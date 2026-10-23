@@ -23,6 +23,7 @@
  */
 
 #include "target_input_plugin_loader.h"
+#include "target_camera_pose.h"
 #include "target_input_arbiter.h"
 #include "target_component_loader.h"
 
@@ -293,6 +294,10 @@ input_host_iface(void)
 		// workspace controller's forwarded events — #1996). The slot IS
 		// the queue's poll; nothing provider-specific lives in between.
 		g_input_host.poll_pointer_events = u_pointer_sink_poll;
+		// The SAME implementation the viewer-tracking host iface carries, so a
+		// hand-tracking provider reading a webcam gets the pose head tracking
+		// calibrated (tracking-provider-discovery.md §6).
+		g_input_host.get_camera_pose = target_camera_pose_host_get;
 		g_input_host_filled = true;
 	}
 	return &g_input_host;
@@ -368,6 +373,7 @@ target_input_plugin_set_display_geometry(const struct xrt_input_host_display_geo
 	if (g_input_geometry_mutex_ready) {
 		os_mutex_unlock(&g_input_geometry_mutex);
 	}
+	target_camera_pose_set_home_display(geometry->display_width_m, geometry->display_height_m, NULL);
 
 	// One-off init fact, once per process: a bug report needs to show
 	// whether providers ever got geometry at all.

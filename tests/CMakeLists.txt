@@ -188,6 +188,9 @@ if(TARGET target_lists)
 	# Tracking-provider-discovery §4a / ADR-054 N8 -- the viewer pose page
 	# (seqlock, wrap, torn-read stress, stale), its named shm, the host supervisor.
 	list(APPEND tests tests_viewer_pose_page)
+	# The runtime-owned camera calibration store + the get_camera_pose answer both
+	# host ifaces give (tracking-provider-discovery.md section 6).
+	list(APPEND tests tests_camera_calib)
 	# Multi-screen M1 -- target_screens_build: registry -> per-screen list.
 	list(APPEND tests tests_target_screens)
 	# ADR-047 Amendment 8 -- display hotplug: the claim sweep's scheduler, the
@@ -660,6 +663,9 @@ endif()
 if(TARGET tests_viewer_pose_page)
 	target_link_libraries(tests_viewer_pose_page PRIVATE target_lists xrt-interfaces aux_util aux_os)
 endif()
+if(TARGET tests_camera_calib)
+	target_link_libraries(tests_camera_calib PRIVATE target_lists xrt-interfaces aux_util aux_os)
+endif()
 if(TARGET tests_target_display_hotplug)
 	target_link_libraries(tests_target_display_hotplug PRIVATE target_lists xrt-interfaces aux_os)
 endif()
@@ -971,9 +977,16 @@ if(TARGET tests_oxr_view_space)
 			)
 		add_dependencies(tests_tracking_calibrate_e2e drv_sim_tracking_plugin)
 		set(_calib_pairs "${CMAKE_CURRENT_BINARY_DIR}/tracking_calibrate_e2e_pairs.json")
+		# With the CLI built, the commit goes through the real 'tracking calibrate apply'.
+		set(_calib_cli "")
+		if(TARGET cli)
+			add_dependencies(tests_tracking_calibrate_e2e cli)
+			set(_calib_cli "DXR_CALIB_E2E_CLI=$<TARGET_FILE:cli>")
+		endif()
 		add_test(NAME tests_tracking_calibrate_e2e
 		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1
-		                 "DXR_CALIB_E2E_OUT=${_calib_pairs}" $<TARGET_FILE:tests_tracking_calibrate_e2e> --success
+		                 "DXR_CALIB_E2E_OUT=${_calib_pairs}" ${_calib_cli} $<TARGET_FILE:tests_tracking_calibrate_e2e>
+		                 --success
 		         )
 		set_tests_properties(tests_tracking_calibrate_e2e PROPERTIES FIXTURES_SETUP calib_pairs)
 		if(TARGET cli)
@@ -988,6 +1001,18 @@ if(TARGET tests_oxr_view_space)
 			                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_CAMERA=1
 			                 $<TARGET_FILE:cli> tracking calibrate --screen E2E-1 --watch --json --count 3
 			         )
+			# No calibration stored (a config dir that does not exist): the answer is still a
+			# pose, the default prior on top of a 194 mm-high panel (97 + 8 mm).
+			add_test(NAME camera_calibration_cli_show_prior
+			         COMMAND ${CMAKE_COMMAND} -E env
+			                 "XDG_CONFIG_HOME=${CMAKE_CURRENT_BINARY_DIR}/camera_calibration_cli_none"
+			                 $<TARGET_FILE:cli> camera calibration show --camera cam0 --screen S1 --panel-mm 344x194
+			                 --json
+			         )
+			set_tests_properties(
+				camera_calibration_cli_show_prior PROPERTIES PASS_REGULAR_EXPRESSION
+				                                             "\"source\":[ \t]*\"default-prior\".*\"t_m\":[^]]*0\\.105"
+				)
 			set_tests_properties(
 				tracking_calibrate_cli_watch PROPERTIES PASS_REGULAR_EXPRESSION
 				                                        "\"tracks_camera_space\":true.*\"camera\":{\"key\":\"sim-tracking:webcam0\""

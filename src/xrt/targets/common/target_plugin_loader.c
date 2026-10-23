@@ -2304,7 +2304,14 @@ target_plugin_set_preferred(const char *id)
 	if (!target_component_user_dir(dir, sizeof(dir))) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	/* Best-effort: create the manifest dir if absent (single level). */
+	/* Best-effort mkdir -p (a fresh macOS account lacks .../DisplayXR itself). */
+	for (char *p = dir + 1; *p != '\0'; p++) {
+		if (*p == '/') {
+			*p = '\0';
+			(void)mkdir(dir, 0755);
+			*p = '/';
+		}
+	}
 	(void)mkdir(dir, 0755);
 
 	char path[PATH_MAX];

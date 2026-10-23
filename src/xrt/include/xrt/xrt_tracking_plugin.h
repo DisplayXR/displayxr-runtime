@@ -47,9 +47,13 @@
  * estimated distance, the same capture time) beside the display-space sample.
  * Nothing consumes it in this release; it is the input of the mirror-alignment
  * camera-pose calibration (`displayxr-cli tracking calibrate`, a runtime-side
- * solver), which writes the solved pose back as provider settings
- * (`CAMERA_POSE`, spec §6). The block is struct_size-gated, so a provider that
- * does not report it simply leaves @ref XRT_TRACKING_SAMPLE_CAMERA_VALID clear.
+ * solver), which writes the solved pose into the RUNTIME's camera calibration
+ * store, keyed by (camera, screen) — not into any provider's settings (spec
+ * §6). A provider reads the pose back through
+ * @ref xrt_tracking_plugin_host_iface::get_camera_pose, the same answer an
+ * input provider using the same camera gets. The block is struct_size-gated,
+ * so a provider that does not report it simply leaves
+ * @ref XRT_TRACKING_SAMPLE_CAMERA_VALID clear.
  *
  * ABI policy per ADR-020: `struct_size` first on every struct, append-only
  * vtables, loader-side major reject.
@@ -60,6 +64,7 @@
 
 #pragma once
 
+#include "xrt/xrt_camera_pose.h"
 #include "xrt/xrt_component_settings.h"
 #include "xrt/xrt_results.h"
 
@@ -144,7 +149,7 @@ extern "C" {
  */
 struct xrt_tracking_camera_sample
 {
-	//! Stable key of the camera the measurement came from (what `CAMERA_POSE` settings are keyed by).
+	//! Stable key of the camera the measurement came from (what the camera calibration store is keyed by, spec §6).
 	char camera_key[XRT_TRACKING_CAMERA_KEY_MAX];
 	//! Unit direction from the optical centre to the left eye point (the face landmarker's accurate part).
 	float left_dir[3];
@@ -165,7 +170,7 @@ struct xrt_tracking_camera_sample
  * Display space (the eye-position convention of `xrt_display_metrics.h`):
  * metres, origin at the centre of the display surface, +X right, +Y up, +Z out
  * of the glass toward the viewer. The provider maps its sensor into this space
- * (its own calibration / the `CAMERA_POSE` setting); the runtime never does.
+ * (through `host->get_camera_pose`, spec §6); the runtime never does.
  *
  * `struct_size` first (ADR-020): fields are appended only, and the runtime
  * reads no further than the provider's `struct_size`.
@@ -283,13 +288,53 @@ struct xrt_tracking_plugin_host_iface
 	 */
 	xrt_result_t (*get_display_geometry)(struct xrt_tracking_host_display_geometry *inout);
 
+	/*!
+	 * Where camera `camera_key` sits relative to screen `screen_key`: the
+	 * runtime's camera calibration store, resolved display-declared >
+	 * user-calibration > placement-hint > default-prior, so the answer is
+	 * never "not found" (`xrt/xrt_camera_pose.h`; spec §6). Pass this host
+	 * iface as `host`. The SAME answer the input host iface's slot of the same
+	 * name gives for the same camera and screen: one calibration serves every
+	 * class. The answer also carries the viewer's per-user iris scale.
+	 *
+	 * Carved out of the former reserved[0]: size and every other offset
+	 * unchanged, the API major stays 1. An older runtime leaves it NULL —
+	 * providers MUST NULL-check (and cover-check `struct_size`). Announced by
+	 * @ref XRT_TRACKING_PLUGIN_HOST_HAS_GET_CAMERA_POSE.
+	 */
+	xrt_camera_get_pose_fn_t get_camera_pose;
+
 	//! Reserved for forward-compatible callbacks (an ADR-043 camera-consumer open, N8). MUST NOT be dereferenced.
-	void *reserved[12];
+	void *reserved[11];
 };
 
+/*!
+ * Defined when this header carries the
+ * @ref xrt_tracking_plugin_host_iface::get_camera_pose slot, so a provider
+ * that must also compile against an older runtime header can `#ifdef`-guard
+ * its use.
+ */
+#define XRT_TRACKING_PLUGIN_HOST_HAS_GET_CAMERA_POSE 1
+
+/*!
+ * True when @p HOST carries a filled @ref xrt_tracking_plugin_host_iface::get_camera_pose
+ * (whole-field `struct_size` coverage plus the NULL test an older runtime needs).
+ */
+#define XRT_TRACKING_PLUGIN_HOST_HAS_CAMERA_POSE(HOST)                                                                 \
+	((HOST) != NULL &&                                                                                             \
+	 (HOST)->struct_size >=                                                                                        \
+	     offsetof(struct xrt_tracking_plugin_host_iface, get_camera_pose) + sizeof((HOST)->get_camera_pose) &&     \
+	 (HOST)->get_camera_pose != NULL)
+
+// clang-format off
+XRT_TRACKING_PLUGIN_ABI_ASSERT(offsetof(struct xrt_tracking_plugin_host_iface, get_camera_pose) ==
+                                   offsetof(struct xrt_tracking_plugin_host_iface, get_display_geometry) +
+                                       sizeof(void *),
+                               "xrt_tracking_plugin_host_iface: get_camera_pose must occupy the former reserved[0]");
 XRT_TRACKING_PLUGIN_ABI_ASSERT(sizeof(struct xrt_tracking_plugin_host_iface) ==
                                    2 * sizeof(uint32_t) + 14 * sizeof(void *),
                                "xrt_tracking_plugin_host_iface size changed - see ADR-020");
+// clang-format on
 
 
 /*

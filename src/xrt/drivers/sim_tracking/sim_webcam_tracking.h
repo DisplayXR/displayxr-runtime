@@ -236,7 +236,7 @@ sim_webcam_select_mode(const struct u_stereo_uvc_mode *modes, uint32_t count, st
 
 /*!
  * The stable key a camera is known by (`xrt_tracking_camera_sample::camera_key`,
- * the `CAMERA_POSE` settings key): USB "vvvv:pppp" when the device has a
+ * the camera calibration store key): USB "vvvv:pppp" when the device has a
  * VID:PID, else its OS id, else its name.
  */
 void

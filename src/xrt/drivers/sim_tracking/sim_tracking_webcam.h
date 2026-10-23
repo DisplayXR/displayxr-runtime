@@ -53,7 +53,7 @@ sim_tracking_webcam_probe(const struct sim_webcam_settings *s);
 void
 sim_tracking_webcam_describe(const struct sim_webcam_settings *s, struct xrt_tracking_provider_info *out);
 
-//! The key of the camera `WEBCAM_DEVICE` selects (what `CAMERA_POSE_<n>_CAMERA` matches). Opens nothing.
+//! The key of the camera `WEBCAM_DEVICE` selects (the camera calibration store key). Opens nothing.
 bool
 sim_tracking_webcam_camera_key(const struct sim_webcam_settings *s, char *out, size_t cap);
 
@@ -61,7 +61,7 @@ sim_tracking_webcam_camera_key(const struct sim_webcam_settings *s, char *out, s
  * Start the camera worker and the pump. @p nominal is the display's nominal
  * viewer (the MANAGED collapse target), @p screen_h_m the panel height (the
  * camera sits on its top edge). @p calibrated (copied; NULL = none) is the
- * camera's `CAMERA_POSE_<n>`: when given, every measurement is mapped to
+ * camera's pose from the host (get_camera_pose): when given, every measurement is mapped to
  * display space as R * cam + T (sim_tracking_camera_to_display, with its
  * depth / focal scale) BEFORE smoothing, replacing the bezel-offset model.
  * Pushes one sample synchronously. NULL when the source cannot run (the core

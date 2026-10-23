@@ -2254,7 +2254,16 @@ tc_store_write(
 	} else {
 		char dir[PATH_MAX];
 		if (target_component_user_dir(dir, sizeof(dir))) {
-			(void)mkdir(dir, 0755); // best-effort, single level (as `preferred`)
+			// mkdir -p: on a fresh macOS account even ~/Library/Application Support/DisplayXR
+			// is missing, and a single-level mkdir failed every first write.
+			for (char *p = dir + 1; *p != '\0'; p++) {
+				if (*p == '/') {
+					*p = '\0';
+					(void)mkdir(dir, 0755);
+					*p = '/';
+				}
+			}
+			(void)mkdir(dir, 0755);
 		}
 		char *printed = cJSON_Print(root);
 		FILE *f = printed != NULL ? fopen(path, "wb") : NULL;

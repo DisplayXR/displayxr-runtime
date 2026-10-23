@@ -87,6 +87,8 @@ cli_print_help(int argc, const char **argv)
 	P("                      'camera list [--json]', 'camera calib <id> [--raw|--rectified]',\n");
 	P("                      'camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]\n");
 	P("                      [--frames N] [--seconds S] [--out DIR]' — rate, layout, disparity, PNG.\n");
+	P("                      'camera calibration list|show|set-placement|reset' — where each camera sits\n");
+	P("                      relative to each screen (local store, shared by every provider).\n");
 #ifdef CLI_HAVE_DESKTOP
 	P("  desktop <...>     - Desktop control (XR_DXR_desktop_control, ADR-056), the user's store + audit\n");
 	P("                      log: 'desktop status [--json]', 'desktop stop|resume' (kill switch),\n");
@@ -160,6 +162,10 @@ main(int argc, const char **argv)
 		return cli_cmd_conv(argc, argv);
 	}
 	if (strcmp(argv[1], "camera") == 0) {
+		// The calibration store is local (no IPC): routed before the IPC-only camera verbs.
+		if (argc >= 3 && strcmp(argv[2], "calibration") == 0) {
+			return cli_cmd_camera_calibration(argc, argv);
+		}
 		return cli_cmd_camera(argc, argv);
 	}
 #ifdef CLI_HAVE_DESKTOP

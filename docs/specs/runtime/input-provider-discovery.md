@@ -790,6 +790,19 @@ your `struct_size` as you set it. Publication is logged once
 (`input plugin loader: display geometry published to providers: …`), so a bug
 report shows whether providers ever got geometry at all.
 
+**`host->get_camera_pose(host, camera_key, screen_key, &pose)`** — where a camera sits relative
+to a screen, for a camera-based input provider (hand tracking off a webcam). Carved from the former
+`reserved[3]` (size and offsets unchanged, API major stays 1; NULL on an older runtime, announced by
+`XRT_INPUT_PLUGIN_HOST_HAS_GET_CAMERA_POSE`). It is the **same function** the viewer-tracking host
+iface carries: the runtime's camera calibration store, resolved display-declared > user-calibration
+> placement-hint > default-prior (top centre of the bezel, `T = (0, H/2 + 8 mm, 0)`), so the
+answer is never "not found" and always says its `source`. A calibration done once for head
+tracking therefore serves the hands with no second procedure, and an uncalibrated camera gets the
+same prior head tracking assumes. Store, precedence, placement geometry and the per-user iris
+scale: `tracking-provider-discovery.md` §6 (*Camera calibration store*); struct:
+`xrt/xrt_camera_pose.h`. Read it at `create_devices` (or on a slow timer, following `generation`),
+never per frame.
+
 ### 4b.7 Testing without hardware
 
 `sim_input` carries a scripted navigation device so the role walk, the

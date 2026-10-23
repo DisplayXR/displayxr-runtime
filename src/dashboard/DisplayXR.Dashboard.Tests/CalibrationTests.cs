@@ -342,6 +342,23 @@ public class CalibrationTests
         // unit scales are not written (apply then clears them)
         Assert.DoesNotContain("--depth-scale", CalibrationCommands.Apply(Key, "cam:0", pose, null, 1, 1).Args);
         Assert.Contains("--focal-scale", CalibrationCommands.Apply(Key, "cam:0", pose, null, 1, 1.02).Args);
+        // The solve's quality is recorded with the calibration when given.
+        var q = CalibrationCommands.Apply(Key, "cam:0", pose, null, 1, 1, 2.1, 10, "b").Args;
+        Assert.Contains("--rms-mm", q);
+        Assert.Contains("2.100", q);
+        Assert.Contains("--samples", q);
+        Assert.Contains("--mode", q);
+    }
+
+    [Fact]
+    public void ApplyStoreFailure_SaysWhatDidNotWrite()
+    {
+        var o = JsonNode.Parse(TestData.Text("calibrate-apply-store.json"))!.AsObject();
+        o["ok"] = false;
+        o["failed"] = "camera_pose";
+        o["reason"] = "denied";
+        Assert.False(CalibrationCommands.ParseApply(o.ToJsonString(), out var report));
+        Assert.Contains("camera pose failed: denied", report);
     }
 
     [Fact]
@@ -481,10 +498,16 @@ public class CalibrationTests
         Assert.False(req.IsSolve);
         Assert.Equal(new CliArgs("tracking", "calibrate", "apply", "--screen", Key, "--camera", "sim-tracking:webcam0", "--pose",
                                  "0.037000,0.182000,0.000000,0.078459,0.000000,0.000000,0.996917", "--provider", "sim-tracking",
+                                 "--rms-mm", "0.000", "--samples", "6", "--mode", "b",
                                  "--depth-scale", "0.925926", "--json"), req.Args);
 
-        Assert.True(CalibrationCommands.ParseApply(TestData.Text("calibrate-apply.json"), out var report));
-        Assert.Contains("CAMERA_POSE_0 of 'sim-tracking'", report);
+        // The current CLI: the runtime-owned camera calibration store.
+        Assert.True(CalibrationCommands.ParseApply(TestData.Text("calibrate-apply-store.json"), out var report));
+        Assert.Contains("camera 'sim-tracking:webcam0'", report);
+        Assert.Contains("shared by every provider", report);
+        // An older CLI (#2303, provider settings) still reads.
+        Assert.True(CalibrationCommands.ParseApply(TestData.Text("calibrate-apply.json"), out var legacy));
+        Assert.Contains("CAMERA_POSE_0 of 'sim-tracking'", legacy);
         s.ApplyFinished(true, report);
         Assert.Equal(CalibPhase.Done, s.Phase);
         Assert.False(s.WantsStream);

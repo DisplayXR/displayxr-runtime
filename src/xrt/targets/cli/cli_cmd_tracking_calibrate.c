@@ -20,9 +20,13 @@
  *       Runs the solver (math/m_mirror_calib.h) on {dot_m, sample} pairs.
  *
  *   tracking calibrate apply --screen <key> --camera <key> --pose tx,ty,tz,qx,qy,qz,qw
- *                      [--provider <id>] [--depth-scale X] [--focal-scale X]
- *                      [--slot N] [--machine] [--json]
- *       Commits the result as the provider's reserved CAMERA_POSE_<n> settings.
+ *                      [--depth-scale X] [--focal-scale X] [--rms-mm X] [--samples N]
+ *                      [--mode a|b|c] [--machine] [--json]
+ *       Commits the result into the runtime's camera calibration store, keyed
+ *       by (camera, screen) and shared by every provider of every class that
+ *       reads that camera (util/u_camera_calib.h). --depth-scale is the solved
+ *       iris scale: a per-USER value, stored apart. --provider / --slot (the
+ *       #2303 shape) are accepted and ignored.
  *
  * Contract: docs/specs/runtime/tracking-provider-discovery.md, "Camera pose calibration".
  */
@@ -36,6 +40,7 @@
 
 #include "math/m_mirror_calib.h"
 #include "os/os_threading.h"
+#include "util/u_camera_calib.h"
 #include "os/os_time.h"
 #include "util/u_time.h"
 
@@ -63,8 +68,6 @@
 #endif
 
 #define P(...) printf(__VA_ARGS__)
-//! CAMERA_POSE_<n> slots, n = 0 .. CAL_POSE_SLOTS - 1 (spec: same range every provider scans).
-#define CAL_POSE_SLOTS 16
 #define CAL_MAX_PROVIDERS 16
 
 //! Value of `--name <v>` anywhere in argv[2..], or NULL.
@@ -738,8 +741,10 @@ cmd_solve(int argc, const char **argv)
 			  res->distance_m[i], samples[i].est_distance_m, res->rejected[i] ? "  REJECTED" : "");
 		}
 		P("\tsetting: %s\n", setting);
-		P("\tcommit:  displayxr-cli tracking calibrate apply --screen %s --camera %s --pose %s\n",
-		  screen[0] ? screen : "<key>", camera_key[0] ? camera_key : "<key>", setting);
+		P("\tcommit:  displayxr-cli tracking calibrate apply --screen %s --camera %s --pose %s --rms-mm %.3f "
+		  "--samples %d --mode %s --depth-scale %.4f\n",
+		  screen[0] ? screen : "<key>", camera_key[0] ? camera_key : "<key>", setting, res->rms_m * 1e3,
+		  res->used_count, m_mirror_calib_mode_str(opt.mode), res->iris_scale);
 	} else {
 		P("refused (%s): %s\n", m_mirror_calib_status_str(res->status), res->reason);
 	}
@@ -750,26 +755,28 @@ cmd_solve(int argc, const char **argv)
 
 /*
  *
- * Apply: commit as the provider's CAMERA_POSE_<n> settings.
+ * Apply: commit into the runtime's camera calibration store.
  *
  */
 
+//! Parse "tx,ty,tz,qx,qy,qz,qw" into t / q; false on anything else (or a zero quaternion).
 static bool
-pose_valid(const char *s)
+pose_parse(const char *s, double t[3], double q[4])
 {
 	if (s == NULL) {
 		return false;
 	}
 	const char *c = s;
+	double v[7];
 	double q2 = 0.0;
 	for (int i = 0; i < 7; i++) {
 		char *end = NULL;
-		const double v = strtod(c, &end);
-		if (end == c || !isfinite(v)) {
+		v[i] = strtod(c, &end);
+		if (end == c || !isfinite(v[i])) {
 			return false;
 		}
 		if (i >= 3) {
-			q2 += v * v;
+			q2 += v[i] * v[i];
 		}
 		c = end;
 		if (i < 6) {
@@ -779,52 +786,31 @@ pose_valid(const char *s)
 			c++;
 		}
 	}
-	return *c == '\0' && q2 > 1e-9;
-}
-
-//! The provider apply writes to when --provider is absent: PreferredPlugin if enabled, else the first enabled.
-static bool
-default_provider(char *out, size_t cap)
-{
-	struct target_tracking_plugin_desc list[CAL_MAX_PROVIDERS];
-	const int n = target_tracking_plugin_enumerate(list, CAL_MAX_PROVIDERS);
-	char pref[64] = {0};
-	if (target_tracking_plugin_get_preferred(pref, sizeof(pref))) {
-		for (int i = 0; i < n; i++) {
-			if (list[i].enabled && strcmp(list[i].id, pref) == 0) {
-				snprintf(out, cap, "%s", list[i].id);
-				return true;
-			}
-		}
+	if (*c != '\0' || !(q2 > 1e-9)) {
+		return false;
 	}
-	for (int i = 0; i < n; i++) {
-		if (list[i].enabled) {
-			snprintf(out, cap, "%s", list[i].id);
-			return true;
-		}
-	}
-	return false;
+	memcpy(t, v, 3 * sizeof(double));
+	memcpy(q, v + 3, 4 * sizeof(double));
+	return true;
 }
 
 static bool
-provider_registered(const char *id)
+pose_valid(const char *s)
 {
-	struct target_tracking_plugin_desc list[CAL_MAX_PROVIDERS];
-	const int n = target_tracking_plugin_enumerate(list, CAL_MAX_PROVIDERS);
-	for (int i = 0; i < n; i++) {
-		if (strcmp(list[i].id, id) == 0) {
-			return true;
-		}
-	}
-	return false;
+	double t[3], q[4];
+	return pose_parse(s, t, q);
 }
 
-static bool
-get_key(const char *id, const char *key, char *buf, size_t cap)
+static const char *
+store_result_str(enum u_camera_calib_store_result w, bool machine)
 {
-	buf[0] = '\0';
-	return target_component_get_setting(target_tracking_plugin_component_class(), id, key, buf, cap, NULL) &&
-	       buf[0] != '\0';
+	switch (w) {
+	case U_CAMERA_CALIB_STORE_OK: return "ok";
+	case U_CAMERA_CALIB_STORE_DENIED:
+		return machine ? "denied: the machine layer needs an elevated terminal / root" : "denied";
+	case U_CAMERA_CALIB_STORE_UNSUPPORTED: return "no store path (HOME / config dir unset?)";
+	default: return "store write failed";
+	}
 }
 
 static int
@@ -838,134 +824,106 @@ cmd_apply(int argc, const char **argv)
 	if (pose == NULL && argc > 4 && argv[argc - 1][0] != '-' && pose_valid(argv[argc - 1])) {
 		pose = argv[argc - 1]; // positional, as the spec's "apply --screen <k> --camera <k> <pose>"
 	}
-	if (screen == NULL || camera == NULL || !pose_valid(pose)) {
+	struct u_camera_calib_record rec;
+	memset(&rec, 0, sizeof(rec));
+	if (screen == NULL || camera == NULL || !pose_parse(pose, rec.t_m, rec.q)) {
 		P("error: 'tracking calibrate apply' needs --screen <key> --camera <key> --pose tx,ty,tz,qx,qy,qz,qw\n"
 		  "       (metres, display space; the \"setting\" field of 'calibrate solve --json').\n");
 		return 1;
 	}
-	char provider[64] = {0};
-	const char *pv = opt_value(argc, argv, "--provider");
-	if (pv != NULL) {
-		snprintf(provider, sizeof(provider), "%s", pv);
-	} else if (!default_provider(provider, sizeof(provider))) {
-		P("error: no enabled viewer-tracking provider is registered; pass --provider <id>.\n");
+	if (strlen(camera) >= U_CAMERA_CALIB_KEY_MAX || strlen(screen) >= U_CAMERA_CALIB_KEY_MAX) {
+		P("error: --camera / --screen keys are limited to %d bytes.\n", U_CAMERA_CALIB_KEY_MAX - 1);
 		return 1;
 	}
-	if (!provider_registered(provider)) {
-		P("error: '%s' is not a registered viewer-tracking provider (displayxr-cli tracking list).\n",
-		  provider);
-		return 1;
+	// #2303 compatibility: the Dashboard still passes --provider (and may pass --slot). The pose is
+	// no longer a provider's setting — it belongs to the camera + screen — so both are accepted and ignored.
+	const char *provider = opt_value(argc, argv, "--provider");
+	char note[256] = {0};
+	if (provider != NULL || opt_value(argc, argv, "--slot") != NULL) {
+		snprintf(note, sizeof(note),
+		         "--provider / --slot ignored: the camera pose is stored per camera + screen, shared by every "
+		         "provider");
+		fprintf(stderr, "note: %s.\n", note);
 	}
-	double depth_scale = 0.0, focal_scale = 0.0;
+	double depth_scale = 0.0, focal_scale = 1.0, rms_mm = 0.0, samples = 0.0;
 	const char *ds = opt_value(argc, argv, "--depth-scale");
 	const char *fs = opt_value(argc, argv, "--focal-scale");
+	const char *rs = opt_value(argc, argv, "--rms-mm");
+	const char *ns = opt_value(argc, argv, "--samples");
+	const char *ms = opt_value(argc, argv, "--mode");
 	if ((ds != NULL && (!parse_double(ds, &depth_scale) || depth_scale <= 0.0)) ||
-	    (fs != NULL && (!parse_double(fs, &focal_scale) || focal_scale <= 0.0))) {
-		P("error: --depth-scale / --focal-scale must be positive numbers.\n");
+	    (fs != NULL && (!parse_double(fs, &focal_scale) || focal_scale <= 0.0)) ||
+	    (rs != NULL && (!parse_double(rs, &rms_mm) || rms_mm < 0.0)) ||
+	    (ns != NULL && (!parse_double(ns, &samples) || samples < 0.0))) {
+		P("error: --depth-scale / --focal-scale must be positive, --rms-mm / --samples non-negative.\n");
+		return 1;
+	}
+	if (ms != NULL && !(strcmp(ms, "a") == 0 || strcmp(ms, "b") == 0 || strcmp(ms, "c") == 0)) {
+		P("error: --mode must be a, b or c.\n");
 		return 1;
 	}
 
-	// Slot: the one already holding this camera + screen, else the first free one (or --slot).
-	int slot = -1;
-	const char *ss = opt_value(argc, argv, "--slot");
-	if (ss != NULL) {
-		slot = (int)strtol(ss, NULL, 10);
-		if (slot < 0 || slot >= CAL_POSE_SLOTS) {
-			P("error: --slot must be 0..%d.\n", CAL_POSE_SLOTS - 1);
-			return 1;
-		}
+	snprintf(rec.camera_key, sizeof(rec.camera_key), "%s", camera);
+	snprintf(rec.screen_key, sizeof(rec.screen_key), "%s", screen);
+	rec.source = XRT_CAMERA_POSE_SOURCE_USER_CALIBRATION;
+	rec.focal_scale = focal_scale;
+	rec.rms_mm = rms_mm;
+	rec.sample_count = (uint32_t)samples;
+	snprintf(rec.solver_mode, sizeof(rec.solver_mode), "%s", ms != NULL ? ms : "");
+	const enum u_camera_calib_store_result w = u_camera_calib_store_put(&rec, machine);
+	enum u_camera_calib_store_result wi = U_CAMERA_CALIB_STORE_OK;
+	if (w == U_CAMERA_CALIB_STORE_OK && ds != NULL) {
+		// The iris scale belongs to the USER, not the camera: one per-user value.
+		wi = u_camera_calib_set_viewer_iris_scale(depth_scale);
 	}
-	for (int i = 0; slot < 0 && i < CAL_POSE_SLOTS; i++) {
-		char key[48], cam[XRT_TRACKING_CAMERA_KEY_MAX], scr[256];
-		snprintf(key, sizeof(key), "CAMERA_POSE_%d_CAMERA", i);
-		const bool has_cam = get_key(provider, key, cam, sizeof(cam));
-		snprintf(key, sizeof(key), "CAMERA_POSE_%d_SCREEN", i);
-		const bool has_scr = get_key(provider, key, scr, sizeof(scr));
-		if (has_cam && has_scr && strcmp(cam, camera) == 0 && strcmp(scr, screen) == 0) {
-			slot = i;
-		}
-	}
-	for (int i = 0; slot < 0 && i < CAL_POSE_SLOTS; i++) {
-		char key[48], val[256];
-		snprintf(key, sizeof(key), "CAMERA_POSE_%d", i);
-		if (!get_key(provider, key, val, sizeof(val))) {
-			snprintf(key, sizeof(key), "CAMERA_POSE_%d_CAMERA", i);
-			if (!get_key(provider, key, val, sizeof(val))) {
-				slot = i;
-			}
-		}
-	}
-	if (slot < 0) {
-		P("error: all %d CAMERA_POSE slots of '%s' are taken; pass --slot N to overwrite one.\n",
-		  CAL_POSE_SLOTS, provider);
-		return 1;
-	}
-
-	const struct target_component_class *cls = target_tracking_plugin_component_class();
-	char k_pose[48], k_cam[48], k_scr[48], k_depth[48], k_focal[48], vbuf[64];
-	snprintf(k_pose, sizeof(k_pose), "CAMERA_POSE_%d", slot);
-	snprintf(k_cam, sizeof(k_cam), "CAMERA_POSE_%d_CAMERA", slot);
-	snprintf(k_scr, sizeof(k_scr), "CAMERA_POSE_%d_SCREEN", slot);
-	snprintf(k_depth, sizeof(k_depth), "CAMERA_POSE_%d_DEPTH_SCALE", slot);
-	snprintf(k_focal, sizeof(k_focal), "CAMERA_POSE_%d_FOCAL_SCALE", slot);
-	enum target_component_store_result w = TARGET_COMPONENT_STORE_OK;
-	const char *failed = NULL;
-#define WRITE(k, v)                                                                                                    \
-	do {                                                                                                           \
-		if (w == TARGET_COMPONENT_STORE_OK) {                                                                  \
-			w = target_component_set_setting(cls, provider, (k), (v), machine);                            \
-			failed = (k);                                                                                  \
-		}                                                                                                      \
-	} while (0)
-	WRITE(k_cam, camera);
-	WRITE(k_scr, screen);
-	WRITE(k_pose, pose);
-	if (ds != NULL) {
-		snprintf(vbuf, sizeof(vbuf), "%.6f", depth_scale);
-		WRITE(k_depth, vbuf);
-	} else if (w == TARGET_COMPONENT_STORE_OK) {
-		(void)target_component_unset_setting(cls, provider, k_depth, machine);
-	}
-	if (fs != NULL) {
-		snprintf(vbuf, sizeof(vbuf), "%.6f", focal_scale);
-		WRITE(k_focal, vbuf);
-	} else if (w == TARGET_COMPONENT_STORE_OK) {
-		(void)target_component_unset_setting(cls, provider, k_focal, machine);
-	}
-#undef WRITE
-	char store[512] = {0};
-	(void)target_component_setting_store_path(cls, provider, machine, store, sizeof(store));
-	const bool ok = w == TARGET_COMPONENT_STORE_OK;
+	char user_path[1024], machine_path[1024];
+	u_camera_calib_store_paths(user_path, sizeof(user_path), machine_path, sizeof(machine_path));
+	const char *store = machine ? machine_path : user_path;
+	const bool ok = w == U_CAMERA_CALIB_STORE_OK && wi == U_CAMERA_CALIB_STORE_OK;
+	struct u_camera_calib_record stored = rec;
+	(void)u_camera_calib_store_find(camera, screen, XRT_CAMERA_POSE_SOURCE_USER_CALIBRATION, &stored);
 	if (json) {
 		cJSON *o = cJSON_CreateObject();
 		cJSON_AddBoolToObject(o, "ok", ok);
-		cJSON_AddStringToObject(o, "provider", provider);
-		cJSON_AddNumberToObject(o, "slot", slot);
+		cJSON_AddStringToObject(o, "camera", camera);
+		cJSON_AddStringToObject(o, "screen", screen);
+		cJSON_AddStringToObject(o, "source", u_camera_calib_source_str(rec.source));
+		cJSON_AddStringToObject(o, "layer", machine ? "machine" : "user");
 		cJSON_AddStringToObject(o, "store", store);
-		cJSON *keys = cJSON_AddObjectToObject(o, "keys");
-		cJSON_AddStringToObject(keys, k_pose, pose);
-		cJSON_AddStringToObject(keys, k_cam, camera);
-		cJSON_AddStringToObject(keys, k_scr, screen);
+		cJSON_AddItemToObject(o, "t_m", vec_json(stored.t_m, 3));
+		cJSON_AddItemToObject(o, "q", vec_json(stored.q, 4));
+		cJSON_AddNumberToObject(o, "focal_scale", stored.focal_scale);
+		cJSON_AddNumberToObject(o, "rms_mm", stored.rms_mm);
+		cJSON_AddNumberToObject(o, "sample_count", stored.sample_count);
+		cJSON_AddStringToObject(o, "solver_mode", stored.solver_mode);
+		cJSON_AddNumberToObject(o, "timestamp_unix", (double)stored.timestamp_unix);
 		if (ds != NULL) {
-			cJSON_AddNumberToObject(keys, k_depth, depth_scale);
+			cJSON_AddNumberToObject(o, "viewer_iris_scale", depth_scale);
 		}
-		if (fs != NULL) {
-			cJSON_AddNumberToObject(keys, k_focal, focal_scale);
+		if (provider != NULL) {
+			cJSON_AddStringToObject(o, "provider", provider); // echoed, not used
+		}
+		if (note[0] != '\0') {
+			cJSON_AddStringToObject(o, "note", note);
 		}
 		if (!ok) {
-			cJSON_AddStringToObject(o, "failed_key", failed != NULL ? failed : "");
+			cJSON_AddStringToObject(o, "failed",
+			                        w != U_CAMERA_CALIB_STORE_OK ? "camera_pose" : "iris_scale");
+			cJSON_AddStringToObject(o, "reason",
+			                        store_result_str(w != U_CAMERA_CALIB_STORE_OK ? w : wi, machine));
 		}
 		print_json(o, false);
 		cJSON_Delete(o);
 	} else if (ok) {
-		P("Wrote %s = %s (camera '%s', screen '%s') for '%s' in %s.\n", k_pose, pose, camera, screen, provider,
-		  store[0] ? store : (machine ? "the machine store" : "the per-user store"));
-		P("Applies at the provider's next start (the next app launch).\n");
+		P("Calibrated camera '%s' on screen '%s': %s (%s layer, %s).\n", camera, screen, pose,
+		  machine ? "machine" : "user", store);
+		if (ds != NULL) {
+			P("Viewer iris scale %.4f (per user).\n", depth_scale);
+		}
+		P("Every provider that reads this camera picks it up at its next start.\n");
 	} else {
-		P("FAIL: writing %s for '%s' (%s).\n", failed != NULL ? failed : "?", provider,
-		  w == TARGET_COMPONENT_STORE_DENIED        ? "denied — HKLM needs an elevated terminal"
-		  : w == TARGET_COMPONENT_STORE_UNSUPPORTED ? "no machine store on this platform — drop --machine"
-		                                            : "store write failed");
+		P("FAIL: writing the %s (%s).\n", w != U_CAMERA_CALIB_STORE_OK ? "camera pose" : "iris scale",
+		  store_result_str(w != U_CAMERA_CALIB_STORE_OK ? w : wi, machine));
 	}
 	return ok ? 0 : 1;
 }
@@ -981,9 +939,10 @@ usage(void)
 	  "[--json]\n");
 	P("        Solve the camera pose from {\"dot_m\":[x,y], \"sample\":<a sample line>} pairs.\n");
 	P("        a: R = I (T_x, T_y; >= 2 dots)  b: + pitch (>= 3 samples, two distances)  c: full R (>= 7).\n");
-	P("  apply --screen <key> --camera <key> --pose tx,ty,tz,qx,qy,qz,qw [--provider <id>]\n");
-	P("        [--depth-scale X] [--focal-scale X] [--slot N] [--machine] [--json]\n");
-	P("        Commit as the provider's CAMERA_POSE_<n> settings (same store as 'tracking set').\n");
+	P("  apply --screen <key> --camera <key> --pose tx,ty,tz,qx,qy,qz,qw [--depth-scale X]\n");
+	P("        [--focal-scale X] [--rms-mm X] [--samples N] [--mode a|b|c] [--machine] [--json]\n");
+	P("        Commit into the runtime's camera calibration store (per camera + screen, shared by every\n");
+	P("        provider; 'displayxr-cli camera calibration list'). --depth-scale = the per-user iris scale.\n");
 	return 1;
 }
 

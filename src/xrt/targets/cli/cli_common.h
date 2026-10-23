@@ -67,6 +67,20 @@ cli_status_build_headless(struct xrt_status_snapshot *out);
 int
 cli_cmd_clients(int argc, const char **argv);
 
+//! `camera calibration list|show|set-placement|reset` — the camera calibration store (local).
+int
+cli_cmd_camera_calibration(int argc, const char **argv);
+
+struct cJSON;
+
+//! `status --json`: each `screens[i]` gains `camera_calibrations`, the root `camera_calibration`.
+void
+cli_camera_calibration_annotate_status(struct cJSON *root);
+
+//! `info --json`: the root gains `camera_calibration` (store paths, viewer iris scale, every record).
+void
+cli_camera_calibration_annotate_info(struct cJSON *root);
+
 /*! ADR-057: `conv run <task> <in> [<in-right>] <out>` (a job, file to file),
  *  `conv consent <id> grant|revoke|status` and `conv camera-block <sog> --facts <json>`. */
 int

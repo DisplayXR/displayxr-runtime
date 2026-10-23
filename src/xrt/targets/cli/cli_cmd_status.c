@@ -278,6 +278,7 @@ status_print(const struct xrt_status_snapshot *snap, bool json, bool watch, bool
 {
 	if (json) {
 		cJSON *root = u_status_snapshot_to_cjson(snap);
+		cli_camera_calibration_annotate_status(root);
 		char *s = watch ? cJSON_PrintUnformatted(root) : cJSON_Print(root);
 		if (s != NULL) {
 			printf("%s\n", s);

@@ -16,6 +16,7 @@
 
 #include "target_tracking_plugin_loader.h"
 #include "target_component_loader.h"
+#include "target_camera_pose.h"
 
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_results.h"
@@ -140,6 +141,8 @@ target_tracking_plugin_get_host_iface(void)
 		g_host.host_api_version = XRT_TRACKING_PLUGIN_API_VERSION_CURRENT;
 		g_host.get_setting = host_get_setting;
 		g_host.get_display_geometry = host_get_display_geometry;
+		// The SAME implementation the input host iface carries: one answer per camera + screen.
+		g_host.get_camera_pose = target_camera_pose_host_get;
 		g_host_filled = true;
 	}
 	return &g_host;
@@ -161,6 +164,7 @@ target_tracking_plugin_set_display_geometry(const struct xrt_tracking_host_displ
 	if (g_geo_mutex_ready) {
 		os_mutex_unlock(&g_geo_mutex);
 	}
+	target_camera_pose_set_home_display(geometry->display_width_m, geometry->display_height_m, NULL);
 }
 
 
