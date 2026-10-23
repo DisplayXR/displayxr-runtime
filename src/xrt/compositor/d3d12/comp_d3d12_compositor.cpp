@@ -25,10 +25,10 @@
 #include "comp_d3d12_deposit.h"
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 // #1264 heavy-d3d12 reroute: the same-adapter fill arm. Vulkan-free D3D11 code
-// that lives in comp_vk_native; consumes only the pure-D3D11 handoff struct.
-#include "vk_native/comp_vk_native_split.h"
+// (comp_hub_d3d11, #2317 P1a); consumes only the pure-D3D11 handoff struct.
+#include "hub_d3d11/comp_hub_d3d11.h"
 #else
-struct comp_vk_split; // the reroute fields exist either way; the code does not
+struct comp_hub_d3d11; // the reroute fields exist either way; the code does not
 #endif
 
 #include "d3d11/comp_d3d11_window.h"
@@ -356,17 +356,17 @@ struct comp_d3d12_compositor
 
 	/*!
 	 * #1264 / ADR-039 heavy-d3d12 reroute. When ACTIVE this session's fill,
-	 * weave and present all belong to the d3d11 fill arm (`comp_vk_split` —
+	 * weave and present all belong to the d3d11 fill arm (`comp_hub_d3d11` —
 	 * the measured event-immune engine): the renderer's atlas is an imported
 	 * D3D11 deposit slot, the compositor's own DP / target / out-device split
 	 * machinery is never created (one weaver per HWND — the split took it),
-	 * and the frame path exits through comp_vk_split_weave_and_present. The
+	 * and the frame path exits through comp_hub_d3d11_weave_and_present. The
 	 * own-legs arm remains the hybrid path and the DXR_SPLIT_D3D12_ROUTE=own
 	 * A/B control.
 	 */
 	struct
 	{
-		struct comp_vk_split *split;
+		struct comp_hub_d3d11 *split;
 		struct comp_d3d12_deposit *dep;
 		bool active;
 		//! The DP canvas rect the frame path last published (repaint replays it).
@@ -1829,7 +1829,7 @@ d3d12_reroute_route_d3d11(void)
 
 /*!
  * #1264 heavy-d3d12 reroute Stage A: stand the d3d11 fill arm up for this
- * session — comp_vk_split's Stage A1 (out device, HWND target, D3D11 DP per
+ * session — comp_hub_d3d11's Stage A1 (out device, HWND target, D3D11 DP per
  * ADR-037 §3a), then the deposit ring, then wire the transport. Mirrors the VK
  * compositor's A1/A2 split. Best-effort: any failure leaves the session on its
  * stock path with the reason logged; nothing half-engages.
@@ -1841,7 +1841,7 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
                       int32_t display_screen_top)
 {
 	const LUID app_luid = c->device->GetAdapterLuid();
-	struct comp_vk_split_info si = {};
+	struct comp_hub_d3d11_info si = {};
 	si.xdev = xdev;
 	si.hwnd = c->hwnd;
 	si.dp_factory_d3d11 = c->dp_factory_d3d11;
@@ -1858,8 +1858,7 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	si.preferred_height = c->settings.preferred.height;
 
 	const char *short_reason = NULL;
-	if (comp_vk_split_stage_a(&si, &c->reroute.split, &short_reason) != XRT_SUCCESS ||
-	    c->reroute.split == NULL) {
+	if (comp_hub_d3d11_stage_a(&si, &c->reroute.split, &short_reason) != XRT_SUCCESS || c->reroute.split == NULL) {
 		c->split_off_reason = (short_reason != NULL) ? short_reason : COMP_SPLIT_REASON_STAGE_A_FAILED;
 		U_LOG_W("#1264 reroute: d3d11 fill arm Stage A refused (%s) — stock path",
 		        c->split_off_reason != NULL ? c->split_off_reason : "?");
@@ -1878,16 +1877,16 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	}
 	if (comp_d3d12_deposit_create(c->device, sys_w, sys_h, &c->reroute.dep) != XRT_SUCCESS ||
 	    c->reroute.dep == NULL) {
-		comp_vk_split_retire(&c->reroute.split, "deposit creation failed", COMP_SPLIT_REASON_STAGE_A_FAILED);
+		comp_hub_d3d11_retire(&c->reroute.split, "deposit creation failed", COMP_SPLIT_REASON_STAGE_A_FAILED);
 		c->split_off_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
 		return;
 	}
 
-	struct comp_vk_deposit_handoff handoff = {};
+	struct comp_hub_d3d11_handoff handoff = {};
 	if (!comp_d3d12_deposit_get_handoff(c->reroute.dep, &handoff) ||
-	    !comp_vk_split_wire_bridge(c->reroute.split, &handoff)) {
+	    !comp_hub_d3d11_wire_bridge(c->reroute.split, &handoff)) {
 		comp_d3d12_deposit_destroy(&c->reroute.dep);
-		comp_vk_split_retire(&c->reroute.split, "bridge wire failed", COMP_SPLIT_REASON_STAGE_A_FAILED);
+		comp_hub_d3d11_retire(&c->reroute.split, "bridge wire failed", COMP_SPLIT_REASON_STAGE_A_FAILED);
 		c->split_off_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
 		return;
 	}
@@ -1902,7 +1901,7 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	// This tier's flatten family is RGBA (the atlas ring's, and the scratch
 	// the plane copies promote from) — the arm's chains must match or the
 	// bind refuses on the typeless-family check.
-	comp_vk_split_set_plane_format(c->reroute.split, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM);
+	comp_hub_d3d11_set_plane_format(c->reroute.split, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM);
 
 	c->reroute.active = true;
 	c->split_off_reason = NULL;
@@ -1911,7 +1910,7 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	// arm stood up is replayed into it; later ones are forwarded by
 	// comp_d3d12_compositor_set_screens.
 	if (c->seg_screens != nullptr && c->seg_sys_info != nullptr) {
-		comp_vk_split_set_screens(c->reroute.split, c->seg_screens, c->seg_sys_info, c->seg_pinned_display_id);
+		comp_hub_d3d11_set_screens(c->reroute.split, c->seg_screens, c->seg_sys_info, c->seg_pinned_display_id);
 	}
 	U_LOG_W(
 	    "#1264 heavy-d3d12 reroute ACTIVE: this session's fill/weave/present run on the d3d11 fill "
@@ -1969,7 +1968,7 @@ d3d12_reroute_copy_to_plane(struct comp_d3d12_compositor *c, ID3D12Resource *scr
  * ANCHOR, so a window move with unchanged zone geometry still reaches the vendor.
  * Only the generation is held still. Nothing is ever skipped, so there is no
  * "did the publish succeed" bookkeeping to get out of step with: an early return
- * inside @ref comp_vk_split_publish_zone_wish (authored plane not landed, raster
+ * inside @ref comp_hub_d3d11_publish_zone_wish (authored plane not landed, raster
  * kind not binary, 0x0 client rect) simply means the vendor has not yet seen this
  * generation, and the next frame re-offers the same one.
  *
@@ -2062,14 +2061,14 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 	}
 
 	// The captured mask request rasters on the ARM (out_mask_req kinds ==
-	// COMP_VK_SPLIT_MASK_* numerically). A BRIDGED authored mask captured no
+	// COMP_HUB_D3D11_MASK_* numerically). A BRIDGED authored mask captured no
 	// raster and gates the composite off its plane instead — the own-legs
 	// capture block's exact exemption.
 	bool mask_ok = false;
 	if (c->out_mask_req.kind != D3D12_OUT_MASK_NONE && c->out_mask_req.count > 0) {
-		mask_ok = comp_vk_split_raster_mask(c->reroute.split, c->out_mask_req.kind, c->out_mask_req.rects,
-		                                    c->out_mask_req.feather, c->out_mask_req.count,
-		                                    c->out_mask_req.w, c->out_mask_req.h);
+		mask_ok = comp_hub_d3d11_raster_mask(c->reroute.split, c->out_mask_req.kind, c->out_mask_req.rects,
+		                                     c->out_mask_req.feather, c->out_mask_req.count, c->out_mask_req.w,
+		                                     c->out_mask_req.h);
 	}
 	if (!mask_ok && !bridged_authored) {
 		return false;
@@ -2088,9 +2087,9 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 	const uint32_t cw = eff_canvas->valid ? eff_canvas->w : region_w;
 	const uint32_t ch = eff_canvas->valid ? eff_canvas->h : region_h;
 
-	comp_vk_split_stage_local2d(c->reroute.split, pl.shared_handle, pl.generation, pl.width, pl.height, hash,
-	                            box.offset.w, box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h,
-	                            region_w, region_h, cx, cy, cw, ch, mode, opaque, mask_is_plane);
+	comp_hub_d3d11_stage_local2d(c->reroute.split, pl.shared_handle, pl.generation, pl.width, pl.height, hash,
+	                             box.offset.w, box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h,
+	                             region_w, region_h, cx, cy, cw, ch, mode, opaque, mask_is_plane);
 
 	/*
 	 * ADR-027 P4 — the hardware zone WISH on this route (the VK caller's
@@ -2108,7 +2107,7 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 			c->reroute.wish_content_sig = sig;
 			c->reroute.wish_seq++;
 		}
-		comp_vk_split_publish_zone_wish(c->reroute.split, c->reroute.wish_seq);
+		comp_hub_d3d11_publish_zone_wish(c->reroute.split, c->reroute.wish_seq);
 	} else {
 		/*
 		 * The wish is WITHDRAWN, not merely unchanged. Drop the signature so the
@@ -2118,7 +2117,7 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 		 * retired would licence it to coalesce the republish away.
 		 */
 		c->reroute.wish_content_sig = 0;
-		comp_vk_split_clear_zone_wish(c->reroute.split);
+		comp_hub_d3d11_clear_zone_wish(c->reroute.split);
 	}
 	return true;
 }
@@ -2668,7 +2667,7 @@ d3d12_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 	}
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	else if (c->reroute.active && c->reroute.split != NULL) {
-		comp_vk_split_request_display_mode(c->reroute.split, true);
+		comp_hub_d3d11_request_display_mode(c->reroute.split, true);
 	}
 #endif
 
@@ -2688,7 +2687,7 @@ d3d12_compositor_end_session(struct xrt_compositor *xc)
 	}
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	else if (c->reroute.active && c->reroute.split != NULL) {
-		comp_vk_split_request_display_mode(c->reroute.split, false);
+		comp_hub_d3d11_request_display_mode(c->reroute.split, false);
 	}
 #endif
 
@@ -3991,7 +3990,7 @@ d3d12_projection_layer_view_count(const struct comp_layer_accum *layers)
  * twin of the D3D11 compositor's pre-split gate — only off the zero-copy path
  * (the atlas must be ours to crop: a repaint is never armed on it), off the
  * #1264 reroute (the d3d11 fill arm owns the weave there and segments with its
- * own manager, comp_vk_split) and while the back buffer matches the client
+ * own manager, comp_hub_d3d11) and while the back buffer matches the client
  * area (the segment rects are window px). A window on the primary screen only
  * stays single-DP, byte for byte. Publishes the table it took for the next
  * xrLocateViews (M3). Weave thread, under c->mutex.
@@ -4689,7 +4688,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		if (c->reroute.active) {
 			if (c->repaint_quit.load(std::memory_order_relaxed) || !c->repaint.armed ||
 			    c->repaint.app_frame_in_progress || c->reroute.split == NULL ||
-			    !comp_vk_split_has_weave_slot(c->reroute.split)) {
+			    !comp_hub_d3d11_has_weave_slot(c->reroute.split)) {
 				c->repaint.bail_armed++;
 				u_repaint_trace_bail_armed(&c->repaint.trace);
 				continue;
@@ -4705,7 +4704,8 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			// chain was the only throttle, and it throttles by FILLING (4-5
 			// deep, every weave 3 periods late on the reference box). Ask the
 			// arm for a frame-latency token first; no token = no fill.
-			if (c->repaint.partition.next_release_ns == 0 && !comp_vk_split_repaint_admit(c->reroute.split)) {
+			if (c->repaint.partition.next_release_ns == 0 &&
+			    !comp_hub_d3d11_repaint_admit(c->reroute.split)) {
 				c->repaint.bail_gate++;
 				u_repaint_trace_bail_gate(&c->repaint.trace);
 				continue;
@@ -4716,8 +4716,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			// between this and fire_t0, so one read serves both: fire_t0 pairs with
 			// fire_t1 for DURATION (trace + #1264 shed), rp_start_ns feeds spacing.
 			const uint64_t rp_start_ns = fire_t0;
-			comp_vk_split_weave_and_present(c->reroute.split, /*is_repaint=*/true,
-			                                &c->reroute.canvas);
+			comp_hub_d3d11_weave_and_present(c->reroute.split, /*is_repaint=*/true, &c->reroute.canvas);
 			c->repaint.count++;
 			const uint64_t fire_t1 = os_monotonic_get_ns();
 			u_repaint_gate_note_repaint(&c->repaint.gate, rp_start_ns);
@@ -5545,7 +5544,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		 * clipped to the intersection (the rung-4 "bottom of the zone is
 		 * cut" finding — the bottom 448 px of an 840x1448 window never
 		 * composited). The arm's own chain follows via the per-frame
-		 * comp_vk_split_resize_target below, which early-outs on same dims.
+		 * comp_hub_d3d11_resize_target below, which early-outs on same dims.
 		 */
 		RECT rr;
 		if (GetClientRect(c->hwnd, &rr) && rr.right > 0 && rr.bottom > 0) {
@@ -5920,7 +5919,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// Follow the window FIRST — the weave target, the composite region
 		// and the canvas below all derive from this frame's dims, and the
 		// call early-outs on same size (steady state costs a compare).
-		(void)comp_vk_split_resize_target(c->reroute.split, tgt_width, tgt_height);
+		(void)comp_hub_d3d11_resize_target(c->reroute.split, tgt_width, tgt_height);
 
 		/*
 		 * #1264 plane transport — the same deposit half the own-legs split
@@ -5971,18 +5970,17 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 						                            (ID3D12Resource *)bp.resource12);
 						c->reroute.bd_copied_hash = bd_hash;
 					}
-					comp_vk_split_stage_backdrop(c->reroute.split, bp.shared_handle,
-					                             bp.generation, bp.width, bp.height, bd_hash,
-					                             bd_box.offset.w, bd_box.offset.h,
-					                             (uint32_t)bd_box.extent.w,
-					                             (uint32_t)bd_box.extent.h, bd_w, bd_h);
+					comp_hub_d3d11_stage_backdrop(c->reroute.split, bp.shared_handle, bp.generation,
+					                              bp.width, bp.height, bd_hash, bd_box.offset.w,
+					                              bd_box.offset.h, (uint32_t)bd_box.extent.w,
+					                              (uint32_t)bd_box.extent.h, bd_w, bd_h);
 					bd_staged = true;
 				}
 			}
 			if (!bd_staged) {
 				// The NULL drop — un-stages the plane so a slot can never
 				// claim a backdrop it has no pixels for.
-				comp_vk_split_stage_backdrop(c->reroute.split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+				comp_hub_d3d11_stage_backdrop(c->reroute.split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 				c->repaint.backdrop_w = 0;
 				c->repaint.backdrop_h = 0;
 			}
@@ -5998,7 +5996,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, tgt_width,
 			    tgt_height, &eff_canvas, /*slot=*/-1, /*is_repaint=*/false);
 			if (!deposited) {
-				comp_vk_split_stage_no_composite(c->reroute.split);
+				comp_hub_d3d11_stage_no_composite(c->reroute.split);
 			}
 		}
 
@@ -6013,14 +6011,14 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		comp_d3d12_deposit_signal(c->reroute.dep, c->command_queue);
 		gpu_wait_idle_app(c);
 
-		struct comp_vk_deposit_handoff rr_handoff = {};
+		struct comp_hub_d3d11_handoff rr_handoff = {};
 		if (comp_d3d12_deposit_get_handoff(c->reroute.dep, &rr_handoff)) {
 			// #1883 / #2218 (#3): the slot carries this frame's segment
 			// partition (by its seq), so the arm crops each segment's views
 			// where this atlas painted them.
-			comp_vk_split_stage_segment_content(c->reroute.split, &c->seg_content);
-			comp_vk_split_submit_atlas(c->reroute.split, &rr_handoff, c->eff_layout.cols,
-			                           c->eff_layout.rows, c->eff_layout.tile_w, c->eff_layout.tile_h);
+			comp_hub_d3d11_stage_segment_content(c->reroute.split, &c->seg_content);
+			comp_hub_d3d11_submit_atlas(c->reroute.split, &rr_handoff, c->eff_layout.cols,
+			                            c->eff_layout.rows, c->eff_layout.tile_w, c->eff_layout.tile_h);
 			comp_d3d12_deposit_note_consumed(c->reroute.dep, rr_handoff.slot);
 			// The PLANE release edge, behind the pre_plane_write wait
 			// submit_atlas just recorded on the same D3D11 immediate
@@ -6042,8 +6040,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 		c->reroute.canvas = rr_canvas;
 
-		const bool rr_wove = comp_vk_split_weave_and_present(c->reroute.split, /*is_repaint=*/false,
-		                                                     &rr_canvas);
+		const bool rr_wove =
+		    comp_hub_d3d11_weave_and_present(c->reroute.split, /*is_repaint=*/false, &rr_canvas);
 
 		// #868: arm the repaint replay exactly as the VK tier does — a frame
 		// that wove nothing keeps the panel's last woven frame and stays
@@ -6060,7 +6058,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 		}
 
-		comp_vk_split_render_diag(c->reroute.split);
+		comp_hub_d3d11_render_diag(c->reroute.split);
 		return XRT_SUCCESS;
 	}
 #endif
@@ -6693,7 +6691,7 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	// the deposit slots and quiesces its own device), then the deposit —
 	// AFTER the repaint join above, since the fill ticks drive the arm.
 	if (c->reroute.split != NULL) {
-		comp_vk_split_destroy(&c->reroute.split);
+		comp_hub_d3d11_destroy(&c->reroute.split);
 	}
 	if (c->reroute.dep != NULL) {
 		comp_d3d12_deposit_destroy(&c->reroute.dep);
@@ -7245,8 +7243,8 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		}
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 		else if (c->reroute.active && c->reroute.split != NULL) {
-			px_ok = comp_vk_split_get_display_pixel_info(c->reroute.split, &disp_px_w, &disp_px_h,
-			                                             &disp_left, &disp_top);
+			px_ok = comp_hub_d3d11_get_display_pixel_info(c->reroute.split, &disp_px_w, &disp_px_h,
+			                                              &disp_left, &disp_top);
 		}
 #endif
 		if (px_ok && disp_px_w > 0 && disp_px_h > 0) {
@@ -7369,7 +7367,7 @@ comp_d3d12_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	if (c->reroute.active && c->reroute.split != NULL) {
 		const bool ok =
-		    comp_vk_split_get_predicted_eye_positions(c->reroute.split, out_eye_pos) && out_eye_pos->valid;
+		    comp_hub_d3d11_get_predicted_eye_positions(c->reroute.split, out_eye_pos) && out_eye_pos->valid;
 		if (ok) {
 			u_eye_history_push(&c->eye_hist, out_eye_pos, (int64_t)os_monotonic_get_ns());
 		}
@@ -7412,7 +7410,7 @@ comp_d3d12_compositor_get_display_dimensions(struct xrt_compositor *xc,
 
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	if (c->reroute.active && c->reroute.split != NULL) {
-		return comp_vk_split_get_display_dimensions(c->reroute.split, out_width_m, out_height_m);
+		return comp_hub_d3d11_get_display_dimensions(c->reroute.split, out_width_m, out_height_m);
 	}
 #endif
 	return xrt_display_processor_d3d12_get_display_dimensions(
@@ -7523,9 +7521,9 @@ comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
 		}
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 		else if (have_reroute_dp) {
-			px_ok = comp_vk_split_get_display_pixel_info(c->reroute.split, &disp_px_w, &disp_px_h,
-			                                             &disp_left, &disp_top);
-			dim_ok = comp_vk_split_get_display_dimensions(c->reroute.split, &disp_w_m, &disp_h_m);
+			px_ok = comp_hub_d3d11_get_display_pixel_info(c->reroute.split, &disp_px_w, &disp_px_h,
+			                                              &disp_left, &disp_top);
+			dim_ok = comp_hub_d3d11_get_display_dimensions(c->reroute.split, &disp_w_m, &disp_h_m);
 		}
 #endif
 		if (!px_ok || disp_px_w == 0 || disp_px_h == 0 || !dim_ok) {
@@ -7608,8 +7606,7 @@ comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 	if (c->reroute.active && c->reroute.split != NULL) {
 		// The d3d11 arm owns the weaver; it quiesces its own device around
 		// the switch, exactly as the VK tier's forward does.
-		return comp_vk_split_request_display_mode(c->reroute.split, enable_3d) ? XRT_SUCCESS
-		                                                                       : XRT_ERROR_D3D12;
+		return comp_hub_d3d11_request_display_mode(c->reroute.split, enable_3d) ? XRT_SUCCESS : XRT_ERROR_D3D12;
 	}
 #endif
 	// #2247: the primary screen stays 2D while the window has wholly left it;
@@ -7652,7 +7649,7 @@ comp_d3d12_compositor_set_screens(struct xrt_compositor *xc,
 	// segments the window; it rebuilds its manager on its next weave (the VK
 	// tier's shape). The copy above stays for the tier's own path.
 	if (c->reroute.active && c->reroute.split != NULL) {
-		comp_vk_split_set_screens(c->reroute.split, list, info, pinned_display_id);
+		comp_hub_d3d11_set_screens(c->reroute.split, list, info, pinned_display_id);
 	}
 #endif
 	// ...and nothing may frame views from the old table meanwhile.
@@ -7676,7 +7673,7 @@ comp_d3d12_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_
 	// own manager and publishes its own table (eyes filled per query, like
 	// below) — the VK tier's shape.
 	if (c->reroute.active && c->reroute.split != NULL) {
-		return comp_vk_split_get_segment_metrics(c->reroute.split, out) && out->count > 0;
+		return comp_hub_d3d11_get_segment_metrics(c->reroute.split, out) && out->count > 0;
 	}
 #endif
 	std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
@@ -7723,7 +7720,7 @@ comp_d3d12_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t 
 	}
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	else if (c->reroute.active && c->reroute.split != NULL) {
-		comp_vk_split_set_eye_tracking_mode(c->reroute.split, mode);
+		comp_hub_d3d11_set_eye_tracking_mode(c->reroute.split, mode);
 	}
 #endif
 }
@@ -7883,9 +7880,9 @@ d3d12_zone_dp_supported(struct comp_d3d12_compositor *c)
  * weaver that in fact advertises zone slots. The tier-1 fallback then fires on the
  * first zones frame and requests hardware 3D, which silently overrides an app's 2D
  * rendering mode for the rest of the session (the mask leg itself was never
- * affected: it publishes through the arm, @ref comp_vk_split_publish_zone_wish).
+ * affected: it publishes through the arm, @ref comp_hub_d3d11_publish_zone_wish).
  *
- * So ask whichever arm owns the weaver. `comp_vk_split_zone_dp_supported` exists
+ * So ask whichever arm owns the weaver. `comp_hub_d3d11_zone_dp_supported` exists
  * for exactly this question -- its own doc says the compositor cannot answer it for
  * a split session.
  */
@@ -7897,7 +7894,7 @@ d3d12_zone_dp_supported_weaving_arm(struct comp_d3d12_compositor *c)
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	weaver_on_arm = (c->reroute.active && c->reroute.split != NULL);
 	if (weaver_on_arm) {
-		arm_consumes = comp_vk_split_zone_dp_supported(c->reroute.split);
+		arm_consumes = comp_hub_d3d11_zone_dp_supported(c->reroute.split);
 	}
 #endif
 	// Shared with the VK tier so the two cannot drift, and unit-tested without
@@ -7998,11 +7995,10 @@ d3d12_bind_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_ma
 			return true;
 		}
 		struct comp_d3d12_deposit_plane mp = {};
-		if (comp_d3d12_deposit_plane_ensure(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_MASK, mask->w,
-		                                    mask->h) &&
+		if (comp_d3d12_deposit_plane_ensure(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_MASK, mask->w, mask->h) &&
 		    comp_d3d12_deposit_plane_get(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_MASK, &mp) &&
-		    comp_vk_split_bind_mask_plane(c->reroute.split, mp.shared_handle, mp.generation, mp.width,
-		                                  mp.height)) {
+		    comp_hub_d3d11_bind_mask_plane(c->reroute.split, mp.shared_handle, mp.generation, mp.width,
+		                                   mp.height)) {
 			c->mask_plane_live = true;
 			c->mask_plane_gen = mask->res_gen;
 		}
@@ -8076,7 +8072,7 @@ d3d12_stage_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_m
 			// 0 un-stages: the recipe stamps the plane invalid rather than
 			// lending an older frame's pixels — the arm's exact contract.
 			if (c->reroute.split != NULL) {
-				comp_vk_split_stage_mask_plane(c->reroute.split, 0, 0, 0);
+				comp_hub_d3d11_stage_mask_plane(c->reroute.split, 0, 0, 0);
 			}
 			return;
 		}
@@ -8118,9 +8114,9 @@ d3d12_stage_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_m
 				c->cmd_list->ResourceBarrier(2, post);
 				c->reroute.mask_copied_key = key;
 			}
-			comp_vk_split_stage_mask_plane(c->reroute.split, key, mask->w, mask->h);
+			comp_hub_d3d11_stage_mask_plane(c->reroute.split, key, mask->w, mask->h);
 		} else {
-			comp_vk_split_stage_mask_plane(c->reroute.split, 0, 0, 0);
+			comp_hub_d3d11_stage_mask_plane(c->reroute.split, 0, 0, 0);
 		}
 		return;
 	}

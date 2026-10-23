@@ -9,7 +9,7 @@
  *
  * The D3D12 flavour of the VK tier's deposit (comp_vk_native_deposit.h — read
  * its topology section first): a ring of D3D11 textures the D3D12 renderer's
- * atlas lands in directly, so the proven d3d11 fill arm (comp_vk_split — which
+ * atlas lands in directly, so the proven d3d11 fill arm (comp_hub_d3d11 — which
  * is Vulkan-free and consumes only the pure-D3D11 handoff struct) can weave and
  * present it. Measured motivation: under real app GPU load the d3d12 out arm
  * serializes (8–9 ms fires; Intel preemption is draw-granular, PRIORITY_HIGH
@@ -21,7 +21,7 @@
  *       D3D11 deposit texture (same adapter, NT-shared, fence-synced)
  *          |  app queue Signal()s a shared ID3D11Fence (opened as ID3D12Fence)
  *          v
- *   comp_vk_split's ingress GPU-waits on the D3D11 immediate context --> the
+ *   comp_hub_d3d11's ingress GPU-waits on the D3D11 immediate context --> the
  *   d3d11-ends comp_xbridge --> the d3d11 out device fill arm
  * @endverbatim
  *
@@ -49,7 +49,7 @@
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_results.h"
 
-#include "vk_native/comp_vk_native_deposit.h" // struct comp_vk_deposit_handoff (pure D3D11/Win32)
+#include "hub_d3d11/comp_hub_d3d11_handoff.h" // struct comp_hub_d3d11_handoff (pure D3D11/Win32)
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -122,11 +122,11 @@ void
 comp_d3d12_deposit_signal(struct comp_d3d12_deposit *dep, void *app_queue);
 
 /*!
- * Fill @p out for comp_vk_split (same contract as the VK deposit's handoff:
+ * Fill @p out for comp_hub_d3d11 (same contract as the VK deposit's handoff:
  * pointers BORROWED, `keyed_mutex` NULL — this flavour is always fence mode).
  */
 bool
-comp_d3d12_deposit_get_handoff(struct comp_d3d12_deposit *dep, struct comp_vk_deposit_handoff *out);
+comp_d3d12_deposit_get_handoff(struct comp_d3d12_deposit *dep, struct comp_hub_d3d11_handoff *out);
 
 /*!
  * The consumer's staging copy of @p slot has been recorded on the D3D11
@@ -166,7 +166,7 @@ comp_d3d12_deposit_note_consumed(struct comp_d3d12_deposit *dep, uint32_t slot);
  */
 struct comp_d3d12_deposit_plane
 {
-	void *shared_handle; //!< `HANDLE` for comp_vk_split_stage_*.
+	void *shared_handle; //!< `HANDLE` for comp_hub_d3d11_stage_*.
 	void *resource12;    //!< `ID3D12Resource *` — the copy destination (COMMON at rest).
 	uint32_t width;
 	uint32_t height;
@@ -184,7 +184,7 @@ comp_d3d12_deposit_plane_get(struct comp_d3d12_deposit *dep, uint32_t plane, str
 
 /*!
  * The d3d11 arm's producer has recorded its reads of every live plane (the
- * caller has just run comp_vk_split_submit_atlas, whose pre_plane_write wait
+ * caller has just run comp_hub_d3d11_submit_atlas, whose pre_plane_write wait
  * sits ahead on the same D3D11 immediate context) — signal the shared fence
  * past every claim so far on that context. One signal covers all planes.
  */

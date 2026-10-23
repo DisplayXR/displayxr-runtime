@@ -19,7 +19,7 @@ true of the *switches* and false of the *mechanisms*:
 |---|---|---|---|
 | **Late weave** | **dormant**, on X11 and Wayland, Intel and NVIDIA | Two problems. (1) The `VK_KHR_present_wait` tier is all `#ifdef XRT_OS_WINDOWS`, even though the runtime already enables `presentId`/`presentWait` on every enable2 device. (2) The vblank-grid tier's only feeder is `VK_GOOGLE_display_timing`, which no Linux desktop driver exposes on a windowed swapchain. | Un-gate the present_wait tier (**S**, #2060), then add grid feeders from `VK_EXT_present_timing` (**M**, #2061) and from `wp_presentation` / X11 Present (**M**, #2062) |
 | **Repaint** | **enable2 apps only** on single-queue GPUs | Tier 2 (`VK_LAYER_DXR_queue_lock`) is injected only by `xrCreateVulkanInstanceKHR`. It has shipped on Linux only since v2.42.0 (#2036). enable1 apps (all shipped native demos, #886) have to enable the layer themselves. | A runtime-armed implicit layer (**S/M**, #2063), or the same-adapter fill engine (#2065) |
-| **Split / weave-on-scanout** | **absent** | `comp_vk_native_split.cpp` is `XRT_OS_WINDOWS && XRT_HAVE_D3D11`: the transport is D3D11/D3D12 end to end | Same-adapter fill engine with its own `VkDevice` (**L**, #2065), then PRIME dma-buf weave-on-scanout (**L**, #2066) |
+| **Split / weave-on-scanout** | **absent** | `hub_d3d11/comp_hub_d3d11.cpp` is `XRT_OS_WINDOWS && XRT_HAVE_D3D11`: the transport is D3D11/D3D12 end to end | Same-adapter fill engine with its own `VkDevice` (**L**, #2065), then PRIME dma-buf weave-on-scanout (**L**, #2066) |
 
 The slot partition (#1257) and the #206 forward horizon consume the same vblank grid and are
 dormant for the same reason. #2064 adds their Linux arm and one log line that names the live
@@ -57,7 +57,7 @@ own `.deb`.
 | Windows D3D11 / D3D12 | DXGI frame-latency waitable + `GetFrameStatistics` vblank grid; #850 governor | `comp_weave_latency_win.h`, the D3D targets | `[WITNESS]` + `DXR_DP_FORWARD_HORIZON_TRACE` rows |
 | Windows VK, multi-queue (NVIDIA) | `VK_KHR_present_wait`: `comp_vk_native_target_acquire` blocks on present id `last − (MAX_LATENCY−1)`; the residual is measured there and fed to `set_frame_timing` | `target_present_wait_fn`, acquire block under `#ifdef XRT_OS_WINDOWS` | no `vkWaitForPresentKHR unavailable` line |
 | Windows VK, Intel (DComp bridge) | DXGI waitable on the bridge swapchain, governor-managed | `dcomp_setup` (`DXR_VK_BRIDGE_PACING`) | `#912: pacing the VK bridge on the DXGI waitable, depth N` |
-| Windows VK under the split | the D3D11 fill arm's own waitable | `comp_vk_native_split.cpp` | `weave placement: … split=1` |
+| Windows VK under the split | the D3D11 fill arm's own waitable | `hub_d3d11/comp_hub_d3d11.cpp` | `weave placement: … split=1` |
 | Android VK | vblank grid from `VK_GOOGLE_display_timing`, then sleep to `next_vblank − (weave_cost + 1.5 ms)` | `target_feed_vblank_grid`; the grid block in `comp_vk_native_target_acquire` | `#902: display-timing grid — refresh …`, `#902: late weave on the measured grid …` |
 | **Linux VK, X11** | grid block compiled, **grid never trusted**; present_wait tier compiled out | same | `#902: display-timing feeder — … has_ext=0` |
 | **Linux VK, Wayland** | same | same | same |
@@ -176,7 +176,7 @@ their own device. The options:
 |---|---|---|
 | Windows D3D11 / D3D12 / VK | **default on**, hybrid and (ADR-039) same-adapter | VK renders into a D3D11 deposit (`comp_vk_native_deposit.cpp`, VK-0). `comp_xbridge` carries it (D3D12 cross-adapter heap, or a same-adapter shared open) to an egress ring on the scanout adapter. A D3D11 fill arm with its **own device and immediate context** does weave, DP, repaint tick and DXGI present. Planes (Local2D, backdrop, authored mask) ride the same slots (VK-1b). Ordered by an `ID3D11Fence` imported as a VK timeline semaphore. |
 | Android | absent | — |
-| **Linux** | **absent** | `comp_vk_native_split.cpp` is `#if defined(XRT_OS_WINDOWS) && defined(XRT_HAVE_D3D11)`; no `weave placement:` line |
+| **Linux** | **absent** | `hub_d3d11/comp_hub_d3d11.cpp` is `#if defined(XRT_OS_WINDOWS) && defined(XRT_HAVE_D3D11)`; no `weave placement:` line |
 
 ADR-039's finding is what makes this matter on a single-GPU Linux laptop, not only on hybrids. The
 split's load-bearing property is **headroom**, not the removed copy: the fill arm ticks about

@@ -2,15 +2,20 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  VK-1 — the in-process Vulkan output-device split (#918 / #1178).
- * @ingroup comp_vk_native
+ * @brief  The D3D11 hub (fill arm): weave + present on a D3D11 device for any producer.
+ * @ingroup comp_hub_d3d11
+ *
+ * Born as VK-1, the in-process Vulkan output-device split (#918 / #1178), in
+ * comp_vk_native (as comp_vk_native_split.cpp); extracted into its own library
+ * by #2317 P1a because it was never Vulkan code. Symbols renamed
+ * comp_vk_split_* -> comp_hub_d3d11_*; behaviour unchanged.
  *
  * Topology, the ordering contract and what this rung deliberately leaves to VK-2
- * are all stated in comp_vk_native_split.h — read that first.
+ * are all stated in hub_d3d11/comp_hub_d3d11.h — read that first.
  */
 
-#include "comp_vk_native_split.h"
-#include "comp_vk_native_deposit.h"
+#include "comp_hub_d3d11.h"
+#include "comp_hub_d3d11_handoff.h"
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_processor_d3d11.h"
@@ -67,7 +72,7 @@
  *
  */
 
-struct comp_vk_split
+struct comp_hub_d3d11
 {
 	struct xrt_device *xdev;
 	HWND hwnd;
@@ -146,7 +151,7 @@ struct comp_vk_split
 	 * backdrop), which the bridge chains must match for the same
 	 * typeless-family reason as dp_input_fmt. The VK deposit's planes are
 	 * BGRA (the default); the d3d12 reroute's are RGBA (its atlas/flatten
-	 * family) and it says so via comp_vk_split_set_plane_format. The mask
+	 * family) and it says so via comp_hub_d3d11_set_plane_format. The mask
 	 * plane stays R8 regardless.
 	 */
 	DXGI_FORMAT plane_fmt;
@@ -244,7 +249,7 @@ struct comp_vk_split
 	 * @name Multi-screen M6 under the split (ADR-047 Amendments 1 + 2)
 	 *
 	 * The D3D11 segment manager, on the OUTPUT device. @ref segments is made
-	 * lazily on the first weave after @ref comp_vk_split_set_screens.
+	 * lazily on the first weave after @ref comp_hub_d3d11_set_screens.
 	 * @{
 	 */
 	struct comp_d3d11_segments *segments;
@@ -350,7 +355,7 @@ split_test_fake_dp_refuse(void)
  * and the caller falls through to the Vulkan factory on the app device.
  */
 static bool
-split_make_dp(struct comp_vk_split *s)
+split_make_dp(struct comp_hub_d3d11 *s)
 {
 	if (s->dp_factory_d3d11 == NULL) {
 		U_LOG_W("VK output-device split: no D3D11 display-processor factory — the scanout adapter "
@@ -436,8 +441,8 @@ split_dp_view_format(ID3D11ShaderResourceView *srv)
 }
 
 static ID3D11ShaderResourceView *
-split_plane_dp_view(struct comp_vk_split *s,
-                    struct comp_vk_split::split_plane_view *v,
+split_plane_dp_view(struct comp_hub_d3d11 *s,
+                    struct comp_hub_d3d11::split_plane_view *v,
                     void *plane_srv,
                     uint64_t content_seq,
                     uint32_t w,
@@ -563,7 +568,7 @@ split_plane_dp_view(struct comp_vk_split *s,
 
 //! Free the raster's four D3D objects. Idempotent.
 static void
-split_release_mask(struct comp_vk_split::split_mask_raster *m)
+split_release_mask(struct comp_hub_d3d11::split_mask_raster *m)
 {
 	if (m->srv != nullptr) {
 		m->srv->Release();
@@ -583,15 +588,15 @@ split_release_mask(struct comp_vk_split::split_mask_raster *m)
 	}
 	m->w = 0;
 	m->h = 0;
-	m->kind = COMP_VK_SPLIT_MASK_NONE;
+	m->kind = COMP_HUB_D3D11_MASK_NONE;
 	m->rect_count = 0;
 }
 
 //! (Re)allocate the R8 RTV + staged SRV pair at @p w x @p h on the OUT device.
 static bool
-split_mask_ensure(struct comp_vk_split *s, uint32_t w, uint32_t h)
+split_mask_ensure(struct comp_hub_d3d11 *s, uint32_t w, uint32_t h)
 {
-	struct comp_vk_split::split_mask_raster *m = &s->mask;
+	struct comp_hub_d3d11::split_mask_raster *m = &s->mask;
 	if (m->tex != nullptr && m->w == w && m->h == h) {
 		return true;
 	}
@@ -638,9 +643,9 @@ split_mask_ensure(struct comp_vk_split *s, uint32_t w, uint32_t h)
 //! One `ClearView` of @p value over @p r, clamped into the raster.
 static void
 split_mask_fill(
-    struct comp_vk_split *s, ID3D11DeviceContext1 *ctx1, const struct xrt_rect *r, int32_t inset, float value)
+    struct comp_hub_d3d11 *s, ID3D11DeviceContext1 *ctx1, const struct xrt_rect *r, int32_t inset, float value)
 {
-	struct comp_vk_split::split_mask_raster *m = &s->mask;
+	struct comp_hub_d3d11::split_mask_raster *m = &s->mask;
 	int32_t left = r->offset.w + inset;
 	int32_t top = r->offset.h + inset;
 	int32_t right = r->offset.w + r->extent.w - inset;
@@ -666,7 +671,7 @@ split_mask_fill(
 }
 
 static void
-split_release_plane_view(struct comp_vk_split::split_plane_view *v)
+split_release_plane_view(struct comp_hub_d3d11::split_plane_view *v)
 {
 	if (v->srv != nullptr) {
 		v->srv->Release();
@@ -682,11 +687,11 @@ split_release_plane_view(struct comp_vk_split::split_plane_view *v)
 }
 
 static void
-split_segments_release(struct comp_vk_split *s);
+split_segments_release(struct comp_hub_d3d11 *s);
 
 //! Release the output half. Idempotent; leaves the borrowed app end alone.
 static void
-split_release_out(struct comp_vk_split *s)
+split_release_out(struct comp_hub_d3d11 *s)
 {
 	if (s->xbridge != NULL) {
 		comp_xbridge_quiesce(s->xbridge);
@@ -697,7 +702,7 @@ split_release_out(struct comp_vk_split *s)
 	 * (#224 P4's clear edge). A session that just disappears leaves the vendor
 	 * unioning a mask nobody owns.
 	 */
-	comp_vk_split_clear_zone_wish(s);
+	comp_hub_d3d11_clear_zone_wish(s);
 	comp_d3d11_outcomp_destroy(&s->outcomp);
 	split_release_mask(&s->mask);
 	s->repaint_mask_srv = NULL;
@@ -756,7 +761,7 @@ split_release_out(struct comp_vk_split *s)
 
 
 static void
-split_destroy_mutexes(struct comp_vk_split *s)
+split_destroy_mutexes(struct comp_hub_d3d11 *s)
 {
 	if (s->mutexes_init) {
 		os_mutex_destroy(&s->seg_mutex);
@@ -781,7 +786,7 @@ split_destroy_mutexes(struct comp_vk_split *s)
  * freshly swapped-in DP). One WARN per edge. Weave thread.
  */
 static void
-split_seg_primary_lens(struct comp_vk_split *s, bool force)
+split_seg_primary_lens(struct comp_hub_d3d11 *s, bool force)
 {
 	const bool uncovered = !comp_d3d11_segments_primary_covered(s->segments);
 	os_mutex_lock(&s->dp_mutex);
@@ -805,12 +810,12 @@ split_seg_primary_lens(struct comp_vk_split *s, bool force)
  * compositor lock held) and return the previous one for the segment manager
  * to destroy. Re-sends the session-level state a new DP has not seen; the
  * per-frame inputs follow, because the hand-off runs before them in
- * @ref comp_vk_split_weave_and_present.
+ * @ref comp_hub_d3d11_weave_and_present.
  */
 static struct xrt_display_processor_d3d11 *
 split_seg_swap_primary_cb(void *userdata, struct xrt_display_processor_d3d11 *dp)
 {
-	struct comp_vk_split *s = static_cast<struct comp_vk_split *>(userdata);
+	struct comp_hub_d3d11 *s = static_cast<struct comp_hub_d3d11 *>(userdata);
 	os_mutex_lock(&s->dp_mutex);
 	struct xrt_display_processor_d3d11 *old = s->dp;
 	s->dp = dp;
@@ -833,7 +838,7 @@ split_seg_swap_primary_cb(void *userdata, struct xrt_display_processor_d3d11 *dp
 
 //! Tear the segment manager down (no window hand-back: the split's DP goes next).
 static void
-split_segments_release(struct comp_vk_split *s)
+split_segments_release(struct comp_hub_d3d11 *s)
 {
 	if (!s->mutexes_init) {
 		return;
@@ -853,14 +858,14 @@ split_segments_release(struct comp_vk_split *s)
  * One metric update for the segment manager, run on the weave thread before
  * any per-frame DP input is sent (a window-handle hand-off may swap @ref dp).
  * Builds the manager on the OUTPUT device on first use or after
- * @ref comp_vk_split_set_screens, reads the window's client rect (device px:
+ * @ref comp_hub_d3d11_set_screens, reads the window's client rect (device px:
  * every DisplayXR executable is per-monitor DPI aware, #1201) and publishes
  * the table this weave took for the next xrLocateViews.
  *
  * @return true when this weave takes the per-segment path.
  */
 static bool
-split_segments_update(struct comp_vk_split *s, uint32_t tgt_w, uint32_t tgt_h, struct comp_seg_rect *out_window)
+split_segments_update(struct comp_hub_d3d11 *s, uint32_t tgt_w, uint32_t tgt_h, struct comp_seg_rect *out_window)
 {
 	bool split = false;
 	struct comp_seg_rect win = {0, 0, 0, 0};
@@ -951,10 +956,10 @@ split_segments_update(struct comp_vk_split *s, uint32_t tgt_w, uint32_t tgt_h, s
 }
 
 extern "C" void
-comp_vk_split_set_screens(struct comp_vk_split *s,
-                          const struct xrt_screen_list *list,
-                          const struct xrt_system_compositor_info *info,
-                          uint64_t pinned_display_id)
+comp_hub_d3d11_set_screens(struct comp_hub_d3d11 *s,
+                           const struct xrt_screen_list *list,
+                           const struct xrt_system_compositor_info *info,
+                           uint64_t pinned_display_id)
 {
 	if (s == nullptr || list == nullptr || info == nullptr) {
 		return;
@@ -981,7 +986,7 @@ comp_vk_split_set_screens(struct comp_vk_split *s,
 }
 
 extern "C" void
-comp_vk_split_stage_segment_content(struct comp_vk_split *s, const struct comp_segments_content *content)
+comp_hub_d3d11_stage_segment_content(struct comp_hub_d3d11 *s, const struct comp_segments_content *content)
 {
 	if (s == nullptr) {
 		return;
@@ -994,7 +999,7 @@ comp_vk_split_stage_segment_content(struct comp_vk_split *s, const struct comp_s
 }
 
 extern "C" bool
-comp_vk_split_get_segment_metrics(struct comp_vk_split *s, struct xrt_segment_metrics *out)
+comp_hub_d3d11_get_segment_metrics(struct comp_hub_d3d11 *s, struct xrt_segment_metrics *out)
 {
 	if (out == nullptr) {
 		return false;
@@ -1032,9 +1037,9 @@ comp_vk_split_get_segment_metrics(struct comp_vk_split *s, struct xrt_segment_me
  */
 
 extern "C" xrt_result_t
-comp_vk_split_stage_a(const struct comp_vk_split_info *info,
-                      struct comp_vk_split **out_split,
-                      const char **out_short_reason)
+comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
+                       struct comp_hub_d3d11 **out_split,
+                       const char **out_short_reason)
 {
 	*out_split = NULL;
 	*out_short_reason = COMP_SPLIT_REASON_KILLED_BY_ENV;
@@ -1122,7 +1127,7 @@ comp_vk_split_stage_a(const struct comp_vk_split_info *info,
 		return XRT_ERROR_COMPOSITOR_NOT_SUPPORTED;
 	}
 
-	struct comp_vk_split *s = U_TYPED_CALLOC(struct comp_vk_split);
+	struct comp_hub_d3d11 *s = U_TYPED_CALLOC(struct comp_hub_d3d11);
 	if (s == NULL) {
 		*out_short_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
 		return XRT_ERROR_ALLOCATION;
@@ -1236,7 +1241,7 @@ comp_vk_split_stage_a(const struct comp_vk_split_info *info,
 }
 
 extern "C" bool
-comp_vk_split_wire_bridge(struct comp_vk_split *s, const struct comp_vk_deposit_handoff *handoff)
+comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11_handoff *handoff)
 {
 	if (s == nullptr || handoff == nullptr || handoff->d3d11_device == nullptr) {
 		U_LOG_W("VK output-device split: no deposit to bridge from (#1178)");
@@ -1402,9 +1407,9 @@ comp_vk_split_wire_bridge(struct comp_vk_split *s, const struct comp_vk_deposit_
 }
 
 extern "C" void
-comp_vk_split_destroy(struct comp_vk_split **split_ptr)
+comp_hub_d3d11_destroy(struct comp_hub_d3d11 **split_ptr)
 {
-	struct comp_vk_split *s = *split_ptr;
+	struct comp_hub_d3d11 *s = *split_ptr;
 	if (s == nullptr) {
 		return;
 	}
@@ -1424,9 +1429,9 @@ comp_vk_split_destroy(struct comp_vk_split **split_ptr)
 }
 
 extern "C" void
-comp_vk_split_retire(struct comp_vk_split **split_ptr, const char *why, const char *short_reason)
+comp_hub_d3d11_retire(struct comp_hub_d3d11 **split_ptr, const char *why, const char *short_reason)
 {
-	struct comp_vk_split *s = *split_ptr;
+	struct comp_hub_d3d11 *s = *split_ptr;
 	if (s == nullptr) {
 		return;
 	}
@@ -1447,7 +1452,7 @@ comp_vk_split_retire(struct comp_vk_split **split_ptr, const char *why, const ch
 	        "session (split=0 reason=%s) (#918)",
 	        short_reason != nullptr ? short_reason : COMP_SPLIT_REASON_STAGE_A_FAILED);
 
-	comp_vk_split_destroy(split_ptr);
+	comp_hub_d3d11_destroy(split_ptr);
 }
 
 
@@ -1460,13 +1465,13 @@ comp_vk_split_retire(struct comp_vk_split **split_ptr, const char *why, const ch
 //! #1264 — the caller's 2D-plane format, defaulting to the VK deposit's BGRA
 //! for every session that never says otherwise (zero-init reads as unset).
 static inline DXGI_FORMAT
-split_plane_fmt(struct comp_vk_split *s)
+split_plane_fmt(struct comp_hub_d3d11 *s)
 {
 	return (s->plane_fmt != DXGI_FORMAT_UNKNOWN) ? s->plane_fmt : DXGI_FORMAT_B8G8R8A8_UNORM;
 }
 
 extern "C" void
-comp_vk_split_set_plane_format(struct comp_vk_split *s, uint32_t dxgi_format)
+comp_hub_d3d11_set_plane_format(struct comp_hub_d3d11 *s, uint32_t dxgi_format)
 {
 	if (s == nullptr) {
 		return;
@@ -1478,18 +1483,18 @@ comp_vk_split_set_plane_format(struct comp_vk_split *s, uint32_t dxgi_format)
 }
 
 extern "C" void
-comp_vk_split_stage_backdrop(struct comp_vk_split *s,
-                             void *nt_handle,
-                             uint64_t generation,
-                             uint32_t alloc_w,
-                             uint32_t alloc_h,
-                             uint64_t content_seq,
-                             int32_t dirty_x,
-                             int32_t dirty_y,
-                             uint32_t dirty_w,
-                             uint32_t dirty_h,
-                             uint32_t bd_w,
-                             uint32_t bd_h)
+comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *s,
+                              void *nt_handle,
+                              uint64_t generation,
+                              uint32_t alloc_w,
+                              uint32_t alloc_h,
+                              uint64_t content_seq,
+                              int32_t dirty_x,
+                              int32_t dirty_y,
+                              uint32_t dirty_w,
+                              uint32_t dirty_h,
+                              uint32_t bd_w,
+                              uint32_t bd_h)
 {
 	if (s == nullptr || s->xbridge == nullptr) {
 		return;
@@ -1536,7 +1541,7 @@ comp_vk_split_stage_backdrop(struct comp_vk_split *s,
 }
 
 extern "C" void
-comp_vk_split_invalidate_plane(struct comp_vk_split *s, uint32_t plane)
+comp_hub_d3d11_invalidate_plane(struct comp_hub_d3d11 *s, uint32_t plane)
 {
 	if (s == nullptr || s->xbridge == nullptr) {
 		return;
@@ -1545,18 +1550,18 @@ comp_vk_split_invalidate_plane(struct comp_vk_split *s, uint32_t plane)
 }
 
 extern "C" bool
-comp_vk_split_raster_mask(struct comp_vk_split *s,
-                          uint32_t kind,
-                          const struct xrt_rect *rects,
-                          const float *feather_px,
-                          uint32_t rect_count,
-                          uint32_t region_w,
-                          uint32_t region_h)
+comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
+                           uint32_t kind,
+                           const struct xrt_rect *rects,
+                           const float *feather_px,
+                           uint32_t rect_count,
+                           uint32_t region_w,
+                           uint32_t region_h)
 {
 	if (s == nullptr || s->out_dev == nullptr || region_w == 0 || region_h == 0) {
 		return false;
 	}
-	if (kind == COMP_VK_SPLIT_MASK_NONE || rect_count == 0 || rects == nullptr) {
+	if (kind == COMP_HUB_D3D11_MASK_NONE || rect_count == 0 || rects == nullptr) {
 		s->repaint_mask_srv = nullptr;
 		return false;
 	}
@@ -1564,7 +1569,7 @@ comp_vk_split_raster_mask(struct comp_vk_split *s,
 		rect_count = XRT_MAX_LAYERS;
 	}
 
-	struct comp_vk_split::split_mask_raster *m = &s->mask;
+	struct comp_hub_d3d11::split_mask_raster *m = &s->mask;
 
 	// Dirty-check on everything the raster is a function of. The steady-state
 	// frame reuses the staged SRV and touches the GPU not at all.
@@ -1574,7 +1579,7 @@ comp_vk_split_raster_mask(struct comp_vk_split *s,
 		if (memcmp(&m->rects[i], &rects[i], sizeof(rects[i])) != 0) {
 			dirty = true;
 		}
-		if (kind == COMP_VK_SPLIT_MASK_ZONE_FEATHER && feather_px != nullptr &&
+		if (kind == COMP_HUB_D3D11_MASK_ZONE_FEATHER && feather_px != nullptr &&
 		    m->feather[i] != feather_px[i]) {
 			dirty = true;
 		}
@@ -1613,18 +1618,18 @@ comp_vk_split_raster_mask(struct comp_vk_split *s,
 	 * extracting all four into one unit touches the shipped D3D11 leg, so it is
 	 * tracked as its own change rather than folded into new Vulkan transport.
 	 */
-	const float base = (kind == COMP_VK_SPLIT_MASK_IMPLICIT) ? 1.0f : 0.0f;
+	const float base = (kind == COMP_HUB_D3D11_MASK_IMPLICIT) ? 1.0f : 0.0f;
 	const float all[4] = {base, 0.0f, 0.0f, 0.0f};
 	s->out_ctx->ClearRenderTargetView(m->rtv, all);
 
 	for (uint32_t i = 0; i < rect_count; i++) {
-		if (kind == COMP_VK_SPLIT_MASK_IMPLICIT) {
+		if (kind == COMP_HUB_D3D11_MASK_IMPLICIT) {
 			// Inverse of the zone raster: M=0 (show the flattened 2D) inside
 			// each Local2D rect, M=1 (keep the weave) everywhere else.
 			split_mask_fill(s, ctx1, &rects[i], 0, 0.0f);
 			continue;
 		}
-		if (kind == COMP_VK_SPLIT_MASK_ZONE_BINARY) {
+		if (kind == COMP_HUB_D3D11_MASK_ZONE_BINARY) {
 			split_mask_fill(s, ctx1, &rects[i], 0, 1.0f);
 			continue;
 		}
@@ -1697,7 +1702,7 @@ comp_vk_split_raster_mask(struct comp_vk_split *s,
  * `composite=false` on the recipe, projection-only frames — and never a retire.
  */
 static bool
-split_ensure_outcomp(struct comp_vk_split *s)
+split_ensure_outcomp(struct comp_hub_d3d11 *s)
 {
 	if (s->outcomp != nullptr) {
 		return true;
@@ -1718,7 +1723,7 @@ split_ensure_outcomp(struct comp_vk_split *s)
 }
 
 extern "C" void
-comp_vk_split_stage_no_composite(struct comp_vk_split *s)
+comp_hub_d3d11_stage_no_composite(struct comp_hub_d3d11 *s)
 {
 	if (s == nullptr || s->xbridge == nullptr) {
 		return;
@@ -1728,25 +1733,25 @@ comp_vk_split_stage_no_composite(struct comp_vk_split *s)
 }
 
 extern "C" void
-comp_vk_split_stage_local2d(struct comp_vk_split *s,
-                            void *nt_handle,
-                            uint64_t generation,
-                            uint32_t alloc_w,
-                            uint32_t alloc_h,
-                            uint64_t content_seq,
-                            int32_t dirty_x,
-                            int32_t dirty_y,
-                            uint32_t dirty_w,
-                            uint32_t dirty_h,
-                            uint32_t region_w,
-                            uint32_t region_h,
-                            int32_t cx,
-                            int32_t cy,
-                            uint32_t cw,
-                            uint32_t ch,
-                            uint32_t composite_mode,
-                            bool opaque_present,
-                            bool mask_is_plane)
+comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *s,
+                             void *nt_handle,
+                             uint64_t generation,
+                             uint32_t alloc_w,
+                             uint32_t alloc_h,
+                             uint64_t content_seq,
+                             int32_t dirty_x,
+                             int32_t dirty_y,
+                             uint32_t dirty_w,
+                             uint32_t dirty_h,
+                             uint32_t region_w,
+                             uint32_t region_h,
+                             int32_t cx,
+                             int32_t cy,
+                             uint32_t cw,
+                             uint32_t ch,
+                             uint32_t composite_mode,
+                             bool opaque_present,
+                             bool mask_is_plane)
 {
 	if (s == nullptr || s->xbridge == nullptr) {
 		return;
@@ -1760,7 +1765,7 @@ comp_vk_split_stage_local2d(struct comp_vk_split *s,
 	 * can composite.
 	 */
 	if (nt_handle == nullptr || content_seq == 0 || region_w == 0 || region_h == 0 || !split_ensure_outcomp(s)) {
-		comp_vk_split_stage_no_composite(s);
+		comp_hub_d3d11_stage_no_composite(s);
 		return;
 	}
 
@@ -1780,7 +1785,7 @@ comp_vk_split_stage_local2d(struct comp_vk_split *s,
 			    "#918 VK-1b: the Local2D plane could not be bound — 2D content does not composite "
 			    "under the split for this session; the 3D weave is unaffected");
 		}
-		comp_vk_split_stage_no_composite(s);
+		comp_hub_d3d11_stage_no_composite(s);
 		return;
 	}
 
@@ -1804,7 +1809,7 @@ comp_vk_split_stage_local2d(struct comp_vk_split *s,
 }
 
 extern "C" bool
-comp_vk_split_bind_mask_plane(struct comp_vk_split *s, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h)
+comp_hub_d3d11_bind_mask_plane(struct comp_hub_d3d11 *s, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h)
 {
 	if (s == nullptr || s->xbridge == nullptr) {
 		return true; // nothing to bind against, and nothing broken
@@ -1829,7 +1834,7 @@ comp_vk_split_bind_mask_plane(struct comp_vk_split *s, void *nt_handle, uint64_t
 }
 
 extern "C" void
-comp_vk_split_stage_mask_plane(struct comp_vk_split *s, uint64_t content_seq, uint32_t w, uint32_t h)
+comp_hub_d3d11_stage_mask_plane(struct comp_hub_d3d11 *s, uint64_t content_seq, uint32_t w, uint32_t h)
 {
 	if (s == nullptr || s->xbridge == nullptr) {
 		return;
@@ -1843,7 +1848,7 @@ comp_vk_split_stage_mask_plane(struct comp_vk_split *s, uint64_t content_seq, ui
 }
 
 extern "C" bool
-comp_vk_split_zone_dp_supported(struct comp_vk_split *s)
+comp_hub_d3d11_zone_dp_supported(struct comp_hub_d3d11 *s)
 {
 	if (s == nullptr || s->dp == nullptr) {
 		return false;
@@ -1862,9 +1867,9 @@ comp_vk_split_zone_dp_supported(struct comp_vk_split *s)
 }
 
 extern "C" void
-comp_vk_split_publish_zone_wish(struct comp_vk_split *s, uint64_t seq)
+comp_hub_d3d11_publish_zone_wish(struct comp_hub_d3d11 *s, uint64_t seq)
 {
-	if (s == nullptr || s->dp == nullptr || s->hwnd == nullptr || !comp_vk_split_zone_dp_supported(s)) {
+	if (s == nullptr || s->dp == nullptr || s->hwnd == nullptr || !comp_hub_d3d11_zone_dp_supported(s)) {
 		return;
 	}
 	/*
@@ -1912,7 +1917,7 @@ comp_vk_split_publish_zone_wish(struct comp_vk_split *s, uint64_t seq)
 		 * a frame whose composite sampled the feather mask still publishes the
 		 * binary one - which is why this reads the raster's KIND, not just its SRV.
 		 */
-		if (s->mask.srv == nullptr || s->mask.kind != COMP_VK_SPLIT_MASK_ZONE_BINARY) {
+		if (s->mask.srv == nullptr || s->mask.kind != COMP_HUB_D3D11_MASK_ZONE_BINARY) {
 			return;
 		}
 		srv = s->mask.srv;
@@ -1936,7 +1941,7 @@ comp_vk_split_publish_zone_wish(struct comp_vk_split *s, uint64_t seq)
 }
 
 extern "C" void
-comp_vk_split_clear_zone_wish(struct comp_vk_split *s)
+comp_hub_d3d11_clear_zone_wish(struct comp_hub_d3d11 *s)
 {
 	if (s == nullptr || s->dp == nullptr || !s->zone_published) {
 		return;
@@ -1946,7 +1951,7 @@ comp_vk_split_clear_zone_wish(struct comp_vk_split *s)
 }
 
 extern "C" void
-comp_vk_split_set_hud(struct comp_vk_split *s, const void *pixels, uint32_t w, uint32_t h, bool dirty)
+comp_hub_d3d11_set_hud(struct comp_hub_d3d11 *s, const void *pixels, uint32_t w, uint32_t h, bool dirty)
 {
 	if (s == nullptr || s->out_dev == nullptr) {
 		return;
@@ -1985,12 +1990,12 @@ comp_vk_split_set_hud(struct comp_vk_split *s, const void *pixels, uint32_t w, u
 }
 
 extern "C" void
-comp_vk_split_submit_atlas(struct comp_vk_split *s,
-                           const struct comp_vk_deposit_handoff *handoff,
-                           uint32_t cols,
-                           uint32_t rows,
-                           uint32_t view_w,
-                           uint32_t view_h)
+comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *s,
+                            const struct comp_hub_d3d11_handoff *handoff,
+                            uint32_t cols,
+                            uint32_t rows,
+                            uint32_t view_w,
+                            uint32_t view_h)
 {
 	if (s == nullptr || s->xbridge == nullptr || handoff == nullptr || handoff->texture == nullptr) {
 		return;
@@ -2151,7 +2156,7 @@ comp_vk_split_submit_atlas(struct comp_vk_split *s,
  * is presented regardless.
  */
 static bool
-split_composite(struct comp_vk_split *s, int32_t slot, bool is_repaint, ID3D11Texture2D *dst)
+split_composite(struct comp_hub_d3d11 *s, int32_t slot, bool is_repaint, ID3D11Texture2D *dst)
 {
 	if (s->outcomp == nullptr || dst == nullptr) {
 		return false;
@@ -2276,10 +2281,10 @@ split_composite(struct comp_vk_split *s, int32_t slot, bool is_repaint, ID3D11Te
  *
  * Not a bridge plane and not transported: `u_hud` rasterises to a CPU buffer, so
  * the bitmap was uploaded straight to an out-device texture by
- * @ref comp_vk_split_set_hud. Same shape as `d3d11_render_hud_overlay`'s.
+ * @ref comp_hub_d3d11_set_hud. Same shape as `d3d11_render_hud_overlay`'s.
  */
 static void
-split_draw_hud(struct comp_vk_split *s, ID3D11Texture2D *dst, uint32_t tgt_w, uint32_t tgt_h)
+split_draw_hud(struct comp_hub_d3d11 *s, ID3D11Texture2D *dst, uint32_t tgt_w, uint32_t tgt_h)
 {
 	if (!s->hud_live || s->hud_tex == nullptr || dst == nullptr) {
 		return;
@@ -2298,7 +2303,7 @@ split_draw_hud(struct comp_vk_split *s, ID3D11Texture2D *dst, uint32_t tgt_w, ui
  * hysteresis is holding a worst-case egress ring.
  */
 static ID3D11ShaderResourceView *
-split_crop_for_dp(struct comp_vk_split *s, ID3D11ShaderResourceView *src_srv, uint32_t content_w, uint32_t content_h)
+split_crop_for_dp(struct comp_hub_d3d11 *s, ID3D11ShaderResourceView *src_srv, uint32_t content_w, uint32_t content_h)
 {
 	if (src_srv == nullptr) {
 		return nullptr;
@@ -2384,7 +2389,7 @@ split_crop_for_dp(struct comp_vk_split *s, ID3D11ShaderResourceView *src_srv, ui
 }
 
 extern "C" bool
-comp_vk_split_resize_target(struct comp_vk_split *s, uint32_t width, uint32_t height)
+comp_hub_d3d11_resize_target(struct comp_hub_d3d11 *s, uint32_t width, uint32_t height)
 {
 	if (s == nullptr || s->target == nullptr || width == 0 || height == 0) {
 		return false;
@@ -2440,7 +2445,7 @@ comp_vk_split_resize_target(struct comp_vk_split *s, uint32_t width, uint32_t he
  * defect rather than a frame of latency.
  */
 static void
-split_check_target_follows_window(struct comp_vk_split *s, uint32_t tgt_w, uint32_t tgt_h)
+split_check_target_follows_window(struct comp_hub_d3d11 *s, uint32_t tgt_w, uint32_t tgt_h)
 {
 	if (s->hwnd == nullptr) {
 		return;
@@ -2475,13 +2480,13 @@ split_check_target_follows_window(struct comp_vk_split *s, uint32_t tgt_w, uint3
 	    "composed for the CHAIN's geometry and DXGI then scales or clips it into the window, so the picture "
 	    "keeps the old size while the atlas, the content box, the egress ring and every [RENDER] counter "
 	    "track the window correctly and read healthy. Whatever moved the window did not reach "
-	    "comp_vk_split_resize_target (#1178).",
+	    "comp_hub_d3d11_resize_target (#1178).",
 	    win_w, win_h, tgt_w, tgt_h, (unsigned long long)((now - s->tgt_drift_since_ns) / (1000 * 1000)),
 	    (unsigned long long)s->tgt_drift_frames);
 }
 
 extern "C" bool
-comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const struct xrt_rect *canvas)
+comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_rect *canvas)
 {
 	if (s == nullptr || s->xbridge == nullptr || s->target == nullptr || s->dp == nullptr) {
 		return false;
@@ -2741,19 +2746,19 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 }
 
 extern "C" bool
-comp_vk_split_has_weave_slot(struct comp_vk_split *s)
+comp_hub_d3d11_has_weave_slot(struct comp_hub_d3d11 *s)
 {
 	return s != nullptr && s->xbridge != nullptr && comp_xbridge_get_weave_slot(s->xbridge) >= 0;
 }
 
 extern "C" bool
-comp_vk_split_repaint_admit(struct comp_vk_split *s)
+comp_hub_d3d11_repaint_admit(struct comp_hub_d3d11 *s)
 {
 	return s == nullptr || s->target == nullptr || comp_d3d11_target_repaint_admit(s->target);
 }
 
 extern "C" void
-comp_vk_split_set_app_paced(struct comp_vk_split *s, bool paced)
+comp_hub_d3d11_set_app_paced(struct comp_hub_d3d11 *s, bool paced)
 {
 	if (s == nullptr || s->target == nullptr) {
 		return;
@@ -2762,7 +2767,7 @@ comp_vk_split_set_app_paced(struct comp_vk_split *s, bool paced)
 }
 
 extern "C" void
-comp_vk_split_render_diag(struct comp_vk_split *s)
+comp_hub_d3d11_render_diag(struct comp_hub_d3d11 *s)
 {
 	if (s == nullptr || s->xbridge == nullptr) {
 		return;
@@ -2831,7 +2836,7 @@ comp_vk_split_render_diag(struct comp_vk_split *s)
  */
 
 extern "C" bool
-comp_vk_split_get_predicted_eye_positions(struct comp_vk_split *s, struct xrt_eye_positions *out_eye_pos)
+comp_hub_d3d11_get_predicted_eye_positions(struct comp_hub_d3d11 *s, struct xrt_eye_positions *out_eye_pos)
 {
 	if (s == nullptr) {
 		return false;
@@ -2843,7 +2848,7 @@ comp_vk_split_get_predicted_eye_positions(struct comp_vk_split *s, struct xrt_ey
 }
 
 extern "C" bool
-comp_vk_split_get_display_dimensions(struct comp_vk_split *s, float *out_width_m, float *out_height_m)
+comp_hub_d3d11_get_display_dimensions(struct comp_hub_d3d11 *s, float *out_width_m, float *out_height_m)
 {
 	if (s == nullptr) {
 		return false;
@@ -2856,8 +2861,8 @@ comp_vk_split_get_display_dimensions(struct comp_vk_split *s, float *out_width_m
 }
 
 extern "C" bool
-comp_vk_split_get_display_pixel_info(
-    struct comp_vk_split *s, uint32_t *out_width_px, uint32_t *out_height_px, int32_t *out_left, int32_t *out_top)
+comp_hub_d3d11_get_display_pixel_info(
+    struct comp_hub_d3d11 *s, uint32_t *out_width_px, uint32_t *out_height_px, int32_t *out_left, int32_t *out_top)
 {
 	if (s == nullptr) {
 		return false;
@@ -2870,7 +2875,7 @@ comp_vk_split_get_display_pixel_info(
 }
 
 extern "C" bool
-comp_vk_split_request_display_mode(struct comp_vk_split *s, bool enable_3d)
+comp_hub_d3d11_request_display_mode(struct comp_hub_d3d11 *s, bool enable_3d)
 {
 	if (s == nullptr) {
 		return false;
@@ -2889,7 +2894,7 @@ comp_vk_split_request_display_mode(struct comp_vk_split *s, bool enable_3d)
 }
 
 extern "C" void
-comp_vk_split_set_eye_tracking_mode(struct comp_vk_split *s, uint32_t mode)
+comp_hub_d3d11_set_eye_tracking_mode(struct comp_hub_d3d11 *s, uint32_t mode)
 {
 	if (s == nullptr) {
 		return;
@@ -2905,7 +2910,7 @@ comp_vk_split_set_eye_tracking_mode(struct comp_vk_split *s, uint32_t mode)
 }
 
 extern "C" bool
-comp_vk_split_get_background_preview(struct comp_vk_split *s, struct xrt_dp_background_preview *out_preview)
+comp_hub_d3d11_get_background_preview(struct comp_hub_d3d11 *s, struct xrt_dp_background_preview *out_preview)
 {
 	if (s == nullptr || out_preview == nullptr) {
 		return false;
@@ -2921,9 +2926,9 @@ comp_vk_split_get_background_preview(struct comp_vk_split *s, struct xrt_dp_back
 #else /* !(XRT_OS_WINDOWS && XRT_HAVE_D3D11) */
 
 extern "C" xrt_result_t
-comp_vk_split_stage_a(const struct comp_vk_split_info *info,
-                      struct comp_vk_split **out_split,
-                      const char **out_short_reason)
+comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
+                       struct comp_hub_d3d11 **out_split,
+                       const char **out_short_reason)
 {
 	(void)info;
 	*out_split = NULL;
@@ -2938,7 +2943,7 @@ comp_vk_split_stage_a(const struct comp_vk_split_info *info,
 }
 
 extern "C" bool
-comp_vk_split_wire_bridge(struct comp_vk_split *split, const struct comp_vk_deposit_handoff *handoff)
+comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *split, const struct comp_hub_d3d11_handoff *handoff)
 {
 	(void)split;
 	(void)handoff;
@@ -2946,13 +2951,13 @@ comp_vk_split_wire_bridge(struct comp_vk_split *split, const struct comp_vk_depo
 }
 
 extern "C" void
-comp_vk_split_destroy(struct comp_vk_split **split_ptr)
+comp_hub_d3d11_destroy(struct comp_hub_d3d11 **split_ptr)
 {
 	(void)split_ptr;
 }
 
 extern "C" void
-comp_vk_split_retire(struct comp_vk_split **split_ptr, const char *why, const char *short_reason)
+comp_hub_d3d11_retire(struct comp_hub_d3d11 **split_ptr, const char *why, const char *short_reason)
 {
 	(void)split_ptr;
 	(void)why;
@@ -2960,12 +2965,12 @@ comp_vk_split_retire(struct comp_vk_split **split_ptr, const char *why, const ch
 }
 
 extern "C" void
-comp_vk_split_submit_atlas(struct comp_vk_split *split,
-                           const struct comp_vk_deposit_handoff *handoff,
-                           uint32_t cols,
-                           uint32_t rows,
-                           uint32_t view_w,
-                           uint32_t view_h)
+comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *split,
+                            const struct comp_hub_d3d11_handoff *handoff,
+                            uint32_t cols,
+                            uint32_t rows,
+                            uint32_t view_w,
+                            uint32_t view_h)
 {
 	(void)split;
 	(void)handoff;
@@ -2976,18 +2981,18 @@ comp_vk_split_submit_atlas(struct comp_vk_split *split,
 }
 
 extern "C" void
-comp_vk_split_stage_backdrop(struct comp_vk_split *split,
-                             void *nt_handle,
-                             uint64_t generation,
-                             uint32_t alloc_w,
-                             uint32_t alloc_h,
-                             uint64_t content_seq,
-                             int32_t dirty_x,
-                             int32_t dirty_y,
-                             uint32_t dirty_w,
-                             uint32_t dirty_h,
-                             uint32_t bd_w,
-                             uint32_t bd_h)
+comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *split,
+                              void *nt_handle,
+                              uint64_t generation,
+                              uint32_t alloc_w,
+                              uint32_t alloc_h,
+                              uint64_t content_seq,
+                              int32_t dirty_x,
+                              int32_t dirty_y,
+                              uint32_t dirty_w,
+                              uint32_t dirty_h,
+                              uint32_t bd_w,
+                              uint32_t bd_h)
 {
 	(void)split;
 	(void)nt_handle;
@@ -3004,20 +3009,20 @@ comp_vk_split_stage_backdrop(struct comp_vk_split *split,
 }
 
 extern "C" void
-comp_vk_split_invalidate_plane(struct comp_vk_split *split, uint32_t plane)
+comp_hub_d3d11_invalidate_plane(struct comp_hub_d3d11 *split, uint32_t plane)
 {
 	(void)split;
 	(void)plane;
 }
 
 extern "C" bool
-comp_vk_split_raster_mask(struct comp_vk_split *split,
-                          uint32_t kind,
-                          const struct xrt_rect *rects,
-                          const float *feather_px,
-                          uint32_t rect_count,
-                          uint32_t region_w,
-                          uint32_t region_h)
+comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *split,
+                           uint32_t kind,
+                           const struct xrt_rect *rects,
+                           const float *feather_px,
+                           uint32_t rect_count,
+                           uint32_t region_w,
+                           uint32_t region_h)
 {
 	(void)split;
 	(void)kind;
@@ -3030,25 +3035,25 @@ comp_vk_split_raster_mask(struct comp_vk_split *split,
 }
 
 extern "C" void
-comp_vk_split_stage_local2d(struct comp_vk_split *split,
-                            void *nt_handle,
-                            uint64_t generation,
-                            uint32_t alloc_w,
-                            uint32_t alloc_h,
-                            uint64_t content_seq,
-                            int32_t dirty_x,
-                            int32_t dirty_y,
-                            uint32_t dirty_w,
-                            uint32_t dirty_h,
-                            uint32_t region_w,
-                            uint32_t region_h,
-                            int32_t cx,
-                            int32_t cy,
-                            uint32_t cw,
-                            uint32_t ch,
-                            uint32_t composite_mode,
-                            bool opaque_present,
-                            bool mask_is_plane)
+comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *split,
+                             void *nt_handle,
+                             uint64_t generation,
+                             uint32_t alloc_w,
+                             uint32_t alloc_h,
+                             uint64_t content_seq,
+                             int32_t dirty_x,
+                             int32_t dirty_y,
+                             uint32_t dirty_w,
+                             uint32_t dirty_h,
+                             uint32_t region_w,
+                             uint32_t region_h,
+                             int32_t cx,
+                             int32_t cy,
+                             uint32_t cw,
+                             uint32_t ch,
+                             uint32_t composite_mode,
+                             bool opaque_present,
+                             bool mask_is_plane)
 {
 	(void)split;
 	(void)nt_handle;
@@ -3072,13 +3077,14 @@ comp_vk_split_stage_local2d(struct comp_vk_split *split,
 }
 
 extern "C" void
-comp_vk_split_stage_no_composite(struct comp_vk_split *split)
+comp_hub_d3d11_stage_no_composite(struct comp_hub_d3d11 *split)
 {
 	(void)split;
 }
 
 extern "C" bool
-comp_vk_split_bind_mask_plane(struct comp_vk_split *split, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h)
+comp_hub_d3d11_bind_mask_plane(
+    struct comp_hub_d3d11 *split, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h)
 {
 	(void)split;
 	(void)nt_handle;
@@ -3089,7 +3095,7 @@ comp_vk_split_bind_mask_plane(struct comp_vk_split *split, void *nt_handle, uint
 }
 
 extern "C" void
-comp_vk_split_stage_mask_plane(struct comp_vk_split *split, uint64_t content_seq, uint32_t w, uint32_t h)
+comp_hub_d3d11_stage_mask_plane(struct comp_hub_d3d11 *split, uint64_t content_seq, uint32_t w, uint32_t h)
 {
 	(void)split;
 	(void)content_seq;
@@ -3098,27 +3104,27 @@ comp_vk_split_stage_mask_plane(struct comp_vk_split *split, uint64_t content_seq
 }
 
 extern "C" bool
-comp_vk_split_zone_dp_supported(struct comp_vk_split *split)
+comp_hub_d3d11_zone_dp_supported(struct comp_hub_d3d11 *split)
 {
 	(void)split;
 	return false;
 }
 
 extern "C" void
-comp_vk_split_publish_zone_wish(struct comp_vk_split *split, uint64_t seq)
+comp_hub_d3d11_publish_zone_wish(struct comp_hub_d3d11 *split, uint64_t seq)
 {
 	(void)split;
 	(void)seq;
 }
 
 extern "C" void
-comp_vk_split_clear_zone_wish(struct comp_vk_split *split)
+comp_hub_d3d11_clear_zone_wish(struct comp_hub_d3d11 *split)
 {
 	(void)split;
 }
 
 extern "C" void
-comp_vk_split_set_hud(struct comp_vk_split *split, const void *pixels, uint32_t w, uint32_t h, bool dirty)
+comp_hub_d3d11_set_hud(struct comp_hub_d3d11 *split, const void *pixels, uint32_t w, uint32_t h, bool dirty)
 {
 	(void)split;
 	(void)pixels;
@@ -3128,7 +3134,7 @@ comp_vk_split_set_hud(struct comp_vk_split *split, const void *pixels, uint32_t 
 }
 
 extern "C" bool
-comp_vk_split_resize_target(struct comp_vk_split *split, uint32_t width, uint32_t height)
+comp_hub_d3d11_resize_target(struct comp_hub_d3d11 *split, uint32_t width, uint32_t height)
 {
 	(void)split;
 	(void)width;
@@ -3137,7 +3143,7 @@ comp_vk_split_resize_target(struct comp_vk_split *split, uint32_t width, uint32_
 }
 
 extern "C" bool
-comp_vk_split_weave_and_present(struct comp_vk_split *split, bool is_repaint, const struct xrt_rect *canvas)
+comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *split, bool is_repaint, const struct xrt_rect *canvas)
 {
 	(void)split;
 	(void)is_repaint;
@@ -3146,20 +3152,20 @@ comp_vk_split_weave_and_present(struct comp_vk_split *split, bool is_repaint, co
 }
 
 extern "C" bool
-comp_vk_split_has_weave_slot(struct comp_vk_split *split)
+comp_hub_d3d11_has_weave_slot(struct comp_hub_d3d11 *split)
 {
 	(void)split;
 	return false;
 }
 
 extern "C" void
-comp_vk_split_render_diag(struct comp_vk_split *split)
+comp_hub_d3d11_render_diag(struct comp_hub_d3d11 *split)
 {
 	(void)split;
 }
 
 extern "C" bool
-comp_vk_split_get_predicted_eye_positions(struct comp_vk_split *split, struct xrt_eye_positions *out_eye_pos)
+comp_hub_d3d11_get_predicted_eye_positions(struct comp_hub_d3d11 *split, struct xrt_eye_positions *out_eye_pos)
 {
 	(void)split;
 	(void)out_eye_pos;
@@ -3167,7 +3173,7 @@ comp_vk_split_get_predicted_eye_positions(struct comp_vk_split *split, struct xr
 }
 
 extern "C" bool
-comp_vk_split_get_display_dimensions(struct comp_vk_split *split, float *out_width_m, float *out_height_m)
+comp_hub_d3d11_get_display_dimensions(struct comp_hub_d3d11 *split, float *out_width_m, float *out_height_m)
 {
 	(void)split;
 	(void)out_width_m;
@@ -3176,11 +3182,8 @@ comp_vk_split_get_display_dimensions(struct comp_vk_split *split, float *out_wid
 }
 
 extern "C" bool
-comp_vk_split_get_display_pixel_info(struct comp_vk_split *split,
-                                     uint32_t *out_width_px,
-                                     uint32_t *out_height_px,
-                                     int32_t *out_left,
-                                     int32_t *out_top)
+comp_hub_d3d11_get_display_pixel_info(
+    struct comp_hub_d3d11 *split, uint32_t *out_width_px, uint32_t *out_height_px, int32_t *out_left, int32_t *out_top)
 {
 	(void)split;
 	(void)out_width_px;
@@ -3191,7 +3194,7 @@ comp_vk_split_get_display_pixel_info(struct comp_vk_split *split,
 }
 
 extern "C" bool
-comp_vk_split_request_display_mode(struct comp_vk_split *split, bool enable_3d)
+comp_hub_d3d11_request_display_mode(struct comp_hub_d3d11 *split, bool enable_3d)
 {
 	(void)split;
 	(void)enable_3d;
@@ -3199,14 +3202,14 @@ comp_vk_split_request_display_mode(struct comp_vk_split *split, bool enable_3d)
 }
 
 extern "C" void
-comp_vk_split_set_eye_tracking_mode(struct comp_vk_split *split, uint32_t mode)
+comp_hub_d3d11_set_eye_tracking_mode(struct comp_hub_d3d11 *split, uint32_t mode)
 {
 	(void)split;
 	(void)mode;
 }
 
 extern "C" bool
-comp_vk_split_get_background_preview(struct comp_vk_split *split, struct xrt_dp_background_preview *out_preview)
+comp_hub_d3d11_get_background_preview(struct comp_hub_d3d11 *split, struct xrt_dp_background_preview *out_preview)
 {
 	(void)split;
 	(void)out_preview;
@@ -3214,10 +3217,10 @@ comp_vk_split_get_background_preview(struct comp_vk_split *split, struct xrt_dp_
 }
 
 extern "C" void
-comp_vk_split_set_screens(struct comp_vk_split *split,
-                          const struct xrt_screen_list *list,
-                          const struct xrt_system_compositor_info *info,
-                          uint64_t pinned_display_id)
+comp_hub_d3d11_set_screens(struct comp_hub_d3d11 *split,
+                           const struct xrt_screen_list *list,
+                           const struct xrt_system_compositor_info *info,
+                           uint64_t pinned_display_id)
 {
 	(void)split;
 	(void)list;
@@ -3226,14 +3229,14 @@ comp_vk_split_set_screens(struct comp_vk_split *split,
 }
 
 extern "C" void
-comp_vk_split_stage_segment_content(struct comp_vk_split *split, const struct comp_segments_content *content)
+comp_hub_d3d11_stage_segment_content(struct comp_hub_d3d11 *split, const struct comp_segments_content *content)
 {
 	(void)split;
 	(void)content;
 }
 
 extern "C" bool
-comp_vk_split_get_segment_metrics(struct comp_vk_split *split, struct xrt_segment_metrics *out)
+comp_hub_d3d11_get_segment_metrics(struct comp_hub_d3d11 *split, struct xrt_segment_metrics *out)
 {
 	(void)split;
 	if (out != NULL) {

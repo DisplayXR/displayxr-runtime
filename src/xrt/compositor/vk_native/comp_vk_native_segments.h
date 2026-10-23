@@ -11,8 +11,8 @@
  * processor of ITS screen, a pre-cropped atlas holding exactly that segment's
  * views, `canvas = segment rect`, and its own present origin; the results are
  * composited into the one presented surface. A segment with no DP for its
- * screen (a plug-in without `create_dp_vk_for_screen`), or whose DP needs 1:1 pixels on a resampled screen, gets a flat 2D
- * blit of one view instead.
+ * screen (a plug-in without `create_dp_vk_for_screen`), or whose DP needs 1:1 pixels on a resampled screen, gets a flat
+ * 2D blit of one view instead.
  *
  * The session's primary DP (`comp_vk_native_compositor::display_processor`)
  * keeps weaving the primary screen's segment, and it keeps owning everything
@@ -40,7 +40,7 @@
  * runs. On Linux every segment DP is windowless and no hooks are set.
  * Under the Vulkan #918 split the weave is a D3D11 one on the scanout adapter
  * and this module is not used: the split segments with the D3D11 manager
- * (comp_vk_native_split.cpp).
+ * (hub_d3d11/comp_hub_d3d11.cpp).
  * Design note: docs/architecture/comp-segments.md.
  */
 

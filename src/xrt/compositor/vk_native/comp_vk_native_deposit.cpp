@@ -1136,7 +1136,7 @@ comp_vk_deposit_plane_wait_value(struct comp_vk_deposit *dep)
 }
 
 extern "C" bool
-comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_vk_deposit_handoff *out)
+comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_hub_d3d11_handoff *out)
 {
 	if (dep == NULL || out == NULL || dep->dx == NULL) {
 		return false;
@@ -1427,7 +1427,7 @@ comp_vk_deposit_get_timeline(struct comp_vk_deposit *dep)
 }
 
 extern "C" bool
-comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_vk_deposit_handoff *out)
+comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_hub_d3d11_handoff *out)
 {
 	(void)dep;
 	(void)out;

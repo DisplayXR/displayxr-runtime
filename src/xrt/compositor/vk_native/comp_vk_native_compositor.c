@@ -13,7 +13,7 @@
 
 #include "comp_vk_native_compositor.h"
 #include "comp_vk_native_deposit.h"
-#include "comp_vk_native_split.h"
+#include "hub_d3d11/comp_hub_d3d11.h"
 #include "comp_vk_native_swapchain.h"
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_renderer.h"
@@ -100,7 +100,7 @@
 #include "d3d11/comp_d3d11_window.h"
 // #918 Phase 3 — the shared `weave placement:` line, plus the canonical reason
 // tokens. This compositor DOES have an output-device split (VK-1, #1178), but
-// every call into the transport goes through comp_vk_native_split.h; what is
+// every call into the transport goes through hub_d3d11/comp_hub_d3d11.h; what is
 // needed here are the reason tokens and, since VK-1b, the PLANE indices the
 // plane pass stages against. Both are macros — still no direct bridge call.
 #include "d3d/d3d_weave_placement.h"
@@ -431,10 +431,10 @@ struct comp_vk_native_compositor
 	 * Non-NULL ⟹ the weave, the repaint tick and the present live on the
 	 * SCANOUT adapter and this compositor's Vulkan display processor and
 	 * Vulkan target were never created. Everything the split owns is behind
-	 * the opaque handle — see comp_vk_native_split.h.
+	 * the opaque handle — see hub_d3d11/comp_hub_d3d11.h.
 	 * @{
 	 */
-	struct comp_vk_split *split;
+	struct comp_hub_d3d11 *split;
 
 	//! Packed LUID of the VkPhysicalDevice — the split's gate and the
 	//! `weave placement:` line both need it, resolved once.
@@ -2414,7 +2414,7 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 		// bound on a signal it just deleted. Same key as everywhere else:
 		// this compositor's own grid, not the process-wide state.
 		if (c->split != NULL) {
-			comp_vk_split_set_app_paced(c->split, c->repaint.partition.next_release_ns != 0);
+			comp_hub_d3d11_set_app_paced(c->split, c->repaint.partition.next_release_ns != 0);
 		}
 #endif
 	}
@@ -2515,7 +2515,7 @@ vk_repaint_disarm_locked(struct comp_vk_native_compositor *c)
  * So the dispatch lives here, in one function whose contract is the whole
  * invariant: **the output follows the window**. A third output owner has to be
  * added to this function or it will present at the wrong size — and the tripwire
- * in `comp_vk_split_weave_and_present` says so out loud if one ever is not.
+ * in `comp_hub_d3d11_weave_and_present` says so out loud if one ever is not.
  *
  * Caller MUST hold c->mutex.
  */
@@ -2527,7 +2527,7 @@ vk_output_follow_window_locked(struct comp_vk_native_compositor *c, uint32_t wid
 		// The scanout chain is the runtime's own, on the runtime's own
 		// device; no Vulkan object is involved and there is nothing to
 		// drain on the app's Vulkan device.
-		(void)comp_vk_split_resize_target(c->split, width, height);
+		(void)comp_hub_d3d11_resize_target(c->split, width, height);
 		return;
 	}
 #endif
@@ -3554,7 +3554,7 @@ vk_dp_display_pixel_info(
 {
 #ifdef XRT_OS_WINDOWS
 	if (c->split != NULL) {
-		return comp_vk_split_get_display_pixel_info(c->split, out_w, out_h, out_left, out_top);
+		return comp_hub_d3d11_get_display_pixel_info(c->split, out_w, out_h, out_left, out_top);
 	}
 #endif
 #ifdef XRT_OS_WINDOWS
@@ -3578,7 +3578,7 @@ vk_dp_display_dimensions(struct comp_vk_native_compositor *c, float *out_w_m, fl
 {
 #ifdef XRT_OS_WINDOWS
 	if (c->split != NULL) {
-		return comp_vk_split_get_display_dimensions(c->split, out_w_m, out_h_m);
+		return comp_hub_d3d11_get_display_dimensions(c->split, out_w_m, out_h_m);
 	}
 #endif
 #ifdef XRT_OS_WINDOWS
@@ -3601,7 +3601,7 @@ vk_dp_predicted_eyes(struct comp_vk_native_compositor *c, struct xrt_eye_positio
 	bool ok;
 #ifdef XRT_OS_WINDOWS
 	if (c->split != NULL) {
-		ok = comp_vk_split_get_predicted_eye_positions(c->split, out_eye_pos);
+		ok = comp_hub_d3d11_get_predicted_eye_positions(c->split, out_eye_pos);
 	} else {
 		os_mutex_lock(&c->dp_swap_mutex); // ADR-047 Amendment 2 swap
 		ok = c->display_processor != NULL &&
@@ -5942,7 +5942,7 @@ vk_segments_hwnd_bracket_cb(void *userdata, bool begin, struct xrt_display_proce
  *   window's own monitor, in that monitor's device px — not a desktop rect
  *   (docs/specs/runtime/wayland-window-geometry.md, M2 follow-up);
  * - Windows under the #918 split (the weave is the split's D3D11 one, which
- *   segments with the D3D11 manager inside comp_vk_native_split.cpp — here
+ *   segments with the D3D11 manager inside hub_d3d11/comp_hub_d3d11.cpp — here
  *   display_processor is NULL);
  * - zero-copy (no compositor-owned atlas to crop per segment);
  * - a self-submitting DP or one with no render pass (the split path records
@@ -7059,7 +7059,7 @@ comp_vk_native_compositor_wait_swapchain_read(struct comp_vk_native_compositor *
  *
  * - the windowed Vulkan site, inside vk_dp_weave_and_present, skipped on
  *   `is_repaint`,
- * - the split site, after the `is_repaint=false` comp_vk_split_weave_and_present
+ * - the split site, after the `is_repaint=false` comp_hub_d3d11_weave_and_present
  *   in layer_commit (the repaint thread's call passes `is_repaint=true` and does
  *   not tick),
  * - the shared-texture site, which has no repaint at all.
@@ -7094,7 +7094,7 @@ vk_rear_budget_tick(struct comp_vk_native_compositor *c)
 	if (polled) {
 #ifdef XRT_OS_WINDOWS
 		if (c->split != NULL) {
-			got = comp_vk_split_get_background_preview(c->split, &pv);
+			got = comp_hub_d3d11_get_background_preview(c->split, &pv);
 		}
 #endif
 		if (!got && c->display_processor != NULL) {
@@ -10319,7 +10319,7 @@ vk_repaint_thread(void *ptr)
 		if (c->split != NULL) {
 			// Bail BEFORE pacing+acquire when there is nothing published to
 			// replay (warmup, or an app frame that refused its slot).
-			if (!comp_vk_split_has_weave_slot(c->split)) {
+			if (!comp_hub_d3d11_has_weave_slot(c->split)) {
 				continue;
 			}
 			const uint64_t fire_t0 = os_monotonic_get_ns();
@@ -10332,7 +10332,7 @@ vk_repaint_thread(void *ptr)
 			}
 			// #1339: no fill into the arm's flip queue while it holds a
 			// pending present (see comp_d3d11_target_repaint_admit).
-			if (c->repaint.partition.next_release_ns == 0 && !comp_vk_split_repaint_admit(c->split)) {
+			if (c->repaint.partition.next_release_ns == 0 && !comp_hub_d3d11_repaint_admit(c->split)) {
 				u_repaint_trace_bail_gate(&c->repaint.trace);
 				os_mutex_unlock(&c->mutex);
 				continue;
@@ -10341,7 +10341,7 @@ vk_repaint_thread(void *ptr)
 			// #1339: spacing is stamped from the START of the fire (fire_t0/t1
 			// keep measuring DURATION for the trace).
 			const uint64_t rp_start_ns = os_monotonic_get_ns();
-			(void)comp_vk_split_weave_and_present(c->split, /*is_repaint=*/true, &rp_canvas);
+			(void)comp_hub_d3d11_weave_and_present(c->split, /*is_repaint=*/true, &rp_canvas);
 			c->repaint.count++;
 			const uint64_t fire_t1 = os_monotonic_get_ns();
 			u_repaint_gate_note_repaint(&c->repaint.gate, rp_start_ns);
@@ -12093,7 +12093,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		 * claims a timeline value for that submit, so the handoff read below
 		 * carries a `fence_value` that covers the planes as well as the atlas —
 		 * one GPU-side consumer wait for both. And it stages the plane and the
-		 * backdrop extent that comp_vk_split_submit_atlas then stamps onto the
+		 * backdrop extent that comp_hub_d3d11_submit_atlas then stamps onto the
 		 * slot's recipe.
 		 */
 		vk_split_stage_planes(c, tgt_width, tgt_height);
@@ -12109,20 +12109,20 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		{
 			bool hud_dirty = false;
 			if (vk_hud_prepare(c, tgt_width, tgt_height, &hud_dirty)) {
-				comp_vk_split_set_hud(c->split, u_hud_get_pixels(c->hud), u_hud_get_width(c->hud),
-				                      u_hud_get_height(c->hud), hud_dirty);
+				comp_hub_d3d11_set_hud(c->split, u_hud_get_pixels(c->hud), u_hud_get_width(c->hud),
+				                       u_hud_get_height(c->hud), hud_dirty);
 			} else {
-				comp_vk_split_set_hud(c->split, NULL, 0, 0, false);
+				comp_hub_d3d11_set_hud(c->split, NULL, 0, 0, false);
 			}
 		}
 
-		struct comp_vk_deposit_handoff handoff = {0};
+		struct comp_hub_d3d11_handoff handoff = {0};
 		struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
 		if (comp_vk_deposit_get_handoff(dep, &handoff)) {
 			// #1883: the slot carries this frame's segment partition (by its seq).
-			comp_vk_split_stage_segment_content(c->split, &c->seg_content);
-			comp_vk_split_submit_atlas(c->split, &handoff, c->eff_layout.cols, c->eff_layout.rows,
-			                           c->eff_layout.tile_w, c->eff_layout.tile_h);
+			comp_hub_d3d11_stage_segment_content(c->split, &c->seg_content);
+			comp_hub_d3d11_submit_atlas(c->split, &handoff, c->eff_layout.cols, c->eff_layout.rows,
+			                            c->eff_layout.tile_w, c->eff_layout.tile_h);
 			/*
 			 * The slot is free again the instant the bridge's staging copy
 			 * has been recorded on this same immediate context — release it
@@ -12132,7 +12132,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 			comp_vk_deposit_note_consumed(dep, handoff.slot);
 			/*
 			 * VK-1b — the same edge for the PLANES, and it has to be here
-			 * rather than inside the split: comp_vk_split_submit_atlas has
+			 * rather than inside the split: comp_hub_d3d11_submit_atlas has
 			 * just taken the bridge's `pre_plane_write` wait on this app
 			 * immediate context, and this signal must land BEHIND it in that
 			 * one ordered stream. Vulkan's next flatten waits for the value.
@@ -12141,7 +12141,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		}
 
 		const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
-		const bool wove = comp_vk_split_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
+		const bool wove = comp_hub_d3d11_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
 
 		/*
 		 * XR_DXR_depth_budget — the split arm's tick. The preview comes from
@@ -12184,7 +12184,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 			}
 			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 		}
-		comp_vk_split_render_diag(c->split);
+		comp_hub_d3d11_render_diag(c->split);
 
 		if (c->owns_window && c->own_window != NULL) {
 			comp_d3d11_window_signal_paint_done(c->own_window);
@@ -12777,7 +12777,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	 * deposit those slots were copied FROM. The repaint thread was already
 	 * joined at the top of this function, which is what makes that safe.
 	 */
-	comp_vk_split_destroy(&c->split);
+	comp_hub_d3d11_destroy(&c->split);
 
 	/*
 	 * VK-1b — the plane pass's own objects. The framebuffer is built over the
@@ -13381,7 +13381,7 @@ vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, con
 		return;
 	}
 
-	comp_vk_split_retire(&c->split, why, short_reason);
+	comp_hub_d3d11_retire(&c->split, why, short_reason);
 	c->split_off_reason = short_reason;
 
 	/*
@@ -13389,7 +13389,7 @@ vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, con
 	 * image and is only ever used by the split's plane pass. Drop it here, in
 	 * the ONE recovery path, so the app-device flatten below goes back to its
 	 * private scratch and no stale framebuffer can outlive the transport that
-	 * gave it its attachment. `comp_vk_split_retire` has already quiesced the
+	 * gave it its attachment. `comp_hub_d3d11_retire` has already quiesced the
 	 * bridge, so nothing is still reading it.
 	 */
 	if (c->plane_bd_fb != VK_NULL_HANDLE) {
@@ -13857,7 +13857,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	 * single-device Vulkan path it always did.
 	 */
 	{
-		struct comp_vk_split_info si = {
+		struct comp_hub_d3d11_info si = {
 		    .xdev = xdev,
 		    .hwnd = c->hwnd,
 		    .dp_factory_d3d11 = dp_factory_d3d11,
@@ -13870,7 +13870,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		    .preferred_width = c->settings.preferred.width,
 		    .preferred_height = c->settings.preferred.height,
 		};
-		comp_vk_split_stage_a(&si, &c->split, &c->split_off_reason);
+		comp_hub_d3d11_stage_a(&si, &c->split, &c->split_off_reason);
 	}
 	/*
 	 * What a RETIRE needs to rebuild the Vulkan half this session may never
@@ -14468,9 +14468,9 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	 */
 #ifdef XRT_OS_WINDOWS
 	if (c->split != NULL) {
-		struct comp_vk_deposit_handoff handoff = {0};
+		struct comp_hub_d3d11_handoff handoff = {0};
 		bool ok = comp_vk_deposit_get_handoff(comp_vk_native_renderer_get_deposit(c->renderer), &handoff) &&
-		          comp_vk_split_wire_bridge(c->split, &handoff);
+		          comp_hub_d3d11_wire_bridge(c->split, &handoff);
 		if (!ok) {
 			vk_split_retire_locked(c,
 			                       "the cross-adapter transport could not be wired to the "
@@ -16193,7 +16193,7 @@ vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d)
 #ifdef XRT_OS_WINDOWS
 	// #918 VK-1: the split's D3D11 weaver owns the panel's 2D/3D state.
 	if (c->split != NULL) {
-		return comp_vk_split_request_display_mode(c->split, enable_3d);
+		return comp_hub_d3d11_request_display_mode(c->split, enable_3d);
 	}
 #endif
 	// No display processor yet. If THIS compositor will create one (it has a
@@ -16262,7 +16262,7 @@ comp_vk_native_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint3
 	// #918 VK-1: under the split the weaver is the D3D11 one on the scanout
 	// adapter, and it owns the vendor's eye-tracking mode for this session.
 	if (c->split != NULL) {
-		comp_vk_split_set_eye_tracking_mode(c->split, mode);
+		comp_hub_d3d11_set_eye_tracking_mode(c->split, mode);
 	}
 #endif
 }
@@ -16315,7 +16315,7 @@ comp_vk_native_compositor_get_segment_metrics(struct xrt_compositor *xc, struct 
 	// adapter, which segments with its own manager and publishes its own
 	// table (eyes filled per query, like below).
 	if (c->split != NULL) {
-		return comp_vk_split_get_segment_metrics(c->split, out) && out->count > 0;
+		return comp_hub_d3d11_get_segment_metrics(c->split, out) && out->count > 0;
 	}
 #endif
 	os_mutex_lock(&c->seg_pub_mutex);
@@ -16394,7 +16394,7 @@ comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
 	// segments the window (ADR-047 Amendment 1); it rebuilds its manager on
 	// its next weave. The copy above stays for a retire back to Vulkan.
 	if (c->split != NULL) {
-		comp_vk_split_set_screens(c->split, list, &c->sys_info, pinned_display_id);
+		comp_hub_d3d11_set_screens(c->split, list, &c->sys_info, pinned_display_id);
 	}
 #endif
 	os_mutex_unlock(&c->mutex);
@@ -18039,7 +18039,7 @@ vk_split_cmd_ring_take(struct comp_vk_native_compositor *c,
  * Ordering, like the plane pass: its own command buffer, its own value claimed
  * on the deposit timeline AFTER the atlas submit, and it must run BEFORE the
  * handoff is taken — @ref comp_vk_deposit_get_handoff reports the latest claimed
- * value, so the single `Wait` @ref comp_vk_split_submit_atlas takes on the other
+ * value, so the single `Wait` @ref comp_hub_d3d11_submit_atlas takes on the other
  * adapter then covers this pass too.
  *
  * A repaint never reaches here (it replays inside the split), which is the same
@@ -18218,10 +18218,10 @@ vk_split_flatten_local2d(struct comp_vk_native_compositor *c,
  * VK-1b-2 — resolve this frame's mask REQUEST and raster it on the out device.
  *
  * Every input is CPU-side, which is why the mask is REBUILT where it is consumed
- * rather than transported. See comp_vk_split_raster_mask for why this runs in the
+ * rather than transported. See comp_hub_d3d11_raster_mask for why this runs in the
  * deposit half here and from a captured request on the D3D12 leg.
  *
- * @return the resolved `COMP_VK_SPLIT_MASK_*` kind, or NONE when the frame needs
+ * @return the resolved `COMP_HUB_D3D11_MASK_*` kind, or NONE when the frame needs
  *         no mask (or the raster failed, which degrades only the composite).
  */
 static uint32_t
@@ -18230,7 +18230,7 @@ vk_split_raster_frame_mask(struct comp_vk_native_compositor *c, int32_t proj_idx
 	struct xrt_rect rects[XRT_MAX_LAYERS];
 	float feather[XRT_MAX_LAYERS];
 	uint32_t count = 0;
-	uint32_t kind = COMP_VK_SPLIT_MASK_NONE;
+	uint32_t kind = COMP_HUB_D3D11_MASK_NONE;
 
 	memset(feather, 0, sizeof(feather));
 
@@ -18252,7 +18252,7 @@ vk_split_raster_frame_mask(struct comp_vk_native_compositor *c, int32_t proj_idx
 		 * rasters ONE mask per frame, so a feathered frame gets the ramp and
 		 * skips the publish rather than publishing ramped geometry.
 		 */
-		kind = any_feather ? COMP_VK_SPLIT_MASK_ZONE_FEATHER : COMP_VK_SPLIT_MASK_ZONE_BINARY;
+		kind = any_feather ? COMP_HUB_D3D11_MASK_ZONE_FEATHER : COMP_HUB_D3D11_MASK_ZONE_BINARY;
 	} else {
 		for (uint32_t i = 0; i < c->layer_accum.layer_count && count < XRT_MAX_LAYERS; i++) {
 			if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D) {
@@ -18263,14 +18263,14 @@ vk_split_raster_frame_mask(struct comp_vk_native_compositor *c, int32_t proj_idx
 			}
 			rects[count++] = c->layer_accum.layers[i].data.local_2d.rect;
 		}
-		kind = COMP_VK_SPLIT_MASK_IMPLICIT;
+		kind = COMP_HUB_D3D11_MASK_IMPLICIT;
 	}
 
 	if (count == 0) {
-		return COMP_VK_SPLIT_MASK_NONE;
+		return COMP_HUB_D3D11_MASK_NONE;
 	}
-	if (!comp_vk_split_raster_mask(c->split, kind, rects, feather, count, region_w, region_h)) {
-		return COMP_VK_SPLIT_MASK_NONE;
+	if (!comp_hub_d3d11_raster_mask(c->split, kind, rects, feather, count, region_w, region_h)) {
+		return COMP_HUB_D3D11_MASK_NONE;
 	}
 	return kind;
 }
@@ -18282,8 +18282,8 @@ vk_split_raster_frame_mask(struct comp_vk_native_compositor *c, int32_t proj_idx
 static void
 vk_split_unstage_planes(struct comp_vk_native_compositor *c)
 {
-	comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-	comp_vk_split_stage_no_composite(c->split);
+	comp_hub_d3d11_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+	comp_hub_d3d11_stage_no_composite(c->split);
 }
 
 static void
@@ -18344,8 +18344,8 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	if (region_w != c->plane_region_w || region_h != c->plane_region_h) {
 		c->plane_region_w = region_w;
 		c->plane_region_h = region_h;
-		comp_vk_split_invalidate_plane(c->split, COMP_XBRIDGE_PLANE_BACKDROP);
-		comp_vk_split_invalidate_plane(c->split, COMP_XBRIDGE_PLANE_LOCAL2D);
+		comp_hub_d3d11_invalidate_plane(c->split, COMP_XBRIDGE_PLANE_BACKDROP);
+		comp_hub_d3d11_invalidate_plane(c->split, COMP_XBRIDGE_PLANE_LOCAL2D);
 	}
 
 	/*
@@ -18355,7 +18355,7 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 * is what the bridge waits on. Claiming a SECOND value here — after it, on
 	 * the same monotonic timeline — makes the handoff's `fence_value` cover the
 	 * planes as well as the atlas, so the single `ID3D11DeviceContext4::Wait`
-	 * comp_vk_split_submit_atlas already takes orders BOTH.
+	 * comp_hub_d3d11_submit_atlas already takes orders BOTH.
 	 */
 	if (!vk_split_cmd_ring_ensure(c, &c->plane_cmd_pool, c->plane_cmd, c->plane_cmd_value,
 	                             &c->plane_cmd_next, "plane")) {
@@ -18514,11 +18514,11 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 		struct xrt_rect box = {0};
 		uint64_t hash = 0;
 		vk_local2d_digest(c, proj_idx, /*over=*/false, region_w, region_h, &box, &hash);
-		comp_vk_split_stage_backdrop(c->split, pl.shared_handle, pl.generation, pl.width, pl.height, hash,
-		                             box.offset.w, box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h,
-		                             bd_w, bd_h);
+		comp_hub_d3d11_stage_backdrop(c->split, pl.shared_handle, pl.generation, pl.width, pl.height, hash,
+		                              box.offset.w, box.offset.h, (uint32_t)box.extent.w,
+		                              (uint32_t)box.extent.h, bd_w, bd_h);
 	} else {
-		comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		comp_hub_d3d11_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 	}
 
 	/*
@@ -18530,8 +18530,8 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 */
 	bool mask_is_plane = false;
 	if (mask_ok) {
-		comp_vk_split_stage_mask_plane(c->split, vk_mask_plane_seq(&plmask, amask), plmask.width,
-		                               plmask.height);
+		comp_hub_d3d11_stage_mask_plane(c->split, vk_mask_plane_seq(&plmask, amask), plmask.width,
+		                                plmask.height);
 		/*
 		 * ADR-027/#801 - in a ZONES frame an explicit wish is PUBLISH-only and
 		 * never a blend gate, so the composite there still gates on the binary
@@ -18540,11 +18540,11 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 		 */
 		mask_is_plane = !c->zones_frame;
 	} else {
-		comp_vk_split_stage_mask_plane(c->split, 0, 0, 0);
+		comp_hub_d3d11_stage_mask_plane(c->split, 0, 0, 0);
 	}
 
 	if (!l2d_ok) {
-		comp_vk_split_stage_no_composite(c->split);
+		comp_hub_d3d11_stage_no_composite(c->split);
 		return;
 	}
 
@@ -18559,11 +18559,11 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 * A legacy authored mask is the composite's own gate and needs no raster -
 	 * its pixels are on the plane. Every other kind is rebuilt out-side.
 	 */
-	uint32_t mask_kind = COMP_VK_SPLIT_MASK_NONE;
+	uint32_t mask_kind = COMP_HUB_D3D11_MASK_NONE;
 	if (!mask_is_plane) {
 		mask_kind = vk_split_raster_frame_mask(c, proj_idx, region_w, region_h);
-		if (mask_kind == COMP_VK_SPLIT_MASK_NONE) {
-			comp_vk_split_stage_no_composite(c->split);
+		if (mask_kind == COMP_HUB_D3D11_MASK_NONE) {
+			comp_hub_d3d11_stage_no_composite(c->split);
 			return;
 		}
 	}
@@ -18591,10 +18591,10 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	uint64_t l2d_hash = 0;
 	vk_local2d_digest(c, proj_idx, /*over=*/true, region_w, region_h, &l2d_box, &l2d_hash);
 
-	comp_vk_split_stage_local2d(c->split, pl2d.shared_handle, pl2d.generation, pl2d.width, pl2d.height, l2d_hash,
-	                            l2d_box.offset.w, l2d_box.offset.h, (uint32_t)l2d_box.extent.w,
-	                            (uint32_t)l2d_box.extent.h, region_w, region_h, cx, cy, cw, ch, composite_mode,
-	                            opaque_present, mask_is_plane);
+	comp_hub_d3d11_stage_local2d(c->split, pl2d.shared_handle, pl2d.generation, pl2d.width, pl2d.height, l2d_hash,
+	                             l2d_box.offset.w, l2d_box.offset.h, (uint32_t)l2d_box.extent.w,
+	                             (uint32_t)l2d_box.extent.h, region_w, region_h, cx, cy, cw, ch, composite_mode,
+	                             opaque_present, mask_is_plane);
 
 	/*
 	 * ADR-027 P4 — the hardware zone WISH, on the path an active split takes.
@@ -18609,11 +18609,11 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 * wish is hardware geometry and stays binary (#800/#803), and this rung
 	 * rasters one mask per frame.
 	 */
-	if (c->zones_frame && (mask_ok || mask_kind == COMP_VK_SPLIT_MASK_ZONE_BINARY)) {
+	if (c->zones_frame && (mask_ok || mask_kind == COMP_HUB_D3D11_MASK_ZONE_BINARY)) {
 		c->zone_publish_seq++;
-		comp_vk_split_publish_zone_wish(c->split, c->zone_publish_seq);
+		comp_hub_d3d11_publish_zone_wish(c->split, c->zone_publish_seq);
 	} else if (!c->zones_frame) {
-		comp_vk_split_clear_zone_wish(c->split);
+		comp_hub_d3d11_clear_zone_wish(c->split);
 	}
 }
 #endif /* XRT_OS_WINDOWS */
@@ -19476,10 +19476,10 @@ vk_zone_dp_supported(struct comp_vk_native_compositor *c)
  * advertise zone slots, the tier-1 fallback fires on the first zones frame, and the
  * hardware-3D request it makes silently overrides the app's 2D rendering mode for
  * the rest of the session. The mask leg itself was never affected -- it publishes
- * through the arm (@ref comp_vk_split_publish_zone_wish), which is why this only
+ * through the arm (@ref comp_hub_d3d11_publish_zone_wish), which is why this only
  * ever showed up as "2D does not stick", never as a lost mask.
  *
- * `comp_vk_split_zone_dp_supported` exists for exactly this question; its doc says
+ * `comp_hub_d3d11_zone_dp_supported` exists for exactly this question; its doc says
  * outright that the compositor cannot answer it for a split session.
  */
 static bool
@@ -19490,7 +19490,7 @@ vk_zone_dp_supported_weaving_arm(struct comp_vk_native_compositor *c)
 #ifdef XRT_OS_WINDOWS
 	weaver_on_arm = (c->split != NULL);
 	if (weaver_on_arm) {
-		arm_consumes = comp_vk_split_zone_dp_supported(c->split);
+		arm_consumes = comp_hub_d3d11_zone_dp_supported(c->split);
 	}
 #endif
 	// The dispatch is shared with the d3d12 tier and unit-tested without a GPU:
@@ -19609,7 +19609,7 @@ vk_split_ensure_mask_plane(struct comp_vk_native_compositor *c, struct comp_vk_n
 	struct comp_vk_deposit *dep = (c->renderer != NULL) ? comp_vk_native_renderer_get_deposit(c->renderer) : NULL;
 	if (mask == NULL || dep == NULL) {
 		// No authored mask this frame: drop the plane. Not a failure.
-		return comp_vk_split_bind_mask_plane(c->split, NULL, 0, 0, 0);
+		return comp_hub_d3d11_bind_mask_plane(c->split, NULL, 0, 0, 0);
 	}
 	if (!comp_vk_deposit_plane_ensure(dep, COMP_VK_DEPOSIT_PLANE_MASK, mask->w, mask->h, VK_FORMAT_R8_UNORM)) {
 		return false;
@@ -19618,7 +19618,7 @@ vk_split_ensure_mask_plane(struct comp_vk_native_compositor *c, struct comp_vk_n
 	if (!comp_vk_deposit_plane_get(dep, COMP_VK_DEPOSIT_PLANE_MASK, &pl)) {
 		return false;
 	}
-	return comp_vk_split_bind_mask_plane(c->split, pl.shared_handle, pl.generation, pl.width, pl.height);
+	return comp_hub_d3d11_bind_mask_plane(c->split, pl.shared_handle, pl.generation, pl.width, pl.height);
 }
 
 /*!

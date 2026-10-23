@@ -73,7 +73,7 @@ This is the part that is routinely assumed rather than checked.
 
 The forward horizon is computed in `comp_weave_latency_win.h`, whose entire body is inside
 `#ifdef _WIN32`. Its three call sites are `comp_d3d11_compositor.cpp:2386`,
-`comp_d3d12_compositor.cpp:3732`, and `comp_vk_native_split.cpp:2253` (the Windows split arm).
+`comp_d3d12_compositor.cpp:3732`, and `hub_d3d11/comp_hub_d3d11.cpp:2253` (the Windows split arm).
 **There is no Android call site**, and the CNSDK display processor does not wire the
 `set_predicted_scanout` slot at all (`leia_display_processor_cnsdk.cpp:2566–2585`).
 
