@@ -121,6 +121,17 @@ void *
 comp_d3d11_renderer_get_atlas_shared_handle(struct comp_d3d11_renderer *renderer);
 
 /*!
+ * The DXGI format every atlas this process creates will have:
+ * `DXGI_FORMAT_R8G8B8A8_UNORM` unless `DXR_ATLAS_FORMAT` asks for a deeper one
+ * (#2273). Needs no renderer, so the compositor can ask before Stage A whether
+ * the #918 bridge (8-bit only) can carry the atlas at all.
+ *
+ * @ingroup comp_d3d11
+ */
+uint32_t
+comp_d3d11_renderer_requested_atlas_format(void);
+
+/*!
  * #918: monotonic atlas generation. Bumped ONLY on a genuine (re)allocation —
  * never on the #602 fits-early-out, which keeps the same texture. A consumer
  * holding an open of the shared handle re-opens when this changes.

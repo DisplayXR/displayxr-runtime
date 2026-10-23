@@ -5670,6 +5670,13 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			 */
 			xbi.panel_width = xdev->hmd->screens[0].w_pixels;
 			xbi.panel_height = xdev->hmd->screens[0].h_pixels;
+			/*
+			 * #2273: the chain is built in the atlas's own format. Left 0 it
+			 * defaulted to RGBA8, so a DXR_ATLAS_FORMAT atlas was refused at
+			 * every submit by the #1178 guard (every present skipped, the
+			 * panel held its last woven frame).
+			 */
+			xbi.atlas_format = comp_d3d11_renderer_requested_atlas_format();
 
 			const char *xb_reason = nullptr;
 			const uint64_t xb_t0 = os_monotonic_get_ns();

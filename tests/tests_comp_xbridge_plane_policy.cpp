@@ -347,6 +347,28 @@ TEST_CASE("a freshly authored plane transports on its own frame and lands on the
  * reader meeting the guard later has every reason to think it is over-strict and
  * relax it back to a plain same-family test. That is why it is a test.
  */
+/*
+ * #2273 — the bridge now builds its chain in a deep atlas format too. The rule
+ * is unchanged (own format or its family's TYPELESS member), and the refusal
+ * the panel run hit before the fix stays a refusal: a 10-bit source into the
+ * default RGBA8 chain is a cross-family copy, which D3D drops silently.
+ */
+TEST_CASE("xb_source_format_compatible: deep atlas chains (#2273)")
+{
+	CHECK(xb_source_format_compatible(DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM) ==
+	      XB_SRC_FMT_EXACT);
+	CHECK(xb_source_format_compatible(DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT) ==
+	      XB_SRC_FMT_EXACT);
+	CHECK(xb_source_format_compatible(DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R10G10B10A2_TYPELESS) ==
+	      XB_SRC_FMT_TYPELESS_TO_CONCRETE);
+	CHECK(xb_source_format_compatible(DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_TYPELESS) ==
+	      XB_SRC_FMT_TYPELESS_TO_CONCRETE);
+	CHECK_FALSE(xb_source_format_accepted(
+	    xb_source_format_compatible(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM)));
+	CHECK_FALSE(xb_source_format_accepted(
+	    xb_source_format_compatible(DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT)));
+}
+
 TEST_CASE("xb_source_format_compatible accepts exactly two sources")
 {
 	SECTION("the chain's own format is the trivial accept")
