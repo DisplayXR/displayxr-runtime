@@ -126,6 +126,7 @@ set(tests
     tests_sim_input_nav
     tests_sim_input_hands
     tests_gamepad_map
+    tests_ultraleap_map
     tests_touch_gesture
     tests_comp_layer_view_camera
     tests_comp_color_policy
@@ -982,6 +983,18 @@ target_include_directories(
 			  ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 	)
 target_link_libraries(tests_gamepad_map PRIVATE xrt-interfaces)
+# The Ultraleap provider's display-plane mapping (drivers/ultraleap/ultraleap_map.c):
+# relative (display heights, the default) and physical (measured mount) modes,
+# radii / velocity gain, and the settings parse. Pure C with no LeapC
+# dependency, compiled straight in — so it builds and runs on every box,
+# including the CI ones that carry no Leap SDK and never build the plug-in.
+target_sources(
+	tests_ultraleap_map PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/ultraleap/ultraleap_map.c
+	)
+target_include_directories(
+	tests_ultraleap_map PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/ultraleap
+	)
+target_link_libraries(tests_ultraleap_map PRIVATE xrt-interfaces)
 # #132 — the touch provider's gesture recogniser + rig/aim math, and the
 # pointer-event ring it is fed from. Compiled straight in for the same reason
 # as tests_sim_input_nav: what is under test is the mapping table (pure

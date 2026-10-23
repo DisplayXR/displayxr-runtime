@@ -30,6 +30,7 @@ extern "C" {
 #endif
 
 struct xrt_device;
+struct ul_map_config;
 
 /*!
  * Create the left+right motion-controller devices, bringing the hub
@@ -52,10 +53,19 @@ struct xrt_device;
  * role arbitration usually gets a definitive answer rather than
  * @ref XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN.
  *
+ * @p map_cfg (the provider's settings, `ultraleap_map.h`) and
+ * @p display_height_m (the host's display geometry; <= 0 = unknown, the
+ * mapping falls back to a nominal panel) decide where the display-plane
+ * (`RIG_LOCAL`) hands land. A reused hub takes this call's values — they are
+ * per system, read once per instance by the plug-in entry point.
+ *
  * @ingroup drv_ultraleap
  */
 xrt_result_t
-ul_create_devices(struct xrt_device **out_left, struct xrt_device **out_right);
+ul_create_devices(const struct ul_map_config *map_cfg,
+                  float display_height_m,
+                  struct xrt_device **out_left,
+                  struct xrt_device **out_right);
 
 /*!
  * Is a Leap Motion device actually attached right now? Non-blocking

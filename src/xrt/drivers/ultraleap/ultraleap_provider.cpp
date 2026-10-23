@@ -23,11 +23,15 @@
  *   whenever this provider holds a role.
  *
  * Coordinate mapping: DESKTOP tracking mode (device on the desk, facing
- * up). Leap's desktop frame is right-handed, y up, z toward the user —
- * the same handedness as OpenXR — so the mapping is mm→m plus a fixed
- * mount offset that places the interaction volume in the tabletop-scale
- * scene DisplayXR view rigs show (LOCAL origin = stage height 1.6 m; see
- * sim_input_device.c for the same reasoning).
+ * up), published DISPLAY-PLANE-relative on a `XRT_TRACKING_TYPE_RIG_LOCAL`
+ * origin (input-provider-discovery.md §4b.4, the same mechanism sim_input
+ * uses since #2191). Leap's desktop frame shares the display plane's axes
+ * (+X right, +Y up, +Z toward the user), so rotations pass through and only
+ * positions are mapped — by default RELATIVELY, in display heights
+ * (`p = H·anchor_h + H·gain · leap_m`), because on a 3D display the Leap's
+ * physical pose relative to the panel is usually not known; `MAPPING` =
+ * `physical` gives 1:1 metres from a measured mount instead. The mapping
+ * itself is the pure `ultraleap_map.c` (unit-tested without a device).
  *
  * @author Joseph Albers <joseph.albers@outlook.de>
  * @author David Fattal
@@ -47,6 +51,7 @@
 #include "util/u_logging.h"
 
 #include "ultraleap_interface.h"
+#include "ultraleap_map.h"
 
 #include "LeapC.h"
 
@@ -126,15 +131,6 @@
  */
 #define UL_RECONNECT_GRACE_NS (3LL * 1000 * 1000 * 1000)
 
-/*!
- * Mount offset: where the Leap device's origin sits in stage space.
- * Hands hover 10–40 cm above the device, so an origin at stage height
- * minus ~15 cm puts the interaction volume around y ≈ 1.6 m — the
- * region a display-scale view rig actually shows (LOCAL origin = stage
- * 1.6 m). u_var-tunable at runtime for desk setups that differ.
- */
-static const struct xrt_vec3 ul_mount_offset_default = {0.0f, 1.45f, -0.10f};
-
 static const enum xrt_space_relation_flags ul_valid_flags = (enum xrt_space_relation_flags)(
     XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
     XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
@@ -173,8 +169,18 @@ struct ul_hub
 	int64_t clock_offset_ns;
 	bool have_clock_offset;
 
-	//! Mount offset, u_var-tunable.
-	struct xrt_vec3 mount_offset;
+	/*!
+	 * Display-plane mapping (ultraleap_map.h). `map_cfg` + `display_height_m`
+	 * are the source of truth — refreshed from the settings and the host's
+	 * display geometry at every create_devices, and u_var-tunable live
+	 * (`map_physical` mirrors `map_cfg.mode` for the debug UI); `map` is
+	 * re-resolved from them at the top of every tracking frame. Guarded by
+	 * mutex (u_var writes are unlocked, as for every u_var tunable).
+	 */
+	struct ul_map_config map_cfg;
+	bool map_physical;
+	float display_height_m;
+	struct ul_map map;
 
 	//! Diagnostics (u_var).
 	uint64_t frame_count;
@@ -311,26 +317,26 @@ leap_result_to_string(eLeapRS result)
  *
  */
 
-//! Leap desktop-frame mm → stage-space meters (+ mount offset).
+//! Leap desktop-frame mm → display-plane metres (hub->map, resolved per frame).
 static inline struct xrt_vec3
 ul_map_position(const struct ul_hub *hub, LEAP_VECTOR v)
 {
-	struct xrt_vec3 out;
-	out.x = v.x / 1000.0f + hub->mount_offset.x;
-	out.y = v.y / 1000.0f + hub->mount_offset.y;
-	out.z = v.z / 1000.0f + hub->mount_offset.z;
-	return out;
+	return ul_map_position_mm(&hub->map, v.x, v.y, v.z);
 }
 
+//! Leap orientation → display plane: the frames share axes, so it passes through.
 static inline struct xrt_quat
-ul_map_orientation(LEAP_QUATERNION q)
+ul_map_rotation(LEAP_QUATERNION q)
 {
-	struct xrt_quat out;
-	out.x = q.x;
-	out.y = q.y;
-	out.z = q.z;
-	out.w = q.w;
-	return out;
+	return ul_map_orientation(q.x, q.y, q.z, q.w);
+}
+
+//! Re-resolve hub->map from the (possibly u_var-tweaked) config. Caller holds hub->mutex.
+static void
+ul_hub_resolve_map(struct ul_hub *hub)
+{
+	hub->map_cfg.mode = hub->map_physical ? UL_MAPPING_PHYSICAL : UL_MAPPING_RELATIVE;
+	ul_map_resolve(&hub->map_cfg, hub->display_height_m, &hub->map);
 }
 
 //! Map a Leap-clock microsecond stamp into the monotonic domain.
@@ -366,10 +372,10 @@ ul_process_joint(const struct ul_hub *hub,
                  float width,
                  struct xrt_hand_joint_value *joint)
 {
-	joint->radius = (width / 1000.0f) / 2.0f;
+	joint->radius = ul_map_radius_from_width_mm(&hub->map, width);
 	struct xrt_space_relation *relation = &joint->relation;
 
-	relation->pose.orientation = ul_map_orientation(joint_orientation);
+	relation->pose.orientation = ul_map_rotation(joint_orientation);
 	relation->pose.position = ul_map_position(hub, joint_pos);
 	relation->relation_flags = ul_valid_flags;
 }
@@ -454,6 +460,7 @@ ul_handle_tracking_event(struct ul_hub *hub, const LEAP_TRACKING_EVENT *ev, int6
 	os_mutex_lock(&hub->mutex);
 	int64_t ts = ul_map_timestamp(hub, (int64_t)ev->info.timestamp, recv_ns);
 	hub->frame_count++;
+	ul_hub_resolve_map(hub);
 	os_mutex_unlock(&hub->mutex);
 
 	for (uint32_t i = 0; i < ev->nHands; i++) {
@@ -480,8 +487,13 @@ ul_handle_tracking_event(struct ul_hub *hub, const LEAP_TRACKING_EVENT *ev, int6
 			// Pose → relation history (palm = grip/aim anchor).
 			struct xrt_space_relation rel = {};
 			rel.pose.position = ul_map_position(hub, hand->palm.position);
-			rel.pose.orientation = ul_map_orientation(hand->palm.orientation);
-			rel.relation_flags = ul_valid_flags;
+			rel.pose.orientation = ul_map_rotation(hand->palm.orientation);
+			// Leap's palm velocity, scaled by the same gain as the
+			// positions so prediction moves the hand at scene scale.
+			rel.linear_velocity = ul_map_velocity_mm_s(&hub->map, hand->palm.velocity.x,
+			                                           hand->palm.velocity.y, hand->palm.velocity.z);
+			rel.relation_flags = (enum xrt_space_relation_flags)(
+			    ul_valid_flags | XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
 			m_relation_history_push(dev->history, &rel, ts);
 
 			dev->tracked = true;
@@ -845,7 +857,7 @@ ul_hub_destroy(struct ul_hub *hub)
  * and sets @p out_err on failure. Caller holds ul_hub_lock().
  */
 static struct ul_hub *
-ul_hub_create(xrt_result_t *out_err)
+ul_hub_create(const struct ul_map_config *map_cfg, float display_height_m, xrt_result_t *out_err)
 {
 	*out_err = XRT_ERROR_ALLOCATION;
 
@@ -853,7 +865,10 @@ ul_hub_create(xrt_result_t *out_err)
 	if (hub == NULL) {
 		return NULL;
 	}
-	hub->mount_offset = ul_mount_offset_default;
+	hub->map_cfg = *map_cfg;
+	hub->map_physical = map_cfg->mode == UL_MAPPING_PHYSICAL;
+	hub->display_height_m = display_height_m;
+	ul_hub_resolve_map(hub);
 	hub->presence = XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN;
 	g_ul_presence = (int)XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN;
 	// #941: startup grace — the idle watchdog only fires once nothing has
@@ -893,7 +908,11 @@ ul_hub_create(xrt_result_t *out_err)
 
 	u_var_add_root(hub, "Ultraleap Input Hub", true);
 	u_var_add_ro_u64(hub, &hub->frame_count, "tracking_frame_count");
-	u_var_add_vec3_f32(hub, &hub->mount_offset, "mount_offset_m");
+	u_var_add_bool(hub, &hub->map_physical, "mapping_physical");
+	u_var_add_vec3_f32(hub, &hub->map_cfg.anchor_h, "anchor_h (relative)");
+	u_var_add_f32(hub, &hub->map_cfg.gain_h_per_m, "gain_h_per_m (relative)");
+	u_var_add_vec3_f32(hub, &hub->map_cfg.mount_m, "mount_m (physical)");
+	u_var_add_f32(hub, &hub->display_height_m, "display_height_m");
 	u_var_add_bool(hub, &hub->leap_connected, "leap_connected");
 	u_var_add_ro_u64(hub, &hub->idle_disconnects, "idle_disconnects");
 	u_var_add_ro_i32(hub, &hub->attached_devices, "attached_devices");
@@ -1126,8 +1145,14 @@ ul_create_device(struct ul_hub *hub, int hand)
 	// 6DOF — origin type must not stay TRACKING_TYPE_NONE, or the
 	// legacy builder injects arm-model offsets into every pose (see the
 	// matching comment in sim_input_device.c).
-	dev->base.tracking_origin->type = XRT_TRACKING_TYPE_OTHER;
-	snprintf(dev->base.tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s", "Ultraleap Tracker");
+	//
+	// RIG_LOCAL (§4b.4): display-plane relative. The builder anchors the
+	// origin at the initial rig and the overseer composes the rig delta, so
+	// `world = rig(t) ∘ L` — the hands sit in front of the panel in every
+	// reference space with no stage height to guess (the old stage mount
+	// offset {0, 1.45, -0.10} was an HMD/standing-VR assumption).
+	dev->base.tracking_origin->type = XRT_TRACKING_TYPE_RIG_LOCAL;
+	snprintf(dev->base.tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s", "Ultraleap Rig-Local Volume");
 
 	snprintf(dev->base.str, sizeof(dev->base.str), "Ultraleap %s Hand (controller emulation)",
 	         is_left ? "Left" : "Right");
@@ -1156,7 +1181,10 @@ ul_create_device(struct ul_hub *hub, int hand)
  */
 
 extern "C" xrt_result_t
-ul_create_devices(struct xrt_device **out_left, struct xrt_device **out_right)
+ul_create_devices(const struct ul_map_config *map_cfg,
+                  float display_height_m,
+                  struct xrt_device **out_left,
+                  struct xrt_device **out_right)
 {
 	// Held across the whole create, including the settle wait below: a
 	// second thread asking for devices at the same moment must reuse the
@@ -1167,12 +1195,44 @@ ul_create_devices(struct xrt_device **out_left, struct xrt_device **out_right)
 	const bool reused = g_ul_hub != NULL;
 	if (!reused) {
 		xrt_result_t xret = XRT_SUCCESS;
-		g_ul_hub = ul_hub_create(&xret);
+		g_ul_hub = ul_hub_create(map_cfg, display_height_m, &xret);
 		if (g_ul_hub == NULL) {
 			return xret;
 		}
 	}
 	struct ul_hub *hub = g_ul_hub;
+
+	if (reused) {
+		// Settings and display geometry are per system: a reused hub takes
+		// this instance's (the last instance created wins while several
+		// share the process — they share one Leap, too).
+		os_mutex_lock(&hub->mutex);
+		hub->map_cfg = *map_cfg;
+		hub->map_physical = map_cfg->mode == UL_MAPPING_PHYSICAL;
+		hub->display_height_m = display_height_m;
+		ul_hub_resolve_map(hub);
+		os_mutex_unlock(&hub->mutex);
+	}
+	{
+		struct ul_map m;
+		ul_map_resolve(map_cfg, display_height_m, &m);
+		if (map_cfg->mode == UL_MAPPING_PHYSICAL) {
+			U_LOG_W(
+			    "ultraleap: mapping = physical, Leap origin at (%.3f, %.3f, %.3f) m from the display "
+			    "centre "
+			    "(display-plane frame, 1:1).",
+			    (double)m.offset_m.x, (double)m.offset_m.y, (double)m.offset_m.z);
+		} else {
+			U_LOG_W(
+			    "ultraleap: mapping = relative, display height %.3f m%s: anchor (%.2f, %.2f, %.2f) H = "
+			    "(%.3f, %.3f, %.3f) m, gain %.2f H/m = %.3f m/m (display-plane frame).",
+			    (double)(display_height_m > 0.0f ? display_height_m : UL_MAP_FALLBACK_DISPLAY_HEIGHT_M),
+			    display_height_m > 0.0f ? "" : " (FALLBACK - no display geometry from the runtime)",
+			    (double)map_cfg->anchor_h.x, (double)map_cfg->anchor_h.y, (double)map_cfg->anchor_h.z,
+			    (double)m.offset_m.x, (double)m.offset_m.y, (double)m.offset_m.z,
+			    (double)map_cfg->gain_h_per_m, (double)m.scale);
+		}
+	}
 
 	struct ul_device *left = ul_create_device(hub, 0);
 	struct ul_device *right = ul_create_device(hub, 1);
