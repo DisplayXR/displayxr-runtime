@@ -1,7 +1,8 @@
 # Copyright 2026, The DisplayXR Project
 # SPDX-License-Identifier: BSL-1.0
 #
-# #1855: the opt-in ONNX face estimator for sim_display webcam eye tracking
+# #1855: the opt-in ONNX face estimator for the sim webcam eye tracker
+# (sim_tracking SOURCE=webcam, and sim_display's deprecated WEBCAM_TRACKING alias)
 # (-DXRT_SIM_WEBCAM_ESTIMATOR=onnx). Included from src/xrt/drivers/CMakeLists.txt
 # only when that option is set, so the default and release builds fetch nothing,
 # ship no new library and keep the stub estimator.
@@ -11,7 +12,7 @@
 #     headers, its runtime library and its LICENSE are extracted;
 #   - the YuNet face detector (opencv_zoo, MIT), dynamic-input ONNX export.
 # Nothing is committed. The plug-in loads the library at run time by full path,
-# so it never links against it (sim_display_face_estimator_onnx.c).
+# so it never links against it (sim_face_estimator_onnx.c).
 #
 # Sets for the caller:
 #   SIM_WEBCAM_ESTIMATOR_SOURCE   the estimator .c to compile
@@ -67,12 +68,12 @@ function(_sim_webcam_download url sha256 dest)
 			return()
 		endif()
 	endif()
-	message(STATUS "sim_display webcam (#1855): fetching ${url}")
+	message(STATUS "sim webcam tracking (#1855): fetching ${url}")
 	file(DOWNLOAD "${url}" "${dest}" EXPECTED_HASH SHA256=${sha256} TLS_VERIFY ON STATUS _st)
 	list(GET _st 0 _code)
 	if(NOT _code EQUAL 0)
 		file(REMOVE "${dest}")
-		message(FATAL_ERROR "sim_display webcam (#1855): download of ${url} failed: ${_st}")
+		message(FATAL_ERROR "sim webcam tracking (#1855): download of ${url} failed: ${_st}")
 	endif()
 endfunction()
 
@@ -88,12 +89,12 @@ if(NOT EXISTS "${SIM_ORT_LIB_FILE}" OR NOT EXISTS "${SIM_ORT_INCLUDE_DIR}/onnxru
 		PATTERNS "*/include/*" "*/lib/${SIM_ORT_LIB_NAME}" "*/LICENSE"
 		)
 	if(NOT EXISTS "${SIM_ORT_LIB_FILE}")
-		message(FATAL_ERROR "sim_display webcam (#1855): ${SIM_ORT_LIB_NAME} not found in ${_sim_ort_archive}")
+		message(FATAL_ERROR "sim webcam tracking (#1855): ${SIM_ORT_LIB_NAME} not found in ${_sim_ort_archive}")
 	endif()
 endif()
 
-set(SIM_WEBCAM_ESTIMATOR_SOURCE sim_display/sim_display_face_estimator_onnx.c)
-message(STATUS "sim_display webcam (#1855): face estimator = YuNet via ONNX Runtime ${SIM_ORT_VERSION}")
+set(SIM_WEBCAM_ESTIMATOR_SOURCE sim_tracking/sim_face_estimator_onnx.c)
+message(STATUS "sim webcam tracking (#1855): face estimator = YuNet via ONNX Runtime ${SIM_ORT_VERSION}")
 
 # Compile flags for a target that builds SIM_WEBCAM_ESTIMATOR_SOURCE.
 function(sim_webcam_onnx_configure tgt)

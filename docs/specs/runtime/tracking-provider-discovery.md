@@ -434,26 +434,74 @@ solves, commits `CAMERA_POSE_0`, and checks that the reported eyes equal the scr
 ## 8. In-tree reference provider: `sim_tracking`
 
 `src/xrt/drivers/sim_tracking/` → `DisplayXR-SimTracking.{dll,dylib,so}`, id `sim-tracking`,
-ProbeOrder 200. A scripted viewer with **no camera** (or, with `CAMERA=1`, a simulated webcam for the §6 calibration), the hardware-free CI source. Opt-in:
-`probe()` declines unless `ENABLE` = 1. Settings (`displayxr-cli tracking options sim-tracking`):
+ProbeOrder 200. Two sources, picked by `SOURCE`:
+
+- `script` (default) — a scripted viewer with **no camera**, the hardware-free CI source; with
+  `CAMERA=1` it also simulates a webcam for the §6 calibration (the test bed);
+- `webcam` — the #1855 webcam eye tracker (moved here from `sim_display`): a plain colour webcam,
+  a face estimator for the two pupils, a pinhole + IPD-prior depth model, one-euro smoothing and
+  the MANAGED loss collapse. It pushes display-space eye samples **and** the camera-space block
+  (`XRT_TRACKING_SAMPLE_CAMERA_VALID`: camera key — USB `vvvv:pppp`, else the OS device id —
+  per-eye unit direction and distance from the optical centre, the raw unsmoothed measurement of
+  the newest face frame), so it is the reference input for the §6 calibration. `describe()`
+  reports `XRT_TRACKING_TRACKS_CAMERA_SPACE` and the `camera_key`. Like the test bed, it honours
+  the §6 calibration: when a `CAMERA_POSE_<n>` slot names its camera key, every measurement is
+  mapped to display space as `T + R · (depth_scale · s̃ · normalize(u_x, u_y, k·u_z))` before
+  smoothing; with none it uses its own bezel-offset model (`WEBCAM_OFFSET_MM`, `WEBCAM_*`).
+
+Opt-in: `probe()` declines unless `ENABLE` = 1. With `SOURCE=webcam` it also declines unless a
+face estimator is built in **and** a camera matching `WEBCAM_DEVICE` is enumerated (it never
+opens the camera to decide; the camera opens on `start()`, on the provider's own worker thread).
+Settings (`displayxr-cli tracking options sim-tracking`):
 
 | Key | Default | |
 |---|---|---|
 | `ENABLE` | 0 | opt-in |
+| `SOURCE` | script | `script` / `webcam` |
 | `SCRIPT` | sweep | `sweep` (head sweeps left-right) / `offset` (holds still) |
 | `PERIOD_MS`, `AMPLITUDE_M` | 4000, 0.10 | sweep |
 | `OFFSET_X_M` / `_Y_M` / `_Z_M` | 0 | from the nominal viewer (host geometry) |
 | `IPD_MM` | 63 | |
 | `LOSS_PERIOD_MS` | 0 | > 0: tracking off for half of every period (exercises the state event) |
-| `RATE_HZ` | 60 | push rate |
+| `RATE_HZ` | 60 | push rate (webcam: how often the tracker is polled; one push per analysed frame while tracking, every tick while lost so the collapse animates) |
 | `CAMERA` | 0 | 1: simulate a webcam — camera-space samples + display output through `CAMERA_POSE_<n>` (§6) |
 | `CAMERA_KEY` | `sim-tracking:webcam0` | the simulated camera's key |
 | `CAMERA_TRUE_POSE` | the bezel prior | hidden ground truth `"tx,ty,tz,qx,qy,qz,qw"` the camera measures from |
 | `CAMERA_DEPTH_BIAS` | 1 | reported distance = true × this (a simulated per-user iris error) |
+| `WEBCAM_ESTIMATOR` | auto | `auto` (the built-in estimator) / `none` / the built-in name (`yunet-onnx`) |
+| `WEBCAM_MODEL` | beside the plug-in | face model path (onnx builds) |
+| `WEBCAM_DEVICE` | first camera | index (`0`, `1`, …) or a case-insensitive substring of the name |
+| `WEBCAM_HFOV_DEG` | 70 | horizontal field of view (distance accuracy depends on it) |
+| `WEBCAM_IPD_MM` | 63 | IPD prior for the monocular depth |
+| `WEBCAM_OFFSET_MM` | 0,0,0 | uncalibrated camera position from the top-centre of the panel, `x,y,z` mm (a `CAMERA_POSE_<n>` for the camera's key replaces this model, §6) |
+| `WEBCAM_MIRROR` | 0 | the source delivers a mirrored image |
 
-The #1855 webcam tracker core still lives in `sim_display` (`SIM_DISPLAY_WEBCAM_TRACKING`,
-unchanged; when on, sim_display tracks and so wins its own screen). Moving it into `sim_tracking`
-as `SCRIPT=webcam` is a follow-up.
+**Which estimator is built in is a build-time choice.** The default build (and every release)
+compiles the stub estimator and fetches nothing, so `SOURCE=webcam` declines in probe with one
+WARN. `-DXRT_SIM_WEBCAM_ESTIMATOR=onnx` fetches ONNX Runtime + the YuNet face model (both pinned
+by SHA256), loads them at run time from the plug-in's own directory (never linked) and copies
+them next to both plug-ins. Details: `docs/vendors/sim_display/README.md` § *Webcam eye tracking*.
+
+**One core, two hosts.** The camera worker, estimator and geometry
+(`sim_tracking/sim_webcam_*`, `sim_face_*`) read their settings only through a small callback,
+`sim_webcam_settings::get(key) -> string`. `sim_tracking` satisfies it from its host iface;
+`sim_display` satisfies it from its settings shim for the **one-release deprecation alias**
+`WEBCAM_TRACKING` (and the legacy `SIM_DISPLAY_WEBCAM_*` names): with it on, sim_display keeps
+the old behaviour — it tracks in-process, OWN-like, advertising MANAGED, and so wins its own
+screen over any provider (§4 rule 1) — and logs one WARN pointing to `sim-tracking SOURCE=webcam`.
+Both hosts use the same `WEBCAM_*` key names.
+
+**Camera claims (ADR-043 Amendment 5).** sim_display's `get_claimed_cameras` declares the webcam
+whenever its alias is on, as before. On the provider path the camera is declared by the provider
+itself (`describe().camera_key`); the trunk does not yet fold an active provider's camera into the
+service's claim set (§10 item 10), so with only `SOURCE=webcam` on, the service's UVC SBS
+source is not told the webcam is taken. Do not opt the same webcam into `stereo-cameras.json`.
+
+**macOS camera permission.** macOS has no capture backend yet (`aux_os_uvc` builds its stubs
+there), so `SOURCE=webcam` declines on macOS today. When an AVFoundation backend lands, access is
+gated by the **hosting process's** `NSCameraUsageDescription` and TCC grant: in-process (the only
+hosting this release) that is the app's own permission, exactly as for the sim_display alias; a
+standalone provider process (§10 item 1) will need its own usage string and grant.
 
 Dev trees stage it next to sim-input (`scripts/build_macos.sh`, `scripts/build_linux.sh`); the CI
 end-to-end arm is `tests_oxr_view_space_viewer_tracking`.
@@ -504,7 +552,11 @@ screen's own DP with the desktop-geometry mapping (§4b).
    policy, so composing it is a separate decision).
 7. **Workspace tiles on a secondary presenter** (`comp_d3d11_service_get_client_workspace_view_frame`)
    and the controller's FRAME_TICK viewer: still the presenter DP's eyes.
-8. **`sim_tracking` SCRIPT=webcam**: move the #1855 webcam core out of `sim_display`.
+8. ~~`sim_tracking` webcam source~~ — **done**: `SOURCE=webcam` (§8), honouring `CAMERA_POSE_<n>`;
+   sim_display's `WEBCAM_TRACKING` is a one-release alias over the same core, removed next release.
 9. Installer rows: the Windows runtime installer ships `DisplayXR-SimTracking.dll` (allowlisted, N4b)
    but writes no `TrackingProviders` row yet; the Linux / macOS packages do not ship it yet.
    `versions.json` for the open provider. (The Dashboard card landed: Components → Tracking providers.)
+10. **Provider camera claims**: fold the active provider's `describe().camera_key` into the
+    service's ADR-043 Amendment 5 refusal set (today only the display plug-in's
+    `get_claimed_cameras` feeds it).

@@ -70,21 +70,40 @@ endif()
 add_library(drv_sim_display_includes INTERFACE)
 target_include_directories(drv_sim_display_includes INTERFACE sim_display)
 
-# #1855: the face estimator behind sim_display webcam eye tracking. "stub" (the
-# default, and what every release ships) builds none: the toggle then logs a WARN
+# #1855: the face estimator behind the webcam eye tracker (sim_tracking
+# SOURCE=webcam, and sim_display's deprecated WEBCAM_TRACKING alias). "stub" (the
+# default, and what every release ships) builds none: the tracker then logs a WARN
 # and never opens a camera. "onnx" is a developer opt-in that fetches ONNX
 # Runtime + the YuNet face model (both pinned by SHA256) and drops the runtime
-# library and the model next to the plug-in; see sim_display/sim_webcam_onnx.cmake.
+# library and the model next to the plug-ins; see sim_tracking/sim_webcam_onnx.cmake.
 set(XRT_SIM_WEBCAM_ESTIMATOR "stub" CACHE STRING
-	"sim_display webcam eye tracking face estimator (#1855): stub | onnx")
+	"webcam eye tracker face estimator (#1855): stub | onnx")
 set_property(CACHE XRT_SIM_WEBCAM_ESTIMATOR PROPERTY STRINGS stub onnx)
 if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
-	include(${CMAKE_CURRENT_SOURCE_DIR}/sim_display/sim_webcam_onnx.cmake)
+	include(${CMAKE_CURRENT_SOURCE_DIR}/sim_tracking/sim_webcam_onnx.cmake)
 elseif(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "stub")
-	set(SIM_WEBCAM_ESTIMATOR_SOURCE sim_display/sim_display_face_estimator_none.c)
+	set(SIM_WEBCAM_ESTIMATOR_SOURCE sim_tracking/sim_face_estimator_none.c)
 else()
 	message(FATAL_ERROR "XRT_SIM_WEBCAM_ESTIMATOR must be stub or onnx, not '${XRT_SIM_WEBCAM_ESTIMATOR}'")
 endif()
+
+# The webcam tracker core (#1855), owned by sim_tracking and compiled into both
+# hosts: sim_tracking (SOURCE=webcam) and sim_display (the one-release
+# WEBCAM_TRACKING alias). Its only host dependency is the sim_webcam_settings
+# callback, so there is one copy of the code.
+set(SIM_WEBCAM_CORE_SOURCES
+	sim_tracking/sim_face_estimator.h
+	${SIM_WEBCAM_ESTIMATOR_SOURCE}
+	sim_tracking/sim_face_yunet.c
+	sim_tracking/sim_face_yunet.h
+	sim_tracking/sim_webcam_settings.h
+	sim_tracking/sim_webcam_source.c
+	sim_tracking/sim_webcam_source.h
+	sim_tracking/sim_webcam_tracker.c
+	sim_tracking/sim_webcam_tracker.h
+	sim_tracking/sim_webcam_tracking.c
+	sim_tracking/sim_webcam_tracking.h
+	)
 
 # Simulation 3D display driver (always available as fallback, FORCE_SIM_DISPLAY=1 overrides vendor drivers)
 set(SIM_DISPLAY_SOURCES
@@ -101,16 +120,10 @@ set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_stereo_camera.h
 	sim_display/sim_display_stereo_camera_pattern.c
 	sim_display/sim_display_stereo_camera_pattern.h
-	# #1855: opt-in webcam eye tracking (SIM_DISPLAY_WEBCAM_TRACKING=1).
-	sim_display/sim_display_face_estimator.h
-	${SIM_WEBCAM_ESTIMATOR_SOURCE}
-	sim_display/sim_display_face_yunet.c
-	sim_display/sim_display_face_yunet.h
+	# #1855: the deprecated WEBCAM_TRACKING alias — sim_display's glue over the
+	# core sim_tracking owns.
 	sim_display/sim_display_webcam.c
-	sim_display/sim_display_webcam_tracker.c
-	sim_display/sim_display_webcam_tracker.h
-	sim_display/sim_display_webcam_tracking.c
-	sim_display/sim_display_webcam_tracking.h
+	${SIM_WEBCAM_CORE_SOURCES}
 	)
 
 # Vulkan display processor (anaglyph/blend shaders)
@@ -187,7 +200,7 @@ endif()
 
 # aux_ogl headers (ogl_api.h) are in auxiliary/ogl/
 target_include_directories(drv_sim_display PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
-	${CMAKE_CURRENT_SOURCE_DIR}/sim_conversion)
+	${CMAKE_CURRENT_SOURCE_DIR}/sim_conversion ${CMAKE_CURRENT_SOURCE_DIR}/sim_tracking)
 
 if(XRT_HAVE_VULKAN)
 	target_link_libraries(drv_sim_display PRIVATE aux_vk)
@@ -290,7 +303,7 @@ else()
 	add_dependencies(drv_sim_display_plugin ${RUNTIME_TARGET})
 	if(MSVC)
 		# #1855: the webcam tracker's capture backend (aux_os_uvc, Media
-		# Foundation) is reached only under SIM_DISPLAY_WEBCAM_TRACKING=1.
+		# Foundation) is reached only under WEBCAM_TRACKING=1 (deprecated alias).
 		# Delay-load it so every process that loads this plug-in does not map
 		# MF at load — and so the plug-in still loads on Windows "N" editions,
 		# which ship without Media Foundation.
@@ -302,6 +315,7 @@ endif()
 target_include_directories(drv_sim_display_plugin PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/sim_display
 	${CMAKE_CURRENT_SOURCE_DIR}/sim_conversion
+	${CMAKE_CURRENT_SOURCE_DIR}/sim_tracking
 	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
 	)
 
@@ -316,7 +330,7 @@ if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
 		POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SIM_ORT_LIB_FILE}" "${SIM_WEBCAM_MODEL_FILE}"
 			"$<TARGET_FILE_DIR:drv_sim_display_plugin>/"
-		COMMENT "sim_display webcam (#1855): copying ${SIM_ORT_LIB_NAME} + ${SIM_WEBCAM_MODEL_NAME} next to the plug-in"
+		COMMENT "sim webcam (#1855): copying ${SIM_ORT_LIB_NAME} + ${SIM_WEBCAM_MODEL_NAME} next to the sim_display plug-in"
 		VERBATIM
 		)
 endif()
@@ -595,9 +609,13 @@ add_library(drv_sim_tracking_plugin SHARED
 	sim_tracking/sim_tracking_plugin.c
 	sim_tracking/sim_tracking_script.c
 	sim_tracking/sim_tracking_script.h
+	# SOURCE=webcam (#1855 moved here): the provider wrapper + the shared core.
+	sim_tracking/sim_tracking_webcam.c
+	sim_tracking/sim_tracking_webcam.h
+	${SIM_WEBCAM_CORE_SOURCES}
 	)
 if(XRT_HAVE_LINUX)
-	target_link_libraries(drv_sim_tracking_plugin PRIVATE xrt-interfaces aux_util aux_os drv_includes m)
+	target_link_libraries(drv_sim_tracking_plugin PRIVATE xrt-interfaces aux_util aux_os aux_os_uvc drv_includes m)
 else()
 	target_compile_definitions(drv_sim_tracking_plugin PRIVATE XRT_USING_RUNTIME_DLL)
 	target_link_libraries(
@@ -607,9 +625,31 @@ else()
 			xrt-interfaces
 			aux_util
 			aux_os
+			aux_os_uvc
 			drv_includes
 		)
 	add_dependencies(drv_sim_tracking_plugin ${RUNTIME_TARGET})
+	if(MSVC)
+		# SOURCE=webcam's capture backend (aux_os_uvc, Media Foundation): delay-
+		# loaded, as in sim_display, so loading the provider never maps MF and
+		# it still loads on Windows "N" editions.
+		target_link_options(drv_sim_tracking_plugin PRIVATE
+			"/DELAYLOAD:mf.dll" "/DELAYLOAD:mfplat.dll" "/DELAYLOAD:mfreadwrite.dll")
+		target_link_libraries(drv_sim_tracking_plugin PRIVATE delayimp)
+	endif()
+endif()
+if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
+	# The opt-in estimator loads ONNX Runtime + the model from the plug-in's OWN
+	# directory; the install rules above already put them in the shared plug-in dir.
+	sim_webcam_onnx_configure(drv_sim_tracking_plugin)
+	add_custom_command(
+		TARGET drv_sim_tracking_plugin
+		POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SIM_ORT_LIB_FILE}" "${SIM_WEBCAM_MODEL_FILE}"
+			"$<TARGET_FILE_DIR:drv_sim_tracking_plugin>/"
+		COMMENT "sim webcam (#1855): copying ${SIM_ORT_LIB_NAME} + ${SIM_WEBCAM_MODEL_NAME} next to the sim_tracking plug-in"
+		VERBATIM
+		)
 endif()
 target_include_directories(drv_sim_tracking_plugin PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/sim_tracking

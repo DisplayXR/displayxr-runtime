@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  sim_display webcam eye tracking (#1855): the pure parts — camera
+ * @brief  webcam eye tracking (#1855, sim_tracking SOURCE=webcam): the pure parts — camera
  *         model, landmarks -> eye positions, one-euro smoothing, the
  *         tracking-loss timeout and the MANAGED collapse / revival blend, and
  *         device / mode selection. No OS calls, no threads: unit-tested on
- *         every OS (tests/tests_sim_webcam_tracking.cpp).
+ *         every OS (tests/tests_sim_webcam_tracking.cpp). Compiled into
+ *         sim_tracking (`SOURCE=webcam`) and into sim_display (the
+ *         deprecated `WEBCAM_TRACKING` alias); see sim_webcam_source.h.
  *
  * Coordinate frame (the DP's eye-position frame): metres, origin at the
  * centre of the panel's active area, +x right, +y up, +z out of the panel
@@ -24,7 +26,7 @@
  * (63 mm), Z = f * IPD / d_px. A yawed head shortens d_px and so reads
  * slightly far — the documented accuracy limit of a single plain webcam.
  *
- * @ingroup drv_sim_display
+ * @ingroup drv_sim_tracking
  */
 
 #pragma once
@@ -98,6 +100,32 @@ sim_webcam_landmarks_to_eyes(const struct sim_webcam_config *cfg,
                              uint32_t image_h,
                              const struct sim_face_landmarks *lm,
                              struct xrt_vec3 out_eyes[2]);
+
+/*!
+ * What the camera measured, in the CAMERA's frame
+ * (`xrt_tracking_camera_sample`): origin at the optical centre, +X the
+ * viewer's right as the user sees it (un-mirrored, whatever
+ * @ref sim_webcam_config::mirrored says about the source), +Y up, +Z out of
+ * the lens toward the viewer. With this model's un-tilted camera the frame is
+ * the display frame moved to the camera, so `display = camera position +
+ * distance * dir` — the relation a camera-pose calibration solves for.
+ */
+struct sim_webcam_camera_eyes
+{
+	float dir[2][3];     //!< unit direction to each eye; [0] = viewer's left (smaller X)
+	float distance_m[2]; //!< distance along dir, metres (monocular IPD-prior depth)
+};
+
+/*!
+ * Landmarks -> camera-space eyes (the raw measurement, before smoothing).
+ * Same usability rules as @ref sim_webcam_landmarks_to_eyes.
+ */
+bool
+sim_webcam_landmarks_to_camera(const struct sim_webcam_config *cfg,
+                               uint32_t image_w,
+                               uint32_t image_h,
+                               const struct sim_face_landmarks *lm,
+                               struct sim_webcam_camera_eyes *out);
 
 /*!
  * The inverse, for tests and tools: where the camera of @p cfg sees display-
@@ -205,6 +233,14 @@ sim_webcam_select_device(const struct u_stereo_uvc_device *devs, uint32_t count,
  */
 bool
 sim_webcam_select_mode(const struct u_stereo_uvc_mode *modes, uint32_t count, struct u_stereo_uvc_mode *out);
+
+/*!
+ * The stable key a camera is known by (`xrt_tracking_camera_sample::camera_key`,
+ * the `CAMERA_POSE` settings key): USB "vvvv:pppp" when the device has a
+ * VID:PID, else its OS id, else its name.
+ */
+void
+sim_webcam_camera_key(const struct u_stereo_uvc_device *dev, char *out, size_t cap);
 
 /*!
  * Parse "x,y,z" millimetres into metres. @return false (and @p out untouched)

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  sim_display webcam eye tracking (#1855): the pluggable face
+ * @brief  webcam eye tracking (#1855, sim_tracking SOURCE=webcam): the pluggable face
  *         estimator — one camera frame in, two pupil positions out.
  *
  * Everything around the estimator (camera, worker thread, geometry,
@@ -11,19 +11,20 @@
  * build carries NONE (@ref sim_face_estimator_default_available returns
  * false), and webcam tracking then stays off — the camera is never opened
  * for an estimator that cannot see a face. See
- * docs/vendors/sim_display/README.md § Webcam eye tracking.
+ * docs/specs/runtime/tracking-provider-discovery.md § sim_tracking.
  *
  * Constraints on an estimator that lands here: vendor-neutral, permissively
  * licensed, builds in this repo's toolchain on Windows + Linux, model weights
  * FETCHED at build time with a pinned hash (never committed), CPU-only, fast
  * enough for the camera rate at ~640x480.
  *
- * @ingroup drv_sim_display
+ * @ingroup drv_sim_tracking
  */
 
 #pragma once
 
-#include "sim_display_webcam_tracking.h"
+#include "sim_webcam_settings.h"
+#include "sim_webcam_tracking.h"
 
 #include <stdbool.h>
 
@@ -50,12 +51,17 @@ struct sim_face_estimator
 };
 
 /*!
- * Is a real estimator built into this binary? Cheap, loads nothing — decides
- * whether SIM_DISPLAY_WEBCAM_TRACKING may advertise tracking and open the
- * camera.
+ * Is a real estimator built into this binary (and its files present)? Cheap,
+ * loads nothing — decides whether a webcam tracker may advertise tracking and
+ * open the camera. @p settings supplies `WEBCAM_MODEL` (a model path
+ * override); NULL = none. The answer is cached per process.
  */
 bool
-sim_face_estimator_default_available(void);
+sim_face_estimator_default_available(const struct sim_webcam_settings *settings);
+
+//! The built-in estimator's name ("yunet-onnx"), or "none" for the stub build.
+const char *
+sim_face_estimator_default_name(void);
 
 /*!
  * The built-in estimator, or NULL when none is built in. Called on a display
@@ -63,7 +69,7 @@ sim_face_estimator_default_available(void);
  * first estimate() call (the worker thread), never here.
  */
 struct sim_face_estimator *
-sim_face_estimator_create_default(void);
+sim_face_estimator_create_default(const struct sim_webcam_settings *settings);
 
 static inline void
 sim_face_estimator_destroy(struct sim_face_estimator **est_ptr)

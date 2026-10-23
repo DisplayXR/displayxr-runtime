@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  sim_display webcam eye tracking (#1855): the worker. See the header.
- * @ingroup drv_sim_display
+ * @brief  webcam eye tracking (#1855, sim_tracking SOURCE=webcam): the worker. See the header.
+ * @ingroup drv_sim_tracking
  */
 
-#include "sim_display_webcam_tracker.h"
-#include "sim_display_face_estimator.h"
+#include "sim_webcam_tracker.h"
+#include "sim_face_estimator.h"
 
 #include "util/u_logging.h"
 #include "util/u_stereo_uvc.h"
@@ -30,18 +30,42 @@ struct sim_webcam_tracker
 	char device_sel[256];
 	struct sim_face_estimator *est;
 	float screen_h_m;
+	sim_webcam_map_fn map_fn; //!< NULL = the built-in bezel-offset model
+	void *map_ctx;
 
 	// Guarded by lock: the latest-wins handoff.
 	struct os_mutex lock;
 	struct sim_webcam_track_state state;
 	uint64_t frames;
+	enum sim_webcam_tracker_state wstate;
+	char camera_key[128];
+	bool have_camera_meas;
+	uint64_t camera_meas_ns;
+	struct sim_webcam_camera_eyes camera_meas;
 };
 
 static void
-publish(struct sim_webcam_tracker *t, bool found, const struct xrt_vec3 eyes[2], uint64_t t_ns)
+set_state(struct sim_webcam_tracker *t, enum sim_webcam_tracker_state s)
+{
+	os_mutex_lock(&t->lock);
+	t->wstate = s;
+	os_mutex_unlock(&t->lock);
+}
+
+static void
+publish(struct sim_webcam_tracker *t,
+        bool found,
+        const struct xrt_vec3 eyes[2],
+        const struct sim_webcam_camera_eyes *cam,
+        uint64_t t_ns)
 {
 	os_mutex_lock(&t->lock);
 	sim_webcam_track_update(&t->state, &t->cfg, found, eyes, t_ns);
+	if (found && cam != NULL) {
+		t->camera_meas = *cam;
+		t->camera_meas_ns = t_ns;
+		t->have_camera_meas = true;
+	}
 	t->frames++;
 	os_mutex_unlock(&t->lock);
 }
@@ -68,18 +92,22 @@ worker(void *ptr)
 	const int32_t idx = sim_webcam_select_device(devs, n, t->device_sel);
 	if (idx < 0) {
 		U_LOG_W(
-		    "sim_display webcam tracking (#1855): no camera matches SIM_DISPLAY_WEBCAM_DEVICE='%s' (%u present)"
+		    "webcam tracking (#1855): no camera matches WEBCAM_DEVICE='%s' (%u present)"
 		    " - not tracking",
 		    t->device_sel, n);
+		set_state(t, SIM_WEBCAM_TRACKER_NO_SOURCE);
 		return NULL;
 	}
 	struct u_stereo_uvc_device dev = devs[idx];
+	os_mutex_lock(&t->lock);
+	sim_webcam_camera_key(&dev, t->camera_key, sizeof(t->camera_key));
+	os_mutex_unlock(&t->lock);
 
 	const uint32_t mc = b->list_modes != NULL ? b->list_modes(b->ctx, dev.id, modes, U_STEREO_UVC_MAX_MODES) : 0;
 	struct u_stereo_uvc_mode mode;
 	if (!sim_webcam_select_mode(modes, mc, &mode)) {
-		U_LOG_W("sim_display webcam tracking (#1855): camera '%s' reports no capture mode - not tracking",
-		        dev.name);
+		U_LOG_W("webcam tracking (#1855): camera '%s' reports no capture mode - not tracking", dev.name);
+		set_state(t, SIM_WEBCAM_TRACKER_NO_SOURCE);
 		return NULL;
 	}
 
@@ -88,11 +116,13 @@ worker(void *ptr)
 	}
 	void *h = NULL;
 	if (b->open == NULL || !b->open(b->ctx, dev.id, &mode, 0, 0, &h)) {
-		U_LOG_W("sim_display webcam tracking (#1855): could not open camera '%s' - not tracking", dev.name);
+		U_LOG_W("webcam tracking (#1855): could not open camera '%s' - not tracking", dev.name);
+		set_state(t, SIM_WEBCAM_TRACKER_NO_SOURCE);
 		return NULL;
 	}
-	U_LOG_W("sim_display webcam tracking (#1855): camera OPENED - '%s' %ux%u@%.0f, estimator '%s'", dev.name,
-	        mode.width, mode.height, (double)mode.fps, t->est->name != NULL ? t->est->name : "?");
+	set_state(t, SIM_WEBCAM_TRACKER_RUNNING);
+	U_LOG_W("webcam tracking (#1855): camera OPENED - '%s' %ux%u@%.0f, estimator '%s'", dev.name, mode.width,
+	        mode.height, (double)mode.fps, t->est->name != NULL ? t->est->name : "?");
 
 	while (keep_running(t)) {
 		struct u_stereo_uvc_raw_frame frame;
@@ -101,20 +131,28 @@ worker(void *ptr)
 			continue;
 		}
 		if (r != U_STEREO_UVC_READ_OK) {
-			U_LOG_W("sim_display webcam tracking (#1855): camera '%s' failed - tracking stopped", dev.name);
+			U_LOG_W("webcam tracking (#1855): camera '%s' failed - tracking stopped", dev.name);
+			set_state(t, SIM_WEBCAM_TRACKER_NO_SOURCE);
 			break;
 		}
 		struct sim_face_landmarks lm;
 		memset(&lm, 0, sizeof(lm));
 		struct xrt_vec3 eyes[2] = {{0, 0, 0}, {0, 0, 0}};
-		const bool found =
-		    t->est->estimate(t->est, &frame, &lm) &&
-		    sim_webcam_landmarks_to_eyes(&t->cfg, t->screen_h_m, frame.width, frame.height, &lm, eyes);
-		publish(t, found, eyes, frame.time_ns > 0 ? (uint64_t)frame.time_ns : 0);
+		struct sim_webcam_camera_eyes cam;
+		memset(&cam, 0, sizeof(cam));
+		bool found = t->est->estimate(t->est, &frame, &lm) &&
+		             sim_webcam_landmarks_to_camera(&t->cfg, frame.width, frame.height, &lm, &cam);
+		if (found && t->map_fn != NULL) {
+			t->map_fn(t->map_ctx, &cam, eyes); // the host's calibration replaces the bezel model
+		} else if (found) {
+			found =
+			    sim_webcam_landmarks_to_eyes(&t->cfg, t->screen_h_m, frame.width, frame.height, &lm, eyes);
+		}
+		publish(t, found, eyes, &cam, frame.time_ns > 0 ? (uint64_t)frame.time_ns : 0);
 	}
 
 	b->close(h);
-	U_LOG_W("sim_display webcam tracking (#1855): camera CLOSED - '%s'", dev.name);
+	U_LOG_W("webcam tracking (#1855): camera CLOSED - '%s'", dev.name);
 	return NULL;
 }
 
@@ -124,6 +162,18 @@ sim_webcam_tracker_create(const struct sim_webcam_config *cfg,
                           const char *device_sel,
                           struct sim_face_estimator *est,
                           float screen_h_m)
+{
+	return sim_webcam_tracker_create_mapped(cfg, backend, device_sel, est, screen_h_m, NULL, NULL);
+}
+
+struct sim_webcam_tracker *
+sim_webcam_tracker_create_mapped(const struct sim_webcam_config *cfg,
+                                 const struct u_stereo_uvc_backend *backend,
+                                 const char *device_sel,
+                                 struct sim_face_estimator *est,
+                                 float screen_h_m,
+                                 sim_webcam_map_fn map_fn,
+                                 void *map_ctx)
 {
 	if (cfg == NULL || backend == NULL || backend->read == NULL || backend->close == NULL || est == NULL ||
 	    est->estimate == NULL) {
@@ -140,6 +190,8 @@ sim_webcam_tracker_create(const struct sim_webcam_config *cfg,
 	}
 	t->est = est;
 	t->screen_h_m = screen_h_m;
+	t->map_fn = map_fn;
+	t->map_ctx = map_ctx;
 	sim_webcam_track_reset(&t->state);
 
 	if (os_mutex_init(&t->lock) != 0) {
@@ -191,4 +243,39 @@ sim_webcam_tracker_frame_count(struct sim_webcam_tracker *t)
 	const uint64_t n = t->frames;
 	os_mutex_unlock(&t->lock);
 	return n;
+}
+
+enum sim_webcam_tracker_state
+sim_webcam_tracker_state(struct sim_webcam_tracker *t)
+{
+	os_mutex_lock(&t->lock);
+	const enum sim_webcam_tracker_state s = t->wstate;
+	os_mutex_unlock(&t->lock);
+	return s;
+}
+
+bool
+sim_webcam_tracker_camera(struct sim_webcam_tracker *t,
+                          uint64_t now_ns,
+                          struct sim_webcam_camera_eyes *out,
+                          uint64_t *out_capture_ns,
+                          char *key,
+                          size_t key_cap)
+{
+	os_mutex_lock(&t->lock);
+	const bool fresh = t->have_camera_meas && t->camera_key[0] != '\0' &&
+	                   (now_ns <= t->camera_meas_ns || now_ns - t->camera_meas_ns <= t->cfg.timeout_ns);
+	if (fresh) {
+		if (out != NULL) {
+			*out = t->camera_meas;
+		}
+		if (out_capture_ns != NULL) {
+			*out_capture_ns = t->camera_meas_ns;
+		}
+	}
+	if (key != NULL && key_cap > 0) {
+		snprintf(key, key_cap, "%s", t->camera_key);
+	}
+	os_mutex_unlock(&t->lock);
+	return fresh;
 }

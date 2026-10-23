@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  sim_display webcam eye tracking (#1855): YuNet pre- and
- *         post-processing (see sim_display_face_yunet.h).
- * @ingroup drv_sim_display
+ * @brief  webcam eye tracking (#1855, sim_tracking SOURCE=webcam): YuNet pre- and
+ *         post-processing (see sim_face_yunet.h).
+ * @ingroup drv_sim_tracking
  */
 
-#include "sim_display_face_yunet.h"
+#include "sim_face_yunet.h"
 
 #include "util/u_stereo_uvc.h"
 

@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  sim_display webcam eye tracking (#1855): the pure parts. See the header.
- * @ingroup drv_sim_display
+ * @brief  webcam eye tracking (#1855, sim_tracking SOURCE=webcam): the pure parts. See the header.
+ * @ingroup drv_sim_tracking
  */
 
-#include "sim_display_webcam_tracking.h"
+#include "sim_webcam_tracking.h"
 
 #include "util/u_stereo_uvc.h"
 
@@ -97,6 +97,50 @@ sim_webcam_landmarks_to_eyes(const struct sim_webcam_config *cfg,
 	} else {
 		out_eyes[0] = e[1];
 		out_eyes[1] = e[0];
+	}
+	return true;
+}
+
+bool
+sim_webcam_landmarks_to_camera(const struct sim_webcam_config *cfg,
+                               uint32_t image_w,
+                               uint32_t image_h,
+                               const struct sim_face_landmarks *lm,
+                               struct sim_webcam_camera_eyes *out)
+{
+	if (lm == NULL || !lm->found || image_w == 0 || image_h == 0 || out == NULL) {
+		return false;
+	}
+	const double f = focal_px(cfg, image_w);
+	const double cx = (double)image_w * 0.5;
+	const double cy = (double)image_h * 0.5;
+	const double du = (double)lm->eye_px[0][0] - (double)lm->eye_px[1][0];
+	const double dv = (double)lm->eye_px[0][1] - (double)lm->eye_px[1][1];
+	const double d_px = sqrt(du * du + dv * dv);
+	if (!(d_px >= 1.0)) {
+		return false;
+	}
+	const double ipd = (cfg->ipd_m > 0.0f) ? (double)cfg->ipd_m : (double)SIM_WEBCAM_DEFAULT_IPD_M;
+	const double z = f * ipd / d_px;
+	if (!(z >= 0.1 && z <= 5.0)) {
+		return false;
+	}
+	const double sx = cfg->mirrored ? 1.0 : -1.0; // the same un-mirroring as the display mapping
+
+	double p[2][3];
+	for (int i = 0; i < 2; i++) {
+		p[i][0] = sx * ((double)lm->eye_px[i][0] - cx) * z / f;
+		p[i][1] = -((double)lm->eye_px[i][1] - cy) * z / f;
+		p[i][2] = z;
+	}
+	const int l = p[0][0] <= p[1][0] ? 0 : 1;
+	for (int e = 0; e < 2; e++) {
+		const double *q = p[e == 0 ? l : 1 - l];
+		const double n = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]);
+		for (int c = 0; c < 3; c++) {
+			out->dir[e][c] = (float)(q[c] / n);
+		}
+		out->distance_m[e] = (float)n;
 	}
 	return true;
 }
@@ -371,6 +415,19 @@ sim_webcam_select_mode(const struct u_stereo_uvc_mode *modes, uint32_t count, st
 	}
 	*out = modes[best];
 	return true;
+}
+
+void
+sim_webcam_camera_key(const struct u_stereo_uvc_device *dev, char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return;
+	}
+	if (dev->has_vid_pid) {
+		snprintf(out, cap, "%04x:%04x", dev->vid, dev->pid);
+	} else {
+		snprintf(out, cap, "%s", dev->id[0] != '\0' ? dev->id : dev->name);
+	}
 }
 
 bool
