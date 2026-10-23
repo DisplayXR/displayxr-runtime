@@ -215,3 +215,88 @@ TEST_CASE("placement keeps the hands in view from the nominal viewer", "[sim_inp
 	CHECK(sim_input_hand_center(false, z, h, NAN, -1.0f).position.y ==
 	      Catch::Approx(sim_input_hand_center(false, z, h, 0.10f, 0.60f).position.y));
 }
+
+TEST_CASE("the hand's own size follows the Leap gain, display-metric (HAND_SCALE_H_PER_M)", "[sim_input][hands]")
+{
+	// The Ultraleap provider's relative mapping draws a hand at 2.5 display
+	// heights per metre (ultraleap_map.h): a 10 cm hand on a 0.194 m panel
+	// shows as 0.25 H = 4.9 cm. The sim hand matches it.
+	const float H = 0.194f;
+	const float z = SIM_INPUT_HAND_DISTANCE_DEFAULT_M, vy = 0.10f, vz = 0.60f;
+
+	// The factor: gain x H; <= 0 / non-finite = 1:1 metres; no height = the fallback H.
+	CHECK(sim_input_hand_scale(SIM_INPUT_HAND_SCALE_DEFAULT_H_PER_M, H) == Catch::Approx(2.5f * H));
+	CHECK(sim_input_hand_scale(0.0f, H) == 1.0f);
+	CHECK(sim_input_hand_scale(-1.0f, H) == 1.0f);
+	CHECK(sim_input_hand_scale(NAN, H) == 1.0f);
+	CHECK(sim_input_hand_scale(2.5f, 0.0f) == Catch::Approx(2.5f * SIM_INPUT_DISPLAY_HEIGHT_FALLBACK_M));
+
+	for (bool left : {true, false}) {
+		CAPTURE(left);
+		const xrt_hand hand = left ? XRT_HAND_LEFT : XRT_HAND_RIGHT;
+		const xrt_pose c = sim_input_hand_center(left, z, H, vy, vz);
+		xrt_space_relation root = {};
+		sim_input_hand_relation(&c, sim_input_hand_radius(H, z, vz), left ? M_PI : 0.0, 1000 * kNsPerS, &root);
+
+		u_hand_tracking_curl_values open = {};
+		sim_input_hand_curls(SIM_INPUT_PINCH_OPEN, 0.0, 0, &open);
+		xrt_hand_joint_set real = {}; // 1:1 metres, what u_hand_simulation produces
+		u_hand_sim_simulate_for_valve_index_knuckles(&open, hand, &root, &real);
+
+		xrt_hand_joint_set dflt = real;
+		sim_input_hand_scale_joints(&dflt, sim_input_hand_scale(SIM_INPUT_HAND_SCALE_DEFAULT_H_PER_M, H));
+		xrt_hand_joint_set off = real;
+		sim_input_hand_scale_joints(&off, sim_input_hand_scale(0.0f, H));
+
+		const auto &jr = real.values.hand_joint_set_default;
+		const auto &jd = dflt.values.hand_joint_set_default;
+		const auto &jo = off.values.hand_joint_set_default;
+		const float real_span = dist(jr[XRT_HAND_JOINT_WRIST].relation.pose.position,
+		                             jr[XRT_HAND_JOINT_MIDDLE_TIP].relation.pose.position);
+		const float drawn_span = dist(jd[XRT_HAND_JOINT_WRIST].relation.pose.position,
+		                              jd[XRT_HAND_JOINT_MIDDLE_TIP].relation.pose.position);
+		const float per_10cm = drawn_span / real_span * 0.10f;
+		std::printf("HAND_SCALE %s: real wrist-middle tip %.4f m -> drawn %.4f m; per 10 cm %.4f m = %.3f H\n",
+		            left ? "left " : "right", real_span, drawn_span, per_10cm, per_10cm / H);
+		CAPTURE(real_span, drawn_span, per_10cm);
+		CHECK(real_span > 0.10f); // a plausible real hand
+		// 0.25 H +/- 10% per 10 cm of real hand.
+		CHECK(per_10cm > 0.25f * H * 0.9f);
+		CHECK(per_10cm < 0.25f * H * 1.1f);
+
+		// The wrist IS the root (local origin) and stays there.
+		CHECK(dist(jd[XRT_HAND_JOINT_WRIST].relation.pose.position, {0.0f, 0.0f, 0.0f}) < 1e-6f);
+		// The root (circle point, grip pose) does not move: the placement
+		// tests above stay what they were.
+		CHECK(dflt.hand_pose.pose.position.x == real.hand_pose.pose.position.x);
+		CHECK(dflt.hand_pose.pose.position.y == real.hand_pose.pose.position.y);
+		CHECK(dflt.hand_pose.pose.position.z == real.hand_pose.pose.position.z);
+
+		// Joints are hand-local (the state tracker composes hand_pose onto
+		// them), so the root is the local origin.
+		const xrt_vec3 rp = {0.0f, 0.0f, 0.0f};
+		for (int i = 0; i < XRT_HAND_JOINT_COUNT; i++) {
+			CAPTURE(i);
+			// Radii scale by the same factor.
+			CHECK(jd[i].radius == Catch::Approx(jr[i].radius * 2.5f * H));
+			// Joint offsets from the root scale by it too.
+			CHECK(dist(jd[i].relation.pose.position, rp) ==
+			      Catch::Approx(dist(jr[i].relation.pose.position, rp) * 2.5f * H).margin(1e-6));
+			// 0 restores 1:1 exactly.
+			CHECK(jo[i].relation.pose.position.x == jr[i].relation.pose.position.x);
+			CHECK(jo[i].relation.pose.position.y == jr[i].relation.pose.position.y);
+			CHECK(jo[i].relation.pose.position.z == jr[i].relation.pose.position.z);
+			CHECK(jo[i].radius == jr[i].radius);
+		}
+
+		// A held pinch stays a pinch at the drawn size.
+		u_hand_tracking_curl_values hold = {};
+		sim_input_hand_curls(SIM_INPUT_PINCH_HOLD, 0.0, 0, &hold);
+		xrt_hand_joint_set pinch = {};
+		u_hand_sim_simulate_for_valve_index_knuckles(&hold, hand, &root, &pinch);
+		sim_input_hand_scale_joints(&pinch, sim_input_hand_scale(SIM_INPUT_HAND_SCALE_DEFAULT_H_PER_M, H));
+		const auto &jp = pinch.values.hand_joint_set_default;
+		CHECK(dist(jp[XRT_HAND_JOINT_THUMB_TIP].relation.pose.position,
+		           jp[XRT_HAND_JOINT_INDEX_TIP].relation.pose.position) < 0.015f);
+	}
+}

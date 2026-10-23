@@ -52,6 +52,10 @@ struct sim_input_controller_config
 	//! `get_display_geometry`); viewer_z_m <= 0 = the script's fallback viewer.
 	float viewer_y_m;
 	float viewer_z_m;
+	//! `HAND_SCALE_H_PER_M` resolved against the display height
+	//! (@ref sim_input_hand_scale): metres of drawn hand per metre of real
+	//! hand. <= 0 = 1:1.
+	float hand_scale;
 };
 
 /*!
