@@ -357,14 +357,17 @@ win_preferred_mode(const char *gdi_device_name, uint32_t *out_w, uint32_t *out_h
 /*!
  * The native mode of a screen row: the registry's device mode where the
  * platform reader fills one (Linux DRM, macOS), DisplayConfig's preferred mode
- * on Windows. Shared by the headless and the service builder.
+ * on Windows; on macOS the current backing store against the panel's pixel
+ * grid. Shared by the headless and the service builder.
  */
 static void
 fill_native(const struct xrt_screen *in, struct xrt_status_screen *s)
 {
 	uint32_t mode_w = in->native_width;
 	uint32_t mode_h = in->native_height;
+#ifndef XRT_OS_MACOS
 	uint32_t pref_w = 0, pref_h = 0;
+#endif
 #ifdef XRT_OS_WINDOWS
 	uint32_t w = 0, h = 0, mhz = 0;
 	if (win_preferred_mode(s->device_name, &w, &h, &mhz)) {
@@ -381,7 +384,15 @@ fill_native(const struct xrt_screen *in, struct xrt_status_screen *s)
 	pref_w = in->preferred_width;
 	pref_h = in->preferred_height;
 #endif
+#ifdef XRT_OS_MACOS
+	// The rect is in POINTS and the mode in BACKING pixels, so the desktop
+	// rule would flag every 2x Retina mode. Native iff the backing store is
+	// the panel's own pixel grid (os_display_desktop_macos.c fills it as the
+	// preferred mode); 0 = unknown, which never warns.
+	u_status_native_resolve_backing(&s->native, mode_w, mode_h, in->preferred_width, in->preferred_height);
+#else
 	u_status_native_resolve(&s->native, mode_w, mode_h, pref_w, pref_h, s->desktop.width, s->desktop.height);
+#endif
 }
 
 /*!

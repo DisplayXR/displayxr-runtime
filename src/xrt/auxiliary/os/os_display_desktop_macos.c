@@ -37,6 +37,18 @@
  * POINT width on a HiDPI mode (1920 for a 4K panel at 1920x1080@2x). This file
  * used it for the caller-DPI pair until the multi-screen enumeration landed,
  * which made `isPanelConfirmed` false on every Retina panel.
+ *
+ * ## The panel's own pixel grid: `preferred_width/height`
+ *
+ * `native_width` is the CURRENT mode's backing store, which on a HiDPI mode is
+ * the panel's pixel grid only when the user picked the default "looks like"
+ * size: "More Space" renders a LARGER backing store (1800x1169@2x = 3600x2338
+ * on a 3024x1964 panel) and downsamples it, "Larger Text" renders a smaller
+ * one and upsamples it. Either breaks a 3D panel's weave. So the panel's
+ * native pixel size is published separately, as `preferred_width/height`
+ * (the field desktop Linux fills from Mutter's preferred mode), and the screen
+ * is at its native mode iff current backing == preferred — see
+ * @ref panel_native_mode.
  */
 
 #include "os_display_desktop.h"
@@ -48,6 +60,7 @@
 
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/graphics/IOGraphicsTypes.h> // kDisplayModeNativeFlag
 // CGDisplayCreateUUIDFromDisplayID is declared in ColorSync, NOT CoreGraphics —
 // it was moved there in 10.13 and CoreGraphics re-exports only the symbol, not
 // the declaration. Including CoreGraphics alone builds it as an implicit
@@ -196,6 +209,78 @@ os_display_macos_is_test_fake(uint32_t display_id)
 	return display_id == OS_DISPLAY_MACOS_TEST_FAKE_ID && os_display_macos_test_split(NULL);
 }
 
+/*!
+ * The panel's native pixel size: the display's real pixel grid, which is what
+ * the current mode's backing store must equal for the window server to scan it
+ * out 1:1.
+ *
+ * 1. The mode IOKit flags `kDisplayModeNativeFlag`. On Apple Silicon the
+ *    built-in panel flags both the 1x mode and the default HiDPI mode whose
+ *    backing equals it (3024x1964 and 1512x982@2x on a 14" MacBook Pro); their
+ *    pixel sizes agree, so any flagged mode answers. The duplicate low-res
+ *    (HiDPI) modes are listed so a display that only flags its HiDPI variant
+ *    is still found.
+ * 2. Fallback, no mode flagged: the largest 1x mode (pixel size == point
+ *    size), i.e. the largest real timing. Deliberately NOT the largest mode
+ *    overall, which on a Retina panel is a "More Space" HiDPI mode whose
+ *    backing (3600x2338) is larger than the panel. `kDisplayModeDefaultFlag`
+ *    is not used: it marks the mode macOS would pick by default, which on an
+ *    external HiDPI-capable monitor is often a scaled mode, not the panel grid.
+ *
+ * @return false (outputs untouched) when the display lists no usable mode.
+ */
+static bool
+panel_native_mode(CGDirectDisplayID did, uint32_t *out_w, uint32_t *out_h)
+{
+	const void *keys[] = {kCGDisplayShowDuplicateLowResolutionModes};
+	const void *vals[] = {kCFBooleanTrue};
+	CFDictionaryRef opts =
+	    CFDictionaryCreate(NULL, keys, vals, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFArrayRef modes = CGDisplayCopyAllDisplayModes(did, opts);
+	if (opts != NULL) {
+		CFRelease(opts);
+	}
+	if (modes == NULL) {
+		return false;
+	}
+
+	uint32_t flagged_w = 0, flagged_h = 0;
+	uint32_t big_w = 0, big_h = 0;
+	const CFIndex count = CFArrayGetCount(modes);
+	for (CFIndex i = 0; i < count; i++) {
+		CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+		const uint32_t pw = (uint32_t)CGDisplayModeGetPixelWidth(m);
+		const uint32_t ph = (uint32_t)CGDisplayModeGetPixelHeight(m);
+		if (pw == 0 || ph == 0) {
+			continue;
+		}
+		if ((CGDisplayModeGetIOFlags(m) & kDisplayModeNativeFlag) != 0 &&
+		    (uint64_t)pw * ph > (uint64_t)flagged_w * flagged_h) {
+			flagged_w = pw;
+			flagged_h = ph;
+		}
+		const bool one_x =
+		    pw == (uint32_t)CGDisplayModeGetWidth(m) && ph == (uint32_t)CGDisplayModeGetHeight(m);
+		if (one_x && (uint64_t)pw * ph > (uint64_t)big_w * big_h) {
+			big_w = pw;
+			big_h = ph;
+		}
+	}
+	CFRelease(modes);
+
+	if (flagged_w > 0) {
+		*out_w = flagged_w;
+		*out_h = flagged_h;
+		return true;
+	}
+	if (big_w > 0) {
+		*out_w = big_w;
+		*out_h = big_h;
+		return true;
+	}
+	return false;
+}
+
 //! The real CoreGraphics record of @p display_id.
 static bool
 fill_desktop_info_cg(uint32_t display_id, struct os_display_desktop_info *out_info);
@@ -209,6 +294,7 @@ cut_desktop_info(struct os_display_desktop_info *d, uint32_t x0, uint32_t w)
 	d->left += (int32_t)x0;
 	d->width = w;
 	d->native_width = (uint32_t)((double)d->native_width * frac + 0.5);
+	d->preferred_width = (uint32_t)((double)d->preferred_width * frac + 0.5);
 	d->width_in_caller_dpi = (uint32_t)((double)d->width_in_caller_dpi * frac + 0.5);
 	d->physical_width_mm = (uint32_t)((double)d->physical_width_mm * frac + 0.5);
 }
@@ -289,6 +375,14 @@ fill_desktop_info_cg(uint32_t display_id, struct os_display_desktop_info *out_in
 		out_info->native_height = px_h;
 		out_info->native_source = OS_DISPLAY_NATIVE_SOURCE_COREGRAPHICS;
 		out_info->scale = (double)px_w / (double)out_info->width;
+		// The panel's own grid, so "is this screen native?" compares the
+		// current backing store with it in device pixels, never against the
+		// point rect (which is half the size on every 2x Retina mode).
+		uint32_t pref_w = 0, pref_h = 0;
+		if (panel_native_mode(did, &pref_w, &pref_h)) {
+			out_info->preferred_width = pref_w;
+			out_info->preferred_height = pref_h;
+		}
 	}
 	out_info->width_in_caller_dpi = px_w;
 	out_info->height_in_caller_dpi = px_h;

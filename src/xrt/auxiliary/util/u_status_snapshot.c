@@ -470,6 +470,24 @@ u_status_native_resolve(struct xrt_status_native *n,
 }
 
 void
+u_status_native_resolve_backing(
+    struct xrt_status_native *n, uint32_t backing_w, uint32_t backing_h, uint32_t panel_w, uint32_t panel_h)
+{
+	// Panel grid unknown: the native mode is unknown (0x0, never warns) —
+	// NOT the backing compared against the point rect, which is the 2x Retina
+	// false positive this basis exists to avoid.
+	u_status_native_resolve(n, backing_w, backing_h, panel_w, panel_h, 0, 0);
+	n->basis = XRT_STATUS_NATIVE_BASIS_BACKING;
+	if (panel_w == 0 || panel_h == 0) {
+		n->width = 0;
+		n->height = 0;
+		n->is_native = false;
+		n->current_width = backing_w;
+		n->current_height = backing_h;
+	}
+}
+
+void
 u_status_physical_pick(uint32_t confidence,
                        float plugin_w_m,
                        float plugin_h_m,
@@ -515,12 +533,14 @@ u_status_warnings_derive(struct xrt_status_snapshot *snap)
 		const bool claimed = s->claim.plugin_id[0] != '\0';
 
 		// NOT_NATIVE — only when the native mode is KNOWN; unknown never warns.
-		// Compositor basis (desktop Linux): its current mode is not its
-		// preferred one. Otherwise: the desktop rect is not the native mode.
+		// Compositor / backing basis (desktop Linux, macOS): the current mode
+		// is not the preferred (panel-native) one, both device pixels.
+		// Otherwise: the desktop rect is not the native mode.
 		const bool native_known = s->native.width > 0 && s->native.height > 0;
 		bool not_native = false;
 		uint32_t now_w = s->desktop.width, now_h = s->desktop.height;
-		if (s->native.basis == XRT_STATUS_NATIVE_BASIS_COMPOSITOR) {
+		const bool backing = s->native.basis == XRT_STATUS_NATIVE_BASIS_BACKING;
+		if (s->native.basis == XRT_STATUS_NATIVE_BASIS_COMPOSITOR || backing) {
 			now_w = s->native.current_width;
 			now_h = s->native.current_height;
 			not_native = native_known && now_w > 0 && now_h > 0 && !s->native.is_native;
@@ -528,7 +548,19 @@ u_status_warnings_derive(struct xrt_status_snapshot *snap)
 			not_native = native_known && now_w > 0 && now_h > 0 &&
 			             (now_w != s->native.width || now_h != s->native.height);
 		}
-		if (claimed && not_native) {
+		if (claimed && not_native && backing) {
+			// macOS renders a scaled resolution into a backing store of
+			// another size and resamples it onto the panel; the fix is the
+			// tile System Settings > Displays labels "Default", not a size to
+			// type. Kept under XRT_STATUS_TEXT_MAX (128) at 4-digit sizes.
+			const bool larger = (uint64_t)now_w * now_h > (uint64_t)s->native.width * s->native.height;
+			(void)snprintf(
+			    text, sizeof(text),
+			    "macOS 'Displays' is set to a scaled resolution (rendered %ux%u, %s to the %ux%u "
+			    "panel): choose Default.",
+			    now_w, now_h, larger ? "downsampled" : "upsampled", s->native.width, s->native.height);
+			screen_warn(s, U_STATUS_W_NOT_NATIVE, XRT_STATUS_LEVEL_CRITICAL, text);
+		} else if (claimed && not_native) {
 			(void)snprintf(
 			    text, sizeof(text),
 			    "Set this screen to its native %ux%u (now %ux%u): a 3D panel weaves correctly only "

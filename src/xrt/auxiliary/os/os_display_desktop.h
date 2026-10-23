@@ -182,12 +182,15 @@ struct os_display_desktop_info
 	//! (Mutter DisplayConfig does; DRM sysfs does not). 0 = unknown.
 	uint32_t native_refresh_mhz;
 
-	//! The compositor's PREFERRED mode for this connector, when the compositor
-	//! reports one (Mutter DisplayConfig's `is-preferred` mode; @ref
-	//! native_source is then COMPOSITOR and @ref native_width is the
-	//! compositor's CURRENT mode). "Is this output at its native mode?" is
-	//! then current == preferred — a fact in device pixels, unlike @ref width,
-	//! which is a logical rect on a scaled desktop. 0 = unknown.
+	//! The output's PREFERRED (panel-native) mode, when the platform reports
+	//! one; @ref native_width is then the CURRENT mode. Desktop Linux: Mutter
+	//! DisplayConfig's `is-preferred` mode (@ref native_source COMPOSITOR).
+	//! macOS: the panel's native pixel grid (the `kDisplayModeNativeFlag`
+	//! mode, else the largest 1x mode), while @ref native_width is the
+	//! current mode's backing store (@ref native_source COREGRAPHICS). "Is
+	//! this output at its native mode?" is then current == preferred — a fact
+	//! in device pixels, unlike @ref width, which is a logical rect on a scaled
+	//! desktop (points on macOS). 0 = unknown.
 	uint32_t preferred_width;
 	uint32_t preferred_height;
 	/*! @} */
