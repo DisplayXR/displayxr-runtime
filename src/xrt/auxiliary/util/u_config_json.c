@@ -23,12 +23,10 @@
 #include <sys/stat.h>
 
 #include "bindings/b_generated_bindings_helpers.h"
-#include <assert.h>
 
 DEBUG_GET_ONCE_OPTION(active_config, "P_OVERRIDE_ACTIVE_CONFIG", NULL)
 
 #define CONFIG_FILE_NAME "config_v0.json"
-#define GUI_STATE_FILE_NAME "gui_state_v0.json"
 
 void
 u_config_json_close(struct u_config_json *json)
@@ -101,44 +99,6 @@ get_obj(cJSON *json, const char *name)
 		U_LOG_I("JSON does not contain node '%s'!", name);
 	}
 	return item;
-}
-
-XRT_MAYBE_UNUSED static bool
-get_obj_bool(cJSON *json, const char *name, bool *out_bool)
-{
-	if (json == NULL) {
-		return false;
-	}
-	cJSON *item = get_obj(json, name);
-	if (item == NULL) {
-		return false;
-	}
-
-	if (!u_json_get_bool(item, out_bool)) {
-		U_LOG_E("Failed to parse '%s'!", name);
-		return false;
-	}
-
-	return true;
-}
-
-static bool
-get_obj_int(cJSON *json, const char *name, int *out_int)
-{
-	if (json == NULL) {
-		return false;
-	}
-	cJSON *item = get_obj(json, name);
-	if (item == NULL) {
-		return false;
-	}
-
-	if (!u_json_get_int(item, out_int)) {
-		U_LOG_E("Failed to parse '%s'!", name);
-		return false;
-	}
-
-	return true;
 }
 
 static bool
@@ -237,40 +197,6 @@ u_config_json_get_active(struct u_config_json *json, enum u_config_json_active_c
 	parse_active(tmp, "json", out_active);
 }
 
-bool
-u_config_json_get_remote_settings(struct u_config_json *json, int *out_port, uint32_t *out_view_count)
-{
-	cJSON *t = cJSON_GetObjectItemCaseSensitive(json->root, "remote");
-	if (t == NULL) {
-		U_LOG_E("No remote node");
-		return false;
-	}
-
-	int ver = -1;
-	if (!get_obj_int(t, "version", &ver)) {
-		U_LOG_E("Missing version tag!");
-		return false;
-	}
-	if (ver >= 1) {
-		U_LOG_E("Unknown version tag '%i'!", ver);
-		return false;
-	}
-
-	int port = 0;
-	if (!get_obj_int(t, "port", &port)) {
-		return false;
-	}
-	int view_count = 0;
-	if (!get_obj_int(t, "view_count", &view_count)) {
-		return false;
-	}
-
-	*out_port = port;
-	*out_view_count = view_count;
-
-	return true;
-}
-
 static cJSON *
 open_tracking_settings(struct u_config_json *json)
 {
@@ -347,51 +273,6 @@ u_config_json_get_tracking_overrides(struct u_config_json *json,
 	return true;
 }
 
-bool
-u_config_json_get_tracking_settings(struct u_config_json *json, struct xrt_settings_tracking *s)
-{
-	cJSON *t = open_tracking_settings(json);
-	if (t == NULL) {
-		return false;
-	}
-
-	char tmp[16];
-
-	bool bad = false;
-
-	int ver = -1;
-
-	bad |= !get_obj_int(t, "version", &ver);
-	if (bad || ver >= 1) {
-		U_LOG_E("Missing or unknown version tag '%i' in tracking config", ver);
-		return false;
-	}
-
-
-	bad |= !get_obj_str(t, "camera_name", s->camera_name, sizeof(s->camera_name));
-	bad |= !get_obj_int(t, "camera_mode", &s->camera_mode);
-	bad |= !get_obj_str(t, "camera_type", tmp, sizeof(tmp));
-	bad |= !get_obj_str(t, "calibration_path", s->calibration_path, sizeof(s->calibration_path));
-	if (bad) {
-		return false;
-	}
-
-	if (strcmp(tmp, "regular_mono") == 0) {
-		s->camera_type = XRT_SETTINGS_CAMERA_TYPE_REGULAR_MONO;
-	} else if (strcmp(tmp, "regular_sbs") == 0) {
-		s->camera_type = XRT_SETTINGS_CAMERA_TYPE_REGULAR_SBS;
-	} else if (strcmp(tmp, "ps4") == 0) {
-		s->camera_type = XRT_SETTINGS_CAMERA_TYPE_PS4;
-	} else if (strcmp(tmp, "leap_motion") == 0) {
-		s->camera_type = XRT_SETTINGS_CAMERA_TYPE_LEAP_MOTION;
-	} else {
-		U_LOG_W("Unknown camera type '%s'", tmp);
-		return false;
-	}
-
-	return true;
-}
-
 static void
 u_config_json_make_default_root(struct u_config_json *json)
 {
@@ -410,45 +291,6 @@ u_config_write(struct u_config_json *json, const char *filename)
 	fclose(config_file);
 	config_file = NULL;
 	free(str);
-}
-
-void
-u_config_json_save_calibration(struct u_config_json *json, struct xrt_settings_tracking *settings)
-{
-	if (!json->file_loaded) {
-		u_config_json_make_default_root(json);
-	}
-	u_config_json_assign_schema(json);
-
-	cJSON *root = json->root;
-
-	cJSON *t = cJSON_GetObjectItem(root, "tracking");
-	if (!t) {
-		t = cJSON_AddObjectToObject(root, "tracking");
-	}
-
-	cJSON_DeleteItemFromObject(t, "version");
-	cJSON_AddNumberToObject(t, "version", 0);
-
-	cJSON_DeleteItemFromObject(t, "camera_name");
-	cJSON_AddStringToObject(t, "camera_name", settings->camera_name);
-
-	cJSON_DeleteItemFromObject(t, "camera_mode");
-	cJSON_AddNumberToObject(t, "camera_mode", settings->camera_mode);
-
-	cJSON_DeleteItemFromObject(t, "camera_type");
-	switch (settings->camera_type) {
-	case XRT_SETTINGS_CAMERA_TYPE_REGULAR_MONO: cJSON_AddStringToObject(t, "camera_type", "regular_mono"); break;
-	case XRT_SETTINGS_CAMERA_TYPE_REGULAR_SBS: cJSON_AddStringToObject(t, "camera_type", "regular_sbs"); break;
-	case XRT_SETTINGS_CAMERA_TYPE_SLAM: cJSON_AddStringToObject(t, "camera_type", "slam_sbs"); break;
-	case XRT_SETTINGS_CAMERA_TYPE_PS4: cJSON_AddStringToObject(t, "camera_type", "ps4"); break;
-	case XRT_SETTINGS_CAMERA_TYPE_LEAP_MOTION: cJSON_AddStringToObject(t, "camera_type", "leap_motion"); break;
-	}
-
-	cJSON_DeleteItemFromObject(t, "calibration_path");
-	cJSON_AddStringToObject(t, "calibration_path", settings->calibration_path);
-
-	u_config_write(json, CONFIG_FILE_NAME);
 }
 
 static cJSON *
@@ -511,55 +353,4 @@ u_config_json_save_overrides(struct u_config_json *json, struct xrt_tracking_ove
 	}
 
 	u_config_write(json, CONFIG_FILE_NAME);
-}
-
-void
-u_gui_state_open_file(struct u_config_json *json)
-{
-	u_config_json_open_or_create_file(json, GUI_STATE_FILE_NAME);
-}
-
-static const char *
-u_gui_state_scene_to_string(enum u_gui_state_scene scene)
-{
-	switch (scene) {
-	case GUI_STATE_SCENE_CALIBRATE: return "calibrate";
-	default: assert(false); return NULL;
-	}
-}
-
-struct cJSON *
-u_gui_state_get_scene(struct u_config_json *json, enum u_gui_state_scene scene)
-{
-	if (json->root == NULL) {
-		return NULL;
-	}
-	const char *scene_name = u_gui_state_scene_to_string(scene);
-
-	struct cJSON *c =
-	    cJSON_DetachItemFromObjectCaseSensitive(cJSON_GetObjectItemCaseSensitive(json->root, "scenes"), scene_name);
-	cJSON_Delete(json->root);
-	return c;
-}
-
-void
-u_gui_state_save_scene(struct u_config_json *json, enum u_gui_state_scene scene, struct cJSON *new_state)
-{
-
-	if (!json->file_loaded) {
-		u_config_json_make_default_root(json);
-	}
-
-	cJSON *root = json->root;
-
-	const char *scene_name = u_gui_state_scene_to_string(scene);
-
-	struct cJSON *sc = cJSON_GetObjectItemCaseSensitive(root, "scenes");
-
-	if (!sc) {
-		sc = cJSON_AddObjectToObject(root, "scenes");
-	}
-	cJSON_DeleteItemFromObject(sc, scene_name);
-	cJSON_AddItemToObject(sc, scene_name, new_state);
-	u_config_write(json, GUI_STATE_FILE_NAME);
 }

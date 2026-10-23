@@ -188,8 +188,7 @@
   ],
 
   "excluded": {
-    "displayxr-runtime": "No LunarG step -- Vulkan comes from vcpkg (vulkan-headers + vulkan-loader + glslang[tools]) at a pinned commit. Immutable pins cannot rot; this is the pattern the others should migrate to (runtime#1029).",
-    "displayxr-runtime/.gitlab-ci/windows/monado_deps_build.ps1": "Inert Monado-era leftover carrying a stale LunarG URL. Not on any active CI path -- excluded so the canary does not report a failure nothing can act on."
+    "displayxr-runtime": "No LunarG step -- Vulkan comes from vcpkg (vulkan-headers + vulkan-loader + glslang[tools]) at a pinned commit. Immutable pins cannot rot; this is the pattern the others should migrate to (runtime#1029)."
   },
 
   "consumer_floors": {

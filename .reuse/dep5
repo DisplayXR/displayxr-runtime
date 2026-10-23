@@ -2,22 +2,6 @@ Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: Monado
 Source: <https://monado.freedesktop.org>
 
-Files: doc/changes/drivers/*
-  doc/changes/misc_features/*
-  doc/changes/misc_fixes/*
-  doc/changes/state_trackers/*
-  doc/changes/libmonado/*
-  doc/changes/ipc/*
-  doc/changes/xrt/*
-  doc/changes/auxiliary/*
-  doc/changes/compositor/*
-  doc/changes/doc/*
-  doc/changes/big/*
-  doc/changes/tracking/*
-Copyright: 2020-2025, Collabora, Ltd. and the Monado contributors
-License: CC0-1.0
-Comment: Prevents needing a license header per fragment between releases.
-
 Files: src/xrt/targets/openxr_android/src/main/res/mipmap-mdpi/*.webp
   src/xrt/targets/openxr_android/src/main/res/mipmap-hdpi/*.webp
   src/xrt/targets/openxr_android/src/main/res/mipmap-xhdpi/*.webp
@@ -32,11 +16,6 @@ Copyright: 2023-2024, Collabora, Ltd.
 License: CC-BY-4.0
 Comment: Based on the official Monado logo commissioned by Collabora.
 
-Files: doc/doxygen-awesome-css/*
-Copyright: 2021-2023, jothepro
-License: MIT
-Comment: SPDX-License-Identifier missing.
-
 Files: src/external/cjson/*
 Copyright: 2009-2017, Dave Gamble and cJSON contributors
 License: MIT
@@ -49,16 +28,6 @@ Copyright: 2016-2020, Mitchell Dowd
 License: MIT
 Comment: SPDX-License-Identifier missing.
  Debian calls this "Expat" for clarity.
-
-Files: src/external/hungarian/*
-Copyright: 2016, mcximing
-License: BSD-2-Clause
-Comment: SPDX-License-Identifier missing.
-
-Files: src/external/openvr_includes/*
-Copyright: 2015-2020, Valve Corporation
-License: BSD-3-Clause
-Comment: License identifier missing.
 
 Files: src/external/imgui/imgui*
  src/external/imgui/imconfig.h
@@ -120,13 +89,3 @@ Files: src/external/tracy/*
 Copyright: 2017-2022, Bartosz Taudul
 License: BSD-3-Clause
 Comment: SPDX-License-Identifier missing.
-
-Files: src/external/valve-file-vdf/*
-Copyright: 2016-2023, Matthias Moeller
-License: MIT
-Comment: SPDX-License-Identifier missing.
-
-Files: flake.lock
-Copyright: No copyright
-License: CC0-1.0
-Comment: Computer-generated files do not have a copyright per US law.

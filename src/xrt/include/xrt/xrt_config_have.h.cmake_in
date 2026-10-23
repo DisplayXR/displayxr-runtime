@@ -11,13 +11,11 @@
 
 /* keep sorted */
 
-#cmakedefine XRT_HAVE_BLUETOOTH
 #cmakedefine XRT_HAVE_D3D11
 #cmakedefine XRT_HAVE_D3D12
 #cmakedefine XRT_HAVE_DBUS
 #cmakedefine XRT_HAVE_DXGI
 #cmakedefine XRT_HAVE_EGL
-#cmakedefine XRT_HAVE_HIDAPI
 #cmakedefine XRT_HAVE_JPEG
 #cmakedefine XRT_HAVE_LIBBSD
 #cmakedefine XRT_HAVE_METAL
@@ -31,6 +29,5 @@
 #cmakedefine XRT_HAVE_V4L2
 #cmakedefine XRT_HAVE_VULKAN
 #cmakedefine XRT_HAVE_WAYLAND
-#cmakedefine XRT_HAVE_WAYLAND_DIRECT
 #cmakedefine XRT_HAVE_WIL
 #cmakedefine XRT_HAVE_WINRT
