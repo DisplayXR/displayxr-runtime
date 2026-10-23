@@ -24,6 +24,7 @@ set(tests
     tests_worker
     tests_pose
     tests_view_rig_point
+    tests_mirror_calib
     tests_vec3_angle
     tests_u_multi_display
     tests_dp_weave_scope
@@ -594,6 +595,8 @@ target_link_libraries(tests_pose PRIVATE aux_math)
 # shared core's eye mapping: bit-for-bit against displayxr-common across a sweep,
 # plus the issue's joint cases.
 target_link_libraries(tests_view_rig_point PRIVATE aux_math)
+# Mirror-alignment camera-pose calibration solver (tracking-provider-discovery.md, "Camera pose calibration").
+target_link_libraries(tests_mirror_calib PRIVATE aux_math)
 target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
@@ -922,6 +925,42 @@ if(TARGET tests_oxr_view_space)
 		                 DXR_TRACKING_SIM_TRACKING_AMPLITUDE_M=0.1 $<TARGET_FILE:tests_oxr_view_space>
 		                 "[viewer_tracking]" --success --allow-running-no-tests
 		         )
+
+		# Camera-pose calibration end to end (tracking-provider-discovery.md, "Camera
+		# pose calibration"): the real sim_tracking plug-in with a hidden
+		# CAMERA_TRUE_POSE -> camera-space samples at five dots x two distances ->
+		# the solver -> CAMERA_POSE_0 -> the provider's display-space output. The
+		# collected pairs feed the CLI arms (`tracking calibrate solve` on them,
+		# `tracking calibrate --watch --json` on the live provider).
+		add_executable(tests_tracking_calibrate_e2e tests_tracking_calibrate_e2e.cpp)
+		target_link_libraries(
+			tests_tracking_calibrate_e2e PRIVATE xrt-external-catch2 target_lists xrt-interfaces aux_math aux_util
+			                                     aux_os
+			)
+		add_dependencies(tests_tracking_calibrate_e2e drv_sim_tracking_plugin)
+		set(_calib_pairs "${CMAKE_CURRENT_BINARY_DIR}/tracking_calibrate_e2e_pairs.json")
+		add_test(NAME tests_tracking_calibrate_e2e
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1
+		                 "DXR_CALIB_E2E_OUT=${_calib_pairs}" $<TARGET_FILE:tests_tracking_calibrate_e2e> --success
+		         )
+		set_tests_properties(tests_tracking_calibrate_e2e PROPERTIES FIXTURES_SETUP calib_pairs)
+		if(TARGET cli)
+			add_test(NAME tracking_calibrate_cli_solve
+			         COMMAND $<TARGET_FILE:cli> tracking calibrate solve --in ${_calib_pairs} --mode b --json)
+			set_tests_properties(
+				tracking_calibrate_cli_solve PROPERTIES FIXTURES_REQUIRED calib_pairs PASS_REGULAR_EXPRESSION
+				                                        "\"ok\":[ \t]*true"
+				)
+			add_test(NAME tracking_calibrate_cli_watch
+			         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1
+			                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_CAMERA=1
+			                 $<TARGET_FILE:cli> tracking calibrate --screen E2E-1 --watch --json --count 3
+			         )
+			set_tests_properties(
+				tracking_calibrate_cli_watch PROPERTIES PASS_REGULAR_EXPRESSION
+				                                        "\"tracks_camera_space\":true.*\"camera\":{\"key\":\"sim-tracking:webcam0\""
+				)
+		endif()
 	endif()
 	add_test(NAME tests_oxr_view_space_no_input_providers
 		 COMMAND tests_oxr_view_space "[tracking_props_noproviders]" --success --allow-running-no-tests

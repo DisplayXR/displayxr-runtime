@@ -51,6 +51,51 @@ bool
 sim_tracking_script_eval(
     const struct sim_tracking_script *s, int64_t t_ns, float left[3], float right[3], float head[3]);
 
+/*
+ *
+ * The scripted camera (calibration test bed). Pure, like the script.
+ *
+ */
+
+//! Most CAMERA_POSE_<n> slots a provider scans (n = 0 .. SIM_TRACKING_POSE_SLOTS-1).
+#define SIM_TRACKING_POSE_SLOTS 16
+
+/*!
+ * A simulated webcam. It *measures* the scripted eyes from its TRUE pose (the
+ * hidden ground truth, `CAMERA_TRUE_POSE`) — a camera-space unit direction and
+ * a distance (times `depth_bias`, a simulated per-user iris error) — and the
+ * provider *reports* display-space eyes by mapping those measurements back
+ * through its BELIEVED pose: the calibrated `CAMERA_POSE_<n>` for its camera,
+ * else the prior (top-centre bezel, identity). A correct calibration makes
+ * the reported eyes equal the scripted ones.
+ */
+struct sim_tracking_camera
+{
+	double true_t[3];   //!< ground-truth camera position, display space, metres
+	double true_q[4];   //!< ground-truth orientation x, y, z, w (camera frame -> display frame)
+	double depth_bias;  //!< reported distance = true distance * this (1 = exact)
+	double pose_t[3];   //!< believed pose (calibrated or prior)
+	double pose_q[4];   //!< believed orientation
+	double depth_scale; //!< believed per-user depth correction (CAMERA_POSE_<n>_DEPTH_SCALE), 1 = none
+	double focal_scale; //!< believed focal scale (CAMERA_POSE_<n>_FOCAL_SCALE), 1 = none
+};
+
+//! Parse "tx,ty,tz,qx,qy,qz,qw" (metres; the quaternion is normalised). False (outputs untouched) on error.
+bool
+sim_tracking_parse_pose(const char *s, double t[3], double q[4]);
+
+//! The prior a camera provider uses before calibration: top-centre bezel, T_y = H/2 + 8 mm, identity.
+void
+sim_tracking_camera_prior(float display_height_m, double t[3], double q[4]);
+
+//! What the camera measures for a display-space eye: unit direction + distance (times depth_bias).
+void
+sim_tracking_camera_measure(const struct sim_tracking_camera *c, const float eye[3], float dir[3], float *distance_m);
+
+//! A measurement mapped to display space through the BELIEVED pose: T + R * (depth_scale * d * u'(focal_scale)).
+void
+sim_tracking_camera_to_display(const struct sim_tracking_camera *c, const float dir[3], float distance_m, float out[3]);
+
 #ifdef __cplusplus
 }
 #endif

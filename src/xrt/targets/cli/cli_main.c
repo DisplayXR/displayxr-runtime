@@ -50,7 +50,8 @@ cli_print_help(int argc, const char **argv)
 	P("  tracking <...>    - Viewer-tracking providers (ADR-054 N6; verbs mirror 'input').\n");
 	P("                      'tracking list [--json]', 'tracking enable|disable <id> [--machine]',\n");
 	P("                      'tracking use|prefer <id> [--machine]', 'tracking reset', 'tracking options <id>',\n");
-	P("                      'tracking set <id> <KEY> <value> [--machine]', 'tracking unset <id> <KEY>'.\n");
+	P("                      'tracking set <id> <KEY> <value> [--machine]', 'tracking unset <id> <KEY>',\n");
+	P("                      'tracking calibrate --screen <key> --watch --json' / 'calibrate solve|apply'.\n");
 	P("  runtime <...>     - Inspect / switch the active OpenXR runtime.\n");
 	P("                      'runtime status'   full loader precedence + conflicts,\n");
 	P("                      'runtime list'     every runtime on the box (incl. unregistered),\n");

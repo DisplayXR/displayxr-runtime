@@ -37,6 +37,10 @@ cli_cmd_input(int argc, const char **argv);
 int
 cli_cmd_tracking(int argc, const char **argv);
 
+//! `tracking calibrate [solve|apply]` - mirror-alignment camera-pose calibration (tracking-provider-discovery.md).
+int
+cli_cmd_tracking_calibrate(int argc, const char **argv);
+
 int
 cli_cmd_runtime(int argc, const char **argv);
 

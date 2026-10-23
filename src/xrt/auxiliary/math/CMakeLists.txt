@@ -52,6 +52,8 @@ add_library(
 	m_matrix_2x2.h
 	m_matrix_4x4_f64.h
 	m_matrix_projection.cpp
+	m_mirror_calib.c
+	m_mirror_calib.h
 	m_optics.c
 	m_permutation.c
 	m_permutation.h

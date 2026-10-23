@@ -264,7 +264,7 @@ splices its eyes into every IPC client's views (§4a) — an IPC client is told 
 because the service delivers it. The composed answer is the **primary** screen's; the per-screen
 `xrEnumerateDisplaysDXR` capabilities stay each screen's DP's own (§10).
 
-## 6. Camera-space samples and camera-pose calibration (follow-up)
+## 6. Camera-space samples and camera pose calibration
 
 A camera-based provider MAY report, beside the display-space sample, what it measured in its
 **camera** frame — `sample.camera` with `XRT_TRACKING_SAMPLE_CAMERA_VALID`:
@@ -277,19 +277,145 @@ A camera-based provider MAY report, beside the display-space sample, what it mea
 
 Same `capture_ns` as the display-space sample. Camera frame: origin at the optical centre, +X right
 as the user sees it (un-mirrored), +Y up, +Z out of the lens toward the viewer. `describe()` sets
-`XRT_TRACKING_TRACKS_CAMERA_SPACE` when it fills the block.
-
-Nothing consumes it yet. It is the input of the **mirror-alignment camera-pose calibration**
-(design: `displayxr-tracking-open` `docs/design.md` §10): `displayxr-cli tracking calibrate
---screen <key> --watch --json` streams these samples as NDJSON for the Dashboard's calibration
-window, `displayxr-cli tracking calibrate solve` runs a runtime-side solver (camera pose `(R, T)` in
-display space, per-sample residuals, iris scale), and the result is committed as provider
-settings. Reserved setting keys, **per camera and per screen**: `CAMERA_POSE_<n>` =
-`"tx,ty,tz,qx,qy,qz,qw"` (metres, display space), with `CAMERA_POSE_<n>_CAMERA` = the camera key
-and `CAMERA_POSE_<n>_SCREEN` = the screen key it applies to. A provider applies the pose for the
-camera it reads and the screen it serves; until one is set it uses its own prior (a top-centre
-bezel camera). Any provider that reports camera-space samples gets calibration for free — the
+`XRT_TRACKING_TRACKS_CAMERA_SPACE` when it fills the block. Its one consumer is the camera pose
+calibration below. Any provider that reports camera-space samples gets calibration for free: the
 method and the solver belong to the class, not to a provider.
+
+### Camera pose calibration
+
+Design: `displayxr-tracking-open` `docs/design.md` §10 (mirror alignment). Solver:
+`src/xrt/auxiliary/math/m_mirror_calib.{h,c}` (pure C11, `tests/tests_mirror_calib.cpp`).
+
+**Method.** The display's front surface is a weak mirror: an eye that sees a dot overlap its own
+reflection is on the display normal through that dot (closed-eye variant: the *midpoint* of the
+two eyes is). Each such alignment pins the aligned eye point's display-space `(x, y)` to the dot's
+known position `D_i` — pixel offset × pixel pitch from the display's reported metres — with no
+depth.
+
+**Model.** Camera pose `(R, T)`: display point = `T + R · camera point`. Sample `i` has the eye
+point's camera-space unit direction `u_i`, its estimated distance `s̃_i`, and an unknown true
+distance `s_i`:
+
+```
+xy( T + s_i · R · u_i ) = D_i          (two equations, one new unknown per sample)
+```
+
+For a given pose each `s_i` is eliminated in closed form (the 1-D least-squares foot,
+`s_i = a·(D_i − T_xy) / |a|²` with `a = xy(R u_i)`), so the iteration runs over the pose
+parameters only. The residual is the in-plane distance between the fitted eye point and its dot.
+
+| Mode | Unknowns | Minimum | Solve |
+|---|---|---|---|
+| `a` | `R = I`: `T_x, T_y` | 2 samples at 2 distinct dots | closed form: each sample is a line through `D_i` along `xy(u_i)`; `T` is their least-squares meet |
+| `b` | + pitch (`R = Rx(θ)`) | 3 samples; two head distances to condition θ | Levenberg–Marquardt from (a) |
+| `c` | full `R` (rotation vector) + `T_x, T_y`, optional focal scale `k` | 7 samples at 3 distinct dots (9 in practice: a 3×3 grid at 15 % inset, two distances) | LM from (b) |
+
+`k` = the camera's true focal length / the one its directions were computed with; the corrected
+direction is `normalize(u_x, u_y, k·u_z)`. The reported angles follow
+`R = Rz(roll)·Ry(yaw)·Rx(pitch)` (positive pitch = optical axis tilted down); the quaternion is
+authoritative.
+
+**Observability.**
+- **`T_z` never enters the `x, y` equations, in any mode** — not only under `R = I`. The solver
+  reports the assumed value (`--tz-mm`, default 0 = on the glass plane), which biases the viewer
+  distance one-for-one by a few millimetres. Pinned by a test: data generated with `T_z = 25 mm`
+  fits exactly at any assumed `T_z`.
+- **One dot is degenerate** (scale ambiguity: the dot baseline is what fixes the scale). The
+  solver refuses — `status: "degenerate"` with a reason — when the samples cover fewer distinct
+  dots (≥ 10 mm apart) than the mode needs, when the in-plane rays are parallel, or when the
+  column-scaled normal matrix at the solution is rank deficient. Above condition 10⁶ it still
+  solves but flags `ill_conditioned`.
+- **A fit that puts an eye point behind the camera is refused** (`behind_camera`): typically a
+  wrong model (mode `a` on a strongly pitched camera) or a mirrored camera frame.
+- **Accuracy is geometry-limited.** With a top-bezel camera the centre / top / bottom dots lie on
+  one line through the camera, so `T_y` comes from where the left and right rays cross it. With
+  0.2° direction noise and 2 mm alignment noise, five samples in mode `a` land at a median 2.3 mm
+  (p95 ≈ 6 mm) over random bezel poses; ten samples, median 1.8 mm. The procedure's live check
+  (and arrow-key nudge) closes the tail; rejection (`--reject-mm`, the procedure's 5 mm) drops a
+  sample captured before the head settled.
+- **Iris scale.** `iris_scale = median(s_i / s̃_i)` over the used samples: the user's own iris
+  size against the landmarker's model, which removes the largest depth error. It is committed as
+  `CAMERA_POSE_<n>_DEPTH_SCALE` (`--depth-scale`).
+
+**CLI** (the Dashboard drives these; it links no runtime code, ADR-051 D4):
+
+```
+displayxr-cli tracking calibrate --screen <key> --watch --json [--provider <id>] [--count N] [--interval-ms N]
+displayxr-cli tracking calibrate solve --in <file|-> [--mode a|b|c] [--eye mid|left|right] [--focal]
+                                       [--reject-mm X] [--tz-mm X] [--json]
+displayxr-cli tracking calibrate apply --screen <key> --camera <key> --pose tx,ty,tz,qx,qy,qz,qw
+                                       [--provider <id>] [--depth-scale X] [--focal-scale X] [--slot N] [--machine] [--json]
+```
+
+- **Watch** hosts the provider headlessly in-process (the `selftest` path: discovery, display
+  info, the arbitration; the provider is started with a CLI-owned sink), and prints NDJSON: one
+  `hello` line, then one `sample` line per pushed sample (latest-wins; `--interval-ms` throttles).
+  It stops on Ctrl-C, on EOF of a *piped* stdin (the Dashboard closing its end), or after
+  `--count` samples; without `--watch`, after one. Exit 3 with an `error` line when no provider is
+  resident (`no_provider`), it fails to start (`start_failed`), or it pushes nothing in 5 s
+  (`no_samples`). Reading the service's provider instead is a follow-up (§10 item 5).
+
+```json
+{"type":"hello","screen":"<key>","provider":"sim-tracking","source":"scripted sweep (simulated webcam)",
+ "camera_key":"sim-tracking:webcam0","tracks_camera_space":true,"viewer_source":"provider:sim-tracking",
+ "viewer_reason":"","display":{"width_m":0.60,"height_m":0.34,"pixel_width":3840,"pixel_height":2160},"note":"..."}
+{"type":"sample","seq":12,"capture_ns":270407621817000,"tracking":true,"confidence":1,
+ "display":{"left_eye":[x,y,z],"right_eye":[x,y,z]},
+ "camera":{"key":"sim-tracking:webcam0","left_dir":[x,y,z],"left_distance_m":0.60,"right_dir":[x,y,z],"right_distance_m":0.60}}
+{"type":"error","error":"no_provider","reason":"..."}
+```
+
+  `camera` is `null` on a sample without the camera-space block; `display` in `hello` is `null`
+  when the display info could not be read.
+- **Solve** input: an array of pairs, or `{"mode","eye","camera_key","screen","samples":[...]}`
+  (flags override the file). A pair is `{"dot_m":[x,y], "sample": <a watch sample line>}` (the
+  Dashboard records the line it captured on Space), or `"sample": <its camera object>`, or an
+  already-chosen eye point `{"dot_m":[x,y], "dir":[x,y,z], "distance_m": d}`. `eye` picks the
+  aligned point from the per-eye block (default `mid`, the closed-eye variant). Output (exit 0 ok,
+  2 refused, 1 bad input):
+
+```json
+{"ok":true,"status":"ok","reason":"","mode":"b","eye":"mid","camera_key":"sim-tracking:webcam0","screen":"<key>",
+ "pose":{"t_m":[0.035,0.183,0],"q":[0.0785,0,0,0.9969],"pitch_deg":9.0,"yaw_deg":0,"roll_deg":0,"focal_scale":1,
+         "tz_observable":false},
+ "setting":"0.035000,0.183000,0.000000,0.078459,0.000000,0.000000,0.996917",
+ "rms_mm":0.0,"max_mm":0.0,"iris_scale":1.0,"params":3,"rank":3,"condition":115.4,"ill_conditioned":false,
+ "iterations":7,"sample_count":10,"used_count":10,"distinct_dots":5,
+ "samples":[{"index":0,"dot_m":[0,0],"residual_mm":0.0,"distance_m":0.534,"estimated_distance_m":0.534,"rejected":false}]}
+```
+
+  On refusal `ok` is false, `status` is `invalid_input` / `too_few_samples` / `degenerate` /
+  `behind_camera`, `pose` is `null`, `samples` is empty and `reason` says why.
+- **Apply** writes the reserved settings through the same store as `tracking set` (per user;
+  `--machine` = HKLM on Windows). Slot: the one already holding this camera + screen, else the
+  first free `n` in 0..15 (`--slot` overrides). `--depth-scale` / `--focal-scale` are written when
+  given and cleared otherwise. `--provider` defaults to the row the loader ranks first. `--json`
+  prints `{"ok","provider","slot","store","keys":{...}}`.
+
+**Reserved setting keys** (per camera and per screen; `n` = 0..15):
+
+| Key | Value |
+|---|---|
+| `CAMERA_POSE_<n>` | `"tx,ty,tz,qx,qy,qz,qw"`: metres, display space; camera → display |
+| `CAMERA_POSE_<n>_CAMERA` | the camera key it applies to |
+| `CAMERA_POSE_<n>_SCREEN` | the screen key it applies to |
+| `CAMERA_POSE_<n>_DEPTH_SCALE` | optional: multiplies the provider's distance estimate (the solved iris scale) |
+| `CAMERA_POSE_<n>_FOCAL_SCALE` | optional: the solved `k` (mode `c` with `--focal`) |
+
+A provider applies the slot for the camera it reads and the screen it serves: display eye =
+`T + R · (depth_scale · s̃ · normalize(u_x, u_y, k·u_z))`; with no slot it uses its own prior (a
+top-centre bezel camera, `T_y = H/2 + 8 mm`, `R = I`). **This release:** the host does not pass a
+provider the key of the screen it serves (per-screen routing is §10 item 1), so a provider takes
+the first slot whose `_CAMERA` matches; `_SCREEN` is recorded for when routing lands, and
+`calibrate --screen` is echoed, not routed.
+
+**Test bed.** `sim_tracking` with `CAMERA=1` simulates a webcam (§8): it measures the scripted eyes
+from the hidden `CAMERA_TRUE_POSE` and reports them through its calibrated `CAMERA_POSE_<n>` (else
+the prior). `tests_tracking_calibrate_e2e` loads the real plug-in with a hidden pose
+(35, 183, 0) mm + 9° pitch, places the eye midpoint on the normals of five dots at two distances,
+solves, commits `CAMERA_POSE_0`, and checks that the reported eyes equal the scripted ones (about
+105 mm off through the prior, under 0.2 mm after). `tracking_calibrate_cli_solve` and
+`tracking_calibrate_cli_watch` run the two CLI verbs on the same setup (POSIX: manifest discovery).
 
 ## 7. Cameras: what a provider may open
 
@@ -308,7 +434,7 @@ method and the solver belong to the class, not to a provider.
 ## 8. In-tree reference provider: `sim_tracking`
 
 `src/xrt/drivers/sim_tracking/` → `DisplayXR-SimTracking.{dll,dylib,so}`, id `sim-tracking`,
-ProbeOrder 200. A scripted viewer with **no camera**, the hardware-free CI source. Opt-in:
+ProbeOrder 200. A scripted viewer with **no camera** (or, with `CAMERA=1`, a simulated webcam for the §6 calibration), the hardware-free CI source. Opt-in:
 `probe()` declines unless `ENABLE` = 1. Settings (`displayxr-cli tracking options sim-tracking`):
 
 | Key | Default | |
@@ -320,6 +446,10 @@ ProbeOrder 200. A scripted viewer with **no camera**, the hardware-free CI sourc
 | `IPD_MM` | 63 | |
 | `LOSS_PERIOD_MS` | 0 | > 0: tracking off for half of every period (exercises the state event) |
 | `RATE_HZ` | 60 | push rate |
+| `CAMERA` | 0 | 1: simulate a webcam — camera-space samples + display output through `CAMERA_POSE_<n>` (§6) |
+| `CAMERA_KEY` | `sim-tracking:webcam0` | the simulated camera's key |
+| `CAMERA_TRUE_POSE` | the bezel prior | hidden ground truth `"tx,ty,tz,qx,qy,qz,qw"` the camera measures from |
+| `CAMERA_DEPTH_BIAS` | 1 | reported distance = true × this (a simulated per-user iris error) |
 
 The #1855 webcam tracker core still lives in `sim_display` (`SIM_DISPLAY_WEBCAM_TRACKING`,
 unchanged; when on, sim_display tracks and so wins its own screen). Moving it into `sim_tracking`
@@ -362,8 +492,11 @@ screen's own DP with the desktop-geometry mapping (§4b).
 3. **`screen_hint` contract** for a provider that measures several screens natively (one camera per
    screen, or a calibrated multi-screen rig): today every sample is in the primary's display space
    and the trunk maps it (§4b); a provider-supplied hint would bypass the mapping for its screen.
-4. **Camera-pose calibration** (§6): `tracking calibrate --watch --json`, the solver, the Dashboard
-   window — per screen, which also replaces the coplanar desktop-layout assumption of §4b.
+4. **Camera-pose calibration** (§6): the solver, `tracking calibrate [solve|apply]`, `--watch
+   --json` and the `sim_tracking` camera test bed are **done**; open: the Dashboard window, the
+   service-side watch (read the service's running provider rather than hosting a second one),
+   `_SCREEN` matching once providers are passed their screen key (item 3), and replacing the
+   coplanar desktop-layout assumption of §4b with a per-screen pose.
 5. **Service live re-selection**: today a tracking policy change applies at the next service start
    (the scan is one-shot, the advertisement static per instance).
 6. **Per-screen composed `xrEnumerateDisplaysDXR` caps** for a non-primary screen a provider serves
