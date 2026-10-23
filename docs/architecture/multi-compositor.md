@@ -73,8 +73,8 @@ shared fence (`client_d3d12_compositor_init_try_timeline_semaphores` →
 `layer_commit_with_semaphore`), **but the D3D11 service does not wait on it**:
 `compositor_layer_commit_with_semaphore` (`comp_d3d11_service.cpp`) discards the semaphore and value
 and commits with `XRT_GRAPHICS_SYNC_HANDLE_INVALID`, and the client returns without a local wait on
-that path, so D3D12 client→service GPU ordering is currently unenforced (known gap; issue to be
-filed).
+that path, so D3D12 client→service GPU ordering is currently unenforced (known gap, tracked as #2320; the semaphore must become a GPU-side
+wait on the ingest device).
 
 ## Per-window parallax
 
