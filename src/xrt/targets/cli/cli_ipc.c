@@ -27,7 +27,7 @@ bool
 cli_service_pipe_present(void)
 {
 #ifdef XRT_OS_WINDOWS
-	if (WaitNamedPipeA("\\.\pipe\displayxr\displayxr_comp_ipc", 1)) {
+	if (WaitNamedPipeA("\\\\.\\pipe\\displayxr\\displayxr_comp_ipc", 1)) {
 		return true;
 	}
 	return GetLastError() != ERROR_FILE_NOT_FOUND; // busy / timeout = it exists
