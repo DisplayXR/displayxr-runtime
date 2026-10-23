@@ -19,7 +19,6 @@
 #include "util/u_native_images_debug.h"
 
 #include "xrt/xrt_frame.h"
-#include "xrt/xrt_prober.h"
 #include "xrt/xrt_tracking.h"
 #include "xrt/xrt_settings.h"
 #include "xrt/xrt_frameserver.h"

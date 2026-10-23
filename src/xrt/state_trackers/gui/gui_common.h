@@ -90,38 +90,6 @@ struct gui_ogl_texture
  */
 
 /*!
- * Initialize the prober and open all devices found.
- *
- * @public @memberof gui_program
- */
-int
-gui_prober_init(struct gui_program *p);
-
-/*!
- * Create devices.
- *
- * @public @memberof gui_program
- */
-int
-gui_prober_select(struct gui_program *p);
-
-/*!
- * Update all devices.
- *
- * @public @memberof gui_program
- */
-void
-gui_prober_update(struct gui_program *p);
-
-/*!
- * Destroy all opened devices and destroy the prober.
- *
- * @public @memberof gui_program
- */
-void
-gui_prober_teardown(struct gui_program *p);
-
-/*!
  * Create a sink that will turn frames into OpenGL textures, since the frame
  * can come from another thread @ref gui_ogl_sink_update needs to be called.
  *
@@ -190,31 +158,12 @@ gui_scene_manager_destroy(struct gui_program *p);
  */
 
 /*!
- * Shows the main menu.
- *
- * @public @memberof gui_program
- */
-void
-gui_scene_main_menu(struct gui_program *p);
-
-/*!
- * Shows a UI that lets you set up tracking overrides.
- *
- * @public @memberof gui_program
- */
-void
-gui_scene_tracking_overrides(struct gui_program *p);
-
-/*!
  * Regular debug UI.
  *
  * @public @memberof gui_program
  */
 void
 gui_scene_debug(struct gui_program *p);
-
-void
-gui_scene_resampler_test(struct gui_program *p);
 
 /*!
  * @}

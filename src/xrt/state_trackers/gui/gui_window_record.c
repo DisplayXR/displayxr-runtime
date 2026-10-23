@@ -23,7 +23,6 @@
 #include "util/u_format.h"
 
 #include "xrt/xrt_frame.h"
-#include "xrt/xrt_prober.h"
 #include "xrt/xrt_tracking.h"
 #include "xrt/xrt_frameserver.h"
 
