@@ -462,6 +462,26 @@ dock that stays visible. Version 19 adds that part to every window entry:
 Additive: no field changed meaning, so the schema stays `version: 1`, and an
 older consumer ignores the new key.
 
+**Verified (private headless GNOME Shell 50.1).** Two monitors, 3840x2160 at
+200 % (primary, 1920x1080 logical) and 1920x1200 at 133 %, logical layout:
+
+- Top bar only: the primary's `work_area` was `[0, 32, 1920, 1048]`. The top
+  bar is 32 px there (the actor picked at y 0-31 is the panel, at y 32 it is
+  not), and a window maximized on that monitor got exactly that frame. The
+  secondary, which has no top bar, had `[1920, 0, 1440, 900]`, its whole
+  monitor, again the maximized frame.
+- Ubuntu's session (its dock on the left, fixed): `[67, 32, 1853, 1048]`. The
+  dock ends at x 67, and a window maximized there got exactly that frame.
+- Switching the dock to auto-hide and back emitted `WindowsChanged` with
+  `[0, 32, 1920, 1048]`, then `[67, 32, 1853, 1048]`, within 0.3 s, while no
+  window moved.
+- The Unity plug-in's side-step (DisplayXR/displayxr-unity#399) with the
+  work area stepped into the top-left corner of the work area: (24, 56) under
+  the 32 px bar, (91, 56) with the dock. Without it, the window landed at
+  (24, 24), partly under the top bar, or at (0, 304), partly under the dock.
+- Version 18 has no `work_area`, and the plug-in then behaves as before.
+- No JS errors in any run.
+
 ## 5. Known limitations / follow-ups (#817)
 
 (Capture-exclusion limitations are listed with it, in §6.6.)
