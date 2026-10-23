@@ -4493,6 +4493,9 @@ d3d11_hub_commit(struct comp_d3d11_compositor *c,
 	}
 	c->hub.canvas = cv;
 
+	// #2317 P1c: the D rows of DXR_WEAVE_LATENCY_CSV need this frame's promise —
+	// the same value the tier's own weave marks with.
+	comp_hub_d3d11_set_predicted_display_time(c->hub.split, c->last_display_time_ns);
 	const bool wove = comp_hub_d3d11_weave_and_present(c->hub.split, /*is_repaint=*/false, &cv);
 
 	// #868: arm the replay; a frame that wove nothing keeps the panel's last

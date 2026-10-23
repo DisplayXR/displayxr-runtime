@@ -128,6 +128,8 @@ struct comp_hub_d3d11
 	void *post_weave_userdata;
 	//! #2317 P1b: @ref comp_hub_d3d11_info::stable_atlas.
 	bool stable_atlas;
+	//! #2317 P1c: @ref comp_hub_d3d11_set_predicted_display_time.
+	uint64_t predicted_display_time_ns;
 
 	/*!
 	 * #2317 P1b: DIRECT ingress. The producer's stable atlas opened on THIS
@@ -2818,7 +2820,10 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 	if (is_repaint) {
 		comp_d3d11_target_weave_mark_repaint(s->target, s->mode_3d);
 	} else {
-		comp_d3d11_target_weave_mark(s->target, /*predicted_display_time_ns=*/0, s->mode_3d);
+		// #2317 P1c: the caller's xrWaitFrame promise for this frame, so the
+		// DXR_WEAVE_LATENCY_CSV site emits the D (prediction error) rows the
+		// tiers' own sites do. 0 (never set) keeps the old no-D-row behaviour.
+		comp_d3d11_target_weave_mark(s->target, s->predicted_display_time_ns, s->mode_3d);
 	}
 
 	xrt_display_processor_d3d11_set_frame_timing(s->dp, comp_d3d11_target_get_measured_weave_ns(s->target),
@@ -3006,7 +3011,10 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 	if (is_repaint) {
 		comp_d3d11_target_weave_mark_repaint(s->target, s->mode_3d);
 	} else {
-		comp_d3d11_target_weave_mark(s->target, /*predicted_display_time_ns=*/0, s->mode_3d);
+		// #2317 P1c: the caller's xrWaitFrame promise for this frame, so the
+		// DXR_WEAVE_LATENCY_CSV site emits the D (prediction error) rows the
+		// tiers' own sites do. 0 (never set) keeps the old no-D-row behaviour.
+		comp_d3d11_target_weave_mark(s->target, s->predicted_display_time_ns, s->mode_3d);
 	}
 
 	/*
@@ -3177,6 +3185,14 @@ comp_hub_d3d11_pre_render(struct comp_hub_d3d11 *s)
 	}
 	if (s->xbridge != nullptr) {
 		comp_xbridge_pre_render(s->xbridge);
+	}
+}
+
+extern "C" void
+comp_hub_d3d11_set_predicted_display_time(struct comp_hub_d3d11 *s, uint64_t predicted_display_time_ns)
+{
+	if (s != nullptr) {
+		s->predicted_display_time_ns = predicted_display_time_ns;
 	}
 }
 
@@ -3747,6 +3763,13 @@ comp_hub_d3d11_set_display_period(struct comp_hub_d3d11 *split, uint64_t period_
 {
 	(void)split;
 	(void)period_ns;
+}
+
+extern "C" void
+comp_hub_d3d11_set_predicted_display_time(struct comp_hub_d3d11 *split, uint64_t predicted_display_time_ns)
+{
+	(void)split;
+	(void)predicted_display_time_ns;
 }
 
 extern "C" uint64_t

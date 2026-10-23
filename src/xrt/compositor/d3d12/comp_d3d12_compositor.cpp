@@ -6040,6 +6040,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 		c->reroute.canvas = rr_canvas;
 
+		// #2317 P1c: the D rows of DXR_WEAVE_LATENCY_CSV need this frame's promise.
+		comp_hub_d3d11_set_predicted_display_time(c->reroute.split, c->last_display_time_ns);
 		const bool rr_wove =
 		    comp_hub_d3d11_weave_and_present(c->reroute.split, /*is_repaint=*/false, &rr_canvas);
 
