@@ -84,7 +84,24 @@ foreach ($app in @($rows | ForEach-Object { $_.app } | Select-Object -Unique)) {
             if ($h.gpu_app_total -ne '' -and $n.gpu_app_total -ne '') { $gpus += ([double]$h.gpu_app_total - [double]$n.gpu_app_total) }
         }
     }
-    if ($deltas.Count -eq 0) { W ('- **' + $app + '**: no verified native/hub pair - no verdict (see refused runs).'); continue }
+    if ($deltas.Count -eq 0) {
+        # Fallback when one site writes no R (vknative needs VK_KHR_present_wait):
+        # PresentMon present->display. A DIFFERENT metric, labelled as such.
+        $natP = @($rows | Where-Object { $_.app -eq $app -and $_.arm -eq 'native' -and $_.status -eq 'OK' -and $_.pm_until_displayed_p50 -ne '' })
+        $hubP = @($rows | Where-Object { $_.app -eq $app -and $_.arm -eq 'hub' -and $_.status -eq 'OK' -and $_.pm_until_displayed_p50 -ne '' })
+        $pd = @()
+        foreach ($n in $natP) { $h = $hubP | Where-Object { $_.rep -eq $n.rep } | Select-Object -First 1
+            if ($h -ne $null) { $pd += ([double]$h.pm_until_displayed_p50 - [double]$n.pm_until_displayed_p50) } }
+        if ($pd.Count -eq 0) { W ('- **' + $app + '**: no verified native/hub pair - no verdict (see refused runs).'); continue }
+        $nm = Get-TrueMedian @($natP | ForEach-Object { [double]$_.pm_until_displayed_p50 })
+        $bd = [math]::Max($NoiseMs, $NoiseFrac * $nm); $pm = Get-TrueMedian $pd
+        $v = 'within noise'
+        if ($pm -le -$bd -and @($pd | Where-Object { $_ -lt 0 }).Count -eq $pd.Count) { $v = 'hub BETTER' }
+        elseif ($pm -ge $bd -and @($pd | Where-Object { $_ -gt 0 }).Count -eq $pd.Count) { $v = 'hub WORSE' }
+        W ('- **{0}**: {1} on PresentMon MsUntilDisplayed p50 (present->display; R unavailable on one arm) - hub-native median {2:+0.00;-0.00} ms over {3} pair(s), band +/-{4:0.00} ms{5}' -f `
+            $app, $v, $pm, $pd.Count, $bd, $(if ($pd.Count -lt 3) { ' (n<3: indicative only)' } else { '' }))
+        continue
+    }
     $natMed = Get-TrueMedian @($nat | ForEach-Object { [double]$_.r_p50 })
     $band = [math]::Max($NoiseMs, $NoiseFrac * $natMed)
     $dm = Get-TrueMedian $deltas
