@@ -849,6 +849,20 @@ u_cursor_draw_arrow_rgba(uint8_t *rgba, uint32_t w, uint32_t h)
 	}
 }
 
+bool
+u_cursor_draw_rgba_is_blank(const uint8_t *rgba, uint32_t pixel_count)
+{
+	if (rgba == NULL) {
+		return true;
+	}
+	for (uint32_t i = 0; i < pixel_count; i++) {
+		if (rgba[(size_t)i * 4 + 3] != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void
 u_cursor_draw_unblend(const uint8_t *on_black, const uint8_t *on_white, uint32_t pixel_count, uint8_t *out)
 {

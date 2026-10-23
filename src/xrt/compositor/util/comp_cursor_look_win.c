@@ -28,6 +28,12 @@
  * drawn frames GetCursorInfo() has no cursor to report. The shape is then the
  * CLASS cursor of the window under the pointer, else the last mirrored shape,
  * else the system arrow (IDC_ARROW).
+ *
+ * Blank cursor: some toolkits hide the pointer by selecting a cursor that draws
+ * nothing instead of none (SDL on Windows does), so GetCursorInfo() reports a
+ * real HCURSOR. Mirrored, it drew an invisible runtime cursor over exactly the
+ * content it was meant to sit on. A shape that unblends to fully transparent is
+ * remembered and treated as hidden, as above.
  */
 
 #include "comp_cursor_look.h"
@@ -98,10 +104,12 @@ cursor_base_size_pt(void)
 	return cached;
 }
 
-//! Rasterise @p hc over black and white; on success the look holds it.
+//! Rasterise @p hc over black and white; on success the look holds it. A
+//! shape that draws nothing is not adopted: false with *out_blank set.
 static bool
-snapshot(struct comp_cursor_look *look, HCURSOR hc, float scale)
+snapshot(struct comp_cursor_look *look, HCURSOR hc, float scale, bool *out_blank)
 {
+	*out_blank = false;
 	ICONINFO ii;
 	memset(&ii, 0, sizeof(ii));
 	if (!GetIconInfo(hc, &ii)) {
@@ -196,6 +204,10 @@ snapshot(struct comp_cursor_look *look, HCURSOR hc, float scale)
 	}
 	free(black);
 	free(white);
+	if (ok && u_cursor_draw_rgba_is_blank(rgba, (uint32_t)n)) {
+		*out_blank = true;
+		ok = false;
+	}
 	if (!ok) {
 		free(rgba);
 		return false;
@@ -230,6 +242,20 @@ snapshot(struct comp_cursor_look *look, HCURSOR hc, float scale)
 	return true;
 }
 
+//! The shape to draw while the OS cursor is hidden (or blank): the class cursor
+//! of the window under the pointer, else the last mirrored shape, else IDC_ARROW.
+static HCURSOR
+hidden_fallback(const struct comp_cursor_look *look)
+{
+	POINT pt;
+	HWND under = GetCursorPos(&pt) ? WindowFromPoint(pt) : NULL;
+	HCURSOR hc = under != NULL ? (HCURSOR)GetClassLongPtr(under, GCLP_HCURSOR) : NULL;
+	if (hc != NULL && (void *)hc != look->os_blank) {
+		return hc;
+	}
+	return look->os_cursor != NULL ? (HCURSOR)look->os_cursor : LoadCursor(NULL, IDC_ARROW);
+}
+
 bool
 comp_cursor_look_platform_mirror(struct comp_cursor_look *look, float backing_scale)
 {
@@ -239,15 +265,8 @@ comp_cursor_look_platform_mirror(struct comp_cursor_look *look, float backing_sc
 	memset(&ci, 0, sizeof(ci));
 	ci.cbSize = sizeof(ci);
 	HCURSOR hc = GetCursorInfo(&ci) ? ci.hCursor : NULL;
-	if (hc == NULL) {
-		// Hidden (see the file comment): the class cursor of the window
-		// under the pointer, else the last mirrored shape, else IDC_ARROW.
-		POINT pt;
-		HWND under = GetCursorPos(&pt) ? WindowFromPoint(pt) : NULL;
-		hc = under != NULL ? (HCURSOR)GetClassLongPtr(under, GCLP_HCURSOR) : NULL;
-		if (hc == NULL) {
-			hc = look->os_cursor != NULL ? (HCURSOR)look->os_cursor : LoadCursor(NULL, IDC_ARROW);
-		}
+	if (hc == NULL || (void *)hc == look->os_blank) {
+		hc = hidden_fallback(look);
 	}
 	if (hc == NULL) {
 		return false;
@@ -258,8 +277,29 @@ comp_cursor_look_platform_mirror(struct comp_cursor_look *look, float backing_sc
 	if ((void *)hc == look->os_failed) {
 		return false; // an unreadable shape is not retried every frame
 	}
-	if (snapshot(look, hc, scale)) {
+	bool blank = false;
+	if (snapshot(look, hc, scale, &blank)) {
 		return true;
+	}
+	if (blank) {
+		// A "hidden" cursor that is really a blank one: remember it and
+		// take the hidden path for it, now and on every later frame.
+		look->os_blank = (void *)hc;
+		static bool warned_blank = false; // process-wide, one notice
+		if (!warned_blank) {
+			warned_blank = true;
+			U_LOG_W("cursor_draw: the OS cursor %p draws nothing (an app hid it with a blank cursor) - "
+			        "treating it as hidden (one-time notice)",
+			        (void *)hc);
+		}
+		hc = hidden_fallback(look);
+		if (hc == NULL || (void *)hc == look->os_blank) {
+			return look->rgba != NULL;
+		}
+		if ((void *)hc == look->os_cursor && look->os_scale == scale && look->rgba != NULL) {
+			return true;
+		}
+		return snapshot(look, hc, scale, &blank);
 	}
 	look->os_failed = (void *)hc;
 	U_LOG_W("cursor_draw: could not read the OS cursor %p - keeping the last shape or the arrow", (void *)hc);
@@ -280,7 +320,8 @@ comp_cursor_look_from_os_cursor(struct comp_cursor_look *look, uint64_t os_curso
 	if ((void *)hc == look->os_failed) {
 		return false; // not retried every frame
 	}
-	if (snapshot(look, hc, scale)) {
+	bool blank = false;
+	if (snapshot(look, hc, scale, &blank)) {
 		look->os_failed = NULL;
 		return true;
 	}
