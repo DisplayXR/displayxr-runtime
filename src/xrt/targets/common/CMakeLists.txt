@@ -14,6 +14,8 @@ add_library(
 			    target_component_loader.c target_component_loader.h
 			    target_input_plugin_loader.c target_input_plugin_loader.h target_input_pref.h
 			    target_conversion_plugin_loader.c target_conversion_plugin_loader.h
+			    target_tracking_plugin_loader.c target_tracking_plugin_loader.h
+			    target_viewer_tracking.c target_viewer_tracking.h
 			    target_conv_status.c target_conv_status.h
 			    target_conv_store.c
 			    target_plugin_loader.c target_plugin_loader.h

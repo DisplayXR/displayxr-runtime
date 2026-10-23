@@ -255,6 +255,7 @@ target_plugin_classify_manifest(const char *filename)
 	static const char json_suffix[] = ".json";
 	static const char ip_suffix[] = "-input-provider.json";
 	static const char cp_suffix[] = "-conversion-provider.json";
+	static const char tp_suffix[] = "-tracking-provider.json";
 	/*
 	 * ADR-053 P4 model packs (`<pack>.models.json`) are not manifests. They
 	 * ship beside the conversion provider that lists them in `packs[]` — in
@@ -272,6 +273,7 @@ target_plugin_classify_manifest(const char *filename)
 	const size_t json_len = sizeof(json_suffix) - 1;
 	const size_t ip_len = sizeof(ip_suffix) - 1;
 	const size_t cp_len = sizeof(cp_suffix) - 1;
+	const size_t tp_len = sizeof(tp_suffix) - 1;
 	const size_t pack_len = sizeof(pack_suffix) - 1;
 
 	/* A bare suffix is not a manifest: there must be a name in front. */
@@ -287,6 +289,9 @@ target_plugin_classify_manifest(const char *filename)
 	if (n >= cp_len && strcmp(filename + n - cp_len, cp_suffix) == 0) {
 		return n > cp_len ? TARGET_PLUGIN_MANIFEST_CONVERSION : TARGET_PLUGIN_MANIFEST_NONE;
 	}
+	if (n >= tp_len && strcmp(filename + n - tp_len, tp_suffix) == 0) {
+		return n > tp_len ? TARGET_PLUGIN_MANIFEST_TRACKING : TARGET_PLUGIN_MANIFEST_NONE;
+	}
 	return TARGET_PLUGIN_MANIFEST_DISPLAY;
 }
 
@@ -297,6 +302,7 @@ target_component_class_id_str(uint32_t class_id)
 	case TARGET_COMPONENT_CLASS_DISPLAY: return "display";
 	case TARGET_COMPONENT_CLASS_INPUT: return "input";
 	case TARGET_COMPONENT_CLASS_CONVERSION: return "conversion";
+	case TARGET_COMPONENT_CLASS_TRACKING: return "tracking";
 	default: return "none";
 	}
 }

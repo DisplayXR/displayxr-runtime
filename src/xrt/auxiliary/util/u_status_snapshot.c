@@ -879,6 +879,18 @@ screen_to_cjson(const struct xrt_status_screen *s)
 		cJSON_AddNullToObject(et, "default");
 	}
 	cJSON_AddStringToObject(et, "state", u_status_tracking_str(s->eye_tracking.state));
+	// ADR-054 N6 Part 2: whose eyes the views follow, and why (a provider in standby says so).
+	if (s->eye_tracking.viewer_source[0] != '\0') {
+		cJSON_AddStringToObject(et, "viewer_source", s->eye_tracking.viewer_source);
+		if (s->eye_tracking.viewer_reason[0] != '\0') {
+			cJSON_AddStringToObject(et, "viewer_reason", s->eye_tracking.viewer_reason);
+		} else {
+			cJSON_AddNullToObject(et, "viewer_reason");
+		}
+	} else {
+		cJSON_AddNullToObject(et, "viewer_source");
+		cJSON_AddNullToObject(et, "viewer_reason");
+	}
 
 	if (s->mode.valid) {
 		cJSON *mode = cJSON_AddObjectToObject(o, "mode");

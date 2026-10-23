@@ -2272,6 +2272,19 @@ Chained to `XrSystemProperties` alongside `XrDisplayInfoDXR`. If `supportedModes
 the display has no eye tracking; `defaultMode` is undefined and
 `xrRequestEyeTrackingModeDXR` returns `XR_ERROR_FEATURE_UNSUPPORTED` for any mode.
 
+> **Implementation note — the composed advertisement (DisplayXR, ADR-054 N6 Part 2).** No struct
+> and no spec version change. What `supportedModes` reports is *composed by the runtime*, not read
+> verbatim from the display plug-in: a display that does not track itself but whose plug-in
+> declares the viewer policy `EXTERNAL_OK` advertises `MANAGED_BIT | MANUAL_BIT` (default MANAGED)
+> when an enabled viewer-tracking provider (a webcam tracker, a depth camera, …) has a usable source
+> **at system creation**, and its 3D rendering modes report tracking. `advertised = display tracks
+> OR (EXTERNAL_OK AND a usable provider)`. The answer is **static per instance** — a provider
+> installed, enabled or disabled later applies at the next instance. "Supported" is not "tracking
+> now": live state is `XrViewEyeTrackingStateDXR::isTracking` and
+> `XrEventDataEyeTrackingStateChangedDXR` (no face, camera unplugged, provider stopped → false).
+> A display that tracks always uses its own eyes. Contract:
+> `docs/specs/runtime/tracking-provider-discovery.md` §5.
+
 #### `XrViewEyeTrackingStateDXR` — Extends `XrViewState`
 
 ```c

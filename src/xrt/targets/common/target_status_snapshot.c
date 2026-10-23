@@ -14,6 +14,7 @@
 #include "target_conv_status.h"
 #include "target_plugin_loader.h"
 #include "target_screens.h"
+#include "target_viewer_tracking.h"
 
 #include "xrt/xrt_compositor.h" // xrt_dp_factory_registry
 #include "xrt/xrt_config_os.h"
@@ -383,6 +384,54 @@ fill_native(const struct xrt_screen *in, struct xrt_status_screen *s)
 	u_status_native_resolve(&s->native, mode_w, mode_h, pref_w, pref_h, s->desktop.width, s->desktop.height);
 }
 
+/*!
+ * ADR-054 N6 Part 2: the screen's viewer source. The arbitration this process
+ * recorded (in-process runtime, service, or a headless CLI evaluation) is for
+ * the PRIMARY screen; a screen that advertises tracking itself reads "dp"; any
+ * other screen keeps the nominal viewer — a provider is routed to the primary
+ * screen only in this release (per-screen provider routing is a follow-up).
+ */
+static void
+fill_viewer_source(struct xrt_status_screen *s)
+{
+	struct target_viewer_decision d;
+	bool have = target_viewer_tracking_get_decision(&d);
+	if (s->roles.runtime_default && !have) {
+		// Headless (the CLI's own process): arbitrate now, nothing started.
+		const struct xrt_plugin_iface *iface = target_plugin_get_active();
+		if (iface != NULL) {
+			target_viewer_tracking_evaluate(iface, target_plugin_get_active_instance(),
+			                                s->eye_tracking.supported, &d);
+			have = true;
+		}
+	}
+	if (s->roles.runtime_default && have) {
+		// The caps the app sees are the COMPOSED ones (idempotent when the
+		// screen info already carries them, as in-process).
+		uint32_t sup = 0, def = 0;
+		bool mark = false;
+		target_viewer_compose_advertisement(s->eye_tracking.supported, s->eye_tracking.default_mode, &d, &sup,
+		                                    &def, &mark);
+		s->eye_tracking.supported = sup;
+		s->eye_tracking.default_mode = def;
+		target_viewer_source_label(&d, s->eye_tracking.viewer_source, sizeof(s->eye_tracking.viewer_source));
+		snprintf(s->eye_tracking.viewer_reason, sizeof(s->eye_tracking.viewer_reason), "%s", d.reason);
+		return;
+	}
+	if (s->eye_tracking.supported != 0) {
+		snprintf(s->eye_tracking.viewer_source, sizeof(s->eye_tracking.viewer_source), "dp");
+		snprintf(s->eye_tracking.viewer_reason, sizeof(s->eye_tracking.viewer_reason),
+		         "display tracks the viewer on this screen");
+		return;
+	}
+	if (s->roles.runtime_default) {
+		return; // no display processor in this process: not evaluated
+	}
+	snprintf(s->eye_tracking.viewer_source, sizeof(s->eye_tracking.viewer_source), "nominal");
+	snprintf(s->eye_tracking.viewer_reason, sizeof(s->eye_tracking.viewer_reason),
+	         "viewer-tracking providers serve the primary screen only (for now)");
+}
+
 static void
 fill_screen(const struct xrt_screen *in,
             uint32_t index,
@@ -482,6 +531,8 @@ fill_screen(const struct xrt_screen *in,
 	s->eye_tracking.supported = in->info.supported_eye_tracking_modes;
 	s->eye_tracking.default_mode = in->info.default_eye_tracking_mode;
 	s->eye_tracking.state = XRT_STATUS_TRACKING_NO_DP; // headless: nothing is bound
+
+	fill_viewer_source(s);
 }
 
 #ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS

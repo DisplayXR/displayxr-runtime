@@ -178,6 +178,10 @@ if(TARGET target_lists)
 	# (DIAG reply size, generation, CONV_* warnings, `conv list --json`), and the
 	# headless pass + selftest exit-13 path on stub providers.
 	list(APPEND tests tests_conv_snapshot)
+	# ADR-054 N6 Part 2 -- the viewer arbitration (DP > provider > nominal), the
+	# composed XR_DXR_display_info advertisement, the viewer-policy slot rule,
+	# the -tracking-provider.json router and sim_tracking's script (pure).
+	list(APPEND tests tests_viewer_arbitration)
 	# Multi-screen M1 -- target_screens_build: registry -> per-screen list.
 	list(APPEND tests tests_target_screens)
 	# ADR-047 Amendment 8 -- display hotplug: the claim sweep's scheduler, the
@@ -636,6 +640,13 @@ target_compile_definitions(
 if(TARGET tests_target_screens)
 	target_link_libraries(tests_target_screens PRIVATE target_lists xrt-interfaces aux_os)
 endif()
+if(TARGET tests_viewer_arbitration)
+	target_sources(
+		tests_viewer_arbitration PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking/sim_tracking_script.c
+		)
+	target_include_directories(tests_viewer_arbitration PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking)
+	target_link_libraries(tests_viewer_arbitration PRIVATE target_lists xrt-interfaces aux_util aux_os)
+endif()
 if(TARGET tests_target_display_hotplug)
 	target_link_libraries(tests_target_display_hotplug PRIVATE target_lists xrt-interfaces aux_os)
 endif()
@@ -652,7 +663,7 @@ if(TARGET tests_conversion_loader)
 	# twins (`*_dp_abi`, `*_input_abi`): CI's per-class conformance step
 	# registers those under HKLM for one self-test run to prove every class
 	# loader rejects a foreign ABI major and falls through (ADR-020 rule 3).
-	foreach(_stub ok abi dp dp_abi input input_abi)
+	foreach(_stub ok abi dp dp_abi input input_abi tracking_abi)
 		add_library(tests_conversion_loader_stub_${_stub} MODULE tests_conversion_loader_stub.c)
 		target_link_libraries(tests_conversion_loader_stub_${_stub} PRIVATE xrt-interfaces)
 		set_target_properties(tests_conversion_loader_stub_${_stub} PROPERTIES C_VISIBILITY_PRESET hidden PREFIX "")
@@ -672,6 +683,11 @@ if(TARGET tests_conversion_loader)
 	target_compile_definitions(
 		tests_conversion_loader_stub_input_abi PRIVATE STUB_KIND_INPUT
 							       "STUB_PLUGIN_API=(XRT_INPUT_PLUGIN_API_VERSION_CURRENT + 1)"
+		)
+	# ADR-054 N6 Part 2: the viewer-tracking class's ABI-mismatch twin (N4 cell).
+	target_compile_definitions(
+		tests_conversion_loader_stub_tracking_abi PRIVATE STUB_KIND_TRACKING
+								  "STUB_PLUGIN_API=(XRT_TRACKING_PLUGIN_API_VERSION_CURRENT + 1)"
 		)
 	target_compile_definitions(
 		tests_conversion_loader
@@ -879,6 +895,32 @@ if(TARGET tests_oxr_view_space)
 		                 DXR_INPUT_SIM_INPUT_ENABLE=1 DXR_INPUT_SIM_INPUT_HANDS=right
 		                 DXR_INPUT_SIM_INPUT_PINCH=hold $<TARGET_FILE:tests_oxr_view_space> "[rig_hands_hold]"
 		                 --success --allow-running-no-tests
+		         )
+	endif()
+	# ADR-054 N6 Part 2 — the viewer-tracking class end to end: sim_tracking's
+	# scripted sweep drives xrLocateViews through sim_display (EXTERNAL_OK, no
+	# tracker of its own), and XR_DXR_display_info advertises the COMPOSED
+	# MANAGED|MANUAL. Its own process (the tracking scan is one-shot), with the
+	# sim-display manifest beside it so the dev build's DP is the one found.
+	# POSIX only: discovery there reads XRT_PLUGIN_SEARCH_PATH, while Windows
+	# discovery is registry-only, so the arms would find no provider and fail
+	# (CI's per-class conformance step covers the Windows registry path).
+	if(NOT WIN32 AND TARGET drv_sim_tracking_plugin AND TARGET drv_sim_display_plugin)
+		set(_viewer_dir "${CMAKE_CURRENT_BINARY_DIR}/viewer_tracking_plugins/$<CONFIG>")
+		file(GENERATE
+		     OUTPUT "${_viewer_dir}/200-sim-tracking-tracking-provider.json"
+		     CONTENT "{\n  \"file_format_version\": \"1.0\",\n  \"plugin\": {\n    \"id\": \"sim-tracking\",\n    \"display_name\": \"DisplayXR Sim Tracking\",\n    \"binary_path\": \"$<TARGET_FILE:drv_sim_tracking_plugin>\",\n    \"probe_order\": 200\n  }\n}\n"
+		     )
+		file(GENERATE
+		     OUTPUT "${_viewer_dir}/200-sim-display.json"
+		     CONTENT "{\n  \"file_format_version\": \"1.0\",\n  \"plugin\": {\n    \"id\": \"sim-display\",\n    \"display_name\": \"DisplayXR Sim Display\",\n    \"binary_path\": \"$<TARGET_FILE:drv_sim_display_plugin>\",\n    \"probe_order\": 200\n  }\n}\n"
+		     )
+		add_dependencies(tests_oxr_view_space drv_sim_tracking_plugin drv_sim_display_plugin)
+		add_test(NAME tests_oxr_view_space_viewer_tracking
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1
+		                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_PERIOD_MS=2000
+		                 DXR_TRACKING_SIM_TRACKING_AMPLITUDE_M=0.1 $<TARGET_FILE:tests_oxr_view_space>
+		                 "[viewer_tracking]" --success --allow-running-no-tests
 		         )
 	endif()
 	add_test(NAME tests_oxr_view_space_no_input_providers

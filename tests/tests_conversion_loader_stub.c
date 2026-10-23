@@ -15,6 +15,8 @@
  *    loader sees a clean decline);
  *  - STUB_KIND_DISPLAY, STUB_PLUGIN_API=<other major>: the ABI-mismatch
  *    fixture for the DP class — negotiate reports the foreign major;
+ *  - STUB_KIND_TRACKING + STUB_PLUGIN_API: the viewer-tracking class's
+ *    ABI-mismatch twin (ADR-054 N6 Part 2), for the same N4 cell.
  *  - STUB_KIND_INPUT [+ STUB_PLUGIN_API]: the same two shapes for the
  *    input-provider class.
  *
@@ -29,6 +31,7 @@
 #include "xrt/xrt_input_plugin.h"
 #include "xrt/xrt_plugin.h"
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_tracking_plugin.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -133,6 +136,32 @@ xrtInputPluginNegotiate(uint32_t runtime_api_version,
 	return XRT_ERROR_PROBER_NOT_SUPPORTED;
 }
 
+#elif defined(STUB_KIND_TRACKING)
+
+#ifndef STUB_PLUGIN_API
+#define STUB_PLUGIN_API XRT_TRACKING_PLUGIN_API_VERSION_CURRENT
+#endif
+
+// ADR-054 N6 Part 2: the same two shapes for the viewer-tracking class.
+static struct xrt_tracking_plugin_iface g_tracking_foreign_iface;
+
+STUB_EXPORT xrt_result_t
+xrtTrackingPluginNegotiate(uint32_t runtime_api_version,
+                           const struct xrt_tracking_plugin_host_iface *host,
+                           struct xrt_tracking_plugin_iface **out_iface,
+                           uint32_t *out_plugin_api_version)
+{
+	(void)host;
+	*out_iface = NULL;
+	*out_plugin_api_version = STUB_PLUGIN_API;
+	if (runtime_api_version != STUB_PLUGIN_API) {
+		g_tracking_foreign_iface.struct_size = (uint32_t)sizeof(g_tracking_foreign_iface);
+		*out_iface = &g_tracking_foreign_iface;
+		return XRT_SUCCESS;
+	}
+	return XRT_ERROR_PROBER_NOT_SUPPORTED;
+}
+
 #else
-#error "define STUB_KIND_CONVERSION, STUB_KIND_DISPLAY or STUB_KIND_INPUT"
+#error "define STUB_KIND_CONVERSION, STUB_KIND_DISPLAY, STUB_KIND_INPUT or STUB_KIND_TRACKING"
 #endif

@@ -2169,3 +2169,118 @@ TEST_CASE("sim-input HANDS=right PINCH=hold: one hand, one sustained pinch (#219
 	destroyTracker(trackers[1]);
 	tear_down(rt);
 }
+
+namespace {
+
+//! The viewer-tracking arms run only in their own process (the tracking scan is one-shot).
+bool
+viewer_tracking_process()
+{
+	const char *enable = std::getenv("DXR_TRACKING_SIM_TRACKING_ENABLE");
+	return enable != nullptr && std::strcmp(enable, "1") == 0;
+}
+
+void
+sleep_ms(int ms)
+{
+#if defined(_WIN32)
+	Sleep((DWORD)ms);
+#else
+	struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+	nanosleep(&ts, nullptr);
+#endif
+}
+
+} // namespace
+
+TEST_CASE("sim_tracking's scripted sweep drives xrLocateViews through sim_display (ADR-054 N6 Part 2)",
+          "[oxr][view_space][viewer_tracking]")
+{
+	// sim_display does not track and declares EXTERNAL_OK, so the trunk serves
+	// its screen from the best enabled viewer-tracking provider: sim_tracking
+	// (generated manifest + DXR_TRACKING_SIM_TRACKING_ENABLE=1, SCRIPT=sweep,
+	// PERIOD_MS=2000, AMPLITUDE_M=0.1 — tests_oxr_view_space_viewer_tracking).
+	// The head starts at the nominal viewer and is +AMPLITUDE to the right a
+	// quarter period later; the raw display-space eyes and the views follow.
+	if (!viewer_tracking_process()) {
+		WARN("this arm needs the sim-tracking provider - see tests_oxr_view_space_viewer_tracking");
+		SUCCEED("not the viewer-tracking process");
+		return;
+	}
+	Runtime rt;
+	if (!bring_up(rt)) {
+		return;
+	}
+	if (!rt.have_view_rig) {
+		WARN("XR_DXR_view_rig not advertised: no raw eye channel to read");
+		SUCCEED("nothing to read");
+		tear_down(rt);
+		return;
+	}
+
+	auto raw_centroid_x = [&](XrViewDisplayRawDXR &raw, std::vector<XrView> &views) {
+		views = rt.views(rt.view, rt.now(), nullptr, &raw);
+		REQUIRE(raw.eyeCountOutput >= 2);
+		float cx = 0.0f;
+		for (uint32_t i = 0; i < raw.eyeCountOutput; i++) {
+			cx += raw.rawEyes[i].x;
+		}
+		return cx / (float)raw.eyeCountOutput;
+	};
+
+	XrViewDisplayRawDXR raw0 = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	std::vector<XrView> v0;
+	const float x0 = raw_centroid_x(raw0, v0); // starts the provider (on demand) at phase 0
+	sleep_ms(500);                             // a quarter of PERIOD_MS=2000
+	XrViewDisplayRawDXR raw1 = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	std::vector<XrView> v1;
+	const float x1 = raw_centroid_x(raw1, v1);
+
+	const float vx0 = rt.centroid(v0).x;
+	const float vx1 = rt.centroid(v1).x;
+	std::printf(
+	    "N6 viewer tracking: raw eye centroid x %.4f -> %.4f m (tracking %d/%d), view centroid x %.4f -> "
+	    "%.4f\n",
+	    x0, x1, (int)raw0.isTracking, (int)raw1.isTracking, vx0, vx1);
+	CHECK(raw1.isTracking == XR_TRUE);
+	CHECK(std::fabs(x0) < 0.03f); // phase 0: at the nominal viewer (sim's nominal x is 0)
+	CHECK(x1 - x0 > 0.06f);       // a quarter period later: ~+0.1 m to the right
+	CHECK(x1 - x0 < 0.12f);
+	CHECK(raw1.rawEyes[1].x - raw1.rawEyes[0].x == Catch::Approx(0.063f).margin(0.002f)); // IPD_MM default
+	CHECK(vx1 > vx0); // the views follow the same way
+
+	tear_down(rt);
+}
+
+TEST_CASE("the composed advertisement: sim_display + a usable provider advertises MANAGED|MANUAL (ADR-054 N6 Part 2)",
+          "[oxr][view_space][viewer_tracking]")
+{
+	if (!viewer_tracking_process()) {
+		WARN("this arm needs the sim-tracking provider - see tests_oxr_view_space_viewer_tracking");
+		SUCCEED("not the viewer-tracking process");
+		return;
+	}
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info) {
+		WARN("XR_DXR_display_info not advertised");
+		SUCCEED("nothing to read");
+		tear_down(rt);
+		return;
+	}
+	XrEyeTrackingModeCapabilitiesDXR caps = {XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
+	XrSystemProperties props = {XR_TYPE_SYSTEM_PROPERTIES};
+	props.next = &caps;
+	auto getProps = rt.fn<PFN_xrGetSystemProperties>("xrGetSystemProperties");
+	REQUIRE(XR_SUCCEEDED(getProps(rt.instance, rt.system, &props)));
+	std::printf("N6 composed advertisement: supportedModes=0x%x defaultMode=%d\n", (unsigned)caps.supportedModes,
+	            (int)caps.defaultMode);
+	// sim_display alone advertises 0 (honest); the trunk composes MANAGED|MANUAL.
+	CHECK(caps.supportedModes == (XrEyeTrackingModeCapabilityFlagsDXR)3);
+	CHECK((int)caps.defaultMode == 0); // MANAGED
+	tear_down(rt);
+}

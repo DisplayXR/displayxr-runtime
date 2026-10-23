@@ -142,7 +142,7 @@ ensure_mutex(void)
 
 /*
  *
- * Windows: RegNotifyChangeKeyValue over the six roots.
+ * Windows: RegNotifyChangeKeyValue over the eight roots (four classes x HKLM + HKCU).
  *
  */
 
@@ -153,6 +153,7 @@ static const char *const k_registry_roots[WATCH_CLASSES] = {
     "Software\\DisplayXR\\DisplayProcessors",
     "Software\\DisplayXR\\InputProviders",
     "Software\\DisplayXR\\ConversionProviders",
+    "Software\\DisplayXR\\TrackingProviders",
 };
 
 //! Open @p root for KEY_NOTIFY. While it does not exist yet, open its parent
@@ -444,6 +445,8 @@ fingerprint_now(uint64_t out[WATCH_CLASSES])
 	}
 	out[TARGET_COMPONENT_CLASS_DISPLAY] = fold_path(out[TARGET_COMPONENT_CLASS_DISPLAY], dir, "preferred");
 	out[TARGET_COMPONENT_CLASS_INPUT] = fold_path(out[TARGET_COMPONENT_CLASS_INPUT], dir, "input-preferred");
+	out[TARGET_COMPONENT_CLASS_TRACKING] =
+	    fold_path(out[TARGET_COMPONENT_CLASS_TRACKING], dir, "tracking-preferred");
 	// N7 (#2143): the EmulatedControllers gate — what `input emulated on|off`
 	// writes; the Windows twin lives under the InputProviders root the
 	// registry watch already covers.
@@ -467,6 +470,7 @@ fingerprint_now(uint64_t out[WATCH_CLASSES])
 		case TARGET_PLUGIN_MANIFEST_DISPLAY: cls = TARGET_COMPONENT_CLASS_DISPLAY; break;
 		case TARGET_PLUGIN_MANIFEST_INPUT: cls = TARGET_COMPONENT_CLASS_INPUT; break;
 		case TARGET_PLUGIN_MANIFEST_CONVERSION: cls = TARGET_COMPONENT_CLASS_CONVERSION; break;
+		case TARGET_PLUGIN_MANIFEST_TRACKING: cls = TARGET_COMPONENT_CLASS_TRACKING; break;
 		default: continue;
 		}
 		out[cls] = fold_path(out[cls], dir, ent->d_name);

@@ -45,6 +45,7 @@ add_executable(
 	cli_cmd_dp.c
 	cli_cmd_perf.c
 	cli_cmd_input.c
+	cli_cmd_tracking.c
 	cli_cmd_runtime.c
 	cli_cmd_displays.c
 	cli_cmd_status.c

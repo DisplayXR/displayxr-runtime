@@ -408,6 +408,22 @@ struct cli_query_result
 	char input_right_str[256];
 	char input_note[256];
 
+	/* ADR-054 N6 Part 2: the viewer-tracking class — the scan tally, the
+	 * resident rows in rank order, and the primary screen's viewer source as
+	 * the trunk would arbitrate it (evaluated headlessly: nothing started). */
+	bool tracking_evaluated;     //!< the arbitration ran (display info known)
+	int tracking_registered;     //!< usable rows
+	int tracking_enabled;        //!< ... of which enabled
+	int tracking_scan_declined;  //!< enabled, dispatched, no usable source
+	int tracking_scan_failed;    //!< load / ABI failures
+	int tracking_scan_untrusted; //!< refused by the provenance gate
+	int tracking_ranked_count;
+	char tracking_ranked[16][64];
+	char tracking_viewer_source[96]; //!< "dp" / "provider:<id>" / "nominal"
+	char tracking_viewer_reason[128];
+	char tracking_viewer_policy[16];  //!< the DP's viewer policy: OWN / EXTERNAL_OK / FIXED
+	uint32_t tracking_composed_modes; //!< what XR_DXR_display_info would advertise (composed)
+
 	/* Rig (navigation) role checks (ADR-034 Amendment 4 / #1380). ABSENCE
 	 * NEVER FAILS: with no `XRT_DEVICE_TYPE_NAVIGATION` device in the
 	 * system the fields stay "not evaluated" and the verdict is untouched —

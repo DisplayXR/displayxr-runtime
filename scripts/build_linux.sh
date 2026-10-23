@@ -248,6 +248,26 @@ else
   echo "Note: DisplayXR-SimInput.so not found — no input provider staged (qwerty keeps the hand roles)."
 fi
 
+# Viewer-tracking provider (ADR-054 N6 Part 2): the scripted viewer; probe()
+# declines unless `displayxr-cli tracking set sim-tracking ENABLE 1`.
+SIMTRACK_PLUGIN="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimTracking.so" -type f | head -1)"
+if [ -n "$SIMTRACK_PLUGIN" ]; then
+  cp "$SIMTRACK_PLUGIN" "$PLUGIN_DIR/"
+  cat > "$PLUGIN_DIR/200-sim-tracking-tracking-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-tracking",
+        "display_name": "DisplayXR Sim Tracking",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PLUGIN_DIR/DisplayXR-SimTracking.so",
+        "probe_order":  200
+    }
+}
+EOF
+fi
+
 # Gamepad input provider (ADR-034 / ADR-054). Desktop Linux has no pad reader
 # yet (evdev follow-up): the provider DECLINES at probe, so staging the
 # manifest costs nothing and the dev tree matches macOS / Windows.

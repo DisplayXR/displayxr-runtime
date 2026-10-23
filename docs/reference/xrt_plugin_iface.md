@@ -558,6 +558,38 @@ Declare the capture devices your display owns — above all the camera your eye 
 
 **NULL is allowed** (declares nothing). The runtime still refuses every plug-in camera's `platform_device_hint` and its own small built-in list (`u_stereo_uvc_builtin_tracker_refusal`: a few VID:PIDs plug-ins already reported as tracker cameras, and the generic names "tracking camera" / "eye track"), so an older plug-in is covered conservatively. Appended per ADR-020 after `describe_settings` (gated by `struct_size`, no API bump): `#ifdef XRT_PLUGIN_IFACE_HAS_CLAIMED_CAMERAS`, test with `xrt_plugin_iface_has_claimed_cameras()`. Reference implementation: sim_display returns the webcam its opt-in eye tracker would read (`sim_display_webcam_claimed_cameras`). Today the service asks the **active** plug-in only.
 
+### `get_viewer_policy` (may the views follow an external viewer? ADR-054 N6 Part 2)
+
+```c
+uint32_t (*get_viewer_policy)(struct xrt_plugin_instance *inst, const struct xrt_display_descriptor *display);
+```
+
+Say whether the views on your display may follow a viewer measured by someone else — a
+viewer-tracking provider (`xrt/xrt_tracking_plugin.h`, the fourth component class) — when your
+display does **not** track the viewer itself. Return one of `enum xrt_plugin_viewer_policy`:
+
+| Value | Meaning |
+|---|---|
+| `XRT_PLUGIN_VIEWER_POLICY_OWN` (1) | The display owns the viewer; a provider is never used on it. |
+| `XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK` (2) | When you report no eye tracking, the trunk may drive your views from the best enabled provider, and composes the `XR_DXR_display_info` tracking advertisement for you (MANAGED\|MANUAL + `HAS_TRACKING` on your 3D modes). |
+| `XRT_PLUGIN_VIEWER_POLICY_FIXED` (3) | Never viewer-coupled (an N-view panel whose optics supply the parallax): views stay nominal whatever providers are installed. |
+
+A display that **tracks** (`supported_eye_tracking_modes != 0`) always wins on its own screen,
+whatever this returns: the trunk never splices a second eye source into a screen whose weave uses
+tracked eyes, and it never pushes eyes into your DP. Keep reporting only what **your** display does
+in `get_display_info` — honest zero when you have no tracker.
+
+`display` is a runtime-built descriptor (as for `get_display_info_for_monitor`), or NULL for your
+active panel; answer per screen when you drive several. Pure, cheap, any thread, `inst` may be NULL.
+
+**NULL is allowed** and, like a `struct_size` that predates the slot, 0 or any unknown value, reads
+as **FIXED** — so no installed display changes behaviour. Appended per ADR-020 after
+`get_claimed_cameras` (gated by `struct_size`, no API bump): `#ifdef
+XRT_PLUGIN_IFACE_HAS_VIEWER_POLICY`, read it with `xrt_plugin_iface_viewer_policy()` (the rule
+above, applied). Reference implementation: sim_display returns `EXTERNAL_OK`
+(`sim_display_plugin_get_viewer_policy`). Contract:
+[tracking-provider-discovery.md](../specs/runtime/tracking-provider-discovery.md) §4–5.
+
 ## Forward-compatibility rules
 
 The iface is designed to evolve without breaking older plug-ins:

@@ -1,0 +1,12 @@
+/*
+ * Single-symbol export filter for viewer-tracking provider plug-ins on
+ * Linux/BSD (ADR-054 N6 Part 2): exactly `xrtTrackingPluginNegotiate`;
+ * every statically linked aux symbol stays local so it can never interpose
+ * the runtime's copies (#496).
+ */
+{
+	global:
+		xrtTrackingPluginNegotiate;
+	local:
+		*;
+};

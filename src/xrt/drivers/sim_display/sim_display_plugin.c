@@ -379,6 +379,20 @@ sim_display_plugin_get_claimed_cameras(struct xrt_plugin_instance *inst,
 	return sim_display_webcam_claimed_cameras(capacity, out_ids);
 }
 
+/*!
+ * ADR-054 N6 Part 2: the viewer policy. sim_display has no eye tracker of its
+ * own (unless a dev toggle turns one on, in which case it advertises tracking
+ * and the trunk uses ITS eyes whatever this says), so its views may follow a
+ * viewer-tracking provider: EXTERNAL_OK, on every screen it drives.
+ */
+static uint32_t
+sim_display_plugin_get_viewer_policy(struct xrt_plugin_instance *inst, const struct xrt_display_descriptor *display)
+{
+	(void)inst;
+	(void)display;
+	return XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK;
+}
+
 static struct xrt_plugin_iface g_sim_display_iface = {
     .struct_size = sizeof(struct xrt_plugin_iface),
     .reserved_0 = 0,
@@ -510,6 +524,9 @@ static struct xrt_plugin_iface g_sim_display_iface = {
 
     /* ADR-043 Amendment 5: the opt-in webcam tracker's camera is never the UVC source's. */
     .get_claimed_cameras = sim_display_plugin_get_claimed_cameras,
+
+    /* ADR-054 N6 Part 2: views may follow a viewer-tracking provider when sim does not track. */
+    .get_viewer_policy = sim_display_plugin_get_viewer_policy,
 };
 
 
