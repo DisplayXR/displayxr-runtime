@@ -54,6 +54,8 @@ add_library(
 	u_camera_consent.c
 	u_camera_consent.h
 	u_camera_consent_store.c
+	u_camera_calib.c
+	u_camera_calib.h
 	u_client_class.c
 	u_credential.c
 	u_credential.h

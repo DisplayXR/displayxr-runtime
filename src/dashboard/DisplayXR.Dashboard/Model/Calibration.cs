@@ -389,10 +389,17 @@ public static class CalibrationCommands
     public static CliArgs Solve(string inputPath) =>
         new("tracking", "calibrate", "solve", "--in", inputPath, "--mode", Mode, "--eye", "mid", "--reject-mm", RejectMm, "--json");
 
-    public static CliArgs Apply(string screenKey, string cameraKey, CameraPose pose, string? provider, double irisScale, double focalScale)
+    public static CliArgs Apply(string screenKey, string cameraKey, CameraPose pose, string? provider, double irisScale, double focalScale,
+                                double rmsMm = -1, int samples = 0, string? mode = null)
     {
         var a = new List<string> { "tracking", "calibrate", "apply", "--screen", screenKey, "--camera", cameraKey, "--pose", pose.Setting };
+        // Accepted and ignored since the runtime-owned camera calibration store: the pose belongs to the
+        // camera + screen, not to a provider. Still passed so an older CLI keeps working.
         if (!string.IsNullOrEmpty(provider)) { a.Add("--provider"); a.Add(provider); }
+        // The solve's quality, recorded with the calibration (the "calibrated (rms 2.1 mm)" label).
+        if (rmsMm >= 0 && double.IsFinite(rmsMm)) { a.Add("--rms-mm"); a.Add(rmsMm.ToString("F3", CultureInfo.InvariantCulture)); }
+        if (samples > 0) { a.Add("--samples"); a.Add(samples.ToString(CultureInfo.InvariantCulture)); }
+        if (mode is "a" or "b" or "c") { a.Add("--mode"); a.Add(mode); }
         if (irisScale > 0 && double.IsFinite(irisScale) && Math.Abs(irisScale - 1) > 1e-6)
         {
             a.Add("--depth-scale");
@@ -408,8 +415,10 @@ public static class CalibrationCommands
     }
 
     /// <summary>
-    /// <c>calibrate apply --json</c>: <c>{"ok","provider","slot","store","keys":{...}}</c>. The report
-    /// names the slot and the store; a failure names the key that did not write.
+    /// <c>calibrate apply --json</c>. Current CLI (the runtime-owned camera calibration store):
+    /// <c>{"ok","camera","screen","source":"user-calibration","layer","store",...,"failed","reason"}</c>;
+    /// older CLI (#2303, a provider's settings): <c>{"ok","provider","slot","store","keys":{...}}</c>.
+    /// The report names where it was saved; a failure says what did not write.
     /// </summary>
     public static bool ParseApply(string? json, out string report)
     {
@@ -422,6 +431,13 @@ public static class CalibrationCommands
             if (r.ValueKind != JsonValueKind.Object || !r.Has("ok")) return false;
             bool ok = r.Bool("ok");
             string store = r.Str("store");
+            if (r.Has("source"))
+            {
+                report = ok
+                    ? $"Saved as the calibration of camera '{r.Str("camera")}' on this screen, shared by every provider" + (store.Length > 0 ? $" ({store})." : ".")
+                    : $"writing the {r.Str("failed", "calibration").Replace('_', ' ')} failed: {r.Str("reason", "store write failed")}" + (store.Length > 0 ? $" ({store})." : ".");
+                return ok;
+            }
             report = ok
                 ? $"Saved as CAMERA_POSE_{r.Int("slot")} of '{r.Str("provider")}'" + (store.Length > 0 ? $" in {store}." : ".")
                 : $"writing {r.Str("failed_key", "a setting")} of '{r.Str("provider")}' failed" + (store.Length > 0 ? $" ({store})." : ".");

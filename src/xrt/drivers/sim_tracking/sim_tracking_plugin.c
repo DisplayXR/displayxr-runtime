@@ -14,9 +14,12 @@
  *    block (camera key, per-eye direction + distance). Needs a face estimator
  *    built in (`-DXRT_SIM_WEBCAM_ESTIMATOR=onnx`); the default build's probe
  *    declines.
- * Both camera sources report display eyes through the calibrated
- * `CAMERA_POSE_<n>` for their camera key (R * cam + T) when one is set, else
- * their own prior.
+ * Both camera sources report display eyes through the camera's pose as the
+ * RUNTIME answers it (`host->get_camera_pose`: display-declared >
+ * user-calibration > placement-hint > default-prior, spec §6) — R * cam + T,
+ * with the viewer's per-user iris scale. The provider keeps no prior of its
+ * own any more; the legacy `CAMERA_POSE_<n>` settings (and, for the webcam,
+ * an explicit `WEBCAM_OFFSET_MM`) are read only as one-release fallbacks.
  *
  * **Opt-in.** `probe()` declines unless the `ENABLE` setting is 1 — being
  * registered is not enough (a scripted head sweeping the views with nothing
@@ -79,8 +82,8 @@ static const struct xrt_component_setting_desc g_descs[] = {
     {"RATE_HZ", XRT_COMPONENT_SETTING_TYPE_INT, "60", "samples per second the provider thread pushes"},
     {"CAMERA", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
      "1: simulate a webcam (calibration test bed). The scripted eyes are MEASURED from CAMERA_TRUE_POSE "
-     "(camera-space samples, XRT_TRACKING_SAMPLE_CAMERA_VALID) and REPORTED through the calibrated "
-     "CAMERA_POSE_<n> for CAMERA_KEY, else the top-centre bezel prior"},
+     "(camera-space samples, XRT_TRACKING_SAMPLE_CAMERA_VALID) and REPORTED through the runtime's pose for "
+     "CAMERA_KEY (host get_camera_pose: calibration > placement hint > top-centre default prior)"},
     {"CAMERA_KEY", XRT_COMPONENT_SETTING_TYPE_STRING, "sim-tracking:webcam0", "the simulated camera's key"},
     {"CAMERA_TRUE_POSE", XRT_COMPONENT_SETTING_TYPE_STRING, "",
      "hidden ground truth \"tx,ty,tz,qx,qy,qz,qw\" (metres, display space); empty = the bezel prior"},
@@ -95,8 +98,8 @@ static const struct xrt_component_setting_desc g_descs[] = {
     {"WEBCAM_HFOV_DEG", XRT_COMPONENT_SETTING_TYPE_FLOAT, "70", "SOURCE=webcam: horizontal field of view (10..170)"},
     {"WEBCAM_IPD_MM", XRT_COMPONENT_SETTING_TYPE_FLOAT, "63", "SOURCE=webcam: IPD prior for depth (40..90)"},
     {"WEBCAM_OFFSET_MM", XRT_COMPONENT_SETTING_TYPE_STRING, "0,0,0",
-     "SOURCE=webcam, uncalibrated: camera position from the panel's top-centre, \"x,y,z\" mm (a CAMERA_POSE_<n> "
-     "for the camera's key replaces this model)"},
+     "DEPRECATED (SOURCE=webcam): when set, the legacy bezel-offset model (camera at the panel's top-centre + "
+     "\"x,y,z\" mm) replaces the runtime's default prior; a calibration or placement hint still wins"},
     {"WEBCAM_MIRROR", XRT_COMPONENT_SETTING_TYPE_BOOL, "0", "SOURCE=webcam: the source delivers a mirrored image"},
 };
 
@@ -241,13 +244,13 @@ make_sample(const struct sim_tracking *st, int64_t t_ns, struct xrt_tracking_vie
 }
 
 /*!
- * The calibrated pose for @p camera_key: the first `CAMERA_POSE_<n>` slot whose
- * `_CAMERA` is that key, into @p c's believed pose (+ depth / focal scale).
- * @return true when a well-formed slot was found; false leaves @p c's pose as
- * the caller set it (its prior).
+ * LEGACY (one release, #2303's storage): the first `CAMERA_POSE_<n>` provider
+ * setting whose `_CAMERA` is @p camera_key, into @p c's believed pose (+ depth /
+ * focal scale). Superseded by the runtime's camera calibration store; read
+ * only when the host has no user calibration / placement hint for the camera.
  */
 static bool
-load_calibrated_pose(const char *camera_key, struct sim_tracking_camera *c)
+load_legacy_pose(const char *camera_key, struct sim_tracking_camera *c)
 {
 	char v[256];
 	for (int n = 0; n < SIM_TRACKING_POSE_SLOTS; n++) {
@@ -259,8 +262,7 @@ load_calibrated_pose(const char *camera_key, struct sim_tracking_camera *c)
 		snprintf(key, sizeof(key), "CAMERA_POSE_%d", n);
 		double t[3], q[4];
 		if (!setting(key, v, sizeof(v)) || !sim_tracking_parse_pose(v, t, q)) {
-			U_LOG_W("sim-tracking: %s for camera '%s' is missing or malformed - using the prior.", key,
-			        cam);
+			U_LOG_W("sim-tracking: legacy %s for camera '%s' is missing or malformed - ignored.", key, cam);
 			return false;
 		}
 		memcpy(c->pose_t, t, sizeof(t));
@@ -270,21 +272,98 @@ load_calibrated_pose(const char *camera_key, struct sim_tracking_camera *c)
 		snprintf(key, sizeof(key), "CAMERA_POSE_%d_FOCAL_SCALE", n);
 		c->focal_scale = setting_float(key, 1.0f);
 		U_LOG_W(
-		    "sim-tracking: camera '%s' calibrated pose CAMERA_POSE_%d = (%.4f, %.4f, %.4f) m, q (%.4f, %.4f, "
-		    "%.4f, %.4f), depth scale %.4f, focal scale %.4f.",
-		    cam, n, c->pose_t[0], c->pose_t[1], c->pose_t[2], c->pose_q[0], c->pose_q[1], c->pose_q[2],
-		    c->pose_q[3], c->depth_scale, c->focal_scale);
+		    "sim-tracking: camera '%s' uses the LEGACY provider setting CAMERA_POSE_%d (deprecated, removed "
+		    "next "
+		    "release): re-run 'displayxr-cli tracking calibrate apply' to move it into the runtime's camera "
+		    "calibration store.",
+		    cam, n);
 		return true;
 	}
 	return false;
 }
 
+//! Where the believed pose came from.
+enum sim_pose_origin
+{
+	SIM_POSE_HOST,         //!< the runtime's answer (any source)
+	SIM_POSE_LEGACY,       //!< the legacy CAMERA_POSE_<n> settings
+	SIM_POSE_LEGACY_MODEL, //!< SOURCE=webcam: the legacy bezel-offset model (WEBCAM_OFFSET_MM / no host slot)
+	SIM_POSE_LOCAL_PRIOR,  //!< no host slot (an older runtime): the top-centre prior, computed here
+};
+
+static void
+pose_from_host(const struct xrt_camera_pose *a, struct sim_tracking_camera *c)
+{
+	for (int i = 0; i < 3; i++) {
+		c->pose_t[i] = a->position_m[i];
+	}
+	for (int i = 0; i < 4; i++) {
+		c->pose_q[i] = a->orientation[i];
+	}
+	c->focal_scale = a->focal_scale > 0.0f ? a->focal_scale : 1.0;
+	c->depth_scale = a->viewer_iris_scale > 0.0f ? a->viewer_iris_scale : 1.0;
+}
+
+/*!
+ * The believed pose of @p camera_key into @p c, by the runtime's precedence:
+ * the host answer when it is a real one (display-declared, user calibration
+ * or placement hint); else a legacy `CAMERA_POSE_<n>`; else (webcam only) an
+ * explicitly set legacy `WEBCAM_OFFSET_MM`; else the host's default prior;
+ * else — an older runtime without the slot — the prior computed here.
+ */
+static enum sim_pose_origin
+resolve_pose(const char *camera_key, float display_height_m, bool webcam, struct sim_tracking_camera *c)
+{
+	c->depth_scale = 1.0;
+	c->focal_scale = 1.0;
+	struct xrt_camera_pose a;
+	memset(&a, 0, sizeof(a));
+	a.struct_size = (uint32_t)sizeof(a);
+	const bool have_host = XRT_TRACKING_PLUGIN_HOST_HAS_CAMERA_POSE(g_host) &&
+	                       g_host->get_camera_pose(g_host, camera_key, NULL, &a) == XRT_SUCCESS &&
+	                       a.source != XRT_CAMERA_POSE_SOURCE_NONE;
+	enum sim_pose_origin origin;
+	char offset_v[64];
+	if (have_host && a.source > XRT_CAMERA_POSE_SOURCE_DEFAULT_PRIOR) {
+		origin = SIM_POSE_HOST;
+	} else if (load_legacy_pose(camera_key, c)) {
+		return SIM_POSE_LEGACY;
+	} else if (webcam && !have_host) {
+		return SIM_POSE_LEGACY_MODEL; // an older runtime: the model this source always had
+	} else if (webcam && setting("WEBCAM_OFFSET_MM", offset_v, sizeof(offset_v))) {
+		U_LOG_W(
+		    "sim-tracking: camera '%s' uses the LEGACY WEBCAM_OFFSET_MM bezel-offset model (deprecated): "
+		    "'displayxr-cli camera calibration set-placement' replaces it.",
+		    camera_key);
+		return SIM_POSE_LEGACY_MODEL;
+	} else if (have_host) {
+		origin = SIM_POSE_HOST;
+	} else {
+		sim_tracking_camera_prior(display_height_m, c->pose_t, c->pose_q);
+		U_LOG_W(
+		    "sim-tracking: the runtime has no get_camera_pose slot - camera '%s' assumed at the top centre.",
+		    camera_key);
+		return SIM_POSE_LOCAL_PRIOR;
+	}
+	pose_from_host(&a, c);
+	U_LOG_W(
+	    "sim-tracking: camera '%s' pose from the runtime, source %s (rms %.2f mm): (%.4f, %.4f, %.4f) m, q (%.4f, "
+	    "%.4f, %.4f, %.4f), focal scale %.4f, viewer iris scale %.4f.",
+	    camera_key,
+	    a.source == XRT_CAMERA_POSE_SOURCE_DISPLAY_DECLARED   ? "display-declared"
+	    : a.source == XRT_CAMERA_POSE_SOURCE_USER_CALIBRATION ? "user-calibration"
+	    : a.source == XRT_CAMERA_POSE_SOURCE_PLACEMENT_HINT   ? "placement-hint"
+	                                                          : "default-prior",
+	    (double)a.rms_mm, c->pose_t[0], c->pose_t[1], c->pose_t[2], c->pose_q[0], c->pose_q[1], c->pose_q[2],
+	    c->pose_q[3], c->focal_scale, c->depth_scale);
+	return origin;
+}
+
 /*!
  * The camera model from settings: the hidden true pose, and the believed pose
- * — the `CAMERA_POSE_<n>` slot whose `_CAMERA` is this camera's key, else the
- * prior. `_SCREEN` is recorded by the calibration but not matched here: the
- * host does not pass the served screen's key yet (providers serve the primary
- * screen only, spec §4), so the first slot for this camera wins.
+ * (@ref resolve_pose). The provider serves the primary screen (spec §4), so
+ * it asks for "the screen it serves" (NULL) and the runtime matches any stored
+ * screen for this camera.
  */
 static void
 load_camera(struct sim_tracking *st, float display_height_m)
@@ -295,6 +374,7 @@ load_camera(struct sim_tracking *st, float display_height_m)
 	}
 	struct sim_tracking_camera *c = &st->cam;
 	memset(c, 0, sizeof(*c));
+	// The hidden truth defaults to where an uncalibrated camera is assumed to be.
 	sim_tracking_camera_prior(display_height_m, c->true_t, c->true_q);
 	sim_tracking_camera_prior(display_height_m, c->pose_t, c->pose_q);
 	c->depth_bias = setting_float("CAMERA_DEPTH_BIAS", 1.0f);
@@ -307,14 +387,7 @@ load_camera(struct sim_tracking *st, float display_height_m)
 	if (!st->camera_on) {
 		return;
 	}
-	if (load_calibrated_pose(st->camera_key, c)) {
-		return;
-	}
-	sim_tracking_camera_prior(display_height_m, c->pose_t, c->pose_q);
-	U_LOG_W(
-	    "sim-tracking: camera '%s' has no CAMERA_POSE_<n> - reporting through the bezel prior (%.4f, %.4f, "
-	    "%.4f) m.",
-	    st->camera_key, c->pose_t[0], c->pose_t[1], c->pose_t[2]);
+	(void)resolve_pose(st->camera_key, display_height_m, false, c);
 }
 
 static void *
@@ -441,14 +514,17 @@ sim_tracking_start(struct xrt_tracking_plugin_instance *inst, const struct xrt_t
 
 	if (source_is_webcam()) {
 		const float screen_h_m = display_height_m > 0.0f ? display_height_m : 0.194f; // sim default panel
-		// The calibration (CAMERA_POSE_<n> for this camera's key) replaces the bezel-offset model.
+		// The runtime's camera pose (calibration, placement hint or its default prior) maps every
+		// measurement; the legacy bezel-offset model runs only on an explicit WEBCAM_OFFSET_MM or
+		// an older runtime without the host slot.
 		struct sim_tracking_camera pose;
 		memset(&pose, 0, sizeof(pose));
-		pose.depth_scale = 1.0;
-		pose.focal_scale = 1.0;
 		char key[XRT_TRACKING_CAMERA_KEY_MAX];
-		const bool calibrated = sim_tracking_webcam_camera_key(&g_webcam_settings, key, sizeof(key)) &&
-		                        load_calibrated_pose(key, &pose);
+		enum sim_pose_origin origin = SIM_POSE_LEGACY_MODEL;
+		if (sim_tracking_webcam_camera_key(&g_webcam_settings, key, sizeof(key))) {
+			origin = resolve_pose(key, screen_h_m, true, &pose);
+		}
+		const bool calibrated = origin != SIM_POSE_LEGACY_MODEL;
 		st->webcam = sim_tracking_webcam_start(&g_webcam_settings, screen_h_m, sc->nominal, sc->ipd_m,
 		                                       st->interval_ns, calibrated ? &pose : NULL, sink);
 		if (st->webcam == NULL) {
@@ -461,7 +537,7 @@ sim_tracking_start(struct xrt_tracking_plugin_instance *inst, const struct xrt_t
 		    "%lld "
 		    "Hz poll).",
 		    (double)sc->nominal[0], (double)sc->nominal[1], (double)sc->nominal[2], (double)screen_h_m,
-		    calibrated ? "calibrated CAMERA_POSE" : "uncalibrated bezel-offset model", (long long)rate);
+		    calibrated ? "camera pose from the runtime" : "legacy bezel-offset model", (long long)rate);
 		return XRT_SUCCESS;
 	}
 

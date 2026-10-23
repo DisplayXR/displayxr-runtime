@@ -57,7 +57,8 @@ sim_tracking_script_eval(
  *
  */
 
-//! Most CAMERA_POSE_<n> slots a provider scans (n = 0 .. SIM_TRACKING_POSE_SLOTS-1).
+//! Most LEGACY CAMERA_POSE_<n> provider-setting slots scanned (one-release fallback) (n = 0 ..
+//! SIM_TRACKING_POSE_SLOTS-1).
 #define SIM_TRACKING_POSE_SLOTS 16
 
 /*!
@@ -65,8 +66,8 @@ sim_tracking_script_eval(
  * hidden ground truth, `CAMERA_TRUE_POSE`) — a camera-space unit direction and
  * a distance (times `depth_bias`, a simulated per-user iris error) — and the
  * provider *reports* display-space eyes by mapping those measurements back
- * through its BELIEVED pose: the calibrated `CAMERA_POSE_<n>` for its camera,
- * else the prior (top-centre bezel, identity). A correct calibration makes
+ * through its BELIEVED pose: the host's get_camera_pose answer for its camera
+ * (calibration > placement hint > the top-centre default prior). A correct calibration makes
  * the reported eyes equal the scripted ones.
  */
 struct sim_tracking_camera
@@ -76,8 +77,8 @@ struct sim_tracking_camera
 	double depth_bias;  //!< reported distance = true distance * this (1 = exact)
 	double pose_t[3];   //!< believed pose (calibrated or prior)
 	double pose_q[4];   //!< believed orientation
-	double depth_scale; //!< believed per-user depth correction (CAMERA_POSE_<n>_DEPTH_SCALE), 1 = none
-	double focal_scale; //!< believed focal scale (CAMERA_POSE_<n>_FOCAL_SCALE), 1 = none
+	double depth_scale; //!< believed per-user depth correction (the viewer iris scale), 1 = none
+	double focal_scale; //!< believed focal scale (the calibration's), 1 = none
 };
 
 //! Parse "tx,ty,tz,qx,qy,qz,qw" (metres; the quaternion is normalised). False (outputs untouched) on error.

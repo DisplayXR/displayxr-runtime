@@ -1,0 +1,18 @@
+{
+	"ok":	true,
+	"camera":	"sim-tracking:webcam0",
+	"screen":	"DXR-0001-00000001",
+	"source":	"user-calibration",
+	"layer":	"user",
+	"store":	"/Users/me/.config/monado/camera-calibration.json",
+	"t_m":	[0.035, 0.183, 0],
+	"q":	[0.078459, 0, 0, 0.996917],
+	"focal_scale":	1,
+	"rms_mm":	2.1,
+	"sample_count":	10,
+	"solver_mode":	"b",
+	"timestamp_unix":	1792754595,
+	"viewer_iris_scale":	0.925926,
+	"provider":	"sim-tracking",
+	"note":	"--provider / --slot ignored: the camera pose is stored per camera + screen, shared by every provider"
+}

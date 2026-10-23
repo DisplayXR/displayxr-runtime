@@ -418,8 +418,9 @@ authoritative.
   (and arrow-key nudge) closes the tail; rejection (`--reject-mm`, the procedure's 5 mm) drops a
   sample captured before the head settled.
 - **Iris scale.** `iris_scale = median(s_i / s̃_i)` over the used samples: the user's own iris
-  size against the landmarker's model, which removes the largest depth error. It is committed as
-  `CAMERA_POSE_<n>_DEPTH_SCALE` (`--depth-scale`).
+  size against the landmarker's model, which removes the largest depth error. It is a property of
+  the **user**, not of the camera: `--depth-scale` commits it as the one per-user viewer iris
+  scale (below), which every face-based provider multiplies its iris-size depth by.
 
 **Dashboard.** Components → Tracking providers → **Calibrate camera…** on a provider-served screen
 opens the calibration window (`src/dashboard/README.md` § *Camera calibration window*): full screen on
@@ -477,36 +478,119 @@ displayxr-cli tracking calibrate apply --screen <key> --camera <key> --pose tx,t
 
   On refusal `ok` is false, `status` is `invalid_input` / `too_few_samples` / `degenerate` /
   `behind_camera`, `pose` is `null`, `samples` is empty and `reason` says why.
-- **Apply** writes the reserved settings through the same store as `tracking set` (per user;
-  `--machine` = HKLM on Windows). Slot: the one already holding this camera + screen, else the
-  first free `n` in 0..15 (`--slot` overrides). `--depth-scale` / `--focal-scale` are written when
-  given and cleared otherwise. `--provider` defaults to the row the loader ranks first. `--json`
-  prints `{"ok","provider","slot","store","keys":{...}}`.
+- **Apply** writes the **camera calibration store** (below): one `user-calibration` record for
+  (`--camera`, `--screen`), replacing the previous one; `--machine` writes the machine layer
+  (HKLM / root). `--rms-mm`, `--samples`, `--mode` record the solve's quality (the Dashboard passes
+  them; the "calibrated (rms 2.1 mm)" label reads them). `--focal-scale` is stored with the pose;
+  `--depth-scale` writes the per-user viewer iris scale. `--provider` and `--slot` (the #2303
+  shape, which the Dashboard still sends) are **accepted and ignored** with a one-line `note` on
+  stderr and in the JSON. Output:
 
-**Reserved setting keys** (per camera and per screen; `n` = 0..15):
+```json
+{"ok":true,"camera":"sim-tracking:webcam0","screen":"<key>","source":"user-calibration","layer":"user",
+ "store":"/home/me/.config/displayxr/camera-calibration.json","t_m":[0.035,0.183,0],"q":[0.0785,0,0,0.9969],
+ "focal_scale":1,"rms_mm":2.1,"sample_count":10,"solver_mode":"b","timestamp_unix":1792754595,
+ "viewer_iris_scale":0.926,"provider":"sim-tracking","note":"--provider / --slot ignored: ..."}
+```
 
-| Key | Value |
-|---|---|
-| `CAMERA_POSE_<n>` | `"tx,ty,tz,qx,qy,qz,qw"`: metres, display space; camera → display |
-| `CAMERA_POSE_<n>_CAMERA` | the camera key it applies to |
-| `CAMERA_POSE_<n>_SCREEN` | the screen key it applies to |
-| `CAMERA_POSE_<n>_DEPTH_SCALE` | optional: multiplies the provider's distance estimate (the solved iris scale) |
-| `CAMERA_POSE_<n>_FOCAL_SCALE` | optional: the solved `k` (mode `c` with `--focal`) |
+  On failure `ok` is false, `failed` is `camera_pose` or `iris_scale`, and `reason` says why
+  (`denied: the machine layer needs an elevated terminal / root`, `store write failed`, ...).
 
-A provider applies the slot for the camera it reads and the screen it serves: display eye =
-`T + R · (depth_scale · s̃ · normalize(u_x, u_y, k·u_z))`; with no slot it uses its own prior (a
-top-centre bezel camera, `T_y = H/2 + 8 mm`, `R = I`). **This release:** the host does not pass a
-provider the key of the screen it serves (per-screen routing is §10 item 1), so a provider takes
-the first slot whose `_CAMERA` matches; `_SCREEN` is recorded for when routing lands, and
-`calibrate --screen` is echoed, not routed.
+### Camera calibration store (runtime-owned, shared by every class)
+
+A camera's pose relative to a screen is a property of the **camera and the screen**, not of a
+provider. The runtime owns it (`util/u_camera_calib.h`), keyed by `(camera_key, screen_key)`, per
+user with an optional machine-wide layer; the user layer wins for the same key. One calibration,
+done once for head tracking, serves **every provider that reads that camera, whatever its class**:
+a viewer-tracking provider and a hand-tracking input provider (ADR-034) on the same webcam get the
+identical answer (pinned by `tests_camera_calib`).
+
+| | User layer | Machine layer |
+|---|---|---|
+| Windows | `HKCU\Software\DisplayXR\Cameras\Calibration\<camera>@<screen>` (calibrations), `...\Cameras\Placement\<camera>@<screen>` (placement hints) | same paths under HKLM (elevated writes) |
+| Linux | `$XDG_CONFIG_HOME/displayxr/camera-calibration.json`, else `~/.config/monado/camera-calibration.json` | `/etc/displayxr/camera-calibration.json` |
+| macOS | same as Linux (the runtime's user config dir, like `camera_consent.json`) | `/Library/Application Support/DisplayXR/camera-calibration.json` |
+
+On Windows each subkey holds REG_SZ values `Camera`, `Screen`, `Timestamp`, and `Pose`
+(`"tx,ty,tz,qx,qy,qz,qw"`), `FocalScale`, `RmsMm`, `SampleCount`, `SolverMode` for a calibration,
+or `Edge`, `OffsetMm`, `MarginMm` for a placement hint; `\` in a key becomes `#` in the subkey
+name, and lookups match the `Camera` / `Screen` values. Writes **create missing directories**
+(the first apply on a fresh macOS account used to fail `ok:false`). The POSIX file:
+
+```json
+{"version":1,"records":[
+ {"camera":"046d:085e","screen":"SAM-7303-H4ZR","source":"user-calibration","t_m":[0.01,0.105,0],
+  "q":[0,0,0,1],"focal_scale":1,"rms_mm":2.1,"sample_count":10,"solver_mode":"b","timestamp_unix":1792754595},
+ {"camera":"046d:085e","screen":"SAM-7303-H4ZR","source":"placement-hint",
+  "placement":{"edge":"bottom","offset_mm":0,"margin_mm":0},"timestamp_unix":1792754595}]}
+```
+
+**Iris scale is per user.** One value, apart from every camera record: `viewer.json`
+`{"iris_scale":0.926}` beside the user file (Windows `HKCU\Software\DisplayXR\Viewer` `IrisScale`).
+Any face-based provider may multiply its iris-size depth by it; the host answer carries it
+(`viewer_iris_scale`) so a provider needs one call.
+
+**The answer — never "not found".** Both host ifaces carry `get_camera_pose(host, camera_key,
+screen_key, &pose)` (`xrt/xrt_camera_pose.h`; the tracking host iface's former `reserved[0]`, the
+input host iface's former `reserved[3]` — ADR-020: size and offsets unchanged, no major bump,
+announced by `XRT_TRACKING_PLUGIN_HOST_HAS_GET_CAMERA_POSE` / `XRT_INPUT_PLUGIN_HOST_HAS_GET_CAMERA_POSE`,
+NULL on an older runtime). Both point at one runtime function (`target_camera_pose_host_get`).
+Precedence, highest first; every answer reports its `source`:
+
+| `source` | When | Pose |
+|---|---|---|
+| `display-declared` | the display declares its own camera | the declared pose. **Not wired yet**: the planned ADR-043 field (runtime #2296) feeds `target_camera_pose_set_declared_hook`; today only tests install it |
+| `user-calibration` | a stored calibration for this camera + screen | the solved pose, `rms_mm`, `sample_count`, `solver_mode`, `focal_scale` |
+| `placement-hint` | a stored hint (`camera calibration set-placement`) | from the panel size, `R = I`, `m = 8 mm + margin_mm`: top `(o, H/2 + m, 0)`, bottom `(o, −(H/2 + m), 0)`, left `(−(W/2 + m), o, 0)`, right `(W/2 + m, o, 0)`; `o` = `offset_mm` along the edge (+X right on top / bottom, +Y up on left / right) |
+| `default-prior` | nothing stored | the top centre of the bezel, `R = I`, `T = (0, H/2 + 8 mm, 0)` (`XRT_CAMERA_POSE_BEZEL_MARGIN_M`) |
+
+`H` / `W` are the physical panel size from the display geometry the host already publishes
+(`get_display_geometry`); with nothing stored and no geometry yet the call returns
+`XRT_ERROR_INPUT_HOST_GEOMETRY_NOT_READY`. `screen_key` NULL / `""` means "the screen I serve"
+(providers serve the primary screen, §4) and matches a stored record for the camera on any screen,
+the newest winning. `generation` (a hash of the answer + the iris scale) moves whenever the
+answer changes, so a provider can re-read it on `start()` or a slow timer and re-apply a new
+calibration without a restart. A provider applies it as display eye =
+`T + R · (iris_scale · s̃ · normalize(u_x, u_y, k·u_z))`.
+
+**CLI** (local, no service):
+
+```
+displayxr-cli camera calibration list  [--camera K] [--screen S] [--json]
+displayxr-cli camera calibration show  --camera K [--screen S] [--panel-mm WxH] [--json]
+displayxr-cli camera calibration set-placement --camera K --screen S --edge top|bottom|left|right
+                                       [--offset-mm X] [--margin-mm X] [--machine] [--json]
+displayxr-cli camera calibration reset [--camera K] [--screen S] [--source user-calibration|placement-hint]
+                                       [--iris] [--machine] [--json]
+```
+
+`show` resolves exactly what a provider gets (panel from `--panel-mm`, else the screen's row in the
+headless status snapshot). Each record / answer in JSON carries `source`, a display `label` —
+`"calibrated (rms 2.1 mm)"`, `"uncalibrated (placed on the bottom edge)"`,
+`"uncalibrated (assumed top centre)"`, `"declared by the display"` — `t_m`, `q`, `rms_mm`,
+`timestamp_unix` and `age_s`. `status --json` adds `camera_calibrations` (the stored records for that
+screen) to every `screens[i]` and a root `camera_calibration` `{store, viewer}`; `info --json` adds the
+root `camera_calibration` with every record, so the Dashboard can show "calibrated" on both the
+tracking card and the input card.
+
+**Legacy provider settings (one release).** #2303 stored the pose as the provider's own
+`CAMERA_POSE_<n>` / `_CAMERA` / `_SCREEN` / `_DEPTH_SCALE` / `_FOCAL_SCALE` settings. `sim_tracking`
+still reads them when the host has no calibration or placement hint for the camera — with one WARN
+naming the fix (re-run `apply`) — and they are **removed in the next release**.
 
 **Test bed.** `sim_tracking` with `CAMERA=1` simulates a webcam (§8): it measures the scripted eyes
-from the hidden `CAMERA_TRUE_POSE` and reports them through its calibrated `CAMERA_POSE_<n>` (else
-the prior). `tests_tracking_calibrate_e2e` loads the real plug-in with a hidden pose
-(35, 183, 0) mm + 9° pitch, places the eye midpoint on the normals of five dots at two distances,
-solves, commits `CAMERA_POSE_0`, and checks that the reported eyes equal the scripted ones (about
-105 mm off through the prior, under 0.2 mm after). `tracking_calibrate_cli_solve` and
-`tracking_calibrate_cli_watch` run the two CLI verbs on the same setup (POSIX: manifest discovery).
+from the hidden `CAMERA_TRUE_POSE` and reports them through the host's `get_camera_pose` answer.
+`tests_tracking_calibrate_e2e` loads the real plug-in with a hidden pose (35, 183, 0) mm + 9° pitch,
+places the eye midpoint on the normals of five dots at two distances, solves, commits through the
+real `displayxr-cli tracking calibrate apply` (with `--provider`, as the Dashboard sends it) into a
+fresh, not-yet-existing per-user config dir, and checks that the reported eyes equal the scripted
+ones (105 mm off through the default prior, under 0.2 mm after); then that the legacy
+`CAMERA_POSE_0` fallback still applies with the store cleared, and that a placement hint moves the
+reported eyes by exactly its translation. `tests_camera_calib` covers the store (round trip,
+directory creation, user over machine, reset, iris scale), the prior for two panel sizes, the hint
+geometry per edge, the full precedence, and the input and tracking host ifaces answering
+identically. `tracking_calibrate_cli_solve`, `tracking_calibrate_cli_watch` and
+`camera_calibration_cli_show_prior` run the CLI verbs (POSIX: manifest discovery).
 
 ## 7. Cameras: what a provider may open
 
@@ -535,10 +619,12 @@ ProbeOrder 200. Two sources, picked by `SOURCE`:
   (`XRT_TRACKING_SAMPLE_CAMERA_VALID`: camera key — USB `vvvv:pppp`, else the OS device id —
   per-eye unit direction and distance from the optical centre, the raw unsmoothed measurement of
   the newest face frame), so it is the reference input for the §6 calibration. `describe()`
-  reports `XRT_TRACKING_TRACKS_CAMERA_SPACE` and the `camera_key`. Like the test bed, it honours
-  the §6 calibration: when a `CAMERA_POSE_<n>` slot names its camera key, every measurement is
-  mapped to display space as `T + R · (depth_scale · s̃ · normalize(u_x, u_y, k·u_z))` before
-  smoothing; with none it uses its own bezel-offset model (`WEBCAM_OFFSET_MM`, `WEBCAM_*`).
+  reports `XRT_TRACKING_TRACKS_CAMERA_SPACE` and the `camera_key`. Like the test bed, it maps every
+  measurement through the host's §6 `get_camera_pose` answer for its camera —
+  `T + R · (iris_scale · s̃ · normalize(u_x, u_y, k·u_z))` before smoothing — so an uncalibrated
+  camera uses the runtime's default prior or the user's placement hint, never a prior of its own.
+  Its old bezel-offset model runs only as a legacy fallback: when `WEBCAM_OFFSET_MM` is set
+  explicitly (and nothing better is stored), or on an older runtime without the host slot.
 
 Opt-in: `probe()` declines unless `ENABLE` = 1. With `SOURCE=webcam` it also declines unless a
 face estimator is built in **and** a camera matching `WEBCAM_DEVICE` is enumerated (it never
@@ -555,7 +641,7 @@ Settings (`displayxr-cli tracking options sim-tracking`):
 | `IPD_MM` | 63 | |
 | `LOSS_PERIOD_MS` | 0 | > 0: tracking off for half of every period (exercises the state event) |
 | `RATE_HZ` | 60 | push rate (webcam: how often the tracker is polled; one push per analysed frame while tracking, every tick while lost so the collapse animates) |
-| `CAMERA` | 0 | 1: simulate a webcam — camera-space samples + display output through `CAMERA_POSE_<n>` (§6) |
+| `CAMERA` | 0 | 1: simulate a webcam — camera-space samples + display output through the host's camera pose (§6) |
 | `CAMERA_KEY` | `sim-tracking:webcam0` | the simulated camera's key |
 | `CAMERA_TRUE_POSE` | the bezel prior | hidden ground truth `"tx,ty,tz,qx,qy,qz,qw"` the camera measures from |
 | `CAMERA_DEPTH_BIAS` | 1 | reported distance = true × this (a simulated per-user iris error) |
@@ -564,7 +650,7 @@ Settings (`displayxr-cli tracking options sim-tracking`):
 | `WEBCAM_DEVICE` | first camera | index (`0`, `1`, …) or a case-insensitive substring of the name |
 | `WEBCAM_HFOV_DEG` | 70 | horizontal field of view (distance accuracy depends on it) |
 | `WEBCAM_IPD_MM` | 63 | IPD prior for the monocular depth |
-| `WEBCAM_OFFSET_MM` | 0,0,0 | uncalibrated camera position from the top-centre of the panel, `x,y,z` mm (a `CAMERA_POSE_<n>` for the camera's key replaces this model, §6) |
+| `WEBCAM_OFFSET_MM` | unset | **deprecated**: when set, the legacy bezel-offset model (top-centre of the panel + `x,y,z` mm) replaces the runtime's default prior; a stored calibration or placement hint still wins. Use `camera calibration set-placement` instead (§6) |
 | `WEBCAM_MIRROR` | 0 | the source delivers a mirrored image |
 
 **Which estimator is built in is a build-time choice.** The default build (and every release)
@@ -654,7 +740,7 @@ apps beside a service reading the page instead of opening the camera again.
    policy, so composing it is a separate decision).
 7. **Workspace tiles on a secondary presenter** (`comp_d3d11_service_get_client_workspace_view_frame`)
    and the controller's FRAME_TICK viewer: still the presenter DP's eyes.
-8. ~~`sim_tracking` webcam source~~ — **done**: `SOURCE=webcam` (§8), honouring `CAMERA_POSE_<n>`;
+8. ~~`sim_tracking` webcam source~~ — **done**: `SOURCE=webcam` (§8), through the host's camera pose (§6);
    sim_display's `WEBCAM_TRACKING` is a one-release alias over the same core, removed next release.
 9. Installer rows: the Windows runtime installer ships `DisplayXR-SimTracking.dll` (allowlisted, N4b)
    but writes no `TrackingProviders` row yet; the Linux / macOS packages do not ship it yet.
@@ -662,3 +748,11 @@ apps beside a service reading the page instead of opening the camera again.
 10. **Provider camera claims**: fold the active provider's `describe().camera_key` into the
     service's ADR-043 Amendment 5 refusal set (today only the display plug-in's
     `get_claimed_cameras` feeds it).
+11. **Display-declared camera pose** (runtime #2296, the ADR-043 field): feed
+   `target_camera_pose_set_declared_hook` from the display processor so a display that knows its
+   own camera outranks a user calibration (§6). The hook and the precedence are in place.
+12. **Remove the legacy `CAMERA_POSE_<n>` provider settings** and `WEBCAM_OFFSET_MM` (one release
+   after the camera calibration store, §6).
+13. **Per-screen camera-pose routing**: the host answers "the screen I serve" from any stored screen
+   for the camera; once a provider is told the key of the screen it serves, pass it.
+

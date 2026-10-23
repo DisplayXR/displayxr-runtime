@@ -15,6 +15,7 @@ add_library(
 			    target_input_plugin_loader.c target_input_plugin_loader.h target_input_pref.h
 			    target_conversion_plugin_loader.c target_conversion_plugin_loader.h
 			    target_tracking_plugin_loader.c target_tracking_plugin_loader.h
+			    target_camera_pose.c target_camera_pose.h
 			    target_viewer_tracking.c target_viewer_tracking.h
 			    target_viewer_host.c target_viewer_host.h
 			    target_conv_status.c target_conv_status.h

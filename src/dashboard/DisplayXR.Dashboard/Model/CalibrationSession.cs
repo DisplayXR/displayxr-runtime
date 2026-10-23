@@ -338,7 +338,8 @@ public sealed class CalibrationSession
         string camera = Solve.CameraKey is { Length: > 0 } c ? c : Hello?.CameraKey ?? "";
         Phase = CalibPhase.Applying;
         ApplyReport = null;
-        _pending = new CalibRequest(false, CalibrationCommands.Apply(ScreenKey, camera, Pose, Hello?.Provider, Solve.IrisScale, Solve.FocalScale), null);
+        _pending = new CalibRequest(false, CalibrationCommands.Apply(ScreenKey, camera, Pose, Hello?.Provider, Solve.IrisScale, Solve.FocalScale,
+                                                                       Solve.RmsMm, Solve.UsedCount, Solve.Mode), null);
     }
 
     /// <summary>The apply run finished.</summary>

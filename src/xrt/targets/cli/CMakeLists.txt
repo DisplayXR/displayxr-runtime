@@ -56,6 +56,7 @@ add_executable(
 	cli_cmd_workspace.c
 	cli_cmd_lift.cpp
 	cli_cmd_camera.c
+	cli_cmd_camera_calibration.c
 	cli_cmd_conv.cpp
 	cli_cmd_conv_run.cpp
 	cli_component_options.c

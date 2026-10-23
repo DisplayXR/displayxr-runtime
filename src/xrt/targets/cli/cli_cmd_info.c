@@ -20,6 +20,10 @@
 #include "cli_common.h"
 #include "cli_query.h"
 
+#include <cjson/cJSON.h>
+
+#include <stdio.h>
+
 
 int
 cli_cmd_info(int argc, const char **argv)
@@ -34,7 +38,15 @@ cli_cmd_info(int argc, const char **argv)
 	cli_query_lift_caps_from_service(&r);
 
 	if (cli_has_flag(argc, argv, "--json")) {
-		cli_query_print_info_json(&r);
+		cJSON *root = cli_query_info_to_cjson(&r);
+		cli_camera_calibration_annotate_info(root);
+		char *out = cJSON_Print(root);
+		if (out != NULL) {
+			printf("%s\n", out);
+			fflush(stdout); // #1892: the tail must be out before any teardown
+			cJSON_free(out);
+		}
+		cJSON_Delete(root);
 	} else {
 		cli_query_print_info_text(&r);
 	}

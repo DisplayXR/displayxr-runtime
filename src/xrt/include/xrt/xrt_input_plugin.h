@@ -35,6 +35,7 @@
 
 #pragma once
 
+#include "xrt/xrt_camera_pose.h"
 #include "xrt/xrt_component_settings.h"
 #include "xrt/xrt_results.h"
 
@@ -358,10 +359,28 @@ struct xrt_input_plugin_host_iface
 	uint32_t (*poll_pointer_events)(struct xrt_input_pointer_event *out, uint32_t max);
 
 	/*!
+	 * Where camera `camera_key` sits relative to screen `screen_key` — for a
+	 * camera-based input provider (hand tracking off the same webcam a
+	 * viewer-tracking provider reads). The runtime's camera calibration
+	 * store, resolved display-declared > user-calibration > placement-hint >
+	 * default-prior, so the answer is never "not found"
+	 * (`xrt/xrt_camera_pose.h`; `tracking-provider-discovery.md` §6). Pass
+	 * this host iface as `host`. It is the SAME answer the viewer-tracking
+	 * host iface's slot of the same name gives for the same camera and
+	 * screen: a calibration done once for head tracking serves the hands.
+	 *
+	 * Carved out of the former reserved[3], like the slots above: size and
+	 * every other offset unchanged, the API major stays 1. An older runtime
+	 * leaves it NULL — providers MUST NULL-check (and cover-check
+	 * `struct_size`). Announced by @ref XRT_INPUT_PLUGIN_HOST_HAS_GET_CAMERA_POSE.
+	 */
+	xrt_camera_get_pose_fn_t get_camera_pose;
+
+	/*!
 	 * Reserved space for forward-compatible host-supplied callbacks.
 	 * Providers MUST NOT dereference any reserved slot.
 	 */
-	void *reserved[11];
+	void *reserved[10];
 };
 
 /*!
@@ -380,8 +399,15 @@ struct xrt_input_plugin_host_iface
  */
 #define XRT_INPUT_PLUGIN_HOST_HAS_POLL_POINTER_EVENTS 1
 
-// The get_display_geometry, get_setting and poll_pointer_events slots were
-// carved out of the former reserved[0] / reserved[1] / reserved[2]: the host
+/*!
+ * Defined when this header carries the
+ * @ref xrt_input_plugin_host_iface::get_camera_pose slot, so a provider that
+ * must also compile against an older runtime header can `#ifdef`-guard its use.
+ */
+#define XRT_INPUT_PLUGIN_HOST_HAS_GET_CAMERA_POSE 1
+
+// The get_display_geometry, get_setting, poll_pointer_events and get_camera_pose
+// slots were carved out of the former reserved[0] / [1] / [2] / [3]: the host
 // iface's size and every other offset are unchanged, so providers built
 // against the previous header keep working and the API major stays 1.
 // clang-format off
@@ -393,9 +419,13 @@ XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, poll_po
                                 offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
                                     2 * sizeof(void *),
                             "xrt_input_plugin_host_iface: poll_pointer_events must occupy the former reserved[2]");
-XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, reserved) ==
+XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, get_camera_pose) ==
                                 offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
                                     3 * sizeof(void *),
+                            "xrt_input_plugin_host_iface: get_camera_pose must occupy the former reserved[3]");
+XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, reserved) ==
+                                offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
+                                    4 * sizeof(void *),
                             "xrt_input_plugin_host_iface: get_display_geometry must occupy the former reserved[0]");
 XRT_INPUT_PLUGIN_ABI_ASSERT(sizeof(struct xrt_input_plugin_host_iface) ==
                                 2 * sizeof(uint32_t) + 14 * sizeof(void *),
