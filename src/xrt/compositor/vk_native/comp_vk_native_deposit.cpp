@@ -159,6 +159,10 @@ deposit_dxgi_format(VkFormat vk_format)
 	switch (vk_format) {
 	case VK_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
 	case VK_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+	// #2273 deep atlases (DXR_ATLAS_FORMAT): same bit layout on both ends (R in
+	// bits 0-9 / the first half), so the split carries them instead of retiring.
+	case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return DXGI_FORMAT_R10G10B10A2_UNORM;
+	case VK_FORMAT_R16G16B16A16_SFLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
 	// VK-1b: the authored zone mask is a scalar coverage plane, R8 on both ends.
 	case VK_FORMAT_R8_UNORM: return DXGI_FORMAT_R8_UNORM;
 	default: return DXGI_FORMAT_UNKNOWN;

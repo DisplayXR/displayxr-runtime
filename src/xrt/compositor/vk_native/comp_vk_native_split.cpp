@@ -416,6 +416,25 @@ split_make_dp(struct comp_vk_split *s)
  * Returns NULL on any failure, which the caller treats as "no backdrop" — a
  * degraded feature, never a broken frame.
  */
+/*!
+ * The format the DP is told for the atlas it weaves: the SRV's own, when the
+ * split carries a deep atlas (#2273: R10G10B10A2 / RGBA16F), else the 8-bit
+ * value it always declared. Twin of the in-process d3d11_dp_view_format.
+ */
+static DXGI_FORMAT
+split_dp_view_format(ID3D11ShaderResourceView *srv)
+{
+	if (srv == nullptr) {
+		return DXGI_FORMAT_R8G8B8A8_UNORM;
+	}
+	D3D11_SHADER_RESOURCE_VIEW_DESC d = {};
+	srv->GetDesc(&d);
+	if (d.Format == DXGI_FORMAT_R10G10B10A2_UNORM || d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+		return d.Format;
+	}
+	return DXGI_FORMAT_R8G8B8A8_UNORM;
+}
+
 static ID3D11ShaderResourceView *
 split_plane_dp_view(struct comp_vk_split *s,
                     struct comp_vk_split::split_plane_view *v,
@@ -2677,7 +2696,7 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 		sf.view_height = weave_view_h;
 		sf.tile_columns = weave_cols;
 		sf.tile_rows = weave_rows;
-		sf.src_format = (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM;
+		sf.src_format = (uint32_t)split_dp_view_format(atlas_srv);
 		sf.target_rtv = comp_d3d11_target_get_rtv(s->target);
 		sf.target_width = tgt_w;
 		sf.target_height = tgt_h;
@@ -2694,7 +2713,7 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 		comp_d3d11_target_bind(s->target);
 	} else {
 		xrt_display_processor_d3d11_process_atlas(s->dp, s->out_ctx, atlas_srv, weave_view_w, weave_view_h,
-		                                          weave_cols, weave_rows, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM,
+		                                          weave_cols, weave_rows, (uint32_t)split_dp_view_format(atlas_srv),
 		                                          tgt_w, tgt_h, cv.offset.w, cv.offset.h, (uint32_t)cv.extent.w,
 		                                          (uint32_t)cv.extent.h);
 	}
