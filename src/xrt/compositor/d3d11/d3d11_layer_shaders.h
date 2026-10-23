@@ -326,3 +326,39 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     return src_tex.Sample(samp, src_uv);
 }
 )";
+
+// #2273 HDR10 — re-encode the composed (sRGB-encoded) atlas as SMPTE ST 2084 PQ,
+// 1.0 linear = 203 cd/m^2 (BT.2408 reference white), primaries passed through.
+// Drawn with local2d_flatten_vs over the whole atlas; reads a copy of it texel
+// for texel (Load, no filtering), so the pass is exact. Alpha is untouched.
+static const char *atlas_pq_encode_ps_source = R"(
+Texture2D<float4> src_tex : register(t0);
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+float3 srgb_to_linear(float3 c)
+{
+    return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+float3 linear_to_pq(float3 y)
+{
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float3 ym = pow(saturate(y), m1);
+    return pow((c1 + c2 * ym) / (1.0 + c3 * ym), m2);
+}
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float4 c = src_tex.Load(int3(int2(input.position.xy), 0));
+    return float4(linear_to_pq(srgb_to_linear(saturate(c.rgb)) * (203.0 / 10000.0)), c.a);
+}
+)";

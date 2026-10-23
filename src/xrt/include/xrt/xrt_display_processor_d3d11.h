@@ -850,6 +850,27 @@ struct xrt_display_processor_d3d11
 	bool (*get_eye_positions_at)(struct xrt_display_processor_d3d11 *xdp,
 	                             int64_t target_ns,
 	                             struct xrt_eye_positions *out);
+
+	/*!
+	 * Will the DP weave an atlas in @p encoding if told so through
+	 * @ref set_atlas_encoding? Asked before the runtime sends any encoding
+	 * beyond the ENCODED/LINEAR pair that @ref get_color_capability
+	 * negotiates — today @ref XRT_ATLAS_ENCODING_PQ (HDR10 atlases, #2273).
+	 * A new capability value was deliberately NOT added for this: runtimes
+	 * compare that capability with `== XRT_DP_COLOR_EITHER`, so a DP
+	 * reporting an unknown value to an older runtime would lose its LINEAR
+	 * path.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ only
+	 * ENCODED/LINEAR are ever sent, exactly as before. Appended after
+	 * @ref get_eye_positions_at per ADR-020, announced by
+	 * XRT_DP_D3D11_HAS_ATLAS_ENCODING_QUERY.
+	 *
+	 * @param xdp      Pointer to self.
+	 * @param encoding The encoding the runtime would send.
+	 * @return true if the DP weaves @p encoding correctly.
+	 */
+	bool (*accepts_atlas_encoding)(struct xrt_display_processor_d3d11 *xdp, enum xrt_atlas_encoding encoding);
 };
 
 
@@ -935,7 +956,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_overlay_2d_fi
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_present_origin)     == XRT_DP_D3D11_BASE_OFF + 32 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_get_depth)         == XRT_DP_D3D11_BASE_OFF + 33 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_eye_positions_at)   == XRT_DP_D3D11_BASE_OFF + 34 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 35 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, accepts_atlas_encoding) == XRT_DP_D3D11_BASE_OFF + 35 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 36 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the five lift slots (lift_get_caps,
@@ -1011,6 +1033,13 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                    
  * additive (ADR-020).
  */
 #define XRT_DP_D3D11_HAS_EYE_POSITIONS_AT 1
+
+/*!
+ * Defined when this header carries the accepts_atlas_encoding slot and
+ * @ref XRT_ATLAS_ENCODING_PQ (#2273), so a plug-in built against an older
+ * runtime can #ifdef-guard its implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_D3D11_HAS_ATLAS_ENCODING_QUERY 1
 
 // clang-format on
 
@@ -1669,6 +1698,23 @@ xrt_display_processor_d3d11_tolerates_resample(struct xrt_display_processor_d3d1
 		return false;
 	}
 	return (caps.flags & XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE) != 0;
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::accepts_atlas_encoding
+ *
+ * Every "didn't answer" case — NULL DP, absent slot, NULL — is false.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_accepts_atlas_encoding(struct xrt_display_processor_d3d11 *xdp,
+                                                   enum xrt_atlas_encoding encoding)
+{
+	if (xdp == NULL || !XRT_DP_HAS_SLOT(xdp, accepts_atlas_encoding) || xdp->accepts_atlas_encoding == NULL) {
+		return false;
+	}
+	return xdp->accepts_atlas_encoding(xdp, encoding);
 }
 
 #ifdef __cplusplus

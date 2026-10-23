@@ -45,7 +45,10 @@
 // Append-only: the slot ends each vtable, right after what used to end it.
 static_assert(offsetof(xrt_display_processor_d3d11, get_eye_positions_at) ==
               offsetof(xrt_display_processor_d3d11, lift_get_depth) + sizeof(void *));
+// D3D11 has since appended accepts_atlas_encoding (#2273) after it.
 static_assert(offsetof(xrt_display_processor_d3d11, get_eye_positions_at) + sizeof(void *) ==
+              offsetof(xrt_display_processor_d3d11, accepts_atlas_encoding));
+static_assert(offsetof(xrt_display_processor_d3d11, accepts_atlas_encoding) + sizeof(void *) ==
               sizeof(xrt_display_processor_d3d11));
 static_assert(offsetof(xrt_display_processor_d3d12, get_eye_positions_at) ==
               offsetof(xrt_display_processor_d3d12, set_present_origin) + sizeof(void *));

@@ -428,6 +428,18 @@ comp_d3d11_renderer_flatten_local_2d(struct comp_d3d11_renderer *renderer,
                                      bool unpremultiplied);
 
 /*!
+ * #2273 — re-encode the composed atlas in place from sRGB to SMPTE ST 2084 PQ
+ * (1.0 linear = 203 cd/m^2, primaries passed through), for a DP that accepted
+ * @ref XRT_ATLAS_ENCODING_PQ. Requires the R10G10B10A2 atlas
+ * (DXR_ATLAS_FORMAT=rgb10a2); any other format returns an error and leaves the
+ * atlas untouched. Leaves no SRV/RTV bound.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_renderer_encode_atlas_pq(struct comp_d3d11_renderer *renderer);
+
+/*!
  * Blit the atlas texture to a back buffer with GPU stretching.
  *
  * Used for mono/2D fallback when the atlas texture is smaller than

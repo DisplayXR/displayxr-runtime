@@ -105,6 +105,12 @@ struct comp_d3d11_renderer
 	//! Constant buffer for the flatten pass (FlattenParams).
 	ID3D11Buffer *flatten_cb;
 
+	//! #2273 PQ re-encode pass (lazily created, DXR_ATLAS_ENCODING=pq only):
+	//! the shader, and a same-desc copy of the atlas it reads from.
+	ID3D11PixelShader *pq_encode_ps;
+	ID3D11Texture2D *pq_src_texture;
+	ID3D11ShaderResourceView *pq_src_srv;
+
 	//! Constant buffer for shader parameters.
 	ID3D11Buffer *constant_buffer;
 
@@ -1646,6 +1652,9 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	SAFE_RELEASE(r->sampler_linear);
 	SAFE_RELEASE(r->constant_buffer);
 	SAFE_RELEASE(r->flatten_cb);
+	SAFE_RELEASE(r->pq_src_srv);
+	SAFE_RELEASE(r->pq_src_texture);
+	SAFE_RELEASE(r->pq_encode_ps);
 	SAFE_RELEASE(r->equirect2_ps);
 	SAFE_RELEASE(r->equirect2_ps_array);
 	SAFE_RELEASE(r->equirect2_vs);
@@ -3053,6 +3062,100 @@ comp_d3d11_renderer_flatten_local_2d(struct comp_d3d11_renderer *renderer,
 	// drops this binding anyway — no scratch read/write overlap).
 	ID3D11ShaderResourceView *null_srv = nullptr;
 	internals.context->PSSetShaderResources(0, 1, &null_srv);
+	return XRT_SUCCESS;
+}
+
+static void
+release_pq_src(struct comp_d3d11_renderer *renderer)
+{
+	if (renderer->pq_src_srv != nullptr) {
+		renderer->pq_src_srv->Release();
+		renderer->pq_src_srv = nullptr;
+	}
+	if (renderer->pq_src_texture != nullptr) {
+		renderer->pq_src_texture->Release();
+		renderer->pq_src_texture = nullptr;
+	}
+}
+
+xrt_result_t
+comp_d3d11_renderer_encode_atlas_pq(struct comp_d3d11_renderer *renderer)
+{
+	if (renderer == nullptr || renderer->atlas_texture == nullptr || renderer->atlas_rtv == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	auto internals = get_internals(renderer->c);
+
+	D3D11_TEXTURE2D_DESC desc;
+	renderer->atlas_texture->GetDesc(&desc);
+	if (desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM) {
+		// PQ code values need the 10-bit atlas; an 8-bit one would band.
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	if (renderer->pq_encode_ps == nullptr) {
+		ID3DBlob *blob = nullptr;
+		if (compile_shader(internals.device, atlas_pq_encode_ps_source, "PSMain", "ps_5_0", &blob) !=
+		    XRT_SUCCESS) {
+			return XRT_ERROR_D3D;
+		}
+		HRESULT hr = internals.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+		                                                 nullptr, &renderer->pq_encode_ps);
+		blob->Release();
+		if (FAILED(hr)) {
+			U_LOG_E("encode_atlas_pq: CreatePixelShader failed: 0x%08x", hr);
+			return XRT_ERROR_D3D;
+		}
+	}
+
+	// The source copy follows the atlas through every resize.
+	if (renderer->pq_src_texture != nullptr) {
+		D3D11_TEXTURE2D_DESC have;
+		renderer->pq_src_texture->GetDesc(&have);
+		if (have.Width != desc.Width || have.Height != desc.Height || have.Format != desc.Format) {
+			release_pq_src(renderer);
+		}
+	}
+	if (renderer->pq_src_texture == nullptr) {
+		D3D11_TEXTURE2D_DESC sd = desc;
+		sd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		sd.MiscFlags = 0;
+		sd.CPUAccessFlags = 0;
+		sd.Usage = D3D11_USAGE_DEFAULT;
+		HRESULT hr = internals.device->CreateTexture2D(&sd, nullptr, &renderer->pq_src_texture);
+		if (SUCCEEDED(hr)) {
+			hr = internals.device->CreateShaderResourceView(renderer->pq_src_texture, nullptr,
+			                                                &renderer->pq_src_srv);
+		}
+		if (FAILED(hr)) {
+			U_LOG_E("encode_atlas_pq: source copy alloc failed: 0x%08x", hr);
+			release_pq_src(renderer);
+			return XRT_ERROR_D3D;
+		}
+	}
+
+	internals.context->CopyResource(renderer->pq_src_texture, renderer->atlas_texture);
+
+	internals.context->OMSetRenderTargets(1, &renderer->atlas_rtv, nullptr);
+	D3D11_VIEWPORT vp = {};
+	vp.Width = static_cast<float>(desc.Width);
+	vp.Height = static_cast<float>(desc.Height);
+	vp.MaxDepth = 1.0f;
+	internals.context->RSSetViewports(1, &vp);
+	internals.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	internals.context->IASetInputLayout(nullptr);
+	internals.context->VSSetShader(renderer->local2d_flatten_vs, nullptr, 0);
+	internals.context->PSSetShader(renderer->pq_encode_ps, nullptr, 0);
+	internals.context->RSSetState(renderer->rasterizer_state);
+	internals.context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
+	internals.context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
+	internals.context->PSSetShaderResources(0, 1, &renderer->pq_src_srv);
+	internals.context->Draw(3, 0);
+
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	internals.context->PSSetShaderResources(0, 1, &null_srv);
+	ID3D11RenderTargetView *null_rtv = nullptr;
+	internals.context->OMSetRenderTargets(1, &null_rtv, nullptr);
 	return XRT_SUCCESS;
 }
 
