@@ -376,6 +376,14 @@ struct os_display_panel_claim
 	bool verified;
 
 	bool is_primary;
+
+	/*!
+	 * The monitor the panel rect was already on before this re-resolve
+	 * (display hotplug, #2305). Outranks every other claim, so a second
+	 * claimed panel plugged in (or one re-verified) never moves the panel
+	 * rect away from the monitor a live session's DP is weaving.
+	 */
+	bool incumbent;
 };
 
 /*!
@@ -385,8 +393,10 @@ struct os_display_panel_claim
  * and resolves the pick by OS identity (@ref os_display_desktop_info_for_device).
  *
  * - No reported origin ((0, 0)): the claim wins over the size rules and the
- *   primary fallback. Among several claims: a VERIFIED one, then one whose
- *   rect is the panel's pixel size, then a non-primary one, then the first.
+ *   primary fallback. Among several claims: the incumbent (the monitor the
+ *   panel rect was on before a hotplug re-resolve), then a VERIFIED one, then
+ *   one whose rect is the panel's pixel size, then a non-primary one, then
+ *   the first.
  * - A reported origin INSIDE a claimed rect: -1, so the origin rule runs
  *   exactly as before (the two agree).
  * - A reported origin on NONE of the claimed monitors: the plug-in

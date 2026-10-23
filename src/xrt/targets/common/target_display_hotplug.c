@@ -9,6 +9,7 @@
 #include "target_display_hotplug.h"
 
 #include "os/os_display_hotplug.h"
+#include "os/os_display_topology.h"
 #include "os/os_threading.h"
 #include "os/os_time.h"
 #include "util/u_logging.h"
@@ -354,7 +355,73 @@ target_display_topology_signature(void)
 	struct os_display_desktop_info mons[OS_DISPLAY_DESKTOP_MAX_MONITORS];
 	memset(mons, 0, sizeof(mons));
 	const uint32_t n = os_display_desktop_enumerate(mons, OS_DISPLAY_DESKTOP_MAX_MONITORS);
-	return target_display_topology_hash(mons, n);
+	uint64_t h = target_display_topology_hash(mons, n);
+	// Windows (no desktop enumeration) and desktop Linux (DRM connectors: a
+	// Wayland session has no RandR, and X11's list does not move on a
+	// connector that is plugged but not enabled yet). macOS reads nothing here.
+	struct os_display_topology_entry outs[OS_DISPLAY_TOPOLOGY_MAX];
+	const uint32_t no = os_display_topology_read(outs, OS_DISPLAY_TOPOLOGY_MAX);
+	if (no > 0) {
+		const uint64_t ho = os_display_topology_hash(outs, no);
+		h = fnv_bytes(h, &ho, sizeof(ho));
+	}
+	return h;
+}
+
+void
+target_topology_filter_init(struct target_topology_filter *f, uint32_t stable_needed)
+{
+	if (f == NULL) {
+		return;
+	}
+	memset(f, 0, sizeof(*f));
+	f->stable_needed = stable_needed != 0 ? stable_needed : TARGET_HOTPLUG_POLL_STABLE;
+}
+
+bool
+target_topology_filter_feed(struct target_topology_filter *f, uint64_t sig)
+{
+	if (f == NULL) {
+		return false;
+	}
+	if (!f->have_baseline) {
+		f->have_baseline = true;
+		f->baseline = sig;
+		return false;
+	}
+	if (sig == f->baseline) {
+		// Back where the last sweep saw it (a blink): nothing happened.
+		f->have_candidate = false;
+		f->candidate_seen = 0;
+		return false;
+	}
+	if (!f->have_candidate || f->candidate != sig) {
+		// A new topology (or a storm still moving): start counting it.
+		f->have_candidate = true;
+		f->candidate = sig;
+		f->candidate_seen = 1;
+	} else {
+		f->candidate_seen++;
+	}
+	if (f->candidate_seen >= f->stable_needed) {
+		f->baseline = sig;
+		f->have_candidate = false;
+		f->candidate_seen = 0;
+		return true;
+	}
+	return false;
+}
+
+void
+target_topology_filter_rebase(struct target_topology_filter *f, uint64_t sig)
+{
+	if (f == NULL) {
+		return;
+	}
+	f->have_baseline = true;
+	f->baseline = sig;
+	f->have_candidate = false;
+	f->candidate_seen = 0;
 }
 
 
@@ -377,8 +444,7 @@ struct target_display_hotplug
 	struct target_hotplug_sched sched;
 	uint64_t poll_period_ns; //!< 0 = no poll
 	uint64_t next_poll_ns;
-	uint64_t last_sig;
-	bool have_sig;
+	struct target_topology_filter filter;
 	bool os_subscribed;
 
 	//! Last reason text a request carried (logged with the run).
@@ -508,11 +574,9 @@ hotplug_thread(void *ptr)
 			os_mutex_unlock(&hp->mutex);
 			const uint64_t sig = target_display_topology_signature();
 			os_mutex_lock(&hp->mutex);
-			if (hp->have_sig && sig != hp->last_sig) {
+			if (target_topology_filter_feed(&hp->filter, sig)) {
 				event_locked(hp, TARGET_HOTPLUG_SOURCE_POLL, "monitor list changed");
 			}
-			hp->last_sig = sig;
-			hp->have_sig = true;
 			now = os_monotonic_get_ns();
 		}
 
@@ -547,8 +611,7 @@ hotplug_thread(void *ptr)
 			const uint64_t sig = hp->poll_period_ns != 0 ? target_display_topology_signature() : 0;
 			os_mutex_lock(&hp->mutex);
 			if (hp->poll_period_ns != 0) {
-				hp->last_sig = sig;
-				hp->have_sig = true;
+				target_topology_filter_rebase(&hp->filter, sig);
 			}
 			continue;
 		}
@@ -569,18 +632,42 @@ hotplug_thread(void *ptr)
 	return NULL;
 }
 
-bool
-target_display_hotplug_enabled(void)
+//! The host feeds its own display re-probe (the Windows / desktop-Linux service).
+static bool g_host_feeds = false;
+
+void
+target_display_hotplug_set_host_feed(bool host_feeds)
 {
-	const char *e = getenv("DXR_DISPLAY_HOTPLUG");
-	if (e != NULL && e[0] != '\0') {
-		return e[0] != '0';
+	pthread_mutex_lock(&g_hp_lock);
+	g_host_feeds = host_feeds;
+	pthread_mutex_unlock(&g_hp_lock);
+}
+
+bool
+target_display_hotplug_default_enabled(const char *env, bool host_feeds)
+{
+	if (env != NULL && env[0] != '\0') {
+		return env[0] != '0';
 	}
-#if defined(XRT_OS_MACOS)
+	if (host_feeds) {
+		return false;
+	}
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_WINDOWS) || defined(XRT_OS_LINUX_DESKTOP)
+	// #2305: in-process sessions on Windows and desktop Linux too — a casting
+	// tool's virtual monitor, a dock, a cable blink while an app runs.
 	return true;
 #else
 	return false;
 #endif
+}
+
+bool
+target_display_hotplug_enabled(void)
+{
+	pthread_mutex_lock(&g_hp_lock);
+	const bool host_feeds = g_host_feeds;
+	pthread_mutex_unlock(&g_hp_lock);
+	return target_display_hotplug_default_enabled(getenv("DXR_DISPLAY_HOTPLUG"), host_feeds);
 }
 
 struct target_display_hotplug *
@@ -596,6 +683,7 @@ target_display_hotplug_start(target_display_hotplug_rebuild_fn fn, void *user)
 	hp->fn = fn;
 	hp->user = user;
 	target_hotplug_sched_init(&hp->sched, 0, 0);
+	target_topology_filter_init(&hp->filter, 0);
 	hp->poll_period_ns = MS(500);
 	const char *poll = getenv("DXR_DISPLAY_HOTPLUG_POLL_MS");
 	if (poll != NULL && poll[0] != '\0') {

@@ -6128,6 +6128,29 @@ oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool 
 		generation = xrt_instance_get_display_generation(xinst);
 	}
 	sess->display_generation = generation;
+
+	// #2305: the session DP's home screen. Recorded from the first list; on a
+	// hotplug re-push the non-Metal compositors get the list re-anchored on
+	// it (Metal tracks its session DP's identity itself).
+	if (initial || !sess->display_home.valid) {
+		u_screen_home_record(&sess->display_home, screens);
+		sess->display_home_logged = (int)U_SCREEN_HOME_IN_PLACE;
+	}
+	if (!initial && !sess->is_metal_native_compositor) {
+		const enum u_screen_home_outcome o = u_screen_home_anchor(&sess->display_home, screens);
+		if ((int)o != sess->display_home_logged) {
+			sess->display_home_logged = (int)o;
+			U_LOG_W(
+			    "display hotplug: the session's own display processor stays on screen 0x%016llx ('%s') — "
+			    "%s%s",
+			    (unsigned long long)sess->display_home.screen_id, sess->display_home.plugin_id,
+			    u_screen_home_outcome_str(o),
+			    (o == U_SCREEN_HOME_GONE || o == U_SCREEN_HOME_RECLAIMED)
+			        ? "; per-screen segments are off until it returns (the session DP keeps weaving the "
+			          "window, as before the hotplug)"
+			        : "");
+		}
+	}
 	uint64_t pinned = 0;
 #ifdef OXR_HAVE_DXR_display_info
 	pinned = sess->bound_display_id;

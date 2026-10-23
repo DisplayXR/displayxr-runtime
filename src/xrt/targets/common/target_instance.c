@@ -215,6 +215,25 @@ static void
 fill_display_desktop_info(struct xrt_system_compositor_info *info);
 
 /*!
+ * #2305: the registry monitor the panel rect was last resolved to by the claim
+ * rule (0 = another rule, or no resolve yet), and the plug-in that claimed it.
+ * A re-resolve keeps that monitor while it is still claimed, and keeps the
+ * last rect while the claim is gone (target_screens_panel_reresolve_decide).
+ * Reset at system create, so a new system starts from the plain rules.
+ */
+static uint64_t g_panel_claim_monitor_id = 0;
+static char g_panel_claim_plugin[64] = "";
+static bool g_panel_kept_logged = false;
+
+static void
+panel_claim_state_reset(void)
+{
+	g_panel_claim_monitor_id = 0;
+	g_panel_claim_plugin[0] = '\0';
+	g_panel_kept_logged = false;
+}
+
+/*!
  * Display dashboard phase 7: a per-screen preference that forces the
  * SYSTEM-DEFAULT screen to a plug-in other than the active one moves that
  * screen's DP — the session's own (primary) DP — to the preferred plug-in too:
@@ -1065,12 +1084,51 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	// An origin that agrees with a claim keeps the origin rule untouched.
 	bool claim_overrides_origin = false;
 	bool resolved = false;
-	if (target_screens_panel_from_claims(&info->dp_registry, info->active_plugin_id, &hint, &desktop,
-	                                     &claim_overrides_origin)) {
+	uint64_t claim_monitor_id = 0;
+	const bool same_plugin =
+	    strncmp(g_panel_claim_plugin, info->active_plugin_id, sizeof(g_panel_claim_plugin)) == 0;
+	// #2305: on a re-resolve the monitor the rect is already on stays the pick
+	// while the active plug-in still claims it (a second claimed panel plugged
+	// in must not move the rect off the one a live session's DP weaves).
+	const uint64_t incumbent = same_plugin ? g_panel_claim_monitor_id : 0;
+	const bool claim_resolved =
+	    target_screens_panel_from_claims_ex(&info->dp_registry, info->active_plugin_id, &hint, incumbent, &desktop,
+	                                        &claim_overrides_origin, &claim_monitor_id);
+	switch (target_screens_panel_reresolve_decide(g_panel_claim_monitor_id, same_plugin, claim_resolved)) {
+	case TARGET_PANEL_TAKE_CLAIM:
 		match.rule = OS_DISPLAY_DESKTOP_RULE_CLAIM;
 		resolved = true;
-	} else {
+		g_panel_claim_monitor_id = claim_monitor_id;
+		(void)snprintf(g_panel_claim_plugin, sizeof(g_panel_claim_plugin), "%s", info->active_plugin_id);
+		if (g_panel_kept_logged) {
+			U_LOG_W("Panel rect: '%s' claims a monitor again (0x%016llx) — re-resolving the panel rect.",
+			        info->active_plugin_id, (unsigned long long)claim_monitor_id);
+			g_panel_kept_logged = false;
+		}
+		break;
+	case TARGET_PANEL_KEEP_PREVIOUS:
+		// The claimed panel is gone (unplugged, its service restarting, a
+		// cable blink): the origin / primary rules would hand the panel rect
+		// to the nearest monitor — possibly a virtual one in its place. Keep
+		// the last rect; the claim's return re-resolves it.
+		if (!g_panel_kept_logged) {
+			U_LOG_W(
+			    "Panel rect: '%s' no longer claims monitor 0x%016llx (unplugged / not ready) — keeping the "
+			    "last panel rect (%d, %d) %ux%u on '%s' instead of falling back to the origin / primary "
+			    "rule "
+			    "(#2305).",
+			    info->active_plugin_id, (unsigned long long)g_panel_claim_monitor_id,
+			    (int)info->display_screen_left, (int)info->display_screen_top, info->display_desktop_width,
+			    info->display_desktop_height, info->display_device_name);
+			g_panel_kept_logged = true;
+		}
+		return;
+	case TARGET_PANEL_TAKE_FALLBACK:
+	default:
+		g_panel_claim_monitor_id = 0;
+		g_panel_claim_plugin[0] = '\0';
 		resolved = os_display_desktop_info_for_panel(&hint, &desktop, &match);
+		break;
 	}
 
 	if (!resolved) {
@@ -1396,6 +1454,7 @@ out:
 		// plug-in branch above on purpose: a (0,0) origin — no plug-in, or
 		// sim_display expressing no preference — resolves to the primary
 		// monitor, which is the right answer for both readings.
+		panel_claim_state_reset(); // #2305: a new system resolves from the plain rules
 		fill_display_desktop_info(&xsysc->info);
 
 		// Display dashboard phase 7: a per-screen preference on the

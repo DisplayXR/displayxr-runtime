@@ -21,9 +21,12 @@
 
 #include "xrt/xrt_plugin.h"
 #include "xrt/xrt_screen.h"
+#include "xrt/xrt_config_os.h"
 
 #include "target_display_hotplug.h"
 #include "target_screen_pin.h"
+
+#include "os/os_display_topology.h"
 
 #include <cstdio>
 #include <cstring>
@@ -543,4 +546,137 @@ TEST_CASE("hotplug topology hash: equal lists hash equal, any monitor change doe
 	std::memcpy(b, a, sizeof(a));
 	b[0].left = -1512;
 	CHECK(target_display_topology_hash(b, 1) != h1);
+}
+
+
+/*
+ *
+ * #2305: in-process re-probe on Windows and Linux — the default, the poll's
+ * platform signature and its blink filter.
+ *
+ */
+
+TEST_CASE("hotplug default: on in-process, off where the host feeds its own re-probe, env wins", "[target][hotplug]")
+{
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_WINDOWS) || defined(XRT_OS_LINUX_DESKTOP)
+	CHECK(target_display_hotplug_default_enabled(nullptr, false));
+	CHECK(target_display_hotplug_default_enabled("", false));
+#else
+	CHECK_FALSE(target_display_hotplug_default_enabled(nullptr, false));
+#endif
+	// The Windows / desktop-Linux service: its tray / uevent feeders drive reprobe_run.
+	CHECK_FALSE(target_display_hotplug_default_enabled(nullptr, true));
+	// DXR_DISPLAY_HOTPLUG: 0 is the opt-out, anything else forces it on.
+	CHECK_FALSE(target_display_hotplug_default_enabled("0", false));
+	CHECK(target_display_hotplug_default_enabled("1", true));
+}
+
+TEST_CASE("hotplug poll filter: a blink back to the baseline is no event", "[target][hotplug]")
+{
+	target_topology_filter f;
+	target_topology_filter_init(&f, 0);
+	CHECK(f.stable_needed == TARGET_HOTPLUG_POLL_STABLE);
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xA)); // first: baseline only
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xA));
+	// The DS1 HDMI blink: the panel's output gone for one poll, then back.
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xB));
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xA));
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xA));
+	// Flapping between two states never settles: no event either.
+	for (int i = 0; i < 6; i++) {
+		CHECK_FALSE(target_topology_filter_feed(&f, (i & 1) != 0 ? 0xA : 0xB));
+	}
+}
+
+TEST_CASE("hotplug poll filter: a change that holds is one event, then the new baseline", "[target][hotplug]")
+{
+	target_topology_filter f;
+	target_topology_filter_init(&f, 2);
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xA));
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xB));
+	CHECK(target_topology_filter_feed(&f, 0xB));
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xB)); // steady: nothing more
+	// A storm still moving restarts the count.
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xC));
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xD));
+	CHECK(target_topology_filter_feed(&f, 0xD));
+	// A sweep (OS / plug-in triggered) re-bases: the topology it saw is no event.
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xE));
+	target_topology_filter_rebase(&f, 0xE);
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xE));
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xE));
+}
+
+namespace {
+
+os_display_topology_entry
+output(const char *key, uint32_t state, int32_t left, uint32_t w, uint32_t h)
+{
+	os_display_topology_entry e{};
+	std::snprintf(e.key, sizeof(e.key), "%s", key);
+	e.state = state;
+	e.left = left;
+	e.width = w;
+	e.height = h;
+	return e;
+}
+
+} // namespace
+
+TEST_CASE("hotplug platform signature: a virtual monitor, a different panel, a mode or state change all move it",
+          "[target][hotplug]")
+{
+	// A Windows laptop + a 3D panel on a second output (EnumDisplayDevicesW keys).
+	os_display_topology_entry a[3] = {
+	    output("\\\\.\\DISPLAY1|\\\\?\\DISPLAY#BOE0A1C#4&1&UID8388688#{e6f07b5f}", 0x5, 0, 2560, 1600),
+	    output("\\\\.\\DISPLAY5|\\\\?\\DISPLAY#LEN6611#5&2&UID4352#{e6f07b5f}", 0x1, -3840, 3840, 2160),
+	};
+	const uint64_t h0 = os_display_topology_hash(a, 2);
+	CHECK(h0 == os_display_topology_hash(a, 2));
+	CHECK(h0 != os_display_topology_hash(a, 1));
+	CHECK(os_display_topology_hash(nullptr, 3) == os_display_topology_hash(nullptr, 0));
+
+	// A casting tool's IddCx "extend" monitor appears (no real EDID): the
+	// signature moves, so the sweep runs — the TRIGGER. Whether it can be the
+	// panel is the claim registry's call (tests_aux_display_desktop_select,
+	// tests_u_screen_home), never this list's.
+	os_display_topology_entry b[3];
+	std::memcpy(b, a, sizeof(a));
+	b[2] = output("\\\\.\\DISPLAY9|\\\\?\\DISPLAY#MTT1337#1&0&UID0#{e6f07b5f}", 0x1, 2560, 1920, 1080);
+	CHECK(os_display_topology_hash(b, 3) != h0);
+
+	// Another panel on the same output (the monitor interface name carries the EDID id).
+	std::memcpy(b, a, sizeof(a));
+	std::snprintf(b[1].key, sizeof(b[1].key), "%s",
+	              "\\\\.\\DISPLAY5|\\\\?\\DISPLAY#LEN6612#5&2&UID4352#{e6f07b5f}");
+	CHECK(os_display_topology_hash(b, 2) != h0);
+
+	// A mode change, a move, a state change (Linux: connected -> disconnected).
+	std::memcpy(b, a, sizeof(a));
+	b[1].width = 1920;
+	CHECK(os_display_topology_hash(b, 2) != h0);
+	std::memcpy(b, a, sizeof(a));
+	b[1].left = 2560;
+	CHECK(os_display_topology_hash(b, 2) != h0);
+	std::memcpy(b, a, sizeof(a));
+	b[1].state = 0;
+	CHECK(os_display_topology_hash(b, 2) != h0);
+
+	// Key boundaries are separated ("ab"+"c" != "a"+"bc").
+	os_display_topology_entry p[2] = {output("ab", 0, 0, 0, 0), output("c", 0, 0, 0, 0)};
+	os_display_topology_entry q[2] = {output("a", 0, 0, 0, 0), output("bc", 0, 0, 0, 0)};
+	CHECK(os_display_topology_hash(p, 2) != os_display_topology_hash(q, 2));
+}
+
+TEST_CASE("hotplug platform signature: this host's read is stable while nothing changes", "[target][hotplug]")
+{
+	// Whatever this host has (0 entries on macOS / a headless CI box): two
+	// reads back to back agree, and so does the combined signature.
+	os_display_topology_entry e1[OS_DISPLAY_TOPOLOGY_MAX];
+	os_display_topology_entry e2[OS_DISPLAY_TOPOLOGY_MAX];
+	const uint32_t n1 = os_display_topology_read(e1, OS_DISPLAY_TOPOLOGY_MAX);
+	const uint32_t n2 = os_display_topology_read(e2, OS_DISPLAY_TOPOLOGY_MAX);
+	CHECK(n1 == n2);
+	CHECK(os_display_topology_hash(e1, n1) == os_display_topology_hash(e2, n2));
+	CHECK(target_display_topology_signature() == target_display_topology_signature());
 }
