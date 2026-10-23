@@ -427,6 +427,41 @@ audit weigh device px, and now use `device_scale`.
 no import from, or runtime dependency on, DisplayXR or any vendor stack — that
 is what lets any package ship it and any runtime consume it.
 
+### 4.2 The monitor's work area (extension version 19)
+
+`monitor` is the whole monitor. An app that places its own window needs the
+part of the monitor that is left to windows: the Unity plug-in's side-step
+(DisplayXR/displayxr-unity#399) moves the app's window into a corner of its
+monitor when another app's window covers it, and with only the monitor rect a
+top corner put the window under GNOME's top bar, a left or bottom one under a
+dock that stays visible. Version 19 adds that part to every window entry:
+
+```json
+"monitor": { "x": 0, "y": 0, "w": 1920, "h": 1080, "scale": 1.0, "device_scale": 1.0,
+             "work_area": [0, 32, 1920, 1048] }
+```
+
+- `work_area`: `[x, y, w, h]` in stage coordinates, the space of
+  `monitor.x/y/w/h` (§4.1). It is mutter's work area of that monitor
+  (`Meta.Workspace.get_work_area_for_monitor`), the area mutter keeps a
+  maximized window in: the monitor minus every strut (GNOME Shell's top bar,
+  a dock that stays visible, such as Ubuntu's by default; an auto-hiding dock
+  reserves none).
+- Struts can differ between workspaces, so it is asked of the window's own
+  workspace (`Meta.Window.get_workspace()`, which is the active one for a
+  window on all workspaces), else of the active workspace.
+- Absent when it cannot be told (no workspace answers, an empty rect). A
+  consumer treats a missing `work_area` as the whole monitor, which is what it
+  had before version 19.
+- A change of the work area alone (the dock switched to auto-hide or back, a
+  monitor change) emits `WindowsChanged` (mutter's `workareas-changed`).
+- GNOME 42–44 hand back a `Meta.Rectangle`, 45+ an `Mtk.Rectangle`; both
+  have `x`, `y`, `width`, `height`. The pure part is `WorkArea` in `lib.js`,
+  unit-tested by `scripts/test_gnome_extension_work_area.js`.
+
+Additive: no field changed meaning, so the schema stays `version: 1`, and an
+older consumer ignores the new key.
+
 ## 5. Known limitations / follow-ups (#817)
 
 (Capture-exclusion limitations are listed with it, in §6.6.)

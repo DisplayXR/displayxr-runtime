@@ -369,6 +369,15 @@ spec, §12.5.
   (and its text-at-a-point reads, which find a window by its title, come back
   empty); an older extension simply has no `SetTitleAccess` and keeps giving
   titles to everyone. See the spec, §12.5.
+- Version 19, no interface change: a window entry's `monitor` gains
+  **`work_area`**, `[x, y, w, h]` in stage coordinates (the same space as the
+  monitor's `x`, `y`, `w`, `h`): the part of that monitor that the top bar and a
+  dock that stays visible leave to windows (mutter's work area, on the window's
+  workspace). Absent when it cannot be told. An app that places its own window
+  (the Unity plug-in's side-step steps into a corner, DisplayXR/displayxr-unity#399)
+  uses it to keep the window out from under the top bar and the dock. A change
+  of the work area alone (the dock switched to auto-hide or back) also emits
+  `WindowsChanged`. Additive; the schema stays `version: 1`. See the spec, §4.2.
 
 Verify the extension survives the lock screen (version 14+): lock from another
 terminal (`loginctl lock-session`) or a remote shell, then

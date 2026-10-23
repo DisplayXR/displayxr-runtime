@@ -245,10 +245,18 @@
 //       "frame":  [x, y, w, h],             // Meta.Window.get_frame_rect()
 //       "buffer": [x, y, w, h],             // Meta.Window.get_buffer_rect()
 //       "monitor": { "x": 0, "y": 0, "w": 3840, "h": 2160, "scale": 1.0,
-//                    "device_scale": 1.0 },  // ext v11+: device px per
+//                    "device_scale": 1.0,    // ext v11+: device px per
 //                                           // stage px on this monitor (the
 //                                           // stage view's scale). Absent
 //                                           // when it cannot be told.
+//                    "work_area": [0, 32, 3840, 2128] },
+//                                           // ext v19+: [x, y, w, h], stage
+//                                           // coordinates: the part of this
+//                                           // monitor that the top bar and a
+//                                           // fixed dock leave to windows
+//                                           // (mutter's work area, on the
+//                                           // window's workspace). Absent when
+//                                           // it cannot be told.
 //       "capture_excluded": false,          // ext v2+: CaptureExclusion1 active
 //       "lattice_drop": false,              // ext v7+: the last drag ended ON
 //                                           // the drag lattice and the window
@@ -1375,6 +1383,65 @@
         },
     };
 
+    /*
+     * ── The work area (version 19, displayxr-unity#399) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_work_area.js drives it.
+     *
+     * A window entry's "monitor" is the whole monitor. An app that places its
+     * own window (the Unity plug-in's side-step steps into a corner) needs the
+     * part the top bar and a fixed dock leave to windows: mutter's WORK AREA of
+     * that monitor, published as monitor.work_area. Struts can differ between
+     * workspaces, so it is asked of the window's own workspace
+     * (Meta.Window.get_workspace(), which is the active one for a window on all
+     * workspaces), else of the active workspace. Absent when neither answers.
+     * Same on GNOME 42-50: Meta.Workspace.get_work_area_for_monitor() hands
+     * back a Meta.Rectangle (42-44) or an Mtk.Rectangle (45+), both x, y,
+     * width, height.
+     */
+    const WorkArea = {
+        //! The workspace to ask about @p win: its own, else the active one of
+        //! @p workspaceManager (global.workspace_manager), else null.
+        workspaceOf(win, workspaceManager) {
+            let ws = null;
+            try {
+                ws = win?.get_workspace?.() ?? null;
+            } catch (e) {
+                ws = null;
+            }
+            if (!ws) {
+                try {
+                    ws = workspaceManager?.get_active_workspace?.() ?? null;
+                } catch (e) {
+                    ws = null;
+                }
+            }
+            return ws;
+        },
+
+        //! [x, y, w, h] (stage coordinates) of monitor @p mon's work area on
+        //! workspace @p ws, or null when it cannot be told.
+        rect(ws, mon) {
+            if (!ws || typeof ws.get_work_area_for_monitor !== 'function' || !Number.isInteger(mon) || mon < 0)
+                return null;
+            let r = null;
+            try {
+                r = ws.get_work_area_for_monitor(mon);
+            } catch (e) {
+                return null;
+            }
+            const v = [r?.x, r?.y, r?.width, r?.height];
+            if (!v.every(Number.isInteger) || v[2] <= 0 || v[3] <= 0)
+                return null;
+            return v;
+        },
+
+        //! monitor.work_area of @p win on monitor @p mon, or null.
+        of(win, mon, workspaceManager) {
+            return WorkArea.rect(WorkArea.workspaceOf(win, workspaceManager), mon);
+        },
+    };
+
     globalThis.displayxrWindowGeometry = {
         //! gi: {Clutter, GObject, Meta, Gio, GLib} — however the caller's
         //! shell spells the import. Returns {WindowGeometryService}.
@@ -1399,6 +1466,8 @@
         PointerPick,
         //! Who gets window titles, exported for its unit test.
         TitleAccess,
+        //! The monitor's work area, exported for its unit test.
+        WorkArea,
     };
 
     function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene, Mtk, GdkPixbuf, moveSync = true,
@@ -3711,6 +3780,14 @@
                     }));
                 this._displaySignals.push(
                     display.connect('notify::focus-window', () => this._queueEmit()));
+                // v19: a strut that comes or goes (a dock set to fixed or
+                // hidden, a monitor change) moves monitor.work_area.
+                try {
+                    this._displaySignals.push(
+                        display.connect('workareas-changed', () => this._queueEmit()));
+                } catch (e) {
+                    log(`displayxr: no workareas-changed signal (${e}); work_area follows the next emit`);
+                }
                 // Interactive grabs (move / resize). Published as `moving` so a
                 // consumer that repositions a window knows to wait for the user
                 // to let go. The signal's argument list grew a `screen`
@@ -3966,6 +4043,11 @@
                     const deviceScale = StageScale.deviceScale(layout, scale);
                     if (deviceScale !== null)
                         monitor.device_scale = deviceScale;
+                    // v19: what the top bar and a fixed dock leave to
+                    // windows. Absent when it cannot be told.
+                    const workArea = WorkArea.of(win, mon, global.workspace_manager);
+                    if (workArea)
+                        monitor.work_area = workArea;
                 }
                 return {
                     id: Number(win.get_id()),
