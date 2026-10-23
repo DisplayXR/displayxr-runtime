@@ -1568,6 +1568,15 @@ void
 comp_d3d11_service_weave_set_overlay_unchanged(struct xrt_compositor *xc, bool overlay_unchanged);
 
 /*!
+ * #2289: tag the client's per-client capture trigger with its executable
+ * basename (`%TEMP%\displayxr_atlas_trigger.<tag>`), the Windows twin of the
+ * POSIX weave engines' #2207 tag. Set per submit from the IPC handler; "" or
+ * NULL = the global trigger only.
+ */
+void
+comp_d3d11_service_weave_set_capture_tag(struct xrt_compositor *xc, const char *tag);
+
+/*!
  * XR_DXR_weave v15 (XrWeaveSubmitOverlayFilterDXR): the lens-filter strength
  * the NEXT @ref comp_d3d11_service_weave_submit asks for its overlay, [0,1];
  * negative = the display processor's own default. Per submit: consumed and
