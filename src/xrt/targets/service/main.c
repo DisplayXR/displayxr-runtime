@@ -115,6 +115,15 @@ static void
 register_display_followup(void)
 {
 	target_display_hotplug_set_followup_sink(display_followup_to_reprobe);
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_LINUX_DESKTOP)
+	// #2305: the in-process hotplug sweep is on by default on Windows and
+	// desktop Linux now, but this process already re-probes on its own OS
+	// events (the tray's WM_DISPLAYCHANGE / WM_DEVICECHANGE; DRM uevents +
+	// Mutter MonitorsChanged) through reprobe_run, which also refreshes the
+	// segment screens and the weave engines. One feeder, not two. (macOS
+	// keeps the sweep: the service has no other display-change source there.)
+	target_display_hotplug_set_host_feed(true);
+#endif
 }
 
 /*

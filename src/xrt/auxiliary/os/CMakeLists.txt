@@ -97,6 +97,18 @@ if(APPLE)
 else()
 	target_sources(aux_os PRIVATE os_display_hotplug_stubs.c)
 endif()
+# The cheap topology read the hotplug sweep polls (#2305): Windows has no
+# desktop enumeration and pure Wayland no RandR, so the sweep's signature needs
+# a platform part there. EnumDisplayDevicesW only (user32, already linked by
+# every Windows process); sysfs reads on desktop Linux.
+target_sources(aux_os PRIVATE os_display_topology.h os_display_topology.c)
+if(WIN32)
+	target_sources(aux_os PRIVATE os_display_topology_win32.c)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	target_sources(aux_os PRIVATE os_display_topology_linux.c)
+else()
+	target_sources(aux_os PRIVATE os_display_topology_stubs.c)
+endif()
 
 if(APPLE)
 	target_sources(aux_os PRIVATE os_macos.c)

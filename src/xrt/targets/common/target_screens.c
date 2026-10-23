@@ -291,12 +291,13 @@ iface_has_probe_displays(const struct xrt_plugin_iface *iface)
 	       iface->probe_displays != NULL;
 }
 
-uint32_t
-target_screens_collect_panel_claims(const struct xrt_dp_factory_registry *reg,
-                                    const char *active_plugin_id,
-                                    struct os_display_panel_claim *out_claims,
-                                    struct os_display_edid_monitor *out_mons,
-                                    uint32_t max)
+static uint32_t
+collect_panel_claims(const struct xrt_dp_factory_registry *reg,
+                     const char *active_plugin_id,
+                     struct os_display_panel_claim *out_claims,
+                     struct os_display_edid_monitor *out_mons,
+                     uint64_t *out_ids,
+                     uint32_t max)
 {
 	if (reg == NULL || out_claims == NULL || max == 0 || active_plugin_id == NULL || active_plugin_id[0] == '\0') {
 		return 0;
@@ -326,9 +327,22 @@ target_screens_collect_panel_claims(const struct xrt_dp_factory_registry *reg,
 		if (out_mons != NULL) {
 			out_mons[n] = mon;
 		}
+		if (out_ids != NULL) {
+			out_ids[n] = e->monitor_id;
+		}
 		n++;
 	}
 	return n;
+}
+
+uint32_t
+target_screens_collect_panel_claims(const struct xrt_dp_factory_registry *reg,
+                                    const char *active_plugin_id,
+                                    struct os_display_panel_claim *out_claims,
+                                    struct os_display_edid_monitor *out_mons,
+                                    uint32_t max)
+{
+	return collect_panel_claims(reg, active_plugin_id, out_claims, out_mons, NULL, max);
 }
 
 bool
@@ -338,16 +352,35 @@ target_screens_panel_from_claims(const struct xrt_dp_factory_registry *reg,
                                  struct os_display_desktop_info *out_desktop,
                                  bool *out_overrides_origin)
 {
+	return target_screens_panel_from_claims_ex(reg, active_plugin_id, hint, 0, out_desktop, out_overrides_origin,
+	                                           NULL);
+}
+
+bool
+target_screens_panel_from_claims_ex(const struct xrt_dp_factory_registry *reg,
+                                    const char *active_plugin_id,
+                                    const struct os_display_panel_hint *hint,
+                                    uint64_t incumbent_monitor_id,
+                                    struct os_display_desktop_info *out_desktop,
+                                    bool *out_overrides_origin,
+                                    uint64_t *out_monitor_id)
+{
 	if (out_overrides_origin != NULL) {
 		*out_overrides_origin = false;
+	}
+	if (out_monitor_id != NULL) {
+		*out_monitor_id = 0;
 	}
 	if (out_desktop == NULL) {
 		return false;
 	}
 	struct os_display_panel_claim claims[XRT_DP_REGISTRY_MAX_ENTRIES];
 	struct os_display_edid_monitor mons[XRT_DP_REGISTRY_MAX_ENTRIES];
-	const uint32_t n =
-	    target_screens_collect_panel_claims(reg, active_plugin_id, claims, mons, XRT_DP_REGISTRY_MAX_ENTRIES);
+	uint64_t ids[XRT_DP_REGISTRY_MAX_ENTRIES];
+	const uint32_t n = collect_panel_claims(reg, active_plugin_id, claims, mons, ids, XRT_DP_REGISTRY_MAX_ENTRIES);
+	for (uint32_t i = 0; i < n; i++) {
+		claims[i].incumbent = incumbent_monitor_id != 0 && ids[i] == incumbent_monitor_id;
+	}
 	bool overrides = false;
 	const int32_t pick = os_display_desktop_select_claim(claims, n, hint, &overrides);
 	if (pick < 0) {
@@ -364,5 +397,26 @@ target_screens_panel_from_claims(const struct xrt_dp_factory_registry *reg,
 	if (out_overrides_origin != NULL) {
 		*out_overrides_origin = overrides;
 	}
+	if (out_monitor_id != NULL) {
+		*out_monitor_id = ids[pick];
+	}
 	return true;
+}
+
+enum target_panel_reresolve
+target_screens_panel_reresolve_decide(uint64_t prev_claim_monitor_id, bool same_active_plugin, bool claim_resolved)
+{
+	if (claim_resolved) {
+		return TARGET_PANEL_TAKE_CLAIM;
+	}
+	if (prev_claim_monitor_id != 0 && same_active_plugin) {
+		// The rect came from the active plug-in's own claim and that claim is
+		// gone (the panel unplugged, its vendor service restarting, a cable
+		// blink): keep the last panel rect rather than fall to the origin /
+		// primary rules, which would hand the panel rect to whatever monitor
+		// is nearest — the laptop screen, or a virtual monitor that took the
+		// panel's place on the desktop. The claim's return re-resolves it.
+		return TARGET_PANEL_KEEP_PREVIOUS;
+	}
+	return TARGET_PANEL_TAKE_FALLBACK;
 }

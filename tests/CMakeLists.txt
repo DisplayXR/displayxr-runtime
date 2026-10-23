@@ -81,6 +81,7 @@ set(tests
     tests_aux_zone_canvas
     tests_aux_tiling_zero_copy
     tests_aux_screen_info
+    tests_u_screen_home
     tests_ipc_app_group
     tests_status_snapshot
     tests_status_ipc
@@ -545,6 +546,10 @@ target_link_libraries(tests_aux_tiling_zero_copy PRIVATE xrt-interfaces)
 # system-default / plug-in per-monitor slot / EDID-derived rules. Header only;
 # it reads the plug-in ABI structs, hence xrt-interfaces.
 target_link_libraries(tests_aux_screen_info PRIVATE xrt-interfaces)
+
+# #2305 -- a live session's home screen across display hotplugs (u_screen_home):
+# the SYSTEM_DEFAULT flag the segment managers read never leaves the session DP's panel.
+target_link_libraries(tests_u_screen_home PRIVATE xrt-interfaces)
 
 # Input focus follows the application (#962 follow-up): the pure sibling rule
 # in ipc/shared/ipc_app_group.h — name, process tree, executable tie-break.

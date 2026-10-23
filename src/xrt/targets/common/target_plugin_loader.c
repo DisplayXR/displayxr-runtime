@@ -4023,7 +4023,7 @@ target_plugin_release_claim_sources(void)
 uint32_t
 target_plugin_rescan_claim_sources(void)
 {
-#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_ANDROID)
+#if !defined(XRT_OS_ANDROID)
 	(void)target_plugin_get_active();
 	if (g_refresh_mutex_initialized) {
 		os_mutex_lock(&g_refresh_mutex);
@@ -4056,11 +4056,10 @@ target_plugin_rescan_claim_sources(void)
 	}
 	return added;
 #else
-	// TODO(multi-screen hotplug, Windows): the Windows claim-source set is
-	// collected once and kept, so a vendor plug-in that declined at instance
-	// create is never re-probed. Needs the twin of
-	// rescan_display_sources_platform over the registry entries (ADR-047
-	// Amendment 8). Android: one plug-in, no claim-only sources.
+	// Android: one plug-in, no claim-only sources. (Windows rescans like
+	// POSIX since #2305: rescan_display_sources_platform walks the same
+	// registry entries discovery does, so a vendor plug-in that declined at
+	// instance create — no panel then — is asked again on a hotplug.)
 	return 0;
 #endif
 }

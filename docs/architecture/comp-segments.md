@@ -396,6 +396,17 @@ What a compositor does with it (Metal today; the other managers already rebuild 
   never woven by a fallback DP or by the session DP. `DXR_TEST_SCREEN_NOT_READY=<name|id>` forces
   it.
 
+- **D3D11 / D3D12 / OpenGL / Vulkan (Windows, desktop Linux — #2305).** These managers read
+  "the session DP's screen" off the list's `SYSTEM_DEFAULT` flag and rebuild every segment DP on
+  `set_screens`. So the session re-anchors each hotplug re-push on its **home screen** first
+  (`util/u_screen_home`, called from `oxr_session_push_screens`): the flag stays on the screen the
+  session DP was made for while the same plug-in wins it, and when that screen is gone or
+  re-claimed no screen carries the flag — the managers then take their single-DP path ("does not
+  know the system-default screen — no segmentation") and the session DP keeps weaving the window,
+  exactly as before any sweep existed; it is never re-targeted, and no second weaver is built for
+  its panel. A WARN per outcome change: `display hotplug: the session's own display processor
+  stays on screen 0x… — in place | re-anchored | gone | re-claimed`.
+
 Test hook (macOS): `DXR_TEST_FAKE_MONITOR_FILE=<path>`. While the file holds a number S, the main
 display enumerates as two monitors cut at S points (the window can straddle the cut, since the
 WindowServer still shows one display); holding `reid`, the main display gets another identity.

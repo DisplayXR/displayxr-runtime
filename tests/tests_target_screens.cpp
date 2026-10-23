@@ -602,3 +602,37 @@ TEST_CASE("panel from claims: a claim the OS cannot resolve by identity never fa
 	CHECK_FALSE(overrides);
 	CHECK(d.width == 0);
 }
+
+/*
+ * #2305: what a re-resolve does with the panel rect when the claim rule does
+ * not fire — never fall from a claimed monitor to the origin / primary rules,
+ * which can land on an unclaimed or virtual monitor.
+ */
+TEST_CASE("panel re-resolve: a vanished claim keeps the last rect; no claim before keeps the old rules")
+{
+	// The claim resolves: take it, whatever came before.
+	CHECK(target_screens_panel_reresolve_decide(0, true, true) == TARGET_PANEL_TAKE_CLAIM);
+	CHECK(target_screens_panel_reresolve_decide(0x42, true, true) == TARGET_PANEL_TAKE_CLAIM);
+	CHECK(target_screens_panel_reresolve_decide(0x42, false, true) == TARGET_PANEL_TAKE_CLAIM);
+
+	// The panel was claimed and its claim is gone (unplugged, the vendor
+	// service restarting, a virtual monitor now where the panel was): keep.
+	CHECK(target_screens_panel_reresolve_decide(0x42, true, false) == TARGET_PANEL_KEEP_PREVIOUS);
+
+	// Another active plug-in now (an adoption), or no claim ever: the plain
+	// rules, exactly as before #2305.
+	CHECK(target_screens_panel_reresolve_decide(0x42, false, false) == TARGET_PANEL_TAKE_FALLBACK);
+	CHECK(target_screens_panel_reresolve_decide(0, true, false) == TARGET_PANEL_TAKE_FALLBACK);
+}
+
+TEST_CASE("panel from claims (ex): unresolvable identity declines and reports no monitor")
+{
+	fixture f;
+	f.vendor.probe_displays = fake_probe_displays;
+	os_display_panel_hint h = {};
+	os_display_desktop_info d = {};
+	uint64_t mon = 0x99;
+	CHECK_FALSE(
+	    target_screens_panel_from_claims_ex(&f.reg, "vendor", &h, f.reg.entries[2].monitor_id, &d, nullptr, &mon));
+	CHECK(mon == 0);
+}
