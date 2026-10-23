@@ -257,7 +257,8 @@ os_display_desktop_select_claim(const struct os_display_panel_claim *claims,
 		}
 		const bool size_match = hint != NULL && hint->pixel_width > 0 && hint->pixel_height > 0 &&
 		                        c->width == hint->pixel_width && c->height == hint->pixel_height;
-		const int score = (c->verified ? 4 : 0) + (size_match ? 2 : 0) + (!c->is_primary ? 1 : 0);
+		const int score =
+		    (c->incumbent ? 8 : 0) + (c->verified ? 4 : 0) + (size_match ? 2 : 0) + (!c->is_primary ? 1 : 0);
 		if (score > best_score) {
 			best = (int32_t)i;
 			best_score = score;

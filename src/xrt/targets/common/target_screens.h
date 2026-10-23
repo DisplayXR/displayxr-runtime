@@ -137,6 +137,44 @@ target_screens_panel_from_claims(const struct xrt_dp_factory_registry *reg,
                                  struct os_display_desktop_info *out_desktop,
                                  bool *out_overrides_origin);
 
+/*!
+ * @ref target_screens_panel_from_claims with display-hotplug stickiness
+ * (#2305): @p incumbent_monitor_id (0 = none) is the registry monitor the
+ * panel rect was resolved to before this re-resolve; while the active plug-in
+ * still claims it, it wins over every other claim (a second panel plugged in
+ * never moves the rect off the one a live session weaves). @p out_monitor_id
+ * (may be NULL) receives the registry monitor id of the pick.
+ */
+bool
+target_screens_panel_from_claims_ex(const struct xrt_dp_factory_registry *reg,
+                                    const char *active_plugin_id,
+                                    const struct os_display_panel_hint *hint,
+                                    uint64_t incumbent_monitor_id,
+                                    struct os_display_desktop_info *out_desktop,
+                                    bool *out_overrides_origin,
+                                    uint64_t *out_monitor_id);
+
+//! What a panel-rect re-resolve does (@ref target_screens_panel_reresolve_decide).
+enum target_panel_reresolve
+{
+	TARGET_PANEL_TAKE_CLAIM = 0,    //!< The claim rule resolved: publish it.
+	TARGET_PANEL_KEEP_PREVIOUS = 1, //!< The claimed panel vanished: keep the last rect.
+	TARGET_PANEL_TAKE_FALLBACK = 2, //!< No claim now or before: origin / size / primary, as always.
+};
+
+/*!
+ * Pure (#2305): on a re-resolve (hotplug sweep, world event — never the first
+ * resolve), the panel rect never falls from a claimed monitor to the origin /
+ * size / primary rules — those can land on an unclaimed or virtual monitor.
+ *
+ * @param prev_claim_monitor_id  The registry monitor the last resolve took by
+ *                               the claim rule; 0 when it took another rule.
+ * @param same_active_plugin     The active plug-in is the one that claimed it.
+ * @param claim_resolved         The claim rule resolved now.
+ */
+enum target_panel_reresolve
+target_screens_panel_reresolve_decide(uint64_t prev_claim_monitor_id, bool same_active_plugin, bool claim_resolved);
+
 #ifdef __cplusplus
 }
 #endif

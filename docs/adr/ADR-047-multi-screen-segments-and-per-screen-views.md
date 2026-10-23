@@ -349,7 +349,12 @@ there was no panel then, was never asked again. Decisions:
    **follow-up sweeps** at +0.5, 1, 1.5, 2, 3, 4, 6 and 8 s, because a plug-in that cannot say when
    its backend is ready must still be re-probed after it is; a plug-in's own request arms none (it
    says it is ready). Vendor-neutral throughout. `DXR_DISPLAY_HOTPLUG=0|1` forces it off / on;
-   the default is on where the OS notification is wired (macOS) and off elsewhere.
+   the default is on for in-process sessions on macOS, Windows and desktop Linux (#2305) and off
+   on Android and in a host that feeds its own re-probe (the Windows / desktop-Linux service —
+   `target_display_hotplug_set_host_feed`). On Windows and Linux the poll signature adds the
+   platform outputs (`os_display_topology_read`: `EnumDisplayDevicesW` under a pinned
+   per-monitor-v2 context; DRM connector `status` / `enabled`), and a changed signature must hold
+   for two polls before it is an event (an HDMI blink costs nothing).
 
 2. **The sweep, and copy-on-publish.** First, holding only the loader's lock: load every plug-in
    that is not a display-claim source yet (`target_plugin_rescan_claim_sources` — a plug-in that
@@ -466,13 +471,19 @@ the panel attached). Test hook: `DXR_TEST_FAKE_MONITOR_FILE=<path>` — while th
 S the main display enumerates as two monitors cut at S points; holding `reid` re-identifies it (the
 session DP's monitor "unplugged" with an unknown one in its place).
 
-**TODO (other boxes).** Windows: `WM_DISPLAYCHANGE` on a message-only window as the trigger, and
-the twin of `target_plugin_rescan_claim_sources` over the registry entries (the Windows claim-source
-set is collected once and keeps declined plug-ins out); the D3D11 / D3D12 / GL / Vulkan managers
-already re-table on `set_screens`, but rebuild their DPs rather than carrying them over. Linux:
-RandR `RRScreenChangeNotify` (or a DRM `change` uevent) as the trigger; the POSIX rescan and the
-Vulkan manager's `set_screens` are in place. Both: `DXR_DISPLAY_HOTPLUG=1` runs the poll, untested
-there. The service / IPC path: the service's own registry is rebuilt by the sweep, but the
+**Windows and desktop Linux (#2305).** On by default for in-process sessions, triggered by the
+poll above (an in-process runtime owns no window or message loop to receive `WM_DISPLAYCHANGE` on;
+the service keeps its own feeders). `target_plugin_rescan_claim_sources` now runs on Windows too.
+Three stickiness rules keep a bound weaver safe: (a) the panel rect's **incumbent** monitor wins the
+claim rule while the active plug-in still claims it; (b) when that claim vanishes (unplug, vendor
+service restart, blink) the **last panel rect is kept** instead of falling to the origin / primary
+rules, which could land on an unclaimed or virtual monitor; (c) every hotplug re-push to a D3D11 /
+D3D12 / GL / Vulkan compositor is **re-anchored on the session DP's home screen**
+(`u_screen_home_anchor`): those managers read "the session DP's screen" off SYSTEM_DEFAULT, so the
+flag stays on the home screen, and when the home screen is gone or re-claimed no screen carries it —
+segmentation pauses and the session DP weaves the window as it did before the sweep existed, never
+a second weaver on its panel. The managers still rebuild their segment DPs on `set_screens` rather
+than carrying them over (Metal's session-DP identity logic is not ported; follow-up). The service / IPC path: the service's own registry is rebuilt by the sweep, but the
 generation is not forwarded to clients (macOS IPC sessions do not segment). Detail:
 `docs/architecture/comp-segments.md` § *Display hotplug*.
 

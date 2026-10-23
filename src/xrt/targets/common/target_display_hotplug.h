@@ -19,8 +19,14 @@
  * - **the OS** — `os_display_hotplug_subscribe` (macOS: the CoreGraphics
  *   reconfiguration callback, delivered on the main run loop);
  * - **a poll** of a cheap topology signature (the OS monitor list: ids, rects,
- *   modes) — the safety net for a process whose main thread runs no run loop,
- *   and the only trigger where the OS notification is not wired;
+ *   modes; plus, where that list is empty or partial, the platform outputs of
+ *   `os_display_topology_read` — Windows `EnumDisplayDevicesW`, desktop-Linux
+ *   DRM connector state) — the safety net for a process whose main thread runs
+ *   no run loop, and the only trigger where the OS notification is not wired
+ *   (Windows, Linux: an in-process runtime owns no window / message loop to
+ *   receive `WM_DISPLAYCHANGE` on, #2305). A changed signature must hold for
+ *   @ref TARGET_HOTPLUG_POLL_STABLE consecutive polls before it is an event,
+ *   so a cable blink that comes back inside one poll period costs nothing;
  * - **a plug-in** — `xrt_plugin_host_iface::request_display_rescan`, for the
  *   vendor backend that recognises a panel seconds after the OS saw the monitor.
  *
@@ -188,9 +194,48 @@ target_screens_change_format(const struct xrt_screen_list *before,
 uint64_t
 target_display_topology_hash(const struct os_display_desktop_info *mons, uint32_t count);
 
-//! The current OS monitor list's hash (`os_display_desktop_enumerate`).
+/*!
+ * The current topology signature: the OS monitor list's hash
+ * (`os_display_desktop_enumerate`) mixed with the platform outputs'
+ * (`os_display_topology_read`; Windows, desktop Linux). Cheap: no EDID read.
+ */
 uint64_t
 target_display_topology_signature(void);
+
+//! Consecutive polls a changed signature must hold before it is an event.
+#define TARGET_HOTPLUG_POLL_STABLE 2u
+
+/*!
+ * The poll's blink filter (pure, not thread-safe). The baseline is the
+ * topology the last sweep saw; a signature that differs from it becomes a
+ * candidate, and only a candidate seen @ref stable_needed times in a row is an
+ * event. A signature back at the baseline drops the candidate: an HDMI blink
+ * (the panel's monitor gone and back within a poll or two) is no sweep.
+ */
+struct target_topology_filter
+{
+	bool have_baseline;
+	uint64_t baseline;
+	bool have_candidate;
+	uint64_t candidate;
+	uint32_t candidate_seen;
+	uint32_t stable_needed;
+};
+
+//! Initialise (0 = @ref TARGET_HOTPLUG_POLL_STABLE).
+void
+target_topology_filter_init(struct target_topology_filter *f, uint32_t stable_needed);
+
+/*!
+ * Feed one poll's signature. Returns true when it is an event (the candidate
+ * then becomes the baseline). The first signature only sets the baseline.
+ */
+bool
+target_topology_filter_feed(struct target_topology_filter *f, uint64_t sig);
+
+//! A sweep just ran and saw @p sig: that is the baseline now, any candidate is dropped.
+void
+target_topology_filter_rebase(struct target_topology_filter *f, uint64_t sig);
 
 
 /*
@@ -210,11 +255,27 @@ struct target_display_hotplug;
 
 /*!
  * Is the monitor enabled in this process? `DXR_DISPLAY_HOTPLUG=0` turns it
- * off, `=1` on; unset = on where the OS notification is wired (macOS), off
- * elsewhere (TODO: Windows / Linux, ADR-047 Amendment 8).
+ * off, `=1` on. Unset: on for in-process sessions on macOS, Windows and
+ * desktop Linux (#2305), off on Android — and off in a host that feeds its
+ * own display re-probe (@ref target_display_hotplug_set_host_feed: the
+ * Windows / desktop-Linux service, whose tray / DRM-uevent / Mutter feeders
+ * already drive `reprobe_run`).
  */
 bool
 target_display_hotplug_enabled(void);
+
+/*!
+ * The host process re-probes displays on its own OS events (the service on
+ * Windows and desktop Linux). Turns the default of
+ * @ref target_display_hotplug_enabled off so the two do not double up; an
+ * explicit `DXR_DISPLAY_HOTPLUG` still wins. Call before the system is created.
+ */
+void
+target_display_hotplug_set_host_feed(bool host_feeds);
+
+//! Pure: the default decision (exposed for tests). @p env = `DXR_DISPLAY_HOTPLUG` (NULL = unset).
+bool
+target_display_hotplug_default_enabled(const char *env, bool host_feeds);
 
 /*!
  * Start the worker (one per process; a second start fails). The poll period

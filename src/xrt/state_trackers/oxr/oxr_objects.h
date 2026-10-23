@@ -29,6 +29,7 @@
 #include "util/u_index_fifo.h"
 #include "util/u_hashset.h"
 #include "util/u_hashmap.h"
+#include "util/u_screen_home.h"
 #include "util/u_device.h"
 #include "util/u_cursor_depth.h"
 #include "util/u_tracking_any.h"
@@ -2995,6 +2996,16 @@ struct oxr_session
 	 * handed its compositor. A frame that sees another re-pushes them.
 	 */
 	uint64_t display_generation;
+
+	/*!
+	 * #2305: the screen the session's own DP was made for (the system default
+	 * of its first screen list). Every hotplug re-push to a D3D11 / D3D12 /
+	 * GL / Vulkan compositor keeps SYSTEM_DEFAULT on it (u_screen_home_anchor),
+	 * so a bound weaver is never re-targeted or doubled by a re-push.
+	 */
+	struct u_screen_home display_home;
+	//! The last anchor outcome logged (one WARN per change, not per re-push).
+	int display_home_logged;
 
 	/*!
 	 * True when the session is bound to a display OTHER than the system

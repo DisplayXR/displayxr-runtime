@@ -127,6 +127,8 @@ add_library(
 	u_metrics.h
 	u_misc.c
 	u_misc.h
+	u_screen_home.c
+	u_screen_home.h
 	u_mcp_capability.c
 	u_mcp_capability.h
 	u_app_partition.c
