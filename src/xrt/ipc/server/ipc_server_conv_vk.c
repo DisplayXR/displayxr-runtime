@@ -65,6 +65,7 @@
 #include "multi/comp_multi_weave_lift.h"
 #include "vk_conv/vk_conv_gpu.h"
 #include "vk_conv/vk_conv_weave.h"
+#include "vk/vk_helpers.h"
 
 #include "util/u_logging.h"
 
@@ -176,6 +177,17 @@ ipc_server_conv_attach_vk(struct xrt_system_compositor *xsysc)
 	// gpu.dp_lift: none (D3D11 only).
 	gpu.nominal_z_m = xsysc->info.nominal_viewer_z_m;
 	gpu.adapter_luid = 0; // satellites are CPU-lane only on POSIX
+	{
+		// ADR-058 Amendment 1: integrated GPUs get the smaller late output.
+		VkPhysicalDeviceProperties props;
+		memset(&props, 0, sizeof(props));
+		vk->vkGetPhysicalDeviceProperties(vk->physical_device, &props);
+		gpu.adapter_class = props.vendorID == 0x106Bu ? CONV_ADAPTER_APPLE
+		                    : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+		                        ? CONV_ADAPTER_INTEGRATED
+		                    : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? CONV_ADAPTER_DISCRETE
+		                                                                               : CONV_ADAPTER_UNKNOWN;
+	}
 
 	struct vk_conv_gpu_caps caps;
 	vk_conv_gpu_get_caps(g_conv_vk.glue, &caps);

@@ -24,14 +24,27 @@ sim_fake_eyes_at(const struct sim_fake_eyes_params *p,
 	float cx = p->nominal_x_m;
 	float cy = p->nominal_y_m;
 	const float cz = p->nominal_z_m;
-	if (p->sway_m != 0.0f && p->sway_period_ns > 0) {
+	double yaw = 0.0;
+	if ((p->sway_m != 0.0f || p->turn_rad != 0.0f) && p->sway_period_ns > 0) {
 		// Phase from the target time directly: deterministic, no clock.
 		const double phase =
 		    SIM_EYES_TWO_PI * (double)(target_ns % p->sway_period_ns) / (double)p->sway_period_ns;
 		cx += p->sway_m * (float)sin(phase);
 		cy += 0.5f * p->sway_m * (float)sin(2.0 * phase);
+		yaw = (double)p->turn_rad * sin(phase); // the head turns with the sway (ADR-058 test vehicle)
 	}
 	const float half_ipd = p->ipd_m / 2.0f;
+	if (yaw != 0.0 && view_count == 2) {
+		// A turned head: the pair rotates about its midpoint (right eye back for yaw > 0).
+		const float hx = half_ipd * (float)cos(yaw), hz = half_ipd * (float)sin(yaw);
+		memset(out, 0, sizeof(*out));
+		out->eyes[0] = (struct xrt_eye_position){cx - hx, cy, cz - hz};
+		out->eyes[1] = (struct xrt_eye_position){cx + hx, cy, cz + hz};
+		out->count = 2;
+		out->timestamp_ns = target_ns;
+		out->valid = true;
+		return;
+	}
 
 	memset(out, 0, sizeof(*out));
 	if (view_count == 1) {

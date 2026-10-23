@@ -201,7 +201,13 @@ sim_display_eyes_at(struct xrt_eye_positions *out,
 	// sim_display always reported.
 	static float sway_m = -1.0f;
 	static int64_t sway_period_ns = 0;
+	static float turn_rad = 0.0f;
 	if (sway_m < 0.0f) {
+		float deg = sim_display_setting_float("TRACKING_TURN_DEG", 0.0f);
+		if (!(deg >= 0.0f) || deg > 60.0f) {
+			deg = 0.0f;
+		}
+		turn_rad = deg * 0.017453292519943295f;
 		float mm = sim_display_setting_float("TRACKING_SWAY_MM", 0.0f);
 		if (!(mm >= 0.0f) || mm > 500.0f) {
 			mm = 0.0f;
@@ -221,6 +227,7 @@ sim_display_eyes_at(struct xrt_eye_positions *out,
 	    .ipd_m = ipd_m,
 	    .sway_m = sim_display_fake_tracking_enabled() ? sway_m : 0.0f,
 	    .sway_period_ns = sway_period_ns,
+	    .turn_rad = sim_display_fake_tracking_enabled() ? turn_rad : 0.0f,
 	};
 	sim_fake_eyes_at(&p, view_count, target_ns, out);
 	out->is_tracking = sim_display_fake_tracking_sample_at(target_ns, NULL); // false unless TRACKING (#441)

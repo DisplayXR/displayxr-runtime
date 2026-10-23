@@ -260,6 +260,68 @@ u_lift_reproject_render(const struct u_lift_reproject_policy *pol,
 
 /*
  *
+ * Re-run rule (the presenter's cache, ADR-058 phase 1).
+ *
+ */
+
+//! A view's offset from the viewpoints' midpoint moved this far (a head
+//! turn, an IPD / view-spread change): re-synthesize.
+#define U_LIFT_REPROJECT_RERUN_SPREAD_M 0.0005f
+//! The midpoint's distance from the glass moved this far: re-synthesize
+//! (the composed budget scales with 1 / distance).
+#define U_LIFT_REPROJECT_RERUN_DISTANCE_M 0.005f
+//! The easing factor moved this much: re-synthesize.
+#define U_LIFT_REPROJECT_RERUN_EASE 0.02f
+
+/*!
+ * Whether a late synthesis at @p cur (with ease @p cur_ease) would differ
+ * visibly from the cached one made at @p prev (@p prev_ease). A common (x, y)
+ * translation of viewpoints parallel to the glass never asks for one: both
+ * geometries are invariant under it (x_s = p' + (E - C) q), so the cached
+ * views are already right; with a turned head (views at different depths) it
+ * shifts each view by about move * (dz / z) * q, which is bounded by the
+ * spread threshold too. True for invalid input (re-synthesize when in doubt).
+ */
+bool
+u_lift_reproject_needs_rerun(
+    const float (*prev)[3], const float (*cur)[3], uint32_t view_count, float prev_ease, float cur_ease);
+
+
+/*
+ *
+ * Straddling rects (ADR-058 Amendment 1 item 2).
+ *
+ */
+
+//! The #2256 coverage dwell (== COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS).
+#define U_LIFT_REPROJECT_SCREEN_HOLD_NS (500ull * 1000ull * 1000ull)
+
+/*!
+ * Which screen's eyes place a lifted rect: the screen under the rect's
+ * CENTRE, with the coverage dwell of #2256 as hysteresis -- a new screen
+ * takes over only once it has held the centre continuously for hold_ns; the
+ * first screen seen is taken at once. Keys are any non-zero screen identity
+ * (a screen id, a DP pointer); 0 = unknown (keeps the current one).
+ */
+struct u_lift_reproject_screen_dwell
+{
+	uint64_t hold_ns;
+	uint64_t current;   //!< the screen whose eyes place the rect (0 = none yet)
+	uint64_t candidate; //!< a different screen under the centre, dwell running
+	uint64_t since_ns;
+};
+
+//! @p hold_ns 0 = U_LIFT_REPROJECT_SCREEN_HOLD_NS.
+void
+u_lift_reproject_screen_dwell_init(struct u_lift_reproject_screen_dwell *d, uint64_t hold_ns);
+
+//! Advance with the screen under the centre this frame; returns the screen to place with.
+uint64_t
+u_lift_reproject_screen_dwell_update(struct u_lift_reproject_screen_dwell *d, uint64_t under_centre, uint64_t now_ns);
+
+
+/*
+ *
  * Result age (ADR-058 decision 4's stats split; internal until the
  * XrLiftStreamStatsDXR append lands with the ADR).
  *

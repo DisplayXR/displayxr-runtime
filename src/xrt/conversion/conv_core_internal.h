@@ -72,6 +72,13 @@ struct conv_ring_slot
 	//! sampled (the S3 snapshot's timestamp; the conversion start for the
 	//! nominal viewer or a task without S3). Feeds the internal placement age.
 	uint64_t placed_eyes_ns;
+
+	/* ADR-058 late view synthesis: a composed result kept as its source. */
+	bool late_valid;                     //!< published as a late source (no views)
+	struct xrt_conv_image late_src;      //!< colour copy of the converted input
+	struct conv_late_source late;        //!< S5's inputs (recorded viewpoints)
+	struct conv_policy_view_in late_vin; //!< S3's inputs (eyes NULL) to place it at later eyes
+	uint64_t late_gen;                   //!< content generation
 };
 
 struct conv_stream
@@ -111,6 +118,12 @@ struct conv_stream
 	//! acquired (latest-wins skipped it): the next acquired result carries it.
 	bool discontinuity_unread;
 	struct conv_policy_view_state vstate;
+	uint64_t late_gen;       //!< ADR-058: last content generation published as a late source
+	uint64_t late_placed_ns; //!< ADR-058: eyes sample time of the newest late placement (stats)
+	bool late_logged;        //!< ADR-058: "late view synthesis on" logged for this stream
+	uint64_t late_prepares;  //!< ADR-058: presenter frames that placed a late source
+	uint64_t late_reruns;    //!< ADR-058: ... of which re-synthesized (the rest reused the cached views)
+	uint64_t late_log_ns;    //!< ADR-058: last counters line (INFO, once a second at most)
 	struct conv_observer observer;
 	bool has_observer;
 	struct xrt_conv_depth_info last_depth;
@@ -249,6 +262,7 @@ struct conv_validated
 struct conv_core
 {
 	struct conv_core_config cfg;
+	uint32_t late_adapter_class; //!< ADR-058: CONV_ADAPTER_* of the installed presenter (conv_core_set_gpu)
 	char preferred[XRT_CONV_TASK_RESERVED_FIRST][CONV_ID_MAX + 16];
 
 	/* registry_mtx: registry, readiness, generations, warm ops (leaf). */

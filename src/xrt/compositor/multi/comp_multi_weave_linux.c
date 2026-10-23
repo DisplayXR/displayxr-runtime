@@ -2295,6 +2295,7 @@ weave_lift_record_batch(struct multi_compositor *mc,
 		r.tile_h = mc->weave.out_h;
 		r.batch = true;
 		comp_multi_weave_lift_rect_frame(mc, rr, win_w, win_h, (uint64_t)(uintptr_t)mc->weave.dp, &r.frame);
+		comp_multi_weave_lift_rect_place(mc, rr, win_w, win_h, &r);
 		(void)comp_multi_weave_lift_record(&mc->weave.lift, cmd, &r);
 	}
 }
@@ -2349,6 +2350,7 @@ weave_lift_record_nview(struct multi_compositor *mc,
 		r.tile_h = cvh;
 		r.batch = false;
 		comp_multi_weave_lift_rect_frame(mc, rr, win_w, win_h, (uint64_t)(uintptr_t)mc->weave.dp, &r.frame);
+		comp_multi_weave_lift_rect_place(mc, rr, win_w, win_h, &r);
 		(void)comp_multi_weave_lift_record(&mc->weave.lift, cmd, &r);
 	}
 }
@@ -2489,6 +2491,15 @@ weave_run_frame(struct vk_bundle *vk,
 	}
 	// XR_DXR_lift §6: lift this submit's rects (false = weave them as drawn).
 	const bool lifting = lift_requested && comp_multi_weave_lift_begin(&mc->weave.lift, vk, lift->count);
+	// ADR-058 Amendment 1: one runtime-side eye sample from the DP for this
+	// weave, taken before any lifted rect is placed; the late synthesis, the
+	// reply below and the core's publish use it (the vendor weaver's internal
+	// pose stays the DP's).
+	struct xrt_eye_positions lift_eyes;
+	const bool have_lift_eyes = lifting && comp_multi_weave_lift_sample_frame_eyes(mc, &lift_eyes);
+	if (!have_lift_eyes) {
+		comp_multi_weave_lift_clear_frame_eyes(&mc->weave.lift);
+	}
 
 	VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
 
@@ -3274,7 +3285,11 @@ weave_run_frame(struct vk_bundle *vk,
 		U_ZERO(out_eyes);
 	}
 #endif
-	if (!xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eyes)) {
+	if (have_lift_eyes) {
+		// The sample the lifted rects were placed with (one per weave).
+		*out_eyes = lift_eyes;
+		comp_multi_conv_eyes_publish((uint64_t)(uintptr_t)mc->weave.dp, out_eyes);
+	} else if (!xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eyes)) {
 		U_ZERO(out_eyes);
 	} else {
 		// The conversion core's per-DP eyes (roadmap §5.2): a lifted rect's

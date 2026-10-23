@@ -8,6 +8,8 @@
 
 #include "conv_pipeline.h"
 
+#include "util/u_conv_viewsyn.h"
+
 #include <math.h>
 #include <string.h>
 
@@ -199,53 +201,132 @@ run_s6(const struct conv_pipeline *p, const struct conv_depth_readback_ops *read
 	}
 }
 
-static bool
-run_s5(const struct conv_pipeline *p, const struct conv_viewsyn_ops *viewsyn, struct conv_pipeline_frame *f)
+void
+conv_viewsyn_request_to_params(const struct conv_viewsyn_request *req, struct u_conv_viewsyn_params *p)
 {
-	if (viewsyn == NULL || viewsyn->render == NULL || f->in.image_count == 0 || f->views_target.memory_kind == 0) {
-		return false;
+	u_conv_viewsyn_params_defaults(p);
+	p->view_count = req->view_count;
+	for (uint32_t i = 0; i < req->view_count && i < U_CONV_VIEWSYN_MAX_VIEWS; i++) {
+		p->viewpoints_m[i][0] = req->viewpoints_m[i][0];
+		p->viewpoints_m[i][1] = req->viewpoints_m[i][1];
+		p->viewpoints_m[i][2] = req->viewpoints_m[i][2];
 	}
+	p->rect_width_m = req->rect_width_m;
+	p->rect_height_m = req->rect_height_m;
+	if (req->depth_info != NULL) {
+		p->depth = *req->depth_info;
+	}
+	p->range_near = req->range_near;
+	p->range_far = req->range_far;
+	p->convergence = req->convergence;
+	p->budget = req->budget;
+	p->rear_cap_m = req->rear_cap_m;
+}
+
+//! S5's request for frame @p f (false: no range to normalise against).
+static bool
+s5_request(const struct conv_pipeline *p, struct conv_pipeline_frame *f, struct conv_viewsyn_request *r)
+{
 	struct xrt_conv_depth_info *di = &f->result.depth_info;
-	struct conv_viewsyn_request r;
-	memset(&r, 0, sizeof(r));
-	r.color = &f->in.images[0];
-	r.depth = &f->result.depth;
-	r.depth_info = di;
-	r.view_count = p->view_count;
-	memcpy(r.viewpoints_m, f->params.viewpoints_xyz, sizeof(r.viewpoints_m));
-	r.rect_width_m = f->params.rect_width_m;
-	r.rect_height_m = f->params.rect_height_m;
-	if (!conv_policy_depth_range(di, &r.range_near, &r.range_far)) {
+	memset(r, 0, sizeof(*r));
+	r->color = &f->in.images[0];
+	r->depth = &f->result.depth;
+	r->depth_info = di;
+	r->view_count = p->view_count;
+	memcpy(r->viewpoints_m, f->params.viewpoints_xyz, sizeof(r->viewpoints_m));
+	r->rect_width_m = f->params.rect_width_m;
+	r->rect_height_m = f->params.rect_height_m;
+	if (!conv_policy_depth_range(di, &r->range_near, &r->range_far)) {
 		return false; // no range: nothing to normalise against (never a silent min-max)
 	}
 	if (f->params.convergence_mode == XRT_CONV_CONVERGENCE_DECODED) {
-		r.convergence = f->params.convergence;
+		r->convergence = f->params.convergence;
 	} else {
 		// AUTO and no estimator: the middle of the content, in nearness.
-		const double nn = conv_policy_nearness(di->kind, r.range_near);
-		const double nf = conv_policy_nearness(di->kind, r.range_far);
-		r.convergence = (float)conv_policy_from_nearness(di->kind, 0.5 * (nn + nf));
+		const double nn = conv_policy_nearness(di->kind, r->range_near);
+		const double nf = conv_policy_nearness(di->kind, r->range_far);
+		r->convergence = (float)conv_policy_from_nearness(di->kind, 0.5 * (nn + nf));
 	}
-	r.budget = f->budget > 0.0f ? f->budget : CONV_POLICY_BUDGET_DEFAULT;
-	r.rear_cap_m = f->rear_cap_m;
-	r.target = &f->views_target;
-	r.layout = p->views_layout;
-	r.new_content = f->new_content;
-	if (!viewsyn->render(viewsyn->ud, &r)) {
-		return false;
-	}
+	r->budget = f->budget > 0.0f ? f->budget : CONV_POLICY_BUDGET_DEFAULT;
+	r->rear_cap_m = f->rear_cap_m;
+	r->target = &f->views_target;
+	r->layout = p->views_layout;
+	r->new_content = f->new_content;
+	return true;
+}
 
-	f->result.views = f->views_target;
-	f->result.written |= XRT_CONV_OUT_VIEWS;
+//! What S5 records beside the views, rendered or deferred.
+static void
+s5_finish(const struct conv_pipeline *p, struct conv_pipeline_frame *f, const struct conv_viewsyn_request *r)
+{
+	struct xrt_conv_depth_info *di = &f->result.depth_info;
 	struct xrt_conv_views_info *vi = &f->result.views_info;
 	memset(vi, 0, sizeof(*vi));
 	vi->view_count = p->view_count;
 	vi->layout = p->views_layout;
 	memcpy(vi->eye_xyz, f->params.viewpoints_xyz, sizeof(vi->eye_xyz));
 	vi->baseline_m = f->params.baseline_m;
-	di->convergence_value = r.convergence;
+	di->convergence_value = r->convergence;
 	di->suggest_flags |= 4u; // convergence_value valid
+}
+
+static bool
+run_s5(const struct conv_pipeline *p, const struct conv_viewsyn_ops *viewsyn, struct conv_pipeline_frame *f)
+{
+	if (f->in.image_count == 0) {
+		return false;
+	}
+	struct conv_viewsyn_request r;
+	if (!s5_request(p, f, &r)) {
+		return false;
+	}
+	if (f->defer_s5) {
+		// ADR-058: the presenter re-runs this at each display frame's eyes.
+		struct conv_late_source *l = &f->late;
+		memset(l, 0, sizeof(*l));
+		l->depth_info = f->result.depth_info;
+		l->view_count = r.view_count;
+		l->layout = r.layout;
+		memcpy(l->viewpoints_m, r.viewpoints_m, sizeof(l->viewpoints_m));
+		l->rect_width_m = r.rect_width_m;
+		l->rect_height_m = r.rect_height_m;
+		l->range_near = r.range_near;
+		l->range_far = r.range_far;
+		l->convergence = r.convergence;
+		l->budget = r.budget;
+		l->rear_cap_m = r.rear_cap_m;
+		s5_finish(p, f, &r);
+		l->depth_info.convergence_value = r.convergence;
+		f->late_ready = true;
+		return true;
+	}
+	if (viewsyn == NULL || viewsyn->render == NULL || f->views_target.memory_kind == 0 ||
+	    !viewsyn->render(viewsyn->ud, &r)) {
+		return false;
+	}
+	f->result.views = f->views_target;
+	f->result.written |= XRT_CONV_OUT_VIEWS;
+	s5_finish(p, f, &r);
 	return true;
+}
+
+bool
+conv_pipeline_render_deferred(const struct conv_pipeline *p,
+                              const struct conv_viewsyn_ops *viewsyn,
+                              struct conv_pipeline_frame *f)
+{
+	if (!f->late_ready) {
+		return false;
+	}
+	const bool was = f->defer_s5;
+	f->defer_s5 = false;
+	const bool ok = run_s5(p, viewsyn, f);
+	f->defer_s5 = was;
+	if (ok) {
+		f->late_ready = false;
+		f->result.written &= p->outputs;
+	}
+	return ok;
 }
 
 xrt_result_t
@@ -256,6 +337,7 @@ conv_pipeline_execute(const struct conv_pipeline *p,
 {
 	f->provider_out.struct_size = (uint32_t)sizeof(f->provider_out);
 	f->provider_out.written = 0;
+	f->late_ready = false;
 	f->in.struct_size = (uint32_t)sizeof(f->in);
 	f->params.struct_size = (uint32_t)sizeof(f->params);
 

@@ -719,6 +719,13 @@ glue_release_all(d3d11_lift *l)
 	l->core_weave.clear();
 	d3d11_conv_viewsyn_destroy(&l->viewsyn);
 	rel(l->viewsyn_deferred);
+	for (auto &kv : l->late_states) {
+		rel(kv.second.srv);
+		rel(kv.second.tex);
+	}
+	l->late_states.clear();
+	d3d11_conv_viewsyn_destroy(&l->late_vs);
+	rel(l->late_deferred);
 	d3d11_conv_content_check_destroy(&l->content_check);
 }
 
@@ -941,6 +948,45 @@ glue_upload(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_im
 	return held;
 }
 
+/*!
+ * ADR-058: the converted input into a ring slot's late source (dispatcher
+ * thread). A CPU input is uploaded; a glue input is copied on the service
+ * context inside both keyed mutexes.
+ */
+static bool
+glue_copy(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_image *dst)
+{
+	d3d11_lift *l = (d3d11_lift *)ud;
+	if (src == nullptr || dst == nullptr) {
+		return false;
+	}
+	if (src->memory_kind == XRT_CONV_MEM_CPU) {
+		return glue_upload(ud, src, dst);
+	}
+	if (src->memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE || dst->memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE ||
+	    !glue_enter(l)) {
+		return false;
+	}
+	glue_img a, b;
+	const bool ok = glue_find(l, src->import_key, &a) && glue_find(l, dst->import_key, &b) && a.w == b.w &&
+	                a.h == b.h && a.dxgi == b.dxgi && a.layers == 1 && b.layers == 1;
+	const bool held_a = ok && img_acquire(a.km, src, 4);
+	const bool held_b = held_a && img_acquire(b.km, dst, 4);
+	if (held_b) {
+		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		l->svc_context->CopyResource(b.tex, a.tex);
+		l->svc_context->Flush();
+	}
+	if (held_b) {
+		img_release(b.km, dst);
+	}
+	if (held_a) {
+		img_release(a.km, src);
+	}
+	glue_leave(l);
+	return held_b;
+}
+
 void
 d3d11_lift_glue_alloc_ops(struct d3d11_lift *l, struct conv_image_alloc_ops *out)
 {
@@ -951,6 +997,7 @@ d3d11_lift_glue_alloc_ops(struct d3d11_lift *l, struct conv_image_alloc_ops *out
 	out->alloc = glue_alloc;
 	out->free = glue_free;
 	out->upload = glue_upload;
+	out->copy = glue_copy;
 	out->ud = l;
 }
 
@@ -2189,6 +2236,7 @@ core_weave_submit_locked(d3d11_lift *l,
 		p = ws->last_params;
 	}
 	conv_frame_submit fr = {};
+	fr.weave_rect = true; // ADR-058: woven by this presenter (late view synthesis)
 	fr.source_time = source_time;
 	fr.frame_flags = p.inpaint != 0 ? XRT_CONV_FRAME_INPAINT : 0u;
 	uint32_t n = viewpoint_floats / 3;
@@ -2250,8 +2298,172 @@ core_weave_submit_locked(d3d11_lift *l,
 	return r;
 }
 
+/*!
+ * ADR-058 late view synthesis, render thread, under the service's
+ * immediate-context mutex (the weave holds it around lift_weave_rect_batch):
+ * synthesize the pinned late source at this display frame's eyes into the
+ * stream's own views texture when the cache rule asks -- recorded on a
+ * deferred context and replayed with ExecuteCommandList(list, TRUE) on the
+ * immediate context the weave is drawing on, so none of its state leaks --
+ * and hand that texture out as the pin's views. False = weave flat.
+ */
+static bool
+core_pin_late(
+    d3d11_lift *l, conv_core *core, uint64_t core_id, const conv_result &r, int32_t cx, int32_t cy, d3d11_lift_pin *out)
+{
+	const uint64_t now = os_monotonic_get_ns();
+	// Streams no longer woven let their views go (10 s unused).
+	for (auto it = l->late_states.begin(); it != l->late_states.end();) {
+		if (it->first != core_id && now - it->second.used_ns > 10ull * 1000000000ull) {
+			rel(it->second.srv);
+			rel(it->second.tex);
+			it = l->late_states.erase(it);
+		} else {
+			++it;
+		}
+	}
+	d3d11_late_state &ls = l->late_states[core_id];
+	ls.used_ns = now;
+	conv_late_frame lf;
+	auto warn = [&](const char *why) {
+		if (!ls.warned) {
+			ls.warned = true;
+			U_LOG_W("[lift] core stream %llu: late view synthesis failed (%s); woven flat",
+			        (unsigned long long)core_id, why);
+		}
+	};
+	// ADR-058 Amendment 1: the weave's one runtime-side sample; a rect centred (dwelled)
+	// on another screen than the sample's keeps its conversion placement.
+	uint32_t mode = l->late_have_eyes ? CONV_LATE_EYES_SAMPLE : CONV_LATE_EYES_SNAPSHOT;
+	if (l->late_have_eyes && l->late_segs.count >= 2 && cx != INT32_MIN) {
+		uint64_t under = 0;
+		for (uint32_t i = 0; i < l->late_segs.count && i < XRT_MAX_SEGMENTS; i++) {
+			const xrt_segment_metric &s = l->late_segs.seg[i];
+			if (cx >= s.window_rect.offset.w && cx < s.window_rect.offset.w + s.window_rect.extent.w &&
+			    cy >= s.window_rect.offset.h && cy < s.window_rect.offset.h + s.window_rect.extent.h) {
+				under = s.screen_id != 0 ? s.screen_id : (uint64_t)i + 1u;
+				break;
+			}
+		}
+		const uint64_t at = u_lift_reproject_screen_dwell_update(&ls.straddle, under, now);
+		for (uint32_t i = 0; i < l->late_segs.count && i < XRT_MAX_SEGMENTS; i++) {
+			const xrt_segment_metric &s = l->late_segs.seg[i];
+			if ((s.screen_id != 0 ? s.screen_id : (uint64_t)i + 1u) == at && !s.is_primary) {
+				mode = CONV_LATE_EYES_RECORDED;
+			}
+		}
+	}
+	conv_eyes fe;
+	conv_eyes_from_xrt(&l->late_eyes, &fe);
+	if (!conv_core_stream_late_prepare_ex(core, core_id, r.ring_slot, mode, &fe, now, &ls.cache, &lf)) {
+		warn("prepare");
+		return false;
+	}
+	const uint32_t n = lf.req.view_count > 0 ? lf.req.view_count : 1;
+	const uint32_t tw = lf.view_w * n, th = lf.view_h;
+	bool rerun = lf.rerun;
+	if (ls.tex == nullptr || ls.w != tw || ls.h != th) {
+		rel(ls.srv);
+		rel(ls.tex);
+		ls.written = false;
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = tw;
+		td.Height = th;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+		if (FAILED(l->svc_device->CreateTexture2D(&td, nullptr, &ls.tex)) ||
+		    FAILED(l->svc_device->CreateShaderResourceView(ls.tex, nullptr, &ls.srv))) {
+			rel(ls.srv);
+			rel(ls.tex);
+			ls.cache.valid = false;
+			warn("target");
+			return false;
+		}
+		ls.w = tw;
+		ls.h = th;
+		rerun = true;
+	}
+	if (rerun) {
+		glue_img cg, dg;
+		if (!glue_find(l, lf.color.import_key, &cg) || !glue_find(l, lf.depth.import_key, &dg) ||
+		    cg.srv == nullptr || dg.srv == nullptr) {
+			ls.cache.valid = false;
+			warn("source not a GPU image");
+			return false;
+		}
+		if (l->late_vs == nullptr && !l->late_vs_tried) {
+			l->late_vs_tried = true;
+			l->late_vs = d3d11_conv_viewsyn_create(l->svc_device);
+			if (FAILED(l->svc_device->CreateDeferredContext(0, &l->late_deferred))) {
+				l->late_deferred = nullptr;
+			}
+		}
+		if (l->late_vs == nullptr || l->late_deferred == nullptr) {
+			ls.cache.valid = false;
+			warn("no view synthesis stage");
+			return false;
+		}
+		u_conv_viewsyn_params p;
+		conv_viewsyn_request_to_params(&lf.req, &p);
+		d3d11_conv_viewsyn_inputs in = {};
+		in.color = cg.srv;
+		in.color_width = cg.w;
+		in.color_height = cg.h;
+		in.depth = dg.srv;
+		in.depth_width = dg.w;
+		in.depth_height = dg.h;
+		in.new_content = lf.req.new_content;
+		d3d11_conv_viewsyn_target tg = {};
+		tg.texture = ls.tex;
+		tg.rtv_format = DXGI_FORMAT_UNKNOWN;
+		tg.layout = XRT_CONV_VIEWS_ROW;
+		bool ok = false;
+		const bool held_c = img_acquire(cg.km, &lf.color, 4);
+		const bool held_d = held_c && img_acquire(dg.km, &lf.depth, 4);
+		if (held_d) {
+			ID3D11CommandList *list = nullptr;
+			ok = d3d11_conv_viewsyn_record(l->late_vs, l->late_deferred, &in, &p, &tg, &list);
+			if (ok) {
+				l->svc_context->ExecuteCommandList(list, TRUE);
+			}
+			rel(list);
+		}
+		if (held_d) {
+			img_release(dg.km, &lf.depth);
+		}
+		if (held_c) {
+			img_release(cg.km, &lf.color);
+		}
+		if (!ok) {
+			ls.cache.valid = false;
+			warn("render");
+			return false;
+		}
+		ls.written = true;
+	}
+	if (!ls.written) {
+		return false;
+	}
+	out->km = nullptr; // runtime-private: no keyed mutex to hold
+	out->srv = ls.srv;
+	out->width = tw;
+	out->height = th;
+	// The viewpoints the views now stand for (the depth cursor reads them).
+	out->vp_count = n <= XRT_LIFT_MAX_VIEWS ? n : XRT_LIFT_MAX_VIEWS;
+	for (uint32_t i = 0; i < out->vp_count; i++) {
+		out->vps[3 * i + 0] = lf.req.viewpoints_m[i][0];
+		out->vps[3 * i + 1] = lf.req.viewpoints_m[i][1];
+		out->vps[3 * i + 2] = lf.req.viewpoints_m[i][2];
+	}
+	return true;
+}
+
 bool
-core_pin_latest(d3d11_lift *l, uint64_t owner, uint64_t id, d3d11_lift_pin *out)
+core_pin_latest(d3d11_lift *l, uint64_t owner, uint64_t id, int32_t cx, int32_t cy, d3d11_lift_pin *out)
 {
 	conv_core *core = nullptr;
 	uint64_t core_id = 0;
@@ -2265,33 +2477,45 @@ core_pin_latest(d3d11_lift *l, uint64_t owner, uint64_t id, d3d11_lift_pin *out)
 		return false;
 	}
 	glue_img vg, dg;
-	const bool have_views = (r.written & XRT_CONV_OUT_VIEWS) != 0 && glue_find(l, r.views.import_key, &vg) &&
-	                        vg.srv != nullptr && vg.km != nullptr;
-	if (!have_views || !img_acquire(vg.km, &r.views, 4)) {
-		// No GPU views (a busy slot, or a CPU result the glue could not
-		// mirror, #2030): weave it flat.
-		conv_core_stream_release(core, core_id, r.ring_slot);
-		glue_leave(l);
-		return false;
+	if (r.late) {
+		// ADR-058: a composed result kept as its source.
+		if (!core_pin_late(l, core, core_id, r, cx, cy, out)) {
+			conv_core_stream_release(core, core_id, r.ring_slot);
+			glue_leave(l);
+			return false;
+		}
+	} else {
+		const bool have_views = (r.written & XRT_CONV_OUT_VIEWS) != 0 &&
+		                        glue_find(l, r.views.import_key, &vg) && vg.srv != nullptr && vg.km != nullptr;
+		if (!have_views || !img_acquire(vg.km, &r.views, 4)) {
+			// No GPU views (a busy slot, or a CPU result the glue could not
+			// mirror, #2030): weave it flat.
+			conv_core_stream_release(core, core_id, r.ring_slot);
+			glue_leave(l);
+			return false;
+		}
+		out->km = vg.km;
+		out->srv = vg.srv;
+		out->width = vg.w;
+		out->height = vg.h;
 	}
 	out->lift = l;
 	out->stream_id = id;
 	out->slot = -1;
-	out->km = vg.km;
-	out->srv = vg.srv;
-	out->width = vg.w;
-	out->height = vg.h;
 	out->view_count = r.views_info.view_count != 0 ? r.views_info.view_count : 1;
 	const bool whole = r.active[0] == 0.0f && r.active[1] == 0.0f && r.active[2] == 0.0f && r.active[3] == 0.0f;
 	out->active[0] = whole ? 0.0f : r.active[0];
 	out->active[1] = whole ? 0.0f : r.active[1];
 	out->active[2] = whole ? 1.0f : r.active[2];
 	out->active[3] = whole ? 1.0f : r.active[3];
-	out->vp_count = r.views_info.view_count <= XRT_LIFT_MAX_VIEWS ? r.views_info.view_count : XRT_LIFT_MAX_VIEWS;
-	for (uint32_t i = 0; i < out->vp_count; i++) {
-		out->vps[3 * i + 0] = r.views_info.eye_xyz[i][0];
-		out->vps[3 * i + 1] = r.views_info.eye_xyz[i][1];
-		out->vps[3 * i + 2] = r.views_info.eye_xyz[i][2];
+	if (!r.late) { // a late pin carries the viewpoints it was just placed for
+		out->vp_count =
+		    r.views_info.view_count <= XRT_LIFT_MAX_VIEWS ? r.views_info.view_count : XRT_LIFT_MAX_VIEWS;
+		for (uint32_t i = 0; i < out->vp_count; i++) {
+			out->vps[3 * i + 0] = r.views_info.eye_xyz[i][0];
+			out->vps[3 * i + 1] = r.views_info.eye_xyz[i][1];
+			out->vps[3 * i + 2] = r.views_info.eye_xyz[i][2];
+		}
 	}
 	memcpy(out->rect_center, r.rect_center, sizeof(out->rect_center));
 	memcpy(out->rect_size, r.rect_size, sizeof(out->rect_size));
@@ -2396,7 +2620,31 @@ d3d11_lift_pin_latest(struct d3d11_lift *l, uint64_t owner, uint64_t id, struct 
 	if (l == nullptr || (id & D3D11_LIFT_CORE_STREAM_TAG) == 0) {
 		return false;
 	}
-	return core_pin_latest(l, owner, id, out);
+	return core_pin_latest(l, owner, id, INT32_MIN, INT32_MIN, out);
+}
+
+void
+d3d11_lift_set_frame_place(struct d3d11_lift *l,
+                           const struct xrt_eye_positions *eyes,
+                           const struct xrt_segment_metrics *segs)
+{
+	if (l == nullptr) {
+		return;
+	}
+	l->late_have_eyes = eyes != nullptr && eyes->valid;
+	l->late_eyes = l->late_have_eyes ? *eyes : xrt_eye_positions{};
+	l->late_segs = segs != nullptr ? *segs : xrt_segment_metrics{};
+}
+
+bool
+d3d11_lift_pin_latest_at(
+    struct d3d11_lift *l, uint64_t owner, uint64_t id, int32_t cx, int32_t cy, struct d3d11_lift_pin *out)
+{
+	*out = d3d11_lift_pin{};
+	if (l == nullptr || (id & D3D11_LIFT_CORE_STREAM_TAG) == 0) {
+		return false;
+	}
+	return core_pin_latest(l, owner, id, cx, cy, out);
 }
 
 void
@@ -2408,7 +2656,9 @@ d3d11_lift_unpin(struct d3d11_lift_pin *pin)
 	if (pin->depth_held) {
 		pin->depth_km->ReleaseSync(0);
 	}
-	pin->km->ReleaseSync(0);
+	if (pin->km != nullptr) { // ADR-058 late views are runtime-private (no keyed mutex)
+		pin->km->ReleaseSync(0);
+	}
 	core_unpin(pin->lift, pin);
 	*pin = d3d11_lift_pin{};
 }

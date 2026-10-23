@@ -19,6 +19,13 @@
 #include "comp_multi_weave_macos_backend.h"
 #endif
 
+#include "os/os_time.h"
+#include "util/comp_segments.h"
+
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+#include "vk_native/comp_vk_native_segments.h"
+#endif
+
 #include <pthread.h>
 #include <string.h>
 
@@ -321,6 +328,109 @@ comp_multi_weave_lift_rect_frame(struct multi_compositor *mc,
 		out->height_m = (float)rect->extent.h / (float)win_h * wm.window_height_m;
 	}
 	out->valid = true;
+}
+
+
+/*
+ *
+ * ADR-058 Amendment 1: one runtime-side eye sample per weave; per-rect placement.
+ *
+ */
+
+//! One refresh ahead: when the woven pixels are seen on a present-owner weave.
+#define WEAVE_LIFT_EYES_LEAD_NS (16666667LL)
+
+bool
+comp_multi_weave_lift_sample_frame_eyes(struct multi_compositor *mc, struct xrt_eye_positions *out)
+{
+	struct comp_multi_weave_lift *l = &mc->weave.lift;
+	memset(out, 0, sizeof(*out));
+	l->have_frame_eyes = false;
+	const int64_t target = (int64_t)os_monotonic_get_ns() + WEAVE_LIFT_EYES_LEAD_NS;
+	if (!multi_compositor_get_eye_positions_at(mc, target, out) || !out->valid) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	l->frame_eyes = *out;
+	l->have_frame_eyes = true;
+	return true;
+}
+
+void
+comp_multi_weave_lift_clear_frame_eyes(struct comp_multi_weave_lift *l)
+{
+	l->have_frame_eyes = false;
+}
+
+//! The rect's straddle dwell (one per lifted stream; the oldest slot is reused).
+static struct u_lift_reproject_screen_dwell *
+straddle_dwell(struct comp_multi_weave_lift *l, uint64_t stream)
+{
+	uint32_t free_i = XRT_LIFT_WEAVE_RECTS_MAX;
+	for (uint32_t i = 0; i < XRT_LIFT_WEAVE_RECTS_MAX; i++) {
+		if (l->straddle[i].stream == stream) {
+			return &l->straddle[i].dwell;
+		}
+		if (l->straddle[i].stream == 0 && free_i == XRT_LIFT_WEAVE_RECTS_MAX) {
+			free_i = i;
+		}
+	}
+	const uint32_t i = free_i < XRT_LIFT_WEAVE_RECTS_MAX ? free_i : (uint32_t)(stream % XRT_LIFT_WEAVE_RECTS_MAX);
+	l->straddle[i].stream = stream;
+	u_lift_reproject_screen_dwell_init(&l->straddle[i].dwell, 0);
+	return &l->straddle[i].dwell;
+}
+
+void
+comp_multi_weave_lift_rect_place(struct multi_compositor *mc,
+                                 const struct xrt_rect *rect,
+                                 uint32_t win_w,
+                                 uint32_t win_h,
+                                 struct vk_conv_weave_rect *r)
+{
+	struct comp_multi_weave_lift *l = &mc->weave.lift;
+	if (!l->have_frame_eyes) {
+		r->eyes_mode = 0; // the stream's snapshot, as before
+		return;
+	}
+	r->eyes_mode = 1; // the weave's one runtime-side sample
+	r->frame_eyes = l->frame_eyes;
+	(void)win_w;
+	(void)win_h;
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+	// The sample is the primary screen's; a rect centred on another screen
+	// (dwelled) keeps its conversion placement: its frame is the primary's.
+	struct comp_vk_native_segments *segs = (struct comp_vk_native_segments *)mc->weave.segs;
+	const struct comp_segment_table *t = segs != NULL ? comp_vk_native_segments_get_table(segs) : NULL;
+	if (t == NULL || t->count < 2 || rect == NULL || r->binding == NULL) {
+		return;
+	}
+	const int32_t cx = rect->offset.w + rect->extent.w / 2, cy = rect->offset.h + rect->extent.h / 2;
+	uint64_t under = 0;
+	bool primary = true;
+	for (uint32_t i = 0; i < t->count; i++) {
+		const struct comp_segment *s = &t->seg[i];
+		if (cx >= s->window_rect.x && cx < s->window_rect.x + (int32_t)s->window_rect.w &&
+		    cy >= s->window_rect.y && cy < s->window_rect.y + (int32_t)s->window_rect.h) {
+			under = s->screen_id != 0 ? s->screen_id : (uint64_t)i + 1u;
+			break;
+		}
+	}
+	struct u_lift_reproject_screen_dwell *d = straddle_dwell(l, r->binding->stream_id);
+	const uint64_t at = u_lift_reproject_screen_dwell_update(d, under, os_monotonic_get_ns());
+	for (uint32_t i = 0; i < t->count; i++) {
+		const uint64_t id = t->seg[i].screen_id != 0 ? t->seg[i].screen_id : (uint64_t)i + 1u;
+		if (id == at) {
+			primary = t->seg[i].is_primary;
+			break;
+		}
+	}
+	if (at != 0 && !primary) {
+		r->eyes_mode = 2; // keep the conversion's placement this frame
+	}
+#else
+	(void)rect;
+#endif
 }
 
 #endif // XRT_OS_MACOS || XRT_OS_LINUX_DESKTOP

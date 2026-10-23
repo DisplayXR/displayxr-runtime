@@ -104,6 +104,12 @@ struct conv_core_config
 	bool recenter_off;        //!< DXR_LIFT_RECENTER=0
 	uint64_t eyes_max_age_ns; //!< older snapshots count as stale; 0 = no limit
 
+	/* ADR-058 late view synthesis (composed streams on the runtime-woven
+	 * paths; resolved by the caller from the environment). */
+	bool late_viewsyn_off;          //!< DXR_LIFT_LATE_VIEWSYN=0: S5 stays on the conversion thread
+	uint32_t late_viewsyn_max_edge; //!< DXR_LIFT_LATE_VIEWSYN_MAX_EDGE: per-view long edge; 0 = 960
+	float reproject_max_m;          //!< DXR_LIFT_REPROJECT_MAX_M; <= 0 = U_LIFT_REPROJECT_MAX_M_DEFAULT
+
 	/* Control thread. */
 	uint32_t tick_ms; //!< 0 = 100
 	//! Stall watchdog for stream calls: max(this, 20 × est_latency); 0 = 10 s.
@@ -128,6 +134,9 @@ struct conv_core_gpu
 	//! The display's nominal viewing distance (S3's straight-on viewer), known
 	//! with the display; ≤ 0 = keep conv_core_config::nominal_z_m.
 	float nominal_z_m;
+	//! CONV_ADAPTER_* of the device the presenter synthesizes on (ADR-058
+	//! Amendment 1 item 5: the late output's default size).
+	uint32_t adapter_class;
 };
 
 /*! Install (or, with NULL, remove) the GPU-side stages. Replaces the
@@ -466,6 +475,116 @@ conv_core_eyes_retire(struct conv_core *core, uint64_t dp_key);
  */
 xrt_result_t
 conv_core_stream_bind_eyes(struct conv_core *core, uint64_t stream_id, uint64_t dp_key);
+
+/*
+ *
+ * ADR-058 late view synthesis (phase 1: composed streams, runtime-woven paths).
+ *
+ */
+
+//! Default per-view long edge of a late synthesis, pixels (discrete / Apple GPUs).
+#define CONV_LATE_MAX_EDGE_DEFAULT 960u
+//! ... on integrated GPUs (ADR-058 Amendment 1 item 5: Intel ANV measured
+//! 2.30 / 4.41 ms for 2 / 4 views at 960, ~1 ms at 512).
+#define CONV_LATE_MAX_EDGE_INTEGRATED 512u
+
+/*! @name The presenter's adapter class (conv_core_gpu::adapter_class) @{ */
+#define CONV_ADAPTER_UNKNOWN 0u
+#define CONV_ADAPTER_DISCRETE 1u
+#define CONV_ADAPTER_INTEGRATED 2u
+#define CONV_ADAPTER_APPLE 3u //!< Apple silicon: unified memory, measured like a discrete part
+/*! @} */
+
+/*!
+ * The per-view long edge of a late synthesis: @p env_edge
+ * (DXR_LIFT_LATE_VIEWSYN_MAX_EDGE, 0 = unset) always wins; else 512 on an
+ * integrated GPU, 960 otherwise (discrete, Apple, unknown).
+ */
+uint32_t
+conv_late_max_edge(uint32_t env_edge, uint32_t adapter_class);
+
+/*! @name How a late synthesis gets its eyes (conv_core_stream_late_prepare_ex) @{ */
+//! The stream's bound eyes snapshot at now (diagnostics and tests).
+#define CONV_LATE_EYES_SNAPSHOT 0u
+//! One RUNTIME-side target-time sample from the DP per weave, used by the late
+//! synthesis, the reply eyes and the core's eye publish (ADR-058 Amendment 1
+//! item 3); never a second runtime sample. The vendor weaver's internal pose
+//! is never exposed and stays the DP's (ADR-033).
+#define CONV_LATE_EYES_SAMPLE 1u
+//! The viewpoints the result was converted for (no re-placement this frame):
+//! a straddling rect whose centre screen's eyes are not in the rect's frame.
+#define CONV_LATE_EYES_RECORDED 2u
+/*! @} */
+
+/*! The presenter's cache of its last late synthesis of one stream (one per
+ *  stream per consumer, zero-initialised; the consumer owns the views). */
+struct conv_late_cache
+{
+	bool valid;
+	uint64_t generation;
+	uint32_t view_count;
+	float viewpoints_m[XRT_CONV_MAX_VIEWS][3];
+	float ease;
+};
+
+/*! One display frame's late synthesis of a pinned result. Points into
+ *  itself: use in place, never copy. */
+struct conv_late_frame
+{
+	//! Re-synthesize into the consumer's views now; false = its cached views
+	//! (same content, an eye pair that moved less than the re-run rule) stand.
+	bool rerun;
+	struct xrt_conv_image color, depth; //!< the ring slot's source (valid while the result is pinned)
+	struct xrt_conv_depth_info depth_info;
+	struct conv_viewsyn_request req; //!< color / depth / depth_info point above; target NULL (the consumer's)
+	uint32_t view_w, view_h;         //!< per-view extent, long edge capped (late_viewsyn_max_edge)
+	uint64_t generation;             //!< content generation (a new result = a new value)
+	uint32_t verdict;                //!< enum u_lift_reproject_verdict
+	float ease;
+	float delta_m;    //!< largest viewpoint move since conversion
+	uint64_t eyes_ns; //!< sample time of the eyes it is placed for (0 = the nominal viewer)
+};
+
+/*!
+ * The late synthesis of the result pinned in @p ring_slot (conv_result::late)
+ * at the eyes of this display frame: @p eyes when the caller has the frame's
+ * own (its DP's target-time query), else the stream's bound eyes snapshot at
+ * @p now_ns. The eyes go through the stream's S3 viewpoint policy (on a copy
+ * of its state) and u_lift_reproject's correction limit; @p cache decides
+ * whether the consumer re-synthesizes (and is updated when it should).
+ *
+ * @return false when the pinned result is not a late source (use its views).
+ */
+bool
+conv_core_stream_late_prepare(struct conv_core *core,
+                              uint64_t stream_id,
+                              uint32_t ring_slot,
+                              const struct conv_eyes *eyes,
+                              uint64_t now_ns,
+                              struct conv_late_cache *cache,
+                              struct conv_late_frame *out);
+
+/*!
+ * conv_core_stream_late_prepare with an explicit eyes source
+ * (CONV_LATE_EYES_*): SAMPLE needs @p eyes (the weave's one runtime-side
+ * target-time sample from the DP), SNAPSHOT ignores it, RECORDED keeps the
+ * conversion's viewpoints (out->verdict HOLD).
+ */
+bool
+conv_core_stream_late_prepare_ex(struct conv_core *core,
+                                 uint64_t stream_id,
+                                 uint32_t ring_slot,
+                                 uint32_t eyes_mode,
+                                 const struct conv_eyes *eyes,
+                                 uint64_t now_ns,
+                                 struct conv_late_cache *cache,
+                                 struct conv_late_frame *out);
+
+struct xrt_eye_positions;
+
+//! A DP's eye answer as the core's eyes (count clamped; the sample's own timestamp).
+void
+conv_eyes_from_xrt(const struct xrt_eye_positions *in, struct conv_eyes *out);
 
 /*!
  * Read the eyes a stream bound to @p dp_key would use at @p now_ns. False

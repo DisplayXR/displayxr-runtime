@@ -822,6 +822,15 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		    .lift_owner = lift_owner,
 		    .lift_rects = lift_rects,
 		};
+		// ADR-058 Amendment 1: one runtime-side eye sample from the DP for this
+		// weave, taken before any lifted rect is placed; the late synthesis,
+		// the reply below and the core's publish use it (the vendor weaver's
+		// internal pose stays the DP's).
+		struct xrt_eye_positions lift_eyes;
+		const bool have_lift_eyes = lift_count > 0 && comp_multi_weave_lift_sample_frame_eyes(mc, &lift_eyes);
+		if (!have_lift_eyes) {
+			comp_multi_weave_lift_clear_frame_eyes(&mc->weave.lift);
+		}
 		if (!be->record_and_wait(mc, &params)) {
 			break;
 		}
@@ -835,7 +844,12 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// Eyes flow OUT (runtime -> caller) for the caller's next off-axis
 		// frame; the weave itself reads the tracker DP-internally.
 		U_ZERO(out_eyes);
-		if (!be->get_eyes(mc, out_eyes)) {
+		if (have_lift_eyes) {
+			*out_eyes = lift_eyes; // the sample the lifted rects were placed with
+			const void *dp_key =
+			    mc->weave.dp != NULL ? (const void *)mc->weave.dp : (const void *)mc->weave.dp_metal;
+			comp_multi_conv_eyes_publish((uint64_t)(uintptr_t)dp_key, out_eyes);
+		} else if (!be->get_eyes(mc, out_eyes)) {
 			U_ZERO(out_eyes);
 		} else {
 			// The conversion core's per-DP eyes (roadmap §5.2): a lifted rect's

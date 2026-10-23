@@ -299,6 +299,102 @@ u_lift_reproject_render(const struct u_lift_reproject_policy *pol,
 
 /*
  *
+ * Re-run rule.
+ *
+ */
+
+bool
+u_lift_reproject_needs_rerun(
+    const float (*prev)[3], const float (*cur)[3], uint32_t view_count, float prev_ease, float cur_ease)
+{
+	if (prev == NULL || cur == NULL || view_count == 0 || view_count > U_LIFT_REPROJECT_MAX_VIEWS ||
+	    !isfinite(prev_ease) || !isfinite(cur_ease)) {
+		return true;
+	}
+	if (fabs((double)cur_ease - (double)prev_ease) > (double)U_LIFT_REPROJECT_RERUN_EASE) {
+		return true;
+	}
+	double pc[3] = {0, 0, 0}, cc[3] = {0, 0, 0};
+	for (uint32_t i = 0; i < view_count; i++) {
+		for (uint32_t k = 0; k < 3; k++) {
+			if (!isfinite(prev[i][k]) || !isfinite(cur[i][k])) {
+				return true;
+			}
+			pc[k] += prev[i][k];
+			cc[k] += cur[i][k];
+		}
+	}
+	for (uint32_t k = 0; k < 3; k++) {
+		pc[k] /= (double)view_count;
+		cc[k] /= (double)view_count;
+	}
+	if (fabs(cc[2] - pc[2]) > (double)U_LIFT_REPROJECT_RERUN_DISTANCE_M) {
+		return true;
+	}
+	const double thr = (double)U_LIFT_REPROJECT_RERUN_SPREAD_M;
+	double tilt = 0.0; // the largest view depth offset from the midpoint, over its distance
+	for (uint32_t i = 0; i < view_count; i++) {
+		double s = 0.0;
+		for (uint32_t k = 0; k < 3; k++) {
+			const double d = ((double)cur[i][k] - cc[k]) - ((double)prev[i][k] - pc[k]);
+			s += d * d;
+		}
+		if (s > thr * thr) {
+			return true;
+		}
+		if (cc[2] > 0.0) {
+			const double t = fabs((double)cur[i][2] - cc[2]) / cc[2];
+			tilt = t > tilt ? t : tilt;
+		}
+	}
+	// A common (x, y) move is exact only for a pair parallel to the glass: a
+	// turned head (views at different depths) shifts each view by about
+	// move * (dz / z) * q, q <= 1. Bound it by the same threshold.
+	const double lx = cc[0] - pc[0], ly = cc[1] - pc[1];
+	return sqrt(lx * lx + ly * ly) * tilt > thr;
+}
+
+
+/*
+ *
+ * Straddling rects.
+ *
+ */
+
+void
+u_lift_reproject_screen_dwell_init(struct u_lift_reproject_screen_dwell *d, uint64_t hold_ns)
+{
+	memset(d, 0, sizeof(*d));
+	d->hold_ns = hold_ns != 0 ? hold_ns : U_LIFT_REPROJECT_SCREEN_HOLD_NS;
+}
+
+uint64_t
+u_lift_reproject_screen_dwell_update(struct u_lift_reproject_screen_dwell *d, uint64_t under_centre, uint64_t now_ns)
+{
+	if (d->hold_ns == 0) {
+		d->hold_ns = U_LIFT_REPROJECT_SCREEN_HOLD_NS;
+	}
+	if (under_centre == 0) {
+		return d->current;
+	}
+	if (d->current == 0 || under_centre == d->current) {
+		d->current = under_centre; // first seen, or back home: no dwell
+		d->candidate = 0;
+		return d->current;
+	}
+	if (under_centre != d->candidate) {
+		d->candidate = under_centre;
+		d->since_ns = now_ns;
+	} else if (now_ns - d->since_ns >= d->hold_ns) {
+		d->current = under_centre;
+		d->candidate = 0;
+	}
+	return d->current;
+}
+
+
+/*
+ *
  * Ages.
  *
  */

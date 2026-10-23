@@ -45,6 +45,12 @@ static const struct knob g_knobs[] = {
      "FAKE_TRACKING_SWAY_MM"},
     {{"TRACKING_SWAY_PERIOD_MS", XRT_COMPONENT_SETTING_TYPE_INT, "4000", "fake tracking: sway period (>= 100)"},
      "FAKE_TRACKING_SWAY_PERIOD_MS"},
+    // ADR-058: a head turn on the sway period, so the late view synthesis'
+    // re-run rule has an eye-pair rotation to react to; 0 = facing the glass.
+    {{"TRACKING_TURN_DEG", XRT_COMPONENT_SETTING_TYPE_FLOAT, "0",
+      "fake tracking: turn the head (yaw) by this amplitude (degrees, <= 60) on the sway period; 0 = facing "
+      "the glass"},
+     "FAKE_TRACKING_TURN_DEG"},
     // Panel geometry + output.
     {{"OUTPUT", XRT_COMPONENT_SETTING_TYPE_ENUM, "blend",
       "initial output mode: 2d|passthrough, anaglyph, sbs, squeezed|squeezed_sbs, quad, interlaced, blend"},

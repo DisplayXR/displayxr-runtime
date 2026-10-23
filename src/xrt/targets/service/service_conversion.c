@@ -33,6 +33,7 @@
 #include "os/os_threading.h"
 #include "util/u_camera_consent.h"
 #include "util/u_file_logging.h"
+#include "util/u_lift_reproject.h"
 #include "util/u_logging.h"
 
 #include <ctype.h>
@@ -217,6 +218,35 @@ tramp_upload(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_i
 	struct conv_image_alloc_ops gpu;
 	if (gpu_enter(&gpu)) {
 		ok = gpu.upload != NULL && gpu.upload(gpu.ud, src, dst);
+		gpu_leave();
+	}
+	return ok;
+}
+
+//! ADR-058: a ring slot's late source, copied from the converted input.
+static bool
+tramp_copy(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_image *dst)
+{
+	(void)ud;
+	if (src->memory_kind == XRT_CONV_MEM_CPU && dst->memory_kind == XRT_CONV_MEM_CPU) {
+		// Both CPU (no GPU glue took either): a plain copy of the rows.
+		const uint32_t bpp = bpp_of(src->format);
+		const uint32_t sp = src->row_stride != 0 ? src->row_stride : src->width * bpp;
+		const uint32_t dp = dst->row_stride != 0 ? dst->row_stride : dst->width * bpp;
+		if (src->cpu_ptr == NULL || dst->cpu_ptr == NULL || src->width != dst->width ||
+		    src->height != dst->height || src->format != dst->format) {
+			return false;
+		}
+		for (uint32_t y = 0; y < src->height; y++) {
+			memcpy((uint8_t *)dst->cpu_ptr + (size_t)y * dp, (const uint8_t *)src->cpu_ptr + (size_t)y * sp,
+			       (size_t)src->width * bpp);
+		}
+		return true;
+	}
+	bool ok = false;
+	struct conv_image_alloc_ops gpu;
+	if (gpu_enter(&gpu)) {
+		ok = gpu.copy != NULL && gpu.copy(gpu.ud, src, dst);
 		gpu_leave();
 	}
 	return ok;
@@ -1161,6 +1191,7 @@ service_conversion_start(void)
 	cfg.alloc.alloc = tramp_alloc;
 	cfg.alloc.free = tramp_free;
 	cfg.alloc.upload = tramp_upload;
+	cfg.alloc.copy = tramp_copy;
 	// cfg.viewsyn / cfg.readback: installed once the D3D11 device exists
 	// (on_gpu, conv_core_set_gpu). The S7 observer needs no device.
 	cfg.create_convergence_observer = conv_observer_autoconv_factory;
@@ -1171,6 +1202,30 @@ service_conversion_start(void)
 		const char *rc = getenv("DXR_LIFT_RECENTER");
 		cfg.recenter_off =
 		    rc != NULL && (strcmp(rc, "0") == 0 || strcmp(rc, "off") == 0 || strcmp(rc, "OFF") == 0);
+	}
+	{
+		// ADR-058 late view synthesis: ON for composed streams on the woven
+		// paths; DXR_LIFT_LATE_VIEWSYN=0 / off keeps S5 on the conversion thread.
+		const char *lv = getenv("DXR_LIFT_LATE_VIEWSYN");
+		cfg.late_viewsyn_off =
+		    lv != NULL && (strcmp(lv, "0") == 0 || strcmp(lv, "off") == 0 || strcmp(lv, "OFF") == 0);
+		const char *me = getenv("DXR_LIFT_LATE_VIEWSYN_MAX_EDGE");
+		const long edge = me != NULL ? strtol(me, NULL, 10) : 0;
+		cfg.late_viewsyn_max_edge = edge >= 64 && edge <= 4096 ? (uint32_t)edge : 0u;
+		const char *mm = getenv("DXR_LIFT_REPROJECT_MAX_M");
+		cfg.reproject_max_m = mm != NULL ? strtof(mm, NULL) : 0.0f;
+		if (cfg.late_viewsyn_off) {
+			U_LOG_W(
+			    "[conv] late view synthesis OFF (DXR_LIFT_LATE_VIEWSYN=%s): composed views are "
+			    "synthesized at conversion time (ADR-058 opt-out)",
+			    lv);
+		} else {
+			U_LOG_W(
+			    "[conv] late view synthesis ON (ADR-058): composed weave-rect views at each frame's "
+			    "eyes, per-view long edge %s, correction limit %.3f m",
+			    cfg.late_viewsyn_max_edge != 0 ? me : "by adapter (960 discrete / Apple, 512 integrated)",
+			    cfg.reproject_max_m > 0.0f ? cfg.reproject_max_m : U_LIFT_REPROJECT_MAX_M_DEFAULT);
+		}
 	}
 	cfg.on_event = on_event;
 	for (uint32_t t = 0; t < XRT_CONV_TASK_RESERVED_FIRST && t < TARGET_CONV_POLICY_TASKS; t++) {

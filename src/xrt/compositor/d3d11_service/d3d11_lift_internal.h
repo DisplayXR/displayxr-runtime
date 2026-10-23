@@ -20,6 +20,7 @@
 #include "conversion/conv_core.h"
 
 #include "util/u_lift_mailbox.h"
+#include "util/u_lift_reproject.h"
 #include "util/u_lift_rig.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"
@@ -172,6 +173,19 @@ struct lift_core_stream
 };
 
 //! A glue-allocated image on the SERVICE device.
+//! ADR-058: one stream's late views on the weave path (render thread only).
+struct d3d11_late_state
+{
+	struct conv_late_cache cache = {};
+	ID3D11Texture2D *tex = nullptr; //!< N views side by side, R8G8B8A8_UNORM
+	ID3D11ShaderResourceView *srv = nullptr;
+	uint32_t w = 0, h = 0;
+	bool written = false;
+	bool warned = false;
+	uint64_t used_ns = 0;
+	struct u_lift_reproject_screen_dwell straddle = {}; //!< the rect-centre screen (Amendment 1 item 2)
+};
+
 struct glue_img
 {
 	ID3D11Texture2D *tex = nullptr;
@@ -330,6 +344,16 @@ struct d3d11_lift
 	//! the replay touches the shared immediate context. nullptr = the device
 	//! refused one: S5 draws on the immediate context, as before.
 	ID3D11DeviceContext *viewsyn_deferred = nullptr;
+	//! ADR-058 late view synthesis on the weave path (render thread only,
+	//! under the service's immediate-context mutex the weave holds): its own
+	//! stage + deferred context, so the dispatcher's S5 is never shared.
+	d3d11_conv_viewsyn *late_vs = nullptr;
+	bool late_vs_tried = false;
+	ID3D11DeviceContext *late_deferred = nullptr;
+	std::map<uint64_t, struct d3d11_late_state> late_states; //!< core stream id ->
+	bool late_have_eyes = false; //!< this weave's one runtime-side sample (d3d11_lift_set_frame_place)
+	struct xrt_eye_positions late_eyes = {};
+	struct xrt_segment_metrics late_segs = {}; //!< this weave's segment table (count < 2 = one screen)
 	//! #2030: the still-image content check (its own device; created on the
 	//! first PHOTO submit, under glue_mtx).
 	struct d3d11_conv_content_check *content_check = nullptr;
@@ -459,7 +483,7 @@ core_weave_submit_locked(d3d11_lift *l,
                          const xrt_lift_rect_frame *frame,
                          uint64_t *out_frame_id);
 bool
-core_pin_latest(d3d11_lift *l, uint64_t owner, uint64_t id, d3d11_lift_pin *out);
+core_pin_latest(d3d11_lift *l, uint64_t owner, uint64_t id, int32_t cx, int32_t cy, d3d11_lift_pin *out);
 void
 core_unpin(d3d11_lift *l, d3d11_lift_pin *pin);
 

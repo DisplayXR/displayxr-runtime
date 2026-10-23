@@ -997,7 +997,9 @@ pick_kind(struct vk_conv_gpu *g,
           uint32_t *out_kind,
           bool *out_private_ok)
 {
-	const bool runtime_only = (req->usage & (CONV_IMAGE_USAGE_RENDER_TARGET | CONV_IMAGE_USAGE_MIRROR)) != 0;
+	const bool runtime_only =
+	    (req->usage & (CONV_IMAGE_USAGE_RENDER_TARGET | CONV_IMAGE_USAGE_MIRROR | CONV_IMAGE_USAGE_LATE_SOURCE)) !=
+	    0;
 	uint32_t allowed;
 	if (runtime_only) {
 		allowed = g->caps.memory_kinds & ~XRT_CONV_MEM_CPU;
@@ -1135,6 +1137,60 @@ glue_upload(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_im
 	return fits && vk_conv_gpu_write(g, dst, src->cpu_ptr, pitch);
 }
 
+static bool
+waits_add(struct vk_conv_gpu *g, struct vkc_waits *w, const struct xrt_conv_image *x);
+
+/*!
+ * ADR-058: the converted input into a ring slot's late source, complete on
+ * return (the conversion dispatcher; a host wait, once per conversion). A CPU
+ * input is uploaded; a glue input is copied on the GPU after its sync.
+ */
+static bool
+glue_copy(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_image *dst)
+{
+	struct vk_conv_gpu *g = (struct vk_conv_gpu *)ud;
+	if (src == NULL || dst == NULL || !is_glue_image(dst)) {
+		return false;
+	}
+	if (is_cpu_image(src)) {
+		return glue_upload(ud, src, dst);
+	}
+	if (!is_glue_image(src) || !gate_enter(g)) {
+		return false;
+	}
+	struct vk_bundle *vk = g->vk;
+	work_lock(g);
+	struct vkc_img *a = img_find(g, src->import_key);
+	struct vkc_img *b = img_find(g, dst->import_key);
+	bool ok = a != NULL && b != NULL && a->w == b->w && a->h == b->h && a->conv_fmt == b->conv_fmt;
+	struct vkc_waits waits;
+	memset(&waits, 0, sizeof(waits));
+	ok = ok && waits_add(g, &waits, src);
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	if (ok && cmd_begin(g, &cmd)) {
+		cmd_global_barrier(vk, cmd);
+		img_acquire_foreign(g, cmd, a);
+		img_acquire_foreign(g, cmd, b);
+		VkImageCopy region = {
+		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .extent = {a->w, a->h, 1},
+		};
+		vk->vkCmdCopyImage(cmd, a->image, VK_IMAGE_LAYOUT_GENERAL, b->image, VK_IMAGE_LAYOUT_GENERAL, 1,
+		                   &region);
+		cmd_global_barrier(vk, cmd);
+		img_release_foreign(g, cmd, b);
+		img_release_foreign(g, cmd, a);
+		ok = cmd_submit_wait(g, cmd, &waits);
+	} else {
+		waits_release(g, &waits);
+		ok = false;
+	}
+	os_mutex_unlock(&g->work_mtx);
+	gate_leave(g);
+	return ok;
+}
+
 void
 vk_conv_gpu_alloc_ops(struct vk_conv_gpu *g, struct conv_image_alloc_ops *out)
 {
@@ -1145,6 +1201,7 @@ vk_conv_gpu_alloc_ops(struct vk_conv_gpu *g, struct conv_image_alloc_ops *out)
 	out->alloc = glue_alloc;
 	out->free = glue_free;
 	out->upload = glue_upload;
+	out->copy = glue_copy;
 	out->ud = g;
 }
 
@@ -2932,6 +2989,7 @@ vk_conv_gpu_lookup(struct vk_conv_gpu *g, const struct xrt_conv_image *x, struct
 	struct vkc_img *img = img_find(g, x->import_key);
 	if (img != NULL) {
 		out->image = img->image;
+		out->view = img->view;
 		out->format = img->format;
 		out->width = img->w;
 		out->height = img->h;

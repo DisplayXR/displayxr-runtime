@@ -173,7 +173,8 @@ vk_conv_gpu_read(struct vk_conv_gpu *g, const struct xrt_conv_image *src, void *
 struct vk_conv_gpu_image_ref
 {
 	VkImage image;
-	VkFormat format; //!< the creation format (an _SRGB one is copied, not blitted, to stay encoded)
+	VkImageView view; //!< 2D, layer 0, the UNORM alias (what S5 samples); ADR-058's late stage
+	VkFormat format;  //!< the creation format (an _SRGB one is copied, not blitted, to stay encoded)
 	uint32_t width, height, layers;
 	bool foreign;
 	/*!
