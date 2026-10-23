@@ -807,6 +807,11 @@ struct d3d11_client_render_resources
 	//! Unused when the atlas already fills the mode exactly (zero-copy).
 	wil::com_ptr<ID3D11Texture2D>          weave_crop_tex;
 	wil::com_ptr<ID3D11ShaderResourceView> weave_crop_srv;
+	//! #2289: the client's executable basename, the tag of its per-client
+	//! capture trigger (`%TEMP%\displayxr_atlas_trigger.<tag>`); "" = the
+	//! global trigger only. Set per submit from the IPC handler, like the
+	//! POSIX weave engines' #2207 tag.
+	char                                   weave_capture_tag[64];
 	uint32_t                               weave_crop_w;
 	uint32_t                               weave_crop_h;
 
@@ -29747,6 +29752,25 @@ comp_d3d11_service_weave_set_overlay_unchanged(struct xrt_compositor *xc, bool o
 	c->render.weave_overlay_unchanged_next = overlay_unchanged;
 }
 
+extern "C" void
+comp_d3d11_service_weave_set_capture_tag(struct xrt_compositor *xc, const char *tag)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	// The trigger convention (u_capture_intent.h) names the process WITHOUT a
+	// trailing ".exe" ("displayxr_atlas_trigger.chrome"); the IPC-side basename
+	// keeps it ("chrome.exe"), so strip it here.
+	char tmp[sizeof(c->render.weave_capture_tag)];
+	snprintf(tmp, sizeof(tmp), "%s", tag != nullptr ? tag : "");
+	const size_t n = strlen(tmp);
+	if (n > 4 && _stricmp(tmp + n - 4, ".exe") == 0) {
+		tmp[n - 4] = '\0';
+	}
+	memcpy(c->render.weave_capture_tag, tmp, sizeof(tmp));
+}
+
 uint32_t
 comp_d3d11_service_weave_lift_cursor_mask(struct xrt_compositor *xc)
 {
@@ -30651,6 +30675,79 @@ weave_seg_snap_dp(struct d3d11_service_compositor *c, int32_t target_x, int32_t 
 	return comp_d3d11_segments_snap_dp(c->weave_segs, &at, os_monotonic_get_ns(), nullptr);
 }
 
+/*
+ * #2289: file-trigger capture for the present-owner (XR_DXR_weave) route — the
+ * Windows twin of the POSIX weave engines' #2207 trigger. The route never
+ * presents, so the two %TEMP%\workspace_screenshot sites (which sit just before
+ * a Present) never see it. Same names as u_capture_intent.h, read in the
+ * SERVICE's %TEMP%, per-client variants (the client's executable basename)
+ * checked before the global ones:
+ *
+ *   displayxr_atlas_trigger[.<exe>]             -> displayxr_atlas[.<exe>].input.png  (the caller's
+ *                                                  submitted buffer; best effort, read after the weave
+ *                                                  released its keyed-mutex hold)
+ *                                                  displayxr_atlas[.<exe>].png        (the DP input: the
+ *                                                  crop / batch atlas with the lifted rects written in)
+ *                                                  displayxr_atlas[.<exe>].woven.png  (the output handed
+ *                                                  back to the caller, overlay fallback included)
+ *   displayxr_atlas_trigger[.<exe>].projection  -> displayxr_atlas[.<exe>].projection.png (DP input only)
+ *
+ * Alpha is written as submitted (dxr_diag_dump_tex). Cost on the hot path: up
+ * to four GetFileAttributes per submit; the readbacks run only on a submit
+ * that consumed a trigger. One WARN per capture names the files.
+ */
+static bool
+svc_weave_capture_poll(const char *tag, bool *projection_only, char *stem, size_t stem_cap)
+{
+	const char *tmp = getenv("TEMP");
+	if (tmp == nullptr || tmp[0] == '\0') {
+		return false;
+	}
+	const bool have_tag = tag != nullptr && tag[0] != '\0';
+	struct cand
+	{
+		bool per_exe;
+		bool proj;
+	};
+	const cand order[] = {{true, true}, {true, false}, {false, true}, {false, false}};
+	for (const cand &k : order) {
+		if (k.per_exe && !have_tag) {
+			continue;
+		}
+		char path[MAX_PATH];
+		snprintf(path, sizeof(path), "%s\\displayxr_atlas_trigger%s%s%s", tmp, k.per_exe ? "." : "",
+		         k.per_exe ? tag : "", k.proj ? ".projection" : "");
+		if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+			continue;
+		}
+		DeleteFileA(path);
+		snprintf(stem, stem_cap, "displayxr_atlas%s%s", k.per_exe ? "." : "", k.per_exe ? tag : "");
+		*projection_only = k.proj;
+		return true;
+	}
+	return false;
+}
+
+//! #2289: dump the texture behind an SRV (the DP input of whichever weave path ran).
+static void
+svc_weave_capture_dump_srv(struct d3d11_service_system *sys, ID3D11ShaderResourceView *srv, const char *name)
+{
+	if (srv == nullptr) {
+		return;
+	}
+	ID3D11Resource *res = nullptr;
+	srv->GetResource(&res);
+	if (res == nullptr) {
+		return;
+	}
+	ID3D11Texture2D *tex = nullptr;
+	if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex)) && tex != nullptr) {
+		dxr_diag_dump_tex(sys, tex, name);
+		tex->Release();
+	}
+	res->Release();
+}
+
 bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                xrt_graphics_buffer_handle_t in_handle,
@@ -31054,6 +31151,14 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 	D3D11_TEXTURE2D_DESC idesc = {};
 	in_tex->GetDesc(&idesc);
+
+	// #2289: present-owner capture trigger, decided once per submit; the
+	// dumps run after the weave (see svc_weave_capture_poll).
+	char cap_stem[96] = {0};
+	bool cap_projection_only = false;
+	const bool cap_armed = svc_weave_capture_poll(c->render.weave_capture_tag, &cap_projection_only, cap_stem,
+	                                              sizeof(cap_stem));
+	ID3D11ShaderResourceView *cap_dp_srv = nullptr; // the DP input of the path that ran
 
 	// DIAGNOSTIC ONLY (browser#73). Armed by creating
 	// %TEMP%\dxr_weave_dump_trigger; consumed (deleted) by the first submit that
@@ -31479,6 +31584,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->RSSetViewports(1, &weave_vp);
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
+		cap_dp_srv = dp_srv;
 		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
 		if (seg_split) {
 			weave_seg_record(sys, c, dp, dp_srv, cvw, cvh, layout->tile_columns, layout->tile_rows, win_w,
@@ -31557,6 +31663,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->RSSetViewports(1, &weave_vp);
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
+		cap_dp_srv = in_srv;
 		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), in_srv,
 		                                          view_w, view_h, /*tile_columns*/ 2, /*tile_rows*/ 1,
@@ -31708,6 +31815,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->RSSetViewports(1, &weave_vp);
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
+		cap_dp_srv = c->render.weave_sbs_srv.get();
 		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
 		if (seg_split) {
 			weave_seg_record(sys, c, dp, c->render.weave_sbs_srv.get(), win_w, win_h, /*cols*/ 2,
@@ -31755,6 +31863,26 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	}
 	ov_hold.release();
 	gpu_frame.stamp(WEAVE_TS_POST_FALLBACK);
+
+	// #2289: the present-owner capture, after the weave and the overlay
+	// fallback so the woven file is what the caller is about to present.
+	if (cap_armed) {
+		char nm[160];
+		if (cap_projection_only) {
+			snprintf(nm, sizeof(nm), "%s.projection", cap_stem);
+			svc_weave_capture_dump_srv(sys, cap_dp_srv, nm);
+			U_LOG_W("#2289 weave capture (projection only): %%TEMP%%\\%s.png (client '%s')", nm,
+			        c->render.weave_capture_tag);
+		} else {
+			snprintf(nm, sizeof(nm), "%s.input", cap_stem);
+			dxr_diag_dump_tex(sys, in_tex, nm);
+			svc_weave_capture_dump_srv(sys, cap_dp_srv, cap_stem);
+			snprintf(nm, sizeof(nm), "%s.woven", cap_stem);
+			dxr_diag_dump_tex(sys, c->render.weave_output_texture.get(), nm);
+			U_LOG_W("#2289 weave capture: %%TEMP%%\\%s{.input,,.woven}.png (client '%s', %ux%u)", cap_stem,
+			        c->render.weave_capture_tag, win_w, win_h);
+		}
+	}
 	const uint8_t timing_route = ov_srv == nullptr ? WEAVE_OV_NONE : (ov_in_dp ? WEAVE_OV_DP : WEAVE_OV_FALLBACK);
 	// Route log: first overlay frame and every change only (never per frame).
 	if (ov_srv != nullptr &&
