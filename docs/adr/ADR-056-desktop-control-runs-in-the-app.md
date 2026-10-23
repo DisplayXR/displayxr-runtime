@@ -322,6 +322,18 @@ restore (0.3–9 s) plus the first PipeWire frame. If the shared monitor set cha
 token was issued (hotplug), the portal prompts instead of restoring silently. v1 already
 treats that as a revocation, so both scopes go `DENIED` and the app asks again.
 
+*Corrected 2026-10-23 (#2306):* xdg-desktop-portal-gnome restores the screens all or nothing.
+With a covered monitor missing, a RemoteDesktop restore comes back silently with input only,
+and only a ScreenCast restore prompts. The runtime waits up to 6 s for a covered real monitor
+(a blink), and if it is still missing, it does not restore (`TIMEOUT`) and keeps the grant for
+a later retry: a slow HDMI handshake, a monitor off the bus or a closed lid must not cost the
+user the capture grant. A covered screen-cast virtual monitor (a casting tool's extended
+display) never returns as the same monitor, so it is never waited for. Once it is gone, a grant
+that covers input is restored with its input only (CONTROL stays, CAPTURE goes `DENIED`, the
+grant is saved without the screens), a screens-only grant is revoked without showing the
+dialog, and a request for CAPTURE asks again. Before, such a grant stalled every action 6 s and
+failed it, forever (spec §10.5).
+
 Capture runs on its **own worker** per session, never behind the action worker. A 13 s
 `TYPE_TEXT` must not delay a still, and a still must not run between an action's target
 verification and its injection. It skips the idle wait: capture injects nothing, so it cannot
@@ -447,7 +459,8 @@ runtime made the product worse on exactly the OS where the dialog is the consent
    the dialog of that verifying restore, or an `ASK_AGAIN` (whose answer replaces the grant,
    spec §10.2 — the in-memory grant is dropped too, which also corrects the old behaviour of
    putting it back); a silent restore that is not silent or is refused (the portal no longer
-   honours it); the session closed by anything but a lock (the indicator's Stop); the kill
+   honours it); the session closed by anything but a lock (the indicator's Stop); a
+   screens-only grant whose covered screen-cast virtual monitor is gone (#2306); the kill
    switch, which removes every saved grant; `displayxr-cli desktop forget <exe>`, which removes
    the grants recorded for that executable. `desktop status` lists the saved grants (never the
    token).

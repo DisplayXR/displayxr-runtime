@@ -144,7 +144,7 @@ connector_ok(const char *c)
 static bool
 shape_ok(const struct u_desktop_gnome_grant *g)
 {
-	if (g->nmonitors > U_DESKTOP_GNOME_GRANT_MONITORS) {
+	if (g->nmonitors > U_DESKTOP_GNOME_GRANT_MONITORS || g->nvirtual > U_DESKTOP_GNOME_GRANT_MONITORS) {
 		return false;
 	}
 	return g->screencast ? (g->screens && !g->devices) : (g->devices || g->screens);
@@ -188,6 +188,20 @@ u_desktop_gnome_grant_encode(const char *key,
 	for (uint32_t i = 0; mons != NULL && g->screens && i < g->nmonitors; i++) {
 		if (connector_ok(g->monitors[i])) {
 			cJSON_AddItemToArray(mons, cJSON_CreateString(g->monitors[i]));
+		}
+	}
+	// The covered screen-cast virtual monitors, written with every screens grant (even
+	// empty: its presence tells this format from an older runtime's, which ignores it).
+	cJSON *vmons = g->screens ? cJSON_AddArrayToObject(o, "virtual_monitors") : NULL;
+	for (uint32_t i = 0; vmons != NULL && i < g->nvirtual; i++) {
+		if (!connector_ok(g->virtual_monitors[i]) || !connector_ok(g->virtual_serials[i])) {
+			continue;
+		}
+		cJSON *vm = cJSON_CreateObject();
+		if (vm != NULL) {
+			cJSON_AddStringToObject(vm, "connector", g->virtual_monitors[i]);
+			cJSON_AddStringToObject(vm, "serial", g->virtual_serials[i]);
+			cJSON_AddItemToArray(vmons, vm);
 		}
 	}
 	cJSON_AddStringToObject(o, "saved", now);
@@ -256,6 +270,7 @@ u_desktop_gnome_grant_decode(const char *json, const char *key, struct u_desktop
 	const cJSON *portal = cJSON_GetObjectItemCaseSensitive(o, "portal");
 	const cJSON *tok = cJSON_GetObjectItemCaseSensitive(o, "restore_token");
 	const cJSON *mons = cJSON_GetObjectItemCaseSensitive(o, "monitors");
+	const cJSON *vmons = cJSON_GetObjectItemCaseSensitive(o, "virtual_monitors");
 	if (!cJSON_IsNumber(ver) || ver->valuedouble < 1 || ver->valuedouble != (double)(int)ver->valuedouble) {
 		goto done;
 	}
@@ -293,8 +308,32 @@ u_desktop_gnome_grant_decode(const char *json, const char *key, struct u_desktop
 			snprintf(g.monitors[g.nmonitors++], sizeof(g.monitors[0]), "%s", m->valuestring);
 		}
 	}
+	if (vmons != NULL && !cJSON_IsArray(vmons)) {
+		goto done;
+	}
+	if (vmons != NULL) {
+		g.virtual_known = true;
+		int n = cJSON_GetArraySize(vmons);
+		if (n > U_DESKTOP_GNOME_GRANT_MONITORS) {
+			goto done;
+		}
+		for (int i = 0; i < n; i++) {
+			const cJSON *m = cJSON_GetArrayItem(vmons, i);
+			const cJSON *c = cJSON_GetObjectItemCaseSensitive(m, "connector");
+			const cJSON *s = cJSON_GetObjectItemCaseSensitive(m, "serial");
+			if (!cJSON_IsObject(m) || !cJSON_IsString(c) || !connector_ok(c->valuestring) ||
+			    !cJSON_IsString(s) || !connector_ok(s->valuestring)) {
+				goto done;
+			}
+			snprintf(g.virtual_monitors[g.nvirtual], sizeof(g.virtual_monitors[0]), "%s", c->valuestring);
+			snprintf(g.virtual_serials[g.nvirtual], sizeof(g.virtual_serials[0]), "%s", s->valuestring);
+			g.nvirtual++;
+		}
+	}
 	if (!g.screens) {
 		g.nmonitors = 0;
+		g.nvirtual = 0;
+		g.virtual_known = false;
 	}
 	if (!shape_ok(&g)) {
 		goto done;
@@ -309,6 +348,34 @@ done:
 	cJSON_Delete(o);
 	wipe(&g, sizeof(g));
 	return st;
+}
+
+void
+u_desktop_gnome_grant_covered(const struct u_desktop_gnome_grant *g, struct u_desktop_gnome_covered *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (g == NULL || !g->screens) {
+		return;
+	}
+	for (uint32_t i = 0; i < g->nmonitors && i < U_DESKTOP_GNOME_GRANT_MONITORS; i++) {
+		if (!g->virtual_known && u_desktop_gnome_legacy_virtual(g->monitors[i])) {
+			if (out->nv < U_DESKTOP_GNOME_COVERED_MAX) {
+				snprintf(out->vconn[out->nv], sizeof(out->vconn[0]), "%s", g->monitors[i]);
+				out->vserial[out->nv][0] = '\0'; // unknown: matched by connector
+				out->nv++;
+			}
+		} else if (out->n < U_DESKTOP_GNOME_COVERED_MAX) {
+			snprintf(out->conn[out->n], sizeof(out->conn[0]), "%s", g->monitors[i]);
+			out->n++;
+		}
+	}
+	for (uint32_t i = 0; i < g->nvirtual && i < U_DESKTOP_GNOME_GRANT_MONITORS; i++) {
+		if (out->nv < U_DESKTOP_GNOME_COVERED_MAX) {
+			snprintf(out->vconn[out->nv], sizeof(out->vconn[0]), "%s", g->virtual_monitors[i]);
+			snprintf(out->vserial[out->nv], sizeof(out->vserial[0]), "%s", g->virtual_serials[i]);
+			out->nv++;
+		}
+	}
 }
 
 //! Wipe and free a text that may hold a token.

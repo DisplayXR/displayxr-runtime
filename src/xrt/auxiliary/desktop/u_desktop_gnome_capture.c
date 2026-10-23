@@ -48,17 +48,11 @@
  *
  */
 
-struct dc_monitor
-{
-	char conn[32];
-	struct u_desktop_rect rect;
-};
-
 struct dc_state
 {
 	uint32_t serial;
 	uint32_t n;
-	struct dc_monitor m[8];
+	struct u_desktop_gnome_monitor m[8];
 };
 
 //! Everything about the layout a restore cares about: mutter's serial AND the
@@ -82,6 +76,8 @@ struct dc_mode
 {
 	char conn[32];
 	int32_t w, h;
+	bool cast_virtual; //!< mutter's screen-cast virtual monitor (u_desktop_gnome_is_cast_virtual)
+	char serial[32];
 };
 
 static bool
@@ -154,11 +150,14 @@ dc_read(DBusConnection *c, struct dc_state *out)
 	while (iter_is(&mons, DBUS_TYPE_STRUCT) && nmodes < 16) {
 		DBusMessageIter mon, spec;
 		dbus_message_iter_recurse(&mons, &mon);
-		const char *conn = NULL;
+		// (ssss): connector, vendor, product, serial.
+		const char *conn = NULL, *vendor = NULL, *product = NULL, *mserial = NULL;
 		if (iter_is(&mon, DBUS_TYPE_STRUCT)) {
 			dbus_message_iter_recurse(&mon, &spec);
-			if (iter_is(&spec, DBUS_TYPE_STRING)) {
-				dbus_message_iter_get_basic(&spec, &conn);
+			const char **fields[4] = {&conn, &vendor, &product, &mserial};
+			for (int f = 0; f < 4 && iter_is(&spec, DBUS_TYPE_STRING); f++) {
+				dbus_message_iter_get_basic(&spec, fields[f]);
+				dbus_message_iter_next(&spec);
 			}
 		}
 		if (conn != NULL && dbus_message_iter_next(&mon) && iter_is(&mon, DBUS_TYPE_ARRAY)) {
@@ -188,6 +187,9 @@ dc_read(DBusConnection *c, struct dc_state *out)
 					snprintf(modes[nmodes].conn, sizeof(modes[nmodes].conn), "%s", conn);
 					modes[nmodes].w = w;
 					modes[nmodes].h = h;
+					modes[nmodes].cast_virtual = u_desktop_gnome_is_cast_virtual(vendor, product);
+					snprintf(modes[nmodes].serial, sizeof(modes[nmodes].serial), "%s",
+					         mserial != NULL ? mserial : "");
 					nmodes++;
 					break;
 				}
@@ -249,10 +251,12 @@ dc_read(DBusConnection *c, struct dc_state *out)
 
 	for (uint32_t i = 0; i < nlog; i++) {
 		int32_t w = 0, h = 0;
+		const struct dc_mode *md = NULL;
 		for (uint32_t k = 0; k < nmodes; k++) {
 			if (strcmp(modes[k].conn, logical[i].conn) == 0) {
 				w = modes[k].w;
 				h = modes[k].h;
+				md = &modes[k];
 			}
 		}
 		if (w <= 0 || h <= 0) {
@@ -267,20 +271,16 @@ dc_read(DBusConnection *c, struct dc_state *out)
 			w = (int32_t)lround(w / logical[i].scale);
 			h = (int32_t)lround(h / logical[i].scale);
 		}
-		struct dc_monitor *m = &out->m[out->n++];
+		struct u_desktop_gnome_monitor *m = &out->m[out->n++];
 		snprintf(m->conn, sizeof(m->conn), "%s", logical[i].conn);
 		m->rect = (struct u_desktop_rect){logical[i].x, logical[i].y, w, h};
+		m->cast_virtual = md != NULL && md->cast_virtual;
+		snprintf(m->serial, sizeof(m->serial), "%s", md != NULL ? md->serial : "");
 	}
 	ok = out->n > 0;
 done:
 	dbus_message_unref(reply);
 	return ok;
-}
-
-static bool
-rect_close(const struct u_desktop_rect *a, const struct u_desktop_rect *b)
-{
-	return abs(a->x - b->x) <= 2 && abs(a->y - b->y) <= 2 && abs(a->w - b->w) <= 2 && abs(a->h - b->h) <= 2;
 }
 
 
@@ -498,7 +498,8 @@ open_pw_remote(struct gnome_portal *p)
 	return true;
 }
 
-//! The connectors of the monitors the open session's streams show.
+//! The monitors the open session's streams show: real ones by connector, mutter's
+//! screen-cast virtual ones (a casting tool's extended display) by connector + serial.
 static void
 record_covered(struct gnome_portal *p)
 {
@@ -506,16 +507,18 @@ record_covered(struct gnome_portal *p)
 	if (!dc_read(p->c, &dc)) {
 		return;
 	}
-	uint32_t n = 0;
-	for (uint32_t i = 0; i < p->cap.nstreams && n < 8; i++) {
-		for (uint32_t k = 0; k < dc.n; k++) {
-			if (rect_close(&p->cap.streams[i].rect, &dc.m[k].rect)) {
-				snprintf(p->cap.covered[n++], sizeof(p->cap.covered[0]), "%s", dc.m[k].conn);
-				break;
-			}
-		}
+	struct u_desktop_rect rects[MAX_STREAMS];
+	uint32_t n = p->cap.nstreams < MAX_STREAMS ? p->cap.nstreams : MAX_STREAMS;
+	for (uint32_t i = 0; i < n; i++) {
+		rects[i] = p->cap.streams[i].rect;
 	}
-	p->cap.ncovered = n;
+	u_desktop_gnome_covered_from_streams(rects, n, dc.m, dc.n, &p->cap.covered);
+	if (p->cap.covered.nv > 0) {
+		U_LOG_I(
+		    "desktop/gnome: the screen grant covers %u screen-cast virtual monitor(s) (first: %s): a "
+		    "restore never waits for them — once gone, GNOME cannot restore the screens",
+		    p->cap.covered.nv, p->cap.covered.vconn[0]);
+	}
 	u_desktop_layout_settle_reset(&p->cap.layout, dc_fingerprint(&dc));
 }
 
@@ -539,7 +542,15 @@ gp_cap_after_start(struct gnome_portal *p)
 	pthread_mutex_unlock(&p->lock);
 
 	if (had_screens && cp->sources_selected && !screens) {
-		U_LOG_W("desktop/gnome: the portal restored the session WITHOUT any screen (monitors changed?)");
+		// GNOME restores the screens all or nothing: a covered monitor that is gone
+		// (a screen-cast virtual one) drops them all, and the renewed token no longer
+		// covers them. CAPTURE is revoked; CONTROL (the input, if granted) stays.
+		U_LOG_W(
+		    "desktop/gnome: the portal restored the session WITHOUT any screen (a monitor the grant covered is "
+		    "gone?) — screen capture is no longer granted; request it again");
+		pthread_mutex_lock(&p->lock);
+		cp->access = U_DESKTOP_ACCESS_DENIED;
+		pthread_mutex_unlock(&p->lock);
 	}
 	if (screens) {
 		record_covered(p);
@@ -624,8 +635,9 @@ gp_cap_end_upgrade(struct gnome_portal *p, struct gp_cap_saved *saved, bool ok)
 }
 
 enum u_desktop_result
-gp_cap_before_restore(struct gnome_portal *p, char *msg)
+gp_cap_before_restore(struct gnome_portal *p, bool *gone, char *msg)
 {
+	*gone = false;
 	pthread_mutex_lock(&p->lock);
 	bool screens = p->have_token && p->cap.token_screens;
 	pthread_mutex_unlock(&p->lock);
@@ -639,23 +651,28 @@ gp_cap_before_restore(struct gnome_portal *p, char *msg)
 			return U_DESKTOP_OK; // cannot tell: no worse than before
 		}
 		uint64_t now = gdbus_now_ms();
-		uint32_t missing = 0;
-		for (uint32_t i = 0; i < p->cap.ncovered; i++) {
-			bool found = false;
-			for (uint32_t k = 0; k < dc.n && !found; k++) {
-				found = strcmp(dc.m[k].conn, p->cap.covered[i]) == 0;
-			}
-			missing += found ? 0 : 1;
-		}
+		uint32_t missing = 0, vgone = 0;
+		char names[128];
+		u_desktop_gnome_covered_missing(&p->cap.covered, dc.m, dc.n, &missing, &vgone, names, sizeof(names));
 		// Settled = LAYOUT_SETTLE_MS since the LAST layout change and since every
 		// covered monitor is back (§11 run N4: a returning monitor was restored on
-		// after ~0.4 s, measured from an earlier change).
-		uint32_t left =
-		    u_desktop_layout_settle_step(&p->cap.layout, now, dc_fingerprint(&dc), missing, LAYOUT_SETTLE_MS);
-		if (left == 0) {
+		// after ~0.4 s, measured from an earlier change). A covered screen-cast
+		// virtual monitor that is gone never comes back: not waited for.
+		enum u_desktop_restore_verdict v =
+		    u_desktop_restore_guard_step(&p->cap.layout, start, now, dc_fingerprint(&dc), missing, vgone,
+		                                 LAYOUT_SETTLE_MS, LAYOUT_WAIT_MAX_MS);
+		if (v == U_DESKTOP_RESTORE_NOW) {
 			return U_DESKTOP_OK;
 		}
-		if (now - start >= LAYOUT_WAIT_MAX_MS || gp_quitting(p)) {
+		if (v == U_DESKTOP_RESTORE_GONE) {
+			*gone = true;
+			gp_set_msg(msg, "a screen-cast virtual monitor the screen grant covers is gone (%s)", names);
+			return U_DESKTOP_OK;
+		}
+		// A covered real monitor still missing after the wait (a slow HDMI handshake, a
+		// monitor off the bus, a closed lid): no restore now, the grant is kept for a
+		// later retry — never the screens' loss.
+		if (v == U_DESKTOP_RESTORE_MISSING || v == U_DESKTOP_RESTORE_UNSETTLED || gp_quitting(p)) {
 			gp_set_msg(msg,
 			           missing > 0
 			               ? "a monitor the screen grant covers is missing — not restoring (retry when "
@@ -665,6 +682,33 @@ gp_cap_before_restore(struct gnome_portal *p, char *msg)
 		}
 		gp_pump(p, 100);
 	}
+}
+
+bool
+gp_cap_screens_gone(struct gnome_portal *p)
+{
+	pthread_mutex_lock(&p->lock);
+	bool check = p->have_token && p->cap.token_screens && !p->cap.open_streams;
+	pthread_mutex_unlock(&p->lock);
+	// Only a covered screen-cast virtual monitor is ever "gone": one look, no wait.
+	if (!check || p->cap.covered.nv == 0 || p->c == NULL) {
+		return false;
+	}
+	struct dc_state dc;
+	if (!dc_read(p->c, &dc)) {
+		return false; // cannot tell: answered from the grant, as before
+	}
+	uint32_t missing = 0, vgone = 0;
+	char names[128];
+	u_desktop_gnome_covered_missing(&p->cap.covered, dc.m, dc.n, &missing, &vgone, names, sizeof(names));
+	if (vgone == 0) {
+		return false;
+	}
+	U_LOG_W(
+	    "desktop/gnome: a screen-cast virtual monitor the screen grant covers is gone (%s) — GNOME cannot "
+	    "restore the grant's screens: the request asks again",
+	    names);
+	return true;
 }
 
 void
@@ -709,6 +753,34 @@ cap_revoke(struct gnome_portal *p, const char *why)
 	memset(used, 0, sizeof(used));
 }
 
+bool
+gp_cap_restore_gone(struct gnome_portal *p, bool may_ask, char *msg)
+{
+	pthread_mutex_lock(&p->lock);
+	bool input = p->have_token && !p->cap.token_sc && p->cap.token_devices;
+	pthread_mutex_unlock(&p->lock);
+	char why[U_DESKTOP_MSG_SIZE];
+	snprintf(why, sizeof(why), "%s", msg != NULL ? msg : "a monitor the screen grant covers is gone");
+	if (input || may_ask) {
+		// RemoteDesktop: GNOME restores the input without the screens (no dialog);
+		// gp_cap_after_start then revokes CAPTURE and the grant is saved without them.
+		U_LOG_W("desktop/gnome: %s — restoring anyway: %s", why,
+		        input ? "GNOME brings the input back without the screens (CAPTURE is revoked, CONTROL stays)"
+		              : "the portal's dialog may ask again");
+		if (msg != NULL) {
+			msg[0] = '\0';
+		}
+		return true;
+	}
+	// A screens-only grant: its restore would show GNOME's dialog in the middle of an
+	// action, and the monitor never comes back. Revoke it here instead (the app asks
+	// again when it wants to).
+	U_LOG_W("desktop/gnome: %s — the screen grant cannot be restored: revoked", why);
+	cap_revoke(p, "a monitor it covered is gone");
+	gp_set_msg(msg, "%s — the screen grant cannot be restored; request access again", why);
+	return false;
+}
+
 static enum u_desktop_result
 open_sc_session(struct gnome_portal *p, enum gp_open mode, char *msg)
 {
@@ -728,9 +800,14 @@ open_sc_session(struct gnome_portal *p, enum gp_open mode, char *msg)
 	gp_session_close(p);
 	p->start_declined = false;
 	if (restoring) {
-		enum u_desktop_result rr = gp_cap_before_restore(p, msg);
+		bool gone = false;
+		enum u_desktop_result rr = gp_cap_before_restore(p, &gone, msg);
 		if (rr != U_DESKTOP_OK) {
 			return rr;
+		}
+		// The restore shows the dialog when a covered monitor is gone: only where one is allowed.
+		if (gone && !gp_cap_restore_gone(p, mode == GP_OPEN_RESTORE_OR_ASK, msg)) {
+			return U_DESKTOP_ERR_NOT_GRANTED;
 		}
 	}
 	char token[64], stoken[64];
@@ -948,9 +1025,15 @@ cmd_request_scopes(struct gnome_portal *p, struct gp_cmd *c)
 
 	gp_grant_sync(p); // the app's saved grant: no dialog for what it covers
 	pthread_mutex_lock(&p->lock);
-	bool ctl_now = gp_cap_control_granted_locked(p) || p->consent_only_granted;
-	bool cap_now = (p->have_token && p->cap.token_screens) || p->cap.open_streams;
 	bool reask = p->cap.reask;
+	pthread_mutex_unlock(&p->lock);
+	// A screen grant that covers a screen-cast virtual monitor that is gone cannot
+	// restore its screens (GNOME restores them all or nothing): never "granted" from
+	// memory — ask. (A missing real monitor may come back: answered as before.)
+	bool screens_gone = want_cap && !reask && gp_cap_screens_gone(p);
+	pthread_mutex_lock(&p->lock);
+	bool ctl_now = gp_cap_control_granted_locked(p) || p->consent_only_granted;
+	bool cap_now = (p->have_token && p->cap.token_screens && !screens_gone) || p->cap.open_streams;
 	pthread_mutex_unlock(&p->lock);
 
 	enum u_desktop_access ctl = U_DESKTOP_ACCESS_UNKNOWN, cap = U_DESKTOP_ACCESS_UNKNOWN;
@@ -1075,6 +1158,18 @@ cmd_capture_prepare(struct gnome_portal *p, struct gp_cmd *c)
 			return r;
 		}
 		if (cp->nstreams == 0) {
+			pthread_mutex_lock(&p->lock);
+			bool input = p->have_token && !cp->token_sc && cp->token_devices;
+			pthread_mutex_unlock(&p->lock);
+			if (input) {
+				// GNOME restored a combined grant with its input only (a screen-cast
+				// virtual monitor it covered is gone): CONTROL stays, CAPTURE is revoked
+				// (gp_cap_after_start), the grant is saved without the screens.
+				gp_set_msg(c->msg,
+				           "the portal restored the grant without its screens (a monitor it covered is "
+				           "gone) — request screen capture again");
+				return U_DESKTOP_ERR_NOT_GRANTED;
+			}
 			cap_revoke(p, "the portal restored no screen");
 			gp_session_close(p);
 			gp_set_msg(c->msg, "the portal restored no screen — request access again");
