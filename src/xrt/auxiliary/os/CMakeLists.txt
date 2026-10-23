@@ -114,6 +114,19 @@ elseif(APPLE OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
 	target_sources(aux_os PRIVATE os_process.h os_process_posix.c)
 endif()
 
+# ADR-054 N8: named shared memory (the viewer pose page a tracking host writes
+# and the service + in-process runtimes read). Windows: a Local\ section with
+# an explicit DACL (advapi32, linked above). Desktop Linux + macOS: shm_open
+# (librt on older glibc). Not on Android (bionic has no shm_open).
+if(WIN32)
+	target_sources(aux_os PRIVATE os_shm.h os_shm_win32.c)
+elseif(APPLE OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
+	target_sources(aux_os PRIVATE os_shm.h os_shm_posix.c)
+	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+		target_link_libraries(aux_os PRIVATE rt)
+	endif()
+endif()
+
 ####
 # UVC capture backend of the vendor-neutral stereo camera source (ADR-043
 # Amendment 4, util/u_stereo_uvc.h). Its own library so the capture DLL

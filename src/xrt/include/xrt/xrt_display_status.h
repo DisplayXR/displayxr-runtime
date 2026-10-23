@@ -378,6 +378,17 @@ struct xrt_status_eye_tracking
 	 * "none". "" = not evaluated.
 	 */
 	char viewer_provider[16];
+	/*!
+	 * Where that provider runs (tracking-provider-discovery.md §4a), filled
+	 * where the views follow a provider: "host" (the service's supervised
+	 * `displayxr-tracking-host`), "service" (in the service: no host binary),
+	 * "in_process" (loaded by the process that built the snapshot), "page"
+	 * (read from the service's pose page). "" = no provider here.
+	 */
+	char viewer_hosting[16];
+	int64_t viewer_host_pid;       //!< the host's pid (0 = not running / n/a)
+	char viewer_host_state[16];    //!< "idle" / "starting" / "running" / "backoff" / "failed" / "stopped"
+	uint32_t viewer_host_restarts; //!< host restarts since the service started
 };
 
 //! The rendering mode a screen is in (phase 2; absent headless).

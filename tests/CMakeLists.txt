@@ -185,6 +185,9 @@ if(TARGET target_lists)
 	# composed XR_DXR_display_info advertisement, the viewer-policy slot rule,
 	# the -tracking-provider.json router and sim_tracking's script (pure).
 	list(APPEND tests tests_viewer_arbitration)
+	# Tracking-provider-discovery §4a / ADR-054 N8 -- the viewer pose page
+	# (seqlock, wrap, torn-read stress, stale), its named shm, the host supervisor.
+	list(APPEND tests tests_viewer_pose_page)
 	# Multi-screen M1 -- target_screens_build: registry -> per-screen list.
 	list(APPEND tests tests_target_screens)
 	# ADR-047 Amendment 8 -- display hotplug: the claim sweep's scheduler, the
@@ -654,6 +657,9 @@ if(TARGET tests_viewer_arbitration)
 	target_include_directories(tests_viewer_arbitration PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking)
 	target_link_libraries(tests_viewer_arbitration PRIVATE target_lists xrt-interfaces aux_util aux_os)
 endif()
+if(TARGET tests_viewer_pose_page)
+	target_link_libraries(tests_viewer_pose_page PRIVATE target_lists xrt-interfaces aux_util aux_os)
+endif()
 if(TARGET tests_target_display_hotplug)
 	target_link_libraries(tests_target_display_hotplug PRIVATE target_lists xrt-interfaces aux_os)
 endif()
@@ -926,9 +932,31 @@ if(TARGET tests_oxr_view_space)
 		add_test(NAME tests_oxr_view_space_viewer_tracking
 		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1
 		                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_PERIOD_MS=2000
-		                 DXR_TRACKING_SIM_TRACKING_AMPLITUDE_M=0.1 $<TARGET_FILE:tests_oxr_view_space>
-		                 "[viewer_tracking]" --success --allow-running-no-tests
+		                 DXR_TRACKING_SIM_TRACKING_AMPLITUDE_M=0.1 DXR_VIEWER_POSE_PAGE=none
+		                 $<TARGET_FILE:tests_oxr_view_space> "[viewer_tracking]" --success --allow-running-no-tests
 		         )
+		# (DXR_VIEWER_POSE_PAGE=none: never attach to a live service's page on a
+		# dev box; this arm is the in-process LOCAL hosting.)
+
+		# §4a out-of-process hosting end to end: probe, serve on demand, kill ->
+		# restart with backoff, orderly stop, all read off the page here; and the
+		# in-process runtime glue as a READER of that page (no provider loaded).
+		if(TARGET displayxr-tracking-host)
+			add_executable(tests_tracking_host tests_tracking_host.cpp)
+			target_link_libraries(
+				tests_tracking_host PRIVATE xrt-external-catch2 target_lists xrt-interfaces aux_util aux_os
+				)
+			target_compile_definitions(
+				tests_tracking_host PRIVATE "TRACKING_HOST_EXE=\"$<TARGET_FILE:displayxr-tracking-host>\""
+				)
+			add_dependencies(tests_tracking_host displayxr-tracking-host drv_sim_tracking_plugin)
+			add_test(NAME tests_tracking_host
+			         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1
+			                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_SCRIPT=sweep
+			                 DXR_TRACKING_SIM_TRACKING_PERIOD_MS=500 DXR_TRACKING_SIM_TRACKING_AMPLITUDE_M=0.1
+			                 $<TARGET_FILE:tests_tracking_host> --success
+			         )
+		endif()
 
 		# Camera-pose calibration end to end (tracking-provider-discovery.md, "Camera
 		# pose calibration"): the real sim_tracking plug-in with a hidden

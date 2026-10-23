@@ -486,6 +486,16 @@ os_process_current_pid(void)
 }
 
 bool
+os_process_is_alive(long pid)
+{
+	if (pid <= 0) {
+		return false;
+	}
+	// EPERM: it exists, it is just not ours to signal.
+	return kill((pid_t)pid, 0) == 0 || errno == EPERM;
+}
+
+bool
 os_named_mutex_held(const char *name)
 {
 	(void)name;

@@ -419,6 +419,23 @@ os_process_current_pid(void)
 }
 
 bool
+os_process_is_alive(long pid)
+{
+	if (pid <= 0) {
+		return false;
+	}
+	HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+	if (h == NULL) {
+		// Access denied: it exists (a process of another integrity / user).
+		return GetLastError() == ERROR_ACCESS_DENIED;
+	}
+	DWORD code = 0;
+	const bool alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+	CloseHandle(h);
+	return alive;
+}
+
+bool
 os_named_mutex_held(const char *name)
 {
 	if (name == NULL) {

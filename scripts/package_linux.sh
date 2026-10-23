@@ -8,6 +8,8 @@
 #
 # Output: dist/displayxr-runtime-linux-<arch>-<version>.tar.gz containing
 #   bin/displayxr-cli bin/displayxr-service
+#   bin/displayxr-tracking-host    (tracking-provider-discovery §4a: the viewer-tracking
+#       provider's supervised host process, spawned by the service from its own directory)
 #   bin/displayxr-conversion-host  (ADR-053 D5: the conversion-provider satellite,
 #       spawned by the service from its own directory)
 #   bin/displayxr-gnome-extension-enable
@@ -78,6 +80,8 @@ SERVICE_BIN="$(find "$BUILD_DIR/src/xrt/targets/service" -maxdepth 1 -name displ
 # own directory (one process per conversion-provider binary), so it ships
 # beside displayxr-service.
 HOST_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-conversion-host -type f 2>/dev/null | head -1 || true)"
+# Tracking-provider-discovery §4a: the viewer-tracking host, same rule.
+TRACKHOST_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-tracking-host -type f 2>/dev/null | head -1 || true)"
 PLUGIN_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.so" -type f | head -1)"
 # ADR-054 §2 clause 3: every component class ships its sim_* reference. Both
 # decline at probe until their ENABLE setting is on, so staging them changes
@@ -108,6 +112,10 @@ SIMCONV_PACK="$(dirname "$SIMCONV_SO")/sim-conversion.models.json"
 }
 [ -n "$HOST_BIN" ] || {
     echo "error: displayxr-conversion-host not built — the tarball ships it beside the service (ADR-053 P2)" >&2
+    exit 1
+}
+[ -n "$TRACKHOST_BIN" ] || {
+    echo "error: displayxr-tracking-host not built — the tarball ships it beside the service (tracking-provider-discovery §4a)" >&2
     exit 1
 }
 # Same hybrid-runtime guard as package_deb_linux.sh (here-string: see there).
@@ -175,6 +183,7 @@ if [ -n "$DASHBOARD_BIN" ]; then
 fi
 cp "$SERVICE_BIN" "$STAGE/bin/"
 cp "$HOST_BIN" "$STAGE/bin/"
+cp "$TRACKHOST_BIN" "$STAGE/bin/"
 cp "$ROOT/scripts/linux/systemd/displayxr.socket" "$ROOT/scripts/linux/systemd/displayxr.service.in" \
     "$STAGE/share/systemd/user/"
 cp "$RUNTIME_SO" "$STAGE/lib/"

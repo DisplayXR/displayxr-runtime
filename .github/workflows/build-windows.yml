@@ -273,7 +273,9 @@ jobs:
           # each binary's link edge named (the Release LINK_LIBRARIES in the
           # Ninja Multi-Config impl file), because a static library drags in no
           # import and shows only on the link line.
-          $trunk = @("_package/bin/DisplayXRClient.dll", "_package/bin/displayxr-service.exe", "_package/bin/displayxr-cli.exe")
+          # displayxr-tracking-host (tracking-provider-discovery §4a) loads providers
+          # only through the tracking loader, exactly like the service.
+          $trunk = @("_package/bin/DisplayXRClient.dll", "_package/bin/displayxr-service.exe", "_package/bin/displayxr-cli.exe", "_package/bin/displayxr-tracking-host.exe")
           $forbiddenDeps = "SimulatedReality|LeapC|DisplayXR-Sim|DisplayXR-Ultraleap|DisplayXR-LeiaSR|DimencoWeaving"
           $forbiddenLibs = "drv_sim_display\.lib|drv_leia|drv_ultraleap|SimulatedReality|LeapC|drv_sim_input|drv_sim_conversion|drv_sim_tracking"
           $ninjaFile = "build/CMakeFiles/impl-Release.ninja"

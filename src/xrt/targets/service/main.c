@@ -57,6 +57,8 @@ workspace_launch_provider(const char *controller_id)
 #include "target_component_loader.h"    // ADR-054: the component class ids
 #include "target_input_plugin_loader.h" // ADR-054 N3d: input policy re-read -> arbiter re-rank
 #include "target_viewer_tracking.h"     // ADR-054 N6 Part 2: the service hosts the viewer-tracking provider
+#include "target_viewer_host.h"         // §4a: the out-of-process host binary name
+#include "service_spawn.h"              // its sibling path
 #include "service_conversion.h"         // ADR-053: the conversion core
 #include "service_component_watch.h"    // ADR-054 N3d (#2051): the policy-store watch
 
@@ -79,6 +81,7 @@ service_main_body(void *p)
 	return NULL;
 }
 
+#include <stdlib.h> // getenv (DXR_TRACKING_HOST_EXE)
 #include <string.h> // strcmp for --workspace flag
 
 /*!
@@ -189,6 +192,22 @@ register_component_watch(void)
 	// it HOSTS the viewer-tracking provider (once, shared by every client)
 	// and composes the tracking advertisement the clients read.
 	target_viewer_tracking_set_service_process(true);
+	// Tracking-provider-discovery §4a: the provider runs in its own supervised
+	// host process when the binary ships beside the service; else in here.
+	// DXR_TRACKING_HOST_EXE (dev / test only) names another binary, or `none`
+	// to keep the provider in the service.
+	{
+		const char *env = getenv("DXR_TRACKING_HOST_EXE");
+		char host_exe[1024];
+		if (env != NULL && env[0] != '\0') {
+			if (strcmp(env, "none") != 0 && service_spawn_file_exists(env)) {
+				target_viewer_tracking_set_host_exe(env);
+			}
+		} else if (service_spawn_sibling_path(TARGET_VIEWER_HOST_EXE, host_exe, sizeof(host_exe)) &&
+		           service_spawn_file_exists(host_exe)) {
+			target_viewer_tracking_set_host_exe(host_exe);
+		}
+	}
 	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_DISPLAY, on_display_policy_watch, NULL);
 	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_INPUT, on_input_policy_watch, NULL);
 	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_TRACKING, on_tracking_policy_watch, NULL);

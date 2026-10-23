@@ -44,7 +44,7 @@ Each graphics API gets a native compositor — no interop, no Vulkan intermediar
 - **drivers/** — `sim_display/` (vendor-neutral simulation + plug-in), `qwerty/` (keyboard/mouse), and the in-tree input providers (ADR-034 / ADR-054 class, plug-in DLLs): `sim_input/` (scripted reference), `net_input/` (loopback-TCP feeder), `ultraleap/` (SDK-gated hands), `gamepad/` (XInput / GameController pad → `/user/gamepad` role + rig navigation + optional emulated controllers; Linux stub), and the viewer-tracking reference provider `sim_tracking/` (ADR-054 N6 Part 2, the fourth class: a scripted viewer that drives `xrLocateViews` on a display that does not track and declares `EXTERNAL_OK`; contract `xrt/xrt_tracking_plugin.h`, spec `docs/specs/runtime/tracking-provider-discovery.md`). Vendor plug-ins (Leia SR etc.) ship from their own repos per ADR-019.
 - **state_trackers/oxr/** — OpenXR API implementation
 - **ipc/** — IPC for service mode (preserve for `_ipc` apps, WebXR, multi-app workspace controllers)
-- **targets/** — Build targets (runtime library, `displayxr-cli`, `displayxr-service`)
+- **targets/** — Build targets (runtime library, `displayxr-cli`, `displayxr-service`, and the service's two supervised satellites: `displayxr-conversion-host` (ADR-053) and `displayxr-tracking-host` (the viewer-tracking provider's process, writing the shared-memory viewer pose page — `docs/specs/runtime/tracking-provider-discovery.md` §4a))
 
 ### Key interfaces (C, vtable-style polymorphism)
 `xrt_device`, `xrt_compositor`, `xrt_instance`, `xrt_prober`. Full catalog incl. display-processor vtables: `docs/archive/vendor-integration-historical.md`.

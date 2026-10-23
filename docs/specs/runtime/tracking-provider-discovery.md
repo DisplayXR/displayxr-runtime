@@ -1,6 +1,7 @@
 # Viewer-Tracking Provider Discovery Contract
 
-**Status:** implemented (ADR-054 §4.1, N6 Part 2, #2144) — in-process and service hosting (§4a), per-screen routing (§4b).
+**Status:** implemented (ADR-054 §4.1, N6 Part 2, #2144) — in-process, service and out-of-process hosting
+(§4a, the N8 viewer pose page), per-screen routing (§4b).
 **ABI:** `src/xrt/include/xrt/xrt_tracking_plugin.h`, major 1 (`XRT_TRACKING_PLUGIN_API_VERSION_CURRENT`).
 **Siblings:** [plugin-discovery.md](plugin-discovery.md) (display processors),
 [input-provider-discovery.md](input-provider-discovery.md),
@@ -139,15 +140,16 @@ The provider is hosted by **the process that computes the views**, once:
 
 | Process | Hosts? | What it does |
 |---|---|---|
-| In-process runtime (`_handle` / `_texture` / `_hosted`, no service involved) | yes | `oxr_session.c` splices the provider's eyes into `xrLocateViews` |
-| `displayxr-service` | **yes — one provider for every IPC client** | its own native system runs the same loader and the same arbitration (`target_viewer_tracking.c`); the IPC view paths splice the provider's eyes |
+| In-process runtime (`_handle` / `_texture` / `_hosted`) **with no service running** | yes | `oxr_session.c` splices the provider's eyes into `xrLocateViews` (the fallback) |
+| In-process runtime **beside a running service** | **no — it reads the service's pose page** | finds a live page at system creation, loads no provider, posts demand on its first viewer request, drains the page into its own ring (§4a "Out-of-process hosting") |
+| `displayxr-service` | **owns it — one provider for every client** | runs the provider in `displayxr-tracking-host` (or in itself without that binary), creates the pose page, splices the page's eyes into the IPC view paths with the same arbitration (`target_viewer_tracking.c`) |
+| `displayxr-tracking-host` | **yes — the only process the provider's code runs in** | spawned and supervised by the service; the provider's sink IS the page writer |
 | IPC client (any app under `XRT_FORCE_MODE=ipc`, a workspace session, a weave present-owner) | **never** | it never creates a native system, so `xrt_system_devices::viewer_tracking` is NULL and nothing is scanned or loaded; the service's answer is used as is |
 
 A hybrid runtime is therefore in-process when it has no service and an IPC client when it has
-one, and a provider is never loaded twice for one view path. (An in-process app running *beside*
-a service still hosts its own: the two are different view paths. Each starts its provider only
-on its first viewer request, so the second camera open happens only when both kinds of app run
-at once — see §10.)
+one, and a provider is never loaded twice on one desktop: an in-process app *beside* a service
+reads the same page the service's IPC clients are served from, so the camera is opened once.
+(Before this release such an app hosted its own copy and the camera was opened twice.)
 
 In the service, every place that hands an IPC client eyes **for its views** asks the arbitration
 (`ipc_viewer_override_eyes` → `xrt_viewer_tracking_override_eyes`, `ipc_server_handler.c`):
@@ -180,6 +182,88 @@ once, that a registration / preference change applies at the next service start.
 Not covered by the service splice yet: a workspace tile framed from **another presenter's** screen
 (`comp_d3d11_service_get_client_workspace_view_frame`, ADR-052 D2) keeps that presenter DP's eyes,
 and the `XR_DXR_weave` output eyes of a present-owner stay the DP's (they are weaving eyes).
+
+#### Out-of-process hosting: `displayxr-tracking-host` and the viewer pose page (ADR-054 N8)
+
+The provider's code runs in **its own small process**, so a provider crash takes down only that
+process, and one camera open serves the whole desktop. The ABI is unchanged: the provider is
+still started with an `xrt_tracking_sink` and pushes samples from its own thread — in the host the
+sink is the page writer.
+
+**The page** (`util/u_viewer_pose_page.h`, pure C, no OS calls; `os/os_shm.h` maps it). One 8 KiB
+named shared-memory section per user desktop: Windows `Local\DisplayXR-ViewerPose-v1` (the
+session namespace), POSIX `/dxr-vpose-<uid>`. The service creates it; `DXR_VIEWER_POSE_PAGE` in a
+process's environment names another one (tests, dev boxes) and `none` disables it there.
+
+| Offset | Block | Written by |
+|---|---|---|
+| 0 | geometry: magic `DVPP`, version 1, header / slot / sample sizes, ring size 16, owner pid + creation time | the owner, once (magic last) |
+| 64 | `write_count` (samples published), `heartbeat_ns` | the producer |
+| 128 | owner status (seqlock): supervisor state, restarts, generation, host pid, provider id | the service |
+| 320 | producer status (seqlock): pid, generation, `get_status()`, `describe()` (tracks, source, camera key) | the host |
+| 768 | `demand_ns`: the last time a reader needed a viewer | any reader |
+| 1024 | 16 slots of `{seq, struct xrt_tracking_viewer_sample}` | the producer |
+
+Each slot is a seqlock: sample number `k` has `seq = 2k + 2` once written, `2k + 1` while being
+written; `write_count` is published after the slot. A reader keeps its own cursor, copies every
+sample published since its last read, re-checks `seq` after the copy (torn → retried, lapped →
+dropped and counted) and pushes the samples into its own `u_eye_history` ring — then samples it at
+the target time with the unchanged rules (§1). A restarted host continues the count, so readers'
+cursors stay valid. The producer is untrusted: the reader validates the geometry once and bounds
+every index; page strings are re-terminated. A sample's `struct_size` is the page's (an older,
+shorter sample is zero-extended), so an appended ABI field rides the page without a version bump.
+
+**Security.** Windows: the creator sets an explicit DACL — SYSTEM, Administrators and the creating
+user's SID, full access; nobody else — plus a Medium mandatory label (no-write-up), so a
+non-elevated app of the same user can open a page a Medium-IL (or elevated) service created.
+POSIX: mode 0600. Readers map it read-write only for the one `demand_ns` word; same-user code is
+trusted with the page as it is with the IPC socket.
+
+**Liveness = tracking.** A reader treats the page as live while the owner's pid is alive and the
+producer's heartbeat (every 100 ms) is younger than 1.5 s with its pid alive (`os_process_is_alive`,
+checked at most every 250 ms). Not live → the answer is the last known viewer with
+`is_tracking = false` (the existing contract); no sample for over 500 ms reads the same through the
+ring's stale rule. A reader whose service went away re-opens the page by name at most once a
+second (a restarted service makes a new one).
+
+**The host** (`src/xrt/targets/tracking_host/`, one binary for every provider):
+
+```
+displayxr-tracking-host --probe --page <name> --parent <pid> [--trust-enforce 0|1]
+displayxr-tracking-host --serve --provider <id> --page <name> --parent <pid> --generation <n>
+                        --channel <token> [--geometry w,h,x,y,z] [--trust-enforce 0|1]
+```
+
+Both modes run the tracking class scan through the shared loader exactly as an in-process runtime
+does — path guard, the **ADR-054 N4b provenance gate**, the ABI gate, `probe()` — so the service
+never loads a provider binary. `--probe` writes the rank-0 provider's id and `describe()` into the
+producer block and exits 0 (10 = none usable); the service runs it once at system creation (≤ 5 s)
+and composes the advertisement from it (§5). `--serve` starts the named provider with the page
+sink, publishes its status + heartbeat every 100 ms, and stops the provider and exits 0 on the
+service's stop byte or when its control channel closes. It refuses to run elevated (exit 13;
+`DXR_TRACKING_HOST_ALLOW_ELEVATED=1` for elevated CI). Parent death: Windows job object
+(`KILL_ON_JOB_CLOSE`), Linux `PR_SET_PDEATHSIG`, macOS kqueue `NOTE_EXIT` — plus the channel.
+Exit codes (`target_viewer_host.h`): 0 orderly, 2 usage, 10 no provider, 11 start failed, 12 page,
+13 elevated, 14 channel. Logs: Windows `%LOCALAPPDATA%\DisplayXR\DisplayXR_tracking-host.<pid>_<ts>.log`;
+macOS `~/Library/Logs/DisplayXR/DisplayXR_tracking-host.log`; Linux
+`$XDG_STATE_HOME/displayxr/DisplayXR_tracking-host.log` (appended across restarts).
+
+**Supervision** (`targets/common/target_viewer_host.c`; the pure state machine is pinned by
+`tests/tests_viewer_pose_page.cpp`). The service spawns the host **on demand** — the first viewer
+request of an IPC client, or a reader's `demand_ns` on the page — never at load (the camera opens
+only when somebody needs a viewer), and keeps it until system teardown. One supervisor thread,
+one 100 ms tick: reap, the producer's hello (its pid + generation in the producer block), a
+heartbeat watchdog (3 s silent → killed, counted as a crash). Restart after an abnormal exit with a
+backoff of 0.5 s doubling to 30 s (reset after 60 s running); 5 abnormal exits within 2 min →
+FAILED, retried after 10 min; exit 10 / 2 / 13 → FAILED at once (a respawn would say the same).
+One WARN per spawn, exit and restart — never per frame. Orderly stop: the stop byte, 3 s grace,
+then terminate.
+
+**Fallbacks.** No host binary beside the service (`DXR_TRACKING_HOST_EXE` names another, `none`
+forces this) → the provider runs **in the service** and its sink still writes the page, so
+in-process apps beside it still share it (a 100 ms thread there beats the heartbeat and answers
+readers' demand); `status` says `hosting: "service"`. No page (creation failed, Android) → the
+pre-page behaviour: service and in-process apps host their own. No service → in-process load.
 
 ### 4b. Per screen: read the segment DP of THAT screen
 
@@ -506,9 +590,10 @@ source is not told the webcam is taken. Do not opt the same webcam into `stereo-
 
 **macOS camera permission.** macOS has no capture backend yet (`aux_os_uvc` builds its stubs
 there), so `SOURCE=webcam` declines on macOS today. When an AVFoundation backend lands, access is
-gated by the **hosting process's** `NSCameraUsageDescription` and TCC grant: in-process (the only
-hosting this release) that is the app's own permission, exactly as for the sim_display alias; a
-standalone provider process (§10 item 1) will need its own usage string and grant.
+gated by the **hosting process's** `NSCameraUsageDescription` and TCC grant: in-process that is
+the app's own permission, exactly as for the sim_display alias; under the service it is
+`displayxr-tracking-host`, which will need its own usage string (an embedded Info.plist) and grant
+(follow-up, §10).
 
 Dev trees stage it next to sim-input (`scripts/build_macos.sh`, `scripts/build_linux.sh`); the CI
 end-to-end arm is `tests_oxr_view_space_viewer_tracking`.
@@ -527,7 +612,10 @@ end-to-end arm is `tests_oxr_view_space_viewer_tracking`.
 - `displayxr-cli info --json` → the same `tracking_providers` object (the Dashboard's Components page reads it).
 - `displayxr-cli status --json` → per screen `eye_tracking.viewer_source`, `viewer_reason`,
   `viewer_policy` (the display's policy for that screen) and `viewer_provider` (§4b) — from the service over DIAG when it is reachable (its live provider
-  state), else headless (evaluated, nothing started).
+  state), else headless (evaluated, nothing started) — and, where the views follow a provider,
+  `viewer_host`: `{"hosting": "host" | "service" | "in_process" | "page", "pid", "state":
+  "idle" | "starting" | "running" | "backoff" | "failed" | "stopped", "restarts"}` (§4a; `null` otherwise).
+  A headless CLI beside a running service reports the page's view (`hosting: "page"`).
 - Logs: one WARN per process for the primary decision (`viewer tracking (ADR-054 N6): primary screen
   viewer source = ...`, plus "hosted in the service, shared by every IPC client" there), one WARN
   per screen whose answer changed at a topology publish (`screen 0x... viewer source = ...`, with
@@ -536,12 +624,18 @@ end-to-end arm is `tests_oxr_view_space_viewer_tracking`.
 
 ## 10. Follow-ups
 
-Done since the first release: **service hosting** (§4a) and **per-screen routing** through each
-screen's own DP with the desktop-geometry mapping (§4b).
+Done since the first release: **service hosting** (§4a), **per-screen routing** through each
+screen's own DP with the desktop-geometry mapping (§4b), and **out-of-process hosting** (§4a):
+`displayxr-tracking-host` supervised by the service, the N8 seqlock pose page as the sink, in-process
+apps beside a service reading the page instead of opening the camera again.
 
-1. **Out-of-process hosting** (ADR-053 §5 hosting contract): the sink becomes the N8 seqlock pose
-   page; the ABI does not change. It also ends the "in-process app beside a service opens the
-   camera a second time" case (§4a).
+1. **Out-of-process hosting — open ends**: the service's host is spawned per service run, so a
+   tracking registration change still applies at the next service start (item 5); the macOS host
+   needs its own `NSCameraUsageDescription` before an AVFoundation webcam source can run there (§8);
+   `tracking calibrate --watch` still hosts its own provider rather than reading the page (item 4);
+   an in-process app that starts *before* the service has created the page keeps its own
+   provider for its instance (the decision is static per instance); Windows hardware runs of the
+   host (the `Local\` page across integrity levels, the job object) are owed by the Windows box.
 2. **Provider as an ADR-043 camera consumer** (with the §7 constraint) — through a reserved host
    slot.
 3. **`screen_hint` contract** for a provider that measures several screens natively (one camera per
@@ -549,7 +643,8 @@ screen's own DP with the desktop-geometry mapping (§4b).
    and the trunk maps it (§4b); a provider-supplied hint would bypass the mapping for its screen.
 4. **Camera-pose calibration** (§6): the solver, `tracking calibrate [solve|apply]`, `--watch
    --json`, the `sim_tracking` camera test bed and the Dashboard calibration window are **done**;
-   open: the service-side watch (read the service's running provider rather than hosting a second one),
+   open: the service-side watch (read the service's pose page, §4a, rather than hosting a second
+   provider),
    `_SCREEN` matching once providers are passed their screen key (item 3), and replacing the
    coplanar desktop-layout assumption of §4b with a per-screen pose.
 5. **Service live re-selection**: today a tracking policy change applies at the next service start

@@ -35,6 +35,7 @@ tccutil reset ScreenCapture com.displayxr.desktop-capture >/dev/null 2>&1 || tru
 rm -f "$HOME/Library/Application Support/DisplayXR/desktop-capture-prompted"
 pkill -x displayxr-service 2>/dev/null || true
 pkill -x displayxr-conversion-host 2>/dev/null || true
+pkill -x displayxr-tracking-host 2>/dev/null || true
 
 echo "Removing DisplayXR runtime..."
 # This recursive delete covers the runtime dylib, the

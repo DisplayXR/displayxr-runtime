@@ -158,6 +158,8 @@ add_library(
 	u_setting.h
 	u_shm_ring.c
 	u_shm_ring.h
+	u_viewer_pose_page.c
+	u_viewer_pose_page.h
 	u_space_overseer.c
 	u_space_overseer.h
 	u_status_snapshot.c
