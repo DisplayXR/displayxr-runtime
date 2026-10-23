@@ -42,7 +42,7 @@ public sealed record CalibRequest(bool IsSolve, CliArgs? Args, string? SolveInpu
 public sealed class CalibrationSession
 {
     public const string AlignPrompt =
-        "Close your left eye. With your right eye, find the reflection of your closed eye and move your head until the cross sits on it. Press Space.";
+        "Close your left eye. With your right eye, find the reflection of your closed eye and move your head until the cross sits on it. Press Space (or click).";
 
     private readonly Screen? _screen;
     private readonly CalibSample?[] _captured = new CalibSample?[CalibGeometry.Dots.Count];
