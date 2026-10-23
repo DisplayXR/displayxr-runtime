@@ -803,6 +803,16 @@ void
 u_cursor_draw_unblend(const uint8_t *on_black, const uint8_t *on_white, uint32_t pixel_count, uint8_t *out);
 
 /*!
+ * Does a recovered cursor image draw nothing at all (every pixel fully
+ * transparent)? A toolkit may "hide" the pointer by selecting a BLANK cursor
+ * rather than none (SDL on Windows does), and mirroring that shape would draw
+ * an invisible runtime cursor exactly where the app hid its own. The look
+ * treats such a cursor as hidden. NULL or zero pixels count as blank.
+ */
+bool
+u_cursor_draw_rgba_is_blank(const uint8_t *rgba, uint32_t pixel_count);
+
+/*!
  * Linux default look (#2102): convert a cursor-theme image's pixels - Xcursor's
  * ARGB32, one 32-bit word per pixel, alpha in the top byte, colour already
  * PREMULTIPLIED - to the look's premultiplied RGBA8 (bytes R, G, B, A). Colour is

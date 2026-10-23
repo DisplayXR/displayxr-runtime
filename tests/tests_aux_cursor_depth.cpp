@@ -1573,6 +1573,26 @@ TEST_CASE("cursor_draw: unblend recovers premultiplied colour and alpha from the
 	}
 }
 
+TEST_CASE("cursor_draw: a cursor that unblends to fully transparent is blank (SDL's hidden cursor)")
+{
+	// A blank cursor draws nothing: the background shows unchanged in both renders.
+	uint8_t b[16], w[16], out[16];
+	for (int i = 0; i < 4; i++) {
+		memset(b + i * 4, 0, 4);
+		memset(w + i * 4, 255, 4);
+	}
+	u_cursor_draw_unblend(b, w, 4, out);
+	CHECK(u_cursor_draw_rgba_is_blank(out, 4));
+
+	// One opaque pixel anywhere (here the last) is a real shape.
+	memset(w + 12, 0, 4); // black over white: an opaque black pixel
+	u_cursor_draw_unblend(b, w, 4, out);
+	CHECK_FALSE(u_cursor_draw_rgba_is_blank(out, 4));
+
+	// No image at all is treated as blank, never as a shape to draw.
+	CHECK(u_cursor_draw_rgba_is_blank(nullptr, 4));
+}
+
 TEST_CASE("cursor_draw: unblend - monochrome AND/XOR cursors, inverted pixels opaque white")
 {
 	// AND=0 XOR=0: black. AND=0 XOR=1: white. AND=1 XOR=0: transparent.
