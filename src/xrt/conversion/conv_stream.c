@@ -664,7 +664,11 @@ late_depth_usable(struct conv_core *core,
                   struct conv_ring_slot *o,
                   const struct xrt_conv_image *provider_depth)
 {
-	if (provider_depth->sync.kind != XRT_CONV_SYNC_NONE) {
+	// A keyed-mutex image is usable: the presenter acquires the mutex when it
+	// pins the late source (the D3D11 glue hands every provider image over
+	// with one, so refusing it would exclude every GPU depth provider on
+	// Windows). A fence-synced image still has GPU work in flight: not usable.
+	if (provider_depth->sync.kind != XRT_CONV_SYNC_NONE && provider_depth->sync.kind != XRT_CONV_SYNC_KEYED_MUTEX) {
 		return false;
 	}
 	const struct xrt_conv_image *d = &o->targets[CONV_RING_DEPTH];
