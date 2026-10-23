@@ -9,7 +9,7 @@
  * Edit the census and re-run the script; the lint workflow runs it with
  * --check, which also fails when a name here no longer occurs in src/xrt.
  *
- * 67 levers: 48 Tier 1 (next launch), 19 Tier 2 (service-scoped).
+ * 68 levers: 49 Tier 1 (next launch), 19 Tier 2 (service-scoped).
  *
  * This is a DESCRIPTION of the levers, not a way to set them: only the names
  * u_setting_is_managed() accepts resolve from the per-user / machine stores.
@@ -50,6 +50,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_CURSOR_SOFTEN_BLUR_MAX_PX", 1, "App, Svc", "8", "Hard ceiling on the blur radius, panel px, in [0, 8]"},
 	{"DXR_CURSOR_SOFTEN_FULL_D", 1, "App, Svc", "0.03", "Cursor disparity magnitude (eye baselines) at which the opacity reaches ALPHA_MIN; smoothstep from 0."},
 	{"DXR_D3D_FORCE_GPU", 1, "Both", "unset", "Supported contract (#845). scanout / igpu / dgpu / index."},
+	{"DXR_DISPLAY_HOTPLUG", 1, "App", "on in-process on macOS, Windows and desktop Linux (#2305); off on Android and in the Windows / desktop-Linux service, which re-probes on its own OS events", "Opt-out (0) / force-on (1) for the in-process display-hotplug sweep (ADR-047 Amendment 8): a monitor or panel plugged, unplugged, moved or re-moded while the app runs re-resolves the per-screen..."},
 	{"DXR_DP_FORWARD_HORIZON", 1, "App", "on (kill switch)", "#206: per-weave FORWARD horizon for the vendor eye predictor, computed from the vsync-locked vblank grid (DXGI frame statistics - measured period, not nominal)."},
 	{"DXR_DP_FORWARD_HORIZON_LOOP", 1, "App", "on (kill switch)", "#1435: learns the pipeline's whole-period offset (composition frame on DComp chains, queued frame at governor depth >= 2) from realised flips - mode of the last 32 resolved weaves, >= 24 agreeing..."},
 	{"DXR_FILL_FENCE_PARK", 1, "App", "on (kill switch)", "#1264 S1: a fill's GPU fence wait releases the compositor lock (re-validated on retake; superseded fills are dropped)."},
