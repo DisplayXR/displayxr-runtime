@@ -68,6 +68,13 @@ DEBUG_GET_ONCE_OPTION(hosted_inset, "DXR_HOSTED_INSET", "0,0,0,0")
 // back to DXR_HOSTED_INSET). Read with GetPropW, which sends the app nothing.
 static const wchar_t *const kHostedViewRectProp = L"DXR_HostedViewRect";
 
+// Apps that draw their menus and dialogs inside the client area (Substance
+// Modeler) would have them hidden under the embedded 3D view. With this on
+// (default), a click on the app's own uncovered client area (its menu bar)
+// hides the 3D view so that UI shows; Esc, or a few seconds with no input,
+// brings it back.
+DEBUG_GET_ONCE_BOOL_OPTION(hosted_ui_peek, "DXR_HOSTED_UI_PEEK", true)
+
 // Marker for SendInput-injected mouse events — WndProc skips re-forwarding these.
 // Used to break the loop: WndProc→SendInput→WM_LBUTTONDOWN→WndProc.
 #define WORKSPACE_SENDINPUT_MARKER 0xD15B1A7E
@@ -209,6 +216,13 @@ struct comp_d3d11_window
 
 	//! The host's DXR_HostedViewRect as last applied (window thread).
 	uint64_t embed_view_rect;
+
+	//! UI peek (DXR_HOSTED_UI_PEEK): the 3D view is hidden so the app's own
+	//! menus and dialogs show; button/key states for edge detection (window thread).
+	bool embed_ui_peek;
+	bool embed_peeking;
+	bool peek_lbutton_down;
+	bool peek_escape_down;
 
 	//! Window thread handle
 	HANDLE thread_handle;
@@ -697,6 +711,11 @@ set_fullscreen(HWND hWnd, bool fullscreen)
 //! WM_TIMER id and period: re-read the app's published viewer rect.
 #define DXR_EMBED_RECT_TIMER 0xE3B1
 #define DXR_EMBED_RECT_PERIOD_MS 250
+//! WM_TIMER id and period: watch for clicks on the app's own UI (UI peek).
+#define DXR_EMBED_PEEK_TIMER 0xE3B2
+#define DXR_EMBED_PEEK_PERIOD_MS 50
+//! UI peek ends after this long with no keyboard or mouse input.
+#define DXR_EMBED_PEEK_IDLE_MS 4000
 
 //! The window this thread embeds — WinEvent callbacks carry no context, and
 //! each comp_d3d11_window has its own thread.
@@ -811,6 +830,62 @@ embed_fit(struct comp_d3d11_window *w, HWND hwnd)
 	SetWindowPos(hwnd, NULL, origin.x + l, origin.y + t, cw, ch, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
 }
 
+/*!
+ * UI peek, polled on the window thread. The app's clicks go to the app, not
+ * to us, so watch the global button state: a left click whose point is in
+ * the host's client area, uncovered by us (its menu bar), hides the 3D view.
+ * Esc or a few seconds without input shows it again. Reads global state
+ * only; sends the app nothing.
+ */
+static void
+embed_peek_tick(struct comp_d3d11_window *w, HWND hwnd)
+{
+	HWND host = w->embed_host;
+	if (host == NULL) {
+		return;
+	}
+	const bool lbutton = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+	const bool escape = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+	const bool clicked = lbutton && !w->peek_lbutton_down;
+	const bool escaped = escape && !w->peek_escape_down;
+	w->peek_lbutton_down = lbutton;
+	w->peek_escape_down = escape;
+
+	if (!w->embed_peeking) {
+		if (!clicked || InterlockedCompareExchange(&w->embed_fullscreen, 0, 0) != 0) {
+			return;
+		}
+		POINT pt;
+		RECT client;
+		if (!GetCursorPos(&pt) || GetAncestor(WindowFromPoint(pt), GA_ROOT) != host) {
+			return;
+		}
+		POINT local = pt;
+		if (!ScreenToClient(host, &local) || !GetClientRect(host, &client) || !PtInRect(&client, local)) {
+			return; // title bar / frame: moving the window, not using its UI
+		}
+		w->embed_peeking = true;
+		ShowWindow(hwnd, SW_HIDE);
+		static bool peek_logged = false;
+		if (!peek_logged) {
+			peek_logged = true;
+			U_LOG_W(
+			    "D3D11 window: UI peek — 3D view hidden for the app's own menus/dialogs (Esc or %d s idle "
+			    "brings it back; DXR_HOSTED_UI_PEEK=0 disables)",
+			    DXR_EMBED_PEEK_IDLE_MS / 1000);
+		}
+		return;
+	}
+
+	LASTINPUTINFO lii = {sizeof(lii)};
+	const bool idle = GetLastInputInfo(&lii) && GetTickCount() - lii.dwTime >= DXR_EMBED_PEEK_IDLE_MS;
+	if (escaped || idle) {
+		w->embed_peeking = false;
+		embed_fit(w, hwnd);
+		ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+	}
+}
+
 static void CALLBACK
 embed_event_cb(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG id_object, LONG id_child, DWORD thread, DWORD time)
 {
@@ -860,6 +935,9 @@ embed_adopt(struct comp_d3d11_window *w, HWND hwnd, HWND host)
 	ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 	// A published viewer rect changes without the host window moving.
 	SetTimer(hwnd, DXR_EMBED_RECT_TIMER, DXR_EMBED_RECT_PERIOD_MS, NULL);
+	if (w->embed_ui_peek) {
+		SetTimer(hwnd, DXR_EMBED_PEEK_TIMER, DXR_EMBED_PEEK_PERIOD_MS, NULL);
+	}
 
 	RECT rc = {0};
 	GetClientRect(host, &rc);
@@ -1272,6 +1350,10 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			if (w->embed_host != NULL || ++w->embed_search_tries >= DXR_EMBED_SEARCH_TRIES) {
 				KillTimer(hWnd, DXR_EMBED_SEARCH_TIMER);
 			}
+			return 0;
+		}
+		if (wParam == DXR_EMBED_PEEK_TIMER) {
+			embed_peek_tick(w, hWnd);
 			return 0;
 		}
 		if (wParam == DXR_EMBED_RECT_TIMER) {
@@ -2092,6 +2174,7 @@ window_create_internal(uint32_t width,
 	w->embed_requested = embed != WINDOW_EMBED_OFF;
 	w->embed_keep_looking = embed == WINDOW_EMBED_LOOKING;
 	if (w->embed_requested) {
+		w->embed_ui_peek = debug_get_bool_option_hosted_ui_peek();
 		const char *inset = debug_get_option_hosted_inset();
 		float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 		if (inset != NULL && sscanf(inset, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]) == 4 && v[0] >= 0.0f &&
