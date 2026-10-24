@@ -454,6 +454,7 @@ library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, contr
 | `DXR_LINUX_DIRECT_SCANOUT` | `compositor/vk_native/comp_vk_native_compositor.c:5845` | `getenv` | off | App | 1 | Opt-in RandR direct-scanout present path on Linux |
 | `DXR_WINDOW_POS` | `compositor/vk_native/comp_vk_native_compositor.c:5248` | `getenv` | plug-in reported | App | 1 | `"x,y"` override for the self-owned window position (#715) |
 | `DXR_WINDOW_FULLSCREEN` | `compositor/vk_native/comp_vk_native_window_xcb.c:273` | `getenv` | on | App | 1 | `=0` opts out of EWMH fullscreen placement (Linux XCB) |
+| `DXR_XCB_ADOPT_OWN_WINDOW` | `compositor/vk_native/comp_vk_native_window_xcb.c` | `getenv` | auto (on under Wine/Proton) | App | 1 | Hosted window becomes a child of the process's own top-level X11 window instead of a second top-level — one presenting surface for a Wine/Proton app (#2322); `=1` forces, `=0` disables |
 
 ### Native-Wayland window drag (#1748)
 

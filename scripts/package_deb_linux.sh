@@ -451,6 +451,7 @@ STABLE_SONAMES=(
     libudev.so.1                    # libudev1
     libX11.so.6 libX11-xcb.so.1     # libx11-6, libx11-xcb1
     libxcb.so.1 libxcb-randr.so.0   # libxcb1, libxcb-randr0
+    libxcb-shape.so.0               # libxcb-shape0 (adopt-own-window input region, #2322)
     libXrandr.so.2                  # libxrandr2
     libwayland-client.so.0          # libwayland-client0 (move-sync frame tag, #1748)
 )
