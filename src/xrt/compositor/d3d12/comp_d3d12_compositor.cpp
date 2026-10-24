@@ -417,6 +417,11 @@ struct comp_d3d12_compositor
 		uint32_t plane_cl_next;
 		bool plane_cl_failed;
 		uint64_t plane_cl_fallbacks;
+		//! #2342: plane-rewrite frames that rode the trailing list (the
+		//! counterpart of @ref plane_cl_fallbacks), and the 10 s `[RENDER]`
+		//! line's clock.
+		uint64_t plane_cl_used;
+		uint64_t plane_cl_diag_ns;
 		/*!
 		 * #2342 P2c: on a hub route the HUB is the one capture site. A pending
 		 * capture intent is moved here at the top of the frame (so this tier's
@@ -2026,6 +2031,7 @@ d3d12_reroute_plane_list(struct comp_d3d12_compositor *c)
 	r.plane_cl_cur = (int32_t)idx;
 	r.plane_cl_open = true;
 	r.plane_cl_next++;
+	r.plane_cl_used++;
 	return e.list;
 }
 
@@ -6302,6 +6308,22 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 
 		comp_hub_d3d11_render_diag(c->reroute.split);
+		/*
+		 * #2342: which list the DIRECT plane rewrites rode — session totals,
+		 * at most once per 10 s and only once a plane was ever rewritten on
+		 * DIRECT (projection-only sessions print nothing).
+		 */
+		if (c->reroute.plane_cl_used != 0 || c->reroute.plane_cl_fallbacks != 0) {
+			const uint64_t pnow = os_monotonic_get_ns();
+			if (pnow - c->reroute.plane_cl_diag_ns >= 10ULL * U_TIME_1S_IN_NS) {
+				c->reroute.plane_cl_diag_ns = pnow;
+				U_LOG_W(
+				    "[RENDER] reroute plane_cl_used=%llu plane_cl_fallbacks=%llu (session totals, "
+				    "#2342)",
+				    (unsigned long long)c->reroute.plane_cl_used,
+				    (unsigned long long)c->reroute.plane_cl_fallbacks);
+			}
+		}
 		return XRT_SUCCESS;
 	}
 #endif
