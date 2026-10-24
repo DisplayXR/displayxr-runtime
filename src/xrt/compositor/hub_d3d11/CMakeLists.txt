@@ -23,7 +23,7 @@ add_library(
 target_link_libraries(
 	comp_hub_d3d11
 	PUBLIC xrt-interfaces
-	PRIVATE comp_util aux_util aux_os aux_math
+	PRIVATE comp_util aux_util aux_os aux_math xrt-external-stb
 	)
 
 target_include_directories(comp_hub_d3d11 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

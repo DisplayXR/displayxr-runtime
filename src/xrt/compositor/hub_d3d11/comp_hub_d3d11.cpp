@@ -29,6 +29,7 @@
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_tiling.h"
+#include "util/u_image_capture.h"
 
 #include "os/os_time.h"
 #include "util/u_time.h"
@@ -64,6 +65,12 @@
 
 #include "os/os_threading.h"
 #include "util/comp_segments.h"
+
+// #2342 P2c: the hub's capture site encodes its own PNGs. STB_IMAGE_WRITE_STATIC
+// scopes the symbols to this TU (the tiers that link the hub carry their own).
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 
 /*
@@ -437,6 +444,23 @@ struct comp_hub_d3d11
 	/*! @} */
 
 	uint64_t composites, composite_bails;
+
+	/*!
+	 * #2342 P2c: the one capture site (@ref comp_hub_d3d11_capture_arm). Set
+	 * by the tier on its app thread and served by the next app-frame weave on
+	 * the same thread, both under the compositor mutex.
+	 */
+	struct
+	{
+		bool armed;
+		bool projection_only;
+		bool served;
+		bool ok;
+		char path[512];
+		char woven_path[512];
+		uint32_t in_w, in_h, out_w, out_h;
+		bool woven_ok;
+	} cap;
 
 	//! @name Counters for the `[RENDER]` line and the F4/R1 tripwires.
 	//! @{
@@ -3003,6 +3027,142 @@ split_draw_hud(struct comp_hub_d3d11 *s, ID3D11Texture2D *dst, uint32_t tgt_w, u
 }
 
 /*!
+ * #2342 P2c: read back the top-left @p w x @p h of @p tex on THIS device and
+ * encode it as an RGBA8 PNG at @p path. 8-bit RGBA / BGRA families only (a deep
+ * atlas is refused by name, as the tiers' captures do); BGRA is swizzled; alpha
+ * forced opaque unless DXR_ATLAS_CAPTURE_RAW_ALPHA=1. Capture frames only: one
+ * staging copy and a Map, which waits for this context.
+ */
+static bool
+split_capture_tex_png(struct comp_hub_d3d11 *s, ID3D11Texture2D *tex, uint32_t w, uint32_t h, const char *path)
+{
+	if (tex == nullptr || w == 0 || h == 0 || path == nullptr || path[0] == '\0') {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC d = {};
+	tex->GetDesc(&d);
+	bool swap_rb = false;
+	switch (d.Format) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: break;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: swap_rb = true; break;
+	default:
+		U_LOG_W("#2342 hub capture: texture format %d is not 8-bit RGBA/BGRA — %s skipped", (int)d.Format,
+		        path);
+		return false;
+	}
+	if (w > d.Width) {
+		w = d.Width;
+	}
+	if (h > d.Height) {
+		h = d.Height;
+	}
+	D3D11_TEXTURE2D_DESC sd = d;
+	sd.Width = w;
+	sd.Height = h;
+	sd.MipLevels = 1;
+	sd.ArraySize = 1;
+	sd.SampleDesc.Count = 1;
+	sd.SampleDesc.Quality = 0;
+	sd.Usage = D3D11_USAGE_STAGING;
+	sd.BindFlags = 0;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	sd.MiscFlags = 0;
+	ID3D11Texture2D *staging = nullptr;
+	if (FAILED(s->out_dev->CreateTexture2D(&sd, nullptr, &staging)) || staging == nullptr) {
+		return false;
+	}
+	D3D11_BOX box = {0, 0, 0, w, h, 1};
+	s->out_ctx->CopySubresourceRegion(staging, 0, 0, 0, 0, tex, 0, &box);
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	bool ok = false;
+	if (SUCCEEDED(s->out_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+		const size_t pitch = (size_t)w * 4u;
+		uint8_t *tight = (uint8_t *)malloc(pitch * h);
+		if (tight != nullptr) {
+			u_image_capture_to_rgba8(tight, (const uint8_t *)m.pData, w, h, m.RowPitch, swap_rb,
+			                         u_image_capture_raw_alpha());
+			ok = stbi_write_png(path, (int)w, (int)h, 4, tight, (int)pitch) != 0;
+			free(tight);
+		}
+		s->out_ctx->Unmap(staging, 0);
+	}
+	staging->Release();
+	return ok;
+}
+
+//! The texture behind @p srv (AddRef'd), or NULL.
+static ID3D11Texture2D *
+split_srv_texture(ID3D11ShaderResourceView *srv)
+{
+	if (srv == nullptr) {
+		return nullptr;
+	}
+	ID3D11Resource *res = nullptr;
+	srv->GetResource(&res);
+	if (res == nullptr) {
+		return nullptr;
+	}
+	ID3D11Texture2D *tex = nullptr;
+	if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex))) {
+		tex = nullptr;
+	}
+	res->Release();
+	return tex;
+}
+
+/*!
+ * #2342 P2c: the DP-input half of an armed capture, right after the weave
+ * consumed @p atlas_srv: its content box (@p w x @p h at the origin — the crop
+ * when one ran, else the content box of the slot/atlas). App frames only.
+ */
+static void
+split_capture_dp_input(
+    struct comp_hub_d3d11 *s, bool is_repaint, ID3D11ShaderResourceView *atlas_srv, uint32_t w, uint32_t h)
+{
+	if (is_repaint || !s->cap.armed || s->cap.served) {
+		return;
+	}
+	ID3D11Texture2D *tex = split_srv_texture(atlas_srv);
+	s->cap.ok = split_capture_tex_png(s, tex, w, h, s->cap.path);
+	if (tex != nullptr) {
+		tex->Release();
+	}
+	s->cap.in_w = w;
+	s->cap.in_h = h;
+	s->cap.served = true;
+}
+
+/*!
+ * #2342 P2c: the post-weave half (full triggers only) — the back buffer after
+ * the weave, the masked composite and the HUD, i.e. what is about to be
+ * presented — and the one WARN naming the files.
+ */
+static void
+split_capture_woven(struct comp_hub_d3d11 *s, bool is_repaint, ID3D11Texture2D *dst, uint32_t tgt_w, uint32_t tgt_h)
+{
+	if (is_repaint || !s->cap.armed || !s->cap.served) {
+		return;
+	}
+	s->cap.armed = false;
+	if (!s->cap.projection_only) {
+		s->cap.woven_ok = split_capture_tex_png(s, dst, tgt_w, tgt_h, s->cap.woven_path);
+		s->cap.out_w = tgt_w;
+		s->cap.out_h = tgt_h;
+		U_LOG_W("#2342 hub capture (%s): DP input %ux%u -> %s%s; post-weave %ux%u -> %s%s",
+		        s->direct.active ? "direct" : "xbridge", s->cap.in_w, s->cap.in_h, s->cap.path,
+		        s->cap.ok ? "" : " FAILED", tgt_w, tgt_h, s->cap.woven_path, s->cap.woven_ok ? "" : " FAILED");
+	} else {
+		U_LOG_W("#2342 hub capture (%s, projection-only): DP input %ux%u -> %s%s",
+		        s->direct.active ? "direct" : "xbridge", s->cap.in_w, s->cap.in_h, s->cap.path,
+		        s->cap.ok ? "" : " FAILED");
+	}
+}
+
+/*!
  * The residual crop, on the OUTPUT device — only ever reached when the R2 resize
  * hysteresis is holding a worst-case egress ring.
  */
@@ -3703,6 +3863,9 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 		    (uint32_t)split_dp_view_format(atlas_srv), tgt_w, tgt_h, cv.offset.w, cv.offset.h,
 		    (uint32_t)cv.extent.w, (uint32_t)cv.extent.h);
 	}
+	// #2342 P2c: an armed capture's DP input — read before the consumer signal
+	// below releases the atlas back to the producer.
+	split_capture_dp_input(s, is_repaint, atlas_srv, d.content_w, d.content_h);
 
 	{
 		auto *dst = static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(s->target));
@@ -3726,6 +3889,7 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 		}
 
 		split_draw_hud(s, dst, tgt_w, tgt_h);
+		split_capture_woven(s, is_repaint, dst, tgt_w, tgt_h);
 		if (s->post_weave_fn != nullptr) {
 			s->post_weave_fn(s->post_weave_userdata, s->out_dev, s->out_ctx, dst, tgt_w, tgt_h, is_repaint);
 		}
@@ -4080,6 +4244,8 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 		                                          tgt_w, tgt_h, cv.offset.w, cv.offset.h, (uint32_t)cv.extent.w,
 		                                          (uint32_t)cv.extent.h);
 	}
+	// #2342 P2c: an armed capture's DP input (the slot's content box).
+	split_capture_dp_input(s, is_repaint, atlas_srv, slot_cw, slot_ch);
 
 	/*
 	 * VK-1b-2 — the masked 2D-over-3D composite, then the HUD, both on the OUT
@@ -4092,6 +4258,7 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 		auto *dst = static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(s->target));
 		(void)split_composite(s, slot, is_repaint, dst);
 		split_draw_hud(s, dst, tgt_w, tgt_h);
+		split_capture_woven(s, is_repaint, dst, tgt_w, tgt_h);
 		if (s->post_weave_fn != nullptr) {
 			s->post_weave_fn(s->post_weave_userdata, s->out_dev, s->out_ctx, dst, tgt_w, tgt_h, is_repaint);
 		}
@@ -4184,6 +4351,53 @@ comp_hub_d3d11_set_post_weave_hook(struct comp_hub_d3d11 *s, comp_hub_d3d11_post
 		s->post_weave_fn = fn;
 		s->post_weave_userdata = userdata;
 	}
+}
+
+extern "C" void
+comp_hub_d3d11_capture_arm(struct comp_hub_d3d11 *s, bool projection_only, const char *path)
+{
+	if (s == nullptr || path == nullptr || path[0] == '\0') {
+		return;
+	}
+	auto &c = s->cap;
+	c = {};
+	c.armed = true;
+	c.projection_only = projection_only;
+	snprintf(c.path, sizeof(c.path), "%s", path);
+	// The service twin's sibling name: insert ".woven" before the extension of
+	// the last path component ("...\\displayxr_atlas.png" -> "...woven.png").
+	const char *dot = strrchr(c.path, '.');
+	const char *sep = strrchr(c.path, '\\');
+	const char *fsep = strrchr(c.path, '/');
+	if (fsep != nullptr && (sep == nullptr || fsep > sep)) {
+		sep = fsep;
+	}
+	if (dot == nullptr || (sep != nullptr && dot < sep)) {
+		snprintf(c.woven_path, sizeof(c.woven_path), "%s.woven.png", c.path);
+	} else {
+		snprintf(c.woven_path, sizeof(c.woven_path), "%.*s.woven%s", (int)(dot - c.path), c.path, dot);
+	}
+}
+
+extern "C" bool
+comp_hub_d3d11_capture_take(struct comp_hub_d3d11 *s, bool *out_ok)
+{
+	if (out_ok != nullptr) {
+		*out_ok = false;
+	}
+	if (s == nullptr || (!s->cap.armed && !s->cap.served)) {
+		return false;
+	}
+	const bool ok = s->cap.served && s->cap.ok;
+	if (!s->cap.served) {
+		// Armed, but the app frame wove nothing (#918 F4): consumed unserved.
+		U_LOG_W("#2342 hub capture: the app frame wove nothing — %s not written", s->cap.path);
+	}
+	s->cap = {};
+	if (out_ok != nullptr) {
+		*out_ok = ok;
+	}
+	return true;
 }
 
 extern "C" uint64_t
@@ -4960,6 +5174,24 @@ comp_hub_d3d11_set_post_weave_hook(struct comp_hub_d3d11 *split, comp_hub_d3d11_
 	(void)split;
 	(void)fn;
 	(void)userdata;
+}
+
+extern "C" void
+comp_hub_d3d11_capture_arm(struct comp_hub_d3d11 *split, bool projection_only, const char *path)
+{
+	(void)split;
+	(void)projection_only;
+	(void)path;
+}
+
+extern "C" bool
+comp_hub_d3d11_capture_take(struct comp_hub_d3d11 *split, bool *out_ok)
+{
+	(void)split;
+	if (out_ok != NULL) {
+		*out_ok = false;
+	}
+	return false;
 }
 
 extern "C" void *

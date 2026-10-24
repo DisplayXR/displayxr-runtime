@@ -386,6 +386,13 @@ struct comp_d3d11_compositor
 		uint64_t mask_gen;
 		uint64_t mask_key;
 		uint32_t mask_w, mask_h;
+		/*!
+		 * #2342 P2c: on a hub route the HUB is the one capture site. A pending
+		 * capture intent is moved here at the top of the frame (so this tier's
+		 * own projection / post dispatch points stay idle), handed to the hub
+		 * before the app-frame weave, and completed after it.
+		 */
+		struct u_capture_intent capture;
 	} hub;
 
 	//! Output target (DXGI swapchain).
@@ -4629,7 +4636,18 @@ d3d11_hub_commit(struct comp_d3d11_compositor *c,
 	// #2317 P1c: the D rows of DXR_WEAVE_LATENCY_CSV need this frame's promise —
 	// the same value the tier's own weave marks with.
 	comp_hub_d3d11_set_predicted_display_time(c->hub.split, c->last_display_time_ns);
+	// #2342 P2c: the hub's one capture site (DP input + post-weave back buffer).
+	if (c->hub.capture.pending) {
+		comp_hub_d3d11_capture_arm(c->hub.split, c->hub.capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
+		                           c->hub.capture.path);
+	}
 	const bool wove = comp_hub_d3d11_weave_and_present(c->hub.split, /*is_repaint=*/false, &cv);
+	{
+		bool cap_ok = false;
+		if (comp_hub_d3d11_capture_take(c->hub.split, &cap_ok) && c->hub.capture.pending) {
+			u_capture_intent_complete(&c->hub.capture, &c->mcp_capture, cap_ok);
+		}
+	}
 
 	// #868: arm the replay; a frame that wove nothing keeps the panel's last
 	// woven frame and stays disarmed.
@@ -4881,6 +4899,19 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		const char *why = c->hub.retire_pending;
 		c->hub.retire_pending = NULL;
 		d3d11_hub_retire(c, why);
+	}
+
+	// #2342 P2c: the hub is this frame's capture site (after the retire above:
+	// a frame that is composed natively keeps the native dispatch points).
+	if (c->hub.active && c->capture_intent.pending) {
+		if (c->hub.capture.pending) {
+			u_capture_intent_complete(&c->hub.capture, &c->mcp_capture, false);
+		}
+		c->hub.capture = c->capture_intent;
+		c->capture_intent.pending = false;
+	} else if (!c->hub.active && c->hub.capture.pending) {
+		// Handed to a hub that retired before weaving it: fail it, never strand it.
+		u_capture_intent_complete(&c->hub.capture, &c->mcp_capture, false);
 	}
 
 	// XR_DXR_depth_budget v2 (#1365): the rear-budget ROI is clamped to the
