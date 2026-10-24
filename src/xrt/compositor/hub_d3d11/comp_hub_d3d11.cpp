@@ -257,6 +257,7 @@ struct comp_hub_d3d11
 	bool warned_slot_open;
 	bool warned_atlas_open;
 	bool warned_ring_contract;
+	bool warned_typed_srgb; //!< #2345 review: split_refuse_typed_srgb
 	uint32_t wire_fmt, wire_w, wire_h;
 
 	/*!
@@ -611,15 +612,18 @@ split_make_dp(struct comp_hub_d3d11 *s)
  * receives: encoded"), and every 2D plane holds the encoded flatten, so the
  * hub must read them through the UNORM member of their family: an `_SRGB` view
  * would decode them (the DP would weave linear values — too dark), and a
- * TYPELESS format cannot back a view at all (the open would fail and DIRECT
- * would fall to xbridge, or the crop would silently fall back uncropped).
+ * TYPELESS format cannot be a view format at all.
  *
+ * A UNORM view can only be made of a typed UNORM texture or a TYPELESS one: a
+ * texture created TYPED `_SRGB` takes only `_SRGB` views. So the producer
+ * contract is "typed UNORM or TYPELESS", and a typed `_SRGB` producer surface is
+ * REFUSED by name (@ref split_refuse_typed_srgb) rather than viewed decoding.
  * Today every producer hands a typed UNORM texture (the D3D11 renderer atlas
  * R8G8B8A8_UNORM, the D3D12 deposit R8G8B8A8_UNORM, the VK deposit
- * B8G8R8A8_UNORM / R8G8B8A8_UNORM / the #2273 deep formats), so this maps each to
- * itself; it exists so the hub's view is the honest one by construction, not by
- * the producer's current choice. The D3D11 shim's planes are already the
- * #1795 TYPELESS scratch with an `_SRGB` RTV sibling, viewed UNORM here.
+ * B8G8R8A8_UNORM / R8G8B8A8_UNORM / the #2273 deep formats) and maps to itself;
+ * the D3D11 shim's planes are the #1795 TYPELESS scratch with an `_SRGB` RTV
+ * sibling, viewed UNORM here. The hub's OWN crop scratch is created TYPELESS
+ * (@ref split_typeless_format) so its UNORM view always exists.
  *
  * Mirrors d3d_dxgi_format_to_unorm_sample (aux_d3d), which this Vulkan-free
  * unit cannot include (that header pulls in the Vulkan headers).
@@ -640,6 +644,54 @@ split_nondecoding_format(DXGI_FORMAT f)
 	case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
 	default: return f;
 	}
+}
+
+//! #2345 review: the TYPELESS member of @p f's family (the hub's crop scratch),
+//! or @p f itself when it has none listed here.
+static DXGI_FORMAT
+split_typeless_format(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+	case DXGI_FORMAT_R10G10B10A2_UNORM: return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+	case DXGI_FORMAT_R8_TYPELESS:
+	case DXGI_FORMAT_R8_UNORM: return DXGI_FORMAT_R8_TYPELESS;
+	default: return f;
+	}
+}
+
+/*!
+ * #2345 review: a producer surface created TYPED `_SRGB` cannot take the
+ * non-decoding view (a typed texture's views must match its format), so it is
+ * refused by name — once per session — and the caller treats it as an open
+ * failure (DIRECT falls to xbridge; a plane degrades alone). Returns true when
+ * @p tex must be refused.
+ */
+static bool
+split_refuse_typed_srgb(struct comp_hub_d3d11 *s, ID3D11Texture2D *tex, const char *what)
+{
+	D3D11_TEXTURE2D_DESC d = {};
+	tex->GetDesc(&d);
+	if (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB && d.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+		return false;
+	}
+	if (!s->warned_typed_srgb) {
+		s->warned_typed_srgb = true;
+		U_LOG_W(
+		    "#2342 hub: the producer's %s is a TYPED _SRGB texture (format %d) — it cannot be viewed "
+		    "without decoding its encoded bytes (ADR-044), so the hub refuses it; producers hand typed "
+		    "UNORM or TYPELESS surfaces",
+		    what, (int)d.Format);
+	}
+	return true;
 }
 
 /*!
@@ -1936,6 +1988,9 @@ split_direct_bind_plane(struct comp_hub_d3d11 *s, uint32_t plane, void *handle, 
 	if (SUCCEEDED(s->out_dev->QueryInterface(__uuidof(ID3D11Device1), (void **)&od1)) && od1 != nullptr) {
 		hr = od1->OpenSharedResource1((HANDLE)handle, __uuidof(ID3D11Texture2D), (void **)&p.tex);
 		od1->Release();
+	}
+	if (SUCCEEDED(hr) && p.tex != nullptr && split_refuse_typed_srgb(s, p.tex, "2D plane")) {
+		hr = E_INVALIDARG;
 	}
 	if (SUCCEEDED(hr) && p.tex != nullptr) {
 		D3D11_TEXTURE2D_DESC td = {};
@@ -3259,7 +3314,9 @@ split_crop_for_dp(struct comp_hub_d3d11 *s, ID3D11ShaderResourceView *src_srv, u
 		desc.Height = content_h;
 		desc.MipLevels = 1;
 		desc.ArraySize = 1;
-		desc.Format = src_fmt;
+		// #2345 review: TYPELESS, so its non-decoding view exists whatever the
+		// source's typed member is (the copy below stays in the family).
+		desc.Format = split_typeless_format(src_fmt);
 		desc.SampleDesc.Count = 1;
 		desc.Usage = D3D11_USAGE_DEFAULT;
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -3535,6 +3592,9 @@ split_direct_open_slot(struct comp_hub_d3d11 *s, uint32_t idx, const struct comp
 		od1->Release();
 	}
 	D3D11_TEXTURE2D_DESC td = {};
+	if (SUCCEEDED(hr) && e.tex != nullptr && split_refuse_typed_srgb(s, e.tex, "ring slot")) {
+		hr = E_INVALIDARG;
+	}
 	if (SUCCEEDED(hr) && e.tex != nullptr) {
 		e.tex->GetDesc(&td);
 		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
@@ -3680,6 +3740,12 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 				U_LOG_W("#2317 hub: the producer atlas would not open on the hub device (hr=0x%08lx)",
 				        (unsigned long)hr);
 			}
+			return;
+		}
+		if (split_refuse_typed_srgb(s, d.tex, "atlas")) {
+			d.tex->Release();
+			d.tex = nullptr;
+			d.have_frame = false;
 			return;
 		}
 		D3D11_TEXTURE2D_DESC td = {};
