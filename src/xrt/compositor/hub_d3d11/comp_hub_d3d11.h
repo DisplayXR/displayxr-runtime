@@ -229,6 +229,20 @@ struct comp_hub_d3d11_info
 	 * because nothing would order its slot rewrites after the hub's reads.
 	 */
 	bool ring_direct;
+
+	/*!
+	 * #2317 P2c: a RING producer whose 2D PLANES (Local2D over-flatten,
+	 * 2D-under backdrop, authored mask) may ride the DIRECT ingress. It
+	 * promises the plane twin of the atlas contract: it writes its
+	 * single-buffered plane surfaces on the queue that signals the deposit
+	 * fence, BEFORE the signal the handoff's `fence_value` names (so the
+	 * hub's producer wait covers them), and it GPU-waits for
+	 * @ref comp_hub_d3d11_get_plane_release_value on the consumer fence before
+	 * any submit that rewrites a plane (so a rewrite never overlaps a weave or
+	 * repaint still sampling it). Without it, a ring session moves to xbridge
+	 * on its first plane frame (`reason=plane_content`), as before P2c.
+	 */
+	bool ring_direct_planes;
 };
 
 /*!
@@ -828,7 +842,8 @@ comp_hub_d3d11_get_background_preview(struct comp_hub_d3d11 *split, struct xrt_d
  * handoff's fence after the passes that write the atlas, and flush; a ring
  * producer skips its deposit's note_consumed calls and takes the owed releases
  * from @ref comp_hub_d3d11_take_slot_release instead. Can turn false mid-session
- * (a ring producer's first 2D-plane frame), never back.
+ * (a ring-contract or slot-open failure, or the first 2D-plane frame of a ring
+ * producer without comp_hub_d3d11_info::ring_direct_planes), never back.
  */
 bool
 comp_hub_d3d11_is_direct(struct comp_hub_d3d11 *split);
@@ -903,12 +918,30 @@ comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split);
  *   construction: the producer only re-enters a slot after the hub has moved
  *   off it.
  *
- * **Planes.** DIRECT carries projection only. The first frame that stages real
- * 2D-plane content (Local2D, 2D-under backdrop, an authored mask) moves the
- * session to the xbridge ingress for good (`hub placement: CHANGED ...
- * ingress=xbridge reason=plane_content`) BEFORE that frame is submitted, so no
- * frame ever loses its planes. If the bridge cannot be wired then, the session
- * stays DIRECT and the planes degrade alone (the existing feature-local rule).
+ * **Planes (#2317 P2c).** A producer that declares
+ * @ref comp_hub_d3d11_info::ring_direct_planes keeps its planes on DIRECT: the
+ * hub opens each plane surface on its own device (as it does the stable atlas's)
+ * and reads it in place, and the frame's recipe is snapshotted beside the slot it
+ * nominates (a DIRECT weave only ever weaves the newest nominated frame, so one
+ * snapshot is the whole ring's). The planes are single-buffered, so their two
+ * edges are:
+ * - **write -> read:** the producer writes them before the deposit signal the
+ *   handoff names; the weave's producer wait already covers them.
+ * - **read -> rewrite:** EVERY weave and repaint samples them, not just the one
+ *   that moved onto a slot, so the producer GPU-waits for the consumer fence's
+ *   LATEST value (@ref comp_hub_d3d11_get_plane_release_value) before a submit
+ *   that rewrites a plane. The caller holds the compositor mutex from that wait
+ *   through @ref comp_hub_d3d11_submit_atlas, so no repaint is recorded between
+ *   the two.
+ * - **keyed-mutex deposits** have no fence to wait on: their planes keep the
+ *   deposit's documented TIMING-ONLY contract (#1274 — the flatten's own CPU
+ *   wait covers write -> read; the on-change cadence separates the rewrite),
+ *   exactly as they had on xbridge.
+ *
+ * A producer that does NOT declare it keeps the P2a rule: the first frame that
+ * stages real 2D-plane content moves the session to the xbridge ingress for good
+ * (`hub placement: CHANGED ... ingress=xbridge reason=plane_content`) BEFORE that
+ * frame is submitted, so no frame ever loses its planes.
  * @{
  */
 
@@ -938,6 +971,19 @@ comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split);
  */
 void *
 comp_hub_d3d11_get_consumer_fence_handle(struct comp_hub_d3d11 *split);
+
+/*!
+ * #2317 P2c: the consumer-fence value a ring producer's next PLANE rewrite must
+ * GPU-wait for (on the fence it opened from
+ * @ref comp_hub_d3d11_get_consumer_fence_handle): the value the hub's latest
+ * weave or repaint signalled after its reads, so every read of the
+ * single-buffered plane surfaces recorded so far. 0 = nothing to wait for (no
+ * DIRECT fence-mode ring session, or no weave yet). Stays valid after a move to
+ * xbridge, so the first bridged plane write still waits out the DIRECT era's
+ * last reads.
+ */
+uint64_t
+comp_hub_d3d11_get_plane_release_value(struct comp_hub_d3d11 *split);
 
 /*!
  * Pop one owed slot release: the hub will never read @p out_slot again until

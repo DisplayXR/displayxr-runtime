@@ -130,6 +130,8 @@ struct comp_hub_d3d11
 	bool stable_atlas;
 	//! #2317 P2a: @ref comp_hub_d3d11_info::ring_direct.
 	bool ring_direct;
+	//! #2317 P2c: @ref comp_hub_d3d11_info::ring_direct_planes.
+	bool ring_direct_planes;
 	//! #2317 P1c: @ref comp_hub_d3d11_set_predicted_display_time.
 	uint64_t predicted_display_time_ns;
 
@@ -1297,6 +1299,8 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 static void
 split_direct_to_xbridge(struct comp_hub_d3d11 *s, const char *reason);
 static void
+split_direct_demote_for_planes(struct comp_hub_d3d11 *s);
+static void
 split_direct_ring_vet(struct comp_hub_d3d11 *s,
                       const struct comp_hub_d3d11_handoff *handoff,
                       uint32_t content_w,
@@ -1420,6 +1424,7 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
 	s->same_adapter = gate.same_adapter;
 	s->stable_atlas = info->stable_atlas;
 	s->ring_direct = info->ring_direct;
+	s->ring_direct_planes = info->ring_direct_planes;
 	s->direct.cur = -1;
 	wcsncpy_s(s->out_desc, sdesc.Description, _TRUNCATE);
 
@@ -2065,10 +2070,10 @@ comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *s,
                               uint32_t bd_w,
                               uint32_t bd_h)
 {
-	// #2317 P2a: real backdrop content on a RING producer needs the xbridge
-	// ingress (P2b carries planes on DIRECT for the stable atlas only).
+	// #2317 P2a: real backdrop content on a RING producer that did not declare
+	// the plane contract needs the xbridge ingress (P2c: one that did keeps it).
 	if (s != nullptr && nt_handle != nullptr && content_seq != 0 && bd_w != 0 && bd_h != 0) {
-		split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_PLANES);
+		split_direct_demote_for_planes(s);
 	}
 	if (s == nullptr || !split_has_plane_transport(s)) {
 		return false;
@@ -2348,10 +2353,10 @@ comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *s,
                              bool opaque_present,
                              bool mask_is_plane)
 {
-	// #2317 P2a: a real Local2D composite on a RING producer needs the xbridge
-	// ingress (P2b carries planes on DIRECT for the stable atlas only).
+	// #2317 P2a: a real Local2D composite on a RING producer that did not
+	// declare the plane contract needs the xbridge ingress (P2c).
 	if (s != nullptr && nt_handle != nullptr && content_seq != 0 && region_w != 0 && region_h != 0) {
-		split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_PLANES);
+		split_direct_demote_for_planes(s);
 	}
 	if (s == nullptr || !split_has_plane_transport(s)) {
 		return false;
@@ -2411,10 +2416,10 @@ comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *s,
 extern "C" bool
 comp_hub_d3d11_bind_mask_plane(struct comp_hub_d3d11 *s, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h)
 {
-	// #2317 P2a: an authored mask plane on a RING producer needs the xbridge
-	// ingress (P2b carries planes on DIRECT for the stable atlas only).
+	// #2317 P2a: an authored mask plane on a RING producer that did not
+	// declare the plane contract needs the xbridge ingress (P2c).
 	if (s != nullptr && nt_handle != nullptr && w != 0 && h != 0) {
-		split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_PLANES);
+		split_direct_demote_for_planes(s);
 	}
 	if (s == nullptr || !split_has_plane_transport(s)) {
 		return true; // nothing to bind against, and nothing broken
@@ -3340,6 +3345,28 @@ split_direct_open_slot(struct comp_hub_d3d11 *s, uint32_t idx, const struct comp
 }
 
 /*!
+ * #2317 P2b/P2c: snapshot @p rec beside the frame being nominated, with the
+ * planes this frame staged marked valid — the DIRECT twin of the bridge's
+ * per-slot plane stamp. A plane is valid when the frame staged content for it
+ * (seq != 0) AND its surface is open here; otherwise every consumer fails
+ * closed, as on a slot. One snapshot serves a ring too: a DIRECT weave (and its
+ * repaints) only ever reads the NEWEST nominated frame.
+ */
+static void
+split_direct_stamp_recipe(struct comp_hub_d3d11 *s, const struct comp_xbridge_recipe *rec)
+{
+	auto &d = s->direct;
+	d.rec = *rec;
+	d.rec.plane_valid = 0;
+	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
+		if (d.planes[p].seq != 0 && d.planes[p].srv != nullptr) {
+			d.rec.plane_valid |= 1u << p;
+			d.rec.plane_seq[p] = d.planes[p].seq;
+		}
+	}
+}
+
+/*!
  * Nominate this frame's atlas: re-open it when its generation moved, and record
  * the fence value the weave waits for. Nothing here waits or copies.
  */
@@ -3382,6 +3409,9 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 		d.content_w = content_w;
 		d.content_h = content_h;
 		d.gen = s->layout_gen;
+		// #2317 P2c: the ring frame's planes ride beside it (the producer
+		// wrote them before the signal prod_value names).
+		split_direct_stamp_recipe(s, rec);
 		d.have_frame = true;
 		d.frames++;
 		d.frame_seq = ++s->seq;
@@ -3456,14 +3486,7 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 	 * when the frame staged content for it (seq != 0) AND its surface is open
 	 * here; otherwise every consumer fails closed, as on a slot.
 	 */
-	d.rec = *rec;
-	d.rec.plane_valid = 0;
-	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
-		if (d.planes[p].seq != 0 && d.planes[p].srv != nullptr) {
-			d.rec.plane_valid |= 1u << p;
-			d.rec.plane_seq[p] = d.planes[p].seq;
-		}
-	}
+	split_direct_stamp_recipe(s, rec);
 	d.have_frame = true;
 	d.frames++;
 	d.frame_seq = ++s->seq;
@@ -3782,6 +3805,21 @@ split_direct_to_xbridge(struct comp_hub_d3d11 *s, const char *reason)
 	    "content, which the DIRECT ingress does not transport; the comp_xbridge ingress takes over for the "
 	    "rest of the session (wired in %.1f ms) (#2317 P2a)",
 	    reason, (double)(os_monotonic_get_ns() - t0) / 1.0e6);
+}
+
+/*!
+ * #2317 P2c: a ring frame staged real 2D-plane content. A producer that declared
+ * @ref comp_hub_d3d11_info::ring_direct_planes keeps DIRECT (its planes are read
+ * in place); any other moves to xbridge (P2a's `plane_content`). The stable
+ * atlas never moves (split_direct_to_xbridge is ring-only).
+ */
+static void
+split_direct_demote_for_planes(struct comp_hub_d3d11 *s)
+{
+	if (s->ring_direct_planes) {
+		return;
+	}
+	split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_PLANES);
 }
 
 extern "C" bool
@@ -4139,6 +4177,17 @@ comp_hub_d3d11_get_consumer_fence_handle(struct comp_hub_d3d11 *s)
 		return nullptr;
 	}
 	return (void *)s->direct.cons_handle;
+}
+
+extern "C" uint64_t
+comp_hub_d3d11_get_plane_release_value(struct comp_hub_d3d11 *s)
+{
+	// Fence-mode ring sessions only; survives a move to xbridge (the fence and
+	// its last value outlive the DIRECT era, see split_direct_to_xbridge).
+	if (s == nullptr || !s->direct.ring || s->direct.km || s->direct.cons_fence == nullptr) {
+		return 0;
+	}
+	return s->direct.cons_value;
 }
 
 extern "C" bool
@@ -4809,6 +4858,13 @@ comp_hub_d3d11_get_consumer_fence_handle(struct comp_hub_d3d11 *split)
 {
 	(void)split;
 	return NULL;
+}
+
+extern "C" uint64_t
+comp_hub_d3d11_get_plane_release_value(struct comp_hub_d3d11 *split)
+{
+	(void)split;
+	return 0;
 }
 
 extern "C" bool

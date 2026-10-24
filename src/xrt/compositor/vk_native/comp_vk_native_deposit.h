@@ -299,6 +299,16 @@ comp_vk_deposit_note_hub_release(struct comp_vk_deposit *dep, uint32_t slot, uin
  */
 void
 comp_vk_deposit_current_slot_hub_wait(struct comp_vk_deposit *dep, VkSemaphore *out_semaphore, uint64_t *out_value);
+
+/*!
+ * #2317 P2c: the hub's consumer fence as imported by
+ * @ref comp_vk_deposit_bind_consumer_fence (a timeline semaphore), or
+ * `VK_NULL_HANDLE` when none is bound (keyed-mutex mode, or not DIRECT). The
+ * plane pass waits on it for comp_hub_d3d11_get_plane_release_value before it
+ * rewrites a plane the hub reads in place.
+ */
+VkSemaphore
+comp_vk_deposit_get_hub_timeline(struct comp_vk_deposit *dep);
 /*! @} */
 
 /*!

@@ -389,6 +389,9 @@ struct comp_d3d12_compositor
 		//! Change-detection for the authored-mask staged->plane copy
 		//! ((res_gen << 48) | author_seq — either half moving re-copies).
 		uint64_t mask_copied_key;
+		//! #2317 P2c: this app frame recorded a rewrite of a deposit plane
+		//! (on DIRECT its execute then waits out the hub's last plane read).
+		bool plane_written;
 	} reroute;
 
 	//! Output target (DXGI swapchain).
@@ -1852,6 +1855,10 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	si.app_timeline_semaphores = true;
 	// #2317 P2a: this caller honours the DIRECT release contract (frame exit).
 	si.ring_direct = true;
+	// #2317 P2c: ...and its plane twin: the plane copies ride the app list
+	// that signals the deposit fence, and a list that rewrites a plane waits
+	// out the hub's last plane read (comp_d3d12_deposit_plane_wait_hub).
+	si.ring_direct_planes = true;
 	si.render_packed_luid =
 	    ((uint64_t)(uint32_t)app_luid.HighPart << 32) | (uint64_t)(uint32_t)app_luid.LowPart;
 	si.display_screen_left = display_screen_left;
@@ -1943,6 +1950,7 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 static void
 d3d12_reroute_copy_to_plane(struct comp_d3d12_compositor *c, ID3D12Resource *scratch, ID3D12Resource *plane)
 {
+	c->reroute.plane_written = true; // #2317 P2c
 	D3D12_RESOURCE_BARRIER pre[2] = {};
 	pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	pre[0].Transition.pResource = scratch;
@@ -6044,6 +6052,17 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// plane the arm's producer is still reading. GPU-side, usually
 		// already satisfied.
 		comp_d3d12_deposit_plane_wait(c->reroute.dep, c->command_queue);
+		/*
+		 * #2317 P2c: on DIRECT the hub reads the planes IN PLACE on every
+		 * weave and repaint, so a list that rewrites one waits out the hub's
+		 * latest read on its consumer fence. GPU-side; c->mutex is held from
+		 * here through the handoff, so no repaint is recorded in between.
+		 */
+		if (c->reroute.plane_written) {
+			comp_d3d12_deposit_plane_wait_hub(c->reroute.dep, c->command_queue,
+			                                  comp_hub_d3d11_get_plane_release_value(c->reroute.split));
+		}
+		c->reroute.plane_written = false;
 
 		c->cmd_list->Close();
 		ID3D12CommandList *rr_lists[] = {c->cmd_list};
@@ -8180,6 +8199,7 @@ d3d12_stage_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_m
 				post[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
 				c->cmd_list->ResourceBarrier(2, post);
 				c->reroute.mask_copied_key = key;
+				c->reroute.plane_written = true; // #2317 P2c
 			}
 			comp_hub_d3d11_stage_mask_plane(c->reroute.split, key, mask->w, mask->h);
 		} else {
