@@ -135,6 +135,12 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 			comp_vk_native_window_xcb.h)
 		target_include_directories(comp_vk_native PRIVATE ${XCB_INCLUDE_DIRS})
 		target_link_libraries(comp_vk_native PRIVATE ${XCB_LIBRARIES})
+		if(XCB_SHAPE_FOUND)
+			# Empty input region for the adopt-own-window child (#2322).
+			target_compile_definitions(comp_vk_native PRIVATE XRT_HAVE_XCB_SHAPE=1)
+			target_include_directories(comp_vk_native PRIVATE ${XCB_SHAPE_INCLUDE_DIRS})
+			target_link_libraries(comp_vk_native PRIVATE ${XCB_SHAPE_LIBRARIES})
+		endif()
 
 		# #902 present-feedback feeder: the desktop-Linux source for the vblank
 		# grid late weave aims at (X11 Present CompleteNotify, encoded in-tree —
