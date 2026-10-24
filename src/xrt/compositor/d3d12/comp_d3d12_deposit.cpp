@@ -31,6 +31,9 @@ struct comp_d3d12_deposit_slot
 	//! The fence value the consumer's release signal reaches once its copy of
 	//! this slot is ordered. 0 while no consumer has taken it.
 	uint64_t release_value;
+	//! #2317 P2a: the hub's consumer-fence value covering its DIRECT reads of
+	//! this slot. 0 while nothing is owed.
+	uint64_t hub_release;
 };
 
 struct comp_d3d12_deposit_plane_slot
@@ -59,6 +62,12 @@ struct comp_d3d12_deposit
 	//! #1264 plane transport — single-buffered, panel-sized once.
 	struct comp_d3d12_deposit_plane_slot plane[COMP_D3D12_DEPOSIT_PLANE_COUNT];
 	uint64_t plane_release_value;
+
+	//! #2317 P2a: the hub's consumer fence, opened on the app device (NULL
+	//! unless the hub reads this deposit DIRECT).
+	ID3D12Fence *hub_fence12;
+	//! #2317 P2a: bumped on every ring (re)allocation — the hub's re-open key.
+	uint64_t ring_generation;
 
 	//! Shared D3D11 fence; the SAME object opened on the app device as fence12.
 	ID3D11Fence *fence11;
@@ -95,6 +104,7 @@ deposit_free_ring(struct comp_d3d12_deposit *dep)
 			s->tex = NULL;
 		}
 		s->release_value = 0;
+		s->hub_release = 0;
 	}
 }
 
@@ -108,6 +118,7 @@ deposit_free_ring(struct comp_d3d12_deposit *dep)
 static bool
 deposit_alloc_ring(struct comp_d3d12_deposit *dep)
 {
+	dep->ring_generation++;
 	for (uint32_t i = 0; i < COMP_D3D12_DEPOSIT_RING; i++) {
 		struct comp_d3d12_deposit_slot *s = &dep->ring[i];
 
@@ -285,6 +296,10 @@ comp_d3d12_deposit_destroy(struct comp_d3d12_deposit **deposit_ptr)
 		deposit_free_plane(dep, p);
 	}
 
+	if (dep->hub_fence12 != NULL) {
+		dep->hub_fence12->Release();
+		dep->hub_fence12 = NULL;
+	}
 	if (dep->fence12 != NULL) {
 		dep->fence12->Release();
 		dep->fence12 = NULL;
@@ -360,6 +375,11 @@ comp_d3d12_deposit_advance(struct comp_d3d12_deposit *dep, void *app_queue)
 		// frames it is already satisfied — the common case at D>=2.
 		((ID3D12CommandQueue *)app_queue)->Wait(dep->fence12, s->release_value);
 	}
+	// #2317 P2a: the same back-pressure for the hub's DIRECT reads, on its own
+	// consumer fence. GPU-side; free once satisfied.
+	if (s->hub_release != 0 && app_queue != NULL && dep->hub_fence12 != NULL) {
+		((ID3D12CommandQueue *)app_queue)->Wait(dep->hub_fence12, s->hub_release);
+	}
 }
 
 extern "C" void *
@@ -414,7 +434,44 @@ comp_d3d12_deposit_get_handoff(struct comp_d3d12_deposit *dep, struct comp_hub_d
 	out->height = dep->height;
 	out->slot = dep->slot;
 	out->dxgi_format = (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM;
+	out->generation = dep->ring_generation;
 	return true;
+}
+
+extern "C" bool
+comp_d3d12_deposit_bind_consumer_fence(struct comp_d3d12_deposit *dep, void *nt_handle)
+{
+	if (dep == NULL) {
+		return false;
+	}
+	if (dep->hub_fence12 != NULL) {
+		dep->hub_fence12->Release();
+		dep->hub_fence12 = NULL;
+	}
+	for (uint32_t i = 0; i < COMP_D3D12_DEPOSIT_RING; i++) {
+		dep->ring[i].hub_release = 0;
+	}
+	if (nt_handle == NULL) {
+		return true;
+	}
+	const HRESULT hr =
+	    dep->app_dev->OpenSharedHandle((HANDLE)nt_handle, __uuidof(ID3D12Fence), (void **)&dep->hub_fence12);
+	if (FAILED(hr) || dep->hub_fence12 == NULL) {
+		dep->hub_fence12 = NULL;
+		U_LOG_W("d3d12 deposit: the hub's consumer fence would not open on the app device (0x%08lx)",
+		        (unsigned long)hr);
+		return false;
+	}
+	return true;
+}
+
+extern "C" void
+comp_d3d12_deposit_note_hub_release(struct comp_d3d12_deposit *dep, uint32_t slot, uint64_t value)
+{
+	if (dep == NULL || slot >= COMP_D3D12_DEPOSIT_RING || dep->hub_fence12 == NULL) {
+		return;
+	}
+	dep->ring[slot].hub_release = value;
 }
 
 extern "C" void

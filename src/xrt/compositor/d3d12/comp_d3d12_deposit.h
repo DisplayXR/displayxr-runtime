@@ -138,6 +138,36 @@ void
 comp_d3d12_deposit_note_consumed(struct comp_d3d12_deposit *dep, uint32_t slot);
 
 /*!
+ * @name #2317 P2a: the hub's DIRECT ingress (same adapter)
+ *
+ * The hub then opens each ring slot on its OWN device and weaves it in place —
+ * no staging copy, no @ref comp_d3d12_deposit_note_consumed. Its reads are
+ * released on a SEPARATE fence the hub owns (comp_hub_d3d11's consumer fence),
+ * so this deposit's fence keeps exactly one signaller (the app queue) and can
+ * never step backwards. Ordering stays GPU-side both ways (ADR-055).
+ * @{
+ */
+
+/*!
+ * Open the hub's consumer fence (`HANDLE`, from
+ * comp_hub_d3d11_get_consumer_fence_handle) on the app's D3D12 device. NULL
+ * unbinds (and forgets every owed release). False when the open failed — the
+ * caller must then keep the hub off DIRECT ingress, since nothing else would
+ * order a slot rewrite after the hub's read.
+ */
+bool
+comp_d3d12_deposit_bind_consumer_fence(struct comp_d3d12_deposit *dep, void *nt_handle);
+
+/*!
+ * The hub has moved off @p slot (comp_hub_d3d11_take_slot_release): its reads
+ * complete when the consumer fence reaches @p value. The app queue's next
+ * write into the slot waits for it in @ref comp_d3d12_deposit_advance.
+ */
+void
+comp_d3d12_deposit_note_hub_release(struct comp_d3d12_deposit *dep, uint32_t slot, uint64_t value);
+/*! @} */
+
+/*!
  * @name The PLANE surfaces (#1264 reroute plane transport)
  *
  * The VK deposit's VK-1b, D3D12 flavour: single-buffered NT-shared D3D11
