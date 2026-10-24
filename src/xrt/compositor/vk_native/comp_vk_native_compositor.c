@@ -1504,6 +1504,13 @@ struct comp_vk_native_compositor
 	//! at the projection-done boundary (PROJECTION_ONLY) or end of
 	//! frame (POST_COMPOSE).
 	struct u_capture_intent capture_intent;
+	/*!
+	 * #2342 P2c: on a hub route the HUB is the one capture site. A pending
+	 * capture intent is moved here at the top of the frame (so this tier's
+	 * own projection / post dispatch points stay idle), handed to the hub
+	 * before the app-frame weave, and completed after it.
+	 */
+	struct u_capture_intent hub_capture;
 
 	//! Composite-tap diagnostics (#833 debugging): the Local2D composite
 	//! stashes this frame's target + scratch state here so the
@@ -11360,6 +11367,19 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// frame; consumed at the projection-done boundary or end of frame
 	// depending on requested mode. See u_capture_intent.h.
 	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
+#ifdef XRT_OS_WINDOWS
+	// #2342 P2c: under the split the hub is the one capture site.
+	if (c->split != NULL && c->capture_intent.pending) {
+		if (c->hub_capture.pending) {
+			u_capture_intent_complete(&c->hub_capture, &c->mcp_capture, false);
+		}
+		c->hub_capture = c->capture_intent;
+		c->capture_intent.pending = false;
+	} else if (c->split == NULL && c->hub_capture.pending) {
+		// Handed to a split that retired before weaving it: fail it, never strand it.
+		u_capture_intent_complete(&c->hub_capture, &c->mcp_capture, false);
+	}
+#endif
 
 	// Composite-tap state is per-frame: only valid when this frame's
 	// Local2D composite runs and re-stashes it.
@@ -12205,7 +12225,18 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		comp_hub_d3d11_set_predicted_display_time(c->split, c->layer_accum.data.display_time_ns > 0
 		                                                        ? (uint64_t)c->layer_accum.data.display_time_ns
 		                                                        : c->last_display_time_ns);
+		// #2342 P2c: the hub's one capture site (DP input + post-weave back buffer).
+		if (c->hub_capture.pending) {
+			comp_hub_d3d11_capture_arm(c->split, c->hub_capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
+			                           c->hub_capture.path);
+		}
 		const bool wove = comp_hub_d3d11_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
+		{
+			bool cap_ok = false;
+			if (comp_hub_d3d11_capture_take(c->split, &cap_ok) && c->hub_capture.pending) {
+				u_capture_intent_complete(&c->hub_capture, &c->mcp_capture, cap_ok);
+			}
+		}
 
 		/*
 		 * XR_DXR_depth_budget — the split arm's tick. The preview comes from

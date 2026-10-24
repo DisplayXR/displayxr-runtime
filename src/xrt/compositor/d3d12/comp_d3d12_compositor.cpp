@@ -392,6 +392,13 @@ struct comp_d3d12_compositor
 		//! #2317 P2c: this app frame recorded a rewrite of a deposit plane
 		//! (on DIRECT its execute then waits out the hub's last plane read).
 		bool plane_written;
+		/*!
+		 * #2342 P2c: on a hub route the HUB is the one capture site. A pending
+		 * capture intent is moved here at the top of the frame (so this tier's
+		 * own projection / post dispatch points stay idle), handed to the hub
+		 * before the app-frame weave, and completed after it.
+		 */
+		struct u_capture_intent capture;
 	} reroute;
 
 	//! Output target (DXGI swapchain).
@@ -5367,6 +5374,18 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// projection-done boundary (PROJECTION_ONLY, once renderer split
 	// lands) or end of frame (POST_COMPOSE).
 	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	// #2342 P2c: under the reroute the hub is the one capture site.
+	if (c->reroute.active && c->capture_intent.pending) {
+		if (c->reroute.capture.pending) {
+			u_capture_intent_complete(&c->reroute.capture, &c->mcp_capture, false);
+		}
+		c->reroute.capture = c->capture_intent;
+		c->capture_intent.pending = false;
+	} else if (!c->reroute.active && c->reroute.capture.pending) {
+		u_capture_intent_complete(&c->reroute.capture, &c->mcp_capture, false);
+	}
+#endif
 
 	// XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B). ZERO COST UNLESS
 	// REQUESTED: one field test, false for every session that never chained
@@ -6137,8 +6156,20 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		                                          c->layer_accum.data.display_time_ns > 0
 		                                              ? (uint64_t)c->layer_accum.data.display_time_ns
 		                                              : c->last_display_time_ns);
+		// #2342 P2c: the hub's one capture site (DP input + post-weave back buffer).
+		if (c->reroute.capture.pending) {
+			comp_hub_d3d11_capture_arm(c->reroute.split,
+			                           c->reroute.capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
+			                           c->reroute.capture.path);
+		}
 		const bool rr_wove =
 		    comp_hub_d3d11_weave_and_present(c->reroute.split, /*is_repaint=*/false, &rr_canvas);
+		{
+			bool cap_ok = false;
+			if (comp_hub_d3d11_capture_take(c->reroute.split, &cap_ok) && c->reroute.capture.pending) {
+				u_capture_intent_complete(&c->reroute.capture, &c->mcp_capture, cap_ok);
+			}
+		}
 
 		// #868: arm the repaint replay exactly as the VK tier does — a frame
 		// that wove nothing keeps the panel's last woven frame and stays

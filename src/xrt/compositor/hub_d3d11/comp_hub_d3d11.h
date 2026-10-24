@@ -1095,6 +1095,52 @@ comp_hub_d3d11_set_post_weave_hook(struct comp_hub_d3d11 *split, comp_hub_d3d11_
 /*! @} */
 
 /*!
+ * @name #2342 P2c: the ONE capture site for every hub route
+ *
+ * The shared atlas trigger (u_capture_intent: `%TEMP%\displayxr_atlas_trigger`,
+ * its `.projection` and per-exe variants, and MCP `capture_frame`) is polled
+ * by the tier as before, and on a hub route the tier hands the pending intent
+ * to the hub instead of servicing it at its own dispatch points (which, on the
+ * D3D12 reroute and the VK split, read a deposit ring slot the producer may
+ * already have rewritten, or never ran at all). The hub writes, on the next APP
+ * frame it weaves, with the service twin's names (#2207 / #2289):
+ *
+ * - **the DP input** — the content-cropped atlas handed to process_atlas
+ *   (ADR-030), pre-weave — to @p path: `displayxr_atlas[.<exe>].png`, or
+ *   `displayxr_atlas[.<exe>].projection.png` for a projection-only trigger;
+ * - **the post-weave back buffer** (weave + masked composite + HUD, what is
+ *   presented) to the sibling `displayxr_atlas[.<exe>].woven.png` — full
+ *   triggers only. A projection-only trigger writes the DP input alone.
+ *
+ * On a hub route window-space layers are composited into the atlas by the
+ * producer before the handoff, so the DP input carries them for both trigger
+ * kinds — the hub has no projection-only boundary of its own (as the twin).
+ * Alpha is forced opaque unless `DXR_ATLAS_CAPTURE_RAW_ALPHA=1`. One WARN per
+ * completed capture names both files. A readback (one staging copy + a Map) runs
+ * only on the frame that captures.
+ * @{
+ */
+
+/*!
+ * Arm a capture for the next APP-frame weave (never a repaint). @p path is the
+ * intent's output path; the woven sibling is derived from it. A second arm
+ * before the first was taken replaces it.
+ */
+void
+comp_hub_d3d11_capture_arm(struct comp_hub_d3d11 *split, bool projection_only, const char *path);
+
+/*!
+ * After the app-frame weave: true when a capture was armed (it is now
+ * disarmed, whatever happened), with @p out_ok whether its DP input was
+ * written. A frame that wove nothing (#918 F4) consumes the arm with
+ * @p out_ok false, so the tier can complete its intent (and an MCP waiter)
+ * rather than leave it pending.
+ */
+bool
+comp_hub_d3d11_capture_take(struct comp_hub_d3d11 *split, bool *out_ok);
+/*! @} */
+
+/*!
  * @name Multi-screen M6 under the split (ADR-047 Amendment 1, Vulkan)
  *
  * Under the split the weave is the D3D11 one on the scanout adapter, so a
