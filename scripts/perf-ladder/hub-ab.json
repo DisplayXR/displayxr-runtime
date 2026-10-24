@@ -135,20 +135,20 @@
           "topologies": [
             "same-adapter"
           ],
-          "expectLine": "hub placement: hub=1 .*ingress=direct",
-          "note": "P2a default: the #1264 reroute reads the deposit ring DIRECT on one adapter (0 transport copies)."
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge ingress_reason=default_xbridge",
+          "note": "Default: xbridge on every route until the single-GPU desktop gate (#2317)."
         },
         {
-          "name": "hub-xbridge",
+          "name": "hub-direct",
           "env": {
-            "DXR_HUB_INGRESS": "xbridge"
+            "DXR_HUB_INGRESS": "direct"
           },
           "expectPath": "hub",
           "topologies": [
             "same-adapter"
           ],
-          "expectLine": "hub placement: hub=1 .*ingress=xbridge ingress_reason=forced_by_env",
-          "note": "A/B control: the pre-P2a staged xbridge ingress (3 transport copies)."
+          "expectLine": "hub placement: hub=1 .*ingress=direct",
+          "note": "P2a opt-in: DIRECT ingress, 0 transport copies."
         },
         {
           "name": "own-split",
@@ -199,20 +199,20 @@
           "topologies": [
             "same-adapter"
           ],
-          "expectLine": "hub placement: hub=1 .*ingress=direct",
-          "note": "P2a default: DIRECT on one adapter (keyed-mutex mode on drivers without D3D12_FENCE import)."
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge ingress_reason=default_xbridge",
+          "note": "Default: xbridge on every route until the single-GPU desktop gate (#2317)."
         },
         {
-          "name": "hub-xbridge",
+          "name": "hub-direct",
           "env": {
-            "DXR_HUB_INGRESS": "xbridge"
+            "DXR_HUB_INGRESS": "direct"
           },
           "expectPath": "hub",
           "topologies": [
             "same-adapter"
           ],
-          "expectLine": "hub placement: hub=1 .*ingress=xbridge ingress_reason=forced_by_env",
-          "note": "A/B control: the pre-P2a staged xbridge ingress."
+          "expectLine": "hub placement: hub=1 .*ingress=direct",
+          "note": "P2a opt-in: DIRECT ingress, 0 transport copies."
         }
       ]
     },

@@ -1283,6 +1283,8 @@ comp_hub_d3d11_get_segment_metrics(struct comp_hub_d3d11 *s, struct xrt_segment_
 static bool
 split_direct_forced_off(void);
 static bool
+split_direct_forced_on(void);
+static bool
 split_wire_direct(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11_handoff *handoff);
 static void
 split_submit_direct(struct comp_hub_d3d11 *s,
@@ -1710,6 +1712,15 @@ comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11
 		s->ingress_reason = COMP_HUB_INGRESS_REASON_FORCED;
 	} else if (!s->stable_atlas && !s->ring_direct) {
 		s->ingress_reason = COMP_HUB_INGRESS_REASON_PRODUCER;
+	} else if (!s->stable_atlas && !split_direct_forced_on()) {
+		/*
+		 * #2317: DIRECT is OPT-IN for the ring producers (the D3D12 reroute,
+		 * the VK split) until a single-dGPU desktop has run VK fence-mode
+		 * DIRECT and Unreal; the default flip is a one-line follow-up here.
+		 * The D3D11 shim's stable atlas keeps DIRECT: DXR_HUB=1 is itself the
+		 * opt-in, and that path is measured.
+		 */
+		s->ingress_reason = COMP_HUB_INGRESS_REASON_DEFAULT_XBRIDGE;
 	} else if (split_wire_direct(s, handoff)) {
 		s->ingress_reason = nullptr;
 		U_LOG_W("D3D11 hub: stage A2 (direct) took %.1f ms", (double)(os_monotonic_get_ns() - t0) / 1.0e6);
@@ -3154,17 +3165,34 @@ split_check_target_follows_window(struct comp_hub_d3d11 *s, uint32_t tgt_w, uint
  *
  */
 
+//! `DXR_HUB_INGRESS`: 0 unset (the per-producer default), 1 `xbridge`, 2 `direct`.
+static int
+split_ingress_env(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		const char *e = getenv("DXR_HUB_INGRESS");
+		v = (e != nullptr && strcmp(e, "xbridge") == 0)  ? 1
+		    : (e != nullptr && strcmp(e, "direct") == 0) ? 2
+		                                                 : 0;
+	}
+	return v;
+}
+
 //! DXR_HUB_INGRESS=xbridge: keep the comp_xbridge route even when DIRECT is
 //! possible — the A/B control for the transport's cost.
 static bool
 split_direct_forced_off(void)
 {
-	static int off = -1;
-	if (off < 0) {
-		const char *e = getenv("DXR_HUB_INGRESS");
-		off = (e != nullptr && strcmp(e, "xbridge") == 0) ? 1 : 0;
-	}
-	return off == 1;
+	return split_ingress_env() == 1;
+}
+
+//! DXR_HUB_INGRESS=direct: the opt-in a RING producer needs for DIRECT ingress
+//! until the single-GPU desktop gate passes (#2317; see the call site).
+static bool
+split_direct_forced_on(void)
+{
+	return split_ingress_env() == 2;
 }
 
 /*!
@@ -4163,7 +4191,7 @@ comp_hub_d3d11_log_placement(struct comp_hub_d3d11 *s, const char *producer)
 	    s->direct.active ? "direct" : "xbridge", why != nullptr ? " ingress_reason=" : "",
 	    why != nullptr ? why : "", producer != nullptr ? producer : "?",
 	    s->direct.active ? (s->direct.km ? ", keyed-mutex mode" : ", fence mode")
-	                     : "; DXR_HUB_INGRESS=xbridge is the A/B control");
+	                     : "; DXR_HUB_INGRESS=direct opts in to DIRECT on one adapter");
 }
 
 extern "C" bool
