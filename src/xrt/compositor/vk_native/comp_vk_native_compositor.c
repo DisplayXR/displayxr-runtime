@@ -10377,6 +10377,41 @@ vk_repaint_thread(void *ptr)
 				os_mutex_unlock(&c->mutex);
 				continue;
 			}
+			/*
+			 * #2345 review: the pace above can block about a period plus the
+			 * #884 late sleep, so an app frame may have landed meanwhile —
+			 * re-run the cadence gate under the lock, as the native VK arm,
+			 * the D3D12 reroute and the D3D11 hub arms do, or the fill fires
+			 * right behind the app's own present.
+			 */
+			{
+				const bool move_fill_locked = move_fill && vk_wl_move_fill_due(c, period_ns);
+				const uint64_t now_r = os_monotonic_get_ns();
+#ifdef VK_MIDFRAME_FILL
+				const bool mf_locked = mf_on && vk_midframe_active(c);
+				bool relock_gate_ok;
+				if (mf_locked && mf_fill) {
+					relock_gate_ok = vk_midframe_gate_open(c, now_r, period_ns, NULL);
+				} else {
+					relock_gate_ok = !(c->repaint.force != 1 && !move_fill_locked &&
+					                   !u_repaint_gate_open(&c->repaint.gate, now_r, period_ns,
+					                                        &c->repaint.partition));
+					if (relock_gate_ok && mf_locked && !move_fill_locked &&
+					    vk_midframe_app_mid(c)) {
+						relock_gate_ok = vk_midframe_gate_open(c, now_r, period_ns, NULL);
+					}
+				}
+#else
+				const bool relock_gate_ok =
+				    !(c->repaint.force != 1 && !move_fill_locked &&
+				      !u_repaint_gate_open(&c->repaint.gate, now_r, period_ns, &c->repaint.partition));
+#endif
+				if (!relock_gate_ok) {
+					u_repaint_trace_bail_race(&c->repaint.trace);
+					os_mutex_unlock(&c->mutex);
+					continue;
+				}
+			}
 			// #1339 / #2342 P2c: the hub's one admission + replay — no fill
 			// into the arm's flip queue while it holds a pending present (see
 			// comp_d3d11_target_repaint_admit).
