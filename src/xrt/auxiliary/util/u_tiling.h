@@ -384,6 +384,47 @@ u_tiling_compute_canvas_view(const struct xrt_rendering_mode *mode,
 }
 
 /*!
+ * Atlas ALLOCATION request that holds a canvas-derived content region.
+ *
+ * A compositor allocates its atlas at the mode atlas (the stable worst case,
+ * #602) and packs the frame's content — `cols × view_w` by `rows × view_h` —
+ * top-left into it. The mode atlas is sized for the display's orientation at
+ * mode-compute time, so once the canvas rotates (an Android device turned to
+ * portrait: a 2560×1600 panel's 1920×1200 views become 1200×1920) the content
+ * is TALLER than the mode atlas. A renderer that then clamps the view to the
+ * allocation squashes every view into the short tile — the atlas the DP weaves
+ * and the atlas capture both lose rows (DisplayXR/displayxr-unity#418: a
+ * 2400×1920 two-view frame captured as 2400×1600).
+ *
+ * Returns the per-dimension max of the mode atlas and the content extent, so
+ * the request never shrinks below the mode atlas and always fits the content.
+ *
+ * @param mode_atlas_w  Mode atlas width (the worst-case request so far).
+ * @param mode_atlas_h  Mode atlas height.
+ * @param cols          Tile columns.
+ * @param rows          Tile rows.
+ * @param view_w        Per-view content width (canvas-derived).
+ * @param view_h        Per-view content height (canvas-derived).
+ * @param[out] out_w    Allocation width to request.
+ * @param[out] out_h    Allocation height to request.
+ */
+static inline void
+u_tiling_atlas_alloc_for_content(uint32_t mode_atlas_w,
+                                 uint32_t mode_atlas_h,
+                                 uint32_t cols,
+                                 uint32_t rows,
+                                 uint32_t view_w,
+                                 uint32_t view_h,
+                                 uint32_t *out_w,
+                                 uint32_t *out_h)
+{
+	uint32_t content_w = cols * view_w;
+	uint32_t content_h = rows * view_h;
+	*out_w = content_w > mode_atlas_w ? content_w : mode_atlas_w;
+	*out_h = content_h > mode_atlas_h ? content_h : mode_atlas_h;
+}
+
+/*!
  * Where a compositor's create-time size came from — see
  * u_tiling_pick_window_size().
  */
