@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Embedded into the bare displayxr-tracking-host executable as its __TEXT,__info_plist section
+  (-sectcreate; see CMakeLists.txt): a command-line tool has no bundle, so this is where macOS
+  reads the camera usage string from when a viewer-tracking provider opens a webcam inside it.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.displayxr.tracking-host</string>
+	<key>CFBundleName</key>
+	<string>DisplayXR Tracking Host</string>
+	<key>CFBundleDisplayName</key>
+	<string>DisplayXR Tracking Host</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@CMAKE_PROJECT_VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@CMAKE_PROJECT_VERSION@</string>
+	<key>NSCameraUsageDescription</key>
+	<string>DisplayXR uses the camera to follow where your eyes are, so 3D content is drawn for your point of view. Video stays on this computer and is never recorded.</string>
+</dict>
+</plist>
