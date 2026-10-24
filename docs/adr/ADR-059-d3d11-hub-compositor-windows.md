@@ -213,10 +213,17 @@ ADR-037/#918 (all-scanout 16.0 ms, all-dGPU 42.1 ms, split 16.6 ms motion-to-pho
   - **Lazy transparency** (`comp_lazy_transparency.h`) is desktop-Linux-only and never ran on the
     Windows VK split.
 
-  What a Windows VK app gains instead is the DXGI present. On an Intel iGPU, VK has no
-  `VK_KHR_present_wait`, so the native leg has no late-weave R at all and presents through a
-  composed GDI copy; the hub gets independent flip (−17 ms, measured above). Nothing in this list
-  is lost relative to native VK on Windows, so nothing is ported. The `[WITNESS]` / R / D harness
+  The native Windows VK leg's **present_wait tier itself** is bypassed too. On a dGPU whose driver
+  exposes `VK_KHR_present_wait` (NVIDIA, AMD), native VK paces its late weave by waiting for each
+  present to reach glass. Under the hub that VK pacer does not run: the hub paces with the DXGI
+  path's own equivalent, the frame-latency waitable plus DXGI frame-statistics scanout waits and
+  the #850 governor, which is the native D3D11 leg's pacer. On an Intel iGPU, VK has no
+  `VK_KHR_present_wait` at all, so the native leg has no late-weave R and presents through a
+  composed GDI copy; there the hub gets independent flip (−17 ms, measured above).
+
+  Neither case loses a function against native VK on Windows, so nothing is ported. The dGPU
+  case, where native VK's present_wait pacing is replaced by DXGI's, is a measurement for the
+  single-dGPU desktop run. The `[WITNESS]` / R / D harness
   vk arms (`run_hub_ab.ps1 -Apps vk`) are the check.
 - **Metal is untouched** — the biggest drifter is out of scope here; macOS keeps its native
   compositor by the same "hub in the platform's native API" rule.
@@ -285,7 +292,8 @@ legs keep their own copies until P5 deletes them.
   only when that point was skipped.
 - **Colour at the import boundary** (ADR-044 §1). Every hub view of a producer surface uses the
   non-decoding UNORM member of its family; crops are raw copies.
-- **VK present_wait extras.** None is lost relative to native VK on Windows; see *Consequences*.
+- **VK present_wait extras.** None is lost relative to native VK on Windows. The present_wait
+  tier itself, which native VK uses on dGPUs, is replaced by the DXGI pacer; see *Consequences*.
 
 ## References
 
