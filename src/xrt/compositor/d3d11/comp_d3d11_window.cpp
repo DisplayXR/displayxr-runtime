@@ -48,8 +48,8 @@
 DEBUG_GET_ONCE_BOOL_OPTION(start_windowed, "XRT_COMPOSITOR_START_WINDOWED", false)
 
 // Where a hosted (runtime-owned) in-process window goes: "auto" (default)
-// embeds it as a child filling the app's own main window when the app has
-// one, else falls back to the panel-fullscreen window; "embed" is auto that
+// embeds it over the app's own main window (owned by it, covering its
+// client area) when the app has one, else falls back to the panel-fullscreen window; "embed" is auto that
 // keeps looking for a main window that appears later; "fullscreen" restores
 // the pre-embedding behaviour.
 DEBUG_GET_ONCE_OPTION(hosted_window, "DXR_HOSTED_WINDOW", "auto")
@@ -167,7 +167,8 @@ struct comp_d3d11_window
 	/*!
 	 * Embed a hosted window into the app's own main window (DXR_HOSTED_WINDOW).
 	 * Legacy apps (no XR_DXR_*_window_binding) get a runtime-created window;
-	 * embedding makes it a WS_CHILD filling the app window's client area, so
+	 * embedding makes it a borderless window owned by the app's window and
+	 * covering its client area (see embed_adopt for why not WS_CHILD), so
 	 * the 3D shows inside the app and several apps weave side by side, each in
 	 * its own window. Set by comp_d3d11_window_create only — the service's
 	 * windows (comp_d3d11_window_create_ex) are never embedded.
@@ -698,6 +699,14 @@ embed_find_cb(HWND h, LPARAM lp)
 	if ((GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) {
 		return TRUE;
 	}
+	// A main window has a caption or at least a title; untitled visible
+	// top-levels are splash screens, message-only helpers, WebView hosts.
+	// InternalGetWindowText, not GetWindowText: the latter SENDS WM_GETTEXT to
+	// the window's thread, which may be blocked waiting on us (see embed_adopt).
+	WCHAR text[2];
+	if ((GetWindowLongW(h, GWL_STYLE) & WS_CAPTION) != WS_CAPTION && InternalGetWindowText(h, text, 2) == 0) {
+		return TRUE;
+	}
 	WCHAR cls[64];
 	if (GetClassNameW(h, cls, 64) > 0 && wcscmp(cls, szWindowClass) == 0) {
 		return TRUE;
@@ -722,16 +731,18 @@ embed_find_host(void)
 	return es.best;
 }
 
-//! Fill the host's client area (the child's coordinates are host-client relative).
+//! Cover the host's client area (screen coordinates; we are owned, not a child).
 static void
 embed_fit(struct comp_d3d11_window *w)
 {
 	HWND host = w->embed_host;
 	RECT rc;
-	if (host == NULL || w->hwnd == NULL || !GetClientRect(host, &rc)) {
+	POINT origin = {0, 0};
+	if (host == NULL || w->hwnd == NULL || !GetClientRect(host, &rc) || !ClientToScreen(host, &origin)) {
 		return;
 	}
-	SetWindowPos(w->hwnd, HWND_TOP, 0, 0, rc.right, rc.bottom, SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+	SetWindowPos(w->hwnd, NULL, origin.x, origin.y, rc.right, rc.bottom,
+	             SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
 }
 
 static void CALLBACK
@@ -749,22 +760,24 @@ embed_event_cb(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG id_object, LONG 
 }
 
 /*!
- * Make @p hwnd a child filling @p host's client area. The host is the app's
- * own window on the app's UI thread; a cross-thread parent/child pair shares
- * an input queue (Win32 attaches them), which is what lets the 3D view take
- * clicks and keys like part of the app. The host gets WS_CLIPCHILDREN so its
- * own painting (often a 2D mirror of the VR view) does not draw over us.
- * Window thread only.
+ * Put @p hwnd over @p host's client area as a borderless window OWNED by
+ * the host: it stays above the app window, minimizes and restores with it,
+ * has no taskbar entry of its own, and follows it through a WinEvent hook.
+ *
+ * Deliberately not SetParent / WS_CHILD and no change to the host's style:
+ * the host lives on the app's UI thread, which is often blocked inside
+ * xrCreateSession waiting for this very window, and both of those send it
+ * synchronous messages (a deadlock until the create times out). Setting an
+ * owner and reading the host's rect send it nothing. Window thread only.
  */
 static void
 embed_adopt(struct comp_d3d11_window *w, HWND hwnd, HWND host)
 {
 	LONG style = GetWindowLongW(hwnd, GWL_STYLE);
-	style = (style & ~(WS_OVERLAPPEDWINDOW | WS_POPUP)) | WS_CHILD | WS_CLIPSIBLINGS;
+	style = (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP;
 	SetWindowLongW(hwnd, GWL_STYLE, style);
 	SetWindowLongW(hwnd, GWL_EXSTYLE, GetWindowLongW(hwnd, GWL_EXSTYLE) & ~WS_EX_APPWINDOW);
-	SetWindowLongW(host, GWL_STYLE, GetWindowLongW(host, GWL_STYLE) | WS_CLIPCHILDREN);
-	SetParent(hwnd, host);
+	SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, (LONG_PTR)host);
 
 	InterlockedExchange(&w->is_fullscreen, FALSE);
 	InterlockedExchangePointer((volatile PVOID *)&w->embed_host, host);
@@ -775,13 +788,15 @@ embed_adopt(struct comp_d3d11_window *w, HWND hwnd, HWND host)
 	w->embed_hook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, NULL,
 	                                embed_event_cb, host_pid, host_tid, WINEVENT_OUTOFCONTEXT);
 
+	SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+	embed_fit(w);
+	ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
 	RECT rc = {0};
 	GetClientRect(host, &rc);
-	SetWindowPos(hwnd, HWND_TOP, 0, 0, rc.right, rc.bottom, SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
-
 	WCHAR title[128] = L"";
-	GetWindowTextW(host, title, 128);
-	U_LOG_W("D3D11 window: embedded in the app's window %p '%ls' (%ldx%ld client) — DXR_HOSTED_WINDOW=fullscreen "
+	InternalGetWindowText(host, title, 128);
+	U_LOG_W("D3D11 window: embedded over the app's window %p '%ls' (%ldx%ld client) — DXR_HOSTED_WINDOW=fullscreen "
 	        "restores the panel-fullscreen window",
 	        (void *)host, title, (long)rc.right, (long)rc.bottom);
 }
