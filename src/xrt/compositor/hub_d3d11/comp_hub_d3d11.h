@@ -121,6 +121,7 @@
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_defines.h"
+#include "xrt/xrt_display_color.h"
 #include "xrt/xrt_results.h"
 
 #include <stdint.h>
@@ -781,6 +782,22 @@ comp_hub_d3d11_request_display_mode(struct comp_hub_d3d11 *split, bool enable_3d
 
 void
 comp_hub_d3d11_set_eye_tracking_mode(struct comp_hub_d3d11 *split, uint32_t mode);
+
+/*!
+ * #2340 — would the split's weaver weave an atlas in @p encoding? The D3D11
+ * `accepts_atlas_encoding` slot, forwarded; false for a DP without the slot.
+ */
+bool
+comp_hub_d3d11_accepts_atlas_encoding(struct comp_hub_d3d11 *split, enum xrt_atlas_encoding encoding);
+
+/*!
+ * #2340 — declare the encoding of the atlases the producer now hands over to
+ * the split's weaver. Remembered and re-sent to a swapped-in DP (ADR-047
+ * Amendment 2), like the eye-tracking mode. Segment DPs on other screens are
+ * not told (the in-process D3D11 path declares none to them either).
+ */
+void
+comp_hub_d3d11_set_atlas_encoding(struct comp_hub_d3d11 *split, enum xrt_atlas_encoding encoding);
 
 /*!
  * XR_DXR_depth_budget - one background preview from the split's weaver.

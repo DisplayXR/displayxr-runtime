@@ -64,6 +64,8 @@
 #include "shaders/equirect2.vert.h"
 #include "shaders/equirect2.frag.h"
 #include "shaders/equirect2_array.frag.h"
+#include "shaders/atlas_pq.vert.h"
+#include "shaders/atlas_pq.frag.h"
 
 //! Upper bound on zone draws (and so descriptor sets) per frame:
 //! zones (OXR_DISPLAY_ZONES_MAX_ZONES_3D = 32) × views (XRT_MAX_VIEWS = 8).
@@ -443,6 +445,33 @@ struct comp_vk_native_renderer
 		//! The softened pipelines failed once (ADR-046 B.7); logged.
 		bool warned_soft;
 	} cursor;
+
+	/*!
+	 * #2340 PQ re-encode pass (DXR_ATLAS_ENCODING=pq only; all null unless
+	 * ever requested). Two private images of the atlas's format and
+	 * allocation: the atlas is copied into @ref src, the pass draws
+	 * src -> dst, and dst is copied back. Owning both ends keeps the
+	 * framebuffer and the descriptor set fixed while the deposit ring
+	 * alternates the atlas view every frame; the price is two atlas copies,
+	 * paid only by the experimental path.
+	 */
+	struct
+	{
+		VkRenderPass render_pass;
+		VkDescriptorSetLayout set_layout;
+		VkPipelineLayout pipeline_layout;
+		VkPipeline pipeline;
+		VkDescriptorPool descriptor_pool;
+		VkDescriptorSet descriptor_set;
+		VkSampler sampler;
+		VkImage src, dst;
+		VkDeviceMemory src_memory, dst_memory;
+		VkImageView src_view, dst_view;
+		VkFramebuffer framebuffer;
+		uint32_t w, h;
+		//! The pipeline could not be built; never retried.
+		bool failed;
+	} pq;
 };
 
 static void
@@ -1086,6 +1115,9 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 static void
 cursor_destroy(struct comp_vk_native_renderer *r);
 
+static void
+pq_destroy(struct comp_vk_native_renderer *r);
+
 void
 comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 {
@@ -1106,6 +1138,7 @@ comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 	// vkDestroyDevice.
 	zone_compose_target_destroy(r);
 	cursor_destroy(r); // XR_DXR_cursor_depth v5 (all null unless ever requested)
+	pq_destroy(r);     // #2340 (likewise)
 	// After destroy_atlas_resources — that call drops the borrowed handles
 	// into the deposit's ring, this one frees the ring itself.
 	comp_vk_deposit_destroy(&r->deposit);
@@ -4201,6 +4234,477 @@ comp_vk_native_renderer_get_linear_compose_target(struct comp_vk_native_renderer
 	*out_view = (uint64_t)(uintptr_t)r->zone.compose_view;
 	*out_width = r->zone.compose_w;
 	*out_height = r->zone.compose_h;
+	return true;
+}
+
+/*
+ *
+ * #2340 PQ re-encode pass.
+ *
+ */
+
+static void
+pq_destroy_targets(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+
+	if (r->pq.framebuffer != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, r->pq.framebuffer, NULL);
+		r->pq.framebuffer = VK_NULL_HANDLE;
+	}
+	VkImageView *views[2] = {&r->pq.src_view, &r->pq.dst_view};
+	VkImage *images[2] = {&r->pq.src, &r->pq.dst};
+	VkDeviceMemory *memories[2] = {&r->pq.src_memory, &r->pq.dst_memory};
+	for (int i = 0; i < 2; i++) {
+		if (*views[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImageView(vk->device, *views[i], NULL);
+			*views[i] = VK_NULL_HANDLE;
+		}
+		if (*images[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImage(vk->device, *images[i], NULL);
+			*images[i] = VK_NULL_HANDLE;
+		}
+		if (*memories[i] != VK_NULL_HANDLE) {
+			vk->vkFreeMemory(vk->device, *memories[i], NULL);
+			*memories[i] = VK_NULL_HANDLE;
+		}
+	}
+	r->pq.w = 0;
+	r->pq.h = 0;
+}
+
+static void
+pq_destroy(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+
+	pq_destroy_targets(r);
+	if (r->pq.pipeline != VK_NULL_HANDLE) {
+		vk->vkDestroyPipeline(vk->device, r->pq.pipeline, NULL);
+		r->pq.pipeline = VK_NULL_HANDLE;
+	}
+	if (r->pq.pipeline_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyPipelineLayout(vk->device, r->pq.pipeline_layout, NULL);
+		r->pq.pipeline_layout = VK_NULL_HANDLE;
+	}
+	if (r->pq.descriptor_pool != VK_NULL_HANDLE) {
+		// Frees descriptor_set with it.
+		vk->vkDestroyDescriptorPool(vk->device, r->pq.descriptor_pool, NULL);
+		r->pq.descriptor_pool = VK_NULL_HANDLE;
+		r->pq.descriptor_set = VK_NULL_HANDLE;
+	}
+	if (r->pq.set_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyDescriptorSetLayout(vk->device, r->pq.set_layout, NULL);
+		r->pq.set_layout = VK_NULL_HANDLE;
+	}
+	if (r->pq.sampler != VK_NULL_HANDLE) {
+		vk->vkDestroySampler(vk->device, r->pq.sampler, NULL);
+		r->pq.sampler = VK_NULL_HANDLE;
+	}
+	if (r->pq.render_pass != VK_NULL_HANDLE) {
+		vk->vkDestroyRenderPass(vk->device, r->pq.render_pass, NULL);
+		r->pq.render_pass = VK_NULL_HANDLE;
+	}
+}
+
+//! The render pass, descriptor set and pipeline: independent of the atlas size.
+static bool
+pq_ensure_pipeline(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+
+	if (r->pq.pipeline != VK_NULL_HANDLE) {
+		return true;
+	}
+	if (r->pq.failed) {
+		return false;
+	}
+
+	// The caller barriers dst into and out of COLOR_ATTACHMENT_OPTIMAL, so the
+	// pass neither transitions nor loads: every texel is overwritten.
+	VkAttachmentDescription att = {
+	    .format = r->format,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+	    .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	};
+	VkAttachmentReference ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+	VkSubpassDescription subpass = {
+	    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+	    .colorAttachmentCount = 1,
+	    .pColorAttachments = &ref,
+	};
+	VkRenderPassCreateInfo rp_ci = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+	    .attachmentCount = 1,
+	    .pAttachments = &att,
+	    .subpassCount = 1,
+	    .pSubpasses = &subpass,
+	};
+	VkResult res = vk->vkCreateRenderPass(vk->device, &rp_ci, NULL, &r->pq.render_pass);
+
+	// texelFetch ignores filtering; a combined sampler is simply the binding.
+	VkSamplerCreateInfo smp_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+	    .magFilter = VK_FILTER_NEAREST,
+	    .minFilter = VK_FILTER_NEAREST,
+	    .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+	    .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .maxLod = 0.0f,
+	};
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreateSampler(vk->device, &smp_ci, NULL, &r->pq.sampler);
+	}
+
+	VkDescriptorSetLayoutBinding binding = {
+	    .binding = 0,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .descriptorCount = 1,
+	    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+	};
+	VkDescriptorSetLayoutCreateInfo dsl_ci = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+	    .bindingCount = 1,
+	    .pBindings = &binding,
+	};
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreateDescriptorSetLayout(vk->device, &dsl_ci, NULL, &r->pq.set_layout);
+	}
+	VkPipelineLayoutCreateInfo pl_ci = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+	    .setLayoutCount = 1,
+	    .pSetLayouts = &r->pq.set_layout,
+	};
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreatePipelineLayout(vk->device, &pl_ci, NULL, &r->pq.pipeline_layout);
+	}
+	VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+	VkDescriptorPoolCreateInfo dp_ci = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+	    .maxSets = 1,
+	    .poolSizeCount = 1,
+	    .pPoolSizes = &pool_size,
+	};
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreateDescriptorPool(vk->device, &dp_ci, NULL, &r->pq.descriptor_pool);
+	}
+	VkDescriptorSetAllocateInfo ds_ai = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+	    .descriptorPool = r->pq.descriptor_pool,
+	    .descriptorSetCount = 1,
+	    .pSetLayouts = &r->pq.set_layout,
+	};
+	if (res == VK_SUCCESS) {
+		res = vk->vkAllocateDescriptorSets(vk->device, &ds_ai, &r->pq.descriptor_set);
+	}
+
+	VkShaderModule vert = VK_NULL_HANDLE;
+	VkShaderModule frag = VK_NULL_HANDLE;
+	VkShaderModuleCreateInfo sm_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+	    .codeSize = sizeof(shaders_atlas_pq_vert),
+	    .pCode = shaders_atlas_pq_vert,
+	};
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &vert);
+	}
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_atlas_pq_frag);
+		sm_ci.pCode = shaders_atlas_pq_frag;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &frag);
+	}
+
+	if (res == VK_SUCCESS) {
+		VkPipelineShaderStageCreateInfo stages[2] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+		        .module = vert,
+		        .pName = "main",
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+		        .module = frag,
+		        .pName = "main",
+		    },
+		};
+		VkPipelineVertexInputStateCreateInfo vertex_input = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+		};
+		VkPipelineInputAssemblyStateCreateInfo input_assembly = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		    .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		};
+		VkPipelineViewportStateCreateInfo viewport_state = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+		    .viewportCount = 1,
+		    .scissorCount = 1,
+		};
+		VkPipelineRasterizationStateCreateInfo rasterization = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		    .polygonMode = VK_POLYGON_MODE_FILL,
+		    .cullMode = VK_CULL_MODE_NONE,
+		    .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+		    .lineWidth = 1.0f,
+		};
+		VkPipelineMultisampleStateCreateInfo multisample = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+		};
+		// Blending off: the pass replaces every texel, alpha included.
+		VkPipelineColorBlendAttachmentState blend_attachment = {
+		    .blendEnable = VK_FALSE,
+		    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+		                      VK_COLOR_COMPONENT_A_BIT,
+		};
+		VkPipelineColorBlendStateCreateInfo blend_state = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		    .attachmentCount = 1,
+		    .pAttachments = &blend_attachment,
+		};
+		VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+		VkPipelineDynamicStateCreateInfo dynamic_state = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+		    .dynamicStateCount = 2,
+		    .pDynamicStates = dynamic_states,
+		};
+		VkGraphicsPipelineCreateInfo pipeline_ci = {
+		    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+		    .stageCount = 2,
+		    .pStages = stages,
+		    .pVertexInputState = &vertex_input,
+		    .pInputAssemblyState = &input_assembly,
+		    .pViewportState = &viewport_state,
+		    .pRasterizationState = &rasterization,
+		    .pMultisampleState = &multisample,
+		    .pColorBlendState = &blend_state,
+		    .pDynamicState = &dynamic_state,
+		    .layout = r->pq.pipeline_layout,
+		    .renderPass = r->pq.render_pass,
+		    .subpass = 0,
+		};
+		res = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, &r->pq.pipeline);
+	}
+	if (vert != VK_NULL_HANDLE) {
+		vk->vkDestroyShaderModule(vk->device, vert, NULL);
+	}
+	if (frag != VK_NULL_HANDLE) {
+		vk->vkDestroyShaderModule(vk->device, frag, NULL);
+	}
+
+	if (res != VK_SUCCESS) {
+		U_LOG_E("encode_atlas_pq: pipeline creation failed: %d", res);
+		pq_destroy(r); // frees whatever was made before the failure
+		r->pq.failed = true;
+		return false;
+	}
+	return true;
+}
+
+static bool
+pq_create_image(struct comp_vk_native_renderer *r,
+                VkImageUsageFlags usage,
+                VkImage *out_image,
+                VkDeviceMemory *out_memory,
+                VkImageView *out_view)
+{
+	struct vk_bundle *vk = r->vk;
+
+	VkImageCreateInfo ici = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = r->format,
+	    .extent = {r->atlas_alloc_width, r->atlas_alloc_height, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = usage,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	if (vk->vkCreateImage(vk->device, &ici, NULL, out_image) != VK_SUCCESS) {
+		*out_image = VK_NULL_HANDLE;
+		return false;
+	}
+	VkMemoryRequirements mr;
+	vk->vkGetImageMemoryRequirements(vk->device, *out_image, &mr);
+	uint32_t type_id = 0;
+	if (!vk_get_memory_type(vk, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type_id)) {
+		return false;
+	}
+	VkMemoryAllocateInfo mai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mr.size,
+	    .memoryTypeIndex = type_id,
+	};
+	if (vk->vkAllocateMemory(vk->device, &mai, NULL, out_memory) != VK_SUCCESS) {
+		*out_memory = VK_NULL_HANDLE;
+		return false;
+	}
+	if (vk->vkBindImageMemory(vk->device, *out_image, *out_memory, 0) != VK_SUCCESS) {
+		return false;
+	}
+	VkImageViewCreateInfo vci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = *out_image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = r->format,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	if (vk->vkCreateImageView(vk->device, &vci, NULL, out_view) != VK_SUCCESS) {
+		*out_view = VK_NULL_HANDLE;
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * The two private images and the framebuffer, sized to the atlas ALLOCATION.
+ * They follow it through a grow, which only happens behind the resize path's
+ * vkDeviceWaitIdle, so nothing still reads the old ones when they go.
+ */
+static bool
+pq_ensure_targets(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+	const uint32_t w = r->atlas_alloc_width;
+	const uint32_t h = r->atlas_alloc_height;
+
+	if (r->pq.framebuffer != VK_NULL_HANDLE && r->pq.w == w && r->pq.h == h) {
+		return true;
+	}
+	pq_destroy_targets(r);
+
+	if (!pq_create_image(r, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, &r->pq.src,
+	                     &r->pq.src_memory, &r->pq.src_view) ||
+	    !pq_create_image(r, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &r->pq.dst,
+	                     &r->pq.dst_memory, &r->pq.dst_view)) {
+		U_LOG_E("encode_atlas_pq: could not allocate the %ux%u working images", w, h);
+		pq_destroy_targets(r);
+		return false;
+	}
+	VkFramebufferCreateInfo fb_ci = {
+	    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+	    .renderPass = r->pq.render_pass,
+	    .attachmentCount = 1,
+	    .pAttachments = &r->pq.dst_view,
+	    .width = w,
+	    .height = h,
+	    .layers = 1,
+	};
+	if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &r->pq.framebuffer) != VK_SUCCESS) {
+		r->pq.framebuffer = VK_NULL_HANDLE;
+		U_LOG_E("encode_atlas_pq: framebuffer creation failed (%ux%u)", w, h);
+		pq_destroy_targets(r);
+		return false;
+	}
+	VkDescriptorImageInfo image_info = {
+	    .sampler = r->pq.sampler,
+	    .imageView = r->pq.src_view,
+	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+	VkWriteDescriptorSet write = {
+	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	    .dstSet = r->pq.descriptor_set,
+	    .dstBinding = 0,
+	    .descriptorCount = 1,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .pImageInfo = &image_info,
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+	r->pq.w = w;
+	r->pq.h = h;
+	return true;
+}
+
+bool
+comp_vk_native_renderer_encode_atlas_pq(struct comp_vk_native_renderer *r, void *cmd_ptr)
+{
+	if (r == NULL || cmd_ptr == NULL || r->atlas_image == VK_NULL_HANDLE) {
+		return false;
+	}
+	if (r->format != VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+		// PQ code values need the 10-bit atlas; an 8-bit one would band.
+		return false;
+	}
+	if (!pq_ensure_pipeline(r) || !pq_ensure_targets(r)) {
+		return false;
+	}
+
+	struct vk_bundle *vk = r->vk;
+	VkCommandBuffer cmd = (VkCommandBuffer)cmd_ptr;
+	const uint32_t w = r->pq.w;
+	const uint32_t h = r->pq.h;
+	const VkImageCopy copy = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .extent = {w, h, 1},
+	};
+
+	/*
+	 * 1. atlas -> src. The source stages also order this pass after the
+	 * previous frame's use of the same private images: a barrier's first scope
+	 * covers everything earlier on the queue, and on the split path the
+	 * previous frame's pass may still be executing.
+	 */
+	cmd_image_barrier(
+	    vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+	        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT);
+	cmd_image_barrier(vk, cmd, r->pq.src, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+	                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+	vk->vkCmdCopyImage(cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->pq.src,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	cmd_image_barrier(vk, cmd, r->pq.src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                  VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+	// 2. src -> dst through the encode shader.
+	cmd_image_barrier(vk, cmd, r->pq.dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0,
+	                  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+	VkRenderPassBeginInfo rp_begin = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = r->pq.render_pass,
+	    .framebuffer = r->pq.framebuffer,
+	    .renderArea = {{0, 0}, {w, h}},
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+	VkViewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
+	VkRect2D scissor = {{0, 0}, {w, h}};
+	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->pq.pipeline);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->pq.pipeline_layout, 0, 1,
+	                            &r->pq.descriptor_set, 0, NULL);
+	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	vk->vkCmdEndRenderPass(cmd);
+
+	// 3. dst -> atlas, which goes back to the layout every reader expects.
+	cmd_image_barrier(vk, cmd, r->pq.dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                  VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+	cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+	                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	vk->vkCmdCopyImage(cmd, r->pq.dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->atlas_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
 	return true;
 }
 

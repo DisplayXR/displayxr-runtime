@@ -66,7 +66,10 @@ static_assert(offsetof(xrt_display_processor_metal, get_eye_positions_at) + size
 // move every variant slot), after set_weave_sync.
 static_assert(offsetof(xrt_display_processor_vk, get_eye_positions_at) ==
               offsetof(xrt_display_processor_vk, set_weave_sync) + sizeof(void *));
+// Vulkan has since appended accepts_atlas_encoding (#2340) after it.
 static_assert(offsetof(xrt_display_processor_vk, get_eye_positions_at) + sizeof(void *) ==
+              offsetof(xrt_display_processor_vk, accepts_atlas_encoding));
+static_assert(offsetof(xrt_display_processor_vk, accepts_atlas_encoding) + sizeof(void *) ==
               sizeof(xrt_display_processor_vk));
 // And the base itself did NOT grow (that would be the silent break).
 static_assert(sizeof(xrt_display_processor) == offsetof(xrt_display_processor, clear_local_zone_mask) + sizeof(void *));

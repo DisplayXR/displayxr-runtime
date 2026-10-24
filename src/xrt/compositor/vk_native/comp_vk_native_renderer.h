@@ -217,6 +217,24 @@ comp_vk_native_renderer_get_linear_compose_target(struct comp_vk_native_renderer
                                                   uint32_t *out_height);
 
 /*!
+ * #2340 — record, into @p cmd, an in-place re-encode of the composed atlas from
+ * sRGB to SMPTE ST 2084 PQ (1.0 linear = 203 cd/m^2, primaries passed through),
+ * for a display processor that accepted @ref XRT_ATLAS_ENCODING_PQ. The Vulkan
+ * twin of the D3D11 compositor's comp_d3d11_renderer_encode_atlas_pq().
+ *
+ * Requires the A2B10G10R10 atlas (DXR_ATLAS_FORMAT=rgb10a2): any other format,
+ * or a pass that cannot be built, records nothing and returns false. The atlas
+ * is expected in SHADER_READ_ONLY_OPTIMAL and is left there.
+ *
+ * @param renderer The renderer.
+ * @param cmd      VkCommandBuffer in the recording state.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_renderer_encode_atlas_pq(struct comp_vk_native_renderer *renderer, void *cmd);
+
+/*!
  * Resize the renderer's atlas texture.
  *
  * @param renderer The renderer.
