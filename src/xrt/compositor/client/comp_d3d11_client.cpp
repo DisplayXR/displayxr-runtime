@@ -1018,6 +1018,7 @@ client_d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 	// layer_sync RPC ships it to the service. The service per-view loop
 	// will queue an `ID3D11DeviceContext4::Wait` on this value and skip
 	// the legacy KeyedMutex acquire entirely for fence-capable clients.
+	bool signals_flushed = false; // #2320
 	if (c->workspace_sync_fence) {
 		c->workspace_sync_fence_value++;
 		HRESULT hr_wsf =
@@ -1053,12 +1054,21 @@ client_d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 			// signal can never complete, so the wait would just burn its
 			// budget every frame. Keep both.
 			c->fence_context->Flush();
+			signals_flushed = true;
 			comp_ipc_client_compositor_set_workspace_sync_fence_value(
 			    &c->xcn->base, c->workspace_sync_fence_value);
 		}
 	}
 
 	if (c->timeline_semaphore) {
+		// #2320: the service now queues a GPU-side Wait on this value when this
+		// client is not on the workspace_sync_fence path. The Signal above only
+		// QUEUED into the immediate context; submit it, or the service's Wait
+		// would hold its shared context until our next flush (and for ever if
+		// we died first -- the #922 shape). The fence path flushed already.
+		if (!signals_flushed) {
+			c->fence_context->Flush();
+		}
 		// We got this from the native compositor, so we can pass it back
 		OutputDebugStringA("[DisplayXR] xrEndFrame: Using timeline semaphore commit\n");
 		int64_t profile_t1 = os_monotonic_get_ns();
