@@ -75,6 +75,13 @@ static const wchar_t *const kHostedViewRectProp = L"DXR_HostedViewRect";
 // brings it back.
 DEBUG_GET_ONCE_BOOL_OPTION(hosted_ui_peek, "DXR_HOSTED_UI_PEEK", true)
 
+// Who gets mouse input over an embedded 3D view: "runtime" (default: the
+// runtime's own camera/hand controls, qwerty) or "app": the 3D view never
+// takes focus and passes the mouse through to the app window under it, so
+// apps whose 3D follows their own desktop camera (ParaView, Slicer) keep
+// their native navigation, picking and widgets. Keys then stay with the app.
+DEBUG_GET_ONCE_OPTION(hosted_input, "DXR_HOSTED_INPUT", "runtime")
+
 // Marker for SendInput-injected mouse events — WndProc skips re-forwarding these.
 // Used to break the loop: WndProc→SendInput→WM_LBUTTONDOWN→WndProc.
 #define WORKSPACE_SENDINPUT_MARKER 0xD15B1A7E
@@ -224,6 +231,9 @@ struct comp_d3d11_window
 	bool peek_lbutton_down;
 	bool peek_escape_down;
 	DWORD peek_hover_since; //!< GetTickCount when the cursor reached the app's UI; 0 = not there
+
+	//! DXR_HOSTED_INPUT=app: mouse passes through to the host, never focused (set before thread start).
+	bool embed_input_to_app;
 
 	//! Window thread handle
 	HANDLE thread_handle;
@@ -937,7 +947,11 @@ embed_adopt(struct comp_d3d11_window *w, HWND hwnd, HWND host)
 	LONG style = GetWindowLongW(hwnd, GWL_STYLE);
 	style = (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP;
 	SetWindowLongW(hwnd, GWL_STYLE, style);
-	SetWindowLongW(hwnd, GWL_EXSTYLE, GetWindowLongW(hwnd, GWL_EXSTYLE) & ~WS_EX_APPWINDOW);
+	LONG ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) & ~WS_EX_APPWINDOW;
+	if (w->embed_input_to_app) {
+		ex_style |= WS_EX_NOACTIVATE;
+	}
+	SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style);
 	SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, (LONG_PTR)host);
 
 	InterlockedExchange(&w->is_fullscreen, FALSE);
@@ -969,6 +983,62 @@ embed_adopt(struct comp_d3d11_window *w, HWND hwnd, HWND host)
 	    (void *)host, title, (long)rc.right, (long)rc.bottom);
 }
 
+/*!
+ * DXR_HOSTED_INPUT=app: hand mouse input over the embedded view to the host
+ * window, in the host's client coordinates, as if the 3D view were not there.
+ * Posted, never sent: the host's UI thread may be blocked on this runtime.
+ * Wheel messages already carry screen coordinates. When the app captures the
+ * mouse on a button-down (Qt, Win32 drags do), the rest of the drag goes to it
+ * directly. Window thread only. Returns true when the message was handled.
+ */
+static bool
+embed_route_input_to_app(struct comp_d3d11_window *w, UINT message, WPARAM wParam, LPARAM lParam, LRESULT *result)
+{
+	HWND host = (HWND)InterlockedCompareExchangePointer((volatile PVOID *)&w->embed_host, NULL, NULL);
+	if (!w->embed_input_to_app || host == NULL) {
+		return false;
+	}
+	switch (message) {
+	case WM_MOUSEACTIVATE: *result = MA_NOACTIVATE; return true;
+	case WM_SETCURSOR:
+		// The app can't set the cursor over a window it doesn't own; keep it visible.
+		if (LOWORD(lParam) != HTCLIENT) {
+			return false;
+		}
+		SetCursor(LoadCursor(NULL, IDC_ARROW));
+		*result = TRUE;
+		return true;
+	case WM_MOUSEWHEEL:
+	case WM_MOUSEHWHEEL:
+		PostMessageW(host, message, wParam, lParam);
+		*result = 0;
+		return true;
+	case WM_MOUSEMOVE:
+	case WM_LBUTTONDOWN:
+	case WM_LBUTTONUP:
+	case WM_LBUTTONDBLCLK:
+	case WM_RBUTTONDOWN:
+	case WM_RBUTTONUP:
+	case WM_RBUTTONDBLCLK:
+	case WM_MBUTTONDOWN:
+	case WM_MBUTTONUP:
+	case WM_MBUTTONDBLCLK:
+	case WM_XBUTTONDOWN:
+	case WM_XBUTTONUP:
+	case WM_XBUTTONDBLCLK: {
+		HWND self = w->hwnd;
+		POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+		if (self == NULL || !ClientToScreen(self, &pt) || !ScreenToClient(host, &pt)) {
+			return false;
+		}
+		PostMessageW(host, message, wParam, MAKELPARAM((short)pt.x, (short)pt.y));
+		*result = 0;
+		return true;
+	}
+	default: return false;
+	}
+}
+
 // Forward declaration — defined later in this file alongside the suppress
 // setters so the logic lives in one place. Used by wnd_proc to gate key
 // and mouse forwarding.
@@ -988,6 +1058,11 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	if (!w) {
 		// Window not fully set up yet
 		return DefWindowProcW(hWnd, message, wParam, lParam);
+	}
+
+	LRESULT routed = 0;
+	if (embed_route_input_to_app(w, message, wParam, lParam, &routed)) {
+		return routed;
 	}
 
 	switch (message) {
@@ -2202,6 +2277,14 @@ window_create_internal(uint32_t width,
 			memcpy(w->embed_inset, v, sizeof(v));
 		} else if (inset != NULL && strcmp(inset, "0,0,0,0") != 0) {
 			U_LOG_W("D3D11 window: DXR_HOSTED_INSET='%s' is not left,top,right,bottom (>= 0) — ignored", inset);
+		}
+		const char *input = debug_get_option_hosted_input();
+		w->embed_input_to_app = input != NULL && strcmp(input, "app") == 0;
+		// With the mouse going to the app, its UI around the view is never covered,
+		// and the strip above the view is often the view's own toolbar (ParaView):
+		// hovering it must not hide the 3D.
+		if (w->embed_input_to_app) {
+			w->embed_ui_peek = false;
 		}
 	}
 	w->instance = GetModuleHandle(NULL);
