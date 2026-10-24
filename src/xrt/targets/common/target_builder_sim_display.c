@@ -27,6 +27,7 @@
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty/qwerty_device.h"
+#include "qwerty/qwerty_interface.h"
 #endif
 
 #include <assert.h>
