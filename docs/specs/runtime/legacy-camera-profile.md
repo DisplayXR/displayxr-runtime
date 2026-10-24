@@ -76,7 +76,9 @@ The record uses `XrCameraRigDXR` tuning vocabulary and excludes `pose`:
 | `convergenceDiopters` | Inverse convergence distance; zero means infinity | `0.5` |
 | `verticalFov` | Full vertical field of view, radians | Existing qwerty `tan(vFOV/2) = 0.3249`, approximately 36 degrees |
 | `metersToVirtual` | Constant metres-to-virtual-world scale | `1` |
+| `pitchDegrees` | Initial camera pitch, degrees, negative = looking down; also the Space-reset look. The one non-tuning field: framing for titles whose work area sits at hand height, below a camera that starts level. Position and later navigation stay the user's | `0` |
 
+`pitchDegrees` must lie in `[-89, 89]`; outside that the record is rejected.
 The same scalar bounds as a chained camera rig apply: eye factors `[0, 10000]`,
 convergence `[0, 20]`, vertical FOV `[0.01, 3.13]`, and positive
 metres-to-virtual scale `[0.0001, 100000]`. A nonpositive `metersToVirtual` maps
