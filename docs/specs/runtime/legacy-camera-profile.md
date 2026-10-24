@@ -76,7 +76,17 @@ The record uses `XrCameraRigDXR` tuning vocabulary and excludes `pose`:
 | `convergenceDiopters` | Inverse convergence distance; zero means infinity | `0.5` |
 | `verticalFov` | Full vertical field of view, radians | Existing qwerty `tan(vFOV/2) = 0.3249`, approximately 36 degrees |
 | `metersToVirtual` | Constant metres-to-virtual-world scale | `1` |
+| `pitchDegrees` | Initial camera pitch, degrees, negative = looking down; also the Space-reset look | `0` |
+| `pullbackMeters` | Initial distance behind the default camera position, along the starting look (so with `pitchDegrees` the camera also rises), metres; also part of the Space-reset pose | `0` |
 
+`pitchDegrees` and `pullbackMeters` are the only non-tuning fields: they frame
+where the camera *starts*, for titles whose work area sits at arm's length and
+hand height (Substance 3D Modeler's clay block starts a few tens of centimetres
+below and in front of a camera that starts level at eye height). Everything the
+user drives afterwards stays theirs.
+
+`pitchDegrees` must lie in `[-89, 89]` and `pullbackMeters` in `[0, 10]`; outside
+those the record is rejected.
 The same scalar bounds as a chained camera rig apply: eye factors `[0, 10000]`,
 convergence `[0, 20]`, vertical FOV `[0.01, 3.13]`, and positive
 metres-to-virtual scale `[0.0001, 100000]`. A nonpositive `metersToVirtual` maps

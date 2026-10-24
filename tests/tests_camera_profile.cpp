@@ -232,3 +232,33 @@ TEST_CASE("Process lookup uses ProgramData and the actual executable basename", 
 	CHECK(profile.m2v == .25f); // Reads live process environment, not a stale CRT cache.
 }
 #endif
+
+TEST_CASE("pitchDegrees sets the initial camera tilt in radians and is bounded", "[camera-profile]")
+{
+	u_camera_profile profile{};
+	REQUIRE(u_camera_profile_parse("{}", 0, &profile, nullptr, 0));
+	CHECK(profile.pitch_rad == 0);
+	REQUIRE(u_camera_profile_parse(R"({"pitchDegrees":-30})", 0, &profile, nullptr, 0));
+	CHECK(profile.pitch_rad == Approx(-0.5235987756));
+	CHECK(profile.m2v == 1); // other fields keep their defaults
+
+	u_camera_profile untouched = profile;
+	char error[128] = {};
+	CHECK_FALSE(u_camera_profile_parse(R"({"pitchDegrees":95})", 0, &profile, error, sizeof(error)));
+	CHECK(std::string(error).find("pitchDegrees") != std::string::npos);
+	CHECK_FALSE(u_camera_profile_parse(R"({"pitchDegrees":-90})", 0, &profile, nullptr, 0));
+	CHECK_FALSE(u_camera_profile_parse(R"({"pitchDegrees":"down"})", 0, &profile, nullptr, 0));
+	CHECK_FALSE(u_camera_profile_parse(R"({"pitchDegrees":-30,"pitchDegrees":-20})", 0, &profile, nullptr, 0));
+	CHECK(profile.pitch_rad == untouched.pitch_rad);
+}
+
+TEST_CASE("pullbackMeters sets the initial camera distance and is bounded", "[camera-profile]")
+{
+	u_camera_profile profile{};
+	REQUIRE(u_camera_profile_parse("{}", 0, &profile, nullptr, 0));
+	CHECK(profile.pullback_m == 0);
+	REQUIRE(u_camera_profile_parse(R"({"pullbackMeters":0.8,"pitchDegrees":-30})", 0, &profile, nullptr, 0));
+	CHECK(profile.pullback_m == Approx(0.8));
+	CHECK_FALSE(u_camera_profile_parse(R"({"pullbackMeters":-0.1})", 0, &profile, nullptr, 0));
+	CHECK_FALSE(u_camera_profile_parse(R"({"pullbackMeters":11})", 0, &profile, nullptr, 0));
+}
