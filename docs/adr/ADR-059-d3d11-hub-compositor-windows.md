@@ -196,6 +196,28 @@ ADR-037/#918 (all-scanout 16.0 ms, all-dGPU 42.1 ms, split 16.6 ms motion-to-pho
 - **Mid-session retire is the delicate path** (one weaver per HWND; swapchain re-create on the
   same HWND; the fresh DP must be re-told 3D/eye mode/frame timing). → fixed and re-validated
   in #2321; retire stays a transitional mechanism until planes ride the hub (Phase 2).
+- **Vulkan's present_wait extras do not follow a VK app onto the hub, by design** (#2342). The hub
+  presents through DXGI on its own `comp_d3d11_target`, so the `vk_native` target is never created
+  on a hub route, and every pacing helper it carries is bypassed:
+  - The **adaptive grid lead** (`comp_late_weave_adapt.h`, #2068) learns a composited Linux
+    desktop's latch-before-vblank. Its own header says the vblank IS the deadline under DXGI flip,
+    so it has nothing to learn on Windows.
+  - The **present_wait depth floor** (`comp_late_weave_depth.h`, #2119) exists because a composited
+    surface shows a commit two refreshes late. The hub's DXGI path has the #850 late-weave governor
+    instead: depth on the frame-latency waitable, raised by saturation, capped by
+    `DXR_LATE_WEAVE_MAX_LATENCY`. That is the same lever, DXGI-native, and the same governor the
+    native D3D11 leg runs.
+  - The **#867 lookahead** is already the hub's: VK's `predict_frame` / `wait_frame` read
+    `comp_hub_d3d11_get_predicted_lookahead_ns` and mark its ledger (#2336 / #2327), through the
+    same `late_weave_lookahead_ns` formula.
+  - **Lazy transparency** (`comp_lazy_transparency.h`) is desktop-Linux-only and never ran on the
+    Windows VK split.
+
+  What a Windows VK app gains instead is the DXGI present. On an Intel iGPU, VK has no
+  `VK_KHR_present_wait`, so the native leg has no late-weave R at all and presents through a
+  composed GDI copy; the hub gets independent flip (−17 ms, measured above). Nothing in this list
+  is lost relative to native VK on Windows, so nothing is ported. The `[WITNESS]` / R / D harness
+  vk arms (`run_hub_ab.ps1 -Apps vk`) are the check.
 - **Metal is untouched** — the biggest drifter is out of scope here; macOS keeps its native
   compositor by the same "hub in the platform's native API" rule.
 
@@ -229,6 +251,36 @@ latency the old D rows hid. Tracked as #2337 (experiment: GPU-wait the in-flight
 weave). Consequence for this ADR: on a single adapter the shims take DIRECT ingress (#2336, a default
 change on the already-default hub routes, gated on the single-dGPU desktop run and the engine checks);
 cross-adapter stays xbridge until #2337 is settled.
+
+## Amendment 2 (2026-10-25) — P2c: the hub is the one implementation for its routes
+
+#2342 (P2c) moves the remaining per-route copies on the hub routes into `comp_hub_d3d11`. The native
+legs keep their own copies until P5 deletes them.
+
+- **Ring producers' planes ride DIRECT.** A ring producer that declares
+  `comp_hub_d3d11_info::ring_direct_planes` keeps its Local2D, backdrop and mask planes on DIRECT
+  ingress. The hub reads them in place, and the frame's recipe is snapshotted beside its slot.
+  The single-buffered planes get the atlas's two edges:
+  - write → read: the producer writes them before the deposit signal;
+  - read → rewrite: a submit that rewrites a plane GPU-waits for the consumer fence's *latest*
+    value (`comp_hub_d3d11_get_plane_release_value`).
+
+  Both ring producers declare it, so the P2a `reason=plane_content` move to xbridge is now only
+  the fallback for a producer that does not. Keyed-mutex VK deposits keep their documented
+  timing-only planes (#1274).
+- **Per-segment zone publish and clear** run in the hub on every route, which is the native
+  #2218 #4 rule. The D3D11 shim's `segments_planes` refusal is retired.
+- **One repaint pacer and admission.** `comp_hub_d3d11_repaint_pace_hold` / `_wait`, then
+  `comp_hub_d3d11_repaint`, give every hub route the native D3D11 leg's pacing (scanout wait plus the
+  #884 late sleep) and its #1339 admission. The pacer hold is lifetime-safe against a retire. Before
+  this, all three routes skipped pacing, so `DXR_WEAVE_REPAINT_FORCE=1` gave 0 repaints/s on the
+  hub (#2321 surprise 6). `DXR_LATE_WEAVE` is read once for every hub route, by the hub's target.
+- **One capture site.** On a hub route the tier hands its pending `u_capture_intent` to the hub.
+  The hub writes the DP input to `displayxr_atlas[.<exe>][.projection].png` and, for full
+  triggers, the post-weave back buffer to `…woven.png`: the service twin's names.
+- **Colour at the import boundary** (ADR-044 §1). Every hub view of a producer surface uses the
+  non-decoding UNORM member of its family; crops are raw copies.
+- **VK present_wait extras.** None is lost relative to native VK on Windows; see *Consequences*.
 
 ## References
 
