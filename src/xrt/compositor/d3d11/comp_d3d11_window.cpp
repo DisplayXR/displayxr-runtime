@@ -747,19 +747,20 @@ embed_find_host(void)
 /*!
  * Cover the app's viewer: the host's client area minus DXR_HOSTED_INSET, in
  * screen coordinates (we are owned, not a child) — or, after F11, the whole
- * monitor the host is on.
+ * monitor the host is on. @p hwnd is ours: w->hwnd is only published once
+ * creation finishes, after the first fit.
  */
 static void
-embed_fit(struct comp_d3d11_window *w)
+embed_fit(struct comp_d3d11_window *w, HWND hwnd)
 {
 	HWND host = w->embed_host;
-	if (host == NULL || w->hwnd == NULL) {
+	if (host == NULL || hwnd == NULL) {
 		return;
 	}
 	if (InterlockedCompareExchange(&w->embed_fullscreen, 0, 0) != 0) {
 		MONITORINFO mi = {sizeof(mi)};
 		if (GetMonitorInfo(MonitorFromWindow(host, MONITOR_DEFAULTTONEAREST), &mi)) {
-			SetWindowPos(w->hwnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top,
+			SetWindowPos(hwnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top,
 			             mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
 			             SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
 		}
@@ -780,7 +781,7 @@ embed_fit(struct comp_d3d11_window *w)
 	if (cw <= 0 || ch <= 0) {
 		return;
 	}
-	SetWindowPos(w->hwnd, NULL, origin.x + l, origin.y + t, cw, ch, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+	SetWindowPos(hwnd, NULL, origin.x + l, origin.y + t, cw, ch, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
 }
 
 static void CALLBACK
@@ -793,7 +794,7 @@ embed_event_cb(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG id_object, LONG 
 	(void)time;
 	struct comp_d3d11_window *w = t_embed_window;
 	if (w != NULL && hwnd == w->embed_host && id_object == OBJID_WINDOW) {
-		embed_fit(w);
+		embed_fit(w, w->hwnd);
 	}
 }
 
@@ -828,7 +829,7 @@ embed_adopt(struct comp_d3d11_window *w, HWND hwnd, HWND host)
 
 	SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
 	             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-	embed_fit(w);
+	embed_fit(w, hwnd);
 	ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
 	RECT rc = {0};
@@ -1001,7 +1002,7 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				LONG fs = !InterlockedCompareExchange(&w->embed_fullscreen, 0, 0);
 				InterlockedExchange(&w->embed_fullscreen, fs);
 				InterlockedExchange(&w->is_fullscreen, fs);
-				embed_fit(w);
+				embed_fit(w, hWnd);
 				U_LOG_W("D3D11 window: F11 — embedded view %s", fs ? "fullscreen on the panel" : "back in the app's viewer");
 				return 0;
 			}
