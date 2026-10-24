@@ -409,6 +409,15 @@ struct comp_vk_native_renderer
 	 * reach. NULL (the default) restores the owned-atlas path verbatim.
 	 */
 	struct comp_vk_deposit *deposit;
+	/*!
+	 * #2317 P2a: wait-half storage for the deposit chain (deposit_chain_signal):
+	 * the deposit's own release and the hub's DIRECT release, both timelines.
+	 * Must outlive the vkQueueSubmit it is chained into; one submit is built
+	 * at a time, the same rule as the keyed-mutex chain storage.
+	 */
+	VkSemaphore deposit_wait_sems[2];
+	uint64_t deposit_wait_values[2];
+	VkPipelineStageFlags deposit_wait_stages[2];
 
 	/*!
 	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
@@ -1759,7 +1768,9 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
  *
  * @param[out] sem_storage,value_storage Caller-owned storage that must outlive
  *        the vkQueueSubmit call — VkSubmitInfo only borrows pointers.
- * @param[out] wait_value_storage,wait_stage_storage Likewise, for the wait half.
+ * @param[out] wait_value_storage,wait_stage_storage Unused since #2317 P2a: the
+ *        wait half can carry TWO timelines now, so the renderer owns its storage
+ *        (`deposit_wait_*`). Kept so the three call sites stay unchanged.
  */
 static void
 deposit_chain_signal(struct comp_vk_native_renderer *r,
@@ -1807,16 +1818,40 @@ deposit_chain_signal(struct comp_vk_native_renderer *r,
 	 * attachment on the draw path and a transfer destination on the blit/clear
 	 * path — so earlier stages of this submit still overlap the wait.
 	 */
+	/*
+	 * #2317 P2a: and the hub's DIRECT-ingress release of the same slot, on the
+	 * hub's own consumer fence — a second timeline, because the hub read this
+	 * slot on ITS device and signals there (one signaller per timeline). At
+	 * most one of the two is normally owed; both may be across the one-time
+	 * move from DIRECT to xbridge.
+	 */
+	(void)wait_value_storage;
+	(void)wait_stage_storage;
+	const VkPipelineStageFlags stage =
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+	uint32_t n = 0;
 	const uint64_t release = comp_vk_deposit_current_slot_wait(r->deposit);
 	if (release != 0) {
-		*wait_value_storage = release;
-		*wait_stage_storage =
-		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-		timeline_info->waitSemaphoreValueCount = 1;
-		timeline_info->pWaitSemaphoreValues = wait_value_storage;
-		submit_info->waitSemaphoreCount = 1;
-		submit_info->pWaitSemaphores = sem_storage;
-		submit_info->pWaitDstStageMask = wait_stage_storage;
+		r->deposit_wait_sems[n] = *sem_storage;
+		r->deposit_wait_values[n] = release;
+		r->deposit_wait_stages[n] = stage;
+		n++;
+	}
+	VkSemaphore hub_sem = VK_NULL_HANDLE;
+	uint64_t hub_release = 0;
+	comp_vk_deposit_current_slot_hub_wait(r->deposit, &hub_sem, &hub_release);
+	if (hub_sem != VK_NULL_HANDLE && hub_release != 0) {
+		r->deposit_wait_sems[n] = hub_sem;
+		r->deposit_wait_values[n] = hub_release;
+		r->deposit_wait_stages[n] = stage;
+		n++;
+	}
+	if (n != 0) {
+		timeline_info->waitSemaphoreValueCount = n;
+		timeline_info->pWaitSemaphoreValues = r->deposit_wait_values;
+		submit_info->waitSemaphoreCount = n;
+		submit_info->pWaitSemaphores = r->deposit_wait_sems;
+		submit_info->pWaitDstStageMask = r->deposit_wait_stages;
 	}
 }
 

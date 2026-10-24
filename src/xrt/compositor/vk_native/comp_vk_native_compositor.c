@@ -12123,21 +12123,34 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 			comp_hub_d3d11_stage_segment_content(c->split, &c->seg_content);
 			comp_hub_d3d11_submit_atlas(c->split, &handoff, c->eff_layout.cols, c->eff_layout.rows,
 			                            c->eff_layout.tile_w, c->eff_layout.tile_h);
+			if (!comp_hub_d3d11_is_direct(c->split)) {
+				/*
+				 * The slot is free again the instant the bridge's staging copy
+				 * has been recorded on this same immediate context — release it
+				 * so Vulkan's next write into it is ordered, not merely likely.
+				 * Queued signal; nothing waits here.
+				 */
+				comp_vk_deposit_note_consumed(dep, handoff.slot);
+				/*
+				 * VK-1b — the same edge for the PLANES, and it has to be here
+				 * rather than inside the split: comp_hub_d3d11_submit_atlas has
+				 * just taken the bridge's `pre_plane_write` wait on this app
+				 * immediate context, and this signal must land BEHIND it in that
+				 * one ordered stream. Vulkan's next flatten waits for the value.
+				 */
+				comp_vk_deposit_note_planes_consumed(dep);
+			}
 			/*
-			 * The slot is free again the instant the bridge's staging copy
-			 * has been recorded on this same immediate context — release it
-			 * so Vulkan's next write into it is ordered, not merely likely.
-			 * Queued signal; nothing waits here.
+			 * #2317 P2a: DIRECT ingress — the hub reads the slot on its own
+			 * device and owes each slot's release once it moves off it (also
+			 * the DIRECT era's last slot after a move to xbridge). Bookkeeping
+			 * only; Vulkan's next write into the slot waits on the GPU.
 			 */
-			comp_vk_deposit_note_consumed(dep, handoff.slot);
-			/*
-			 * VK-1b — the same edge for the PLANES, and it has to be here
-			 * rather than inside the split: comp_hub_d3d11_submit_atlas has
-			 * just taken the bridge's `pre_plane_write` wait on this app
-			 * immediate context, and this signal must land BEHIND it in that
-			 * one ordered stream. Vulkan's next flatten waits for the value.
-			 */
-			comp_vk_deposit_note_planes_consumed(dep);
+			uint32_t rel_slot = 0;
+			uint64_t rel_value = 0;
+			while (comp_hub_d3d11_take_slot_release(c->split, &rel_slot, &rel_value)) {
+				comp_vk_deposit_note_hub_release(dep, rel_slot, rel_value);
+			}
 		}
 
 		const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
@@ -13385,6 +13398,12 @@ vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, con
 
 	comp_hub_d3d11_retire(&c->split, why, short_reason);
 	c->split_off_reason = short_reason;
+	// #2317 P2a: the hub (and the consumer fence it owned) is gone; nothing
+	// more is owed. Safe: every submit that waited on it has completed (the
+	// per-frame draw-fence wait), and the retire runs under c->mutex.
+	if (c->renderer != NULL) {
+		(void)comp_vk_deposit_bind_consumer_fence(comp_vk_native_renderer_get_deposit(c->renderer), NULL);
+	}
 
 	/*
 	 * VK-1b — the plane framebuffer is built over the deposit plane's imported
@@ -13866,6 +13885,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		    .has_shared_texture = c->has_shared_texture,
 		    .transparent_background = transparent_background,
 		    .app_timeline_semaphores = app_timeline_semaphores,
+		    // #2317 P2a: this caller honours the DIRECT release contract.
+		    .ring_direct = true,
 		    .render_packed_luid = c->render_packed_luid,
 		    .display_screen_left = display_screen_left,
 		    .display_screen_top = display_screen_top,
@@ -14471,8 +14492,23 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #ifdef XRT_OS_WINDOWS
 	if (c->split != NULL) {
 		struct comp_hub_d3d11_handoff handoff = {0};
-		bool ok = comp_vk_deposit_get_handoff(comp_vk_native_renderer_get_deposit(c->renderer), &handoff) &&
-		          comp_hub_d3d11_wire_bridge(c->split, &handoff);
+		struct comp_vk_deposit *a2_dep = comp_vk_native_renderer_get_deposit(c->renderer);
+		bool ok =
+		    comp_vk_deposit_get_handoff(a2_dep, &handoff) && comp_hub_d3d11_wire_bridge(c->split, &handoff);
+		if (ok) {
+			/*
+			 * #2317 P2a: on ONE adapter the hub reads the ring DIRECT. In
+			 * fence mode its reads are released on its own consumer fence,
+			 * which Vulkan must import to order a slot rewrite after them —
+			 * no import, no DIRECT (the hub moves to xbridge, one-time, before
+			 * any frame). Keyed-mutex deposits need no fence at all.
+			 */
+			void *cons = comp_hub_d3d11_get_consumer_fence_handle(c->split);
+			if (cons != NULL && !comp_vk_deposit_bind_consumer_fence(a2_dep, cons)) {
+				comp_hub_d3d11_leave_direct(c->split, COMP_HUB_INGRESS_REASON_DIRECT_FAILED);
+			}
+			comp_hub_d3d11_log_placement(c->split, "vk");
+		}
 		if (!ok) {
 			vk_split_retire_locked(c,
 			                       "the cross-adapter transport could not be wired to the "
