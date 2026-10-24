@@ -239,12 +239,29 @@ struct comp_hub_d3d11_info
 #define COMP_HUB_REASON_NO_SHARED_FENCE "no_shared_fence"
 //! Stage A2 (bridge or direct wiring) failed after Stage A1 succeeded.
 #define COMP_HUB_REASON_WIRE_FAILED "wire_failed"
-//! Mid-session RETIRE: the frame carried an XR_DXR_local_3d_zone Local2D layer.
-#define COMP_HUB_REASON_LOCAL2D "local2d_layer"
-//! Mid-session RETIRE: the frame carried XR_DXR_display_zones zone layers.
-#define COMP_HUB_REASON_ZONES "zone_layer"
-//! Mid-session RETIRE: the session submitted an authored (Tier-3 / zones) mask.
-#define COMP_HUB_REASON_AUTHORED_MASK "authored_mask"
+/*!
+ * Mid-session RETIRE (#2317 P2b): a frame needed a plane — the Local2D
+ * over-flatten, the 2D-under backdrop or an authored mask — and the hub could not
+ * carry it (the producer's NT share, the hub's open or bind, its composite unit
+ * or its mask raster failed). Every one of those is an allocation-class failure
+ * that would recur, so the tier's own legs take the session rather than ship it
+ * without its 2D. Fires on the frame AFTER the failure (that one frame runs
+ * without its 2D band).
+ *
+ * The P1b plane retires (`local2d_layer`, `zone_layer`, `authored_mask`) are
+ * gone: Local2D, zones, authored masks and the backdrop ride the hub on both
+ * ingress routes.
+ */
+#define COMP_HUB_REASON_PLANE_UNAVAILABLE "plane_unavailable"
+/*!
+ * Mid-session RETIRE (#2317 P2b review): a zones frame or an authored mask while
+ * the hub's last weave SEGMENTED the window across screens. The D3D11 tier
+ * natively publishes the zone mask to every segment's DP, cropped to its screen
+ * (#2218 #4); the hub publishes to its primary DP only, so the secondary panel
+ * would never get its mask. Retires BEFORE that frame is composed, so the
+ * native legs compose it. Until the per-segment publish is ported (P2 follow-up).
+ */
+#define COMP_HUB_REASON_SEGMENTS_PLANES "segments_planes"
 /*! @} */
 
 /*!
@@ -380,8 +397,15 @@ comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *split,
  * @param bd_w,bd_h The backdrop's OWN extent (the composite region), which is not
  *        the plane's extent. 0 ⟹ the frame produced no backdrop and the weave
  *        clears the display processor's background.
+ *
+ * On the DIRECT ingress (#2317 P2b) the surface is not transported at all: the
+ * hub opens @p nt_handle on its own device and reads it in place, ordered by the
+ * atlas's two fences (the producer writes it before signalling).
+ *
+ * @return false only when a plane that was ASKED FOR could not be bound (the
+ *         plane is then un-staged); a NULL / 0 drop is not a failure.
  */
-void
+bool
 comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *split,
                               void *nt_handle,
                               uint64_t generation,
@@ -468,8 +492,14 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *split,
  *        with a live plane: per ADR-027/#801 an explicit wish is PUBLISH-only and
  *        never a blend gate, so the composite there always gates on the binary
  *        zone raster.
+ *
+ * @return false when this frame could not stage a composite (no plane surface,
+ *         a bind/open failure, or no composite unit) — the frame then runs
+ *         `composite=false`. The D3D11 tier names that rung
+ *         (@ref COMP_HUB_REASON_PLANE_UNAVAILABLE); the VK and D3D12 legs
+ *         degrade the 2D band and ignore it.
  */
-void
+bool
 comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *split,
                              void *nt_handle,
                              uint64_t generation,
@@ -518,6 +548,14 @@ comp_hub_d3d11_set_plane_format(struct comp_hub_d3d11 *split, uint32_t dxgi_form
  */
 bool
 comp_hub_d3d11_zone_dp_supported(struct comp_hub_d3d11 *split);
+
+/*!
+ * #2317 P2b — the scanout weaver's hardware zone grid (what
+ * `xrGetLocalZoneCapsDXR`-class queries report), for a producer whose own
+ * display processor the hub replaced. False when the weaver has no zones.
+ */
+bool
+comp_hub_d3d11_get_zone_grid(struct comp_hub_d3d11 *split, uint32_t *out_grid_w, uint32_t *out_grid_h);
 
 /*!
  * ADR-027 P4 — publish the last @ref COMP_HUB_D3D11_MASK_ZONE_BINARY raster as

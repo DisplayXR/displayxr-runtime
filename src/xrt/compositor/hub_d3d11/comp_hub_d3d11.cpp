@@ -162,6 +162,47 @@ struct comp_hub_d3d11
 		uint64_t cropped_value;
 		uint64_t frames;
 		uint64_t reopens;
+
+		/*!
+		 * #2317 P2b: the three PLANES on this route — the producer's own
+		 * NT-shared plane surfaces (Local2D over-flatten, 2D-under backdrop,
+		 * authored mask) opened on THIS device, read in place. They are
+		 * written on the producer's immediate context before it signals
+		 * @ref prod_value and read before this hub signals @ref cons_value,
+		 * so the atlas's two fences order them too: no transport, no copy,
+		 * no extra fence.
+		 */
+		struct split_direct_plane
+		{
+			HANDLE handle; //!< the source handle the open was made from
+			uint64_t gen;  //!< its allocation generation; a change re-opens
+			ID3D11Texture2D *tex;
+			ID3D11ShaderResourceView *srv;
+			uint32_t w, h;
+			//! The content seq staged for the next submit; 0 = unused this frame.
+			uint64_t seq;
+			//! The handle + generation whose open FAILED: never retried (or
+			//! logged) again until the producer hands a different one.
+			HANDLE failed_handle;
+			uint64_t failed_gen;
+		} planes[COMP_XBRIDGE_PLANE_COUNT];
+		/*!
+		 * The composite recipe of the frame @ref tex holds, snapshotted at
+		 * submit (#1140's rule, one level down: a repaint between two app
+		 * frames composites the recipe of the frame it re-weaves, never the
+		 * live CPU state). Same shape as an xbridge slot's stamp, so the one
+		 * composite reads either.
+		 */
+		struct comp_xbridge_recipe rec;
+		/*!
+		 * The zone-wish publish owed by the app frame being submitted. On this
+		 * route the authored mask plane IS the producer's surface, rewritten on
+		 * the producer's context before its signal, so the publish (which
+		 * samples it on THIS context) runs inside that frame's weave, after the
+		 * producer wait — not from the deposit half, where nothing orders it.
+		 */
+		bool publish_pending;
+		uint64_t publish_seq;
 	} direct;
 
 	//! Panel extent, for the placement line and the bridge's plane sizing.
@@ -221,6 +262,10 @@ struct comp_hub_d3d11
 	//! @{
 	bool bd_plane_live;
 	uint32_t bd_w, bd_h;
+	//! #2317 P2b: the backdrop extent last handed to the DP, for the
+	//! change-only lifecycle WARN in @ref split_set_backdrop.
+	uint32_t bd_handed_w, bd_handed_h;
+	bool bd_handed_logged;
 	uint64_t sideband_copies, sideband_skips, sideband_bytes;
 	//! @}
 
@@ -244,6 +289,14 @@ struct comp_hub_d3d11
 		bool warned;
 	};
 	struct split_mask_raster mask;
+	/*!
+	 * #2317 P2b review: the BINARY zone wish of a FEATHERED zones frame. The
+	 * composite samples the feather ramp (@ref mask); the published wish must
+	 * stay binary (#800/#803), so a feathered frame rasters both, exactly as the
+	 * D3D11 tier natively rasters its wish and feather masks separately. Only
+	 * ever ZONE_BINARY; only rastered when @ref mask is ZONE_FEATHER.
+	 */
+	struct split_mask_raster wish;
 
 	/*!
 	 * The raster the LAST APP FRAME produced. #868: a repaint replays
@@ -286,6 +339,8 @@ struct comp_hub_d3d11
 
 	//! ADR-027 P4 — the scanout weaver's zone capability, probed once.
 	int zone_dp_state;
+	//! #2317 P2b: what that probe returned, for @ref comp_hub_d3d11_get_zone_grid.
+	struct xrt_dp_local_zone_caps zone_caps;
 	bool zone_published;
 
 	/*!
@@ -510,6 +565,16 @@ split_plane_dp_view(struct comp_hub_d3d11 *s,
 	}
 	ptex->GetDesc(&pd);
 	ptex->Release();
+	/*
+	 * #2317 P2b: the format the copy below must land in is the SOURCE VIEW's.
+	 * A bridge egress plane is typed, so its view and texture agree; a DIRECT
+	 * plane is the producer's own scratch, which is TYPELESS when it carries an
+	 * `_SRGB` RTV sibling (#1795) — and a typeless format cannot back the SRV
+	 * created below. Same family either way, so the copy is valid.
+	 */
+	D3D11_SHADER_RESOURCE_VIEW_DESC psd = {};
+	psrv->GetDesc(&psd);
+	const DXGI_FORMAT src_fmt = psd.Format;
 
 	// Passthrough: the plane is exactly what the display processor asked for.
 	if (pd.Width == w && pd.Height == h) {
@@ -526,14 +591,14 @@ split_plane_dp_view(struct comp_hub_d3d11 *s,
 	 * dropped, not failed, and the display processor would sample a never-written
 	 * texture with every counter healthy.
 	 */
-	if (fmt != pd.Format && !v->fmt_warned) {
+	if (fmt != src_fmt && !v->fmt_warned) {
 		v->fmt_warned = true;
 		U_LOG_W(
 		    "%s: DP-view format 0x%x requested but the plane is 0x%x — using the plane's, because a "
 		    "cross-family CopySubresourceRegion is silently dropped (#1178)",
-		    what, (unsigned)fmt, (unsigned)pd.Format);
+		    what, (unsigned)fmt, (unsigned)src_fmt);
 	}
-	fmt = pd.Format;
+	fmt = src_fmt;
 
 	const bool need_alloc = (v->tex == nullptr) || (v->srv == nullptr) || v->w != w || v->h != h;
 	if (need_alloc) {
@@ -637,9 +702,8 @@ split_release_mask(struct comp_hub_d3d11::split_mask_raster *m)
 
 //! (Re)allocate the R8 RTV + staged SRV pair at @p w x @p h on the OUT device.
 static bool
-split_mask_ensure(struct comp_hub_d3d11 *s, uint32_t w, uint32_t h)
+split_mask_ensure(struct comp_hub_d3d11 *s, struct comp_hub_d3d11::split_mask_raster *m, uint32_t w, uint32_t h)
 {
-	struct comp_hub_d3d11::split_mask_raster *m = &s->mask;
 	if (m->tex != nullptr && m->w == w && m->h == h) {
 		return true;
 	}
@@ -685,10 +749,14 @@ split_mask_ensure(struct comp_hub_d3d11 *s, uint32_t w, uint32_t h)
 
 //! One `ClearView` of @p value over @p r, clamped into the raster.
 static void
-split_mask_fill(
-    struct comp_hub_d3d11 *s, ID3D11DeviceContext1 *ctx1, const struct xrt_rect *r, int32_t inset, float value)
+split_mask_fill(struct comp_hub_d3d11 *s,
+                struct comp_hub_d3d11::split_mask_raster *m,
+                ID3D11DeviceContext1 *ctx1,
+                const struct xrt_rect *r,
+                int32_t inset,
+                float value)
 {
-	struct comp_hub_d3d11::split_mask_raster *m = &s->mask;
+	(void)s;
 	int32_t left = r->offset.w + inset;
 	int32_t top = r->offset.h + inset;
 	int32_t right = r->offset.w + r->extent.w - inset;
@@ -737,6 +805,14 @@ static void
 split_release_direct(struct comp_hub_d3d11 *s)
 {
 	auto &d = s->direct;
+	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
+		if (d.planes[p].srv != NULL) {
+			d.planes[p].srv->Release();
+		}
+		if (d.planes[p].tex != NULL) {
+			d.planes[p].tex->Release();
+		}
+	}
 	if (d.srv != NULL) {
 		d.srv->Release();
 	}
@@ -777,6 +853,7 @@ split_release_out(struct comp_hub_d3d11 *s)
 	comp_hub_d3d11_clear_zone_wish(s);
 	comp_d3d11_outcomp_destroy(&s->outcomp);
 	split_release_mask(&s->mask);
+	split_release_mask(&s->wish);
 	s->repaint_mask_srv = NULL;
 	if (s->hud_tex != NULL) {
 		s->hud_tex->Release();
@@ -1128,7 +1205,8 @@ static void
 split_submit_direct(struct comp_hub_d3d11 *s,
                     const struct comp_hub_d3d11_handoff *handoff,
                     uint32_t content_w,
-                    uint32_t content_h);
+                    uint32_t content_h,
+                    const struct comp_xbridge_recipe *rec);
 static bool
 split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_rect *canvas);
 
@@ -1602,7 +1680,244 @@ comp_hub_d3d11_set_plane_format(struct comp_hub_d3d11 *s, uint32_t dxgi_format)
 	s->plane_fmt = (DXGI_FORMAT)dxgi_format;
 }
 
-extern "C" void
+/*
+ * #2317 P2b — the plane TRANSPORT, picked by the ingress. Everything above the
+ * transport (the recipe, the raster, the composite, the wish publish) is one
+ * code path; only "how does a producer plane surface become an SRV on this
+ * device" differs:
+ *
+ *  - comp_xbridge ingress: the bridge's plane chains (Option I producer read,
+ *    copy into the slot's egress plane), exactly as the VK and D3D12 legs ride.
+ *  - DIRECT ingress (same adapter, the D3D11 tier): the producer's NT-shared
+ *    surface opened on THIS device and read in place. Ordered by the atlas's
+ *    own two fences, because the producer writes its planes on the same
+ *    immediate context, before the producer signal, and every read here is
+ *    recorded before the consumer signal.
+ */
+
+//! True when some plane transport exists on this route.
+static inline bool
+split_has_plane_transport(struct comp_hub_d3d11 *s)
+{
+	return s->xbridge != nullptr || s->direct.active;
+}
+
+/*!
+ * DIRECT: open @p handle on the hub device (re-opened only on a new handle or
+ * generation, so the steady state is a compare). The SRV is created in @p fmt —
+ * the producer's scratch is TYPELESS when it carries an `_SRGB` RTV sibling
+ * (#1795), so the texture's own format cannot be used to view it.
+ */
+static bool
+split_direct_bind_plane(struct comp_hub_d3d11 *s, uint32_t plane, void *handle, uint64_t generation, DXGI_FORMAT fmt)
+{
+	if (plane >= COMP_XBRIDGE_PLANE_COUNT || handle == nullptr) {
+		return false;
+	}
+	auto &p = s->direct.planes[plane];
+	if (p.srv != nullptr && p.handle == (HANDLE)handle && p.gen == generation) {
+		return true;
+	}
+	if (p.failed_handle == (HANDLE)handle && p.failed_gen == generation) {
+		return false; // this exact surface already refused; the caller names the rung
+	}
+	if (p.srv != nullptr) {
+		p.srv->Release();
+	}
+	if (p.tex != nullptr) {
+		p.tex->Release();
+	}
+	p = {};
+
+	ID3D11Device1 *od1 = nullptr;
+	HRESULT hr = E_NOINTERFACE;
+	if (SUCCEEDED(s->out_dev->QueryInterface(__uuidof(ID3D11Device1), (void **)&od1)) && od1 != nullptr) {
+		hr = od1->OpenSharedResource1((HANDLE)handle, __uuidof(ID3D11Texture2D), (void **)&p.tex);
+		od1->Release();
+	}
+	if (SUCCEEDED(hr) && p.tex != nullptr) {
+		D3D11_TEXTURE2D_DESC td = {};
+		p.tex->GetDesc(&td);
+		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+		sd.Format = fmt;
+		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		sd.Texture2D.MipLevels = 1;
+		hr = s->out_dev->CreateShaderResourceView(p.tex, &sd, &p.srv);
+		p.w = td.Width;
+		p.h = td.Height;
+	}
+	if (FAILED(hr) || p.srv == nullptr) {
+		if (p.tex != nullptr) {
+			p.tex->Release();
+		}
+		p = {};
+		p.failed_handle = (HANDLE)handle;
+		p.failed_gen = generation;
+		// On a (re)bind only, never per frame: a failed open is retried only
+		// when the producer hands a new handle or generation.
+		U_LOG_W(
+		    "#2317 P2b hub: plane %u would not open on the hub device (hr=0x%08lx) — that plane "
+		    "does not composite on this route",
+		    plane, (unsigned long)hr);
+		return false;
+	}
+	p.handle = (HANDLE)handle;
+	p.gen = generation;
+	return true;
+}
+
+//! Bind a producer plane on whichever transport this route has.
+static bool
+split_plane_bind(struct comp_hub_d3d11 *s,
+                 uint32_t plane,
+                 void *handle,
+                 uint64_t generation,
+                 DXGI_FORMAT fmt,
+                 uint32_t alloc_w,
+                 uint32_t alloc_h)
+{
+	if (s->direct.active) {
+		return split_direct_bind_plane(s, plane, handle, generation, fmt);
+	}
+	return comp_xbridge_bind_plane(s->xbridge, plane, handle, generation, (uint32_t)fmt, alloc_w, alloc_h);
+}
+
+//! Stage (or, with @p seq 0, un-stage) a plane for the next submit.
+static void
+split_plane_stage(
+    struct comp_hub_d3d11 *s, uint32_t plane, uint64_t seq, int32_t dx, int32_t dy, uint32_t dw, uint32_t dh)
+{
+	if (s->direct.active) {
+		if (plane < COMP_XBRIDGE_PLANE_COUNT) {
+			s->direct.planes[plane].seq = seq;
+		}
+		return;
+	}
+	comp_xbridge_stage_plane(s->xbridge, plane, seq, dx, dy, dw, dh);
+}
+
+/*
+ * #2317 P2b — the consume-half RESOLVERS: "this frame's recipe" and "this
+ * frame's plane", from an xbridge egress slot or from the one DIRECT atlas. The
+ * composite, the backdrop hand-off and the wish publish read only these, so both
+ * routes run the same code (@p slot is ignored on DIRECT).
+ */
+
+//! The recipe of the frame @p slot holds (xbridge), or of the DIRECT atlas.
+static bool
+split_frame_recipe(struct comp_hub_d3d11 *s, int32_t slot, struct comp_xbridge_recipe *out)
+{
+	if (s->direct.active) {
+		if (!s->direct.have_frame) {
+			return false;
+		}
+		*out = s->direct.rec;
+		return true;
+	}
+	if (slot < 0) {
+		return false;
+	}
+	return comp_xbridge_slot_recipe(s->xbridge, slot, out);
+}
+
+/*!
+ * The SRV of @p plane for the frame whose recipe carried @p seq, or NULL. On
+ * DIRECT the recipe's valid bit is the proof (the frame staged that plane and
+ * the surface is the producer's own, never rewritten under a weave); on xbridge
+ * the bridge proves @p seq against the slot (#918 review F3).
+ */
+static ID3D11ShaderResourceView *
+split_frame_plane_srv(struct comp_hub_d3d11 *s, int32_t slot, uint32_t plane, uint64_t seq)
+{
+	if (s->direct.active) {
+		return plane < COMP_XBRIDGE_PLANE_COUNT ? s->direct.planes[plane].srv : nullptr;
+	}
+	return static_cast<ID3D11ShaderResourceView *>(comp_xbridge_get_plane_srv(s->xbridge, slot, plane, seq));
+}
+
+//! The allocated extent of @p plane's surface on this device.
+static bool
+split_frame_plane_extent(struct comp_hub_d3d11 *s, uint32_t plane, uint32_t *out_w, uint32_t *out_h)
+{
+	if (s->direct.active) {
+		if (plane >= COMP_XBRIDGE_PLANE_COUNT || s->direct.planes[plane].srv == nullptr) {
+			return false;
+		}
+		*out_w = s->direct.planes[plane].w;
+		*out_h = s->direct.planes[plane].h;
+		return true;
+	}
+	return comp_xbridge_plane_extent(s->xbridge, plane, out_w, out_h);
+}
+
+/*!
+ * This frame's composite recipe from the staged CPU state — the one stamp the
+ * xbridge route hands to @ref comp_xbridge_stage_recipe and the DIRECT route
+ * snapshots beside its atlas.
+ */
+static void
+split_build_recipe(struct comp_hub_d3d11 *s, uint32_t content_w, uint32_t content_h, struct comp_xbridge_recipe *r)
+{
+	*r = {};
+	r->composite = s->l2d_plane_live;
+	r->region_w = s->l2d_plane_live ? s->comp_region_w : content_w;
+	r->region_h = s->l2d_plane_live ? s->comp_region_h : content_h;
+	r->bd_w = s->bd_w;
+	r->bd_h = s->bd_h;
+	if (s->l2d_plane_live) {
+		r->composite_mode = s->comp_mode;
+		r->mask_kind = s->comp_mask_kind;
+		r->opaque_present = s->comp_opaque;
+		r->cx = s->comp_cx;
+		r->cy = s->comp_cy;
+		r->cw = s->comp_cw;
+		r->ch = s->comp_ch;
+	}
+}
+
+/*!
+ * VK-1b — hand the display processor the weaving frame's 2D-under backdrop, from
+ * that frame's own recipe rather than live CPU state (#1140). A NULL SRV is the
+ * correct clear: the frame produced no 2D-under layers, and the display
+ * processor falls back to the captured desktop alone. Must precede process_atlas.
+ */
+static void
+split_set_backdrop(struct comp_hub_d3d11 *s, int32_t slot)
+{
+	struct comp_xbridge_recipe rec = {};
+	ID3D11ShaderResourceView *bd_srv = nullptr;
+	uint32_t bd_w = 0, bd_h = 0;
+	if (split_frame_recipe(s, slot, &rec) && rec.bd_w > 0 && rec.bd_h > 0 &&
+	    (rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_BACKDROP)) != 0) {
+		const uint64_t bd_seq = rec.plane_seq[COMP_XBRIDGE_PLANE_BACKDROP];
+		bd_srv = split_plane_dp_view(s, &s->dp_bd_view,
+		                             split_frame_plane_srv(s, slot, COMP_XBRIDGE_PLANE_BACKDROP, bd_seq),
+		                             bd_seq, rec.bd_w, rec.bd_h, split_plane_fmt(s), "backdrop publish");
+		if (bd_srv != nullptr) {
+			bd_w = rec.bd_w;
+			bd_h = rec.bd_h;
+		}
+	}
+	/*
+	 * On a change of what the DP is handed (appear / resize / withdraw) only —
+	 * and only the session's FIRST appearance is a WARN: an app that toggles an
+	 * under-layer every other frame would otherwise log at frame rate.
+	 */
+	if (bd_w != s->bd_handed_w || bd_h != s->bd_handed_h) {
+		s->bd_handed_w = bd_w;
+		s->bd_handed_h = bd_h;
+		if (bd_w != 0 && !s->bd_handed_logged) {
+			s->bd_handed_logged = true;
+			U_LOG_W("#2317 P2b hub: 2D-under backdrop handed to the DP: %ux%u (%s)", bd_w, bd_h,
+			        s->direct.active ? "direct" : "xbridge");
+		} else {
+			U_LOG_I("#2317 P2b hub: 2D-under backdrop handed to the DP: %ux%u", bd_w, bd_h);
+		}
+	}
+	xrt_display_processor_d3d11_set_background_2d(s->dp, bd_srv, bd_w, bd_h);
+}
+
+extern "C" bool
 comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *s,
                               void *nt_handle,
                               uint64_t generation,
@@ -1616,8 +1931,8 @@ comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *s,
                               uint32_t bd_w,
                               uint32_t bd_h)
 {
-	if (s == nullptr || s->xbridge == nullptr) {
-		return;
+	if (s == nullptr || !split_has_plane_transport(s)) {
+		return false;
 	}
 
 	/*
@@ -1626,11 +1941,11 @@ comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *s,
 	 * lending the weave an older frame's backdrop.
 	 */
 	if (nt_handle == nullptr || content_seq == 0 || bd_w == 0 || bd_h == 0) {
-		comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, 0, 0, 0, 0, 0);
+		split_plane_stage(s, COMP_XBRIDGE_PLANE_BACKDROP, 0, 0, 0, 0, 0);
 		s->bd_plane_live = false;
 		s->bd_w = 0;
 		s->bd_h = 0;
-		return;
+		return true; // nothing asked for, nothing failed
 	}
 
 	/*
@@ -1639,58 +1954,49 @@ comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *s,
 	 * drains the producer first, which is why the surface is allocated once at
 	 * the panel and never at the region.
 	 */
-	if (!comp_xbridge_bind_plane(s->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, nt_handle, generation,
-	                             (uint32_t)split_plane_fmt(s), alloc_w, alloc_h)) {
+	if (!split_plane_bind(s, COMP_XBRIDGE_PLANE_BACKDROP, nt_handle, generation, split_plane_fmt(s), alloc_w,
+	                      alloc_h)) {
 		/*
 		 * The backdrop degrades on its OWN — a session without one simply has
-		 * no 2D-under band, and the 3D weave is untouched. Never a reason to
-		 * give the scanout adapter back.
+		 * no 2D-under band, and the 3D weave is untouched. The VK and D3D12
+		 * legs keep the scanout adapter; the D3D11 tier reads the false and
+		 * names it (#2317 P2b `plane_unavailable`).
 		 */
-		comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, 0, 0, 0, 0, 0);
+		split_plane_stage(s, COMP_XBRIDGE_PLANE_BACKDROP, 0, 0, 0, 0, 0);
 		s->bd_plane_live = false;
 		s->bd_w = 0;
 		s->bd_h = 0;
-		return;
+		return false;
 	}
 
-	comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, content_seq, dirty_x, dirty_y, dirty_w,
-	                         dirty_h);
+	split_plane_stage(s, COMP_XBRIDGE_PLANE_BACKDROP, content_seq, dirty_x, dirty_y, dirty_w, dirty_h);
 	s->bd_plane_live = true;
 	s->bd_w = bd_w;
 	s->bd_h = bd_h;
+	return true;
 }
 
 extern "C" void
 comp_hub_d3d11_invalidate_plane(struct comp_hub_d3d11 *s, uint32_t plane)
 {
+	// DIRECT has no slots holding older copies of a plane: the one surface IS
+	// the producer's, so there is nothing to invalidate.
 	if (s == nullptr || s->xbridge == nullptr) {
 		return;
 	}
 	comp_xbridge_invalidate_plane(s->xbridge, plane);
 }
 
-extern "C" bool
-comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
-                           uint32_t kind,
-                           const struct xrt_rect *rects,
-                           const float *feather_px,
-                           uint32_t rect_count,
-                           uint32_t region_w,
-                           uint32_t region_h)
+static bool
+split_raster_into(struct comp_hub_d3d11 *s,
+                  struct comp_hub_d3d11::split_mask_raster *m,
+                  uint32_t kind,
+                  const struct xrt_rect *rects,
+                  const float *feather_px,
+                  uint32_t rect_count,
+                  uint32_t region_w,
+                  uint32_t region_h)
 {
-	if (s == nullptr || s->out_dev == nullptr || region_w == 0 || region_h == 0) {
-		return false;
-	}
-	if (kind == COMP_HUB_D3D11_MASK_NONE || rect_count == 0 || rects == nullptr) {
-		s->repaint_mask_srv = nullptr;
-		return false;
-	}
-	if (rect_count > XRT_MAX_LAYERS) {
-		rect_count = XRT_MAX_LAYERS;
-	}
-
-	struct comp_hub_d3d11::split_mask_raster *m = &s->mask;
-
 	// Dirty-check on everything the raster is a function of. The steady-state
 	// frame reuses the staged SRV and touches the GPU not at all.
 	bool dirty =
@@ -1705,12 +2011,10 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
 		}
 	}
 	if (!dirty) {
-		s->repaint_mask_srv = m->srv;
 		return true;
 	}
 
-	if (!split_mask_ensure(s, region_w, region_h)) {
-		s->repaint_mask_srv = nullptr;
+	if (!split_mask_ensure(s, m, region_w, region_h)) {
 		return false;
 	}
 
@@ -1722,7 +2026,6 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
 			    "#918 VK-1b: the out device has no ID3D11DeviceContext1, so the mask raster has no "
 			    "ClearView — 2D content does not composite under the split for this session");
 		}
-		s->repaint_mask_srv = nullptr;
 		return false;
 	}
 
@@ -1746,11 +2049,11 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
 		if (kind == COMP_HUB_D3D11_MASK_IMPLICIT) {
 			// Inverse of the zone raster: M=0 (show the flattened 2D) inside
 			// each Local2D rect, M=1 (keep the weave) everywhere else.
-			split_mask_fill(s, ctx1, &rects[i], 0, 0.0f);
+			split_mask_fill(s, m, ctx1, &rects[i], 0, 0.0f);
 			continue;
 		}
 		if (kind == COMP_HUB_D3D11_MASK_ZONE_BINARY) {
-			split_mask_fill(s, ctx1, &rects[i], 0, 1.0f);
+			split_mask_fill(s, m, ctx1, &rects[i], 0, 1.0f);
 			continue;
 		}
 
@@ -1788,7 +2091,7 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
 			if (inset > max_inset) {
 				inset = max_inset;
 			}
-			split_mask_fill(s, ctx1, &rects[i], inset, v);
+			split_mask_fill(s, m, ctx1, &rects[i], inset, v);
 		}
 	}
 	ctx1->Release();
@@ -1807,9 +2110,42 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
 
 	// On a rect/dims change only, never per frame.
 	U_LOG_W("#918 VK-1b: out-device mask raster kind=%u %ux%u, %u rect(s)", kind, region_w, region_h, rect_count);
-
-	s->repaint_mask_srv = m->srv;
 	return true;
+}
+
+extern "C" bool
+comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
+                           uint32_t kind,
+                           const struct xrt_rect *rects,
+                           const float *feather_px,
+                           uint32_t rect_count,
+                           uint32_t region_w,
+                           uint32_t region_h)
+{
+	if (s == nullptr || s->out_dev == nullptr || region_w == 0 || region_h == 0) {
+		return false;
+	}
+	if (kind == COMP_HUB_D3D11_MASK_NONE || rect_count == 0 || rects == nullptr) {
+		s->repaint_mask_srv = nullptr;
+		return false;
+	}
+	if (rect_count > XRT_MAX_LAYERS) {
+		rect_count = XRT_MAX_LAYERS;
+	}
+	const bool ok = split_raster_into(s, &s->mask, kind, rects, feather_px, rect_count, region_w, region_h);
+	s->repaint_mask_srv = ok ? s->mask.srv : nullptr;
+	/*
+	 * #2317 P2b review: a FEATHERED zones frame also rasters its BINARY wish,
+	 * for the publish — the composite's ramp never reaches the vendor
+	 * (#800/#803), and publishing nothing would leave the vendor holding a stale
+	 * wish while the zone moves. A failure here costs the publish only.
+	 */
+	if (ok && kind == COMP_HUB_D3D11_MASK_ZONE_FEATHER &&
+	    !split_raster_into(s, &s->wish, COMP_HUB_D3D11_MASK_ZONE_BINARY, rects, nullptr, rect_count, region_w,
+	                       region_h)) {
+		s->wish.kind = COMP_HUB_D3D11_MASK_NONE;
+	}
+	return ok;
 }
 
 /*!
@@ -1845,14 +2181,14 @@ split_ensure_outcomp(struct comp_hub_d3d11 *s)
 extern "C" void
 comp_hub_d3d11_stage_no_composite(struct comp_hub_d3d11 *s)
 {
-	if (s == nullptr || s->xbridge == nullptr) {
+	if (s == nullptr || !split_has_plane_transport(s)) {
 		return;
 	}
-	comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, 0, 0, 0, 0, 0);
+	split_plane_stage(s, COMP_XBRIDGE_PLANE_LOCAL2D, 0, 0, 0, 0, 0);
 	s->l2d_plane_live = false;
 }
 
-extern "C" void
+extern "C" bool
 comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *s,
                              void *nt_handle,
                              uint64_t generation,
@@ -1873,8 +2209,8 @@ comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *s,
                              bool opaque_present,
                              bool mask_is_plane)
 {
-	if (s == nullptr || s->xbridge == nullptr) {
-		return;
+	if (s == nullptr || !split_has_plane_transport(s)) {
+		return false;
 	}
 
 	/*
@@ -1886,11 +2222,11 @@ comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *s,
 	 */
 	if (nt_handle == nullptr || content_seq == 0 || region_w == 0 || region_h == 0 || !split_ensure_outcomp(s)) {
 		comp_hub_d3d11_stage_no_composite(s);
-		return;
+		return false;
 	}
 
-	if (!comp_xbridge_bind_plane(s->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, nt_handle, generation,
-	                             (uint32_t)split_plane_fmt(s), alloc_w, alloc_h)) {
+	if (!split_plane_bind(s, COMP_XBRIDGE_PLANE_LOCAL2D, nt_handle, generation, split_plane_fmt(s), alloc_w,
+	                      alloc_h)) {
 		/*
 		 * #918 review D4 — the Local2D plane IS the composite's `twod` under the
 		 * split, so a frame that could not bind it has no composite to stamp.
@@ -1906,11 +2242,10 @@ comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *s,
 			    "under the split for this session; the 3D weave is unaffected");
 		}
 		comp_hub_d3d11_stage_no_composite(s);
-		return;
+		return false;
 	}
 
-	comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, content_seq, dirty_x, dirty_y, dirty_w,
-	                         dirty_h);
+	split_plane_stage(s, COMP_XBRIDGE_PLANE_LOCAL2D, content_seq, dirty_x, dirty_y, dirty_w, dirty_h);
 	s->l2d_plane_live = true;
 	s->comp_region_w = region_w;
 	s->comp_region_h = region_h;
@@ -1926,12 +2261,13 @@ comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *s,
 	 * that landed with this slot; every other kind is the out-device raster.
 	 */
 	s->comp_mask_kind = mask_is_plane ? COMP_XBRIDGE_MASK_PLANE : COMP_XBRIDGE_MASK_OUT_RASTER;
+	return true;
 }
 
 extern "C" bool
 comp_hub_d3d11_bind_mask_plane(struct comp_hub_d3d11 *s, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h)
 {
-	if (s == nullptr || s->xbridge == nullptr) {
+	if (s == nullptr || !split_has_plane_transport(s)) {
 		return true; // nothing to bind against, and nothing broken
 	}
 	if (nt_handle == nullptr || w == 0 || h == 0) {
@@ -1942,8 +2278,7 @@ comp_hub_d3d11_bind_mask_plane(struct comp_hub_d3d11 *s, void *nt_handle, uint64
 
 	// Sized at the MASK (#918 review F5), so a dims change rebuilds the chain.
 	// On-change only: the steady-state call is the bridge's own early-out.
-	if (!comp_xbridge_bind_plane(s->xbridge, COMP_XBRIDGE_PLANE_MASK, nt_handle, generation,
-	                             (uint32_t)DXGI_FORMAT_R8_UNORM, w, h)) {
+	if (!split_plane_bind(s, COMP_XBRIDGE_PLANE_MASK, nt_handle, generation, DXGI_FORMAT_R8_UNORM, w, h)) {
 		s->mask_plane_live = false;
 		s->mask_plane_gen = 0;
 		return false;
@@ -1956,15 +2291,15 @@ comp_hub_d3d11_bind_mask_plane(struct comp_hub_d3d11 *s, void *nt_handle, uint64
 extern "C" void
 comp_hub_d3d11_stage_mask_plane(struct comp_hub_d3d11 *s, uint64_t content_seq, uint32_t w, uint32_t h)
 {
-	if (s == nullptr || s->xbridge == nullptr) {
+	if (s == nullptr || !split_has_plane_transport(s)) {
 		return;
 	}
 	if (!s->mask_plane_live || content_seq == 0) {
 		// 0 is the bridge's "this frame does not use the plane".
-		comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
+		split_plane_stage(s, COMP_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
 		return;
 	}
-	comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_MASK, content_seq, 0, 0, w, h);
+	split_plane_stage(s, COMP_XBRIDGE_PLANE_MASK, content_seq, 0, 0, w, h);
 }
 
 extern "C" bool
@@ -1978,6 +2313,7 @@ comp_hub_d3d11_zone_dp_supported(struct comp_hub_d3d11 *s)
 		caps.struct_size = sizeof(caps);
 		const bool ok = xrt_display_processor_d3d11_get_local_zone_caps(s->dp, &caps) && caps.supported != 0;
 		s->zone_dp_state = ok ? 1 : 2;
+		s->zone_caps = caps;
 		if (ok) {
 			U_LOG_W("#918 VK-1b: scanout weaver supports local zones — grid %ux%u max_mask %ux%u",
 			        caps.zone_grid_width, caps.zone_grid_height, caps.max_mask_width, caps.max_mask_height);
@@ -1986,8 +2322,8 @@ comp_hub_d3d11_zone_dp_supported(struct comp_hub_d3d11 *s)
 	return s->zone_dp_state == 1;
 }
 
-extern "C" void
-comp_hub_d3d11_publish_zone_wish(struct comp_hub_d3d11 *s, uint64_t seq)
+static void
+split_publish_zone_wish_now(struct comp_hub_d3d11 *s, uint64_t seq)
 {
 	if (s == nullptr || s->dp == nullptr || s->hwnd == nullptr || !comp_hub_d3d11_zone_dp_supported(s)) {
 		return;
@@ -2010,16 +2346,16 @@ comp_hub_d3d11_publish_zone_wish(struct comp_hub_d3d11 *s, uint64_t seq)
 		 * so a not-yet-landed authored wish publishes nothing and the vendor keeps
 		 * the one it already has.
 		 */
-		const int32_t wslot = comp_xbridge_get_weave_slot(s->xbridge);
+		// #2317 P2b: the weave slot on xbridge; the frame being woven on DIRECT.
+		const int32_t wslot = s->direct.active ? -1 : comp_xbridge_get_weave_slot(s->xbridge);
 		struct comp_xbridge_recipe rec = {};
-		if (wslot < 0 || !comp_xbridge_slot_recipe(s->xbridge, wslot, &rec) ||
-		    (rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_MASK)) == 0) {
+		if (!split_frame_recipe(s, wslot, &rec) || (rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_MASK)) == 0) {
 			return;
 		}
 		const uint64_t want = rec.plane_seq[COMP_XBRIDGE_PLANE_MASK];
-		void *plane_srv = comp_xbridge_get_plane_srv(s->xbridge, wslot, COMP_XBRIDGE_PLANE_MASK, want);
+		void *plane_srv = split_frame_plane_srv(s, wslot, COMP_XBRIDGE_PLANE_MASK, want);
 		uint32_t pw = 0, ph = 0;
-		if (plane_srv == nullptr || !comp_xbridge_plane_extent(s->xbridge, COMP_XBRIDGE_PLANE_MASK, &pw, &ph) ||
+		if (plane_srv == nullptr || !split_frame_plane_extent(s, COMP_XBRIDGE_PLANE_MASK, &pw, &ph) ||
 		    pw == 0 || ph == 0) {
 			return;
 		}
@@ -2037,12 +2373,19 @@ comp_hub_d3d11_publish_zone_wish(struct comp_hub_d3d11 *s, uint64_t seq)
 		 * a frame whose composite sampled the feather mask still publishes the
 		 * binary one - which is why this reads the raster's KIND, not just its SRV.
 		 */
-		if (s->mask.srv == nullptr || s->mask.kind != COMP_HUB_D3D11_MASK_ZONE_BINARY) {
+		// #2317 P2b review: a feathered frame publishes its separate binary wish.
+		const struct comp_hub_d3d11::split_mask_raster *wm =
+		    (s->mask.kind == COMP_HUB_D3D11_MASK_ZONE_BINARY) ? &s->mask
+		    : (s->mask.kind == COMP_HUB_D3D11_MASK_ZONE_FEATHER &&
+		       s->wish.kind == COMP_HUB_D3D11_MASK_ZONE_BINARY)
+		        ? &s->wish
+		        : nullptr;
+		if (wm == nullptr || wm->srv == nullptr) {
 			return;
 		}
-		srv = s->mask.srv;
-		mw = s->mask.w;
-		mh = s->mask.h;
+		srv = wm->srv;
+		mw = wm->w;
+		mh = wm->h;
 	}
 	if (srv == nullptr || mw == 0 || mh == 0) {
 		return;
@@ -2060,9 +2403,49 @@ comp_hub_d3d11_publish_zone_wish(struct comp_hub_d3d11 *s, uint64_t seq)
 	}
 }
 
+extern "C" bool
+comp_hub_d3d11_get_zone_grid(struct comp_hub_d3d11 *s, uint32_t *out_grid_w, uint32_t *out_grid_h)
+{
+	if (!comp_hub_d3d11_zone_dp_supported(s)) {
+		return false;
+	}
+	if (out_grid_w != nullptr) {
+		*out_grid_w = s->zone_caps.zone_grid_width;
+	}
+	if (out_grid_h != nullptr) {
+		*out_grid_h = s->zone_caps.zone_grid_height;
+	}
+	return true;
+}
+
+extern "C" void
+comp_hub_d3d11_publish_zone_wish(struct comp_hub_d3d11 *s, uint64_t seq)
+{
+	if (s == nullptr) {
+		return;
+	}
+	/*
+	 * #2317 P2b — DIRECT defers to the frame's own weave (see
+	 * comp_hub_d3d11::direct.publish_pending): the plane this samples is the
+	 * producer's surface, written before the producer's signal and ordered for
+	 * THIS context only by the weave's wait on it. The publish is a per-frame
+	 * sideband, so running it a few hundred microseconds later in the same app
+	 * frame changes nothing the vendor can see.
+	 */
+	if (s->direct.active) {
+		s->direct.publish_pending = true;
+		s->direct.publish_seq = seq;
+		return;
+	}
+	split_publish_zone_wish_now(s, seq);
+}
+
 extern "C" void
 comp_hub_d3d11_clear_zone_wish(struct comp_hub_d3d11 *s)
 {
+	if (s != nullptr) {
+		s->direct.publish_pending = false; // a withdrawn wish owes no publish
+	}
 	if (s == nullptr || s->dp == nullptr || !s->zone_published) {
 		return;
 	}
@@ -2168,9 +2551,13 @@ comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *s,
 		s->gen_view_h = view_h;
 	}
 
-	// #2317 P1b: DIRECT ingress has no transport to size, nominate or submit.
+	struct comp_xbridge_recipe r = {};
+	split_build_recipe(s, content_w, content_h, &r);
+
+	// #2317 P1b: DIRECT ingress has no transport to size, nominate or submit
+	// (P2b: the recipe rides beside the one atlas instead of in a slot).
 	if (s->direct.active) {
-		split_submit_direct(s, handoff, content_w, content_h);
+		split_submit_direct(s, handoff, content_w, content_h, &r);
 		return;
 	}
 
@@ -2193,21 +2580,6 @@ comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *s,
 	 * width and height. A consume half can never read a slot claiming pixels it
 	 * does not have — every `plane_valid` test fails closed.
 	 */
-	struct comp_xbridge_recipe r = {};
-	r.composite = s->l2d_plane_live;
-	r.region_w = s->l2d_plane_live ? s->comp_region_w : content_w;
-	r.region_h = s->l2d_plane_live ? s->comp_region_h : content_h;
-	r.bd_w = s->bd_w;
-	r.bd_h = s->bd_h;
-	if (s->l2d_plane_live) {
-		r.composite_mode = s->comp_mode;
-		r.mask_kind = s->comp_mask_kind;
-		r.opaque_present = s->comp_opaque;
-		r.cx = s->comp_cx;
-		r.cy = s->comp_cy;
-		r.cw = s->comp_cw;
-		r.ch = s->comp_ch;
-	}
 	comp_xbridge_stage_recipe(s->xbridge, &r);
 
 	/*
@@ -2298,7 +2670,7 @@ split_composite(struct comp_hub_d3d11 *s, int32_t slot, bool is_repaint, ID3D11T
 	}
 
 	struct comp_xbridge_recipe rec = {};
-	if (!comp_xbridge_slot_recipe(s->xbridge, slot, &rec) || !rec.composite) {
+	if (!split_frame_recipe(s, slot, &rec) || !rec.composite) {
 		// A projection-only frame filled this slot. The correct answer, not a bail.
 		return false;
 	}
@@ -2328,8 +2700,8 @@ split_composite(struct comp_hub_d3d11 *s, int32_t slot, bool is_repaint, ID3D11T
 		s->composite_bails++;
 		return false;
 	}
-	auto *twod_srv = static_cast<ID3D11ShaderResourceView *>(comp_xbridge_get_plane_srv(
-	    s->xbridge, slot, COMP_XBRIDGE_PLANE_LOCAL2D, rec.plane_seq[COMP_XBRIDGE_PLANE_LOCAL2D]));
+	ID3D11ShaderResourceView *twod_srv =
+	    split_frame_plane_srv(s, slot, COMP_XBRIDGE_PLANE_LOCAL2D, rec.plane_seq[COMP_XBRIDGE_PLANE_LOCAL2D]);
 	if (twod_srv == nullptr) {
 		s->composite_bails++;
 		return false;
@@ -2357,8 +2729,8 @@ split_composite(struct comp_hub_d3d11 *s, int32_t slot, bool is_repaint, ID3D11T
 			s->composite_bails++;
 			return false;
 		}
-		mask_srv = static_cast<ID3D11ShaderResourceView *>(comp_xbridge_get_plane_srv(
-		    s->xbridge, slot, COMP_XBRIDGE_PLANE_MASK, rec.plane_seq[COMP_XBRIDGE_PLANE_MASK]));
+		mask_srv =
+		    split_frame_plane_srv(s, slot, COMP_XBRIDGE_PLANE_MASK, rec.plane_seq[COMP_XBRIDGE_PLANE_MASK]);
 	} else {
 		mask_srv = s->repaint_mask_srv;
 	}
@@ -2707,9 +3079,12 @@ static void
 split_submit_direct(struct comp_hub_d3d11 *s,
                     const struct comp_hub_d3d11_handoff *handoff,
                     uint32_t content_w,
-                    uint32_t content_h)
+                    uint32_t content_h,
+                    const struct comp_xbridge_recipe *rec)
 {
 	auto &d = s->direct;
+	// Every return that does not nominate this frame drops its recipe with it.
+	d.rec = {};
 	/*
 	 * #2317 review: the producer has ALREADY signalled this frame's value. Any
 	 * return below that does not nominate it must also drop the previous one —
@@ -2773,6 +3148,20 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 	d.content_w = content_w;
 	d.content_h = content_h;
 	d.gen = s->layout_gen;
+	/*
+	 * #2317 P2b: the recipe, with the planes this frame staged marked valid —
+	 * the DIRECT twin of the bridge's per-slot plane stamp. A plane is valid
+	 * when the frame staged content for it (seq != 0) AND its surface is open
+	 * here; otherwise every consumer fails closed, as on a slot.
+	 */
+	d.rec = *rec;
+	d.rec.plane_valid = 0;
+	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
+		if (d.planes[p].seq != 0 && d.planes[p].srv != nullptr) {
+			d.rec.plane_valid |= 1u << p;
+			d.rec.plane_seq[p] = d.planes[p].seq;
+		}
+	}
 	d.have_frame = true;
 	d.frames++;
 	s->seq++;
@@ -2856,11 +3245,18 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 	xrt_display_processor_d3d11_set_predicted_scanout(s->dp,
 	                                                  comp_d3d11_target_predict_weave_to_scanout_ns(s->target));
 
+	// #2317 P2b: the frame's zone-wish publish, now that the producer wait above
+	// orders this context after the mask plane's write (app frames only: a
+	// repaint replays rendering, never the once-per-app-frame sideband, #868).
+	if (!is_repaint && d.publish_pending) {
+		d.publish_pending = false;
+		split_publish_zone_wish_now(s, d.publish_seq);
+	}
+
 	comp_d3d11_target_bind(s->target);
 
-	// No 2D-under backdrop on this route (P1b carries plain projection only;
-	// the producer retires the hub before a frame with planes reaches it).
-	xrt_display_processor_d3d11_set_background_2d(s->dp, nullptr, 0, 0);
+	// #2317 P2b: the 2D-under backdrop, from the producer's plane surface.
+	split_set_backdrop(s, -1);
 
 	struct xrt_rect cv = {};
 	if (canvas != nullptr) {
@@ -2896,12 +3292,19 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 		    (uint32_t)cv.extent.w, (uint32_t)cv.extent.h);
 	}
 
-	// Every read of the producer's atlas is recorded: release it back.
-	d.cons_value++;
-	d.out_ctx4->Signal(d.cons_fence, d.cons_value);
-
 	{
 		auto *dst = static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(s->target));
+		// #2317 P2b: the masked 2D-over-3D composite — the same unit, recipe
+		// and mask the xbridge route runs, reading the producer's planes.
+		(void)split_composite(s, -1, is_repaint, dst);
+
+		// Every read of the producer's atlas AND its planes is now recorded
+		// (backdrop view, weave, composite): release them back. Signalled
+		// after the composite, not after the weave, because the composite
+		// samples the Local2D and mask planes the producer rewrites next.
+		d.cons_value++;
+		d.out_ctx4->Signal(d.cons_fence, d.cons_value);
+
 		split_draw_hud(s, dst, tgt_w, tgt_h);
 		if (s->post_weave_fn != nullptr) {
 			s->post_weave_fn(s->post_weave_userdata, s->out_dev, s->out_ctx, dst, tgt_w, tgt_h, is_repaint);
@@ -3082,24 +3485,7 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 	 * that filled this slot produced no 2D-under layers, and the display
 	 * processor falls back to the captured desktop alone.
 	 */
-	{
-		struct comp_xbridge_recipe rec = {};
-		ID3D11ShaderResourceView *bd_srv = nullptr;
-		uint32_t bd_w = 0, bd_h = 0;
-		if (comp_xbridge_slot_recipe(s->xbridge, slot, &rec) && rec.bd_w > 0 && rec.bd_h > 0 &&
-		    (rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_BACKDROP)) != 0) {
-			const uint64_t bd_seq = rec.plane_seq[COMP_XBRIDGE_PLANE_BACKDROP];
-			bd_srv = split_plane_dp_view(
-			    s, &s->dp_bd_view,
-			    comp_xbridge_get_plane_srv(s->xbridge, slot, COMP_XBRIDGE_PLANE_BACKDROP, bd_seq), bd_seq,
-			    rec.bd_w, rec.bd_h, DXGI_FORMAT_B8G8R8A8_UNORM, "backdrop publish");
-			if (bd_srv != nullptr) {
-				bd_w = rec.bd_w;
-				bd_h = rec.bd_h;
-			}
-		}
-		xrt_display_processor_d3d11_set_background_2d(s->dp, bd_srv, bd_w, bd_h);
-	}
+	split_set_backdrop(s, slot);
 
 	struct xrt_rect cv = {};
 	if (canvas != nullptr) {
@@ -3530,7 +3916,7 @@ comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *split,
 	(void)view_h;
 }
 
-extern "C" void
+extern "C" bool
 comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *split,
                               void *nt_handle,
                               uint64_t generation,
@@ -3556,6 +3942,7 @@ comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *split,
 	(void)dirty_h;
 	(void)bd_w;
 	(void)bd_h;
+	return false;
 }
 
 extern "C" void
@@ -3584,7 +3971,7 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *split,
 	return false;
 }
 
-extern "C" void
+extern "C" bool
 comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *split,
                              void *nt_handle,
                              uint64_t generation,
@@ -3624,6 +4011,7 @@ comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *split,
 	(void)composite_mode;
 	(void)opaque_present;
 	(void)mask_is_plane;
+	return false;
 }
 
 extern "C" void
@@ -3657,6 +4045,15 @@ extern "C" bool
 comp_hub_d3d11_zone_dp_supported(struct comp_hub_d3d11 *split)
 {
 	(void)split;
+	return false;
+}
+
+extern "C" bool
+comp_hub_d3d11_get_zone_grid(struct comp_hub_d3d11 *split, uint32_t *out_grid_w, uint32_t *out_grid_h)
+{
+	(void)split;
+	(void)out_grid_w;
+	(void)out_grid_h;
 	return false;
 }
 

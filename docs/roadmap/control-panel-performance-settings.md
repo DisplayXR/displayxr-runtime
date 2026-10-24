@@ -627,6 +627,7 @@ setting, never `getenv`): `displayxr-cli input …` surfaces both.
 | Var | Read site | Default | Proc | Why not |
 |---|---|---|---|---|
 | `DXR_TEST_SPLIT_FAIL_STAGEA` | `compositor/xbridge/comp_split_gate.c:62` | off | App | Forces Stage A to fail |
+| `DXR_TEST_HUB_PLANE_FAIL` | `d3d11/comp_d3d11_compositor.cpp` (`d3d11_hub_stage_planes`) | off | App | Under `DXR_HUB=1`, refuses the first frame that needs a plane so the `plane_unavailable` retire can be exercised (#2317 P2b) |
 | `DXR_TEST_FAKE_DP_REFUSE` | `d3d11/comp_d3d11_compositor.cpp:3684`; `d3d12/…:1136`; `vk_native/hub_d3d11/comp_hub_d3d11.cpp:269` | off | App | Forces a DP refusal on the scanout adapter |
 | `DXR_TEST_FORCE_WEAVE_INGEST_DP` | `compositor/d3d11_service/comp_d3d11_service.cpp:4269` | 0 | Svc | Forces the #1172 weave-on-ingest arm |
 | `DXR_TEST_FAKE_DEVICE_REMOVED` | `compositor/d3d11_service/comp_d3d11_service.cpp:3633` | 0 | Svc | Simulates device loss |
