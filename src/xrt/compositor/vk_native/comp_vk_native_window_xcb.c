@@ -25,6 +25,10 @@
 #include <xcb/xcb.h>
 #include <xcb/randr.h>    // xcb_randr_get_monitors — resolve the target monitor
                           // INDEX from the plug-in-reported panel position (#715).
+#ifdef XRT_HAVE_XCB_SHAPE
+#include <xcb/shape.h> // empty input region for the adopted child window (#2322)
+#endif
+#include <unistd.h>       // getpid — find this process's own top-level (#2322)
 #include <X11/Xlib-xcb.h> // XGetXCBConnection (libX11-xcb) — Xlib→XCB bridge for
                           // app-provided windows (XR_DXR_xlib_window_binding).
 
@@ -33,6 +37,10 @@ struct comp_vk_native_window_xcb
 	xcb_connection_t *connection;
 	xcb_window_t window;
 	xcb_window_t root;
+	//! Adopt-own-window mode (#2322): when the hosted window was created as a
+	//! child of this process's own top-level X11 window (a hosted Windows app
+	//! under a translation layer), that parent; XCB_NONE otherwise.
+	xcb_window_t adopted_parent;
 
 	//! WM_DELETE_WINDOW atom, so a user close is a clean event not an X error.
 	xcb_atom_t atom_wm_delete_window;
@@ -396,12 +404,139 @@ find_argb_visual(xcb_screen_t *screen)
 	return XCB_NONE;
 }
 
+/*
+ * Adopt-own-window mode (#2322). A hosted app that already owns a top-level X11
+ * window in THIS process (a hosted Windows app under a translation layer: it
+ * has an HWND, not an X11 handle, so it cannot use XR_DXR_xlib_window_binding)
+ * would otherwise get a second fullscreen top-level that fights the app's own
+ * window: whichever is covered starves under a FIFO swapchain, and the app
+ * drops to background mode when the runtime window holds focus. Instead the
+ * hosted window is created as a CHILD of the process's largest viewable
+ * top-level (_NET_WM_PID == getpid()): drawn over the app's own present,
+ * following its geometry, with an empty input region so input falls through.
+ */
+static bool
+window_has_pid(xcb_connection_t *conn, xcb_window_t w, xcb_atom_t net_wm_pid, uint32_t pid)
+{
+	xcb_get_property_reply_t *pr =
+	    xcb_get_property_reply(conn, xcb_get_property(conn, 0, w, net_wm_pid, XCB_ATOM_CARDINAL, 0, 1), NULL);
+	bool match =
+	    pr != NULL && xcb_get_property_value_length(pr) >= 4 && *(uint32_t *)xcb_get_property_value(pr) == pid;
+	free(pr);
+	return match;
+}
+
+//! The window of @p pid among the root's children, or one level down inside a
+//! reparenting window manager's frame; XCB_NONE when there is none.
+static xcb_window_t
+own_client_window(xcb_connection_t *conn, xcb_window_t top, xcb_atom_t net_wm_pid, uint32_t pid)
+{
+	if (window_has_pid(conn, top, net_wm_pid, pid)) {
+		return top;
+	}
+	xcb_window_t found = XCB_NONE;
+	xcb_query_tree_reply_t *tree = xcb_query_tree_reply(conn, xcb_query_tree(conn, top), NULL);
+	if (tree != NULL) {
+		xcb_window_t *kids = xcb_query_tree_children(tree);
+		int n = xcb_query_tree_children_length(tree);
+		for (int i = 0; i < n && found == XCB_NONE; i++) {
+			if (window_has_pid(conn, kids[i], net_wm_pid, pid)) {
+				found = kids[i];
+			}
+		}
+		free(tree);
+	}
+	return found;
+}
+
+static xcb_window_t
+find_own_toplevel(xcb_connection_t *conn, xcb_window_t root, uint32_t *out_w, uint32_t *out_h)
+{
+	xcb_atom_t net_wm_pid = intern_atom(conn, "_NET_WM_PID");
+	if (net_wm_pid == XCB_ATOM_NONE) {
+		return XCB_NONE;
+	}
+	const uint32_t my_pid = (uint32_t)getpid();
+
+	xcb_query_tree_reply_t *tree = xcb_query_tree_reply(conn, xcb_query_tree(conn, root), NULL);
+	if (tree == NULL) {
+		return XCB_NONE;
+	}
+	xcb_window_t best = XCB_NONE;
+	uint64_t best_area = 0;
+	xcb_window_t *tops = xcb_query_tree_children(tree);
+	int n = xcb_query_tree_children_length(tree);
+	for (int i = 0; i < n; i++) {
+		xcb_window_t w = own_client_window(conn, tops[i], net_wm_pid, my_pid);
+		if (w == XCB_NONE) {
+			continue;
+		}
+		xcb_get_window_attributes_reply_t *ar =
+		    xcb_get_window_attributes_reply(conn, xcb_get_window_attributes(conn, w), NULL);
+		bool viewable = ar != NULL && ar->map_state == XCB_MAP_STATE_VIEWABLE;
+		free(ar);
+		if (!viewable) {
+			continue;
+		}
+		xcb_get_geometry_reply_t *gr = xcb_get_geometry_reply(conn, xcb_get_geometry(conn, w), NULL);
+		if (gr == NULL) {
+			continue;
+		}
+		uint64_t area = (uint64_t)gr->width * (uint64_t)gr->height;
+		if (area > best_area) {
+			best_area = area;
+			best = w;
+			*out_w = gr->width;
+			*out_h = gr->height;
+		}
+		free(gr);
+	}
+	free(tree);
+	return best;
+}
+
+//! Create the hosted window as an input-transparent child of @p parent.
+static void
+create_adopted_child(
+    struct comp_vk_native_window_xcb *win, xcb_screen_t *screen, xcb_window_t parent, uint32_t pw, uint32_t ph)
+{
+	xcb_connection_t *conn = win->connection;
+	win->adopted_parent = parent;
+	win->width = pw;
+	win->height = ph;
+	uint32_t vl[2] = {screen->black_pixel, XCB_EVENT_MASK_STRUCTURE_NOTIFY};
+	xcb_create_window(conn, XCB_COPY_FROM_PARENT, win->window, parent, 0, 0, (uint16_t)pw, (uint16_t)ph, 0,
+	                  XCB_WINDOW_CLASS_INPUT_OUTPUT, XCB_COPY_FROM_PARENT, XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK,
+	                  vl);
+	// Empty input region: pointer events fall through to the app's own window
+	// underneath; keyboard focus stays with the app's top-level.
+#ifdef XRT_HAVE_XCB_SHAPE
+	xcb_shape_rectangles(conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_INPUT, XCB_CLIP_ORDERING_UNSORTED, win->window, 0, 0,
+	                     0, NULL);
+#else
+	U_LOG_W(
+	    "XCB: built without xcb-shape — the adopted child window takes pointer events instead of passing "
+	    "them to the app (install libxcb-shape0-dev and rebuild)");
+#endif
+	// Follow the parent's geometry (ConfigureNotify) and its end (DestroyNotify).
+	// The event mask is per client, so this does not disturb the app's own.
+	uint32_t pmask = XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+	xcb_change_window_attributes(conn, parent, XCB_CW_EVENT_MASK, &pmask);
+	xcb_map_window(conn, win->window);
+	xcb_flush(conn);
+	U_LOG_W(
+	    "XCB: hosted window 0x%08x created as a CHILD of this process's own top-level window 0x%08x "
+	    "(%ux%u): one presenting surface on screen, input falls through (#2322)",
+	    (unsigned)win->window, (unsigned)parent, pw, ph);
+}
+
 xrt_result_t
 comp_vk_native_window_xcb_create(uint32_t width,
                                  uint32_t height,
                                  int32_t screen_left,
                                  int32_t screen_top,
                                  bool transparent_background,
+                                 bool adopt_own_window_auto,
                                  struct comp_vk_native_window_xcb **out_win)
 {
 	if (width == 0) {
@@ -443,6 +578,28 @@ comp_vk_native_window_xcb_create(uint32_t width,
 	os_mutex_init(&win->pump_lock);
 
 	win->window = xcb_generate_id(conn);
+
+	// Adopt-own-window mode (#2322). DXR_XCB_ADOPT_OWN_WINDOW=1 forces it, =0
+	// disables it; unset, it follows @p adopt_own_window_auto. Falls back to a
+	// runtime-owned top-level when the process has no viewable window.
+	{
+		const char *adopt_env = getenv("DXR_XCB_ADOPT_OWN_WINDOW");
+		const bool adopt = adopt_env != NULL ? (strcmp(adopt_env, "0") != 0) : adopt_own_window_auto;
+		uint32_t pw = 0;
+		uint32_t ph = 0;
+		xcb_window_t parent = adopt ? find_own_toplevel(conn, screen->root, &pw, &ph) : XCB_NONE;
+		if (parent != XCB_NONE && pw > 0 && ph > 0) {
+			create_adopted_child(win, screen, parent, pw, ph);
+			*out_win = win;
+			return XRT_SUCCESS;
+		}
+		if (adopt) {
+			U_LOG_W(
+			    "XCB: adopt-own-window wanted but no viewable top-level window of pid %ld found — "
+			    "using a runtime-owned top-level window",
+			    (long)getpid());
+		}
+	}
 
 	// Transparent-background mode (XR_DXR_xlib_window_binding
 	// transparentBackgroundEnabled): render into a 32-bit ARGB visual so the
@@ -856,6 +1013,19 @@ comp_vk_native_window_xcb_pump(struct comp_vk_native_window_xcb *win)
 		switch (type) {
 		case XCB_CONFIGURE_NOTIFY: {
 			xcb_configure_notify_event_t *cfg = (xcb_configure_notify_event_t *)event;
+			if (win->adopted_parent != XCB_NONE && cfg->window == win->adopted_parent) {
+				// Adopted parent changed size — follow it.
+				if (cfg->width > 0 && cfg->height > 0 &&
+				    (cfg->width != win->width || cfg->height != win->height)) {
+					uint32_t dims[2] = {cfg->width, cfg->height};
+					xcb_configure_window(win->connection, win->window,
+					                     XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, dims);
+					xcb_flush(win->connection);
+					win->width = cfg->width;
+					win->height = cfg->height;
+				}
+				break;
+			}
 			if (cfg->width > 0 && cfg->height > 0) {
 				win->width = cfg->width;
 				win->height = cfg->height;
@@ -870,12 +1040,17 @@ comp_vk_native_window_xcb_pump(struct comp_vk_native_window_xcb *win)
 			}
 			break;
 		}
-		case XCB_DESTROY_NOTIFY:
+		case XCB_DESTROY_NOTIFY: {
+			const xcb_destroy_notify_event_t *dn = (const xcb_destroy_notify_event_t *)event;
+			if (dn->window != win->window && dn->window != win->adopted_parent) {
+				break;
+			}
 			win->valid = false;
 #ifdef XRT_BUILD_DRIVER_QWERTY
 			dispatch_focus_out(win); // Nothing may stay held on a window that is gone.
 #endif
 			break;
+		}
 		default: break;
 		}
 		free(event);

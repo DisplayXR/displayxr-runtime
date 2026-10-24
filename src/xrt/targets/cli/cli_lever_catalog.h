@@ -9,7 +9,7 @@
  * Edit the census and re-run the script; the lint workflow runs it with
  * --check, which also fails when a name here no longer occurs in src/xrt.
  *
- * 71 levers: 52 Tier 1 (next launch), 19 Tier 2 (service-scoped).
+ * 72 levers: 53 Tier 1 (next launch), 19 Tier 2 (service-scoped).
  *
  * This is a DESCRIPTION of the levers, not a way to set them: only the names
  * u_setting_is_managed() accepts resolve from the per-user / machine stores.
@@ -85,6 +85,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_WINDOW_FULLSCREEN", 1, "App", "on", "=0 opts out of EWMH fullscreen placement (Linux XCB)"},
 	{"DXR_WINDOW_POS", 1, "App", "plug-in reported", "\"x,y\" override for the self-owned window position (#715)"},
 	{"DXR_WL_MOVE_SYNC", 1, "App", "on whenever the window-geometry@displayxr.org extension supports it (version 9+, GNOME 45+)", "Move-synchronised re-weave: every commit carries a 1x1 subsurface tag of the position its frame was woven for, and the extension paints each frame of a compositor drag (title bar, Super+drag, the..."},
+	{"DXR_XCB_ADOPT_OWN_WINDOW", 1, "App", "auto (on when the app's VkInstance has no VK_KHR_xcb_surface)", "Hosted window becomes an input-transparent child of the process's own top-level X11 window instead of a second top-level: one presenting surface for a hosted Windows app under a translation layer..."},
 	{"DXR_APP_FRAME_DIVISOR", 2, "App", "off (1)", "#1257 slot partition: xrWaitFrame releases the app every Dth vblank (D=2..8) and the repaint loop fills the other slots at panel rate with a KNOWN N=D schedule - steady output cadence, no..."},
 	{"DXR_COMMIT_PACE", 2, "Svc", "on (1; 0/1/2)", "Commit backpressure. =0 lets a client run free; =2 is the legacy tick-align shape"},
 	{"DXR_DEVICE_REMOVED_EXIT_MS", 2, "Svc", "2000", "Delay before the service exits on an unrecoverable DEVICE_REMOVED"},

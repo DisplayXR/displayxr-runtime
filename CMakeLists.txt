@@ -227,6 +227,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	find_package(udev)
 	if(PKGCONFIG_FOUND)
 		pkg_check_modules(XCB xcb xcb-randr x11-xcb)
+		# xcb-shape: optional — gives the adopt-own-window hosted child window an
+		# empty input region so input falls through to the app (#2322). Without
+		# it the mode still works but the child takes pointer events.
+		pkg_check_modules(XCB_SHAPE xcb-shape)
 		# Xlib + Xrandr: only needed for the direct-scanout present path
 		# (VK_EXT_acquire_xlib_display steals a RandR output as a VkDisplayKHR,
 		# bypassing Xorg/compositor — ST-5539). Optional; absence just leaves

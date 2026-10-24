@@ -15017,8 +15017,14 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			apply_window_pos_override(&win_left, &win_top);
 			U_LOG_I("Creating self-owned XCB window (%ux%u at %d,%d)", win_w, win_h, win_left,
 			        win_top);
+			// No VK_KHR_xcb_surface on the app's instance means the target will
+			// present through the Xlib fallback: a hosted Windows app under a
+			// translation layer, which already owns its own X11 top-level.
+			// Present as a child of that window rather than a second top-level
+			// (#2322).
+			const bool adopt_own_window = !comp_vk_native_target_instance_has_xcb_surface(c);
 			xrt_result_t xret = comp_vk_native_window_xcb_create(
-			    win_w, win_h, win_left, win_top, transparent_background, &c->xcb_window);
+			    win_w, win_h, win_left, win_top, transparent_background, adopt_own_window, &c->xcb_window);
 			if (xret != XRT_SUCCESS) {
 				U_LOG_E("Failed to create self-owned XCB window");
 				free(c);
