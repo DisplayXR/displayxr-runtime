@@ -47,6 +47,13 @@
 // Environment variable to start in windowed mode
 DEBUG_GET_ONCE_BOOL_OPTION(start_windowed, "XRT_COMPOSITOR_START_WINDOWED", false)
 
+// Where a hosted (runtime-owned) in-process window goes: "auto" (default)
+// embeds it as a child filling the app's own main window when the app has
+// one, else falls back to the panel-fullscreen window; "embed" is auto that
+// keeps looking for a main window that appears later; "fullscreen" restores
+// the pre-embedding behaviour.
+DEBUG_GET_ONCE_OPTION(hosted_window, "DXR_HOSTED_WINDOW", "auto")
+
 // Marker for SendInput-injected mouse events — WndProc skips re-forwarding these.
 // Used to break the loop: WndProc→SendInput→WM_LBUTTONDOWN→WndProc.
 #define WORKSPACE_SENDINPUT_MARKER 0xD15B1A7E
@@ -156,6 +163,28 @@ struct comp_d3d11_window
 	//! style/geometry path — the window is a real, showable presenter surface
 	//! that simply starts out invisible. See comp_d3d11_window_set_visible.
 	bool start_hidden;
+
+	/*!
+	 * Embed a hosted window into the app's own main window (DXR_HOSTED_WINDOW).
+	 * Legacy apps (no XR_DXR_*_window_binding) get a runtime-created window;
+	 * embedding makes it a WS_CHILD filling the app window's client area, so
+	 * the 3D shows inside the app and several apps weave side by side, each in
+	 * its own window. Set by comp_d3d11_window_create only — the service's
+	 * windows (comp_d3d11_window_create_ex) are never embedded.
+	 */
+	bool embed_requested;
+
+	//! Keep searching for a host after creation ("embed"; window thread only).
+	bool embed_keep_looking;
+
+	//! The app window this one is a child of, NULL = top-level (window thread writes).
+	volatile HWND embed_host;
+
+	//! Out-of-context hook following the host's moves / resizes (window thread only).
+	HWINEVENTHOOK embed_hook;
+
+	//! "embed" mode searches so far (window thread only).
+	int embed_search_tries;
 
 	//! Window thread handle
 	HANDLE thread_handle;
@@ -630,6 +659,133 @@ set_fullscreen(HWND hWnd, bool fullscreen)
 	}
 }
 
+/*
+ *
+ * Embedding a hosted window into the app's own window (DXR_HOSTED_WINDOW).
+ *
+ */
+
+//! WM_TIMER id: look again for a host window ("embed" mode).
+#define DXR_EMBED_SEARCH_TIMER 0xE3B0
+//! How often, and for how long, "embed" mode keeps looking.
+#define DXR_EMBED_SEARCH_PERIOD_MS 500
+#define DXR_EMBED_SEARCH_TRIES 60
+
+//! The window this thread embeds — WinEvent callbacks carry no context, and
+//! each comp_d3d11_window has its own thread.
+static thread_local struct comp_d3d11_window *t_embed_window = NULL;
+
+struct embed_search
+{
+	DWORD pid;
+	HWND best;
+	LONG best_area;
+};
+
+/*!
+ * The app's main window: a visible, unowned, non-tool top-level window of
+ * this process that is not one of ours, at least 320x240, the largest one.
+ */
+static BOOL CALLBACK
+embed_find_cb(HWND h, LPARAM lp)
+{
+	struct embed_search *es = (struct embed_search *)lp;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(h, &pid);
+	if (pid != es->pid || !IsWindowVisible(h) || IsIconic(h) || GetWindow(h, GW_OWNER) != NULL) {
+		return TRUE;
+	}
+	if ((GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) {
+		return TRUE;
+	}
+	WCHAR cls[64];
+	if (GetClassNameW(h, cls, 64) > 0 && wcscmp(cls, szWindowClass) == 0) {
+		return TRUE;
+	}
+	RECT rc;
+	if (!GetClientRect(h, &rc) || rc.right < 320 || rc.bottom < 240) {
+		return TRUE;
+	}
+	const LONG area = rc.right * rc.bottom;
+	if (area > es->best_area) {
+		es->best = h;
+		es->best_area = area;
+	}
+	return TRUE;
+}
+
+static HWND
+embed_find_host(void)
+{
+	struct embed_search es = {GetCurrentProcessId(), NULL, 0};
+	EnumWindows(embed_find_cb, (LPARAM)&es);
+	return es.best;
+}
+
+//! Fill the host's client area (the child's coordinates are host-client relative).
+static void
+embed_fit(struct comp_d3d11_window *w)
+{
+	HWND host = w->embed_host;
+	RECT rc;
+	if (host == NULL || w->hwnd == NULL || !GetClientRect(host, &rc)) {
+		return;
+	}
+	SetWindowPos(w->hwnd, HWND_TOP, 0, 0, rc.right, rc.bottom, SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
+static void CALLBACK
+embed_event_cb(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG id_object, LONG id_child, DWORD thread, DWORD time)
+{
+	(void)hook;
+	(void)event;
+	(void)id_child;
+	(void)thread;
+	(void)time;
+	struct comp_d3d11_window *w = t_embed_window;
+	if (w != NULL && hwnd == w->embed_host && id_object == OBJID_WINDOW) {
+		embed_fit(w);
+	}
+}
+
+/*!
+ * Make @p hwnd a child filling @p host's client area. The host is the app's
+ * own window on the app's UI thread; a cross-thread parent/child pair shares
+ * an input queue (Win32 attaches them), which is what lets the 3D view take
+ * clicks and keys like part of the app. The host gets WS_CLIPCHILDREN so its
+ * own painting (often a 2D mirror of the VR view) does not draw over us.
+ * Window thread only.
+ */
+static void
+embed_adopt(struct comp_d3d11_window *w, HWND hwnd, HWND host)
+{
+	LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+	style = (style & ~(WS_OVERLAPPEDWINDOW | WS_POPUP)) | WS_CHILD | WS_CLIPSIBLINGS;
+	SetWindowLongW(hwnd, GWL_STYLE, style);
+	SetWindowLongW(hwnd, GWL_EXSTYLE, GetWindowLongW(hwnd, GWL_EXSTYLE) & ~WS_EX_APPWINDOW);
+	SetWindowLongW(host, GWL_STYLE, GetWindowLongW(host, GWL_STYLE) | WS_CLIPCHILDREN);
+	SetParent(hwnd, host);
+
+	InterlockedExchange(&w->is_fullscreen, FALSE);
+	InterlockedExchangePointer((volatile PVOID *)&w->embed_host, host);
+	t_embed_window = w;
+
+	DWORD host_pid = 0;
+	const DWORD host_tid = GetWindowThreadProcessId(host, &host_pid);
+	w->embed_hook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, NULL,
+	                                embed_event_cb, host_pid, host_tid, WINEVENT_OUTOFCONTEXT);
+
+	RECT rc = {0};
+	GetClientRect(host, &rc);
+	SetWindowPos(hwnd, HWND_TOP, 0, 0, rc.right, rc.bottom, SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+
+	WCHAR title[128] = L"";
+	GetWindowTextW(host, title, 128);
+	U_LOG_W("D3D11 window: embedded in the app's window %p '%ls' (%ldx%ld client) — DXR_HOSTED_WINDOW=fullscreen "
+	        "restores the panel-fullscreen window",
+	        (void *)host, title, (long)rc.right, (long)rc.bottom);
+}
+
 // Forward declaration — defined later in this file alongside the suppress
 // setters so the logic lives in one place. Used by wnd_proc to gate key
 // and mouse forwarding.
@@ -785,6 +941,10 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (wParam == VK_F11) {
 			HWND fwd_check = (HWND)InterlockedCompareExchangePointer(
 			    (volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
+			if (fwd_check == NULL && w->embed_host != NULL) {
+				// Embedded in the app's window: the app owns its window state.
+				return 0;
+			}
 			if (fwd_check == NULL) {
 				// Non-workspace mode: toggle fullscreen directly
 				LONG fs = InterlockedCompareExchange(&w->is_fullscreen, 0, 0);
@@ -1014,6 +1174,16 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	} break;
 
 	case WM_TIMER:
+		if (wParam == DXR_EMBED_SEARCH_TIMER) {
+			HWND host = w->embed_host == NULL ? embed_find_host() : NULL;
+			if (host != NULL) {
+				embed_adopt(w, hWnd, host);
+			}
+			if (w->embed_host != NULL || ++w->embed_search_tries >= DXR_EMBED_SEARCH_TRIES) {
+				KillTimer(hWnd, DXR_EMBED_SEARCH_TIMER);
+			}
+			return 0;
+		}
 		// #667: a buffered lone Ctrl was held with no following key — deliver it
 		// to the focused app so apps that bind Ctrl still get it.
 		if (wParam == DXR_KB_FLUSH_TIMER) {
@@ -1648,7 +1818,18 @@ window_thread_body(struct comp_d3d11_window *w)
 		}
 	}
 
-	if (!w->hidden) {
+	HWND embed_host = (w->embed_requested && !w->hidden) ? embed_find_host() : NULL;
+	if (embed_host != NULL) {
+		embed_adopt(w, hwnd, embed_host);
+		if (w->start_hidden) {
+			ShowWindow(hwnd, SW_HIDE);
+		}
+	} else if (w->embed_requested && w->embed_keep_looking && !w->hidden) {
+		// "embed": the app may create its main window after the session.
+		SetTimer(hwnd, DXR_EMBED_SEARCH_TIMER, DXR_EMBED_SEARCH_PERIOD_MS, NULL);
+	}
+
+	if (!w->hidden && embed_host == NULL) {
 		// Check if we should start fullscreen
 		bool start_fullscreen = !debug_get_bool_option_start_windowed();
 		if (start_fullscreen) {
@@ -1693,6 +1874,12 @@ window_thread_body(struct comp_d3d11_window *w)
 	}
 
 	U_LOG_W("D3D11 window thread: Message loop exited");
+
+	if (w->embed_hook != NULL) {
+		UnhookWinEvent(w->embed_hook);
+		w->embed_hook = NULL;
+	}
+	t_embed_window = NULL;
 
 	// Cleanup: unregister window class (must be done on the thread that registered it)
 	if (w->window_class) {
@@ -1742,6 +1929,23 @@ window_thread_func(LPVOID param)
  *
  */
 
+//! How a window is placed relative to the app's own window (DXR_HOSTED_WINDOW).
+enum window_embed_mode
+{
+	WINDOW_EMBED_OFF,    //!< top-level (service windows; "fullscreen")
+	WINDOW_EMBED_AUTO,   //!< child of the app's main window if it has one at creation
+	WINDOW_EMBED_LOOKING //!< as AUTO, and keep looking for a main window that appears later
+};
+
+static xrt_result_t
+window_create_internal(uint32_t width,
+                       uint32_t height,
+                       int32_t screen_left,
+                       int32_t screen_top,
+                       bool start_hidden,
+                       enum window_embed_mode embed,
+                       struct comp_d3d11_window **out);
+
 extern "C" xrt_result_t
 comp_d3d11_window_create(uint32_t width,
                          uint32_t height,
@@ -1749,7 +1953,16 @@ comp_d3d11_window_create(uint32_t width,
                          int32_t screen_top,
                          struct comp_d3d11_window **out)
 {
-	return comp_d3d11_window_create_ex(width, height, screen_left, screen_top, /*start_hidden*/ false, out);
+	// In-process hosted windows only: the service creates its windows
+	// through comp_d3d11_window_create_ex, which never embeds.
+	const char *mode = debug_get_option_hosted_window();
+	enum window_embed_mode embed = WINDOW_EMBED_AUTO;
+	if (mode != NULL && strcmp(mode, "fullscreen") == 0) {
+		embed = WINDOW_EMBED_OFF;
+	} else if (mode != NULL && strcmp(mode, "embed") == 0) {
+		embed = WINDOW_EMBED_LOOKING;
+	}
+	return window_create_internal(width, height, screen_left, screen_top, /*start_hidden*/ false, embed, out);
 }
 
 extern "C" xrt_result_t
@@ -1760,12 +1973,26 @@ comp_d3d11_window_create_ex(uint32_t width,
                             bool start_hidden,
                             struct comp_d3d11_window **out)
 {
+	return window_create_internal(width, height, screen_left, screen_top, start_hidden, WINDOW_EMBED_OFF, out);
+}
+
+static xrt_result_t
+window_create_internal(uint32_t width,
+                       uint32_t height,
+                       int32_t screen_left,
+                       int32_t screen_top,
+                       bool start_hidden,
+                       enum window_embed_mode embed,
+                       struct comp_d3d11_window **out)
+{
 	struct comp_d3d11_window *w = U_TYPED_CALLOC(struct comp_d3d11_window);
 	if (w == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
 
 	w->start_hidden = start_hidden;
+	w->embed_requested = embed != WINDOW_EMBED_OFF;
+	w->embed_keep_looking = embed == WINDOW_EMBED_LOOKING;
 	w->instance = GetModuleHandle(NULL);
 	w->requested_width = width > 0 ? width : 1920;
 	w->requested_height = height > 0 ? height : 1080;
