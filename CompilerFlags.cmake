@@ -37,6 +37,22 @@ if(NOT WIN32 AND NOT APPLE)
 	set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -Wl,--no-undefined")
 endif()
 
+if(ANDROID)
+	# 16 KB page-size support (DisplayXR/displayxr-unity#418). Android 15+
+	# devices may run a 16 KB-page kernel, whose dynamic linker refuses any .so
+	# with PT_LOAD segments aligned below 16 KB -- and NDK r26 (our pin) still
+	# links at 4 KB. A 16 KB-aligned library loads fine on 4 KB kernels too.
+	# This is the NDK-documented mechanism for r26 and older (r27 adds the
+	# ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES switch, r28 makes it the default);
+	# the explicit flag stays correct on every NDK. Both the root build and the
+	# client AAR's standalone layer build include this file, so their
+	# queue-lock layer copies stay byte-identical. CI asserts the result on
+	# the artifacts: scripts/check_android_page_align.py.
+	set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
+	set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
+	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
+endif()
+
 # Must call before adding targets that will use xrt-optimized-math
 macro(xrt_optimized_math_flags)
 	if(MSVC)

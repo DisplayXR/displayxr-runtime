@@ -221,3 +221,37 @@ TEST_CASE("scaled view: without display info it splits the window, never to 0", 
 	CHECK(vw == 3840);
 	CHECK(vh == 2160);
 }
+
+/*
+ * DisplayXR/displayxr-unity#418: the atlas ALLOCATION must hold the canvas
+ * content in any orientation. NP02J (2560x1600 panel, 2x1 at view scale 0.75):
+ * the landscape mode atlas is 3840x1200; rotated to portrait the canvas views
+ * are 1200x1920, a 2400x1920 content region taller than that atlas. The
+ * vk_native renderer clamped the view to the allocation, and the frame (DP
+ * input and xrCaptureAtlasDXR alike) came out 2400x1600.
+ */
+TEST_CASE("atlas alloc: a portrait canvas grows the landscape mode atlas", "[tiling][window_size]")
+{
+	uint32_t aw = 0, ah = 0;
+
+	// Portrait on a landscape mode atlas: height grows to the content, width
+	// keeps the larger mode atlas (high-water, never shrinks).
+	u_tiling_atlas_alloc_for_content(3840, 1200, 2, 1, 1200, 1920, &aw, &ah);
+	CHECK(aw == 3840);
+	CHECK(ah == 1920);
+
+	// Landscape fullscreen: content == mode atlas, request unchanged.
+	u_tiling_atlas_alloc_for_content(3840, 1200, 2, 1, 1920, 1200, &aw, &ah);
+	CHECK(aw == 3840);
+	CHECK(ah == 1200);
+
+	// A smaller (freeform) window never shrinks the request below the mode atlas.
+	u_tiling_atlas_alloc_for_content(3840, 1200, 2, 1, 600, 900, &aw, &ah);
+	CHECK(aw == 3840);
+	CHECK(ah == 1200);
+
+	// 2x2 quad: both axes scale by the tile grid.
+	u_tiling_atlas_alloc_for_content(2560, 1600, 2, 2, 800, 1280, &aw, &ah);
+	CHECK(aw == 2560);
+	CHECK(ah == 2560);
+}

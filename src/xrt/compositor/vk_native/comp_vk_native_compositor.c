@@ -11494,12 +11494,27 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 						                                           &generation) &&
 						    win_w > 0 && win_h > 0) {
 							u_tiling_compute_canvas_view(mode, win_w, win_h, &new_vw, &new_vh);
+							// unity#418: the mode atlas is sized for the panel's
+							// orientation at mode-compute time. Rotated to
+							// portrait, the canvas views (1200x1920 on a
+							// 2560x1600 panel) are taller than it, and the
+							// renderer's fit-clamp squashed each view into the
+							// short tile — the DP's input and the atlas capture
+							// lost rows (2400x1920 captured as 2400x1600). Make
+							// the allocation hold the content; it high-waters
+							// once per orientation, then fits.
+							u_tiling_atlas_alloc_for_content(
+							    new_aw, new_ah, mode->tile_columns, mode->tile_rows, new_vw,
+							    new_vh, &new_aw, &new_ah);
 							if (generation != c->android_rect_generation_viewed) {
 								c->android_rect_generation_viewed = generation;
-								U_LOG_W("VIEW_DIMS: window %ux%u x mode scale -> view %ux%u "
-								        "(mode %ux%u) (#1367)",
-								        win_w, win_h, new_vw, new_vh,
-								        mode->view_width_pixels, mode->view_height_pixels);
+								U_LOG_W(
+								    "VIEW_DIMS: window %ux%u x mode scale -> view "
+								    "%ux%u "
+								    "(mode %ux%u, atlas req %ux%u) (#1367)",
+								    win_w, win_h, new_vw, new_vh,
+								    mode->view_width_pixels, mode->view_height_pixels,
+								    new_aw, new_ah);
 							}
 						}
 					}
