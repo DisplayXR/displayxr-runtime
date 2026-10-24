@@ -229,6 +229,21 @@ struct comp_hub_d3d11_info
 	 * because nothing would order its slot rewrites after the hub's reads.
 	 */
 	bool ring_direct;
+
+	/*!
+	 * #2317 P2c: a RING producer whose 2D PLANES (Local2D over-flatten,
+	 * 2D-under backdrop, authored mask) may ride the DIRECT ingress. It
+	 * promises the plane twin of the atlas contract: it writes its
+	 * single-buffered plane surfaces on the queue that signals the deposit
+	 * fence, BEFORE the signal the handoff's `fence_value` names (so the
+	 * hub's producer wait covers them), and it GPU-waits for
+	 * @ref comp_hub_d3d11_get_plane_release_value on the consumer fence before
+	 * any submit that rewrites a plane (so a rewrite never overlaps a weave or
+	 * repaint still sampling it). Without it — and always for a KEYED-MUTEX
+	 * deposit, which has no consumer fence — a ring session moves to xbridge on
+	 * its first plane frame (`reason=plane_content`), as before P2c.
+	 */
+	bool ring_direct_planes;
 };
 
 /*!
@@ -263,17 +278,14 @@ struct comp_hub_d3d11_info
  * The P1b plane retires (`local2d_layer`, `zone_layer`, `authored_mask`) are
  * gone: Local2D, zones, authored masks and the backdrop ride the hub on both
  * ingress routes.
+ *
+ * So is `segments_planes` (P2b review; retired by #2342 P2c): a zones frame or
+ * an authored mask while the window was segmented across screens used to retire
+ * to the native legs, because the hub published the zone mask to its primary DP
+ * only. The hub now publishes it to every segment DP cropped to its screen and
+ * clears them with it (#2218 #4, the native rule), on every hub route.
  */
 #define COMP_HUB_REASON_PLANE_UNAVAILABLE "plane_unavailable"
-/*!
- * Mid-session RETIRE (#2317 P2b review): a zones frame or an authored mask while
- * the hub's last weave SEGMENTED the window across screens. The D3D11 tier
- * natively publishes the zone mask to every segment's DP, cropped to its screen
- * (#2218 #4); the hub publishes to its primary DP only, so the secondary panel
- * would never get its mask. Retires BEFORE that frame is composed, so the
- * native legs compose it. Until the per-segment publish is ported (P2 follow-up).
- */
-#define COMP_HUB_REASON_SEGMENTS_PLANES "segments_planes"
 /*! @} */
 
 /*!
@@ -739,6 +751,65 @@ bool
 comp_hub_d3d11_repaint_admit(struct comp_hub_d3d11 *split);
 
 /*!
+ * @name #2342 P2c: the hub's ONE repaint pacer and admission
+ *
+ * Every hub route (the D3D11 shim, the D3D12 #1264 reroute, the Vulkan split)
+ * replays through these, so the pacing and the admission are the hub's, read
+ * once, and identical across routes: the native D3D11 leg's shape, which is
+ * the reference (`[WITNESS]` repaint rates under the frame divisor and under
+ * `DXR_WEAVE_REPAINT_FORCE=1`).
+ *
+ *  1. **Pace, unlocked** (skipped by the caller under an ENGAGED #1257
+ *     partition, whose schedule IS the pacing — as natively):
+ *     @ref comp_hub_d3d11_repaint_pace_hold under the compositor lock, then
+ *     @ref comp_hub_d3d11_repaint_pace_wait without it. That is
+ *     comp_d3d11_target_repaint_pace on the hub's target — the scanout wait
+ *     plus the #884 late-weave sleep to `period - R` — made safe against a
+ *     hub retire that runs while the repaint thread is sleeping. Before P2c
+ *     the three hub routes skipped pacing altogether ("no app-side target"),
+ *     so a forced repaint tried at the loop's free-running tick and the #1339
+ *     admission refused it every time: the 0/s of #2321 surprise 6.
+ *  2. **Fire, under the lock:** @ref comp_hub_d3d11_repaint — the
+ *     has-a-frame test, the #1339 frame-latency admission (skipped under an
+ *     engaged partition, as natively), then the replay weave.
+ *
+ * The tier keeps the parts that are its own state: armed / app-frame-in-
+ * progress, the #1257 cadence gate and DXR_WEAVE_REPAINT_FORCE, and its trace
+ * counters. The late-weave knob itself (`DXR_LATE_WEAVE`) is read once, by the
+ * hub's target (comp_d3d11_target): no tier reads its own copy on a hub route.
+ * @{
+ */
+void *
+comp_hub_d3d11_repaint_pace_hold(struct comp_hub_d3d11 *split);
+
+void
+comp_hub_d3d11_repaint_pace_wait(void *hold);
+
+//! What @ref comp_hub_d3d11_repaint did — a closed set the tiers map onto
+//! their own trace counters.
+enum comp_hub_d3d11_repaint_result
+{
+	//! The replay was woven and presented.
+	COMP_HUB_D3D11_REPAINT_FIRED = 0,
+	//! Nothing woven yet to replay (warmup, or an app frame that refused).
+	COMP_HUB_D3D11_REPAINT_NO_FRAME,
+	//! #1339: the present queue is at the frame-latency cap; skip this tick.
+	COMP_HUB_D3D11_REPAINT_NOT_ADMITTED,
+	//! A fire that presented nothing (#918 F4/F7: no ready slot); the panel
+	//! holds the last frame. Counts as a fire for spacing.
+	COMP_HUB_D3D11_REPAINT_NOT_WOVEN,
+};
+
+/*!
+ * One replay attempt. Call under the compositor mutex, after the tier's own
+ * armed / in-progress / gate tests. @p partition_engaged skips the admission
+ * exactly as the native leg does (the #1257 schedule owns the slots).
+ */
+enum comp_hub_d3d11_repaint_result
+comp_hub_d3d11_repaint(struct comp_hub_d3d11 *split, bool partition_engaged, const struct xrt_rect *canvas);
+/*! @} */
+
+/*!
  * #1482: @ref comp_d3d11_target_set_app_paced on the arm's own target — the
  * fill arm's app frames block on THAT chain's frame-latency waitable, so it is
  * that target which must stop draining surplus tokens while the #1257 grid is
@@ -828,7 +899,8 @@ comp_hub_d3d11_get_background_preview(struct comp_hub_d3d11 *split, struct xrt_d
  * handoff's fence after the passes that write the atlas, and flush; a ring
  * producer skips its deposit's note_consumed calls and takes the owed releases
  * from @ref comp_hub_d3d11_take_slot_release instead. Can turn false mid-session
- * (a ring producer's first 2D-plane frame), never back.
+ * (a ring-contract or slot-open failure, or the first 2D-plane frame of a ring
+ * producer without comp_hub_d3d11_info::ring_direct_planes), never back.
  */
 bool
 comp_hub_d3d11_is_direct(struct comp_hub_d3d11 *split);
@@ -903,12 +975,31 @@ comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split);
  *   construction: the producer only re-enters a slot after the hub has moved
  *   off it.
  *
- * **Planes.** DIRECT carries projection only. The first frame that stages real
- * 2D-plane content (Local2D, 2D-under backdrop, an authored mask) moves the
- * session to the xbridge ingress for good (`hub placement: CHANGED ...
- * ingress=xbridge reason=plane_content`) BEFORE that frame is submitted, so no
- * frame ever loses its planes. If the bridge cannot be wired then, the session
- * stays DIRECT and the planes degrade alone (the existing feature-local rule).
+ * **Planes (#2317 P2c).** A producer that declares
+ * @ref comp_hub_d3d11_info::ring_direct_planes keeps its planes on DIRECT: the
+ * hub opens each plane surface on its own device (as it does the stable atlas's)
+ * and reads it in place, and the frame's recipe is snapshotted beside the slot it
+ * nominates (a DIRECT weave only ever weaves the newest nominated frame, so one
+ * snapshot is the whole ring's). The planes are single-buffered, so their two
+ * edges are:
+ * - **write -> read:** the producer writes them before the deposit signal the
+ *   handoff names; the weave's producer wait already covers them.
+ * - **read -> rewrite:** EVERY weave and repaint samples them, not just the one
+ *   that moved onto a slot, so the producer GPU-waits for the consumer fence's
+ *   LATEST value (@ref comp_hub_d3d11_get_plane_release_value) before a submit
+ *   that rewrites a plane. The caller holds the compositor mutex from that wait
+ *   through @ref comp_hub_d3d11_submit_atlas, so no repaint is recorded between
+ *   the two.
+ * - **keyed-mutex deposits** have no consumer fence to order the rewrite on, and
+ *   DIRECT samples the planes in place on every repaint, so they keep the P2a
+ *   move to xbridge on their first plane frame (`reason=plane_content`), where
+ *   the planes are copied into hub-owned slots under the deposit's documented
+ *   timing-only contract (#1274).
+ *
+ * A producer that does NOT declare it keeps the P2a rule: the first frame that
+ * stages real 2D-plane content moves the session to the xbridge ingress for good
+ * (`hub placement: CHANGED ... ingress=xbridge reason=plane_content`) BEFORE that
+ * frame is submitted, so no frame ever loses its planes.
  * @{
  */
 
@@ -938,6 +1029,19 @@ comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split);
  */
 void *
 comp_hub_d3d11_get_consumer_fence_handle(struct comp_hub_d3d11 *split);
+
+/*!
+ * #2317 P2c: the consumer-fence value a ring producer's next PLANE rewrite must
+ * GPU-wait for (on the fence it opened from
+ * @ref comp_hub_d3d11_get_consumer_fence_handle): the value the hub's latest
+ * weave or repaint signalled after its reads, so every read of the
+ * single-buffered plane surfaces recorded so far. 0 = nothing to wait for (no
+ * DIRECT fence-mode ring session, or no weave yet). Stays valid after a move to
+ * xbridge, so the first bridged plane write still waits out the DIRECT era's
+ * last reads.
+ */
+uint64_t
+comp_hub_d3d11_get_plane_release_value(struct comp_hub_d3d11 *split);
 
 /*!
  * Pop one owed slot release: the hub will never read @p out_slot again until
@@ -990,6 +1094,59 @@ typedef void (*comp_hub_d3d11_post_weave_fn)(
 
 void
 comp_hub_d3d11_set_post_weave_hook(struct comp_hub_d3d11 *split, comp_hub_d3d11_post_weave_fn fn, void *userdata);
+/*! @} */
+
+/*!
+ * @name #2342 P2c: the ONE capture site for every hub route
+ *
+ * The shared atlas trigger (u_capture_intent: `%TEMP%\displayxr_atlas_trigger`,
+ * its `.projection` and per-exe variants, and MCP `capture_frame`) is polled
+ * by the tier as before. Exactly one consumer per trigger:
+ *
+ * - **POST_COMPOSE (full) triggers** — the tier hands them to the hub at the
+ *   top of the frame (its own post-compose point, which on the D3D12 reroute
+ *   never ran, then stays idle). The hub writes, on the next APP frame it
+ *   weaves, with the service twin's names (#2207 / #2289): the DP input — the
+ *   content-cropped atlas handed to process_atlas (ADR-030), pre-weave — to
+ *   `displayxr_atlas[.<exe>].png`, and the post-weave back buffer (weave +
+ *   masked composite + HUD, what is presented) to
+ *   `displayxr_atlas[.<exe>].woven.png`.
+ * - **PROJECTION_ONLY triggers** stay with the tier's own projection-done
+ *   point, which reads the renderer atlas BEFORE the window-space pass (the
+ *   HUD-free capture `/make-app-logos` depends on). Only if that point was
+ *   skipped (zero-copy) and the intent is still pending at the handoff does the
+ *   tier hand it to the hub, which then writes the DP input alone to
+ *   `displayxr_atlas[.<exe>].projection.png`.
+ *
+ * Alpha is forced opaque unless `DXR_ATLAS_CAPTURE_RAW_ALPHA=1`. One WARN per
+ * completed capture names the files. A readback (one staging copy + a Map) runs
+ * only on the frame that captures.
+ * @{
+ */
+
+/*!
+ * Arm a capture for the next APP-frame weave (never a repaint). @p path is the
+ * intent's output path and @p woven_path its post-weave sibling (the tier
+ * derives it with u_capture_intent_sibling_path; ignored for projection-only).
+ * Always arms, even with an empty path: the write then fails and the intent
+ * completes as failed, so an MCP waiter is never left re-arming. A second arm
+ * before the first was taken replaces it.
+ */
+void
+comp_hub_d3d11_capture_arm(struct comp_hub_d3d11 *split,
+                           bool projection_only,
+                           const char *path,
+                           const char *woven_path);
+
+/*!
+ * After the app-frame weave: true when a capture was armed (it is now
+ * disarmed, whatever happened), with @p out_ok whether its DP input was
+ * written. A frame that wove nothing (#918 F4) consumes the arm with
+ * @p out_ok false, so the tier can complete its intent (and an MCP waiter)
+ * rather than leave it pending.
+ */
+bool
+comp_hub_d3d11_capture_take(struct comp_hub_d3d11 *split, bool *out_ok);
 /*! @} */
 
 /*!

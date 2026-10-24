@@ -238,6 +238,17 @@ comp_d3d12_deposit_note_planes_consumed(struct comp_d3d12_deposit *dep);
 //! any plane. No-op while nothing has consumed a plane.
 void
 comp_d3d12_deposit_plane_wait(struct comp_d3d12_deposit *dep, void *app_queue);
+
+/*!
+ * #2317 P2c: the planes' back edge on the hub's DIRECT ingress. The hub reads
+ * the plane surfaces in place on every weave and repaint, so the app queue's
+ * next plane rewrite GPU-waits for @p value (comp_hub_d3d11_get_plane_release_value)
+ * on the hub's consumer fence bound by @ref comp_d3d12_deposit_bind_consumer_fence.
+ * Queue before executing a list that rewrites any plane. No-op with no fence
+ * bound or @p value 0; free once satisfied.
+ */
+void
+comp_d3d12_deposit_plane_wait_hub(struct comp_d3d12_deposit *dep, void *app_queue, uint64_t value);
 /*! @} */
 
 #ifdef __cplusplus

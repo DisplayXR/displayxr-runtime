@@ -655,8 +655,38 @@ comp_d3d11_target_bind(struct comp_d3d11_target *target)
  * loop needs (measured on the D3D12 leg: 31.9 -> 16.9 fps with essentially zero
  * repaints issued). Scanout pacing alone is passive and costs nothing.
  */
+static void
+d3d11_target_repaint_pace_on(IDXGISwapChain1 *swapchain);
+
 extern "C" void
 comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target)
+{
+	d3d11_target_repaint_pace_on(target->swapchain);
+}
+
+extern "C" void *
+comp_d3d11_target_repaint_pace_hold(struct comp_d3d11_target *target)
+{
+	if (target == nullptr || target->swapchain == nullptr) {
+		return nullptr;
+	}
+	target->swapchain->AddRef();
+	return target->swapchain;
+}
+
+extern "C" void
+comp_d3d11_target_repaint_pace_held(void *hold)
+{
+	if (hold == nullptr) {
+		return;
+	}
+	auto *sc = static_cast<IDXGISwapChain1 *>(hold);
+	d3d11_target_repaint_pace_on(sc);
+	sc->Release();
+}
+
+static void
+d3d11_target_repaint_pace_on(IDXGISwapChain1 *swapchain)
 {
 	// Composed chains: statistics are unusable and measured_r is 0, so BOTH
 	// pacers below no-op — leaving Present(1) as the only throttle, blocking
@@ -682,8 +712,8 @@ comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target)
 	if (g_frame_latency_waitable != nullptr && g_scanout_stats_strikes >= 0) {
 		const UINT relax = (UINT)(g_lw_gov_d3d11.effective - 1);
 		if (g_last_present_count > relax) {
-			late_weave_wait_scanout(target->swapchain, g_last_present_count - relax,
-			                        g_lw_gov_d3d11.period_ns, g_weave_latency_d3d11.freq());
+			late_weave_wait_scanout(swapchain, g_last_present_count - relax, g_lw_gov_d3d11.period_ns,
+			                        g_weave_latency_d3d11.freq());
 		}
 	}
 

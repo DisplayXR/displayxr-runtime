@@ -489,6 +489,10 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
             (PFN_xrVoidFunction*)&g_zone.pfnSubmit);
         xrGetInstanceProcAddr(xr.instance, "xrDestroyLocal3DZoneMaskDXR",
             (PFN_xrVoidFunction*)&g_zone.pfnDestroy);
+        // #2342: optional Tier-3 entry point (DXR_LOCAL2D_MASK=3).
+        xrGetInstanceProcAddr(xr.instance,
+                              "xrAcquireLocal3DZoneRenderTargetDXR",
+                              (PFN_xrVoidFunction *)&g_zone.pfnAcquire);
         if (!g_zone.pfnCreate || !g_zone.pfnSetRects || !g_zone.pfnSubmit || !g_zone.pfnDestroy) {
             LOG_WARN("XR_DXR_local_3d_zone advertised but entry points missing — harness disabled");
             g_zone.available = false;

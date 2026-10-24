@@ -1504,6 +1504,13 @@ struct comp_vk_native_compositor
 	//! at the projection-done boundary (PROJECTION_ONLY) or end of
 	//! frame (POST_COMPOSE).
 	struct u_capture_intent capture_intent;
+	/*!
+	 * #2342 P2c: on a hub route the HUB is the one capture site. A pending
+	 * capture intent is moved here at the top of the frame (so this tier's
+	 * own projection / post dispatch points stay idle), handed to the hub
+	 * before the app-frame weave, and completed after it.
+	 */
+	struct u_capture_intent hub_capture;
 
 	//! Composite-tap diagnostics (#833 debugging): the Local2D composite
 	//! stashes this frame's target + scratch state here so the
@@ -10346,6 +10353,22 @@ vk_repaint_thread(void *ptr)
 			if (!comp_hub_d3d11_has_weave_slot(c->split)) {
 				continue;
 			}
+			/*
+			 * #2342 P2c: the HUB paces the replay, on its own target — the
+			 * native D3D11 leg's pacer (scanout wait + #884 late sleep), held
+			 * under the lock so a retire cannot free what the unlocked wait
+			 * reads. Skipped under an ENGAGED #1257 partition (the schedule IS
+			 * the pacing), as natively. Before P2c the split replay had none.
+			 */
+			if (c->repaint.partition.next_release_ns == 0) {
+				void *hold = NULL;
+				os_mutex_lock(&c->mutex);
+				if (c->split != NULL) {
+					hold = comp_hub_d3d11_repaint_pace_hold(c->split);
+				}
+				os_mutex_unlock(&c->mutex);
+				comp_hub_d3d11_repaint_pace_wait(hold);
+			}
 			const uint64_t fire_t0 = os_monotonic_get_ns();
 			os_mutex_lock(&c->mutex);
 			if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
@@ -10354,18 +10377,55 @@ vk_repaint_thread(void *ptr)
 				os_mutex_unlock(&c->mutex);
 				continue;
 			}
-			// #1339: no fill into the arm's flip queue while it holds a
-			// pending present (see comp_d3d11_target_repaint_admit).
-			if (c->repaint.partition.next_release_ns == 0 && !comp_hub_d3d11_repaint_admit(c->split)) {
-				u_repaint_trace_bail_gate(&c->repaint.trace);
-				os_mutex_unlock(&c->mutex);
-				continue;
+			/*
+			 * #2345 review: the pace above can block about a period plus the
+			 * #884 late sleep, so an app frame may have landed meanwhile —
+			 * re-run the cadence gate under the lock, as the native VK arm,
+			 * the D3D12 reroute and the D3D11 hub arms do, or the fill fires
+			 * right behind the app's own present.
+			 */
+			{
+				const bool move_fill_locked = move_fill && vk_wl_move_fill_due(c, period_ns);
+				const uint64_t now_r = os_monotonic_get_ns();
+#ifdef VK_MIDFRAME_FILL
+				const bool mf_locked = mf_on && vk_midframe_active(c);
+				bool relock_gate_ok;
+				if (mf_locked && mf_fill) {
+					relock_gate_ok = vk_midframe_gate_open(c, now_r, period_ns, NULL);
+				} else {
+					relock_gate_ok = !(c->repaint.force != 1 && !move_fill_locked &&
+					                   !u_repaint_gate_open(&c->repaint.gate, now_r, period_ns,
+					                                        &c->repaint.partition));
+					if (relock_gate_ok && mf_locked && !move_fill_locked &&
+					    vk_midframe_app_mid(c)) {
+						relock_gate_ok = vk_midframe_gate_open(c, now_r, period_ns, NULL);
+					}
+				}
+#else
+				const bool relock_gate_ok =
+				    !(c->repaint.force != 1 && !move_fill_locked &&
+				      !u_repaint_gate_open(&c->repaint.gate, now_r, period_ns, &c->repaint.partition));
+#endif
+				if (!relock_gate_ok) {
+					u_repaint_trace_bail_race(&c->repaint.trace);
+					os_mutex_unlock(&c->mutex);
+					continue;
+				}
 			}
+			// #1339 / #2342 P2c: the hub's one admission + replay — no fill
+			// into the arm's flip queue while it holds a pending present (see
+			// comp_d3d11_target_repaint_admit).
 			const struct xrt_rect rp_canvas = vk_dp_canvas_rect(c);
 			// #1339: spacing is stamped from the START of the fire (fire_t0/t1
 			// keep measuring DURATION for the trace).
 			const uint64_t rp_start_ns = os_monotonic_get_ns();
-			(void)comp_hub_d3d11_weave_and_present(c->split, /*is_repaint=*/true, &rp_canvas);
+			const enum comp_hub_d3d11_repaint_result rr =
+			    comp_hub_d3d11_repaint(c->split, c->repaint.partition.next_release_ns != 0, &rp_canvas);
+			if (rr == COMP_HUB_D3D11_REPAINT_NOT_ADMITTED || rr == COMP_HUB_D3D11_REPAINT_NO_FRAME) {
+				u_repaint_trace_bail_gate(&c->repaint.trace);
+				os_mutex_unlock(&c->mutex);
+				continue;
+			}
 			c->repaint.count++;
 			const uint64_t fire_t1 = os_monotonic_get_ns();
 			u_repaint_gate_note_repaint(&c->repaint.gate, rp_start_ns);
@@ -11342,6 +11402,20 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// frame; consumed at the projection-done boundary or end of frame
 	// depending on requested mode. See u_capture_intent.h.
 	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
+#ifdef XRT_OS_WINDOWS
+	// #2342 P2c: under the split the hub is the POST-compose capture site; a
+	// projection-only intent stays with the native projection-done point.
+	if (c->split != NULL && c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_POST_COMPOSE) {
+		if (c->hub_capture.pending) {
+			u_capture_intent_complete(&c->hub_capture, &c->mcp_capture, false);
+		}
+		c->hub_capture = c->capture_intent;
+		c->capture_intent.pending = false;
+	} else if (c->split == NULL && c->hub_capture.pending) {
+		// Handed to a split that retired before weaving it: fail it, never strand it.
+		u_capture_intent_complete(&c->hub_capture, &c->mcp_capture, false);
+	}
+#endif
 
 	// Composite-tap state is per-frame: only valid when this frame's
 	// Local2D composite runs and re-stashes it.
@@ -12187,7 +12261,26 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		comp_hub_d3d11_set_predicted_display_time(c->split, c->layer_accum.data.display_time_ns > 0
 		                                                        ? (uint64_t)c->layer_accum.data.display_time_ns
 		                                                        : c->last_display_time_ns);
+		// #2342 P2c: a projection-only intent the native point skipped (zero-copy)
+		// goes to the hub too (one consumer either way); then arm the hub.
+		if (c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY &&
+		    !c->hub_capture.pending) {
+			c->hub_capture = c->capture_intent;
+			c->capture_intent.pending = false;
+		}
+		if (c->hub_capture.pending) {
+			char woven[MCP_CAPTURE_PATH_MAX + 16];
+			u_capture_intent_sibling_path(c->hub_capture.path, ".woven", woven, sizeof(woven));
+			comp_hub_d3d11_capture_arm(c->split, c->hub_capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
+			                           c->hub_capture.path, woven);
+		}
 		const bool wove = comp_hub_d3d11_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
+		{
+			bool cap_ok = false;
+			if (comp_hub_d3d11_capture_take(c->split, &cap_ok) && c->hub_capture.pending) {
+				u_capture_intent_complete(&c->hub_capture, &c->mcp_capture, cap_ok);
+			}
+		}
 
 		/*
 		 * XR_DXR_depth_budget — the split arm's tick. The preview comes from
@@ -13918,6 +14011,10 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		    .app_timeline_semaphores = app_timeline_semaphores,
 		    // #2317 P2a: this caller honours the DIRECT release contract.
 		    .ring_direct = true,
+		    // #2317 P2c: ...and its plane twin: the plane pass signals the
+		    // deposit timeline before the handoff and waits out the hub's last
+		    // plane read (vk_split_stage_planes).
+		    .ring_direct_planes = true,
 		    .render_packed_luid = c->render_packed_luid,
 		    .display_screen_left = display_screen_left,
 		    .display_screen_top = display_screen_top,
@@ -18526,8 +18623,21 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	uint64_t signal_value = 0;
 	comp_vk_deposit_claim_signal(dep, &sem, &signal_value);
 	const uint64_t wait_value = comp_vk_deposit_plane_wait_value(dep);
-	VkPipelineStageFlags wait_stage =
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+	/*
+	 * #2317 P2c: on the hub's DIRECT ingress the planes are read IN PLACE by
+	 * every weave and repaint, so this rewrite also waits out the hub's latest
+	 * read, on its consumer fence (imported as a second timeline). Fence mode
+	 * only — keyed-mutex deposits keep their timing-only planes (#1274).
+	 */
+	const VkSemaphore hub_sem = comp_vk_deposit_get_hub_timeline(dep);
+	const uint64_t hub_value = comp_hub_d3d11_get_plane_release_value(c->split);
+	VkPipelineStageFlags wait_stages[2] = {
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	};
+	VkSemaphore wait_sems[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	uint64_t wait_values[2] = {0, 0};
+	uint32_t wait_count = 0;
 
 	VkTimelineSemaphoreSubmitInfo timeline_info = {
 	    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
@@ -18544,11 +18654,21 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 		submit_info.signalSemaphoreCount = 1;
 		submit_info.pSignalSemaphores = &sem;
 		if (wait_value != 0) {
-			timeline_info.waitSemaphoreValueCount = 1;
-			timeline_info.pWaitSemaphoreValues = &wait_value;
-			submit_info.waitSemaphoreCount = 1;
-			submit_info.pWaitSemaphores = &sem;
-			submit_info.pWaitDstStageMask = &wait_stage;
+			wait_sems[wait_count] = sem;
+			wait_values[wait_count] = wait_value;
+			wait_count++;
+		}
+		if (hub_sem != VK_NULL_HANDLE && hub_value != 0) {
+			wait_sems[wait_count] = hub_sem;
+			wait_values[wait_count] = hub_value;
+			wait_count++;
+		}
+		if (wait_count != 0) {
+			timeline_info.waitSemaphoreValueCount = wait_count;
+			timeline_info.pWaitSemaphoreValues = wait_values;
+			submit_info.waitSemaphoreCount = wait_count;
+			submit_info.pWaitSemaphores = wait_sems;
+			submit_info.pWaitDstStageMask = wait_stages;
 		}
 	}
 

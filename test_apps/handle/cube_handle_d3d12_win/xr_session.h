@@ -43,6 +43,8 @@ struct ZoneMaskHarness {
     PFN_xrSetLocal3DZoneFromRectsDXR pfnSetRects = nullptr;
     PFN_xrSubmitLocal3DZoneDXR pfnSubmit = nullptr;
     PFN_xrDestroyLocal3DZoneMaskDXR pfnDestroy = nullptr;
+    // #2342: Tier-3 (DXR_LOCAL2D_MASK=3) — optional; NULL leaves Tier-2 only.
+    PFN_xrAcquireLocal3DZoneRenderTargetDXR pfnAcquire = nullptr;
     XrLocal3DZoneMaskDXR mask = XR_NULL_HANDLE;
 };
 extern ZoneMaskHarness g_zone;

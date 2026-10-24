@@ -386,6 +386,13 @@ struct comp_d3d11_compositor
 		uint64_t mask_gen;
 		uint64_t mask_key;
 		uint32_t mask_w, mask_h;
+		/*!
+		 * #2342 P2c: on a hub route the HUB is the one capture site. A pending
+		 * capture intent is moved here at the top of the frame (so this tier's
+		 * own projection / post dispatch points stay idle), handed to the hub
+		 * before the app-frame weave, and completed after it.
+		 */
+		struct u_capture_intent capture;
 	} hub;
 
 	//! Output target (DXGI swapchain).
@@ -3658,11 +3665,21 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		// fraction of its slots. Under an ENGAGED partition the schedule
 		// IS the pacing; skip it.
 		const uint64_t pace_t0 = os_monotonic_get_ns();
-		// #2317 P1b: under the hub there is no target on this side; the hub's
-		// flip chain and repaint_admit below are the throttle (the D3D12
-		// reroute's shape).
+		// #2342 P2c: under the hub there is no target on this side; the HUB
+		// paces, on its own target, exactly as this leg paces natively (the
+		// hold is taken under the lock so a retire cannot free what the
+		// unlocked wait reads).
 		if (c->repaint.partition.next_release_ns == 0 && c->target != nullptr) {
 			comp_d3d11_target_repaint_pace(c->target);
+		} else if (c->repaint.partition.next_release_ns == 0 && c->hub.active) {
+			void *hold = nullptr;
+			{
+				std::lock_guard<std::mutex> hold_lock(c->mutex);
+				if (c->hub.active) {
+					hold = comp_hub_d3d11_repaint_pace_hold(c->hub.split);
+				}
+			}
+			comp_hub_d3d11_repaint_pace_wait(hold);
 		}
 		const uint64_t pace_t1 = os_monotonic_get_ns();
 		u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
@@ -3687,13 +3704,17 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 				u_repaint_trace_bail_race(&c->repaint.trace);
 				continue;
 			}
-			if (c->repaint.partition.next_release_ns == 0 && !comp_hub_d3d11_repaint_admit(c->hub.split)) {
+			// #2342 P2c: the hub's one admission + replay (has-a-frame was
+			// tested above, so NO_FRAME cannot come back here).
+			const uint64_t hub_rp_start_ns = os_monotonic_get_ns();
+			const enum comp_hub_d3d11_repaint_result hub_rr = comp_hub_d3d11_repaint(
+			    c->hub.split, c->repaint.partition.next_release_ns != 0, &c->hub.canvas);
+			if (hub_rr == COMP_HUB_D3D11_REPAINT_NOT_ADMITTED ||
+			    hub_rr == COMP_HUB_D3D11_REPAINT_NO_FRAME) {
 				c->repaint.bail_gate++;
 				u_repaint_trace_bail_gate(&c->repaint.trace);
 				continue;
 			}
-			const uint64_t hub_rp_start_ns = os_monotonic_get_ns();
-			comp_hub_d3d11_weave_and_present(c->hub.split, /*is_repaint=*/true, &c->hub.canvas);
 			c->repaint.count++;
 			const uint64_t hub_fire_t1 = os_monotonic_get_ns();
 			u_repaint_gate_note_repaint(&c->repaint.gate, hub_rp_start_ns);
@@ -4615,7 +4636,26 @@ d3d11_hub_commit(struct comp_d3d11_compositor *c,
 	// #2317 P1c: the D rows of DXR_WEAVE_LATENCY_CSV need this frame's promise —
 	// the same value the tier's own weave marks with.
 	comp_hub_d3d11_set_predicted_display_time(c->hub.split, c->last_display_time_ns);
+	// #2342 P2c: a projection-only intent the native point skipped goes to the
+	// hub too (one consumer either way); then arm the hub's capture.
+	if (c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY &&
+	    !c->hub.capture.pending) {
+		c->hub.capture = c->capture_intent;
+		c->capture_intent.pending = false;
+	}
+	if (c->hub.capture.pending) {
+		char woven[MCP_CAPTURE_PATH_MAX + 16];
+		u_capture_intent_sibling_path(c->hub.capture.path, ".woven", woven, sizeof(woven));
+		comp_hub_d3d11_capture_arm(c->hub.split, c->hub.capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
+		                           c->hub.capture.path, woven);
+	}
 	const bool wove = comp_hub_d3d11_weave_and_present(c->hub.split, /*is_repaint=*/false, &cv);
+	{
+		bool cap_ok = false;
+		if (comp_hub_d3d11_capture_take(c->hub.split, &cap_ok) && c->hub.capture.pending) {
+			u_capture_intent_complete(&c->hub.capture, &c->mcp_capture, cap_ok);
+		}
+	}
 
 	// #868: arm the replay; a frame that wove nothing keeps the panel's last
 	// woven frame and stays disarmed.
@@ -4858,23 +4898,30 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	 * composed natively with its planes.
 	 */
 	/*
-	 * #2317 P2b review: the zone publish under the hub reaches its PRIMARY DP
-	 * only, where natively every segment DP gets the mask cropped to its screen
-	 * (#2218 #4). A frame that publishes one (zones, or an authored mask) while
-	 * the hub's last weave segmented the window is the native legs' — refused by
-	 * name until the per-segment publish is ported.
+	 * #2342 P2c: a zones frame or an authored mask on a SEGMENTED window no
+	 * longer retires the hub (`segments_planes`, P2b review): the hub publishes
+	 * the zone mask to every segment DP cropped to its screen, and clears them,
+	 * exactly as this tier natively does (#2218 #4).
 	 */
-	if (c->hub.active && c->hub.retire_pending == NULL && (zones_frame || d3d11_frame_authored_mask(c) != NULL)) {
-		struct xrt_segment_metrics sm;
-		memset(&sm, 0, sizeof(sm));
-		if (comp_hub_d3d11_get_segment_metrics(c->hub.split, &sm) && sm.count > 1) {
-			c->hub.retire_pending = COMP_HUB_REASON_SEGMENTS_PLANES;
-		}
-	}
 	if (c->hub.active && c->hub.retire_pending != NULL) {
 		const char *why = c->hub.retire_pending;
 		c->hub.retire_pending = NULL;
 		d3d11_hub_retire(c, why);
+	}
+
+	// #2342 P2c: the hub is this frame's POST-compose capture site (after the
+	// retire above: a frame composed natively keeps the native dispatch points).
+	// A projection-only intent stays with the native projection-done point,
+	// which reads the atlas before the window-space pass.
+	if (c->hub.active && c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_POST_COMPOSE) {
+		if (c->hub.capture.pending) {
+			u_capture_intent_complete(&c->hub.capture, &c->mcp_capture, false);
+		}
+		c->hub.capture = c->capture_intent;
+		c->capture_intent.pending = false;
+	} else if (!c->hub.active && c->hub.capture.pending) {
+		// Handed to a hub that retired before weaving it: fail it, never strand it.
+		u_capture_intent_complete(&c->hub.capture, &c->mcp_capture, false);
 	}
 
 	// XR_DXR_depth_budget v2 (#1365): the rear-budget ROI is clamped to the

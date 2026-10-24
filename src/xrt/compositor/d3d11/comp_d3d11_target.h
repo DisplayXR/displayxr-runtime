@@ -109,6 +109,23 @@ void
 comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target);
 
 /*!
+ * #2342 P2c: @ref comp_d3d11_target_repaint_pace for a caller that cannot keep
+ * the TARGET alive across the unlocked wait (the D3D11 hub: a mid-session retire
+ * destroys its target under the compositor lock while the repaint thread paces
+ * without it). Call @ref comp_d3d11_target_repaint_pace_hold UNDER the
+ * compositor lock — it AddRefs the swapchain the pacer reads and returns it
+ * (NULL = nothing to pace on) — then @ref comp_d3d11_target_repaint_pace_held
+ * WITHOUT the lock, which paces exactly as comp_d3d11_target_repaint_pace and
+ * releases the hold. The rest of the pacer's state is file-scope (one target
+ * per process on this path), so it outlives the target.
+ */
+void *
+comp_d3d11_target_repaint_pace_hold(struct comp_d3d11_target *target);
+
+void
+comp_d3d11_target_repaint_pace_held(void *hold);
+
+/*!
  * #1339: may a repaint present NOW without deepening the present queue?
  *
  * Takes one frame-latency token non-blockingly (timeout 0). A repaint is a

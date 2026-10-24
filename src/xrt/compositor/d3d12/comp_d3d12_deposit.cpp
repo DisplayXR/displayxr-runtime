@@ -618,6 +618,15 @@ comp_d3d12_deposit_note_planes_consumed(struct comp_d3d12_deposit *dep)
 }
 
 extern "C" void
+comp_d3d12_deposit_plane_wait_hub(struct comp_d3d12_deposit *dep, void *app_queue, uint64_t value)
+{
+	if (dep == NULL || app_queue == NULL || dep->hub_fence12 == NULL || value == 0) {
+		return;
+	}
+	((ID3D12CommandQueue *)app_queue)->Wait(dep->hub_fence12, value);
+}
+
+extern "C" void
 comp_d3d12_deposit_plane_wait(struct comp_d3d12_deposit *dep, void *app_queue)
 {
 	if (dep == NULL || app_queue == NULL || dep->fence12 == NULL || dep->plane_release_value == 0) {

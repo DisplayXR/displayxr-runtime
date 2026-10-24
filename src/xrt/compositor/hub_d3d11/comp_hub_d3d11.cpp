@@ -29,6 +29,7 @@
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_tiling.h"
+#include "util/u_image_capture.h"
 
 #include "os/os_time.h"
 #include "util/u_time.h"
@@ -64,6 +65,12 @@
 
 #include "os/os_threading.h"
 #include "util/comp_segments.h"
+
+// #2342 P2c: the hub's capture site encodes its own PNGs. STB_IMAGE_WRITE_STATIC
+// scopes the symbols to this TU (the tiers that link the hub carry their own).
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 
 /*
@@ -130,6 +137,8 @@ struct comp_hub_d3d11
 	bool stable_atlas;
 	//! #2317 P2a: @ref comp_hub_d3d11_info::ring_direct.
 	bool ring_direct;
+	//! #2317 P2c: @ref comp_hub_d3d11_info::ring_direct_planes.
+	bool ring_direct_planes;
 	//! #2317 P1c: @ref comp_hub_d3d11_set_predicted_display_time.
 	uint64_t predicted_display_time_ns;
 
@@ -248,6 +257,7 @@ struct comp_hub_d3d11
 	bool warned_slot_open;
 	bool warned_atlas_open;
 	bool warned_ring_contract;
+	bool warned_typed_srgb; //!< #2345 review: split_refuse_typed_srgb
 	uint32_t wire_fmt, wire_w, wire_h;
 
 	/*!
@@ -436,6 +446,23 @@ struct comp_hub_d3d11
 
 	uint64_t composites, composite_bails;
 
+	/*!
+	 * #2342 P2c: the one capture site (@ref comp_hub_d3d11_capture_arm). Set
+	 * by the tier on its app thread and served by the next app-frame weave on
+	 * the same thread, both under the compositor mutex.
+	 */
+	struct
+	{
+		bool armed;
+		bool projection_only;
+		bool served;
+		bool ok;
+		char path[512];
+		char woven_path[512];
+		uint32_t in_w, in_h, out_w, out_h;
+		bool woven_ok;
+	} cap;
+
 	//! @name Counters for the `[RENDER]` line and the F4/R1 tripwires.
 	//! @{
 	uint64_t no_slot;
@@ -579,6 +606,95 @@ split_make_dp(struct comp_hub_d3d11 *s)
  * degraded feature, never a broken frame.
  */
 /*!
+ * #2342 P2c, ADR-044 at the import boundary: the NON-DECODING view format of a
+ * producer surface the hub samples (the atlas, a ring slot, the crop scratch, a
+ * plane). Every producer atlas holds ENCODED bytes (ADR-044 §1, "Atlas the DP
+ * receives: encoded"), and every 2D plane holds the encoded flatten, so the
+ * hub must read them through the UNORM member of their family: an `_SRGB` view
+ * would decode them (the DP would weave linear values — too dark), and a
+ * TYPELESS format cannot be a view format at all.
+ *
+ * A UNORM view can only be made of a typed UNORM texture or a TYPELESS one: a
+ * texture created TYPED `_SRGB` takes only `_SRGB` views. So the producer
+ * contract is "typed UNORM or TYPELESS", and a typed `_SRGB` producer surface is
+ * REFUSED by name (@ref split_refuse_typed_srgb) rather than viewed decoding.
+ * Today every producer hands a typed UNORM texture (the D3D11 renderer atlas
+ * R8G8B8A8_UNORM, the D3D12 deposit R8G8B8A8_UNORM, the VK deposit
+ * B8G8R8A8_UNORM / R8G8B8A8_UNORM / the #2273 deep formats) and maps to itself;
+ * the D3D11 shim's planes are the #1795 TYPELESS scratch with an `_SRGB` RTV
+ * sibling, viewed UNORM here. The hub's OWN crop scratch is created TYPELESS
+ * (@ref split_typeless_format) so its UNORM view always exists.
+ *
+ * Mirrors d3d_dxgi_format_to_unorm_sample (aux_d3d), which this Vulkan-free
+ * unit cannot include (that header pulls in the Vulkan headers).
+ */
+static DXGI_FORMAT
+split_nondecoding_format(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+	// The #2273 deep atlas is RGBA16F; a typeless 16-bit surface is viewed so.
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+	case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
+	default: return f;
+	}
+}
+
+//! #2345 review: the TYPELESS member of @p f's family (the hub's crop scratch),
+//! or @p f itself when it has none listed here.
+static DXGI_FORMAT
+split_typeless_format(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+	case DXGI_FORMAT_R10G10B10A2_UNORM: return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+	case DXGI_FORMAT_R8_TYPELESS:
+	case DXGI_FORMAT_R8_UNORM: return DXGI_FORMAT_R8_TYPELESS;
+	default: return f;
+	}
+}
+
+/*!
+ * #2345 review: a producer surface created TYPED `_SRGB` cannot take the
+ * non-decoding view (a typed texture's views must match its format), so it is
+ * refused by name — once per session — and the caller treats it as an open
+ * failure (DIRECT falls to xbridge; a plane degrades alone). Returns true when
+ * @p tex must be refused.
+ */
+static bool
+split_refuse_typed_srgb(struct comp_hub_d3d11 *s, ID3D11Texture2D *tex, const char *what)
+{
+	D3D11_TEXTURE2D_DESC d = {};
+	tex->GetDesc(&d);
+	if (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB && d.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+		return false;
+	}
+	if (!s->warned_typed_srgb) {
+		s->warned_typed_srgb = true;
+		U_LOG_W(
+		    "#2342 hub: the producer's %s is a TYPED _SRGB texture (format %d) — it cannot be viewed "
+		    "without decoding its encoded bytes (ADR-044), so the hub refuses it; producers hand typed "
+		    "UNORM or TYPELESS surfaces",
+		    what, (int)d.Format);
+	}
+	return true;
+}
+
+/*!
  * The format the DP is told for the atlas it weaves: the SRV's own, when the
  * split carries a deep atlas (#2273: R10G10B10A2 / RGBA16F), else the 8-bit
  * value it always declared. Twin of the in-process d3d11_dp_view_format.
@@ -633,7 +749,8 @@ split_plane_dp_view(struct comp_hub_d3d11 *s,
 	 */
 	D3D11_SHADER_RESOURCE_VIEW_DESC psd = {};
 	psrv->GetDesc(&psd);
-	const DXGI_FORMAT src_fmt = psd.Format;
+	// #2342 P2c (ADR-044): never a decoding view of an encoded plane.
+	const DXGI_FORMAT src_fmt = split_nondecoding_format(psd.Format);
 
 	// Passthrough: the plane is exactly what the display processor asked for.
 	if (pd.Width == w && pd.Height == h) {
@@ -1297,6 +1414,8 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 static void
 split_direct_to_xbridge(struct comp_hub_d3d11 *s, const char *reason);
 static void
+split_direct_demote_for_planes(struct comp_hub_d3d11 *s);
+static void
 split_direct_ring_vet(struct comp_hub_d3d11 *s,
                       const struct comp_hub_d3d11_handoff *handoff,
                       uint32_t content_w,
@@ -1420,6 +1539,7 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
 	s->same_adapter = gate.same_adapter;
 	s->stable_atlas = info->stable_atlas;
 	s->ring_direct = info->ring_direct;
+	s->ring_direct_planes = info->ring_direct_planes;
 	s->direct.cur = -1;
 	wcsncpy_s(s->out_desc, sdesc.Description, _TRUNCATE);
 
@@ -1869,11 +1989,15 @@ split_direct_bind_plane(struct comp_hub_d3d11 *s, uint32_t plane, void *handle, 
 		hr = od1->OpenSharedResource1((HANDLE)handle, __uuidof(ID3D11Texture2D), (void **)&p.tex);
 		od1->Release();
 	}
+	if (SUCCEEDED(hr) && p.tex != nullptr && split_refuse_typed_srgb(s, p.tex, "2D plane")) {
+		hr = E_INVALIDARG;
+	}
 	if (SUCCEEDED(hr) && p.tex != nullptr) {
 		D3D11_TEXTURE2D_DESC td = {};
 		p.tex->GetDesc(&td);
 		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-		sd.Format = fmt;
+		// #2342 P2c (ADR-044): the non-decoding member, whatever was asked.
+		sd.Format = split_nondecoding_format(fmt);
 		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 		sd.Texture2D.MipLevels = 1;
 		hr = s->out_dev->CreateShaderResourceView(p.tex, &sd, &p.srv);
@@ -2065,10 +2189,10 @@ comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *s,
                               uint32_t bd_w,
                               uint32_t bd_h)
 {
-	// #2317 P2a: real backdrop content on a RING producer needs the xbridge
-	// ingress (P2b carries planes on DIRECT for the stable atlas only).
+	// #2317 P2a: real backdrop content on a RING producer that did not declare
+	// the plane contract needs the xbridge ingress (P2c: one that did keeps it).
 	if (s != nullptr && nt_handle != nullptr && content_seq != 0 && bd_w != 0 && bd_h != 0) {
-		split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_PLANES);
+		split_direct_demote_for_planes(s);
 	}
 	if (s == nullptr || !split_has_plane_transport(s)) {
 		return false;
@@ -2348,10 +2472,10 @@ comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *s,
                              bool opaque_present,
                              bool mask_is_plane)
 {
-	// #2317 P2a: a real Local2D composite on a RING producer needs the xbridge
-	// ingress (P2b carries planes on DIRECT for the stable atlas only).
+	// #2317 P2a: a real Local2D composite on a RING producer that did not
+	// declare the plane contract needs the xbridge ingress (P2c).
 	if (s != nullptr && nt_handle != nullptr && content_seq != 0 && region_w != 0 && region_h != 0) {
-		split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_PLANES);
+		split_direct_demote_for_planes(s);
 	}
 	if (s == nullptr || !split_has_plane_transport(s)) {
 		return false;
@@ -2411,10 +2535,10 @@ comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *s,
 extern "C" bool
 comp_hub_d3d11_bind_mask_plane(struct comp_hub_d3d11 *s, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h)
 {
-	// #2317 P2a: an authored mask plane on a RING producer needs the xbridge
-	// ingress (P2b carries planes on DIRECT for the stable atlas only).
+	// #2317 P2a: an authored mask plane on a RING producer that did not
+	// declare the plane contract needs the xbridge ingress (P2c).
 	if (s != nullptr && nt_handle != nullptr && w != 0 && h != 0) {
-		split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_PLANES);
+		split_direct_demote_for_planes(s);
 	}
 	if (s == nullptr || !split_has_plane_transport(s)) {
 		return true; // nothing to bind against, and nothing broken
@@ -2550,6 +2674,23 @@ split_publish_zone_wish_now(struct comp_hub_d3d11 *s, uint64_t seq)
 	                                                        (uint32_t)r.bottom, seq)) {
 		s->zone_published = true;
 	}
+	/*
+	 * #2342 P2c (#2218 #4, the native D3D11 rule): a window spanning screens —
+	 * every segment DP gets the mask cropped to its screen, so a 2D zone on
+	 * screen B stays 2D there even when screen A has a 3D zone (the vendor's
+	 * verdict is per panel). The manager lives on THIS device, and @p srv is
+	 * this device's (an out-device raster or plane view), so the crop is one
+	 * CopySubresourceRegion per segment. A screen the window has left is
+	 * cleared inside. seg_mutex: the app thread reads the manager for eyes;
+	 * every caller of this is serialised with the weave by the compositor
+	 * mutex, which is what serialises the manager's rebuild.
+	 */
+	if (s->mutexes_init) {
+		os_mutex_lock(&s->seg_mutex);
+		comp_d3d11_segments_publish_zone_mask(s->segments, s->out_ctx, srv, mw, mh, (uint32_t)r.right,
+		                                      (uint32_t)r.bottom, seq);
+		os_mutex_unlock(&s->seg_mutex);
+	}
 }
 
 extern "C" bool
@@ -2592,10 +2733,18 @@ comp_hub_d3d11_publish_zone_wish(struct comp_hub_d3d11 *s, uint64_t seq)
 extern "C" void
 comp_hub_d3d11_clear_zone_wish(struct comp_hub_d3d11 *s)
 {
-	if (s != nullptr) {
-		s->direct.publish_pending = false; // a withdrawn wish owes no publish
+	if (s == nullptr) {
+		return;
 	}
-	if (s == nullptr || s->dp == nullptr || !s->zone_published) {
+	s->direct.publish_pending = false; // a withdrawn wish owes no publish
+	// #2342 P2c (#2218 #4): every segment DP that holds a published crop too.
+	// Idempotent; a manager with nothing published is a no-op.
+	if (s->mutexes_init) {
+		os_mutex_lock(&s->seg_mutex);
+		comp_d3d11_segments_clear_zone_mask(s->segments);
+		os_mutex_unlock(&s->seg_mutex);
+	}
+	if (s->dp == nullptr || !s->zone_published) {
 		return;
 	}
 	xrt_display_processor_d3d11_clear_local_zone_mask(s->dp);
@@ -2973,6 +3122,142 @@ split_draw_hud(struct comp_hub_d3d11 *s, ID3D11Texture2D *dst, uint32_t tgt_w, u
 }
 
 /*!
+ * #2342 P2c: read back the top-left @p w x @p h of @p tex on THIS device and
+ * encode it as an RGBA8 PNG at @p path. 8-bit RGBA / BGRA families only (a deep
+ * atlas is refused by name, as the tiers' captures do); BGRA is swizzled; alpha
+ * forced opaque unless DXR_ATLAS_CAPTURE_RAW_ALPHA=1. Capture frames only: one
+ * staging copy and a Map, which waits for this context.
+ */
+static bool
+split_capture_tex_png(struct comp_hub_d3d11 *s, ID3D11Texture2D *tex, uint32_t w, uint32_t h, const char *path)
+{
+	if (tex == nullptr || w == 0 || h == 0 || path == nullptr || path[0] == '\0') {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC d = {};
+	tex->GetDesc(&d);
+	bool swap_rb = false;
+	switch (d.Format) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: break;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: swap_rb = true; break;
+	default:
+		U_LOG_W("#2342 hub capture: texture format %d is not 8-bit RGBA/BGRA — %s skipped", (int)d.Format,
+		        path);
+		return false;
+	}
+	if (w > d.Width) {
+		w = d.Width;
+	}
+	if (h > d.Height) {
+		h = d.Height;
+	}
+	D3D11_TEXTURE2D_DESC sd = d;
+	sd.Width = w;
+	sd.Height = h;
+	sd.MipLevels = 1;
+	sd.ArraySize = 1;
+	sd.SampleDesc.Count = 1;
+	sd.SampleDesc.Quality = 0;
+	sd.Usage = D3D11_USAGE_STAGING;
+	sd.BindFlags = 0;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	sd.MiscFlags = 0;
+	ID3D11Texture2D *staging = nullptr;
+	if (FAILED(s->out_dev->CreateTexture2D(&sd, nullptr, &staging)) || staging == nullptr) {
+		return false;
+	}
+	D3D11_BOX box = {0, 0, 0, w, h, 1};
+	s->out_ctx->CopySubresourceRegion(staging, 0, 0, 0, 0, tex, 0, &box);
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	bool ok = false;
+	if (SUCCEEDED(s->out_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+		const size_t pitch = (size_t)w * 4u;
+		uint8_t *tight = (uint8_t *)malloc(pitch * h);
+		if (tight != nullptr) {
+			u_image_capture_to_rgba8(tight, (const uint8_t *)m.pData, w, h, m.RowPitch, swap_rb,
+			                         u_image_capture_raw_alpha());
+			ok = stbi_write_png(path, (int)w, (int)h, 4, tight, (int)pitch) != 0;
+			free(tight);
+		}
+		s->out_ctx->Unmap(staging, 0);
+	}
+	staging->Release();
+	return ok;
+}
+
+//! The texture behind @p srv (AddRef'd), or NULL.
+static ID3D11Texture2D *
+split_srv_texture(ID3D11ShaderResourceView *srv)
+{
+	if (srv == nullptr) {
+		return nullptr;
+	}
+	ID3D11Resource *res = nullptr;
+	srv->GetResource(&res);
+	if (res == nullptr) {
+		return nullptr;
+	}
+	ID3D11Texture2D *tex = nullptr;
+	if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex))) {
+		tex = nullptr;
+	}
+	res->Release();
+	return tex;
+}
+
+/*!
+ * #2342 P2c: the DP-input half of an armed capture, right after the weave
+ * consumed @p atlas_srv: its content box (@p w x @p h at the origin — the crop
+ * when one ran, else the content box of the slot/atlas). App frames only.
+ */
+static void
+split_capture_dp_input(
+    struct comp_hub_d3d11 *s, bool is_repaint, ID3D11ShaderResourceView *atlas_srv, uint32_t w, uint32_t h)
+{
+	if (is_repaint || !s->cap.armed || s->cap.served) {
+		return;
+	}
+	ID3D11Texture2D *tex = split_srv_texture(atlas_srv);
+	s->cap.ok = split_capture_tex_png(s, tex, w, h, s->cap.path);
+	if (tex != nullptr) {
+		tex->Release();
+	}
+	s->cap.in_w = w;
+	s->cap.in_h = h;
+	s->cap.served = true;
+}
+
+/*!
+ * #2342 P2c: the post-weave half (full triggers only) — the back buffer after
+ * the weave, the masked composite and the HUD, i.e. what is about to be
+ * presented — and the one WARN naming the files.
+ */
+static void
+split_capture_woven(struct comp_hub_d3d11 *s, bool is_repaint, ID3D11Texture2D *dst, uint32_t tgt_w, uint32_t tgt_h)
+{
+	if (is_repaint || !s->cap.armed || !s->cap.served) {
+		return;
+	}
+	s->cap.armed = false;
+	if (!s->cap.projection_only) {
+		s->cap.woven_ok = split_capture_tex_png(s, dst, tgt_w, tgt_h, s->cap.woven_path);
+		s->cap.out_w = tgt_w;
+		s->cap.out_h = tgt_h;
+		U_LOG_W("#2342 hub capture (%s): DP input %ux%u -> %s%s; post-weave %ux%u -> %s%s",
+		        s->direct.active ? "direct" : "xbridge", s->cap.in_w, s->cap.in_h, s->cap.path,
+		        s->cap.ok ? "" : " FAILED", tgt_w, tgt_h, s->cap.woven_path, s->cap.woven_ok ? "" : " FAILED");
+	} else {
+		U_LOG_W("#2342 hub capture (%s, projection-only): DP input %ux%u -> %s%s",
+		        s->direct.active ? "direct" : "xbridge", s->cap.in_w, s->cap.in_h, s->cap.path,
+		        s->cap.ok ? "" : " FAILED");
+	}
+}
+
+/*!
  * The residual crop, on the OUTPUT device — only ever reached when the R2 resize
  * hysteresis is holding a worst-case egress ring.
  */
@@ -3029,7 +3314,9 @@ split_crop_for_dp(struct comp_hub_d3d11 *s, ID3D11ShaderResourceView *src_srv, u
 		desc.Height = content_h;
 		desc.MipLevels = 1;
 		desc.ArraySize = 1;
-		desc.Format = src_fmt;
+		// #2345 review: TYPELESS, so its non-decoding view exists whatever the
+		// source's typed member is (the copy below stays in the family).
+		desc.Format = split_typeless_format(src_fmt);
 		desc.SampleDesc.Count = 1;
 		desc.Usage = D3D11_USAGE_DEFAULT;
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -3037,7 +3324,9 @@ split_crop_for_dp(struct comp_hub_d3d11 *s, ID3D11ShaderResourceView *src_srv, u
 			return src_srv;
 		}
 		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-		srv_desc.Format = desc.Format;
+		// #2342 P2c (ADR-044): the scratch is in the source's family (the copy
+		// below is a raw reinterpretation); its view never decodes.
+		srv_desc.Format = split_nondecoding_format(desc.Format);
 		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 		srv_desc.Texture2D.MipLevels = 1;
 		if (FAILED(s->out_dev->CreateShaderResourceView(s->dp_input_tex, &srv_desc, &s->dp_input_srv))) {
@@ -3303,10 +3592,14 @@ split_direct_open_slot(struct comp_hub_d3d11 *s, uint32_t idx, const struct comp
 		od1->Release();
 	}
 	D3D11_TEXTURE2D_DESC td = {};
+	if (SUCCEEDED(hr) && e.tex != nullptr && split_refuse_typed_srgb(s, e.tex, "ring slot")) {
+		hr = E_INVALIDARG;
+	}
 	if (SUCCEEDED(hr) && e.tex != nullptr) {
 		e.tex->GetDesc(&td);
 		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-		sd.Format = td.Format;
+		// #2342 P2c (ADR-044): the slot holds encoded bytes; view, don't decode.
+		sd.Format = split_nondecoding_format(td.Format);
 		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 		sd.Texture2D.MipLevels = 1;
 		hr = s->out_dev->CreateShaderResourceView(e.tex, &sd, &e.srv);
@@ -3337,6 +3630,28 @@ split_direct_open_slot(struct comp_hub_d3d11 *s, uint32_t idx, const struct comp
 	e.h = td.Height;
 	s->direct.reopens++;
 	return true;
+}
+
+/*!
+ * #2317 P2b/P2c: snapshot @p rec beside the frame being nominated, with the
+ * planes this frame staged marked valid — the DIRECT twin of the bridge's
+ * per-slot plane stamp. A plane is valid when the frame staged content for it
+ * (seq != 0) AND its surface is open here; otherwise every consumer fails
+ * closed, as on a slot. One snapshot serves a ring too: a DIRECT weave (and its
+ * repaints) only ever reads the NEWEST nominated frame.
+ */
+static void
+split_direct_stamp_recipe(struct comp_hub_d3d11 *s, const struct comp_xbridge_recipe *rec)
+{
+	auto &d = s->direct;
+	d.rec = *rec;
+	d.rec.plane_valid = 0;
+	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
+		if (d.planes[p].seq != 0 && d.planes[p].srv != nullptr) {
+			d.rec.plane_valid |= 1u << p;
+			d.rec.plane_seq[p] = d.planes[p].seq;
+		}
+	}
 }
 
 /*!
@@ -3382,6 +3697,9 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 		d.content_w = content_w;
 		d.content_h = content_h;
 		d.gen = s->layout_gen;
+		// #2317 P2c: the ring frame's planes ride beside it (the producer
+		// wrote them before the signal prod_value names).
+		split_direct_stamp_recipe(s, rec);
 		d.have_frame = true;
 		d.frames++;
 		d.frame_seq = ++s->seq;
@@ -3424,10 +3742,17 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 			}
 			return;
 		}
+		if (split_refuse_typed_srgb(s, d.tex, "atlas")) {
+			d.tex->Release();
+			d.tex = nullptr;
+			d.have_frame = false;
+			return;
+		}
 		D3D11_TEXTURE2D_DESC td = {};
 		d.tex->GetDesc(&td);
 		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-		sd.Format = td.Format;
+		// #2342 P2c (ADR-044): the atlas holds encoded bytes; view, don't decode.
+		sd.Format = split_nondecoding_format(td.Format);
 		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 		sd.Texture2D.MipLevels = 1;
 		if (FAILED(s->out_dev->CreateShaderResourceView(d.tex, &sd, &d.srv)) || d.srv == nullptr) {
@@ -3456,14 +3781,7 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 	 * when the frame staged content for it (seq != 0) AND its surface is open
 	 * here; otherwise every consumer fails closed, as on a slot.
 	 */
-	d.rec = *rec;
-	d.rec.plane_valid = 0;
-	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
-		if (d.planes[p].seq != 0 && d.planes[p].srv != nullptr) {
-			d.rec.plane_valid |= 1u << p;
-			d.rec.plane_seq[p] = d.planes[p].seq;
-		}
-	}
+	split_direct_stamp_recipe(s, rec);
 	d.have_frame = true;
 	d.frames++;
 	d.frame_seq = ++s->seq;
@@ -3655,6 +3973,9 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 		    (uint32_t)split_dp_view_format(atlas_srv), tgt_w, tgt_h, cv.offset.w, cv.offset.h,
 		    (uint32_t)cv.extent.w, (uint32_t)cv.extent.h);
 	}
+	// #2342 P2c: an armed capture's DP input — read before the consumer signal
+	// below releases the atlas back to the producer.
+	split_capture_dp_input(s, is_repaint, atlas_srv, d.content_w, d.content_h);
 
 	{
 		auto *dst = static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(s->target));
@@ -3678,6 +3999,7 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 		}
 
 		split_draw_hud(s, dst, tgt_w, tgt_h);
+		split_capture_woven(s, is_repaint, dst, tgt_w, tgt_h);
 		if (s->post_weave_fn != nullptr) {
 			s->post_weave_fn(s->post_weave_userdata, s->out_dev, s->out_ctx, dst, tgt_w, tgt_h, is_repaint);
 		}
@@ -3782,6 +4104,25 @@ split_direct_to_xbridge(struct comp_hub_d3d11 *s, const char *reason)
 	    "content, which the DIRECT ingress does not transport; the comp_xbridge ingress takes over for the "
 	    "rest of the session (wired in %.1f ms) (#2317 P2a)",
 	    reason, (double)(os_monotonic_get_ns() - t0) / 1.0e6);
+}
+
+/*!
+ * #2317 P2c: a ring frame staged real 2D-plane content. A FENCE-mode producer
+ * that declared @ref comp_hub_d3d11_info::ring_direct_planes keeps DIRECT (its
+ * planes are read in place, their rewrite ordered on the consumer fence); any
+ * other moves to xbridge (P2a's `plane_content`). A KEYED-MUTEX deposit has no
+ * consumer fence to order the rewrite on, and DIRECT samples the plane in place
+ * on every repaint, which widens the #1274 timing-only race beyond xbridge's
+ * (whose copy lands in a hub-owned slot) — so it keeps the P2a move (#2345
+ * review). The stable atlas never moves (split_direct_to_xbridge is ring-only).
+ */
+static void
+split_direct_demote_for_planes(struct comp_hub_d3d11 *s)
+{
+	if (s->ring_direct_planes && !s->direct.km) {
+		return;
+	}
+	split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_PLANES);
 }
 
 extern "C" bool
@@ -4017,6 +4358,8 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 		                                          tgt_w, tgt_h, cv.offset.w, cv.offset.h, (uint32_t)cv.extent.w,
 		                                          (uint32_t)cv.extent.h);
 	}
+	// #2342 P2c: an armed capture's DP input (the slot's content box).
+	split_capture_dp_input(s, is_repaint, atlas_srv, slot_cw, slot_ch);
 
 	/*
 	 * VK-1b-2 — the masked 2D-over-3D composite, then the HUD, both on the OUT
@@ -4029,6 +4372,7 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 		auto *dst = static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(s->target));
 		(void)split_composite(s, slot, is_repaint, dst);
 		split_draw_hud(s, dst, tgt_w, tgt_h);
+		split_capture_woven(s, is_repaint, dst, tgt_w, tgt_h);
 		if (s->post_weave_fn != nullptr) {
 			s->post_weave_fn(s->post_weave_userdata, s->out_dev, s->out_ctx, dst, tgt_w, tgt_h, is_repaint);
 		}
@@ -4123,6 +4467,45 @@ comp_hub_d3d11_set_post_weave_hook(struct comp_hub_d3d11 *s, comp_hub_d3d11_post
 	}
 }
 
+extern "C" void
+comp_hub_d3d11_capture_arm(struct comp_hub_d3d11 *s, bool projection_only, const char *path, const char *woven_path)
+{
+	if (s == nullptr) {
+		return;
+	}
+	// Arm even with an empty path: the write fails and the intent completes as
+	// failed (an early return here would leave _take false and the tier's
+	// intent re-arming every frame). The buffers hold MCP_CAPTURE_PATH_MAX (256)
+	// plus the ".woven" infix with room to spare.
+	auto &c = s->cap;
+	c = {};
+	c.armed = true;
+	c.projection_only = projection_only;
+	snprintf(c.path, sizeof(c.path), "%s", path != nullptr ? path : "");
+	snprintf(c.woven_path, sizeof(c.woven_path), "%s", woven_path != nullptr ? woven_path : "");
+}
+
+extern "C" bool
+comp_hub_d3d11_capture_take(struct comp_hub_d3d11 *s, bool *out_ok)
+{
+	if (out_ok != nullptr) {
+		*out_ok = false;
+	}
+	if (s == nullptr || (!s->cap.armed && !s->cap.served)) {
+		return false;
+	}
+	const bool ok = s->cap.served && s->cap.ok;
+	if (!s->cap.served) {
+		// Armed, but the app frame wove nothing (#918 F4): consumed unserved.
+		U_LOG_W("#2342 hub capture: the app frame wove nothing — %s not written", s->cap.path);
+	}
+	s->cap = {};
+	if (out_ok != nullptr) {
+		*out_ok = ok;
+	}
+	return true;
+}
+
 extern "C" uint64_t
 comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *s)
 {
@@ -4139,6 +4522,17 @@ comp_hub_d3d11_get_consumer_fence_handle(struct comp_hub_d3d11 *s)
 		return nullptr;
 	}
 	return (void *)s->direct.cons_handle;
+}
+
+extern "C" uint64_t
+comp_hub_d3d11_get_plane_release_value(struct comp_hub_d3d11 *s)
+{
+	// Fence-mode ring sessions only; survives a move to xbridge (the fence and
+	// its last value outlive the DIRECT era, see split_direct_to_xbridge).
+	if (s == nullptr || !s->direct.ring || s->direct.km || s->direct.cons_fence == nullptr) {
+		return 0;
+	}
+	return s->direct.cons_value;
 }
 
 extern "C" bool
@@ -4198,6 +4592,38 @@ extern "C" bool
 comp_hub_d3d11_repaint_admit(struct comp_hub_d3d11 *s)
 {
 	return s == nullptr || s->target == nullptr || comp_d3d11_target_repaint_admit(s->target);
+}
+
+extern "C" void *
+comp_hub_d3d11_repaint_pace_hold(struct comp_hub_d3d11 *s)
+{
+	return (s != nullptr && s->target != nullptr) ? comp_d3d11_target_repaint_pace_hold(s->target) : nullptr;
+}
+
+extern "C" void
+comp_hub_d3d11_repaint_pace_wait(void *hold)
+{
+	comp_d3d11_target_repaint_pace_held(hold);
+}
+
+extern "C" enum comp_hub_d3d11_repaint_result
+comp_hub_d3d11_repaint(struct comp_hub_d3d11 *s, bool partition_engaged, const struct xrt_rect *canvas)
+{
+	if (!comp_hub_d3d11_has_weave_slot(s)) {
+		return COMP_HUB_D3D11_REPAINT_NO_FRAME;
+	}
+	// #1339 under the lock, as natively: the app frame waits on the same
+	// waitable while holding it, so a token taken outside could be the app's.
+	if (!partition_engaged && !comp_hub_d3d11_repaint_admit(s)) {
+		return COMP_HUB_D3D11_REPAINT_NOT_ADMITTED;
+	}
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("#2342 hub: repaints paced and admitted by the hub (the native D3D11 leg's shape)");
+	}
+	return comp_hub_d3d11_weave_and_present(s, /*is_repaint=*/true, canvas) ? COMP_HUB_D3D11_REPAINT_FIRED
+	                                                                        : COMP_HUB_D3D11_REPAINT_NOT_WOVEN;
 }
 
 extern "C" void
@@ -4811,6 +5237,13 @@ comp_hub_d3d11_get_consumer_fence_handle(struct comp_hub_d3d11 *split)
 	return NULL;
 }
 
+extern "C" uint64_t
+comp_hub_d3d11_get_plane_release_value(struct comp_hub_d3d11 *split)
+{
+	(void)split;
+	return 0;
+}
+
 extern "C" bool
 comp_hub_d3d11_take_slot_release(struct comp_hub_d3d11 *split, uint32_t *out_slot, uint64_t *out_value)
 {
@@ -4847,6 +5280,47 @@ comp_hub_d3d11_set_post_weave_hook(struct comp_hub_d3d11 *split, comp_hub_d3d11_
 	(void)split;
 	(void)fn;
 	(void)userdata;
+}
+
+extern "C" void
+comp_hub_d3d11_capture_arm(struct comp_hub_d3d11 *split, bool projection_only, const char *path, const char *woven_path)
+{
+	(void)split;
+	(void)projection_only;
+	(void)path;
+	(void)woven_path;
+}
+
+extern "C" bool
+comp_hub_d3d11_capture_take(struct comp_hub_d3d11 *split, bool *out_ok)
+{
+	(void)split;
+	if (out_ok != NULL) {
+		*out_ok = false;
+	}
+	return false;
+}
+
+extern "C" void *
+comp_hub_d3d11_repaint_pace_hold(struct comp_hub_d3d11 *split)
+{
+	(void)split;
+	return NULL;
+}
+
+extern "C" void
+comp_hub_d3d11_repaint_pace_wait(void *hold)
+{
+	(void)hold;
+}
+
+extern "C" enum comp_hub_d3d11_repaint_result
+comp_hub_d3d11_repaint(struct comp_hub_d3d11 *split, bool partition_engaged, const struct xrt_rect *canvas)
+{
+	(void)split;
+	(void)partition_engaged;
+	(void)canvas;
+	return COMP_HUB_D3D11_REPAINT_NO_FRAME;
 }
 
 #endif /* XRT_OS_WINDOWS && XRT_HAVE_D3D11 */

@@ -1086,6 +1086,12 @@ comp_vk_deposit_note_hub_release(struct comp_vk_deposit *dep, uint32_t slot, uin
 	dep->ring[slot].hub_release = value;
 }
 
+extern "C" VkSemaphore
+comp_vk_deposit_get_hub_timeline(struct comp_vk_deposit *dep)
+{
+	return dep != NULL ? dep->hub_timeline : VK_NULL_HANDLE;
+}
+
 extern "C" void
 comp_vk_deposit_current_slot_hub_wait(struct comp_vk_deposit *dep, VkSemaphore *out_semaphore, uint64_t *out_value)
 {
@@ -1563,6 +1569,13 @@ comp_vk_deposit_current_slot_hub_wait(struct comp_vk_deposit *dep, VkSemaphore *
 	(void)dep;
 	*out_semaphore = VK_NULL_HANDLE;
 	*out_value = 0;
+}
+
+extern "C" VkSemaphore
+comp_vk_deposit_get_hub_timeline(struct comp_vk_deposit *dep)
+{
+	(void)dep;
+	return VK_NULL_HANDLE;
 }
 
 extern "C" bool
