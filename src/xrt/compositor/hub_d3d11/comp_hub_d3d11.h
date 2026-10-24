@@ -277,17 +277,14 @@ struct comp_hub_d3d11_info
  * The P1b plane retires (`local2d_layer`, `zone_layer`, `authored_mask`) are
  * gone: Local2D, zones, authored masks and the backdrop ride the hub on both
  * ingress routes.
+ *
+ * So is `segments_planes` (P2b review; retired by #2342 P2c): a zones frame or
+ * an authored mask while the window was segmented across screens used to retire
+ * to the native legs, because the hub published the zone mask to its primary DP
+ * only. The hub now publishes it to every segment DP cropped to its screen and
+ * clears them with it (#2218 #4, the native rule), on every hub route.
  */
 #define COMP_HUB_REASON_PLANE_UNAVAILABLE "plane_unavailable"
-/*!
- * Mid-session RETIRE (#2317 P2b review): a zones frame or an authored mask while
- * the hub's last weave SEGMENTED the window across screens. The D3D11 tier
- * natively publishes the zone mask to every segment's DP, cropped to its screen
- * (#2218 #4); the hub publishes to its primary DP only, so the secondary panel
- * would never get its mask. Retires BEFORE that frame is composed, so the
- * native legs compose it. Until the per-segment publish is ported (P2 follow-up).
- */
-#define COMP_HUB_REASON_SEGMENTS_PLANES "segments_planes"
 /*! @} */
 
 /*!
