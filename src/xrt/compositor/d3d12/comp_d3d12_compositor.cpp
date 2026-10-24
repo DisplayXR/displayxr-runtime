@@ -6059,6 +6059,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			comp_hub_d3d11_stage_segment_content(c->reroute.split, &c->seg_content);
 			comp_hub_d3d11_submit_atlas(c->reroute.split, &rr_handoff, c->eff_layout.cols,
 			                            c->eff_layout.rows, c->eff_layout.tile_w, c->eff_layout.tile_h);
+			// #2317 P2a review: only a handed-off slot may be advanced past.
+			comp_d3d12_deposit_note_handed(c->reroute.dep);
 			if (!comp_hub_d3d11_is_direct(c->reroute.split)) {
 				comp_d3d12_deposit_note_consumed(c->reroute.dep, rr_handoff.slot);
 				// The PLANE release edge, behind the pre_plane_write wait
@@ -6091,7 +6093,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		c->reroute.canvas = rr_canvas;
 
 		// #2317 P1c: the D rows of DXR_WEAVE_LATENCY_CSV need this frame's promise.
-		comp_hub_d3d11_set_predicted_display_time(c->reroute.split, c->last_display_time_ns);
+		// #2327 review: THIS frame's own promise (its xrEndFrame displayTime),
+		// not the latest xrWaitFrame's — a pipelined app has already waited
+		// for the next frame by the time this one is committed.
+		comp_hub_d3d11_set_predicted_display_time(c->reroute.split,
+		                                          c->layer_accum.data.display_time_ns > 0
+		                                              ? (uint64_t)c->layer_accum.data.display_time_ns
+		                                              : c->last_display_time_ns);
 		const bool rr_wove =
 		    comp_hub_d3d11_weave_and_present(c->reroute.split, /*is_repaint=*/false, &rr_canvas);
 

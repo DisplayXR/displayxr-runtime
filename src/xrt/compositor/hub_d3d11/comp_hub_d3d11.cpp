@@ -72,10 +72,6 @@
  *
  */
 
-//! #2317 P2a: slots the DIRECT ingress can hold open per ring producer (both
-//! deposits run a ring of 2; headroom so a deeper ring needs no change here).
-#define COMP_HUB_D3D11_DIRECT_RING 4
-
 struct comp_hub_d3d11
 {
 	struct xrt_device *xdev;
@@ -243,6 +239,15 @@ struct comp_hub_d3d11
 	 */
 	const char *ingress_reason;
 	bool direct_to_xbridge_failed;
+	//! #2317 P2a review: the session's placement line is out, so a later move
+	//! to xbridge prints a CHANGED line (before it, the move is reported by
+	//! comp_hub_d3d11_log_placement itself).
+	bool placement_logged;
+	//! #2317 P2a review: once-per-SESSION warnings (a function static would
+	//! silence every later session in the process).
+	bool warned_slot_open;
+	bool warned_atlas_open;
+	bool warned_ring_contract;
 	uint32_t wire_fmt, wire_w, wire_h;
 
 	/*!
@@ -1289,6 +1294,11 @@ static bool
 split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_rect *canvas);
 static void
 split_direct_to_xbridge(struct comp_hub_d3d11 *s, const char *reason);
+static void
+split_direct_ring_vet(struct comp_hub_d3d11 *s,
+                      const struct comp_hub_d3d11_handoff *handoff,
+                      uint32_t content_w,
+                      uint32_t content_h);
 static void
 split_pdt_put(struct comp_hub_d3d11 *s, uint64_t seq, uint64_t pdt_ns);
 static uint64_t
@@ -2642,6 +2652,16 @@ comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *s,
 	// #2317 P1b: a stable atlas is written on this very context (or, DIRECT, the
 	// fence is the hub's to wait on from its own context), so there is nothing to
 	// order here.
+	/*
+	 * #2317 P2a review: a ring producer's frame is vetted for DIRECT before
+	 * anything is recorded — a slot that will not open (or does not hold the
+	 * content box), or a producer that broke the ring contract, moves the
+	 * session to xbridge here, and this very frame is then bridged whole.
+	 */
+	if (s->direct.active && s->direct.ring) {
+		split_direct_ring_vet(s, handoff, cols * view_w, rows * view_h);
+	}
+
 	// #2317 P2a: nor for a DIRECT ring producer — the hub waits on the
 	// producer's fence from its OWN context, at the weave.
 	if (!s->stable_atlas && !s->direct.active && s->app_ctx4 != nullptr && handoff->fence != nullptr &&
@@ -2727,6 +2747,11 @@ comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *s,
 	if (km != nullptr) {
 		const HRESULT km_hr = km->AcquireSync(0, 100);
 		if (km_hr != S_OK) {
+			// WAIT_ABANDONED: acquired after all (the last owner died holding
+			// it) — give it back, or the producer's next acquire times out.
+			if (km_hr == (HRESULT)WAIT_ABANDONED) {
+				km->ReleaseSync(0);
+			}
 			static uint32_t km_skips = 0;
 			if ((km_skips++ % 300u) == 0u) {
 				U_LOG_W(
@@ -3272,9 +3297,8 @@ split_direct_open_slot(struct comp_hub_d3d11 *s, uint32_t idx, const struct comp
 			e.tex->Release();
 		}
 		memset(&e, 0, sizeof(e));
-		static bool warned = false;
-		if (!warned) {
-			warned = true;
+		if (!s->warned_slot_open) {
+			s->warned_slot_open = true;
 			U_LOG_W("#2317 hub: a deposit slot would not open on the hub device (hr=0x%08lx)",
 			        (unsigned long)hr);
 		}
@@ -3365,9 +3389,8 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 		}
 		if (FAILED(hr) || d.tex == nullptr) {
 			d.tex = nullptr;
-			static bool warned = false;
-			if (!warned) {
-				warned = true;
+			if (!s->warned_atlas_open) {
+				s->warned_atlas_open = true;
 				U_LOG_W("#2317 hub: the producer atlas would not open on the hub device (hr=0x%08lx)",
 				        (unsigned long)hr);
 			}
@@ -3495,6 +3518,12 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 	if (km != nullptr && reads_atlas) {
 		const HRESULT km_hr = km->AcquireSync(0, 2);
 		if (km_hr != S_OK) {
+			// #2317 P2a review: WAIT_ABANDONED means the mutex WAS acquired;
+			// release it before skipping, or Vulkan's next acquire on this
+			// slot times out every frame.
+			if (km_hr == (HRESULT)WAIT_ABANDONED) {
+				km->ReleaseSync(0);
+			}
 			d.km_skips++;
 			s->no_slot++;
 			return false;
@@ -3636,6 +3665,52 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 }
 
 /*!
+ * #2317 P2a review: vet a ring producer's frame for DIRECT before it is
+ * recorded. Every failure here would otherwise leave the hub with no frame for
+ * the rest of the session (have_frame stays false, every weave is `no_slot`),
+ * so each one moves the session to xbridge, which bridges this frame whole.
+ */
+static void
+split_direct_ring_vet(struct comp_hub_d3d11 *s,
+                      const struct comp_hub_d3d11_handoff *handoff,
+                      uint32_t content_w,
+                      uint32_t content_h)
+{
+	auto &d = s->direct;
+	const uint32_t idx = handoff->slot % COMP_HUB_D3D11_DIRECT_RING;
+
+	/*
+	 * Backstop for the ring contract: the producer may only rewrite a slot
+	 * after the hub moved OFF it (it then owes the release). The same slot,
+	 * same ring generation, at a NEWER fence value means it rewrote the slot
+	 * the hub and its repaints are still reading. Fence mode only: a
+	 * keyed-mutex deposit carries no value to compare.
+	 */
+	if (!d.km && d.cur >= 0 && (uint32_t)d.cur == idx && d.slots[idx].tex != nullptr &&
+	    d.slots[idx].gen == handoff->generation && handoff->fence_value > d.prod_value) {
+		if (!s->warned_ring_contract) {
+			s->warned_ring_contract = true;
+			U_LOG_W(
+			    "#2317 hub: the producer re-nominated the slot the hub is reading (slot %u, fence %llu "
+			    "-> %llu) — a ring-contract violation; leaving DIRECT ingress",
+			    idx, (unsigned long long)d.prod_value, (unsigned long long)handoff->fence_value);
+		}
+		split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_RING_CONTRACT);
+		return;
+	}
+	if (handoff->shared_handle == nullptr || content_w == 0 || content_h == 0) {
+		return; // nothing to nominate; split_submit_direct drops the frame
+	}
+	if (!split_direct_open_slot(s, idx, handoff)) {
+		split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_DIRECT_FAILED);
+		return;
+	}
+	if (content_w > d.slots[idx].w || content_h > d.slots[idx].h) {
+		split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_DIRECT_FAILED);
+	}
+}
+
+/*!
  * #2317 P2a: a RING producer's frame staged real 2D-plane content, which only
  * the xbridge ingress carries. Wire the bridge FIRST (so a failure leaves the
  * session exactly as it was: DIRECT, planes degraded alone), then stop reading
@@ -3668,6 +3743,12 @@ split_direct_to_xbridge(struct comp_hub_d3d11 *s, const char *reason)
 	split_release_direct_slots(s);
 	d.active = false;
 	s->ingress_reason = reason;
+	if (!s->placement_logged) {
+		// #2317 P2a review: before the session's placement line, the move is
+		// reported BY that line (ingress=xbridge ingress_reason=<reason>), so
+		// the log never shows a CHANGED ahead of the line it corrects.
+		return;
+	}
 	U_LOG_W(
 	    "hub placement: CHANGED hub=1 ingress=xbridge reason=%s — this session's frames carry 2D-plane "
 	    "content, which the DIRECT ingress does not transport; the comp_xbridge ingress takes over for the "
@@ -4073,6 +4154,7 @@ comp_hub_d3d11_log_placement(struct comp_hub_d3d11 *s, const char *producer)
 		return;
 	}
 	const char *why = comp_hub_d3d11_ingress_reason(s);
+	s->placement_logged = true;
 	U_LOG_W(
 	    "hub placement: hub=1 render=%08lx:%08lx hub_dev=%08lx:%08lx ingress=%s%s%s — weave/present on the "
 	    "D3D11 hub's own device (#2317 P2a; %s ring deposit%s)",

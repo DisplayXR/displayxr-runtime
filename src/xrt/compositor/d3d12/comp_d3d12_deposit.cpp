@@ -17,6 +17,9 @@
 #include <stdio.h>
 #include <string.h>
 
+static_assert(COMP_D3D12_DEPOSIT_RING <= COMP_HUB_D3D11_DIRECT_RING,
+              "the hub's DIRECT ingress indexes deposit slots modulo COMP_HUB_D3D11_DIRECT_RING");
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11_4.h>
@@ -58,6 +61,9 @@ struct comp_d3d12_deposit
 
 	struct comp_d3d12_deposit_slot ring[COMP_D3D12_DEPOSIT_RING];
 	uint32_t slot;
+	//! #2317 P2a review: @ref slot was handed to the consumer since it was
+	//! chosen; only then may @ref comp_d3d12_deposit_advance move past it.
+	bool handed;
 
 	//! #1264 plane transport — single-buffered, panel-sized once.
 	struct comp_d3d12_deposit_plane_slot plane[COMP_D3D12_DEPOSIT_PLANE_COUNT];
@@ -352,6 +358,7 @@ comp_d3d12_deposit_resize(struct comp_d3d12_deposit *dep, uint32_t width, uint32
 	dep->width = width;
 	dep->height = height;
 	dep->slot = 0;
+	dep->handed = false;
 	if (!deposit_alloc_ring(dep)) {
 		U_LOG_W("d3d12 deposit: resize to %ux%u failed — deposit is now INACTIVE", width, height);
 		deposit_free_ring(dep);
@@ -367,7 +374,12 @@ comp_d3d12_deposit_advance(struct comp_d3d12_deposit *dep, void *app_queue)
 	if (dep == NULL) {
 		return;
 	}
-	dep->slot = (dep->slot + 1) % COMP_D3D12_DEPOSIT_RING;
+	// #2317 P2a review: a slot that never reached the consumer is reused —
+	// moving past it would lap onto a slot the hub may still be reading.
+	if (dep->handed) {
+		dep->slot = (dep->slot + 1) % COMP_D3D12_DEPOSIT_RING;
+		dep->handed = false;
+	}
 	struct comp_d3d12_deposit_slot *s = &dep->ring[dep->slot];
 	if (s->release_value != 0 && app_queue != NULL && dep->fence12 != NULL) {
 		// GPU-side back-pressure: nothing on this queue may rewrite the slot
@@ -436,6 +448,14 @@ comp_d3d12_deposit_get_handoff(struct comp_d3d12_deposit *dep, struct comp_hub_d
 	out->dxgi_format = (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM;
 	out->generation = dep->ring_generation;
 	return true;
+}
+
+extern "C" void
+comp_d3d12_deposit_note_handed(struct comp_d3d12_deposit *dep)
+{
+	if (dep != NULL) {
+		dep->handed = true;
+	}
 }
 
 extern "C" bool

@@ -163,9 +163,19 @@ comp_vk_deposit_resize(struct comp_vk_deposit *dep, uint32_t width, uint32_t hei
  * Advance to the next ring slot and return its images. Call once per APP frame,
  * before the atlas is drawn — never for a repaint, which replays the atlas the
  * last app frame left in the current slot.
+ *
+ * #2317 P2a review: advances only past a slot that was HANDED OFF
+ * (@ref comp_vk_deposit_note_handed); a frame that never reached the consumer
+ * leaves its slot to be re-rendered by the next one, so the ring can never lap
+ * onto the slot the hub's DIRECT ingress is still reading.
  */
 void
 comp_vk_deposit_advance(struct comp_vk_deposit *dep, uint64_t *out_image, uint64_t *out_view);
+
+//! #2317 P2a review: the current slot was handed to the consumer
+//! (comp_hub_d3d11_submit_atlas); the next advance may move past it.
+void
+comp_vk_deposit_note_handed(struct comp_vk_deposit *dep);
 
 /*!
  * The current slot's images, without advancing.

@@ -99,6 +99,12 @@ comp_d3d12_deposit_resize(struct comp_d3d12_deposit *dep, uint32_t width, uint32
  * wait: if a consumer has claimed the slot, queue a GPU-side
  * `ID3D12CommandQueue::Wait` for its release value on @p app_queue
  * (`ID3D12CommandQueue *`). Costs nothing when already satisfied.
+ *
+ * #2317 P2a review: advances only past a slot that was HANDED OFF
+ * (@ref comp_d3d12_deposit_note_handed). A frame that failed before its
+ * handoff leaves its slot unsubmitted, and the next frame re-renders into that
+ * same slot rather than lapping onto the one the hub may still be reading
+ * (and whose release it has not owed yet).
  */
 void
 comp_d3d12_deposit_advance(struct comp_d3d12_deposit *dep, void *app_queue);
@@ -136,6 +142,12 @@ comp_d3d12_deposit_get_handoff(struct comp_d3d12_deposit *dep, struct comp_hub_d
  */
 void
 comp_d3d12_deposit_note_consumed(struct comp_d3d12_deposit *dep, uint32_t slot);
+
+//! #2317 P2a review: the current slot was handed to the consumer
+//! (comp_hub_d3d11_submit_atlas). The next @ref comp_d3d12_deposit_advance may
+//! move past it.
+void
+comp_d3d12_deposit_note_handed(struct comp_d3d12_deposit *dep);
 
 /*!
  * @name #2317 P2a: the hub's DIRECT ingress (same adapter)

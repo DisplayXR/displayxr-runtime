@@ -21,6 +21,9 @@
 #include <stdio.h>
 #include <string.h>
 
+static_assert(COMP_VK_DEPOSIT_RING <= COMP_HUB_D3D11_DIRECT_RING,
+              "the hub's DIRECT ingress indexes deposit slots modulo COMP_HUB_D3D11_DIRECT_RING");
+
 // The deposit is a Windows mechanism end to end (D3D11 shared textures,
 // ID3D11Fence, DXGI adapter LUIDs). Everything below compiles to nothing
 // elsewhere; the header's entry points keep their signatures so call sites need
@@ -92,6 +95,9 @@ struct comp_vk_deposit
 
 	struct comp_vk_deposit_slot ring[COMP_VK_DEPOSIT_RING];
 	uint32_t slot;
+	//! #2317 P2a review: @ref slot was handed to the consumer since it was
+	//! chosen; only then may @ref comp_vk_deposit_advance move past it.
+	bool handed;
 
 	//! VK-1b — the plane surfaces, and the one release value they all share.
 	struct comp_vk_deposit_plane_slot plane[COMP_VK_DEPOSIT_PLANE_COUNT];
@@ -848,6 +854,7 @@ comp_vk_deposit_resize(struct comp_vk_deposit *dep, uint32_t width, uint32_t hei
 	dep->width = width;
 	dep->height = height;
 	dep->slot = 0;
+	dep->handed = false;
 
 	if (!deposit_alloc_ring(dep)) {
 		U_LOG_W("vk deposit: resize to %ux%u failed — deposit is now INACTIVE", width, height);
@@ -865,8 +872,20 @@ comp_vk_deposit_advance(struct comp_vk_deposit *dep, uint64_t *out_image, uint64
 	if (dep == NULL) {
 		return;
 	}
-	dep->slot = (dep->slot + 1) % COMP_VK_DEPOSIT_RING;
+	// #2317 P2a review: a slot that never reached the consumer is reused.
+	if (dep->handed) {
+		dep->slot = (dep->slot + 1) % COMP_VK_DEPOSIT_RING;
+		dep->handed = false;
+	}
 	comp_vk_deposit_get_current(dep, out_image, out_view);
+}
+
+extern "C" void
+comp_vk_deposit_note_handed(struct comp_vk_deposit *dep)
+{
+	if (dep != NULL) {
+		dep->handed = true;
+	}
 }
 
 extern "C" void
@@ -1470,6 +1489,12 @@ comp_vk_deposit_advance(struct comp_vk_deposit *dep, uint64_t *out_image, uint64
 	if (out_view != NULL) {
 		*out_view = 0;
 	}
+}
+
+extern "C" void
+comp_vk_deposit_note_handed(struct comp_vk_deposit *dep)
+{
+	(void)dep;
 }
 
 extern "C" void
