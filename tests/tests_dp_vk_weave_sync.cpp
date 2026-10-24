@@ -79,7 +79,9 @@ TEST_CASE("dp_vk_weave_sync: slot 17 is appended after set_overlay_2d_filter_str
 	CHECK(offsetof(struct xrt_display_processor_vk, set_weave_sync) == base + 17 * sizeof(void *));
 	// N6 Part 1 (#2144) appended get_eye_positions_at (slot 18) after it.
 	CHECK(offsetof(struct xrt_display_processor_vk, get_eye_positions_at) == base + 18 * sizeof(void *));
-	CHECK(sizeof(struct xrt_display_processor_vk) == base + 19 * sizeof(void *));
+	// #2340 appended accepts_atlas_encoding (slot 19) after that.
+	CHECK(offsetof(struct xrt_display_processor_vk, accepts_atlas_encoding) == base + 19 * sizeof(void *));
+	CHECK(sizeof(struct xrt_display_processor_vk) == base + 20 * sizeof(void *));
 	CHECK(sizeof(VkSemaphore_XDP) == 8); // pointer on 64-bit, uint64_t on 32-bit: always a VkSemaphore's size
 #ifndef XRT_DP_VK_HAS_WEAVE_SYNC
 	FAIL("XRT_DP_VK_HAS_WEAVE_SYNC must be defined by the header that carries the slot");

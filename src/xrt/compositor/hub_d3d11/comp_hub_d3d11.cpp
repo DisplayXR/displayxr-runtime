@@ -444,6 +444,9 @@ struct comp_hub_d3d11
 	//! The session's eye-tracking mode, re-sent to a swapped-in DP.
 	uint32_t eye_tracking_mode;
 	bool eye_tracking_mode_set;
+	//! #2340: the declared atlas encoding, re-sent to a swapped-in DP.
+	enum xrt_atlas_encoding atlas_encoding;
+	bool atlas_encoding_set;
 	/*! @} */
 
 	uint64_t composites, composite_bails;
@@ -1188,6 +1191,9 @@ split_seg_swap_primary_cb(void *userdata, struct xrt_display_processor_d3d11 *dp
 		xrt_display_processor_d3d11_set_shared_texture_present(dp, false);
 		if (s->eye_tracking_mode_set) {
 			xrt_display_processor_d3d11_set_eye_tracking_mode(dp, s->eye_tracking_mode);
+		}
+		if (s->atlas_encoding_set) {
+			xrt_display_processor_d3d11_set_atlas_encoding(dp, s->atlas_encoding);
 		}
 		// #2247: the session's mode, but not on a primary screen the window left.
 		split_seg_primary_lens(s, true);
@@ -4840,6 +4846,34 @@ comp_hub_d3d11_set_eye_tracking_mode(struct comp_hub_d3d11 *s, uint32_t mode)
 }
 
 extern "C" bool
+comp_hub_d3d11_accepts_atlas_encoding(struct comp_hub_d3d11 *s, enum xrt_atlas_encoding encoding)
+{
+	if (s == nullptr) {
+		return false;
+	}
+	os_mutex_lock(&s->dp_mutex);
+	const bool ok = s->dp != nullptr && xrt_display_processor_d3d11_accepts_atlas_encoding(s->dp, encoding);
+	os_mutex_unlock(&s->dp_mutex);
+	return ok;
+}
+
+extern "C" void
+comp_hub_d3d11_set_atlas_encoding(struct comp_hub_d3d11 *s, enum xrt_atlas_encoding encoding)
+{
+	if (s == nullptr) {
+		return;
+	}
+	os_mutex_lock(&s->dp_mutex);
+	// Remembered for a swapped-in DP (Amendment 2).
+	s->atlas_encoding = encoding;
+	s->atlas_encoding_set = true;
+	if (s->dp != nullptr) {
+		xrt_display_processor_d3d11_set_atlas_encoding(s->dp, encoding);
+	}
+	os_mutex_unlock(&s->dp_mutex);
+}
+
+extern "C" bool
 comp_hub_d3d11_get_background_preview(struct comp_hub_d3d11 *s, struct xrt_dp_background_preview *out_preview)
 {
 	if (s == nullptr || out_preview == nullptr) {
@@ -5147,6 +5181,21 @@ comp_hub_d3d11_set_eye_tracking_mode(struct comp_hub_d3d11 *split, uint32_t mode
 {
 	(void)split;
 	(void)mode;
+}
+
+extern "C" bool
+comp_hub_d3d11_accepts_atlas_encoding(struct comp_hub_d3d11 *split, enum xrt_atlas_encoding encoding)
+{
+	(void)split;
+	(void)encoding;
+	return false;
+}
+
+extern "C" void
+comp_hub_d3d11_set_atlas_encoding(struct comp_hub_d3d11 *split, enum xrt_atlas_encoding encoding)
+{
+	(void)split;
+	(void)encoding;
 }
 
 extern "C" bool

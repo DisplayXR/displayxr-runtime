@@ -571,7 +571,7 @@ target_link_libraries(tests_u_eye_history PRIVATE aux_os xrt-interfaces)
 # ... and the target-time slot on all five DP vtables: appended last, gated,
 # falling back to the vendor horizon.
 target_link_libraries(tests_dp_eye_positions_at PRIVATE xrt-interfaces)
-# ... and the D3D11 PQ atlas query (#2273): appended last, gated, false when absent.
+# ... and the D3D11 (#2273) + Vulkan (#2340) PQ atlas queries: appended last, gated, false when absent.
 target_link_libraries(tests_dp_atlas_encoding_query PRIVATE xrt-interfaces)
 
 if(TARGET tests_sim_display_monitor_geometry)
