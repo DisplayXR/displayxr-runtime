@@ -877,9 +877,12 @@ comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split);
  *
  * On ONE adapter the hub opens each deposit ring slot on its own device and
  * weaves it in place: no comp_xbridge, no transport copy (xbridge's staged
- * ingress paid three: staging, cross-adapter heap, egress). The default on a
- * single adapter; `DXR_HUB_INGRESS=xbridge` is the A/B control and the one-line
- * way back. Cross-adapter sessions always take xbridge.
+ * ingress paid three: staging, cross-adapter heap, egress). OPT-IN for now:
+ * `DXR_HUB_INGRESS=direct` (the default stays xbridge,
+ * `ingress_reason=default_xbridge`, until a single-dGPU desktop has run VK
+ * fence-mode DIRECT; the flip is tracked in #2317). `DXR_HUB_INGRESS=xbridge`
+ * forces the bridge for every producer, the D3D11 shim included.
+ * Cross-adapter sessions always take xbridge.
  *
  * Synchronisation, all GPU-side (ADR-055):
  * - **write -> read:** the producer signals the deposit's shared fence after
@@ -911,6 +914,9 @@ comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split);
 
 //! `DXR_HUB_INGRESS=xbridge`: the A/B control / kill switch.
 #define COMP_HUB_INGRESS_REASON_FORCED "forced_by_env"
+//! A ring producer on one adapter without `DXR_HUB_INGRESS=direct`: DIRECT is
+//! opt-in for the ring producers until the single-GPU desktop gate (#2317).
+#define COMP_HUB_INGRESS_REASON_DEFAULT_XBRIDGE "default_xbridge"
 //! Render and hub devices are on different adapters: xbridge is the transport.
 #define COMP_HUB_INGRESS_REASON_CROSS_ADAPTER "cross_adapter"
 //! DIRECT was eligible but a fence/texture/interface it needs was unavailable.
