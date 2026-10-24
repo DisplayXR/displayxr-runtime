@@ -239,12 +239,20 @@ struct comp_hub_d3d11_info
 #define COMP_HUB_REASON_NO_SHARED_FENCE "no_shared_fence"
 //! Stage A2 (bridge or direct wiring) failed after Stage A1 succeeded.
 #define COMP_HUB_REASON_WIRE_FAILED "wire_failed"
-//! Mid-session RETIRE: the frame carried an XR_DXR_local_3d_zone Local2D layer.
-#define COMP_HUB_REASON_LOCAL2D "local2d_layer"
-//! Mid-session RETIRE: the frame carried XR_DXR_display_zones zone layers.
-#define COMP_HUB_REASON_ZONES "zone_layer"
-//! Mid-session RETIRE: the session submitted an authored (Tier-3 / zones) mask.
-#define COMP_HUB_REASON_AUTHORED_MASK "authored_mask"
+/*!
+ * Mid-session RETIRE (#2317 P2b): a frame needed a plane — the Local2D
+ * over-flatten, the 2D-under backdrop or an authored mask — and the hub could not
+ * carry it (the producer's NT share, the hub's open or bind, its composite unit
+ * or its mask raster failed). Every one of those is an allocation-class failure
+ * that would recur, so the tier's own legs take the session rather than ship it
+ * without its 2D. Fires on the frame AFTER the failure (that one frame runs
+ * without its 2D band).
+ *
+ * The P1b plane retires (`local2d_layer`, `zone_layer`, `authored_mask`) are
+ * gone: Local2D, zones, authored masks and the backdrop ride the hub on both
+ * ingress routes.
+ */
+#define COMP_HUB_REASON_PLANE_UNAVAILABLE "plane_unavailable"
 /*! @} */
 
 /*!
@@ -478,8 +486,9 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *split,
  *
  * @return false when this frame could not stage a composite (no plane surface,
  *         a bind/open failure, or no composite unit) — the frame then runs
- *         `composite=false`. The VK and D3D12 legs degrade the
- *         2D band and ignore it.
+ *         `composite=false`. The D3D11 tier names that rung
+ *         (@ref COMP_HUB_REASON_PLANE_UNAVAILABLE); the VK and D3D12 legs
+ *         degrade the 2D band and ignore it.
  */
 bool
 comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *split,

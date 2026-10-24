@@ -334,11 +334,16 @@ struct comp_d3d11_compositor
 	 * consumer fence — no transport copy). Across adapters: comp_xbridge Option I,
 	 * the same two copies this tier's own split pays.
 	 *
-	 * Scope: plain projection (+ the window-space layers and the cursor the
-	 * renderer composes INTO the atlas). A frame carrying Local2D layers, zones or
-	 * an authored mask retires the hub for the rest of the session and rebuilds
-	 * this tier's single-device legs (@ref d3d11_hub_retire) BEFORE that frame is
-	 * composed, so nothing is ever rendered without them.
+	 * Scope: projection (+ the window-space layers and the cursor the renderer
+	 * composes INTO the atlas) and, since #2317 P2b, the PLANES — the Local2D
+	 * over-flatten, display zones, authored masks and the 2D-under backdrop. The
+	 * flattens run on this device into NT-shared, panel-sized scratch exactly as
+	 * this tier's own split deposits them; @ref d3d11_hub_stage_planes hands them
+	 * to the hub's plane API (the VK and D3D12 legs' calls), whose one composite
+	 * runs on the hub's device. DIRECT opens them in place under the atlas's
+	 * fences; xbridge transports them as planes. A plane the hub could not carry
+	 * retires it (@ref COMP_HUB_REASON_PLANE_UNAVAILABLE, @ref d3d11_hub_retire);
+	 * the rest of the retire machinery is that rung's.
 	 *
 	 * `split` and `active` change only under BOTH c->mutex (the frame path) and
 	 * dp_swap_mutex (the app-thread forwarders), which read `split` under the
@@ -363,6 +368,24 @@ struct comp_d3d11_compositor
 		//! retried every frame until it does (never a permanent black session).
 		bool target_owed;
 		uint32_t target_retries;
+		/*!
+		 * #2317 P2b: a plane the hub could not carry this frame — retired at
+		 * the top of the NEXT frame (before anything reads the hub), so the
+		 * failing frame's atlas still presents and the next one is native.
+		 */
+		const char *retire_pending;
+		/*!
+		 * #2317 P2b: the authored mask's PLANE SURFACE — an NT-shared R8 copy of
+		 * the frame's authored mask, refreshed inside layer_commit only when the
+		 * mask's content changes. The mask's own staged texture is rewritten
+		 * from OpenXR entry points (outside the frame), which neither of the
+		 * hub's orderings covers; this copy is written where both do.
+		 */
+		ID3D11Texture2D *mask_tex;
+		HANDLE mask_share;
+		uint64_t mask_gen;
+		uint64_t mask_key;
+		uint32_t mask_w, mask_h;
 	} hub;
 
 	//! Output target (DXGI swapchain).
@@ -933,6 +956,23 @@ static struct comp_d3d11_zone_mask *
 d3d11_frame_authored_mask(struct comp_d3d11_compositor *c);
 static void
 d3d11_stage_mask_plane(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_mask *mask);
+// #2317 P2b: the hub's planes for this frame (defined with the deposit helpers).
+static const char *
+d3d11_hub_stage_planes(struct comp_d3d11_compositor *c, const struct u_canvas_rect *eff_canvas);
+
+/*!
+ * #2317 P2b: this tier's plane SOURCES (the Local2D over-flatten and 2D-under
+ * backdrop scratches) are consumed off this device — by its own output-device
+ * split (comp_xbridge) or by the D3D11 hub (xbridge, or opened in place on
+ * DIRECT). Either way they are allocated once at the PANEL extent (outside the
+ * R2 churn path) and NT-shareable, and a composite region is clamped to the
+ * panel they were sized for.
+ */
+static inline bool
+d3d11_planes_shared(const struct comp_d3d11_compositor *c)
+{
+	return c->split_active || c->hub.active;
+}
 
 /*!
  * #918 F4: count a frame whose weave produced nothing and whose Present was
@@ -4234,6 +4274,18 @@ d3d11_hub_fill_handoff(struct comp_d3d11_compositor *c, struct comp_hub_d3d11_ha
 static void
 d3d11_hub_release_producer(struct comp_d3d11_compositor *c)
 {
+	// #2317 P2b: the authored-mask plane surface exists only for the hub.
+	if (c->hub.mask_share != nullptr) {
+		CloseHandle(c->hub.mask_share);
+		c->hub.mask_share = nullptr;
+	}
+	if (c->hub.mask_tex != nullptr) {
+		c->hub.mask_tex->Release();
+		c->hub.mask_tex = nullptr;
+	}
+	c->hub.mask_key = 0;
+	c->hub.mask_w = 0;
+	c->hub.mask_h = 0;
 	if (c->hub.ctx4 != nullptr) {
 		c->hub.ctx4->Release();
 		c->hub.ctx4 = nullptr;
@@ -4355,13 +4407,27 @@ d3d11_hub_stage_a(struct comp_d3d11_compositor *c,
 		return COMP_HUB_REASON_WIRE_FAILED;
 	}
 
+	/*
+	 * #2317 P2b: the planes. The flatten scratches are panel-sized under the hub
+	 * (the same rule this tier's own split follows, and for the same reason: a
+	 * plane surface that never resizes never re-opens), and their family is
+	 * RGBA — the target's — which the hub's plane chains must match or the bind
+	 * refuses on the typeless-family check (the D3D12 reroute's call).
+	 */
+	if (xdev->hmd != NULL) {
+		c->split_panel_w = xdev->hmd->screens[0].w_pixels;
+		c->split_panel_h = xdev->hmd->screens[0].h_pixels;
+	}
+	comp_hub_d3d11_set_plane_format(c->hub.split, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM);
+
 	c->hub.active = true;
 	c->hub.dp_factory_d3d11 = dp_factory_d3d11;
 	return nullptr;
 }
 
 /*!
- * Mid-session RETIRE: the session submitted content the hub does not carry yet.
+ * Mid-session RETIRE: the session needs something the hub could not carry
+ * (since #2317 P2b only @ref COMP_HUB_REASON_PLANE_UNAVAILABLE fires mid-session).
  * Tears the hub down (its RETIRED WARN and `weave placement: CHANGED` line) and
  * rebuilds this tier's SINGLE-DEVICE legs — target + display processor on the
  * app device, the rung a failed split Stage A falls through to. Caller holds
@@ -4403,8 +4469,8 @@ static void
 d3d11_hub_retire(struct comp_d3d11_compositor *c, const char *token)
 {
 	U_LOG_W(
-	    "hub placement: CHANGED hub=0 reason=%s — the D3D11 hub does not carry this content yet; the "
-	    "tier's single-device legs take over for the rest of the session (#2317 P1b)",
+	    "hub placement: CHANGED hub=0 reason=%s — the D3D11 hub could not carry this session's content; "
+	    "the tier's single-device legs take over for the rest of the session (#2317)",
 	    token);
 
 	/*
@@ -4418,8 +4484,7 @@ d3d11_hub_retire(struct comp_d3d11_compositor *c, const char *token)
 
 	{
 		std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
-		comp_hub_d3d11_retire(&c->hub.split, "the session submitted content the D3D11 hub does not carry yet",
-		                      token);
+		comp_hub_d3d11_retire(&c->hub.split, "the session needs content the D3D11 hub could not carry", token);
 		c->hub.split = nullptr;
 		c->hub.active = false;
 	}
@@ -4785,19 +4850,17 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	c->zones_frame = zones_frame;
 
 	/*
-	 * #2317 P1b: the hub carries plain projection (and the window-space layers
-	 * and cursor the renderer composes INTO the atlas) — not the plane machinery.
-	 * A frame that needs it RETIRES the hub before anything below reads it, so the
-	 * frame that first needs it is composed natively, never without its planes.
+	 * #2317 P2b: Local2D, zones, authored masks and the 2D-under backdrop ride
+	 * the hub (d3d11_hub_stage_planes, below), so none of them retires it any
+	 * more. What can still retire it is a plane the hub could NOT carry on an
+	 * earlier frame — an allocation-class failure that would recur — and that
+	 * retire runs HERE, before anything below reads the hub, so this frame is
+	 * composed natively with its planes.
 	 */
-	if (c->hub.active) {
-		const char *hub_why = have_local_2d                          ? COMP_HUB_REASON_LOCAL2D
-		                      : zones_frame                          ? COMP_HUB_REASON_ZONES
-		                      : d3d11_frame_authored_mask(c) != NULL ? COMP_HUB_REASON_AUTHORED_MASK
-		                                                             : NULL;
-		if (hub_why != NULL) {
-			d3d11_hub_retire(c, hub_why);
-		}
+	if (c->hub.active && c->hub.retire_pending != NULL) {
+		const char *why = c->hub.retire_pending;
+		c->hub.retire_pending = NULL;
+		d3d11_hub_retire(c, why);
 	}
 
 	// XR_DXR_depth_budget v2 (#1365): the rear-budget ROI is clamped to the
@@ -5272,6 +5335,16 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// #2317 P1b: the hub weaves and presents; nothing below (offscreen path,
 	// this tier's target, DP, HUD) exists for this session.
 	if (c->hub.active) {
+		/*
+		 * #2317 P2b: the DEPOSIT half for the hub — flatten the 2D, publish the
+		 * planes, stamp the recipe — after both passes (the atlas is complete)
+		 * and before the producer signal in d3d11_hub_commit, so on DIRECT the
+		 * hub's wait on that signal orders its reads of the planes too.
+		 */
+		const char *plane_fail = d3d11_hub_stage_planes(c, &eff_canvas);
+		if (plane_fail != NULL && c->hub.retire_pending == NULL) {
+			c->hub.retire_pending = plane_fail;
+		}
 		return d3d11_hub_commit(c, &eff_canvas, &eye_pos, tgt_width, tgt_height);
 	}
 
@@ -8353,7 +8426,7 @@ d3d11_flatten_one_local2d_layer(struct comp_d3d11_compositor *c,
 static void
 d3d11_clamp_region_to_panel(struct comp_d3d11_compositor *c, uint32_t *w, uint32_t *h)
 {
-	if (!c->split_active || c->split_panel_w == 0 || c->split_panel_h == 0) {
+	if (!d3d11_planes_shared(c) || c->split_panel_w == 0 || c->split_panel_h == 0) {
 		return;
 	}
 	if (*w <= c->split_panel_w && *h <= c->split_panel_h) {
@@ -8420,6 +8493,9 @@ d3d11_clear_scratch_region(struct comp_d3d11_compositor *c,
 		c->context->ClearRenderTargetView(rtv, transparent);
 		if (c->split_active && c->xbridge != nullptr) {
 			comp_xbridge_invalidate_plane(c->xbridge, plane);
+		} else if (c->hub.active) {
+			// #2317 P2b: the hub's xbridge slots owe the same full refresh.
+			comp_hub_d3d11_invalidate_plane(c->hub.split, plane);
 		}
 		return;
 	}
@@ -8627,7 +8703,8 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
 	 * once (so it never enters the R2 churn path) and NT-shareable (so the
 	 * producer opens it directly, with no extra app-device copy per frame).
 	 */
-	const bool split = c->split_active;
+	// #2317 P2b: under the hub too — it opens or transports this as a plane.
+	const bool split = d3d11_planes_shared(c);
 	const uint32_t alloc_w = split ? c->split_panel_w : region_w;
 	const uint32_t alloc_h = split ? c->split_panel_h : region_h;
 	// #1795: same contract as the over-flatten â€” `_SRGB` RTV, encoded bytes.
@@ -8668,7 +8745,8 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
 	 * slot it wove. Returning it anyway keeps the non-split path byte-identical
 	 * and gives the caller its dims.
 	 */
-	if (split && c->xbridge != nullptr) {
+	// (Under the hub d3d11_hub_stage_planes stages it, from the dims returned.)
+	if (c->split_active && c->xbridge != nullptr) {
 		struct xrt_rect box = {};
 		uint64_t hash = 0;
 		d3d11_local2d_digest(c, proj_idx, /*over=*/false, region_w, region_h, &box, &hash);
@@ -9352,6 +9430,332 @@ d3d11_zone_mask_alloc(ID3D11Device *device,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * #2317 P2b — refresh the hub's authored-mask PLANE SURFACE from @p mask.
+ *
+ * An NT-shared R8 texture at the mask's extent, re-allocated only on a dims
+ * change and re-copied only when the mask's content key moves (a different mask
+ * object, or a new authoring call on the same one). The copy runs HERE, inside
+ * layer_commit, after the frame's back-fence and before its producer signal —
+ * the window both hub routes order. The mask's own staged texture is not that
+ * window: an OpenXR entry point rewrites it between frames, while a repaint may
+ * be reading.
+ *
+ * @param out_seq The content key to stage (never 0).
+ * @return false when the surface could not be allocated or shared.
+ */
+static bool
+d3d11_hub_mask_plane_refresh(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_mask *mask, uint64_t *out_seq)
+{
+	if (mask == nullptr || mask->staged == nullptr || mask->w == 0 || mask->h == 0) {
+		return false;
+	}
+	if (c->hub.mask_tex == nullptr || c->hub.mask_w != mask->w || c->hub.mask_h != mask->h) {
+		if (c->hub.mask_share != nullptr) {
+			CloseHandle(c->hub.mask_share);
+			c->hub.mask_share = nullptr;
+		}
+		if (c->hub.mask_tex != nullptr) {
+			c->hub.mask_tex->Release();
+			c->hub.mask_tex = nullptr;
+		}
+		c->hub.mask_key = 0;
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = mask->w;
+		td.Height = mask->h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+		HRESULT hr = c->device->CreateTexture2D(&td, nullptr, &c->hub.mask_tex);
+		IDXGIResource1 *dr = nullptr;
+		if (SUCCEEDED(hr) && c->hub.mask_tex != nullptr &&
+		    SUCCEEDED(
+		        c->hub.mask_tex->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&dr))) &&
+		    dr != nullptr) {
+			hr = dr->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+			                            nullptr, &c->hub.mask_share);
+			dr->Release();
+		}
+		if (FAILED(hr) || c->hub.mask_share == nullptr) {
+			// On a dims change only (this is retired next frame), never per frame.
+			U_LOG_W("#2317 P2b hub: the authored-mask plane surface (%ux%u) could not be shared (0x%08lx)",
+			        mask->w, mask->h, (unsigned long)hr);
+			if (c->hub.mask_share != nullptr) {
+				CloseHandle(c->hub.mask_share);
+				c->hub.mask_share = nullptr;
+			}
+			if (c->hub.mask_tex != nullptr) {
+				c->hub.mask_tex->Release();
+				c->hub.mask_tex = nullptr;
+			}
+			return false;
+		}
+		c->hub.mask_w = mask->w;
+		c->hub.mask_h = mask->h;
+		c->hub.mask_gen++;
+	}
+
+	uint64_t key = 1469598103934665603ull;
+	key = (key ^ (uint64_t)(uintptr_t)mask) * 1099511628211ull;
+	key = (key ^ mask->author_seq) * 1099511628211ull;
+	key = (key ^ c->hub.mask_gen) * 1099511628211ull;
+	if (key == 0) {
+		key = 1; // 0 is "this frame does not use the plane"
+	}
+	if (key != c->hub.mask_key) {
+		c->context->CopyResource(c->hub.mask_tex, mask->staged);
+		c->hub.mask_key = key;
+	}
+	*out_seq = key;
+	return true;
+}
+
+/*!
+ * #2317 P2b — the hub's PLANES for this app frame: the DEPOSIT half this tier's
+ * own split runs (d3d11_composite_zone_mask's prepare_only branch +
+ * d3d11_flatten_backdrop_2d + d3d11_stage_mask_plane), shaped as the VK leg's
+ * vk_split_stage_planes, so the hub's ONE composite consumes it on either ingress.
+ *
+ *  - the 2D-under backdrop and the Local2D over-flatten are flattened HERE, on
+ *    the app device, into the panel-sized NT-shared scratch, and handed over by
+ *    handle with their change-skip digest and dirty box;
+ *  - the authored mask (sticky legacy mask, or a zones frame's explicit wish)
+ *    rides as the mask plane, from the copy d3d11_hub_mask_plane_refresh keeps;
+ *  - every other mask kind is pure CPU rects and is rastered on the HUB'S device
+ *    (comp_hub_d3d11_raster_mask), where the composite samples it;
+ *  - the zone wish publishes through the hub's display processor (this tier has
+ *    none under the hub, so d3d11_sync_zone_mask_to_dp is inert).
+ *
+ * Every frame un-stages what it does not use, so no recipe ever claims a plane
+ * the frame did not produce. Caller holds c->mutex, after both renderer passes.
+ *
+ * @return NULL, or @ref COMP_HUB_REASON_PLANE_UNAVAILABLE when a plane this
+ *         frame needs could not be carried (the caller retires next frame).
+ */
+static const char *
+d3d11_hub_stage_planes(struct comp_d3d11_compositor *c, const struct u_canvas_rect *eff_canvas)
+{
+	struct comp_hub_d3d11 *hub = c->hub.split;
+	struct comp_d3d11_zone_mask *amask = d3d11_frame_authored_mask(c);
+	const bool zones = c->zones_frame;
+
+	// The common frame: nothing 2D at all. Un-stage, so the recipe says so.
+	if (!c->local_2d_last_frame && !zones && amask == nullptr) {
+		comp_hub_d3d11_stage_backdrop(hub, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		comp_hub_d3d11_bind_mask_plane(hub, nullptr, 0, 0, 0);
+		comp_hub_d3d11_stage_mask_plane(hub, 0, 0, 0);
+		comp_hub_d3d11_stage_no_composite(hub);
+		comp_hub_d3d11_clear_zone_wish(hub);
+		return nullptr;
+	}
+
+	const uint32_t panel_w = c->split_panel_w;
+	const uint32_t panel_h = c->split_panel_h;
+	/*
+	 * DXR_TEST_HUB_PLANE_FAIL=1 — test-only: refuse the first frame that needs a
+	 * plane, so the one remaining mid-session retire (plane_unavailable) can be
+	 * exercised on a box where every plane would carry (the DXR_TEST_SPLIT_FAIL_*
+	 * / DXR_TEST_FAKE_DP_REFUSE pattern).
+	 */
+	static int s_test_plane_fail = -1;
+	if (s_test_plane_fail < 0) {
+		const char *e = getenv("DXR_TEST_HUB_PLANE_FAIL");
+		s_test_plane_fail = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	if (panel_w == 0 || panel_h == 0 || s_test_plane_fail == 1) {
+		comp_hub_d3d11_stage_backdrop(hub, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		comp_hub_d3d11_stage_mask_plane(hub, 0, 0, 0);
+		comp_hub_d3d11_stage_no_composite(hub);
+		return COMP_HUB_REASON_PLANE_UNAVAILABLE;
+	}
+
+	int32_t proj_idx = -1;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			proj_idx = (int32_t)i;
+			break;
+		}
+	}
+	// Zones frames flatten ALL Local2D layers (no under/over split, as natively).
+	const int32_t over_idx = zones ? -1 : proj_idx;
+	bool have_under = false;
+	uint32_t over_count = 0;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		if (proj_idx >= 0 && (int32_t)i < proj_idx) {
+			have_under = true;
+		}
+		if (over_idx < 0 || (int32_t)i > over_idx) {
+			over_count++;
+		}
+	}
+
+	// The window region inside the panel-sized surfaces (#464), as natively.
+	uint32_t region_w = panel_w;
+	uint32_t region_h = panel_h;
+	{
+		RECT r;
+		if (c->hwnd != nullptr && GetClientRect(c->hwnd, &r) && r.right > 0 && r.bottom > 0) {
+			region_w = ((uint32_t)r.right < panel_w) ? (uint32_t)r.right : panel_w;
+			region_h = ((uint32_t)r.bottom < panel_h) ? (uint32_t)r.bottom : panel_h;
+		}
+	}
+	d3d11_clamp_region_to_panel(c, &region_w, &region_h);
+
+	bool failed = false;
+
+	// 1. The 2D-under backdrop (DP set_background_2d, pre-weave on the hub).
+	{
+		uint32_t bd_w = 0, bd_h = 0;
+		ID3D11ShaderResourceView *bd = d3d11_flatten_backdrop_2d(c, panel_w, panel_h, &bd_w, &bd_h);
+		c->repaint.backdrop_w = bd_w;
+		c->repaint.backdrop_h = bd_h;
+		bool staged = false;
+		if (bd != nullptr && c->backdrop_scratch_share != nullptr) {
+			struct xrt_rect box = {};
+			uint64_t hash = 0;
+			d3d11_local2d_digest(c, proj_idx, /*over=*/false, bd_w, bd_h, &box, &hash);
+			staged = comp_hub_d3d11_stage_backdrop(
+			    hub, c->backdrop_scratch_share, c->backdrop_scratch_gen, panel_w, panel_h, hash,
+			    box.offset.w, box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h, bd_w, bd_h);
+		}
+		if (!staged) {
+			comp_hub_d3d11_stage_backdrop(hub, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+			// Under-layers that could not cross are a plane this frame lost.
+			failed = failed || (have_under && proj_idx >= 0);
+		}
+	}
+
+	// 2. The authored mask, staged before (and independently of) the composite
+	//    decision — the #918 F1/D6 rule: a Tier-3 mask must bootstrap.
+	bool mask_ok = false;
+	uint64_t mask_seq = 0;
+	if (amask != nullptr) {
+		mask_ok = d3d11_hub_mask_plane_refresh(c, amask, &mask_seq) &&
+		          comp_hub_d3d11_bind_mask_plane(hub, c->hub.mask_share, c->hub.mask_gen, amask->w, amask->h);
+		failed = failed || !mask_ok;
+	} else {
+		comp_hub_d3d11_bind_mask_plane(hub, nullptr, 0, 0, 0);
+	}
+	comp_hub_d3d11_stage_mask_plane(hub, mask_ok ? mask_seq : 0, amask != nullptr ? amask->w : 0,
+	                                amask != nullptr ? amask->h : 0);
+
+	// 3. The masked composite. ADR-027/#801: in a ZONES frame an explicit wish
+	//    is PUBLISH-only and never the blend gate; a legacy authored mask IS it.
+	const bool mask_is_plane = mask_ok && !zones;
+	if (!zones && !mask_is_plane && over_count == 0) {
+		comp_hub_d3d11_stage_no_composite(hub);
+		comp_hub_d3d11_clear_zone_wish(hub);
+		return failed ? COMP_HUB_REASON_PLANE_UNAVAILABLE : nullptr;
+	}
+
+	// The over-flatten, into the panel-sized NT-shared scratch (RGBA: the
+	// hub's plane family; `_SRGB` RTV sibling per #1795, as natively).
+	const DXGI_FORMAT l2d_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+	const DXGI_FORMAT l2d_rtv_fmt =
+	    d3d11_local2d_honest() ? d3d_dxgi_format_srgb_rtv(l2d_fmt) : DXGI_FORMAT_UNKNOWN;
+	if (!d3d11_ensure_rt_srv_scratch(c->device, &c->local2d_scratch, &c->local2d_scratch_srv,
+	                                 &c->local2d_scratch_rtv, panel_w, panel_h, l2d_fmt, "local2d scratch",
+	                                 &c->local2d_scratch_share, &c->local2d_scratch_gen, l2d_rtv_fmt) ||
+	    c->local2d_scratch_share == nullptr) {
+		comp_hub_d3d11_stage_no_composite(hub);
+		if (!zones) {
+			comp_hub_d3d11_clear_zone_wish(hub);
+		}
+		return COMP_HUB_REASON_PLANE_UNAVAILABLE;
+	}
+	d3d11_flatten_local_2d_layers(c, region_w, region_h, over_idx);
+
+	// The mask every other kind needs, rastered on the HUB'S device from rects.
+	uint32_t kind = COMP_HUB_D3D11_MASK_NONE;
+	if (!mask_is_plane) {
+		struct xrt_rect rects[XRT_MAX_LAYERS];
+		float feather[XRT_MAX_LAYERS] = {};
+		uint32_t count = 0;
+		if (zones) {
+			bool any_feather = false;
+			for (uint32_t i = 0; i < c->layer_accum.layer_count && count < XRT_MAX_LAYERS; i++) {
+				if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+					continue;
+				}
+				feather[count] = c->layer_accum.layers[i].data.zone_3d.feather_px;
+				any_feather = any_feather || feather[count] > 0.0f;
+				rects[count++] = c->layer_accum.layers[i].data.zone_3d.rect;
+			}
+			// #803: a feathered frame's COMPOSITE samples the ramp; the hub
+			// rasters one mask per frame, so such a frame skips the auto-wish
+			// publish below rather than publish ramped geometry (the VK rung's
+			// documented behaviour).
+			kind = any_feather ? COMP_HUB_D3D11_MASK_ZONE_FEATHER : COMP_HUB_D3D11_MASK_ZONE_BINARY;
+		} else {
+			for (uint32_t i = 0; i < c->layer_accum.layer_count && count < XRT_MAX_LAYERS; i++) {
+				if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D) {
+					continue;
+				}
+				if (proj_idx >= 0 && (int32_t)i < proj_idx) {
+					continue; // under-layer (backdrop) — not part of the overlay mask
+				}
+				rects[count++] = c->layer_accum.layers[i].data.local_2d.rect;
+			}
+			kind = COMP_HUB_D3D11_MASK_IMPLICIT;
+		}
+		if (count == 0 || !comp_hub_d3d11_raster_mask(hub, kind, rects, feather, count, region_w, region_h)) {
+			comp_hub_d3d11_stage_no_composite(hub);
+			if (!zones) {
+				comp_hub_d3d11_clear_zone_wish(hub);
+			}
+			return COMP_HUB_REASON_PLANE_UNAVAILABLE;
+		}
+	}
+
+	// The same per-mode blend this tier's own composite picks.
+	const uint32_t mode = zones           ? COMP_D3D11_COMPOSITE_MODE_ZONES
+	                      : mask_is_plane ? COMP_D3D11_COMPOSITE_MODE_LERP
+	                                      : COMP_D3D11_COMPOSITE_MODE_ALPHA_OVER;
+	const bool opaque = c->transparent_background && debug_get_bool_option_present_opaque_comp();
+	const int32_t cx = eff_canvas->valid ? eff_canvas->x : 0;
+	const int32_t cy = eff_canvas->valid ? eff_canvas->y : 0;
+	const uint32_t cw = eff_canvas->valid ? eff_canvas->w : region_w;
+	const uint32_t ch = eff_canvas->valid ? eff_canvas->h : region_h;
+
+	struct xrt_rect box = {};
+	uint64_t hash = 0;
+	d3d11_local2d_digest(c, over_idx, /*over=*/true, region_w, region_h, &box, &hash);
+	if (!comp_hub_d3d11_stage_local2d(hub, c->local2d_scratch_share, c->local2d_scratch_gen, panel_w, panel_h, hash,
+	                                  box.offset.w, box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h,
+	                                  region_w, region_h, cx, cy, cw, ch, mode, opaque, mask_is_plane)) {
+		failed = true;
+	}
+
+	/*
+	 * ADR-027 P4 / #224 — the hardware zone publish through the hub's weaver,
+	 * with this tier's own content rule (d3d11_sync_zone_mask_to_dp): a zones
+	 * frame publishes its WISH (an authored wish verbatim off its plane, else
+	 * the auto binary raster); a legacy frame publishes its sticky submitted
+	 * mask (off the plane — every authored mask rides it under the hub); with
+	 * neither, the publish is withdrawn. c->zone_publish_seq is the content
+	 * generation in every case (bumped by submits, auto re-rasters and explicit
+	 * wish changes), so a vendor evaluates each generation once.
+	 */
+	if (zones) {
+		if (mask_ok || kind == COMP_HUB_D3D11_MASK_ZONE_BINARY) {
+			comp_hub_d3d11_publish_zone_wish(hub, c->zone_publish_seq);
+		}
+	} else if (mask_ok) {
+		comp_hub_d3d11_publish_zone_wish(hub, c->zone_publish_seq);
+	} else {
+		comp_hub_d3d11_clear_zone_wish(hub);
+	}
+	return failed ? COMP_HUB_REASON_PLANE_UNAVAILABLE : nullptr;
+}
+
 // #918 — Tier-1 authoring (whole mask 3D or 2D) on an EXPLICIT context.
 // Phase 2a: mirrored onto the output-device shadow when one exists. The raster
 // samples nothing, so running it twice is exact — not an approximation of a
@@ -9683,6 +10087,10 @@ comp_d3d11_compositor_zone_get_hw_caps(struct xrt_compositor *xc,
 	}
 	if (out_grid_h != nullptr) {
 		*out_grid_h = 0;
+	}
+	// #2317 P2b: under the hub the weaver (and so the zone grid) is the hub's.
+	if (c->hub.active) {
+		return comp_hub_d3d11_get_zone_grid(c->hub.split, out_grid_w, out_grid_h);
 	}
 	if (!d3d11_zone_dp_supported(c)) {
 		return false;
