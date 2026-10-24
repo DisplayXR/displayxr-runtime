@@ -39,6 +39,7 @@
 #include <windows.h>
 #include <windowsx.h> // GET_X_LPARAM, GET_Y_LPARAM
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -53,6 +54,12 @@ DEBUG_GET_ONCE_BOOL_OPTION(start_windowed, "XRT_COMPOSITOR_START_WINDOWED", fals
 // keeps looking for a main window that appears later; "fullscreen" restores
 // the pre-embedding behaviour.
 DEBUG_GET_ONCE_OPTION(hosted_window, "DXR_HOSTED_WINDOW", "auto")
+
+// The app's own UI strips the embedded 3D view leaves uncovered, so it fills
+// just the app's viewer: "left,top,right,bottom" of the app window's client
+// area in 96-DPI units (scaled by the window's DPI), e.g. "0,33.4,0,0" for a
+// menu bar. Default: the whole client area.
+DEBUG_GET_ONCE_OPTION(hosted_inset, "DXR_HOSTED_INSET", "0,0,0,0")
 
 // Marker for SendInput-injected mouse events — WndProc skips re-forwarding these.
 // Used to break the loop: WndProc→SendInput→WM_LBUTTONDOWN→WndProc.
@@ -186,6 +193,12 @@ struct comp_d3d11_window
 
 	//! "embed" mode searches so far (window thread only).
 	int embed_search_tries;
+
+	//! DXR_HOSTED_INSET, 96-DPI units: left, top, right, bottom (set before thread start).
+	float embed_inset[4];
+
+	//! F11 while embedded: cover the whole panel instead of the app's viewer (window thread).
+	volatile LONG embed_fullscreen;
 
 	//! Window thread handle
 	HANDLE thread_handle;
@@ -731,18 +744,43 @@ embed_find_host(void)
 	return es.best;
 }
 
-//! Cover the host's client area (screen coordinates; we are owned, not a child).
+/*!
+ * Cover the app's viewer: the host's client area minus DXR_HOSTED_INSET, in
+ * screen coordinates (we are owned, not a child) — or, after F11, the whole
+ * monitor the host is on.
+ */
 static void
 embed_fit(struct comp_d3d11_window *w)
 {
 	HWND host = w->embed_host;
-	RECT rc;
-	POINT origin = {0, 0};
-	if (host == NULL || w->hwnd == NULL || !GetClientRect(host, &rc) || !ClientToScreen(host, &origin)) {
+	if (host == NULL || w->hwnd == NULL) {
 		return;
 	}
-	SetWindowPos(w->hwnd, NULL, origin.x, origin.y, rc.right, rc.bottom,
-	             SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+	if (InterlockedCompareExchange(&w->embed_fullscreen, 0, 0) != 0) {
+		MONITORINFO mi = {sizeof(mi)};
+		if (GetMonitorInfo(MonitorFromWindow(host, MONITOR_DEFAULTTONEAREST), &mi)) {
+			SetWindowPos(w->hwnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top,
+			             mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+			             SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+		}
+		return;
+	}
+	RECT rc;
+	POINT origin = {0, 0};
+	if (!GetClientRect(host, &rc) || !ClientToScreen(host, &origin)) {
+		return;
+	}
+	const float scale = (float)GetDpiForWindow(host) / 96.0f;
+	const LONG l = (LONG)(w->embed_inset[0] * scale + 0.5f);
+	const LONG t = (LONG)(w->embed_inset[1] * scale + 0.5f);
+	const LONG r = (LONG)(w->embed_inset[2] * scale + 0.5f);
+	const LONG b = (LONG)(w->embed_inset[3] * scale + 0.5f);
+	const LONG cw = rc.right - l - r;
+	const LONG ch = rc.bottom - t - b;
+	if (cw <= 0 || ch <= 0) {
+		return;
+	}
+	SetWindowPos(w->hwnd, NULL, origin.x + l, origin.y + t, cw, ch, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
 }
 
 static void CALLBACK
@@ -959,7 +997,12 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			HWND fwd_check = (HWND)InterlockedCompareExchangePointer(
 			    (volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
 			if (fwd_check == NULL && w->embed_host != NULL) {
-				// Embedded in the app's window: the app owns its window state.
+				// Embedded: F11 switches between the app's viewer and the whole panel.
+				LONG fs = !InterlockedCompareExchange(&w->embed_fullscreen, 0, 0);
+				InterlockedExchange(&w->embed_fullscreen, fs);
+				InterlockedExchange(&w->is_fullscreen, fs);
+				embed_fit(w);
+				U_LOG_W("D3D11 window: F11 — embedded view %s", fs ? "fullscreen on the panel" : "back in the app's viewer");
 				return 0;
 			}
 			if (fwd_check == NULL) {
@@ -2010,6 +2053,16 @@ window_create_internal(uint32_t width,
 	w->start_hidden = start_hidden;
 	w->embed_requested = embed != WINDOW_EMBED_OFF;
 	w->embed_keep_looking = embed == WINDOW_EMBED_LOOKING;
+	if (w->embed_requested) {
+		const char *inset = debug_get_option_hosted_inset();
+		float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		if (inset != NULL && sscanf(inset, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]) == 4 && v[0] >= 0.0f &&
+		    v[1] >= 0.0f && v[2] >= 0.0f && v[3] >= 0.0f) {
+			memcpy(w->embed_inset, v, sizeof(v));
+		} else if (inset != NULL && strcmp(inset, "0,0,0,0") != 0) {
+			U_LOG_W("D3D11 window: DXR_HOSTED_INSET='%s' is not left,top,right,bottom (>= 0) — ignored", inset);
+		}
+	}
 	w->instance = GetModuleHandle(NULL);
 	w->requested_width = width > 0 ? width : 1920;
 	w->requested_height = height > 0 ? height : 1080;
