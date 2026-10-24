@@ -25,6 +25,17 @@ if(WIN32)
 	endif()
 endif()
 
+if(APPLE)
+	# A viewer-tracking provider may open a webcam in this process (tracking-provider-discovery.md §8).
+	# macOS reads the camera usage string from the executable's Info.plist; a bare executable carries
+	# it as an embedded __TEXT,__info_plist section. Note: TCC asks the RESPONSIBLE process — this
+	# string is what it shows once the host is its own responsible process (§10 item 1).
+	set(_vhost_plist "${CMAKE_CURRENT_BINARY_DIR}/Info.plist")
+	configure_file(${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in ${_vhost_plist} @ONLY)
+	target_link_options(displayxr-tracking-host PRIVATE "LINKER:-sectcreate,__TEXT,__info_plist,${_vhost_plist}")
+	set_property(TARGET displayxr-tracking-host APPEND PROPERTY LINK_DEPENDS ${_vhost_plist})
+endif()
+
 # In the build tree, sit next to the runtime library: providers built against
 # it import the aux surface from it (macOS: @rpath/openxr_displayxr.dylib,
 # resolved through the host's rpath; the staged / installed host gets

@@ -726,12 +726,16 @@ itself (`describe().camera_key`); the trunk does not yet fold an active provider
 service's claim set (§10 item 10), so with only `SOURCE=webcam` on, the service's UVC SBS
 source is not told the webcam is taken. Do not opt the same webcam into `stereo-cameras.json`.
 
-**macOS camera permission.** macOS has no capture backend yet (`aux_os_uvc` builds its stubs
-there), so `SOURCE=webcam` declines on macOS today. When an AVFoundation backend lands, access is
-gated by the **hosting process's** `NSCameraUsageDescription` and TCC grant: in-process that is
-the app's own permission, exactly as for the sim_display alias; under the service it is
-`displayxr-tracking-host`, which will need its own usage string (an embedded Info.plist) and grant
-(follow-up, §10).
+**macOS camera permission.** Access is gated by the TCC grant and the `NSCameraUsageDescription`
+of the process macOS holds **responsible** for the one opening the camera. In-process that is the
+app (or, for a binary started from a terminal, the terminal app — a test app run from Terminal uses
+Terminal's grant). `aux_os_uvc` has no macOS capture backend, so `SOURCE=webcam` declines on macOS;
+an out-of-tree provider with its own AVFoundation capture (the open camera tracking provider) runs
+there today. `displayxr-tracking-host` carries its own usage string, embedded in the bare executable
+as a `__TEXT,__info_plist` section (`src/xrt/targets/tracking_host/Info.plist.in`, bundle id
+`com.displayxr.tracking-host`). That string is necessary but not yet sufficient under the service:
+the service spawns the host with fork + exec, so the host inherits the service's responsibility and
+TCC consults the service (or whatever launched it) — see §10 item 1.
 
 Dev trees stage it next to sim-input (`scripts/build_macos.sh`, `scripts/build_linux.sh`); the CI
 end-to-end arm is `tests_oxr_view_space_viewer_tracking`.
@@ -769,7 +773,10 @@ apps beside a service reading the page instead of opening the camera again.
 
 1. **Out-of-process hosting — open ends**: the service's host is spawned per service run, so a
    tracking registration change still applies at the next service start (item 5); the macOS host
-   needs its own `NSCameraUsageDescription` before an AVFoundation webcam source can run there (§8);
+   carries its own `NSCameraUsageDescription` (embedded `__info_plist`), but TCC asks the RESPONSIBLE
+   process, which for a fork + exec child of the service is the service — the host must be spawned
+   with responsibility disclaimed (`posix_spawn` + `responsibility_spawnattrs_setdisclaim`, macOS
+   only, in `os_process_spawn`) before the prompt and the grant name the host (§8);
    `tracking calibrate --watch` still hosts its own provider rather than reading the page (item 4);
    an in-process app that starts *before* the service has created the page keeps its own
    provider for its instance (the decision is static per instance); Windows hardware runs of the
