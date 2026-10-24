@@ -785,10 +785,11 @@ embed_adopt(struct comp_d3d11_window *w, HWND hwnd, HWND host)
 
 	DWORD host_pid = 0;
 	const DWORD host_tid = GetWindowThreadProcessId(host, &host_pid);
-	w->embed_hook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, NULL,
-	                                embed_event_cb, host_pid, host_tid, WINEVENT_OUTOFCONTEXT);
+	w->embed_hook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, NULL, embed_event_cb,
+	                                host_pid, host_tid, WINEVENT_OUTOFCONTEXT);
 
-	SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+	SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+	             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 	embed_fit(w);
 	ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
@@ -796,9 +797,10 @@ embed_adopt(struct comp_d3d11_window *w, HWND hwnd, HWND host)
 	GetClientRect(host, &rc);
 	WCHAR title[128] = L"";
 	InternalGetWindowText(host, title, 128);
-	U_LOG_W("D3D11 window: embedded over the app's window %p '%ls' (%ldx%ld client) — DXR_HOSTED_WINDOW=fullscreen "
-	        "restores the panel-fullscreen window",
-	        (void *)host, title, (long)rc.right, (long)rc.bottom);
+	U_LOG_W(
+	    "D3D11 window: embedded over the app's window %p '%ls' (%ldx%ld client) — DXR_HOSTED_WINDOW=fullscreen "
+	    "restores the panel-fullscreen window",
+	    (void *)host, title, (long)rc.right, (long)rc.bottom);
 }
 
 // Forward declaration — defined later in this file alongside the suppress
