@@ -655,18 +655,26 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 	self.linear_velocity = qd->linear_velocity;
 	self.angular_velocity = qd->angular_velocity;
 
-	// Mouse hand: the right controller is wherever the cursor points, head-relative.
+	// Mouse hand: the right controller is wherever the cursor points. From the
+	// located views it is placed in the tracking origin directly (the views'
+	// head is the display device's, not necessarily the qwerty HMD's); the
+	// fallback is head-relative and parented to the qwerty HMD below.
 	bool mouse_hand = false;
+	bool mouse_hand_in_origin = false;
 	if (qd_is_ctrl && qc == qd->sys->rctrl && qd->sys->mouse_hand && qd->sys->hmd != NULL) {
 		struct qwerty_system *qs = qd->sys;
 		os_mutex_lock(&qs->view_lock);
 		if (qs->mouse_hand_cursor_valid) {
 			const float scale = qs->mouse_hand_depth_scale > 0.0f ? qs->mouse_hand_depth_scale : 1.0f;
-			if (!qs->mouse_hand_views_valid ||
-			    !qwerty_mouse_hand_pose_from_views(qs->mouse_hand_u, qs->mouse_hand_v, scale,
-			                                       qs->mouse_hand_eyes, qs->mouse_hand_fovs, &self.pose)) {
-				const float depth =
-				    scale * (qs->cam_convergence > 0.05f ? 1.0f / qs->cam_convergence : 0.6f);
+			const float screen_m = qs->cam_convergence > 0.05f ? 1.0f / qs->cam_convergence : 0.6f;
+			struct xrt_pose in_head;
+			if (qs->mouse_hand_views_valid &&
+			    qwerty_mouse_hand_pose_from_views(qs->mouse_hand_u, qs->mouse_hand_v, scale, screen_m,
+			                                      qs->mouse_hand_eyes, qs->mouse_hand_fovs, &in_head)) {
+				math_pose_transform(&qs->mouse_hand_head, &in_head, &self.pose);
+				mouse_hand_in_origin = true;
+			} else {
+				const float depth = scale * screen_m;
 				qwerty_mouse_hand_pose(qs->mouse_hand_u, qs->mouse_hand_v, qs->mouse_hand_aspect,
 				                       qs->cam_half_tan_vfov, depth, &self.pose);
 			}
@@ -677,7 +685,7 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 		os_mutex_unlock(&qs->view_lock);
 	}
 
-	if (qd_is_ctrl && (qc->follow_hmd || mouse_hand)) {
+	if (qd_is_ctrl && !mouse_hand_in_origin && (qc->follow_hmd || mouse_hand)) {
 		struct qwerty_device *qd_hmd = &qd->sys->hmd->base;
 
 		// #1692: push RELATIONS, not bare poses. A pose-only step carries
@@ -1693,6 +1701,7 @@ bool
 qwerty_mouse_hand_pose_from_views(float u,
                                   float v,
                                   float depth_scale,
+                                  float fallback_dist,
                                   const struct xrt_pose eyes[2],
                                   const struct xrt_fov fovs[2],
                                   struct xrt_pose *out_pose)
@@ -1711,10 +1720,10 @@ qwerty_mouse_hand_pose_from_views(float u,
 	if (fabsf(den) < 1e-5f) {
 		den = r0 - r1;
 	}
-	if (fabsf(den) < 1e-5f) {
-		return false;
+	float dist = fabsf(den) < 1e-5f ? 0.0f : (e1.x - e0.x) / den;
+	if (!(dist > 0.0f) || !isfinite(dist)) {
+		dist = fallback_dist;
 	}
-	const float dist = (e1.x - e0.x) / den;
 	if (!(dist > 0.0f) || !isfinite(dist)) {
 		return false;
 	}
@@ -1741,18 +1750,27 @@ qwerty_mouse_hand_pose_from_views(float u,
 void
 qwerty_set_mouse_hand_views(struct xrt_device **xdevs,
                             size_t count,
-                            const struct xrt_pose poses[2],
+                            const struct xrt_pose eyes[2],
                             const struct xrt_fov fovs[2])
 {
 	struct qwerty_system *qs = find_qwerty_system(xdevs, count);
 	if (qs == NULL || !qs->mouse_hand) {
 		return;
 	}
+	// A head frame between the eyes, aligned with the (parallel) views, so the
+	// solver sees eyes on its X axis looking down -Z.
+	struct xrt_pose head = {eyes[0].orientation,
+	                        {(eyes[0].position.x + eyes[1].position.x) * 0.5f,
+	                         (eyes[0].position.y + eyes[1].position.y) * 0.5f,
+	                         (eyes[0].position.z + eyes[1].position.z) * 0.5f}};
+	struct xrt_pose head_inv;
+	math_pose_invert(&head, &head_inv);
 	os_mutex_lock(&qs->view_lock);
-	qs->mouse_hand_eyes[0] = poses[0];
-	qs->mouse_hand_eyes[1] = poses[1];
+	math_pose_transform(&head_inv, &eyes[0], &qs->mouse_hand_eyes[0]);
+	math_pose_transform(&head_inv, &eyes[1], &qs->mouse_hand_eyes[1]);
 	qs->mouse_hand_fovs[0] = fovs[0];
 	qs->mouse_hand_fovs[1] = fovs[1];
+	qs->mouse_hand_head = head;
 	qs->mouse_hand_views_valid = true;
 	os_mutex_unlock(&qs->view_lock);
 }

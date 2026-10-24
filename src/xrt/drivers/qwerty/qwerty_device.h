@@ -91,8 +91,9 @@ struct qwerty_system
 	float mouse_hand_aspect;  //!< view width / height
 	float mouse_hand_depth_scale;       //!< along the eye-to-cursor ray; 1 = on the virtual screen (zero parallax)
 	bool mouse_hand_views_valid;        //!< the views below came from a real xrLocateViews
-	struct xrt_pose mouse_hand_eyes[2]; //!< head-relative eye poses the app renders with
+	struct xrt_pose mouse_hand_eyes[2]; //!< the app's eye poses, relative to mouse_hand_head
 	struct xrt_fov mouse_hand_fovs[2];  //!< their (off-axis, window-fitted) FOVs
+	struct xrt_pose mouse_hand_head;    //!< between the eyes, view-aligned, in the tracking origin
 
 	float nominal_viewer_z; //!< meters (e.g. 0.6 from sim_display)
 	float screen_height_m;  //!< meters (e.g. 0.194 from sim_display)
@@ -661,12 +662,16 @@ qwerty_mouse_hand_pose(float u, float v, float aspect, float half_tan_vfov, floa
  * (@p u, @p v, -1..1, +v up) picks a point on it, and the hand sits on the ray
  * from the centre eye through that point, @p depth_scale of the way (1 = on
  * the screen: zero parallax, under the cursor in both eyes), aimed along it.
- * Returns false if the views do not describe a screen in front of the eyes.
+ * Coincident eyes (an untracked viewer: one view twice) carry no screen
+ * distance; the screen is then taken @p fallback_dist ahead, which keeps the
+ * hand under the cursor since such views have no parallax. Returns false if
+ * no screen in front of the eyes can be found that way either.
  */
 bool
 qwerty_mouse_hand_pose_from_views(float u,
                                   float v,
                                   float depth_scale,
+                                  float fallback_dist,
                                   const struct xrt_pose eyes[2],
                                   const struct xrt_fov fovs[2],
                                   struct xrt_pose *out_pose);

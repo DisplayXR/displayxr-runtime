@@ -128,23 +128,29 @@ TEST_CASE("The mouse hand lands on the views' virtual screen under the cursor", 
 	}
 
 	xrt_pose pose{};
-	REQUIRE(qwerty_mouse_hand_pose_from_views(0, 0, 1, eyes, fovs, &pose));
+	REQUIRE(qwerty_mouse_hand_pose_from_views(0, 0, 1, 0, eyes, fovs, &pose));
 	CHECK(pose.position.x == Catch::Approx(0).margin(1e-5));
 	CHECK(pose.position.y == Catch::Approx(-0.2));
 	CHECK(pose.position.z == Catch::Approx(-1.0));
 
-	REQUIRE(qwerty_mouse_hand_pose_from_views(1, 1, 1, eyes, fovs, &pose));
+	REQUIRE(qwerty_mouse_hand_pose_from_views(1, 1, 1, 0, eyes, fovs, &pose));
 	CHECK(pose.position.x == Catch::Approx(0.8));
 	CHECK(pose.position.y == Catch::Approx(0.3));
 
 	// Deeper along the same ray from the centre eye: same screen position, twice as far.
-	REQUIRE(qwerty_mouse_hand_pose_from_views(1, 1, 2, eyes, fovs, &pose));
+	REQUIRE(qwerty_mouse_hand_pose_from_views(1, 1, 2, 0, eyes, fovs, &pose));
 	CHECK(pose.position.x == Catch::Approx(1.6));
 	CHECK(pose.position.y == Catch::Approx(0.6));
 	CHECK(pose.position.z == Catch::Approx(-2.0));
 
-	// Identical eyes describe no screen: refuse rather than guess.
+	// Identical eyes (untracked viewer) describe no screen distance: with no
+	// fallback, refuse; with one, the screen is that far ahead and the cursor
+	// still maps through the (off-axis) view.
 	xrt_pose same[2] = {eyes[0], eyes[0]};
 	xrt_fov same_fov[2] = {fovs[0], fovs[0]};
-	CHECK_FALSE(qwerty_mouse_hand_pose_from_views(0, 0, 1, same, same_fov, &pose));
+	CHECK_FALSE(qwerty_mouse_hand_pose_from_views(0, 0, 1, 0, same, same_fov, &pose));
+	REQUIRE(qwerty_mouse_hand_pose_from_views(1, 1, 1, 0.5f, same, same_fov, &pose));
+	CHECK(pose.position.x == Catch::Approx(ex[0] + std::tan(fovs[0].angle_right) * 0.5f));
+	CHECK(pose.position.y == Catch::Approx(std::tan(fovs[0].angle_up) * 0.5f));
+	CHECK(pose.position.z == Catch::Approx(-0.5));
 }
