@@ -69,9 +69,10 @@ kill switch):
 |---|---|---|---|
 | d3d11 | default | default env (own #918 split) | `hub`: `DXR_HUB=1` (`hub placement: hub=1 ... ingress=xbridge`) |
 | d3d11 | same-adapter | default env (own same-adapter engage) | `hub-direct`: `DXR_HUB=1` (`ingress=direct`); `hub-xbridge`: + `DXR_HUB_INGRESS=xbridge` |
-| d3d12 | default | default env (own-legs split) | `hub` (optional): `DXR_SPLIT_D3D12_HYBRID_REROUTE=1` - the code gate also needs `DXR_APP_FRAME_DIVISOR>=2`, so it is not like-for-like |
-| d3d12 | same-adapter | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`heavy-d3d12 reroute ACTIVE`) |
-| vk | both | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`VK output-device split ACTIVE`) |
+| d3d12 | default | default env (own-legs split) | `hub` (optional): `DXR_SPLIT_D3D12_HYBRID_REROUTE=1` (`ingress=xbridge`) - the code gate also needs `DXR_APP_FRAME_DIVISOR>=2`, so it is not like-for-like |
+| d3d12 | same-adapter | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env, the #1264 reroute (`hub placement: hub=1 ... ingress=direct`, P2a); `hub-xbridge`: + `DXR_HUB_INGRESS=xbridge` |
+| vk | default | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`ingress=xbridge ingress_reason=cross_adapter`) |
+| vk | same-adapter | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`ingress=direct`, P2a); `hub-xbridge`: + `DXR_HUB_INGRESS=xbridge` |
 | gl | both | default env | - (reference row) |
 
 ```powershell
@@ -100,8 +101,10 @@ kill switch):
 - **R / D.** `DXR_WEAVE_LATENCY_CSV=<run dir>\wl` writes `wl.<site>.csv`; R is
   joined F->S exactly as `weave_latency.py` does (app frames only, window
   limited by QPC). D rows exist only where the site is handed
-  `predicted_display_time_ns`: the native `d3d11`/`d3d12` sites do; the fill
-  arm's `d3d11` site (`comp_vk_split` passes 0) and `vknative` do not (P1c).
+  `predicted_display_time_ns`: the native `d3d11`/`d3d12` sites and, since P1c,
+  the hub's `d3d11` site do; `vknative` does not. Since #2327 the hub pairs
+  each weave with the promise of the frame it actually weaves (by seq), and the
+  d3d12/vk callers predict from the hub target's measured #867 lookahead.
   `vknative` needs `VK_KHR_present_wait` - absent there, no CSV at all.
 - **Hygiene.** Apps launch de-elevated via `explorer.exe` -> `.bat` (env is
   process-level, so the runtime's `getenv` sees it), centred, forced to the
