@@ -10,7 +10,6 @@
 #include "target_input_plugin_loader.h"
 #include "target_input_pref.h"
 
-#include "xrt/xrt_config_drivers.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_input_plugin.h"
 #include "xrt/xrt_input_selection.h"
@@ -20,10 +19,6 @@
 #include "os/os_time.h"
 
 #include "util/u_logging.h"
-
-#ifdef XRT_BUILD_DRIVER_QWERTY
-#include "qwerty/qwerty_interface.h"
-#endif
 
 #include <stddef.h>
 #include <stdio.h>
@@ -234,6 +229,10 @@ struct t_input_arbiter
 	uint64_t dropped_keys[8];
 	uint32_t dropped_next;
 };
+
+
+//! See t_input_arbiter_set_floor_self_report.
+static t_input_arbiter_floor_self_fn g_floor_self_report = NULL;
 
 static struct t_input_arbiter g_arb = {0};
 
@@ -554,14 +553,12 @@ profile_to_report_locked(const struct t_input_candidate *winner, struct xrt_devi
 		return xdev->name; // A real provider reports itself.
 	}
 
-#ifdef XRT_BUILD_DRIVER_QWERTY
-	// The mouse hand (DXR_MOUSE_HAND) is a deliberate input the user chose,
-	// not a stand-in waiting for a provider: report its own profiles (MX Ink
-	// first) rather than masquerading as an idle provider's.
-	if (qwerty_is_mouse_hand(xdev)) {
+	// A floor device the user chose deliberately (the qwerty mouse hand,
+	// DXR_MOUSE_HAND) is not a stand-in waiting for a provider: it reports
+	// its own profiles rather than masquerading as an idle provider's.
+	if (g_floor_self_report != NULL && g_floor_self_report(xdev)) {
 		return xdev->name;
 	}
-#endif
 
 	// The floor won: find the top-ranked provider candidate's device
 	// for this hand (either hand as a fallback — the profile is a
@@ -1551,6 +1548,12 @@ t_input_arbiter_nav_candidate_present(int32_t nav_index)
 	bool present = nav_candidate_present_locked(nav_index);
 	os_mutex_unlock(&g_arb_mutex);
 	return present;
+}
+
+void
+t_input_arbiter_set_floor_self_report(t_input_arbiter_floor_self_fn fn)
+{
+	g_floor_self_report = fn;
 }
 
 void
