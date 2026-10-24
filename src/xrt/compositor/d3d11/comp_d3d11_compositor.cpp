@@ -4858,19 +4858,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	 * composed natively with its planes.
 	 */
 	/*
-	 * #2317 P2b review: the zone publish under the hub reaches its PRIMARY DP
-	 * only, where natively every segment DP gets the mask cropped to its screen
-	 * (#2218 #4). A frame that publishes one (zones, or an authored mask) while
-	 * the hub's last weave segmented the window is the native legs' — refused by
-	 * name until the per-segment publish is ported.
+	 * #2342 P2c: a zones frame or an authored mask on a SEGMENTED window no
+	 * longer retires the hub (`segments_planes`, P2b review): the hub publishes
+	 * the zone mask to every segment DP cropped to its screen, and clears them,
+	 * exactly as this tier natively does (#2218 #4).
 	 */
-	if (c->hub.active && c->hub.retire_pending == NULL && (zones_frame || d3d11_frame_authored_mask(c) != NULL)) {
-		struct xrt_segment_metrics sm;
-		memset(&sm, 0, sizeof(sm));
-		if (comp_hub_d3d11_get_segment_metrics(c->hub.split, &sm) && sm.count > 1) {
-			c->hub.retire_pending = COMP_HUB_REASON_SEGMENTS_PLANES;
-		}
-	}
 	if (c->hub.active && c->hub.retire_pending != NULL) {
 		const char *why = c->hub.retire_pending;
 		c->hub.retire_pending = NULL;

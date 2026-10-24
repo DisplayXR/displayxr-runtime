@@ -2555,6 +2555,23 @@ split_publish_zone_wish_now(struct comp_hub_d3d11 *s, uint64_t seq)
 	                                                        (uint32_t)r.bottom, seq)) {
 		s->zone_published = true;
 	}
+	/*
+	 * #2342 P2c (#2218 #4, the native D3D11 rule): a window spanning screens —
+	 * every segment DP gets the mask cropped to its screen, so a 2D zone on
+	 * screen B stays 2D there even when screen A has a 3D zone (the vendor's
+	 * verdict is per panel). The manager lives on THIS device, and @p srv is
+	 * this device's (an out-device raster or plane view), so the crop is one
+	 * CopySubresourceRegion per segment. A screen the window has left is
+	 * cleared inside. seg_mutex: the app thread reads the manager for eyes;
+	 * every caller of this is serialised with the weave by the compositor
+	 * mutex, which is what serialises the manager's rebuild.
+	 */
+	if (s->mutexes_init) {
+		os_mutex_lock(&s->seg_mutex);
+		comp_d3d11_segments_publish_zone_mask(s->segments, s->out_ctx, srv, mw, mh, (uint32_t)r.right,
+		                                      (uint32_t)r.bottom, seq);
+		os_mutex_unlock(&s->seg_mutex);
+	}
 }
 
 extern "C" bool
@@ -2597,10 +2614,18 @@ comp_hub_d3d11_publish_zone_wish(struct comp_hub_d3d11 *s, uint64_t seq)
 extern "C" void
 comp_hub_d3d11_clear_zone_wish(struct comp_hub_d3d11 *s)
 {
-	if (s != nullptr) {
-		s->direct.publish_pending = false; // a withdrawn wish owes no publish
+	if (s == nullptr) {
+		return;
 	}
-	if (s == nullptr || s->dp == nullptr || !s->zone_published) {
+	s->direct.publish_pending = false; // a withdrawn wish owes no publish
+	// #2342 P2c (#2218 #4): every segment DP that holds a published crop too.
+	// Idempotent; a manager with nothing published is a no-op.
+	if (s->mutexes_init) {
+		os_mutex_lock(&s->seg_mutex);
+		comp_d3d11_segments_clear_zone_mask(s->segments);
+		os_mutex_unlock(&s->seg_mutex);
+	}
+	if (s->dp == nullptr || !s->zone_published) {
 		return;
 	}
 	xrt_display_processor_d3d11_clear_local_zone_mask(s->dp);
