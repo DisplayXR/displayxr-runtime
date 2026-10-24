@@ -857,8 +857,12 @@ embed_peek_tick(struct comp_d3d11_window *w, HWND hwnd)
 		}
 		POINT pt;
 		RECT client;
+		RECT ours;
 		if (!GetCursorPos(&pt) || GetAncestor(WindowFromPoint(pt), GA_ROOT) != host) {
 			return;
+		}
+		if (GetWindowRect(hwnd, &ours) && PtInRect(&ours, pt)) {
+			return; // over the 3D view (input passed through to the app): not the app's own UI
 		}
 		POINT local = pt;
 		if (!ScreenToClient(host, &local) || !GetClientRect(host, &client) || !PtInRect(&client, local)) {
