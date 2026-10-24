@@ -75,6 +75,15 @@ static const wchar_t *const kHostedViewRectProp = L"DXR_HostedViewRect";
 // brings it back.
 DEBUG_GET_ONCE_BOOL_OPTION(hosted_ui_peek, "DXR_HOSTED_UI_PEEK", true)
 
+// Live stereo depth for an embedded app, set by any helper (a depth slider)
+// as a property on the app's main window: strength (IPD/parallax factor,
+// 1 = nominal) x 1000 | convergence distance in mm << 16; a 0 field leaves
+// that setting alone. The runtime applies it on its 250 ms rect poll and
+// publishes the values in effect, same packing, as DXR_HostedDepthNow on the
+// same window, so a slider can start from them.
+static const wchar_t *const kHostedDepthProp = L"DXR_HostedDepth";
+static const wchar_t *const kHostedDepthNowProp = L"DXR_HostedDepthNow";
+
 // Marker for SendInput-injected mouse events — WndProc skips re-forwarding these.
 // Used to break the loop: WndProc→SendInput→WM_LBUTTONDOWN→WndProc.
 #define WORKSPACE_SENDINPUT_MARKER 0xD15B1A7E
@@ -216,6 +225,10 @@ struct comp_d3d11_window
 
 	//! The host's DXR_HostedViewRect as last applied (window thread).
 	uint64_t embed_view_rect;
+
+	//! The host's DXR_HostedDepth as last applied, and DXR_HostedDepthNow as last published (window thread).
+	uint64_t embed_depth;
+	uint64_t embed_depth_now;
 
 	//! UI peek (DXR_HOSTED_UI_PEEK): the 3D view is hidden so the app's own
 	//! menus and dialogs show; button/key states for edge detection (window thread).
@@ -906,6 +919,41 @@ embed_peek_tick(struct comp_d3d11_window *w, HWND hwnd)
 	}
 }
 
+/*!
+ * Apply the host's DXR_HostedDepth when it changes and publish the depth in
+ * effect as DXR_HostedDepthNow. SetPropW/GetPropW send the app nothing.
+ */
+static void
+embed_sync_depth(struct comp_d3d11_window *w, HWND host)
+{
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (w->xsysd == NULL) {
+		return;
+	}
+	const uint64_t want = (uint64_t)(uintptr_t)GetPropW(host, kHostedDepthProp);
+	if (want != w->embed_depth) {
+		w->embed_depth = want;
+		const float strength = (float)(want & 0xFFFF) / 1000.0f;
+		const float convergence_m = (float)((want >> 16) & 0xFFFF) / 1000.0f;
+		qwerty_set_depth(w->xsysd->xdevs, w->xsysd->xdev_count, strength, convergence_m);
+	}
+	float strength = 0.0f;
+	float convergence_m = 0.0f;
+	if (qwerty_get_depth(w->xsysd->xdevs, w->xsysd->xdev_count, &strength, &convergence_m)) {
+		const uint64_t s = (uint64_t)(strength * 1000.0f + 0.5f);
+		const uint64_t c = (uint64_t)(convergence_m * 1000.0f + 0.5f);
+		const uint64_t now = (s > 0xFFFF ? 0xFFFF : s) | (c > 0xFFFF ? 0xFFFF : c) << 16;
+		if (now != w->embed_depth_now) {
+			w->embed_depth_now = now;
+			SetPropW(host, kHostedDepthNowProp, (HANDLE)(uintptr_t)now);
+		}
+	}
+#else
+	(void)w;
+	(void)host;
+#endif
+}
+
 static void CALLBACK
 embed_event_cb(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG id_object, LONG id_child, DWORD thread, DWORD time)
 {
@@ -1381,6 +1429,9 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			if (host != NULL &&
 			    (uint64_t)(uintptr_t)GetPropW(host, kHostedViewRectProp) != w->embed_view_rect) {
 				embed_fit(w, hWnd);
+			}
+			if (host != NULL) {
+				embed_sync_depth(w, host);
 			}
 			return 0;
 		}
