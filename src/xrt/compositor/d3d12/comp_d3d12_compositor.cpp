@@ -5375,8 +5375,9 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// lands) or end of frame (POST_COMPOSE).
 	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
-	// #2342 P2c: under the reroute the hub is the one capture site.
-	if (c->reroute.active && c->capture_intent.pending) {
+	// #2342 P2c: under the reroute the hub is the POST-compose capture site; a
+	// projection-only intent stays with the native projection-done point.
+	if (c->reroute.active && c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_POST_COMPOSE) {
 		if (c->reroute.capture.pending) {
 			u_capture_intent_complete(&c->reroute.capture, &c->mcp_capture, false);
 		}
@@ -6156,11 +6157,19 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		                                          c->layer_accum.data.display_time_ns > 0
 		                                              ? (uint64_t)c->layer_accum.data.display_time_ns
 		                                              : c->last_display_time_ns);
-		// #2342 P2c: the hub's one capture site (DP input + post-weave back buffer).
+		// #2342 P2c: a projection-only intent the native point skipped goes to
+		// the hub too (one consumer either way); then arm the hub's capture.
+		if (c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY &&
+		    !c->reroute.capture.pending) {
+			c->reroute.capture = c->capture_intent;
+			c->capture_intent.pending = false;
+		}
 		if (c->reroute.capture.pending) {
+			char woven[MCP_CAPTURE_PATH_MAX + 16];
+			u_capture_intent_sibling_path(c->reroute.capture.path, ".woven", woven, sizeof(woven));
 			comp_hub_d3d11_capture_arm(c->reroute.split,
 			                           c->reroute.capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
-			                           c->reroute.capture.path);
+			                           c->reroute.capture.path, woven);
 		}
 		const bool rr_wove =
 		    comp_hub_d3d11_weave_and_present(c->reroute.split, /*is_repaint=*/false, &rr_canvas);

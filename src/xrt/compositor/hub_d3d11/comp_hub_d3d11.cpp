@@ -4398,29 +4398,21 @@ comp_hub_d3d11_set_post_weave_hook(struct comp_hub_d3d11 *s, comp_hub_d3d11_post
 }
 
 extern "C" void
-comp_hub_d3d11_capture_arm(struct comp_hub_d3d11 *s, bool projection_only, const char *path)
+comp_hub_d3d11_capture_arm(struct comp_hub_d3d11 *s, bool projection_only, const char *path, const char *woven_path)
 {
-	if (s == nullptr || path == nullptr || path[0] == '\0') {
+	if (s == nullptr) {
 		return;
 	}
+	// Arm even with an empty path: the write fails and the intent completes as
+	// failed (an early return here would leave _take false and the tier's
+	// intent re-arming every frame). The buffers hold MCP_CAPTURE_PATH_MAX (256)
+	// plus the ".woven" infix with room to spare.
 	auto &c = s->cap;
 	c = {};
 	c.armed = true;
 	c.projection_only = projection_only;
-	snprintf(c.path, sizeof(c.path), "%s", path);
-	// The service twin's sibling name: insert ".woven" before the extension of
-	// the last path component ("...\\displayxr_atlas.png" -> "...woven.png").
-	const char *dot = strrchr(c.path, '.');
-	const char *sep = strrchr(c.path, '\\');
-	const char *fsep = strrchr(c.path, '/');
-	if (fsep != nullptr && (sep == nullptr || fsep > sep)) {
-		sep = fsep;
-	}
-	if (dot == nullptr || (sep != nullptr && dot < sep)) {
-		snprintf(c.woven_path, sizeof(c.woven_path), "%s.woven.png", c.path);
-	} else {
-		snprintf(c.woven_path, sizeof(c.woven_path), "%.*s.woven%s", (int)(dot - c.path), c.path, dot);
-	}
+	snprintf(c.path, sizeof(c.path), "%s", path != nullptr ? path : "");
+	snprintf(c.woven_path, sizeof(c.woven_path), "%s", woven_path != nullptr ? woven_path : "");
 }
 
 extern "C" bool
@@ -5221,11 +5213,12 @@ comp_hub_d3d11_set_post_weave_hook(struct comp_hub_d3d11 *split, comp_hub_d3d11_
 }
 
 extern "C" void
-comp_hub_d3d11_capture_arm(struct comp_hub_d3d11 *split, bool projection_only, const char *path)
+comp_hub_d3d11_capture_arm(struct comp_hub_d3d11 *split, bool projection_only, const char *path, const char *woven_path)
 {
 	(void)split;
 	(void)projection_only;
 	(void)path;
+	(void)woven_path;
 }
 
 extern "C" bool

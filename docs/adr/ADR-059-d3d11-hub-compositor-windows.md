@@ -275,9 +275,11 @@ legs keep their own copies until P5 deletes them.
   #884 late sleep) and its #1339 admission. The pacer hold is lifetime-safe against a retire. Before
   this, all three routes skipped pacing, so `DXR_WEAVE_REPAINT_FORCE=1` gave 0 repaints/s on the
   hub (#2321 surprise 6). `DXR_LATE_WEAVE` is read once for every hub route, by the hub's target.
-- **One capture site.** On a hub route the tier hands its pending `u_capture_intent` to the hub.
-  The hub writes the DP input to `displayxr_atlas[.<exe>][.projection].png` and, for full
-  triggers, the post-weave back buffer to `…woven.png`: the service twin's names.
+- **One consumer per capture trigger.** On a hub route a full (post-compose) `u_capture_intent`
+  is handed to the hub, which writes the DP input to `displayxr_atlas[.<exe>].png` and the
+  post-weave back buffer to `…woven.png` (the service twin's names). A projection-only trigger
+  stays with the tier's own projection-done point (pre-window-space, HUD-free). The hub takes it
+  only when that point was skipped.
 - **Colour at the import boundary** (ADR-044 §1). Every hub view of a producer surface uses the
   non-decoding UNORM member of its family; crops are raw copies.
 - **VK present_wait extras.** None is lost relative to native VK on Windows; see *Consequences*.
