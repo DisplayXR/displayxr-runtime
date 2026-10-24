@@ -2738,6 +2738,18 @@ d3d12_compositor_predict_frame(struct xrt_compositor *xc,
 		}
 		comp_d3d12_target_mark_wait_frame(c->target);
 	}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	else if (c->reroute.active && c->reroute.split != nullptr) {
+		// #2327: the #1264 reroute has no d3d12 target — the hub's target owns
+		// the weave and the present, so ITS #867 ledger is the measured one.
+		// The fixed two-period fallback over-promised by ~0.75 ms (D < 0).
+		const uint64_t measured = comp_hub_d3d11_get_predicted_lookahead_ns(c->reroute.split);
+		if (measured != 0) {
+			lookahead_ns = (int64_t)measured;
+		}
+		comp_hub_d3d11_mark_wait_frame(c->reroute.split);
+	}
+#endif
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	// #1257 partition: panel period on purpose — see wait_frame's note on
 	// the double-pacing failure.
@@ -2804,6 +2816,18 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 		}
 		comp_d3d12_target_mark_wait_frame(c->target);
 	}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	else if (c->reroute.active && c->reroute.split != nullptr) {
+		// #2327: the #1264 reroute has no d3d12 target — the hub's target owns
+		// the weave and the present, so ITS #867 ledger is the measured one.
+		// The fixed two-period fallback over-promised by ~0.75 ms (D < 0).
+		const uint64_t measured = comp_hub_d3d11_get_predicted_lookahead_ns(c->reroute.split);
+		if (measured != 0) {
+			lookahead_ns = (int64_t)measured;
+		}
+		comp_hub_d3d11_mark_wait_frame(c->reroute.split);
+	}
+#endif
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	// #1257 partition: deliberately still the PANEL period, never D x period
 	// — the stretched period made well-behaved apps pace themselves on top
@@ -7175,6 +7199,13 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		comp_d3d12_target_set_display_period(
 		    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
 	}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	// #2327: and the hub's, whose governor drives the reroute's lookahead.
+	if (c->reroute.active && c->reroute.split != nullptr) {
+		comp_hub_d3d11_set_display_period(c->reroute.split,
+		                                  (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+	}
+#endif
 
 	// #868: start the repaint loop. It arms itself off the first non-zero-copy
 	// DP frame and is inert until then, so starting it here (before the display

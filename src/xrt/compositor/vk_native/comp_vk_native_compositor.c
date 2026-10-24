@@ -2312,6 +2312,18 @@ vk_compositor_predict_frame(struct xrt_compositor *xc,
 		}
 		comp_vk_native_target_mark_wait_frame(c->target);
 	}
+#ifdef XRT_OS_WINDOWS
+	else if (c->split != NULL) {
+		// #2327: under the split there is no VK target — the hub's target owns
+		// the weave and the present, so ITS #867 ledger is the measured one.
+		// The fixed two-period fallback over-promised by ~0.75 ms (D < 0).
+		const uint64_t measured = comp_hub_d3d11_get_predicted_lookahead_ns(c->split);
+		if (measured != 0) {
+			lookahead_ns = (int64_t)measured;
+		}
+		comp_hub_d3d11_mark_wait_frame(c->split);
+	}
+#endif
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	// #1257 partition: panel period on purpose — see wait_frame's note on
 	// the double-pacing failure.
@@ -2433,6 +2445,18 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 		}
 		comp_vk_native_target_mark_wait_frame(c->target);
 	}
+#ifdef XRT_OS_WINDOWS
+	else if (c->split != NULL) {
+		// #2327: under the split there is no VK target — the hub's target owns
+		// the weave and the present, so ITS #867 ledger is the measured one.
+		// The fixed two-period fallback over-promised by ~0.75 ms (D < 0).
+		const uint64_t measured = comp_hub_d3d11_get_predicted_lookahead_ns(c->split);
+		if (measured != 0) {
+			lookahead_ns = (int64_t)measured;
+		}
+		comp_hub_d3d11_mark_wait_frame(c->split);
+	}
+#endif
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	// #1257 partition: deliberately still the PANEL period, never D x period.
 	// Reporting the stretched period made well-behaved apps pace themselves
@@ -14506,6 +14530,12 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			void *cons = comp_hub_d3d11_get_consumer_fence_handle(c->split);
 			if (cons != NULL && !comp_vk_deposit_bind_consumer_fence(a2_dep, cons)) {
 				comp_hub_d3d11_leave_direct(c->split, COMP_HUB_INGRESS_REASON_DIRECT_FAILED);
+			}
+			if (c->display_refresh_rate > 0.0f) {
+				// #2327: the hub target's governor drives the #867 lookahead
+				// wait_frame now reads under the split.
+				comp_hub_d3d11_set_display_period(
+				    c->split, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
 			}
 			comp_hub_d3d11_log_placement(c->split, "vk");
 		}

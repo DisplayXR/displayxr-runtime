@@ -245,6 +245,20 @@ struct comp_hub_d3d11
 	bool direct_to_xbridge_failed;
 	uint32_t wire_fmt, wire_w, wire_h;
 
+	/*!
+	 * #2327: the predicted display time promised for each recent frame, keyed
+	 * by its hub `seq`, so a weave marks the latency CSV with the promise of
+	 * the frame it actually weaves — on the xbridge ring routes that can be an
+	 * earlier frame than the one most recently submitted.
+	 */
+	struct
+	{
+		uint64_t seq;
+		uint64_t pdt_ns;
+	} pdt_ring[8];
+	//! The `seq` whose promise @ref pdt_ring last recorded (first set per frame wins).
+	uint64_t pdt_seq;
+
 	//! Panel extent, for the placement line and the bridge's plane sizing.
 	uint32_t panel_w, panel_h;
 
@@ -1275,6 +1289,10 @@ static bool
 split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_rect *canvas);
 static void
 split_direct_to_xbridge(struct comp_hub_d3d11 *s, const char *reason);
+static void
+split_pdt_put(struct comp_hub_d3d11 *s, uint64_t seq, uint64_t pdt_ns);
+static uint64_t
+split_pdt_get(struct comp_hub_d3d11 *s, uint64_t seq);
 
 extern "C" xrt_result_t
 comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
@@ -3401,6 +3419,28 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 }
 
 /*!
+ * #2327: record @p pdt_ns as the promise for frame @p seq, and look one up.
+ * 0 = unknown (the weave then writes no D row rather than a mispaired one).
+ */
+static void
+split_pdt_put(struct comp_hub_d3d11 *s, uint64_t seq, uint64_t pdt_ns)
+{
+	auto &e = s->pdt_ring[seq % (sizeof(s->pdt_ring) / sizeof(s->pdt_ring[0]))];
+	e.seq = seq;
+	e.pdt_ns = pdt_ns;
+}
+
+static uint64_t
+split_pdt_get(struct comp_hub_d3d11 *s, uint64_t seq)
+{
+	if (seq == 0) {
+		return 0;
+	}
+	const auto &e = s->pdt_ring[seq % (sizeof(s->pdt_ring) / sizeof(s->pdt_ring[0]))];
+	return e.seq == seq ? e.pdt_ns : 0;
+}
+
+/*!
  * The DIRECT twin of the bridge weave below: one atlas, no slot to pick. The
  * crop-before-DP rule (ADR-030) still holds — the atlas is worst-case sized —
  * so a content box smaller than the texture is cropped on THIS device, the same
@@ -3500,10 +3540,11 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 	if (is_repaint) {
 		comp_d3d11_target_weave_mark_repaint(s->target, s->mode_3d);
 	} else {
-		// #2317 P1c: the caller's xrWaitFrame promise for this frame, so the
-		// DXR_WEAVE_LATENCY_CSV site emits the D (prediction error) rows the
-		// tiers' own sites do. 0 (never set) keeps the old no-D-row behaviour.
-		comp_d3d11_target_weave_mark(s->target, s->predicted_display_time_ns, s->mode_3d);
+		// #2317 P1c: the caller's xrWaitFrame promise for THIS frame (#2327:
+		// looked up by the woven frame's seq), so the DXR_WEAVE_LATENCY_CSV
+		// site emits the D (prediction error) rows the tiers' own sites do.
+		// 0 (never set) keeps the old no-D-row behaviour.
+		comp_d3d11_target_weave_mark(s->target, split_pdt_get(s, d.frame_seq), s->mode_3d);
 	}
 
 	xrt_display_processor_d3d11_set_frame_timing(s->dp, comp_d3d11_target_get_measured_weave_ns(s->target),
@@ -3762,7 +3803,14 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 		// #2317 P1c: the caller's xrWaitFrame promise for this frame, so the
 		// DXR_WEAVE_LATENCY_CSV site emits the D (prediction error) rows the
 		// tiers' own sites do. 0 (never set) keeps the old no-D-row behaviour.
-		comp_d3d11_target_weave_mark(s->target, s->predicted_display_time_ns, s->mode_3d);
+		// #2327: the promise of the frame that FILLED this slot (by its seq) —
+		// the newest weavable slot can be an earlier frame than the one most
+		// recently submitted, and pairing it with that frame's promise reads a
+		// period early. Unknown seq = no D row, never a mispaired one.
+		uint64_t slot_seq = 0;
+		const uint64_t pdt =
+		    comp_xbridge_slot_seq(s->xbridge, slot, &slot_seq) ? split_pdt_get(s, slot_seq) : 0;
+		comp_d3d11_target_weave_mark(s->target, pdt, s->mode_3d);
 	}
 
 	/*
@@ -3924,6 +3972,13 @@ comp_hub_d3d11_set_predicted_display_time(struct comp_hub_d3d11 *s, uint64_t pre
 {
 	if (s != nullptr) {
 		s->predicted_display_time_ns = predicted_display_time_ns;
+		// #2327: keyed by the frame just submitted (callers set this after
+		// comp_hub_d3d11_submit_atlas); the first set per frame wins, so a
+		// submit that nominated nothing never relabels the previous frame.
+		if (s->seq != 0 && s->seq != s->pdt_seq) {
+			split_pdt_put(s, s->seq, predicted_display_time_ns);
+			s->pdt_seq = s->seq;
+		}
 	}
 }
 
