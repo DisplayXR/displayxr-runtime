@@ -72,6 +72,10 @@ What the table implies:
 - **Where the rows do not differ:**
   - **Fast path.** A single-layer `_SRGB` frame skips the private target and is byte-identical to the old path. The predicate is `u_color_compose_fast_path()` in `auxiliary/util/u_color_encoding.h`.
   - **Zero-copy.** A UNORM source never takes zero-copy, because it still owes the encode.
+- **The D3D11 hub (ADR-059, Windows).** The hub adds no colour step of its own. Each in-process producer above (D3D11 shim, D3D12 #1264 reroute, VK split) renders its atlas by its own row, then hands the hub that **encoded** atlas. What happens at that import boundary (audited for #2342):
+  - **Atlas and planes are read through non-decoding views.** The hub's views of a producer atlas, a deposit ring slot, the crop scratch and the 2D planes are the UNORM member of their family (`split_nondecoding_format`). An `_SRGB` view would decode the encoded bytes, and the DP would weave linear values. A TYPELESS one cannot back a view. Every producer hands a typed UNORM texture today: the D3D11 renderer atlas and the D3D12 deposit are `R8G8B8A8_UNORM`; the VK deposit is `B8G8R8A8_UNORM` or `R8G8B8A8_UNORM` (or a #2273 deep format). So the rule holds by construction, not by the producer's current choice. The D3D11 shim's planes are the #1795 TYPELESS scratch with an `_SRGB` RTV sibling, viewed UNORM.
+  - **Crops are raw copies.** The ADR-030 crop-before-DP and the region-sized DP views are `CopySubresourceRegion` within one typeless family, a bit reinterpretation. The hub never blits through an `_SRGB` target. On the VK side, the producer's handoff from its private compose target into the deposit is `vkCmdCopyImage` when the atlas is `B8G8R8A8_UNORM` (the compose target's storage format). Any other atlas format (`R8G8B8A8_UNORM` or a deep one) takes a UNORM→UNORM/float blit, with no sRGB step on either side.
+  - **The post-weave Local2D composite and the HUD** are the same `comp_d3d11_outcomp` unit and UNORM back buffer the native D3D11 leg uses. Hub and native 2D pixels are byte-identical (#2335 oracles).
 - **Escape hatch.** `DXR_COLOR_LEGACY_UNORM_ENCODED=1` restores the passthrough reading process-wide. On Android set it with `adb shell setprop debug.xrt.DXR_COLOR_LEGACY_UNORM_ENCODED 1`. It is a diagnostic, not a setting.
 
 ### 2. What the app writes, per format
@@ -123,6 +127,7 @@ The helper keys on the *target's* format. Pinning a format and calling the helpe
 | vk_native | `$TMPDIR/displayxr_atlas_trigger` | `$TMPDIR/displayxr_atlas.png` |
 | Metal, GL | `/tmp/dxr_atlas_trigger` | `/tmp/dxr_atlas.png` |
 | D3D11 service | `%TEMP%\workspace_screenshot_trigger` | pre-weave `…_atlas_*.png` plus the post-weave file |
+| D3D11 hub (every hub route on Windows, #2342) | `%TEMP%\displayxr_atlas_trigger[.<exe>][.projection]` | the DP input (pre-weave, content-cropped) to `displayxr_atlas[.<exe>][.projection].png`; full triggers also write the post-weave back buffer to `displayxr_atlas[.<exe>].woven.png` |
 
 ### 6. What guards each row
 
