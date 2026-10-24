@@ -384,11 +384,14 @@ Focus is determined by `GetAsyncKeyState()` for reliability (avoids stuck keys f
 For creation tools on a 3D display (Substance 3D Modeler and the like), where
 holding CTRL / ALT to move a hand is too awkward to sculpt with. Opt-in per
 process: with `DXR_MOUSE_HAND=1` in the app's environment, the right controller
-stops following the keyboard and sits **under the cursor** over the 3D view, on
-the ray from the camera through the cursor, aimed along it
-(`qwerty_mouse_hand_pose`; the window reports the cursor through
-`qwerty_set_mouse_hand_cursor`). It starts at the zero-parallax distance, so the
-hand appears on the screen surface.
+stops following the keyboard and sits **under the cursor** over the 3D view. Each
+`xrLocateViews` hands qwerty the two head-relative views the app renders with
+(`qwerty_set_mouse_hand_views`); the virtual screen they project onto is solved
+from them (both eyes share its edges), the cursor (`qwerty_set_mouse_hand_cursor`,
+reported by the window) picks a point on it, and the hand sits on the ray from the
+centre eye through that point, aimed along it (`qwerty_mouse_hand_pose_from_views`).
+It starts on that screen — zero parallax, under the cursor in both eyes — so it
+works with off-axis, eye-tracked, window-fitted views.
 
 | Input | Action |
 |-------|--------|
@@ -396,7 +399,7 @@ hand appears on the screen surface.
 | LMB | Right trigger (MX Ink: tip force) |
 | RMB | Right grip / squeeze (MX Ink: middle cluster) — mouse look moves to MMB |
 | MMB + Drag | Rotate the camera |
-| Wheel | Hand depth: away from you = deeper, 10% per notch |
+| Wheel | Hand depth along the eye→cursor ray: away from you = deeper, 10% per notch (0.2–5× the screen distance) |
 | SHIFT + Wheel | IPD+Parallax ×/÷ 1.1, as before |
 | Back / Forward (XBUTTON1 / 2) | Right menu / system (MX Ink: front / back cluster) |
 | 1 / 2 / 3 | Left (support) hand menu / trigger / grip — not rendering modes |

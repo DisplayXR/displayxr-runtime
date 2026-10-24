@@ -4507,6 +4507,14 @@ locate_views_one(struct oxr_logger *log,
 	m_relation_chain_push_relation(&xrc, &T_base_xdev);
 	m_relation_chain_resolve(&xrc, &T_base_head);
 
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	// Mouse hand (DXR_MOUSE_HAND): the head-relative views the app renders
+	// with, so qwerty can put the hand on their virtual screen under the cursor.
+	if (located_view_count >= 2 && sess->sys->xsysd != NULL) {
+		qwerty_set_mouse_hand_views(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, poses, fovs);
+	}
+#endif
+
 
 	if (print) {
 		for (uint32_t i = 0; i < located_view_count; i++) {

@@ -661,12 +661,15 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 		struct qwerty_system *qs = qd->sys;
 		os_mutex_lock(&qs->view_lock);
 		if (qs->mouse_hand_cursor_valid) {
-			float depth = qs->mouse_hand_depth_m;
-			if (!(depth > 0.0f)) {
-				depth = qs->cam_convergence > 0.05f ? 1.0f / qs->cam_convergence : 0.6f;
+			const float scale = qs->mouse_hand_depth_scale > 0.0f ? qs->mouse_hand_depth_scale : 1.0f;
+			if (!qs->mouse_hand_views_valid ||
+			    !qwerty_mouse_hand_pose_from_views(qs->mouse_hand_u, qs->mouse_hand_v, scale,
+			                                       qs->mouse_hand_eyes, qs->mouse_hand_fovs, &self.pose)) {
+				const float depth =
+				    scale * (qs->cam_convergence > 0.05f ? 1.0f / qs->cam_convergence : 0.6f);
+				qwerty_mouse_hand_pose(qs->mouse_hand_u, qs->mouse_hand_v, qs->mouse_hand_aspect,
+				                       qs->cam_half_tan_vfov, depth, &self.pose);
 			}
-			qwerty_mouse_hand_pose(qs->mouse_hand_u, qs->mouse_hand_v, qs->mouse_hand_aspect,
-			                       qs->cam_half_tan_vfov, depth, &self.pose);
 			self.linear_velocity = (struct xrt_vec3){0, 0, 0};
 			self.angular_velocity = (struct xrt_vec3){0, 0, 0};
 			mouse_hand = true;
@@ -1673,6 +1676,87 @@ qwerty_mouse_hand_pose(float u, float v, float aspect, float half_tan_vfov, floa
 	math_quat_normalize(&out_pose->orientation);
 }
 
+//! Aim -Z along @p dir (normalised in place).
+static struct xrt_quat
+aim_along(struct xrt_vec3 *dir)
+{
+	const struct xrt_vec3 fwd = {0.0f, 0.0f, -1.0f};
+	math_vec3_normalize(dir);
+	struct xrt_vec3 axis;
+	math_vec3_cross(&fwd, dir, &axis);
+	struct xrt_quat q = {axis.x, axis.y, axis.z, 1.0f + m_vec3_dot(fwd, *dir)};
+	math_quat_normalize(&q);
+	return q;
+}
+
+bool
+qwerty_mouse_hand_pose_from_views(float u,
+                                  float v,
+                                  float depth_scale,
+                                  const struct xrt_pose eyes[2],
+                                  const struct xrt_fov fovs[2],
+                                  struct xrt_pose *out_pose)
+{
+	const struct xrt_vec3 e0 = eyes[0].position;
+	const struct xrt_vec3 e1 = eyes[1].position;
+	const float l0 = tanf(fovs[0].angle_left);
+	const float r0 = tanf(fovs[0].angle_right);
+	const float d0 = tanf(fovs[0].angle_down);
+	const float u0 = tanf(fovs[0].angle_up);
+	const float l1 = tanf(fovs[1].angle_left);
+	const float r1 = tanf(fovs[1].angle_right);
+
+	// Both eyes see the same screen edges: e0.x + l0 * D == e1.x + l1 * D.
+	float den = l0 - l1;
+	if (fabsf(den) < 1e-5f) {
+		den = r0 - r1;
+	}
+	if (fabsf(den) < 1e-5f) {
+		return false;
+	}
+	const float dist = (e1.x - e0.x) / den;
+	if (!(dist > 0.0f) || !isfinite(dist)) {
+		return false;
+	}
+
+	const float s = (u + 1.0f) * 0.5f;
+	const float t = (v + 1.0f) * 0.5f;
+	const struct xrt_vec3 on_screen = {
+	    e0.x + (l0 + (r0 - l0) * s) * dist,
+	    e0.y + (d0 + (u0 - d0) * t) * dist,
+	    e0.z - dist,
+	};
+	const struct xrt_vec3 centre = {(e0.x + e1.x) * 0.5f, (e0.y + e1.y) * 0.5f, (e0.z + e1.z) * 0.5f};
+	struct xrt_vec3 ray = {on_screen.x - centre.x, on_screen.y - centre.y, on_screen.z - centre.z};
+
+	out_pose->position = (struct xrt_vec3){
+	    centre.x + ray.x * depth_scale,
+	    centre.y + ray.y * depth_scale,
+	    centre.z + ray.z * depth_scale,
+	};
+	out_pose->orientation = aim_along(&ray);
+	return true;
+}
+
+void
+qwerty_set_mouse_hand_views(struct xrt_device **xdevs,
+                            size_t count,
+                            const struct xrt_pose poses[2],
+                            const struct xrt_fov fovs[2])
+{
+	struct qwerty_system *qs = find_qwerty_system(xdevs, count);
+	if (qs == NULL || !qs->mouse_hand) {
+		return;
+	}
+	os_mutex_lock(&qs->view_lock);
+	qs->mouse_hand_eyes[0] = poses[0];
+	qs->mouse_hand_eyes[1] = poses[1];
+	qs->mouse_hand_fovs[0] = fovs[0];
+	qs->mouse_hand_fovs[1] = fovs[1];
+	qs->mouse_hand_views_valid = true;
+	os_mutex_unlock(&qs->view_lock);
+}
+
 bool
 qwerty_is_mouse_hand(struct xrt_device *xdev)
 {
@@ -1709,13 +1793,10 @@ void
 qwerty_adjust_mouse_hand_depth(struct qwerty_system *qs, int steps)
 {
 	os_mutex_lock(&qs->view_lock);
-	float depth = qs->mouse_hand_depth_m;
-	if (!(depth > 0.0f)) {
-		depth = qs->cam_convergence > 0.05f ? 1.0f / qs->cam_convergence : 0.6f;
-	}
+	float scale = qs->mouse_hand_depth_scale > 0.0f ? qs->mouse_hand_depth_scale : 1.0f;
 	// Wheel away from you pushes the hand into the scene, 10% per notch.
-	depth *= powf(1.1f, (float)steps);
-	qs->mouse_hand_depth_m = depth < 0.05f ? 0.05f : (depth > 20.0f ? 20.0f : depth);
+	scale *= powf(1.1f, (float)steps);
+	qs->mouse_hand_depth_scale = scale < 0.2f ? 0.2f : (scale > 5.0f ? 5.0f : scale);
 	os_mutex_unlock(&qs->view_lock);
 }
 

@@ -334,6 +334,17 @@ qwerty_mouse_hand_enabled(struct xrt_device **xdevs, size_t xdev_count);
 void
 qwerty_set_mouse_hand_cursor(struct xrt_device **xdevs, size_t xdev_count, float u, float v, float aspect);
 
+/*!
+ * The two head-relative views (@p poses, @p fovs) the app was just given by
+ * xrLocateViews, so the mouse hand lands on the same virtual screen the views
+ * project onto. A no-op unless the mouse hand is on.
+ */
+void
+qwerty_set_mouse_hand_views(struct xrt_device **xdevs,
+                            size_t xdev_count,
+                            const struct xrt_pose poses[2],
+                            const struct xrt_fov fovs[2]);
+
 
 /*!
  * Enable or disable qwerty input processing (keyboard/mouse events).
