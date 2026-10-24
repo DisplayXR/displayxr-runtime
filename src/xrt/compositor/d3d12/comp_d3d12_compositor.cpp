@@ -1850,6 +1850,8 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	// The gate this bool exists for is Vulkan's (a timeline semaphore the
 	// runtime cannot enable after the fact); D3D12 fences always interop.
 	si.app_timeline_semaphores = true;
+	// #2317 P2a: this caller honours the DIRECT release contract (frame exit).
+	si.ring_direct = true;
 	si.render_packed_luid =
 	    ((uint64_t)(uint32_t)app_luid.HighPart << 32) | (uint64_t)(uint32_t)app_luid.LowPart;
 	si.display_screen_left = display_screen_left;
@@ -1902,6 +1904,20 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	// the plane copies promote from) — the arm's chains must match or the
 	// bind refuses on the typeless-family check.
 	comp_hub_d3d11_set_plane_format(c->reroute.split, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM);
+
+	/*
+	 * #2317 P2a: the reroute is same-adapter by construction, so the hub reads
+	 * the deposit ring DIRECT (no transport copy) unless DXR_HUB_INGRESS=xbridge.
+	 * Its reads are released on its own consumer fence, which this queue must
+	 * open to order a slot rewrite after them — no open, no DIRECT.
+	 */
+	{
+		void *cons = comp_hub_d3d11_get_consumer_fence_handle(c->reroute.split);
+		if (cons != nullptr && !comp_d3d12_deposit_bind_consumer_fence(c->reroute.dep, cons)) {
+			comp_hub_d3d11_leave_direct(c->reroute.split, COMP_HUB_INGRESS_REASON_DIRECT_FAILED);
+		}
+	}
+	comp_hub_d3d11_log_placement(c->reroute.split, "d3d12");
 
 	c->reroute.active = true;
 	c->split_off_reason = NULL;
@@ -6019,11 +6035,21 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			comp_hub_d3d11_stage_segment_content(c->reroute.split, &c->seg_content);
 			comp_hub_d3d11_submit_atlas(c->reroute.split, &rr_handoff, c->eff_layout.cols,
 			                            c->eff_layout.rows, c->eff_layout.tile_w, c->eff_layout.tile_h);
-			comp_d3d12_deposit_note_consumed(c->reroute.dep, rr_handoff.slot);
-			// The PLANE release edge, behind the pre_plane_write wait
-			// submit_atlas just recorded on the same D3D11 immediate
-			// context — one ordered stream, one signal for every plane.
-			comp_d3d12_deposit_note_planes_consumed(c->reroute.dep);
+			if (!comp_hub_d3d11_is_direct(c->reroute.split)) {
+				comp_d3d12_deposit_note_consumed(c->reroute.dep, rr_handoff.slot);
+				// The PLANE release edge, behind the pre_plane_write wait
+				// submit_atlas just recorded on the same D3D11 immediate
+				// context — one ordered stream, one signal for every plane.
+				comp_d3d12_deposit_note_planes_consumed(c->reroute.dep);
+			}
+			// #2317 P2a: DIRECT ingress — the hub owes each slot's release
+			// once it moves off it; the app queue's next write into that
+			// slot waits for it (comp_d3d12_deposit_advance, GPU-side).
+			uint32_t rel_slot = 0;
+			uint64_t rel_value = 0;
+			while (comp_hub_d3d11_take_slot_release(c->reroute.split, &rel_slot, &rel_value)) {
+				comp_d3d12_deposit_note_hub_release(c->reroute.dep, rel_slot, rel_value);
+			}
 		}
 
 		// The DP canvas: the effective canvas sub-rect when one is active,

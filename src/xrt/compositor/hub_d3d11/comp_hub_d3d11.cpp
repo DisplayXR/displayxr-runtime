@@ -72,6 +72,10 @@
  *
  */
 
+//! #2317 P2a: slots the DIRECT ingress can hold open per ring producer (both
+//! deposits run a ring of 2; headroom so a deeper ring needs no change here).
+#define COMP_HUB_D3D11_DIRECT_RING 4
+
 struct comp_hub_d3d11
 {
 	struct xrt_device *xdev;
@@ -128,6 +132,8 @@ struct comp_hub_d3d11
 	void *post_weave_userdata;
 	//! #2317 P1b: @ref comp_hub_d3d11_info::stable_atlas.
 	bool stable_atlas;
+	//! #2317 P2a: @ref comp_hub_d3d11_info::ring_direct.
+	bool ring_direct;
 	//! #2317 P1c: @ref comp_hub_d3d11_set_predicted_display_time.
 	uint64_t predicted_display_time_ns;
 
@@ -157,9 +163,11 @@ struct comp_hub_d3d11
 		uint32_t content_w, content_h;
 		uint64_t gen; //!< layout generation of the frame @ref tex holds
 		bool have_frame;
-		//! The producer frame (@ref prod_value) the crop scratch holds, 0 = none:
+		//! The producer frame (its hub `seq`) the crop scratch holds, 0 = none:
 		//! a repaint re-weaves the same frame, so it reuses the crop.
-		uint64_t cropped_value;
+		uint64_t cropped_seq;
+		//! The hub `seq` of the frame @ref have_frame nominates.
+		uint64_t frame_seq;
 		uint64_t frames;
 		uint64_t reopens;
 
@@ -203,7 +211,39 @@ struct comp_hub_d3d11
 		 */
 		bool publish_pending;
 		uint64_t publish_seq;
+		/*
+		 * #2317 P2a: the RING producers (VK deposit, D3D12 reroute). Each
+		 * deposit slot is opened on this device once per ring generation;
+		 * @ref cur names the slot the hub reads. Unused (ring=false) for the
+		 * stable atlas, which keeps @ref tex / @ref srv.
+		 */
+		bool ring;
+		//! The deposit is KEYED-MUTEX mode: no fences; each weave brackets
+		//! its reads with the slot's keyed mutex.
+		bool km;
+		struct
+		{
+			ID3D11Texture2D *tex;
+			ID3D11ShaderResourceView *srv;
+			IDXGIKeyedMutex *km; //!< KEYED-MUTEX mode only
+			uint64_t gen;        //!< the deposit ring generation it was opened at
+			uint32_t w, h;
+		} slots[COMP_HUB_D3D11_DIRECT_RING];
+		int32_t cur; //!< nominated slot, -1 = none
+		//! Per slot: the consumer-fence value the producer must wait for before
+		//! rewriting it, owed once the hub has moved off it (0 = nothing owed).
+		uint64_t release_owed[COMP_HUB_D3D11_DIRECT_RING];
+		uint64_t km_skips;
 	} direct;
+
+	/*!
+	 * #2317 P2a: why the ingress is xbridge (a `COMP_HUB_INGRESS_REASON_*`
+	 * token), NULL while DIRECT. And what a mid-session move to xbridge needs
+	 * to wire the bridge: the deposit's format and extent at A2.
+	 */
+	const char *ingress_reason;
+	bool direct_to_xbridge_failed;
+	uint32_t wire_fmt, wire_w, wire_h;
 
 	//! Panel extent, for the placement line and the bridge's plane sizing.
 	uint32_t panel_w, panel_h;
@@ -800,6 +840,28 @@ split_release_plane_view(struct comp_hub_d3d11::split_plane_view *v)
 static void
 split_segments_release(struct comp_hub_d3d11 *s);
 
+//! #2317 P2a: drop the ring slots opened on this device (not the fences).
+static void
+split_release_direct_slots(struct comp_hub_d3d11 *s)
+{
+	auto &d = s->direct;
+	for (uint32_t i = 0; i < COMP_HUB_D3D11_DIRECT_RING; i++) {
+		auto &e = d.slots[i];
+		if (e.km != NULL) {
+			e.km->Release();
+		}
+		if (e.srv != NULL) {
+			e.srv->Release();
+		}
+		if (e.tex != NULL) {
+			e.tex->Release();
+		}
+		memset(&e, 0, sizeof(e));
+	}
+	d.cur = -1;
+	d.have_frame = false;
+}
+
 //! Release the output half. Idempotent; leaves the borrowed app end alone.
 static void
 split_release_direct(struct comp_hub_d3d11 *s)
@@ -834,7 +896,9 @@ split_release_direct(struct comp_hub_d3d11 *s)
 	if (d.out_ctx4 != NULL) {
 		d.out_ctx4->Release();
 	}
+	split_release_direct_slots(s);
 	memset(&d, 0, sizeof(d));
+	d.cur = -1;
 }
 
 static void
@@ -1209,6 +1273,8 @@ split_submit_direct(struct comp_hub_d3d11 *s,
                     const struct comp_xbridge_recipe *rec);
 static bool
 split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_rect *canvas);
+static void
+split_direct_to_xbridge(struct comp_hub_d3d11 *s, const char *reason);
 
 extern "C" xrt_result_t
 comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
@@ -1323,6 +1389,8 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
 	s->panel_h = panel_h;
 	s->same_adapter = gate.same_adapter;
 	s->stable_atlas = info->stable_atlas;
+	s->ring_direct = info->ring_direct;
+	s->direct.cur = -1;
 	wcsncpy_s(s->out_desc, sdesc.Description, _TRUNCATE);
 
 	const char *reason = nullptr;
@@ -1416,48 +1484,14 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
 	return XRT_SUCCESS;
 }
 
-extern "C" bool
-comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11_handoff *handoff)
+/*!
+ * Wire comp_xbridge between the deposit's device (already recorded in @p s by
+ * @ref comp_hub_d3d11_wire_bridge) and the output device, and allocate the
+ * egress ring. Shared by Stage A2 and #2317 P2a's mid-session move off DIRECT.
+ */
+static bool
+split_wire_xbridge(struct comp_hub_d3d11 *s, uint32_t dxgi_format, uint32_t width, uint32_t height)
 {
-	if (s == nullptr || handoff == nullptr || handoff->d3d11_device == nullptr) {
-		U_LOG_W("VK output-device split: no deposit to bridge from (#1178)");
-		return false;
-	}
-
-	const uint64_t t0 = os_monotonic_get_ns();
-
-	s->app_dev = (ID3D11Device *)handoff->d3d11_device;
-	s->app_ctx = (ID3D11DeviceContext *)handoff->d3d11_context;
-	s->app_adapter = (IDXGIAdapter *)handoff->dxgi_adapter;
-
-	/*
-	 * The GPU-side ordering handle. Without it there is no way to make the
-	 * bridge's read wait for Vulkan's write except a CPU wait, which this rung
-	 * may not take — so its absence fails the wiring rather than degrading it.
-	 */
-	if (FAILED(s->app_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&s->app_ctx4)) ||
-	    s->app_ctx4 == nullptr) {
-		U_LOG_W("VK output-device split: the deposit's device has no ID3D11DeviceContext4, so the "
-		        "bridge cannot GPU-wait on the atlas fence (#1178)");
-		s->app_ctx4 = nullptr;
-		return false;
-	}
-
-	/*
-	 * #2317 P1b: a stable same-adapter atlas needs no transport at all — open it
-	 * on this device. Falls through to the bridge (Option I) if any piece of the
-	 * direct wiring is unavailable; DXR_HUB_INGRESS=xbridge forces the bridge,
-	 * as the A/B control.
-	 */
-	if (s->stable_atlas && s->same_adapter && !split_direct_forced_off()) {
-		if (split_wire_direct(s, handoff)) {
-			U_LOG_W("D3D11 hub: stage A2 (direct) took %.1f ms",
-			        (double)(os_monotonic_get_ns() - t0) / 1.0e6);
-			return true;
-		}
-		U_LOG_W("#2317 hub: DIRECT ingress unavailable on this device — taking the comp_xbridge route");
-	}
-
 	// Worst-case system atlas — the cross-adapter ring is sized for this once,
 	// so a mode switch never reallocates the heap mid-flight.
 	uint32_t sys_w = 0, sys_h = 0;
@@ -1466,8 +1500,8 @@ comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11
 		                              &sys_h);
 	}
 	if (sys_w == 0 || sys_h == 0) {
-		sys_w = handoff->width;
-		sys_h = handoff->height;
+		sys_w = width;
+		sys_h = height;
 	}
 
 	struct comp_xbridge_info xbi = {};
@@ -1504,7 +1538,7 @@ comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11
 	 * path. Everything downstream of this — the cross-adapter heap, the egress
 	 * ring, the display processor's SRV — is already format-agnostic.
 	 */
-	xbi.atlas_format = handoff->dxgi_format;
+	xbi.atlas_format = dxgi_format;
 
 	// The bridge's out_adapter is used for its own consumer D3D12 device, so it
 	// must be the scanout adapter the out device lives on.
@@ -1599,9 +1633,70 @@ comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11
 	        "once per frame (#918 VK-1)",
 	        s->out_desc, (unsigned long)s->out_luid.HighPart, (unsigned long)s->out_luid.LowPart,
 	        (unsigned long)s->render_luid.HighPart, (unsigned long)s->render_luid.LowPart);
-	U_LOG_W("VK output-device split: stage A2 (bridge) took %.1f ms",
-	        (double)(os_monotonic_get_ns() - t0) / 1.0e6);
 	return true;
+}
+
+extern "C" bool
+comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11_handoff *handoff)
+{
+	if (s == nullptr || handoff == nullptr || handoff->d3d11_device == nullptr) {
+		U_LOG_W("VK output-device split: no deposit to bridge from (#1178)");
+		return false;
+	}
+
+	const uint64_t t0 = os_monotonic_get_ns();
+
+	s->app_dev = (ID3D11Device *)handoff->d3d11_device;
+	s->app_ctx = (ID3D11DeviceContext *)handoff->d3d11_context;
+	s->app_adapter = (IDXGIAdapter *)handoff->dxgi_adapter;
+
+	/*
+	 * The GPU-side ordering handle. Without it there is no way to make the
+	 * bridge's read wait for Vulkan's write except a CPU wait, which this rung
+	 * may not take — so its absence fails the wiring rather than degrading it.
+	 */
+	if (FAILED(s->app_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&s->app_ctx4)) ||
+	    s->app_ctx4 == nullptr) {
+		U_LOG_W(
+		    "VK output-device split: the deposit's device has no ID3D11DeviceContext4, so the "
+		    "bridge cannot GPU-wait on the atlas fence (#1178)");
+		s->app_ctx4 = nullptr;
+		return false;
+	}
+
+	// What a mid-session move to xbridge (#2317 P2a) needs to wire the bridge.
+	s->wire_fmt = handoff->dxgi_format;
+	s->wire_w = handoff->width;
+	s->wire_h = handoff->height;
+
+	/*
+	 * #2317 P1b/P2a: on ONE adapter neither producer shape needs a transport —
+	 * open the atlas (the D3D11 tier's stable texture, or each ring slot of the
+	 * VK / D3D12 deposit) on this device and weave it in place. Falls through
+	 * to the bridge if any piece of the direct wiring is unavailable;
+	 * DXR_HUB_INGRESS=xbridge forces the bridge, as the A/B control.
+	 */
+	if (!s->same_adapter) {
+		s->ingress_reason = COMP_HUB_INGRESS_REASON_CROSS_ADAPTER;
+	} else if (split_direct_forced_off()) {
+		s->ingress_reason = COMP_HUB_INGRESS_REASON_FORCED;
+	} else if (!s->stable_atlas && !s->ring_direct) {
+		s->ingress_reason = COMP_HUB_INGRESS_REASON_PRODUCER;
+	} else if (split_wire_direct(s, handoff)) {
+		s->ingress_reason = nullptr;
+		U_LOG_W("D3D11 hub: stage A2 (direct) took %.1f ms", (double)(os_monotonic_get_ns() - t0) / 1.0e6);
+		return true;
+	} else {
+		s->ingress_reason = COMP_HUB_INGRESS_REASON_DIRECT_FAILED;
+		U_LOG_W("#2317 hub: DIRECT ingress unavailable on this device — taking the comp_xbridge route");
+	}
+
+	const bool ok = split_wire_xbridge(s, handoff->dxgi_format, handoff->width, handoff->height);
+	if (ok) {
+		U_LOG_W("VK output-device split: stage A2 (bridge) took %.1f ms",
+		        (double)(os_monotonic_get_ns() - t0) / 1.0e6);
+	}
+	return ok;
 }
 
 extern "C" void
@@ -1931,6 +2026,11 @@ comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *s,
                               uint32_t bd_w,
                               uint32_t bd_h)
 {
+	// #2317 P2a: real backdrop content on a RING producer needs the xbridge
+	// ingress (P2b carries planes on DIRECT for the stable atlas only).
+	if (s != nullptr && nt_handle != nullptr && content_seq != 0 && bd_w != 0 && bd_h != 0) {
+		split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_PLANES);
+	}
 	if (s == nullptr || !split_has_plane_transport(s)) {
 		return false;
 	}
@@ -2209,6 +2309,11 @@ comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *s,
                              bool opaque_present,
                              bool mask_is_plane)
 {
+	// #2317 P2a: a real Local2D composite on a RING producer needs the xbridge
+	// ingress (P2b carries planes on DIRECT for the stable atlas only).
+	if (s != nullptr && nt_handle != nullptr && content_seq != 0 && region_w != 0 && region_h != 0) {
+		split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_PLANES);
+	}
 	if (s == nullptr || !split_has_plane_transport(s)) {
 		return false;
 	}
@@ -2267,6 +2372,11 @@ comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *s,
 extern "C" bool
 comp_hub_d3d11_bind_mask_plane(struct comp_hub_d3d11 *s, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h)
 {
+	// #2317 P2a: an authored mask plane on a RING producer needs the xbridge
+	// ingress (P2b carries planes on DIRECT for the stable atlas only).
+	if (s != nullptr && nt_handle != nullptr && w != 0 && h != 0) {
+		split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_PLANES);
+	}
 	if (s == nullptr || !split_has_plane_transport(s)) {
 		return true; // nothing to bind against, and nothing broken
 	}
@@ -2514,7 +2624,10 @@ comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *s,
 	// #2317 P1b: a stable atlas is written on this very context (or, DIRECT, the
 	// fence is the hub's to wait on from its own context), so there is nothing to
 	// order here.
-	if (!s->stable_atlas && s->app_ctx4 != nullptr && handoff->fence != nullptr && handoff->fence_value != 0) {
+	// #2317 P2a: nor for a DIRECT ring producer — the hub waits on the
+	// producer's fence from its OWN context, at the weave.
+	if (!s->stable_atlas && !s->direct.active && s->app_ctx4 != nullptr && handoff->fence != nullptr &&
+	    handoff->fence_value != 0) {
 		s->app_ctx4->Wait((ID3D11Fence *)handoff->fence, handoff->fence_value);
 	}
 
@@ -3016,38 +3129,51 @@ split_direct_forced_off(void)
  * is required: without the producer fence the weave could read a half-written
  * atlas, and without the consumer fence the producer could overwrite one a
  * repaint is still reading — and neither may become a CPU wait (ADR-055).
+ *
+ * #2317 P2a: a RING producer (the VK deposit, the D3D12 reroute's deposit)
+ * takes the same two fences, except that the consumer fence is opened by the
+ * producer's OWN API (an `ID3D12Fence` / an imported Vulkan timeline) rather
+ * than on the deposit's D3D11 device — the producer's queue is what rewrites
+ * the slot. A KEYED-MUTEX deposit takes neither: its slot mutexes carry both
+ * edges.
  */
 static bool
 split_wire_direct(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11_handoff *handoff)
 {
 	auto &d = s->direct;
-	if (handoff->fence_shared_handle == nullptr || s->app_ctx4 == nullptr) {
+	const bool ring = !s->stable_atlas;
+	const bool km = ring && handoff->keyed_mutex != nullptr;
+	if ((!km && handoff->fence_shared_handle == nullptr) || s->app_ctx4 == nullptr) {
 		return false;
 	}
 
 	ID3D11Device5 *out5 = nullptr;
 	ID3D11Device5 *app5 = nullptr;
 	bool ok = SUCCEEDED(s->out_dev->QueryInterface(__uuidof(ID3D11Device5), (void **)&out5)) && out5 != nullptr &&
-	          SUCCEEDED(s->app_dev->QueryInterface(__uuidof(ID3D11Device5), (void **)&app5)) && app5 != nullptr &&
 	          SUCCEEDED(s->out_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&d.out_ctx4)) &&
 	          d.out_ctx4 != nullptr;
 	HRESULT hr = S_OK;
-	if (ok) {
+	if (ok && !km) {
 		hr = out5->OpenSharedFence((HANDLE)handoff->fence_shared_handle, __uuidof(ID3D11Fence),
 		                           (void **)&d.prod_fence);
 		ok = SUCCEEDED(hr) && d.prod_fence != nullptr;
 	}
-	if (ok) {
+	if (ok && !km) {
 		hr = out5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence), (void **)&d.cons_fence);
 		ok = SUCCEEDED(hr) && d.cons_fence != nullptr;
 	}
-	if (ok) {
+	if (ok && !km) {
 		hr = d.cons_fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &d.cons_handle);
 		ok = SUCCEEDED(hr) && d.cons_handle != nullptr;
 	}
-	if (ok) {
-		hr = app5->OpenSharedFence(d.cons_handle, __uuidof(ID3D11Fence), (void **)&d.cons_fence_app);
-		ok = SUCCEEDED(hr) && d.cons_fence_app != nullptr;
+	// The stable atlas is rewritten on the deposit's own D3D11 context, so
+	// that is where its back-fence wait lives (comp_hub_d3d11_pre_render).
+	if (ok && !ring) {
+		ok = SUCCEEDED(s->app_dev->QueryInterface(__uuidof(ID3D11Device5), (void **)&app5)) && app5 != nullptr;
+		if (ok) {
+			hr = app5->OpenSharedFence(d.cons_handle, __uuidof(ID3D11Fence), (void **)&d.cons_fence_app);
+			ok = SUCCEEDED(hr) && d.cons_fence_app != nullptr;
+		}
 	}
 	if (out5 != nullptr) {
 		out5->Release();
@@ -3061,13 +3187,85 @@ split_wire_direct(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11_handoff 
 		return false;
 	}
 
+	d.ring = ring;
+	d.km = km;
+	d.cur = -1;
 	d.active = true;
 	U_LOG_W(
 	    "D3D11 hub ACTIVE: weave/repaint/present move to '%ls' LUID=%08lx:%08lx (app "
 	    "device on LUID=%08lx:%08lx); the producer's atlas is read IN PLACE on this device — DIRECT "
-	    "ingress, no transport copy (#2317 P1b)",
+	    "ingress, no transport copy (#2317 %s)",
 	    s->out_desc, (unsigned long)s->out_luid.HighPart, (unsigned long)s->out_luid.LowPart,
-	    (unsigned long)s->render_luid.HighPart, (unsigned long)s->render_luid.LowPart);
+	    (unsigned long)s->render_luid.HighPart, (unsigned long)s->render_luid.LowPart,
+	    !ring ? "P1b" : (km ? "P2a, ring deposit, keyed-mutex mode" : "P2a, ring deposit, fence mode"));
+	return true;
+}
+
+/*!
+ * #2317 P2a: open ring slot @p idx on this device (once per ring generation).
+ * False leaves the slot unusable for this frame; the weave then presents
+ * nothing and the panel holds the last woven frame (#918 F4).
+ */
+static bool
+split_direct_open_slot(struct comp_hub_d3d11 *s, uint32_t idx, const struct comp_hub_d3d11_handoff *handoff)
+{
+	auto &e = s->direct.slots[idx];
+	if (e.tex != nullptr && e.gen == handoff->generation) {
+		return true;
+	}
+	if (e.km != nullptr) {
+		e.km->Release();
+	}
+	if (e.srv != nullptr) {
+		e.srv->Release();
+	}
+	if (e.tex != nullptr) {
+		e.tex->Release();
+	}
+	memset(&e, 0, sizeof(e));
+
+	ID3D11Device1 *od1 = nullptr;
+	HRESULT hr = E_NOINTERFACE;
+	if (SUCCEEDED(s->out_dev->QueryInterface(__uuidof(ID3D11Device1), (void **)&od1)) && od1 != nullptr) {
+		hr = od1->OpenSharedResource1((HANDLE)handoff->shared_handle, __uuidof(ID3D11Texture2D),
+		                              (void **)&e.tex);
+		od1->Release();
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	if (SUCCEEDED(hr) && e.tex != nullptr) {
+		e.tex->GetDesc(&td);
+		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+		sd.Format = td.Format;
+		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		sd.Texture2D.MipLevels = 1;
+		hr = s->out_dev->CreateShaderResourceView(e.tex, &sd, &e.srv);
+	}
+	if (SUCCEEDED(hr) && s->direct.km) {
+		hr = e.tex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&e.km);
+	}
+	if (FAILED(hr) || e.tex == nullptr || e.srv == nullptr || (s->direct.km && e.km == nullptr)) {
+		if (e.km != nullptr) {
+			e.km->Release();
+		}
+		if (e.srv != nullptr) {
+			e.srv->Release();
+		}
+		if (e.tex != nullptr) {
+			e.tex->Release();
+		}
+		memset(&e, 0, sizeof(e));
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W("#2317 hub: a deposit slot would not open on the hub device (hr=0x%08lx)",
+			        (unsigned long)hr);
+		}
+		return false;
+	}
+	e.gen = handoff->generation;
+	e.w = td.Width;
+	e.h = td.Height;
+	s->direct.reopens++;
 	return true;
 }
 
@@ -3085,6 +3283,41 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 	auto &d = s->direct;
 	// Every return that does not nominate this frame drops its recipe with it.
 	d.rec = {};
+
+	if (d.ring) {
+		/*
+		 * #2317 P2a: the hub moves OFF the slot it was reading. Every read of
+		 * it is already recorded (weaves and repaints are serialised with this
+		 * call), so the consumer fence's current value is that slot's release:
+		 * owe it to the producer, whose next write into the slot waits for it.
+		 * Keyed-mutex mode owes nothing — the slot mutex is the release.
+		 */
+		const uint32_t idx = handoff->slot % COMP_HUB_D3D11_DIRECT_RING;
+		if (d.cur >= 0 && (uint32_t)d.cur != idx && !d.km && d.cons_value != 0) {
+			d.release_owed[d.cur] = d.cons_value;
+		}
+		d.cur = -1;
+		d.have_frame = false;
+		if (handoff->shared_handle == nullptr || !split_direct_open_slot(s, idx, handoff)) {
+			return;
+		}
+		const auto &e = d.slots[idx];
+		if (content_w > e.w || content_h > e.h) {
+			return; // never weave a box the texture does not hold
+		}
+		d.cur = (int32_t)idx;
+		d.tex_w = e.w;
+		d.tex_h = e.h;
+		d.prod_value = d.km ? 0 : handoff->fence_value;
+		d.content_w = content_w;
+		d.content_h = content_h;
+		d.gen = s->layout_gen;
+		d.have_frame = true;
+		d.frames++;
+		d.frame_seq = ++s->seq;
+		return;
+	}
+
 	/*
 	 * #2317 review: the producer has ALREADY signalled this frame's value. Any
 	 * return below that does not nominate it must also drop the previous one —
@@ -3164,7 +3397,7 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 	}
 	d.have_frame = true;
 	d.frames++;
-	s->seq++;
+	d.frame_seq = ++s->seq;
 }
 
 /*!
@@ -3177,7 +3410,16 @@ static bool
 split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_rect *canvas)
 {
 	auto &d = s->direct;
-	if (s->target == nullptr || s->dp == nullptr || !d.have_frame || d.srv == nullptr) {
+	ID3D11ShaderResourceView *src_srv = d.srv;
+	IDXGIKeyedMutex *km = nullptr;
+	if (d.ring) {
+		src_srv = nullptr;
+		if (d.cur >= 0) {
+			src_srv = d.slots[d.cur].srv;
+			km = d.slots[d.cur].km;
+		}
+	}
+	if (s->target == nullptr || s->dp == nullptr || !d.have_frame || src_srv == nullptr) {
 		s->no_slot++;
 		return false;
 	}
@@ -3195,6 +3437,30 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 		return false;
 	}
 
+	// A repaint of the frame the crop scratch already holds re-reads the crop,
+	// not the atlas: one crop per PRODUCER frame, never one per weave.
+	const bool needs_crop = d.content_w != d.tex_w || d.content_h != d.tex_h;
+	const bool crop_cached = needs_crop && d.cropped_seq != 0 && d.cropped_seq == d.frame_seq &&
+	                         s->dp_input_srv != nullptr && s->dp_input_w == d.content_w &&
+	                         s->dp_input_h == d.content_h;
+	const bool reads_atlas = !crop_cached;
+
+	/*
+	 * #2317 P2a, KEYED-MUTEX deposits: the slot's mutex is the ordering, both
+	 * ways. Bounded and uncontended by construction (the producer re-enters a
+	 * slot only after the hub has moved off it, and its own acquire/release
+	 * ride its submit); a timeout SKIPS the weave — presents nothing, the panel
+	 * holds the last frame — and is counted, never waited out.
+	 */
+	if (km != nullptr && reads_atlas) {
+		const HRESULT km_hr = km->AcquireSync(0, 2);
+		if (km_hr != S_OK) {
+			d.km_skips++;
+			s->no_slot++;
+			return false;
+		}
+	}
+
 	/*
 	 * #2317 review: acquire FIRST. Everything after the first read of the
 	 * producer's atlas (the crop below, or the weave) must reach the consumer
@@ -3202,25 +3468,25 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 	 */
 	uint32_t target_index = 0;
 	if (comp_d3d11_target_acquire(s->target, &target_index) != XRT_SUCCESS) {
+		if (km != nullptr && reads_atlas) {
+			km->ReleaseSync(0);
+		}
 		s->no_slot++;
 		return false;
 	}
 
 	// THE ordering edge: GPU-side, this thread does not block.
-	if (d.prod_fence != nullptr && d.prod_value != 0) {
+	if (reads_atlas && d.prod_fence != nullptr && d.prod_value != 0) {
 		d.out_ctx4->Wait(d.prod_fence, d.prod_value);
 	}
 
-	ID3D11ShaderResourceView *atlas_srv = d.srv;
-	if (d.content_w != d.tex_w || d.content_h != d.tex_h) {
-		// A repaint of the frame the scratch already holds re-reads the crop,
-		// not the atlas: one crop per PRODUCER frame, never one per weave.
-		if (d.cropped_value != 0 && d.cropped_value == d.prod_value && s->dp_input_srv != nullptr &&
-		    s->dp_input_w == d.content_w && s->dp_input_h == d.content_h) {
+	ID3D11ShaderResourceView *atlas_srv = src_srv;
+	if (needs_crop) {
+		if (crop_cached) {
 			atlas_srv = s->dp_input_srv;
 		} else {
 			atlas_srv = split_crop_for_dp(s, atlas_srv, d.content_w, d.content_h);
-			d.cropped_value = (atlas_srv == s->dp_input_srv) ? d.prod_value : 0;
+			d.cropped_seq = (atlas_srv == s->dp_input_srv) ? d.frame_seq : 0;
 		}
 	}
 
@@ -3302,8 +3568,16 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 		// (backdrop view, weave, composite): release them back. Signalled
 		// after the composite, not after the weave, because the composite
 		// samples the Local2D and mask planes the producer rewrites next.
-		d.cons_value++;
-		d.out_ctx4->Signal(d.cons_fence, d.cons_value);
+		// #2317 P2a: a keyed-mutex ring deposit releases its slot mutex
+		// instead (no fences on that driver).
+		if (km != nullptr) {
+			if (reads_atlas) {
+				km->ReleaseSync(0);
+			}
+		} else if (d.cons_fence != nullptr) {
+			d.cons_value++;
+			d.out_ctx4->Signal(d.cons_fence, d.cons_value);
+		}
 
 		split_draw_hud(s, dst, tgt_w, tgt_h);
 		if (s->post_weave_fn != nullptr) {
@@ -3311,7 +3585,53 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 		}
 	}
 
-	return comp_d3d11_target_present(s->target, 1) == XRT_SUCCESS;
+	if (comp_d3d11_target_present(s->target, 1) != XRT_SUCCESS) {
+		// The consumer signal above is owed to a producer GPU wait: make sure
+		// it reaches the GPU even when the present (which flushes) failed.
+		s->out_ctx->Flush();
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * #2317 P2a: a RING producer's frame staged real 2D-plane content, which only
+ * the xbridge ingress carries. Wire the bridge FIRST (so a failure leaves the
+ * session exactly as it was: DIRECT, planes degraded alone), then stop reading
+ * the deposit directly. Called on the producer's thread before this frame's
+ * submit, so the frame that brought the planes is the first one bridged.
+ *
+ * The consumer fence and every release already owed stay alive: the producer
+ * still waits for the DIRECT era's last reads, and the slot the hub was on is
+ * owed now.
+ */
+static void
+split_direct_to_xbridge(struct comp_hub_d3d11 *s, const char *reason)
+{
+	auto &d = s->direct;
+	if (!d.active || !d.ring || s->xbridge != nullptr || s->direct_to_xbridge_failed) {
+		return;
+	}
+	const uint64_t t0 = os_monotonic_get_ns();
+	if (!split_wire_xbridge(s, s->wire_fmt, s->wire_w, s->wire_h)) {
+		s->direct_to_xbridge_failed = true;
+		U_LOG_W(
+		    "#2317 hub: 2D-plane content arrived but the comp_xbridge ingress could not be wired — the "
+		    "session stays on DIRECT ingress and its 2D planes do not composite; the 3D weave is "
+		    "unaffected");
+		return;
+	}
+	if (d.cur >= 0 && !d.km && d.cons_value != 0) {
+		d.release_owed[d.cur] = d.cons_value;
+	}
+	split_release_direct_slots(s);
+	d.active = false;
+	s->ingress_reason = reason;
+	U_LOG_W(
+	    "hub placement: CHANGED hub=1 ingress=xbridge reason=%s — this session's frames carry 2D-plane "
+	    "content, which the DIRECT ingress does not transport; the comp_xbridge ingress takes over for the "
+	    "rest of the session (wired in %.1f ms) (#2317 P2a)",
+	    reason, (double)(os_monotonic_get_ns() - t0) / 1.0e6);
 }
 
 extern "C" bool
@@ -3648,6 +3968,67 @@ comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *s)
 	return ((uint64_t)(uint32_t)s->out_luid.HighPart << 32) | (uint64_t)(uint32_t)s->out_luid.LowPart;
 }
 
+extern "C" void *
+comp_hub_d3d11_get_consumer_fence_handle(struct comp_hub_d3d11 *s)
+{
+	if (s == nullptr || !s->direct.ring) {
+		return nullptr;
+	}
+	return (void *)s->direct.cons_handle;
+}
+
+extern "C" bool
+comp_hub_d3d11_take_slot_release(struct comp_hub_d3d11 *s, uint32_t *out_slot, uint64_t *out_value)
+{
+	if (s == nullptr) {
+		return false;
+	}
+	for (uint32_t i = 0; i < COMP_HUB_D3D11_DIRECT_RING; i++) {
+		if (s->direct.release_owed[i] != 0) {
+			*out_slot = i;
+			*out_value = s->direct.release_owed[i];
+			s->direct.release_owed[i] = 0;
+			return true;
+		}
+	}
+	return false;
+}
+
+extern "C" void
+comp_hub_d3d11_leave_direct(struct comp_hub_d3d11 *s, const char *reason)
+{
+	if (s != nullptr) {
+		split_direct_to_xbridge(s, reason != nullptr ? reason : COMP_HUB_INGRESS_REASON_DIRECT_FAILED);
+	}
+}
+
+extern "C" const char *
+comp_hub_d3d11_ingress_reason(struct comp_hub_d3d11 *s)
+{
+	if (s == nullptr) {
+		return nullptr;
+	}
+	return s->direct.active ? nullptr : s->ingress_reason;
+}
+
+extern "C" void
+comp_hub_d3d11_log_placement(struct comp_hub_d3d11 *s, const char *producer)
+{
+	if (s == nullptr) {
+		return;
+	}
+	const char *why = comp_hub_d3d11_ingress_reason(s);
+	U_LOG_W(
+	    "hub placement: hub=1 render=%08lx:%08lx hub_dev=%08lx:%08lx ingress=%s%s%s — weave/present on the "
+	    "D3D11 hub's own device (#2317 P2a; %s ring deposit%s)",
+	    (unsigned long)s->render_luid.HighPart, (unsigned long)s->render_luid.LowPart,
+	    (unsigned long)s->out_luid.HighPart, (unsigned long)s->out_luid.LowPart,
+	    s->direct.active ? "direct" : "xbridge", why != nullptr ? " ingress_reason=" : "",
+	    why != nullptr ? why : "", producer != nullptr ? producer : "?",
+	    s->direct.active ? (s->direct.km ? ", keyed-mutex mode" : ", fence mode")
+	                     : "; DXR_HUB_INGRESS=xbridge is the A/B control");
+}
+
 extern "C" bool
 comp_hub_d3d11_repaint_admit(struct comp_hub_d3d11 *s)
 {
@@ -3674,8 +4055,9 @@ comp_hub_d3d11_render_diag(struct comp_hub_d3d11 *s)
 		s->diag_window_ns = dnow;
 		// #2317 P1b: no transport, so no xb_kb / ingress counters to report.
 		U_LOG_W(
-		    "[RENDER] split=1 hub_ingress=direct frames=%llu reopens=%llu no_slot=%llu out_crop=%llu "
-		    "(session totals)",
+		    "[RENDER] split=1 hub_ingress=direct ring=%d km=%d km_skips=%llu frames=%llu reopens=%llu "
+		    "no_slot=%llu out_crop=%llu (session totals)",
+		    s->direct.ring ? 1 : 0, s->direct.km ? 1 : 0, (unsigned long long)s->direct.km_skips,
 		    (unsigned long long)s->direct.frames, (unsigned long long)s->direct.reopens,
 		    (unsigned long long)s->no_slot, (unsigned long long)s->out_crop);
 		return;
@@ -4255,6 +4637,43 @@ comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split)
 {
 	(void)split;
 	return 0;
+}
+
+extern "C" void *
+comp_hub_d3d11_get_consumer_fence_handle(struct comp_hub_d3d11 *split)
+{
+	(void)split;
+	return NULL;
+}
+
+extern "C" bool
+comp_hub_d3d11_take_slot_release(struct comp_hub_d3d11 *split, uint32_t *out_slot, uint64_t *out_value)
+{
+	(void)split;
+	(void)out_slot;
+	(void)out_value;
+	return false;
+}
+
+extern "C" const char *
+comp_hub_d3d11_ingress_reason(struct comp_hub_d3d11 *split)
+{
+	(void)split;
+	return NULL;
+}
+
+extern "C" void
+comp_hub_d3d11_leave_direct(struct comp_hub_d3d11 *split, const char *reason)
+{
+	(void)split;
+	(void)reason;
+}
+
+extern "C" void
+comp_hub_d3d11_log_placement(struct comp_hub_d3d11 *split, const char *producer)
+{
+	(void)split;
+	(void)producer;
 }
 
 extern "C" void

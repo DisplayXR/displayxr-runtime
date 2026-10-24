@@ -213,10 +213,22 @@ struct comp_hub_d3d11_info
 	 * own split does (two copies, no staging). Either way the producer must call
 	 * @ref comp_hub_d3d11_pre_render before it rewrites the atlas.
 	 *
-	 * False (every ring deposit: the VK and D3D12 tiers) keeps the forced staged
-	 * ingress exactly as before.
+	 * False (every ring deposit: the VK and D3D12 tiers): on the SAME adapter
+	 * the hub reads each ring slot DIRECT (#2317 P2a — see
+	 * @ref comp_hub_d3d11_take_slot_release); across adapters, or with
+	 * `DXR_HUB_INGRESS=xbridge`, the forced staged ingress exactly as before.
 	 */
 	bool stable_atlas;
+
+	/*!
+	 * #2317 P2a: a RING producer that honours the DIRECT contract — it skips
+	 * its deposit's note_consumed calls while @ref comp_hub_d3d11_is_direct,
+	 * hands every @ref comp_hub_d3d11_take_slot_release to its deposit, and
+	 * opens @ref comp_hub_d3d11_get_consumer_fence_handle. A ring producer that
+	 * leaves it false stays on xbridge (`ingress_reason=producer_unsupported`),
+	 * because nothing would order its slot rewrites after the hub's reads.
+	 */
+	bool ring_direct;
 };
 
 /*!
@@ -811,9 +823,12 @@ comp_hub_d3d11_get_background_preview(struct comp_hub_d3d11 *split, struct xrt_d
 
 /*!
  * True when the hub reads the producer's atlas DIRECTLY on its own device
- * (same adapter, @ref comp_hub_d3d11_info::stable_atlas): no comp_xbridge, no
- * transport copy. The producer must then signal the handoff's fence after the
- * passes that write the atlas, and flush.
+ * (same adapter: the stable atlas, or since #2317 P2a a ring deposit's slot): no
+ * comp_xbridge, no transport copy. A stable-atlas producer must then signal the
+ * handoff's fence after the passes that write the atlas, and flush; a ring
+ * producer skips its deposit's note_consumed calls and takes the owed releases
+ * from @ref comp_hub_d3d11_take_slot_release instead. Can turn false mid-session
+ * (a ring producer's first 2D-plane frame), never back.
  */
 bool
 comp_hub_d3d11_is_direct(struct comp_hub_d3d11 *split);
@@ -855,6 +870,104 @@ comp_hub_d3d11_mark_wait_frame(struct comp_hub_d3d11 *split);
 //! Packed LUID (HighPart<<32 | LowPart) of the hub's own device, for the placement line.
 uint64_t
 comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split);
+
+/*!
+ * @name #2317 P2a: DIRECT ingress for the RING producers (the D3D12 #1264
+ * reroute and the Vulkan deposit)
+ *
+ * On ONE adapter the hub opens each deposit ring slot on its own device and
+ * weaves it in place: no comp_xbridge, no transport copy (xbridge's staged
+ * ingress paid three: staging, cross-adapter heap, egress). The default on a
+ * single adapter; `DXR_HUB_INGRESS=xbridge` is the A/B control and the one-line
+ * way back. Cross-adapter sessions always take xbridge.
+ *
+ * Synchronisation, all GPU-side (ADR-055):
+ * - **write -> read:** the producer signals the deposit's shared fence after
+ *   the atlas (as it always did); every hub weave of that slot waits for it on
+ *   the hub's immediate context.
+ * - **read -> rewrite:** the hub signals its OWN consumer fence after every
+ *   weave's reads (app and repaint). When the next app frame moves the hub off
+ *   a slot, that slot's last read value is OWED to the producer
+ *   (@ref comp_hub_d3d11_take_slot_release); the producer's next write into
+ *   the slot GPU-waits for it on the consumer fence it opened from
+ *   @ref comp_hub_d3d11_get_consumer_fence_handle. A separate fence rather than
+ *   the deposit's own, so each timeline has exactly one signaller and can never
+ *   step backwards.
+ * - **KEYED-MUTEX deposits** (no D3D12_FENCE import, e.g. Intel UHD Vulkan):
+ *   no fences at all. The hub brackets each weave's reads with the slot's own
+ *   keyed mutex (key 0, bounded acquire, skip-on-timeout — the deposit's
+ *   documented contract), which carries both edges. Uncontended by
+ *   construction: the producer only re-enters a slot after the hub has moved
+ *   off it.
+ *
+ * **Planes.** DIRECT carries projection only. The first frame that stages real
+ * 2D-plane content (Local2D, 2D-under backdrop, an authored mask) moves the
+ * session to the xbridge ingress for good (`hub placement: CHANGED ...
+ * ingress=xbridge reason=plane_content`) BEFORE that frame is submitted, so no
+ * frame ever loses its planes. If the bridge cannot be wired then, the session
+ * stays DIRECT and the planes degrade alone (the existing feature-local rule).
+ * @{
+ */
+
+//! `DXR_HUB_INGRESS=xbridge`: the A/B control / kill switch.
+#define COMP_HUB_INGRESS_REASON_FORCED "forced_by_env"
+//! Render and hub devices are on different adapters: xbridge is the transport.
+#define COMP_HUB_INGRESS_REASON_CROSS_ADAPTER "cross_adapter"
+//! DIRECT was eligible but a fence/texture/interface it needs was unavailable.
+#define COMP_HUB_INGRESS_REASON_DIRECT_FAILED "direct_wire_failed"
+//! Mid-session: a frame staged 2D-plane content, which only xbridge carries.
+#define COMP_HUB_INGRESS_REASON_PLANES "plane_content"
+//! A ring producer that does not declare @ref comp_hub_d3d11_info::ring_direct.
+#define COMP_HUB_INGRESS_REASON_PRODUCER "producer_unsupported"
+
+/*!
+ * NT handle of the hub's consumer fence (`ID3D11Fence`, created SHARED on the
+ * hub's device), or NULL when no ring producer runs DIRECT in fence mode. The
+ * producer opens it ONCE after @ref comp_hub_d3d11_wire_bridge; the handle stays
+ * valid for the hub's lifetime (it survives a demotion to xbridge, because
+ * releases owed from the DIRECT era are still waited on).
+ */
+void *
+comp_hub_d3d11_get_consumer_fence_handle(struct comp_hub_d3d11 *split);
+
+/*!
+ * Pop one owed slot release: the hub will never read @p out_slot again until
+ * the producer re-nominates it, and every read it recorded completes when the
+ * consumer fence reaches @p out_value. Call after every
+ * @ref comp_hub_d3d11_submit_atlas, in a loop until false, and hand each to the
+ * deposit (the producer's next write into that slot waits for it, GPU-side).
+ * Always false on xbridge-only and keyed-mutex sessions.
+ */
+bool
+comp_hub_d3d11_take_slot_release(struct comp_hub_d3d11 *split, uint32_t *out_slot, uint64_t *out_value);
+
+/*!
+ * Move a ring producer's session off DIRECT onto the xbridge ingress for good
+ * (the same one-time move 2D-plane content triggers), naming @p reason — for a
+ * producer that cannot honour the DIRECT contract, e.g. one whose API would not
+ * open the consumer fence. Call before the first frame is submitted, or at any
+ * app-frame boundary. No-op unless a ring producer runs DIRECT.
+ */
+void
+comp_hub_d3d11_leave_direct(struct comp_hub_d3d11 *split, const char *reason);
+
+/*!
+ * Why this session's ingress is xbridge (one of `COMP_HUB_INGRESS_REASON_*`),
+ * or NULL when it is DIRECT.
+ */
+const char *
+comp_hub_d3d11_ingress_reason(struct comp_hub_d3d11 *split);
+
+/*!
+ * The ONE `hub placement: hub=1 render=<luid> hub_dev=<luid> ingress=direct|xbridge
+ * [ingress_reason=<token>]` WARN for a ring producer's session, in the D3D11
+ * shim's format. Call once, after @ref comp_hub_d3d11_wire_bridge succeeded.
+ *
+ * @param producer "d3d12" or "vk" — prose only, after the parse fields.
+ */
+void
+comp_hub_d3d11_log_placement(struct comp_hub_d3d11 *split, const char *producer);
+/*! @} */
 
 /*!
  * Called on the weaving thread after every weave (app and repaint) and BEFORE
