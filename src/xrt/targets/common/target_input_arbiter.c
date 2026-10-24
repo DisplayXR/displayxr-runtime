@@ -10,6 +10,7 @@
 #include "target_input_plugin_loader.h"
 #include "target_input_pref.h"
 
+#include "xrt/xrt_config_drivers.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_input_plugin.h"
 #include "xrt/xrt_input_selection.h"
