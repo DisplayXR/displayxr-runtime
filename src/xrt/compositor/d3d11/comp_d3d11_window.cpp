@@ -835,8 +835,8 @@ embed_fit(struct comp_d3d11_window *w, HWND hwnd)
 
 /*!
  * UI peek, polled on the window thread. The cursor resting on (or a click
- * in) the host's client area that we leave uncovered, i.e. its menu bar,
- * hides the 3D view. On hover, not only on click: an app that stops running
+ * in) the host's client area directly above us, i.e. its menu bar, hides
+ * the 3D view. On hover, not only on click: an app that stops running
  * its UI while occluded (Modeler) drops a click that lands while we still
  * cover it. Esc or a few seconds without input shows the 3D again. Reads
  * global input state only; sends the app nothing.
@@ -863,10 +863,12 @@ embed_peek_tick(struct comp_d3d11_window *w, HWND hwnd)
 		RECT client;
 		RECT ours;
 		POINT local;
+		// The app's own UI strip above the 3D view (its menu bar / toolbar), whose
+		// dropdowns open over the view. Side panels beside the view never need it.
 		const bool on_app_ui = InterlockedCompareExchange(&w->embed_fullscreen, 0, 0) == 0 &&
 		                       GetCursorPos(&pt) && GetAncestor(WindowFromPoint(pt), GA_ROOT) == host &&
-		                       // Over the 3D view (input passed through to the app) is not the app's own UI.
-		                       !(GetWindowRect(hwnd, &ours) && PtInRect(&ours, pt)) &&
+		                       GetWindowRect(hwnd, &ours) && pt.y < ours.top && pt.x >= ours.left &&
+		                       pt.x < ours.right &&
 		                       // The title bar / frame moves the window; only the client area is its UI.
 		                       (local = pt, ScreenToClient(host, &local)) && GetClientRect(host, &client) &&
 		                       PtInRect(&client, local);
