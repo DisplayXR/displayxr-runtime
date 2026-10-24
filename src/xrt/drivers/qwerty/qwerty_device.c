@@ -1673,6 +1673,16 @@ qwerty_mouse_hand_pose(float u, float v, float aspect, float half_tan_vfov, floa
 }
 
 bool
+qwerty_is_mouse_hand(struct xrt_device *xdev)
+{
+	if (xdev == NULL || xdev->destroy != qwerty_destroy) {
+		return false;
+	}
+	struct qwerty_system *qs = qwerty_device(xdev)->sys;
+	return qs != NULL && qs->mouse_hand && xdev == &qs->rctrl->base.base;
+}
+
+bool
 qwerty_mouse_hand_enabled(struct xrt_device **xdevs, size_t count)
 {
 	struct qwerty_system *qs = find_qwerty_system(xdevs, count);

@@ -20,6 +20,10 @@
 
 #include "util/u_logging.h"
 
+#ifdef XRT_BUILD_DRIVER_QWERTY
+#include "qwerty/qwerty_interface.h"
+#endif
+
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -548,6 +552,15 @@ profile_to_report_locked(const struct t_input_candidate *winner, struct xrt_devi
 	if (winner->iface != NULL) {
 		return xdev->name; // A real provider reports itself.
 	}
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	// The mouse hand (DXR_MOUSE_HAND) is a deliberate input the user chose,
+	// not a stand-in waiting for a provider: report its own profiles (MX Ink
+	// first) rather than masquerading as an idle provider's.
+	if (qwerty_is_mouse_hand(xdev)) {
+		return xdev->name;
+	}
+#endif
 
 	// The floor won: find the top-ranked provider candidate's device
 	// for this hand (either hand as a fallback — the profile is a

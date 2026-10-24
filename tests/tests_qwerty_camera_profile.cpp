@@ -6,6 +6,8 @@
 #include "util/u_camera_profile.h"
 #include "math/m_api.h"
 
+#include <cmath>
+
 namespace {
 struct Devices
 {

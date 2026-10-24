@@ -318,6 +318,10 @@ qwerty_get_view_state(struct xrt_device **xdevs,
 bool
 qwerty_set_camera_profile(struct xrt_device **xdevs, size_t xdev_count, const struct u_camera_profile *profile);
 
+//! Is @p xdev the qwerty right controller while the mouse hand drives it?
+bool
+qwerty_is_mouse_hand(struct xrt_device *xdev);
+
 //! Is the mouse hand (DXR_MOUSE_HAND) on for the qwerty system in @p xdevs?
 bool
 qwerty_mouse_hand_enabled(struct xrt_device **xdevs, size_t xdev_count);
