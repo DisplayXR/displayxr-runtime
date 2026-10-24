@@ -844,10 +844,13 @@ embed_peek_tick(struct comp_d3d11_window *w, HWND hwnd)
 	if (host == NULL) {
 		return;
 	}
-	const bool lbutton = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-	const bool escape = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-	const bool clicked = lbutton && !w->peek_lbutton_down;
-	const bool escaped = escape && !w->peek_escape_down;
+	// Bit 0 = "pressed since the last call": catches a press shorter than the poll.
+	const SHORT lstate = GetAsyncKeyState(VK_LBUTTON);
+	const SHORT estate = GetAsyncKeyState(VK_ESCAPE);
+	const bool lbutton = (lstate & 0x8000) != 0;
+	const bool escape = (estate & 0x8000) != 0;
+	const bool clicked = (lbutton && !w->peek_lbutton_down) || (!lbutton && (lstate & 1) != 0);
+	const bool escaped = (escape && !w->peek_escape_down) || (!escape && (estate & 1) != 0);
 	w->peek_lbutton_down = lbutton;
 	w->peek_escape_down = escape;
 
