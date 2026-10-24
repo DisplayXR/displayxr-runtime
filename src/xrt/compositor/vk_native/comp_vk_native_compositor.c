@@ -5340,7 +5340,7 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 
 static void
 vk_split_composite_window_space(struct comp_vk_native_compositor *c);
-static void
+static bool
 vk_split_encode_atlas_pq(struct comp_vk_native_compositor *c);
 //! VK-1b-3 - this frame's authoritative app-authored mask, and the ensure that
 //! must run BEFORE any command is recorded. Defined with the zone helpers.
@@ -13077,7 +13077,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		 * window-space pass and before the handoff, so the bridge carries a PQ
 		 * atlas to the split's D3D11 weaver, which was told PQ.
 		 */
-		vk_split_encode_atlas_pq(c);
+		const bool pq_frame_ok = vk_split_encode_atlas_pq(c);
 
 		/*
 		 * VK-1b — the PLANE pass, before the handoff is taken.
@@ -13112,18 +13112,26 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		struct comp_hub_d3d11_handoff handoff = {0};
 		struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
 		if (comp_vk_deposit_get_handoff(dep, &handoff)) {
-			// #1883: the slot carries this frame's segment partition (by its seq).
-			comp_hub_d3d11_stage_segment_content(c->split, &c->seg_content);
-			comp_hub_d3d11_submit_atlas(c->split, &handoff, c->eff_layout.cols, c->eff_layout.rows,
-			                            c->eff_layout.tile_w, c->eff_layout.tile_h);
-			// #2317 P2a review: only a handed-off slot may be advanced past.
-			comp_vk_deposit_note_handed(dep);
+			if (pq_frame_ok) {
+				// #1883: the slot carries this frame's segment partition (by its seq).
+				comp_hub_d3d11_stage_segment_content(c->split, &c->seg_content);
+				comp_hub_d3d11_submit_atlas(c->split, &handoff, c->eff_layout.cols, c->eff_layout.rows,
+				                            c->eff_layout.tile_w, c->eff_layout.tile_h);
+				// #2317 P2a review: only a handed-off slot may be advanced past.
+				comp_vk_deposit_note_handed(dep);
+			} else {
+				// #2340: an atlas the DP was told is PQ but that missed the
+				// pass. Not handed over, so nothing new is woven (F4) and the
+				// next frame re-renders this slot.
+				U_LOG_I("DXR_ATLAS_ENCODING=pq (#2340): PQ pass skipped this frame - slot not handed over");
+			}
 			if (!comp_hub_d3d11_is_direct(c->split)) {
 				/*
 				 * The slot is free again the instant the bridge's staging copy
 				 * has been recorded on this same immediate context — release it
 				 * so Vulkan's next write into it is ordered, not merely likely.
-				 * Queued signal; nothing waits here.
+				 * Queued signal; nothing waits here. (A slot held back above
+				 * was never read, so releasing it is immediate and harmless.)
 				 */
 				comp_vk_deposit_note_consumed(dep, handoff.slot);
 				/*
@@ -19247,18 +19255,22 @@ vk_split_composite_window_space(struct comp_vk_native_compositor *c)
  * it. A repaint replays inside the split over a slot already encoded.
  *
  * A ring with every entry still in flight skips the encode for that frame
- * rather than stall (the #925 rule), and that frame then weaves an atlas
- * declared PQ that is not. The CPU-paced frame structure the ring relies on
- * makes that practically unreachable; it is a one-frame artefact, never a
- * wedge.
+ * rather than stall (the #925 rule). The DP has been told PQ, so an atlas
+ * that missed the pass must not reach it: false tells the caller to release
+ * the slot without handing it over, and that frame presents nothing (#918 F4),
+ * leaving the last encoded frame on the panel. The CPU-paced frame structure
+ * the ring relies on makes it practically unreachable.
+ *
+ * @return false only when PQ is in effect and this frame's atlas was NOT
+ *         encoded; true otherwise (encoded, or PQ not in effect).
  */
-static void
+static bool
 vk_split_encode_atlas_pq(struct comp_vk_native_compositor *c)
 {
 	struct vk_bundle *vk = &c->vk;
 
 	if (!vk_pq_requested() || c->split == NULL || c->renderer == NULL) {
-		return;
+		return true;
 	}
 	if (!c->pq_split_checked) {
 		c->pq_split_checked = true;
@@ -19274,22 +19286,26 @@ vk_split_encode_atlas_pq(struct comp_vk_native_compositor *c)
 		}
 	}
 	if (!c->pq_split_active) {
-		return;
+		return true;
 	}
 	struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
 	if (dep == NULL) {
-		return;
+		return false;
 	}
 	if (!vk_split_cmd_ring_ensure(c, &c->pq_cmd_pool, c->pq_cmd, c->pq_cmd_value, &c->pq_cmd_next, "PQ encode")) {
-		return;
+		// No ring at all is permanent, unlike a busy one: stop declaring PQ.
+		U_LOG_W("DXR_ATLAS_ENCODING=pq (#2340, experimental): no command ring for the PQ pass - PQ off");
+		c->pq_split_active = false;
+		comp_hub_d3d11_set_atlas_encoding(c->split, XRT_ATLAS_ENCODING_ENCODED);
+		return true;
 	}
 	const int32_t ring = vk_split_cmd_ring_take(c, dep, c->pq_cmd_value, &c->pq_cmd_next);
 	if (ring < 0) {
-		return; // every entry still in flight: see above
+		return false; // every entry still in flight: see above
 	}
 	const VkCommandBuffer cmd = c->pq_cmd[ring];
 	if (vk->vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) {
-		return;
+		return false;
 	}
 	VkCommandBufferBeginInfo begin_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -19303,7 +19319,7 @@ vk_split_encode_atlas_pq(struct comp_vk_native_compositor *c)
 		U_LOG_W("DXR_ATLAS_ENCODING=pq (#2340, experimental): the PQ pass is unavailable - PQ off");
 		c->pq_split_active = false;
 		comp_hub_d3d11_set_atlas_encoding(c->split, XRT_ATLAS_ENCODING_ENCODED);
-		return;
+		return true; // PQ is off from here on, so this sRGB atlas is declared right
 	}
 
 	VkSemaphore sem = VK_NULL_HANDLE;
@@ -19329,12 +19345,13 @@ vk_split_encode_atlas_pq(struct comp_vk_native_compositor *c)
 		if (sem != VK_NULL_HANDLE) {
 			comp_vk_deposit_abandon_signal(dep);
 		}
-		return;
+		return false;
 	}
 	if (sem == VK_NULL_HANDLE && vk->vkQueueWaitIdle != NULL) {
 		vk->vkQueueWaitIdle(vk->main_queue->queue);
 	}
 	c->pq_cmd_value[ring] = signal_value;
+	return true;
 }
 
 /*!
