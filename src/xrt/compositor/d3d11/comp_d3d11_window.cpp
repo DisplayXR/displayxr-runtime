@@ -76,8 +76,9 @@ static const wchar_t *const kHostedViewRectProp = L"DXR_HostedViewRect";
 DEBUG_GET_ONCE_BOOL_OPTION(hosted_ui_peek, "DXR_HOSTED_UI_PEEK", true)
 
 // Live stereo depth for an embedded app, set by any helper (a depth slider)
-// as a property on the app's main window: strength (IPD/parallax factor,
-// 1 = nominal) x 1000 | convergence distance in mm << 16; a 0 field leaves
+// as a property on the app's main window: strength (stereo relative to the
+// app's own seeded rig, 1 = its nominal) x 1000 | convergence distance in
+// mm << 16; a 0 field leaves
 // that setting alone. The runtime applies it on its 250 ms rect poll and
 // publishes the values in effect, same packing, as DXR_HostedDepthNow on the
 // same window, so a slider can start from them.

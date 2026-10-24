@@ -319,17 +319,20 @@ bool
 qwerty_set_camera_profile(struct xrt_device **xdevs, size_t xdev_count, const struct u_camera_profile *profile);
 
 /*!
- * Set the stereo depth live, as absolute values: @p strength is the IPD and
- * parallax factor (1 = the rig's nominal stereo; clamped to the same comfort
- * limits as the keyboard controls), @p convergence_m the distance of the
- * zero-parallax plane in metres (camera mode only). A value <= 0 leaves that
- * setting as it is. Returns false without a qwerty system.
+ * Set the stereo depth live: @p strength scales the IPD and parallax factors
+ * the app's camera profile seeded (1 = the app's own nominal stereo, whatever
+ * its rig; clamped to the same comfort limits as the keyboard controls),
+ * @p convergence_m is the distance of the zero-parallax plane in metres
+ * (camera mode only; on a camera rig this also rescales the world, so it is
+ * not a pure shift of the screen plane). A value <= 0 leaves that setting as
+ * it is. Returns false without a qwerty system.
  */
 bool
 qwerty_set_depth(struct xrt_device **xdevs, size_t xdev_count, float strength, float convergence_m);
 
 /*!
- * The current stereo depth: @p out_strength (IPD/parallax factor) and
+ * The current stereo depth: @p out_strength (relative to the seeded factor, as
+ * qwerty_set_depth takes it) and
  * @p out_convergence_m (0 in display mode). Returns false without a qwerty system.
  */
 bool
