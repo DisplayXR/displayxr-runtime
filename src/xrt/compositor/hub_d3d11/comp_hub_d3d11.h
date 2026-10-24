@@ -750,6 +750,65 @@ bool
 comp_hub_d3d11_repaint_admit(struct comp_hub_d3d11 *split);
 
 /*!
+ * @name #2342 P2c: the hub's ONE repaint pacer and admission
+ *
+ * Every hub route (the D3D11 shim, the D3D12 #1264 reroute, the Vulkan split)
+ * replays through these, so the pacing and the admission are the hub's, read
+ * once, and identical across routes: the native D3D11 leg's shape, which is
+ * the reference (`[WITNESS]` repaint rates under the frame divisor and under
+ * `DXR_WEAVE_REPAINT_FORCE=1`).
+ *
+ *  1. **Pace, unlocked** (skipped by the caller under an ENGAGED #1257
+ *     partition, whose schedule IS the pacing — as natively):
+ *     @ref comp_hub_d3d11_repaint_pace_hold under the compositor lock, then
+ *     @ref comp_hub_d3d11_repaint_pace_wait without it. That is
+ *     comp_d3d11_target_repaint_pace on the hub's target — the scanout wait
+ *     plus the #884 late-weave sleep to `period - R` — made safe against a
+ *     hub retire that runs while the repaint thread is sleeping. Before P2c
+ *     the three hub routes skipped pacing altogether ("no app-side target"),
+ *     so a forced repaint tried at the loop's free-running tick and the #1339
+ *     admission refused it every time: the 0/s of #2321 surprise 6.
+ *  2. **Fire, under the lock:** @ref comp_hub_d3d11_repaint — the
+ *     has-a-frame test, the #1339 frame-latency admission (skipped under an
+ *     engaged partition, as natively), then the replay weave.
+ *
+ * The tier keeps the parts that are its own state: armed / app-frame-in-
+ * progress, the #1257 cadence gate and DXR_WEAVE_REPAINT_FORCE, and its trace
+ * counters. The late-weave knob itself (`DXR_LATE_WEAVE`) is read once, by the
+ * hub's target (comp_d3d11_target): no tier reads its own copy on a hub route.
+ * @{
+ */
+void *
+comp_hub_d3d11_repaint_pace_hold(struct comp_hub_d3d11 *split);
+
+void
+comp_hub_d3d11_repaint_pace_wait(void *hold);
+
+//! What @ref comp_hub_d3d11_repaint did — a closed set the tiers map onto
+//! their own trace counters.
+enum comp_hub_d3d11_repaint_result
+{
+	//! The replay was woven and presented.
+	COMP_HUB_D3D11_REPAINT_FIRED = 0,
+	//! Nothing woven yet to replay (warmup, or an app frame that refused).
+	COMP_HUB_D3D11_REPAINT_NO_FRAME,
+	//! #1339: the present queue is at the frame-latency cap; skip this tick.
+	COMP_HUB_D3D11_REPAINT_NOT_ADMITTED,
+	//! A fire that presented nothing (#918 F4/F7: no ready slot); the panel
+	//! holds the last frame. Counts as a fire for spacing.
+	COMP_HUB_D3D11_REPAINT_NOT_WOVEN,
+};
+
+/*!
+ * One replay attempt. Call under the compositor mutex, after the tier's own
+ * armed / in-progress / gate tests. @p partition_engaged skips the admission
+ * exactly as the native leg does (the #1257 schedule owns the slots).
+ */
+enum comp_hub_d3d11_repaint_result
+comp_hub_d3d11_repaint(struct comp_hub_d3d11 *split, bool partition_engaged, const struct xrt_rect *canvas);
+/*! @} */
+
+/*!
  * #1482: @ref comp_d3d11_target_set_app_paced on the arm's own target — the
  * fill arm's app frames block on THAT chain's frame-latency waitable, so it is
  * that target which must stop draining surplus tokens while the #1257 grid is

@@ -10346,6 +10346,22 @@ vk_repaint_thread(void *ptr)
 			if (!comp_hub_d3d11_has_weave_slot(c->split)) {
 				continue;
 			}
+			/*
+			 * #2342 P2c: the HUB paces the replay, on its own target — the
+			 * native D3D11 leg's pacer (scanout wait + #884 late sleep), held
+			 * under the lock so a retire cannot free what the unlocked wait
+			 * reads. Skipped under an ENGAGED #1257 partition (the schedule IS
+			 * the pacing), as natively. Before P2c the split replay had none.
+			 */
+			if (c->repaint.partition.next_release_ns == 0) {
+				void *hold = NULL;
+				os_mutex_lock(&c->mutex);
+				if (c->split != NULL) {
+					hold = comp_hub_d3d11_repaint_pace_hold(c->split);
+				}
+				os_mutex_unlock(&c->mutex);
+				comp_hub_d3d11_repaint_pace_wait(hold);
+			}
 			const uint64_t fire_t0 = os_monotonic_get_ns();
 			os_mutex_lock(&c->mutex);
 			if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
@@ -10354,18 +10370,20 @@ vk_repaint_thread(void *ptr)
 				os_mutex_unlock(&c->mutex);
 				continue;
 			}
-			// #1339: no fill into the arm's flip queue while it holds a
-			// pending present (see comp_d3d11_target_repaint_admit).
-			if (c->repaint.partition.next_release_ns == 0 && !comp_hub_d3d11_repaint_admit(c->split)) {
-				u_repaint_trace_bail_gate(&c->repaint.trace);
-				os_mutex_unlock(&c->mutex);
-				continue;
-			}
+			// #1339 / #2342 P2c: the hub's one admission + replay — no fill
+			// into the arm's flip queue while it holds a pending present (see
+			// comp_d3d11_target_repaint_admit).
 			const struct xrt_rect rp_canvas = vk_dp_canvas_rect(c);
 			// #1339: spacing is stamped from the START of the fire (fire_t0/t1
 			// keep measuring DURATION for the trace).
 			const uint64_t rp_start_ns = os_monotonic_get_ns();
-			(void)comp_hub_d3d11_weave_and_present(c->split, /*is_repaint=*/true, &rp_canvas);
+			const enum comp_hub_d3d11_repaint_result rr =
+			    comp_hub_d3d11_repaint(c->split, c->repaint.partition.next_release_ns != 0, &rp_canvas);
+			if (rr == COMP_HUB_D3D11_REPAINT_NOT_ADMITTED || rr == COMP_HUB_D3D11_REPAINT_NO_FRAME) {
+				u_repaint_trace_bail_gate(&c->repaint.trace);
+				os_mutex_unlock(&c->mutex);
+				continue;
+			}
 			c->repaint.count++;
 			const uint64_t fire_t1 = os_monotonic_get_ns();
 			u_repaint_gate_note_repaint(&c->repaint.gate, rp_start_ns);
