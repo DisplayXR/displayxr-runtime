@@ -605,6 +605,44 @@ split_make_dp(struct comp_hub_d3d11 *s)
  * degraded feature, never a broken frame.
  */
 /*!
+ * #2342 P2c, ADR-044 at the import boundary: the NON-DECODING view format of a
+ * producer surface the hub samples (the atlas, a ring slot, the crop scratch, a
+ * plane). Every producer atlas holds ENCODED bytes (ADR-044 §1, "Atlas the DP
+ * receives: encoded"), and every 2D plane holds the encoded flatten, so the
+ * hub must read them through the UNORM member of their family: an `_SRGB` view
+ * would decode them (the DP would weave linear values — too dark), and a
+ * TYPELESS format cannot back a view at all (the open would fail and DIRECT
+ * would fall to xbridge, or the crop would silently fall back uncropped).
+ *
+ * Today every producer hands a typed UNORM texture (the D3D11 renderer atlas
+ * R8G8B8A8_UNORM, the D3D12 deposit R8G8B8A8_UNORM, the VK deposit
+ * B8G8R8A8_UNORM / R8G8B8A8_UNORM / the #2273 deep formats), so this maps each to
+ * itself; it exists so the hub's view is the honest one by construction, not by
+ * the producer's current choice. The D3D11 shim's planes are already the
+ * #1795 TYPELESS scratch with an `_SRGB` RTV sibling, viewed UNORM here.
+ *
+ * Mirrors d3d_dxgi_format_to_unorm_sample (aux_d3d), which this Vulkan-free
+ * unit cannot include (that header pulls in the Vulkan headers).
+ */
+static DXGI_FORMAT
+split_nondecoding_format(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+	// The #2273 deep atlas is RGBA16F; a typeless 16-bit surface is viewed so.
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+	case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
+	default: return f;
+	}
+}
+
+/*!
  * The format the DP is told for the atlas it weaves: the SRV's own, when the
  * split carries a deep atlas (#2273: R10G10B10A2 / RGBA16F), else the 8-bit
  * value it always declared. Twin of the in-process d3d11_dp_view_format.
@@ -659,7 +697,8 @@ split_plane_dp_view(struct comp_hub_d3d11 *s,
 	 */
 	D3D11_SHADER_RESOURCE_VIEW_DESC psd = {};
 	psrv->GetDesc(&psd);
-	const DXGI_FORMAT src_fmt = psd.Format;
+	// #2342 P2c (ADR-044): never a decoding view of an encoded plane.
+	const DXGI_FORMAT src_fmt = split_nondecoding_format(psd.Format);
 
 	// Passthrough: the plane is exactly what the display processor asked for.
 	if (pd.Width == w && pd.Height == h) {
@@ -1902,7 +1941,8 @@ split_direct_bind_plane(struct comp_hub_d3d11 *s, uint32_t plane, void *handle, 
 		D3D11_TEXTURE2D_DESC td = {};
 		p.tex->GetDesc(&td);
 		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-		sd.Format = fmt;
+		// #2342 P2c (ADR-044): the non-decoding member, whatever was asked.
+		sd.Format = split_nondecoding_format(fmt);
 		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 		sd.Texture2D.MipLevels = 1;
 		hr = s->out_dev->CreateShaderResourceView(p.tex, &sd, &p.srv);
@@ -3227,7 +3267,9 @@ split_crop_for_dp(struct comp_hub_d3d11 *s, ID3D11ShaderResourceView *src_srv, u
 			return src_srv;
 		}
 		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-		srv_desc.Format = desc.Format;
+		// #2342 P2c (ADR-044): the scratch is in the source's family (the copy
+		// below is a raw reinterpretation); its view never decodes.
+		srv_desc.Format = split_nondecoding_format(desc.Format);
 		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 		srv_desc.Texture2D.MipLevels = 1;
 		if (FAILED(s->out_dev->CreateShaderResourceView(s->dp_input_tex, &srv_desc, &s->dp_input_srv))) {
@@ -3496,7 +3538,8 @@ split_direct_open_slot(struct comp_hub_d3d11 *s, uint32_t idx, const struct comp
 	if (SUCCEEDED(hr) && e.tex != nullptr) {
 		e.tex->GetDesc(&td);
 		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-		sd.Format = td.Format;
+		// #2342 P2c (ADR-044): the slot holds encoded bytes; view, don't decode.
+		sd.Format = split_nondecoding_format(td.Format);
 		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 		sd.Texture2D.MipLevels = 1;
 		hr = s->out_dev->CreateShaderResourceView(e.tex, &sd, &e.srv);
@@ -3642,7 +3685,8 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 		D3D11_TEXTURE2D_DESC td = {};
 		d.tex->GetDesc(&td);
 		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-		sd.Format = td.Format;
+		// #2342 P2c (ADR-044): the atlas holds encoded bytes; view, don't decode.
+		sd.Format = split_nondecoding_format(td.Format);
 		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 		sd.Texture2D.MipLevels = 1;
 		if (FAILED(s->out_dev->CreateShaderResourceView(d.tex, &sd, &d.srv)) || d.srv == nullptr) {
