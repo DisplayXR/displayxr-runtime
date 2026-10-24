@@ -102,7 +102,97 @@ static DWORD g_savedWindowStyle = 0;
 //                        XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT.
 static bool g_l2dPanel = false;
 static bool g_l2dMask = false;
+// #2342: DXR_LOCAL2D_MASK=3 additionally acquires the Tier-3 render target and
+// draws one app-authored stroke into it (a 3D bar down the left edge, outside
+// both rect islands) — the authored mask that has to reach the compositor as a
+// PLANE, mirroring cube_handle_d3d11_win's #918 review F1 mode.
+static bool g_l2dMaskTier3 = false;
 static bool g_l2dPanel2 = false;
+
+/*!
+ * #2342: the Tier-3 stroke, Vulkan flavour
+ * (XrLocal3DZoneRenderTargetVulkanDXR). The runtime hands the R8 image in
+ * COLOR_ATTACHMENT_OPTIMAL (it is not a transfer destination), so the stroke is
+ * a one-attachment render pass that LOADs the existing mask and
+ * vkCmdClearAttachments a bar to M=1. Same-queue order is the contract; one-off
+ * at activation (submitImmediate).
+ */
+static void DrawTier3StrokeVk(VkRenderer *renderer) {
+  if (g_zone.pfnAcquire == nullptr) {
+    LOG_ERROR("[mask] Tier-3 requested but xrAcquireLocal3DZoneRenderTargetDXR "
+              "is unavailable");
+    return;
+  }
+  XrLocal3DZoneRenderTargetVulkanDXR rtb = {
+      (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_DXR};
+  XrResult ar = g_zone.pfnAcquire(g_zone.mask, (void *)&rtb);
+  if (XR_FAILED(ar) || rtb.imageView == nullptr) {
+    LOG_ERROR("[mask] xrAcquireLocal3DZoneRenderTargetDXR failed (0x%x)",
+              (unsigned)ar);
+    return;
+  }
+  VkAttachmentDescription ad = {};
+  ad.format = VK_FORMAT_R8_UNORM;
+  ad.samples = VK_SAMPLE_COUNT_1_BIT;
+  ad.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  ad.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  ad.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  ad.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  ad.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  ad.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  VkAttachmentReference ar0 = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp = {};
+  sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+  sp.colorAttachmentCount = 1;
+  sp.pColorAttachments = &ar0;
+  VkRenderPassCreateInfo rpci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpci.attachmentCount = 1;
+  rpci.pAttachments = &ad;
+  rpci.subpassCount = 1;
+  rpci.pSubpasses = &sp;
+  VkRenderPass rp = VK_NULL_HANDLE;
+  VkFramebuffer fb = VK_NULL_HANDLE;
+  VkImageView view = (VkImageView)rtb.imageView;
+  if (vkCreateRenderPass(renderer->device, &rpci, nullptr, &rp) != VK_SUCCESS) {
+    LOG_ERROR("[mask] Tier-3 stroke: render pass create failed");
+    return;
+  }
+  VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  fci.renderPass = rp;
+  fci.attachmentCount = 1;
+  fci.pAttachments = &view;
+  fci.width = rtb.width;
+  fci.height = rtb.height;
+  fci.layers = 1;
+  if (vkCreateFramebuffer(renderer->device, &fci, nullptr, &fb) != VK_SUCCESS) {
+    vkDestroyRenderPass(renderer->device, rp, nullptr);
+    LOG_ERROR("[mask] Tier-3 stroke: framebuffer create failed");
+    return;
+  }
+  const VkRect2D bar = {
+      {(int32_t)(rtb.width / 16), (int32_t)(rtb.height / 3)},
+      {rtb.width / 8 - rtb.width / 16, rtb.height * 2 / 3 - rtb.height / 3}};
+  renderer->ring.submitImmediate([&](VkCommandBuffer cmd) {
+    VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = rp;
+    rbi.framebuffer = fb;
+    rbi.renderArea = {{0, 0}, {rtb.width, rtb.height}};
+    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    VkClearAttachment ca = {};
+    ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ca.colorAttachment = 0;
+    ca.clearValue.color.float32[0] = 1.0f;
+    VkClearRect cr = {bar, 0, 1};
+    vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+    vkCmdEndRenderPass(cmd);
+  });
+  vkDestroyFramebuffer(renderer->device, fb, nullptr);
+  vkDestroyRenderPass(renderer->device, rp, nullptr);
+  LOG_INFO("[mask] Tier-3 stroke drawn into the %ux%u authored mask (bar %d,%d "
+           "%ux%u)",
+           rtb.width, rtb.height, bar.offset.x, bar.offset.y, bar.extent.width,
+           bar.extent.height);
+}
 // #491 part 3 — a Local2D backdrop submitted BEFORE the projection (an UNDER
 // layer). 0 = off, 2 = opaque checker, 3 = semi-transparent (desktop shows
 // through). DXR_LOCAL2D_BACKDROP=1 ⟹ opaque (2); =2 ⟹ semi-transparent (3).
@@ -1311,8 +1401,13 @@ static void RenderThreadFunc(
                                 islands[0].extent = {(int32_t)(winW * 7 / 16), (int32_t)(winH / 2)};
                                 islands[1].offset = {(int32_t)(winW / 16), (int32_t)(winH / 16)};
                                 islands[1].extent = {(int32_t)(winW / 4), (int32_t)(winH / 4)};
-                                ok = XR_SUCCEEDED(g_zone.pfnSetRects(g_zone.mask, 2, islands)) &&
-                                     XR_SUCCEEDED(g_zone.pfnSubmit(g_zone.mask));
+                                ok = XR_SUCCEEDED(g_zone.pfnSetRects(
+                                    g_zone.mask, 2, islands));
+                                if (ok && g_l2dMaskTier3) {
+                                  DrawTier3StrokeVk(renderer);
+                                }
+                                ok = ok && XR_SUCCEEDED(
+                                               g_zone.pfnSubmit(g_zone.mask));
                             }
                         }
 
@@ -1474,7 +1569,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         const char* e = getenv("DXR_LOCAL2D_PANEL");
         if (e && *e == '1') g_l2dPanel = true;
         e = getenv("DXR_LOCAL2D_MASK");
-        if (e && *e == '1') g_l2dMask = true;
+        if (e && (*e == '1' || *e == '3')) {
+          g_l2dMask = true;
+          g_l2dMaskTier3 = (*e == '3'); // #2342
+        }
         e = getenv("DXR_LOCAL2D_PANEL2");
         if (e && *e == '1') g_l2dPanel2 = true;
         e = getenv("DXR_LOCAL2D_ACTIVATION_FRAME");
