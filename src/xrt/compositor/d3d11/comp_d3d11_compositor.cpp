@@ -4857,6 +4857,20 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	 * retire runs HERE, before anything below reads the hub, so this frame is
 	 * composed natively with its planes.
 	 */
+	/*
+	 * #2317 P2b review: the zone publish under the hub reaches its PRIMARY DP
+	 * only, where natively every segment DP gets the mask cropped to its screen
+	 * (#2218 #4). A frame that publishes one (zones, or an authored mask) while
+	 * the hub's last weave segmented the window is the native legs' — refused by
+	 * name until the per-segment publish is ported.
+	 */
+	if (c->hub.active && c->hub.retire_pending == NULL && (zones_frame || d3d11_frame_authored_mask(c) != NULL)) {
+		struct xrt_segment_metrics sm;
+		memset(&sm, 0, sizeof(sm));
+		if (comp_hub_d3d11_get_segment_metrics(c->hub.split, &sm) && sm.count > 1) {
+			c->hub.retire_pending = COMP_HUB_REASON_SEGMENTS_PLANES;
+		}
+	}
 	if (c->hub.active && c->hub.retire_pending != NULL) {
 		const char *why = c->hub.retire_pending;
 		c->hub.retire_pending = NULL;
@@ -5342,8 +5356,24 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		 * hub's wait on that signal orders its reads of the planes too.
 		 */
 		const char *plane_fail = d3d11_hub_stage_planes(c, &eff_canvas);
-		if (plane_fail != NULL && c->hub.retire_pending == NULL) {
-			c->hub.retire_pending = plane_fail;
+		if (plane_fail != NULL) {
+			/*
+			 * #2317 P2b review — ADR-059 decision 5: a frame whose planes the
+			 * hub could not carry is composed by the native leg, never woven
+			 * without them (2D zones woven as 3D, a missing panel). So this frame
+			 * presents NOTHING (the panel holds the last good frame), the replay
+			 * stays disarmed so a paused app cannot repaint it at panel rate, and
+			 * the next frame retires at the top and composes natively. No
+			 * producer signal is issued: the next back-fence waits the consumer
+			 * value the hub already signalled.
+			 */
+			if (c->hub.retire_pending == NULL) {
+				c->hub.retire_pending = plane_fail;
+			}
+			c->repaint.armed = false;
+			c->context->Flush();
+			d3d11_split_note_skipped_present(c, "a frame whose planes the hub could not carry");
+			return XRT_SUCCESS;
 		}
 		return d3d11_hub_commit(c, &eff_canvas, &eye_pos, tgt_width, tgt_height);
 	}
@@ -9293,6 +9323,13 @@ d3d11_zone_mask_alloc(ID3D11Device *device,
 	mask->w = w;
 	mask->h = h;
 	const bool split = out_device != nullptr && out_device != device;
+	/*
+	 * #918 Phase 2a / #2317 P2b review: unique ACROSS mask objects, assigned to
+	 * every mask — the split keys its plane re-open on it, the hub its content
+	 * copy. (Every split-only reader is gated on split_active.)
+	 */
+	static uint64_t s_zone_mask_gen = 0;
+	mask->staged_gen = ++s_zone_mask_gen;
 
 	D3D11_TEXTURE2D_DESC td = {};
 	td.Width = w;
@@ -9384,8 +9421,6 @@ d3d11_zone_mask_alloc(ID3D11Device *device,
 		 * masks both numbered 1 would leave the producer reading the first one's
 		 * texture for the second one's pixels.
 		 */
-		static uint64_t s_zone_mask_gen = 0;
-		mask->staged_gen = ++s_zone_mask_gen;
 		if (mask->staged_share == nullptr) {
 			U_LOG_W(
 			    "zone_mask_create: no NT share handle for the authored mask — Tier-3 (app-drawn) "
@@ -9499,8 +9534,13 @@ d3d11_hub_mask_plane_refresh(struct comp_d3d11_compositor *c, struct comp_d3d11_
 		c->hub.mask_gen++;
 	}
 
+	/*
+	 * #2317 P2b review: keyed on the mask's unique staged_gen (as natively,
+	 * d3d11_stage_mask_plane), never its address — a destroyed mask's
+	 * replacement can land at the same address, dims and author_seq.
+	 */
 	uint64_t key = 1469598103934665603ull;
-	key = (key ^ (uint64_t)(uintptr_t)mask) * 1099511628211ull;
+	key = (key ^ mask->staged_gen) * 1099511628211ull;
 	key = (key ^ mask->author_seq) * 1099511628211ull;
 	key = (key ^ c->hub.mask_gen) * 1099511628211ull;
 	if (key == 0) {
@@ -9689,10 +9729,8 @@ d3d11_hub_stage_planes(struct comp_d3d11_compositor *c, const struct u_canvas_re
 				any_feather = any_feather || feather[count] > 0.0f;
 				rects[count++] = c->layer_accum.layers[i].data.zone_3d.rect;
 			}
-			// #803: a feathered frame's COMPOSITE samples the ramp; the hub
-			// rasters one mask per frame, so such a frame skips the auto-wish
-			// publish below rather than publish ramped geometry (the VK rung's
-			// documented behaviour).
+			// #803: a feathered frame's COMPOSITE samples the ramp and its
+			// PUBLISH the binary wish — the hub rasters both (#2317 P2b review).
 			kind = any_feather ? COMP_HUB_D3D11_MASK_ZONE_FEATHER : COMP_HUB_D3D11_MASK_ZONE_BINARY;
 		} else {
 			for (uint32_t i = 0; i < c->layer_accum.layer_count && count < XRT_MAX_LAYERS; i++) {
@@ -9745,7 +9783,9 @@ d3d11_hub_stage_planes(struct comp_d3d11_compositor *c, const struct u_canvas_re
 	 * wish changes), so a vendor evaluates each generation once.
 	 */
 	if (zones) {
-		if (mask_ok || kind == COMP_HUB_D3D11_MASK_ZONE_BINARY) {
+		// #2317 P2b review: a feathered frame publishes too — the hub rasters
+		// its binary wish beside the ramp, as this tier natively does.
+		if (mask_ok || kind == COMP_HUB_D3D11_MASK_ZONE_BINARY || kind == COMP_HUB_D3D11_MASK_ZONE_FEATHER) {
 			comp_hub_d3d11_publish_zone_wish(hub, c->zone_publish_seq);
 		}
 	} else if (mask_ok) {

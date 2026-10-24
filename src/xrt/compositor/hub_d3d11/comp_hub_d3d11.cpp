@@ -265,6 +265,7 @@ struct comp_hub_d3d11
 	//! #2317 P2b: the backdrop extent last handed to the DP, for the
 	//! change-only lifecycle WARN in @ref split_set_backdrop.
 	uint32_t bd_handed_w, bd_handed_h;
+	bool bd_handed_logged;
 	uint64_t sideband_copies, sideband_skips, sideband_bytes;
 	//! @}
 
@@ -288,6 +289,14 @@ struct comp_hub_d3d11
 		bool warned;
 	};
 	struct split_mask_raster mask;
+	/*!
+	 * #2317 P2b review: the BINARY zone wish of a FEATHERED zones frame. The
+	 * composite samples the feather ramp (@ref mask); the published wish must
+	 * stay binary (#800/#803), so a feathered frame rasters both, exactly as the
+	 * D3D11 tier natively rasters its wish and feather masks separately. Only
+	 * ever ZONE_BINARY; only rastered when @ref mask is ZONE_FEATHER.
+	 */
+	struct split_mask_raster wish;
 
 	/*!
 	 * The raster the LAST APP FRAME produced. #868: a repaint replays
@@ -693,9 +702,8 @@ split_release_mask(struct comp_hub_d3d11::split_mask_raster *m)
 
 //! (Re)allocate the R8 RTV + staged SRV pair at @p w x @p h on the OUT device.
 static bool
-split_mask_ensure(struct comp_hub_d3d11 *s, uint32_t w, uint32_t h)
+split_mask_ensure(struct comp_hub_d3d11 *s, struct comp_hub_d3d11::split_mask_raster *m, uint32_t w, uint32_t h)
 {
-	struct comp_hub_d3d11::split_mask_raster *m = &s->mask;
 	if (m->tex != nullptr && m->w == w && m->h == h) {
 		return true;
 	}
@@ -741,10 +749,14 @@ split_mask_ensure(struct comp_hub_d3d11 *s, uint32_t w, uint32_t h)
 
 //! One `ClearView` of @p value over @p r, clamped into the raster.
 static void
-split_mask_fill(
-    struct comp_hub_d3d11 *s, ID3D11DeviceContext1 *ctx1, const struct xrt_rect *r, int32_t inset, float value)
+split_mask_fill(struct comp_hub_d3d11 *s,
+                struct comp_hub_d3d11::split_mask_raster *m,
+                ID3D11DeviceContext1 *ctx1,
+                const struct xrt_rect *r,
+                int32_t inset,
+                float value)
 {
-	struct comp_hub_d3d11::split_mask_raster *m = &s->mask;
+	(void)s;
 	int32_t left = r->offset.w + inset;
 	int32_t top = r->offset.h + inset;
 	int32_t right = r->offset.w + r->extent.w - inset;
@@ -841,6 +853,7 @@ split_release_out(struct comp_hub_d3d11 *s)
 	comp_hub_d3d11_clear_zone_wish(s);
 	comp_d3d11_outcomp_destroy(&s->outcomp);
 	split_release_mask(&s->mask);
+	split_release_mask(&s->wish);
 	s->repaint_mask_srv = NULL;
 	if (s->hud_tex != NULL) {
 		s->hud_tex->Release();
@@ -1885,12 +1898,21 @@ split_set_backdrop(struct comp_hub_d3d11 *s, int32_t slot)
 			bd_h = rec.bd_h;
 		}
 	}
-	// On a change of what the DP is handed (appear / resize / withdraw) only.
+	/*
+	 * On a change of what the DP is handed (appear / resize / withdraw) only —
+	 * and only the session's FIRST appearance is a WARN: an app that toggles an
+	 * under-layer every other frame would otherwise log at frame rate.
+	 */
 	if (bd_w != s->bd_handed_w || bd_h != s->bd_handed_h) {
 		s->bd_handed_w = bd_w;
 		s->bd_handed_h = bd_h;
-		U_LOG_W("#2317 P2b hub: 2D-under backdrop handed to the DP: %ux%u (%s)", bd_w, bd_h,
-		        s->direct.active ? "direct" : "xbridge");
+		if (bd_w != 0 && !s->bd_handed_logged) {
+			s->bd_handed_logged = true;
+			U_LOG_W("#2317 P2b hub: 2D-under backdrop handed to the DP: %ux%u (%s)", bd_w, bd_h,
+			        s->direct.active ? "direct" : "xbridge");
+		} else {
+			U_LOG_I("#2317 P2b hub: 2D-under backdrop handed to the DP: %ux%u", bd_w, bd_h);
+		}
 	}
 	xrt_display_processor_d3d11_set_background_2d(s->dp, bd_srv, bd_w, bd_h);
 }
@@ -1965,28 +1987,16 @@ comp_hub_d3d11_invalidate_plane(struct comp_hub_d3d11 *s, uint32_t plane)
 	comp_xbridge_invalidate_plane(s->xbridge, plane);
 }
 
-extern "C" bool
-comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
-                           uint32_t kind,
-                           const struct xrt_rect *rects,
-                           const float *feather_px,
-                           uint32_t rect_count,
-                           uint32_t region_w,
-                           uint32_t region_h)
+static bool
+split_raster_into(struct comp_hub_d3d11 *s,
+                  struct comp_hub_d3d11::split_mask_raster *m,
+                  uint32_t kind,
+                  const struct xrt_rect *rects,
+                  const float *feather_px,
+                  uint32_t rect_count,
+                  uint32_t region_w,
+                  uint32_t region_h)
 {
-	if (s == nullptr || s->out_dev == nullptr || region_w == 0 || region_h == 0) {
-		return false;
-	}
-	if (kind == COMP_HUB_D3D11_MASK_NONE || rect_count == 0 || rects == nullptr) {
-		s->repaint_mask_srv = nullptr;
-		return false;
-	}
-	if (rect_count > XRT_MAX_LAYERS) {
-		rect_count = XRT_MAX_LAYERS;
-	}
-
-	struct comp_hub_d3d11::split_mask_raster *m = &s->mask;
-
 	// Dirty-check on everything the raster is a function of. The steady-state
 	// frame reuses the staged SRV and touches the GPU not at all.
 	bool dirty =
@@ -2001,12 +2011,10 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
 		}
 	}
 	if (!dirty) {
-		s->repaint_mask_srv = m->srv;
 		return true;
 	}
 
-	if (!split_mask_ensure(s, region_w, region_h)) {
-		s->repaint_mask_srv = nullptr;
+	if (!split_mask_ensure(s, m, region_w, region_h)) {
 		return false;
 	}
 
@@ -2018,7 +2026,6 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
 			    "#918 VK-1b: the out device has no ID3D11DeviceContext1, so the mask raster has no "
 			    "ClearView — 2D content does not composite under the split for this session");
 		}
-		s->repaint_mask_srv = nullptr;
 		return false;
 	}
 
@@ -2042,11 +2049,11 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
 		if (kind == COMP_HUB_D3D11_MASK_IMPLICIT) {
 			// Inverse of the zone raster: M=0 (show the flattened 2D) inside
 			// each Local2D rect, M=1 (keep the weave) everywhere else.
-			split_mask_fill(s, ctx1, &rects[i], 0, 0.0f);
+			split_mask_fill(s, m, ctx1, &rects[i], 0, 0.0f);
 			continue;
 		}
 		if (kind == COMP_HUB_D3D11_MASK_ZONE_BINARY) {
-			split_mask_fill(s, ctx1, &rects[i], 0, 1.0f);
+			split_mask_fill(s, m, ctx1, &rects[i], 0, 1.0f);
 			continue;
 		}
 
@@ -2084,7 +2091,7 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
 			if (inset > max_inset) {
 				inset = max_inset;
 			}
-			split_mask_fill(s, ctx1, &rects[i], inset, v);
+			split_mask_fill(s, m, ctx1, &rects[i], inset, v);
 		}
 	}
 	ctx1->Release();
@@ -2103,9 +2110,42 @@ comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
 
 	// On a rect/dims change only, never per frame.
 	U_LOG_W("#918 VK-1b: out-device mask raster kind=%u %ux%u, %u rect(s)", kind, region_w, region_h, rect_count);
-
-	s->repaint_mask_srv = m->srv;
 	return true;
+}
+
+extern "C" bool
+comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *s,
+                           uint32_t kind,
+                           const struct xrt_rect *rects,
+                           const float *feather_px,
+                           uint32_t rect_count,
+                           uint32_t region_w,
+                           uint32_t region_h)
+{
+	if (s == nullptr || s->out_dev == nullptr || region_w == 0 || region_h == 0) {
+		return false;
+	}
+	if (kind == COMP_HUB_D3D11_MASK_NONE || rect_count == 0 || rects == nullptr) {
+		s->repaint_mask_srv = nullptr;
+		return false;
+	}
+	if (rect_count > XRT_MAX_LAYERS) {
+		rect_count = XRT_MAX_LAYERS;
+	}
+	const bool ok = split_raster_into(s, &s->mask, kind, rects, feather_px, rect_count, region_w, region_h);
+	s->repaint_mask_srv = ok ? s->mask.srv : nullptr;
+	/*
+	 * #2317 P2b review: a FEATHERED zones frame also rasters its BINARY wish,
+	 * for the publish — the composite's ramp never reaches the vendor
+	 * (#800/#803), and publishing nothing would leave the vendor holding a stale
+	 * wish while the zone moves. A failure here costs the publish only.
+	 */
+	if (ok && kind == COMP_HUB_D3D11_MASK_ZONE_FEATHER &&
+	    !split_raster_into(s, &s->wish, COMP_HUB_D3D11_MASK_ZONE_BINARY, rects, nullptr, rect_count, region_w,
+	                       region_h)) {
+		s->wish.kind = COMP_HUB_D3D11_MASK_NONE;
+	}
+	return ok;
 }
 
 /*!
@@ -2333,12 +2373,19 @@ split_publish_zone_wish_now(struct comp_hub_d3d11 *s, uint64_t seq)
 		 * a frame whose composite sampled the feather mask still publishes the
 		 * binary one - which is why this reads the raster's KIND, not just its SRV.
 		 */
-		if (s->mask.srv == nullptr || s->mask.kind != COMP_HUB_D3D11_MASK_ZONE_BINARY) {
+		// #2317 P2b review: a feathered frame publishes its separate binary wish.
+		const struct comp_hub_d3d11::split_mask_raster *wm =
+		    (s->mask.kind == COMP_HUB_D3D11_MASK_ZONE_BINARY) ? &s->mask
+		    : (s->mask.kind == COMP_HUB_D3D11_MASK_ZONE_FEATHER &&
+		       s->wish.kind == COMP_HUB_D3D11_MASK_ZONE_BINARY)
+		        ? &s->wish
+		        : nullptr;
+		if (wm == nullptr || wm->srv == nullptr) {
 			return;
 		}
-		srv = s->mask.srv;
-		mw = s->mask.w;
-		mh = s->mask.h;
+		srv = wm->srv;
+		mw = wm->w;
+		mh = wm->h;
 	}
 	if (srv == nullptr || mw == 0 || mh == 0) {
 		return;

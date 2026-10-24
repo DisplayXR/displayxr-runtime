@@ -153,6 +153,17 @@ static int g_wishMode = 0;
 static ID3D11RenderTargetView* g_wishRTV = nullptr; // runtime-owned (Tier-3 binding)
 static uint32_t g_wishW = 0, g_wishH = 0;
 
+// DXR_ZONES_FEATHER=<px> — chain XrDisplayZoneFeatherDXR (radiusPx) on every
+// zone at xrEndFrame, as the d3d12 sibling does. 0/unset = hard edges, the spec
+// default; the published wish stays binary regardless (runtime#800).
+static float ZonesFeatherRadiusPx() {
+    static const float r = []() {
+        const char* v = getenv("DXR_ZONES_FEATHER");
+        return (v != nullptr) ? (float)atof(v) : 0.0f;
+    }();
+    return r;
+}
+
 // DXR_ZONES_VALIDATE=1 — chain the validate bit on every frame-end info.
 static bool ZonesValidateEnabled() {
     static const bool e = []() {
@@ -1034,6 +1045,8 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
     // points (locate and xrEndFrame) — same instances within the frame.
     XrDisplayZoneDXR zoneStructs[kNumZones];
     XrDisplayRigDXR rigStructs[kNumZones];
+    XrDisplayZoneFeatherDXR featherStructs[kNumZones];
+    const float featherPx = ZonesFeatherRadiusPx();
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
     // ADR-041: what each zone LAYER carries (>= submitViewCounts[zi]).
@@ -1050,7 +1063,14 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         rigStructs[zi].perspectiveFactor = z.perspectiveFactor;
 
         zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_DXR};
-        zoneStructs[zi].next = &rigStructs[zi];
+        if (featherPx > 0.0f) {
+            featherStructs[zi] = {(XrStructureType)XR_TYPE_DISPLAY_ZONE_FEATHER_DXR};
+            featherStructs[zi].radiusPx = featherPx;
+            featherStructs[zi].next = &rigStructs[zi];
+            zoneStructs[zi].next = &featherStructs[zi];
+        } else {
+            zoneStructs[zi].next = &rigStructs[zi];
+        }
         zoneStructs[zi].zoneId = z.zoneId;
         zoneStructs[zi].rect = z.rect;
 

@@ -253,6 +253,15 @@ struct comp_hub_d3d11_info
  * ingress routes.
  */
 #define COMP_HUB_REASON_PLANE_UNAVAILABLE "plane_unavailable"
+/*!
+ * Mid-session RETIRE (#2317 P2b review): a zones frame or an authored mask while
+ * the hub's last weave SEGMENTED the window across screens. The D3D11 tier
+ * natively publishes the zone mask to every segment's DP, cropped to its screen
+ * (#2218 #4); the hub publishes to its primary DP only, so the secondary panel
+ * would never get its mask. Retires BEFORE that frame is composed, so the
+ * native legs compose it. Until the per-segment publish is ported (P2 follow-up).
+ */
+#define COMP_HUB_REASON_SEGMENTS_PLANES "segments_planes"
 /*! @} */
 
 /*!
