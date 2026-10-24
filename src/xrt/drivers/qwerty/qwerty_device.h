@@ -78,6 +78,19 @@ struct qwerty_system
 	                            //!< converted perspective on P (so P is seamless)
 
 	// Hardware config (set by target builder)
+	/*!
+	 * Mouse hand (DXR_MOUSE_HAND): the right controller sits under the cursor
+	 * over the 3D view, at a wheel-adjusted depth, instead of following the
+	 * keyboard. The cursor is written by the window thread through
+	 * qwerty_set_mouse_hand_cursor and read by get_tracked_pose; view_lock.
+	 */
+	bool mouse_hand;
+	bool mouse_hand_cursor_valid;
+	float mouse_hand_u;       //!< cursor across the view, -1 (left) .. 1 (right)
+	float mouse_hand_v;       //!< cursor up the view, -1 (bottom) .. 1 (top)
+	float mouse_hand_aspect;  //!< view width / height
+	float mouse_hand_depth_m; //!< hand distance ahead of the camera; 0 = the zero-parallax distance
+
 	float nominal_viewer_z; //!< meters (e.g. 0.6 from sim_display)
 	float screen_height_m;  //!< meters (e.g. 0.194 from sim_display)
 
@@ -601,6 +614,15 @@ void
 qwerty_adjust_convergence(struct qwerty_system *qs, float direction);
 
 /*!
+ * Mouse hand: move the hand @p steps wheel notches deeper (+) or nearer (-),
+ * 10% of its distance per notch, starting from the zero-parallax distance.
+ *
+ * @public @memberof qwerty_system
+ */
+void
+qwerty_adjust_mouse_hand_depth(struct qwerty_system *qs, int steps);
+
+/*!
  * Adjust virtual display height by multiplier (display mode only, clamped [0.1,10]).
  * No-op if in camera mode.
  * @public @memberof qwerty_system
@@ -619,6 +641,15 @@ qwerty_reset_view_state(struct qwerty_system *qs);
 /*!
  * @}
  */
+
+/*!
+ * The mouse hand's pose in the camera's frame: on the ray from the camera
+ * through view position (@p u, @p v) (-1..1, +v up) of a view with vertical
+ * half-tan @p half_tan_vfov and @p aspect, @p depth_m ahead (along -Z), aimed
+ * along that ray. Projects onto the cursor for the centre eye.
+ */
+void
+qwerty_mouse_hand_pose(float u, float v, float aspect, float half_tan_vfov, float depth_m, struct xrt_pose *out_pose);
 
 #ifdef __cplusplus
 }

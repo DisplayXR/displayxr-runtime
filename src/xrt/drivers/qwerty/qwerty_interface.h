@@ -318,6 +318,18 @@ qwerty_get_view_state(struct xrt_device **xdevs,
 bool
 qwerty_set_camera_profile(struct xrt_device **xdevs, size_t xdev_count, const struct u_camera_profile *profile);
 
+//! Is the mouse hand (DXR_MOUSE_HAND) on for the qwerty system in @p xdevs?
+bool
+qwerty_mouse_hand_enabled(struct xrt_device **xdevs, size_t xdev_count);
+
+/*!
+ * Where the cursor is over the 3D view, for the mouse hand: @p u -1 (left) .. 1
+ * (right), @p v -1 (bottom) .. 1 (top), @p aspect the view's width / height.
+ * Called by the window that owns the view; a no-op unless the mouse hand is on.
+ */
+void
+qwerty_set_mouse_hand_cursor(struct xrt_device **xdevs, size_t xdev_count, float u, float v, float aspect);
+
 
 /*!
  * Enable or disable qwerty input processing (keyboard/mouse events).

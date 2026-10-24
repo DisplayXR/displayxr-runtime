@@ -429,6 +429,8 @@ option(XRT_FEATURE_OPENXR_INTERACTION_WINMR "Enable XR_EXT_hp_mixed_reality_cont
 option(XRT_FEATURE_OPENXR_INTERACTION_BYTEDANCE "Enable XR_BD_controller_interaction" OFF)
 option(XRT_FEATURE_OPENXR_INTERACTION_VIVE_COSMOS "Enable XR_HTC_vive_cosmos_controller_interaction" OFF)
 option(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3 "Enable XR_HTC_vive_focus3_controller_interaction" OFF)
+# ON: the qwerty mouse hand (DXR_MOUSE_HAND) presents as an MX Ink stylus, which creation tools sculpt with.
+option(XRT_FEATURE_OPENXR_INTERACTION_MX_INK "Enable XR_LOGITECH_mx_ink_stylus_interaction" ON)
 option(XRT_FEATURE_OPENXR_INTERACTION_FB_PROXIMITY "Enable XR_FB_touch_controller_proximity" OFF)
 option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PRO "Enable XR_FB_touch_controller_pro" OFF)
 option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS "Enable XR_META_touch_controller_plus" OFF)

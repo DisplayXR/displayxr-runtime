@@ -378,7 +378,37 @@ Focus is determined by `GetAsyncKeyState()` for reliability (avoids stuck keys f
 | Wheel | Convergence/vHeight (see §4) | Speed +/- | Speed +/- | Speed +/- both |
 | SHIFT + Wheel | IPD+Parallax ×/÷ 1.1 | — | — | — |
 
-### 6.4 Sensitivity Constants
+
+### 6.4 Mouse Hand (`DXR_MOUSE_HAND=1`)
+
+For creation tools on a 3D display (Substance 3D Modeler and the like), where
+holding CTRL / ALT to move a hand is too awkward to sculpt with. Opt-in per
+process: with `DXR_MOUSE_HAND=1` in the app's environment, the right controller
+stops following the keyboard and sits **under the cursor** over the 3D view, on
+the ray from the camera through the cursor, aimed along it
+(`qwerty_mouse_hand_pose`; the window reports the cursor through
+`qwerty_set_mouse_hand_cursor`). It starts at the zero-parallax distance, so the
+hand appears on the screen surface.
+
+| Input | Action |
+|-------|--------|
+| Move | Right hand follows the cursor |
+| LMB | Right trigger (MX Ink: tip force) |
+| RMB | Right grip / squeeze (MX Ink: middle cluster) — mouse look moves to MMB |
+| MMB + Drag | Rotate the camera |
+| Wheel | Hand depth: away from you = deeper, 10% per notch |
+| SHIFT + Wheel | IPD+Parallax ×/÷ 1.1, as before |
+| Back / Forward (XBUTTON1 / 2) | Right menu / system (MX Ink: front / back cluster) |
+| 1 / 2 / 3 | Left (support) hand menu / trigger / grip — not rendering modes |
+
+The right controller also offers `/interaction_profiles/logitech/mx_ink_stylus_logitech`
+(`XR_LOGITECH_mx_ink_stylus_interaction`, `XRT_FEATURE_OPENXR_INTERACTION_MX_INK`,
+default ON) **first** in its binding profiles, so an app that binds the MX Ink
+stylus gets one; apps that do not fall through to Touch / Index / Vive / simple as
+before. No physical stylus is involved: the MX Ink is tracked by a Quest headset,
+which a 3D display does not have, so the mouse is the stylus.
+
+### 6.5 Sensitivity Constants
 
 | Constant | Value | Effect |
 |----------|-------|--------|

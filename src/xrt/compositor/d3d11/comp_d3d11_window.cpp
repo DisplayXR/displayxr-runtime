@@ -651,6 +651,21 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		return DefWindowProcW(hWnd, message, wParam, lParam);
 	}
 
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	// Mouse hand (DXR_MOUSE_HAND): tell qwerty where the cursor is over this
+	// view, so the right hand can sit under it. Only this window knows its size.
+	if (message == WM_MOUSEMOVE && w->qwerty_enabled && w->xsysd != NULL &&
+	    qwerty_mouse_hand_enabled(w->xsysd->xdevs, w->xsysd->xdev_count)) {
+		RECT rc;
+		if (GetClientRect(hWnd, &rc) && rc.right > 0 && rc.bottom > 0) {
+			const float u = 2.0f * (float)GET_X_LPARAM(lParam) / (float)rc.right - 1.0f;
+			const float v = 1.0f - 2.0f * (float)GET_Y_LPARAM(lParam) / (float)rc.bottom;
+			qwerty_set_mouse_hand_cursor(w->xsysd->xdevs, w->xsysd->xdev_count, u, v,
+			                             (float)rc.right / (float)rc.bottom);
+		}
+	}
+#endif
+
 	switch (message) {
 	case WM_SETCURSOR:
 		// Hide the OS cursor over the workspace window's client area.

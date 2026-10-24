@@ -12,6 +12,7 @@
 #include "math/m_api.h"
 #include "math/m_space.h"
 #include "math/m_mathinclude.h"
+#include "math/m_vec3.h"
 
 #include "util/u_device.h"
 #include "util/u_distortion_mesh.h"
@@ -35,6 +36,8 @@
 #include "util/u_debug.h"
 // [QTRACE] pose-path tracer, off unless DXR_QTRACE=1 (docs/reference/debug-logging.md)
 DEBUG_GET_ONCE_BOOL_OPTION(qwerty_qtrace, "DXR_QTRACE", false)
+// The right controller follows the cursor over the 3D view (and offers MX Ink).
+DEBUG_GET_ONCE_BOOL_OPTION(mouse_hand, "DXR_MOUSE_HAND", false)
 
 // Suppress qwerty pose integration while the WebXR bridge is driving the
 // session. multi_compositor flips this via qwerty_set_bridge_relay_active().
@@ -204,6 +207,27 @@ static struct xrt_binding_output_pair simple_outputs[1] = {
     {XRT_OUTPUT_NAME_SIMPLE_VIBRATION, XRT_OUTPUT_NAME_WMR_HAPTIC},
 };
 
+/*
+ * MX Ink (XR_LOGITECH_mx_ink_stylus_interaction) for the mouse hand: left
+ * click is the tip, right click the middle cluster, the mouse's back /
+ * forward buttons the front / back clusters. Creation tools sculpt with it.
+ */
+static struct xrt_binding_input_pair mx_ink_inputs[9] = {
+    {XRT_INPUT_MX_INK_TIP_FORCE, XRT_INPUT_WMR_TRIGGER_VALUE},
+    {XRT_INPUT_MX_INK_CLUSTER_MIDDLE_FORCE, XRT_INPUT_WMR_SQUEEZE_CLICK},
+    {XRT_INPUT_MX_INK_CLUSTER_FRONT_CLICK, XRT_INPUT_WMR_MENU_CLICK},
+    {XRT_INPUT_MX_INK_CLUSTER_BACK_CLICK, XRT_INPUT_WMR_HOME_CLICK},
+    {XRT_INPUT_MX_INK_SYSTEM_CLICK, XRT_INPUT_WMR_HOME_CLICK},
+    {XRT_INPUT_MX_INK_GRIP_POSE, XRT_INPUT_WMR_GRIP_POSE},
+    {XRT_INPUT_MX_INK_AIM_POSE, XRT_INPUT_WMR_AIM_POSE},
+    {XRT_INPUT_MX_INK_TIP_POSE, XRT_INPUT_WMR_AIM_POSE},
+    {XRT_INPUT_GENERIC_PALM_POSE, XRT_INPUT_GENERIC_PALM_POSE},
+};
+
+static struct xrt_binding_output_pair mx_ink_outputs[1] = {
+    {XRT_OUTPUT_NAME_MX_INK_HAPTIC, XRT_OUTPUT_NAME_WMR_HAPTIC},
+};
+
 static struct xrt_binding_profile binding_profiles[5] = {
     {
         .name = XRT_DEVICE_WMR_CONTROLLER,
@@ -241,6 +265,24 @@ static struct xrt_binding_profile binding_profiles[5] = {
         .output_count = ARRAY_SIZE(simple_outputs),
     },
 };
+
+//! The mouse hand's list: MX Ink first, so an app that binds it gets a stylus; the rest as above.
+static struct xrt_binding_profile binding_profiles_stylus[6];
+
+static void
+init_stylus_binding_profiles(void)
+{
+	binding_profiles_stylus[0] = (struct xrt_binding_profile){
+	    .name = XRT_DEVICE_MX_INK_STYLUS,
+	    .inputs = mx_ink_inputs,
+	    .input_count = ARRAY_SIZE(mx_ink_inputs),
+	    .outputs = mx_ink_outputs,
+	    .output_count = ARRAY_SIZE(mx_ink_outputs),
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(binding_profiles); i++) {
+		binding_profiles_stylus[i + 1] = binding_profiles[i];
+	}
+}
 
 static void
 qwerty_system_remove(struct qwerty_system *qs, struct qwerty_device *qd);
@@ -613,7 +655,26 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 	self.linear_velocity = qd->linear_velocity;
 	self.angular_velocity = qd->angular_velocity;
 
-	if (qd_is_ctrl && qc->follow_hmd) {
+	// Mouse hand: the right controller is wherever the cursor points, head-relative.
+	bool mouse_hand = false;
+	if (qd_is_ctrl && qc == qd->sys->rctrl && qd->sys->mouse_hand && qd->sys->hmd != NULL) {
+		struct qwerty_system *qs = qd->sys;
+		os_mutex_lock(&qs->view_lock);
+		if (qs->mouse_hand_cursor_valid) {
+			float depth = qs->mouse_hand_depth_m;
+			if (!(depth > 0.0f)) {
+				depth = qs->cam_convergence > 0.05f ? 1.0f / qs->cam_convergence : 0.6f;
+			}
+			qwerty_mouse_hand_pose(qs->mouse_hand_u, qs->mouse_hand_v, qs->mouse_hand_aspect,
+			                       qs->cam_half_tan_vfov, depth, &self.pose);
+			self.linear_velocity = (struct xrt_vec3){0, 0, 0};
+			self.angular_velocity = (struct xrt_vec3){0, 0, 0};
+			mouse_hand = true;
+		}
+		os_mutex_unlock(&qs->view_lock);
+	}
+
+	if (qd_is_ctrl && (qc->follow_hmd || mouse_hand)) {
 		struct qwerty_device *qd_hmd = &qd->sys->hmd->base;
 
 		// #1692: push RELATIONS, not bare poses. A pose-only step carries
@@ -879,6 +940,15 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 	qs->rctrl = qright;
 	qs->log_level = log_level;
 	qs->process_keys = true;
+
+	qs->mouse_hand = debug_get_bool_option_mouse_hand();
+	if (qs->mouse_hand) {
+		init_stylus_binding_profiles();
+		qright->base.base.binding_profiles = binding_profiles_stylus;
+		qright->base.base.binding_profile_count = ARRAY_SIZE(binding_profiles_stylus);
+		U_LOG_W("qwerty: mouse hand on (DXR_MOUSE_HAND) - the right hand follows the cursor over the 3D view; "
+		        "left click = tip/trigger, right click = grip, wheel = depth, middle drag = look");
+	}
 
 	// Default rendering mode matches sim_display default (mode 1 = first 3D mode)
 	qs->rendering_mode = 1;
@@ -1582,6 +1652,60 @@ find_qwerty_system(struct xrt_device **xdevs, size_t count)
 			return qwerty_device(xdevs[i])->sys;
 	}
 	return NULL;
+}
+
+void
+qwerty_mouse_hand_pose(float u, float v, float aspect, float half_tan_vfov, float depth_m, struct xrt_pose *out_pose)
+{
+	const float tv = half_tan_vfov;
+	const float th = half_tan_vfov * (aspect > 0.0f ? aspect : 1.0f);
+	out_pose->position = (struct xrt_vec3){u * th * depth_m, v * tv * depth_m, -depth_m};
+
+	// Aim along the ray: the rotation taking -Z onto it.
+	const struct xrt_vec3 fwd = {0.0f, 0.0f, -1.0f};
+	struct xrt_vec3 dir = {u * th, v * tv, -1.0f};
+	math_vec3_normalize(&dir);
+	struct xrt_vec3 axis;
+	math_vec3_cross(&fwd, &dir, &axis);
+	const float w = 1.0f + m_vec3_dot(fwd, dir);
+	out_pose->orientation = (struct xrt_quat){axis.x, axis.y, axis.z, w};
+	math_quat_normalize(&out_pose->orientation);
+}
+
+bool
+qwerty_mouse_hand_enabled(struct xrt_device **xdevs, size_t count)
+{
+	struct qwerty_system *qs = find_qwerty_system(xdevs, count);
+	return qs != NULL && qs->mouse_hand;
+}
+
+void
+qwerty_set_mouse_hand_cursor(struct xrt_device **xdevs, size_t count, float u, float v, float aspect)
+{
+	struct qwerty_system *qs = find_qwerty_system(xdevs, count);
+	if (qs == NULL || !qs->mouse_hand) {
+		return;
+	}
+	os_mutex_lock(&qs->view_lock);
+	qs->mouse_hand_u = u < -1.0f ? -1.0f : (u > 1.0f ? 1.0f : u);
+	qs->mouse_hand_v = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
+	qs->mouse_hand_aspect = aspect;
+	qs->mouse_hand_cursor_valid = true;
+	os_mutex_unlock(&qs->view_lock);
+}
+
+void
+qwerty_adjust_mouse_hand_depth(struct qwerty_system *qs, int steps)
+{
+	os_mutex_lock(&qs->view_lock);
+	float depth = qs->mouse_hand_depth_m;
+	if (!(depth > 0.0f)) {
+		depth = qs->cam_convergence > 0.05f ? 1.0f / qs->cam_convergence : 0.6f;
+	}
+	// Wheel away from you pushes the hand into the scene, 10% per notch.
+	depth *= powf(1.1f, (float)steps);
+	qs->mouse_hand_depth_m = depth < 0.05f ? 0.05f : (depth > 20.0f ? 20.0f : depth);
+	os_mutex_unlock(&qs->view_lock);
 }
 
 bool
