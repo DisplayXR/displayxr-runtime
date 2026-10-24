@@ -336,3 +336,109 @@ TEST_CASE("gamepad map: button actions follow the table", "[gamepad_map]")
 		CHECK(bound);
 	}
 }
+
+
+/*
+ *
+ * Touch emulation (EMULATE_PROFILE = touch).
+ *
+ */
+
+TEST_CASE("gamepad map: touch buttons land on the Touch layout per hand", "[gamepad_map][touch]")
+{
+	struct gamepad_state s = connected_state();
+	s.buttons = GAMEPAD_BTN_A | GAMEPAD_BTN_Y | GAMEPAD_BTN_SHOULDER_LEFT | GAMEPAD_BTN_MENU;
+	s.left_trigger = 0.25f;
+	s.right_trigger = 0.75f;
+
+	struct gamepad_touch_hand l, r;
+	gamepad_map_touch_hand(&s, true, 0.15f, 0.25f, &l);
+	gamepad_map_touch_hand(&s, false, 0.15f, 0.25f, &r);
+
+	CHECK(std::fabs(l.trigger - (0.25f)) < kEps);
+	CHECK(std::fabs(r.trigger - (0.75f)) < kEps);
+	CHECK(l.squeeze == 1.0f);
+	CHECK(r.squeeze == 0.0f);
+	CHECK_FALSE(l.lower); // X
+	CHECK(l.upper);       // Y
+	CHECK(r.lower);       // A
+	CHECK_FALSE(r.upper); // B
+	CHECK(l.menu);
+	CHECK_FALSE(r.menu); // Menu belongs to the left Touch only
+}
+
+TEST_CASE("gamepad map: touch D-pad is the right thumbstick, the left one with View held", "[gamepad_map][touch]")
+{
+	struct gamepad_state s = connected_state();
+	s.buttons = GAMEPAD_BTN_DPAD_UP | GAMEPAD_BTN_DPAD_LEFT;
+
+	struct gamepad_touch_hand l, r;
+	gamepad_map_touch_hand(&s, true, 0.15f, 0.25f, &l);
+	gamepad_map_touch_hand(&s, false, 0.15f, 0.25f, &r);
+	CHECK(r.thumbstick_x == -1.0f);
+	CHECK(r.thumbstick_y == 1.0f);
+	CHECK(l.thumbstick_x == 0.0f);
+	CHECK(l.thumbstick_y == 0.0f);
+
+	s.buttons |= GAMEPAD_BTN_VIEW;
+	gamepad_map_touch_hand(&s, true, 0.15f, 0.25f, &l);
+	gamepad_map_touch_hand(&s, false, 0.15f, 0.25f, &r);
+	CHECK(l.thumbstick_x == -1.0f);
+	CHECK(l.thumbstick_y == 1.0f);
+	CHECK(r.thumbstick_x == 0.0f);
+	CHECK(r.thumbstick_y == 0.0f);
+}
+
+TEST_CASE("gamepad map: touch sticks move their own hand, stick click switches to depth", "[gamepad_map][touch]")
+{
+	struct gamepad_state s = connected_state();
+	s.left_x = 1.0f;
+	s.right_y = 1.0f;
+
+	struct gamepad_touch_hand l, r;
+	gamepad_map_touch_hand(&s, true, 0.15f, 0.5f, &l);
+	gamepad_map_touch_hand(&s, false, 0.15f, 0.5f, &r);
+	CHECK(std::fabs(l.velocity_mps.x - (0.5f)) < kEps);
+	CHECK(l.velocity_mps.y == 0.0f);
+	CHECK(std::fabs(r.velocity_mps.y - (0.5f)) < kEps);
+	CHECK(r.velocity_mps.z == 0.0f);
+
+	// Right stick clicked in: up pushes the right hand INTO the screen (−Z).
+	s.buttons = GAMEPAD_BTN_THUMB_RIGHT;
+	gamepad_map_touch_hand(&s, false, 0.15f, 0.5f, &r);
+	CHECK(r.velocity_mps.x == 0.0f);
+	CHECK(r.velocity_mps.y == 0.0f);
+	CHECK(std::fabs(r.velocity_mps.z - (-0.5f)) < kEps);
+
+	// Inside the deadzone nothing moves; disconnected yields zeros.
+	s = connected_state();
+	s.left_x = 0.1f;
+	gamepad_map_touch_hand(&s, true, 0.15f, 0.5f, &l);
+	CHECK(l.velocity_mps.x == 0.0f);
+	s.connected = false;
+	s.left_trigger = 1.0f;
+	gamepad_map_touch_hand(&s, true, 0.15f, 0.5f, &l);
+	CHECK(l.trigger == 0.0f);
+}
+
+TEST_CASE("gamepad map: a quick View tap recenters, a hold or View + D-pad does not", "[gamepad_map][touch]")
+{
+	const int64_t ms = 1000LL * 1000;
+	struct gamepad_state up = connected_state();
+	struct gamepad_state view = connected_state();
+	view.buttons = GAMEPAD_BTN_VIEW;
+	struct gamepad_state view_dpad = connected_state();
+	view_dpad.buttons = GAMEPAD_BTN_VIEW | GAMEPAD_BTN_DPAD_UP;
+
+	struct gamepad_tap tap = {};
+	CHECK_FALSE(gamepad_map_view_tap(&tap, &view, 1000 * ms));
+	CHECK(gamepad_map_view_tap(&tap, &up, 1100 * ms));
+	CHECK_FALSE(gamepad_map_view_tap(&tap, &up, 1200 * ms)); // fires once
+
+	CHECK_FALSE(gamepad_map_view_tap(&tap, &view, 2000 * ms));
+	CHECK_FALSE(gamepad_map_view_tap(&tap, &up, 2600 * ms)); // held too long
+
+	CHECK_FALSE(gamepad_map_view_tap(&tap, &view, 3000 * ms));
+	CHECK_FALSE(gamepad_map_view_tap(&tap, &view_dpad, 3050 * ms));
+	CHECK_FALSE(gamepad_map_view_tap(&tap, &up, 3100 * ms)); // steered the left stick
+}

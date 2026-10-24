@@ -46,6 +46,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 
 
@@ -76,8 +78,12 @@ gamepad_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 	(void)inst;
 	*out_count = 0;
 
-	const bool nav = gamepad_setting_on("NAV", true);
 	const bool emulate = gamepad_setting_on("EMULATE_CONTROLLERS", true);
+	char profile[16];
+	const bool touch = emulate && gamepad_setting("EMULATE_PROFILE", profile, sizeof(profile)) &&
+	                   strcmp(profile, "touch") == 0;
+	// Touch hands take the sticks, so the rig would fight them: off unless asked for.
+	const bool nav = gamepad_setting_on("NAV", !touch);
 	const uint32_t needed = 1 + (nav ? 1 : 0) + (emulate ? 2 : 0);
 	if (max_count < needed) {
 		return XRT_ERROR_ALLOCATION;
@@ -104,7 +110,24 @@ gamepad_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 	if (nav) {
 		devs[n++] = gamepad_create_navigation(hub);
 	}
-	if (emulate) {
+	if (touch) {
+		struct gamepad_touch_config tcfg = {
+		    .deadzone = cfg.map.deadzone,
+		    .hand_speed_mps = gamepad_setting_float("HAND_SPEED", 0.25f, 0.01f, 5.0f),
+		    .right_home = {0.08f, -0.04f, 0.12f},
+		};
+		char home[64];
+		if (gamepad_setting("HAND_HOME", home, sizeof(home))) {
+			struct xrt_vec3 v;
+			if (sscanf(home, "%f,%f,%f", &v.x, &v.y, &v.z) == 3) {
+				tcfg.right_home = v;
+			} else {
+				U_LOG_W("gamepad: HAND_HOME '%s' is not x,y,z — keeping the default.", home);
+			}
+		}
+		devs[n++] = gamepad_create_touch_controller(hub, XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, &tcfg);
+		devs[n++] = gamepad_create_touch_controller(hub, XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER, &tcfg);
+	} else if (emulate) {
 		devs[n++] = gamepad_create_emulated_controller(hub, XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER);
 		devs[n++] = gamepad_create_emulated_controller(hub, XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER);
 	}
@@ -134,7 +157,8 @@ gamepad_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 	gamepad_hub_release(hub);
 
 	U_LOG_W("gamepad: %u device(s) — pad%s%s; a present pad takes the gamepad role%s%s.", n,
-	        nav ? ", navigation" : "", emulate ? ", emulated left/right controllers" : "",
+	        nav ? ", navigation" : "",
+	        touch ? ", emulated left/right Touch controllers" : emulate ? ", emulated left/right controllers" : "",
 	        nav ? " and the rig" : "", emulate ? " and the hand roles" : "");
 	return XRT_SUCCESS;
 }
