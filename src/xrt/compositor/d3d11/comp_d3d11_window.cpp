@@ -61,6 +61,13 @@ DEBUG_GET_ONCE_OPTION(hosted_window, "DXR_HOSTED_WINDOW", "auto")
 // menu bar. Default: the whole client area.
 DEBUG_GET_ONCE_OPTION(hosted_inset, "DXR_HOSTED_INSET", "0,0,0,0")
 
+// An app whose viewer moves inside its window (docked panels) publishes the
+// viewer's rect itself, live, as this property on its main window: physical
+// pixels of its client area packed as x | y << 16 | width << 32 | height << 48
+// (SetPropW(main_hwnd, L"DXR_HostedViewRect", (HANDLE)packed); 0 or removed =
+// back to DXR_HOSTED_INSET). Read with GetPropW, which sends the app nothing.
+static const wchar_t *const kHostedViewRectProp = L"DXR_HostedViewRect";
+
 // Marker for SendInput-injected mouse events — WndProc skips re-forwarding these.
 // Used to break the loop: WndProc→SendInput→WM_LBUTTONDOWN→WndProc.
 #define WORKSPACE_SENDINPUT_MARKER 0xD15B1A7E
@@ -199,6 +206,9 @@ struct comp_d3d11_window
 
 	//! F11 while embedded: cover the whole panel instead of the app's viewer (window thread).
 	volatile LONG embed_fullscreen;
+
+	//! The host's DXR_HostedViewRect as last applied (window thread).
+	uint64_t embed_view_rect;
 
 	//! Window thread handle
 	HANDLE thread_handle;
@@ -684,6 +694,9 @@ set_fullscreen(HWND hWnd, bool fullscreen)
 //! How often, and for how long, "embed" mode keeps looking.
 #define DXR_EMBED_SEARCH_PERIOD_MS 500
 #define DXR_EMBED_SEARCH_TRIES 60
+//! WM_TIMER id and period: re-read the app's published viewer rect.
+#define DXR_EMBED_RECT_TIMER 0xE3B1
+#define DXR_EMBED_RECT_PERIOD_MS 250
 
 //! The window this thread embeds — WinEvent callbacks carry no context, and
 //! each comp_d3d11_window has its own thread.
@@ -745,8 +758,9 @@ embed_find_host(void)
 }
 
 /*!
- * Cover the app's viewer: the host's client area minus DXR_HOSTED_INSET, in
- * screen coordinates (we are owned, not a child) — or, after F11, the whole
+ * Cover the app's viewer: the rect the app publishes as DXR_HostedViewRect, else
+ * the host's client area minus DXR_HOSTED_INSET, in screen coordinates (we are
+ * owned, not a child) — or, after F11, the whole
  * monitor the host is on. @p hwnd is ours: w->hwnd is only published once
  * creation finishes, after the first fit.
  */
@@ -757,6 +771,8 @@ embed_fit(struct comp_d3d11_window *w, HWND hwnd)
 	if (host == NULL || hwnd == NULL) {
 		return;
 	}
+	const uint64_t view = (uint64_t)(uintptr_t)GetPropW(host, kHostedViewRectProp);
+	w->embed_view_rect = view;
 	if (InterlockedCompareExchange(&w->embed_fullscreen, 0, 0) != 0) {
 		MONITORINFO mi = {sizeof(mi)};
 		if (GetMonitorInfo(MonitorFromWindow(host, MONITOR_DEFAULTTONEAREST), &mi)) {
@@ -771,13 +787,24 @@ embed_fit(struct comp_d3d11_window *w, HWND hwnd)
 	if (!GetClientRect(host, &rc) || !ClientToScreen(host, &origin)) {
 		return;
 	}
-	const float scale = (float)GetDpiForWindow(host) / 96.0f;
-	const LONG l = (LONG)(w->embed_inset[0] * scale + 0.5f);
-	const LONG t = (LONG)(w->embed_inset[1] * scale + 0.5f);
-	const LONG r = (LONG)(w->embed_inset[2] * scale + 0.5f);
-	const LONG b = (LONG)(w->embed_inset[3] * scale + 0.5f);
-	const LONG cw = rc.right - l - r;
-	const LONG ch = rc.bottom - t - b;
+	LONG l, t, cw, ch;
+	if (view != 0) {
+		// Clamped to the client area: the app's rect may lag a resize.
+		l = (LONG)(view & 0xFFFF);
+		t = (LONG)((view >> 16) & 0xFFFF);
+		cw = (LONG)((view >> 32) & 0xFFFF);
+		ch = (LONG)((view >> 48) & 0xFFFF);
+		cw = l + cw > rc.right ? rc.right - l : cw;
+		ch = t + ch > rc.bottom ? rc.bottom - t : ch;
+	} else {
+		const float scale = (float)GetDpiForWindow(host) / 96.0f;
+		l = (LONG)(w->embed_inset[0] * scale + 0.5f);
+		t = (LONG)(w->embed_inset[1] * scale + 0.5f);
+		const LONG r = (LONG)(w->embed_inset[2] * scale + 0.5f);
+		const LONG b = (LONG)(w->embed_inset[3] * scale + 0.5f);
+		cw = rc.right - l - r;
+		ch = rc.bottom - t - b;
+	}
 	if (cw <= 0 || ch <= 0) {
 		return;
 	}
@@ -831,6 +858,8 @@ embed_adopt(struct comp_d3d11_window *w, HWND hwnd, HWND host)
 	             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 	embed_fit(w, hwnd);
 	ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+	// A published viewer rect changes without the host window moving.
+	SetTimer(hwnd, DXR_EMBED_RECT_TIMER, DXR_EMBED_RECT_PERIOD_MS, NULL);
 
 	RECT rc = {0};
 	GetClientRect(host, &rc);
@@ -1242,6 +1271,14 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			}
 			if (w->embed_host != NULL || ++w->embed_search_tries >= DXR_EMBED_SEARCH_TRIES) {
 				KillTimer(hWnd, DXR_EMBED_SEARCH_TIMER);
+			}
+			return 0;
+		}
+		if (wParam == DXR_EMBED_RECT_TIMER) {
+			HWND host = w->embed_host;
+			if (host != NULL &&
+			    (uint64_t)(uintptr_t)GetPropW(host, kHostedViewRectProp) != w->embed_view_rect) {
+				embed_fit(w, hWnd);
 			}
 			return 0;
 		}
