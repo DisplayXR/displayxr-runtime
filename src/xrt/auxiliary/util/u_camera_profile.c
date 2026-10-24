@@ -149,6 +149,8 @@ u_camera_profile_parse(const char *json, float aspect, struct u_camera_profile *
 			bit = 8;
 		else if (strcmp(key, "metersToVirtual") == 0 || strcmp(key, "renderedBaselineMeters") == 0)
 			bit = 16;
+		else if (strcmp(key, "pitchDegrees") == 0)
+			bit = 32;
 		if (bit == 0 || (seen & bit)) {
 			ok = false;
 			reason = "unknown, duplicate or conflicting camera profile key";
@@ -191,6 +193,13 @@ u_camera_profile_parse(const char *json, float aspect, struct u_camera_profile *
 				value = 2.0 * atan(tan(horizontal * 0.5) / aspect);
 			}
 			result.half_tan_vfov = (float)tan(bounded(value, 0.01, 3.13) * 0.5);
+		} else if (bit == 32) {
+			if (!(value >= -89.0 && value <= 89.0)) {
+				ok = false;
+				reason = "pitchDegrees must be between -89 and 89";
+				break;
+			}
+			result.pitch_rad = (float)(value * (3.141592653589793 / 180.0));
 		} else {
 			if (strcmp(key, "renderedBaselineMeters") == 0) {
 				if (value <= 0) {

@@ -1558,6 +1558,14 @@ reset_view_tuning(struct qwerty_system *qs)
 	qs->disp_perspective = 1.0f;
 }
 
+//! The camera's starting look: level, or the profile's pitchDegrees (about +X; negative looks down).
+static struct xrt_quat
+initial_orientation(const struct qwerty_system *qs)
+{
+	const float pitch = qs->camera_profile_active ? qs->camera_profile.pitch_rad : 0.0f;
+	return (struct xrt_quat){sinf(pitch * 0.5f), 0.0f, 0.0f, cosf(pitch * 0.5f)};
+}
+
 void
 qwerty_reset_view_state(struct qwerty_system *qs)
 {
@@ -1565,7 +1573,7 @@ qwerty_reset_view_state(struct qwerty_system *qs)
 	reset_view_tuning(qs);
 	if (qs->hmd != NULL) {
 		qs->hmd->base.pose.position = QWERTY_HMD_CAMERA_POS;
-		qs->hmd->base.pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		qs->hmd->base.pose.orientation = initial_orientation(qs);
 	}
 
 	U_LOG_W("Qwerty: view state reset to %s", qs->camera_profile_active ? "camera profile" : "camera defaults");
@@ -1596,6 +1604,11 @@ qwerty_set_camera_profile(struct xrt_device **xdevs, size_t count, const struct 
 		qs->camera_profile_active = true;
 		qs->camera_profile = *profile;
 		set_camera_tuning(qs, profile);
+		// Start looking where the profile says. The profile seeds once, at the
+		// first eligible session, before the user has navigated.
+		if (qs->hmd != NULL && profile->pitch_rad != 0.0f) {
+			qs->hmd->base.pose.orientation = initial_orientation(qs);
+		}
 	}
 	os_mutex_unlock(&qs->view_lock);
 	return available;
