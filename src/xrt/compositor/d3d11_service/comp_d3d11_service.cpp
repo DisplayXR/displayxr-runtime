@@ -1556,6 +1556,15 @@ struct d3d11_service_compositor
 	uint64_t read_done_value;      //!< last value queued on the signal (commit thread only)
 	int64_t read_done_drop_log_ns; //!< 1/s throttle for the drop-not-defer log
 
+	//! #2320 -- commit-semaphore wait for clients NOT on the workspace_sync_fence
+	//! path (the D3D12 IPC client). All on the client's IPC thread.
+	bool commit_sem_stale = false;              //!< this commit's semaphore timed out: views stale
+	bool commit_sem_wait_logged = false;        //!< WARN-once oracle
+	int64_t commit_sem_window_start_ns = 0;     //!< [FENCE] commit_sem 10 s window
+	uint32_t commit_sem_complete_in_window = 0; //!< already complete, no wait
+	uint32_t commit_sem_reached_in_window = 0;  //!< reached within the bounded wait
+	uint32_t commit_sem_timeout_in_window = 0;  //!< timed out -> views stale, tile reused
+
 	//! XR_DXR_display_zones (#551) — standalone wish-over-IPC publish state.
 	//! Mirrors the in-process auto-wish raster (comp_d3d11_compositor's
 	//! d3d11_update_zone_wish_mask): an R8_UNORM union-of-zone-rects mask,
@@ -21308,6 +21317,9 @@ service_acquire_source_image(struct d3d11_service_system *sys,
                              uint32_t *acquired_count,
                              uint32_t acquired_cap)
 {
+	if (c->commit_sem_stale) {
+		return false; // #2320: this commit's semaphore timed out -- treat the source as stale.
+	}
 	if (!sc->service_created || sc->images[img].keyed_mutex == nullptr) {
 		return true; // No cross-process mutex on this image.
 	}
@@ -24574,6 +24586,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				continue;
 			}
 
+			if (c->commit_sem_stale) {
+				// #2320: the commit semaphore did not complete within its
+				// bounded wait -- the image may still be mid-render. Reuse
+				// the tile's previous composite (frozen, never torn).
+				view_skip_blit[eye] = true;
+				view_zc_eligible[eye] = false;
+				continue;
+			}
 			if (view_scs[eye]->service_created && view_scs[eye]->images[view_img_indices[eye]].keyed_mutex) {
 				// Phase 2 fence path is opt-in per client. The service
 				// always creates a workspace_sync_fence at session-create,
@@ -27082,12 +27102,156 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	return XRT_SUCCESS;
 }
 
+/*!
+ * #2320 -- the bounded CPU wait budget for a commit semaphore, in ms.
+ *
+ * `DXR_IPC_SEM_WAIT_MS` (0-33; 0 = the semaphore is ignored as before #2320 --
+ * the A/B switch, logged once).
+ * Default: ONE present period of the client's own screen (~16 ms at 60 Hz). It
+ * is larger than `DXR_FENCE_WAIT_MS`'s 4 ms on purpose: what it blocks is THIS
+ * client's own IPC thread for THIS client's own GPU frame -- the D3D12 client's
+ * already-accepted "local blocking" fallback, and where the #1019 commit pacing
+ * already blocks. No other client and no render-thread work waits on it.
+ */
+static int
+svc_commit_sem_wait_ms(const struct d3d11_service_compositor *c)
+{
+	static int env_ms = -2; // -2 = not read yet, -1 = unset
+	if (env_ms == -2) {
+		const char *e = getenv("DXR_IPC_SEM_WAIT_MS");
+		env_ms = (e != nullptr && e[0] != '\0') ? std::max(0, std::min(atoi(e), 33)) : -1;
+	}
+	if (env_ms >= 0) {
+		return env_ms;
+	}
+	const float hz = svc_client_hz(c);
+	int ms = hz > 1.0f ? (int)(1000.0f / hz + 0.5f) : 16;
+	return std::max(1, std::min(ms, 33));
+}
+
+/*!
+ * #2320 -- has the client's GPU reached `value` on its commit semaphore?
+ *
+ * The same bounded-CPU-wait shape as service_fence_reached() (#922: never queue
+ * a GPU Wait on the shared immediate context for a client-promised value; a
+ * client that dies before signalling would jam the weave, every blit and every
+ * other client), on the semaphore's fence instead of workspace_sync_fence. The
+ * verdict is always re-read from GetCompletedValue() after the wait.
+ */
+static bool
+service_commit_sem_reached(struct d3d11_service_compositor *c, ID3D11Fence *fence, uint64_t value, int wait_ms)
+{
+	if (c->fence_wait_event == nullptr) {
+		return fence->GetCompletedValue() >= value;
+	}
+	ResetEvent(c->fence_wait_event);
+	if (FAILED(fence->SetEventOnCompletion(value, c->fence_wait_event))) {
+		return fence->GetCompletedValue() >= value;
+	}
+	WaitForSingleObject(c->fence_wait_event, (DWORD)wait_ms);
+	return fence->GetCompletedValue() >= value;
+}
+
+/*!
+ * #2320 -- honour the commit semaphore of a client that is NOT on the
+ * workspace_sync_fence path (the D3D12 IPC client).
+ *
+ * That client cannot hold the swapchain's keyed mutex, so the legacy
+ * AcquireSync(0, 4 ms) succeeds trivially and orders nothing; until #2320 the
+ * semaphore was dropped too, and the service could sample an image before the
+ * client's GPU work had finished.
+ *
+ * The wait runs HERE, on the client's own IPC thread, with no lock held
+ * (c->mutex is taken inside compositor_layer_commit) -- not as a GPU Wait on
+ * sys->context. A GPU Wait on the shared, in-order immediate context would make
+ * one slow client's frame stall every other client's blit, the compose, the
+ * weave and Present (ADR-035 D3: one client never sets the weave cadence), and
+ * a value that never arrives would be #922 again. Here the worst case is that
+ * THIS client's commit returns a budget later.
+ *
+ * Timeout: the commit's views are marked stale (`c->commit_sem_stale`, read
+ * by the projection loop and service_acquire_source_image): each tile keeps
+ * its previous composite -- frozen, never torn -- exactly what the
+ * workspace_sync_fence path does when service_fence_reached() times out.
+ */
+static void
+svc_commit_sem_wait(struct d3d11_service_compositor *c, struct xrt_compositor_semaphore *xcsem, uint64_t value)
+{
+	c->commit_sem_stale = false;
+	if (xcsem == nullptr || value == 0) {
+		return;
+	}
+	// workspace_sync_fence clients are ordered by #922's path; leave them be.
+	if (c->workspace_sync_fence && c->last_signaled_fence_value.load(std::memory_order_acquire) != 0) {
+		return;
+	}
+	struct d3d11_service_semaphore *sem = d3d11_service_semaphore_from_xrt(xcsem);
+	if (sem->sys != c->sys || !sem->fence) {
+		return;
+	}
+	ID3D11Fence *fence = sem->fence.get();
+	const int wait_ms = svc_commit_sem_wait_ms(c);
+	if (wait_ms == 0) {
+		static bool s_logged_off = false;
+		if (!s_logged_off) {
+			s_logged_off = true;
+			U_LOG_W(
+			    "[FENCE] #2320: DXR_IPC_SEM_WAIT_MS=0 -- commit semaphores IGNORED (pre-#2320 "
+			    "behaviour, A/B only): no ordering for D3D12 IPC clients");
+		}
+		return;
+	}
+
+	if (fence->GetCompletedValue() >= value) {
+		c->commit_sem_complete_in_window++; // fast path: already done, no wait
+	} else {
+		if (!c->commit_sem_wait_logged) {
+			c->commit_sem_wait_logged = true;
+			U_LOG_W(
+			    "[FENCE] client=%p #2320: first commit-semaphore wait armed (value=%llu, bounded "
+			    "CPU wait %d ms on this client's IPC thread; timeout = views stale, tile reused)",
+			    (void *)c, (unsigned long long)value, wait_ms);
+		}
+		if (service_commit_sem_reached(c, fence, value, wait_ms)) {
+			c->commit_sem_reached_in_window++;
+		} else {
+			// Same verdict as an `incomplete` view on the fence path. No #1215
+			// drop-not-defer step is needed: read_done is signalled only with
+			// a workspace_sync_fence value, which this client never ships, so
+			// no app wait_image is gated on a read we are skipping.
+			c->commit_sem_stale = true;
+			c->commit_sem_timeout_in_window++;
+		}
+	}
+
+	int64_t now_ns = os_monotonic_get_ns();
+	if (c->commit_sem_window_start_ns == 0) {
+		c->commit_sem_window_start_ns = now_ns;
+	}
+	int64_t window_ns = now_ns - c->commit_sem_window_start_ns;
+	if (window_ns >= 10LL * 1000000000LL) {
+		U_LOG_W("[FENCE] client=%p commit_sem already_complete=%u waits_reached=%u timed_out=%u window_s=%lld",
+		        (void *)c, c->commit_sem_complete_in_window, c->commit_sem_reached_in_window,
+		        c->commit_sem_timeout_in_window, (long long)(window_ns / 1000000000LL));
+		c->commit_sem_window_start_ns = now_ns;
+		c->commit_sem_complete_in_window = 0;
+		c->commit_sem_reached_in_window = 0;
+		c->commit_sem_timeout_in_window = 0;
+	}
+}
+
 static xrt_result_t
 compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
                                         struct xrt_compositor_semaphore *xcsem,
                                         uint64_t value)
 {
-	return compositor_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	// #2320: BEFORE compositor_layer_commit reads any of this commit's images.
+	svc_commit_sem_wait(c, xcsem, value);
+	xrt_result_t xret = compositor_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+	c->commit_sem_stale = false;
+	return xret;
 }
 
 //! HARDWARE 2D/3D request (#533/#575) — the weave-state signal, decoupled from
