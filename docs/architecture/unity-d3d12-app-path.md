@@ -24,8 +24,16 @@ DisplayXR-native app — it drives OpenXR through its own XR pipeline and never 
 
 The provider makes a shipping Unity player behave like the native `cube_handle_d3d12_win`
 handle app: **Unity's XR-Management "DisplayXR Display" provider itself calls `xrCreateSession`**
-(no hook), passing Unity's device on a `XrGraphicsBindingD3D12KHR`/`…D3D11KHR` next-chained to
-an `XrWin32WindowBindingCreateInfoDXR`. It is still *not* a drop-in cube equivalent, for one
+(no hook), passing a graphics binding next-chained to an `XrWin32WindowBindingCreateInfoDXR`. **Which
+device that binding carries depends on the mode:** standalone D3D12 binds a **provider-owned D3D12
+device/queue created on the runtime's adapter LUID** (`ps_create_own_device`) and bridges Unity's
+eyes into the runtime swapchain through an NT-shared 2-slice texture + shared fence (one
+`CopyTextureRegion` per slice per frame) — passing Unity's device and handing the runtime's swapchain
+resources straight to Unity device-removes, because they are raw cross-device pointers; **under the
+shell** (IPC route) the provider aliases **Unity's own device** (`ps_alias_unity_device_d3d12`); a
+D3D11 *built player* binds Unity's device (true zero-copy), a D3D11 *editor* uses an own device +
+bridge. A Unity device on a different adapter than the runtime's refuses to start (a cross-adapter
+bridge presents black). Source of truth: `displayxr-unity` `docs~/architecture/xr-display-provider.md`. It is still *not* a drop-in cube equivalent, for one
 reason that survives the rewrite: **submission model.** Unity submits a **fixed-resolution,
 always-2-view** projection layer (per-eye swapchains sized once at session start, or one
 `arraySize=2` swapchain under Single-Pass-Instanced; `scaleXY` not applied per frame), whereas

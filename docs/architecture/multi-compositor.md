@@ -67,8 +67,14 @@ from compositing ([ADR-007](../adr/ADR-007-compositor-never-weaves.md)), so the 
 Cross-process texture sharing uses the platform-native primitive per API — DXGI shared handles
 (D3D11/D3D12), IOSurface (Metal), and the GL/VK shared-texture paths — never a Vulkan intermediary
 ([ADR-001](../adr/ADR-001-native-compositors-per-graphics-api.md)). The client→service handoff is
-synchronised with a keyed mutex (D3D11 source) or a shared fence (D3D12); the D3D11 leg also has a
-shared-fence model (`workspace_sync_fence`), not only KeyedMutex.
+synchronised with a keyed mutex (D3D11 source); the D3D11 leg also has a shared-fence model
+(`workspace_sync_fence`), not only KeyedMutex. The D3D12 IPC client creates, imports and signals a
+shared fence (`client_d3d12_compositor_init_try_timeline_semaphores` →
+`layer_commit_with_semaphore`), **but the D3D11 service does not wait on it**:
+`compositor_layer_commit_with_semaphore` (`comp_d3d11_service.cpp`) discards the semaphore and value
+and commits with `XRT_GRAPHICS_SYNC_HANDLE_INVALID`, and the client returns without a local wait on
+that path, so D3D12 client→service GPU ordering is currently unenforced (known gap, tracked as #2320; the semaphore must become a GPU-side
+wait on the ingest device).
 
 ## Per-window parallax
 

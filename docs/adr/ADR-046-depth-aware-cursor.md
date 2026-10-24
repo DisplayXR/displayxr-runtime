@@ -257,6 +257,13 @@ compile-safe stubs: `oxr_session_cursor_depth_hand_request()` returns false. The
 content (cursor on the display plane) with a one-time WARN. Wiring vk_native is the next step,
 and it can be tested on macOS through MoltenVK.
 
+*Note (2026-10-23, #2317 audit):* this paragraph is about the Phase 3a depth *patch* only, and
+still holds (`oxr_session_cursor_depth_hand_request()` returns false for everything but Metal).
+The Amendment 3 *measured-disparity* source is separate and has since landed on every in-process
+native compositor (vk_native, D3D11, D3D12, GL, Metal) and the D3D11 service
+(`oxr_session_cursor_measure_hand_request()`), so those paths do not fall back to "no content"
+when the app opts into measurement.
+
 **Evidence** (macOS, sim_display SBS, `cube_handle_metal_macos`, atlas captures 1512×1646, cursor
 x offset between the two stacked tiles):
 
