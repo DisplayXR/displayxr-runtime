@@ -1,13 +1,14 @@
 ---
-status: Proposed
+status: Accepted
 date: 2026-10-24
 source: "#2317"
 ---
 # ADR-059: One D3D11 hub compositor on Windows; the per-API in-process compositors become import shims
 
-**Status:** Proposed (2026-10-24). Phase 1 of epic #2317 is implemented default-OFF behind
-`DXR_HUB=1` (PR #2321) with its A/B harness (PR #2323); no default changes until this ADR is
-accepted. Related: [ADR-001](ADR-001-native-compositors-per-graphics-api.md) (amended, not
+**Status:** Accepted (David, 2026-10-24; proposed the same day). Phase 1 of epic #2317 is
+implemented default-OFF behind `DXR_HUB=1` (PR #2321) with its A/B harness (PR #2323); Phase 2
+has landed the planes through the hub (#2335). Defaults still flip only per API behind the
+acceptance gates below. Related: [ADR-001](ADR-001-native-compositors-per-graphics-api.md) (amended, not
 superseded), [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md)
 D3, [ADR-037](ADR-037-adapter-placement-policy-hybrid-devices.md),
 [ADR-039](ADR-039-one-fill-engine-for-every-tier.md),
@@ -214,6 +215,20 @@ than the copy count predicts (DIRECT ingress: not worse at all), 60/60/0 witness
 engaged on the hybrid, repaint cadence preserved under the frame divisor, the full test matrix
 (zones, Local2D, cursor, transparency, capture, multi-screen segments, the ADR-044 oracle,
 `displayxr-cli selftest`) green, and — for Unity, Unreal and the browser — the Phase 4 checks.
+
+## Amendment 1 (2026-10-24) — bridge ingress is one frame stale; direct ingress is a frame fresher
+
+The measurements above said the DIRECT and xbridge ingress modes were "within noise". That is
+true of the residual R (weave→scanout) and false of content age. Once the hub pairs each weave
+with the predicted display time of the frame it actually shows (#2336, the fix for #2327), every
+xbridge arm reads D ≈ +16.7 ms — one refresh — while DIRECT reads +0.03 ms: `comp_xbridge_pick_slot`
+selects the newest slot whose cross-adapter copy has *completed* on a CPU check, which right after a
+submit is the previous frame. The shipped D3D11 and D3D12 own-split routes use the same pick, so the
+hybrid-topology motion-to-photon figures in ADR-037 and in the table above carry one frame of transport
+latency the old D rows hid. Tracked as #2337 (experiment: GPU-wait the in-flight slot on the app-frame
+weave). Consequence for this ADR: on a single adapter the shims take DIRECT ingress (#2336, a default
+change on the already-default hub routes, gated on the single-dGPU desktop run and the engine checks);
+cross-adapter stays xbridge until #2337 is settled.
 
 ## References
 
