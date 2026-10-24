@@ -1589,7 +1589,7 @@ find_qwerty_system(struct xrt_device **xdevs, size_t count)
 }
 
 bool
-qwerty_set_depth(struct xrt_device **xdevs, size_t count, float strength, float convergence_m)
+qwerty_set_depth(struct xrt_device **xdevs, size_t count, float strength, float convergence_m, bool relative)
 {
 	struct qwerty_system *qs = find_qwerty_system(xdevs, count);
 	if (qs == NULL) {
@@ -1599,7 +1599,12 @@ qwerty_set_depth(struct xrt_device **xdevs, size_t count, float strength, float 
 	if (qs->camera_mode) {
 		// Same comfort clamps as qwerty_adjust_view_factor / _convergence.
 		dxr_rig_display_info info = {qs->screen_height_m, 1.0f, qs->nominal_viewer_z};
-		if (strength > 0.0f) {
+		if (strength > 0.0f && !relative) {
+			dxr_camera_rig cam = {.inv_convergence_distance = qs->cam_convergence, .m2v = qs->cam_m2v};
+			const float v = clampf(strength, 0.01f, dxr_rig_max_ipd_factor(&cam, &info));
+			qs->cam_spread_factor = v;
+			qs->cam_parallax_factor = v;
+		} else if (strength > 0.0f) {
 			// Relative to what the app's profile seeded, so 1 is each app's own
 			// nominal (a true-geometry rig seeds ~0.03, the default rig 1).
 			const float base = qs->cam_spread_base > 0.0f ? qs->cam_spread_base : 1.0f;
@@ -1629,7 +1634,8 @@ qwerty_set_depth(struct xrt_device **xdevs, size_t count, float strength, float 
 }
 
 bool
-qwerty_get_depth(struct xrt_device **xdevs, size_t count, float *out_strength, float *out_convergence_m)
+qwerty_get_depth(
+    struct xrt_device **xdevs, size_t count, float *out_strength, float *out_relative, float *out_convergence_m)
 {
 	struct qwerty_system *qs = find_qwerty_system(xdevs, count);
 	if (qs == NULL) {
@@ -1637,7 +1643,8 @@ qwerty_get_depth(struct xrt_device **xdevs, size_t count, float *out_strength, f
 	}
 	os_mutex_lock(&qs->view_lock);
 	const float base = qs->cam_spread_base > 0.0f ? qs->cam_spread_base : 1.0f;
-	*out_strength = qs->camera_mode ? qs->cam_spread_factor / base : qs->disp_spread_factor;
+	*out_strength = qs->camera_mode ? qs->cam_spread_factor : qs->disp_spread_factor;
+	*out_relative = qs->camera_mode ? qs->cam_spread_factor / base : qs->disp_spread_factor;
 	*out_convergence_m = qs->camera_mode && qs->cam_convergence > 0.0f ? 1.0f / qs->cam_convergence : 0.0f;
 	os_mutex_unlock(&qs->view_lock);
 	return true;

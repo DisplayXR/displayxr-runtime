@@ -76,14 +76,18 @@ static const wchar_t *const kHostedViewRectProp = L"DXR_HostedViewRect";
 DEBUG_GET_ONCE_BOOL_OPTION(hosted_ui_peek, "DXR_HOSTED_UI_PEEK", true)
 
 // Live stereo depth for an embedded app, set by any helper (a depth slider)
-// as a property on the app's main window: strength (stereo relative to the
-// app's own seeded rig, 1 = its nominal) x 1000 | convergence distance in
-// mm << 16; a 0 field leaves
+// as a property on the app's main window: strength (absolute camera IPD /
+// parallax factor) x 1000 | convergence distance in mm << 16; a 0 field leaves
 // that setting alone. The runtime applies it on its 250 ms rect poll and
 // publishes the values in effect, same packing, as DXR_HostedDepthNow on the
 // same window, so a slider can start from them.
 static const wchar_t *const kHostedDepthProp = L"DXR_HostedDepth";
 static const wchar_t *const kHostedDepthNowProp = L"DXR_HostedDepthNow";
+// The same with strength relative to the app's own seeded rig (1 = its
+// nominal, whatever ipdFactor its camera profile set), for a shared slider.
+// Whichever of the two a helper changed last wins; both are published.
+static const wchar_t *const kHostedDepthRelProp = L"DXR_HostedDepthRel";
+static const wchar_t *const kHostedDepthRelNowProp = L"DXR_HostedDepthRelNow";
 
 // Marker for SendInput-injected mouse events — WndProc skips re-forwarding these.
 // Used to break the loop: WndProc→SendInput→WM_LBUTTONDOWN→WndProc.
@@ -230,6 +234,8 @@ struct comp_d3d11_window
 	//! The host's DXR_HostedDepth as last applied, and DXR_HostedDepthNow as last published (window thread).
 	uint64_t embed_depth;
 	uint64_t embed_depth_now;
+	uint64_t embed_depth_rel;
+	uint64_t embed_depth_rel_now;
 
 	//! UI peek (DXR_HOSTED_UI_PEEK): the 3D view is hidden so the app's own
 	//! menus and dialogs show; button/key states for edge detection (window thread).
@@ -936,17 +942,31 @@ embed_sync_depth(struct comp_d3d11_window *w, HWND host)
 		w->embed_depth = want;
 		const float strength = (float)(want & 0xFFFF) / 1000.0f;
 		const float convergence_m = (float)((want >> 16) & 0xFFFF) / 1000.0f;
-		qwerty_set_depth(w->xsysd->xdevs, w->xsysd->xdev_count, strength, convergence_m);
+		qwerty_set_depth(w->xsysd->xdevs, w->xsysd->xdev_count, strength, convergence_m, false);
+	}
+	const uint64_t want_rel = (uint64_t)(uintptr_t)GetPropW(host, kHostedDepthRelProp);
+	if (want_rel != w->embed_depth_rel) {
+		w->embed_depth_rel = want_rel;
+		qwerty_set_depth(w->xsysd->xdevs, w->xsysd->xdev_count, (float)(want_rel & 0xFFFF) / 1000.0f,
+		                 (float)((want_rel >> 16) & 0xFFFF) / 1000.0f, true);
 	}
 	float strength = 0.0f;
+	float relative = 0.0f;
 	float convergence_m = 0.0f;
-	if (qwerty_get_depth(w->xsysd->xdevs, w->xsysd->xdev_count, &strength, &convergence_m)) {
+	if (qwerty_get_depth(w->xsysd->xdevs, w->xsysd->xdev_count, &strength, &relative, &convergence_m)) {
 		const uint64_t s = (uint64_t)(strength * 1000.0f + 0.5f);
+		const uint64_t r = (uint64_t)(relative * 1000.0f + 0.5f);
 		const uint64_t c = (uint64_t)(convergence_m * 1000.0f + 0.5f);
-		const uint64_t now = (s > 0xFFFF ? 0xFFFF : s) | (c > 0xFFFF ? 0xFFFF : c) << 16;
+		const uint64_t cf = (c > 0xFFFF ? 0xFFFF : c) << 16;
+		const uint64_t now = (s > 0xFFFF ? 0xFFFF : s) | cf;
+		const uint64_t rel_now = (r > 0xFFFF ? 0xFFFF : r) | cf;
 		if (now != w->embed_depth_now) {
 			w->embed_depth_now = now;
 			SetPropW(host, kHostedDepthNowProp, (HANDLE)(uintptr_t)now);
+		}
+		if (rel_now != w->embed_depth_rel_now) {
+			w->embed_depth_rel_now = rel_now;
+			SetPropW(host, kHostedDepthRelNowProp, (HANDLE)(uintptr_t)rel_now);
 		}
 	}
 #else
