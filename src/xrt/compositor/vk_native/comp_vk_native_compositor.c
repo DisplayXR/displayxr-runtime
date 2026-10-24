@@ -501,6 +501,11 @@ struct comp_vk_native_compositor
 	VkCommandBuffer ws_cmd[VK_SPLIT_PLANE_CMD_RING];
 	uint64_t ws_cmd_value[VK_SPLIT_PLANE_CMD_RING];
 	uint32_t ws_cmd_next;
+	//! #2340 — the PQ re-encode pass's own ring, recycled the same way.
+	VkCommandPool pq_cmd_pool;
+	VkCommandBuffer pq_cmd[VK_SPLIT_PLANE_CMD_RING];
+	uint64_t pq_cmd_value[VK_SPLIT_PLANE_CMD_RING];
+	uint32_t pq_cmd_next;
 	/*!
 	 * Last frame's composite region. A change means the panel-sized plane holds
 	 * stale pixels outside the new region, so the whole surface is re-cleared and
@@ -640,6 +645,30 @@ struct comp_vk_native_compositor
 	 * moves — a fresh DP's state is unknown.
 	 */
 	int dp_atlas_encoding_latched;
+
+	/*!
+	 * #2340 DXR_ATLAS_ENCODING=pq (experimental, needs DXR_ATLAS_FORMAT=rgb10a2).
+	 *
+	 * Vulkan DP path: @ref pq_dp_asked is the DP the `accepts_atlas_encoding`
+	 * answer in @ref pq_dp_accepts belongs to (NULL = not asked; reset
+	 * wherever the DP pointer moves, like @ref dp_atlas_encoding_latched).
+	 * @ref pq_atlas_now says the atlas the DP is about to read holds PQ code
+	 * values — set per APP frame, kept across a repaint (which replays the
+	 * same, already encoded, atlas) — and is what
+	 * @ref vk_native_atlas_encoding declares.
+	 *
+	 * Split path: the split's D3D11 DP is asked once (@ref pq_split_checked);
+	 * @ref pq_split_active while it weaves PQ.
+	 */
+	struct xrt_display_processor *pq_dp_asked;
+	bool pq_dp_accepts;
+	bool pq_atlas_now;
+	bool pq_split_checked;
+	bool pq_split_active;
+	//! One WARN each, never per frame.
+	bool pq_warned_format;
+	bool pq_warned_override;
+	bool pq_warned_pass;
 
 	//! A 2D/3D request that arrived BEFORE the display processor existed (it is
 	//! created lazily with the first target, while xrRequestDisplayRenderingModeDXR
@@ -5072,6 +5101,8 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 
 static void
 vk_split_composite_window_space(struct comp_vk_native_compositor *c);
+static bool
+vk_split_encode_atlas_pq(struct comp_vk_native_compositor *c);
 //! VK-1b-3 - this frame's authoritative app-authored mask, and the ensure that
 //! must run BEFORE any command is recorded. Defined with the zone helpers.
 struct comp_vk_native_zone_mask;
@@ -5898,6 +5929,9 @@ vk_segments_swap_primary_cb(void *userdata, struct xrt_display_processor *dp)
 	os_mutex_unlock(&c->dp_swap_mutex);
 	// #1484: a fresh DP's colour state is unknown; the weave site re-asserts it.
 	c->dp_atlas_encoding_latched = -1;
+	// #2340: and it has not been asked about PQ.
+	c->pq_dp_asked = NULL;
+	c->pq_atlas_now = false;
 	if (dp != NULL) {
 		struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)dp;
 		c->dp_tolerates_resample = xrt_display_processor_vk_tolerates_resample(vdp);
@@ -6243,7 +6277,16 @@ dxr_vk_atlas_encoding_override(void)
 static inline enum xrt_atlas_encoding
 vk_native_atlas_encoding(const struct comp_vk_native_compositor *c)
 {
-	(void)c;
+	/*
+	 * #2340 — the one linear-ish exception so far, and still not a guess from
+	 * a format: PQ only after THIS DP said it accepts it and the compositor
+	 * itself re-encoded the atlas (vk_maybe_encode_atlas_pq). A DP swapped in
+	 * since (ADR-047 Amendment 2) was not asked, so it is told ENCODED until
+	 * the next app frame asks it.
+	 */
+	if (c->pq_atlas_now && c->pq_dp_asked != NULL && c->display_processor == c->pq_dp_asked) {
+		return XRT_ATLAS_ENCODING_PQ;
+	}
 	return XRT_ATLAS_ENCODING_ENCODED;
 }
 
@@ -6263,9 +6306,25 @@ vk_segments_atlas_encoding(struct comp_vk_native_compositor *c)
 	if (over != DXR_VK_ATLAS_ENCODING_NO_OVERRIDE) {
 		return over;
 	}
-	return (int)vk_native_atlas_encoding(c);
+	const enum xrt_atlas_encoding enc = vk_native_atlas_encoding(c);
+	// #2340: PQ goes only to a DP that accepted it, and the segment DPs on the
+	// other screens were not asked — the in-process D3D11 path does not tell
+	// its segment DPs either.
+	return (int)(enc == XRT_ATLAS_ENCODING_PQ ? XRT_ATLAS_ENCODING_ENCODED : enc);
 }
 #endif
+
+//! #1484 / #2340 — a declared encoding's name for the WARN lines; -1 = none yet.
+static const char *
+vk_atlas_encoding_name(int enc)
+{
+	switch (enc) {
+	case (int)XRT_ATLAS_ENCODING_ENCODED: return "ENCODED";
+	case (int)XRT_ATLAS_ENCODING_LINEAR: return "LINEAR";
+	case (int)XRT_ATLAS_ENCODING_PQ: return "PQ";
+	default: return "undeclared";
+	}
+}
 
 /*!
  * #1484 — assert @p dp's atlas encoding, the way the D3D11 service's
@@ -6298,12 +6357,96 @@ vk_dp_assert_atlas_encoding(struct comp_vk_native_compositor *c,
 	xrt_display_processor_set_atlas_encoding(dp, enc);
 	// One WARN per CHANGE, never per frame (a first declaration counts as a
 	// change, so this fires exactly once on a stable path).
-	U_LOG_W("#1484 VK atlas encoding declared to the DP: %s (was %s)",
-	        enc == XRT_ATLAS_ENCODING_LINEAR ? "LINEAR" : "ENCODED",
-	        c->dp_atlas_encoding_latched < 0                                 ? "undeclared"
-	        : c->dp_atlas_encoding_latched == (int)XRT_ATLAS_ENCODING_LINEAR ? "LINEAR"
-	                                                                         : "ENCODED");
+	U_LOG_W("#1484 VK atlas encoding declared to the DP: %s (was %s)", vk_atlas_encoding_name((int)enc),
+	        vk_atlas_encoding_name(c->dp_atlas_encoding_latched));
 	c->dp_atlas_encoding_latched = (int)enc;
+}
+
+/*!
+ * #2340 — DXR_ATLAS_ENCODING=pq (experimental, needs DXR_ATLAS_FORMAT=rgb10a2):
+ * cached once, like the D3D11 compositor's knob of the same name.
+ */
+static bool
+vk_pq_requested(void)
+{
+	static int requested = -1;
+	if (requested < 0) {
+		const char *v = getenv("DXR_ATLAS_ENCODING");
+		requested =
+		    (v != NULL && (v[0] == 'p' || v[0] == 'P') && (v[1] == 'q' || v[1] == 'Q') && v[2] == '\0') ? 1 : 0;
+	}
+	return requested == 1;
+}
+
+/*!
+ * #2340 — PQ code values need the 10-bit atlas (an 8-bit one would band, a
+ * float one is not what the D3D11 deposit maps to R10G10B10A2). One WARN when
+ * the knob is set over any other format.
+ */
+static bool
+vk_pq_atlas_format_ok(struct comp_vk_native_compositor *c)
+{
+	if (c->renderer != NULL &&
+	    (VkFormat)comp_vk_native_renderer_get_format(c->renderer) == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+		return true;
+	}
+	if (!c->pq_warned_format) {
+		c->pq_warned_format = true;
+		U_LOG_W(
+		    "DXR_ATLAS_ENCODING=pq (#2340, experimental): atlas is not A2B10G10R10 "
+		    "(set DXR_ATLAS_FORMAT=rgb10a2) - keeping the sRGB atlas");
+	}
+	return false;
+}
+
+/*!
+ * #2340 — the Vulkan DP path (no split: Linux, macOS, a same-adapter Windows
+ * box). Re-encode the composed atlas as PQ in @p cmd, but only for a DP that
+ * accepts PQ through the appended `accepts_atlas_encoding` slot; anything else
+ * — unset knob, older DP, 8-bit/16F atlas, zero-copy (@p cmd NULL, no atlas) —
+ * leaves the atlas and the declared encoding exactly as before, with one WARN
+ * saying why. The declaration itself rides vk_native_atlas_encoding, so every
+ * weave site's existing #1484 assert sends it.
+ *
+ * App frames only: a repaint replays the atlas this already encoded.
+ */
+static void
+vk_maybe_encode_atlas_pq(struct comp_vk_native_compositor *c, VkCommandBuffer cmd)
+{
+	c->pq_atlas_now = false;
+	if (!vk_pq_requested() || cmd == VK_NULL_HANDLE || c->display_processor == NULL) {
+		return;
+	}
+	if (dxr_vk_atlas_encoding_override() != DXR_VK_ATLAS_ENCODING_NO_OVERRIDE) {
+		if (!c->pq_warned_override) {
+			c->pq_warned_override = true;
+			U_LOG_W(
+			    "DXR_ATLAS_ENCODING=pq (#2340, experimental): DXR_VK_ATLAS_ENCODING overrides the "
+			    "declaration - keeping the sRGB atlas");
+		}
+		return;
+	}
+	if (!vk_pq_atlas_format_ok(c)) {
+		return;
+	}
+	if (c->pq_dp_asked != c->display_processor) {
+		c->pq_dp_asked = c->display_processor;
+		c->pq_dp_accepts = xrt_display_processor_vk_accepts_atlas_encoding(
+		    (struct xrt_display_processor_vk *)c->display_processor, XRT_ATLAS_ENCODING_PQ);
+		U_LOG_W("DXR_ATLAS_ENCODING=pq (#2340, experimental): %s",
+		        c->pq_dp_accepts ? "Vulkan DP accepts PQ - weaving a PQ atlas"
+		                         : "Vulkan DP does not accept PQ - keeping the sRGB atlas");
+	}
+	if (!c->pq_dp_accepts) {
+		return;
+	}
+	c->pq_atlas_now = comp_vk_native_renderer_encode_atlas_pq(c->renderer, cmd);
+	if (!c->pq_atlas_now && !c->pq_warned_pass) {
+		c->pq_warned_pass = true;
+		U_LOG_W(
+		    "DXR_ATLAS_ENCODING=pq (#2340, experimental): the PQ pass is unavailable - keeping "
+		    "the sRGB atlas");
+	}
 }
 
 
@@ -7711,6 +7854,14 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				    (VkImageView)(uintptr_t)src_view_u64,
 				    atlas_w_pre, atlas_h_pre,
 				    view_width, view_height, tc, tr);
+			}
+
+			// #2340 HDR10 (experimental): PQ-encode the atlas after the
+			// last pass that composes into it and before the crop that
+			// hands it to the DP. Zero-copy has no atlas to encode; a
+			// repaint replays the one this frame already encoded.
+			if (!is_repaint) {
+				vk_maybe_encode_atlas_pq(c, zero_copy ? VK_NULL_HANDLE : cmd);
 			}
 
 			// Crop atlas to content dimensions before passing to DP
@@ -11919,6 +12070,9 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				    view_width, view_height, tc, tr);
 			}
 
+			// #2340 HDR10 (experimental): as on the windowed path.
+			vk_maybe_encode_atlas_pq(c, zero_copy ? VK_NULL_HANDLE : cmd);
+
 			// Crop atlas to content dimensions before passing to DP
 			{
 				uint32_t content_w = tc * view_width;
@@ -12087,6 +12241,13 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		vk_split_composite_window_space(c);
 
 		/*
+		 * #2340 HDR10 (experimental) — PQ-encode the atlas after the
+		 * window-space pass and before the handoff, so the bridge carries a PQ
+		 * atlas to the split's D3D11 weaver, which was told PQ.
+		 */
+		const bool pq_frame_ok = vk_split_encode_atlas_pq(c);
+
+		/*
 		 * VK-1b — the PLANE pass, before the handoff is taken.
 		 *
 		 * Order matters twice. It flattens into deposit-backed surfaces and
@@ -12119,10 +12280,16 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		struct comp_hub_d3d11_handoff handoff = {0};
 		struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
 		if (comp_vk_deposit_get_handoff(dep, &handoff)) {
-			// #1883: the slot carries this frame's segment partition (by its seq).
-			comp_hub_d3d11_stage_segment_content(c->split, &c->seg_content);
-			comp_hub_d3d11_submit_atlas(c->split, &handoff, c->eff_layout.cols, c->eff_layout.rows,
-			                            c->eff_layout.tile_w, c->eff_layout.tile_h);
+			if (pq_frame_ok) {
+				// #1883: the slot carries this frame's segment partition (by its seq).
+				comp_hub_d3d11_stage_segment_content(c->split, &c->seg_content);
+				comp_hub_d3d11_submit_atlas(c->split, &handoff, c->eff_layout.cols, c->eff_layout.rows,
+				                            c->eff_layout.tile_w, c->eff_layout.tile_h);
+			} else {
+				// #2340: an atlas the DP was told is PQ but that missed the
+				// pass. Release the slot unseen; nothing new is woven (F4).
+				U_LOG_I("DXR_ATLAS_ENCODING=pq (#2340): PQ pass skipped this frame - slot not handed over");
+			}
 			/*
 			 * The slot is free again the instant the bridge's staging copy
 			 * has been recorded on this same immediate context — release it
@@ -12801,6 +12968,10 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		vk->vkDestroyCommandPool(vk->device, c->ws_cmd_pool, NULL);
 		c->ws_cmd_pool = VK_NULL_HANDLE;
 	}
+	if (c->pq_cmd_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyCommandPool(vk->device, c->pq_cmd_pool, NULL);
+		c->pq_cmd_pool = VK_NULL_HANDLE;
+	}
 	if (c->plane_cmd_pool != VK_NULL_HANDLE) {
 		vk->vkDestroyCommandPool(vk->device, c->plane_cmd_pool, NULL);
 		c->plane_cmd_pool = VK_NULL_HANDLE;
@@ -13162,6 +13333,7 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 		c->vk.main_queue->queue = saved_main_queue;
 		// #1484: a fresh DP's colour state is unknown; the weave sites assert it.
 		c->dp_atlas_encoding_latched = -1;
+		c->pq_dp_asked = NULL; // #2340: nor been asked about PQ
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("VK display processor factory failed (error %d), continuing without", (int)dp_ret);
 			c->display_processor = NULL;
@@ -14403,6 +14575,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		        "heap-reuse collision.");
 		c->display_processor = NULL;
 		c->dp_atlas_encoding_latched = -1; // #1484
+		c->pq_dp_asked = NULL;             // #2340
 	}
 
 	// Determine view dimensions (half width for a 2-view atlas), never 0 — a
@@ -18137,6 +18310,118 @@ vk_split_composite_window_space(struct comp_vk_native_compositor *c)
 		vk->vkQueueWaitIdle(vk->main_queue->queue);
 	}
 	c->ws_cmd_value[ring] = signal_value;
+}
+
+/*!
+ * #2340 — DXR_ATLAS_ENCODING=pq on the SPLIT path: re-encode the atlas as PQ
+ * for the split's D3D11 weaver, the one that weaves it. That DP is asked once
+ * through its `accepts_atlas_encoding` slot (#2294) and, if it accepts, told
+ * PQ through the split, which re-sends it to a DP swapped in later. The deposit
+ * maps the A2B10G10R10 atlas to R10G10B10A2, the format the D3D11 tier encodes.
+ *
+ * Same ordering and fencing as the window-space pass above: its own ring entry,
+ * a deposit-timeline value claimed AFTER the atlas and window-space submits and
+ * BEFORE the handoff, so the one `Wait` comp_hub_d3d11_submit_atlas takes covers
+ * it. A repaint replays inside the split over a slot already encoded.
+ *
+ * A ring with every entry still in flight skips the encode for that frame
+ * rather than stall (the #925 rule). The DP has been told PQ, so an atlas
+ * that missed the pass must not reach it: false tells the caller to release
+ * the slot without handing it over, and that frame presents nothing (#918 F4),
+ * leaving the last encoded frame on the panel. The CPU-paced frame structure
+ * the ring relies on makes it practically unreachable.
+ *
+ * @return false only when PQ is in effect and this frame's atlas was NOT
+ *         encoded; true otherwise (encoded, or PQ not in effect).
+ */
+static bool
+vk_split_encode_atlas_pq(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	if (!vk_pq_requested() || c->split == NULL || c->renderer == NULL) {
+		return true;
+	}
+	if (!c->pq_split_checked) {
+		c->pq_split_checked = true;
+		c->pq_split_active =
+		    vk_pq_atlas_format_ok(c) && comp_hub_d3d11_accepts_atlas_encoding(c->split, XRT_ATLAS_ENCODING_PQ);
+		if (!c->pq_warned_format) {
+			U_LOG_W("DXR_ATLAS_ENCODING=pq (#2340, experimental): %s",
+			        c->pq_split_active ? "split D3D11 DP accepts PQ - weaving a PQ atlas"
+			                           : "split D3D11 DP does not accept PQ - keeping the sRGB atlas");
+		}
+		if (c->pq_split_active) {
+			comp_hub_d3d11_set_atlas_encoding(c->split, XRT_ATLAS_ENCODING_PQ);
+		}
+	}
+	if (!c->pq_split_active) {
+		return true;
+	}
+	struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
+	if (dep == NULL) {
+		return false;
+	}
+	if (!vk_split_cmd_ring_ensure(c, &c->pq_cmd_pool, c->pq_cmd, c->pq_cmd_value, &c->pq_cmd_next, "PQ encode")) {
+		// No ring at all is permanent, unlike a busy one: stop declaring PQ.
+		U_LOG_W("DXR_ATLAS_ENCODING=pq (#2340, experimental): no command ring for the PQ pass - PQ off");
+		c->pq_split_active = false;
+		comp_hub_d3d11_set_atlas_encoding(c->split, XRT_ATLAS_ENCODING_ENCODED);
+		return true;
+	}
+	const int32_t ring = vk_split_cmd_ring_take(c, dep, c->pq_cmd_value, &c->pq_cmd_next);
+	if (ring < 0) {
+		return false; // every entry still in flight: see above
+	}
+	const VkCommandBuffer cmd = c->pq_cmd[ring];
+	if (vk->vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) {
+		return false;
+	}
+	VkCommandBufferBeginInfo begin_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &begin_info);
+	const bool encoded = comp_vk_native_renderer_encode_atlas_pq(c->renderer, cmd);
+	vk->vkEndCommandBuffer(cmd);
+	if (!encoded) {
+		// The pass cannot be built: stop declaring PQ (nothing was recorded).
+		U_LOG_W("DXR_ATLAS_ENCODING=pq (#2340, experimental): the PQ pass is unavailable - PQ off");
+		c->pq_split_active = false;
+		comp_hub_d3d11_set_atlas_encoding(c->split, XRT_ATLAS_ENCODING_ENCODED);
+		return true; // PQ is off from here on, so this sRGB atlas is declared right
+	}
+
+	VkSemaphore sem = VK_NULL_HANDLE;
+	uint64_t signal_value = 0;
+	comp_vk_deposit_claim_signal(dep, &sem, &signal_value);
+	VkTimelineSemaphoreSubmitInfo timeline_info = {
+	    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+	};
+	VkSubmitInfo submit_info = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	if (sem != VK_NULL_HANDLE) {
+		timeline_info.signalSemaphoreValueCount = 1;
+		timeline_info.pSignalSemaphoreValues = &signal_value;
+		submit_info.pNext = &timeline_info;
+		submit_info.signalSemaphoreCount = 1;
+		submit_info.pSignalSemaphores = &sem;
+	}
+	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
+		// The claimed value would never be signalled — give it back.
+		if (sem != VK_NULL_HANDLE) {
+			comp_vk_deposit_abandon_signal(dep);
+		}
+		return false;
+	}
+	if (sem == VK_NULL_HANDLE && vk->vkQueueWaitIdle != NULL) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+	c->pq_cmd_value[ring] = signal_value;
+	return true;
 }
 
 /*!

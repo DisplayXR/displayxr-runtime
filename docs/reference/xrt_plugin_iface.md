@@ -987,7 +987,7 @@ based on. The old slot keeps meaning "now + your default horizon". A DP without 
 today's latest-answer behaviour — every path returns its `get_predicted_eye_positions` answer
 unchanged; implementing the slot opts in to display-time sampling. Full contract: [eye-tracking-modes.md § Target-time query](../specs/vendor/eye-tracking-modes.md#target-time-query-adr-054-41--n6-part-1-2144).
 
-## PQ atlases: `accepts_atlas_encoding` (D3D11, #2273)
+## PQ atlases: `accepts_atlas_encoding` (D3D11 #2273, Vulkan #2340)
 
 `bool (*accepts_atlas_encoding)(xdp, enum xrt_atlas_encoding encoding)` — an optional slot appended to
 the D3D11 vtable after `get_eye_positions_at` (ADR-020, ABI unchanged, `#ifdef
@@ -998,6 +998,15 @@ ST 2084 code values, 1.0 linear = 203 cd/m², primaries passed through), under t
 `DXR_ATLAS_ENCODING=pq` + `DXR_ATLAS_FORMAT=rgb10a2` knobs. Keep reporting `get_color_capability` as
 before: the runtime compares it with `== XRT_DP_COLOR_EITHER`, which is why PQ is a query and not a
 new capability value.
+
+**Vulkan (#2340).** The same slot, same signature (taking `struct xrt_display_processor_vk *`), appended
+to the **`xrt_display_processor_vk` variant** after its `get_eye_positions_at` — not to the embedded base,
+whose growth would move every variant slot (ADR-020, ABI unchanged, `#ifdef
+XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY`; helper `xrt_display_processor_vk_accepts_atlas_encoding()`, false for
+an absent slot per `base.struct_size`, or NULL). A DP that answers true for `XRT_ATLAS_ENCODING_PQ` then
+receives PQ through the base's existing `set_atlas_encoding` (slot 14) before `process_atlas`. Under the
+Windows weave-on-scanout split the Vulkan atlas is woven by the D3D11 DP on the output adapter, so there
+the D3D11 slot above is the one asked.
 
 ## Frame-timing inputs are an offer, never a requirement
 

@@ -22,6 +22,8 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		shaders/equirect2.frag
 		shaders/equirect2_array.frag
 		shaders/alpha_probe.comp
+		shaders/atlas_pq.vert
+		shaders/atlas_pq.frag
 		)
 
 	# Multi-screen segment manager (ADR-047 D2), its own library so the
