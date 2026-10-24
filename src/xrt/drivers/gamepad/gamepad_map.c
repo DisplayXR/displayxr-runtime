@@ -317,8 +317,8 @@ gamepad_map_touch_hand(const struct gamepad_state *state,
 	if (view == is_left) {
 		out->thumbstick_x = ((b & GAMEPAD_BTN_DPAD_RIGHT) != 0 ? 1.0f : 0.0f) -
 		                    ((b & GAMEPAD_BTN_DPAD_LEFT) != 0 ? 1.0f : 0.0f);
-		out->thumbstick_y = ((b & GAMEPAD_BTN_DPAD_UP) != 0 ? 1.0f : 0.0f) -
-		                    ((b & GAMEPAD_BTN_DPAD_DOWN) != 0 ? 1.0f : 0.0f);
+		out->thumbstick_y =
+		    ((b & GAMEPAD_BTN_DPAD_UP) != 0 ? 1.0f : 0.0f) - ((b & GAMEPAD_BTN_DPAD_DOWN) != 0 ? 1.0f : 0.0f);
 	}
 
 	float x = 0.0f, y = 0.0f;

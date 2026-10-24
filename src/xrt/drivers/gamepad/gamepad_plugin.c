@@ -80,8 +80,8 @@ gamepad_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 
 	const bool emulate = gamepad_setting_on("EMULATE_CONTROLLERS", true);
 	char profile[16];
-	const bool touch = emulate && gamepad_setting("EMULATE_PROFILE", profile, sizeof(profile)) &&
-	                   strcmp(profile, "touch") == 0;
+	const bool touch =
+	    emulate && gamepad_setting("EMULATE_PROFILE", profile, sizeof(profile)) && strcmp(profile, "touch") == 0;
 	// Touch hands take the sticks, so the rig would fight them: off unless asked for.
 	const bool nav = gamepad_setting_on("NAV", !touch);
 	const uint32_t needed = 1 + (nav ? 1 : 0) + (emulate ? 2 : 0);
@@ -158,7 +158,9 @@ gamepad_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 
 	U_LOG_W("gamepad: %u device(s) — pad%s%s; a present pad takes the gamepad role%s%s.", n,
 	        nav ? ", navigation" : "",
-	        touch ? ", emulated left/right Touch controllers" : emulate ? ", emulated left/right controllers" : "",
+	        touch     ? ", emulated left/right Touch controllers"
+	        : emulate ? ", emulated left/right controllers"
+	                  : "",
 	        nav ? " and the rig" : "", emulate ? " and the hand roles" : "");
 	return XRT_SUCCESS;
 }

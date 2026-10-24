@@ -151,9 +151,9 @@ gamepad_create_emulated_controller(struct gamepad_hub *hub, enum xrt_device_type
 //! How the Touch pair (`EMULATE_PROFILE` = touch) moves its hands.
 struct gamepad_touch_config
 {
-	float deadzone;               //!< radial stick deadzone, as @ref gamepad_map_config::deadzone
-	float hand_speed_mps;         //!< hand speed at full stick deflection (`HAND_SPEED`)
-	struct xrt_vec3 right_home;   //!< right hand's rest point, rig-local metres; the left hand mirrors X
+	float deadzone;             //!< radial stick deadzone, as @ref gamepad_map_config::deadzone
+	float hand_speed_mps;       //!< hand speed at full stick deflection (`HAND_SPEED`)
+	struct xrt_vec3 right_home; //!< right hand's rest point, rig-local metres; the left hand mirrors X
 };
 
 /*!
