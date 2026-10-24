@@ -110,3 +110,18 @@ TEST_CASE("A profile pitch tilts the starting camera and is the Space reset targ
 	CHECK(level_pose.orientation.x == 0);
 	CHECK(level_pose.orientation.w == 1);
 }
+
+TEST_CASE("A profile pullback moves the starting camera back along its look", "[qwerty][camera-profile]")
+{
+	Devices d;
+	xrt_pose &pose = qwerty_device(d.devices[0])->pose;
+	pose.position = {0, 1.6f, 0.6f};
+	u_camera_profile profile = U_CAMERA_PROFILE_DEFAULT;
+	profile.pitch_rad = -0.5235987756f; // 30 degrees down
+	profile.pullback_m = 1.0f;
+	REQUIRE(qwerty_set_camera_profile(d.devices, 3, &profile));
+	// Backwards along a look tilted down: back (+Z) and up (+Y).
+	CHECK(pose.position.x == 0);
+	CHECK(pose.position.y == Catch::Approx(1.6 + 0.5));
+	CHECK(pose.position.z == Catch::Approx(0.6 + std::cos(0.5235987756)));
+}

@@ -9,10 +9,11 @@
 extern "C" {
 #endif
 
-//! Camera-rig tuning, plus where the camera starts looking. Navigation itself
-//! (the voluntary pose the user drives) is never configuration data; only its
-//! starting tilt is, because that is framing: many VR titles put their work
-//! area at hand height, below a camera that starts level (pitchDegrees).
+//! Camera-rig tuning, plus where the camera starts. Navigation itself (the
+//! voluntary pose the user drives) is never configuration data; its starting
+//! framing is: many VR titles put their work area at arm's length and hand
+//! height, below and too close to a camera that starts level at eye height
+//! (pitchDegrees, pullbackMeters).
 struct u_camera_profile
 {
 	float ipd_factor;
@@ -22,10 +23,12 @@ struct u_camera_profile
 	float m2v;
 	//! Initial camera pitch, radians, positive = up; also what Space resets to.
 	float pitch_rad;
+	//! Initial distance behind the default camera position along its starting view, metres.
+	float pullback_m;
 };
 
 //! The existing qwerty camera defaults (tan(18 degrees) is historically rounded).
-#define U_CAMERA_PROFILE_DEFAULT {1.0f, 1.0f, 0.5f, 0.3249f, 1.0f, 0.0f}
+#define U_CAMERA_PROFILE_DEFAULT {1.0f, 1.0f, 0.5f, 0.3249f, 1.0f, 0.0f, 0.0f}
 
 enum u_camera_profile_result
 {
