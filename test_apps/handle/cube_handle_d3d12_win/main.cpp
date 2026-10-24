@@ -97,7 +97,75 @@ static DWORD g_savedWindowStyle = 0;
 //                        list-order stacking + alpha fringing).
 static bool g_l2dPanel = false;
 static bool g_l2dMask = false;
+// #2342: DXR_LOCAL2D_MASK=3 additionally acquires the Tier-3 render target and
+// draws one app-authored stroke into it (a 3D bar down the left edge, outside
+// both rect islands) — the authored mask that has to reach the compositor as a
+// PLANE, mirroring cube_handle_d3d11_win's #918 review F1 mode.
+static bool g_l2dMaskTier3 = false;
 static bool g_l2dPanel2 = false;
+
+/*!
+ * #2342: the Tier-3 stroke, D3D12 flavour (XrLocal3DZoneRenderTargetD3D12DXR).
+ * The runtime hands the R8 resource in RENDER_TARGET; the app makes its own
+ * RTV, clears a bar to M=1 on its own queue, and submits after (same-queue
+ * order is the contract). One-off at activation, so a fence wait here is fine.
+ */
+static void DrawTier3StrokeD3D12(ID3D12Device *dev, ID3D12CommandQueue *queue) {
+  if (g_zone.pfnAcquire == nullptr) {
+    LOG_ERROR("[mask] Tier-3 requested but xrAcquireLocal3DZoneRenderTargetDXR "
+              "is unavailable");
+    return;
+  }
+  XrLocal3DZoneRenderTargetD3D12DXR rtb = {
+      (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_DXR};
+  XrResult ar = g_zone.pfnAcquire(g_zone.mask, (void *)&rtb);
+  if (XR_FAILED(ar) || rtb.resource == nullptr) {
+    LOG_ERROR("[mask] xrAcquireLocal3DZoneRenderTargetDXR failed (0x%x)",
+              (unsigned)ar);
+    return;
+  }
+  ComPtr<ID3D12DescriptorHeap> heap;
+  D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+  hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  hd.NumDescriptors = 1;
+  ComPtr<ID3D12CommandAllocator> alloc;
+  ComPtr<ID3D12GraphicsCommandList> list;
+  ComPtr<ID3D12Fence> fence;
+  if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap))) ||
+      FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                         IID_PPV_ARGS(&alloc))) ||
+      FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                    alloc.Get(), nullptr,
+                                    IID_PPV_ARGS(&list))) ||
+      FAILED(
+          dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+    LOG_ERROR("[mask] Tier-3 stroke: D3D12 object creation failed");
+    return;
+  }
+  D3D12_RENDER_TARGET_VIEW_DESC rd = {};
+  rd.Format = DXGI_FORMAT_R8_UNORM;
+  rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv = heap->GetCPUDescriptorHandleForHeapStart();
+  dev->CreateRenderTargetView((ID3D12Resource *)rtb.resource, &rd, rtv);
+  const float m3d[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+  D3D12_RECT bar = {(LONG)(rtb.width / 16), (LONG)(rtb.height / 3),
+                    (LONG)(rtb.width / 8), (LONG)(rtb.height * 2 / 3)};
+  list->ClearRenderTargetView(rtv, m3d, 1, &bar);
+  list->Close();
+  ID3D12CommandList *lists[] = {list.Get()};
+  queue->ExecuteCommandLists(1, lists);
+  queue->Signal(fence.Get(), 1);
+  HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (ev != nullptr) {
+    fence->SetEventOnCompletion(1, ev);
+    WaitForSingleObject(ev, 2000);
+    CloseHandle(ev);
+  }
+  LOG_INFO("[mask] Tier-3 stroke drawn into the %ux%u authored mask (bar "
+           "%ld,%ld %ldx%ld)",
+           rtb.width, rtb.height, bar.left, bar.top, bar.right - bar.left,
+           bar.bottom - bar.top);
+}
 // #491 part 3 — 2D-under backdrop (0=off, 2=opaque, 3=semi-transparent).
 static int g_l2dBackdropVariant = 0;
 static bool g_l2dActive = false; // set once panels (+ optional mask) are live
@@ -1763,8 +1831,15 @@ static void RenderThreadFunc(
                                 islands[0].extent = {(int32_t)(winW * 7 / 16), (int32_t)(winH / 2)};
                                 islands[1].offset = {(int32_t)(winW / 16), (int32_t)(winH / 16)};
                                 islands[1].extent = {(int32_t)(winW / 4), (int32_t)(winH / 4)};
-                                ok = XR_SUCCEEDED(g_zone.pfnSetRects(g_zone.mask, 2, islands)) &&
-                                     XR_SUCCEEDED(g_zone.pfnSubmit(g_zone.mask));
+                                ok = XR_SUCCEEDED(g_zone.pfnSetRects(
+                                    g_zone.mask, 2, islands));
+                                if (ok && g_l2dMaskTier3) {
+                                  DrawTier3StrokeD3D12(
+                                      renderer->device.Get(),
+                                      renderer->commandQueue.Get());
+                                }
+                                ok = ok && XR_SUCCEEDED(
+                                               g_zone.pfnSubmit(g_zone.mask));
                             }
                         }
 
@@ -1897,7 +1972,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         const char* e = getenv("DXR_LOCAL2D_PANEL");
         if (e && *e == '1') g_l2dPanel = true;
         e = getenv("DXR_LOCAL2D_MASK");
-        if (e && *e == '1') g_l2dMask = true;
+        if (e && (*e == '1' || *e == '3')) {
+          g_l2dMask = true;
+          g_l2dMaskTier3 = (*e == '3'); // #2342
+        }
         e = getenv("DXR_LOCAL2D_PANEL2");
         if (e && *e == '1') g_l2dPanel2 = true;
         e = getenv("DXR_LOCAL2D_ACTIVATION_FRAME");
