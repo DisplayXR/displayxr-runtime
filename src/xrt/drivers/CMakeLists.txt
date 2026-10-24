@@ -1056,6 +1056,7 @@ set(DRV_GAMEPAD_SOURCES
 	gamepad/gamepad_plugin.c
 	gamepad/gamepad_settings.c
 	gamepad/gamepad_settings.h
+	gamepad/gamepad_touch.c
 	)
 if(APPLE)
 	list(APPEND DRV_GAMEPAD_SOURCES gamepad/gamepad_backend_gc.m)

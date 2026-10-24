@@ -26,6 +26,16 @@ static const struct xrt_component_setting_desc g_descs[] = {
      "also publish an emulated left / right khr/simple_controller pair driven by the pad (shoulders / X / A = "
      "select, View / Menu = menu), so handle apps get xrSyncActions controllers; a present pad then holds the "
      "hand roles over qwerty. 0 = hands untouched"},
+    {"EMULATE_PROFILE", XRT_COMPONENT_SETTING_TYPE_ENUM, "simple",
+     "which controllers EMULATE_CONTROLLERS publishes: simple = fixed khr/simple_controller pair; touch = an "
+     "oculus/touch_controller pair whose hands the sticks move (stick click + stick = depth, triggers / shoulders "
+     "= trigger / squeeze, A B X Y = A B X Y, D-pad = right thumbstick or left with View held, View tap = "
+     "recenter hands) for VR creation tools. touch turns NAV off unless NAV is set"},
+    {"HAND_SPEED", XRT_COMPONENT_SETTING_TYPE_FLOAT, "0.25",
+     "touch profile: hand speed at full stick deflection, metres per second (0.01..5)"},
+    {"HAND_HOME", XRT_COMPONENT_SETTING_TYPE_STRING, "0.08,-0.04,0.12",
+     "touch profile: the right hand's rest point x,y,z in display-plane metres (+Z toward the viewer); the left "
+     "hand mirrors x"},
     {"INVERT_LOOK_Y", XRT_COMPONENT_SETTING_TYPE_BOOL, "0", "flip the right stick's pitch direction"},
     {"IDLE_TIMEOUT_S", XRT_COMPONENT_SETTING_TYPE_FLOAT, "20",
      "last-used input wins: the pad holds its roles (gamepad, rig, hands) only while connected AND touched within "
