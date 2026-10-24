@@ -251,6 +251,47 @@ VkSemaphore
 comp_vk_deposit_get_timeline(struct comp_vk_deposit *dep);
 
 /*!
+ * @name #2317 P2a: the hub's DIRECT ingress (same adapter)
+ *
+ * The hub then opens each ring slot on its OWN device and weaves it in place —
+ * no staging copy, no @ref comp_vk_deposit_note_consumed. FENCE mode: its reads
+ * are released on a SEPARATE fence the hub owns (comp_hub_d3d11's consumer
+ * fence), imported here as a second timeline semaphore, so this deposit's own
+ * timeline keeps one signaller and can never step backwards. KEYED-MUTEX mode
+ * needs none of this: the hub brackets its reads with each slot's own mutex.
+ * @{
+ */
+
+/*!
+ * Import the hub's consumer fence (`HANDLE`, from
+ * comp_hub_d3d11_get_consumer_fence_handle) as a timeline semaphore. NULL
+ * unbinds (and forgets every owed release). False when the import failed or the
+ * deposit is in keyed-mutex mode — the caller must then keep the hub off DIRECT
+ * ingress in fence mode, since nothing else would order a slot rewrite after the
+ * hub's read. The caller guarantees no submit still references a semaphore it
+ * unbinds (the per-frame draw-fence wait does).
+ */
+bool
+comp_vk_deposit_bind_consumer_fence(struct comp_vk_deposit *dep, void *nt_handle);
+
+/*!
+ * The hub has moved off @p slot (comp_hub_d3d11_take_slot_release): its reads
+ * complete when the consumer fence reaches @p value. Vulkan's next write into
+ * the slot waits for it (@ref comp_vk_deposit_current_slot_hub_wait).
+ */
+void
+comp_vk_deposit_note_hub_release(struct comp_vk_deposit *dep, uint32_t slot, uint64_t value);
+
+/*!
+ * The CURRENT slot's owed hub release: the semaphore to wait on and the value,
+ * or `VK_NULL_HANDLE` / 0 when nothing is owed. Call after
+ * @ref comp_vk_deposit_advance, beside @ref comp_vk_deposit_current_slot_wait.
+ */
+void
+comp_vk_deposit_current_slot_hub_wait(struct comp_vk_deposit *dep, VkSemaphore *out_semaphore, uint64_t *out_value);
+/*! @} */
+
+/*!
  * Fill @p out with everything a D3D consumer needs. This is the VK-1 entry
  * point; nothing in the runtime calls it yet.
  *

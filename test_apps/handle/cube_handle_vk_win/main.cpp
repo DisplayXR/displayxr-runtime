@@ -109,7 +109,9 @@ static bool g_l2dPanel2 = false;
 static int g_l2dBackdropVariant = 0;
 static bool g_l2dActive = false; // set once panels (+ optional mask) are live
 static long g_l2dFrameCounter = 0;
-static const long g_l2dActivationFrame = 10;
+// DXR_LOCAL2D_ACTIVATION_FRAME=N overrides (#2317 P2a: a mid-session move of
+// the hub off DIRECT ingress, after N projection-only frames).
+static long g_l2dActivationFrame = 10;
 
 // A window-anchored Local2D panel swapchain (static content: filled once, then
 // referenced every frame). The image rests in SHADER_READ_ONLY_OPTIMAL so the
@@ -1475,6 +1477,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (e && *e == '1') g_l2dMask = true;
         e = getenv("DXR_LOCAL2D_PANEL2");
         if (e && *e == '1') g_l2dPanel2 = true;
+        e = getenv("DXR_LOCAL2D_ACTIVATION_FRAME");
+        if (e != nullptr && *e != 0) {
+            const long f = strtol(e, nullptr, 10);
+            if (f > 0) g_l2dActivationFrame = f;
+        }
         // #491 part 3 — DXR_LOCAL2D_BACKDROP=1 ⟹ opaque backdrop (variant 2);
         // =2 ⟹ semi-transparent backdrop (variant 3, desktop shows through).
         // Either implies the Local2D panel path is active.

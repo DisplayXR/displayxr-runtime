@@ -1,7 +1,7 @@
 {
   "kit": "DXRHubAB",
-  "kitVersion": "0.2.0",
-  "issue": "#2317 P1d",
+  "kitVersion": "0.3.0",
+  "issue": "#2317 P1d, P2a",
   "windowSeconds": 20,
   "warmupSeconds": 6,
   "reps": 3,
@@ -24,7 +24,7 @@
     "native": "per-API in-process compositor weaves + presents (no output-device split, no hub)",
     "fill-arm": "D3D11 fill arm (comp_vk_native_split): #1264 d3d12 reroute or the VK output-device split",
     "own-split": "the API's own #918 output-device split (d3d12 own legs / d3d11 own split) - NOT the hub",
-    "hub": "comp_hub_d3d11 in-process shim (DXR_HUB=1, P1b) - 'hub placement: hub=1'"
+    "hub": "comp_hub_d3d11 - 'hub placement: hub=1': the D3D11 shim (DXR_HUB=1, P1b) or, since P2a, the d3d12 #1264 reroute / the VK split (ring deposits)"
   },
   "apps": [
     {
@@ -110,11 +110,11 @@
           "env": {
             "DXR_SPLIT_D3D12_HYBRID_REROUTE": "1"
           },
-          "expectPath": "fill-arm",
+          "expectPath": "hub",
           "topologies": [
             "default"
           ],
-          "expectLine": "heavy-d3d12 reroute ACTIVE",
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge",
           "optional": true,
           "note": "Code gate (comp_d3d12_compositor.cpp reroute_topology_ok): a HYBRID reroute needs DXR_SPLIT_D3D12_HYBRID_REROUTE=1 AND DXR_APP_FRAME_DIVISOR>=2, which halves the app's frame rate - not a like-for-like arm. Run with -Arms native,hub to see the refusal."
         },
@@ -131,11 +131,24 @@
         {
           "name": "hub",
           "env": {},
-          "expectPath": "fill-arm",
+          "expectPath": "hub",
           "topologies": [
             "same-adapter"
           ],
-          "expectLine": "heavy-d3d12 reroute ACTIVE"
+          "expectLine": "hub placement: hub=1 .*ingress=direct",
+          "note": "P2a default: the #1264 reroute reads the deposit ring DIRECT on one adapter (0 transport copies)."
+        },
+        {
+          "name": "hub-xbridge",
+          "env": {
+            "DXR_HUB_INGRESS": "xbridge"
+          },
+          "expectPath": "hub",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge ingress_reason=forced_by_env",
+          "note": "A/B control: the pre-P2a staged xbridge ingress (3 transport copies)."
         },
         {
           "name": "own-split",
@@ -173,8 +186,33 @@
         {
           "name": "hub",
           "env": {},
-          "expectPath": "fill-arm",
-          "expectLine": "VK output-device split ACTIVE"
+          "expectPath": "hub",
+          "topologies": [
+            "default"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge ingress_reason=cross_adapter"
+        },
+        {
+          "name": "hub",
+          "env": {},
+          "expectPath": "hub",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=direct",
+          "note": "P2a default: DIRECT on one adapter (keyed-mutex mode on drivers without D3D12_FENCE import)."
+        },
+        {
+          "name": "hub-xbridge",
+          "env": {
+            "DXR_HUB_INGRESS": "xbridge"
+          },
+          "expectPath": "hub",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge ingress_reason=forced_by_env",
+          "note": "A/B control: the pre-P2a staged xbridge ingress."
         }
       ]
     },
