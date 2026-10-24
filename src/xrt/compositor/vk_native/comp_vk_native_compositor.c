@@ -12147,6 +12147,8 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 			comp_hub_d3d11_stage_segment_content(c->split, &c->seg_content);
 			comp_hub_d3d11_submit_atlas(c->split, &handoff, c->eff_layout.cols, c->eff_layout.rows,
 			                            c->eff_layout.tile_w, c->eff_layout.tile_h);
+			// #2317 P2a review: only a handed-off slot may be advanced past.
+			comp_vk_deposit_note_handed(dep);
 			if (!comp_hub_d3d11_is_direct(c->split)) {
 				/*
 				 * The slot is free again the instant the bridge's staging copy
@@ -12179,7 +12181,12 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 
 		const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
 		// #2317 P1c: the D rows of DXR_WEAVE_LATENCY_CSV need this frame's promise.
-		comp_hub_d3d11_set_predicted_display_time(c->split, c->last_display_time_ns);
+		// #2327 review: THIS frame's own promise (its xrEndFrame displayTime),
+		// not the latest xrWaitFrame's — a pipelined app has already waited
+		// for the next frame by the time this one is committed.
+		comp_hub_d3d11_set_predicted_display_time(c->split, c->layer_accum.data.display_time_ns > 0
+		                                                        ? (uint64_t)c->layer_accum.data.display_time_ns
+		                                                        : c->last_display_time_ns);
 		const bool wove = comp_hub_d3d11_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
 
 		/*

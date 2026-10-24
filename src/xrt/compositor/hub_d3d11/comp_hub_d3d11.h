@@ -919,6 +919,9 @@ comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split);
 #define COMP_HUB_INGRESS_REASON_PLANES "plane_content"
 //! A ring producer that does not declare @ref comp_hub_d3d11_info::ring_direct.
 #define COMP_HUB_INGRESS_REASON_PRODUCER "producer_unsupported"
+//! Mid-session backstop: the producer re-nominated the slot the hub is reading
+//! with a newer fence value (it rewrote it without handing over another slot).
+#define COMP_HUB_INGRESS_REASON_RING_CONTRACT "ring_contract"
 
 /*!
  * NT handle of the hub's consumer fence (`ID3D11Fence`, created SHARED on the

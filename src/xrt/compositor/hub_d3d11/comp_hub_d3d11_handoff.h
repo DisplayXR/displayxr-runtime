@@ -23,6 +23,13 @@ extern "C" {
 #endif
 
 /*!
+ * #2317 P2a: the deepest deposit ring the hub's DIRECT ingress can hold open
+ * (it indexes slots by @ref comp_hub_d3d11_handoff::slot). Every deposit
+ * static_asserts its ring against this.
+ */
+#define COMP_HUB_D3D11_DIRECT_RING 4
+
+/*!
  * Everything a D3D consumer (the hub's @ref comp_xbridge wiring) needs to pick the
  * deposit up. Pointers are BORROWED — the deposit owns them and outlives no
  * caller.
