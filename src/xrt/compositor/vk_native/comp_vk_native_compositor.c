@@ -13918,6 +13918,10 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		    .app_timeline_semaphores = app_timeline_semaphores,
 		    // #2317 P2a: this caller honours the DIRECT release contract.
 		    .ring_direct = true,
+		    // #2317 P2c: ...and its plane twin: the plane pass signals the
+		    // deposit timeline before the handoff and waits out the hub's last
+		    // plane read (vk_split_stage_planes).
+		    .ring_direct_planes = true,
 		    .render_packed_luid = c->render_packed_luid,
 		    .display_screen_left = display_screen_left,
 		    .display_screen_top = display_screen_top,
@@ -18526,8 +18530,21 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	uint64_t signal_value = 0;
 	comp_vk_deposit_claim_signal(dep, &sem, &signal_value);
 	const uint64_t wait_value = comp_vk_deposit_plane_wait_value(dep);
-	VkPipelineStageFlags wait_stage =
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+	/*
+	 * #2317 P2c: on the hub's DIRECT ingress the planes are read IN PLACE by
+	 * every weave and repaint, so this rewrite also waits out the hub's latest
+	 * read, on its consumer fence (imported as a second timeline). Fence mode
+	 * only — keyed-mutex deposits keep their timing-only planes (#1274).
+	 */
+	const VkSemaphore hub_sem = comp_vk_deposit_get_hub_timeline(dep);
+	const uint64_t hub_value = comp_hub_d3d11_get_plane_release_value(c->split);
+	VkPipelineStageFlags wait_stages[2] = {
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	};
+	VkSemaphore wait_sems[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	uint64_t wait_values[2] = {0, 0};
+	uint32_t wait_count = 0;
 
 	VkTimelineSemaphoreSubmitInfo timeline_info = {
 	    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
@@ -18544,11 +18561,21 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 		submit_info.signalSemaphoreCount = 1;
 		submit_info.pSignalSemaphores = &sem;
 		if (wait_value != 0) {
-			timeline_info.waitSemaphoreValueCount = 1;
-			timeline_info.pWaitSemaphoreValues = &wait_value;
-			submit_info.waitSemaphoreCount = 1;
-			submit_info.pWaitSemaphores = &sem;
-			submit_info.pWaitDstStageMask = &wait_stage;
+			wait_sems[wait_count] = sem;
+			wait_values[wait_count] = wait_value;
+			wait_count++;
+		}
+		if (hub_sem != VK_NULL_HANDLE && hub_value != 0) {
+			wait_sems[wait_count] = hub_sem;
+			wait_values[wait_count] = hub_value;
+			wait_count++;
+		}
+		if (wait_count != 0) {
+			timeline_info.waitSemaphoreValueCount = wait_count;
+			timeline_info.pWaitSemaphoreValues = wait_values;
+			submit_info.waitSemaphoreCount = wait_count;
+			submit_info.pWaitSemaphores = wait_sems;
+			submit_info.pWaitDstStageMask = wait_stages;
 		}
 	}
 
