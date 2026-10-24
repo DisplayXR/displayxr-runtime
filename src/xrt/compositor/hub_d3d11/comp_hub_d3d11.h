@@ -239,8 +239,9 @@ struct comp_hub_d3d11_info
 	 * hub's producer wait covers them), and it GPU-waits for
 	 * @ref comp_hub_d3d11_get_plane_release_value on the consumer fence before
 	 * any submit that rewrites a plane (so a rewrite never overlaps a weave or
-	 * repaint still sampling it). Without it, a ring session moves to xbridge
-	 * on its first plane frame (`reason=plane_content`), as before P2c.
+	 * repaint still sampling it). Without it — and always for a KEYED-MUTEX
+	 * deposit, which has no consumer fence — a ring session moves to xbridge on
+	 * its first plane frame (`reason=plane_content`), as before P2c.
 	 */
 	bool ring_direct_planes;
 };
@@ -989,10 +990,11 @@ comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split);
  *   that rewrites a plane. The caller holds the compositor mutex from that wait
  *   through @ref comp_hub_d3d11_submit_atlas, so no repaint is recorded between
  *   the two.
- * - **keyed-mutex deposits** have no fence to wait on: their planes keep the
- *   deposit's documented TIMING-ONLY contract (#1274 — the flatten's own CPU
- *   wait covers write -> read; the on-change cadence separates the rewrite),
- *   exactly as they had on xbridge.
+ * - **keyed-mutex deposits** have no consumer fence to order the rewrite on, and
+ *   DIRECT samples the planes in place on every repaint, so they keep the P2a
+ *   move to xbridge on their first plane frame (`reason=plane_content`), where
+ *   the planes are copied into hub-owned slots under the deposit's documented
+ *   timing-only contract (#1274).
  *
  * A producer that does NOT declare it keeps the P2a rule: the first frame that
  * stages real 2D-plane content moves the session to the xbridge ingress for good

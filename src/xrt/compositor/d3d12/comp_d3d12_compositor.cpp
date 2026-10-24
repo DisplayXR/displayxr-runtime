@@ -389,9 +389,34 @@ struct comp_d3d12_compositor
 		//! Change-detection for the authored-mask staged->plane copy
 		//! ((res_gen << 48) | author_seq — either half moving re-copies).
 		uint64_t mask_copied_key;
-		//! #2317 P2c: this app frame recorded a rewrite of a deposit plane
-		//! (on DIRECT its execute then waits out the hub's last plane read).
+		/*!
+		 * #2317 P2c: this app frame recorded a deposit-plane rewrite on the MAIN
+		 * list while DIRECT (the rare fallback when no trailing list is free —
+		 * see @ref plane_cl): its whole execute then waits out the hub's last
+		 * plane read.
+		 */
 		bool plane_written;
+		/*!
+		 * #2345 review: on DIRECT the scratch -> plane copies ride a TRAILING
+		 * list, executed after the frame's main list and its CPU wait
+		 * (gpu_wait_idle_app), behind a queue Wait on the hub's consumer fence.
+		 * Only those copies wait for the hub's latest weave; the frame's own
+		 * CPU wait never does. Two entries, each reused once its own fence
+		 * value has completed (checked, never waited for).
+		 */
+		struct
+		{
+			ID3D12CommandAllocator *alloc;
+			ID3D12GraphicsCommandList *list;
+			uint64_t done_value;
+		} plane_cl[2];
+		ID3D12Fence *plane_cl_fence;
+		uint64_t plane_cl_value;
+		int32_t plane_cl_cur; //!< the entry open this frame (valid while @ref plane_cl_open)
+		bool plane_cl_open;
+		uint32_t plane_cl_next;
+		bool plane_cl_failed;
+		uint64_t plane_cl_fallbacks;
 		/*!
 		 * #2342 P2c: on a hub route the HUB is the one capture site. A pending
 		 * capture intent is moved here at the top of the frame (so this tier's
@@ -1949,15 +1974,72 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	    sys_w, sys_h, (unsigned)COMP_D3D12_DEPOSIT_RING);
 }
 /*!
- * Record a scratch -> deposit-plane copy on the app list. Both resources sit
- * in COMMON at rest (the scratch's deposit-half steady state; the imported
- * plane's cross-API decay state); the copy brackets its own states. Requires
+ * #2345 review: the list a deposit-plane rewrite is recorded on. Off DIRECT
+ * (xbridge) it is the app's main list, as always — the deposit's own plane
+ * release orders it. On DIRECT it is this frame's TRAILING list (opened on
+ * first use), so only the copies wait on the hub's consumer fence. When no
+ * trailing entry is free (the GPU two frames behind) or one cannot be created,
+ * the main list again, flagged so the execute waits out the hub as before.
+ */
+static ID3D12GraphicsCommandList *
+d3d12_reroute_plane_list(struct comp_d3d12_compositor *c)
+{
+	if (c->reroute.split == NULL || !comp_hub_d3d11_is_direct(c->reroute.split)) {
+		return c->cmd_list;
+	}
+	auto &r = c->reroute;
+	if (r.plane_cl_open) {
+		return r.plane_cl[r.plane_cl_cur].list;
+	}
+	if (!r.plane_cl_failed && r.plane_cl_fence == nullptr &&
+	    FAILED(c->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+	                                  reinterpret_cast<void **>(&r.plane_cl_fence)))) {
+		r.plane_cl_fence = nullptr;
+		r.plane_cl_failed = true;
+	}
+	const uint32_t idx = r.plane_cl_next % 2u;
+	auto &e = r.plane_cl[idx];
+	if (!r.plane_cl_failed && e.alloc == nullptr) {
+		if (FAILED(c->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+		                                             __uuidof(ID3D12CommandAllocator),
+		                                             reinterpret_cast<void **>(&e.alloc))) ||
+		    FAILED(c->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, e.alloc, nullptr,
+		                                        __uuidof(ID3D12GraphicsCommandList),
+		                                        reinterpret_cast<void **>(&e.list)))) {
+			r.plane_cl_failed = true;
+			U_LOG_W(
+			    "#2342 reroute: no trailing plane-copy list — plane rewrites ride the main list "
+			    "(its execute waits out the hub's last plane read)");
+		} else {
+			e.list->Close();
+		}
+	}
+	const bool busy =
+	    e.done_value != 0 && r.plane_cl_fence != nullptr && r.plane_cl_fence->GetCompletedValue() < e.done_value;
+	if (r.plane_cl_failed || e.list == nullptr || busy) {
+		r.plane_cl_fallbacks++;
+		r.plane_written = true;
+		return c->cmd_list;
+	}
+	e.alloc->Reset();
+	e.list->Reset(e.alloc, nullptr);
+	r.plane_cl_cur = (int32_t)idx;
+	r.plane_cl_open = true;
+	r.plane_cl_next++;
+	return e.list;
+}
+
+/*!
+ * Record a scratch -> deposit-plane copy (on @ref d3d12_reroute_plane_list's
+ * list). Both resources sit in COMMON at rest (the scratch's deposit-half
+ * steady state; the imported plane's cross-API decay state); the copy brackets
+ * its own states, so it is valid at the head of a trailing list too. Requires
  * identical extents — both are panel-sized by the widened alloc conditions.
  */
 static void
 d3d12_reroute_copy_to_plane(struct comp_d3d12_compositor *c, ID3D12Resource *scratch, ID3D12Resource *plane)
 {
-	c->reroute.plane_written = true; // #2317 P2c
+	ID3D12GraphicsCommandList *cl = d3d12_reroute_plane_list(c);
 	D3D12_RESOURCE_BARRIER pre[2] = {};
 	pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	pre[0].Transition.pResource = scratch;
@@ -1967,9 +2049,9 @@ d3d12_reroute_copy_to_plane(struct comp_d3d12_compositor *c, ID3D12Resource *scr
 	pre[1] = pre[0];
 	pre[1].Transition.pResource = plane;
 	pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-	c->cmd_list->ResourceBarrier(2, pre);
+	cl->ResourceBarrier(2, pre);
 
-	c->cmd_list->CopyResource(plane, scratch);
+	cl->CopyResource(plane, scratch);
 
 	D3D12_RESOURCE_BARRIER post[2] = {};
 	post[0] = pre[0];
@@ -1978,7 +2060,7 @@ d3d12_reroute_copy_to_plane(struct comp_d3d12_compositor *c, ID3D12Resource *scr
 	post[1] = pre[1];
 	post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
 	post[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-	c->cmd_list->ResourceBarrier(2, post);
+	cl->ResourceBarrier(2, post);
 }
 
 /*!
@@ -6095,6 +6177,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		 * weave and repaint, so a list that rewrites one waits out the hub's
 		 * latest read on its consumer fence. GPU-side; c->mutex is held from
 		 * here through the handoff, so no repaint is recorded in between.
+		 * Only the rare main-list fallback (d3d12_reroute_plane_list) queues
+		 * the wait in front of the whole frame.
 		 */
 		if (c->reroute.plane_written) {
 			comp_d3d12_deposit_plane_wait_hub(c->reroute.dep, c->command_queue,
@@ -6105,8 +6189,30 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		c->cmd_list->Close();
 		ID3D12CommandList *rr_lists[] = {c->cmd_list};
 		c->command_queue->ExecuteCommandLists(1, rr_lists);
-		comp_d3d12_deposit_signal(c->reroute.dep, c->command_queue);
-		gpu_wait_idle_app(c);
+		if (c->reroute.plane_cl_open) {
+			/*
+			 * #2345 review: the trailing plane-copy list. The frame's own CPU
+			 * wait covers the main list ONLY; the copies are queued after it,
+			 * behind the hub's consumer-fence value, and the deposit signal
+			 * (what the hub's producer wait names) after them. No CPU waits on
+			 * the hub; the entry is reused once its own value completes.
+			 */
+			gpu_wait_idle_app(c);
+			auto &pe = c->reroute.plane_cl[c->reroute.plane_cl_cur];
+			pe.list->Close();
+			comp_d3d12_deposit_plane_wait_hub(c->reroute.dep, c->command_queue,
+			                                  comp_hub_d3d11_get_plane_release_value(c->reroute.split));
+			ID3D12CommandList *pl_lists[] = {pe.list};
+			c->command_queue->ExecuteCommandLists(1, pl_lists);
+			c->reroute.plane_cl_value++;
+			c->command_queue->Signal(c->reroute.plane_cl_fence, c->reroute.plane_cl_value);
+			pe.done_value = c->reroute.plane_cl_value;
+			c->reroute.plane_cl_open = false;
+			comp_d3d12_deposit_signal(c->reroute.dep, c->command_queue);
+		} else {
+			comp_d3d12_deposit_signal(c->reroute.dep, c->command_queue);
+			gpu_wait_idle_app(c);
+		}
 
 		struct comp_hub_d3d11_handoff rr_handoff = {};
 		if (comp_d3d12_deposit_get_handoff(c->reroute.dep, &rr_handoff)) {
@@ -6847,6 +6953,23 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 			gpu_wait_idle_out(c);
 		}
 	}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	// #2345 review: the reroute's trailing plane-copy lists, once the queue is idle.
+	for (uint32_t i = 0; i < 2; i++) {
+		if (c->reroute.plane_cl[i].list != nullptr) {
+			c->reroute.plane_cl[i].list->Release();
+			c->reroute.plane_cl[i].list = nullptr;
+		}
+		if (c->reroute.plane_cl[i].alloc != nullptr) {
+			c->reroute.plane_cl[i].alloc->Release();
+			c->reroute.plane_cl[i].alloc = nullptr;
+		}
+	}
+	if (c->reroute.plane_cl_fence != nullptr) {
+		c->reroute.plane_cl_fence->Release();
+		c->reroute.plane_cl_fence = nullptr;
+	}
+#endif
 
 	/*
 	 * #918 D12-3: quiesce the bridge NEXT — stop submitting, join its watchdog
@@ -8246,8 +8369,10 @@ d3d12_stage_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_m
 				pre[1].Transition.pResource = (ID3D12Resource *)mp.resource12;
 				pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
 				pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-				c->cmd_list->ResourceBarrier(2, pre);
-				c->cmd_list->CopyResource((ID3D12Resource *)mp.resource12, mask->staged);
+				// #2345 review: the trailing plane list on DIRECT.
+				ID3D12GraphicsCommandList *pcl = d3d12_reroute_plane_list(c);
+				pcl->ResourceBarrier(2, pre);
+				pcl->CopyResource((ID3D12Resource *)mp.resource12, mask->staged);
 				D3D12_RESOURCE_BARRIER post[2] = {};
 				post[0] = pre[0];
 				post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -8255,9 +8380,8 @@ d3d12_stage_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_m
 				post[1] = pre[1];
 				post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
 				post[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-				c->cmd_list->ResourceBarrier(2, post);
+				pcl->ResourceBarrier(2, post);
 				c->reroute.mask_copied_key = key;
-				c->reroute.plane_written = true; // #2317 P2c
 			}
 			comp_hub_d3d11_stage_mask_plane(c->reroute.split, key, mask->w, mask->h);
 		} else {

@@ -4041,15 +4041,19 @@ split_direct_to_xbridge(struct comp_hub_d3d11 *s, const char *reason)
 }
 
 /*!
- * #2317 P2c: a ring frame staged real 2D-plane content. A producer that declared
- * @ref comp_hub_d3d11_info::ring_direct_planes keeps DIRECT (its planes are read
- * in place); any other moves to xbridge (P2a's `plane_content`). The stable
- * atlas never moves (split_direct_to_xbridge is ring-only).
+ * #2317 P2c: a ring frame staged real 2D-plane content. A FENCE-mode producer
+ * that declared @ref comp_hub_d3d11_info::ring_direct_planes keeps DIRECT (its
+ * planes are read in place, their rewrite ordered on the consumer fence); any
+ * other moves to xbridge (P2a's `plane_content`). A KEYED-MUTEX deposit has no
+ * consumer fence to order the rewrite on, and DIRECT samples the plane in place
+ * on every repaint, which widens the #1274 timing-only race beyond xbridge's
+ * (whose copy lands in a hub-owned slot) — so it keeps the P2a move (#2345
+ * review). The stable atlas never moves (split_direct_to_xbridge is ring-only).
  */
 static void
 split_direct_demote_for_planes(struct comp_hub_d3d11 *s)
 {
-	if (s->ring_direct_planes) {
+	if (s->ring_direct_planes && !s->direct.km) {
 		return;
 	}
 	split_direct_to_xbridge(s, COMP_HUB_INGRESS_REASON_PLANES);

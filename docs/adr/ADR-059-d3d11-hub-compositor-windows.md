@@ -265,9 +265,12 @@ legs keep their own copies until P5 deletes them.
   - read → rewrite: a submit that rewrites a plane GPU-waits for the consumer fence's *latest*
     value (`comp_hub_d3d11_get_plane_release_value`).
 
-  Both ring producers declare it, so the P2a `reason=plane_content` move to xbridge is now only
-  the fallback for a producer that does not. Keyed-mutex VK deposits keep their documented
-  timing-only planes (#1274).
+  Both ring producers declare it, so the P2a `reason=plane_content` move to xbridge remains only
+  as a fallback, for a producer that does not declare it and for every keyed-mutex VK deposit.
+  Such a deposit has no consumer fence to order a plane rewrite on, so its planes keep xbridge's
+  copies under the documented timing-only contract (#1274).
+  On D3D12 the plane copies ride a trailing command list, so only that list waits on the hub,
+  never the frame's CPU wait.
 - **Per-segment zone publish and clear** run in the hub on every route, which is the native
   #2218 #4 rule. The D3D11 shim's `segments_planes` refusal is retired.
 - **One repaint pacer and admission.** `comp_hub_d3d11_repaint_pace_hold` / `_wait`, then
