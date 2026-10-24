@@ -1566,13 +1566,28 @@ initial_orientation(const struct qwerty_system *qs)
 	return (struct xrt_quat){sinf(pitch * 0.5f), 0.0f, 0.0f, cosf(pitch * 0.5f)};
 }
 
+//! The profile's pullbackMeters: backwards (+Z) along the starting look, in world space.
+static struct xrt_vec3
+initial_pullback(const struct qwerty_system *qs)
+{
+	if (!qs->camera_profile_active || qs->camera_profile.pullback_m == 0.0f) {
+		return (struct xrt_vec3){0.0f, 0.0f, 0.0f};
+	}
+	const float pitch = qs->camera_profile.pitch_rad;
+	const float d = qs->camera_profile.pullback_m;
+	// Rotating (0, 0, d) about +X by pitch.
+	return (struct xrt_vec3){0.0f, -sinf(pitch) * d, cosf(pitch) * d};
+}
+
 void
 qwerty_reset_view_state(struct qwerty_system *qs)
 {
 	os_mutex_lock(&qs->view_lock);
 	reset_view_tuning(qs);
 	if (qs->hmd != NULL) {
+		const struct xrt_vec3 pullback = initial_pullback(qs);
 		qs->hmd->base.pose.position = QWERTY_HMD_CAMERA_POS;
+		math_vec3_accum(&pullback, &qs->hmd->base.pose.position);
 		qs->hmd->base.pose.orientation = initial_orientation(qs);
 	}
 
@@ -1604,10 +1619,14 @@ qwerty_set_camera_profile(struct xrt_device **xdevs, size_t count, const struct 
 		qs->camera_profile_active = true;
 		qs->camera_profile = *profile;
 		set_camera_tuning(qs, profile);
-		// Start looking where the profile says. The profile seeds once, at the
-		// first eligible session, before the user has navigated.
+		// Start where the profile frames the camera. The profile seeds once, at
+		// the first eligible session, before the user has navigated.
 		if (qs->hmd != NULL && profile->pitch_rad != 0.0f) {
 			qs->hmd->base.pose.orientation = initial_orientation(qs);
+		}
+		if (qs->hmd != NULL && profile->pullback_m != 0.0f) {
+			const struct xrt_vec3 pullback = initial_pullback(qs);
+			math_vec3_accum(&pullback, &qs->hmd->base.pose.position);
 		}
 	}
 	os_mutex_unlock(&qs->view_lock);
