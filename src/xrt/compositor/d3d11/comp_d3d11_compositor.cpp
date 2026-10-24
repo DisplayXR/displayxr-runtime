@@ -4636,10 +4636,18 @@ d3d11_hub_commit(struct comp_d3d11_compositor *c,
 	// #2317 P1c: the D rows of DXR_WEAVE_LATENCY_CSV need this frame's promise —
 	// the same value the tier's own weave marks with.
 	comp_hub_d3d11_set_predicted_display_time(c->hub.split, c->last_display_time_ns);
-	// #2342 P2c: the hub's one capture site (DP input + post-weave back buffer).
+	// #2342 P2c: a projection-only intent the native point skipped goes to the
+	// hub too (one consumer either way); then arm the hub's capture.
+	if (c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY &&
+	    !c->hub.capture.pending) {
+		c->hub.capture = c->capture_intent;
+		c->capture_intent.pending = false;
+	}
 	if (c->hub.capture.pending) {
+		char woven[MCP_CAPTURE_PATH_MAX + 16];
+		u_capture_intent_sibling_path(c->hub.capture.path, ".woven", woven, sizeof(woven));
 		comp_hub_d3d11_capture_arm(c->hub.split, c->hub.capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
-		                           c->hub.capture.path);
+		                           c->hub.capture.path, woven);
 	}
 	const bool wove = comp_hub_d3d11_weave_and_present(c->hub.split, /*is_repaint=*/false, &cv);
 	{
@@ -4901,9 +4909,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		d3d11_hub_retire(c, why);
 	}
 
-	// #2342 P2c: the hub is this frame's capture site (after the retire above:
-	// a frame that is composed natively keeps the native dispatch points).
-	if (c->hub.active && c->capture_intent.pending) {
+	// #2342 P2c: the hub is this frame's POST-compose capture site (after the
+	// retire above: a frame composed natively keeps the native dispatch points).
+	// A projection-only intent stays with the native projection-done point,
+	// which reads the atlas before the window-space pass.
+	if (c->hub.active && c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_POST_COMPOSE) {
 		if (c->hub.capture.pending) {
 			u_capture_intent_complete(&c->hub.capture, &c->mcp_capture, false);
 		}

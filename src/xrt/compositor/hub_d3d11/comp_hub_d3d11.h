@@ -1099,35 +1099,42 @@ comp_hub_d3d11_set_post_weave_hook(struct comp_hub_d3d11 *split, comp_hub_d3d11_
  *
  * The shared atlas trigger (u_capture_intent: `%TEMP%\displayxr_atlas_trigger`,
  * its `.projection` and per-exe variants, and MCP `capture_frame`) is polled
- * by the tier as before, and on a hub route the tier hands the pending intent
- * to the hub instead of servicing it at its own dispatch points (which, on the
- * D3D12 reroute and the VK split, read a deposit ring slot the producer may
- * already have rewritten, or never ran at all). The hub writes, on the next APP
- * frame it weaves, with the service twin's names (#2207 / #2289):
+ * by the tier as before. Exactly one consumer per trigger:
  *
- * - **the DP input** — the content-cropped atlas handed to process_atlas
- *   (ADR-030), pre-weave — to @p path: `displayxr_atlas[.<exe>].png`, or
- *   `displayxr_atlas[.<exe>].projection.png` for a projection-only trigger;
- * - **the post-weave back buffer** (weave + masked composite + HUD, what is
- *   presented) to the sibling `displayxr_atlas[.<exe>].woven.png` — full
- *   triggers only. A projection-only trigger writes the DP input alone.
+ * - **POST_COMPOSE (full) triggers** — the tier hands them to the hub at the
+ *   top of the frame (its own post-compose point, which on the D3D12 reroute
+ *   never ran, then stays idle). The hub writes, on the next APP frame it
+ *   weaves, with the service twin's names (#2207 / #2289): the DP input — the
+ *   content-cropped atlas handed to process_atlas (ADR-030), pre-weave — to
+ *   `displayxr_atlas[.<exe>].png`, and the post-weave back buffer (weave +
+ *   masked composite + HUD, what is presented) to
+ *   `displayxr_atlas[.<exe>].woven.png`.
+ * - **PROJECTION_ONLY triggers** stay with the tier's own projection-done
+ *   point, which reads the renderer atlas BEFORE the window-space pass (the
+ *   HUD-free capture `/make-app-logos` depends on). Only if that point was
+ *   skipped (zero-copy) and the intent is still pending at the handoff does the
+ *   tier hand it to the hub, which then writes the DP input alone to
+ *   `displayxr_atlas[.<exe>].projection.png`.
  *
- * On a hub route window-space layers are composited into the atlas by the
- * producer before the handoff, so the DP input carries them for both trigger
- * kinds — the hub has no projection-only boundary of its own (as the twin).
  * Alpha is forced opaque unless `DXR_ATLAS_CAPTURE_RAW_ALPHA=1`. One WARN per
- * completed capture names both files. A readback (one staging copy + a Map) runs
+ * completed capture names the files. A readback (one staging copy + a Map) runs
  * only on the frame that captures.
  * @{
  */
 
 /*!
  * Arm a capture for the next APP-frame weave (never a repaint). @p path is the
- * intent's output path; the woven sibling is derived from it. A second arm
+ * intent's output path and @p woven_path its post-weave sibling (the tier
+ * derives it with u_capture_intent_sibling_path; ignored for projection-only).
+ * Always arms, even with an empty path: the write then fails and the intent
+ * completes as failed, so an MCP waiter is never left re-arming. A second arm
  * before the first was taken replaces it.
  */
 void
-comp_hub_d3d11_capture_arm(struct comp_hub_d3d11 *split, bool projection_only, const char *path);
+comp_hub_d3d11_capture_arm(struct comp_hub_d3d11 *split,
+                           bool projection_only,
+                           const char *path,
+                           const char *woven_path);
 
 /*!
  * After the app-frame weave: true when a capture was armed (it is now

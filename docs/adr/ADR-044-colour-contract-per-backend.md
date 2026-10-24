@@ -127,7 +127,6 @@ The helper keys on the *target's* format. Pinning a format and calling the helpe
 | vk_native | `$TMPDIR/displayxr_atlas_trigger` | `$TMPDIR/displayxr_atlas.png` |
 | Metal, GL | `/tmp/dxr_atlas_trigger` | `/tmp/dxr_atlas.png` |
 | D3D11 service | `%TEMP%\workspace_screenshot_trigger` | pre-weave `…_atlas_*.png` plus the post-weave file |
-| D3D11 hub (every hub route on Windows, #2342) | `%TEMP%\displayxr_atlas_trigger[.<exe>][.projection]` | the DP input (pre-weave, content-cropped) to `displayxr_atlas[.<exe>][.projection].png`; full triggers also write the post-weave back buffer to `displayxr_atlas[.<exe>].woven.png` |
 
 ### 6. What guards each row
 

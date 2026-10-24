@@ -11368,8 +11368,9 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// depending on requested mode. See u_capture_intent.h.
 	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
 #ifdef XRT_OS_WINDOWS
-	// #2342 P2c: under the split the hub is the one capture site.
-	if (c->split != NULL && c->capture_intent.pending) {
+	// #2342 P2c: under the split the hub is the POST-compose capture site; a
+	// projection-only intent stays with the native projection-done point.
+	if (c->split != NULL && c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_POST_COMPOSE) {
 		if (c->hub_capture.pending) {
 			u_capture_intent_complete(&c->hub_capture, &c->mcp_capture, false);
 		}
@@ -12225,10 +12226,18 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		comp_hub_d3d11_set_predicted_display_time(c->split, c->layer_accum.data.display_time_ns > 0
 		                                                        ? (uint64_t)c->layer_accum.data.display_time_ns
 		                                                        : c->last_display_time_ns);
-		// #2342 P2c: the hub's one capture site (DP input + post-weave back buffer).
+		// #2342 P2c: a projection-only intent the native point skipped (zero-copy)
+		// goes to the hub too (one consumer either way); then arm the hub.
+		if (c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY &&
+		    !c->hub_capture.pending) {
+			c->hub_capture = c->capture_intent;
+			c->capture_intent.pending = false;
+		}
 		if (c->hub_capture.pending) {
+			char woven[MCP_CAPTURE_PATH_MAX + 16];
+			u_capture_intent_sibling_path(c->hub_capture.path, ".woven", woven, sizeof(woven));
 			comp_hub_d3d11_capture_arm(c->split, c->hub_capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
-			                           c->hub_capture.path);
+			                           c->hub_capture.path, woven);
 		}
 		const bool wove = comp_hub_d3d11_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
 		{
