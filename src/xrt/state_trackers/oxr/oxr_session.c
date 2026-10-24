@@ -6899,9 +6899,10 @@ seed_legacy_camera_profile(struct oxr_session *sess, bool profile_external_bindi
 	if (applied) {
 		U_LOG_W(
 		    "Legacy camera profile: ipd=%.6g parallax=%.6g convergenceDiopters=%.6g verticalFov=%.6g "
-		    "metersToVirtual=%.6g pitchDegrees=%.6g",
+		    "metersToVirtual=%.6g pitchDegrees=%.6g pullbackMeters=%.6g",
 		    profile.ipd_factor, profile.parallax_factor, profile.inv_convergence_distance,
-		    2.0f * atanf(profile.half_tan_vfov), profile.m2v, profile.pitch_rad * (180.0f / 3.14159265f));
+		    2.0f * atanf(profile.half_tan_vfov), profile.m2v, profile.pitch_rad * (180.0f / 3.14159265f),
+		    profile.pullback_m);
 	}
 }
 #endif

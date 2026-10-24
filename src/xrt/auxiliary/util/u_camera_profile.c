@@ -151,6 +151,8 @@ u_camera_profile_parse(const char *json, float aspect, struct u_camera_profile *
 			bit = 16;
 		else if (strcmp(key, "pitchDegrees") == 0)
 			bit = 32;
+		else if (strcmp(key, "pullbackMeters") == 0)
+			bit = 64;
 		if (bit == 0 || (seen & bit)) {
 			ok = false;
 			reason = "unknown, duplicate or conflicting camera profile key";
@@ -200,6 +202,13 @@ u_camera_profile_parse(const char *json, float aspect, struct u_camera_profile *
 				break;
 			}
 			result.pitch_rad = (float)(value * (3.141592653589793 / 180.0));
+		} else if (bit == 64) {
+			if (!(value >= 0.0 && value <= 10.0)) {
+				ok = false;
+				reason = "pullbackMeters must be between 0 and 10";
+				break;
+			}
+			result.pullback_m = (float)value;
 		} else {
 			if (strcmp(key, "renderedBaselineMeters") == 0) {
 				if (value <= 0) {

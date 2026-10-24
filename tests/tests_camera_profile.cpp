@@ -251,3 +251,14 @@ TEST_CASE("pitchDegrees sets the initial camera tilt in radians and is bounded",
 	CHECK_FALSE(u_camera_profile_parse(R"({"pitchDegrees":-30,"pitchDegrees":-20})", 0, &profile, nullptr, 0));
 	CHECK(profile.pitch_rad == untouched.pitch_rad);
 }
+
+TEST_CASE("pullbackMeters sets the initial camera distance and is bounded", "[camera-profile]")
+{
+	u_camera_profile profile{};
+	REQUIRE(u_camera_profile_parse("{}", 0, &profile, nullptr, 0));
+	CHECK(profile.pullback_m == 0);
+	REQUIRE(u_camera_profile_parse(R"({"pullbackMeters":0.8,"pitchDegrees":-30})", 0, &profile, nullptr, 0));
+	CHECK(profile.pullback_m == Approx(0.8));
+	CHECK_FALSE(u_camera_profile_parse(R"({"pullbackMeters":-0.1})", 0, &profile, nullptr, 0));
+	CHECK_FALSE(u_camera_profile_parse(R"({"pullbackMeters":11})", 0, &profile, nullptr, 0));
+}
