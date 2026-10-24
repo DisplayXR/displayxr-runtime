@@ -4723,6 +4723,26 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			comp_d3d12_target_repaint_pace(c->target);
 			u_repaint_trace_pace(&c->repaint.trace, pace_t0, os_monotonic_get_ns());
 		}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		/*
+		 * #2342 P2c: the reroute's fill is the HUB's replay, so the hub paces
+		 * it — on its own target, the native D3D11 leg's pacer (scanout wait +
+		 * #884 late sleep). Before P2c this arm had no pacer at all and a
+		 * forced repaint free-ran into the #1339 admission, which refused it.
+		 */
+		else if (c->repaint.partition.next_release_ns == 0 && c->reroute.active) {
+			const uint64_t pace_t0 = os_monotonic_get_ns();
+			void *hold = nullptr;
+			{
+				std::lock_guard<std::mutex> hold_lock(c->mutex);
+				if (c->reroute.active && c->reroute.split != NULL) {
+					hold = comp_hub_d3d11_repaint_pace_hold(c->reroute.split);
+				}
+			}
+			comp_hub_d3d11_repaint_pace_wait(hold);
+			u_repaint_trace_pace(&c->repaint.trace, pace_t0, os_monotonic_get_ns());
+		}
+#endif
 
 		std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -4748,23 +4768,21 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 				u_repaint_trace_bail_race(&c->repaint.trace);
 				continue;
 			}
-			// #1339: the reroute has no app-side pacer; the d3d11 arm's flip
-			// chain was the only throttle, and it throttles by FILLING (4-5
-			// deep, every weave 3 periods late on the reference box). Ask the
-			// arm for a frame-latency token first; no token = no fill.
-			if (c->repaint.partition.next_release_ns == 0 &&
-			    !comp_hub_d3d11_repaint_admit(c->reroute.split)) {
-				c->repaint.bail_gate++;
-				u_repaint_trace_bail_gate(&c->repaint.trace);
-				continue;
-			}
-
+			// #1339 / #2342 P2c: the hub's one admission + replay — a
+			// frame-latency token first (no token = no fill: the arm's flip
+			// chain throttles by FILLING otherwise, 4-5 deep), then the weave.
 			const uint64_t fire_t0 = os_monotonic_get_ns();
 			// #1339: spacing is stamped from the START of the fire. Nothing runs
 			// between this and fire_t0, so one read serves both: fire_t0 pairs with
 			// fire_t1 for DURATION (trace + #1264 shed), rp_start_ns feeds spacing.
 			const uint64_t rp_start_ns = fire_t0;
-			comp_hub_d3d11_weave_and_present(c->reroute.split, /*is_repaint=*/true, &c->reroute.canvas);
+			const enum comp_hub_d3d11_repaint_result rr = comp_hub_d3d11_repaint(
+			    c->reroute.split, c->repaint.partition.next_release_ns != 0, &c->reroute.canvas);
+			if (rr == COMP_HUB_D3D11_REPAINT_NOT_ADMITTED || rr == COMP_HUB_D3D11_REPAINT_NO_FRAME) {
+				c->repaint.bail_gate++;
+				u_repaint_trace_bail_gate(&c->repaint.trace);
+				continue;
+			}
 			c->repaint.count++;
 			const uint64_t fire_t1 = os_monotonic_get_ns();
 			u_repaint_gate_note_repaint(&c->repaint.gate, rp_start_ns);

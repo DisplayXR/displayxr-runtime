@@ -4274,6 +4274,38 @@ comp_hub_d3d11_repaint_admit(struct comp_hub_d3d11 *s)
 	return s == nullptr || s->target == nullptr || comp_d3d11_target_repaint_admit(s->target);
 }
 
+extern "C" void *
+comp_hub_d3d11_repaint_pace_hold(struct comp_hub_d3d11 *s)
+{
+	return (s != nullptr && s->target != nullptr) ? comp_d3d11_target_repaint_pace_hold(s->target) : nullptr;
+}
+
+extern "C" void
+comp_hub_d3d11_repaint_pace_wait(void *hold)
+{
+	comp_d3d11_target_repaint_pace_held(hold);
+}
+
+extern "C" enum comp_hub_d3d11_repaint_result
+comp_hub_d3d11_repaint(struct comp_hub_d3d11 *s, bool partition_engaged, const struct xrt_rect *canvas)
+{
+	if (!comp_hub_d3d11_has_weave_slot(s)) {
+		return COMP_HUB_D3D11_REPAINT_NO_FRAME;
+	}
+	// #1339 under the lock, as natively: the app frame waits on the same
+	// waitable while holding it, so a token taken outside could be the app's.
+	if (!partition_engaged && !comp_hub_d3d11_repaint_admit(s)) {
+		return COMP_HUB_D3D11_REPAINT_NOT_ADMITTED;
+	}
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("#2342 hub: repaints paced and admitted by the hub (the native D3D11 leg's shape)");
+	}
+	return comp_hub_d3d11_weave_and_present(s, /*is_repaint=*/true, canvas) ? COMP_HUB_D3D11_REPAINT_FIRED
+	                                                                        : COMP_HUB_D3D11_REPAINT_NOT_WOVEN;
+}
+
 extern "C" void
 comp_hub_d3d11_set_app_paced(struct comp_hub_d3d11 *s, bool paced)
 {
@@ -4928,6 +4960,28 @@ comp_hub_d3d11_set_post_weave_hook(struct comp_hub_d3d11 *split, comp_hub_d3d11_
 	(void)split;
 	(void)fn;
 	(void)userdata;
+}
+
+extern "C" void *
+comp_hub_d3d11_repaint_pace_hold(struct comp_hub_d3d11 *split)
+{
+	(void)split;
+	return NULL;
+}
+
+extern "C" void
+comp_hub_d3d11_repaint_pace_wait(void *hold)
+{
+	(void)hold;
+}
+
+extern "C" enum comp_hub_d3d11_repaint_result
+comp_hub_d3d11_repaint(struct comp_hub_d3d11 *split, bool partition_engaged, const struct xrt_rect *canvas)
+{
+	(void)split;
+	(void)partition_engaged;
+	(void)canvas;
+	return COMP_HUB_D3D11_REPAINT_NO_FRAME;
 }
 
 #endif /* XRT_OS_WINDOWS && XRT_HAVE_D3D11 */

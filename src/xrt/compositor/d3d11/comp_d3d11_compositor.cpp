@@ -3658,11 +3658,21 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		// fraction of its slots. Under an ENGAGED partition the schedule
 		// IS the pacing; skip it.
 		const uint64_t pace_t0 = os_monotonic_get_ns();
-		// #2317 P1b: under the hub there is no target on this side; the hub's
-		// flip chain and repaint_admit below are the throttle (the D3D12
-		// reroute's shape).
+		// #2342 P2c: under the hub there is no target on this side; the HUB
+		// paces, on its own target, exactly as this leg paces natively (the
+		// hold is taken under the lock so a retire cannot free what the
+		// unlocked wait reads).
 		if (c->repaint.partition.next_release_ns == 0 && c->target != nullptr) {
 			comp_d3d11_target_repaint_pace(c->target);
+		} else if (c->repaint.partition.next_release_ns == 0 && c->hub.active) {
+			void *hold = nullptr;
+			{
+				std::lock_guard<std::mutex> hold_lock(c->mutex);
+				if (c->hub.active) {
+					hold = comp_hub_d3d11_repaint_pace_hold(c->hub.split);
+				}
+			}
+			comp_hub_d3d11_repaint_pace_wait(hold);
 		}
 		const uint64_t pace_t1 = os_monotonic_get_ns();
 		u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
@@ -3687,13 +3697,17 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 				u_repaint_trace_bail_race(&c->repaint.trace);
 				continue;
 			}
-			if (c->repaint.partition.next_release_ns == 0 && !comp_hub_d3d11_repaint_admit(c->hub.split)) {
+			// #2342 P2c: the hub's one admission + replay (has-a-frame was
+			// tested above, so NO_FRAME cannot come back here).
+			const uint64_t hub_rp_start_ns = os_monotonic_get_ns();
+			const enum comp_hub_d3d11_repaint_result hub_rr = comp_hub_d3d11_repaint(
+			    c->hub.split, c->repaint.partition.next_release_ns != 0, &c->hub.canvas);
+			if (hub_rr == COMP_HUB_D3D11_REPAINT_NOT_ADMITTED ||
+			    hub_rr == COMP_HUB_D3D11_REPAINT_NO_FRAME) {
 				c->repaint.bail_gate++;
 				u_repaint_trace_bail_gate(&c->repaint.trace);
 				continue;
 			}
-			const uint64_t hub_rp_start_ns = os_monotonic_get_ns();
-			comp_hub_d3d11_weave_and_present(c->hub.split, /*is_repaint=*/true, &c->hub.canvas);
 			c->repaint.count++;
 			const uint64_t hub_fire_t1 = os_monotonic_get_ns();
 			u_repaint_gate_note_repaint(&c->repaint.gate, hub_rp_start_ns);
