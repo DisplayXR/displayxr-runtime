@@ -684,6 +684,21 @@ jobs:
             echo "  ok: manifest stamp CNSDK_LOADER_BUILD=$bstamp"
           fi
 
+      # DisplayXR/displayxr-unity#418: Android 15+ devices with a 16 KB-page
+      # kernel refuse to dlopen any .so whose PT_LOAD segments are aligned below
+      # 16 KB. Every library this repo builds links with
+      # -Wl,-z,max-page-size=16384 (CompilerFlags.cmake); prove it from the
+      # artifact. The leia payload (the plug-in from displayxr-leia-plugin and
+      # the CNSDK loader/JNI libs) is built elsewhere: reported as a warning
+      # until those builds adopt the flag, never silently passed.
+      - name: Assert 16 KB page alignment of every APK .so (${{ matrix.variant }})
+        if: steps.build.outcome == 'success'
+        run: |
+          set -euo pipefail
+          APK=$(find src/xrt/targets/openxr_android/build/outputs/apk/release -name '*.apk' | head -1)
+          python3 scripts/check_android_page_align.py \
+            --warn-only 'libdxrp050_*.so' --warn-only 'libleia*.so' "$APK"
+
       - name: Stage the APK with a release name
         id: stage
         if: steps.build.outcome == 'success'
@@ -771,6 +786,10 @@ jobs:
             exit 1
           fi
           echo "  ok: no other native libs in the AAR"
+
+          # unity#418: the layer lands in every consuming app's lib dir; a
+          # 4 KB-aligned copy silently never loads on a 16 KB-page device.
+          python3 scripts/check_android_page_align.py "outlib/DisplayXR-Client-${VER}.aar"
 
           rm -rf _aarchk && mkdir -p _aarchk/aar _aarchk/apk
           unzip -q -o "outlib/DisplayXR-Client-${VER}.aar" "$LAYER" -d _aarchk/aar
