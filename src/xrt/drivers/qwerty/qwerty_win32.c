@@ -624,9 +624,11 @@ qwerty_process_win32(struct xrt_device **xdevs,
 					if (wParam == '1')
 						is_keydown ? qwerty_press_menu(qleft) : qwerty_release_menu(qleft);
 					else if (wParam == '2')
-						is_keydown ? qwerty_press_trigger(qleft) : qwerty_release_trigger(qleft);
+						is_keydown ? qwerty_press_trigger(qleft)
+						           : qwerty_release_trigger(qleft);
 					else
-						is_keydown ? qwerty_press_squeeze(qleft) : qwerty_release_squeeze(qleft);
+						is_keydown ? qwerty_press_squeeze(qleft)
+						           : qwerty_release_squeeze(qleft);
 				}
 			} else if (is_keydown && qsys->hmd_focused) {
 				qwerty_set_rendering_mode(qsys, (int)(wParam - '1'));

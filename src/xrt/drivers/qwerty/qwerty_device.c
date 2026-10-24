@@ -946,8 +946,9 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 		init_stylus_binding_profiles();
 		qright->base.base.binding_profiles = binding_profiles_stylus;
 		qright->base.base.binding_profile_count = ARRAY_SIZE(binding_profiles_stylus);
-		U_LOG_W("qwerty: mouse hand on (DXR_MOUSE_HAND) - the right hand follows the cursor over the 3D view; "
-		        "left click = tip/trigger, right click = grip, wheel = depth, middle drag = look");
+		U_LOG_W(
+		    "qwerty: mouse hand on (DXR_MOUSE_HAND) - the right hand follows the cursor over the 3D view; "
+		    "left click = tip/trigger, right click = grip, wheel = depth, middle drag = look");
 	}
 
 	// Default rendering mode matches sim_display default (mode 1 = first 3D mode)
