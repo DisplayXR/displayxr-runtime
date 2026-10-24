@@ -223,6 +223,7 @@ struct comp_d3d11_window
 	bool embed_peeking;
 	bool peek_lbutton_down;
 	bool peek_escape_down;
+	DWORD peek_hover_since; //!< GetTickCount when the cursor reached the app's UI; 0 = not there
 
 	//! Window thread handle
 	HANDLE thread_handle;
@@ -716,6 +717,8 @@ set_fullscreen(HWND hWnd, bool fullscreen)
 #define DXR_EMBED_PEEK_PERIOD_MS 50
 //! UI peek ends after this long with no keyboard or mouse input.
 #define DXR_EMBED_PEEK_IDLE_MS 4000
+//! UI peek starts after the cursor rests this long on the app's own UI strip.
+#define DXR_EMBED_PEEK_HOVER_MS 150
 
 //! The window this thread embeds — WinEvent callbacks carry no context, and
 //! each comp_d3d11_window has its own thread.
@@ -831,11 +834,12 @@ embed_fit(struct comp_d3d11_window *w, HWND hwnd)
 }
 
 /*!
- * UI peek, polled on the window thread. The app's clicks go to the app, not
- * to us, so watch the global button state: a left click whose point is in
- * the host's client area, uncovered by us (its menu bar), hides the 3D view.
- * Esc or a few seconds without input shows it again. Reads global state
- * only; sends the app nothing.
+ * UI peek, polled on the window thread. The cursor resting on (or a click
+ * in) the host's client area that we leave uncovered, i.e. its menu bar,
+ * hides the 3D view. On hover, not only on click: an app that stops running
+ * its UI while occluded (Modeler) drops a click that lands while we still
+ * cover it. Esc or a few seconds without input shows the 3D again. Reads
+ * global input state only; sends the app nothing.
  */
 static void
 embed_peek_tick(struct comp_d3d11_window *w, HWND hwnd)
@@ -855,22 +859,29 @@ embed_peek_tick(struct comp_d3d11_window *w, HWND hwnd)
 	w->peek_escape_down = escape;
 
 	if (!w->embed_peeking) {
-		if (!clicked || InterlockedCompareExchange(&w->embed_fullscreen, 0, 0) != 0) {
-			return;
-		}
 		POINT pt;
 		RECT client;
 		RECT ours;
-		if (!GetCursorPos(&pt) || GetAncestor(WindowFromPoint(pt), GA_ROOT) != host) {
+		POINT local;
+		const bool on_app_ui = InterlockedCompareExchange(&w->embed_fullscreen, 0, 0) == 0 &&
+		                       GetCursorPos(&pt) && GetAncestor(WindowFromPoint(pt), GA_ROOT) == host &&
+		                       // Over the 3D view (input passed through to the app) is not the app's own UI.
+		                       !(GetWindowRect(hwnd, &ours) && PtInRect(&ours, pt)) &&
+		                       // The title bar / frame moves the window; only the client area is its UI.
+		                       (local = pt, ScreenToClient(host, &local)) && GetClientRect(host, &client) &&
+		                       PtInRect(&client, local);
+		if (!on_app_ui) {
+			w->peek_hover_since = 0;
 			return;
 		}
-		if (GetWindowRect(hwnd, &ours) && PtInRect(&ours, pt)) {
-			return; // over the 3D view (input passed through to the app): not the app's own UI
+		const DWORD now = GetTickCount();
+		if (w->peek_hover_since == 0) {
+			w->peek_hover_since = now | 1; // never 0 while hovering
 		}
-		POINT local = pt;
-		if (!ScreenToClient(host, &local) || !GetClientRect(host, &client) || !PtInRect(&client, local)) {
-			return; // title bar / frame: moving the window, not using its UI
+		if (!clicked && now - w->peek_hover_since < DXR_EMBED_PEEK_HOVER_MS) {
+			return;
 		}
+		w->peek_hover_since = 0;
 		w->embed_peeking = true;
 		ShowWindow(hwnd, SW_HIDE);
 		static bool peek_logged = false;
