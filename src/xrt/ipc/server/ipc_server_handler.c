@@ -973,11 +973,8 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			eye_offset_x = wm.window_center_offset_x_m;
 			eye_offset_y = wm.window_center_offset_y_m;
 			eye_offset_z = wm.window_center_offset_z_m;
-			win_orient = wm.window_orientation;
-			win_has_orientation = (fabsf(win_orient.x) > 0.0001f ||
-			                      fabsf(win_orient.y) > 0.0001f ||
-			                      fabsf(win_orient.z) > 0.0001f ||
-			                      fabsf(win_orient.w - 1.0f) > 0.0001f);
+			// A never-filled (zero) quaternion is the identity.
+			win_has_orientation = u_canvas_window_orientation(&wm, &win_orient);
 			// XR_DXR_view_rig raw channel: the effective canvas on the
 			// panel — wm already describes the canvas sub-rect when one
 			// is set (u_canvas_apply_to_metrics), the client area
