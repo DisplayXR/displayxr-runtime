@@ -1377,6 +1377,7 @@ split_segments_release(struct comp_hub_d3d11 *s)
  * every DisplayXR executable is per-monitor DPI aware, #1201) and publishes
  * the table this weave took for the next xrLocateViews.
  *
+ * @param out_window The window rect this weave segmented (optional, NULL = not wanted).
  * @return true when this weave takes the per-segment path.
  */
 static bool
@@ -1480,7 +1481,9 @@ split_segments_update(struct comp_hub_d3d11 *s, uint32_t tgt_w, uint32_t tgt_h, 
 	s->seg_pub = m;
 	os_mutex_unlock(&s->seg_mutex);
 
-	*out_window = win;
+	if (out_window != nullptr) {
+		*out_window = win;
+	}
 	return split;
 }
 
@@ -1595,6 +1598,57 @@ static uint64_t
 split_pdt_get(struct comp_hub_d3d11 *s, uint64_t seq);
 
 /*!
+ * The hub's runtime-owned D3D11 device on @p adapter, for BOTH presenter
+ * strategies (#2370 review: one bring-up, so the two cannot drift): device +
+ * immediate context, multithread protection (the vendor DP may touch the
+ * context from its own threads), the one-deep DXGI queue, the adapter's DXGI
+ * factory and its description. The swapchain strategy presents on this
+ * device; client-presents never does, for which the frame-latency setting is
+ * inert.
+ *
+ * @return NULL on success, else a short phrase for the DISABLED WARN; the
+ *         caller's split_release_out undoes whatever was made.
+ */
+static const char *
+split_create_out_device(struct comp_hub_d3d11 *s, IDXGIAdapter *adapter)
+{
+	UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+	D3D_FEATURE_LEVEL got = {};
+	static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+	HRESULT hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels, ARRAYSIZE(levels),
+	                               D3D11_SDK_VERSION, &s->out_dev, &got, &s->out_ctx);
+	if (FAILED(hr) || s->out_dev == nullptr || s->out_ctx == nullptr) {
+		U_LOG_W("D3D11 hub: D3D11CreateDevice failed 0x%08lx", (unsigned long)hr);
+		return "D3D11CreateDevice failed";
+	}
+	// The output context has one caller at a time (layer_commit and the repaint
+	// loop, both under the compositor mutex), but the vendor DP may touch it
+	// from its own threads.
+	ID3D10Multithread *omt = nullptr;
+	if (SUCCEEDED(s->out_dev->QueryInterface(__uuidof(ID3D10Multithread), (void **)&omt)) && omt != nullptr) {
+		omt->SetMultithreadProtected(TRUE);
+		omt->Release();
+	}
+	// Same one-deep DXGI queue the app device gets: on the swapchain strategy
+	// the present happens HERE, so this is where the pacing lever lives.
+	IDXGIDevice1 *od1 = nullptr;
+	if (SUCCEEDED(s->out_dev->QueryInterface(__uuidof(IDXGIDevice1), (void **)&od1)) && od1 != nullptr) {
+		od1->SetMaximumFrameLatency(1);
+		od1->Release();
+	}
+	hr = adapter->GetParent(__uuidof(IDXGIFactory4), (void **)&s->out_factory);
+	if (FAILED(hr) || s->out_factory == nullptr) {
+		U_LOG_W("D3D11 hub: the adapter's DXGI factory failed 0x%08lx", (unsigned long)hr);
+		return "DXGI factory unavailable";
+	}
+	DXGI_ADAPTER_DESC ad{};
+	if (SUCCEEDED(adapter->GetDesc(&ad))) {
+		wcsncpy_s(s->out_desc, ad.Description, _TRUNCATE);
+	}
+	return nullptr;
+}
+
+/*!
  * #2370: Stage A1 of the CLIENT-PRESENTS presenter strategy. Nothing here is
  * the scanout adapter's: the caller presents, so the hub's device is made on
  * the caller's (render) adapter, its weaver is a windowless DP, and its target
@@ -1654,22 +1708,13 @@ split_stage_a_client(const struct comp_hub_d3d11_info *info,
 	s->ring_direct_planes = info->ring_direct_planes;
 	s->direct.cur = -1;
 
+	// The caller's adapter, by LUID: the device the weave and the caller's
+	// present share.
 	IDXGIAdapter *adapter = nullptr;
 	{
 		IDXGIFactory4 *f4 = nullptr;
-		HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void **)&f4);
-		if (SUCCEEDED(hr) && f4 != nullptr) {
-			hr = f4->EnumAdapterByLuid(s->render_luid, __uuidof(IDXGIAdapter), (void **)&adapter);
-			if (SUCCEEDED(hr) && adapter != nullptr) {
-				s->out_factory = f4;
-				f4 = nullptr;
-				DXGI_ADAPTER_DESC ad{};
-				if (SUCCEEDED(adapter->GetDesc(&ad))) {
-					wcsncpy_s(s->out_desc, ad.Description, _TRUNCATE);
-				}
-			}
-		}
-		if (f4 != nullptr) {
+		if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void **)&f4)) && f4 != nullptr) {
+			(void)f4->EnumAdapterByLuid(s->render_luid, __uuidof(IDXGIAdapter), (void **)&adapter);
 			f4->Release();
 		}
 		if (adapter == nullptr) {
@@ -1677,26 +1722,12 @@ split_stage_a_client(const struct comp_hub_d3d11_info *info,
 		}
 	}
 	if (why == nullptr) {
-		UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-		D3D_FEATURE_LEVEL got = {};
-		static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-		HRESULT hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels, ARRAYSIZE(levels),
-		                               D3D11_SDK_VERSION, &s->out_dev, &got, &s->out_ctx);
-		if (FAILED(hr) || s->out_dev == nullptr || s->out_ctx == nullptr) {
-			why = "D3D11CreateDevice failed on the caller's adapter";
-		}
+		why = split_create_out_device(s, adapter);
 	}
 	if (adapter != nullptr) {
 		adapter->Release();
 	}
 	if (why == nullptr) {
-		// The vendor DP may touch the context from its own threads (as on the
-		// swapchain strategy).
-		ID3D10Multithread *omt = nullptr;
-		if (SUCCEEDED(s->out_dev->QueryInterface(__uuidof(ID3D10Multithread), (void **)&omt)) && omt != nullptr) {
-			omt->SetMultithreadProtected(TRUE);
-			omt->Release();
-		}
 		if (!split_make_client_dp(s, (const struct xrt_dp_registry_entry *)info->windowless_dp_entry)) {
 			why = "the plug-in cannot weave this screen windowless";
 		}
@@ -1859,41 +1890,9 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
 	const char *reason = nullptr;
 	const char *stage_a_token = nullptr;
 
-	// Runtime-owned D3D11 device on the scanout adapter.
-	{
-		UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-		D3D_FEATURE_LEVEL got = {};
-		static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-		HRESULT hr = D3D11CreateDevice(scanout.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels,
-		                               ARRAYSIZE(levels), D3D11_SDK_VERSION, &s->out_dev, &got, &s->out_ctx);
-		if (FAILED(hr) || s->out_dev == nullptr || s->out_ctx == nullptr) {
-			U_LOG_W("VK output-device split: D3D11CreateDevice failed 0x%08lx", (unsigned long)hr);
-			reason = "D3D11CreateDevice failed";
-		}
-	}
-	if (reason == nullptr) {
-		// The output context has one caller at a time (layer_commit and the
-		// repaint loop, both under the compositor mutex), but the vendor DP may
-		// touch it from its own threads.
-		ID3D10Multithread *omt = nullptr;
-		if (SUCCEEDED(s->out_dev->QueryInterface(__uuidof(ID3D10Multithread), (void **)&omt)) &&
-		    omt != nullptr) {
-			omt->SetMultithreadProtected(TRUE);
-			omt->Release();
-		}
-		// Same one-deep DXGI queue the app device gets: the present happens
-		// HERE now, so this is where the pacing lever lives.
-		IDXGIDevice1 *od1 = nullptr;
-		if (SUCCEEDED(s->out_dev->QueryInterface(__uuidof(IDXGIDevice1), (void **)&od1)) && od1 != nullptr) {
-			od1->SetMaximumFrameLatency(1);
-			od1->Release();
-		}
-		HRESULT hr = scanout->GetParent(__uuidof(IDXGIFactory4), (void **)&s->out_factory);
-		if (FAILED(hr) || s->out_factory == nullptr) {
-			U_LOG_W("VK output-device split: scanout DXGI factory failed 0x%08lx", (unsigned long)hr);
-			reason = "scanout DXGI factory unavailable";
-		}
-	}
+	// Runtime-owned D3D11 device on the scanout adapter (#2370 review: the one
+	// bring-up both presenter strategies share).
+	reason = split_create_out_device(s, scanout.get());
 
 	/*
 	 * ADR-037 §3a — ASK THE PLUG-IN BEFORE THE SPLIT COMMITS (the D3D11 leg's
@@ -4431,8 +4430,9 @@ split_weave_client(struct comp_hub_d3d11 *s, bool is_repaint)
 		        cl.target.w, cl.target.h, tgt_w, tgt_h);
 	}
 
-	struct comp_seg_rect seg_window = {0, 0, 0, 0};
-	const bool seg_split = split_segments_update(s, tgt_w, tgt_h, &seg_window);
+	// The segment window IS cl.target (split_segments_update reads it), so
+	// both the single-DP and the segmented canvas come from cv_w x cv_h above.
+	const bool seg_split = split_segments_update(s, tgt_w, tgt_h, nullptr);
 
 	// No swapchain, so no measured weave->scanout and no vblank grid: the
 	// period only (0 measured = the DP's own heuristic, as on a cold target).
@@ -4594,19 +4594,20 @@ static void
 split_direct_to_xbridge(struct comp_hub_d3d11 *s, const char *reason)
 {
 	auto &d = s->direct;
-	if (s->client_presents) {
-		// #2370: client-presents has no xbridge leg (no scanout device to
-		// bridge to): the session stays DIRECT, the offending frame is not
-		// woven, and the texture keeps its last frame. Said once.
-		if (!s->direct_to_xbridge_failed) {
-			s->direct_to_xbridge_failed = true;
-			U_LOG_W("D3D11 hub client-presents: a frame needed the xbridge ingress (%s), which this strategy "
-			        "does not carry — it stays DIRECT (#2370)",
-			        reason != nullptr ? reason : "?");
-		}
+	// Only a RING session ever moves (the stable atlas reads its planes in
+	// place on DIRECT): this guard first, so a stable-atlas client-presents
+	// session's plane frames never reach the branch below.
+	if (!d.active || !d.ring || s->xbridge != nullptr || s->direct_to_xbridge_failed) {
 		return;
 	}
-	if (!d.active || !d.ring || s->xbridge != nullptr || s->direct_to_xbridge_failed) {
+	if (s->client_presents) {
+		// #2370: client-presents has no xbridge leg (no scanout device to
+		// bridge to): the ring session stays DIRECT and the frame that asked
+		// is woven from its slot without the move. Said once.
+		s->direct_to_xbridge_failed = true;
+		U_LOG_W("D3D11 hub client-presents: a ring frame asked for the xbridge ingress (%s), which this strategy "
+		        "does not carry — the session stays DIRECT (#2370)",
+		        reason != nullptr ? reason : "?");
 		return;
 	}
 	const uint64_t t0 = os_monotonic_get_ns();

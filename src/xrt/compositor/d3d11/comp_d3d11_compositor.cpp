@@ -4738,16 +4738,25 @@ d3d11_hub_stage_a(struct comp_d3d11_compositor *c,
 	 * #2370: a texture-class session rides the hub only as the CLIENT-PRESENTS
 	 * presenter strategy, and only when (a) the hub was asked for explicitly
 	 * (`DXR_HUB=1` — default OFF while it is validated), (b) the session is
-	 * bound to an ADR-060 texture target (the rect the hub phases from), and
-	 * (c) the hub's Stage A gets a windowless DP that declares
-	 * PHASE_FROM_PRESENT_ORIGIN. Any other texture session keeps the closed
-	 * refusal `shared_texture_session`, and the tier's own legs compose it.
+	 * bound to an ADR-060 texture target (the rect the hub phases from), (c)
+	 * it is opaque and asks for no PQ atlas (neither is carried on this
+	 * strategy yet), and (d) the hub's Stage A gets a windowless DP that
+	 * declares PHASE_FROM_PRESENT_ORIGIN. EVERY other texture session is
+	 * refused with the one closed token `shared_texture_session` — the same
+	 * policy and token set as the D3D12 tier (ADR-059 Amendment 3) — and the
+	 * tier's own legs compose it.
 	 */
 	const bool client_presents = c->has_shared_texture;
 	if (client_presents) {
 		const char *why = nullptr;
 		if (d3d11_hub_policy() != D3D11_HUB_POLICY_FORCED) {
 			why = nullptr; // the default: silent, exactly the pre-#2370 line
+		} else if (c->owns_window) {
+			why = "a runtime-owned window";
+		} else if (transparent_background) {
+			why = "a transparent session (not carried on client-presents yet)";
+		} else if (d3d11_pq_atlas_requested()) {
+			why = "a PQ atlas was requested (not carried on client-presents yet)";
 		} else if (!d3d11_tt_bound(c)) {
 			why = "the session is not bound to a texture target (XR_DXR_win32_window_binding v9)";
 		} else if (c->tt.entry == nullptr) {
@@ -4960,7 +4969,13 @@ d3d11_hub_retire(struct comp_d3d11_compositor *c, const char *token)
 		c->tt.windowless = false;
 		made = d3d11_make_windowless_texture_dp(c, c->device, c->context);
 		if (!made) {
+			// The create path's ADR-060 WARN, verbatim: the downgrade is visible.
 			c->tt.anchor_fallback = c->app_hwnd != nullptr;
+			U_LOG_W(c->tt.anchor_fallback
+			            ? "ADR-060: texture target cannot phase windowless — the windowHandle anchor carries "
+			              "the weave (SPEC_VERSION 8 path); the rect still defines the canvas"
+			            : "ADR-060: texture target cannot phase windowless and no windowHandle was given — "
+			              "weaving display-scoped (no window phase)");
 		}
 	}
 	if (!made && !d3d11_make_dp(c, c->hub.dp_factory_d3d11, c->device, c->context, false)) {

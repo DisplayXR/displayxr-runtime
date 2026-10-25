@@ -514,6 +514,8 @@ struct comp_d3d12_compositor
 
 	//! #2370: the app's shared-texture HANDLE (borrowed), for the hub's client-presents open.
 	void *shared_texture_handle;
+	//! #2370: its extent, read once at create (the client-presents clamp).
+	uint32_t shared_texture_w, shared_texture_h;
 
 	//! #2370: the session screen's DP registry entry (system-owned), the hub's windowless DP source.
 	const struct xrt_dp_registry_entry *client_entry;
@@ -2185,6 +2187,154 @@ d3d12_reroute_abandon(struct comp_d3d12_compositor *c, bool hybrid, const char *
 }
 
 /*!
+ * The reroute's shared tail after the hub's Stage A1 — the deposit ring at the
+ * worst-case system atlas (ADR-010), the wiring, the consumer-fence bind, the
+ * panel dims and plane format, the placement line, the screen-list replay and
+ * the #2362 app release-fence probe. ONE copy for the stock reroute and the
+ * #2370 client-presents strategy, so neither can lose a piece the other has.
+ *
+ * @p hybrid: the stock reroute runs cross-adapter (#2375). A failure then goes
+ * through d3d12_reroute_abandon (quiet destroy, the own-legs split follows),
+ * and the hub=1 line names the hybrid route reason.
+ *
+ * @p client: the consumer-fence bind is REQUIRED (it is the texture handoff,
+ * not only the ring release), and a failure tears down quietly — the caller's
+ * gate then refuses `shared_texture_session`. Otherwise a failure abandons the
+ * reroute (d3d12_reroute_abandon) and a missing bind only leaves DIRECT, as
+ * before.
+ *
+ * @return true when the reroute is active.
+ */
+static bool
+d3d12_reroute_wire(struct comp_d3d12_compositor *c, struct xrt_device *xdev, bool hybrid, bool client)
+{
+	// The deposit ring at the worst-case system atlas (ADR-010's sizing rule,
+	// same numbers the own-legs arm bridges at).
+	uint32_t sys_w = 0, sys_h = 0;
+	if (xdev->rendering_mode_count > 0) {
+		u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &sys_w, &sys_h);
+	}
+	if (sys_w == 0 || sys_h == 0) {
+		sys_w = c->settings.preferred.width;
+		sys_h = c->settings.preferred.height;
+	}
+	const char *fail = nullptr;
+	if (comp_d3d12_deposit_create(c->device, sys_w, sys_h, &c->reroute.dep) != XRT_SUCCESS ||
+	    c->reroute.dep == NULL) {
+		fail = "deposit creation failed";
+	}
+	if (fail == nullptr) {
+		struct comp_hub_d3d11_handoff handoff = {};
+		// The #2317 test hook targets the stock reroute's fallback only.
+		const bool test_fail = !client && d3d12_test_hub_stage_a_fail();
+		if (test_fail || !comp_d3d12_deposit_get_handoff(c->reroute.dep, &handoff) ||
+		    !comp_hub_d3d11_wire_bridge(c->reroute.split, &handoff)) {
+			fail = test_fail ? "DXR_TEST_HUB_STAGE_A_FAIL" : "bridge wire failed";
+		}
+	}
+	/*
+	 * #2317 P2a: on one adapter the hub can read the deposit ring DIRECT (no
+	 * transport copy; DXR_HUB_INGRESS=direct opts in, the hub's ingress policy
+	 * decides). A HYBRID reroute (the default on a cross-adapter box, #2375)
+	 * always takes xbridge (ingress_reason=cross_adapter). DIRECT reads are released
+	 * on the hub's own consumer fence, which this queue must open to order a
+	 * slot rewrite after them — no open, no DIRECT. #2370: under
+	 * client-presents the same fence is the texture handoff, so no open, no hub.
+	 */
+	if (fail == nullptr) {
+		void *cons = comp_hub_d3d11_get_consumer_fence_handle(c->reroute.split);
+		const bool bound = cons != nullptr && comp_d3d12_deposit_bind_consumer_fence(c->reroute.dep, cons);
+		if (client && !bound) {
+			fail = "the hub's consumer fence could not be opened on this queue";
+		} else if (cons != nullptr && !bound) {
+			comp_hub_d3d11_leave_direct(c->reroute.split, COMP_HUB_INGRESS_REASON_DIRECT_FAILED);
+		}
+	}
+	if (fail != nullptr) {
+		comp_d3d12_deposit_destroy(&c->reroute.dep);
+		if (client) {
+			U_LOG_W("D3D11 hub client-presents (d3d12): %s — this tier's own legs compose (#2370)", fail);
+			comp_hub_d3d11_destroy(&c->reroute.split);
+		} else {
+			d3d12_reroute_abandon(c, hybrid, fail);
+		}
+		return false;
+	}
+
+	// The plane machinery's panel-sizing rule reads these (same source the
+	// own-legs Stage A fills them from).
+	if (xdev->hmd != NULL) {
+		c->split_panel_w = xdev->hmd->screens[0].w_pixels;
+		c->split_panel_h = xdev->hmd->screens[0].h_pixels;
+	}
+
+	// This tier's flatten family is RGBA (the atlas ring's, and the scratch
+	// the plane copies promote from) — the arm's chains must match or the
+	// bind refuses on the typeless-family check.
+	comp_hub_d3d11_set_plane_format(c->reroute.split, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM);
+	// #2317: a hybrid reroute's hub=1 line names why it is on the hub
+	// (reason=hybrid_reroute_default_on, or hybrid_reroute_opt_in when
+	// DXR_SPLIT_D3D12_HYBRID_REROUTE is set to a non-false value); the same-adapter default
+	// (and #2370 client-presents, always on the app's adapter) passes NULL and
+	// keeps its line unchanged.
+	comp_hub_d3d11_set_route_reason(c->reroute.split,
+	                                !hybrid ? nullptr
+	                                        : (d3d12_reroute_hybrid_policy() == D3D12_HYBRID_REROUTE_FORCED
+	                                               ? COMP_HUB_REASON_HYBRID_REROUTE_OPT_IN
+	                                               : COMP_HUB_REASON_HYBRID_REROUTE_DEFAULT_ON));
+	comp_hub_d3d11_log_placement(c->reroute.split, "d3d12");
+	c->reroute.active = true;
+	c->reroute.client_presents = client;
+	// #2370: client-presents weaves on the app's adapter (the app presents),
+	// so its `weave placement:` line is the native texture session's.
+	c->split_off_reason = client ? COMP_SPLIT_REASON_SHARED_TEXTURE : NULL;
+	// #2218 (#3): the arm segments the window with its own manager (ADR-047
+	// Amendment 1, the VK tier's shape). A screen list handed over before the
+	// arm stood up is replayed into it; later ones are forwarded by
+	// comp_d3d12_compositor_set_screens.
+	if (c->seg_screens != nullptr && c->seg_sys_info != nullptr) {
+		comp_hub_d3d11_set_screens(c->reroute.split, c->seg_screens, c->seg_sys_info, c->seg_pinned_display_id);
+	}
+	/*
+	 * #2362: an app-published release fence (engine apps that render on their
+	 * own main queue — the Unreal plug-in's RuntimeQueue). Probed once: the
+	 * publisher sets it before xrCreateSession.
+	 */
+	{
+		ID3D12Fence *af = nullptr;
+		const char *why = "none";
+		if (comp_d3d12_app_release_fence_query(c->command_queue, c->device, &af, &why)) {
+			c->app_defer_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			if (c->app_defer_event == nullptr ||
+			    FAILED(c->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+			                                  reinterpret_cast<void **>(&c->app_defer_fence)))) {
+				c->app_defer_fence = nullptr;
+				af->Release();
+				af = nullptr;
+				why = "defer_fence_failed";
+			}
+		}
+		c->reroute.app_fence = af;
+		c->reroute.app_fence_reason = why;
+		U_LOG_W("#2362 hub ingest: release_fence=%s%s%s%s", af != nullptr ? "app" : "none",
+		        af != nullptr ? "" : " reason=", af != nullptr ? "" : why,
+		        af == nullptr ? ""
+		        : debug_get_bool_option("DXR_D3D12_DEFER_IDLE_WAIT", true)
+		            ? " defer_idle_wait=1"
+		            : " defer_idle_wait=0 (DXR_D3D12_DEFER_IDLE_WAIT=0)");
+	}
+
+	U_LOG_W(
+	    "#1264 heavy-d3d12 reroute ACTIVE%s: this session's fill/weave/present run on the d3d11 fill "
+	    "arm (ADR-039 — one fill engine); the atlas renders into a D3D11 deposit ring opened on the "
+	    "app's D3D12 device, %ux%u x%u. DXR_SPLIT_D3D12_ROUTE=own reverts to the tier's own arm.",
+	    client ? " (client-presents, #2370: the hub weaves into the app's shared texture)" : "", sys_w, sys_h,
+	    (unsigned)COMP_D3D12_DEPOSIT_RING);
+	return true;
+}
+
+
+/*!
  * @param out_refused set true when the hub's Stage A1 DECLINED the session (a
  *        policy refusal; `c->split_off_reason` holds its token, nothing was
  *        created), false for a stand-up failure after A1 or on success.
@@ -2234,112 +2384,7 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 		return false;
 	}
 
-	// The deposit ring at the worst-case system atlas (ADR-010's sizing rule,
-	// same numbers the own-legs arm bridges at).
-	uint32_t sys_w = 0, sys_h = 0;
-	if (xdev->rendering_mode_count > 0) {
-		u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &sys_w, &sys_h);
-	}
-	if (sys_w == 0 || sys_h == 0) {
-		sys_w = c->settings.preferred.width;
-		sys_h = c->settings.preferred.height;
-	}
-	if (comp_d3d12_deposit_create(c->device, sys_w, sys_h, &c->reroute.dep) != XRT_SUCCESS ||
-	    c->reroute.dep == NULL) {
-		d3d12_reroute_abandon(c, hybrid, "deposit creation failed");
-		return false;
-	}
-
-	struct comp_hub_d3d11_handoff handoff = {};
-	const bool test_fail = d3d12_test_hub_stage_a_fail();
-	if (test_fail || !comp_d3d12_deposit_get_handoff(c->reroute.dep, &handoff) ||
-	    !comp_hub_d3d11_wire_bridge(c->reroute.split, &handoff)) {
-		comp_d3d12_deposit_destroy(&c->reroute.dep);
-		d3d12_reroute_abandon(c, hybrid, test_fail ? "DXR_TEST_HUB_STAGE_A_FAIL" : "bridge wire failed");
-		return false;
-	}
-
-	// The plane machinery's panel-sizing rule reads these (same source the
-	// own-legs Stage A fills them from).
-	if (xdev->hmd != NULL) {
-		c->split_panel_w = xdev->hmd->screens[0].w_pixels;
-		c->split_panel_h = xdev->hmd->screens[0].h_pixels;
-	}
-
-	// This tier's flatten family is RGBA (the atlas ring's, and the scratch
-	// the plane copies promote from) — the arm's chains must match or the
-	// bind refuses on the typeless-family check.
-	comp_hub_d3d11_set_plane_format(c->reroute.split, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM);
-
-	/*
-	 * #2317 P2a: on one adapter the hub can read the deposit ring DIRECT (no
-	 * transport copy; DXR_HUB_INGRESS=direct opts in, the hub's ingress policy
-	 * decides). A HYBRID reroute (the default on a cross-adapter box, #2375)
-	 * always takes xbridge (ingress_reason=cross_adapter). DIRECT reads are released
-	 * on the hub's own consumer fence, which this queue must open to order a
-	 * slot rewrite after them — no open, no DIRECT.
-	 */
-	{
-		void *cons = comp_hub_d3d11_get_consumer_fence_handle(c->reroute.split);
-		if (cons != nullptr && !comp_d3d12_deposit_bind_consumer_fence(c->reroute.dep, cons)) {
-			comp_hub_d3d11_leave_direct(c->reroute.split, COMP_HUB_INGRESS_REASON_DIRECT_FAILED);
-		}
-	}
-	// #2317: a hybrid reroute's hub=1 line names why it is on the hub
-	// (reason=hybrid_reroute_default_on, or hybrid_reroute_opt_in when
-	// DXR_SPLIT_D3D12_HYBRID_REROUTE is set to a non-false value); the same-adapter default
-	// passes NULL and keeps its line unchanged.
-	comp_hub_d3d11_set_route_reason(c->reroute.split,
-	                                !hybrid ? nullptr
-	                                        : (d3d12_reroute_hybrid_policy() == D3D12_HYBRID_REROUTE_FORCED
-	                                               ? COMP_HUB_REASON_HYBRID_REROUTE_OPT_IN
-	                                               : COMP_HUB_REASON_HYBRID_REROUTE_DEFAULT_ON));
-	comp_hub_d3d11_log_placement(c->reroute.split, "d3d12");
-
-	c->reroute.active = true;
-	c->split_off_reason = NULL;
-	// #2218 (#3): the arm segments the window with its own manager (ADR-047
-	// Amendment 1, the VK tier's shape). A screen list handed over before the
-	// arm stood up is replayed into it; later ones are forwarded by
-	// comp_d3d12_compositor_set_screens.
-	if (c->seg_screens != nullptr && c->seg_sys_info != nullptr) {
-		comp_hub_d3d11_set_screens(c->reroute.split, c->seg_screens, c->seg_sys_info, c->seg_pinned_display_id);
-	}
-	/*
-	 * #2362: an app-published release fence (engine apps that render on their
-	 * own main queue — the Unreal plug-in's RuntimeQueue). Probed once: the
-	 * publisher sets it before xrCreateSession.
-	 */
-	{
-		ID3D12Fence *af = nullptr;
-		const char *why = "none";
-		if (comp_d3d12_app_release_fence_query(c->command_queue, c->device, &af, &why)) {
-			c->app_defer_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-			if (c->app_defer_event == nullptr ||
-			    FAILED(c->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
-			                                  reinterpret_cast<void **>(&c->app_defer_fence)))) {
-				c->app_defer_fence = nullptr;
-				af->Release();
-				af = nullptr;
-				why = "defer_fence_failed";
-			}
-		}
-		c->reroute.app_fence = af;
-		c->reroute.app_fence_reason = why;
-		U_LOG_W("#2362 hub ingest: release_fence=%s%s%s%s", af != nullptr ? "app" : "none",
-		        af != nullptr ? "" : " reason=", af != nullptr ? "" : why,
-		        af == nullptr ? ""
-		        : debug_get_bool_option("DXR_D3D12_DEFER_IDLE_WAIT", true)
-		            ? " defer_idle_wait=1"
-		            : " defer_idle_wait=0 (DXR_D3D12_DEFER_IDLE_WAIT=0)");
-	}
-
-	U_LOG_W(
-	    "#1264 heavy-d3d12 reroute ACTIVE: this session's fill/weave/present run on the d3d11 fill "
-	    "arm (ADR-039 — one fill engine); the atlas renders into a D3D11 deposit ring opened on the "
-	    "app's D3D12 device, %ux%u x%u. DXR_SPLIT_D3D12_ROUTE=own reverts to the tier's own arm.",
-	    sys_w, sys_h, (unsigned)COMP_D3D12_DEPOSIT_RING);
-	return true;
+	return d3d12_reroute_wire(c, xdev, hybrid, /*client=*/false);
 }
 /*!
  * #2345 review: the list a deposit-plane rewrite is recorded on. Off DIRECT
@@ -2625,23 +2670,27 @@ d3d12_client_presents_requested(void)
 /*!
  * #2370: this frame's client-presents target — the app's window client area
  * on the desktop (device px, read under a per-monitor-v2 pin through ADR-060
- * R1's resolve, clamped to the shared texture). The D3D12 tier carries no v9
+ * R1's compose, clamped to the shared texture). The D3D12 tier carries no v9
  * target binding yet, so the reference window + rect is the windowHandle anchor
- * and its whole client area. False when the window is gone or empty.
+ * and its whole client area (a documented limitation, #2382). False when the
+ * window is gone or empty.
  */
 static bool
 d3d12_client_target(struct comp_d3d12_compositor *c, struct comp_seg_rect *out)
 {
-	if (c->app_hwnd == nullptr || !IsWindow(c->app_hwnd) || c->shared_texture == nullptr) {
+	if (c->app_hwnd == nullptr || !IsWindow(c->app_hwnd) || c->shared_texture_w == 0) {
 		return false;
 	}
+	// ONE per-monitor-v2 pin for the size and the origin (the host may be
+	// DPI-unaware; docs/reference/dpi-awareness.md), then R1's pure compose.
 	comp_texture_target_pfn_set_thread_dpi_ctx set_ctx = comp_texture_target_dpi_setter();
 	DPI_AWARENESS_CONTEXT prev = nullptr;
 	if (set_ctx != nullptr) {
 		prev = set_ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 	}
 	RECT rc = {};
-	const BOOL ok = GetClientRect(c->app_hwnd, &rc);
+	POINT org = {0, 0};
+	const BOOL ok = GetClientRect(c->app_hwnd, &rc) && ClientToScreen(c->app_hwnd, &org);
 	if (set_ctx != nullptr && prev != nullptr) {
 		(void)set_ctx(prev);
 	}
@@ -2653,9 +2702,9 @@ d3d12_client_target(struct comp_d3d12_compositor *c, struct comp_seg_rect *out)
 	tt.ref = c->app_hwnd;
 	tt.w = (uint32_t)rc.right;
 	tt.h = (uint32_t)rc.bottom;
-	const D3D12_RESOURCE_DESC td = c->shared_texture->GetDesc();
 	struct comp_texture_target_resolved r = {};
-	if (!comp_texture_target_resolve_win32(&tt, (uint32_t)td.Width, (uint32_t)td.Height, &r)) {
+	if (!comp_texture_target_compose(&tt, (int32_t)org.x, (int32_t)org.y, c->shared_texture_w,
+	                                 c->shared_texture_h, &r)) {
 		return false;
 	}
 	*out = r.screen;
@@ -2673,8 +2722,12 @@ d3d12_client_target(struct comp_d3d12_compositor *c, struct comp_seg_rect *out)
 static bool
 d3d12_reroute_stage_a_client(struct comp_d3d12_compositor *c, struct xrt_device *xdev)
 {
+	// One policy with the D3D11 tier (ADR-059 Amendment 3): every refusal is
+	// `shared_texture_session`; this WARN names the rung.
 	const char *why = nullptr;
-	if (c->app_hwnd == nullptr) {
+	if (c->transparent_background) {
+		why = "a transparent session (not carried on client-presents yet)";
+	} else if (c->app_hwnd == nullptr) {
 		why = "no windowHandle to phase the texture from (the D3D12 tier has no v9 target binding yet)";
 	} else if (c->client_entry == nullptr) {
 		why = "no DP registry entry for the session screen";
@@ -2710,48 +2763,7 @@ d3d12_reroute_stage_a_client(struct comp_d3d12_compositor *c, struct xrt_device 
 		return false;
 	}
 
-	uint32_t sys_w = 0, sys_h = 0;
-	if (xdev->rendering_mode_count > 0) {
-		u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &sys_w, &sys_h);
-	}
-	if (sys_w == 0 || sys_h == 0) {
-		sys_w = c->settings.preferred.width;
-		sys_h = c->settings.preferred.height;
-	}
-	struct comp_hub_d3d11_handoff handoff = {};
-	void *cons = nullptr;
-	bool ok = comp_d3d12_deposit_create(c->device, sys_w, sys_h, &c->reroute.dep) == XRT_SUCCESS &&
-	          c->reroute.dep != NULL && comp_d3d12_deposit_get_handoff(c->reroute.dep, &handoff) &&
-	          comp_hub_d3d11_wire_bridge(c->reroute.split, &handoff);
-	if (ok) {
-		// The handoff fence: this queue GPU-waits it before the app's use of
-		// the texture, and before any rewrite of a slot the hub still reads.
-		cons = comp_hub_d3d11_get_consumer_fence_handle(c->reroute.split);
-		ok = cons != nullptr && comp_d3d12_deposit_bind_consumer_fence(c->reroute.dep, cons);
-	}
-	if (!ok) {
-		U_LOG_W("D3D11 hub client-presents (d3d12): the deposit ring or its DIRECT wiring failed — this tier's "
-		        "own legs compose (#2370)");
-		comp_d3d12_deposit_destroy(&c->reroute.dep);
-		comp_hub_d3d11_destroy(&c->reroute.split);
-		return false;
-	}
-
-	if (xdev->hmd != NULL) {
-		c->split_panel_w = xdev->hmd->screens[0].w_pixels;
-		c->split_panel_h = xdev->hmd->screens[0].h_pixels;
-	}
-	comp_hub_d3d11_set_plane_format(c->reroute.split, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM);
-	comp_hub_d3d11_log_placement(c->reroute.split, "d3d12");
-	c->reroute.active = true;
-	c->reroute.client_presents = true;
-	// The weave runs on the app's adapter (the app presents): the native
-	// texture session's `weave placement:` line, token and all.
-	c->split_off_reason = COMP_SPLIT_REASON_SHARED_TEXTURE;
-	if (c->seg_screens != nullptr && c->seg_sys_info != nullptr) {
-		comp_hub_d3d11_set_screens(c->reroute.split, c->seg_screens, c->seg_sys_info, c->seg_pinned_display_id);
-	}
-	return true;
+	return d3d12_reroute_wire(c, xdev, /*hybrid=*/false, /*client=*/true);
 }
 #endif
 
@@ -7953,6 +7965,11 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		}
 		c->has_shared_texture = true;
 		c->shared_texture_handle = shared_texture_handle;
+		{
+			const D3D12_RESOURCE_DESC std = c->shared_texture->GetDesc();
+			c->shared_texture_w = (uint32_t)std.Width;
+			c->shared_texture_h = std.Height;
+		}
 
 		// #747: name it. The D3D12 debug layer identifies resources by name, and
 		// with none set every barrier complaint reads "Unnamed ID3D12Resource
