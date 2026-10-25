@@ -1,0 +1,19 @@
+{
+	"ok":	false,
+	"status":	"degenerate",
+	"reason":	"the samples constrain only 3 of the 5 pose parameters (rank deficient): vary the head distance and use more dots",
+	"mode":	"c",
+	"eye":	"mid",
+	"camera_key":	"sim-tracking:webcam0",
+	"screen":	"DXR-0001-00000001",
+	"pose":	null,
+	"params":	5,
+	"rank":	3,
+	"condition":	1929550954514.9658,
+	"ill_conditioned":	true,
+	"iterations":	2,
+	"sample_count":	10,
+	"used_count":	10,
+	"distinct_dots":	5,
+	"samples":	[]
+}

@@ -31,7 +31,7 @@ public enum CalibPhase
 }
 
 /// <summary>What the window must run next; it reports back through <see cref="CalibrationSession.SolveFinished"/> / <see cref="CalibrationSession.ApplyFinished"/>.</summary>
-public sealed record CalibRequest(bool IsSolve, CliArgs? Args, string? SolveInput);
+public sealed record CalibRequest(bool IsSolve, CliArgs? Args, string? SolveInput, string? Mode = null);
 
 /// <summary>
 /// The calibration window's state machine (design §10 procedure). Pure: no process, no UI, no clock
@@ -43,6 +43,10 @@ public sealed class CalibrationSession
 {
     public const string AlignPrompt =
         "Close your left eye. With your right eye, find the reflection of your closed eye and move your head until the cross sits on it. Press Space (or click).";
+
+    /// <summary>The distance instruction of each pass (the user eyeballs it; the samples' distances check it).</summary>
+    public const string NearPrompt = "Near pass: lean in to about 35 cm from the screen. ";
+    public const string FarPrompt = "Far pass: sit back to about 65 cm from the screen. ";
 
     private readonly Screen? _screen;
     private readonly CalibSample?[] _captured = new CalibSample?[CalibGeometry.Dots.Count];
@@ -72,6 +76,12 @@ public sealed class CalibrationSession
     public string? Error { get; private set; }
 
     public SolveResult? Solve { get; private set; }
+
+    /// <summary>The mode of the solve in flight (or of <see cref="Solve"/>).</summary>
+    public string SolveMode { get; private set; } = CalibrationCommands.Mode;
+
+    /// <summary>Set when the full solve was refused as degenerate and the result is the fallback mode's.</summary>
+    public string? FallbackNote { get; private set; }
     /// <summary>The pose being checked / applied: the solved one plus the arrow-key nudge.</summary>
     public CameraPose? Pose { get; private set; }
     public double NudgeXmm { get; private set; }
@@ -84,6 +94,17 @@ public sealed class CalibrationSession
 
     public int CapturedCount => _captured.Count(c => c is not null);
     public IReadOnlyList<CalibSample?> Captured => _captured;
+
+    /// <summary>
+    /// The mean estimated eye-midpoint distance of a pass's captures (metres), or null when the pass
+    /// has none, or a capture has no distance estimate.
+    /// </summary>
+    public double? PassDistanceM(CalibPass pass)
+    {
+        var cams = CalibGeometry.PassIndices(pass).Select(i => _captured[i]?.Camera).Where(c => c is not null).ToArray();
+        if (cams.Length == 0 || cams.Any(c => !c!.HasDistance)) return null;
+        return cams.Average(c => c!.MidPoint.Length);
+    }
 
     /// <summary>The watch child is still needed (the window stops it otherwise).</summary>
     public bool WantsStream => Phase is not (CalibPhase.Done or CalibPhase.Failed or CalibPhase.Cancelled);
@@ -116,15 +137,16 @@ public sealed class CalibrationSession
     public string Prompt => Phase switch
     {
         CalibPhase.Starting => "Starting the tracking provider…",
-        CalibPhase.Aligning when CurrentDot is { LeanBack: true } =>
-            "Lean back, then: " + AlignPrompt,
-        CalibPhase.Aligning => AlignPrompt,
+        CalibPhase.Aligning when CurrentDot is { Pass: CalibPass.Far } => FarPrompt + AlignPrompt,
+        CalibPhase.Aligning => NearPrompt + AlignPrompt,
         CalibPhase.Solving => "Solving the camera pose…",
         CalibPhase.Review when Solve is { Ok: false } s => $"The solver refused the samples ({s.Status}): {s.Reason}",
         CalibPhase.Review when Solve is { HighRms: true } => "The fit is loose (RMS above 5 mm). Retake the flagged samples, or continue to the live check.",
+        CalibPhase.Review when FallbackNote is not null => "Fit done with the reduced model (pitch only, no yaw). Press Space for the live check.",
         CalibPhase.Review => "Fit done. Press Space for the live check.",
         CalibPhase.LiveCheck =>
-            "Live check: keep your left eye closed and move your head. The dot should stay on the reflection of your closed eye. Arrow keys nudge it by 1 mm; Enter applies.",
+            "Live check: keep your left eye closed and check near AND far — lean in to about 35 cm, then sit back to about 65 cm, moving your head at each. " +
+            "The dot should stay on the reflection of your closed eye at both distances. Arrow keys nudge it by 1 mm; Enter applies.",
         CalibPhase.Applying => "Saving the calibration…",
         CalibPhase.Done => "Calibration saved. It applies at the provider's next start (the next app launch). Press Esc to close.",
         CalibPhase.Failed => Error ?? "Calibration stopped.",
@@ -141,7 +163,7 @@ public sealed class CalibrationSession
             {
             case CalibPhase.Aligning:
                 string lockText = Latest is null ? "waiting for a sample" : !Latest.Tracking ? "no face lock" : Latest.Camera is null ? "no camera-space sample" : Stable ? "still" : "hold still";
-                return $"Target {CapturedCount + 1} of {CalibGeometry.Dots.Count}: {CurrentDot?.Name}{StatusText.Sep}{lockText}"
+                return $"Target {CapturedCount + 1} of {CalibGeometry.Dots.Count}: {CurrentDot?.Label}{StatusText.Sep}{lockText}"
                        + (Armed ? $"{StatusText.Sep}captures when still" : "") + $"{StatusText.Sep}Esc cancels";
             case CalibPhase.Review:
                 return Solve is { Ok: true } ? "Space: live check · R: retake flagged · A: start over · Esc: cancel"
@@ -285,17 +307,45 @@ public sealed class CalibrationSession
         _queue.RemoveAt(0);
         Armed = false;
         _stable.Reset(); // the next target needs its own still run
-        if (_queue.Count == 0) RequestSolve();
+        if (_queue.Count == 0 && DistancesDiffer()) RequestSolve();
+    }
+
+    /// <summary>
+    /// Both passes are in: is the far pass far enough? If not, queue the far pass again and say why
+    /// (the error line). Unknown distances (a provider without estimates) pass: the solver's own
+    /// rank check is then the only guard.
+    /// </summary>
+    private bool DistancesDiffer()
+    {
+        if (PassDistanceM(CalibPass.Near) is not { } near || PassDistanceM(CalibPass.Far) is not { } far) return true;
+        if (far >= CalibGeometry.MinDistanceRatio * near) return true;
+        Error = string.Format(CultureInfo.InvariantCulture,
+            "The two passes were too close in distance (near about {0:0} cm, far about {1:0} cm; the far pass needs at least {2:0.0}x the near one). " +
+            "Sit further back and retake the far pass.", near * 100, far * 100, CalibGeometry.MinDistanceRatio);
+        foreach (int i in CalibGeometry.PassIndices(CalibPass.Far))
+        {
+            _captured[i] = null;
+            _queue.Add(i);
+        }
+        return false;
     }
 
     private void RequestSolve()
     {
+        Error = null;
+        FallbackNote = null;
+        RequestSolve(CalibrationCommands.Mode);
+    }
+
+    private void RequestSolve(string mode)
+    {
         Phase = CalibPhase.Solving;
-        _pending = new CalibRequest(true, null, BuildSolveInput());
+        SolveMode = mode;
+        _pending = new CalibRequest(true, null, BuildSolveInput(mode), mode);
     }
 
     /// <summary>The solve input for the current captures (every slot is filled when this runs).</summary>
-    public string BuildSolveInput()
+    public string BuildSolveInput(string mode = CalibrationCommands.Mode)
     {
         var g = Geometry!;
         var pairs = CalibGeometry.Dots.Where(d => _captured[d.Index] is not null).Select(d =>
@@ -304,7 +354,7 @@ public sealed class CalibrationSession
             return (x, y, _captured[d.Index]!);
         });
         string camera = Hello?.CameraKey is { Length: > 0 } k ? k : _captured.FirstOrDefault(c => c is not null)?.Camera?.Key ?? "";
-        return CalibrationCommands.SolveInput(ScreenKey, camera, pairs);
+        return CalibrationCommands.SolveInput(ScreenKey, camera, pairs, mode);
     }
 
     /// <summary>The solve run finished: its exit code and stdout's JSON (exit 0 ok, 2 refused, 1 bad input).</summary>
@@ -313,6 +363,15 @@ public sealed class CalibrationSession
         if (Phase != CalibPhase.Solving) return;
         if (started && SolveResult.TryParse(json, out var r))
         {
+            if (!r!.Ok && r.Status == "degenerate" && SolveMode == CalibrationCommands.Mode)
+            {
+                // The full rotation is not constrained by these samples: solve the reduced model,
+                // and say so on the result.
+                FallbackNote = $"The full solve (mode {CalibrationCommands.Mode}: pitch, yaw, roll) was refused as degenerate ({r.Reason}); " +
+                               $"this is mode {CalibrationCommands.FallbackMode} (pitch only), which cannot correct a camera yaw.";
+                RequestSolve(CalibrationCommands.FallbackMode);
+                return;
+            }
             Solve = r;
             Error = r!.Ok ? null : r.Reason;
             NudgeXmm = NudgeYmm = 0;

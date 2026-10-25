@@ -392,7 +392,7 @@ parameters only. The residual is the in-plane distance between the fitted eye po
 |---|---|---|---|
 | `a` | `R = I`: `T_x, T_y` | 2 samples at 2 distinct dots | closed form: each sample is a line through `D_i` along `xy(u_i)`; `T` is their least-squares meet |
 | `b` | + pitch (`R = Rx(θ)`) | 3 samples; two head distances to condition θ | Levenberg–Marquardt from (a) |
-| `c` | full `R` (rotation vector) + `T_x, T_y`, optional focal scale `k` | 7 samples at 3 distinct dots (9 in practice: a 3×3 grid at 15 % inset, two distances) | LM from (b) |
+| `c` | full `R` (rotation vector) + `T_x, T_y`, optional focal scale `k` | 7 samples at 3 distinct dots, at two head distances (the Dashboard: 5 dots × near / far = 10) | LM from (b) |
 
 `k` = the camera's true focal length / the one its directions were computed with; the corrected
 direction is `normalize(u_x, u_y, k·u_z)`. The reported angles follow
@@ -422,12 +422,31 @@ authoritative.
   the **user**, not of the camera: `--depth-scale` commits it as the one per-user viewer iris
   scale (below), which every face-based provider multiplies its iris-size depth by.
 
+- **Two head distances, or a rotation reads as a translation.** The fit uses only the directions
+  (every `s_i` is free), so at one head distance a small camera yaw — or a principal point off the
+  image centre — is indistinguishable from a sideways offset of `T`, and a pitch from a vertical
+  one. Mode `b` has no yaw at all: a 4° yaw on a laptop's centred camera lands as a `T_x` of
+  tens of millimetres with a small RMS, and a pitch / `T_y` / depth-scale trade-off at one distance
+  makes the live-check dot drift as the head moves back. With the same dots aligned leaning in
+  (~35 cm) and sitting back (~65 cm), mode `c` is well conditioned: in simulation (0.2° direction,
+  2 mm alignment noise) a median 7 mm of `T` error and 0.2° of yaw, against a refusal (rank
+  deficient) noise-free at one distance. The **focal scale is not solved** in that layout: with five
+  dots it trades off against the rotation (half the noisy fits flag `ill_conditioned`).
+
 **Dashboard.** Components → Tracking providers → **Calibrate camera…** on a provider-served screen
 opens the calibration window (`src/dashboard/README.md` § *Camera calibration window*): full screen on
-that screen, the six targets of design §10 (centre; left, right, top, bottom at a 30 % inset; centre
-leaning back), capture on Space once the eye midpoint has been still for 0.5 s, `solve` with mode `b`
-and `--reject-mm 5`, retake of the flagged samples, the live-check dot (computed client-side from the
-camera block through the solved pose and iris scale) with 1 mm arrow-key nudges, then `apply`.
+that screen, the five dots of design §10 (centre; left, right, top, bottom at a 30 % inset) aligned
+twice — a **near pass** (leaning in, about 35 cm) then a **far pass** (sitting back, about 65 cm).
+Capture on Space once the eye midpoint has been still for 0.5 s. Before solving, the far pass's mean
+estimated eye distance must be ≥ 1.5× the near pass's (the iris estimate's per-user scale cancels in
+the ratio; a provider without distance estimates skips the check), else the far pass is retaken.
+`solve` with mode `c` (no `--focal`) and `--reject-mm 5`; only if that is refused as `degenerate`
+does it re-solve with mode `b` and say so on the result. Then retake of the flagged samples, the
+live-check dot (computed client-side from the camera block through the solved pose and iris scale)
+checked near **and** far, with 1 mm arrow-key nudges, then `apply`. The last solve's input is kept
+(overwritten each time) at `<LocalApplicationData>/DisplayXR/calibration-last-solve.json` beside
+`dashboard.log`, which records each solve's pose (T, pitch / yaw / roll, focal and iris scale, RMS,
+mode, sample count) — so a run can be re-solved with `calibrate solve --in` afterwards.
 
 **CLI** (the Dashboard drives these; it links no runtime code, ADR-051 D4):
 

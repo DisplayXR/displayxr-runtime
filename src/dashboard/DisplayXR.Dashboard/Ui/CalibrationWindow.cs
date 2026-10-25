@@ -207,18 +207,23 @@ public sealed class CalibrationWindow : Window
         {
             if (req.IsSolve)
             {
-                string path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"displayxr-calibration-{Guid.NewGuid():N}.json");
-                try
-                {
-                    await File.WriteAllTextAsync(path, req.SolveInput ?? "");
-                    var args = CalibrationCommands.Solve(path);
-                    DashboardLog.Info($"calibration: displayxr-cli {args}");
-                    var r = await _cli.RunAsync(args, DashboardContext.ActionTimeout);
-                    _session.SolveFinished(r.Started && !r.TimedOut, r.ExitCode, r.Json, r.Summary);
-                    if (_session.Solve is { } s)
-                        DashboardLog.Info($"calibration: solve {s.Status}, RMS {s.RmsMm:0.00} mm, iris scale {s.IrisScale:0.000}");
-                }
-                finally { try { File.Delete(path); } catch { } }
+                // Kept (overwritten by the next solve) so a run can be re-solved and inspected afterwards.
+                string path = CalibrationCommands.LastSolveInputPath;
+                Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!);
+                await File.WriteAllTextAsync(path, req.SolveInput ?? "");
+                var args = CalibrationCommands.Solve(path, req.Mode ?? CalibrationCommands.Mode);
+                DashboardLog.Info($"calibration: displayxr-cli {args}");
+                var r = await _cli.RunAsync(args, DashboardContext.ActionTimeout);
+                bool parsed = SolveResult.TryParse(r.Json, out var result);
+                _session.SolveFinished(r.Started && !r.TimedOut, r.ExitCode, r.Json, r.Summary);
+                if (parsed) DashboardLog.Info("calibration: " + CalibrationCommands.Describe(result!));
+                if (_session.Phase == CalibPhase.Solving && _session.FallbackNote is { } note)
+                    DashboardLog.Warn("calibration: " + note);
+                var near = _session.PassDistanceM(CalibPass.Near);
+                var far = _session.PassDistanceM(CalibPass.Far);
+                if (near is not null && far is not null && _session.Phase != CalibPhase.Solving)
+                    DashboardLog.Info(string.Format(CultureInfo.InvariantCulture,
+                        "calibration: estimated pass distances near {0:0.000} m, far {1:0.000} m; input kept at {2}", near, far, path));
             }
             else if (req.Args is { } args)
             {
@@ -281,7 +286,7 @@ public sealed class CalibrationWindow : Window
         _status.Text = _session.Status + (_session.Phase == CalibPhase.LiveCheck && _session.LivePoint is { } p
             ? string.Format(CultureInfo.InvariantCulture, "{0}eye midpoint ({1:0.0}, {2:0.0}, {3:0.0}) mm", StatusText.Sep, p.X * 1000, p.Y * 1000, p.Z * 1000)
             : "");
-        _error.Text = _session.Phase is CalibPhase.LiveCheck or CalibPhase.Review && _session.Error is { } err ? err : "";
+        _error.Text = _session.Phase is CalibPhase.LiveCheck or CalibPhase.Review or CalibPhase.Aligning && _session.Error is { } err ? err : "";
         _error.IsVisible = _error.Text.Length > 0;
         // Keep the text away from the cross: below it when the cross is in the top half, above otherwise.
         bool below = cy < h / 2;
@@ -304,7 +309,7 @@ public sealed class CalibrationWindow : Window
     private void BuildReview()
     {
         var s = _session.Solve;
-        string key = s is null ? "none" + _session.Error : s.Status + s.RmsMm + s.Setting + s.Samples.Count;
+        string key = s is null ? "none" + _session.Error : s.Status + s.Mode + s.RmsMm + s.Setting + s.Samples.Count;
         if (key == _reviewKey) return;
         _reviewKey = key;
         var col = new StackPanel { Spacing = 6 };
@@ -334,14 +339,18 @@ public sealed class CalibrationWindow : Window
         {
             Line(string.Format(ci, "RMS {0:0.00} mm · max {1:0.00} mm · iris scale {2:0.000}", s.RmsMm, s.MaxMm, s.IrisScale), 0xF0, 18);
             if (s.HighRms) Line("Warning: RMS above 5 mm. Retake the flagged samples (R) or start over (A).", 0xF0);
+            if (_session.FallbackNote is { } note) Line(note, 0xF0);
+            if (s.IllConditioned) Line("Warning: the fit is ill-conditioned (the samples barely constrain a parameter). Check near and far in the live check; start over (A) with a bigger distance change if the dot drifts.", 0xF0);
             Line(string.Format(ci, "Camera at ({0:0.0}, {1:0.0}) mm from the screen centre, pitch {2:0.0}°, yaw {3:0.0}°, roll {4:0.0}° (mode {5}; depth from the glass is not observable and assumed 0).",
                                s.Pose!.T.X * 1000, s.Pose.T.Y * 1000, s.PitchDeg, s.YawDeg, s.RollDeg, s.Mode), 0xA0);
             Line(string.Format(ci, "{0} of {1} samples used, {2} distinct targets{3}.", s.UsedCount, s.SampleCount, s.DistinctDots,
                                s.IllConditioned ? "; ill-conditioned" : ""), 0xA0);
+            if (_session.PassDistanceM(CalibPass.Near) is { } dn && _session.PassDistanceM(CalibPass.Far) is { } df)
+                Line(string.Format(ci, "Estimated head distance: near pass {0:0} cm, far pass {1:0} cm (before the iris scale).", dn * 100, df * 100), 0xA0);
             var flagged = s.Flagged;
             foreach (var r in s.Samples)
             {
-                string name = r.Index < CalibGeometry.Dots.Count ? CalibGeometry.Dots[r.Index].Name : $"#{r.Index}";
+                string name = r.Index < CalibGeometry.Dots.Count ? CalibGeometry.Dots[r.Index].Label : $"#{r.Index}";
                 string mark = r.Rejected ? "  REJECTED" : flagged.Contains(r.Index) ? "  over 5 mm" : "";
                 Line(string.Format(ci, "  {0,-22} residual {1,6:0.00} mm   distance {2:0.000} m (estimated {3:0.000}){4}",
                                    name, r.ResidualMm, r.DistanceM, r.EstimatedDistanceM, mark), r.Rejected || mark.Length > 0 ? (byte)0xF0 : (byte)0xA0, 13, true);
