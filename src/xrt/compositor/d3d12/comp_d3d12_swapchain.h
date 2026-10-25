@@ -65,6 +65,15 @@ void *
 comp_d3d12_swapchain_get_resource(struct xrt_swapchain *xsc, uint32_t index);
 
 /*!
+ * #2362: the app's published release-fence value recorded when image @p index
+ * was last released (0 = none).
+ *
+ * @ingroup comp_d3d12
+ */
+uint64_t
+comp_d3d12_swapchain_get_release_value(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
  * The DXGI format a view over @p resource must use.
  *
  * Swapchain images are created TYPELESS (#1503), which is not a legal view
