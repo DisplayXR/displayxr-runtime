@@ -2051,19 +2051,43 @@ d3d12_fill_arm_active(struct comp_d3d12_compositor *c)
  * and the cross-adapter hop belongs to the xbridge downstream -- the same
  * xbridge the VK tier already crosses on hybrid hardware.
  *
- * OPT-IN and default OFF: this is a bring-up flag, exactly as
- * DXR_SPLIT_SAME_ADAPTER_D3D12 was for Phase C. It does not become a default
- * without its own measured acceptance record (ADR-059's per-API bar, #2317).
+ * DEFAULT ON (#2375): a hybrid d3d12 session takes the hub without any env,
+ * as the in-process D3D11 leg does. One hub, one kill switch, with a per-route
+ * override (both managed settings, read through the settings chain, so
+ * `displayxr-cli perf set` and the Dashboard reach apps they never launched):
+ *
+ *   1. `DXR_SPLIT_D3D12_HYBRID_REROUTE` set decides for this route: a false
+ *      spelling kills it (`hub=0 reason=hybrid_reroute_disabled_by_env`), any
+ *      non-false value engages it (`reason=hybrid_reroute_opt_in`, the
+ *      pre-flip spelling) even under `DXR_HUB=0`.
+ *   2. Else `DXR_HUB` killed (a false spelling) kills this route too
+ *      (`hub=0 reason=hub_disabled_by_env`).
+ *   3. Else the default: engaged (`reason=hybrid_reroute_default_on`).
  */
-static bool
-d3d12_reroute_hybrid_optin(void)
+enum d3d12_hybrid_reroute_policy
 {
-	static int on = -1;
-	if (on < 0) {
-		const char *e = getenv("DXR_SPLIT_D3D12_HYBRID_REROUTE");
-		on = (e != NULL && e[0] == '1') ? 1 : 0;
+	D3D12_HYBRID_REROUTE_DEFAULT,      //!< both unset: on (`reason=hybrid_reroute_default_on`)
+	D3D12_HYBRID_REROUTE_DISABLED,     //!< the route's own kill switch
+	D3D12_HYBRID_REROUTE_HUB_DISABLED, //!< `DXR_HUB` killed, the route knob unset
+	D3D12_HYBRID_REROUTE_FORCED,       //!< the route knob set to any non-false value
+};
+
+static enum d3d12_hybrid_reroute_policy
+d3d12_reroute_hybrid_policy(void)
+{
+	static int policy = -1;
+	if (policy < 0) {
+		switch (comp_split_gate_setting_policy("DXR_SPLIT_D3D12_HYBRID_REROUTE")) {
+		case COMP_SPLIT_GATE_SETTING_DISABLED: policy = D3D12_HYBRID_REROUTE_DISABLED; break;
+		case COMP_SPLIT_GATE_SETTING_FORCED: policy = D3D12_HYBRID_REROUTE_FORCED; break;
+		default:
+			policy = comp_split_gate_setting_policy("DXR_HUB") == COMP_SPLIT_GATE_SETTING_DISABLED
+			             ? D3D12_HYBRID_REROUTE_HUB_DISABLED
+			             : D3D12_HYBRID_REROUTE_DEFAULT;
+			break;
+		}
 	}
-	return on == 1;
+	return (enum d3d12_hybrid_reroute_policy)policy;
 }
 
 /*!
@@ -2147,6 +2171,9 @@ d3d12_reroute_abandon(struct comp_d3d12_compositor *c, bool hybrid, const char *
 }
 
 /*!
+ * @param out_refused set true when the hub's Stage A1 DECLINED the session (a
+ *        policy refusal; `c->split_off_reason` holds its token, nothing was
+ *        created), false for a stand-up failure after A1 or on success.
  * @return true when the reroute is ACTIVE for this session. On false nothing
  *         of it is left standing; the caller picks the fallback (#2317: the
  *         own-legs split for a HYBRID session, the stock path otherwise).
@@ -2156,8 +2183,10 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
                       struct xrt_device *xdev,
                       int32_t display_screen_left,
                       int32_t display_screen_top,
-                      bool hybrid)
+                      bool hybrid,
+                      bool *out_refused)
 {
+	*out_refused = false;
 	const LUID app_luid = c->device->GetAdapterLuid();
 	struct comp_hub_d3d11_info si = {};
 	si.xdev = xdev;
@@ -2184,6 +2213,7 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	const char *short_reason = NULL;
 	if (comp_hub_d3d11_stage_a(&si, &c->reroute.split, &short_reason) != XRT_SUCCESS || c->reroute.split == NULL) {
 		c->split_off_reason = (short_reason != NULL) ? short_reason : COMP_SPLIT_REASON_STAGE_A_FAILED;
+		*out_refused = true;
 		U_LOG_W("#1264 reroute: d3d11 fill arm Stage A refused (%s) — %s",
 		        c->split_off_reason != NULL ? c->split_off_reason : "?",
 		        hybrid ? "HYBRID session falls back to the own-legs split (#2317)" : "stock path");
@@ -2230,8 +2260,8 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	/*
 	 * #2317 P2a: on one adapter the hub can read the deposit ring DIRECT (no
 	 * transport copy; DXR_HUB_INGRESS=direct opts in, the hub's ingress policy
-	 * decides). A HYBRID reroute (DXR_SPLIT_D3D12_HYBRID_REROUTE=1) always
-	 * takes xbridge (ingress_reason=cross_adapter). DIRECT reads are released
+	 * decides). A HYBRID reroute (the default on a cross-adapter box, #2375)
+	 * always takes xbridge (ingress_reason=cross_adapter). DIRECT reads are released
 	 * on the hub's own consumer fence, which this queue must open to order a
 	 * slot rewrite after them — no open, no DIRECT.
 	 */
@@ -2241,10 +2271,15 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 			comp_hub_d3d11_leave_direct(c->reroute.split, COMP_HUB_INGRESS_REASON_DIRECT_FAILED);
 		}
 	}
-	// #2317: the hybrid reroute is opt-in, so its hub=1 line names why
-	// (reason=hybrid_reroute_opt_in); the same-adapter default passes NULL and
-	// keeps its line unchanged.
-	comp_hub_d3d11_set_route_reason(c->reroute.split, hybrid ? COMP_HUB_REASON_HYBRID_REROUTE_OPT_IN : nullptr);
+	// #2317: a hybrid reroute's hub=1 line names why it is on the hub
+	// (reason=hybrid_reroute_default_on, or hybrid_reroute_opt_in when
+	// DXR_SPLIT_D3D12_HYBRID_REROUTE is set to a non-false value); the same-adapter default
+	// passes NULL and keeps its line unchanged.
+	comp_hub_d3d11_set_route_reason(c->reroute.split,
+	                                !hybrid ? nullptr
+	                                        : (d3d12_reroute_hybrid_policy() == D3D12_HYBRID_REROUTE_FORCED
+	                                               ? COMP_HUB_REASON_HYBRID_REROUTE_OPT_IN
+	                                               : COMP_HUB_REASON_HYBRID_REROUTE_DEFAULT_ON));
 	comp_hub_d3d11_log_placement(c->reroute.split, "d3d12");
 
 	c->reroute.active = true;
@@ -2646,8 +2681,9 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	const char *reason = gate.reason;
 	c->split_off_reason = gate.short_reason;
 	/*
-	 * The reroute is same-adapter by acceptance; DXR_SPLIT_D3D12_HYBRID_REROUTE=1
-	 * extends it to the hybrid topology the VK tier already serves on the hub.
+	 * The reroute was same-adapter by acceptance (#1264); #2317 extended it to
+	 * the hybrid topology the VK tier already serves on the hub, opt-in, and
+	 * #2375 made that the default (d3d12_reroute_hybrid_policy).
 	 *
 	 * WHY THE DIVISOR WAS REQUIRED (#1309, 2026-09-02 -- not correctness). The
 	 * opt-in used to engage only with DXR_APP_FRAME_DIVISOR>=2 too. That was a
@@ -2668,25 +2704,39 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	 * against the own split at full rate -- R/D, no pipelining frame, GPU/CPU
 	 * per adapter, 60/60/0 witness, engines clean -- plus the acceptance items
 	 * #1315 left open (mode switch, a >=5-min soak, an events leg). That needs
-	 * the arm runnable at D=1, which this gate now allows. The default (no env
-	 * var) is unchanged: own-legs split, `hub=0
-	 * reason=hybrid_reroute_default_off`. The old gate stays reachable as the
-	 * control: DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR=1.
+	 * the arm runnable at D=1, which this gate allows. The old gate stays
+	 * reachable as the control: DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR=1.
 	 *
-	 * A hybrid reroute whose Stage A fails falls back to the own-legs split
-	 * (`hub placement: CHANGED hub=0 reason=hybrid_reroute_stage_a_failed`,
-	 * #2376), at any divisor -- the first default-flip gate in #2375.
+	 * DEFAULT ON (#2375; hybrid-laptop record in #2374 / #2375, open legs
+	 * listed there): no env var means the hub (`reason=hybrid_reroute_default_on`).
+	 * Kill switches and their precedence: d3d12_reroute_hybrid_policy.
+	 * `hybrid_reroute_default_off` is a retired token (pre-flip field logs).
+	 *
+	 * A hub Stage A1 REFUSAL (a policy decline: render_unresolvable,
+	 * no_panel_dims, ...) prints `hub placement: hub=0 reason=<that token>`; a
+	 * STAND-UP failure after A1 (deposit ring, bridge wiring,
+	 * DXR_TEST_HUB_STAGE_A_FAIL) prints `hub placement: CHANGED hub=0
+	 * reason=hybrid_reroute_stage_a_failed` (#2376). Either way the own-legs
+	 * split takes the session, at any divisor.
 	 */
 	bool hybrid_reroute = false;
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	const char *hybrid_hub_reason = nullptr; // hub=0 token for a hybrid session left on its own legs
+	const char *hybrid_hub_hint = "";        // per token: how to get the hub back, if anything
 	if (!gate.same_adapter && gate.split_active) {
-		if (!d3d12_reroute_hybrid_optin()) {
-			hybrid_hub_reason = COMP_HUB_REASON_HYBRID_REROUTE_DEFAULT_OFF;
+		const enum d3d12_hybrid_reroute_policy hp = d3d12_reroute_hybrid_policy();
+		if (hp == D3D12_HYBRID_REROUTE_DISABLED) {
+			hybrid_hub_reason = COMP_HUB_REASON_HYBRID_REROUTE_DISABLED_BY_ENV;
+		} else if (hp == D3D12_HYBRID_REROUTE_HUB_DISABLED) {
+			hybrid_hub_reason = COMP_HUB_REASON_HUB_DISABLED_BY_ENV;
+			hybrid_hub_hint = "; the DXR_HUB kill switch covers this route";
 		} else if (d3d12_reroute_hybrid_require_divisor() && u_app_partition_divisor() < 2) {
 			hybrid_hub_reason = COMP_HUB_REASON_HYBRID_REROUTE_NEEDS_DIVISOR;
+			hybrid_hub_hint =
+			    "; DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR=1 needs DXR_APP_FRAME_DIVISOR>=2";
 		} else if (!d3d12_reroute_route_d3d11()) {
 			hybrid_hub_reason = COMP_HUB_REASON_HYBRID_REROUTE_ROUTE_OWN;
+			hybrid_hub_hint = "; DXR_SPLIT_D3D12_ROUTE=own keeps the own-legs arm";
 		} else {
 			hybrid_reroute = true;
 		}
@@ -2694,8 +2744,8 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	if (hybrid_hub_reason != nullptr) {
 		U_LOG_W(
 		    "hub placement: hub=0 reason=%s — this HYBRID session routes to the tier's own-legs #918 split "
-		    "(#2317; DXR_SPLIT_D3D12_HYBRID_REROUTE=1 routes it onto the D3D11 hub)",
-		    hybrid_hub_reason);
+		    "(#2375%s)",
+		    hybrid_hub_reason, hybrid_hub_hint);
 	}
 #endif
 	const bool reroute_topology_ok = gate.same_adapter || hybrid_reroute;
@@ -2715,9 +2765,10 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 			    gate.same_adapter ? "same-adapter" : "HYBRID (cross-adapter)", sdesc.Description,
 			    (unsigned long)sdesc.AdapterLuid.HighPart, (unsigned long)sdesc.AdapterLuid.LowPart,
 			    gate.same_adapter ? ", accepted default"
-			                      : ", opt-in DXR_SPLIT_D3D12_HYBRID_REROUTE=1, any frame divisor (#2317)");
-			if (d3d12_reroute_stage_a(c, xdev, display_screen_left, display_screen_top,
-			                          !gate.same_adapter) ||
+			                      : ", the hybrid default since #2375, any frame divisor (#2317)");
+			bool hub_refused = false;
+			if (d3d12_reroute_stage_a(c, xdev, display_screen_left, display_screen_top, !gate.same_adapter,
+			                          &hub_refused) ||
 			    gate.same_adapter) {
 				// Active, or a same-adapter failure: the stock path, as before.
 				return;
@@ -2733,10 +2784,21 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 			 * standing (d3d12_reroute_abandon), so the own-legs Stage A below
 			 * starts from the same state as a session that never opted in.
 			 */
-			U_LOG_W(
-			    "hub placement: CHANGED hub=0 reason=%s — the D3D11 hub could not stand up for this HYBRID "
-			    "session; the tier's own-legs #918 split takes it (#2317)",
-			    COMP_HUB_REASON_HYBRID_REROUTE_STAGE_A_FAILED);
+			if (hub_refused) {
+				// A policy decline in the hub's Stage A1: nothing stood up, so
+				// this is a placement, not a change. Name the hub's own token.
+				U_LOG_W(
+				    "hub placement: hub=0 reason=%s — the D3D11 hub declined this HYBRID session; the "
+				    "tier's own-legs #918 split takes it (#2375)",
+				    c->split_off_reason != nullptr ? c->split_off_reason
+				                                   : COMP_SPLIT_REASON_STAGE_A_FAILED);
+			} else {
+				U_LOG_W(
+				    "hub placement: CHANGED hub=0 reason=%s — the D3D11 hub could not stand up for "
+				    "this "
+				    "HYBRID session; the tier's own-legs #918 split takes it (#2317)",
+				    COMP_HUB_REASON_HYBRID_REROUTE_STAGE_A_FAILED);
+			}
 			c->split_off_reason = gate.short_reason;
 			hybrid_fallback = true;
 		}

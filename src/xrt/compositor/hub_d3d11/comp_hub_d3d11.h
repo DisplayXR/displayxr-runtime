@@ -328,9 +328,11 @@ struct comp_hub_d3d11_info
  */
 #define COMP_HUB_REASON_PLANE_UNAVAILABLE "plane_unavailable"
 /*!
- * #2317: the D3D12 tier's HYBRID reroute (`DXR_SPLIT_D3D12_HYBRID_REROUTE=1`)
- * failed its Stage A (the hub refused, the deposit ring or the bridge wiring
- * failed, or `DXR_TEST_HUB_STAGE_A_FAIL=1`). Printed as `hub placement: CHANGED
+ * #2317: the D3D12 tier's HYBRID reroute (the default on a cross-adapter box
+ * since #2375) failed to STAND UP after the hub's Stage A1 accepted it (the
+ * deposit ring or the bridge wiring failed, or `DXR_TEST_HUB_STAGE_A_FAIL=1`).
+ * An A1 policy refusal is not this token: it prints `hub placement: hub=0
+ * reason=<the hub's own refusal token>`. Printed as `hub placement: CHANGED
  * hub=0 reason=<this>` BEFORE the own-legs split's own Stage A and placement
  * line: the session falls back to the own-legs split, never to the
  * single-device stock path.
@@ -367,16 +369,37 @@ struct comp_hub_d3d11_info
 #define COMP_HUB_REASON_PLANES_UNSUPPORTED_GL "planes_unsupported_gl"
 /*!
  * #2317: the D3D12 tier on a HYBRID (cross-adapter) box. The #1264 reroute
- * onto the hub engaged because `DXR_SPLIT_D3D12_HYBRID_REROUTE=1` asked for it.
- * Unlike the tokens above this one rides a `hub=1` line, as its `reason=`
- * field (@ref comp_hub_d3d11_set_route_reason): the hybrid reroute is not the
- * default yet, so the line says why this session is on the hub.
+ * onto the hub engaged because `DXR_SPLIT_D3D12_HYBRID_REROUTE` was set to a
+ * non-false value (the pre-#2375 opt-in spelling; it also overrides
+ * `DXR_HUB=0`). Unlike the tokens above this one
+ * rides a `hub=1` line, as its `reason=` field
+ * (@ref comp_hub_d3d11_set_route_reason).
  */
 #define COMP_HUB_REASON_HYBRID_REROUTE_OPT_IN "hybrid_reroute_opt_in"
 /*!
- * #2317: the D3D12 tier on a HYBRID box, `DXR_SPLIT_D3D12_HYBRID_REROUTE` not
- * set. The tier's own-legs #918 split weaves (its D3D12 DP on the scanout
- * device, xbridge transport), as it has since #918. `hub=0`.
+ * #2375: the D3D12 tier on a HYBRID box, `DXR_SPLIT_D3D12_HYBRID_REROUTE`
+ * unset: the #1264 reroute onto the hub is the default. Rides a `hub=1` line
+ * as its `reason=` field, like @ref COMP_HUB_REASON_HYBRID_REROUTE_OPT_IN.
+ */
+#define COMP_HUB_REASON_HYBRID_REROUTE_DEFAULT_ON "hybrid_reroute_default_on"
+/*!
+ * #2375: the D3D12 tier on a HYBRID box, `DXR_SPLIT_D3D12_HYBRID_REROUTE` set
+ * to a false spelling (the route's own kill switch). The tier's own-legs #918 split weaves (its D3D12 DP on
+ * the scanout device, xbridge transport), as it has since #918. `hub=0`.
+ */
+#define COMP_HUB_REASON_HYBRID_REROUTE_DISABLED_BY_ENV "hybrid_reroute_disabled_by_env"
+/*!
+ * #2375: the D3D12 tier on a HYBRID box, `DXR_HUB` killed and
+ * `DXR_SPLIT_D3D12_HYBRID_REROUTE` unset: the hub-wide kill switch covers the
+ * reroute too (one hub, one kill switch). The tier's own-legs #918 split
+ * weaves. `hub=0`. The D3D11 tier's own `DXR_HUB=0` line keeps
+ * @ref COMP_HUB_REASON_DISABLED_BY_ENV.
+ */
+#define COMP_HUB_REASON_HUB_DISABLED_BY_ENV "hub_disabled_by_env"
+/*!
+ * RETIRED (#2375): the pre-flip `hub=0` token for a hybrid d3d12 session with
+ * the reroute unset. Nothing emits it; kept so field logs from v2.53.x still
+ * resolve.
  */
 #define COMP_HUB_REASON_HYBRID_REROUTE_DEFAULT_OFF "hybrid_reroute_default_off"
 /*!

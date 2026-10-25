@@ -542,6 +542,16 @@ struct cli_query_result
 	char gpu_hub_env[64];
 	char gpu_hub_source[16]; //!< "env" / "user" / "machine" / "default".
 	/*!
+	 * #2375: DXR_SPLIT_D3D12_HYBRID_REROUTE as THIS process resolves it (the
+	 * settings chain; a managed name). An in-process D3D12 session on a
+	 * cross-adapter box weaves through the D3D11 hub by default; `=0` is the
+	 * kill switch back to the tier's own-legs split. A hint, like the DXR_HUB
+	 * fields: the session's `hub placement:` log line is the truth.
+	 */
+	bool gpu_d3d12_reroute_env_set;
+	char gpu_d3d12_reroute_env[64];
+	char gpu_d3d12_reroute_source[16]; //!< "env" / "user" / "machine" / "default".
+	/*!
 	 * #918 Phase 2b — the SERVICE split, as far as a headless tool can honestly
 	 * answer it: this process is not the service, holds no IPC connection, and
 	 * must not pretend to know what the running service decided. What it does

@@ -1,6 +1,6 @@
 {
   "kit": "DXRHubAB",
-  "kitVersion": "0.5.0",
+  "kitVersion": "0.6.0",
   "issue": "#2317 P1d, P2a, step 2 (d3d11 hub default), P3 (gl, opt-in), d3d12 hybrid reroute at full rate",
   "windowSeconds": 20,
   "warmupSeconds": 6,
@@ -114,6 +114,7 @@
         {
           "name": "native",
           "env": {
+            "DXR_SPLIT_D3D12_HYBRID_REROUTE": "0",
             "DXR_APP_FRAME_DIVISOR": "0",
             "DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR": "0"
           },
@@ -121,8 +122,8 @@
           "topologies": [
             "default"
           ],
-          "expectLine": "hub placement: hub=0 reason=hybrid_reroute_default_off",
-          "note": "Hybrid default: the own-legs #918 split (its D3D12 DP on the scanout device, xbridge transport).",
+          "expectLine": "hub placement: hub=0 reason=hybrid_reroute_disabled_by_env",
+          "note": "Kill switch (#2375): the own-legs #918 split (its D3D12 DP on the scanout device, xbridge transport), the hybrid default before the flip.",
           "rejectLines": [
             "#1257 partition: xrWaitFrame throttles the app"
           ]
@@ -130,7 +131,6 @@
         {
           "name": "hub",
           "env": {
-            "DXR_SPLIT_D3D12_HYBRID_REROUTE": "1",
             "DXR_APP_FRAME_DIVISOR": "0",
             "DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR": "0"
           },
@@ -140,9 +140,9 @@
           ],
           "expectLines": [
             "heavy-d3d12 reroute ACTIVE",
-            "hub placement: hub=1 .*ingress=xbridge.* reason=hybrid_reroute_opt_in"
+            "hub placement: hub=1 .*ingress=xbridge.* reason=hybrid_reroute_default_on"
           ],
-          "note": "#2317: the hybrid reroute onto the D3D11 hub at the app's full frame rate (no divisor). Cross-adapter, so ingress=xbridge ingress_reason=cross_adapter.",
+          "note": "#2375: the default env - the hybrid reroute onto the D3D11 hub at the app's full frame rate (no divisor). Cross-adapter, so ingress=xbridge ingress_reason=cross_adapter.",
           "rejectLines": [
             "#1257 partition: xrWaitFrame throttles the app"
           ]
@@ -150,7 +150,6 @@
         {
           "name": "hub-divisor2",
           "env": {
-            "DXR_SPLIT_D3D12_HYBRID_REROUTE": "1",
             "DXR_APP_FRAME_DIVISOR": "2",
             "DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR": "0"
           },
@@ -160,7 +159,7 @@
           ],
           "expectLines": [
             "heavy-d3d12 reroute ACTIVE",
-            "hub placement: hub=1 .*ingress=xbridge.* reason=hybrid_reroute_opt_in",
+            "hub placement: hub=1 .*ingress=xbridge.* reason=hybrid_reroute_default_on",
             "#1257 partition: xrWaitFrame throttles the app to every 2th vblank"
           ],
           "note": "Control: the pre-#2317 gate shape (reroute + DXR_APP_FRAME_DIVISOR=2, #1309). Expect 60 presents = 30 weaves + 30 repaints."
