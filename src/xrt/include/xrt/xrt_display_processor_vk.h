@@ -813,6 +813,31 @@ struct xrt_display_processor_vk
 	bool (*get_eye_positions_at)(struct xrt_display_processor_vk *xdp,
 	                             int64_t target_ns,
 	                             struct xrt_eye_positions *out);
+
+	/*!
+	 * Will the DP weave an atlas in @p encoding if told so through the base's
+	 * @ref xrt_display_processor::set_atlas_encoding? Asked before the
+	 * runtime sends any encoding beyond the ENCODED/LINEAR pair that
+	 * @ref xrt_display_processor::get_handoff_color_capability negotiates —
+	 * today @ref XRT_ATLAS_ENCODING_PQ (HDR10 atlases, #2340). The Vulkan
+	 * twin of the D3D11 slot of the same name (#2294), and a query rather
+	 * than a new capability value for the same reason: runtimes compare
+	 * that capability with `== XRT_DP_COLOR_EITHER`.
+	 *
+	 * Lives on the VK variant, not the base, for the reason
+	 * @ref get_eye_positions_at does: growing the embedded base would move
+	 * every variant slot.
+	 *
+	 * Optional — an absent slot (older plug-in `base.struct_size`) or NULL ⟹
+	 * only ENCODED/LINEAR are ever sent, exactly as before. Appended after
+	 * @ref get_eye_positions_at per ADR-020 (append-only within a major; no
+	 * version bump), announced by XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY.
+	 *
+	 * @param xdp      Pointer to self.
+	 * @param encoding The encoding the runtime would send.
+	 * @return true if the DP weaves @p encoding correctly.
+	 */
+	bool (*accepts_atlas_encoding)(struct xrt_display_processor_vk *xdp, enum xrt_atlas_encoding encoding);
 };
 
 /*!
@@ -927,7 +952,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_overlay_2d)     
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_overlay_2d_filter_strength) == sizeof(struct xrt_display_processor) + 16 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_weave_sync)            == sizeof(struct xrt_display_processor) + 17 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_eye_positions_at)     == sizeof(struct xrt_display_processor) + 18 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 19 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, accepts_atlas_encoding)   == sizeof(struct xrt_display_processor) + 19 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 20 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the @ref
@@ -986,6 +1012,14 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_d
  * (ADR-020).
  */
 #define XRT_DP_VK_HAS_EYE_POSITIONS_AT 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::accepts_atlas_encoding slot and
+ * @ref XRT_ATLAS_ENCODING_PQ (#2340), so a plug-in built against an older
+ * runtime can #ifdef-guard its implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY 1
 // clang-format on
 
 /*!
@@ -1570,6 +1604,29 @@ xrt_display_processor_vk_get_eye_positions_at(struct xrt_display_processor_vk *x
 		return xrt_display_processor_get_predicted_eye_positions(&xdp->base, out);
 	}
 	return xdp->get_eye_positions_at(xdp, target_ns, out);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::accepts_atlas_encoding
+ *
+ * Every "didn't answer" case — NULL DP, absent slot (older plug-in
+ * `base.struct_size`), NULL — is false. Takes the VARIANT pointer; cast a base
+ * `xrt_display_processor *` from a Vulkan factory as the other vk wrappers'
+ * callers do.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_accepts_atlas_encoding(struct xrt_display_processor_vk *xdp, enum xrt_atlas_encoding encoding)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->accepts_atlas_encoding + sizeof(xdp->accepts_atlas_encoding);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->accepts_atlas_encoding == NULL) {
+		return false;
+	}
+	return xdp->accepts_atlas_encoding(xdp, encoding);
 }
 
 #ifdef __cplusplus
