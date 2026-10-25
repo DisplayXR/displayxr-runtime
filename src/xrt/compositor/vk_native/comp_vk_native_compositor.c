@@ -1366,6 +1366,13 @@ struct comp_vk_native_compositor
 		//! (c->mutex taken -> weave returned), EMA — what a commit drain
 		//! stands behind when the serve has not finished.
 		uint64_t serve_ema_ns;
+		//! #2356 TRACE breakdown of the commit's own host time (EMAs):
+		//! c->mutex acquisition in layer_commit; and, inside the stamp's
+		//! ws_commit, the ws_stamp.mutex wait, the recording proper and
+		//! vkEndCommandBuffer (where a tiler driver may build its per-bin
+		//! command streams).
+		uint64_t commit_lock_ema_ns;
+		uint64_t ws_lock_ema_ns, ws_rec_ema_ns, ws_end_ema_ns;
 		/*!
 		 * #1905/#1962: harm-scored fallback to the blocking hand-off. On an
 		 * app that runs frames ahead (a command-buffer ring that never
@@ -9821,6 +9828,7 @@ vk_async_composite_window_space_at_commit(struct comp_vk_native_compositor *c, b
 	const uint64_t t0 = os_monotonic_get_ns();
 
 	os_mutex_lock(&c->ws_stamp.mutex);
+	const uint64_t t_lk = os_monotonic_get_ns();
 	// One outstanding at most (already retired / discarded at the top of this
 	// commit; this is the bound for the case that wait gave up).
 	c->ws_stamp.pending_submit = false;
@@ -9861,6 +9869,7 @@ vk_async_composite_window_space_at_commit(struct comp_vk_native_compositor *c, b
 		}
 	}
 	const VkCommandBuffer cmd = c->ws_stamp.cmd;
+	const uint64_t t_rec0 = os_monotonic_get_ns();
 	if (vk->vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) {
 		os_mutex_unlock(&c->ws_stamp.mutex);
 		return;
@@ -9894,7 +9903,9 @@ vk_async_composite_window_space_at_commit(struct comp_vk_native_compositor *c, b
 	    c->eff_layout.tile_w, c->eff_layout.tile_h, c->eff_layout.cols, c->eff_layout.rows);
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
 	                         &full, 0, NULL, 0, NULL);
+	const uint64_t t_rec1 = os_monotonic_get_ns();
 	vk->vkEndCommandBuffer(cmd);
+	const uint64_t t_end = os_monotonic_get_ns();
 
 	// Recorded, not submitted: the serve submits it as its first act
 	// (vk_ws_stamp_submit_for_serve), on the runtime queue. The app thread
@@ -9917,6 +9928,9 @@ vk_async_composite_window_space_at_commit(struct comp_vk_native_compositor *c, b
 	os_mutex_lock(&c->weave_hand.mutex);
 	c->hand_async.win_ws_commit++;
 	vk_ws_stamp_ema(&c->hand_async.ws_commit_ema_ns, d);
+	vk_ws_stamp_ema(&c->hand_async.ws_lock_ema_ns, t_lk - t0);
+	vk_ws_stamp_ema(&c->hand_async.ws_rec_ema_ns, t_rec1 - t_rec0);
+	vk_ws_stamp_ema(&c->hand_async.ws_end_ema_ns, t_end - t_rec1);
 	os_mutex_unlock(&c->weave_hand.mutex);
 
 	static bool s_logged_on = false;
@@ -10787,6 +10801,10 @@ vk_repaint_thread(void *ptr)
 				const uint32_t ha_ws_iw = c->hand_async.win_ws_img_waits;
 				const double ha_ws_iw_ms = (double)c->hand_async.ws_img_wait_ema_ns / 1e6;
 				const double ha_serve_ms = (double)c->hand_async.serve_ema_ns / 1e6;
+				const double ha_clk_ms = (double)c->hand_async.commit_lock_ema_ns / 1e6;
+				const double ha_wlk_ms = (double)c->hand_async.ws_lock_ema_ns / 1e6;
+				const double ha_wrec_ms = (double)c->hand_async.ws_rec_ema_ns / 1e6;
+				const double ha_wend_ms = (double)c->hand_async.ws_end_ema_ns / 1e6;
 				c->hand_async.win_ws_img_waits = 0;
 				c->hand_async.win_async = 0;
 				c->hand_async.win_sync = 0;
@@ -10807,7 +10825,8 @@ vk_repaint_thread(void *ptr)
 				    "app_iv=%.1fms park=%d layer=%d} handoff{mode=%s async=%d frames=%u/%u "
 				    "wait_ema=%.2fms stalls=%u trips=%u recovered=%u probe_fails=%u wsync_prev=%.2fms "
 				    "ws_commit=%u ws_commit_ema=%.2fms ws_sub_ema=%.2fms ws_retire_ema=%.2fms "
-				    "ws_img_waits=%u ws_img_wait_ema=%.2fms serve_ema=%.2fms}",
+				    "ws_img_waits=%u ws_img_wait_ema=%.2fms serve_ema=%.2fms commit_lock_ema=%.2fms "
+				    "ws_lock_ema=%.2fms ws_rec_ema=%.2fms ws_end_ema=%.2fms}",
 				    (int)vk_midframe_active(c), c->repaint.mf.legacy_fires,
 				    c->repaint.mf.midframe_fires, c->repaint.mf.in_frame, c->repaint.mf.skip_pending,
 				    c->repaint.mf.skip_duty, duty_pct, dxr_midframe_fill_duty(),
@@ -10815,7 +10834,8 @@ vk_repaint_thread(void *ptr)
 				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6, (int)dxr_midframe_fill_park(),
 				    (int)c->repaint.mf.layer_live, ha_mode, (int)c->hand_async.enabled, ha_async,
 				    ha_total, ha_wait_ms, ha_stalls, ha_trips, ha_rec, ha_pfail, wsync_prev_ms, ha_ws,
-				    ha_ws_ms, ha_ws_sub_ms, ha_ws_ret_ms, ha_ws_iw, ha_ws_iw_ms, ha_serve_ms);
+				    ha_ws_ms, ha_ws_sub_ms, ha_ws_ret_ms, ha_ws_iw, ha_ws_iw_ms, ha_serve_ms, ha_clk_ms,
+				    ha_wlk_ms, ha_wrec_ms, ha_wend_ms);
 				c->repaint.mf.legacy_fires = 0;
 				c->repaint.mf.midframe_fires = 0;
 				c->repaint.mf.in_frame = 0;
@@ -13269,7 +13289,14 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 	}
 	if (drain != VK_ASYNC_DRAIN_LOCK_TAKEN) {
+		// #2356 TRACE: how long the commit stands behind c->mutex (a fill,
+		// or anything else the weave thread holds it for).
+		const uint64_t lk0 = os_monotonic_get_ns();
 		os_mutex_lock(&c->mutex);
+		const uint64_t lkd = os_monotonic_get_ns() - lk0;
+		os_mutex_lock(&c->weave_hand.mutex);
+		vk_ws_stamp_ema(&c->hand_async.commit_lock_ema_ns, lkd);
+		os_mutex_unlock(&c->weave_hand.mutex);
 	}
 #else
 	// #2095: same bound without the non-blocking hand-off (see above).
