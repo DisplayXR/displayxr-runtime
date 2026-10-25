@@ -38,8 +38,9 @@ provider) opens a borderless full-screen window on that screen (the monitor that
 screen's desktop rect from the status feed; a points-vs-pixels platform is matched at the feed's
 scale). Method: [tracking-provider-discovery.md §6](../../docs/specs/runtime/tracking-provider-discovery.md#camera-pose-calibration).
 
-- Black, a dim ring at the edges to light the face, a white cross on each target in turn: centre;
-  left, right, top, bottom at a 30 % inset; centre again, leaning back. A target's display-space
+- Black, a bright ring at the edges to light the face (+ / − adjust it), a white cross on each target
+  in turn: centre; left, right, top, bottom at a 30 % inset — first leaning in to about 35 cm (the
+  near pass), then the same five sitting back to about 65 cm (the far pass). A target's display-space
   position is (pixel − screen centre) × pixel pitch, y up, on the screen's native grid; the metres
   are the watch's `hello.display` (the provider's display space) on the runtime-default screen, else
   the screen's layout metres, else its physical size.
@@ -49,14 +50,20 @@ scale). Method: [tracking-provider-discovery.md §6](../../docs/specs/runtime/tr
   when the eye midpoint's camera-space direction has been still (< 0.3°) for 0.5 s, otherwise it
   arms and captures as soon as it is (the ring round the cross brightens with the still run). The
   captured line is recorded verbatim with its dot as `{dot_m, sample}`, `eye: "mid"`.
-- After the sixth target the pairs go to a temp file and `calibrate solve` (mode `b`, reject 5 mm).
-  The result shows RMS, max, iris scale, the pose and each sample's residual. R retakes the
-  flagged samples (the rejected ones; on RMS > 5 mm, those over 5 mm), A starts over; a refusal
-  (`ok: false`) shows the solver's reason.
+- After the tenth target the far pass's mean estimated eye distance must be ≥ 1.5× the near pass's
+  (`CalibGeometry.MinDistanceRatio`); otherwise the window says how far each pass was and queues the
+  far pass again. Then the pairs go to `<LocalApplicationData>/DisplayXR/calibration-last-solve.json`
+  (kept, overwritten by the next solve) and `calibrate solve` (mode `c`: full rotation + T_x, T_y; no
+  focal scale; reject 5 mm). Only a `degenerate` refusal re-solves with mode `b`, and the result says
+  it is the reduced model. `dashboard.log` gets one line per solve with the pose and its quality. The
+  result shows RMS, max, iris scale, the pose, the two passes' distances and each sample's residual.
+  R retakes the flagged samples (the rejected ones; on RMS > 5 mm, those over 5 mm), A starts over; a
+  refusal (`ok: false`) shows the solver's reason.
 - Space: the live check. A green dot follows the eye midpoint's predicted foot, computed in the
   Dashboard from each sample's camera block through the solved pose and iris scale
-  (`T + R · (iris · s̃ · u)`, what the provider will do once applied). Arrow keys nudge T_x / T_y by
-  1 mm. Enter runs `calibrate apply`; Backspace goes back to the result.
+  (`T + R · (iris · s̃ · u)`, what the provider will do once applied); the prompt asks for a check
+  leaning in and sitting back. Arrow keys nudge T_x / T_y by 1 mm. Enter runs `calibrate apply`;
+  Backspace goes back to the result.
 - All of it is `Model/Calibration.cs` + `Model/CalibrationSession.cs` (pure: NDJSON, dot geometry,
   stability, solve / apply parsing, the state machine); `Ui/CalibrationWindow.cs` only draws it.
   Tests: `CalibrationTests` over fixtures captured from the CLI with sim-tracking `CAMERA=1`.

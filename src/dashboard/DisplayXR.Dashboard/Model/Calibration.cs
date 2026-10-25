@@ -52,10 +52,25 @@ public readonly record struct Vec3(double X, double Y, double Z)
 }
 
 /// <summary>
-/// One target of the procedure. <see cref="Fx"/> / <see cref="Fy"/> are fractions of the screen
-/// (0 = left / top edge, 1 = right / bottom edge).
+/// The two head distances of the procedure. One distance cannot separate a camera rotation from a
+/// camera translation (a small yaw or pitch looks like a sideways or vertical offset at a fixed
+/// distance), so every dot is aligned once leaning in and once sitting back.
 /// </summary>
-public sealed record CalibDot(int Index, string Name, double Fx, double Fy, bool LeanBack);
+public enum CalibPass
+{
+    Near,
+    Far,
+}
+
+/// <summary>
+/// One target of the procedure: a dot, in one of the two passes. <see cref="Fx"/> / <see cref="Fy"/>
+/// are fractions of the screen (0 = left / top edge, 1 = right / bottom edge).
+/// </summary>
+public sealed record CalibDot(int Index, string Name, double Fx, double Fy, CalibPass Pass)
+{
+    /// <summary>The name with its pass, for the status line and the result table.</summary>
+    public string Label => $"{Name}, {(Pass == CalibPass.Near ? "near" : "far")}";
+}
 
 /// <summary>
 /// The target screen's pixel grid and physical size, and the dot maths: a dot's display-space
@@ -67,16 +82,30 @@ public sealed record CalibGeometry(long PixelWidth, long PixelHeight, double Wid
     /// <summary>The inset of the left / right / top / bottom dots (design §10: an inset, not the corners).</summary>
     public const double Inset = 0.30;
 
-    /// <summary>Centre; left, right, top, bottom at a 30 % inset; centre again, leaning back.</summary>
-    public static readonly IReadOnlyList<CalibDot> Dots = new[]
+    /// <summary>Targets per pass: centre; left, right, top, bottom at a 30 % inset.</summary>
+    public const int DotsPerPass = 5;
+
+    /// <summary>
+    /// The far pass's mean eye distance must be at least this many times the near pass's. Below it
+    /// the rotation / translation split is poorly conditioned (in simulation, 0.2° direction and
+    /// 2 mm alignment noise: a 1.3x spread leaves ~27 mm of T error, 1.5x ~14 mm, 1.75x ~10 mm).
+    /// The distances are the provider's uncalibrated iris estimates, but a per-user scale cancels
+    /// in the ratio.
+    /// </summary>
+    public const double MinDistanceRatio = 1.5;
+
+    /// <summary>The five dots leaning in (about 35 cm), then the same five sitting back (about 65 cm).</summary>
+    public static readonly IReadOnlyList<CalibDot> Dots = new[] { CalibPass.Near, CalibPass.Far }.SelectMany((pass, p) => new[]
     {
-        new CalibDot(0, "centre", 0.5, 0.5, false),
-        new CalibDot(1, "left", Inset, 0.5, false),
-        new CalibDot(2, "right", 1 - Inset, 0.5, false),
-        new CalibDot(3, "top", 0.5, Inset, false),
-        new CalibDot(4, "bottom", 0.5, 1 - Inset, false),
-        new CalibDot(5, "centre, leaning back", 0.5, 0.5, true),
-    };
+        new CalibDot(p * DotsPerPass + 0, "centre", 0.5, 0.5, pass),
+        new CalibDot(p * DotsPerPass + 1, "left", Inset, 0.5, pass),
+        new CalibDot(p * DotsPerPass + 2, "right", 1 - Inset, 0.5, pass),
+        new CalibDot(p * DotsPerPass + 3, "top", 0.5, Inset, pass),
+        new CalibDot(p * DotsPerPass + 4, "bottom", 0.5, 1 - Inset, pass),
+    }).ToArray();
+
+    /// <summary>The target indices of one pass.</summary>
+    public static IReadOnlyList<int> PassIndices(CalibPass pass) => Dots.Where(d => d.Pass == pass).Select(d => d.Index).ToArray();
 
     public bool IsValid => PixelWidth > 0 && PixelHeight > 0 && WidthM > 0 && HeightM > 0;
 
@@ -184,6 +213,9 @@ public sealed record CameraBlock(string Key, Vec3 LeftDir, double LeftDistanceM,
             return 0.5 * (dl * LeftDir.Normalized + dr * RightDir.Normalized);
         }
     }
+
+    /// <summary>Both eyes carry a distance estimate (else <see cref="MidPoint"/> is a unit-distance direction).</summary>
+    public bool HasDistance => LeftDistanceM > 0 && RightDistanceM > 0;
 
     internal static CameraBlock? Read(JsonElement? e)
     {
@@ -379,15 +411,45 @@ public sealed record SolveResult(bool Ok, string Status, string Reason, string M
 /// <summary>The CLI lines the window runs (argument vectors, never parsed strings).</summary>
 public static class CalibrationCommands
 {
-    /// <summary>The solver mode: translation + pitch (a clip-on or tilted camera; exact R = I is a special case).</summary>
-    public const string Mode = "b";
+    /// <summary>
+    /// The solver mode: the full rotation (pitch, yaw, roll) + T_x, T_y. Two head distances are what
+    /// make it solvable; at one distance a yaw (or a principal point off the image centre) is absorbed
+    /// as a sideways offset of T, and a pitch as a vertical one. The focal scale is NOT solved
+    /// (<c>--focal</c>): with this dot layout it is ill-conditioned against the rotation (in
+    /// simulation half the solves flag <c>ill_conditioned</c> and the yaw error grows ~40x).
+    /// </summary>
+    public const string Mode = "c";
+
+    /// <summary>The fallback when mode <see cref="Mode"/> is refused as degenerate: translation + pitch.</summary>
+    public const string FallbackMode = "b";
     public const string RejectMm = "5";
 
     public static CliArgs Watch(string screenKey) =>
         new("tracking", "calibrate", "--screen", screenKey, "--watch", "--json", "--interval-ms", "20");
 
-    public static CliArgs Solve(string inputPath) =>
-        new("tracking", "calibrate", "solve", "--in", inputPath, "--mode", Mode, "--eye", "mid", "--reject-mm", RejectMm, "--json");
+    public static CliArgs Solve(string inputPath, string mode = Mode) =>
+        new("tracking", "calibrate", "solve", "--in", inputPath, "--mode", mode, "--eye", "mid", "--reject-mm", RejectMm, "--json");
+
+    /// <summary>
+    /// Where the window keeps the last solve's input (overwritten by each solve), beside the
+    /// Dashboard log, so a run can be re-solved and inspected afterwards
+    /// (<c>displayxr-cli tracking calibrate solve --in &lt;this&gt; --mode c --json</c>).
+    /// </summary>
+    public static string LastSolveInputPath { get; } = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DisplayXR", "calibration-last-solve.json");
+
+    /// <summary>The one-line log record of a solve: the pose and its quality.</summary>
+    public static string Describe(SolveResult r)
+    {
+        var ci = CultureInfo.InvariantCulture;
+        if (!r.Ok || r.Pose is null)
+            return string.Format(ci, "solve refused: mode {0}, {1} samples, status {2}: {3}", r.Mode, r.SampleCount, r.Status, r.Reason);
+        return string.Format(ci,
+            "solve ok: mode {0}, T ({1:0.0}, {2:0.0}, {3:0.0}) mm, pitch {4:0.00} yaw {5:0.00} roll {6:0.00} deg, " +
+            "focal scale {7:0.0000}, iris scale {8:0.0000}, RMS {9:0.00} mm (max {10:0.00}), {11}/{12} samples, {13} dots{14}",
+            r.Mode, r.Pose.T.X * 1000, r.Pose.T.Y * 1000, r.Pose.T.Z * 1000, r.PitchDeg, r.YawDeg, r.RollDeg, r.FocalScale,
+            r.IrisScale, r.RmsMm, r.MaxMm, r.UsedCount, r.SampleCount, r.DistinctDots, r.IllConditioned ? ", ILL-CONDITIONED" : "");
+    }
 
     public static CliArgs Apply(string screenKey, string cameraKey, CameraPose pose, string? provider, double irisScale, double focalScale,
                                 double rmsMm = -1, int samples = 0, string? mode = null)
@@ -449,7 +511,8 @@ public static class CalibrationCommands
     /// <summary>
     /// The solve input (§6, the object form): <c>{"mode","eye","camera_key","screen","samples":[{"dot_m":[x,y],"sample":&lt;the watch line&gt;}]}</c>.
     /// </summary>
-    public static string SolveInput(string screenKey, string cameraKey, IEnumerable<(double X, double Y, CalibSample Sample)> pairs)
+    public static string SolveInput(string screenKey, string cameraKey, IEnumerable<(double X, double Y, CalibSample Sample)> pairs,
+                                    string mode = Mode)
     {
         var arr = new JsonArray();
         foreach (var (x, y, s) in pairs)
@@ -460,7 +523,7 @@ public static class CalibrationCommands
             });
         var root = new JsonObject
         {
-            ["mode"] = Mode,
+            ["mode"] = mode,
             ["eye"] = "mid",
             ["camera_key"] = cameraKey,
             ["screen"] = screenKey,

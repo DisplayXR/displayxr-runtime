@@ -399,6 +399,94 @@ TEST_CASE("mirror calib: mode (c) recovers a full rotation and the focal scale",
 	CHECK(r.rank == 6);
 }
 
+/*
+ * The Dashboard's procedure (five dots at a 30 % inset, a near pass then a far pass) on a laptop
+ * panel whose top-bezel camera is turned 4 deg toward +X: why it solves mode (c) and not (b), and
+ * why it needs the two distances.
+ */
+TEST_CASE("mirror calib: the near/far procedure recovers a yawed laptop camera in mode (c)", "[mirror_calib]")
+{
+	const double w = 0.30, h = 0.19;
+	const std::vector<std::pair<double, double>> dots = {
+	    {0, 0}, {-0.2 * w, 0}, {0.2 * w, 0}, {0, 0.2 * h}, {0, -0.2 * h}};
+	const Pose p = make_pose(0.0, 0.105, 0.0, 2.0, 4.0, 0.5);
+	auto procedure = [&](std::vector<double> zs, const Noise &n, std::mt19937 &rng) {
+		std::vector<m_mirror_calib_sample> s;
+		for (double z : zs) {
+			for (auto d : dots) {
+				s.push_back(make_sample(p, d.first, d.second, z, n, rng));
+			}
+		}
+		return s;
+	};
+	auto solve = [](const std::vector<m_mirror_calib_sample> &s, m_mirror_calib_mode mode,
+	                m_mirror_calib_result &r) {
+		m_mirror_calib_options opt;
+		m_mirror_calib_options_init(&opt);
+		opt.mode = mode;
+		opt.reject_threshold_m = 0.005;
+		return m_mirror_calib_solve(s.data(), (int)s.size(), &opt, &r);
+	};
+
+	SECTION("noise-free: (c) is exact with two distances, refused at one")
+	{
+		std::mt19937 rng(21);
+		m_mirror_calib_result r;
+		REQUIRE(solve(procedure({0.35, 0.65}, Noise{}, rng), M_MIRROR_CALIB_MODE_FULL, r));
+		CHECK(r.yaw_deg == Catch::Approx(4.0).margin(1e-4));
+		CHECK(r.pitch_deg == Catch::Approx(2.0).margin(1e-4));
+		CHECK(t_err_xy(r, p) < 1e-6);
+		CHECK_FALSE(r.ill_conditioned);
+
+		// One distance: rotation and translation trade off exactly. Refused, so the Dashboard
+		// falls back (and its distance check keeps this from being reached).
+		m_mirror_calib_result r1;
+		CHECK_FALSE(solve(procedure({0.50, 0.50}, Noise{}, rng), M_MIRROR_CALIB_MODE_FULL, r1));
+		CHECK(r1.status == M_MIRROR_CALIB_ERROR_DEGENERATE);
+
+		// (b) has no yaw: the yaw lands in T (tens of millimetres), with no warning.
+		m_mirror_calib_result rb;
+		REQUIRE(solve(procedure({0.35, 0.65}, Noise{}, rng), M_MIRROR_CALIB_MODE_PITCH, rb));
+		CHECK(t_err_xy(rb, p) > 0.020);
+	}
+
+	SECTION("noisy: (c) lands within ~1 cm; the focal scale is not worth solving here")
+	{
+		const Noise n{0.2, 0.002, 0.07, 1.0};
+		std::vector<double> err_c, err_ck, yaw_c;
+		int ill_ck = 0;
+		for (unsigned seed = 0; seed < 40; seed++) {
+			std::mt19937 rng(1000 + seed);
+			const auto s = procedure({0.35, 0.65}, n, rng);
+			m_mirror_calib_result r, rk;
+			REQUIRE(solve(s, M_MIRROR_CALIB_MODE_FULL, r));
+			err_c.push_back(t_err_xy(r, p));
+			yaw_c.push_back(fabs(r.yaw_deg - 4.0));
+			m_mirror_calib_options opt;
+			m_mirror_calib_options_init(&opt);
+			opt.mode = M_MIRROR_CALIB_MODE_FULL;
+			opt.solve_focal_scale = true;
+			opt.reject_threshold_m = 0.005;
+			if (m_mirror_calib_solve(s.data(), (int)s.size(), &opt, &rk)) {
+				err_ck.push_back(t_err_xy(rk, p));
+				ill_ck += rk.ill_conditioned ? 1 : 0;
+			}
+		}
+		auto med = [](std::vector<double> v) {
+			std::sort(v.begin(), v.end());
+			return v[v.size() / 2];
+		};
+		std::printf(
+		    "[mirror_calib] near/far procedure, 40 seeds: (c) median |dT| %.1f mm, median |dyaw| %.2f deg; "
+		    "(c)+focal median |dT| %.1f mm, %d ill-conditioned\n",
+		    med(err_c) * 1e3, med(yaw_c), err_ck.empty() ? 0.0 : med(err_ck) * 1e3, ill_ck);
+		CHECK(med(err_c) < 0.010);
+		CHECK(med(yaw_c) < 0.5);
+		// With five dots the focal scale trades off against the rotation: many fits flag it.
+		CHECK(ill_ck > 0);
+	}
+}
+
 TEST_CASE("mirror calib: iris scale and outlier rejection", "[mirror_calib]")
 {
 	std::mt19937 rng(9);
