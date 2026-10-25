@@ -130,6 +130,7 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
                                    void *shared_texture_handle,
                                    bool transparent_background,
                                    uint64_t bound_display_id,
+                                   const void *texture_target_binding,
                                    struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -146,10 +147,19 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 		display_screen_top = sys->xsysc->info.display_screen_top;
 	}
 
+	// XR_DXR_win32_window_binding v9 (ADR-060): the texture target binding.
+	struct comp_d3d11_texture_target_info tt_info = {0};
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	oxr_texture_target_fill_d3d11_info(sys, (const XrWin32TextureTargetBindingDXR *)texture_target_binding,
+	                                   bound_display_id, &tt_info);
+#else
+	(void)texture_target_binding;
+#endif
+
 	// Create the D3D11 native compositor
 	xrt_result_t xret = comp_d3d11_compositor_create(
 	    xdev, window_handle, (void *)next->device, dp_factory_d3d11, shared_texture_handle,
-	    transparent_background, display_screen_left, display_screen_top, &xcn);
+	    transparent_background, display_screen_left, display_screen_top, &tt_info, &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create D3D11 native compositor: %d", xret);
@@ -193,6 +203,7 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 	// Track external window / shared texture mode
 	sess->has_external_window =
 	    (window_handle != NULL || shared_texture_handle != NULL);
+	sess->texture_target_bound = tt_info.bound && shared_texture_handle != NULL;
 	if (sess->has_external_window) {
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 		if (head != NULL) {

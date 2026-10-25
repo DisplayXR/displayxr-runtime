@@ -186,6 +186,30 @@ comp_dp_factory_for_session(const struct xrt_system_compositor_info *info,
 	return comp_dp_scalar_for_api(info, api);
 }
 
+/*!
+ * ADR-060: the registry ENTRY an in-process session's screen is woven from — the
+ * bound display's when @p bound_display_id is set, else the primary entry
+ * (@ref xrt_dp_registry_primary_entry). For callers that need more than the
+ * factory: the per-screen factory, the claim hints and the screen rect (the
+ * windowless texture-target DP). NULL when the registry has none.
+ */
+static inline const struct xrt_dp_registry_entry *
+comp_dp_entry_for_session(const struct xrt_system_compositor_info *info, uint64_t bound_display_id)
+{
+	if (info == NULL) {
+		return NULL;
+	}
+	if (bound_display_id != 0) {
+		for (uint32_t i = 0; i < info->dp_registry.entry_count; i++) {
+			if (info->dp_registry.entries[i].monitor_id == bound_display_id) {
+				return &info->dp_registry.entries[i];
+			}
+		}
+		return NULL;
+	}
+	return xrt_dp_registry_primary_entry(&info->dp_registry, info->active_plugin_id);
+}
+
 #ifdef __cplusplus
 }
 #endif

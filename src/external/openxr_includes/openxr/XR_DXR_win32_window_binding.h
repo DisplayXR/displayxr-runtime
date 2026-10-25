@@ -40,12 +40,17 @@ extern "C" {
 #endif
 
 #define XR_DXR_win32_window_binding 1
-#define XR_DXR_win32_window_binding_SPEC_VERSION 8
+#define XR_DXR_win32_window_binding_SPEC_VERSION 9
 #define XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME "XR_DXR_win32_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)
 // This should be replaced with an official Khronos-assigned value if the extension is standardized
 #define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999001)
+// SPEC_VERSION 9: texture target binding (ADR-060).
+#define XR_TYPE_WIN32_TEXTURE_TARGET_BINDING_DXR ((XrStructureType)1004999015)
+#define XR_TYPE_WIN32_TEXTURE_TARGET_FRAME_DXR ((XrStructureType)1004999016)
+#define XR_TYPE_SYSTEM_WIN32_TEXTURE_TARGET_PROPERTIES_DXR ((XrStructureType)1004999017)
+#define XR_TYPE_WIN32_TEXTURE_TARGET_STATE_DXR ((XrStructureType)1004999018)
 
 /*!
  * @brief Callback for offscreen readback mode (CPU fallback).
@@ -134,6 +139,99 @@ typedef struct XrCompositionLayerWindowSpaceDXR {
                                             //!< 0 = screen depth, negative = toward viewer
 } XrCompositionLayerWindowSpaceDXR;
 #endif // XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
+
+/*
+ * SPEC_VERSION 9 — texture target binding (ADR-060).
+ *
+ * A shared-texture session (sharedTextureHandle != NULL) names where its
+ * texture is drawn: a REFERENCE WINDOW (the app's own top-level window, or
+ * NULL for desktop coordinates) and a TARGET RECT in that window's client
+ * area, in physical device pixels. The runtime weaves into the shared texture
+ * at (0, 0, rect.w, rect.h) — the rect IS the canvas — phases the interlace
+ * from the target's live screen position, and frames the views to it. It never
+ * subclasses, reparents or binds a display processor to the reference window.
+ * Honored only when the display processor phases without a window; otherwise
+ * the session falls back to windowHandle as an anchor (SPEC_VERSION 8 path).
+ */
+
+typedef XrFlags64 XrWin32TextureTargetFrameFlagsDXR;
+//! ADVISORY: the reference window is being moved or resized by the user right
+//! now. Reserved in SPEC_VERSION 9; the runtime never does phase math from it.
+static const XrWin32TextureTargetFrameFlagsDXR XR_WIN32_TEXTURE_TARGET_FRAME_DRAGGING_BIT_DXR = 0x00000001;
+
+typedef XrFlags64 XrWin32TextureTargetStateFlagsDXR;
+//! The weave was phased from the target's position on a windowless display processor.
+static const XrWin32TextureTargetStateFlagsDXR XR_WIN32_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE_BIT_DXR = 0x00000001;
+//! The display processor cannot phase windowless; windowHandle carried the weave (SPEC_VERSION 8 path).
+static const XrWin32TextureTargetStateFlagsDXR XR_WIN32_TEXTURE_TARGET_STATE_ANCHOR_FALLBACK_BIT_DXR = 0x00000002;
+//! The target spanned screens and was woven per screen.
+static const XrWin32TextureTargetStateFlagsDXR XR_WIN32_TEXTURE_TARGET_STATE_SEGMENTED_BIT_DXR = 0x00000004;
+//! Some part of the target was written flat 2D (a 2D screen, or a screen that cannot weave it).
+static const XrWin32TextureTargetStateFlagsDXR XR_WIN32_TEXTURE_TARGET_STATE_FLAT_SEGMENT_BIT_DXR = 0x00000008;
+//! The target rect was larger than the shared texture and was clamped to it.
+static const XrWin32TextureTargetStateFlagsDXR XR_WIN32_TEXTURE_TARGET_STATE_CLAMPED_BIT_DXR = 0x00000010;
+
+/*!
+ * @brief System capability, chained on XrSystemProperties::next.
+ *
+ * A PREDICTION made before any session exists; the session's
+ * XrWin32TextureTargetStateDXR is the authority.
+ *
+ * @extends XrSystemProperties
+ */
+typedef struct XrSystemWin32TextureTargetPropertiesDXR {
+    XrStructureType       type;                  //!< Must be XR_TYPE_SYSTEM_WIN32_TEXTURE_TARGET_PROPERTIES_DXR
+    void* XR_MAY_ALIAS    next;
+    XrBool32              supportsTextureTarget; //!< The runtime implements the texture target structs
+    XrBool32              windowlessPhase;       //!< The active display processor is expected to phase without a window
+} XrSystemWin32TextureTargetPropertiesDXR;
+
+/*!
+ * @brief Session creation: names the texture target.
+ *
+ * Valid only with XrWin32WindowBindingCreateInfoDXR::sharedTextureHandle set
+ * and readbackCallback NULL. windowHandle, if set, is the fallback anchor.
+ *
+ * @extends XrWin32WindowBindingCreateInfoDXR
+ */
+typedef struct XrWin32TextureTargetBindingDXR {
+    XrStructureType           type;              //!< Must be XR_TYPE_WIN32_TEXTURE_TARGET_BINDING_DXR
+    const void* XR_MAY_ALIAS  next;
+    void*                     referenceWindow;   //!< HWND (top-level, this process) or NULL = desktop device px
+    XrRect2Di                 initialTargetRect; //!< Used until the first frame carries a target
+} XrWin32TextureTargetBindingDXR;
+
+/*!
+ * @brief Per-frame target. Chained on XrFrameEndInfo::next (authoritative)
+ *        and optionally on XrViewLocateInfo::next (frames that locate's views).
+ *
+ * Omitted on a frame, the last value is reused.
+ *
+ * @extends XrFrameEndInfo
+ * @extends XrViewLocateInfo
+ */
+typedef struct XrWin32TextureTargetFrameDXR {
+    XrStructureType                   type;            //!< Must be XR_TYPE_WIN32_TEXTURE_TARGET_FRAME_DXR
+    const void* XR_MAY_ALIAS          next;
+    void*                             referenceWindow; //!< This frame's reference; NULL = desktop device px
+    XrRect2Di                         targetRect;      //!< Device px in referenceWindow's client area (or the desktop)
+    XrWin32TextureTargetFrameFlagsDXR flags;           //!< Advisory hints; 0 = none
+} XrWin32TextureTargetFrameDXR;
+
+/*!
+ * @brief What the runtime used. Chained on XrFrameState::next at xrWaitFrame;
+ *        describes the most recently WOVEN frame. Diagnostic, not a control loop.
+ *
+ * @extends XrFrameState
+ */
+typedef struct XrWin32TextureTargetStateDXR {
+    XrStructureType                   type;              //!< Must be XR_TYPE_WIN32_TEXTURE_TARGET_STATE_DXR
+    void* XR_MAY_ALIAS                next;
+    XrWin32TextureTargetStateFlagsDXR flags;
+    XrOffset2Di                       wovenScreenOrigin; //!< The target's resolved desktop origin, device px
+    XrRect2Di                         wovenTargetRect;   //!< The rect that frame was woven for
+    XrTime                            wovenDisplayTime;  //!< That frame's predictedDisplayTime
+} XrWin32TextureTargetStateDXR;
 
 #ifdef __cplusplus
 }

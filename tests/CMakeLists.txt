@@ -98,6 +98,7 @@ set(tests
     tests_aux_tracking_any
     tests_comp_rear_budget
     tests_comp_segments
+    tests_comp_texture_target
     tests_comp_weave_screens
     tests_comp_lazy_transparency
     tests_comp_overlay_2d_vk
@@ -1326,6 +1327,10 @@ target_link_libraries(tests_comp_rear_budget PRIVATE xrt-interfaces aux_os xrt-e
 target_sources(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
 target_include_directories(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 target_link_libraries(tests_comp_segments PRIVATE xrt-interfaces aux_util)
+
+# ADR-060: the texture target binding's one resolve (header-only math).
+target_include_directories(tests_comp_texture_target PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_link_libraries(tests_comp_texture_target PRIVATE xrt-interfaces aux_util)
 
 # #2218 item 6: the desktop-Linux service's XR_DXR_weave present-owner woven per
 # screen — the window placed against the screens in one pixel frame, the table

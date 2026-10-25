@@ -99,6 +99,9 @@ struct comp_d3d11_segments
 	int owner_index;          //!< index of the screen holding the handle, -1 = none
 	bool primary_for_screen;  //!< the primary's plug-in has create_dp_d3d11_for_screen
 	bool primary_windowless;  //!< the session's primary DP is windowless right now
+	//! ADR-060: the primary is windowless by construction (texture target):
+	//! fed its origin on the split path, but never forces that path.
+	bool primary_origin_fed;
 	ID3D11DeviceContext *ctx; //!< last update's context (the hand-back at destroy)
 
 	//! The app thread reads st[i].dp for eyes; the weave creates/destroys it.
@@ -837,6 +840,14 @@ comp_d3d11_segments_enabled(const struct comp_d3d11_segments *segs)
 	return segs != nullptr && segs->enabled;
 }
 
+extern "C" void
+comp_d3d11_segments_set_primary_phases_from_origin(struct comp_d3d11_segments *segs, bool on)
+{
+	if (segs != nullptr) {
+		segs->primary_origin_fed = on;
+	}
+}
+
 extern "C" bool
 comp_d3d11_segments_update(struct comp_d3d11_segments *segs,
                            const struct comp_seg_rect *window_desktop,
@@ -1035,7 +1046,8 @@ comp_d3d11_segments_record(struct comp_d3d11_segments *segs, const struct comp_d
 			if (g->is_primary) {
 				// The session feeds its own DP everything else; windowless
 				// (another screen holds the window), it needs its phase here.
-				if (segs->primary_windowless && g->screen_1to1 != COMP_SEG_1TO1_NO) {
+				if ((segs->primary_windowless || segs->primary_origin_fed) &&
+				    g->screen_1to1 != COMP_SEG_1TO1_NO) {
 					xrt_display_processor_d3d11_set_present_origin(dp, g->present_origin_x,
 					                                               g->present_origin_y);
 				}
@@ -1108,6 +1120,9 @@ comp_d3d11_segments_record(struct comp_d3d11_segments *segs, const struct comp_d
 	}
 	const uint32_t flat_seg_n = flat_n;
 	flat_n += comp_segments_uncovered(t, &f->canvas, &flat_dst[flat_n], COMP_SEGMENTS_MAX_UNCOVERED);
+	if (f->out_any_flat != nullptr) {
+		*f->out_any_flat = flat_n > 0;
+	}
 	if (flat_n > 0 && f->outcomp != nullptr) {
 		const uint32_t views = f->tile_columns * f->tile_rows;
 		const uint32_t vi = views > 0 ? (views - 1) / 2 : 0;

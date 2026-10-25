@@ -2121,6 +2121,7 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
                                    void *shared_texture_handle,
                                    bool transparent_background,
                                    uint64_t bound_display_id,
+                                   const void *texture_target_binding,
                                    struct oxr_session *sess);
 #endif
 
@@ -2982,6 +2983,10 @@ struct oxr_session
 
 	//! True if session was created with an external window handle (XR_DXR_win32_window_binding).
 	bool has_external_window;
+
+	//! XR_DXR_win32_window_binding v9 (ADR-060): the session was created with an
+	//! XrWin32TextureTargetBindingDXR honoured by its compositor (native D3D11).
+	bool texture_target_bound;
 
 	/*!
 	 * XrSessionDisplayBindingDXR (XR_DXR_display_info v22, multi-screen M1):
@@ -4976,6 +4981,40 @@ oxr_input_providers_roles_changed(struct oxr_logger *log,
                                   const struct xrt_system_roles *old_roles,
                                   const struct xrt_system_roles *new_roles);
 
+
+#ifdef OXR_HAVE_DXR_win32_window_binding
+/*
+ * XR_DXR_win32_window_binding v9 — texture target binding (ADR-060),
+ * oxr_texture_target.c.
+ */
+//! The XrWin32TextureTargetBindingDXR chained on the window binding, or NULL.
+const XrWin32TextureTargetBindingDXR *
+oxr_texture_target_find_binding(const XrSessionCreateInfo *createInfo);
+//! Spec §3 create-time valid usage (no-op without a binding).
+XrResult
+oxr_texture_target_verify_create(struct oxr_logger *log, const XrSessionCreateInfo *createInfo);
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+struct comp_d3d11_texture_target_info;
+//! The compositor's create-time binding (zeroed = not bound when @p tb is NULL).
+void
+oxr_texture_target_fill_d3d11_info(struct oxr_system *sys,
+                                   const XrWin32TextureTargetBindingDXR *tb,
+                                   uint64_t bound_display_id,
+                                   struct comp_d3d11_texture_target_info *out);
+#endif
+//! xrEndFrame: validate + forward this frame's XrWin32TextureTargetFrameDXR.
+XrResult
+oxr_texture_target_frame_end(struct oxr_logger *log, struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo);
+//! xrLocateViews: forward a chained XrWin32TextureTargetFrameDXR (frames this locate).
+void
+oxr_texture_target_locate(struct oxr_logger *log, struct oxr_session *sess, const XrViewLocateInfo *viewLocateInfo);
+//! xrWaitFrame: fill a chained XrWin32TextureTargetStateDXR.
+void
+oxr_texture_target_wait(struct oxr_session *sess, XrFrameState *frameState);
+//! xrGetSystemProperties: fill a chained XrSystemWin32TextureTargetPropertiesDXR.
+void
+oxr_texture_target_system_properties(struct oxr_system *sys, XrSystemProperties *properties);
+#endif
 
 #ifdef OXR_HAVE_EXT_user_presence
 XrResult

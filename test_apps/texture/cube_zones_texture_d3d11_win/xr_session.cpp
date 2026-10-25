@@ -348,6 +348,15 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     return true;
 }
 
+bool TextureTargetEnabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* e = getenv("DXR_TEXTURE_TARGET");
+        enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device,
                    HANDLE sharedTextureHandle, HWND appHwnd) {
     LOG_INFO("Creating OpenXR session with shared texture handle + window binding...");
@@ -381,6 +390,30 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device,
             sessionTarget.transparentBackgroundEnabled = XR_TRUE;
             LOG_INFO("Transparent background ENABLED (zones default; DISPLAYXR_TRANSPARENT_BG=0 to opt out)");
         }
+    }
+
+    // XR_DXR_win32_window_binding v9 (ADR-060) smoke mode: DXR_TEXTURE_TARGET=1
+    // names the texture target (this window + its whole client area) instead
+    // of relying on the HWND anchor; DXR_TEXTURE_TARGET_NOANCHOR=1 also drops
+    // windowHandle, so a DP that cannot phase windowless weaves display-scoped.
+    // main.cpp chains the per-frame XrWin32TextureTargetFrameDXR.
+    XrWin32TextureTargetBindingDXR textureTarget = {XR_TYPE_WIN32_TEXTURE_TARGET_BINDING_DXR};
+    if (TextureTargetEnabled() && appHwnd && sharedTextureHandle) {
+        RECT rc = {};
+        GetClientRect(appHwnd, &rc);
+        textureTarget.referenceWindow = (void*)appHwnd;
+        textureTarget.initialTargetRect.offset = {0, 0};
+        textureTarget.initialTargetRect.extent = {rc.right > 0 ? (int32_t)rc.right : 1,
+                                                  rc.bottom > 0 ? (int32_t)rc.bottom : 1};
+        sessionTarget.next = &textureTarget;
+        const char* na = getenv("DXR_TEXTURE_TARGET_NOANCHOR");
+        if (na != nullptr && na[0] == '1') {
+            sessionTarget.windowHandle = nullptr;
+        }
+        LOG_INFO("ADR-060 texture target binding: reference window %p, rect %dx%d, anchor %s",
+            (void*)appHwnd, (int)textureTarget.initialTargetRect.extent.width,
+            (int)textureTarget.initialTargetRect.extent.height,
+            sessionTarget.windowHandle ? "kept (fallback)" : "dropped");
     }
 
     if (xr.hasWin32WindowBindingExt && appHwnd && sharedTextureHandle) {

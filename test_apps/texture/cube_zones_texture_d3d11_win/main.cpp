@@ -545,6 +545,22 @@ static bool CreateBlitResources(ID3D11Device* device) {
     return SUCCEEDED(hr);
 }
 
+// ADR-060 smoke mode: this frame's texture target — this window's whole client
+// area, chained ahead of @p next. The same instance serves every call of the
+// frame (locates, then xrEndFrame), re-pointed right before each.
+static XrWin32TextureTargetFrameDXR g_ttFrame = {XR_TYPE_WIN32_TEXTURE_TARGET_FRAME_DXR};
+static const void* TextureTargetChain(HWND hwnd, const void* next) {
+    if (!TextureTargetEnabled() || hwnd == nullptr) return next;
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    g_ttFrame.next = next;
+    g_ttFrame.referenceWindow = (void*)hwnd;
+    g_ttFrame.targetRect.offset = {0, 0};
+    g_ttFrame.targetRect.extent = {rc.right > 0 ? (int32_t)rc.right : 1, rc.bottom > 0 ? (int32_t)rc.bottom : 1};
+    g_ttFrame.flags = 0;
+    return &g_ttFrame;
+}
+
 // Blit the runtime-composited shared texture into the app's window back
 // buffer. For the zones path the runtime fills the FULL WINDOW region of the
 // shared texture with the multi-zone composite (output rect superseded by
@@ -1290,7 +1306,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         zoneStructs[zi].rect = z.rect;
 
         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
-        locateInfo.next = &zoneStructs[zi];
+        locateInfo.next = TextureTargetChain(xr.windowHandle, &zoneStructs[zi]);
         locateInfo.viewConfigurationType = xr.viewConfigType;
         locateInfo.displayTime = frameState.predictedDisplayTime;
         locateInfo.space = xr.localSpace;
@@ -1536,6 +1552,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
     if (chainZonesEnd) {
         endInfo.next = &zonesEnd;
     }
+    endInfo.next = TextureTargetChain(xr.windowHandle, endInfo.next);
 
     xrEndFrame(xr.session, &endInfo);
 
@@ -1732,6 +1749,7 @@ static void RenderOneFrame(RenderState& rs) {
                 }
             }
 
+            locateInfo.next = TextureTargetChain(xr.windowHandle, locateInfo.next);
             xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
 
             // ADR-041: the layer must carry EVERY located view. Render eyeCount
