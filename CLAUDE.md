@@ -73,7 +73,7 @@ Vendor display drivers ship as **plug-in DLLs** from their own repos (ADR-019). 
 
 ### Custom OpenXR extensions
 - `XR_DXR_win32_window_binding` — app passes HWND to runtime
-- `XR_DXR_cocoa_window_binding` — app passes NSWindow to runtime
+- `XR_DXR_cocoa_window_binding` — app passes an NSView (CAMetalLayer-backed) to runtime
 - `XR_DXR_xlib_window_binding` — app passes X11 Display*/Window to runtime (desktop Linux)
 - `XR_DXR_display_info` — display dimensions, eye-tracking modes
 - `XR_DXR_android_surface_binding` — app passes its own Android Surface/`ANativeWindow`; `xrSetAndroidSurfaceDXR` republishes it across background/resume, `xrSetAndroidWindowGeometryDXR` feeds the per-frame window rect (ADR-036 D6), and `xrSubmitAndroidInputEventDXR` (spec v3) feeds the surface's touch to the runtime's touch input provider (#132: orbit / pinch / pan rig + emulated controller; the hosted SurfaceView feeds it by itself). **Required for multi-window on Android** — the runtime-spawned SurfaceView is `_hosted`-fullscreen-only

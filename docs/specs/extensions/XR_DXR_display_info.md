@@ -5,10 +5,10 @@
 | Field | Value |
 |---|---|
 | **Proposal Title** | OpenXR Extensions for Tracked 3D (Autostereoscopic) Displays |
-| **Authors** | David Fattal (Leia Inc.) |
+| **Authors** | The DisplayXR Project |
 | **Date** | 2026-02-13 |
 | **Revision** | 0.2 |
-| **Status** | Draft — proposed for Khronos OpenXR Working Group review |
+| **Status** | Implemented (`SPEC_VERSION` 23). `XrStructureType` values are provisional (1004999xxx) until Khronos registration |
 | **Extension Names** | `XR_DXR_win32_window_binding`, `XR_DXR_android_surface_binding`, `XR_DXR_cocoa_window_binding`, `XR_DXR_display_info` |
 | **OpenXR Version** | 1.0 |
 | **Extension Type** | Instance extensions |
