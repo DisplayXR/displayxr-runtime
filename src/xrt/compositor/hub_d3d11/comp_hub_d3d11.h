@@ -978,7 +978,7 @@ enum comp_hub_d3d11_repaint_result
  * two (its frame submit is the only point the handoff fence reaches it). The
  * caller re-presents its last woven texture on its own cadence, or not; a
  * repaint for texture targets needs an app-visible release fence (a later
- * revision of the ADR-060 binding). The tier keeps its replay disarmed.
+ * revision of the ADR-060 binding, #2378). The tier keeps its replay disarmed.
  */
 enum comp_hub_d3d11_repaint_result
 comp_hub_d3d11_repaint(struct comp_hub_d3d11 *split, bool partition_engaged, const struct xrt_rect *canvas);
