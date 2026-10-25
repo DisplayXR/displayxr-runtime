@@ -2474,7 +2474,26 @@ xrt_format_to_gl_internal(int64_t fmt)
 	case 0x8C43: return GL_SRGB8_ALPHA8;   // GL_SRGB8_ALPHA8
 	case 0x881A: return GL_RGBA16F;         // GL_RGBA16F
 	case 0x8814: return GL_RGBA32F;         // GL_RGBA32F
+	case 0x81A5: return GL_DEPTH_COMPONENT16;
+	case 0x81A6: return GL_DEPTH_COMPONENT24;
+	case 0x8CAC: return GL_DEPTH_COMPONENT32F;
+	case 0x88F0: return GL_DEPTH24_STENCIL8;
 	default:     return GL_RGBA8;
+	}
+}
+
+//! Pixel format/type for allocating @p internal_format with no data. Depth
+//! internal formats need a depth pixel format, or glTexImage fails with
+//! GL_INVALID_OPERATION and the swapchain image is left unallocated.
+static void
+gl_alloc_pixel_format(GLenum internal_format, GLenum *out_format, GLenum *out_type)
+{
+	switch (internal_format) {
+	case GL_DEPTH_COMPONENT16:
+	case GL_DEPTH_COMPONENT24: *out_format = GL_DEPTH_COMPONENT; *out_type = GL_UNSIGNED_INT; break;
+	case GL_DEPTH_COMPONENT32F: *out_format = GL_DEPTH_COMPONENT; *out_type = GL_FLOAT; break;
+	case GL_DEPTH24_STENCIL8: *out_format = GL_DEPTH_STENCIL; *out_type = GL_UNSIGNED_INT_24_8; break;
+	default: *out_format = GL_RGBA; *out_type = GL_UNSIGNED_BYTE; break;
 	}
 }
 
@@ -2753,6 +2772,8 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 	// submits them as two projection views with imageArrayIndex 0/1. Non-layered
 	// swapchains keep the GL_TEXTURE_2D path unchanged.
 	GLenum internal_format = xrt_format_to_gl_internal(info->format);
+	GLenum pixel_format, pixel_type;
+	gl_alloc_pixel_format(internal_format, &pixel_format, &pixel_type);
 	uint32_t array_size = info->array_size > 0 ? info->array_size : 1;
 	sc->target = array_size > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
 	glGenTextures(image_count, sc->textures);
@@ -2762,11 +2783,11 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 		if (sc->target == GL_TEXTURE_2D_ARRAY) {
 			glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, internal_format,
 			             info->width, info->height, array_size, 0,
-			             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+			             pixel_format, pixel_type, NULL);
 		} else {
 			glTexImage2D(GL_TEXTURE_2D, 0, internal_format,
 			             info->width, info->height, 0,
-			             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+			             pixel_format, pixel_type, NULL);
 		}
 		glTexParameteri(sc->target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 		glTexParameteri(sc->target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -8804,12 +8825,18 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 static void
 gl_compositor_set_formats(struct comp_gl_compositor *c)
 {
-	// GL format enum values
-	c->base.base.info.format_count = 4;
+	// GL format enum values. Depth formats are advertised so apps that require
+	// a depth swapchain (Godot's OpenXR module fails to initialise without one)
+	// can create it; depth is not composed (no XR_KHR_composition_layer_depth).
+	c->base.base.info.format_count = 8;
 	c->base.base.info.formats[0] = 0x8058; // GL_RGBA8
 	c->base.base.info.formats[1] = 0x8C43; // GL_SRGB8_ALPHA8
 	c->base.base.info.formats[2] = 0x881A; // GL_RGBA16F
 	c->base.base.info.formats[3] = 0x8814; // GL_RGBA32F
+	c->base.base.info.formats[4] = 0x8CAC; // GL_DEPTH_COMPONENT32F
+	c->base.base.info.formats[5] = 0x88F0; // GL_DEPTH24_STENCIL8
+	c->base.base.info.formats[6] = 0x81A6; // GL_DEPTH_COMPONENT24
+	c->base.base.info.formats[7] = 0x81A5; // GL_DEPTH_COMPONENT16
 }
 
 
