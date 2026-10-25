@@ -10,13 +10,19 @@
 #
 # Usage:
 #   scripts/adr060_r2_first_run.sh --expect leia|leia-l4|sim --browser <chrome.exe> --url <T1 page> [--seconds 25] [--keep]
+#                                  [--leia-repo <displayxr-leia-plugin checkout on the L4 branch>]   (leia-l4 only)
 #
 #   --expect leia  The active DP is the Leia plug-in WITHOUT L4 (today's
 #                  release). Pass = the service declined the windowless path (the
 #                  plug-in gives no hint, so no extra weaver is even created) and
 #                  the client weaves on the window-bound DP exactly as before
 #                  (the no-regression check).
-#   --expect leia-l4  Leia WITH the L4 bit (later). Pass = the windowless lines.
+#   --expect leia-l4  Leia WITH L4, built from --leia-repo (feat/l4-phase-from-present-origin)
+#                  against THIS runtime checkout, registered over the installed
+#                  leia-sr row for the run (register_dev_plugin.bat), restored
+#                  afterwards (reg import of the exported row; only the allowlist
+#                  rows this run added are removed; released DLL hash + `dp list`
+#                  verified). Pass = the windowless lines on the real SR weaver.
 #   --expect sim   sim-display is the active DP. Pass = the windowless lines.
 #   --keep         Leave the R2 build installed (default: restore the snapshot).
 #
@@ -31,7 +37,10 @@
 # ordinary Chrome on the box is left alone.
 set -euo pipefail
 
-EXPECT="" BROWSER="" URL="" SECONDS_RUN=25 KEEP=0
+EXPECT="" BROWSER="" URL="" SECONDS_RUN=25 KEEP=0 LEIA_REPO=""
+# The released leia-sr DLL the restore must land back on (2.18.0 on the panel box);
+# override with --leia-released-sha when the box carries another release.
+LEIA_RELEASED_SHA="154b7a87d94c8ff2b5e112c6e734cf014da381d7c125c26be9a0067538b35f12"
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect) EXPECT="$2"; shift 2 ;;
@@ -39,12 +48,20 @@ while [ $# -gt 0 ]; do
     --url) URL="$2"; shift 2 ;;
     --seconds) SECONDS_RUN="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --leia-repo) LEIA_REPO="$2"; shift 2 ;;
+    --leia-released-sha) LEIA_RELEASED_SHA="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 case "$EXPECT" in leia|leia-l4|sim) ;; *) echo "ERROR: --expect leia|leia-l4|sim" >&2; exit 2 ;; esac
 [ -n "$BROWSER" ] && [ -n "$URL" ] || { echo "ERROR: --browser and --url are required" >&2; exit 2; }
 [ -f "$BROWSER" ] || { echo "ERROR: browser not found: $BROWSER" >&2; exit 2; }
+if [ "$EXPECT" = leia-l4 ]; then
+  [ -n "$LEIA_REPO" ] && [ -d "$LEIA_REPO/src/drv_leia" ] || { echo "ERROR: --expect leia-l4 needs --leia-repo <displayxr-leia-plugin checkout>" >&2; exit 2; }
+  LEIA_REPO="$(cd "$LEIA_REPO" && pwd)"
+  grep -q "runtime ADR-060 R2, L4" <<< "$(git -C "$LEIA_REPO" log --oneline -20)" \
+    || { echo "ERROR: $LEIA_REPO HEAD does not carry the L4 commit (feat/l4-phase-from-present-origin)" >&2; exit 2; }
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BROWSER_DIR="$(cd "$(dirname "$BROWSER")" && pwd)"
@@ -79,11 +96,54 @@ cp -f "$PF"/plugins/*.dll "$SNAP/plugins/" 2>/dev/null || true
 reg query 'HKLM\Software\DisplayXR\Runtime' //v Version //reg:64 2>/dev/null | awk '/Version/{print $3}' > "$SNAP/Version.txt" || true
 echo "== snapshot: $SNAP (Version $(cat "$SNAP/Version.txt" 2>/dev/null))"
 
+ALLOW_KEY='HKLM\Software\DisplayXR\Trust\Allowlist'
+LEIA_KEY='HKLM\Software\DisplayXR\DisplayProcessors\leia-sr'
+allowlist_names() { reg query "$ALLOW_KEY" //reg:64 2>/dev/null | awk '/REG_SZ/{print $1}' | sort || true; }
+
+# leia-l4: put the exported released row back and drop the allowlist rows this
+# run added (and only those), listing them. No installer run: on this box an
+# installer cascades, and a service an installer restarts can fall to sim-display.
+leia_restore() {
+  [ "$EXPECT" = leia-l4 ] && [ -f "$SNAP/leia-sr.reg" ] || return 0
+  echo "== restoring the released leia-sr row"
+  reg delete "$LEIA_KEY" //f //reg:64 >/dev/null 2>&1 || true
+  reg import "$(cygpath -w "$SNAP/leia-sr.reg")" //reg:64 >/dev/null 2>&1 \
+    || echo "WARN: reg import of $SNAP/leia-sr.reg failed — import it by hand" >&2
+  allowlist_names > "$SNAP/allowlist.after"
+  local added
+  added="$(comm -13 "$SNAP/allowlist.before" "$SNAP/allowlist.after" || true)"
+  if [ -n "$added" ]; then
+    echo "== Trust\\Allowlist rows added by this run (removing):"
+    while read -r v; do
+      [ -n "$v" ] || continue
+      echo "   $v"
+      reg delete "$ALLOW_KEY" //v "$v" //f //reg:64 >/dev/null 2>&1 || echo "   WARN: could not delete $v" >&2
+    done <<< "$added"
+  else
+    echo "== no Trust\\Allowlist rows were added by this run"
+  fi
+}
+
+# leia-l4: after the service restart, the row and DLL must be the released ones.
+leia_verify() {
+  [ "$EXPECT" = leia-l4 ] && [ -f "$SNAP/leia-sr.reg" ] || return 0
+  local bin sha
+  bin="$(reg query "$LEIA_KEY" //v Binary //reg:64 2>/dev/null | awk -F'REG_SZ' '/Binary/{gsub(/^[ \t]+/,"",$2); print $2}')"
+  sha="$(sha256sum "$(cygpath -u "$bin")" 2>/dev/null | awk '{print tolower($1)}')"
+  echo "== leia-sr row Binary=$bin sha256=$sha"
+  [ "$sha" = "$LEIA_RELEASED_SHA" ] && echo "   released DLL hash OK" || echo "   WARN: hash != the released $LEIA_RELEASED_SHA" >&2
+  "$PF/displayxr-cli.exe" dp list 2>&1 | grep -i "leia" || true
+  "$PF/displayxr-cli.exe" info 2>&1 | grep -iE "plug-?in|leia" | head -5 || true
+}
+
 restore() {
   if [ "$KEEP" = 1 ]; then
     echo "== --keep: the R2 build stays installed; snapshot kept at $SNAP"
+    [ "$EXPECT" = leia-l4 ] && [ -f "$SNAP/leia-sr.reg" ] && \
+      echo "== --keep: the DEV leia-sr stays registered; restore later with: reg import \"$(cygpath -w "$SNAP/leia-sr.reg")\" /reg:64 (allowlist rows before the run: $SNAP/allowlist.before)"
     return
   fi
+  leia_restore
   echo "== restoring the snapshot"
   close_dxr_browser
   taskkill //F //IM displayxr-service.exe >/dev/null 2>&1 || true
@@ -95,12 +155,43 @@ restore() {
   explorer.exe "C:\\Program Files\\DisplayXR\\Runtime\\displayxr-service.exe" || true  # explorer.exe exits non-zero on success
   sleep 3
   echo "== restored; service restarted non-elevated. Snapshot kept at $SNAP (delete when satisfied)"
+  leia_verify
 }
 trap restore EXIT
 
 # 2. Build + push (the only sanctioned way onto Program Files).
 cmd //c "scripts\\build_windows.bat build"
 bash scripts/push-runtime-pf.sh --browser-dir "$BROWSER_DIR"
+
+# 2b. leia-l4: build the L4 plug-in against THIS runtime checkout and register it
+#     over the installed leia-sr row (export first, so the restore can put it back).
+if [ "$EXPECT" = leia-l4 ]; then
+  reg export "$LEIA_KEY" "$(cygpath -w "$SNAP/leia-sr.reg")" //y //reg:64 >/dev/null \
+    || { echo "ERROR: could not export $LEIA_KEY — not touching the plug-in" >&2; exit 1; }
+  allowlist_names > "$SNAP/allowlist.before"
+  echo "== leia-sr row exported to $SNAP/leia-sr.reg ($(wc -l < "$SNAP/allowlist.before") allowlist rows before)"
+  # Through .cmd files: paths here may contain spaces, and quotes do not survive an
+  # inline `cmd //c "..."` from MSYS intact.
+  { printf '%s\r\n' '@echo off'
+    printf 'set "DXR_RUNTIME_SOURCE_DIR=%s"\r\n' "$(cygpath -w "$ROOT")"
+    printf 'cd /d "%s" || exit /b 1\r\n' "$(cygpath -w "$LEIA_REPO")"
+    printf 'call scripts\\build-windows.bat build\r\n'
+  } > "$SNAP/leia_build.cmd"
+  cmd //c "$(cygpath -w "$SNAP/leia_build.cmd")"
+  DEV_DLL="$(find "$LEIA_REPO/_package" -name DisplayXR-LeiaSR.dll -newer "$SNAP/leia-sr.reg" 2>/dev/null | sed -n 1p)"
+  [ -n "$DEV_DLL" ] || { echo "ERROR: no freshly built DisplayXR-LeiaSR.dll under $LEIA_REPO/_package" >&2; exit 1; }
+  echo "== dev plug-in: $DEV_DLL sha256=$(sha256sum "$DEV_DLL" | awk '{print $1}')"
+  { printf '%s\r\n' '@echo off'
+    printf 'cd /d "%s" || exit /b 1\r\n' "$(cygpath -w "$ROOT")"
+    printf 'call scripts\\register_dev_plugin.bat leia "%s"\r\n' "$(cygpath -w "$DEV_DLL")"
+  } > "$SNAP/leia_register.cmd"
+  cmd //c "$(cygpath -w "$SNAP/leia_register.cmd")"
+  # The dev plug-in loads at the next service start.
+  taskkill //F //IM displayxr-service.exe >/dev/null 2>&1 || true
+  sleep 1
+  explorer.exe "C:\\Program Files\\DisplayXR\\Runtime\\displayxr-service.exe" || true  # exits non-zero on success
+  sleep 3
+fi
 
 # 3. Which DP is active (informational; --expect must match it).
 "$PF/displayxr-cli.exe" dp list 2>&1 | head -20 || true
@@ -146,6 +237,11 @@ case "$EXPECT" in
     has "OWN WINDOWLESS display processor" || { echo "FAIL: no windowless weave DP"; fail=1; }
     has "phased from present origin" || { echo "FAIL: no present-origin push"; fail=1; }
     has "segmenting its window per screen" && echo "   (split rule (a) engaged: the offered screen list became the segment list)"
+    if [ "$EXPECT" = leia-l4 ]; then
+      has "externalRouting=1" || echo "WARN: no 'externalRouting=1' caps line from the plug-in in this log"
+      has "does not hint windowless phase" && { echo "FAIL: the L4 plug-in gave no hint"; fail=1; }
+      has "SR refused EXTERNAL routing for a WINDOWLESS" && { echo "FAIL: SR refused EXTERNAL for the windowless weaver (display-scoped phase)"; fail=1; }
+    fi
     ;;
 esac
 # Never acceptable on any arm:
