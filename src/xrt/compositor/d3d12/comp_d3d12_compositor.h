@@ -67,6 +67,12 @@ comp_d3d12_compositor_sample_release_value(struct comp_d3d12_compositor *c);
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  *
+ * @param windowless_dp_entry #2370: the session screen's DP registry entry
+ *        (`const struct xrt_dp_registry_entry *`, owned by the system
+ *        compositor info) — the source of the hub's windowless DP when a
+ *        texture session takes the client-presents strategy (`DXR_HUB=1`).
+ *        NULL keeps every texture session on this tier's own legs.
+ *
  * @ingroup comp_d3d12
  */
 xrt_result_t
@@ -80,6 +86,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
                              bool transparent_background,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
+                             const void *windowless_dp_entry,
                              struct xrt_compositor_native **out_xc);
 
 /*!

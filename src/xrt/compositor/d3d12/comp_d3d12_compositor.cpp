@@ -16,6 +16,7 @@
 #include "comp_d3d12_outcomp.h"
 #include "comp_d3d12_segments.h" // multi-screen M6 (D3D12)
 #include "util/comp_segments_route.h"
+#include "util/comp_texture_target_win32.h" // #2370: the client-presents target read
 #include "xrt/xrt_screen.h"
 
 // #918 D12-3 — the output-device split: the activation decision and the
@@ -370,6 +371,13 @@ struct comp_d3d12_compositor
 		struct comp_hub_d3d11 *split;
 		struct comp_d3d12_deposit *dep;
 		bool active;
+		/*!
+		 * #2370: the reroute runs the hub's CLIENT-PRESENTS presenter strategy
+		 * for a texture session: the hub weaves into the app's shared texture
+		 * and this queue GPU-waits the hub's release before the app's own use
+		 * of it. No repaint. Set with `active`.
+		 */
+		bool client_presents;
 		//! The DP canvas rect the frame path last published (repaint replays it).
 		struct xrt_rect canvas;
 		//! Change-detection for the scratch->plane copies (planes are
@@ -503,6 +511,12 @@ struct comp_d3d12_compositor
 
 	//! True if shared texture mode is active (offscreen rendering).
 	bool has_shared_texture;
+
+	//! #2370: the app's shared-texture HANDLE (borrowed), for the hub's client-presents open.
+	void *shared_texture_handle;
+
+	//! #2370: the session screen's DP registry entry (system-owned), the hub's windowless DP source.
+	const struct xrt_dp_registry_entry *client_entry;
 
 	//! Transparent session (#573): the DP composes-under-bg. With
 	//! DXR_PRESENT_OPAQUE (#833) this also flips the Local2D composite into
@@ -2591,12 +2605,172 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 }
 #endif // COMP_D3D12_HAVE_D3D11_FILL_ARM
 
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+/*!
+ * #2370: `DXR_HUB=1` — the explicit opt-in a texture session needs to take the
+ * hub's client-presents strategy (default OFF while it is validated). Read
+ * once; any other value (or unset) keeps the tier's own legs.
+ */
+static bool
+d3d12_client_presents_requested(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_HUB");
+		on = (e != nullptr && e[0] != '\0' && comp_split_gate_parse_requested(e)) ? 1 : 0;
+	}
+	return on == 1;
+}
+
+/*!
+ * #2370: this frame's client-presents target — the app's window client area
+ * on the desktop (device px, read under a per-monitor-v2 pin through ADR-060
+ * R1's resolve, clamped to the shared texture). The D3D12 tier carries no v9
+ * target binding yet, so the reference window + rect is the windowHandle anchor
+ * and its whole client area. False when the window is gone or empty.
+ */
+static bool
+d3d12_client_target(struct comp_d3d12_compositor *c, struct comp_seg_rect *out)
+{
+	if (c->app_hwnd == nullptr || !IsWindow(c->app_hwnd) || c->shared_texture == nullptr) {
+		return false;
+	}
+	comp_texture_target_pfn_set_thread_dpi_ctx set_ctx = comp_texture_target_dpi_setter();
+	DPI_AWARENESS_CONTEXT prev = nullptr;
+	if (set_ctx != nullptr) {
+		prev = set_ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+	}
+	RECT rc = {};
+	const BOOL ok = GetClientRect(c->app_hwnd, &rc);
+	if (set_ctx != nullptr && prev != nullptr) {
+		(void)set_ctx(prev);
+	}
+	if (!ok || rc.right <= 0 || rc.bottom <= 0) {
+		return false;
+	}
+	struct comp_texture_target tt = {};
+	tt.bound = true;
+	tt.ref = c->app_hwnd;
+	tt.w = (uint32_t)rc.right;
+	tt.h = (uint32_t)rc.bottom;
+	const D3D12_RESOURCE_DESC td = c->shared_texture->GetDesc();
+	struct comp_texture_target_resolved r = {};
+	if (!comp_texture_target_resolve_win32(&tt, (uint32_t)td.Width, (uint32_t)td.Height, &r)) {
+		return false;
+	}
+	*out = r.screen;
+	return true;
+}
+
+/*!
+ * #2370: Stage A of the hub's CLIENT-PRESENTS strategy for a texture session —
+ * the #1264 reroute's shape (hub Stage A1, deposit ring, DIRECT wiring), with
+ * the hub on THIS adapter, weaving into the app's shared texture with a
+ * windowless DP. Quiet on failure (the hub's WARN names the rung): nothing is
+ * left standing and the caller's gate refuses `shared_texture_session`, the
+ * pre-#2370 path.
+ */
+static bool
+d3d12_reroute_stage_a_client(struct comp_d3d12_compositor *c, struct xrt_device *xdev)
+{
+	const char *why = nullptr;
+	if (c->app_hwnd == nullptr) {
+		why = "no windowHandle to phase the texture from (the D3D12 tier has no v9 target binding yet)";
+	} else if (c->client_entry == nullptr) {
+		why = "no DP registry entry for the session screen";
+	} else if (c->shared_texture_handle == nullptr || c->dp_factory_d3d11 == nullptr) {
+		why = "no shared texture handle or no D3D11 DP factory";
+	}
+	if (why != nullptr) {
+		U_LOG_W("D3D11 hub client-presents not taken (d3d12): %s (#2370)", why);
+		return false;
+	}
+
+	const LUID app_luid = c->device->GetAdapterLuid();
+	struct comp_hub_d3d11_info si = {};
+	si.xdev = xdev;
+	si.hwnd = nullptr; // nothing is ever bound to a window
+	si.dp_factory_d3d11 = c->dp_factory_d3d11;
+	si.has_shared_texture = true;
+	si.client_presents = true;
+	si.client_texture_handle = c->shared_texture_handle;
+	si.windowless_dp_entry = (const void *)c->client_entry;
+	si.transparent_background = c->transparent_background;
+	si.app_timeline_semaphores = true;
+	si.ring_direct = true;
+	si.ring_direct_planes = true;
+	si.render_packed_luid =
+	    ((uint64_t)(uint32_t)app_luid.HighPart << 32) | (uint64_t)(uint32_t)app_luid.LowPart;
+	si.preferred_width = c->settings.preferred.width;
+	si.preferred_height = c->settings.preferred.height;
+
+	const char *short_reason = nullptr;
+	if (comp_hub_d3d11_stage_a(&si, &c->reroute.split, &short_reason) != XRT_SUCCESS || c->reroute.split == NULL) {
+		c->reroute.split = nullptr;
+		return false;
+	}
+
+	uint32_t sys_w = 0, sys_h = 0;
+	if (xdev->rendering_mode_count > 0) {
+		u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &sys_w, &sys_h);
+	}
+	if (sys_w == 0 || sys_h == 0) {
+		sys_w = c->settings.preferred.width;
+		sys_h = c->settings.preferred.height;
+	}
+	struct comp_hub_d3d11_handoff handoff = {};
+	void *cons = nullptr;
+	bool ok = comp_d3d12_deposit_create(c->device, sys_w, sys_h, &c->reroute.dep) == XRT_SUCCESS &&
+	          c->reroute.dep != NULL && comp_d3d12_deposit_get_handoff(c->reroute.dep, &handoff) &&
+	          comp_hub_d3d11_wire_bridge(c->reroute.split, &handoff);
+	if (ok) {
+		// The handoff fence: this queue GPU-waits it before the app's use of
+		// the texture, and before any rewrite of a slot the hub still reads.
+		cons = comp_hub_d3d11_get_consumer_fence_handle(c->reroute.split);
+		ok = cons != nullptr && comp_d3d12_deposit_bind_consumer_fence(c->reroute.dep, cons);
+	}
+	if (!ok) {
+		U_LOG_W("D3D11 hub client-presents (d3d12): the deposit ring or its DIRECT wiring failed — this tier's "
+		        "own legs compose (#2370)");
+		comp_d3d12_deposit_destroy(&c->reroute.dep);
+		comp_hub_d3d11_destroy(&c->reroute.split);
+		return false;
+	}
+
+	if (xdev->hmd != NULL) {
+		c->split_panel_w = xdev->hmd->screens[0].w_pixels;
+		c->split_panel_h = xdev->hmd->screens[0].h_pixels;
+	}
+	comp_hub_d3d11_set_plane_format(c->reroute.split, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM);
+	comp_hub_d3d11_log_placement(c->reroute.split, "d3d12");
+	c->reroute.active = true;
+	c->reroute.client_presents = true;
+	// The weave runs on the app's adapter (the app presents): the native
+	// texture session's `weave placement:` line, token and all.
+	c->split_off_reason = COMP_SPLIT_REASON_SHARED_TEXTURE;
+	if (c->seg_screens != nullptr && c->seg_sys_info != nullptr) {
+		comp_hub_d3d11_set_screens(c->reroute.split, c->seg_screens, c->seg_sys_info, c->seg_pinned_display_id);
+	}
+	return true;
+}
+#endif
+
 static void
 d3d12_split_stage_a(struct comp_d3d12_compositor *c,
                     struct xrt_device *xdev,
                     int32_t display_screen_left,
                     int32_t display_screen_top)
 {
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	/*
+	 * #2370: a texture session with `DXR_HUB=1` tries the hub's client-presents
+	 * strategy first; on any refusal the gate below refuses
+	 * `shared_texture_session` and this tier's own legs compose, as before.
+	 */
+	if (c->has_shared_texture && d3d12_client_presents_requested() && d3d12_reroute_stage_a_client(c, xdev)) {
+		return;
+	}
+#endif
 	const uint64_t stage_a_start_ns = os_monotonic_get_ns();
 	double stage_a_bridge_ms = 0.0;
 	HRESULT hr = S_OK;
@@ -6730,6 +6904,12 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			                           c->reroute.capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
 			                           c->reroute.capture.path, woven);
 		}
+		if (c->reroute.client_presents) {
+			// #2370: this frame's target, read NOW (a drag moves it).
+			struct comp_seg_rect tgt = {};
+			const bool tgt_ok = d3d12_client_target(c, &tgt);
+			comp_hub_d3d11_set_client_target(c->reroute.split, tgt_ok, tgt.x, tgt.y, tgt.w, tgt.h);
+		}
 		const bool rr_wove =
 		    comp_hub_d3d11_weave_and_present(c->reroute.split, /*is_repaint=*/false, &rr_canvas);
 		{
@@ -6748,8 +6928,18 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		c->repaint.view_h = c->eff_layout.tile_h;
 		c->repaint.cols = c->eff_layout.cols;
 		c->repaint.rows = c->eff_layout.rows;
-		c->repaint.armed = rr_wove;
-		if (rr_wove) {
+		c->repaint.armed = rr_wove && !c->reroute.client_presents;
+		if (c->reroute.client_presents) {
+			/*
+			 * #2370: THE HANDOFF. The app's queue GPU-waits the hub's write of
+			 * its texture before anything it submits next (its blit / present
+			 * of it): the native texture path's single-queue ordering, across
+			 * devices. No CPU wait; no repaint (comp_hub_d3d11_repaint).
+			 */
+			comp_d3d12_deposit_plane_wait_hub(c->reroute.dep, c->command_queue,
+			                                  comp_hub_d3d11_get_plane_release_value(c->reroute.split));
+		}
+		if (rr_wove && !c->reroute.client_presents) {
 			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
 			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 		}
@@ -7601,6 +7791,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
                              bool transparent_background,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
+                             const void *windowless_dp_entry,
                              struct xrt_compositor_native **out_xc)
 {
 	if (d3d12_device == nullptr) {
@@ -7746,6 +7937,8 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->shared_texture = nullptr;
 	c->shared_texture_rtv_heap = nullptr;
 	c->has_shared_texture = false;
+	c->shared_texture_handle = nullptr;
+	c->client_entry = (const struct xrt_dp_registry_entry *)windowless_dp_entry;
 	c->tap_postcomposite_pending = false;
 	c->tap_postcomposite_idx = 0;
 	if (shared_texture_handle != nullptr) {
@@ -7759,6 +7952,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			return XRT_ERROR_D3D;
 		}
 		c->has_shared_texture = true;
+		c->shared_texture_handle = shared_texture_handle;
 
 		// #747: name it. The D3D12 debug layer identifies resources by name, and
 		// with none set every barrier complaint reads "Unnamed ID3D12Resource
@@ -7947,7 +8141,8 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		// this campaign measured (found on the first Unity verdict run).
 		bool have_fill_surface = c->target != nullptr;
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
-		have_fill_surface = have_fill_surface || c->reroute.active;
+		// #2370: client-presents has no replay (the app presents).
+		have_fill_surface = have_fill_surface || (c->reroute.active && !c->reroute.client_presents);
 #endif
 		if (c->repaint.enabled == 1 && have_fill_surface) {
 			c->repaint_quit.store(false);

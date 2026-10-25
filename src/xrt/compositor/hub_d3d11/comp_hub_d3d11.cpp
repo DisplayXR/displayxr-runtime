@@ -65,6 +65,8 @@
 
 #include "os/os_threading.h"
 #include "util/comp_segments.h"
+#include "util/comp_dp_windowless_d3d11.h" // #2370 client-presents: the windowless DP rule
+#include "util/comp_frame_witness.h"       // #2370 client-presents: no target, so its own witness
 
 // #2342 P2c: the hub's capture site encodes its own PNGs. STB_IMAGE_WRITE_STATIC
 // scopes the symbols to this TU (the tiers that link the hub carry their own).
@@ -85,6 +87,36 @@ struct comp_hub_d3d11
 	HWND hwnd;
 	void *dp_factory_d3d11;
 	bool transparent_background;
+
+	/*!
+	 * #2370: the CLIENT-PRESENTS presenter strategy (comp_hub_d3d11_info::
+	 * client_presents). @ref target is NULL and stays NULL: the weave writes
+	 * @ref client's texture and the caller presents it.
+	 */
+	bool client_presents;
+	struct
+	{
+		ID3D11Texture2D *tex;        //!< the caller's shared texture, opened on @ref out_dev
+		ID3D11RenderTargetView *rtv; //!< the weave's target
+		uint32_t w, h;               //!< its extent
+		DXGI_FORMAT fmt;
+		//! This frame's target on the desktop (comp_hub_d3d11_set_client_target).
+		bool target_valid;
+		struct comp_seg_rect target;
+		//! The windowless primary DP's screen origin, desktop device px.
+		int32_t panel_left, panel_top;
+		bool origin_logged;
+		int32_t origin_x, origin_y;
+		//! Display period for the DP's frame timing (no target to ask).
+		uint64_t period_ns;
+		//! What the last weave did (comp_hub_d3d11_get_client_weave_state).
+		bool segmented;
+		bool any_flat;
+		uint64_t handoffs;
+		uint64_t repaints_refused;
+		bool repaint_logged;
+		bool clamp_logged;
+	} client;
 
 	/*!
 	 * The panel's requested 2D/3D state, latched from every successful
@@ -580,6 +612,119 @@ split_make_dp(struct comp_hub_d3d11 *s)
 	// this is always false — stated rather than assumed.
 	xrt_display_processor_d3d11_set_shared_texture_present(s->dp, false);
 	return true;
+}
+
+/*!
+ * #2370: the client-presents strategy has no swapchain, so the target's frame
+ * witness never runs; this one counts its weaves and its handoffs (the
+ * caller's present is out of sight, so "present" here = the texture handed
+ * back). Same DXR_FRAME_WITNESS switch and line shape as every other site.
+ */
+static comp_frame_witness g_frame_witness_hub_client{"d3d11-hub-client"};
+
+/*!
+ * #2370: the client-presents weaver — a WINDOWLESS primary DP for the session
+ * screen, phased from the caller's target (ADR-060 R2's contract, one rule
+ * shared with the native tier: comp_dp_make_windowless_d3d11). Same single
+ * creation point as @ref split_make_dp: it succeeds and becomes the session's
+ * weaver, or nothing was created at all.
+ */
+static bool
+split_make_client_dp(struct comp_hub_d3d11 *s, const struct xrt_dp_registry_entry *e)
+{
+	if (split_test_fake_dp_refuse()) {
+		U_LOG_W("DXR_TEST_FAKE_DP_REFUSE=1: refusing the client-presents display processor (test)");
+		return false;
+	}
+	const char *why = nullptr;
+	xrt_result_t ret = XRT_SUCCESS;
+	if (!comp_dp_make_windowless_d3d11(e, s->out_dev, s->out_ctx, &s->dp, &why, &ret)) {
+		U_LOG_W(
+		    "D3D11 hub client-presents: no windowless display processor (%s%s%s, error %d) — the session "
+		    "needs XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN (ADR-060 R2) to weave a texture it does not "
+		    "present (#2370)",
+		    why, e != nullptr ? ", plug-in " : "", e != nullptr ? e->plugin_id : "", (int)ret);
+		s->dp = nullptr;
+		return false;
+	}
+	s->client.panel_left = e->screen_left;
+	s->client.panel_top = e->screen_top;
+	// The CALLER presents (client_presents=true), and the target is its shared
+	// texture — the native texture tier's two session settings, verbatim.
+	xrt_display_processor_d3d11_set_transparent_background(s->dp, s->transparent_background,
+	                                                       /*client_presents=*/true);
+	xrt_display_processor_d3d11_set_shared_texture_present(s->dp, true);
+	U_LOG_W(
+	    "D3D11 hub client-presents: WINDOWLESS primary DP from '%s' (screen at %d,%d %ux%u) on the hub device — "
+	    "phased from the caller's target via set_present_origin; no window is ever handed to the vendor "
+	    "(#2370, ADR-060 R2)",
+	    e->plugin_id, e->screen_left, e->screen_top, e->pixel_width, e->pixel_height);
+	return true;
+}
+
+/*!
+ * #2370: open the caller's shared texture on the hub device — an NT handle
+ * (`OpenSharedResource1`, what a D3D12 caller shares) or a legacy share handle
+ * (`OpenSharedResource`, what `D3D11_RESOURCE_MISC_SHARED` gives) — and make
+ * the weave's render-target view. Same adapter by construction (the hub device
+ * is on the caller's adapter).
+ */
+static bool
+split_open_client_texture(struct comp_hub_d3d11 *s, void *handle)
+{
+	auto &cl = s->client;
+	if (handle == nullptr) {
+		return false;
+	}
+	HRESULT hr = E_FAIL;
+	ID3D11Device1 *d1 = nullptr;
+	if (SUCCEEDED(s->out_dev->QueryInterface(__uuidof(ID3D11Device1), (void **)&d1)) && d1 != nullptr) {
+		hr = d1->OpenSharedResource1((HANDLE)handle, __uuidof(ID3D11Texture2D), (void **)&cl.tex);
+		d1->Release();
+	}
+	if (FAILED(hr) || cl.tex == nullptr) {
+		cl.tex = nullptr;
+		hr = s->out_dev->OpenSharedResource((HANDLE)handle, __uuidof(ID3D11Texture2D), (void **)&cl.tex);
+	}
+	if (FAILED(hr) || cl.tex == nullptr) {
+		U_LOG_W("D3D11 hub client-presents: could not open the caller's shared texture %p on the hub device "
+		        "(hr=0x%08lx)",
+		        handle, (unsigned long)hr);
+		cl.tex = nullptr;
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	cl.tex->GetDesc(&td);
+	cl.w = td.Width;
+	cl.h = td.Height;
+	cl.fmt = td.Format;
+	// A NULL desc, exactly as the native tier makes its RTV on the same texture.
+	hr = s->out_dev->CreateRenderTargetView(cl.tex, nullptr, &cl.rtv);
+	if (FAILED(hr) || cl.rtv == nullptr) {
+		U_LOG_W("D3D11 hub client-presents: no render-target view on the caller's texture (format %u, "
+		        "hr=0x%08lx)",
+		        (unsigned)td.Format, (unsigned long)hr);
+		cl.rtv = nullptr;
+		cl.tex->Release();
+		cl.tex = nullptr;
+		return false;
+	}
+	U_LOG_W("D3D11 hub client-presents: the caller's shared texture %ux%u format=%u is the weave target",
+	        td.Width, td.Height, (unsigned)td.Format);
+	return true;
+}
+
+static void
+split_release_client_texture(struct comp_hub_d3d11 *s)
+{
+	if (s->client.rtv != nullptr) {
+		s->client.rtv->Release();
+		s->client.rtv = nullptr;
+	}
+	if (s->client.tex != nullptr) {
+		s->client.tex->Release();
+		s->client.tex = nullptr;
+	}
 }
 
 /*!
@@ -1084,6 +1229,8 @@ split_release_out(struct comp_hub_d3d11 *s)
 	 * that follows a retire binds the window again.
 	 */
 	split_segments_release(s);
+	// #2370: the caller's texture view goes with the device it was opened on.
+	split_release_client_texture(s);
 	/*
 	 * The weaver dies BEFORE its device, and before the target it was writing
 	 * into is gone — the (hwnd, device) bind key means a weaver left alive here
@@ -1237,7 +1384,14 @@ split_segments_update(struct comp_hub_d3d11 *s, uint32_t tgt_w, uint32_t tgt_h, 
 {
 	bool split = false;
 	struct comp_seg_rect win = {0, 0, 0, 0};
-	if (s->seg_screens != nullptr && s->seg_sys_info != nullptr && s->hwnd != nullptr && s->dp != nullptr) {
+	if (s->client_presents) {
+		// #2370: the segment window IS the caller's target on the desktop
+		// (ADR-060 §2: one resolve feeds phase, canvas and segments).
+		if (s->seg_screens != nullptr && s->seg_sys_info != nullptr && s->dp != nullptr &&
+		    s->client.target_valid) {
+			win = s->client.target;
+		}
+	} else if (s->seg_screens != nullptr && s->seg_sys_info != nullptr && s->hwnd != nullptr && s->dp != nullptr) {
 		RECT rc = {};
 		POINT org = {0, 0};
 		if (GetClientRect(s->hwnd, &rc) && ClientToScreen(s->hwnd, &org)) {
@@ -1257,7 +1411,14 @@ split_segments_update(struct comp_hub_d3d11 *s, uint32_t tgt_w, uint32_t tgt_h, 
 			}
 			if (s->segments == nullptr) {
 				s->segments = comp_d3d11_segments_create(s->out_dev);
-				if (s->segments != nullptr) {
+				if (s->segments != nullptr && s->client_presents) {
+					// #2370: no window to hand off — the primary DP is
+					// windowless by construction and phases from its origin
+					// on the split path too (ADR-060, R1's segment rule).
+					comp_d3d11_segments_set_screens(s->segments, s->seg_screens, s->seg_sys_info,
+					                                s->seg_pinned_display_id);
+					comp_d3d11_segments_set_primary_phases_from_origin(s->segments, true);
+				} else if (s->segments != nullptr) {
 					// ADR-047 Amendment 2: the window follows the majority
 					// screen, by swapping this split's own DP.
 					struct comp_d3d11_segments_hwnd_hooks hooks = {};
@@ -1433,6 +1594,135 @@ split_pdt_put(struct comp_hub_d3d11 *s, uint64_t seq, uint64_t pdt_ns);
 static uint64_t
 split_pdt_get(struct comp_hub_d3d11 *s, uint64_t seq);
 
+/*!
+ * #2370: Stage A1 of the CLIENT-PRESENTS presenter strategy. Nothing here is
+ * the scanout adapter's: the caller presents, so the hub's device is made on
+ * the caller's (render) adapter, its weaver is a windowless DP, and its target
+ * is the caller's shared texture. Every refusal is the closed token
+ * `shared_texture_session` (the tier's own legs compose, exactly as before
+ * #2370) behind one WARN naming the rung.
+ */
+static xrt_result_t
+split_stage_a_client(const struct comp_hub_d3d11_info *info,
+                     struct comp_hub_d3d11 **out_split,
+                     const char **out_short_reason)
+{
+	*out_split = NULL;
+	*out_short_reason = COMP_SPLIT_REASON_SHARED_TEXTURE;
+	const uint64_t t0 = os_monotonic_get_ns();
+
+	const uint32_t panel_w =
+	    (info->xdev != NULL && info->xdev->hmd != NULL) ? info->xdev->hmd->screens[0].w_pixels : 0;
+	const uint32_t panel_h =
+	    (info->xdev != NULL && info->xdev->hmd != NULL) ? info->xdev->hmd->screens[0].h_pixels : 0;
+	const char *why = nullptr;
+	if (info->client_texture_handle == NULL) {
+		why = "no shared texture handle";
+	} else if (info->windowless_dp_entry == NULL) {
+		why = "no DP registry entry for the session screen";
+	} else if (info->render_packed_luid == 0) {
+		why = "the caller's adapter LUID is unknown";
+	} else if (panel_w == 0 || panel_h == 0) {
+		why = "no panel dimensions";
+	}
+	if (why != nullptr) {
+		U_LOG_W("D3D11 hub client-presents DISABLED (%s) — the tier's own legs compose (#2370)", why);
+		return XRT_ERROR_COMPOSITOR_NOT_SUPPORTED;
+	}
+
+	struct comp_hub_d3d11 *s = U_TYPED_CALLOC(struct comp_hub_d3d11);
+	if (s == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	os_mutex_init(&s->seg_mutex);
+	os_mutex_init(&s->dp_mutex);
+	s->mutexes_init = true;
+	s->xdev = info->xdev;
+	s->hwnd = NULL; // nothing is ever bound to a window
+	s->dp_factory_d3d11 = info->dp_factory_d3d11;
+	s->transparent_background = info->transparent_background;
+	s->client_presents = true;
+	s->mode_3d = true;
+	s->render_luid = split_luid_from_packed(info->render_packed_luid);
+	s->out_luid = s->render_luid;
+	s->panel_w = panel_w;
+	s->panel_h = panel_h;
+	// The hub device IS on the caller's adapter: DIRECT ingress, no transport.
+	s->same_adapter = true;
+	s->stable_atlas = info->stable_atlas;
+	s->ring_direct = info->ring_direct;
+	s->ring_direct_planes = info->ring_direct_planes;
+	s->direct.cur = -1;
+
+	IDXGIAdapter *adapter = nullptr;
+	{
+		IDXGIFactory4 *f4 = nullptr;
+		HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void **)&f4);
+		if (SUCCEEDED(hr) && f4 != nullptr) {
+			hr = f4->EnumAdapterByLuid(s->render_luid, __uuidof(IDXGIAdapter), (void **)&adapter);
+			if (SUCCEEDED(hr) && adapter != nullptr) {
+				s->out_factory = f4;
+				f4 = nullptr;
+				DXGI_ADAPTER_DESC ad{};
+				if (SUCCEEDED(adapter->GetDesc(&ad))) {
+					wcsncpy_s(s->out_desc, ad.Description, _TRUNCATE);
+				}
+			}
+		}
+		if (f4 != nullptr) {
+			f4->Release();
+		}
+		if (adapter == nullptr) {
+			why = "the caller's adapter could not be resolved by LUID";
+		}
+	}
+	if (why == nullptr) {
+		UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+		D3D_FEATURE_LEVEL got = {};
+		static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+		HRESULT hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels, ARRAYSIZE(levels),
+		                               D3D11_SDK_VERSION, &s->out_dev, &got, &s->out_ctx);
+		if (FAILED(hr) || s->out_dev == nullptr || s->out_ctx == nullptr) {
+			why = "D3D11CreateDevice failed on the caller's adapter";
+		}
+	}
+	if (adapter != nullptr) {
+		adapter->Release();
+	}
+	if (why == nullptr) {
+		// The vendor DP may touch the context from its own threads (as on the
+		// swapchain strategy).
+		ID3D10Multithread *omt = nullptr;
+		if (SUCCEEDED(s->out_dev->QueryInterface(__uuidof(ID3D10Multithread), (void **)&omt)) && omt != nullptr) {
+			omt->SetMultithreadProtected(TRUE);
+			omt->Release();
+		}
+		if (!split_make_client_dp(s, (const struct xrt_dp_registry_entry *)info->windowless_dp_entry)) {
+			why = "the plug-in cannot weave this screen windowless";
+		}
+	}
+	if (why == nullptr && !split_open_client_texture(s, info->client_texture_handle)) {
+		why = "the caller's shared texture could not be opened on the hub device";
+	}
+	if (why != nullptr) {
+		split_release_out(s);
+		split_destroy_mutexes(s);
+		free(s);
+		U_LOG_W("D3D11 hub client-presents DISABLED (%s) — the tier's own legs compose (#2370)", why);
+		return XRT_ERROR_COMPOSITOR_NOT_SUPPORTED;
+	}
+
+	s->diag_window_ns = os_monotonic_get_ns();
+	*out_split = s;
+	*out_short_reason = nullptr;
+	U_LOG_W(
+	    "D3D11 hub client-presents: stage A1 took %.1f ms (device on the CALLER's adapter '%ls' "
+	    "LUID=%08lx:%08lx + windowless DP + the caller's texture; no swapchain — the caller presents)",
+	    (double)(os_monotonic_get_ns() - t0) / 1.0e6, s->out_desc, (unsigned long)s->out_luid.HighPart,
+	    (unsigned long)s->out_luid.LowPart);
+	return XRT_SUCCESS;
+}
+
 extern "C" xrt_result_t
 comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
                        struct comp_hub_d3d11 **out_split,
@@ -1440,6 +1730,12 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
 {
 	*out_split = NULL;
 	*out_short_reason = COMP_SPLIT_REASON_KILLED_BY_ENV;
+
+	// #2370: the client-presents strategy has its own Stage A1 (no scanout
+	// adapter, no swapchain); the split gate below is the swapchain strategy's.
+	if (info->client_presents && info->has_shared_texture) {
+		return split_stage_a_client(info, out_split, out_short_reason);
+	}
 
 	if (!comp_split_gate_env_requested()) {
 		return XRT_ERROR_COMPOSITOR_NOT_SUPPORTED;
@@ -1844,6 +2140,26 @@ comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11
 	 * to the bridge if any piece of the direct wiring is unavailable;
 	 * DXR_HUB_INGRESS=xbridge forces the bridge, as the A/B control.
 	 */
+	if (s->client_presents) {
+		/*
+		 * #2370: the client-presents hub is on the caller's adapter by
+		 * construction, and DIRECT is its only ingress: an xbridge ring would
+		 * be a transport copy with nowhere to go (there is no scanout device),
+		 * and its keyed-mutex ring shape has no consumer fence to hand the
+		 * texture back with. No DIRECT, no hub — the caller refuses by name.
+		 */
+		if ((s->stable_atlas || s->ring_direct) && handoff->keyed_mutex == nullptr &&
+		    split_wire_direct(s, handoff)) {
+			s->ingress_reason = nullptr;
+			U_LOG_W("D3D11 hub client-presents: stage A2 (direct) took %.1f ms",
+			        (double)(os_monotonic_get_ns() - t0) / 1.0e6);
+			return true;
+		}
+		U_LOG_W("D3D11 hub client-presents: DIRECT ingress unavailable (%s) — not wired (#2370)",
+		        (s->stable_atlas || s->ring_direct) ? "fence wiring failed (or a keyed-mutex deposit)"
+		                                            : "the producer does not honour the DIRECT contract");
+		return false;
+	}
 	if (!s->same_adapter) {
 		s->ingress_reason = COMP_HUB_INGRESS_REASON_CROSS_ADAPTER;
 	} else if (split_direct_forced_off()) {
@@ -3569,6 +3885,14 @@ split_wire_direct(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11_handoff 
 	d.km = km;
 	d.cur = -1;
 	d.active = true;
+	if (s->client_presents) {
+		U_LOG_W(
+		    "D3D11 hub ACTIVE (client-presents): weave moves to the hub device on '%ls' LUID=%08lx:%08lx, the "
+		    "caller's own adapter; the producer's atlas is read IN PLACE (DIRECT) and the weave is written "
+		    "into the caller's texture, handed back on the consumer fence (#2370)",
+		    s->out_desc, (unsigned long)s->out_luid.HighPart, (unsigned long)s->out_luid.LowPart);
+		return true;
+	}
 	U_LOG_W(
 	    "D3D11 hub ACTIVE: weave/repaint/present move to '%ls' LUID=%08lx:%08lx (app "
 	    "device on LUID=%08lx:%08lx); the producer's atlas is read IN PLACE on this device — DIRECT "
@@ -4033,6 +4357,183 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 }
 
 /*!
+ * #2370: the CLIENT-PRESENTS weave — split_weave_direct's ordering, written
+ * into the caller's shared texture instead of a back buffer, with no Present.
+ *
+ * Ordering, both ways on the GPU, no CPU wait (ADR-055):
+ *  - IN: the producer fence. The caller's frame-N passes signal it on its
+ *    immediate context, and everything the caller did with the texture after
+ *    the previous handoff (its blit / present of frame N-1) precedes those
+ *    passes there — so waiting it orders this write after the caller's last
+ *    read as well as after the atlas.
+ *  - OUT: the consumer fence, signalled once the weave, the composite and an
+ *    armed capture have recorded; the caller's context waits it in
+ *    comp_hub_d3d11_pre_render at the end of its frame submit. The flush below
+ *    is what lets the caller's queue ever see the signal (there is no Present
+ *    to flush it).
+ *
+ * App thread, compositor mutex held. Exactly one process_atlas per handoff
+ * (per segment on the split path, as natively).
+ */
+static bool
+split_weave_client(struct comp_hub_d3d11 *s, bool is_repaint)
+{
+	auto &d = s->direct;
+	auto &cl = s->client;
+	if (is_repaint) {
+		// Suppressed by design: see comp_hub_d3d11_repaint.
+		return false;
+	}
+	ID3D11ShaderResourceView *src_srv = d.srv;
+	if (d.ring) {
+		src_srv = d.cur >= 0 ? d.slots[d.cur].srv : nullptr;
+	}
+	if (!d.active || d.km || s->dp == nullptr || cl.rtv == nullptr || !d.have_frame || src_srv == nullptr ||
+	    !cl.target_valid) {
+		s->no_slot++;
+		return false;
+	}
+	if (d.gen != s->layout_gen) {
+		s->stale_refusals++;
+		s->no_slot++;
+		return false;
+	}
+	const uint32_t weave_cols = s->gen_cols != 0 ? s->gen_cols : 1;
+	const uint32_t weave_rows = s->gen_rows != 0 ? s->gen_rows : 1;
+	const uint32_t weave_view_w = d.content_w / weave_cols;
+	const uint32_t weave_view_h = d.content_h / weave_rows;
+	if (weave_view_w == 0 || weave_view_h == 0) {
+		s->no_slot++;
+		return false;
+	}
+
+	// THE ordering edge (IN).
+	if (d.prod_fence != nullptr && d.prod_value != 0) {
+		d.out_ctx4->Wait(d.prod_fence, d.prod_value);
+	}
+
+	// Crop-before-DP: one crop per producer frame (there is no repaint to reuse it).
+	ID3D11ShaderResourceView *atlas_srv = src_srv;
+	if (d.content_w != d.tex_w || d.content_h != d.tex_h) {
+		atlas_srv = split_crop_for_dp(s, atlas_srv, d.content_w, d.content_h);
+		d.cropped_seq = (atlas_srv == s->dp_input_srv) ? d.frame_seq : 0;
+	}
+
+	// ADR-060 section 3: the canvas is the target's size at the texture's
+	// origin, clamped to the texture.
+	const uint32_t tgt_w = cl.w;
+	const uint32_t tgt_h = cl.h;
+	const uint32_t cv_w = cl.target.w < tgt_w ? cl.target.w : tgt_w;
+	const uint32_t cv_h = cl.target.h < tgt_h ? cl.target.h : tgt_h;
+	if ((cv_w != cl.target.w || cv_h != cl.target.h) && !cl.clamp_logged) {
+		cl.clamp_logged = true;
+		U_LOG_W("D3D11 hub client-presents: target %ux%u larger than the shared texture %ux%u — woven clamped",
+		        cl.target.w, cl.target.h, tgt_w, tgt_h);
+	}
+
+	struct comp_seg_rect seg_window = {0, 0, 0, 0};
+	const bool seg_split = split_segments_update(s, tgt_w, tgt_h, &seg_window);
+
+	// No swapchain, so no measured weave->scanout and no vblank grid: the
+	// period only (0 measured = the DP's own heuristic, as on a cold target).
+	xrt_display_processor_d3d11_set_frame_timing(s->dp, 0, cl.period_ns);
+	xrt_display_processor_d3d11_set_predicted_scanout(s->dp, 0);
+
+	// #2317 P2b: the frame's zone-wish publish, ordered after the producer wait.
+	if (d.publish_pending) {
+		d.publish_pending = false;
+		split_publish_zone_wish_now(s, d.publish_seq);
+	}
+
+	D3D11_VIEWPORT vp = {};
+	vp.Width = (float)tgt_w;
+	vp.Height = (float)tgt_h;
+	vp.MaxDepth = 1.0f;
+	s->out_ctx->OMSetRenderTargets(1, &cl.rtv, nullptr);
+	s->out_ctx->RSSetViewports(1, &vp);
+
+	// #2317 P2b: the 2D-under backdrop, from the producer's plane surface.
+	split_set_backdrop(s, -1);
+
+	bool any_flat = false;
+	if (seg_split) {
+		struct comp_d3d11_segments_frame sf = {};
+		sf.content = &s->seg_content_staged;
+		sf.context = s->out_ctx;
+		sf.src_srv = atlas_srv;
+		sf.view_width = weave_view_w;
+		sf.view_height = weave_view_h;
+		sf.tile_columns = weave_cols;
+		sf.tile_rows = weave_rows;
+		sf.src_format = (uint32_t)split_dp_view_format(atlas_srv);
+		sf.target_rtv = cl.rtv;
+		sf.target_width = tgt_w;
+		sf.target_height = tgt_h;
+		sf.canvas.x = 0;
+		sf.canvas.y = 0;
+		sf.canvas.w = cv_w;
+		sf.canvas.h = cv_h;
+		sf.transparent_background = s->transparent_background;
+		sf.atlas_encoding = -1;
+		sf.primary_dp = s->dp;
+		sf.outcomp = split_ensure_outcomp(s) ? s->outcomp : nullptr;
+		sf.client_presents = true; // the caller presents the texture
+		sf.out_any_flat = &any_flat;
+		(void)comp_d3d11_segments_record(s->segments, &sf);
+		s->out_ctx->OMSetRenderTargets(1, &cl.rtv, nullptr);
+		s->out_ctx->RSSetViewports(1, &vp);
+	} else {
+		// ADR-060 R2: the windowless DP's phase = the target's origin on its screen.
+		const int32_t ox = cl.target.x - cl.panel_left;
+		const int32_t oy = cl.target.y - cl.panel_top;
+		xrt_display_processor_d3d11_set_present_origin(s->dp, ox, oy);
+		if (!cl.origin_logged) {
+			cl.origin_logged = true;
+			U_LOG_W(
+			    "D3D11 hub client-presents: windowless DP phased from present origin (%d,%d) — target at "
+			    "(%d,%d) %ux%u, screen at (%d,%d) (#2370)",
+			    ox, oy, cl.target.x, cl.target.y, cl.target.w, cl.target.h, cl.panel_left, cl.panel_top);
+		} else if (ox != cl.origin_x || oy != cl.origin_y) {
+			// A drag: INFO, only on change — never a per-frame WARN.
+			U_LOG_I("D3D11 hub client-presents: set_present_origin -> (%d,%d)", ox, oy);
+		}
+		cl.origin_x = ox;
+		cl.origin_y = oy;
+		xrt_display_processor_d3d11_process_atlas(s->dp, s->out_ctx, atlas_srv, weave_view_w, weave_view_h,
+		                                          weave_cols, weave_rows, (uint32_t)split_dp_view_format(atlas_srv),
+		                                          tgt_w, tgt_h, 0, 0, cv_w, cv_h);
+	}
+	cl.segmented = seg_split;
+	cl.any_flat = any_flat;
+	g_frame_witness_hub_client.count_weave(false, s->mode_3d);
+
+	split_capture_dp_input(s, false, atlas_srv, d.content_w, d.content_h);
+
+	// The masked 2D-over-3D composite (zones / Local2D / authored mask) onto the
+	// caller's texture — the unit, recipe and mask the swapchain strategy runs.
+	(void)split_composite(s, -1, false, cl.tex);
+	// `.woven.png` = the caller's texture, as the caller is about to present it.
+	split_capture_woven(s, false, cl.tex, tgt_w, tgt_h);
+	if (s->post_weave_fn != nullptr) {
+		s->post_weave_fn(s->post_weave_userdata, s->out_dev, s->out_ctx, cl.tex, tgt_w, tgt_h, false);
+	}
+
+	// The handoff (OUT): every read of the atlas and planes and every write of
+	// the texture is recorded. Unbind the texture so no hub state keeps it
+	// bound while the caller uses it.
+	ID3D11RenderTargetView *null_rtv = nullptr;
+	s->out_ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+	if (d.cons_fence != nullptr) {
+		d.cons_value++;
+		d.out_ctx4->Signal(d.cons_fence, d.cons_value);
+	}
+	s->out_ctx->Flush();
+	cl.handoffs++;
+	g_frame_witness_hub_client.count_present();
+	return true;
+}
+
+/*!
  * #2317 P2a review: vet a ring producer's frame for DIRECT before it is
  * recorded. Every failure here would otherwise leave the hub with no frame for
  * the rest of the session (have_frame stays false, every weave is `no_slot`),
@@ -4093,6 +4594,18 @@ static void
 split_direct_to_xbridge(struct comp_hub_d3d11 *s, const char *reason)
 {
 	auto &d = s->direct;
+	if (s->client_presents) {
+		// #2370: client-presents has no xbridge leg (no scanout device to
+		// bridge to): the session stays DIRECT, the offending frame is not
+		// woven, and the texture keeps its last frame. Said once.
+		if (!s->direct_to_xbridge_failed) {
+			s->direct_to_xbridge_failed = true;
+			U_LOG_W("D3D11 hub client-presents: a frame needed the xbridge ingress (%s), which this strategy "
+			        "does not carry — it stays DIRECT (#2370)",
+			        reason != nullptr ? reason : "?");
+		}
+		return;
+	}
 	if (!d.active || !d.ring || s->xbridge != nullptr || s->direct_to_xbridge_failed) {
 		return;
 	}
@@ -4146,6 +4659,11 @@ split_direct_demote_for_planes(struct comp_hub_d3d11 *s)
 extern "C" bool
 comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_rect *canvas)
 {
+	if (s != nullptr && s->client_presents) {
+		// #2370: the canvas is the caller's target (comp_hub_d3d11_set_client_target).
+		(void)canvas;
+		return split_weave_client(s, is_repaint);
+	}
 	if (s != nullptr && s->direct.active) {
 		return split_weave_direct(s, is_repaint, canvas);
 	}
@@ -4406,6 +4924,32 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 }
 
 extern "C" bool
+comp_hub_d3d11_is_client_presents(struct comp_hub_d3d11 *s)
+{
+	return s != nullptr && s->client_presents;
+}
+
+extern "C" void
+comp_hub_d3d11_set_client_target(struct comp_hub_d3d11 *s, bool valid, int32_t x, int32_t y, uint32_t w, uint32_t h)
+{
+	if (s == nullptr || !s->client_presents) {
+		return;
+	}
+	s->client.target_valid = valid && w > 0 && h > 0;
+	s->client.target.x = x;
+	s->client.target.y = y;
+	s->client.target.w = w;
+	s->client.target.h = h;
+}
+
+extern "C" void
+comp_hub_d3d11_get_client_weave_state(struct comp_hub_d3d11 *s, bool *out_segmented, bool *out_any_flat)
+{
+	*out_segmented = s != nullptr && s->client_presents && s->client.segmented;
+	*out_any_flat = s != nullptr && s->client_presents && s->client.any_flat;
+}
+
+extern "C" bool
 comp_hub_d3d11_has_weave_slot(struct comp_hub_d3d11 *s)
 {
 	if (s != nullptr && s->direct.active) {
@@ -4456,6 +5000,10 @@ comp_hub_d3d11_set_predicted_display_time(struct comp_hub_d3d11 *s, uint64_t pre
 extern "C" void
 comp_hub_d3d11_set_display_period(struct comp_hub_d3d11 *s, uint64_t period_ns)
 {
+	if (s != nullptr && s->client_presents && period_ns != 0) {
+		s->client.period_ns = period_ns; // #2370: no target to hold it
+		return;
+	}
 	if (s == nullptr || s->target == nullptr || period_ns == 0) {
 		return;
 	}
@@ -4595,6 +5143,17 @@ comp_hub_d3d11_log_placement(struct comp_hub_d3d11 *s, const char *producer)
 	}
 	const char *why = comp_hub_d3d11_ingress_reason(s);
 	s->placement_logged = true;
+	if (s->client_presents) {
+		// #2370: its own line shape; `presenter=client` is the parse target.
+		U_LOG_W(
+		    "hub placement: hub=1 render=%08lx:%08lx hub_dev=%08lx:%08lx ingress=%s presenter=client — weave on "
+		    "the D3D11 hub's own device into the app's shared texture; the app presents (#2370; %s ring "
+		    "deposit; forced by the DXR_HUB env var)",
+		    (unsigned long)s->render_luid.HighPart, (unsigned long)s->render_luid.LowPart,
+		    (unsigned long)s->out_luid.HighPart, (unsigned long)s->out_luid.LowPart,
+		    s->direct.active ? "direct" : "xbridge", producer != nullptr ? producer : "?");
+		return;
+	}
 	U_LOG_W(
 	    "hub placement: hub=1 render=%08lx:%08lx hub_dev=%08lx:%08lx ingress=%s%s%s%s%s — weave/present on "
 	    "the D3D11 hub's own device (#2317 P2a; %s ring deposit%s)",
@@ -4636,6 +5195,17 @@ comp_hub_d3d11_repaint_pace_wait(void *hold)
 extern "C" enum comp_hub_d3d11_repaint_result
 comp_hub_d3d11_repaint(struct comp_hub_d3d11 *s, bool partition_engaged, const struct xrt_rect *canvas)
 {
+	if (s != nullptr && s->client_presents) {
+		// #2370: suppressed — see the header. Counted, one lifecycle WARN.
+		s->client.repaints_refused++;
+		if (!s->client.repaint_logged) {
+			s->client.repaint_logged = true;
+			U_LOG_W(
+			    "D3D11 hub client-presents: repaint suppressed — the caller presents its texture on its own "
+			    "cadence; a re-weave between its frames has no fence it could wait on (#2370)");
+		}
+		return COMP_HUB_D3D11_REPAINT_NOT_ADMITTED;
+	}
 	if (!comp_hub_d3d11_has_weave_slot(s)) {
 		return COMP_HUB_D3D11_REPAINT_NO_FRAME;
 	}
@@ -4671,6 +5241,16 @@ comp_hub_d3d11_render_diag(struct comp_hub_d3d11 *s)
 			return;
 		}
 		s->diag_window_ns = dnow;
+		if (s->client_presents) {
+			// #2370: the client-presents strategy: no transport, no present.
+			U_LOG_W(
+			    "[RENDER] split=1 hub_ingress=direct presenter=client handoffs=%llu repaints_refused=%llu "
+			    "frames=%llu reopens=%llu no_slot=%llu out_crop=%llu (session totals)",
+			    (unsigned long long)s->client.handoffs, (unsigned long long)s->client.repaints_refused,
+			    (unsigned long long)s->direct.frames, (unsigned long long)s->direct.reopens,
+			    (unsigned long long)s->no_slot, (unsigned long long)s->out_crop);
+			return;
+		}
 		// #2317 P1b: no transport, so no xb_kb / ingress counters to report.
 		U_LOG_W(
 		    "[RENDER] split=1 hub_ingress=direct ring=%d km=%d km_skips=%llu frames=%llu reopens=%llu "
@@ -5131,6 +5711,33 @@ comp_hub_d3d11_has_weave_slot(struct comp_hub_d3d11 *split)
 {
 	(void)split;
 	return false;
+}
+
+extern "C" bool
+comp_hub_d3d11_is_client_presents(struct comp_hub_d3d11 *split)
+{
+	(void)split;
+	return false;
+}
+
+extern "C" void
+comp_hub_d3d11_set_client_target(
+    struct comp_hub_d3d11 *split, bool valid, int32_t x, int32_t y, uint32_t w, uint32_t h)
+{
+	(void)split;
+	(void)valid;
+	(void)x;
+	(void)y;
+	(void)w;
+	(void)h;
+}
+
+extern "C" void
+comp_hub_d3d11_get_client_weave_state(struct comp_hub_d3d11 *split, bool *out_segmented, bool *out_any_flat)
+{
+	(void)split;
+	*out_segmented = false;
+	*out_any_flat = false;
 }
 
 extern "C" void

@@ -178,8 +178,47 @@ struct comp_hub_d3d11_info
 	 */
 	void *dp_factory_d3d11;
 
-	//! The app owns the present — ineligible (`shared_texture_session`).
+	/*!
+	 * The app owns the present (a texture-class session). Ineligible
+	 * (`shared_texture_session`) unless @ref client_presents is also set.
+	 */
 	bool has_shared_texture;
+
+	/*!
+	 * #2370 (ADR-035 D3, ADR-060): the CLIENT-PRESENTS presenter strategy. The
+	 * hub composites, crops and weaves as on the swapchain strategy, but into the
+	 * CALLER's shared texture (@ref client_texture_handle, opened on the hub's
+	 * device): no hub swapchain, no hub Present. The caller presents.
+	 *
+	 * Stage A then differs in three places, each for the same reason — the
+	 * present is the caller's, so the hub follows it:
+	 *  - the hub device is created on the RENDER adapter (the caller's,
+	 *    @ref render_packed_luid), not the scanout adapter: the weave goes where
+	 *    the present is, so no egress copy exists. Ingress is DIRECT only.
+	 *  - the weaver is a WINDOWLESS primary DP for @ref windowless_dp_entry's
+	 *    screen, kept only when it declares
+	 *    XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN (ADR-060 R2); it is phased
+	 *    every weave from the target the caller hands
+	 *    (@ref comp_hub_d3d11_set_client_target). A refusal is
+	 *    `shared_texture_session` — the tier's own legs compose.
+	 *  - @ref hwnd may be NULL; nothing is ever bound to a window.
+	 *
+	 * The handoff back to the caller is the DIRECT consumer fence: signalled
+	 * after the weave and composite wrote the texture, waited GPU-side on the
+	 * caller's context by @ref comp_hub_d3d11_pre_render — which the caller
+	 * issues at the end of its frame submit, so every command it records after
+	 * (its blit / present of the texture) orders after the weave. No CPU wait.
+	 *
+	 * Repaint is suppressed (see @ref comp_hub_d3d11_repaint).
+	 */
+	bool client_presents;
+
+	//! #2370: the caller's shared-texture HANDLE (NT or legacy share), opened on the hub device.
+	void *client_texture_handle;
+
+	//! #2370: the session screen's `const struct xrt_dp_registry_entry *` (owned
+	//! by the system compositor info, outlives the session) — the windowless DP's source.
+	const void *windowless_dp_entry;
 
 	//! Forwarded to the out-device DP and the out-device swapchain.
 	bool transparent_background;
@@ -931,6 +970,15 @@ enum comp_hub_d3d11_repaint_result
  * One replay attempt. Call under the compositor mutex, after the tier's own
  * armed / in-progress / gate tests. @p partition_engaged skips the admission
  * exactly as the native leg does (the #1257 schedule owns the slots).
+ *
+ * #2370: under the client-presents presenter strategy this always returns
+ * @ref COMP_HUB_D3D11_REPAINT_NOT_ADMITTED and weaves nothing. A re-weave
+ * between app frames would write the caller's texture while the caller may be
+ * reading it for its own present, and no fence the caller can see orders the
+ * two (its frame submit is the only point the handoff fence reaches it). The
+ * caller re-presents its last woven texture on its own cadence, or not; a
+ * repaint for texture targets needs an app-visible release fence (a later
+ * revision of the ADR-060 binding). The tier keeps its replay disarmed.
  */
 enum comp_hub_d3d11_repaint_result
 comp_hub_d3d11_repaint(struct comp_hub_d3d11 *split, bool partition_engaged, const struct xrt_rect *canvas);
@@ -1278,6 +1326,34 @@ comp_hub_d3d11_set_post_weave_hook(struct comp_hub_d3d11 *split, comp_hub_d3d11_
  * only on the frame that captures.
  * @{
  */
+
+/*!
+ * #2370: is this hub running the client-presents presenter strategy
+ * (@ref comp_hub_d3d11_info::client_presents)?
+ */
+bool
+comp_hub_d3d11_is_client_presents(struct comp_hub_d3d11 *split);
+
+/*!
+ * #2370 (ADR-060 R1's target binding, consumed as DATA): the rect the caller
+ * draws its shared texture at THIS frame, in desktop device px (the resolved
+ * reference window + rect, `comp_texture_target_resolved::screen`). The next
+ * weave derives everything from it: the canvas (0, 0, w, h) in the texture,
+ * the windowless DP's present origin (rect origin minus its screen's origin),
+ * and the segment window. Call before @ref comp_hub_d3d11_weave_and_present;
+ * @p valid false (the reference window died) makes that weave write nothing.
+ */
+void
+comp_hub_d3d11_set_client_target(
+    struct comp_hub_d3d11 *split, bool valid, int32_t x, int32_t y, uint32_t w, uint32_t h);
+
+/*!
+ * #2370: did the last client-presents weave take the per-screen (segmented)
+ * path, and did any part of it go flat 2D? For the caller's
+ * XrWin32TextureTargetStateDXR reply.
+ */
+void
+comp_hub_d3d11_get_client_weave_state(struct comp_hub_d3d11 *split, bool *out_segmented, bool *out_any_flat);
 
 /*!
  * Arm a capture for the next APP-frame weave (never a repaint). @p path is the
