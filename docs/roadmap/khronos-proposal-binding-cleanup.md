@@ -209,10 +209,19 @@ ABI snapshot test plus its lint check. The snapshot built from these headers is
 **identical, assert for assert (342), to one built from `main`'s headers**, so
 no layout or type value moved.
 
-**Still open:** the Unity provider and `displayxr-demo-mediaplayer` (which
-copies the guarded layer block for xlib and can drop the copy) should include
-the published headers instead of copying values. Those are separate PRs in their
-own repos. Stages 2–3 are parked until #206 moves.
+**Unity:** the plug-in keeps its documented no-source-dependency rule, so its
+hand-written mirror stays. A lint step guards it instead
+(displayxr-unity#422): it diffs every mirrored type value, extension name,
+struct, entry point and SPEC_VERSION against `displayxr-extensions` at a pinned
+sha. A renumbering therefore shows up as a red PR when that sha is bumped,
+instead of a silent wire break. Its first run found two harmless drifts, now
+listed in its `KNOWN_DRIFT` table: the win32 mirror still carries
+`chromaKeyColor` (tail padding), and it still declares the removed
+`xrSetSharedTextureOutputRectDXR` (dormant code only).
+
+**Still open:** `displayxr-demo-mediaplayer` copies the guarded layer block for
+xlib and can drop the copy once this merges. Stages 2–3 are parked until #206
+moves.
 
 ## 7. Coordination with ADR-060 (`#697`, texture target binding)
 
