@@ -342,6 +342,10 @@ struct comp_hub_d3d11_info
 #define COMP_HUB_REASON_GL_NO_CLIP_CONTROL "gl_no_clip_control"
 //! The deposit device, texture, fences or every GL import failed.
 #define COMP_HUB_REASON_GL_DEPOSIT_FAILED "gl_deposit_failed"
+//! The import succeeded but the create-time round-trip probe (GL clears a
+//! sentinel, D3D11 reads one texel back) did not see GL's bytes in the D3D11
+//! texture: weaving would show black or stale content.
+#define COMP_HUB_REASON_GL_DEPOSIT_UNVERIFIED "gl_deposit_unverified"
 /*!
  * Mid-session RETIRE: a frame carried a Local2D layer, a display-zones layer or
  * an authored zone mask. The GL leg's flatten scratches and masks are plain GL

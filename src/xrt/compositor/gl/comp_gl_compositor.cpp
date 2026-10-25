@@ -1245,6 +1245,11 @@ struct comp_gl_compositor
 		void *dp_window;
 		//! The session's last 3D wish, re-sent to a retire's fresh GL DP.
 		bool want_3d;
+		//! The deposit's adapter came from GL_DEVICE_LUID_EXT (placement `luid=`).
+		bool luid_exact;
+		//! A retire handed the HWND back to GL's presenter: log the first
+		//! SwapBuffers after it, once.
+		bool log_first_native_present;
 		//! #867: the predicted display time handed out last (monotonic clamp).
 		uint64_t last_display_time_ns;
 		//! The POST_COMPOSE capture intent handed to the hub this frame.
@@ -5468,6 +5473,7 @@ gl_hub_stage_a2(struct comp_gl_compositor *c, struct gl_interop_adapter *adapter
 	struct comp_gl_deposit_info di = {};
 	di.dxgi_adapter = adapter->adapter;
 	di.luid_exact = adapter->confirmed_same_as_gl;
+	c->hub.luid_exact = di.luid_exact;
 	di.width = c->atlas_tex_width;
 	di.height = c->atlas_tex_height;
 	const char *why = comp_gl_deposit_create(&di, &c->hub.dep);
@@ -5520,6 +5526,7 @@ gl_hub_retire(struct comp_gl_compositor *c, const char *token)
 	c->atlas_texture = c->hub.native_atlas;
 	c->hub.native_atlas = 0;
 	c->repaint.armed = false;
+	c->hub.log_first_native_present = true;
 	if (c->hub.capture.pending) {
 		u_capture_intent_complete(&c->hub.capture, &c->mcp_capture, false);
 	}
@@ -5559,14 +5566,14 @@ gl_hub_log_placement(struct comp_gl_compositor *c,
 	const char *ir = comp_hub_d3d11_ingress_reason(c->hub.split);
 	const char *mr = comp_gl_deposit_import_reason(c->hub.dep);
 	U_LOG_W(
-	    "hub placement: hub=1 render=%08lx:%08lx hub_dev=%08lx:%08lx ingress=%s%s%s import=%s%s%s luid=%s — "
-	    "weave/present on the D3D11 hub's own device, the GL atlas in a D3D11 deposit on the GL adapter "
+	    "hub placement: hub=1 render=%08lx:%08lx hub_dev=%08lx:%08lx ingress=%s%s%s import=%s%s%s sync=%s luid=%s "
+	    "— weave/present on the D3D11 hub's own device, the GL atlas in a D3D11 deposit on the GL adapter "
 	    "(#2317 P3; DXR_HUB=1)",
 	    (unsigned long)rdesc.AdapterLuid.HighPart, (unsigned long)rdesc.AdapterLuid.LowPart,
 	    (unsigned long)(uint32_t)(hl >> 32), (unsigned long)(uint32_t)hl,
 	    comp_hub_d3d11_is_direct(c->hub.split) ? "direct" : "xbridge", ir != NULL ? " ingress_reason=" : "",
 	    ir != NULL ? ir : "", comp_gl_deposit_import_name(c->hub.dep), mr != NULL ? " import_reason=" : "",
-	    mr != NULL ? mr : "", c->gl_context_luid_valid ? "exact" : "heuristic");
+	    mr != NULL ? mr : "", comp_gl_deposit_sync_name(c->hub.dep), c->hub.luid_exact ? "exact" : "heuristic");
 
 	uint64_t render_packed_luid = 0;
 	memcpy(&render_packed_luid, &rdesc.AdapterLuid, sizeof(render_packed_luid));
@@ -5820,7 +5827,18 @@ gl_window_present(struct comp_gl_compositor *c, GLuint atlas_for_present, float 
 		glFlush();
 		gl_dcomp_readback_present_frame(c);
 	} else {
+#ifdef XRT_GL_HUB
+		const BOOL swapped = SwapBuffers(c->hdc);
+		if (c->hub.log_first_native_present) {
+			// #2317 P3 review: the HWND just came back from the hub's DXGI
+			// chain to GL's own presenter; say whether that first present took.
+			c->hub.log_first_native_present = false;
+			U_LOG_W("#2317 GL hub retire: first native SwapBuffers after the retire %s (GetLastError=%lu)",
+			        swapped ? "succeeded" : "FAILED", swapped ? 0ul : (unsigned long)GetLastError());
+		}
+#else
 		SwapBuffers(c->hdc);
+#endif
 		if (c->owns_window && c->own_window != NULL) {
 			comp_d3d11_window_signal_paint_done(c->own_window);
 		}
@@ -8126,10 +8144,12 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		gl_publish_compose_to_atlas(c);
 	}
 	glDisable(GL_FRAMEBUFFER_SRGB);
+#ifdef XRT_GL_HUB
 	if (c->atlas_top_down) {
 		// Every later pass (and the native legs after a retire) is bottom-up.
 		glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
 	}
+#endif
 
 	} // end if (!zero_copy)
 

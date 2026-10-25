@@ -79,6 +79,10 @@ struct comp_gl_deposit
 	uint64_t rel_value;
 
 	// --- nv_dx_interop path ---
+	//! The NON-shared transit texture GL renders into (WGL_NV_DX_interop2 is
+	//! only reliable on a texture the interop device owns outright); the
+	//! deposit context copies it into @ref tex after every unlock.
+	ID3D11Texture2D *iop_tex;
 	HANDLE iop_dev;
 	HANDLE iop_obj;
 	bool locked;
@@ -187,12 +191,19 @@ gl_dep_import_memory_object(struct comp_gl_deposit *dep, PFN_dxr_glImportSemapho
 	glMemoryObjectParameterivEXT(dep->gl_mem, GL_DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
 	/*
 	 * The import size: the driver owns the D3D11 allocation's real size and a
-	 * dedicated D3D11-image import binds the whole resource, so this is the
-	 * texel footprint rounded up to the 64 KiB allocation granularity. A driver
-	 * that disagrees errors here or at the storage call below, and the session
-	 * takes the interop path instead (import_reason=memory_import_failed).
+	 * dedicated D3D11-image import binds the whole resource. D3D11 does not
+	 * report that size, so this is a CONSERVATIVE OVERSIZE: the extent padded
+	 * to 128 texels each way (any tiled layout's footprint) at 4 B/texel,
+	 * rounded up to the 64 KiB allocation granularity. A driver that disagrees
+	 * errors here or at the storage call below (the session then takes the
+	 * interop path, import_reason=memory_import_failed); one that accepts a
+	 * wrong size is caught by the create-time round-trip probe.
 	 */
-	const GLuint64 bytes = (((GLuint64)dep->width * dep->height * 4u) + 0xFFFFu) & ~(GLuint64)0xFFFFu;
+	const GLuint64 pad_w = ((GLuint64)dep->width + 127u) & ~(GLuint64)127u;
+	const GLuint64 pad_h = ((GLuint64)dep->height + 127u) & ~(GLuint64)127u;
+	const GLuint64 bytes = ((pad_w * pad_h * 4u) + 0xFFFFu) & ~(GLuint64)0xFFFFu;
+	U_LOG_W("GL deposit: memory_object import of %ux%u with size %llu bytes", dep->width, dep->height,
+	        (unsigned long long)bytes);
 	// Importing an NT handle does not transfer its ownership (the spec): the
 	// deposit closes tex_share itself at destroy.
 	glImportMemoryWin32HandleEXT(dep->gl_mem, bytes, GL_HANDLE_TYPE_D3D11_IMAGE_EXT, dep->tex_share);
@@ -244,8 +255,21 @@ gl_dep_import_interop(struct comp_gl_deposit *dep)
 		U_LOG_W("GL deposit: wglDXOpenDeviceNV failed (%lu)", GetLastError());
 		return false;
 	}
+	{
+		D3D11_TEXTURE2D_DESC td = {};
+		dep->tex->GetDesc(&td);
+		td.MiscFlags = 0; // NOT shared: the one interop shape this stack writes back reliably
+		HRESULT hr = dep->dx->CreateTexture2D(&td, nullptr, &dep->iop_tex);
+		if (FAILED(hr) || dep->iop_tex == nullptr) {
+			U_LOG_W("GL deposit: interop transit texture create failed: 0x%08lx", (unsigned long)hr);
+			dep->iop_tex = nullptr;
+			dep->CloseDeviceNV(dep->iop_dev);
+			dep->iop_dev = NULL;
+			return false;
+		}
+	}
 	glGenTextures(1, &dep->gl_tex);
-	dep->iop_obj = reg(dep->iop_dev, dep->tex, dep->gl_tex, GL_TEXTURE_2D, WGL_ACCESS_READ_WRITE_NV);
+	dep->iop_obj = reg(dep->iop_dev, dep->iop_tex, dep->gl_tex, GL_TEXTURE_2D, WGL_ACCESS_READ_WRITE_NV);
 	if (dep->iop_obj == NULL) {
 		U_LOG_W("GL deposit: wglDXRegisterObjectNV failed (%lu)", GetLastError());
 		glDeleteTextures(1, &dep->gl_tex);
@@ -268,6 +292,96 @@ gl_dep_import_interop(struct comp_gl_deposit *dep)
 		return false;
 	}
 	return true;
+}
+
+extern "C" const char *
+comp_gl_deposit_sync_name(struct comp_gl_deposit *dep)
+{
+	return dep != nullptr && dep->mo ? "fence" : "lock_copy";
+}
+
+/*!
+ * The create-time ROUND-TRIP PROBE (the VK deposit's, for GL): GL clears the
+ * atlas to a sentinel through the frame path's own publish (begin/end), the
+ * deposit context waits on the producer fence and copies texel (0,0) to a
+ * staging texture, and the CPU reads it back. A mismatch means the import
+ * "worked" but the bytes never reach the D3D11 resource — the failure mode
+ * WGL_NV_DX_interop2 write-back has on a shared texture, and the one a wrong
+ * memory-object size could cause — so the session refuses
+ * (`gl_deposit_unverified`) instead of weaving black. A one-time, BOUNDED CPU
+ * wait (1 s) at create; never on the frame path.
+ */
+static bool
+gl_dep_probe(struct comp_gl_deposit *dep)
+{
+	static const uint8_t want[4] = {0x33, 0x66, 0x99, 0xCC};
+
+	comp_gl_deposit_begin(dep, nullptr);
+	GLint prev = 0;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev);
+	const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	GLuint fbo = 0;
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dep->gl_tex, 0);
+	glClearColor(want[0] / 255.0f, want[1] / 255.0f, want[2] / 255.0f, want[3] / 255.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev);
+	glDeleteFramebuffers(1, &fbo);
+	if (scissor) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	struct comp_hub_d3d11_handoff h = {};
+	comp_gl_deposit_end(dep, /*hub_direct=*/true, &h);
+
+	D3D11_TEXTURE2D_DESC sd = {};
+	sd.Width = 1;
+	sd.Height = 1;
+	sd.MipLevels = 1;
+	sd.ArraySize = 1;
+	sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	sd.SampleDesc.Count = 1;
+	sd.Usage = D3D11_USAGE_STAGING;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	ID3D11Texture2D *staging = nullptr;
+	if (FAILED(dep->dx->CreateTexture2D(&sd, nullptr, &staging)) || staging == nullptr) {
+		U_LOG_W("GL deposit probe: staging texture create failed");
+		return false;
+	}
+	dep->ctx4->Wait(dep->fence, dep->fence_value);
+	const D3D11_BOX box = {0, 0, 0, 1, 1, 1};
+	dep->ctx->CopySubresourceRegion(staging, 0, 0, 0, 0, dep->tex, 0, &box);
+	dep->ctx->Flush();
+
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	HRESULT hr = DXGI_ERROR_WAS_STILL_DRAWING;
+	for (int i = 0; i < 1000 && hr == DXGI_ERROR_WAS_STILL_DRAWING; i++) {
+		hr = dep->ctx->Map(staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			Sleep(1);
+		}
+	}
+	bool ok = false;
+	uint8_t got[4] = {0, 0, 0, 0};
+	if (SUCCEEDED(hr)) {
+		memcpy(got, m.pData, 4);
+		dep->ctx->Unmap(staging, 0);
+		ok = true;
+		for (int k = 0; k < 4; k++) {
+			const int d = (int)got[k] - (int)want[k];
+			ok = ok && d >= -1 && d <= 1;
+		}
+	}
+	staging->Release();
+	if (!ok) {
+		U_LOG_W(
+		    "GL deposit probe: FAILED (import=%s, hr=0x%08lx, read %02x%02x%02x%02x, want %02x%02x%02x%02x) — "
+		    "GL's writes do not reach the D3D11 texture; refusing (gl_deposit_unverified)",
+		    dep->import_name, (unsigned long)hr, got[0], got[1], got[2], got[3], want[0], want[1], want[2],
+		    want[3]);
+	}
+	return ok;
 }
 
 extern "C" const char *
@@ -381,15 +495,22 @@ comp_gl_deposit_create(const struct comp_gl_deposit_info *info, struct comp_gl_d
 		comp_gl_deposit_destroy(&dep);
 		return COMP_HUB_REASON_GL_DEPOSIT_FAILED;
 	}
+	if (!gl_dep_probe(dep)) {
+		comp_gl_deposit_destroy(&dep);
+		return COMP_HUB_REASON_GL_DEPOSIT_UNVERIFIED;
+	}
 
 	U_LOG_W(
-	    "GL deposit: ACTIVE (import=%s%s%s) — the GL atlas renders straight into a %ux%u NT-shared D3D11 "
-	    "texture on the GL context's adapter (zero copies); %s. No glFinish (#2317 P3)",
+	    "GL deposit: ACTIVE (import=%s%s%s sync=%s) — %ux%u NT-shared D3D11 atlas on the GL context's "
+	    "adapter, round-trip probe OK; %s. No glFinish (#2317 P3)",
 	    dep->import_name, dep->import_reason != nullptr ? " import_reason=" : "",
-	    dep->import_reason != nullptr ? dep->import_reason : "", dep->width, dep->height,
-	    dep->mo ? "completion and release are shared ID3D11Fences imported as GL semaphores (GPU-side)"
-	            : "GL writes are bracketed by wglDXLock/UnlockObjectsNV, completion published on a shared "
-	              "ID3D11Fence from the deposit's D3D11 context");
+	    dep->import_reason != nullptr ? dep->import_reason : "", comp_gl_deposit_sync_name(dep), dep->width,
+	    dep->height,
+	    dep->mo ? "GL renders straight into it (zero copies); completion and release are shared ID3D11Fences "
+	              "imported as GL semaphores (GPU-side)"
+	            : "GL renders into a non-shared interop transit texture bracketed by wglDXLock/UnlockObjectsNV "
+	              "(the lock is a CPU sync point); the deposit context copies it in after the unlock (ONE GPU "
+	              "copy per frame on this fallback rung) and signals the shared fence");
 	*out_dep = dep;
 	return nullptr;
 }
@@ -433,6 +554,9 @@ comp_gl_deposit_destroy(struct comp_gl_deposit **dep_ptr)
 	}
 	if (dep->fence != nullptr) {
 		dep->fence->Release();
+	}
+	if (dep->iop_tex != nullptr) {
+		dep->iop_tex->Release();
 	}
 	if (dep->tex_share != nullptr) {
 		CloseHandle(dep->tex_share);
@@ -516,8 +640,14 @@ comp_gl_deposit_begin(struct comp_gl_deposit *dep, struct comp_hub_d3d11 *hub)
 		return;
 	}
 
-	// Interop: submit the wait, then take the object for GL. The lock orders
-	// GL after the D3D11 commands already queued on this device.
+	/*
+	 * Interop: the hub reads only the SHARED deposit, which only this context
+	 * writes (the copy in comp_gl_deposit_end, behind the wait just queued), so
+	 * that edge is in-stream. GL writes only the transit, whose last D3D11
+	 * access was the previous frame's copy out of it — a command on the
+	 * registered resource, which is exactly what the interop lock orders GL
+	 * after.
+	 */
 	dep->ctx->Flush();
 	if (!dep->locked) {
 		dep->LockObjectsNV(dep->iop_dev, 1, &dep->iop_obj);
@@ -548,7 +678,10 @@ comp_gl_deposit_end(struct comp_gl_deposit *dep, bool hub_direct, struct comp_hu
 			dep->UnlockObjectsNV(dep->iop_dev, 1, &dep->iop_obj);
 			dep->locked = false;
 		}
-		// After the unlock the interop contract orders this behind GL's writes.
+		// After the unlock the interop contract orders D3D11 commands that
+		// ACCESS the registered transit behind GL's writes: this copy is one,
+		// and the fence signal follows it in this context's stream.
+		dep->ctx->CopyResource(dep->tex, dep->iop_tex);
 		dep->ctx4->Signal(dep->fence, dep->fence_value);
 		dep->ctx->Flush();
 	}

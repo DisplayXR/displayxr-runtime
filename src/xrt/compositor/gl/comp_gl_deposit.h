@@ -30,14 +30,19 @@
  *    back-fence (`comp_hub_d3d11_pre_render`) is satisfied, and GL waits on it
  *    before its first atlas write. The same mechanism the VK deposit uses
  *    (ADR-055).
- * 2. **nv_dx_interop** — `WGL_NV_DX_interop2` registers the D3D11 texture as a
- *    GL texture on the deposit device. `wglDXLockObjectsNV` /
- *    `wglDXUnlockObjectsNV` bracket the GL writes; the interop contract orders
- *    them against the D3D11 commands on that device on either side (the hub's
- *    back-fence wait queued before the lock, the producer-fence signal queued
- *    after the unlock). No `glFinish`, no keyed mutex. Whether a driver honours
- *    the lock with a GPU-side or a driver-internal wait is the driver's
- *    business; the placement line names the path so a measurement can tell.
+ * 2. **nv_dx_interop** (`sync=lock_copy`) — `WGL_NV_DX_interop2` registers a
+ *    NON-shared transit texture (interop write-back into a shared texture does
+ *    not reach the D3D resource on this stack) as the GL atlas.
+ *    `wglDXLockObjectsNV` / `wglDXUnlockObjectsNV` bracket the GL writes, and
+ *    after the unlock the deposit context copies the transit into the shared
+ *    deposit and signals the producer fence. Every edge rests on a D3D11
+ *    command that ACCESSES the registered texture (the copy), which is what the
+ *    interop contract orders. ONE GPU copy per frame on this fallback rung; the
+ *    lock is a CPU sync point. No `glFinish`, no keyed mutex.
+ *
+ * Both paths are verified at create by a round-trip probe (GL clears a
+ * sentinel, D3D11 reads one texel back); a mismatch refuses the hub
+ * (`gl_deposit_unverified`) rather than weave black.
  *
  * Neither path ever calls `glFinish` or `glClientWaitSync` on the frame path.
  *
@@ -116,6 +121,15 @@ comp_gl_deposit_gl_texture(struct comp_gl_deposit *dep);
 //! `COMP_GL_DEPOSIT_IMPORT_*`.
 const char *
 comp_gl_deposit_import_name(struct comp_gl_deposit *dep);
+
+/*!
+ * How the two edges are carried (placement `sync=`): `fence` (memory_object:
+ * GPU-side shared fences, zero copies) or `lock_copy` (interop: the
+ * wglDXLock/UnlockObjectsNV CPU sync point plus ONE GPU copy from the
+ * non-shared transit texture into the deposit).
+ */
+const char *
+comp_gl_deposit_sync_name(struct comp_gl_deposit *dep);
 
 //! `COMP_GL_DEPOSIT_IMPORT_REASON_*` when the fallback was taken, else NULL.
 const char *
