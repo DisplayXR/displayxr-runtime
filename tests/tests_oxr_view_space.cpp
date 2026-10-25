@@ -2089,6 +2089,121 @@ TEST_CASE("RIG_LOCAL hands sit on the display plane the SESSION sees, in every s
 	check_same_hands("runtime-win vs bridge-relay", hosted.local, relay.local, 0.002f);
 }
 
+TEST_CASE("RIG_LOCAL hands follow the display plane a chained XR_DXR_view_rig puts in LOCAL",
+          "[oxr][view_space][rig_hands]")
+{
+	// Field report (cube_handle_metal_macos --hands --actions, 2026-10-25): an
+	// external-window app that chains a display rig at the LOCAL origin — the
+	// shape every engine plug-in and cube app has — located its sim-input
+	// wrists and grips at (+-0.03, -1.56, 0.25) in LOCAL: on the PHYSICAL plane
+	// (the head's tracking origin, LOCAL's 1.6 m stage height below), not on
+	// the plane its views and displayPlanePose are in. Once a view locate
+	// chains a rig, the display plane the session sees is where the rig puts
+	// it, and RIG_LOCAL must land there (input-provider-discovery.md §4b.4).
+	//
+	// The external-window class cannot come up headlessly; the runtime-window
+	// class carries the same rule, and a rig posed AWAY from the physical
+	// plane makes a miss unmistakable (before the fix the hands stayed at the
+	// physical plane, ~0.6 m from where the rig shows them).
+	const char *enable = std::getenv("DXR_INPUT_SIM_INPUT_ENABLE");
+	if (enable == nullptr || std::strcmp(enable, "1") != 0) {
+		WARN(
+		    "this arm needs the sim-input provider - see tests_oxr_view_space_rig_hands in "
+		    "tests/CMakeLists.txt");
+		SUCCEED("not the rig-hands process");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.hand_tracking = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_view_rig || !rt.have_hand_tracking) {
+		WARN("XR_DXR_view_rig / XR_EXT_hand_tracking not advertised (no hand-tracking provider resident)");
+		SUCCEED("nothing to locate");
+		tear_down(rt);
+		return;
+	}
+
+	const XrTime t = rt.now();
+
+	// Unscaled (virtualDisplayHeight = the canvas height), posed and yawed.
+	XrViewDisplayRawDXR raw0 = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	(void)rt.views(rt.local, t, nullptr, &raw0);
+	const float canvas_h = raw0.canvasSizeMeters.height;
+	REQUIRE(canvas_h > 0.0f);
+	XrDisplayRigDXR rig = {XR_TYPE_DISPLAY_RIG_DXR};
+	rig.pose = {qyaw(0.4f), {0.4f, 0.3f, -0.35f}};
+	rig.virtualDisplayHeight = canvas_h;
+	rig.ipdFactor = 1.0f;
+	rig.parallaxFactor = 1.0f;
+	rig.perspectiveFactor = 1.0f;
+
+	// Hands with no rig: the physical plane's frame (the #2191 contract).
+	PlaneHands phys{};
+	XrPosef phys_plane{};
+	REQUIRE(measure_plane_hands(rt, rt.local, t, &phys, &phys_plane));
+
+	// A view locate chaining the rig: displayPlanePose is the rig pose.
+	XrViewDisplayRawDXR raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	(void)rt.views(rt.local, t, &rig, &raw);
+	const XrPosef plane = raw.displayPlanePose;
+	INFO("rig plane in LOCAL: " << pstr(plane) << "  physical plane in LOCAL: " << pstr(phys_plane));
+	CHECK(vdist(plane.position, rig.pose.position) < kPosTolM);
+
+	auto createTracker = rt.fn<PFN_xrCreateHandTrackerEXT>("xrCreateHandTrackerEXT");
+	auto destroyTracker = rt.fn<PFN_xrDestroyHandTrackerEXT>("xrDestroyHandTrackerEXT");
+	auto locateJoints = rt.fn<PFN_xrLocateHandJointsEXT>("xrLocateHandJointsEXT");
+	for (int h = 0; h < 2; h++) {
+		XrHandTrackerCreateInfoEXT hci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+		hci.hand = h == 0 ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
+		hci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+		XrHandTrackerEXT tracker = XR_NULL_HANDLE;
+		REQUIRE(XR_SUCCEEDED(createTracker(rt.session, &hci, &tracker)));
+
+		auto locate = [&](const void *chain, XrHandJointLocationEXT *out) {
+			XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+			li.next = chain;
+			li.baseSpace = rt.local;
+			li.time = t;
+			XrHandJointLocationsEXT jl = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+			jl.jointCount = XR_HAND_JOINT_COUNT_EXT;
+			jl.jointLocations = out;
+			REQUIRE(XR_SUCCEEDED(locateJoints(tracker, &li, &jl)));
+			REQUIRE(jl.isActive);
+		};
+		XrHandJointLocationEXT base[XR_HAND_JOINT_COUNT_EXT] = {};
+		XrHandJointLocationEXT scoped[XR_HAND_JOINT_COUNT_EXT] = {};
+		locate(nullptr, base);
+		locate(&rig, scoped);
+
+		const XrPosef w = base[XR_HAND_JOINT_WRIST_EXT].pose;
+		const XrVector3f in_rig = pmul(pinv(plane), w).position;
+		CAPTURE(h, w.position.x, w.position.y, w.position.z, in_rig.x, in_rig.y, in_rig.z);
+		// The same display-plane point as with no rig, now in the rig's frame.
+		CHECK(vdist(in_rig, phys.wrist[h]) < kPosTolM);
+		// An unscaled rig: base-space joints ARE the spec-4 rig-frame joints,
+		// which must not move either (they undo the plane RIG_LOCAL landed on).
+		for (uint32_t j = 0; j < XR_HAND_JOINT_COUNT_EXT; j++) {
+			CAPTURE(j);
+			CHECK(vdist(base[j].pose.position, scoped[j].pose.position) < kPosTolM);
+			CHECK(qangle_deg(base[j].pose.orientation, scoped[j].pose.orientation) < kAngTolDeg);
+		}
+		destroyTracker(tracker);
+	}
+
+	// A view locate that chains nothing again: back on the physical plane.
+	PlaneHands again{};
+	XrPosef again_plane{};
+	REQUIRE(measure_plane_hands(rt, rt.local, t, &again, &again_plane));
+	CHECK(vdist(again_plane.position, phys_plane.position) < kPosTolM);
+	check_same_hands("no rig, after a rigged locate", again, phys, kPosTolM);
+
+	tear_down(rt);
+}
+
 TEST_CASE("sim-input HANDS=right PINCH=hold: one hand, one sustained pinch (#2191)",
           "[oxr][view_space][rig_hands_hold]")
 {

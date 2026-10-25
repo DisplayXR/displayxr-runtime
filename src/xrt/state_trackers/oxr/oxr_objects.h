@@ -1318,6 +1318,15 @@ void
 oxr_session_get_view_space_offset(struct oxr_session *sess, struct xrt_pose *out_offset);
 
 /*!
+ * The display plane the session's most recent rigged view locate put in the
+ * head's tracking-origin space (see oxr_session::rig_canvas::rig_plane_origin).
+ * Returns false when the latest view locate chained no rig (or the session is
+ * a bridge relay, whose descriptors are inert).
+ */
+bool
+oxr_session_get_rig_plane_origin(struct oxr_session *sess, struct xrt_pose *out_plane_origin);
+
+/*!
  * #1502: publish the session's VIEW-space eye-centroid offset (thread safe).
  * Only @ref oxr_session_locate_views calls this.
  */
@@ -3163,6 +3172,16 @@ struct oxr_session
 		XrTime display_time; //!< the view locate's predicted display time
 		struct m_view_rig_canvas canvas;
 		struct xrt_pose plane_origin;
+		/*!
+		 * Where the rig chained on that same view locate puts the
+		 * physical display plane's origin, in the tracking-origin space
+		 * (unscaled: the pose of display point 0 through the rig) — the
+		 * display plane the SESSION sees once it declares a rig. RIG_LOCAL
+		 * devices land on it (oxr_space.c, rig_local_plane_correction).
+		 * Cleared by a view locate that chains no rig.
+		 */
+		bool rig_plane_valid;
+		struct xrt_pose rig_plane_origin;
 	} rig_canvas;
 
 	/*!

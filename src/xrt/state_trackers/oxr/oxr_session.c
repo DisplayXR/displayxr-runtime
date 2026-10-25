@@ -3144,17 +3144,82 @@ static void
 session_record_rig_canvas(struct oxr_session *sess,
                           XrTime display_time,
                           const struct m_view_rig_canvas *canvas,
-                          const struct xrt_pose *plane_origin)
+                          const struct xrt_pose *plane_origin,
+                          const struct m_view_rig *rig_origin)
 {
 	if (canvas == NULL || !canvas->valid) {
 		return;
 	}
+
+	/*
+	 * The display plane the session sees once it declares a rig: where the
+	 * rig puts the physical plane's origin (display point 0), unscaled. A
+	 * RIG_LOCAL pose L is then located at rig_plane o L (oxr_space.c,
+	 * rig_local_plane_correction) — the views' frame, so an unscaled rig's
+	 * hands and controllers coincide with its views in base space, and equal
+	 * the spec-4 rig-frame joints for that rig. The mapping is the shared
+	 * point core (m_view_rig_map_relation), the one the joints use, so the
+	 * canvas centre / orientation and a camera rig's nominal-viewer offset
+	 * come out exactly as for a joint. Bridge relays keep the physical plane:
+	 * their descriptors are inert.
+	 */
+	bool rig_plane_valid = false;
+	struct xrt_pose rig_plane = XRT_POSE_IDENTITY;
+	if (rig_origin != NULL && rig_origin->kind != M_VIEW_RIG_NONE && !sess->is_bridge_relay) {
+		struct xrt_space_relation at_plane = XRT_SPACE_RELATION_ZERO;
+		at_plane.pose = *plane_origin;
+		struct xrt_space_relation mapped;
+		m_view_rig_map_relation(canvas, rig_origin, plane_origin, &at_plane, 0.0f, &mapped, NULL);
+		rig_plane = mapped.pose;
+		rig_plane_valid = true;
+	}
+
 	os_mutex_lock(&sess->rig_canvas.lock);
 	sess->rig_canvas.valid = true;
 	sess->rig_canvas.display_time = display_time;
 	sess->rig_canvas.canvas = *canvas;
 	sess->rig_canvas.plane_origin = *plane_origin;
+	sess->rig_canvas.rig_plane_valid = rig_plane_valid;
+	sess->rig_canvas.rig_plane_origin = rig_plane;
 	os_mutex_unlock(&sess->rig_canvas.lock);
+}
+
+//! A view locate that chains no rig: RIG_LOCAL goes back to the physical plane.
+static void
+session_clear_rig_plane(struct oxr_session *sess)
+{
+	os_mutex_lock(&sess->rig_canvas.lock);
+	sess->rig_canvas.rig_plane_valid = false;
+	os_mutex_unlock(&sess->rig_canvas.lock);
+}
+
+//! The view locate's rig, in the tracking-origin space, as the point core takes it.
+static void
+session_view_rig_to_m(const struct oxr_view_rig_state *vr,
+                      enum m_view_rig_kind kind,
+                      const struct xrt_pose *pose_origin,
+                      struct m_view_rig *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->kind = kind;
+	out->pose = *pose_origin;
+	out->virtual_display_height = vr->virtual_display_height;
+	out->perspective_factor = vr->perspective_factor;
+	out->m2v = vr->m2v;
+	out->inv_convergence_distance = vr->inv_convergence_distance;
+	out->half_tan_vfov = vr->half_tan_vfov;
+}
+
+bool
+oxr_session_get_rig_plane_origin(struct oxr_session *sess, struct xrt_pose *out_plane_origin)
+{
+	os_mutex_lock(&sess->rig_canvas.lock);
+	const bool valid = sess->rig_canvas.rig_plane_valid;
+	if (valid) {
+		*out_plane_origin = sess->rig_canvas.rig_plane_origin;
+	}
+	os_mutex_unlock(&sess->rig_canvas.lock);
+	return valid;
 }
 
 /*!
@@ -3459,6 +3524,9 @@ locate_views_one(struct oxr_logger *log,
 		enum oxr_view_rig_type rig_type = view_rig_update_from_chain(sess, viewLocateInfo);
 		rig_camera = rig_type == OXR_VIEW_RIG_CAMERA;
 		rig_display = rig_type == OXR_VIEW_RIG_DISPLAY;
+		if (rig_type == OXR_VIEW_RIG_NONE) {
+			session_clear_rig_plane(sess);
+		}
 
 		view_raw = OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_VIEW_DISPLAY_RAW_DXR, XrViewDisplayRawDXR);
 		if (view_raw != NULL) {
@@ -3964,8 +4032,15 @@ locate_views_one(struct oxr_logger *log,
 				lc.canvas.nominal_z_m = nominal.z;
 				if (seg == NULL || (seg->side_effects && seg->rig_dx == 0.0f && seg->rig_dy == 0.0f &&
 				                    seg->vdh_scale <= 0.0f)) {
+					struct m_view_rig rec_rig;
+					const struct xrt_pose rec_rig_pose = {world_head_ori, world_head_pos};
+					session_view_rig_to_m(&sess->view_rig,
+					                      rig_camera    ? M_VIEW_RIG_CAMERA
+					                      : rig_display ? M_VIEW_RIG_DISPLAY
+					                                    : M_VIEW_RIG_NONE,
+					                      &rec_rig_pose, &rec_rig);
 					session_record_rig_canvas(sess, viewLocateInfo->displayTime, &lc.canvas,
-					                          &phys_plane_origin);
+					                          &phys_plane_origin, &rec_rig);
 				}
 				struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS];
 
@@ -4245,7 +4320,22 @@ locate_views_one(struct oxr_logger *log,
 				    .nominal_y_m = reply.canvas.nominal_y_m,
 				    .nominal_z_m = reply.canvas.nominal_z_m,
 				};
-				session_record_rig_canvas(sess, viewLocateInfo->displayTime, &rc, &reply.canvas.plane);
+				// Only for a rig THIS app chained (the server also
+				// synthesises a camera rig from qwerty for unchained
+				// runtime-window clients, #595 — their plane stays the head
+				// pose). The kind and pose are what the SERVER applied (a
+				// workspace override may replace the forwarded rig):
+				// raw.display_pose is that rig pose, tracking-origin space.
+				struct m_view_rig rec_rig;
+				const enum m_view_rig_kind applied =
+				    rig_info.rig_type == IPC_VIEW_RIG_NONE      ? M_VIEW_RIG_NONE
+				    : reply.rig_applied == IPC_VIEW_RIG_CAMERA  ? M_VIEW_RIG_CAMERA
+				    : reply.rig_applied == IPC_VIEW_RIG_DISPLAY ? M_VIEW_RIG_DISPLAY
+				                                                : M_VIEW_RIG_NONE;
+				const struct xrt_pose rec_rig_pose = reply.raw.display_pose;
+				session_view_rig_to_m(&sess->view_rig, applied, &rec_rig_pose, &rec_rig);
+				session_record_rig_canvas(sess, viewLocateInfo->displayTime, &rc, &reply.canvas.plane,
+				                          &rec_rig);
 			}
 			for (uint32_t i = 0; i < wire_views; i++) {
 				fovs[i] = reply.fovs[i];
@@ -7566,7 +7656,8 @@ hand_joints_resolve_rig(struct oxr_logger *log,
                         struct m_view_rig_canvas *out_canvas,
                         struct xrt_pose *out_plane_base,
                         struct m_view_rig *out_rig,
-                        int64_t *out_canvas_age_ns)
+                        int64_t *out_canvas_age_ns,
+                        bool source_rig_local)
 {
 	*out_canvas_age_ns = -1; // no recorded canvas
 	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
@@ -7579,7 +7670,15 @@ hand_joints_resolve_rig(struct oxr_logger *log,
 	const bool recorded = sess->rig_canvas.valid;
 	if (recorded) {
 		*out_canvas = sess->rig_canvas.canvas;
-		plane_origin = sess->rig_canvas.plane_origin;
+		// The plane the base-space joints sit on: the rig plane when the
+		// latest view locate chained a rig (RIG_LOCAL lands there,
+		// oxr_space.c), else the physical one. Either way undoing it
+		// recovers the same display-plane point L, so the spec-4 mapping
+		// below is unchanged by which plane RIG_LOCAL landed on.
+		// Stage-anchored (non-RIG_LOCAL) sources never moved: physical.
+		plane_origin = (source_rig_local && sess->rig_canvas.rig_plane_valid)
+		                   ? sess->rig_canvas.rig_plane_origin
+		                   : sess->rig_canvas.plane_origin;
 		*out_canvas_age_ns = (int64_t)(at_time - sess->rig_canvas.display_time);
 	}
 	os_mutex_unlock(&sess->rig_canvas.lock);
@@ -7770,8 +7869,10 @@ oxr_session_hand_joints(struct oxr_logger *log,
 	struct m_view_rig rig;
 	if (inst->extensions.DXR_view_rig && view_rig_parse_chain(&sess->joint_rig, locateInfo) != OXR_VIEW_RIG_NONE) {
 		int64_t age_ns = -1;
-		rig_joints =
-		    hand_joints_resolve_rig(log, sess, baseSpc, at_time, &rig_canvas, &rig_plane_base, &rig, &age_ns);
+		rig_joints = hand_joints_resolve_rig(
+		    log, sess, baseSpc, at_time, &rig_canvas, &rig_plane_base, &rig, &age_ns,
+		    data_source->xdev->tracking_origin != NULL &&
+		        data_source->xdev->tracking_origin->type == XRT_TRACKING_TYPE_RIG_LOCAL);
 		// Per session, on every verdict change (never per frame).
 		const int32_t verdict = rig_joints ? 1 : 0;
 		if (verdict != sess->rig_joints_verdict) {

@@ -677,12 +677,29 @@ space resolves to:
 | Runtime-window (`_hosted`, legacy, headless without `XR_DXR_display_info`) — in-process or IPC | the head **device** pose, `rig(t)` (the head device *is* the display; qwerty / the composer move it) | `rig(t) ∘ L` | yes — WASD / mouse-look / a navigating provider carry the hands (*Amendment 2*) |
 | External-window (`_handle`, `_texture`, the Unity / Unreal providers) — in-process or IPC | the **identity at the head's tracking origin** (the app owns its camera) | `T_origin ∘ L` | no — the plane does not move for these sessions, so neither do the hands; an app that navigates declares it through `XR_DXR_view_rig` |
 | Bridge relay (`XR_DXR_display_info` + headless) | the identity at the head's tracking origin | `T_origin ∘ L` | no |
+| Any non-bridge session whose latest `xrLocateViews` chained an `XR_DXR_view_rig` descriptor | where the **rig** puts the physical plane: `P` = display point 0 mapped through the rig, unscaled (for a full-canvas display rig, its `pose` — the `displayPlanePose` it reports) | `T_origin ∘ P ∘ L` | with the rig — the app's views are in that frame |
 
 The space graph is session-agnostic and resolves every RIG_LOCAL pose to the
 first row's `rig(t) ∘ L`. For the other two rows the state tracker re-bases it
 (`oxr_space.c::rig_local_plane_correction`, applied in `xrLocateSpace(s)` and
-in the hand-joint base): `C = T_origin ∘ inv(head_pose(t)) ∘ inv(T_origin)`,
-left-multiplied, in the locate's base space. It has to be per session: one
+in the hand-joint base): `C = T_origin ∘ P ∘ inv(head_pose(t)) ∘ inv(T_origin)`,
+left-multiplied, in the locate's base space, with `P` = identity for the
+external-window / bridge-relay rows and the rig plane for the last row.
+
+The rig row exists because `T_origin` is **not** the LOCAL origin: LOCAL sits
+at the builder's 1.6 m stage offset above the head's tracking origin, so an
+external-window app that chains a display rig at the LOCAL origin (the normal
+engine / cube-app shape) saw its hands and grips 1.6 m below its views until
+the rig plane was honoured (cube_handle_metal_macos `--hands --actions`,
+wrists at y ≈ −1.56 instead of +0.04). `P` is recorded by each view locate
+(in service mode from the server's applied rig, `raw.display_pose`) and cleared
+by one that chains nothing; it goes through the same point core as spec-4
+rig-scoped joints (`m_view_rig_map_relation`), so for an unscaled rig
+base-space joints equal the rig-frame ones, and the spec-4 mapping undoes `P`
+rather than the physical plane for RIG_LOCAL sources. A hand locate **before**
+the session's first rigged view locate still sees the physical plane — locate
+views first each frame. Pinned by `tests_oxr_view_space_rig_hands` ("RIG_LOCAL
+hands follow the display plane a chained XR_DXR_view_rig puts in LOCAL"). It has to be per session: one
 graph serves sessions of both kinds (several IPC clients), and an
 external-window session flips the head device into `EXT_APP_MODE` — which
 replaces the fly-camera pose with the display plug-in's static nominal viewer —
