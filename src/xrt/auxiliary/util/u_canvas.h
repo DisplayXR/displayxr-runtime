@@ -17,6 +17,7 @@
 #include "xrt/xrt_display_metrics.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include <math.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -96,6 +97,40 @@ u_canvas_zone_canvas_dims(
 		return true;
 	}
 	return false;
+}
+
+/*!
+ * The window orientation of @p metrics, and whether it is a real rotation.
+ *
+ * A compositor that never fills `window_orientation` (it is zero-initialised
+ * with the rest of the struct — the Metal and GL compositors) leaves a ZERO
+ * quaternion, not the identity. Tested as "differs from (0,0,0,1)", that read
+ * as a rotation, and a zero quaternion multiplied into any pose chain zeroes
+ * the orientation and silently drops every rotation composed after it. A
+ * degenerate quaternion is therefore the identity here.
+ *
+ * @return true when the window is rotated (non-identity, non-degenerate).
+ */
+static inline bool
+u_canvas_window_orientation(const struct xrt_window_metrics *metrics, struct xrt_quat *out_orient)
+{
+	const struct xrt_quat q = metrics->window_orientation;
+	const float n2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+	if (!(n2 > 1e-6f)) {
+		out_orient->x = 0.0f;
+		out_orient->y = 0.0f;
+		out_orient->z = 0.0f;
+		out_orient->w = 1.0f;
+		return false;
+	}
+	const float inv = 1.0f / sqrtf(n2);
+	// Field by field, not a compound literal: this header is included from C++ (MSVC C4576).
+	out_orient->x = q.x * inv;
+	out_orient->y = q.y * inv;
+	out_orient->z = q.z * inv;
+	out_orient->w = q.w * inv;
+	return fabsf(out_orient->x) > 0.0001f || fabsf(out_orient->y) > 0.0001f || fabsf(out_orient->z) > 0.0001f ||
+	       fabsf(out_orient->w - 1.0f) > 0.0001f;
 }
 
 /*!

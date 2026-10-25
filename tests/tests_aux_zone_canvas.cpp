@@ -22,6 +22,8 @@
 
 #include "catch_amalgamated.hpp"
 
+#include <cmath>
+
 namespace {
 
 struct xrt_window_metrics
@@ -154,4 +156,29 @@ TEST_CASE("zone_canvas: an invalid or empty zone leaves the reported dims alone"
 	CHECK_FALSE(u_canvas_zone_canvas_dims(0, 0, &z, &w, &h));
 	CHECK(w == 0);
 	CHECK(h == 0);
+}
+
+TEST_CASE("window orientation: a never-filled (zero) quaternion is the identity, not a rotation")
+{
+	// The Metal and GL compositors never write window_orientation, so it stays
+	// zero-initialised. Read as "differs from (0,0,0,1)" it became a rotated
+	// canvas whose zero quaternion zeroed every pose it was multiplied into
+	// (the rig plane of RIG_LOCAL hands: joint orientations came back 0,0,0,0).
+	struct xrt_window_metrics wm = {};
+	struct xrt_quat q = {9, 9, 9, 9};
+	CHECK_FALSE(u_canvas_window_orientation(&wm, &q));
+	CHECK(q.x == 0.0f);
+	CHECK(q.y == 0.0f);
+	CHECK(q.z == 0.0f);
+	CHECK(q.w == 1.0f);
+
+	wm.window_orientation = xrt_quat{0, 0, 0, 1};
+	CHECK_FALSE(u_canvas_window_orientation(&wm, &q));
+
+	// A real rotation (30 deg about Y, scaled by 2) is detected and normalised.
+	const float s = std::sin(0.2617994f), c = std::cos(0.2617994f);
+	wm.window_orientation = xrt_quat{0, 2.0f * s, 0, 2.0f * c};
+	CHECK(u_canvas_window_orientation(&wm, &q));
+	CHECK(q.y == Catch::Approx(s).margin(1e-6));
+	CHECK(q.w == Catch::Approx(c).margin(1e-6));
 }
