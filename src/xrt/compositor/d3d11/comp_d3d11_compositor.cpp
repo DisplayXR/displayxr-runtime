@@ -4303,14 +4303,10 @@ d3d11_hub_policy(void)
 {
 	static int policy = -1;
 	if (policy < 0) {
-		char buf[64];
-		const char *e = u_setting_get_raw("DXR_HUB", buf, sizeof(buf), nullptr);
-		if (e == nullptr || e[0] == '\0') {
-			policy = D3D11_HUB_POLICY_DEFAULT;
-		} else if (!comp_split_gate_parse_requested(e)) {
-			policy = D3D11_HUB_POLICY_DISABLED;
-		} else {
-			policy = D3D11_HUB_POLICY_FORCED;
+		switch (comp_split_gate_setting_policy("DXR_HUB")) {
+		case COMP_SPLIT_GATE_SETTING_DISABLED: policy = D3D11_HUB_POLICY_DISABLED; break;
+		case COMP_SPLIT_GATE_SETTING_FORCED: policy = D3D11_HUB_POLICY_FORCED; break;
+		default: policy = D3D11_HUB_POLICY_DEFAULT; break;
 		}
 	}
 	return (enum d3d11_hub_policy_kind)policy;

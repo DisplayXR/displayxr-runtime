@@ -210,3 +210,18 @@ TEST_CASE("#918: a NULL input block is the kill switch, not a crash")
 	REQUIRE(out.short_reason != nullptr);
 	CHECK(strcmp(out.short_reason, COMP_SPLIT_REASON_KILLED_BY_ENV) == 0);
 }
+
+TEST_CASE("#2375: the tri-state setting policy shared by DXR_HUB and the D3D12 hybrid reroute")
+{
+	CHECK(comp_split_gate_parse_setting_policy(nullptr) == COMP_SPLIT_GATE_SETTING_DEFAULT);
+	CHECK(comp_split_gate_parse_setting_policy("") == COMP_SPLIT_GATE_SETTING_DEFAULT);
+	for (const char *v : {"0", "f", "false", "n", "no", "off", "OFF"}) {
+		INFO(v);
+		CHECK(comp_split_gate_parse_setting_policy(v) == COMP_SPLIT_GATE_SETTING_DISABLED);
+	}
+	// FORCED is any non-false value, not just "1".
+	for (const char *v : {"1", "on", "true", "yes", "2"}) {
+		INFO(v);
+		CHECK(comp_split_gate_parse_setting_policy(v) == COMP_SPLIT_GATE_SETTING_FORCED);
+	}
+}

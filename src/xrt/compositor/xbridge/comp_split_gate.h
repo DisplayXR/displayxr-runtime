@@ -409,6 +409,36 @@ bool
 comp_split_gate_parse_requested(const char *value);
 
 /*!
+ * A tri-state reading of one managed on-by-default setting (`DXR_HUB`,
+ * `DXR_SPLIT_D3D12_HYBRID_REROUTE`, #2317 / #2375): unset, killed, or set to
+ * anything else. The kill spellings are exactly those of
+ * @ref comp_split_gate_parse_requested.
+ */
+enum comp_split_gate_setting_policy
+{
+	COMP_SPLIT_GATE_SETTING_DEFAULT,  //!< unset or empty: the caller's default
+	COMP_SPLIT_GATE_SETTING_DISABLED, //!< a false spelling (`0`, `f…`, `n…`, `off`): the kill switch
+	COMP_SPLIT_GATE_SETTING_FORCED,   //!< any non-false value (`1`, `on`, `yes`, …)
+};
+
+/*!
+ * The unlatched parser behind @ref comp_split_gate_setting_policy.
+ *
+ * @param value the raw value, or NULL when unset.
+ */
+enum comp_split_gate_setting_policy
+comp_split_gate_parse_setting_policy(const char *value);
+
+/*!
+ * Read @p name through the settings chain (`u_setting_get_raw`: env, then the
+ * per-user and machine stores for a managed name) and classify it with
+ * @ref comp_split_gate_parse_setting_policy. NOT latched: callers latch, so a
+ * process answers one way for its whole life.
+ */
+enum comp_split_gate_setting_policy
+comp_split_gate_setting_policy(const char *name);
+
+/*!
  * `DXR_TEST_SPLIT_FAIL_STAGEA=1` — testability hook for the fallback matrix.
  * Forces Stage A to fail at the point the bridge would be created, so the "one
  * WARN, stock path" degrade can be exercised without a machine that genuinely

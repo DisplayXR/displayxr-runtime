@@ -245,6 +245,11 @@ engaged on the hybrid, repaint cadence preserved under the frame divisor, the fu
 (zones, Local2D, cursor, transparency, capture, multi-screen segments, the ADR-044 oracle,
 `displayxr-cli selftest`) green, and — for Unity, Unreal and the browser — the Phase 4 checks.
 
+| route | topology | default | evidence | open |
+|---|---|---|---|---|
+| D3D11 in-process | hybrid | hub (#2363, `DXR_HUB=0` kills) | #2363 harness + tracked-viewer eyeball (#2375) | single-dGPU desktop (#2371) |
+| D3D12 in-process (the #1264 reroute) | hybrid | hub (#2375). Kill: `DXR_SPLIT_D3D12_HYBRID_REROUTE` set to a false spelling; unset, `DXR_HUB=0` kills it too (`hub_disabled_by_env`); any non-false value of the route knob engages it even under `DXR_HUB=0` | #2374 harness (n=3, full rate); #2376 fallback to own-legs; #2375 hybrid-laptop gates passed: rep-3 repeat, soak, refusal/retire, events, Unity engine repeats, reduced test matrix, tracked-viewer eyeball | single-dGPU desktop (#2371); Unreal engine check DEFERRED; mode switch PARTIAL (2D→3D and 1/2/3 keys unexercised); eye-tracking state change unexercised; ADR-044 raw-alpha oracle OPEN |
+
 ## Amendment 1 (2026-10-24) — bridge ingress is one frame stale; direct ingress is a frame fresher
 
 The measurements above said the DIRECT and xbridge ingress modes were "within noise". That is

@@ -556,6 +556,25 @@ probe_native_display_mode(struct cli_query_result *r, const struct xrt_plugin_di
 }
 
 /*!
+ * One managed on-by-default setting as THIS process resolves it (the settings
+ * chain: env, then the per-user and machine stores): whether it is set, its
+ * raw value, and where it came from ("env" / "user" / "machine" / "default").
+ */
+static void
+probe_managed_setting(
+    const char *name, bool *out_set, char *out_value, size_t value_size, char *out_source, size_t source_size)
+{
+	char buf[64];
+	enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+	const char *v = u_setting_get_raw(name, buf, sizeof(buf), &src);
+	snprintf(out_source, source_size, "%s", u_setting_source_str(src));
+	*out_set = v != NULL && v[0] != '\0';
+	if (*out_set) {
+		snprintf(out_value, value_size, "%s", v);
+	}
+}
+
+/*!
  * #918 — GPU topology. Enumerates the hardware adapters, names the one that
  * scans out the 3D panel, names the one the runtime would suggest to render
  * on, and states whether the weave-on-scanout split has anything to do on this
@@ -577,26 +596,16 @@ probe_gpu_topology(struct cli_query_result *r, const struct xrt_plugin_display_i
 	// #1252: through the settings chain, not getenv alone — otherwise this
 	// report would disagree with what the runtime does the moment anyone sets
 	// the lever from the Dashboard instead of the environment.
-	char weave_buf[64];
-	enum u_setting_source weave_src = U_SETTING_SOURCE_DEFAULT;
-	const char *env = u_setting_get_raw("DXR_WEAVE_ON_SCANOUT", weave_buf, sizeof(weave_buf), &weave_src);
-	r->gpu_weave_env_set = env != NULL && env[0] != '\0';
-	if (r->gpu_weave_env_set) {
-		snprintf(r->gpu_weave_env, sizeof(r->gpu_weave_env), "%s", env);
-	}
-	snprintf(r->gpu_weave_source, sizeof(r->gpu_weave_source), "%s", u_setting_source_str(weave_src));
-	// #2317 step 2: the D3D11 hub's kill switch, read as the runtime reads it
-	// (through the settings chain, a managed name).
-	{
-		char hub_buf[64];
-		enum u_setting_source hub_src = U_SETTING_SOURCE_DEFAULT;
-		const char *hub = u_setting_get_raw("DXR_HUB", hub_buf, sizeof(hub_buf), &hub_src);
-		snprintf(r->gpu_hub_source, sizeof(r->gpu_hub_source), "%s", u_setting_source_str(hub_src));
-		r->gpu_hub_env_set = hub != NULL && hub[0] != '\0';
-		if (r->gpu_hub_env_set) {
-			snprintf(r->gpu_hub_env, sizeof(r->gpu_hub_env), "%s", hub);
-		}
-	}
+	// The managed split / hub kill switches, read as the runtime reads them
+	// (through the settings chain): DXR_WEAVE_ON_SCANOUT, DXR_HUB (#2317 step
+	// 2) and the D3D12 hybrid reroute (#2375).
+	probe_managed_setting("DXR_WEAVE_ON_SCANOUT", &r->gpu_weave_env_set, r->gpu_weave_env, sizeof(r->gpu_weave_env),
+	                      r->gpu_weave_source, sizeof(r->gpu_weave_source));
+	probe_managed_setting("DXR_HUB", &r->gpu_hub_env_set, r->gpu_hub_env, sizeof(r->gpu_hub_env), r->gpu_hub_source,
+	                      sizeof(r->gpu_hub_source));
+	probe_managed_setting("DXR_SPLIT_D3D12_HYBRID_REROUTE", &r->gpu_d3d12_reroute_env_set, r->gpu_d3d12_reroute_env,
+	                      sizeof(r->gpu_d3d12_reroute_env), r->gpu_d3d12_reroute_source,
+	                      sizeof(r->gpu_d3d12_reroute_source));
 	// Answered from the env alone here, so every early return below still
 	// reports it; re-stated at the end once the topology is known.
 	describe_service_split(r);
@@ -2726,6 +2735,11 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		   "says what it did)\n",
 		   r->gpu_hub_env_set ? r->gpu_hub_env : "<unset>",
 		   r->gpu_hub_source[0] ? r->gpu_hub_source : "default");
+		PT("DXR_SPLIT_D3D12_HYBRID_REROUTE=%s [%s] (kill switch; in-process D3D12 apps on a cross-adapter box "
+		   "weave through the D3D11 hub by default, #2375 -- each app's log 'hub placement:' line says what it "
+		   "did)\n",
+		   r->gpu_d3d12_reroute_env_set ? r->gpu_d3d12_reroute_env : "<unset>",
+		   r->gpu_d3d12_reroute_source[0] ? r->gpu_d3d12_reroute_source : "default");
 		PT("%s\n", r->gpu_service_split);
 		PT("%s\n", r->gpu_service_ingest);
 	}
@@ -3101,6 +3115,10 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		                        r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
 		cJSON_AddStringToObject(gt, "hub_env", r->gpu_hub_env_set ? r->gpu_hub_env : "<unset>");
 		cJSON_AddStringToObject(gt, "hub_source", r->gpu_hub_source[0] ? r->gpu_hub_source : "default");
+		cJSON_AddStringToObject(gt, "d3d12_hybrid_reroute_env",
+		                        r->gpu_d3d12_reroute_env_set ? r->gpu_d3d12_reroute_env : "<unset>");
+		cJSON_AddStringToObject(gt, "d3d12_hybrid_reroute_source",
+		                        r->gpu_d3d12_reroute_source[0] ? r->gpu_d3d12_reroute_source : "default");
 		cJSON_AddStringToObject(gt, "service_split", r->gpu_service_split);
 		cJSON_AddStringToObject(gt, "split_ingress", r->gpu_split_ingress);
 		cJSON_AddStringToObject(gt, "service_ingest", r->gpu_service_ingest);

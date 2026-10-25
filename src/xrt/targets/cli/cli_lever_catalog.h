@@ -9,7 +9,7 @@
  * Edit the census and re-run the script; the lint workflow runs it with
  * --check, which also fails when a name here no longer occurs in src/xrt.
  *
- * 68 levers: 49 Tier 1 (next launch), 19 Tier 2 (service-scoped).
+ * 69 levers: 50 Tier 1 (next launch), 19 Tier 2 (service-scoped).
  *
  * This is a DESCRIPTION of the levers, not a way to set them: only the names
  * u_setting_is_managed() accepts resolve from the per-user / machine stores.
@@ -61,6 +61,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_LINUX_DIRECT_SCANOUT", 1, "App", "off", "Opt-in RandR direct-scanout present path on Linux"},
 	{"DXR_MAX_CLIENTS", 1, "Svc", "0 = auto", "#959 admitted-client cap. Read once at service start"},
 	{"DXR_PRESENT_OPAQUE", 1, "App", "off", "Opaque flip chain instead of the composed chain."},
+	{"DXR_SPLIT_D3D12_HYBRID_REROUTE", 1, "App", "on on a cross-adapter box (a false spelling kills; DXR_HUB=0 also kills it when this is unset)", "#2375: hybrid d3d12 sessions weave through the D3D11 hub by default, with legs still open (single-dGPU #2371, Unreal, 2D-to-3D and view-count keys, eye-tracking change)."},
 	{"DXR_SPLIT_INGRESS", 1, "App", "adaptive", "adaptive reads a still source in place; staged pins the PR 3-5 per-frame copy."},
 	{"DXR_STEREO_CAMERA", 1, "Svc", "on", "ADR-043 admin/dev kill switch: 0 = the service enumerates zero stereo cameras (indistinguishable from \"none\", on purpose) and every start returns XR_ERROR_STEREO_CAMERA_DISABLED_DXR."},
 	{"DXR_STEREO_CAMERA_UVC", 1, "Svc", "unset (= on when configured)", "ADR-043 Amendment 4: 0 = the service's vendor-neutral UVC side-by-side stereo webcam source claims nothing, whatever stereo-cameras.json says."},

@@ -75,6 +75,10 @@ static const char *const managed_names[] = {
     // the split gate's parser, so the Dashboard can turn the hub off for an app
     // it never launched, as it can the split it sits on.
     "DXR_HUB",
+    // #2375: the D3D12 tier's hybrid reroute onto the D3D11 hub, default on
+    // since its hybrid acceptance record; =0 is its kill switch, read once per
+    // process with the split gate's parser, the DXR_HUB shape.
+    "DXR_SPLIT_D3D12_HYBRID_REROUTE",
 };
 
 #define MANAGED_COUNT ((uint32_t)(sizeof(managed_names) / sizeof(managed_names[0])))

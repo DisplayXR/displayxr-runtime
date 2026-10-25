@@ -69,7 +69,7 @@ kill switch):
 |---|---|---|---|
 | d3d11 | default | `DXR_HUB=0` (own #918 split; the kill switch since #2317 step 2) | `hub`: default env (`hub placement: hub=1 ... ingress=xbridge`) |
 | d3d11 | same-adapter | `DXR_HUB=0` (own same-adapter engage) | `hub-direct`: `DXR_HUB=1` (`ingress=direct`); `hub-xbridge`: + `DXR_HUB_INGRESS=xbridge`; optional `default-same`: default env, expected NATIVE (`reason=same_adapter_opt_in` - the default-on scope is cross-adapter until the desktop run) |
-| d3d12 | default | default env (own-legs split, `hub placement: hub=0 reason=hybrid_reroute_default_off`) | `hub`: `DXR_SPLIT_D3D12_HYBRID_REROUTE=1` at full frame rate (#2317; expects `heavy-d3d12 reroute ACTIVE` + `hub placement: hub=1 ... ingress=xbridge ingress_reason=cross_adapter reason=hybrid_reroute_opt_in`); `hub-divisor2`: + `DXR_APP_FRAME_DIVISOR=2`, the pre-#2317 gate shape (#1309) as the control |
+| d3d12 | default | `DXR_SPLIT_D3D12_HYBRID_REROUTE=0` (own-legs split, the kill switch since #2375: `hub placement: hub=0 reason=hybrid_reroute_disabled_by_env`) | `hub`: default env at full frame rate (#2375; expects `heavy-d3d12 reroute ACTIVE` + `hub placement: hub=1 ... ingress=xbridge ingress_reason=cross_adapter reason=hybrid_reroute_default_on`); `hub-divisor2`: + `DXR_APP_FRAME_DIVISOR=2`, the pre-#2317 gate shape (#1309) as the control |
 | d3d12 | same-adapter | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env, the #1264 reroute (`hub placement: hub=1 ... ingress=xbridge ingress_reason=default_xbridge`); `hub-direct`: + `DXR_HUB_INGRESS=direct` (P2a, `ingress=direct`) |
 | vk | default | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`ingress=xbridge ingress_reason=cross_adapter`) |
 | vk | same-adapter | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`ingress=xbridge ingress_reason=default_xbridge`); `hub-direct`: + `DXR_HUB_INGRESS=direct` (P2a) |
@@ -94,7 +94,10 @@ kill switch):
   `DXR_APP_FRAME_DIVISOR>=2` as well as `DXR_SPLIT_D3D12_HYBRID_REROUTE=1`
   (#1309: a cost/benefit scope from the partition campaign, not a correctness
   gate), so it could not be compared with the own split at full rate. The
-  opt-in alone now engages it; `DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR=1`
+  opt-in alone engages it, and since #2375 it is the hybrid default
+  (`DXR_SPLIT_D3D12_HYBRID_REROUTE=0` is the kill switch, so the `native` arm
+  sets it; kit 0.6.0 results are not comparable with 0.5.0 runs, whose d3d12
+  arms had the opposite env); `DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR=1`
   restores the old gate. Run it with
   `.\run_hub_ab.ps1 -Apps d3d12 -Topology default -Arms native,hub,hub-divisor2`.
   An arm with `expectLines` (an array) must match every regex in it; `rejectLines`

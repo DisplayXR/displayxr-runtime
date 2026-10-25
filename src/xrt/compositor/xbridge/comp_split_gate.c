@@ -62,6 +62,24 @@ comp_split_gate_env_requested(void)
 	return enabled == 1;
 }
 
+enum comp_split_gate_setting_policy
+comp_split_gate_parse_setting_policy(const char *value)
+{
+	if (value == NULL || value[0] == '\0') {
+		return COMP_SPLIT_GATE_SETTING_DEFAULT;
+	}
+	return comp_split_gate_parse_requested(value) ? COMP_SPLIT_GATE_SETTING_FORCED
+	                                              : COMP_SPLIT_GATE_SETTING_DISABLED;
+}
+
+enum comp_split_gate_setting_policy
+comp_split_gate_setting_policy(const char *name)
+{
+	char buf[64];
+	const char *v = u_setting_get_raw(name, buf, sizeof(buf), NULL);
+	return comp_split_gate_parse_setting_policy(v);
+}
+
 bool
 comp_split_gate_env_same_adapter(void)
 {
