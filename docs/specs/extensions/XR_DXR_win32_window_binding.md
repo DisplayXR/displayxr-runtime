@@ -5,8 +5,10 @@
 | Extension Name | `XR_DXR_win32_window_binding` |
 | Spec Version | 8 |
 | Type Values | `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR` (1004999001), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR` (1004999002) |
-| Author | Leia Inc. |
-| Platform | Windows (Win32). Linux/Android reserved for future use. |
+| Author | The DisplayXR Project |
+| Platform | Windows (Win32). Sibling bindings: [`cocoa`](XR_DXR_cocoa_window_binding.md) (macOS), [`xlib`](XR_DXR_xlib_window_binding.md) and [`wayland`](XR_DXR_wayland_surface_binding.md) (desktop Linux), [`android`](XR_DXR_android_surface_binding.md). |
+| Window-space layer | Enables `XrCompositionLayerWindowSpaceDXR` (1004999002). The struct is declared identically, `#ifndef`-guarded on the type value, in all five window/surface binding headers (win32, cocoa, xlib, wayland, android), so any of them may be included in any order. The runtime accepts the layer on any window-bound, native-compositor or IPC session. |
+| Deprecated | `readbackCallback` (offscreen CPU readback): new code must pass NULL. The runtime still honours it and the field keeps its offset, so no `SPEC_VERSION` change. Use `sharedTextureHandle` for windowless output. |
 
 ---
 
@@ -965,7 +967,6 @@ the [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin
 - **Multi-app simultaneous testing** — Validate two per-session apps rendering to different windows at the same time
 - **Async weaving** — Replace `vkQueueWaitIdle()` with fence-based synchronization for better throughput
 - **WebXR / browser integration** — Browser passes canvas backing surface as window handle via `XR_DXR_win32_window_binding`; requires browser vendor cooperation
-- **Linux / Android platform support** — Extend `windowHandle` to accept XCB/Wayland/ANativeWindow handles
 - **Khronos standardization** — Propose `XR_DXR_win32_window_binding` for inclusion in the OpenXR specification
 
 ### 9.2 Forward-compatibility roadmap (additive only)

@@ -3,8 +3,9 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_xlib_window_binding` |
-| Spec Version | 1 |
+| Spec Version | 2 |
 | Type Values | `XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR` (1004999200) |
+| Window-space layer | Enables `XrCompositionLayerWindowSpaceDXR` (1004999002). The struct is declared identically, `#ifndef`-guarded on the type value, in all five window/surface binding headers (win32, cocoa, xlib, wayland, android), so any of them may be included in any order. The runtime accepts the layer on any window-bound, native-compositor or IPC session. |
 | Author | The DisplayXR Project |
 | Platform | Desktop Linux (X11/Xlib). Wayland has its own sibling: [`XR_DXR_wayland_surface_binding`](XR_DXR_wayland_surface_binding.md). |
 
@@ -112,8 +113,6 @@ stay self-consistent under a uniformly scaled root.
 ## 6. Out of Scope / Future
 
 - **Texture class** (shared-texture content handoff, the `sharedTextureHandle` / readback fields of the win32/cocoa siblings) — deliberately absent from spec v1; add as a follow-up revision when a Linux `_texture` producer exists (#696 is the class taxonomy reference).
-- **Transparent background** (`transparentBackgroundEnabled` sibling field) — X11 ARGB-visual transparency is not wired in the Linux compositor yet.
-- **Window-space composition layers** (`XrCompositionLayerWindowSpaceDXR`) — not declared by this extension yet; the shared type value (1004999002) makes a later `#ifndef`-guarded adoption possible, mirroring the cocoa header.
 - **Wayland** — no stable absolute window position (needed for interlacing phase); X11/XCB first by design (`docs/roadmap/linux-support.md` § Decisions). Since then: `XR_DXR_wayland_surface_binding` ships the present path, and #817 adds windowed weaving under Wayland via a compositor-published geometry service (`docs/specs/runtime/wayland-window-geometry.md`).
 
 ## 7. Revision History
@@ -121,3 +120,6 @@ stay self-consistent under a uniformly scaled root.
 | Version | Changes |
 |---------|---------|
 | 1 | Initial version — window binding only (`xDisplay` + `window`); Linux Phase 3 (#660) |
+| 2 | `transparentBackgroundEnabled` — X11 ARGB-visual transparent surface opt-in (#757) |
+
+The header also declares the shared `XrCompositionLayerWindowSpaceDXR` block (2026-10). That needed no version change: the runtime already accepted the layer on xlib sessions, and apps had been copying the guarded block themselves.

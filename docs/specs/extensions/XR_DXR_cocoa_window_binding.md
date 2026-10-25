@@ -5,8 +5,10 @@
 | Extension Name | `XR_DXR_cocoa_window_binding` |
 | Spec Version | 8 |
 | Type Values | `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR` (1004999004), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR` (1004999002), `XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR` (1004999330, v8) |
-| Author | Leia Inc. |
+| Author | The DisplayXR Project |
 | Platform | macOS (Cocoa / AppKit). |
+| Window-space layer | Enables `XrCompositionLayerWindowSpaceDXR` (1004999002). The struct is declared identically, `#ifndef`-guarded on the type value, in all five window/surface binding headers (win32, cocoa, xlib, wayland, android), so any of them may be included in any order. The runtime accepts the layer on any window-bound, native-compositor or IPC session. |
+| Deprecated | `readbackCallback` (offscreen CPU readback): new code must pass NULL. The runtime still honours it and the field keeps its offset, so no `SPEC_VERSION` change. Use `sharedIOSurface` for windowless output. |
 
 ---
 
@@ -254,8 +256,9 @@ xrCreateSession(instance, &sessionInfo, &session);
 
 | Extension | Relationship |
 |---|---|
-| `XR_DXR_win32_window_binding` | Windows counterpart — mutually exclusive (one per platform). Shares `XrCompositionLayerWindowSpaceDXR`. |
-| `XR_DXR_android_surface_binding` | Android counterpart (planned, not yet implemented). |
+| `XR_DXR_win32_window_binding` | Windows counterpart — mutually exclusive (one per platform). All five window/surface bindings share `XrCompositionLayerWindowSpaceDXR`. |
+| `XR_DXR_android_surface_binding` | Android counterpart (implemented, #1037). |
+| `XR_DXR_xlib_window_binding` / `XR_DXR_wayland_surface_binding` | Desktop-Linux counterparts (X11, Wayland). |
 | `XR_DXR_display_info` | Independent. Can be used alone (runtime-managed window) or together (app-owned view + display geometry + mode control). |
 
 ---

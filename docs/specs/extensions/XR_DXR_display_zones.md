@@ -3,11 +3,11 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_display_zones` |
-| Spec Version | 1 |
-| Type Values | `1004999150–1004999153` |
-| Author | Leia Inc. |
+| Spec Version | 3 |
+| Type Values | `1004999150–1004999154` |
+| Author | The DisplayXR Project |
 | Platform | All (extension-app classes only) |
-| Requires | `XR_DXR_local_3d_zone` (≥ v3), `XR_DXR_view_rig` (≥ v2) |
+| Requires | `XR_DXR_local_3d_zone` (≥ v4), `XR_DXR_view_rig` (≥ v2) |
 
 > **Status:** implemented (runtime phases P1–P4 of
 > `docs/roadmap/display-zones.md`); design per

@@ -8,6 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 **Status:** Implemented (runtime#1037, ADR-036 D2/D6; layout hint runtime#1396; input event runtime#132) · **Spec version:** 3
 **Platforms:** Android (`__ANDROID__`) · **Graphics APIs:** Vulkan (`comp_vk_native`)
 **Header:** [`src/external/openxr_includes/openxr/XR_DXR_android_surface_binding.h`](../../../src/external/openxr_includes/openxr/XR_DXR_android_surface_binding.h)
+**Window-space layer:** enables `XrCompositionLayerWindowSpaceDXR` (1004999002), declared identically and `#ifndef`-guarded on the type value in all five window/surface binding headers; the runtime accepts it on any window-bound, native-compositor or IPC session.
 
 Sibling window-binding extensions:
 [`XR_DXR_win32_window_binding`](XR_DXR_win32_window_binding.md) (HWND) ·

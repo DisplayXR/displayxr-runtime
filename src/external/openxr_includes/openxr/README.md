@@ -27,14 +27,14 @@ Rules:
 
 | Values | Extension | Notes |
 |---|---|---|
-| 1004999001–002 | `XR_DXR_win32_window_binding` | 002 = `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR`, deliberately shared with the cocoa binding (`#ifndef`-guarded, same struct) |
-| 1004999003–013 | `XR_DXR_display_info` | 003, 006–008, 010–013 assigned; 005/009 unused gaps |
+| 1004999001–002 | `XR_DXR_win32_window_binding` | 002 = `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR`, deliberately shared by all five window/surface binding headers (win32, cocoa, xlib, wayland, android): same struct, `#ifndef`-guarded on the type value |
+| 1004999003–014 | `XR_DXR_display_info` | 003, 006–008, 010–014 assigned (014 = `XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR`); 005 = the Android binding's create-info (see its row); 009 unused |
 | 1004999004 | `XR_DXR_cocoa_window_binding` | + shares 002 (see above) |
 | 1004999100–113 | `XR_DXR_spatial_workspace` | 111–112 screens / placement (spec v25), 113 = `XR_TYPE_WORKSPACE_OVERLAY_SCREEN_DXR` (spec v26); 114–119 free for it |
 | 1004999120–122 | `XR_DXR_workspace_file_dialog` | 122 is an `XrResult`, not an `XrStructureType` |
 | 1004999130–132 | `XR_DXR_mcp_tools` | |
 | 1004999140–142 | `XR_DXR_view_rig` | |
-| 1004999150–153 | `XR_DXR_display_zones` | assigned (spec v1) |
+| 1004999150–154 | `XR_DXR_display_zones` | 150–153 spec v1; 154 = `XR_TYPE_DISPLAY_ZONE_FEATHER_DXR` (spec v3) |
 | 1004999160–166 | `XR_DXR_local_3d_zone` | relocated from 130–136 (collided with mcp_tools) — spec v4 |
 | 1004999170–171 | `XR_DXR_atlas_capture` | relocated from 120–121 (collided with workspace_file_dialog) — spec v3 |
 | 1004999180 | `XR_DXR_macos_gl_binding` | relocated from 1004999010 (collided with display_info) — spec v2 |

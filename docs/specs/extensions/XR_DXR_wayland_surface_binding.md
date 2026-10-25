@@ -5,6 +5,7 @@
 | Extension Name | `XR_DXR_wayland_surface_binding` |
 | Spec Version | 2 |
 | Type Values | `XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR` (1004999250), `XR_TYPE_WAYLAND_SURFACE_GEOMETRY_DXR` (1004999251) |
+| Window-space layer | Enables `XrCompositionLayerWindowSpaceDXR` (1004999002). The struct is declared identically, `#ifndef`-guarded on the type value, in all five window/surface binding headers (win32, cocoa, xlib, wayland, android), so any of them may be included in any order. The runtime accepts the layer on any window-bound, native-compositor or IPC session. |
 | Author | The DisplayXR Project |
 | Platform | Desktop Linux (Wayland). X11 has its own sibling: [`XR_DXR_xlib_window_binding`](XR_DXR_xlib_window_binding.md). |
 
