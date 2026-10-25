@@ -159,3 +159,6 @@ src/xrt/targets/openxr_android/src/main/jniLibs/
 
 # build-android.yml unpacks APK libs here to check them; never commit them
 _apkchk/
+
+# ADR-060 first-run snapshots (scripts/adr060_r2_first_run.sh)
+/_adr060_snapshot_*/
