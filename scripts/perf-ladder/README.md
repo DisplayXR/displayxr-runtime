@@ -69,7 +69,7 @@ kill switch):
 |---|---|---|---|
 | d3d11 | default | `DXR_HUB=0` (own #918 split; the kill switch since #2317 step 2) | `hub`: default env (`hub placement: hub=1 ... ingress=xbridge`) |
 | d3d11 | same-adapter | `DXR_HUB=0` (own same-adapter engage) | `hub-direct`: `DXR_HUB=1` (`ingress=direct`); `hub-xbridge`: + `DXR_HUB_INGRESS=xbridge`; optional `default-same`: default env, expected NATIVE (`reason=same_adapter_opt_in` - the default-on scope is cross-adapter until the desktop run) |
-| d3d12 | default | default env (own-legs split) | `hub` (optional): `DXR_SPLIT_D3D12_HYBRID_REROUTE=1` (`ingress=xbridge`) - the code gate also needs `DXR_APP_FRAME_DIVISOR>=2`, so it is not like-for-like |
+| d3d12 | default | default env (own-legs split, `hub placement: hub=0 reason=hybrid_reroute_default_off`) | `hub`: `DXR_SPLIT_D3D12_HYBRID_REROUTE=1` at full frame rate (#2317; expects `heavy-d3d12 reroute ACTIVE` + `hub placement: hub=1 ... ingress=xbridge ingress_reason=cross_adapter reason=hybrid_reroute_opt_in`); `hub-divisor2`: + `DXR_APP_FRAME_DIVISOR=2`, the pre-#2317 gate shape (#1309) as the control |
 | d3d12 | same-adapter | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env, the #1264 reroute (`hub placement: hub=1 ... ingress=xbridge ingress_reason=default_xbridge`); `hub-direct`: + `DXR_HUB_INGRESS=direct` (P2a, `ingress=direct`) |
 | vk | default | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`ingress=xbridge ingress_reason=cross_adapter`) |
 | vk | same-adapter | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`ingress=xbridge ingress_reason=default_xbridge`); `hub-direct`: + `DXR_HUB_INGRESS=direct` (P2a) |
@@ -90,6 +90,18 @@ kill switch):
   `DXR_D3D_FORCE_GPU=scanout` / `DXR_VK_FORCE_GPU=scanout` so render, weave and
   present share the scanout adapter (what a single-GPU desktop sees by default).
   `-Arms own-split` runs d3d12's own split as a third arm.
+- **The d3d12 hybrid reroute (#2317).** Before #2317 the hybrid reroute needed
+  `DXR_APP_FRAME_DIVISOR>=2` as well as `DXR_SPLIT_D3D12_HYBRID_REROUTE=1`
+  (#1309: a cost/benefit scope from the partition campaign, not a correctness
+  gate), so it could not be compared with the own split at full rate. The
+  opt-in alone now engages it; `DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR=1`
+  restores the old gate. Run it with
+  `.\run_hub_ab.ps1 -Apps d3d12 -Topology default -Arms native,hub,hub-divisor2`.
+  An arm with `expectLines` (an array) must match every regex in it; `rejectLines`
+  must match none (the full-rate arms reject the `#1257 partition` line, and pin
+  `DXR_APP_FRAME_DIVISOR=0` so a stray user-level value cannot leak in).
+  `hub-divisor2` must show the partition line; the optional `needs-divisor` arm
+  checks the `hybrid_reroute_needs_divisor` token.
 - **Verification, not assumption.** Each run's path is classified from the app
   log (`weave placement:` / `hub placement:` verbatim + the split/reroute ACTIVE
   lines) and cross-checked against the `[WITNESS]` site (`d3d11` for the fill

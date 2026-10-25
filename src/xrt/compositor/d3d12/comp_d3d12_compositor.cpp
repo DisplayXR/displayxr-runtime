@@ -2053,7 +2053,7 @@ d3d12_fill_arm_active(struct comp_d3d12_compositor *c)
  *
  * OPT-IN and default OFF: this is a bring-up flag, exactly as
  * DXR_SPLIT_SAME_ADAPTER_D3D12 was for Phase C. It does not become a default
- * without its own measured acceptance record.
+ * without its own measured acceptance record (ADR-059's per-API bar, #2317).
  */
 static bool
 d3d12_reroute_hybrid_optin(void)
@@ -2061,6 +2061,24 @@ d3d12_reroute_hybrid_optin(void)
 	static int on = -1;
 	if (on < 0) {
 		const char *e = getenv("DXR_SPLIT_D3D12_HYBRID_REROUTE");
+		on = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return on == 1;
+}
+
+/*!
+ * #2317: `DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR=1` restores the #1309
+ * gate -- the hybrid reroute engages only when the #1257 partition is also
+ * requested (`DXR_APP_FRAME_DIVISOR>=2`). Default OFF: the opt-in alone engages
+ * the reroute at the app's full frame rate. See the gate in
+ * d3d12_split_stage_a for why the divisor was required and what lifts it.
+ */
+static bool
+d3d12_reroute_hybrid_require_divisor(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR");
 		on = (e != NULL && e[0] == '1') ? 1 : 0;
 	}
 	return on == 1;
@@ -2210,10 +2228,12 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	comp_hub_d3d11_set_plane_format(c->reroute.split, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM);
 
 	/*
-	 * #2317 P2a: the reroute is same-adapter by construction, so the hub reads
-	 * the deposit ring DIRECT (no transport copy) unless DXR_HUB_INGRESS=xbridge.
-	 * Its reads are released on its own consumer fence, which this queue must
-	 * open to order a slot rewrite after them — no open, no DIRECT.
+	 * #2317 P2a: on one adapter the hub can read the deposit ring DIRECT (no
+	 * transport copy; DXR_HUB_INGRESS=direct opts in, the hub's ingress policy
+	 * decides). A HYBRID reroute (DXR_SPLIT_D3D12_HYBRID_REROUTE=1) always
+	 * takes xbridge (ingress_reason=cross_adapter). DIRECT reads are released
+	 * on the hub's own consumer fence, which this queue must open to order a
+	 * slot rewrite after them — no open, no DIRECT.
 	 */
 	{
 		void *cons = comp_hub_d3d11_get_consumer_fence_handle(c->reroute.split);
@@ -2221,6 +2241,10 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 			comp_hub_d3d11_leave_direct(c->reroute.split, COMP_HUB_INGRESS_REASON_DIRECT_FAILED);
 		}
 	}
+	// #2317: the hybrid reroute is opt-in, so its hub=1 line names why
+	// (reason=hybrid_reroute_opt_in); the same-adapter default passes NULL and
+	// keeps its line unchanged.
+	comp_hub_d3d11_set_route_reason(c->reroute.split, hybrid ? COMP_HUB_REASON_HYBRID_REROUTE_OPT_IN : nullptr);
 	comp_hub_d3d11_log_placement(c->reroute.split, "d3d12");
 
 	c->reroute.active = true;
@@ -2622,26 +2646,59 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	const char *reason = gate.reason;
 	c->split_off_reason = gate.short_reason;
 	/*
-	 * PROTOTYPE: the reroute is same-adapter by acceptance; the opt-in extends it
-	 * to the hybrid topology the VK tier already serves on this same arm.
+	 * The reroute is same-adapter by acceptance; DXR_SPLIT_D3D12_HYBRID_REROUTE=1
+	 * extends it to the hybrid topology the VK tier already serves on the hub.
 	 *
-	 * The hybrid engage ALSO requires the partition to be requested, and that is
-	 * the whole reason it can be considered for default-on. Measured on a real
-	 * client: the reroute's BENEFIT needs the divisor (-42% app iGPU at D=3),
-	 * while its COST is paid either way (+19 CPU points with the reroute alone,
-	 * `C-REROUTE-NODIV`). Engaging it for a session that never asked for the
-	 * partition is therefore all cost and no benefit.
+	 * WHY THE DIVISOR WAS REQUIRED (#1309, 2026-09-02 -- not correctness). The
+	 * opt-in used to engage only with DXR_APP_FRAME_DIVISOR>=2 too. That was a
+	 * cost/benefit scope from the #1257 partition campaign. The reroute's
+	 * BENEFIT there was the partition (-42% app iGPU at D=3), which the
+	 * own-legs arm refuses (its partition event record -- 3 of 3 deep dips --
+	 * never passed the matrix). Its COST was MEASURED and paid either way:
+	 * +19 app CPU points with the reroute alone (`C-REROUTE-NODIV`, 3/3 reps);
+	 * only its CAUSE was unattributed (no profile), and #1315 could not
+	 * re-measure it on a loaded box. There is no known correctness defect at
+	 * full rate: C-REROUTE-NODIV itself ran D=1 hybrid clean at 59.75/s
+	 * (pre-hub). Nothing in the arm depends on the divisor: the partition
+	 * throttle keys on the reroute being ACTIVE and is a no-op at D<2.
 	 *
-	 * That cost is probably not removable: it is not the staged ingress (the
-	 * deposit is a RING, so adaptive ingress would stage every frame anyway) and
-	 * not the fill loop (both arms tick on a byte-identical formula). What is
-	 * left is the D3D11 device + immediate context this arm submits through
-	 * every frame, against the own-legs path's pure D3D12 -- structural, not a
-	 * bug. So scope the engage to the sessions that pay for it rather than chase
-	 * the cost.
+	 * WHAT LIFTS IT (#2317). The arm is now the D3D11 hub (ADR-059), whose
+	 * predicted cost is its xbridge ingress copies (ADR-059: +8.7 GPU / +9.8
+	 * CPU points on one adapter). The question is ADR-059's per-API bar
+	 * against the own split at full rate -- R/D, no pipelining frame, GPU/CPU
+	 * per adapter, 60/60/0 witness, engines clean -- plus the acceptance items
+	 * #1315 left open (mode switch, a >=5-min soak, an events leg). That needs
+	 * the arm runnable at D=1, which this gate now allows. The default (no env
+	 * var) is unchanged: own-legs split, `hub=0
+	 * reason=hybrid_reroute_default_off`. The old gate stays reachable as the
+	 * control: DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR=1.
+	 *
+	 * A hybrid reroute whose Stage A fails falls back to the own-legs split
+	 * (`hub placement: CHANGED hub=0 reason=hybrid_reroute_stage_a_failed`,
+	 * #2376), at any divisor -- the first default-flip gate in #2375.
 	 */
-	const bool reroute_topology_ok =
-	    gate.same_adapter || (d3d12_reroute_hybrid_optin() && u_app_partition_divisor() >= 2);
+	bool hybrid_reroute = false;
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	const char *hybrid_hub_reason = nullptr; // hub=0 token for a hybrid session left on its own legs
+	if (!gate.same_adapter && gate.split_active) {
+		if (!d3d12_reroute_hybrid_optin()) {
+			hybrid_hub_reason = COMP_HUB_REASON_HYBRID_REROUTE_DEFAULT_OFF;
+		} else if (d3d12_reroute_hybrid_require_divisor() && u_app_partition_divisor() < 2) {
+			hybrid_hub_reason = COMP_HUB_REASON_HYBRID_REROUTE_NEEDS_DIVISOR;
+		} else if (!d3d12_reroute_route_d3d11()) {
+			hybrid_hub_reason = COMP_HUB_REASON_HYBRID_REROUTE_ROUTE_OWN;
+		} else {
+			hybrid_reroute = true;
+		}
+	}
+	if (hybrid_hub_reason != nullptr) {
+		U_LOG_W(
+		    "hub placement: hub=0 reason=%s — this HYBRID session routes to the tier's own-legs #918 split "
+		    "(#2317; DXR_SPLIT_D3D12_HYBRID_REROUTE=1 routes it onto the D3D11 hub)",
+		    hybrid_hub_reason);
+	}
+#endif
+	const bool reroute_topology_ok = gate.same_adapter || hybrid_reroute;
 	//! #2317: a hybrid reroute failed its Stage A; the own-legs split takes over.
 	bool hybrid_fallback = false;
 	if (reroute_topology_ok && gate.split_active) {
@@ -2658,7 +2715,7 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 			    gate.same_adapter ? "same-adapter" : "HYBRID (cross-adapter)", sdesc.Description,
 			    (unsigned long)sdesc.AdapterLuid.HighPart, (unsigned long)sdesc.AdapterLuid.LowPart,
 			    gate.same_adapter ? ", accepted default"
-			                      : ", PROTOTYPE opt-in DXR_SPLIT_D3D12_HYBRID_REROUTE=1");
+			                      : ", opt-in DXR_SPLIT_D3D12_HYBRID_REROUTE=1, any frame divisor (#2317)");
 			if (d3d12_reroute_stage_a(c, xdev, display_screen_left, display_screen_top,
 			                          !gate.same_adapter) ||
 			    gate.same_adapter) {

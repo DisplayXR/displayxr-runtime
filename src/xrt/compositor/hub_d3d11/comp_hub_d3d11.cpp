@@ -252,6 +252,8 @@ struct comp_hub_d3d11
 	//! to xbridge prints a CHANGED line (before it, the move is reported by
 	//! comp_hub_d3d11_log_placement itself).
 	bool placement_logged;
+	//! #2317: the producer's route token for the placement line (NULL = none).
+	const char *route_reason;
 	//! #2317 P2a review: once-per-SESSION warnings (a function static would
 	//! silence every later session in the process).
 	bool warned_slot_open;
@@ -4588,14 +4590,23 @@ comp_hub_d3d11_log_placement(struct comp_hub_d3d11 *s, const char *producer)
 	const char *why = comp_hub_d3d11_ingress_reason(s);
 	s->placement_logged = true;
 	U_LOG_W(
-	    "hub placement: hub=1 render=%08lx:%08lx hub_dev=%08lx:%08lx ingress=%s%s%s — weave/present on the "
-	    "D3D11 hub's own device (#2317 P2a; %s ring deposit%s)",
+	    "hub placement: hub=1 render=%08lx:%08lx hub_dev=%08lx:%08lx ingress=%s%s%s%s%s — weave/present on "
+	    "the D3D11 hub's own device (#2317 P2a; %s ring deposit%s)",
 	    (unsigned long)s->render_luid.HighPart, (unsigned long)s->render_luid.LowPart,
 	    (unsigned long)s->out_luid.HighPart, (unsigned long)s->out_luid.LowPart,
 	    s->direct.active ? "direct" : "xbridge", why != nullptr ? " ingress_reason=" : "",
-	    why != nullptr ? why : "", producer != nullptr ? producer : "?",
+	    why != nullptr ? why : "", s->route_reason != nullptr ? " reason=" : "",
+	    s->route_reason != nullptr ? s->route_reason : "", producer != nullptr ? producer : "?",
 	    s->direct.active ? (s->direct.km ? ", keyed-mutex mode" : ", fence mode")
 	                     : "; DXR_HUB_INGRESS=direct opts in to DIRECT on one adapter");
+}
+
+extern "C" void
+comp_hub_d3d11_set_route_reason(struct comp_hub_d3d11 *s, const char *reason)
+{
+	if (s != nullptr) {
+		s->route_reason = reason;
+	}
 }
 
 extern "C" bool
@@ -5282,6 +5293,13 @@ comp_hub_d3d11_log_placement(struct comp_hub_d3d11 *split, const char *producer)
 {
 	(void)split;
 	(void)producer;
+}
+
+extern "C" void
+comp_hub_d3d11_set_route_reason(struct comp_hub_d3d11 *split, const char *reason)
+{
+	(void)split;
+	(void)reason;
 }
 
 extern "C" void
