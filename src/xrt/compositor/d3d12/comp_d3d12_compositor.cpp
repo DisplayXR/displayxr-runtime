@@ -2084,11 +2084,61 @@ d3d12_reroute_route_d3d11(void)
  * compositor's A1/A2 split. Best-effort: any failure leaves the session on its
  * stock path with the reason logged; nothing half-engages.
  */
+/*!
+ * DXR_TEST_HUB_STAGE_A_FAIL=1 — test-only: the reroute's Stage A fails at its
+ * last step (after the hub's Stage A1 and the deposit ring succeeded, before
+ * the bridge is wired), so the failure handling below can be exercised on real
+ * hardware. A HYBRID session must then fall back to the own-legs split (#2317,
+ * the default-flip blocker); a same-adapter one keeps today's stock path.
+ */
+static bool
+d3d12_test_hub_stage_a_fail(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_TEST_HUB_STAGE_A_FAIL");
+		on = (e != NULL && e[0] == '1') ? 1 : 0;
+		if (on == 1) {
+			U_LOG_W("DXR_TEST_HUB_STAGE_A_FAIL=1: TEST-ONLY — the d3d12 reroute's Stage A will fail");
+		}
+	}
+	return on == 1;
+}
+
+/*!
+ * Tear down a reroute whose Stage A failed after the hub was created. A
+ * same-adapter session keeps the stock path, so the hub's RETIRED WARN and its
+ * `weave placement: CHANGED` correction apply. A HYBRID session falls back to
+ * the own-legs split (#2317), whose own Stage A and placement line follow, so
+ * the hub is destroyed quietly: a `weave placement: CHANGED ... RENDER adapter`
+ * line here would be false the moment the own-legs split engaged.
+ */
 static void
+d3d12_reroute_abandon(struct comp_d3d12_compositor *c, bool hybrid, const char *why)
+{
+	if (hybrid) {
+		U_LOG_W(
+		    "#1264 reroute: d3d11 fill arm Stage A failed (%s) — HYBRID session falls back to the "
+		    "own-legs split (#2317)",
+		    why);
+		comp_hub_d3d11_destroy(&c->reroute.split);
+	} else {
+		comp_hub_d3d11_retire(&c->reroute.split, why, COMP_SPLIT_REASON_STAGE_A_FAILED);
+	}
+	c->split_off_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
+}
+
+/*!
+ * @return true when the reroute is ACTIVE for this session. On false nothing
+ *         of it is left standing; the caller picks the fallback (#2317: the
+ *         own-legs split for a HYBRID session, the stock path otherwise).
+ */
+static bool
 d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
                       struct xrt_device *xdev,
                       int32_t display_screen_left,
-                      int32_t display_screen_top)
+                      int32_t display_screen_top,
+                      bool hybrid)
 {
 	const LUID app_luid = c->device->GetAdapterLuid();
 	struct comp_hub_d3d11_info si = {};
@@ -2116,9 +2166,10 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	const char *short_reason = NULL;
 	if (comp_hub_d3d11_stage_a(&si, &c->reroute.split, &short_reason) != XRT_SUCCESS || c->reroute.split == NULL) {
 		c->split_off_reason = (short_reason != NULL) ? short_reason : COMP_SPLIT_REASON_STAGE_A_FAILED;
-		U_LOG_W("#1264 reroute: d3d11 fill arm Stage A refused (%s) — stock path",
-		        c->split_off_reason != NULL ? c->split_off_reason : "?");
-		return;
+		U_LOG_W("#1264 reroute: d3d11 fill arm Stage A refused (%s) — %s",
+		        c->split_off_reason != NULL ? c->split_off_reason : "?",
+		        hybrid ? "HYBRID session falls back to the own-legs split (#2317)" : "stock path");
+		return false;
 	}
 
 	// The deposit ring at the worst-case system atlas (ADR-010's sizing rule,
@@ -2133,18 +2184,17 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	}
 	if (comp_d3d12_deposit_create(c->device, sys_w, sys_h, &c->reroute.dep) != XRT_SUCCESS ||
 	    c->reroute.dep == NULL) {
-		comp_hub_d3d11_retire(&c->reroute.split, "deposit creation failed", COMP_SPLIT_REASON_STAGE_A_FAILED);
-		c->split_off_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
-		return;
+		d3d12_reroute_abandon(c, hybrid, "deposit creation failed");
+		return false;
 	}
 
 	struct comp_hub_d3d11_handoff handoff = {};
-	if (!comp_d3d12_deposit_get_handoff(c->reroute.dep, &handoff) ||
+	const bool test_fail = d3d12_test_hub_stage_a_fail();
+	if (test_fail || !comp_d3d12_deposit_get_handoff(c->reroute.dep, &handoff) ||
 	    !comp_hub_d3d11_wire_bridge(c->reroute.split, &handoff)) {
 		comp_d3d12_deposit_destroy(&c->reroute.dep);
-		comp_hub_d3d11_retire(&c->reroute.split, "bridge wire failed", COMP_SPLIT_REASON_STAGE_A_FAILED);
-		c->split_off_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
-		return;
+		d3d12_reroute_abandon(c, hybrid, test_fail ? "DXR_TEST_HUB_STAGE_A_FAIL" : "bridge wire failed");
+		return false;
 	}
 
 	// The plane machinery's panel-sizing rule reads these (same source the
@@ -2216,6 +2266,7 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	    "arm (ADR-039 — one fill engine); the atlas renders into a D3D11 deposit ring opened on the "
 	    "app's D3D12 device, %ux%u x%u. DXR_SPLIT_D3D12_ROUTE=own reverts to the tier's own arm.",
 	    sys_w, sys_h, (unsigned)COMP_D3D12_DEPOSIT_RING);
+	return true;
 }
 /*!
  * #2345 review: the list a deposit-plane rewrite is recorded on. Off DIRECT
@@ -2591,6 +2642,8 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	 */
 	const bool reroute_topology_ok =
 	    gate.same_adapter || (d3d12_reroute_hybrid_optin() && u_app_partition_divisor() >= 2);
+	//! #2317: a hybrid reroute failed its Stage A; the own-legs split takes over.
+	bool hybrid_fallback = false;
 	if (reroute_topology_ok && gate.split_active) {
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 		if (d3d12_reroute_route_d3d11()) {
@@ -2606,19 +2659,42 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 			    (unsigned long)sdesc.AdapterLuid.HighPart, (unsigned long)sdesc.AdapterLuid.LowPart,
 			    gate.same_adapter ? ", accepted default"
 			                      : ", PROTOTYPE opt-in DXR_SPLIT_D3D12_HYBRID_REROUTE=1");
-			d3d12_reroute_stage_a(c, xdev, display_screen_left, display_screen_top);
-			return;
+			if (d3d12_reroute_stage_a(c, xdev, display_screen_left, display_screen_top,
+			                          !gate.same_adapter) ||
+			    gate.same_adapter) {
+				// Active, or a same-adapter failure: the stock path, as before.
+				return;
+			}
+			/*
+			 * #2317 (the hybrid default-flip blocker): a HYBRID reroute whose
+			 * Stage A failed used to return here too, leaving the session on
+			 * the single-device stock path (weave on the render adapter, every
+			 * present crossing to scanout — ADR-037's 42 ms row) with no
+			 * `hub placement:` line. It falls back to the own-legs split
+			 * instead: the hybrid default before the opt-in, and the path the
+			 * gate would have taken without it. Nothing of the reroute is left
+			 * standing (d3d12_reroute_abandon), so the own-legs Stage A below
+			 * starts from the same state as a session that never opted in.
+			 */
+			U_LOG_W(
+			    "hub placement: CHANGED hub=0 reason=%s — the D3D11 hub could not stand up for this HYBRID "
+			    "session; the tier's own-legs #918 split takes it (#2317)",
+			    COMP_HUB_REASON_HYBRID_REROUTE_STAGE_A_FAILED);
+			c->split_off_reason = gate.short_reason;
+			hybrid_fallback = true;
 		}
 #endif
-		// ADR-039: same adapter, split ENGAGED anyway — the fill engine is
-		// the point, not the copy. The "cross-adapter" heap below is simply
-		// a shared heap when both LUIDs match.
-		U_LOG_W(
-		    "#918 output-device split: ADR-039 same-adapter ENGAGE on the OWN-LEGS arm on '%ls' "
-		    "LUID=%08lx:%08lx (DXR_SPLIT_D3D12_ROUTE=own — the A/B control; its event record did "
-		    "not pass the matrix, so the partition refuses on this arm)",
-		    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
-		    (unsigned long)sdesc.AdapterLuid.LowPart);
+		if (!hybrid_fallback) {
+			// ADR-039: same adapter, split ENGAGED anyway — the fill engine is
+			// the point, not the copy. The "cross-adapter" heap below is simply
+			// a shared heap when both LUIDs match.
+			U_LOG_W(
+			    "#918 output-device split: ADR-039 same-adapter ENGAGE on the OWN-LEGS arm on '%ls' "
+			    "LUID=%08lx:%08lx (DXR_SPLIT_D3D12_ROUTE=own — the A/B control; its event record did "
+			    "not pass the matrix, so the partition refuses on this arm)",
+			    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+			    (unsigned long)sdesc.AdapterLuid.LowPart);
+		}
 	} else if (gate.same_adapter && c->split_off_reason != nullptr &&
 	           strcmp(c->split_off_reason, COMP_SPLIT_REASON_SOFTWARE_SCANOUT) == 0) {
 		/*
