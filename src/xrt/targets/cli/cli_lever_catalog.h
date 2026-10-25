@@ -79,7 +79,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_VK_QUEUE_MODE", 1, "App", "auto", "#902 repaint queue tier. The oxr_vulkan read decides layer injection at VkInstance create - irreversible for that instance"},
 	{"DXR_WEAVE_ON_SCANOUT", 1, "App", "on (kill switch)", "Kill switch for the ADR-037 output-device split."},
 	{"DXR_WEAVE_REPAINT", 1, "App", "on", "Master switch for #868 repaint. Decides whether the repaint thread is spawned"},
-	{"DXR_WEAVE_SINGLE_THREAD", 1, "App", "on (Android), off elsewhere", "#1196 pins the DP weave to one thread where the DP is proven thread-affine"},
+	{"DXR_WEAVE_SINGLE_THREAD", 1, "App", "on (Android; and vulkan_enable1 apps whose repaint shares the app's queue, #2393), off elsewhere", "#1196 pins the DP weave to one thread where the DP is proven thread-affine"},
 	{"DXR_WINDOW_FULLSCREEN", 1, "App", "on", "=0 opts out of EWMH fullscreen placement (Linux XCB)"},
 	{"DXR_WINDOW_POS", 1, "App", "plug-in reported", "\"x,y\" override for the self-owned window position (#715)"},
 	{"DXR_WL_MOVE_SYNC", 1, "App", "on whenever the window-geometry@displayxr.org extension supports it (version 9+, GNOME 45+)", "Move-synchronised re-weave: every commit carries a 1x1 subsurface tag of the position its frame was woven for, and the extension paints each frame of a compositor drag (title bar, Super+drag, the..."},

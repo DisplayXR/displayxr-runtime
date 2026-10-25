@@ -547,6 +547,10 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	    // The deposit's same-adapter sync rung needs the submit-time
 	    // keyed-mutex handshake, which is invalid without the extension.
 	    sess->sys->vk.win32_keyed_mutex_enabled,
+	    // #2393: vulkan_enable1 = the app created the device. Needed at create
+	    // (the weave-thread ownership is decided there), not only at the
+	    // set_vk_device_origin call below.
+	    !sys->inst->extensions.KHR_vulkan_enable2,
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
