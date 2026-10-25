@@ -4667,7 +4667,7 @@ comp_hub_d3d11_render_diag(struct comp_hub_d3d11 *s)
 {
 	if (s != nullptr && s->direct.active) {
 		const uint64_t dnow = os_monotonic_get_ns();
-		if (dnow - s->diag_window_ns < 10 * U_TIME_1S_IN_NS) {
+		if (dnow - s->diag_window_ns < 10ULL * U_TIME_1S_IN_NS) {
 			return;
 		}
 		s->diag_window_ns = dnow;
@@ -4685,7 +4685,7 @@ comp_hub_d3d11_render_diag(struct comp_hub_d3d11 *s)
 	}
 
 	const uint64_t now = os_monotonic_get_ns();
-	if (now - s->diag_window_ns < 10 * U_TIME_1S_IN_NS) {
+	if (now - s->diag_window_ns < 10ULL * U_TIME_1S_IN_NS) {
 		return;
 	}
 	s->diag_window_ns = now;
