@@ -255,8 +255,21 @@ struct comp_hub_d3d11_info
  * `dp_refused_scanout`, ...). Fixed parse targets; never reformatted.
  * @{
  */
-//! `DXR_HUB` is not `1`: the tier runs its own legs (the default).
+/*!
+ * RETIRED as an emitted token by #2317 step 2, kept on purpose. It meant
+ * "`DXR_HUB` is not `1`" while the D3D11 shim was opt-in (P1b..P2c); since step 2
+ * the in-process D3D11 leg weaves through the hub BY DEFAULT and the only way to
+ * opt out is the kill switch, @ref COMP_HUB_REASON_DISABLED_BY_ENV. Field logs
+ * from builds before step 2 still carry this string; nothing emits it today.
+ */
 #define COMP_HUB_REASON_NOT_REQUESTED "not_requested"
+/*!
+ * `DXR_HUB=0` (or another false spelling): the kill switch (#2317 step 2, the
+ * #1264 / ADR-039 pattern). The tier runs its own legs exactly as before the
+ * default flipped. Distinct from the split gate's `killed_by_env`, which names
+ * `DXR_WEAVE_ON_SCANOUT=0` — that one refuses the hub too, through the gate.
+ */
+#define COMP_HUB_REASON_DISABLED_BY_ENV "disabled_by_env"
 //! The runtime owns the window (`_hosted`): its drag phase-snap provider is the
 //! tier's own display processor, which the hub would replace. Not carried yet.
 #define COMP_HUB_REASON_HOSTED_WINDOW "hosted_window"
@@ -266,6 +279,14 @@ struct comp_hub_d3d11_info
 #define COMP_HUB_REASON_NO_SHARED_FENCE "no_shared_fence"
 //! Stage A2 (bridge or direct wiring) failed after Stage A1 succeeded.
 #define COMP_HUB_REASON_WIRE_FAILED "wire_failed"
+/*!
+ * #2317 step 2: the session asked for a PQ atlas (`DXR_ATLAS_ENCODING=pq`,
+ * #2273, experimental). The encoding is negotiated with the tier's OWN display
+ * processor (`accepts_atlas_encoding` / `set_atlas_encoding`), which the hub
+ * replaces; until the hub forwards that negotiation to its weaver the session
+ * stays native rather than silently weave an sRGB-declared PQ atlas or drop PQ.
+ */
+#define COMP_HUB_REASON_ATLAS_ENCODING "atlas_encoding_requested"
 /*!
  * Mid-session RETIRE (#2317 P2b): a frame needed a plane — the Local2D
  * over-flatten, the 2D-under backdrop or an authored mask — and the hub could not

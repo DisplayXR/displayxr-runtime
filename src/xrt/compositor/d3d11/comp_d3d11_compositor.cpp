@@ -21,7 +21,7 @@
 #include "comp_d3d11_state_guard.h"
 #include "comp_xbridge.h"
 #include "comp_split_gate.h"
-// #2317 P1b: the D3D11 hub (DXR_HUB=1 shim).
+// #2317: the D3D11 hub (P1b shim; the default since step 2, DXR_HUB=0 kills it).
 #include "hub_d3d11/comp_hub_d3d11.h"
 #include "hub_d3d11/comp_hub_d3d11_handoff.h"
 
@@ -323,7 +323,9 @@ struct comp_d3d11_compositor
 	bool local2d_plane_warned;
 
 	/*!
-	 * #2317 P1b: the D3D11 HUB SHIM, behind `DXR_HUB=1` (default OFF).
+	 * #2317 P1b: the D3D11 HUB SHIM — the DEFAULT since #2317 step 2 for a
+	 * session that passes its create-time checks; `DXR_HUB=0` is the kill
+	 * switch (@ref d3d11_hub_policy).
 	 *
 	 * When active this tier owns no display processor, no target and no split:
 	 * the renderer composes the atlas on the app device exactly as always, and the
@@ -2612,6 +2614,19 @@ d3d11_projection_layer_view_count(const struct comp_layer_accum *layers)
 	return 0;
 }
 
+//! #2273 `DXR_ATLAS_ENCODING=pq`, read once (shared by the PQ encode and the
+//! hub's create-time refusal, so the two can never disagree).
+static bool
+d3d11_pq_atlas_requested(void)
+{
+	static int requested = -1;
+	if (requested < 0) {
+		const char *v = getenv("DXR_ATLAS_ENCODING");
+		requested = (v != nullptr && _stricmp(v, "pq") == 0) ? 1 : 0;
+	}
+	return requested == 1;
+}
+
 /*!
  * #2273 — DXR_ATLAS_ENCODING=pq (experimental, needs DXR_ATLAS_FORMAT=rgb10a2):
  * re-encode the composed atlas as PQ and declare it, but only to a DP that
@@ -2622,12 +2637,7 @@ d3d11_projection_layer_view_count(const struct comp_layer_accum *layers)
 static void
 d3d11_maybe_encode_atlas_pq(struct comp_d3d11_compositor *c)
 {
-	static int requested = -1;
-	if (requested < 0) {
-		const char *v = getenv("DXR_ATLAS_ENCODING");
-		requested = (v != nullptr && _stricmp(v, "pq") == 0) ? 1 : 0;
-	}
-	if (requested == 0 || c->display_processor == NULL) {
+	if (!d3d11_pq_atlas_requested() || c->display_processor == NULL) {
 		return;
 	}
 	if (!c->pq_atlas_checked) {
@@ -4264,16 +4274,41 @@ d3d11_make_dp(struct comp_d3d11_compositor *c,
               ID3D11DeviceContext *context,
               bool on_scanout);
 
-//! `DXR_HUB=1`, read once. Process-level env, like every in-process DXR_* knob.
-static bool
-d3d11_hub_requested(void)
+/*!
+ * #2317 step 2: what `DXR_HUB` asks for. Read once; process-level env, like every
+ * in-process DXR_* knob.
+ *
+ * - unset / empty: DEFAULT — the hub engages for every session that passes the
+ *   create-time checks in @ref d3d11_hub_stage_a (the #1264 / ADR-039 shape).
+ * - a false spelling (`0`, `false`, `off`, `no`): the KILL SWITCH — the tier's
+ *   own legs, exactly as before the flip (`reason=disabled_by_env`).
+ * - anything else (`1`): FORCED — the P1b..P2c opt-in, kept so existing
+ *   recipes keep working. It forces nothing past a refusal: a hosted,
+ *   transparent or texture-class session still goes native by name.
+ */
+enum d3d11_hub_policy_kind
 {
-	static int on = -1;
-	if (on < 0) {
+	D3D11_HUB_POLICY_DEFAULT,
+	D3D11_HUB_POLICY_DISABLED,
+	D3D11_HUB_POLICY_FORCED,
+};
+
+static enum d3d11_hub_policy_kind
+d3d11_hub_policy(void)
+{
+	static int policy = -1;
+	if (policy < 0) {
 		const char *e = getenv("DXR_HUB");
-		on = (e != nullptr && e[0] == '1') ? 1 : 0;
+		if (e == nullptr || e[0] == '\0') {
+			policy = D3D11_HUB_POLICY_DEFAULT;
+		} else if (e[0] == '0' || _stricmp(e, "false") == 0 || _stricmp(e, "off") == 0 ||
+		           _stricmp(e, "no") == 0) {
+			policy = D3D11_HUB_POLICY_DISABLED;
+		} else {
+			policy = D3D11_HUB_POLICY_FORCED;
+		}
 	}
-	return on == 1;
+	return (enum d3d11_hub_policy_kind)policy;
 }
 
 //! The pure-D3D11 handoff for this tier's renderer atlas (the per-frame fields
@@ -4341,8 +4376,8 @@ d3d11_hub_stage_a(struct comp_d3d11_compositor *c,
                   int32_t display_screen_left,
                   int32_t display_screen_top)
 {
-	if (!d3d11_hub_requested()) {
-		return COMP_HUB_REASON_NOT_REQUESTED;
+	if (d3d11_hub_policy() == D3D11_HUB_POLICY_DISABLED) {
+		return COMP_HUB_REASON_DISABLED_BY_ENV;
 	}
 	if (c->has_shared_texture) {
 		return COMP_SPLIT_REASON_SHARED_TEXTURE;
@@ -4355,6 +4390,9 @@ d3d11_hub_stage_a(struct comp_d3d11_compositor *c,
 	}
 	if (transparent_background) {
 		return COMP_HUB_REASON_TRANSPARENT;
+	}
+	if (d3d11_pq_atlas_requested()) {
+		return COMP_HUB_REASON_ATLAS_ENCODING;
 	}
 
 	uint64_t render_packed_luid = 0;
@@ -6205,10 +6243,11 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	const char *split_off_reason = COMP_SPLIT_REASON_KILLED_BY_ENV;
 
 	/*
-	 * #2317 P1b — the D3D11 HUB, behind DXR_HUB=1, decided FIRST. When it
-	 * engages, this tier's own split, target and display processor are never
-	 * created; when it refuses, nothing was left behind and the stock ladder
-	 * below runs exactly as before. ONE `hub placement:` line per session.
+	 * #2317 — the D3D11 HUB, decided FIRST. The default since step 2 (DXR_HUB=0
+	 * is the kill switch). When it engages, this tier's own split, target and
+	 * display processor are never created; when it refuses — the kill switch or
+	 * any create-time check — nothing was left behind and the stock ladder below
+	 * runs exactly as before. ONE `hub placement:` line per session.
 	 */
 	{
 		const char *hub_reason = d3d11_hub_stage_a(c, xdev, dp_factory_d3d11, transparent_background,
@@ -6222,12 +6261,23 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			}
 			U_LOG_W(
 			    "hub placement: hub=1 render=%08lx:%08lx hub_dev=%08lx:%08lx ingress=%s — weave/present "
-			    "on the D3D11 hub's own device (#2317 P1b; DXR_HUB=1)",
+			    "on the D3D11 hub's own device (#2317; %s)",
 			    (unsigned long)rdesc.AdapterLuid.HighPart, (unsigned long)rdesc.AdapterLuid.LowPart,
 			    (unsigned long)(uint32_t)(hl >> 32), (unsigned long)(uint32_t)hl,
-			    comp_hub_d3d11_is_direct(c->hub.split) ? "direct" : "xbridge");
+			    comp_hub_d3d11_is_direct(c->hub.split) ? "direct" : "xbridge",
+			    // No other `hub=<digit>` in this line: the leading field is a
+			    // parse target, and log greps are case-insensitive.
+			    d3d11_hub_policy() == D3D11_HUB_POLICY_FORCED
+			        ? "forced by the DXR_HUB env var"
+			        : "the default; the DXR_HUB env var at 0 kills it");
+		} else if (strcmp(hub_reason, COMP_HUB_REASON_DISABLED_BY_ENV) == 0) {
+			U_LOG_W(
+			    "hub placement: hub=0 reason=%s — the DXR_HUB kill switch: this tier's own legs weave "
+			    "(#2317)",
+			    hub_reason);
 		} else {
-			U_LOG_W("hub placement: hub=0 reason=%s (#2317 P1b)", hub_reason);
+			U_LOG_W("hub placement: hub=0 reason=%s — this tier's own legs weave this session (#2317)",
+			        hub_reason);
 		}
 	}
 

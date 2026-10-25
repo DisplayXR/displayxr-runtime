@@ -343,6 +343,8 @@ _package\run_cube_handle_d3d11_win.bat
 ```
 **Elevated-terminal caveat:** the bundled Khronos `openxr_loader.dll` (1.1.38 and 1.1.43) silently ignores `XR_RUNTIME_JSON` in elevated/admin processes and falls back to `HKLM\Software\Khronos\OpenXR\1\ActiveRuntime`. Use a non-elevated terminal, or push the rebuilt DLL to Program Files.
 
+**In-process D3D11 weaves through the hub by default (#2317 step 2, ADR-059).** A plain window-bound `_handle` D3D11 session presents from `comp_hub_d3d11`; `DXR_HUB=0` is the kill switch back to the tier's own legs (for A/B and oracle native arms — an old recipe that leaves `DXR_HUB` unset for its "native" arm now measures the hub). Each session logs one `hub placement: hub=1 … | hub=0 reason=<token>` line.
+
 **Which DLL loaded?** Every `xrCreateInstance` logs a WARN line near the top of `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.<pid>_<ts>.log` — search `loaded from:` for the authoritative path. Full dev-iteration reference: `docs/getting-started/building.md`.
 
 After a rebuild, push binaries to `C:\Program Files\DisplayXR\Runtime` with **`scripts/push-runtime-pf.sh`** — never hand-copy. A *partial* copy (e.g. service exe updated, client DLLs not) arms a time bomb: the client↔service git-tag gate rejects every `xrCreateInstance` from the moment the service next restarts, and every app goes black with no obvious cause. The script copies the full set (excluding the shell + preserving the installed MCP adapter), verifies both tags match, and restarts the service immediately so a mismatch can never lie dormant. Only run the installer when the installer itself changed.
