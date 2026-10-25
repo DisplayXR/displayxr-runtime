@@ -1250,6 +1250,11 @@ struct comp_gl_compositor
 		//! A retire handed the HWND back to GL's presenter: log the first
 		//! SwapBuffers after it, once.
 		bool log_first_native_present;
+		//! After a retire: the GL DP's factory has not succeeded yet (retried,
+		//! frames held). See gl_hub_retry_dp.
+		bool dp_owed;
+		uint32_t dp_owed_frames;
+		uint32_t dp_attempts;
 		//! #867: the predicted display time handed out last (monotonic clamp).
 		uint64_t last_display_time_ns;
 		//! The POST_COMPOSE capture intent handed to the hub this frame.
@@ -5304,7 +5309,7 @@ gl_segments_tick(struct comp_gl_compositor *c, bool eligible, uint32_t present_w
  */
 
 static void
-gl_create_gl_dp(struct comp_gl_compositor *c, void *dp_factory_gl, void *dp_window)
+gl_create_gl_dp(struct comp_gl_compositor *c, void *dp_factory_gl, void *dp_window, bool quiet_failure)
 {
 	if (dp_factory_gl == NULL) {
 		return;
@@ -5336,7 +5341,9 @@ gl_create_gl_dp(struct comp_gl_compositor *c, void *dp_factory_gl, void *dp_wind
 #endif
 		xrt_display_processor_gl_set_shared_texture_present(c->display_processor, gl_shared_texture_present);
 	} else {
-		U_LOG_W("GL compositor: display processor factory returned %d, using built-in shaders", dp_ret);
+		if (!quiet_failure) {
+			U_LOG_W("GL compositor: display processor factory returned %d, using built-in shaders", dp_ret);
+		}
 		c->display_processor = NULL;
 	}
 }
@@ -5502,6 +5509,66 @@ gl_hub_stage_a2(struct comp_gl_compositor *c, struct gl_interop_adapter *adapter
 }
 
 /*!
+ * After a retire the GL display processor is OWED until its factory succeeds:
+ * the vendor's GL weaver for this HWND can refuse for a moment after the hub's
+ * D3D11 weaver was released (measured: Leia SR srCreateWeaverGL returned
+ * SR_ERROR_RUNTIME_FAILURE ~85 ms after the D3D11 weaver's reaper ran). Tried
+ * at the retire and then every @ref GL_HUB_DP_RETRY_FRAMES frames; meanwhile
+ * the native leg presents NOTHING (@ref gl_hub_hold_frame), so the panel
+ * holds the last hub-woven frame instead of an unwoven atlas. After
+ * @ref GL_HUB_DP_GIVE_UP_FRAMES frames it gives up and the native leg runs
+ * without a DP (the pre-existing no-plug-in behaviour), logged once. Caller
+ * holds c->mutex with the GL context current.
+ */
+#define GL_HUB_DP_RETRY_FRAMES 15
+#define GL_HUB_DP_GIVE_UP_FRAMES 600
+static void
+gl_hub_retry_dp(struct comp_gl_compositor *c)
+{
+	if (!c->hub.dp_owed || (c->hub.dp_owed_frames % GL_HUB_DP_RETRY_FRAMES) != 0) {
+		return;
+	}
+	c->hub.dp_attempts++;
+	os_mutex_lock(&c->dp_swap_mutex);
+	gl_create_gl_dp(c, c->hub.dp_factory_gl, c->hub.dp_window, /*quiet_failure=*/true);
+	if (c->display_processor != NULL) {
+		// The fresh DP has seen none of the session's state.
+		xrt_display_processor_gl_request_display_mode(c->display_processor, c->hub.want_3d);
+		if (c->eye_tracking_mode_set) {
+			xrt_display_processor_gl_set_eye_tracking_mode(c->display_processor, c->eye_tracking_mode);
+		}
+	}
+	os_mutex_unlock(&c->dp_swap_mutex);
+	if (c->display_processor != NULL) {
+		c->hub.dp_owed = false;
+		U_LOG_W(
+		    "#2317 GL hub retire: GL display processor created on attempt %u — %u app frame(s) were held "
+		    "(not presented) while it was owed",
+		    c->hub.dp_attempts, c->hub.dp_owed_frames);
+	} else if (c->hub.dp_owed_frames >= GL_HUB_DP_GIVE_UP_FRAMES) {
+		c->hub.dp_owed = false;
+		U_LOG_W(
+		    "#2317 GL hub retire: no GL display processor after %u attempts / %u held frames — the native leg "
+		    "presents without a weaver from here on",
+		    c->hub.dp_attempts, c->hub.dp_owed_frames);
+	}
+}
+
+//! A frame while the GL DP is owed: present nothing (the panel keeps the last
+//! hub-woven frame), stay disarmed. Logged once per retire.
+static void
+gl_hub_hold_frame(struct comp_gl_compositor *c)
+{
+	if (c->hub.dp_owed_frames == 0) {
+		U_LOG_W(
+		    "#2317 GL hub retire: the GL display processor is not ready yet — holding the last hub-woven "
+		    "frame (no unwoven present) until it is");
+	}
+	c->hub.dp_owed_frames++;
+	c->repaint.armed = false;
+}
+
+/*!
  * Mid-session RETIRE (@ref COMP_HUB_REASON_PLANES_UNSUPPORTED_GL): the hub's
  * RETIRED + `weave placement: CHANGED` lines, the deposit freed, the GL atlas
  * and the GL display processor back. Caller holds c->mutex with the GL context
@@ -5531,18 +5598,10 @@ gl_hub_retire(struct comp_gl_compositor *c, const char *token)
 		u_capture_intent_complete(&c->hub.capture, &c->mcp_capture, false);
 	}
 
-	os_mutex_lock(&c->dp_swap_mutex);
-	gl_create_gl_dp(c, c->hub.dp_factory_gl, c->hub.dp_window);
-	if (c->display_processor != NULL) {
-		// The fresh DP has seen none of the session's state.
-		xrt_display_processor_gl_request_display_mode(c->display_processor, c->hub.want_3d);
-		if (c->eye_tracking_mode_set) {
-			xrt_display_processor_gl_set_eye_tracking_mode(c->display_processor, c->eye_tracking_mode);
-		}
-	} else {
-		U_LOG_W("#2317 GL hub retire: no GL display processor — continuing without");
-	}
-	os_mutex_unlock(&c->dp_swap_mutex);
+	c->hub.dp_owed = c->hub.dp_factory_gl != NULL;
+	c->hub.dp_owed_frames = 0;
+	c->hub.dp_attempts = 0;
+	gl_hub_retry_dp(c);
 }
 
 /*!
@@ -5605,7 +5664,11 @@ static void
 gl_hub_commit(struct comp_gl_compositor *c, const struct comp_segments_content *seg_content)
 {
 	struct comp_hub_d3d11_handoff h = {};
-	comp_gl_deposit_end(c->hub.dep, comp_hub_d3d11_is_direct(c->hub.split), &h);
+	const uint32_t cols = c->eff_cols > 0 ? c->eff_cols : c->tile_columns;
+	const uint32_t rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
+	const uint32_t tile_w = c->eff_tile_w > 0 ? c->eff_tile_w : c->view_width;
+	const uint32_t tile_h = c->eff_tile_h > 0 ? c->eff_tile_h : c->view_height;
+	comp_gl_deposit_end(c->hub.dep, comp_hub_d3d11_is_direct(c->hub.split), cols * tile_w, rows * tile_h, &h);
 
 	// The hub's swapchain IS the resize path while it is up (#1178).
 	RECT rc;
@@ -5614,10 +5677,6 @@ gl_hub_commit(struct comp_gl_compositor *c, const struct comp_segments_content *
 		                             (uint32_t)(rc.bottom - rc.top));
 	}
 
-	const uint32_t cols = c->eff_cols > 0 ? c->eff_cols : c->tile_columns;
-	const uint32_t rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
-	const uint32_t tile_w = c->eff_tile_w > 0 ? c->eff_tile_w : c->view_width;
-	const uint32_t tile_h = c->eff_tile_h > 0 ? c->eff_tile_h : c->view_height;
 	comp_hub_d3d11_stage_segment_content(c->hub.split, seg_content);
 	comp_hub_d3d11_submit_atlas(c->hub.split, &h, cols, rows, tile_w, tile_h);
 
@@ -7285,6 +7344,8 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	if (c->hub.active && (c->local_2d_last_frame || c->zones_frame ||
 	                      (c->active_zone_mask != NULL && c->active_zone_mask->submitted))) {
 		gl_hub_retire(c, COMP_HUB_REASON_PLANES_UNSUPPORTED_GL);
+	} else if (c->hub.dp_owed) {
+		gl_hub_retry_dp(c);
 	}
 	// #2342 P2c: the hub is this frame's POST-compose capture site; a
 	// projection-only intent stays with the native projection-done point.
@@ -8190,6 +8251,8 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		// #2317 P3: the hub weaves and presents; the GL weave, present,
 		// DwmFlush pacing and repaint snapshot are not used.
 		gl_hub_commit(c, &seg_content);
+	} else if (c->hub.dp_owed) {
+		gl_hub_hold_frame(c);
 	} else
 #endif
 #ifdef XRT_OS_WINDOWS
@@ -9865,7 +9928,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 #endif
 	// Under the hub the HWND's weaver is the hub's D3D11 one (one per window).
 	if (!gl_hub_active(c)) {
-		gl_create_gl_dp(c, dp_factory_gl, dp_window);
+		gl_create_gl_dp(c, dp_factory_gl, dp_window, false);
 	}
 
 	// Transparent-background present path (Windows). Gated on an app-provided
@@ -9914,7 +9977,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		if (hub_reason != NULL) {
 			U_LOG_W("hub placement: hub=0 reason=%s (#2317 P3)", hub_reason);
 			gl_log_weave_placement_native(c, xdev, display_screen_left, display_screen_top);
-			gl_create_gl_dp(c, dp_factory_gl, dp_window);
+			gl_create_gl_dp(c, dp_factory_gl, dp_window, false);
 		} else {
 			gl_hub_log_placement(c, xdev, display_screen_left, display_screen_top);
 		}

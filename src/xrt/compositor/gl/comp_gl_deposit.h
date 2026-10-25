@@ -161,10 +161,16 @@ comp_gl_deposit_begin(struct comp_gl_deposit *dep, struct comp_hub_d3d11 *hub);
  * fields. When the hub's ingress is NOT direct, also queues the GPU-side wait
  * on the deposit's D3D11 context that orders comp_xbridge's read after GL's
  * write (the hub's stable-atlas xbridge route waits on nothing itself: it
- * assumes the producer wrote on that context).
+ * assumes the producer wrote on that context). On the interop path only the
+ * @p content_w x @p content_h top-left box (what the hub crops and weaves) is
+ * copied from the transit into the deposit.
  */
 void
-comp_gl_deposit_end(struct comp_gl_deposit *dep, bool hub_direct, struct comp_hub_d3d11_handoff *h);
+comp_gl_deposit_end(struct comp_gl_deposit *dep,
+                    bool hub_direct,
+                    uint32_t content_w,
+                    uint32_t content_h,
+                    struct comp_hub_d3d11_handoff *h);
 
 #ifdef __cplusplus
 }

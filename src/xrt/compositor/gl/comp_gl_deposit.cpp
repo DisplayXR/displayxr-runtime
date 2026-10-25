@@ -333,7 +333,7 @@ gl_dep_probe(struct comp_gl_deposit *dep)
 		glEnable(GL_SCISSOR_TEST);
 	}
 	struct comp_hub_d3d11_handoff h = {};
-	comp_gl_deposit_end(dep, /*hub_direct=*/true, &h);
+	comp_gl_deposit_end(dep, /*hub_direct=*/true, dep->width, dep->height, &h);
 
 	D3D11_TEXTURE2D_DESC sd = {};
 	sd.Width = 1;
@@ -656,7 +656,11 @@ comp_gl_deposit_begin(struct comp_gl_deposit *dep, struct comp_hub_d3d11 *hub)
 }
 
 extern "C" void
-comp_gl_deposit_end(struct comp_gl_deposit *dep, bool hub_direct, struct comp_hub_d3d11_handoff *h)
+comp_gl_deposit_end(struct comp_gl_deposit *dep,
+                    bool hub_direct,
+                    uint32_t content_w,
+                    uint32_t content_h,
+                    struct comp_hub_d3d11_handoff *h)
 {
 	if (dep == nullptr) {
 		return;
@@ -681,7 +685,16 @@ comp_gl_deposit_end(struct comp_gl_deposit *dep, bool hub_direct, struct comp_hu
 		// After the unlock the interop contract orders D3D11 commands that
 		// ACCESS the registered transit behind GL's writes: this copy is one,
 		// and the fence signal follows it in this context's stream.
-		dep->ctx->CopyResource(dep->tex, dep->iop_tex);
+		// Only the content box the hub crops and weaves (top-left): a full
+		// copy of the worst-case atlas measured 54% app GPU vs 9.6% native on
+		// an Intel UHD (#2317 P3 panel).
+		const D3D11_BOX box = {0,
+		                       0,
+		                       0,
+		                       content_w < dep->width ? content_w : dep->width,
+		                       content_h < dep->height ? content_h : dep->height,
+		                       1};
+		dep->ctx->CopySubresourceRegion(dep->tex, 0, 0, 0, 0, dep->iop_tex, 0, &box);
 		dep->ctx4->Signal(dep->fence, dep->fence_value);
 		dep->ctx->Flush();
 	}
