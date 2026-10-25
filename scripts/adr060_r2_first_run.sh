@@ -177,7 +177,10 @@ if [ "$EXPECT" = leia-l4 ]; then
     printf 'cd /d "%s" || exit /b 1\r\n' "$(cygpath -w "$LEIA_REPO")"
     printf 'call scripts\\build-windows.bat build\r\n'
   } > "$SNAP/leia_build.cmd"
-  cmd //c "$(cygpath -w "$SNAP/leia_build.cmd")"
+  # A depot_tools ninja first on PATH breaks the plug-in's CMake configure
+  # ("ninja --version: no such file"; seen on the panel box): drop it for this build.
+  LEIA_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vi 'depot_tools' | paste -sd: - || true)"
+  PATH="${LEIA_PATH:-$PATH}" cmd //c "$(cygpath -w "$SNAP/leia_build.cmd")"
   DEV_DLL="$(find "$LEIA_REPO/_package" -name DisplayXR-LeiaSR.dll -newer "$SNAP/leia-sr.reg" 2>/dev/null | sed -n 1p)"
   [ -n "$DEV_DLL" ] || { echo "ERROR: no freshly built DisplayXR-LeiaSR.dll under $LEIA_REPO/_package" >&2; exit 1; }
   echo "== dev plug-in: $DEV_DLL sha256=$(sha256sum "$DEV_DLL" | awk '{print $1}')"
