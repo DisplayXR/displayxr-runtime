@@ -680,7 +680,16 @@ if [ "$COMPONENT" = unity ]; then
       else
         # Channel 1 — repack the .tgz with the signed DLL, re-upload over the asset.
         cp "$SIGNED_DLL" "$DLL"
-        ( cd "$D/x" && tar czf "$D/$TGZ" "$(basename "$PKGDIR")" )
+        # COPYFILE_DISABLE + --no-mac-metadata: macOS bsdtar otherwise adds a `._<name>`
+        # AppleDouble entry for EVERY file (v2.33.0 shipped 297 of them; Unity imports
+        # `._*.meta` / `._*.so` from a tarball install as junk assets). macOS `tar tzf`
+        # HIDES those entries, so count with Python's tarfile and refuse a dirty pack.
+        find "$D/x" -name '._*' -delete
+        ( cd "$D/x" && if tar --version 2>/dev/null | grep -q bsdtar; then
+            COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -czf "$D/$TGZ" "$(basename "$PKGDIR")"
+          else tar czf "$D/$TGZ" "$(basename "$PKGDIR")"; fi )
+        AD=$(python3 -I -c 'import tarfile,sys;print(sum("/._" in n or n.startswith("._") for n in tarfile.open(sys.argv[1]).getnames()))' "$D/$TGZ")
+        [ "$AD" = 0 ] || { echo "REFUSING: repacked $TGZ has $AD AppleDouble (._*) entries"; exit 1; }
         gh release upload "$NEW_TAG" "$D/$TGZ" --clobber -R "$REPO"
         # Channel 2 — put the signed DLL on the `upm` branch + move its version tag.
         # Uses the Phase-1 clone (cwd = the repo). CI already force-pushed `upm`
