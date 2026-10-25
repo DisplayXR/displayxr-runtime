@@ -1,7 +1,7 @@
 {
   "kit": "DXRHubAB",
-  "kitVersion": "0.3.0",
-  "issue": "#2317 P1d, P2a",
+  "kitVersion": "0.4.0",
+  "issue": "#2317 P1d, P2a, step 2 (d3d11 hub default)",
   "windowSeconds": 20,
   "warmupSeconds": 6,
   "reps": 3,
@@ -34,17 +34,18 @@
       "arms": [
         {
           "name": "native",
-          "env": {},
+          "env": {
+            "DXR_HUB": "0"
+          },
           "expectPath": "own-split",
           "topologies": [
             "default"
-          ]
+          ],
+          "expectLine": "hub placement: hub=0 reason=disabled_by_env"
         },
         {
           "name": "hub",
-          "env": {
-            "DXR_HUB": "1"
-          },
+          "env": {},
           "expectPath": "hub",
           "topologies": [
             "default"
@@ -53,11 +54,14 @@
         },
         {
           "name": "native",
-          "env": {},
+          "env": {
+            "DXR_HUB": "0"
+          },
           "expectPath": "own-split",
           "topologies": [
             "same-adapter"
-          ]
+          ],
+          "expectLine": "hub placement: hub=0 reason=disabled_by_env"
         },
         {
           "name": "hub-direct",
@@ -88,6 +92,16 @@
             "DXR_WEAVE_ON_SCANOUT": "0"
           },
           "expectPath": "native",
+          "optional": true
+        },
+        {
+          "name": "default-same",
+          "env": {},
+          "expectPath": "own-split",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=0 reason=same_adapter_opt_in",
           "optional": true
         }
       ]
@@ -232,5 +246,5 @@
     }
   ],
   "maxRetries": 3,
-  "armNotes": "An arm runs only on the topologies it lists (absent = all). 'native' = the path main takes BY DEFAULT on that topology (VK: the kill switch, its only non-hub path). expectLine = an extra regex the app log must match."
+  "armNotes": "An arm runs only on the topologies it lists (absent = all). 'native' = the per-API leg that is not the hub (for most apps the path main takes by default; VK: the kill switch, its only non-hub path; d3d11 since #2317 step 2: DXR_HUB=0, the tier's own #918 split / same-adapter engage). d3d11 hub arms: the default env on the hybrid (cross-adapter) topology; DXR_HUB=1 on same-adapter, where the default stays native until the single-dGPU desktop run (optional arm 'default-same' checks that). expectLine = an extra regex the app log must match."
 }

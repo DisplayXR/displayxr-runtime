@@ -585,6 +585,18 @@ probe_gpu_topology(struct cli_query_result *r, const struct xrt_plugin_display_i
 		snprintf(r->gpu_weave_env, sizeof(r->gpu_weave_env), "%s", env);
 	}
 	snprintf(r->gpu_weave_source, sizeof(r->gpu_weave_source), "%s", u_setting_source_str(weave_src));
+	// #2317 step 2: the D3D11 hub's kill switch, read as the runtime reads it
+	// (through the settings chain, a managed name).
+	{
+		char hub_buf[64];
+		enum u_setting_source hub_src = U_SETTING_SOURCE_DEFAULT;
+		const char *hub = u_setting_get_raw("DXR_HUB", hub_buf, sizeof(hub_buf), &hub_src);
+		snprintf(r->gpu_hub_source, sizeof(r->gpu_hub_source), "%s", u_setting_source_str(hub_src));
+		r->gpu_hub_env_set = hub != NULL && hub[0] != '\0';
+		if (r->gpu_hub_env_set) {
+			snprintf(r->gpu_hub_env, sizeof(r->gpu_hub_env), "%s", hub);
+		}
+	}
 	// Answered from the env alone here, so every early return below still
 	// reports it; re-stated at the end once the topology is known.
 	describe_service_split(r);
@@ -2709,6 +2721,11 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		PT("%s\n", r->gpu_verdict);
 		PT("DXR_WEAVE_ON_SCANOUT=%s (kill switch; the split is ON by default)\n",
 		   r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
+		PT("DXR_HUB=%s [%s] (kill switch; in-process D3D11 apps on a cross-adapter box weave through the "
+		   "D3D11 hub by default, =1 also on one adapter, #2317 -- each app's log 'hub placement:' line "
+		   "says what it did)\n",
+		   r->gpu_hub_env_set ? r->gpu_hub_env : "<unset>",
+		   r->gpu_hub_source[0] ? r->gpu_hub_source : "default");
 		PT("%s\n", r->gpu_service_split);
 		PT("%s\n", r->gpu_service_ingest);
 	}
@@ -3082,6 +3099,8 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddBoolToObject(gt, "applies", r->gpu_split_applies);
 		cJSON_AddStringToObject(gt, "weave_on_scanout_env",
 		                        r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
+		cJSON_AddStringToObject(gt, "hub_env", r->gpu_hub_env_set ? r->gpu_hub_env : "<unset>");
+		cJSON_AddStringToObject(gt, "hub_source", r->gpu_hub_source[0] ? r->gpu_hub_source : "default");
 		cJSON_AddStringToObject(gt, "service_split", r->gpu_service_split);
 		cJSON_AddStringToObject(gt, "split_ingress", r->gpu_split_ingress);
 		cJSON_AddStringToObject(gt, "service_ingest", r->gpu_service_ingest);

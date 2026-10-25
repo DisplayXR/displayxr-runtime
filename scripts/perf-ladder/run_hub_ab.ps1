@@ -401,6 +401,10 @@ function Invoke-Run {
     foreach ($k in $envMap.Keys) { $lines += ('set "{0}={1}"' -f $k, $envMap[$k]) }
     if ($RuntimePath -ne '') { $lines += ('set "PATH={0};%PATH%"' -f $RuntimePath) }
     $lines += ('cd /d "{0}"' -f $AppDir)
+    # A launch explorer.exe delivers AFTER this run gave up (seen: ~2 min late while another
+    # process held the panel) must not start: the next run would adopt it, with THIS arm's env.
+    $cancel = Join-Path $runDir 'launch.cancel'
+    $lines += ('if exist "{0}" exit /b 0' -f $cancel)
     $lines += ('"{0}" > "{1}" 2>&1' -f $item.exe, (Join-Path $runDir 'app-stdout.txt'))
     $bat = Join-Path $runDir 'launch.bat'
     Set-Content -Path $bat -Value ($lines -join "`r`n") -Encoding Ascii
@@ -415,7 +419,12 @@ function Invoke-Run {
         if ($proc -ne $null) { break }
         Start-Sleep -Milliseconds 300
     }
-    if ($proc -eq $null) { Log '  APP_NO_START'; Add-FailRow $rep $app $arm 0 'APP_NO_START' $runName; return 'APP_NO_START' }
+    if ($proc -eq $null) {
+        # Cancel a late delivery of this launch (the .bat checks the file before starting the app).
+        New-Item -ItemType File -Path $cancel -Force | Out-Null
+        Log '  APP_NO_START (launch.cancel written: a late explorer delivery will not start the app)'
+        Add-FailRow $rep $app $arm 0 'APP_NO_START' $runName; return 'APP_NO_START'
+    }
     $appPid = $proc.Id
     $script:startedPids += $appPid
     $logPath = $null

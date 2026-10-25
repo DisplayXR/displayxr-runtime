@@ -9,7 +9,7 @@
  * Edit the census and re-run the script; the lint workflow runs it with
  * --check, which also fails when a name here no longer occurs in src/xrt.
  *
- * 67 levers: 48 Tier 1 (next launch), 19 Tier 2 (service-scoped).
+ * 68 levers: 49 Tier 1 (next launch), 19 Tier 2 (service-scoped).
  *
  * This is a DESCRIPTION of the levers, not a way to set them: only the names
  * u_setting_is_managed() accepts resolve from the per-user / machine stores.
@@ -53,6 +53,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_DP_FORWARD_HORIZON", 1, "App", "on (kill switch)", "#206: per-weave FORWARD horizon for the vendor eye predictor, computed from the vsync-locked vblank grid (DXGI frame statistics - measured period, not nominal)."},
 	{"DXR_DP_FORWARD_HORIZON_LOOP", 1, "App", "on (kill switch)", "#1435: learns the pipeline's whole-period offset (composition frame on DComp chains, queued frame at governor depth >= 2) from realised flips - mode of the last 32 resolved weaves, >= 24 agreeing..."},
 	{"DXR_FILL_FENCE_PARK", 1, "App", "on (kill switch)", "#1264 S1: a fill's GPU fence wait releases the compositor lock (re-validated on retake; superseded fills are dropped)."},
+	{"DXR_HUB", 1, "App", "on on a cross-adapter box (=0 kills; =1 also engages on one adapter)", "#2317 step 2 (ADR-059 decision 4): the in-process D3D11 leg weaves and presents through the D3D11 hub (comp_hub_d3d11) for every session that passes its create-time checks on the cross-adapter..."},
 	{"DXR_L2D_CLIP", 1, "App", "on", "#862 clips the Local2D composite to non-identity pixels"},
 	{"DXR_LATE_WEAVE", 1, "App + Svc", "on", "Weave as late as possible before scanout."},
 	{"DXR_LATE_WEAVE_SLIP_CAP", 1, "App + Svc", "on (0 = pre-2026-09 policy)", "Damps governor depth flapping: slip-rate escalation capped at needed_depth()+1, return probe needs 3 clean slip windows, slip re-escalation within two dwells of a probe doubles the dwell (30 -> 60..."},

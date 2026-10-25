@@ -67,8 +67,8 @@ kill switch):
 
 | app | topology | `native` (expected path) | hub arm(s) (expected line) |
 |---|---|---|---|
-| d3d11 | default | default env (own #918 split) | `hub`: `DXR_HUB=1` (`hub placement: hub=1 ... ingress=xbridge`) |
-| d3d11 | same-adapter | default env (own same-adapter engage) | `hub-direct`: `DXR_HUB=1` (`ingress=direct`); `hub-xbridge`: + `DXR_HUB_INGRESS=xbridge` |
+| d3d11 | default | `DXR_HUB=0` (own #918 split; the kill switch since #2317 step 2) | `hub`: default env (`hub placement: hub=1 ... ingress=xbridge`) |
+| d3d11 | same-adapter | `DXR_HUB=0` (own same-adapter engage) | `hub-direct`: `DXR_HUB=1` (`ingress=direct`); `hub-xbridge`: + `DXR_HUB_INGRESS=xbridge`; optional `default-same`: default env, expected NATIVE (`reason=same_adapter_opt_in` - the default-on scope is cross-adapter until the desktop run) |
 | d3d12 | default | default env (own-legs split) | `hub` (optional): `DXR_SPLIT_D3D12_HYBRID_REROUTE=1` (`ingress=xbridge`) - the code gate also needs `DXR_APP_FRAME_DIVISOR>=2`, so it is not like-for-like |
 | d3d12 | same-adapter | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env, the #1264 reroute (`hub placement: hub=1 ... ingress=xbridge ingress_reason=default_xbridge`); `hub-direct`: + `DXR_HUB_INGRESS=direct` (P2a, `ingress=direct`) |
 | vk | default | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`ingress=xbridge ingress_reason=cross_adapter`) |
