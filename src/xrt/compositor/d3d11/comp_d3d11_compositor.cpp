@@ -1461,6 +1461,9 @@ d3d11_client_geometry(
 	return true;
 }
 
+static bool
+d3d11_window_metrics(struct comp_d3d11_compositor *c, bool for_locate, struct xrt_window_metrics *out_metrics);
+
 static struct u_canvas_rect
 d3d11_effective_canvas(struct comp_d3d11_compositor *c)
 {
@@ -5592,7 +5595,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		 * resolver on its eye-only/legacy branches.
 		 */
 		struct xrt_window_metrics canvas = {};
-		const bool have_canvas = comp_d3d11_compositor_get_window_metrics(xc, &canvas);
+		// ADR-060: THIS frame's target (the xrEndFrame slot), never a locate in flight.
+		const bool have_canvas = d3d11_window_metrics(d3d11_comp(xc), /* for_locate */ false, &canvas);
 
 		// XR_DXR_cursor_depth v5: resolve the cursor BEFORE the projection
 		// pass - its sprite's encoding takes part in the frame's compose
@@ -10934,17 +10938,14 @@ comp_d3d11_compositor_get_texture_target_state(struct xrt_compositor *xc,
 	return true;
 }
 
-bool
-comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics)
+/*!
+ * The window (bound: the texture target) metrics. @p for_locate: frame them to
+ * the target a locate in flight chained (the oxr locate path), else to the
+ * xrEndFrame slot (the frame being composed) — ADR-060, R1 review.
+ */
+static bool
+d3d11_window_metrics(struct comp_d3d11_compositor *c, bool for_locate, struct xrt_window_metrics *out_metrics)
 {
-	if (xc == nullptr || out_metrics == nullptr) {
-		if (out_metrics != nullptr) {
-			out_metrics->valid = false;
-		}
-		return false;
-	}
-
-	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 	memset(out_metrics, 0, sizeof(*out_metrics));
 
 	// Shared-texture (texture-app) sessions carry the app's window in
@@ -10989,7 +10990,7 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_w
 	uint32_t win_px_w = 0;
 	uint32_t win_px_h = 0;
 	POINT client_origin = {0, 0};
-	if (!d3d11_client_geometry(c, &win_px_w, &win_px_h, &client_origin, /* for_locate */ true) || win_px_w == 0 ||
+	if (!d3d11_client_geometry(c, &win_px_w, &win_px_h, &client_origin, for_locate) || win_px_w == 0 ||
 	    win_px_h == 0) {
 		return false;
 	}
@@ -10997,11 +10998,16 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_w
 	// Multi-screen M6: the window's desktop rect, for the segment table.
 	// Device px — every DisplayXR executable is per-monitor DPI aware
 	// (#1201), the same space the screen registry's monitor rects are in.
-	c->seg_window.x = client_origin.x;
-	c->seg_window.y = client_origin.y;
-	c->seg_window.w = win_px_w;
-	c->seg_window.h = win_px_h;
-	c->have_seg_window = true;
+	// A bound texture session's segment window is d3d11_tt_weave's alone (set
+	// from the xrEndFrame resolve on the weave thread): a locate thread must
+	// not swap its rect in under the segment update.
+	if (!d3d11_tt_bound(c)) {
+		c->seg_window.x = client_origin.x;
+		c->seg_window.y = client_origin.y;
+		c->seg_window.w = win_px_w;
+		c->seg_window.h = win_px_h;
+		c->have_seg_window = true;
+	}
 
 	// Compute pixel size (meters per pixel)
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
@@ -11046,6 +11052,18 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_w
 	out_metrics->valid = true;
 
 	return true;
+}
+
+bool
+comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics)
+{
+	if (xc == nullptr || out_metrics == nullptr) {
+		if (out_metrics != nullptr) {
+			out_metrics->valid = false;
+		}
+		return false;
+	}
+	return d3d11_window_metrics(d3d11_comp(xc), /* for_locate */ true, out_metrics);
 }
 
 extern "C" bool
