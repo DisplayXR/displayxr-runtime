@@ -23,6 +23,7 @@
 #include "comp_xbridge.h"
 #include "comp_split_gate.h"
 #include "comp_d3d12_deposit.h"
+#include "comp_d3d12_app_release_fence.h" // #2362
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 // #1264 heavy-d3d12 reroute: the same-adapter fill arm. Vulkan-free D3D11 code
 // (comp_hub_d3d11, #2317 P1a); consumes only the pure-D3D11 handoff struct.
@@ -429,7 +430,42 @@ struct comp_d3d12_compositor
 		 * before the app-frame weave, and completed after it.
 		 */
 		struct u_capture_intent capture;
+		/*!
+		 * #2362: the release fence the APP published on the queue it handed
+		 * us (comp_d3d12_app_release_fence.h), probed once at Stage A. When
+		 * present, every hub-route frame queues a GPU-side Wait for the
+		 * published value on @ref comp_d3d12_compositor::command_queue in
+		 * front of the work that reads the app's image, and the frame exit
+		 * DEFERS its CPU idle-wait (see @ref app_defer_fence). NULL: none
+		 * published (or on another device) — the route is unchanged.
+		 */
+		ID3D12Fence *app_fence;
+		const char *app_fence_reason;
+		//! Last published value already waited for (a Wait per NEW value).
+		uint64_t app_fence_waited;
+		//! Session totals for the [RENDER] line: frames whose read was
+		//! ordered behind a fresh app value, and deferred drains that had to
+		//! block (the GPU had not reached the frame by the next reset).
+		uint64_t app_fence_waits;
+		uint64_t app_defer_blocked;
+		uint64_t app_fence_diag_ns;
 	} reroute;
+
+	/*!
+	 * #2362: the hub-route frame exit's DEFERRED CPU idle-wait. With an app
+	 * release fence consumed, the frame's atlas work on @ref command_queue
+	 * waits (GPU-side) for the app's own GPU frame, so an immediate
+	 * gpu_wait_idle_app at the exit would make xrEndFrame(N) block until the
+	 * APP's GPU frame N completes — the serialisation displayxr-unreal#65
+	 * measured. Instead the exit signals @ref app_defer_fence and returns; every
+	 * site that needs the app timeline idle (each command-allocator reset,
+	 * teardown, swapchain destroy) first waits for that value
+	 * (d3d12_app_drain_deferred). Same CPU wait, one frame later; none added.
+	 * 0 = nothing deferred.
+	 */
+	ID3D12Fence *app_defer_fence;
+	std::atomic<uint64_t> app_defer_value{0};
+	uint64_t app_defer_next;
 
 	//! Output target (DXGI swapchain).
 	struct comp_d3d12_target *target;
@@ -1338,6 +1374,84 @@ gpu_wait_idle_out(struct comp_d3d12_compositor *c)
 	gpu_wait_idle_on(d3d12_out_timeline(c));
 }
 
+/*!
+ * #2362: complete a hub-route frame exit's DEFERRED idle-wait (see
+ * @ref comp_d3d12_compositor::app_defer_fence). Call before anything that needs
+ * the app timeline idle and does not already call gpu_wait_idle_app: every
+ * `cmd_allocator->Reset()`, teardown, swapchain destroy. Free when nothing is
+ * deferred or the GPU is already past it. Thread-safe (a fence wait with no
+ * event, no shared counter).
+ */
+static void
+d3d12_app_drain_deferred(struct comp_d3d12_compositor *c)
+{
+	const uint64_t v = c->app_defer_value.load(std::memory_order_acquire);
+	if (v == 0 || c->app_defer_fence == nullptr || c->app_defer_fence->GetCompletedValue() >= v) {
+		return;
+	}
+	const uint64_t t0 = os_monotonic_get_ns();
+	c->app_defer_fence->SetEventOnCompletion(v, nullptr); // blocks until reached
+	const uint64_t dt = os_monotonic_get_ns() - t0;
+	c->reroute.app_defer_blocked++;
+	if (dt > 200ull * U_TIME_1MS_IN_NS) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W("#2362 hub ingest: a deferred frame drain blocked %.1f ms — the app's release fence "
+			        "was signalled late (or never: a hang here means the app published a value it did "
+			        "not submit)",
+			        (double)dt / 1e6);
+		}
+	}
+}
+
+/*!
+ * #2362: queue the GPU-side Wait for the app's latest published release value
+ * on the app queue, once per new value, in front of the next ExecuteCommandLists
+ * that reads the app's image. Hub route only (Stage A probes the fence).
+ */
+static void
+d3d12_reroute_wait_app_release(struct comp_d3d12_compositor *c)
+{
+	if (c->reroute.app_fence == nullptr) {
+		return;
+	}
+	const uint64_t v = comp_d3d12_app_release_fence_value(c->command_queue);
+	if (v == 0 || v <= c->reroute.app_fence_waited) {
+		return;
+	}
+	c->command_queue->Wait(c->reroute.app_fence, v);
+	c->reroute.app_fence_waited = v;
+	c->reroute.app_fence_waits++;
+}
+
+/*!
+ * #2362: the hub-route frame exit's CPU wait. Without an app release fence it
+ * is the immediate gpu_wait_idle_app it always was. With one, the frame's work
+ * is queued behind the app's own GPU frame, so the wait is DEFERRED to the next
+ * site that needs the timeline idle (d3d12_app_drain_deferred): signal our own
+ * fence past the frame and return.
+ */
+static void
+d3d12_reroute_frame_cpu_wait(struct comp_d3d12_compositor *c)
+{
+	if (c->reroute.app_fence == nullptr || c->app_defer_fence == nullptr) {
+		gpu_wait_idle_app(c);
+		return;
+	}
+	const uint64_t v = ++c->app_defer_next;
+	c->command_queue->Signal(c->app_defer_fence, v);
+	c->app_defer_value.store(v, std::memory_order_release);
+}
+
+extern "C" void
+comp_d3d12_compositor_drain_deferred(struct comp_d3d12_compositor *c)
+{
+	if (c != nullptr) {
+		d3d12_app_drain_deferred(c);
+	}
+}
+
 /*
  *
  * #918 D12-3 — Stage A: stand the output device and the bridge up.
@@ -1972,6 +2086,28 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	if (c->seg_screens != nullptr && c->seg_sys_info != nullptr) {
 		comp_hub_d3d11_set_screens(c->reroute.split, c->seg_screens, c->seg_sys_info, c->seg_pinned_display_id);
 	}
+	/*
+	 * #2362: an app-published release fence (engine apps that render on their
+	 * own main queue — the Unreal plug-in's RuntimeQueue). Probed once: the
+	 * publisher sets it before xrCreateSession.
+	 */
+	{
+		ID3D12Fence *af = nullptr;
+		const char *why = "none";
+		if (comp_d3d12_app_release_fence_query(c->command_queue, c->device, &af, &why) &&
+		    FAILED(c->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+		                                  reinterpret_cast<void **>(&c->app_defer_fence)))) {
+			c->app_defer_fence = nullptr;
+			af->Release();
+			af = nullptr;
+			why = "defer_fence_failed";
+		}
+		c->reroute.app_fence = af;
+		c->reroute.app_fence_reason = why;
+		U_LOG_W("#2362 hub ingest: release_fence=%s%s%s", af != nullptr ? "app" : "none",
+		        af != nullptr ? "" : " reason=", af != nullptr ? "" : why);
+	}
+
 	U_LOG_W(
 	    "#1264 heavy-d3d12 reroute ACTIVE: this session's fill/weave/present run on the d3d11 fill "
 	    "arm (ADR-039 — one fill engine); the atlas renders into a D3D11 deposit ring opened on the "
@@ -3668,6 +3804,7 @@ d3d12_compositor_capture_atlas_to_png(struct comp_d3d12_compositor *c, const cha
 	// Re-arm the cmd_allocator + cmd_list for our private use. GPU is
 	// guaranteed idle at this point because layer_commit's existing
 	// fence wait runs before we get here.
+	d3d12_app_drain_deferred(c); // #2362
 	c->cmd_allocator->Reset();
 	c->cmd_list->Reset(c->cmd_allocator, nullptr);
 
@@ -4925,6 +5062,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			c->out_cmd_allocator->Reset();
 			c->out_cmd_list->Reset(c->out_cmd_allocator, nullptr);
 		} else {
+			d3d12_app_drain_deferred(c); // #2362
 			c->cmd_allocator->Reset();
 			c->cmd_list->Reset(c->cmd_allocator, nullptr);
 		}
@@ -5917,6 +6055,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 
 	// Reset command allocator and command list
+	d3d12_app_drain_deferred(c); // #2362
 	c->cmd_allocator->Reset();
 	c->cmd_list->Reset(c->cmd_allocator, nullptr);
 
@@ -6053,6 +6192,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 			c->cmd_list->Close();
 			ID3D12CommandList *flush_lists[] = {c->cmd_list};
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+			if (c->reroute.active) {
+				d3d12_reroute_wait_app_release(c); // #2362: this list reads the app's image
+			}
+#endif
 			c->command_queue->ExecuteCommandLists(1, flush_lists);
 			gpu_wait_idle_app(c);
 
@@ -6060,6 +6204,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			d3d12_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_PROJECTION_ONLY);
 
 			// Re-arm cmd_list and put atlas back in RENDER_TARGET.
+			d3d12_app_drain_deferred(c); // #2362
 			c->cmd_allocator->Reset();
 			c->cmd_list->Reset(c->cmd_allocator, nullptr);
 			ws_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -6194,6 +6339,9 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		c->cmd_list->Close();
 		ID3D12CommandList *rr_lists[] = {c->cmd_list};
+		// #2362: the app's GPU write to its image is ordered before our read
+		// of it — GPU-side, on this queue, never a CPU wait (ADR-055).
+		d3d12_reroute_wait_app_release(c);
 		c->command_queue->ExecuteCommandLists(1, rr_lists);
 		if (c->reroute.plane_cl_open) {
 			/*
@@ -6202,8 +6350,9 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			 * behind the hub's consumer-fence value, and the deposit signal
 			 * (what the hub's producer wait names) after them. No CPU waits on
 			 * the hub; the entry is reused once its own value completes.
+			 * #2362: deferred when an app release fence is consumed.
 			 */
-			gpu_wait_idle_app(c);
+			d3d12_reroute_frame_cpu_wait(c);
 			auto &pe = c->reroute.plane_cl[c->reroute.plane_cl_cur];
 			pe.list->Close();
 			comp_d3d12_deposit_plane_wait_hub(c->reroute.dep, c->command_queue,
@@ -6217,7 +6366,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			comp_d3d12_deposit_signal(c->reroute.dep, c->command_queue);
 		} else {
 			comp_d3d12_deposit_signal(c->reroute.dep, c->command_queue);
-			gpu_wait_idle_app(c);
+			// #2362: deferred when an app release fence is consumed.
+			d3d12_reroute_frame_cpu_wait(c);
 		}
 
 		struct comp_hub_d3d11_handoff rr_handoff = {};
@@ -6324,6 +6474,18 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				    (unsigned long long)c->reroute.plane_cl_fallbacks);
 			}
 		}
+		// #2362: the consumed app release fence, session totals, 10 s cadence,
+		// only on a session that consumes one.
+		if (c->reroute.app_fence != nullptr) {
+			const uint64_t fnow = os_monotonic_get_ns();
+			if (fnow - c->reroute.app_fence_diag_ns >= 10ULL * U_TIME_1S_IN_NS) {
+				c->reroute.app_fence_diag_ns = fnow;
+				U_LOG_W("[RENDER] reroute release_fence=app waits=%llu deferred_blocked=%llu "
+				        "(session totals, #2362)",
+				        (unsigned long long)c->reroute.app_fence_waits,
+				        (unsigned long long)c->reroute.app_defer_blocked);
+			}
+		}
 		return XRT_SUCCESS;
 	}
 #endif
@@ -6349,6 +6511,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			gpu_wait_idle_app(c);
 
 			// Fresh command list for weaver
+			d3d12_app_drain_deferred(c); // #2362
 			c->cmd_allocator->Reset();
 			c->cmd_list->Reset(c->cmd_allocator, nullptr);
 
@@ -6483,6 +6646,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				                                D3D12_RESOURCE_STATE_COMMON, tap_path);
 				// Re-arm the cmd list for the composite below (the capture
 				// helper leaves it closed+executed).
+				d3d12_app_drain_deferred(c); // #2362
 				c->cmd_allocator->Reset();
 				c->cmd_list->Reset(c->cmd_allocator, nullptr);
 			}
@@ -6741,6 +6905,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			c->out_cmd_allocator->Reset();
 			c->out_cmd_list->Reset(c->out_cmd_allocator, nullptr);
 		} else {
+			d3d12_app_drain_deferred(c); // #2362
 			c->cmd_allocator->Reset();
 			c->cmd_list->Reset(c->cmd_allocator, nullptr);
 		}
@@ -6935,6 +7100,8 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	if (c->repaint_thread.joinable()) {
 		c->repaint_thread.join();
 	}
+	// #2362: a deferred frame may still be reading the deposit / app images.
+	d3d12_app_drain_deferred(c);
 	if (c->repaint.ticks > 0) {
 		U_LOG_W("#868: repaints=%llu ticks=%llu bail{armed=%llu gate=%llu race=%llu}",
 		        (unsigned long long)c->repaint.count, (unsigned long long)c->repaint.ticks,
@@ -6991,7 +7158,16 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 		c->reroute.plane_cl_fence->Release();
 		c->reroute.plane_cl_fence = nullptr;
 	}
+	// #2362: the app's release fence reference and our deferred-drain fence.
+	if (c->reroute.app_fence != nullptr) {
+		c->reroute.app_fence->Release();
+		c->reroute.app_fence = nullptr;
+	}
 #endif
+	if (c->app_defer_fence != nullptr) {
+		c->app_defer_fence->Release();
+		c->app_defer_fence = nullptr;
+	}
 
 	/*
 	 * #918 D12-3: quiesce the bridge NEXT — stop submitting, join its watchdog
@@ -7368,6 +7544,22 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	 */
 	d3d12_split_stage_a(c, xdev, display_screen_left, display_screen_top);
 	d3d12_log_weave_placement(c, xdev, display_screen_left, display_screen_top);
+	/*
+	 * #2362: off the hub route an app-published release fence is reported but
+	 * NOT consumed. This tier's own paths CPU-wait the app queue mid-frame
+	 * (gpu_wait_idle_app between the atlas and the weave lists), so a Wait on
+	 * the app's fence there would serialise xrEndFrame behind the app's GPU
+	 * frame — the cost displayxr-unreal#65 measured. One line, at create.
+	 */
+	if (!c->reroute.active) {
+		ID3D12Fence *af = nullptr;
+		const char *why = "none";
+		if (comp_d3d12_app_release_fence_query(c->command_queue, c->device, &af, &why)) {
+			af->Release();
+			U_LOG_W("#2362 release_fence=app consumed=0 route=%s (consumed on the hub route only)",
+			        c->split_active ? "own_split" : "in_process");
+		}
+	}
 
 	// Create output target (DXGI swapchain).
 	// The D3D12 weaver renders to whatever render target is bound on the
@@ -8744,6 +8936,7 @@ d3d12_ensure_scratch(struct comp_d3d12_compositor *c,
 static void
 d3d12_zone_cmd_begin(struct comp_d3d12_compositor *c)
 {
+	d3d12_app_drain_deferred(c); // #2362
 	c->cmd_allocator->Reset();
 	c->cmd_list->Reset(c->cmd_allocator, nullptr);
 }

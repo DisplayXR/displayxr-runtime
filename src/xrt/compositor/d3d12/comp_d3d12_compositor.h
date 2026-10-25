@@ -28,6 +28,14 @@ extern "C" {
 #endif
 
 /*!
+ * #2362: wait out a hub-route frame whose CPU idle-wait was deferred (an app
+ * release fence was consumed). Call before releasing anything the last frame's
+ * GPU work may still read (swapchain images). Free when nothing is pending.
+ */
+void
+comp_d3d12_compositor_drain_deferred(struct comp_d3d12_compositor *c);
+
+/*!
  * Create a native D3D12 compositor.
  *
  * This compositor renders directly using D3D12 without any Vulkan involvement.

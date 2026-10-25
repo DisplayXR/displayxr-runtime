@@ -194,6 +194,9 @@ d3d12_swapchain_destroy(struct xrt_swapchain *xsc)
 {
 	struct comp_d3d12_swapchain *sc = d3d12_sc(xsc);
 
+	// #2362: a hub-route frame with a deferred idle-wait may still read these.
+	comp_d3d12_compositor_drain_deferred(sc->c);
+
 	for (uint32_t i = 0; i < sc->image_count; i++) {
 		if (sc->images[i] != nullptr) {
 			sc->images[i]->Release();
