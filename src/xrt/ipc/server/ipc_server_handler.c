@@ -7359,6 +7359,21 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 	if (!comp_d3d11_service_weave_bind_window(ics->xc, hwnd)) {
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
+	// ADR-060 R2: offer the screen list. Inert unless this client's weave DP
+	// turns out windowless; then the service cuts the window per screen itself
+	// (the vendor's own 2D-region logic is gone with the window). A bind is
+	// rare (once per window), so the enumeration is not a per-frame cost.
+	if (ics->server != NULL && ics->server->xsysc != NULL && hwnd != 0 &&
+	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
+		struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (list != NULL) {
+			if (xrt_instance_enumerate_displays(ics->server->xinst, list) == XRT_SUCCESS) {
+				comp_d3d11_service_weave_offer_screens(ics->server->xsysc,
+				                                       (struct xrt_compositor *)ics->xc, list);
+			}
+			free(list);
+		}
+	}
 	return XRT_SUCCESS;
 #elif defined(COMP_MULTI_HAVE_WEAVE)
 	if (!comp_multi_weave_bind_window(ics->xc, hwnd)) {

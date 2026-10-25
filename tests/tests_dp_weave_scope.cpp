@@ -24,6 +24,7 @@ namespace {
 //! Set when the vtable slot is entered, so a test can assert it was NOT.
 bool g_called = false;
 uint32_t g_reported = XRT_DP_WEAVE_SCOPE_CANVAS;
+uint32_t g_flags = 0;
 bool g_answer = true;
 
 bool
@@ -35,6 +36,7 @@ fake_get_scanout_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_sca
 		return false;
 	}
 	out_caps->weave_scope = g_reported;
+	out_caps->flags = g_flags;
 	return true;
 }
 
@@ -170,4 +172,48 @@ TEST_CASE("dp_weave_scope: the caps call honours the caller's struct_size")
 	REQUIRE(xrt_display_processor_d3d11_get_scanout_caps(&dp, &caps));
 	CHECK(caps.weave_scope == XRT_DP_WEAVE_SCOPE_SCANOUT);
 	CHECK(caps.struct_size == sizeof(caps));
+}
+
+TEST_CASE("dp_weave_scope: windowless phase is opt-in, per instance (ADR-060)")
+{
+	g_called = false;
+	g_answer = true;
+	g_reported = XRT_DP_WEAVE_SCOPE_CANVAS;
+
+	// No DP at all: false, and nothing is dereferenced.
+	CHECK_FALSE(xrt_display_processor_d3d11_phases_from_present_origin(nullptr));
+
+	// A plug-in built before get_scanout_caps: false, slot never entered.
+	struct xrt_display_processor_d3d11 old_dp = make_dp(size_without_slot(), /* with_fn */ true);
+	g_flags = XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN;
+	CHECK_FALSE(xrt_display_processor_d3d11_phases_from_present_origin(&old_dp));
+	CHECK_FALSE(g_called);
+
+	struct xrt_display_processor_d3d11 dp = make_dp(sizeof(dp), /* with_fn */ true);
+
+	// A plug-in built before the bit wrote 0 there: stays window-bound.
+	g_flags = 0;
+	CHECK_FALSE(xrt_display_processor_d3d11_phases_from_present_origin(&dp));
+
+	// The other flag alone does not imply this one.
+	g_flags = XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE;
+	CHECK_FALSE(xrt_display_processor_d3d11_phases_from_present_origin(&dp));
+	CHECK(xrt_display_processor_d3d11_tolerates_resample(&dp));
+
+	g_flags = XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN;
+	CHECK(xrt_display_processor_d3d11_phases_from_present_origin(&dp));
+	CHECK_FALSE(xrt_display_processor_d3d11_tolerates_resample(&dp));
+
+	g_flags = XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN | XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE;
+	CHECK(xrt_display_processor_d3d11_phases_from_present_origin(&dp));
+
+	// A DP that declines the caps call is window-bound whatever it would say.
+	g_answer = false;
+	CHECK_FALSE(xrt_display_processor_d3d11_phases_from_present_origin(&dp));
+
+	struct xrt_display_processor_d3d11 null_slot = make_dp(sizeof(null_slot), /* with_fn */ false);
+	g_answer = true;
+	CHECK_FALSE(xrt_display_processor_d3d11_phases_from_present_origin(&null_slot));
+
+	g_flags = 0;
 }

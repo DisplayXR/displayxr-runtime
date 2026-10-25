@@ -139,6 +139,26 @@ struct xrt_dp_scanout_caps
 #define XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE (1u << 0)
 
 /*!
+ * @ref xrt_dp_scanout_caps::flags: THIS instance weaves a window correctly
+ * without holding it. Its output is right at any position it is handed
+ * through `set_present_origin` (+ the canvas offset): either its phase comes
+ * from that origin (a vendor weaver routed to the caller, ADR-033), or its
+ * output has no position-dependent phase at all (side-by-side, anaglyph). Set
+ * per INSTANCE, because a vendor may fall back per create (e.g. an SDK that
+ * refuses external routing yields a weaver that reads only its own window and
+ * ignores the origin — which must leave this bit clear).
+ *
+ * The runtime makes a windowless DP for a window it does not own (the D3D11
+ * service's present-owner, ADR-060 R2; the texture target of ADR-060) only
+ * when the instance sets this bit, and otherwise falls back to a DP bound to
+ * the window. Bit clear (the default, every plug-in built before the bit) =
+ * "do not use me windowless".
+ *
+ * @ingroup xrt_iface
+ */
+#define XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN (1u << 1)
+
+/*!
  * Size of the V1 caps shape. Plug-ins accept any caller `struct_size >= ` this
  * and reject only callers older than the slot itself.
  */

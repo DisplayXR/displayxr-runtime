@@ -392,6 +392,22 @@ comp_d3d11_service_set_client_segment_screens(struct xrt_system_compositor *xsys
                                               uint64_t pinned_display_id);
 
 /*!
+ * ADR-060 R2: the IPC server OFFERS a present-owner the screen list at
+ * `weave_bind_window` (from its own instance's `enumerate_displays`). Inert
+ * unless the client's weave DP is windowless
+ * (XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN): only then does it become the
+ * client's segment list (pin 0), so the runtime cuts the window per screen
+ * where the vendor's own 2D-region logic no longer runs. A client that enabled
+ * segments itself keeps its own list and pin.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_weave_offer_screens(struct xrt_system_compositor *xsysc,
+                                       struct xrt_compositor *xc,
+                                       const struct xrt_screen_list *list);
+
+/*!
  * Display dashboard phase 7: the screen registry was re-resolved (a display
  * re-probe — after a per-screen DP preference changed, or a monitor was
  * plugged, unplugged or moved: WM_DISPLAYCHANGE feeds the same worker). For
