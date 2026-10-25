@@ -19,6 +19,7 @@
 #include "comp_vk_native_renderer.h"
 #include "comp_vk_native_alpha_probe.h"
 #include "comp_vk_native_segments.h"
+#include "comp_vk_native_async_handoff.h"
 
 #include "util/comp_swapchain_ring.h"
 #include "util/comp_cursor_look.h"
@@ -1348,6 +1349,11 @@ struct comp_vk_native_compositor
 		//! wait (> 0.5 ms — the previous weave was still unserved: the bound).
 		uint64_t wait_ema_ns;
 		uint32_t win_async, win_sync, win_stalls;
+		//! #2356 TRACE (under weave_hand.mutex like the tallies above):
+		//! frames whose window-space layers were composited at commit, and
+		//! the EMA of that composite's app-thread cost (record + submit + wait).
+		uint32_t win_ws_commit;
+		uint64_t ws_commit_ema_ns;
 		/*!
 		 * #1905/#1962: harm-scored fallback to the blocking hand-off. On an
 		 * app that runs frames ahead (a command-buffer ring that never
@@ -1457,6 +1463,16 @@ struct comp_vk_native_compositor
 	bool ws_linear_failed; //!< sticky: init failed once, stay on the fallback
 	bool ws_linear_logged;
 	//! @}
+	/*!
+	 * #2356: this frame's window-space layers were already composited into
+	 * the atlas by layer_commit (vk_async_composite_window_space_at_commit),
+	 * so the weave must not stamp them again. Reset by every layer_commit
+	 * before its draw; read by the weave under c->mutex. Only ever set on the
+	 * Android non-blocking hand-off path.
+	 */
+	bool ws_composited_at_commit;
+	//! #2356: fence for that commit-time composite (app thread, c->mutex held).
+	VkFence ws_commit_fence;
 	/*!
 	 * Swapchain images destroyed since the last window-space pass (#1782).
 	 *
@@ -7727,7 +7743,11 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			// and redrawn. The atlas already carries what the last app
 			// frame composited, so replaying the weave over it is both
 			// correct and what the repaint is for.
-			if (!zero_copy && !is_repaint) {
+			//
+			// #2356: and skipped when layer_commit already composited them
+			// (the non-blocking hand-off path) — stamping twice would
+			// double the overlay's alpha.
+			if (!zero_copy && !is_repaint && !c->ws_composited_at_commit) {
 				uint32_t atlas_w_pre, atlas_h_pre;
 				comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w_pre, &atlas_h_pre);
 				vk_compositor_render_window_space_into_atlas(c, cmd,
@@ -9259,6 +9279,11 @@ vk_midframe_active(const struct comp_vk_native_compositor *c)
  * blocking wait (vk_async_handoff_eligible), as do zero-copy frames (the
  * "atlas" is then the app's own image).
  *
+ * #2356: window-space layers are no longer one of them on this path —
+ * layer_commit composites them into the atlas itself, waited, before the
+ * post (vk_async_composite_window_space_at_commit), and the weave then skips
+ * its own stamp. Local2D and zones still read app images from the weave.
+ *
  * The served weave now runs while the app is submitting its next frame, so
  * its queue work goes to the runtime-owned queue (see the queue choice in
  * vk_dp_weave_and_present) — on the app's queue it queued behind the app's
@@ -9319,25 +9344,163 @@ dxr_async_handoff_resolve(bool layer_live, bool rt_queue, int single, int *out_f
  * Only when the served weave reads nothing the app owns — see the design
  * note above. Called under c->mutex, after the frame's layer scan.
  */
+static struct comp_vk_native_async_frame
+vk_async_frame_facts(const struct comp_vk_native_compositor *c, bool zero_copy)
+{
+	struct comp_vk_native_async_frame f = {
+	    .enabled = c->hand_async.enabled,
+	    // The serve must be able to run on the runtime-owned queue + pool (the
+	    // pool is created after the switch resolves and its failure drops the
+	    // queue) — on the app's queue it starves the fills.
+	    .runtime_queue = c->repaint_queue != VK_NULL_HANDLE && c->repaint_cmd_pool != VK_NULL_HANDLE,
+	    .zero_copy = zero_copy,
+	    .local_2d = c->local_2d_last_frame,
+	    .zones = c->zones_frame,
+	    .zone_mask = c->active_zone_mask != NULL,
+	    .has_window_space = false,
+	    .window_space_at_commit = c->ws_composited_at_commit,
+	};
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_WINDOW_SPACE) {
+			f.has_window_space = true;
+			break;
+		}
+	}
+	return f;
+}
+
 static bool
 vk_async_handoff_eligible(const struct comp_vk_native_compositor *c, bool zero_copy)
 {
-	if (!c->hand_async.enabled || zero_copy || c->local_2d_last_frame || c->zones_frame ||
-	    c->active_zone_mask != NULL) {
-		return false;
+	// #2356: a window-space frame qualifies once layer_commit composited its
+	// layers itself (vk_async_composite_window_space_at_commit).
+	const struct comp_vk_native_async_frame f = vk_async_frame_facts(c, zero_copy);
+	return comp_vk_native_async_frame_eligible(&f);
+}
+
+/*!
+ * #2356: composite this frame's window-space layers into the atlas NOW, on the
+ * app thread, instead of at weave time — so the served weave reads only the
+ * runtime-owned atlas and the frame may take the non-blocking hand-off.
+ *
+ * Why here and not a deferred wait in xrWaitSwapchainImage: the weave's reads
+ * of the app's image are not CPU-observable at the serve's end (the #2095
+ * chain submits the pre-weave batch without a host wait; GPU completion is
+ * only seen at the next commit), so deferring the protection would need a
+ * per-image GPU-completion handshake between the weave thread and the layer
+ * swapchain. Compositing at commit needs none: the submit is waited here, like
+ * renderer_draw's own submit for the projection images, so once xrEndFrame
+ * returns no GPU work of ours reads the app's layer image. It is the SAME
+ * GPU work the weave used to record (vk_compositor_render_window_space_into_atlas,
+ * incl. the #1795 linear path), just moved: no snapshot image, no extra copy.
+ * The atlas then already carries the overlay, which is exactly what a repaint
+ * or a mid-frame fill replays (#868).
+ *
+ * Only when the frame would otherwise qualify (comp_vk_native_async_composite_ws_at_commit);
+ * every other frame keeps the weave-time composite, byte-identical. On any
+ * failure c->ws_composited_at_commit stays false and the weave composites them
+ * as before (and the frame stays blocking).
+ *
+ * App thread, c->mutex held, after renderer_draw (the atlas holds the
+ * projection content in SHADER_READ_ONLY_OPTIMAL) and after the commit's drain
+ * of the previous non-blocking weave.
+ */
+static void
+vk_async_composite_window_space_at_commit(struct comp_vk_native_compositor *c, bool zero_copy)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	c->ws_composited_at_commit = false;
+	const struct comp_vk_native_async_frame f = vk_async_frame_facts(c, zero_copy);
+	if (!comp_vk_native_async_composite_ws_at_commit(&f) || c->renderer == NULL || c->eff_layout.cols == 0 ||
+	    c->eff_layout.rows == 0) {
+		return;
 	}
-	// The serve must be able to run on the runtime-owned queue + pool (the
-	// pool is created after the switch resolves and its failure drops the
-	// queue) — on the app's queue it starves the fills.
-	if (c->repaint_queue == VK_NULL_HANDLE || c->repaint_cmd_pool == VK_NULL_HANDLE) {
-		return false;
+	const uint64_t t0 = os_monotonic_get_ns();
+
+	VkCommandPool pool = (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
+	if (pool == VK_NULL_HANDLE) {
+		return;
 	}
-	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-		if (c->layer_accum.layers[i].data.type == XRT_LAYER_WINDOW_SPACE) {
-			return false; // composited from the app's image AT weave time
+	if (c->ws_commit_fence == VK_NULL_HANDLE) {
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		if (vk->vkCreateFence(vk->device, &fci, NULL, &c->ws_commit_fence) != VK_SUCCESS) {
+			c->ws_commit_fence = VK_NULL_HANDLE;
+			return;
 		}
 	}
-	return true;
+	VkCommandBufferAllocateInfo ai = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	    .commandPool = pool,
+	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+	    .commandBufferCount = 1,
+	};
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	if (vk->vkAllocateCommandBuffers(vk->device, &ai, &cmd) != VK_SUCCESS) {
+		return;
+	}
+	VkCommandBufferBeginInfo bi = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &bi);
+	uint32_t atlas_w = 0, atlas_h = 0;
+	comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w, &atlas_h);
+	vk_compositor_render_window_space_into_atlas(
+	    c, cmd, (VkImage)(uintptr_t)comp_vk_native_renderer_get_atlas_image(c->renderer),
+	    (VkImageView)(uintptr_t)comp_vk_native_renderer_get_atlas_view(c->renderer), atlas_w, atlas_h,
+	    c->eff_layout.tile_w, c->eff_layout.tile_h, c->eff_layout.cols, c->eff_layout.rows);
+	vk->vkEndCommandBuffer(cmd);
+
+	VkSubmitInfo si = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	// The renderer's queue, on this thread, exactly as renderer_draw submits —
+	// with its one retry on the Adreno shared-GSL -3 (#1905).
+	VkResult res =
+	    comp_vk_native_queue_submit_retry(vk, vk->main_queue->queue, &si, c->ws_commit_fence, "ws-commit");
+	if (res == VK_SUCCESS) {
+		VkResult wres = vk->vkWaitForFences(vk->device, 1, &c->ws_commit_fence, VK_TRUE, UINT64_MAX);
+		vk->vkResetFences(vk->device, 1, &c->ws_commit_fence);
+		// The submit happened, so the overlay IS in the atlas either way: the
+		// weave must not stamp it a second time. A failed wait means device
+		// loss (renderer_draw treats it the same), where the hand-off mode is
+		// moot.
+		c->ws_composited_at_commit = true;
+		if (wres != VK_SUCCESS) {
+			U_LOG_E("#2356: waiting the window-space commit composite failed: %d", wres);
+		}
+	} else {
+		static bool s_logged = false;
+		if (!s_logged) {
+			s_logged = true;
+			U_LOG_W(
+			    "#2356: window-space commit composite submit failed (%d) — the weave composites them "
+			    "(blocking hand-off for those frames)",
+			    res);
+		}
+	}
+	vk->vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
+
+	if (c->ws_composited_at_commit) {
+		const uint64_t d = os_monotonic_get_ns() - t0;
+		os_mutex_lock(&c->weave_hand.mutex);
+		c->hand_async.win_ws_commit++;
+		const uint64_t ema = c->hand_async.ws_commit_ema_ns;
+		c->hand_async.ws_commit_ema_ns = ema == 0 ? (d == 0 ? 1 : d) : (ema * 7 + d) / 8;
+		os_mutex_unlock(&c->weave_hand.mutex);
+
+		static bool s_logged_on = false;
+		if (!s_logged_on) {
+			s_logged_on = true;
+			U_LOG_W(
+			    "#2356: window-space layers composite at layer_commit on the non-blocking hand-off path "
+			    "(first frame: %.2f ms on the app thread)",
+			    (double)d / 1e6);
+		}
+	}
 }
 
 //! TRACE: fold one app-side hand-off wait into the EMA. weave_hand.mutex held.
@@ -10183,9 +10346,12 @@ vk_repaint_thread(void *ptr)
 				const uint32_t ha_trips = c->hand_async.trips;
 				const uint32_t ha_rec = c->hand_async.recoveries;
 				const uint32_t ha_pfail = c->hand_async.probe_fails;
+				const uint32_t ha_ws = c->hand_async.win_ws_commit;
+				const double ha_ws_ms = (double)c->hand_async.ws_commit_ema_ns / 1e6;
 				c->hand_async.win_async = 0;
 				c->hand_async.win_sync = 0;
 				c->hand_async.win_stalls = 0;
+				c->hand_async.win_ws_commit = 0;
 				os_mutex_unlock(&c->weave_hand.mutex);
 				// #2095: the app thread's wait on the previous chained weave at
 				// the top of layer_commit (EMA) — where GPU completion is now
@@ -10199,14 +10365,16 @@ vk_repaint_thread(void *ptr)
 				    "#1905 trace site=vk midframe{on=%d legacy_fires=%u midframe_fires=%u in_frame=%u "
 				    "skip_pending=%u skip_duty=%u duty=%.0f%%/%u%% fill_ema=%.2fms parked_ema=%.2fms "
 				    "app_iv=%.1fms park=%d layer=%d} handoff{mode=%s async=%d frames=%u/%u "
-				    "wait_ema=%.2fms stalls=%u trips=%u recovered=%u probe_fails=%u wsync_prev=%.2fms}",
+				    "wait_ema=%.2fms stalls=%u trips=%u recovered=%u probe_fails=%u wsync_prev=%.2fms "
+				    "ws_commit=%u ws_commit_ema=%.2fms}",
 				    (int)vk_midframe_active(c), c->repaint.mf.legacy_fires,
 				    c->repaint.mf.midframe_fires, c->repaint.mf.in_frame, c->repaint.mf.skip_pending,
 				    c->repaint.mf.skip_duty, duty_pct, dxr_midframe_fill_duty(),
 				    (double)c->repaint.mf.fill_ema_ns / 1e6, (double)c->repaint.mf.parked_ema_ns / 1e6,
 				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6, (int)dxr_midframe_fill_park(),
 				    (int)c->repaint.mf.layer_live, ha_mode, (int)c->hand_async.enabled, ha_async,
-				    ha_total, ha_wait_ms, ha_stalls, ha_trips, ha_rec, ha_pfail, wsync_prev_ms);
+				    ha_total, ha_wait_ms, ha_stalls, ha_trips, ha_rec, ha_pfail, wsync_prev_ms, ha_ws,
+				    ha_ws_ms);
 				c->repaint.mf.legacy_fires = 0;
 				c->repaint.mf.midframe_fires = 0;
 				c->repaint.mf.in_frame = 0;
@@ -11856,6 +12024,10 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		                                             &c->capture_src_atlas_h);
 	}
 
+	// #2356: set again (on the Android non-blocking hand-off path only) once
+	// this frame's window-space layers are composited at commit.
+	c->ws_composited_at_commit = false;
+
 	// Render projection layers to atlas texture (skip if zero-copy)
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
@@ -12281,6 +12453,10 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				 */
 				uint64_t my_seq;
 #ifdef VK_MIDFRAME_FILL
+				// #2356: composite the window-space layers into the atlas
+				// here, waited, when that is all that keeps this frame off
+				// the non-blocking hand-off.
+				vk_async_composite_window_space_at_commit(c, zero_copy);
 				// #1905 ask 2: decided here, under c->mutex, from this frame's
 				// committed layers (see vk_async_handoff_eligible).
 				// #1905/#1962: and admitted by the harm-scored fallback,
@@ -12785,6 +12961,10 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	if (c->repaint_fence != VK_NULL_HANDLE) {
 		vk->vkDestroyFence(vk->device, c->repaint_fence, NULL);
 		c->repaint_fence = VK_NULL_HANDLE;
+	}
+	if (c->ws_commit_fence != VK_NULL_HANDLE) { // #2356
+		vk->vkDestroyFence(vk->device, c->ws_commit_fence, NULL);
+		c->ws_commit_fence = VK_NULL_HANDLE;
 	}
 
 	if (c->frame_fence != VK_NULL_HANDLE) {
