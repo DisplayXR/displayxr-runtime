@@ -958,16 +958,28 @@ runtime's `COMP_VK_NATIVE_WL_MOVE_SYNC_TAG_MOD` and the extension's `MOVE_SYNC_T
 serials are the same output. With the single reused desktop-Linux output allocation, "an output"
 is one submit's weave into it.
 
-**Where it is filled.** The desktop-Linux dma-buf submit path (`XrWeaveDmabufDescDXR`). Every
-other path of a v12 runtime writes `valid = logicalValid = XR_FALSE`, `serial = 0`; the IN chain
-is accepted everywhere and dropped outside desktop Linux. A pre-v12 runtime never touches the
+**Where it is filled.**
+- **Desktop Linux:** the dma-buf submit path (`XrWeaveDmabufDescDXR`).
+- **Windows (D3D11 service, ADR-060 R3):** the handle submit, but only while the caller's weave
+  display processor is **windowless**: the service then feeds the vendor weaver
+  `set_present_origin` from its own read of the bound window, so the origin is exactly what the
+  weave used. `valid = XR_TRUE`, `wovenOriginOnScreen` is the bound window's client origin
+  (desktop device px), and `logicalValid = XR_FALSE` (Windows has no logical space). A weave DP
+  bound to the window reads the window itself, so no exact value exists to report: `valid =
+  XR_FALSE`, `serial = 0`, as before.
+- **Every other path** of a v12 runtime writes `valid = logicalValid = XR_FALSE`, `serial = 0`.
+
+The IN chain is accepted everywhere and dropped outside desktop Linux. No spec-version bump goes
+with the Windows fill: the struct and its "`valid = XR_FALSE` = not reported" rule are unchanged,
+so every v12 caller already handles both answers. A pre-v12 runtime never touches the
 OUT struct, so a caller zero-initialises it (or gates on `extensionVersion >= 12`).
 
 **Wire (runtime-internal).** Both additions are **appended**, leaving every pre-v12 field at its
 offset: `weave_set_window_geometry` gains `logical_valid, logical_x, logical_y, logical_scale`
 after `display_id`, and `weave_submit_dmabuf`'s reply gains a trailing 40-byte
 `ipc_weave_woven_origin` after `eyes` (per frame — not on `weave_get_output_dmabuf`, which a
-client calls only when the output is (re)allocated). Each side converts field by field between
+client calls only when the output is (re)allocated). The Windows `weave_submit` reply gains the
+same trailing struct after `lift_cursor_mask` (ADR-060 R3). Each side converts field by field between
 the wire POD and `xrt_weave_woven_origin`; nothing is byte-copied across layouts. The wire has no
 per-call version negotiation: messages are fixed-size on a `SOCK_STREAM` socket, and a client
 library and service built from different trees are refused at connect by the `u_git_tag` gate

@@ -712,6 +712,24 @@ struct d3d11_client_render_resources
 	int32_t weave_dp_origin_x;
 	int32_t weave_dp_origin_y;
 
+	/*!
+	 * ADR-060 R3 (XR_DXR_weave v12 §5e on Windows): the window origin THIS
+	 * submit fed the windowless DP's phase, desktop-absolute device px —
+	 * pending until the submit is accepted, then latched with a serial. Only a
+	 * windowless DP reports one: a window-bound vendor weaver reads the window
+	 * itself, so a value the service read would be a different, earlier read.
+	 * Written and read on the client's own thread (weave_submit, then its IPC
+	 * reply).
+	 */
+	bool weave_origin_pending;
+	int32_t weave_origin_pending_x;
+	int32_t weave_origin_pending_y;
+	bool weave_woven_valid;
+	int32_t weave_woven_x;
+	int32_t weave_woven_y;
+	uint64_t weave_woven_serial; //!< of the last latched origin; 0 = none yet
+	uint64_t weave_woven_next;   //!< monotonic counter behind weave_woven_serial
+
 	//! HUD overlay (runtime-owned windows only)
 	struct u_hud *hud;
 
@@ -5817,6 +5835,10 @@ svc_weave_push_present_origin(struct d3d11_service_compositor *c, struct xrt_dis
 	const int32_t x = win.x - c->render.weave_dp_screen_x;
 	const int32_t y = win.y - c->render.weave_dp_screen_y;
 	xrt_display_processor_d3d11_set_present_origin(dp, x, y);
+	// R3: what this weave was phased for, latched once the submit is accepted.
+	c->render.weave_origin_pending = true;
+	c->render.weave_origin_pending_x = win.x;
+	c->render.weave_origin_pending_y = win.y;
 	if (!c->render.weave_dp_origin_valid) {
 		U_LOG_W(
 		    "ADR-060 R2: windowless weave DP phased from present origin (%d,%d) — window %p at (%d,%d), "
@@ -31783,6 +31805,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// ADR-060 R2: a windowless weave DP takes its phase from the origin the
 	// service reads now — every weave site below (v6, batch, legacy, and the
 	// primary segment of a split weave, whose canvas offset adds to it).
+	c->render.weave_origin_pending = false;
 	svc_weave_push_present_origin(c, dp, wnd);
 	bool clear_output = weave_frame_first;
 	if (weave_frame_first) {
@@ -32404,6 +32427,38 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		cpu_ms[WEAVE_CPU_SUBMIT] = (double)((int64_t)os_monotonic_get_ns() - t_entry_ns) / 1e6;
 		weave_timing_account(sys, &c->render, cpu_ms, timing_path, timing_route, ov_unchanged, win_w, win_h);
 	}
+	// ADR-060 R3: latch the origin this accepted weave used (none for a
+	// window-bound DP: valid false, serial 0, exactly the pre-R3 reply).
+	c->render.weave_woven_valid = c->render.weave_origin_pending;
+	if (c->render.weave_origin_pending) {
+		c->render.weave_woven_x = c->render.weave_origin_pending_x;
+		c->render.weave_woven_y = c->render.weave_origin_pending_y;
+		c->render.weave_woven_serial = ++c->render.weave_woven_next;
+	} else {
+		c->render.weave_woven_serial = 0;
+	}
+	return true;
+}
+
+bool
+comp_d3d11_service_weave_get_woven_origin(struct xrt_compositor *xc,
+                                          int32_t *out_x,
+                                          int32_t *out_y,
+                                          uint64_t *out_serial)
+{
+	*out_x = 0;
+	*out_y = 0;
+	*out_serial = 0;
+	if (xc == nullptr) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (!c->render.weave_woven_valid) {
+		return false;
+	}
+	*out_x = c->render.weave_woven_x;
+	*out_y = c->render.weave_woven_y;
+	*out_serial = c->render.weave_woven_serial;
 	return true;
 }
 

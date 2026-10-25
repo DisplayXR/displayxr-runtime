@@ -502,12 +502,15 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # ADR-046 Amendment 1 then APPENDS lift_cursor_mask (XR_DXR_cursor_depth
         # v3: which lift rects of this submit got the runtime's depth cursor),
         # after segment_count, by the same rule.
+        # ADR-060 R3 then APPENDS origin (XR_DXR_weave v12 §5e on Windows: the
+        # origin a windowless weave DP was phased for), after lift_cursor_mask.
         sub = [a.name for a in self._call("weave_submit").out_args]
         self.assertEqual(sub, ["have_output", "width", "height", "fence_value", "eyes", "segment_count",
-                               "lift_cursor_mask"])
+                               "lift_cursor_mask", "origin"])
         call = self._call("weave_submit")
+        self.assertEqual(call.out_args[-3].typename, "uint32_t")
         self.assertEqual(call.out_args[-2].typename, "uint32_t")
-        self.assertEqual(call.out_args[-1].typename, "uint32_t")
+        self.assertEqual(call.out_args[-1].typename, "struct ipc_weave_woven_origin")
         # weave_submit_dmabuf (desktop Linux: never segmented) is untouched.
         sub = [a.name for a in self._call("weave_submit_dmabuf").out_args]
         self.assertEqual(sub, ["have_output", "width", "height", "fence_value", "eyes", "origin"])

@@ -328,6 +328,8 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
 xrt_result_t
 comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
 
+struct xrt_weave_woven_origin; // xrt/xrt_weave_dmabuf.h
+
 xrt_result_t
 comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         xrt_graphics_buffer_handle_t in_handle,
@@ -355,7 +357,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint64_t *out_fence_value,
                                         struct xrt_eye_positions *out_eyes,
                                         uint32_t *out_segment_count,
-                                        uint32_t *out_lift_cursor_mask);
+                                        uint32_t *out_lift_cursor_mask,
+                                        struct xrt_weave_woven_origin *out_origin);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *xc,
