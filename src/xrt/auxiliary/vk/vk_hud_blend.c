@@ -586,6 +586,25 @@ vk_hud_blend_draw_no_layout_fmt(struct vk_hud_blend *blend,
 		return;
 	}
 
+	/*
+	 * #2356: the render area is the destination rect (clamped to the
+	 * framebuffer), not the whole framebuffer. The draw is scissored to that
+	 * rect anyway, and the pass LOADs and STOREs, so the pixels are the same —
+	 * but a tiling GPU (Adreno) loads, bins and stores only the render area:
+	 * a full-atlas render area made every stamp of a small window-space layer
+	 * pay for the whole ~3K atlas, in GPU time and in the driver's per-bin
+	 * command building on the recording thread. The clamp also keeps the
+	 * scissor offset non-negative, which Vulkan requires.
+	 */
+	const int64_t x0 = dst_x < 0 ? 0 : dst_x;
+	const int64_t y0 = dst_y < 0 ? 0 : dst_y;
+	const int64_t x1 = (int64_t)dst_x + dst_w > (int64_t)fb_w ? (int64_t)fb_w : (int64_t)dst_x + dst_w;
+	const int64_t y1 = (int64_t)dst_y + dst_h > (int64_t)fb_h ? (int64_t)fb_h : (int64_t)dst_y + dst_h;
+	if (x1 <= x0 || y1 <= y0) {
+		return; // entirely outside the framebuffer
+	}
+	const VkRect2D area = {{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+
 	VkDescriptorSet desc_set = get_or_create_image_desc(blend, vk, hud_image, src_view_fmt);
 	if (desc_set == VK_NULL_HANDLE) {
 		return;
@@ -595,13 +614,13 @@ vk_hud_blend_draw_no_layout_fmt(struct vk_hud_blend *blend,
 	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 	    .renderPass = blend->render_pass,
 	    .framebuffer = fb,
-	    .renderArea = {{0, 0}, {fb_w, fb_h}},
+	    .renderArea = area,
 	};
 	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
 
 	VkViewport vp = {(float)dst_x, (float)dst_y, (float)dst_w, (float)dst_h, 0.0f, 1.0f};
 	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
-	VkRect2D scissor = {{dst_x, dst_y}, {dst_w, dst_h}};
+	VkRect2D scissor = area;
 	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
 
 	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,

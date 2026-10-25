@@ -19,6 +19,7 @@
 #include "comp_vk_native_renderer.h"
 #include "comp_vk_native_alpha_probe.h"
 #include "comp_vk_native_segments.h"
+#include "comp_vk_native_async_handoff.h"
 
 #include "util/comp_swapchain_ring.h"
 #include "util/comp_cursor_look.h"
@@ -1348,6 +1349,34 @@ struct comp_vk_native_compositor
 		//! wait (> 0.5 ms — the previous weave was still unserved: the bound).
 		uint64_t wait_ema_ns;
 		uint32_t win_async, win_sync, win_stalls;
+		//! #2356 TRACE (under weave_hand.mutex like the tallies above):
+		//! frames whose window-space layers were composited at commit, and
+		//! the EMA of that composite's app-thread cost (record + submit + wait).
+		uint32_t win_ws_commit;
+		uint64_t ws_commit_ema_ns;
+		//! #2356 TRACE breakdown (same lock): the serve thread's submit of
+		//! the stamp (EMA), and app-thread waits for it — at
+		//! xrWaitSwapchainImage (count + EMA of the waits that blocked) and
+		//! before renderer_draw (EMA).
+		uint64_t ws_sub_ema_ns;
+		uint32_t win_ws_img_waits;
+		uint64_t ws_img_wait_ema_ns;
+		uint64_t ws_retire_ema_ns;
+		//! #2356 TRACE: wall time of an app-frame serve on the weave thread
+		//! (c->mutex taken -> weave returned), EMA — what a commit drain
+		//! stands behind when the serve has not finished.
+		uint64_t serve_ema_ns;
+		//! #2356 TRACE breakdown of the commit's own host time (EMAs):
+		//! c->mutex acquisition in layer_commit; and, inside the stamp's
+		//! ws_commit, the ws_stamp.mutex wait, the recording proper and
+		//! vkEndCommandBuffer (where a tiler driver may build its per-bin
+		//! command streams).
+		uint64_t commit_lock_ema_ns;
+		uint64_t ws_lock_ema_ns, ws_rec_ema_ns, ws_end_ema_ns;
+		//! #2356 TRACE: the stamp's recording (on the serve) split at the
+		//! enum vk_ws_prof probes — each entry is the time since the previous
+		//! probe reached (EMA).
+		uint64_t ws_prof_ema_ns[8];
 		/*!
 		 * #1905/#1962: harm-scored fallback to the blocking hand-off. On an
 		 * app that runs frames ahead (a command-buffer ring that never
@@ -1457,6 +1486,61 @@ struct comp_vk_native_compositor
 	bool ws_linear_failed; //!< sticky: init failed once, stay on the fallback
 	bool ws_linear_logged;
 	//! @}
+	/*!
+	 * #2356: this frame's window-space layers were already composited into
+	 * the atlas by layer_commit (vk_async_composite_window_space_at_commit),
+	 * so the weave must not stamp them again. Reset by every layer_commit
+	 * before its draw; read by the weave under c->mutex. Only ever set on the
+	 * Android non-blocking hand-off path.
+	 */
+	bool ws_composited_at_commit;
+	/*!
+	 * #2356: the commit-time window-space stamp — at most ONE in flight.
+	 *
+	 * DECIDED at commit (app thread: it only tags the layer images), RECORDED
+	 * and SUBMITTED by the serve as its first act, on the runtime queue — so
+	 * the app thread does no Vulkan work for it at all (submitting or
+	 * recording it on the app thread measured 5.5-6 ms there, at any GPU
+	 * clock). Never host-waited on the frame path. What then waits for it,
+	 * and only when needed:
+	 *  - the served weave: queue order on that same queue (plus a full
+	 *    barrier at the stamp's end), never the host;
+	 *  - the next stamp and the next renderer_draw (which rewrites the atlas
+	 *    on the app's queue): the fence, at the top of the next commit —
+	 *    normally long signalled, since the serve that follows the stamp on
+	 *    the same queue was already drained;
+	 *  - the app re-acquiring a layer image the stamp reads:
+	 *    xrWaitSwapchainImage waits the fence when that image carries the
+	 *    in-flight stamp's serial (comp_vk_native_compositor_wait_swapchain_read)
+	 *    — backpressure only if the app laps the compositor. If the stamp is
+	 *    still only recorded, the wait first lets the outstanding serve run
+	 *    (the #1905 quiesce), so the fence it waits is one that will signal;
+	 *    a stamp the serve never submitted (a dropped frame) read nothing and
+	 *    is simply discarded.
+	 * Everything below is under @ref mutex (any thread: commit, wait_image,
+	 * swapchain destroy).
+	 */
+	struct
+	{
+		struct os_mutex mutex;
+		VkCommandPool pool; //!< on the runtime queue's family
+		VkCommandBuffer cmd;
+		VkFence fence;
+		bool in_flight;      //!< submitted; the fence is pending until retired
+		bool pending_submit; //!< decided at commit; the serve records + submits it
+		//! the serve is recording it right now — WITHOUT the mutex held, so
+		//! xrWaitSwapchainImage on any swapchain never stands behind the
+		//! recording; a wait on a tagged image treats it like pending_submit
+		bool recording;
+		/*!
+		 * #2356 TRACE: timestamps the composite drops while the serve records
+		 * the stamp (prof_on), so the row can bisect the recording. Indexed by
+		 * enum vk_ws_prof; 0 = that point was not reached this frame.
+		 */
+		bool prof_on;
+		uint64_t prof[8];
+		uint64_t serial;     //!< of the last recorded stamp (images are tagged with it)
+	} ws_stamp;
 	/*!
 	 * Swapchain images destroyed since the last window-space pass (#1782).
 	 *
@@ -3059,6 +3143,29 @@ vk_compositor_layer_zone_3d(struct xrt_compositor *xc,
  * @param tile_columns  Atlas tile columns.
  * @param tile_rows     Atlas tile rows.
  */
+
+//! #2356 TRACE: probe points of the window-space composite's recording.
+enum vk_ws_prof
+{
+	VK_WS_PROF_START = 0, //!< before vkResetCommandBuffer
+	VK_WS_PROF_BEGUN,     //!< after reset + begin + the leading barrier
+	VK_WS_PROF_DEAD,      //!< after forgetting destroyed images
+	VK_WS_PROF_SETUP,     //!< after the path's target / framebuffer setup
+	VK_WS_PROF_CIN,       //!< after the linear path's copy-in
+	VK_WS_PROF_STAMP,     //!< after the stamp render passes
+	VK_WS_PROF_COUT,      //!< after the linear path's copy-out (or the encoded path's barrier)
+	VK_WS_PROF_END,       //!< after the trailing barrier + vkEndCommandBuffer
+};
+
+//! #2356 TRACE: drop a probe timestamp (only while the serve records the stamp).
+static inline void
+vk_ws_prof(struct comp_vk_native_compositor *c, enum vk_ws_prof at)
+{
+	if (c->ws_stamp.prof_on) {
+		c->ws_stamp.prof[at] = os_monotonic_get_ns();
+	}
+}
+
 /*!
  * Drop window_space_blend's cache entries for swapchain images destroyed since
  * the last call (#1782). See comp_vk_native_compositor::ws_dead.
@@ -3087,6 +3194,102 @@ vk_compositor_forget_dead_window_space_images(struct comp_vk_native_compositor *
 	c->ws_dead.count = 0;
 	c->ws_dead.overflow = false;
 	os_mutex_unlock(&c->ws_dead.mutex);
+}
+
+/*!
+ * The atlas-pixel rect window-space layer @p ws is stamped at in view @p eye
+ * of a @p tile_columns x @p tile_rows grid of @p view_w x @p view_h tiles —
+ * the ONE placement rule, shared by the stamp and by the #2356 bounds of the
+ * linear path's copies (so the two can never disagree).
+ */
+static void
+vk_ws_eye_rect(const struct xrt_layer_window_space_data *ws,
+               uint32_t eye,
+               uint32_t tile_columns,
+               uint32_t tile_rows,
+               uint32_t view_w,
+               uint32_t view_h,
+               int32_t *out_x,
+               int32_t *out_y,
+               int32_t *out_w,
+               int32_t *out_h)
+{
+	const uint32_t effective_views = tile_columns * tile_rows;
+	const uint32_t tile_x = eye % tile_columns;
+	const uint32_t tile_y = eye / tile_columns;
+
+	const float tile_origin_x = (float)(tile_x * view_w);
+	const float tile_origin_y = (float)(tile_y * view_h);
+	const float tile_w = (float)view_w;
+	const float tile_h = (float)view_h;
+
+	// Per-view horizontal disparity, graded across the view sweep
+	// (view index = baseline order, same as the projection views):
+	// first view = -half, last = +half. Degenerates to the classic
+	// -/+ pair for 2-view modes and to 0 for a single view.
+	const float half_disp = ws->disparity / 2.0f;
+	float eye_shift = 0.0f;
+	if (effective_views > 1) {
+		float t = (float)eye / (float)(effective_views - 1);
+		eye_shift = -half_disp + ws->disparity * t;
+	}
+
+	*out_x = (int32_t)(tile_origin_x + (ws->x + eye_shift) * tile_w);
+	*out_y = (int32_t)(tile_origin_y + ws->y * tile_h);
+	*out_w = (int32_t)(ws->width * tile_w);
+	*out_h = (int32_t)(ws->height * tile_h);
+}
+
+/*!
+ * #2356: the atlas region every window-space stamp of this frame touches (the
+ * union of the per-view rects, clamped to the atlas). False when nothing would
+ * be drawn. The linear path copies only this region to and from its compose
+ * target: two whole-atlas copies were most of the composite's GPU cost (a
+ * 600x1024 panel on a ~3 K atlas), and the bytes outside it are never touched.
+ */
+static bool
+vk_ws_stamp_bounds(const struct comp_vk_native_compositor *c,
+                   uint32_t atlas_w,
+                   uint32_t atlas_h,
+                   uint32_t view_w,
+                   uint32_t view_h,
+                   uint32_t tile_columns,
+                   uint32_t tile_rows,
+                   VkOffset3D *out_off,
+                   VkExtent3D *out_ext)
+{
+	int64_t x0 = INT64_MAX, y0 = INT64_MAX, x1 = INT64_MIN, y1 = INT64_MIN;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_WINDOW_SPACE || layer->sc_array[0] == NULL) {
+			continue;
+		}
+		const uint32_t views = tile_columns * tile_rows;
+		for (uint32_t eye = 0; eye < views; eye++) {
+			int32_t dx, dy, dw, dh;
+			vk_ws_eye_rect(&layer->data.window_space, eye, tile_columns, tile_rows, view_w, view_h, &dx,
+			               &dy, &dw, &dh);
+			if (dw <= 0 || dh <= 0) {
+				continue;
+			}
+			x0 = dx < x0 ? dx : x0;
+			y0 = dy < y0 ? dy : y0;
+			x1 = (int64_t)dx + dw > x1 ? (int64_t)dx + dw : x1;
+			y1 = (int64_t)dy + dh > y1 ? (int64_t)dy + dh : y1;
+		}
+	}
+	// One pixel of margin each side: the stamp's rasterisation never reaches
+	// past its rect, but the margin costs nothing and absorbs any rounding.
+	x0 = x0 - 1 < 0 ? 0 : x0 - 1;
+	y0 = y0 - 1 < 0 ? 0 : y0 - 1;
+	x1 = x1 + 1 > (int64_t)atlas_w ? (int64_t)atlas_w : x1 + 1;
+	y1 = y1 + 1 > (int64_t)atlas_h ? (int64_t)atlas_h : y1 + 1;
+	if (x1 <= x0 || y1 <= y0) {
+		return false;
+	}
+	*out_off = (VkOffset3D){(int32_t)x0, (int32_t)y0, 0};
+	*out_ext = (VkExtent3D){(uint32_t)(x1 - x0), (uint32_t)(y1 - y0), 1};
+	return true;
 }
 
 /*!
@@ -3166,30 +3369,9 @@ vk_compositor_stamp_window_space_layers(struct comp_vk_native_compositor *c,
 		// 1×1 grid whose tile spans the full content region, so the old
 		// hardware-keyed full-region special case is just the grid math.
 		uint32_t effective_views = tile_columns * tile_rows;
-		float half_disp = ws->disparity / 2.0f;
 		for (uint32_t eye = 0; eye < effective_views; eye++) {
-			uint32_t tile_x = eye % tile_columns;
-			uint32_t tile_y = eye / tile_columns;
-
-			float tile_origin_x = (float)(tile_x * view_w);
-			float tile_origin_y = (float)(tile_y * view_h);
-			float tile_w = (float)view_w;
-			float tile_h = (float)view_h;
-
-			// Per-view horizontal disparity, graded across the view sweep
-			// (view index = baseline order, same as the projection views):
-			// first view = -half, last = +half. Degenerates to the classic
-			// -/+ pair for 2-view modes and to 0 for a single view.
-			float eye_shift = 0.0f;
-			if (effective_views > 1) {
-				float t = (float)eye / (float)(effective_views - 1);
-				eye_shift = -half_disp + ws->disparity * t;
-			}
-
-			int32_t dx = (int32_t)(tile_origin_x + (ws->x + eye_shift) * tile_w);
-			int32_t dy = (int32_t)(tile_origin_y + ws->y * tile_h);
-			int32_t dw_i = (int32_t)(ws->width * tile_w);
-			int32_t dh_i = (int32_t)(ws->height * tile_h);
+			int32_t dx, dy, dw_i, dh_i;
+			vk_ws_eye_rect(ws, eye, tile_columns, tile_rows, view_w, view_h, &dx, &dy, &dw_i, &dh_i);
 			if (dw_i <= 0 || dh_i <= 0) {
 				continue;
 			}
@@ -3355,10 +3537,23 @@ vk_compositor_render_window_space_linear(struct comp_vk_native_compositor *c,
 		c->ws_linear_fb_h = ch;
 	}
 
+	// #2356: only the region the stamps touch makes the round trip. The blend
+	// render pass loads its target and draws only inside the stamp rects, so
+	// the compose target outside the region (undefined after the UNDEFINED
+	// transition below) is never read back into the atlas.
+	VkOffset3D region_off = {0, 0, 0};
+	VkExtent3D region_ext = {cw, ch, 1};
+	if (!vk_ws_stamp_bounds(c, atlas_w, atlas_h, view_w, view_h, tile_columns, tile_rows, &region_off,
+	                        &region_ext)) {
+		return true; // nothing would be drawn: the atlas is already right
+	}
+	vk_ws_prof(c, VK_WS_PROF_SETUP);
 	const VkImageCopy whole = {
 	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffset = region_off,
 	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .extent = {cw, ch, 1},
+	    .dstOffset = region_off,
+	    .extent = region_ext,
 	};
 
 	// 1. atlas -> compose target (bytes).
@@ -3372,6 +3567,7 @@ vk_compositor_render_window_space_linear(struct comp_vk_native_compositor *c,
 	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
 	vk->vkCmdCopyImage(cmd, atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, comp_image,
 	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &whole);
+	vk_ws_prof(c, VK_WS_PROF_CIN);
 
 	// 2. blend in linear light.
 	ws_linear_barrier(vk, cmd, comp_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -3381,6 +3577,7 @@ vk_compositor_render_window_space_linear(struct comp_vk_native_compositor *c,
 	vk_compositor_stamp_window_space_layers(c, cmd, &c->window_space_blend_linear, c->ws_linear_fb,
 	                                        /*honest=*/true, atlas_w, atlas_h, view_w, view_h, tile_columns,
 	                                        tile_rows);
+	vk_ws_prof(c, VK_WS_PROF_STAMP);
 
 	// 3. compose target -> atlas (bytes), atlas back to the DP's layout.
 	ws_linear_barrier(vk, cmd, comp_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -3397,6 +3594,7 @@ vk_compositor_render_window_space_linear(struct comp_vk_native_compositor *c,
 	                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
 	                  VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	vk_ws_prof(c, VK_WS_PROF_COUT);
 
 	if (!c->ws_linear_logged) {
 		c->ws_linear_logged = true;
@@ -3424,6 +3622,7 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 	// the same reason the framebuffer eviction below is: the previous frame's
 	// submit is waited on before this recording begins.
 	vk_compositor_forget_dead_window_space_images(c);
+	vk_ws_prof(c, VK_WS_PROF_DEAD);
 
 	bool has_ws = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
@@ -3517,6 +3716,7 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 		c->atlas_ws_fb = c->atlas_ws_fb_ring[slot];
 	}
 
+	vk_ws_prof(c, VK_WS_PROF_SETUP);
 	// Atlas: SHADER_READ_ONLY_OPTIMAL → COLOR_ATTACHMENT_OPTIMAL.
 	VkImageMemoryBarrier atlas_to_color = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -3534,6 +3734,7 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 
 	vk_compositor_stamp_window_space_layers(c, cmd, &c->window_space_blend, c->atlas_ws_fb, /*honest=*/false,
 	                                        atlas_w, atlas_h, view_w, view_h, tile_columns, tile_rows);
+	vk_ws_prof(c, VK_WS_PROF_STAMP);
 
 	// Atlas: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL for DP.
 	VkImageMemoryBarrier atlas_back = {
@@ -4994,6 +5195,9 @@ vk_native_dispatch_composite_tap(struct comp_vk_native_compositor *c)
 #endif
 }
 
+static void
+vk_ws_stamp_wait_submitted(struct comp_vk_native_compositor *c); // #2356, below
+
 // Run the capture readback if the per-frame intent matches @p mode_filter.
 // Caller polls intent at top of layer_commit; this fires at each boundary.
 static void
@@ -5002,6 +5206,10 @@ vk_native_dispatch_capture(struct comp_vk_native_compositor *c, uint32_t mode_fi
 	if (!u_capture_intent_should_capture(&c->capture_intent, mode_filter)) {
 		return;
 	}
+	// #2356: a commit-time window-space stamp writes the atlas on the runtime
+	// queue; the capture reads it from another. Trigger-gated, so a host wait
+	// is fine here.
+	vk_ws_stamp_wait_submitted(c);
 	bool ok = vk_native_capture_atlas_to_png(c, c->capture_intent.path);
 	if (ok) {
 		U_LOG_I("Atlas captured (mode=%u) to %s",
@@ -7016,16 +7224,321 @@ vk_weave_sync_note_layer_reads_locked(struct comp_vk_native_compositor *c, uint6
 	}
 }
 
+//! #2356: bound on any wait for the commit-time window-space stamp.
+#define VK_WS_STAMP_WAIT_NS (2ULL * U_TIME_1S_IN_NS)
+
+/*!
+ * #2356: ws_stamp.mutex held. Retire the in-flight commit-time stamp, waiting
+ * its fence (bounded). Returns false only when it did not retire inside the
+ * bound — the fence is then still pending and must not be reset or reused.
+ */
+static bool
+vk_ws_stamp_retire_locked(struct comp_vk_native_compositor *c)
+{
+	if (!c->ws_stamp.in_flight) {
+		return true;
+	}
+	struct vk_bundle *vk = &c->vk;
+	const VkResult r = vk->vkWaitForFences(vk->device, 1, &c->ws_stamp.fence, VK_TRUE, VK_WS_STAMP_WAIT_NS);
+	if (r == VK_TIMEOUT) {
+		return false;
+	}
+	// Signalled, or the device is gone (nothing is coming back either way).
+	vk->vkResetFences(vk->device, 1, &c->ws_stamp.fence);
+	c->ws_stamp.in_flight = false;
+	if (r != VK_SUCCESS) {
+		U_LOG_E("#2356: waiting the window-space stamp fence failed: %d", r);
+	}
+	return true;
+}
+
+//! #2356 TRACE: fold @p d into an EMA (0 = no data yet).
+static inline void
+vk_ws_stamp_ema(uint64_t *ema, uint64_t d)
+{
+	*ema = *ema == 0 ? (d == 0 ? 1 : d) : (*ema * 7 + d) / 8;
+}
+
+static void
+vk_ws_stamp_warn_timeout(const char *who)
+{
+	static uint64_t s_warn_ns = 0; // a GPU that is not coming back: throttle
+	const uint64_t now = os_monotonic_get_ns();
+	if (s_warn_ns == 0 || now - s_warn_ns > 5ULL * U_TIME_1S_IN_NS) {
+		s_warn_ns = now;
+		U_LOG_W(
+		    "#2356: %s waited %llu ms for the window-space stamp and it has not retired — proceeding "
+		    "(throttled to one line per 5 s)",
+		    who, (unsigned long long)(VK_WS_STAMP_WAIT_NS / U_TIME_1MS_IN_NS));
+	}
+}
+
+/*!
+ * #2356: layer_commit, before renderer_draw rewrites the atlas. The previous
+ * commit's serve has been drained by now, so a stamp still only RECORDED was
+ * never submitted (its frame was dropped): it read nothing and is discarded.
+ * One that was submitted is retired (normally already signalled — the serve
+ * that followed it on the same queue was waited by the #2095 commit wait or
+ * its own host waits). A timeout is logged; the next stamp then refuses to
+ * reuse the pending fence and that frame falls back to the weave-time
+ * composite.
+ */
+static void
+vk_ws_stamp_retire_before_draw(struct comp_vk_native_compositor *c)
+{
+	const uint64_t t0 = os_monotonic_get_ns();
+	os_mutex_lock(&c->ws_stamp.mutex);
+	c->ws_stamp.pending_submit = false;
+	const bool was_in_flight = c->ws_stamp.in_flight;
+	const bool ok = vk_ws_stamp_retire_locked(c);
+	os_mutex_unlock(&c->ws_stamp.mutex);
+	if (!ok) {
+		vk_ws_stamp_warn_timeout("layer_commit");
+	}
+#ifdef VK_MIDFRAME_FILL
+	if (was_in_flight) {
+		const uint64_t d = os_monotonic_get_ns() - t0;
+		os_mutex_lock(&c->weave_hand.mutex);
+		vk_ws_stamp_ema(&c->hand_async.ws_retire_ema_ns, d);
+		os_mutex_unlock(&c->weave_hand.mutex);
+	}
+#else
+	(void)t0;
+	(void)was_in_flight;
+#endif
+}
+
+/*!
+ * #2356: a reader of the atlas off the serve's queue (the post-compose
+ * capture) — wait a SUBMITTED stamp only; never discard a recorded one, whose
+ * serve may still be about to run. Trigger-gated, so a host wait is fine.
+ */
+static void
+vk_ws_stamp_wait_submitted(struct comp_vk_native_compositor *c)
+{
+	os_mutex_lock(&c->ws_stamp.mutex);
+	const bool ok = vk_ws_stamp_retire_locked(c);
+	os_mutex_unlock(&c->ws_stamp.mutex);
+	if (!ok) {
+		vk_ws_stamp_warn_timeout("atlas capture");
+	}
+}
+
+#ifdef VK_MIDFRAME_FILL
+static bool
+vk_async_handoff_quiesce(struct comp_vk_native_compositor *c); // #1905, below
+#endif
+
+//! ws_stamp.mutex held: does the latest stamp read image @p index of @p xsc (UINT32_MAX = any)?
+static bool
+vk_ws_stamp_reads_locked(struct comp_vk_native_compositor *c, struct xrt_swapchain *xsc, uint32_t index)
+{
+	const uint64_t s = c->ws_stamp.serial;
+	if (s == 0) {
+		return false;
+	}
+	if (index != UINT32_MAX) {
+		return comp_vk_native_swapchain_get_stamp_serial(xsc, index) == s;
+	}
+	for (uint32_t i = 0; i < xsc->image_count; i++) {
+		if (comp_vk_native_swapchain_get_stamp_serial(xsc, i) == s) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*!
+ * #2356: xrWaitSwapchainImage / swapchain destroy — hold the app off a layer
+ * image the latest commit-time stamp reads until that stamp has retired on the
+ * GPU. Only one stamp is ever outstanding, so an image tagged with an older
+ * serial has already retired. A stamp that is only RECORDED (its serve has not
+ * run yet) is waited by first letting the outstanding serve run (the #1905
+ * quiesce: c->mutex is not held here); if the serve then did not submit it, it
+ * read nothing and is discarded.
+ */
+static void
+vk_ws_stamp_wait_image(struct comp_vk_native_compositor *c, struct xrt_swapchain *xsc, uint32_t index)
+{
+	const char *who = index == UINT32_MAX ? "swapchain destroy" : "xrWaitSwapchainImage";
+	os_mutex_lock(&c->ws_stamp.mutex);
+	bool reads = (c->ws_stamp.in_flight || c->ws_stamp.pending_submit || c->ws_stamp.recording) &&
+	             vk_ws_stamp_reads_locked(c, xsc, index);
+	const bool pending = reads && (c->ws_stamp.pending_submit || c->ws_stamp.recording);
+	os_mutex_unlock(&c->ws_stamp.mutex);
+	if (!reads) {
+		return; // the common case
+	}
+	const uint64_t t0 = os_monotonic_get_ns();
+#ifdef VK_MIDFRAME_FILL
+	if (pending) {
+		(void)vk_async_handoff_quiesce(c);
+	}
+#else
+	(void)pending;
+#endif
+	os_mutex_lock(&c->ws_stamp.mutex);
+	if (c->ws_stamp.pending_submit && vk_ws_stamp_reads_locked(c, xsc, index)) {
+		c->ws_stamp.pending_submit = false; // never submitted: nothing reads the image
+	}
+	bool ok = true;
+	if (c->ws_stamp.in_flight && vk_ws_stamp_reads_locked(c, xsc, index)) {
+		ok = vk_ws_stamp_retire_locked(c);
+	}
+	os_mutex_unlock(&c->ws_stamp.mutex);
+	if (!ok) {
+		vk_ws_stamp_warn_timeout(who);
+	}
+#ifdef VK_MIDFRAME_FILL
+	const uint64_t d = os_monotonic_get_ns() - t0;
+	os_mutex_lock(&c->weave_hand.mutex);
+	c->hand_async.win_ws_img_waits++;
+	vk_ws_stamp_ema(&c->hand_async.ws_img_wait_ema_ns, d);
+	os_mutex_unlock(&c->weave_hand.mutex);
+#else
+	(void)t0;
+#endif
+}
+
+#ifdef VK_MIDFRAME_FILL
+/*!
+ * #2356: the serve's first act for a frame whose window-space composite was
+ * decided at commit — RECORD it (from this frame's published layer state) and
+ * submit it on @p queue (the runtime queue: see serve_rt), so queue order puts
+ * it ahead of everything this weave submits. c->mutex held (the serve), weave
+ * thread — the same thread the weave-time composite always recorded on, so the
+ * blend caches keep a single user. On any failure the stamp is discarded: this
+ * one frame is woven without its overlay, and nothing reads the app's image.
+ *
+ * TRACE: ws_rec_ema / ws_end_ema / ws_sub_ema, plus the per-probe split
+ * (enum vk_ws_prof) as ws_prof EMAs.
+ */
+static void
+vk_ws_stamp_submit_for_serve(struct comp_vk_native_compositor *c, VkQueue queue)
+{
+	struct vk_bundle *vk = &c->vk;
+	os_mutex_lock(&c->ws_stamp.mutex);
+	if (!c->ws_stamp.pending_submit) {
+		os_mutex_unlock(&c->ws_stamp.mutex);
+		return;
+	}
+	c->ws_stamp.pending_submit = false;
+	const VkCommandBuffer cmd = c->ws_stamp.cmd;
+	if (cmd == VK_NULL_HANDLE || c->renderer == NULL) {
+		os_mutex_unlock(&c->ws_stamp.mutex);
+		return;
+	}
+	// Record and submit without the mutex: every xrWaitSwapchainImage takes it.
+	// cmd, pool and fence have this thread as their only user meanwhile (the
+	// next commit drains this serve before it touches them).
+	c->ws_stamp.recording = true;
+	os_mutex_unlock(&c->ws_stamp.mutex);
+
+	for (uint32_t i = 0; i < ARRAY_SIZE(c->ws_stamp.prof); i++) {
+		c->ws_stamp.prof[i] = 0;
+	}
+	c->ws_stamp.prof_on = true;
+	vk_ws_prof(c, VK_WS_PROF_START);
+	bool ok = vk->vkResetCommandBuffer(cmd, 0) == VK_SUCCESS;
+	VkCommandBufferBeginInfo bi = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	ok = ok && vk->vkBeginCommandBuffer(cmd, &bi) == VK_SUCCESS;
+	VkResult res = VK_ERROR_UNKNOWN;
+	if (ok) {
+		/*
+		 * Full barriers either side. Before: anything still reading the
+		 * atlas on this queue (a fill's crop or DP pass) completes first —
+		 * the composite's own first barrier only waits the fragment stage.
+		 * After: the crop (transfer), the transparency probe and the DP,
+		 * whatever stage they read in, see the composited atlas — the
+		 * composite's own last barrier only makes it visible to the fragment
+		 * stage, which was enough when it shared the weave's command buffer.
+		 */
+		const VkMemoryBarrier full = {
+		    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+		    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+		                         1, &full, 0, NULL, 0, NULL);
+		vk_ws_prof(c, VK_WS_PROF_BEGUN);
+		uint32_t atlas_w = 0, atlas_h = 0;
+		comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w, &atlas_h);
+		vk_compositor_render_window_space_into_atlas(
+		    c, cmd, (VkImage)(uintptr_t)comp_vk_native_renderer_get_atlas_image(c->renderer),
+		    (VkImageView)(uintptr_t)comp_vk_native_renderer_get_atlas_view(c->renderer), atlas_w, atlas_h,
+		    c->eff_layout.tile_w, c->eff_layout.tile_h, c->eff_layout.cols, c->eff_layout.rows);
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+		                         1, &full, 0, NULL, 0, NULL);
+		const uint64_t t_rec1 = os_monotonic_get_ns();
+		ok = vk->vkEndCommandBuffer(cmd) == VK_SUCCESS;
+		vk_ws_prof(c, VK_WS_PROF_END);
+		const uint64_t t_end = os_monotonic_get_ns();
+		if (ok) {
+			VkSubmitInfo si = {
+			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+			    .commandBufferCount = 1,
+			    .pCommandBuffers = &cmd,
+			};
+			res = comp_vk_native_queue_submit_retry(vk, queue, &si, c->ws_stamp.fence, "ws-stamp");
+		}
+		const uint64_t t_sub = os_monotonic_get_ns();
+		os_mutex_lock(&c->ws_stamp.mutex);
+		c->ws_stamp.in_flight = res == VK_SUCCESS;
+		os_mutex_unlock(&c->ws_stamp.mutex);
+
+		// TRACE (weave_hand.mutex is a leaf; ws_stamp.mutex is never taken under it).
+		const uint64_t *pr = c->ws_stamp.prof;
+		os_mutex_lock(&c->weave_hand.mutex);
+		vk_ws_stamp_ema(&c->hand_async.ws_rec_ema_ns, t_rec1 - pr[VK_WS_PROF_START]);
+		vk_ws_stamp_ema(&c->hand_async.ws_end_ema_ns, t_end - t_rec1);
+		vk_ws_stamp_ema(&c->hand_async.ws_sub_ema_ns, t_sub - t_end);
+		// Each probe's share: from the previous probe that was reached.
+		uint64_t prev = pr[VK_WS_PROF_START];
+		for (uint32_t i = VK_WS_PROF_BEGUN; i <= VK_WS_PROF_END; i++) {
+			if (pr[i] != 0 && prev != 0 && pr[i] >= prev) {
+				vk_ws_stamp_ema(&c->hand_async.ws_prof_ema_ns[i], pr[i] - prev);
+				prev = pr[i];
+			}
+		}
+		os_mutex_unlock(&c->weave_hand.mutex);
+	}
+	c->ws_stamp.prof_on = false;
+	os_mutex_lock(&c->ws_stamp.mutex);
+	c->ws_stamp.recording = false;
+	os_mutex_unlock(&c->ws_stamp.mutex);
+
+	if (res != VK_SUCCESS) {
+		static bool s_logged = false;
+		if (!s_logged) {
+			s_logged = true;
+			U_LOG_W(
+			    "#2356: window-space stamp record/submit failed (%d) — that frame is woven without its "
+			    "overlay",
+			    res);
+		}
+	}
+}
+#endif
+
 void
 comp_vk_native_compositor_wait_swapchain_read(struct comp_vk_native_compositor *c,
                                               struct xrt_swapchain *xsc,
                                               uint32_t index)
 {
+	if (c == NULL || xsc == NULL) {
+		return;
+	}
+	// #2356: the commit-time window-space stamp (not part of the #2095 ring).
+	vk_ws_stamp_wait_image(c, xsc, index);
+
 	// `created` is set once, under c->mutex, by the first chained frame; the
 	// app thread reads it bare. Benign: an image can only have been tagged
 	// by a chained frame, and that frame's commit happens-before the app's
 	// next wait on the image (the hand-off wait, or the same thread).
-	if (c == NULL || xsc == NULL || !c->wsync.created) {
+	if (!c->wsync.created) {
 		return;
 	}
 	uint64_t serial = 0;
@@ -7458,10 +7971,21 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	 * work and its waits drain nothing of the app's. The non-blocking switch
 	 * requires a runtime-owned queue (dxr_async_handoff_resolve).
 	 */
-	const bool serve_rt = !is_repaint && c->hand_async.serving && c->repaint_queue != VK_NULL_HANDLE &&
-	                      c->repaint_cmd_pool != VK_NULL_HANDLE;
+	//
+	// #2356: and so does ANY serve of a frame whose window-space layers were
+	// composited at commit — that composite was submitted on the runtime
+	// queue, and queue order on it is what orders it before this weave. A
+	// blocking serve (the #1962 fallback) is safe there for the same reason
+	// as a non-blocking one, and its requester is parked meanwhile.
+	const bool serve_rt = !is_repaint && (c->hand_async.serving || c->ws_composited_at_commit) &&
+	                      c->repaint_queue != VK_NULL_HANDLE && c->repaint_cmd_pool != VK_NULL_HANDLE;
 	if (serve_rt) {
 		queue = c->repaint_queue;
+	}
+	// #2356: this frame's window-space stamp, recorded at commit, goes first
+	// on this queue — ahead of the acquire, the crop and the DP.
+	if (!is_repaint && c->ws_composited_at_commit) {
+		vk_ws_stamp_submit_for_serve(c, queue);
 	}
 #endif
 
@@ -7734,7 +8258,11 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			// and redrawn. The atlas already carries what the last app
 			// frame composited, so replaying the weave over it is both
 			// correct and what the repaint is for.
-			if (!zero_copy && !is_repaint) {
+			//
+			// #2356: and skipped when layer_commit already composited them
+			// (the non-blocking hand-off path) — stamping twice would
+			// double the overlay's alpha.
+			if (!zero_copy && !is_repaint && !c->ws_composited_at_commit) {
 				uint32_t atlas_w_pre, atlas_h_pre;
 				comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w_pre, &atlas_h_pre);
 				vk_compositor_render_window_space_into_atlas(c, cmd,
@@ -9266,6 +9794,13 @@ vk_midframe_active(const struct comp_vk_native_compositor *c)
  * blocking wait (vk_async_handoff_eligible), as do zero-copy frames (the
  * "atlas" is then the app's own image).
  *
+ * #2356: window-space layers are no longer one of them on this path —
+ * layer_commit submits their composite into the atlas itself, on the serve's
+ * queue, before the post (vk_async_composite_window_space_at_commit); the
+ * weave then skips its own stamp, and the app's reuse of a layer image is
+ * held at xrWaitSwapchainImage until that submit retires — the #2095
+ * backpressure. Local2D and zones still read app images from the weave.
+ *
  * The served weave now runs while the app is submitting its next frame, so
  * its queue work goes to the runtime-owned queue (see the queue choice in
  * vk_dp_weave_and_present) — on the app's queue it queued behind the app's
@@ -9326,25 +9861,183 @@ dxr_async_handoff_resolve(bool layer_live, bool rt_queue, int single, int *out_f
  * Only when the served weave reads nothing the app owns — see the design
  * note above. Called under c->mutex, after the frame's layer scan.
  */
+static struct comp_vk_native_async_frame
+vk_async_frame_facts(const struct comp_vk_native_compositor *c, bool zero_copy)
+{
+	struct comp_vk_native_async_frame f = {
+	    .enabled = c->hand_async.enabled,
+	    // The serve must be able to run on the runtime-owned queue + pool (the
+	    // pool is created after the switch resolves and its failure drops the
+	    // queue) — on the app's queue it starves the fills.
+	    .runtime_queue = c->repaint_queue != VK_NULL_HANDLE && c->repaint_cmd_pool != VK_NULL_HANDLE,
+	    .zero_copy = zero_copy,
+	    .local_2d = c->local_2d_last_frame,
+	    .zones = c->zones_frame,
+	    .zone_mask = c->active_zone_mask != NULL,
+	    .has_window_space = false,
+	    .window_space_at_commit = c->ws_composited_at_commit,
+	};
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_WINDOW_SPACE) {
+			f.has_window_space = true;
+			break;
+		}
+	}
+	return f;
+}
+
 static bool
 vk_async_handoff_eligible(const struct comp_vk_native_compositor *c, bool zero_copy)
 {
-	if (!c->hand_async.enabled || zero_copy || c->local_2d_last_frame || c->zones_frame ||
-	    c->active_zone_mask != NULL) {
-		return false;
+	// #2356: a window-space frame qualifies once layer_commit composited its
+	// layers itself (vk_async_composite_window_space_at_commit).
+	const struct comp_vk_native_async_frame f = vk_async_frame_facts(c, zero_copy);
+	return comp_vk_native_async_frame_eligible(&f);
+}
+
+/*!
+ * #2356: decide, at commit, that this frame's window-space layers are
+ * composited into the atlas by a separate stamp batch (instead of inside the
+ * weave's own command buffer) — so the frame may take the non-blocking
+ * hand-off while the app's layer images stay protected.
+ *
+ * DECIDED AND TAGGED HERE; RECORDED AND SUBMITTED BY THE SERVE. Every app-
+ * thread placement of the Vulkan work cost the app its frame on a Nubia Pad 2:
+ * v1 submitted + host-waited here (14 ms at 220 MHz, 33 fps), v2 submitted
+ * here (~6 ms inside vkQueueSubmit, 38.5 fps), v3/v4 recorded here (~5.5 ms of
+ * recording at any GPU clock, 45.5 fps). Now the app thread only tags the
+ * layer images; the serve records and submits the batch as its first act
+ * (vk_ws_stamp_submit_for_serve) on the RUNTIME queue — the queue the serve
+ * runs on — and it is ordered by the GPU:
+ *
+ *  - AFTER the app's writes to its layer image and renderer_draw's atlas
+ *    writes: renderer_draw host-waited its own fence on the app's queue just
+ *    before this, and that fence covers everything submitted there before
+ *    it (the app's rendering into the layer image included). Exactly the
+ *    reasoning that already lets the non-blocking serve run on this queue.
+ *  - BEFORE the served weave: same queue, later in submission order, and the
+ *    stamp ends in a full ALL_COMMANDS barrier, so the crop, the transparency
+ *    probe and the DP's own submits (the DP was created against this queue,
+ *    #868; on the #2095 chain its pre_sem signal covers every earlier
+ *    command on the queue) all see the composited atlas. A frame stamped here
+ *    is therefore always served on the runtime queue, blocking or not
+ *    (vk_dp_weave_and_present's serve_rt).
+ *  - BEFORE the app overwrites the layer image: the image is tagged HERE with
+ *    the stamp's serial and xrWaitSwapchainImage waits the stamp's fence for
+ *    it (vk_ws_stamp_wait_image; if the serve has not yet run it first lets
+ *    it run) — the #2095 backpressure, for this one batch. With a
+ *    multi-image layer swapchain it has long retired by then.
+ *  - BEFORE the next stamp / renderer_draw rewrites the atlas: the fence, at
+ *    the top of the next commit (vk_ws_stamp_retire_before_draw) — normally
+ *    already signalled, because the serve that followed it on the same queue
+ *    was drained.
+ *
+ * It is the SAME GPU work the weave used to record
+ * (vk_compositor_render_window_space_into_atlas, incl. the #1795 linear path),
+ * moved, not duplicated; repaints and fills replay the atlas, which now
+ * already carries the overlay (#868).
+ *
+ * Only when the frame would otherwise qualify (comp_vk_native_async_composite_ws_at_commit);
+ * every other frame keeps the weave-time composite. On any failure
+ * c->ws_composited_at_commit stays false and the weave composites the layers
+ * as before (and the frame stays blocking).
+ *
+ * App thread, c->mutex held, after renderer_draw (the atlas holds the
+ * projection content in SHADER_READ_ONLY_OPTIMAL, and stays so until the serve
+ * — fills are skipped while a request is pending) and after the commit's drain
+ * of the previous non-blocking weave.
+ */
+static void
+vk_async_composite_window_space_at_commit(struct comp_vk_native_compositor *c, bool zero_copy)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	c->ws_composited_at_commit = false;
+	const struct comp_vk_native_async_frame f = vk_async_frame_facts(c, zero_copy);
+	if (!comp_vk_native_async_composite_ws_at_commit(&f) || c->renderer == NULL || c->eff_layout.cols == 0 ||
+	    c->eff_layout.rows == 0) {
+		return;
 	}
-	// The serve must be able to run on the runtime-owned queue + pool (the
-	// pool is created after the switch resolves and its failure drops the
-	// queue) — on the app's queue it starves the fills.
-	if (c->repaint_queue == VK_NULL_HANDLE || c->repaint_cmd_pool == VK_NULL_HANDLE) {
-		return false;
+	const uint64_t t0 = os_monotonic_get_ns();
+
+	os_mutex_lock(&c->ws_stamp.mutex);
+	const uint64_t t_lk = os_monotonic_get_ns();
+	// One outstanding at most (already retired / discarded at the top of this
+	// commit; this is the bound for the case that wait gave up).
+	c->ws_stamp.pending_submit = false;
+	if (!vk_ws_stamp_retire_locked(c)) {
+		os_mutex_unlock(&c->ws_stamp.mutex);
+		return;
 	}
-	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-		if (c->layer_accum.layers[i].data.type == XRT_LAYER_WINDOW_SPACE) {
-			return false; // composited from the app's image AT weave time
+	if (c->ws_stamp.pool == VK_NULL_HANDLE) {
+		// Its own pool, on the runtime queue's family: the renderer's belongs
+		// to this thread's renderer_draw, the repaint pool to the weave thread.
+		VkCommandPoolCreateInfo pci = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+		    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+		    .queueFamilyIndex = (uint32_t)c->repaint_queue_family,
+		};
+		VkCommandBufferAllocateInfo ai = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		    .commandBufferCount = 1,
+		};
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		bool ok = vk->vkCreateCommandPool(vk->device, &pci, NULL, &c->ws_stamp.pool) == VK_SUCCESS;
+		if (ok) {
+			ai.commandPool = c->ws_stamp.pool;
+			ok = vk->vkAllocateCommandBuffers(vk->device, &ai, &c->ws_stamp.cmd) == VK_SUCCESS;
+		}
+		if (ok && c->ws_stamp.fence == VK_NULL_HANDLE) {
+			ok = vk->vkCreateFence(vk->device, &fci, NULL, &c->ws_stamp.fence) == VK_SUCCESS;
+		}
+		if (!ok) {
+			if (c->ws_stamp.pool != VK_NULL_HANDLE) {
+				vk->vkDestroyCommandPool(vk->device, c->ws_stamp.pool, NULL);
+			}
+			c->ws_stamp.pool = VK_NULL_HANDLE;
+			c->ws_stamp.cmd = VK_NULL_HANDLE;
+			os_mutex_unlock(&c->ws_stamp.mutex);
+			return;
 		}
 	}
-	return true;
+	// Decided, not recorded: the serve records AND submits it as its first act
+	// (vk_ws_stamp_submit_for_serve), on the runtime queue, from this frame's
+	// published layer state (stable under c->mutex until the next commit,
+	// which drains that serve first). The app thread does no Vulkan work for
+	// it at all: v2 submitted here (~6 ms in that vkQueueSubmit), v3/v4
+	// recorded here (~5.5 ms of recording on a Nubia Pad 2, at any GPU
+	// clock). The layer images are tagged NOW, so an xrWaitSwapchainImage
+	// that races the serve still waits for it (vk_ws_stamp_wait_image).
+	c->ws_stamp.pending_submit = true;
+	const uint64_t serial = ++c->ws_stamp.serial;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const struct comp_layer *l = &c->layer_accum.layers[i];
+		if (l->data.type == XRT_LAYER_WINDOW_SPACE && l->sc_array[0] != NULL) {
+			comp_vk_native_swapchain_note_stamp(l->sc_array[0], l->data.window_space.sub.image_index,
+			                                    serial);
+		}
+	}
+	c->ws_composited_at_commit = true;
+	os_mutex_unlock(&c->ws_stamp.mutex);
+
+	// TRACE: the app thread's cost — the decision and the tags only.
+	const uint64_t d = os_monotonic_get_ns() - t0;
+	os_mutex_lock(&c->weave_hand.mutex);
+	c->hand_async.win_ws_commit++;
+	vk_ws_stamp_ema(&c->hand_async.ws_commit_ema_ns, d);
+	vk_ws_stamp_ema(&c->hand_async.ws_lock_ema_ns, t_lk - t0);
+	os_mutex_unlock(&c->weave_hand.mutex);
+
+	static bool s_logged_on = false;
+	if (!s_logged_on) {
+		s_logged_on = true;
+		U_LOG_W(
+		    "#2356: window-space layers are composited by the serve (recorded + submitted on the runtime "
+		    "queue as its first act); layer_commit only tags the layer images — no app-thread Vulkan work "
+		    "(first frame: %.3f ms on the app thread)",
+		    (double)d / 1e6);
+	}
 }
 
 //! TRACE: fold one app-side hand-off wait into the EMA. weave_hand.mutex held.
@@ -10110,12 +10803,20 @@ vk_repaint_thread(void *ptr)
 				h_skip = false;
 #ifdef VK_MIDFRAME_FILL
 				c->hand_async.serving = h_async;
+				const uint64_t serve_t0 = os_monotonic_get_ns();
 #endif
 				h_result = vk_dp_weave_and_present(c, /*is_repaint=*/false, h_zero_copy, h_zc_image,
 				                                   h_zc_view, h_zc_format, h_zc_w, h_zc_h, h_tgt_w,
 				                                   h_tgt_h, h_ftime, h_fp, &h_skip);
 #ifdef VK_MIDFRAME_FILL
 				c->hand_async.serving = false;
+				{
+					// #2356 TRACE: serve wall time (weave_hand.mutex: the row reads it there).
+					const uint64_t sd = os_monotonic_get_ns() - serve_t0;
+					os_mutex_lock(&c->weave_hand.mutex);
+					vk_ws_stamp_ema(&c->hand_async.serve_ema_ns, sd);
+					os_mutex_unlock(&c->weave_hand.mutex);
+				}
 #endif
 			}
 			// else: torn down under the waiter. Fail the frame, never strand it.
@@ -10190,9 +10891,26 @@ vk_repaint_thread(void *ptr)
 				const uint32_t ha_trips = c->hand_async.trips;
 				const uint32_t ha_rec = c->hand_async.recoveries;
 				const uint32_t ha_pfail = c->hand_async.probe_fails;
+				const uint32_t ha_ws = c->hand_async.win_ws_commit;
+				const double ha_ws_ms = (double)c->hand_async.ws_commit_ema_ns / 1e6;
+				const double ha_ws_sub_ms = (double)c->hand_async.ws_sub_ema_ns / 1e6;
+				const double ha_ws_ret_ms = (double)c->hand_async.ws_retire_ema_ns / 1e6;
+				const uint32_t ha_ws_iw = c->hand_async.win_ws_img_waits;
+				const double ha_ws_iw_ms = (double)c->hand_async.ws_img_wait_ema_ns / 1e6;
+				const double ha_serve_ms = (double)c->hand_async.serve_ema_ns / 1e6;
+				const double ha_clk_ms = (double)c->hand_async.commit_lock_ema_ns / 1e6;
+				const double ha_wlk_ms = (double)c->hand_async.ws_lock_ema_ns / 1e6;
+				const double ha_wrec_ms = (double)c->hand_async.ws_rec_ema_ns / 1e6;
+				const double ha_wend_ms = (double)c->hand_async.ws_end_ema_ns / 1e6;
+				double ha_prof[8];
+				for (uint32_t pi = 0; pi < 8; pi++) {
+					ha_prof[pi] = (double)c->hand_async.ws_prof_ema_ns[pi] / 1e6;
+				}
+				c->hand_async.win_ws_img_waits = 0;
 				c->hand_async.win_async = 0;
 				c->hand_async.win_sync = 0;
 				c->hand_async.win_stalls = 0;
+				c->hand_async.win_ws_commit = 0;
 				os_mutex_unlock(&c->weave_hand.mutex);
 				// #2095: the app thread's wait on the previous chained weave at
 				// the top of layer_commit (EMA) — where GPU completion is now
@@ -10206,14 +10924,22 @@ vk_repaint_thread(void *ptr)
 				    "#1905 trace site=vk midframe{on=%d legacy_fires=%u midframe_fires=%u in_frame=%u "
 				    "skip_pending=%u skip_duty=%u duty=%.0f%%/%u%% fill_ema=%.2fms parked_ema=%.2fms "
 				    "app_iv=%.1fms park=%d layer=%d} handoff{mode=%s async=%d frames=%u/%u "
-				    "wait_ema=%.2fms stalls=%u trips=%u recovered=%u probe_fails=%u wsync_prev=%.2fms}",
+				    "wait_ema=%.2fms stalls=%u trips=%u recovered=%u probe_fails=%u wsync_prev=%.2fms "
+				    "ws_commit=%u ws_commit_ema=%.2fms ws_sub_ema=%.2fms ws_retire_ema=%.2fms "
+				    "ws_img_waits=%u ws_img_wait_ema=%.2fms serve_ema=%.2fms commit_lock_ema=%.2fms "
+				    "ws_lock_ema=%.2fms ws_rec_ema=%.2fms ws_end_ema=%.2fms rec{begin=%.2f dead=%.2f "
+				    "setup=%.2f cin=%.2f stamp=%.2f cout=%.2f end=%.2f}ms}",
 				    (int)vk_midframe_active(c), c->repaint.mf.legacy_fires,
 				    c->repaint.mf.midframe_fires, c->repaint.mf.in_frame, c->repaint.mf.skip_pending,
 				    c->repaint.mf.skip_duty, duty_pct, dxr_midframe_fill_duty(),
 				    (double)c->repaint.mf.fill_ema_ns / 1e6, (double)c->repaint.mf.parked_ema_ns / 1e6,
 				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6, (int)dxr_midframe_fill_park(),
 				    (int)c->repaint.mf.layer_live, ha_mode, (int)c->hand_async.enabled, ha_async,
-				    ha_total, ha_wait_ms, ha_stalls, ha_trips, ha_rec, ha_pfail, wsync_prev_ms);
+				    ha_total, ha_wait_ms, ha_stalls, ha_trips, ha_rec, ha_pfail, wsync_prev_ms, ha_ws,
+				    ha_ws_ms, ha_ws_sub_ms, ha_ws_ret_ms, ha_ws_iw, ha_ws_iw_ms, ha_serve_ms, ha_clk_ms,
+				    ha_wlk_ms, ha_wrec_ms, ha_wend_ms, ha_prof[VK_WS_PROF_BEGUN],
+				    ha_prof[VK_WS_PROF_DEAD], ha_prof[VK_WS_PROF_SETUP], ha_prof[VK_WS_PROF_CIN],
+				    ha_prof[VK_WS_PROF_STAMP], ha_prof[VK_WS_PROF_COUT], ha_prof[VK_WS_PROF_END]);
 				c->repaint.mf.legacy_fires = 0;
 				c->repaint.mf.midframe_fires = 0;
 				c->repaint.mf.in_frame = 0;
@@ -11930,6 +12656,14 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		                                             &c->capture_src_atlas_h);
 	}
 
+	// #2356: set again (on the Android non-blocking hand-off path only) once
+	// this frame's window-space layers are composited at commit.
+	c->ws_composited_at_commit = false;
+	// #2356: and the previous commit's stamp, still in flight only if its serve
+	// never ran (a dropped frame), must retire before renderer_draw rewrites
+	// the atlas it wrote. Normally already signalled: a no-op.
+	vk_ws_stamp_retire_before_draw(c);
+
 	// Render projection layers to atlas texture (skip if zero-copy)
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
@@ -12374,6 +13108,10 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				 */
 				uint64_t my_seq;
 #ifdef VK_MIDFRAME_FILL
+				// #2356: composite the window-space layers into the atlas
+				// here, waited, when that is all that keeps this frame off
+				// the non-blocking hand-off.
+				vk_async_composite_window_space_at_commit(c, zero_copy);
 				// #1905 ask 2: decided here, under c->mutex, from this frame's
 				// committed layers (see vk_async_handoff_eligible).
 				// #1905/#1962: and admitted by the harm-scored fallback,
@@ -12741,7 +13479,14 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 	}
 	if (drain != VK_ASYNC_DRAIN_LOCK_TAKEN) {
+		// #2356 TRACE: how long the commit stands behind c->mutex (a fill,
+		// or anything else the weave thread holds it for).
+		const uint64_t lk0 = os_monotonic_get_ns();
 		os_mutex_lock(&c->mutex);
+		const uint64_t lkd = os_monotonic_get_ns() - lk0;
+		os_mutex_lock(&c->weave_hand.mutex);
+		vk_ws_stamp_ema(&c->hand_async.commit_lock_ema_ns, lkd);
+		os_mutex_unlock(&c->weave_hand.mutex);
 	}
 #else
 	// #2095: same bound without the non-blocking hand-off (see above).
@@ -12879,6 +13624,17 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		vk->vkDestroyFence(vk->device, c->repaint_fence, NULL);
 		c->repaint_fence = VK_NULL_HANDLE;
 	}
+	// #2356: the commit-time stamp. Its pool's command buffer goes with it.
+	if (c->ws_stamp.fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, c->ws_stamp.fence, NULL);
+		c->ws_stamp.fence = VK_NULL_HANDLE;
+	}
+	if (c->ws_stamp.pool != VK_NULL_HANDLE) {
+		vk->vkDestroyCommandPool(vk->device, c->ws_stamp.pool, NULL);
+		c->ws_stamp.pool = VK_NULL_HANDLE;
+		c->ws_stamp.cmd = VK_NULL_HANDLE;
+	}
+	c->ws_stamp.in_flight = false;
 
 	if (c->frame_fence != VK_NULL_HANDLE) {
 		c->vk.vkDestroyFence(c->vk.device, c->frame_fence, NULL);
@@ -13043,6 +13799,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	os_mutex_destroy(&c->weave_hand.mutex);
 	os_mutex_destroy(&c->wsync.mutex); // #2095: ring resources went with the device idle above
 	os_mutex_destroy(&c->ws_dead.mutex);
+	os_mutex_destroy(&c->ws_stamp.mutex); // #2356
 #ifdef VK_NATIVE_HAVE_SEGMENTS
 	os_mutex_destroy(&c->seg_pub_mutex);
 #endif
@@ -13638,6 +14395,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// #2095: the weave-sync ring's leaf lock — see vk_weave_sync_ring.
 	os_mutex_init(&c->wsync.mutex);
 	os_mutex_init(&c->ws_dead.mutex); // #1782
+	os_mutex_init(&c->ws_stamp.mutex); // #2356
 #ifdef VK_NATIVE_HAVE_SEGMENTS
 	os_mutex_init(&c->seg_pub_mutex); // multi-screen M3
 #endif

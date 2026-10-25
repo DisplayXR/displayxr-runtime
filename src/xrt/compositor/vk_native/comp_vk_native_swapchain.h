@@ -145,6 +145,25 @@ void
 comp_vk_native_swapchain_note_read(struct xrt_swapchain *xsc, uint32_t index, uint64_t serial);
 
 /*!
+ * #2356: the serial of the last commit-time window-space stamp that reads
+ * image @p index (0 = none). Call under the compositor's ws_stamp lock — see
+ * comp_vk_native_compositor_wait_swapchain_read().
+ *
+ * @ingroup comp_vk_native
+ */
+uint64_t
+comp_vk_native_swapchain_get_stamp_serial(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
+ * #2356: record that commit-time stamp @p serial reads image @p index
+ * (monotone). Same lock rule.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_swapchain_note_stamp(struct xrt_swapchain *xsc, uint32_t index, uint64_t serial);
+
+/*!
  * #1559: true when this swapchain's `VkImage`s really are in the `*_SRGB`
  * format the app asked for, rather than the UNORM sibling the runtime reads.
  *

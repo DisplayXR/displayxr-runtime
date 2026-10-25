@@ -89,6 +89,7 @@ set(tests
     tests_aux_window_replug
     tests_aux_wayland_geom
     tests_comp_wl_move_sync_tag
+    tests_comp_vk_async_handoff
     tests_aux_weave_span2d
     tests_aux_weave_present_origin
     tests_aux_display_live_rescale
@@ -1264,6 +1265,8 @@ target_include_directories(tests_comp_feedback_pace PRIVATE ${PROJECT_SOURCE_DIR
 target_include_directories(tests_comp_late_weave_depth PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #1748 -- the move-sync tag encode is a header-only function in vk_native.
 target_include_directories(tests_comp_wl_move_sync_tag PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #2356 -- which frames may take the non-blocking hand-off. Header-only.
+target_include_directories(tests_comp_vk_async_handoff PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # ADR-027 tier-1 dispatch (#1331). Header-only pure logic -- no compositor
 # library, no graphics API, no device -- so it needs the include path and
 # nothing else.
