@@ -326,6 +326,15 @@ struct comp_hub_d3d11_info
  * clears them with it (#2218 #4, the native rule), on every hub route.
  */
 #define COMP_HUB_REASON_PLANE_UNAVAILABLE "plane_unavailable"
+/*!
+ * #2317: the D3D12 tier's HYBRID reroute (`DXR_SPLIT_D3D12_HYBRID_REROUTE=1`)
+ * failed its Stage A (the hub refused, the deposit ring or the bridge wiring
+ * failed, or `DXR_TEST_HUB_STAGE_A_FAIL=1`). Printed as `hub placement: CHANGED
+ * hub=0 reason=<this>` BEFORE the own-legs split's own Stage A and placement
+ * line: the session falls back to the own-legs split, never to the
+ * single-device stock path.
+ */
+#define COMP_HUB_REASON_HYBRID_REROUTE_STAGE_A_FAILED "hybrid_reroute_stage_a_failed"
 
 /*
  * #2317 P3: the OpenGL shim's refusals (comp_gl_compositor + comp_gl_deposit).
