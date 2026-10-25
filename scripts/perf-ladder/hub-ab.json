@@ -1,7 +1,7 @@
 {
   "kit": "DXRHubAB",
-  "kitVersion": "0.3.0",
-  "issue": "#2317 P1d, P2a",
+  "kitVersion": "0.4.0",
+  "issue": "#2317 P1d, P2a, step 2 (d3d11 hub default)",
   "windowSeconds": 20,
   "warmupSeconds": 6,
   "reps": 3,
@@ -34,17 +34,18 @@
       "arms": [
         {
           "name": "native",
-          "env": {},
+          "env": {
+            "DXR_HUB": "0"
+          },
           "expectPath": "own-split",
           "topologies": [
             "default"
-          ]
+          ],
+          "expectLine": "hub placement: hub=0 reason=disabled_by_env"
         },
         {
           "name": "hub",
-          "env": {
-            "DXR_HUB": "1"
-          },
+          "env": {},
           "expectPath": "hub",
           "topologies": [
             "default"
@@ -53,17 +54,18 @@
         },
         {
           "name": "native",
-          "env": {},
+          "env": {
+            "DXR_HUB": "0"
+          },
           "expectPath": "own-split",
           "topologies": [
             "same-adapter"
-          ]
+          ],
+          "expectLine": "hub placement: hub=0 reason=disabled_by_env"
         },
         {
           "name": "hub-direct",
-          "env": {
-            "DXR_HUB": "1"
-          },
+          "env": {},
           "expectPath": "hub",
           "topologies": [
             "same-adapter"
@@ -73,7 +75,6 @@
         {
           "name": "hub-xbridge",
           "env": {
-            "DXR_HUB": "1",
             "DXR_HUB_INGRESS": "xbridge"
           },
           "expectPath": "hub",
@@ -232,5 +233,5 @@
     }
   ],
   "maxRetries": 3,
-  "armNotes": "An arm runs only on the topologies it lists (absent = all). 'native' = the path main takes BY DEFAULT on that topology (VK: the kill switch, its only non-hub path). expectLine = an extra regex the app log must match."
+  "armNotes": "An arm runs only on the topologies it lists (absent = all). 'native' = the path main takes BY DEFAULT on that topology (VK: the kill switch, its only non-hub path). expectLine = an extra regex the app log must match. d3d11 since #2317 step 2: the hub is the default, so 'native' is the kill switch DXR_HUB=0 (the tier's own #918 split / same-adapter engage) and the hub arms run the default env."
 }
