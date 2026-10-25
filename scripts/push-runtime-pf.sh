@@ -163,7 +163,7 @@ fi
 # 5. Restart the service so any residual mismatch surfaces immediately.
 taskkill //F //IM displayxr-service.exe >/dev/null 2>&1 || true
 sleep 1
-explorer.exe "C:\\Program Files\\DisplayXR\\Runtime\\displayxr-service.exe"
+explorer.exe "C:\\Program Files\\DisplayXR\\Runtime\\displayxr-service.exe" || true  # explorer.exe exits non-zero on success; set -e would abort
 sleep 3
 tasklist //FI "IMAGENAME eq displayxr-service.exe" 2>/dev/null | grep -qi displayxr-service.exe \
   && echo "== service restarted (non-elevated), versions consistent: $CT" \

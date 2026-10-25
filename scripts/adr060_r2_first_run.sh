@@ -67,8 +67,8 @@ LOGDIR="$(cygpath -u "$LOCALAPPDATA")/DisplayXR"
 
 # 0. Is this the R2 + R3 build?
 cd "$ROOT"
-git log --oneline -20 | grep -q "ADR-060 R2" || { echo "ERROR: HEAD does not contain the ADR-060 R2 commit" >&2; exit 1; }
-git log --oneline -20 | grep -q "ADR-060 R3" || echo "WARN: HEAD has R2 but not R3 — the woven-origin reply is not under test"
+grep -q "ADR-060 R2" <<< "$(git log --oneline -20)" || { echo "ERROR: HEAD does not contain the ADR-060 R2 commit" >&2; exit 1; }
+grep -q "ADR-060 R3" <<< "$(git log --oneline -20)" || echo "WARN: HEAD has R2 but not R3 — the woven-origin reply is not under test"
 echo "== source: $(git log --oneline -1)"
 [ -d "$PF" ] || { echo "ERROR: $PF not found" >&2; exit 1; }
 
@@ -92,7 +92,7 @@ restore() {
   cp -f "$SNAP"/plugins/*.dll "$PF/plugins/" 2>/dev/null || true
   v="$(cat "$SNAP/Version.txt" 2>/dev/null)"
   [ -n "$v" ] && reg add 'HKLM\Software\DisplayXR\Runtime' //v Version //t REG_SZ //d "$v" //f //reg:64 >/dev/null 2>&1 || true
-  explorer.exe "C:\\Program Files\\DisplayXR\\Runtime\\displayxr-service.exe"
+  explorer.exe "C:\\Program Files\\DisplayXR\\Runtime\\displayxr-service.exe" || true  # explorer.exe exits non-zero on success
   sleep 3
   echo "== restored; service restarted non-elevated. Snapshot kept at $SNAP (delete when satisfied)"
 }
@@ -107,13 +107,22 @@ bash scripts/push-runtime-pf.sh --browser-dir "$BROWSER_DIR"
 
 # 4. Run the page. The service log of THIS run is the newest one after this point.
 MARK="$(date +%s)"
-"$BROWSER" --new-window "$URL" >/dev/null 2>&1 &
+# Launch NON-elevated through explorer.exe on a .cmd: a browser started from this
+# elevated shell runs at High integrity against the Medium-integrity service, and
+# Chromium launched that way can hang in ShowWindow. Fresh profile + logging.
+mkdir -p "$SNAP/browser"
+{ printf '%s\r\n' '@echo off' 'set XR_RUNTIME_JSON='
+  printf 'start "" "%s" --user-data-dir="%s" --no-first-run --no-default-browser-check --enable-logging --log-file="%s" --v=1 "%s"\r\n' \
+    "$(cygpath -w "$BROWSER")" "$(cygpath -w "$SNAP/browser/profile")" "$(cygpath -w "$SNAP/browser/chrome.log")" "$URL"
+} > "$SNAP/browser/launch.cmd"
+explorer.exe "$(cygpath -w "$SNAP/browser/launch.cmd")" || true
+echo "== browser log: $SNAP/browser/chrome.log"
 echo "== browser up; waiting ${SECONDS_RUN}s (drag the window across a seam if the run should test the split)"
 sleep "$SECONDS_RUN"
 close_dxr_browser
 sleep 1
 
-LOG="$(ls -t "$LOGDIR"/DisplayXR_displayxr-service.*.log 2>/dev/null | head -1)"
+LOG="$(ls -t "$LOGDIR"/DisplayXR_displayxr-service.*.log 2>/dev/null | sed -n 1p)"  # head -1 = SIGPIPE (141) under pipefail
 [ -n "$LOG" ] || { echo "FAIL: no service log under $LOGDIR" >&2; exit 1; }
 [ "$(stat -c %Y "$LOG")" -ge "$MARK" ] || echo "WARN: the newest service log predates this run: $LOG"
 echo "== service log: $LOG"
