@@ -220,3 +220,12 @@ What this plan therefore leaves alone: the win32 v8→v9 numbering, values
 wording. Stage 1's win32 edit is editorial and type-preserving, but we still
 tell that session before it lands, so their v9 builds on it. Any rename or
 deprecation in win32, the texture class or zones (D1, D2) goes to them first.
+
+**ADR-060 session confirmed (2026-10-25):** Stage 1's win32 change and the
+readback deprecation note can both land before v9, and v9 will rebase onto
+them. Their branches don't edit the win32 header yet. Two conditions: name the
+include guard after the **type** (e.g.
+`#ifndef XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR`, as cocoa already does), so
+that both headers share one guard; and keep the readback deprecation
+**doc-only**, because the compositors still have the offscreen readback branch
+and removing it is a separate change. They want one ping before either lands.
