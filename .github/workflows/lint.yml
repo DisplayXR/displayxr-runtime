@@ -113,6 +113,15 @@ jobs:
         # extensions (displayxr-extensions#2).
         run: python3 scripts/gen_extensions_index.py --check --github
 
+      - name: XR_DXR_* ABI snapshot matches the headers
+        # tests/tests_dxr_abi_snapshot.cpp pins struct layouts, XrStructureType
+        # values and SPEC_VERSIONs that shipped apps are compiled against (its
+        # static_asserts fail the build on every platform when something moves).
+        # This step catches what the build cannot: an ADDITIVE change (a new
+        # struct or type value) that was never snapshotted and so is unpinned.
+        # Re-run the script and commit the diff to make the change deliberate.
+        run: python3 scripts/gen_dxr_abi_snapshot.py --check
+
       - name: Developer-settings lever catalog matches the census
         # src/xrt/targets/cli/cli_lever_catalog.h (what `displayxr-cli perf list
         # --all` and the Dashboard's Developer settings list) is generated from

@@ -8,7 +8,7 @@
 // assignment. Extension names are expected to be stable; numeric values are
 // not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
 // interface history did not restart with the name).
-// See GOVERNANCE.md.
+// See GOVERNANCE.md in https://github.com/DisplayXR/displayxr-extensions.
 //
 /*!
  * @file

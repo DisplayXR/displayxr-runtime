@@ -185,16 +185,34 @@ but it is not required.
 6. Whether `XR_DXR_weave` (an app that presents for itself) belongs with
    question 1.
 
-## 6. Decisions for David
+## 6. Decisions (David, 2026-10-25)
 
-| | Decision | Recommendation |
+There will be no WG interaction for now, so every decision is one we can make
+and carry out ourselves, or one we park.
+
+| | Decision | Outcome |
 |---|---|---|
-| D1 | Texture class + readback: keep both in the binding and flag them, or split them out now | Keep both, flag in the issue, deprecate readback in docs. Don't split while ADR-060 v9 is in flight. |
-| D2 | Window-space layer: its own extension, or leave it in win32 + cocoa | Its own extension, additive, value unchanged |
-| D3 | Provisional → official values policy | Dual-accept inbound, opt-in outbound; ask the WG before writing code |
-| D4 | display_info core subset for the issue | `XrDisplayInfoDXR` + rendering modes + mode/hardware-state events. Out: desktop position/info, eye-tracking mode request, multi-display (mention as future work) |
-| D5 | Author naming | "The DisplayXR Project" (matches copyrights and #206) |
-| D6 | Doc vs issue for this plan | This doc on a draft PR; flip it to a tracking issue if you prefer checkboxes |
+| D1 | Texture class + readback | Keep both fields. `readbackCallback` deprecated in **docs and header comments only** (the runtime keeps honouring it and keeps the compositors' readback path). The texture class is left to ADR-060 / win32 v9. |
+| D2 | Window-space layer ownership | **Every binding extension enables it.** The struct is declared identically in all five binding headers behind one guard on the type value. No new extension and no new type value. A standalone extension waits for registration, if it happens at all. |
+| D3 | Provisional → official values | **No migration now.** Prepare by pinning the ABI (Stage 1 test) and by having consumers include the published headers instead of copying values. The mechanism (accept both values from apps; apps opt in to receiving new ones) is decided when #206 moves. |
+| D4 | display_info core | `XrDisplayInfoDXR` + rendering modes + mode / hardware-state events. Recorded in `docs/specs/extensions/spatial-display-set.md`; no code change. |
+| D5 | Author naming | "The DisplayXR Project" |
+| D6 | Doc vs issue | This doc, merged once reviewed |
+
+**Done in this PR (Stage 0 + Stage 1):** the spec-text fixes for F1, F6 and F7
+(plus two more drifts found along the way: display_zones said v1 / 150–153 /
+"requires local_3d_zone ≥ v3" against a v3 header that adds 154 and requires
+≥ v4; the type-value registry called 005 an unused gap, and it is the Android
+create-info), the overview page, the shared guard (F2 + D2), the dead
+`#ifdef` (F4), the GOVERNANCE pointer in the 9 pinned headers (F10), and the
+ABI snapshot test plus its lint check. The snapshot built from these headers is
+**identical, assert for assert (342), to one built from `main`'s headers**, so
+no layout or type value moved.
+
+**Still open:** the Unity provider and `displayxr-demo-mediaplayer` (which
+copies the guarded layer block for xlib and can drop the copy) should include
+the published headers instead of copying values. Those are separate PRs in their
+own repos. Stages 2–3 are parked until #206 moves.
 
 ## 7. Coordination with ADR-060 (`#697`, texture target binding)
 

@@ -8,7 +8,7 @@
 // assignment. Extension names are expected to be stable; numeric values are
 // not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
 // interface history did not restart with the name).
-// See GOVERNANCE.md.
+// See GOVERNANCE.md in https://github.com/DisplayXR/displayxr-extensions.
 //
 /*!
  * @file
@@ -52,7 +52,10 @@ extern "C" {
 // This should be replaced with an official Khronos-assigned value if the extension is standardized
 #define XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999004)
 
-// Window-space composition layer (shared with XR_DXR_win32_window_binding)
+// Window-space composition layer. Every window/surface binding extension
+// (win32, cocoa, xlib, wayland, android) enables it and declares it with this
+// SAME guarded block, so any combination of these headers can be included in
+// any order. The guard is the type value, shared by all five copies.
 #ifndef XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
 #define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR ((XrStructureType)1004999002)
 
@@ -61,8 +64,12 @@ extern "C" {
  *
  * Renders a textured quad at a position specified as fractions of the target
  * window dimensions. Coordinates automatically scale when the window is resized.
- * The same texture is composited into both eye views with a per-eye horizontal
- * shift controlled by the disparity parameter.
+ * The same texture is composited into every view with a per-eye horizontal
+ * shift controlled by the disparity parameter. The layer is composited before
+ * the display processor (it is woven like any other layer).
+ *
+ * Valid on a session created with a window/surface binding, on a session of a
+ * native compositor, and on an IPC (service) session.
  *
  * @extends XrFrameEndInfo (submitted as a composition layer)
  */
@@ -78,7 +85,7 @@ typedef struct XrCompositionLayerWindowSpaceDXR {
     float                       disparity;  //!< Horizontal shift, fraction of window width.
                                             //!< 0 = screen depth, negative = toward viewer
 } XrCompositionLayerWindowSpaceDXR;
-#endif
+#endif // XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
 
 /*!
  * @brief Structure passed in XrSessionCreateInfo::next chain to provide
@@ -99,14 +106,28 @@ typedef struct XrCompositionLayerWindowSpaceDXR {
  *
  * @extends XrSessionCreateInfo
  */
+/*!
+ * @brief Callback for offscreen readback mode (CPU fallback).
+ *
+ * DEPRECATED: new code must pass NULL. The runtime still honours it; no shipped
+ * consumer passes a non-NULL value. Shared by the win32 and cocoa bindings.
+ *
+ * @param pixels   Pointer to RGBA pixel data (width * height * 4 bytes)
+ * @param width    Image width in pixels
+ * @param height   Image height in pixels
+ * @param userdata Opaque pointer from readbackUserdata
+ */
+#ifndef XR_DXR_PFN_READBACK_CALLBACK_DEFINED
+#define XR_DXR_PFN_READBACK_CALLBACK_DEFINED 1
 typedef void (*PFN_xrReadbackCallback)(
     const uint8_t *pixels, uint32_t width, uint32_t height, void *userdata);
+#endif
 
 typedef struct XrCocoaWindowBindingCreateInfoDXR {
     XrStructureType          type;              //!< Must be XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR
     const void* XR_MAY_ALIAS next;              //!< Pointer to next structure in chain
     void*                    viewHandle;        //!< NSView* with CAMetalLayer backing, or NULL for offscreen
-    PFN_xrReadbackCallback   readbackCallback;  //!< Called with composited RGBA pixels (offscreen mode)
+    PFN_xrReadbackCallback   readbackCallback;  //!< DEPRECATED, pass NULL (offscreen CPU readback)
     void*                    readbackUserdata;   //!< Passed to readbackCallback
     void*                    sharedIOSurface;   //!< IOSurfaceRef for zero-copy Metal texture sharing, or NULL
     XrBool32                 transparentBackgroundEnabled; //!< When XR_TRUE, NSWindow + CAMetalLayer
