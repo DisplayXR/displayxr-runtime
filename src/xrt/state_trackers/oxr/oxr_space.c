@@ -168,6 +168,19 @@ space_is_rig_local(const struct oxr_space *spc)
  * which turns the graph's result into T_B_origin o L. Done here, per session,
  * because one space graph serves sessions of both kinds (several IPC clients;
  * EXT_APP_MODE flips the head pose at xrCreateSession, after the builder ran).
+ *
+ * A session whose latest xrLocateViews chained an XR_DXR_view_rig sees the
+ * plane where its RIG puts it instead (P = oxr_session_get_rig_plane_origin,
+ * tracking-origin space) — in every session class but the bridge relay, whose
+ * descriptors are inert. Its views are in that frame, so its hands and
+ * controllers must be too:
+ *
+ *     C_B = T_B_origin o P o inv(head_pose(t)) o inv(T_B_origin)
+ *
+ * (P = identity is the external-window case above.) Without this, an
+ * external-window rig app that poses its display rig at the LOCAL origin —
+ * the normal shape: Unity, Unreal, the cube apps — saw its RIG_LOCAL hands at
+ * T_B_origin o L, i.e. LOCAL's 1.6 m stage height BELOW its views.
  */
 static bool
 rig_local_plane_correction(struct oxr_session *sess,
@@ -176,7 +189,9 @@ rig_local_plane_correction(struct oxr_session *sess,
                            int64_t at_timestamp_ns,
                            struct xrt_pose *out_c)
 {
-	if (!sess->has_external_window && !sess->is_bridge_relay) {
+	struct xrt_pose plane = XRT_POSE_IDENTITY;
+	const bool rig_plane = oxr_session_get_rig_plane_origin(sess, &plane);
+	if (!rig_plane && !sess->has_external_window && !sess->is_bridge_relay) {
 		return false; // The plane IS the head device pose: the graph is right.
 	}
 	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
@@ -200,11 +215,12 @@ rig_local_plane_correction(struct oxr_session *sess,
 		T_B_origin.pose = (struct xrt_pose)XRT_POSE_IDENTITY;
 	}
 
-	struct xrt_pose inv_hp, inv_origin, tmp;
+	struct xrt_pose inv_hp, inv_origin, tmp, tmp2;
 	math_pose_invert(&hp.pose, &inv_hp);
 	math_pose_invert(&T_B_origin.pose, &inv_origin);
 	math_pose_transform(&inv_hp, &inv_origin, &tmp);
-	math_pose_transform(&T_B_origin.pose, &tmp, out_c);
+	math_pose_transform(&plane, &tmp, &tmp2);
+	math_pose_transform(&T_B_origin.pose, &tmp2, out_c);
 	return true;
 }
 
