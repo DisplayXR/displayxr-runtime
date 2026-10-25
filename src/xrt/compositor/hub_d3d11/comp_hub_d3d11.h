@@ -244,6 +244,15 @@ struct comp_hub_d3d11_info
 	 * its first plane frame (`reason=plane_content`), as before P2c.
 	 */
 	bool ring_direct_planes;
+
+	/*!
+	 * #2317 step 2: decline a SAME-ADAPTER engage with
+	 * @ref COMP_HUB_REASON_SAME_ADAPTER_OPT_IN. The D3D11 shim sets it when the
+	 * hub engages by default (no explicit `DXR_HUB=1`): the default-on scope is
+	 * the cross-adapter (hybrid) topology until the single-dGPU desktop run of
+	 * ADR-059's acceptance lands. Zero for every other caller (unchanged).
+	 */
+	bool same_adapter_needs_opt_in;
 };
 
 /*!
@@ -287,6 +296,14 @@ struct comp_hub_d3d11_info
  * stays native rather than silently weave an sRGB-declared PQ atlas or drop PQ.
  */
 #define COMP_HUB_REASON_ATLAS_ENCODING "atlas_encoding_requested"
+/*!
+ * #2317 step 2 review: render == scanout and the hub was not explicitly
+ * requested (`DXR_HUB=1`). The default-on scope is the cross-adapter (hybrid)
+ * topology; a single adapter — every single-dGPU desktop — keeps the tier's own
+ * legs (its ADR-039 same-adapter engage) until the desktop run of ADR-059's
+ * acceptance has been made. `DXR_HUB=1` engages it there.
+ */
+#define COMP_HUB_REASON_SAME_ADAPTER_OPT_IN "same_adapter_opt_in"
 /*!
  * Mid-session RETIRE (#2317 P2b): a frame needed a plane — the Local2D
  * over-flatten, the 2D-under backdrop or an authored mask — and the hub could not

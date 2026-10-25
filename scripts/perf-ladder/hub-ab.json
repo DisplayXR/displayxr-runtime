@@ -65,7 +65,9 @@
         },
         {
           "name": "hub-direct",
-          "env": {},
+          "env": {
+            "DXR_HUB": "1"
+          },
           "expectPath": "hub",
           "topologies": [
             "same-adapter"
@@ -75,6 +77,7 @@
         {
           "name": "hub-xbridge",
           "env": {
+            "DXR_HUB": "1",
             "DXR_HUB_INGRESS": "xbridge"
           },
           "expectPath": "hub",
@@ -89,6 +92,16 @@
             "DXR_WEAVE_ON_SCANOUT": "0"
           },
           "expectPath": "native",
+          "optional": true
+        },
+        {
+          "name": "default-same",
+          "env": {},
+          "expectPath": "own-split",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=0 reason=same_adapter_opt_in",
           "optional": true
         }
       ]
@@ -233,5 +246,5 @@
     }
   ],
   "maxRetries": 3,
-  "armNotes": "An arm runs only on the topologies it lists (absent = all). 'native' = the path main takes BY DEFAULT on that topology (VK: the kill switch, its only non-hub path). expectLine = an extra regex the app log must match. d3d11 since #2317 step 2: the hub is the default, so 'native' is the kill switch DXR_HUB=0 (the tier's own #918 split / same-adapter engage) and the hub arms run the default env."
+  "armNotes": "An arm runs only on the topologies it lists (absent = all). 'native' = the per-API leg that is not the hub (for most apps the path main takes by default; VK: the kill switch, its only non-hub path; d3d11 since #2317 step 2: DXR_HUB=0, the tier's own #918 split / same-adapter engage). d3d11 hub arms: the default env on the hybrid (cross-adapter) topology; DXR_HUB=1 on same-adapter, where the default stays native until the single-dGPU desktop run (optional arm 'default-same' checks that). expectLine = an extra regex the app log must match."
 }

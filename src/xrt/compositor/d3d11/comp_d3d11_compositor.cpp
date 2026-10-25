@@ -324,8 +324,9 @@ struct comp_d3d11_compositor
 
 	/*!
 	 * #2317 P1b: the D3D11 HUB SHIM — the DEFAULT since #2317 step 2 for a
-	 * session that passes its create-time checks; `DXR_HUB=0` is the kill
-	 * switch (@ref d3d11_hub_policy).
+	 * session that passes its create-time checks on a cross-adapter box
+	 * (`DXR_HUB=1` on one adapter); `DXR_HUB=0` is the kill switch
+	 * (@ref d3d11_hub_policy).
 	 *
 	 * When active this tier owns no display processor, no target and no split:
 	 * the renderer composes the atlas on the app device exactly as always, and the
@@ -4275,16 +4276,20 @@ d3d11_make_dp(struct comp_d3d11_compositor *c,
               bool on_scanout);
 
 /*!
- * #2317 step 2: what `DXR_HUB` asks for. Read once; process-level env, like every
- * in-process DXR_* knob.
+ * #2317 step 2: what `DXR_HUB` asks for. Read once, through the settings chain
+ * (env > per-user > machine — a managed name, so `displayxr-cli perf set` and
+ * the Dashboard can set it for apps they never launched), and parsed with the
+ * split gate's own parser so its false spellings match DXR_WEAVE_ON_SCANOUT's.
  *
- * - unset / empty: DEFAULT — the hub engages for every session that passes the
- *   create-time checks in @ref d3d11_hub_stage_a (the #1264 / ADR-039 shape).
- * - a false spelling (`0`, `false`, `off`, `no`): the KILL SWITCH — the tier's
- *   own legs, exactly as before the flip (`reason=disabled_by_env`).
- * - anything else (`1`): FORCED — the P1b..P2c opt-in, kept so existing
- *   recipes keep working. It forces nothing past a refusal: a hosted,
- *   transparent or texture-class session still goes native by name.
+ * - unset / empty: DEFAULT — the hub engages for a session that passes the
+ *   create-time checks in @ref d3d11_hub_stage_a ON THE CROSS-ADAPTER (hybrid)
+ *   TOPOLOGY. A single adapter declines with `same_adapter_opt_in` until the
+ *   single-dGPU desktop run of ADR-059's acceptance lands.
+ * - a false spelling (`0`, `f…`, `n…`, `off`): the KILL SWITCH — the tier's own
+ *   legs, exactly as before the flip (`reason=disabled_by_env`).
+ * - anything else (`1`): FORCED — engages on a single adapter too (the P1b..P2c
+ *   opt-in). It forces nothing past a refusal: a hosted, transparent or
+ *   texture-class session still goes native by name.
  */
 enum d3d11_hub_policy_kind
 {
@@ -4298,11 +4303,11 @@ d3d11_hub_policy(void)
 {
 	static int policy = -1;
 	if (policy < 0) {
-		const char *e = getenv("DXR_HUB");
+		char buf[64];
+		const char *e = u_setting_get_raw("DXR_HUB", buf, sizeof(buf), nullptr);
 		if (e == nullptr || e[0] == '\0') {
 			policy = D3D11_HUB_POLICY_DEFAULT;
-		} else if (e[0] == '0' || _stricmp(e, "false") == 0 || _stricmp(e, "off") == 0 ||
-		           _stricmp(e, "no") == 0) {
+		} else if (!comp_split_gate_parse_requested(e)) {
 			policy = D3D11_HUB_POLICY_DISABLED;
 		} else {
 			policy = D3D11_HUB_POLICY_FORCED;
@@ -4424,6 +4429,8 @@ d3d11_hub_stage_a(struct comp_d3d11_compositor *c,
 	si.preferred_width = c->settings.preferred.width;
 	si.preferred_height = c->settings.preferred.height;
 	si.stable_atlas = true;
+	// #2317 step 2 review: default-on scope = cross-adapter until the desktop run.
+	si.same_adapter_needs_opt_in = (d3d11_hub_policy() != D3D11_HUB_POLICY_FORCED);
 
 	const char *short_reason = nullptr;
 	if (comp_hub_d3d11_stage_a(&si, &c->hub.split, &short_reason) != XRT_SUCCESS || c->hub.split == nullptr) {

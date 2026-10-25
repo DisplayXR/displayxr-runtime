@@ -531,14 +531,16 @@ struct cli_query_result
 	char gpu_weave_env[64];
 	char gpu_weave_source[16]; //!< "env" / "user" / "machine" / "default".
 	/*!
-	 * #2317 step 2: DXR_HUB as THIS process sees it. Since step 2 the in-process
-	 * D3D11 leg weaves through the D3D11 hub by default and `DXR_HUB=0` is the
-	 * kill switch. Process environment only (an app's own env decides for that
-	 * app), so this is a hint, not a statement about any running session — the
+	 * #2317 step 2: DXR_HUB as THIS process resolves it (the settings chain;
+	 * a managed name). The in-process D3D11 leg weaves through the D3D11 hub by
+	 * default on a cross-adapter box; `DXR_HUB=0` is the kill switch and `=1`
+	 * also engages it on one adapter. An "env" source says nothing about another
+	 * process, "user" / "machine" describe every app; either way a hint — the
 	 * session's own `hub placement:` log line is the truth.
 	 */
 	bool gpu_hub_env_set;
 	char gpu_hub_env[64];
+	char gpu_hub_source[16]; //!< "env" / "user" / "machine" / "default".
 	/*!
 	 * #918 Phase 2b — the SERVICE split, as far as a headless tool can honestly
 	 * answer it: this process is not the service, holds no IPC connection, and

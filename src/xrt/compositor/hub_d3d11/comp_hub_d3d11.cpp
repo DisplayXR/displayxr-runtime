@@ -1495,22 +1495,31 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
 	comp_split_gate_evaluate(&gin, &gate);
 	*out_short_reason = gate.short_reason;
 
+	// #2317 step 2: a caller that engages by DEFAULT stays off a single adapter
+	// until the desktop run (decided before the ENGAGE line, so nothing is said
+	// about an engage that does not happen).
+	if (gate.same_adapter && gate.split_active && info->same_adapter_needs_opt_in) {
+		*out_short_reason = COMP_HUB_REASON_SAME_ADAPTER_OPT_IN;
+		return XRT_ERROR_COMPOSITOR_NOT_SUPPORTED;
+	}
 	if (gate.same_adapter && gate.split_active) {
 		// ADR-039: same adapter, split ENGAGED anyway — the fill engine is
 		// the point, not the copy. The ingress below is a same-adapter
 		// shared-texture open (no PCIe hop).
-		U_LOG_W("VK output-device split: ADR-039 same-adapter ENGAGE on '%ls' "
-		        "LUID=%08lx:%08lx — one fill engine for every tier "
-		        "(DXR_SPLIT_SAME_ADAPTER)",
-		        sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
-		        (unsigned long)sdesc.AdapterLuid.LowPart);
+		U_LOG_W(
+		    "D3D11 hub: ADR-039 same-adapter ENGAGE on '%ls' "
+		    "LUID=%08lx:%08lx — one fill engine for every tier "
+		    "(DXR_SPLIT_SAME_ADAPTER)",
+		    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+		    (unsigned long)sdesc.AdapterLuid.LowPart);
 	} else if (gate.same_adapter) {
 		// Not a failure: on a MUX'd / single-GPU box the weave is already
 		// local, so the split has nothing to do. One line, no WARN storm.
-		U_LOG_W("VK output-device split: scanout adapter '%ls' LUID=%08lx:%08lx IS the app's adapter — "
-		        "split is a no-op (#918)",
-		        sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
-		        (unsigned long)sdesc.AdapterLuid.LowPart);
+		U_LOG_W(
+		    "D3D11 hub: scanout adapter '%ls' LUID=%08lx:%08lx IS the app's adapter — "
+		    "the output-device split is a no-op (#918)",
+		    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+		    (unsigned long)sdesc.AdapterLuid.LowPart);
 	}
 	if (!gate.split_active) {
 		return XRT_ERROR_COMPOSITOR_NOT_SUPPORTED;
@@ -1619,9 +1628,10 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
 		split_destroy_mutexes(s);
 		free(s);
 		*out_short_reason = (stage_a_token != nullptr) ? stage_a_token : COMP_SPLIT_REASON_STAGE_A_FAILED;
-		U_LOG_W("VK output-device split DISABLED (%s) — falling back to the stock single-device Vulkan "
-		        "path (#918)",
-		        reason);
+		U_LOG_W(
+		    "D3D11 hub DISABLED (%s) — the calling compositor's own legs take the session "
+		    "(#918)",
+		    reason);
 		return XRT_ERROR_COMPOSITOR_NOT_SUPPORTED;
 	}
 

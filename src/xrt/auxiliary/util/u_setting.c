@@ -70,6 +70,11 @@ static const char *const managed_names[] = {
     // D3D11 service, GL, VK native), all through u_setting_get_raw with their
     // original parse. Only "0" changes anything (opt-out of the default ON).
     "DXR_LATE_WEAVE",
+    // #2317 step 2: the in-process D3D11 hub's kill switch (=0) and its
+    // same-adapter opt-in (=1). Read once per process by the D3D11 tier with
+    // the split gate's parser, so the Dashboard can turn the hub off for an app
+    // it never launched, as it can the split it sits on.
+    "DXR_HUB",
 };
 
 #define MANAGED_COUNT ((uint32_t)(sizeof(managed_names) / sizeof(managed_names[0])))
