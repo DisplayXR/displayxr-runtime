@@ -55,6 +55,10 @@ extern "C" {
  *        enabled. Read only by the VK-0 deposit (#1178) — the runtime cannot
  *        turn the feature on after device creation, and the deposit's D3D-fence
  *        sync has no correct fallback without it.
+ * @param app_created_device True when the APP created the VkDevice
+ *        (XR_KHR_vulkan_enable v1). Known before the compositor exists, so the
+ *        weave-thread ownership decision can key on it (#2393); the later
+ *        comp_vk_native_compositor_set_vk_device_origin call only logs.
  * @param out_xc Pointer to receive the created compositor.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -80,6 +84,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  int32_t display_screen_top,
                                  bool app_timeline_semaphores,
                                  bool app_keyed_mutex,
+                                 bool app_created_device,
                                  struct xrt_compositor_native **out_xc);
 
 /*!

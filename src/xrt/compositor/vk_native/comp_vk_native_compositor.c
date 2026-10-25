@@ -14520,6 +14520,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  int32_t display_screen_top,
                                  bool app_timeline_semaphores,
                                  bool app_keyed_mutex,
+                                 bool app_created_device,
                                  struct xrt_compositor_native **out_xc)
 {
 	if (vk_device == NULL) {
@@ -15205,6 +15206,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		 * a sysprop for `adb shell setprop` — the kill switch has to be
 		 * reachable on the device that exhibits the bug.
 		 */
+		bool single_explicit = false; // DXR_WEAVE_SINGLE_THREAD / sysprop was set
 		{
 #ifdef XRT_OS_ANDROID
 			int single = 1;
@@ -15242,6 +15244,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			const char *se = getenv("DXR_WEAVE_SINGLE_THREAD");
 			if (se != NULL && se[0] != '\0') {
 				single = (se[0] == '0') ? 0 : 1;
+				single_explicit = true;
 			}
 #ifdef XRT_OS_ANDROID
 			else {
@@ -15249,14 +15252,12 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 				if (__system_property_get("debug.dxr.weave_single_thread", sp) > 0 &&
 				    sp[0] != '\0') {
 					single = (sp[0] == '0') ? 0 : 1;
+					single_explicit = true;
 				}
 			}
 #endif
+			// Logged below, once the #2393 enable1 rule has had its say.
 			c->weave_hand.enabled = single;
-			U_LOG_W("#1196: weave thread ownership: %s (DXR_WEAVE_SINGLE_THREAD / "
-			        "debug.dxr.weave_single_thread; 0 disables)",
-			        single ? "single — app frames weave on the repaint thread"
-			               : "legacy — app thread and repaint thread both weave");
 #ifdef VK_MIDFRAME_FILL
 			// #1905: resolve (and log, once) the duty + park knobs at
 			// startup rather than on the repaint thread's first tick. The
@@ -15342,6 +15343,71 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		                           c->repaint.enabled == 1)
 		                              ? 1
 		                              : 0;
+
+		/*
+		 * #2393: a vulkan_enable1 app on the shared-queue tier weaves on ONE
+		 * thread by default.
+		 *
+		 * Under enable1 the app created the VkDevice, so the repaint has no
+		 * queue of its own and shares the app's, serialised per call by
+		 * VK_LAYER_DXR_queue_lock. With legacy ownership two threads then
+		 * weave into the one VkSwapchainKHR: the app thread inside
+		 * xrEndFrame, and the repaint thread. That is a circular wait:
+		 *
+		 *  - a fill acquires target image A, submits, and fence-parks with
+		 *    c->mutex RELEASED (#1264 S1) — still holding A unpresented;
+		 *  - on the shared queue the fill's work sits behind whatever the
+		 *    app has already submitted, so the park lasts about as long as
+		 *    the app's GPU frame — the window in which the app reaches
+		 *    xrEndFrame;
+		 *  - the app thread takes c->mutex and calls vkAcquireNextImageKHR.
+		 *    The late-weave chain on Windows is the 2-image floor
+		 *    (minImageCount 2), so only ONE image may be acquired at a time
+		 *    and A is it: the acquire cannot succeed until A is presented;
+		 *  - presenting A (or handing it back) needs c->mutex, which the
+		 *    app thread holds while it waits.
+		 *
+		 * Unbounded that is a hang; with DXR_VK_ACQUIRE_TIMEOUT_MS armed the
+		 * acquire times out, the frame fails, and the failed frames make the
+		 * app look quiet, so the repaint fills every refresh and re-forms
+		 * the cycle on the next commit — every acquire fails (field report:
+		 * an enable1 app, hosted, Windows; DXR_WEAVE_SINGLE_THREAD=1 cleared
+		 * it). Single ownership puts every acquire and present on the
+		 * repaint thread, so no thread can wait in acquire on an image
+		 * another thread holds.
+		 *
+		 * Scoped to exactly that combination: enable2 apps (the runtime made
+		 * the device) keep their validated default, and Android already
+		 * defaults to single. An explicit DXR_WEAVE_SINGLE_THREAD wins in
+		 * both directions — =0 restores the legacy ownership. Not under the
+		 * #918 split either: there the weave is the hub's, not this
+		 * VkSwapchainKHR's, and #1261 keeps that path's ownership as validated.
+		 */
+		bool split_engaged = false;
+#ifdef XRT_OS_WINDOWS
+		split_engaged = (c->split != NULL);
+#endif
+		const bool enable1_shared_queue = app_created_device && c->repaint.shared_queue == 1 && !split_engaged;
+		if (enable1_shared_queue && single_explicit && c->weave_hand.enabled == 0) {
+			// Say so, so a log of an explicit =0 run cannot be mistaken
+			// for one where the auto default failed to engage.
+			U_LOG_W(
+			    "#2393: DXR_WEAVE_SINGLE_THREAD=0 OVERRIDES the vulkan_enable1 shared-queue "
+			    "default (single ownership) — legacy two-thread ownership kept; the app-frame "
+			    "target acquire can starve behind a parked fill");
+		} else if (enable1_shared_queue && !single_explicit && c->weave_hand.enabled == 0) {
+			c->weave_hand.enabled = 1;
+			U_LOG_W(
+			    "#2393: vulkan_enable1 app with the repaint sharing its queue "
+			    "(VK_LAYER_DXR_queue_lock) — single weave-thread ownership auto-enabled "
+			    "(two weaving threads time out the target acquire; "
+			    "DXR_WEAVE_SINGLE_THREAD=0 overrides)");
+		}
+		U_LOG_W(
+		    "#1196: weave thread ownership: %s (DXR_WEAVE_SINGLE_THREAD / "
+		    "debug.dxr.weave_single_thread; 0 disables)",
+		    c->weave_hand.enabled == 1 ? "single — app frames weave on the repaint thread"
+		                               : "legacy — app thread and repaint thread both weave");
 #ifdef VK_MIDFRAME_FILL
 		// #1905 enable policy: mid-frame fill auto-enables on the same
 		// marker handshake — the layer is live in this device's chain, so the

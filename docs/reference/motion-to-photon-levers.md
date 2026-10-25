@@ -405,6 +405,17 @@ serialisation in effect …` line naming `DXR_WEAVE_REPAINT=0` as the A/B switch
 is disabled automatically: the collapse first reported in #2039 reproduced *without* the layer and was
 later attributed to a tracked viewer plus a low GPU clock.
 
+**Single weave-thread ownership is the default there (#2393).** With the repaint sharing an
+enable1 app's queue, legacy ownership (`DXR_WEAVE_SINGLE_THREAD` off — the desktop default) has two
+threads weaving into the one `VkSwapchainKHR`: the app thread inside `xrEndFrame`, and the repaint
+thread. A field report (an enable1 app, hosted, Windows) saw every app-frame
+`vkAcquireNextImageKHR` time out and the session return `XR_ERROR_RUNTIME_FAILURE` from then on,
+cleared by `DXR_WEAVE_SINGLE_THREAD=1`. So when the device is app-created (enable1) **and** the
+shared-queue tier engaged, the compositor turns single ownership on and logs one
+`#2393: vulkan_enable1 app with the repaint sharing its queue …` WARN ahead of the usual `#1196:
+weave thread ownership` line. An explicit `DXR_WEAVE_SINGLE_THREAD=0` restores the legacy
+ownership; enable2 sessions and Android are unchanged.
+
 ### `DXR_DEFER_PRESENT` — **REMOVED from the code; kept here as the measurement record** (#837)
 
 > **The variable no longer exists.** `grep -rn DEFER_PRESENT src/` returns nothing — the
