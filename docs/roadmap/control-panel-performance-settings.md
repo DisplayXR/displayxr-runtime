@@ -630,6 +630,7 @@ setting, never `getenv`): `displayxr-cli input …` surfaces both.
 |---|---|---|---|---|
 | `DXR_TEST_SPLIT_FAIL_STAGEA` | `compositor/xbridge/comp_split_gate.c:62` | off | App | Forces Stage A to fail |
 | `DXR_TEST_HUB_PLANE_FAIL` | `d3d11/comp_d3d11_compositor.cpp` (`d3d11_hub_stage_planes`) | off | App | Under the D3D11 hub (the default since #2317 step 2), refuses the first frame that needs a plane so the `plane_unavailable` retire can be exercised (#2317 P2b) |
+| `DXR_HUB_GL_IMPORT` | `compositor/gl/comp_gl_deposit.cpp` (`comp_gl_deposit_create`) | unset (= `GL_EXT_memory_object_win32` + `GL_EXT_semaphore_win32` when the driver has both, else `WGL_NV_DX_interop2`) | App | Under `DXR_HUB=1` on a GL session (GL is opt-in, never the D3D11 default): `interop` forces the `WGL_NV_DX_interop2` deposit import (the A/B control for the fallback path, `import_reason=forced_by_env`), `memory_object` forbids the fallback (a driver without the memory-object path then refuses with `gl_no_interop`). Placement-line oracle only (#2317 P3) |
 | `DXR_TEST_FAKE_DP_REFUSE` | `d3d11/comp_d3d11_compositor.cpp:3684`; `d3d12/…:1136`; `vk_native/hub_d3d11/comp_hub_d3d11.cpp:269` | off | App | Forces a DP refusal on the scanout adapter |
 | `DXR_TEST_FORCE_WEAVE_INGEST_DP` | `compositor/d3d11_service/comp_d3d11_service.cpp:4269` | 0 | Svc | Forces the #1172 weave-on-ingest arm |
 | `DXR_TEST_FAKE_DEVICE_REMOVED` | `compositor/d3d11_service/comp_d3d11_service.cpp:3633` | 0 | Svc | Simulates device loss |

@@ -212,13 +212,28 @@ the iGPU; otherwise leave it alone and let the split keep the dGPU rendering.
 | **D3D11 service** (`_ipc`, any client API) | yes, per presenter | `presenter_ineligible,weave_on_ingest` (`CLIENT_TEXTURE` / self-presenting — the client owns the present, ADR-037 §7, and its display processor follows it onto the render device, #1172) · `legacy_standalone` · `no_panel_dimensions` · `same_adapter` · `stage_a_failed` · `killed_by_env` |
 | In-process **D3D12** (Unity, Unreal), projection-only | yes | as D3D11, plus `layers_unsupported` (a zones / Local2D / mask frame retires the split for the session) and `dp_refused_scanout` (ADR-037 §3a) |
 | In-process **Vulkan** (Windows) | yes (#1178, v2.12.1/v2.13.0; `comp_vk_native_split.cpp`) — via a same-adapter D3D11 deposit the atlas renders into, then the ordinary cross-adapter bridge | `no_timeline_semaphore` (app's `VkDevice` lacks `VK_KHR_timeline_semaphore`) · `no_hwnd` · the common gate tokens; `api_unsupported` only on non-Windows builds (ADR-037 §3) |
-| In-process **OpenGL** | **no** | `api_unsupported` — and ADR-037 §5: OpenGL exposes no device-*selection* API at all (it does usually expose the adapter's *identity* — see below) |
+| In-process **OpenGL** | **no** by default; **yes under `DXR_HUB=1`** (#2317 P3, the D3D11 hub) | `api_unsupported` — and ADR-037 §5: OpenGL exposes no device-*selection* API at all (it does usually expose the adapter's *identity* — see below) |
 | Metal / Android | n/a | single-adapter; the rule degenerates |
 
-OpenGL takes rung 2 **unconditionally** and cannot reach a half-engaged state:
-nothing in the GL compositor consults a scanout adapter, allocates a bridge, or
-creates a second device. It logs the placement line and renders exactly as
-before. Vulkan (Windows) has a split as of #1178 — see ADR-037 §3; the
+By default OpenGL takes rung 2 and cannot reach a half-engaged state: nothing
+in the GL compositor consults a scanout adapter, allocates a bridge, or creates
+a second device. It logs the placement line and renders exactly as before.
+
+**Under `DXR_HUB=1` (#2317 P3)** GL still cannot be *told* which adapter to use,
+so the shim *reads* it: the GL context's LUID from `GL_DEVICE_LUID_EXT`, else an
+unambiguous `GL_VENDOR` / `GL_RENDERER` match. The ADR-037 §2 fallback is a
+guess and is refused as `gl_no_luid`. The GL atlas then renders into a D3D11
+deposit created **on that adapter** — `GL_EXT_memory_object_win32` +
+`GL_EXT_semaphore_win32` (`import=memory_object sync=fence`, zero copies), else
+`WGL_NV_DX_interop2` through a non-shared transit texture
+(`import=nv_dx_interop sync=lock_copy`, one GPU copy) — and the D3D11 hub
+weaves and presents on the scanout adapter: DIRECT when GL is already there,
+comp_xbridge across adapters. A create-time round-trip probe verifies the
+import (`gl_deposit_unverified`). Other refusals: `gl_no_interop`,
+`gl_no_clip_control`, `gl_deposit_failed`; a Local2D / zones / authored-mask
+frame retires the hub (`planes_unsupported_gl`). To put a GL app on one
+adapter, pin the exe with `UserGpuPreferences` — `DXR_D3D_FORCE_GPU` does not
+move GL. Vulkan (Windows) has a split as of #1178 — see ADR-037 §3; the
 `DXR_VK_DEPOSIT` section below documents its first rung (VK-0) and predates the
 split, so its "Not a split" / `api_unsupported` wording describes that rung only.
 

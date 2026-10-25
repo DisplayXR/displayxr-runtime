@@ -85,6 +85,15 @@ if(WIN32)
 			${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_segments_gl.h
 			${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_segments_route.h
 		)
+
+	# #2317 P3: the GL shim onto the D3D11 hub (DXR_HUB=1). The GL atlas renders
+	# into a D3D11 deposit (comp_gl_deposit) that the hub weaves and presents.
+	# Linked only where the hub exists (WIN32 + D3D11); XRT_GL_HUB gates the code.
+	if(TARGET comp_hub_d3d11 AND XRT_HAVE_D3D11)
+		target_sources(comp_gl PRIVATE comp_gl_deposit.cpp comp_gl_deposit.h)
+		target_link_libraries(comp_gl PRIVATE comp_hub_d3d11)
+		target_compile_definitions(comp_gl PRIVATE XRT_GL_HUB)
+	endif()
 elseif(APPLE)
 	target_link_libraries(comp_gl PRIVATE "-framework OpenGL" "-framework Cocoa" "-framework IOSurface")
 endif()

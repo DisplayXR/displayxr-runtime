@@ -69,6 +69,7 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 	                                     bound_display_id != 0 ? bound_display_id : COMP_DP_PRIMARY_MONITOR, // #2218
 	                                     COMP_DP_API_GL)
 	        : NULL,
+	    NULL,                 // dp_factory_d3d11: the D3D11 hub is Windows-only (#2317 P3)
 	    shared_iosurface,     // IOSurfaceRef for shared texture mode (or NULL for windowed)
 	    /*transparent_background*/ false,  // GL transparent present path is deferred (PR #3b §3b)
 	    /*display_screen_left*/ 0,   // macOS: NSOpenGLView positioning, no D3D11 window

@@ -269,7 +269,9 @@ struct comp_hub_d3d11_info
  * "`DXR_HUB` is not `1`" while the D3D11 shim was opt-in (P1b..P2c); since step 2
  * the in-process D3D11 leg weaves through the hub BY DEFAULT and the only way to
  * opt out is the kill switch, @ref COMP_HUB_REASON_DISABLED_BY_ENV. Field logs
- * from builds before step 2 still carry this string; nothing emits it today.
+ * from builds before step 2 still carry this string. The D3D11 leg no longer
+ * emits it; the OpenGL shim (#2317 P3) still does, because GL stays opt-in
+ * (exactly `DXR_HUB=1`) whatever the D3D11 default is.
  */
 #define COMP_HUB_REASON_NOT_REQUESTED "not_requested"
 /*!
@@ -324,6 +326,35 @@ struct comp_hub_d3d11_info
  * clears them with it (#2218 #4, the native rule), on every hub route.
  */
 #define COMP_HUB_REASON_PLANE_UNAVAILABLE "plane_unavailable"
+
+/*
+ * #2317 P3: the OpenGL shim's refusals (comp_gl_compositor + comp_gl_deposit).
+ * GL cannot be told which adapter to use (ADR-037 §5), so every one of these
+ * is a statement about the adapter and driver GL already landed on.
+ */
+//! The GL context's adapter could not be identified: no `GL_DEVICE_LUID_EXT`
+//! and no unambiguous GL_VENDOR / GL_RENDERER match. The deposit device would
+//! have to be guessed, which the shim never does.
+#define COMP_HUB_REASON_GL_NO_LUID "gl_no_luid"
+//! Neither import path exists on this driver: no `GL_EXT_memory_object_win32` +
+//! `GL_EXT_semaphore_win32` and no `WGL_NV_DX_interop2`.
+#define COMP_HUB_REASON_GL_NO_INTEROP "gl_no_interop"
+//! No `glClipControl` (GL 4.5 / ARB_clip_control): the atlas cannot be painted
+//! top-down into the D3D11 deposit.
+#define COMP_HUB_REASON_GL_NO_CLIP_CONTROL "gl_no_clip_control"
+//! The deposit device, texture, fences or every GL import failed.
+#define COMP_HUB_REASON_GL_DEPOSIT_FAILED "gl_deposit_failed"
+//! The import succeeded but the create-time round-trip probe (GL clears a
+//! sentinel, D3D11 reads one texel back) did not see GL's bytes in the D3D11
+//! texture: weaving would show black or stale content.
+#define COMP_HUB_REASON_GL_DEPOSIT_UNVERIFIED "gl_deposit_unverified"
+/*!
+ * Mid-session RETIRE: a frame carried a Local2D layer, a display-zones layer or
+ * an authored zone mask. The GL leg's flatten scratches and masks are plain GL
+ * textures, not D3D11-shareable surfaces, so the hub cannot carry them; the
+ * GL compositor's own legs take the session and compose that frame.
+ */
+#define COMP_HUB_REASON_PLANES_UNSUPPORTED_GL "planes_unsupported_gl"
 /*! @} */
 
 /*!

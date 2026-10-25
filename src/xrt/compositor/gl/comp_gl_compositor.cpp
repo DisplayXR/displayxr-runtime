@@ -42,6 +42,13 @@
 #include "comp_gl_segments.h"
 #include "util/comp_segments_gl.h"
 #include "util/comp_segments_route.h"
+#ifdef XRT_GL_HUB
+// #2317 P3: the GL shim onto the D3D11 hub (DXR_HUB=1). The atlas renders into
+// a D3D11 deposit on the GL context's adapter; the hub weaves and presents it.
+#include "comp_gl_deposit.h"
+#include "hub_d3d11/comp_hub_d3d11.h"
+#include "hub_d3d11/comp_hub_d3d11_handoff.h"
+#endif
 #endif
 
 #include "xrt/xrt_device.h"
@@ -1215,7 +1222,105 @@ struct comp_gl_compositor
 	struct xrt_segment_view_routing seg_route_logged;
 	/*! @} */
 #endif
+
+#ifdef XRT_GL_HUB
+	/*!
+	 * @name #2317 P3: the D3D11 hub (DXR_HUB=1)
+	 *
+	 * While @ref hub.active the GL atlas IS the deposit's texture (zero copies),
+	 * painted top-down; the hub weaves it with the D3D11 display processor and
+	 * presents it to the app's HWND, and this compositor's own weave, present,
+	 * repaint replay, DwmFlush pacing and GL display processor are not used.
+	 * @{
+	 */
+	struct
+	{
+		bool active;
+		struct comp_hub_d3d11 *split;
+		struct comp_gl_deposit *dep;
+		//! The GL atlas the native legs paint, swapped back in on a retire.
+		GLuint native_atlas;
+		//! What a retire needs to stand the GL display processor up.
+		void *dp_factory_gl;
+		void *dp_window;
+		//! The session's last 3D wish, re-sent to a retire's fresh GL DP.
+		bool want_3d;
+		//! The deposit's adapter came from GL_DEVICE_LUID_EXT (placement `luid=`).
+		bool luid_exact;
+		//! A retire handed the HWND back to GL's presenter: log the first
+		//! SwapBuffers after it, once.
+		bool log_first_native_present;
+		//! After a retire: the GL DP's factory has not succeeded yet (retried,
+		//! frames held). See gl_hub_retry_dp.
+		bool dp_owed;
+		uint32_t dp_owed_frames;
+		uint32_t dp_attempts;
+		//! #867: the predicted display time handed out last (monotonic clamp).
+		uint64_t last_display_time_ns;
+		//! The POST_COMPOSE capture intent handed to the hub this frame.
+		struct u_capture_intent capture;
+	} hub;
+	/*! @} */
+#endif
+
+	/*!
+	 * #2317 P3: this frame paints the atlas TOP-DOWN (D3D row order) because its
+	 * target is the hub's D3D11 deposit: `glClipControl(GL_UPPER_LEFT)` flips
+	 * every draw within its viewport and @ref gl_atlas_viewport mirrors the
+	 * viewport itself about @ref atlas_flip_h (the frame's content height), so
+	 * the content box lands at D3D's top-left, upright, view 0 first. Always
+	 * false off the hub, where every call below is the unchanged GL call.
+	 */
+	bool atlas_top_down;
+	GLint atlas_flip_h;
 };
+
+/*!
+ * #2317 P3: glViewport / glScissor for an ATLAS pass. Off the hub this is the
+ * plain call; under it the rectangle is mirrored about the content height (see
+ * @ref comp_gl_compositor::atlas_top_down).
+ */
+static inline void
+gl_atlas_viewport(const struct comp_gl_compositor *c, GLint x, GLint y, GLsizei w, GLsizei h)
+{
+	glViewport(x, c->atlas_top_down ? c->atlas_flip_h - y - (GLint)h : y, w, h);
+}
+
+static inline void
+gl_atlas_scissor(const struct comp_gl_compositor *c, GLint x, GLint y, GLsizei w, GLsizei h)
+{
+	glScissor(x, c->atlas_top_down ? c->atlas_flip_h - y - (GLint)h : y, w, h);
+}
+
+//! #2317 P3: the D3D11 hub has this session (always false on a build without it).
+static inline bool
+gl_hub_active(const struct comp_gl_compositor *c)
+{
+#ifdef XRT_GL_HUB
+	return c->hub.active;
+#else
+	(void)c;
+	return false;
+#endif
+}
+
+/*!
+ * #2317 P3: the GL shim's OWN gate — `DXR_HUB=1` exactly, read once; unset (or
+ * any other value) is OFF. Deliberately not the D3D11 tier's hub policy, whose
+ * default may engage the hub on its own (#2363): GL stays opt-in on every
+ * topology until the Intel interop transit cost and a single-dGPU desktop run
+ * are settled (the flip is tracked in #2317).
+ */
+static inline bool
+gl_hub_requested(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_HUB");
+		on = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return on == 1;
+}
 
 static inline struct comp_gl_compositor *
 gl_comp(struct xrt_compositor *xc)
@@ -2793,6 +2898,34 @@ gl_compositor_predict_frame(struct xrt_compositor *xc,
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = now_ns + period_ns / 2;
 	*out_predicted_display_time_ns = now_ns + period_ns;
+#ifdef XRT_GL_HUB
+	{
+		/*
+		 * #2317 P3: under the hub the frame reaches the panel through the hub's
+		 * DXGI chain, so the prediction is its target's measured
+		 * wait_frame -> scanout lookahead (#867), as for every hub route, with
+		 * the D3D11 tier's monotonic clamp. Off the hub: unchanged.
+		 */
+		struct comp_gl_compositor *c = gl_comp(xc);
+		const bool hub_on = gl_hub_requested();
+		if (hub_on) {
+			os_mutex_lock(&c->mutex);
+		}
+		if (hub_on && c->hub.active) {
+			const uint64_t measured = comp_hub_d3d11_get_predicted_lookahead_ns(c->hub.split);
+			*out_predicted_display_time_ns = now_ns + (measured != 0 ? (int64_t)measured : period_ns * 2);
+			comp_hub_d3d11_mark_wait_frame(c->hub.split);
+			comp_hub_d3d11_set_app_paced(c->hub.split, c->repaint.partition.next_release_ns != 0);
+			if (*out_predicted_display_time_ns <= (int64_t)c->hub.last_display_time_ns) {
+				*out_predicted_display_time_ns = (int64_t)c->hub.last_display_time_ns + 1;
+			}
+			c->hub.last_display_time_ns = (uint64_t)*out_predicted_display_time_ns;
+		}
+		if (hub_on) {
+			os_mutex_unlock(&c->mutex);
+		}
+	}
+#endif
 	// #1257 partition: panel period on purpose — reporting D x period made
 	// apps pace themselves on top of the throttle (double pacing); pacing
 	// lives in the throttle alone.
@@ -2836,7 +2969,7 @@ gl_compositor_wait_frame(struct xrt_compositor *xc,
 		// This in-process tier is UNSUPPORTED (see u_app_partition.h) —
 		// the throttle refuses cleanly unless the bring-up override is set.
 		u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns,
-		                         /*tier_supported=*/false);
+		                         /*tier_supported=*/gl_hub_active(c));
 	}
 
 	int64_t wake, gpu_time;
@@ -4929,10 +5062,11 @@ gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *pat
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read_fbo);
 	glDeleteFramebuffers(1, &fbo);
 
+	// #2317 P3: the hub's deposit is painted top-down already (D3D row order).
+	const bool src_top_down = c->atlas_top_down && src_tex == c->atlas_texture;
 	for (uint32_t y = 0; y < content_h; y++) {
 		memcpy(top_down + (size_t)y * row_pitch,
-		       bottom_up + (size_t)(content_h - 1 - y) * row_pitch,
-		       row_pitch);
+		       bottom_up + (size_t)(src_top_down ? y : content_h - 1 - y) * row_pitch, row_pitch);
 	}
 	free(bottom_up);
 
@@ -5173,6 +5307,425 @@ gl_segments_tick(struct comp_gl_compositor *c, bool eligible, uint32_t present_w
 }
 #endif // XRT_OS_WINDOWS
 
+/*
+ *
+ * The GL display processor (factored out of create so a hub refusal or retire
+ * can stand it up later with the same calls).
+ *
+ */
+
+static void
+gl_create_gl_dp(struct comp_gl_compositor *c, void *dp_factory_gl, void *dp_window, bool quiet_failure)
+{
+	if (dp_factory_gl == NULL) {
+		return;
+	}
+	xrt_dp_factory_gl_fn_t factory = (xrt_dp_factory_gl_fn_t)dp_factory_gl;
+	xrt_result_t dp_ret = factory(dp_window, &c->display_processor);
+	if (dp_ret == XRT_SUCCESS && c->display_processor != NULL) {
+		U_LOG_W("GL compositor: display processor created via factory");
+		// Weave scope, once — see the D3D11 leg. GL output is a window.
+		(void)u_weave_scope_report(xrt_display_processor_gl_get_weave_scope(c->display_processor), "GL",
+		                           /* panel_scoped */ false);
+		// Forward session-level transparency (#573 — chroma-key-free;
+		// mirrors the D3D11/D3D12/VK legs). client_presents=false: the DP
+		// owns see-through (compose-under-bg from the atlas alpha). The GL
+		// compositor's own DComp transparent present (when interop/readback
+		// is up) is independent and blends the live desktop into the fully
+		// transparent border. No-op on DPs without the slot (e.g.
+		// sim_display, which preserves alpha natively).
+		xrt_display_processor_gl_set_transparent_background(c->display_processor, c->transparent_background,
+		                                                    false);
+
+		// #68: tell the DP whether the app self-presents only the canvas
+		// (texture app) vs the runtime presenting the full target (handle).
+		// has_shared_texture is Windows-only (WGL_NV_DX_interop2); on other
+		// platforms GL has no shared-texture present → always false.
+		bool gl_shared_texture_present = false;
+#ifdef XRT_OS_WINDOWS
+		gl_shared_texture_present = c->has_shared_texture;
+#endif
+		xrt_display_processor_gl_set_shared_texture_present(c->display_processor, gl_shared_texture_present);
+	} else {
+		if (!quiet_failure) {
+			U_LOG_W("GL compositor: display processor factory returned %d, using built-in shaders", dp_ret);
+		}
+		c->display_processor = NULL;
+	}
+}
+
+#ifdef XRT_OS_WINDOWS
+//! The native GL leg's ONE `weave placement:` line: no split, rung 2 (#918 Phase 3).
+static void
+gl_log_weave_placement_native(struct comp_gl_compositor *c,
+                              struct xrt_device *xdev,
+                              int32_t display_screen_left,
+                              int32_t display_screen_top)
+{
+	const uint32_t pw = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
+	const uint32_t ph = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
+	uint64_t gl_packed_luid = 0;
+	if (c->gl_context_luid_valid) {
+		memcpy(&gl_packed_luid, &c->gl_context_luid, sizeof(gl_packed_luid));
+	}
+	d3d_log_weave_placement(gl_packed_luid, display_screen_left, display_screen_top, pw, ph,
+	                        /* split_active */ false, COMP_SPLIT_REASON_API_UNSUPPORTED);
+}
+#endif
+
+#ifdef XRT_GL_HUB
+/*
+ *
+ * #2317 P3: the OpenGL shim onto the D3D11 hub (DXR_HUB=1, default OFF).
+ *
+ * The D3D11 tier's P1b shim with a GL producer. Stage A1 (at create, before the
+ * GL display processor would exist) decides and stands the hub up on the
+ * scanout adapter: its D3D11 device, the D3D11 display processor bound to the
+ * app's HWND, its swapchain. Stage A2 (once the atlas dims are known) creates
+ * the deposit (comp_gl_deposit) on the GL context's adapter and wires the
+ * ingress: DIRECT when the hub's device is on that same adapter, comp_xbridge
+ * across adapters. A refusal at any rung is just the native GL leg; a frame the
+ * hub cannot carry (planes) retires it for the rest of the session.
+ *
+ */
+
+/*!
+ * Stage A1. GL context current. NULL = the hub is up (Stage A2 still owed),
+ * else the reason token for `hub placement: hub=0 reason=`. On NULL,
+ * @p out_adapter holds an AddRef'd adapter the caller hands to Stage A2.
+ */
+static const char *
+gl_hub_stage_a1(struct comp_gl_compositor *c,
+                struct xrt_device *xdev,
+                void *dp_factory_d3d11,
+                bool transparent_background,
+                int32_t display_screen_left,
+                int32_t display_screen_top,
+                struct gl_interop_adapter *out_adapter)
+{
+	if (!gl_hub_requested()) {
+		return COMP_HUB_REASON_NOT_REQUESTED;
+	}
+	if (c->hwnd == NULL) {
+		return COMP_SPLIT_REASON_NO_HWND;
+	}
+	if (c->owns_window) {
+		return COMP_HUB_REASON_HOSTED_WINDOW;
+	}
+	if (transparent_background) {
+		// DComp / compose-under transparency stays on the native GL leg.
+		return COMP_HUB_REASON_TRANSPARENT;
+	}
+	if (glClipControl == NULL) {
+		return COMP_HUB_REASON_GL_NO_CLIP_CONTROL;
+	}
+
+	/*
+	 * ADR-037 §5: GL cannot be TOLD which adapter to use, so the shim READS the
+	 * one the context landed on and puts the deposit there. A §2 fallback answer
+	 * is not the GL adapter — it is a guess, and the shim never guesses.
+	 */
+	*out_adapter = gl_resolve_interop_adapter(c, "D3D11 hub deposit");
+	if (out_adapter->adapter == NULL || strstr(out_adapter->provenance, "fallback") != NULL) {
+		if (out_adapter->adapter != NULL) {
+			out_adapter->adapter->Release();
+			out_adapter->adapter = NULL;
+		}
+		return COMP_HUB_REASON_GL_NO_LUID;
+	}
+	gl_log_interop_placement(c, "D3D11 hub deposit", out_adapter);
+	const uint64_t render_packed_luid =
+	    ((uint64_t)(uint32_t)out_adapter->luid.HighPart << 32) | (uint64_t)(uint32_t)out_adapter->luid.LowPart;
+
+	struct comp_hub_d3d11_info si = {};
+	si.xdev = xdev;
+	si.hwnd = c->hwnd;
+	si.dp_factory_d3d11 = dp_factory_d3d11;
+	si.has_shared_texture = false;
+	si.transparent_background = false;
+	// The gate this bool exists for is Vulkan's; the GL deposit's sync is a
+	// shared D3D11 fence (memory_object) or the interop lock.
+	si.app_timeline_semaphores = true;
+	si.render_packed_luid = render_packed_luid;
+	si.display_screen_left = display_screen_left;
+	si.display_screen_top = display_screen_top;
+	si.preferred_width = GL_DEFAULT_WIDTH;
+	si.preferred_height = GL_DEFAULT_HEIGHT;
+	{
+		RECT rc;
+		if (GetClientRect(c->hwnd, &rc) && rc.right > rc.left && rc.bottom > rc.top) {
+			si.preferred_width = (uint32_t)(rc.right - rc.left);
+			si.preferred_height = (uint32_t)(rc.bottom - rc.top);
+		}
+	}
+	// One texture for the deposit's life, rewritten only after the hub's
+	// back-fence: the D3D11 tier's stable-atlas shape.
+	si.stable_atlas = true;
+
+	const char *short_reason = NULL;
+	if (comp_hub_d3d11_stage_a(&si, &c->hub.split, &short_reason) != XRT_SUCCESS || c->hub.split == NULL) {
+		c->hub.split = NULL;
+		out_adapter->adapter->Release();
+		out_adapter->adapter = NULL;
+		return short_reason != NULL ? short_reason : COMP_SPLIT_REASON_STAGE_A_FAILED;
+	}
+	c->hub.active = true;
+	c->hub.want_3d = true;
+	return NULL;
+}
+
+/*!
+ * Stage A2: the deposit and the ingress, once the atlas dims are known. GL
+ * context current. Releases @p adapter. On failure the hub is destroyed
+ * (nothing has presented, so a destroy, not a retire) and the caller takes the
+ * native leg.
+ */
+static const char *
+gl_hub_stage_a2(struct comp_gl_compositor *c, struct gl_interop_adapter *adapter)
+{
+	struct comp_gl_deposit_info di = {};
+	di.dxgi_adapter = adapter->adapter;
+	di.luid_exact = adapter->confirmed_same_as_gl;
+	c->hub.luid_exact = di.luid_exact;
+	di.width = c->atlas_tex_width;
+	di.height = c->atlas_tex_height;
+	const char *why = comp_gl_deposit_create(&di, &c->hub.dep);
+	adapter->adapter->Release();
+	adapter->adapter = NULL;
+	if (why == NULL) {
+		struct comp_hub_d3d11_handoff h = {};
+		comp_gl_deposit_fill_handoff(c->hub.dep, &h);
+		if (!comp_hub_d3d11_wire_bridge(c->hub.split, &h)) {
+			why = COMP_HUB_REASON_WIRE_FAILED;
+		}
+	}
+	if (why != NULL) {
+		comp_hub_d3d11_destroy(&c->hub.split);
+		comp_gl_deposit_destroy(&c->hub.dep);
+		c->hub.active = false;
+		return why;
+	}
+
+	// The atlas IS the deposit from here on (zero copies).
+	c->hub.native_atlas = c->atlas_texture;
+	c->atlas_texture = comp_gl_deposit_gl_texture(c->hub.dep);
+	const float hz = comp_display_refresh_hz_win(c->hwnd);
+	comp_hub_d3d11_set_display_period(c->hub.split, (uint64_t)(U_TIME_1S_IN_NS / (hz > 1.0f ? hz : 60.0f)));
+	return NULL;
+}
+
+/*!
+ * After a retire the GL display processor is OWED until its factory succeeds:
+ * the vendor's GL weaver for this HWND can refuse for a moment after the hub's
+ * D3D11 weaver was released (measured: Leia SR srCreateWeaverGL returned
+ * SR_ERROR_RUNTIME_FAILURE ~85 ms after the D3D11 weaver's reaper ran). Tried
+ * at the retire and then every @ref GL_HUB_DP_RETRY_FRAMES frames; meanwhile
+ * the native leg presents NOTHING (@ref gl_hub_hold_frame), so the panel
+ * holds the last hub-woven frame instead of an unwoven atlas. After
+ * @ref GL_HUB_DP_GIVE_UP_FRAMES frames it gives up and the native leg runs
+ * without a DP (the pre-existing no-plug-in behaviour), logged once. Caller
+ * holds c->mutex with the GL context current.
+ */
+#define GL_HUB_DP_RETRY_FRAMES 15
+#define GL_HUB_DP_GIVE_UP_FRAMES 600
+static void
+gl_hub_retry_dp(struct comp_gl_compositor *c)
+{
+	if (!c->hub.dp_owed || (c->hub.dp_owed_frames % GL_HUB_DP_RETRY_FRAMES) != 0) {
+		return;
+	}
+	c->hub.dp_attempts++;
+	os_mutex_lock(&c->dp_swap_mutex);
+	gl_create_gl_dp(c, c->hub.dp_factory_gl, c->hub.dp_window, /*quiet_failure=*/true);
+	if (c->display_processor != NULL) {
+		// The fresh DP has seen none of the session's state.
+		xrt_display_processor_gl_request_display_mode(c->display_processor, c->hub.want_3d);
+		if (c->eye_tracking_mode_set) {
+			xrt_display_processor_gl_set_eye_tracking_mode(c->display_processor, c->eye_tracking_mode);
+		}
+	}
+	os_mutex_unlock(&c->dp_swap_mutex);
+	if (c->display_processor != NULL) {
+		c->hub.dp_owed = false;
+		U_LOG_W(
+		    "#2317 GL hub retire: GL display processor created on attempt %u — %u app frame(s) were held "
+		    "(not presented) while it was owed",
+		    c->hub.dp_attempts, c->hub.dp_owed_frames);
+	} else if (c->hub.dp_owed_frames >= GL_HUB_DP_GIVE_UP_FRAMES) {
+		c->hub.dp_owed = false;
+		U_LOG_W(
+		    "#2317 GL hub retire: no GL display processor after %u attempts / %u held frames — the native leg "
+		    "presents without a weaver from here on",
+		    c->hub.dp_attempts, c->hub.dp_owed_frames);
+	}
+}
+
+//! A frame while the GL DP is owed: present nothing (the panel keeps the last
+//! hub-woven frame), stay disarmed. Logged once per retire.
+static void
+gl_hub_hold_frame(struct comp_gl_compositor *c)
+{
+	if (c->hub.dp_owed_frames == 0) {
+		U_LOG_W(
+		    "#2317 GL hub retire: the GL display processor is not ready yet — holding the last hub-woven "
+		    "frame (no unwoven present) until it is");
+	}
+	c->hub.dp_owed_frames++;
+	c->repaint.armed = false;
+}
+
+/*!
+ * Mid-session RETIRE (@ref COMP_HUB_REASON_PLANES_UNSUPPORTED_GL): the hub's
+ * RETIRED + `weave placement: CHANGED` lines, the deposit freed, the GL atlas
+ * and the GL display processor back. Caller holds c->mutex with the GL context
+ * current; the frame that triggered it is then composed natively.
+ */
+static void
+gl_hub_retire(struct comp_gl_compositor *c, const char *token)
+{
+	U_LOG_W(
+	    "hub placement: CHANGED hub=0 reason=%s — the D3D11 hub cannot carry this session's 2D planes "
+	    "(the GL flatten scratches are not D3D11-shareable); the GL compositor's own legs take over for the "
+	    "rest of the session (#2317 P3)",
+	    token);
+
+	os_mutex_lock(&c->dp_swap_mutex);
+	comp_hub_d3d11_retire(&c->hub.split, "the GL session needs planes the D3D11 hub cannot carry", token);
+	c->hub.split = NULL;
+	c->hub.active = false;
+	os_mutex_unlock(&c->dp_swap_mutex);
+
+	comp_gl_deposit_destroy(&c->hub.dep);
+	c->atlas_texture = c->hub.native_atlas;
+	c->hub.native_atlas = 0;
+	c->repaint.armed = false;
+	c->hub.log_first_native_present = true;
+	if (c->hub.capture.pending) {
+		u_capture_intent_complete(&c->hub.capture, &c->mcp_capture, false);
+	}
+
+	c->hub.dp_owed = c->hub.dp_factory_gl != NULL;
+	c->hub.dp_owed_frames = 0;
+	c->hub.dp_attempts = 0;
+	gl_hub_retry_dp(c);
+}
+
+/*!
+ * The session's ONE `hub placement: hub=1 …` line, plus the `weave placement:`
+ * line with the hub's answer (the weave is on the hub's device).
+ */
+static void
+gl_hub_log_placement(struct comp_gl_compositor *c,
+                     struct xrt_device *xdev,
+                     int32_t display_screen_left,
+                     int32_t display_screen_top)
+{
+	struct comp_hub_d3d11_handoff h = {};
+	comp_gl_deposit_fill_handoff(c->hub.dep, &h);
+	IDXGIAdapter *ra = (IDXGIAdapter *)h.dxgi_adapter;
+	DXGI_ADAPTER_DESC rdesc = {};
+	if (ra != NULL) {
+		ra->GetDesc(&rdesc);
+	}
+	const uint64_t hl = comp_hub_d3d11_get_hub_luid(c->hub.split);
+	const char *ir = comp_hub_d3d11_ingress_reason(c->hub.split);
+	const char *mr = comp_gl_deposit_import_reason(c->hub.dep);
+	U_LOG_W(
+	    "hub placement: hub=1 render=%08lx:%08lx hub_dev=%08lx:%08lx ingress=%s%s%s import=%s%s%s sync=%s luid=%s "
+	    "— weave/present on the D3D11 hub's own device, the GL atlas in a D3D11 deposit on the GL adapter "
+	    "(#2317 P3; DXR_HUB=1)",
+	    (unsigned long)rdesc.AdapterLuid.HighPart, (unsigned long)rdesc.AdapterLuid.LowPart,
+	    (unsigned long)(uint32_t)(hl >> 32), (unsigned long)(uint32_t)hl,
+	    comp_hub_d3d11_is_direct(c->hub.split) ? "direct" : "xbridge", ir != NULL ? " ingress_reason=" : "",
+	    ir != NULL ? ir : "", comp_gl_deposit_import_name(c->hub.dep), mr != NULL ? " import_reason=" : "",
+	    mr != NULL ? mr : "", comp_gl_deposit_sync_name(c->hub.dep), c->hub.luid_exact ? "exact" : "heuristic");
+
+	uint64_t render_packed_luid = 0;
+	memcpy(&render_packed_luid, &rdesc.AdapterLuid, sizeof(render_packed_luid));
+	const uint32_t pw = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
+	const uint32_t ph = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
+	d3d_log_weave_placement(render_packed_luid, display_screen_left, display_screen_top, pw, ph,
+	                        /* split_active */ true, NULL);
+}
+
+//! The atlas pass is about to paint the deposit: order it after the hub's last
+//! read and turn the top-down painting on. Caller holds c->mutex, GL current.
+static void
+gl_hub_begin_atlas(struct comp_gl_compositor *c)
+{
+	comp_gl_deposit_begin(c->hub.dep, c->hub.split);
+	const uint32_t rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
+	const uint32_t tile_h = c->eff_tile_h > 0 ? c->eff_tile_h : c->view_height;
+	c->atlas_flip_h = (GLint)(rows * tile_h);
+	c->atlas_top_down = true;
+	glClipControl(GL_UPPER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
+}
+
+/*!
+ * The app frame under the hub: publish the deposit, weave + present on the hub,
+ * arm the replay. Caller holds c->mutex with the GL context current, after the
+ * atlas pass and every GL read of the atlas this frame.
+ */
+static void
+gl_hub_commit(struct comp_gl_compositor *c, const struct comp_segments_content *seg_content)
+{
+	struct comp_hub_d3d11_handoff h = {};
+	const uint32_t cols = c->eff_cols > 0 ? c->eff_cols : c->tile_columns;
+	const uint32_t rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
+	const uint32_t tile_w = c->eff_tile_w > 0 ? c->eff_tile_w : c->view_width;
+	const uint32_t tile_h = c->eff_tile_h > 0 ? c->eff_tile_h : c->view_height;
+	comp_gl_deposit_end(c->hub.dep, comp_hub_d3d11_is_direct(c->hub.split), cols * tile_w, rows * tile_h, &h);
+
+	// The hub's swapchain IS the resize path while it is up (#1178).
+	RECT rc;
+	if (GetClientRect(c->hwnd, &rc) && rc.right > rc.left && rc.bottom > rc.top) {
+		comp_hub_d3d11_resize_target(c->hub.split, (uint32_t)(rc.right - rc.left),
+		                             (uint32_t)(rc.bottom - rc.top));
+	}
+
+	comp_hub_d3d11_stage_segment_content(c->hub.split, seg_content);
+	comp_hub_d3d11_submit_atlas(c->hub.split, &h, cols, rows, tile_w, tile_h);
+
+	// #2327: THIS frame's own promise (its xrEndFrame displayTime).
+	comp_hub_d3d11_set_predicted_display_time(c->hub.split, c->layer_accum.data.display_time_ns > 0
+	                                                            ? (uint64_t)c->layer_accum.data.display_time_ns
+	                                                            : c->hub.last_display_time_ns);
+
+	// #2342 P2c: one consumer per trigger. A projection-only intent still
+	// pending here (the native point did not take it) goes to the hub too.
+	if (c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY &&
+	    !c->hub.capture.pending) {
+		c->hub.capture = c->capture_intent;
+		c->capture_intent.pending = false;
+	}
+	if (c->hub.capture.pending) {
+		char woven[MCP_CAPTURE_PATH_MAX + 16];
+		u_capture_intent_sibling_path(c->hub.capture.path, ".woven", woven, sizeof(woven));
+		comp_hub_d3d11_capture_arm(c->hub.split, c->hub.capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
+		                           c->hub.capture.path, woven);
+	}
+
+	// The GL leg hands its DP no canvas (zeros = the full window); so does this.
+	const struct xrt_rect cv = {};
+	const bool wove = comp_hub_d3d11_weave_and_present(c->hub.split, /*is_repaint=*/false, &cv);
+	{
+		bool cap_ok = false;
+		if (comp_hub_d3d11_capture_take(c->hub.split, &cap_ok) && c->hub.capture.pending) {
+			u_capture_intent_complete(&c->hub.capture, &c->mcp_capture, cap_ok);
+		}
+	}
+
+	// #868: arm the replay; a frame that wove nothing keeps the panel's last
+	// woven frame and stays disarmed.
+	c->repaint.armed = wove;
+	if (wove) {
+		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+		u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
+	}
+	comp_hub_d3d11_render_diag(c->hub.split);
+}
+#endif // XRT_GL_HUB
+
 /*!
  * #868 / #875: bind the present target, run the masked composite (or the plain
  * weave), and present. Shared by the app frame and the repaint replay.
@@ -5339,7 +5892,18 @@ gl_window_present(struct comp_gl_compositor *c, GLuint atlas_for_present, float 
 		glFlush();
 		gl_dcomp_readback_present_frame(c);
 	} else {
+#ifdef XRT_GL_HUB
+		const BOOL swapped = SwapBuffers(c->hdc);
+		if (c->hub.log_first_native_present) {
+			// #2317 P3 review: the HWND just came back from the hub's DXGI
+			// chain to GL's own presenter; say whether that first present took.
+			c->hub.log_first_native_present = false;
+			U_LOG_W("#2317 GL hub retire: first native SwapBuffers after the retire %s (GetLastError=%lu)",
+			        swapped ? "succeeded" : "FAILED", swapped ? 0ul : (unsigned long)GetLastError());
+		}
+#else
 		SwapBuffers(c->hdc);
+#endif
 		if (c->owns_window && c->own_window != NULL) {
 			comp_d3d11_window_signal_paint_done(c->own_window);
 		}
@@ -5408,6 +5972,56 @@ gl_repaint_thread(void *ptr)
 		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			continue;
 		}
+
+#ifdef XRT_GL_HUB
+		/*
+		 * #2317 P3: under the hub the replay is the hub's re-weave of the frame
+		 * it last wove — no GL work and no GL context. The hub paces (its
+		 * target's scanout wait + #884 late sleep, skipped under an engaged
+		 * #1257 partition), admits (#1339) and fires, exactly as for the D3D11
+		 * shim (#2342 P2c). The hold is taken under the lock so a retire cannot
+		 * free what the unlocked wait reads.
+		 */
+		if (c->hub.active) {
+			if (c->repaint.partition.next_release_ns == 0) {
+				void *hold = NULL;
+				os_mutex_lock(&c->mutex);
+				if (c->hub.active) {
+					hold = comp_hub_d3d11_repaint_pace_hold(c->hub.split);
+				}
+				os_mutex_unlock(&c->mutex);
+				comp_hub_d3d11_repaint_pace_wait(hold);
+			}
+			os_mutex_lock(&c->mutex);
+			if (!os_thread_helper_is_running(&c->repaint_thread) || !c->hub.active || !c->repaint.armed ||
+			    c->repaint.app_frame_in_progress || !comp_hub_d3d11_has_weave_slot(c->hub.split) ||
+			    (c->repaint.force != 1 && !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(),
+			                                                   period_ns, &c->repaint.partition))) {
+				os_mutex_unlock(&c->mutex);
+				continue;
+			}
+			const uint64_t hub_rp_start_ns = os_monotonic_get_ns();
+			const struct xrt_rect cv = {};
+			const enum comp_hub_d3d11_repaint_result rr =
+			    comp_hub_d3d11_repaint(c->hub.split, c->repaint.partition.next_release_ns != 0, &cv);
+			if (rr == COMP_HUB_D3D11_REPAINT_NOT_ADMITTED || rr == COMP_HUB_D3D11_REPAINT_NO_FRAME) {
+				os_mutex_unlock(&c->mutex);
+				continue;
+			}
+			c->repaint.count++;
+			u_repaint_gate_note_repaint(&c->repaint.gate, hub_rp_start_ns);
+			os_mutex_unlock(&c->mutex);
+			static bool hub_logged = false;
+			if (!hub_logged) {
+				hub_logged = true;
+				U_LOG_W(
+				    "#868: repainting via the D3D11 hub at %.1f Hz while the app is between frames "
+				    "(#2317 P3)",
+				    hz);
+			}
+			continue;
+		}
+#endif
 
 		os_mutex_lock(&c->mutex);
 
@@ -5689,8 +6303,8 @@ gl_render_quad_layer(struct comp_gl_compositor *c,
 		// the same physical tile its view's projection content did.
 		uint32_t tox = 0, toy = 0;
 		u_tiling_view_origin_gl(vi, cols, rows, tile_w, tile_h, &tox, &toy);
-		glViewport((GLint)tox, (GLint)toy, (GLsizei)tile_w, (GLsizei)tile_h);
-		glScissor((GLint)tox, (GLint)toy, (GLsizei)tile_w, (GLsizei)tile_h);
+		gl_atlas_viewport(c, (GLint)tox, (GLint)toy, (GLsizei)tile_w, (GLsizei)tile_h);
+		gl_atlas_scissor(c, (GLint)tox, (GLint)toy, (GLsizei)tile_w, (GLsizei)tile_h);
 
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
@@ -5923,8 +6537,8 @@ gl_render_equirect2_layer(struct comp_gl_compositor *c,
 		// did.
 		uint32_t tox = 0, toy = 0;
 		u_tiling_view_origin_gl(vi, cols, rows, tile_w, tile_h, &tox, &toy);
-		glViewport((GLint)tox, (GLint)toy, (GLsizei)tile_w, (GLsizei)tile_h);
-		glScissor((GLint)tox, (GLint)toy, (GLsizei)tile_w, (GLsizei)tile_h);
+		gl_atlas_viewport(c, (GLint)tox, (GLint)toy, (GLsizei)tile_w, (GLsizei)tile_h);
+		gl_atlas_scissor(c, (GLint)tox, (GLint)toy, (GLsizei)tile_w, (GLsizei)tile_h);
 
 		// Fullscreen strip, 4 vertices — the viewport/scissor restrict it.
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -6366,7 +6980,7 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 			bw = c->eff_tile_w;
 			bh = c->eff_tile_h;
 		}
-		glViewport((GLint)bx, (GLint)by, (GLsizei)bw, (GLsizei)bh);
+		gl_atlas_viewport(c, (GLint)bx, (GLint)by, (GLsizei)bw, (GLsizei)bh);
 		// Clipped to the zone in a zones frame (#1949): the clip is
 		// top-left-origin, the tile box bottom-left.
 		const GLint sx0 = (GLint)bx + (GLint)lroundf(clip[0] * (float)bw);
@@ -6376,7 +6990,7 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 		if (sx1 <= sx0 || sy1 <= sy0) {
 			continue;
 		}
-		glScissor(sx0, sy0, (GLsizei)(sx1 - sx0), (GLsizei)(sy1 - sy0));
+		gl_atlas_scissor(c, sx0, sy0, (GLsizei)(sx1 - sx0), (GLsizei)(sy1 - sy0));
 
 		float xy[4][2];
 		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, xy);
@@ -6722,6 +7336,33 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	glDisable(GL_BLEND);
 	glDisable(GL_CULL_FACE);
 	glDisable(GL_SCISSOR_TEST);
+
+	// #2317 P3: this frame paints the atlas top-down only if the hub takes it.
+	c->atlas_top_down = false;
+#ifdef XRT_GL_HUB
+	/*
+	 * The hub carries the atlas only. A Local2D layer (its over-flatten and its
+	 * 2D-under backdrop), a display-zones frame or an authored zone mask needs
+	 * planes the GL leg keeps in plain GL textures, so the session RETIRES to
+	 * the native legs before this frame is composed — never a frame without
+	 * its 2D (ADR-059 decision 5).
+	 */
+	if (c->hub.active && (c->local_2d_last_frame || c->zones_frame ||
+	                      (c->active_zone_mask != NULL && c->active_zone_mask->submitted))) {
+		gl_hub_retire(c, COMP_HUB_REASON_PLANES_UNSUPPORTED_GL);
+	} else if (c->hub.dp_owed) {
+		gl_hub_retry_dp(c);
+	}
+	// #2342 P2c: the hub is this frame's POST-compose capture site; a
+	// projection-only intent stays with the native projection-done point.
+	if (c->hub.active && c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_POST_COMPOSE) {
+		if (c->hub.capture.pending) {
+			u_capture_intent_complete(&c->hub.capture, &c->mcp_capture, false);
+		}
+		c->hub.capture = c->capture_intent;
+		c->capture_intent.pending = false;
+	}
+#endif
 	// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3). ZERO COST UNLESS
 	// REQUESTED: two field tests, both false for every session that never
 	// chained the measured-disparity source. Read before any of this frame's
@@ -6915,7 +7556,8 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		// XR_DXR_cursor_depth v5: a frame carrying a runtime-drawn cursor
 		// composes into the atlas - the cursor is drawn there, never into the
 		// app's own image.
-		if (mode != NULL && c->layer_accum.layer_count == 1 && !seg_routed_frame && !cursor_pending) {
+		if (mode != NULL && c->layer_accum.layer_count == 1 && !seg_routed_frame && !cursor_pending &&
+		    !gl_hub_active(c)) {
 			struct comp_layer *layer = &c->layer_accum.layers[0];
 			if (layer->data.type == XRT_LAYER_PROJECTION ||
 			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
@@ -7027,6 +7669,13 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 	// --- Step 1: Render layers into atlas texture (skip if zero-copy) ---
 	if (!zero_copy) {
+#ifdef XRT_GL_HUB
+	// #2317 P3: the atlas is the hub's deposit — wait out the hub's last read,
+	// then paint top-down.
+	if (c->hub.active) {
+		gl_hub_begin_atlas(c);
+	}
+#endif
 	/*
 	 * #1589/#1610 — which target do this frame's layers paint?
 	 *
@@ -7360,17 +8009,17 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 				if (zw <= 0 || zh <= 0) {
 					continue;
 				}
-				glViewport(zx, zy, zw, zh);
+				gl_atlas_viewport(c, zx, zy, zw, zh);
 			} else if (routed) {
 #ifdef XRT_OS_WINDOWS
 				// Multi-screen M3: the segment's rect inside the tile, in the
 				// tile's GL (bottom-left) coordinates. The fullscreen triangle
 				// is clipped to the viewport, so no scissor is needed.
 				const struct comp_seg_rect g = comp_segments_gl_flip(&route_rect, tbh);
-				glViewport((GLint)tbx + g.x, (GLint)tby + g.y, (GLsizei)g.w, (GLsizei)g.h);
+				gl_atlas_viewport(c, (GLint)tbx + g.x, (GLint)tby + g.y, (GLsizei)g.w, (GLsizei)g.h);
 #endif
 			} else {
-				glViewport(tbx, tby, tbw, tbh);
+				gl_atlas_viewport(c, tbx, tby, tbw, tbh);
 			}
 
 			// The shared blend state, plus the OPAQUE_COVER alpha-of-one
@@ -7505,7 +8154,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 				uint32_t wsx = 0, wsy = 0;
 				u_tiling_view_origin_gl(eye, c->eff_cols, c->eff_rows, c->eff_tile_w, c->eff_tile_h,
 					                &wsx, &wsy);
-				glViewport((GLint)wsx, (GLint)wsy, c->eff_tile_w, c->eff_tile_h);
+				gl_atlas_viewport(c, (GLint)wsx, (GLint)wsy, c->eff_tile_w, c->eff_tile_h);
 			}
 
 			// Per-view disparity, graded across the view sweep (#413):
@@ -7562,6 +8211,12 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		gl_publish_compose_to_atlas(c);
 	}
 	glDisable(GL_FRAMEBUFFER_SRGB);
+#ifdef XRT_GL_HUB
+	if (c->atlas_top_down) {
+		// Every later pass (and the native legs after a retire) is bottom-up.
+		glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
+	}
+#endif
 
 	} // end if (!zero_copy)
 
@@ -7597,8 +8252,17 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	// blit which normally binds it, causing GL_INVALID_OPERATION in core profile)
 	glBindVertexArray(c->vao_empty);
 	GLuint atlas_for_present = zero_copy ? zc_texture : c->atlas_texture;
+#ifdef XRT_GL_HUB
+	if (c->hub.active) {
+		// #2317 P3: the hub weaves and presents; the GL weave, present,
+		// DwmFlush pacing and repaint snapshot are not used.
+		gl_hub_commit(c, &seg_content);
+	} else if (c->hub.dp_owed) {
+		gl_hub_hold_frame(c);
+	} else
+#endif
 #ifdef XRT_OS_WINDOWS
-	if (c->has_shared_texture) {
+	    if (c->has_shared_texture) {
 		// Shared-texture present: weave into the dedicated GL render target
 		// (shared_present_fbo → shared_gl_texture), then bridge the result into
 		// the app's shared D3D surface via gl_shared_readback_upload
@@ -7680,7 +8344,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	} else
 #endif
 #ifdef __APPLE__
-	if (c->has_shared_iosurface) {
+	    if (c->has_shared_iosurface) {
 		// Shared IOSurface mode: render into the IOSurface via its dedicated
 		// FBO. Unlike the Windows D3D path, the GL→IOSurface write is direct
 		// (the GL texture IS the IOSurface backing) — no readback bridge
@@ -7812,6 +8476,17 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			u_eye_history_push(&c->eye_hist, &fresh_eyes, (int64_t)os_monotonic_get_ns());
 		}
 	}
+#ifdef XRT_GL_HUB
+	else if (c->hub.active) {
+		// #2317 P3: the weaver this frame was the hub's D3D11 one.
+		struct xrt_eye_positions fresh_eyes = {0};
+		if (comp_hub_d3d11_get_predicted_eye_positions(c->hub.split, &fresh_eyes) && fresh_eyes.valid) {
+			c->cached_eye_pos = fresh_eyes;
+			c->have_cached_eye_pos = true;
+			u_eye_history_push(&c->eye_hist, &fresh_eyes, (int64_t)os_monotonic_get_ns());
+		}
+	}
+#endif
 
 	glBindVertexArray(0);
 	glUseProgram(0);
@@ -7951,6 +8626,18 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	free(c->seg_sys_info);
 	c->seg_sys_info = NULL;
 	os_mutex_destroy(&c->seg_pub_mutex);
+#endif
+#ifdef XRT_GL_HUB
+	// #2317 P3: the hub (its bridge quiesced inside), then the deposit (GL
+	// objects first, on this context), then the GL atlas is ours again.
+	// (A capture intent still stashed for it dies with the MCP box above.)
+	c->hub.capture.pending = false;
+	comp_hub_d3d11_destroy(&c->hub.split);
+	if (c->hub.dep != NULL) {
+		comp_gl_deposit_destroy(&c->hub.dep);
+		c->atlas_texture = c->hub.native_atlas;
+	}
+	c->hub.active = false;
 #endif
 	xrt_display_processor_gl_destroy(&c->display_processor);
 	os_mutex_destroy(&c->dp_swap_mutex);
@@ -8653,7 +9340,13 @@ comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3
 	// Multi-screen M6: the weave may swap the primary DP (ADR-047 Amendment 2).
 	os_mutex_lock(&c->dp_swap_mutex);
 	bool ok = false;
-	if (c->display_processor != NULL) {
+#ifdef XRT_GL_HUB
+	c->hub.want_3d = enable_3d;
+	if (c->hub.active) {
+		ok = comp_hub_d3d11_request_display_mode(c->hub.split, enable_3d);
+	} else
+#endif
+	    if (c->display_processor != NULL) {
 		bool dp_3d = enable_3d;
 #ifdef XRT_OS_WINDOWS
 		// #2247: the primary screen stays 2D while the window has wholly left
@@ -8678,6 +9371,11 @@ comp_gl_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mod
 	os_mutex_lock(&c->dp_swap_mutex);
 	c->eye_tracking_mode_set = true; // re-sent to a swapped-in primary DP (M6)
 	c->eye_tracking_mode = mode;
+#ifdef XRT_GL_HUB
+	if (c->hub.active) {
+		comp_hub_d3d11_set_eye_tracking_mode(c->hub.split, mode);
+	}
+#endif
 	if (c->display_processor != NULL) {
 		xrt_display_processor_gl_set_eye_tracking_mode(c->display_processor, mode);
 	}
@@ -8697,6 +9395,11 @@ comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 	os_mutex_lock(&c->dp_swap_mutex);
 	bool ok = c->display_processor != NULL &&
 	          xrt_display_processor_gl_get_predicted_eye_positions(c->display_processor, out_eye_pos);
+#ifdef XRT_GL_HUB
+	if (c->hub.active) {
+		ok = comp_hub_d3d11_get_predicted_eye_positions(c->hub.split, out_eye_pos);
+	}
+#endif
 	os_mutex_unlock(&c->dp_swap_mutex);
 	if (ok && out_eye_pos->valid) {
 		// N6 Part 1 (#2144): keyed by the time it was asked.
@@ -8722,9 +9425,14 @@ comp_gl_compositor_get_eye_positions_at(struct xrt_compositor *xc,
 	// display-time sampling; if that slot fails, the ring is read at the
 	// target CLAMPED to its newest sample (never extrapolated).
 	os_mutex_lock(&c->dp_swap_mutex);
-	const bool has = xrt_display_processor_gl_has_eye_positions_at(c->display_processor);
-	const bool ok =
-	    has && xrt_display_processor_gl_get_eye_positions_at(c->display_processor, target_ns, out_eye_pos);
+	bool has = xrt_display_processor_gl_has_eye_positions_at(c->display_processor);
+	bool ok = has && xrt_display_processor_gl_get_eye_positions_at(c->display_processor, target_ns, out_eye_pos);
+#ifdef XRT_GL_HUB
+	if (c->hub.active) {
+		has = comp_hub_d3d11_has_eye_positions_at(c->hub.split);
+		ok = has && comp_hub_d3d11_get_eye_positions_at(c->hub.split, target_ns, out_eye_pos);
+	}
+#endif
 	os_mutex_unlock(&c->dp_swap_mutex);
 	if (ok && out_eye_pos->valid) {
 		return true;
@@ -8770,6 +9478,14 @@ comp_gl_compositor_set_screens(struct xrt_compositor *xc,
 	os_mutex_lock(&c->seg_pub_mutex);
 	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
 	os_mutex_unlock(&c->seg_pub_mutex);
+#ifdef XRT_GL_HUB
+	// #2317 P3: under the hub the D3D11 segment manager on the hub's device
+	// segments the window (ADR-047 Amendment 1); the GL copy above stays for
+	// the native legs after a retire.
+	if (c->hub.active) {
+		comp_hub_d3d11_set_screens(c->hub.split, list, info, pinned_display_id);
+	}
+#endif
 	os_mutex_unlock(&c->mutex);
 #else
 	(void)xc;
@@ -8791,6 +9507,20 @@ comp_gl_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_seg
 		return false;
 	}
 	struct comp_gl_compositor *c = gl_comp(xc);
+#ifdef XRT_GL_HUB
+	{
+		bool hub_ok = false;
+		os_mutex_lock(&c->dp_swap_mutex);
+		const bool hub_on = c->hub.active;
+		if (hub_on) {
+			hub_ok = comp_hub_d3d11_get_segment_metrics(c->hub.split, out) && out->count > 0;
+		}
+		os_mutex_unlock(&c->dp_swap_mutex);
+		if (hub_on) {
+			return hub_ok;
+		}
+	}
+#endif
 	os_mutex_lock(&c->seg_pub_mutex);
 	*out = c->seg_pub;
 	// The eyes are predicted NOW, per segment: the primary from the session's
@@ -8966,6 +9696,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
                           void *gl_context,
                           void *gl_display,
                           void *dp_factory_gl,
+                          void *dp_factory_d3d11,
                           void *shared_texture_handle,
                           bool transparent_background,
                           int32_t display_screen_left,
@@ -8975,6 +9706,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	struct comp_gl_compositor *c = U_TYPED_CALLOC(struct comp_gl_compositor);
 	c->xdev = xdev;
 	c->transparent_background = transparent_background;
+	(void)dp_factory_d3d11; // #2317 P3: the D3D11 hub's weaver (Windows, DXR_HUB=1 only)
 
 	// #868: before ANY path that can reach gl_compositor_destroy — it joins the
 	// repaint thread and destroys this mutex, so both must be valid even on the
@@ -9038,16 +9770,26 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	 * with the same one line every other compositor emits. There is no
 	 * half-engaged state to reach: nothing in this compositor consults a scanout
 	 * adapter or creates a second device for the weave.
+	 *
+	 * #2317 P3: the exception is the D3D11 HUB (DXR_HUB=1), which needs no
+	 * choice either — it READS the GL adapter, puts a D3D11 deposit there, and
+	 * moves the weave and present to the hub's device on the scanout adapter.
+	 * Stage A1 runs first; while it is up the line below is printed after Stage
+	 * A2, with the hub's answer.
 	 */
-	{
-		const uint32_t pw = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
-		const uint32_t ph = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
-		uint64_t gl_packed_luid = 0;
-		if (c->gl_context_luid_valid) {
-			memcpy(&gl_packed_luid, &c->gl_context_luid, sizeof(gl_packed_luid));
-		}
-		d3d_log_weave_placement(gl_packed_luid, display_screen_left, display_screen_top, pw, ph,
-		                        /* split_active */ false, COMP_SPLIT_REASON_API_UNSUPPORTED);
+#ifdef XRT_GL_HUB
+	struct gl_interop_adapter hub_adapter = {};
+	const char *hub_reason = !gl_hub_requested() ? COMP_HUB_REASON_NOT_REQUESTED
+	                         : shared_texture_handle != NULL
+	                             ? COMP_SPLIT_REASON_SHARED_TEXTURE
+	                             : gl_hub_stage_a1(c, xdev, dp_factory_d3d11, transparent_background,
+	                                               display_screen_left, display_screen_top, &hub_adapter);
+	if (hub_reason != NULL) {
+		U_LOG_W("hub placement: hub=0 reason=%s (#2317 P3)", hub_reason);
+	}
+#endif
+	if (!gl_hub_active(c)) {
+		gl_log_weave_placement_native(c, xdev, display_screen_left, display_screen_top);
 	}
 
 	// Set up the GL→D3D shared-texture present path if a handle was provided.
@@ -9179,44 +9921,20 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	// Create display processor via factory.
 	// For hosted apps (no external window), use the compositor's own window
 	// so the SR SDK GL weaver gets a valid HWND.
-	if (dp_factory_gl != NULL) {
-		void *dp_window = window_handle;
+	void *dp_window = window_handle;
 #ifdef XRT_OS_WINDOWS
-		if (dp_window == NULL && c->hwnd != NULL) {
-			dp_window = (void *)c->hwnd;
-		}
+	if (dp_window == NULL && c->hwnd != NULL) {
+		dp_window = (void *)c->hwnd;
+	}
 #endif
-		xrt_dp_factory_gl_fn_t factory = (xrt_dp_factory_gl_fn_t)dp_factory_gl;
-		xrt_result_t dp_ret = factory(dp_window, &c->display_processor);
-		if (dp_ret == XRT_SUCCESS && c->display_processor != NULL) {
-			U_LOG_W("GL compositor: display processor created via factory");
-			// Weave scope, once — see the D3D11 leg. GL output is a window.
-			(void)u_weave_scope_report(xrt_display_processor_gl_get_weave_scope(c->display_processor),
-			                           "GL", /* panel_scoped */ false);
-			// Forward session-level transparency (#573 — chroma-key-free;
-			// mirrors the D3D11/D3D12/VK legs). client_presents=false: the DP
-			// owns see-through (compose-under-bg from the atlas alpha). The GL
-			// compositor's own DComp transparent present (when interop/readback
-			// is up) is independent and blends the live desktop into the fully
-			// transparent border. No-op on DPs without the slot (e.g.
-			// sim_display, which preserves alpha natively).
-			xrt_display_processor_gl_set_transparent_background(
-			    c->display_processor, c->transparent_background, false);
-
-			// #68: tell the DP whether the app self-presents only the canvas
-			// (texture app) vs the runtime presenting the full target (handle).
-			// has_shared_texture is Windows-only (WGL_NV_DX_interop2); on other
-			// platforms GL has no shared-texture present → always false.
-			bool gl_shared_texture_present = false;
-#ifdef XRT_OS_WINDOWS
-			gl_shared_texture_present = c->has_shared_texture;
+#ifdef XRT_GL_HUB
+	// #2317 P3: a retire (or a Stage A2 refusal) stands the GL DP up later.
+	c->hub.dp_factory_gl = dp_factory_gl;
+	c->hub.dp_window = dp_window;
 #endif
-			xrt_display_processor_gl_set_shared_texture_present(
-			    c->display_processor, gl_shared_texture_present);
-		} else {
-			U_LOG_W("GL compositor: display processor factory returned %d, using built-in shaders", dp_ret);
-			c->display_processor = NULL;
-		}
+	// Under the hub the HWND's weaver is the hub's D3D11 one (one per window).
+	if (!gl_hub_active(c)) {
+		gl_create_gl_dp(c, dp_factory_gl, dp_window, false);
 	}
 
 	// Transparent-background present path (Windows). Gated on an app-provided
@@ -9247,9 +9965,30 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 
 	// Initialize GL resources (atlas worst-case sized, crop before DP per-frame)
 	if (!gl_init_resources(c, width, height)) {
+#ifdef XRT_GL_HUB
+		comp_hub_d3d11_destroy(&c->hub.split);
+		if (hub_adapter.adapter != NULL) {
+			hub_adapter.adapter->Release();
+		}
+#endif
 		free(c);
 		return XRT_ERROR_OPENGL;
 	}
+
+#ifdef XRT_GL_HUB
+	// #2317 P3 Stage A2: the deposit (atlas-sized) and the ingress. A refusal
+	// here is the native leg, whose DP was skipped above: stand it up now.
+	if (c->hub.active) {
+		hub_reason = gl_hub_stage_a2(c, &hub_adapter);
+		if (hub_reason != NULL) {
+			U_LOG_W("hub placement: hub=0 reason=%s (#2317 P3)", hub_reason);
+			gl_log_weave_placement_native(c, xdev, display_screen_left, display_screen_top);
+			gl_create_gl_dp(c, dp_factory_gl, dp_window, false);
+		} else {
+			gl_hub_log_placement(c, xdev, display_screen_left, display_screen_top);
+		}
+	}
+#endif
 
 	// Create HUD overlay for runtime-owned windows
 	if (c->owns_window) {
