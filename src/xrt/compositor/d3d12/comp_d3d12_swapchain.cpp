@@ -23,6 +23,7 @@
 #include <dxgi1_6.h>
 
 #include <cstring>
+#include <atomic>
 
 /*!
  * Maximum number of images in a swapchain.
@@ -52,6 +53,11 @@ struct comp_d3d12_swapchain
 	//! Per-image state for multi-acquire tracking (#151).
 	//! 0 = FREE, 1 = ACQUIRED, 2 = WAITED.
 	uint8_t img_state[MAX_SWAPCHAIN_IMAGES];
+
+	//! #2362: the app's published release-fence value when it released each
+	//! image (0 = none). Written on the app's releasing thread, read by
+	//! layer_commit.
+	std::atomic<uint64_t> release_value[MAX_SWAPCHAIN_IMAGES];
 
 	//! Round-robin hint for next acquire.
 	uint32_t next_hint;
@@ -185,14 +191,34 @@ d3d12_swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
+	// #2362: sample the app's release value for THIS image now — the app
+	// publishes it immediately before this call, on this thread.
+	sc->release_value[index].store(comp_d3d12_compositor_sample_release_value(sc->c), std::memory_order_release);
+
 	sc->img_state[index] = IMG_FREE;
 	return XRT_SUCCESS;
+}
+
+extern "C" uint64_t
+comp_d3d12_swapchain_get_release_value(struct xrt_swapchain *xsc, uint32_t index)
+{
+	struct comp_d3d12_swapchain *sc = d3d12_sc(xsc);
+	if (sc == nullptr || index >= sc->image_count) {
+		return 0;
+	}
+	return sc->release_value[index].load(std::memory_order_acquire);
 }
 
 static void
 d3d12_swapchain_destroy(struct xrt_swapchain *xsc)
 {
 	struct comp_d3d12_swapchain *sc = d3d12_sc(xsc);
+
+	// #2362: a hub-route frame with a deferred idle-wait may still read these.
+	// Takes c->mutex. The compositor outlives its swapchains: the state
+	// tracker destroys every swapchain (a session child) before the session's
+	// compositor, and the compositor holds no swapchain references.
+	comp_d3d12_compositor_drain_deferred(sc->c);
 
 	for (uint32_t i = 0; i < sc->image_count; i++) {
 		if (sc->images[i] != nullptr) {
