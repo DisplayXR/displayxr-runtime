@@ -82,6 +82,9 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 SNAP="$ROOT/_adr060_snapshot_$STAMP"
 LOGDIR="$(cygpath -u "$LOCALAPPDATA")/DisplayXR"
 
+ALLOW_KEY='HKLM\Software\DisplayXR\Trust\Allowlist'
+allowlist_names() { reg query "$ALLOW_KEY" //reg:64 2>/dev/null | awk '/REG_SZ/{print $1}' | sort || true; }
+
 # 0. Is this the R2 + R3 build?
 cd "$ROOT"
 grep -q "ADR-060 R2" <<< "$(git log --oneline -20)" || { echo "ERROR: HEAD does not contain the ADR-060 R2 commit" >&2; exit 1; }
@@ -94,21 +97,30 @@ mkdir -p "$SNAP/plugins"
 cp -f "$PF"/*.dll "$PF"/*.exe "$PF"/*.json "$SNAP/" 2>/dev/null || true
 cp -f "$PF"/plugins/*.dll "$SNAP/plugins/" 2>/dev/null || true
 reg query 'HKLM\Software\DisplayXR\Runtime' //v Version //reg:64 2>/dev/null | awk '/Version/{print $3}' > "$SNAP/Version.txt" || true
+# Trust\Allowlist value names BEFORE anything is pushed: push-runtime-pf.sh adds
+# the dev plug-in digests (5 rows on the panel box) and register_dev_plugin.bat
+# the dev Leia DLL's; the restore removes exactly the rows this run added.
+allowlist_names > "$SNAP/allowlist.before"
 echo "== snapshot: $SNAP (Version $(cat "$SNAP/Version.txt" 2>/dev/null))"
 
-ALLOW_KEY='HKLM\Software\DisplayXR\Trust\Allowlist'
 LEIA_KEY='HKLM\Software\DisplayXR\DisplayProcessors\leia-sr'
-allowlist_names() { reg query "$ALLOW_KEY" //reg:64 2>/dev/null | awk '/REG_SZ/{print $1}' | sort || true; }
 
-# leia-l4: put the exported released row back and drop the allowlist rows this
-# run added (and only those), listing them. No installer run: on this box an
-# installer cascades, and a service an installer restarts can fall to sim-display.
+# leia-l4: put the exported released row back (allowlist_restore drops the dev
+# DLL's row). No installer run: on the panel box an installer cascades, and a
+# service an installer restarts can fall to sim-display.
 leia_restore() {
   [ "$EXPECT" = leia-l4 ] && [ -f "$SNAP/leia-sr.reg" ] || return 0
   echo "== restoring the released leia-sr row"
   reg delete "$LEIA_KEY" //f //reg:64 >/dev/null 2>&1 || true
   reg import "$(cygpath -w "$SNAP/leia-sr.reg")" //reg:64 >/dev/null 2>&1 \
     || echo "WARN: reg import of $SNAP/leia-sr.reg failed — import it by hand" >&2
+}
+
+# Every arm: drop the Trust\Allowlist rows this run added (the runtime push's dev
+# plug-in digests, and on leia-l4 the dev Leia DLL's), listing them in
+# $SNAP/allowlist.removed. Rows that existed before the run are never touched.
+allowlist_restore() {
+  [ -f "$SNAP/allowlist.before" ] || return 0
   allowlist_names > "$SNAP/allowlist.after"
   local added
   added="$(comm -13 "$SNAP/allowlist.before" "$SNAP/allowlist.after" || true)"
@@ -117,6 +129,7 @@ leia_restore() {
     while read -r v; do
       [ -n "$v" ] || continue
       echo "   $v"
+      echo "$v" >> "$SNAP/allowlist.removed"
       reg delete "$ALLOW_KEY" //v "$v" //f //reg:64 >/dev/null 2>&1 || echo "   WARN: could not delete $v" >&2
     done <<< "$added"
   else
@@ -144,6 +157,7 @@ restore() {
     return
   fi
   leia_restore
+  allowlist_restore
   echo "== restoring the snapshot"
   close_dxr_browser
   taskkill //F //IM displayxr-service.exe >/dev/null 2>&1 || true
@@ -168,8 +182,7 @@ bash scripts/push-runtime-pf.sh --browser-dir "$BROWSER_DIR"
 if [ "$EXPECT" = leia-l4 ]; then
   reg export "$LEIA_KEY" "$(cygpath -w "$SNAP/leia-sr.reg")" //y //reg:64 >/dev/null \
     || { echo "ERROR: could not export $LEIA_KEY — not touching the plug-in" >&2; exit 1; }
-  allowlist_names > "$SNAP/allowlist.before"
-  echo "== leia-sr row exported to $SNAP/leia-sr.reg ($(wc -l < "$SNAP/allowlist.before") allowlist rows before)"
+  echo "== leia-sr row exported to $SNAP/leia-sr.reg ($(wc -l < "$SNAP/allowlist.before") allowlist rows before the run)"
   # Through .cmd files: paths here may contain spaces, and quotes do not survive an
   # inline `cmd //c "..."` from MSYS intact.
   { printf '%s\r\n' '@echo off'
@@ -182,8 +195,20 @@ if [ "$EXPECT" = leia-l4 ]; then
   LEIA_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vi 'depot_tools' | paste -sd: - || true)"
   PATH="${LEIA_PATH:-$PATH}" cmd //c "$(cygpath -w "$SNAP/leia_build.cmd")"
   DEV_DLL="$(find "$LEIA_REPO/_package" -name DisplayXR-LeiaSR.dll -newer "$SNAP/leia-sr.reg" 2>/dev/null | sed -n 1p)"
-  [ -n "$DEV_DLL" ] || { echo "ERROR: no freshly built DisplayXR-LeiaSR.dll under $LEIA_REPO/_package" >&2; exit 1; }
-  echo "== dev plug-in: $DEV_DLL sha256=$(sha256sum "$DEV_DLL" | awk '{print $1}')"
+  # An incremental rebuild of a tree a peer already built relinks nothing, so no
+  # DLL is newer than the export: fall back to the newest one and say so.
+  [ -n "$DEV_DLL" ] || { DEV_DLL="$(ls -t $(find "$LEIA_REPO/_package" -name DisplayXR-LeiaSR.dll 2>/dev/null) 2>/dev/null | sed -n 1p)"; [ -n "$DEV_DLL" ] && echo "== no relink (up to date); using the newest build: $DEV_DLL (mtime $(date -r "$DEV_DLL" "+%F %T"))"; }
+  [ -n "$DEV_DLL" ] || { echo "ERROR: no DisplayXR-LeiaSR.dll under $LEIA_REPO/_package" >&2; exit 1; }
+  DEV_SHA="$(sha256sum "$DEV_DLL" | awk '{print tolower($1)}')"
+  echo "== dev plug-in: $DEV_DLL sha256=$DEV_SHA (mtime $(date -r "$DEV_DLL" "+%F %T"))"
+  printf '%s  %s\n' "$DEV_SHA" "$DEV_DLL" > "$SNAP/dev_dll.sha256"
+  # EXPECT_DEV_SHA=<sha256>: refuse to register anything but the DLL a peer reported.
+  if [ -n "${EXPECT_DEV_SHA:-}" ]; then
+    [ "$DEV_SHA" = "$(printf '%s' "$EXPECT_DEV_SHA" | tr 'A-F' 'a-f')" ] && echo "   matches EXPECT_DEV_SHA" \
+      || { echo "ERROR: dev DLL sha256 $DEV_SHA != EXPECT_DEV_SHA $EXPECT_DEV_SHA — not registering" >&2; exit 1; }
+  else
+    echo "   (EXPECT_DEV_SHA unset: compare by hand with the sha256 the builder reported)"
+  fi
   { printf '%s\r\n' '@echo off'
     printf 'cd /d "%s" || exit /b 1\r\n' "$(cygpath -w "$ROOT")"
     printf 'call scripts\\register_dev_plugin.bat leia "%s"\r\n' "$(cygpath -w "$DEV_DLL")"
@@ -242,6 +267,7 @@ case "$EXPECT" in
     has "segmenting its window per screen" && echo "   (split rule (a) engaged: the offered screen list became the segment list)"
     if [ "$EXPECT" = leia-l4 ]; then
       has "externalRouting=1" || echo "WARN: no 'externalRouting=1' caps line from the plug-in in this log"
+      has "hints windowless phase" || echo "WARN: no 'hints windowless phase' line (L4 >= 23365af logs it once)"
       has "does not hint windowless phase" && { echo "FAIL: the L4 plug-in gave no hint"; fail=1; }
       has "SR refused EXTERNAL routing for a WINDOWLESS" && { echo "FAIL: SR refused EXTERNAL for the windowless weaver (display-scoped phase)"; fail=1; }
     fi
