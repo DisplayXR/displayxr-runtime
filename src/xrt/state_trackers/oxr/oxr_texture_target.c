@@ -138,8 +138,9 @@ forward_frame(struct oxr_logger *log, struct oxr_session *sess, const XrWin32Tex
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
 		comp_d3d11_compositor_set_texture_target(
-		    &sess->xcn->base, tf->referenceWindow, tf->targetRect.offset.x, tf->targetRect.offset.y,
-		    (uint32_t)tf->targetRect.extent.width, (uint32_t)tf->targetRect.extent.height, (uint64_t)tf->flags);
+		    &sess->xcn->base, !at_frame_end, tf->referenceWindow, tf->targetRect.offset.x,
+		    tf->targetRect.offset.y, (uint32_t)tf->targetRect.extent.width,
+		    (uint32_t)tf->targetRect.extent.height, (uint64_t)tf->flags);
 	}
 #endif
 	return XR_SUCCESS;
@@ -170,6 +171,34 @@ oxr_texture_target_locate(struct oxr_logger *log, struct oxr_session *sess, cons
 	if (tf != NULL) {
 		(void)forward_frame(log, sess, tf, false);
 	}
+}
+
+void
+oxr_texture_target_locate_end(struct oxr_session *sess)
+{
+	if (!sess->texture_target_bound) {
+		return;
+	}
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
+		comp_d3d11_compositor_end_texture_target_locate(&sess->xcn->base);
+	}
+#endif
+}
+
+void
+oxr_texture_target_note_ignored(struct oxr_session *sess, const XrSessionCreateInfo *createInfo)
+{
+	if (sess->texture_target_bound || oxr_texture_target_find_binding(createInfo) == NULL) {
+		return;
+	}
+	// Spec v9 is honoured by the in-process D3D11 compositor only (ADR-060
+	// decision 3). An app that dropped windowHandle trusting it would weave
+	// display-scoped with nothing in the log otherwise.
+	U_LOG_W(
+	    "xrCreateSession: XrWin32TextureTargetBindingDXR IGNORED — only the in-process D3D11 compositor honours "
+	    "the texture target binding (D3D12 / GL / Vulkan arrive via the hub; IPC sessions are not covered by "
+	    "v9). windowHandle, if given, carries the weave as in SPEC_VERSION 8.");
 }
 
 void

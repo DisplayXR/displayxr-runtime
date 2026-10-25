@@ -93,15 +93,28 @@ struct comp_d3d11_texture_target_info
 };
 
 /*!
- * This frame's target (from xrEndFrame — authoritative — or a locate). Takes
- * effect at the next weave / metrics read. Ignored unless the session was
- * created bound. @p flags are XrWin32TextureTargetFrameFlagsDXR (advisory).
+ * A frame's target. @p for_locate false: from xrEndFrame — authoritative, what
+ * the weave uses (an omitted struct keeps the last xrEndFrame value). @p
+ * for_locate true: from xrLocateViews — frames only that locate's views (the
+ * window metrics), until @ref comp_d3d11_compositor_end_texture_target_locate.
+ * Ignored unless the session was created bound. @p flags are
+ * XrWin32TextureTargetFrameFlagsDXR (advisory).
  *
  * @ingroup comp_d3d11
  */
 void
-comp_d3d11_compositor_set_texture_target(
-    struct xrt_compositor *xc, void *reference_window, int32_t x, int32_t y, uint32_t w, uint32_t h, uint64_t flags);
+comp_d3d11_compositor_set_texture_target(struct xrt_compositor *xc,
+                                         bool for_locate,
+                                         void *reference_window,
+                                         int32_t x,
+                                         int32_t y,
+                                         uint32_t w,
+                                         uint32_t h,
+                                         uint64_t flags);
+
+//! The locate that chained a target returned: metrics fall back to the xrEndFrame slot.
+void
+comp_d3d11_compositor_end_texture_target_locate(struct xrt_compositor *xc);
 
 //! XrWin32TextureTargetStateFlagsDXR, same values.
 #define COMP_D3D11_TT_STATE_WINDOWLESS_PHASE 0x1u

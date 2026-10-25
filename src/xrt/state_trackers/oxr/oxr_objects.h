@@ -5008,6 +5008,12 @@ oxr_texture_target_frame_end(struct oxr_logger *log, struct oxr_session *sess, c
 //! xrLocateViews: forward a chained XrWin32TextureTargetFrameDXR (frames this locate).
 void
 oxr_texture_target_locate(struct oxr_logger *log, struct oxr_session *sess, const XrViewLocateInfo *viewLocateInfo);
+//! xrLocateViews returned: the next metrics read falls back to the xrEndFrame target.
+void
+oxr_texture_target_locate_end(struct oxr_session *sess);
+//! After session creation: one WARN when a binding was given but nothing honours it.
+void
+oxr_texture_target_note_ignored(struct oxr_session *sess, const XrSessionCreateInfo *createInfo);
 //! xrWaitFrame: fill a chained XrWin32TextureTargetStateDXR.
 void
 oxr_texture_target_wait(struct oxr_session *sess, XrFrameState *frameState);

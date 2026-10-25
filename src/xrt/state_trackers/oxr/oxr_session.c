@@ -5109,11 +5109,6 @@ oxr_session_locate_views(struct oxr_logger *log,
                          uint32_t *viewCountOutput,
                          XrView *views)
 {
-#ifdef OXR_HAVE_DXR_win32_window_binding
-	// v9 (ADR-060): a texture target chained on the locate frames these views
-	// (the window metrics below are the target's).
-	oxr_texture_target_locate(log, sess, viewLocateInfo);
-#endif
 	struct xrt_segment_metrics m;
 	struct xrt_device *xdev = GET_XDEV_BY_ROLE(sess->sys, head);
 	// ADR-047 Amendment 7: no other presenting DP unless the table says so.
@@ -7212,6 +7207,11 @@ oxr_session_create(struct oxr_logger *log,
 		}
 		return ret;
 	}
+
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	// v9 (ADR-060): say so when a texture target binding is not honoured.
+	oxr_texture_target_note_ignored(sess, createInfo);
+#endif
 
 	/*
 	 * Track whether this session has an APP-PROVIDED window / readback / shared
