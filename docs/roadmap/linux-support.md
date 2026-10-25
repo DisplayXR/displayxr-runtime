@@ -296,6 +296,17 @@ override, checked **before** the plug-in value (dev boxes, sim_display):
 The same knob and plug-in plumbing apply to the macOS vk_native self-owned
 window (`comp_vk_native_window_macos.m`).
 
+**Wine/Proton apps (hosted, no window binding) — adopt-own-window mode (#2322).** A Windows
+OpenXR app under Proton reaches the runtime through wineopenxr as a hosted app: it has an HWND,
+not an X11 window, so it cannot use `XR_DXR_xlib_window_binding`. Rather than opening a second
+fullscreen top-level that fights the app's own window (the covered one starves under FIFO, and the
+app drops to background mode when the runtime window holds focus), the runtime finds the process's
+own largest viewable top-level (`_NET_WM_PID == getpid()`) and creates its hosted window as a
+**child** of it, with an empty input region (xcb-shape) so input falls through. Automatic when
+`WINEPREFIX`/`WINELOADERNOEXEC` is set; `DXR_XCB_ADOPT_OWN_WINDOW=1` forces, `=0` disables. The
+same change adds an Xlib-surface fallback in the Vulkan native target, because winevulkan's host
+instance enables `VK_KHR_xlib_surface` but never `VK_KHR_xcb_surface`.
+
 ### Phase 2 — Service / IPC path
 
 **Phase 2a — build-green on Linux CI ✅ (done).** `displayxr-service` + the
