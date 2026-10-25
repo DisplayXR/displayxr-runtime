@@ -9,7 +9,7 @@
 # path the service took, and that nothing else changed.
 #
 # Usage:
-#   scripts/adr060_r2_first_run.sh --expect leia|sim --browser <chrome.exe> --url <T1 page> [--seconds 25] [--keep]
+#   scripts/adr060_r2_first_run.sh --expect leia|leia-l4|sim --browser <chrome.exe> --url <T1 page> [--seconds 25] [--keep]
 #
 #   --expect leia  The active DP is the Leia plug-in WITHOUT the L4 bit (today's
 #                  release). Pass = the service tried windowless, the DP did not
@@ -24,8 +24,10 @@
 #   - the runtime is installed in C:\Program Files\DisplayXR\Runtime;
 #   - the active DP is what --expect says (`displayxr-cli dp list`; the script prints it).
 #
-# Heads-up first on a SHARED box: this restarts displayxr-service and kills any
-# running browser / cube test app (push-runtime-pf.sh does).
+# Heads-up first on a SHARED box: this restarts displayxr-service and closes the
+# DisplayXR Browser and any cube test app. Only Chrome processes running from the
+# --browser exe's directory are closed (push-runtime-pf.sh --browser-dir); anyone's
+# ordinary Chrome on the box is left alone.
 set -euo pipefail
 
 EXPECT="" BROWSER="" URL="" SECONDS_RUN=25 KEEP=0
@@ -44,6 +46,19 @@ case "$EXPECT" in leia|leia-l4|sim) ;; *) echo "ERROR: --expect leia|leia-l4|sim
 [ -f "$BROWSER" ] || { echo "ERROR: browser not found: $BROWSER" >&2; exit 2; }
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BROWSER_DIR="$(cd "$(dirname "$BROWSER")" && pwd)"
+
+# Close the DisplayXR Browser only: chrome.exe processes whose image is under
+# BROWSER_DIR. Never `taskkill /IM chrome.exe` — that closes every Chrome on the box.
+close_dxr_browser() {
+  local win
+  win="$(cygpath -w "$BROWSER_DIR")"
+  win="${win%\\}"
+  case "$win" in *"'"*) echo "ERROR: browser dir must not contain a quote: $win" >&2; return 1 ;; esac
+  powershell.exe -NoProfile -Command \
+    "Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { \$_.Path -and \$_.Path.StartsWith('$win\\', [StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force" \
+    >/dev/null 2>&1 || true
+}
 PF="/c/Program Files/DisplayXR/Runtime"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 SNAP="$ROOT/_adr060_snapshot_$STAMP"
@@ -69,7 +84,7 @@ restore() {
     return
   fi
   echo "== restoring the snapshot"
-  taskkill //F //IM chrome.exe >/dev/null 2>&1 || true
+  close_dxr_browser
   taskkill //F //IM displayxr-service.exe >/dev/null 2>&1 || true
   sleep 1
   cp -f "$SNAP"/*.dll "$SNAP"/*.exe "$SNAP"/*.json "$PF/" 2>/dev/null || echo "WARN: some files did not restore (locked?) — re-run the copy from $SNAP" >&2
@@ -84,7 +99,7 @@ trap restore EXIT
 
 # 2. Build + push (the only sanctioned way onto Program Files).
 cmd //c "scripts\\build_windows.bat build"
-bash scripts/push-runtime-pf.sh
+bash scripts/push-runtime-pf.sh --browser-dir "$BROWSER_DIR"
 
 # 3. Which DP is active (informational; --expect must match it).
 "$PF/displayxr-cli.exe" dp list 2>&1 | head -20 || true
@@ -94,7 +109,7 @@ MARK="$(date +%s)"
 "$BROWSER" --new-window "$URL" >/dev/null 2>&1 &
 echo "== browser up; waiting ${SECONDS_RUN}s (drag the window across a seam if the run should test the split)"
 sleep "$SECONDS_RUN"
-taskkill //F //IM chrome.exe >/dev/null 2>&1 || true
+close_dxr_browser
 sleep 1
 
 LOG="$(ls -t "$LOGDIR"/DisplayXR_displayxr-service.*.log 2>/dev/null | head -1)"
