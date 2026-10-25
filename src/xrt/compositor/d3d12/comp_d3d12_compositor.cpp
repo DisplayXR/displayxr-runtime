@@ -1514,7 +1514,10 @@ d3d12_reroute_wait_app_release(struct comp_d3d12_compositor *c)
 static void
 d3d12_reroute_frame_cpu_wait(struct comp_d3d12_compositor *c)
 {
-	if (c->reroute.app_fence == nullptr || c->app_defer_fence == nullptr) {
+	// DXR_D3D12_DEFER_IDLE_WAIT=0 keeps the immediate idle-wait while still
+	// consuming the fence (A/B only: what the deferral buys). Default on.
+	static const bool defer = debug_get_bool_option("DXR_D3D12_DEFER_IDLE_WAIT", true);
+	if (c->reroute.app_fence == nullptr || c->app_defer_fence == nullptr || !defer) {
 		gpu_wait_idle_app(c);
 		return;
 	}
@@ -2200,8 +2203,12 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 		}
 		c->reroute.app_fence = af;
 		c->reroute.app_fence_reason = why;
-		U_LOG_W("#2362 hub ingest: release_fence=%s%s%s", af != nullptr ? "app" : "none",
-		        af != nullptr ? "" : " reason=", af != nullptr ? "" : why);
+		U_LOG_W("#2362 hub ingest: release_fence=%s%s%s%s", af != nullptr ? "app" : "none",
+		        af != nullptr ? "" : " reason=", af != nullptr ? "" : why,
+		        af == nullptr ? ""
+		        : debug_get_bool_option("DXR_D3D12_DEFER_IDLE_WAIT", true)
+		            ? " defer_idle_wait=1"
+		            : " defer_idle_wait=0 (DXR_D3D12_DEFER_IDLE_WAIT=0)");
 	}
 
 	U_LOG_W(
