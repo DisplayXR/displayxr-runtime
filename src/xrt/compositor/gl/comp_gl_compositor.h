@@ -34,6 +34,9 @@ struct xrt_rect;
  * @param gl_context             Platform GL context (HGLRC on Windows, EGLContext on Android, CGLContextObj on macOS).
  * @param gl_display             Platform display (HDC on Windows, EGLDisplay on Android, NULL on macOS).
  * @param dp_factory_gl          Display processor factory (may be NULL).
+ * @param dp_factory_d3d11       #2317 P3: the D3D11 display-processor factory the D3D11 hub
+ *                               weaves with under `DXR_HUB=1` (Windows; may be NULL, which
+ *                               the hub refuses as `dp_refused_scanout`). Ignored elsewhere.
  * @param shared_texture_handle  D3D11 shared texture HANDLE for offscreen mode (Windows only, may be NULL).
  * @param transparent_background Request transparent desktop composition. On Windows the
  *                               compositor switches to a DComp + WGL_NV_DX_interop2 present
@@ -54,6 +57,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
                           void *gl_context,
                           void *gl_display,
                           void *dp_factory_gl,
+                          void *dp_factory_d3d11,
                           void *shared_texture_handle,
                           bool transparent_background,
                           int32_t display_screen_left,

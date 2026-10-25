@@ -92,21 +92,21 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
 	                                 bound_display_id != 0 ? bound_display_id : COMP_DP_PRIMARY_MONITOR, // #2218
 	                                 COMP_DP_API_GL)
 	    : NULL;
+	// #2317 P3: the D3D11 hub (DXR_HUB=1) weaves with the plug-in's D3D11 DP,
+	// for the same monitor; NULL keeps the hub refused.
+	void *dp_factory_d3d11 =
+	    (sys->xsysc != NULL)
+	        ? comp_dp_factory_for_window(&sys->xsysc->info,
+	                                     bound_display_id != 0 ? bound_display_id : COMP_DP_PRIMARY_MONITOR,
+	                                     COMP_DP_API_D3D11)
+	        : NULL;
 	int32_t display_screen_left = (sys->xsysc != NULL) ? sys->xsysc->info.display_screen_left : 0;
 	int32_t display_screen_top = (sys->xsysc != NULL) ? sys->xsysc->info.display_screen_top : 0;
 
 	// Create the GL native compositor
-	xrt_result_t xret = comp_gl_compositor_create(
-	    xdev,
-	    window_handle,
-	    gl_context,
-	    gl_display,
-	    dp_factory_gl,
-	    shared_texture_handle,
-	    transparent_background,
-	    display_screen_left,
-	    display_screen_top,
-	    &xcn);
+	xrt_result_t xret = comp_gl_compositor_create(xdev, window_handle, gl_context, gl_display, dp_factory_gl,
+	                                              dp_factory_d3d11, shared_texture_handle, transparent_background,
+	                                              display_screen_left, display_screen_top, &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create GL native compositor: %d", xret);
