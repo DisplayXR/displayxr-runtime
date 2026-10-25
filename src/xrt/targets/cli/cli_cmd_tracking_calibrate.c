@@ -12,7 +12,8 @@
  *       starts it, and streams its samples — the camera-space block (camera
  *       key, per-eye unit direction + estimated distance) beside the
  *       display-space eyes. `--json`: one NDJSON line per sample after a
- *       "hello" line; `--watch` keeps going until Ctrl-C / stdin EOF (the
+ *       "hello" line (which also carries the camera's current pose answer,
+ *       the prior the Dashboard sizes its target layout from); `--watch` keeps going until Ctrl-C / stdin EOF (the
  *       Dashboard's stop) or `--count` samples; without it, one sample.
  *
  *   tracking calibrate solve --in <file|-> [--mode a|b|c] [--eye mid|left|right]
@@ -44,6 +45,7 @@
 #include "os/os_time.h"
 #include "util/u_time.h"
 
+#include "target_camera_pose.h"
 #include "target_component_loader.h"
 #include "target_tracking_plugin_loader.h"
 
@@ -374,6 +376,21 @@ cmd_watch(int argc, const char **argv)
 			cJSON_AddNumberToObject(d, "pixel_height", r->display_info.display_pixel_height);
 		} else {
 			cJSON_AddNullToObject(o, "display");
+		}
+		// The pose the camera has now (display-declared > user-calibration > placement hint >
+		// default prior): the prior the Dashboard lays its targets out from, so each dot keeps
+		// the face inside the camera's view.
+		struct u_camera_calib_record pose;
+		const float pw = r->display_info_ok ? (float)r->display_info.display_width_m : 0.0f;
+		const float ph = r->display_info_ok ? (float)r->display_info.display_height_m : 0.0f;
+		if (info.camera_key[0] != '\0' &&
+		    target_camera_pose_resolve(info.camera_key, screen, pw, ph, &pose, NULL)) {
+			cJSON *cp = cJSON_AddObjectToObject(o, "camera_pose");
+			cJSON_AddItemToObject(cp, "t_m", vec_json(pose.t_m, 3));
+			cJSON_AddItemToObject(cp, "q", vec_json(pose.q, 4));
+			cJSON_AddStringToObject(cp, "source", u_camera_calib_source_str(pose.source));
+		} else {
+			cJSON_AddNullToObject(o, "camera_pose");
 		}
 		cJSON_AddStringToObject(o, "note",
 		                        "providers serve the primary screen only in this release; --screen is echoed, "

@@ -996,9 +996,12 @@ if(TARGET tests_oxr_view_space)
 				tracking_calibrate_cli_solve PROPERTIES FIXTURES_REQUIRED calib_pairs PASS_REGULAR_EXPRESSION
 				                                        "\"ok\":[ \t]*true"
 				)
+			# No calibration stored (a config dir that does not exist): the hello's camera_pose is
+			# the default prior, the layout prior the Dashboard sizes its targets from.
 			add_test(NAME tracking_calibrate_cli_watch
 			         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1
 			                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_CAMERA=1
+			                 "XDG_CONFIG_HOME=${CMAKE_CURRENT_BINARY_DIR}/tracking_calibrate_cli_none"
 			                 $<TARGET_FILE:cli> tracking calibrate --screen E2E-1 --watch --json --count 3
 			         )
 			# No calibration stored (a config dir that does not exist): the answer is still a
@@ -1015,7 +1018,7 @@ if(TARGET tests_oxr_view_space)
 				)
 			set_tests_properties(
 				tracking_calibrate_cli_watch PROPERTIES PASS_REGULAR_EXPRESSION
-				                                        "\"tracks_camera_space\":true.*\"camera\":{\"key\":\"sim-tracking:webcam0\""
+				                                        "\"tracks_camera_space\":true.*\"camera_pose\":{\"t_m\":\\[[^]]*\\],\"q\":\\[[^]]*\\],\"source\":\"default-prior\"}.*\"camera\":{\"key\":\"sim-tracking:webcam0\""
 				)
 		endif()
 	endif()

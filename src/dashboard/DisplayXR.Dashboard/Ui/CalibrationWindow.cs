@@ -37,6 +37,7 @@ public sealed class CalibrationWindow : Window
     private readonly Action _onApplied;
     private IWatchProcess? _child;
     private bool _busy;
+    private bool _layoutLogged;
 
     private readonly Canvas _canvas = new();
     private readonly Border _ring = new() { IsHitTestVisible = false };
@@ -195,6 +196,11 @@ public sealed class CalibrationWindow : Window
     /// <summary>After every input: run what the session asked for, stop the child when it is done, redraw.</summary>
     private void Step()
     {
+        if (!_layoutLogged && _session.Layout is { } l && _session.Geometry is { } g)
+        {
+            _layoutLogged = true;
+            DashboardLog.Info("calibration: " + l.Describe(g));
+        }
         if (!_session.WantsStream) StopChild();
         if (!_busy && _session.TakeRequest() is { } req) _ = RunAsync(req);
         Render();
@@ -286,7 +292,7 @@ public sealed class CalibrationWindow : Window
         _status.Text = _session.Status + (_session.Phase == CalibPhase.LiveCheck && _session.LivePoint is { } p
             ? string.Format(CultureInfo.InvariantCulture, "{0}eye midpoint ({1:0.0}, {2:0.0}, {3:0.0}) mm", StatusText.Sep, p.X * 1000, p.Y * 1000, p.Z * 1000)
             : "");
-        _error.Text = _session.Phase is CalibPhase.LiveCheck or CalibPhase.Review or CalibPhase.Aligning && _session.Error is { } err ? err : "";
+        _error.Text = _session.ViewWarning ?? (_session.Phase is CalibPhase.LiveCheck or CalibPhase.Review or CalibPhase.Aligning && _session.Error is { } err ? err : "");
         _error.IsVisible = _error.Text.Length > 0;
         // Keep the text away from the cross: below it when the cross is in the top half, above otherwise.
         bool below = cy < h / 2;
@@ -350,7 +356,8 @@ public sealed class CalibrationWindow : Window
             var flagged = s.Flagged;
             foreach (var r in s.Samples)
             {
-                string name = r.Index < CalibGeometry.Dots.Count ? CalibGeometry.Dots[r.Index].Label : $"#{r.Index}";
+                var dots = _session.Layout?.Dots;
+                string name = dots is not null && r.Index < dots.Count ? dots[r.Index].Label : $"#{r.Index}";
                 string mark = r.Rejected ? "  REJECTED" : flagged.Contains(r.Index) ? "  over 5 mm" : "";
                 Line(string.Format(ci, "  {0,-22} residual {1,6:0.00} mm   distance {2:0.000} m (estimated {3:0.000}){4}",
                                    name, r.ResidualMm, r.DistanceM, r.EstimatedDistanceM, mark), r.Rejected || mark.Length > 0 ? (byte)0xF0 : (byte)0xA0, 13, true);

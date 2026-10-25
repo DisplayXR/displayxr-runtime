@@ -487,6 +487,63 @@ TEST_CASE("mirror calib: the near/far procedure recovers a yawed laptop camera i
 	}
 }
 
+/*
+ * The Dashboard's geometry-sized layout on the same laptop (CalibLayout, a 60 deg 16:9 view with the
+ * face kept in it from the default prior): the near pass is three dots moved up to 61 mm, the far
+ * pass a 3 x 3 grid at a 12 % inset with its bottom row moved up to -25 mm. The wider far grid is
+ * the lever on roll; the old 5 + 5 layout is the baseline.
+ */
+TEST_CASE("mirror calib: the wide far grid pins roll better than the 5 + 5 layout", "[mirror_calib]")
+{
+	const double w = 0.30121409893035889, h = 0.19562980532646179;
+	const double dx = 605 * w / 3024, dy = 393 * h / 1964;
+	using Dots = std::vector<std::pair<double, double>>;
+	const Dots five = {{0, 0}, {-dx, 0}, {dx, 0}, {0, dy}, {0, -dy}};
+	const Dots near_line = {{0, 0.06116}, {-dx, 0.06116}, {dx, 0.06116}};
+	Dots grid;
+	for (double y : {0.07431, 0.0, -0.02480}) {
+		for (double x : {-0.11445, 0.0, 0.11445}) {
+			grid.push_back({x, y});
+		}
+	}
+	// The live MacBook solve: T (4.2, 98.1) mm, pitch -0.23, yaw 0.22, roll -2.08 deg.
+	const Pose p = make_pose(0.0042, 0.0981, 0.0, -0.23, 0.22, -2.08);
+	const Noise n{0.2, 0.002, 0.07, 1.0};
+	auto run = [&](const Dots &near, const Dots &far, std::vector<double> &err_t, std::vector<double> &err_roll) {
+		for (unsigned seed = 0; seed < 60; seed++) {
+			std::mt19937 rng(7000 + seed);
+			std::vector<m_mirror_calib_sample> s;
+			for (auto d : near) {
+				s.push_back(make_sample(p, d.first, d.second, 0.40, n, rng));
+			}
+			for (auto d : far) {
+				s.push_back(make_sample(p, d.first, d.second, 0.70, n, rng));
+			}
+			m_mirror_calib_options opt;
+			m_mirror_calib_options_init(&opt);
+			opt.mode = M_MIRROR_CALIB_MODE_FULL;
+			opt.reject_threshold_m = 0.005;
+			m_mirror_calib_result r;
+			REQUIRE(m_mirror_calib_solve(s.data(), (int)s.size(), &opt, &r));
+			err_t.push_back(t_err_xy(r, p));
+			err_roll.push_back(fabs(r.roll_deg - -2.08));
+		}
+	};
+	auto med = [](std::vector<double> v) {
+		std::sort(v.begin(), v.end());
+		return v[v.size() / 2];
+	};
+	std::vector<double> t_old, roll_old, t_new, roll_new;
+	run(five, five, t_old, roll_old);
+	run(near_line, grid, t_new, roll_new);
+	std::printf(
+	    "[mirror_calib] laptop, 60 seeds: 5 + 5 median |dT| %.1f mm |droll| %.2f deg; 3 + 3x3 median |dT| %.1f mm "
+	    "|droll| %.2f deg\n",
+	    med(t_old) * 1e3, med(roll_old), med(t_new) * 1e3, med(roll_new));
+	CHECK(med(roll_new) < 0.75 * med(roll_old));
+	CHECK(med(t_new) < 0.010);
+}
+
 TEST_CASE("mirror calib: iris scale and outlier rejection", "[mirror_calib]")
 {
 	std::mt19937 rng(9);

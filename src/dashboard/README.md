@@ -39,18 +39,22 @@ screen's desktop rect from the status feed; a points-vs-pixels platform is match
 scale). Method: [tracking-provider-discovery.md §6](../../docs/specs/runtime/tracking-provider-discovery.md#camera-pose-calibration).
 
 - Black, a bright ring at the edges to light the face (+ / − adjust it), a white cross on each target
-  in turn: centre; left, right, top, bottom at a 30 % inset — first leaning in to about 35 cm (the
-  near pass), then the same five sitting back to about 65 cm (the far pass). A target's display-space
-  position is (pixel − screen centre) × pixel pitch, y up, on the screen's native grid; the metres
-  are the watch's `hello.display` (the provider's display space) on the runtime-default screen, else
-  the screen's layout metres, else its physical size.
-- One `tracking calibrate --screen <key> --watch --json` child for the window's life (stopped by
+  in turn: a near pass (about 40 cm) then a far pass (about 70 cm). The targets are sized from the
+  geometry (`CalibLayout`, spec §6 *Dashboard*): ideally five central dots near and a 3 × 3 grid at a
+  12 % inset far; each is checked against a conservative 60° / 16:9 camera view from the hello's
+  `camera_pose` (the prior), keeping the eyes plus 70 mm up, 70 mm down and 75 mm to each side 2°
+  inside it, and moved toward the camera's axis (vertically first) when it does not fit; merged dots
+  are dropped, and a pass where nothing fits moves back 5 cm at a time. The layout is logged. A
+  target's display-space- One `tracking calibrate --screen <key> --watch --json` child for the window's life (stopped by
   closing its stdin, killed after 1.5 s; Esc stops it at any time). Prompt: close the left eye, find
   the closed eye's reflection with the right eye, put the cross on it, Space. Space captures at once
   when the eye midpoint's camera-space direction has been still (< 0.3°) for 0.5 s, otherwise it
-  arms and captures as soon as it is (the ring round the cross brightens with the still run). The
+  arms and captures as soon as it is (the ring round the cross brightens with the still run). While
+  there is no face lock, or the measured face reaches the edge of the assumed view, the window says
+  "move so your face stays in the camera's view" and holds the capture; a second Space captures
+  anyway (the view is an assumption). The
   captured line is recorded verbatim with its dot as `{dot_m, sample}`, `eye: "mid"`.
-- After the tenth target the far pass's mean estimated eye distance must be ≥ 1.5× the near pass's
+- After the last target the far pass's mean estimated eye distance must be ≥ 1.5× the near pass's
   (`CalibGeometry.MinDistanceRatio`); otherwise the window says how far each pass was and queues the
   far pass again. Then the pairs go to `<LocalApplicationData>/DisplayXR/calibration-last-solve.json`
   (kept, overwritten by the next solve) and `calibrate solve` (mode `c`: full rotation + T_x, T_y; no
