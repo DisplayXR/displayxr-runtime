@@ -1304,7 +1304,13 @@ gl_hub_active(const struct comp_gl_compositor *c)
 #endif
 }
 
-//! #2317 P3: `DXR_HUB=1`, read once — the same knob the D3D11 shim reads.
+/*!
+ * #2317 P3: the GL shim's OWN gate — `DXR_HUB=1` exactly, read once; unset (or
+ * any other value) is OFF. Deliberately not the D3D11 tier's hub policy, whose
+ * default may engage the hub on its own (#2363): GL stays opt-in on every
+ * topology until the Intel interop transit cost and a single-dGPU desktop run
+ * are settled (the flip is tracked in #2317).
+ */
 static inline bool
 gl_hub_requested(void)
 {
