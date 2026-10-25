@@ -269,7 +269,9 @@ struct comp_hub_d3d11_info
  * "`DXR_HUB` is not `1`" while the D3D11 shim was opt-in (P1b..P2c); since step 2
  * the in-process D3D11 leg weaves through the hub BY DEFAULT and the only way to
  * opt out is the kill switch, @ref COMP_HUB_REASON_DISABLED_BY_ENV. Field logs
- * from builds before step 2 still carry this string; nothing emits it today.
+ * from builds before step 2 still carry this string. The D3D11 leg no longer
+ * emits it; the OpenGL shim (#2317 P3) still does, because GL stays opt-in
+ * (exactly `DXR_HUB=1`) whatever the D3D11 default is.
  */
 #define COMP_HUB_REASON_NOT_REQUESTED "not_requested"
 /*!
