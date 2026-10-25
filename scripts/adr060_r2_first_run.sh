@@ -11,10 +11,11 @@
 # Usage:
 #   scripts/adr060_r2_first_run.sh --expect leia|leia-l4|sim --browser <chrome.exe> --url <T1 page> [--seconds 25] [--keep]
 #
-#   --expect leia  The active DP is the Leia plug-in WITHOUT the L4 bit (today's
-#                  release). Pass = the service tried windowless, the DP did not
-#                  declare the bit, and the client weaves on the window-bound DP
-#                  exactly as before (the no-regression check).
+#   --expect leia  The active DP is the Leia plug-in WITHOUT L4 (today's
+#                  release). Pass = the service declined the windowless path (the
+#                  plug-in gives no hint, so no extra weaver is even created) and
+#                  the client weaves on the window-bound DP exactly as before
+#                  (the no-regression check).
 #   --expect leia-l4  Leia WITH the L4 bit (later). Pass = the windowless lines.
 #   --expect sim   sim-display is the active DP. Pass = the windowless lines.
 #   --keep         Leave the R2 build installed (default: restore the snapshot).
@@ -125,7 +126,10 @@ echo "-- R2 lines:"
 show "ADR-060 R2"
 case "$EXPECT" in
   leia)
-    has "does not declare PHASE_FROM_PRESENT_ORIGIN" || { echo "FAIL: expected the DP to decline the bit"; fail=1; }
+    # The plug-in hint (no L4) skips the windowless try outright; a plug-in that
+    # hints but whose instance then declines logs the second line instead.
+    has "does not hint windowless phase" || has "does not declare PHASE_FROM_PRESENT_ORIGIN" \
+      || { echo "FAIL: expected the windowless path to be declined (no hint / no bit)"; fail=1; }
     has "OWN WINDOWLESS display processor" && { echo "FAIL: went windowless on a plug-in without the bit"; fail=1; }
     has "weaves on its OWN display processor on the RENDER device" || has "panel DP" || echo "WARN: no window-bound weave-DP line found; check the log by hand"
     ;;

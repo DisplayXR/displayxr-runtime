@@ -5778,7 +5778,7 @@ svc_make_windowless_weave_dp(struct d3d11_service_system *sys, struct d3d11_serv
 		// The plug-in did not say it can (an older plug-in, or a vendor SDK
 		// without external routing): skip the create rather than bring a
 		// vendor weaver up only to destroy it. Once per client.
-		U_LOG_I("ADR-060 R2: '%s' does not hint windowless phase for this screen — window-bound weave DP",
+		U_LOG_W("ADR-060 R2: '%s' does not hint windowless phase for this screen — window-bound weave DP",
 		        e->plugin_id);
 		return nullptr;
 	}
