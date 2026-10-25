@@ -12,11 +12,12 @@
  *
  * #2356: window-space layers used to be composited into the atlas AT WEAVE
  * TIME, straight from the app's layer swapchain image, so every frame carrying
- * one stayed blocking. They are now composited at layer_commit instead, on the
- * app thread, into the runtime-owned atlas, and that submit is waited before
- * xrEndFrame returns (the same rule renderer_draw already follows for the
- * projection images). A frame whose window-space layers were composited at
- * commit therefore reads only runtime-owned images at weave time and may go
+ * one stayed blocking. They are now composited at layer_commit instead, into
+ * the runtime-owned atlas: submitted on the serve's own queue (queue order puts
+ * it before the weave) with no host wait, while the app's reuse of the layer
+ * image is held at xrWaitSwapchainImage until that submit retires (the #2095
+ * backpressure). A frame whose window-space layers were composited at commit
+ * therefore reads only runtime-owned images at weave time and may go
  * non-blocking.
  *
  * Local2D, zones and an active zone mask still read app images from the served

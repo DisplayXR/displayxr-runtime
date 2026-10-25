@@ -60,6 +60,14 @@ struct comp_vk_native_swapchain
 	 */
 	uint64_t read_serial[MAX_SWAPCHAIN_IMAGES];
 
+	/*!
+	 * #2356: per image, the serial of the last commit-time window-space stamp
+	 * that reads it (0 = none) — the compositor's ws_stamp, separate from the
+	 * #2095 ring above. Same rule: written at commit and read at
+	 * wait_image/destroy, both under the compositor's ws_stamp lock.
+	 */
+	uint64_t stamp_serial[MAX_SWAPCHAIN_IMAGES];
+
 	//! VkImages.
 	VkImage images[MAX_SWAPCHAIN_IMAGES];
 
@@ -315,6 +323,22 @@ comp_vk_native_swapchain_note_read(struct xrt_swapchain *xsc, uint32_t index, ui
 	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
 	if (index < sc->image_count && serial > sc->read_serial[index]) {
 		sc->read_serial[index] = serial;
+	}
+}
+
+uint64_t
+comp_vk_native_swapchain_get_stamp_serial(struct xrt_swapchain *xsc, uint32_t index)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	return index < sc->image_count ? sc->stamp_serial[index] : 0;
+}
+
+void
+comp_vk_native_swapchain_note_stamp(struct xrt_swapchain *xsc, uint32_t index, uint64_t serial)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	if (index < sc->image_count && serial > sc->stamp_serial[index]) {
+		sc->stamp_serial[index] = serial;
 	}
 }
 
