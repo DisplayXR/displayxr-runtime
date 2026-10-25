@@ -45,11 +45,16 @@ public sealed class CalibrationSession
         "Close your left eye. With your right eye, find the reflection of your closed eye and move your head until the cross sits on it. Press Space (or click).";
 
     /// <summary>The distance instruction of each pass (the user eyeballs it; the samples' distances check it).</summary>
-    public const string NearPrompt = "Near pass: lean in to about 35 cm from the screen. ";
-    public const string FarPrompt = "Far pass: sit back to about 65 cm from the screen. ";
+    public static string NearPrompt(double m) => $"Near pass: lean in to about {m * 100:0} cm from the screen. ";
+    public static string FarPrompt(double m) => $"Far pass: sit back to about {m * 100:0} cm from the screen. ";
+
+    public const string OutOfViewWarning =
+        "Move so your face stays in the camera's view: your eyes are near the edge of what it sees. (Press Space again to capture anyway.)";
+    public const string NoLockWarning = "No face lock: move so your face stays in the camera's view.";
 
     private readonly Screen? _screen;
-    private readonly CalibSample?[] _captured = new CalibSample?[CalibGeometry.Dots.Count];
+    private CalibSample?[] _captured = Array.Empty<CalibSample?>();
+    private bool _override;
     private readonly List<int> _queue = new();
     private readonly StabilityTracker _stable = new();
     private CalibRequest? _pending;
@@ -58,13 +63,15 @@ public sealed class CalibrationSession
     {
         ScreenKey = screenKey;
         _screen = screen;
-        _queue.AddRange(CalibGeometry.Dots.Select(d => d.Index));
     }
 
     public string ScreenKey { get; }
     public CalibPhase Phase { get; private set; } = CalibPhase.Starting;
     public CalibHello? Hello { get; private set; }
     public CalibGeometry? Geometry { get; private set; }
+
+    /// <summary>The targets, sized from the geometry and the hello's camera pose (null until the hello).</summary>
+    public CalibLayout? Layout { get; private set; }
     public CalibSample? Latest { get; private set; }
 
     /// <summary>Space was pressed while the head was moving: capture as soon as it is still.</summary>
@@ -90,7 +97,25 @@ public sealed class CalibrationSession
     public bool StreamEnded { get; private set; }
 
     /// <summary>The dot the user is aligning on (Aligning only).</summary>
-    public CalibDot? CurrentDot => Phase == CalibPhase.Aligning && _queue.Count > 0 ? CalibGeometry.Dots[_queue[0]] : null;
+    public CalibDot? CurrentDot => Phase == CalibPhase.Aligning && _queue.Count > 0 && Layout is { } l ? l.Dots[_queue[0]] : null;
+
+    /// <summary>
+    /// The live guard while aligning: no face lock, or the face around the measured eye midpoint
+    /// reaching the edge of the camera's view (<see cref="CameraView.FaceInView(Vec3, double)"/>, no
+    /// margin). A capture waits for it to clear; Space again overrides the edge warning (the field of
+    /// view is an assumption).
+    /// </summary>
+    public string? ViewWarning
+    {
+        get
+        {
+            if (Phase != CalibPhase.Aligning || Latest is null || Layout is null) return null;
+            if (!Latest.Tracking) return NoLockWarning;
+            if (Latest.Camera is not { } c) return null;
+            var p = c.HasDistance ? c.MidPoint : Layout.DistanceM(CurrentDot?.Pass ?? CalibPass.Near) * c.MidPoint.Normalized;
+            return Layout.View.FaceInView(p, 0) ? null : OutOfViewWarning;
+        }
+    }
 
     public int CapturedCount => _captured.Count(c => c is not null);
     public IReadOnlyList<CalibSample?> Captured => _captured;
@@ -101,7 +126,8 @@ public sealed class CalibrationSession
     /// </summary>
     public double? PassDistanceM(CalibPass pass)
     {
-        var cams = CalibGeometry.PassIndices(pass).Select(i => _captured[i]?.Camera).Where(c => c is not null).ToArray();
+        if (Layout is null) return null;
+        var cams = Layout.PassIndices(pass).Select(i => _captured[i]?.Camera).Where(c => c is not null).ToArray();
         if (cams.Length == 0 || cams.Any(c => !c!.HasDistance)) return null;
         return cams.Average(c => c!.MidPoint.Length);
     }
@@ -137,15 +163,17 @@ public sealed class CalibrationSession
     public string Prompt => Phase switch
     {
         CalibPhase.Starting => "Starting the tracking provider…",
-        CalibPhase.Aligning when CurrentDot is { Pass: CalibPass.Far } => FarPrompt + AlignPrompt,
-        CalibPhase.Aligning => NearPrompt + AlignPrompt,
+        CalibPhase.Aligning when CurrentDot is { Pass: CalibPass.Far } => FarPrompt(Layout!.FarM) + AlignPrompt,
+        CalibPhase.Aligning when Layout is not null => NearPrompt(Layout.NearM) + AlignPrompt,
+        CalibPhase.Aligning => AlignPrompt,
         CalibPhase.Solving => "Solving the camera pose…",
         CalibPhase.Review when Solve is { Ok: false } s => $"The solver refused the samples ({s.Status}): {s.Reason}",
         CalibPhase.Review when Solve is { HighRms: true } => "The fit is loose (RMS above 5 mm). Retake the flagged samples, or continue to the live check.",
         CalibPhase.Review when FallbackNote is not null => "Fit done with the reduced model (pitch only, no yaw). Press Space for the live check.",
         CalibPhase.Review => "Fit done. Press Space for the live check.",
         CalibPhase.LiveCheck =>
-            "Live check: keep your left eye closed and check near AND far — lean in to about 35 cm, then sit back to about 65 cm, moving your head at each. " +
+            $"Live check: keep your left eye closed and check near AND far — lean in to about {(Layout?.NearM ?? CalibLayout.NearTargetM) * 100:0} cm, " +
+            $"then sit back to about {(Layout?.FarM ?? CalibLayout.FarTargetM) * 100:0} cm, moving your head at each. " +
             "The dot should stay on the reflection of your closed eye at both distances. Arrow keys nudge it by 1 mm; Enter applies.",
         CalibPhase.Applying => "Saving the calibration…",
         CalibPhase.Done => "Calibration saved. It applies at the provider's next start (the next app launch). Press Esc to close.",
@@ -162,8 +190,9 @@ public sealed class CalibrationSession
             switch (Phase)
             {
             case CalibPhase.Aligning:
-                string lockText = Latest is null ? "waiting for a sample" : !Latest.Tracking ? "no face lock" : Latest.Camera is null ? "no camera-space sample" : Stable ? "still" : "hold still";
-                return $"Target {CapturedCount + 1} of {CalibGeometry.Dots.Count}: {CurrentDot?.Label}{StatusText.Sep}{lockText}"
+                string lockText = Latest is null ? "waiting for a sample" : !Latest.Tracking ? "no face lock" : Latest.Camera is null ? "no camera-space sample"
+                                : ViewWarning is not null ? "face near the edge of the camera's view" : Stable ? "still" : "hold still";
+                return $"Target {CapturedCount + 1} of {_captured.Length}: {CurrentDot?.Label}{StatusText.Sep}{lockText}"
                        + (Armed ? $"{StatusText.Sep}captures when still" : "") + $"{StatusText.Sep}Esc cancels";
             case CalibPhase.Review:
                 return Solve is { Ok: true } ? "Space: live check · R: retake flagged · A: start over · Esc: cancel"
@@ -197,12 +226,19 @@ public sealed class CalibrationSession
                 Fail("The screen's physical size is not known, so the target positions cannot be computed.");
                 return;
             }
+            if (Layout is null)
+            {
+                Layout = CalibLayout.Build(Geometry, h.CameraPose, h.CameraPoseSource);
+                _captured = new CalibSample?[Layout.Dots.Count];
+                _queue.Clear();
+                _queue.AddRange(Layout.Dots.Select(d => d.Index));
+            }
             if (Phase == CalibPhase.Starting) Phase = CalibPhase.Aligning;
             break;
         case CalibSample s:
             Latest = s;
             _stable.Add(s);
-            if (Phase == CalibPhase.Aligning && Armed && Stable) Capture();
+            if (Phase == CalibPhase.Aligning && Armed && Stable && (ViewWarning is null || _override)) Capture();
             break;
         case CalibError e:
             Fail(ErrorText(e));
@@ -232,7 +268,14 @@ public sealed class CalibrationSession
         switch (Phase)
         {
         case CalibPhase.Aligning:
-            if (Stable && Latest is { Usable: true }) Capture();
+            if (ViewWarning is not null)
+            {
+                // A second Space while warned overrides the edge guard (never a lost lock: no sample).
+                if (Armed) _override = true;
+                Armed = true;
+                if (_override && Stable && Latest is { Usable: true }) Capture();
+            }
+            else if (Stable && Latest is { Usable: true }) Capture();
             else Armed = true;
             break;
         case CalibPhase.Review when Solve is { Ok: true, Pose: not null }:
@@ -275,13 +318,13 @@ public sealed class CalibrationSession
     {
         if (Phase != CalibPhase.Review) return;
         var f = Solve?.Flagged ?? Array.Empty<int>();
-        Retake(f.Count > 0 ? f : CalibGeometry.Dots.Select(d => d.Index).ToArray());
+        Retake(f.Count > 0 ? f : Enumerable.Range(0, _captured.Length).ToArray());
     }
 
     /// <summary>A: start over.</summary>
     public void RetakeAll()
     {
-        if (Phase == CalibPhase.Review) Retake(CalibGeometry.Dots.Select(d => d.Index).ToArray());
+        if (Phase == CalibPhase.Review) Retake(Enumerable.Range(0, _captured.Length).ToArray());
     }
 
     private void Retake(IReadOnlyList<int> indices)
@@ -297,6 +340,7 @@ public sealed class CalibrationSession
         Pose = null;
         Error = null;
         Armed = false;
+        _override = false;
         Phase = _queue.Count > 0 ? CalibPhase.Aligning : CalibPhase.Review;
     }
 
@@ -306,6 +350,7 @@ public sealed class CalibrationSession
         _captured[_queue[0]] = s;
         _queue.RemoveAt(0);
         Armed = false;
+        _override = false;
         _stable.Reset(); // the next target needs its own still run
         if (_queue.Count == 0 && DistancesDiffer()) RequestSolve();
     }
@@ -322,7 +367,7 @@ public sealed class CalibrationSession
         Error = string.Format(CultureInfo.InvariantCulture,
             "The two passes were too close in distance (near about {0:0} cm, far about {1:0} cm; the far pass needs at least {2:0.0}x the near one). " +
             "Sit further back and retake the far pass.", near * 100, far * 100, CalibGeometry.MinDistanceRatio);
-        foreach (int i in CalibGeometry.PassIndices(CalibPass.Far))
+        foreach (int i in Layout!.PassIndices(CalibPass.Far))
         {
             _captured[i] = null;
             _queue.Add(i);
@@ -348,7 +393,7 @@ public sealed class CalibrationSession
     public string BuildSolveInput(string mode = CalibrationCommands.Mode)
     {
         var g = Geometry!;
-        var pairs = CalibGeometry.Dots.Where(d => _captured[d.Index] is not null).Select(d =>
+        var pairs = Layout!.Dots.Where(d => _captured[d.Index] is not null).Select(d =>
         {
             var (x, y) = g.Metres(d);
             return (x, y, _captured[d.Index]!);

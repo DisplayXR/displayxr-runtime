@@ -79,12 +79,6 @@ public sealed record CalibDot(int Index, string Name, double Fx, double Fy, Cali
 /// </summary>
 public sealed record CalibGeometry(long PixelWidth, long PixelHeight, double WidthM, double HeightM, string Source)
 {
-    /// <summary>The inset of the left / right / top / bottom dots (design §10: an inset, not the corners).</summary>
-    public const double Inset = 0.30;
-
-    /// <summary>Targets per pass: centre; left, right, top, bottom at a 30 % inset.</summary>
-    public const int DotsPerPass = 5;
-
     /// <summary>
     /// The far pass's mean eye distance must be at least this many times the near pass's. Below it
     /// the rotation / translation split is poorly conditioned (in simulation, 0.2° direction and
@@ -93,19 +87,6 @@ public sealed record CalibGeometry(long PixelWidth, long PixelHeight, double Wid
     /// in the ratio.
     /// </summary>
     public const double MinDistanceRatio = 1.5;
-
-    /// <summary>The five dots leaning in (about 35 cm), then the same five sitting back (about 65 cm).</summary>
-    public static readonly IReadOnlyList<CalibDot> Dots = new[] { CalibPass.Near, CalibPass.Far }.SelectMany((pass, p) => new[]
-    {
-        new CalibDot(p * DotsPerPass + 0, "centre", 0.5, 0.5, pass),
-        new CalibDot(p * DotsPerPass + 1, "left", Inset, 0.5, pass),
-        new CalibDot(p * DotsPerPass + 2, "right", 1 - Inset, 0.5, pass),
-        new CalibDot(p * DotsPerPass + 3, "top", 0.5, Inset, pass),
-        new CalibDot(p * DotsPerPass + 4, "bottom", 0.5, 1 - Inset, pass),
-    }).ToArray();
-
-    /// <summary>The target indices of one pass.</summary>
-    public static IReadOnlyList<int> PassIndices(CalibPass pass) => Dots.Where(d => d.Pass == pass).Select(d => d.Index).ToArray();
 
     public bool IsValid => PixelWidth > 0 && PixelHeight > 0 && WidthM > 0 && HeightM > 0;
 
@@ -156,6 +137,218 @@ public sealed record CalibGeometry(long PixelWidth, long PixelHeight, double Wid
         if (hello is { WidthM: > 0, HeightM: > 0 } h2)
             return new CalibGeometry(pw, ph, h2.WidthM, h2.HeightM, "display info");
         return null;
+    }
+}
+
+/// <summary>
+/// What the camera can see, for the target layout and the live "face in view" guard. No provider
+/// reports its field of view today, so <see cref="Default"/> is a conservative 60° horizontal at
+/// 16:9 (18° half-height). A face counts as in view when its eye midpoint and the face around it —
+/// <see cref="FaceAboveM"/> up to the forehead, <see cref="FaceBelowM"/> down to the mouth (eyes,
+/// nose and mouth are what a landmarker needs; a cut-off chin is tolerated: a laptop camera
+/// tracked a near-pass eye midpoint 19° below its axis at 42 cm, where the chin is ~31° below),
+/// <see cref="FaceSideM"/> to each side — are inside the view less a margin.
+/// </summary>
+public sealed record CameraView(double HfovDeg, double Aspect)
+{
+    public static readonly CameraView Default = new(60, 9.0 / 16);
+
+    public const double FaceAboveM = 0.070;
+    public const double FaceBelowM = 0.070;
+    public const double FaceSideM = 0.075;
+
+    /// <summary>The layout keeps the face this far inside the view; the live guard fires at the edge itself.</summary>
+    public const double LayoutMarginDeg = 2.0;
+
+    private static readonly Vec3[] FaceOffsets =
+    {
+        new(0, FaceAboveM, 0), new(0, -FaceBelowM, 0), new(-FaceSideM, 0, 0), new(FaceSideM, 0, 0),
+    };
+
+    public double HalfHorizontalRad => HfovDeg * Math.PI / 360.0;
+    public double HalfVerticalRad => Math.Atan(Math.Tan(HalfHorizontalRad) * Aspect);
+
+    /// <summary>A camera-space point inside the view less <paramref name="marginDeg"/> (camera +Z toward the viewer).</summary>
+    public bool InView(Vec3 p, double marginDeg)
+    {
+        double m = marginDeg * Math.PI / 180.0;
+        double th = Math.Tan(HalfHorizontalRad - m), tv = Math.Tan(HalfVerticalRad - m);
+        return p.Z > 0 && Math.Abs(p.X) <= th * p.Z && Math.Abs(p.Y) <= tv * p.Z;
+    }
+
+    /// <summary>The face around a camera-space eye midpoint is in view (the camera held upright).</summary>
+    public bool FaceInView(Vec3 eyeCamera, double marginDeg) => FaceOffsets.All(o => InView(eyeCamera + o, marginDeg));
+
+    /// <summary>The face around a display-space eye midpoint is in view of a camera at <paramref name="pose"/>.</summary>
+    public bool FaceInView(CameraPose pose, Vec3 eyeDisplay, double marginDeg) =>
+        FaceOffsets.All(o => InView(pose.ToCamera(eyeDisplay + o), marginDeg));
+}
+
+/// <summary>
+/// The targets of one calibration, sized from the geometry (§6 Dashboard): a near pass of the five
+/// central dots (centre; left, right, top, bottom at a 30 % inset) and a far pass of a 3 × 3 grid at
+/// a 12 % inset, the wide grid being what pins roll and yaw. The eye midpoint sits on the normal
+/// through the dot, so every dot is checked against the camera's view from the prior pose at its
+/// pass distance (<see cref="CameraView.FaceInView(CameraPose, Vec3, double)"/>, with
+/// <see cref="CameraView.LayoutMarginDeg"/>); a dot that would take the face out is moved toward the
+/// camera's axis (vertically first, so it keeps its sideways lever), dots that end within 15 mm of
+/// another in their pass are dropped, and a pass whose every dot is out moves 5 cm further back.
+/// </summary>
+public sealed class CalibLayout
+{
+    public const double NearInset = 0.30;
+    public const double FarInset = 0.12;
+    public const double NearTargetM = 0.40;
+    public const double FarTargetM = 0.70;
+    /// <summary>The far pass is at least this many times the near one (above <see cref="CalibGeometry.MinDistanceRatio"/>, for slack).</summary>
+    public const double FarOverNear = 1.75;
+    public const double StepM = 0.05;
+    public const double MaxDistanceM = 1.20;
+    public const double MinSeparationM = 0.015;
+
+    /// <summary>The default prior (no stored pose): upright, top centre, 8 mm above the panel (u_camera_calib_default_prior).</summary>
+    public static CameraPose DefaultPrior(double heightM) => new(new Vec3(0, heightM / 2 + 0.008, 0), 0, 0, 0, 1);
+
+    private static readonly (string Name, double Fx, double Fy)[] NearIdeal =
+    {
+        ("centre", 0.5, 0.5), ("left", NearInset, 0.5), ("right", 1 - NearInset, 0.5),
+        ("top", 0.5, NearInset), ("bottom", 0.5, 1 - NearInset),
+    };
+
+    private static readonly (string Name, double Fx, double Fy)[] FarIdeal =
+    {
+        ("top left", FarInset, FarInset), ("top", 0.5, FarInset), ("top right", 1 - FarInset, FarInset),
+        ("left", FarInset, 0.5), ("centre", 0.5, 0.5), ("right", 1 - FarInset, 0.5),
+        ("bottom left", FarInset, 1 - FarInset), ("bottom", 0.5, 1 - FarInset), ("bottom right", 1 - FarInset, 1 - FarInset),
+    };
+
+    private CalibLayout(IReadOnlyList<CalibDot> dots, double nearM, double farM, CameraPose prior, string priorSource, CameraView view,
+                        IReadOnlyList<string> notes)
+    {
+        Dots = dots;
+        NearM = nearM;
+        FarM = farM;
+        Prior = prior;
+        PriorSource = priorSource;
+        View = view;
+        Notes = notes;
+    }
+
+    public IReadOnlyList<CalibDot> Dots { get; }
+    /// <summary>The pass distances the prompts ask for (eye to glass, metres).</summary>
+    public double NearM { get; }
+    public double FarM { get; }
+    public CameraPose Prior { get; }
+    public string PriorSource { get; }
+    public CameraView View { get; }
+    /// <summary>What the geometry changed (a dot moved or dropped, a pass moved back), for the log.</summary>
+    public IReadOnlyList<string> Notes { get; }
+
+    public double DistanceM(CalibPass pass) => pass == CalibPass.Near ? NearM : FarM;
+
+    public IReadOnlyList<int> PassIndices(CalibPass pass) => Dots.Where(d => d.Pass == pass).Select(d => d.Index).ToArray();
+
+    /// <summary>The layout for <paramref name="g"/> seen from <paramref name="prior"/> (null: the default prior).</summary>
+    public static CalibLayout Build(CalibGeometry g, CameraPose? prior = null, string? priorSource = null, CameraView? view = null)
+    {
+        var pose = prior ?? DefaultPrior(g.HeightM);
+        string source = prior is null ? "default-prior" : priorSource is { Length: > 0 } s ? s : "hello";
+        var v = view ?? CameraView.Default;
+        var notes = new List<string>();
+        var dots = new List<CalibDot>();
+        double near = PlacePass(g, pose, v, CalibPass.Near, NearIdeal, NearTargetM, dots, notes);
+        double far = PlacePass(g, pose, v, CalibPass.Far, FarIdeal, Math.Max(FarTargetM, FarOverNear * near), dots, notes);
+        return new CalibLayout(dots, near, far, pose, source, v, notes);
+    }
+
+    private static double PlacePass(CalibGeometry g, CameraPose pose, CameraView v, CalibPass pass, (string Name, double Fx, double Fy)[] ideal,
+                                    double z, List<CalibDot> dots, List<string> notes)
+    {
+        string passName = pass == CalibPass.Near ? "near" : "far";
+        double target = z;
+        for (; z <= MaxDistanceM + 1e-9; z += StepM)
+        {
+            var anchor = Anchor(g, pose, z);
+            if (!Fits(v, pose, anchor.X, anchor.Y, z)) continue;
+            if (z > target + 1e-9)
+                notes.Add(string.Format(CultureInfo.InvariantCulture, "{0} pass moved back to {1:0} cm: closer, no target keeps the face in the camera's view",
+                                        passName, z * 100));
+            var kept = new List<(double X, double Y)>();
+            foreach (var (name, fx, fy) in ideal)
+            {
+                var (ix, iy) = g.Metres(new CalibDot(0, name, fx, fy, pass));
+                var (x, y) = Clamp(v, pose, (ix, iy), anchor, z);
+                if (kept.Any(k => Math.Sqrt((k.X - x) * (k.X - x) + (k.Y - y) * (k.Y - y)) < MinSeparationM))
+                {
+                    notes.Add($"{passName} {name}: dropped (moved onto another target)");
+                    continue;
+                }
+                if (Math.Abs(x - ix) > 1e-4 || Math.Abs(y - iy) > 1e-4)
+                    notes.Add(string.Format(CultureInfo.InvariantCulture, "{0} {1}: moved ({2:+0;-0;0}, {3:+0;-0;0}) mm to keep the face in view",
+                                            passName, name, (x - ix) * 1000, (y - iy) * 1000));
+                kept.Add((x, y));
+                var (ffx, ffy) = g.FromMetres(x, y);
+                dots.Add(new CalibDot(dots.Count, name, ffx, ffy, pass));
+            }
+            return z;
+        }
+        // Nothing fits even far back (a camera looking away): lay the ideal targets out, the live guard decides.
+        notes.Add($"{passName} pass: no distance up to {MaxDistanceM * 100:0} cm keeps the face in view from the prior; targets not adjusted");
+        foreach (var (name, fx, fy) in ideal) dots.Add(new CalibDot(dots.Count, name, fx, fy, pass));
+        return target;
+    }
+
+    private static bool Fits(CameraView v, CameraPose pose, double x, double y, double z) =>
+        v.FaceInView(pose, new Vec3(x, y, z), CameraView.LayoutMarginDeg);
+
+    /// <summary>Where the camera's axis meets the pass distance, clamped into the far inset rectangle.</summary>
+    private static (double X, double Y) Anchor(CalibGeometry g, CameraPose pose, double z)
+    {
+        var a = pose.Rotate(new Vec3(0, 0, 1));
+        double fx = pose.T.X, fy = pose.T.Y;
+        if (a.Z > 0.1)
+        {
+            double s = (z - pose.T.Z) / a.Z;
+            fx += s * a.X;
+            fy += s * a.Y;
+        }
+        double hx = (0.5 - FarInset) * g.WidthM, hy = (0.5 - FarInset) * g.HeightM;
+        return (Math.Clamp(fx, -hx, hx), Math.Clamp(fy, -hy, hy));
+    }
+
+    /// <summary>
+    /// The ideal point if the face fits there, else the fitting point nearest it along the vertical
+    /// toward the anchor's height, else along the line to the anchor. The fitting set is convex
+    /// (linear constraints in the eye position), so bisection finds its edge.
+    /// </summary>
+    private static (double X, double Y) Clamp(CameraView v, CameraPose pose, (double X, double Y) ideal, (double X, double Y) anchor, double z)
+    {
+        if (Fits(v, pose, ideal.X, ideal.Y, z)) return ideal;
+        var to = (ideal.X, anchor.Y);
+        if (!Fits(v, pose, to.X, to.Y, z)) to = anchor;
+        double lo = 0, hi = 1; // lo: out, hi: in
+        for (int i = 0; i < 40; i++)
+        {
+            double m = (lo + hi) / 2;
+            if (Fits(v, pose, ideal.X + (to.X - ideal.X) * m, ideal.Y + (to.Y - ideal.Y) * m, z)) hi = m;
+            else lo = m;
+        }
+        return (ideal.X + (to.X - ideal.X) * hi, ideal.Y + (to.Y - ideal.Y) * hi);
+    }
+
+    /// <summary>One log line: the prior, the distances and every target in millimetres.</summary>
+    public string Describe(CalibGeometry g)
+    {
+        var ci = CultureInfo.InvariantCulture;
+        var parts = Dots.Select(d =>
+        {
+            var (x, y) = g.Metres(d);
+            return string.Format(ci, "{0} ({1:0}, {2:0})", d.Label, x * 1000, y * 1000);
+        });
+        return string.Format(ci, "layout: prior {0} T ({1:0.0}, {2:0.0}, {3:0.0}) mm, view {4:0}° H at {5:0.00}; near {6:0} cm, far {7:0} cm; {8}",
+                             PriorSource, Prior.T.X * 1000, Prior.T.Y * 1000, Prior.T.Z * 1000, View.HfovDeg, View.Aspect,
+                             NearM * 100, FarM * 100, string.Join("; ", parts))
+               + (Notes.Count > 0 ? " | " + string.Join("; ", Notes) : "");
     }
 }
 
@@ -232,7 +425,12 @@ public abstract record CalibLine;
 
 /// <summary>The watch's first line: which provider and camera, and the display it measures in.</summary>
 public sealed record CalibHello(string Screen, string Provider, string Source, string CameraKey, bool TracksCameraSpace,
-                                string ViewerSource, string ViewerReason, CalibHelloDisplay? Display, string Note) : CalibLine;
+                                string ViewerSource, string ViewerReason, CalibHelloDisplay? Display, string Note) : CalibLine
+{
+    /// <summary>The camera's current pose answer (<c>hello.camera_pose</c>; null from an older CLI): the layout's prior.</summary>
+    public CameraPose? CameraPose { get; init; }
+    public string CameraPoseSource { get; init; } = "";
+}
 
 /// <summary>One pushed sample. <see cref="Raw"/> is the line verbatim: what the solve input records.</summary>
 public sealed record CalibSample(long Seq, long CaptureNs, bool Tracking, double Confidence, Vec3? LeftEye, Vec3? RightEye,
@@ -263,8 +461,20 @@ public static class CalibLineParser
                 CalibHelloDisplay? d = r.Obj("display") is { } dd
                     ? new CalibHelloDisplay(dd.Num("width_m"), dd.Num("height_m"), dd.Long("pixel_width"), dd.Long("pixel_height"))
                     : null;
+                CameraPose? pose = null;
+                if (r.Obj("camera_pose") is { } cp)
+                {
+                    var pt = cp.Arr("t_m").Select(x => x.ValueKind == JsonValueKind.Number ? x.GetDouble() : double.NaN).ToArray();
+                    var pq = cp.Arr("q").Select(x => x.ValueKind == JsonValueKind.Number ? x.GetDouble() : double.NaN).ToArray();
+                    if (pt.Length == 3 && pq.Length == 4 && pt.Concat(pq).All(double.IsFinite) && pq.Sum(x => x * x) > 0.5)
+                        pose = new CameraPose(new Vec3(pt[0], pt[1], pt[2]), pq[0], pq[1], pq[2], pq[3]);
+                }
                 return new CalibHello(r.Str("screen"), r.Str("provider"), r.Str("source"), r.Str("camera_key"),
-                                      r.Bool("tracks_camera_space"), r.Str("viewer_source"), r.Str("viewer_reason"), d, r.Str("note"));
+                                      r.Bool("tracks_camera_space"), r.Str("viewer_source"), r.Str("viewer_reason"), d, r.Str("note"))
+                {
+                    CameraPose = pose,
+                    CameraPoseSource = pose is null ? "" : r.Obj("camera_pose") is { } cs ? cs.Str("source") : "",
+                };
             case "sample":
                 var disp = r.Obj("display");
                 return new CalibSample(r.Long("seq"), r.Long("capture_ns"), r.Bool("tracking"), r.Num("confidence"),
@@ -323,6 +533,9 @@ public sealed record CameraPose(Vec3 T, double Qx, double Qy, double Qz, double 
         var t = 2.0 * q.Cross(v);
         return v + Qw * t + q.Cross(t);
     }
+
+    /// <summary>A display-space point into the camera frame: Rᵀ · (p − T).</summary>
+    public Vec3 ToCamera(Vec3 displayPoint) => new CameraPose(T, -Qx, -Qy, -Qz, Qw).Rotate(displayPoint - T);
 
     public CameraPose Nudged(double dxM, double dyM) => this with { T = new Vec3(T.X + dxM, T.Y + dyM, T.Z) };
 

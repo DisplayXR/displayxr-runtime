@@ -392,7 +392,7 @@ parameters only. The residual is the in-plane distance between the fitted eye po
 |---|---|---|---|
 | `a` | `R = I`: `T_x, T_y` | 2 samples at 2 distinct dots | closed form: each sample is a line through `D_i` along `xy(u_i)`; `T` is their least-squares meet |
 | `b` | + pitch (`R = Rx(θ)`) | 3 samples; two head distances to condition θ | Levenberg–Marquardt from (a) |
-| `c` | full `R` (rotation vector) + `T_x, T_y`, optional focal scale `k` | 7 samples at 3 distinct dots, at two head distances (the Dashboard: 5 dots × near / far = 10) | LM from (b) |
+| `c` | full `R` (rotation vector) + `T_x, T_y`, optional focal scale `k` | 7 samples at 3 distinct dots, at two head distances (the Dashboard: a near and a far pass, sized from the geometry) | LM from (b) |
 
 `k` = the camera's true focal length / the one its directions were computed with; the corrected
 direction is `normalize(u_x, u_y, k·u_z)`. The reported angles follow
@@ -435,18 +435,47 @@ authoritative.
 
 **Dashboard.** Components → Tracking providers → **Calibrate camera…** on a provider-served screen
 opens the calibration window (`src/dashboard/README.md` § *Camera calibration window*): full screen on
-that screen, the five dots of design §10 (centre; left, right, top, bottom at a 30 % inset) aligned
-twice — a **near pass** (leaning in, about 35 cm) then a **far pass** (sitting back, about 65 cm).
-Capture on Space once the eye midpoint has been still for 0.5 s. Before solving, the far pass's mean
-estimated eye distance must be ≥ 1.5× the near pass's (the iris estimate's per-user scale cancels in
-the ratio; a provider without distance estimates skips the check), else the far pass is retaken.
-`solve` with mode `c` (no `--focal`) and `--reject-mm 5`; only if that is refused as `degenerate`
-does it re-solve with mode `b` and say so on the result. Then retake of the flagged samples, the
-live-check dot (computed client-side from the camera block through the solved pose and iris scale)
-checked near **and** far, with 1 mm arrow-key nudges, then `apply`. The last solve's input is kept
-(overwritten each time) at `<LocalApplicationData>/DisplayXR/calibration-last-solve.json` beside
-`dashboard.log`, which records each solve's pose (T, pitch / yaw / roll, focal and iris scale, RMS,
-mode, sample count) — so a run can be re-solved with `calibrate solve --in` afterwards.
+that screen, two passes of targets — a **near pass** (about 40 cm) and a **far pass** (about 70 cm,
+at least 1.75× the near distance).
+
+- **Layout from the geometry** (`CalibLayout`). The eye midpoint sits on the normal through the
+  dot, so a dot is only usable where the face stays inside the camera's view at that distance. Ideal
+  targets: near — the five central dots (centre; left, right, top, bottom at a 30 % inset); far — a
+  3 × 3 grid at a 12 % inset, whose wider lever is what pins roll and yaw. Each is checked from the
+  **prior pose** — the watch `hello`'s `camera_pose` (the camera's current answer: user calibration,
+  placement hint or the default prior `T = (0, H/2 + 8 mm, 0)`, `R = I`) — against the camera's
+  view: no provider reports a field of view yet, so a conservative **60° horizontal at 16:9**
+  (18° half-height). "In view" means the eye midpoint and the face around it — 70 mm up to the
+  forehead, 70 mm down to the mouth, 75 mm to each side — inside the view less a **2° margin**. (The
+  chin is not required: a laptop camera tracked a near-pass eye midpoint 19° below its axis at
+  42 cm, with the chin ~31° below, and with the chin required no target on a laptop screen fits at
+  40 cm under the conservative view.) A dot that does not fit moves toward the camera's axis —
+  vertically first, so it keeps its sideways lever; dots that end within 15 mm of another in their
+  pass are dropped; a pass where nothing fits moves back in 5 cm steps. On a laptop (0.30 × 0.20 m,
+  camera 106 mm above centre) that gives a near pass of three dots at +61 mm (centre, left, right;
+  top and bottom merge into them) and the far grid with its bottom row moved up to −25 mm: 12
+  targets. The layout and every adjustment go to `dashboard.log`.
+- **Live guard.** While aligning, a sample without a face lock, or whose measured face (the same
+  box, around the camera-space eye midpoint, at the view's edge with no margin) leaves the assumed
+  view, shows "move so your face stays in the camera's view" and holds the capture until it clears.
+  The view is an assumption, so a second Space captures anyway.
+- **Distance check.** Before solving, the far pass's mean estimated eye distance must be ≥ 1.5× the
+  near pass's (the iris estimate's per-user scale cancels in the ratio; a provider without distance
+  estimates skips the check), else the far pass is retaken.
+- **Solve** with mode `c` (no `--focal`) and `--reject-mm 5`; only if that is refused as
+  `degenerate` does it re-solve with mode `b` and say so on the result. Then retake of the flagged
+  samples, the live-check dot (computed client-side from the camera block through the solved pose
+  and iris scale) checked near **and** far, with 1 mm arrow-key nudges, then `apply`. The last
+  solve's input is kept (overwritten each time) at
+  `<LocalApplicationData>/DisplayXR/calibration-last-solve.json` beside `dashboard.log`, which
+  records each solve's pose (T, pitch / yaw / roll, focal and iris scale, RMS, mode, sample count) —
+  so a run can be re-solved with `calibrate solve --in` afterwards.
+- **What the layout buys** (simulation, the live laptop pose T (4.2, 98.1) mm, roll −2.1°; 0.2°
+  direction and 2 mm alignment noise; median over 300 seeds): the 5 + 5 layout at 40 / 70 cm,
+  |ΔT| 6.9 mm, pitch 0.55°, yaw 0.19°, **roll 1.00°**; the clamped 3 + 3 × 3 layout, |ΔT| 5.6 mm,
+  pitch 0.27°, yaw 0.33°, **roll 0.44°**. With one sample 15 mm off its normal, fits more than
+  15 mm out (or refused) drop from 90 to 39 of 300. The near pass being a single row is its cost:
+  an outlier there is harder to reject than one in the far grid.
 
 **CLI** (the Dashboard drives these; it links no runtime code, ADR-051 D4):
 
@@ -469,7 +498,8 @@ displayxr-cli tracking calibrate apply --screen <key> --camera <key> --pose tx,t
 ```json
 {"type":"hello","screen":"<key>","provider":"sim-tracking","source":"scripted sweep (simulated webcam)",
  "camera_key":"sim-tracking:webcam0","tracks_camera_space":true,"viewer_source":"provider:sim-tracking",
- "viewer_reason":"","display":{"width_m":0.60,"height_m":0.34,"pixel_width":3840,"pixel_height":2160},"note":"..."}
+ "viewer_reason":"","display":{"width_m":0.60,"height_m":0.34,"pixel_width":3840,"pixel_height":2160},
+ "camera_pose":{"t_m":[0,0.178,0],"q":[0,0,0,1],"source":"default-prior"},"note":"..."}
 {"type":"sample","seq":12,"capture_ns":270407621817000,"tracking":true,"confidence":1,
  "display":{"left_eye":[x,y,z],"right_eye":[x,y,z]},
  "camera":{"key":"sim-tracking:webcam0","left_dir":[x,y,z],"left_distance_m":0.60,"right_dir":[x,y,z],"right_distance_m":0.60}}
@@ -477,7 +507,10 @@ displayxr-cli tracking calibrate apply --screen <key> --camera <key> --pose tx,t
 ```
 
   `camera` is `null` on a sample without the camera-space block; `display` in `hello` is `null`
-  when the display info could not be read.
+  when the display info could not be read. `hello.camera_pose` is the camera's current pose answer
+  for (`camera_key`, `--screen`) — what the runtime would hand the provider: display-declared >
+  user calibration > placement hint > default prior, `source` naming which — and the Dashboard's
+  layout prior; `null` when no camera key or no panel size.
 - **Solve** input: an array of pairs, or `{"mode","eye","camera_key","screen","samples":[...]}`
   (flags override the file). A pair is `{"dot_m":[x,y], "sample": <a watch sample line>}` (the
   Dashboard records the line it captured on Space), or `"sample": <its camera object>`, or an

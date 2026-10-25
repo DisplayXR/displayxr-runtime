@@ -15,12 +15,14 @@ namespace DisplayXR.Dashboard.Tests;
 /// Fixtures, captured from this branch's <c>displayxr-cli</c> (macOS, sim-tracking with
 /// <c>CAMERA=1</c>, <c>SCRIPT=offset</c>, hidden <c>CAMERA_TRUE_POSE</c> = (35, 183, 0) mm + 9° pitch,
 /// <c>CAMERA_DEPTH_BIAS=1.08</c>; screen key and store path neutralised):
-/// - <c>calibrate-watch.ndjson</c>: the hello, then one sample per Dashboard target (centre, left,
-///   right, top, bottom at 40 cm — the near pass; the same five at 70 cm — the far pass), each with
-///   the eye midpoint on that dot's normal (<c>SCRIPT=offset</c>, one <c>--count 1</c> watch per target);
+/// - <c>calibrate-watch.ndjson</c>: the hello (with <c>camera_pose</c>: the default prior, no store),
+///   then one sample per target of the layout <see cref="CalibLayout.Build"/> makes for it — near pass
+///   at 40 cm: centre, left, right, moved up to 61 mm (top / bottom merged into them); far pass at
+///   70 cm: the 3 × 3 grid at a 12 % inset, bottom row moved up to −25 mm — each with the eye
+///   midpoint on that dot's normal (<c>SCRIPT=offset</c>, one <c>--count 1</c> watch per target);
 /// - <c>calibrate-solve-input.json</c>: the pairs the CLI solved; <c>calibrate-solve-ok.json</c> its
-///   mode <c>c</c> result with <c>--reject-mm 5</c>; <c>-rejected</c>: the near left sample taken 15 mm
-///   off its normal; <c>-highrms</c>: 35 mm off, without rejection (RMS 7.9 mm);
+///   mode <c>c</c> result with <c>--reject-mm 5</c>; <c>-rejected</c>: the far left sample taken 15 mm
+///   off its normal; <c>-highrms</c>: 35 mm off, without rejection (RMS 7.2 mm);
 ///   <c>-c-degenerate</c>: mode <c>c</c> on the five dots twice at one distance (55 cm, rank 3 of 5);
 ///   <c>-b-ok</c>: an earlier mode <c>b</c> result (six samples, 55 and 75 cm); <c>-degenerate</c>:
 ///   mode <c>b</c> on three samples at one dot; <c>calibrate-apply.json</c>: <c>calibrate apply --json</c>;
@@ -82,7 +84,10 @@ public class CalibrationTests
         Assert.Equal(0.30121409893035889, h.Display.WidthM, 12);
 
         var smp = Watch.Skip(1).Select(CalibLineParser.Parse).Cast<CalibSample>().ToArray();
-        Assert.Equal(10, smp.Length);
+        Assert.Equal(12, smp.Length);
+        Assert.Equal(0.1058149026632309, h.CameraPose!.T.Y, 12);
+        Assert.Equal(1.0, h.CameraPose.Qw);
+        Assert.Equal("default-prior", h.CameraPoseSource);
         Assert.All(smp, x => Assert.True(x.Usable));
         Assert.Equal("sim-tracking:webcam0", smp[0].Camera!.Key);
         Assert.NotNull(smp[0].LeftEye);
@@ -136,25 +141,82 @@ public class CalibrationTests
 
     // --- dot geometry ---------------------------------------------------------------------
 
+    private static CalibDot Dot(double fx, double fy) => new(0, "t", fx, fy, CalibPass.Near);
+
+    private static readonly CalibGeometry Laptop = new(3024, 1964, 0.30121409893035889, 0.19562980532646179, "test");
+
+    private static string[] Labels(CalibLayout l) => l.Dots.Select(d => d.Label).ToArray();
+
     [Fact]
-    public void Dots_AreCentre_FourAt30PercentInset_NearThenFar()
+    public void Layout_Laptop_DefaultPrior_NearDotsMoveUp_FarGridBottomRowMovesUp()
     {
-        var d = CalibGeometry.Dots;
-        Assert.Equal(10, d.Count);
-        for (int p = 0; p < 2; p++)
-        {
-            int o = p * CalibGeometry.DotsPerPass;
-            Assert.Equal((0.5, 0.5), (d[o].Fx, d[o].Fy));
-            Assert.Equal((0.3, 0.5), (d[o + 1].Fx, d[o + 1].Fy));
-            Assert.Equal((0.7, 0.5), (d[o + 2].Fx, d[o + 2].Fy));
-            Assert.Equal((0.5, 0.3), (d[o + 3].Fx, d[o + 3].Fy));
-            Assert.Equal((0.5, 0.7), (d[o + 4].Fx, d[o + 4].Fy));
-            Assert.All(d.Skip(o).Take(CalibGeometry.DotsPerPass), x => Assert.Equal(p == 0 ? CalibPass.Near : CalibPass.Far, x.Pass));
-        }
-        Assert.Equal(Enumerable.Range(0, 10), d.Select(x => x.Index));
-        Assert.Equal("left, near", d[1].Label);
-        Assert.Equal("left, far", d[6].Label);
-        Assert.Equal(new[] { 5, 6, 7, 8, 9 }, CalibGeometry.PassIndices(CalibPass.Far));
+        var l = CalibLayout.Build(Laptop);
+        Assert.Equal("default-prior", l.PriorSource);
+        Assert.Equal(0.40, l.NearM, 9);
+        Assert.Equal(0.70, l.FarM, 9);
+        Assert.Equal(new[] { "centre, near", "left, near", "right, near",
+                             "top left, far", "top, far", "top right, far", "left, far", "centre, far", "right, far",
+                             "bottom left, far", "bottom, far", "bottom right, far" }, Labels(l));
+        Assert.Equal(Enumerable.Range(0, 12), l.Dots.Select(d => d.Index));
+        Assert.Equal(new[] { 0, 1, 2 }, l.PassIndices(CalibPass.Near));
+        // Near: the eyes 40 cm out would put the mouth below the view under the camera: up to 61 mm.
+        foreach (var i in l.PassIndices(CalibPass.Near)) Assert.Equal(0.0612, Laptop.Metres(l.Dots[i]).Y, 3);
+        Assert.Equal(-0.0603, Laptop.Metres(l.Dots[1]).X, 4); // keeps its sideways lever
+        // Far: the top and middle rows as laid out, the bottom row moved up to -25 mm.
+        Assert.Equal(-0.1144, Laptop.Metres(l.Dots[3]).X, 4);
+        Assert.Equal(0.0743, Laptop.Metres(l.Dots[3]).Y, 4);
+        Assert.Equal(-0.0248, Laptop.Metres(l.Dots[11]).Y, 4);
+        Assert.Contains(l.Notes, n => n.StartsWith("near top: dropped"));
+        Assert.Contains("near centre: moved (0, +61) mm to keep the face in view", l.Notes);
+        Assert.Contains("far bottom right: moved (0, +50) mm to keep the face in view", l.Notes);
+        Assert.Equal(8, l.Notes.Count);
+        Assert.StartsWith("layout: prior default-prior T (0.0, 105.8, 0.0) mm, view 60° H at 0.56; near 40 cm, far 70 cm; centre, near (0, 61)",
+                          l.Describe(Laptop));
+    }
+
+    [Fact]
+    public void Layout_EveryTarget_KeepsTheFaceInView_FromThePrior()
+    {
+        var monitor = new CalibGeometry(3840, 2160, 0.60, 0.3375, "test");
+        foreach (var g in new[] { Laptop, monitor })
+            foreach (var view in new[] { CameraView.Default, new CameraView(78, 9.0 / 16) })
+            {
+                var l = CalibLayout.Build(g, null, null, view);
+                Assert.DoesNotContain(l.Notes, n => n.Contains("not adjusted"));
+                foreach (var d in l.Dots)
+                {
+                    var (x, y) = g.Metres(d);
+                    // Pixel snapping moves a dot by under a pixel; the 2° layout margin absorbs it.
+                    Assert.True(view.FaceInView(l.Prior, new Vec3(x, y, l.DistanceM(d.Pass)), CameraView.LayoutMarginDeg - 0.1), $"{g.WidthM} {view.HfovDeg}: {d.Label}");
+                }
+                Assert.True(l.FarM >= CalibGeometry.MinDistanceRatio * l.NearM);
+            }
+    }
+
+    [Fact]
+    public void Layout_WideView_KeepsTheIdealTargets()
+    {
+        var l = CalibLayout.Build(Laptop, null, null, new CameraView(120, 0.75));
+        Assert.Empty(l.Notes);
+        Assert.Equal(14, l.Dots.Count);
+        Assert.Equal(Laptop.Pixel(Dot(0.3, 0.5)), Laptop.Pixel(l.Dots[1]));
+        Assert.Equal(Laptop.Pixel(Dot(0.12, 0.12)), Laptop.Pixel(l.Dots[5]));
+    }
+
+    [Fact]
+    public void Layout_FollowsThePrior_AndMovesAPassBackWhenNothingFits()
+    {
+        // A stored pose 50 mm to the right: the far grid stays (it fits), the near dots stay centred on the screen.
+        var right = new CameraPose(new Vec3(0.05, 0.106, 0), 0, 0, 0, 1);
+        var l = CalibLayout.Build(Laptop, right, "user-calibration");
+        Assert.Equal("user-calibration", l.PriorSource);
+        Assert.Equal(12, l.Dots.Count);
+        // A camera 300 mm above the screen centre: nothing fits at 40 cm, the near pass moves back.
+        var high = new CameraPose(new Vec3(0, 0.30, 0), 0, 0, 0, 1);
+        var h = CalibLayout.Build(Laptop, high);
+        Assert.True(h.NearM > CalibLayout.NearTargetM);
+        Assert.Contains(h.Notes, n => n.StartsWith("near pass moved back to"));
+        Assert.True(h.FarM >= CalibLayout.FarOverNear * h.NearM - 1e-9);
     }
 
     [Fact]
@@ -162,17 +224,17 @@ public class CalibrationTests
     {
         var g = new CalibGeometry(3840, 2160, 0.60, 0.3375, "test");
         // left: pixel 1152 -> (1152 - 1920) * 0.60/3840 = -0.12
-        var (lx, ly) = g.Metres(CalibGeometry.Dots[1]);
+        var (lx, ly) = g.Metres(Dot(0.3, 0.5));
         Assert.Equal(-0.12, lx, 9);
         Assert.Equal(0, ly, 9);
         // top: pixel y 648 -> (1080 - 648) * 0.3375/2160 = +0.0675 (y up)
-        var (tx, ty) = g.Metres(CalibGeometry.Dots[3]);
+        var (tx, ty) = g.Metres(Dot(0.5, 0.3));
         Assert.Equal(0, tx, 9);
         Assert.Equal(0.0675, ty, 9);
-        var (bx, by) = g.Metres(CalibGeometry.Dots[4]);
+        var (bx, by) = g.Metres(Dot(0.5, 0.7));
         Assert.Equal(-0.0675, by, 9);
         // centre
-        Assert.Equal((0.0, 0.0), g.Metres(CalibGeometry.Dots[0]));
+        Assert.Equal((0.0, 0.0), g.Metres(Dot(0.5, 0.5)));
         // the inverse (the live-check dot) lands back on the dot's fraction
         Assert.Equal((0.3, 0.5), g.FromMetres(-0.12, 0));
         Assert.Equal((0.5, 0.3), g.FromMetres(0, 0.0675));
@@ -182,11 +244,11 @@ public class CalibrationTests
     public void DotPixels_AreWhole_AndTheMetresFollowTheRoundedPixel()
     {
         var g = new CalibGeometry(3024, 1964, 0.30121409893035889, 0.19562980532646179, "test");
-        Assert.Equal((907L, 982L), g.Pixel(CalibGeometry.Dots[1]));
-        Assert.Equal((1512L, 589L), g.Pixel(CalibGeometry.Dots[3]));
-        var (x, _) = g.Metres(CalibGeometry.Dots[1]);
+        Assert.Equal((907L, 982L), g.Pixel(Dot(0.3, 0.5)));
+        Assert.Equal((1512L, 589L), g.Pixel(Dot(0.5, 0.3)));
+        var (x, _) = g.Metres(Dot(0.3, 0.5));
         Assert.Equal(-605 * 0.30121409893035889 / 3024, x, 12);
-        Assert.Equal(907.0 / 3024, g.Fraction(CalibGeometry.Dots[1]).Fx, 12);
+        Assert.Equal(907.0 / 3024, g.Fraction(Dot(0.3, 0.5)).Fx, 12);
     }
 
     [Fact]
@@ -269,7 +331,7 @@ public class CalibrationTests
         var s = Started();
         Assert.Equal(CalibPhase.Aligning, s.Phase);
         Assert.Equal("centre", s.CurrentDot!.Name);
-        Assert.Equal(CalibrationSession.NearPrompt + CalibrationSession.AlignPrompt, s.Prompt);
+        Assert.Equal(CalibrationSession.NearPrompt(0.40) + CalibrationSession.AlignPrompt, s.Prompt);
         s.OnLine(At(Watch[1], 1_000_000_000));
         s.Space();
         Assert.True(s.Armed);
@@ -278,6 +340,62 @@ public class CalibrationTests
         Assert.Equal(1, s.CapturedCount);
         Assert.False(s.Armed);
         Assert.Equal("left", s.CurrentDot!.Name);
+    }
+
+    /// <summary>The sample line with its eyes turned <paramref name="deg"/> further down in the camera (about the camera X axis).</summary>
+    private static string TurnedDown(string line, double deg)
+    {
+        var o = JsonNode.Parse(line)!.AsObject();
+        double a = deg * Math.PI / 180;
+        var cam = o["camera"]!.AsObject();
+        foreach (var k in new[] { "left_dir", "right_dir" })
+        {
+            var d = cam[k]!.AsArray();
+            double y = d[1]!.GetValue<double>(), z = d[2]!.GetValue<double>();
+            cam[k] = new JsonArray(d[0]!.GetValue<double>(), y * Math.Cos(a) - z * Math.Sin(a), y * Math.Sin(a) + z * Math.Cos(a));
+        }
+        return o.ToJsonString();
+    }
+
+    [Fact]
+    public void Guard_FaceAtTheEdgeOfTheView_HoldsTheCapture_SpaceAgainOverrides()
+    {
+        var s = Started();
+        Assert.Null(s.ViewWarning);
+        s.OnLine(At(Watch[1], 1_000_000_000));
+        Assert.Null(s.ViewWarning); // the fixture targets keep the face in view
+        string edge = TurnedDown(Watch[1], 15);
+        s.OnLine(At(edge, 1_100_000_000));
+        Assert.Equal(CalibrationSession.OutOfViewWarning, s.ViewWarning);
+        Assert.Contains("face near the edge of the camera's view", s.Status);
+        s.Space();
+        Assert.True(s.Armed);
+        s.OnLine(At(edge, 1_800_000_000));
+        Assert.True(s.Stable);
+        Assert.Equal(0, s.CapturedCount); // held while warned
+        // Back in view: the armed capture goes through.
+        s.OnLine(At(Watch[1], 1_900_000_000));
+        s.OnLine(At(Watch[1], 2_500_000_000));
+        Assert.Equal(1, s.CapturedCount);
+
+        // A second Space while warned captures anyway.
+        s.OnLine(At(TurnedDown(Watch[2], 15), 3_000_000_000));
+        s.OnLine(At(TurnedDown(Watch[2], 15), 3_600_000_000));
+        s.Space();
+        Assert.Equal(1, s.CapturedCount);
+        s.Space();
+        Assert.Equal(2, s.CapturedCount);
+    }
+
+    [Fact]
+    public void Guard_NoFaceLock_SaysSo_AndNeverCaptures()
+    {
+        var s = Started();
+        s.OnLine("{\"type\":\"sample\",\"seq\":9,\"capture_ns\":2000000000,\"tracking\":false,\"camera\":null}");
+        Assert.Equal(CalibrationSession.NoLockWarning, s.ViewWarning);
+        s.Space();
+        s.Space();
+        Assert.Equal(0, s.CapturedCount);
     }
 
     [Fact]
@@ -296,15 +414,15 @@ public class CalibrationTests
     public void SecondPass_PromptsSittingBack()
     {
         var s = Started();
-        Assert.StartsWith("Near pass: lean in to about 35 cm", s.Prompt);
+        Assert.StartsWith("Near pass: lean in to about 40 cm", s.Prompt);
         long t = 1_000_000_000;
-        foreach (var line in Watch.Skip(1).Take(5)) CaptureSample(s, line, ref t);
+        foreach (var line in Watch.Skip(1).Take(3)) CaptureSample(s, line, ref t);
         Assert.Equal(CalibPass.Far, s.CurrentDot!.Pass);
-        Assert.Equal("centre", s.CurrentDot.Name);
-        Assert.StartsWith("Far pass: sit back to about 65 cm", s.Prompt);
-        Assert.Contains("Target 6 of 10: centre, far", s.Status);
+        Assert.Equal("top left", s.CurrentDot.Name);
+        Assert.StartsWith("Far pass: sit back to about 70 cm", s.Prompt);
+        Assert.Contains("Target 4 of 12: top left, far", s.Status);
         // The camera-to-eye distance (the camera sits 186 mm from the screen centre), with the 1.08 depth bias.
-        Assert.InRange(s.PassDistanceM(CalibPass.Near)!.Value / 1.08, 0.44, 0.45);
+        Assert.InRange(s.PassDistanceM(CalibPass.Near)!.Value / 1.08, 0.42, 0.44);
         Assert.Null(s.PassDistanceM(CalibPass.Far));
     }
 
@@ -314,16 +432,16 @@ public class CalibrationTests
         var s = Started();
         long t = 1_000_000_000;
         // The "far" pass taken at the near distance.
-        foreach (var line in Watch.Skip(1).Take(5).Concat(Watch.Skip(1).Take(5))) CaptureSample(s, line, ref t);
+        foreach (var line in Watch.Skip(1).Take(3).Concat(Enumerable.Repeat(Watch[1], 9))) CaptureSample(s, line, ref t);
         Assert.Equal(CalibPhase.Aligning, s.Phase);
         Assert.Null(s.TakeRequest());
-        Assert.Equal(5, s.CapturedCount);
+        Assert.Equal(3, s.CapturedCount);
         Assert.Equal(CalibPass.Far, s.CurrentDot!.Pass);
-        Assert.Equal("centre", s.CurrentDot.Name);
+        Assert.Equal("top left", s.CurrentDot.Name);
         Assert.Contains("Sit further back and retake the far pass", s.Error);
-        Assert.Contains("near about 48 cm, far about 48 cm", s.Error);
+        Assert.Contains("near about 46 cm, far about 45 cm", s.Error);
         // Now really far: the solve runs, and the warning is gone.
-        foreach (var line in Watch.Skip(6)) CaptureSample(s, line, ref t);
+        foreach (var line in Watch.Skip(4)) CaptureSample(s, line, ref t);
         Assert.Equal(CalibPhase.Solving, s.Phase);
         Assert.Null(s.Error);
         Assert.NotNull(s.TakeRequest());
@@ -342,13 +460,13 @@ public class CalibrationTests
         }
         var s = Started();
         long t = 1_000_000_000;
-        foreach (var line in Watch.Skip(1).Take(5).Concat(Watch.Skip(1).Take(5))) CaptureSample(s, NoDistance(line), ref t);
+        foreach (var line in Watch.Skip(1).Take(3).Concat(Enumerable.Repeat(Watch[1], 9))) CaptureSample(s, NoDistance(line), ref t);
         Assert.Null(s.PassDistanceM(CalibPass.Near));
         Assert.Equal(CalibPhase.Solving, s.Phase);
     }
 
     [Fact]
-    public void TenCaptures_RequestAModeCSolve_WithTheCliShapedInput()
+    public void AllCaptures_RequestAModeCSolve_WithTheCliShapedInput()
     {
         var s = Captured();
         Assert.Equal(CalibPhase.Solving, s.Phase);
@@ -434,8 +552,8 @@ public class CalibrationTests
         Assert.Equal(0.0, r.YawDeg, 3);
         Assert.Equal(0.0, r.RollDeg, 3);
         Assert.Equal(1 / 1.08, r.IrisScale, 5);
-        Assert.Equal(10, r.Samples.Count);
-        Assert.Equal(5, r.DistinctDots);
+        Assert.Equal(12, r.Samples.Count);
+        Assert.Equal(12, r.DistinctDots);
         Assert.All(r.Samples, x => Assert.True(x.ResidualMm < 0.01));
         Assert.False(r.HighRms);
         Assert.Empty(r.Flagged);
@@ -451,7 +569,7 @@ public class CalibrationTests
         Assert.Contains("roll", d);
         Assert.Contains("focal scale 1.0000, iris scale 0.9259", d);
         Assert.Contains("RMS 0.00 mm", d);
-        Assert.Contains("10/10 samples, 5 dots", d);
+        Assert.Contains("12/12 samples, 12 dots", d);
         Assert.True(SolveResult.TryParse(TestData.Text("calibrate-solve-c-degenerate.json"), out var refused));
         Assert.StartsWith("solve refused: mode c, 10 samples, status degenerate: the samples constrain only 3 of the 5", CalibrationCommands.Describe(refused!));
     }
@@ -500,15 +618,15 @@ public class CalibrationTests
         s.TakeRequest();
         s.SolveFinished(true, 0, TestData.Text("calibrate-solve-rejected.json"), "");
         Assert.Equal(CalibPhase.Review, s.Phase);
-        Assert.Equal(new[] { 1 }, s.Solve!.Flagged);
-        Assert.True(s.Solve.Samples[1].Rejected);
+        Assert.Equal(new[] { 6 }, s.Solve!.Flagged);
+        Assert.True(s.Solve.Samples[6].Rejected);
         Assert.False(s.Solve.HighRms);
         s.RetakeFlagged();
         Assert.Equal(CalibPhase.Aligning, s.Phase);
-        Assert.Equal("left, near", s.CurrentDot!.Label);
-        Assert.Equal(9, s.CapturedCount);
+        Assert.Equal("left, far", s.CurrentDot!.Label);
+        Assert.Equal(11, s.CapturedCount);
         long t = 9_000_000_000;
-        CaptureSample(s, Watch[2], ref t);
+        CaptureSample(s, Watch[7], ref t);
         Assert.Equal(CalibPhase.Solving, s.Phase);
         Assert.NotNull(s.TakeRequest());
     }
@@ -521,7 +639,7 @@ public class CalibrationTests
         Assert.True(r.HighRms);
         Assert.True(r.RmsMm > 5);
         Assert.Equal(r.Samples.Where(x => x.ResidualMm > 5).Select(x => x.Index), r.Flagged);
-        Assert.Contains(1, r.Flagged);
+        Assert.Contains(6, r.Flagged);
 
         var s = Captured();
         s.TakeRequest();
@@ -575,11 +693,11 @@ public class CalibrationTests
         s.Space();
         Assert.Equal(CalibPhase.LiveCheck, s.Phase);
         var g = s.Geometry!;
-        for (int i = 0; i < 10; i++)
+        for (int i = 0; i < 12; i++)
         {
             s.OnLine(Watch[1 + i]);
             var (fx, fy) = s.LiveFoot!.Value;
-            var (dx, dy) = g.Fraction(CalibGeometry.Dots[i]);
+            var (dx, dy) = g.Fraction(s.Layout!.Dots[i]);
             // within 0.1 mm of the target
             Assert.True(Math.Abs((fx - dx) * g.WidthM) < 1e-4, $"dot {i} x: {(fx - dx) * g.WidthM * 1000:0.000} mm");
             Assert.True(Math.Abs((fy - dy) * g.HeightM) < 1e-4, $"dot {i} y: {(fy - dy) * g.HeightM * 1000:0.000} mm");
@@ -587,7 +705,7 @@ public class CalibrationTests
         // the depth uses the iris scale: the near centre sample at 40 cm, the far one at 70 cm
         s.OnLine(Watch[1]);
         Assert.Equal(0.40, s.LivePoint!.Value.Z, 3);
-        s.OnLine(Watch[6]);
+        s.OnLine(Watch[8]);
         Assert.Equal(0.70, s.LivePoint!.Value.Z, 3);
         Assert.Contains("near AND far", s.Prompt);
     }
@@ -615,8 +733,8 @@ public class CalibrationTests
         var req = s.TakeRequest()!;
         Assert.False(req.IsSolve);
         Assert.Equal(new CliArgs("tracking", "calibrate", "apply", "--screen", Key, "--camera", "sim-tracking:webcam0", "--pose",
-                                 "0.037000,0.182000,0.000000,0.078459,-0.000000,0.000000,0.996917", "--provider", "sim-tracking",
-                                 "--rms-mm", "0.000", "--samples", "10", "--mode", "c",
+                                 "0.037000,0.182000,0.000000,0.078459,-0.000000,-0.000000,0.996917", "--provider", "sim-tracking",
+                                 "--rms-mm", "0.000", "--samples", "12", "--mode", "c",
                                  "--depth-scale", "0.925926", "--json"), req.Args);
 
         // The current CLI: the runtime-owned camera calibration store.
