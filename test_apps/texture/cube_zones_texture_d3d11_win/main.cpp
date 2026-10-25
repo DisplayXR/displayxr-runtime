@@ -199,6 +199,19 @@ struct DisplayZone {
 };
 static DisplayZone g_zonesArr[kNumZones];
 
+// Phase probe (ported from the D3D12 variant, #727): DXR_SLICE_COLORS=1 paints
+// each view a solid color (view 0 = BLUE, view 1 = RED) instead of the cube, so
+// a woven readback shows the interlace directly — with a tracked or simulated
+// viewer (SR_SIMULATED_VIEWER); untracked the Leia DP returns flat blue.
+static bool ZoneSliceColors() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("DXR_SLICE_COLORS");
+        cached = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static const XrRect2Di kZoneARect        = {{0, 180}, {640, 540}};
 static const XrRect2Di kZoneBRect        = {{700, 180}, {520, 360}};
 static const XrRect2Di kZoneBOverlapRect = {{400, 300}, {520, 360}};
@@ -1421,10 +1434,21 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
             vp.MaxDepth = 1.0f;
             renderer.context->RSSetViewports(1, &vp);
 
-            const XMMATRIX viewMatrix = ColumnMajorToXMMatrix(rigViews[vi].view_matrix);
-            const XMMATRIX projMatrix = ColumnMajorToXMMatrix(rigViews[vi].projection_matrix);
-            RenderScene(renderer, rtv, z.depthDSV.Get(), z.tileW, z.tileH,
-                        viewMatrix, projMatrix, 1.0f, 0.03f);
+            if (ZoneSliceColors()) {
+                // Solid per-view fill of this view's tile (D3D11.1 ClearView with a rect).
+                static const float kBlue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+                static const float kRed[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+                ComPtr<ID3D11DeviceContext1> ctx1;
+                if (SUCCEEDED(renderer.context.As(&ctx1))) {
+                    const D3D11_RECT tile = {(LONG)(vi * z.tileW), 0, (LONG)((vi + 1) * z.tileW), (LONG)z.tileH};
+                    ctx1->ClearView(rtv, (vi == 0) ? kBlue : kRed, &tile, 1);
+                }
+            } else {
+                const XMMATRIX viewMatrix = ColumnMajorToXMMatrix(rigViews[vi].view_matrix);
+                const XMMATRIX projMatrix = ColumnMajorToXMMatrix(rigViews[vi].projection_matrix);
+                RenderScene(renderer, rtv, z.depthDSV.Get(), z.tileW, z.tileH,
+                            viewMatrix, projMatrix, 1.0f, 0.03f);
+            }
 
             projViews[zi][vi].subImage.swapchain = z.swapchain;
             projViews[zi][vi].subImage.imageRect.offset = {(int32_t)(vi * z.tileW), 0};
@@ -2131,7 +2155,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // coords, top-down; (0,0) = primary/unknown is safe), BEFORE
     // xrCreateSession so the display processor tracks the window on the
     // panel from the start.
-    SetWindowPos(hwnd, nullptr, g_displayScreenLeft, g_displayScreenTop, 0, 0,
+    // DXR_WINDOW_POS="dx,dy" offsets that move from the panel's origin (device
+    // px): phase tests compare the same window at x and x+1 (ADR-060).
+    int posDx = 0, posDy = 0;
+    if (const char* p = getenv("DXR_WINDOW_POS")) {
+        if (sscanf(p, "%d,%d", &posDx, &posDy) == 2) {
+            LOG_INFO("DXR_WINDOW_POS: window at panel origin + (%d,%d)", posDx, posDy);
+        } else {
+            posDx = posDy = 0;
+        }
+    }
+    SetWindowPos(hwnd, nullptr, g_displayScreenLeft + posDx, g_displayScreenTop + posDy, 0, 0,
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
     // Check for session target extension (required for texture mode)
