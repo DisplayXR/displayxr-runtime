@@ -364,6 +364,31 @@ struct comp_hub_d3d11_info
  * GL compositor's own legs take the session and compose that frame.
  */
 #define COMP_HUB_REASON_PLANES_UNSUPPORTED_GL "planes_unsupported_gl"
+/*!
+ * #2317: the D3D12 tier on a HYBRID (cross-adapter) box. The #1264 reroute
+ * onto the hub engaged because `DXR_SPLIT_D3D12_HYBRID_REROUTE=1` asked for it.
+ * Unlike the tokens above this one rides a `hub=1` line, as its `reason=`
+ * field (@ref comp_hub_d3d11_set_route_reason): the hybrid reroute is not the
+ * default yet, so the line says why this session is on the hub.
+ */
+#define COMP_HUB_REASON_HYBRID_REROUTE_OPT_IN "hybrid_reroute_opt_in"
+/*!
+ * #2317: the D3D12 tier on a HYBRID box, `DXR_SPLIT_D3D12_HYBRID_REROUTE` not
+ * set. The tier's own-legs #918 split weaves (its D3D12 DP on the scanout
+ * device, xbridge transport), as it has since #918. `hub=0`.
+ */
+#define COMP_HUB_REASON_HYBRID_REROUTE_DEFAULT_OFF "hybrid_reroute_default_off"
+/*!
+ * #2317: the D3D12 tier on a HYBRID box, the reroute opted in, but
+ * `DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR=1` restores the #1309 gate
+ * (engage only with `DXR_APP_FRAME_DIVISOR>=2`) and no divisor is set. `hub=0`.
+ */
+#define COMP_HUB_REASON_HYBRID_REROUTE_NEEDS_DIVISOR "hybrid_reroute_needs_divisor"
+/*!
+ * #2317: the D3D12 tier on a HYBRID box, the reroute opted in, but
+ * `DXR_SPLIT_D3D12_ROUTE=own` keeps the own-legs arm. `hub=0`.
+ */
+#define COMP_HUB_REASON_HYBRID_REROUTE_ROUTE_OWN "hybrid_reroute_route_own"
 /*! @} */
 
 /*!
@@ -1158,6 +1183,18 @@ comp_hub_d3d11_ingress_reason(struct comp_hub_d3d11 *split);
  */
 void
 comp_hub_d3d11_log_placement(struct comp_hub_d3d11 *split, const char *producer);
+
+/*!
+ * Why the producer routed this session onto the hub (one of the
+ * `COMP_HUB_REASON_*` tokens, e.g. @ref COMP_HUB_REASON_HYBRID_REROUTE_OPT_IN),
+ * printed as ` reason=<token>` on the @ref comp_hub_d3d11_log_placement line.
+ * Call before that line; NULL (the default) prints no field, so every route
+ * that does not call this keeps its line unchanged. The string must outlive
+ * the split (a literal). A line can then carry BOTH `ingress_reason=<token>`
+ * and ` reason=<token>`: parsers must anchor `reason=` on its leading space.
+ */
+void
+comp_hub_d3d11_set_route_reason(struct comp_hub_d3d11 *split, const char *reason);
 /*! @} */
 
 /*!

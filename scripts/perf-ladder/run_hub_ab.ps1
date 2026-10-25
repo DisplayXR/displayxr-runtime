@@ -541,6 +541,26 @@ function Invoke-Run {
         $hit = @($logLines | Where-Object { $_ -match $arm.expectLine }).Count
         if ($hit -eq 0) { $status = 'REFUSED'; $pathOk = $false; $flags += 'EXPECT_LINE_MISSING' }
     }
+    # expectLines: every regex must match some line (#2317: the d3d12 hybrid
+    # reroute arm proves both the reroute ACTIVE line and its hub=1 line).
+    if ($arm.PSObject.Properties['expectLines'] -ne $null) {
+        $li = 0
+        foreach ($rx in @($arm.expectLines)) {
+            $hit = @($logLines | Where-Object { $_ -match $rx }).Count
+            if ($hit -eq 0) { $status = 'REFUSED'; $pathOk = $false; $flags += ('EXPECT_LINE_' + $li + '_MISSING') }
+            $li++
+        }
+    }
+    # rejectLines: no regex may match (#2317: the full-rate arms must NOT show
+    # the #1257 partition, or a stray DXR_APP_FRAME_DIVISOR changed the subject).
+    if ($arm.PSObject.Properties['rejectLines'] -ne $null) {
+        $li = 0
+        foreach ($rx in @($arm.rejectLines)) {
+            $hit = @($logLines | Where-Object { $_ -match $rx }).Count
+            if ($hit -gt 0) { $status = 'REFUSED'; $pathOk = $false; $flags += ('REJECT_LINE_' + $li + '_PRESENT') }
+            $li++
+        }
+    }
     # Every run must load the SAME runtime + DP: a peer pushing a build or a
     # plug-in mid-campaign silently changes the subject (measured: one arm of a
     # validation pass loaded a different git tag than its sibling).
