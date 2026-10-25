@@ -273,6 +273,9 @@ sim_display_plugin_probe_displays(struct xrt_plugin_instance *inst,
 #endif
 #if defined(_WIN32)
 		c->supported_apis |= XRT_DP_API_BIT_D3D11 | XRT_DP_API_BIT_D3D12;
+		// ADR-060 R2: its screen-bound D3D11 DP is exact at any origin (no
+		// D3D11 sim mode has a position-dependent phase), so say so up front.
+		c->supported_apis |= XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE;
 #endif
 #if !defined(XRT_OS_ANDROID) && defined(XRT_HAVE_OPENGL)
 		// Desktop-GL DP only; Android is VK-only and a headless Linux build

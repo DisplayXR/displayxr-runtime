@@ -5774,6 +5774,14 @@ svc_make_windowless_weave_dp(struct d3d11_service_system *sys, struct d3d11_serv
 	    e->pixel_width == 0 || e->pixel_height == 0) {
 		return nullptr; // no per-screen factory, or no screen rect to phase against
 	}
+	if ((e->claim_apis & XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE) == 0) {
+		// The plug-in did not say it can (an older plug-in, or a vendor SDK
+		// without external routing): skip the create rather than bring a
+		// vendor weaver up only to destroy it. Once per client.
+		U_LOG_I("ADR-060 R2: '%s' does not hint windowless phase for this screen — window-bound weave DP",
+		        e->plugin_id);
+		return nullptr;
+	}
 
 	struct xrt_screen_binding b;
 	memset(&b, 0, sizeof(b));

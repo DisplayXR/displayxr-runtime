@@ -326,6 +326,26 @@ enum xrt_display_claim_confidence
 /*! @} */
 
 /*!
+ * Not an API but a capability HINT, carried in the same mask so it costs no
+ * ABI change (ADR-060 R2, decision 4): this monitor's per-screen factories
+ * (`create_dp_<api>_for_screen`, window NULL) can make a DP that declares
+ * XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN — e.g. the vendor SDK on this
+ * box supports external weaver routing. It lets the runtime skip a windowless
+ * create that is bound to be refused (a vendor weaver bring-up and teardown
+ * for nothing). A HINT only: the instance's scanout bit stays the authority.
+ * Bit clear (every plug-in built before it) = do not try. Kept far above the
+ * API bits so a future API bit never collides with it.
+ */
+#define XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE (1u << 24)
+
+/*!
+ * Defined when this header carries @ref XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE
+ * (and XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN): a plug-in built against
+ * an older header can `#ifdef` its use.
+ */
+#define XRT_PLUGIN_HAS_WINDOWLESS_PHASE_HINT 1
+
+/*!
  * One monitor a plug-in claims, returned from
  * `xrt_plugin_iface::probe_displays`. Fixed layout (no `struct_size`): the
  * plug-in fills a runtime-provided array and returns a count, so growth is

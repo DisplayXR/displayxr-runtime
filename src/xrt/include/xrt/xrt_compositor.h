@@ -2786,6 +2786,9 @@ struct xrt_dp_registry_entry
 	 * preference (`displayxr-cli dp use <id> --screen <key>`). Sources are
 	 * `enum u_setting_source` values: 0 none, 1 env, 2 user, 3 machine.
 	 */
+	//! The winning claim's `supported_apis` as the plug-in reported it, incl.
+	//! hint bits such as XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE (ADR-060 R2).
+	uint32_t claim_apis;
 	//! A per-screen preference won this monitor (over confidence and the active plug-in).
 	bool forced;
 	//! Where the preference that forced it came from; 0 when not forced.
