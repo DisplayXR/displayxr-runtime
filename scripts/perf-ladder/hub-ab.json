@@ -1,7 +1,7 @@
 {
   "kit": "DXRHubAB",
   "kitVersion": "0.4.0",
-  "issue": "#2317 P1d, P2a, step 2 (d3d11 hub default)",
+  "issue": "#2317 P1d, P2a, step 2 (d3d11 hub default), P3 (gl, opt-in)",
   "windowSeconds": 20,
   "warmupSeconds": 6,
   "reps": 3,
@@ -234,6 +234,7 @@
       "name": "gl",
       "exe": "cube_handle_gl_win.exe",
       "nativeSite": "gl",
+      "note": "GL has no device-selection API (ADR-037 5): DXR_D3D_FORCE_GPU does not move it. The same-adapter topology needs a per-exe UserGpuPreferences pin (GpuPreference=1;) on cube_handle_gl_win.exe for the run, removed afterwards.",
       "arms": [
         {
           "name": "native",
@@ -241,6 +242,41 @@
           "expectPath": "native",
           "placementRequired": false,
           "witnessRequired": false
+        },
+        {
+          "name": "hub",
+          "env": {
+            "DXR_HUB": "1"
+          },
+          "expectPath": "hub",
+          "topologies": [
+            "default"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge ingress_reason=cross_adapter import=",
+          "note": "#2317 P3: the GL atlas in a D3D11 deposit on the GL adapter (dGPU), the hub on the scanout iGPU."
+        },
+        {
+          "name": "hub-direct",
+          "env": {
+            "DXR_HUB": "1"
+          },
+          "expectPath": "hub",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=direct import=",
+          "note": "#2317 P3: GL, deposit and hub on one adapter - DIRECT ingress, 0 transport copies."
+        },
+        {
+          "name": "hub-interop",
+          "env": {
+            "DXR_HUB": "1",
+            "DXR_HUB_GL_IMPORT": "interop"
+          },
+          "expectPath": "hub",
+          "expectLine": "hub placement: hub=1 .*import=nv_dx_interop import_reason=forced_by_env",
+          "optional": true,
+          "note": "#2317 P3: the WGL_NV_DX_interop2 fallback import, forced (A/B control)."
         }
       ]
     }
