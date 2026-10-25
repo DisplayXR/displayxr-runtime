@@ -328,11 +328,12 @@ which the hub opens on its own device. The caller presents.
 Client-presents is **default OFF**: only `DXR_HUB=1` engages it, on either tier. Every texture
 session it does not take is refused with the one closed token `shared_texture_session`, behind one
 WARN naming the rung. The tier's own legs then compose exactly as before. The refusal rungs are the
-same on both tiers:
+same on both tiers. Under `DXR_HUB=1` both tiers print `hub placement: hub=0 reason=shared_texture_session`
+(the D3D12 tier prints no `hub placement:` line otherwise, unchanged):
 
 | Rung | D3D11 | D3D12 |
 |---|---|---|
-| `DXR_HUB` not `1` | silent (pre-#2370 line) | silent |
+| `DXR_HUB` not `1` | silent (pre-#2370 line) | silent (no `hub placement:` line, as before) |
 | transparent session | refused | refused |
 | PQ atlas requested | refused | n/a (the tier has no PQ atlas) |
 | no target | not bound to a v9 texture target | no `windowHandle` |

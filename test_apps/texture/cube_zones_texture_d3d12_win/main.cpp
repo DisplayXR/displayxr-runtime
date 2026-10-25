@@ -190,6 +190,17 @@ static ComPtr<IDCompositionTarget> g_dcompTarget;
 static ComPtr<IDCompositionVisual> g_dcompVisual;
 static bool g_transparentPresent = true;
 
+// DXR_SPIN_FREEZE=1: hold the cube still, so captures from two runs (e.g. a
+// hub vs native A/B, #2370) can be compared byte for byte.
+static bool SpinFrozen() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("DXR_SPIN_FREEZE");
+        v = (e != nullptr && e[0] == '1') ? 1 : 0;
+    }
+    return v == 1;
+}
+
 // Autonomous-verification dump (DXR_TEXDUMP). "1" or empty-but-present →
 // default %TEMP%\zones_texture_readback.png; any other value is the literal
 // path; unset → no dump. The readback runs after the present so it captures
@@ -2295,7 +2306,7 @@ static void RenderOneFrame(RenderState& rs) {
     }
 
     // Update scene (cube rotation) — both zones share the rotation, offset in phase.
-    UpdateScene(renderer, rs.perfStats->deltaTime);
+    UpdateScene(renderer, SpinFrozen() ? 0.0f : rs.perfStats->deltaTime);
 
     PollEvents(xr);
 

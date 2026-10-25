@@ -2779,8 +2779,15 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	 * strategy first; on any refusal the gate below refuses
 	 * `shared_texture_session` and this tier's own legs compose, as before.
 	 */
-	if (c->has_shared_texture && d3d12_client_presents_requested() && d3d12_reroute_stage_a_client(c, xdev)) {
-		return;
+	if (c->has_shared_texture && d3d12_client_presents_requested()) {
+		if (d3d12_reroute_stage_a_client(c, xdev)) {
+			return;
+		}
+		// The D3D11 tier's line and token, so a refusal reads the same on both
+		// tiers (ADR-059 Amendment 3). Only on an explicit DXR_HUB=1: the
+		// default log is unchanged.
+		U_LOG_W("hub placement: hub=0 reason=%s — this tier's own legs weave this session (#2370)",
+		        COMP_SPLIT_REASON_SHARED_TEXTURE);
 	}
 #endif
 	const uint64_t stage_a_start_ns = os_monotonic_get_ns();
