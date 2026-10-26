@@ -8602,7 +8602,14 @@ comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 	if (c->reroute.active && c->reroute.split != NULL) {
 		// The d3d11 arm owns the weaver; it quiesces its own device around
 		// the switch, exactly as the VK tier's forward does.
-		return comp_hub_d3d11_request_display_mode(c->reroute.split, enable_3d) ? XRT_SUCCESS : XRT_ERROR_D3D12;
+		//
+		// This function returns BOOL, not xrt_result_t: oxr_session.c records
+		// sess->hardware_display_3d only on `true`. Mapping the hub's answer
+		// through `? XRT_SUCCESS : XRT_ERROR_D3D12` inverted it (XRT_SUCCESS is
+		// 0 == false), so a session never recorded a switch to 2D and the next
+		// 2D->3D rendering-mode request looked like "no change" and never
+		// reached the lens.
+		return comp_hub_d3d11_request_display_mode(c->reroute.split, enable_3d);
 	}
 #endif
 	// #2247: the primary screen stays 2D while the window has wholly left it;
