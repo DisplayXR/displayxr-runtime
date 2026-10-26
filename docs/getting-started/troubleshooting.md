@@ -594,6 +594,37 @@ It never force-closes your other programs.
   the holders to close normally, once, and continues if they did.
 - To see the holders yourself from an admin prompt: `tasklist /m DisplayXRClient.dll`.
 
+## An app's Ctrl+Space (or Ctrl+Shift+Space) does nothing — the workspace hotkey took it
+
+**Symptom.** A keyboard shortcut works in an app until DisplayXR is installed, then pressing
+it does nothing in the app (and may open the workspace controller instead). Typical
+victims of the old default: Blender's *Toggle Maximize Area* (Ctrl+Space), IDE / editor
+completion, the Windows IME switch.
+
+**Cause.** The service's workspace **launch hotkey** is a low-level keyboard hook, so it
+sees the combo before any application and consumes it while no workspace controller is
+running. Until 2026-10-26 the default was **Ctrl+Space**; it is now **Ctrl+Shift+Space**.
+A box that never changed the setting picks up the new default when the runtime is
+upgraded. A box where someone explicitly set `Ctrl+Space` (by hand, or later through the
+CLI or dashboard) keeps it — that is treated as a user choice.
+
+**Check.** `displayxr-cli workspace list` prints each controller's launch hotkey and
+whether it is the `default` or a `user` setting. The tray's Workspace submenu shows the
+same combo (greyed *Launch hotkey: …* line).
+
+**Fix.** Pick a combo your apps do not use, or none:
+
+```
+displayxr-cli workspace set <id> --hotkey ctrl+shift+f9   # any combo
+displayxr-cli workspace reset <id>                        # back to the default (Ctrl+Shift+Space, auto)
+displayxr-cli workspace set <id> --no-hotkey              # no hotkey; launch from the tray or 'workspace launch'
+```
+
+or use the DisplayXR Dashboard (*Components* → workspace controller → *Launch*). A running
+service applies the change immediately. The workspace controller itself (e.g. the
+DisplayXR Shell) claims its own toggle chord only while it is running. Spec:
+`docs/specs/runtime/workspace-controller-registration.md` §*Launch settings*.
+
 ## Still stuck?
 
 Grab a bug-report dump and open an issue on the

@@ -43,7 +43,15 @@ extern "C" {
 #define SERVICE_HOTKEY_MOD_WIN (1u << 3)
 
 //! The default launch combo of every workspace controller.
-#define SERVICE_HOTKEY_DEFAULT "Ctrl+Space"
+//!
+//! Ctrl+Shift+Space since 2026-10-26 (was Ctrl+Space): the service's
+//! low-level hook sees a key before any app, and Ctrl+Space is a common app
+//! binding (editor completion, "maximize area" in DCC tools, Windows IME
+//! switching). The default is never written to service.json (setters prune an
+//! entry that equals it), so a box that never customised the combo follows
+//! this value on upgrade, and an explicit `"hotkey": "Ctrl+Space"` stays a
+//! user choice.
+#define SERVICE_HOTKEY_DEFAULT "Ctrl+Shift+Space"
 
 //! Longest canonical combo ("Ctrl+Shift+Alt+Win+BracketRight") plus slack.
 #define SERVICE_HOTKEY_MAX 48

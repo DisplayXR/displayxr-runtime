@@ -50,6 +50,21 @@ The current `Enable / Auto / Disable` set, the `Ctrl+Space` keyboard-hook-based 
 - `XR_DXR_spatial_workspace` (or whatever the extension ends up named) must include at least: (1) a way for the controller to register tray menu definitions; (2) a way for the service to forward menu clicks to the controller; (3) a "request orderly shutdown" message the controller can use as a single internal entry point for teardown invoked from any source — tray click, system shutdown, OEM device-management agent, debugger detach, etc. Symmetry: the same message a third-party launcher would send to politely ask the controller to leave.
 - The transitional first-party shell defaults (`Enable / Auto / Disable`, `Ctrl+Space`, `TerminateProcess`) move from runtime-owned code into shell-owned code as the protocol lands. The runtime keeps the *fallback* path (last-resort kill) and the *render* path (drawing whatever menu definitions the controller supplied). Nothing else.
 
+## Amendment 1 (2026-10-26) — default launch combo is Ctrl+Shift+Space
+
+The `Ctrl+Space` named above (Context, Decision and Consequences) was the default launch
+combo when this ADR was written; the text is left as it stood. Since the display dashboard's
+phase 8 the combo is a per-controller setting in `service.json`, and on 2026-10-26 its
+**default** changed to **`Ctrl+Shift+Space`** (`SERVICE_HOTKEY_DEFAULT`) on Windows, macOS
+(Control+Shift+Space — Control, not Command) and Linux. Reason: the service's low-level hook
+runs before any application, so a default that applications also bind (editor / IDE
+completion, "maximize area" in DCC tools, the Windows IME switch) silently stole the key from
+all of them. Nothing else in this ADR changes: the hook is still installed only in `auto` mode
+while no controller runs, and the controller still owns its own toggle chord while it is up
+(the first-party shell now registers `Ctrl+Shift+Space` for it). A box that never customised
+the combo follows the new default on upgrade; an explicitly stored `Ctrl+Space` is kept. See
+`docs/specs/runtime/workspace-controller-registration.md` §*Launch settings*.
+
 ## Related
 
 - Phase 2.0 (`feature/shell-brand-separation`): manifest-driven controller detection, PID-match auth, `service_orchestrator_get_workspace_pid()`.

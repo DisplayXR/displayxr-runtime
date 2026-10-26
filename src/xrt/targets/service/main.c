@@ -493,7 +493,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 		ExitProcess(0);
 	}
 
-	// #975: become the singleton BEFORE touching the tray, the Ctrl+Space hook,
+	// #975: become the singleton BEFORE touching the tray, the launch-hotkey hook,
 	// or any child process. The pipe's FILE_FLAG_FIRST_PIPE_INSTANCE inside
 	// ipc_server_main stays the authoritative gate; this earlier check keeps a
 	// second instance (client auto-launch racing a dev restart, a logon race)
@@ -660,7 +660,7 @@ main(int argc, char *argv[])
 	ipc_server_set_workspace_supports_file_dialog_provider(
 	    service_orchestrator_get_workspace_supports_file_dialog);
 
-	// Let the macOS menu-bar status item / Ctrl+Space hotkey summon the
+	// Let the macOS menu-bar status item / launch hotkey summon the
 	// controller through the orchestrator's registry-discovery + respawn path.
 	ipc_server_set_workspace_summon_provider(service_orchestrator_summon_workspace);
 

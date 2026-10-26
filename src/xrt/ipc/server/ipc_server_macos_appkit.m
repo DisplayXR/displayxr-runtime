@@ -8,7 +8,7 @@
  */
 
 #import <Cocoa/Cocoa.h>
-#import <Carbon/Carbon.h> // RegisterEventHotKey — system-wide Ctrl+Space toggle (#61)
+#import <Carbon/Carbon.h> // RegisterEventHotKey — system-wide Control+Shift+Space toggle (#61)
 
 #include "ipc_server_macos_appkit.h"
 #include "ipc_server_input_queue.h"
@@ -20,7 +20,7 @@
 
 #include <stdbool.h>
 #include <ctype.h>
-#include <signal.h> // SIGTERM the controller on Ctrl+Space toggle (#61)
+#include <signal.h> // SIGTERM the controller on the toggle hotkey (#61)
 #include <spawn.h>  // posix_spawn the workspace controller (#61)
 #include <stdlib.h> // getenv
 #include <string.h> // strerror
@@ -270,7 +270,7 @@ queue_ns_input_event(NSEvent *event)
 
 // Spawn the workspace controller (shell). The macOS analogue of the Windows
 // service_orchestrator's spawn_workspace (#61): the service is the persistent
-// root, and Ctrl+Space launches the controller on demand when none is running.
+// root, and the launch hotkey starts the controller on demand when none is running.
 // DISPLAYXR_SHELL_PATH points at the controller binary (or a dev launcher script
 // that sets the controller's env — XR_RUNTIME_JSON etc. — and execs it); the
 // child inherits the service's environment. Productization can move this to the
@@ -281,7 +281,7 @@ spawn_workspace_controller(void)
 {
 	const char *path = getenv("DISPLAYXR_SHELL_PATH");
 	if (path == NULL || path[0] == '\0') {
-		U_LOG_W("Workspace: Ctrl+Space but DISPLAYXR_SHELL_PATH is unset — cannot spawn the controller");
+		U_LOG_W("Workspace: toggle hotkey but DISPLAYXR_SHELL_PATH is unset — cannot spawn the controller");
 		return;
 	}
 	char *const argv[] = {(char *)path, NULL};
@@ -291,13 +291,13 @@ spawn_workspace_controller(void)
 		U_LOG_W("Workspace: failed to spawn controller '%s': %s", path, strerror(rc));
 		return;
 	}
-	U_LOG_W("Workspace: Ctrl+Space — spawned controller '%s' (pid %d)", path, (int)pid);
+	U_LOG_W("Workspace: toggle hotkey — spawned controller '%s' (pid %d)", path, (int)pid);
 }
 
 // TOGGLE the workspace controller (#61): SIGTERM it when running (its handler
 // runs the cleanup that kills the apps it launched, then it exits and the IPC
 // disconnect resets workspace_controller_pid → the next toggle spawns again);
-// spawn it when absent. Mirrors the Windows service_orchestrator Ctrl+Space.
+// spawn it when absent. Mirrors the Windows service_orchestrator launch hotkey.
 static void
 do_workspace_toggle(struct ipc_server *s)
 {
@@ -315,7 +315,7 @@ do_workspace_toggle(struct ipc_server *s)
 	}
 }
 
-// System-wide Ctrl+Space toggle (#61). The service window is created lazily only
+// System-wide Control+Shift+Space toggle (#61). The service window is created lazily only
 // once a client connects, so before the controller exists there is NO window to
 // receive NSEvents — the toggle must be a GLOBAL hotkey (the macOS analogue of
 // the Windows orchestrator's RegisterHotKey), which fires regardless of focus or
@@ -344,15 +344,21 @@ install_toggle_hotkey(void)
 	EventTypeSpec spec = {kEventClassKeyboard, kEventHotKeyPressed};
 	InstallApplicationEventHandler(toggle_hotkey_handler, 1, &spec, NULL, NULL);
 	EventHotKeyRef ref;
-	// Primary: Ctrl+Space (Windows parity). On systems where the OS owns
-	// Ctrl+Space for "Select the previous input source", this registration is
-	// shadowed and won't fire — the fallback below covers that.
+	// Control+Shift+Space — the Windows / Linux default (SERVICE_HOTKEY_DEFAULT,
+	// "Ctrl+Shift+Space"; Control, not Command). It was Control+Space until
+	// 2026-10-26, which macOS itself owns for "Select the previous input
+	// source" and many apps bind; Control+Shift+Space has no system binding.
+	// The old Control+Option+Space fallback is gone with it: it existed only
+	// because Control+Space was shadowed, and it is macOS's own "Select next
+	// source in Input menu" chord. Fixed for now — service.json's per-controller
+	// hotkey is not applied on macOS yet.
 	EventHotKeyID id1 = {.signature = 'DXR1', .id = 1};
-	RegisterEventHotKey(kVK_Space, controlKey, id1, GetApplicationEventTarget(), 0, &ref);
-	// Fallback: Ctrl+Option+Space (conflict-free) → same toggle.
-	EventHotKeyID id2 = {.signature = 'DXR2', .id = 2};
-	RegisterEventHotKey(kVK_Space, controlKey | optionKey, id2, GetApplicationEventTarget(), 0, &ref);
-	U_LOG_W("Workspace: registered toggle hotkey Ctrl+Space (fallback Ctrl+Option+Space)");
+	OSStatus st = RegisterEventHotKey(kVK_Space, controlKey | shiftKey, id1, GetApplicationEventTarget(), 0, &ref);
+	if (st != noErr) {
+		U_LOG_W("Workspace: could not register toggle hotkey Control+Shift+Space (OSStatus %d)", (int)st);
+		return;
+	}
+	U_LOG_W("Workspace: registered toggle hotkey Control+Shift+Space");
 }
 
 // macOS menu-bar status item (#61, Piece 3). A visible, discoverable surface for
@@ -361,7 +367,7 @@ install_toggle_hotkey(void)
 // crash-respawn path via ipc_server_request_workspace_summon), and quits the
 // service GRACEFULLY ("Quit" → raise SIGTERM → the kqueue EVFILT_SIGNAL path →
 // service_orchestrator_shutdown, which reaps the controller — no orphan).
-// Complements the global Ctrl+Space hotkey with a no-TCC, always-visible control.
+// Complements the global toggle hotkey with a no-TCC, always-visible control.
 /*
  *
  * XR_DXR_stereo_camera R3 (ADR-043 §7): the menu-bar indicator ("3D camera in
@@ -827,7 +833,7 @@ ipc_server_macos_pump_main_thread(struct ipc_server *s)
 			// only shows an NSStatusItem once the app has finished launching —
 			// finishLaunching is the documented non-blocking way to do that.
 			[NSApp finishLaunching];
-			// System-wide Ctrl+Space toggle — must be a global hotkey because the
+			// System-wide Control+Shift+Space toggle — must be a global hotkey because the
 			// service has no window (hence no key responder) until a controller
 			// connects (#61).
 			install_toggle_hotkey();
@@ -862,7 +868,7 @@ ipc_server_macos_pump_main_thread(struct ipc_server *s)
 		// controller the surface window is hidden (see the render gate) and the
 		// service is a background daemon — reclaiming activation here would steal
 		// focus from the user's desktop apps AND makeKeyAndOrderFront would re-show
-		// the window we just hid. Ctrl+Space (a global hotkey) respawns the
+		// the window we just hid. The toggle hotkey (global) respawns the
 		// controller, which sets workspace_mode and re-shows the surface.
 		bool workspace_up = (s != NULL) && s->workspace_mode;
 		if (workspace_up && ![NSApp isActive]) {
@@ -895,7 +901,7 @@ ipc_server_macos_pump_main_thread(struct ipc_server *s)
 			// orphaned on the abrupt IPC drop), give it a brief moment, then exit
 			// the service. Reachable once the surface window exists (a controller is
 			// up). ESC is NO LONGER a kill-switch — it flows through to the
-			// controller (restore-maximized / launcher-close). The Ctrl+Space toggle
+			// controller (restore-maximized / launcher-close). The Control+Shift+Space toggle
 			// is a global hotkey (above), not handled here, since the service may
 			// have no window yet.
 			if ([event type] == NSEventTypeKeyDown) {

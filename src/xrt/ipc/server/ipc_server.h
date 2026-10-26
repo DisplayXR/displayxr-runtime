@@ -1070,7 +1070,7 @@ ipc_server_set_workspace_supports_file_dialog_provider(ipc_server_workspace_supp
  * Function pointer the IPC server calls to summon (spawn-if-absent) the
  * registered workspace controller on demand. The standalone service registers
  * the orchestrator's spawn entry point here so UI surfaces inside ipc_server
- * (the macOS menu-bar status item / Ctrl+Space hotkey, #61) can launch the
+ * (the macOS menu-bar status item / toggle hotkey, #61) can launch the
  * controller through the same registry-discovery + crash-respawn path as
  * startup, rather than an ad-hoc spawn. Idempotent: a no-op when the controller
  * is already running.

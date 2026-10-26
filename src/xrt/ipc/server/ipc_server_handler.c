@@ -387,7 +387,7 @@ count_class_locked(struct ipc_server *s, volatile struct ipc_client_state *ics, 
 }
 
 // The effective workspace-controller pid for input/command authorization. The
-// orchestrator only knows a pid for a controller it SPAWNED (Windows Ctrl+Space
+// orchestrator only knows a pid for a controller it SPAWNED (Windows launch-hotkey
 // trampoline). A manually-launched controller — the macOS shell (#61), and any
 // dev/CLI-launched shell — instead registers itself via xrActivateWorkspaceEXT,
 // which sets s->workspace_controller_pid. Prefer that activate-registered pid and

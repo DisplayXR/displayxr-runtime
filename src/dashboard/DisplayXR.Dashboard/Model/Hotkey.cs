@@ -12,11 +12,19 @@ public enum HotkeyModifiers { None = 0, Ctrl = 1, Shift = 2, Alt = 4, Win = 8 }
 
 /// <summary>
 /// A workspace-controller launch combo, as the CLI spells it: modifiers in the
-/// order Ctrl, Shift, Alt, Win, then one key, joined by '+' ("Ctrl+Space",
+/// order Ctrl, Shift, Alt, Win, then one key, joined by '+' ("Ctrl+Shift+Space",
 /// "Ctrl+Shift+F9"). Valid = at least one modifier and exactly one key.
 /// </summary>
 public readonly record struct Hotkey(HotkeyModifiers Modifiers, string Key)
 {
+    /// <summary>
+    /// The runtime's default launch combo (<c>SERVICE_HOTKEY_DEFAULT</c>; Ctrl+Space before
+    /// 2026-10-26). For text and the fixture only: the live value always comes from
+    /// <c>workspace list --json</c> (<c>launch.hotkey</c> with <c>source: "default"</c>),
+    /// so an older runtime still shows its own default.
+    /// </summary>
+    public const string Default = "Ctrl+Shift+Space";
+
     private static readonly Dictionary<string, HotkeyModifiers> ModNames = new(StringComparer.OrdinalIgnoreCase)
     {
         ["ctrl"] = HotkeyModifiers.Ctrl, ["control"] = HotkeyModifiers.Ctrl, ["ctl"] = HotkeyModifiers.Ctrl,

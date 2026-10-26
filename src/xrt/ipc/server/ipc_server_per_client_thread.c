@@ -630,7 +630,7 @@ ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_stat
 	//   - our xscs drop took the strong ref count from 2 → 1,
 	//   - the snapshot's lingering strong ref kept the swapchain alive,
 	//   - the render thread could be mid-snapshot-deref on a slot
-	//     that's already partially torn down (Ctrl+Space deactivate
+	//     that's already partially torn down (launch-hotkey deactivate
 	//     hits this because the workspace controller's compositor
 	//     destroy runs in a different order than per-client destroys).
 	// Reversing the order means the snapshot's strong refs are gone

@@ -336,7 +336,7 @@ show_context_menu(HWND hwnd)
 
 		// Display dashboard phase 8: the configured launch combo
 		// (service.json; `displayxr-cli workspace set <id> --hotkey`), never a
-		// hard-coded Ctrl+Space. Informational, so greyed.
+		// hard-coded combo. Informational, so greyed.
 		{
 			const char *combo = service_orchestrator_get_launch_hotkey();
 			wchar_t combo_wide[64] = L"";
@@ -1283,7 +1283,7 @@ tray_thread_body(LPVOID param)
 }
 
 
-// #950: the tray thread hosts the message pump, the Ctrl+Space hook and the
+// #950: the tray thread hosts the message pump, the launch-hotkey hook and the
 // orchestrator spawn path; an exception escaping it is recorded ([TERMINATE])
 // before it propagates exactly as before.
 static void *

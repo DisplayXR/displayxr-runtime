@@ -29,7 +29,7 @@ struct ipc_server;
  * Lazily bootstraps NSApplication on first call. Safe to call every poll
  * iteration; cheap when idle. Must be called from the main thread.
  *
- * @p s is the IPC server (for the workspace lifecycle hotkeys, #61): Ctrl+Space
+ * @p s is the IPC server (for the workspace lifecycle hotkeys, #61): Control+Shift+Space
  * toggles the workspace controller (spawn when absent / SIGTERM when present),
  * read from `s->workspace_controller_pid`. May be NULL (hotkeys become no-ops).
  */

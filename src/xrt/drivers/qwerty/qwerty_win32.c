@@ -670,7 +670,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 			break;
 
 		// ESC: no-op in workspace mode. Workspace lifecycle is controlled by
-		// Ctrl+Space (system hotkey) and the tray icon, not ESC.
+		// the launch hotkey (Ctrl+Shift+Space by default) and the tray icon, not ESC.
 		case VK_ESCAPE:
 			break;
 

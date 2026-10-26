@@ -266,7 +266,7 @@ elseif(APPLE)
 			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.c
 			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.h
 		)
-	# Carbon: RegisterEventHotKey for the system-wide Ctrl+Space workspace toggle
+	# Carbon: RegisterEventHotKey for the system-wide Control+Shift+Space workspace toggle
 	# (the service has no window before a controller connects, so the toggle can't
 	# be an NSEvent — it must be a global hotkey, #61).
 	target_link_libraries(ipc_server PRIVATE "-framework CoreFoundation" "-framework Cocoa" "-framework Carbon")

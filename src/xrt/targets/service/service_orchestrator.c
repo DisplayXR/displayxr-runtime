@@ -374,9 +374,10 @@ spawn_workspace(void)
  * Hotkey handling — low-level keyboard hook (WH_KEYBOARD_LL).
  *
  * RegisterHotKey turned out unreliable on systems where Windows IME or
- * third-party launchers already claim Ctrl+Space (error 1408 on every
- * plausible combo). A low-level keyboard hook runs before global-hotkey
- * dispatch, so our chord always wins.
+ * third-party launchers already claim the combo (error 1408 on every
+ * plausible combo; first seen with the old Ctrl+Space default). A
+ * low-level keyboard hook runs before global-hotkey dispatch, so our chord
+ * always wins — which is also why the default must not be a combo apps use.
  *
  * The hook proc runs on the thread that installed it (the tray thread,
  * which has a GetMessage pump). From there we PostMessage a custom
@@ -386,7 +387,8 @@ spawn_workspace(void)
  *
  * #344: the hook is *uninstalled* while the controller is running (see
  * spawn_workspace + workspace_watch_thread_func). The shell owns
- * Ctrl+Space via its own RegisterHotKey while it's up; we only need the
+ * its toggle chord (the same combo by default, Ctrl+Shift+Space) via its own
+ * RegisterHotKey while it's up; we only need the
  * LL hook to handle the "no controller running → spawn one" case. This
  * keeps the runtime entirely out of the keyboard pipeline whenever the
  * workspace is alive — no chance of throttling/disabling other chords
@@ -415,11 +417,13 @@ orchestrator_kbd_hook_proc(int nCode, WPARAM wParam, LPARAM lParam)
 	if (want_vk == 0 || kbd->vkCode != want_vk)
 		goto pass;
 
-	// Display dashboard phase 8: the configured combo (service.json, Ctrl+Space
-	// by default) must match EXACTLY — every required modifier down, every
-	// other modifier up — so e.g. Ctrl+Shift+Space or the Win+Space IME switch
-	// pass through when the combo is Ctrl+Space. GetAsyncKeyState is a
-	// register read; sub-microsecond.
+	// Display dashboard phase 8: the configured combo (service.json,
+	// SERVICE_HOTKEY_DEFAULT = Ctrl+Shift+Space when absent) must match
+	// EXACTLY — every required modifier down, every other modifier up — so
+	// with the default, plain Ctrl+Space (an app's binding: editor completion,
+	// "maximize area", the IME switch) and Win+Space pass through untouched,
+	// and a user who stored Ctrl+Space does not swallow Ctrl+Shift+Space.
+	// GetAsyncKeyState is a register read; sub-microsecond.
 	{
 		const uint32_t want = s_hook_mods;
 		uint32_t down = 0;
@@ -649,10 +653,10 @@ apply_workspace_mode(enum service_child_mode mode)
 		break;
 
 	case SERVICE_CHILD_AUTO:
-		// Install low-level keyboard hook so Ctrl+Space summons the workspace
+		// Install low-level keyboard hook so the launch combo summons the workspace
 		// controller. #344: the hook is only active when the controller is
 		// NOT running — spawn_workspace uninstalls it on a successful launch
-		// (the shell's own RegisterHotKey owns Ctrl+Space while up), and the
+		// (the shell's own RegisterHotKey owns its toggle chord while up), and the
 		// watchdog re-installs it on controller exit. This keeps the runtime
 		// out of the keyboard pipeline whenever the workspace is alive, so
 		// even an LL-hook timeout couldn't throttle other chords.
@@ -975,7 +979,7 @@ workspace_watch_thread_func(LPVOID param)
  * it with "--service-managed", and respawn it on crash via a waitpid watcher
  * thread. None of this touches the main thread, so it is safe w.r.t. the
  * kqueue/AppKit main-thread-ownership hazard (only the deferred Piece 3 global
- * Ctrl+Space hotkey would re-enter that).
+ * launch hotkey would re-enter that).
  *
  */
 
@@ -1251,7 +1255,7 @@ watch_thread_func(void *param)
 		}
 
 		// Crash-respawn ONLY in ENABLE (always-on). In AUTO the controller is
-		// summoned on demand (Ctrl+Space / status item) and a close or crash
+		// summoned on demand (launch hotkey / status item) and a close or crash
 		// returns to the off state — the next summon relaunches it. DISABLE never
 		// respawns.
 		if (s_workspace_available && s_launch.mode == SERVICE_CHILD_ENABLE) {
@@ -1343,7 +1347,7 @@ apply_workspace_mode(enum service_child_mode mode)
 
 	case SERVICE_CHILD_AUTO:
 		// On-demand (Windows parity): do NOT spawn at init. The controller is
-		// summoned via Ctrl+Space / the menu-bar status item, and a close or
+		// summoned via the launch hotkey / the menu-bar status item, and a close or
 		// crash returns to the off state. This keeps the service running with the
 		// shell off — menu bar visible — until the user summons it.
 		break;
@@ -1463,7 +1467,7 @@ void
 service_orchestrator_summon_workspace(void)
 {
 	// Idempotent: spawn_workspace() no-ops when a controller is already running
-	// or none is registered. This is the on-demand AUTO trigger (Ctrl+Space /
+	// or none is registered. This is the on-demand AUTO trigger (launch hotkey /
 	// menu-bar status item) — in AUTO the controller is not spawned at init.
 	spawn_workspace();
 }
@@ -1507,8 +1511,10 @@ service_orchestrator_apply_config(const struct service_config *cfg)
 	enum service_child_mode new_mode = s_launch.mode;
 	pthread_mutex_unlock(&s_lock);
 
-	// No global launch hotkey on macOS yet (the status item summons); the
-	// hotkey setting is stored and reported, and applies once one exists.
+	// macOS: the global toggle hotkey is the fixed default combo
+	// (Control+Shift+Space, plus the Control+Option+Space fallback) registered
+	// in ipc_server_macos_appkit.m; it does not follow service.json yet. The
+	// hotkey setting is stored and reported, and applies once it does.
 	if (new_mode != old_mode) {
 		apply_workspace_mode(new_mode);
 	}

@@ -243,10 +243,10 @@ TEST_CASE("AUTO: discovered, not spawned at init, launch request spawns once", "
 	CHECK(std::string(service_orchestrator_get_workspace_entry()->id) == "testctl");
 	CHECK(service_orchestrator_get_workspace_supports_file_dialog());
 	CHECK(service_orchestrator_get_workspace_mode() == SERVICE_CHILD_AUTO);
-	CHECK(std::string(service_orchestrator_get_launch_hotkey()) == "Ctrl+Space");
+	CHECK(std::string(service_orchestrator_get_launch_hotkey()) == "Ctrl+Shift+Space");
 
 	// The hotkey is armed with the default combo, nothing spawned yet.
-	CHECK(last_armed() == "Ctrl+Space");
+	CHECK(last_armed() == "Ctrl+Shift+Space");
 	std::this_thread::sleep_for(std::chrono::milliseconds(200));
 	CHECK(f.lines().empty());
 	CHECK(service_orchestrator_get_workspace_pid() == 0);
@@ -263,7 +263,7 @@ TEST_CASE("AUTO: discovered, not spawned at init, launch request spawns once", "
 	CHECK(pid == (long)service_orchestrator_get_workspace_pid());
 	CHECK(l[0].find(" --service-managed ") != std::string::npos);
 	CHECK(l[0].find("session=1") != std::string::npos);
-	CHECK(l[0].find("hotkey=Ctrl+Space") != std::string::npos);
+	CHECK(l[0].find("hotkey=Ctrl+Shift+Space") != std::string::npos);
 
 	CHECK(service_orchestrator_request_launch("testctl") == SERVICE_LAUNCH_ALREADY_RUNNING);
 

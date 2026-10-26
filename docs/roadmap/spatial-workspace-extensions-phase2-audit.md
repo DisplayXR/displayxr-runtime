@@ -205,7 +205,7 @@ The runtime today renders the launcher tile grid *before* any app client connect
 
 Reading the code at 9866 and 11777 it looks like one flag, but it actually serves two transitions:
 1. Standalone → workspace re-activate (a previously-direct-rendering app gets re-claimed by a re-activated workspace).
-2. Workspace dismissed → workspace re-activated (after Ctrl+Space toggles the workspace off and back on).
+2. Workspace dismissed → workspace re-activated (after the launch hotkey — Ctrl+Space at the time, Ctrl+Shift+Space by default since 2026-10-26 — toggles the workspace off and back on).
 
 When the lifecycle simplifies in Phase 2.G, separate these into two flags or two state-machine arms — folding them together saved code in the original spatial-shell-phase4D work but obscures the transitions for anyone refactoring.
 

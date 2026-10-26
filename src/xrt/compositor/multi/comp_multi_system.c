@@ -5582,7 +5582,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	// Show the full-screen surface only while a workspace controller or content
 	// client is present; hide it (and skip rendering the empty backdrop) when the
 	// controller goes away so the macOS desktop returns. The service stays running
-	// as a daemon — Ctrl+Space respawns the controller, which re-shows the surface.
+	// as a daemon — the toggle hotkey respawns the controller, which re-shows the surface.
 	// Without this, toggling the shell off left the borderless full-screen window
 	// up showing its last (empty) frame as a black screen with no way to escape.
 	bool should_show = (order_count > 0) || msc->workspace_active;

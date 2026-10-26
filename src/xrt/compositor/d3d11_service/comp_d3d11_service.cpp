@@ -4703,7 +4703,7 @@ struct d3d11_multi_compositor
 	//! True after dismiss cleanup (EXIT_REQUEST sent, captures released).
 	bool dismiss_cleanup_done;
 
-	//! Workspace deactivated (Ctrl+Space): window hidden, DP released, captures stopped.
+	//! Workspace deactivated (launch hotkey): window hidden, DP released, captures stopped.
 	//! Unlike window_dismissed, the multi-comp structure stays alive for re-activation.
 	bool suspended;
 
@@ -12624,7 +12624,7 @@ pipeline_idle_quiesce_if_due(struct d3d11_service_system *sys, struct d3d11_mult
 	if (sys == nullptr || mc == nullptr || mc->idle_quiesced) {
 		return false;
 	}
-	// `suspended` is the workspace-deactivate quiesce (Ctrl+Space) — same
+	// `suspended` is the workspace-deactivate quiesce (launch hotkey) — same
 	// teardown, different trigger, and it already released the DP.
 	// An active workspace controller is not in `clients[]` (it owns the
 	// workspace, it is not a slot in it), so a controller with no apps open
@@ -17267,7 +17267,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	if (mc->window_dismissed) {
 		// Workspace window closed (ESC / close button). Behaves like deactivate:
 		// restore 2D windows, send LOSS_PENDING (not EXIT_REQUEST) to IPC
-		// clients. The workspace can re-activate via Ctrl+Space.
+		// clients. The workspace can re-activate via the launch hotkey.
 		if (!mc->dismiss_cleanup_done) {
 			mc->dismiss_cleanup_done = true;
 
@@ -17370,7 +17370,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 
 	// Check window validity — ESC or close button triggers deactivate (suspend),
-	// not the old permanent dismiss. The workspace can re-activate via Ctrl+Space.
+	// not the old permanent dismiss. The workspace can re-activate via the launch hotkey.
 	//
 	// #964: under the DEFAULT policy the service window is just the presenter
 	// for hosted clients, so closing it ends that client's session (#999) and
@@ -38472,7 +38472,7 @@ comp_d3d11_service_get_capture_client_info(struct xrt_system_compositor *xsysc,
  *
  * Activate used to flag only slot members (`pending_workspace_reentry` on
  * `mc->clients[]`), so a client that was standalone at that moment — a forced-
- * IPC app started before Ctrl+Space — was never told: its commits took the
+ * IPC app started before the launch hotkey — was never told: its commits took the
  * workspace early-return before process_atlas/Present (dark) while its per-
  * client DP stayed alive on the panel (a second weaver).
  *
@@ -38668,7 +38668,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		return true;
 	}
 
-	// If workspace was suspended (deactivated via Ctrl+Space), resume it:
+	// If workspace was suspended (deactivated via the launch hotkey), resume it:
 	// show window, recreate DP, restart render thread.
 	if (sys->multi_comp != nullptr && sys->multi_comp->suspended) {
 		struct d3d11_multi_compositor *mc = sys->multi_comp;
@@ -38840,7 +38840,7 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 			// An app that presents into its OWN window needs that window back
 			// — including (#1014) a hosted client whose window WE created and
 			// parked at activate. Restoring them is what makes shell death or
-			// Ctrl+Space leave every client reachable instead of stranded.
+			// the launch hotkey leave every client reachable instead of stranded.
 			if (slot->compositor != nullptr && (slot->compositor->presenter == PRESENTER_APP_HWND ||
 			                                    slot->compositor->presenter == PRESENTER_CLIENT_TEXTURE)) {
 				HWND show = slot->app_hwnd;
@@ -38855,7 +38855,7 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 
 		// The default rule re-picks on the next render tick.
 		mc->focused_slot = -1;
-		// #964 Phase A: the controller is gone (Ctrl+Space, or it disconnected
+		// #964 Phase A: the controller is gone (launch hotkey, or it disconnected
 		// mid-override) — the default policy owns the panel again, so drop the
 		// override and let pipeline_pick_focus start from a clean debounce.
 		mc->foreground_override_slot.store(-1, std::memory_order_release);

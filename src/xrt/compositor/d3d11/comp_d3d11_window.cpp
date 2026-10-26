@@ -969,11 +969,11 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (message == WM_KEYDOWN && wParam == VK_ESCAPE) {
 			// Workspace mode with no focused app: input_forward_hwnd is NULL so
 			// we fall into this block, but closing the window kills the service.
-			// Swallow the key instead; user can press Ctrl+Space to dismiss.
+			// Swallow the key instead; user can press the launch hotkey to dismiss.
 			//
 			// Phase 2.G considered removing this carve-out (the workspace
 			// controller now owns deactivate semantics via xrDeactivateSpatial-
-			// WorkspaceEXT and Ctrl+Space, so the runtime in principle could
+			// WorkspaceEXT and the launch hotkey, so the runtime in principle could
 			// fall through to WM_CLOSE on bare ESC). We kept it because an
 			// accidental ESC press while in empty-workspace state would still
 			// take the service down with the window, which is a real regression

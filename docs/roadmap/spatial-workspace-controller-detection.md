@@ -151,12 +151,12 @@ If the workspace controller binary is `displayxr-shell.exe` and no `.controller.
 
 ## Hotkey registration interaction
 
-Today `apply_workspace_mode(SERVICE_CHILD_AUTO)` installs the WH_KEYBOARD_LL hook so Ctrl+Space launches the controller. With detection added:
+Today `apply_workspace_mode(SERVICE_CHILD_AUTO)` installs the WH_KEYBOARD_LL hook so the launch hotkey (Ctrl+Space when this was written; Ctrl+Shift+Space by default since 2026-10-26) launches the controller. With detection added:
 
-- `s_workspace_available == false` → never install the hook regardless of mode. Ctrl+Space does nothing system-wide. Logged once at startup as `"workspace controller not installed; Ctrl+Space disabled"`.
+- `s_workspace_available == false` → never install the hook regardless of mode. The launch hotkey does nothing system-wide. Logged once at startup as `"workspace controller not installed; Ctrl+Space disabled"`.
 - `s_workspace_available == true` → existing logic applies.
 
-This avoids the buggy state where the hook is installed but the spawn target doesn't exist (today's behavior in that edge case prints "Cannot find workspace controller binary 'X' next to service" on every Ctrl+Space, in commit `4cf3ba93d`'s addition).
+This avoids the buggy state where the hook is installed but the spawn target doesn't exist (today's behavior in that edge case prints "Cannot find workspace controller binary 'X' next to service" on every hotkey press, in commit `4cf3ba93d`'s addition).
 
 ## Edge cases
 

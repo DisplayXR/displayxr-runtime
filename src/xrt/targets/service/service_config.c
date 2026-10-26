@@ -45,7 +45,7 @@ service_config_set_defaults(struct service_config *cfg)
 	// specific workspace app; controllers self-register from their own
 	// installer. See docs/specs/runtime/workspace-controller-registration.md.
 	cfg->workspace_binary[0] = '\0';
-	// No per-controller entries = every controller on Ctrl+Space, auto.
+	// No per-controller entries = every controller on Ctrl+Shift+Space, auto.
 	cfg->controller_count = 0;
 }
 
