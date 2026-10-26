@@ -179,7 +179,9 @@ comp_vk_native_segments_enabled(const struct comp_vk_native_segments *segs);
  * screen)? Pure (@ref comp_segments_window_is_split on the manager's screens):
  * no lifecycle, no DPs. The weave publishes the answer for the compose step,
  * which withholds zero-copy while it is true so the frame reaches
- * @ref comp_vk_native_segments_update instead of the primary DP.
+ * @ref comp_vk_native_segments_update instead of the primary DP. Also true while the
+ * primary DP is windowless (another screen holds the window): the update must
+ * keep running until it has handed the window back (#2305).
  */
 bool
 comp_vk_native_segments_would_split(const struct comp_vk_native_segments *segs,
