@@ -59,14 +59,19 @@ comp_texture_target_ref_alive_win32(void *ref)
 }
 
 /*!
- * The client-area origin of @p wnd on the desktop, in physical device px
- * (per-monitor-v2 pin). False when the window is gone.
+ * The client-area origin of @p wnd on the desktop, and optionally its client
+ * size, in physical device px (per-monitor-v2 pin). False when the window is
+ * gone.
  */
 static inline bool
-comp_texture_target_client_origin_win32(void *wnd, POINT *out_origin)
+comp_texture_target_client_origin_win32(void *wnd, POINT *out_origin, SIZE *out_size)
 {
 	out_origin->x = 0;
 	out_origin->y = 0;
+	if (out_size != NULL) {
+		out_size->cx = 0;
+		out_size->cy = 0;
+	}
 	HWND hwnd = (HWND)wnd;
 	if (hwnd == NULL || !IsWindow(hwnd)) {
 		return false;
@@ -76,7 +81,15 @@ comp_texture_target_client_origin_win32(void *wnd, POINT *out_origin)
 	if (set_ctx != NULL) {
 		prev = set_ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 	}
-	const BOOL ok = ClientToScreen(hwnd, out_origin);
+	BOOL ok = ClientToScreen(hwnd, out_origin);
+	if (ok && out_size != NULL) {
+		RECT rc;
+		ok = GetClientRect(hwnd, &rc);
+		if (ok) {
+			out_size->cx = rc.right > 0 ? rc.right : 0;
+			out_size->cy = rc.bottom > 0 ? rc.bottom : 0;
+		}
+	}
 	if (set_ctx != NULL && prev != NULL) {
 		(void)set_ctx(prev);
 	}
@@ -100,7 +113,7 @@ comp_texture_target_resolve_win32(const struct comp_texture_target *tt,
 		return false;
 	}
 	POINT origin = {0, 0};
-	if (tt->ref != NULL && !comp_texture_target_client_origin_win32(tt->ref, &origin)) {
+	if (tt->ref != NULL && !comp_texture_target_client_origin_win32(tt->ref, &origin, NULL)) {
 		return false;
 	}
 	return comp_texture_target_compose(tt, (int32_t)origin.x, (int32_t)origin.y, tex_w, tex_h, out);

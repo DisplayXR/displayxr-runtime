@@ -1527,7 +1527,9 @@ d3d11_effective_canvas(struct comp_d3d11_compositor *c)
  * padded render target (the DP's viewport carries the offset into the phase)
  * and copy it back to (0,0). Returns the padded RTV and the offset, or NULL to
  * weave straight into the shared texture (no offset, or one that cannot be
- * corrected — WARNed once per episode).
+ * corrected — WARNed once per episode). A target wholly right of or below the
+ * anchor's client area is refused too: the weaver judges the weave on the
+ * part of its viewport inside that area and would weave nothing (2D).
  *
  * App thread, c->mutex held (layer_commit).
  */
@@ -1538,11 +1540,12 @@ d3d11_tt_anchor_pad(struct comp_d3d11_compositor *c,
                     int32_t *out_y)
 {
 	POINT anchor;
-	if (c->shared_texture == nullptr || !comp_texture_target_client_origin_win32(c->app_hwnd, &anchor)) {
+	SIZE client;
+	if (c->shared_texture == nullptr || !comp_texture_target_client_origin_win32(c->app_hwnd, &anchor, &client)) {
 		return nullptr;
 	}
-	if (!comp_texture_target_anchor_offset(r, anchor.x, anchor.y, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION, out_x,
-	                                       out_y)) {
+	if (!comp_texture_target_anchor_offset(r, anchor.x, anchor.y, (uint32_t)client.cx, (uint32_t)client.cy,
+	                                       D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION, out_x, out_y)) {
 		const bool offset = r->screen.x != anchor.x || r->screen.y != anchor.y;
 		if (offset && !c->tt.pad_refused_warned) {
 			c->tt.pad_refused_warned = true;

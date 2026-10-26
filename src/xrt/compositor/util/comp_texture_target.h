@@ -126,12 +126,18 @@ comp_texture_target_present_origin(const struct comp_texture_target_resolved *r,
  * canvas at this offset into a render target of at least (x + w) x (y + h)
  * phases it where the app draws it. False when there is nothing to correct
  * (offset 0,0) or it cannot be corrected: the target starts left of or above
- * the anchor's client area, or the render target would exceed @p max_dim.
+ * the anchor's client area, starts at or past its right or bottom edge (a
+ * windowed weaver judges the weave on the part of the viewport inside the
+ * anchor's client area, so it would weave nothing), or the render target
+ * would exceed @p max_dim. @p anchor_w / @p anchor_h: the anchor's client
+ * size, 0 = unknown (no overlap check).
  */
 static inline bool
 comp_texture_target_anchor_offset(const struct comp_texture_target_resolved *r,
                                   int32_t anchor_left,
                                   int32_t anchor_top,
+                                  uint32_t anchor_w,
+                                  uint32_t anchor_h,
                                   uint32_t max_dim,
                                   int32_t *out_x,
                                   int32_t *out_y)
@@ -144,6 +150,9 @@ comp_texture_target_anchor_offset(const struct comp_texture_target_resolved *r,
 	const int64_t x = (int64_t)r->screen.x - anchor_left;
 	const int64_t y = (int64_t)r->screen.y - anchor_top;
 	if (x < 0 || y < 0 || (x == 0 && y == 0)) {
+		return false;
+	}
+	if ((anchor_w > 0 && x >= (int64_t)anchor_w) || (anchor_h > 0 && y >= (int64_t)anchor_h)) {
 		return false;
 	}
 	if (x + r->screen.w > (int64_t)max_dim || y + r->screen.h > (int64_t)max_dim) {
