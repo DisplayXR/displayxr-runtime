@@ -3159,7 +3159,9 @@ synth_primary_edid_claim(const struct xrt_display_descriptor *descs,
 	}
 	out[0].monitor_id = descs[pick].monitor_id;
 	out[0].confidence = (uint32_t)XRT_DISPLAY_CLAIM_EDID;
-	out[0].supported_apis = 0xFFFFFFFFu;
+	// Every API (masked against the real factories at fill time), but never a
+	// capability hint: a plug-in that cannot even enumerate monitors asserts nothing.
+	out[0].supported_apis = 0xFFFFFFFFu & ~XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE;
 	out[0].serial[0] = '\0';
 	return 1;
 }
@@ -3304,6 +3306,7 @@ fill_registry_entry(struct xrt_dp_registry_entry *e,
 		e->dp_factory_metal = (void *)iface->create_dp_metal;
 	}
 #endif
+	e->claim_apis = claim->supported_apis;
 	e->owning_iface = (const void *)iface;
 	e->owning_instance = src->inst;
 }

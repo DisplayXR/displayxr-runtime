@@ -7359,6 +7359,21 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 	if (!comp_d3d11_service_weave_bind_window(ics->xc, hwnd)) {
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
+	// ADR-060 R2: offer the screen list. Inert unless this client's weave DP
+	// turns out windowless; then the service cuts the window per screen itself
+	// (the vendor's own 2D-region logic is gone with the window). A bind is
+	// rare (once per window), so the enumeration is not a per-frame cost.
+	if (ics->server != NULL && ics->server->xsysc != NULL && hwnd != 0 &&
+	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
+		struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (list != NULL) {
+			if (xrt_instance_enumerate_displays(ics->server->xinst, list) == XRT_SUCCESS) {
+				comp_d3d11_service_weave_offer_screens(ics->server->xsysc,
+				                                       (struct xrt_compositor *)ics->xc, list);
+			}
+			free(list);
+		}
+	}
 	return XRT_SUCCESS;
 #elif defined(COMP_MULTI_HAVE_WEAVE)
 	if (!comp_multi_weave_bind_window(ics->xc, hwnd)) {
@@ -7551,12 +7566,15 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         struct xrt_eye_positions *out_eyes,
                         uint32_t *out_segment_count,
                         uint32_t *out_lift_cursor_mask,
+                        struct ipc_weave_woven_origin *out_origin,
                         const xrt_graphics_buffer_handle_t *handles,
                         uint32_t handle_count)
 {
 	IPC_TRACE_MARKER();
 
 	*out_have_output = false;
+	// v12 §5e: no woven origin unless the D3D11 service reports one (ADR-060 R3).
+	memset(out_origin, 0, sizeof(*out_origin));
 	// XR_DXR_weave v19 cheap split signal: 0 = woven by one display processor
 	// (every platform but the D3D11 service, every window on one screen).
 	*out_segment_count = 0;
@@ -7702,6 +7720,18 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_segment_count = comp_d3d11_service_weave_segment_count(ics->xc);
 	// XR_DXR_cursor_depth v6: which lift rects of this submit got the cursor.
 	*out_lift_cursor_mask = comp_d3d11_service_weave_lift_cursor_mask(ics->xc);
+	// ADR-060 R3: the origin a windowless weave DP was phased for; field by
+	// field onto the wire POD. No logical space on Windows.
+	{
+		int32_t ox = 0, oy = 0;
+		uint64_t serial = 0;
+		if (comp_d3d11_service_weave_get_woven_origin(ics->xc, &ox, &oy, &serial)) {
+			out_origin->valid = 1u;
+			out_origin->x = ox;
+			out_origin->y = oy;
+			out_origin->serial = serial;
+		}
+	}
 	return XRT_SUCCESS;
 #elif defined(COMP_MULTI_HAVE_WEAVE)
 	// handles[0] is the retained IOSurfaceRef (macOS) / acquired AHardwareBuffer
@@ -8370,9 +8400,11 @@ ipc_handle_weave_submit_sync(volatile struct ipc_client_state *ics,
 
 	// Everything else — auth, validation, the weave — is the v9 submit's,
 	// byte for byte.
+	// weave_submit_sync's reply carries no origin (Android has none to report).
+	struct ipc_weave_woven_origin unused_origin;
 	xrt_result_t xret =
 	    ipc_handle_weave_submit(ics, args, out_have_output, out_width, out_height, out_fence_value, out_eyes,
-	                            out_segment_count, out_lift_cursor_mask, handles, handle_count);
+	                            out_segment_count, out_lift_cursor_mask, &unused_origin, handles, handle_count);
 
 	// Always collect: also drops a sync request a refused submit never reached.
 	int release_fd = ics->xc != NULL ? comp_multi_weave_android_take_sync_result(ics->xc) : -1;

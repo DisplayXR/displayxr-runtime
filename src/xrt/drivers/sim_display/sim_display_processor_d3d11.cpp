@@ -885,8 +885,17 @@ sim_dp_d3d11_set_window(struct xrt_display_processor_d3d11 *xdp, void *window_ha
 static bool
 sim_dp_d3d11_get_scanout_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_scanout_caps *out_caps)
 {
-	(void)xdp;
-	return sim_scanout_fill_caps(out_caps, "D3D11");
+	if (!sim_scanout_fill_caps(out_caps, "D3D11")) {
+		return false;
+	}
+	// ADR-060: no D3D11 sim mode has a position-dependent phase (#817), so a
+	// screen-bound instance — the one that confines itself to its canvas — is
+	// exact at any origin it is handed, window or not. The unbound DP draws
+	// the whole target and stays window-bound.
+	if (sim_dp_d3d11(xdp)->screen_bound) {
+		out_caps->flags |= XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN;
+	}
+	return true;
 }
 
 

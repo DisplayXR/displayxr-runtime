@@ -692,6 +692,44 @@ struct d3d11_client_render_resources
 	//! #1172: last encoding pushed to @ref weave_dp; -1 = unknown (#1016 rule).
 	int weave_dp_encoding;
 
+	/*!
+	 * ADR-060 R2: @ref weave_dp was made WINDOWLESS for its screen
+	 * (`create_dp_d3d11_for_screen`, window NULL) and declared
+	 * XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN. It then holds no window
+	 * (the vendor never touches another process's HWND), and every weave of
+	 * this client feeds it `set_present_origin` from the service's own read of
+	 * @ref weave_dp_hwnd, relative to @ref weave_dp_screen_x / _y — the screen
+	 * the DP was bound to. False = the window-bound DP (the pre-R2 path).
+	 */
+	bool weave_dp_windowless;
+
+	//! ADR-060 R2: desktop origin of the screen the windowless @ref weave_dp is bound to.
+	int32_t weave_dp_screen_x;
+	int32_t weave_dp_screen_y;
+
+	//! ADR-060 R2: last origin pushed (WARN on the first only; INFO on change).
+	bool weave_dp_origin_valid;
+	int32_t weave_dp_origin_x;
+	int32_t weave_dp_origin_y;
+
+	/*!
+	 * ADR-060 R3 (XR_DXR_weave v12 §5e on Windows): the window origin THIS
+	 * submit fed the windowless DP's phase, desktop-absolute device px —
+	 * pending until the submit is accepted, then latched with a serial. Only a
+	 * windowless DP reports one: a window-bound vendor weaver reads the window
+	 * itself, so a value the service read would be a different, earlier read.
+	 * Written and read on the client's own thread (weave_submit, then its IPC
+	 * reply).
+	 */
+	bool weave_origin_pending;
+	int32_t weave_origin_pending_x;
+	int32_t weave_origin_pending_y;
+	bool weave_woven_valid;
+	int32_t weave_woven_x;
+	int32_t weave_woven_y;
+	uint64_t weave_woven_serial; //!< of the last latched origin; 0 = none yet
+	uint64_t weave_woven_next;   //!< monotonic counter behind weave_woven_serial
+
 	//! HUD overlay (runtime-owned windows only)
 	struct u_hud *hud;
 
@@ -1195,6 +1233,15 @@ struct d3d11_service_compositor
 	struct xrt_screen_list *seg_screens;             //!< heap copy; NULL = segmentation not enabled
 	struct xrt_system_compositor_info *seg_sys_info; //!< heap copy (the DP registry)
 	uint64_t seg_pinned_display_id;
+	/*!
+	 * ADR-060 R2: the screen list the IPC server OFFERED at weave_bind_window
+	 * (heap copy, under @ref seg_mutex). Inert until this client's weave DP
+	 * turns out windowless: then it becomes @ref seg_screens (pin 0), so the
+	 * split rule holds — a windowless vendor weaver interlaces everything it is
+	 * handed, so a window reaching a 2D monitor must be cut per screen by the
+	 * runtime. A client whose DP stayed window-bound never uses it.
+	 */
+	struct xrt_screen_list *weave_offered_screens;
 	bool seg_rebuild; //!< a new list arrived: rebuild the manager on the next weave
 	struct comp_d3d11_segments *segments;
 	struct comp_d3d11_outcomp *seg_outcomp; //!< flat-2D fill, on @ref seg_device
@@ -5644,6 +5691,176 @@ svc_weave_dp_device_ok(struct d3d11_service_system *sys,
 }
 
 /*!
+ * ADR-060 R2 — DXR_WEAVE_WINDOWLESS=0 keeps every present-owner on a DP bound
+ * to its window (the pre-R2 path). Default on: the path below still engages
+ * only for a DP that declares XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN.
+ */
+static bool
+svc_weave_windowless_enabled(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_WEAVE_WINDOWLESS");
+		on = (e != nullptr && e[0] == '0') ? 0 : 1;
+		if (on == 0) {
+			U_LOG_W(
+			    "DXR_WEAVE_WINDOWLESS=0: present-owners weave on a DP bound to their window (ADR-060 R2 "
+			    "off)");
+		}
+	}
+	return on == 1;
+}
+
+/*!
+ * ADR-060 R2 — turn the offered screen list into this client's segment list,
+ * once its weave DP is windowless (split rule (a): the predicate runs on
+ * every weave, the per-screen weave only when the window leaves the primary
+ * screen — weave_seg_update). No-op when the client already enabled segments
+ * itself (its own pin stands) or nothing was offered. Client thread.
+ */
+static void
+svc_weave_activate_offered_screens(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (c == nullptr || !c->render.weave_dp_windowless) {
+		return;
+	}
+	struct xrt_screen_list *list = nullptr;
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		if (c->seg_screens != nullptr || c->weave_offered_screens == nullptr) {
+			return;
+		}
+		list = c->weave_offered_screens;
+		c->weave_offered_screens = nullptr;
+	}
+	U_LOG_W(
+	    "ADR-060 R2: windowless present-owner %p — segmenting its window per screen (%u screens; a 2D "
+	    "monitor's part stays flat)",
+	    (void *)c, list->count);
+	comp_d3d11_service_set_client_segment_screens(&sys->base, reinterpret_cast<struct xrt_compositor *>(c), list,
+	                                              0);
+	free(list);
+}
+
+/*!
+ * ADR-060 R2 — try to make @p c's weave DP WINDOWLESS.
+ *
+ * The present-owner's window belongs to ANOTHER process. A DP bound to it in
+ * the vendor's own window mode tries to subclass it (refused cross-process,
+ * silently) and runs its own occlusion and 2D-region logic on a window it
+ * cannot see into. The runtime is the placement authority here (ADR-033), so
+ * instead: a DP for the primary screen with NO window, phased every weave from
+ * `set_present_origin` (svc_weave_push_present_origin). Used only when the
+ * instance declares XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN — an SDK
+ * without external routing makes a windowless weaver that ignores the origin,
+ * which would be a wrong phase with nothing in the log.
+ *
+ * Same thread and lock rules as the caller (client thread, no render_mutex).
+ *
+ * @return the DP, or NULL ⟹ the caller makes the window-bound one as before.
+ */
+static struct xrt_display_processor_d3d11 *
+svc_make_windowless_weave_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (!svc_weave_windowless_enabled()) {
+		return nullptr;
+	}
+	const struct xrt_system_compositor_info *info = &sys->base.info;
+	const struct xrt_dp_registry_entry *e =
+	    xrt_dp_registry_primary_entry(&info->dp_registry, info->active_plugin_id);
+	const struct xrt_plugin_iface *iface =
+	    e != nullptr ? (const struct xrt_plugin_iface *)e->owning_iface : nullptr;
+	if (e == nullptr || e->dp_factory_d3d11 == nullptr || !xrt_plugin_iface_has_create_dp_d3d11_for_screen(iface) ||
+	    e->pixel_width == 0 || e->pixel_height == 0) {
+		return nullptr; // no per-screen factory, or no screen rect to phase against
+	}
+	if ((e->claim_apis & XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE) == 0) {
+		// The plug-in did not say it can (an older plug-in, or a vendor SDK
+		// without external routing): skip the create rather than bring a
+		// vendor weaver up only to destroy it. Once per client.
+		U_LOG_W("ADR-060 R2: '%s' does not hint windowless phase for this screen — window-bound weave DP",
+		        e->plugin_id);
+		return nullptr;
+	}
+
+	struct xrt_screen_binding b;
+	memset(&b, 0, sizeof(b));
+	b.struct_size = (uint32_t)sizeof(b);
+	b.monitor_id = e->monitor_id;
+	b.desktop_left = e->screen_left;
+	b.desktop_top = e->screen_top;
+	b.desktop_width = e->pixel_width;
+	b.desktop_height = e->pixel_height;
+	snprintf(b.serial, sizeof(b.serial), "%s", e->serial);
+
+	struct xrt_display_processor_d3d11 *dp = nullptr;
+	xrt_result_t ret = iface->create_dp_d3d11_for_screen((struct xrt_plugin_instance *)e->owning_instance,
+	                                                     sys->device.get(), sys->context.get(), nullptr, &b, &dp);
+	if (ret != XRT_SUCCESS || dp == nullptr) {
+		U_LOG_W("ADR-060 R2: windowless weave DP refused by '%s' (error %d) — using the window-bound DP",
+		        e->plugin_id, (int)ret);
+		return nullptr;
+	}
+	if (!xrt_display_processor_d3d11_phases_from_present_origin(dp)) {
+		// One per client: an older plug-in, or a vendor SDK without external routing.
+		U_LOG_W(
+		    "ADR-060 R2: '%s' DP does not declare PHASE_FROM_PRESENT_ORIGIN — destroyed; this present-owner "
+		    "weaves on a DP bound to its window, as before",
+		    e->plugin_id);
+		xrt_display_processor_d3d11_destroy(&dp);
+		return nullptr;
+	}
+	c->render.weave_dp_screen_x = e->screen_left;
+	c->render.weave_dp_screen_y = e->screen_top;
+	return dp;
+}
+
+//! The window's client area in desktop device px (defined with the segment path).
+static bool
+svc_seg_window_rect(HWND hwnd, struct comp_seg_rect *out);
+
+/*!
+ * ADR-060 R2 — feed a windowless weave DP the window's origin on its screen,
+ * read now from the window manager (the placement authority, ADR-033).
+ * `GetClientRect` / `ClientToScreen` work cross-process and the service is
+ * per-monitor DPI aware, so this is device px in the screen registry's space.
+ * Call before every process_atlas of the weave (cheap; a drag moves it). The
+ * per-segment DPs of a split weave are fed by the segment manager; this is
+ * the client's own DP, which weaves the primary screen's part.
+ *
+ * Holding render_mutex (the caller is weave_submit).
+ */
+static void
+svc_weave_push_present_origin(struct d3d11_service_compositor *c, struct xrt_display_processor_d3d11 *dp, HWND wnd)
+{
+	if (c == nullptr || dp == nullptr || dp != c->render.weave_dp || !c->render.weave_dp_windowless) {
+		return;
+	}
+	struct comp_seg_rect win = {};
+	if (!svc_seg_window_rect(wnd, &win)) {
+		return; // the window is gone or zero-sized: keep the last origin
+	}
+	const int32_t x = win.x - c->render.weave_dp_screen_x;
+	const int32_t y = win.y - c->render.weave_dp_screen_y;
+	xrt_display_processor_d3d11_set_present_origin(dp, x, y);
+	// R3: what this weave was phased for, latched once the submit is accepted.
+	c->render.weave_origin_pending = true;
+	c->render.weave_origin_pending_x = win.x;
+	c->render.weave_origin_pending_y = win.y;
+	if (!c->render.weave_dp_origin_valid) {
+		U_LOG_W(
+		    "ADR-060 R2: windowless weave DP phased from present origin (%d,%d) — window %p at (%d,%d), "
+		    "screen at (%d,%d)",
+		    x, y, (void *)wnd, win.x, win.y, c->render.weave_dp_screen_x, c->render.weave_dp_screen_y);
+	} else if (x != c->render.weave_dp_origin_x || y != c->render.weave_dp_origin_y) {
+		U_LOG_I("ADR-060 R2: present origin -> (%d,%d)", x, y);
+	}
+	c->render.weave_dp_origin_valid = true;
+	c->render.weave_dp_origin_x = x;
+	c->render.weave_dp_origin_y = y;
+}
+
+/*!
  * #1172 — build @p c's own INGEST-device display processor, once.
  *
  * MUST be called from the client's OWN thread and WITHOUT `render_mutex` held.
@@ -5677,6 +5894,16 @@ svc_ensure_client_weave_dp(struct d3d11_service_system *sys, struct d3d11_servic
 		if (c->render.weave_dp_hwnd == hwnd) {
 			return; // already ours, on the right window
 		}
+		if (c->render.weave_dp_windowless) {
+			// ADR-060 R2: a windowless DP holds no window, so a rebind is just a
+			// new window to read the origin from — no destroy, no vendor call.
+			U_LOG_W(
+			    "ADR-060 R2: client window moved %p -> %p — the windowless weave DP follows it in place",
+			    (void *)c->render.weave_dp_hwnd, (void *)hwnd);
+			c->render.weave_dp_hwnd = hwnd;
+			c->render.weave_dp_origin_valid = false;
+			return;
+		}
 		// Rebound to a different window: one weaver per HWND means destroy
 		// before recreate, never two live against the same client.
 		U_LOG_W("#1172 weave DP: client window moved %p -> %p — recreating its ingest DP",
@@ -5684,6 +5911,8 @@ svc_ensure_client_weave_dp(struct d3d11_service_system *sys, struct d3d11_servic
 		xrt_display_processor_d3d11_destroy(&c->render.weave_dp);
 		c->render.weave_dp_hwnd = nullptr;
 		c->render.weave_dp_refused = false;
+		c->render.weave_dp_windowless = false;
+		c->render.weave_dp_origin_valid = false;
 	}
 	if (c->render.weave_dp_refused) {
 		return;
@@ -5722,6 +5951,23 @@ svc_ensure_client_weave_dp(struct d3d11_service_system *sys, struct d3d11_servic
 		return;
 	}
 
+	// ADR-060 R2: a DP that needs no window, when the plug-in can make one.
+	c->render.weave_dp = svc_make_windowless_weave_dp(sys, c);
+	if (c->render.weave_dp != nullptr) {
+		c->render.weave_dp_windowless = true;
+		c->render.weave_dp_origin_valid = false;
+		c->render.weave_dp_hwnd = hwnd;
+		c->render.weave_dp_client_presents = -1;
+		c->render.weave_dp_encoding = -1;
+		(void)xrt_display_processor_d3d11_set_transparent_background(c->render.weave_dp, true, true);
+		U_LOG_W(
+		    "[pipeline] this client weaves on its OWN WINDOWLESS display processor (ADR-060 R2: dp=%p, window "
+		    "%p read for its origin only, never handed to the vendor; device=%p)",
+		    (void *)c->render.weave_dp, (void *)hwnd, (void *)sys->device.get());
+		svc_weave_activate_offered_screens(sys, c);
+		return;
+	}
+
 	void *dp_fac = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
 	if (dp_fac == nullptr) {
 		c->render.weave_dp_refused = true;
@@ -5743,6 +5989,7 @@ svc_ensure_client_weave_dp(struct d3d11_service_system *sys, struct d3d11_servic
 	}
 
 	c->render.weave_dp_hwnd = hwnd;
+	c->render.weave_dp_windowless = false;
 	// #1016: a fresh DP's state is unknown; the weave sites assert both.
 	c->render.weave_dp_client_presents = -1;
 	c->render.weave_dp_encoding = -1;
@@ -7403,6 +7650,8 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_dp_refused = false;
 	res->weave_dp_client_presents = -1;
 	res->weave_dp_encoding = -1;
+	res->weave_dp_windowless = false;
+	res->weave_dp_origin_valid = false;
 
 	res->back_buffer_rtv.reset();
 	res->crop_srv.reset();
@@ -27848,6 +28097,8 @@ compositor_destroy(struct xrt_compositor *xc)
 	c->seg_screens = nullptr;
 	free(c->seg_sys_info);
 	c->seg_sys_info = nullptr;
+	free(c->weave_offered_screens);
+	c->weave_offered_screens = nullptr;
 
 	delete c;
 }
@@ -31559,6 +31810,11 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// anything else, so its submit is the single-DP one, byte for byte.
 	struct comp_seg_rect seg_win = {};
 	const bool seg_split = !legacy_single_rect && weave_seg_update(sys, c, wnd, win_w, win_h, &seg_win);
+	// ADR-060 R2: a windowless weave DP takes its phase from the origin the
+	// service reads now — every weave site below (v6, batch, legacy, and the
+	// primary segment of a split weave, whose canvas offset adds to it).
+	c->render.weave_origin_pending = false;
+	svc_weave_push_present_origin(c, dp, wnd);
 	bool clear_output = weave_frame_first;
 	if (weave_frame_first) {
 		c->render.weave_saw_frame_first = true;
@@ -32179,6 +32435,38 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		cpu_ms[WEAVE_CPU_SUBMIT] = (double)((int64_t)os_monotonic_get_ns() - t_entry_ns) / 1e6;
 		weave_timing_account(sys, &c->render, cpu_ms, timing_path, timing_route, ov_unchanged, win_w, win_h);
 	}
+	// ADR-060 R3: latch the origin this accepted weave used (none for a
+	// window-bound DP: valid false, serial 0, exactly the pre-R3 reply).
+	c->render.weave_woven_valid = c->render.weave_origin_pending;
+	if (c->render.weave_origin_pending) {
+		c->render.weave_woven_x = c->render.weave_origin_pending_x;
+		c->render.weave_woven_y = c->render.weave_origin_pending_y;
+		c->render.weave_woven_serial = ++c->render.weave_woven_next;
+	} else {
+		c->render.weave_woven_serial = 0;
+	}
+	return true;
+}
+
+bool
+comp_d3d11_service_weave_get_woven_origin(struct xrt_compositor *xc,
+                                          int32_t *out_x,
+                                          int32_t *out_y,
+                                          uint64_t *out_serial)
+{
+	*out_x = 0;
+	*out_y = 0;
+	*out_serial = 0;
+	if (xc == nullptr) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (!c->render.weave_woven_valid) {
+		return false;
+	}
+	*out_x = c->render.weave_woven_x;
+	*out_y = c->render.weave_woven_y;
+	*out_serial = c->render.weave_woven_serial;
 	return true;
 }
 
@@ -35309,6 +35597,30 @@ comp_d3d11_service_set_client_segment_screens(struct xrt_system_compositor *xsys
 	    "segments: IPC client %p (pid %ld) enabled segments — %u screen(s) in the registry, pinned display "
 	    "0x%016llx",
 	    (void *)c, c->client_pid, list->count, (unsigned long long)pinned_display_id);
+}
+
+void
+comp_d3d11_service_weave_offer_screens(struct xrt_system_compositor *xsysc,
+                                       struct xrt_compositor *xc,
+                                       const struct xrt_screen_list *list)
+{
+	if (xsysc == nullptr || xc == nullptr || list == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (copy == nullptr) {
+		return;
+	}
+	*copy = *list;
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		free(c->weave_offered_screens);
+		c->weave_offered_screens = copy;
+	}
+	// A rebind to a new window of a client already weaving windowless.
+	svc_weave_activate_offered_screens(sys, c);
 }
 
 //! The screen of @p list with id @p id, or nullptr.

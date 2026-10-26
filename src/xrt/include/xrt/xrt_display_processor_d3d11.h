@@ -1701,6 +1701,28 @@ xrt_display_processor_d3d11_tolerates_resample(struct xrt_display_processor_d3d1
 }
 
 /*!
+ * May this instance weave a window it does not hold
+ * (@ref XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN)? Every "didn't answer"
+ * case — NULL DP, absent slot, NULL, false return — is false, so a plug-in
+ * built before the bit keeps its window-bound path.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_phases_from_present_origin(struct xrt_display_processor_d3d11 *xdp)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	struct xrt_dp_scanout_caps caps;
+	xrt_dp_scanout_caps_init(&caps);
+	if (!xrt_display_processor_d3d11_get_scanout_caps(xdp, &caps)) {
+		return false;
+	}
+	return (caps.flags & XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN) != 0;
+}
+
+/*!
  * @copydoc xrt_display_processor_d3d11::accepts_atlas_encoding
  *
  * Every "didn't answer" case — NULL DP, absent slot, NULL — is false.

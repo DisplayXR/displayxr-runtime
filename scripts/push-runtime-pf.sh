@@ -20,6 +20,29 @@
 #      instead of on some future restart.
 set -euo pipefail
 
+# Opt-in: --browser-dir <dir> kills only the chrome.exe processes whose image is
+# under <dir> (the DisplayXR Browser's install dir) instead of EVERY chrome.exe —
+# for a shared box where someone's ordinary Chrome must survive a push. Without
+# it the behaviour is unchanged.
+BROWSER_DIR=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --browser-dir) BROWSER_DIR="$2"; shift 2 ;;
+    *) echo "ERROR: unknown argument: $1 (only --browser-dir <dir>)" >&2; exit 2 ;;
+  esac
+done
+
+# Kill chrome.exe processes running from under $1 (a Windows or POSIX path) only.
+kill_browser_under() {
+  local win
+  win="$(cygpath -w "$1" 2>/dev/null || printf '%s' "$1")"
+  win="${win%\\}"
+  case "$win" in *"'"*) echo "ERROR: --browser-dir must not contain a quote: $win" >&2; exit 2 ;; esac
+  powershell.exe -NoProfile -Command \
+    "Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { \$_.Path -and \$_.Path.StartsWith('$win\\', [StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force" \
+    >/dev/null 2>&1 || true
+}
+
 PKG="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/_package/bin"
 PF="/c/Program Files/DisplayXR/Runtime"
 [ -f "$PKG/DisplayXRClient.dll" ] || { echo "ERROR: $PKG has no runtime build (run scripts/build_windows.bat build first)" >&2; exit 1; }
@@ -30,7 +53,13 @@ tag_of() { grep -aoE "v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-g[0-9a-f]+|v[0-9]+\.[0-9]+\
 echo "== build tag in _package: $(tag_of "$PKG/DisplayXRClient.dll")"
 
 # 2. Kill client processes that hold DisplayXRClient.dll (NOT the service).
-for exe in chrome.exe cube_handle_d3d11_win.exe cube_hosted_d3d11_win.exe \
+if [ -n "$BROWSER_DIR" ]; then
+  kill_browser_under "$BROWSER_DIR"
+  echo "== closed only the browser under $BROWSER_DIR (--browser-dir); other Chrome windows untouched"
+else
+  taskkill //F //IM chrome.exe >/dev/null 2>&1 || true
+fi
+for exe in cube_handle_d3d11_win.exe cube_hosted_d3d11_win.exe \
            cube_handle_d3d12_win.exe cube_handle_gl_win.exe cube_handle_vk_win.exe \
            displayxr-shell.exe; do
   taskkill //F //IM "$exe" >/dev/null 2>&1 || true
@@ -134,7 +163,7 @@ fi
 # 5. Restart the service so any residual mismatch surfaces immediately.
 taskkill //F //IM displayxr-service.exe >/dev/null 2>&1 || true
 sleep 1
-explorer.exe "C:\\Program Files\\DisplayXR\\Runtime\\displayxr-service.exe"
+explorer.exe "C:\\Program Files\\DisplayXR\\Runtime\\displayxr-service.exe" || true  # explorer.exe exits non-zero on success; set -e would abort
 sleep 3
 tasklist //FI "IMAGENAME eq displayxr-service.exe" 2>/dev/null | grep -qi displayxr-service.exe \
   && echo "== service restarted (non-elevated), versions consistent: $CT" \

@@ -908,8 +908,12 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint64_t *out_fence_value,
                                         struct xrt_eye_positions *out_eyes,
                                         uint32_t *out_segment_count,
-                                        uint32_t *out_lift_cursor_mask)
+                                        uint32_t *out_lift_cursor_mask,
+                                        struct xrt_weave_woven_origin *out_origin)
 {
+	if (out_origin != NULL) {
+		memset(out_origin, 0, sizeof(*out_origin));
+	}
 	if (xc == NULL || out_have_output == NULL || out_width == NULL || out_height == NULL ||
 	    out_fence_value == NULL || out_eyes == NULL || out_lift_cursor_mask == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -966,10 +970,11 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	struct xrt_eye_positions eyes = {0};
 	uint32_t segs = 0;
 	uint32_t lift_cursor_mask = 0;
+	struct ipc_weave_woven_origin origin = {0};
 	// Generated arg order: in args, then in_handles (handles, count), then out
 	// args. This copies the handles, it does not consume them.
-	xrt_result_t xret = ipc_call_weave_submit(icc->ipc_c, &args, handles, handle_count, &have, &w, &h, &fv,
-	                                          &eyes, &segs, &lift_cursor_mask);
+	xrt_result_t xret = ipc_call_weave_submit(icc->ipc_c, &args, handles, handle_count, &have, &w, &h, &fv, &eyes,
+	                                          &segs, &lift_cursor_mask, &origin);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
@@ -982,6 +987,17 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 		*out_segment_count = segs;
 	}
 	*out_lift_cursor_mask = lift_cursor_mask;
+	// v12 §5e on Windows (ADR-060 R3): field by field off the wire POD.
+	if (out_origin != NULL) {
+		out_origin->valid = origin.valid != 0;
+		out_origin->x = origin.x;
+		out_origin->y = origin.y;
+		out_origin->logical_valid = origin.valid != 0 && origin.logical_valid != 0;
+		out_origin->logical_x = origin.logical_x;
+		out_origin->logical_y = origin.logical_y;
+		out_origin->logical_scale = origin.logical_scale;
+		out_origin->serial = origin.serial;
+	}
 	return XRT_SUCCESS;
 }
 

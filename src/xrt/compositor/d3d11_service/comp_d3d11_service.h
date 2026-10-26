@@ -392,6 +392,22 @@ comp_d3d11_service_set_client_segment_screens(struct xrt_system_compositor *xsys
                                               uint64_t pinned_display_id);
 
 /*!
+ * ADR-060 R2: the IPC server OFFERS a present-owner the screen list at
+ * `weave_bind_window` (from its own instance's `enumerate_displays`). Inert
+ * unless the client's weave DP is windowless
+ * (XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN): only then does it become the
+ * client's segment list (pin 0), so the runtime cuts the window per screen
+ * where the vendor's own 2D-region logic no longer runs. A client that enabled
+ * segments itself keeps its own list and pin.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_weave_offer_screens(struct xrt_system_compositor *xsysc,
+                                       struct xrt_compositor *xc,
+                                       const struct xrt_screen_list *list);
+
+/*!
  * Display dashboard phase 7: the screen registry was re-resolved (a display
  * re-probe — after a per-screen DP preference changed, or a monitor was
  * plugged, unplugged or moved: WM_DISPLAYCHANGE feeds the same worker). For
@@ -1678,6 +1694,20 @@ comp_d3d11_service_weave_get_segments(struct xrt_compositor *xc, struct xrt_segm
  */
 uint32_t
 comp_d3d11_service_weave_segment_count(struct xrt_compositor *xc);
+
+/*!
+ * XR_DXR_weave v12 §5e on Windows (ADR-060 R3): the window origin the last
+ * ACCEPTED submit of @p xc was phased for, desktop-absolute device px, with its
+ * serial (monotonic, >= 1). Known only when the client's weave DP is windowless
+ * (the service fed that origin to `set_present_origin`); a window-bound vendor
+ * weaver reads its window itself, so nothing exact can be reported — false,
+ * all outputs 0, the pre-R3 reply.
+ */
+bool
+comp_d3d11_service_weave_get_woven_origin(struct xrt_compositor *xc,
+                                          int32_t *out_x,
+                                          int32_t *out_y,
+                                          uint64_t *out_serial);
 
 /*!
  * The screen a zone-scoped locate of client @p xc must be framed against

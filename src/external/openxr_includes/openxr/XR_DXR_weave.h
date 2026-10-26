@@ -1055,9 +1055,12 @@ typedef struct XrWeaveWindowLogicalOriginDXR {
  * COMP_VK_NATIVE_WL_MOVE_SYNC_TAG_MOD; it is deliberately not part of this API.
  * Tag only when @c logicalValid.
  *
- * Filled on the desktop-Linux dma-buf submit path (XrWeaveDmabufDescDXR). Every
- * other path of a v12 runtime writes @c valid = @c logicalValid = XR_FALSE and
- * @c serial = 0, so a portable caller may always chain it. A runtime older than
+ * Filled on the desktop-Linux dma-buf submit path (XrWeaveDmabufDescDXR), and on
+ * the Windows D3D11 service while the caller's weave display processor is
+ * windowless (the service then phases it from its own read of the bound window;
+ * @c logicalValid stays XR_FALSE). Every other path of a v12 runtime writes
+ * @c valid = @c logicalValid = XR_FALSE and @c serial = 0, so a portable caller
+ * may always chain it. A runtime older than
  * v12 never touches the struct: zero-initialise it (or check the enabled
  * extension's spec version) so an untouched struct reads as "not reported".
  */

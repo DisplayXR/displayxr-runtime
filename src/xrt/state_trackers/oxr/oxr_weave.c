@@ -182,7 +182,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint64_t *out_fence_value,
                                         struct xrt_eye_positions *out_eyes,
                                         uint32_t *out_segment_count,
-                                        uint32_t *out_lift_cursor_mask);
+                                        uint32_t *out_lift_cursor_mask,
+                                        struct xrt_weave_woven_origin *out_origin);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req);
@@ -1204,7 +1205,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
 		    layout.view_count > 0 ? &layout : NULL, flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL,
 		    mono_in_2d, overlay_unchanged, overlay_filter_strength, &have_out, &w, &h, &fence_value, &eyes,
-		    &submit_segment_count, &lift_cursor_mask);
+		    &submit_segment_count, &lift_cursor_mask, &woven);
 	}
 	if (xret == XRT_ERROR_FEATURE_NOT_SUPPORTED) {
 		// The service has no weave engine for this platform (desktop Linux
