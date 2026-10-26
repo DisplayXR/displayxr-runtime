@@ -99,3 +99,36 @@ TEST_CASE("texture target: present origin is relative to the weaving screen")
 	CHECK(ox2 - 326 == 1);
 	CHECK(oy2 == 220);
 }
+
+TEST_CASE("texture target: anchor fallback weaves the canvas at the target's offset in the anchor")
+{
+	// A DCC viewport at (113,67) inside the anchor window whose client area sits at (26,82).
+	comp_texture_target tt = bound(113, 67, 2636, 1034);
+	comp_texture_target_resolved r{};
+	REQUIRE(comp_texture_target_compose(&tt, 26, 82, 3840, 2160, &r));
+	int32_t ox = -1, oy = -1;
+	REQUIRE(comp_texture_target_anchor_offset(&r, 26, 82, 0, 0, 16384, &ox, &oy));
+	CHECK(ox == 113);
+	CHECK(oy == 67);
+
+	// The reference differs from the anchor: the offset is relative to the anchor.
+	REQUIRE(comp_texture_target_anchor_offset(&r, 0, 0, 0, 0, 16384, &ox, &oy));
+	CHECK(ox == 139);
+	CHECK(oy == 149);
+
+	// Nothing to correct when the canvas starts at the anchor's client origin.
+	CHECK_FALSE(comp_texture_target_anchor_offset(&r, 139, 149, 0, 0, 16384, &ox, &oy));
+	CHECK(ox == 0);
+	CHECK(oy == 0);
+	// Left of / above the anchor's client area: no render target pixel can hold it.
+	CHECK_FALSE(comp_texture_target_anchor_offset(&r, 140, 0, 0, 0, 16384, &ox, &oy));
+	CHECK_FALSE(comp_texture_target_anchor_offset(&r, 0, 150, 0, 0, 16384, &ox, &oy));
+	// Inside the anchor's client area (partial overlap is fine)...
+	CHECK(comp_texture_target_anchor_offset(&r, 26, 82, 1280, 720, 16384, &ox, &oy));
+	// ...but starting at or past its right/bottom edge leaves the weaver nothing to weave.
+	CHECK_FALSE(comp_texture_target_anchor_offset(&r, 26, 82, 113, 720, 16384, &ox, &oy));
+	CHECK_FALSE(comp_texture_target_anchor_offset(&r, 26, 82, 1280, 67, 16384, &ox, &oy));
+	// The padded render target would exceed the device limit.
+	CHECK_FALSE(comp_texture_target_anchor_offset(&r, 0, 0, 0, 0, 2700, &ox, &oy));
+	CHECK_FALSE(comp_texture_target_anchor_offset(nullptr, 0, 0, 0, 0, 16384, &ox, &oy));
+}

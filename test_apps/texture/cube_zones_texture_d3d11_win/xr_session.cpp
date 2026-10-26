@@ -357,6 +357,19 @@ bool TextureTargetEnabled() {
     return enabled == 1;
 }
 
+void TextureTargetInset(int* x, int* y) {
+    static int ix = -1, iy = 0;
+    if (ix < 0) {
+        ix = 0;
+        const char* e = getenv("DXR_TEXTURE_TARGET_INSET");
+        if (e != nullptr && sscanf(e, "%d,%d", &ix, &iy) != 2) { ix = 0; iy = 0; }
+        if (ix < 0) ix = 0;
+        if (iy < 0) iy = 0;
+    }
+    *x = ix;
+    *y = iy;
+}
+
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device,
                    HANDLE sharedTextureHandle, HWND appHwnd) {
     LOG_INFO("Creating OpenXR session with shared texture handle + window binding...");
@@ -402,9 +415,11 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device,
         RECT rc = {};
         GetClientRect(appHwnd, &rc);
         textureTarget.referenceWindow = (void*)appHwnd;
-        textureTarget.initialTargetRect.offset = {0, 0};
-        textureTarget.initialTargetRect.extent = {rc.right > 0 ? (int32_t)rc.right : 1,
-                                                  rc.bottom > 0 ? (int32_t)rc.bottom : 1};
+        int ix = 0, iy = 0;
+        TextureTargetInset(&ix, &iy);
+        textureTarget.initialTargetRect.offset = {ix, iy};
+        textureTarget.initialTargetRect.extent = {rc.right - ix > 0 ? (int32_t)(rc.right - ix) : 1,
+                                                  rc.bottom - iy > 0 ? (int32_t)(rc.bottom - iy) : 1};
         sessionTarget.next = &textureTarget;
         const char* na = getenv("DXR_TEXTURE_TARGET_NOANCHOR");
         if (na != nullptr && na[0] == '1') {
