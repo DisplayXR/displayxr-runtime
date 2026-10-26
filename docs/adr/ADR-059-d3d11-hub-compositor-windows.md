@@ -300,6 +300,58 @@ legs keep their own copies until P5 deletes them.
 - **VK present_wait extras.** None is lost relative to native VK on Windows. The present_wait
   tier itself, which native VK uses on dGPUs, is replaced by the DXGI pacer; see *Consequences*.
 
+## Amendment 3 (2026-10-26) — client-presents: texture-class sessions on the hub (#2370)
+
+The hub gains a third presenter strategy (ADR-035 D3), **client-presents**, for texture-class
+(`_texture`) sessions. It has no hub swapchain and no hub `Present`. The hub composites and crops as
+on the swapchain strategy. A windowless primary DP weaves into the **caller's** shared texture,
+which the hub opens on its own device. The caller presents.
+
+- **Device placement follows the presenter.** The hub device is created on the caller's adapter (by
+  LUID), not on the scanout adapter. The caller presents, so the weave goes where the present is:
+  there is no egress copy, and DIRECT is the only ingress. A ring frame that asks for xbridge stays
+  DIRECT.
+- **Phase** follows ADR-060 R2. The DP is created windowless through `create_dp_d3d11_for_screen`.
+  It is kept only when the plug-in hints windowless phase and the instance declares
+  `XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN`. Every weave feeds it `set_present_origin(target
+  − screen origin)`, and the segment manager does the same on the split path. The rule lives in
+  one place, `util/comp_dp_windowless_d3d11.h`, shared with the native D3D11 texture path.
+- **Handoff.** After the weave and composite the hub signals its DIRECT consumer fence and flushes.
+  The tier GPU-waits that fence on the caller's context (D3D11) or queue (D3D12) at the end of the
+  frame submit. The texture contract is unchanged ("after `xrEndFrame`, use the texture"), and
+  there is no CPU wait (ADR-055).
+- **Capture:** `…woven.png` is the caller's texture.
+- **Witness:** `[WITNESS] site=d3d11-hub-client`, where "present" means a handoff.
+
+### One policy, one token
+
+Client-presents is **default OFF**: only `DXR_HUB=1` engages it, on either tier. Every texture
+session it does not take is refused with the one closed token `shared_texture_session`, behind one
+WARN naming the rung. The tier's own legs then compose exactly as before. The refusal rungs are the
+same on both tiers. Under `DXR_HUB=1` both tiers print `hub placement: hub=0 reason=shared_texture_session`
+(the D3D12 tier prints no `hub placement:` line otherwise, unchanged):
+
+| Rung | D3D11 | D3D12 |
+|---|---|---|
+| `DXR_HUB` not `1` | silent (pre-#2370 line) | silent (no `hub placement:` line, as before) |
+| transparent session | refused | refused |
+| PQ atlas requested | refused | n/a (the tier has no PQ atlas) |
+| no target | not bound to a v9 texture target | no `windowHandle` |
+| no registry entry / handle / factory | refused | refused |
+| no windowless DP with the flag | refused (in the hub's Stage A) | refused (in the hub's Stage A) |
+| DIRECT wiring or fence bind fails | refused | refused |
+
+### Known limitations (follow-ups)
+
+- **No repaint.** A re-weave between app frames would write the texture while the caller may be
+  reading it, and the caller has no fence it could wait on between frames. `comp_hub_d3d11_repaint`
+  returns `NOT_ADMITTED` and the tiers keep their replay disarmed. The fix is an app-visible release
+  fence in a later revision of the ADR-060 binding (#2378).
+- **D3D12 has no v9 target binding yet.** On D3D12 the target is the `windowHandle`'s whole client
+  area. A sub-rect target therefore phases from the client-area corner, and no
+  `XrWin32TextureTargetStateDXR` is produced (#2382).
+- **OpenGL texture mode** is not carried; it waits for the GL shim (#2366).
+
 ## References
 
 - Epic #2317; PRs #2321 (hub extraction + `DXR_HUB=1` shim + D rows), #2323 (A/B harness),

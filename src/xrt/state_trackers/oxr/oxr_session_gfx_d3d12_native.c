@@ -107,7 +107,10 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
 	void *dp_factory_d3d11 = NULL;
 	int32_t display_screen_left = 0;
 	int32_t display_screen_top = 0;
+	// #2370: the session screen's registry entry, for the hub's windowless DP.
+	const void *windowless_dp_entry = NULL;
 	if (sys->xsysc != NULL) {
+		windowless_dp_entry = (const void *)comp_dp_entry_for_session(&sys->xsysc->info, bound_display_id);
 		// #2218: a session bound to a display takes that monitor's plug-in (both arms).
 		dp_factory_d3d12 = comp_dp_factory_for_session(&sys->xsysc->info, bound_display_id, COMP_DP_API_D3D12);
 		dp_factory_d3d11 = comp_dp_factory_for_session(&sys->xsysc->info, bound_display_id, COMP_DP_API_D3D11);
@@ -120,7 +123,7 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
 	    xdev, window_handle, shared_texture_handle,
 	    (void *)next->device, (void *)next->queue,
 	    dp_factory_d3d12, dp_factory_d3d11, transparent_background,
-	    display_screen_left, display_screen_top, &xcn);
+	    display_screen_left, display_screen_top, windowless_dp_entry, &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create D3D12 native compositor: %d", xret);
