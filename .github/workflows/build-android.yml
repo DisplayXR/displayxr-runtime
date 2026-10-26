@@ -218,7 +218,13 @@ jobs:
       # deadlock after boot (every app 2D until the service was force-stopped);
       # CNSDK #756: panel SPR wake guard (Lume phone class: double image in every
       # 3D app after a sleep/wake). Service-side only; no API/loader change.
-      CNSDK_TAG: v0.10.83
+      # v0.10.85: matches leia-plugin v2.18.2 (built against
+      # cnsdk-android-0.10.85+210.7647837.zip). CNSDK #758: the head-tracking engine
+      # rebuilds the session when the camera stops delivering frames without an
+      # error (2 s stall, #754 back-off) instead of waiting ~30 s for the plug-in
+      # watchdog; CNSDK #757: a tracking-camera override uses that camera's pose.
+      # No API, loader or INTRODUCED_IN change. (v0.10.84 = #757 only, no release.)
+      CNSDK_TAG: v0.10.85
 
     steps:
 
