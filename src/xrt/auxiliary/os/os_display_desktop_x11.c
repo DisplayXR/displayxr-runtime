@@ -36,6 +36,32 @@
  * same `XRRGetMonitors` result (@ref query_monitors), so they cannot disagree
  * about the layout — which matters, because panel selection consults both.
  *
+ * ## An X error on our connection stays on our connection (#2311)
+ *
+ * Every connection here is private and only queried, so an X error on it just
+ * means "that output is gone / unreadable", which every caller already treats
+ * as unknown. Left to Xlib, though, it goes to the process-global error
+ * handler, and the default one prints "X Error of failed request" and exits
+ * the HOST process. Since the in-process display-hotplug sweep (#2305) re-reads
+ * RandR around every topology change, an output destroyed between
+ * XRRGetMonitors and XRRGetOutputProperty (XWayland destroys a monitor's
+ * output with it) killed the app with BadRROutput.
+ *
+ * So each connection carries its own error hook (@ref x11_open_private): the
+ * per-display hook of Xlib's extension interface (XAddExtension + XESetError),
+ * which `_XReply` offers every error on that connection before the global
+ * handler. Every request here waits for its reply, so every error passes it.
+ *
+ * Not XSetErrorHandler: that handler is process-wide. Swapped in from the
+ * sweep's worker thread it would also swallow the app's own errors raised on
+ * its render / event thread meanwhile (a toolkit's error trap then misses
+ * them), and a save / restore interleaved with the app or a toolkit doing the
+ * same can leave the wrong handler installed for good. The hook is state of a
+ * Display only the calling thread uses and dies with XCloseDisplay: no global
+ * state, nothing to restore, nothing to race. xcb's checked requests would
+ * isolate errors too, at the price of rewriting both readers against two more
+ * dlopen'd libraries.
+ *
  * ## Wayland
  *
  * Not handled here, and not handleable: a Wayland client is deliberately denied
@@ -76,6 +102,18 @@ struct os_xrr_monitor_info
 	void *outputs;
 };
 
+//! XExtCodes; only `extension` is read.
+struct os_x_ext_codes
+{
+	int extension;
+	int major_opcode;
+	int first_event;
+	int first_error;
+};
+
+//! An XESetError hook: (display, xError *, codes, ret_code), True suppresses the error.
+typedef int (*os_x_error_hook)(os_x_display *, void *, struct os_x_ext_codes *, int *);
+
 struct x11_fns
 {
 	void *lib_x11;
@@ -86,6 +124,8 @@ struct x11_fns
 	os_x_window (*XDefaultRootWindow)(os_x_display *);
 	char *(*XGetAtomName)(os_x_display *, os_x_atom);
 	int (*XFree)(void *);
+	struct os_x_ext_codes *(*XAddExtension)(os_x_display *);
+	os_x_error_hook (*XESetError)(os_x_display *, int, os_x_error_hook);
 
 	struct os_xrr_monitor_info *(*XRRGetMonitors)(os_x_display *, os_x_window, int, int *);
 	void (*XRRFreeMonitors)(struct os_xrr_monitor_info *);
@@ -139,6 +179,10 @@ x11_fns_load(struct x11_fns *f)
 	LOAD(lib_x11, XDefaultRootWindow, "XDefaultRootWindow");
 	LOAD(lib_x11, XGetAtomName, "XGetAtomName");
 	LOAD(lib_x11, XFree, "XFree");
+	// Required, not optional: no request goes out on a connection without
+	// the error hook (#2311). Both are in every libX11 since X11R4.
+	LOAD(lib_x11, XAddExtension, "XAddExtension");
+	LOAD(lib_x11, XESetError, "XESetError");
 	LOAD(lib_xrandr, XRRGetMonitors, "XRRGetMonitors");
 	LOAD(lib_xrandr, XRRFreeMonitors, "XRRFreeMonitors");
 
@@ -166,6 +210,44 @@ x11_fns_unload(struct x11_fns *f)
 		dlclose(f->lib_x11);
 	}
 	memset(f, 0, sizeof(*f));
+}
+
+/*!
+ * Every X error on a private connection: suppressed, and the request that
+ * raised it returns its failure value (NULL / None / the error code), which
+ * the callers already handle as "unknown" (#2311).
+ */
+static int
+x11_private_error_hook(os_x_display *dpy, void *err, struct os_x_ext_codes *codes, int *ret_code)
+{
+	(void)dpy;
+	(void)err;
+	(void)codes;
+	*ret_code = 0; // what _XReply returns: no reply
+	return 1;
+}
+
+/*!
+ * XOpenDisplay(NULL) with @ref x11_private_error_hook installed on the new
+ * connection, before its first request (see "An X error on our connection" at
+ * the top). NULL when there is no display, or when the hook cannot be
+ * installed: then no request is sent at all.
+ */
+static os_x_display *
+x11_open_private(const struct x11_fns *f)
+{
+	// NULL honours $DISPLAY.
+	os_x_display *dpy = f->XOpenDisplay(NULL);
+	if (dpy == NULL) {
+		return NULL;
+	}
+	const struct os_x_ext_codes *codes = f->XAddExtension(dpy);
+	if (codes == NULL) {
+		f->XCloseDisplay(dpy);
+		return NULL;
+	}
+	(void)f->XESetError(dpy, codes->extension, x11_private_error_hook);
+	return dpy;
 }
 
 //! Squared distance from (x, y) to the nearest edge of a monitor rect, 0 inside.
@@ -211,9 +293,9 @@ query_monitors(struct os_display_desktop_info *out_infos, uint32_t max_infos)
 
 	uint32_t written = 0;
 
-	// NULL honours $DISPLAY. No display (headless, or pure Wayland with no
-	// XWayland) is a normal "unknown", not a failure to report.
-	os_x_display *dpy = f.XOpenDisplay(NULL);
+	// No display (headless, or pure Wayland with no XWayland) is a normal
+	// "unknown", not a failure to report.
+	os_x_display *dpy = x11_open_private(&f);
 	if (dpy != NULL) {
 		int count = 0;
 		os_x_window root = f.XDefaultRootWindow(dpy);
@@ -289,7 +371,10 @@ os_display_x11_read_monitor_edids(struct os_display_randr_edid *out, uint32_t ma
 		return 0;
 	}
 	uint32_t written = 0;
-	os_x_display *dpy = (f.XInternAtom != NULL && f.XRRGetOutputProperty != NULL) ? f.XOpenDisplay(NULL) : NULL;
+	// The output can be destroyed between XRRGetMonitors and its property read
+	// (a monitor unplugged mid-sweep): BadRROutput, absorbed by the
+	// connection's hook, and that monitor reads as having no EDID (#2311).
+	os_x_display *dpy = (f.XInternAtom != NULL && f.XRRGetOutputProperty != NULL) ? x11_open_private(&f) : NULL;
 	if (dpy != NULL) {
 		// only_if_exists: a server that never published an EDID property
 		// has no such atom, and creating one would be a side effect.
