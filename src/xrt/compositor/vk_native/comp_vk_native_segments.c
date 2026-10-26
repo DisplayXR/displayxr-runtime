@@ -999,6 +999,13 @@ comp_vk_native_segments_would_split(const struct comp_vk_native_segments *segs,
 	if (segs == NULL || !segs->enabled) {
 		return false;
 	}
+	// Windows: a windowless primary DP (another screen took the window,
+	// ADR-047 Amendment 2) still needs comp_vk_native_segments_update after
+	// the window is back on the primary alone — the update times the
+	// hand-back. Zero-copy would skip it and leave the panel woven windowless.
+	if (segs->primary_windowless) {
+		return true;
+	}
 	return comp_segments_window_is_split(window_desktop, canvas, segs->screens, segs->screen_count);
 }
 
