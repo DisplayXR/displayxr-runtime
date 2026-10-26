@@ -236,6 +236,11 @@ common_shutdown(volatile struct ipc_client_state *ics)
 			ics->server->xsysc->info.workspace_mode = false;
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 			comp_d3d11_service_deactivate_workspace(ics->server->xsysc);
+			// #2416: this client's compositor was torn down while the
+			// workspace was still active, so the #814 failsafe skipped
+			// itself; run it now that the controller no longer owns the
+			// mode, or a dead controller leaves the lens in 3D.
+			comp_d3d11_service_workspace_controller_lost(ics->server->xsysc);
 #endif
 #if defined(COMP_MULTI_SHARED_SURFACE)
 			// The shared surface keeps rendering while workspace_active; a dead
