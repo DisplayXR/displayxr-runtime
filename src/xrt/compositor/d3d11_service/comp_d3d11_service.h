@@ -728,6 +728,21 @@ void
 comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc);
 
 /*!
+ * #2416: the workspace controller's connection was lost without an orderly
+ * workspace_deactivate (crash, forced kill). Call AFTER
+ * comp_d3d11_service_deactivate_workspace(): re-runs the #814 teardown
+ * failsafe — which skipped itself while the dying controller's compositor was
+ * torn down, because the workspace was still active then — and requests
+ * hardware 2D through the ADR-028 hardware-only channel when the panel is in 3D
+ * and no survivor wants it (same survivor rules as the orderly exit). No-op
+ * while a live bridge relay owns the mode, or if the workspace is active again.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_workspace_controller_lost(struct xrt_system_compositor *xsysc);
+
+/*!
  * Grab or release all user input for the workspace controller (modal input
  * grab — XR_DXR_spatial_workspace spec_version 18). While grabbed, the
  * compositor window stops forwarding keyboard / mouse-button / scroll input to

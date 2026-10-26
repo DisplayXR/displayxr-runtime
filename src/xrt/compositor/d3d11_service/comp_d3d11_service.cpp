@@ -9,6 +9,7 @@
 
 #include "comp_d3d11_service.h"
 #include "comp_eye_dp_policy.h"
+#include "comp_failsafe_2d_policy.h"
 #include "comp_d3d11_service_formats.h"
 #include "d3d11_service_shaders.h"
 #include "d3d11_bitmap_font.h"
@@ -27711,36 +27712,52 @@ service_scan_teardown_survivors(struct d3d11_service_system *sys,
  * the multi-compositor (so the survivor scan below cannot see the dying client),
  * and must not yet have run `fini_client_render_resources` (the DP has to still
  * be alive to take the request).
+ *
+ * #2416: @p c may be NULL, meaning "the workspace controller's connection was
+ * lost" (see @ref comp_d3d11_service_workspace_controller_lost). The workspace
+ * gate below exists because a live controller owns the display mode — but when
+ * the controller dies uncleanly its compositor is torn down BEFORE the IPC layer
+ * deactivates the workspace, so its own teardown pass hit that gate and nothing
+ * ever asked the lens back to 2D. The controller-loss call runs the same scan
+ * once more, after the deactivate, with no dying client left to exclude: the
+ * same survivor rules apply, so the unclean exit lands exactly where the orderly
+ * one (deactivate first, then teardown) already did.
  */
 static void
 service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
 {
-	if (sys == nullptr || panel_dp(sys, c) == nullptr) {
+	if (sys == nullptr) {
 		return;
 	}
-	// Workspace: the controller owns the display mode (a client leaving is
-	// routine there). Bridge: the relay owns it via the HWND path. Use the
-	// authoritative process-global bridge gate, not the per-client one — the
-	// question here is "is a bridge driving the panel", not "was this client
-	// the bridge client".
-	if (sys->workspace_mode || bridge_relay_is_live_authoritative(sys)) {
+	// The decision is comp_failsafe_2d_decide() (comp_failsafe_2d_policy.h) —
+	// pure, shared by both call kinds, and pinned by tests_comp_failsafe_2d_policy.
+	// This function only reads its inputs and acts on the verdict.
+	//
+	// Gates first, before any scan. Workspace: the controller owns the display
+	// mode (a client leaving is routine there). Bridge: the relay owns it via
+	// the HWND path. Use the authoritative process-global bridge gate, not the
+	// per-client one — the question here is "is a bridge driving the panel",
+	// not "was this client the bridge client".
+	struct comp_failsafe_2d_state st = {};
+	st.have_panel_dp = panel_dp(sys, c) != nullptr;
+	st.workspace_mode = sys->workspace_mode;
+	st.bridge_relay_live = st.have_panel_dp && !st.workspace_mode && bridge_relay_is_live_authoritative(sys);
+	st.hardware_display_3d = sys->hardware_display_3d;
+	if (comp_failsafe_2d_gate(&st) != COMP_FAILSAFE_2D_PROCEED) {
 		return;
-	}
-	if (!sys->hardware_display_3d) {
-		return; // already flat — nothing stranded
 	}
 
 	// Does anything left standing still want the lens? A weave present-owner
 	// holds the panel in 3D merely by existing (weave_force_3d_if_needed is
 	// self-healing), so a surviving one would just re-assert 3D on its next
 	// submit; flattening here would only produce a visible flicker.
-	bool this_client_is_weave_owner = c->render.weave_hwnd != nullptr;
-	bool survivor_wants_3d = false;
-	uint32_t survivors = service_scan_teardown_survivors(sys, c, &survivor_wants_3d);
-	if (survivor_wants_3d) {
-		return;
-	}
-	// #939: `survivor_wants_3d` above only says "a weave present-owner
+	st.departing_is_weave_owner = c != nullptr && c->render.weave_hwnd != nullptr;
+	const char *who = c == nullptr                    ? "#2416: workspace controller lost"
+	                  : st.departing_is_weave_owner ? "weave present-owner client leaving"
+	                                                : "last client leaving";
+	st.survivors = service_scan_teardown_survivors(sys, c, &st.weave_owner_survives);
+
+	// #939: `weave_owner_survives` above only says "a weave present-owner
 	// survives". A HOSTED survivor that is presenting in 3D — plain-Chrome
 	// WebXR holding the panel while the DisplayXR Browser exits — wants the
 	// lens just as much, and its standing wish says so (content mode with
@@ -27748,7 +27765,8 @@ service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struc
 	// one-shot 2D dip at every browser exit beside a live WebXR session; the
 	// focus rule re-arms the survivor's wish a tick later, so nothing here is
 	// stranded by leaving the lens alone.
-	{
+	int wants_3d_slot = -1;
+	if (!st.weave_owner_survives) {
 		struct d3d11_multi_compositor *tmc = sys->multi_comp;
 		struct xrt_device *head = sys->xsysd != nullptr ? sys->xsysd->static_roles.head : nullptr;
 		for (int i = 0; tmc != nullptr && i < D3D11_MULTI_MAX_CLIENTS; i++) {
@@ -27763,20 +27781,39 @@ service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struc
 			    (wm >= 0 && head != nullptr && (uint32_t)wm < head->rendering_mode_count &&
 			     head->rendering_modes[wm].hardware_display_3d);
 			if (wants_3d) {
-				U_LOG_W(
-				    "#814 failsafe: %s client leaving, but presenting survivor slot %d ('%s') still "
-				    "wants 3D — leaving the lens alone (#939)",
-				    this_client_is_weave_owner ? "weave present-owner" : "last", i,
-				    other->slot_app_name);
-				return;
+				wants_3d_slot = i;
+				break;
 			}
 		}
 	}
-	// An ordinary client leaving while others are still connected is not
-	// evidence that the panel should go flat — one of those survivors may be
-	// the one that asked for 3D. Only the departure of the weave present-owner
-	// itself, or of the last client on the box, releases the lens.
-	if (!this_client_is_weave_owner && survivors > 0) {
+	st.presenting_survivor_wants_3d = wants_3d_slot >= 0;
+
+	switch (comp_failsafe_2d_decide(&st)) {
+	case COMP_FAILSAFE_2D_SKIP_SURVIVOR_WANTS_3D:
+		U_LOG_W(
+		    "#814 failsafe: %s, but presenting survivor slot %d ('%s') still "
+		    "wants 3D — leaving the lens alone (#939)",
+		    who, wants_3d_slot, sys->multi_comp->clients[wants_3d_slot].compositor->slot_app_name);
+		return;
+	case COMP_FAILSAFE_2D_REQUEST_2D: break;
+	default:
+		// An ordinary client leaving while others are still connected is not
+		// evidence that the panel should go flat — one of those survivors may
+		// be the one that asked for 3D. Only the departure of the weave
+		// present-owner itself, or of the last client on the box, releases the
+		// lens.
+		return;
+	}
+
+	if (c == nullptr) {
+		// #2416: no client to carry the request — the controller's compositor
+		// is already gone. Same hardware-only ADR-028 channel the client path
+		// below ends in (`service_apply_pending_mode` with hw=0 and no content
+		// mode resolves to exactly this call): keep the active rendering mode,
+		// ask for a flat lens.
+		U_LOG_W("%s with the panel in 3D (%u survivor(s)) — requesting hardware 2D", who, st.survivors);
+		(void)service_request_mode_transition(sys, nullptr, UINT32_MAX, /* want_3d */ false,
+		                                      /* skip_dp */ false, "controller_lost");
 		return;
 	}
 
@@ -27788,7 +27825,7 @@ service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struc
 	c->pending_content_mode.store(0xFFFFFFFFu, std::memory_order_release);
 	c->pending_hw_3d.store(0, std::memory_order_release);
 	U_LOG_W("#814 failsafe: %s client leaving with the panel in 3D (%u survivor(s)) — requesting hardware 2D",
-	        this_client_is_weave_owner ? "weave present-owner" : "last", survivors);
+	        st.departing_is_weave_owner ? "weave present-owner" : "last", st.survivors);
 	(void)service_apply_pending_mode(sys, c, /* bridge_live */ false, /* as_service */ true,
 	                                 /* holds_render_mutex */ true);
 }
@@ -38788,6 +38825,19 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 
 	U_LOG_W("Workspace: window created for empty workspace (ready for Ctrl+O)");
 	return true;
+}
+
+void
+comp_d3d11_service_workspace_controller_lost(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == nullptr) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	// The failsafe drives the panel DP and walks the slot table: render_mutex,
+	// as at its teardown call sites (clients_mutex nests inside it).
+	render_mutex_fair_lock lock(sys);
+	service_failsafe_hardware_2d_on_teardown(sys, nullptr);
 }
 
 void
