@@ -3,8 +3,8 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_win32_window_binding` |
-| Spec Version | 8 |
-| Type Values | `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR` (1004999001), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR` (1004999002) |
+| Spec Version | 9 |
+| Type Values | `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR` (1004999001), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR` (1004999002); v9 texture target: 1004999015-018 ([§3.6](#36-texture-target-binding-v9)) |
 | Author | The DisplayXR Project |
 | Platform | Windows (Win32). Sibling bindings: [`cocoa`](XR_DXR_cocoa_window_binding.md) (macOS), [`xlib`](XR_DXR_xlib_window_binding.md) and [`wayland`](XR_DXR_wayland_surface_binding.md) (desktop Linux), [`android`](XR_DXR_android_surface_binding.md). |
 | Window-space layer | Enables `XrCompositionLayerWindowSpaceDXR` (1004999002). The struct is declared identically, `#ifndef`-guarded on the type value, in all five window/surface binding headers (win32, cocoa, xlib, wayland, android), so any of them may be included in any order. The runtime accepts the layer on any window-bound, native-compositor or IPC session. |
@@ -125,7 +125,7 @@ The two concepts are inseparable: window-space layers only make sense when there
 
 ```c
 #define XR_DXR_win32_window_binding                          1
-#define XR_DXR_win32_window_binding_SPEC_VERSION             8
+#define XR_DXR_win32_window_binding_SPEC_VERSION             9
 #define XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME           "XR_DXR_win32_window_binding"
 #define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR         ((XrStructureType)1004999001)
 #define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR     ((XrStructureType)1004999002)
@@ -138,9 +138,10 @@ The two concepts are inseparable: window-space layers only make sense when there
 | 1 | Initial: `windowHandle`, `readbackCallback`, `sharedTextureHandle`. |
 | 4 | `transparentBackgroundEnabled` — runtime configures DComp / DXGI for per-pixel desktop transparency. |
 | 5 | `chromaKeyColor` — optional app-supplied chroma-key override. `0` = runtime DP picks its own default. |
-| 6 | `xrSetSharedTextureSurround2DEXT` — register a full-window 2D shared texture for the non-canvas region. Enables apps with a fixed 3D zone (sub-rect canvas) to deliver full-resolution 2D content for the surrounding area. See [§3.6](#36-xrsetsharedtexturesurround2dext). |
+| 6 | `xrSetSharedTextureSurround2DEXT` — register a full-window 2D shared texture for the non-canvas region. Enables apps with a fixed 3D zone (sub-rect canvas) to deliver full-resolution 2D content for the surrounding area. *(Removed in v8; that §3.6 is gone.)* |
 | 7 | `xrSetSharedTextureSurround2DFenceEXT` — D3D12 variant of §3.6 that uses `ID3D12Fence` for producer→consumer sync. D3D12-native shared resources do not reliably expose `IDXGIKeyedMutex`, so the spec-v6 API does not work for D3D12 apps. *(Removed in v8.)* |
 | 8 | Removed `xrSetSharedTextureOutputRectDXR` + `xrSetSharedTextureSurround2DEXT` + `xrSetSharedTextureSurround2DFenceEXT` — superseded by [`XR_DXR_display_zones`](XR_DXR_display_zones.md) (ADR-031). See [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md). **Also removed `chromaKeyColor`** (#573) — transparency is carried end-to-end by per-pixel alpha and a transparent present; the `set_chroma_key` slot is gone from all five display-processor vtables. |
+| 9 | Texture target binding (ADR-060): a shared-texture session names where its texture is drawn (a reference window + a rect, device px) instead of handing the runtime an HWND to bind a weaver to. Four additive structs; see [§3.6](#36-texture-target-binding-v9). Existing v8 apps are unaffected. |
 
 ### 3.2 XrWin32WindowBindingCreateInfoDXR
 
@@ -421,6 +422,39 @@ struct xrt_layer_window_space_data
 > zones + M 2D zones + a per-pixel wish mask); a `_texture` app gets identical capability
 > through it (verified: `cube_zones_texture_d3d11_win` / `cube_zones_texture_d3d12_win` /
 > `cube_zones_texture_metal_macos`).
+
+### 3.6 Texture target binding (v9)
+
+> Full text: [`XR_DXR_win32_window_binding_v9_texture_target.md`](XR_DXR_win32_window_binding_v9_texture_target.md).
+> Decision record: [ADR-060](../../adr/ADR-060-texture-target-reference-window-binding.md). Since runtime v2.55.0.
+
+A `_texture` session (`sharedTextureHandle` set) chains `XrWin32TextureTargetBindingDXR` on
+`XrWin32WindowBindingCreateInfoDXR::next`. It names a **reference window** (the app's own
+top-level window, or NULL for desktop coordinates) and a **target rect** in that window's client
+area, in physical device pixels. The runtime then:
+
+- weaves into the shared texture at `(0, 0, rect.w, rect.h)`, so the rect is the canvas, with or without zones;
+- phases the weave from the target's live desktop position, which it reads at weave time;
+- frames the views to the target, per screen when the target spans screens;
+- never subclasses, reparents, or binds a display processor to the reference window.
+
+| Struct | Chained on | Role |
+|---|---|---|
+| `XrSystemWin32TextureTargetPropertiesDXR` (1004999017) | `XrSystemProperties` | `supportsTextureTarget`, and a **prediction** of `windowlessPhase` |
+| `XrWin32TextureTargetBindingDXR` (1004999015) | `XrWin32WindowBindingCreateInfoDXR` | `referenceWindow` + `initialTargetRect` |
+| `XrWin32TextureTargetFrameDXR` (1004999016) | `XrFrameEndInfo` (authoritative); optionally `XrViewLocateInfo` (frames that locate's views only) | this frame's `referenceWindow` + `targetRect`; `flags` (DRAGGING reserved) |
+| `XrWin32TextureTargetStateDXR` (1004999018) | `XrFrameState` at `xrWaitFrame` | what the last woven frame used: `WINDOWLESS_PHASE`, `ANCHOR_FALLBACK`, `SEGMENTED`, `FLAT_SEGMENT`, `CLAMPED`; the woven origin and rect |
+
+The binding is honoured only when the display processor phases without a window
+(`XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN`; the Leia plug-in from v2.18.3 with LeiaSR
+1.39.0 or later; and sim-display). Otherwise `windowHandle`, if given, is the **fallback anchor** and the
+session weaves as in v8. The state's `ANCHOR_FALLBACK` bit says which path ran. The in-process
+D3D11 compositor honours v9. On other sessions the binding is ignored with one WARN, and
+D3D12 and GL reach texture mode through the hub (see the full text, §8).
+
+When the binding is chained, the [shared-texture contract](#shared-texture-contract-_texture-mode)
+above still holds: worst-case size, allocated once. Two differences: the read-back UV is
+`rect / shared size` from the origin, and the "submit a zones frame every frame" rule does not apply.
 
 ---
 
