@@ -1994,8 +1994,18 @@ xb_watchdog_thread(struct comp_xbridge *xb)
 
 		if (advanced || !(prod_stall || cons_stall || attempt_stall)) {
 			if (stage > 0) {
-				U_LOG_W("%s: bridge recovered at prod=%llu cons=%llu (#1017)", XB_TAG(xb),
-				        (unsigned long long)prod_done, (unsigned long long)cons_done);
+				// Once `degraded` is latched, submit returns at its first line, so
+				// the counters freeze and this branch is reached by silence, not by
+				// progress. Do not call that a recovery (#1575).
+				if (xb->degraded.load(std::memory_order_acquire)) {
+					U_LOG_W(
+					    "%s: no stall since DEGRADED stopped submissions at prod=%llu cons=%llu — "
+					    "the bridge is NOT recovered; it stays degraded for this session (#1017, #1575)",
+					    XB_TAG(xb), (unsigned long long)prod_done, (unsigned long long)cons_done);
+				} else {
+					U_LOG_W("%s: bridge recovered at prod=%llu cons=%llu (#1017)", XB_TAG(xb),
+					        (unsigned long long)prod_done, (unsigned long long)cons_done);
+				}
 			}
 			last_prod_done = prod_done;
 			last_cons_done = cons_done;
@@ -3259,9 +3269,6 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 	if (content_w == 0 || content_h == 0 || xb->eg_w == 0) {
 		return;
 	}
-	// Counted BEFORE the allocator-busy early-outs below: the watchdog's whole
-	// point is that a skipped frame is still an attempted frame (#918 F3).
-	xb->attempted.fetch_add(1, std::memory_order_release);
 
 	/*
 	 * #1178 — the content box must FIT the egress ring, and saying so is not the
@@ -3271,10 +3278,12 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 	 * anywhere records that anything went wrong.
 	 *
 	 * `comp_xbridge_set_content_size` runs immediately before every submit and
-	 * either sizes the ring to the content box or holds the worst-case ring
-	 * (which is >= any content box, since the box is clamped to `max_*` there),
-	 * so this is unreachable by construction. That is precisely why it must say
-	 * so out loud rather than paper over it if the construction ever changes.
+	 * either sizes the ring to the content box or holds the worst-case ring. It
+	 * clamps the RING to `max_*`, but not the caller's box, so this IS reachable:
+	 * a content box larger than the worst-case system atlas — a window larger
+	 * than the panel, e.g. after a 150 % -> 300 % DPI move doubled it to
+	 * 3848x2169 on a 3840x2160 panel (#1603 is the same shape for a 2-view
+	 * layout) — lands here on every frame for as long as it stays that size.
 	 */
 	if (!xb_check_copy_extent(xb, "atlas submit (content box vs egress ring)", content_w, content_h,
 	                          /*src=*/0, 0, xb->eg_w, xb->eg_h)) {
@@ -3348,6 +3357,21 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 			return;
 		}
 	}
+
+	/*
+	 * Counted HERE: after every refusal above, BEFORE the allocator-busy and
+	 * no-egress-slot early-outs below. The watchdog's whole point is that a
+	 * skipped frame is still an attempted frame (#918 F3) — a frame the GPU
+	 * side could not take is evidence of a wedge. A frame refused above is
+	 * not: the format / extent checks are CPU-side verdicts on what the caller
+	 * handed in, and they repeat for as long as the caller's sizes disagree.
+	 * Counting them made the watchdog read "attempted, no egress progress" as a
+	 * wedged CONSUMER and latch `degraded` after 5 s, so a window that was
+	 * larger than the panel for 5 s stayed black for the rest of the session
+	 * even after it was resized to fit. The refusals still have their own
+	 * counters and their own throttled ERROR lines.
+	 */
+	xb->attempted.fetch_add(1, std::memory_order_release);
 
 	// The app's writes to the atlas complete before the producer reads it. This
 	// is a fence SIGNAL on the immediate context — no CPU wait. The Flush is
