@@ -3022,6 +3022,21 @@ struct oxr_session
 	int display_home_logged;
 
 	/*!
+	 * #2305: the panel's desktop origin as the resolver published it with the
+	 * session's first screen list (start) and with the latest hotplug re-push
+	 * (now), panel-confirmed rects only. A DP that cached its origin at
+	 * creation keeps reporting the start one after a live arrangement change;
+	 * oxr_session_get_window_metrics rebases on the latest
+	 * (u_canvas_rebase_display_origin). Not for Metal (its own coordinates).
+	 * Written on the frame thread by oxr_session_push_screens.
+	 */
+	bool panel_origin_valid;
+	int32_t panel_origin_start_left;
+	int32_t panel_origin_start_top;
+	int32_t panel_origin_now_left;
+	int32_t panel_origin_now_top;
+
+	/*!
 	 * True when the session is bound to a display OTHER than the system
 	 * default and that display's size is known: @ref bound_display_info then
 	 * backs the session's display-scoped Kooima inputs (physical size,

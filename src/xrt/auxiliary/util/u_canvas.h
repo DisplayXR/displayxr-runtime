@@ -16,6 +16,7 @@
 
 #include "xrt/xrt_display_metrics.h"
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <math.h>
 
@@ -179,6 +180,57 @@ u_canvas_apply_to_metrics(struct xrt_window_metrics *metrics,
 
 	metrics->window_center_offset_x_m = (canvas_center_px_x - disp_center_px_x) * pixel_size_x;
 	metrics->window_center_offset_y_m = -((canvas_center_px_y - disp_center_px_y) * pixel_size_y);
+}
+
+/*!
+ * Rebase window metrics on the panel's CURRENT desktop origin (#2305).
+ *
+ * A display processor may cache its panel's desktop origin when it is created
+ * (the Leia SR weaver reads the SR display location once), and a compositor
+ * measures the window against whatever origin its DP reports. After a live
+ * arrangement change the runtime's resolver re-places the panel, but the DP
+ * still answers with the session-start origin — so the window-relative Kooima
+ * sees the window off-centre by exactly the distance the panel moved, and the
+ * view skews until the panel is moved back.
+ *
+ * When @p metrics still carry the session-start origin (@p start_left,
+ * @p start_top) and the resolver now places the panel at @p now_left,
+ * @p now_top, the origin and the window-centre offset are moved onto the
+ * resolver's answer. Metrics whose origin is anything else are left alone: a
+ * DP that follows the panel already reports the new origin, and one that never
+ * agreed with the resolver (a different coordinate space) is not this
+ * function's to correct.
+ *
+ * @return true when @p metrics were changed.
+ */
+static inline bool
+u_canvas_rebase_display_origin(
+    struct xrt_window_metrics *metrics, int32_t start_left, int32_t start_top, int32_t now_left, int32_t now_top)
+{
+	if (metrics == NULL || !metrics->valid || metrics->display_pixel_width == 0 ||
+	    metrics->display_pixel_height == 0) {
+		return false;
+	}
+	if (now_left == start_left && now_top == start_top) {
+		return false;
+	}
+	if (metrics->display_screen_left != start_left || metrics->display_screen_top != start_top) {
+		return false;
+	}
+
+	const float pixel_size_x = metrics->display_width_m / (float)metrics->display_pixel_width;
+	const float pixel_size_y = metrics->display_height_m / (float)metrics->display_pixel_height;
+	const int64_t dx = (int64_t)now_left - (int64_t)start_left;
+	const int64_t dy = (int64_t)now_top - (int64_t)start_top;
+
+	// The window centre is measured from the display origin: moving the origin
+	// right by dx moves the centre left by dx; Y is negated (screen Y-down,
+	// eye Y-up), so moving the origin down by dy moves the centre up.
+	metrics->window_center_offset_x_m -= (float)dx * pixel_size_x;
+	metrics->window_center_offset_y_m += (float)dy * pixel_size_y;
+	metrics->display_screen_left = now_left;
+	metrics->display_screen_top = now_top;
+	return true;
 }
 
 #ifdef __cplusplus
