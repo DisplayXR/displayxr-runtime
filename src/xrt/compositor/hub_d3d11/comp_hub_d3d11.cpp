@@ -1406,7 +1406,17 @@ split_segments_update(struct comp_hub_d3d11 *s, uint32_t tgt_w, uint32_t tgt_h, 
 		if (s->seg_rebuild || s->segments == nullptr) {
 			os_mutex_lock(&s->seg_mutex); // the app thread reads s->segments for eyes
 			if (s->seg_rebuild) {
-				comp_d3d11_segments_set_hwnd_hooks(s->segments, nullptr);
+				// A new screen list (a hotplug re-push, #2305) while another
+				// screen's segment DP holds the window: the hooks stay
+				// installed so the destroy hands the window back to the
+				// split's own DP first (ADR-047 Amendment 2), as the D3D11,
+				// Vulkan and GL rebuilds do. Clearing them first (the
+				// teardown shape, split_segments_release, where the split's
+				// DP goes next) destroyed the DP holding the window and left
+				// the split's DP windowless, while the new manager starts
+				// out believing the primary holds it — so a window that came
+				// back to the panel within the hand-off dwell was never
+				// handed back and the panel stayed flat.
 				comp_d3d11_segments_destroy(&s->segments);
 				s->seg_rebuild = false;
 			}
