@@ -127,6 +127,16 @@ patched one class with a per-class constant.
    space-agnostic, they are plane-relative, and `displayPlanePose` reports
    that plane in the locate space so a RAW app can rebase anything else it
    located there (grips, hand joints) into its own view.
+   *Scope (clarified 2026-10-27):* RAW applies to the sessions the runtime
+   treats as display-relative: those that bind their own window
+   (`has_external_window`) and bridge relays (`is_bridge_relay`). A hosted
+   session that enables `XR_DXR_display_info` without binding a window (for
+   example an app reaching the runtime through a compatibility layer that
+   cannot hand over a native window) keeps render-ready `XrView.pose` through
+   the standard `T_base_head` chain, the #739 rule. Such an app still gets the
+   tracked eyes: `XrViewDisplayRawDXR` on `XrViewState::next` is filled
+   whenever eye positions exist, with no window condition, which is the
+   channel this ADR reserves for aware consumers that do their own math.
 4. **No reference space is redefined per session class.** LOCAL stays the
    root + (0, 1.6, 0) of upstream Monado — what legacy VR titles expect: STAGE at
    the floor, the head standing at 1.6 m — and the qwerty rig is seeded at the same
