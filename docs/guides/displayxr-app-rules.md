@@ -796,7 +796,10 @@ its own content by definition, so there is no full-window backer. Reference apps
   build your own asymmetric off-axis frustum. The plane itself is
   `XrViewDisplayRawDXR::displayPlanePose`, reported in the locate space: compose it in when you draw
   something you located in that space through a RAW view (`cube_handle_d3d11_win` rebases its
-  grip / joint markers this way). Ref: `XR_DXR_display_info.md:976-989`.
+  grip / joint markers this way). RAW `XrView.pose` needs a session that binds its own window (or a
+  bridge relay); a hosted session without a window binding gets render-ready poses and reads the
+  tracked eyes from `XrViewDisplayRawDXR` on `XrViewState::next` instead (ADR-024 Amendment 1,
+  item 3). Ref: `XR_DXR_display_info.md:976-989`.
 
 - **INV-6.2 — Without the extension (legacy/RENDER_READY), the runtime returns converged poses +
   FOV; you still build the matrix from `XrFovf`** (the runtime never returns a matrix).

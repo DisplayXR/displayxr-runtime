@@ -90,11 +90,13 @@ classes actually diverge in what they get back (the contract is [ADR-024, Amendm
   client converts, the server never sees the base space. Legacy clients keep the standard
   `T_base_head` chain (never the eye override — the #739 lesson), which carries the server's head
   motion in whatever base space the app asked for.
-- **RAW (extension apps with `XR_DXR_display_info` and no rig chained).** The app owns the
+- **RAW (extension apps with `XR_DXR_display_info`, no rig chained, that bind their own window — or bridge relays).** The app owns the
   camera: `XrView.pose` is the display processor's eyes **relative to the display plane**, identity
   orientation, in every base space — ADR-024 / INV-6.1. `XrViewDisplayRawDXR::displayPlanePose`
   says where that plane is in the locate space, which is how a RAW app composes anything else it
-  located there (grips, hand joints) into its own view.
+  located there (grips, hand joints) into its own view. A hosted session with the extension but no
+  window binding keeps render-ready `XrView.pose` (the `T_base_head` chain) and reads the tracked
+  eyes from `XrViewDisplayRawDXR`, which is filled whenever eye positions exist.
 - **Reference spaces are not redefined per class.** `LOCAL` is Monado's root + (0, 1.6, 0) for
   everyone (what legacy VR titles expect: STAGE at the floor, the head standing at 1.6 m); the
   qwerty rig is seeded at the same height. A hosted legacy title therefore sees its eyes about
