@@ -118,6 +118,17 @@ bool
 comp_d3d11_segments_enabled(const struct comp_d3d11_segments *segs);
 
 /*!
+ * ADR-060 (texture target binding): the session's primary DP is windowless by
+ * construction — it phases from set_present_origin and no screen ever holds a
+ * window. The split weave then feeds the primary's segment its present origin,
+ * exactly as for a primary made windowless by a hand-off; unlike that case, a
+ * target wholly on the primary screen is NOT forced through the split path
+ * (the caller pushes the origin on its single-DP weave, ADR-060 split rule).
+ */
+void
+comp_d3d11_segments_set_primary_phases_from_origin(struct comp_d3d11_segments *segs, bool on);
+
+/*!
  * #2218: would this window take the split path (not wholly on the primary
  * screen)? Pure (@ref comp_segments_window_is_split on the manager's screens):
  * no lifecycle, no DPs. The weave publishes the answer for the compose step,
@@ -212,6 +223,9 @@ struct comp_d3d11_segments_frame
 	const struct comp_segments_screen *rate_screens;
 	const float *rate_hz;
 	uint32_t rate_count;
+	//! ADR-060: optional out — set true when any part of the canvas was written
+	//! flat 2D (a segment that could not weave, or canvas off every screen).
+	bool *out_any_flat;
 };
 
 /*!

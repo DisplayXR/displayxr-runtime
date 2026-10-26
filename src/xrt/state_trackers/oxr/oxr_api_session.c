@@ -321,6 +321,11 @@ oxr_xrLocateViews(XrSession session,
 		                 viewLocateInfo->viewConfigurationType);
 	}
 
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	// v9 (ADR-060): a texture target chained on the locate frames THESE views
+	// only (the window metrics read during it); xrEndFrame's value is untouched.
+	oxr_texture_target_locate(&log, sess, viewLocateInfo);
+#endif
 	XrResult res = oxr_session_locate_views( //
 	    &log,                                //
 	    sess,                                //
@@ -329,6 +334,9 @@ oxr_xrLocateViews(XrSession session,
 	    viewCapacityInput,                   //
 	    viewCountOutput,                     //
 	    views);                              //
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	oxr_texture_target_locate_end(sess);
+#endif
 
 	// Cache recommended-view signal for MCP introspection.
 	if (res == XR_SUCCESS && viewCapacityInput > 0 && views != NULL) {

@@ -26,6 +26,7 @@ add_library(
 	oxr_conformance.c
 	oxr_chain.h
 	oxr_display_zones.c
+	oxr_texture_target.c
 	oxr_dpad.c
 	oxr_event.c
 	oxr_extension_support.h

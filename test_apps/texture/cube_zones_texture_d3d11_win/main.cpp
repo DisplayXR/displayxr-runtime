@@ -199,6 +199,19 @@ struct DisplayZone {
 };
 static DisplayZone g_zonesArr[kNumZones];
 
+// Phase probe (ported from the D3D12 variant, #727): DXR_SLICE_COLORS=1 paints
+// each view a solid color (view 0 = BLUE, view 1 = RED) instead of the cube, so
+// a woven readback shows the interlace directly — with a tracked or simulated
+// viewer (SR_SIMULATED_VIEWER); untracked the Leia DP returns flat blue.
+static bool ZoneSliceColors() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("DXR_SLICE_COLORS");
+        cached = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static const XrRect2Di kZoneARect        = {{0, 180}, {640, 540}};
 static const XrRect2Di kZoneBRect        = {{700, 180}, {520, 360}};
 static const XrRect2Di kZoneBOverlapRect = {{400, 300}, {520, 360}};
@@ -543,6 +556,22 @@ static bool CreateBlitResources(ID3D11Device* device) {
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     hr = device->CreateBuffer(&cbd, nullptr, &g_blitParamsCB);
     return SUCCEEDED(hr);
+}
+
+// ADR-060 smoke mode: this frame's texture target — this window's whole client
+// area, chained ahead of @p next. The same instance serves every call of the
+// frame (locates, then xrEndFrame), re-pointed right before each.
+static XrWin32TextureTargetFrameDXR g_ttFrame = {XR_TYPE_WIN32_TEXTURE_TARGET_FRAME_DXR};
+static const void* TextureTargetChain(HWND hwnd, const void* next) {
+    if (!TextureTargetEnabled() || hwnd == nullptr) return next;
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    g_ttFrame.next = next;
+    g_ttFrame.referenceWindow = (void*)hwnd;
+    g_ttFrame.targetRect.offset = {0, 0};
+    g_ttFrame.targetRect.extent = {rc.right > 0 ? (int32_t)rc.right : 1, rc.bottom > 0 ? (int32_t)rc.bottom : 1};
+    g_ttFrame.flags = 0;
+    return &g_ttFrame;
 }
 
 // Blit the runtime-composited shared texture into the app's window back
@@ -1290,7 +1319,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         zoneStructs[zi].rect = z.rect;
 
         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
-        locateInfo.next = &zoneStructs[zi];
+        locateInfo.next = TextureTargetChain(xr.windowHandle, &zoneStructs[zi]);
         locateInfo.viewConfigurationType = xr.viewConfigType;
         locateInfo.displayTime = frameState.predictedDisplayTime;
         locateInfo.space = xr.localSpace;
@@ -1405,10 +1434,21 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
             vp.MaxDepth = 1.0f;
             renderer.context->RSSetViewports(1, &vp);
 
-            const XMMATRIX viewMatrix = ColumnMajorToXMMatrix(rigViews[vi].view_matrix);
-            const XMMATRIX projMatrix = ColumnMajorToXMMatrix(rigViews[vi].projection_matrix);
-            RenderScene(renderer, rtv, z.depthDSV.Get(), z.tileW, z.tileH,
-                        viewMatrix, projMatrix, 1.0f, 0.03f);
+            if (ZoneSliceColors()) {
+                // Solid per-view fill of this view's tile (D3D11.1 ClearView with a rect).
+                static const float kBlue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+                static const float kRed[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+                ComPtr<ID3D11DeviceContext1> ctx1;
+                if (SUCCEEDED(renderer.context.As(&ctx1))) {
+                    const D3D11_RECT tile = {(LONG)(vi * z.tileW), 0, (LONG)((vi + 1) * z.tileW), (LONG)z.tileH};
+                    ctx1->ClearView(rtv, (vi == 0) ? kBlue : kRed, &tile, 1);
+                }
+            } else {
+                const XMMATRIX viewMatrix = ColumnMajorToXMMatrix(rigViews[vi].view_matrix);
+                const XMMATRIX projMatrix = ColumnMajorToXMMatrix(rigViews[vi].projection_matrix);
+                RenderScene(renderer, rtv, z.depthDSV.Get(), z.tileW, z.tileH,
+                            viewMatrix, projMatrix, 1.0f, 0.03f);
+            }
 
             projViews[zi][vi].subImage.swapchain = z.swapchain;
             projViews[zi][vi].subImage.imageRect.offset = {(int32_t)(vi * z.tileW), 0};
@@ -1536,6 +1576,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
     if (chainZonesEnd) {
         endInfo.next = &zonesEnd;
     }
+    endInfo.next = TextureTargetChain(xr.windowHandle, endInfo.next);
 
     xrEndFrame(xr.session, &endInfo);
 
@@ -1732,6 +1773,7 @@ static void RenderOneFrame(RenderState& rs) {
                 }
             }
 
+            locateInfo.next = TextureTargetChain(xr.windowHandle, locateInfo.next);
             xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
 
             // ADR-041: the layer must carry EVERY located view. Render eyeCount
@@ -2113,7 +2155,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // coords, top-down; (0,0) = primary/unknown is safe), BEFORE
     // xrCreateSession so the display processor tracks the window on the
     // panel from the start.
-    SetWindowPos(hwnd, nullptr, g_displayScreenLeft, g_displayScreenTop, 0, 0,
+    // DXR_WINDOW_POS="dx,dy" offsets that move from the panel's origin (device
+    // px): phase tests compare the same window at x and x+1 (ADR-060).
+    int posDx = 0, posDy = 0;
+    if (const char* p = getenv("DXR_WINDOW_POS")) {
+        if (sscanf(p, "%d,%d", &posDx, &posDy) == 2) {
+            LOG_INFO("DXR_WINDOW_POS: window at panel origin + (%d,%d)", posDx, posDy);
+        } else {
+            posDx = posDy = 0;
+        }
+    }
+    SetWindowPos(hwnd, nullptr, g_displayScreenLeft + posDx, g_displayScreenTop + posDy, 0, 0,
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
     // Check for session target extension (required for texture mode)

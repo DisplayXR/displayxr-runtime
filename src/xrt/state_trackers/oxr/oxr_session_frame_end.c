@@ -3205,6 +3205,16 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		return oxr_error(log, XR_ERROR_LAYER_INVALID, "(frameEndInfo->layers == NULL)");
 	}
 
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	// v9 (ADR-060): this frame's texture target, before the layers it frames.
+	{
+		XrResult tt_ret = oxr_texture_target_frame_end(log, sess, frameEndInfo);
+		if (tt_ret != XR_SUCCESS) {
+			return tt_ret;
+		}
+	}
+#endif
+
 #ifdef OXR_HAVE_DXR_display_zones
 	// XR_DXR_display_zones (ADR-027): zones-frame detection + gating. Only
 	// runs with the extension enabled — zero-zone bit-identity is

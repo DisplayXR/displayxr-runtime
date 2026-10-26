@@ -1026,6 +1026,12 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 	}
 #endif // OXR_HAVE_META_body_tracking_calibration
 
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	if (sys->inst->extensions.DXR_win32_window_binding) {
+		oxr_texture_target_system_properties(sys, properties);
+	}
+#endif
+
 #ifdef OXR_HAVE_DXR_display_info
 	XrDisplayInfoDXR *display_info = NULL;
 	if (sys->inst->extensions.DXR_display_info) {

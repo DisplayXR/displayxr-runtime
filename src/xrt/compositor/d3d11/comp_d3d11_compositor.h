@@ -44,12 +44,15 @@ extern "C" {
  * @param display_screen_left Display top-left X in OS screen coords (from xsysc->info,
  *                            populated by the vendor plug-in iface). 0 = primary.
  * @param display_screen_top  Display top-left Y in OS screen coords. 0 = primary.
+ * @param texture_target ADR-060 texture target binding (XR_DXR_win32_window_binding
+ *                       v9), or NULL. Only meaningful with @p shared_texture_handle.
  * @param out_xc Pointer to receive the created compositor.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  *
  * @ingroup comp_d3d11
  */
+struct comp_d3d11_texture_target_info;
 xrt_result_t
 comp_d3d11_compositor_create(struct xrt_device *xdev,
                              void *hwnd,
@@ -59,7 +62,86 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
                              bool transparent_background,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
+                             const struct comp_d3d11_texture_target_info *texture_target,
                              struct xrt_compositor_native **out_xc);
+
+/*
+ * ADR-060 — texture target binding (XR_DXR_win32_window_binding v9).
+ *
+ * A shared-texture session names where its texture is drawn: a reference
+ * window (or NULL = desktop px) plus a rect in its client area, device px. The
+ * compositor resolves the pair at every weave, phases a WINDOWLESS primary DP
+ * from it (set_present_origin), frames the window metrics to it, and segments
+ * it across screens. The reference window is only read, never handed to a DP.
+ */
+
+/*!
+ * Create-time binding. @p windowless_dp_entry is the DP registry entry of the
+ * session's screen (`const struct xrt_dp_registry_entry *`, owned by the
+ * system compositor info, outlives the session), used to make the windowless
+ * primary DP through the plug-in's create_dp_d3d11_for_screen.
+ *
+ * @ingroup comp_d3d11
+ */
+struct comp_d3d11_texture_target_info
+{
+	bool bound;
+	void *reference_window;
+	int32_t x, y;
+	uint32_t w, h;
+	const void *windowless_dp_entry;
+};
+
+/*!
+ * A frame's target. @p for_locate false: from xrEndFrame — authoritative, what
+ * the weave uses (an omitted struct keeps the last xrEndFrame value). @p
+ * for_locate true: from xrLocateViews — frames only that locate's views (the
+ * window metrics), until @ref comp_d3d11_compositor_end_texture_target_locate.
+ * Ignored unless the session was created bound. @p flags are
+ * XrWin32TextureTargetFrameFlagsDXR (advisory).
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_compositor_set_texture_target(struct xrt_compositor *xc,
+                                         bool for_locate,
+                                         void *reference_window,
+                                         int32_t x,
+                                         int32_t y,
+                                         uint32_t w,
+                                         uint32_t h,
+                                         uint64_t flags);
+
+//! The locate that chained a target returned: metrics fall back to the xrEndFrame slot.
+void
+comp_d3d11_compositor_end_texture_target_locate(struct xrt_compositor *xc);
+
+//! XrWin32TextureTargetStateFlagsDXR, same values.
+#define COMP_D3D11_TT_STATE_WINDOWLESS_PHASE 0x1u
+#define COMP_D3D11_TT_STATE_ANCHOR_FALLBACK 0x2u
+#define COMP_D3D11_TT_STATE_SEGMENTED 0x4u
+#define COMP_D3D11_TT_STATE_FLAT_SEGMENT 0x8u
+#define COMP_D3D11_TT_STATE_CLAMPED 0x10u
+
+/*!
+ * What the most recently woven frame used (XrWin32TextureTargetStateDXR).
+ *
+ * @ingroup comp_d3d11
+ */
+struct comp_d3d11_texture_target_state
+{
+	bool valid; //!< at least one bound frame was woven
+	uint64_t flags;
+	int32_t screen_x, screen_y;
+	int32_t rect_x, rect_y;
+	uint32_t rect_w, rect_h;
+	int64_t display_time_ns;
+};
+
+//! @return false when the session is not bound.
+bool
+comp_d3d11_compositor_get_texture_target_state(struct xrt_compositor *xc,
+                                               struct comp_d3d11_texture_target_state *out);
 
 /*
  * XR_DXR_local_3d_zone — authored 2D/3D mask consumer (Phase 1 of unified

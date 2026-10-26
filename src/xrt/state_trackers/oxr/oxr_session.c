@@ -5659,6 +5659,11 @@ oxr_session_frame_wait(struct oxr_logger *log, struct oxr_session *sess, XrFrame
 		return oxr_session_success_result(sess);
 	}
 
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	// v9 (ADR-060): what the last woven frame used (diagnostic).
+	oxr_texture_target_wait(sess, frameState);
+#endif
+
 	// For AppContainer apps (Chrome WebXR), deliver the deferred VISIBLE/FOCUSED
 	// state transitions at the start of xrWaitFrame. This is earlier than xrEndFrame
 	// and allows Chrome to proceed with its frame loop.
@@ -6630,10 +6635,14 @@ oxr_session_create_impl(struct oxr_logger *log,
 				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create xrt_session! '%i'", xret);
 			}
 			// Use D3D11 native compositor - no Vulkan involvement
+			const void *tt_binding = NULL;
+#ifdef OXR_HAVE_DXR_win32_window_binding
+			tt_binding = oxr_texture_target_find_binding(createInfo);
+#endif
 			return oxr_session_populate_d3d11_native(log, sys, d3d11, xsi->external_window_handle,
 			                                          xsi->shared_texture_handle,
 			                                          xsi->transparent_background_enabled,
-			                                          xsi->bound_display_id,
+			                                          xsi->bound_display_id, tt_binding,
 			                                          *out_session);
 		}
 #else
@@ -6929,6 +6938,14 @@ oxr_session_create(struct oxr_logger *log,
 	const XrWin32WindowBindingCreateInfoDXR *target_info = OXR_GET_INPUT_FROM_CHAIN(
 	    createInfo, XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR, XrWin32WindowBindingCreateInfoDXR);
 	if (target_info) {
+#ifdef OXR_HAVE_DXR_win32_window_binding
+		// v9 (ADR-060): a texture target binding's valid usage, before any
+		// of the binding is acted on.
+		XrResult tt_ret = oxr_texture_target_verify_create(log, createInfo);
+		if (tt_ret != XR_SUCCESS) {
+			return tt_ret;
+		}
+#endif
 		if (target_info->windowHandle) {
 			xsi.external_window_handle = (void *)target_info->windowHandle;
 		}
@@ -7190,6 +7207,11 @@ oxr_session_create(struct oxr_logger *log,
 		}
 		return ret;
 	}
+
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	// v9 (ADR-060): say so when a texture target binding is not honoured.
+	oxr_texture_target_note_ignored(sess, createInfo);
+#endif
 
 	/*
 	 * Track whether this session has an APP-PROVIDED window / readback / shared

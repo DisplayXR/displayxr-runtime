@@ -29,6 +29,7 @@ Rules:
 |---|---|---|
 | 1004999001–002 | `XR_DXR_win32_window_binding` | 002 = `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR`, deliberately shared by all five window/surface binding headers (win32, cocoa, xlib, wayland, android): same struct, `#ifndef`-guarded on the type value |
 | 1004999003–014 | `XR_DXR_display_info` | 003, 006–008, 010–014 assigned (014 = `XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR`); 005 = the Android binding's create-info (see its row); 009 unused |
+| 1004999015–018 | `XR_DXR_win32_window_binding` (v9 additions) | 015 = `XR_TYPE_WIN32_TEXTURE_TARGET_BINDING_DXR`, 016 = `XR_TYPE_WIN32_TEXTURE_TARGET_FRAME_DXR`, 017 = `XR_TYPE_SYSTEM_WIN32_TEXTURE_TARGET_PROPERTIES_DXR`, 018 = `XR_TYPE_WIN32_TEXTURE_TARGET_STATE_DXR` (spec v9, ADR-060 texture target binding) |
 | 1004999004 | `XR_DXR_cocoa_window_binding` | + shares 002 (see above) |
 | 1004999100–113 | `XR_DXR_spatial_workspace` | 111–112 screens / placement (spec v25), 113 = `XR_TYPE_WORKSPACE_OVERLAY_SCREEN_DXR` (spec v26); 114–119 free for it |
 | 1004999120–122 | `XR_DXR_workspace_file_dialog` | 122 is an `XrResult`, not an `XrStructureType` |

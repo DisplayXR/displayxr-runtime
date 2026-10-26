@@ -57,8 +57,12 @@ static_assert(offsetof(XrCocoaWindowPlacementInfoDXR, flags) == 16, "XrCocoaWind
 #endif
 
 // ---- XR_DXR_win32_window_binding.h
-static_assert(XR_DXR_win32_window_binding_SPEC_VERSION == 8, "XR_DXR_win32_window_binding_SPEC_VERSION moved");
+static_assert(XR_DXR_win32_window_binding_SPEC_VERSION == 9, "XR_DXR_win32_window_binding_SPEC_VERSION moved");
 static_assert(XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR == (XrStructureType)1004999001, "XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR renumbered");
+static_assert(XR_TYPE_WIN32_TEXTURE_TARGET_BINDING_DXR == (XrStructureType)1004999015, "XR_TYPE_WIN32_TEXTURE_TARGET_BINDING_DXR renumbered");
+static_assert(XR_TYPE_WIN32_TEXTURE_TARGET_FRAME_DXR == (XrStructureType)1004999016, "XR_TYPE_WIN32_TEXTURE_TARGET_FRAME_DXR renumbered");
+static_assert(XR_TYPE_SYSTEM_WIN32_TEXTURE_TARGET_PROPERTIES_DXR == (XrStructureType)1004999017, "XR_TYPE_SYSTEM_WIN32_TEXTURE_TARGET_PROPERTIES_DXR renumbered");
+static_assert(XR_TYPE_WIN32_TEXTURE_TARGET_STATE_DXR == (XrStructureType)1004999018, "XR_TYPE_WIN32_TEXTURE_TARGET_STATE_DXR renumbered");
 #if UINTPTR_MAX == UINT64_MAX
 static_assert(sizeof(XrWin32WindowBindingCreateInfoDXR) == 56, "XrWin32WindowBindingCreateInfoDXR size changed");
 static_assert(offsetof(XrWin32WindowBindingCreateInfoDXR, type) == 0, "XrWin32WindowBindingCreateInfoDXR::type moved");
@@ -68,6 +72,29 @@ static_assert(offsetof(XrWin32WindowBindingCreateInfoDXR, readbackCallback) == 2
 static_assert(offsetof(XrWin32WindowBindingCreateInfoDXR, readbackUserdata) == 32, "XrWin32WindowBindingCreateInfoDXR::readbackUserdata moved");
 static_assert(offsetof(XrWin32WindowBindingCreateInfoDXR, sharedTextureHandle) == 40, "XrWin32WindowBindingCreateInfoDXR::sharedTextureHandle moved");
 static_assert(offsetof(XrWin32WindowBindingCreateInfoDXR, transparentBackgroundEnabled) == 48, "XrWin32WindowBindingCreateInfoDXR::transparentBackgroundEnabled moved");
+static_assert(sizeof(XrSystemWin32TextureTargetPropertiesDXR) == 24, "XrSystemWin32TextureTargetPropertiesDXR size changed");
+static_assert(offsetof(XrSystemWin32TextureTargetPropertiesDXR, type) == 0, "XrSystemWin32TextureTargetPropertiesDXR::type moved");
+static_assert(offsetof(XrSystemWin32TextureTargetPropertiesDXR, next) == 8, "XrSystemWin32TextureTargetPropertiesDXR::next moved");
+static_assert(offsetof(XrSystemWin32TextureTargetPropertiesDXR, supportsTextureTarget) == 16, "XrSystemWin32TextureTargetPropertiesDXR::supportsTextureTarget moved");
+static_assert(offsetof(XrSystemWin32TextureTargetPropertiesDXR, windowlessPhase) == 20, "XrSystemWin32TextureTargetPropertiesDXR::windowlessPhase moved");
+static_assert(sizeof(XrWin32TextureTargetBindingDXR) == 40, "XrWin32TextureTargetBindingDXR size changed");
+static_assert(offsetof(XrWin32TextureTargetBindingDXR, type) == 0, "XrWin32TextureTargetBindingDXR::type moved");
+static_assert(offsetof(XrWin32TextureTargetBindingDXR, next) == 8, "XrWin32TextureTargetBindingDXR::next moved");
+static_assert(offsetof(XrWin32TextureTargetBindingDXR, referenceWindow) == 16, "XrWin32TextureTargetBindingDXR::referenceWindow moved");
+static_assert(offsetof(XrWin32TextureTargetBindingDXR, initialTargetRect) == 24, "XrWin32TextureTargetBindingDXR::initialTargetRect moved");
+static_assert(sizeof(XrWin32TextureTargetFrameDXR) == 48, "XrWin32TextureTargetFrameDXR size changed");
+static_assert(offsetof(XrWin32TextureTargetFrameDXR, type) == 0, "XrWin32TextureTargetFrameDXR::type moved");
+static_assert(offsetof(XrWin32TextureTargetFrameDXR, next) == 8, "XrWin32TextureTargetFrameDXR::next moved");
+static_assert(offsetof(XrWin32TextureTargetFrameDXR, referenceWindow) == 16, "XrWin32TextureTargetFrameDXR::referenceWindow moved");
+static_assert(offsetof(XrWin32TextureTargetFrameDXR, targetRect) == 24, "XrWin32TextureTargetFrameDXR::targetRect moved");
+static_assert(offsetof(XrWin32TextureTargetFrameDXR, flags) == 40, "XrWin32TextureTargetFrameDXR::flags moved");
+static_assert(sizeof(XrWin32TextureTargetStateDXR) == 56, "XrWin32TextureTargetStateDXR size changed");
+static_assert(offsetof(XrWin32TextureTargetStateDXR, type) == 0, "XrWin32TextureTargetStateDXR::type moved");
+static_assert(offsetof(XrWin32TextureTargetStateDXR, next) == 8, "XrWin32TextureTargetStateDXR::next moved");
+static_assert(offsetof(XrWin32TextureTargetStateDXR, flags) == 16, "XrWin32TextureTargetStateDXR::flags moved");
+static_assert(offsetof(XrWin32TextureTargetStateDXR, wovenScreenOrigin) == 24, "XrWin32TextureTargetStateDXR::wovenScreenOrigin moved");
+static_assert(offsetof(XrWin32TextureTargetStateDXR, wovenTargetRect) == 32, "XrWin32TextureTargetStateDXR::wovenTargetRect moved");
+static_assert(offsetof(XrWin32TextureTargetStateDXR, wovenDisplayTime) == 48, "XrWin32TextureTargetStateDXR::wovenDisplayTime moved");
 #endif
 
 // ---- XR_DXR_xlib_window_binding.h
