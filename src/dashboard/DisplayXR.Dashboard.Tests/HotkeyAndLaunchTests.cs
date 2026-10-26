@@ -13,6 +13,7 @@ public class HotkeyAndLaunchTests
 {
     [Theory]
     [InlineData("Ctrl+Space", "Ctrl+Space")]
+    [InlineData("shift+ctrl+space", "Ctrl+Shift+Space")]
     [InlineData("ctrl+shift+f9", "Ctrl+Shift+F9")]
     [InlineData(" Shift + Ctrl + a ", "Ctrl+Shift+A")]          // canonical modifier order, upper-case letter
     [InlineData("Control+Alt+Return", "Ctrl+Alt+Enter")]         // aliases
@@ -64,7 +65,7 @@ public class HotkeyAndLaunchTests
         Assert.EndsWith("workspace-host.exe", host.Exe);
         Assert.True(host.Connected);
         Assert.Equal(5120, host.Pid);
-        Assert.Equal(new LaunchConfig("auto", "Ctrl+Space", "default"), host.Launch);
+        Assert.Equal(new LaunchConfig("auto", Hotkey.Default, "default"), host.Launch);
         var other = ws.Controllers[1];
         Assert.False(other.Connected);
         Assert.Null(other.Pid);
@@ -125,5 +126,18 @@ public class HotkeyAndLaunchTests
         Assert.Equal("Ctrl+Shift+F9", other.Launch!.Hotkey);
         Assert.True(other.Connected);
         Assert.True(Run("workspace set other-controller --no-hotkey").Ok);
+        Assert.True(Run("workspace reset other-controller").Ok);
+        Assert.True(WorkspaceList.TryParse(Run("workspace list --json").Stdout, out ws));
+        Assert.Equal(new LaunchConfig("auto", "Ctrl+Shift+Space", "default"),
+                     ws!.Controllers.Single(c => c.Id == "other-controller").Launch);
+    }
+
+    [Fact]
+    public void Default_IsCtrlShiftSpace_AndCanonical()
+    {
+        Assert.Equal("Ctrl+Shift+Space", Hotkey.Default);
+        Assert.True(Hotkey.TryParse(Hotkey.Default, out var hk, out var err), err);
+        Assert.Equal(Hotkey.Default, hk.ToString());
+        Assert.Equal(HotkeyModifiers.Ctrl | HotkeyModifiers.Shift, hk.Modifiers);
     }
 }

@@ -57,7 +57,7 @@ comp_window_macos_set_window_rect(struct comp_target *ct, int32_t x, int32_t y, 
 /*!
  * Show (orderFront) or hide (orderOut) the full-screen surface window (#61). The
  * macOS service is a persistent daemon; when no workspace controller is connected
- * (Ctrl+Space toggled the shell off) it hides the borderless full-screen window
+ * (the toggle hotkey turned the shell off) it hides the borderless full-screen window
  * so the normal macOS desktop returns, and shows it again when a controller
  * reconnects. Runs on the main thread.
  *

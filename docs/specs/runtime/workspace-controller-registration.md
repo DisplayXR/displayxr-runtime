@@ -83,7 +83,7 @@ menu ordering.
 | Type | Meaning |
 |---|---|
 | `lifecycle:enable` | Service applies `SERVICE_CHILD_ENABLE` — controller is always running. |
-| `lifecycle:auto` | Service applies `SERVICE_CHILD_AUTO` — Ctrl+Space spawns on demand. |
+| `lifecycle:auto` | Service applies `SERVICE_CHILD_AUTO` — the launch hotkey (Ctrl+Shift+Space by default) spawns on demand. |
 | `lifecycle:disable` | Service applies `SERVICE_CHILD_DISABLE` — controller never auto-spawns. |
 | `separator` | Renders an `MF_SEPARATOR`. Not a click target. `Label` is ignored. |
 | `controller:<action-name>` | Service runs `CreateProcess` of `Binary` with `--workspace-action <action-name>`. The controller is responsible for singleton-aware forwarding (see below). |
@@ -217,7 +217,7 @@ registration `<id>`:
 
 | key | absent | values |
 |---|---|---|
-| `hotkey` | `Ctrl+Space` | a combo (below), or `null` = no hotkey (launch from the tray / `workspace launch` only) |
+| `hotkey` | `Ctrl+Shift+Space` | a combo (below), or `null` = no hotkey (launch from the tray / `workspace launch` only) |
 | `mode` | `auto` | `auto` (on demand) or `disabled` (never launched, no hook) |
 
 An entry exists only while it differs from the defaults (the CLI prunes it back), so
@@ -226,6 +226,22 @@ old meaning — **the active controller's** mode (`auto` / `disable` / the legac
 always-on `enable`) — and every writer (CLI, tray menu) keeps it and the active
 controller's `mode` in step. In a hand-edited file where they disagree, the
 per-controller entry wins. `enable` has no per-controller spelling and reports as `auto`.
+
+**Default combo, and upgrades (2026-10-26).** The default is `Ctrl+Shift+Space`
+(`SERVICE_HOTKEY_DEFAULT`). It was `Ctrl+Space` until 2026-10-26 and changed because the
+service's hook sees a key before any application: `Ctrl+Space` is a common application
+binding (editor / IDE completion, "maximize area" in DCC tools, the Windows IME switch), and
+the old default took it from all of them. Because the default is never written to
+`service.json` (a setter prunes an entry equal to it), the change needs no migration step:
+
+| `service.json` before the upgrade | after |
+|---|---|
+| no entry for the controller, or no `hotkey` key (every box that never customised it) | `Ctrl+Shift+Space`, `source: "default"` |
+| `"hotkey": "Ctrl+Space"` (only by hand: the old setters pruned it) | kept — `Ctrl+Space`, `source: "user"` |
+| any other combo, or `null` | unchanged |
+
+To go back to the old combo: `displayxr-cli workspace set <id> --hotkey ctrl+space` (or
+the dashboard's capture box); `workspace reset <id>` returns to the current default.
 
 **Combo grammar.** `[Ctrl+][Shift+][Alt+][Win+]<Key>`, at least one modifier.
 `<Key>` is `Space`, `A`-`Z`, `0`-`9`, `F1`-`F24`, `Tab`, `Enter`, `Backquote`, `Minus`,
@@ -239,9 +255,19 @@ listed). Anything else is rejected. Implementation: `service_hotkey.c`, unit-tes
 
 **Matching.** (Windows; Linux: see *Linux* below.) The service's `WH_KEYBOARD_LL` hook fires on the configured key with
 **exactly** the configured modifier set down — every required modifier down, every other
-modifier up — so `Ctrl+Space` does not swallow `Ctrl+Shift+Space` or the `Win+Space` IME
-switch. As before (#344) the hook is installed only in `auto` mode while the controller is
+modifier up — so the default `Ctrl+Shift+Space` leaves plain `Ctrl+Space` (an application's
+binding) and the `Win+Space` IME switch untouched, and a user-set `Ctrl+Space` does not
+swallow `Ctrl+Shift+Space`. As before (#344) the hook is installed only in `auto` mode while the controller is
 **not** running; `disabled` or `hotkey: null` installs no hook at all.
+
+**macOS.** The service registers one global Carbon hotkey, **Control+Shift+Space**
+(`controlKey | shiftKey` — Control, not Command, so it is the same physical chord as on
+Windows and Linux), as a toggle: it launches the controller when none is running and
+SIGTERMs it when one is. It is fixed — the per-controller `hotkey` in `service.json` is
+stored and reported but not applied on macOS yet. Until 2026-10-26 it was Control+Space,
+plus a Control+Option+Space fallback for boxes where macOS owns Control+Space ("Select the
+previous input source"); the fallback is gone too, since Control+Shift+Space has no system
+binding and Control+Option+Space is macOS's own "Select next source in Input menu".
 
 **Active controller.** `active_id` is the controller the service spawns — the selection
 rule of *Service-side discovery* below (`service_config_pick_controller`, shared by the
@@ -253,7 +279,7 @@ service and the CLI). Only the active controller is launched by the hotkey or
 ```
 displayxr-cli workspace list [--json]
 displayxr-cli workspace set <id> --hotkey "<combo>" | --no-hotkey | --mode auto|disabled
-displayxr-cli workspace reset <id>                 # back to Ctrl+Space, auto
+displayxr-cli workspace reset <id>                 # back to Ctrl+Shift+Space, auto
 displayxr-cli workspace launch <id>                # spawn now, through the running service
 displayxr-cli workspace hotkey-suspend on|off      # take the hook out / put it back
 ```
@@ -294,7 +320,7 @@ controller runs, dismissing it is the controller's own binding (it owns its togg
 Nothing requires it to.
 
 **Tray.** The active controller's submenu shows a greyed `Launch hotkey: <combo>` (or
-`none`) line, and the tray tooltip names the combo — never a hard-coded Ctrl+Space.
+`none`) line, and the tray tooltip names the combo — never a hard-coded one.
 
 ## Linux: orchestration, launch hotkey, lifecycle
 
@@ -319,11 +345,11 @@ backends each time the combo is (re)applied, and re-picks when the extension com
    (`org.displayxr.WorkspaceHotkey1` on the `org.displayxr.WindowGeometry` bus name;
    `wayland-window-geometry.md` §10). Works under Wayland *and* X11 GNOME, through
    mutter's own `grab_accelerator`. The service pushes the combo it resolved from
-   `service.json` in GTK syntax (`Ctrl+Space` → `<Control>space`) together with its own
+   `service.json` in GTK syntax (`Ctrl+Shift+Space` → `<Control><Shift>space`) together with its own
    systemd user unit (parsed from `/proc/self/cgroup`, `displayxr.service`):
    `Configure(accelerator, unit)`. `service.json` stays authoritative — the extension only
    caches the last pushed value. A disabled controller, `hotkey: null` or no registered
-   controller pushes `""`, which releases the grab (no controller, no grab — Ctrl+Space is
+   controller pushes `""`, which releases the grab (no controller, no grab — the combo is
    never taken from other apps on a box without one).
 2. **X11 root-window grab** (`DISPLAY` set, no `WAYLAND_DISPLAY`, no v13 extension):
    `xcb_grab_key` of the combo's keysym (with and without CapsLock / NumLock) on the root
@@ -657,8 +683,8 @@ root. `acme-cockpit.json`:
 
 1. Registered key / manifest resolves: `displayxr-cli workspace list --json`
    lists the id with the right `binary`.
-2. Hotkey spawn: `displayxr-cli workspace set <id> --hotkey ctrl+space`, press
-   it, the controller starts with `DISPLAYXR_WORKSPACE_SESSION=1` and, on
+2. Hotkey spawn: with the default `Ctrl+Shift+Space` (or `displayxr-cli workspace set
+   <id> --hotkey ctrl+shift+f9`), press it, the controller starts with `DISPLAYXR_WORKSPACE_SESSION=1` and, on
    POSIX, `--service-managed`; a second press dismisses it; `workspace launch
    <id>` starts it without the hotkey.
 3. Lifecycle: killing the controller leaves the service running; the next

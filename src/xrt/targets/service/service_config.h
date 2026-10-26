@@ -42,7 +42,7 @@ enum service_child_mode
  */
 enum service_hotkey_setting
 {
-	SERVICE_HOTKEY_SETTING_DEFAULT = 0, //!< key absent → SERVICE_HOTKEY_DEFAULT (Ctrl+Space)
+	SERVICE_HOTKEY_SETTING_DEFAULT = 0, //!< key absent → SERVICE_HOTKEY_DEFAULT (Ctrl+Shift+Space)
 	SERVICE_HOTKEY_SETTING_NONE,        //!< `"hotkey": null` → no hotkey
 	SERVICE_HOTKEY_SETTING_COMBO,       //!< `"hotkey": "<combo>"` (canonical spelling)
 };
@@ -51,7 +51,7 @@ enum service_hotkey_setting
  * User launch settings for one workspace controller, keyed by its registry id
  * (`service.json` → `"controllers": { "<id>": { "hotkey": …, "mode": … } }`).
  *
- * Entries only exist while they differ from the defaults (Ctrl+Space, auto):
+ * Entries only exist while they differ from the defaults (Ctrl+Shift+Space, auto):
  * every setter prunes an entry that went back to the defaults, so "an entry
  * exists" is what the CLI reports as `"source": "user"`.
  */
@@ -82,7 +82,7 @@ struct service_launch_resolved
  * Stored in `%LOCALAPPDATA%\DisplayXR\service.json` on Windows,
  * `~/.config/displayxr/service.json` on Linux/macOS.
  *
- * Missing file or missing keys → defaults (auto/true, Ctrl+Space).
+ * Missing file or missing keys → defaults (auto/true, Ctrl+Shift+Space).
  */
 struct service_config
 {
@@ -211,7 +211,7 @@ service_config_set_controller_mode(struct service_config *cfg,
                                    bool is_active);
 
 /*!
- * Forget every customisation of controller @p id (back to Ctrl+Space, auto).
+ * Forget every customisation of controller @p id (back to Ctrl+Shift+Space, auto).
  * When @p is_active the top-level `workspace` goes back to auto too.
  */
 void

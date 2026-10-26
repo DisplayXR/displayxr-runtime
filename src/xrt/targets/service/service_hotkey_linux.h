@@ -52,7 +52,7 @@ void
 service_hotkey_linux_start(service_hotkey_linux_activate_fn on_activate);
 
 /*!
- * Arm @p combo (canonical service_hotkey grammar, "Ctrl+Space"), or disarm
+ * Arm @p combo (canonical service_hotkey grammar, "Ctrl+Shift+Space"), or disarm
  * with NULL / "" (no controller, `--no-hotkey`, mode disabled). Idempotent.
  */
 void

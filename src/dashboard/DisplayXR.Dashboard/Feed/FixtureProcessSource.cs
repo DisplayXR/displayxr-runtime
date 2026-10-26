@@ -249,6 +249,13 @@ public sealed class FixtureProcessSource : IProcessSource
                 l["source"] = "user";
                 return new CliResult(0, $"Workspace controller '{sid}' updated (live).", "", false, null);
             }
+            if (a is [_, "reset", var rid] && Find(rid) is { } rc && rc["launch"] is JsonObject rl)
+            {
+                rl["mode"] = "auto";
+                rl["hotkey"] = Model.Hotkey.Default;
+                rl["source"] = "default";
+                return new CliResult(0, $"Workspace controller '{rid}': launch settings back to the defaults (mode=auto hotkey={Model.Hotkey.Default}).", "", false, null);
+            }
             if (a is [_, "launch", var lid] && Find(lid) is { } lc)
             {
                 if (lc["launch"]?["mode"]?.GetValue<string>() == "disabled")

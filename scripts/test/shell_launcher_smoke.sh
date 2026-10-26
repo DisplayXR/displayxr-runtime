@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Shell launcher smoke test — autonomous end-to-end exerciser for Phase 5 tasks.
 #
-# Launches displayxr-shell + cube_handle_d3d11_win, activates the shell via
-# Ctrl+Space, captures a screenshot, toggles Ctrl+L to show the launcher panel,
+# Launches displayxr-shell + cube_handle_d3d11_win directly (no launch hotkey),
+# waits for the shell to activate, captures a screenshot, toggles Ctrl+L to show the launcher panel,
 # captures again, toggles Ctrl+L to hide, captures a third time, cleans up.
 #
 # Outputs under scripts/test/out/:

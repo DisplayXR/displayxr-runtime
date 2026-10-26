@@ -52,7 +52,7 @@ service_orchestrator_shutdown(void);
  * is running takes effect on the next menu open — no service restart
  * required.
  *
- * When false, the tray hides the Workspace submenu and the Ctrl+Space
+ * When false, the tray hides the Workspace submenu and the launch
  * hotkey is a no-op — the runtime is operating as a standalone OpenXR +
  * WebXR platform with no spatial-desktop features.
  */
@@ -136,11 +136,11 @@ service_orchestrator_get_workspace_supports_file_dialog(void);
  * Summon (spawn-if-absent) the registered workspace controller on demand.
  * Idempotent — a no-op when the controller is already running. Registered as
  * the IPC server's workspace-summon provider so macOS UI surfaces (the menu-bar
- * status item / Ctrl+Space hotkey, #61) launch the controller through the same
+ * status item / launch hotkey, #61) launch the controller through the same
  * registry-discovery + crash-respawn path as startup.
  *
  * Defined in the macOS / desktop-Linux orchestrator branch. The Windows
- * orchestrator summons via its own Ctrl+Space trampoline and never references
+ * orchestrator summons via its own launch-hotkey trampoline and never references
  * this symbol; Android has no orchestrator (stubs only).
  */
 void
@@ -184,7 +184,7 @@ uint32_t
 service_orchestrator_request_launch(const char *controller_id);
 
 /*!
- * Canonical launch combo of the active controller ("Ctrl+Space" by default),
+ * Canonical launch combo of the active controller ("Ctrl+Shift+Space" by default),
  * or "" when it has none (`--no-hotkey`) or no controller is registered. For
  * tray UI text. The pointer stays valid until the next config apply.
  */

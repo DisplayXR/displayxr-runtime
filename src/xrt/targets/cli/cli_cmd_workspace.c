@@ -15,7 +15,7 @@
  *       Write the launch settings into service.json, then ask the running
  *       service to re-apply them (`system_reload_service_config`).
  *   workspace reset <id>
- *       Forget every customisation of <id> (Ctrl+Space, auto).
+ *       Forget every customisation of <id> (Ctrl+Shift+Space, auto).
  *   workspace launch <id>
  *       Ask the running service to spawn <id> now, through the hotkey's own
  *       spawn path (`system_workspace_launch`).
@@ -347,7 +347,7 @@ cmd_set(int argc, const char **argv)
 	for (int i = 4; i < argc; i++) {
 		if (strcmp(argv[i], "--hotkey") == 0) {
 			if (i + 1 >= argc) {
-				E("error: '--hotkey' needs a combo, e.g. \"Ctrl+Space\".\n");
+				E("error: '--hotkey' needs a combo, e.g. \"" SERVICE_HOTKEY_DEFAULT "\".\n");
 				return 1;
 			}
 			hotkey = argv[++i];
@@ -564,11 +564,11 @@ print_usage(void)
 	E("Usage: displayxr-cli workspace <list|set|reset|launch|hotkey-suspend> ...\n");
 	E("  list [--json]                       Registered workspace controllers, the active one, live state and\n");
 	E("                                      launch settings.\n");
-	E("  set <id> --hotkey <combo>           Launch hotkey, e.g. \"Ctrl+Space\" (the default), "
+	E("  set <id> --hotkey <combo>           Launch hotkey, e.g. \"" SERVICE_HOTKEY_DEFAULT "\" (the default), "
 	  "\"Ctrl+Shift+F9\".\n");
 	E("  set <id> --no-hotkey                No hotkey (launch from the tray or 'workspace launch').\n");
 	E("  set <id> --mode auto|disabled       auto = on demand (default); disabled = never launched.\n");
-	E("  reset <id>                          Back to the defaults (Ctrl+Space, auto).\n");
+	E("  reset <id>                          Back to the defaults (" SERVICE_HOTKEY_DEFAULT ", auto).\n");
 	E("  launch <id>                         Ask the running service to spawn <id> now.\n");
 	E("  hotkey-suspend on|off               Take the service's launch-hotkey hook out / put it back\n");
 	E("                                      (for a hotkey-capture box; auto-resumes after 60 s).\n");

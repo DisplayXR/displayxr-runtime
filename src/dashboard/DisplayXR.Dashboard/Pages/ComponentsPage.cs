@@ -356,7 +356,8 @@ public sealed class ComponentsPage : Page
             Background = Tokens.Field, CornerRadius = Tokens.Radius("FieldRadius"), VerticalAlignment = VerticalAlignment.Center,
         };
         Avalonia.Automation.AutomationProperties.SetName(capture, $"Launch hotkey for {c.Name}");
-        ToolTip.SetTip(capture, "Click, then press the combination: at least one of Ctrl / Shift / Alt / Win plus a key.");
+        ToolTip.SetTip(capture, "Click, then press the combination: at least one of Ctrl / Shift / Alt / Win plus a key. "
+                              + "The service sees it before any app, so avoid a combo your apps use (Ctrl+Space, for one).");
         capture.PointerPressed += (_, e) =>
         {
             if (busy) return;
@@ -406,6 +407,13 @@ public sealed class ComponentsPage : Page
         var clear = U.Button("Clear", () => _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--no-hotkey")), "quiet", "sm");
         clear.IsEnabled = !busy && launch.Hotkey is { Length: > 0 };
 
+        // Back to the runtime's defaults: `workspace reset` drops the controller's
+        // service.json entry, so it follows the default again (an upgraded box that
+        // stored Ctrl+Space gets Ctrl+Shift+Space this way).
+        var reset = U.Button("Reset", () => _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "reset", id)), "quiet", "sm");
+        reset.IsEnabled = !busy && launch.Source == "user";
+        ToolTip.SetTip(reset, $"Back to the runtime's defaults ({Hotkey.Default}, Auto on current runtimes).");
+
         // (b) mode.
         var mode = new ComboBox { ItemsSource = new[] { "Auto (on demand)", "Disabled" }, SelectedIndex = launch.Disabled ? 1 : 0, MinWidth = 190, IsEnabled = !busy };
         mode.Classes.Add("field");
@@ -430,7 +438,7 @@ public sealed class ComponentsPage : Page
 
         var label = U.Text("Launch", "label");
         label.VerticalAlignment = VerticalAlignment.Center;
-        var row = U.Flow(10, 6, label, capture, clear, mode, launchNow);
+        var row = U.Flow(10, 6, label, capture, clear, reset, mode, launchNow);
 
         // (d) state chips.
         var chips = U.Flow(6, 4, U.Chip("registered"));

@@ -612,7 +612,7 @@ handle_event(struct comp_window_linux *cwl,
 		if (cwl->atom_wm_delete_window != XCB_ATOM_NONE && cm->data.data32[0] == cwl->atom_wm_delete_window) {
 			// The surface is the workspace itself, not an app window: a WM close
 			// (Alt+F4) does not tear it down. The controller owns the lifecycle
-			// (Ctrl+Space / its own exit), which hides the surface.
+			// (launch hotkey / its own exit), which hides the surface.
 			U_LOG_W("comp_window_linux: ignoring WM close request on the workspace surface");
 		}
 		return;

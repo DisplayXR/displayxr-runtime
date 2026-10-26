@@ -347,7 +347,7 @@ comp_window_macos_set_window_rect(struct comp_target *ct, int32_t x, int32_t y, 
 }
 
 //! Show/hide the full-screen surface window (#61). When the workspace controller
-//! goes away (Ctrl+Space toggle-off / shell exit) the service keeps running but
+//! goes away (toggle-hotkey off / shell exit) the service keeps running but
 //! must drop its borderless full-screen window so the macOS desktop returns —
 //! otherwise the last (empty backdrop) frame sits on top as a black screen with
 //! no menu bar/dock to escape. orderFront brings it back when a controller
@@ -373,7 +373,7 @@ comp_window_macos_set_visible(struct comp_target *ct, bool visible)
 		} else {
 			[cwm->window orderOut:nil];
 			// Restore the desktop cursor the instant the surface is hidden —
-			// otherwise it stays hidden (Ctrl+Space-close left no cursor until a
+			// otherwise it stays hidden (a toggle-hotkey close left no cursor until a
 			// click forced a refresh). #61.
 			if (cwm->cursor_hidden) {
 				CGDisplayShowCursor(kCGDirectMainDisplay);

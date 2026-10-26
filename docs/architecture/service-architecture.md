@@ -123,7 +123,7 @@ Windows only.
    ┌─────────────────────────────────┴───────────────────────────────────────────────────┐
    │ displayxr-service.exe  (ONE process, ONE heap)                                       │
    │  main thread ─ ipc_server_main → main_loop (20 Hz)            ipc_server_process.c:537│
-   │  tray thread ─ message pump + WH_KEYBOARD_LL Ctrl+Space hook   service_tray_win.c:514 │
+   │  tray thread ─ message pump + WH_KEYBOARD_LL hotkey hook       service_tray_win.c:514 │
    │  watchdog thread ─ WaitForSingleObject(child, INFINITE)         service_orchestrator.c:418│
    │  per-client IPC threads ×N (≤ IPC_MAX_CLIENTS 8)               ipc_server_process.c:1029│
    │  D3D11 window thread (service-owned HWND)                      comp_d3d11_window.cpp:1650│
@@ -152,7 +152,7 @@ Windows only.
 | Logon → service | `HKLM\...\Run` value, `--autostart`; exits immediately if `start_on_login=false` | `installer/DisplayXRInstaller.nsi:873`; `main.c:125-128` (`ExitProcess(0)`) |
 | Any IPC client → service | pipe missing ⇒ `CreateProcessA(displayxr-service.exe)` → `service\` sibling → `ShellExecuteExA` (works from AppContainer). **No arguments** — workspace mode is entered later by `workspace_activate`, never by launch | `ipc_client_connection.c:195-262` |
 | Singleton | the named pipe with `FILE_FLAG_FIRST_PIPE_INSTANCE`; the pidfile path is a libbsd-only no-op on Windows | `ipc_server_mainloop_windows.cpp:153-155,184-198`; `u_process.c:86-91` |
-| Service → shell | `WH_KEYBOARD_LL` hook on the **tray** thread, matching the **configured** launch combo exactly (`service.json` `controllers.<id>.hotkey`, Ctrl+Space by default; none → no hook) → `PostMessage(WM_ORCHESTRATOR_SPAWN_WORKSPACE)` → `spawn_workspace()` → `CreateProcessA("<binary> --service-managed", CREATE_NO_WINDOW, inherited env + DISPLAYXR_WORKSPACE_HOTKEY)`. DIAG `system_workspace_launch` posts the same message. Hook is **uninstalled while the shell runs** (#344) and re-armed by the watchdog on exit. Config changes — tray menu or DIAG `system_reload_service_config` — all run on the tray thread through `service_orchestrator_apply_config`; DIAG `system_workspace_hotkey_suspend` takes the hook out for ≤ 60 s (launch settings: `workspace-controller-registration.md`) | `service_orchestrator.c:700-779, 388, 267, 409-412, 358-362` |
+| Service → shell | `WH_KEYBOARD_LL` hook on the **tray** thread, matching the **configured** launch combo exactly (`service.json` `controllers.<id>.hotkey`, Ctrl+Shift+Space by default — Ctrl+Space before 2026-10-26; none → no hook) → `PostMessage(WM_ORCHESTRATOR_SPAWN_WORKSPACE)` → `spawn_workspace()` → `CreateProcessA("<binary> --service-managed", CREATE_NO_WINDOW, inherited env + DISPLAYXR_WORKSPACE_HOTKEY)`. DIAG `system_workspace_launch` posts the same message. Hook is **uninstalled while the shell runs** (#344) and re-armed by the watchdog on exit. Config changes — tray menu or DIAG `system_reload_service_config` — all run on the tray thread through `service_orchestrator_apply_config`; DIAG `system_workspace_hotkey_suspend` takes the hook out for ≤ 60 s (launch settings: `workspace-controller-registration.md`) | `service_orchestrator.c:700-779, 388, 267, 409-412, 358-362` |
 | Shell → apps | `CreateProcessA` with `DISPLAYXR_WORKSPACE_SESSION=1`, `CREATE_NEW_CONSOLE`, **no job object**; the shell reaps them only on its own orderly exit (`request_client_exit` → 1 s → `TerminateProcess`) | `displayxr-shell-pvt/src/main.c:3519-3599, 7106-7145` |
 | Shell → voice | `CreateProcessA(displayxr-voice.exe)`, MCP client only, never touches the service | `displayxr-shell-pvt/src/shell_voice.c:652-767` |
 | Tray → DisplayXR Dashboard | `ShellExecuteW`, untracked | `service_tray_win.c` (`launch_dashboard`) |
@@ -201,7 +201,7 @@ fire for the window thread — `git show cc7df1676`):
 |---|---|---|
 | `wnd_proc` (trampoline `try{wnd_proc_inner}` **inside** the callback — the only placement that works across the x64 kernel-callback boundary) | `comp_d3d11_window.cpp:1377-1391` | message dropped, window lives |
 | `window_thread_func` | `comp_d3d11_window.cpp:1575-1591` | thread stops, `window_release` vote |
-| `capture_render_thread_func` | `comp_d3d11_service.cpp:6041, 6139-6164` | thread stops, `capture_render_running=false` — restartable but **nothing polls it**; recovery needs a new client or a Ctrl+Space cycle |
+| `capture_render_thread_func` | `comp_d3d11_service.cpp:6041, 6139-6164` | thread stops, `capture_render_running=false` — restartable but **nothing polls it**; recovery needs a new client or a launch-hotkey cycle |
 | `window_op_worker_func` (detached) | `comp_d3d11_service.cpp:1333-1375` | worker gone for the process lifetime; queued 2D restores silently stop |
 | capture `frame_pool.Recreate` only | `d3d11_capture.cpp:166` | — |
 
@@ -646,7 +646,7 @@ connect-after ⇒ always joins (relay — no claimant since #1180 — and contro
 **Transitions** (evidence in the standalone review): a client that was standalone when the
 shell activates is **never** flagged for reverse hot-switch (only slot members are, `:17836-17844`) —
 its commits take the workspace early-return (`:12431`) before `process_atlas`/`Present`, so it
-**goes dark with a live orphan DP** (INFERRED reachable: forced-IPC cube then Ctrl+Space). On
+**goes dark with a live orphan DP** (INFERRED reachable: forced-IPC cube then the launch hotkey). On
 deactivate, slot members lazily rebuild per-client resources on their own IPC threads
 (`:12440-12513`, DP factory on the IPC thread) — but a client with **no `app_hwnd`** (Chrome/hosted
 that joined under the shell) fails the `IsWindow` test and logs `swap_chain=NULL` forever
@@ -681,7 +681,7 @@ HRESULT.
 |---|---|---|---|---|
 | **Vendor DP** | in `probe`/`DllMain` during per-client `refresh_display_processors` → **every** client's `xrCreateSession` blocks behind `g_refresh_mutex`; in `process_atlas` on the render thread → workspace stops, controller RPCs park; on an IPC thread (standalone) → that client + shared-context contention | whole service (banner, no chatter) | caught only in `wnd_proc`/render thread; IPC threads → silent death | whole process |
 | **Input providers** | `get_presence` under `g_arb_mutex` → **every** client's `xrSyncActions` blocks (and each client's frame loop behind `ipc_c->mutex`); provider `hub->mutex` stall → all consumers of that provider | whole service (#943 signature — but see below) | crosses the C ABI ⇒ terminate, no banner, no WER | whole process |
-| tray thread | tray + Ctrl+Space dead; IPC survives | — | terminate | — |
+| tray thread | tray + launch hotkey dead; IPC survives | — | terminate | — |
 | window thread | frozen window; cross-thread window calls behind it | — | contained | — |
 | render thread | workspace stops compositing; clients keep sessions | — | contained, not self-healing | — |
 | per-client IPC thread | that client — unless inside `global_state.lock`/`g_arb_mutex`/`g_refresh_mutex`/`render_mutex` | whole service | terminate | — |
@@ -689,7 +689,7 @@ HRESULT.
 | **conversion provider, in-service** (`dp-lift` always; any provider with `Hosting=in-service`) | its dispatcher waits; the stall watchdog marks the rows FAILED(`hung`) and abandons the exec thread until the service restarts; compositor unaffected | whole service | whole service | whole process |
 | **conversion host** (separate process, ADR-053 P2) | the stall watchdog kills the host (exit 30) → crash path | the host only: streams survive, WARMING(`restarting`) → re-open after the backoff | same | **isolated** (also DLL conflicts between model runtimes). A host that dies before signalling a fence is invisible to the compositor (the fence rule) |
 | **viewer-tracking host** (separate process, §4a) | its heartbeat stops → killed after 3 s → crash path; the view paths never wait on it (they read the page) | the host only: views hold the last known viewer, `is_tracking` false, restart after the backoff | same | **isolated**; a scribbling host can only corrupt its own samples (the reader bounds every index) |
-| shell (separate process) | nothing blocks in the service; a hung shell keeps the Ctrl+Space hook uninstalled | watchdog respawn/re-arm, no backoff | same (exit code never read) | **isolated — the only real boundary in the design** |
+| shell (separate process) | nothing blocks in the service; a hung shell keeps the launch-hotkey hook uninstalled | watchdog respawn/re-arm, no backoff | same (exit code never read) | **isolated — the only real boundary in the design** |
 
 **On #943's mechanism.** The filed chain (last-client teardown → `xrt_system_devices_feature_dec`
 → refcount 0 → provider `end_feature` → `exit()`) is **not live at this commit**: `feature_inc`

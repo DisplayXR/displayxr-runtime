@@ -69,7 +69,8 @@ round_trip(const service_config &in)
 TEST_CASE("hotkey combos parse and format canonically", "[service][hotkey]")
 {
 	CHECK(canon("Ctrl+Space") == "Ctrl+Space");
-	CHECK(canon(SERVICE_HOTKEY_DEFAULT) == "Ctrl+Space");
+	CHECK(canon(SERVICE_HOTKEY_DEFAULT) == "Ctrl+Shift+Space");
+	CHECK(canon("shift+ctrl+space") == "Ctrl+Shift+Space");
 	CHECK(canon("ctrl+space") == "Ctrl+Space");
 	CHECK(canon("Shift+Ctrl+F9") == "Ctrl+Shift+F9");
 	CHECK(canon("Win+Alt+Shift+Ctrl+BracketRight") == "Ctrl+Shift+Alt+Win+BracketRight");
@@ -163,6 +164,8 @@ TEST_CASE("hotkey grammar maps on to X11 keysyms and modifier masks", "[service]
 	// keysymdef.h: XK_space 0x20, XK_a 0x61, XK_F1 0xffbe, XK_Return 0xff0d ...
 	CHECK(x11("Ctrl+Space").keysym == 0x0020u);
 	CHECK(x11("Ctrl+Space").mods == SERVICE_HOTKEY_X11_CONTROL);
+	CHECK(x11(SERVICE_HOTKEY_DEFAULT).keysym == 0x0020u);
+	CHECK(x11(SERVICE_HOTKEY_DEFAULT).mods == (SERVICE_HOTKEY_X11_CONTROL | SERVICE_HOTKEY_X11_SHIFT));
 	CHECK(x11("Alt+A").keysym == 0x0061u); // the level-0 (lower-case) keysym
 	CHECK(x11("Alt+Z").keysym == 0x007au);
 	CHECK(x11("Alt+A").mods == SERVICE_HOTKEY_X11_MOD1);
@@ -210,6 +213,7 @@ TEST_CASE("hotkey grammar maps on to X11 keysyms and modifier masks", "[service]
 TEST_CASE("hotkey grammar maps on to GTK accelerators", "[service][hotkey][linux]")
 {
 	CHECK(accel("Ctrl+Space") == "<Control>space");
+	CHECK(accel(SERVICE_HOTKEY_DEFAULT) == "<Control><Shift>space");
 	CHECK(accel("ctrl+shift+f5") == "<Control><Shift>F5");
 	CHECK(accel("Alt+Win+A") == "<Alt><Super>a");
 	CHECK(accel("Win+PageDown") == "<Super>Page_Down");
@@ -229,14 +233,14 @@ TEST_CASE("hotkey grammar maps on to GTK accelerators", "[service][hotkey][linux
 	CHECK_FALSE(service_hotkey_to_accelerator(&none, buf, sizeof(buf)));
 }
 
-TEST_CASE("defaults: Ctrl+Space, auto, source default", "[service][config]")
+TEST_CASE("defaults: Ctrl+Shift+Space, auto, source default", "[service][config]")
 {
 	service_config cfg = defaults();
 	service_launch_resolved r;
 	service_config_resolve_launch(&cfg, "shell", true, &r);
 	CHECK(r.mode == SERVICE_CHILD_AUTO);
 	CHECK(r.has_hotkey);
-	CHECK(std::string(r.hotkey_text) == "Ctrl+Space");
+	CHECK(std::string(r.hotkey_text) == "Ctrl+Shift+Space");
 	CHECK_FALSE(r.user);
 
 	// A missing / empty / malformed file is the defaults.
@@ -293,7 +297,7 @@ TEST_CASE("service.json round-trips the controllers map", "[service][config]")
 	CHECK(r.user);
 	service_config_resolve_launch(&back, "kiosk", false, &r);
 	CHECK(r.mode == SERVICE_CHILD_DISABLE);
-	CHECK(std::string(r.hotkey_text) == "Ctrl+Space");
+	CHECK(std::string(r.hotkey_text) == "Ctrl+Shift+Space");
 	service_config_resolve_launch(&back, "unknown", false, &r);
 	CHECK_FALSE(r.user);
 	CHECK(r.mode == SERVICE_CHILD_AUTO);
@@ -306,11 +310,41 @@ TEST_CASE("a malformed stored hotkey falls back to the default", "[service][conf
 	                                "\"other\": {\"hotkey\": \"ctrl+q\", \"mode\": \"bogus\"}}}");
 	service_launch_resolved r;
 	service_config_resolve_launch(&cfg, "shell", true, &r);
-	CHECK(std::string(r.hotkey_text) == "Ctrl+Space");
+	CHECK(std::string(r.hotkey_text) == "Ctrl+Shift+Space");
 	CHECK_FALSE(r.user); // pruned: nothing customised survived
 	service_config_resolve_launch(&cfg, "other", false, &r);
 	CHECK(std::string(r.hotkey_text) == "Ctrl+Q"); // stored canonicalised
 	CHECK(r.mode == SERVICE_CHILD_AUTO);
+}
+
+TEST_CASE("upgrade from the Ctrl+Space default: absent follows, explicit stays", "[service][config]")
+{
+	// A service.json written by a build whose default was Ctrl+Space never
+	// stored it (the setters prune the default), so it has no hotkey key and
+	// now resolves to the new default.
+	service_config cfg = defaults();
+	service_config_parse_json(&cfg, "{\"workspace\": \"auto\", \"start_on_login\": true}");
+	service_launch_resolved r;
+	service_config_resolve_launch(&cfg, "shell", true, &r);
+	CHECK(std::string(r.hotkey_text) == "Ctrl+Shift+Space");
+	CHECK_FALSE(r.user);
+
+	// An explicit Ctrl+Space (hand-edited, or set after this change) is a user
+	// choice: kept, reported as "user", and survives a round trip.
+	cfg = defaults();
+	service_config_parse_json(&cfg, "{\"controllers\": {\"shell\": {\"hotkey\": \"ctrl+space\"}}}");
+	service_config_resolve_launch(&cfg, "shell", true, &r);
+	CHECK(std::string(r.hotkey_text) == "Ctrl+Space");
+	CHECK(r.user);
+	service_config back = round_trip(cfg);
+	service_config_resolve_launch(&back, "shell", true, &r);
+	CHECK(std::string(r.hotkey_text) == "Ctrl+Space");
+	CHECK(r.user);
+
+	// Choosing Ctrl+Space through the setter stores an entry now.
+	cfg = defaults();
+	REQUIRE(service_config_set_controller_hotkey(&cfg, "shell", "Ctrl+Space"));
+	CHECK(cfg.controller_count == 1);
 }
 
 TEST_CASE("setters prune back to defaults and keep the top-level mode in step", "[service][config]")
@@ -327,7 +361,7 @@ TEST_CASE("setters prune back to defaults and keep the top-level mode in step", 
 
 	// Back to auto + the default combo → the entry disappears → "default".
 	REQUIRE(service_config_set_controller_mode(&cfg, "shell", SERVICE_CHILD_AUTO, true));
-	REQUIRE(service_config_set_controller_hotkey(&cfg, "shell", "Ctrl+Space"));
+	REQUIRE(service_config_set_controller_hotkey(&cfg, "shell", "Ctrl+Shift+Space"));
 	CHECK(cfg.controller_count == 0);
 	CHECK(cfg.workspace == SERVICE_CHILD_AUTO);
 	service_config_resolve_launch(&cfg, "shell", true, &r);
@@ -425,7 +459,7 @@ TEST_CASE("workspace list --json document", "[service][config]")
 	CHECK(cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(a, "pid")));
 	cJSON *la = cJSON_GetObjectItemCaseSensitive(a, "launch");
 	CHECK(std::string(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(la, "mode"))) == "auto");
-	CHECK(std::string(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(la, "hotkey"))) == "Ctrl+Space");
+	CHECK(std::string(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(la, "hotkey"))) == "Ctrl+Shift+Space");
 	CHECK(std::string(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(la, "source"))) == "default");
 	cJSON *lb = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(arr, 1), "launch");
 	CHECK(std::string(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(lb, "hotkey"))) == "Ctrl+Shift+F9");

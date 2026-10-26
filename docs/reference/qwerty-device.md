@@ -355,7 +355,7 @@ Focus is determined by `GetAsyncKeyState()` for reliability (avoids stuck keys f
 | T / F / G / H | Thumbstick **and trackpad** up/left/down/right (one key drives both) | Focused controller |
 | TAB | Toggle the runtime HUD overlay | Global |
 | 1 / 2 / 3 | Select rendering mode | HMD focused |
-| ESC | No-op (workspace lifecycle is Ctrl+Space / tray, not ESC) | Global |
+| ESC | No-op (workspace lifecycle is the launch hotkey — Ctrl+Shift+Space by default — / tray, not ESC) | Global |
 
 > **Trackpad click has no key.** `qwerty_press_trackpad_click()` exists in the
 > driver API but neither the Win32 nor the SDL backend binds a key to it, so
