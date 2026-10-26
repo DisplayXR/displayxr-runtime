@@ -579,8 +579,11 @@ static const void* TextureTargetChain(HWND hwnd, const void* next) {
     GetClientRect(hwnd, &rc);
     g_ttFrame.next = next;
     g_ttFrame.referenceWindow = (void*)hwnd;
-    g_ttFrame.targetRect.offset = {0, 0};
-    g_ttFrame.targetRect.extent = {rc.right > 0 ? (int32_t)rc.right : 1, rc.bottom > 0 ? (int32_t)rc.bottom : 1};
+    int ix = 0, iy = 0;
+    TextureTargetInset(&ix, &iy);
+    g_ttFrame.targetRect.offset = {ix, iy};
+    g_ttFrame.targetRect.extent = {rc.right - ix > 0 ? (int32_t)(rc.right - ix) : 1,
+                                   rc.bottom - iy > 0 ? (int32_t)(rc.bottom - iy) : 1};
     g_ttFrame.flags = 0;
     return &g_ttFrame;
 }
@@ -597,12 +600,19 @@ static void BlitSharedTextureToBackBuffer(D3D11Renderer& renderer,
 
     renderer.context->OMSetRenderTargets(1, &backBufferRTV, nullptr);
 
+    // ADR-060 smoke: with DXR_TEXTURE_TARGET_INSET the texture is drawn at the
+    // target rect's offset, the case where the canvas is not the whole window.
+    int ix = 0, iy = 0;
+    if (TextureTargetEnabled()) TextureTargetInset(&ix, &iy);
+    if ((uint32_t)ix >= winW || (uint32_t)iy >= winH) { ix = 0; iy = 0; }
+    winW -= (uint32_t)ix;
+    winH -= (uint32_t)iy;
     float vpW = (winW < g_sharedWidth) ? (float)winW : (float)g_sharedWidth;
     float vpH = (winH < g_sharedHeight) ? (float)winH : (float)g_sharedHeight;
 
     D3D11_VIEWPORT vp = {};
-    vp.TopLeftX = 0.0f;
-    vp.TopLeftY = 0.0f;
+    vp.TopLeftX = (float)ix;
+    vp.TopLeftY = (float)iy;
     vp.Width = vpW;
     vp.Height = vpH;
     vp.MaxDepth = 1.0f;
