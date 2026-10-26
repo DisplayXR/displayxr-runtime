@@ -30,6 +30,7 @@
 #include "stb_image.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -1525,6 +1526,30 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
             vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.cubeVertexBuffer, &offset);
             vkCmdBindIndexBuffer(cmd, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
             vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+
+            // Test knob (default off): DXR_TEST_GPU_LOAD=N adds N large cube
+            // draws per eye, each nearer the camera than the last so every one
+            // passes the depth test and shades - a heavier GPU frame for
+            // repro work that depends on the app's GPU time (runtime#2393).
+            static int s_gpu_load = -1;
+            if (s_gpu_load < 0) {
+                const char *gl = getenv("DXR_TEST_GPU_LOAD");
+                s_gpu_load = (gl != nullptr) ? atoi(gl) : 0;
+                if (s_gpu_load < 0) s_gpu_load = 0;
+                if (s_gpu_load > 0) LOG_INFO("DXR_TEST_GPU_LOAD=%d extra overdraw passes per eye", s_gpu_load);
+            }
+            for (int i = 0; i < s_gpu_load; i++) {
+                float lscl[16], ltrans[16], lmodel[16], lmvp[16];
+                mat4_scaling(lscl, 0.6f, 0.6f, 0.6f);
+                mat4_translation(ltrans, 0.0f, 1.6f, -2.0f + 0.9f * (float)i / (float)s_gpu_load);
+                mat4_multiply(lmodel, ltrans, lscl);
+                mat4_multiply(lmvp, vp, lmodel);
+                float lpush[32];
+                memcpy(lpush, lmvp, 64);
+                memcpy(lpush + 16, lmodel, 64);
+                vkCmdPushConstants(cmd, renderer.cubePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 128, lpush);
+                vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+            }
         }
 
         // Draw grid floor
