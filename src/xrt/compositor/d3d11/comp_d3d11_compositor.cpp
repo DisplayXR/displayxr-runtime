@@ -483,6 +483,14 @@ struct comp_d3d11_compositor
 		bool origin_logged;
 		int32_t origin_x;
 		int32_t origin_y;
+		//! Anchor fallback: the padded render target the canvas is woven
+		//! into at its offset in the anchor's client area (d3d11_tt_weave).
+		ID3D11Texture2D *pad_tex;
+		ID3D11RenderTargetView *pad_rtv;
+		uint32_t pad_w;
+		uint32_t pad_h;
+		bool pad_logged;
+		bool pad_refused_warned;
 		//! What the last woven bound frame used (under `mutex`).
 		struct comp_d3d11_texture_target_state state;
 	} tt;
@@ -1512,6 +1520,99 @@ d3d11_effective_canvas(struct comp_d3d11_compositor *c)
 }
 
 /*!
+ * ADR-060 anchor fallback: the windowed DP phases render-target pixel p as the
+ * anchor window's client pixel p, but the app draws texel (0,0) of the shared
+ * texture at the target's origin. When that origin is inside the anchor's
+ * client area but not at its corner, weave the canvas at the same offset of a
+ * padded render target (the DP's viewport carries the offset into the phase)
+ * and copy it back to (0,0). Returns the padded RTV and the offset, or NULL to
+ * weave straight into the shared texture (no offset, or one that cannot be
+ * corrected — WARNed once per episode).
+ *
+ * App thread, c->mutex held (layer_commit).
+ */
+static ID3D11RenderTargetView *
+d3d11_tt_anchor_pad(struct comp_d3d11_compositor *c,
+                    const struct comp_texture_target_resolved *r,
+                    int32_t *out_x,
+                    int32_t *out_y)
+{
+	POINT anchor;
+	if (c->shared_texture == nullptr || !comp_texture_target_client_origin_win32(c->app_hwnd, &anchor)) {
+		return nullptr;
+	}
+	if (!comp_texture_target_anchor_offset(r, anchor.x, anchor.y, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION, out_x,
+	                                       out_y)) {
+		const bool offset = r->screen.x != anchor.x || r->screen.y != anchor.y;
+		if (offset && !c->tt.pad_refused_warned) {
+			c->tt.pad_refused_warned = true;
+			U_LOG_W(
+			    "ADR-060: target at (%d,%d) cannot be phased from the windowHandle anchor "
+			    "(client at %d,%d) — weaving unpadded, the phase is off by the target's offset",
+			    r->screen.x, r->screen.y, (int)anchor.x, (int)anchor.y);
+		}
+		return nullptr;
+	}
+	c->tt.pad_refused_warned = false;
+
+	const uint32_t need_w = (uint32_t)*out_x + r->screen.w;
+	const uint32_t need_h = (uint32_t)*out_y + r->screen.h;
+	if (c->tt.pad_tex == nullptr || c->tt.pad_w < need_w || c->tt.pad_h < need_h) {
+		if (c->tt.pad_rtv != nullptr) {
+			c->tt.pad_rtv->Release();
+			c->tt.pad_rtv = nullptr;
+		}
+		if (c->tt.pad_tex != nullptr) {
+			c->tt.pad_tex->Release();
+			c->tt.pad_tex = nullptr;
+		}
+		// Grow-only: a drag or resize must not reallocate every frame.
+		D3D11_TEXTURE2D_DESC desc;
+		c->shared_texture->GetDesc(&desc);
+		desc.Width = std::max(need_w, c->tt.pad_w);
+		desc.Height = std::max(need_h, c->tt.pad_h);
+		desc.MipLevels = 1;
+		desc.ArraySize = 1;
+		desc.SampleDesc.Count = 1;
+		desc.SampleDesc.Quality = 0;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+		desc.CPUAccessFlags = 0;
+		desc.MiscFlags = 0;
+		D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
+		c->shared_rtv->GetDesc(&rtv_desc);
+		HRESULT hr = c->device->CreateTexture2D(&desc, nullptr, &c->tt.pad_tex);
+		if (SUCCEEDED(hr)) {
+			hr = c->device->CreateRenderTargetView(c->tt.pad_tex, &rtv_desc, &c->tt.pad_rtv);
+		}
+		if (FAILED(hr)) {
+			if (c->tt.pad_tex != nullptr) {
+				c->tt.pad_tex->Release();
+				c->tt.pad_tex = nullptr;
+			}
+			c->tt.pad_w = 0;
+			c->tt.pad_h = 0;
+			if (!c->tt.pad_refused_warned) {
+				c->tt.pad_refused_warned = true;
+				U_LOG_W("ADR-060: anchor phase pad %ux%u failed (0x%08x) — weaving unpadded", need_w,
+				        need_h, (unsigned)hr);
+			}
+			return nullptr;
+		}
+		c->tt.pad_w = desc.Width;
+		c->tt.pad_h = desc.Height;
+	}
+	if (!c->tt.pad_logged) {
+		c->tt.pad_logged = true;
+		U_LOG_W(
+		    "ADR-060: windowHandle anchor phase — canvas woven at (%d,%d) of the anchor's client area "
+		    "(target at (%d,%d) %ux%u, pad %ux%u)",
+		    *out_x, *out_y, r->screen.x, r->screen.y, r->screen.w, r->screen.h, c->tt.pad_w, c->tt.pad_h);
+	}
+	return c->tt.pad_rtv;
+}
+
+/*!
  * ADR-060: weave a bound texture session's frame into the shared texture
  * (already bound as the render target) for the target resolved NOW — one
  * resolve feeds the phase, the segment window and the canvas (§2, §3).
@@ -1626,10 +1727,31 @@ d3d11_tt_weave(struct comp_d3d11_compositor *c,
 			c->tt.origin_x = ox;
 			c->tt.origin_y = oy;
 		}
-		xrt_display_processor_d3d11_process_atlas(c->display_processor, c->context, atlas_srv, view_width,
-		                                          view_height, tile_columns, tile_rows,
-		                                          d3d11_dp_view_format(atlas_srv), target_w, target_h, 0, 0,
-		                                          r.screen.w, r.screen.h);
+		int32_t pad_x = 0, pad_y = 0;
+		ID3D11RenderTargetView *pad_rtv =
+		    c->tt.anchor_fallback ? d3d11_tt_anchor_pad(c, &r, &pad_x, &pad_y) : nullptr;
+		if (pad_rtv != nullptr) {
+			// The canvas goes in at the anchor offset, starting from what the
+			// shared texture holds (a read-back DP sees the same pixels), and
+			// comes back out at (0,0), where the app reads it.
+			const D3D11_BOX in = {0, 0, 0, r.screen.w, r.screen.h, 1};
+			c->context->CopySubresourceRegion(c->tt.pad_tex, 0, (UINT)pad_x, (UINT)pad_y, 0,
+			                                  c->shared_texture, 0, &in);
+			c->context->OMSetRenderTargets(1, &pad_rtv, nullptr);
+			xrt_display_processor_d3d11_process_atlas(c->display_processor, c->context, atlas_srv,
+			                                          view_width, view_height, tile_columns, tile_rows,
+			                                          d3d11_dp_view_format(atlas_srv), c->tt.pad_w,
+			                                          c->tt.pad_h, pad_x, pad_y, r.screen.w, r.screen.h);
+			const D3D11_BOX out = {
+			    (UINT)pad_x, (UINT)pad_y, 0, (UINT)pad_x + r.screen.w, (UINT)pad_y + r.screen.h, 1};
+			c->context->CopySubresourceRegion(c->shared_texture, 0, 0, 0, 0, c->tt.pad_tex, 0, &out);
+			c->context->OMSetRenderTargets(1, &c->shared_rtv, nullptr);
+		} else {
+			xrt_display_processor_d3d11_process_atlas(c->display_processor, c->context, atlas_srv,
+			                                          view_width, view_height, tile_columns, tile_rows,
+			                                          d3d11_dp_view_format(atlas_srv), target_w, target_h,
+			                                          0, 0, r.screen.w, r.screen.h);
+		}
 	}
 
 	// What this frame used — XrWin32TextureTargetStateDXR at the next xrWaitFrame.
@@ -6228,6 +6350,14 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 #endif
 
 	// Destroy shared texture resources
+	if (c->tt.pad_rtv != nullptr) {
+		c->tt.pad_rtv->Release();
+		c->tt.pad_rtv = nullptr;
+	}
+	if (c->tt.pad_tex != nullptr) {
+		c->tt.pad_tex->Release();
+		c->tt.pad_tex = nullptr;
+	}
 	if (c->shared_rtv != nullptr) {
 		c->shared_rtv->Release();
 		c->shared_rtv = nullptr;

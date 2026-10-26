@@ -59,6 +59,31 @@ comp_texture_target_ref_alive_win32(void *ref)
 }
 
 /*!
+ * The client-area origin of @p wnd on the desktop, in physical device px
+ * (per-monitor-v2 pin). False when the window is gone.
+ */
+static inline bool
+comp_texture_target_client_origin_win32(void *wnd, POINT *out_origin)
+{
+	out_origin->x = 0;
+	out_origin->y = 0;
+	HWND hwnd = (HWND)wnd;
+	if (hwnd == NULL || !IsWindow(hwnd)) {
+		return false;
+	}
+	comp_texture_target_pfn_set_thread_dpi_ctx set_ctx = comp_texture_target_dpi_setter();
+	DPI_AWARENESS_CONTEXT prev = NULL;
+	if (set_ctx != NULL) {
+		prev = set_ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+	}
+	const BOOL ok = ClientToScreen(hwnd, out_origin);
+	if (set_ctx != NULL && prev != NULL) {
+		(void)set_ctx(prev);
+	}
+	return ok != FALSE;
+}
+
+/*!
  * Resolve @p tt for this weave: read the reference window's client origin on
  * the desktop NOW (a drag moves it), under a per-monitor-v2 pin, then compose
  * and clamp to the shared texture. Returns false when the reference window is
@@ -75,23 +100,8 @@ comp_texture_target_resolve_win32(const struct comp_texture_target *tt,
 		return false;
 	}
 	POINT origin = {0, 0};
-	if (tt->ref != NULL) {
-		HWND ref = (HWND)tt->ref;
-		if (!IsWindow(ref)) {
-			return false;
-		}
-		comp_texture_target_pfn_set_thread_dpi_ctx set_ctx = comp_texture_target_dpi_setter();
-		DPI_AWARENESS_CONTEXT prev = NULL;
-		if (set_ctx != NULL) {
-			prev = set_ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-		}
-		const BOOL ok = ClientToScreen(ref, &origin);
-		if (set_ctx != NULL && prev != NULL) {
-			(void)set_ctx(prev);
-		}
-		if (!ok) {
-			return false;
-		}
+	if (tt->ref != NULL && !comp_texture_target_client_origin_win32(tt->ref, &origin)) {
+		return false;
 	}
 	return comp_texture_target_compose(tt, (int32_t)origin.x, (int32_t)origin.y, tex_w, tex_h, out);
 }
