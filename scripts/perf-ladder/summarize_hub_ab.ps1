@@ -125,6 +125,30 @@ foreach ($cb in $combos) {
         $(if ($gpus.Count -gt 0) { '{0:+0.0;-0.0}' -f (Get-TrueMedian $gpus) } else { '-' }), $note,
         $(if ($p2d.Count -gt 0) { '{0:+0.00;-0.00}' -f (Get-TrueMedian $p2d) } else { '-' }))
 }
+$hasThr = ($rows.Count -gt 0 -and $rows[0].PSObject.Properties['thr_cpu'] -ne $null -and
+           @($rows | Where-Object { $_.thr_cpu -ne '' }).Count -gt 0)
+if ($hasThr) {
+    W ''
+    W '## Per-thread CPU (-ThreadSample, #2371)'
+    W ''
+    W 'Percent of ONE core over the measurement window, from `thread_sampler.ps1`. A thread is named by the module it STARTED in (Win32 start address; every CRT-created thread starts in `ucrtbase`), `[main]` = the app main thread, where the in-process compositor and the hub weave + present. user/kernel: a loop around a syscall is kernel-heavy; a busy-wait in a driver is user-heavy.'
+    W ''
+    W '| app | arm | n ok | app CPU % | threads % | user % | kernel % |'
+    W '|---|---|---|---|---|---|---|'
+    foreach ($g in $groups) {
+        $ok = @($g.Group | Where-Object { $_.status -eq 'OK' -and $_.thr_cpu -ne '' })
+        $a = @($g.Group)[0]
+        W ('| {0} | {1} | {2} | {3} | {4} | {5} | {6} |' -f $a.app, $a.arm, $ok.Count, (Med $ok 'app_cpu'), (Med $ok 'thr_cpu'), (Med $ok 'thr_user'), (Med $ok 'thr_kernel'))
+    }
+    W ''
+    W '| rep | app | arm | pid | status | app CPU % | threads % (user/kernel) | top 3 threads: module+offset tid: % (user/kernel) |'
+    W '|---|---|---|---|---|---|---|---|'
+    foreach ($r in $rows) {
+        if ($r.thr_cpu -eq '') { continue }
+        W ('| {0} | {1} | {2} | {3} | {4} | {5} | {6} ({7}/{8}) | {9} |' -f $r.rep, $r.app, $r.arm, $r.pid, $r.status, $r.app_cpu,
+            $r.thr_cpu, $r.thr_user, $r.thr_kernel, (($r.thr_top3 -replace '\|', '/') -replace ' / ', '<br>'))
+    }
+}
 W ''
 W '## Placement evidence (verbatim, first run of each arm)'
 W ''

@@ -16,7 +16,12 @@
 #   - GPU Running Time per adapter for the app pid (+ dwm, + adapter totals),
 #     the lib_sample.ps1 / gpusample.ps1 delta method;
 #   - PresentMon present mode + MsBetweenPresents / MsUntilDisplayed when a
-#     PresentMon exe is on PATH or passed with -PresentMon (optional).
+#     PresentMon exe is on PATH or passed with -PresentMon (optional);
+#   - with -ThreadSample (or DXR_HUB_AB_THREAD_SAMPLE=1, #2371): per-thread CPU
+#     of the app over the same window - total / user / kernel and the top 3
+#     threads by the module they started in (thread_sampler.ps1), plus
+#     DXR_WEAVE_REPAINT_TRACE=1 on every arm. -DryRun prints the plan and each
+#     arm's env and launches nothing.
 #
 # Hygiene: the app is launched NON-elevated through explorer.exe -> .bat (env is
 # process-level in the .bat, so the runtime DLL's getenv sees it), centred, and
@@ -44,11 +49,14 @@ param(
     [string]$PresentMon = '',             # PresentMon exe; '' = look on PATH; 'none' = skip
     [int]$WaitForPanelMin = 20,
     [string]$Label = '',
-    [string]$ExpectRuntime = ''          # runtime git tag every run must load; '' = pinned to the first run's
+    [string]$ExpectRuntime = '',         # runtime git tag every run must load; '' = pinned to the first run's
+    [switch]$ThreadSample,                # #2371: per-thread CPU attribution per run (also DXR_HUB_AB_THREAD_SAMPLE=1)
+    [switch]$DryRun                       # print the plan + each arm's env, launch nothing
 )
 Set-StrictMode -Version 2
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib_sample.ps1')
+if ($env:DXR_HUB_AB_THREAD_SAMPLE -eq '1') { $ThreadSample = $true }
 
 foreach ($n in @('Apps', 'Arms')) {
     $v = Get-Variable $n -ValueOnly
@@ -321,6 +329,22 @@ function Measure-PresentMon {
     return $m
 }
 
+# --- Per-arm environment ----------------------------------------------------------
+function Get-ArmEnv {
+    # base -> topology -> arm (later wins); the per-run additions last.
+    param($arm, [string]$runDir)
+    $envMap = [ordered]@{}
+    foreach ($kv in $cfg.baseEnv.PSObject.Properties) { $envMap[$kv.Name] = [string]$kv.Value }
+    foreach ($kv in $topoEnv.PSObject.Properties)     { $envMap[$kv.Name] = [string]$kv.Value }
+    foreach ($kv in $arm.env.PSObject.Properties)     { $envMap[$kv.Name] = [string]$kv.Value }
+    $envMap['DXR_WEAVE_LATENCY_CSV'] = (Join-Path $runDir 'wl')
+    # #2371: with thread sampling, the app log also carries the hub target's
+    # #1339 stage-1/stage-2 wait peaks and instant/timeout counts every 5 s.
+    if ($ThreadSample) { $envMap['DXR_WEAVE_REPAINT_TRACE'] = '1' }
+    if ($RuntimeJson -ne '') { $envMap['XR_RUNTIME_JSON'] = $RuntimeJson }
+    return $envMap
+}
+
 # --- Block 0: environment -------------------------------------------------------
 & (Join-Path $PSScriptRoot 'probe_caps.ps1') -OutDir $outDir | Out-Null
 $caps = Get-Content (Join-Path $outDir 'capabilities.json') -Raw | ConvertFrom-Json
@@ -339,6 +363,7 @@ $envInfo = [ordered]@{
     host = $env:COMPUTERNAME; topology = $Topology; topologyEnv = $topoEnv
     runtimeJson = $RuntimeJson; runtimePath = $RuntimePath; appDir = $AppDir
     windowSec = $windowSec; warmupSec = $warmupSec; reps = $reps; cooldownSec = $coolSec
+    threadSample = [bool]$ThreadSample
     presentMon = $(if ($pmExe) { $pmExe } else { 'not found - skipped' })
     harnessElevated = $caps.elevated; onAc = $caps.power.onAc; scanoutLuid = $scanoutLuid
     adapters = $caps.adapters
@@ -365,8 +390,18 @@ foreach ($app in $cfg.apps) {
 }
 if ($plan.Count -eq 0) { throw 'nothing to run (check -Apps / -Arms / -AppDir)' }
 Log ('plan per rep: ' + (($plan | ForEach-Object { $_.app.name + '/' + $_.arm.name }) -join ', '))
+if ($ThreadSample) { Log 'thread sampling ON (#2371): thread_sampler.ps1 per run, DXR_WEAVE_REPAINT_TRACE=1 on every arm' }
+if ($DryRun) {
+    foreach ($item in $plan) {
+        $em = Get-ArmEnv $item.arm (Join-Path $outDir ('r1-' + $item.app.name + '-' + $item.arm.name))
+        Log ('DRY RUN ' + $item.app.name + '/' + $item.arm.name + ' expect=' + $item.arm.expectPath + ' exe=' + $item.exe)
+        foreach ($k in $em.Keys) { Log ('    ' + $k + '=' + $em[$k]) }
+    }
+    Log ('DRY RUN: ' + $reps + ' rep(s) x ' + $plan.Count + ' run(s) would launch; nothing started. Output dir: ' + $outDir)
+    return
+}
 
-$hdr = 'rep,app,arm,topology,pid,status,path,expect_path,witness_site,present_s,repaint_s,weave_s,mode,r_site,r_frames,r_repaints,r_n,r_p50,r_p95,r_p99,d_n,d_p50,d_p95,d_p99,gpu_app_scanout,gpu_app_render,gpu_app_total,gpu_dwm,gpu_tot_scanout,gpu_tot_other,app_cpu,pm_n,pm_mode,pm_between_p50,pm_between_p95,pm_display_p50,pm_until_displayed_p50,pm_dropped_pct,runtime,dp,tracked,foreground,window_s,run_dir,flags'
+$hdr = 'rep,app,arm,topology,pid,status,path,expect_path,witness_site,present_s,repaint_s,weave_s,mode,r_site,r_frames,r_repaints,r_n,r_p50,r_p95,r_p99,d_n,d_p50,d_p95,d_p99,gpu_app_scanout,gpu_app_render,gpu_app_total,gpu_dwm,gpu_tot_scanout,gpu_tot_other,app_cpu,thr_cpu,thr_user,thr_kernel,thr_top3,pm_n,pm_mode,pm_between_p50,pm_between_p95,pm_display_p50,pm_until_displayed_p50,pm_dropped_pct,runtime,dp,tracked,foreground,window_s,run_dir,flags'
 $hdr | Out-File -Encoding ascii $csvPath
 
 function Add-FailRow {
@@ -391,12 +426,7 @@ function Invoke-Run {
     if (-not (Wait-PanelFree)) { return 'ABORT' }
 
     # Env: base -> topology -> arm (later wins). Process-level, in the .bat.
-    $envMap = [ordered]@{}
-    foreach ($kv in $cfg.baseEnv.PSObject.Properties) { $envMap[$kv.Name] = [string]$kv.Value }
-    foreach ($kv in $topoEnv.PSObject.Properties)     { $envMap[$kv.Name] = [string]$kv.Value }
-    foreach ($kv in $arm.env.PSObject.Properties)     { $envMap[$kv.Name] = [string]$kv.Value }
-    $envMap['DXR_WEAVE_LATENCY_CSV'] = (Join-Path $runDir 'wl')
-    if ($RuntimeJson -ne '') { $envMap['XR_RUNTIME_JSON'] = $RuntimeJson }
+    $envMap = Get-ArmEnv $arm $runDir
     $lines = @('@echo off')
     foreach ($k in $envMap.Keys) { $lines += ('set "{0}={1}"' -f $k, $envMap[$k]) }
     if ($RuntimePath -ne '') { $lines += ('set "PATH={0};%PATH%"' -f $RuntimePath) }
@@ -427,6 +457,15 @@ function Invoke-Run {
     }
     $appPid = $proc.Id
     $script:startedPids += $appPid
+    # #2371: per-thread CPU, sampled from launch; the sampler exits with the app.
+    $thrDir = Join-Path $runDir 'threads'
+    $sampler = $null
+    $tw0 = [int64]0; $tw1 = [int64]0
+    if ($ThreadSample) {
+        $sArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + (Join-Path $PSScriptRoot 'thread_sampler.ps1') + '"'),
+                   '-ProcessId', $appPid, '-OutDir', ('"' + $thrDir + '"'))
+        $sampler = Start-Process powershell.exe -ArgumentList $sArgs -WindowStyle Hidden -PassThru
+    }
     $logPath = $null
     $result = 'OK'
     $foreground = 'no'
@@ -484,6 +523,7 @@ function Invoke-Run {
                   -RedirectStandardOutput (Join-Path $runDir 'presentmon-stdout.txt') -RedirectStandardError (Join-Path $runDir 'presentmon-stderr.txt')
         }
         $cpu0 = Get-CpuSnapshot -procIds @($appPid)
+        $tw0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
         $g0 = Get-GpuSnapshot
         $q0 = Get-Qpc
         # Focus is part of the subject: losing the foreground mid-window moved R
@@ -510,6 +550,7 @@ function Invoke-Run {
         if ($contended.Count -gt 0) { $flags += ('CONTENDED_' + ($contended -join '+')) }
         $g1 = Get-GpuSnapshot
         $cpu1 = Get-CpuSnapshot -procIds @($appPid)
+        $tw1 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
         if ($fgLostPolls -eq 0 -and -not ($flags -match 'NOT_FOREGROUND')) { $foreground = 'yes' }
         if ($pm -ne $null) { $pm.WaitForExit(15000) | Out-Null; if (-not $pm.HasExited) { $flags += 'PM_TIMEOUT'; Stop-Process -Id $pm.Id -Force -ErrorAction SilentlyContinue } }
         $windowS = [math]::Round(($q1 - $q0) / [Diagnostics.Stopwatch]::Frequency, 2)
@@ -617,6 +658,15 @@ function Invoke-Run {
     } else { $flags += 'GPU_COUNTER_FAIL' }
     $cpu = Get-CpuDeltaPct $cpu0 $cpu1
 
+    # #2371: the same window, per thread (start module, user/kernel).
+    $thr = [ordered]@{ ok = $false; total = ''; user = ''; kernel = ''; threads = 0; windowS = ''; top = @() }
+    if ($sampler -ne $null) {
+        $sampler.WaitForExit(10000) | Out-Null
+        if (-not $sampler.HasExited) { Stop-Process -Id $sampler.Id -Force -ErrorAction SilentlyContinue }
+        if ($tw1 -gt 0) { $thr = Measure-ThreadCpu -Dir $thrDir -ProcId $appPid -T0Ms $tw0 -T1Ms $tw1 -Top 3 }
+        if (-not $thr.ok) { $flags += 'NO_THREAD_SAMPLES' }
+    }
+
     $pmr = $null
     if ($pmExe) { $pmr = Measure-PresentMon (Join-Path $runDir 'presentmon.csv'); if ($pmr.n -eq 0) { $flags += 'PM_NO_ROWS' } }
     else { $pmr = [ordered]@{ n = ''; mode = ''; between50 = ''; between95 = ''; display50 = ''; untilDisp50 = ''; droppedPct = '' } }
@@ -625,18 +675,19 @@ function Invoke-Run {
         rep = $rep; app = $app.name; arm = $arm.name; topology = $Topology; pid = $appPid; status = $status
         path = $ev.path; expectPath = $expect; placement = $ev.placement; hubPlacement = $ev.hubPlacement
         activeLines = $ev.active; lateWeave = $ev.lateWeave; loadedFrom = $ev.loadedFrom; tracked = $ev.tracked
-        env = $envMap; gpuPerLuid = $perLuid; latency = $lat; presentMon = $pmr; flags = $flags
+        env = $envMap; gpuPerLuid = $perLuid; latency = $lat; presentMon = $pmr; threads = $thr; flags = $flags
     }
     [IO.File]::WriteAllText((Join-Path $runDir 'run.json'), ($run | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
 
     $vals = @($rep, $app.name, $arm.name, $Topology, $appPid, $status, $ev.path, $expect, $witSite, $wp, $wr, $ww, $wm,
               $lat.site, $lat.frames, $lat.repaints, $lat.rN, $lat.r50, $lat.r95, $lat.r99, $lat.dN, $lat.d50, $lat.d95, $lat.d99,
-              $gs, $gr, $gt, $gd, $gts, $gto, $cpu,
+              $gs, $gr, $gt, $gd, $gts, $gto, $cpu, $thr.total, $thr.user, $thr.kernel, (@($thr.top) -join ' / '),
               $pmr.n, $pmr.mode, $pmr.between50, $pmr.between95, $pmr.display50, $pmr.untilDisp50, $pmr.droppedPct, $ev.runtime, $ev.dp,
               $ev.tracked, $foreground, $windowS, $runName, ($flags -join ';'))
     Add-Content -Path $csvPath -Value (($vals | ForEach-Object { ([string]$_) -replace ',', ';' }) -join ',') -Encoding Ascii
     Log ('  {0} path={1} (want {2}) site={3} present/s={4} R p50/p95={5}/{6} n={7} D n={8} gpu app={9}% fg={10} {11}' -f `
         $status, $ev.path, $expect, $witSite, $wp, $lat.r50, $lat.r95, $lat.rN, $lat.dN, $gt, $foreground, ($flags -join ';'))
+    if ($thr.ok) { Log ('    app CPU ' + $cpu + ' %; threads ' + $thr.total + ' % (user ' + $thr.user + ' / kernel ' + $thr.kernel + '): ' + (@($thr.top) -join ' / ')) }
     if ($status -eq 'REFUSED') { Log ('    placement: ' + $ev.placement); if ($ev.active.Count -gt 0) { Log ('    active: ' + ($ev.active -join ' | ')) } }
     if ($status -eq 'REFUSED' -and ($foreground -ne 'yes' -or ($flags -match '^CONTENDED_')) -and $pathOk) { return 'REFUSED_FOCUS' }
     return $status

@@ -81,6 +81,8 @@ kill switch):
 .\run_hub_ab.ps1 -AppDir ... -Windows 10 -Reps 1                        # validation pass
 .\run_hub_ab.ps1 ... -RuntimeJson <dev json> -RuntimePath <_package\bin> # a from-source runtime
 .\run_hub_ab.ps1 ... -PresentMon <PresentMon.exe>                       # optional present-mode columns
+.\run_hub_ab.ps1 ... -ThreadSample                                      # + per-thread CPU attribution (#2371)
+.\run_hub_ab.ps1 ... -DryRun                                            # print the plan + each arm's env, launch nothing
 ```
 
 - **Topology matters on a hybrid laptop.** The d3d12 reroute onto the fill arm
@@ -127,8 +129,31 @@ kill switch):
   66-133 ms in validation). Before every launch the harness waits up to
   `-WaitForPanelMin` while any other XR client runs; it only ever stops the pid
   it started and never touches `displayxr-service`.
+- **Per-thread CPU (#2371).** The #2371 single-GPU run measured ~50 % app
+  CPU (of one core) on the hub's DIRECT ingress against ~10 % native. A
+  process total cannot say which thread burns it, so `-ThreadSample` (or
+  `DXR_HUB_AB_THREAD_SAMPLE=1` in the harness's environment) starts
+  `thread_sampler.ps1` beside every run: once a second it records each app
+  thread's user and kernel time and its Win32 start address, resolved to
+  `module+offset` against the process's module list. The harness cuts the
+  same window it measures `app_cpu` over and adds `thr_cpu`, `thr_user`,
+  `thr_kernel` and `thr_top3` (the three busiest threads, `module+offset
+  tid: % (user/kernel)`, `[main]` = the app main thread) to `runs.csv`,
+  `run.json` and a *Per-thread CPU* section in `summary.md`; the raw
+  samples stay in `<run>\threads\`. Reading it: a thread that started in a
+  GPU driver's user-mode module is a driver worker; the `[main]` thread is
+  where the in-process compositor (and the hub) weave and present; every
+  CRT-created runtime thread starts in `ucrtbase`. Mostly-kernel time points
+  at a loop around a syscall (present, frame statistics, short sleeps),
+  mostly-user time at a busy-wait. Sampling also sets
+  `DXR_WEAVE_REPAINT_TRACE=1` on every arm, so each app log carries the hub
+  target's frame-latency wait peaks and instant/timeout counts. The sampler
+  is read-only and also runs on its own against anything already running:
+  `.\thread_sampler.ps1 -ProcessName displayxr-service -Seconds 10 -Report`.
+  For #2371, run the single-GPU harness command with `-ThreadSample` added
+  and attach `summary.md`, `runs.csv` and the per-run `threads\` folders.
 - Output: `results\hub-ab-<stamp>[-label]\` - `runs.csv`, `summary.md`
   (arm x app medians, verdict per app from the interleaved pairs, placement
   evidence, every run), `environment.json`, `capabilities.json`,
   `displayxr-cli-info.txt`, and per run `launch.bat`, `app.log`, `wl.*.csv`,
-  `presentmon.csv`, `run.json`.
+  `presentmon.csv`, `run.json` (and `threads\` with `-ThreadSample`).

@@ -300,3 +300,60 @@ function Get-TrueMedian {
     if ($n % 2 -eq 1) { return $s[[int][math]::Floor($n / 2)] }
     return ($s[$n / 2 - 1] + $s[$n / 2]) / 2.0   # even n: mean of middle two (the n=3->max bug, never again)
 }
+
+function Resolve-ThreadModule {
+    # Start address -> 'module+0xoffset' from thread_sampler.ps1's module map.
+    param([string]$Dir, [int]$ProcId, [int64]$Addr)
+    if ($Addr -eq 0) { return '?' }
+    $mf = Join-Path $Dir ('modules_' + $ProcId + '.csv')
+    if (Test-Path $mf) {
+        foreach ($m in @(Import-Csv $mf)) {
+            $b = [int64]$m.base; $s = [int64]$m.size
+            if ($Addr -ge $b -and $Addr -lt ($b + $s)) { return ('{0}+0x{1:x}' -f $m.module, ($Addr - $b)) }
+        }
+    }
+    return ('0x{0:x}' -f $Addr)
+}
+
+function Measure-ThreadCpu {
+    # #2371: per-thread CPU (percent of ONE core) of $ProcId between Unix-epoch
+    # ms $T0Ms and $T1Ms, from thread_sampler.ps1's threads.csv in $Dir. Each
+    # thread's delta is taken between its first and last sample inside the
+    # window. Returns total/user/kernel and the top N threads as strings
+    # 'module+0xoff tid[ main]: total (user/kernel)'.
+    param([string]$Dir, [int]$ProcId, [int64]$T0Ms = 0, [int64]$T1Ms = [int64]::MaxValue, [int]$Top = 3)
+    $r = [ordered]@{ ok = $false; total = ''; user = ''; kernel = ''; threads = 0; windowS = ''; top = @() }
+    $csv = Join-Path $Dir 'threads.csv'
+    if (-not (Test-Path $csv)) { return $r }
+    $all = @(Import-Csv $csv | Where-Object { [int]$_.pid -eq $ProcId })
+    if ($all.Count -eq 0) { return $r }
+    # The process's first-enumerated thread is its main thread: the one the
+    # in-process compositor weaves and presents on. CRT-created threads all
+    # start in ucrtbase, so this label is what tells the app thread apart.
+    $mainTid = $all[0].tid
+    $rows = @($all | Where-Object { [int64]$_.t_ms -ge $T0Ms -and [int64]$_.t_ms -le $T1Ms })
+    if ($rows.Count -eq 0) { return $r }
+    $per = @()
+    $span = 0.0
+    foreach ($g in ($rows | Group-Object tid)) {
+        $in = @($g.Group | Sort-Object { [int64]$_.t_ms })
+        if ($in.Count -lt 2) { continue }
+        $a = $in[0]; $b = $in[$in.Count - 1]
+        $el = [double]([int64]$b.t_ms - [int64]$a.t_ms)
+        if ($el -le 0) { continue }
+        if ($el -gt $span) { $span = $el }
+        $du = 100.0 * ([int64]$b.user_ms - [int64]$a.user_ms) / $el
+        $dk = 100.0 * ([int64]$b.kernel_ms - [int64]$a.kernel_ms) / $el
+        $per += New-Object PSObject -Property @{ tid = $g.Name; addr = [int64]$a.start_addr; u = $du; k = $dk; t = ($du + $dk) }
+    }
+    if ($per.Count -eq 0) { return $r }
+    $r.ok = $true
+    $r.threads = $per.Count
+    $r.windowS = [math]::Round($span / 1000.0, 1)
+    $r.total = [math]::Round((($per | Measure-Object t -Sum).Sum), 1)
+    $r.user = [math]::Round((($per | Measure-Object u -Sum).Sum), 1)
+    $r.kernel = [math]::Round((($per | Measure-Object k -Sum).Sum), 1)
+    $r.top = @($per | Sort-Object t -Descending | Select-Object -First $Top | ForEach-Object {
+            '{0} tid{1}{5}: {2:F1} ({3:F1}/{4:F1})' -f (Resolve-ThreadModule -Dir $Dir -ProcId $ProcId -Addr $_.addr), $_.tid, $_.t, $_.u, $_.k, $(if ($_.tid -eq $mainTid) { ' [main]' } else { '' }) })
+    return $r
+}
