@@ -6156,8 +6156,45 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			                          &eff_canvas, -1);
 
 			weaving_done = true;
+
+			/*
+			 * #2421: the post-compose capture site for a client-presents session
+			 * (texture class, ADR-060 texture target). The window path services
+			 * the intent after its present and the hub route in
+			 * split_capture_woven; this branch returned before either, so a
+			 * `displayxr_atlas_trigger[.<exe>]` was consumed and nothing was
+			 * written. Same files as the hub route: `<path>` = the DP input (the
+			 * atlas), `<path>.woven` = the caller's texture as the caller is about
+			 * to present it. A zero-copy frame already wrote its atlas at the
+			 * projection-done point (the intent is complete, its path still set
+			 * for this frame): only the woven half is owed.
+			 */
+			const bool owes_input = c->capture_intent.pending &&
+			                        c->capture_intent.mode == MCP_CAPTURE_MODE_POST_COMPOSE;
+			const bool owes_woven = owes_input || (zero_copy && !c->capture_intent.pending &&
+			                                       c->capture_intent.path[0] != '\0' &&
+			                                       c->capture_intent.mode == MCP_CAPTURE_MODE_POST_COMPOSE);
+			if (owes_woven) {
+				char woven[MCP_CAPTURE_PATH_MAX + 16];
+				u_capture_intent_sibling_path(c->capture_intent.path, ".woven", woven, sizeof(woven));
+				const bool wok = d3d11_capture_texture_to_png(c->device, c->context, c->shared_texture,
+				                                              dp_target_w, dp_target_h, 0, 0, woven);
+				bool ok = true;
+				if (owes_input) {
+					ok = d3d11_compositor_capture_atlas_to_png(c, c->capture_intent.path);
+				}
+				U_LOG_W("#2421 texture capture: DP input -> %s%s; post-weave %ux%u (the caller's texture) -> %s%s",
+				        c->capture_intent.path, ok ? "" : " FAILED", dp_target_w, dp_target_h, woven,
+				        wok ? "" : " FAILED");
+				if (owes_input) {
+					u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
+				}
+			}
 		}
 
+		// #2421: a frame this branch could not weave (no DP or no RTV) still
+		// answers the intent, as the window path does (failed, never stranded).
+		d3d11_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_POST_COMPOSE);
 		c->context->Flush();
 		return XRT_SUCCESS;
 	}
