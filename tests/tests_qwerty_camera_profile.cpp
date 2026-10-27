@@ -154,3 +154,16 @@ TEST_CASE("The mouse hand lands on the views' virtual screen under the cursor", 
 	CHECK(pose.position.y == Catch::Approx(std::tan(fovs[0].angle_up) * 0.5f));
 	CHECK(pose.position.z == Catch::Approx(-0.5));
 }
+
+TEST_CASE("A pen's tip pressure drives the mouse hand's tip force", "[qwerty][mouse-hand]")
+{
+	// Mouse: the click alone.
+	CHECK(qwerty_mouse_hand_tip_value(false, false, 0.0f) == 0.0f);
+	CHECK(qwerty_mouse_hand_tip_value(true, false, 0.0f) == 1.0f);
+	// Pen hovering, or a pressure from a stale contact: no tip force.
+	CHECK(qwerty_mouse_hand_tip_value(false, true, 0.7f) == 0.0f);
+	// Pen down: its pressure, clamped, and never below a light touch.
+	CHECK(qwerty_mouse_hand_tip_value(true, true, 0.5f) == Catch::Approx(0.5f));
+	CHECK(qwerty_mouse_hand_tip_value(true, true, 0.0f) == Catch::Approx(0.05f));
+	CHECK(qwerty_mouse_hand_tip_value(true, true, 3.0f) == 1.0f);
+}

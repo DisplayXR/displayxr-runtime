@@ -408,8 +408,16 @@ The right controller also offers `/interaction_profiles/logitech/mx_ink_stylus_l
 (`XR_LOGITECH_mx_ink_stylus_interaction`, `XRT_FEATURE_OPENXR_INTERACTION_MX_INK`,
 default ON) **first** in its binding profiles, so an app that binds the MX Ink
 stylus gets one; apps that do not fall through to Touch / Index / Vive / simple as
-before. No physical stylus is involved: the MX Ink is tracked by a Quest headset,
+before. No physical MX Ink is involved: the MX Ink is tracked by a Quest headset,
 which a 3D display does not have, so the mouse is the stylus.
+
+**A pen is the stylus too.** A Windows Ink pen (pen tablet, pen display, or a
+pen-capable screen) over the 3D window moves the hand like the mouse, because
+Windows promotes the pen to mouse messages: tip = LMB, barrel + tip = RMB.
+On top of that, its tip pressure (`WM_POINTER*`, `GetPointerPenInfo`) becomes
+the analog tip force (MX Ink `tip/force`, and the trigger value): the pen's pressure
+while its tip is down, at least 0.05, so a first contact that reports zero still
+selects. A pen that senses no pressure, and the mouse, give 0 or 1 from the click.
 
 ### 6.5 Sensitivity Constants
 

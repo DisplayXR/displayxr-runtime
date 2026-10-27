@@ -356,7 +356,15 @@ qwerty_update_inputs(struct xrt_device *xd)
 	             1.0f * (qc->trackpad_up_pressed - qc->trackpad_down_pressed));
 	// clang-format on
 
-	xd->inputs[QWERTY_TRIGGER].value.vec1.x = 1.0f * qc->trigger_clicked;
+	float trigger = 1.0f * qc->trigger_clicked;
+	struct qwerty_system *qs = qd->sys;
+	if (qs != NULL && qs->mouse_hand && qc == qs->rctrl) {
+		os_mutex_lock(&qs->view_lock);
+		trigger = qwerty_mouse_hand_tip_value(qc->trigger_clicked, qs->mouse_hand_pen_active,
+		                                      qs->mouse_hand_pen_pressure);
+		os_mutex_unlock(&qs->view_lock);
+	}
+	xd->inputs[QWERTY_TRIGGER].value.vec1.x = trigger;
 	xd->inputs[QWERTY_TRIGGER].timestamp = qc->trigger_timestamp;
 	xd->inputs[QWERTY_MENU].value.boolean = qc->menu_clicked;
 	xd->inputs[QWERTY_MENU].timestamp = qc->menu_timestamp;
@@ -1805,6 +1813,32 @@ qwerty_set_mouse_hand_cursor(struct xrt_device **xdevs, size_t count, float u, f
 	qs->mouse_hand_aspect = aspect;
 	qs->mouse_hand_cursor_valid = true;
 	os_mutex_unlock(&qs->view_lock);
+}
+
+void
+qwerty_set_mouse_hand_pen(struct xrt_device **xdevs, size_t count, bool active, float pressure)
+{
+	struct qwerty_system *qs = find_qwerty_system(xdevs, count);
+	if (qs == NULL || !qs->mouse_hand) {
+		return;
+	}
+	os_mutex_lock(&qs->view_lock);
+	qs->mouse_hand_pen_active = active;
+	qs->mouse_hand_pen_pressure = pressure < 0.0f ? 0.0f : (pressure > 1.0f ? 1.0f : pressure);
+	os_mutex_unlock(&qs->view_lock);
+}
+
+float
+qwerty_mouse_hand_tip_value(bool clicked, bool pen_active, float pressure)
+{
+	if (!clicked) {
+		return 0.0f;
+	}
+	if (!pen_active) {
+		return 1.0f;
+	}
+	const float light_touch = 0.05f;
+	return pressure < light_touch ? light_touch : (pressure > 1.0f ? 1.0f : pressure);
 }
 
 void

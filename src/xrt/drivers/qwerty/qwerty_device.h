@@ -94,6 +94,8 @@ struct qwerty_system
 	struct xrt_pose mouse_hand_eyes[2]; //!< the app's eye poses, relative to mouse_hand_head
 	struct xrt_fov mouse_hand_fovs[2];  //!< their (off-axis, window-fitted) FOVs
 	struct xrt_pose mouse_hand_head;    //!< between the eyes, view-aligned, in the tracking origin
+	bool mouse_hand_pen_active;         //!< a pressure-sensing pen is over the view (Windows Ink)
+	float mouse_hand_pen_pressure;      //!< its tip pressure, 0..1; view_lock
 
 	float nominal_viewer_z; //!< meters (e.g. 0.6 from sim_display)
 	float screen_height_m;  //!< meters (e.g. 0.194 from sim_display)
@@ -667,6 +669,16 @@ qwerty_mouse_hand_pose(float u, float v, float aspect, float half_tan_vfov, floa
  * hand under the cursor since such views have no parallax. Returns false if
  * no screen in front of the eyes can be found that way either.
  */
+/*!
+ * The mouse hand's trigger / MX Ink tip force: the pen's tip pressure
+ * (@p pressure, 0..1) while a pressure-sensing pen is over the view
+ * (@p pen_active) and its tip is down (@p clicked), else 0 / 1 from the click.
+ * A pen tip that is down reads at least a light touch, so a pen that reports
+ * zero pressure at first contact still selects.
+ */
+float
+qwerty_mouse_hand_tip_value(bool clicked, bool pen_active, float pressure);
+
 bool
 qwerty_mouse_hand_pose_from_views(float u,
                                   float v,

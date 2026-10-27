@@ -335,6 +335,16 @@ void
 qwerty_set_mouse_hand_cursor(struct xrt_device **xdevs, size_t xdev_count, float u, float v, float aspect);
 
 /*!
+ * A pen over the 3D view, for the mouse hand: @p active while a pen that
+ * senses pressure hovers or touches, @p pressure its tip pressure 0..1. The
+ * pen's position and tip / barrel clicks arrive as the mouse messages Windows
+ * promotes them to; this only adds the analog tip force (MX Ink tip, trigger).
+ * A no-op unless the mouse hand is on.
+ */
+void
+qwerty_set_mouse_hand_pen(struct xrt_device **xdevs, size_t xdev_count, bool active, float pressure);
+
+/*!
  * The first two views the app was just given by xrLocateViews: their eye
  * poses in the head device's tracking origin (@p eyes) and their FOVs
  * (@p fovs), exactly as the app renders them, so the mouse hand lands on the
