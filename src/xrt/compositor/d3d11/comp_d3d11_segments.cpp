@@ -361,9 +361,13 @@ slot_replace(struct comp_d3d11_segments *segs, uint32_t i, struct xrt_display_pr
  * All of it runs on the weave thread between two weaves (the caller holds the
  * compositor lock), so a frame weaves with the old pair or the new pair and
  * never with a gap.
+ *
+ * @p back_home: the hand-back to the session's home screen before a
+ * screen-list rebuild (@ref hwnd_return_to_primary), not a majority flip — the
+ * window may be wholly on another screen then. It only changes the log line.
  */
 static void
-hwnd_handoff(struct comp_d3d11_segments *segs, uint32_t t, ID3D11DeviceContext *ctx)
+hwnd_handoff(struct comp_d3d11_segments *segs, uint32_t t, ID3D11DeviceContext *ctx, bool back_home)
 {
 	const int o = segs->owner_index;
 	if (o == (int)t) {
@@ -421,14 +425,22 @@ hwnd_handoff(struct comp_d3d11_segments *segs, uint32_t t, ID3D11DeviceContext *
 	comp_segments_owner_set_result(&segs->owner, t_id, h != nullptr,
 	                               now_owner >= 0 ? segs->screens[now_owner].id : 0);
 
-	// One line per flip (the flip itself is hysteresis-gated).
+	// One line per flip (the flip itself is hysteresis-gated), with the real
+	// reason. The old owner weaves windowless only if step 1 made it a DP.
 	const double ms = (double)(os_monotonic_get_ns() - t0) / 1.0e6;
 	if (h != nullptr) {
+		char why[128];
+		if (back_home) {
+			snprintf(why, sizeof(why),
+			         "back to the session's home screen 0x%016llx before a screen-list rebuild",
+			         (unsigned long long)t_id);
+		} else {
+			snprintf(why, sizeof(why), "screen 0x%016llx holds the majority", (unsigned long long)t_id);
+		}
 		U_LOG_W(
-		    "segments: window handle handed from '%s' to '%s' (screen 0x%016llx holds the majority) in "
-		    "%.1f ms — drag snap follows it; '%s' weaves windowless",
-		    screen_name(segs, o), screen_name(segs, (int)t), (unsigned long long)t_id, ms,
-		    screen_name(segs, o));
+		    "segments: window handle handed from '%s' to '%s' (%s) in %.1f ms — drag snap follows it; '%s' %s",
+		    screen_name(segs, o), screen_name(segs, (int)t), why, ms, screen_name(segs, o),
+		    w != nullptr ? "weaves windowless" : "has no DP now");
 	} else {
 		U_LOG_W("segments: window handle hand-off to '%s' FAILED after %.1f ms — %s", screen_name(segs, (int)t),
 		        ms, now_owner >= 0 ? "rolled back to the previous owner" : "no DP holds the window now");
@@ -446,7 +458,7 @@ hwnd_return_to_primary(struct comp_d3d11_segments *segs)
 	    (segs->owner_index == (int)segs->primary_index && !segs->primary_windowless)) {
 		return;
 	}
-	hwnd_handoff(segs, segs->primary_index, segs->ctx);
+	hwnd_handoff(segs, segs->primary_index, segs->ctx, true);
 }
 
 static void
@@ -899,7 +911,7 @@ comp_d3d11_segments_update(struct comp_d3d11_segments *segs,
 		const uint64_t target = comp_segments_owner_update(&segs->owner, &segs->table, os_monotonic_get_ns());
 		const int ti = target != 0 ? screen_index_of(segs, target) : -1;
 		if (ti >= 0) {
-			hwnd_handoff(segs, (uint32_t)ti, ctx);
+			hwnd_handoff(segs, (uint32_t)ti, ctx, false);
 		}
 	}
 
