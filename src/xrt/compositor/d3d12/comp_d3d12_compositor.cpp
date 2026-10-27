@@ -1907,6 +1907,41 @@ d3d12_split_release_out(struct comp_d3d12_compositor *c)
  * placement. This function never takes it itself (`std::mutex` is not
  * recursive, and layer_commit's call would deadlock on the spot if it did).
  */
+/*!
+ * #2405: drag phase-snap provider for the runtime-owned window — the D3D12
+ * twin of the D3D11 compositor's. Runs on the window thread. The DP pointer
+ * only changes with this provider detached (create arms it after the DP
+ * exists, d3d12_split_retire detaches it around the rebuild, destroy detaches
+ * it first; the setter's exclusive lock waits out a snap in flight).
+ */
+static bool
+d3d12_compositor_snap_window_rect_cb(void *userdata,
+                                     int32_t origin_x,
+                                     int32_t origin_y,
+                                     int32_t target_x,
+                                     int32_t target_y,
+                                     int32_t *out_x,
+                                     int32_t *out_y)
+{
+	auto *c = static_cast<struct comp_d3d12_compositor *>(userdata);
+	if (c == nullptr || c->display_processor == nullptr) {
+		return false;
+	}
+	return xrt_display_processor_d3d12_snap_window_rect(c->display_processor, origin_x, origin_y, target_x, target_y,
+	                                                    out_x, out_y);
+}
+
+//! #2405: arm (or detach) the own window's drag snap. No-op for an app window.
+static void
+d3d12_set_snap_provider(struct comp_d3d12_compositor *c, bool arm)
+{
+	if (!c->owns_window || c->own_window == nullptr) {
+		return;
+	}
+	comp_d3d11_window_set_snap_provider(c->own_window, arm ? d3d12_compositor_snap_window_rect_cb : nullptr,
+	                                    arm ? c : nullptr);
+}
+
 static void
 d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why, const char *short_reason)
 {
@@ -1957,6 +1992,7 @@ d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why, const char 
 		xrt_display_processor_d3d12_clear_local_zone_mask(c->display_processor);
 		c->zone_published = false;
 	}
+	d3d12_set_snap_provider(c, false); // #2405: no snap while the DP is replaced
 	xrt_display_processor_d3d12_destroy(&c->display_processor);
 
 	if (c->target != nullptr) {
@@ -2016,7 +2052,7 @@ d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why, const char 
 		U_LOG_E(
 		    "#918: no display processor on the app device either, after retiring the split — this "
 		    "session will not weave");
-	}
+	}	d3d12_set_snap_provider(c, true);
 }
 
 /*!
@@ -7705,6 +7741,9 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 		comp_xbridge_destroy(&c->xbridge);
 	}
 
+	// #2405: detach the drag snap before any DP dies.
+	d3d12_set_snap_provider(c, false);
+
 	// Multi-screen M6: segment DPs + crop textures, before the primary DP (the
 	// repaint thread is joined and the GPU idle, so no weave is in flight).
 	comp_d3d12_segments_destroy(&c->segments);
@@ -8244,6 +8283,9 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	} else {
 		U_LOG_W("No D3D12 display processor factory provided");
 	}
+	// #2405: the runtime-owned window phase-snaps while the user drags it, as
+	// on the D3D11 leg (answers "no snap" while no DP exists, e.g. the reroute).
+	d3d12_set_snap_provider(c, true);
 
 	// If display processor is available, query display pixel info to compute
 	// optimal view dimensions (scaled to window size, matching D3D11 model).
