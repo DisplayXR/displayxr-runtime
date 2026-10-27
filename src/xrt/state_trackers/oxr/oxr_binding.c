@@ -808,6 +808,19 @@ oxr_action_get_current_interaction_profile(struct oxr_logger *log,
 		if (interactionProfile->interactionProfile != XR_NULL_PATH) {
 			oxr_path_get_string(log, inst, interactionProfile->interactionProfile, &profile_str, &profile_len);
 		}
+		// #2322 kit: apps poll this every frame; log only when a top-level path's answer changes.
+		static XrPath seen_top[8];
+		static XrPath seen_profile[8];
+		bool changed = true;
+		for (int i = 0; i < 8; i++) {
+			if (seen_top[i] == topLevelUserPath || seen_top[i] == XR_NULL_PATH) {
+				changed = seen_top[i] == XR_NULL_PATH || seen_profile[i] != interactionProfile->interactionProfile;
+				seen_top[i] = topLevelUserPath;
+				seen_profile[i] = interactionProfile->interactionProfile;
+				break;
+			}
+		}
+		if (changed)
 		oxr_warn(log,
 		         " [DIAG] xrGetCurrentInteractionProfile: topLevel='%s' -> profile='%s' (path=0x%" PRIx64 ")",
 		         top_str ? top_str : "<null>",
