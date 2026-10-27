@@ -726,6 +726,22 @@ struct comp_d3d11_compositor
 	//! Time of the last predicted display time.
 	uint64_t last_display_time_ns;
 
+	/*!
+	 * #2386: set by layer_commit when the frame reached a present that paces the
+	 * app thread (Present(1) on the target, or the hub's on-scanout present);
+	 * cleared by every wait_frame. False at wait_frame means the previous frame
+	 * paced nothing — a texture-target session (the app presents), a frame with
+	 * no layers, a skipped present — and wait_frame then sleeps to the next
+	 * display-period slot itself. App thread only.
+	 */
+	bool last_frame_presented;
+
+	//! #2386: the slot grid wait_frame paces unpresented frames on (0 = unset).
+	uint64_t unpresented_next_ns;
+
+	//! #2386: os_nanosleep is Sleep(ms) on Windows, too coarse to pace on.
+	struct os_precise_sleeper unpresented_sleeper;
+
 
 
 	//! HUD overlay (runtime-owned windows only).
@@ -1946,6 +1962,26 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 
 	// Use queried display refresh rate
 	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
+
+	// #2386: the note below holds only for a frame that presented. A frame
+	// that did not (texture target: the app presents; no layers; a skipped
+	// present) blocked on nothing, and wait/begin/end would free-run (~8,700
+	// frames/s with zero layers, ~1,200/s on a texture target). Pace those on
+	// a period grid, before the lock. A presenting frame resets the grid.
+	if (!c->last_frame_presented) {
+		uint64_t now = os_monotonic_get_ns();
+		uint64_t next = c->unpresented_next_ns + (uint64_t)period_ns;
+		if (c->unpresented_next_ns == 0 || next + (uint64_t)period_ns < now) {
+			next = now; // first unpresented frame, or the grid fell behind
+		}
+		if (next > now) {
+			os_precise_sleeper_nanosleep(&c->unpresented_sleeper, (int32_t)(next - now));
+		}
+		c->unpresented_next_ns = next;
+	} else {
+		c->unpresented_next_ns = 0;
+	}
+	c->last_frame_presented = false;
 
 	// Frame pacing is handled by Present(1) + SetMaximumFrameLatency(1).
 	// Present(1) blocks until vsync, and the frame latency limit of 1
@@ -5305,6 +5341,7 @@ d3d11_hub_commit(struct comp_d3d11_compositor *c,
 	c->repaint.zero_copy = false;
 	c->repaint.zc_srv = nullptr;
 	c->repaint.armed = wove;
+	c->last_frame_presented = wove; // #2386: the hub's on-scanout present
 	if (wove) {
 		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
 		u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
@@ -6299,6 +6336,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// Present with VSync
 	xret = comp_d3d11_target_present(c->target, 1);
+	c->last_frame_presented = (xret == XRT_SUCCESS); // #2386
 
 	// Signal WM_PAINT that the frame is done (unblocks modal drag loop)
 	if (c->owns_window && c->own_window != nullptr) {
@@ -6520,6 +6558,7 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	// XR_DXR_depth_budget: the runner owns a mutex.
 	comp_rear_budget_fini(&c->rear_budget);
 	u_eye_history_destroy(&c->eye_hist); // N6 Part 1 (#2144)
+	os_precise_sleeper_deinit(&c->unpresented_sleeper); // #2386
 
 	delete c;
 }
@@ -6728,6 +6767,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	memset(&c->base, 0, sizeof(c->base));
 
 	c->xdev = xdev;
+	os_precise_sleeper_init(&c->unpresented_sleeper); // #2386
 
 	mcp_capture_init(&c->mcp_capture);
 	mcp_capture_install(&c->mcp_capture);
@@ -6791,6 +6831,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create self-owned window");
 			comp_rear_budget_fini(&c->rear_budget);
+			os_precise_sleeper_deinit(&c->unpresented_sleeper); // #2386
 			delete c;
 			return xret;
 		}

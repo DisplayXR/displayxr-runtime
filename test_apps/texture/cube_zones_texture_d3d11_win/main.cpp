@@ -171,6 +171,19 @@ static bool SpinFrozen() {
     return v == 1;
 }
 
+// DXR_TEXTURE_PRESENT_INTERVAL=0: present the shared texture without vsync, so
+// the only thing pacing the loop is xrWaitFrame (#2386: a DCC host presents on
+// its own clock, not per XR frame). Default 1. The measured rate is logged once
+// a second while it is set.
+static int PresentInterval() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("DXR_TEXTURE_PRESENT_INTERVAL");
+        v = (e != nullptr && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
 // Autonomous-verification dump (DXR_TEXDUMP). "1" or empty-but-present →
 // default %TEMP%\zones_texture_readback.png; any other value is the literal
 // path; unset → no dump. The readback runs after the present so it captures
@@ -732,6 +745,9 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
 
     if (stats.fpsAccumulator >= 1.0f) {
         stats.fps = stats.frameCount / stats.fpsAccumulator;
+        if (PresentInterval() == 0) {
+            LOG_INFO("loop rate: %.1f frames/s (DXR_TEXTURE_PRESENT_INTERVAL=0)", stats.fps);
+        }
         stats.frameCount = 0;
         stats.fpsAccumulator = 0.0f;
     }
@@ -783,7 +799,7 @@ static void PresentAndMaybeDump(RenderState& rs) {
         renderer.context->ClearRenderTargetView(rs.appBackBufferRTV.Get(), clearColor);
         BlitSharedTextureToBackBuffer(renderer, rs.appBackBufferRTV.Get(),
                                       g_windowWidth, g_windowHeight);
-        if (rs.appSwapchain) rs.appSwapchain->Present(1, 0);
+        if (rs.appSwapchain) rs.appSwapchain->Present(PresentInterval(), 0);
     }
 
     // One-shot DXR_TEXDUMP at the warmup gate (HUD/zones are active by then).
