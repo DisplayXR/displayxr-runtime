@@ -1417,6 +1417,17 @@ void
 oxr_system_get_screens(struct oxr_system *sys, struct xrt_screen_list *out_list);
 
 /*!
+ * #2305: a whole copy of the system compositor info (`xsysc->info`) that a
+ * display hotplug cannot tear. The claim sweep rewrites the info's DP registry
+ * and panel desktop rect in place on its own thread, so the copy is taken
+ * through `xrt_instance::get_display_snapshot`, under the lock the sweep
+ * holds; an instance without a live sweep gets a plain copy (nothing rewrites
+ * it there). False when the system has no compositor.
+ */
+bool
+oxr_system_get_info(struct oxr_system *sys, struct xrt_system_compositor_info *out_info);
+
+/*!
  * Hand the session's in-process compositor the screens + the registry they
  * were built from (one snapshot). Session create, and every display-topology
  * change (ADR-047 Amendment 8).
