@@ -100,7 +100,7 @@ window."*
 
 **Step 1** — Apply IPD and parallax factors (common stage above).
 
-**Step 2** — Compute the meters-to-virtual conversion factor:
+**Step 2** — Derive the display rig's meters-to-virtual factor:
 
 ```
 m2v = virtual_display_height / screen.height_m
@@ -109,6 +109,13 @@ m2v = virtual_display_height / screen.height_m
 This maps physical meters into the app's coordinate system.  If
 `virtual_display_height` equals `screen.height_m`, the ratio is 1:1 (one
 app unit = one meter).
+
+This `m2v` is **derived**, and it is specific to the display rig: the eye and
+the canvas are scaled by the same factor (Steps 3–4), so the rig stays
+angle-true whatever `virtual_display_height` is (`perspective_factor` aside).  The camera rig's
+`metersToVirtual` is a separate, app-supplied input with a different rule;
+setting it to this display-rig value is the mistake described in the
+camera-centric section's *Gain* step (#2422).
 
 **Step 3** — Scale eye position into virtual units:
 
@@ -199,26 +206,33 @@ Think *"a virtual camera whose frustum shifts with your head."*
 
 | Field | Range | Description |
 |-------|-------|-------------|
-| `ipd_factor` | [0, 1] | See common stage |
-| `parallax_factor` | [0, 1] | See common stage |
-| `inv_convergence_distance` | > 0 | `1 / convergence_distance` in 1/meters.  Controls how much eye displacement shifts the frustum.  Larger values = stronger stereo in projection. |
-| `half_tan_vfov` | > 0 | `tan(vFOV / 2)`.  Defines the base symmetric FOV before asymmetric shifts.  Divide by a zoom factor at the call site for easy zooming (no trig round-trip). |
+| `ipd_factor` | ≥ 0 | See common stage.  **Absolute** in the camera rig (`XrCameraRigDXR::ipdFactor`): a stereo camera's inter-axial is not bounded to the natural IPD |
+| `parallax_factor` | ≥ 0 | See common stage.  Absolute, like `ipd_factor` |
+| `inv_convergence_distance` | ≥ 0 | `1 / convergence_distance` in 1/**world units** (`XrCameraRigDXR::convergenceDiopters`; 1/meters when `m2v` = 1).  0 = convergence at infinity (parallel views).  Controls how much eye displacement shifts the frustum. |
+| `half_tan_vfov` | > 0 | `tan(vFOV / 2)` (`XrCameraRigDXR::verticalFov`, converted at the boundary).  Defines the base symmetric FOV before asymmetric shifts.  Divide by a zoom factor at the call site for easy zooming (no trig round-trip).  **Never a scale**: it does not move the eye and does not enter the gain `f`. |
+| `m2v` | > 0 | `XrCameraRigDXR::metersToVirtual` (spec 3): meters → world units on the eye.  ≤ 0 / unset = 1.  An **input**, not derived from the frustum; choose it from the gain rule below |
 
 ### Pipeline
 
 **Step 1** — Apply IPD and parallax factors (common stage above, reuses
 `m_multiview_apply_eye_factors()`).
 
-**Step 2** — Compute the eye displacement from the nominal screen plane:
+**Step 2** — Compute the eye displacement from the canvas-centre eye
+`(0, 0, nominal_z)`, scaled into world units:
 
 ```
-eye_local.x = processed.x
-eye_local.y = processed.y
-eye_local.z = processed.z - nominal_z
+eye_local.x = m2v * processed.x
+eye_local.y = m2v * processed.y
+eye_local.z = m2v * (processed.z - nominal_z)
 ```
 
-This gives the eye's offset relative to the screen surface.  A viewer
-sitting at exactly the nominal distance has `eye_local.z = 0`.
+A viewer sitting at exactly the nominal distance has `eye_local.z = 0`.
+Only `z` is measured from the nominal viewer: `x` and `y` are measured from
+the **canvas axis** (the canvas normal through the canvas centre; in the
+runtime the eyes are canvas-rebased first, see *Windowed Mode* below).  A
+nominal viewer the display reports above the window centre is therefore an
+eye offset like any tracked one, and `pose` is where the canvas-centre eye
+maps, not where the nominal viewer maps.
 
 **Step 3** — Transform `eye_local` from display space to world space via the
 camera pose:
@@ -235,8 +249,8 @@ viewMatrix = transpose(R) * translate(-eye_world)
 
 where `R` is the rotation matrix from `camera_pose.orientation`.
 
-**Step 5** — Scale `eye_local` by `inv_convergence_distance` for the
-projection shift:
+**Step 5** — Scale `eye_local` (world units) by `inv_convergence_distance`
+for the projection shift:
 
 ```
 dx = eye_local.x * inv_convergence_distance
@@ -247,6 +261,33 @@ dz = eye_local.z * inv_convergence_distance
 This controls how strongly the eye displacement affects the frustum
 asymmetry.  A larger convergence distance (smaller `invd`) means the
 frustum shifts less per unit of eye movement.
+
+**Gain.**  Steps 2 and 5 together turn an eye `y` meters off the canvas axis
+into a frustum centre turned by `atan(m2v * invd * y)`; the physical angle
+is `atan(y / nominal_z)`.  Their ratio is the rig's angle and disparity gain:
+
+```
+f = m2v * inv_convergence_distance * nominal_z
+```
+
+`f = 1` is angle-true and comfort-neutral (a viewer offset keeps its physical
+angle; disparity matches the physical window); `f > 1` multiplies head-motion
+parallax and disparity by `f`.  `half_tan_vfov` does not enter `f`.  For
+angle-true framing pick
+
+```
+m2v = 1 / (inv_convergence_distance * nominal_z)
+```
+
+Picking `m2v` as the framing scale at the convergence plane instead
+(`2 * half_tan_vfov / (inv_convergence_distance * screen.height_m)`, i.e. the
+display rig's Step 2 applied to the camera frustum) gives
+`f = half_tan_vfov / tan(canvas_vfov / 2)`: a wide app vFOV on a small window
+multiplies every angle (#2422).  The same `f` is the comfort quantity
+(`ipd_factor * f`) and is what `dxr_view_rig_camera_to_display` carries into the
+display rig's `ipd_factor` / `parallax_factor` when it converts a camera rig.
+Worked example and the display-rig recipe for putting the nominal eye on the
+camera axis: [`XR_DXR_view_rig` §3](../specs/extensions/XR_DXR_view_rig.md#3-camera-rig-gain-meterstovirtual-convergencediopters-and-verticalfov-2422).
 
 **Step 6** — Compute the base symmetric half-tangents:
 
@@ -300,7 +341,7 @@ fov.angleDown  = -atan(tan_down)
 | `view_matrix[16]` | Column-major 4x4 view matrix |
 | `projection_matrix[16]` | Column-major 4x4 asymmetric frustum projection |
 | `fov` | `XrFovf` — four signed angles in radians |
-| `eye_world` | Eye position in world space |
+| `eye_world` | Eye position in world space (`camera_pose` + rotated `eye_local`) |
 | `orientation` | Camera orientation (same for both eyes) |
 
 No `eye_display` — the display-space eye position is not meaningful in
@@ -344,8 +385,10 @@ screen       = {window_width_m, window_height_m}
 raw_eye.xy  -= eye_offset.xy
 ```
 
-The `m2v` factor (`virtual_display_height / screen_height_m`) naturally
-grows as the window shrinks, producing correct perspective scaling.  No
+The display rig's `m2v` factor (`virtual_display_height / screen_height_m`)
+naturally grows as the window shrinks, producing correct perspective scaling.
+The camera rig's `m2v` is an app input and does not track the window, so the
+camera rig's gain `f` does not change with the window size.  No
 artificial `vs` viewport-scale multiplication is needed.
 
 ### Per-segment canvas (multi-screen M3)
