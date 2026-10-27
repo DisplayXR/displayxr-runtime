@@ -119,19 +119,64 @@ typedef struct XrDisplayRigDXR {
  * convergence distance in WORLD units (it reduces to 1/m when
  * metersToVirtual == 1). 0 (or unset) is treated as 1.0, preserving the
  * pre-v3 behavior where one world unit was implicitly one meter.
+ *
+ * Effective gain (#2422). The rig's angle and disparity gain over the physical
+ * window is one number:
+ *
+ *     f = metersToVirtual * convergenceDiopters * N
+ *
+ * where N is the nominal viewer distance the display reports (meters). The eye
+ * the display reports (tracked, or its nominal viewer) is taken relative to the
+ * canvas centre; its x/y offset (meters) is multiplied by metersToVirtual and
+ * placed in the camera frame, and the frustum is sheared by that offset times
+ * convergenceDiopters. An eye y meters off the canvas axis therefore sees the
+ * frustum centre turned by atan(f * y / N), against the physical atan(y / N).
+ * f == 1 is angle-true (a viewer offset keeps its physical angle, and disparity
+ * matches the physical window); f > 1 multiplies head-motion parallax and
+ * disparity by f.
+ *
+ * verticalFov only sets the base frustum half-tangent, tan(verticalFov / 2). It
+ * is never a scale: it does not enter f and does not size anything the eye
+ * moves through. Choose metersToVirtual from the convergence distance, not
+ * from the framing:
+ *
+ *     metersToVirtual = 1 / (convergenceDiopters * N)     (angle-true, f == 1)
+ *
+ * Setting metersToVirtual to the framing scale at the convergence plane,
+ * 2 * tan(verticalFov / 2) / (convergenceDiopters * canvas height), gives
+ * f = tan(verticalFov / 2) / tan(canvas vFOV / 2), which is why a wide app
+ * vFOV on a small window appears to lift the eyes.
+ *
+ * The axis is the canvas normal through the canvas centre, not the viewer. A
+ * nominal viewer y meters above the window centre (most displays report one)
+ * sits metersToVirtual * y world units above the camera pose and looks at the
+ * frame centre atan(f * y / N) below the camera axis, even at f == 1 (there the
+ * angle is the true viewing angle). An app that wants the nominal eye ON its
+ * camera axis should chain XrDisplayRigDXR instead: pose at the glass point
+ * (the camera pose moved 1 / convergenceDiopters along its forward axis),
+ * oriented as the camera pitched up by atan(viewerY / viewerZ) about its local
+ * X axis; virtualDisplayHeight = 2 * tan(verticalFov / 2) / convergenceDiopters
+ * (the frustum height at that plane); ipdFactor, parallaxFactor and
+ * perspectiveFactor = 1. viewerY / viewerZ is the nominal eye relative to the
+ * canvas centre (XrViewDisplayRawDXR, canvas-rebased). Worked example:
+ * docs/specs/extensions/XR_DXR_view_rig.md.
  */
 typedef struct XrCameraRigDXR {
     XrStructureType          type;   //!< Must be XR_TYPE_CAMERA_RIG_DXR
     const void* XR_MAY_ALIAS next;
-    XrPosef pose;                  //!< camera pose in the locate space
+    XrPosef pose;                  //!< camera pose in the locate space; the canvas-centre eye
+                                   //!< (0, 0, N) maps here, NOT the nominal viewer
     float   ipdFactor;             //!< ABSOLUTE eye-separation scale (>= 0; any positive — a stereo
                                    //!< camera's inter-axial is not bounded to natural IPD). NOT the
                                    //!< display rig's relative [0,1] factor. Divergence comfort is
                                    //!< guarded on convergence, not by bounding this.
     float   parallaxFactor;        //!< ABSOLUTE parallax scale (>= 0); not the [0,1] display factor
     float   convergenceDiopters;   //!< 1/(convergence distance in world units); 0 = infinity
-    float   verticalFov;           //!< radians, full vertical angle
-    float   metersToVirtual;       //!< meters→world scale on the eye; 0/unset = 1.0 (spec v3)
+    float   verticalFov;           //!< radians, full vertical angle; sets the base frustum
+                                   //!< half-tangent only, never a scale (does not enter f)
+    float   metersToVirtual;       //!< meters→world scale on the eye; 0/unset = 1.0 (spec v3).
+                                   //!< Gain f = metersToVirtual * convergenceDiopters * N;
+                                   //!< 1 / (convergenceDiopters * N) is angle-true (f == 1)
 } XrCameraRigDXR;
 
 // ---- Result: app chains this on XrViewState::next; runtime fills it. ----
