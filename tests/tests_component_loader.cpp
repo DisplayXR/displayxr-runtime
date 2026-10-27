@@ -21,6 +21,7 @@
 #include "catch_amalgamated.hpp"
 
 #include <atomic>
+#include <cctype>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -529,6 +530,60 @@ TEST_CASE("component loader: the load path resolves each class's entry point and
 
 #endif
 
+
+#if defined(_WIN32) && defined(TCL_NEEDS_DEP_PATH) && defined(CONV_STUB_DP_PATH)
+
+TEST_CASE("component loader: a missing static import is NAMED, not just reported as error 126 (#2436)",
+          "[component_loader]")
+{
+	// Same overrides as the load-path case above: the fixtures live in the
+	// build tree and are unsigned.
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");
+	target_component_trust_set_enforce_override(0);
+
+	// The walk on its own: the dependent's one unresolvable import is named.
+	char missing[128] = "x";
+	REQUIRE(target_component_win_first_missing_import(TCL_NEEDS_DEP_PATH, missing, sizeof(missing)));
+	CHECK(_stricmp(missing, TCL_DEP_NAME) == 0);
+
+	// A module whose every import resolves names nothing.
+	char none[128] = "x";
+	CHECK_FALSE(target_component_win_first_missing_import(CONV_STUB_DP_PATH, none, sizeof(none)));
+	CHECK(none[0] == '\0');
+
+	// Bad input never claims a name.
+	CHECK_FALSE(target_component_win_first_missing_import(nullptr, none, sizeof(none)));
+	CHECK_FALSE(target_component_win_first_missing_import("C:\\does\\not\\exist.dll", none, sizeof(none)));
+	CHECK_FALSE(target_component_win_first_missing_import(TCL_NEEDS_DEP_PATH, nullptr, 0));
+
+	// And through the load path: classified as DEPENDENCY_MISSING, error 126
+	// kept, and the reason carries the library's name.
+	const Class disp = plain_class("xrtPluginNegotiate", 1);
+	std::unique_ptr<Entry> e = make_entry("needs-dep", 250);
+	std::snprintf(e->binary_path, sizeof(e->binary_path), "%s", TCL_NEEDS_DEP_PATH);
+	void *module = nullptr;
+	void *fn = nullptr;
+	uint32_t os_error = 0;
+	char reason[192] = "";
+	CHECK(target_component_load_binary(&disp, e.get(), &module, &fn, &os_error, reason, sizeof(reason)) ==
+	      TARGET_COMPONENT_LOAD_DEPENDENCY_MISSING);
+	CHECK(module == nullptr);
+	CHECK(os_error == (uint32_t)ERROR_MOD_NOT_FOUND);
+	std::string r(reason);
+	for (char &ch : r) {
+		ch = (char)tolower((unsigned char)ch);
+	}
+	std::string want(TCL_DEP_NAME);
+	for (char &ch : want) {
+		ch = (char)tolower((unsigned char)ch);
+	}
+	CHECK(r.find(want) != std::string::npos);
+
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+	target_component_trust_set_enforce_override(-1);
+}
+
+#endif
 
 /*
  *

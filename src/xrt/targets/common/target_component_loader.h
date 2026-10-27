@@ -840,6 +840,21 @@ target_component_load_binary_ex(const struct target_component_class *cls,
                                 char *reason,
                                 size_t reason_cap);
 
+#ifdef _WIN32
+/*!
+ * Name the first STATIC import of @p binary_path (UTF-8, absolute) that this
+ * process could not resolve: not an API set, not already resident, not next
+ * to the binary, and not found by this process's own DLL search order (which
+ * a host that called SetDefaultDllDirectories has narrowed, #2436). Writes
+ * the import's name to @p out and returns true; false when every direct
+ * import resolves (the missing library is then a transitive dependency) or
+ * the binary cannot be read. Maps the binary as an image resource only —
+ * nothing in it executes. Delay-load imports are not considered.
+ */
+bool
+target_component_win_first_missing_import(const char *binary_path, char *out, size_t out_cap);
+#endif
+
 //! FreeLibrary / dlclose a module from @ref target_component_load_binary. NULL is a no-op.
 void
 target_component_unload(void *module);
