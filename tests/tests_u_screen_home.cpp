@@ -149,3 +149,91 @@ TEST_CASE("screen home: the panel re-claimed by another plug-in is not the sessi
 	CHECK(defaults(reclaimed, &def) == 0);
 	CHECK(std::strcmp(u_screen_home_outcome_str(U_SCREEN_HOME_RECLAIMED), "re-claimed") == 0);
 }
+
+/*
+ * #2305, runtime #2311 on Windows hardware (2026-10-27): with the panel
+ * unplugged the re-push took the window off the laptop's segment DP and gave
+ * it back to the session DP of the missing panel. When the home is gone AND
+ * its plug-in wins no screen, the session keeps the compositor's last list;
+ * when the plug-in still wins one (the panel re-identified under another id,
+ * a second panel), the re-push goes ahead with no default, as before.
+ */
+TEST_CASE("screen home: gone with its plug-in unlisted (unplugged) vs gone but re-identified")
+{
+	xrt_screen_list first{};
+	add(first, LAPTOP, "sim-display", 0, false);
+	add(first, PANEL, "vendor", -1920, true);
+	u_screen_home h{};
+	u_screen_home_record(&h, &first);
+
+	// Unplugged: only the laptop. Gone, and nothing is the vendor's.
+	xrt_screen_list unplugged{};
+	add(unplugged, LAPTOP, "sim-display", 0, true);
+	CHECK(u_screen_home_anchor(&h, &unplugged) == U_SCREEN_HOME_GONE);
+	CHECK(u_screen_home_plugin_unlisted(&h, &unplugged));
+
+	// A virtual monitor took the panel's place: still nothing of the vendor's.
+	xrt_screen_list virt{};
+	add(virt, LAPTOP, "sim-display", 0, false);
+	add(virt, VIRTUAL, "sim-display", -1920, true);
+	CHECK(u_screen_home_plugin_unlisted(&h, &virt));
+
+	// Mid-replug, Windows shows the panel alone at (0, 0) under a new,
+	// position-derived id: gone by id, but the vendor wins a screen.
+	xrt_screen_list transient{};
+	add(transient, PANEL2, "vendor", 0, true);
+	CHECK(u_screen_home_anchor(&h, &transient) == U_SCREEN_HOME_GONE);
+	CHECK_FALSE(u_screen_home_plugin_unlisted(&h, &transient));
+
+	// Back in place, or re-claimed by another plug-in: not "unlisted" (the
+	// vendor's own screen is there, or the home id is listed at all).
+	xrt_screen_list back{};
+	add(back, LAPTOP, "sim-display", 0, false);
+	add(back, PANEL, "vendor", -1920, true);
+	CHECK_FALSE(u_screen_home_plugin_unlisted(&h, &back));
+
+	// No home recorded, no list: never.
+	u_screen_home none{};
+	CHECK_FALSE(u_screen_home_plugin_unlisted(&none, &unplugged));
+	CHECK_FALSE(u_screen_home_plugin_unlisted(&h, nullptr));
+}
+
+TEST_CASE("screen home: keep the last list only when unplugged and every monitor left is unmoved")
+{
+	// The rig of 2026-10-27: the panel left of the laptop, the laptop at the origin.
+	xrt_screen_list last{};
+	add(last, PANEL, "vendor", -1920, true);
+	add(last, LAPTOP, "sim-display", 0, false);
+	u_screen_home h{};
+	u_screen_home_record(&h, &last);
+
+	// Unplugged; the laptop stays at (0, 0): keep the last list.
+	xrt_screen_list unplugged{};
+	add(unplugged, LAPTOP, "sim-display", 0, true);
+	const u_screen_home_outcome o = u_screen_home_anchor(&h, &unplugged);
+	REQUIRE(o == U_SCREEN_HOME_GONE);
+	CHECK(u_screen_home_keep_last_list(&h, o, &unplugged, &last));
+
+	// No list handed yet, or any other outcome: push as before.
+	CHECK_FALSE(u_screen_home_keep_last_list(&h, o, &unplugged, nullptr));
+	CHECK_FALSE(u_screen_home_keep_last_list(&h, U_SCREEN_HOME_RECLAIMED, &unplugged, &last));
+	CHECK_FALSE(u_screen_home_keep_last_list(&h, U_SCREEN_HOME_IN_PLACE, &unplugged, &last));
+
+	// The panel was at the origin and the laptop shifted onto it: the kept
+	// rects would be stale, push.
+	xrt_screen_list shifted{};
+	add(shifted, LAPTOP, "sim-display", -1920, true);
+	CHECK_FALSE(u_screen_home_keep_last_list(&h, U_SCREEN_HOME_GONE, &shifted, &last));
+
+	// A monitor the last list never had (plugged while the panel is out): push.
+	xrt_screen_list added{};
+	add(added, LAPTOP, "sim-display", 0, true);
+	add(added, VIRTUAL, "sim-display", 1920, false);
+	CHECK_FALSE(u_screen_home_keep_last_list(&h, U_SCREEN_HOME_GONE, &added, &last));
+
+	// Gone by id but the vendor still wins a screen (re-identified, or the
+	// Windows mid-replug transient): push, as before.
+	xrt_screen_list transient{};
+	add(transient, PANEL2, "vendor", 0, true);
+	CHECK_FALSE(u_screen_home_keep_last_list(&h, U_SCREEN_HOME_GONE, &transient, &last));
+}

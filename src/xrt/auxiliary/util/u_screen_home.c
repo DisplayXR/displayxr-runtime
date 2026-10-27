@@ -73,6 +73,47 @@ u_screen_home_anchor(const struct u_screen_home *home, struct xrt_screen_list *l
 	return out;
 }
 
+bool
+u_screen_home_plugin_unlisted(const struct u_screen_home *home, const struct xrt_screen_list *list)
+{
+	if (home == NULL || !home->valid || list == NULL) {
+		return false;
+	}
+	for (uint32_t i = 0; i < count_of(list); i++) {
+		if (strncmp(list->screens[i].plugin_id, home->plugin_id, sizeof(home->plugin_id)) == 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool
+u_screen_home_keep_last_list(const struct u_screen_home *home,
+                             enum u_screen_home_outcome outcome,
+                             const struct xrt_screen_list *now,
+                             const struct xrt_screen_list *last)
+{
+	if (outcome != U_SCREEN_HOME_GONE || last == NULL || !u_screen_home_plugin_unlisted(home, now)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < count_of(now); i++) {
+		const struct xrt_screen *s = &now->screens[i];
+		bool same = false;
+		for (uint32_t k = 0; k < count_of(last); k++) {
+			const struct xrt_screen *l = &last->screens[k];
+			if (l->id == s->id) {
+				same = l->desktop_left == s->desktop_left && l->desktop_top == s->desktop_top &&
+				       l->desktop_width == s->desktop_width && l->desktop_height == s->desktop_height;
+				break;
+			}
+		}
+		if (!same) {
+			return false;
+		}
+	}
+	return true;
+}
+
 const char *
 u_screen_home_outcome_str(enum u_screen_home_outcome o)
 {

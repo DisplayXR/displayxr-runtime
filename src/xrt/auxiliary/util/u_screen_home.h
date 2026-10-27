@@ -70,6 +70,34 @@ u_screen_home_record(struct u_screen_home *home, const struct xrt_screen_list *l
 enum u_screen_home_outcome
 u_screen_home_anchor(const struct u_screen_home *home, struct xrt_screen_list *list);
 
+/*!
+ * The home's plug-in wins no screen in @p list at all: with
+ * @ref U_SCREEN_HOME_GONE, the panel is unplugged rather than re-identified
+ * under another screen id (a position-derived id after an arrangement change,
+ * or Windows showing it alone at (0, 0) mid-replug) or replaced by another
+ * claimed panel. Then no list can put a second weaver on the session DP's
+ * panel, and a re-push would only take the window off the screen it is on
+ * (#2305, runtime #2311 on Windows hardware). False when no home is recorded.
+ */
+bool
+u_screen_home_plugin_unlisted(const struct u_screen_home *home, const struct xrt_screen_list *list);
+
+/*!
+ * Should a hotplug re-push leave the compositor on the list it was last
+ * handed (@p last) instead of @p now? Only when the home is
+ * @ref U_SCREEN_HOME_GONE, its plug-in is unlisted
+ * (@ref u_screen_home_plugin_unlisted), and every screen in @p now is in
+ * @p last at the same desktop rect — so the kept list still describes every
+ * monitor that is left. A layout that shifted (the removed panel was at the
+ * desktop origin, say) re-pushes as before: a stale rect there would split a
+ * window on one real monitor into two segments.
+ */
+bool
+u_screen_home_keep_last_list(const struct u_screen_home *home,
+                             enum u_screen_home_outcome outcome,
+                             const struct xrt_screen_list *now,
+                             const struct xrt_screen_list *last);
+
 //! A short word for @p o ("in place", "re-anchored", "gone", "re-claimed", "unrecorded").
 const char *
 u_screen_home_outcome_str(enum u_screen_home_outcome o);

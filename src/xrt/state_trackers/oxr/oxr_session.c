@@ -5954,6 +5954,9 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	}
 #endif
 
+	free(sess->display_last_pushed);
+	sess->display_last_pushed = NULL;
+
 	free(sess);
 
 	return ret;
@@ -6090,6 +6093,9 @@ oxr_cocoa_window_placement_app_owned(const XrSessionCreateInfo *createInfo)
 }
 #endif
 
+//! oxr_session::display_home_logged for "gone, the last list kept" (past every u_screen_home_outcome).
+#define OXR_SCREEN_HOME_LOGGED_KEPT_LIST 0x100
+
 /*
  * Does allocation, population and basic init, so we can use early-returns to
  * simplify code flow and avoid weird if/else.
@@ -6141,20 +6147,47 @@ oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool 
 		u_screen_home_record(&sess->display_home, screens);
 		sess->display_home_logged = (int)U_SCREEN_HOME_IN_PLACE;
 	}
+	// The home is gone, its plug-in wins no screen now (unplugged, not
+	// re-identified) and every monitor left is where the last list has it:
+	// the compositor keeps that list, so a window that Windows moved to
+	// another screen stays with that screen's segment DP and per-segment
+	// views. Re-pushing would hand the window back to the session DP of a
+	// panel that is not there, which can neither weave nor measure it (on
+	// Windows hardware the laptop then showed one eye of a whole-panel
+	// frustum until the replug). No second weaver can result: nothing is
+	// claimed by the panel's plug-in.
+	bool keep_last_list = false;
 	if (!initial && !sess->is_metal_native_compositor) {
 		const enum u_screen_home_outcome o = u_screen_home_anchor(&sess->display_home, screens);
-		if ((int)o != sess->display_home_logged) {
-			sess->display_home_logged = (int)o;
-			U_LOG_W(
-			    "display hotplug: the session's own display processor stays on screen 0x%016llx ('%s') — "
-			    "%s%s",
-			    (unsigned long long)sess->display_home.screen_id, sess->display_home.plugin_id,
-			    u_screen_home_outcome_str(o),
-			    (o == U_SCREEN_HOME_GONE || o == U_SCREEN_HOME_RECLAIMED)
-			        ? "; per-screen segments are off until it returns (the session DP keeps weaving the "
-			          "window, as before the hotplug)"
-			        : "");
+		keep_last_list = u_screen_home_keep_last_list(&sess->display_home, o, screens, sess->display_last_pushed);
+		const int logged = keep_last_list ? OXR_SCREEN_HOME_LOGGED_KEPT_LIST : (int)o;
+		if (logged != sess->display_home_logged) {
+			sess->display_home_logged = logged;
+			if (keep_last_list) {
+				U_LOG_W(
+				    "display hotplug: the session's own display processor stays on screen 0x%016llx ('%s') — "
+				    "gone, and '%s' wins no screen now (unplugged); the compositor keeps its last screen "
+				    "list until it returns, so a window on another screen stays with that screen's DP "
+				    "(#2305)",
+				    (unsigned long long)sess->display_home.screen_id, sess->display_home.plugin_id,
+				    sess->display_home.plugin_id);
+			} else {
+				U_LOG_W(
+				    "display hotplug: the session's own display processor stays on screen 0x%016llx ('%s') "
+				    "— %s%s",
+				    (unsigned long long)sess->display_home.screen_id, sess->display_home.plugin_id,
+				    u_screen_home_outcome_str(o),
+				    (o == U_SCREEN_HOME_GONE || o == U_SCREEN_HOME_RECLAIMED)
+				        ? "; per-screen segments are off until it returns (the session DP keeps weaving the "
+				          "window, as before the hotplug)"
+				        : "");
+			}
 		}
+	}
+	if (keep_last_list) {
+		free(screens);
+		free(info);
+		return;
 	}
 	uint64_t pinned = 0;
 #ifdef OXR_HAVE_DXR_display_info
@@ -6211,6 +6244,15 @@ oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool 
 		comp_gl_compositor_set_screens(&sess->xcn->base, screens, info, pinned);
 	}
 #endif
+
+	// What the compositor holds now (u_screen_home_keep_last_list compares
+	// the next list with it). No copy = never keep: the re-push as before.
+	if (sess->display_last_pushed == NULL) {
+		sess->display_last_pushed = U_TYPED_CALLOC(struct xrt_screen_list);
+	}
+	if (sess->display_last_pushed != NULL) {
+		*sess->display_last_pushed = *screens;
+	}
 
 	free(screens);
 	free(info);
