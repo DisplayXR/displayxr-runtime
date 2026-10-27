@@ -567,9 +567,15 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	comp_vk_native_compositor_set_rear_budget_requested(&xcn->base, sys->inst->extensions.DXR_depth_budget);
 #endif
 
-	// Set system compositor info (display dimensions, nominal viewer, legacy flags)
+	// Set system compositor info (display dimensions, nominal viewer, legacy flags).
+	// #2305: copied under the display-hotplug sweep's lock — the sweep may be
+	// rewriting xsysc->info on its own thread right now.
 	if (sess->sys->xsysc != NULL) {
-		comp_vk_native_compositor_set_sys_info(&xcn->base, &sess->sys->xsysc->info);
+		struct xrt_system_compositor_info *sys_info = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+		if (sys_info != NULL && oxr_system_get_info(sess->sys, sys_info)) {
+			comp_vk_native_compositor_set_sys_info(&xcn->base, sys_info);
+		}
+		free(sys_info);
 	}
 
 	// Set the compositor directly — no client wrapper needed

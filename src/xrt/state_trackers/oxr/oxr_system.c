@@ -18,6 +18,7 @@
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_screen.h"
 #include "util/u_debug.h"
+#include "util/u_misc.h"
 #include "util/u_verify.h"
 
 #include "oxr_objects.h"
@@ -1177,6 +1178,25 @@ oxr_system_get_screens(struct oxr_system *sys, struct xrt_screen_list *out_list)
 	scr->info.default_eye_tracking_mode = info->default_eye_tracking_mode;
 	scr->info.source = XRT_SCREEN_INFO_SOURCE_SYSTEM;
 	out_list->count = 1;
+}
+
+bool
+oxr_system_get_info(struct oxr_system *sys, struct xrt_system_compositor_info *out_info)
+{
+	if (sys == NULL || sys->xsysc == NULL || out_info == NULL) {
+		return false;
+	}
+	// The snapshot hands out the screen list too; only the info is wanted.
+	struct xrt_instance *xinst = sys->inst != NULL ? sys->inst->xinst : NULL;
+	struct xrt_screen_list *scratch = U_TYPED_CALLOC(struct xrt_screen_list);
+	const bool locked =
+	    scratch != NULL && xrt_instance_get_display_snapshot(xinst, scratch, out_info, NULL) == XRT_SUCCESS;
+	free(scratch);
+	if (!locked) {
+		// No live claim sweep on this instance: nothing rewrites the info.
+		*out_info = sys->xsysc->info;
+	}
+	return true;
 }
 
 #ifdef OXR_HAVE_DXR_display_info
