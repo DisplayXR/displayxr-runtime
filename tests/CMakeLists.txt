@@ -754,6 +754,30 @@ if(TARGET tests_component_loader)
 			)
 	endif()
 endif()
+# #2436 -- a module whose static import cannot be resolved from the test
+# process: the dependency is written to an isolated directory (never next to
+# the dependent, the test executable, or on PATH), so loading the dependent
+# fails with error 126 and the loader must name the missing import.
+if(WIN32 AND TARGET tests_component_loader)
+	add_library(tests_component_loader_dep SHARED tests_component_loader_missing_dep.c)
+	target_compile_definitions(tests_component_loader_dep PRIVATE TCL_DEP_LIBRARY)
+	set_target_properties(
+		tests_component_loader_dep
+		PROPERTIES PREFIX ""
+			   OUTPUT_NAME "dxr_test_missing_dep"
+			   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tcl_isolated_dep"
+			   ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tcl_isolated_dep"
+		)
+	add_library(tests_component_loader_needs_dep MODULE tests_component_loader_missing_dep.c)
+	target_link_libraries(tests_component_loader_needs_dep PRIVATE tests_component_loader_dep)
+	set_target_properties(tests_component_loader_needs_dep PROPERTIES PREFIX "")
+	add_dependencies(tests_component_loader tests_component_loader_needs_dep)
+	target_compile_definitions(
+		tests_component_loader
+		PRIVATE "TCL_NEEDS_DEP_PATH=\"$<TARGET_FILE:tests_component_loader_needs_dep>\""
+			"TCL_DEP_NAME=\"$<TARGET_FILE_NAME:tests_component_loader_dep>\""
+		)
+endif()
 if(TARGET tests_conv_host_satellite)
 	target_link_libraries(tests_conv_host_satellite PRIVATE conv_host_core xrt-interfaces aux_util)
 	add_dependencies(tests_conv_host_satellite displayxr-conversion-host drv_sim_conversion_plugin

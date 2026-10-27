@@ -1098,6 +1098,119 @@ tc_module_is_bin(HMODULE dll, const struct tc_bin *b)
 	       (((uint64_t)fi.nFileIndexHigh << 32) | fi.nFileIndexLow) == b->ino;
 }
 
+//! Is the import @p name (UTF-16, bare file name) resolvable for a binary in @p dir?
+static bool
+tc_import_resolves(const wchar_t *dir, const wchar_t *name)
+{
+	// API sets are virtual: the loader maps them through the schema, not the disk.
+	if (_wcsnicmp(name, L"api-ms-", 7) == 0 || _wcsnicmp(name, L"ext-ms-", 7) == 0) {
+		return true;
+	}
+	// Already resident: the loader binds it by base name with no search.
+	if (GetModuleHandleW(name) != NULL) {
+		return true;
+	}
+	// LOAD_WITH_ALTERED_SEARCH_PATH looks in the binary's own directory first.
+	wchar_t sibling[TARGET_COMPONENT_PATH_MAX];
+	if (swprintf_s(sibling, sizeof(sibling) / sizeof(sibling[0]), L"%s\\%s", dir, name) > 0 &&
+	    GetFileAttributesW(sibling) != INVALID_FILE_ATTRIBUTES) {
+		return true;
+	}
+	// Everything else goes through THIS process's search order — which is the
+	// point: a host that called SetDefaultDllDirectories no longer searches
+	// PATH, and a datafile load of a bare name honours exactly that (#2436).
+	// Mapped as data: no DllMain, no imports of its own resolved.
+	HMODULE h = LoadLibraryExW(name, NULL, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+	if (h == NULL) {
+		return false;
+	}
+	FreeLibrary(h);
+	return true;
+}
+
+bool
+target_component_win_first_missing_import(const char *binary_path, char *out, size_t out_cap)
+{
+	if (out != NULL && out_cap > 0) {
+		out[0] = '\0';
+	}
+	if (binary_path == NULL || out == NULL || out_cap == 0) {
+		return false;
+	}
+	wchar_t wpath[TARGET_COMPONENT_PATH_MAX];
+	if (!tc_u2w(binary_path, wpath, (int)(sizeof(wpath) / sizeof(wpath[0])))) {
+		return false;
+	}
+	for (wchar_t *p = wpath; *p != L'\0'; p++) {
+		if (*p == L'/') {
+			*p = L'\\';
+		}
+	}
+	wchar_t dir[TARGET_COMPONENT_PATH_MAX];
+	wcscpy_s(dir, sizeof(dir) / sizeof(dir[0]), wpath);
+	wchar_t *slash = wcsrchr(dir, L'\\');
+	if (slash == NULL) {
+		return false;
+	}
+	*slash = L'\0';
+
+	// Mapped as an image (sections at their RVAs) but never executed: no
+	// DllMain, no import resolution — which is what lets this read the import
+	// table of a binary that cannot be loaded for real.
+	HMODULE img = LoadLibraryExW(wpath, NULL, LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE);
+	if (img == NULL) {
+		return false;
+	}
+	// Datafile handles carry flag bits in the low bits of the base address.
+	const uint8_t *base = (const uint8_t *)((uintptr_t)img & ~(uintptr_t)3);
+
+	bool found = false;
+	const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
+	if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0 && dos->e_lfanew < 0x10000) {
+		const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+		// Same bitness as this process only: the loader would refuse anything else first.
+		if (nt->Signature == IMAGE_NT_SIGNATURE && nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR_MAGIC &&
+		    nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
+			const DWORD size_of_image = nt->OptionalHeader.SizeOfImage;
+			const IMAGE_DATA_DIRECTORY *dd =
+			    &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+			if (dd->VirtualAddress != 0 && dd->VirtualAddress < size_of_image) {
+				const IMAGE_IMPORT_DESCRIPTOR *imp =
+				    (const IMAGE_IMPORT_DESCRIPTOR *)(base + dd->VirtualAddress);
+				// Static imports only: /DELAYLOAD entries live in their own
+				// directory and are resolved (or not) by the plug-in later.
+				for (int guard = 0; guard < 512; guard++, imp++) {
+					if ((const uint8_t *)(imp + 1) > base + size_of_image || imp->Name == 0) {
+						break;
+					}
+					if (imp->Name >= size_of_image) {
+						break;
+					}
+					const char *name = (const char *)(base + imp->Name);
+					size_t max_len = (size_t)(size_of_image - imp->Name);
+					size_t len = strnlen(name, max_len < 260 ? max_len : 260);
+					if (len == 0 || len >= 260) {
+						continue;
+					}
+					wchar_t wname[260];
+					int wn = MultiByteToWideChar(CP_ACP, 0, name, (int)len, wname, 259);
+					if (wn <= 0) {
+						continue;
+					}
+					wname[wn] = L'\0';
+					if (!tc_import_resolves(dir, wname)) {
+						snprintf(out, out_cap, "%.*s", (int)len, name);
+						found = true;
+						break;
+					}
+				}
+			}
+		}
+	}
+	FreeLibrary(img);
+	return found;
+}
+
 enum target_component_load_result
 target_component_load_binary_ex(const struct target_component_class *cls,
                                 struct target_component_entry *e,
@@ -1231,18 +1344,45 @@ target_component_load_binary_ex(const struct target_component_class *cls,
 		// library IT imports is missing — typically the vendor platform the
 		// component should resolve lazily (ADR-045 rule 1).
 		const bool dep = gle == ERROR_MOD_NOT_FOUND;
-		TC_LOG_LOAD(quiet, "%s:   %s: LoadLibrary(%s) failed (err=%lu)%s.", tc_tag(cls), e->id, e->binary_path, gle,
-		        dep ? " — a library the binary imports is missing (vendor platform not installed, or not "
-		              "resolvable from this process)"
-		            : "");
+		// #2436: name the library. Error 126 alone cannot tell "vendor
+		// platform not installed" from "installed, but this HOST's DLL
+		// search order cannot see it" (a host that called
+		// SetDefaultDllDirectories no longer searches PATH) — and the
+		// second is a plug-in packaging bug that only shows up in some
+		// apps. The walk re-runs the static-import resolution against
+		// this process's search order, without executing anything.
+		char missing[128] = {0};
+		const bool named =
+		    dep && target_component_win_first_missing_import(e->binary_path, missing, sizeof(missing));
+		if (named) {
+			TC_LOG_LOAD(quiet,
+			            "%s:   %s: LoadLibrary(%s) failed (err=%lu) — it statically imports '%s', which "
+			            "this process cannot resolve (not next to the binary, not resident, not on this "
+			            "process's DLL search path). The plug-in must resolve it itself (delay-load + "
+			            "full path) for hosts that restrict the search path.",
+			            tc_tag(cls), e->id, e->binary_path, gle, missing);
+		} else {
+			TC_LOG_LOAD(
+			    quiet, "%s:   %s: LoadLibrary(%s) failed (err=%lu)%s.", tc_tag(cls), e->id, e->binary_path,
+			    gle,
+			    dep ? " — a library the binary imports is missing (vendor platform not installed, or "
+			          "not resolvable from this process; every direct import resolves, so it is a "
+			          "dependency of one of them)"
+			        : "");
+		}
 		if (out_os_error != NULL) {
 			*out_os_error = (uint32_t)gle;
 		}
 		if (reason != NULL) {
-			snprintf(reason, reason_cap, "%s (err=%lu)",
-			         dep ? "dependency missing: a library the binary imports was not found"
-			             : "LoadLibrary failed",
-			         gle);
+			if (named) {
+				snprintf(reason, reason_cap,
+				         "dependency missing: %s not found from this process (err=%lu)", missing, gle);
+			} else {
+				snprintf(reason, reason_cap, "%s (err=%lu)",
+				         dep ? "dependency missing: a library the binary imports was not found"
+				             : "LoadLibrary failed",
+				         gle);
+			}
 		}
 		return dep ? TARGET_COMPONENT_LOAD_DEPENDENCY_MISSING : TARGET_COMPONENT_LOAD_FAILED;
 	}

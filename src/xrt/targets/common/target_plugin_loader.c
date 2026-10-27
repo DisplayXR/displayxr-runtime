@@ -175,6 +175,72 @@ plugin_note_reject(const char *id, uint32_t probe_order)
 }
 
 /*!
+ * `DXR_DP_NO_FALLBACK=1` — never let a lower-ranked display plug-in stand in
+ * for a better-ranked one that FAILED TO LOAD in this process (#2436).
+ *
+ * The default is to fall through ProbeOrder, which on a vendor box ends at the
+ * sim-display fallback: the app runs, but nothing is woven on the panel, and
+ * the choice is fixed for the life of the process. A host that would rather
+ * fail `xrCreateInstance` than render unwoven sets this. A plug-in that loaded
+ * and DECLINED its probe (not this hardware) is not a failure and still falls
+ * through; a disabled or excluded one was never attempted. Read once.
+ */
+static bool
+plugin_no_fallback(void)
+{
+	static int s_value = -1;
+	if (s_value < 0) {
+		const char *env = getenv("DXR_DP_NO_FALLBACK");
+		s_value = (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+		if (s_value) {
+			U_LOG_W(
+			    "plugin loader: DXR_DP_NO_FALLBACK set — a display plug-in that fails to load will NOT "
+			    "be replaced by a lower-ranked one; discovery stops there instead.");
+		}
+	}
+	return s_value == 1;
+}
+
+/*!
+ * #2436: refuse to continue discovery after a better-ranked plug-in failed to
+ * load, when DXR_DP_NO_FALLBACK asks for it. @p rejected_before is
+ * g_rejected_count before the attempt, so a declined probe never trips it.
+ */
+static bool
+plugin_stop_after_failure(const char *id, int rejected_before)
+{
+	if (g_rejected_count == rejected_before || !plugin_no_fallback()) {
+		return false;
+	}
+	U_LOG_E(
+	    "plugin loader: display plug-in '%s' failed to load (%s) and DXR_DP_NO_FALLBACK is set — "
+	    "refusing to fall back to a lower-ranked plug-in. No display processor is active in this process.",
+	    id, g_best_rejected_reason[0] != '\0' ? g_best_rejected_reason : "load or probe failed");
+	return true;
+}
+
+/*!
+ * #2436: say LOUDLY when the winner is a fallback and a better-ranked
+ * registered plug-in failed to load in this process. The per-attempt WARN
+ * names the failure; this is the one line that says what it cost — the app
+ * renders on the fallback for its whole life, and fixing the cause needs the
+ * app restarted. Silent otherwise (no rejects, or a non-fallback winner).
+ */
+static void
+plugin_report_fallback(const struct xrt_plugin_iface *iface)
+{
+	if (iface == NULL || g_rejected_count == 0 || !target_plugin_iface_is_fallback(iface)) {
+		return;
+	}
+	U_LOG_E(
+	    "plugin loader: FELL BACK to '%s': the better-ranked display plug-in '%s' failed to load in this "
+	    "process (%s). Content will not be processed for the 3D display. The choice is fixed for this "
+	    "process: restart the app after fixing the cause. Set DXR_DP_NO_FALLBACK=1 to fail instead.",
+	    iface->id != NULL ? iface->id : "?", g_best_rejected_id[0] != '\0' ? g_best_rejected_id : "?",
+	    g_best_rejected_reason[0] != '\0' ? g_best_rejected_reason : "load or probe failed");
+}
+
+/*!
  * `DXR_PLUGIN_EXCLUSIVE=<plugin-id>` — load ONLY the named display plug-in and
  * do not even `LoadLibrary`/`dlopen` any other registered one (#1545, #1523).
  *
@@ -1863,6 +1929,21 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 				free(entries);
 				return iface;
 			}
+			// #2436: the user pinned this plug-in, so anything else is a
+			// stand-in. Under DXR_DP_NO_FALLBACK a FAILED (not declined)
+			// preference stops discovery here. Not counted as a reject:
+			// the ProbeOrder loop below re-attempts the same row and
+			// counts it there if it still out-ranks the winner.
+			if (first_call && !g_last_reject_declined && plugin_no_fallback()) {
+				U_LOG_E(
+				    "plugin loader: preferred display plug-in '%s' failed to load (%s) and "
+				    "DXR_DP_NO_FALLBACK is set — refusing to fall back. No display processor is active "
+				    "in this process.",
+				    preferred,
+				    g_last_reject_reason[0] != '\0' ? g_last_reject_reason : "load or probe failed");
+				free(entries);
+				return NULL;
+			}
 			U_LOG_W("plugin loader: preferred plug-in '%s' failed — falling back to ProbeOrder.",
 			        preferred);
 			break;
@@ -1913,7 +1994,14 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		/* #1212: attempted in ascending ProbeOrder and failed, so this is
 		 * by construction a better-ranked plug-in than whatever wins
 		 * below. The self-test's vendor_dp check keys off this. */
+		const int rejected_before = g_rejected_count;
 		plugin_note_reject(entries[i].id, entries[i].probe_order);
+		/* #2436: only on the first-call pass — a refresh never replaces
+		 * the active plug-in with a worse one, so it has nothing to stop. */
+		if (first_call && plugin_stop_after_failure(entries[i].id, rejected_before)) {
+			free(entries);
+			return NULL;
+		}
 	}
 	free(entries);
 
@@ -2374,6 +2462,7 @@ target_plugin_get_active(void)
 	}
 
 	g_active_iface = discover_active_plugin(&g_active_instance, 0xFFFFFFFFu /* try all */);
+	plugin_report_fallback(g_active_iface);
 	return g_active_iface;
 }
 
