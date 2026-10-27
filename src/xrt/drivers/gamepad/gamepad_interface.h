@@ -148,6 +148,24 @@ gamepad_create_navigation(struct gamepad_hub *hub);
 struct xrt_device *
 gamepad_create_emulated_controller(struct gamepad_hub *hub, enum xrt_device_type type);
 
+//! How the Touch pair (`EMULATE_PROFILE` = touch) moves its hands.
+struct gamepad_touch_config
+{
+	float deadzone;             //!< radial stick deadzone, as @ref gamepad_map_config::deadzone
+	float hand_speed_mps;       //!< hand speed at full stick deflection (`HAND_SPEED`)
+	struct xrt_vec3 right_home; //!< right hand's rest point, rig-local metres; the left hand mirrors X
+};
+
+/*!
+ * One emulated `oculus/touch_controller` (@p type = LEFT or RIGHT hand)
+ * whose pose the pad moves (@ref gamepad_map_touch_hand), rig-local like
+ * the simple pair, with the full Touch button set and haptics.
+ */
+struct xrt_device *
+gamepad_create_touch_controller(struct gamepad_hub *hub,
+                                enum xrt_device_type type,
+                                const struct gamepad_touch_config *cfg);
+
 #ifdef __cplusplus
 }
 #endif

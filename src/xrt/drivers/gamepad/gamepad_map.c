@@ -291,3 +291,78 @@ gamepad_map_action_pressed(const struct gamepad_state *state,
 	}
 	return false;
 }
+
+void
+gamepad_map_touch_hand(const struct gamepad_state *state,
+                       bool is_left,
+                       float deadzone,
+                       float hand_speed_mps,
+                       struct gamepad_touch_hand *out)
+{
+	const struct gamepad_touch_hand zero = {0};
+	*out = zero;
+	if (state == NULL || !state->connected) {
+		return;
+	}
+	const uint32_t b = state->buttons;
+
+	out->trigger = clamp_01(is_left ? state->left_trigger : state->right_trigger);
+	out->squeeze = (b & (is_left ? GAMEPAD_BTN_SHOULDER_LEFT : GAMEPAD_BTN_SHOULDER_RIGHT)) != 0 ? 1.0f : 0.0f;
+	out->lower = (b & (is_left ? GAMEPAD_BTN_X : GAMEPAD_BTN_A)) != 0;
+	out->upper = (b & (is_left ? GAMEPAD_BTN_Y : GAMEPAD_BTN_B)) != 0;
+	out->menu = is_left && (b & GAMEPAD_BTN_MENU) != 0;
+
+	// The D-pad is the right thumbstick, or the left one while View is held.
+	const bool view = (b & GAMEPAD_BTN_VIEW) != 0;
+	if (view == is_left) {
+		out->thumbstick_x = ((b & GAMEPAD_BTN_DPAD_RIGHT) != 0 ? 1.0f : 0.0f) -
+		                    ((b & GAMEPAD_BTN_DPAD_LEFT) != 0 ? 1.0f : 0.0f);
+		out->thumbstick_y =
+		    ((b & GAMEPAD_BTN_DPAD_UP) != 0 ? 1.0f : 0.0f) - ((b & GAMEPAD_BTN_DPAD_DOWN) != 0 ? 1.0f : 0.0f);
+	}
+
+	float x = 0.0f, y = 0.0f;
+	if (is_left) {
+		gamepad_map_apply_deadzone(state->left_x, state->left_y, deadzone, &x, &y);
+	} else {
+		gamepad_map_apply_deadzone(state->right_x, state->right_y, deadzone, &x, &y);
+	}
+	float speed = hand_speed_mps;
+	if (!(speed == speed) || speed < 0.0f) {
+		speed = 0.0f;
+	}
+	const bool depth = (b & (is_left ? GAMEPAD_BTN_THUMB_LEFT : GAMEPAD_BTN_THUMB_RIGHT)) != 0;
+	if (depth) {
+		// Stick up pushes the hand into the screen (−Z, away from the viewer).
+		out->velocity_mps.z = -y * speed;
+	} else {
+		out->velocity_mps.x = x * speed;
+		out->velocity_mps.y = y * speed;
+	}
+}
+
+bool
+gamepad_map_view_tap(struct gamepad_tap *tap, const struct gamepad_state *state, int64_t now_ns)
+{
+	const uint32_t dpad =
+	    GAMEPAD_BTN_DPAD_UP | GAMEPAD_BTN_DPAD_DOWN | GAMEPAD_BTN_DPAD_LEFT | GAMEPAD_BTN_DPAD_RIGHT;
+	const bool view = state != NULL && state->connected && (state->buttons & GAMEPAD_BTN_VIEW) != 0;
+
+	if (view) {
+		if (tap->down_ns == 0) {
+			tap->down_ns = now_ns > 0 ? now_ns : 1;
+			tap->spoiled = false;
+		}
+		if ((state->buttons & dpad) != 0) {
+			tap->spoiled = true;
+		}
+		return false;
+	}
+	if (tap->down_ns == 0) {
+		return false;
+	}
+	const bool is_tap = !tap->spoiled && now_ns - tap->down_ns <= GAMEPAD_MAP_TAP_MAX_NS;
+	tap->down_ns = 0;
+	tap->spoiled = false;
+	return is_tap;
+}

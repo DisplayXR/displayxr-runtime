@@ -264,6 +264,68 @@ gamepad_map_has_activity(const struct gamepad_state *state, float deadzone);
 //! Trigger pull counted as activity (0..1) — above a resting trigger's noise.
 #define GAMEPAD_MAP_TRIGGER_ACTIVITY 0.05f
 
+
+/*
+ *
+ * Touch emulation (`EMULATE_PROFILE` = touch).
+ *
+ */
+
+/*!
+ * One emulated `oculus/touch_controller` hand as the pad drives it. VR
+ * sculpting / painting tools (Substance 3D Modeler and the like) need the
+ * full Touch layout and hands that MOVE, so in this mode each stick moves
+ * its own hand instead of the rig:
+ *
+ * - trigger = that side's trigger, squeeze = that side's shoulder;
+ * - lower / upper face button = X / Y on the left hand, A / B on the right;
+ * - menu = the pad's Menu button (left hand only, as on a real Touch);
+ * - the app-facing thumbstick comes from the D-pad: the right hand's by
+ *   default, the left hand's while View is held;
+ * - the hand moves in the display plane with its stick, and along depth
+ *   (stick up = into the screen) while that stick is clicked in.
+ */
+struct gamepad_touch_hand
+{
+	float trigger; //!< 0..1
+	float squeeze; //!< 0..1
+	bool lower;    //!< X (left) / A (right)
+	bool upper;    //!< Y (left) / B (right)
+	bool menu;     //!< left hand only
+	float thumbstick_x, thumbstick_y;
+	struct xrt_vec3 velocity_mps; //!< rig-local: +X right, +Y up, +Z toward the viewer
+};
+
+/*!
+ * Map @p state to hand @p is_left. Stick motion goes through the radial
+ * @p deadzone and is scaled to @p hand_speed_mps at full deflection. A
+ * disconnected state yields all zeros.
+ */
+void
+gamepad_map_touch_hand(const struct gamepad_state *state,
+                       bool is_left,
+                       float deadzone,
+                       float hand_speed_mps,
+                       struct gamepad_touch_hand *out);
+
+/*!
+ * Recenter is a TAP of View: pressed and released within
+ * @ref GAMEPAD_MAP_TAP_MAX_NS with no D-pad direction pressed meanwhile
+ * (View + D-pad steers the left thumbstick and is not a tap).
+ */
+#define GAMEPAD_MAP_TAP_MAX_NS (300LL * 1000 * 1000)
+
+//! View-tap detector state; zero-initialise.
+struct gamepad_tap
+{
+	int64_t down_ns; //!< when View went down, 0 = up
+	bool spoiled;    //!< a D-pad direction was pressed while View was down
+};
+
+//! Feed one sample; true on the release that completes a tap.
+bool
+gamepad_map_view_tap(struct gamepad_tap *tap, const struct gamepad_state *state, int64_t now_ns);
+
 /*!
  * The idle rule behind presence: true when @p idle_timeout_s <= 0 (the
  * connected-only behaviour), else when @p last_activity_ns is non-zero and
