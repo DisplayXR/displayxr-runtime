@@ -324,9 +324,13 @@ struct xrt_screen_list;
 /*!
  * Multi-screen M2: hand the compositor the system's screens so a window that
  * spans several of them is woven per segment, each by its own screen's display
- * processor (ADR-047 D2). Call after @ref comp_vk_native_compositor_set_sys_info
- * (it reads the DP registry from there). @p pinned_display_id is the session's
- * `XrSessionDisplayBindingDXR` (0 = none); a pinned session is never segmented.
+ * processor (ADR-047 D2). @p info is the system info @p list was built from:
+ * the segment DPs come from its per-monitor DP registry, not from the
+ * session-start info of @ref comp_vk_native_compositor_set_sys_info, so a
+ * screen plugged in after the session started (or claimed by a plug-in a
+ * display hotplug loaded later) has its entry (#2305). Both are copied.
+ * @p pinned_display_id is the session's `XrSessionDisplayBindingDXR`
+ * (0 = none); a pinned session is never segmented.
  * Desktop Linux X11/XWayland only; a no-op elsewhere.
  *
  * @ingroup comp_vk_native
@@ -334,6 +338,7 @@ struct xrt_screen_list;
 void
 comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
                                       const struct xrt_screen_list *list,
+                                      const struct xrt_system_compositor_info *info,
                                       uint64_t pinned_display_id);
 
 /*!

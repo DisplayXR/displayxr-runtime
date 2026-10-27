@@ -6254,11 +6254,13 @@ oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool 
 #if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_WINDOWS))
 	// Multi-screen M2 (Linux) / M6 (Windows): the in-process Vulkan compositor
 	// weaves a window that spans screens per segment, each with its own
-	// screen's DP; it needs the screen list (and stays single-DP for a session
-	// pinned to one display). On Windows under the #918 split the compositor
-	// hands the list on to the split's D3D11 segment manager.
+	// screen's DP; it needs the screen list and the registry it was built
+	// from (#2305: a hotplugged screen's DP is only in the fresh one), and
+	// stays single-DP for a session pinned to one display. On Windows under
+	// the #918 split the compositor hands both on to the split's D3D11
+	// segment manager.
 	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
-		comp_vk_native_compositor_set_screens(&sess->xcn->base, screens, pinned);
+		comp_vk_native_compositor_set_screens(&sess->xcn->base, screens, info, pinned);
 	}
 #endif
 
