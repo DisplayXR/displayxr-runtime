@@ -13046,6 +13046,37 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		// the DP (legacy sticky publish / clear edge; the zones wish only
 		// exists where the composite ran — not on this shared path yet).
 		vk_sync_zone_mask_to_dp(c);
+
+		/*
+		 * #2421: the post-compose capture site for a client-presents session
+		 * (texture class). The window exits below dispatch it; this branch
+		 * returned first, so a `displayxr_atlas_trigger[.<exe>]` was consumed
+		 * and nothing was written. Same files as the D3D11/D3D12 legs and the
+		 * hub: `<path>` = the DP input (the atlas), `<path>.woven` = the shared
+		 * image as the app is about to present it. The DP's process_atlas
+		 * returns the target in PRESENT_SRC_KHR (xrt_display_processor_vk.h);
+		 * the blit fallback leaves it in GENERAL
+		 * (comp_vk_native_renderer_blit_to_shared). The dump restores it.
+		 */
+		if (u_capture_intent_should_capture(&c->capture_intent, MCP_CAPTURE_MODE_POST_COMPOSE)) {
+			char woven[MCP_CAPTURE_PATH_MAX + 16];
+			u_capture_intent_sibling_path(c->capture_intent.path, ".woven", woven, sizeof(woven));
+			const bool wok =
+			    weaving_done
+			        ? vk_native_dump_image_to_png(c, c->shared_image, tgt_width, tgt_height,
+			                                      VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+			                                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, false, woven)
+			        : vk_native_dump_image_to_png(c, c->shared_image, tgt_width, tgt_height,
+			                                      VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+			                                      VK_PIPELINE_STAGE_TRANSFER_BIT, false, woven);
+			vk_ws_stamp_wait_submitted(c);
+			const bool ok = vk_native_capture_atlas_to_png(c, c->capture_intent.path);
+			U_LOG_W("#2421 texture capture: DP input -> %s%s; post-weave %ux%u (the caller's image) -> %s%s",
+			        c->capture_intent.path, ok ? "" : " FAILED", tgt_width, tgt_height, woven,
+			        wok ? "" : " FAILED");
+			u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
+		}
 		return XRT_SUCCESS;
 	}
 

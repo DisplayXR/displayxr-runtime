@@ -7225,6 +7225,26 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// GPU-complete when the DP samples it during the call.
 		d3d12_sync_zone_mask_to_dp(c);
 
+		/*
+		 * #2421: the post-compose capture site for a client-presents session
+		 * (texture class). Both window exits below dispatch it; this branch
+		 * returned first, so a `displayxr_atlas_trigger[.<exe>]` was consumed
+		 * and nothing was written. Same files as the D3D11 legs and the hub:
+		 * `<path>` = the DP input (the atlas), `<path>.woven` = the shared
+		 * texture as the app is about to present it (GPU-complete: the wait
+		 * above).
+		 */
+		if (u_capture_intent_should_capture(&c->capture_intent, MCP_CAPTURE_MODE_POST_COMPOSE)) {
+			char woven[MCP_CAPTURE_PATH_MAX + 16];
+			u_capture_intent_sibling_path(c->capture_intent.path, ".woven", woven, sizeof(woven));
+			const bool wok =
+			    d3d12_capture_backbuffer_to_png(c, c->shared_texture, D3D12_RESOURCE_STATE_COMMON, woven);
+			const bool ok = d3d12_compositor_capture_atlas_to_png(c, c->capture_intent.path);
+			U_LOG_W("#2421 texture capture: DP input -> %s%s; post-weave (the caller's texture) -> %s%s",
+			        c->capture_intent.path, ok ? "" : " FAILED", woven, wok ? "" : " FAILED");
+			u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
+		}
+
 		return XRT_SUCCESS;
 	}
 
