@@ -154,26 +154,55 @@ target_screens_panel_from_claims_ex(const struct xrt_dp_factory_registry *reg,
                                     bool *out_overrides_origin,
                                     uint64_t *out_monitor_id);
 
+/*!
+ * #2305: the claimed panel is back where the plug-in itself says it is. True
+ * when @p prev_claim_monitor_id (the monitor the last resolve took by the
+ * claim rule) is no longer among the active plug-in's claims, and the
+ * plug-in's reported origin lies on a monitor it does claim now — the case in
+ * which the claim rule declines (the two sources agree) although a claim
+ * exists, so the origin rule lands on that claimed monitor.
+ *
+ * Seen on Windows (runtime #2311, Acer DS1 over HDMI): mid-replug, Windows
+ * reports the panel ALONE at (0, 0) for about a second, the claim rule takes
+ * it there (a new, position-derived monitor id), and when the layout returns
+ * the panel is claimed again under its own id at the plug-in's origin. Without
+ * this the re-resolve read "the claim is gone" and kept the transient (0, 0)
+ * rect for the rest of the session.
+ */
+bool
+target_screens_panel_claimed_at_origin(const struct xrt_dp_factory_registry *reg,
+                                       const char *active_plugin_id,
+                                       const struct os_display_panel_hint *hint,
+                                       uint64_t prev_claim_monitor_id);
+
 //! What a panel-rect re-resolve does (@ref target_screens_panel_reresolve_decide).
 enum target_panel_reresolve
 {
 	TARGET_PANEL_TAKE_CLAIM = 0,    //!< The claim rule resolved: publish it.
 	TARGET_PANEL_KEEP_PREVIOUS = 1, //!< The claimed panel vanished: keep the last rect.
-	TARGET_PANEL_TAKE_FALLBACK = 2, //!< No claim now or before: origin / size / primary, as always.
+	TARGET_PANEL_TAKE_FALLBACK = 2, //!< No claim now or before, or the panel is back at the plug-in's
+	                                //!< origin: origin / size / primary, as always.
 };
 
 /*!
  * Pure (#2305): on a re-resolve (hotplug sweep, world event — never the first
  * resolve), the panel rect never falls from a claimed monitor to the origin /
- * size / primary rules — those can land on an unclaimed or virtual monitor.
+ * size / primary rules — those can land on an unclaimed or virtual monitor —
+ * unless the plug-in's own origin is on a monitor it claims again.
  *
  * @param prev_claim_monitor_id  The registry monitor the last resolve took by
  *                               the claim rule; 0 when it took another rule.
  * @param same_active_plugin     The active plug-in is the one that claimed it.
  * @param claim_resolved         The claim rule resolved now.
+ * @param claimed_at_origin      @ref target_screens_panel_claimed_at_origin:
+ *                               the claim rule declined only because the
+ *                               plug-in's origin is on a monitor it claims.
  */
 enum target_panel_reresolve
-target_screens_panel_reresolve_decide(uint64_t prev_claim_monitor_id, bool same_active_plugin, bool claim_resolved);
+target_screens_panel_reresolve_decide(uint64_t prev_claim_monitor_id,
+                                      bool same_active_plugin,
+                                      bool claim_resolved,
+                                      bool claimed_at_origin);
 
 #ifdef __cplusplus
 }

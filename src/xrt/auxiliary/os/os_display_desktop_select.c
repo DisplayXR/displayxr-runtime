@@ -214,6 +214,28 @@ claim_contains(const struct os_display_panel_claim *c, int32_t x, int32_t y)
 	       (int64_t)x < (int64_t)c->left + (int64_t)c->width && (int64_t)y < (int64_t)c->top + (int64_t)c->height;
 }
 
+static bool
+hint_has_origin(const struct os_display_panel_hint *hint)
+{
+	return hint != NULL && (hint->screen_left != 0 || hint->screen_top != 0);
+}
+
+bool
+os_display_desktop_origin_on_claim(const struct os_display_panel_claim *claims,
+                                   uint32_t count,
+                                   const struct os_display_panel_hint *hint)
+{
+	if (claims == NULL || !hint_has_origin(hint)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (claim_contains(&claims[i], hint->screen_left, hint->screen_top)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 int32_t
 os_display_desktop_select_claim(const struct os_display_panel_claim *claims,
                                 uint32_t count,
@@ -227,15 +249,16 @@ os_display_desktop_select_claim(const struct os_display_panel_claim *claims,
 		return -1;
 	}
 
-	const bool have_origin = hint != NULL && (hint->screen_left != 0 || hint->screen_top != 0);
+	// The plug-in's origin is on a monitor it claims: the two sources agree,
+	// and the origin rule keeps the answer it always gave.
+	if (os_display_desktop_origin_on_claim(claims, count, hint)) {
+		return -1;
+	}
+
+	const bool have_origin = hint_has_origin(hint);
 	bool any_verified = false;
 	for (uint32_t i = 0; i < count; i++) {
 		any_verified = any_verified || claims[i].verified;
-		// The plug-in's origin is on a monitor it claims: the two sources
-		// agree, and the origin rule keeps the answer it always gave.
-		if (have_origin && claim_contains(&claims[i], hint->screen_left, hint->screen_top)) {
-			return -1;
-		}
 	}
 
 	// An origin on none of the claimed monitors is the plug-in contradicting

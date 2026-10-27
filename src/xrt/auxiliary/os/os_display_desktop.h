@@ -417,6 +417,21 @@ os_display_desktop_select_claim(const struct os_display_panel_claim *claims,
                                 bool *out_overrides_origin);
 
 /*!
+ * Does the plug-in's reported origin lie on one of the monitors it claims?
+ * That is the one case in which @ref os_display_desktop_select_claim declines
+ * although claims exist (the two sources agree, so the origin rule stays in
+ * charge). Pure; the same "(0, 0) = no origin" reading as the selector.
+ *
+ * A hotplug re-resolve (#2305) needs to tell this apart from "no claim at
+ * all": here the claimed panel is where the plug-in says it is; there the
+ * panel is gone.
+ */
+bool
+os_display_desktop_origin_on_claim(const struct os_display_panel_claim *claims,
+                                   uint32_t count,
+                                   const struct os_display_panel_hint *hint);
+
+/*!
  * Resolve one monitor by OS identity instead of by a point: the platform
  * handle when there is one (Windows: the HMONITOR from the EDID enumeration,
  * resolved under a pinned per-monitor-v2 context, so the rect is physical

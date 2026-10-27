@@ -403,13 +403,44 @@ target_screens_panel_from_claims_ex(const struct xrt_dp_factory_registry *reg,
 	return true;
 }
 
+bool
+target_screens_panel_claimed_at_origin(const struct xrt_dp_factory_registry *reg,
+                                       const char *active_plugin_id,
+                                       const struct os_display_panel_hint *hint,
+                                       uint64_t prev_claim_monitor_id)
+{
+	struct os_display_panel_claim claims[XRT_DP_REGISTRY_MAX_ENTRIES];
+	uint64_t ids[XRT_DP_REGISTRY_MAX_ENTRIES];
+	const uint32_t n = collect_panel_claims(reg, active_plugin_id, claims, NULL, ids, XRT_DP_REGISTRY_MAX_ENTRIES);
+	for (uint32_t i = 0; i < n; i++) {
+		if (prev_claim_monitor_id != 0 && ids[i] == prev_claim_monitor_id) {
+			// The previous pick is still claimed: not a return under another
+			// identity (two panels of one vendor keep the incumbent's rect).
+			return false;
+		}
+	}
+	return os_display_desktop_origin_on_claim(claims, n, hint);
+}
+
 enum target_panel_reresolve
-target_screens_panel_reresolve_decide(uint64_t prev_claim_monitor_id, bool same_active_plugin, bool claim_resolved)
+target_screens_panel_reresolve_decide(uint64_t prev_claim_monitor_id,
+                                      bool same_active_plugin,
+                                      bool claim_resolved,
+                                      bool claimed_at_origin)
 {
 	if (claim_resolved) {
 		return TARGET_PANEL_TAKE_CLAIM;
 	}
 	if (prev_claim_monitor_id != 0 && same_active_plugin) {
+		if (claimed_at_origin) {
+			// The claim rule declined only because the plug-in's own origin
+			// is on a monitor it claims again: the panel is back, and the
+			// origin rule lands on that claimed monitor. Keeping the last
+			// rect here would pin a transient one (Windows mid-replug shows
+			// the panel alone at (0, 0)) for the rest of the session, since
+			// the claim rule never fires while the two sources agree.
+			return TARGET_PANEL_TAKE_FALLBACK;
+		}
 		// The rect came from the active plug-in's own claim and that claim is
 		// gone (the panel unplugged, its vendor service restarting, a cable
 		// blink): keep the last panel rect rather than fall to the origin /
