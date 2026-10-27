@@ -3283,6 +3283,23 @@ locate_resolve_canvas(struct oxr_session *sess,
 	out->canvas.has_orientation = win_has_orientation;
 }
 
+struct xrt_pose g_inv2322_view_centre = XRT_POSE_IDENTITY; // INVESTIGATION (#2322)
+struct xrt_pose g_inv2322_view_centre_comp = XRT_POSE_IDENTITY;
+bool g_inv2322_view_valid = false;
+
+/* #2322 dev knob (#2322): DXR_HOSTED_RAW_VIEWS=1 makes a hosted session take the RAW
+ * (display-plane-relative) view contract exactly like a handle app. Investigation only. */
+static bool
+inv2322_hosted_raw_views(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		const char *e = getenv("DXR_HOSTED_RAW_VIEWS");
+		v = (e != NULL && *e != '\0' && *e != '0') ? 1 : 0;
+	}
+	return v == 1;
+}
+
 static XrResult
 locate_views_one(struct oxr_logger *log,
                  struct oxr_session *sess,
@@ -3516,7 +3533,7 @@ locate_views_one(struct oxr_logger *log,
 	bool qwerty_display = false;
 	if (rig_camera || rig_display) {
 		active_rig = &sess->view_rig;
-	} else if (have_view_state && !sess->has_external_window) {
+	} else if (have_view_state && !sess->has_external_window && !inv2322_hosted_raw_views()) {
 		qwerty_rig = (struct oxr_view_rig_state){
 		    .type = view_state.camera_mode ? OXR_VIEW_RIG_CAMERA : OXR_VIEW_RIG_DISPLAY,
 		    .ipd_factor = view_state.ipd_factor,
@@ -3692,7 +3709,7 @@ locate_views_one(struct oxr_logger *log,
 	// Bridge-relay sessions (headless, XR_DXR_display_info) forward raw
 	// DP-tracked eye positions to a browser app; treat them like handle
 	// apps (display-local views) and keep the display plane at the origin.
-	if (!sess->has_external_window && !sess->is_bridge_relay) {
+	if (!sess->has_external_window && !sess->is_bridge_relay && !inv2322_hosted_raw_views()) {
 		struct xrt_space_relation display_relation = XRT_SPACE_RELATION_ZERO;
 		xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &display_relation);
 		world_head_pos = display_relation.pose.position;
@@ -4078,7 +4095,7 @@ locate_views_one(struct oxr_logger *log,
 			// verbatim whatever the locate space (displayPlanePose says where
 			// that plane is in the locate space). FOVs come from the device.
 			// Skip in IPC/workspace mode: the server provides them in view poses.
-			if ((sess->has_external_window || sess->is_bridge_relay) && !have_eye_override && have_eyes) {
+			if ((sess->has_external_window || sess->is_bridge_relay || inv2322_hosted_raw_views()) && !have_eye_override && have_eyes) {
 				for (uint32_t ei = 0; ei < eye_count; ei++) {
 					view_eye_world[ei] = (struct xrt_vec3){
 					    adj_eyes[ei].x, adj_eyes[ei].y, adj_eyes[ei].z};
@@ -4451,7 +4468,7 @@ locate_views_one(struct oxr_logger *log,
 		// T_xdev_head-only chain / the non-Windows service-mode skip): it
 		// re-added the standing height for one class of in-tree test cube, and
 		// those cubes now simply locate in STAGE.
-		const bool server_display_relative = sess->has_external_window || sess->is_bridge_relay;
+		const bool server_display_relative = sess->has_external_window || sess->is_bridge_relay || inv2322_hosted_raw_views();
 		if (server_display_relative && !have_eyes && !have_eye_override) {
 			// Use server poses directly (display-plane-relative)
 			result.pose = view_pose;
@@ -4539,7 +4556,7 @@ locate_views_one(struct oxr_logger *log,
 					tracked_eye = (struct xrt_vec3){0, 0, 0.5f};
 				}
 
-				if (!sess->has_external_window && !sess->is_bridge_relay) {
+				if (!sess->has_external_window && !sess->is_bridge_relay && !inv2322_hosted_raw_views()) {
 					// DISPLAY MODE (runtime window): compose the tracked eye
 					// on the display-plane pose (tracking-origin space).
 					struct xrt_vec3 rotated_eye;
@@ -4865,6 +4882,23 @@ locate_views_one(struct oxr_logger *log,
 		oxr_slog_cancel(&slog);
 	}
 
+	if (views != NULL && *viewCountOutput >= 2) { // INVESTIGATION (#2322): cache the located view centre for the head-locked quad repair
+		g_inv2322_view_centre.orientation = *(struct xrt_quat *)&views[0].pose.orientation;
+		g_inv2322_view_centre.position.x = 0.5f * (views[0].pose.position.x + views[1].pose.position.x);
+		g_inv2322_view_centre.position.y = 0.5f * (views[0].pose.position.y + views[1].pose.position.y);
+		g_inv2322_view_centre.position.z = 0.5f * (views[0].pose.position.z + views[1].pose.position.z);
+		// Convert to the compositor (root) frame NOW, while baseSpc is certainly alive;
+		// a cached space pointer crashed in oxr_space_locate_device a frame later.
+		if (baseSpc != NULL && baseSpc->space_type != OXR_SPACE_TYPE_REFERENCE_VIEW) {
+			struct xrt_pose comp;
+			if (oxr_session_layer_pose_in_compositor_frame(log, sess, baseSpc, &g_inv2322_view_centre,
+			                                               viewLocateInfo->displayTime, &comp)) {
+				g_inv2322_view_centre_comp = comp;
+				g_inv2322_view_valid = true;
+			}
+		}
+	}
+	{ static int ssd_n = 0; if (ssd_n < 3 && views != NULL) { ssd_n++; for (uint32_t _i = 0; _i < 2; _i++) { U_LOG_W("SSDIAG locate_views_one[%u]: pos=(%.3f,%.3f,%.3f) ori=(%.3f,%.3f,%.3f,%.3f) fov=(%.3f,%.3f,%.3f,%.3f)", _i, views[_i].pose.position.x, views[_i].pose.position.y, views[_i].pose.position.z, views[_i].pose.orientation.x, views[_i].pose.orientation.y, views[_i].pose.orientation.z, views[_i].pose.orientation.w, views[_i].fov.angleLeft, views[_i].fov.angleRight, views[_i].fov.angleUp, views[_i].fov.angleDown); } } }
 	return oxr_session_success_result(sess);
 }
 
@@ -5334,6 +5368,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 	oxr_segment_views_route_record(&sess->seg_route, &route);
 	locate_fill_bindings(sess, viewState, &route);
+	{ static int ssd_n = 0; if (ssd_n < 3 && views != NULL && viewCountOutput != NULL) { ssd_n++; for (uint32_t _i = 0; _i < *viewCountOutput && _i < 4; _i++) { U_LOG_W("SSDIAG locateViews[%u]: pos=(%.3f,%.3f,%.3f) ori=(%.3f,%.3f,%.3f,%.3f) fov=(%.3f,%.3f,%.3f,%.3f) flags=0x%llx", _i, views[_i].pose.position.x, views[_i].pose.position.y, views[_i].pose.position.z, views[_i].pose.orientation.x, views[_i].pose.orientation.y, views[_i].pose.orientation.z, views[_i].pose.orientation.w, views[_i].fov.angleLeft, views[_i].fov.angleRight, views[_i].fov.angleUp, views[_i].fov.angleDown, (unsigned long long)(viewState ? viewState->viewStateFlags : 0)); } } }
 	return oxr_session_success_result(sess);
 }
 
@@ -7542,7 +7577,7 @@ hand_joints_resolve_rig(struct oxr_logger *log,
 			}
 		}
 		oxr_session_get_nominal_viewer(sess, &out_canvas->nominal_y_m, &out_canvas->nominal_z_m);
-		if (!sess->has_external_window && !sess->is_bridge_relay) {
+		if (!sess->has_external_window && !sess->is_bridge_relay && !inv2322_hosted_raw_views()) {
 			struct xrt_space_relation dr = XRT_SPACE_RELATION_ZERO;
 			const int64_t t_ns = time_state_ts_to_monotonic_ns(sess->sys->inst->timekeeping, at_time);
 			xrt_device_get_tracked_pose(head, XRT_INPUT_GENERIC_HEAD_POSE, t_ns, &dr);

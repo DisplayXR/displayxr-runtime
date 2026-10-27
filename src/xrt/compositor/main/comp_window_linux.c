@@ -32,6 +32,8 @@
 #include "main/comp_window_linux_private.h"
 
 #include <vulkan/vulkan_xcb.h>
+#include <X11/Xlib.h>
+#include <vulkan/vulkan_xlib.h> // #2322 prototype
 #include <xcb/xcb.h>
 #include <xcb/randr.h>
 
@@ -835,6 +837,35 @@ comp_window_linux_init_post_vulkan(struct comp_target *ct, uint32_t width, uint3
 		pfn = (PFN_vkCreateXcbSurfaceKHR)vk->vkGetInstanceProcAddr(vk->instance, "vkCreateXcbSurfaceKHR");
 	}
 	if (pfn == NULL) {
+		// #2322 prototype: under Wine/Proton the app's VkInstance comes from
+		// winevulkan, which only ever enables VK_KHR_xlib_surface on the host side.
+		// Fall back to an Xlib surface on the same XID (XIDs are server-global).
+		PFN_vkCreateXlibSurfaceKHR pfn_xlib =
+		    (PFN_vkCreateXlibSurfaceKHR)vk->vkGetInstanceProcAddr(vk->instance, "vkCreateXlibSurfaceKHR");
+		if (pfn_xlib != NULL) {
+			static Display *xlib_dpy = NULL;
+			if (xlib_dpy == NULL) {
+				xlib_dpy = XOpenDisplay(NULL);
+			}
+			if (xlib_dpy != NULL) {
+				VkXlibSurfaceCreateInfoKHR xinfo = {
+				    .sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
+				    .dpy = xlib_dpy,
+				    .window = (Window)cwl->window,
+				};
+				VkResult xret = pfn_xlib(vk->instance, &xinfo, NULL, &cwl->base.surface.handle);
+				if (xret == VK_SUCCESS) {
+					U_LOG_W("comp_window_linux: #2322 — no VK_KHR_xcb_surface on this instance; created an "
+					        "Xlib surface on window 0x%08x instead", cwl->window);
+					pthread_mutex_lock(&cwl->lock);
+					ct->width = cwl->width;
+					ct->height = cwl->height;
+					pthread_mutex_unlock(&cwl->lock);
+					return true;
+				}
+				U_LOG_E("comp_window_linux: vkCreateXlibSurfaceKHR: %s", vk_result_string(xret));
+			}
+		}
 		U_LOG_E("comp_window_linux: vkCreateXcbSurfaceKHR unavailable — VK_KHR_xcb_surface must be enabled");
 		return false;
 	}

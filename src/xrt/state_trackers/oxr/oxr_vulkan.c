@@ -83,10 +83,35 @@ oxr_vk_get_instance_exts(struct oxr_logger *log,
                          uint32_t *namesCountOutput,
                          char *namesString)
 {
-	size_t length = strlen(xrt_gfx_vk_instance_extensions) + 1;
+	// INVESTIGATION KNOB (#2322 T1, local only, not for merge): under
+	// Wine/Proton the app's VkInstance is winevulkan's, which cannot enable the
+	// Linux WSI names (VK_KHR_xcb_surface / VK_KHR_wayland_surface) - wineopenxr's
+	// probe then fails vkCreateInstance with VK_ERROR_EXTENSION_NOT_PRESENT. With
+	// DXR_VK_INSTANCE_EXTS_NO_WSI=1 the enable1 answer omits them; only valid on
+	// the IPC route, where the client never creates a VkSurfaceKHR.
+	static char no_wsi_buf[512];
+	const char *answer = xrt_gfx_vk_instance_extensions;
+	const char *no_wsi = getenv("DXR_VK_INSTANCE_EXTS_NO_WSI");
+	if (no_wsi != NULL && no_wsi[0] == '1') {
+		char tmp[512];
+		no_wsi_buf[0] = '\0';
+		snprintf(tmp, sizeof(tmp), "%s", xrt_gfx_vk_instance_extensions);
+		for (char *tok = strtok(tmp, " "); tok != NULL; tok = strtok(NULL, " ")) {
+			if (strcmp(tok, "VK_KHR_xcb_surface") == 0 || strcmp(tok, "VK_KHR_wayland_surface") == 0 ||
+			    strcmp(tok, "VK_KHR_xlib_surface") == 0 || strcmp(tok, "VK_KHR_surface") == 0) {
+				continue;
+			}
+			if (no_wsi_buf[0] != '\0') {
+				strncat(no_wsi_buf, " ", sizeof(no_wsi_buf) - strlen(no_wsi_buf) - 1);
+			}
+			strncat(no_wsi_buf, tok, sizeof(no_wsi_buf) - strlen(no_wsi_buf) - 1);
+		}
+		answer = no_wsi_buf;
+		U_LOG_W("DXR_VK_INSTANCE_EXTS_NO_WSI=1: enable1 instance extensions = '%s'", answer);
+	}
+	size_t length = strlen(answer) + 1;
 
-	OXR_TWO_CALL_HELPER(log, namesCapacityInput, namesCountOutput, namesString, length,
-	                    xrt_gfx_vk_instance_extensions, XR_SUCCESS);
+	OXR_TWO_CALL_HELPER(log, namesCapacityInput, namesCountOutput, namesString, length, answer, XR_SUCCESS);
 }
 
 /*!

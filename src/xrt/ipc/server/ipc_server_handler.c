@@ -8692,6 +8692,7 @@ ipc_handle_device_get_view_poses(volatile struct ipc_client_state *ics,
                                  int64_t at_timestamp_ns,
                                  uint32_t view_count)
 {
+	static int ssd_force_qwerty = -1; if (ssd_force_qwerty < 0) { ssd_force_qwerty = getenv("DXR_IPC_LEGACY_QWERTY_VIEWS") != NULL; if (ssd_force_qwerty) IPC_WARN(ics->server, "SSDIAG: DXR_IPC_LEGACY_QWERTY_VIEWS set — view poses from the head device, not SR/oop"); }
 	struct ipc_message_channel *imc = (struct ipc_message_channel *)&ics->imc;
 	struct ipc_device_get_view_poses_reply reply = XRT_STRUCT_INIT;
 	struct ipc_server *s = ics->server;
@@ -8717,14 +8718,14 @@ ipc_handle_device_get_view_poses(volatile struct ipc_client_state *ics,
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Try SR-aware view poses first (pass client compositor for per-client window metrics)
-	if (ipc_try_get_sr_view_poses(ics, (struct xrt_compositor *)ics->xc, xdev, fallback_eye_relation, at_timestamp_ns,
+	if (!ssd_force_qwerty && ipc_try_get_sr_view_poses(ics, (struct xrt_compositor *)ics->xc, xdev, fallback_eye_relation, at_timestamp_ns,
 	                               view_count, NULL, NULL, &reply.head_relation, fovs, poses)) {
 		reply.result = XRT_SUCCESS;
 	} else
 #elif defined(COMP_MULTI_SHARED_SURFACE)
 	// Out-of-process macOS (#48): DP-sourced server-side Kooima (see
 	// ipc_handle_device_get_view_poses_2 for the rationale).
-	if (ipc_try_get_oop_view_poses(ics, xdev, fallback_eye_relation, at_timestamp_ns, view_count, NULL, NULL,
+	if (!ssd_force_qwerty && ipc_try_get_oop_view_poses(ics, xdev, fallback_eye_relation, at_timestamp_ns, view_count, NULL, NULL,
 	                               &reply.head_relation, fovs, poses)) {
 		reply.result = XRT_SUCCESS;
 	} else

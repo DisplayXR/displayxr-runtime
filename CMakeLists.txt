@@ -226,7 +226,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	# `REQUIRED`; relaxed for the Linux bring-up. See docs/roadmap/linux-support.md.
 	find_package(udev)
 	if(PKGCONFIG_FOUND)
-		pkg_check_modules(XCB xcb xcb-randr x11-xcb)
+		pkg_check_modules(XCB xcb xcb-randr xcb-shape x11-xcb)
 		# Xlib + Xrandr: only needed for the direct-scanout present path
 		# (VK_EXT_acquire_xlib_display steals a RandR output as a VkDisplayKHR,
 		# bypassing Xorg/compositor — ST-5539). Optional; absence just leaves

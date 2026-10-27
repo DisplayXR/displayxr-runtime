@@ -2938,6 +2938,23 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 				 * composited: it drew nothing, so the next layer
 				 * is still the first one in.
 				 */
+				{
+					// INVESTIGATION (#2322, local only): where did the quad land?
+					static int s_qdiag = 0;
+					if (s_qdiag < 4) {
+						s_qdiag++;
+						const struct xrt_pose *qp = &layer->data.quad.pose;
+						U_LOG_W("#2322 qdraw eye=%u quad pos=(%.3f,%.3f,%.3f) ori=(%.3f,%.3f,%.3f,%.3f) "
+						        "size=(%.3f,%.3f) cam=(%.3f,%.3f,%.3f) front=%d rect=(%d,%d %dx%d) sc=%p",
+						        eye, qp->position.x, qp->position.y, qp->position.z, qp->orientation.x,
+						        qp->orientation.y, qp->orientation.z, qp->orientation.w, layer->data.quad.size.x,
+						        layer->data.quad.size.y, cams[eye].pose.position.x, cams[eye].pose.position.y,
+						        cams[eye].pose.position.z,
+						        (int)comp_layer_quad_is_front_facing(qp, &cams[eye].pose.position),
+						        sub->rect.offset.w, sub->rect.offset.h, sub->rect.extent.w, sub->rect.extent.h,
+						        (void *)xsc);
+					}
+				}
 				if (!comp_layer_quad_is_front_facing(&layer->data.quad.pose,
 				                                     &cams[eye].pose.position)) {
 					continue;

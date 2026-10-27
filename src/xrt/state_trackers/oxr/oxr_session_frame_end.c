@@ -520,6 +520,14 @@ verify_space(struct oxr_logger *log, uint32_t layer_index, XrSpace space)
 	return XR_SUCCESS;
 }
 
+// INVESTIGATION (#2322, local only): quads whose struct arrived garbled and
+// were given defaults; submit_quad_layer head-locks them so the UI is visible.
+extern struct xrt_pose g_inv2322_view_centre; // INVESTIGATION (#2322), set in oxr_session.c
+extern struct xrt_pose g_inv2322_view_centre_comp;
+extern bool g_inv2322_view_valid;
+static const void *g_inv2322_fixed_quads[8];
+static uint32_t g_inv2322_fixed_quad_count;
+
 static XrResult
 verify_quad_layer(struct oxr_session *sess,
                   struct xrt_compositor *xc,
@@ -546,6 +554,51 @@ verify_quad_layer(struct oxr_session *sess,
 		return ret;
 	}
 
+	// INVESTIGATION (#2322 T2, local only): a quad layer arriving through wineopenxr
+	// can carry a garbage pose; rather than refusing the whole frame, reset it to identity.
+	if (!math_quat_validate_within_1_percent((struct xrt_quat *)&quad->pose.orientation) ||
+	    !math_vec3_validate((struct xrt_vec3 *)&quad->pose.position)) {
+		static int fixed = 0;
+		if (fixed < 3) {
+			fixed++;
+			U_LOG_W("#2322 quad[%u]: invalid pose pos=(%f,%f,%f) q=(%f,%f,%f,%f) -> identity", layer_index,
+			        quad->pose.position.x, quad->pose.position.y, quad->pose.position.z, quad->pose.orientation.x,
+			        quad->pose.orientation.y, quad->pose.orientation.z, quad->pose.orientation.w);
+		}
+		XrCompositionLayerQuad *wq = (XrCompositionLayerQuad *)quad;
+		wq->pose.position = (XrVector3f){0.0f, 0.0f, -1.0f};
+		wq->pose.orientation = (XrQuaternionf){0.0f, 0.0f, 0.0f, 1.0f};
+		// The rest of the struct is garbage too in this failure mode: take the
+		// full swapchain as the source rect and a 1 m-wide head-locked quad.
+		if (wq->subImage.imageRect.extent.width <= 0 || wq->subImage.imageRect.extent.height <= 0) {
+			wq->subImage.imageRect.offset = (XrOffset2Di){0, 0};
+			wq->subImage.imageRect.extent = (XrExtent2Di){(int32_t)sc->width, (int32_t)sc->height};
+		}
+		wq->subImage.imageArrayIndex = 0;
+		if (!(wq->size.width > 0.0f) || !(wq->size.height > 0.0f) || !isfinite(wq->size.width) ||
+		    !isfinite(wq->size.height)) {
+			float aspect = sc->height > 0 ? (float)sc->width / (float)sc->height : 1.0f;
+			wq->size = (XrExtent2Df){1.0f, 1.0f / (aspect > 0.0f ? aspect : 1.0f)};
+		}
+		wq->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+		if (g_inv2322_fixed_quad_count < 8) {
+			g_inv2322_fixed_quads[g_inv2322_fixed_quad_count++] = wq;
+		}
+		{
+			struct oxr_space *qspc = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_space *, wq->space);
+			static int s_sp = 0;
+			if (s_sp < 2) {
+				s_sp++;
+				U_LOG_W("#2322 quad[%u]: space=%p type=%d (ref/action) sc=%ux%u -> rect %dx%d size %.2fx%.2f",
+				        layer_index, (void *)qspc, qspc ? (int)qspc->space_type : -1, sc->width, sc->height,
+				        wq->subImage.imageRect.extent.width, wq->subImage.imageRect.extent.height, wq->size.width,
+				        wq->size.height);
+			}
+		}
+		if (wq->space == XR_NULL_HANDLE) {
+			// no space: leave it, the verifier below reports it
+		}
+	}
 	if (!math_quat_validate_within_1_percent((struct xrt_quat *)&quad->pose.orientation)) {
 		XrQuaternionf *q = &quad->pose.orientation;
 		return layer_error_throttled(
@@ -562,10 +615,21 @@ verify_quad_layer(struct oxr_session *sess,
 	}
 
 	if (sc->array_layer_count <= quad->subImage.imageArrayIndex) {
-		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-		                 "(frameEndInfo->layers[%u]->subImage.imageArrayIndex == %u) Invalid swapchain array "
-		                 "index for quad layer (%u).",
-		                 layer_index, quad->subImage.imageArrayIndex, sc->array_layer_count);
+		// INVESTIGATION (#2322 T2, local only): log the raw quad fields and tolerate
+		// an out-of-range array index by treating it as 0.
+		static int dumped = 0;
+		if (dumped < 3) {
+			dumped++;
+			U_LOG_W("#2322 quad[%u]: flags=0x%llx space=%p eyeVisibility=%d swapchain=%p rect=(%d,%d %dx%d) "
+			        "arrayIndex=%u pose=(%f,%f,%f) q=(%f,%f,%f,%f) size=(%f,%f) sc_layers=%u",
+			        layer_index, (unsigned long long)quad->layerFlags, (void *)quad->space, (int)quad->eyeVisibility,
+			        (void *)quad->subImage.swapchain, quad->subImage.imageRect.offset.x, quad->subImage.imageRect.offset.y,
+			        quad->subImage.imageRect.extent.width, quad->subImage.imageRect.extent.height,
+			        quad->subImage.imageArrayIndex, quad->pose.position.x, quad->pose.position.y, quad->pose.position.z,
+			        quad->pose.orientation.x, quad->pose.orientation.y, quad->pose.orientation.z, quad->pose.orientation.w,
+			        quad->size.width, quad->size.height, sc->array_layer_count);
+		}
+		((XrCompositionLayerQuad *)quad)->subImage.imageArrayIndex = 0;
 	}
 
 	if (sc->face_count != 1) {
@@ -1877,6 +1941,32 @@ submit_quad_layer(struct oxr_session *sess,
 
 	if (spc->space_type == OXR_SPACE_TYPE_REFERENCE_VIEW) {
 		flags |= XRT_LAYER_COMPOSITION_VIEW_SPACE_BIT;
+	}
+
+	// INVESTIGATION (#2322, local only): a repaired quad is head-locked —
+	// 1.2 m ahead of the head, centred on the (downward-looking) view axis.
+	bool inv2322_fixed = false;
+	for (uint32_t i = 0; i < g_inv2322_fixed_quad_count; i++) {
+		if (g_inv2322_fixed_quads[i] == quad) {
+			inv2322_fixed = true;
+		}
+	}
+	// INVESTIGATION (#2322): the mod's own UI quad arrives 5.8 m wide at head+1.5 m
+	// through the Proton bridge and blacks out the view — head-lock EVERY quad.
+	inv2322_fixed = (sc != NULL && sc->width > 0 && sc->height > 0);
+	if (inv2322_fixed && head != NULL) {
+		// Place the quad relative to the LOCATED view centre (what the compositor's
+		// cameras are built from, #1580), in the app's locate space, then convert
+		// with the same helper every layer pose goes through.
+		struct xrt_pose local = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, -0.05f, -1.2f}};
+		if (g_inv2322_view_valid) {
+			math_pose_transform(&g_inv2322_view_centre_comp, &local, &pose);
+		} else {
+			pose = local;
+			flags |= XRT_LAYER_COMPOSITION_VIEW_SPACE_BIT;
+		}
+		quad->size.width = 1.0f;
+		quad->size.height = 1.0f * ((float)sc->height / (float)(sc->width > 0 ? sc->width : 1));
 	}
 
 	struct xrt_layer_data data;
@@ -3257,6 +3347,8 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	}
 #endif
 
+	uint64_t inv2322_dropped_mask = 0; // INVESTIGATION (#2322 T2, local only)
+	g_inv2322_fixed_quad_count = 0;
 	for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
 		const XrCompositionLayerBaseHeader *layer = frameEndInfo->layers[i];
 		if (layer == NULL) {
@@ -3307,12 +3399,26 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			break;
 #endif // OXR_HAVE_DXR_local_3d_zone
 		default:
-			return oxr_error(log, XR_ERROR_LAYER_INVALID,
-			                 "(frameEndInfo->layers[%u]->type) layer type not supported (%u)", i,
-			                 layer->type);
+			// INVESTIGATION (#2322 T2, local only): fall through to the drop logic.
+			res = oxr_error(log, XR_ERROR_LAYER_INVALID,
+			                "(frameEndInfo->layers[%u]->type) layer type not supported (%u)", i,
+			                layer->type);
+			break;
 		}
 
 		if (res != XR_SUCCESS) {
+			// INVESTIGATION (#2322 T2, local only): a non-projection layer that
+			// arrives garbled (wineopenxr thunk) is dropped instead of refusing the frame.
+			if (layer->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION && i < 64) {
+				static int dropped_logged = 0;
+				if (dropped_logged < 3) {
+					dropped_logged++;
+					U_LOG_W("#2322: dropping layer[%u] type=%d (verify failed %d)", i, (int)layer->type,
+					        (int)res);
+				}
+				inv2322_dropped_mask |= (1ull << i);
+				continue;
+			}
 			return res;
 		}
 	}
@@ -3475,6 +3581,9 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
 		const XrCompositionLayerBaseHeader *layer = frameEndInfo->layers[i];
 		assert(layer != NULL);
+		if (i < 64 && (inv2322_dropped_mask & (1ull << i))) {
+			continue; // INVESTIGATION (#2322 T2, local only)
+		}
 
 		switch (layer->type) {
 		case XR_TYPE_COMPOSITION_LAYER_PROJECTION:

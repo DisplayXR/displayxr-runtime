@@ -100,6 +100,7 @@
 
 #ifdef XRT_GRAPHICS_SYNC_HANDLE_IS_FD
 #include <unistd.h>
+#include "comp_multi_weave_capture.h" // #2322 diag
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -5478,6 +5479,9 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	}
 
 	// Collect the clients to composite this frame (active, visible, with content).
+	static uint32_t ssd_frame = 0; ssd_frame++; const bool ssd_on = (ssd_frame <= 5) || (ssd_frame % 120) == 0;
+#define SSD(...) do { if (ssd_on) U_LOG_W("SSDIAG " __VA_ARGS__); } while (0)
+	static struct comp_multi_weave_capture ssd_cap; // #2322 diag: shared-surface capture
 	struct shared_client_render order[MULTI_MAX_CLIENTS];
 	uint32_t order_count = 0;
 	// #1005: the frame's snapshot, not msc->clients (list_and_timing_lock is
@@ -5493,6 +5497,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 			continue;
 		}
 		if (!mc->delivered.active || mc->delivered.layer_count == 0) {
+			SSD("skip client %p: delivered.active=%d layer_count=%u", (void *)mc, mc->delivered.active, mc->delivered.layer_count);
 			continue;
 		}
 		struct multi_layer_entry *layer = NULL;
@@ -5504,6 +5509,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 			}
 		}
 		if (layer == NULL) {
+			SSD("skip client %p: no projection/zone layer among %u (type0=%d)", (void *)mc, mc->delivered.layer_count, (int)mc->delivered.layers[0].data.type);
 			continue;
 		}
 
@@ -5531,6 +5537,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 		}
 
 		struct shared_client_render *e = &order[order_count++];
+		SSD("collect client %p as order[%u]: layer type=%d views=%u", (void *)mc, order_count-1, (int)layer->data.type, layer->data.view_count);
 		e->mc = mc;
 		e->layer = layer;
 		e->slot = (int)k;
@@ -5571,6 +5578,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 		e->win_y = wy;
 		e->win_w = ww;
 		e->win_h = wh;
+		SSD("  client %p: placed=%d win_px=(%d,%d %dx%d) win_m=%.3fx%.3f pose=(%.3f,%.3f,%.3f)", (void *)e->mc, e->placed, e->win_x, e->win_y, e->win_w, e->win_h, e->win_w_m, e->win_h_m, e->pose_x, e->pose_y, e->pose_z);
 	}
 
 	// Lazy-init the shared window/DP once a client is present. Avoids creating a
@@ -5586,6 +5594,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	// Without this, toggling the shell off left the borderless full-screen window
 	// up showing its last (empty) frame as a black screen with no way to escape.
 	bool should_show = (order_count > 0) || msc->workspace_active;
+	SSD("frame %u: order_count=%u workspace_active=%d should_show=%d surface_init=%d", ssd_frame, order_count, msc->workspace_active, should_show, msc->shared_surface_initialized);
 	if (!should_show && !msc->shared_surface_initialized) {
 		return; // nothing to show yet, never initialized
 	}
@@ -5709,6 +5718,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 			        (double)(os_monotonic_get_ns() - msc->shared_gpu_stalled_since_ns) / 1e9);
 		}
 		msc->shared_fenced_buffer = -1;
+		if (ssd_cap.target[1].recorded || ssd_cap.target[2].recorded) { comp_multi_weave_capture_finish(&ssd_cap, vk, "shared-surface"); }
 	}
 
 	// Frame pacing (the shared target is the only consumer; it must drive pacing).
@@ -5720,6 +5730,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 		comp_target_mark_begin(ct, frame_id, now_ns);
 	}
 
+	const bool ssd_capturing = comp_multi_weave_capture_begin(&ssd_cap, vk); if (ssd_capturing) U_LOG_W("SSDIAG capture armed this frame");
 	uint32_t buffer_index = 0;
 	ct->acquire_timeout_ns = MULTI_ACQUIRE_TIMEOUT_NS; // #1007
 	VkResult ret = comp_target_acquire(ct, &buffer_index);
@@ -6011,6 +6022,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 				VkImage im = VK_NULL_HANDLE;
 				uint32_t ai = 0;
 				if (!get_session_layer_view(e->layer, v, &tw, &th, &fmt, &iv, &im, &ai)) {
+					SSD("  draw c%u eye%u v%u: get_session_layer_view FAILED", c, eye, v);
 					continue;
 				}
 				int sx = e->layer->data.proj.v[v].sub.rect.offset.w;
@@ -6021,6 +6033,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 				float img_w = (float)sc->vkic.info.width;
 				float img_h = (float)sc->vkic.info.height;
 				if (img_w <= 0.0f || img_h <= 0.0f) {
+					SSD("  draw c%u eye%u v%u: img %fx%f <=0", c, eye, v, img_w, img_h);
 					continue;
 				}
 
@@ -6073,6 +6086,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 					                            eye_h, px_per_m_x, px_per_m_y, &rx, &ry, &rw, &rh);
 				}
 				if (rw <= 0 || rh <= 0) {
+					SSD("  draw c%u eye%u v%u: rect %d,%d %dx%d <=0", c, eye, v, rx, ry, rw, rh);
 					continue;
 				}
 				int tile_x0 = (int)eye * eye_w;
@@ -6094,6 +6108,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 				float cdy0 = fmaxf(fdy0, 0.0f);
 				float cdy1 = fminf(fdy1, (float)eye_h);
 				if (cdx1 - cdx0 < 1.0f || cdy1 - cdy0 < 1.0f) {
+					SSD("  draw c%u eye%u v%u: clipped away cd=(%.1f..%.1f, %.1f..%.1f)", c, eye, v, cdx0, cdx1, cdy0, cdy1);
 					continue;
 				}
 				float ux0 = (cdx0 - fdx0) / (fdx1 - fdx0), ux1 = (cdx1 - fdx0) / (fdx1 - fdx0);
@@ -6115,6 +6130,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 				    .glow_color = {glow_color[0], glow_color[1], glow_color[2], glow_color[3]},
 				};
 				SHARED_SET_HUD_PC(pc);
+				SSD("  draw c%u eye%u v%u: DRAW tex %dx%d fmt=%d im=%p ai=%u rect=(%d,%d %dx%d) clip=(%.0f..%.0f,%.0f..%.0f)", c, eye, v, tw, th, (int)fmt, (void *)im, ai, rx, ry, rw, rh, cdx0, cdx1, cdy0, cdy1);
 				comp_multi_content_blend_draw(content_blend, vk, cmd, im, ai, fmt, hud_img, hud_fmt,
 				                              &pc, (int32_t)cdx0, (int32_t)cdy0,
 				                              (uint32_t)(cdx1 - cdx0), (uint32_t)(cdy1 - cdy0));
@@ -6187,6 +6203,8 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	                         0, 0, NULL, 0, NULL, 1, &pre_weave);
 
+	SSD("frame %u: content_target.content=%p shared_dp=%p atlas=%p buffer=%u", ssd_frame, (void *)content_target.content, (void *)msc->shared_dp, (void *)msc->shared_atlas_image, buffer_index);
+	if (ssd_capturing) { comp_multi_weave_capture_record(&ssd_cap, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_ATLAS, msc->shared_atlas_image, (uint32_t)eye_w * tile_columns, (uint32_t)eye_h, atlas_format, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT); }
 	if (msc->shared_dp != NULL) {
 		xrt_display_processor_set_target_color_view(msc->shared_dp, ct->images[buffer_index].view);
 		xrt_display_processor_process_atlas(msc->shared_dp, cmd,
@@ -6210,6 +6228,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &post_weave);
 
+	if (ssd_capturing) { comp_multi_weave_capture_record(&ssd_cap, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_WOVEN, ct->images[buffer_index].handle, ct->width, ct->height, ct->format, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT); }
 	if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
 		return;
 	}
@@ -6230,6 +6249,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	// Same external-synchronization rule as the per-session path above (#1036).
 	vk_queue_lock(vk->main_queue);
 	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, msc->shared_fences[buffer_index]);
+	if (ssd_capturing && (ssd_cap.target[1].recorded || ssd_cap.target[2].recorded)) { vk->vkWaitForFences(vk->device, 1, &msc->shared_fences[buffer_index], VK_TRUE, 2000000000ull); comp_multi_weave_capture_finish(&ssd_cap, vk, "shared-surface"); U_LOG_W("SSDIAG capture finished"); }
 	vk_queue_unlock(vk->main_queue);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[#59] shared submit failed: %s", vk_result_string(ret));
