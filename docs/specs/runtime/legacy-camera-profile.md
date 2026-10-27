@@ -93,19 +93,68 @@ Three optional aliases are converted at session creation:
 | `convergenceMeters` | Positive distance becomes `convergenceDiopters = 1 / distance` |
 
 Use either a canonical field or its alias, not both. Duplicate keys, conflicting
-aliases, unknown fields, nonnumeric/nonfinite values and malformed JSON reject
-the complete record. JSON input is bounded to 64 KiB. File paths support UTF-8,
-including non-ASCII executable basenames on Windows.
+aliases, nonnumeric/nonfinite values of a known field, out-of-domain alias values
+(`convergenceMeters`/`renderedBaselineMeters` ≤ 0, `horizontalFovDeg` outside
+`(0, 180)`) and malformed JSON reject the complete record. JSON input is bounded
+to 64 KiB. File paths support UTF-8, including non-ASCII executable basenames on
+Windows.
+
+**Unknown fields are skipped, not fatal** ([#2450](https://github.com/DisplayXR/displayxr-runtime/issues/2450)).
+A field this runtime does not recognise is ignored whatever its value, and the
+known fields in the same record still apply, so a profile written for a newer
+runtime degrades gracefully on an older one. The runtime logs one WARN naming
+the skipped fields when the profile is resolved, for example:
+
+```
+Legacy camera profile: unknown camera profile key(s) ignored: pitchDegrees, pullbackMeters
+```
+
+Field names are case-sensitive, so a misspelt field (`ipdfactor`) is also
+skipped with that WARN rather than rejecting the record; check the log when a
+value appears to have no effect.
 
 Baseline conversion uses a fixed reference rather than a per-frame division by
 tracked eye separation. The selected world scale therefore stays constant when
 the viewer changes. No tracked-IPD normalization switch is provided.
 
+## Disparity does not depend on the display
+
+The profile seeds a **camera** rig, computed by the shared core's camera math
+like a chained `XrCameraRigDXR` ([`XR_DXR_view_rig` §3](../extensions/XR_DXR_view_rig.md)).
+Neither the display's physical size nor the display rig's virtual height enters
+it. For a point `Z` world units in front of the camera, the disparity as a
+fraction of the canvas width is
+
+```
+ipdFactor × metersToVirtual × (convergenceDiopters − 1/Z) × eyeSeparation
+    / (2 × tan(verticalFov / 2) × canvasAspect)
+```
+
+(`Z → ∞` for the far limit; positive is behind the glass). The only
+display-dependent inputs are the eye separation the display processor reports
+(`sim_display`: synthetic 60 mm; a tracked display: the viewer's real eyes) and
+the canvas aspect. A profile therefore gives the same canvas-relative disparity
+on `sim_display` and on a vendor panel of the same aspect, within the few
+percent those two inputs differ. On the glass it is that fraction times the
+canvas width in metres. The display's nominal viewer distance enters only the
+comfort clamp on `convergenceDiopters`, applied once at seed time.
+
+The `vH` the qwerty diagnostics print alongside a camera rig (default 1.3 m) is
+the dormant **display** rig's virtual height, kept for the P toggle. It does
+not scale the camera rig's eyes. `tests_camera_rig_disparity` pins the
+relation above across panel sizes ([#2451](https://github.com/DisplayXR/displayxr-runtime/issues/2451)).
+
+What `sim_display` cannot reproduce is the panel's optics: how much disparity
+a given lenticular panel shows comfortably, before crosstalk and ghosting,
+has to be judged on that panel.
+
 ## Validation
 
 `tests_camera_profile` covers parsing, defaults, scalar bounds, alias conversions
-for 16:9 and 16:10 canvases, file/override precedence, invalid data, size limits
-and Unicode paths. `tests_qwerty_camera_profile` exercises actual qwerty devices:
+for 16:9 and 16:10 canvases, file/override precedence, invalid data, skipped
+unknown fields and their notice, size limits and Unicode paths.
+`tests_camera_rig_disparity` checks the camera rig's disparity against the
+closed form above on `sim_display`'s and two vendor panels' geometry. `tests_qwerty_camera_profile` exercises actual qwerty devices:
 profile seeding, live adjustments, Space reset, independent-system defaults and
 display-mode exclusion.
 

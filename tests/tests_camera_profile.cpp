@@ -65,11 +65,13 @@ TEST_CASE("Malformed or ambiguous profiles never partly apply", "[camera-profile
 		CHECK_FALSE(u_camera_profile_parse(json, 1, &profile, nullptr, 0));
 		CHECK(std::memcmp(&before, &profile, sizeof(profile)) == 0);
 	}
-	for (const char *json :
-	     {"[]", "null", "{} trailing", R"({"pose":{}})", R"({"ipdFactor":"1"})", R"({"ipdFactor":1e999})",
-	      R"({"ipdFactor":1,"ipdFactor":2})", R"({"verticalFov":1,"horizontalFovDeg":90})",
-	      R"({"convergenceMeters":0})", R"({"renderedBaselineMeters":-1})",
-	      R"({"metersToVirtual":1,"renderedBaselineMeters":0.063})", R"({"parallaxFactor":0.2,"unknown":1})"}) {
+	for (const char *json : {"[]", "null", "{} trailing", R"({"ipdFactor":"1"})", R"({"ipdFactor":1e999})",
+	                         R"({"ipdFactor":1,"ipdFactor":2})", R"({"verticalFov":1,"horizontalFovDeg":90})",
+	                         R"({"convergenceMeters":0})", R"({"renderedBaselineMeters":-1})",
+	                         R"({"metersToVirtual":1,"renderedBaselineMeters":0.063})",
+	                         // An unknown key never masks a bad known one, nor a malformed document.
+	                         R"({"pitchDegrees":-30,"ipdFactor":"1"})", R"({"futureKey":1,"convergenceMeters":0})",
+	                         R"({"futureKey":1} trailing)"}) {
 		CAPTURE(json);
 		u_camera_profile profile{7, 8, 9, 10, 11}, before = profile;
 		char reason[160]{};
@@ -77,6 +79,54 @@ TEST_CASE("Malformed or ambiguous profiles never partly apply", "[camera-profile
 		CHECK(std::memcmp(&before, &profile, sizeof(profile)) == 0);
 		CHECK(reason[0] != '\0');
 	}
+}
+
+TEST_CASE("Unknown keys are skipped with a notice and the known keys still apply", "[camera-profile]")
+{
+	// #2450: a profile written for a newer runtime (here the proposed framing
+	// keys) must keep its convergence/FOV/ipdFactor on a runtime that lacks them.
+	u_camera_profile profile{};
+	char notice[160]{};
+	REQUIRE(u_camera_profile_parse(
+	    R"({"convergenceMeters":0.8,"pitchDegrees":-30,"verticalFov":1.05,"pullbackMeters":0.6,"ipdFactor":0.05})",
+	    1, &profile, notice, sizeof(notice)));
+	CHECK(profile.inv_convergence_distance == 1.25f);
+	CHECK(2.0 * std::atan(profile.half_tan_vfov) == Approx(1.05));
+	CHECK(profile.ipd_factor == .05f);
+	CHECK(profile.parallax_factor == 1);
+	CHECK(profile.m2v == 1);
+	CHECK(std::string(notice) == "unknown camera profile key(s) ignored: pitchDegrees, pullbackMeters");
+
+	// Any value shape is skipped, including the excluded pose vocabulary.
+	REQUIRE(u_camera_profile_parse(R"({"pose":{"x":[1,2]},"note":"text","flag":null})", 1, &profile, notice,
+	                               sizeof(notice)));
+	CHECK(profile.ipd_factor == 1);
+	CHECK(std::string(notice) == "unknown camera profile key(s) ignored: pose, note, flag");
+
+	// A clean profile leaves the notice empty; control bytes never reach a log line.
+	REQUIRE(u_camera_profile_parse(R"({"ipdFactor":0.5})", 1, &profile, notice, sizeof(notice)));
+	CHECK(notice[0] == '\0');
+	REQUIRE(u_camera_profile_parse(R"({"bad\u001bkey":1})", 1, &profile, notice, sizeof(notice)));
+	CHECK(std::string(notice) == "unknown camera profile key(s) ignored: bad?key");
+
+	// The notice is bounded however many keys there are; a tiny buffer is fine.
+	std::string many = "{";
+	for (int i = 0; i < 64; i++)
+		many += "\"someVeryLongFutureCameraProfileKeyName" + std::to_string(i) + "\":1,";
+	many += "\"ipdFactor\":2}";
+	REQUIRE(u_camera_profile_parse(many.c_str(), 1, &profile, notice, sizeof(notice)));
+	CHECK(profile.ipd_factor == 2);
+	CHECK(std::strlen(notice) < sizeof(notice));
+	char tiny[4]{};
+	REQUIRE(u_camera_profile_parse(many.c_str(), 1, &profile, tiny, sizeof(tiny)));
+	CHECK(std::strlen(tiny) < sizeof(tiny));
+	REQUIRE(u_camera_profile_parse(many.c_str(), 1, &profile, nullptr, 0));
+
+	// The loader returns the notice alongside LOADED, for both override forms.
+	REQUIRE(u_camera_profile_load(nullptr, nullptr, R"({"pitchDegrees":-30,"metersToVirtual":3})", 1, &profile,
+	                              notice, sizeof(notice)) == U_CAMERA_PROFILE_LOADED);
+	CHECK(profile.m2v == 3);
+	CHECK(std::string(notice) == "unknown camera profile key(s) ignored: pitchDegrees");
 }
 
 TEST_CASE("Legal JSON number and key escapes remain supported", "[camera-profile]")
