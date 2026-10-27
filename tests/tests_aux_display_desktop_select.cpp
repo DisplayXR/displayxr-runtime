@@ -336,3 +336,47 @@ TEST_CASE("claim select: an incumbent does not override an origin the plug-in re
 	claims[0].incumbent = true;
 	CHECK(os_display_desktop_select_claim(claims, 2, &h, nullptr) == -1); // origin rule, as before
 }
+
+/*
+ * #2305: the predicate a hotplug re-resolve uses to tell "the claim rule
+ * declined because the plug-in's origin agrees with a claim" (the panel is
+ * where the plug-in says) from "no claim" (the panel is gone). It must agree
+ * with select_claim's own early return, case for case.
+ */
+TEST_CASE("claim select: origin_on_claim is exactly select_claim's 'the two agree' case")
+{
+	// The 2026-10-27 hardware shape: the panel back at (-3840, 0) under its own
+	// claim, the plug-in still reporting (-3840, 0).
+	const os_display_panel_claim back[] = {claim(-3840, 3840, 2160, true)};
+	os_display_panel_hint h = panel_hint();
+	h.screen_left = -3840;
+	CHECK(os_display_desktop_origin_on_claim(back, 1, &h));
+	CHECK(os_display_desktop_select_claim(back, 1, &h, nullptr) == -1);
+
+	// The transient a second earlier: the panel alone at (0, 0). The origin is
+	// on no claim, so the VERIFIED claim overrides it (not the agree case).
+	const os_display_panel_claim transient[] = {claim(0, 3840, 2160, true, true)};
+	CHECK_FALSE(os_display_desktop_origin_on_claim(transient, 1, &h));
+	bool overrides = false;
+	CHECK(os_display_desktop_select_claim(transient, 1, &h, &overrides) == 0);
+	CHECK(overrides);
+
+	// An EDID-level claim agrees just the same.
+	const os_display_panel_claim edid_only[] = {claim(-3840, 3840, 2160, false)};
+	CHECK(os_display_desktop_origin_on_claim(edid_only, 1, &h));
+
+	// No origin ((0, 0) reads as "none"), no claims, no hint: never.
+	h.screen_left = 0;
+	CHECK_FALSE(os_display_desktop_origin_on_claim(transient, 1, &h));
+	h.screen_left = -3840;
+	CHECK_FALSE(os_display_desktop_origin_on_claim(nullptr, 0, &h));
+	CHECK_FALSE(os_display_desktop_origin_on_claim(back, 0, &h));
+	CHECK_FALSE(os_display_desktop_origin_on_claim(back, 1, nullptr));
+
+	// Edges: the last pixel is inside, one past it is not.
+	h.screen_left = -1;
+	h.screen_top = 2159;
+	CHECK(os_display_desktop_origin_on_claim(back, 1, &h));
+	h.screen_top = 2160;
+	CHECK_FALSE(os_display_desktop_origin_on_claim(back, 1, &h));
+}

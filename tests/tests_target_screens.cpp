@@ -611,18 +611,76 @@ TEST_CASE("panel from claims: a claim the OS cannot resolve by identity never fa
 TEST_CASE("panel re-resolve: a vanished claim keeps the last rect; no claim before keeps the old rules")
 {
 	// The claim resolves: take it, whatever came before.
-	CHECK(target_screens_panel_reresolve_decide(0, true, true) == TARGET_PANEL_TAKE_CLAIM);
-	CHECK(target_screens_panel_reresolve_decide(0x42, true, true) == TARGET_PANEL_TAKE_CLAIM);
-	CHECK(target_screens_panel_reresolve_decide(0x42, false, true) == TARGET_PANEL_TAKE_CLAIM);
+	CHECK(target_screens_panel_reresolve_decide(0, true, true, false) == TARGET_PANEL_TAKE_CLAIM);
+	CHECK(target_screens_panel_reresolve_decide(0x42, true, true, false) == TARGET_PANEL_TAKE_CLAIM);
+	CHECK(target_screens_panel_reresolve_decide(0x42, false, true, false) == TARGET_PANEL_TAKE_CLAIM);
 
 	// The panel was claimed and its claim is gone (unplugged, the vendor
 	// service restarting, a virtual monitor now where the panel was): keep.
-	CHECK(target_screens_panel_reresolve_decide(0x42, true, false) == TARGET_PANEL_KEEP_PREVIOUS);
+	CHECK(target_screens_panel_reresolve_decide(0x42, true, false, false) == TARGET_PANEL_KEEP_PREVIOUS);
 
 	// Another active plug-in now (an adoption), or no claim ever: the plain
 	// rules, exactly as before #2305.
-	CHECK(target_screens_panel_reresolve_decide(0x42, false, false) == TARGET_PANEL_TAKE_FALLBACK);
-	CHECK(target_screens_panel_reresolve_decide(0, true, false) == TARGET_PANEL_TAKE_FALLBACK);
+	CHECK(target_screens_panel_reresolve_decide(0x42, false, false, false) == TARGET_PANEL_TAKE_FALLBACK);
+	CHECK(target_screens_panel_reresolve_decide(0, true, false, false) == TARGET_PANEL_TAKE_FALLBACK);
+}
+
+/*
+ * #2305 on Windows hardware (runtime #2311, Acer DS1 over HDMI, 2026-10-27):
+ * mid-replug Windows shows the panel ALONE at (0, 0) for about a second; the
+ * claim rule takes it there (`panel rect: 3840x2160 at (0, 0) … [rule: plug-in
+ * claim]`, monitor 0xa714… — a position-derived id). When the layout returns,
+ * the plug-in claims the panel under its own id at its own origin (-3840, 0),
+ * so the claim rule declines (origin and claim agree). That is the panel coming
+ * back, not the claim going away: the origin rule must take over. Before, the
+ * re-resolve logged `no longer claims monitor 0xa714… — keeping the last panel
+ * rect (0, 0)` and published (0, 0) for the rest of the session.
+ */
+TEST_CASE("panel re-resolve: the panel back at the plug-in's own origin is not a vanished claim")
+{
+	// The decision: claimed at the origin -> the origin rule, never "keep".
+	CHECK(target_screens_panel_reresolve_decide(0x42, true, false, true) == TARGET_PANEL_TAKE_FALLBACK);
+	// A resolving claim still wins; another plug-in still takes the plain rules.
+	CHECK(target_screens_panel_reresolve_decide(0x42, true, true, true) == TARGET_PANEL_TAKE_CLAIM);
+	CHECK(target_screens_panel_reresolve_decide(0x42, false, false, true) == TARGET_PANEL_TAKE_FALLBACK);
+
+	// The input, from the registry. The fixture's vendor claims HDMI-1 at
+	// (2880, 0) and DP-1 at (6720, 0), both 3840x2160.
+	fixture f;
+	f.vendor.probe_displays = fake_probe_displays;
+	f.reg.entries[2].confidence = (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED;
+	const uint64_t gone = 0xa714fca2f6c6b6b4ull; // the transient pick, no longer in the registry
+	os_display_panel_hint h = {};
+	h.pixel_width = 3840;
+	h.pixel_height = 2160;
+
+	// The plug-in's origin is on DP-1, which it claims: the panel is back.
+	h.screen_left = 6720;
+	CHECK(target_screens_panel_claimed_at_origin(&f.reg, "vendor", &h, gone));
+	// ...on HDMI-1 (an EDID-level claim) too: agreement, not confidence, is the test.
+	h.screen_left = 2880 + 100;
+	h.screen_top = 50;
+	CHECK(target_screens_panel_claimed_at_origin(&f.reg, "vendor", &h, gone));
+
+	// The previous pick is still claimed: keep it (two panels of one vendor).
+	h.screen_left = 6720;
+	h.screen_top = 0;
+	CHECK_FALSE(target_screens_panel_claimed_at_origin(&f.reg, "vendor", &h, f.reg.entries[1].monitor_id));
+
+	// The origin is on no claimed monitor (the eDP-1 laptop is the fallback
+	// plug-in's), or there is no origin: the panel is not back — keep.
+	h.screen_left = 100;
+	CHECK_FALSE(target_screens_panel_claimed_at_origin(&f.reg, "vendor", &h, gone));
+	h.screen_left = 0;
+	CHECK_FALSE(target_screens_panel_claimed_at_origin(&f.reg, "vendor", &h, gone));
+
+	// No claims at all (unplugged): keep.
+	h.screen_left = 6720;
+	f.reg.entries[1].not_ready = true;
+	f.reg.entries[2].not_ready = true;
+	CHECK_FALSE(target_screens_panel_claimed_at_origin(&f.reg, "vendor", &h, gone));
+	// Another plug-in's view of the same registry: nothing it claims.
+	CHECK_FALSE(target_screens_panel_claimed_at_origin(&f.reg, "fallback", &h, gone));
 }
 
 TEST_CASE("panel from claims (ex): unresolvable identity declines and reports no monitor")

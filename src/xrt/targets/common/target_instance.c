@@ -1094,7 +1094,15 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	const bool claim_resolved =
 	    target_screens_panel_from_claims_ex(&info->dp_registry, info->active_plugin_id, &hint, incumbent, &desktop,
 	                                        &claim_overrides_origin, &claim_monitor_id);
-	switch (target_screens_panel_reresolve_decide(g_panel_claim_monitor_id, same_plugin, claim_resolved)) {
+	// The claim rule also declines when the plug-in's origin agrees with one of
+	// its claims; after a claim-rule pick that is the panel coming back (under
+	// a new, position-derived id on Windows), not the claim going away.
+	const bool claimed_at_origin =
+	    !claim_resolved && incumbent != 0 &&
+	    target_screens_panel_claimed_at_origin(&info->dp_registry, info->active_plugin_id, &hint, incumbent);
+	const enum target_panel_reresolve decision =
+	    target_screens_panel_reresolve_decide(g_panel_claim_monitor_id, same_plugin, claim_resolved, claimed_at_origin);
+	switch (decision) {
 	case TARGET_PANEL_TAKE_CLAIM:
 		match.rule = OS_DISPLAY_DESKTOP_RULE_CLAIM;
 		resolved = true;
@@ -1125,6 +1133,14 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 		return;
 	case TARGET_PANEL_TAKE_FALLBACK:
 	default:
+		if (claimed_at_origin) {
+			U_LOG_W(
+			    "Panel rect: '%s' claims the monitor at its reported origin (%d, %d) again (the last pick, "
+			    "0x%016llx, is gone) — re-resolving the panel rect by the origin rule (#2305).",
+			    info->active_plugin_id, (int)plugin_left, (int)plugin_top,
+			    (unsigned long long)g_panel_claim_monitor_id);
+			g_panel_kept_logged = false;
+		}
 		g_panel_claim_monitor_id = 0;
 		g_panel_claim_plugin[0] = '\0';
 		resolved = os_display_desktop_info_for_panel(&hint, &desktop, &match);
