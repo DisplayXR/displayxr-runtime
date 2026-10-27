@@ -24,6 +24,7 @@ set(tests
     tests_worker
     tests_pose
     tests_view_rig_point
+    tests_camera_rig_disparity
     tests_mirror_calib
     tests_vec3_angle
     tests_u_multi_display
@@ -621,6 +622,9 @@ target_link_libraries(tests_pose PRIVATE aux_math)
 # shared core's eye mapping: bit-for-bit against displayxr-common across a sweep,
 # plus the issue's joint cases.
 target_link_libraries(tests_view_rig_point PRIVATE aux_math)
+# #2451: the legacy camera rig's disparity is canvas-relative, independent of the
+# display's physical size and of the dormant display-rig virtual height.
+target_link_libraries(tests_camera_rig_disparity PRIVATE aux_math)
 # Mirror-alignment camera-pose calibration solver (tracking-provider-discovery.md, "Camera pose calibration").
 target_link_libraries(tests_mirror_calib PRIVATE aux_math)
 target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)

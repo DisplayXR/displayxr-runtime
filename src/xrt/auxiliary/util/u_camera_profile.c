@@ -117,6 +117,25 @@ valid_tokens(const char *text)
 	return true;
 }
 
+//! Append one skipped key to the success-time notice, sanitised for a log line
+//! (control bytes become '?', long keys are cut) and bounded by the buffer.
+static void
+note_ignored_key(char *notice, size_t size, size_t *used, const char *key)
+{
+	if (*used == 0) {
+		int n = snprintf(notice, size, "unknown camera profile key(s) ignored: ");
+		*used = n < 0 ? 0 : ((size_t)n >= size ? size - 1 : (size_t)n);
+	} else if (*used + 2 < size) {
+		notice[(*used)++] = ',';
+		notice[(*used)++] = ' ';
+	}
+	for (size_t i = 0; key[i] != '\0' && i < 48 && *used + 1 < size; i++) {
+		unsigned char c = (unsigned char)key[i];
+		notice[(*used)++] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+	}
+	notice[*used] = '\0';
+}
+
 bool
 u_camera_profile_parse(const char *json, float aspect, struct u_camera_profile *out, char *error, size_t size)
 {
@@ -133,6 +152,10 @@ u_camera_profile_parse(const char *json, float aspect, struct u_camera_profile *
 	struct u_camera_profile result = U_CAMERA_PROFILE_DEFAULT;
 	unsigned seen = 0;
 	bool ok = true;
+	// Keys this runtime does not know are skipped, not fatal (#2450): a profile
+	// written for a newer runtime keeps its known tuning on an older one.
+	char notice[160] = {0};
+	size_t notice_used = 0;
 	const char *reason = "invalid camera profile";
 	const cJSON *item;
 	cJSON_ArrayForEach(item, root)
@@ -149,9 +172,13 @@ u_camera_profile_parse(const char *json, float aspect, struct u_camera_profile *
 			bit = 8;
 		else if (strcmp(key, "metersToVirtual") == 0 || strcmp(key, "renderedBaselineMeters") == 0)
 			bit = 16;
-		if (bit == 0 || (seen & bit)) {
+		if (bit == 0) {
+			note_ignored_key(notice, sizeof(notice), &notice_used, key);
+			continue;
+		}
+		if (seen & bit) {
 			ok = false;
-			reason = "unknown, duplicate or conflicting camera profile key";
+			reason = "duplicate or conflicting camera profile key";
 			break;
 		}
 		seen |= bit;
@@ -208,7 +235,7 @@ u_camera_profile_parse(const char *json, float aspect, struct u_camera_profile *
 		return invalid(error, size, reason);
 	*out = result;
 	if (error != NULL && size > 0)
-		error[0] = '\0';
+		snprintf(error, size, "%s", notice);
 	return true;
 }
 

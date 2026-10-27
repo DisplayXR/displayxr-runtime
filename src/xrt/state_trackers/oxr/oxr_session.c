@@ -6993,13 +6993,17 @@ seed_legacy_camera_profile(struct oxr_session *sess, bool profile_external_bindi
 	}
 	float aspect = height > 0.0f ? width / height : 0.0f;
 	struct u_camera_profile profile;
-	char error[160] = {0};
+	char error[192] = {0};
 	enum u_camera_profile_result result = u_camera_profile_load_for_process(aspect, &profile, error, sizeof(error));
 	if (result == U_CAMERA_PROFILE_NONE)
 		return;
 	if (result == U_CAMERA_PROFILE_INVALID) {
 		U_LOG_W("Legacy camera profile ignored: %s", error);
 		return;
+	}
+	if (error[0] != '\0') {
+		// #2450: the known keys still apply; name the skipped ones once.
+		U_LOG_W("Legacy camera profile: %s", error);
 	}
 	if (!(state.nominal_viewer_z > 0.0f) || !isfinite(state.nominal_viewer_z)) {
 		U_LOG_W("Legacy camera profile ignored: nominal viewer distance is unavailable");
