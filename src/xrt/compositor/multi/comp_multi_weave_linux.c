@@ -1993,8 +1993,15 @@ weave_offpanel_bands(struct multi_compositor *mc, bool nview, struct u_wl_rect_p
 
 	// Window px -> output px (pure arithmetic, pinned by tests_aux_weave_span2d).
 	bool whole = false;
+	// Scaled for v6 (the output is one content view) AND for a resampled
+	// window: a batch output is the input's size, which is the client's
+	// BUFFER size, while the bound client size is DEVICE px. They differ when
+	// the desktop resamples the window (an X11 client on a fractionally scaled
+	// XWayland desktop: a 3456x2160 buffer shown as 2880x1800 device px).
+	const bool resampled = mc->weave.out_w != mc->weave.win_w || mc->weave.out_h != mc->weave.win_h;
 	const uint32_t n = u_wl_offpanel_bands_to_output(win_bands, win_count, mc->weave.win_w, mc->weave.win_h,
-	                                                 mc->weave.out_w, mc->weave.out_h, nview, out, &whole);
+	                                                 mc->weave.out_w, mc->weave.out_h, nview || resampled, out,
+	                                                 &whole);
 
 	// Log on a change of state only (band count, or "entirely off"), never per
 	// frame and not per drag step.
