@@ -7828,8 +7828,18 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->base.base.info.formats[format_count++] = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R16G16B16A16_UNORM;
-	c->base.base.info.formats[format_count++] = DXGI_FORMAT_D24_UNORM_S8_UINT;
+	/*
+	 * Depth formats, most preferred first (#2430). An app that takes the
+	 * runtime's first usable depth format gets D32_FLOAT, the format every
+	 * D3D sample and engine default assumes; the Khronos hello_xr D3D12
+	 * sample builds a D32_FLOAT depth-stencil view over whichever depth
+	 * swapchain it was given, and D24_UNORM_S8_UINT listed first handed it
+	 * an R24G8_TYPELESS resource, an invalid view, and a device removal
+	 * (DXGI_ERROR_INVALID_CALL) on its first frame. Apps that need stencil
+	 * ask for D24_UNORM_S8_UINT by name and still get it.
+	 */
 	c->base.base.info.formats[format_count++] = DXGI_FORMAT_D32_FLOAT;
+	c->base.base.info.formats[format_count++] = DXGI_FORMAT_D24_UNORM_S8_UINT;
 	c->base.base.info.formats[format_count++] = DXGI_FORMAT_D16_UNORM;
 	c->base.base.info.format_count = format_count;
 
