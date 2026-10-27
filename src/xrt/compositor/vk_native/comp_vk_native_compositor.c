@@ -861,6 +861,9 @@ struct comp_vk_native_compositor
 	 */
 	struct comp_vk_native_segments *segments;
 	struct xrt_screen_list *seg_screens; //!< heap copy; NULL = never set
+	//! heap copy of the info @ref seg_screens was built from (its DP registry;
+	//! #2305: not @ref sys_info, which stays as it was at session create)
+	struct xrt_system_compositor_info *seg_sys_info;
 	uint64_t seg_pinned_display_id;
 	struct comp_seg_rect seg_window;
 	bool have_seg_window;
@@ -6277,7 +6280,7 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 			comp_vk_native_segments_set_hwnd_hooks(segs, &hooks);
 		}
 #endif
-		comp_vk_native_segments_set_screens(segs, c->seg_screens, &c->sys_info, c->seg_pinned_display_id);
+		comp_vk_native_segments_set_screens(segs, c->seg_screens, c->seg_sys_info, c->seg_pinned_display_id);
 		os_mutex_lock(&c->seg_pub_mutex);
 		c->segments = segs;
 		os_mutex_unlock(&c->seg_pub_mutex);
@@ -13921,6 +13924,8 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	os_mutex_unlock(&c->seg_pub_mutex);
 	free(c->seg_screens);
 	c->seg_screens = NULL;
+	free(c->seg_sys_info);
+	c->seg_sys_info = NULL;
 #endif
 	xrt_display_processor_destroy(&c->display_processor);
 
@@ -17561,22 +17566,28 @@ comp_vk_native_compositor_set_view_routing(struct xrt_compositor *xc, const stru
 void
 comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
                                       const struct xrt_screen_list *list,
+                                      const struct xrt_system_compositor_info *info,
                                       uint64_t pinned_display_id)
 {
 #ifdef VK_NATIVE_HAVE_SEGMENTS
-	if (xc == NULL || list == NULL) {
+	if (xc == NULL || list == NULL || info == NULL) {
 		return;
 	}
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
-	if (copy == NULL) {
+	struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+	if (copy == NULL || info_copy == NULL) {
+		free(copy);
+		free(info_copy);
 		return;
 	}
 	*copy = *list;
+	*info_copy = *info;
 
 	// #1394: never block the app thread on a wedged weave.
 	if (vk_weave_blocked(c)) {
 		free(copy);
+		free(info_copy);
 		return;
 	}
 	os_mutex_lock(&c->mutex);
@@ -17590,19 +17601,24 @@ comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
 	os_mutex_unlock(&c->seg_pub_mutex);
 	free(c->seg_screens);
 	c->seg_screens = copy;
+	// #2305: the registry this list was built from, not the session-start one
+	// in c->sys_info — a screen a display hotplug added is only in this one.
+	free(c->seg_sys_info);
+	c->seg_sys_info = info_copy;
 	c->seg_pinned_display_id = pinned_display_id;
 #ifdef XRT_OS_WINDOWS
 	// #918 VK-1: under the split the D3D11 weave on the scanout adapter
 	// segments the window (ADR-047 Amendment 1); it rebuilds its manager on
-	// its next weave. The copy above stays for a retire back to Vulkan.
+	// its next weave. The copies above stay for a retire back to Vulkan.
 	if (c->split != NULL) {
-		comp_hub_d3d11_set_screens(c->split, list, &c->sys_info, pinned_display_id);
+		comp_hub_d3d11_set_screens(c->split, list, info, pinned_display_id);
 	}
 #endif
 	os_mutex_unlock(&c->mutex);
 #else
 	(void)xc;
 	(void)list;
+	(void)info;
 	(void)pinned_display_id;
 #endif
 }
