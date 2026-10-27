@@ -306,6 +306,8 @@ dxr_acquire_timeout_ns(void)
 // carried in struct comp_vk_native_xcb_handle. (VK_USE_PLATFORM_XCB_KHR is
 // defined by CMake via xrt_config_vulkan.h when XRT_HAVE_XCB.)
 #include <vulkan/vulkan_xcb.h>
+#include <X11/Xlib.h>
+#include <vulkan/vulkan_xlib.h> // #2322 prototype: Xlib surface fallback
 #include <xcb/xcb.h>
 #include "comp_vk_native_window_xcb.h"
 // #902: the desktop-Linux vblank-grid source (wp_presentation / X11 Present).
@@ -2037,11 +2039,43 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 		pfnCreateXcbSurface = (PFN_vkCreateXcbSurfaceKHR)
 		    vk->vkGetInstanceProcAddr(vk->instance, "vkCreateXcbSurfaceKHR");
 	}
+	// #2322 prototype: under Wine/Proton the app's VkInstance comes from
+	// winevulkan, whose host instance only enables VK_KHR_xlib_surface. Fall
+	// back to an Xlib surface over the same X11 window id.
 	if (pfnCreateXcbSurface == NULL) {
-		U_LOG_E("vkCreateXcbSurfaceKHR not available — VK_KHR_xcb_surface must be enabled");
-		free(target);
-		return XRT_ERROR_VULKAN;
-	}
+		PFN_vkCreateXlibSurfaceKHR pfnCreateXlibSurface = (PFN_vkCreateXlibSurfaceKHR)
+		    vk->vkGetInstanceProcAddr(vk->instance, "vkCreateXlibSurfaceKHR");
+		Display *dpy = pfnCreateXlibSurface ? XOpenDisplay(NULL) : NULL;
+		if (dpy == NULL) {
+			U_LOG_E("vkCreateXcbSurfaceKHR not available — VK_KHR_xcb_surface must be enabled "
+			        "(xlib fallback: fn=%p dpy=%p)", (void *)pfnCreateXlibSurface, (void *)dpy);
+			free(target);
+			return XRT_ERROR_VULKAN;
+		}
+		VkXlibSurfaceCreateInfoKHR xlib_ci = {
+		    .sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
+		    .pNext = NULL,
+		    .flags = 0,
+		    .dpy = dpy,
+		    .window = (Window)xcb_handle->window,
+		};
+		VkResult xres = pfnCreateXlibSurface(vk->instance, &xlib_ci, NULL, &target->surface);
+		if (xres != VK_SUCCESS) {
+			U_LOG_E("#2322: Failed to create Xlib surface: %d", xres);
+			free(target);
+			return XRT_ERROR_VULKAN;
+		}
+		U_LOG_W("#2322: no VK_KHR_xcb_surface on this instance — created an Xlib surface for window 0x%x",
+		        (unsigned)xcb_handle->window);
+		VkBool32 xps = VK_FALSE;
+		vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device, queue_family_index, target->surface, &xps);
+		if (!xps) {
+			U_LOG_E("Queue family does not support presentation to Xlib surface");
+			vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
+			free(target);
+			return XRT_ERROR_VULKAN;
+		}
+	} else {
 
 	VkXcbSurfaceCreateInfoKHR surface_ci = {
 	    .sType = VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR,
@@ -2068,6 +2102,7 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 		free(target);
 		return XRT_ERROR_VULKAN;
 	}
+	} // end xcb-vs-xlib
 	} // end XCB (non-Wayland) branch
 	target_present_feedback_create(target, hwnd, is_wayland);
 #else
