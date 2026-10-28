@@ -5342,6 +5342,36 @@ gl_segments_tick(struct comp_gl_compositor *c, bool eligible, uint32_t present_w
  *
  */
 
+#ifdef XRT_OS_WINDOWS
+/*!
+ * #2405: drag phase-snap provider for the runtime-owned window — the GL twin
+ * of the D3D11 compositor's. Runs on the window thread. The primary DP can be
+ * swapped (segments) or created late (hub retire) under dp_swap_mutex, and a
+ * vendor DP create may talk to this very window, so the snap only TRIES the
+ * lock: a drag step that coincides with a swap goes unsnapped rather than
+ * risking a wait on the window thread.
+ */
+static bool
+gl_compositor_snap_window_rect_cb(void *userdata,
+                                  int32_t origin_x,
+                                  int32_t origin_y,
+                                  int32_t target_x,
+                                  int32_t target_y,
+                                  int32_t *out_x,
+                                  int32_t *out_y)
+{
+	struct comp_gl_compositor *c = (struct comp_gl_compositor *)userdata;
+	if (c == NULL || os_mutex_trylock(&c->dp_swap_mutex) != 0) {
+		return false;
+	}
+	bool snapped = c->display_processor != NULL &&
+	               xrt_display_processor_gl_snap_window_rect(c->display_processor, origin_x, origin_y, target_x,
+	                                                         target_y, out_x, out_y);
+	os_mutex_unlock(&c->dp_swap_mutex);
+	return snapped;
+}
+#endif // XRT_OS_WINDOWS
+
 static void
 gl_create_gl_dp(struct comp_gl_compositor *c, void *dp_factory_gl, void *dp_window, bool quiet_failure)
 {
@@ -8644,6 +8674,11 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 		c->zone_published = false;
 	}
 #ifdef XRT_OS_WINDOWS
+	// #2405: detach the drag snap before any DP dies (the setter waits out a
+	// snap in flight).
+	if (c->owns_window && c->own_window != NULL) {
+		comp_d3d11_window_set_snap_provider(c->own_window, NULL, NULL);
+	}
 	// Multi-screen M6: the segment DPs (and their GL objects) go first, on
 	// this context. No hooks: the primary DP is destroyed right below, so the
 	// window is not handed back to it.
@@ -10047,6 +10082,15 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		} else {
 			gl_hub_log_placement(c, xdev, display_screen_left, display_screen_top);
 		}
+	}
+#endif
+
+#ifdef XRT_OS_WINDOWS
+	// #2405: the runtime-owned window phase-snaps while the user drags it, as
+	// on the D3D11 leg. Armed once; the provider answers "no snap" while no
+	// GL DP exists (hub-owned weave, a DP still owed after a retire).
+	if (c->owns_window && c->own_window != NULL) {
+		comp_d3d11_window_set_snap_provider(c->own_window, gl_compositor_snap_window_rect_cb, c);
 	}
 #endif
 

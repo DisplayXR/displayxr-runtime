@@ -6208,6 +6208,34 @@ vk_segments_hwnd_bracket_cb(void *userdata, bool begin, struct xrt_display_proce
 	c->snap_dp = begin ? NULL : hwnd_dp;
 	os_mutex_unlock(&c->dp_swap_mutex);
 }
+
+/*!
+ * #2405: drag phase-snap provider for the runtime-owned window (hosted), the
+ * Vulkan twin of the D3D11 compositor's: the same DP choice as
+ * comp_vk_native_compositor_snap_window_rect's Windows branch. Runs on the
+ * window thread, so it only TRIES dp_swap_mutex — a drag step that coincides
+ * with a primary swap goes unsnapped rather than waiting on the window thread.
+ */
+static bool
+vk_own_window_snap_cb(void *userdata,
+                      int32_t origin_x,
+                      int32_t origin_y,
+                      int32_t target_x,
+                      int32_t target_y,
+                      int32_t *out_x,
+                      int32_t *out_y)
+{
+	struct comp_vk_native_compositor *c = (struct comp_vk_native_compositor *)userdata;
+	if (c == NULL || os_mutex_trylock(&c->dp_swap_mutex) != 0) {
+		return false;
+	}
+	struct xrt_display_processor *sdp = c->snap_dp != NULL ? c->snap_dp : c->display_processor;
+	const bool ok = sdp != NULL && xrt_display_processor_vk_snap_window_rect((struct xrt_display_processor_vk *)sdp,
+	                                                                         origin_x, origin_y, target_x, target_y,
+	                                                                         out_x, out_y);
+	os_mutex_unlock(&c->dp_swap_mutex);
+	return ok;
+}
 #endif // XRT_OS_WINDOWS
 
 /*!
@@ -13921,6 +13949,13 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		xrt_display_processor_clear_local_zone_mask(c->display_processor);
 		c->zone_published = false;
 	}
+#ifdef XRT_OS_WINDOWS
+	// #2405: detach the own window's drag snap before any DP dies (the setter
+	// waits out a snap in flight).
+	if (c->owns_window && c->own_window != NULL) {
+		comp_d3d11_window_set_snap_provider(c->own_window, NULL, NULL);
+	}
+#endif
 #ifdef VK_NATIVE_HAVE_SEGMENTS
 	// Multi-screen M2: the segment DPs go first (they share the DP pool). No
 	// window hand-back at teardown: the primary DP goes too (hooks cleared).
@@ -15595,6 +15630,13 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		c->dp_atlas_encoding_latched = -1; // #1484
 		c->pq_dp_asked = NULL;             // #2340
 	}
+#ifdef XRT_OS_WINDOWS
+	// #2405: the runtime-owned window phase-snaps while the user drags it, as
+	// on the D3D11 leg (answers "no snap" while no DP exists).
+	if (c->owns_window && c->own_window != NULL) {
+		comp_d3d11_window_set_snap_provider(c->own_window, vk_own_window_snap_cb, c);
+	}
+#endif
 
 	// Determine view dimensions (half width for a 2-view atlas), never 0 — a
 	// 0-sized atlas fails the renderer create, and with it the whole session.

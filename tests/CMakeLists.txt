@@ -120,6 +120,7 @@ set(tests
     tests_u_eye_history
     tests_sim_eyes
     tests_dp_eye_positions_at
+    tests_dp_snap_window_rect
     tests_dp_atlas_encoding_query
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
@@ -585,6 +586,8 @@ target_link_libraries(tests_u_eye_history PRIVATE aux_os xrt-interfaces)
 # ... and the target-time slot on all five DP vtables: appended last, gated,
 # falling back to the vendor horizon.
 target_link_libraries(tests_dp_eye_positions_at PRIVATE xrt-interfaces)
+# ... and the GL / D3D12 drag phase-snap slot (#2405): appended last, gated, no snap when absent.
+target_link_libraries(tests_dp_snap_window_rect PRIVATE xrt-interfaces)
 # ... and the D3D11 (#2273) + Vulkan (#2340) PQ atlas queries: appended last, gated, false when absent.
 target_link_libraries(tests_dp_atlas_encoding_query PRIVATE xrt-interfaces)
 

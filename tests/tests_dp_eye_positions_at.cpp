@@ -52,11 +52,17 @@ static_assert(offsetof(xrt_display_processor_d3d11, accepts_atlas_encoding) + si
               sizeof(xrt_display_processor_d3d11));
 static_assert(offsetof(xrt_display_processor_d3d12, get_eye_positions_at) ==
               offsetof(xrt_display_processor_d3d12, set_present_origin) + sizeof(void *));
+// D3D12 has since appended snap_window_rect (#2405) after it.
 static_assert(offsetof(xrt_display_processor_d3d12, get_eye_positions_at) + sizeof(void *) ==
+              offsetof(xrt_display_processor_d3d12, snap_window_rect));
+static_assert(offsetof(xrt_display_processor_d3d12, snap_window_rect) + sizeof(void *) ==
               sizeof(xrt_display_processor_d3d12));
 static_assert(offsetof(xrt_display_processor_gl, get_eye_positions_at) ==
               offsetof(xrt_display_processor_gl, set_present_origin) + sizeof(void *));
+// GL has since appended snap_window_rect (#2405) after it.
 static_assert(offsetof(xrt_display_processor_gl, get_eye_positions_at) + sizeof(void *) ==
+              offsetof(xrt_display_processor_gl, snap_window_rect));
+static_assert(offsetof(xrt_display_processor_gl, snap_window_rect) + sizeof(void *) ==
               sizeof(xrt_display_processor_gl));
 static_assert(offsetof(xrt_display_processor_metal, get_eye_positions_at) ==
               offsetof(xrt_display_processor_metal, snap_window_rect) + sizeof(void *));

@@ -401,12 +401,15 @@ fake_gl_set_present_origin(xrt_display_processor_gl *, int32_t x, int32_t y)
 TEST_CASE("GL DP: set_present_origin is the appended last slot, struct_size-gated (multi-screen M6)", "[stereo_camera]")
 {
 	// Appended after get_background_preview (ADR-020); it ended the vtable
-	// until N6 Part 1 (#2144) appended get_eye_positions_at after it.
+	// until N6 Part 1 (#2144) appended get_eye_positions_at after it, then
+	// #2405 snap_window_rect after that.
 	STATIC_REQUIRE(offsetof(xrt_display_processor_gl, set_present_origin) ==
 	               offsetof(xrt_display_processor_gl, get_background_preview) + sizeof(void *));
 	STATIC_REQUIRE(offsetof(xrt_display_processor_gl, get_eye_positions_at) ==
 	               offsetof(xrt_display_processor_gl, set_present_origin) + sizeof(void *));
 	STATIC_REQUIRE(offsetof(xrt_display_processor_gl, get_eye_positions_at) + sizeof(void *) ==
+	               offsetof(xrt_display_processor_gl, snap_window_rect));
+	STATIC_REQUIRE(offsetof(xrt_display_processor_gl, snap_window_rect) + sizeof(void *) ==
 	               sizeof(xrt_display_processor_gl));
 
 	xrt_display_processor_gl dp{};
