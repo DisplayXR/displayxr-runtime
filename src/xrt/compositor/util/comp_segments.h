@@ -427,6 +427,30 @@ comp_segments_tile_rect(const struct comp_seg_rect *seg,
                         struct comp_seg_rect *out);
 
 /*!
+ * Intersect two rects (half-open). @return false (and @p out zeroed) when
+ * they share no pixel.
+ */
+bool
+comp_segments_rect_intersect(const struct comp_seg_rect *a, const struct comp_seg_rect *b, struct comp_seg_rect *out);
+
+/*!
+ * The inverse of @ref comp_segments_tile_rect: a rect in VIEW-TILE pixels
+ * mapped back onto the canvas the atlas holds, in window px. Each edge is
+ * rounded on its own, so the result is exactly where those tile pixels land
+ * when the canvas is woven whole: a DP handed this rect as its canvas and the
+ * tile rect as its tile puts every texel where it always was, at the same
+ * scale (#1575).
+ *
+ * @return false when @p tile is empty or the inputs are degenerate.
+ */
+bool
+comp_segments_canvas_from_tile(const struct comp_seg_rect *tile,
+                               const struct comp_seg_rect *canvas,
+                               uint32_t tile_w,
+                               uint32_t tile_h,
+                               struct comp_seg_rect *out);
+
+/*!
  * #1575: what one frame of a window that overhangs the panel sends across the
  * output-device split's bridge.
  *
@@ -436,14 +460,21 @@ comp_segments_tile_rect(const struct comp_seg_rect *seg,
  * carry, and every such frame was refused: a black panel, and before #2408 a
  * DEGRADED latch for the rest of the session.
  *
- * The pixels past the panel never reach it, so they are not carried: every
- * view tile is cut to the part of the canvas on the panel, at its real offset
- * in the tile, and the DP weaves that part over the same window pixels it
- * always would. Nothing is scaled, so the weave phase and the window-relative
- * Kooima (both computed from the window) do not change. This is the
- * crop-before-the-DP rule the per-screen segments follow (ADR-030): the tile
- * rect is @ref comp_segments_tile_rect of the kept part, and the DP canvas is
- * the kept part itself.
+ * The pixels past the panel never reach it, so they need not be carried.
+ * Every view tile is cut at its real offset, and the DP weaves that cut over
+ * the same window pixels it always would. Nothing is scaled, so the weave
+ * phase and the window-relative Kooima (both computed from the window) do not
+ * change. This is the crop-before-the-DP rule the per-screen segments follow
+ * (ADR-030).
+ *
+ * The cut is a FIXED size for a given tile size: the bridge's per-tile share,
+ * `min(max_w / cols, view_w)` by `min(max_h / rows, view_h)`, placed over the
+ * part of the canvas on the panel. A drag across the panel's edge moves the
+ * cut and never resizes it, so the bridge box, the egress ring and the DP
+ * input keep one size for the whole episode. The DP canvas is the cut mapped
+ * back by @ref comp_segments_canvas_from_tile, so tile and canvas keep one
+ * scale; its edges lie on the window's own edges or past the panel's, where
+ * nothing reaches the panel.
  */
 struct comp_segments_overhang_in
 {
@@ -483,9 +514,14 @@ struct comp_segments_overhang
 {
 	//! How far the canvas reaches past each edge of the panel, window px.
 	uint32_t over_left, over_right, over_top, over_bottom;
-	//! The kept part inside every tile, tile px (its offset is where it sits in the tile).
+	//! The part of the canvas on the panel, window px: what must reach it.
+	struct comp_seg_rect keep;
+	//! @ref keep in tile px, rounded outward: what every tile must carry.
+	struct comp_seg_rect need;
+	//! What every tile carries, tile px: the bridge's per-tile share at its
+	//! real offset, covering @ref need (a drag moves it, never resizes it).
 	struct comp_seg_rect tile;
-	//! Where the DP weaves it: the part of the canvas on the panel, window px.
+	//! Where the DP weaves @ref tile, window px (@ref comp_segments_canvas_from_tile).
 	struct comp_seg_rect canvas;
 	//! What crosses the bridge: cols x tile.w by rows x tile.h.
 	uint32_t box_w, box_h;
@@ -496,10 +532,10 @@ struct comp_segments_overhang
  *
  * Only a content box larger than the bridge (@ref comp_segments_overhang_in::max_w
  * by max_h) is clipped; a box that fits is carried whole, exactly as before.
- * The clip is canvas ∩ panel. Its tile rect is capped at the bridge's share
- * per tile (max_w / cols by max_h / rows), which for tiles sized at the
- * panel's own scale trims at most a pixel of rounding; the DP canvas then
- * loses the same span at the same far edge, so tile and canvas keep one scale.
+ * @ref comp_segments_overhang::canvas covers @ref comp_segments_overhang::keep
+ * whenever the share is wide enough for it, which it is for tiles sized at the
+ * panel's own scale up to one tile pixel of rounding on a window that covers
+ * the whole panel. Tiles not at the panel's scale lose their far part.
  *
  * @param[out] out Filled for COMP_SEG_OVERHANG_CLIPPED, and its over_* fields
  *             for ON_PANEL and OFF_PANEL; zeroed otherwise.

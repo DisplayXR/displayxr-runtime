@@ -956,6 +956,65 @@ comp_segments_tile_rect(const struct comp_seg_rect *seg,
 	return true;
 }
 
+bool
+comp_segments_rect_intersect(const struct comp_seg_rect *a, const struct comp_seg_rect *b, struct comp_seg_rect *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (a == NULL || b == NULL || a->w == 0 || a->h == 0 || b->w == 0 || b->h == 0) {
+		return false;
+	}
+	const int64_t x0 = a->x > b->x ? a->x : b->x;
+	const int64_t y0 = a->y > b->y ? a->y : b->y;
+	const int64_t ax1 = (int64_t)a->x + a->w;
+	const int64_t ay1 = (int64_t)a->y + a->h;
+	const int64_t bx1 = (int64_t)b->x + b->w;
+	const int64_t by1 = (int64_t)b->y + b->h;
+	const int64_t x1 = ax1 < bx1 ? ax1 : bx1;
+	const int64_t y1 = ay1 < by1 ? ay1 : by1;
+	if (x1 <= x0 || y1 <= y0) {
+		return false;
+	}
+	out->x = (int32_t)x0;
+	out->y = (int32_t)y0;
+	out->w = (uint32_t)(x1 - x0);
+	out->h = (uint32_t)(y1 - y0);
+	return true;
+}
+
+bool
+comp_segments_canvas_from_tile(const struct comp_seg_rect *tile,
+                               const struct comp_seg_rect *canvas,
+                               uint32_t tile_w,
+                               uint32_t tile_h,
+                               struct comp_seg_rect *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (tile == NULL || canvas == NULL || tile_w == 0 || tile_h == 0 || tile->w == 0 || tile->h == 0 ||
+	    tile->x < 0 || tile->y < 0) {
+		return false;
+	}
+	// Each edge where those tile pixels land when the whole tile is woven
+	// over the whole canvas (round(v * canvas / tile)).
+	const int64_t x0 = seg_scale_round(tile->x, canvas->w, tile_w);
+	const int64_t y0 = seg_scale_round(tile->y, canvas->h, tile_h);
+	const int64_t x1 = seg_scale_round((int64_t)tile->x + tile->w, canvas->w, tile_w);
+	const int64_t y1 = seg_scale_round((int64_t)tile->y + tile->h, canvas->h, tile_h);
+	if (x1 <= x0 || y1 <= y0) {
+		return false;
+	}
+	out->x = (int32_t)(canvas->x + x0);
+	out->y = (int32_t)(canvas->y + y0);
+	out->w = (uint32_t)(x1 - x0);
+	out->h = (uint32_t)(y1 - y0);
+	return true;
+}
+
 static uint32_t
 seg_overhang_edge(int64_t v, uint32_t limit)
 {
@@ -963,6 +1022,31 @@ seg_overhang_edge(int64_t v, uint32_t limit)
 		return 0;
 	}
 	return v < (int64_t)limit ? (uint32_t)v : limit;
+}
+
+//! floor(v * num / den) and ceil(v * num / den), v/num/den >= 0.
+static int64_t
+seg_scale_floor(int64_t v, int64_t num, int64_t den)
+{
+	return den > 0 ? (v * num) / den : 0;
+}
+
+static int64_t
+seg_scale_ceil(int64_t v, int64_t num, int64_t den)
+{
+	return den > 0 ? (v * num + den - 1) / den : 0;
+}
+
+/*!
+ * Place a cut of @p share tile px over [@p need0, @p need1) inside a tile of
+ * @p tile px: at the need's own start, or as far as the tile allows. A cut at
+ * least as long as the need always covers it; a shorter one keeps its start.
+ */
+static int64_t
+seg_share_start(int64_t need0, int64_t share, int64_t tile)
+{
+	const int64_t last = tile - share; // the furthest start that stays in the tile
+	return need0 < last ? need0 : last;
 }
 
 enum comp_segments_overhang_verdict
@@ -1014,39 +1098,55 @@ comp_segments_overhang_clip(const struct comp_segments_overhang_in *in, struct c
 		return COMP_SEG_OVERHANG_ON_PANEL;
 	}
 
-	// The kept part, window px: the DP canvas, and what the tile rect maps.
+	// The part on the panel, window px.
 	struct comp_seg_rect keep;
 	keep.x = (int32_t)(kx0 - in->window.x);
 	keep.y = (int32_t)(ky0 - in->window.y);
 	keep.w = (uint32_t)(kx1 - kx0);
 	keep.h = (uint32_t)(ky1 - ky0);
-	struct comp_seg_rect tile;
-	if (!comp_segments_tile_rect(&keep, &in->canvas, in->view_w, in->view_h, &tile)) {
+
+	// ... in tile px, rounded outward so its mapping back covers it whole.
+	const int64_t rx0 = kx0 - cx0;
+	const int64_t ry0 = ky0 - cy0;
+	const int64_t rx1 = kx1 - cx0;
+	const int64_t ry1 = ky1 - cy0;
+	int64_t nx0 = seg_scale_floor(rx0, in->view_w, in->canvas.w);
+	int64_t ny0 = seg_scale_floor(ry0, in->view_h, in->canvas.h);
+	int64_t nx1 = seg_scale_ceil(rx1, in->view_w, in->canvas.w);
+	int64_t ny1 = seg_scale_ceil(ry1, in->view_h, in->canvas.h);
+	nx1 = nx1 < (int64_t)in->view_w ? nx1 : (int64_t)in->view_w;
+	ny1 = ny1 < (int64_t)in->view_h ? ny1 : (int64_t)in->view_h;
+	if (nx1 <= nx0 || ny1 <= ny0) {
 		return COMP_SEG_OVERHANG_OFF_PANEL; // thinner than one tile pixel
 	}
+	struct comp_seg_rect need = {(int32_t)nx0, (int32_t)ny0, (uint32_t)(nx1 - nx0), (uint32_t)(ny1 - ny0)};
 
 	/*
-	 * Cap the tile at the bridge's share. For tiles the renderer sized at the
-	 * panel's own scale the kept part already fits, and this trims at most the
-	 * pixel nearest-rounding can add. The DP canvas loses the same span at the
-	 * same far edge, so the tile and the canvas keep one scale (clip, never
-	 * scale).
+	 * The bridge's per-tile share, at its real offset over the need. Its size
+	 * depends only on the tile size, never on where the window is, so a drag
+	 * across the panel's edge moves the cut and keeps the box: no egress
+	 * rebuild and no DP-input re-create per frame of the drag.
 	 */
-	if (tile.w > cap_w) {
-		tile.w = cap_w;
-		const int64_t end =
-		    (int64_t)in->canvas.x + seg_scale_round((int64_t)tile.x + tile.w, in->canvas.w, in->view_w);
-		keep.w = end > keep.x ? (uint32_t)(end - keep.x) : 1u;
-	}
-	if (tile.h > cap_h) {
-		tile.h = cap_h;
-		const int64_t end =
-		    (int64_t)in->canvas.y + seg_scale_round((int64_t)tile.y + tile.h, in->canvas.h, in->view_h);
-		keep.h = end > keep.y ? (uint32_t)(end - keep.y) : 1u;
+	const int64_t share_w = cap_w < in->view_w ? cap_w : in->view_w;
+	const int64_t share_h = cap_h < in->view_h ? cap_h : in->view_h;
+	struct comp_seg_rect tile;
+	tile.x = (int32_t)seg_share_start(nx0, share_w, in->view_w);
+	tile.y = (int32_t)seg_share_start(ny0, share_h, in->view_h);
+	tile.w = (uint32_t)share_w;
+	tile.h = (uint32_t)share_h;
+
+	// The DP canvas comes from the cut itself, never from keep, so the tile
+	// and the canvas share one scale (2873 px on the panel can be 2874 px of
+	// tile content).
+	struct comp_seg_rect canvas;
+	if (!comp_segments_canvas_from_tile(&tile, &in->canvas, in->view_w, in->view_h, &canvas)) {
+		return COMP_SEG_OVERHANG_NO_INPUT;
 	}
 
+	out->keep = keep;
+	out->need = need;
 	out->tile = tile;
-	out->canvas = keep;
+	out->canvas = canvas;
 	out->box_w = in->cols * tile.w;
 	out->box_h = in->rows * tile.h;
 	return COMP_SEG_OVERHANG_CLIPPED;
