@@ -523,7 +523,11 @@ cube vanished"; no window-relative Kooima line for the whole unplug). Decision:
    listed and its plug-in wins no screen — a manager that can move the window handle (D3D11,
    including the #918 hub; OpenGL; Vulkan on Windows) picks the target with
    `comp_segments_handback_decide` (pure, unit-tested): a listed screen whose DP is ready — it
-   reports its screen's pixel and physical size, which the window metrics are built from —
+   reports its screen's pixel and physical size, which the window metrics are built from. "Ready"
+   means the geometry is known, not that the DP is weaving: a vendor DP whose weaver is still
+   pending may report its attached panel's kept geometry (the Leia plug-in does,
+   DisplayXR/displayxr-leia-plugin#471) and flat-blits until its weaver is up; the departed home's
+   DP reports nothing, since its panel is not attached, so it is never a target —
    preferring the DP that already holds the window (nothing is re-made), else the ready screen the
    window covers most, whose window-holding DP is made while the old holder still holds the
    window. That DP moves into the session's primary slot and weaves the window on its own screen's
