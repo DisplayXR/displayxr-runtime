@@ -12,8 +12,10 @@
  * floor, whose engagement is read through `t_input_arbiter_set_floor_engagement`
  * exactly as the qwerty builder installs it.
  *
- * Covers: engage the provider -> it holds; qwerty input -> qwerty takes it
- * back (with the reported profile unchanged); presence loss -> the last
+ * Covers: nothing engaged -> the keyboard holds (from generation 1); the
+ * first pinch -> the provider; qwerty input -> qwerty takes it back (with the
+ * reported profile unchanged); no floor -> a never-engaged slot provider
+ * holds by rank; presence loss -> the last
  * engaged present candidate, and an old engagement does not reclaim on
  * return; a provider without the slot keeps today's behaviour; a pin and a
  * PreferredPlugin stop the switching; `ControllerSwitching` = presence is
@@ -213,6 +215,7 @@ client(uint64_t key, const char *exe)
 struct fixture_options
 {
 	bool with_leap = false;
+	bool no_floor = false;
 	bool switching_use = true;
 	std::string user_default;
 	std::map<std::string, std::string> pins;
@@ -274,15 +277,19 @@ struct fixture
 			l_left_i = g_sys.add(&l_left);
 			g_sys.add(&l_right);
 		}
-		q_left_i = g_sys.add(&q_left);
-		g_sys.add(&q_right);
+		if (!opt.no_floor) {
+			q_left_i = g_sys.add(&q_left);
+			g_sys.add(&q_right);
+		}
 
 		t_input_arbiter_note_provider_pair(&g_cam.iface, instance_of(g_cam), 50, &c_left, &c_right);
 		if (opt.with_leap) {
 			t_input_arbiter_note_provider_pair(&g_leap.iface, instance_of(g_leap), 60, &l_left, &l_right);
 		}
-		t_input_arbiter_note_qwerty_pair(&q_left, &q_right);
-		t_input_arbiter_set_floor_engagement(fake_floor_engaged);
+		if (!opt.no_floor) {
+			t_input_arbiter_note_qwerty_pair(&q_left, &q_right);
+			t_input_arbiter_set_floor_engagement(fake_floor_engaged);
+		}
 		t_input_arbiter_install(&g_sys.base);
 		REQUIRE(g_sys.base.input_selection != nullptr);
 	}
@@ -335,44 +342,62 @@ now_ns()
 } // namespace
 
 
-TEST_CASE("engagement: never-engaged keeps rank order; qwerty input takes the role, a pinch takes it back",
+TEST_CASE("engagement: nothing engaged -> the keyboard holds; a pinch takes the hand, qwerty input takes it back",
           "[input_engagement]")
 {
 	fixture f;
+	// Generation 1 already: a slot provider that has not been engaged does not hold a hand while
+	// the floor exists — the app starts on the emulated controllers, not on controllers that
+	// report nothing until the user touches the mouse (the first live run's bug).
+	struct xrt_system_roles global = XRT_SYSTEM_ROLES_INIT;
+	REQUIRE(g_sys.base.get_roles(&g_sys.base, &global) == XRT_SUCCESS);
+	CHECK(global.left == f.q_left_i);
+	CHECK(global.right == f.q_left_i + 1);
+	CHECK(global.generation_id == 1);
 	struct xrt_system_roles r = f.settle(f.a, 400);
-	CHECK(r.left == f.c_left_i); // nobody engaged: rank order, the provider outranks the floor
+	CHECK(r.left == f.q_left_i);
+	CHECK(r.right == f.q_left_i + 1);
+	// Profile stability (#6): the floor masquerades as the top provider's profile, so the
+	// provider <-> qwerty swap is a pose-source change, not an interaction-profile change.
 	const enum xrt_device_name profile = r.left_profile;
 	CHECK(profile == XRT_DEVICE_SIMPLE_CONTROLLER);
 	const uint64_t g0 = r.generation_id;
+
+	// The first pinch (left hand): the provider takes that hand only.
+	g_cam.engaged[0].store(now_ns());
+	r = f.wait_left(f.a, f.c_left_i);
+	CHECK(r.left == f.c_left_i);
+	CHECK(r.right == f.q_left_i + 1); // the right hand was not engaged: still the keyboard's
+	CHECK(r.generation_id > g0);
+	CHECK(r.left_profile == profile);
+	const uint64_t g1 = r.generation_id;
+
+	// Pinching on: the leader refreshes its own engagement — nothing moves.
+	g_cam.engaged[0].store(now_ns());
+	r = f.settle(f.a, 400);
+	CHECK(r.left == f.c_left_i);
+	CHECK(r.generation_id == g1);
 
 	// The user reaches for the keyboard (a key aimed at the left emulated controller).
 	g_q_input[0].store(now_ns());
 	r = f.wait_left(f.a, f.q_left_i);
 	CHECK(r.left == f.q_left_i);
-	CHECK(r.right == f.c_left_i + 1); // right untouched by a left-hand input: still the provider's
-	CHECK(r.generation_id > g0);
-	// Profile stability (#6): the floor masquerades as the top provider's profile, so the
-	// provider <-> qwerty swap is a pose-source change, not an interaction-profile change.
-	CHECK(r.left_profile == profile);
-	const uint64_t g1 = r.generation_id;
-
-	// Typing on: the leader refreshes its own engagement — nothing moves.
-	g_q_input[0].store(now_ns());
-	r = f.settle(f.a, 400);
-	CHECK(r.left == f.q_left_i);
-	CHECK(r.generation_id == g1);
-
-	// A pinch: the provider takes the hand back.
-	g_cam.engaged[0].store(now_ns());
-	r = f.wait_left(f.a, f.c_left_i);
-	CHECK(r.left == f.c_left_i);
 	CHECK(r.generation_id > g1);
 	CHECK(r.left_profile == profile);
 
 	// The in-process implicit client follows the same walk.
-	struct xrt_system_roles global = XRT_SYSTEM_ROLES_INIT;
 	REQUIRE(g_sys.base.get_roles(&g_sys.base, &global) == XRT_SUCCESS);
-	CHECK(global.left == f.c_left_i);
+	CHECK(global.left == f.q_left_i);
+}
+
+TEST_CASE("engagement: with no floor a never-engaged slot provider holds by rank", "[input_engagement]")
+{
+	fixture_options opt;
+	opt.no_floor = true; // EmulatedControllers = 0
+	fixture f(opt);
+	struct xrt_system_roles r = f.settle(f.a, 400);
+	CHECK(r.left == f.c_left_i);
+	CHECK(r.right == f.c_left_i + 1);
 }
 
 TEST_CASE("engagement: presence loss falls to the last engaged; an old pinch does not reclaim on return",
@@ -415,11 +440,13 @@ TEST_CASE("engagement: a per-app pin is a hard choice — no switching for that 
 	fixture_options opt;
 	opt.pins["A.exe"] = "cam";
 	fixture f(opt);
-	REQUIRE(f.roles(f.a).left == f.c_left_i);
-	REQUIRE(f.roles(f.b).left == f.c_left_i);
+	REQUIRE(f.roles(f.a).left == f.c_left_i); // A pinned: the provider, engaged or not
+	REQUIRE(f.roles(f.b).left == f.q_left_i); // B: nothing engaged -> the keyboard
+	g_cam.engaged[0].store(now_ns());
+	CHECK(f.wait_left(f.b, f.c_left_i).left == f.c_left_i); // B follows the pinch
 	g_q_input[0].store(now_ns());
-	CHECK(f.wait_left(f.b, f.q_left_i).left == f.q_left_i); // B (no pin) follows the keyboard
-	CHECK(f.roles(f.a).left == f.c_left_i);                 // A stays pinned
+	CHECK(f.wait_left(f.b, f.q_left_i).left == f.q_left_i); // ...and the keyboard
+	CHECK(f.roles(f.a).left == f.c_left_i);                 // A stays pinned throughout
 }
 
 TEST_CASE("engagement: PreferredPlugin naming a controller provider stops the switching", "[input_engagement]")

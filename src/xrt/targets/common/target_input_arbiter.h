@@ -56,9 +56,11 @@
  * candidates for a hand, the most recently ENGAGED one wins
  * (@ref xrt_input_plugin_iface::get_engaged_ns for a provider, the last
  * keyboard / mouse input aimed at an emulated controller for the qwerty
- * floor), ties and never-engaged keeping rank order, and a provider without
- * the slot counting as engaged continuously while present (so it behaves
- * exactly as before). Presence still gates; a pin, an app request,
+ * floor), ties keeping rank order. The floor is the DEFAULT holder (never
+ * touched still beats a provider that has not been engaged since it became
+ * present, which holds a hand only when nothing else is eligible), and a
+ * provider without the slot counts as engaged continuously while present (so
+ * it behaves exactly as before). Presence still gates; a pin, an app request,
  * `Policy\Lock`'s machine default and `PreferredPlugin` stay hard choices for
  * the clients they apply to; `ControllerSwitching` = presence restores the
  * pure rank walk. Engagement is read on the presence poll thread, only while

@@ -438,11 +438,21 @@ candidate_store_verdict_locked(struct t_input_candidate *cand, bool present)
 
 /*!
  * ADR-034 Amendment 6: @p cand's engagement for one hand as the walk compares
- * it. A provider without the slot is engaged continuously while present (so
- * it keeps the role exactly as before the amendment); an engagement from
- * before the candidate's current present streak does not count (a provider
- * coming back does not reclaim the role on an old pinch). Caller holds the
- * mutex.
+ * it — higher wins, ties keep rank order. Three tiers:
+ *
+ * - A provider WITHOUT the slot is engaged continuously while present
+ *   (@ref ARBITER_ENGAGED_ALWAYS), so it keeps the role exactly as before the
+ *   amendment.
+ * - The emulated floor is the DEFAULT holder: its last input aimed at that
+ *   controller, or 1 when the keyboard was never touched — so it holds the
+ *   hand over a provider that has not been engaged, from generation 1 on.
+ * - A provider WITH the slot counts only once it has been engaged since its
+ *   latest return to PRESENT (a provider coming back does not reclaim on an
+ *   old pinch); until then 0, the dormant tier — it holds the hand only when
+ *   it is the only eligible candidate (no floor: EmulatedControllers = 0),
+ *   by rank among other dormant ones.
+ *
+ * Caller holds the mutex.
  */
 static int64_t
 effective_engaged_locked(const struct t_input_candidate *cand, bool want_left)
@@ -451,7 +461,11 @@ effective_engaged_locked(const struct t_input_candidate *cand, bool want_left)
 		return ARBITER_ENGAGED_ALWAYS;
 	}
 	const int64_t at = cand->engaged_ns[want_left ? 0 : 1];
-	return at > cand->present_since_ns ? at : 0;
+	const int64_t counted = at > cand->present_since_ns ? at : 0;
+	if (cand->iface == NULL) {
+		return counted > 1 ? counted : 1; // the floor: never touched = the default holder
+	}
+	return counted;
 }
 
 /*!
@@ -459,9 +473,10 @@ effective_engaged_locked(const struct t_input_candidate *cand, bool want_left)
  * Returns NULL when nothing does.
  *
  * @p by_engagement false: the first in priority order (presence-gated rank,
- * ADR-034 Amendment 3). True (Amendment 6): the most recently engaged one,
- * ties — never-engaged included — keeping priority order, so a box where
- * nobody engages anything resolves exactly like the rank walk.
+ * ADR-034 Amendment 3). True (Amendment 6): the highest
+ * @ref effective_engaged_locked — the most recently engaged candidate, the
+ * keyboard floor by default, a never-engaged slot provider only when nothing
+ * else is eligible — ties keeping priority order.
  *
  * Resolved per hand on purpose: a provider that supplies only one
  * controller should leave the other hand to the next-ranked candidate,

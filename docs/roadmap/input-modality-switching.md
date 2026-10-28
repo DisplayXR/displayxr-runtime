@@ -207,7 +207,8 @@ devices held the controllers permanently, and the keyboard never got them
 back. ADR-034 *Amendment 6* adds an engagement reading next to presence —
 `get_engaged_ns` (a pinch, not visibility), the qwerty floor's last input
 aimed at an emulated controller — and the controller walk picks the most
-recently engaged present candidate (rank on ties; providers without the slot
+recently engaged present candidate (the keyboard by default — a provider that
+has not been engaged yet holds only when nothing else can; rank on ties; providers without the slot
 count as always engaged, so nothing changes for them). Pins and
 `PreferredPlugin` stay hard choices; `ControllerSwitching = presence`
 restores A exactly. The masquerade below keeps the swap event-free. Spec:

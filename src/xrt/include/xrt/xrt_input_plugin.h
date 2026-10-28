@@ -592,7 +592,11 @@ struct xrt_input_plugin_iface
 	 * would steal the role back from the keyboard. Engagement is separate
 	 * from presence: a provider that is ABSENT never wins, however recent
 	 * its last engagement, and an engagement older than the provider's
-	 * latest return to PRESENT does not count.
+	 * latest return to PRESENT does not count. Until it has been engaged
+	 * (since that return), a provider implementing this slot does NOT hold
+	 * the hand while another eligible candidate exists — the keyboard /
+	 * mouse emulated controllers are the default holder — and holds it by
+	 * rank only when it is the only candidate.
 	 *
 	 * Called from the arbiter's presence poll thread (never a client
 	 * thread), rate-limited to the presence poll (~250 ms), for every

@@ -413,9 +413,14 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    With `ControllerSwitching = use` (the default, item 3c) and no
    controller preference for the client (§3 *Per-client selection*), each
    hand's controller role goes to the **most recently engaged** present
-   candidate instead of the highest-ranked one; ties and never-engaged keep
-   the rank order, so with nobody engaging anything the result is the
-   Amendment 3 walk. Engagement per candidate and hand:
+   candidate instead of the highest-ranked one; ties keep the rank order.
+   **The keyboard is the default holder:** a provider that implements the
+   slot but has not engaged that hand since its latest return to `PRESENT`
+   does not hold it while any other eligible candidate exists (the floor, or
+   an engaged / slot-less present provider); it holds by rank only when it
+   is the only candidate (`EmulatedControllers = 0`). An app therefore starts
+   on the emulated controllers and the first pinch moves the hand to the
+   provider. Engagement per candidate and hand:
    - a provider implementing `get_engaged_ns` — its last deliberate use
      (camera hands: a pinch; a controller: a button / trigger / stick edge;
      never mere visibility);
@@ -423,7 +428,8 @@ a provider whose profile qwerty cannot emulate is reported honestly.
      so it keeps the role exactly as before (and beats a slot provider that
      is merely present);
    - the qwerty floor — the last keyboard / mouse input aimed at that
-     emulated controller (`qwerty_controller_last_input_ns`, installed with
+     emulated controller, and never touched counts as the default holder
+     (above a dormant slot provider, below any engaged candidate) (`qwerty_controller_last_input_ns`, installed with
      `t_input_arbiter_set_floor_engagement`); the qwerty head's WASD /
      mouse-look is navigation and does not count.
    An engagement older than the candidate's latest return to `PRESENT` does

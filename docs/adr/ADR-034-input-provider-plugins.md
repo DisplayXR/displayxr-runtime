@@ -685,8 +685,14 @@ role. The rank is the wrong axis; the user's last deliberate action is the right
    button / trigger / stick edge for a physical controller — never mere visibility, or a hand
    drifting through the frame would steal the role back.
 2. **Most recently engaged present candidate wins**, per hand, when nothing names a controller
-   candidate for that client. Ties and never-engaged fall back to the Amendment 3 rank order, so a
-   box where nobody engages anything resolves exactly as before. A provider **without** the slot is
+   candidate for that client; ties keep the Amendment 3 rank order. **The keyboard is the default
+   holder:** a provider that implements the slot but has not engaged that hand since its latest
+   return to PRESENT does **not** hold it while any other eligible candidate exists — the qwerty
+   floor (never touched counts as the default holder, not as "never engaged") or an engaged /
+   slot-less present provider holds instead. A dormant slot provider still holds by rank when it is
+   the only candidate (`EmulatedControllers` = 0, no floor). So an app starts on the keyboard, and
+   the first pinch moves the hand to the camera — rather than starting on controllers that report
+   nothing until the user reaches for the mouse (found in the first live run). A provider **without** the slot is
    *engaged continuously while present* — today's behaviour, bit-identical (a Leap provider keeps
    the hands for as long as it is plugged in, and still beats a slot provider that is merely
    present). The qwerty floor's engagement is the last keyboard / mouse input aimed at that
@@ -694,7 +700,8 @@ role. The rank is the wrong axis; the user's last deliberate action is the right
    the movement / look keys and mouse deltas focused on it — the qwerty head's own WASD /
    mouse-look is navigation and does not count).
 3. **Hysteresis is structural.** A role moves only when another present candidate engages, or on
-   presence loss (to the most recently engaged remaining present candidate, else rank). An
+   presence loss (to the most recently engaged remaining present candidate, else the floor, else
+   rank). An
    engagement older than the candidate's latest return to PRESENT does not count, so a provider
    coming back does not reclaim the role on a stale pinch. The leader refreshing its own engagement
    moves nothing.
