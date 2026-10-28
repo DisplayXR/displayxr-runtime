@@ -32,8 +32,11 @@ enum u_camera_profile_result
 //! Parse a complete JSON object. Missing fields use the qwerty defaults.
 //! Scalar bounds match XrCameraRigDXR; geometry-dependent comfort is applied by
 //! the eligible instance. Only horizontalFovDeg needs a positive, finite canvas aspect.
-//! Unknown/duplicate keys, conflicting aliases and non-finite/non-number values
-//! are errors. On failure out is untouched. Optional error receives a reason.
+//! Duplicate keys, conflicting aliases, malformed JSON and non-finite/non-number
+//! values of known keys are errors: out is untouched and the optional error
+//! buffer receives a reason. Unknown keys are skipped whatever their value
+//! (#2450): on success the error buffer is empty, or names the skipped keys so
+//! the caller can warn once.
 bool
 u_camera_profile_parse(
     const char *json, float canvas_aspect, struct u_camera_profile *out, char *error, size_t error_size);
@@ -42,6 +45,7 @@ u_camera_profile_parse(
 //! <profile_dir>/<exe_basename>.json. An invalid override does not fall through
 //! to the per-title file. Missing per-title files return NONE; other failures
 //! return INVALID. Reads at most 64 KiB and never creates files/directories.
+//! On LOADED the error buffer holds the parse notice (skipped keys) or is empty.
 enum u_camera_profile_result
 u_camera_profile_load(const char *exe_basename,
                       const char *profile_dir,
