@@ -1960,3 +1960,304 @@ TEST_CASE("rect intersect (#1575)", "[comp_segments][overhang]")
 	CHECK(r.w == 100);
 	CHECK(r.h == 50);
 }
+
+/*
+ * #1575: the overhang episode's proof (its end line). A resize restarts it;
+ * the DP input's baseline waits for the weave to catch up with the box.
+ */
+namespace {
+
+// The counts and sizes the hub reads before each clipped frame's submit.
+struct proof_rig
+{
+	comp_segments_overhang_proof p{};
+	uint64_t rebuilds = 0;
+	uint64_t dp_creates = 0;
+	uint32_t dp_w = 0, dp_h = 0;
+	uint32_t eg_w = 0, eg_h = 0;
+
+	comp_segments_overhang_proof_event
+	frame(uint32_t win_w, uint32_t win_h, uint32_t view_w, uint32_t view_h, uint32_t box_w, uint32_t box_h)
+	{
+		comp_segments_overhang_proof_in in{};
+		in.window_w = win_w;
+		in.window_h = win_h;
+		in.cols = 2;
+		in.rows = 1;
+		in.view_w = view_w;
+		in.view_h = view_h;
+		in.box_w = box_w;
+		in.box_h = box_h;
+		in.egress_rebuilds = rebuilds;
+		in.dp_creates = dp_creates;
+		in.dp_settled = (eg_w == box_w && eg_h == box_h) || (dp_w == box_w && dp_h == box_h);
+		return comp_segments_overhang_proof_step(&p, &in);
+	}
+
+	// The weave crops a slot of this box into a new DP input.
+	void
+	dp_made(uint32_t w, uint32_t h)
+	{
+		dp_creates++;
+		dp_w = w;
+		dp_h = h;
+	}
+
+	comp_segments_overhang_proof_result
+	end()
+	{
+		comp_segments_overhang_proof_result r{};
+		REQUIRE(comp_segments_overhang_proof_end(&p, rebuilds, dp_creates, &r));
+		CHECK_FALSE(p.open);
+		return r;
+	}
+};
+
+} // namespace
+
+TEST_CASE("overhang proof: the 2026-10-28 right drag — Windows' rescale tail is a resize, the drag proves "
+          "0/0/0 (#1575)",
+          "[comp_segments][overhang]")
+{
+	// G16, cube_handle_d3d12_win at 5220 px wide. Windows rescaled it as its
+	// majority came back onto the panel: 2606x427 -> 5220x865 -> 5220x863.
+	// The ring was worst-case (churn since 14:16:13.920, latched later), so
+	// every slot went through the output-device crop and its DP input.
+	proof_rig r;
+	r.rebuilds = 10;
+	r.eg_w = 3840;
+	r.eg_h = 2160;
+	r.dp_creates = 40;
+	r.dp_w = 2606; // the DP input of the 2606x427 window's slots
+	r.dp_h = 213;
+
+	// 14:16:15.499: the first frame, tiles painted for 5220x865.
+	CHECK(r.frame(5220, 863, 2610, 432, 3840, 432) == COMP_SEG_PROOF_STARTED);
+	// 14:16:15.504: `scanout swapchain follows the window, 5220x865 -> 5220x863`.
+	CHECK(r.frame(5220, 863, 2610, 431, 3840, 431) == COMP_SEG_PROOF_RESIZED);
+	// 14:16:15.505: the weave is still on an older slot (2592x380's 2592x190 box).
+	r.dp_made(2592, 190);
+	CHECK(r.frame(5220, 863, 2610, 431, 3840, 431) == COMP_SEG_PROOF_FRAME);
+	// 14:16:15.508: the first 3840x431 slot reaches the weave.
+	r.dp_made(3840, 431);
+	// The drag, 14:16:15.5 - 14:16:27.3: no size line at all.
+	for (int i = 0; i < 667; i++) {
+		CHECK(r.frame(5220, 863, 2610, 431, 3840, 431) == COMP_SEG_PROOF_FRAME);
+	}
+	const auto res = r.end();
+	CHECK(res.frames == 670);
+	CHECK(res.resizes == 1);
+	CHECK(res.frames_at_size == 669);
+	REQUIRE(res.have_counts);
+	CHECK(res.box_w == 3840);
+	CHECK(res.box_h == 431);
+	CHECK(res.box_changes == 0);
+	CHECK(res.egress_rebuilds == 0);
+	CHECK(res.dp_creates == 0);
+	// The baseline taken on the second submit read the same run as
+	// "box changed 1 times, ... DP input re-created 2 times".
+	CHECK(r.dp_creates - 40 == 2);
+}
+
+TEST_CASE("overhang proof: the episode's own first box reaching the weave is not a re-create (#1575)",
+          "[comp_segments][overhang]")
+{
+	SECTION("latched worst-case ring: 2026-10-28 14:19:15, restore from maximize, then a pure drag")
+	{
+		proof_rig r;
+		r.rebuilds = 10;
+		r.eg_w = 3840;
+		r.eg_h = 2160;
+		r.dp_creates = 60;
+		r.dp_w = 3840; // the maximized window's 3840x974 box
+		r.dp_h = 974;
+		CHECK(r.frame(5220, 863, 2610, 431, 3840, 431) == COMP_SEG_PROOF_STARTED);
+		CHECK(r.frame(5220, 863, 2610, 431, 3840, 431) == COMP_SEG_PROOF_FRAME); // weave a frame behind
+		r.dp_made(3840, 431);
+		for (int i = 0; i < 2494; i++) {
+			CHECK(r.frame(5220, 863, 2610, 431, 3840, 431) == COMP_SEG_PROOF_FRAME);
+		}
+		const auto res = r.end();
+		CHECK(res.frames == 2496);
+		CHECK(res.resizes == 0);
+		REQUIRE(res.have_counts);
+		CHECK(res.box_changes == 0);
+		CHECK(res.egress_rebuilds == 0);
+		CHECK(res.dp_creates == 0); // the run logged 1
+	}
+	SECTION("content-sized ring: no crop, no DP input, settled at once (2026-10-28 D2 drag)")
+	{
+		proof_rig r;
+		r.rebuilds = 1;
+		CHECK(r.frame(3848, 2169, 1924, 1084, 3840, 1084) == COMP_SEG_PROOF_STARTED);
+		// The first frame's submit sizes the ring to the box: `rebuild #2`.
+		r.rebuilds = 2;
+		r.eg_w = 3840;
+		r.eg_h = 1084;
+		for (int i = 0; i < 8878; i++) {
+			CHECK(r.frame(3848, 2169, 1924, 1084, 3840, 1084) == COMP_SEG_PROOF_FRAME);
+		}
+		const auto res = r.end();
+		CHECK(res.frames == 8879);
+		REQUIRE(res.have_counts);
+		CHECK(res.box_changes == 0);
+		CHECK(res.egress_rebuilds == 0);
+		CHECK(res.dp_creates == 0);
+	}
+}
+
+TEST_CASE("overhang proof: a drag that does reallocate is still caught (#1575)", "[comp_segments][overhang]")
+{
+	proof_rig r;
+	r.eg_w = 3840;
+	r.eg_h = 1084;
+	CHECK(r.frame(3848, 2169, 1924, 1084, 3840, 1084) == COMP_SEG_PROOF_STARTED);
+	for (int i = 0; i < 10; i++) {
+		CHECK(r.frame(3848, 2169, 1924, 1084, 3840, 1084) == COMP_SEG_PROOF_FRAME);
+	}
+	// A cut that followed the window's position: the box changes at one
+	// window size and one tile size, on every frame of the drag.
+	for (uint32_t w = 3000; w < 3010; w++) {
+		CHECK(r.frame(3848, 2169, 1924, 1084, w, 1084) == COMP_SEG_PROOF_FRAME);
+		r.rebuilds++;
+		r.dp_made(w, 1084);
+	}
+	const auto res = r.end();
+	CHECK(res.resizes == 0);
+	REQUIRE(res.have_counts);
+	CHECK(res.box_changes == 10);
+	CHECK(res.egress_rebuilds == 10);
+	CHECK(res.dp_creates == 10);
+}
+
+TEST_CASE("overhang proof: an interactive resize opens one episode and the counts cover its last size (#1575)",
+          "[comp_segments][overhang]")
+{
+	proof_rig r;
+	r.eg_w = 3840;
+	r.eg_h = 2160; // the churn's worst-case ring
+	CHECK(r.frame(3898, 673, 1949, 336, 3840, 336) == COMP_SEG_PROOF_STARTED);
+	uint32_t starts = 0, resizes = 0;
+	for (uint32_t w = 3900; w <= 5220; w += 20) {
+		const uint32_t h = 673 + (w - 3900) / 7;
+		const auto ev = r.frame(w, h, w / 2, h / 2, 3840, h / 2);
+		starts += ev == COMP_SEG_PROOF_STARTED;
+		resizes += ev == COMP_SEG_PROOF_RESIZED;
+		r.dp_made(3840, h / 2);
+		r.rebuilds += (w % 200 == 0); // whatever the hysteresis does meanwhile
+	}
+	CHECK(starts == 0);
+	CHECK(resizes == 67);
+	const uint32_t last_h = (673 + (5220 - 3900) / 7) / 2;
+	for (int i = 0; i < 300; i++) {
+		CHECK(r.frame(5220, 673 + (5220 - 3900) / 7, 2610, last_h, 3840, last_h) == COMP_SEG_PROOF_FRAME);
+	}
+	// The R2 settle, 2 s after the last size change, is a real rebuild and is
+	// counted; with a content-sized ring the weave crops nothing more.
+	r.rebuilds++;
+	r.eg_w = 3840;
+	r.eg_h = last_h;
+	for (int i = 0; i < 300; i++) {
+		CHECK(r.frame(5220, 673 + (5220 - 3900) / 7, 2610, last_h, 3840, last_h) == COMP_SEG_PROOF_FRAME);
+	}
+	const auto res = r.end();
+	CHECK(res.resizes == 67);
+	CHECK(res.frames_at_size == 601);
+	REQUIRE(res.have_counts);
+	CHECK(res.box_changes == 0);
+	CHECK(res.egress_rebuilds == 1);
+	CHECK(res.dp_creates == 0);
+}
+
+TEST_CASE("overhang proof: the DP baseline waits a bounded time, and a short last size is not counted (#1575)",
+          "[comp_segments][overhang]")
+{
+	SECTION("a DP input that never reaches the box")
+	{
+		proof_rig r;
+		r.eg_w = 3840;
+		r.eg_h = 2160;
+		r.dp_w = 100;
+		r.dp_h = 100;
+		CHECK(r.frame(5220, 863, 2610, 431, 3840, 431) == COMP_SEG_PROOF_STARTED);
+		for (uint32_t i = 0; i < COMP_SEG_OVERHANG_PROOF_DP_WAIT + 1; i++) {
+			r.frame(5220, 863, 2610, 431, 3840, 431);
+		}
+		CHECK(r.p.dp_base_set);
+		r.dp_made(200, 200); // after the baseline: counted
+		r.frame(5220, 863, 2610, 431, 3840, 431);
+		const auto res = r.end();
+		REQUIRE(res.have_counts);
+		CHECK(res.dp_creates == 1);
+	}
+	SECTION("the episode ends on the frame after its last resize")
+	{
+		proof_rig r;
+		CHECK(r.frame(5220, 863, 2610, 432, 3840, 432) == COMP_SEG_PROOF_STARTED);
+		CHECK(r.frame(5220, 863, 2610, 431, 3840, 431) == COMP_SEG_PROOF_RESIZED);
+		const auto res = r.end();
+		CHECK(res.frames == 2);
+		CHECK(res.resizes == 1);
+		CHECK(res.frames_at_size == 1);
+		CHECK_FALSE(res.have_counts);
+		CHECK(res.dp_creates == 0);
+	}
+	SECTION("no episode")
+	{
+		comp_segments_overhang_proof p{};
+		comp_segments_overhang_proof_result res{};
+		res.frames = 7;
+		CHECK_FALSE(comp_segments_overhang_proof_end(&p, 1, 1, &res));
+		CHECK(res.frames == 0);
+	}
+}
+
+TEST_CASE("overhang: the 2026-10-28 D3 window — a drag that keeps its majority on the panel holds one box, and the "
+          "bridge carries 3840 px of its 5220 (#1575)",
+          "[comp_segments][overhang]")
+{
+	// 5220x863 with 2x1 tiles of 2610x431: the bridge's per-tile share is
+	// 1920, so the cut is 3840 window px wide wherever the window is. The
+	// window's far 1380 px from the panel's part are not carried: that is the
+	// black the laptop showed. The panel's part is always covered.
+	comp_segments_overhang_proof p{};
+	uint32_t starts = 0;
+	for (int32_t x = -5000; x <= -2900; x += 13) {
+		CAPTURE(x);
+		const auto in = overhang_in({x, 416, 5220, 863}, 2, 1, 2610, 431);
+		comp_segments_overhang o{};
+		REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+		CHECK(o.box_w == 3840);
+		CHECK(o.box_h == 431);
+		CHECK(o.canvas.w == 3840);
+		check_clip_invariants(in, o);
+
+		comp_segments_overhang_proof_in pin{};
+		pin.window_w = 5220;
+		pin.window_h = 863;
+		pin.cols = 2;
+		pin.rows = 1;
+		pin.view_w = 2610;
+		pin.view_h = 431;
+		pin.box_w = o.box_w;
+		pin.box_h = o.box_h;
+		pin.dp_settled = true;
+		starts += comp_segments_overhang_proof_step(&p, &pin) == COMP_SEG_PROOF_STARTED;
+	}
+	CHECK(starts == 1);
+	comp_segments_overhang_proof_result res{};
+	REQUIRE(comp_segments_overhang_proof_end(&p, 0, 0, &res));
+	REQUIRE(res.have_counts);
+	CHECK(res.resizes == 0);
+	CHECK(res.box_changes == 0);
+
+	// The episode's first frame in the log: `the window (5220x863 at -3476,416)
+	// ... the DP weaves 3840x863 at 0,0` — on the laptop (x >= 0) only 364 px
+	// of its 1744 px there are carried.
+	const auto in = overhang_in({-3476, 416, 5220, 863}, 2, 1, 2610, 432);
+	comp_segments_overhang o{};
+	REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+	CHECK(o.canvas.x == 0);
+	CHECK(o.canvas.w == 3840);
+	CHECK(-3476 + o.canvas.x + (int32_t)o.canvas.w == 364);
+}

@@ -1152,6 +1152,104 @@ comp_segments_overhang_clip(const struct comp_segments_overhang_in *in, struct c
 	return COMP_SEG_OVERHANG_CLIPPED;
 }
 
+//! Start a stretch of the proof at @p in's size: both baselines wait for the next frame.
+static void
+seg_proof_restart(struct comp_segments_overhang_proof *p, const struct comp_segments_overhang_proof_in *in)
+{
+	p->window_w = in->window_w;
+	p->window_h = in->window_h;
+	p->cols = in->cols;
+	p->rows = in->rows;
+	p->view_w = in->view_w;
+	p->view_h = in->view_h;
+	p->box_w = in->box_w;
+	p->box_h = in->box_h;
+	p->frames_at_size = 1;
+	p->box_changes = 0;
+	p->rebuild_base_set = false;
+	p->dp_base_set = false;
+	p->rebuild_base = 0;
+	p->dp_base = 0;
+	p->dp_wait = 0;
+}
+
+enum comp_segments_overhang_proof_event
+comp_segments_overhang_proof_step(struct comp_segments_overhang_proof *p,
+                                  const struct comp_segments_overhang_proof_in *in)
+{
+	if (p == NULL || in == NULL) {
+		return COMP_SEG_PROOF_FRAME;
+	}
+	if (!p->open) {
+		memset(p, 0, sizeof(*p));
+		p->open = true;
+		p->frames = 1;
+		seg_proof_restart(p, in);
+		return COMP_SEG_PROOF_STARTED;
+	}
+	p->frames++;
+
+	// A resize: the window or the tiles it was painted at changed size. The
+	// renderer follows the window a frame late, so either one counts.
+	if (in->window_w != p->window_w || in->window_h != p->window_h || in->cols != p->cols ||
+	    in->rows != p->rows || in->view_w != p->view_w || in->view_h != p->view_h) {
+		p->resizes++;
+		seg_proof_restart(p, in);
+		return COMP_SEG_PROOF_RESIZED;
+	}
+	p->frames_at_size++;
+
+	// The same size, a different box: the cut followed the window's position.
+	if (in->box_w != p->box_w || in->box_h != p->box_h) {
+		p->box_changes++;
+		p->box_w = in->box_w;
+		p->box_h = in->box_h;
+	}
+	if (!p->rebuild_base_set) {
+		p->rebuild_base_set = true;
+		p->rebuild_base = in->egress_rebuilds;
+	}
+	if (!p->dp_base_set) {
+		if (in->dp_settled || p->dp_wait >= COMP_SEG_OVERHANG_PROOF_DP_WAIT) {
+			p->dp_base_set = true;
+			p->dp_base = in->dp_creates;
+		} else {
+			p->dp_wait++;
+		}
+	}
+	return COMP_SEG_PROOF_FRAME;
+}
+
+bool
+comp_segments_overhang_proof_end(struct comp_segments_overhang_proof *p,
+                                 uint64_t egress_rebuilds,
+                                 uint64_t dp_creates,
+                                 struct comp_segments_overhang_proof_result *out)
+{
+	if (out != NULL) {
+		memset(out, 0, sizeof(*out));
+	}
+	if (p == NULL || !p->open) {
+		return false;
+	}
+	if (out != NULL) {
+		out->frames = p->frames;
+		out->frames_at_size = p->frames_at_size;
+		out->resizes = p->resizes;
+		out->box_w = p->box_w;
+		out->box_h = p->box_h;
+		out->have_counts = p->rebuild_base_set && p->dp_base_set;
+		if (out->have_counts) {
+			out->box_changes = p->box_changes;
+			out->egress_rebuilds =
+			    egress_rebuilds >= p->rebuild_base ? egress_rebuilds - p->rebuild_base : 0;
+			out->dp_creates = dp_creates >= p->dp_base ? dp_creates - p->dp_base : 0;
+		}
+	}
+	memset(p, 0, sizeof(*p));
+	return true;
+}
+
 bool
 comp_segments_source_rect(const struct comp_segment *seg,
                           const struct comp_seg_rect *canvas,

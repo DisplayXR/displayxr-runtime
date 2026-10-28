@@ -330,24 +330,17 @@ struct comp_hub_d3d11
 	//! is an output rect offset inside the window. Guarded by @ref seg_mutex:
 	//! a repaint weaves on the tier's repaint thread.
 	struct xrt_rect last_canvas;
-	//! An episode is in progress: one WARN when it starts, one line when it ends.
-	bool clip_episode;
 	//! The box was too big and the clip did not apply (said once per run of such frames).
 	bool clip_skip_logged;
-	uint64_t clip_episode_frames;
 	uint64_t clip_episodes;
 	uint64_t clip_frames;
 	/*!
-	 * The episode's proof that a drag reallocated nothing: the box it carried,
-	 * how often that box changed, and the egress rebuild / DP-input create
-	 * counts when its second frame began (its first frame may size the ring
-	 * once). Printed as deltas when the episode ends.
+	 * The episode in progress (`open`) and its proof that a drag reallocated
+	 * nothing: one WARN when it starts, one line when it ends, whose counts
+	 * cover the frames at the window's last size
+	 * (comp_segments_overhang_proof_step). Submit thread only.
 	 */
-	uint32_t clip_box_w, clip_box_h;
-	uint64_t clip_box_changes;
-	bool clip_base_set;
-	uint64_t clip_base_rebuilds;
-	uint64_t clip_base_dp_creates;
+	struct comp_segments_overhang_proof clip_proof;
 	/*! @} */
 
 	//! Monotonic app-frame counter — the one sequence every bridge fence uses.
@@ -367,8 +360,11 @@ struct comp_hub_d3d11
 	ID3D11Texture2D *dp_input_tex;
 	ID3D11ShaderResourceView *dp_input_srv;
 	uint32_t dp_input_w, dp_input_h;
-	//! #1575: times @ref dp_input_tex was (re)created, for the overhang episode's proof.
+	//! #1575: times @ref dp_input_tex was (re)created, and the size it was
+	//! last made at, for the overhang episode's proof. Guarded by @ref seg_mutex:
+	//! the weave writes them, the submit reads them.
 	uint64_t dp_input_creates;
+	uint32_t dp_input_made_w, dp_input_made_h;
 	//! #1178 — the format the crop scratch was created in, which must track the
 	//! EGRESS's rather than be assumed: the copy that fills it is dropped in
 	//! silence if the two are different DXGI typeless families.
@@ -3213,48 +3209,65 @@ comp_hub_d3d11_set_hud(struct comp_hub_d3d11 *s, const void *pixels, uint32_t w,
 	s->hud_live = true;
 }
 
-//! #1575: the egress rebuild and DP-input create counts, read together.
+/*!
+ * #1575: the egress rebuild and DP-input create counts, read together, and the
+ * size the DP input was last made at (0x0 = never).
+ */
 static void
-split_overhang_counts(struct comp_hub_d3d11 *s, uint64_t *out_rebuilds, uint64_t *out_dp_creates)
+split_overhang_counts(struct comp_hub_d3d11 *s,
+                      uint64_t *out_rebuilds,
+                      uint64_t *out_dp_creates,
+                      uint32_t *out_dp_w,
+                      uint32_t *out_dp_h)
 {
 	*out_rebuilds = s->xbridge != nullptr ? comp_xbridge_get_egress_rebuilds(s->xbridge) : 0;
 	*out_dp_creates = 0;
+	*out_dp_w = 0;
+	*out_dp_h = 0;
 	if (s->mutexes_init) {
 		os_mutex_lock(&s->seg_mutex);
 		*out_dp_creates = s->dp_input_creates;
+		*out_dp_w = s->dp_input_made_w;
+		*out_dp_h = s->dp_input_made_h;
 		os_mutex_unlock(&s->seg_mutex);
 	}
 }
 
 /*!
  * #1575: close an overhang episode. The one line it prints is the drag
- * check's proof: after the episode's first frame (which may size the egress
- * ring and the DP input once) the box should not have changed and nothing
- * should have been rebuilt, however far the window was dragged.
+ * check's proof: at the window's last size, after its first frame there, the
+ * box should not have changed and nothing should have been rebuilt, however
+ * far the window was dragged. Resizes before that are counted, not proved
+ * (comp_segments_overhang_proof_step).
  */
 static void
 split_overhang_end(struct comp_hub_d3d11 *s, const char *why)
 {
-	if (s->clip_episode) {
-		if (s->clip_base_set) {
-			uint64_t rebuilds = 0, dp_creates = 0;
-			split_overhang_counts(s, &rebuilds, &dp_creates);
-			U_LOG_W(
-			    "D3D11 hub: the overhang clip ends after %llu frames — %s. After its first frame the %ux%u "
-			    "box changed %llu times, the egress ring was rebuilt %llu times and the DP input "
-			    "re-created %llu times (#1575)",
-			    (unsigned long long)s->clip_episode_frames, why, s->clip_box_w, s->clip_box_h,
-			    (unsigned long long)s->clip_box_changes,
-			    (unsigned long long)(rebuilds - s->clip_base_rebuilds),
-			    (unsigned long long)(dp_creates - s->clip_base_dp_creates));
-		} else {
-			U_LOG_W("D3D11 hub: the overhang clip ends after %llu frame — %s (#1575)",
-			        (unsigned long long)s->clip_episode_frames, why);
-		}
+	if (!s->clip_proof.open) {
+		return;
 	}
-	s->clip_episode = false;
-	s->clip_episode_frames = 0;
-	s->clip_base_set = false;
+	uint64_t rebuilds = 0, dp_creates = 0;
+	uint32_t dp_w = 0, dp_h = 0;
+	split_overhang_counts(s, &rebuilds, &dp_creates, &dp_w, &dp_h);
+	struct comp_segments_overhang_proof_result r = {};
+	if (!comp_segments_overhang_proof_end(&s->clip_proof, rebuilds, dp_creates, &r)) {
+		return;
+	}
+	if (r.have_counts) {
+		U_LOG_W(
+		    "D3D11 hub: the overhang clip ends after %llu frames — %s. The window was resized %llu times in "
+		    "it. After the first of its %llu frames at its last size, the %ux%u box changed %llu times, the "
+		    "egress ring was rebuilt %llu times and the DP input re-created %llu times (#1575)",
+		    (unsigned long long)r.frames, why, (unsigned long long)r.resizes,
+		    (unsigned long long)r.frames_at_size, r.box_w, r.box_h, (unsigned long long)r.box_changes,
+		    (unsigned long long)r.egress_rebuilds, (unsigned long long)r.dp_creates);
+	} else {
+		U_LOG_W(
+		    "D3D11 hub: the overhang clip ends after %llu frames — %s. The window was resized %llu times in "
+		    "it, and its last size held %llu frames, too few to count (#1575)",
+		    (unsigned long long)r.frames, why, (unsigned long long)r.resizes,
+		    (unsigned long long)r.frames_at_size);
+	}
 }
 
 /*!
@@ -3365,34 +3378,40 @@ split_overhang_clip(struct comp_hub_d3d11 *s,
 	out->canvas_w = o.canvas.w;
 	out->canvas_h = o.canvas.h;
 
+	/*
+	 * The episode's proof (comp_segments_overhang_proof_step). The counts are
+	 * read before this frame's submit, which may size the egress ring once.
+	 * The DP input is settled for this box when it was already made at it, or
+	 * when the egress ring is the box's own size (the weave then crops nothing
+	 * and makes no DP input). The ring is (re)allocated by this thread only.
+	 */
+	struct comp_segments_overhang_proof_in pin = {};
+	pin.window_w = in.window.w;
+	pin.window_h = in.window.h;
+	pin.cols = cols;
+	pin.rows = rows;
+	pin.view_w = view_w;
+	pin.view_h = view_h;
+	pin.box_w = o.box_w;
+	pin.box_h = o.box_h;
+	{
+		uint32_t dp_w = 0, dp_h = 0, eg_w = 0, eg_h = 0;
+		split_overhang_counts(s, &pin.egress_rebuilds, &pin.dp_creates, &dp_w, &dp_h);
+		comp_xbridge_get_egress_dims(s->xbridge, &eg_w, &eg_h);
+		pin.dp_settled = (eg_w == o.box_w && eg_h == o.box_h) || (dp_w == o.box_w && dp_h == o.box_h);
+	}
+
 	// One WARN per episode: a drag moves the clip every frame, and the
-	// window's position is not news while it keeps overhanging.
-	if (!s->clip_episode) {
-		s->clip_episode = true;
-		s->clip_episode_frames = 0;
+	// window's position is not news while it keeps overhanging. A resize
+	// restarts the proof quietly: an interactive one changes size every frame.
+	if (comp_segments_overhang_proof_step(&s->clip_proof, &pin) == COMP_SEG_PROOF_STARTED) {
 		s->clip_episodes++;
-		s->clip_box_w = o.box_w;
-		s->clip_box_h = o.box_h;
-		s->clip_box_changes = 0;
-		s->clip_base_set = false;
 		U_LOG_W(
 		    "D3D11 hub: the window (%ux%u at %d,%d) overhangs the panel (%ux%u at %d,%d) by %ux%u — clipped: "
 		    "the bridge carries %ux%u tiles of %ux%u (of %ux%u) and the DP weaves %ux%u at %d,%d (#1575)",
 		    in.window.w, in.window.h, in.window.x, in.window.y, in.panel.w, in.panel.h, in.panel.x, in.panel.y,
 		    o.over_left + o.over_right, o.over_top + o.over_bottom, cols, rows, o.tile.w, o.tile.h, view_w,
 		    view_h, o.canvas.w, o.canvas.h, o.canvas.x, o.canvas.y);
-	} else {
-		// From the second frame on: the baseline the end line diffs against,
-		// and every change of the box (a resize; a drag never makes one).
-		if (!s->clip_base_set) {
-			s->clip_base_set = true;
-			split_overhang_counts(s, &s->clip_base_rebuilds, &s->clip_base_dp_creates);
-		}
-		if (o.box_w != s->clip_box_w || o.box_h != s->clip_box_h) {
-			s->clip_box_changes++;
-			s->clip_box_w = o.box_w;
-			s->clip_box_h = o.box_h;
-		}
 	}
 	return true;
 }
@@ -3551,7 +3570,6 @@ comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *s,
 	comp_xbridge_submit(s->xbridge, s->seq, s->layout_gen, handoff->texture, box_w, box_h);
 	if (clipped) {
 		s->clip_frames++;
-		s->clip_episode_frames++;
 	}
 	if (km != nullptr) {
 		km->ReleaseSync(0);
@@ -3959,10 +3977,12 @@ split_crop_for_dp(struct comp_hub_d3d11 *s, ID3D11ShaderResourceView *src_srv, u
 		s->dp_input_w = content_w;
 		s->dp_input_h = content_h;
 		s->dp_input_fmt = src_fmt;
-		// #1575: the overhang episode's proof reads it from the submit.
+		// #1575: the overhang episode's proof reads them from the submit.
 		if (s->mutexes_init) {
 			os_mutex_lock(&s->seg_mutex);
 			s->dp_input_creates++;
+			s->dp_input_made_w = content_w;
+			s->dp_input_made_h = content_h;
 			os_mutex_unlock(&s->seg_mutex);
 		}
 	}

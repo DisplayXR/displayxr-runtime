@@ -543,6 +543,114 @@ struct comp_segments_overhang
 enum comp_segments_overhang_verdict
 comp_segments_overhang_clip(const struct comp_segments_overhang_in *in, struct comp_segments_overhang *out);
 
+/*!
+ * #1575 — the proof an overhang episode's end line carries: that a DRAG
+ * reallocated nothing.
+ *
+ * A drag keeps the window's size, so the cut keeps its size, and after its
+ * first frame nothing may be rebuilt. A RESIZE changes the tiles, so the box,
+ * and may rebuild the egress ring and the DP input. Both can happen in one
+ * episode: on the G16 on 2026-10-28 Windows rescaled a window whose majority
+ * crossed to the other display (5220x863 -> 2605x427 -> 5220x865 -> 5220x863),
+ * and the person kept dragging it. One count could not tell the two apart, so
+ * the drag read as a box change. Hence:
+ *
+ * - A change of the window's size or of its tile grid is a resize. It is
+ *   counted, and the proof restarts there: the end line's counts cover the
+ *   frames at the window's LAST size. The episode itself goes on (one WARN when
+ *   it starts, one line when it ends): an interactive resize changes the size
+ *   on nearly every frame.
+ * - A box change at one window size and one tile grid is the drag bug (a cut
+ *   that follows the window's position). It is still counted.
+ * - The egress ring is sized by the frame's own submit, after its step, so its
+ *   baseline is taken on the next frame (the first frame may size it once).
+ * - The DP input is (re)created by the WEAVE, which takes a slot a frame or
+ *   more after it was submitted. Its baseline waits until the DP input holds
+ *   the box, or no output-device crop is needed (the egress ring is the box's
+ *   own size), for at most @ref COMP_SEG_OVERHANG_PROOF_DP_WAIT frames. A
+ *   baseline taken on the second submit counted the episode's own first box
+ *   reaching the weave as a re-create whenever the ring was worst-case.
+ */
+#define COMP_SEG_OVERHANG_PROOF_DP_WAIT 8u
+
+//! One clipped frame, as @ref comp_segments_overhang_proof_step reads it.
+struct comp_segments_overhang_proof_in
+{
+	//! The client size the frame was cut for.
+	uint32_t window_w, window_h;
+	//! Its tile grid, as painted.
+	uint32_t cols, rows, view_w, view_h;
+	//! The box it carries across the bridge.
+	uint32_t box_w, box_h;
+	//! The bridge's egress rebuild count, read before this frame's submit.
+	uint64_t egress_rebuilds;
+	//! The DP input's create count, read together with @ref dp_settled.
+	uint64_t dp_creates;
+	//! The DP input already holds @ref box_w x @ref box_h, or the egress ring
+	//! is that size (no output-device crop, so no DP input is made).
+	bool dp_settled;
+};
+
+//! An episode's bookkeeping. Zero-init = no episode.
+struct comp_segments_overhang_proof
+{
+	bool open;
+	//! Frames in the episode, and in its stretch at the window's last size.
+	uint64_t frames, frames_at_size;
+	//! Resizes in the episode.
+	uint64_t resizes;
+	//! The size the current stretch is cut at, and the box it carries.
+	uint32_t window_w, window_h, cols, rows, view_w, view_h;
+	uint32_t box_w, box_h;
+	//! Box changes at that size: a drag must make none.
+	uint64_t box_changes;
+	bool rebuild_base_set, dp_base_set;
+	uint64_t rebuild_base, dp_base;
+	//! Frames the DP baseline has waited for the DP input to hold the box.
+	uint32_t dp_wait;
+};
+
+//! What @ref comp_segments_overhang_proof_step saw.
+enum comp_segments_overhang_proof_event
+{
+	//! One more frame of the episode at its size.
+	COMP_SEG_PROOF_FRAME = 0,
+	//! The episode's first frame (the caller logs its WARN).
+	COMP_SEG_PROOF_STARTED,
+	//! The window or its tiles changed size: the proof restarts at this frame.
+	COMP_SEG_PROOF_RESIZED,
+};
+
+/*!
+ * Feed one clipped frame to the episode @p p, opening it if needed. Call it
+ * before the frame's submit (the egress count in @p in must not include that
+ * submit's rebuild yet).
+ */
+enum comp_segments_overhang_proof_event
+comp_segments_overhang_proof_step(struct comp_segments_overhang_proof *p,
+                                  const struct comp_segments_overhang_proof_in *in);
+
+//! What an episode proved, for its end line.
+struct comp_segments_overhang_proof_result
+{
+	uint64_t frames, frames_at_size, resizes;
+	//! The box at the window's last size.
+	uint32_t box_w, box_h;
+	//! False when the last size held too few frames for a baseline; the counts are then 0.
+	bool have_counts;
+	uint64_t box_changes, egress_rebuilds, dp_creates;
+};
+
+/*!
+ * Close the episode @p p (if one is open) against the counts now, and reset
+ * it. @return false when no episode was open (@p out zeroed).
+ */
+bool
+comp_segments_overhang_proof_end(struct comp_segments_overhang_proof *p,
+                                 uint64_t egress_rebuilds,
+                                 uint64_t dp_creates,
+                                 struct comp_segments_overhang_proof_result *out);
+
 /*
  * The partition the atlas content was painted with (#1883).
  */
