@@ -402,10 +402,28 @@ What a compositor does with it (Metal today; the other managers already rebuild 
   (`util/u_screen_home`, called from `oxr_session_push_screens`): the flag stays on the screen the
   session DP was made for while the same plug-in wins it, and when that screen is gone or
   re-claimed no screen carries the flag — the managers then take their single-DP path ("does not
-  know the system-default screen — no segmentation") and the session DP keeps weaving the window,
-  exactly as before any sweep existed; it is never re-targeted, and no second weaver is built for
-  its panel. A WARN per outcome change: `display hotplug: the session's own display processor
-  stays on screen 0x… — in place | re-anchored | gone | re-claimed`.
+  know the system-default screen — no segmentation") and no second weaver is built for its panel.
+  A WARN per outcome change: `display hotplug: the session's own display processor stays on screen
+  0x… — in place | re-anchored | gone | re-claimed`.
+- **Home gone: a bounded wait, then a ready screen (ADR-047 Amendment 8 addendum, #2305).** While
+  the home panel is merely unplugged (its plug-in wins no screen, the compositor's last list still
+  has it, every monitor left is unmoved) the session leaves the compositor on its last list for up
+  to 60 s (`u_screen_home_keep_decide`, `U_SCREEN_HOME_KEEP_BOUND_NS` — the #266 move-back
+  window), so a re-seat comes back with no rebuild; the bound is checked every frame. After it,
+  or as soon as the list changes in another way, the list goes through. Before that rebuild a
+  manager that can move the window handle (D3D11 and the #918 hub, GL, Vulkan on Windows) gives
+  the window to a listed screen whose DP is ready (`comp_segments_handback_decide`: it reports
+  pixel and physical size; the DP already holding the window first) and moves that DP into the
+  session's primary slot — never a new DP for the departed screen, whose DP never becomes ready
+  (flat view 0, no geometry: the laptop showed one eye of a whole-panel frustum). The compositor
+  keeps the slot's screen in `away_screen_id`; when the home is back, the first update moves that
+  DP to its own segment slot and gives the home a windowless DP. Logs: `the compositor keeps its
+  last screen list for up to 60 s`, `the kept screen list ends after N s — …` or `has been gone
+  for N s (bound 60 s) — the compositor takes the list without it now`, then `segments: home
+  screen 0x… is gone — the window stays with '…' (screen 0x…, its DP is ready), whose DP is the
+  session DP now` and, at the replug, `segments: home screen 0x… is back — '…' keeps the window
+  handle as its segment DP …`. Linux Vulkan and D3D12 without the hub have no handle hand-off: after
+  the bound their session DP keeps weaving the window.
 
 Test hook (macOS): `DXR_TEST_FAKE_MONITOR_FILE=<path>`. While the file holds a number S, the main
 display enumerates as two monitors cut at S points (the window can straddle the cut, since the

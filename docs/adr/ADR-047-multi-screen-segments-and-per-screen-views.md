@@ -481,11 +481,57 @@ rules, which could land on an unclaimed or virtual monitor; (c) every hotplug re
 D3D12 / GL / Vulkan compositor is **re-anchored on the session DP's home screen**
 (`u_screen_home_anchor`): those managers read "the session DP's screen" off SYSTEM_DEFAULT, so the
 flag stays on the home screen, and when the home screen is gone or re-claimed no screen carries it —
-segmentation pauses and the session DP weaves the window as it did before the sweep existed, never
-a second weaver on its panel. The managers still rebuild their segment DPs on `set_screens` rather
-than carrying them over (Metal's session-DP identity logic is not ported; follow-up). The service / IPC path: the service's own registry is rebuilt by the sweep, but the
+segmentation pauses, never a second weaver on its panel. **Home gone → keep the list for a bounded
+wait, then hand back to a ready screen** (addendum below). The managers still rebuild their segment
+DPs on `set_screens` rather than carrying them over (Metal's session-DP identity logic is not ported;
+follow-up). The service / IPC path: the service's own registry is rebuilt by the sweep, but the
 generation is not forwarded to clients (macOS IPC sessions do not segment). Detail:
 `docs/architecture/comp-segments.md` § *Display hotplug*.
+
+### Amendment 8 addendum (2026-10-28): home gone — a bounded wait, then a ready screen (#2305)
+
+Rule (c) as first written handed the window back to the home screen's DP before every rebuild. On
+Windows hardware (a laptop with a DS1 panel on HDMI, 2026-10-27) an unplug went: Windows moved the
+window to the laptop, 0.5 s later the laptop's segment DP took the window handle, then the unplug's
+re-push rebuilt without the panel and first handed the window back to the home — that is, to a new
+per-screen DP for the panel that had just left. That DP never became ready: it flat-blitted view 0
+and reported no geometry, so locate fell back to the whole panel as the canvas, and the laptop
+showed one eye of a 0.344 m frustum in a ~0.11 m window until the replug ("looked strange", "the
+cube vanished"; no window-relative Kooima line for the whole unplug). Decision:
+
+1. **A bounded wait.** While the home screen is gone, its plug-in wins no screen (unplugged, not
+   re-identified or re-claimed), the compositor's last list still has the home, and every monitor
+   left is where that list has it, the session leaves the compositor on its last list
+   (`u_screen_home_keep_decide`, pure and unit-tested): the window stays with the laptop's segment
+   DP and per-segment views, and a re-seat comes back with no rebuild in between. The wait is
+   bounded at **60 s** (`U_SCREEN_HOME_KEEP_BOUND_NS`), the same window as the #266 move-back
+   (displayxr-unity#266: the window goes back onto the panel when the same connector returns
+   within ~60 s). The bound is checked every frame, so it expires without a new generation. A
+   replug inside it re-pushes as usual; a monitor added, a moved layout, or the plug-in winning a
+   screen again (the panel re-identified mid-replug) ends the wait early. Logs: `display hotplug:
+   … gone, and '<plug-in>' wins no screen now (unplugged); the compositor keeps its last screen
+   list for up to 60 s …`, then either `the kept screen list ends after N s — the home screen is
+   back` or `screen 0x… ('<plug-in>') has been gone for N s (bound 60 s) — the compositor takes
+   the list without it now …`.
+2. **After the bound the home-gone rule applies**, as before: no screen carries the default and
+   per-screen segments are off until the home returns.
+3. **The hand-back goes to a ready screen, never to the departed one's DP.** Before a rebuild
+   whose list lacks the home, a manager that can move the window handle (D3D11, including the
+   #918 hub; OpenGL; Vulkan on Windows) picks the target with `comp_segments_handback_decide`
+   (pure, unit-tested): a listed screen whose DP is ready — it reports its screen's pixel and
+   physical size, which the window metrics are built from — preferring the DP that already holds
+   the window (nothing is re-made), else the ready screen the window covers most. That DP moves
+   into the session's primary slot and weaves the window on its own screen's geometry (on that rig,
+   the laptop's sim-display DP; the window-relative Kooima lines come back); the departed home's
+   DP is destroyed and no DP is made for it. No ready screen: the window stays on the DP that holds
+   it, with one WARN. The compositor remembers which screen the slot serves
+   (`*_hwnd_hooks::away_screen_id`); when the home comes back, the first update of the new manager
+   moves that DP back to its own screen's slot (still holding the window), gives the home a
+   windowless DP, and the window follows the majority from there — the state a majority hand-off
+   would have left.
+4. **Not covered:** the Vulkan manager on Linux and the D3D12 manager without the hub have no
+   window-handle hand-off, so after the bound their session DP keeps weaving the window as before;
+   Metal tracks its session DP's identity itself and is unchanged.
 
 ## Amendment 9 (2026-10-20): a screen's frame period and scanout adapter are its own
 
