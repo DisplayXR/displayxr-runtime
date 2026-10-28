@@ -533,11 +533,27 @@ cube vanished"; no window-relative Kooima line for the whole unplug). Decision:
    holds it (a segment's moves into the slot), or with none, with one WARN. A home that is still
    there — re-claimed by another plug-in, or listed under a new position-derived id after a
    rearrangement — keeps the old hand-back to its own DP. The compositor remembers which screen the
-   slot serves (`*_hwnd_hooks::away_screen_id`); when the home comes back, the first update of the
+   slot serves (`*_hwnd_hooks::away`, a `comp_segments_away`); when the home comes back, the first update of the
    new manager moves that DP back to its own screen's slot (still holding the window), gives the
    home a windowless DP, and the window follows the majority from there — the state a majority
    hand-off would have left. When the list has the home alone (the other screen off), the home's
    window-holding DP is made and takes the slot back.
+3a. **While the home stays gone, a screen its plug-in wins again stands in for it** (#2305, after
+   the Windows test of 2026-10-28). A serial-less panel's id is position-derived, so the panel
+   alone at (0, 0) — the laptop's screen off — comes back under another id than the one it left
+   with, and the session, whose home is still the old id, puts the default on no screen: before,
+   the laptop's DP stayed in the slot and the panel showed the window flat until the layout went
+   back. Now `comp_segments_away_decide` (pure, unit-tested) makes the one screen the home's
+   plug-in wins the manager's primary, and the first update re-homes to it exactly as for the home
+   itself: beside the slot's screen it gets a windowless DP and the window follows the majority;
+   alone, it takes the window. The same when the slot's own screen leaves too (the OS primary
+   screen, else the first listed screen that can make a DP). The record then names the stand-in
+   instead of clearing, so the home's own DP, on its own binding, is made when the home returns;
+   the session's home does not change. A re-home from a DP of the primary's own plug-in (the
+   stand-in going home) frees the window first — a windowless home DP takes the slot, then the
+   window-holding one — so one vendor never has two weavers on one window. Log: `segments: home
+   screen 0x… is still gone and its plug-in '…' wins a screen again — '…' (screen 0x…) stands in
+   for it: …`.
 4. **Not covered:** the Vulkan manager on Linux and the D3D12 manager without the hub have no
    window-handle hand-off, so after the bound their session DP keeps weaving the window as before;
    Metal tracks its session DP's identity itself and is unchanged.

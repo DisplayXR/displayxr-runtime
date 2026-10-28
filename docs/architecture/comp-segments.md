@@ -418,9 +418,15 @@ What a compositor does with it (Metal today; the other managers already rebuild 
   (flat view 0, no geometry: the laptop showed one eye of a whole-panel frustum). If that DP
   cannot be made, the window stays with its holder (or none). Only when the home is unplugged
   (its id gone and its plug-in winning no screen): a re-claimed or re-identified panel keeps the
-  hand-back to its own DP. The compositor keeps the slot's screen in `away_screen_id`; when the
+  hand-back to its own DP. The compositor keeps the slot's screen (and the plug-ins) in its away
+  record (`struct comp_segments_away`); when the
   home is back, the first update moves that DP to its own segment slot and gives the home a
   windowless DP (the home alone in the list: the home's window-holding DP takes the slot back).
+  While the home stays gone, a list in which its plug-in wins a screen again (the panel alone at
+  (0, 0) under a position-derived id), or without the slot's screen, gets a stand-in primary
+  (`comp_segments_away_decide`) that is re-homed the same way; the record then names the stand-in,
+  so the home's own DP is made when it returns. A re-home from the primary's own plug-in's DP frees
+  the window before the window-holding DP is made (one weaver per window).
   Logs: `the compositor keeps its
   last screen list for up to 60 s`, `the kept screen list ends after N s — …` or `has been gone
   for N s (bound 60 s) — the compositor takes the list without it now`, then `segments: home
