@@ -65,6 +65,7 @@
 
 #include "os/os_threading.h"
 #include "util/comp_segments.h"
+#include "util/comp_texture_target_win32.h" // #1575: the window read under a per-monitor-v2 pin
 #include "util/comp_dp_windowless_d3d11.h" // #2370 client-presents: the windowless DP rule
 #include "util/comp_frame_witness.h"       // #2370 client-presents: no target, so its own witness
 
@@ -311,6 +312,37 @@ struct comp_hub_d3d11
 	//! Panel extent, for the placement line and the bridge's plane sizing.
 	uint32_t panel_w, panel_h;
 
+	/*!
+	 * @name #1575 — a window that overhangs the panel, clipped to it
+	 *
+	 * A window larger than the panel paints a content box the bridge cannot
+	 * carry. The submit cuts every tile to the part on the panel
+	 * (comp_segments_overhang_clip) and the slot carries the clip to the weave.
+	 * @{
+	 */
+	//! The panel on the desktop, physical px: Stage A's origin and
+	//! @ref panel_w x @ref panel_h, then the screen list / system info
+	//! @ref comp_hub_d3d11_set_screens hands over. `w == 0` = unknown, no
+	//! clip. Guarded by @ref seg_mutex: set_screens can run on another thread.
+	struct comp_seg_rect panel_desk;
+	//! The canvas the last weave mapped the atlas onto (zero extent = the
+	//! whole client area). The next submit's clip is cut against it when it
+	//! is an output rect offset inside the window. Guarded by @ref seg_mutex:
+	//! a repaint weaves on the tier's repaint thread.
+	struct xrt_rect last_canvas;
+	//! The box was too big and the clip did not apply (said once per run of such frames).
+	bool clip_skip_logged;
+	uint64_t clip_episodes;
+	uint64_t clip_frames;
+	/*!
+	 * The episode in progress (`open`) and its proof that a drag reallocated
+	 * nothing: one WARN when it starts, one line when it ends, whose counts
+	 * cover the frames at the window's last size
+	 * (comp_segments_overhang_proof_step). Submit thread only.
+	 */
+	struct comp_segments_overhang_proof clip_proof;
+	/*! @} */
+
 	//! Monotonic app-frame counter — the one sequence every bridge fence uses.
 	uint64_t seq;
 
@@ -328,6 +360,11 @@ struct comp_hub_d3d11
 	ID3D11Texture2D *dp_input_tex;
 	ID3D11ShaderResourceView *dp_input_srv;
 	uint32_t dp_input_w, dp_input_h;
+	//! #1575: times @ref dp_input_tex was (re)created, and the size it was
+	//! last made at, for the overhang episode's proof. Guarded by @ref seg_mutex:
+	//! the weave writes them, the submit reads them.
+	uint64_t dp_input_creates;
+	uint32_t dp_input_made_w, dp_input_made_h;
 	//! #1178 — the format the crop scratch was created in, which must track the
 	//! EGRESS's rather than be assumed: the copy that fills it is dropped in
 	//! silence if the two are different DXGI typeless families.
@@ -1521,9 +1558,33 @@ comp_hub_d3d11_set_screens(struct comp_hub_d3d11 *s,
 	s->seg_sys_info = ic;
 	s->seg_pinned_display_id = pinned_display_id;
 	s->seg_rebuild = true;
+
+	/*
+	 * #1575: the panel the overhang clip cuts to — the pinned screen, else the
+	 * system-default one, else the system info's resolved panel rect. All are
+	 * the registry's desktop rects (physical px), and they follow a hotplug
+	 * re-resolve (#2305), which Stage A's origin does not.
+	 */
+	struct comp_seg_rect panel = {0, 0, 0, 0};
+	const struct xrt_screen *ps = xrt_screen_list_find(list, pinned_display_id);
+	for (uint32_t i = 0; ps == nullptr && i < list->count && i < XRT_SCREEN_LIST_MAX; i++) {
+		if ((list->screens[i].flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
+			ps = &list->screens[i];
+		}
+	}
+	if (ps != nullptr && ps->desktop_width > 0 && ps->desktop_height > 0) {
+		panel = {ps->desktop_left, ps->desktop_top, ps->desktop_width, ps->desktop_height};
+	} else if (info->display_desktop_width > 0 && info->display_desktop_height > 0) {
+		panel = {info->display_screen_left, info->display_screen_top, info->display_desktop_width,
+		         info->display_desktop_height};
+	}
+
 	// Nothing may frame views from the old table meanwhile.
 	os_mutex_lock(&s->seg_mutex);
 	memset(&s->seg_pub, 0, sizeof(s->seg_pub));
+	if (panel.w > 0 && panel.h > 0) {
+		s->panel_desk = panel; // #1575: the submit reads it under this lock
+	}
 	os_mutex_unlock(&s->seg_mutex);
 }
 
@@ -1890,6 +1951,12 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
 	s->out_luid = sdesc.AdapterLuid;
 	s->panel_w = panel_w;
 	s->panel_h = panel_h;
+	// #1575: the panel on the desktop until set_screens hands the resolved
+	// rect over. (0,0) is a real origin (a panel that is the primary display).
+	s->panel_desk.x = info->display_screen_left;
+	s->panel_desk.y = info->display_screen_top;
+	s->panel_desk.w = panel_w;
+	s->panel_desk.h = panel_h;
 	s->same_adapter = gate.same_adapter;
 	s->stable_atlas = info->stable_atlas;
 	s->ring_direct = info->ring_direct;
@@ -2201,6 +2268,10 @@ comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11
 	return ok;
 }
 
+// #1575: defined with the submit below.
+static void
+split_overhang_end(struct comp_hub_d3d11 *s, const char *why);
+
 extern "C" void
 comp_hub_d3d11_destroy(struct comp_hub_d3d11 **split_ptr)
 {
@@ -2217,6 +2288,11 @@ comp_hub_d3d11_destroy(struct comp_hub_d3d11 **split_ptr)
 	    (unsigned long long)s->seq, (unsigned long long)s->no_slot, (unsigned long long)s->stale_refusals,
 	    (unsigned long long)s->inflight_weaves, (unsigned long long)s->out_crop, (unsigned long long)s->composites,
 	    (unsigned long long)s->composite_bails);
+	split_overhang_end(s, "the session ends");
+	if (s->clip_episodes > 0) {
+		U_LOG_W("D3D11 hub: %llu frames clipped to the panel over %llu overhang episodes (#1575)",
+		        (unsigned long long)s->clip_frames, (unsigned long long)s->clip_episodes);
+	}
 
 	split_release_out(s);
 	split_destroy_mutexes(s);
@@ -3133,6 +3209,213 @@ comp_hub_d3d11_set_hud(struct comp_hub_d3d11 *s, const void *pixels, uint32_t w,
 	s->hud_live = true;
 }
 
+/*!
+ * #1575: the egress rebuild and DP-input create counts, read together, and the
+ * size the DP input was last made at (0x0 = never).
+ */
+static void
+split_overhang_counts(struct comp_hub_d3d11 *s,
+                      uint64_t *out_rebuilds,
+                      uint64_t *out_dp_creates,
+                      uint32_t *out_dp_w,
+                      uint32_t *out_dp_h)
+{
+	*out_rebuilds = s->xbridge != nullptr ? comp_xbridge_get_egress_rebuilds(s->xbridge) : 0;
+	*out_dp_creates = 0;
+	*out_dp_w = 0;
+	*out_dp_h = 0;
+	if (s->mutexes_init) {
+		os_mutex_lock(&s->seg_mutex);
+		*out_dp_creates = s->dp_input_creates;
+		*out_dp_w = s->dp_input_made_w;
+		*out_dp_h = s->dp_input_made_h;
+		os_mutex_unlock(&s->seg_mutex);
+	}
+}
+
+/*!
+ * #1575: close an overhang episode. The one line it prints is the drag
+ * check's proof: at the window's last size, after its first frame there, the
+ * box should not have changed and nothing should have been rebuilt, however
+ * far the window was dragged. Resizes before that are counted, not proved
+ * (comp_segments_overhang_proof_step).
+ */
+static void
+split_overhang_end(struct comp_hub_d3d11 *s, const char *why)
+{
+	if (!s->clip_proof.open) {
+		return;
+	}
+	uint64_t rebuilds = 0, dp_creates = 0;
+	uint32_t dp_w = 0, dp_h = 0;
+	split_overhang_counts(s, &rebuilds, &dp_creates, &dp_w, &dp_h);
+	struct comp_segments_overhang_proof_result r = {};
+	if (!comp_segments_overhang_proof_end(&s->clip_proof, rebuilds, dp_creates, &r)) {
+		return;
+	}
+	if (r.have_counts) {
+		U_LOG_W(
+		    "D3D11 hub: the overhang clip ends after %llu frames — %s. The window was resized %llu times in "
+		    "it. After the first of its %llu frames at its last size, the %ux%u box changed %llu times, the "
+		    "egress ring was rebuilt %llu times and the DP input re-created %llu times (#1575)",
+		    (unsigned long long)r.frames, why, (unsigned long long)r.resizes,
+		    (unsigned long long)r.frames_at_size, r.box_w, r.box_h, (unsigned long long)r.box_changes,
+		    (unsigned long long)r.egress_rebuilds, (unsigned long long)r.dp_creates);
+	} else {
+		U_LOG_W(
+		    "D3D11 hub: the overhang clip ends after %llu frames — %s. The window was resized %llu times in "
+		    "it, and its last size held %llu frames, too few to count (#1575)",
+		    (unsigned long long)r.frames, why, (unsigned long long)r.resizes,
+		    (unsigned long long)r.frames_at_size);
+	}
+}
+
+/*!
+ * #1575 — the per-tile clip for one frame on the xbridge route, or false to
+ * carry the box whole (the only answer before #1575).
+ *
+ * The bridge's rings are the panel's worst-case atlas; the renderer sizes its
+ * tiles from the window. A window larger than the panel (a 150 % -> 300 % DPI
+ * move, or a drag across the panel's edge that changes the scale) paints a box
+ * the bridge cannot carry, and the bridge refused every such frame. The pixels
+ * past the panel never reach it, so they are not carried: every tile is cut at
+ * its real offset to the bridge's per-tile share, placed over the part on the
+ * panel, and the DP weaves that cut over the same window pixels
+ * (comp_segments_overhang_clip, the segments' crop before the DP). The cut's
+ * size depends only on the tile size, so a drag moves it without resizing the
+ * box: no egress rebuild and no DP-input re-create per frame of a drag.
+ * Window-relative Kooima is computed from the window, not from these pixels,
+ * so nothing the app locates changes.
+ *
+ * The atlas maps onto the whole client area, read NOW (the renderer sized this
+ * frame's tiles from it), unless the last weave's canvas was a sub-rect offset
+ * inside the window (an output rect), which is then used as it is. The window
+ * is read under a per-monitor-v2 pin, so its origin is in the panel rect's
+ * physical px whatever the host's DPI awareness.
+ */
+static bool
+split_overhang_clip(struct comp_hub_d3d11 *s,
+                    uint32_t cols,
+                    uint32_t rows,
+                    uint32_t view_w,
+                    uint32_t view_h,
+                    struct comp_xbridge_tile_clip *out)
+{
+	uint32_t max_w = 0, max_h = 0;
+	comp_xbridge_get_max_dims(s->xbridge, &max_w, &max_h);
+	const uint64_t box_w = (uint64_t)cols * view_w;
+	const uint64_t box_h = (uint64_t)rows * view_h;
+	if (max_w == 0 || max_h == 0 || (box_w <= max_w && box_h <= max_h)) {
+		// The box fits: carried whole, as always.
+		split_overhang_end(s, "the box fits the bridge again, carried whole");
+		s->clip_skip_logged = false;
+		return false;
+	}
+
+	// The two fields another thread writes (set_screens, a repaint), read once.
+	struct comp_seg_rect panel = {0, 0, 0, 0};
+	struct xrt_rect lc = {};
+	if (s->mutexes_init) {
+		os_mutex_lock(&s->seg_mutex);
+		panel = s->panel_desk;
+		lc = s->last_canvas;
+		os_mutex_unlock(&s->seg_mutex);
+	}
+
+	struct comp_segments_overhang_in in = {};
+	POINT org = {0, 0};
+	SIZE size = {0, 0};
+	const bool have_window = s->hwnd != nullptr && comp_texture_target_client_origin_win32(s->hwnd, &org, &size) &&
+	                         size.cx > 0 && size.cy > 0;
+	if (have_window) {
+		in.window = {(int32_t)org.x, (int32_t)org.y, (uint32_t)size.cx, (uint32_t)size.cy};
+		if (lc.extent.w > 0 && lc.extent.h > 0 && (lc.offset.w != 0 || lc.offset.h != 0)) {
+			in.canvas = {lc.offset.w, lc.offset.h, (uint32_t)lc.extent.w, (uint32_t)lc.extent.h};
+		} else {
+			// The whole client area; a caller canvas at (0,0) is the client
+			// area itself, possibly a frame behind a resize.
+			in.canvas = {0, 0, (uint32_t)size.cx, (uint32_t)size.cy};
+		}
+	}
+	in.panel = panel;
+	in.cols = cols;
+	in.rows = rows;
+	in.view_w = view_w;
+	in.view_h = view_h;
+	in.max_w = max_w;
+	in.max_h = max_h;
+
+	struct comp_segments_overhang o = {};
+	const enum comp_segments_overhang_verdict v =
+	    have_window ? comp_segments_overhang_clip(&in, &o) : COMP_SEG_OVERHANG_NO_INPUT;
+	if (v != COMP_SEG_OVERHANG_CLIPPED) {
+		const char *why = v == COMP_SEG_OVERHANG_ON_PANEL ? "the window is wholly on the panel; its tiles are "
+		                                                    "larger than the panel's own"
+		                  : v == COMP_SEG_OVERHANG_OFF_PANEL ? "no part of the window is on the panel"
+		                                                     : "no window or panel rect";
+		split_overhang_end(s, why);
+		if (!s->clip_skip_logged) {
+			s->clip_skip_logged = true;
+			U_LOG_W(
+			    "D3D11 hub: the %llux%llu box does not fit the bridge (%ux%u) and is not clipped (%s) — "
+			    "the bridge refuses it (#1575)",
+			    (unsigned long long)box_w, (unsigned long long)box_h, max_w, max_h, why);
+		}
+		return false;
+	}
+	s->clip_skip_logged = false;
+
+	out->cols = cols;
+	out->rows = rows;
+	out->src_view_w = view_w;
+	out->src_view_h = view_h;
+	out->x = (uint32_t)o.tile.x;
+	out->y = (uint32_t)o.tile.y;
+	out->w = o.tile.w;
+	out->h = o.tile.h;
+	out->canvas_x = o.canvas.x;
+	out->canvas_y = o.canvas.y;
+	out->canvas_w = o.canvas.w;
+	out->canvas_h = o.canvas.h;
+
+	/*
+	 * The episode's proof (comp_segments_overhang_proof_step). The counts are
+	 * read before this frame's submit, which may size the egress ring once.
+	 * The DP input is settled for this box when it was already made at it, or
+	 * when the egress ring is the box's own size (the weave then crops nothing
+	 * and makes no DP input). The ring is (re)allocated by this thread only.
+	 */
+	struct comp_segments_overhang_proof_in pin = {};
+	pin.window_w = in.window.w;
+	pin.window_h = in.window.h;
+	pin.cols = cols;
+	pin.rows = rows;
+	pin.view_w = view_w;
+	pin.view_h = view_h;
+	pin.box_w = o.box_w;
+	pin.box_h = o.box_h;
+	{
+		uint32_t dp_w = 0, dp_h = 0, eg_w = 0, eg_h = 0;
+		split_overhang_counts(s, &pin.egress_rebuilds, &pin.dp_creates, &dp_w, &dp_h);
+		comp_xbridge_get_egress_dims(s->xbridge, &eg_w, &eg_h);
+		pin.dp_settled = (eg_w == o.box_w && eg_h == o.box_h) || (dp_w == o.box_w && dp_h == o.box_h);
+	}
+
+	// One WARN per episode: a drag moves the clip every frame, and the
+	// window's position is not news while it keeps overhanging. A resize
+	// restarts the proof quietly: an interactive one changes size every frame.
+	if (comp_segments_overhang_proof_step(&s->clip_proof, &pin) == COMP_SEG_PROOF_STARTED) {
+		s->clip_episodes++;
+		U_LOG_W(
+		    "D3D11 hub: the window (%ux%u at %d,%d) overhangs the panel (%ux%u at %d,%d) by %ux%u — clipped: "
+		    "the bridge carries %ux%u tiles of %ux%u (of %ux%u) and the DP weaves %ux%u at %d,%d (#1575)",
+		    in.window.w, in.window.h, in.window.x, in.window.y, in.panel.w, in.panel.h, in.panel.x, in.panel.y,
+		    o.over_left + o.over_right, o.over_top + o.over_bottom, cols, rows, o.tile.w, o.tile.h, view_w,
+		    view_h, o.canvas.w, o.canvas.h, o.canvas.x, o.canvas.y);
+	}
+	return true;
+}
+
 extern "C" void
 comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *s,
                             const struct comp_hub_d3d11_handoff *handoff,
@@ -3222,8 +3505,16 @@ comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *s,
 	 * happens anywhere. Only the R2 hysteresis (an interactive resize whose size
 	 * will not hold still) leaves a worst-case ring, and that residual crop runs
 	 * on the OUTPUT device in the weave below.
+	 *
+	 * #1575: and a window that overhangs the panel with a box the bridge cannot
+	 * carry has every tile cut to the part on the panel first, so the box that
+	 * crosses is the clipped one.
 	 */
-	comp_xbridge_set_content_size(s->xbridge, content_w, content_h, s->layout_gen);
+	struct comp_xbridge_tile_clip clip = {};
+	const bool clipped = split_overhang_clip(s, cols, rows, view_w, view_h, &clip);
+	const uint32_t box_w = clipped ? cols * clip.w : content_w;
+	const uint32_t box_h = clipped ? rows * clip.h : content_h;
+	comp_xbridge_set_content_size(s->xbridge, box_w, box_h, s->layout_gen);
 
 	/*
 	 * #1140 — the recipe travels with the pixels. `composite` stays false until
@@ -3273,7 +3564,13 @@ comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *s,
 	if (s->stable_atlas && handoff->shared_handle != nullptr) {
 		comp_xbridge_bind_atlas(s->xbridge, handoff->shared_handle, handoff->generation);
 	}
-	comp_xbridge_submit(s->xbridge, s->seq, s->layout_gen, handoff->texture, content_w, content_h);
+	// #1575: staged right before the submit it belongs to (a skipped frame
+	// above must not leave it armed; the bridge disarms it in the submit).
+	comp_xbridge_stage_tile_clip(s->xbridge, clipped ? &clip : nullptr);
+	comp_xbridge_submit(s->xbridge, s->seq, s->layout_gen, handoff->texture, box_w, box_h);
+	if (clipped) {
+		s->clip_frames++;
+	}
 	if (km != nullptr) {
 		km->ReleaseSync(0);
 	}
@@ -3680,6 +3977,14 @@ split_crop_for_dp(struct comp_hub_d3d11 *s, ID3D11ShaderResourceView *src_srv, u
 		s->dp_input_w = content_w;
 		s->dp_input_h = content_h;
 		s->dp_input_fmt = src_fmt;
+		// #1575: the overhang episode's proof reads them from the submit.
+		if (s->mutexes_init) {
+			os_mutex_lock(&s->seg_mutex);
+			s->dp_input_creates++;
+			s->dp_input_made_w = content_w;
+			s->dp_input_made_h = content_h;
+			os_mutex_unlock(&s->seg_mutex);
+		}
 	}
 
 	ID3D11Resource *src_res = nullptr;
@@ -4856,6 +5161,29 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 	if (canvas != nullptr) {
 		cv = *canvas;
 	}
+	// #1575: the canvas the NEXT submit's overhang clip is cut against. A
+	// repaint weaves here on the tier's repaint thread, hence the lock.
+	if (s->mutexes_init) {
+		os_mutex_lock(&s->seg_mutex);
+		s->last_canvas = cv;
+		os_mutex_unlock(&s->seg_mutex);
+	}
+
+	/*
+	 * #1575: a slot carried clipped to the panel holds only the part of every
+	 * tile that lies on the panel. Its DP canvas is that part, stamped with the
+	 * pixels (#1140), never the live one: the kept pixels land on the window
+	 * pixels they belong to, so the weave phase is the window's as always. The
+	 * target outside it is cleared — those window pixels are off the panel.
+	 */
+	struct comp_xbridge_tile_clip slot_clip = {};
+	const bool slot_clipped = comp_xbridge_slot_tile_clip(s->xbridge, slot, &slot_clip);
+	if (slot_clipped) {
+		cv.offset.w = slot_clip.canvas_x;
+		cv.offset.h = slot_clip.canvas_y;
+		cv.extent.w = (int32_t)slot_clip.canvas_w;
+		cv.extent.h = (int32_t)slot_clip.canvas_h;
+	}
 	if (seg_split) {
 		/*
 		 * The D3D11 segment manager, exactly as the in-process D3D11
@@ -4888,10 +5216,28 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 		sf.target_rtv = comp_d3d11_target_get_rtv(s->target);
 		sf.target_width = tgt_w;
 		sf.target_height = tgt_h;
-		sf.canvas.x = 0;
-		sf.canvas.y = 0;
-		sf.canvas.w = seg_window.w < tgt_w ? seg_window.w : tgt_w;
-		sf.canvas.h = seg_window.h < tgt_h ? seg_window.h : tgt_h;
+		if (slot_clipped) {
+			/*
+			 * #1575: the slot holds the clipped canvas only, so every segment
+			 * (and a routed partition) is mapped against it, and drawn over
+			 * its part inside it, unscaled. The panel's segment finds all of
+			 * its pixels; another screen's segment keeps whatever part of it
+			 * the cut reached, and the rest stays cleared.
+			 */
+			sf.canvas.x = slot_clip.canvas_x;
+			sf.canvas.y = slot_clip.canvas_y;
+			sf.canvas.w = slot_clip.canvas_w;
+			sf.canvas.h = slot_clip.canvas_h;
+			sf.clip_to_canvas = true;
+			if (slot_content.count > 0) {
+				slot_content.canvas = sf.canvas;
+			}
+		} else {
+			sf.canvas.x = 0;
+			sf.canvas.y = 0;
+			sf.canvas.w = seg_window.w < tgt_w ? seg_window.w : tgt_w;
+			sf.canvas.h = seg_window.h < tgt_h ? seg_window.h : tgt_h;
+		}
 		sf.transparent_background = s->transparent_background;
 		sf.atlas_encoding = -1; // the split declares none to its own DP either
 		sf.primary_dp = s->dp;
@@ -4900,6 +5246,14 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 		// Everything after sees the state the single-DP path leaves.
 		comp_d3d11_target_bind(s->target);
 	} else {
+		if (slot_clipped) {
+			// #1575: the DP writes only the clipped canvas; clear the rest.
+			auto *rtv = static_cast<ID3D11RenderTargetView *>(comp_d3d11_target_get_rtv(s->target));
+			if (rtv != nullptr) {
+				const float clear[4] = {0.0f, 0.0f, 0.0f, s->transparent_background ? 0.0f : 1.0f};
+				s->out_ctx->ClearRenderTargetView(rtv, clear);
+			}
+		}
 		xrt_display_processor_d3d11_process_atlas(s->dp, s->out_ctx, atlas_srv, weave_view_w, weave_view_h,
 		                                          weave_cols, weave_rows, (uint32_t)split_dp_view_format(atlas_srv),
 		                                          tgt_w, tgt_h, cv.offset.w, cv.offset.h, (uint32_t)cv.extent.w,

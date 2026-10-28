@@ -340,6 +340,14 @@ struct comp_xbridge
 	struct comp_xbridge_recipe eg_recipe[XB_EGRESS_RING];
 	struct comp_xbridge_recipe staged_recipe;
 
+	//! #1575 — the per-tile clip the next submit carries (one-shot), and the
+	//! one each slot was carried with (`eg_clipped` false = carried whole).
+	struct comp_xbridge_tile_clip staged_clip;
+	bool clip_staged;
+	struct comp_xbridge_tile_clip eg_clip[XB_EGRESS_RING];
+	bool eg_clipped[XB_EGRESS_RING];
+	uint64_t clipped_submits; //!< frames carried clipped to the panel
+
 	// --- planes (#918 Phase 2a) -------------------------------------------
 	//! Panel extent — every plane is allocated here ONCE and never resized.
 	uint32_t panel_w, panel_h;
@@ -690,6 +698,7 @@ xb_release_egress(struct comp_xbridge *xb)
 		xb->eg_gen[i] = 0;
 		xb->eg_cw[i] = 0;
 		xb->eg_ch[i] = 0;
+		xb->eg_clipped[i] = false;
 	}
 	xb->eg_w = 0;
 	xb->eg_h = 0;
@@ -1664,6 +1673,42 @@ comp_xbridge_slot_recipe(struct comp_xbridge *xb, int32_t slot, struct comp_xbri
 	}
 	*out = xb->eg_recipe[slot];
 	return true;
+}
+
+extern "C" void
+comp_xbridge_stage_tile_clip(struct comp_xbridge *xb, const struct comp_xbridge_tile_clip *clip)
+{
+	if (xb == nullptr) {
+		return;
+	}
+	xb->clip_staged = clip != nullptr;
+	if (clip != nullptr) {
+		xb->staged_clip = *clip;
+	}
+}
+
+extern "C" bool
+comp_xbridge_slot_tile_clip(struct comp_xbridge *xb, int32_t slot, struct comp_xbridge_tile_clip *out)
+{
+	if (xb == nullptr || out == nullptr || slot < 0 || slot >= XB_EGRESS_RING || xb->eg_seq[slot] == 0 ||
+	    !xb->eg_clipped[slot]) {
+		return false;
+	}
+	*out = xb->eg_clip[slot];
+	return true;
+}
+
+extern "C" void
+comp_xbridge_get_max_dims(struct comp_xbridge *xb, uint32_t *out_w, uint32_t *out_h)
+{
+	*out_w = xb != nullptr ? xb->max_w : 0;
+	*out_h = xb != nullptr ? xb->max_h : 0;
+}
+
+extern "C" uint64_t
+comp_xbridge_get_egress_rebuilds(struct comp_xbridge *xb)
+{
+	return xb != nullptr ? xb->eg_reallocs : 0;
 }
 
 extern "C" void *
@@ -3255,6 +3300,39 @@ comp_xbridge_pre_plane_write(struct comp_xbridge *xb, uint32_t plane)
 	xb_app_back_wait(xb, xb->prod_submit_seq.load(std::memory_order_acquire));
 }
 
+/*!
+ * #1575 — take (and disarm) the clip staged for this submit. True when one was
+ * staged AND it describes the packed @p content_w x @p content_h box: every
+ * kept rect inside its tile, cols x w by rows x h equal to the box. A clip that
+ * does not is dropped, loudly and throttled, and the frame is carried whole —
+ * the extent checks then refuse it exactly as they would without a clip.
+ */
+static bool
+xb_take_tile_clip(struct comp_xbridge *xb, uint32_t content_w, uint32_t content_h, struct comp_xbridge_tile_clip *out)
+{
+	if (!xb->clip_staged) {
+		return false;
+	}
+	xb->clip_staged = false;
+	const struct comp_xbridge_tile_clip &c = xb->staged_clip;
+	const bool ok = c.cols > 0 && c.rows > 0 && c.w > 0 && c.h > 0 && c.canvas_w > 0 && c.canvas_h > 0 &&
+	                (uint64_t)c.x + c.w <= c.src_view_w && (uint64_t)c.y + c.h <= c.src_view_h &&
+	                (uint64_t)c.cols * c.w == content_w && (uint64_t)c.rows * c.h == content_h;
+	if (!ok) {
+		static uint64_t dropped = 0;
+		if ((dropped++ % 300u) == 0u) {
+			U_LOG_W(
+			    "%s: a staged tile clip (%ux%u tiles, %ux%u at %u,%u of %ux%u) does not describe the %ux%u "
+			    "box — dropped, the frame is carried whole (#1575; %llu so far)",
+			    XB_TAG(xb), c.cols, c.rows, c.w, c.h, c.x, c.y, c.src_view_w, c.src_view_h, content_w,
+			    content_h, (unsigned long long)dropped);
+		}
+		return false;
+	}
+	*out = c;
+	return true;
+}
+
 extern "C" void
 comp_xbridge_submit(struct comp_xbridge *xb,
                     uint64_t seq,
@@ -3263,12 +3341,24 @@ comp_xbridge_submit(struct comp_xbridge *xb,
                     uint32_t content_w,
                     uint32_t content_h)
 {
-	if (xb == nullptr || seq == 0 || xb->degraded.load(std::memory_order_relaxed)) {
+	if (xb == nullptr) {
+		return;
+	}
+	/*
+	 * #1575 — the clip staged for THIS submit, taken before any early-out so a
+	 * refused or skipped frame can never leave it armed for the next one.
+	 */
+	struct comp_xbridge_tile_clip clip = {};
+	const bool clipped = xb_take_tile_clip(xb, content_w, content_h, &clip);
+	if (seq == 0 || xb->degraded.load(std::memory_order_relaxed)) {
 		return;
 	}
 	if (content_w == 0 || content_h == 0 || xb->eg_w == 0) {
 		return;
 	}
+	// #1575: the farthest texel a clipped copy reads in the caller's atlas.
+	const uint32_t clip_src_w = clipped ? (clip.cols - 1) * clip.src_view_w + clip.x + clip.w : 0;
+	const uint32_t clip_src_h = clipped ? (clip.rows - 1) * clip.src_view_h + clip.y + clip.h : 0;
 
 	/*
 	 * #1178 — the content box must FIT the egress ring, and saying so is not the
@@ -3284,6 +3374,9 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 	 * than the panel, e.g. after a 150 % -> 300 % DPI move doubled it to
 	 * 3848x2169 on a 3840x2160 panel (#1603 is the same shape for a 2-view
 	 * layout) — lands here on every frame for as long as it stays that size.
+	 * #1575: a caller that clips such a window to the panel
+	 * (@ref comp_xbridge_stage_tile_clip) hands in the packed, clipped box,
+	 * which fits; only a caller that does not still lands here.
 	 */
 	if (!xb_check_copy_extent(xb, "atlas submit (content box vs egress ring)", content_w, content_h,
 	                          /*src=*/0, 0, xb->eg_w, xb->eg_h)) {
@@ -3323,14 +3416,39 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 		}
 		// #1178 — and the same question about EXTENT. The atlas is the caller's
 		// own texture, sized by the renderer; the staging ring is `max_*`.
-		if (!xb_check_copy_extent(xb, "ingress stage (Option II)", content_w, content_h, (uint32_t)ad.Width,
-		                          ad.Height, xb->max_w, xb->max_h)) {
-			return;
+		if (clipped) {
+			// #1575: the clipped tiles are read from the full-size atlas and
+			// packed into the staging ring, so the two ends are checked apart.
+			if (!xb_check_copy_extent(xb, "ingress stage (Option II, clipped source)", clip_src_w,
+			                          clip_src_h, (uint32_t)ad.Width, ad.Height, 0, 0) ||
+			    !xb_check_copy_extent(xb, "ingress stage (Option II, clipped box)", content_w, content_h, 0,
+			                          0, xb->max_w, xb->max_h)) {
+				return;
+			}
+			// One copy per tile: its kept rect, at its real offset in the
+			// tile, packed tile by tile. Nothing is scaled.
+			for (uint32_t r = 0; r < clip.rows; r++) {
+				for (uint32_t c = 0; c < clip.cols; c++) {
+					const UINT sx = c * clip.src_view_w + clip.x;
+					const UINT sy = r * clip.src_view_h + clip.y;
+					D3D11_BOX tb = {sx, sy, 0, sx + clip.w, sy + clip.h, 1};
+					xb->app_ctx->CopySubresourceRegion(xb->in_tex[in], 0, c * clip.w, r * clip.h, 0,
+					                                   atlas, 0, &tb);
+				}
+			}
+		} else {
+			if (!xb_check_copy_extent(xb, "ingress stage (Option II)", content_w, content_h,
+			                          (uint32_t)ad.Width, ad.Height, xb->max_w, xb->max_h)) {
+				return;
+			}
+			D3D11_BOX box = {0, 0, 0, content_w, content_h, 1};
+			xb->app_ctx->CopySubresourceRegion(xb->in_tex[in], 0, 0, 0, 0, atlas, 0, &box);
 		}
-		D3D11_BOX box = {0, 0, 0, content_w, content_h, 1};
-		xb->app_ctx->CopySubresourceRegion(xb->in_tex[in], 0, 0, 0, 0, atlas, 0, &box);
 		src12 = xb->in_12[in];
 	}
+	// #1575: leg 1 itself clips only when it reads the caller's atlas in place
+	// (Option I); a staged frame arrives above already packed.
+	const bool leg1_clip = clipped && use_direct;
 	if (src12 == nullptr) {
 		return;
 	}
@@ -3352,8 +3470,14 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 		 * the renderer's schedule, not the window's; the cross-adapter ring is
 		 * `max_*`, fixed at create. Nothing before this ever compared them.
 		 */
-		if (!xb_check_copy_extent(xb, where, content_w, content_h, (uint32_t)sd.Width, sd.Height, xb->max_w,
-		                          xb->max_h)) {
+		if (leg1_clip) {
+			if (!xb_check_copy_extent(xb, where, clip_src_w, clip_src_h, (uint32_t)sd.Width, sd.Height, 0,
+			                          0) ||
+			    !xb_check_copy_extent(xb, where, content_w, content_h, 0, 0, xb->max_w, xb->max_h)) {
+				return;
+			}
+		} else if (!xb_check_copy_extent(xb, where, content_w, content_h, (uint32_t)sd.Width, sd.Height,
+		                                 xb->max_w, xb->max_h)) {
 			return;
 		}
 	}
@@ -3438,7 +3562,24 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 	{
 		D3D12_TEXTURE_COPY_LOCATION dst = sub_loc(xb->xa_prod[xa]);
 		D3D12_TEXTURE_COPY_LOCATION src = sub_loc(src12);
-		xb->prod_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+		if (leg1_clip) {
+			// #1575: one copy per tile, each tile's kept rect at its real
+			// offset, packed into the content box leg 2 carries whole.
+			for (uint32_t r = 0; r < clip.rows; r++) {
+				for (uint32_t c = 0; c < clip.cols; c++) {
+					D3D12_BOX tb{};
+					tb.left = c * clip.src_view_w + clip.x;
+					tb.top = r * clip.src_view_h + clip.y;
+					tb.front = 0;
+					tb.right = tb.left + clip.w;
+					tb.bottom = tb.top + clip.h;
+					tb.back = 1;
+					xb->prod_list->CopyTextureRegion(&dst, c * clip.w, r * clip.h, 0, &src, &tb);
+				}
+			}
+		} else {
+			xb->prod_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+		}
 	}
 	{
 		// #1178 — leg 2's extent was checked at the top of this function (`content
@@ -3504,6 +3645,13 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 	xb->eg_gen[eg] = layout_gen;
 	xb->eg_cw[eg] = content_w;
 	xb->eg_ch[eg] = content_h;
+	// #1575: and with the clip it was carried with, so the weave hands its DP
+	// the canvas these pixels belong to (never the live one: #1140's rule).
+	xb->eg_clipped[eg] = clipped;
+	if (clipped) {
+		xb->eg_clip[eg] = clip;
+		xb->clipped_submits++;
+	}
 
 	/*
 	 * #918 Phase 2a — stamp the COMPOSITE RECIPE. plane_valid/plane_seq are
@@ -3968,6 +4116,10 @@ comp_xbridge_quiesce(struct comp_xbridge *xb)
 		    "%s: %llu submits REFUSED on a copy-extent mismatch — the chain is %ux%u worst-case / %ux%u "
 		    "egress (#1178)",
 		    XB_TAG(xb), (unsigned long long)xb->ext_refused, xb->max_w, xb->max_h, xb->eg_w, xb->eg_h);
+	}
+	if (xb->clipped_submits > 0) {
+		U_LOG_W("%s: %llu frames carried clipped to the panel (the window overhung it) (#1575)", XB_TAG(xb),
+		        (unsigned long long)xb->clipped_submits);
 	}
 	if (xb->ingress_mode == XB_INGRESS_ADAPTIVE) {
 		U_LOG_W(

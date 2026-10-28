@@ -921,15 +921,25 @@ comp_segments_tile_rect(const struct comp_seg_rect *seg,
 	if (seg == NULL || canvas == NULL || out == NULL || canvas->w == 0 || canvas->h == 0) {
 		return false;
 	}
-	const int64_t rx = (int64_t)seg->x - canvas->x;
-	const int64_t ry = (int64_t)seg->y - canvas->y;
-	if (rx < 0 || ry < 0) {
+	// #1575: the part of the segment inside the canvas, on every edge. A
+	// segment that starts left of / above the canvas used to be dropped
+	// whole; one past the right / bottom edge was already cut (the clamp
+	// below), so this only changes a segment that starts outside the canvas.
+	const int64_t cx1 = (int64_t)canvas->x + canvas->w;
+	const int64_t cy1 = (int64_t)canvas->y + canvas->h;
+	const int64_t sx0 = seg->x > canvas->x ? seg->x : canvas->x;
+	const int64_t sy0 = seg->y > canvas->y ? seg->y : canvas->y;
+	const int64_t sx1 = ((int64_t)seg->x + seg->w) < cx1 ? ((int64_t)seg->x + seg->w) : cx1;
+	const int64_t sy1 = ((int64_t)seg->y + seg->h) < cy1 ? ((int64_t)seg->y + seg->h) : cy1;
+	if (sx1 <= sx0 || sy1 <= sy0) {
 		return false;
 	}
+	const int64_t rx = sx0 - canvas->x;
+	const int64_t ry = sy0 - canvas->y;
 	const int32_t ax = seg_scale_round(rx, tile_w, canvas->w);
 	const int32_t ay = seg_scale_round(ry, tile_h, canvas->h);
-	int32_t bx = seg_scale_round(rx + seg->w, tile_w, canvas->w);
-	int32_t by = seg_scale_round(ry + seg->h, tile_h, canvas->h);
+	int32_t bx = seg_scale_round(sx1 - canvas->x, tile_w, canvas->w);
+	int32_t by = seg_scale_round(sy1 - canvas->y, tile_h, canvas->h);
 	if (bx > (int32_t)tile_w) {
 		bx = (int32_t)tile_w;
 	}
@@ -943,6 +953,300 @@ comp_segments_tile_rect(const struct comp_seg_rect *seg,
 	out->y = ay;
 	out->w = (uint32_t)(bx - ax);
 	out->h = (uint32_t)(by - ay);
+	return true;
+}
+
+bool
+comp_segments_rect_intersect(const struct comp_seg_rect *a, const struct comp_seg_rect *b, struct comp_seg_rect *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (a == NULL || b == NULL || a->w == 0 || a->h == 0 || b->w == 0 || b->h == 0) {
+		return false;
+	}
+	const int64_t x0 = a->x > b->x ? a->x : b->x;
+	const int64_t y0 = a->y > b->y ? a->y : b->y;
+	const int64_t ax1 = (int64_t)a->x + a->w;
+	const int64_t ay1 = (int64_t)a->y + a->h;
+	const int64_t bx1 = (int64_t)b->x + b->w;
+	const int64_t by1 = (int64_t)b->y + b->h;
+	const int64_t x1 = ax1 < bx1 ? ax1 : bx1;
+	const int64_t y1 = ay1 < by1 ? ay1 : by1;
+	if (x1 <= x0 || y1 <= y0) {
+		return false;
+	}
+	out->x = (int32_t)x0;
+	out->y = (int32_t)y0;
+	out->w = (uint32_t)(x1 - x0);
+	out->h = (uint32_t)(y1 - y0);
+	return true;
+}
+
+bool
+comp_segments_canvas_from_tile(const struct comp_seg_rect *tile,
+                               const struct comp_seg_rect *canvas,
+                               uint32_t tile_w,
+                               uint32_t tile_h,
+                               struct comp_seg_rect *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (tile == NULL || canvas == NULL || tile_w == 0 || tile_h == 0 || tile->w == 0 || tile->h == 0 ||
+	    tile->x < 0 || tile->y < 0) {
+		return false;
+	}
+	// Each edge where those tile pixels land when the whole tile is woven
+	// over the whole canvas (round(v * canvas / tile)).
+	const int64_t x0 = seg_scale_round(tile->x, canvas->w, tile_w);
+	const int64_t y0 = seg_scale_round(tile->y, canvas->h, tile_h);
+	const int64_t x1 = seg_scale_round((int64_t)tile->x + tile->w, canvas->w, tile_w);
+	const int64_t y1 = seg_scale_round((int64_t)tile->y + tile->h, canvas->h, tile_h);
+	if (x1 <= x0 || y1 <= y0) {
+		return false;
+	}
+	out->x = (int32_t)(canvas->x + x0);
+	out->y = (int32_t)(canvas->y + y0);
+	out->w = (uint32_t)(x1 - x0);
+	out->h = (uint32_t)(y1 - y0);
+	return true;
+}
+
+static uint32_t
+seg_overhang_edge(int64_t v, uint32_t limit)
+{
+	if (v <= 0) {
+		return 0;
+	}
+	return v < (int64_t)limit ? (uint32_t)v : limit;
+}
+
+//! floor(v * num / den) and ceil(v * num / den), v/num/den >= 0.
+static int64_t
+seg_scale_floor(int64_t v, int64_t num, int64_t den)
+{
+	return den > 0 ? (v * num) / den : 0;
+}
+
+static int64_t
+seg_scale_ceil(int64_t v, int64_t num, int64_t den)
+{
+	return den > 0 ? (v * num + den - 1) / den : 0;
+}
+
+/*!
+ * Place a cut of @p share tile px over [@p need0, @p need1) inside a tile of
+ * @p tile px: at the need's own start, or as far as the tile allows. A cut at
+ * least as long as the need always covers it; a shorter one keeps its start.
+ */
+static int64_t
+seg_share_start(int64_t need0, int64_t share, int64_t tile)
+{
+	const int64_t last = tile - share; // the furthest start that stays in the tile
+	return need0 < last ? need0 : last;
+}
+
+enum comp_segments_overhang_verdict
+comp_segments_overhang_clip(const struct comp_segments_overhang_in *in, struct comp_segments_overhang *out)
+{
+	if (out == NULL) {
+		return COMP_SEG_OVERHANG_NO_INPUT;
+	}
+	memset(out, 0, sizeof(*out));
+	if (in == NULL || in->cols == 0 || in->rows == 0 || in->view_w == 0 || in->view_h == 0 || in->max_w == 0 ||
+	    in->max_h == 0 || in->window.w == 0 || in->window.h == 0 || in->canvas.w == 0 || in->canvas.h == 0 ||
+	    in->panel.w == 0 || in->panel.h == 0) {
+		return COMP_SEG_OVERHANG_NO_INPUT;
+	}
+	const uint32_t cap_w = in->max_w / in->cols;
+	const uint32_t cap_h = in->max_h / in->rows;
+	if (cap_w == 0 || cap_h == 0) {
+		return COMP_SEG_OVERHANG_NO_INPUT;
+	}
+
+	// The whole box fits: carried whole, exactly as before #1575.
+	if ((uint64_t)in->cols * in->view_w <= in->max_w && (uint64_t)in->rows * in->view_h <= in->max_h) {
+		return COMP_SEG_OVERHANG_FITS;
+	}
+
+	// The canvas on the desktop, and the part of it that is on the panel.
+	const int64_t cx0 = (int64_t)in->window.x + in->canvas.x;
+	const int64_t cy0 = (int64_t)in->window.y + in->canvas.y;
+	const int64_t cx1 = cx0 + in->canvas.w;
+	const int64_t cy1 = cy0 + in->canvas.h;
+	const int64_t px0 = in->panel.x;
+	const int64_t py0 = in->panel.y;
+	const int64_t px1 = px0 + in->panel.w;
+	const int64_t py1 = py0 + in->panel.h;
+
+	out->over_left = seg_overhang_edge(px0 - cx0, in->canvas.w);
+	out->over_right = seg_overhang_edge(cx1 - px1, in->canvas.w);
+	out->over_top = seg_overhang_edge(py0 - cy0, in->canvas.h);
+	out->over_bottom = seg_overhang_edge(cy1 - py1, in->canvas.h);
+
+	const int64_t kx0 = cx0 > px0 ? cx0 : px0;
+	const int64_t ky0 = cy0 > py0 ? cy0 : py0;
+	const int64_t kx1 = cx1 < px1 ? cx1 : px1;
+	const int64_t ky1 = cy1 < py1 ? cy1 : py1;
+	if (kx1 <= kx0 || ky1 <= ky0) {
+		return COMP_SEG_OVERHANG_OFF_PANEL;
+	}
+	if (kx0 == cx0 && ky0 == cy0 && kx1 == cx1 && ky1 == cy1) {
+		return COMP_SEG_OVERHANG_ON_PANEL;
+	}
+
+	// The part on the panel, window px.
+	struct comp_seg_rect keep;
+	keep.x = (int32_t)(kx0 - in->window.x);
+	keep.y = (int32_t)(ky0 - in->window.y);
+	keep.w = (uint32_t)(kx1 - kx0);
+	keep.h = (uint32_t)(ky1 - ky0);
+
+	// ... in tile px, rounded outward so its mapping back covers it whole.
+	const int64_t rx0 = kx0 - cx0;
+	const int64_t ry0 = ky0 - cy0;
+	const int64_t rx1 = kx1 - cx0;
+	const int64_t ry1 = ky1 - cy0;
+	int64_t nx0 = seg_scale_floor(rx0, in->view_w, in->canvas.w);
+	int64_t ny0 = seg_scale_floor(ry0, in->view_h, in->canvas.h);
+	int64_t nx1 = seg_scale_ceil(rx1, in->view_w, in->canvas.w);
+	int64_t ny1 = seg_scale_ceil(ry1, in->view_h, in->canvas.h);
+	nx1 = nx1 < (int64_t)in->view_w ? nx1 : (int64_t)in->view_w;
+	ny1 = ny1 < (int64_t)in->view_h ? ny1 : (int64_t)in->view_h;
+	if (nx1 <= nx0 || ny1 <= ny0) {
+		return COMP_SEG_OVERHANG_OFF_PANEL; // thinner than one tile pixel
+	}
+	struct comp_seg_rect need = {(int32_t)nx0, (int32_t)ny0, (uint32_t)(nx1 - nx0), (uint32_t)(ny1 - ny0)};
+
+	/*
+	 * The bridge's per-tile share, at its real offset over the need. Its size
+	 * depends only on the tile size, never on where the window is, so a drag
+	 * across the panel's edge moves the cut and keeps the box: no egress
+	 * rebuild and no DP-input re-create per frame of the drag.
+	 */
+	const int64_t share_w = cap_w < in->view_w ? cap_w : in->view_w;
+	const int64_t share_h = cap_h < in->view_h ? cap_h : in->view_h;
+	struct comp_seg_rect tile;
+	tile.x = (int32_t)seg_share_start(nx0, share_w, in->view_w);
+	tile.y = (int32_t)seg_share_start(ny0, share_h, in->view_h);
+	tile.w = (uint32_t)share_w;
+	tile.h = (uint32_t)share_h;
+
+	// The DP canvas comes from the cut itself, never from keep, so the tile
+	// and the canvas share one scale (2873 px on the panel can be 2874 px of
+	// tile content).
+	struct comp_seg_rect canvas;
+	if (!comp_segments_canvas_from_tile(&tile, &in->canvas, in->view_w, in->view_h, &canvas)) {
+		return COMP_SEG_OVERHANG_NO_INPUT;
+	}
+
+	out->keep = keep;
+	out->need = need;
+	out->tile = tile;
+	out->canvas = canvas;
+	out->box_w = in->cols * tile.w;
+	out->box_h = in->rows * tile.h;
+	return COMP_SEG_OVERHANG_CLIPPED;
+}
+
+//! Start a stretch of the proof at @p in's size: both baselines wait for the next frame.
+static void
+seg_proof_restart(struct comp_segments_overhang_proof *p, const struct comp_segments_overhang_proof_in *in)
+{
+	p->window_w = in->window_w;
+	p->window_h = in->window_h;
+	p->cols = in->cols;
+	p->rows = in->rows;
+	p->view_w = in->view_w;
+	p->view_h = in->view_h;
+	p->box_w = in->box_w;
+	p->box_h = in->box_h;
+	p->frames_at_size = 1;
+	p->box_changes = 0;
+	p->rebuild_base_set = false;
+	p->dp_base_set = false;
+	p->rebuild_base = 0;
+	p->dp_base = 0;
+	p->dp_wait = 0;
+}
+
+enum comp_segments_overhang_proof_event
+comp_segments_overhang_proof_step(struct comp_segments_overhang_proof *p,
+                                  const struct comp_segments_overhang_proof_in *in)
+{
+	if (p == NULL || in == NULL) {
+		return COMP_SEG_PROOF_FRAME;
+	}
+	if (!p->open) {
+		memset(p, 0, sizeof(*p));
+		p->open = true;
+		p->frames = 1;
+		seg_proof_restart(p, in);
+		return COMP_SEG_PROOF_STARTED;
+	}
+	p->frames++;
+
+	// A resize: the window or the tiles it was painted at changed size. The
+	// renderer follows the window a frame late, so either one counts.
+	if (in->window_w != p->window_w || in->window_h != p->window_h || in->cols != p->cols ||
+	    in->rows != p->rows || in->view_w != p->view_w || in->view_h != p->view_h) {
+		p->resizes++;
+		seg_proof_restart(p, in);
+		return COMP_SEG_PROOF_RESIZED;
+	}
+	p->frames_at_size++;
+
+	// The same size, a different box: the cut followed the window's position.
+	if (in->box_w != p->box_w || in->box_h != p->box_h) {
+		p->box_changes++;
+		p->box_w = in->box_w;
+		p->box_h = in->box_h;
+	}
+	if (!p->rebuild_base_set) {
+		p->rebuild_base_set = true;
+		p->rebuild_base = in->egress_rebuilds;
+	}
+	if (!p->dp_base_set) {
+		if (in->dp_settled || p->dp_wait >= COMP_SEG_OVERHANG_PROOF_DP_WAIT) {
+			p->dp_base_set = true;
+			p->dp_base = in->dp_creates;
+		} else {
+			p->dp_wait++;
+		}
+	}
+	return COMP_SEG_PROOF_FRAME;
+}
+
+bool
+comp_segments_overhang_proof_end(struct comp_segments_overhang_proof *p,
+                                 uint64_t egress_rebuilds,
+                                 uint64_t dp_creates,
+                                 struct comp_segments_overhang_proof_result *out)
+{
+	if (out != NULL) {
+		memset(out, 0, sizeof(*out));
+	}
+	if (p == NULL || !p->open) {
+		return false;
+	}
+	if (out != NULL) {
+		out->frames = p->frames;
+		out->frames_at_size = p->frames_at_size;
+		out->resizes = p->resizes;
+		out->box_w = p->box_w;
+		out->box_h = p->box_h;
+		out->have_counts = p->rebuild_base_set && p->dp_base_set;
+		if (out->have_counts) {
+			out->box_changes = p->box_changes;
+			out->egress_rebuilds =
+			    egress_rebuilds >= p->rebuild_base ? egress_rebuilds - p->rebuild_base : 0;
+			out->dp_creates = dp_creates >= p->dp_base ? dp_creates - p->dp_base : 0;
+		}
+	}
+	memset(p, 0, sizeof(*p));
 	return true;
 }
 

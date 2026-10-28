@@ -228,6 +228,15 @@ struct comp_d3d11_segments_frame
 	//! ADR-060: optional out — set true when any part of the canvas was written
 	//! flat 2D (a segment that could not weave, or canvas off every screen).
 	bool *out_any_flat;
+	/*!
+	 * #1575: @ref src_srv holds only @ref canvas, a cut of the window (an
+	 * egress slot clipped to the panel), so each segment is woven, or filled
+	 * flat, over its part inside @ref canvas rather than its whole window
+	 * rect: the tile and the rect it is drawn into stay one scale, and a
+	 * segment with no part in the cut is left as the clear made it. False
+	 * (zero-init) keeps every segment's whole window rect, as before.
+	 */
+	bool clip_to_canvas;
 };
 
 /*!
