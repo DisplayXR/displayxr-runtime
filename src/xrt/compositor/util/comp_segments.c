@@ -1034,15 +1034,15 @@ comp_segments_overhang_clip(const struct comp_segments_overhang_in *in, struct c
 	 */
 	if (tile.w > cap_w) {
 		tile.w = cap_w;
-		const int64_t far =
+		const int64_t end =
 		    (int64_t)in->canvas.x + seg_scale_round((int64_t)tile.x + tile.w, in->canvas.w, in->view_w);
-		keep.w = far > keep.x ? (uint32_t)(far - keep.x) : 1u;
+		keep.w = end > keep.x ? (uint32_t)(end - keep.x) : 1u;
 	}
 	if (tile.h > cap_h) {
 		tile.h = cap_h;
-		const int64_t far =
+		const int64_t end =
 		    (int64_t)in->canvas.y + seg_scale_round((int64_t)tile.y + tile.h, in->canvas.h, in->view_h);
-		keep.h = far > keep.y ? (uint32_t)(far - keep.y) : 1u;
+		keep.h = end > keep.y ? (uint32_t)(end - keep.y) : 1u;
 	}
 
 	out->tile = tile;
