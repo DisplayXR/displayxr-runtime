@@ -518,10 +518,18 @@ oxr_session_get_nominal_viewer(struct oxr_session *sess, float *out_y_m, float *
  * #1488 PR B: remember a successful sample so the frame-end view-size poll can
  * be served without a second IPC round trip. Called on every path below that
  * returns true, so the cache tracks whichever source actually answered.
+ *
+ * #2305: an in-process sample still measured against the panel's session-start
+ * origin is first rebased on the origin the latest hotplug re-push published
+ * (a DP that cached its origin at creation never sees an arrangement change).
  */
 static bool
-session_cache_window_metrics(struct oxr_session *sess, const struct xrt_window_metrics *wm, bool ok)
+session_cache_window_metrics(struct oxr_session *sess, struct xrt_window_metrics *wm, bool ok)
 {
+	if (ok && wm->valid && sess->panel_origin_valid) {
+		(void)u_canvas_rebase_display_origin(wm, sess->panel_origin_start_left, sess->panel_origin_start_top,
+		                                     sess->panel_origin_now_left, sess->panel_origin_now_top);
+	}
 	if (ok && wm->valid) {
 		sess->last_window_metrics = *wm;
 		sess->last_window_metrics_valid = true;
@@ -6248,6 +6256,32 @@ oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool 
 		generation = xrt_instance_get_display_generation(xinst);
 	}
 	sess->display_generation = generation;
+
+	// #2305: the panel origin the resolver published with this list (see
+	// oxr_session::panel_origin_valid). The start is what the session's DP was
+	// made against; later lists only move "now". Panel-confirmed rects only: a
+	// rect that is not the panel (unplugged: the nearest monitor) says nothing
+	// about where the panel went, so the last confirmed origin stands.
+	const bool panel_confirmed = !sess->is_metal_native_compositor && info->display_desktop_rect_is_panel &&
+	                             info->display_desktop_width > 0 && info->display_desktop_height > 0;
+	if (initial) {
+		sess->panel_origin_valid = panel_confirmed;
+		sess->panel_origin_start_left = info->display_screen_left;
+		sess->panel_origin_start_top = info->display_screen_top;
+		sess->panel_origin_now_left = info->display_screen_left;
+		sess->panel_origin_now_top = info->display_screen_top;
+	} else if (sess->panel_origin_valid && panel_confirmed &&
+	           (info->display_screen_left != sess->panel_origin_now_left ||
+	            info->display_screen_top != sess->panel_origin_now_top)) {
+		sess->panel_origin_now_left = info->display_screen_left;
+		sess->panel_origin_now_top = info->display_screen_top;
+		U_LOG_W(
+		    "display hotplug: the panel is at (%d, %d) now (it was at (%d, %d) when this session started) — "
+		    "window metrics still measured from the start origin are rebased on it, so window-relative "
+		    "views follow the panel",
+		    (int)sess->panel_origin_now_left, (int)sess->panel_origin_now_top,
+		    (int)sess->panel_origin_start_left, (int)sess->panel_origin_start_top);
+	}
 
 	// #2305: the session DP's home screen. Recorded from the first list; on a
 	// hotplug re-push the non-Metal compositors get the list re-anchored on

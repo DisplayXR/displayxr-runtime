@@ -182,3 +182,122 @@ TEST_CASE("window orientation: a never-filled (zero) quaternion is the identity,
 	CHECK(q.y == Catch::Approx(s).margin(1e-6));
 	CHECK(q.w == Catch::Approx(c).margin(1e-6));
 }
+
+/*
+ * #2305: u_canvas_rebase_display_origin — the window-relative Kooima after a
+ * live arrangement change. Numbers from the Windows hardware run (Acer DS1,
+ * 3840x2160, 0.3442 x 0.1936 m, a 3802x1911 window): the panel moved from
+ * (-3840, 0) to (0, 1600) with the window on it, the Leia DP kept reporting
+ * the session-start origin, and eye_offset read (0.3442, -0.1400) m instead of
+ * (0.0000, 0.0035) m.
+ */
+namespace {
+
+struct xrt_window_metrics
+ds1_metrics(int32_t disp_left, int32_t disp_top, int32_t win_left, int32_t win_top)
+{
+	// Built the way the in-process compositors build them (get_window_metrics).
+	struct xrt_window_metrics wm = {};
+	wm.valid = true;
+	wm.display_pixel_width = 3840;
+	wm.display_pixel_height = 2160;
+	wm.display_width_m = 0.3442f;
+	wm.display_height_m = 0.1936f;
+	wm.display_screen_left = disp_left;
+	wm.display_screen_top = disp_top;
+	wm.window_pixel_width = 3802;
+	wm.window_pixel_height = 1911;
+	wm.window_screen_left = win_left;
+	wm.window_screen_top = win_top;
+	const float px = wm.display_width_m / 3840.0f;
+	const float py = wm.display_height_m / 2160.0f;
+	wm.window_width_m = 3802.0f * px;
+	wm.window_height_m = 1911.0f * py;
+	const float cx = (float)(win_left - disp_left) + 3802.0f / 2.0f;
+	const float cy = (float)(win_top - disp_top) + 1911.0f / 2.0f;
+	wm.window_center_offset_x_m = (cx - 1920.0f) * px;
+	wm.window_center_offset_y_m = -((cy - 1080.0f) * py);
+	return wm;
+}
+
+} // namespace
+
+TEST_CASE("rebase_display_origin: a DP stuck on the session-start origin follows the panel (W8b)")
+{
+	// The window moved with the panel: (-3821, 86) on (-3840, 0) -> (19, 1686) on (0, 1600).
+	struct xrt_window_metrics stale = ds1_metrics(-3840, 0, 19, 1686);
+	CHECK(stale.window_center_offset_x_m == Catch::Approx(0.3442f).margin(1e-4));
+	CHECK(stale.window_center_offset_y_m == Catch::Approx(-0.1400f).margin(1e-4));
+
+	const struct xrt_window_metrics truth = ds1_metrics(0, 1600, 19, 1686);
+	REQUIRE(u_canvas_rebase_display_origin(&stale, -3840, 0, 0, 1600));
+	CHECK(stale.window_center_offset_x_m == Catch::Approx(truth.window_center_offset_x_m).margin(1e-5));
+	CHECK(stale.window_center_offset_y_m == Catch::Approx(truth.window_center_offset_y_m).margin(1e-5));
+	CHECK(stale.window_center_offset_x_m == Catch::Approx(0.0f).margin(1e-4));
+	CHECK(stale.window_center_offset_y_m == Catch::Approx(0.0035f).margin(1e-4));
+	CHECK(stale.display_screen_left == 0);
+	CHECK(stale.display_screen_top == 1600);
+	// The window itself is untouched.
+	CHECK(stale.window_screen_left == 19);
+	CHECK(stale.window_width_m == Catch::Approx(truth.window_width_m));
+}
+
+TEST_CASE("rebase_display_origin: a zone canvas composed after the rebase is measured from the new origin")
+{
+	struct xrt_window_metrics stale = ds1_metrics(-3840, 0, 19, 1686);
+	REQUIRE(u_canvas_rebase_display_origin(&stale, -3840, 0, 0, 1600));
+	struct xrt_window_metrics truth = ds1_metrics(0, 1600, 19, 1686);
+	struct u_canvas_rect zone_rect = {true, 100, 200, 640, 480};
+	u_canvas_apply_to_metrics(&stale, &zone_rect);
+	u_canvas_apply_to_metrics(&truth, &zone_rect);
+	CHECK(stale.window_center_offset_x_m == Catch::Approx(truth.window_center_offset_x_m).margin(1e-5));
+	CHECK(stale.window_center_offset_y_m == Catch::Approx(truth.window_center_offset_y_m).margin(1e-5));
+}
+
+TEST_CASE("rebase_display_origin: the W8b run-2 residual (a 130 px start offset) is gone")
+{
+	// Started at (-3840, -130), moved back to (-3840, 0): eye_offset y read -0.0082 m, should be 0.0035 m.
+	struct xrt_window_metrics stale = ds1_metrics(-3840, -130, -3821, 86);
+	CHECK(stale.window_center_offset_y_m == Catch::Approx(-0.0082f).margin(1e-4));
+	REQUIRE(u_canvas_rebase_display_origin(&stale, -3840, -130, -3840, 0));
+	CHECK(stale.window_center_offset_x_m == Catch::Approx(0.0f).margin(1e-4));
+	CHECK(stale.window_center_offset_y_m == Catch::Approx(0.0035f).margin(1e-4));
+}
+
+TEST_CASE("rebase_display_origin: metrics that do not carry the start origin are left alone")
+{
+	// A DP that follows the panel already reports the new origin.
+	struct xrt_window_metrics live = ds1_metrics(0, 1600, 19, 1686);
+	const struct xrt_window_metrics before = live;
+	CHECK_FALSE(u_canvas_rebase_display_origin(&live, -3840, 0, 0, 1600));
+	CHECK(live.window_center_offset_x_m == before.window_center_offset_x_m);
+	CHECK(live.window_center_offset_y_m == before.window_center_offset_y_m);
+	CHECK(live.display_screen_left == 0);
+
+	// A DP whose origin never agreed with the resolver (another coordinate space).
+	struct xrt_window_metrics other = ds1_metrics(-1280, 0, -1270, 43);
+	const struct xrt_window_metrics other_before = other;
+	CHECK_FALSE(u_canvas_rebase_display_origin(&other, -3840, 0, 0, 1600));
+	CHECK(other.window_center_offset_x_m == other_before.window_center_offset_x_m);
+	CHECK(other.display_screen_left == -1280);
+}
+
+TEST_CASE("rebase_display_origin: no move, or nothing to rebase, changes nothing")
+{
+	struct xrt_window_metrics wm = ds1_metrics(-3840, 0, -3821, 86);
+	const struct xrt_window_metrics before = wm;
+	CHECK_FALSE(u_canvas_rebase_display_origin(&wm, -3840, 0, -3840, 0));
+	CHECK(wm.window_center_offset_x_m == before.window_center_offset_x_m);
+	CHECK(wm.window_center_offset_y_m == before.window_center_offset_y_m);
+
+	struct xrt_window_metrics invalid = ds1_metrics(-3840, 0, 19, 1686);
+	invalid.valid = false;
+	CHECK_FALSE(u_canvas_rebase_display_origin(&invalid, -3840, 0, 0, 1600));
+	CHECK(invalid.display_screen_left == -3840);
+
+	struct xrt_window_metrics no_pixels = ds1_metrics(-3840, 0, 19, 1686);
+	no_pixels.display_pixel_width = 0;
+	CHECK_FALSE(u_canvas_rebase_display_origin(&no_pixels, -3840, 0, 0, 1600));
+
+	CHECK_FALSE(u_canvas_rebase_display_origin(NULL, -3840, 0, 0, 1600));
+}

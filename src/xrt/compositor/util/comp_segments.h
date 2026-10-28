@@ -407,11 +407,17 @@ comp_segments_uncovered(const struct comp_segment_table *t,
  * crop (M2) and the per-segment view routing (M3) use, so a segment's views
  * are always placed exactly where its crop reads them.
  *
+ * Only the part of @p seg inside @p canvas is mapped, on every edge (#1575).
+ * A canvas that is itself a cut of the window (an atlas clipped to the panel)
+ * can start a pixel or two inside a segment the live window has moved since;
+ * that segment still gets the tile rect of the part it shares with the canvas.
+ *
  * @param seg     The segment, window px.
  * @param canvas  The canvas the atlas holds, window px.
  * @param tile_w/tile_h  One view tile, px.
  * @param[out] out The rect inside a tile.
- * @return false when the segment is outside the canvas or thinner than a tile pixel.
+ * @return false when no part of the segment is inside the canvas, or that
+ *         part is thinner than a tile pixel.
  */
 bool
 comp_segments_tile_rect(const struct comp_seg_rect *seg,
@@ -419,6 +425,231 @@ comp_segments_tile_rect(const struct comp_seg_rect *seg,
                         uint32_t tile_w,
                         uint32_t tile_h,
                         struct comp_seg_rect *out);
+
+/*!
+ * Intersect two rects (half-open). @return false (and @p out zeroed) when
+ * they share no pixel.
+ */
+bool
+comp_segments_rect_intersect(const struct comp_seg_rect *a, const struct comp_seg_rect *b, struct comp_seg_rect *out);
+
+/*!
+ * The inverse of @ref comp_segments_tile_rect: a rect in VIEW-TILE pixels
+ * mapped back onto the canvas the atlas holds, in window px. Each edge is
+ * rounded on its own, so the result is exactly where those tile pixels land
+ * when the canvas is woven whole: a DP handed this rect as its canvas and the
+ * tile rect as its tile puts every texel where it always was, at the same
+ * scale (#1575).
+ *
+ * @return false when @p tile is empty or the inputs are degenerate.
+ */
+bool
+comp_segments_canvas_from_tile(const struct comp_seg_rect *tile,
+                               const struct comp_seg_rect *canvas,
+                               uint32_t tile_w,
+                               uint32_t tile_h,
+                               struct comp_seg_rect *out);
+
+/*!
+ * #1575: what one frame of a window that overhangs the panel sends across the
+ * output-device split's bridge.
+ *
+ * The bridge's rings are sized once, for the worst-case system atlas (the
+ * panel's), but the renderer sizes its view tiles from the WINDOW. A window
+ * larger than the panel therefore paints a content box the bridge cannot
+ * carry, and every such frame was refused: a black panel, and before #2408 a
+ * DEGRADED latch for the rest of the session.
+ *
+ * The pixels past the panel never reach it, so they need not be carried.
+ * Every view tile is cut at its real offset, and the DP weaves that cut over
+ * the same window pixels it always would. Nothing is scaled, so the weave
+ * phase and the window-relative Kooima (both computed from the window) do not
+ * change. This is the crop-before-the-DP rule the per-screen segments follow
+ * (ADR-030).
+ *
+ * The cut is a FIXED size for a given tile size: the bridge's per-tile share,
+ * `min(max_w / cols, view_w)` by `min(max_h / rows, view_h)`, placed over the
+ * part of the canvas on the panel. A drag across the panel's edge moves the
+ * cut and never resizes it, so the bridge box, the egress ring and the DP
+ * input keep one size for the whole episode. The DP canvas is the cut mapped
+ * back by @ref comp_segments_canvas_from_tile, so tile and canvas keep one
+ * scale; its edges lie on the window's own edges or past the panel's, where
+ * nothing reaches the panel.
+ */
+struct comp_segments_overhang_in
+{
+	//! The window's client area, desktop px.
+	struct comp_seg_rect window;
+	//! The part of the window the atlas maps onto, window px (usually 0,0 and the client size).
+	struct comp_seg_rect canvas;
+	//! The panel, desktop px.
+	struct comp_seg_rect panel;
+	//! The atlas's tile grid.
+	uint32_t cols, rows;
+	//! One tile as painted (its stride in the atlas).
+	uint32_t view_w, view_h;
+	//! The largest box the bridge carries.
+	uint32_t max_w, max_h;
+};
+
+//! What @ref comp_segments_overhang_clip decided.
+enum comp_segments_overhang_verdict
+{
+	//! A degenerate input. The caller keeps its own path.
+	COMP_SEG_OVERHANG_NO_INPUT = 0,
+	//! The whole content box fits the bridge: carried whole, no clip.
+	COMP_SEG_OVERHANG_FITS,
+	//! Too big, but the canvas lies wholly on the panel: the tiles are larger
+	//! than the panel's own, which no clip to the panel can cure (not #1575).
+	COMP_SEG_OVERHANG_ON_PANEL,
+	//! Too big, and no part of the canvas is on the panel: nothing to carry.
+	COMP_SEG_OVERHANG_OFF_PANEL,
+	//! Carry @ref comp_segments_overhang::tile of every view and weave it
+	//! over @ref comp_segments_overhang::canvas.
+	COMP_SEG_OVERHANG_CLIPPED,
+};
+
+//! The clip @ref comp_segments_overhang_clip computed.
+struct comp_segments_overhang
+{
+	//! How far the canvas reaches past each edge of the panel, window px.
+	uint32_t over_left, over_right, over_top, over_bottom;
+	//! The part of the canvas on the panel, window px: what must reach it.
+	struct comp_seg_rect keep;
+	//! @ref keep in tile px, rounded outward: what every tile must carry.
+	struct comp_seg_rect need;
+	//! What every tile carries, tile px: the bridge's per-tile share at its
+	//! real offset, covering @ref need (a drag moves it, never resizes it).
+	struct comp_seg_rect tile;
+	//! Where the DP weaves @ref tile, window px (@ref comp_segments_canvas_from_tile).
+	struct comp_seg_rect canvas;
+	//! What crosses the bridge: cols x tile.w by rows x tile.h.
+	uint32_t box_w, box_h;
+};
+
+/*!
+ * Decide what one frame of @p in sends across the bridge (#1575).
+ *
+ * Only a content box larger than the bridge (@ref comp_segments_overhang_in::max_w
+ * by max_h) is clipped; a box that fits is carried whole, exactly as before.
+ * @ref comp_segments_overhang::canvas covers @ref comp_segments_overhang::keep
+ * whenever the share is wide enough for it, which it is for tiles sized at the
+ * panel's own scale up to one tile pixel of rounding on a window that covers
+ * the whole panel. Tiles not at the panel's scale lose their far part.
+ *
+ * @param[out] out Filled for COMP_SEG_OVERHANG_CLIPPED, and its over_* fields
+ *             for ON_PANEL and OFF_PANEL; zeroed otherwise.
+ */
+enum comp_segments_overhang_verdict
+comp_segments_overhang_clip(const struct comp_segments_overhang_in *in, struct comp_segments_overhang *out);
+
+/*!
+ * #1575 — the proof an overhang episode's end line carries: that a DRAG
+ * reallocated nothing.
+ *
+ * A drag keeps the window's size, so the cut keeps its size, and after its
+ * first frame nothing may be rebuilt. A RESIZE changes the tiles, so the box,
+ * and may rebuild the egress ring and the DP input. Both can happen in one
+ * episode: on the G16 on 2026-10-28 Windows rescaled a window whose majority
+ * crossed to the other display (5220x863 -> 2605x427 -> 5220x865 -> 5220x863),
+ * and the person kept dragging it. One count could not tell the two apart, so
+ * the drag read as a box change. Hence:
+ *
+ * - A change of the window's size or of its tile grid is a resize. It is
+ *   counted, and the proof restarts there: the end line's counts cover the
+ *   frames at the window's LAST size. The episode itself goes on (one WARN when
+ *   it starts, one line when it ends): an interactive resize changes the size
+ *   on nearly every frame.
+ * - A box change at one window size and one tile grid is the drag bug (a cut
+ *   that follows the window's position). It is still counted.
+ * - The egress ring is sized by the frame's own submit, after its step, so its
+ *   baseline is taken on the next frame (the first frame may size it once).
+ * - The DP input is (re)created by the WEAVE, which takes a slot a frame or
+ *   more after it was submitted. Its baseline waits until the DP input holds
+ *   the box, or no output-device crop is needed (the egress ring is the box's
+ *   own size), for at most @ref COMP_SEG_OVERHANG_PROOF_DP_WAIT frames. A
+ *   baseline taken on the second submit counted the episode's own first box
+ *   reaching the weave as a re-create whenever the ring was worst-case.
+ */
+#define COMP_SEG_OVERHANG_PROOF_DP_WAIT 8u
+
+//! One clipped frame, as @ref comp_segments_overhang_proof_step reads it.
+struct comp_segments_overhang_proof_in
+{
+	//! The client size the frame was cut for.
+	uint32_t window_w, window_h;
+	//! Its tile grid, as painted.
+	uint32_t cols, rows, view_w, view_h;
+	//! The box it carries across the bridge.
+	uint32_t box_w, box_h;
+	//! The bridge's egress rebuild count, read before this frame's submit.
+	uint64_t egress_rebuilds;
+	//! The DP input's create count, read together with @ref dp_settled.
+	uint64_t dp_creates;
+	//! The DP input already holds @ref box_w x @ref box_h, or the egress ring
+	//! is that size (no output-device crop, so no DP input is made).
+	bool dp_settled;
+};
+
+//! An episode's bookkeeping. Zero-init = no episode.
+struct comp_segments_overhang_proof
+{
+	bool open;
+	//! Frames in the episode, and in its stretch at the window's last size.
+	uint64_t frames, frames_at_size;
+	//! Resizes in the episode.
+	uint64_t resizes;
+	//! The size the current stretch is cut at, and the box it carries.
+	uint32_t window_w, window_h, cols, rows, view_w, view_h;
+	uint32_t box_w, box_h;
+	//! Box changes at that size: a drag must make none.
+	uint64_t box_changes;
+	bool rebuild_base_set, dp_base_set;
+	uint64_t rebuild_base, dp_base;
+	//! Frames the DP baseline has waited for the DP input to hold the box.
+	uint32_t dp_wait;
+};
+
+//! What @ref comp_segments_overhang_proof_step saw.
+enum comp_segments_overhang_proof_event
+{
+	//! One more frame of the episode at its size.
+	COMP_SEG_PROOF_FRAME = 0,
+	//! The episode's first frame (the caller logs its WARN).
+	COMP_SEG_PROOF_STARTED,
+	//! The window or its tiles changed size: the proof restarts at this frame.
+	COMP_SEG_PROOF_RESIZED,
+};
+
+/*!
+ * Feed one clipped frame to the episode @p p, opening it if needed. Call it
+ * before the frame's submit (the egress count in @p in must not include that
+ * submit's rebuild yet).
+ */
+enum comp_segments_overhang_proof_event
+comp_segments_overhang_proof_step(struct comp_segments_overhang_proof *p,
+                                  const struct comp_segments_overhang_proof_in *in);
+
+//! What an episode proved, for its end line.
+struct comp_segments_overhang_proof_result
+{
+	uint64_t frames, frames_at_size, resizes;
+	//! The box at the window's last size.
+	uint32_t box_w, box_h;
+	//! False when the last size held too few frames for a baseline; the counts are then 0.
+	bool have_counts;
+	uint64_t box_changes, egress_rebuilds, dp_creates;
+};
+
+/*!
+ * Close the episode @p p (if one is open) against the counts now, and reset
+ * it. @return false when no episode was open (@p out zeroed).
+ */
+bool
+comp_segments_overhang_proof_end(struct comp_segments_overhang_proof *p,
+                                 uint64_t egress_rebuilds,
+                                 uint64_t dp_creates,
+                                 struct comp_segments_overhang_proof_result *out);
 
 /*
  * The partition the atlas content was painted with (#1883).

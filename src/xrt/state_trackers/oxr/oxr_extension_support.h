@@ -718,6 +718,21 @@
 
 
 /*
+ * XR_DXR_swapchain_color_encoding
+ *
+ * Hand-added DisplayXR extension (ADR-044 amendment). No entry points: a
+ * next-chain input on XrSwapchainCreateInfo.
+ */
+#if defined(XR_DXR_swapchain_color_encoding)
+#define OXR_HAVE_DXR_swapchain_color_encoding
+#define OXR_EXTENSION_SUPPORT_DXR_swapchain_color_encoding(_)                                                          \
+	_(DXR_swapchain_color_encoding, DXR_SWAPCHAIN_COLOR_ENCODING)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_swapchain_color_encoding(_)
+#endif
+
+
+/*
  * XR_DXR_display_zones
  *
  * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing
@@ -1351,6 +1366,7 @@
     OXR_EXTENSION_SUPPORT_DXR_view_rig(_) \
     OXR_EXTENSION_SUPPORT_DXR_depth_budget(_) \
     OXR_EXTENSION_SUPPORT_DXR_cursor_depth(_) \
+    OXR_EXTENSION_SUPPORT_DXR_swapchain_color_encoding(_) \
     OXR_EXTENSION_SUPPORT_DXR_display_zones(_) \
     OXR_EXTENSION_SUPPORT_DXR_weave(_) \
     OXR_EXTENSION_SUPPORT_DXR_lift(_) \

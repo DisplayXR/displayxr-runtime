@@ -156,6 +156,34 @@ The helper keys on the *target's* format. Pinning a format and calling the helpe
   Encoded bytes therefore pass through whether the swapchain says UNORM or `_SRGB`. Neither is washed out today, but a true-linear UNORM Local2D app renders too dark. Local2D is also flattened after the atlas, so §5's atlas capture cannot see it. App guidance does not change: submit Local2D as `_SRGB` with raw-copied bytes (displayxr-unity v2.21.0 already does). **Order matters:** apps move first. Making the flatten honest before they do would wash out every app that still declares UNORM Local2D.
 - **The displayxr-common Windows window-space HUD swapchain** stays `R8G8B8A8_UNORM` with display-referred bytes. On any format-honest backend it is encoded twice; its move to `_SRGB` is pending (displayxr-common).
 
+### 8. Amendment 1 (2026-10-28): declaring a UNORM swapchain display-encoded
+
+The rule at the top of this ADR stays: the format says what the values mean. But only the 8-bit
+families have an `_SRGB` member, so an app holding display-referred values in a deeper format
+could not say so. For example, a game's 10-bit `R10G10B10A2_UNORM` back buffer submitted by an
+injected layer had to be converted down to 8 bits first.
+
+[`XR_DXR_swapchain_color_encoding`](../specs/extensions/XR_DXR_swapchain_color_encoding.md) adds
+the missing word. A swapchain created with `XR_SWAPCHAIN_COLOR_ENCODING_SRGB_DXR` is read exactly
+like an `_SRGB` one. The swapchain still declares its encoding; the extension only gives the
+deeper formats a way to do it.
+
+- **Where it is honoured.** Spec v1: the in-process D3D11 compositor, which also lists
+  `R10G10B10A2_UNORM`. It sets `xrt_compositor_info::color_encoded_srgb_swapchains`, and the state
+  tracker refuses the declaration (`XR_ERROR_FEATURE_UNSUPPORTED`) on every compositor that does
+  not.
+  - D3D12 is the next row to add. Its five layer-source sites each build an SRV from the app's
+    resource, so the shadow below has to be threaded through each one.
+- **Fast path and zero-copy.** `comp_d3d11_swapchain_is_srgb()` answers "encoded" for a declared
+  swapchain, so it takes the same raw path an `_SRGB` swapchain takes, at the format's full
+  precision.
+- **Compose path.**
+  - An 8-bit declared swapchain is sampled through its `_SRGB` sibling view (the images are
+    TYPELESS).
+  - A format without one is first copied raw into an 8-bit TYPELESS shadow. A UNORM→UNORM draw
+    applies no transfer function. The shadow is then sampled through its `_SRGB` view.
+  - The decode is still the hardware's. No shader holds the curve (§3, `tests_comp_color_policy.cpp`).
+
 ## Consequences
 
 - **One sentence for app authors** (the rule at the top), one table for runtime authors (§1), and a per-leg lint.
