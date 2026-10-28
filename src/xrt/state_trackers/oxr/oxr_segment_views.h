@@ -310,6 +310,26 @@ oxr_segment_views_session_eyes_usable(
 }
 
 /*!
+ * ADR-047 Amendment 8 (#2305): is the session DP another screen's, so that
+ * @ref oxr_segment_views_session_eyes_usable applies the segment rule?
+ *
+ * Keyed on the slot: @p slot_other is the compositor's away record, true from
+ * the update that hands the window to a ready screen (or to a stand-in) until
+ * the update that gives the home its own DP back. @p home_unlisted is the
+ * session's own view of the screen list (the home unplugged); it covers a
+ * compositor that does not report its slot. The slot outlives the list at a
+ * replug: the list names the home again a few ms before the compositor's next
+ * update moves its DP back, and in that gap the other screen's DP still
+ * answers (G16, 2026-10-28: 2-4 ms, one `#615: DP under-reported` line per
+ * replug).
+ */
+static inline bool
+oxr_segment_views_session_dp_away(bool home_unlisted, bool slot_other)
+{
+	return home_unlisted || slot_other;
+}
+
+/*!
  * The untracked eye set: one eye per active view (at least 2), in front of the
  * screen centre at @p z, translated by (@p dx, @p dy) into the caller's frame.
  * The pair is (-ipd/2, +ipd/2); views past 2 repeat it column by column (even

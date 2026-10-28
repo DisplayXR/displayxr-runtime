@@ -900,7 +900,7 @@ hwnd_rehome(struct comp_vk_native_segments *segs, int32_t target_format)
 	if (segs->stand_in != COMP_SEGMENTS_AWAY_NONE) {
 		comp_segments_away_set(away_rec, segs->screens[p].id, segs->screens[p].plugin_id, 0, NULL);
 	} else {
-		memset(away_rec, 0, sizeof(*away_rec));
+		comp_segments_away_clear(away_rec);
 	}
 	if (segs->hooks.bracket != NULL) {
 		segs->hooks.bracket(segs->hooks.userdata, false, listed ? holder : NULL);

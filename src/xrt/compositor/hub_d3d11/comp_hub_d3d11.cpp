@@ -5735,6 +5735,12 @@ comp_hub_d3d11_get_eye_positions_at(struct comp_hub_d3d11 *s, int64_t target_ns,
 }
 
 extern "C" bool
+comp_hub_d3d11_slot_holds_other_screen(struct comp_hub_d3d11 *s)
+{
+	return s != nullptr && comp_segments_away_slot_other(&s->seg_away);
+}
+
+extern "C" bool
 comp_hub_d3d11_get_display_dimensions(struct comp_hub_d3d11 *s, float *out_width_m, float *out_height_m)
 {
 	if (s == nullptr) {
@@ -6235,6 +6241,13 @@ comp_hub_d3d11_get_eye_positions_at(struct comp_hub_d3d11 *split,
 	(void)split;
 	(void)target_ns;
 	(void)out_eye_pos;
+	return false;
+}
+
+extern "C" bool
+comp_hub_d3d11_slot_holds_other_screen(struct comp_hub_d3d11 *split)
+{
+	(void)split;
 	return false;
 }
 

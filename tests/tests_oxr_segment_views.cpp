@@ -423,6 +423,43 @@ TEST_CASE("home gone: the session DP's eyes count only as its screen's segment's
 	CHECK_FALSE(oxr_segment_views_session_eyes_usable(true, false, true, 2, 2));
 }
 
+TEST_CASE("Home gone, replug: the rule holds while the slot still has the other screen's DP (ADR-047 A8, #2305)",
+          "[oxr][segment_views]")
+{
+	// G16, 2026-10-28 (second Windows test), 90 s unplug then replug, cube
+	// d3d11 and vk: the list naming the panel again cleared the session's
+	// "home unlisted" state, and 2-4 ms later, before the compositor's update
+	// moved the panel's DP back into the slot (+7 ms), the laptop's one-eye
+	// sim_display DP still answered: one `#615: DP under-reported` line.
+	const auto usable = [](bool home_unlisted, bool slot_other, uint32_t count) {
+		return oxr_segment_views_session_eyes_usable(oxr_segment_views_session_dp_away(home_unlisted, slot_other),
+		                                             true, true, count, 2);
+	};
+
+	// Before the bound (the re-seat case too): the home unlisted, its own DP
+	// still in the slot. As before: the session state alone decides.
+	CHECK(oxr_segment_views_session_dp_away(true, false));
+	CHECK_FALSE(usable(true, false, 1));
+	CHECK(usable(true, false, 2));
+
+	// At the bound the window is handed to the laptop: its DP in the slot.
+	CHECK_FALSE(usable(true, true, 1));
+
+	// Replug: the list names the panel again, the slot still has the laptop's
+	// DP. Its one eye is refused — the nominal viewer fills the views, as it
+	// did since the bound.
+	CHECK(oxr_segment_views_session_dp_away(false, true));
+	CHECK_FALSE(usable(false, true, 1));
+	CHECK(usable(false, true, 2)); // a covering set still counts
+
+	// The compositor's update gives the panel its own DP back: two eyes are
+	// used, and a later one-eye frame from the home's own DP is the #615
+	// mode-switch lag again, held by the caller's guard.
+	CHECK_FALSE(oxr_segment_views_session_dp_away(false, false));
+	CHECK(usable(false, false, 2));
+	CHECK(usable(false, false, 1));
+}
+
 TEST_CASE("Quad mode on two segments: every view gets a real frustum", "[oxr][segment_views]")
 {
 	// The nominal branch must fill one eye per active view: a 4-view mode

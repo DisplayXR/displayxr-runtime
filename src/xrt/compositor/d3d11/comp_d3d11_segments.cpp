@@ -754,7 +754,7 @@ hwnd_rehome(struct comp_d3d11_segments *segs, ID3D11DeviceContext *ctx)
 	if (segs->stand_in != COMP_SEGMENTS_AWAY_NONE) {
 		comp_segments_away_set(away_rec, segs->screens[p].id, segs->screens[p].plugin_id, 0, nullptr);
 	} else {
-		memset(away_rec, 0, sizeof(*away_rec));
+		comp_segments_away_clear(away_rec);
 	}
 	if (segs->hooks.bracket != nullptr) {
 		segs->hooks.bracket(segs->hooks.userdata, false, listed ? holder : nullptr);

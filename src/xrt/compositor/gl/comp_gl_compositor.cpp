@@ -9477,6 +9477,32 @@ comp_gl_compositor_get_eye_positions_at(struct xrt_compositor *xc,
 	return comp_gl_compositor_get_predicted_eye_positions(xc, out_eye_pos) && out_eye_pos->valid;
 }
 
+bool
+comp_gl_compositor_slot_holds_other_screen(struct xrt_compositor *xc)
+{
+#ifdef XRT_OS_WINDOWS
+	if (xc == NULL) {
+		return false;
+	}
+	struct comp_gl_compositor *c = gl_comp(xc);
+	bool other = false;
+	os_mutex_lock(&c->dp_swap_mutex); // hub.split's lifetime
+#ifdef XRT_GL_HUB
+	if (c->hub.active) {
+		other = comp_hub_d3d11_slot_holds_other_screen(c->hub.split);
+	} else
+#endif
+	{
+		other = comp_segments_away_slot_other(&c->seg_away);
+	}
+	os_mutex_unlock(&c->dp_swap_mutex);
+	return other;
+#else
+	(void)xc;
+	return false;
+#endif
+}
+
 void
 comp_gl_compositor_set_screens(struct xrt_compositor *xc,
                                const struct xrt_screen_list *list,

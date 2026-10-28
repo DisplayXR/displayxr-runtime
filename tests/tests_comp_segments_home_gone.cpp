@@ -365,6 +365,7 @@ TEST_CASE("home gone: the window stays on the laptop's ready DP, never a new DP 
 		CHECK(d->screen != PANEL);
 	}
 	CHECK(r.w.away.screen_id == LAPTOP);
+	CHECK(comp_segments_away_slot_other(&r.w.away)); // what the session's locate reads
 
 	// The rebuilt manager has one screen: no segmentation, the slot is untouched.
 	segs = r.manager(gone);
@@ -372,6 +373,7 @@ TEST_CASE("home gone: the window stays on the laptop's ready DP, never a new DP 
 	comp_vk_native_segments_destroy_for_rebuild(&segs, nullptr);
 	CHECK(fake(r.w.slot) == laptop_dp);
 	CHECK(r.w.away.screen_id == LAPTOP);
+	CHECK(comp_segments_away_slot_other(&r.w.away));
 
 	// The panel is back. The first update of the new manager moves the
 	// laptop's DP out of the slot — still holding the window — and gives the
@@ -379,10 +381,16 @@ TEST_CASE("home gone: the window stays on the laptop's ready DP, never a new DP 
 	r.w.panel_ready = true;
 	segs = r.manager(b);
 	REQUIRE(comp_vk_native_segments_enabled(segs));
+	// The list has the panel back, but until the update below the slot still
+	// holds the laptop's DP: the session keeps refusing its one eye (#2305;
+	// the 2-4 ms `#615` gap of the 2026-10-28 Windows test).
+	CHECK(fake(r.w.slot) == laptop_dp);
+	CHECK(comp_segments_away_slot_other(&r.w.away));
 	const comp_seg_rect canvas{0, 0, ON_PANEL.w, ON_PANEL.h};
 	CHECK(comp_vk_native_segments_would_split(segs, &ON_PANEL, &canvas)); // the update must run
 	(void)comp_vk_native_segments_update(segs, &ON_PANEL, &canvas, kFormat, true, 0);
 	CHECK(r.w.away.screen_id == 0);
+	CHECK_FALSE(comp_segments_away_slot_other(&r.w.away));
 	CHECK(r.w.holder() == laptop_dp);
 	REQUIRE(r.w.slot != nullptr);
 	CHECK(fake(r.w.slot)->screen == PANEL);
@@ -798,6 +806,9 @@ TEST_CASE("comp_segments_away_decide: who stands in for the gone home")
 	comp_segments_next_list_add(&nl, PANEL2, "vendor", false);
 	comp_segments_away none{};
 	CHECK(comp_segments_away_decide(&none, &nl, can, osp, &k) == COMP_SEGMENTS_AWAY_NONE);
+	CHECK_FALSE(comp_segments_away_slot_other(&none));
+	CHECK_FALSE(comp_segments_away_slot_other(nullptr));
+	CHECK(comp_segments_away_slot_other(&away));
 	CHECK(k == -1);
 	comp_segments_next_list with_default{};
 	comp_segments_next_list_add(&with_default, PANEL, "vendor", true);
@@ -837,4 +848,22 @@ TEST_CASE("comp_segments_away_decide: who stands in for the gone home")
 	CHECK(away.screen_id == PANEL2);
 	CHECK(away.home_id == PANEL);
 	CHECK(std::strcmp(away.plugin_id, "vendor") == 0);
+}
+
+TEST_CASE("comp_segments_away: the slot flag follows the record (#2305)")
+{
+	comp_segments_away a{};
+	CHECK_FALSE(comp_segments_away_slot_other(&a));
+	comp_segments_away_set(&a, LAPTOP, "sim-display", PANEL, "vendor");
+	CHECK(comp_segments_away_slot_other(&a));
+	// A stand-in takes over: the home stays the first one recorded.
+	comp_segments_away_set(&a, PANEL2, "vendor", PANEL2, "vendor");
+	CHECK(comp_segments_away_slot_other(&a));
+	CHECK(a.home_id == PANEL);
+	comp_segments_away_clear(&a);
+	CHECK_FALSE(comp_segments_away_slot_other(&a));
+	CHECK(a.screen_id == 0);
+	CHECK(a.home_id == 0);
+	CHECK(a.plugin_id[0] == '\0');
+	comp_segments_away_clear(nullptr); // no-op
 }

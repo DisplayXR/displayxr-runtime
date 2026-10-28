@@ -409,6 +409,38 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess,
 }
 
 /*!
+ * ADR-047 Amendment 8 (#2305): whether this session's compositor has another
+ * screen's DP in its primary slot, i.e. the eye source above is that screen's
+ * DP. Only the in-process compositors that segment a window (D3D11 and the
+ * #918 hub, OpenGL, Vulkan) keep that record; every other compositor (and an
+ * IPC client, whose service splices its views) answers false, and the
+ * session's own "home unlisted" state stands alone, as before.
+ */
+static bool
+oxr_session_slot_holds_other_screen(struct oxr_session *sess)
+{
+	if (sess == NULL || sess->xcn == NULL) {
+		return false;
+	}
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		return comp_d3d11_compositor_slot_holds_other_screen(&sess->xcn->base);
+	}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		return comp_vk_native_compositor_slot_holds_other_screen(&sess->xcn->base);
+	}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor) {
+		return comp_gl_compositor_slot_holds_other_screen(&sess->xcn->base);
+	}
+#endif
+	return false;
+}
+
+/*!
  * Get display dimensions for Kooima asymmetric FOV calculation.
  *
  * Vendor-neutral: reads from xrt_system_compositor_info which is populated
@@ -3714,18 +3746,32 @@ locate_views_one(struct oxr_logger *log,
 		// when the bounded wait ended. Its eyes count only as that screen's
 		// segment's did: a set short of the mode's views (a sim_display DP in
 		// another vendor's session reports one eye) gives way to the nominal
-		// viewer below, so the view does not change at the bound.
+		// viewer below, so the view does not change at the bound. Keyed on
+		// the compositor's slot, which still holds that DP for a few ms after
+		// the screen list names the home again. Only a set the rule would
+		// refuse asks the compositor (a covering set counts either way).
 		if (got_eye_positions &&
-		    !oxr_segment_views_session_eyes_usable(sess->display_home_away, got_eye_positions, eye_pos.valid,
-		                                           eye_pos.count, active_view_count)) {
+		    !oxr_segment_views_session_eyes_usable(true, got_eye_positions, eye_pos.valid, eye_pos.count,
+		                                           active_view_count) &&
+		    oxr_segment_views_session_dp_away(sess->display_home_away,
+		                                      oxr_session_slot_holds_other_screen(sess))) {
 			got_eye_positions = false;
 			static bool logged_away_eyes = false;
-			if (!logged_away_eyes) {
+			static bool logged_slot_eyes = false;
+			if (sess->display_home_away && !logged_away_eyes) {
 				logged_away_eyes = true;
 				U_LOG_W(
 				    "locate: the home panel is unplugged and the session DP reports %u eye(s) for "
 				    "a %u-view mode — the nominal viewer fills the views, as for that screen's "
 				    "segment (ADR-047 Amendment 8, #2305). Logged once.",
+				    (unsigned)eye_pos.count, (unsigned)active_view_count);
+			} else if (!sess->display_home_away && !logged_slot_eyes) {
+				logged_slot_eyes = true;
+				U_LOG_W(
+				    "locate: the home panel is listed again, but the session DP is still another "
+				    "screen's until the compositor's next update and reports %u eye(s) for a %u-view "
+				    "mode — the nominal viewer fills the views, as for that screen's segment "
+				    "(ADR-047 Amendment 8, #2305). Logged once.",
 				    (unsigned)eye_pos.count, (unsigned)active_view_count);
 			}
 		}
