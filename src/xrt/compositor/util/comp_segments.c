@@ -1066,6 +1066,26 @@ comp_segments_away_set(struct comp_segments_away *away,
 	}
 	away->screen_id = screen_id;
 	(void)snprintf(away->plugin_id, COMP_SEGMENTS_ID_MAX, "%s", plugin_id != NULL ? plugin_id : "");
+	away->slot_other = screen_id != 0 ? 1 : 0;
+}
+
+void
+comp_segments_away_clear(struct comp_segments_away *away)
+{
+	if (away == NULL) {
+		return;
+	}
+	away->slot_other = 0;
+	away->screen_id = 0;
+	away->plugin_id[0] = '\0';
+	away->home_id = 0;
+	away->home_plugin_id[0] = '\0';
+}
+
+bool
+comp_segments_away_slot_other(const struct comp_segments_away *away)
+{
+	return away != NULL && away->slot_other != 0;
 }
 
 

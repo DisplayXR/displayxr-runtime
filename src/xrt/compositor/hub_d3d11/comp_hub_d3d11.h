@@ -1027,6 +1027,10 @@ comp_hub_d3d11_get_eye_positions_at(struct comp_hub_d3d11 *split,
                                     int64_t target_ns,
                                     struct xrt_eye_positions *out_eye_pos);
 
+//! ADR-047 Amendment 8 (#2305): the hub's primary slot holds another screen's DP.
+bool
+comp_hub_d3d11_slot_holds_other_screen(struct comp_hub_d3d11 *split);
+
 bool
 comp_hub_d3d11_get_display_dimensions(struct comp_hub_d3d11 *split, float *out_width_m, float *out_height_m);
 

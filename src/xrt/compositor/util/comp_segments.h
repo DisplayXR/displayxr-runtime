@@ -32,6 +32,8 @@
 
 #pragma once
 
+#include "xrt/xrt_compiler.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -1173,6 +1175,10 @@ struct comp_segments_away
 	//! that plug-in wins again is the panel back.
 	uint64_t home_id;
 	char home_plugin_id[COMP_SEGMENTS_ID_MAX];
+	//! 1 while @ref screen_id is set: the slot holds another screen's DP. The
+	//! one field read off the compositor's thread (the session's locate, #2305),
+	//! so it is a 32-bit flag written with the record, not the 64-bit id.
+	xrt_atomic_s32_t slot_other;
 };
 
 //! What @ref comp_segments_away_decide picks.
@@ -1233,6 +1239,18 @@ comp_segments_away_set(struct comp_segments_away *away,
                        const char *plugin_id,
                        uint64_t home_id,
                        const char *home_plugin_id);
+
+//! The home's own DP is back in the slot: clear the record.
+void
+comp_segments_away_clear(struct comp_segments_away *away);
+
+/*!
+ * Whether the session's primary slot holds another screen's DP: the window was
+ * handed to a ready screen at the bound, or a stand-in serves the home (ADR-047
+ * Amendment 8, #2305). Safe to call from any thread; NULL reads as false.
+ */
+bool
+comp_segments_away_slot_other(const struct comp_segments_away *away);
 
 
 /*

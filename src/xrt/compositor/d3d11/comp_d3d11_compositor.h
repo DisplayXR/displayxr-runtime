@@ -297,6 +297,19 @@ comp_d3d11_compositor_get_eye_positions_at(struct xrt_compositor *xc,
                                            struct xrt_eye_positions *out_eye_pos);
 
 /*!
+ * ADR-047 Amendment 8 (#2305): whether the session's primary slot holds another
+ * screen's DP (the window was handed to a ready screen at the home-gone bound,
+ * or a stand-in serves the home), so that the eye set from
+ * @ref comp_d3d11_compositor_get_eye_positions_at must cover the views. Stays true until the
+ * update that gives the home its own DP back, a few ms after the screen list
+ * names the home again. Any thread.
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_compositor_slot_holds_other_screen(struct xrt_compositor *xc);
+
+/*!
  * Get the display dimensions from the display processor.
  *
  * @param xc The compositor.

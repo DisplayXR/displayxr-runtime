@@ -15850,6 +15850,23 @@ comp_vk_native_compositor_get_eye_positions_at(struct xrt_compositor *xc,
 }
 
 bool
+comp_vk_native_compositor_slot_holds_other_screen(struct xrt_compositor *xc)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef XRT_OS_WINDOWS
+	if (c->split != NULL) {
+		return comp_hub_d3d11_slot_holds_other_screen(c->split);
+	}
+#endif
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	return comp_segments_away_slot_other(&c->seg_away);
+#else
+	(void)c;
+	return false;
+#endif
+}
+
+bool
 comp_vk_native_compositor_get_display_dimensions(struct xrt_compositor *xc,
                                                   float *out_width_m,
                                                   float *out_height_m)

@@ -656,7 +656,7 @@ hwnd_rehome(struct comp_gl_segments *segs)
 	if (segs->stand_in != COMP_SEGMENTS_AWAY_NONE) {
 		comp_segments_away_set(away_rec, segs->screens[p].id, segs->screens[p].plugin_id, 0, nullptr);
 	} else {
-		memset(away_rec, 0, sizeof(*away_rec));
+		comp_segments_away_clear(away_rec);
 	}
 	if (segs->stand_in != COMP_SEGMENTS_AWAY_NONE) {
 		char why[160];
