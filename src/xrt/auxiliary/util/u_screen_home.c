@@ -168,6 +168,19 @@ u_screen_home_poll_settle(uint64_t gen, uint64_t before, uint64_t pushed, bool k
 	return a;
 }
 
+bool
+u_screen_home_away_next(bool away, enum u_screen_home_outcome outcome, bool plugin_unlisted)
+{
+	switch (outcome) {
+	case U_SCREEN_HOME_GONE: return plugin_unlisted ? true : away;
+	case U_SCREEN_HOME_IN_PLACE:
+	case U_SCREEN_HOME_REANCHORED:
+	case U_SCREEN_HOME_UNRECORDED: return false;
+	case U_SCREEN_HOME_RECLAIMED:
+	default: return away;
+	}
+}
+
 const char *
 u_screen_home_outcome_str(enum u_screen_home_outcome o)
 {

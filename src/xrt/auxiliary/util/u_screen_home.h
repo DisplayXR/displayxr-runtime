@@ -180,6 +180,21 @@ struct u_screen_home_poll_after
 struct u_screen_home_poll_after
 u_screen_home_poll_settle(uint64_t gen, uint64_t before, uint64_t pushed, bool keeping_after, bool bound_passed);
 
+/*!
+ * After a list is handed to the compositor (not kept): may the session DP be
+ * another screen's DP now (ADR-047 Amendment 8, #2305)? Pure.
+ *
+ * It follows the compositors' away_screen_id: a list with the home unplugged
+ * (@ref U_SCREEN_HOME_GONE with @p plugin_unlisted) is the one before which a
+ * compositor that moves the window handle puts the DP of the screen holding
+ * the window into the session's slot; a list with the home in place
+ * (@ref U_SCREEN_HOME_IN_PLACE, @ref U_SCREEN_HOME_REANCHORED) is the one
+ * whose first update gives the home its own DP back. Any other list (the
+ * panel re-claimed, or listed under a new id) changes nothing: @p away stands.
+ */
+bool
+u_screen_home_away_next(bool away, enum u_screen_home_outcome outcome, bool plugin_unlisted);
+
 //! A short word for @p o ("in place", "re-anchored", "gone", "re-claimed", "unrecorded").
 const char *
 u_screen_home_outcome_str(enum u_screen_home_outcome o);

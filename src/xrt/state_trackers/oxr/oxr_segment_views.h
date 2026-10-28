@@ -284,6 +284,32 @@ oxr_segment_views_segment_eyes(
 }
 
 /*!
+ * ADR-047 Amendment 8, home gone (#2305): does the session DP's eye set count
+ * for a locate that takes one view set for the whole window?
+ *
+ * Normally whatever the session DP answered (@p have_eyes; a set short of the
+ * mode's views at a mode switch is then held by the caller's #615 guard).
+ * With the home panel unplugged (@p home_away), the session DP can be the DP
+ * of the screen the window was handed to, moved into the session's slot when
+ * the bounded wait ended. That DP is a segment DP, and the segment rule
+ * (@ref oxr_segment_views_segment_eyes) applies: a set with fewer than
+ * @p views_needed eyes (a sim_display DP made while another vendor is active
+ * reports one) is not used, and the nominal viewer fills every view, as it
+ * did for that screen's segment until the wait ended. Otherwise the view
+ * changed at the bound: every view from the one eye, raised to the
+ * sim_display nominal height (G16, 2026-10-28).
+ */
+static inline bool
+oxr_segment_views_session_eyes_usable(
+    bool home_away, bool have_eyes, bool valid, uint32_t count, uint32_t views_needed)
+{
+	if (!home_away) {
+		return have_eyes;
+	}
+	return oxr_segment_views_accept_eyes(have_eyes, valid, count) && count >= (views_needed > 0 ? views_needed : 1);
+}
+
+/*!
  * The untracked eye set: one eye per active view (at least 2), in front of the
  * screen centre at @p z, translated by (@p dx, @p dy) into the caller's frame.
  * The pair is (-ipd/2, +ipd/2); views past 2 repeat it column by column (even

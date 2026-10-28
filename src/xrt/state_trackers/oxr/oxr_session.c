@@ -3700,6 +3700,27 @@ locate_views_one(struct oxr_logger *log,
 			        (double)((int64_t)xdisplay_time - (int64_t)os_monotonic_get_ns()) / 1e6,
 			        (int)eye_pos.valid, (int)eye_pos.is_tracking, (unsigned)eye_pos.count);
 		}
+
+		// ADR-047 Amendment 8 (#2305): with the home panel unplugged, the
+		// session DP can be the DP of the screen the window was handed to
+		// when the bounded wait ended. Its eyes count only as that screen's
+		// segment's did: a set short of the mode's views (a sim_display DP in
+		// another vendor's session reports one eye) gives way to the nominal
+		// viewer below, so the view does not change at the bound.
+		if (got_eye_positions &&
+		    !oxr_segment_views_session_eyes_usable(sess->display_home_away, got_eye_positions, eye_pos.valid,
+		                                           eye_pos.count, active_view_count)) {
+			got_eye_positions = false;
+			static bool logged_away_eyes = false;
+			if (!logged_away_eyes) {
+				logged_away_eyes = true;
+				U_LOG_W(
+				    "locate: the home panel is unplugged and the session DP reports %u eye(s) for "
+				    "a %u-view mode — the nominal viewer fills the views, as for that screen's "
+				    "segment (ADR-047 Amendment 8, #2305). Logged once.",
+				    (unsigned)eye_pos.count, (unsigned)active_view_count);
+			}
+		}
 	}
 
 	// One-shot diagnostic: log stereo gate values for first frames
@@ -6303,6 +6324,14 @@ oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool 
 			        : "");
 		}
 		sess->display_home_logged = logged;
+		if (!keep_last_list) {
+			// The list goes through: with the home unplugged, the session DP
+			// may be another screen's DP from here (locate_views_one).
+			sess->display_home_away = u_screen_home_away_next(
+			    sess->display_home_away, o, u_screen_home_plugin_unlisted(&sess->display_home, screens));
+		}
+	} else if (initial) {
+		sess->display_home_away = false;
 	}
 	if (keep_last_list) {
 		free(screens);

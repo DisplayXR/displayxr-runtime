@@ -3040,6 +3040,11 @@ struct oxr_session
 	//! unplugged. Checked once per frame against U_SCREEN_HOME_KEEP_BOUND_NS.
 	bool display_keeping;
 	uint64_t display_keep_since_ns;
+	//! The last list handed to the compositor had the home panel unplugged
+	//! (u_screen_home_away_next): the session DP may be the DP of the screen
+	//! the window was handed to, so its eyes count only under the segment
+	//! rule (oxr_segment_views_session_eyes_usable).
+	bool display_home_away;
 
 	/*!
 	 * True when the session is bound to a display OTHER than the system

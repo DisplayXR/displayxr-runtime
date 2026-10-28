@@ -199,6 +199,52 @@ TEST_CASE("screen home: gone with its plug-in unlisted (unplugged) vs gone but r
 	CHECK_FALSE(u_screen_home_plugin_unlisted(&h, nullptr));
 }
 
+/*
+ * #2305: the session DP may be another screen's from the first list handed on
+ * with the home unplugged (the bound's push) until a list has the home back —
+ * the same span as the compositors' away_screen_id.
+ */
+TEST_CASE("screen home: the session DP may be another screen's from an unplugged list until the home is back")
+{
+	xrt_screen_list first{};
+	add(first, LAPTOP, "sim-display", 0, false);
+	add(first, PANEL, "vendor", -1920, true);
+	u_screen_home h{};
+	u_screen_home_record(&h, &first);
+
+	// The bound's push: the laptop alone, the panel unplugged.
+	xrt_screen_list unplugged{};
+	add(unplugged, LAPTOP, "sim-display", 0, true);
+	bool away = u_screen_home_away_next(false, u_screen_home_anchor(&h, &unplugged),
+	                                    u_screen_home_plugin_unlisted(&h, &unplugged));
+	CHECK(away);
+
+	// Another list while it is still unplugged: still away.
+	away = u_screen_home_away_next(away, u_screen_home_anchor(&h, &unplugged),
+	                               u_screen_home_plugin_unlisted(&h, &unplugged));
+	CHECK(away);
+
+	// The panel listed alone under a new id: nothing hands the window back,
+	// so the slot's DP stands.
+	xrt_screen_list alone{};
+	add(alone, PANEL2, "vendor", 0, true);
+	CHECK(u_screen_home_away_next(away, u_screen_home_anchor(&h, &alone),
+	                              u_screen_home_plugin_unlisted(&h, &alone)));
+
+	// The home back: the first update gives it its own DP again.
+	xrt_screen_list back{};
+	add(back, LAPTOP, "sim-display", 0, false);
+	add(back, PANEL, "vendor", -1920, true);
+	CHECK_FALSE(
+	    u_screen_home_away_next(away, u_screen_home_anchor(&h, &back), u_screen_home_plugin_unlisted(&h, &back)));
+	CHECK_FALSE(u_screen_home_away_next(true, U_SCREEN_HOME_REANCHORED, false));
+
+	// A re-claimed panel never starts it; nothing does without a home.
+	CHECK_FALSE(u_screen_home_away_next(false, U_SCREEN_HOME_RECLAIMED, false));
+	CHECK_FALSE(u_screen_home_away_next(false, U_SCREEN_HOME_GONE, false));
+	CHECK_FALSE(u_screen_home_away_next(true, U_SCREEN_HOME_UNRECORDED, false));
+}
+
 namespace {
 
 constexpr uint64_t kSec = 1000ull * 1000ull * 1000ull;
