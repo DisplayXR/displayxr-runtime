@@ -736,6 +736,15 @@ void
 comp_xbridge_get_max_dims(struct comp_xbridge *xb, uint32_t *out_w, uint32_t *out_h);
 
 /*!
+ * #1575 — how many times the egress ring has been (re)built this session, the
+ * count the `rebuild #N` lines number. A caller diffs it across a stretch of
+ * frames (an overhang episode) to prove that stretch rebuilt nothing. 0 for a
+ * NULL bridge.
+ */
+uint64_t
+comp_xbridge_get_egress_rebuilds(struct comp_xbridge *xb);
+
+/*!
  * `ID3D11ShaderResourceView *` of @p plane for @p slot (NULL when invalid).
  *
  * @param want_seq The content generation the caller's recipe says this slot

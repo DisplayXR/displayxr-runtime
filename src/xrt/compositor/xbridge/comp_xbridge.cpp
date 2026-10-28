@@ -1705,6 +1705,12 @@ comp_xbridge_get_max_dims(struct comp_xbridge *xb, uint32_t *out_w, uint32_t *ou
 	*out_h = xb != nullptr ? xb->max_h : 0;
 }
 
+extern "C" uint64_t
+comp_xbridge_get_egress_rebuilds(struct comp_xbridge *xb)
+{
+	return xb != nullptr ? xb->eg_reallocs : 0;
+}
+
 extern "C" void *
 comp_xbridge_get_plane_srv(struct comp_xbridge *xb, int32_t slot, uint32_t plane, uint64_t want_seq)
 {

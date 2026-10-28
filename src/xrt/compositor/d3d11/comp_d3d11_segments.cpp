@@ -985,6 +985,9 @@ comp_d3d11_segments_record(struct comp_d3d11_segments *segs, const struct comp_d
 	bool weave[COMP_SEGMENTS_MAX] = {};
 	struct comp_seg_rect tile[COMP_SEGMENTS_MAX] = {};
 	bool have_tile[COMP_SEGMENTS_MAX] = {};
+	// Where each segment is drawn: its window rect, or under #1575's clip its
+	// part inside the canvas the source holds.
+	struct comp_seg_rect dst[COMP_SEGMENTS_MAX] = {};
 
 	for (uint32_t k = 0; k < t->count; k++) {
 		const struct comp_segment *g = &t->seg[k];
@@ -992,6 +995,10 @@ comp_d3d11_segments_record(struct comp_d3d11_segments *segs, const struct comp_d
 		// frame the partition it was located for, not the live seam.
 		have_tile[k] =
 		    comp_segments_source_rect(g, &f->canvas, f->view_width, f->view_height, f->content, &tile[k]);
+		dst[k] = g->window_rect;
+		if (f->clip_to_canvas && !comp_segments_rect_intersect(&g->window_rect, &f->canvas, &dst[k])) {
+			have_tile[k] = false; // no part of this segment was carried
+		}
 		const int i = (int)g->screen_index;
 		st_of[k] = (i >= 0 && (uint32_t)i < segs->screen_count) ? &segs->st[i] : nullptr;
 		if (g->is_primary) {
@@ -1114,11 +1121,10 @@ comp_d3d11_segments_record(struct comp_d3d11_segments *segs, const struct comp_d
 				}
 			}
 			ctx->OMSetRenderTargets(1, &rtv, nullptr);
-			set_viewport_scissor(ctx, &g->window_rect);
-			xrt_display_processor_d3d11_process_atlas(dp, ctx, st->crop.srv, tile[k].w, tile[k].h,
-			                                          f->tile_columns, f->tile_rows, f->src_format,
-			                                          f->target_width, f->target_height, g->window_rect.x,
-			                                          g->window_rect.y, g->window_rect.w, g->window_rect.h);
+			set_viewport_scissor(ctx, &dst[k]);
+			xrt_display_processor_d3d11_process_atlas(
+			    dp, ctx, st->crop.srv, tile[k].w, tile[k].h, f->tile_columns, f->tile_rows, f->src_format,
+			    f->target_width, f->target_height, dst[k].x, dst[k].y, dst[k].w, dst[k].h);
 			any_woven = true;
 		}
 	}
@@ -1135,7 +1141,7 @@ comp_d3d11_segments_record(struct comp_d3d11_segments *segs, const struct comp_d
 	for (uint32_t k = 0; k < t->count; k++) {
 		if (!weave[k] && have_tile[k]) {
 			flat_src[flat_n] = tile[k]; // the segment's own views (#1883), like the crop
-			flat_dst[flat_n++] = t->seg[k].window_rect;
+			flat_dst[flat_n++] = dst[k];
 		}
 	}
 	const uint32_t flat_seg_n = flat_n;
