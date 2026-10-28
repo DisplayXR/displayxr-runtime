@@ -888,6 +888,8 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 
 	// Camera-centric defaults
 	qs->cam_spread_factor = 1.0f;
+	qs->cam_spread_base = 1.0f;
+	qs->cam_parallax_base = 1.0f;
 	qs->cam_parallax_factor = 1.0f;
 	qs->cam_convergence = 0.5f;      // 0.5 diopters = 2m convergence
 	qs->cam_half_tan_vfov = 0.3249f; // tan(18 deg) -> 36 deg vFOV
@@ -1539,6 +1541,8 @@ set_camera_tuning(struct qwerty_system *qs, const struct u_camera_profile *profi
 {
 	qs->cam_spread_factor = profile->ipd_factor;
 	qs->cam_parallax_factor = profile->parallax_factor;
+	qs->cam_spread_base = profile->ipd_factor;
+	qs->cam_parallax_base = profile->parallax_factor;
 	qs->cam_convergence = profile->inv_convergence_distance;
 	qs->cam_half_tan_vfov = profile->half_tan_vfov;
 	qs->cam_m2v = profile->m2v;
@@ -1582,6 +1586,68 @@ find_qwerty_system(struct xrt_device **xdevs, size_t count)
 			return qwerty_device(xdevs[i])->sys;
 	}
 	return NULL;
+}
+
+bool
+qwerty_set_depth(struct xrt_device **xdevs, size_t count, float strength, float convergence_m, bool relative)
+{
+	struct qwerty_system *qs = find_qwerty_system(xdevs, count);
+	if (qs == NULL) {
+		return false;
+	}
+	os_mutex_lock(&qs->view_lock);
+	if (qs->camera_mode) {
+		// Same comfort clamps as qwerty_adjust_view_factor / _convergence.
+		dxr_rig_display_info info = {qs->screen_height_m, 1.0f, qs->nominal_viewer_z};
+		if (strength > 0.0f && !relative) {
+			dxr_camera_rig cam = {.inv_convergence_distance = qs->cam_convergence, .m2v = qs->cam_m2v};
+			const float v = clampf(strength, 0.01f, dxr_rig_max_ipd_factor(&cam, &info));
+			qs->cam_spread_factor = v;
+			qs->cam_parallax_factor = v;
+		} else if (strength > 0.0f) {
+			// Relative to what the app's profile seeded, so 1 is each app's own
+			// nominal (a true-geometry rig seeds ~0.03, the default rig 1).
+			const float base = qs->cam_spread_base > 0.0f ? qs->cam_spread_base : 1.0f;
+			const float pbase = qs->cam_parallax_base > 0.0f ? qs->cam_parallax_base : 1.0f;
+			dxr_camera_rig cam = {.inv_convergence_distance = qs->cam_convergence, .m2v = qs->cam_m2v};
+			const float v = clampf(strength * base, 0.01f * base, dxr_rig_max_ipd_factor(&cam, &info));
+			qs->cam_spread_factor = v;
+			qs->cam_parallax_factor = v / base * pbase;
+		}
+		if (convergence_m > 0.0f) {
+			float conv_max = 2.0f;
+			if (qs->cam_m2v > 0.0f && qs->nominal_viewer_z > 0.0f) {
+				dxr_camera_rig cam = {.ipd_factor = qs->cam_spread_factor, .m2v = qs->cam_m2v};
+				conv_max = dxr_rig_max_convergence(&cam, &info, 0.0f);
+			}
+			qs->cam_convergence = clampf(1.0f / convergence_m, 0.0f, conv_max);
+		}
+		U_LOG_I("Qwerty: depth set: IPD/Parallax = %.3f, convergence = %.2f diopters", qs->cam_spread_factor,
+		        qs->cam_convergence);
+	} else if (strength > 0.0f) {
+		const float v = clampf(strength, 0.01f, 1.0f);
+		qs->disp_spread_factor = v;
+		qs->disp_parallax_factor = v;
+	}
+	os_mutex_unlock(&qs->view_lock);
+	return true;
+}
+
+bool
+qwerty_get_depth(
+    struct xrt_device **xdevs, size_t count, float *out_strength, float *out_relative, float *out_convergence_m)
+{
+	struct qwerty_system *qs = find_qwerty_system(xdevs, count);
+	if (qs == NULL) {
+		return false;
+	}
+	os_mutex_lock(&qs->view_lock);
+	const float base = qs->cam_spread_base > 0.0f ? qs->cam_spread_base : 1.0f;
+	*out_strength = qs->camera_mode ? qs->cam_spread_factor : qs->disp_spread_factor;
+	*out_relative = qs->camera_mode ? qs->cam_spread_factor / base : qs->disp_spread_factor;
+	*out_convergence_m = qs->camera_mode && qs->cam_convergence > 0.0f ? 1.0f / qs->cam_convergence : 0.0f;
+	os_mutex_unlock(&qs->view_lock);
+	return true;
 }
 
 bool
