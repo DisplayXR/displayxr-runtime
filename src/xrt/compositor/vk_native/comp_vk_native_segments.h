@@ -83,12 +83,13 @@ void
 comp_vk_native_segments_destroy(struct comp_vk_native_segments **segs_ptr);
 
 /*!
- * @ref comp_vk_native_segments_destroy before a rebuild on @p next, the list
- * the next manager takes (ADR-047 Amendment 8, #2305; Windows, hooks set):
- * with the home screen gone from @p next, the window goes to a screen of
- * @p next whose DP is ready (it stays on the DP holding it when that one
- * qualifies), that DP takes the session's primary slot, and no DP is made for
- * the departed screen. See comp_d3d11_segments_destroy_for_rebuild.
+ * @ref comp_vk_native_segments_destroy before a rebuild on @p next, the list the next
+ * manager takes (ADR-047 Amendment 8, #2305; Windows, hooks set): with the home screen
+ * unplugged in @p next (its id gone, its plug-in winning no screen), the
+ * window goes to a screen of @p next whose DP is ready (it stays on the DP
+ * holding it when that one qualifies), that DP takes the session's primary
+ * slot, and no DP is ever made for the departed screen. See
+ * comp_d3d11_segments_destroy_for_rebuild.
  */
 void
 comp_vk_native_segments_destroy_for_rebuild(struct comp_vk_native_segments **segs_ptr,

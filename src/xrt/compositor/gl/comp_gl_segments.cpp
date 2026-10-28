@@ -426,6 +426,14 @@ hwnd_return_to_primary(struct comp_gl_segments *segs)
 	hwnd_handoff(segs, segs->primary_index, true);
 }
 
+//! ADR-047 Amendment 8 (#2305): the primary slot holds another screen's DP (the home was gone).
+static bool
+away_set(const struct comp_gl_segments *segs)
+{
+	return segs->hooks.swap_primary != nullptr && segs->hooks.away_screen_id != nullptr &&
+	       *segs->hooks.away_screen_id != 0;
+}
+
 //! ADR-047 Amendment 8 (#2305): @p dp reports its screen's pixel and physical size (see the D3D11 twin).
 static bool
 dp_ready(struct xrt_display_processor_gl *dp)
@@ -445,18 +453,18 @@ static void
 next_list_from(const struct xrt_screen_list *l, struct comp_segments_next_list *out)
 {
 	memset(out, 0, sizeof(*out));
-	for (uint32_t i = 0; i < l->count && i < XRT_SCREEN_LIST_MAX && out->count < COMP_SEGMENTS_MAX_SCREENS; i++) {
-		out->ids[out->count++] = l->screens[i].id;
-		if ((l->screens[i].flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
-			out->default_id = l->screens[i].id;
-		}
+	for (uint32_t i = 0; i < l->count && i < XRT_SCREEN_LIST_MAX; i++) {
+		comp_segments_next_list_add(out, l->screens[i].id, l->screens[i].plugin_id,
+		                            (l->screens[i].flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0);
 	}
 }
 
 /*!
- * ADR-047 Amendment 8, home gone (#2305): put the window, and the session's
- * primary slot, on screen @p t's DP, and destroy the departed home's DP that
- * sat in the slot — the D3D11 manager's hwnd_to_session_slot in GL terms.
+ * ADR-047 Amendment 8, home unplugged (#2305): put the window, and the
+ * session's primary slot, on screen @p t's DP, and destroy the departed home's
+ * DP that sat in the slot — the D3D11 manager's hwnd_to_session_slot in GL
+ * terms. No DP is ever made for the departed home; when @p t's cannot be
+ * made, the window stays with its holder (or none).
  */
 static void
 hwnd_to_session_slot(struct comp_gl_segments *segs, uint32_t t, enum comp_segments_handback why)
@@ -466,44 +474,41 @@ hwnd_to_session_slot(struct comp_gl_segments *segs, uint32_t t, enum comp_segmen
 	const uint64_t home_id = segs->screens[p].id;
 	const uint64_t t0 = os_monotonic_get_ns();
 	struct xrt_display_processor_gl *h = nullptr;
-	bool fell_back = false;
+	int slot_screen = -1; // the screen whose DP takes the slot
+	bool made = true;
 	if (o == (int)t) {
 		h = dp_install(segs, t, nullptr, false);
-	} else if (o == (int)p && !segs->primary_windowless) {
-		h = dp_make(segs, t, segs->hooks.hwnd);
-		if (h != nullptr) {
-			struct xrt_display_processor_gl *windowless = dp_install(segs, t, nullptr, false);
-			xrt_display_processor_gl_destroy(&windowless);
-		}
+		slot_screen = (int)t;
 	} else {
-		if (o >= 0) {
-			struct xrt_display_processor_gl *old = dp_install(segs, (uint32_t)o, nullptr, false);
-			xrt_display_processor_gl_destroy(&old);
-		}
 		h = dp_make(segs, t, segs->hooks.hwnd);
 		if (h != nullptr) {
 			struct xrt_display_processor_gl *windowless = dp_install(segs, t, nullptr, false);
 			xrt_display_processor_gl_destroy(&windowless);
+			if (o >= 0 && (uint32_t)o != p) {
+				struct xrt_display_processor_gl *old = dp_install(segs, (uint32_t)o, nullptr, false);
+				xrt_display_processor_gl_destroy(&old);
+			}
+			slot_screen = (int)t;
 		} else {
-			h = dp_make(segs, p, segs->hooks.hwnd);
-			fell_back = h != nullptr;
+			made = false;
+			if (o >= 0 && (uint32_t)o != p) {
+				h = dp_install(segs, (uint32_t)o, nullptr, false);
+				slot_screen = o;
+			}
 		}
 	}
-	const bool stays_home = h == nullptr && o == (int)p && !segs->primary_windowless;
 	if (h != nullptr) {
 		struct xrt_display_processor_gl *old = segs->hooks.swap_primary(segs->hooks.userdata, h);
 		xrt_display_processor_gl_destroy(&old);
 		segs->primary_windowless = false;
 		segs->owner_index = (int)p;
 		if (segs->hooks.away_screen_id != nullptr) {
-			*segs->hooks.away_screen_id = fell_back ? 0 : segs->screens[t].id;
+			*segs->hooks.away_screen_id = segs->screens[slot_screen].id;
 		}
-	} else if (!stays_home) {
-		segs->owner_index = -1; // the slot keeps its windowless DP
 	}
 
 	const double ms = (double)(os_monotonic_get_ns() - t0) / 1.0e6;
-	if (h != nullptr && !fell_back) {
+	if (made) {
 		U_LOG_W(
 		    "segments: home screen 0x%016llx is gone — the GL window %s '%s' (screen 0x%016llx, %s), whose DP "
 		    "is the session DP now, in %.1f ms; no DP is made for the departed screen (ADR-047 Amendment "
@@ -513,13 +518,19 @@ hwnd_to_session_slot(struct comp_gl_segments *segs, uint32_t t, enum comp_segmen
 		    why == COMP_SEGMENTS_HANDBACK_NO_READY ? "no listed screen reports a ready DP" : "its DP is ready",
 		    ms);
 	} else {
+		char stays[160];
+		if (slot_screen >= 0) {
+			snprintf(stays, sizeof(stays), "'%s' (screen 0x%016llx), whose DP is the session DP now",
+			         screen_name(segs, slot_screen), (unsigned long long)segs->screens[slot_screen].id);
+		} else {
+			snprintf(stays, sizeof(stays), "%s", o == (int)p ? "the session DP it is on" : "no DP (none held it)");
+		}
 		U_LOG_W(
 		    "segments: home screen 0x%016llx is gone — GL window handle hand-off to '%s' (screen 0x%016llx) "
-		    "FAILED after %.1f ms; %s (ADR-047 Amendment 8, #2305)",
+		    "FAILED after %.1f ms; the window stays with %s; no DP is made for the departed screen (ADR-047 "
+		    "Amendment 8, #2305)",
 		    (unsigned long long)home_id, screen_name(segs, (int)t), (unsigned long long)segs->screens[t].id, ms,
-		    fell_back    ? "the home's DP holds the window again"
-		    : stays_home ? "the window stays with the session DP it is on"
-		                 : "no DP holds the window now");
+		    stays);
 	}
 }
 
@@ -565,33 +576,46 @@ hwnd_rehome(struct comp_gl_segments *segs)
 	const uint64_t away = *segs->hooks.away_screen_id;
 	const uint32_t p = segs->primary_index;
 	const int a = screen_index_of(segs, away);
-	struct xrt_display_processor_gl *w = nullptr;
-	if (a >= 0 && (uint32_t)a != p) {
-		w = dp_make(segs, p, nullptr);
-	}
+	const bool listed = a >= 0 && (uint32_t)a != p;
+	struct xrt_display_processor_gl *w = dp_make(segs, p, listed ? nullptr : segs->hooks.hwnd);
 	if (w == nullptr) {
 		segs->enabled = false;
 		U_LOG_W(
-		    "segments: home screen 0x%016llx is back, but the GL session DP is still screen 0x%016llx's and %s "
-		    "— no segmentation until the next screen list (ADR-047 Amendment 8, #2305)",
+		    "segments: home screen 0x%016llx is back, but the GL session DP is still screen 0x%016llx's and the "
+		    "home's %s DP could not be made — no segmentation until the next screen list (ADR-047 Amendment "
+		    "8, #2305)",
 		    (unsigned long long)segs->screens[p].id, (unsigned long long)away,
-		    a < 0 ? "that screen is not listed" : "the home's windowless DP could not be made");
+		    listed ? "windowless" : "window-holding");
 		return;
 	}
 	struct xrt_display_processor_gl *holder = segs->hooks.swap_primary(segs->hooks.userdata, w);
-	segs->primary_windowless = true;
-	struct xrt_display_processor_gl *old = dp_install(segs, (uint32_t)a, holder, true);
-	xrt_display_processor_gl_destroy(&old);
-	(void)comp_segments_lifecycle_adopt(&segs->lc, away);
-	segs->owner_index = a;
-	comp_segments_owner_set_result(&segs->owner, away, true, away);
 	*segs->hooks.away_screen_id = 0;
-	U_LOG_W(
-	    "segments: home screen 0x%016llx is back — '%s' (screen 0x%016llx) keeps the GL window handle as its "
-	    "segment DP and the session DP weaves '%s' windowless; the window follows the majority from here "
-	    "(ADR-047 Amendment 8, #2305)",
-	    (unsigned long long)segs->screens[p].id, screen_name(segs, a), (unsigned long long)away,
-	    screen_name(segs, (int)p));
+	if (listed) {
+		segs->primary_windowless = true;
+		struct xrt_display_processor_gl *old = dp_install(segs, (uint32_t)a, holder, true);
+		xrt_display_processor_gl_destroy(&old);
+		(void)comp_segments_lifecycle_adopt(&segs->lc, away);
+		segs->owner_index = a;
+		comp_segments_owner_set_result(&segs->owner, away, true, away);
+		U_LOG_W(
+		    "segments: home screen 0x%016llx is back — '%s' (screen 0x%016llx) keeps the GL window handle as "
+		    "its segment DP and the session DP weaves '%s' windowless; the window follows the majority from "
+		    "here (ADR-047 Amendment 8, #2305)",
+		    (unsigned long long)segs->screens[p].id, screen_name(segs, a), (unsigned long long)away,
+		    screen_name(segs, (int)p));
+	} else {
+		xrt_display_processor_gl_destroy(&holder);
+		segs->primary_windowless = false;
+		segs->owner_index = (int)p;
+		comp_segments_owner_set_result(&segs->owner, segs->screens[p].id, true, segs->screens[p].id);
+		U_LOG_W(
+		    "segments: home screen 0x%016llx is back and screen 0x%016llx is not listed — the home's GL DP "
+		    "takes the window handle back from that screen's DP (ADR-047 Amendment 8, #2305)",
+		    (unsigned long long)segs->screens[p].id, (unsigned long long)away);
+	}
+	if (segs->screen_count < 2) {
+		segs->enabled = false; // one screen: nothing to segment
+	}
 }
 
 //! Bind @p fbo as the draw target and confine viewport + scissor to @p r (top-left, in a @p target_h tall target).
@@ -714,7 +738,9 @@ comp_gl_segments_set_screens(struct comp_gl_segments *segs,
 		U_LOG_W("segments: DXR_SEGMENTS=0 — a GL window spanning screens keeps the single-DP path");
 		return;
 	}
-	if (list == nullptr || info == nullptr || list->count < 2) {
+	// One screen: nothing to segment — unless the home is back while the
+	// primary slot still holds another screen's DP (#2305).
+	if (list == nullptr || info == nullptr || (list->count < 2 && !away_set(segs))) {
 		return;
 	}
 	if (pinned_display_id != 0) {
@@ -837,14 +863,17 @@ comp_gl_segments_set_screens(struct comp_gl_segments *segs,
 		    "comes from its own screen's plug-in",
 		    primary_entry->plugin_id, vendors);
 	}
-	segs->enabled = n >= 2;
+	// ADR-047 Amendment 8 (#2305): the home is back while the primary slot
+	// still holds the screen the window was handed to when it left — on a
+	// one-screen list too (that screen off): the first update re-homes.
+	const bool rehome = away_set(segs);
+	segs->enabled = n >= 2 || rehome;
 	if (segs->enabled) {
 		segs->owner_index = (int)segs->primary_index;
 		comp_segments_owner_init(&segs->owner, segs->screens[segs->primary_index].id, 0, 0);
-		// ADR-047 Amendment 8 (#2305): the home is back while the primary
-		// slot still holds the screen the window was handed to when it left.
-		segs->rehome_pending = segs->hooks.swap_primary != nullptr && segs->hooks.away_screen_id != nullptr &&
-		                       *segs->hooks.away_screen_id != 0;
+		segs->rehome_pending = rehome;
+	}
+	if (n >= 2) {
 		U_LOG_W(
 		    "segments: %u screens, plug-in '%s' — a GL window spanning monitors is woven per monitor "
 		    "(multi-screen M6, OpenGL); the window handle %s",

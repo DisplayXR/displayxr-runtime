@@ -39,7 +39,9 @@
 namespace {
 
 constexpr uint64_t PANEL = 0xb84d0cb8b9e101d5ull;
+constexpr uint64_t PANEL2 = 0xa714fca2f6c6b6b4ull; // the panel under a position-derived id
 constexpr uint64_t LAPTOP = 0xfcf5e577cbe800aeull;
+constexpr uint64_t OTHER = 0x7777777777777777ull; // a third monitor right of the laptop
 constexpr int32_t kFormat = 44; // VK_FORMAT_B8G8R8A8_UNORM
 void *const kHwnd = reinterpret_cast<void *>(uintptr_t{0x1234});
 
@@ -62,7 +64,9 @@ struct World
 	int made_for_panel = 0;
 	bool panel_ready = true;  //!< a DP for the panel reports geometry (false once it is unplugged)
 	bool laptop_ready = true; //!< a DP for the laptop reports geometry
+	bool other_ready = true;  //!< a DP for the third monitor reports geometry
 	bool fail_laptop_window = false;
+	bool fail_other_window = false;
 	xrt_display_processor *slot = nullptr; //!< the compositor's primary slot (the session DP)
 	uint64_t away = 0;                     //!< the compositor's away_screen_id
 
@@ -121,7 +125,10 @@ fake_destroy(xrt_display_processor *xdp)
 bool
 fake_ready(const FakeDp *d)
 {
-	return d->screen == PANEL ? d->w->panel_ready : d->w->laptop_ready;
+	if (d->screen == PANEL || d->screen == PANEL2) {
+		return d->w->panel_ready;
+	}
+	return d->screen == LAPTOP ? d->w->laptop_ready : d->w->other_ready;
 }
 
 bool
@@ -165,7 +172,7 @@ make_dp(World *w, uint64_t screen, bool window)
 	d->screen = screen;
 	d->window = window;
 	d->serial = ++w->made;
-	w->made_for_panel += screen == PANEL ? 1 : 0;
+	w->made_for_panel += (screen == PANEL || screen == PANEL2) ? 1 : 0;
 	w->alive.push_back(d);
 	return d;
 }
@@ -181,7 +188,8 @@ fake_create_dp_vk_for_screen(xrt_plugin_instance *inst,
                              xrt_display_processor **out)
 {
 	World *w = reinterpret_cast<World *>(inst);
-	if (window != nullptr && binding->monitor_id == LAPTOP && w->fail_laptop_window) {
+	if (window != nullptr && ((binding->monitor_id == LAPTOP && w->fail_laptop_window) ||
+	                          (binding->monitor_id == OTHER && w->fail_other_window))) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 	*out = &make_dp(w, binding->monitor_id, window != nullptr)->vk.base;
@@ -211,7 +219,9 @@ struct Rig
 		iface.create_dp_vk_for_screen = fake_create_dp_vk_for_screen;
 		vk.main_queue = &q;
 		add_entry(PANEL, "vendor");
+		add_entry(PANEL2, "vendor");
 		add_entry(LAPTOP, "sim-display");
+		add_entry(OTHER, "sim-display");
 		// The session DP: made at session create for the panel, holding the window.
 		w.slot = &make_dp(&w, PANEL, true)->vk.base;
 	}
@@ -280,6 +290,24 @@ laptop_only()
 {
 	xrt_screen_list l{};
 	add(l, LAPTOP, "sim-display", 0, 2560, 1600, false);
+	return l;
+}
+
+//! The panel, the laptop and a third monitor right of the laptop.
+xrt_screen_list
+three()
+{
+	xrt_screen_list l = both();
+	add(l, OTHER, "sim-display", 2560, 1920, 1080, false);
+	return l;
+}
+
+//! The panel's replug with the laptop's own screen off: the panel alone, the default.
+xrt_screen_list
+panel_only()
+{
+	xrt_screen_list l{};
+	add(l, PANEL, "vendor", -3840, 3840, 2160, true);
 	return l;
 }
 
@@ -451,7 +479,7 @@ TEST_CASE("home in the next list (a replug, a teardown): back to the panel's DP,
 	CHECK(r.w.away == 0);
 }
 
-TEST_CASE("home gone, the laptop's window-holding DP cannot be made: the panel's DP takes it, as before")
+TEST_CASE("home gone, the ready screen's DP cannot be made: the window stays with the panel's DP it is on")
 {
 	Rig r;
 	const xrt_screen_list b = both();
@@ -464,10 +492,127 @@ TEST_CASE("home gone, the laptop's window-holding DP cannot be made: the panel's
 	// that fails nothing is freed — the window stays with the session DP.
 	r.w.panel_ready = false;
 	r.w.fail_laptop_window = true;
+	const int panel_dps = r.w.made_for_panel;
 	const xrt_screen_list gone = laptop_only();
 	comp_vk_native_segments_destroy_for_rebuild(&segs, &gone);
 	CHECK(fake(r.w.slot) == session_dp);
 	CHECK(r.w.holder() == session_dp);
+	CHECK(r.w.made_for_panel == panel_dps);
 	CHECK(r.w.away == 0);
 	comp_vk_native_segments_destroy_for_rebuild(&segs, nullptr);
+}
+
+TEST_CASE("home gone, the holder is not ready and the ready screen's DP cannot be made: never a DP for the panel")
+{
+	Rig r;
+	const xrt_screen_list t3 = three();
+	comp_vk_native_segments *segs = r.manager(t3);
+	// The window across the laptop and the third monitor, most of it on the
+	// laptop: the laptop's DP holds it, the third monitor has a windowless DP.
+	const comp_seg_rect across{1800, 200, 1280, 720}; // 760 px on the laptop, 520 on the third
+	run(segs, across);
+	REQUIRE(r.w.holder() != nullptr);
+	REQUIRE(r.w.holder()->screen == LAPTOP);
+	FakeDp *laptop_dp = r.w.holder();
+
+	// Unplugged; the laptop's DP reports no geometry, the third monitor's
+	// does but its window-holding DP cannot be made. Before the review this
+	// fell back to a new window-holding DP for the departed panel.
+	r.w.panel_ready = false;
+	r.w.laptop_ready = false;
+	r.w.fail_other_window = true;
+	const int panel_dps = r.w.made_for_panel;
+	xrt_screen_list gone{};
+	add(gone, LAPTOP, "sim-display", 0, 2560, 1600, false);
+	add(gone, OTHER, "sim-display", 2560, 1920, 1080, false);
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &gone);
+
+	CHECK(r.w.made_for_panel == panel_dps);
+	for (FakeDp *d : r.w.alive) {
+		CHECK(d->screen != PANEL);
+	}
+	CHECK(r.w.holder() == laptop_dp);
+	CHECK(fake(r.w.slot) == laptop_dp);
+	CHECK(r.w.away == LAPTOP);
+	comp_vk_native_segments_destroy_for_rebuild(&segs, nullptr);
+}
+
+TEST_CASE("the panel re-claimed by another plug-in is still there: the window goes back to its DP, not the laptop's")
+{
+	Rig r;
+	const xrt_screen_list b = both();
+	comp_vk_native_segments *segs = r.manager(b);
+	run(segs, ON_LAPTOP);
+	REQUIRE(r.w.holder()->screen == LAPTOP);
+
+	// Listed, but another plug-in wins it: the session puts the default on
+	// no screen (u_screen_home: re-claimed).
+	xrt_screen_list reclaimed{};
+	add(reclaimed, PANEL, "other", -3840, 3840, 2160, false);
+	add(reclaimed, LAPTOP, "sim-display", 0, 2560, 1600, false);
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &reclaimed);
+	REQUIRE(r.w.holder() != nullptr);
+	CHECK(r.w.holder()->screen == PANEL);
+	CHECK(fake(r.w.slot) == r.w.holder());
+	CHECK(r.w.away == 0);
+}
+
+TEST_CASE("the panel under a new position-derived id is still there: the window goes back to its DP, not the laptop's")
+{
+	Rig r;
+	const xrt_screen_list b = both();
+	comp_vk_native_segments *segs = r.manager(b);
+	run(segs, ON_LAPTOP);
+	REQUIRE(r.w.holder()->screen == LAPTOP);
+
+	// An arrangement change re-identified the panel: its id is gone, but its
+	// plug-in still wins a screen.
+	xrt_screen_list moved{};
+	add(moved, PANEL2, "vendor", 2560, 3840, 2160, false);
+	add(moved, LAPTOP, "sim-display", 0, 2560, 1600, false);
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &moved);
+	REQUIRE(r.w.holder() != nullptr);
+	CHECK(r.w.holder()->screen == PANEL);
+	CHECK(fake(r.w.slot) == r.w.holder());
+	CHECK(r.w.away == 0);
+}
+
+TEST_CASE("the panel back after the bound with the laptop's screen off: the panel's DP takes the window back")
+{
+	Rig r;
+	const xrt_screen_list b = both();
+	comp_vk_native_segments *segs = r.manager(b);
+	run(segs, ON_LAPTOP);
+	FakeDp *laptop_dp = r.w.holder();
+	REQUIRE(laptop_dp->screen == LAPTOP);
+
+	r.w.panel_ready = false;
+	const xrt_screen_list gone = laptop_only();
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &gone);
+	REQUIRE(fake(r.w.slot) == laptop_dp);
+	REQUIRE(r.w.away == LAPTOP);
+	segs = r.manager(gone);
+
+	// The replug lists the panel alone: a one-screen list, still re-homed.
+	r.w.panel_ready = true;
+	const xrt_screen_list p1 = panel_only();
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &p1);
+	segs = r.manager(p1);
+	REQUIRE(comp_vk_native_segments_enabled(segs));
+	const comp_seg_rect canvas{0, 0, ON_PANEL.w, ON_PANEL.h};
+	CHECK(comp_vk_native_segments_would_split(segs, &ON_PANEL, &canvas));
+	(void)comp_vk_native_segments_update(segs, &ON_PANEL, &canvas, kFormat, true, 0);
+	CHECK(r.w.away == 0);
+	REQUIRE(r.w.slot != nullptr);
+	CHECK(fake(r.w.slot)->screen == PANEL);
+	CHECK(fake(r.w.slot)->window);
+	// One screen: nothing to segment from here.
+	CHECK_FALSE(comp_vk_native_segments_enabled(segs));
+	comp_vk_native_segments_set_hwnd_hooks(segs, nullptr);
+	comp_vk_native_segments_destroy(&segs);
+	// The laptop's DP went with the manager's deferred releases (a Vulkan DP
+	// may still be in a fill until then); the panel's window-holding DP is the
+	// session DP and the only one left.
+	CHECK(r.w.alive.size() == 1);
+	CHECK(r.w.holder() == fake(r.w.slot));
 }

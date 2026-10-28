@@ -68,13 +68,15 @@ comp_d3d11_segments_destroy(struct comp_d3d11_segments **segs_ptr);
 
 /*!
  * @ref comp_d3d11_segments_destroy before a rebuild on @p next, the list the
- * next manager takes (ADR-047 Amendment 8, #2305). When @p next still has the
- * home screen (its SYSTEM_DEFAULT) the window goes back to the primary DP as
- * in a teardown. When the home is gone, the window goes to a screen of
- * @p next whose DP is ready — it stays on the DP that holds it when that one
- * qualifies — and that DP takes the session's primary slot; no DP is made for
- * the departed screen. The slot's new screen is written to
- * comp_d3d11_segments_hwnd_hooks::away_screen_id.
+ * next manager takes (ADR-047 Amendment 8, #2305). When the home is unplugged
+ * in @p next (its id gone and its plug-in winning no screen), the window goes
+ * to a screen of @p next whose DP is ready — it stays on the DP that holds it
+ * when that one qualifies — and that DP takes the session's primary slot; no
+ * DP is ever made for the departed screen (failing that, the window stays
+ * with its holder). The slot's new screen is written to
+ * comp_d3d11_segments_hwnd_hooks::away_screen_id. Otherwise (the home listed,
+ * re-claimed or re-identified) the window goes back to the primary DP as in a
+ * teardown.
  */
 void
 comp_d3d11_segments_destroy_for_rebuild(struct comp_d3d11_segments **segs_ptr, const struct xrt_screen_list *next);

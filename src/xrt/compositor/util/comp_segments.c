@@ -863,6 +863,33 @@ comp_segments_owner_needs_windowless_replacement(const struct comp_segment_table
 	return false;
 }
 
+void
+comp_segments_next_list_add(struct comp_segments_next_list *nl, uint64_t id, const char *plugin_id, bool is_default)
+{
+	if (nl == NULL || nl->count >= COMP_SEGMENTS_MAX_SCREENS) {
+		return;
+	}
+	nl->ids[nl->count] = id;
+	(void)snprintf(nl->plugin_ids[nl->count], COMP_SEGMENTS_ID_MAX, "%s", plugin_id != NULL ? plugin_id : "");
+	nl->count++;
+	if (is_default) {
+		nl->default_id = id;
+	}
+}
+
+//! The home is unplugged in @p next: its id is not listed and its plug-in wins no screen (u_screen_home's rule).
+static bool
+next_home_unplugged(const struct comp_segments_next_list *next, const struct comp_segments_screen *home)
+{
+	const uint32_t n = next->count < COMP_SEGMENTS_MAX_SCREENS ? next->count : COMP_SEGMENTS_MAX_SCREENS;
+	for (uint32_t k = 0; k < n; k++) {
+		if (next->ids[k] == home->id || strncmp(next->plugin_ids[k], home->plugin_id, COMP_SEGMENTS_ID_MAX) == 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool
 next_lists(const struct comp_segments_next_list *next, uint64_t id)
 {
@@ -890,11 +917,11 @@ handback_decide(const struct comp_segments_screen *screens,
 		screen_count = COMP_SEGMENTS_MAX_SCREENS;
 	}
 	if (screens == NULL || ready == NULL || next == NULL || primary_index >= screen_count ||
-	    next->default_id == screens[primary_index].id) {
+	    next->default_id == screens[primary_index].id || !next_home_unplugged(next, &screens[primary_index])) {
 		return COMP_SEGMENTS_HANDBACK_HOME;
 	}
 
-	// Home gone. The holder first: the window stays where it is.
+	// Home unplugged. The holder first: the window stays where it is.
 	const bool owner_ok = owner_index >= 0 && (uint32_t)owner_index < screen_count;
 	if (owner_ok && (uint32_t)owner_index != primary_index && ready[owner_index] &&
 	    next_lists(next, screens[owner_index].id)) {

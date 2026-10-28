@@ -837,35 +837,42 @@ comp_segments_owner_needs_windowless_replacement(const struct comp_segment_table
 
 /*!
  * The screen list a rebuild is about to take, as the hand-back needs it: the
- * ids it lists and the one carrying SYSTEM_DEFAULT (the session re-anchors
- * that flag on the session DP's home screen, or puts it on none when the home
- * is gone or re-claimed — u_screen_home).
+ * screens it lists, the plug-in that wins each, and the one carrying
+ * SYSTEM_DEFAULT (the session re-anchors that flag on the session DP's home
+ * screen, or puts it on none when the home is gone or re-claimed —
+ * u_screen_home). Fill it with @ref comp_segments_next_list_add.
  */
 struct comp_segments_next_list
 {
 	uint64_t ids[COMP_SEGMENTS_MAX_SCREENS];
+	char plugin_ids[COMP_SEGMENTS_MAX_SCREENS][COMP_SEGMENTS_ID_MAX];
 	uint32_t count;
 	uint64_t default_id; //!< 0 = no screen carries SYSTEM_DEFAULT
 };
 
+//! Append one screen of the next list (ignored past @ref COMP_SEGMENTS_MAX_SCREENS).
+void
+comp_segments_next_list_add(struct comp_segments_next_list *nl, uint64_t id, const char *plugin_id, bool is_default);
+
 //! What the window handle does before a screen-list rebuild (@ref comp_segments_handback_decide).
 enum comp_segments_handback
 {
-	//! The next list keeps the home screen (or there is no next list, a
+	//! The next list keeps the home screen, re-claims it, or lists its
+	//! plug-in under another screen id (or there is no next list, a
 	//! teardown): back to the home screen's DP, as before (a no-op when it
 	//! holds the window already).
 	COMP_SEGMENTS_HANDBACK_HOME = 0,
-	//! Home gone: the screen holding the window is listed and its DP is
+	//! Home unplugged: the screen holding the window is listed and its DP is
 	//! ready. The window stays on that DP, which moves into the session's
 	//! primary slot (nothing is re-made).
 	COMP_SEGMENTS_HANDBACK_STAY,
-	//! Home gone: the window moves to the listed screen with a ready DP that
-	//! the window covers most, and that screen's new window-holding DP takes
-	//! the primary slot.
+	//! Home unplugged: the window moves to the listed screen with a ready DP
+	//! that the window covers most, and that screen's new window-holding DP
+	//! takes the primary slot.
 	COMP_SEGMENTS_HANDBACK_MOVE,
-	//! Home gone and no listed screen has a ready DP: the window stays on the
-	//! DP that holds it (moved into the primary slot when it is a segment's),
-	//! and no DP is made for the departed screen.
+	//! Home unplugged and no listed screen has a ready DP: the window stays
+	//! on the DP that holds it (moved into the primary slot when it is a
+	//! segment's), and no DP is made for the departed screen.
 	COMP_SEGMENTS_HANDBACK_NO_READY,
 };
 
@@ -874,18 +881,23 @@ enum comp_segments_handback
  * a manager rebuilds on @p next. Pure.
  *
  * The old rule always handed the window back to the home screen's DP. When the
- * home screen is not in @p next any more (unplugged), that is a fresh DP for a
- * panel that is not there: on Windows hardware it never became ready, wove
- * nothing and reported no geometry, so the laptop showed one eye of a
- * whole-panel frustum. Now:
- *   - the home is @p next's default screen, or @p next is NULL: HOME;
+ * home panel is unplugged, that is a fresh DP for a panel that is not there:
+ * on Windows hardware it never became ready, wove nothing and reported no
+ * geometry, so the laptop showed one eye of a whole-panel frustum. Now:
+ *   - @p next is NULL, or the home is not unplugged: HOME. "Unplugged" is the
+ *     session's own keep condition (u_screen_home: gone and its plug-in
+ *     unlisted): the home's id is not in @p next AND no screen of @p next is
+ *     won by the home's plug-in. A home re-claimed by another plug-in, or its
+ *     panel listed under a new (position-derived) id, is still there: the
+ *     window goes back to the home's DP as before;
  *   - else the window's holder (@p owner_index, not the home) is listed and
  *     @p ready: STAY;
  *   - else the listed, @p ready screen (not the home) with the largest share of
  *     the window in @p last (ties and no share: the lowest index): MOVE;
  *   - else NO_READY.
  *
- * @param screens        The manager's screens (indexed like @p ready).
+ * @param screens        The manager's screens (indexed like @p ready); the
+ *                       home's comp_segments_screen::plugin_id is its plug-in.
  * @param screen_count   How many.
  * @param primary_index  The home screen's index (the session DP's screen);
  *                       out of range = no segmentation, HOME.
