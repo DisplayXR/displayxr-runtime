@@ -7828,6 +7828,10 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->base.base.info.formats[format_count++] = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R16G16B16A16_UNORM;
+	// Read as linear like every UNORM format, unless the app declares it
+	// display-encoded (XR_DXR_swapchain_color_encoding): the format a game's
+	// 10-bit back buffer is copied into without converting it.
+	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R10G10B10A2_UNORM;
 	/*
 	 * Depth formats, most preferred first (#2430). An app that takes the
 	 * runtime's first usable depth format gets D32_FLOAT, the format every
@@ -7842,6 +7846,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->base.base.info.formats[format_count++] = DXGI_FORMAT_D24_UNORM_S8_UINT;
 	c->base.base.info.formats[format_count++] = DXGI_FORMAT_D16_UNORM;
 	c->base.base.info.format_count = format_count;
+	c->base.base.info.color_encoded_srgb_swapchains = true;
 
 	U_LOG_I("D3D11 native compositor supports %u swapchain formats", format_count);
 

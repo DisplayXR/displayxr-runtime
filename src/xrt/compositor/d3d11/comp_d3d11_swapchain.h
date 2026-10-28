@@ -82,6 +82,51 @@ comp_d3d11_swapchain_get_compose_srv(struct xrt_swapchain *xsc, uint32_t index);
 bool
 comp_d3d11_swapchain_is_srgb(struct xrt_swapchain *xsc);
 
+//! Most array slices a compose shadow covers (stereo arrays are 2).
+#define COMP_D3D11_SHADOW_MAX_SLICES 4
+
+/*!
+ * XR_DXR_swapchain_color_encoding: the 8-bit shadow a composing frame samples
+ * for an encoded swapchain whose format has no `_SRGB` sibling.
+ *
+ * The caller fills each slice through @p unorm_rtvs with a raw draw of the
+ * swapchain's non-decoding view (no transfer function), then samples
+ * @p srgb_srv, whose `_SRGB` format decodes on sample. @p stamp lets it fill
+ * each image once per frame.
+ *
+ * @ingroup comp_d3d11
+ */
+struct comp_d3d11_compose_shadow
+{
+	void *srgb_srv;                                 //!< ID3D11ShaderResourceView*
+	void *unorm_rtvs[COMP_D3D11_SHADOW_MAX_SLICES]; //!< ID3D11RenderTargetView* per slice
+	uint32_t slice_count;
+	uint32_t width;
+	uint32_t height;
+	uint64_t *stamp; //!< Owned by the swapchain; the caller's frame serial of the last fill
+};
+
+/*!
+ * Does a composing frame have to sample this swapchain through a shadow? True
+ * for an encoded swapchain (XR_DXR_swapchain_color_encoding) whose format has
+ * no `_SRGB` sibling.
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_swapchain_needs_compose_shadow(struct xrt_swapchain *xsc);
+
+/*!
+ * Get (creating on first use) the compose shadow of one image.
+ *
+ * @return false when the swapchain needs no shadow or it could not be created.
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_swapchain_get_compose_shadow(struct xrt_swapchain *xsc,
+                                        uint32_t index,
+                                        struct comp_d3d11_compose_shadow *out_shadow);
+
 /*!
  * Get the render target view for a swapchain image.
  *

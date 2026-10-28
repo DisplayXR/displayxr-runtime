@@ -129,6 +129,31 @@ oxr_xrCreateSwapchain(XrSession session, const XrSwapchainCreateInfo *createInfo
 		                 "(createInfo->format == 0x%04" PRIx64 ") is not supported", createInfo->format);
 	}
 
+#ifdef OXR_HAVE_DXR_swapchain_color_encoding
+	const XrSwapchainColorEncodingCreateInfoDXR *color_encoding = NULL;
+	if (inst->extensions.DXR_swapchain_color_encoding) {
+		color_encoding = OXR_GET_INPUT_FROM_CHAIN(createInfo, XR_TYPE_SWAPCHAIN_COLOR_ENCODING_CREATE_INFO_DXR,
+		                                          XrSwapchainColorEncodingCreateInfoDXR);
+	}
+	if (color_encoding != NULL) {
+		if (color_encoding->colorEncoding != XR_SWAPCHAIN_COLOR_ENCODING_LINEAR_DXR &&
+		    color_encoding->colorEncoding != XR_SWAPCHAIN_COLOR_ENCODING_SRGB_DXR) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(XrSwapchainColorEncodingCreateInfoDXR::colorEncoding == %d) is not a valid "
+			                 "XrSwapchainColorEncodingDXR",
+			                 (int)color_encoding->colorEncoding);
+		}
+		// Refuse rather than read display-encoded values as linear (washed out).
+		if (color_encoding->colorEncoding == XR_SWAPCHAIN_COLOR_ENCODING_SRGB_DXR &&
+		    (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0 &&
+		    !c->info.color_encoded_srgb_swapchains) {
+			return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+			                 "XR_SWAPCHAIN_COLOR_ENCODING_SRGB_DXR is not supported by this session's "
+			                 "compositor (XR_DXR_swapchain_color_encoding)");
+		}
+	}
+#endif
+
 #ifdef OXR_HAVE_KHR_vulkan_swapchain_format_list
 	const XrVulkanSwapchainFormatListCreateInfoKHR *format_list = NULL;
 	if (sess->sys->inst->extensions.KHR_vulkan_swapchain_format_list) {

@@ -197,6 +197,21 @@ struct comp_d3d11_renderer
 	//! @ref u_color_legacy_unorm_encoded, cached at create.
 	bool legacy_color;
 
+	//! XR_DXR_swapchain_color_encoding: the raw fill of compose shadows
+	//! (comp_d3d11_swapchain_get_compose_shadow), built on first use.
+	struct
+	{
+		ID3D11VertexShader *vs;
+		ID3D11PixelShader *ps;       //!< Texture2D source
+		ID3D11PixelShader *ps_array; //!< Texture2DArray source, slice from cb
+		ID3D11Buffer *cb;
+		bool failed;
+		bool logged; //!< One WARN when a frame first composes through a shadow
+	} shadow;
+
+	//! Bumped once per projection pass; stamps compose-shadow fills.
+	uint64_t frame_serial;
+
 	/*!
 	 * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B) — the runtime-drawn
 	 * cursor. ZERO COST UNLESS REQUESTED: `frame.count` is 0 on every frame
@@ -834,6 +849,186 @@ renderer_publish_compose_to_atlas(struct comp_d3d11_renderer *r)
 }
 
 /*!
+ * XR_DXR_swapchain_color_encoding: copy the source's values into the 8-bit
+ * shadow UNCHANGED. A UNORM view in, a UNORM target out, no transfer function:
+ * the decode is the shadow's `_SRGB` view, applied by the hardware on sample
+ * like every other `_SRGB` source (ADR-044 §3).
+ */
+static const char *const shadow_fill_source = R"(
+cbuffer ShadowFillCB : register(b0)
+{
+    uint4 slice; // x = source array slice
+};
+
+Texture2D source : register(t0);
+Texture2DArray source_array : register(t0);
+
+void VSMain(uint id : SV_VertexID, out float4 position : SV_Position)
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+float4 PSMain(float4 position : SV_Position) : SV_Target
+{
+    return source.Load(int3(position.xy, 0));
+}
+
+float4 PSMainArray(float4 position : SV_Position) : SV_Target
+{
+    return source_array.Load(int4(position.xy, slice.x, 0));
+}
+)";
+
+static bool
+renderer_ensure_shadow_fill(struct comp_d3d11_renderer *r)
+{
+	if (r->shadow.ps_array != nullptr) {
+		return true;
+	}
+	if (r->shadow.failed) {
+		return false;
+	}
+	auto internals = get_internals(r->c);
+	ID3DBlob *vs = nullptr, *ps = nullptr, *ps_array = nullptr;
+	bool ok =
+	    compile_shader(internals.device, shadow_fill_source, "VSMain", "vs_5_0", &vs) == XRT_SUCCESS &&
+	    compile_shader(internals.device, shadow_fill_source, "PSMain", "ps_5_0", &ps) == XRT_SUCCESS &&
+	    compile_shader(internals.device, shadow_fill_source, "PSMainArray", "ps_5_0", &ps_array) == XRT_SUCCESS;
+	if (ok) {
+		D3D11_BUFFER_DESC cb = {};
+		cb.ByteWidth = 16;
+		cb.Usage = D3D11_USAGE_DEFAULT;
+		cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		ok = SUCCEEDED(internals.device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(),
+		                                                    nullptr, &r->shadow.vs)) &&
+		     SUCCEEDED(internals.device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr,
+		                                                   &r->shadow.ps)) &&
+		     SUCCEEDED(internals.device->CreatePixelShader(
+		         ps_array->GetBufferPointer(), ps_array->GetBufferSize(), nullptr, &r->shadow.ps_array)) &&
+		     SUCCEEDED(internals.device->CreateBuffer(&cb, nullptr, &r->shadow.cb));
+	}
+	if (vs != nullptr)
+		vs->Release();
+	if (ps != nullptr)
+		ps->Release();
+	if (ps_array != nullptr)
+		ps_array->Release();
+	if (!ok) {
+		r->shadow.failed = true;
+		U_LOG_W(
+		    "XR_DXR_swapchain_color_encoding: compose shadow fill unavailable; deep encoded layers compose "
+		    "as if linear");
+	}
+	return ok;
+}
+
+/*!
+ * The compose-path SRV of an encoded swapchain without an `_SRGB` sibling:
+ * its shadow, filled from the image once per frame. Called mid-pass, so it
+ * restores every piece of pipeline state it changes.
+ */
+static ID3D11ShaderResourceView *
+renderer_compose_shadow_srv(struct comp_d3d11_renderer *r, struct xrt_swapchain *xsc, uint32_t image_index)
+{
+	struct comp_d3d11_compose_shadow shadow = {};
+	if (!renderer_ensure_shadow_fill(r) || !comp_d3d11_swapchain_get_compose_shadow(xsc, image_index, &shadow)) {
+		return static_cast<ID3D11ShaderResourceView *>(comp_d3d11_swapchain_get_compose_srv(xsc, image_index));
+	}
+	if (*shadow.stamp != r->frame_serial) {
+		*shadow.stamp = r->frame_serial;
+		if (!r->shadow.logged) {
+			r->shadow.logged = true;
+			U_LOG_W(
+			    "XR_DXR_swapchain_color_encoding: composing a display-encoded %ux%u x%u source through its "
+			    "8-bit shadow (no _SRGB view for its format)",
+			    shadow.width, shadow.height, shadow.slice_count);
+		}
+		auto internals = get_internals(r->c);
+		ID3D11DeviceContext *ctx = internals.context;
+
+		// Save what the fill touches.
+		ID3D11RenderTargetView *saved_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+		ID3D11DepthStencilView *saved_dsv = nullptr;
+		ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs, &saved_dsv);
+		ID3D11BlendState *saved_blend = nullptr;
+		FLOAT saved_factor[4];
+		UINT saved_mask = 0;
+		ctx->OMGetBlendState(&saved_blend, saved_factor, &saved_mask);
+		ID3D11DepthStencilState *saved_ds = nullptr;
+		UINT saved_ref = 0;
+		ctx->OMGetDepthStencilState(&saved_ds, &saved_ref);
+		ID3D11RasterizerState *saved_rs = nullptr;
+		ctx->RSGetState(&saved_rs);
+		UINT saved_vp_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+		D3D11_VIEWPORT saved_vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+		ctx->RSGetViewports(&saved_vp_count, saved_vps);
+		ID3D11VertexShader *saved_vs = nullptr;
+		ctx->VSGetShader(&saved_vs, nullptr, nullptr);
+		ID3D11PixelShader *saved_ps = nullptr;
+		ctx->PSGetShader(&saved_ps, nullptr, nullptr);
+		ID3D11InputLayout *saved_layout = nullptr;
+		ctx->IAGetInputLayout(&saved_layout);
+		D3D11_PRIMITIVE_TOPOLOGY saved_topology;
+		ctx->IAGetPrimitiveTopology(&saved_topology);
+		ID3D11ShaderResourceView *saved_srv = nullptr;
+		ctx->PSGetShaderResources(0, 1, &saved_srv);
+		ID3D11Buffer *saved_cb = nullptr;
+		ctx->PSGetConstantBuffers(0, 1, &saved_cb);
+
+		// Fill: the swapchain's non-decoding view in, the shadow's UNORM view out.
+		auto *source = static_cast<ID3D11ShaderResourceView *>(comp_d3d11_swapchain_get_srv(xsc, image_index));
+		D3D11_SHADER_RESOURCE_VIEW_DESC source_desc = {};
+		source->GetDesc(&source_desc);
+		const bool array = source_desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+		const D3D11_VIEWPORT vp = {0.0f, 0.0f, (float)shadow.width, (float)shadow.height, 0.0f, 1.0f};
+		ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+		ctx->OMSetDepthStencilState(nullptr, 0);
+		ctx->RSSetState(nullptr);
+		ctx->RSSetViewports(1, &vp);
+		ctx->IASetInputLayout(nullptr);
+		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		ctx->VSSetShader(r->shadow.vs, nullptr, 0);
+		ctx->PSSetShader(array ? r->shadow.ps_array : r->shadow.ps, nullptr, 0);
+		ctx->PSSetConstantBuffers(0, 1, &r->shadow.cb);
+		for (uint32_t s = 0; s < shadow.slice_count; s++) {
+			auto *rtv = static_cast<ID3D11RenderTargetView *>(shadow.unorm_rtvs[s]);
+			const uint32_t slice[4] = {s, 0, 0, 0};
+			ctx->UpdateSubresource(r->shadow.cb, 0, nullptr, slice, 0, 0);
+			ctx->OMSetRenderTargets(1, &rtv, nullptr);
+			ctx->PSSetShaderResources(0, 1, &source);
+			ctx->Draw(3, 0);
+		}
+
+		// Restore.
+		ID3D11ShaderResourceView *null_srv = nullptr;
+		ctx->PSSetShaderResources(0, 1, &null_srv);
+		ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs, saved_dsv);
+		ctx->OMSetBlendState(saved_blend, saved_factor, saved_mask);
+		ctx->OMSetDepthStencilState(saved_ds, saved_ref);
+		ctx->RSSetState(saved_rs);
+		ctx->RSSetViewports(saved_vp_count, saved_vps);
+		ctx->VSSetShader(saved_vs, nullptr, 0);
+		ctx->PSSetShader(saved_ps, nullptr, 0);
+		ctx->IASetInputLayout(saved_layout);
+		ctx->IASetPrimitiveTopology(saved_topology);
+		ctx->PSSetShaderResources(0, 1, &saved_srv);
+		ctx->PSSetConstantBuffers(0, 1, &saved_cb);
+		for (ID3D11RenderTargetView *rtv : saved_rtvs) {
+			if (rtv != nullptr)
+				rtv->Release();
+		}
+		ID3D11DeviceChild *saved[] = {saved_dsv, saved_blend,  saved_ds,  saved_rs, saved_vs,
+		                              saved_ps,  saved_layout, saved_srv, saved_cb};
+		for (ID3D11DeviceChild *object : saved) {
+			if (object != nullptr)
+				object->Release();
+		}
+	}
+	return static_cast<ID3D11ShaderResourceView *>(shadow.srgb_srv);
+}
+
+/*!
  * The SRV a layer is sampled through THIS FRAME.
  *
  * Composing ⟹ the format-honest view (input must be linear, because the
@@ -843,6 +1038,9 @@ renderer_publish_compose_to_atlas(struct comp_d3d11_renderer *r)
 static ID3D11ShaderResourceView *
 layer_source_srv(struct comp_d3d11_renderer *r, struct xrt_swapchain *xsc, uint32_t image_index)
 {
+	if (r->compose_active && comp_d3d11_swapchain_needs_compose_shadow(xsc)) {
+		return renderer_compose_shadow_srv(r, xsc, image_index);
+	}
 	return static_cast<ID3D11ShaderResourceView *>(r->compose_active
 	                                                   ? comp_d3d11_swapchain_get_compose_srv(xsc, image_index)
 	                                                   : comp_d3d11_swapchain_get_srv(xsc, image_index));
@@ -1630,6 +1828,10 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	}
 
 	// XR_DXR_cursor_depth v5 (all NULL unless a cursor was ever drawn).
+	SAFE_RELEASE(r->shadow.vs);
+	SAFE_RELEASE(r->shadow.ps);
+	SAFE_RELEASE(r->shadow.ps_array);
+	SAFE_RELEASE(r->shadow.cb);
 	SAFE_RELEASE(r->cursor.look_srv_srgb);
 	SAFE_RELEASE(r->cursor.look_srv_raw);
 	SAFE_RELEASE(r->cursor.look_tex);
@@ -1895,6 +2097,7 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 	 * target and is copied out at the end of the pass.
 	 */
 	renderer->compose_active = false;
+	renderer->frame_serial++;
 	ID3D11RenderTargetView *target_rtv = renderer->atlas_rtv;
 	if (!renderer_frame_takes_fast_path(renderer, layers)) {
 		ID3D11RenderTargetView *compose_rtv = renderer_ensure_compose_target(renderer);
