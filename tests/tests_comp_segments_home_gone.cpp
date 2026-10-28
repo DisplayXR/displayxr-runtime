@@ -396,7 +396,8 @@ TEST_CASE("home gone while the panel's DP still holds the window: handed to the 
 
 	r.w.panel_ready = true;
 	segs = r.manager(b);
-	(void)comp_vk_native_segments_update(segs, &MOSTLY_PANEL, &MOSTLY_PANEL, kFormat, true, 0);
+	const comp_seg_rect canvas{0, 0, MOSTLY_PANEL.w, MOSTLY_PANEL.h};
+	(void)comp_vk_native_segments_update(segs, &MOSTLY_PANEL, &canvas, kFormat, true, 0);
 	CHECK(r.w.away == 0);
 	CHECK(fake(r.w.slot)->screen == PANEL);
 	comp_vk_native_segments_set_hwnd_hooks(segs, nullptr);
