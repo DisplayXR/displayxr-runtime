@@ -391,6 +391,38 @@ TEST_CASE("a segment takes its DP's eyes tracked or not, like the single-screen 
 	CHECK_FALSE(oxr_segment_views_accept_eyes(true, true, 0));
 }
 
+TEST_CASE("home gone: the session DP's eyes count only as its screen's segment's did (#2305)", "[oxr][segment_views]")
+{
+	// The home in place: whatever the session DP answered — a set short of the
+	// mode's views is the #615 one-frame lag, held by the caller's guard.
+	CHECK(oxr_segment_views_session_eyes_usable(false, true, true, 1, 2));
+	CHECK(oxr_segment_views_session_eyes_usable(false, true, true, 2, 2));
+	CHECK_FALSE(oxr_segment_views_session_eyes_usable(false, false, true, 2, 2));
+
+	// G16, 2026-10-28: after the 60 s bound the laptop's sim_display DP is the
+	// session DP and reports ONE eye, (0, 0.1, 0.6), for the 2-view mode. Up to
+	// the bound the same DP, as the laptop's segment DP, was refused
+	// (oxr_segment_views_segment_eyes) and the nominal pair filled the views.
+	// Same rule now, so nothing changes at the bound.
+	CHECK_FALSE(oxr_segment_views_session_eyes_usable(true, true, true, 1, 2));
+	xrt_segment_metric laptop{};
+	laptop.have_eyes = true;
+	laptop.eyes.valid = true;
+	laptop.eyes.count = 1;
+	laptop.eyes.eyes[0] = {0.0f, 0.1f, 0.6f};
+	xrt_eye_positions e{};
+	CHECK_FALSE(oxr_segment_views_segment_eyes(&laptop, 0.0f, 0.0f, 2, &e));
+
+	// A set that covers the views, or a 1-view mode, still counts; an invalid
+	// or missing set never does.
+	CHECK(oxr_segment_views_session_eyes_usable(true, true, true, 2, 2));
+	CHECK(oxr_segment_views_session_eyes_usable(true, true, true, 1, 1));
+	CHECK(oxr_segment_views_session_eyes_usable(true, true, true, 4, 4));
+	CHECK_FALSE(oxr_segment_views_session_eyes_usable(true, true, true, 2, 4));
+	CHECK_FALSE(oxr_segment_views_session_eyes_usable(true, true, false, 2, 2));
+	CHECK_FALSE(oxr_segment_views_session_eyes_usable(true, false, true, 2, 2));
+}
+
 TEST_CASE("Quad mode on two segments: every view gets a real frustum", "[oxr][segment_views]")
 {
 	// The nominal branch must fill one eye per active view: a 4-view mode

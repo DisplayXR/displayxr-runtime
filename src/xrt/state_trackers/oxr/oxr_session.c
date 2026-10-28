@@ -3708,6 +3708,27 @@ locate_views_one(struct oxr_logger *log,
 			        (double)((int64_t)xdisplay_time - (int64_t)os_monotonic_get_ns()) / 1e6,
 			        (int)eye_pos.valid, (int)eye_pos.is_tracking, (unsigned)eye_pos.count);
 		}
+
+		// ADR-047 Amendment 8 (#2305): with the home panel unplugged, the
+		// session DP can be the DP of the screen the window was handed to
+		// when the bounded wait ended. Its eyes count only as that screen's
+		// segment's did: a set short of the mode's views (a sim_display DP in
+		// another vendor's session reports one eye) gives way to the nominal
+		// viewer below, so the view does not change at the bound.
+		if (got_eye_positions &&
+		    !oxr_segment_views_session_eyes_usable(sess->display_home_away, got_eye_positions, eye_pos.valid,
+		                                           eye_pos.count, active_view_count)) {
+			got_eye_positions = false;
+			static bool logged_away_eyes = false;
+			if (!logged_away_eyes) {
+				logged_away_eyes = true;
+				U_LOG_W(
+				    "locate: the home panel is unplugged and the session DP reports %u eye(s) for "
+				    "a %u-view mode — the nominal viewer fills the views, as for that screen's "
+				    "segment (ADR-047 Amendment 8, #2305). Logged once.",
+				    (unsigned)eye_pos.count, (unsigned)active_view_count);
+			}
+		}
 	}
 
 	// One-shot diagnostic: log stereo gate values for first frames
@@ -6050,6 +6071,9 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	}
 #endif
 
+	free(sess->display_last_pushed);
+	sess->display_last_pushed = NULL;
+
 	free(sess);
 
 	return ret;
@@ -6186,6 +6210,9 @@ oxr_cocoa_window_placement_app_owned(const XrSessionCreateInfo *createInfo)
 }
 #endif
 
+//! oxr_session::display_home_logged for "gone, the last list kept" (past every u_screen_home_outcome).
+#define OXR_SCREEN_HOME_LOGGED_KEPT_LIST 0x100
+
 /*
  * Does allocation, population and basic init, so we can use early-returns to
  * simplify code flow and avoid weird if/else.
@@ -6263,20 +6290,87 @@ oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool 
 		u_screen_home_record(&sess->display_home, screens);
 		sess->display_home_logged = (int)U_SCREEN_HOME_IN_PLACE;
 	}
+	// ADR-047 Amendment 8, home gone (#2305). While the home panel is merely
+	// unplugged — its plug-in wins no screen, and every monitor left is where
+	// the last list has it — the compositor keeps that list for up to
+	// U_SCREEN_HOME_KEEP_BOUND_NS: a window that the OS moved to another
+	// screen stays with that screen's segment DP and per-segment views, and a
+	// re-seat comes back with no rebuild in between. No second weaver can
+	// result: nothing is claimed by the panel's plug-in. After the bound, or
+	// as soon as the list changes in another way, the list goes through and
+	// the home-gone rule applies: no screen carries the default, and (the
+	// panel unplugged) a manager that can move the window handle gives the
+	// window to a screen whose DP is ready, never to a new DP for the
+	// departed screen (on Windows hardware that DP never became ready, and
+	// the laptop showed one eye of a whole-panel frustum until the replug).
+	bool keep_last_list = false;
 	if (!initial && !sess->is_metal_native_compositor) {
 		const enum u_screen_home_outcome o = u_screen_home_anchor(&sess->display_home, screens);
-		if ((int)o != sess->display_home_logged) {
-			sess->display_home_logged = (int)o;
+		const uint64_t now_ns = os_monotonic_get_ns();
+		const enum u_screen_home_keep k =
+		    u_screen_home_keep_decide(&sess->display_home, o, screens, sess->display_last_pushed,
+		                              sess->display_keeping, sess->display_keep_since_ns, now_ns,
+		                              U_SCREEN_HOME_KEEP_BOUND_NS);
+		const double bound_s = (double)U_SCREEN_HOME_KEEP_BOUND_NS / 1e9;
+		const double held_s =
+		    sess->display_keeping ? (double)(now_ns - sess->display_keep_since_ns) / 1e9 : 0.0;
+		int logged = (int)o;
+		if (k == U_SCREEN_HOME_KEEP_START) {
+			sess->display_keeping = true;
+			sess->display_keep_since_ns = now_ns;
+			keep_last_list = true;
+			logged = OXR_SCREEN_HOME_LOGGED_KEPT_LIST;
 			U_LOG_W(
 			    "display hotplug: the session's own display processor stays on screen 0x%016llx ('%s') — "
-			    "%s%s",
+			    "gone, and '%s' wins no screen now (unplugged); the compositor keeps its last screen list "
+			    "for up to %.0f s, so a window on another screen stays with that screen's DP (ADR-047 "
+			    "Amendment 8, #2305)",
+			    (unsigned long long)sess->display_home.screen_id, sess->display_home.plugin_id,
+			    sess->display_home.plugin_id, bound_s);
+		} else if (k == U_SCREEN_HOME_KEEP_HOLD) {
+			keep_last_list = true;
+			logged = OXR_SCREEN_HOME_LOGGED_KEPT_LIST;
+		} else if (k == U_SCREEN_HOME_KEEP_EXPIRED) {
+			sess->display_keeping = false;
+			U_LOG_W(
+			    "display hotplug: screen 0x%016llx ('%s') has been gone for %.1f s (bound %.0f s) — the "
+			    "compositor takes the list without it now; per-screen segments are off until it returns "
+			    "(ADR-047 Amendment 8, #2305)",
+			    (unsigned long long)sess->display_home.screen_id, sess->display_home.plugin_id, held_s,
+			    bound_s);
+		} else if (sess->display_keeping) {
+			sess->display_keeping = false;
+			U_LOG_W("display hotplug: the kept screen list ends after %.1f s — %s (#2305)", held_s,
+			        (o == U_SCREEN_HOME_IN_PLACE || o == U_SCREEN_HOME_REANCHORED)
+			            ? "the home screen is back"
+			            : "the screen list changed in another way (a monitor added or moved, or the panel "
+			              "re-identified)");
+		}
+		if (k != U_SCREEN_HOME_KEEP_EXPIRED && logged != sess->display_home_logged &&
+		    logged != OXR_SCREEN_HOME_LOGGED_KEPT_LIST) {
+			U_LOG_W(
+			    "display hotplug: the session's own display processor stays on screen 0x%016llx ('%s') "
+			    "— %s%s",
 			    (unsigned long long)sess->display_home.screen_id, sess->display_home.plugin_id,
 			    u_screen_home_outcome_str(o),
 			    (o == U_SCREEN_HOME_GONE || o == U_SCREEN_HOME_RECLAIMED)
-			        ? "; per-screen segments are off until it returns (the session DP keeps weaving the "
-			          "window, as before the hotplug)"
+			        ? "; per-screen segments are off until it returns (ADR-047 Amendment 8)"
 			        : "");
 		}
+		sess->display_home_logged = logged;
+		if (!keep_last_list) {
+			// The list goes through: with the home unplugged, the session DP
+			// may be another screen's DP from here (locate_views_one).
+			sess->display_home_away = u_screen_home_away_next(
+			    sess->display_home_away, o, u_screen_home_plugin_unlisted(&sess->display_home, screens));
+		}
+	} else if (initial) {
+		sess->display_home_away = false;
+	}
+	if (keep_last_list) {
+		free(screens);
+		free(info);
+		return;
 	}
 	uint64_t pinned = 0;
 #ifdef OXR_HAVE_DXR_display_info
@@ -6336,6 +6430,15 @@ oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool 
 	}
 #endif
 
+	// What the compositor holds now (u_screen_home_keep_decide compares the
+	// next list with it). No copy = never keep: the re-push as before.
+	if (sess->display_last_pushed == NULL) {
+		sess->display_last_pushed = U_TYPED_CALLOC(struct xrt_screen_list);
+	}
+	if (sess->display_last_pushed != NULL) {
+		*sess->display_last_pushed = *screens;
+	}
+
 	free(screens);
 	free(info);
 }
@@ -6344,21 +6447,41 @@ oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool 
  * Display hotplug (ADR-047 Amendment 8), once per frame on the app's thread:
  * when the system's display topology moved since this session last looked,
  * re-push the screens to the compositor and queue XrEventDataDisplaysChangedDXR.
- * One unlocked read of the generation when nothing changed.
+ * One unlocked read of the generation when nothing changed (plus one clock
+ * read while a kept list waits out its bound, #2305).
  */
 void
 oxr_session_poll_display_topology(struct oxr_logger *log, struct oxr_session *sess)
 {
 	struct xrt_instance *xinst = (sess->sys != NULL && sess->sys->inst != NULL) ? sess->sys->inst->xinst : NULL;
 	const uint64_t gen = xrt_instance_get_display_generation(xinst);
-	if (gen == 0 || gen == sess->display_generation) {
+	// #2305: also due once a kept list (the home panel unplugged) has waited
+	// out its bound with no sweep published since — then the compositor
+	// takes the current list (the home-gone rule).
+	const uint64_t now_ns = sess->display_keeping ? os_monotonic_get_ns() : 0;
+	if (!u_screen_home_poll_due(gen, sess->display_generation, sess->display_keeping, sess->display_keep_since_ns,
+	                            now_ns, U_SCREEN_HOME_KEEP_BOUND_NS)) {
 		return;
 	}
+	const bool bound_passed = gen == 0 || gen == sess->display_generation;
 	const uint64_t before = sess->display_generation;
 	oxr_session_push_screens(log, sess, false);
-	if (sess->display_generation == before) {
-		// No in-process compositor took the list: just follow the generation.
-		sess->display_generation = gen;
+	const struct u_screen_home_poll_after after =
+	    u_screen_home_poll_settle(gen, before, sess->display_generation, sess->display_keeping, bound_passed);
+	sess->display_generation = after.follow;
+	if (after.abandon_keep) {
+		// The push returned before deciding (no in-process compositor took
+		// the list): stop waiting instead of retrying every frame.
+		sess->display_keeping = false;
+		U_LOG_W(
+		    "display hotplug: the kept screen list for screen 0x%016llx ('%s') could not be handed on — the "
+		    "session stops waiting for it (#2305)",
+		    (unsigned long long)sess->display_home.screen_id, sess->display_home.plugin_id);
+	}
+	if (!after.announce) {
+		// Only the bound's own push: the topology did not move, the app saw
+		// the change at the unplug — no event.
+		return;
 	}
 	struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
 	uint32_t count = 0;
@@ -6367,10 +6490,11 @@ oxr_session_poll_display_topology(struct oxr_logger *log, struct oxr_session *se
 		count = list->count;
 		free(list);
 	}
-	U_LOG_W(
-	    "display hotplug: session takes display topology generation %llu -> %llu (%u display(s)) — screens "
-	    "re-pushed to the compositor, no restart",
-	    (unsigned long long)before, (unsigned long long)sess->display_generation, count);
+	U_LOG_W("display hotplug: session takes display topology generation %llu -> %llu (%u display(s)) — %s, no restart",
+	        (unsigned long long)before, (unsigned long long)sess->display_generation, count,
+	        sess->display_keeping ? "the compositor keeps its last screen list for now (the session's panel is "
+	                                "unplugged, #2305)"
+	                              : "screens re-pushed to the compositor");
 #ifdef OXR_HAVE_DXR_display_info
 	if (sess->sys->inst->extensions.DXR_display_info) {
 		oxr_event_push_XrEventDataDisplaysChangedDXR(log, sess, count);

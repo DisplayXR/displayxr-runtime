@@ -1066,6 +1066,174 @@ comp_segments_owner_needs_windowless_replacement(const struct comp_segment_table
                                                  bool owner_is_primary,
                                                  bool owner_has_factory);
 
+/*!
+ * The screen list a rebuild is about to take, as the hand-back needs it: the
+ * screens it lists, the plug-in that wins each, and the one carrying
+ * SYSTEM_DEFAULT (the session re-anchors that flag on the session DP's home
+ * screen, or puts it on none when the home is gone or re-claimed —
+ * u_screen_home). Fill it with @ref comp_segments_next_list_add.
+ */
+struct comp_segments_next_list
+{
+	uint64_t ids[COMP_SEGMENTS_MAX_SCREENS];
+	char plugin_ids[COMP_SEGMENTS_MAX_SCREENS][COMP_SEGMENTS_ID_MAX];
+	uint32_t count;
+	uint64_t default_id; //!< 0 = no screen carries SYSTEM_DEFAULT
+};
+
+//! Append one screen of the next list (ignored past @ref COMP_SEGMENTS_MAX_SCREENS).
+void
+comp_segments_next_list_add(struct comp_segments_next_list *nl, uint64_t id, const char *plugin_id, bool is_default);
+
+//! What the window handle does before a screen-list rebuild (@ref comp_segments_handback_decide).
+enum comp_segments_handback
+{
+	//! The next list keeps the home screen, re-claims it, or lists its
+	//! plug-in under another screen id (or there is no next list, a
+	//! teardown): back to the home screen's DP, as before (a no-op when it
+	//! holds the window already).
+	COMP_SEGMENTS_HANDBACK_HOME = 0,
+	//! Home unplugged: the screen holding the window is listed and its DP is
+	//! ready. The window stays on that DP, which moves into the session's
+	//! primary slot (nothing is re-made).
+	COMP_SEGMENTS_HANDBACK_STAY,
+	//! Home unplugged: the window moves to the listed screen with a ready DP
+	//! that the window covers most, and that screen's new window-holding DP
+	//! takes the primary slot.
+	COMP_SEGMENTS_HANDBACK_MOVE,
+	//! Home unplugged and no listed screen has a ready DP: the window stays
+	//! on the DP that holds it (moved into the primary slot when it is a
+	//! segment's), and no DP is made for the departed screen.
+	COMP_SEGMENTS_HANDBACK_NO_READY,
+};
+
+/*!
+ * ADR-047 Amendment 8, home gone (#2305): where the window handle goes before
+ * a manager rebuilds on @p next. Pure.
+ *
+ * The old rule always handed the window back to the home screen's DP. When the
+ * home panel is unplugged, that is a fresh DP for a panel that is not there:
+ * on Windows hardware it never became ready, wove nothing and reported no
+ * geometry, so the laptop showed one eye of a whole-panel frustum. Now:
+ *   - @p next is NULL, or the home is not unplugged: HOME. "Unplugged" is the
+ *     session's own keep condition (u_screen_home: gone and its plug-in
+ *     unlisted): the home's id is not in @p next AND no screen of @p next is
+ *     won by the home's plug-in. A home re-claimed by another plug-in, or its
+ *     panel listed under a new (position-derived) id, is still there: the
+ *     window goes back to the home's DP as before;
+ *   - else the window's holder (@p owner_index, not the home) is listed and
+ *     @p ready: STAY;
+ *   - else the listed, @p ready screen (not the home) with the largest share of
+ *     the window in @p last (ties and no share: the lowest index): MOVE;
+ *   - else NO_READY.
+ *
+ * @param screens        The manager's screens (indexed like @p ready); the
+ *                       home's comp_segments_screen::plugin_id is its plug-in.
+ * @param screen_count   How many.
+ * @param primary_index  The home screen's index (the session DP's screen);
+ *                       out of range = no segmentation, HOME.
+ * @param owner_index    The screen whose DP holds the window, -1 = none.
+ * @param ready          Per screen: it has a live DP that reports its screen's
+ *                       geometry (the window metrics need it). Ignored for the
+ *                       home.
+ * @param last           The last segment table (the window's share per
+ *                       screen); NULL = no share known.
+ * @param next           The list the rebuild takes; NULL = none (a teardown).
+ * @param[out] out_target The screen the window ends on: the holder for STAY,
+ *                       the new screen for MOVE, the holder for NO_READY (it
+ *                       may be the home itself; -1 when no DP holds the
+ *                       window); -1 for HOME.
+ */
+enum comp_segments_handback
+comp_segments_handback_decide(const struct comp_segments_screen *screens,
+                              uint32_t screen_count,
+                              uint32_t primary_index,
+                              int owner_index,
+                              const bool *ready,
+                              const struct comp_segment_table *last,
+                              const struct comp_segments_next_list *next,
+                              int *out_target);
+
+//! A short word for @p h ("home", "stay", "move", "no ready screen").
+const char *
+comp_segments_handback_str(enum comp_segments_handback h);
+
+/*!
+ * ADR-047 Amendment 8 (#2305): what sits in the session's primary slot while
+ * the home screen is unplugged. Compositor-owned and kept across manager
+ * rebuilds (a rebuild makes a new manager); the segment managers write it.
+ */
+struct comp_segments_away
+{
+	//! The screen whose DP holds the slot instead of the home's; 0 = the home's own DP.
+	uint64_t screen_id;
+	//! That DP's plug-in.
+	char plugin_id[COMP_SEGMENTS_ID_MAX];
+	//! The departed home screen (for the logs) and its plug-in: a screen
+	//! that plug-in wins again is the panel back.
+	uint64_t home_id;
+	char home_plugin_id[COMP_SEGMENTS_ID_MAX];
+};
+
+//! What @ref comp_segments_away_decide picks.
+enum comp_segments_away_pick
+{
+	//! Nothing stands in: the slot keeps its DP and nothing is segmented.
+	COMP_SEGMENTS_AWAY_NONE = 0,
+	//! The home's plug-in wins a screen again under another id: the panel is back.
+	COMP_SEGMENTS_AWAY_PANEL_BACK,
+	//! The slot's own screen left too: a listed screen takes its place.
+	COMP_SEGMENTS_AWAY_HOLDER_GONE,
+};
+
+/*!
+ * ADR-047 Amendment 8, home gone (#2305): a screen list without the home's
+ * default arrives while the session's primary slot holds another screen's DP.
+ * Which listed screen stands in for the home, as the manager's primary? Pure.
+ *
+ * The hand-back took the window off the home because it was unplugged: its
+ * id not listed AND its plug-in winning no screen. Its plug-in winning a
+ * screen again is the panel back — a serial-less panel's id is
+ * position-derived, so a panel alone at (0, 0) comes back under another id
+ * than the one it left with:
+ *   - @p next carries a default (the home itself is back), nothing is away, or
+ *     @p next is NULL: NONE;
+ *   - the home's plug-in wins exactly one listed screen that @p can_make a DP:
+ *     PANEL_BACK, that screen (it may be the slot's own screen already). Two
+ *     or more: not decided here, as if it won none;
+ *   - else the slot's screen is listed: NONE (it keeps the slot, as before);
+ *   - else the slot's DP is a departed screen's: HOLDER_GONE, the OS primary
+ *     screen if it @p can_make a DP (the OS moves a departed monitor's
+ *     windows there), else the first listed one that can;
+ *   - else NONE.
+ *
+ * @param away       The compositor's record; NULL = none.
+ * @param next       The list the manager is being built from.
+ * @param can_make   Parallel to @p next: the screen is placed on the desktop
+ *                   and its plug-in can make a per-screen DP for this API.
+ * @param os_primary Parallel to @p next: the OS's primary monitor.
+ * @param[out] out_index The pick's index into @p next, -1 for NONE.
+ */
+enum comp_segments_away_pick
+comp_segments_away_decide(const struct comp_segments_away *away,
+                          const struct comp_segments_next_list *next,
+                          const bool *can_make,
+                          const bool *os_primary,
+                          int *out_index);
+
+/*!
+ * Record that screen @p screen_id's DP (plug-in @p plugin_id) holds the slot
+ * now. The home is kept from the first record (a stand-in that leaves in
+ * turn does not become "the home"); @p home_id / @p home_plugin_id fill it
+ * only when nothing was away yet.
+ */
+void
+comp_segments_away_set(struct comp_segments_away *away,
+                       uint64_t screen_id,
+                       const char *plugin_id,
+                       uint64_t home_id,
+                       const char *home_plugin_id);
+
 
 /*
  *

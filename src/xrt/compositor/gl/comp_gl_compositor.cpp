@@ -1210,6 +1210,10 @@ struct comp_gl_compositor
 	struct xrt_system_compositor_info *seg_sys_info; //!< heap copy (the DP registry)
 	bool seg_rebuild;                                //!< a new list arrived: rebuild on the next weave
 	uint64_t seg_pinned_display_id;
+	//! ADR-047 Amendment 8 (#2305): the screen whose DP display_processor is
+	//! while the home screen is gone (screen_id 0 = the home's); kept across
+	//! rebuilds.
+	struct comp_segments_away seg_away;
 	//! #2247: the last weave's table does not cover the primary screen (the
 	//! window has wholly left it): the session's DP is asked for 2D there,
 	//! and gets the session's mode back when the window returns. Written by
@@ -5277,7 +5281,9 @@ gl_segments_tick(struct comp_gl_compositor *c, bool eligible, uint32_t present_w
 			// The app thread reads c->segments for eyes (M3): swap under the lock.
 			os_mutex_lock(&c->seg_pub_mutex);
 			if (c->seg_rebuild) {
-				comp_gl_segments_destroy(&c->segments);
+				// The home gone from the new list, the window stays with
+				// a ready screen instead (ADR-047 A8, #2305).
+				comp_gl_segments_destroy_for_rebuild(&c->segments, c->seg_screens);
 				c->seg_rebuild = false;
 			}
 			if (c->segments == NULL) {
@@ -5289,6 +5295,7 @@ gl_segments_tick(struct comp_gl_compositor *c, bool eligible, uint32_t present_w
 					hooks.hwnd = (void *)c->hwnd;
 					hooks.userdata = c;
 					hooks.swap_primary = gl_segments_swap_primary_cb;
+					hooks.away = &c->seg_away;
 					comp_gl_segments_set_hwnd_hooks(c->segments, &hooks);
 					comp_gl_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info,
 					                             c->seg_pinned_display_id);

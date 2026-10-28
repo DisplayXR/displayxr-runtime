@@ -870,6 +870,10 @@ struct comp_vk_native_compositor
 	//! set_screens() handed over a new list; the manager is rebuilt on the
 	//! next weave with no fill in flight.
 	bool seg_rebuild;
+	//! ADR-047 Amendment 8 (#2305, Windows): the screen whose DP
+	//! display_processor is while the home screen is gone (screen_id 0 = the
+	//! home's); kept across rebuilds.
+	struct comp_segments_away seg_away;
 	/*!
 	 * #2218: the last weave found the window NOT wholly on the primary screen,
 	 * so the compose step must not hand the app's image to the DP as-is
@@ -6252,7 +6256,9 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 	// a parked fill, whose command buffer may still use its DPs and images.
 	if (c->seg_rebuild && !c->fill_parked) {
 		os_mutex_lock(&c->seg_pub_mutex); // the app thread reads c->segments (M3)
-		comp_vk_native_segments_destroy(&c->segments);
+		// The home gone from the new list, the window stays with a ready
+		// screen instead (ADR-047 A8, #2305; Windows, hooks set).
+		comp_vk_native_segments_destroy_for_rebuild(&c->segments, c->seg_screens);
 		memset(&c->seg_pub, 0, sizeof(c->seg_pub));
 		os_mutex_unlock(&c->seg_pub_mutex);
 		c->seg_rebuild = false;
@@ -6276,6 +6282,7 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 			    .userdata = c,
 			    .swap_primary = vk_segments_swap_primary_cb,
 			    .bracket = vk_segments_hwnd_bracket_cb,
+			    .away = &c->seg_away,
 			};
 			comp_vk_native_segments_set_hwnd_hooks(segs, &hooks);
 		}

@@ -863,6 +863,211 @@ comp_segments_owner_needs_windowless_replacement(const struct comp_segment_table
 	return false;
 }
 
+void
+comp_segments_next_list_add(struct comp_segments_next_list *nl, uint64_t id, const char *plugin_id, bool is_default)
+{
+	if (nl == NULL || nl->count >= COMP_SEGMENTS_MAX_SCREENS) {
+		return;
+	}
+	nl->ids[nl->count] = id;
+	(void)snprintf(nl->plugin_ids[nl->count], COMP_SEGMENTS_ID_MAX, "%s", plugin_id != NULL ? plugin_id : "");
+	nl->count++;
+	if (is_default) {
+		nl->default_id = id;
+	}
+}
+
+//! The home is unplugged in @p next: its id is not listed and its plug-in wins no screen (u_screen_home's rule).
+static bool
+next_home_unplugged(const struct comp_segments_next_list *next, const struct comp_segments_screen *home)
+{
+	const uint32_t n = next->count < COMP_SEGMENTS_MAX_SCREENS ? next->count : COMP_SEGMENTS_MAX_SCREENS;
+	for (uint32_t k = 0; k < n; k++) {
+		if (next->ids[k] == home->id || strncmp(next->plugin_ids[k], home->plugin_id, COMP_SEGMENTS_ID_MAX) == 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+next_lists(const struct comp_segments_next_list *next, uint64_t id)
+{
+	const uint32_t n = next->count < COMP_SEGMENTS_MAX_SCREENS ? next->count : COMP_SEGMENTS_MAX_SCREENS;
+	for (uint32_t k = 0; k < n; k++) {
+		if (next->ids[k] == id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static enum comp_segments_handback
+handback_decide(const struct comp_segments_screen *screens,
+                uint32_t screen_count,
+                uint32_t primary_index,
+                int owner_index,
+                const bool *ready,
+                const struct comp_segment_table *last,
+                const struct comp_segments_next_list *next,
+                int *target)
+{
+	*target = -1;
+	if (screen_count > COMP_SEGMENTS_MAX_SCREENS) {
+		screen_count = COMP_SEGMENTS_MAX_SCREENS;
+	}
+	if (screens == NULL || ready == NULL || next == NULL || primary_index >= screen_count ||
+	    next->default_id == screens[primary_index].id || !next_home_unplugged(next, &screens[primary_index])) {
+		return COMP_SEGMENTS_HANDBACK_HOME;
+	}
+
+	// Home unplugged. The holder first: the window stays where it is.
+	const bool owner_ok = owner_index >= 0 && (uint32_t)owner_index < screen_count;
+	if (owner_ok && (uint32_t)owner_index != primary_index && ready[owner_index] &&
+	    next_lists(next, screens[owner_index].id)) {
+		*target = owner_index;
+		return COMP_SEGMENTS_HANDBACK_STAY;
+	}
+
+	// Else the ready screen the window covers most.
+	uint64_t best_area = 0;
+	for (uint32_t i = 0; i < screen_count; i++) {
+		if (i == primary_index || !ready[i] || !next_lists(next, screens[i].id)) {
+			continue;
+		}
+		uint64_t area = 0;
+		if (last != NULL) {
+			for (uint32_t k = 0; k < last->count && k < COMP_SEGMENTS_MAX; k++) {
+				if (last->seg[k].screen_id == screens[i].id) {
+					area += seg_area(&last->seg[k]);
+				}
+			}
+		}
+		if (*target < 0 || area > best_area) {
+			*target = (int)i;
+			best_area = area;
+		}
+	}
+	if (*target >= 0) {
+		return COMP_SEGMENTS_HANDBACK_MOVE;
+	}
+
+	// None: the window stays with its holder, whatever that is.
+	*target = owner_ok ? owner_index : -1;
+	return COMP_SEGMENTS_HANDBACK_NO_READY;
+}
+
+enum comp_segments_handback
+comp_segments_handback_decide(const struct comp_segments_screen *screens,
+                              uint32_t screen_count,
+                              uint32_t primary_index,
+                              int owner_index,
+                              const bool *ready,
+                              const struct comp_segment_table *last,
+                              const struct comp_segments_next_list *next,
+                              int *out_target)
+{
+	int target = -1;
+	const enum comp_segments_handback h =
+	    handback_decide(screens, screen_count, primary_index, owner_index, ready, last, next, &target);
+	if (out_target != NULL) {
+		*out_target = target;
+	}
+	return h;
+}
+
+const char *
+comp_segments_handback_str(enum comp_segments_handback h)
+{
+	switch (h) {
+	case COMP_SEGMENTS_HANDBACK_HOME: return "home";
+	case COMP_SEGMENTS_HANDBACK_STAY: return "stay";
+	case COMP_SEGMENTS_HANDBACK_MOVE: return "move";
+	case COMP_SEGMENTS_HANDBACK_NO_READY: return "no ready screen";
+	default: return "?";
+	}
+}
+
+enum comp_segments_away_pick
+comp_segments_away_decide(const struct comp_segments_away *away,
+                          const struct comp_segments_next_list *next,
+                          const bool *can_make,
+                          const bool *os_primary,
+                          int *out_index)
+{
+	if (out_index != NULL) {
+		*out_index = -1;
+	}
+	if (away == NULL || away->screen_id == 0 || next == NULL || can_make == NULL || next->default_id != 0) {
+		return COMP_SEGMENTS_AWAY_NONE;
+	}
+	const uint32_t n = next->count < COMP_SEGMENTS_MAX_SCREENS ? next->count : COMP_SEGMENTS_MAX_SCREENS;
+
+	// The panel back: the one screen its plug-in wins.
+	int won = -1;
+	uint32_t wins = 0;
+	if (away->home_plugin_id[0] != '\0') {
+		for (uint32_t k = 0; k < n; k++) {
+			if (can_make[k] && strncmp(next->plugin_ids[k], away->home_plugin_id, COMP_SEGMENTS_ID_MAX) == 0) {
+				won = (int)k;
+				wins++;
+			}
+		}
+	}
+	if (wins == 1) {
+		if (out_index != NULL) {
+			*out_index = won;
+		}
+		return COMP_SEGMENTS_AWAY_PANEL_BACK;
+	}
+
+	// The slot's screen is still there: it keeps the slot.
+	if (next_lists(next, away->screen_id)) {
+		return COMP_SEGMENTS_AWAY_NONE;
+	}
+
+	// It left too: where the OS puts the window, else the first that can take it.
+	int pick = -1;
+	for (uint32_t k = 0; k < n; k++) {
+		if (!can_make[k]) {
+			continue;
+		}
+		if (os_primary != NULL && os_primary[k]) {
+			pick = (int)k;
+			break;
+		}
+		if (pick < 0) {
+			pick = (int)k;
+		}
+	}
+	if (pick < 0) {
+		return COMP_SEGMENTS_AWAY_NONE;
+	}
+	if (out_index != NULL) {
+		*out_index = pick;
+	}
+	return COMP_SEGMENTS_AWAY_HOLDER_GONE;
+}
+
+void
+comp_segments_away_set(struct comp_segments_away *away,
+                       uint64_t screen_id,
+                       const char *plugin_id,
+                       uint64_t home_id,
+                       const char *home_plugin_id)
+{
+	if (away == NULL) {
+		return;
+	}
+	if (away->screen_id == 0) {
+		away->home_id = home_id;
+		(void)snprintf(away->home_plugin_id, COMP_SEGMENTS_ID_MAX, "%s",
+		               home_plugin_id != NULL ? home_plugin_id : "");
+	}
+	away->screen_id = screen_id;
+	(void)snprintf(away->plugin_id, COMP_SEGMENTS_ID_MAX, "%s", plugin_id != NULL ? plugin_id : "");
+}
+
 
 /*
  *

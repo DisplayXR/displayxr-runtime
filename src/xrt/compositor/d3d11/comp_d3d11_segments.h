@@ -67,6 +67,21 @@ void
 comp_d3d11_segments_destroy(struct comp_d3d11_segments **segs_ptr);
 
 /*!
+ * @ref comp_d3d11_segments_destroy before a rebuild on @p next, the list the
+ * next manager takes (ADR-047 Amendment 8, #2305). When the home is unplugged
+ * in @p next (its id gone and its plug-in winning no screen), the window goes
+ * to a screen of @p next whose DP is ready — it stays on the DP that holds it
+ * when that one qualifies — and that DP takes the session's primary slot; no
+ * DP is ever made for the departed screen (failing that, the window stays
+ * with its holder). The slot's new screen is written to
+ * comp_d3d11_segments_hwnd_hooks::away. Otherwise (the home listed,
+ * re-claimed or re-identified) the window goes back to the primary DP as in a
+ * teardown.
+ */
+void
+comp_d3d11_segments_destroy_for_rebuild(struct comp_d3d11_segments **segs_ptr, const struct xrt_screen_list *next);
+
+/*!
  * How the manager moves the session's window between DPs (ADR-047
  * Amendment 2). All callbacks run on the weave thread with the compositor's
  * weave lock held.
@@ -90,6 +105,19 @@ struct comp_d3d11_segments_hwnd_hooks
 	 * routes its own window's drag snap to it. Optional.
 	 */
 	void (*bracket)(void *userdata, bool begin, struct xrt_display_processor_d3d11 *hwnd_dp);
+	/*!
+	 * Optional, compositor-owned and kept across rebuilds (ADR-047 Amendment
+	 * 8, #2305): the screen whose DP sits in the session's primary slot
+	 * instead of the home screen's (screen_id 0 = the home's), with the
+	 * plug-ins. A hand-back with the home gone sets it; the first update of a
+	 * manager whose list has the home back moves that DP to its own screen's
+	 * slot as the window's holder, gives the home a windowless DP, and clears
+	 * it. While the home stays gone, a list in which its plug-in wins a
+	 * screen again (the panel under another id), or without the slot's
+	 * screen, gets a stand-in primary (comp_segments_away_decide), re-homed
+	 * the same way; the record then names the stand-in.
+	 */
+	struct comp_segments_away *away;
 };
 
 /*!
