@@ -1461,3 +1461,346 @@ TEST_CASE("comp_segments: a screen's own rate only on the chain's own adapter (#
 	CHECK_FALSE(other);
 	CHECK(comp_segments_gated_refresh_hz(165.0f, dgpu, dgpu, 60.0f, nullptr) == 165.0f);
 }
+
+/*
+ * #1575: a window that overhangs the panel is clipped to the panel before its
+ * atlas crosses the output-device split's bridge, instead of being refused.
+ */
+namespace {
+
+comp_segments_overhang_in
+overhang_in(comp_seg_rect window, uint32_t cols, uint32_t rows, uint32_t view_w, uint32_t view_h)
+{
+	comp_segments_overhang_in in{};
+	in.window = window;
+	in.canvas = {0, 0, window.w, window.h};
+	// The G16's 300 % panel left of the main display, and the bridge cap the
+	// 2026-10-26 log reports (`cross-adapter ring 3840x2160`).
+	in.panel = {-3840, 0, 3840, 2160};
+	in.cols = cols;
+	in.rows = rows;
+	in.view_w = view_w;
+	in.view_h = view_h;
+	in.max_w = 3840;
+	in.max_h = 2160;
+	return in;
+}
+
+// The clip keeps one scale: the tile rect maps back onto the DP canvas within
+// half a tile pixel at both edges (the rounding comp_segments_tile_rect does).
+void
+check_one_scale(const comp_segments_overhang_in &in, const comp_segments_overhang &o)
+{
+	const double sx = (double)in.canvas.w / (double)in.view_w;
+	const double sy = (double)in.canvas.h / (double)in.view_h;
+	CHECK(std::fabs(in.canvas.x + o.tile.x * sx - o.canvas.x) <= sx / 2 + 1e-9);
+	CHECK(std::fabs(in.canvas.y + o.tile.y * sy - o.canvas.y) <= sy / 2 + 1e-9);
+	CHECK(std::fabs(in.canvas.x + (o.tile.x + o.tile.w) * sx - (o.canvas.x + (double)o.canvas.w)) <= sx / 2 + 1e-9);
+	CHECK(std::fabs(in.canvas.y + (o.tile.y + o.tile.h) * sy - (o.canvas.y + (double)o.canvas.h)) <= sy / 2 + 1e-9);
+}
+
+} // namespace
+
+TEST_CASE("overhang: the 2026-10-26 start case is clipped to the panel, not refused (#1575)",
+          "[comp_segments][overhang]")
+{
+	// TargetDisplay moved a 1920x1080 Unity player from the 150 % main display
+	// onto the 300 % 3840x2160 panel; Windows doubled it to a 3848x2169 client
+	// at (-2873,597) (outer rect (-2891,512) 3884x2272, which the logged
+	// window-relative Kooima offset (0.0870,-0.0539) m agrees with). The
+	// renderer painted 2x1 tiles of 1924x1084: a 3848x1084 box on a 3840-wide
+	// bridge, refused every frame (`COPY EXTENT MISMATCH ... 3848x1084 ...
+	// destination is 3840x1084`).
+	const auto in = overhang_in({-2873, 597, 3848, 2169}, 2, 1, 1924, 1084);
+	comp_segments_overhang o{};
+	REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+
+	// It reaches past the panel's right edge (onto the main display) and its
+	// bottom edge (off every screen).
+	CHECK(o.over_left == 0);
+	CHECK(o.over_top == 0);
+	CHECK(o.over_right == 975);
+	CHECK(o.over_bottom == 606);
+
+	// The DP weaves the part on the panel, where it is in the window.
+	CHECK(o.canvas.x == 0);
+	CHECK(o.canvas.y == 0);
+	CHECK(o.canvas.w == 2873);
+	CHECK(o.canvas.h == 1563);
+
+	// Each tile keeps that part, at the same offset, unscaled.
+	CHECK(o.tile.x == 0);
+	CHECK(o.tile.y == 0);
+	CHECK(o.tile.w == 1437);
+	CHECK(o.tile.h == 781);
+	CHECK(o.box_w == 2874);
+	CHECK(o.box_h == 781);
+	CHECK(o.box_w <= in.max_w);
+	CHECK(o.box_h <= in.max_h);
+	check_one_scale(in, o);
+}
+
+TEST_CASE("overhang: a window inside the panel, or a box that fits, is carried whole (#1575)",
+          "[comp_segments][overhang]")
+{
+	comp_segments_overhang o{};
+	// The same player before the DPI move: 1920x1080 on the panel.
+	auto in = overhang_in({-2873, 597, 1920, 1080}, 2, 1, 960, 540);
+	CHECK(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_FITS);
+	CHECK(o.box_w == 0);
+
+	// A maximized window (3840x1949, the 10-26 run's later fit).
+	in = overhang_in({-3840, 0, 3840, 1949}, 2, 1, 1920, 974);
+	CHECK(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_FITS);
+
+	// A normal-size window dragged half off the panel: the box fits, so it
+	// crosses whole, exactly as before #1575.
+	in = overhang_in({-4800, 400, 1920, 1080}, 2, 1, 960, 540);
+	CHECK(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_FITS);
+
+	// Taller than the panel but narrow enough: 2x1 at half scale fits.
+	in = overhang_in({-3000, -100, 3000, 2400}, 2, 1, 1500, 1200);
+	CHECK(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_FITS);
+}
+
+TEST_CASE("overhang: each edge clips at its real offset (#1575)", "[comp_segments][overhang]")
+{
+	comp_segments_overhang o{};
+
+	SECTION("left")
+	{
+		// 3900 wide, 60 px past the panel's left edge: the kept part starts
+		// 60 window px (30 tile px) into the window.
+		const auto in = overhang_in({-3900, 80, 3900, 2000}, 2, 1, 1950, 1000);
+		REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+		CHECK(o.over_left == 60);
+		CHECK(o.over_right == 0);
+		CHECK(o.canvas.x == 60);
+		CHECK(o.canvas.w == 3840);
+		CHECK(o.tile.x == 30);
+		CHECK(o.tile.w == 1920);
+		CHECK(o.tile.y == 0);
+		CHECK(o.tile.h == 1000);
+		CHECK(o.box_w == 3840);
+		check_one_scale(in, o);
+	}
+	SECTION("right")
+	{
+		const auto in = overhang_in({-3840, 80, 3900, 2000}, 2, 1, 1950, 1000);
+		REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+		CHECK(o.over_left == 0);
+		CHECK(o.over_right == 60);
+		CHECK(o.canvas.x == 0);
+		CHECK(o.canvas.w == 3840);
+		CHECK(o.tile.x == 0);
+		CHECK(o.tile.w == 1920);
+		check_one_scale(in, o);
+	}
+	SECTION("top")
+	{
+		// 2D (1x1, full scale): 2300 tall on a 2160-tall panel.
+		const auto in = overhang_in({-3500, -140, 3000, 2300}, 1, 1, 3000, 2300);
+		REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+		CHECK(o.over_top == 140);
+		CHECK(o.over_bottom == 0);
+		CHECK(o.canvas.y == 140);
+		CHECK(o.canvas.h == 2160);
+		CHECK(o.tile.y == 140);
+		CHECK(o.tile.h == 2160);
+		CHECK(o.tile.x == 0);
+		CHECK(o.tile.w == 3000);
+		CHECK(o.box_w == 3000);
+		CHECK(o.box_h == 2160);
+		check_one_scale(in, o);
+	}
+	SECTION("bottom")
+	{
+		const auto in = overhang_in({-3500, 0, 3000, 2300}, 1, 1, 3000, 2300);
+		REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+		CHECK(o.over_top == 0);
+		CHECK(o.over_bottom == 140);
+		CHECK(o.canvas.y == 0);
+		CHECK(o.canvas.h == 2160);
+		CHECK(o.tile.y == 0);
+		CHECK(o.tile.h == 2160);
+		check_one_scale(in, o);
+	}
+	SECTION("all four")
+	{
+		// Larger than the panel both ways, centred on it.
+		const auto in = overhang_in({-3870, -20, 3900, 2200}, 2, 1, 1950, 1100);
+		REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+		CHECK(o.over_left == 30);
+		CHECK(o.over_right == 30);
+		CHECK(o.over_top == 20);
+		CHECK(o.over_bottom == 20);
+		CHECK(o.canvas.x == 30);
+		CHECK(o.canvas.y == 20);
+		CHECK(o.canvas.w == 3840);
+		CHECK(o.canvas.h == 2160);
+		CHECK(o.tile.x == 15);
+		CHECK(o.tile.y == 10);
+		CHECK(o.tile.w == 1920);
+		CHECK(o.tile.h == 1080);
+		check_one_scale(in, o);
+	}
+}
+
+TEST_CASE("overhang: a drag across the panel's left edge keeps the offset and fits every step (#1575)",
+          "[comp_segments][overhang]")
+{
+	// A window larger than the panel, dragged left until most of it is off
+	// the desktop. Every step: clipped, the kept part starts where the panel's
+	// left edge is in the window, ends at the window's or the panel's right
+	// edge, and the box always fits the bridge.
+	for (int32_t x = -3860; x >= -6000; x -= 7) {
+		CAPTURE(x);
+		const auto in = overhang_in({x, 100, 3900, 1900}, 2, 1, 1950, 950);
+		comp_segments_overhang o{};
+		REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+		const int32_t panel_x0 = -3840 - x; // the panel's left edge, window px
+		const int32_t panel_x1 = 0 - x;     // its right edge, window px
+		CHECK(o.over_left == (uint32_t)panel_x0);
+		CHECK(o.canvas.x == panel_x0);
+		const int32_t end = panel_x1 < 3900 ? panel_x1 : 3900;
+		CHECK(o.canvas.x + (int32_t)o.canvas.w == end);
+		CHECK(o.box_w <= in.max_w);
+		CHECK(o.box_h <= in.max_h);
+		CHECK(o.tile.x + o.tile.w <= in.view_w);
+		check_one_scale(in, o);
+	}
+}
+
+TEST_CASE("overhang: multi-view grids and odd sizes (#1575)", "[comp_segments][overhang]")
+{
+	comp_segments_overhang o{};
+
+	SECTION("2x2 tiles")
+	{
+		const auto in = overhang_in({-3870, -20, 3900, 2200}, 2, 2, 1950, 1100);
+		REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+		CHECK(o.tile.x == 15);
+		CHECK(o.tile.y == 10);
+		CHECK(o.tile.w == 1920);
+		CHECK(o.tile.h == 1080);
+		CHECK(o.box_w == 3840);
+		CHECK(o.box_h == 2160);
+		check_one_scale(in, o);
+	}
+	SECTION("4x1 tiles")
+	{
+		// Quarter-width views: 4 x 975 = 3900 > 3840.
+		const auto in = overhang_in({-3900, 0, 3900, 2000}, 4, 1, 975, 2000);
+		REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+		CHECK(o.tile.x == 15);
+		CHECK(o.tile.w == 960);
+		CHECK(o.box_w == 3840);
+		check_one_scale(in, o);
+	}
+	SECTION("odd window, floor-sized tiles")
+	{
+		// 3847x2169 -> 1923x1084 tiles (the renderer floors), 3 px past the
+		// left edge and 5 px above the top.
+		const auto in = overhang_in({-3843, -5, 3847, 2169}, 2, 1, 1923, 1084);
+		REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+		CHECK(o.canvas.x == 3);
+		CHECK(o.canvas.y == 5);
+		CHECK(o.canvas.w == 3840);
+		CHECK(o.canvas.h == 2160);
+		CHECK(o.tile.x == 1);
+		CHECK(o.tile.y == 2);
+		CHECK(o.tile.w == 1920);
+		CHECK(o.tile.h == 1080);
+		CHECK(o.box_w <= in.max_w);
+		check_one_scale(in, o);
+	}
+	SECTION("tiles not at the panel's scale are capped, and the canvas follows")
+	{
+		// Full-window tiles side by side (8000 wide): the kept 3840 px of each
+		// is still twice the bridge's share. The tile is capped at 1920 from
+		// its real start, and the DP canvas shrinks to the same 1920 px.
+		const auto in = overhang_in({-3920, 0, 4000, 1000}, 2, 1, 4000, 1000);
+		REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+		CHECK(o.tile.x == 80);
+		CHECK(o.tile.w == 1920);
+		CHECK(o.canvas.x == 80);
+		CHECK(o.canvas.w == 1920);
+		CHECK(o.box_w == 3840);
+		check_one_scale(in, o);
+	}
+	SECTION("a canvas inside the window")
+	{
+		// An output rect: the atlas maps onto (200,100) 3900x1800 of a
+		// 4200-wide window; the canvas's right 60 px are past the panel.
+		auto in = overhang_in({-4040, 0, 4200, 2000}, 2, 1, 1950, 900);
+		in.canvas = {200, 100, 3900, 1800};
+		REQUIRE(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_CLIPPED);
+		CHECK(o.over_left == 0);
+		CHECK(o.over_right == 60);
+		CHECK(o.canvas.x == 200);
+		CHECK(o.canvas.y == 100);
+		CHECK(o.canvas.w == 3840);
+		CHECK(o.canvas.h == 1800);
+		CHECK(o.tile.x == 0);
+		CHECK(o.tile.w == 1920);
+		check_one_scale(in, o);
+	}
+}
+
+TEST_CASE("overhang: what is not clipped (#1575)", "[comp_segments][overhang]")
+{
+	comp_segments_overhang o{};
+
+	// Too big and wholly off the panel: nothing of it reaches the panel.
+	auto in = overhang_in({100, 0, 3900, 1000}, 2, 1, 1950, 500);
+	CHECK(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_OFF_PANEL);
+	CHECK(o.over_right == 3900);
+	CHECK(o.box_w == 0);
+
+	// Too big but wholly on the panel: tiles larger than the panel's own
+	// (#1603's 1x2 box of full-panel tiles). Clipping to the panel cannot
+	// cure that; the caller keeps its refusal.
+	in = overhang_in({-2880, 0, 1920, 2160}, 1, 2, 1920, 2160);
+	CHECK(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_ON_PANEL);
+	CHECK(o.box_w == 0);
+
+	// Degenerate inputs.
+	in = overhang_in({-2873, 597, 3848, 2169}, 0, 1, 1924, 1084);
+	CHECK(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_NO_INPUT);
+	in = overhang_in({-2873, 597, 3848, 2169}, 2, 1, 1924, 1084);
+	in.panel.w = 0;
+	CHECK(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_NO_INPUT);
+	in = overhang_in({-2873, 597, 3848, 2169}, 2, 1, 1924, 1084);
+	in.max_w = 0;
+	CHECK(comp_segments_overhang_clip(&in, &o) == COMP_SEG_OVERHANG_NO_INPUT);
+	CHECK(comp_segments_overhang_clip(nullptr, &o) == COMP_SEG_OVERHANG_NO_INPUT);
+	CHECK(comp_segments_overhang_clip(&in, nullptr) == COMP_SEG_OVERHANG_NO_INPUT);
+}
+
+TEST_CASE("tile rects: a segment that starts outside the canvas maps the part inside it (#1575)",
+          "[comp_segments][overhang]")
+{
+	// The weave cuts segments from the LIVE window, while a clipped slot's
+	// canvas is the part on the panel when the frame was submitted. During a
+	// drag the panel's live segment can start a few px before it.
+	const comp_seg_rect canvas = {60, 0, 3840, 2000}; // the clipped slot, window px
+	const comp_seg_rect live = {55, 0, 3845, 2000};   // the panel's segment now
+	comp_seg_rect t;
+	REQUIRE(comp_segments_tile_rect(&live, &canvas, 1920, 1000, &t));
+	CHECK(t.x == 0);
+	CHECK(t.y == 0);
+	CHECK(t.w == 1920);
+	CHECK(t.h == 1000);
+
+	// Above the canvas too.
+	const comp_seg_rect above = {60, -8, 1920, 508};
+	REQUIRE(comp_segments_tile_rect(&above, &canvas, 1920, 1000, &t));
+	CHECK(t.y == 0);
+	CHECK(t.h == 250);
+	CHECK(t.x == 0);
+	CHECK(t.w == 960);
+
+	// A segment beside the clipped canvas (another screen's) has no part in it.
+	const comp_seg_rect beside = {3900, 0, 975, 1003};
+	CHECK_FALSE(comp_segments_tile_rect(&beside, &canvas, 1920, 1000, &t));
+}
