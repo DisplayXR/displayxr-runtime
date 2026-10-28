@@ -424,7 +424,8 @@ fold_path(uint64_t h, const char *dir, const char *name)
 
 /*!
  * One hash per class over what that class reads from the per-user dir:
- * `preferred` (display), `input-preferred` + `emulated_controllers` + every per-app
+ * `preferred` (display), `input-preferred` + `emulated_controllers` +
+ * `controller_switching` + every per-app
  * `input-preferred-<exe>` pin (input), every manifest by its
  * suffix (the manifest's `enabled` is the POSIX Enabled switch). A file's
  * absence is folded too, and a manifest added or removed changes its
@@ -451,6 +452,8 @@ fingerprint_now(uint64_t out[WATCH_CLASSES])
 	// writes; the Windows twin lives under the InputProviders root the
 	// registry watch already covers.
 	out[TARGET_COMPONENT_CLASS_INPUT] = fold_path(out[TARGET_COMPONENT_CLASS_INPUT], dir, "emulated_controllers");
+	// ADR-034 Amendment 6: `input switching use|presence` (ControllerSwitching).
+	out[TARGET_COMPONENT_CLASS_INPUT] = fold_path(out[TARGET_COMPONENT_CLASS_INPUT], dir, "controller_switching");
 
 	DIR *d = opendir(dir);
 	if (d == NULL) {

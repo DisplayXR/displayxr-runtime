@@ -52,6 +52,20 @@
  * that exists (@ref t_input_arbiter_set_floor_withdrawn), the way `Enabled`
  * withdraws a provider; it never adds or removes devices.
  *
+ * ADR-034 Amendment 6 makes the CONTROLLER walk follow use: among the present
+ * candidates for a hand, the most recently ENGAGED one wins
+ * (@ref xrt_input_plugin_iface::get_engaged_ns for a provider, the last
+ * keyboard / mouse input aimed at an emulated controller for the qwerty
+ * floor), ties keeping rank order. The floor is the DEFAULT holder (never
+ * touched still beats a provider that has not been engaged since it became
+ * present, which holds a hand only when nothing else is eligible), and a
+ * provider without the slot counts as engaged continuously while present (so
+ * it behaves exactly as before). Presence still gates; a pin, an app request,
+ * `Policy\Lock`'s machine default and `PreferredPlugin` stay hard choices for
+ * the clients they apply to; `ControllerSwitching` = presence restores the
+ * pure rank walk. Engagement is read on the presence poll thread, only while
+ * some client is resolving roles; a change of who leads bumps the state epoch.
+ *
  * That reuses the role-change path Monado already has end to end: the
  * OpenXR state tracker re-reads the roles in `xrSyncActions`, rebinds
  * actions and queues `XrEventDataInteractionProfileChanged` when the
@@ -172,6 +186,20 @@ t_input_arbiter_note_provider_gamepad(struct xrt_device *const *devs, uint32_t c
  */
 void
 t_input_arbiter_note_qwerty_pair(struct xrt_device *left, struct xrt_device *right);
+
+/*!
+ * ADR-034 Amendment 6: how the arbiter reads the emulated floor's engagement —
+ * the last time the user drove the qwerty controller @p xdev (os_monotonic_get_ns
+ * clock, 0 = never; `qwerty_controller_last_input_ns`). Called by the qwerty
+ * builder after @ref t_input_arbiter_note_qwerty_pair; wiped by
+ * @ref t_input_arbiter_reset. NULL (or never set) = the floor is never engaged,
+ * so it holds a hand only by rank, as before the amendment. Called from the
+ * presence poll thread only while a client resolves roles; must be lock-free.
+ */
+typedef int64_t (*t_input_arbiter_engaged_fn)(struct xrt_device *xdev);
+
+void
+t_input_arbiter_set_floor_engagement(t_input_arbiter_engaged_fn fn);
 
 /*!
  * N7: was a qwerty pair noted for this build — i.e. does a hand-role floor
@@ -327,6 +355,8 @@ struct t_input_arbiter_policy
 	const char *(*row_id_for)(const struct xrt_input_plugin_iface *iface, struct xrt_input_plugin_instance *inst);
 	//! This process's executable basename (the implicit client's per-app key).
 	bool (*self_exe_basename)(char *out, size_t cap);
+	//! ADR-034 Am.6 `ControllerSwitching`: true = `use` (the default; NULL slot = use), false = `presence`.
+	bool (*get_controller_switching)(void);
 };
 
 /*!

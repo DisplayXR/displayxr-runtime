@@ -61,6 +61,7 @@
 #include <stddef.h>
 
 #include "util/u_logging.h"
+#include "os/os_time.h"
 
 #include "sim_input_interface.h"
 #include "sim_input_settings.h"
@@ -98,6 +99,33 @@ sim_input_plugin_probe(struct xrt_input_plugin_instance **out_inst)
 	return XRT_SUCCESS;
 }
 
+/*!
+ * ADR-034 Amendment 6: the scripted engagement (`ENGAGE_MS`). 0 = off — the
+ * slot stays NULL and sim-input is "engaged continuously while present", the
+ * pre-amendment behaviour every existing run relies on. n > 0: every n ms an
+ * active hand makes one deliberate use, so the controller role follows it /
+ * the keyboard like a real engagement-reporting provider (the in-tree reference
+ * for `get_engaged_ns`).
+ */
+static int64_t g_engage_period_ns = 0;
+static int64_t g_engage_epoch_ns = 0;
+static bool g_engage_hand[2] = {false, false};
+
+static int64_t
+sim_input_plugin_get_engaged_ns(struct xrt_input_plugin_instance *inst, uint32_t hand)
+{
+	(void)inst;
+	if (hand > XRT_INPUT_PLUGIN_HAND_RIGHT || !g_engage_hand[hand] || g_engage_period_ns <= 0) {
+		return 0;
+	}
+	/* The latest scripted engage instant: lock-free arithmetic, no I/O. */
+	const int64_t since = (int64_t)os_monotonic_get_ns() - g_engage_epoch_ns;
+	if (since < g_engage_period_ns) {
+		return 0;
+	}
+	return g_engage_epoch_ns + (since / g_engage_period_ns) * g_engage_period_ns;
+}
+
 /*! The host iface (process-lifetime runtime storage, §4b.6); set at negotiate. */
 static const struct xrt_input_plugin_host_iface *g_host = NULL;
 
@@ -127,6 +155,8 @@ sim_input_display_geometry(float *out_viewer_y_m, float *out_viewer_z_m)
 	*out_viewer_z_m = geo.nominal_viewer_z_m;
 	return geo.display_height_m;
 }
+
+static struct xrt_input_plugin_iface g_sim_input_iface;
 
 static xrt_result_t
 sim_input_plugin_create_devices(struct xrt_input_plugin_instance *inst,
@@ -211,6 +241,18 @@ sim_input_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
+	/* Amendment 6: arm the scripted engagement before the arbiter installs
+	 * (it reads the slot only after create_devices). */
+	g_engage_period_ns = sim_input_setting_ms("ENGAGE_MS") * 1000LL * 1000LL;
+	g_engage_epoch_ns = (int64_t)os_monotonic_get_ns();
+	g_engage_hand[0] = lcfg.active;
+	g_engage_hand[1] = rcfg.active;
+	g_sim_input_iface.get_engaged_ns = g_engage_period_ns > 0 ? sim_input_plugin_get_engaged_ns : NULL;
+	if (g_engage_period_ns > 0) {
+		U_LOG_W("sim-input: ENGAGE_MS=%lld — each active hand engages every %lld ms (ADR-034 Amendment 6).",
+		        (long long)(g_engage_period_ns / 1000000), (long long)(g_engage_period_ns / 1000000));
+	}
+
 	out_devices[0] = left;
 	out_devices[1] = right;
 	if (navdev != NULL) {
@@ -263,6 +305,9 @@ static struct xrt_input_plugin_iface g_sim_input_iface = {
 
     /* N3c: what `displayxr-cli input options sim-input` lists. */
     .describe_settings = sim_input_describe_settings,
+
+    /* ADR-034 Amendment 6: filled by create_devices when ENGAGE_MS > 0. */
+    .get_engaged_ns = NULL,
 };
 
 

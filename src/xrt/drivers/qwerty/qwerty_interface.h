@@ -216,6 +216,22 @@ qwerty_create_devices_ex(enum u_logging_level log_level,
                          struct xrt_device **out_right);
 
 /*!
+ * ADR-034 Amendment 6: when did the user last drive this emulated controller?
+ *
+ * The latest of its button / thumbstick / trackpad edges and the movement /
+ * look keys and mouse deltas aimed at it (Ctrl / Alt focus, or the default
+ * controller), on the os_monotonic_get_ns clock; 0 = never, or @p xd is not a
+ * qwerty controller (the qwerty HMD's own WASD / mouse-look is navigation, not
+ * controller use, and never counts). The role arbiter reads it as the
+ * emulated floor's engagement, so the hand roles return to the keyboard the
+ * moment the user reaches for it. Lock-free; any thread.
+ *
+ * @ingroup drv_qwerty
+ */
+int64_t
+qwerty_controller_last_input_ns(struct xrt_device *xd);
+
+/*!
  * Get the current qwerty HMD pose without side effects.
  *
  * Finds the qwerty HMD in @p xdevs and returns its current internal

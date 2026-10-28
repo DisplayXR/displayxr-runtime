@@ -92,6 +92,14 @@ xrtInputPluginNegotiate(uint32_t runtime_api_version,
     `bindings.json` — e.g. `…/khr/simple_controller` — reusing the same
     mechanism as `qwerty_device.c` / `sim_input_device.c`).
   - `destroy(inst)`.
+  - Appended optional slots (ADR-020, `struct_size`-gated, guarded by
+    `XRT_INPUT_PLUGIN_IFACE_HAS`): `get_presence(inst)` (§4),
+    `describe_settings` (§3 *Component settings*) and
+    `get_engaged_ns(inst, hand)` (ADR-034 *Amendment 6*, §4 item 2b) —
+    `int64_t`, the `os_monotonic_get_ns` time of that hand's last
+    **deliberate** use (0 = left, 1 = right; 0 = never), announced by
+    `XRT_INPUT_PLUGIN_IFACE_HAS_GET_ENGAGED_NS`. NULL = engaged
+    continuously while present (the pre-amendment behaviour).
 - The DLL handle is intentionally leaked (same lifetime rule and rationale
   as the DP loader: one process, one provider, process lifetime).
 
@@ -326,6 +334,16 @@ resolved roles are cached and recomputed only when the arbiter's state epoch
 moved; never on the presence poll thread (#958). The IPC server answers
 `system_devices_get_roles` per connection.
 
+**Engagement (ADR-034 Amendment 6, 2026-10-29).** For the **controller**
+family, the default walk is "most recently engaged present candidate", not
+"highest-ranked present candidate" (§4 item 2b) — but only for a client with
+**no** controller preference: a per-app pin, a session request or a
+`PreferredPlugin` naming a controller provider (with `Policy\Lock` shaping
+which of them is visible, as above) is a hard choice and turns the switching
+off for that client. `ControllerSwitching = presence` (§4 item 3c) turns it
+off everywhere. Engagement is one global reading (one user); the resolution
+stays per client.
+
 ### Lifetime — the provider is per-process, its devices are per-instance
 
 A provider is loaded, negotiated and probed **once per process** and then
@@ -391,6 +409,41 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    qwerty holds them. Qwerty always registers as a device, so the roles
    can come back to it — unless the `EmulatedControllers` gate (3b) is 0,
    in which case there is no qwerty pair and "otherwise" means **no role**.
+2b. **Engagement — the controller role follows use (ADR-034 Amendment 6).**
+   With `ControllerSwitching = use` (the default, item 3c) and no
+   controller preference for the client (§3 *Per-client selection*), each
+   hand's controller role goes to the **most recently engaged** present
+   candidate instead of the highest-ranked one; ties keep the rank order.
+   **The keyboard is the default holder:** a provider that implements the
+   slot but has not engaged that hand since its latest return to `PRESENT`
+   does not hold it while any other eligible candidate exists (the floor, or
+   an engaged / slot-less present provider); it holds by rank only when it
+   is the only candidate (`EmulatedControllers = 0`). An app therefore starts
+   on the emulated controllers and the first pinch moves the hand to the
+   provider. Engagement per candidate and hand:
+   - a provider implementing `get_engaged_ns` — its last deliberate use
+     (camera hands: a pinch; a controller: a button / trigger / stick edge;
+     never mere visibility);
+   - a provider **without** the slot — engaged continuously while present,
+     so it keeps the role exactly as before (and beats a slot provider that
+     is merely present);
+   - the qwerty floor — the last keyboard / mouse input aimed at that
+     emulated controller, and never touched counts as the default holder
+     (above a dormant slot provider, below any engaged candidate) (`qwerty_controller_last_input_ns`, installed with
+     `t_input_arbiter_set_floor_engagement`); the qwerty head's WASD /
+     mouse-look is navigation and does not count.
+   An engagement older than the candidate's latest return to `PRESENT` does
+   not count, so a provider coming back does not reclaim on a stale pinch;
+   the leader refreshing its own engagement moves nothing. The presence
+   poll thread (never a client thread, #958) reads engagement at its
+   ~250 ms rate for **every** present candidate with the slot — holder or
+   not — but **only while a client resolved roles within the last second**:
+   a provider may treat the calls as demand (keep its camera open) and idle
+   when they stop. A change of who engagement puts first bumps the state
+   epoch, so cached per-client roles recompute and `generation_id` moves.
+   The masquerade above still applies, so a provider ↔ qwerty swap by
+   engagement emits no `XrEventDataInteractionProfileChanged`. The hand-
+   tracking, gamepad and rig roles are unaffected.
 2a. `t_input_arbiter_install()` then replaces
    `xrt_system_devices::get_roles` with the arbiter's, which re-reads
    presence (rate-limited to ~250 ms) and bumps `generation_id` whenever
@@ -443,6 +496,24 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    the log. The CTS lane relies on the pair being there (3a):
    `scripts/run_cts.ps1` asserts the gate is absent or 1 before a run and
    never writes it.
+3c. **`ControllerSwitching`** (ADR-034 Amendment 6) — class policy next to
+   `EmulatedControllers`, same read path and overlay rules:
+
+   | Platform | Where | Values |
+   |---|---|---|
+   | Windows | `InputProviders\Policy\ControllerSwitching` (DWORD), HKCU then HKLM 64-bit view, HKCU hidden under `Policy\Lock` = 1 | `1` = `use` (default), `0` = `presence` |
+   | POSIX | `controller_switching` file in the per-user manifest dir | `use` (default) or `presence` (a leading `0` also = presence) |
+   | Android | — | always `use` |
+
+   Absent = `use`. `presence` is exactly the pre-amendment walk (item 2).
+   Read through the loader (`target_input_plugin_get_controller_switching()`,
+   value + source `user|machine|file|default`), never `getenv`. CLI:
+   `displayxr-cli input switching use|presence [--machine]` (POSIX refuses
+   `--machine`); `input list --json` carries `controller_switching:
+   {value, source}`. **Live:** the service's component-policy watch covers it
+   (the Windows watch covers the `Policy` root; POSIX folds the file into the
+   input fingerprint) and the arbiter applies it at the next resolve; an
+   in-process app reads it at its next launch.
 3a. **`DXR_INPUT_PROVIDERS=0`** (process environment, all platforms) does the
    same thing for **one process**: the lazy discovery pass in
    `target_input_plugin_get_iface()` is skipped entirely, no provider DLL is
@@ -494,7 +565,10 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    displaces the qwerty fallback with phantom controllers. The pre-N3c
    `DXR_SIM_INPUT=1` keeps working for one release as an alias (deprecation
    WARN). Environment caveat unchanged: set a variable process-level — the
-   runtime DLL has its own static-CRT environment block.
+   runtime DLL has its own static-CRT environment block. Its `ENGAGE_MS`
+   setting (default 0) is the in-tree reference for `get_engaged_ns`
+   (item 2b): with n > 0 each active hand engages every n ms; at 0 the slot
+   stays NULL and sim-input is engaged continuously while present.
 
 ## 4a. Pose anchoring — provider volumes are rig-relative
 

@@ -199,6 +199,21 @@ its fallback, losing bindings. A middle path: suppress the event only when the
 old and new profile are identical (already implied by the change-only event
 fix), and make the *uniform profile* an opt-in per provider pairing.
 
+### D. The controller role follows the engaged device — **SHIPPED 2026-10-29**
+
+Presence-ranking (A) is the wrong axis for a provider that is present whenever
+a sensor exists: camera hand tracking publishing `khr/simple_controller`
+devices held the controllers permanently, and the keyboard never got them
+back. ADR-034 *Amendment 6* adds an engagement reading next to presence —
+`get_engaged_ns` (a pinch, not visibility), the qwerty floor's last input
+aimed at an emulated controller — and the controller walk picks the most
+recently engaged present candidate (the keyboard by default — a provider that
+has not been engaged yet holds only when nothing else can; rank on ties; providers without the slot
+count as always engaged, so nothing changes for them). Pins and
+`PreferredPlugin` stay hard choices; `ControllerSwitching = presence`
+restores A exactly. The masquerade below keeps the swap event-free. Spec:
+[input-provider-discovery §4 item 2b](../specs/runtime/input-provider-discovery.md#4-role-arbitration-builder-contract).
+
 ### Hot-swap must not stall the client (the load-bearing requirement)
 
 Whatever the arbitration, the transition has to be a **role/profile change the
@@ -234,7 +249,7 @@ reproduction before any fix.
 
 ## Related
 
-- ADR-034 (+ Amendments 1 & 2) · `docs/specs/runtime/input-provider-discovery.md`
+- ADR-034 (+ Amendments 1–6) · `docs/specs/runtime/input-provider-discovery.md`
 - #823 provider channel · #825 hand tracking Tier-2 · #941 idle watchdog
 - Preceding fixes this session: rig-relative composition; unplug-while-idle
   presence (both on `fix/rig-relative-input-poses`).

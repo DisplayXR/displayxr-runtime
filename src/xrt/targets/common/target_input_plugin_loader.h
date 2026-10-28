@@ -241,6 +241,28 @@ bool
 target_input_plugin_get_emulated_controllers(const char **out_source);
 
 /*!
+ * ADR-034 Amendment 6: the `ControllerSwitching` class policy — do the
+ * controller roles follow the ENGAGED device? True (`use`, the default,
+ * absent = use): among the present candidates for a hand, the one the user
+ * most recently used deliberately holds it (a provider's `get_engaged_ns`, the
+ * last keyboard / mouse input aimed at an emulated controller). False
+ * (`presence`): exactly the pre-Amendment-6 walk — the highest-ranked present
+ * candidate. A pin, an app request and `PreferredPlugin` override it either way.
+ *
+ * Windows: `InputProviders\Policy\ControllerSwitching` (DWORD, 1 = use,
+ * 0 = presence), HKCU first (`displayxr-cli input switching use|presence`),
+ * then the HKLM 64-bit view (`--machine`), HKCU ignored under
+ * `InputProviders\Policy\Lock` = 1 — the EmulatedControllers read. POSIX: a
+ * `controller_switching` file in the per-user manifest dir (`presence` or a
+ * leading '0' = presence, anything else = use); no machine tier. Android:
+ * always use. @p out_source as for @ref target_input_plugin_get_emulated_controllers.
+ * Read here, never via `getenv`. The service applies a change live through
+ * its component-policy watch (@ref target_input_plugin_reread_policy).
+ */
+bool
+target_input_plugin_get_controller_switching(const char **out_source);
+
+/*!
  * Read the `PreferredPlugin` override (N3a, ADR-054 verb `prefer`; the
  * input twin of DP spec §2.1/§3.3): the id of the provider ranked FIRST,
  * ahead of ProbeOrder, for the hand/rig arbitration. Windows: HKCU

@@ -37,6 +37,15 @@
  *                                       qwerty left/right pair; the hand roles
  *                                       stay unassigned when no provider holds
  *                                       them. The qwerty head is not affected.
+ *   input switching use|presence [--machine]
+ *                                       `ControllerSwitching` (ADR-034 Amendment 6):
+ *                                       `InputProviders\Policy\ControllerSwitching`
+ *                                       DWORD 1|0, HKCU by default, HKLM with
+ *                                       --machine (POSIX: the per-user
+ *                                       `controller_switching` file). use = the
+ *                                       controller roles follow the device the user
+ *                                       last engaged; presence = highest-ranked
+ *                                       present provider only (pre-Amendment-6).
  *   input options <id> [--json]         The provider's settings: declared + stored,
  *                                       with value and source (N3c).
  *   input set <id> <KEY> <value> [--machine] / input unset <id> <KEY> [--machine]
@@ -174,6 +183,8 @@ cmd_list(int argc, const char **argv)
 	bool force_qwerty = target_input_plugin_get_force_qwerty();
 	const char *emulated_source = "default";
 	const bool emulated = target_input_plugin_get_emulated_controllers(&emulated_source);
+	const char *switching_source = "default";
+	const bool switching_use = target_input_plugin_get_controller_switching(&switching_source);
 	char preferred[64] = {0};
 	const bool have_pref = target_input_plugin_get_preferred(preferred, sizeof(preferred));
 	int active = cli_input_predict_active(list, n, have_pref ? preferred : NULL);
@@ -185,6 +196,10 @@ cmd_list(int argc, const char **argv)
 		cJSON *em = cJSON_AddObjectToObject(root, "emulated_controllers");
 		cJSON_AddNumberToObject(em, "value", emulated ? 1 : 0);
 		cJSON_AddStringToObject(em, "source", emulated_source);
+		// ADR-034 Am.6: ControllerSwitching as {value, source}, the same shape.
+		cJSON *sw = cJSON_AddObjectToObject(root, "controller_switching");
+		cJSON_AddStringToObject(sw, "value", switching_use ? "use" : "presence");
+		cJSON_AddStringToObject(sw, "source", switching_source);
 		if (have_pref) {
 			cJSON_AddStringToObject(root, "preferred", preferred);
 		} else {
@@ -273,6 +288,8 @@ cmd_list(int argc, const char **argv)
 	}
 	P("\tEmulated controllers: %s (%s)%s\n", emulated ? "on" : "off", emulated_source,
 	  emulated ? "" : " — no qwerty left/right pair; hand roles unassigned when no provider holds them");
+	P("\tController switching: %s (%s)%s\n", switching_use ? "use" : "presence", switching_source,
+	  switching_use ? " — the controller roles follow the device last engaged" : "");
 	if (n == 0) {
 		P("\t(none — discovery root absent or empty; %s)\n",
 		  emulated ? "qwerty keeps the hand roles" : "the hand roles stay unassigned");
@@ -433,6 +450,13 @@ store_set_emulated(bool on, bool machine)
 	return reg_set_dword(machine, "Policy", "EmulatedControllers", on ? 1u : 0u);
 }
 
+//! Amendment 6: `InputProviders\Policy\ControllerSwitching` (1 = use, 0 = presence).
+static enum store_write
+store_set_switching(bool use, bool machine)
+{
+	return reg_set_dword(machine, "Policy", "ControllerSwitching", use ? 1u : 0u);
+}
+
 #else /* POSIX / Android */
 
 static enum store_write
@@ -559,6 +583,47 @@ store_set_emulated(bool on, bool machine)
 		return errno == EACCES ? STORE_WRITE_DENIED : STORE_WRITE_FAILED;
 	}
 	fprintf(f, "%s\n", on ? "1" : "0");
+	fclose(f);
+	return STORE_WRITE_OK;
+}
+
+//! Amendment 6: `<per-user dir>/controller_switching` — the word `use` or `presence`.
+static bool
+switching_file_path(char *out, size_t cap, bool create_dir)
+{
+	char dir[512];
+#ifdef XRT_OS_ANDROID
+	(void)dir;
+	(void)create_dir;
+	out[0] = '\0';
+	return false; // no per-user store on Android; always `use`
+#else
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return false;
+	}
+	if (create_dir) {
+		user_dir_mkdir_p(dir);
+	}
+	snprintf(out, cap, "%s/controller_switching", dir);
+	return true;
+#endif
+}
+
+static enum store_write
+store_set_switching(bool use, bool machine)
+{
+	if (machine) {
+		return STORE_WRITE_UNSUPPORTED;
+	}
+	char path[600];
+	if (!switching_file_path(path, sizeof(path), true)) {
+		return STORE_WRITE_UNSUPPORTED;
+	}
+	FILE *f = fopen(path, "wb");
+	if (f == NULL) {
+		return errno == EACCES ? STORE_WRITE_DENIED : STORE_WRITE_FAILED;
+	}
+	fprintf(f, "%s\n", use ? "use" : "presence");
 	fclose(f);
 	return STORE_WRITE_OK;
 }
@@ -859,6 +924,52 @@ cmd_emulated(const char *arg, bool machine)
 	return 0;
 }
 
+/*!
+ * `input switching use|presence [--machine]` — `ControllerSwitching` (ADR-034
+ * Amendment 6). Same store rules as `input emulated`. A running service applies
+ * it live (the component-policy watch re-reads the class policy).
+ */
+static int
+cmd_switching(const char *arg, bool machine)
+{
+	bool use;
+	if (arg != NULL && strcmp(arg, "use") == 0) {
+		use = true;
+	} else if (arg != NULL && strcmp(arg, "presence") == 0) {
+		use = false;
+	} else {
+		P("error: 'input switching' takes use|presence.\n\n");
+		return -1;
+	}
+	const int rc = write_result(store_set_switching(use, machine),
+	                            machine ? "writing the machine-wide ControllerSwitching value"
+	                                    : "writing the per-user ControllerSwitching value",
+	                            machine);
+	if (rc != 0) {
+		return rc;
+	}
+#ifdef XRT_OS_WINDOWS
+	P("Controller switching: %s %s.\n", use ? "use" : "presence",
+	  machine ? "machine-wide (HKLM)" : "for this user (HKCU)");
+	if (machine) {
+		P("note: a per-user (HKCU) ControllerSwitching value still wins for that user (unless "
+		  "InputProviders\\Policy\\Lock = 1).\n");
+	}
+#else
+	char path[600] = {0};
+	(void)switching_file_path(path, sizeof(path), false);
+	P("Controller switching: %s (%s).\n", use ? "use" : "presence", path);
+#endif
+	if (use) {
+		P("The controller roles follow the device the user last engaged (a pinch, a key aimed at an\n");
+		P("emulated controller), among the present ones. Pins, app requests and PreferredPlugin still win.\n");
+	} else {
+		P("The controller roles go to the highest-ranked present provider, keyboard as the floor.\n");
+	}
+	note_pickup(NULL);
+	return 0;
+}
+
 
 /*
  *
@@ -969,7 +1080,7 @@ cmd_haptic_test(int argc, const char **argv)
 static int
 print_usage(void)
 {
-	P("Usage: displayxr-cli input <list|enable|disable|use|reset|emulated|haptic-test>\n");
+	P("Usage: displayxr-cli input <list|enable|disable|use|reset|emulated|switching|haptic-test>\n");
 	P("  list [--json]                Registered input providers: ProbeOrder, Enabled (+ source),\n");
 	P("                               the PreferredPlugin override, and the one ranked first ('*').\n");
 	P("  enable | disable <id> [--machine]\n");
@@ -985,6 +1096,9 @@ print_usage(void)
 	P("                               EmulatedControllers gate: off = no qwerty left/right pair, hand\n");
 	P("                               roles unassigned when no provider holds them (per user; --machine\n");
 	P("                               = HKLM). The qwerty head (look-around) stays either way.\n");
+	P("  switching use | presence [--machine]\n");
+	P("                               ControllerSwitching: use (default) = the controller roles follow the\n");
+	P("                               device last engaged; presence = highest-ranked present provider.\n");
 	cli_component_options_usage(&(const struct cli_component_class){
 	    .verb = "input", .noun = "input provider", .cls = target_input_plugin_component_class()});
 	P("  haptic-test [seconds]        Headless: fire vibrations on the hand-role devices (default 5 s).\n");
@@ -1033,6 +1147,10 @@ cli_cmd_input(int argc, const char **argv)
 	}
 	if (strcmp(verb, "emulated") == 0) {
 		const int rc = cmd_emulated(argc >= 4 ? argv[3] : NULL, machine);
+		return rc < 0 ? print_usage() : rc;
+	}
+	if (strcmp(verb, "switching") == 0) {
+		const int rc = cmd_switching(argc >= 4 ? argv[3] : NULL, machine);
 		return rc < 0 ? print_usage() : rc;
 	}
 	if (strcmp(verb, "haptic-test") == 0) {
