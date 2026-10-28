@@ -980,33 +980,45 @@ qwerty_system_destroy(struct qwerty_system *qs)
 	free(qs);
 }
 
+/*!
+ * ADR-034 Amendment 6: stamp "this device just received user input" for the
+ * role arbiter's engagement walk. A single aligned 64-bit store, read by the
+ * arbiter's presence poll thread only for recency, so a racing read costs at
+ * most one poll tick of staleness.
+ */
+static inline void
+qwerty_note_input(struct qwerty_device *qd)
+{
+	qd->last_input_ns = os_monotonic_get_ns();
+}
+
 // Device methods
 
 // clang-format off
-void qwerty_press_left(struct qwerty_device *qd) { qd->left_pressed = true; }
+void qwerty_press_left(struct qwerty_device *qd) { qd->left_pressed = true; qwerty_note_input(qd); }
 void qwerty_release_left(struct qwerty_device *qd) { qd->left_pressed = false; }
-void qwerty_press_right(struct qwerty_device *qd) { qd->right_pressed = true; }
+void qwerty_press_right(struct qwerty_device *qd) { qd->right_pressed = true; qwerty_note_input(qd); }
 void qwerty_release_right(struct qwerty_device *qd) { qd->right_pressed = false; }
-void qwerty_press_forward(struct qwerty_device *qd) { qd->forward_pressed = true; }
+void qwerty_press_forward(struct qwerty_device *qd) { qd->forward_pressed = true; qwerty_note_input(qd); }
 void qwerty_release_forward(struct qwerty_device *qd) { qd->forward_pressed = false; }
-void qwerty_press_backward(struct qwerty_device *qd) { qd->backward_pressed = true; }
+void qwerty_press_backward(struct qwerty_device *qd) { qd->backward_pressed = true; qwerty_note_input(qd); }
 void qwerty_release_backward(struct qwerty_device *qd) { qd->backward_pressed = false; }
-void qwerty_press_up(struct qwerty_device *qd) { qd->up_pressed = true; }
+void qwerty_press_up(struct qwerty_device *qd) { qd->up_pressed = true; qwerty_note_input(qd); }
 void qwerty_release_up(struct qwerty_device *qd) { qd->up_pressed = false; }
-void qwerty_press_down(struct qwerty_device *qd) { qd->down_pressed = true; }
+void qwerty_press_down(struct qwerty_device *qd) { qd->down_pressed = true; qwerty_note_input(qd); }
 void qwerty_release_down(struct qwerty_device *qd) { qd->down_pressed = false; }
 
-void qwerty_press_look_left(struct qwerty_device *qd) { qd->look_left_pressed = true; }
+void qwerty_press_look_left(struct qwerty_device *qd) { qd->look_left_pressed = true; qwerty_note_input(qd); }
 void qwerty_release_look_left(struct qwerty_device *qd) { qd->look_left_pressed = false; }
-void qwerty_press_look_right(struct qwerty_device *qd) { qd->look_right_pressed = true; }
+void qwerty_press_look_right(struct qwerty_device *qd) { qd->look_right_pressed = true; qwerty_note_input(qd); }
 void qwerty_release_look_right(struct qwerty_device *qd) { qd->look_right_pressed = false; }
-void qwerty_press_look_up(struct qwerty_device *qd) { qd->look_up_pressed = true; }
+void qwerty_press_look_up(struct qwerty_device *qd) { qd->look_up_pressed = true; qwerty_note_input(qd); }
 void qwerty_release_look_up(struct qwerty_device *qd) { qd->look_up_pressed = false; }
-void qwerty_press_look_down(struct qwerty_device *qd) { qd->look_down_pressed = true; }
+void qwerty_press_look_down(struct qwerty_device *qd) { qd->look_down_pressed = true; qwerty_note_input(qd); }
 void qwerty_release_look_down(struct qwerty_device *qd) { qd->look_down_pressed = false; }
-void qwerty_press_roll_left(struct qwerty_device *qd) { qd->roll_left_pressed = true; }
+void qwerty_press_roll_left(struct qwerty_device *qd) { qd->roll_left_pressed = true; qwerty_note_input(qd); }
 void qwerty_release_roll_left(struct qwerty_device *qd) { qd->roll_left_pressed = false; }
-void qwerty_press_roll_right(struct qwerty_device *qd) { qd->roll_right_pressed = true; }
+void qwerty_press_roll_right(struct qwerty_device *qd) { qd->roll_right_pressed = true; qwerty_note_input(qd); }
 void qwerty_release_roll_right(struct qwerty_device *qd) { qd->roll_right_pressed = false; }
 // clang-format on
 
@@ -1014,6 +1026,7 @@ void
 qwerty_press_sprint(struct qwerty_device *qd)
 {
 	qd->sprint_pressed = true;
+	qwerty_note_input(qd);
 }
 void
 qwerty_release_sprint(struct qwerty_device *qd)
@@ -1027,6 +1040,7 @@ qwerty_add_look_delta(struct qwerty_device *qd, float yaw, float pitch)
 	os_mutex_lock(&qd->lock); // #958
 	qd->yaw_delta += yaw * qd->look_speed;
 	qd->pitch_delta += pitch * qd->look_speed;
+	qwerty_note_input(qd);
 
 	// Log device pointer and accumulated deltas (first call only)
 	static bool first_log = true;
@@ -1044,6 +1058,7 @@ qwerty_add_position_delta(struct qwerty_device *qd, float dx, float dy)
 	os_mutex_lock(&qd->lock); // #958
 	qd->x_pos_delta += dx * qd->movement_speed;
 	qd->y_pos_delta += dy * qd->movement_speed;
+	qwerty_note_input(qd);
 	os_mutex_unlock(&qd->lock); // #958
 }
 
@@ -1706,4 +1721,32 @@ qwerty_reset_controller_pose(struct qwerty_controller *qc)
 	qwerty_follow_hmd(qc, true);
 	struct xrt_pose pose = {XRT_QUAT_IDENTITY, QWERTY_CONTROLLER_INITIAL_POS(is_left)};
 	qd->pose = pose;
+}
+
+int64_t
+qwerty_controller_last_input_ns(struct xrt_device *xd)
+{
+	struct qwerty_device *qd = qwerty_device(xd);
+	if (qd == NULL || qd->sys == NULL || (qd != &qd->sys->lctrl->base && qd != &qd->sys->rctrl->base)) {
+		return 0; // not a qwerty controller (the HMD's movement is not controller use)
+	}
+	const struct qwerty_controller *qc = (const struct qwerty_controller *)qd;
+	const int64_t stamps[] = {
+	    qd->last_input_ns,
+	    qc->trigger_timestamp,
+	    qc->menu_timestamp,
+	    qc->squeeze_timestamp,
+	    qc->system_timestamp,
+	    qc->thumbstick_timestamp,
+	    qc->thumbstick_click_timestamp,
+	    qc->trackpad_timestamp,
+	    qc->trackpad_click_timestamp,
+	};
+	int64_t latest = 0;
+	for (size_t i = 0; i < sizeof(stamps) / sizeof(stamps[0]); i++) {
+		if (stamps[i] > latest) {
+			latest = stamps[i];
+		}
+	}
+	return latest;
 }

@@ -76,6 +76,10 @@ t_builder_add_qwerty_input(struct xrt_system_devices *xsysd,
 		}
 	}
 	t_input_arbiter_note_qwerty_pair(left, right);
+	// ADR-034 Amendment 6: the floor's engagement is the last keyboard / mouse
+	// input aimed at an emulated controller, so the hand roles come back to
+	// the keyboard the moment the user reaches for it.
+	t_input_arbiter_set_floor_engagement(qwerty_controller_last_input_ns);
 
 	if (out_qwerty_hmd != NULL) {
 		*out_qwerty_hmd = qwerty_head;

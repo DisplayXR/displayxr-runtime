@@ -130,6 +130,7 @@ set(tests
     tests_input_arbiter_rerank
     tests_input_arbiter_floor
     tests_input_arbiter_per_client
+    tests_input_arbiter_engagement
     tests_sim_input_nav
     tests_sim_input_hands
     tests_gamepad_map
@@ -1190,6 +1191,18 @@ target_include_directories(
 	tests_input_arbiter_per_client PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
 	)
 target_link_libraries(tests_input_arbiter_per_client PRIVATE xrt-interfaces aux_os)
+
+# ADR-034 Amendment 6 — the controller role follows the engaged device: the
+# engagement walk among present candidates, legacy providers continuously
+# engaged, pins / PreferredPlugin / ControllerSwitching = presence stop it, and
+# the slot is polled only while a client resolves roles. Same shape.
+target_sources(
+	tests_input_arbiter_engagement PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common/target_input_arbiter.c
+	)
+target_include_directories(
+	tests_input_arbiter_engagement PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	)
+target_link_libraries(tests_input_arbiter_engagement PRIVATE xrt-interfaces aux_os)
 
 # #1427 — the XR_DXR_weave handle-export latch rule. A pure boolean header with
 # no runtime dependency (see tests_oxr_weave_latch.cpp for why the entry point

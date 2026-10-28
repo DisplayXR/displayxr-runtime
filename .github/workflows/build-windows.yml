@@ -858,6 +858,26 @@ jobs:
             $o = Selftest-Json
             Expect (([int]$o.input_providers.emulated_controllers.value -eq 1) -and ($o.input_providers.emulated_controllers.source -eq "default") -and ((QwertyPair $o) -eq 2)) "emulated: deleted -> back to value=1 source=default with the pair present (got $(Gate $o))"
 
+            # 3f. ControllerSwitching (ADR-034 Amendment 6): class policy next to the
+            # EmulatedControllers gate, same read path — `InputProviders\Policy\
+            # ControllerSwitching` DWORD 1 = use (default) / 0 = presence, HKCU over
+            # HKLM. The arbitration itself is unit-tested (tests_input_arbiter_engagement);
+            # this checks the store, the verb and `input list --json`.
+            function Sw($il) { "$($il.controller_switching.value)/$($il.controller_switching.source)" }
+            $il = Cli-Json @("input", "list")
+            Expect ((Sw $il) -eq "use/default") "switching: absent reads use/default (got $(Sw $il))"
+            reg add "$inRoot\Policy" /v ControllerSwitching /t REG_DWORD /d 0 /f | Out-Null
+            $il = Cli-Json @("input", "list")
+            Expect ((Sw $il) -eq "presence/machine") "switching: HKLM 0 reads presence/machine (got $(Sw $il))"
+            & $cli input switching use | Out-Null
+            Expect ($LASTEXITCODE -eq 0) "switching: 'input switching use' exit 0 (got $LASTEXITCODE)"
+            $il = Cli-Json @("input", "list")
+            Expect ((Sw $il) -eq "use/user") "switching: the verb's HKCU 1 beats HKLM 0 (got $(Sw $il))"
+            reg delete "HKCU\Software\DisplayXR\InputProviders\Policy" /v ControllerSwitching /f | Out-Null
+            reg delete "$inRoot\Policy" /v ControllerSwitching /f | Out-Null
+            $il = Cli-Json @("input", "list")
+            Expect ((Sw $il) -eq "use/default") "switching: deleted -> back to use/default (got $(Sw $il))"
+
             # 3d. The one options contract (ADR-054 decision 7, N3c, #2050), on the
             # conversion class: without its ENABLE setting sim-conversion declines its
             # probe; `conv set` writes the per-user HKCU Settings\ENABLE (no admin), the
@@ -989,7 +1009,7 @@ jobs:
             Write-Host "::error::per-class conformance (ADR-054 N4): $($script:fails.Count) assertion(s) failed — see FAIL lines above."
             exit 1
           }
-          Write-Host "PASS: per-class conformance (ADR-054 N4) — selected / Enabled=0 falls back / Preferred wins / EmulatedControllers gate / ABI mismatch rejected and fallen through."
+          Write-Host "PASS: per-class conformance (ADR-054 N4) — selected / Enabled=0 falls back / Preferred wins / EmulatedControllers gate / ControllerSwitching store / ABI mismatch rejected and fallen through."
           # Explicit: the pwsh step otherwise exits with the LAST native command's
           # code, and the finally block's best-effort `reg delete` of an
           # already-removed value legitimately returns 1.

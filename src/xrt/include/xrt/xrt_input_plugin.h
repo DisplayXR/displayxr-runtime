@@ -573,6 +573,47 @@ struct xrt_input_plugin_iface
 	 * @ref XRT_INPUT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS.
 	 */
 	xrt_component_describe_settings_fn_t describe_settings;
+
+	/*!
+	 * When did the user last DELIBERATELY use this provider's controller for
+	 * @p hand (0 = left, 1 = right)? ADR-034 Amendment 6, "the controller
+	 * role follows the engaged device": among the PRESENT candidates for a
+	 * hand, the most recently engaged one holds that hand's controller role
+	 * (unless a pin, an app request, `Policy\Lock` or `PreferredPlugin`
+	 * names one, or `ControllerSwitching` = presence).
+	 *
+	 * Returns a timestamp on the `os_monotonic_get_ns` clock —
+	 * `CLOCK_MONOTONIC` on POSIX, `QueryPerformanceCounter` on Windows,
+	 * nanoseconds, the same domain as
+	 * @ref xrt_input_pointer_event::timestamp_ns — or 0 for "never".
+	 * Deliberate means an intentional input: for camera-tracked hands a
+	 * pinch, for a physical controller a button / trigger / stick edge —
+	 * NOT mere visibility or tracking, or a hand drifting through the frame
+	 * would steal the role back from the keyboard. Engagement is separate
+	 * from presence: a provider that is ABSENT never wins, however recent
+	 * its last engagement, and an engagement older than the provider's
+	 * latest return to PRESENT does not count.
+	 *
+	 * Called from the arbiter's presence poll thread (never a client
+	 * thread), rate-limited to the presence poll (~250 ms), for every
+	 * PRESENT candidate that implements it — also while another candidate
+	 * holds the role, because that is the only way a provider that is not
+	 * being located can take it back. The runtime calls it ONLY while roles
+	 * are being resolved for a live client (an app's `xrSyncActions` /
+	 * `get_roles` within the last second) and stops when none is, so a
+	 * provider MAY treat these calls as demand and keep its sensor running
+	 * while they arrive (and idle it when they stop). MUST be non-blocking
+	 * and allocation-free, like @ref get_presence; may be called with a
+	 * NULL @p inst if that is what `probe()` produced.
+	 *
+	 * Optional. NULL (or a provider whose `struct_size` predates this slot)
+	 * keeps the pre-Amendment-6 behaviour: the provider counts as engaged
+	 * continuously while present, so it holds the role exactly as it always
+	 * did. Appended under `struct_size` cover (API major stays 1); the
+	 * runtime guards the call with @ref XRT_INPUT_PLUGIN_IFACE_HAS. Announced
+	 * by @ref XRT_INPUT_PLUGIN_IFACE_HAS_GET_ENGAGED_NS.
+	 */
+	int64_t (*get_engaged_ns)(struct xrt_input_plugin_instance *inst, uint32_t hand);
 };
 
 /*!
@@ -581,6 +622,35 @@ struct xrt_input_plugin_iface
  * filling it.
  */
 #define XRT_INPUT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS 1
+
+/*!
+ * Defined when @ref xrt_input_plugin_iface carries `get_engaged_ns` (ADR-034
+ * Amendment 6), so a provider built against an older runtime header can
+ * #ifdef-guard filling it.
+ */
+#define XRT_INPUT_PLUGIN_IFACE_HAS_GET_ENGAGED_NS 1
+
+//! `hand` argument of @ref xrt_input_plugin_iface::get_engaged_ns.
+#define XRT_INPUT_PLUGIN_HAND_LEFT 0u
+//! `hand` argument of @ref xrt_input_plugin_iface::get_engaged_ns.
+#define XRT_INPUT_PLUGIN_HAND_RIGHT 1u
+
+// Append-only (ADR-020): every optional slot sits after the original seven
+// fields, in the order it was added. Moving one is an API major bump.
+// clang-format off
+XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_iface, get_presence) ==
+                                offsetof(struct xrt_input_plugin_iface, destroy) + sizeof(void *),
+                            "xrt_input_plugin_iface: get_presence must follow destroy (ADR-020 append-only)");
+XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_iface, describe_settings) ==
+                                offsetof(struct xrt_input_plugin_iface, get_presence) + sizeof(void *),
+                            "xrt_input_plugin_iface: describe_settings must follow get_presence (ADR-020 append-only)");
+XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_iface, get_engaged_ns) ==
+                                offsetof(struct xrt_input_plugin_iface, describe_settings) + sizeof(void *),
+                            "xrt_input_plugin_iface: get_engaged_ns must follow describe_settings (ADR-020 append-only)");
+XRT_INPUT_PLUGIN_ABI_ASSERT(sizeof(struct xrt_input_plugin_iface) ==
+                                2 * sizeof(uint32_t) + 10 * sizeof(void *),
+                            "xrt_input_plugin_iface size changed - append the slot and update this assert (ADR-020)");
+// clang-format on
 
 
 /*

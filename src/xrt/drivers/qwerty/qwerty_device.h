@@ -122,6 +122,8 @@ struct qwerty_device
 
 	//! #962: last keyboard-integration timestamp (os_monotonic_get_ns); 0 = never.
 	int64_t last_integrate_ns;
+	//! ADR-034 Amendment 6: last user input aimed at this device (os_monotonic_get_ns); 0 = never.
+	int64_t last_input_ns;
 	struct xrt_pose pose;      //!< Internal pose state
 	struct qwerty_system *sys; //!< Reference to the system this device is in.
 

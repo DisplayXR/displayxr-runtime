@@ -35,6 +35,17 @@
 #define ARBITER_PRESENCE_POLL_NS (250LL * 1000 * 1000)
 
 /*!
+ * ADR-034 Amendment 6: the poll thread asks for engagement only while some
+ * client resolved roles (a `get_roles`) this recently — a provider may treat
+ * the calls as demand and keep its sensor alive, so an idle service with no
+ * client must stop making them.
+ */
+#define ARBITER_ENGAGE_DEMAND_NS (1000LL * 1000 * 1000)
+
+//! Effective engagement of a provider without the slot: continuously engaged while present.
+#define ARBITER_ENGAGED_ALWAYS INT64_MAX
+
+/*!
  * Largest number of candidate pairs we arbitrate between: one per
  * registered provider plus the qwerty floor.
  */
@@ -125,6 +136,18 @@ struct t_input_candidate
 	 * presence poll keeps running so re-enabling is instant.
 	 */
 	bool withdrawn;
+
+	/*!
+	 * ADR-034 Amendment 6: the last deliberate use per hand (0 = left, 1 =
+	 * right) on the os_monotonic_get_ns clock, 0 = never — the provider's
+	 * `get_engaged_ns`, or the floor's qwerty input stamp. Written by the
+	 * poll thread under the mutex. Unused for a provider without the slot
+	 * (@ref ARBITER_ENGAGED_ALWAYS).
+	 */
+	int64_t engaged_ns[2];
+
+	//! When the current present streak began (an engagement older than this does not count).
+	int64_t present_since_ns;
 };
 
 //! Slot order for t_input_candidate::ht_devices / ::ht_indices.
@@ -213,6 +236,25 @@ struct t_input_arbiter
 	//! Cached class policy (refreshed by t_input_arbiter_policy_changed, off the hot path).
 	bool policy_lock;
 	char user_default[XRT_INPUT_PROVIDER_ID_SIZE];
+
+	/*!
+	 * ADR-034 Amendment 6: `ControllerSwitching` = use (true, the default):
+	 * the controller roles follow the most recently engaged present
+	 * candidate. False (`presence`): the pre-Amendment-6 rank walk.
+	 */
+	bool switching_use;
+
+	//! The emulated floor's engagement read (the qwerty builder installs it); NULL = never engaged.
+	t_input_arbiter_engaged_fn floor_engaged_fn;
+
+	//! Last `get_roles` on behalf of a client (os_monotonic_get_ns): the engagement-demand gate.
+	int64_t last_roles_read_ns;
+
+	//! Per hand, the candidate (index into @ref candidates) engagement put first at the last poll; -1 = none.
+	int engage_leader[2];
+
+	//! The first engagement-driven move of the system-wide roles logged at WARN; later ones at INFO.
+	bool engage_warned;
 
 	struct t_input_client clients[ARBITER_MAX_CLIENTS];
 
@@ -384,6 +426,10 @@ candidate_store_verdict_locked(struct t_input_candidate *cand, bool present)
 	}
 	if (!cand->have_verdict || present != cand->present) {
 		g_arb.epoch++; // ADR-034 Am.5: every client's resolution may have moved
+		if (present) {
+			// Amendment 6: a new present streak — earlier engagement no longer counts.
+			cand->present_since_ns = os_monotonic_get_ns();
+		}
 	}
 	cand->present = present;
 	cand->have_verdict = true;
@@ -391,27 +437,75 @@ candidate_store_verdict_locked(struct t_input_candidate *cand, bool present)
 }
 
 /*!
- * First present candidate, in priority order, that supplies the hand
- * selected by @p want_left. Returns NULL when nothing does.
+ * ADR-034 Amendment 6: @p cand's engagement for one hand as the walk compares
+ * it. A provider without the slot is engaged continuously while present (so
+ * it keeps the role exactly as before the amendment); an engagement from
+ * before the candidate's current present streak does not count (a provider
+ * coming back does not reclaim the role on an old pinch). Caller holds the
+ * mutex.
+ */
+static int64_t
+effective_engaged_locked(const struct t_input_candidate *cand, bool want_left)
+{
+	if (cand->iface != NULL && !XRT_INPUT_PLUGIN_IFACE_HAS(cand->iface, get_engaged_ns)) {
+		return ARBITER_ENGAGED_ALWAYS;
+	}
+	const int64_t at = cand->engaged_ns[want_left ? 0 : 1];
+	return at > cand->present_since_ns ? at : 0;
+}
+
+/*!
+ * The present candidate that supplies the hand selected by @p want_left.
+ * Returns NULL when nothing does.
+ *
+ * @p by_engagement false: the first in priority order (presence-gated rank,
+ * ADR-034 Amendment 3). True (Amendment 6): the most recently engaged one,
+ * ties — never-engaged included — keeping priority order, so a box where
+ * nobody engages anything resolves exactly like the rank walk.
  *
  * Resolved per hand on purpose: a provider that supplies only one
  * controller should leave the other hand to the next-ranked candidate,
  * not drag both down with it.
  */
 static struct t_input_candidate *
-pick_for_hand_locked(bool want_left)
+pick_for_hand_locked(bool want_left, bool by_engagement)
 {
+	struct t_input_candidate *best = NULL;
+	int64_t best_engaged = 0;
 	for (int i = 0; i < g_arb.candidate_count; i++) {
 		struct t_input_candidate *cand = ranked_locked(i);
 		int32_t index = want_left ? cand->left_index : cand->right_index;
 		if (index < 0) {
 			continue;
 		}
-		if (candidate_is_present_locked(cand)) {
+		if (!candidate_is_present_locked(cand)) {
+			continue;
+		}
+		if (!by_engagement) {
 			return cand;
 		}
+		const int64_t engaged = effective_engaged_locked(cand, want_left);
+		if (best == NULL || engaged > best_engaged) {
+			best = cand;
+			best_engaged = engaged;
+		}
 	}
-	return NULL;
+	return best;
+}
+
+/*!
+ * ADR-034 Amendment 6: does the system-wide walk follow engagement? Only with
+ * `ControllerSwitching` = use AND no `PreferredPlugin` naming a controller
+ * candidate — the user default is a hard choice, like a pin. Caller holds
+ * the mutex.
+ */
+static bool
+candidate_claims_controllers_by_id_locked(const char *id);
+
+static bool
+system_follows_engagement_locked(void)
+{
+	return g_arb.switching_use && !candidate_claims_controllers_by_id_locked(g_arb.user_default);
 }
 
 /*!
@@ -587,8 +681,9 @@ profile_to_report_locked(const struct t_input_candidate *winner, struct xrt_devi
 static void
 refresh_roles_locked(void)
 {
-	struct t_input_candidate *left_cand = pick_for_hand_locked(true);
-	struct t_input_candidate *right_cand = pick_for_hand_locked(false);
+	const bool by_engagement = system_follows_engagement_locked();
+	struct t_input_candidate *left_cand = pick_for_hand_locked(true, by_engagement);
+	struct t_input_candidate *right_cand = pick_for_hand_locked(false, by_engagement);
 
 	int32_t left = left_cand != NULL ? left_cand->left_index : -1;
 	int32_t right = right_cand != NULL ? right_cand->right_index : -1;
@@ -637,13 +732,24 @@ refresh_roles_locked(void)
 	struct xrt_device *rig_xdev =
 	    (rig >= 0 && (size_t)rig < g_arb.xsysd->xdev_count) ? g_arb.xsysd->xdevs[rig] : NULL;
 
-	U_LOG_W(
-	    "input arbiter: hand roles -> left='%s' (%s) right='%s' (%s), rig -> '%s', gamepad -> '%s', "
-	    "generation %u.",
-	    left_xdev != NULL ? left_xdev->str : "<none>", candidate_name(left_cand),
-	    right_xdev != NULL ? right_xdev->str : "<none>", candidate_name(right_cand),
-	    rig_xdev != NULL ? rig_xdev->str : "<runtime fly camera>",
-	    gamepad_xdev != NULL ? gamepad_xdev->str : "<none>", (unsigned)generation);
+	// Amendment 6: a move engagement made (the rank walk would have picked
+	// differently) is a user switching devices — human rate, but it can be
+	// frequent, so WARN the first one and INFO after. Everything else (presence,
+	// policy, install) stays WARN as before.
+	const bool engage_move = by_engagement && (left_cand != pick_for_hand_locked(true, false) ||
+	                                           right_cand != pick_for_hand_locked(false, false));
+	const bool loud = !engage_move || !g_arb.engage_warned;
+	if (engage_move) {
+		g_arb.engage_warned = true;
+	}
+	U_LOG_IFL(loud ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
+	          "input arbiter: hand roles -> left='%s' (%s) right='%s' (%s), rig -> '%s', gamepad -> '%s', "
+	          "generation %u%s.",
+	          left_xdev != NULL ? left_xdev->str : "<none>", candidate_name(left_cand),
+	          right_xdev != NULL ? right_xdev->str : "<none>", candidate_name(right_cand),
+	          rig_xdev != NULL ? rig_xdev->str : "<runtime fly camera>",
+	          gamepad_xdev != NULL ? gamepad_xdev->str : "<none>", (unsigned)generation,
+	          engage_move ? " (controllers follow the engaged device, ControllerSwitching = use)" : "");
 }
 
 /*
@@ -706,6 +812,12 @@ candidate_claims(const struct t_input_candidate *cand, enum xrt_input_role_famil
 	case XRT_INPUT_ROLE_FAMILY_GAMEPAD: return cand->gamepad_index >= 0;
 	default: return false;
 	}
+}
+
+static bool
+candidate_claims_controllers_by_id_locked(const char *id)
+{
+	return candidate_claims(candidate_by_id_locked(id), XRT_INPUT_ROLE_FAMILY_CONTROLLERS);
 }
 
 static uint32_t
@@ -868,14 +980,21 @@ resolve_client_locked(struct t_input_client *c)
 		}
 	}
 
+	// Amendment 6: the controller roles follow the engaged device only when
+	// nothing names a controller candidate for this client — a pin, a request,
+	// or the user default (Policy\Lock is folded into the precedence above) —
+	// and the class policy allows it. A preference is a hard choice; with one,
+	// an absent preferred candidate falls through to the plain rank walk.
+	const bool by_engagement =
+	    g_arb.switching_use && c->pref_src[XRT_INPUT_ROLE_FAMILY_CONTROLLERS] == TARGET_INPUT_PREF_NONE;
 	struct t_input_candidate *hc = hoist[XRT_INPUT_ROLE_FAMILY_CONTROLLERS];
 	struct t_input_candidate *left_cand = hoisted_if_present_locked(hc, hc != NULL ? hc->left_index : -1);
 	if (left_cand == NULL) {
-		left_cand = pick_for_hand_locked(true);
+		left_cand = pick_for_hand_locked(true, by_engagement);
 	}
 	struct t_input_candidate *right_cand = hoisted_if_present_locked(hc, hc != NULL ? hc->right_index : -1);
 	if (right_cand == NULL) {
-		right_cand = pick_for_hand_locked(false);
+		right_cand = pick_for_hand_locked(false, by_engagement);
 	}
 	const int32_t left = left_cand != NULL ? left_cand->left_index : -1;
 	const int32_t right = right_cand != NULL ? right_cand->right_index : -1;
@@ -940,6 +1059,9 @@ static void
 client_roles(const struct xrt_input_selection_client *ref, struct xrt_system_roles *out_roles)
 {
 	struct t_input_client *c = client_get_and_lock(ref); // returns locked
+	// Amendment 6: a live role read — the poll thread keeps asking providers
+	// for engagement (demand) while these keep coming.
+	g_arb.last_roles_read_ns = os_monotonic_get_ns();
 	if (c == NULL) {
 		refresh_roles_locked();
 		*out_roles = g_arb.roles;
@@ -1247,13 +1369,15 @@ sel_client_detach(struct xrt_input_selection *xis, const struct xrt_input_select
  * under the lock. Install and @ref t_input_arbiter_policy_changed call it.
  */
 static void
-read_class_policy(bool *out_lock, char *out_default, size_t cap)
+read_class_policy(bool *out_lock, char *out_default, size_t cap, bool *out_switching_use)
 {
 	*out_lock = g_policy.get_policy_lock != NULL && g_policy.get_policy_lock();
 	out_default[0] = '\0';
 	if (g_policy.get_user_default != NULL) {
 		(void)g_policy.get_user_default(out_default, cap);
 	}
+	// Amendment 6: absent slot = the default, `use`.
+	*out_switching_use = g_policy.get_controller_switching == NULL || g_policy.get_controller_switching();
 }
 
 static xrt_result_t
@@ -1284,6 +1408,51 @@ arbiter_get_roles(struct xrt_system_devices *xsysd, struct xrt_system_roles *out
 }
 
 /*!
+ * Amendment 6: read @p cand's engagement for the hands it supplies, OFF the
+ * lock (provider code). False when it has nothing to read: a provider
+ * without the slot (continuously engaged — nothing to ask), or a floor with
+ * no reader installed.
+ */
+static bool
+query_candidate_engagement(const struct t_input_candidate *cand, t_input_arbiter_engaged_fn floor_fn, int64_t out[2])
+{
+	if (cand->iface == NULL) {
+		if (floor_fn == NULL) {
+			return false;
+		}
+		out[0] = cand->left != NULL ? floor_fn(cand->left) : 0;
+		out[1] = cand->right != NULL ? floor_fn(cand->right) : 0;
+		return true;
+	}
+	if (!XRT_INPUT_PLUGIN_IFACE_HAS(cand->iface, get_engaged_ns)) {
+		return false;
+	}
+	out[0] = cand->left != NULL ? cand->iface->get_engaged_ns(cand->inst, XRT_INPUT_PLUGIN_HAND_LEFT) : 0;
+	out[1] = cand->right != NULL ? cand->iface->get_engaged_ns(cand->inst, XRT_INPUT_PLUGIN_HAND_RIGHT) : 0;
+	return true;
+}
+
+/*!
+ * Amendment 6: who would engagement put first per hand now? When that moved,
+ * bump the epoch so every client re-resolves (and `generation_id` moves where
+ * its roles did). A candidate refreshing an engagement it already leads with
+ * moves nothing — no per-tick churn while the user keeps typing. Caller holds
+ * the mutex; called from the poll thread, which only writes the cache.
+ */
+static void
+note_engage_leaders_locked(void)
+{
+	for (int h = 0; h < 2; h++) {
+		const struct t_input_candidate *lead = pick_for_hand_locked(h == 0, true);
+		const int idx = lead != NULL ? (int)(lead - g_arb.candidates) : -1;
+		if (idx != g_arb.engage_leader[h]) {
+			g_arb.engage_leader[h] = idx;
+			g_arb.epoch++;
+		}
+	}
+}
+
+/*!
  * #958: presence poll thread. Queries every candidate off any client thread
  * (get_presence is never held under g_arb_mutex — only the scalar cache write
  * is), so a slow/blocking provider stalls this dedicated thread, not a client's
@@ -1297,11 +1466,40 @@ arbiter_presence_poll_thread(void *ptr)
 	(void)ptr;
 	while (os_thread_helper_is_running(&g_arb_poll)) {
 		int n = g_arb.candidate_count;
+
+		// Amendment 6: ask for engagement only while a client is resolving
+		// roles (a provider may treat the call as demand), and only when the
+		// policy uses it.
+		os_mutex_lock(&g_arb_mutex);
+		const bool want_engagement =
+		    g_arb.switching_use && g_arb.last_roles_read_ns != 0 &&
+		    os_monotonic_get_ns() - g_arb.last_roles_read_ns < ARBITER_ENGAGE_DEMAND_NS;
+		t_input_arbiter_engaged_fn floor_fn = g_arb.floor_engaged_fn;
+		os_mutex_unlock(&g_arb_mutex);
+
 		for (int i = 0; i < n; i++) {
 			struct t_input_candidate *cand = &g_arb.candidates[i];
 			bool present = query_candidate_presence(cand); // OFF-lock provider call
+			bool withdrawn = false;
+			if (want_engagement && present) {
+				os_mutex_lock(&g_arb_mutex);
+				withdrawn = cand->withdrawn; // a withdrawn candidate is not asked (no demand)
+				os_mutex_unlock(&g_arb_mutex);
+			}
+			int64_t engaged[2] = {0, 0};
+			const bool read_engaged = want_engagement && present && !withdrawn &&
+			                          query_candidate_engagement(cand, floor_fn, engaged); // OFF-lock
 			os_mutex_lock(&g_arb_mutex);
 			candidate_store_verdict_locked(cand, present);
+			if (read_engaged) {
+				cand->engaged_ns[0] = engaged[0];
+				cand->engaged_ns[1] = engaged[1];
+			}
+			os_mutex_unlock(&g_arb_mutex);
+		}
+		if (want_engagement) {
+			os_mutex_lock(&g_arb_mutex);
+			note_engage_leaders_locked();
 			os_mutex_unlock(&g_arb_mutex);
 		}
 		// Sleep the poll interval in small chunks so signal_stop is prompt.
@@ -1361,6 +1559,9 @@ t_input_arbiter_reset(void)
 	os_mutex_lock(&g_arb_mutex);
 	memset(&g_arb, 0, sizeof(g_arb));
 	g_arb.last_noted = -1;
+	g_arb.engage_leader[0] = -1;
+	g_arb.engage_leader[1] = -1;
+	g_arb.switching_use = true;
 	g_arb.roles = (struct xrt_system_roles)XRT_SYSTEM_ROLES_INIT;
 	rebuild_order_locked();
 	os_mutex_unlock(&g_arb_mutex);
@@ -1509,6 +1710,18 @@ t_input_arbiter_note_qwerty_pair(struct xrt_device *left, struct xrt_device *rig
 	g_arb.floor_noted = true;
 }
 
+void
+t_input_arbiter_set_floor_engagement(t_input_arbiter_engaged_fn fn)
+{
+	if (g_arb_mutex_ready) {
+		os_mutex_lock(&g_arb_mutex);
+		g_arb.floor_engaged_fn = fn;
+		os_mutex_unlock(&g_arb_mutex);
+	} else {
+		g_arb.floor_engaged_fn = fn;
+	}
+}
+
 bool
 t_input_arbiter_provider_holds_roles(void)
 {
@@ -1586,12 +1799,14 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 		snprintf(cand->row_id, sizeof(cand->row_id), "%s", row != NULL ? row : "");
 	}
 	bool policy_lock = false;
+	bool switching_use = true;
 	char user_default[XRT_INPUT_PROVIDER_ID_SIZE];
-	read_class_policy(&policy_lock, user_default, sizeof(user_default));
+	read_class_policy(&policy_lock, user_default, sizeof(user_default), &switching_use);
 
 	os_mutex_lock(&g_arb_mutex);
 
 	g_arb.policy_lock = policy_lock;
+	g_arb.switching_use = switching_use;
 	snprintf(g_arb.user_default, sizeof(g_arb.user_default), "%s", user_default);
 	g_arb.epoch++;
 
@@ -1772,8 +1987,9 @@ t_input_arbiter_policy_changed(void)
 		return 0;
 	}
 	bool policy_lock = false;
+	bool switching_use = true;
 	char user_default[XRT_INPUT_PROVIDER_ID_SIZE];
-	read_class_policy(&policy_lock, user_default, sizeof(user_default));
+	read_class_policy(&policy_lock, user_default, sizeof(user_default), &switching_use);
 
 	// Snapshot who is attached, read their pins off the lock, apply by key.
 	struct
@@ -1808,6 +2024,13 @@ t_input_arbiter_policy_changed(void)
 	os_mutex_lock(&g_arb_mutex);
 	g_arb.policy_lock = policy_lock;
 	snprintf(g_arb.user_default, sizeof(g_arb.user_default), "%s", user_default);
+	if (g_arb.switching_use != switching_use) {
+		U_LOG_W("input arbiter: ControllerSwitching -> %s.",
+		        switching_use ? "use (the controller roles follow the engaged device)"
+		                      : "presence (the controller roles follow presence + rank only)");
+		g_arb.switching_use = switching_use;
+		g_arb.epoch++;
+	}
 	for (int i = 0; i < n; i++) {
 		struct t_input_client *c = client_find_locked(snap[i].key);
 		if (c == NULL) {

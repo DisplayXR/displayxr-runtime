@@ -719,6 +719,30 @@ target_input_plugin_get_emulated_controllers(const char **out_source)
 }
 
 /*
+ * ADR-034 Amendment 6: `InputProviders\Policy\ControllerSwitching` (DWORD,
+ * 1 = use, 0 = presence), HKCU over HKLM under `Policy\Lock` — the same
+ * root-policy read as EmulatedControllers.
+ */
+bool
+target_input_plugin_get_controller_switching(const char **out_source)
+{
+	uint32_t value = 1;
+	const uint32_t tier = target_component_read_policy_dword(&g_input_class, "ControllerSwitching", &value);
+	const char *source = "default";
+	if (tier == TARGET_COMPONENT_SETTING_USER) {
+		source = "user";
+	} else if (tier == TARGET_COMPONENT_SETTING_MACHINE) {
+		source = "machine";
+	} else {
+		value = 1; // absent = use
+	}
+	if (out_source != NULL) {
+		*out_source = source;
+	}
+	return value != 0;
+}
+
+/*
  * N3a: `PreferredPlugin` — HKCU first (per user, `input use <id>`), then the
  * HKLM 64-bit view (`--machine`). Same root value name as the DP loader's
  * §2.1 override, under the InputProviders root. Class selection policy, so
@@ -898,6 +922,15 @@ target_input_plugin_get_emulated_controllers(const char **out_source)
 }
 
 bool
+target_input_plugin_get_controller_switching(const char **out_source)
+{
+	if (out_source != NULL) {
+		*out_source = "default";
+	}
+	return true; // no per-user store on Android: the default, `use`
+}
+
+bool
 target_input_plugin_get_preferred(char *out, size_t cap)
 {
 	if (out != NULL && cap > 0) {
@@ -988,6 +1021,39 @@ target_input_plugin_get_emulated_controllers(const char **out_source)
 		*out_source = "file";
 	}
 	return c != '0';
+}
+
+/*
+ * ADR-034 Amendment 6: the `controller_switching` file next to
+ * `emulated_controllers` — the word `presence` (or a leading '0') selects the
+ * pure presence walk, anything else `use`; absent = use. What `displayxr-cli
+ * input switching use|presence` writes. No machine tier on POSIX.
+ */
+bool
+target_input_plugin_get_controller_switching(const char **out_source)
+{
+	if (out_source != NULL) {
+		*out_source = "default";
+	}
+	char dir[PATH_MAX];
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return true;
+	}
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/controller_switching", dir);
+
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return true;
+	}
+	char word[16] = {0};
+	const size_t got = fread(word, 1, sizeof(word) - 1, f);
+	fclose(f);
+	word[got] = '\0';
+	if (out_source != NULL) {
+		*out_source = "file";
+	}
+	return !(word[0] == '0' || strncmp(word, "presence", 8) == 0);
 }
 
 /*
@@ -1232,6 +1298,13 @@ input_policy_row_id_for(const struct xrt_input_plugin_iface *iface, struct xrt_i
 	return NULL;
 }
 
+//! Amendment 6: the arbiter's view of `ControllerSwitching` (true = use).
+static bool
+input_policy_controller_switching(void)
+{
+	return target_input_plugin_get_controller_switching(NULL);
+}
+
 static void
 input_install_arbiter_policy(void)
 {
@@ -1242,6 +1315,7 @@ input_install_arbiter_policy(void)
 	    .get_user_default = target_input_plugin_get_preferred,
 	    .row_id_for = input_policy_row_id_for,
 	    .self_exe_basename = u_exe_basename_self,
+	    .get_controller_switching = input_policy_controller_switching,
 	};
 	t_input_arbiter_set_policy(&policy);
 }

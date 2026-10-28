@@ -41,6 +41,10 @@ static const struct xrt_component_setting_desc g_descs[] = {
     {"HAND_DISTANCE_M", XRT_COMPONENT_SETTING_TYPE_FLOAT, "0.25",
      "how far in front of the display glass the hands' 4 cm circles are centred (metres; the hands sit 12 cm "
      "left / right of the display centre)"},
+    {"ENGAGE_MS", XRT_COMPONENT_SETTING_TYPE_INT, "0",
+     "ADR-034 Amendment 6: every n ms each active hand makes one scripted deliberate use (get_engaged_ns), so "
+     "the controller role follows the engaged device; 0 = the slot is not implemented (engaged continuously "
+     "while present, the pre-amendment behaviour)"},
     {"HAND_SCALE_H_PER_M", XRT_COMPONENT_SETTING_TYPE_FLOAT, "2.5",
      "the hand's own size, in display heights per metre of real hand (joint offsets about the wrist/palm and "
      "joint radii), the Ultraleap relative mapping's gain: a 10 cm hand shows as 0.25 x the display height. "

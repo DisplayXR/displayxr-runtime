@@ -1,6 +1,6 @@
 # ADR-034: Input Providers Are a Second Plug-in Type, Not a Display-Processor Extension
 
-**Status:** Accepted (Phase 1 implemented — #823; role arbitration amended 2026-08-15, see *Amendment 1*; rig-relative pose composition amended 2026-08-15, see *Amendment 2*; presence-ranked hierarchy — all claiming providers stay resident, roles follow presence — amended 2026-08-16, see *Amendment 3*, whose addendum makes the hand-tracking source follow presence too; navigation became a third arbitrated role, composed by the runtime — amended 2026-09-11, see *Amendment 4*). The process that **hosts** input providers is not decided here: today they load in-process, and moving them out is [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) D4.
+**Status:** Accepted (Phase 1 implemented — #823; role arbitration amended 2026-08-15, see *Amendment 1*; rig-relative pose composition amended 2026-08-15, see *Amendment 2*; presence-ranked hierarchy — all claiming providers stay resident, roles follow presence — amended 2026-08-16, see *Amendment 3*, whose addendum makes the hand-tracking source follow presence too; navigation became a third arbitrated role, composed by the runtime — amended 2026-09-11, see *Amendment 4*; hand roles resolved per client with app/user preferences — amended 2026-10-17, see *Amendment 5*; the controller role follows the device the user last engaged — amended 2026-10-29, see *Amendment 6*). The process that **hosts** input providers is not decided here: today they load in-process, and moving them out is [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) D4.
 **Date:** 2026-08-02
 
 ## Context
@@ -657,3 +657,81 @@ an app could not offer its user a choice, and a user could not pin one app to on
 - The trunk rule this generalises (ADR-054 decision 8): every class keeps all installed components
   resident; selection scope is per class — display processors per screen, conversion providers per
   task and per stream, input providers per role family and per client.
+
+## Amendment 6 — The controller role follows the engaged device (2026-10-29)
+
+**Status:** Accepted (David, 2026-10-29). Extends Amendments 1, 3 and 5 for the **controller**
+family (`left` / `right`) only; hand-tracking, gamepad and rig roles keep the presence walk.
+
+### What was wrong
+
+Presence answers "is the hardware there", not "is the user using it". That was good enough while
+every controller provider was hardware you pick up (a controller pair, a Leap Motion on the desk):
+plugged in meant in use. It breaks for a provider that is present whenever a sensor exists — camera
+hand tracking publishing `khr/simple_controller` devices (select = pinch, grip/aim = palm) reports
+PRESENT for as long as there is a webcam, so under Amendment 3 it outranks the qwerty floor
+*permanently*, and a user who reaches for the keyboard and mouse never gets the emulated
+controllers back. Lowering its ProbeOrder only inverts the problem: then a pinch never takes the
+role. The rank is the wrong axis; the user's last deliberate action is the right one.
+
+### Decision
+
+1. **Engagement is separate from presence.** `struct xrt_input_plugin_iface` gains an appended,
+   optional slot (ADR-020: `struct_size`-gated, API major stays 1, announced by
+   `XRT_INPUT_PLUGIN_IFACE_HAS_GET_ENGAGED_NS`):
+   `int64_t (*get_engaged_ns)(struct xrt_input_plugin_instance *inst, uint32_t hand)` — the
+   `os_monotonic_get_ns` time (CLOCK_MONOTONIC on POSIX, QPC on Windows) of that hand's last
+   **deliberate** use, 0 = never. Deliberate means intentional input — a pinch for camera hands, a
+   button / trigger / stick edge for a physical controller — never mere visibility, or a hand
+   drifting through the frame would steal the role back.
+2. **Most recently engaged present candidate wins**, per hand, when nothing names a controller
+   candidate for that client. Ties and never-engaged fall back to the Amendment 3 rank order, so a
+   box where nobody engages anything resolves exactly as before. A provider **without** the slot is
+   *engaged continuously while present* — today's behaviour, bit-identical (a Leap provider keeps
+   the hands for as long as it is plugged in, and still beats a slot provider that is merely
+   present). The qwerty floor's engagement is the last keyboard / mouse input aimed at that
+   emulated controller (`qwerty_controller_last_input_ns`: its button / stick / trackpad edges and
+   the movement / look keys and mouse deltas focused on it — the qwerty head's own WASD /
+   mouse-look is navigation and does not count).
+3. **Hysteresis is structural.** A role moves only when another present candidate engages, or on
+   presence loss (to the most recently engaged remaining present candidate, else rank). An
+   engagement older than the candidate's latest return to PRESENT does not count, so a provider
+   coming back does not reclaim the role on a stale pinch. The leader refreshing its own engagement
+   moves nothing.
+4. **Hard choices stay hard.** A per-app pin, the app's session request, `Policy\Lock` (through the
+   precedence it already shapes) and `PreferredPlugin` naming a controller provider each stop the
+   switching for the clients they apply to. Engagement is global (one user); resolution stays per
+   client (Amendment 5).
+5. **Policy: `ControllerSwitching`** under the input class `Policy` root, the `EmulatedControllers`
+   read path: Windows `InputProviders\Policy\ControllerSwitching` (DWORD, 1 = `use`, 0 =
+   `presence`; HKCU over HKLM, HKCU ignored under `Policy\Lock`), POSIX a per-user
+   `controller_switching` file holding `use` or `presence`. Absent = `use`. `presence` is exactly the
+   pre-amendment walk. CLI: `displayxr-cli input switching use|presence [--machine]`; `input list
+   --json` reports `controller_switching: {value, source}`. A running service applies a change live
+   through its component-policy watch.
+6. **Threading and demand.** Engagement is read on the arbiter's presence poll thread (#958 —
+   never a client thread), at its ~250 ms rate, for **every** present candidate implementing the
+   slot, including ones not holding the role — the only way a provider nobody is locating can take
+   the role back. It is read only while some client resolved roles (`get_roles` / `xrSyncActions`)
+   within the last second, so a provider MAY treat the calls as demand (keep its sensor alive) and
+   idle when they stop; an idle service with no client stops calling. A change of who engagement
+   puts first bumps the arbiter's state epoch, so per-client cached roles recompute and
+   `generation_id` moves where a client's roles did.
+7. **Profile stability holds.** When the floor holds a hand by engagement while a provider is
+   present, the existing masquerade (the floor reports the top-ranked non-withdrawn provider's
+   profile when it can remap it) still applies, so a camera-hands ↔ keyboard swap is a pose-source
+   change with no `XrEventDataInteractionProfileChanged`.
+
+### Consequences
+
+- The first engagement-driven move of the system-wide roles logs at WARN, later ones at INFO; the
+  per-client overlay log is unchanged. Nothing per frame.
+- `sim-input` is the in-tree reference: `ENGAGE_MS` = n makes each active hand engage every n ms
+  (0, the default, leaves the slot NULL — continuously engaged, as before).
+- With **two** controller providers, profile stability is only guaranteed against the top-ranked
+  one (the masquerade mirrors it); an engagement swap between the floor and a lower-ranked
+  provider with a different profile still emits one profile-changed event, as a presence swap
+  between them always has.
+- The `displayxr-tracking-open` hands provider needs only to fill the slot (and may key its camera
+  demand on the calls); its host-side neutral header is generated from this one and the change is
+  append-only.
