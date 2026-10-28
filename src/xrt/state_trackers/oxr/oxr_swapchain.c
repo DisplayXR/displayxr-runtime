@@ -320,6 +320,19 @@ oxr_swapchain_common_create(struct oxr_logger *log,
 	}
 #endif
 
+#ifdef OXR_HAVE_DXR_swapchain_color_encoding
+	// Validated in oxr_api_swapchain.c (the compositor declared support).
+	if (sess->sys->inst->extensions.DXR_swapchain_color_encoding &&
+	    (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0) {
+		const XrSwapchainColorEncodingCreateInfoDXR *color_encoding =
+		    OXR_GET_INPUT_FROM_CHAIN(createInfo, XR_TYPE_SWAPCHAIN_COLOR_ENCODING_CREATE_INFO_DXR,
+		                             XrSwapchainColorEncodingCreateInfoDXR);
+		if (color_encoding != NULL && color_encoding->colorEncoding == XR_SWAPCHAIN_COLOR_ENCODING_SRGB_DXR) {
+			info.create |= XRT_SWAPCHAIN_CREATE_COLOR_ENCODED_SRGB;
+		}
+	}
+#endif
+
 	struct xrt_swapchain *xsc = NULL; // Has to be NULL.
 	xret = xrt_comp_create_swapchain(sess->compositor, &info, &xsc);
 	if (xret == XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED) {

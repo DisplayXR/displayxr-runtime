@@ -629,6 +629,14 @@ enum xrt_swapchain_create_flags
 	XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT = (1u << 0u),
 	//! Signals that the allocator should only allocate one image.
 	XRT_SWAPCHAIN_CREATE_STATIC_IMAGE = (1u << 1u),
+	/*!
+	 * The colour images hold display-encoded (sRGB) values although the
+	 * format may be UNORM: read them exactly like the format's `_SRGB`
+	 * sibling (XR_DXR_swapchain_color_encoding, ADR-044 Amendment 1). Only
+	 * set when the compositor declares
+	 * @ref xrt_compositor_info::color_encoded_srgb_swapchains.
+	 */
+	XRT_SWAPCHAIN_CREATE_COLOR_ENCODED_SRGB = (1u << 2u),
 };
 
 /*!
@@ -1162,6 +1170,14 @@ struct xrt_compositor_info
 
 	//! Initial focus state (returned from server to avoid race condition in IPC mode)
 	bool initial_focused;
+
+	/*!
+	 * The compositor honours @ref XRT_SWAPCHAIN_CREATE_COLOR_ENCODED_SRGB on
+	 * its colour formats (XR_DXR_swapchain_color_encoding). False makes the
+	 * state tracker refuse the declaration with XR_ERROR_FEATURE_UNSUPPORTED
+	 * rather than let the compositor read the values as linear.
+	 */
+	bool color_encoded_srgb_swapchains;
 };
 
 /*!

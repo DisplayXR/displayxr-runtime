@@ -156,6 +156,11 @@
       "group": "capture",
       "title": "Stereo Camera Source",
       "summary": "A runtime-owned, privacy-gated stereo camera source: the display's own camera (usually the eye tracker's, supplied by the vendor plug-in without taking it from the tracker) or an opted-in plain UVC side-by-side webcam, fanned out by the service to clients as rectified newest-frame side-by-side pairs over shared memory"
+    },
+    "XR_DXR_swapchain_color_encoding": {
+      "group": "rendering",
+      "title": "Swapchain Color Encoding",
+      "summary": "Declares that a UNORM swapchain holds display-encoded (sRGB) values, so the runtime reads it like an _SRGB one: lets a 10-bit back buffer be submitted without converting it"
     }
   }
 }

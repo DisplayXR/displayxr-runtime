@@ -85,6 +85,7 @@ typedef __eglMustCastToProperFunctionPointerType (*PFNEGLGETPROCADDRESSPROC)(con
 #include "openxr/XR_DXR_view_rig.h"
 #include "openxr/XR_DXR_depth_budget.h"
 #include "openxr/XR_DXR_cursor_depth.h"
+#include "openxr/XR_DXR_swapchain_color_encoding.h"
 #include "openxr/XR_DXR_display_zones.h"
 #include "openxr/XR_DXR_weave.h"
 #include "openxr/XR_DXR_lift.h"

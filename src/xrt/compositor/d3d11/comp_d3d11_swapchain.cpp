@@ -63,6 +63,22 @@ struct comp_d3d11_swapchain
 	//! The app's requested colour format (DXGI_FORMAT_UNKNOWN for depth).
 	DXGI_FORMAT color_format;
 
+	//! XR_DXR_swapchain_color_encoding: the app declared the values
+	//! display-encoded, so they are read like an `_SRGB` swapchain's.
+	bool encoded_srgb;
+
+	/*!
+	 * An encoded swapchain whose format has no `_SRGB` sibling (10/16-bit):
+	 * a composing frame samples an 8-bit TYPELESS shadow through its `_SRGB`
+	 * view instead, filled by a raw UNORM→UNORM draw. Created lazily, the
+	 * first time a composing frame samples the image.
+	 */
+	bool needs_compose_shadow;
+	ID3D11Texture2D *shadow_images[MAX_SWAPCHAIN_IMAGES];
+	ID3D11ShaderResourceView *shadow_srvs[MAX_SWAPCHAIN_IMAGES];
+	ID3D11RenderTargetView *shadow_rtvs[MAX_SWAPCHAIN_IMAGES][COMP_D3D11_SHADOW_MAX_SLICES];
+	uint64_t shadow_stamps[MAX_SWAPCHAIN_IMAGES];
+
 	//! Render target views for each image.
 	ID3D11RenderTargetView *rtvs[MAX_SWAPCHAIN_IMAGES];
 
@@ -243,6 +259,17 @@ d3d11_swapchain_destroy(struct xrt_swapchain *xsc)
 		if (sc->compose_srvs[i] != nullptr) {
 			sc->compose_srvs[i]->Release();
 		}
+		for (uint32_t s = 0; s < COMP_D3D11_SHADOW_MAX_SLICES; s++) {
+			if (sc->shadow_rtvs[i][s] != nullptr) {
+				sc->shadow_rtvs[i][s]->Release();
+			}
+		}
+		if (sc->shadow_srvs[i] != nullptr) {
+			sc->shadow_srvs[i]->Release();
+		}
+		if (sc->shadow_images[i] != nullptr) {
+			sc->shadow_images[i]->Release();
+		}
 		if (sc->srvs[i] != nullptr) {
 			sc->srvs[i]->Release();
 		}
@@ -390,6 +417,23 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 		// composes, so nothing would bind it.
 		compose_srv_format = srv_format;
 		srv_format = d3d_dxgi_format_srgb_to_unorm(srv_format);
+
+		// XR_DXR_swapchain_color_encoding: values declared display-encoded
+		// are composed exactly like an `_SRGB` swapchain's, decoded on
+		// sample. An 8-bit format has an `_SRGB` sibling the TYPELESS image
+		// can be viewed as; a deeper one has none and composes through a
+		// shadow (comp_d3d11_swapchain_get_compose_shadow).
+		sc->encoded_srgb = (info->create & XRT_SWAPCHAIN_CREATE_COLOR_ENCODED_SRGB) != 0 &&
+		                   !d3d_dxgi_format_is_srgb(dxgi_format);
+		if (sc->encoded_srgb) {
+			const DXGI_FORMAT sibling = d3d_dxgi_format_srgb_rtv(dxgi_format);
+			if (sibling != DXGI_FORMAT_UNKNOWN) {
+				compose_srv_format = sibling;
+			} else {
+				sc->needs_compose_shadow = !u_color_legacy_unorm_encoded();
+			}
+		}
+
 		if (u_color_legacy_unorm_encoded() || compose_srv_format == srv_format) {
 			compose_srv_format = DXGI_FORMAT_UNKNOWN; // nothing extra to build
 		}
@@ -546,7 +590,86 @@ comp_d3d11_swapchain_is_srgb(struct xrt_swapchain *xsc)
 {
 	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
 
-	return d3d_dxgi_format_is_srgb(sc->color_format);
+	// An `_SRGB` format, or values declared display-encoded
+	// (XR_DXR_swapchain_color_encoding): either way the bytes are encoded.
+	return d3d_dxgi_format_is_srgb(sc->color_format) || sc->encoded_srgb;
+}
+
+extern "C" bool
+comp_d3d11_swapchain_needs_compose_shadow(struct xrt_swapchain *xsc)
+{
+	return d3d11_sc(xsc)->needs_compose_shadow;
+}
+
+extern "C" bool
+comp_d3d11_swapchain_get_compose_shadow(struct xrt_swapchain *xsc,
+                                        uint32_t index,
+                                        struct comp_d3d11_compose_shadow *out_shadow)
+{
+	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
+	if (!sc->needs_compose_shadow || index >= sc->image_count || sc->images[index] == nullptr) {
+		return false;
+	}
+
+	if (sc->shadow_images[index] == nullptr) {
+		D3D11_TEXTURE2D_DESC src = {};
+		sc->images[index]->GetDesc(&src);
+		const uint32_t slices =
+		    src.ArraySize < COMP_D3D11_SHADOW_MAX_SLICES ? src.ArraySize : COMP_D3D11_SHADOW_MAX_SLICES;
+
+		// TYPELESS, so the raw fill writes through a UNORM view and the
+		// compose path reads through an `_SRGB` one.
+		D3D11_TEXTURE2D_DESC desc = {};
+		desc.Width = src.Width;
+		desc.Height = src.Height;
+		desc.MipLevels = 1;
+		desc.ArraySize = slices;
+		desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+		desc.SampleDesc.Count = 1;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+		auto internals = get_internals(sc->c);
+		if (FAILED(internals.device->CreateTexture2D(&desc, nullptr, &sc->shadow_images[index]))) {
+			U_LOG_W("XR_DXR_swapchain_color_encoding: no compose shadow for image %u", index);
+			return false;
+		}
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC srv = {};
+		srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		if (slices > 1) {
+			srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+			srv.Texture2DArray.MipLevels = 1;
+			srv.Texture2DArray.ArraySize = slices;
+		} else {
+			srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srv.Texture2D.MipLevels = 1;
+		}
+		internals.device->CreateShaderResourceView(sc->shadow_images[index], &srv, &sc->shadow_srvs[index]);
+
+		for (uint32_t s = 0; s < slices; s++) {
+			D3D11_RENDER_TARGET_VIEW_DESC rtv = {};
+			rtv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+			rtv.Texture2DArray.FirstArraySlice = s;
+			rtv.Texture2DArray.ArraySize = 1;
+			internals.device->CreateRenderTargetView(sc->shadow_images[index], &rtv,
+			                                         &sc->shadow_rtvs[index][s]);
+		}
+		sc->shadow_stamps[index] = UINT64_MAX;
+	}
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	sc->shadow_images[index]->GetDesc(&desc);
+	out_shadow->srgb_srv = sc->shadow_srvs[index];
+	out_shadow->slice_count = desc.ArraySize;
+	for (uint32_t s = 0; s < desc.ArraySize; s++) {
+		out_shadow->unorm_rtvs[s] = sc->shadow_rtvs[index][s];
+	}
+	out_shadow->width = desc.Width;
+	out_shadow->height = desc.Height;
+	out_shadow->stamp = &sc->shadow_stamps[index];
+	return out_shadow->srgb_srv != nullptr;
 }
 
 /*!
