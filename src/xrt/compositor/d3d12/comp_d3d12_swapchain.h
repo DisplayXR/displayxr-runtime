@@ -128,6 +128,14 @@ comp_d3d12_swapchain_compose_format(void *resource);
 bool
 comp_d3d12_swapchain_resource_is_srgb(void *resource);
 
+/*!
+ * XR_DXR_swapchain_color_encoding: must a composing frame sample this image
+ * through an 8-bit shadow? True for an image declared display-encoded whose
+ * format has no `_SRGB` sibling (10/16-bit), which no view can decode.
+ */
+bool
+comp_d3d12_swapchain_resource_needs_compose_shadow(void *resource);
+
 #ifdef __cplusplus
 }
 #endif

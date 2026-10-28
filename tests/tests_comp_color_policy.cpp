@@ -304,7 +304,9 @@ TEST_CASE("colour: the D3D12 leg keeps its two source views apart (#1589)")
 	// Every SRV the renderer builds over an APP image goes through that
 	// helper; the only direct sample_format() calls left are the ones that
 	// genuinely hand the app's bytes on unchanged (the Local2D flatten's
-	// legacy arm; #1795 picks its view by the scratch RTV, not compose_active).
+	// legacy arm; #1795 picks its view by the scratch RTV, not compose_active;
+	// and the XR_DXR_swapchain_color_encoding shadow fill, a raw UNORM->UNORM
+	// copy whose decode is the shadow's `_SRGB` view, not this one).
 	size_t direct = 0;
 	size_t pos = 0;
 	while ((pos = src.find("comp_d3d12_swapchain_sample_format(", pos)) != std::string::npos) {
@@ -321,11 +323,12 @@ TEST_CASE("colour: the D3D12 leg keeps its two source views apart (#1589)")
 	}
 	INFO("the D3D12 renderer calls comp_d3d12_swapchain_sample_format() directly "
 	     << direct
-	     << " time(s), expected 2 — one inside layer_source_format() (the fast-path arm) and one "
+	     << " time(s), expected 3 — one inside layer_source_format() (the fast-path arm), one "
 	        "in comp_d3d12_renderer_flatten_local_2d(), whose legacy (UNORM-RTV) arm hands the app's "
-	        "bytes on unchanged — its `_SRGB`-RTV arm takes the honest view (#1795). "
-	        "A new direct call is a draw that blends in the wrong space.");
-	CHECK(direct == 2);
+	        "bytes on unchanged — its `_SRGB`-RTV arm takes the honest view (#1795) — and one in "
+	        "renderer_fill_compose_shadow(), the raw copy into an encoded image's 8-bit shadow "
+	        "(XR_DXR_swapchain_color_encoding). A new direct call is a draw that blends in the wrong space.");
+	CHECK(direct == 3);
 }
 
 TEST_CASE("colour: the GL leg spells the same model in GL (#1589/#1610)")

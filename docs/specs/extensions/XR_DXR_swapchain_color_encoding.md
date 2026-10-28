@@ -6,7 +6,7 @@
 | Spec Version | 1 |
 | Type Values | `XR_TYPE_SWAPCHAIN_COLOR_ENCODING_CREATE_INFO_DXR` (1004999370) |
 | Author | The DisplayXR Project |
-| Platform | Windows, the in-process D3D11 compositor. Every other path refuses the declaration (§4). |
+| Platform | Windows, the in-process D3D11 and D3D12 compositors. Every other path refuses the declaration (§4). |
 
 ---
 
@@ -74,13 +74,13 @@ Further rules:
 - `XR_ERROR_VALIDATION_FAILURE`: `colorEncoding` is not a value of `XrSwapchainColorEncodingDXR`.
 - `XR_ERROR_FEATURE_UNSUPPORTED`: the session's compositor cannot honour
   `XR_SWAPCHAIN_COLOR_ENCODING_SRGB_DXR`. In spec version 1 that is every path except the
-  in-process D3D11 compositor: D3D12, IPC/service sessions, Vulkan, OpenGL and Metal.
+  in-process D3D11 and D3D12 compositors: IPC/service sessions, Vulkan, OpenGL and Metal.
   - The runtime refuses rather than read the values as linear.
   - An app can then pick the `_SRGB` sibling, or convert, on its own.
 
 ## 5. Formats
 
-The in-process D3D11 compositor adds `DXGI_FORMAT_R10G10B10A2_UNORM` to the formats
+The in-process D3D11 and D3D12 compositors add `DXGI_FORMAT_R10G10B10A2_UNORM` to the formats
 `xrEnumerateSwapchainFormats` returns. Without this extension it is read as linear, like every
 other UNORM format.
 
