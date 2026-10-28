@@ -342,3 +342,69 @@ TEST_CASE("screen home: never kept without a gone home, a recorded home or a las
 	add(reclaimed_last, LAPTOP, "sim-display", 0, true);
 	CHECK(decide(h, unplugged, &reclaimed_last, false, 0, 1) == U_SCREEN_HOME_KEEP_NO);
 }
+
+/*
+ * The session's display poll (#2305, review of the bounded wait): the push is
+ * due on a new generation or once a kept list's bound has passed; a push made
+ * only for the bound must still announce a newer generation its own snapshot
+ * picked up, and a kept list that could not be handed on stops being retried.
+ */
+TEST_CASE("screen home: the poll is due on a new generation or a passed bound")
+{
+	const uint64_t t0 = 50 * kSec;
+	// Nothing new, nothing kept.
+	CHECK_FALSE(u_screen_home_poll_due(4, 4, false, 0, t0, kBound));
+	CHECK_FALSE(u_screen_home_poll_due(0, 0, false, 0, t0, kBound));
+	// A new generation.
+	CHECK(u_screen_home_poll_due(5, 4, false, 0, t0, kBound));
+	// Kept: not yet, then due at the bound.
+	CHECK_FALSE(u_screen_home_poll_due(4, 4, true, t0, t0 + kBound - 1, kBound));
+	CHECK(u_screen_home_poll_due(4, 4, true, t0, t0 + kBound, kBound));
+	// A clock that went backwards is never due by the bound.
+	CHECK_FALSE(u_screen_home_poll_due(4, 4, true, t0, t0 - 1, kBound));
+}
+
+TEST_CASE("screen home: a push made for the bound announces a newer generation it picked up")
+{
+	// The bound's own push, nothing new: no event (the app saw the unplug).
+	u_screen_home_poll_after a = u_screen_home_poll_settle(5, 5, 5, false, true);
+	CHECK(a.follow == 5);
+	CHECK_FALSE(a.announce);
+	CHECK_FALSE(a.abandon_keep);
+
+	// The bound's push, but a sweep published 6 between the poll's read and
+	// the push's snapshot: the session follows 6 and the app hears of it
+	// (it would otherwise be dropped: the next frame sees 6 == 6).
+	a = u_screen_home_poll_settle(5, 5, 6, false, true);
+	CHECK(a.follow == 6);
+	CHECK(a.announce);
+
+	// An ordinary new generation, taken by the compositor.
+	a = u_screen_home_poll_settle(6, 5, 6, false, false);
+	CHECK(a.follow == 6);
+	CHECK(a.announce);
+	// ... or by no compositor: follow what the poll read, still announced.
+	a = u_screen_home_poll_settle(6, 5, 5, false, false);
+	CHECK(a.follow == 6);
+	CHECK(a.announce);
+	// The push's snapshot was newer than the poll's read.
+	a = u_screen_home_poll_settle(6, 5, 7, false, false);
+	CHECK(a.follow == 7);
+	CHECK(a.announce);
+}
+
+TEST_CASE("screen home: a kept list the push could not hand on is abandoned once, not retried every frame")
+{
+	const uint64_t t0 = 9 * kSec;
+	// The bound passed, the push returned before deciding: still keeping.
+	u_screen_home_poll_after a = u_screen_home_poll_settle(5, 5, 5, true, true);
+	CHECK(a.abandon_keep);
+	CHECK_FALSE(a.announce);
+	// The session stops keeping: the next frame's poll is not due.
+	CHECK_FALSE(u_screen_home_poll_due(5, 5, false, t0, t0 + 2 * kBound, kBound));
+
+	// A push that decided (the keep ended or expired) abandons nothing.
+	CHECK_FALSE(u_screen_home_poll_settle(5, 5, 5, false, true).abandon_keep);
+	// Still keeping inside the bound (a generation's push kept the list): fine.
+	CHECK_FALSE(u_screen_home_poll_settle(6, 5, 6, true, false).abandon_keep);
+}

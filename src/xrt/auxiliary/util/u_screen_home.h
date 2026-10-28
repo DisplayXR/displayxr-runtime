@@ -63,14 +63,16 @@ u_screen_home_record(struct u_screen_home *home, const struct xrt_screen_list *l
  * - it is gone, or another plug-in won it: NO screen carries SYSTEM_DEFAULT,
  *   so the segment managers fall back to the single-DP path ("the DP registry
  *   does not know the system-default screen — no segmentation") and nothing
- *   builds a second weaver for its panel. Before that rebuild a manager that
- *   can move the window handle hands the window to a screen of the new list
- *   whose DP is ready — never to a new DP for the departed screen — and that
- *   DP weaves the window until the home is back (ADR-047 Amendment 8). When
- *   the panel comes back (same screen id, same plug-in) the next re-push
- *   restores it. While the home is merely unplugged, the session first keeps
- *   the compositor on its last list for a bounded wait
- *   (@ref u_screen_home_keep_decide).
+ *   builds a second weaver for its panel. When the panel is unplugged (gone
+ *   and its plug-in unlisted, @ref u_screen_home_plugin_unlisted), the
+ *   session first keeps the compositor on its last list for a bounded wait
+ *   (@ref u_screen_home_keep_decide); before the rebuild that follows, a
+ *   manager that can move the window handle hands the window to a screen of
+ *   the new list whose DP is ready — never to a new DP for the departed
+ *   screen — and that DP weaves the window until the home is back (ADR-047
+ *   Amendment 8). A re-claimed or re-identified home keeps the hand-back to
+ *   its own DP. When the panel comes back (same screen id, same plug-in) the
+ *   next re-push restores it.
  */
 enum u_screen_home_outcome
 u_screen_home_anchor(const struct u_screen_home *home, struct xrt_screen_list *list);
@@ -141,6 +143,42 @@ u_screen_home_keep_decide(const struct u_screen_home *home,
                           uint64_t keep_since_ns,
                           uint64_t now_ns,
                           uint64_t bound_ns);
+
+/*!
+ * The session's display poll, once per frame (#2305): does it push the
+ * screens to the compositor? When the topology generation moved
+ * (@p gen non-zero and not @p session_gen), or when a kept list
+ * (@p keeping since @p keep_since_ns) has waited out @p bound_ns.
+ */
+bool
+u_screen_home_poll_due(
+    uint64_t gen, uint64_t session_gen, bool keeping, uint64_t keep_since_ns, uint64_t now_ns, uint64_t bound_ns);
+
+//! What the poll does after its push (@ref u_screen_home_poll_settle).
+struct u_screen_home_poll_after
+{
+	//! The generation the session follows from now on.
+	uint64_t follow;
+	//! The session moved to a new generation: log it and queue
+	//! XrEventDataDisplaysChangedDXR. True also when the poll only came for
+	//! the bound and the push's own snapshot was already newer — that change
+	//! must not go unannounced.
+	bool announce;
+	//! A kept list was due but is still kept: the push returned before it
+	//! could decide (no in-process compositor took the list). Stop keeping,
+	//! with one WARN, rather than retry every frame.
+	bool abandon_keep;
+};
+
+/*!
+ * Settle a poll's push. @p gen is the generation the poll read, @p before the
+ * session's generation before the push and @p pushed after it (the push's own
+ * snapshot, which may be newer than @p gen; equal to @p before when no
+ * compositor took the list). @p keeping_after is the session's keep flag after
+ * the push and @p bound_passed whether the poll came with the bound passed.
+ */
+struct u_screen_home_poll_after
+u_screen_home_poll_settle(uint64_t gen, uint64_t before, uint64_t pushed, bool keeping_after, bool bound_passed);
 
 //! A short word for @p o ("in place", "re-anchored", "gone", "re-claimed", "unrecorded").
 const char *

@@ -145,6 +145,29 @@ u_screen_home_keep_decide(const struct u_screen_home *home,
 	return held < bound_ns ? U_SCREEN_HOME_KEEP_HOLD : U_SCREEN_HOME_KEEP_EXPIRED;
 }
 
+bool
+u_screen_home_poll_due(
+    uint64_t gen, uint64_t session_gen, bool keeping, uint64_t keep_since_ns, uint64_t now_ns, uint64_t bound_ns)
+{
+	if (gen != 0 && gen != session_gen) {
+		return true;
+	}
+	return keeping && now_ns > keep_since_ns && now_ns - keep_since_ns >= bound_ns;
+}
+
+struct u_screen_home_poll_after
+u_screen_home_poll_settle(uint64_t gen, uint64_t before, uint64_t pushed, bool keeping_after, bool bound_passed)
+{
+	struct u_screen_home_poll_after a;
+	memset(&a, 0, sizeof(a));
+	// A compositor that took the list moved the session to the push's own
+	// snapshot; none did: follow what the poll read.
+	a.follow = pushed != before ? pushed : (gen != 0 ? gen : before);
+	a.announce = a.follow != before;
+	a.abandon_keep = keeping_after && bound_passed;
+	return a;
+}
+
 const char *
 u_screen_home_outcome_str(enum u_screen_home_outcome o)
 {

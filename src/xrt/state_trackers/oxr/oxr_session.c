@@ -6243,11 +6243,11 @@ oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool 
 	// re-seat comes back with no rebuild in between. No second weaver can
 	// result: nothing is claimed by the panel's plug-in. After the bound, or
 	// as soon as the list changes in another way, the list goes through and
-	// the home-gone rule applies: no screen carries the default, and a
-	// manager that can move the window handle gives the window to a screen
-	// whose DP is ready, never to a new DP for the departed screen (on
-	// Windows hardware that DP never became ready, and the laptop showed one
-	// eye of a whole-panel frustum until the replug).
+	// the home-gone rule applies: no screen carries the default, and (the
+	// panel unplugged) a manager that can move the window handle gives the
+	// window to a screen whose DP is ready, never to a new DP for the
+	// departed screen (on Windows hardware that DP never became ready, and
+	// the laptop showed one eye of a whole-panel frustum until the replug).
 	bool keep_last_list = false;
 	if (!initial && !sess->is_metal_native_compositor) {
 		const enum u_screen_home_outcome o = u_screen_home_anchor(&sess->display_home, screens);
@@ -6392,22 +6392,33 @@ oxr_session_poll_display_topology(struct oxr_logger *log, struct oxr_session *se
 {
 	struct xrt_instance *xinst = (sess->sys != NULL && sess->sys->inst != NULL) ? sess->sys->inst->xinst : NULL;
 	const uint64_t gen = xrt_instance_get_display_generation(xinst);
-	if (gen == 0 || gen == sess->display_generation) {
-		// #2305: the compositor is on its kept list (the home panel is
-		// unplugged) and no sweep has published since. Once the bound has
-		// passed, hand it the current list (the home-gone rule); the app saw
-		// the change at the unplug, so no event is queued.
-		if (sess->display_keeping &&
-		    os_monotonic_get_ns() - sess->display_keep_since_ns >= U_SCREEN_HOME_KEEP_BOUND_NS) {
-			oxr_session_push_screens(log, sess, false);
-		}
+	// #2305: also due once a kept list (the home panel unplugged) has waited
+	// out its bound with no sweep published since — then the compositor
+	// takes the current list (the home-gone rule).
+	const uint64_t now_ns = sess->display_keeping ? os_monotonic_get_ns() : 0;
+	if (!u_screen_home_poll_due(gen, sess->display_generation, sess->display_keeping, sess->display_keep_since_ns,
+	                            now_ns, U_SCREEN_HOME_KEEP_BOUND_NS)) {
 		return;
 	}
+	const bool bound_passed = gen == 0 || gen == sess->display_generation;
 	const uint64_t before = sess->display_generation;
 	oxr_session_push_screens(log, sess, false);
-	if (sess->display_generation == before) {
-		// No in-process compositor took the list: just follow the generation.
-		sess->display_generation = gen;
+	const struct u_screen_home_poll_after after =
+	    u_screen_home_poll_settle(gen, before, sess->display_generation, sess->display_keeping, bound_passed);
+	sess->display_generation = after.follow;
+	if (after.abandon_keep) {
+		// The push returned before deciding (no in-process compositor took
+		// the list): stop waiting instead of retrying every frame.
+		sess->display_keeping = false;
+		U_LOG_W(
+		    "display hotplug: the kept screen list for screen 0x%016llx ('%s') could not be handed on — the "
+		    "session stops waiting for it (#2305)",
+		    (unsigned long long)sess->display_home.screen_id, sess->display_home.plugin_id);
+	}
+	if (!after.announce) {
+		// Only the bound's own push: the topology did not move, the app saw
+		// the change at the unplug — no event.
+		return;
 	}
 	struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
 	uint32_t count = 0;
