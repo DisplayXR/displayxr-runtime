@@ -3031,6 +3031,15 @@ struct oxr_session
 	struct u_screen_home display_home;
 	//! The last anchor outcome logged (one WARN per change, not per re-push).
 	int display_home_logged;
+	//! The screen list last handed to the compositor (heap; NULL before the
+	//! first push). A re-push while the home panel is unplugged keeps it for
+	//! a bounded wait (u_screen_home_keep_decide).
+	struct xrt_screen_list *display_last_pushed;
+	//! The compositor is being left on @ref display_last_pushed since
+	//! @ref display_keep_since_ns (os_monotonic_get_ns): the home panel is
+	//! unplugged. Checked once per frame against U_SCREEN_HOME_KEEP_BOUND_NS.
+	bool display_keeping;
+	uint64_t display_keep_since_ns;
 
 	/*!
 	 * True when the session is bound to a display OTHER than the system
