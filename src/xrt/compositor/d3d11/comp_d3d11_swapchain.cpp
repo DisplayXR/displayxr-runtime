@@ -391,6 +391,12 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 	// even with GPU sync fixes.
 	if (!is_depth) {
 		DXGI_FORMAT typeless = d3d_dxgi_format_to_typeless_dxgi(dxgi_format);
+		// The shared helper leaves the 10-bit family typed (the runtime's deep
+		// atlas relies on that); an app swapchain image is TYPELESS like every
+		// other colour family, which is what the CTS checks.
+		if (dxgi_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+			typeless = DXGI_FORMAT_R10G10B10A2_TYPELESS;
+		}
 		if (typeless != dxgi_format) {
 			texture_format = typeless;
 			// rtv_format remains the original concrete format so the app's own
