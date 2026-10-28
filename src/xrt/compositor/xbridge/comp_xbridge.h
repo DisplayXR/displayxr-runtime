@@ -689,6 +689,53 @@ bool
 comp_xbridge_slot_recipe(struct comp_xbridge *xb, int32_t slot, struct comp_xbridge_recipe *out);
 
 /*!
+ * #1575 — a per-tile CLIP for one frame: the part of every view tile the
+ * bridge carries, and where the display processor weaves it.
+ *
+ * A window larger than the panel paints a content box larger than the bridge
+ * (the rings are sized once, at the panel's worst-case atlas). Its pixels past
+ * the panel never reach the panel, so the caller cuts every tile to the part
+ * on the panel (comp_segments_overhang_clip) and the bridge carries only that:
+ * tile i's rect @ref x, @ref y, @ref w, @ref h is copied from the caller's
+ * atlas at column `i % cols`, row `i / cols` of the @ref src_view_w x
+ * @ref src_view_h grid, packed into a `cols * w` x `rows * h` box. The slot
+ * is stamped with the clip, so the weave hands its DP @ref canvas_x ..
+ * @ref canvas_h as the canvas: the kept pixels land on the same window pixels
+ * they always would, no scaling, and the weave phase is unchanged.
+ */
+struct comp_xbridge_tile_clip
+{
+	uint32_t cols, rows;             //!< the atlas's tile grid
+	uint32_t src_view_w, src_view_h; //!< one tile in the caller's atlas (its stride)
+	uint32_t x, y, w, h;             //!< the kept rect inside every tile, tile px
+	int32_t canvas_x, canvas_y;      //!< where the DP weaves it, window px
+	uint32_t canvas_w, canvas_h;
+};
+
+/*!
+ * #1575 — stage a per-tile clip for the NEXT @ref comp_xbridge_submit only
+ * (NULL = none, the whole box as before). The submit's `content_w` x
+ * `content_h` must then be the PACKED box, `cols * w` x `rows * h`; a clip
+ * that does not describe it is dropped and the frame is carried whole.
+ */
+void
+comp_xbridge_stage_tile_clip(struct comp_xbridge *xb, const struct comp_xbridge_tile_clip *clip);
+
+/*!
+ * #1575 — the clip stamped on @p slot. False when the slot holds nothing or
+ * was carried whole; the weave then uses its own canvas, as before.
+ */
+bool
+comp_xbridge_slot_tile_clip(struct comp_xbridge *xb, int32_t slot, struct comp_xbridge_tile_clip *out);
+
+/*!
+ * #1575 — the largest content box the bridge carries (its worst-case system
+ * atlas, fixed at create). 0x0 for a NULL bridge.
+ */
+void
+comp_xbridge_get_max_dims(struct comp_xbridge *xb, uint32_t *out_w, uint32_t *out_h);
+
+/*!
  * `ID3D11ShaderResourceView *` of @p plane for @p slot (NULL when invalid).
  *
  * @param want_seq The content generation the caller's recipe says this slot
