@@ -168,20 +168,23 @@ the missing word. A swapchain created with `XR_SWAPCHAIN_COLOR_ENCODING_SRGB_DXR
 like an `_SRGB` one. The swapchain still declares its encoding; the extension only gives the
 deeper formats a way to do it.
 
-- **Where it is honoured.** Spec v1: the in-process D3D11 compositor, which also lists
-  `R10G10B10A2_UNORM`. It sets `xrt_compositor_info::color_encoded_srgb_swapchains`, and the state
-  tracker refuses the declaration (`XR_ERROR_FEATURE_UNSUPPORTED`) on every compositor that does
-  not.
-  - D3D12 is the next row to add. Its five layer-source sites each build an SRV from the app's
-    resource, so the shadow below has to be threaded through each one.
-- **Fast path and zero-copy.** `comp_d3d11_swapchain_is_srgb()` answers "encoded" for a declared
-  swapchain, so it takes the same raw path an `_SRGB` swapchain takes, at the format's full
-  precision.
+- **Where it is honoured.** Spec v1: the in-process D3D11 and D3D12 compositors, which also
+  list `R10G10B10A2_UNORM`. They set `xrt_compositor_info::color_encoded_srgb_swapchains`, and the
+  state tracker refuses the declaration (`XR_ERROR_FEATURE_UNSUPPORTED`) on every compositor that
+  does not.
+- **Fast path and zero-copy.** `comp_d3d11_swapchain_is_srgb()` and
+  `comp_d3d12_swapchain_resource_is_srgb()` answer "encoded" for a declared swapchain, so it takes
+  the same raw path an `_SRGB` swapchain takes, at the format's full precision.
+  - D3D12 stamps the declaration on each image as private data, like the requested view format.
 - **Compose path.**
   - An 8-bit declared swapchain is sampled through its `_SRGB` sibling view (the images are
     TYPELESS).
   - A format without one is first copied raw into an 8-bit TYPELESS shadow. A UNORM→UNORM draw
     applies no transfer function. The shadow is then sampled through its `_SRGB` view.
+  - D3D11 fills the shadow at the layer's sample site and restores the state it touched. D3D12
+    fills it in a pre-pass, before the frame binds its pipeline. There the shadow hangs off the
+    image as private data, and the draw sites swap only the SRV's resource; barriers stay on the
+    image.
   - The decode is still the hardware's. No shader holds the curve (§3, `tests_comp_color_policy.cpp`).
 
 ## Consequences

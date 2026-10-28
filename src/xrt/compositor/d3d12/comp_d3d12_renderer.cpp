@@ -590,6 +590,20 @@ struct comp_d3d12_renderer
 	//! byte-identically to the pre-#1589 renderer.
 	bool compose_active;
 
+	//! XR_DXR_swapchain_color_encoding: the raw fill of compose shadows
+	//! (renderer_fill_compose_shadows), built on first use.
+	struct
+	{
+		ID3D12RootSignature *root_signature;
+		ID3D12PipelineState *pso;
+		ID3D12DescriptorHeap *rtv_heap; //!< One CPU RTV, rewritten per slice
+		bool failed;
+		bool logged; //!< One WARN when a frame first composes through a shadow
+	} shadow;
+
+	//! Bumped once per frame; stamps compose-shadow fills.
+	uint64_t frame_serial;
+
 	//! @ref u_color_legacy_unorm_encoded, cached at create.
 	bool legacy_color;
 
@@ -975,6 +989,302 @@ renderer_target_rtv(struct comp_d3d12_renderer *r)
 	return rtv;
 }
 
+/*
+ * XR_DXR_swapchain_color_encoding — compose shadows.
+ *
+ * A swapchain image the app declared display-encoded is read like an `_SRGB`
+ * one. On the fast path that needs nothing (its values reach the encoded
+ * atlas raw); a COMPOSING frame needs them decoded on sample, and a 10/16-bit
+ * format has no `_SRGB` view to do it. Such an image is first copied raw into
+ * an 8-bit TYPELESS shadow (a UNORM view in, a UNORM target out: no transfer
+ * function), and the layer then samples the shadow through its `_SRGB` view,
+ * so the decode is the hardware's like every other `_SRGB` source (ADR-044 §3).
+ *
+ * The shadow hangs off the image as private data, so it lives exactly as long
+ * as the image; a second private-data stamp records the frame it was filled
+ * in, so an image two views share is filled once.
+ */
+
+// {5A9D2C17-8E43-4B61-9F0D-3C7E1A6B2D84}
+static const GUID kDxrComposeShadowGuid = {
+    0x5a9d2c17, 0x8e43, 0x4b61, {0x9f, 0x0d, 0x3c, 0x7e, 0x1a, 0x6b, 0x2d, 0x84}};
+// {B04E6F38-21C9-4D7A-8E5B-9A1F3C2D7E60}
+static const GUID kDxrComposeShadowStampGuid = {
+    0xb04e6f38, 0x21c9, 0x4d7a, {0x8e, 0x5b, 0x9a, 0x1f, 0x3c, 0x2d, 0x7e, 0x60}};
+
+static const char *const shadow_fill_source = R"(
+cbuffer ShadowFillCB : register(b0)
+{
+    uint slice;
+};
+
+Texture2DArray source : register(t0);
+
+void vs_main(uint id : SV_VertexID, out float4 position : SV_Position)
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+float4 ps_main(float4 position : SV_Position) : SV_Target
+{
+    return source.Load(int4(position.xy, slice, 0));
+}
+)";
+
+static bool
+renderer_ensure_shadow_fill(struct comp_d3d12_renderer *r, ID3D12Device *device)
+{
+	if (r->shadow.pso != nullptr) {
+		return true;
+	}
+	if (r->shadow.failed) {
+		return false;
+	}
+
+	D3D12_DESCRIPTOR_RANGE range = {};
+	range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	range.NumDescriptors = 1;
+	range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+	D3D12_ROOT_PARAMETER params[2] = {};
+	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	params[0].DescriptorTable.NumDescriptorRanges = 1;
+	params[0].DescriptorTable.pDescriptorRanges = &range;
+	params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	params[1].Constants.Num32BitValues = 1;
+	params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	D3D12_ROOT_SIGNATURE_DESC rs_desc = {};
+	rs_desc.NumParameters = 2;
+	rs_desc.pParameters = params;
+
+	ID3DBlob *sig = nullptr, *errors = nullptr, *vs = nullptr, *ps = nullptr;
+	bool ok = SUCCEEDED(D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &errors)) &&
+	          SUCCEEDED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+	                                                IID_PPV_ARGS(&r->shadow.root_signature))) &&
+	          SUCCEEDED(compile_shader(shadow_fill_source, "vs_main", "vs_5_0", &vs)) &&
+	          SUCCEEDED(compile_shader(shadow_fill_source, "ps_main", "ps_5_0", &ps));
+	if (ok) {
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+		pso.pRootSignature = r->shadow.root_signature;
+		pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+		pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+		pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+		pso.SampleMask = UINT_MAX;
+		pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		pso.RasterizerState.DepthClipEnable = TRUE;
+		pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		pso.NumRenderTargets = 1;
+		pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+		pso.SampleDesc.Count = 1;
+		D3D12_DESCRIPTOR_HEAP_DESC heap = {};
+		heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+		heap.NumDescriptors = 1;
+		ok = SUCCEEDED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&r->shadow.pso))) &&
+		     SUCCEEDED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&r->shadow.rtv_heap)));
+	}
+	for (ID3DBlob *blob : {sig, errors, vs, ps}) {
+		if (blob != nullptr) {
+			blob->Release();
+		}
+	}
+	if (!ok) {
+		r->shadow.failed = true;
+		U_LOG_W(
+		    "XR_DXR_swapchain_color_encoding: compose shadow fill unavailable; deep encoded layers compose "
+		    "as if linear");
+	}
+	return ok;
+}
+
+//! The shadow of @p src, created on first use. Borrowed: @p src owns it.
+static ID3D12Resource *
+renderer_get_compose_shadow(ID3D12Device *device, ID3D12Resource *src)
+{
+	ID3D12Resource *shadow = nullptr;
+	UINT size = (UINT)sizeof(shadow);
+	if (SUCCEEDED(src->GetPrivateData(kDxrComposeShadowGuid, &size, &shadow)) && shadow != nullptr) {
+		shadow->Release(); // GetPrivateData added a reference; src keeps its own
+		return shadow;
+	}
+
+	const D3D12_RESOURCE_DESC src_desc = src->GetDesc();
+	D3D12_RESOURCE_DESC desc = {};
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	desc.Width = src_desc.Width;
+	desc.Height = src_desc.Height;
+	desc.DepthOrArraySize = src_desc.DepthOrArraySize;
+	desc.MipLevels = 1;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+	desc.SampleDesc.Count = 1;
+	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+	                                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+	                                           IID_PPV_ARGS(&shadow)))) {
+		return nullptr;
+	}
+	shadow->SetName(L"DXR.compose_shadow");
+	src->SetPrivateDataInterface(kDxrComposeShadowGuid, shadow);
+	shadow->Release(); // src holds it now
+	return shadow;
+}
+
+static D3D12_RESOURCE_BARRIER
+shadow_transition(ID3D12Resource *res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource = res;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	barrier.Transition.StateBefore = before;
+	barrier.Transition.StateAfter = after;
+	return barrier;
+}
+
+//! Fill @p src's shadow for this frame (once), raw.
+static void
+renderer_fill_compose_shadow(struct comp_d3d12_renderer *r,
+                             ID3D12GraphicsCommandList *cmd_list,
+                             ID3D12Device *device,
+                             ID3D12Resource *src)
+{
+	if (!renderer_ensure_shadow_fill(r, device)) {
+		return;
+	}
+	ID3D12Resource *shadow = renderer_get_compose_shadow(device, src);
+	if (shadow == nullptr) {
+		return;
+	}
+	uint64_t stamp = 0;
+	UINT size = (UINT)sizeof(stamp);
+	if (SUCCEEDED(shadow->GetPrivateData(kDxrComposeShadowStampGuid, &size, &stamp)) && stamp == r->frame_serial) {
+		return;
+	}
+	const uint32_t srv_slot = r->next_srv_slot++;
+	if (srv_slot >= r->srv_heap_size) {
+		U_LOG_E("D3D12 renderer: SRV heap overflow in compose shadow fill (slot %u >= %u)", srv_slot,
+		        r->srv_heap_size);
+		return;
+	}
+	shadow->SetPrivateData(kDxrComposeShadowStampGuid, (UINT)sizeof(r->frame_serial), &r->frame_serial);
+
+	const D3D12_RESOURCE_DESC desc = src->GetDesc();
+	if (!r->shadow.logged) {
+		r->shadow.logged = true;
+		U_LOG_W(
+		    "XR_DXR_swapchain_color_encoding: composing a display-encoded %ux%u x%u source through its "
+		    "8-bit shadow (no _SRGB view for its format)",
+		    (unsigned)desc.Width, (unsigned)desc.Height, (unsigned)desc.DepthOrArraySize);
+	}
+
+	// The image's non-decoding view in, the shadow's UNORM view out.
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+	srv.Format = comp_d3d12_swapchain_sample_format(src);
+	srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+	srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srv.Texture2DArray.MipLevels = 1;
+	srv.Texture2DArray.ArraySize = desc.DepthOrArraySize;
+	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
+	srv_cpu.ptr += r->srv_descriptor_size * srv_slot;
+	device->CreateShaderResourceView(src, &srv, srv_cpu);
+	D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = r->srv_heap->GetGPUDescriptorHandleForHeapStart();
+	srv_gpu.ptr += r->srv_descriptor_size * srv_slot;
+
+	// Swapchain images rest in RENDER_TARGET between layer draws (each draw
+	// site moves its source to PIXEL_SHADER_RESOURCE and back).
+	D3D12_RESOURCE_BARRIER before[2] = {
+	    shadow_transition(src, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+	    shadow_transition(shadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+	};
+	cmd_list->ResourceBarrier(2, before);
+
+	cmd_list->SetGraphicsRootSignature(r->shadow.root_signature);
+	cmd_list->SetPipelineState(r->shadow.pso);
+	ID3D12DescriptorHeap *heaps[] = {r->srv_heap};
+	cmd_list->SetDescriptorHeaps(1, heaps);
+	cmd_list->SetGraphicsRootDescriptorTable(0, srv_gpu);
+	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	const D3D12_VIEWPORT viewport = {0.0f, 0.0f, (float)desc.Width, (float)desc.Height, 0.0f, 1.0f};
+	const D3D12_RECT scissor = {0, 0, (LONG)desc.Width, (LONG)desc.Height};
+	cmd_list->RSSetViewports(1, &viewport);
+	cmd_list->RSSetScissorRects(1, &scissor);
+	const D3D12_CPU_DESCRIPTOR_HANDLE rtv = r->shadow.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	for (UINT slice = 0; slice < desc.DepthOrArraySize; slice++) {
+		D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+		rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+		rtv_desc.Texture2DArray.FirstArraySlice = slice;
+		rtv_desc.Texture2DArray.ArraySize = 1;
+		device->CreateRenderTargetView(shadow, &rtv_desc, rtv); // read at OMSetRenderTargets
+		cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+		cmd_list->SetGraphicsRoot32BitConstant(1, slice, 0);
+		cmd_list->DrawInstanced(3, 1, 0, 0);
+	}
+
+	D3D12_RESOURCE_BARRIER after[2] = {
+	    shadow_transition(shadow, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+	    shadow_transition(src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+	};
+	cmd_list->ResourceBarrier(2, after);
+}
+
+/*!
+ * Fill this frame's compose shadows, before the frame binds its own pipeline
+ * state (so nothing has to be restored). Only on composing frames: the fast
+ * path reads every encoded image raw.
+ */
+static void
+renderer_fill_compose_shadows(struct comp_d3d12_renderer *r,
+                              ID3D12GraphicsCommandList *cmd_list,
+                              ID3D12Device *device,
+                              struct comp_layer_accum *layers)
+{
+	if (!r->compose_active) {
+		return;
+	}
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		struct comp_layer *layer = &layers->layers[i];
+		switch (layer->data.type) {
+		case XRT_LAYER_PROJECTION:
+		case XRT_LAYER_PROJECTION_DEPTH:
+		case XRT_LAYER_ZONE_3D:
+			// All three lead with the projection views (the draw reads them the same way).
+			for (uint32_t v = 0; v < XRT_MAX_VIEWS; v++) {
+				if (layer->sc_array[v] == nullptr) {
+					continue;
+				}
+				auto *res = static_cast<ID3D12Resource *>(comp_d3d12_swapchain_get_resource(
+				    layer->sc_array[v], layer->data.proj.v[v].sub.image_index));
+				if (res != nullptr && comp_d3d12_swapchain_resource_needs_compose_shadow(res)) {
+					renderer_fill_compose_shadow(r, cmd_list, device, res);
+				}
+			}
+			break;
+		case XRT_LAYER_QUAD:
+		case XRT_LAYER_WINDOW_SPACE:
+		case XRT_LAYER_EQUIRECT2: {
+			const uint32_t image_index =
+			    layer->data.type == XRT_LAYER_QUAD           ? layer->data.quad.sub.image_index
+			    : layer->data.type == XRT_LAYER_WINDOW_SPACE ? layer->data.window_space.sub.image_index
+			                                                 : layer->data.equirect2.sub.image_index;
+			if (layer->sc_array[0] == nullptr) {
+				break;
+			}
+			auto *res = static_cast<ID3D12Resource *>(
+			    comp_d3d12_swapchain_get_resource(layer->sc_array[0], image_index));
+			if (res != nullptr && comp_d3d12_swapchain_resource_needs_compose_shadow(res)) {
+				renderer_fill_compose_shadow(r, cmd_list, device, res);
+			}
+			break;
+		}
+		default: break;
+		}
+	}
+}
+
 /*!
  * The SRV format a layer's source is sampled through THIS FRAME.
  *
@@ -987,6 +1297,35 @@ layer_source_format(struct comp_d3d12_renderer *r, ID3D12Resource *src_resource)
 {
 	return r->compose_active ? comp_d3d12_swapchain_compose_format(src_resource)
 	                         : comp_d3d12_swapchain_sample_format(src_resource);
+}
+
+/*!
+ * The resource a layer's SRV views THIS FRAME, and its format: the source
+ * itself, or on a composing frame its filled compose shadow
+ * (XR_DXR_swapchain_color_encoding). Barriers stay on the source either way.
+ */
+static ID3D12Resource *
+layer_view_resource(struct comp_d3d12_renderer *r, ID3D12Resource *src_resource, DXGI_FORMAT *out_format)
+{
+	if (r->compose_active && comp_d3d12_swapchain_resource_needs_compose_shadow(src_resource)) {
+		ID3D12Resource *shadow = nullptr;
+		UINT size = (UINT)sizeof(shadow);
+		if (SUCCEEDED(src_resource->GetPrivateData(kDxrComposeShadowGuid, &size, &shadow)) &&
+		    shadow != nullptr) {
+			uint64_t stamp = 0;
+			UINT stamp_size = (UINT)sizeof(stamp);
+			const bool filled =
+			    SUCCEEDED(shadow->GetPrivateData(kDxrComposeShadowStampGuid, &stamp_size, &stamp)) &&
+			    stamp == r->frame_serial;
+			shadow->Release(); // borrowed: the source keeps it alive
+			if (filled) {
+				*out_format = kComposeRtvFormat;
+				return shadow;
+			}
+		}
+	}
+	*out_format = layer_source_format(r, src_resource);
+	return src_resource;
 }
 
 /*!
@@ -1292,14 +1631,14 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 	// app's display-referred bytes reach the DP unchanged. #1503: app
 	// swapchain images are TYPELESS, so either way the view format comes from
 	// the typed format the app requested, not from GetDesc().
-	srv_desc.Format = layer_source_format(r, src_resource);
+	ID3D12Resource *view_resource = layer_view_resource(r, src_resource, &srv_desc.Format);
 	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srv_desc.Texture2D.MipLevels = 1;
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 
 	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
 	srv_cpu.ptr += r->srv_descriptor_size * srv_slot;
-	device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
+	device->CreateShaderResourceView(view_resource, &srv_desc, srv_cpu);
 
 	// Compute per-eye disparity offset
 	float half_disp = ws->disparity / 2.0f;
@@ -1578,7 +1917,7 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 	// takes) the non-decoding view passes the app's bytes through. (#1503
 	// resolves the app's requested format, since the image itself is
 	// TYPELESS.)
-	srv_desc.Format = layer_source_format(r, src_resource);
+	ID3D12Resource *view_resource = layer_view_resource(r, src_resource, &srv_desc.Format);
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	if (layered) {
 		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -1594,7 +1933,7 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 
 	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
 	srv_cpu.ptr += r->srv_descriptor_size * srv_slot;
-	device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
+	device->CreateShaderResourceView(view_resource, &srv_desc, srv_cpu);
 
 	D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = r->srv_heap->GetGPUDescriptorHandleForHeapStart();
 	gpu_srv.ptr += r->srv_descriptor_size * srv_slot;
@@ -1810,7 +2149,7 @@ render_equirect2_layer(struct comp_d3d12_renderer *r,
 	// so a composing frame must sample it LINEAR and let the `_SRGB` RTV apply
 	// the OETF once. (An equirect2 frame never takes the fast path: the layer
 	// is a sub-rect contributor, so renderer_frame_takes_fast_path() counts it.)
-	srv_desc.Format = layer_source_format(r, src_resource);
+	ID3D12Resource *view_resource = layer_view_resource(r, src_resource, &srv_desc.Format);
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	if (layered) {
 		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -1826,7 +2165,7 @@ render_equirect2_layer(struct comp_d3d12_renderer *r,
 
 	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
 	srv_cpu.ptr += r->srv_descriptor_size * srv_slot;
-	device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
+	device->CreateShaderResourceView(view_resource, &srv_desc, srv_cpu);
 
 	D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = r->srv_heap->GetGPUDescriptorHandleForHeapStart();
 	gpu_srv.ptr += r->srv_descriptor_size * srv_slot;
@@ -2891,6 +3230,15 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 	if (r->flatten_root_signature != nullptr) {
 		r->flatten_root_signature->Release();
 	}
+	if (r->shadow.pso != nullptr) {
+		r->shadow.pso->Release();
+	}
+	if (r->shadow.root_signature != nullptr) {
+		r->shadow.root_signature->Release();
+	}
+	if (r->shadow.rtv_heap != nullptr) {
+		r->shadow.rtv_heap->Release();
+	}
 	if (r->composite_srv_heap != nullptr) {
 		r->composite_srv_heap->Release();
 	}
@@ -3018,6 +3366,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 
 	// Reset per-frame SRV slot allocator (slot 0 = atlas, slots 1+ for layers)
 	renderer->next_srv_slot = 1;
+	renderer->frame_serial++;
 
 	// XR_DXR_display_zones (ADR-027): a zones frame composes N placed zone
 	// layers into the window-spanning atlas — the unzoned area must weave
@@ -3075,6 +3424,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	if (!renderer_frame_takes_fast_path(renderer, layers)) {
 		renderer->compose_active = renderer_ensure_compose_target(renderer);
 	}
+	renderer_fill_compose_shadows(renderer, cmd_list, device, layers);
 
 	// Clear the target to black; transparent in zones frames.
 	//
@@ -3372,7 +3722,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			// private `_SRGB` target re-encodes once on write. #1503: the
 			// image is TYPELESS, so either resolve goes through its stamped
 			// requested format rather than src_desc.Format.
-			srv_desc.Format = layer_source_format(renderer, src_resource);
+			ID3D12Resource *view_resource = layer_view_resource(renderer, src_resource, &srv_desc.Format);
 			srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 			// Honor the projection view's array layer. Under single-pass-instanced
 			// the app submits ONE swapchain with viewCount=2 and per-view
@@ -3397,7 +3747,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 
 			D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = renderer->srv_heap->GetCPUDescriptorHandleForHeapStart();
 			srv_cpu.ptr += renderer->srv_descriptor_size * srv_slot;
-			device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
+			device->CreateShaderResourceView(view_resource, &srv_desc, srv_cpu);
 
 			D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = renderer->srv_heap->GetGPUDescriptorHandleForHeapStart();
 			gpu_srv.ptr += renderer->srv_descriptor_size * srv_slot;

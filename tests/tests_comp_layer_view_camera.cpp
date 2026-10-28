@@ -1792,8 +1792,15 @@ TEST_CASE("the equirect2 draw consults the shared rules on every backend that ha
 	    "knows which render target this frame paints (#1610)");
 	CHECK(d3d12_body.find("equirect2_pso_for(") != std::string::npos);
 
+	// layer_view_resource() is the same decision plus the compose shadow of a
+	// display-encoded image (XR_DXR_swapchain_color_encoding); it must itself
+	// defer to layer_source_format() for every other source.
 	INFO("the D3D12 equirect2 draw must take its source SRV format from layer_source_format() (#1589/#1694)");
-	CHECK(d3d12_body.find("layer_source_format(") != std::string::npos);
+	CHECK((d3d12_body.find("layer_source_format(") != std::string::npos ||
+	       d3d12_body.find("layer_view_resource(") != std::string::npos));
+	INFO("layer_view_resource() must defer to layer_source_format() for every source without a compose shadow");
+	// Raw body: code_only() reads its `*out_format = ...` line as a comment continuation.
+	CHECK(function_body(d3d12, "layer_view_resource").find("layer_source_format(") != std::string::npos);
 
 	/*
 	 * ...and the GL-specific half. Three things this leg can get wrong that
