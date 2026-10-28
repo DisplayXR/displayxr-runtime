@@ -13,7 +13,7 @@
  * hands the compositor a list without it. The old rule handed the window back
  * to the home's DP — a fresh DP for a panel that is not there. Now the window
  * stays on the laptop's ready DP, which takes the primary slot, and the
- * compositor remembers that (away_screen_id) so the next manager with the
+ * compositor remembers that (comp_segments_away) so the next manager with the
  * panel back moves it out again. The D3D11 and GL managers carry the same
  * code; only this one builds off Windows, so it is the one driven here.
  */
@@ -29,6 +29,7 @@
 #include "xrt/xrt_display_processor_vk.h"
 #include "xrt/xrt_plugin.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -68,7 +69,8 @@ struct World
 	bool fail_laptop_window = false;
 	bool fail_other_window = false;
 	xrt_display_processor *slot = nullptr; //!< the compositor's primary slot (the session DP)
-	uint64_t away = 0;                     //!< the compositor's away_screen_id
+	comp_segments_away away{};             //!< the compositor's away record
+	int max_window_holders = 0;            //!< most DPs holding the window at once (one weaver per window)
 
 	FakeDp *
 	holder() const
@@ -174,6 +176,7 @@ make_dp(World *w, uint64_t screen, bool window)
 	d->serial = ++w->made;
 	w->made_for_panel += (screen == PANEL || screen == PANEL2) ? 1 : 0;
 	w->alive.push_back(d);
+	w->max_window_holders = std::max(w->max_window_holders, w->window_holders());
 	return d;
 }
 
@@ -253,7 +256,7 @@ struct Rig
 		hooks.hwnd = kHwnd;
 		hooks.userdata = &w;
 		hooks.swap_primary = fake_swap_primary;
-		hooks.away_screen_id = &w.away;
+		hooks.away = &w.away;
 		comp_vk_native_segments_set_hwnd_hooks(segs, &hooks);
 		comp_vk_native_segments_set_screens(segs, &list, &info, 0);
 		return segs;
@@ -361,14 +364,14 @@ TEST_CASE("home gone: the window stays on the laptop's ready DP, never a new DP 
 	for (FakeDp *d : r.w.alive) {
 		CHECK(d->screen != PANEL);
 	}
-	CHECK(r.w.away == LAPTOP);
+	CHECK(r.w.away.screen_id == LAPTOP);
 
 	// The rebuilt manager has one screen: no segmentation, the slot is untouched.
 	segs = r.manager(gone);
 	CHECK_FALSE(comp_vk_native_segments_enabled(segs));
 	comp_vk_native_segments_destroy_for_rebuild(&segs, nullptr);
 	CHECK(fake(r.w.slot) == laptop_dp);
-	CHECK(r.w.away == LAPTOP);
+	CHECK(r.w.away.screen_id == LAPTOP);
 
 	// The panel is back. The first update of the new manager moves the
 	// laptop's DP out of the slot — still holding the window — and gives the
@@ -379,7 +382,7 @@ TEST_CASE("home gone: the window stays on the laptop's ready DP, never a new DP 
 	const comp_seg_rect canvas{0, 0, ON_PANEL.w, ON_PANEL.h};
 	CHECK(comp_vk_native_segments_would_split(segs, &ON_PANEL, &canvas)); // the update must run
 	(void)comp_vk_native_segments_update(segs, &ON_PANEL, &canvas, kFormat, true, 0);
-	CHECK(r.w.away == 0);
+	CHECK(r.w.away.screen_id == 0);
 	CHECK(r.w.holder() == laptop_dp);
 	REQUIRE(r.w.slot != nullptr);
 	CHECK(fake(r.w.slot)->screen == PANEL);
@@ -417,7 +420,7 @@ TEST_CASE("home gone while the panel's DP still holds the window: handed to the 
 	CHECK(fake(r.w.slot) == r.w.holder());
 	CHECK(r.w.made_for_panel == panel_dps);
 	CHECK(r.w.window_holders() == 1);
-	CHECK(r.w.away == LAPTOP);
+	CHECK(r.w.away.screen_id == LAPTOP);
 	for (FakeDp *d : r.w.alive) {
 		CHECK(d->screen != PANEL);
 	}
@@ -426,7 +429,7 @@ TEST_CASE("home gone while the panel's DP still holds the window: handed to the 
 	segs = r.manager(b);
 	const comp_seg_rect canvas{0, 0, MOSTLY_PANEL.w, MOSTLY_PANEL.h};
 	(void)comp_vk_native_segments_update(segs, &MOSTLY_PANEL, &canvas, kFormat, true, 0);
-	CHECK(r.w.away == 0);
+	CHECK(r.w.away.screen_id == 0);
 	CHECK(fake(r.w.slot)->screen == PANEL);
 	comp_vk_native_segments_set_hwnd_hooks(segs, nullptr);
 	comp_vk_native_segments_destroy(&segs);
@@ -451,7 +454,7 @@ TEST_CASE("home gone and no screen with a ready DP: the window stays put, no DP 
 	CHECK(fake(r.w.slot) == session_dp);
 	CHECK(r.w.holder() == session_dp);
 	CHECK(r.w.made_for_panel == panel_dps);
-	CHECK(r.w.away == 0);
+	CHECK(r.w.away.screen_id == 0);
 	comp_vk_native_segments_destroy_for_rebuild(&segs, nullptr);
 }
 
@@ -468,7 +471,7 @@ TEST_CASE("home in the next list (a replug, a teardown): back to the panel's DP,
 	REQUIRE(r.w.holder() != nullptr);
 	CHECK(r.w.holder()->screen == PANEL);
 	CHECK(fake(r.w.slot) == r.w.holder());
-	CHECK(r.w.away == 0);
+	CHECK(r.w.away.screen_id == 0);
 
 	// A teardown with hooks (no next list): the same.
 	segs = r.manager(b);
@@ -476,7 +479,7 @@ TEST_CASE("home in the next list (a replug, a teardown): back to the panel's DP,
 	REQUIRE(r.w.holder()->screen == LAPTOP);
 	comp_vk_native_segments_destroy(&segs);
 	CHECK(r.w.holder()->screen == PANEL);
-	CHECK(r.w.away == 0);
+	CHECK(r.w.away.screen_id == 0);
 }
 
 TEST_CASE("home gone, the ready screen's DP cannot be made: the window stays with the panel's DP it is on")
@@ -498,7 +501,7 @@ TEST_CASE("home gone, the ready screen's DP cannot be made: the window stays wit
 	CHECK(fake(r.w.slot) == session_dp);
 	CHECK(r.w.holder() == session_dp);
 	CHECK(r.w.made_for_panel == panel_dps);
-	CHECK(r.w.away == 0);
+	CHECK(r.w.away.screen_id == 0);
 	comp_vk_native_segments_destroy_for_rebuild(&segs, nullptr);
 }
 
@@ -533,7 +536,7 @@ TEST_CASE("home gone, the holder is not ready and the ready screen's DP cannot b
 	}
 	CHECK(r.w.holder() == laptop_dp);
 	CHECK(fake(r.w.slot) == laptop_dp);
-	CHECK(r.w.away == LAPTOP);
+	CHECK(r.w.away.screen_id == LAPTOP);
 	comp_vk_native_segments_destroy_for_rebuild(&segs, nullptr);
 }
 
@@ -554,7 +557,7 @@ TEST_CASE("the panel re-claimed by another plug-in is still there: the window go
 	REQUIRE(r.w.holder() != nullptr);
 	CHECK(r.w.holder()->screen == PANEL);
 	CHECK(fake(r.w.slot) == r.w.holder());
-	CHECK(r.w.away == 0);
+	CHECK(r.w.away.screen_id == 0);
 }
 
 TEST_CASE("the panel under a new position-derived id is still there: the window goes back to its DP, not the laptop's")
@@ -574,7 +577,7 @@ TEST_CASE("the panel under a new position-derived id is still there: the window 
 	REQUIRE(r.w.holder() != nullptr);
 	CHECK(r.w.holder()->screen == PANEL);
 	CHECK(fake(r.w.slot) == r.w.holder());
-	CHECK(r.w.away == 0);
+	CHECK(r.w.away.screen_id == 0);
 }
 
 TEST_CASE("the panel back after the bound with the laptop's screen off: the panel's DP takes the window back")
@@ -590,7 +593,7 @@ TEST_CASE("the panel back after the bound with the laptop's screen off: the pane
 	const xrt_screen_list gone = laptop_only();
 	comp_vk_native_segments_destroy_for_rebuild(&segs, &gone);
 	REQUIRE(fake(r.w.slot) == laptop_dp);
-	REQUIRE(r.w.away == LAPTOP);
+	REQUIRE(r.w.away.screen_id == LAPTOP);
 	segs = r.manager(gone);
 
 	// The replug lists the panel alone: a one-screen list, still re-homed.
@@ -602,7 +605,7 @@ TEST_CASE("the panel back after the bound with the laptop's screen off: the pane
 	const comp_seg_rect canvas{0, 0, ON_PANEL.w, ON_PANEL.h};
 	CHECK(comp_vk_native_segments_would_split(segs, &ON_PANEL, &canvas));
 	(void)comp_vk_native_segments_update(segs, &ON_PANEL, &canvas, kFormat, true, 0);
-	CHECK(r.w.away == 0);
+	CHECK(r.w.away.screen_id == 0);
 	REQUIRE(r.w.slot != nullptr);
 	CHECK(fake(r.w.slot)->screen == PANEL);
 	CHECK(fake(r.w.slot)->window);
@@ -615,4 +618,223 @@ TEST_CASE("the panel back after the bound with the laptop's screen off: the pane
 	// session DP and the only one left.
 	CHECK(r.w.alive.size() == 1);
 	CHECK(r.w.holder() == fake(r.w.slot));
+}
+
+TEST_CASE("the panel back alone under a new id after the bound: it stands in, then the home's own DP takes over")
+{
+	Rig r;
+	const xrt_screen_list b = both();
+	comp_vk_native_segments *segs = r.manager(b);
+	run(segs, ON_LAPTOP);
+	FakeDp *laptop_dp = r.w.holder();
+	REQUIRE(laptop_dp->screen == LAPTOP);
+
+	// Past the bound: the laptop's DP takes the slot.
+	r.w.panel_ready = false;
+	const xrt_screen_list gone = laptop_only();
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &gone);
+	REQUIRE(fake(r.w.slot) == laptop_dp);
+	REQUIRE(r.w.away.screen_id == LAPTOP);
+	CHECK(r.w.away.home_id == PANEL);
+	CHECK(std::strcmp(r.w.away.home_plugin_id, "vendor") == 0);
+	segs = r.manager(gone);
+
+	// The laptop's screen off, the panel replugged: alone at (0, 0) under its
+	// position-derived id. The session's home is the old id, so no screen
+	// carries the default.
+	r.w.panel_ready = true;
+	const int panel_dps = r.w.made_for_panel;
+	xrt_screen_list alone{};
+	add(alone, PANEL2, "vendor", 0, 3840, 2160, false);
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &alone);
+	CHECK(fake(r.w.slot) == laptop_dp); // no primary in the old manager: nothing moved yet
+	segs = r.manager(alone);
+	REQUIRE(comp_vk_native_segments_enabled(segs));
+	const comp_seg_rect on_alone{200, 200, 1280, 720};
+	const comp_seg_rect canvas{0, 0, on_alone.w, on_alone.h};
+	CHECK(comp_vk_native_segments_would_split(segs, &on_alone, &canvas)); // the update must run
+	(void)comp_vk_native_segments_update(segs, &on_alone, &canvas, kFormat, true, 0);
+	REQUIRE(r.w.slot != nullptr);
+	CHECK(fake(r.w.slot)->screen == PANEL2);
+	CHECK(fake(r.w.slot)->window);
+	CHECK(r.w.made_for_panel == panel_dps + 1);
+	// The laptop's DP (another plug-in) goes with the next update's deferred releases.
+	(void)comp_vk_native_segments_update(segs, &on_alone, &canvas, kFormat, true, 0);
+	CHECK(r.w.window_holders() == 1);
+	// A stand-in: the record names it, so the home's own DP is made when it returns.
+	CHECK(r.w.away.screen_id == PANEL2);
+	CHECK(r.w.away.home_id == PANEL);
+	CHECK_FALSE(comp_vk_native_segments_enabled(segs));
+
+	// The same list again: the slot already holds the stand-in's DP, nothing is re-made.
+	FakeDp *stand_in_dp = fake(r.w.slot);
+	const int made = r.w.made;
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &alone);
+	segs = r.manager(alone);
+	run(segs, on_alone, 100);
+	CHECK(fake(r.w.slot) == stand_in_dp);
+	CHECK(r.w.made == made);
+	CHECK(r.w.away.screen_id == PANEL2);
+
+	// The laptop's screen back on: the extended layout again, the panel under
+	// its own id with the default. The stand-in's DP is the same plug-in's,
+	// so it lets go of the window before the home's DP takes it.
+	r.w.max_window_holders = r.w.window_holders();
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &b);
+	segs = r.manager(b);
+	REQUIRE(comp_vk_native_segments_enabled(segs));
+	const comp_seg_rect canvas_p{0, 0, ON_PANEL.w, ON_PANEL.h};
+	CHECK(comp_vk_native_segments_would_split(segs, &ON_PANEL, &canvas_p));
+	(void)comp_vk_native_segments_update(segs, &ON_PANEL, &canvas_p, kFormat, true, 0);
+	REQUIRE(r.w.slot != nullptr);
+	CHECK(fake(r.w.slot)->screen == PANEL);
+	CHECK(fake(r.w.slot)->window);
+	CHECK(r.w.away.screen_id == 0);
+	CHECK(r.w.max_window_holders == 1);
+	CHECK(r.w.window_holders() == 1);
+	comp_vk_native_segments_set_hwnd_hooks(segs, nullptr);
+	comp_vk_native_segments_destroy(&segs);
+}
+
+TEST_CASE("the panel back beside the laptop under a new id after the bound: it stands in, the laptop keeps the window")
+{
+	Rig r;
+	const xrt_screen_list b = both();
+	comp_vk_native_segments *segs = r.manager(b);
+	run(segs, ON_LAPTOP);
+	FakeDp *laptop_dp = r.w.holder();
+	REQUIRE(laptop_dp->screen == LAPTOP);
+
+	r.w.panel_ready = false;
+	const xrt_screen_list gone = laptop_only();
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &gone);
+	REQUIRE(r.w.away.screen_id == LAPTOP);
+	segs = r.manager(gone);
+
+	// The panel back right of the laptop, under another id, no default.
+	r.w.panel_ready = true;
+	xrt_screen_list moved{};
+	add(moved, LAPTOP, "sim-display", 0, 2560, 1600, false);
+	add(moved, PANEL2, "vendor", 2560, 3840, 2160, false);
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &moved);
+	segs = r.manager(moved);
+	REQUIRE(comp_vk_native_segments_enabled(segs));
+	const comp_seg_rect canvas{0, 0, ON_LAPTOP.w, ON_LAPTOP.h};
+	(void)comp_vk_native_segments_update(segs, &ON_LAPTOP, &canvas, kFormat, true, 0);
+	CHECK(r.w.holder() == laptop_dp);
+	REQUIRE(r.w.slot != nullptr);
+	CHECK(fake(r.w.slot)->screen == PANEL2);
+	CHECK_FALSE(fake(r.w.slot)->window);
+	CHECK(r.w.away.screen_id == PANEL2);
+
+	// The window onto the panel: after the dwell its DP takes the window.
+	const comp_seg_rect on_panel2{2860, 200, 1280, 720};
+	run(segs, on_panel2);
+	REQUIRE(r.w.holder() != nullptr);
+	CHECK(r.w.holder()->screen == PANEL2);
+	CHECK(fake(r.w.slot) == r.w.holder());
+	CHECK(r.w.window_holders() == 1);
+	comp_vk_native_segments_set_hwnd_hooks(segs, nullptr);
+	comp_vk_native_segments_destroy(&segs);
+}
+
+TEST_CASE("the screen holding the window leaves while the panel is gone: the OS primary screen stands in")
+{
+	Rig r;
+	const xrt_screen_list t3 = three();
+	comp_vk_native_segments *segs = r.manager(t3);
+	run(segs, ON_LAPTOP);
+	FakeDp *laptop_dp = r.w.holder();
+	REQUIRE(laptop_dp->screen == LAPTOP);
+
+	r.w.panel_ready = false;
+	const int panel_dps = r.w.made_for_panel;
+	xrt_screen_list gone{};
+	add(gone, LAPTOP, "sim-display", 0, 2560, 1600, false);
+	add(gone, OTHER, "sim-display", 2560, 1920, 1080, false);
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &gone);
+	REQUIRE(fake(r.w.slot) == laptop_dp);
+	REQUIRE(r.w.away.screen_id == LAPTOP);
+	// The slot's screen is listed: it keeps the slot, nothing is segmented.
+	segs = r.manager(gone);
+	CHECK_FALSE(comp_vk_native_segments_enabled(segs));
+
+	// Now the laptop leaves too; the third monitor is the OS primary.
+	xrt_screen_list other_only{};
+	add(other_only, OTHER, "sim-display", 0, 1920, 1080, false);
+	other_only.screens[0].flags |= XRT_SCREEN_FLAG_PRIMARY;
+	r.w.max_window_holders = r.w.window_holders();
+	comp_vk_native_segments_destroy_for_rebuild(&segs, &other_only);
+	segs = r.manager(other_only);
+	REQUIRE(comp_vk_native_segments_enabled(segs));
+	const comp_seg_rect on_other{200, 200, 1280, 720};
+	const comp_seg_rect canvas{0, 0, on_other.w, on_other.h};
+	(void)comp_vk_native_segments_update(segs, &on_other, &canvas, kFormat, true, 0);
+	REQUIRE(r.w.slot != nullptr);
+	CHECK(fake(r.w.slot)->screen == OTHER);
+	CHECK(fake(r.w.slot)->window);
+	CHECK(r.w.away.screen_id == OTHER);
+	CHECK(r.w.away.home_id == PANEL);
+	// Same plug-in as the laptop's DP: the window was freed first.
+	CHECK(r.w.max_window_holders == 1);
+	CHECK(r.w.made_for_panel == panel_dps);
+	for (FakeDp *d : r.w.alive) {
+		CHECK(d->screen != PANEL);
+	}
+	comp_vk_native_segments_set_hwnd_hooks(segs, nullptr);
+	comp_vk_native_segments_destroy(&segs);
+}
+
+TEST_CASE("comp_segments_away_decide: who stands in for the gone home")
+{
+	comp_segments_away away{};
+	comp_segments_away_set(&away, LAPTOP, "sim-display", PANEL, "vendor");
+	bool can[COMP_SEGMENTS_MAX_SCREENS] = {true, true, true, true};
+	bool osp[COMP_SEGMENTS_MAX_SCREENS] = {};
+	int k = -2;
+
+	// Nothing away, or the home back (a default): none.
+	comp_segments_next_list nl{};
+	comp_segments_next_list_add(&nl, PANEL2, "vendor", false);
+	comp_segments_away none{};
+	CHECK(comp_segments_away_decide(&none, &nl, can, osp, &k) == COMP_SEGMENTS_AWAY_NONE);
+	CHECK(k == -1);
+	comp_segments_next_list with_default{};
+	comp_segments_next_list_add(&with_default, PANEL, "vendor", true);
+	CHECK(comp_segments_away_decide(&away, &with_default, can, osp, &k) == COMP_SEGMENTS_AWAY_NONE);
+
+	// The home's plug-in wins one screen: the panel back, even beside the slot's screen.
+	comp_segments_next_list beside{};
+	comp_segments_next_list_add(&beside, LAPTOP, "sim-display", false);
+	comp_segments_next_list_add(&beside, PANEL2, "vendor", false);
+	CHECK(comp_segments_away_decide(&away, &beside, can, osp, &k) == COMP_SEGMENTS_AWAY_PANEL_BACK);
+	CHECK(k == 1);
+	// ... but not when its plug-in cannot make a DP there.
+	bool no_panel[COMP_SEGMENTS_MAX_SCREENS] = {true, false};
+	CHECK(comp_segments_away_decide(&away, &beside, no_panel, osp, &k) == COMP_SEGMENTS_AWAY_NONE);
+
+	// Two screens won by it: not decided here; the slot's screen listed keeps it.
+	comp_segments_next_list two{};
+	comp_segments_next_list_add(&two, LAPTOP, "sim-display", false);
+	comp_segments_next_list_add(&two, PANEL2, "vendor", false);
+	comp_segments_next_list_add(&two, OTHER, "vendor", false);
+	CHECK(comp_segments_away_decide(&away, &two, can, osp, &k) == COMP_SEGMENTS_AWAY_NONE);
+
+	// The slot's screen gone: the OS primary, else the first that can take it.
+	comp_segments_next_list rest{};
+	comp_segments_next_list_add(&rest, OTHER, "sim-display", false);
+	comp_segments_next_list_add(&rest, 0x55ull, "sim-display", false);
+	CHECK(comp_segments_away_decide(&away, &rest, can, osp, &k) == COMP_SEGMENTS_AWAY_HOLDER_GONE);
+	CHECK(k == 0);
+	bool second_primary[COMP_SEGMENTS_MAX_SCREENS] = {false, true};
+	CHECK(comp_segments_away_decide(&away, &rest, can, second_primary, &k) == COMP_SEGMENTS_AWAY_HOLDER_GONE);
+	CHECK(k == 1);
+	bool none_can[COMP_SEGMENTS_MAX_SCREENS] = {};
+	CHECK(comp_segments_away_decide(&away, &rest, none_can, osp, &k) == COMP_SEGMENTS_AWAY_NONE);
+
+	// A stand-in recorded over the first record keeps the departed home.
+	comp_segments_away_set(&away, PANEL2, "vendor", PANEL2, "vendor");
+	CHECK(away.screen_id == PANEL2);
+	CHECK(away.home_id == PANEL);
+	CHECK(std::strcmp(away.plugin_id, "vendor") == 0);
 }

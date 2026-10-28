@@ -459,8 +459,8 @@ struct comp_hub_d3d11
 	uint64_t seg_pinned_display_id;
 	bool seg_rebuild; //!< a new list arrived: rebuild on the next weave
 	//! ADR-047 Amendment 8 (#2305): the screen whose DP @ref dp is while the
-	//! home screen is gone (0 = the home's); kept across rebuilds.
-	uint64_t seg_away_screen_id;
+	//! home screen is gone (screen_id 0 = the home's); kept across rebuilds.
+	struct comp_segments_away seg_away;
 	//! Guards @ref segments (create / destroy) and @ref seg_pub against the
 	//! app thread's xrLocateViews. Taken before @ref dp_mutex, never after.
 	struct os_mutex seg_mutex;
@@ -1443,7 +1443,7 @@ split_segments_update(struct comp_hub_d3d11 *s, uint32_t tgt_w, uint32_t tgt_h, 
 					hooks.swap_primary = split_seg_swap_primary_cb;
 					// The SDK's WndProc drag snap needs no runtime provider.
 					hooks.bracket = nullptr;
-					hooks.away_screen_id = &s->seg_away_screen_id;
+					hooks.away = &s->seg_away;
 					comp_d3d11_segments_set_hwnd_hooks(s->segments, &hooks);
 					comp_d3d11_segments_set_screens(s->segments, s->seg_screens, s->seg_sys_info,
 					                                s->seg_pinned_display_id);

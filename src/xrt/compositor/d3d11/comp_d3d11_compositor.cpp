@@ -670,9 +670,9 @@ struct comp_d3d11_compositor
 	bool seg_rebuild;                                //!< a new list arrived: rebuild on the next weave
 	uint64_t seg_pinned_display_id;
 	//! ADR-047 Amendment 8 (#2305): the screen whose DP display_processor is
-	//! while the home screen is gone (0 = the home's); kept across rebuilds
-	//! (comp_d3d11_segments_hwnd_hooks::away_screen_id).
-	uint64_t seg_away_screen_id;
+	//! while the home screen is gone (screen_id 0 = the home's); kept across
+	//! rebuilds (comp_d3d11_segments_hwnd_hooks::away).
+	struct comp_segments_away seg_away;
 	struct comp_seg_rect seg_window; //!< the window's client area in desktop device px
 	bool have_seg_window;
 	/*!
@@ -1179,7 +1179,7 @@ d3d11_seg_ensure(struct comp_d3d11_compositor *c)
 			hooks.userdata = c;
 			hooks.swap_primary = d3d11_segments_swap_primary_cb;
 			hooks.bracket = d3d11_segments_hwnd_bracket_cb;
-			hooks.away_screen_id = &c->seg_away_screen_id;
+			hooks.away = &c->seg_away;
 			comp_d3d11_segments_set_hwnd_hooks(c->segments, &hooks);
 		}
 		comp_d3d11_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info, c->seg_pinned_display_id);

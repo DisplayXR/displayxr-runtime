@@ -184,7 +184,7 @@ u_screen_home_poll_settle(uint64_t gen, uint64_t before, uint64_t pushed, bool k
  * After a list is handed to the compositor (not kept): may the session DP be
  * another screen's DP now (ADR-047 Amendment 8, #2305)? Pure.
  *
- * It follows the compositors' away_screen_id: a list with the home unplugged
+ * It follows the compositors' away record (comp_segments_away): a list with the home unplugged
  * (@ref U_SCREEN_HOME_GONE with @p plugin_unlisted) is the one before which a
  * compositor that moves the window handle puts the DP of the screen holding
  * the window into the session's slot; a list with the home in place

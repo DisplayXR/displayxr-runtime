@@ -74,7 +74,7 @@ comp_d3d11_segments_destroy(struct comp_d3d11_segments **segs_ptr);
  * when that one qualifies — and that DP takes the session's primary slot; no
  * DP is ever made for the departed screen (failing that, the window stays
  * with its holder). The slot's new screen is written to
- * comp_d3d11_segments_hwnd_hooks::away_screen_id. Otherwise (the home listed,
+ * comp_d3d11_segments_hwnd_hooks::away. Otherwise (the home listed,
  * re-claimed or re-identified) the window goes back to the primary DP as in a
  * teardown.
  */
@@ -108,12 +108,16 @@ struct comp_d3d11_segments_hwnd_hooks
 	/*!
 	 * Optional, compositor-owned and kept across rebuilds (ADR-047 Amendment
 	 * 8, #2305): the screen whose DP sits in the session's primary slot
-	 * instead of the home screen's, 0 = the home's. A hand-back with the home
-	 * gone sets it; the first update of a manager whose list has the home
-	 * back moves that DP to its own screen's slot as the window's holder,
-	 * gives the home a windowless DP, and clears it.
+	 * instead of the home screen's (screen_id 0 = the home's), with the
+	 * plug-ins. A hand-back with the home gone sets it; the first update of a
+	 * manager whose list has the home back moves that DP to its own screen's
+	 * slot as the window's holder, gives the home a windowless DP, and clears
+	 * it. While the home stays gone, a list in which its plug-in wins a
+	 * screen again (the panel under another id), or without the slot's
+	 * screen, gets a stand-in primary (comp_segments_away_decide), re-homed
+	 * the same way; the record then names the stand-in.
 	 */
-	uint64_t *away_screen_id;
+	struct comp_segments_away *away;
 };
 
 /*!

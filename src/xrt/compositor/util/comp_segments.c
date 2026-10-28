@@ -988,6 +988,86 @@ comp_segments_handback_str(enum comp_segments_handback h)
 	}
 }
 
+enum comp_segments_away_pick
+comp_segments_away_decide(const struct comp_segments_away *away,
+                          const struct comp_segments_next_list *next,
+                          const bool *can_make,
+                          const bool *os_primary,
+                          int *out_index)
+{
+	if (out_index != NULL) {
+		*out_index = -1;
+	}
+	if (away == NULL || away->screen_id == 0 || next == NULL || can_make == NULL || next->default_id != 0) {
+		return COMP_SEGMENTS_AWAY_NONE;
+	}
+	const uint32_t n = next->count < COMP_SEGMENTS_MAX_SCREENS ? next->count : COMP_SEGMENTS_MAX_SCREENS;
+
+	// The panel back: the one screen its plug-in wins.
+	int won = -1;
+	uint32_t wins = 0;
+	if (away->home_plugin_id[0] != '\0') {
+		for (uint32_t k = 0; k < n; k++) {
+			if (can_make[k] && strncmp(next->plugin_ids[k], away->home_plugin_id, COMP_SEGMENTS_ID_MAX) == 0) {
+				won = (int)k;
+				wins++;
+			}
+		}
+	}
+	if (wins == 1) {
+		if (out_index != NULL) {
+			*out_index = won;
+		}
+		return COMP_SEGMENTS_AWAY_PANEL_BACK;
+	}
+
+	// The slot's screen is still there: it keeps the slot.
+	if (next_lists(next, away->screen_id)) {
+		return COMP_SEGMENTS_AWAY_NONE;
+	}
+
+	// It left too: where the OS puts the window, else the first that can take it.
+	int pick = -1;
+	for (uint32_t k = 0; k < n; k++) {
+		if (!can_make[k]) {
+			continue;
+		}
+		if (os_primary != NULL && os_primary[k]) {
+			pick = (int)k;
+			break;
+		}
+		if (pick < 0) {
+			pick = (int)k;
+		}
+	}
+	if (pick < 0) {
+		return COMP_SEGMENTS_AWAY_NONE;
+	}
+	if (out_index != NULL) {
+		*out_index = pick;
+	}
+	return COMP_SEGMENTS_AWAY_HOLDER_GONE;
+}
+
+void
+comp_segments_away_set(struct comp_segments_away *away,
+                       uint64_t screen_id,
+                       const char *plugin_id,
+                       uint64_t home_id,
+                       const char *home_plugin_id)
+{
+	if (away == NULL) {
+		return;
+	}
+	if (away->screen_id == 0) {
+		away->home_id = home_id;
+		(void)snprintf(away->home_plugin_id, COMP_SEGMENTS_ID_MAX, "%s",
+		               home_plugin_id != NULL ? home_plugin_id : "");
+	}
+	away->screen_id = screen_id;
+	(void)snprintf(away->plugin_id, COMP_SEGMENTS_ID_MAX, "%s", plugin_id != NULL ? plugin_id : "");
+}
+
 
 /*
  *

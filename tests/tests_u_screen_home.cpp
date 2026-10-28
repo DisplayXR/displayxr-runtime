@@ -202,7 +202,7 @@ TEST_CASE("screen home: gone with its plug-in unlisted (unplugged) vs gone but r
 /*
  * #2305: the session DP may be another screen's from the first list handed on
  * with the home unplugged (the bound's push) until a list has the home back —
- * the same span as the compositors' away_screen_id.
+ * the same span as the compositors' away record.
  */
 TEST_CASE("screen home: the session DP may be another screen's from an unplugged list until the home is back")
 {

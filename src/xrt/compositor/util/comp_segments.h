@@ -927,6 +927,82 @@ comp_segments_handback_decide(const struct comp_segments_screen *screens,
 const char *
 comp_segments_handback_str(enum comp_segments_handback h);
 
+/*!
+ * ADR-047 Amendment 8 (#2305): what sits in the session's primary slot while
+ * the home screen is unplugged. Compositor-owned and kept across manager
+ * rebuilds (a rebuild makes a new manager); the segment managers write it.
+ */
+struct comp_segments_away
+{
+	//! The screen whose DP holds the slot instead of the home's; 0 = the home's own DP.
+	uint64_t screen_id;
+	//! That DP's plug-in.
+	char plugin_id[COMP_SEGMENTS_ID_MAX];
+	//! The departed home screen (for the logs) and its plug-in: a screen
+	//! that plug-in wins again is the panel back.
+	uint64_t home_id;
+	char home_plugin_id[COMP_SEGMENTS_ID_MAX];
+};
+
+//! What @ref comp_segments_away_decide picks.
+enum comp_segments_away_pick
+{
+	//! Nothing stands in: the slot keeps its DP and nothing is segmented.
+	COMP_SEGMENTS_AWAY_NONE = 0,
+	//! The home's plug-in wins a screen again under another id: the panel is back.
+	COMP_SEGMENTS_AWAY_PANEL_BACK,
+	//! The slot's own screen left too: a listed screen takes its place.
+	COMP_SEGMENTS_AWAY_HOLDER_GONE,
+};
+
+/*!
+ * ADR-047 Amendment 8, home gone (#2305): a screen list without the home's
+ * default arrives while the session's primary slot holds another screen's DP.
+ * Which listed screen stands in for the home, as the manager's primary? Pure.
+ *
+ * The hand-back took the window off the home because it was unplugged: its
+ * id not listed AND its plug-in winning no screen. Its plug-in winning a
+ * screen again is the panel back — a serial-less panel's id is
+ * position-derived, so a panel alone at (0, 0) comes back under another id
+ * than the one it left with:
+ *   - @p next carries a default (the home itself is back), nothing is away, or
+ *     @p next is NULL: NONE;
+ *   - the home's plug-in wins exactly one listed screen that @p can_make a DP:
+ *     PANEL_BACK, that screen (it may be the slot's own screen already). Two
+ *     or more: not decided here, as if it won none;
+ *   - else the slot's screen is listed: NONE (it keeps the slot, as before);
+ *   - else the slot's DP is a departed screen's: HOLDER_GONE, the OS primary
+ *     screen if it @p can_make a DP (the OS moves a departed monitor's
+ *     windows there), else the first listed one that can;
+ *   - else NONE.
+ *
+ * @param away       The compositor's record; NULL = none.
+ * @param next       The list the manager is being built from.
+ * @param can_make   Parallel to @p next: the screen is placed on the desktop
+ *                   and its plug-in can make a per-screen DP for this API.
+ * @param os_primary Parallel to @p next: the OS's primary monitor.
+ * @param[out] out_index The pick's index into @p next, -1 for NONE.
+ */
+enum comp_segments_away_pick
+comp_segments_away_decide(const struct comp_segments_away *away,
+                          const struct comp_segments_next_list *next,
+                          const bool *can_make,
+                          const bool *os_primary,
+                          int *out_index);
+
+/*!
+ * Record that screen @p screen_id's DP (plug-in @p plugin_id) holds the slot
+ * now. The home is kept from the first record (a stand-in that leaves in
+ * turn does not become "the home"); @p home_id / @p home_plugin_id fill it
+ * only when nothing was away yet.
+ */
+void
+comp_segments_away_set(struct comp_segments_away *away,
+                       uint64_t screen_id,
+                       const char *plugin_id,
+                       uint64_t home_id,
+                       const char *home_plugin_id);
+
 
 /*
  *

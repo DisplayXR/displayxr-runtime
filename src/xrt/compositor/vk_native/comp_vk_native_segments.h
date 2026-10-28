@@ -124,11 +124,10 @@ struct comp_vk_native_segments_hwnd_hooks
 	void (*bracket)(void *userdata, bool begin, struct xrt_display_processor *hwnd_dp);
 	/*!
 	 * Optional, compositor-owned and kept across rebuilds (ADR-047 Amendment
-	 * 8, #2305): the screen whose DP sits in the session's primary slot
-	 * instead of the home screen's, 0 = the home's. See
-	 * comp_d3d11_segments_hwnd_hooks::away_screen_id.
+	 * 8, #2305): what sits in the session's primary slot while the home is
+	 * gone. See comp_d3d11_segments_hwnd_hooks::away.
 	 */
-	uint64_t *away_screen_id;
+	struct comp_segments_away *away;
 };
 
 /*!

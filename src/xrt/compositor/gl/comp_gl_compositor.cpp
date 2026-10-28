@@ -1211,8 +1211,9 @@ struct comp_gl_compositor
 	bool seg_rebuild;                                //!< a new list arrived: rebuild on the next weave
 	uint64_t seg_pinned_display_id;
 	//! ADR-047 Amendment 8 (#2305): the screen whose DP display_processor is
-	//! while the home screen is gone (0 = the home's); kept across rebuilds.
-	uint64_t seg_away_screen_id;
+	//! while the home screen is gone (screen_id 0 = the home's); kept across
+	//! rebuilds.
+	struct comp_segments_away seg_away;
 	//! #2247: the last weave's table does not cover the primary screen (the
 	//! window has wholly left it): the session's DP is asked for 2D there,
 	//! and gets the session's mode back when the window returns. Written by
@@ -5294,7 +5295,7 @@ gl_segments_tick(struct comp_gl_compositor *c, bool eligible, uint32_t present_w
 					hooks.hwnd = (void *)c->hwnd;
 					hooks.userdata = c;
 					hooks.swap_primary = gl_segments_swap_primary_cb;
-					hooks.away_screen_id = &c->seg_away_screen_id;
+					hooks.away = &c->seg_away;
 					comp_gl_segments_set_hwnd_hooks(c->segments, &hooks);
 					comp_gl_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info,
 					                             c->seg_pinned_display_id);
