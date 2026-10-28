@@ -367,6 +367,12 @@ if(TARGET comp_vk_native
 	# SKIPs when there is no Vulkan device at all.
 	list(APPEND tests tests_comp_vk_equirect2_draw)
 endif()
+if(TARGET comp_vk_segs)
+	# ADR-047 Amendment 8, home gone (#2305) -- the window-handle hand-back
+	# before a screen-list rebuild, end to end through the Vulkan segment
+	# manager with fake display processors (no Vulkan device needed).
+	list(APPEND tests tests_comp_segments_home_gone)
+endif()
 if(XRT_FEATURE_OPENXR)
 	list(APPEND tests tests_input_transform)
 endif()
@@ -1654,6 +1660,10 @@ if(XRT_HAVE_VULKAN)
 endif()
 if(TARGET tests_vk_dmabuf)
 	target_link_libraries(tests_vk_dmabuf PRIVATE comp_util aux_vk)
+endif()
+if(TARGET tests_comp_segments_home_gone)
+	target_link_libraries(tests_comp_segments_home_gone PRIVATE comp_vk_segs comp_util aux_vk)
+	target_include_directories(tests_comp_segments_home_gone PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 endif()
 if(TARGET tests_comp_vk_equirect2_draw)
 	# The generated SPIR-V headers (shaders/equirect2.*.h) live in

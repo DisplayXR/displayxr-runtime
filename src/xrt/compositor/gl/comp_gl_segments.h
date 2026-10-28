@@ -70,6 +70,17 @@ void
 comp_gl_segments_destroy(struct comp_gl_segments **segs_ptr);
 
 /*!
+ * @ref comp_gl_segments_destroy before a rebuild on @p next, the list the next
+ * manager takes (ADR-047 Amendment 8, #2305): with the home screen gone from
+ * @p next, the window goes to a screen of @p next whose DP is ready (it stays
+ * on the DP holding it when that one qualifies), that DP takes the session's
+ * primary slot, and no DP is made for the departed screen. See
+ * comp_d3d11_segments_destroy_for_rebuild.
+ */
+void
+comp_gl_segments_destroy_for_rebuild(struct comp_gl_segments **segs_ptr, const struct xrt_screen_list *next);
+
+/*!
  * How the manager moves the session's window between DPs (ADR-047
  * Amendment 2). Called on the weave thread with the compositor's lock held and
  * its GL context current.
@@ -86,6 +97,13 @@ struct comp_gl_segments_hwnd_hooks
 	 * mode) to @p dp and guards the exchange against its other threads.
 	 */
 	struct xrt_display_processor_gl *(*swap_primary)(void *userdata, struct xrt_display_processor_gl *dp);
+	/*!
+	 * Optional, compositor-owned and kept across rebuilds (ADR-047 Amendment
+	 * 8, #2305): the screen whose DP sits in the session's primary slot
+	 * instead of the home screen's, 0 = the home's. See
+	 * comp_d3d11_segments_hwnd_hooks::away_screen_id.
+	 */
+	uint64_t *away_screen_id;
 };
 
 /*!

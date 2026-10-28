@@ -83,6 +83,18 @@ void
 comp_vk_native_segments_destroy(struct comp_vk_native_segments **segs_ptr);
 
 /*!
+ * @ref comp_vk_native_segments_destroy before a rebuild on @p next, the list
+ * the next manager takes (ADR-047 Amendment 8, #2305; Windows, hooks set):
+ * with the home screen gone from @p next, the window goes to a screen of
+ * @p next whose DP is ready (it stays on the DP holding it when that one
+ * qualifies), that DP takes the session's primary slot, and no DP is made for
+ * the departed screen. See comp_d3d11_segments_destroy_for_rebuild.
+ */
+void
+comp_vk_native_segments_destroy_for_rebuild(struct comp_vk_native_segments **segs_ptr,
+                                            const struct xrt_screen_list *next);
+
+/*!
  * How the manager moves the session's window between DPs (ADR-047
  * Amendment 2, Windows). All callbacks run on the weave thread with the
  * compositor's lock held, inside @ref comp_vk_native_segments_update (or
@@ -109,6 +121,13 @@ struct comp_vk_native_segments_hwnd_hooks
 	 * NULL when it is the session's primary DP (or none does). Optional.
 	 */
 	void (*bracket)(void *userdata, bool begin, struct xrt_display_processor *hwnd_dp);
+	/*!
+	 * Optional, compositor-owned and kept across rebuilds (ADR-047 Amendment
+	 * 8, #2305): the screen whose DP sits in the session's primary slot
+	 * instead of the home screen's, 0 = the home's. See
+	 * comp_d3d11_segments_hwnd_hooks::away_screen_id.
+	 */
+	uint64_t *away_screen_id;
 };
 
 /*!

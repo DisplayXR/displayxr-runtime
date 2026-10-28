@@ -159,6 +159,10 @@ struct comp_vk_native_segments
 	int owner_index;         //!< index of the screen holding the handle, -1 = none
 	bool primary_for_screen; //!< the primary's plug-in has create_dp_vk_for_screen
 	bool primary_windowless; //!< the session's primary DP is windowless right now
+	//! ADR-047 Amendment 8 (#2305): the primary slot holds another screen's DP
+	//! (hooks.away_screen_id) and this list has the home back — the first
+	//! update moves it out (hwnd_rehome).
+	bool rehome_pending;
 	//! The last update's swapchain format (the hand-back at destroy / set_screens).
 	int32_t target_format;
 	bool have_target_format;
@@ -632,6 +636,8 @@ hwnd_handoff(struct comp_vk_native_segments *segs, uint32_t t, int32_t target_fo
 /*!
  * Hand the window back to the primary screen's DP (a screen-list rebuild or a
  * teardown while another screen owns it). No-op when the primary owns it.
+ * Only while the next list still has the home screen (or at a teardown):
+ * hwnd_hand_back picks a ready screen instead when it is gone (#2305).
  */
 static void
 hwnd_return_to_primary(struct comp_vk_native_segments *segs)
@@ -641,6 +647,195 @@ hwnd_return_to_primary(struct comp_vk_native_segments *segs)
 		return;
 	}
 	hwnd_handoff(segs, segs->primary_index, segs->target_format, true);
+}
+
+//! ADR-047 Amendment 8 (#2305): @p dp reports its screen's pixel and physical size (see the D3D11 twin).
+static bool
+dp_ready(struct xrt_display_processor *dp)
+{
+	if (dp == NULL) {
+		return false;
+	}
+	uint32_t px_w = 0, px_h = 0;
+	int32_t left = 0, top = 0;
+	float w_m = 0.0f, h_m = 0.0f;
+	return xrt_display_processor_get_display_pixel_info(dp, &px_w, &px_h, &left, &top) && px_w > 0 &&
+	       px_h > 0 && xrt_display_processor_get_display_dimensions(dp, &w_m, &h_m) && w_m > 0.0f && h_m > 0.0f;
+}
+
+static void
+next_list_from(const struct xrt_screen_list *l, struct comp_segments_next_list *out)
+{
+	memset(out, 0, sizeof(*out));
+	for (uint32_t i = 0; i < l->count && i < XRT_SCREEN_LIST_MAX && out->count < COMP_SEGMENTS_MAX_SCREENS; i++) {
+		out->ids[out->count++] = l->screens[i].id;
+		if ((l->screens[i].flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
+			out->default_id = l->screens[i].id;
+		}
+	}
+}
+
+/*!
+ * ADR-047 Amendment 8, home gone (#2305): put the window, and the session's
+ * primary slot, on screen @p t's DP, and retire the departed home's DP that
+ * sat in the slot — the D3D11 manager's hwnd_to_session_slot in Vulkan terms.
+ * A DP that held the window is handed back to Vulkan before another one is
+ * made with it whenever the caller declared this update release-safe.
+ */
+static void
+hwnd_to_session_slot(struct comp_vk_native_segments *segs, uint32_t t, enum comp_segments_handback why)
+{
+	const int o = segs->owner_index;
+	const uint32_t p = segs->primary_index;
+	const uint64_t home_id = segs->screens[p].id;
+	const uint64_t t0 = os_monotonic_get_ns();
+	const bool can_make = segs->have_target_format;
+	if (segs->hooks.bracket != NULL) {
+		segs->hooks.bracket(segs->hooks.userdata, true, NULL);
+	}
+	struct xrt_display_processor *h = NULL;
+	bool fell_back = false;
+	if (o == (int)t) {
+		h = dp_install(segs, t, NULL, false);
+	} else if (o == (int)p && !segs->primary_windowless) {
+		if (can_make) {
+			h = dp_make(segs, t, segs->target_format, segs->hooks.hwnd);
+		}
+		if (h != NULL) {
+			release_deferred(segs, SEG_RETIRE_DP, (uint64_t)(uintptr_t)dp_install(segs, t, NULL, false));
+		}
+	} else {
+		if (o >= 0) {
+			release_deferred(segs, SEG_RETIRE_DP,
+			                 (uint64_t)(uintptr_t)dp_install(segs, (uint32_t)o, NULL, false));
+			if (segs->release_safe) {
+				retire_drain(segs, true);
+			}
+		}
+		if (can_make) {
+			h = dp_make(segs, t, segs->target_format, segs->hooks.hwnd);
+			if (h != NULL) {
+				release_deferred(segs, SEG_RETIRE_DP,
+				                 (uint64_t)(uintptr_t)dp_install(segs, t, NULL, false));
+			} else {
+				h = dp_make(segs, p, segs->target_format, segs->hooks.hwnd);
+				fell_back = h != NULL;
+			}
+		}
+	}
+	const bool stays_home = h == NULL && o == (int)p && !segs->primary_windowless;
+	if (h != NULL) {
+		struct xrt_display_processor *old = segs->hooks.swap_primary(segs->hooks.userdata, h);
+		release_deferred(segs, SEG_RETIRE_DP, (uint64_t)(uintptr_t)old);
+		segs->primary_windowless = false;
+		segs->owner_index = (int)p;
+		if (segs->hooks.away_screen_id != NULL) {
+			*segs->hooks.away_screen_id = fell_back ? 0 : segs->screens[t].id;
+		}
+	} else if (!stays_home) {
+		segs->owner_index = -1; // the slot keeps its windowless DP
+	}
+	if (segs->hooks.bracket != NULL) {
+		segs->hooks.bracket(segs->hooks.userdata, false, NULL);
+	}
+
+	const double ms = (double)(os_monotonic_get_ns() - t0) / 1.0e6;
+	if (h != NULL && !fell_back) {
+		U_LOG_W(
+		    "segments: home screen 0x%016llx is gone — the window %s '%s' (screen 0x%016llx, %s), whose DP "
+		    "is the session DP now, in %.1f ms; no DP is made for the departed screen (ADR-047 Amendment "
+		    "8, #2305) (Vulkan)",
+		    (unsigned long long)home_id, o == (int)t ? "stays with" : "is handed to", screen_name(segs, (int)t),
+		    (unsigned long long)segs->screens[t].id,
+		    why == COMP_SEGMENTS_HANDBACK_NO_READY ? "no listed screen reports a ready DP" : "its DP is ready",
+		    ms);
+	} else {
+		U_LOG_W(
+		    "segments: home screen 0x%016llx is gone — window handle hand-off to '%s' (screen 0x%016llx) "
+		    "FAILED after %.1f ms; %s (ADR-047 Amendment 8, #2305) (Vulkan)",
+		    (unsigned long long)home_id, screen_name(segs, (int)t), (unsigned long long)segs->screens[t].id, ms,
+		    fell_back    ? "the home's DP holds the window again"
+		    : stays_home ? "the window stays with the session DP it is on"
+		                 : "no DP holds the window now");
+	}
+}
+
+//! Before a rebuild on @p next (NULL = a teardown): the D3D11 manager's hwnd_hand_back in Vulkan terms.
+static void
+hwnd_hand_back(struct comp_vk_native_segments *segs,
+               const struct comp_segment_table *last,
+               const struct xrt_screen_list *next)
+{
+	if (segs->hooks.swap_primary == NULL || segs->primary_index == UINT32_MAX) {
+		return;
+	}
+	struct comp_segments_next_list nl;
+	bool ready[COMP_SEGMENTS_MAX_SCREENS] = {0};
+	if (next != NULL) {
+		next_list_from(next, &nl);
+		for (uint32_t i = 0; i < segs->screen_count; i++) {
+			ready[i] = dp_ready(segs->st[i].dp);
+		}
+	}
+	int t = -1;
+	const enum comp_segments_handback h =
+	    comp_segments_handback_decide(segs->screens, segs->screen_count, segs->primary_index, segs->owner_index,
+	                                  ready, last, next != NULL ? &nl : NULL, &t);
+	if (h == COMP_SEGMENTS_HANDBACK_HOME) {
+		hwnd_return_to_primary(segs);
+		return;
+	}
+	if (t < 0 || (uint32_t)t == segs->primary_index) {
+		U_LOG_W(
+		    "segments: home screen 0x%016llx is gone and no listed screen reports a ready DP — the window "
+		    "stays with %s; no DP is made for the departed screen (ADR-047 Amendment 8, #2305) (Vulkan)",
+		    (unsigned long long)segs->screens[segs->primary_index].id,
+		    t < 0 ? "no DP (none held it)" : "the session DP it is on");
+		return;
+	}
+	hwnd_to_session_slot(segs, (uint32_t)t, h);
+}
+
+//! The home is back while the slot holds another screen's DP: the D3D11 manager's hwnd_rehome in Vulkan terms.
+static void
+hwnd_rehome(struct comp_vk_native_segments *segs, int32_t target_format)
+{
+	segs->rehome_pending = false;
+	const uint64_t away = *segs->hooks.away_screen_id;
+	const uint32_t p = segs->primary_index;
+	const int a = screen_index_of(segs, away);
+	struct xrt_display_processor *w = NULL;
+	if (a >= 0 && (uint32_t)a != p) {
+		w = dp_make(segs, p, target_format, NULL);
+	}
+	if (w == NULL) {
+		segs->enabled = false;
+		U_LOG_W(
+		    "segments: home screen 0x%016llx is back, but the session DP is still screen 0x%016llx's and %s — "
+		    "no segmentation until the next screen list (ADR-047 Amendment 8, #2305) (Vulkan)",
+		    (unsigned long long)segs->screens[p].id, (unsigned long long)away,
+		    a < 0 ? "that screen is not listed" : "the home's windowless DP could not be made");
+		return;
+	}
+	if (segs->hooks.bracket != NULL) {
+		segs->hooks.bracket(segs->hooks.userdata, true, NULL);
+	}
+	struct xrt_display_processor *holder = segs->hooks.swap_primary(segs->hooks.userdata, w);
+	segs->primary_windowless = true;
+	release_deferred(segs, SEG_RETIRE_DP, (uint64_t)(uintptr_t)dp_install(segs, (uint32_t)a, holder, true));
+	(void)comp_segments_lifecycle_adopt(&segs->lc, away);
+	segs->owner_index = a;
+	comp_segments_owner_set_result(&segs->owner, away, true, away);
+	*segs->hooks.away_screen_id = 0;
+	if (segs->hooks.bracket != NULL) {
+		segs->hooks.bracket(segs->hooks.userdata, false, holder);
+	}
+	U_LOG_W(
+	    "segments: home screen 0x%016llx is back — '%s' (screen 0x%016llx) keeps the window handle as its "
+	    "segment DP and the session DP weaves '%s' windowless; the window follows the majority from here "
+	    "(ADR-047 Amendment 8, #2305) (Vulkan)",
+	    (unsigned long long)segs->screens[p].id, screen_name(segs, a), (unsigned long long)away,
+	    screen_name(segs, (int)p));
 }
 
 /*!
@@ -729,6 +924,13 @@ comp_vk_native_segments_create(struct vk_bundle *vk, VkCommandPool cmd_pool, VkQ
 void
 comp_vk_native_segments_destroy(struct comp_vk_native_segments **segs_ptr)
 {
+	comp_vk_native_segments_destroy_for_rebuild(segs_ptr, NULL);
+}
+
+void
+comp_vk_native_segments_destroy_for_rebuild(struct comp_vk_native_segments **segs_ptr,
+                                            const struct xrt_screen_list *next)
+{
 	if (segs_ptr == NULL || *segs_ptr == NULL) {
 		return;
 	}
@@ -736,11 +938,13 @@ comp_vk_native_segments_destroy(struct comp_vk_native_segments **segs_ptr)
 	// The caller guarantees nothing in flight (see the header).
 	segs->release_safe = true;
 	// Another screen holds the window: hand it back to the session's primary
-	// DP first (no hooks = compositor teardown, where the primary DP goes
-	// too). An empty table: the old owner needs no windowless replacement.
+	// DP first — or, the home gone from @p next, to a ready screen (no hooks
+	// = compositor teardown, where the primary DP goes too). An empty table:
+	// the old owner needs no windowless replacement.
+	const struct comp_segment_table last = segs->table;
 	segs->table.count = 0;
 	comp_segments_cover_dwell_init(&segs->cover, 0); // #2247: the hand-back DP gets the session's mode
-	hwnd_return_to_primary(segs);
+	hwnd_hand_back(segs, &last, next);
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		dp_release(segs, i);
 	}
@@ -764,9 +968,10 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 	// The window goes back to the primary DP first (an empty table: the old
 	// owner needs no windowless replacement). Deferred releases only: a fill
 	// may be in flight.
+	const struct comp_segment_table last = segs->table;
 	segs->table.count = 0;
 	comp_segments_cover_dwell_init(&segs->cover, 0); // #2247: the hand-back DP gets the session's mode
-	hwnd_return_to_primary(segs);
+	hwnd_hand_back(segs, &last, list);
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		dp_release(segs, i);
 	}
@@ -776,6 +981,7 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 	segs->owner_index = -1;
 	segs->primary_for_screen = false;
 	segs->primary_windowless = false;
+	segs->rehome_pending = false;
 	segs->enabled = false;
 	segs->screen_count = 0;
 	segs->have_logged_table = false;
@@ -920,6 +1126,10 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 			segs->owner_index = (int)segs->primary_index;
 			comp_segments_owner_init(&segs->owner, segs->screens[segs->primary_index].id, 0, 0);
 		}
+		// ADR-047 Amendment 8 (#2305): the home is back while the primary
+		// slot still holds the screen the window was handed to when it left.
+		segs->rehome_pending = segs->primary_index != UINT32_MAX && segs->hooks.swap_primary != NULL &&
+		                       segs->hooks.away_screen_id != NULL && *segs->hooks.away_screen_id != 0;
 		const bool handoff = segs->hooks.swap_primary != NULL && segs->primary_for_screen;
 		U_LOG_W(
 		    "segments: %u screens, plug-in '%s' — a window spanning screens is woven per screen "
@@ -1016,7 +1226,9 @@ comp_vk_native_segments_would_split(const struct comp_vk_native_segments *segs,
 	// ADR-047 Amendment 2) still needs comp_vk_native_segments_update after
 	// the window is back on the primary alone — the update times the
 	// hand-back. Zero-copy would skip it and leave the panel woven windowless.
-	if (segs->primary_windowless) {
+	// So does a re-home (#2305): the update moves another screen's DP out of
+	// the primary slot.
+	if (segs->primary_windowless || segs->rehome_pending) {
 		return true;
 	}
 	return comp_segments_window_is_split(window_desktop, canvas, segs->screens, segs->screen_count);
@@ -1042,6 +1254,13 @@ comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
 	}
 	segs->target_format = target_format;
 	segs->have_target_format = true;
+	if (segs->rehome_pending) {
+		hwnd_rehome(segs, target_format);
+		if (!segs->enabled) {
+			segs->release_safe = false;
+			return false;
+		}
+	}
 
 	comp_segments_compute(window_desktop, canvas, segs->screens, segs->screen_count, &segs->table);
 	// #2247: advance each screen's lens dead band (the hand-off's dwell).

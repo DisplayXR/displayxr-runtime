@@ -1461,3 +1461,119 @@ TEST_CASE("comp_segments: a screen's own rate only on the chain's own adapter (#
 	CHECK_FALSE(other);
 	CHECK(comp_segments_gated_refresh_hz(165.0f, dgpu, dgpu, 60.0f, nullptr) == 165.0f);
 }
+
+/*
+ * ADR-047 Amendment 8, home gone (#2305). The rig of 2026-10-27: the DS1
+ * (the session DP's home) left of the laptop. The old rule handed the window
+ * back to the home's DP before every rebuild; with the DS1 unplugged that was
+ * a fresh DP for a panel that was not there, which never became ready.
+ */
+TEST_CASE("comp_segments: hand-back target before a rebuild (ADR-047 A8, #2305)", "[comp_segments]")
+{
+	const uint64_t LAPTOP = 0xfcf5;
+	const uint64_t PANEL = 0xb84d;
+	const uint64_t OTHER = 0x7777;
+	comp_segments_screen scr[3] = {
+	    screen(PANEL, -3840, 0, 3840, 2160, 3840, 2160, true), // the home (primary)
+	    screen(LAPTOP, 0, 0, 2560, 1600, 2560, 1600, false),
+	    screen(OTHER, 2560, 0, 1920, 1080, 1920, 1080, false),
+	};
+	const uint32_t home = 0;
+	bool ready[3] = {false, true, true};
+	int target = 99;
+
+	comp_segments_next_list unplugged{};
+	unplugged.ids[unplugged.count++] = LAPTOP;
+	unplugged.ids[unplugged.count++] = OTHER;
+	unplugged.default_id = 0; // the home is gone: no default
+
+	SECTION("the home is back (the next list's default): back home, as before")
+	{
+		comp_segments_next_list back = unplugged;
+		back.ids[back.count++] = PANEL;
+		back.default_id = PANEL;
+		CHECK(comp_segments_handback_decide(scr, 3, home, 1, ready, nullptr, &back, &target) ==
+		      COMP_SEGMENTS_HANDBACK_HOME);
+		CHECK(target == -1);
+	}
+
+	SECTION("no next list (a teardown), or no segmentation: back home, as before")
+	{
+		CHECK(comp_segments_handback_decide(scr, 3, home, 1, ready, nullptr, nullptr, &target) ==
+		      COMP_SEGMENTS_HANDBACK_HOME);
+		CHECK(comp_segments_handback_decide(scr, 3, UINT32_MAX, 1, ready, nullptr, &unplugged, &target) ==
+		      COMP_SEGMENTS_HANDBACK_HOME);
+		CHECK(target == -1);
+	}
+
+	SECTION("home gone, the laptop holds the window and its DP is ready: it stays there")
+	{
+		CHECK(comp_segments_handback_decide(scr, 3, home, 1, ready, nullptr, &unplugged, &target) ==
+		      COMP_SEGMENTS_HANDBACK_STAY);
+		CHECK(target == 1);
+	}
+
+	SECTION("home gone, re-claimed (listed, no default): never back to the home's DP")
+	{
+		comp_segments_next_list reclaimed = unplugged;
+		reclaimed.ids[reclaimed.count++] = PANEL;
+		CHECK(comp_segments_handback_decide(scr, 3, home, 1, ready, nullptr, &reclaimed, &target) ==
+		      COMP_SEGMENTS_HANDBACK_STAY);
+		CHECK(target == 1);
+	}
+
+	SECTION("home gone while its DP still holds the window: to the ready screen the window covers most")
+	{
+		comp_segment_table last{};
+		const comp_seg_rect win{2000, 100, 1200, 700}; // 560 px on the laptop, 640 on OTHER
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 3, &last) == 2);
+		CHECK(comp_segments_handback_decide(scr, 3, home, (int)home, ready, &last, &unplugged, &target) ==
+		      COMP_SEGMENTS_HANDBACK_MOVE);
+		CHECK(target == 2);
+		// No share known: the first ready screen.
+		CHECK(comp_segments_handback_decide(scr, 3, home, (int)home, ready, nullptr, &unplugged, &target) ==
+		      COMP_SEGMENTS_HANDBACK_MOVE);
+		CHECK(target == 1);
+		// Nobody holds the window (a failed hand-off): the same choice.
+		CHECK(comp_segments_handback_decide(scr, 3, home, -1, ready, &last, &unplugged, &target) ==
+		      COMP_SEGMENTS_HANDBACK_MOVE);
+		CHECK(target == 2);
+	}
+
+	SECTION("the holder's DP is not ready (no geometry): to another ready screen")
+	{
+		bool r[3] = {false, false, true};
+		CHECK(comp_segments_handback_decide(scr, 3, home, 1, r, nullptr, &unplugged, &target) ==
+		      COMP_SEGMENTS_HANDBACK_MOVE);
+		CHECK(target == 2);
+	}
+
+	SECTION("the holder's screen left too: to a ready screen that is listed")
+	{
+		comp_segments_next_list only_other{};
+		only_other.ids[only_other.count++] = OTHER;
+		CHECK(comp_segments_handback_decide(scr, 3, home, 1, ready, nullptr, &only_other, &target) ==
+		      COMP_SEGMENTS_HANDBACK_MOVE);
+		CHECK(target == 2);
+	}
+
+	SECTION("no listed screen has a ready DP: the window stays with its holder, never a new home DP")
+	{
+		bool none[3] = {false, false, false};
+		CHECK(comp_segments_handback_decide(scr, 3, home, 1, none, nullptr, &unplugged, &target) ==
+		      COMP_SEGMENTS_HANDBACK_NO_READY);
+		CHECK(target == 1);
+		CHECK(comp_segments_handback_decide(scr, 3, home, (int)home, none, nullptr, &unplugged, &target) ==
+		      COMP_SEGMENTS_HANDBACK_NO_READY);
+		CHECK(target == (int)home);
+		CHECK(comp_segments_handback_decide(scr, 3, home, -1, none, nullptr, &unplugged, &target) ==
+		      COMP_SEGMENTS_HANDBACK_NO_READY);
+		CHECK(target == -1);
+		// The home's own readiness never counts.
+		bool home_only[3] = {true, false, false};
+		CHECK(comp_segments_handback_decide(scr, 3, home, (int)home, home_only, nullptr, &unplugged,
+		                                    &target) == COMP_SEGMENTS_HANDBACK_NO_READY);
+	}
+
+	CHECK(std::strcmp(comp_segments_handback_str(COMP_SEGMENTS_HANDBACK_STAY), "stay") == 0);
+}

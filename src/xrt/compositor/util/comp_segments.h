@@ -835,6 +835,86 @@ comp_segments_owner_needs_windowless_replacement(const struct comp_segment_table
                                                  bool owner_is_primary,
                                                  bool owner_has_factory);
 
+/*!
+ * The screen list a rebuild is about to take, as the hand-back needs it: the
+ * ids it lists and the one carrying SYSTEM_DEFAULT (the session re-anchors
+ * that flag on the session DP's home screen, or puts it on none when the home
+ * is gone or re-claimed — u_screen_home).
+ */
+struct comp_segments_next_list
+{
+	uint64_t ids[COMP_SEGMENTS_MAX_SCREENS];
+	uint32_t count;
+	uint64_t default_id; //!< 0 = no screen carries SYSTEM_DEFAULT
+};
+
+//! What the window handle does before a screen-list rebuild (@ref comp_segments_handback_decide).
+enum comp_segments_handback
+{
+	//! The next list keeps the home screen (or there is no next list, a
+	//! teardown): back to the home screen's DP, as before (a no-op when it
+	//! holds the window already).
+	COMP_SEGMENTS_HANDBACK_HOME = 0,
+	//! Home gone: the screen holding the window is listed and its DP is
+	//! ready. The window stays on that DP, which moves into the session's
+	//! primary slot (nothing is re-made).
+	COMP_SEGMENTS_HANDBACK_STAY,
+	//! Home gone: the window moves to the listed screen with a ready DP that
+	//! the window covers most, and that screen's new window-holding DP takes
+	//! the primary slot.
+	COMP_SEGMENTS_HANDBACK_MOVE,
+	//! Home gone and no listed screen has a ready DP: the window stays on the
+	//! DP that holds it (moved into the primary slot when it is a segment's),
+	//! and no DP is made for the departed screen.
+	COMP_SEGMENTS_HANDBACK_NO_READY,
+};
+
+/*!
+ * ADR-047 Amendment 8, home gone (#2305): where the window handle goes before
+ * a manager rebuilds on @p next. Pure.
+ *
+ * The old rule always handed the window back to the home screen's DP. When the
+ * home screen is not in @p next any more (unplugged), that is a fresh DP for a
+ * panel that is not there: on Windows hardware it never became ready, wove
+ * nothing and reported no geometry, so the laptop showed one eye of a
+ * whole-panel frustum. Now:
+ *   - the home is @p next's default screen, or @p next is NULL: HOME;
+ *   - else the window's holder (@p owner_index, not the home) is listed and
+ *     @p ready: STAY;
+ *   - else the listed, @p ready screen (not the home) with the largest share of
+ *     the window in @p last (ties and no share: the lowest index): MOVE;
+ *   - else NO_READY.
+ *
+ * @param screens        The manager's screens (indexed like @p ready).
+ * @param screen_count   How many.
+ * @param primary_index  The home screen's index (the session DP's screen);
+ *                       out of range = no segmentation, HOME.
+ * @param owner_index    The screen whose DP holds the window, -1 = none.
+ * @param ready          Per screen: it has a live DP that reports its screen's
+ *                       geometry (the window metrics need it). Ignored for the
+ *                       home.
+ * @param last           The last segment table (the window's share per
+ *                       screen); NULL = no share known.
+ * @param next           The list the rebuild takes; NULL = none (a teardown).
+ * @param[out] out_target The screen the window ends on: the holder for STAY,
+ *                       the new screen for MOVE, the holder for NO_READY (it
+ *                       may be the home itself; -1 when no DP holds the
+ *                       window); -1 for HOME.
+ */
+enum comp_segments_handback
+comp_segments_handback_decide(const struct comp_segments_screen *screens,
+                              uint32_t screen_count,
+                              uint32_t primary_index,
+                              int owner_index,
+                              const bool *ready,
+                              const struct comp_segment_table *last,
+                              const struct comp_segments_next_list *next,
+                              int *out_target);
+
+//! A short word for @p h ("home", "stay", "move", "no ready screen").
+const char *
+comp_segments_handback_str(enum comp_segments_handback h);
+
 
 /*
  *

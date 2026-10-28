@@ -669,6 +669,10 @@ struct comp_d3d11_compositor
 	struct xrt_system_compositor_info *seg_sys_info; //!< heap copy (the DP registry)
 	bool seg_rebuild;                                //!< a new list arrived: rebuild on the next weave
 	uint64_t seg_pinned_display_id;
+	//! ADR-047 Amendment 8 (#2305): the screen whose DP display_processor is
+	//! while the home screen is gone (0 = the home's); kept across rebuilds
+	//! (comp_d3d11_segments_hwnd_hooks::away_screen_id).
+	uint64_t seg_away_screen_id;
 	struct comp_seg_rect seg_window; //!< the window's client area in desktop device px
 	bool have_seg_window;
 	/*!
@@ -1156,7 +1160,9 @@ d3d11_seg_ensure(struct comp_d3d11_compositor *c)
 	// The app thread reads c->segments for eyes (M3): swap under the lock.
 	std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
 	if (c->seg_rebuild) {
-		comp_d3d11_segments_destroy(&c->segments);
+		// The window goes back to the home screen's DP, or — the home gone
+		// from the new list — stays with a ready screen (ADR-047 A8, #2305).
+		comp_d3d11_segments_destroy_for_rebuild(&c->segments, c->seg_screens);
 		c->seg_rebuild = false;
 	}
 	if (c->segments != nullptr) {
@@ -1173,6 +1179,7 @@ d3d11_seg_ensure(struct comp_d3d11_compositor *c)
 			hooks.userdata = c;
 			hooks.swap_primary = d3d11_segments_swap_primary_cb;
 			hooks.bracket = d3d11_segments_hwnd_bracket_cb;
+			hooks.away_screen_id = &c->seg_away_screen_id;
 			comp_d3d11_segments_set_hwnd_hooks(c->segments, &hooks);
 		}
 		comp_d3d11_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info, c->seg_pinned_display_id);
