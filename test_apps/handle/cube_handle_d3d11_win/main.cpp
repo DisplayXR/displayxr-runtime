@@ -16,6 +16,7 @@
 
 #include "logging.h"
 #include "input_handler.h"
+#include "gamepad_actions.h" // pad camera control on /user/gamepad
 #include "d3d11_renderer.h"
 
 // #918 review F1 — ID3D11DeviceContext1::ClearView, for the Tier-3 mask stroke.
@@ -70,7 +71,15 @@ struct ActionsState {
 };
 static ActionsState g_actions;
 
-static bool SetupActions(XrInstance instance, XrSession session)
+// Gamepad camera control (displayxr-common gamepad_actions.h): always on.
+// Its action set joins the hand set (when --actions is on) in the single
+// xrAttachSessionActionSets call and in every xrSyncActions.
+static dxr::GamepadActions g_gamepad;
+static bool g_gamepadOk = false;
+
+//! Create the hand action set + its suggested bindings. Attaching happens in
+//! AttachActionSets (once per session, together with the gamepad set).
+static bool SetupActions(XrInstance instance)
 {
     XrActionSetCreateInfo setInfo = {XR_TYPE_ACTION_SET_CREATE_INFO};
     strncpy_s(setInfo.actionSetName, "cube_actions", sizeof(setInfo.actionSetName) - 1);
@@ -135,15 +144,37 @@ static bool SetupActions(XrInstance instance, XrSession session)
         LOG_ERROR("actions: suggest bindings failed");
         return false;
     }
+    return true;
+}
 
+//! The session's ONE xrAttachSessionActionSets: the hand set (actions mode)
+//! plus the gamepad set.
+static bool AttachActionSets(XrSession session)
+{
+    XrActionSet sets[2];
+    uint32_t count = 0;
+    if (g_actionsMode) {
+        sets[count++] = g_actions.actionSet;
+    }
+    if (g_gamepadOk) {
+        sets[count++] = dxr::GamepadActionsSet(g_gamepad);
+    }
+    if (count == 0) {
+        return true;
+    }
     XrSessionActionSetsAttachInfo attach = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
-    attach.countActionSets = 1;
-    attach.actionSets = &g_actions.actionSet;
+    attach.countActionSets = count;
+    attach.actionSets = sets;
     if (XR_FAILED(xrAttachSessionActionSets(session, &attach))) {
         LOG_ERROR("actions: xrAttachSessionActionSets failed");
         return false;
     }
+    return true;
+}
 
+//! Grip spaces for the hand pose action (after the attach).
+static bool SetupActionSpaces(XrSession session)
+{
     for (int hand = 0; hand < 2; hand++) {
         XrActionSpaceCreateInfo si = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
         si.action = g_actions.poseAction;
@@ -159,14 +190,40 @@ static bool SetupActions(XrInstance instance, XrSession session)
     return true;
 }
 
-//! Per-frame: sync + read state + locate the grip spaces at display time.
-static void UpdateActions(XrSession session, XrSpace baseSpace, XrTime displayTime)
+//! Per-frame: one sync for the hand + gamepad sets, the gamepad poll into
+//! @p input, then (actions mode) read state + locate the grip spaces.
+static void UpdateActions(XrSession session, XrSpace baseSpace, XrTime displayTime, InputState& input)
 {
-    XrActiveActionSet active = {g_actions.actionSet, XR_NULL_PATH};
+    XrActiveActionSet active[2] = {};
+    uint32_t activeCount = 0;
+    if (g_actionsMode) {
+        active[activeCount++] = {g_actions.actionSet, XR_NULL_PATH};
+    }
+    if (g_gamepadOk && dxr::GamepadActionsAppendActiveSet(g_gamepad, &active[activeCount])) {
+        activeCount++;
+    }
+    if (activeCount == 0) {
+        return;
+    }
     XrActionsSyncInfo syncInfo = {XR_TYPE_ACTIONS_SYNC_INFO};
-    syncInfo.countActiveActionSets = 1;
-    syncInfo.activeActionSets = &active;
+    syncInfo.countActiveActionSets = activeCount;
+    syncInfo.activeActionSets = active;
     XrResult sr = xrSyncActions(session, &syncInfo);
+
+    // Gamepad: read after every sync. Unfocused, the actions read inactive and
+    // every pad field goes to 0; on a hard sync failure apply an empty sample
+    // so a stale stick cannot keep moving the camera.
+    if (g_gamepadOk) {
+        if (XR_FAILED(sr)) {
+            dxr::GamepadActionsApply(g_gamepad, dxr::GamepadSample{}, InputStateNowSec(), input);
+        } else {
+            dxr::GamepadActionsPoll(session, g_gamepad, input);
+        }
+    }
+    if (!g_actionsMode) {
+        return;
+    }
+
     if (sr == XR_SESSION_NOT_FOCUSED) {
         // Normal until the session reaches FOCUSED; markers stay hidden.
         g_actions.poseValid[0] = g_actions.poseValid[1] = false;
@@ -1442,8 +1499,8 @@ static void RenderOneFrame(RenderState& rs) {
                 if (g_handsMode) {
                     UpdateHands(xr.localSpace, frameState.predictedDisplayTime);
                 }
-                if (g_actionsMode) {
-                    UpdateActions(xr.session, xr.localSpace, frameState.predictedDisplayTime);
+                if (g_actionsMode || g_gamepadOk) {
+                    UpdateActions(xr.session, xr.localSpace, frameState.predictedDisplayTime, g_inputState);
                 }
                 uint32_t modeViewCount = (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount)
                     ? xr.renderingModeViewCounts[xr.currentModeIndex] : 2;
@@ -2713,10 +2770,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // session creation. Failure downgrades to the plain cube.
     if (g_actionsMode) {
         LOG_INFO("Actions mode ENABLED (--actions): khr/simple_controller pose+select+haptic");
-        if (!SetupActions(xr.instance, xr.session)) {
+        if (!SetupActions(xr.instance)) {
             LOG_ERROR("actions: setup failed — continuing without actions mode");
             g_actionsMode = false;
         }
+    }
+    // Gamepad camera control on /user/gamepad (microsoft/xbox_controller).
+    // Failure just leaves the keyboard/mouse.
+    g_gamepadOk = dxr::GamepadActionsCreate(xr.instance, g_gamepad);
+    if (g_gamepadOk) {
+        LOG_INFO("gamepad: action set created (microsoft/xbox_controller on /user/gamepad)");
+    } else {
+        LOG_WARN("gamepad: action set creation failed — continuing without pad control");
+    }
+    if (!AttachActionSets(xr.session)) {
+        g_actionsMode = false;
+        g_gamepadOk = false;
+    }
+    if (g_actionsMode && !SetupActionSpaces(xr.session)) {
+        LOG_ERROR("actions: setup failed — continuing without actions mode");
+        g_actionsMode = false;
     }
 
     // #825 hands mode: create the hand trackers right after session
@@ -2898,6 +2971,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     g_xr = nullptr;
     CleanupHands();
+    dxr::GamepadActionsDestroy(g_gamepad);
+    g_gamepadOk = false;
     if (g_cursorSprite != XR_NULL_HANDLE) {
         xrDestroySwapchain(g_cursorSprite);
         g_cursorSprite = XR_NULL_HANDLE;
