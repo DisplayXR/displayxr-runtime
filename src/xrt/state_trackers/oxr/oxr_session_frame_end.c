@@ -2650,6 +2650,13 @@ submit_equirect1_layer(struct oxr_session *sess,
 static void
 do_synchronize_state_change(struct oxr_logger *log, struct oxr_session *sess)
 {
+	// #2467: decided and changed under sessions_mutex, as in the poll; this
+	// unlocked check only keeps the lock off the steady-state frame path.
+	if (sess->has_ended_once && !(sess->is_appcontainer && sess->state == XR_SESSION_STATE_SYNCHRONIZED)) {
+		return;
+	}
+	os_mutex_lock(&sess->sys->inst->sessions_mutex);
+
 	// First frame: transition from READY to SYNCHRONIZED
 	if (!sess->has_ended_once && sess->state < XR_SESSION_STATE_VISIBLE) {
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
@@ -2665,6 +2672,8 @@ do_synchronize_state_change(struct oxr_logger *log, struct oxr_session *sess)
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
 	}
+
+	os_mutex_unlock(&sess->sys->inst->sessions_mutex);
 }
 
 static XrResult

@@ -967,6 +967,16 @@ handle_reference_space_change_pending(struct oxr_logger *log,
  *
  */
 
+/*
+ * #2467: callers hold inst->sessions_mutex across the check that decides a
+ * transition and the change itself. The poll does (oxr_poll_event), and so does
+ * every API path that changes the state: xrBeginSession, xrEndSession,
+ * xrRequestExitSession, and the first-frame / AppContainer transitions in
+ * xrWaitFrame, xrBeginFrame and xrEndFrame. The one exception is
+ * oxr_session_create, before the session is in the instance's list. With every
+ * writer serialised, writing the state before pushing its event means an app
+ * never pops an event before its state, out of order, or twice.
+ */
 void
 oxr_session_change_state(struct oxr_logger *log, struct oxr_session *sess, XrSessionState state, XrTime time)
 {
@@ -1123,6 +1133,10 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 		}
 #endif
 
+		// #2467: the flags and the state below change under sessions_mutex, as
+		// in the poll (see oxr_session_change_state).
+		os_mutex_lock(&sess->sys->inst->sessions_mutex);
+
 		// For AppContainer apps (Chrome WebXR), force visibility/focus flags to true
 		// to avoid race condition where client calls xrBeginSession before polling events.
 		if (sess->is_appcontainer && (!sess->compositor_visible || !sess->compositor_focused)) {
@@ -1143,7 +1157,12 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 		if (sess->is_appcontainer && sess->compositor_visible && sess->compositor_focused) {
 			oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
 		}
+		os_mutex_unlock(&sess->sys->inst->sessions_mutex);
 	} else {
+		// #2467: under sessions_mutex, so a poll on another thread cannot
+		// promote (and push) in between and reorder or repeat these events.
+		os_mutex_lock(&sess->sys->inst->sessions_mutex);
+
 		// Headless, pretend we got event from the compositor.
 		sess->compositor_visible = true;
 		sess->compositor_focused = true;
@@ -1152,6 +1171,8 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
+
+		os_mutex_unlock(&sess->sys->inst->sessions_mutex);
 	}
 	XrResult ret = oxr_frame_sync_begin_session(&sess->frame_sync);
 	if (ret != XR_SUCCESS) {
@@ -1502,6 +1523,8 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess)
 		sess->compositor_focused = false;
 	}
 
+	// #2467: under sessions_mutex, as in the poll (see oxr_session_change_state).
+	os_mutex_lock(&sess->sys->inst->sessions_mutex);
 	oxr_session_change_state(log, sess, XR_SESSION_STATE_IDLE, 0);
 	if (sess->exiting) {
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_EXITING, 0);
@@ -1515,6 +1538,7 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess)
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_READY, 0);
 #endif // !XRT_OS_ANDROID
 	}
+	os_mutex_unlock(&sess->sys->inst->sessions_mutex);
 	XrResult ret = oxr_frame_sync_end_session(&sess->frame_sync);
 	if (ret != XR_SUCCESS) {
 		return oxr_error(log, ret, "Frame sync object refused to let us end session, probably not running");
@@ -5833,11 +5857,16 @@ oxr_session_frame_wait(struct oxr_logger *log, struct oxr_session *sess, XrFrame
 	// For AppContainer apps (Chrome WebXR), deliver the deferred VISIBLE/FOCUSED
 	// state transitions at the start of xrWaitFrame. This is earlier than xrEndFrame
 	// and allows Chrome to proceed with its frame loop.
-	if (sess->is_appcontainer &&
-	    sess->state == XR_SESSION_STATE_SYNCHRONIZED &&
-	    sess->compositor_visible && sess->compositor_focused) {
-		oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
-		oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
+	// #2467: decided and changed under sessions_mutex, as in the poll; the
+	// unlocked check only keeps the lock off the steady-state frame path.
+	if (sess->is_appcontainer && sess->state == XR_SESSION_STATE_SYNCHRONIZED) {
+		os_mutex_lock(&sess->sys->inst->sessions_mutex);
+		if (sess->state == XR_SESSION_STATE_SYNCHRONIZED && sess->compositor_visible &&
+		    sess->compositor_focused) {
+			oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
+			oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
+		}
+		os_mutex_unlock(&sess->sys->inst->sessions_mutex);
 	}
 
 	if (sess->frame_timing_spew) {
@@ -6012,8 +6041,16 @@ oxr_session_frame_begin(struct oxr_logger *log, struct oxr_session *sess)
 	// yet visible still progresses; the xrPollEvent loop then advances
 	// SYNCHRONIZED->VISIBLE->FOCUSED. AppContainer/WebXR keeps its begin-time
 	// path; headless (xc==NULL) synchronizes at xrBeginSession.
+	// #2467: decided and changed under sessions_mutex, as in the poll; the
+	// unlocked check only keeps the lock off the steady-state frame path. The
+	// re-check matters: an exit requested on another thread may have moved
+	// READY -> STOPPING since, and writing SYNCHRONIZED over it would lose it.
 	if (xc != NULL && !sess->is_appcontainer && sess->state == XR_SESSION_STATE_READY) {
-		oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
+		os_mutex_lock(&sess->sys->inst->sessions_mutex);
+		if (sess->state == XR_SESSION_STATE_READY) {
+			oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
+		}
+		os_mutex_unlock(&sess->sys->inst->sessions_mutex);
 	}
 
 	return ret;
