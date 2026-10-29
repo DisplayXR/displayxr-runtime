@@ -983,8 +983,11 @@ oxr_session_change_state(struct oxr_logger *log, struct oxr_session *sess, XrSes
 		time = time_state_monotonic_to_ts_ns(sess->sys->inst->timekeeping, os_monotonic_get_ns());
 	}
 
-	oxr_event_push_XrEventDataSessionStateChanged(log, sess, state, time);
+	// #2467: the session is in the new state before its event can be popped.
+	// xrPollEvent pops outside sessions_mutex, so with the push first another
+	// thread could see e.g. STOPPING and call xrEndSession before the write.
 	sess->state = state;
+	oxr_event_push_XrEventDataSessionStateChanged(log, sess, state, time);
 }
 
 XrResult
