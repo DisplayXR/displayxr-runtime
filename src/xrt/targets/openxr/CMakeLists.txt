@@ -93,6 +93,10 @@ if(WIN32)
 	# absent. The D3D11 native compositor path never calls into Vulkan
 	# weaver functions, so the delay-loaded DLL is never triggered.
 	target_link_options(${RUNTIME_TARGET} PRIVATE "/DELAYLOAD:vulkan-1.dll")
+	# #2461: the system graphics DLLs are delay-loaded so target_dll_init.c
+	# resolves them from System32. A host that ships its own d3d11.dll /
+	# dxgi.dll (DXVK) would otherwise bind the runtime to those.
+	target_link_options(${RUNTIME_TARGET} PRIVATE "/DELAYLOAD:d3d11.dll" "/DELAYLOAD:dxgi.dll" "/DELAYLOAD:d3d12.dll")
 	target_link_libraries(${RUNTIME_TARGET} PRIVATE delayimp)
 	# Vendor-SDK delay-loads (SR Vulkan beta, etc.) live in the vendor
 	# plug-in DLL's link line — see DisplayXR/displayxr-leia-plugin.
