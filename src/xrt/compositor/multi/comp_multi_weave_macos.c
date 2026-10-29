@@ -55,6 +55,13 @@
  * against the screens in the CG frame (util/comp_weave_screens.h). The shared
  * half is "Per-screen display processors" below; docs/architecture/
  * comp-segments.md § macOS service.
+ *
+ * File-trigger capture (#2470, the #2207 contract): the SERVICE's
+ * `$TMPDIR/displayxr_atlas_trigger[.<client-exe>][.projection]` is polled once
+ * per submit. Both IOSurfaces are read here, backend-neutral — the input as
+ * received (before record_and_wait) and the woven output (after it, i.e. after
+ * the GPU finished) — and the backend fills the DP-input stage inside its
+ * record_and_wait (comp_multi_weave_capture.h).
  */
 
 #include "xrt/xrt_compositor.h"
@@ -83,6 +90,7 @@
 #include <CoreGraphics/CoreGraphics.h>
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 DEBUG_GET_ONCE_OPTION(weave_mac_backend, "DXR_WEAVE_MAC_BACKEND", "auto")
@@ -531,6 +539,41 @@ comp_multi_weave_macos_segs_log(struct multi_compositor *mc, const struct comp_s
 }
 
 
+/*!
+ * #2470: copy one IOSurface (the caller's input or the woven output) into
+ * @p stage of this submit's capture. Both backends treat these surfaces as
+ * BGRA8, so an unspecified pixel format reads as BGRA; anything that is not 4
+ * bytes per pixel is skipped with a WARN (capturing submits only).
+ */
+static void
+weave_capture_iosurface(struct multi_compositor *mc, enum comp_multi_weave_capture_stage stage, IOSurfaceRef surface)
+{
+	if (surface == NULL || !comp_multi_weave_capture_wants(&mc->weave.capture, stage)) {
+		return;
+	}
+	const char *name = stage == COMP_MULTI_WEAVE_CAPTURE_INPUT ? "input" : "woven";
+	const OSType fmt = IOSurfaceGetPixelFormat(surface);
+	if (IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) > 1) {
+		U_LOG_W(
+		    "weave capture (#2470): %s IOSurface (pixel format 0x%08x, %zu bytes/element) is not 4-byte "
+		    "RGBA/BGRA — skipped",
+		    name, (unsigned)fmt, (size_t)IOSurfaceGetBytesPerElement(surface));
+		return;
+	}
+	const bool swap_rb = fmt != (OSType)0x52474241; // 'RGBA'; 'BGRA' and unspecified are BGRA
+	uint32_t seed = 0;
+	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) {
+		U_LOG_W("weave capture (#2470): IOSurfaceLock on the %s surface failed — skipped", name);
+		return;
+	}
+	(void)comp_multi_weave_capture_store(
+	    &mc->weave.capture, stage, (const uint8_t *)IOSurfaceGetBaseAddress(surface),
+	    (uint32_t)IOSurfaceGetWidth(surface), (uint32_t)IOSurfaceGetHeight(surface),
+	    IOSurfaceGetBytesPerRow(surface), swap_rb);
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, &seed);
+}
+
+
 /*
  *
  * Public entry points (called from ipc_server_handler.c).
@@ -552,6 +595,19 @@ comp_multi_weave_bind_window(struct xrt_compositor *xc, uint64_t window_id)
 	os_mutex_unlock(&mc->weave.mutex);
 	U_LOG_W("weave(#759): bound present-owner window id 0x%" PRIx64, window_id);
 	return true;
+}
+
+void
+comp_multi_weave_macos_set_capture_tag(struct xrt_compositor *xc, const char *tag)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	snprintf(mc->weave.capture.tag, sizeof(mc->weave.capture.tag), "%s", tag != NULL ? tag : "");
+	os_mutex_unlock(&mc->weave.mutex);
 }
 
 bool
@@ -703,6 +759,11 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			lift_count = 0; // this backend weaves them as drawn
 		}
 
+		// #2470: one trigger poll per submit; only a capturing submit reads
+		// anything back. A capture left pending by a failed submit is reported
+		// and dropped here (the backend never leaves a Vulkan object in it).
+		const bool capturing = comp_multi_weave_capture_begin(&mc->weave.capture, NULL);
+
 		// (Re)import the input on identity change (new IOSurface = new id).
 		if (mc->weave.in_iosurface == NULL || mc->weave.in_iosurface_id != surface_id) {
 			be->release_input(mc);
@@ -822,11 +883,32 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		    .lift_owner = lift_owner,
 		    .lift_rects = lift_rects,
 		};
+		// #2470: the caller's buffer as received (its GPU writes completed
+		// before the submit — the macOS input contract), before any un-squeeze,
+		// crop or lift.
+		if (capturing) {
+			weave_capture_iosurface(mc, COMP_MULTI_WEAVE_CAPTURE_INPUT,
+			                        (IOSurfaceRef)mc->weave.in_iosurface);
+		}
+
 		if (!be->record_and_wait(mc, &params)) {
 			break;
 		}
 
 		mc->weave.fence_value++;
+
+		// #2470: the woven output — record_and_wait returned after the GPU
+		// finished it — then encode every stage (the backend filled the atlas).
+		if (capturing) {
+			weave_capture_iosurface(mc, COMP_MULTI_WEAVE_CAPTURE_WOVEN,
+			                        (IOSurfaceRef)mc->weave.out_iosurface);
+			char what[160];
+			snprintf(what, sizeof(what), "client=%s backend=%s %s layout, output %ux%u",
+			         mc->weave.capture.tag[0] != 0 ? mc->weave.capture.tag : "?", be->name,
+			         nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"), mc->weave.out_w,
+			         mc->weave.out_h);
+			comp_multi_weave_capture_finish(&mc->weave.capture, NULL, what);
+		}
 
 		*out_width = mc->weave.out_w;
 		*out_height = mc->weave.out_h;
@@ -989,6 +1071,7 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 		mc->weave.overlay_iosurface = NULL;
 	}
 	mc->weave.overlay_iosurface_id = 0;
+	comp_multi_weave_capture_release(&mc->weave.capture, NULL); // #2470: CPU pixels only
 	mc->weave.backend = NULL;
 	mc->weave.backend_ready = false;
 	os_mutex_unlock(&mc->weave.mutex);

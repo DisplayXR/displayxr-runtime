@@ -111,6 +111,11 @@ struct comp_multi_weave_macos_backend
 	bool (*ensure_output)(struct multi_compositor *mc, uint32_t want_w, uint32_t want_h, bool nview);
 
 	//! Record, submit and WAIT for one weave (the synchronous macOS contract).
+	//! #2470: when comp_multi_weave_capture_wants(&mc->weave.capture,
+	//! COMP_MULTI_WEAVE_CAPTURE_ATLAS), also read back the atlas the DP
+	//! consumes (SBS scratch / v6 crop / zero-copy input, lifted views in) into
+	//! that stage, and return with no Vulkan object left in the capture
+	//! (comp_multi_weave_capture_resolve) on success and failure alike.
 	bool (*record_and_wait)(struct multi_compositor *mc, const struct comp_multi_weave_macos_params *p);
 
 	bool (*get_eyes)(struct multi_compositor *mc, struct xrt_eye_positions *out_eyes);

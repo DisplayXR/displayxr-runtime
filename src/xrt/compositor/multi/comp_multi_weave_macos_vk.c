@@ -1662,6 +1662,21 @@ vkb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_m
 		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1,
 		                         &out_to_attach);
 
+		// #2470: the atlas the DP is about to consume (SBS scratch / v6 crop /
+		// the zero-copy input — all SHADER_READ_ONLY here), lifted views in.
+		// Recorded before the split, so it reads what every segment DP reads.
+		if (comp_multi_weave_capture_wants(&mc->weave.capture, COMP_MULTI_WEAVE_CAPTURE_ATLAS)) {
+			uint32_t src_w = mc->weave.sbs_w, src_h = mc->weave.sbs_h;
+			if (nview) {
+				src_w = v6_zero_copy ? mc->weave.in_w : mc->weave.crop_w;
+				src_h = v6_zero_copy ? mc->weave.in_h : mc->weave.crop_h;
+			}
+			comp_multi_weave_capture_record(&mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_ATLAS,
+			                                dp_src_image, src_w, src_h, WEAVE_VK_FORMAT,
+			                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+		}
+
 		// ONE process_atlas per submit. Legacy/batch: 2x1 SBS, per-eye dims = the
 		// window. v6: the caller's grid at content_view dims — output is one
 		// content view (cvw x cvh = the whole window).
@@ -1853,6 +1868,10 @@ vkb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_m
 
 		ok = true;
 	} while (false);
+	// #2470: the atlas readback (if one was recorded) to CPU pixels — the fence
+	// was waited, or the command buffer never reached the queue — so the front
+	// end finishes the capture without a Vulkan bundle.
+	comp_multi_weave_capture_resolve(&mc->weave.capture, vk, ok);
 	return ok;
 }
 

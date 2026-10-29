@@ -441,6 +441,12 @@ if(APPLE)
 		comp_multi PRIVATE multi/comp_multi_weave_macos.c multi/comp_multi_weave_macos_vk.c
 				   multi/comp_multi_weave_macos_backend.h
 		)
+	# #2470: the engine's file-trigger capture (input / atlas / woven PNGs),
+	# shared with desktop Linux (#2207).
+	target_sources(
+		comp_multi PRIVATE multi/comp_multi_weave_capture.c multi/comp_multi_weave_capture.h
+		)
+	target_link_libraries(comp_multi PRIVATE xrt-external-stb)
 	target_link_libraries(
 		comp_multi PRIVATE "-framework IOSurface" "-framework CoreFoundation"
 				   "-framework CoreGraphics"
