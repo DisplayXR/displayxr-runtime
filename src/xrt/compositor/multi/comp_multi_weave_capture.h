@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  File-trigger capture for the service-side Vulkan weave engine
- *         (XR_DXR_weave, comp_multi_weave_linux.c) — #2207.
+ * @brief  File-trigger capture for the service-side weave engines
+ *         (XR_DXR_weave): desktop Linux (comp_multi_weave_linux.c, #2207) and
+ *         macOS (comp_multi_weave_macos.c over its vk / Metal backends, #2470).
  * @ingroup comp_multi
  *
  * The weave engine has no swapchain and no window: a present-owner (the
@@ -35,6 +36,13 @@
  * submit that consumed a trigger records the readback copies into its own
  * command buffer (host-visible staging buffers), waits its own fence, and
  * encodes the PNGs — one WARN per completed capture.
+ *
+ * Two ways to fill a stage: a Vulkan readback recorded into the frame's
+ * command buffer (@ref comp_multi_weave_capture_record, resolved to CPU pixels
+ * once its submit completed), or CPU pixels the engine already has
+ * (@ref comp_multi_weave_capture_store — the macOS front end's IOSurface reads
+ * of the input and the woven output, and the Metal backend's atlas readback).
+ * Either way @ref comp_multi_weave_capture_finish encodes every filled stage.
  */
 
 #pragma once
@@ -60,14 +68,15 @@ enum comp_multi_weave_capture_stage
 	COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT = 3,
 };
 
-//! One recorded readback (staging buffer + what it holds).
+//! One stage's pixels: a recorded Vulkan readback, or (once resolved / stored) CPU RGBA8.
 struct comp_multi_weave_capture_target
 {
-	VkBuffer buffer;
+	VkBuffer buffer; //!< Recorded readback, VK_NULL_HANDLE once resolved.
 	VkDeviceMemory memory;
 	uint32_t w, h;
 	VkFormat format;
-	bool recorded;
+	bool recorded; //!< This stage holds pixels (a pending readback or @ref rgba).
+	uint8_t *rgba; //!< Tight RGBA8 (alpha already forced unless raw), heap; NULL until resolved / stored.
 };
 
 //! Per-client capture state (lives in multi_compositor::weave).
@@ -115,14 +124,40 @@ comp_multi_weave_capture_record(struct comp_multi_weave_capture *cap,
                                 VkAccessFlags last_access);
 
 /*!
+ * Fill @p stage from CPU pixels (4 bytes per pixel, rows @p stride bytes apart;
+ * @p swap_rb for a BGRA8 source). Copied: the source may be unmapped / unlocked
+ * on return. No-op (false) when the stage is not wanted or already filled.
+ */
+bool
+comp_multi_weave_capture_store(struct comp_multi_weave_capture *cap,
+                               enum comp_multi_weave_capture_stage stage,
+                               const uint8_t *src,
+                               uint32_t w,
+                               uint32_t h,
+                               size_t stride,
+                               bool swap_rb);
+
+/*!
  * After the submit that recorded the copies has COMPLETED (caller waited its
- * fence): map each recorded buffer, encode its PNG, free the buffers, emit one
- * WARN, and consume the intent. @p what names the frame in the WARN.
+ * fence), or failed before it was ever submitted (@p gpu_ok false): map each
+ * recorded buffer into CPU pixels (only when @p gpu_ok) and free every staging
+ * buffer. Afterwards the capture holds no Vulkan object, so an engine that
+ * finishes elsewhere (the macOS front end) can pass a NULL bundle there.
+ */
+void
+comp_multi_weave_capture_resolve(struct comp_multi_weave_capture *cap, struct vk_bundle *vk, bool gpu_ok);
+
+/*!
+ * After the submit that recorded the copies has COMPLETED (caller waited its
+ * fence): resolve any recorded buffer (@p vk may be NULL when nothing is
+ * recorded-but-unresolved), encode every filled stage's PNG, free everything,
+ * emit one WARN, and consume the intent. @p what names the frame in the WARN.
  */
 void
 comp_multi_weave_capture_finish(struct comp_multi_weave_capture *cap, struct vk_bundle *vk, const char *what);
 
-//! Free any staging buffers (GPU must be idle on them). Fini / abandon path.
+//! Free any staging buffers (GPU must be idle on them; skipped for a NULL @p vk)
+//! and stored pixels. Fini / abandon path.
 void
 comp_multi_weave_capture_release(struct comp_multi_weave_capture *cap, struct vk_bundle *vk);
 

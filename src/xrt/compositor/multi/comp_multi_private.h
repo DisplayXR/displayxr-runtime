@@ -42,9 +42,7 @@
 #include "multi/comp_multi_content_blend.h"
 #if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
 #include "multi/comp_multi_weave_lift.h"
-#ifdef XRT_OS_LINUX_DESKTOP
 #include "multi/comp_multi_weave_capture.h"
-#endif
 #endif
 
 #include "render/render_interface.h"
@@ -748,6 +746,12 @@ struct multi_compositor
 
 		//! XR_DXR_lift §6: lifted weave rects (vk backend; comp_multi_weave_lift.h).
 		struct comp_multi_weave_lift lift;
+
+		//! #2470: file-trigger capture (input / atlas / woven PNGs) —
+		//! comp_multi_weave_capture.h. The front end reads the input and the
+		//! woven IOSurfaces; the backend fills the atlas stage inside its
+		//! record_and_wait and leaves no Vulkan object behind. Under @ref mutex.
+		struct comp_multi_weave_capture capture;
 
 		/*!
 		 * @name Per-screen display processors (#2218 item 6, ADR-047 D2)
@@ -1907,6 +1911,17 @@ comp_multi_weave_macos_window_on_panel(struct multi_compositor *mc,
                                        uint32_t *out_h,
                                        uint32_t *out_panel_w,
                                        uint32_t *out_panel_h);
+
+/*!
+ * #2470: the weave client's executable basename (the IPC server's OS-derived
+ * per-connection key), the tag of its per-client capture trigger
+ * `$TMPDIR/displayxr_atlas_trigger.<tag>` (comp_multi_weave_capture.h) — the
+ * twin of comp_multi_weave_linux_set_capture_tag. The IPC handler sets it
+ * before every submit; a NULL / empty tag polls only the service-process and
+ * global triggers.
+ */
+void
+comp_multi_weave_macos_set_capture_tag(struct xrt_compositor *xc, const char *tag);
 
 #ifdef COMP_MULTI_WEAVE_HAVE_METAL
 /*!

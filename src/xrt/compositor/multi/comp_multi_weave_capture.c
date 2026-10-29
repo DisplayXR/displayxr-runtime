@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  File-trigger capture for the service-side Vulkan weave engine (#2207).
+ * @brief  File-trigger capture for the service-side weave engines (#2207, #2470).
  * @ingroup comp_multi
  *
  * See comp_multi_weave_capture.h for the trigger names and the three files.
@@ -44,20 +44,32 @@ format_swap_rb(VkFormat format, bool *out_swap)
 	}
 }
 
+static void
+target_free_vk(struct comp_multi_weave_capture_target *t, struct vk_bundle *vk)
+{
+	if (vk == NULL) {
+		return;
+	}
+	if (t->buffer != VK_NULL_HANDLE) {
+		vk->vkDestroyBuffer(vk->device, t->buffer, NULL);
+		t->buffer = VK_NULL_HANDLE;
+	}
+	if (t->memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, t->memory, NULL);
+		t->memory = VK_NULL_HANDLE;
+	}
+}
+
 void
 comp_multi_weave_capture_release(struct comp_multi_weave_capture *cap, struct vk_bundle *vk)
 {
-	if (cap == NULL || vk == NULL) {
+	if (cap == NULL) {
 		return;
 	}
 	for (uint32_t i = 0; i < COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT; i++) {
 		struct comp_multi_weave_capture_target *t = &cap->target[i];
-		if (t->buffer != VK_NULL_HANDLE) {
-			vk->vkDestroyBuffer(vk->device, t->buffer, NULL);
-		}
-		if (t->memory != VK_NULL_HANDLE) {
-			vk->vkFreeMemory(vk->device, t->memory, NULL);
-		}
+		target_free_vk(t, vk);
+		free(t->rgba);
 		memset(t, 0, sizeof(*t));
 	}
 }
@@ -178,12 +190,79 @@ comp_multi_weave_capture_record(struct comp_multi_weave_capture *cap,
 	return true;
 }
 
+bool
+comp_multi_weave_capture_store(struct comp_multi_weave_capture *cap,
+                               enum comp_multi_weave_capture_stage stage,
+                               const uint8_t *src,
+                               uint32_t w,
+                               uint32_t h,
+                               size_t stride,
+                               bool swap_rb)
+{
+	if (!comp_multi_weave_capture_wants(cap, stage) || src == NULL || w == 0 || h == 0 || stride < (size_t)w * 4) {
+		return false;
+	}
+	struct comp_multi_weave_capture_target *t = &cap->target[stage];
+	if (t->recorded) {
+		return false; // one readback per stage per capture
+	}
+	t->rgba = malloc((size_t)w * h * 4);
+	if (t->rgba == NULL) {
+		U_LOG_W("weave capture (#2207): %s stage (%ux%u) allocation failed", stage_name[stage], w, h);
+		return false;
+	}
+	u_image_capture_to_rgba8(t->rgba, src, w, h, stride, swap_rb, u_image_capture_raw_alpha());
+	t->w = w;
+	t->h = h;
+	t->format = swap_rb ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
+	t->recorded = true;
+	return true;
+}
+
+void
+comp_multi_weave_capture_resolve(struct comp_multi_weave_capture *cap, struct vk_bundle *vk, bool gpu_ok)
+{
+	if (cap == NULL || vk == NULL) {
+		return;
+	}
+	const bool keep_alpha = u_image_capture_raw_alpha();
+	for (uint32_t i = 0; i < COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT; i++) {
+		struct comp_multi_weave_capture_target *t = &cap->target[i];
+		if (t->buffer == VK_NULL_HANDLE) {
+			continue; // never recorded, or already CPU pixels
+		}
+		bool swap = false;
+		(void)format_swap_rb(t->format, &swap);
+		void *mapped = NULL;
+		if (gpu_ok && t->rgba == NULL) {
+			t->rgba = malloc((size_t)t->w * t->h * 4);
+		}
+		if (gpu_ok && t->rgba != NULL &&
+		    vk->vkMapMemory(vk->device, t->memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
+			u_image_capture_to_rgba8(t->rgba, (const uint8_t *)mapped, t->w, t->h, (size_t)t->w * 4, swap,
+			                         keep_alpha);
+			vk->vkUnmapMemory(vk->device, t->memory);
+		} else {
+			// Nothing readable: the stage is dropped (finish reports what it wrote).
+			if (gpu_ok) {
+				U_LOG_W("weave capture (#2207): mapping the %s stage readback FAILED", stage_name[i]);
+			}
+			free(t->rgba);
+			t->rgba = NULL;
+			t->recorded = false;
+		}
+		target_free_vk(t, vk);
+	}
+}
+
 void
 comp_multi_weave_capture_finish(struct comp_multi_weave_capture *cap, struct vk_bundle *vk, const char *what)
 {
 	if (cap == NULL || !cap->intent.pending) {
 		return;
 	}
+	comp_multi_weave_capture_resolve(cap, vk, true);
+
 	const bool keep_alpha = u_image_capture_raw_alpha();
 	char written[COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT][MCP_CAPTURE_PATH_MAX + 16];
 	uint32_t dims[COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT][2] = {{0}};
@@ -199,20 +278,8 @@ comp_multi_weave_capture_finish(struct comp_multi_weave_capture *cap, struct vk_
 		char path[MCP_CAPTURE_PATH_MAX + 16];
 		u_capture_intent_sibling_path(cap->intent.path, stage_infix[i], path, sizeof(path));
 
-		bool ok = false;
-		bool swap = false;
-		(void)format_swap_rb(t->format, &swap);
-		const size_t bytes = (size_t)t->w * t->h * 4;
-		void *mapped = NULL;
-		uint8_t *rgba = malloc(bytes);
-		if (rgba != NULL &&
-		    vk->vkMapMemory(vk->device, t->memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
-			u_image_capture_to_rgba8(rgba, (const uint8_t *)mapped, t->w, t->h, (size_t)t->w * 4, swap,
-			                         keep_alpha);
-			vk->vkUnmapMemory(vk->device, t->memory);
-			ok = stbi_write_png(path, (int)t->w, (int)t->h, 4, rgba, (int)t->w * 4) != 0;
-		}
-		free(rgba);
+		const bool ok =
+		    t->rgba != NULL && stbi_write_png(path, (int)t->w, (int)t->h, 4, t->rgba, (int)t->w * 4) != 0;
 		if (ok) {
 			snprintf(written[i], sizeof(written[i]), "%s", path);
 			dims[i][0] = t->w;

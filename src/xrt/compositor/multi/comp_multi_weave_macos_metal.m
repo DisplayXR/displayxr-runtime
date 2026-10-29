@@ -995,6 +995,35 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 			view_count = p->view_count;
 		}
 
+		// #2470: the atlas the DP is about to consume (SBS scratch / v6 crop /
+		// the zero-copy input), lifted views in: one blit into a shared buffer,
+		// read once the command buffer completed. Before the split, so it is
+		// what every segment DP reads too.
+		id<MTLBuffer> cap_buf = nil;
+		uint32_t cap_w = 0, cap_h = 0;
+		if (comp_multi_weave_capture_wants(&mc->weave.capture, COMP_MULTI_WEAVE_CAPTURE_ATLAS)) {
+			cap_w = (uint32_t)[atlas width];
+			cap_h = (uint32_t)[atlas height];
+			cap_buf = [weave_metal_device() newBufferWithLength:(NSUInteger)cap_w * cap_h * 4
+			                                            options:MTLResourceStorageModeShared];
+			if (cap_buf == nil) {
+				U_LOG_W("weave capture (#2470) metal: atlas readback buffer (%ux%u) allocation failed", cap_w,
+				        cap_h);
+			} else {
+				id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+				[blit copyFromTexture:atlas
+				                 sourceSlice:0
+				                 sourceLevel:0
+				                sourceOrigin:MTLOriginMake(0, 0, 0)
+				                  sourceSize:MTLSizeMake(cap_w, cap_h, 1)
+				                    toBuffer:cap_buf
+				           destinationOffset:0
+				      destinationBytesPerRow:(NSUInteger)cap_w * 4
+				    destinationBytesPerImage:(NSUInteger)cap_w * cap_h * 4];
+				[blit endEncoding];
+			}
+		}
+
 		// #2218 item 6: woven per screen? Every one-screen system, every window
 		// wholly on the default screen and every legacy single-rect submit is
 		// the single-DP weave below, byte for byte.
@@ -1084,6 +1113,14 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 		[cmd commit];
 		[cmd waitUntilCompleted];
 		const bool gpu_ok = [cmd status] == MTLCommandBufferStatusCompleted;
+		if (cap_buf != nil) {
+			if (gpu_ok) {
+				(void)comp_multi_weave_capture_store(&mc->weave.capture, COMP_MULTI_WEAVE_CAPTURE_ATLAS,
+				                                     (const uint8_t *)[cap_buf contents], cap_w, cap_h,
+				                                     (size_t)cap_w * 4, true /* BGRA8 */);
+			}
+			[cap_buf release];
+		}
 		// The weave (and every lifted rect in it) is done: the copies are handed
 		// over, snapshots go to their streams, profiles are read, pins drop.
 		// This -- after waitUntilCompleted -- is the ONLY place a frame's result
