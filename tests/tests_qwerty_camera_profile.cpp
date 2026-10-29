@@ -5,6 +5,8 @@
 #include "qwerty_interface.h"
 #include "util/u_camera_profile.h"
 
+#include <cmath>
+
 namespace {
 struct Devices
 {
@@ -80,4 +82,46 @@ TEST_CASE("Profile seeding leaves a display-mode qwerty system alone", "[qwerty]
 	CHECK_FALSE(qwerty_set_camera_profile(d.devices, 3, &profile));
 	CHECK_FALSE(d.state().camera_mode);
 	CHECK(d.state().virtual_display_height == previous.virtual_display_height);
+}
+
+TEST_CASE("A profile pitch tilts the starting camera and is the Space reset target", "[qwerty][camera-profile]")
+{
+	Devices d;
+	xrt_pose &pose = qwerty_device(d.devices[0])->pose;
+	pose.position = {3, 4, 5};
+	u_camera_profile profile = U_CAMERA_PROFILE_DEFAULT;
+	profile.pitch_rad = -0.5235987756f; // 30 degrees down
+	REQUIRE(qwerty_set_camera_profile(d.devices, 3, &profile));
+	CHECK(pose.orientation.x == Catch::Approx(std::sin(-0.2617993878)));
+	CHECK(pose.orientation.y == 0);
+	CHECK(pose.orientation.z == 0);
+	CHECK(pose.orientation.w == Catch::Approx(std::cos(-0.2617993878)));
+	CHECK(pose.position.x == 3); // the starting look is framing; position stays the user's
+
+	pose.orientation = {0, 0, 0, 1};
+	qwerty_reset_view_state(d.system());
+	CHECK(pose.orientation.x == Catch::Approx(std::sin(-0.2617993878)));
+
+	// Without a pitch the camera keeps starting level.
+	Devices level;
+	xrt_pose &level_pose = qwerty_device(level.devices[0])->pose;
+	u_camera_profile flat = U_CAMERA_PROFILE_DEFAULT;
+	REQUIRE(qwerty_set_camera_profile(level.devices, 3, &flat));
+	CHECK(level_pose.orientation.x == 0);
+	CHECK(level_pose.orientation.w == 1);
+}
+
+TEST_CASE("A profile pullback moves the starting camera back along its look", "[qwerty][camera-profile]")
+{
+	Devices d;
+	xrt_pose &pose = qwerty_device(d.devices[0])->pose;
+	pose.position = {0, 1.6f, 0.6f};
+	u_camera_profile profile = U_CAMERA_PROFILE_DEFAULT;
+	profile.pitch_rad = -0.5235987756f; // 30 degrees down
+	profile.pullback_m = 1.0f;
+	REQUIRE(qwerty_set_camera_profile(d.devices, 3, &profile));
+	// Backwards along a look tilted down: back (+Z) and up (+Y).
+	CHECK(pose.position.x == 0);
+	CHECK(pose.position.y == Catch::Approx(1.6 + 0.5));
+	CHECK(pose.position.z == Catch::Approx(0.6 + std::cos(0.5235987756)));
 }
