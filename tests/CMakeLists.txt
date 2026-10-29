@@ -134,6 +134,7 @@ set(tests
     tests_sim_input_nav
     tests_sim_input_hands
     tests_gamepad_map
+    tests_gamepad_hid_report
     tests_touch_gesture
     tests_comp_layer_view_camera
     tests_comp_color_policy
@@ -1130,6 +1131,18 @@ target_include_directories(
 			  ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 	)
 target_link_libraries(tests_gamepad_map PRIVATE xrt-interfaces)
+# #2472 -- the Sony pad HID report parsers + rumble builders the Windows HID
+# reader trusts (drivers/gamepad/gamepad_hid_report.c). Pure byte layouts, so
+# compiled straight in and run on every platform; no pad needed.
+target_sources(
+	tests_gamepad_hid_report
+	PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/gamepad/gamepad_hid_report.c
+	)
+target_include_directories(
+	tests_gamepad_hid_report PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/gamepad
+				 ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_gamepad_hid_report PRIVATE xrt-interfaces)
 # #132 — the touch provider's gesture recogniser + rig/aim math, and the
 # pointer-event ring it is fed from. Compiled straight in for the same reason
 # as tests_sim_input_nav: what is under test is the mapping table (pure
