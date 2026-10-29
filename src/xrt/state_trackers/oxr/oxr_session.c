@@ -4609,6 +4609,15 @@ locate_views_one(struct oxr_logger *log,
 	m_relation_chain_push_relation(&xrc, &T_base_xdev);
 	m_relation_chain_resolve(&xrc, &T_base_head);
 
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	// Mouse hand (DXR_MOUSE_HAND): the first two views exactly as the app gets
+	// them, in the head device's tracking origin, so qwerty can put the hand
+	// on their virtual screen under the cursor.
+	struct xrt_pose mouse_hand_eyes[2];
+	struct xrt_fov mouse_hand_fovs[2];
+	uint32_t mouse_hand_eye_count = 0;
+#endif
+
 
 	if (print) {
 		for (uint32_t i = 0; i < located_view_count; i++) {
@@ -4665,6 +4674,10 @@ locate_views_one(struct oxr_logger *log,
 		// T_xdev_head-only chain / the non-Windows service-mode skip): it
 		// re-added the standing height for one class of in-tree test cube, and
 		// those cubes now simply locate in STAGE.
+		//! This view's eye in the head device's tracking origin (the mouse hand's frame).
+		struct xrt_pose eye_in_origin;
+		math_pose_transform(&T_xdev_head.pose, &view_pose, &eye_in_origin);
+
 		const bool server_display_relative = sess->has_external_window || sess->is_bridge_relay;
 		if (server_display_relative && !have_eyes && !have_eye_override) {
 			// Use server poses directly (display-plane-relative)
@@ -4774,6 +4787,7 @@ locate_views_one(struct oxr_logger *log,
 			}
 
 			if (origin_pose_valid) {
+				eye_in_origin = origin_pose;
 				struct xrt_pose base_pose;
 				locate_views_pose_origin_to_base(&T_base_xdev, &origin_pose, &base_pose);
 				OXR_XRT_POSE_TO_XRPOSEF(base_pose, views[i].pose);
@@ -4798,6 +4812,14 @@ locate_views_one(struct oxr_logger *log,
 		}
 
 		OXR_XRT_FOV_TO_XRFOVF(fov, views[i].fov);
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+		if (i < 2 && view_in_base_space && mouse_hand_eye_count == i) {
+			mouse_hand_eyes[i] = eye_in_origin;
+			mouse_hand_fovs[i] = fov;
+			mouse_hand_eye_count++;
+		}
+#endif
 
 		if (oxr_qtrace_enabled()) {
 			U_LOG_W(
@@ -4859,6 +4881,13 @@ locate_views_one(struct oxr_logger *log,
 			base_space_view_count++; // #1502
 		}
 	}
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (mouse_hand_eye_count == 2 && sess->sys->xsysd != NULL) {
+		qwerty_set_mouse_hand_views(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, mouse_hand_eyes,
+		                            mouse_hand_fovs);
+	}
+#endif
 
 	// Inactive views (active_view_count < reported_view_count): duplicate view 0.
 	// The reported count is fixed by the session's view configuration so the

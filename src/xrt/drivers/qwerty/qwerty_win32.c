@@ -613,12 +613,26 @@ qwerty_process_win32(struct xrt_device **xdevs,
 			}
 			break;
 
-		// 1/2/3: rendering mode (HMD focused, keydown only)
+		// 1/2/3: rendering mode (HMD focused, keydown only). With the mouse
+		// hand they are the support (left) hand: 1 = menu (a palette in most
+		// creation tools), 2 = trigger, 3 = grip.
 		case '1':
 		case '2':
 		case '3':
-			if (is_keydown && qsys->hmd_focused)
+			if (qsys->mouse_hand) {
+				if (is_keydown || is_keyup) {
+					if (wParam == '1')
+						is_keydown ? qwerty_press_menu(qleft) : qwerty_release_menu(qleft);
+					else if (wParam == '2')
+						is_keydown ? qwerty_press_trigger(qleft)
+						           : qwerty_release_trigger(qleft);
+					else
+						is_keydown ? qwerty_press_squeeze(qleft)
+						           : qwerty_release_squeeze(qleft);
+				}
+			} else if (is_keydown && qsys->hmd_focused) {
 				qwerty_set_rendering_mode(qsys, (int)(wParam - '1'));
+			}
 			break;
 
 		// Controller follow HMD toggle
@@ -688,6 +702,70 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	// RMB = mouse look (hold and drag to rotate)
 	// LMB = controller trigger
 	// MMB = controller squeeze/grip
+	// Mouse hand (DXR_MOUSE_HAND): the buttons act on the right hand the
+	// cursor drives — left = trigger / stylus tip, right = grip, back /
+	// forward = menu / system (MX Ink front / back cluster) — and mouse look
+	// moves to the middle button.
+	if (qsys->mouse_hand) {
+		bool consumed = true;
+		switch (message) {
+		case WM_LBUTTONDOWN:
+			qwerty_press_trigger(qright);
+			lmb_was_down = true;
+			break;
+		case WM_LBUTTONUP:
+			qwerty_release_trigger(qright);
+			lmb_was_down = false;
+			break;
+		case WM_RBUTTONDOWN: qwerty_press_squeeze(qright); break;
+		case WM_RBUTTONUP: qwerty_release_squeeze(qright); break;
+		case WM_MBUTTONDOWN:
+			mouse_look_active = true;
+			GetCursorPos(&last_mouse_pos);
+			SetCapture(GetActiveWindow());
+			break;
+		case WM_MBUTTONUP:
+			mouse_look_active = false;
+			ReleaseCapture();
+			break;
+		case WM_XBUTTONDOWN:
+		case WM_XBUTTONUP: {
+			const bool down = message == WM_XBUTTONDOWN;
+			if (GET_XBUTTON_WPARAM(wParam) == XBUTTON1)
+				down ? qwerty_press_menu(qright) : qwerty_release_menu(qright);
+			else
+				down ? qwerty_press_system(qright) : qwerty_release_system(qright);
+		} break;
+		case WM_MOUSEWHEEL: {
+			const int steps = ((short)HIWORD(wParam)) / WHEEL_DELTA;
+			const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+			if (steps != 0 && shift) {
+				qwerty_adjust_view_factor(qsys, (steps > 0) ? 1.1f : (1.0f / 1.1f));
+			} else if (steps != 0) {
+				qwerty_adjust_mouse_hand_depth(qsys, steps);
+			}
+		} break;
+		case WM_MOUSEMOVE: {
+			POINT current_pos;
+			GetCursorPos(&current_pos);
+			const int dx = current_pos.x - last_mouse_pos.x;
+			const int dy = current_pos.y - last_mouse_pos.y;
+			if (mouse_look_active && (dx != 0 || dy != 0) && qd_hmd != NULL) {
+				qwerty_add_look_delta(qd_hmd, (float)(-dx) * SENSITIVITY, (float)(-dy) * SENSITIVITY);
+			}
+			last_mouse_pos = current_pos;
+		} break;
+		default: consumed = false; break;
+		}
+		if (consumed) {
+			if (out_handled != NULL) {
+				*out_handled = true;
+			}
+			QW32_STORE_STATE();
+			return;
+		}
+	}
+
 	switch (message) {
 	case WM_RBUTTONDOWN:
 		// Start mouse look mode

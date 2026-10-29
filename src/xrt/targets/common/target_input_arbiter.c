@@ -230,6 +230,10 @@ struct t_input_arbiter
 	uint32_t dropped_next;
 };
 
+
+//! See t_input_arbiter_set_floor_self_report.
+static t_input_arbiter_floor_self_fn g_floor_self_report = NULL;
+
 static struct t_input_arbiter g_arb = {0};
 
 /*!
@@ -547,6 +551,13 @@ profile_to_report_locked(const struct t_input_candidate *winner, struct xrt_devi
 	}
 	if (winner->iface != NULL) {
 		return xdev->name; // A real provider reports itself.
+	}
+
+	// A floor device the user chose deliberately (the qwerty mouse hand,
+	// DXR_MOUSE_HAND) is not a stand-in waiting for a provider: it reports
+	// its own profiles rather than masquerading as an idle provider's.
+	if (g_floor_self_report != NULL && g_floor_self_report(xdev)) {
+		return xdev->name;
 	}
 
 	// The floor won: find the top-ranked provider candidate's device
@@ -1537,6 +1548,12 @@ t_input_arbiter_nav_candidate_present(int32_t nav_index)
 	bool present = nav_candidate_present_locked(nav_index);
 	os_mutex_unlock(&g_arb_mutex);
 	return present;
+}
+
+void
+t_input_arbiter_set_floor_self_report(t_input_arbiter_floor_self_fn fn)
+{
+	g_floor_self_report = fn;
 }
 
 void

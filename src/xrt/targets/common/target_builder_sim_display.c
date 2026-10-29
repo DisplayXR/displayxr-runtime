@@ -27,6 +27,7 @@
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty/qwerty_device.h"
+#include "qwerty/qwerty_interface.h"
 #endif
 
 #include <assert.h>
@@ -172,6 +173,9 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 	// left/right roles re-resolve against provider presence on every
 	// xrSyncActions — per app start, and mid-session on plug/unplug.
 	t_input_arbiter_install(xsysd);
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	t_input_arbiter_set_floor_self_report(qwerty_is_mouse_hand);
+#endif
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	// Configure qwerty HMD pose and delegate head's pose to qwerty for

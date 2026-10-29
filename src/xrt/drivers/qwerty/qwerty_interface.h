@@ -318,6 +318,44 @@ qwerty_get_view_state(struct xrt_device **xdevs,
 bool
 qwerty_set_camera_profile(struct xrt_device **xdevs, size_t xdev_count, const struct u_camera_profile *profile);
 
+//! Is @p xdev the qwerty right controller while the mouse hand drives it?
+bool
+qwerty_is_mouse_hand(struct xrt_device *xdev);
+
+//! Is the mouse hand (DXR_MOUSE_HAND) on for the qwerty system in @p xdevs?
+bool
+qwerty_mouse_hand_enabled(struct xrt_device **xdevs, size_t xdev_count);
+
+/*!
+ * Where the cursor is over the 3D view, for the mouse hand: @p u -1 (left) .. 1
+ * (right), @p v -1 (bottom) .. 1 (top), @p aspect the view's width / height.
+ * Called by the window that owns the view; a no-op unless the mouse hand is on.
+ */
+void
+qwerty_set_mouse_hand_cursor(struct xrt_device **xdevs, size_t xdev_count, float u, float v, float aspect);
+
+/*!
+ * A pen over the 3D view, for the mouse hand: @p active while a pen that
+ * senses pressure hovers or touches, @p pressure its tip pressure 0..1. The
+ * pen's position and tip / barrel clicks arrive as the mouse messages Windows
+ * promotes them to; this only adds the analog tip force (MX Ink tip, trigger).
+ * A no-op unless the mouse hand is on.
+ */
+void
+qwerty_set_mouse_hand_pen(struct xrt_device **xdevs, size_t xdev_count, bool active, float pressure);
+
+/*!
+ * The first two views the app was just given by xrLocateViews: their eye
+ * poses in the head device's tracking origin (@p eyes) and their FOVs
+ * (@p fovs), exactly as the app renders them, so the mouse hand lands on the
+ * same virtual screen they project onto. A no-op unless the mouse hand is on.
+ */
+void
+qwerty_set_mouse_hand_views(struct xrt_device **xdevs,
+                            size_t xdev_count,
+                            const struct xrt_pose eyes[2],
+                            const struct xrt_fov fovs[2]);
+
 
 /*!
  * Enable or disable qwerty input processing (keyboard/mouse events).

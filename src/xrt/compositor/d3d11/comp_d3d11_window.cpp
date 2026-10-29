@@ -651,6 +651,38 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		return DefWindowProcW(hWnd, message, wParam, lParam);
 	}
 
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	// Mouse hand (DXR_MOUSE_HAND): tell qwerty where the cursor is over this
+	// view, so the right hand can sit under it. Only this window knows its size.
+	if (message == WM_MOUSEMOVE && w->qwerty_enabled && w->xsysd != NULL &&
+	    qwerty_mouse_hand_enabled(w->xsysd->xdevs, w->xsysd->xdev_count)) {
+		RECT rc;
+		if (GetClientRect(hWnd, &rc) && rc.right > 0 && rc.bottom > 0) {
+			const float u = 2.0f * (float)GET_X_LPARAM(lParam) / (float)rc.right - 1.0f;
+			const float v = 1.0f - 2.0f * (float)GET_Y_LPARAM(lParam) / (float)rc.bottom;
+			qwerty_set_mouse_hand_cursor(w->xsysd->xdevs, w->xsysd->xdev_count, u, v,
+			                             (float)rc.right / (float)rc.bottom);
+		}
+	}
+	// A pen (Windows Ink) adds its tip pressure. Position and clicks still come
+	// from the mouse messages Windows promotes the pen to, so don't consume.
+	if ((message == WM_POINTERDOWN || message == WM_POINTERUPDATE || message == WM_POINTERUP ||
+	     message == WM_POINTERLEAVE || message == WM_POINTERCAPTURECHANGED) &&
+	    w->qwerty_enabled && w->xsysd != NULL && qwerty_mouse_hand_enabled(w->xsysd->xdevs, w->xsysd->xdev_count)) {
+		const UINT32 id = GET_POINTERID_WPARAM(wParam);
+		POINTER_INPUT_TYPE type = PT_POINTER;
+		POINTER_PEN_INFO pen = {};
+		if (GetPointerType(id, &type) && type == PT_PEN && GetPointerPenInfo(id, &pen)) {
+			const bool gone = message == WM_POINTERLEAVE || message == WM_POINTERCAPTURECHANGED;
+			const bool senses = (pen.penMask & PEN_MASK_PRESSURE) != 0;
+			qwerty_set_mouse_hand_pen(w->xsysd->xdevs, w->xsysd->xdev_count, senses && !gone,
+			                          senses ? (float)pen.pressure / 1024.0f : 0.0f);
+		} else if (message == WM_POINTERLEAVE || message == WM_POINTERCAPTURECHANGED) {
+			qwerty_set_mouse_hand_pen(w->xsysd->xdevs, w->xsysd->xdev_count, false, 0.0f);
+		}
+	}
+#endif
+
 	switch (message) {
 	case WM_SETCURSOR:
 		// Hide the OS cursor over the workspace window's client area.

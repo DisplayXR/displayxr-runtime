@@ -1060,6 +1060,18 @@
 
 
 /*
+ * XR_LOGITECH_mx_ink_stylus_interaction
+ */
+#if defined(XR_LOGITECH_mx_ink_stylus_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_MX_INK)
+#define OXR_HAVE_LOGITECH_mx_ink_stylus_interaction
+#define OXR_EXTENSION_SUPPORT_LOGITECH_mx_ink_stylus_interaction(_) \
+    _(LOGITECH_mx_ink_stylus_interaction, LOGITECH_MX_INK_STYLUS_INTERACTION)
+#else
+#define OXR_EXTENSION_SUPPORT_LOGITECH_mx_ink_stylus_interaction(_)
+#endif
+
+
+/*
  * XR_META_body_tracking_calibration
  */
 #if defined(XR_META_body_tracking_calibration) && defined(XRT_FEATURE_OPENXR_BODY_TRACKING_CALIBRATION_META)
@@ -1390,6 +1402,7 @@
     OXR_EXTENSION_SUPPORT_HTC_facial_tracking(_) \
     OXR_EXTENSION_SUPPORT_HTC_vive_cosmos_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_HTC_vive_focus3_controller_interaction(_) \
+    OXR_EXTENSION_SUPPORT_LOGITECH_mx_ink_stylus_interaction(_) \
     OXR_EXTENSION_SUPPORT_META_body_tracking_calibration(_) \
     OXR_EXTENSION_SUPPORT_META_body_tracking_full_body(_) \
     OXR_EXTENSION_SUPPORT_META_touch_controller_plus(_) \

@@ -378,7 +378,48 @@ Focus is determined by `GetAsyncKeyState()` for reliability (avoids stuck keys f
 | Wheel | Convergence/vHeight (see §4) | Speed +/- | Speed +/- | Speed +/- both |
 | SHIFT + Wheel | IPD+Parallax ×/÷ 1.1 | — | — | — |
 
-### 6.4 Sensitivity Constants
+
+### 6.4 Mouse Hand (`DXR_MOUSE_HAND=1`)
+
+For creation tools on a 3D display (Substance 3D Modeler and the like), where
+holding CTRL / ALT to move a hand is too awkward to sculpt with. Opt-in per
+process: with `DXR_MOUSE_HAND=1` in the app's environment, the right controller
+stops following the keyboard and sits **under the cursor** over the 3D view. Each
+`xrLocateViews` hands qwerty the two head-relative views the app renders with
+(`qwerty_set_mouse_hand_views`); the virtual screen they project onto is solved
+from them (both eyes share its edges), the cursor (`qwerty_set_mouse_hand_cursor`,
+reported by the window) picks a point on it, and the hand sits on the ray from the
+centre eye through that point, aimed along it (`qwerty_mouse_hand_pose_from_views`).
+It starts on that screen — zero parallax, under the cursor in both eyes — so it
+works with off-axis, eye-tracked, window-fitted views.
+
+| Input | Action |
+|-------|--------|
+| Move | Right hand follows the cursor |
+| LMB | Right trigger (MX Ink: tip force) |
+| RMB | Right grip / squeeze (MX Ink: middle cluster) — mouse look moves to MMB |
+| MMB + Drag | Rotate the camera |
+| Wheel | Hand depth along the eye→cursor ray: away from you = deeper, 10% per notch (0.2–5× the screen distance) |
+| SHIFT + Wheel | IPD+Parallax ×/÷ 1.1, as before |
+| Back / Forward (XBUTTON1 / 2) | Right menu / system (MX Ink: front / back cluster) |
+| 1 / 2 / 3 | Left (support) hand menu / trigger / grip — not rendering modes |
+
+The right controller also offers `/interaction_profiles/logitech/mx_ink_stylus_logitech`
+(`XR_LOGITECH_mx_ink_stylus_interaction`, `XRT_FEATURE_OPENXR_INTERACTION_MX_INK`,
+default ON) **first** in its binding profiles, so an app that binds the MX Ink
+stylus gets one; apps that do not fall through to Touch / Index / Vive / simple as
+before. No physical MX Ink is involved: the MX Ink is tracked by a Quest headset,
+which a 3D display does not have, so the mouse is the stylus.
+
+**A pen is the stylus too.** A Windows Ink pen (pen tablet, pen display, or a
+pen-capable screen) over the 3D window moves the hand like the mouse, because
+Windows promotes the pen to mouse messages: tip = LMB, barrel + tip = RMB.
+On top of that, its tip pressure (`WM_POINTER*`, `GetPointerPenInfo`) becomes
+the analog tip force (MX Ink `tip/force`, and the trigger value): the pen's pressure
+while its tip is down, at least 0.05, so a first contact that reports zero still
+selects. A pen that senses no pressure, and the mouse, give 0 or 1 from the click.
+
+### 6.5 Sensitivity Constants
 
 | Constant | Value | Effect |
 |----------|-------|--------|

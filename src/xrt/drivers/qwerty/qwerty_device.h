@@ -78,6 +78,25 @@ struct qwerty_system
 	                            //!< converted perspective on P (so P is seamless)
 
 	// Hardware config (set by target builder)
+	/*!
+	 * Mouse hand (DXR_MOUSE_HAND): the right controller sits under the cursor
+	 * over the 3D view, at a wheel-adjusted depth, instead of following the
+	 * keyboard. The cursor is written by the window thread through
+	 * qwerty_set_mouse_hand_cursor and read by get_tracked_pose; view_lock.
+	 */
+	bool mouse_hand;
+	bool mouse_hand_cursor_valid;
+	float mouse_hand_u;       //!< cursor across the view, -1 (left) .. 1 (right)
+	float mouse_hand_v;       //!< cursor up the view, -1 (bottom) .. 1 (top)
+	float mouse_hand_aspect;  //!< view width / height
+	float mouse_hand_depth_scale;       //!< along the eye-to-cursor ray; 1 = on the virtual screen (zero parallax)
+	bool mouse_hand_views_valid;        //!< the views below came from a real xrLocateViews
+	struct xrt_pose mouse_hand_eyes[2]; //!< the app's eye poses, relative to mouse_hand_head
+	struct xrt_fov mouse_hand_fovs[2];  //!< their (off-axis, window-fitted) FOVs
+	struct xrt_pose mouse_hand_head;    //!< between the eyes, view-aligned, in the tracking origin
+	bool mouse_hand_pen_active;         //!< a pressure-sensing pen is over the view (Windows Ink)
+	float mouse_hand_pen_pressure;      //!< its tip pressure, 0..1; view_lock
+
 	float nominal_viewer_z; //!< meters (e.g. 0.6 from sim_display)
 	float screen_height_m;  //!< meters (e.g. 0.194 from sim_display)
 
@@ -601,6 +620,15 @@ void
 qwerty_adjust_convergence(struct qwerty_system *qs, float direction);
 
 /*!
+ * Mouse hand: move the hand @p steps wheel notches deeper (+) or nearer (-),
+ * 10% of its distance per notch, starting from the zero-parallax distance.
+ *
+ * @public @memberof qwerty_system
+ */
+void
+qwerty_adjust_mouse_hand_depth(struct qwerty_system *qs, int steps);
+
+/*!
  * Adjust virtual display height by multiplier (display mode only, clamped [0.1,10]).
  * No-op if in camera mode.
  * @public @memberof qwerty_system
@@ -619,6 +647,46 @@ qwerty_reset_view_state(struct qwerty_system *qs);
 /*!
  * @}
  */
+
+/*!
+ * The mouse hand's pose in the camera's frame: on the ray from the camera
+ * through view position (@p u, @p v) (-1..1, +v up) of a view with vertical
+ * half-tan @p half_tan_vfov and @p aspect, @p depth_m ahead (along -Z), aimed
+ * along that ray. Projects onto the cursor for the centre eye.
+ */
+void
+qwerty_mouse_hand_pose(float u, float v, float aspect, float half_tan_vfov, float depth_m, struct xrt_pose *out_pose);
+
+/*!
+ * The mouse hand's pose from the two views the app renders with (@p eyes,
+ * @p fovs: head-relative, parallel eyes, off-axis FOVs onto one virtual
+ * screen). The screen rectangle is solved from the views; the cursor
+ * (@p u, @p v, -1..1, +v up) picks a point on it, and the hand sits on the ray
+ * from the centre eye through that point, @p depth_scale of the way (1 = on
+ * the screen: zero parallax, under the cursor in both eyes), aimed along it.
+ * Coincident eyes (an untracked viewer: one view twice) carry no screen
+ * distance; the screen is then taken @p fallback_dist ahead, which keeps the
+ * hand under the cursor since such views have no parallax. Returns false if
+ * no screen in front of the eyes can be found that way either.
+ */
+/*!
+ * The mouse hand's trigger / MX Ink tip force: the pen's tip pressure
+ * (@p pressure, 0..1) while a pressure-sensing pen is over the view
+ * (@p pen_active) and its tip is down (@p clicked), else 0 / 1 from the click.
+ * A pen tip that is down reads at least a light touch, so a pen that reports
+ * zero pressure at first contact still selects.
+ */
+float
+qwerty_mouse_hand_tip_value(bool clicked, bool pen_active, float pressure);
+
+bool
+qwerty_mouse_hand_pose_from_views(float u,
+                                  float v,
+                                  float depth_scale,
+                                  float fallback_dist,
+                                  const struct xrt_pose eyes[2],
+                                  const struct xrt_fov fovs[2],
+                                  struct xrt_pose *out_pose);
 
 #ifdef __cplusplus
 }

@@ -4,6 +4,9 @@
 #include "qwerty_device.h"
 #include "qwerty_interface.h"
 #include "util/u_camera_profile.h"
+#include "math/m_api.h"
+
+#include <cmath>
 
 namespace {
 struct Devices
@@ -80,4 +83,87 @@ TEST_CASE("Profile seeding leaves a display-mode qwerty system alone", "[qwerty]
 	CHECK_FALSE(qwerty_set_camera_profile(d.devices, 3, &profile));
 	CHECK_FALSE(d.state().camera_mode);
 	CHECK(d.state().virtual_display_height == previous.virtual_display_height);
+}
+
+TEST_CASE("The mouse hand sits on the cursor's ray and aims along it", "[qwerty][mouse-hand]")
+{
+	xrt_pose pose{};
+	// Centre of the view: straight ahead at the requested depth, looking forward.
+	qwerty_mouse_hand_pose(0, 0, 1.6f, 0.5f, 0.8f, &pose);
+	CHECK(pose.position.x == Catch::Approx(0).margin(1e-6));
+	CHECK(pose.position.y == Catch::Approx(0).margin(1e-6));
+	CHECK(pose.position.z == Catch::Approx(-0.8));
+	CHECK(pose.orientation.w == Catch::Approx(1));
+
+	// Top-right corner: on the frustum edge, so it projects onto the corner.
+	qwerty_mouse_hand_pose(1, 1, 1.6f, 0.5f, 2.0f, &pose);
+	CHECK(pose.position.x == Catch::Approx(1 * 0.5 * 1.6 * 2.0));
+	CHECK(pose.position.y == Catch::Approx(1 * 0.5 * 2.0));
+	CHECK(pose.position.z == Catch::Approx(-2.0));
+	// Its aim (-Z rotated) points along the same ray.
+	xrt_vec3 aim{0, 0, -1};
+	math_quat_rotate_vec3(&pose.orientation, &aim, &aim);
+	const float len = std::sqrt(pose.position.x * pose.position.x + pose.position.y * pose.position.y +
+	                            pose.position.z * pose.position.z);
+	CHECK(aim.x == Catch::Approx(pose.position.x / len));
+	CHECK(aim.y == Catch::Approx(pose.position.y / len));
+	CHECK(aim.z == Catch::Approx(pose.position.z / len));
+}
+
+TEST_CASE("The mouse hand lands on the views' virtual screen under the cursor", "[qwerty][mouse-hand]")
+{
+	// Two eyes 63 mm apart looking at a screen 1.6 x 1.0 m, 1 m ahead,
+	// centred 0.2 m below the eye line (off-axis, as a tracked window is).
+	const float dist = 1.0f, left = -0.8f, right = 0.8f, bottom = -0.7f, top = 0.3f;
+	xrt_pose eyes[2] = {};
+	xrt_fov fovs[2] = {};
+	const float ex[2] = {-0.0315f, 0.0315f};
+	for (int i = 0; i < 2; i++) {
+		eyes[i].orientation.w = 1;
+		eyes[i].position = {ex[i], 0, 0};
+		fovs[i].angle_left = std::atan((left - ex[i]) / dist);
+		fovs[i].angle_right = std::atan((right - ex[i]) / dist);
+		fovs[i].angle_down = std::atan(bottom / dist);
+		fovs[i].angle_up = std::atan(top / dist);
+	}
+
+	xrt_pose pose{};
+	REQUIRE(qwerty_mouse_hand_pose_from_views(0, 0, 1, 0, eyes, fovs, &pose));
+	CHECK(pose.position.x == Catch::Approx(0).margin(1e-5));
+	CHECK(pose.position.y == Catch::Approx(-0.2));
+	CHECK(pose.position.z == Catch::Approx(-1.0));
+
+	REQUIRE(qwerty_mouse_hand_pose_from_views(1, 1, 1, 0, eyes, fovs, &pose));
+	CHECK(pose.position.x == Catch::Approx(0.8));
+	CHECK(pose.position.y == Catch::Approx(0.3));
+
+	// Deeper along the same ray from the centre eye: same screen position, twice as far.
+	REQUIRE(qwerty_mouse_hand_pose_from_views(1, 1, 2, 0, eyes, fovs, &pose));
+	CHECK(pose.position.x == Catch::Approx(1.6));
+	CHECK(pose.position.y == Catch::Approx(0.6));
+	CHECK(pose.position.z == Catch::Approx(-2.0));
+
+	// Identical eyes (untracked viewer) describe no screen distance: with no
+	// fallback, refuse; with one, the screen is that far ahead and the cursor
+	// still maps through the (off-axis) view.
+	xrt_pose same[2] = {eyes[0], eyes[0]};
+	xrt_fov same_fov[2] = {fovs[0], fovs[0]};
+	CHECK_FALSE(qwerty_mouse_hand_pose_from_views(0, 0, 1, 0, same, same_fov, &pose));
+	REQUIRE(qwerty_mouse_hand_pose_from_views(1, 1, 1, 0.5f, same, same_fov, &pose));
+	CHECK(pose.position.x == Catch::Approx(ex[0] + std::tan(fovs[0].angle_right) * 0.5f));
+	CHECK(pose.position.y == Catch::Approx(std::tan(fovs[0].angle_up) * 0.5f));
+	CHECK(pose.position.z == Catch::Approx(-0.5));
+}
+
+TEST_CASE("A pen's tip pressure drives the mouse hand's tip force", "[qwerty][mouse-hand]")
+{
+	// Mouse: the click alone.
+	CHECK(qwerty_mouse_hand_tip_value(false, false, 0.0f) == 0.0f);
+	CHECK(qwerty_mouse_hand_tip_value(true, false, 0.0f) == 1.0f);
+	// Pen hovering, or a pressure from a stale contact: no tip force.
+	CHECK(qwerty_mouse_hand_tip_value(false, true, 0.7f) == 0.0f);
+	// Pen down: its pressure, clamped, and never below a light touch.
+	CHECK(qwerty_mouse_hand_tip_value(true, true, 0.5f) == Catch::Approx(0.5f));
+	CHECK(qwerty_mouse_hand_tip_value(true, true, 0.0f) == Catch::Approx(0.05f));
+	CHECK(qwerty_mouse_hand_tip_value(true, true, 3.0f) == 1.0f);
 }

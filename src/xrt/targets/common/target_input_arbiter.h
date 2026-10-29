@@ -84,6 +84,20 @@ struct xrt_input_plugin_iface;
 struct xrt_input_plugin_instance;
 
 /*!
+ * Asks whether a floor (qwerty) device should report its OWN interaction
+ * profile instead of masquerading as the top idle provider's.
+ */
+typedef bool (*t_input_arbiter_floor_self_fn)(struct xrt_device *xdev);
+
+/*!
+ * Install @p fn (NULL = none, the default). The builder that adds the qwerty
+ * floor registers `qwerty_is_mouse_hand`, so the mouse hand keeps its MX Ink
+ * / own profiles while a controller provider is installed but idle.
+ */
+void
+t_input_arbiter_set_floor_self_report(t_input_arbiter_floor_self_fn fn);
+
+/*!
  * Forget everything from a previous system build. Called at the top of
  * the input-provider builder pass.
  */
