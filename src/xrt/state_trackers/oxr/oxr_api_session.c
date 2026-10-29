@@ -271,7 +271,17 @@ oxr_xrRequestExitSession(XrSession session)
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
 	OXR_VERIFY_SESSION_RUNNING(&log, sess);
 
-	return oxr_session_request_exit(&log, sess);
+	/* #2467: an app may call this on one thread while it polls events on
+	 * another (`session` is not externsync here). xrPollEvent makes its state
+	 * changes (VISIBLE -> FOCUSED) under sessions_mutex; without the same lock
+	 * a promotion could land between this walk's VISIBLE and STOPPING and leave
+	 * the session FOCUSED, so the app's xrEndSession fails NOT_STOPPING. */
+	struct oxr_instance *inst = sess->sys->inst;
+	os_mutex_lock(&inst->sessions_mutex);
+	XrResult ret = oxr_session_request_exit(&log, sess);
+	os_mutex_unlock(&inst->sessions_mutex);
+
+	return ret;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
