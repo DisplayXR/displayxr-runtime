@@ -1034,7 +1034,7 @@ endif()
 # = look, ADR-034 Amendment 4), and an optional emulated khr/simple_controller
 # pair so HANDLE apps — denied the qwerty pair because their own window owns
 # the keyboard — get xrSyncActions controllers at all. Platform readers:
-# XInput (Windows), GameController.framework (macOS); desktop Linux is a stub
+# XInput + HID for Sony pads (Windows), GameController.framework (macOS); desktop Linux is a stub
 # that declines at probe (evdev follow-up). Presence-gated: registered by
 # the installer, inert without a pad. Same build model as sim-input above.
 #
@@ -1057,6 +1057,17 @@ set(DRV_GAMEPAD_SOURCES
 	gamepad/gamepad_settings.c
 	gamepad/gamepad_settings.h
 	)
+if(WIN32)
+	# Windows = XInput + HID (Sony pads): gamepad_backend_win.c dispatches per
+	# device between the two readers (#2472).
+	list(APPEND DRV_GAMEPAD_SOURCES
+		gamepad/gamepad_backend_win.c
+		gamepad/gamepad_backend_win.h
+		gamepad/gamepad_backend_hid_win.c
+		gamepad/gamepad_hid_report.c
+		gamepad/gamepad_hid_report.h
+		)
+endif()
 if(APPLE)
 	list(APPEND DRV_GAMEPAD_SOURCES gamepad/gamepad_backend_gc.m)
 endif()
@@ -1079,8 +1090,10 @@ else()
 	add_dependencies(drv_gamepad_plugin ${RUNTIME_TARGET})
 endif()
 if(WIN32)
-	# xinput9_1_0: the Windows-7-and-later XInput import every SDK carries.
-	target_link_libraries(drv_gamepad_plugin PRIVATE xinput9_1_0)
+	# xinput9_1_0: the Windows-7-and-later XInput import every SDK carries;
+	# hid + setupapi: the HID reader (enumeration, attributes, caps). Only the
+	# plug-in DLL imports them — the runtime DLL, service and CLI do not.
+	target_link_libraries(drv_gamepad_plugin PRIVATE xinput9_1_0 hid setupapi)
 elseif(APPLE)
 	target_link_libraries(drv_gamepad_plugin PRIVATE "-framework GameController" "-framework Foundation")
 endif()

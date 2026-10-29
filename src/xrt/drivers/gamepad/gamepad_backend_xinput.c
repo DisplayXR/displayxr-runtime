@@ -16,6 +16,10 @@
  * while disconnected; here we additionally remember the slot that was last
  * connected and try it first, and scan the other three only when it is gone.
  *
+ * This is one of the two Windows readers: `gamepad_backend_win.c` owns the
+ * `gamepad_backend_*` API and dispatches between it and the HID reader
+ * (`gamepad_backend_hid_win.c`, Sony pads, which have no XInput node).
+ *
  * @ingroup drv_gamepad
  */
 
@@ -23,7 +27,7 @@
 
 #ifdef XRT_OS_WINDOWS
 
-#include "gamepad_backend.h"
+#include "gamepad_backend_win.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -35,13 +39,7 @@ static DWORD g_slot = 0;
 static bool g_slot_connected = false;
 
 bool
-gamepad_backend_available(void)
-{
-	return true;
-}
-
-bool
-gamepad_backend_init(void)
+gamepad_xinput_init(void)
 {
 	g_slot = 0;
 	g_slot_connected = false;
@@ -49,7 +47,7 @@ gamepad_backend_init(void)
 }
 
 void
-gamepad_backend_fini(void)
+gamepad_xinput_fini(void)
 {
 	if (g_slot_connected) {
 		XINPUT_VIBRATION off = {0, 0};
@@ -121,7 +119,7 @@ fill_state(const XINPUT_GAMEPAD *g, struct gamepad_state *out)
 }
 
 void
-gamepad_backend_poll(struct gamepad_state *out)
+gamepad_xinput_poll(struct gamepad_state *out)
 {
 	XINPUT_STATE st;
 
@@ -156,7 +154,7 @@ gamepad_backend_poll(struct gamepad_state *out)
 }
 
 void
-gamepad_backend_rumble(float low_frequency, float high_frequency)
+gamepad_xinput_rumble(float low_frequency, float high_frequency)
 {
 	if (!g_slot_connected) {
 		return;
@@ -183,12 +181,6 @@ gamepad_backend_rumble(float low_frequency, float high_frequency)
 	vib.wLeftMotorSpeed = (WORD)(low_frequency * 65535.0f);
 	vib.wRightMotorSpeed = (WORD)(high_frequency * 65535.0f);
 	XInputSetState(g_slot, &vib);
-}
-
-const char *
-gamepad_backend_name(void)
-{
-	return "XInput";
 }
 
 #else
