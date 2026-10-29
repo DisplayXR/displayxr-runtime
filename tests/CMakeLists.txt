@@ -1143,6 +1143,25 @@ target_include_directories(
 				 ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 	)
 target_link_libraries(tests_gamepad_hid_report PRIVATE xrt-interfaces)
+# Dev probe (not a test, never built by default): reads the real Windows
+# gamepad backend -- XInput + HID dispatch -- and prints the live reader and
+# the pad state at 2 Hz for 15 s. `gamepad_backend_probe [--rumble]`.
+if(WIN32)
+	set(_gp ${PROJECT_SOURCE_DIR}/src/xrt/drivers/gamepad)
+	add_executable(
+		gamepad_backend_probe EXCLUDE_FROM_ALL
+		gamepad_backend_probe.c ${_gp}/gamepad_backend_win.c ${_gp}/gamepad_backend_xinput.c
+		${_gp}/gamepad_backend_hid_win.c ${_gp}/gamepad_hid_report.c
+		)
+	target_include_directories(
+		gamepad_backend_probe PRIVATE ${_gp} ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+		)
+	target_link_libraries(
+		gamepad_backend_probe PRIVATE xrt-interfaces aux_util xinput9_1_0 hid setupapi
+		)
+	set_target_properties(gamepad_backend_probe PROPERTIES LINKER_LANGUAGE CXX)
+	unset(_gp)
+endif()
 # #132 — the touch provider's gesture recogniser + rig/aim math, and the
 # pointer-event ring it is fed from. Compiled straight in for the same reason
 # as tests_sim_input_nav: what is under test is the mapping table (pure
