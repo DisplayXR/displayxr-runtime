@@ -272,7 +272,7 @@ environment vtable. `persistentId` = HMAC(secret, device ‖ package ‖ cert) (
 | 4 Delegating client | installer-written list | a list **built into the runtime APK**, keyed by package + certificate digest (an APK cannot be modified by another installer). The DisplayXR Browser is the v1 entry; its per-origin prompt is the consent |
 | 5 OS camera switch | Windows ConsentStore | **The peer uid must hold `CAMERA`** (`checkPermission(CAMERA, pid, uid)`) and its camera app-op must not be ignored (`AppOpsManager.checkOpNoThrow`) → else `PERMISSION_INSUFFICIENT` |
 | 6–7 Stored decision / Allow once | registry / JSON | JSON in the runtime app's private storage (the POSIX store, `u_file_*_in_config_dir`), keyed per §4.1 |
-| 8 Prompt | tray dialog | **Deferred.** A service starting a consent Activity runs into background-activity-launch rules (*inferred*). v1 Android = delegating clients + stored decisions only (set from the runtime's settings Activity or the CLI-equivalent), and everything else `CONSENT_REFUSED`. Native-app prompting waits for a demand |
+| 8 Prompt | tray dialog | **Built in A2 (§13), superseding "deferred".** A runtime-owned consent activity (not exported) names the app label + package: Allow / Only this time / Don't allow. A notification opens it if a background start is blocked. Stored per package + certificate; revoked from the DisplayXR app's 3D camera card or over adb |
 
 ### 4.3 What Android already enforces, and what the runtime keeps
 
@@ -281,7 +281,7 @@ environment vtable. `persistentId` = HMAC(secret, device ‖ package ‖ cert) (
 | Camera only while the user is looking | While-in-use: a background uid's camera client is disconnected. Under option R the owner is the satellite, which holds while-in-use **only because the foreground browser bound it with `BIND_INCLUDE_CAPABILITIES`** (F10). So when the browser leaves the foreground, the OS takes the camera from the satellite. *Inferred; A1 gate checks it.* **Consequence:** the satellite must **not** declare `foregroundServiceType="camera"` (today it declares `connectedDevice\|mediaPlayback`, `AndroidManifest.xml:55-78`). That would let it keep the camera in the background, and the runtime would then have to re-implement the foreground rule itself | Spec §7.2 on Android: today `pid_has_visible_window()` falls to `return true` off Windows/macOS (r3: `ipc_server_stereo_camera.c:601-614`), so the runtime has no rule of its own. Keep the OS as the gate and treat a camera disconnect as `SUSPENDED`. The spec/roadmap's `android_package_is_visible` suggestion is **wrong**: that host slot answers *package visibility* (`<queries>`), not foreground (`xrt_plugin.h:566-605`) |
 | Lock screen | The foreground app stops, so the same disconnect applies | nothing extra |
 | In-use indicator | Status-bar privacy dot (Android 12+), attributed to the **runtime** package, not the browser. Chromium shows its own tab indicator | A notification "3D camera in use by <browser>" with a **Stop** action (= spec §7.4 "Stop camera sharing"). This is the runtime's in-use indicator on Android, and the only place a user sees *who* receives the frames |
-| Runtime's own `CAMERA` permission | Required; it is a runtime permission, so the user grants it to the **runtime app** once (from its Activity) | Request it at first use, through the runtime's settings Activity; until it is granted, report the cameras as `UNAVAILABLE` |
+| Runtime's own `CAMERA` permission | Required; it is a runtime permission, so the user grants it to the **runtime app** once (from its Activity) | **A2:** requested at the first *allowed* start through the consent activity (or the Dashboard's 3D camera card); refused → `PERMISSION_INSUFFICIENT` |
 | Fingerprinting | — | Unchanged (§7.5, keyed per §4.1); the browser coarsens the hint |
 
 Under option V the tracking service is the OS-visible client and none of this changes on the
@@ -721,3 +721,19 @@ the chained struct. **Decision:** adopt R1 as spec v7 at A1/B2a time.
   `drivers/sim_display/` to `auxiliary/util/` and add `XRT_STEREO_CAMERA_SOURCE_SIM` behind
   `debug.xrt.DXR_STEREO_CAMERA_SIM`, so a vendor-plug-in runtime can serve a fake camera
   (§12.6 #4).
+
+---
+
+## 13. A2 as built (runtime PR #2479)
+
+What changed against §4, by David's decisions of 2026-10-31. Normative text: spec §7.1.2 / §7.2 / §7.3.
+
+| Topic | §4 said | A2 does |
+|---|---|---|
+| Identity | (package, cert SHA-256) of the `SO_PEERCRED` uid | As proposed: subject `android:<package>@<current cert sha256>`. A shared-uid set is named by its shared-user name. Several signers → refused. The policy is unchanged and keyed on the subject |
+| Trusted list | built into the APK, package + digest | As proposed. v1 = `org.chromium.chrome` + `d52153793c7a403f3cd733032ed43314f26a7748f6d5c0a2b5e12847ff0df5b2` (the DisplayXR Browser release cert). **New:** a listed package signed by anyone else is *refused* (not prompted), so a rebuild cannot pass for the release; the dev override still admits it (CI test browsers are debug-signed). Key rotation keeps trust via `hasSigningCertificate` |
+| Prompt (row 8) | deferred | **Built** (see the row above) |
+| Front camera (§1.2) | refuse without a live weave in the owning satellite | `BUSY` unless the same uid has a weave submit in the last 1 s, or a visible session, in the same runtime process. A started front stream pauses and is told `SUSPENDED` while that stops. The dev override lifts it |
+| Foreground (§4.3) | OS gate, disconnect → `SUSPENDED` | Screen off / keyguard → session locked (`SUSPENDED`). A source that had delivered and then lost the device stays `SUSPENDED` with its streams kept, instead of the desktop's `UNAVAILABLE` / `SOURCE_BUSY` (`gave_up_is_suspended`). Still no camera-type FGS |
+| Indicator / Stop | notification with Stop | As proposed: ongoing "3D camera in use — Used by <label>", Stop → `USER_STOPPED` |
+| Store | private-storage JSON | `<filesDir>/displayxr/camera_consent.json` (POSIX store format), shared by the satellites and the Dashboard. The JSON delegating list is ignored on Android |
