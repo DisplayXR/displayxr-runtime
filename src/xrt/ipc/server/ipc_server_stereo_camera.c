@@ -1891,7 +1891,11 @@ camera_thread(void *ptr)
 				u_stereo_vrefine_restart(&cam->rect->ref, os_monotonic_get_ns());
 			}
 			U_LOG_W("stereo camera %llu: source opened", (unsigned long long)cam->camera_id);
-			set_state_locked(cam, XRT_STEREO_CAMERA_STATE_WAITING);
+			// A2: a reopen while the OS still holds the camera back stays SUSPENDED
+			// (no WAITING <-> SUSPENDED flapping every retry); frames move it on.
+			set_state_locked(cam, g_platform.gave_up_is_suspended && cam->streamed
+			                          ? XRT_STEREO_CAMERA_STATE_SUSPENDED
+			                          : XRT_STEREO_CAMERA_STATE_WAITING);
 		}
 
 		void *src = cam->src;
