@@ -230,6 +230,8 @@ jobs:
 
       - name: Assert .pkg payload includes plug-in + manifest (#274 regression guard)
         if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          SIGNED: ${{ steps.keychain.outputs.sign }}
         run: |
           set -euo pipefail
           # Filename is versioned post-PR #279
@@ -284,12 +286,38 @@ jobs:
             echo "::error::com.displayxr.desktop-capture.plist (helper LaunchAgent) missing from .pkg payload (#2264)."
             MISSING=1
           fi
+          # displayxr-cli: the only installed way on macOS to run selftest /
+          # status or calibrate a camera (2.57.2 shipped without it).
+          if ! grep -q 'DisplayXR/bin/displayxr-cli$' "$EXPAND_DIR/files"; then
+            echo "::error::displayxr-cli missing from .pkg payload — no installed selftest/status/calibration on macOS."
+            MISSING=1
+          fi
+          # The tracking host opens the camera for a camera-based provider: under
+          # the hardened runtime it needs the camera entitlement and the
+          # NSCameraUsageDescription the prompt shows, or the camera never opens.
+          # Entitlements are applied only by a Developer ID signature (sign-tree's
+          # ad-hoc path adds none), so that half is checked on signed builds only.
+          (cd "$EXPAND_DIR" && gunzip -c "$PAYLOAD" | cpio -i -d --quiet '*DisplayXR/bin/displayxr-tracking-host' 2>/dev/null) || true
+          HOST="$EXPAND_DIR/Library/Application Support/DisplayXR/bin/displayxr-tracking-host"
+          if [ ! -f "$HOST" ]; then
+            echo "::error::could not extract displayxr-tracking-host from the payload to check its signature."
+            MISSING=1
+          else
+            if [ "$SIGNED" = "true" ] && ! codesign -d --entitlements - --xml "$HOST" 2>/dev/null | grep -q 'com.apple.security.device.camera'; then
+              echo "::error::displayxr-tracking-host lacks com.apple.security.device.camera — a camera tracking provider cannot open the camera."
+              MISSING=1
+            fi
+            if ! codesign -dv "$HOST" 2>&1 | grep -q 'Info.plist entries='; then
+              echo "::error::displayxr-tracking-host has no bound Info.plist (NSCameraUsageDescription)."
+              MISSING=1
+            fi
+          fi
           if [ "$MISSING" -ne 0 ]; then
             echo "Payload listing:"
             cat "$EXPAND_DIR/files"
             exit 1
           fi
-          echo "PASS: .pkg payload contains plug-in + manifest + service + LaunchAgent."
+          echo "PASS: .pkg payload contains plug-in + manifest + service + LaunchAgent + cli; tracking-host camera-ready."
 
       - name: Sign, notarize and staple the .pkg (#280)
         if: needs.DetectChanges.outputs.docs_only != 'true' && steps.keychain.outputs.sign == 'true'

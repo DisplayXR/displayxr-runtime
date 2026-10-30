@@ -472,6 +472,32 @@ if [ "$SERVICE_MODE" = "ON" ] && [ -n "$TRACKHOST_BIN" ]; then
   echo "Staged displayxr-tracking-host into _package bin/"
 fi
 
+# displayxr-cli ships in the .pkg too: on macOS it is the only installed way to
+# run selftest / status and to calibrate a camera (the Dashboard is Windows-only).
+# It links the same bundled Vulkan loader + cJSON as the service, and runs the
+# runtime headless in-process, so it needs the same rpath. Service or not.
+CLI_BIN="$BUILD_DIR/src/xrt/targets/cli/displayxr-cli"
+if [ -f "$CLI_BIN" ]; then
+  cp "$CLI_BIN" "$PKG_DIR/bin/displayxr-cli"
+  chmod u+w "$PKG_DIR/bin/displayxr-cli"
+  install_name_tool -change "$BREW_PREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
+                            @rpath/libvulkan.1.dylib \
+                            "$PKG_DIR/bin/displayxr-cli" 2>/dev/null || true
+  install_name_tool -change "$BREW_PREFIX/opt/cjson/lib/libcjson.1.dylib" \
+                            @rpath/libcjson.1.dylib \
+                            "$PKG_DIR/bin/displayxr-cli" 2>/dev/null || true
+  for r in $(otool -l "$PKG_DIR/bin/displayxr-cli" \
+             | awk '/LC_RPATH/{f=1} f && /path /{print $2; f=0}'); do
+    case "$r" in
+      /opt/homebrew/*|/usr/local/*|/tmp/*)
+        install_name_tool -delete_rpath "$r" "$PKG_DIR/bin/displayxr-cli" 2>/dev/null || true ;;
+    esac
+  done
+  install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/displayxr-cli" 2>/dev/null || true
+  codesign --force --sign - "$PKG_DIR/bin/displayxr-cli" 2>/dev/null || true
+  echo "Staged displayxr-cli into _package bin/"
+fi
+
 # #2264: the desktop-capture helper (the one process that holds the Screen
 # Recording grant; in-process Metal compositors reach it over XPC by Mach
 # service name, so it ships with or without the service). It links only system

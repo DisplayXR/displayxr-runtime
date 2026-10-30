@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	DisplayXR-owned executables that load plug-ins AND can open a camera for
+	one: displayxr-tracking-host (the process a viewer-tracking provider's code
+	runs in under the service, tracking-provider-discovery §4a) and
+	displayxr-cli (`tracking calibrate` hosts its own provider). Same
+	library-validation exception as plugin-host.entitlements, plus the camera
+	entitlement the hardened runtime requires before AVFoundation may capture.
+	The prompt's text is the tracking host's embedded Info.plist
+	(NSCameraUsageDescription); the CLI, run from a terminal, uses the
+	terminal's grant.
+	-->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<key>com.apple.security.device.camera</key>
+	<true/>
+</dict>
+</plist>

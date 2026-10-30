@@ -46,6 +46,11 @@ echo "Removing DisplayXR runtime..."
 # those are user-owned dev-iteration state.
 sudo rm -rf "/Library/Application Support/DisplayXR"
 
+# The postinstall's /usr/local/bin/displayxr-cli link — only if it is ours.
+case "$(readlink /usr/local/bin/displayxr-cli 2>/dev/null || true)" in
+    "/Library/Application Support/DisplayXR/"*) sudo rm -f /usr/local/bin/displayxr-cli ;;
+esac
+
 echo "Removing OpenXR runtime registration..."
 # The postinstall registers active_runtime.json in both the XDG config dir and
 # the loader datadir (#385). Remove each only when it points at our install, so

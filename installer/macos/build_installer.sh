@@ -196,6 +196,17 @@ EOF
 cp "$SCRIPT_DIR/uninstall.sh" "$RUNTIME_ROOT/"
 chmod +x "$RUNTIME_ROOT/uninstall.sh"
 
+# --- displayxr-cli (selftest / status / camera calibration) ---
+# The only installed way on macOS to diagnose the runtime or calibrate a camera.
+# postinstall links it into /usr/local/bin. Ships with or without the service.
+if [ -f "$ARTIFACT_DIR/bin/displayxr-cli" ]; then
+    mkdir -p "$RUNTIME_ROOT/bin"
+    cp "$ARTIFACT_DIR/bin/displayxr-cli" "$RUNTIME_ROOT/bin/displayxr-cli"
+    chmod 0755 "$RUNTIME_ROOT/bin/displayxr-cli"
+    codesign --force --sign - "$RUNTIME_ROOT/bin/displayxr-cli" 2>/dev/null || true
+    echo "Staged displayxr-cli into the runtime payload."
+fi
+
 # --- Service binary + LaunchAgent (macOS spatial shell, #61) ---
 # The installed spatial shell (DisplayXRShell .pkg) attaches to displayxr-service
 # as an IPC client. Ship the service (built HYBRID by build_macos.sh --installer)
