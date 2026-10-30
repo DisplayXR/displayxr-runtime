@@ -105,9 +105,14 @@ typedef XrFlags64 XrStereoCameraFlagsDXR;
 // the camera is the eye tracker's; frames exist only while tracking runs (§6)
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING_BIT_DXR = 0x1;
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_USER_FACING_BIT_DXR             = 0x2;
-static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_CALIBRATED_BIT_DXR              = 0x4; // calibration available → RECTIFIED supported
+static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_CALIBRATED_BIT_DXR              = 0x4; // calibration available (does NOT by itself promise RECTIFIED; see RECTIFIABLE)
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_NATIVELY_RECTIFIED_BIT_DXR      = 0x8; // the source already delivers a rectified pair
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_MONOCHROME_BIT_DXR              = 0x10; // luma only (e.g. an IR / grey tracking sensor)
+// v7: a RECTIFIED stream of this camera delivers rectified frames — the source is natively
+// rectified, or the service built a rectifier for it. Set by the runtime only. A CALIBRATED
+// camera without it is RAW-only (its geometry was rejected, e.g. a vertical baseline): a
+// consumer that takes only rectified frames should not list it.
+static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_RECTIFIABLE_BIT_DXR             = 0x20;
 
 typedef enum XrStereoCameraStateDXR {
     XR_STEREO_CAMERA_STATE_AVAILABLE_DXR = 1,   // frames flowing or will flow on start
@@ -947,6 +952,7 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
+| 7 | `XR_STEREO_CAMERA_RECTIFIABLE_BIT_DXR` = `0x20` (appended): set by the runtime exactly when a RECTIFIED stream of the camera delivers rectified frames (natively rectified, or the service's rectifier accepted the calibration at registration). It is the pre-start signal a rectified-only consumer needs: `CALIBRATED` stays set on a pair whose geometry the rectifier rejected, and the RECTIFIED calibration query is a consent point, so neither can be used to filter a camera list. A plug-in's own value of the bit is ignored. No struct change, nothing renumbered |
 | 6 | `XR_STEREO_CAMERA_STREAM_END_REASON_SOURCE_BUSY_DXR` = 4 (appended, nothing renumbered). A started stream whose source cannot start — the device is held by another process, errors on its first read (Media Foundation's shape for a busy UVC device), or (UVC source) delivers nothing within 5 s of opening — ends with this reason and the camera reads `UNAVAILABLE` until the service's retry succeeds; a new start meanwhile is `XR_ERROR_STEREO_CAMERA_BUSY_DXR` (a browser maps both to `NotReadableError`). Before this the stream stayed started at 0 fps with no error (runtime #2221). A source that stops after it delivered is unchanged (its streams wait through the retry). |
 | 5 | `XrStereoCameraDisplayDXR` (`XR_TYPE_STEREO_CAMERA_DISPLAY_DXR` = 1004999317), chained on `XrStereoCameraPropertiesDXR::next`: the `XrDisplayDXR::displayId` of the screen a camera belongs to, 0 = unknown (§3). Plug-in contract (§9): appended `xrt_plugin_stereo_camera_info::monitor_id` (`XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID`). A display topology change wakes the re-enumeration at once. `displayxr-cli camera list` prints the display. Nothing renumbered, no struct changes size (#1961) |
 | 4 | No struct change. The camera list is live (§3): the service re-enumerates its sources during its run (on enumerate, at most once a second, and every ~2 s while a client listens), keeping each camera's index / `cameraId` / `persistentId`; new cameras are appended, vanished ones stay listed as `UNAVAILABLE` (streams end with `SOURCE_LOST`, start is `BUSY`) and come back with their id. `XrEventDataStereoCamerasChangedDXR` is delivered (it was reserved) to every instance that enumerated. Plug-in contract (§9): `enumerate` may be called repeatedly; calibration is per camera index, not "the active device" (#1961) |

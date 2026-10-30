@@ -172,6 +172,7 @@ flags_str(uint64_t f, char *out, size_t cap)
 	    {XRT_PLUGIN_STEREO_CAMERA_CALIBRATED, "CALIBRATED"},
 	    {XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED, "NATIVELY_RECTIFIED"},
 	    {XRT_PLUGIN_STEREO_CAMERA_MONOCHROME, "MONOCHROME"},
+	    {XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE, "RECTIFIABLE"},
 	};
 	for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
 		if (f & k[i].bit) {

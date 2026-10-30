@@ -90,7 +90,12 @@ extern "C" {
 //     opening -- ends with this reason instead of staying started at 0 fps; the camera
 //     reads UNAVAILABLE and a new start is XR_ERROR_STEREO_CAMERA_BUSY_DXR until the
 //     service's retry succeeds (runtime #2221).
-#define XR_DXR_stereo_camera_SPEC_VERSION 6
+// 7 = XR_STEREO_CAMERA_RECTIFIABLE_BIT_DXR (appended): set exactly when a RECTIFIED
+//     stream of this camera will deliver rectified frames, so a consumer that takes
+//     only rectified frames (a browser) can leave the camera out of its list before
+//     any calibration query or stream start. CALIBRATED alone does not imply it: a
+//     calibrated pair whose geometry the service's rectifier rejected is RAW-only.
+#define XR_DXR_stereo_camera_SPEC_VERSION 7
 #define XR_DXR_STEREO_CAMERA_EXTENSION_NAME "XR_DXR_stereo_camera"
 
 // Reserved 1004999300..319 (relocated from 290..309 on the post-lift rebase: 290 was taken by XR_DXR_weave v14). Allocation registry: README.md in this directory.
@@ -147,12 +152,16 @@ typedef XrFlags64 XrStereoCameraFlagsDXR;
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING_BIT_DXR = 0x00000001;
 //! The camera faces the user (a 3D display's front camera).
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_USER_FACING_BIT_DXR = 0x00000002;
-//! Calibration of THIS camera's device is available (RECTIFIED supported).
+//! Calibration of THIS camera's device is available. RECTIFIED output is
+//! promised by XR_STEREO_CAMERA_RECTIFIABLE_BIT_DXR, not by this bit (spec v7).
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_CALIBRATED_BIT_DXR = 0x00000004;
 //! The source already delivers a rectified pair.
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_NATIVELY_RECTIFIED_BIT_DXR = 0x00000008;
 //! Luma only (an IR / grey tracking sensor).
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_MONOCHROME_BIT_DXR = 0x00000010;
+//! Spec v7: a RECTIFIED stream delivers rectified frames (natively rectified, or
+//! the service rectifies it). Set by the runtime, never by a plug-in.
+static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_RECTIFIABLE_BIT_DXR = 0x00000020;
 
 typedef enum XrStereoCameraStateDXR {
     //! Frames flowing, or will flow on start.
