@@ -251,8 +251,8 @@ The rules are the same; the mechanics differ. The normative table is spec §7.1.
 - **The front camera** starts only while your app presents woven 3D in the runtime (a live
   `XR_DXR_weave` submit, or a visible session). Otherwise the start returns
   `XR_ERROR_STEREO_CAMERA_BUSY_DXR`. Rear cameras have no such rule.
-- **Background and lock:** when you leave the foreground the OS takes the camera away, and when the
-  screen locks the runtime pauses the stream. Either way the camera reads `SUSPENDED`, your stream
+- **Background and lock:** when your app leaves the foreground, or the screen locks, the runtime
+  pauses the stream (it does not rely on the OS for this). Either way the camera reads `SUSPENDED`, your stream
   stays started, and frames resume when you come back. Do not end your track on `SUSPENDED`.
 - **The user's controls:** the notification *"3D camera in use"* has a **Stop** action, which ends
   your stream with `USER_STOPPED`. The DisplayXR app's **3D camera** card lists stored decisions;
