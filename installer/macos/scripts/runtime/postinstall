@@ -42,8 +42,25 @@ if [ -f "$AGENT" ]; then
             launchctl bootout "gui/$CONSOLE_UID" "$AGENT" 2>/dev/null || true
             launchctl bootstrap "gui/$CONSOLE_UID" "$AGENT" 2>/dev/null || true
             launchctl enable "gui/$CONSOLE_UID/com.displayxr.service" 2>/dev/null || true
+            # Background Task Management can refuse the agent without telling
+            # anyone: bootstrap returns 0, nothing is registered, and sfltool
+            # shows the item as [enabled, disallowed, not notified]. An
+            # installer cannot allow it, so point the user at the switch
+            # (System Settings > General > Login Items > Allow in the Background).
+            if ! launchctl print "gui/$CONSOLE_UID/com.displayxr.service" >/dev/null 2>&1; then
+                echo "DisplayXR: the service LaunchAgent did not load; Background Task Management likely disallows it. Opening Login Items settings."
+                launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
+                    open "x-apple.systempreferences:com.apple.LoginItems-Settings.extension" 2>/dev/null || true
+            fi
         fi
     fi
+fi
+
+# displayxr-cli on the PATH. The name is ours: an older dev `make install` copy
+# at the same path is replaced.
+if [ -x "$INSTALL_DIR/bin/displayxr-cli" ]; then
+    mkdir -p /usr/local/bin
+    ln -sfn "$INSTALL_DIR/bin/displayxr-cli" /usr/local/bin/displayxr-cli
 fi
 
 # Desktop-capture helper (#2264): load its on-demand agent into the console

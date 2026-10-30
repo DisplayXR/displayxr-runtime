@@ -249,6 +249,32 @@ note_refused(void)
 	        "displayxr-cli beside the running displayxr-service.\n");
 }
 
+#ifdef XRT_OS_MACOS
+/*!
+ * The .pkg's LaunchAgent can be refused by Background Task Management with no
+ * notification: bootstrap succeeds, nothing is loaded, and the service never
+ * starts. Say so when the agent is installed but not loaded in this GUI domain.
+ */
+static void
+note_launch_agent(void)
+{
+	static const char *agent = "/Library/LaunchAgents/com.displayxr.service.plist";
+	if (access(agent, F_OK) != 0) {
+		return;
+	}
+	char cmd[128];
+	snprintf(cmd, sizeof(cmd), "launchctl print gui/%u/com.displayxr.service >/dev/null 2>&1", (unsigned)getuid());
+	if (system(cmd) == 0) {
+		return;
+	}
+	fprintf(stderr,
+	        "displayxr-cli status: the service LaunchAgent is installed but not loaded — macOS likely disallows it "
+	        "as a background item. Turn it on in System Settings > General > Login Items > Allow in the "
+	        "Background, then log out and in (or: launchctl bootstrap gui/%u %s).\n",
+	        (unsigned)getuid(), agent);
+}
+#endif
+
 //! Say why the snapshot is headless — on stderr, so stdout stays the snapshot.
 static void
 note_headless(xrt_result_t why)
@@ -256,6 +282,11 @@ note_headless(xrt_result_t why)
 	if (why == XRT_ERROR_NOT_AUTHORIZED) {
 		note_refused();
 	}
+#ifdef XRT_OS_MACOS
+	if (why != XRT_ERROR_NOT_AUTHORIZED && why != XRT_ERROR_FEATURE_NOT_SUPPORTED) {
+		note_launch_agent();
+	}
+#endif
 	fprintf(stderr,
 	        "displayxr-cli status: no service reached (xrt_result=%d) — showing the HEADLESS snapshot (what a "
 	        "process starting now would get).%s\n",
