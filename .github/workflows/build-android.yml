@@ -458,6 +458,27 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # XR_DXR_stereo_camera consumer probe (stereo-camera-android §12.3): the
+      # Android stand-in for `displayxr-cli camera probe`. Built so the module
+      # keeps compiling; it needs a stereo-camera plug-in + a device to RUN.
+      - name: Build the stereo camera consumer probe (camera_probe_android)
+        id: build_camera_probe
+        if: needs.DetectChanges.outputs.docs_only != 'true' && matrix.variant == 'neutral' && steps.build.outcome == 'success'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          ./gradlew :test_apps:camera_probe_android:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload the camera probe APK
+        if: steps.build_camera_probe.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: camera_probe_android
+          path: test_apps/camera/camera_probe_android/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
       # #1403 Option B — MiniWindowLayout is a CROSS-APK contract, not internals.
       # The DisplayXR Browser's XrSession lives in Chromium's GPU process (an
       # isolated Service with no Activity), so its BROWSER process reflects into

@@ -43,6 +43,17 @@
         tools:ignore="HighSamplingRate" />
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- XR_DXR_stereo_camera (ADR-043) on Android: a display plug-in that sources
+         a stereo camera (the tablet's own pair) opens it with Camera2 inside the
+         satellite that serves the consumer, so the RUNTIME package is the
+         OS-visible camera client (stereo-camera-android.md §4). It is a runtime
+         permission: until the user grants it to the runtime app, opening fails
+         and the plug-in reports the camera unavailable. Deliberately NO
+         foregroundServiceType="camera" on the satellites: the OS while-in-use
+         rule (the camera follows the binding app's foreground state through
+         BIND_INCLUDE_CAPABILITIES) is the foreground gate (§4.3). -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <!-- #1245: restart the runtime service after a reboot so a client's
          bindService() always finds a live service (background-restricted ROMs
          refuse to CREATE one on a client's behalf). -->
