@@ -18,8 +18,7 @@
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:taskAffinity=""
             android:excludeFromRecents="true"
-            android:noHistory="true"
-            android:showWhenLocked="false" />
+            android:noHistory="true" />
 
         <!--
             adb surface for the stored 3D camera decisions (list / revoke /
