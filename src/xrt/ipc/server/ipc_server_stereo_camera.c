@@ -3262,6 +3262,19 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 	s->vis_checked_ns = 0;
 	s->started = true;
 	cam->started_count++;
+	// A camera that just lost its last stream keeps its source open for
+	// LINGER_NS so a quick restart is cheap. Another camera starting ends that
+	// grace at once: two cameras of one device often cannot be open together
+	// (a tablet's front and rear logical pairs: the HAL refuses the second
+	// with "too many cameras already open", measured on a Lume Pad 2), so a
+	// front -> rear switch otherwise waits out the linger plus a reopen retry.
+	for (uint32_t k = 0; k < m->camera_count; k++) {
+		struct scam_camera *other = &m->cams[k];
+		if (other != cam && other->started_count == 0 && other->src != NULL) {
+			other->linger_deadline_ns = 0;
+			os_cond_signal(&other->cond);
+		}
+	}
 	if (!cam->thread_started) {
 		os_thread_init(&cam->thread);
 		if (os_thread_start(&cam->thread, camera_thread, cam) != 0) {
