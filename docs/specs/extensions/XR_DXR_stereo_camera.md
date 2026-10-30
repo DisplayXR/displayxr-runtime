@@ -492,7 +492,7 @@ The policy is pure (two injected vtables) and unit-tested with fakes in `tests_c
 
 On Android the runtime **is** the OS-visible camera client: a display plug-in that sources the
 device's own pair opens it with Camera2 inside the runtime satellite that serves the consumer
-([stereo-camera-android](../../roadmap/stereo-camera-android.md) §1.2, option R). Every app's
+(stereo-camera-android §1.2, option R; design in draft PR [#1834](https://github.com/DisplayXR/displayxr-runtime/pull/1834)). Every app's
 executable is the zygote's `app_process`, so the identity is not a path. It is a **subject**
 derived from the connection's `SO_PEERCRED` uid by the runtime's Java side
 (`StereoCameraConsent.peerIdentity`): `android:<package>@<SHA-256 of the current APK signing
