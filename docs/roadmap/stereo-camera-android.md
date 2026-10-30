@@ -540,8 +540,12 @@ provider process restarts, and every camera disappears and reappears 5 s later. 
 recovered on its own. The tracking service reopened its camera on the next request, with no
 lasting effect. Do not ship that configuration. Two working alternatives:
 
-1. **No third stream (measured, works):** the tracking frame is a 2× decimated copy of one eye's
-   Y plane (640×360), with the factory intrinsics rescaled for the crop. The probe did this.
+1. **No third stream (measured, works):** the tracking frame is cut from one eye's Y plane. The
+   in-app detector **accepts only 640×480**: a 2× decimated 640×360 is refused ("camera format …
+   not supported by the compiled-in face detector", a fatal tracking event). A **centre 4:3 crop
+   (960×720) decimated by 1.5 → 640×480** is accepted, with the factory intrinsics rescaled for
+   the crop (fx 451.5, fy 460.8, cx 318.0, cy 234.9). This costs horizontal field of view against
+   the tracker's own full-array 640×480.
 2. Eyes as `PRIVATE`/GPU outputs and the tracking stream as YUV. The vendor's own camera app
    appears to use this shape (GPU preview surfaces + a YUV face stream). **Not tried.** It is the
    natural shape for A4's AHardwareBuffer path.
@@ -559,7 +563,7 @@ closes, switches the same core to in-service tracking, and times the hand-back.
 | Gate (§7 A0b) | Result on Lume Pad 2 | Verified how |
 |---|---|---|
 | (1a) In-app tracking **initialises and licenses in a service process** | **Yes.** Core init 57–109 ms, `inAppSupported=1`, `licenseRequired=0`, runtime = in-app, sink active. The tracking engine logs "Initialized: with shared camera" and delivers frames to the frame listener for the whole 60 s. No license error of any kind | *measured* |
-| (1b) In-app tracking **reports faces** from the eye-derived frames | **Not yet verified.** Nobody was in front of the tablet during the camera runs (the in-service tracker saw no face either, before and after). See §11.4 | — |
+| (1b) In-app tracking **reports faces** from the eye-derived frames | **Not yet verified.** 640×360 frames are refused by the detector; 640×480 crops are accepted (no format error), but nobody was in front of the tablet during those runs (the in-service tracker saw no face either, before and after). See §11.4 | *measured* (format), faces open |
 | (2) Pair at 30.00 fps | **29.6 fps per eye**, and **every frame pair has identical sensor timestamps** (skew 0 µs, 29.59 matched pairs/s over 60 s), even though the HAL advertises `APPROXIMATE` sync. AE was set to `[30,30]`. That is 29.6, not 30.00 (*measured*). Whether 30.00 needs a fixed frame duration was not tried | *measured* |
 | (2b) Tracking hand-off cost | Detection runs on the caller's thread, as F5 said. The worker fed **~4–6 frames/s** with **no face present**, and the per-call cost grew to ~250 ms. The pair rate was unaffected (the hand-off never runs on the camera thread) | *measured* |
 | (3) After close, the tracking service serves faces again within 5 s, no reboot | **Yes for re-acquiring the camera.** After close, the same core switched back to in-service tracking (disable → set runtime → enable, 13–18 ms). `CameraService` shows the tracking service connecting camera 1 **≈ 50 ms** after our close. Its frames arrived at ~90/s within 1.3 s. In the one run where a person was present (after the HAL-abort run), the first in-service **face** arrived **768 ms** after close, and 2,572 of the next 2,614 frames had a face. **F2's "never reacquires" did not reproduce**: the client re-request is enough | *measured* (face hand-back once, camera hand-back ×3) |
@@ -592,9 +596,10 @@ the tracking service itself uses.
 
 ### 11.4 Still open after A0
 
-- **(1b) faces from in-app tracking on eye-derived 640×360 frames**: needs a person in front of the
-  tablet for one 60 s run. It is the last A0b gate. If the detector insists on 4:3 640×480,
-  alternative 2 above (PRIVATE eyes + YUV tracking stream) is the fallback.
+- **(1b) faces from in-app tracking on eye-derived 640×480 crops**: needs a person in front of the
+  tablet for one 60 s run. It is the last A0b gate. If the cropped field of view or the
+  decimation hurts detection, alternative 2 above (PRIVATE eyes + a full-array YUV tracking
+  stream) is the fallback.
 - **Pose continuity** in-app vs in-service (§1.3 row 3): not measured (needs a face).
 - **Live core switch without re-creating the interlacer** (§1.3 row 2): the probe's core had no
   interlacer. A3 must test it with a weaving core.
