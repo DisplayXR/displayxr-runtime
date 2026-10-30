@@ -536,12 +536,17 @@ frame with a 250 ms cache:
 - **Delegating clients** follow their own visibility rule (a capturing tab keeps its indicator;
   closing it stops the track) — only when the stream's start was allowed by delegation (§7.1.1). **`CAMERA_CONSUMER` and `DIAG`** have no window by contract and
   are exempt — they were granted explicit consent instead.
-- **Android:** no runtime visibility rule of its own. The OS gives the runtime the camera only
-  while the consumer is in the foreground: the satellite inherits the binding app's while-in-use
-  capability, and it deliberately has **no** `foregroundServiceType="camera"`. When the consumer
-  leaves, the OS takes the camera away. A source that had delivered and then loses its device is
-  reported `SUSPENDED`, not `UNAVAILABLE`, while the service retries, and its started streams are
-  kept. They resume when the app returns. **Front camera (option R):** a `USER_FACING` camera
+- **Android:** the runtime keeps its own foreground rule. Do not rely on the OS: on a retail
+  Android 12 tablet the camera service did not take the camera from the satellite when its client
+  went to the background, and a reopen in the background streamed at full rate (measured). While a
+  stream is started, the satellite polls its own process importance. A satellite serves one
+  package, bound with `BIND_IMPORTANT | BIND_ABOVE_CLIENT`, so it is `IMPORTANCE_FOREGROUND`
+  (`BOUND_TOP`) exactly while that package is the top app. Anything lower suspends every stream in
+  that satellite (`SUSPENDED`, no frames), and they resume on return. The satellite still has
+  **no** `foregroundServiceType="camera"`. A source that had delivered and then lost its device to
+  the OS (where the OS does enforce while-in-use, or sensor privacy) is also reported `SUSPENDED`,
+  not `UNAVAILABLE`, while the service retries, and its started streams are kept.
+  **Front camera (option R):** a `USER_FACING` camera
   starts only for a consumer whose uid presents woven 3D in the same runtime process (a weave
   submit within the last second, or a visible session). Otherwise the start returns
   `XR_ERROR_STEREO_CAMERA_BUSY_DXR`. A started front stream gets no frames, and its connection is
