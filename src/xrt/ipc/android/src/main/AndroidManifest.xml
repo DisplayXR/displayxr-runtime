@@ -5,6 +5,37 @@
     -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <application>
+        <!--
+            XR_DXR_stereo_camera A2: the runtime-owned 3D camera consent dialog
+            (and the runtime's own CAMERA permission request). NOT exported:
+            only the runtime's processes start it, and its answer goes back
+            through the requester's ResultReceiver, so no other app can show
+            or answer it. Translucent, out of recents, its own task.
+        -->
+        <activity
+            android:name="org.freedesktop.monado.ipc.CameraConsentActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:showWhenLocked="false" />
+
+        <!--
+            adb surface for the stored 3D camera decisions (list / revoke /
+            revoke-all; StereoCameraConsentStore). Exported to the shell only:
+            the sender must hold android.permission.DUMP, which adb's shell
+            has and no third-party app can.
+        -->
+        <receiver
+            android:name="org.freedesktop.monado.ipc.StereoCameraConsentStore$Receiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="org.displayxr.stereo_camera.CONSENT" />
+            </intent-filter>
+        </receiver>
+
         <service
             android:name="org.freedesktop.monado.ipc.MonadoService"
             android:enabled="true"

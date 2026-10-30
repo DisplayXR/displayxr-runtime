@@ -26,6 +26,7 @@
 #include "util/u_stereo_uvc.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -134,6 +135,55 @@ typedef void (*ipc_server_stereo_camera_notice_fn)(void *ctx, const char *exe, c
 void
 ipc_server_stereo_camera_set_notice_provider(ipc_server_stereo_camera_notice_fn fn, void *ctx);
 
+/*!
+ * Stereo camera A2 (stereo-camera-android §4): what a platform whose consumers
+ * have no meaningful executable path supplies instead (Android: the runtime
+ * service's Java side). Install it before the first client connects; every
+ * field may be NULL / false.
+ */
+struct ipc_server_stereo_camera_platform
+{
+	/*!
+	 * The consent SUBJECT for the peer at (@p pid, @p uid) — used in place of
+	 * the executable path everywhere consent, the delegating check and the
+	 * persistentId key on it (Android: "android:<package>@<cert sha256>",
+	 * util/u_camera_consent_android.h). false / "" = no verifiable identity
+	 * (refused, spec §7.1 step 3). Called on an IPC client thread, no lock held.
+	 */
+	bool (*peer_subject)(void *ctx, long pid, long uid, char *out, size_t cap);
+	//! The OS camera permission of @p subject (Android: the peer package holds
+	//! CAMERA and its camera app-op is not ignored). Step 4 of §7.1.
+	bool (*os_camera_allowed)(void *ctx, const char *subject);
+	//! The consent prompt for @p subject (same contract as the prompt provider).
+	enum u_camera_consent_prompt_answer (*prompt)(
+	    void *ctx, const char *subject, const char *app_name, long pid, uint32_t timeout_ms);
+	/*!
+	 * After consent ALLOWED a start: may THIS process open cameras? Android:
+	 * the runtime package's own CAMERA permission (the runtime is the
+	 * OS-visible camera client); if it is not granted the platform asks the
+	 * user and BLOCKS up to @p timeout_ms. false = PERMISSION_INSUFFICIENT.
+	 */
+	bool (*ensure_service_camera)(void *ctx, uint32_t timeout_ms);
+	/*!
+	 * Option R (§1.2): a USER_FACING camera starts only for a peer whose uid
+	 * presents woven 3D in this process (a weave submit in the last second,
+	 * or a visible session), else BUSY; a started one delivers no frames and
+	 * reads SUSPENDED while that stops being true.
+	 */
+	bool user_facing_requires_presenting;
+	/*!
+	 * A source that gave up after it had delivered (the OS took the camera:
+	 * app in the background, sensor privacy) keeps its started streams
+	 * SUSPENDED instead of UNAVAILABLE while it retries (Android).
+	 */
+	bool gave_up_is_suspended;
+	void *ctx;
+};
+
+//! Install (or clear, NULL) the platform hooks. The struct is copied.
+void
+ipc_server_stereo_camera_set_platform(const struct ipc_server_stereo_camera_platform *p);
+
 //! Called (no lock held) whenever the in-use state may have changed.
 typedef void (*ipc_server_stereo_camera_indicator_fn)(void *ctx);
 
@@ -146,7 +196,7 @@ struct ipc_server_stereo_camera_status
 	uint32_t started_streams; //!< > 0 = "3D camera in use"
 	bool sharing_enabled;     //!< the user's persistent toggle
 	bool locked;              //!< OS session locked: every stream suspended
-	char consumers[256];      //!< "browser.exe, call-app.exe" (base names, de-duplicated)
+	char consumers[256];      //!< "browser.exe, call-app.exe" (base names / Android packages, de-duplicated)
 };
 
 //! false = no manager (service still starting).

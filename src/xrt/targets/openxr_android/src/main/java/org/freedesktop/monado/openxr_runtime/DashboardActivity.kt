@@ -157,6 +157,76 @@ class DashboardActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         checkBatteryOptExemption()
+        refreshCameraCard()
+    }
+
+    /*
+     * 3D camera (XR_DXR_stereo_camera A2): the runtime is the OS-visible camera
+     * client, so it holds CAMERA itself; the per-app decisions the consent
+     * dialog stored are listed here and revoked with a tap (the app is asked
+     * again next time). The adb twin is StereoCameraConsentStore.Receiver.
+     */
+
+    private fun refreshCameraCard() {
+        val granted =
+            checkSelfPermission(android.Manifest.permission.CAMERA) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        val row = findViewById<TextView>(R.id.textCameraPermission)
+        row.text =
+            if (granted) "Camera access for the 3D camera: granted"
+            else "Camera access for the 3D camera: not granted — tap to grant"
+        row.setTextColor(if (granted) 0xFF66BB6A.toInt() else 0xFFFFA726.toInt())
+        row.isClickable = !granted
+        row.setOnClickListener {
+            if (shouldShowRequestPermissionRationale(android.Manifest.permission.CAMERA) ||
+                getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getBoolean(PREF_CAMERA_ASKED, false).not()
+            ) {
+                getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit().putBoolean(PREF_CAMERA_ASKED, true).apply()
+                requestPermissions(arrayOf(android.Manifest.permission.CAMERA), REQ_CAMERA)
+            } else {
+                // Denied for good: only the app's settings page can grant it now.
+                startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+                )
+            }
+        }
+
+        val list = findViewById<android.widget.LinearLayout>(R.id.listCameraConsent)
+        list.removeAllViews()
+        val entries = org.freedesktop.monado.ipc.StereoCameraConsentStore.list(this)
+        if (entries.isEmpty()) {
+            val t = TextView(this)
+            t.text = "No app decisions stored (the DisplayXR Browser needs none)."
+            t.setPadding(0, 8, 0, 8)
+            list.addView(t)
+            return
+        }
+        for (e in entries) {
+            val t = TextView(this)
+            val verb = if (e.decision == "allow") "Allowed" else "Denied"
+            t.text = "$verb: ${labelOf(e.pkg)} (${e.pkg}) — tap to forget"
+            t.setPadding(0, 12, 0, 12)
+            t.isClickable = true
+            t.setOnClickListener {
+                org.freedesktop.monado.ipc.StereoCameraConsentStore.revoke(this, e.pkg)
+                Toast.makeText(this, "${e.pkg} will be asked again", Toast.LENGTH_SHORT).show()
+                refreshCameraCard()
+            }
+            list.addView(t)
+        }
+    }
+
+    private fun labelOf(pkg: String): String =
+        try {
+            packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+        } catch (e: Exception) {
+            pkg
+        }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_CAMERA) refreshCameraCard()
     }
 
     override fun onDestroy() {
@@ -522,5 +592,7 @@ class DashboardActivity : AppCompatActivity() {
         private const val PREFS_NAME = "displayxr_dashboard"
         private const val PREF_BATTERY_OPT_ASKED = "battery_opt_asked"
         private const val PREF_BATTERY_OPT_PENDING = "battery_opt_pending"
+        private const val PREF_CAMERA_ASKED = "camera_asked"
+        private const val REQ_CAMERA = 0x5c
     }
 }

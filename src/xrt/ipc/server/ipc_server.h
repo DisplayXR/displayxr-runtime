@@ -181,6 +181,15 @@ struct ipc_client_state
 	//! connection. Equal to peer_pid until a peer declaration is accepted, after
 	//! which peer_pid becomes the DECLARED target and this stays the authoriser.
 	long opener_pid;
+	//! The opener's uid (SO_PEERCRED on Linux / Android; -1 = unknown or
+	//! not available). Android's stereo camera consent keys on it (the
+	//! package + signing certificate of that uid) and on which connections
+	//! of the same uid present (stereo-camera-android §4).
+	long peer_uid;
+	//! os_monotonic_get_ns() of this connection's last successful weave
+	//! submit (XR_DXR_weave), 0 = never. Written by its own IPC thread, read
+	//! racily by the stereo camera's front-camera gate.
+	int64_t last_weave_ns;
 	//! Input focus follows the APPLICATION (ipc_app_group.h): the peer's
 	//! executable and parent pid, read once at describe_client (best-effort,
 	//! "" / 0 = unknown), so a sibling connection of the focused client can be

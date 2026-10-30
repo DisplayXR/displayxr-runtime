@@ -2031,6 +2031,13 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 	// browser#103 RC-1: the opener IS the peer until (and unless) a declaration
 	// says otherwise; it stays the authoriser after one is accepted.
 	ics->opener_pid = peer_pid;
+	// Stereo camera A2 (Android): the opener's uid (SO_PEERCRED; -1 elsewhere / unknown).
+#ifdef XRT_OS_WINDOWS
+	ics->peer_uid = -1;
+#else
+	ics->peer_uid = ipc_server_derive_peer_uid(ipc_handle);
+#endif
+	ics->last_weave_ns = 0;
 	ics->imc.ipc_handle = ipc_handle;
 	ics->imc.dup_target_pid = 0;
 	ics->server = vs;
