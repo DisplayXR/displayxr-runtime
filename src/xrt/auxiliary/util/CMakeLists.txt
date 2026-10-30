@@ -53,6 +53,8 @@ add_library(
 	u_capture_dims.h
 	u_camera_consent.c
 	u_camera_consent.h
+	u_camera_consent_android.c
+	u_camera_consent_android.h
 	u_camera_consent_store.c
 	u_camera_calib.c
 	u_camera_calib.h
