@@ -878,6 +878,12 @@ u_authenticode_file_signer(const char *path, void *file_handle, char *out, size_
 	return chain_ok;
 }
 
+void
+u_camera_consent_store_set_user_dir(const char *dir)
+{
+	(void)dir; // Windows: always HKCU
+}
+
 #else // POSIX
 
 /*
@@ -901,10 +907,20 @@ path_equal(const char *a, const char *b)
 #define SYSTEM_DELEGATING_FILE "/etc/displayxr/camera-delegating.json"
 #endif
 
+//! Android: the runtime app's private files dir (there is no $HOME / XDG there).
+static char g_user_dir[512];
+
+void
+u_camera_consent_store_set_user_dir(const char *dir)
+{
+	snprintf(g_user_dir, sizeof(g_user_dir), "%s", dir != NULL ? dir : "");
+}
+
 static bool
 user_path(char *out, size_t cap)
 {
-	int n = u_file_get_path_in_config_dir(CONSENT_FILE, out, cap);
+	int n = g_user_dir[0] != '\0' ? snprintf(out, cap, "%s/%s", g_user_dir, CONSENT_FILE)
+	                              : u_file_get_path_in_config_dir(CONSENT_FILE, out, cap);
 	return n > 0 && (size_t)n < cap;
 }
 
@@ -934,7 +950,16 @@ save_user(cJSON *root)
 {
 	// u_file_open_file_in_config_dir creates the directory; we then clamp the
 	// mode — the file holds the id-keying secret.
-	FILE *f = u_file_open_file_in_config_dir(CONSENT_FILE, "w");
+	FILE *f = NULL;
+	if (g_user_dir[0] != '\0') {
+		(void)mkdir(g_user_dir, S_IRWXU);
+		char p[1024];
+		if (user_path(p, sizeof(p))) {
+			f = fopen(p, "w");
+		}
+	} else {
+		f = u_file_open_file_in_config_dir(CONSENT_FILE, "w");
+	}
 	if (f == NULL) {
 		return false;
 	}

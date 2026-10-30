@@ -146,6 +146,7 @@
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "util/u_camera_consent.h"
+#include "util/u_camera_consent_android.h"
 #include "util/u_misc.h"
 #include "util/u_stereo_camera.h"
 #include "util/u_stereo_rectify.h"
@@ -188,6 +189,8 @@ DEBUG_GET_ONCE_NUM_OPTION(stereo_camera_prompt_timeout_ms, "DXR_STEREO_CAMERA_PR
 #define STATS_LOG_NS (5000ll * 1000 * 1000)
 #define REFINE_SAMPLES 512 //!< matches one measurement may return
 #define VISIBILITY_TTL_NS (250ll * 1000 * 1000) //!< foreground-rule cache per stream
+//! A2 front-camera gate: a weave submit this recent means "presents woven 3D".
+#define PRESENTING_WINDOW_NS (1000ll * 1000 * 1000)
 #define PROMPT_TIMEOUT_MS 60000u                //!< an unanswered consent prompt = refused
 #define PROMPT_TIMEOUT_MIN_MS 1000u             //!< DXR_STEREO_CAMERA_PROMPT_TIMEOUT_MS clamp (dev only)
 #define PROMPT_TIMEOUT_MAX_MS 600000u
@@ -296,6 +299,10 @@ struct scam_stream
 	bool delegated;
 	int64_t vis_checked_ns;
 	bool visible;
+	//! A2 (Android, option R): a USER_FACING camera — frames only while the
+	//! peer's uid presents woven 3D in this process.
+	bool needs_presenting;
+	long peer_uid;
 	uint32_t consent_why; //!< enum u_camera_consent_why of the start that allowed it
 	//! The SERVICE ended this stream (user stop / sharing off / source lost):
 	//! stays until destroy; acquire and start report STREAM_ENDED.
@@ -431,6 +438,9 @@ struct scam_camera
 	uint32_t started_count;
 	int64_t linger_deadline_ns;
 	int64_t last_frame_ns;
+	//! A2: the source delivered at least once since a stream started it (reset
+	//! when it closes idle) — tells "the OS took it away" from "never opened".
+	bool streamed;
 	int64_t retry_after_ns;
 	//! When the current source opened (#2221: the UVC first-frame deadline counts from here).
 	int64_t opened_ns;
@@ -515,6 +525,9 @@ struct ipc_server_stereo_camera
 	bool sharing_enabled; //!< cached user toggle (the store is the truth)
 	bool locked;          //!< OS session locked / switched away
 	struct scam_evq evq[IPC_MAX_CLIENTS];
+	//! A2 (Android): decisions + secret from the private-storage store, the
+	//! delegating list from the runtime's built-in one.
+	struct u_camera_consent_store_android android_store;
 };
 
 //! The one manager of this process, for the service's UI (tray / menu bar).
@@ -527,6 +540,21 @@ static ipc_server_stereo_camera_indicator_fn g_indicator_fn = NULL;
 static void *g_indicator_ctx = NULL;
 static ipc_server_stereo_camera_notice_fn g_notice_fn = NULL;
 static void *g_notice_ctx = NULL;
+//! A2: platform identity / permission hooks (Android), copied at set time.
+static struct ipc_server_stereo_camera_platform g_platform;
+static bool g_platform_set = false;
+
+void
+ipc_server_stereo_camera_set_platform(const struct ipc_server_stereo_camera_platform *p)
+{
+	if (p == NULL) {
+		memset(&g_platform, 0, sizeof(g_platform));
+		g_platform_set = false;
+		return;
+	}
+	g_platform = *p;
+	g_platform_set = true;
+}
 
 
 /*
@@ -625,6 +653,9 @@ static bool
 env_os_camera_allowed(void *ctx, const char *exe)
 {
 	(void)ctx;
+	if (g_platform_set && g_platform.os_camera_allowed != NULL) {
+		return g_platform.os_camera_allowed(g_platform.ctx, exe);
+	}
 	return u_camera_consent_os_camera_allowed(exe);
 }
 
@@ -633,6 +664,9 @@ static enum u_camera_consent_prompt_answer
 env_prompt(void *ctx, const char *exe, const char *app_name, long pid, uint32_t timeout_ms)
 {
 	(void)ctx;
+	if (g_platform_set && g_platform.prompt != NULL) {
+		return g_platform.prompt(g_platform.ctx, exe, app_name, pid, timeout_ms);
+	}
 	ipc_server_stereo_camera_prompt_fn fn = g_prompt_fn;
 	if (fn == NULL) {
 		return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
@@ -720,6 +754,61 @@ consent_evaluate(struct ipc_server_stereo_camera *m,
 	return xret;
 }
 
+/*!
+ * The identity consent, the delegating check and the persistentId key on:
+ * the verified executable path on the desktop; on a platform with a
+ * peer_subject hook (Android) the subject it resolves from the connection's
+ * uid. Android without the hook fails closed ("" = refused, spec §7.1 step 3):
+ * its executable is app_process for every app.
+ */
+static void
+peer_identity(volatile struct ipc_client_state *ics, char *out, size_t cap)
+{
+	out[0] = '\0';
+	if (g_platform_set && g_platform.peer_subject != NULL) {
+		if (!g_platform.peer_subject(g_platform.ctx, ics->peer_pid, ics->peer_uid, out, cap)) {
+			out[0] = '\0';
+		}
+		return;
+	}
+#ifdef XRT_OS_ANDROID
+	U_LOG_W("stereo camera: no Android identity provider registered — pid %ld has no verifiable identity",
+	        ics->peer_pid);
+	return;
+#else
+	ipc_server_peer_exe_path(ics->peer_pid, out, cap);
+#endif
+}
+
+/*!
+ * A2 front-camera gate (§1.2 option R): does any connection of @p uid in this
+ * process present woven 3D — a weave submit within PRESENTING_WINDOW_NS, or a
+ * visible session? Reads other connections' fields racily (the per-frame
+ * pattern of input focus); a stale read errs for one frame at most.
+ */
+static bool
+uid_presenting(volatile struct ipc_client_state *ics, long uid, int64_t now)
+{
+	struct ipc_server *vs = ics != NULL ? ics->server : NULL;
+	if (vs == NULL || uid < 0) {
+		return false;
+	}
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *o = &vs->threads[i].ics;
+		if (o->server_thread_index < 0 || o->peer_uid != uid) {
+			continue;
+		}
+		int64_t w = o->last_weave_ns;
+		if (w != 0 && now - w < PRESENTING_WINDOW_NS) {
+			return true;
+		}
+		if (o->xc != NULL && o->client_state.session_active && o->client_state.session_visible) {
+			return true;
+		}
+	}
+	return false;
+}
+
 //! Is @p exe a registered consent-delegating client (cheap store read)?
 static bool
 exe_is_delegating(struct ipc_server_stereo_camera *m, const char *exe)
@@ -772,9 +861,38 @@ pid_has_visible_window(long pid)
  * app here too); CAMERA_CONSUMER / DIAG have no window by contract and are
  * exempt. The OS-lock gate is separate (publish checks m->locked first).
  */
+static void
+evq_push_locked(struct ipc_server_stereo_camera *m, uint64_t owner, const struct xrt_stereo_camera_event *ev);
+
 static bool
-client_visible_locked(struct scam_stream *s, int64_t now)
+client_visible_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s, int64_t now)
 {
+	if (s->needs_presenting) {
+		// A2: no frames while the peer's package stops presenting (it went to
+		// the background, its weave ended). Told as SUSPENDED, per connection.
+		if (s->vis_checked_ns != 0 && now - s->vis_checked_ns < VISIBILITY_TTL_NS) {
+			return s->visible;
+		}
+		bool v = uid_presenting(s->ics, s->peer_uid, now);
+		if (s->vis_checked_ns == 0 || v != s->visible) {
+			if (s->vis_checked_ns != 0 || !v) {
+				U_LOG_W("stereo camera: stream %llu (%s) %s — front camera follows the live weave",
+				        (unsigned long long)s->id, s->consumer,
+				        v ? "presents again, frames resume" : "no live weave, frames suspended");
+			}
+			struct xrt_stereo_camera_event ev = {
+			    .kind = XRT_STEREO_CAMERA_EVENT_CAMERA_STATE,
+			    .value = v ? m->cams[s->camera].state : XRT_STEREO_CAMERA_STATE_SUSPENDED,
+			    .camera_id = m->cams[s->camera].camera_id,
+			};
+			if (s->vis_checked_ns != 0 || !v) {
+				evq_push_locked(m, s->owner, &ev);
+			}
+		}
+		s->vis_checked_ns = now;
+		s->visible = v;
+		return v;
+	}
 	if (s->delegated || s->client_class == XRT_CLIENT_CLASS_CAMERA_CONSUMER ||
 	    s->client_class == XRT_CLIENT_CLASS_DIAG || s->peer_pid <= 0) {
 		return true;
@@ -1619,7 +1737,7 @@ publish_locked(struct ipc_server_stereo_camera *m,
 		// Spec §7.2: nothing while the OS session is locked / switched away,
 		// and nothing to a window-bearing client with no visible window. The
 		// pinned slot is cleared so the last image does not linger.
-		if (m->locked || !m->sharing_enabled || !client_visible_locked(s, now)) {
+		if (m->locked || !m->sharing_enabled || !client_visible_locked(m, s, now)) {
 			u_stereo_camera_ring_clear(&s->ring);
 			continue;
 		}
@@ -1713,6 +1831,7 @@ camera_thread(void *ptr)
 				U_LOG_W("stereo camera %llu: source closed (no started stream for %lld ms)",
 				        (unsigned long long)cam->camera_id, (long long)(LINGER_NS / 1000000));
 				cam->last_frame_ns = 0;
+				cam->streamed = false;
 				cam->source_rate = 0.0f;
 				if (cam->state != XRT_STEREO_CAMERA_STATE_UNAVAILABLE) {
 					cam->state = XRT_STEREO_CAMERA_STATE_AVAILABLE; // idle: "will flow on start"
@@ -1746,8 +1865,14 @@ camera_thread(void *ptr)
 			if (xret != XRT_SUCCESS || src == NULL) {
 				U_LOG_W("stereo camera %llu: %s source open failed (%d); retrying in 1 s",
 				        (unsigned long long)cam->camera_id, source_str(cam->source), (int)xret);
-				set_state_locked(cam, XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
-				end_started_streams_busy_locked(m, cam, "source open failed");
+				if (g_platform.gave_up_is_suspended && cam->streamed) {
+					// A2: the OS still holds the camera back (background); the
+					// started streams wait SUSPENDED for it to come back.
+					set_state_locked(cam, XRT_STEREO_CAMERA_STATE_SUSPENDED);
+				} else {
+					set_state_locked(cam, XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+					end_started_streams_busy_locked(m, cam, "source open failed");
+				}
 				cam->retry_after_ns = os_monotonic_get_ns() + REOPEN_BACKOFF_NS;
 				continue;
 			}
@@ -1779,6 +1904,7 @@ camera_thread(void *ptr)
 
 		switch (w) {
 		case XRT_PLUGIN_STEREO_CAMERA_WAIT_OK: {
+			cam->streamed = true;
 			// R2: rectify once per source frame, outside the lock (only this
 			// thread touches cam->rect after create), only if someone wants it.
 			struct xrt_plugin_stereo_camera_frame rf;
@@ -1832,8 +1958,15 @@ camera_thread(void *ptr)
 		default:
 			U_LOG_W("stereo camera %llu: %s source reported an error; closing, retry in 1 s",
 			        (unsigned long long)cam->camera_id, source_str(cam->source));
-			set_state_locked(cam, XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
-			if (cam->last_frame_ns == 0) {
+			if (g_platform.gave_up_is_suspended && cam->streamed) {
+				// A2 (Android): a source that delivered and then lost the device
+				// lost it to the OS (app in the background, sensor privacy):
+				// SUSPENDED, the started streams kept, the retry runs on.
+				set_state_locked(cam, XRT_STEREO_CAMERA_STATE_SUSPENDED);
+			} else {
+				set_state_locked(cam, XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+			}
+			if (cam->last_frame_ns == 0 && !(g_platform.gave_up_is_suspended && cam->streamed)) {
 				// #2221: it never delivered — a device another process holds errors on its first read.
 				end_started_streams_busy_locked(
 				    m, cam, "source failed before its first frame (held by another process?)");
@@ -2639,6 +2772,17 @@ ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_
 		env = opts->consent_env;
 		env_ctx = opts->consent_env_ctx;
 	}
+#ifdef XRT_OS_ANDROID
+	if (opts == NULL || opts->consent_store == NULL) {
+		// A2: the delegating list is the runtime's built-in one (package +
+		// certificate); decisions / sharing / secret stay in the JSON store.
+		uint32_t n = 0;
+		const struct u_camera_consent_android_trusted *list = u_camera_consent_android_builtin_trusted(&n);
+		u_camera_consent_store_android_init(&m->android_store, store, store_ctx, list, n);
+		store = &m->android_store.ops;
+		store_ctx = &m->android_store;
+	}
+#endif
 	u_camera_consent_init(&m->consent, store, store_ctx, env, env_ctx);
 	m->consent.kill_switch = !debug_get_bool_option_stereo_camera_enabled();
 	m->consent.dev_override = debug_get_bool_option_stereo_camera_dev_allow();
@@ -2660,6 +2804,13 @@ ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_
 	}
 	m->sharing_enabled = u_camera_consent_sharing_enabled(&m->consent);
 	g_mgr = m;
+	if (m->consent.dev_override) {
+		U_LOG_W(
+		    "stereo camera: ******** DXR_STEREO_CAMERA_DEV_ALLOW=1 — DEVELOPER OVERRIDE: every peer gets the "
+		    "camera WITHOUT consent, identity or OS-permission checks (Android: "
+		    "debug.xrt.DXR_STEREO_CAMERA_DEV_ALLOW). "
+		    "Never on a user's device. ********");
+	}
 
 	if (!debug_get_bool_option_stereo_camera_enabled()) {
 		U_LOG_W("stereo camera: disabled by DXR_STEREO_CAMERA=0 (kill switch) — zero cameras");
@@ -2892,8 +3043,8 @@ ipc_handle_stereo_camera_get_properties(volatile struct ipc_client_state *ics,
 	if (m == NULL) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
-	char exe[260] = {0};
-	ipc_server_peer_exe_path(ics->peer_pid, exe, sizeof(exe));
+	char exe[512] = {0};
+	peer_identity(ics, exe, sizeof(exe));
 
 	os_mutex_lock(&m->lock);
 	if (index >= m->camera_count) {
@@ -2960,7 +3111,7 @@ ipc_handle_stereo_camera_get_calibration(volatile struct ipc_client_state *ics,
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	char exe[512] = {0};
-	ipc_server_peer_exe_path(ics->peer_pid, exe, sizeof(exe));
+	peer_identity(ics, exe, sizeof(exe));
 	os_mutex_lock(&m->lock);
 	bool known = camera_by_id_locked(m, camera_id) != NULL && m->sharing_enabled;
 	os_mutex_unlock(&m->lock);
@@ -3087,7 +3238,7 @@ ipc_handle_stereo_camera_stream_create(volatile struct ipc_client_state *ics,
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 	char exe[512] = {0};
-	ipc_server_peer_exe_path(ics->peer_pid, exe, sizeof(exe));
+	peer_identity(ics, exe, sizeof(exe));
 	const bool delegating = exe_is_delegating(m, exe);
 	if (!output_allowed(ics, delegating, req->output)) {
 		U_LOG_W("stereo_camera_stream_create: RAW refused for pid %ld (%s: rectified only)", ics->peer_pid,
@@ -3157,6 +3308,10 @@ ipc_handle_stereo_camera_stream_create(volatile struct ipc_client_state *ics,
 	snprintf(slot->consumer, sizeof(slot->consumer), "%s (pid %ld)", exe[0] ? exe : "?", ics->peer_pid);
 	snprintf(slot->exe, sizeof(slot->exe), "%s", exe);
 	slot->peer_pid = ics->peer_pid;
+	slot->peer_uid = ics->peer_uid;
+	// The developer override lifts this gate too (camera probes without a weave).
+	slot->needs_presenting = g_platform.user_facing_requires_presenting && !m->consent.dev_override &&
+	                         (cam->info.flags & XRT_PLUGIN_STEREO_CAMERA_USER_FACING) != 0;
 	slot->client_class = ics->client_state.client_class;
 	slot->delegating = delegating;
 	*out_stream_id = slot->id;
@@ -3218,6 +3373,15 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
+	// A2 (Android): the runtime is the OS-visible camera client, so it needs
+	// the camera permission itself; the platform asks the user if it must.
+	if (g_platform_set && g_platform.ensure_service_camera != NULL &&
+	    !g_platform.ensure_service_camera(g_platform.ctx, m->consent.prompt_timeout_ms)) {
+		U_LOG_W(
+		    "stereo_camera_stream_start: the runtime itself holds no camera permission — refused "
+		    "(PERMISSION_INSUFFICIENT); grant it from the DisplayXR app");
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
 
 	// Pass 2 (locked): the stream may have gone away while we asked.
 	os_mutex_lock(&m->lock);
@@ -3239,6 +3403,19 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 		return XRT_ERROR_STEREO_CAMERA_DISABLED;
 	}
 	struct scam_camera *cam = &m->cams[s->camera];
+	// A2 (§1.2 option R): the front camera feeds the display's head tracking
+	// while it is open, so only an app that presents woven 3D here may take
+	// it — never one in the background. BUSY (the browser: NotReadableError).
+	if (!u_camera_consent_user_facing_gate(s->needs_presenting, true,
+	                                       !s->needs_presenting ||
+	                                           uid_presenting(ics, s->peer_uid, (int64_t)os_monotonic_get_ns()))) {
+		os_mutex_unlock(&m->lock);
+		U_LOG_W(
+		    "stereo camera %llu: stream %llu start refused for %s — a user-facing camera needs a live "
+		    "weave from the same app in this process (BUSY)",
+		    (unsigned long long)cam->camera_id, (unsigned long long)s->id, s->consumer);
+		return XRT_ERROR_STEREO_CAMERA_BUSY;
+	}
 	// BUSY: the plug-in could not open the source and its retry is still
 	// pending — distinct from "refused", so a browser maps it to NotReadableError.
 	// #1961: so is a camera its source no longer lists (gone, UNAVAILABLE).
@@ -3591,16 +3768,10 @@ ipc_server_stereo_camera_get_status(struct ipc_server_stereo_camera_status *out)
 			continue;
 		}
 		out->started_streams++;
-		// Base name of the executable, de-duplicated, comma separated.
-		const char *base = s->exe;
-		for (const char *p = s->exe; *p != '\0'; p++) {
-			if (*p == '\\' || *p == '/') {
-				base = p + 1;
-			}
-		}
-		if (base[0] == '\0') {
-			base = "unknown app";
-		}
+		// Base name of the executable (Android: the package), de-duplicated, comma separated.
+		char label[256];
+		u_camera_consent_subject_label(s->exe, label, sizeof(label));
+		const char *base = label[0] != '\0' ? label : "unknown app";
 		if (strstr(out->consumers, base) == NULL && n < sizeof(out->consumers) - 1) {
 			n += (size_t)snprintf(out->consumers + n, sizeof(out->consumers) - n, "%s%s", n ? ", " : "", base);
 			if (n >= sizeof(out->consumers)) {

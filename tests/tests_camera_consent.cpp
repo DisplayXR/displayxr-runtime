@@ -11,6 +11,7 @@
 #include "catch_amalgamated.hpp"
 
 #include "util/u_camera_consent.h"
+#include "util/u_camera_consent_android.h"
 #include "util/u_client_class.h"
 #include "util/u_sha256.h"
 #include "xrt/xrt_instance.h"
@@ -1110,4 +1111,285 @@ TEST_CASE("client class: CAMERA_CONSUMER is outside the PRESENT_OWNER quota", "[
 		CHECK(u_client_class_present_owner_count(peers.data(), (uint32_t)peers.size(), "/x") == 3);
 		CHECK(u_client_class_present_owner_count(peers.data(), (uint32_t)peers.size(), "") == 3);
 	}
+}
+
+
+/*
+ *
+ * Android (stereo camera A2): the subject, the built-in trusted list, and the
+ * policy over the Android store view with an Android environment fake.
+ *
+ */
+
+namespace {
+
+const char *const kBrowserPkg = "org.chromium.chrome";
+const char *const kBrowserCert = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const char *const kOtherCert = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const u_camera_consent_android_trusted kTestList[] = {
+    {"org.chromium.chrome",
+     "AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:"
+     "AA:AA",
+     "test browser"},
+};
+
+std::string
+subject_of(const char *pkg, const char *cert)
+{
+	char out[512];
+	REQUIRE(u_camera_consent_android_identity(kTestList, 1, pkg, cert, out, sizeof(out)) ==
+	        U_CAMERA_CONSENT_ANDROID_ID_OK);
+	return out;
+}
+
+//! What the runtime's Java side answers, per package.
+struct android_env
+{
+	std::set<std::string> camera_granted; //!< packages holding CAMERA (app-op not ignored)
+	u_camera_consent_prompt_answer answer = U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	int prompts = 0;
+	std::string last_subject;
+};
+
+bool
+ae_os(void *ctx, const char *subject)
+{
+	char pkg[256];
+	if (!u_camera_consent_android_subject_parse(subject, pkg, sizeof(pkg), nullptr)) {
+		return false;
+	}
+	return ((android_env *)ctx)->camera_granted.count(pkg) > 0;
+}
+u_camera_consent_prompt_answer
+ae_prompt(void *ctx, const char *subject, const char *app, long pid, uint32_t timeout_ms)
+{
+	(void)app;
+	(void)pid;
+	(void)timeout_ms;
+	auto *e = (android_env *)ctx;
+	e->prompts++;
+	e->last_subject = subject;
+	return e->answer;
+}
+//! An APK cannot be replaced by another installer: never user-writable; no Authenticode.
+bool
+ae_writable(void *ctx, const char *exe)
+{
+	(void)ctx;
+	(void)exe;
+	return false;
+}
+const u_camera_consent_env_ops android_env_ops = {ae_os, ae_prompt, ae_writable, nullptr, nullptr};
+
+struct android_rig
+{
+	fake_store store; //!< the private-storage JSON store stand-in
+	u_camera_consent_store_android view;
+	android_env env;
+	u_camera_consent c;
+	android_rig()
+	{
+		// A delegating list in the underlying store must be IGNORED on Android.
+		store.delegating.insert(subject_of("com.example.selfreg", kOtherCert),
+		                        U_CAMERA_CONSENT_DELEGATION_USER);
+		u_camera_consent_store_android_init(&view, &fake_store_ops, &store, kTestList, 1);
+		u_camera_consent_init(&c, &view.ops, &view, &android_env_ops, &env);
+		c.prompt_enabled = true;
+	}
+	u_camera_consent_decision
+	eval(const std::string &subject, uint32_t flags = 0, long pid = 4242)
+	{
+		u_camera_consent_decision d;
+		u_camera_consent_evaluate(&c, subject.c_str(), "App", pid, flags, &d);
+		return d;
+	}
+};
+
+} // namespace
+
+TEST_CASE("android consent: subject format, parse, digest forms", "[camera_consent][android]")
+{
+	char d[U_CAMERA_CONSENT_ANDROID_DIGEST_SIZE];
+	CHECK(u_camera_consent_android_digest_normalize(kTestList[0].cert_sha256, d));
+	CHECK(std::string(d) == kBrowserCert);
+	CHECK_FALSE(u_camera_consent_android_digest_normalize("abcd", d));
+	CHECK_FALSE(u_camera_consent_android_digest_normalize((std::string(kBrowserCert) + "a").c_str(), d));
+	CHECK_FALSE(u_camera_consent_android_digest_normalize(
+	    "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg", d));
+
+	char subj[512];
+	REQUIRE(u_camera_consent_android_subject_format("com.example.app", kOtherCert, subj, sizeof(subj)));
+	CHECK(std::string(subj) == std::string("android:com.example.app@") + kOtherCert);
+	char pkg[256];
+	REQUIRE(u_camera_consent_android_subject_parse(subj, pkg, sizeof(pkg), d));
+	CHECK(std::string(pkg) == "com.example.app");
+	CHECK(std::string(d) == kOtherCert);
+	// Not Android subjects / malformed.
+	CHECK_FALSE(u_camera_consent_android_subject_parse("/system/bin/app_process64", pkg, sizeof(pkg), d));
+	CHECK_FALSE(u_camera_consent_android_subject_parse("android:com.x@1234", pkg, sizeof(pkg), d));
+	CHECK_FALSE(u_camera_consent_android_subject_parse("android:@aaaa", pkg, sizeof(pkg), d));
+	// '@', '/', spaces and quotes are not package characters.
+	CHECK_FALSE(u_camera_consent_android_package_valid("com.x@y"));
+	CHECK_FALSE(u_camera_consent_android_package_valid("com/x"));
+	CHECK_FALSE(u_camera_consent_android_package_valid("com x"));
+	CHECK_FALSE(u_camera_consent_android_package_valid(""));
+	CHECK(u_camera_consent_android_package_valid("android.uid.shared:10123"));
+
+	char label[64];
+	u_camera_consent_subject_label(subj, label, sizeof(label));
+	CHECK(std::string(label) == "com.example.app");
+	u_camera_consent_subject_label("C:\\Apps\\browser.exe", label, sizeof(label));
+	CHECK(std::string(label) == "browser.exe");
+}
+
+TEST_CASE("android consent: identity — trusted package with another certificate is refused",
+          "[camera_consent][android]")
+{
+	char out[512];
+	CHECK(u_camera_consent_android_identity(kTestList, 1, kBrowserPkg, kOtherCert, out, sizeof(out)) ==
+	      U_CAMERA_CONSENT_ANDROID_ID_CERT_MISMATCH);
+	CHECK(out[0] == '\0');
+	CHECK(u_camera_consent_android_identity(kTestList, 1, kBrowserPkg, "", out, sizeof(out)) ==
+	      U_CAMERA_CONSENT_ANDROID_ID_NO_CERT);
+	CHECK(u_camera_consent_android_identity(kTestList, 1, nullptr, kOtherCert, out, sizeof(out)) ==
+	      U_CAMERA_CONSENT_ANDROID_ID_NO_PACKAGE);
+	CHECK(u_camera_consent_android_identity(kTestList, 1, "com.example.app", kOtherCert, out, sizeof(out)) ==
+	      U_CAMERA_CONSENT_ANDROID_ID_OK);
+
+	const u_camera_consent_android_trusted *hit = nullptr;
+	CHECK(u_camera_consent_android_trust_lookup(kTestList, 1, kBrowserPkg, kBrowserCert, &hit) ==
+	      U_CAMERA_CONSENT_ANDROID_TRUSTED);
+	CHECK(hit == &kTestList[0]);
+	CHECK(u_camera_consent_android_trust_lookup(kTestList, 1, "com.example.app", kBrowserCert, &hit) ==
+	      U_CAMERA_CONSENT_ANDROID_NOT_LISTED);
+}
+
+TEST_CASE("android consent: the built-in list is well-formed", "[camera_consent][android]")
+{
+	uint32_t n = 0;
+	const u_camera_consent_android_trusted *list = u_camera_consent_android_builtin_trusted(&n);
+	REQUIRE(n >= 1);
+	for (uint32_t i = 0; i < n; i++) {
+		char d[U_CAMERA_CONSENT_ANDROID_DIGEST_SIZE];
+		CHECK(u_camera_consent_android_package_valid(list[i].package));
+		CHECK(u_camera_consent_android_digest_normalize(list[i].cert_sha256, d));
+	}
+	CHECK(std::string(list[0].package) == kBrowserPkg);
+}
+
+TEST_CASE("android consent: the trusted browser needs no prompt, only CAMERA", "[camera_consent][android]")
+{
+	android_rig r;
+	const std::string browser = subject_of(kBrowserPkg, kBrowserCert);
+	r.env.camera_granted.insert(kBrowserPkg);
+	auto d = r.eval(browser);
+	CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_DELEGATING);
+	CHECK(d.delegated);
+	CHECK(d.delegation_scope == U_CAMERA_CONSENT_DELEGATION_SYSTEM);
+	CHECK(r.env.prompts == 0);
+	CHECK(r.store.sets == 0);
+
+	// Without its own CAMERA permission the browser gets PERMISSION_INSUFFICIENT.
+	r.env.camera_granted.clear();
+	d = r.eval(browser);
+	CHECK(d.verdict == U_CAMERA_CONSENT_OS_DENIED);
+	CHECK(r.env.prompts == 0);
+
+	// A browser that declines delegation is an ordinary app: it is asked.
+	r.env.camera_granted.insert(kBrowserPkg);
+	r.env.answer = U_CAMERA_CONSENT_PROMPT_ALLOW_ONCE;
+	d = r.eval(browser, U_CAMERA_CONSENT_FLAG_DECLINE_DELEGATION);
+	CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_ALLOW_ONCE);
+	CHECK(r.env.prompts == 1);
+}
+
+TEST_CASE("android consent: another app is asked once; Allow and Deny stick; revoke asks again",
+          "[camera_consent][android]")
+{
+	android_rig r;
+	const std::string app = subject_of("com.example.call", kOtherCert);
+	r.env.camera_granted.insert("com.example.call");
+
+	r.env.answer = U_CAMERA_CONSENT_PROMPT_ALLOW;
+	auto d = r.eval(app);
+	CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_ALLOW);
+	CHECK(r.env.prompts == 1);
+	CHECK(r.env.last_subject == app);
+	CHECK(r.store.apps[app] == U_CAMERA_CONSENT_STORED_ALLOW);
+	d = r.eval(app);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_STORED_ALLOW);
+	CHECK(r.env.prompts == 1);
+
+	// Revoke (the Dashboard / adb path clears the entry): asked again; Deny sticks.
+	r.store.apps.erase(app);
+	r.env.answer = U_CAMERA_CONSENT_PROMPT_DENY;
+	d = r.eval(app);
+	CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_DENY);
+	CHECK(r.store.apps[app] == U_CAMERA_CONSENT_STORED_DENY);
+	r.env.answer = U_CAMERA_CONSENT_PROMPT_ALLOW;
+	d = r.eval(app);
+	CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_STORED_DENY);
+	CHECK(r.env.prompts == 2);
+
+	// A reinstall signed by someone else is a different subject: no inherited Allow / Deny.
+	const std::string resigned = subject_of("com.example.call", kBrowserCert);
+	r.env.answer = U_CAMERA_CONSENT_PROMPT_TIMEOUT;
+	d = r.eval(resigned);
+	CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_TIMEOUT);
+	CHECK(r.store.apps.count(resigned) == 0); // an unanswered prompt is never stored
+}
+
+TEST_CASE("android consent: unknown peers, the store's own delegating list, overrides", "[camera_consent][android]")
+{
+	android_rig r;
+	r.env.answer = U_CAMERA_CONSENT_PROMPT_ALLOW;
+	// No identity (no package, or the trusted name with a foreign cert -> "") is refused, never asked.
+	auto d = r.eval("");
+	CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_NO_IDENTITY);
+	CHECK(r.env.prompts == 0);
+
+	// A delegating entry in the JSON store does not delegate on Android.
+	const std::string selfreg = subject_of("com.example.selfreg", kOtherCert);
+	r.env.camera_granted.insert("com.example.selfreg");
+	r.env.answer = U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	d = r.eval(selfreg);
+	CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+	CHECK_FALSE(d.delegated);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE);
+
+	// The developer override admits even an unverifiable peer (a debug-signed browser build).
+	r.c.dev_override = true;
+	d = r.eval("");
+	CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_DEV_OVERRIDE);
+	// The kill switch beats it.
+	r.c.kill_switch = true;
+	d = r.eval(subject_of(kBrowserPkg, kBrowserCert));
+	CHECK(d.verdict == U_CAMERA_CONSENT_DISABLED);
+}
+
+TEST_CASE("android consent: persistentId is keyed per package + certificate", "[camera_consent][android]")
+{
+	android_rig r;
+	char a[64], b[64], c2[64];
+	u_camera_consent_persistent_id(&r.c, "dev-1", subject_of("com.example.a", kOtherCert).c_str(), a);
+	u_camera_consent_persistent_id(&r.c, "dev-1", subject_of("com.example.a", kBrowserCert).c_str(), b);
+	u_camera_consent_persistent_id(&r.c, "dev-1", subject_of("com.example.a", kOtherCert).c_str(), c2);
+	CHECK(std::string(a) != std::string(b));
+	CHECK(std::string(a) == std::string(c2));
+}
+
+TEST_CASE("android consent: the user-facing gate", "[camera_consent][android]")
+{
+	CHECK(u_camera_consent_user_facing_gate(true, true, true));
+	CHECK_FALSE(u_camera_consent_user_facing_gate(true, true, false)); // front, no live weave
+	CHECK(u_camera_consent_user_facing_gate(true, false, false));      // rear: no rule
+	CHECK(u_camera_consent_user_facing_gate(false, true, false));      // platform without the rule
 }

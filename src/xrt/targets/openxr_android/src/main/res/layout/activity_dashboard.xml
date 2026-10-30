@@ -254,6 +254,35 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
+        <!-- XR_DXR_stereo_camera A2: the runtime's own CAMERA permission and
+             the per-app 3D camera decisions (tap a decision to revoke it). -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/cardCamera"
+            style="@style/DashboardCard">
+
+            <LinearLayout style="@style/DashboardCardBody">
+
+                <TextView
+                    style="@style/DashboardCardTitle"
+                    android:text="3D camera" />
+
+                <TextView
+                    android:id="@+id/textCameraPermission"
+                    style="@style/DashboardCardMono"
+                    android:background="?attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:paddingTop="8dp"
+                    android:paddingBottom="8dp" />
+
+                <LinearLayout
+                    android:id="@+id/listCameraConsent"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
         <!-- Actions -->
         <LinearLayout
             android:layout_width="match_parent"
