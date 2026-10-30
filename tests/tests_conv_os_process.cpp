@@ -63,7 +63,10 @@ struct proc_guard
 };
 
 int
-spawn(const std::vector<std::string> &args, proc_guard &g, uint64_t channel_child = OS_NATIVE_HANDLE_INVALID)
+spawn(const std::vector<std::string> &args,
+      proc_guard &g,
+      uint64_t channel_child = OS_NATIVE_HANDLE_INVALID,
+      bool disclaim = false)
 {
 	std::vector<const char *> argv;
 	for (const auto &a : args) {
@@ -75,6 +78,7 @@ spawn(const std::vector<std::string> &args, proc_guard &g, uint64_t channel_chil
 	si.arg_count = (uint32_t)argv.size();
 	si.kill_on_parent_exit = true;
 	si.channel_child_handle = channel_child;
+	si.disclaim_responsibility = disclaim; // macOS: the posix_spawn path; elsewhere ignored
 	return os_process_spawn(&si, &g.p);
 }
 
@@ -127,9 +131,11 @@ pid_alive(long pid)
 
 TEST_CASE("os_process: exit codes arrive verbatim", "[conv][os_process]")
 {
+	const bool disclaim = GENERATE(false, true);
+	CAPTURE(disclaim);
 	for (int code : {0, 7, 20, 30, 139}) {
 		proc_guard g;
-		REQUIRE(spawn({"exit", std::to_string(code)}, g) == 0);
+		REQUIRE(spawn({"exit", std::to_string(code)}, g, OS_NATIVE_HANDLE_INVALID, disclaim) == 0);
 		CHECK(os_process_pid(g.p) > 0);
 		CHECK(wait_exit(g) == code);
 		// A second wait returns the same answer.
@@ -207,13 +213,17 @@ TEST_CASE("os_process: wake latches and coalesces", "[conv][os_process]")
 
 TEST_CASE("os_process: channel frame + pushed handle round trip", "[conv][os_process]")
 {
+	// Both spawn paths: fork + exec, and (macOS) posix_spawn with the
+	// responsibility disclaimed, which must lay out the child identically.
+	const bool disclaim = GENERATE(false, true);
+	CAPTURE(disclaim);
 	os_channel *ch = nullptr;
 	char token[256] = {};
 	uint64_t child_end = OS_NATIVE_HANDLE_INVALID;
 	REQUIRE(os_channel_create_for_child("displayxr-conv-test", &ch, token, sizeof(token), &child_end) == 0);
 
 	proc_guard g;
-	REQUIRE(spawn({"echo", token}, g, child_end) == 0);
+	REQUIRE(spawn({"echo", token}, g, child_end, disclaim) == 0);
 	REQUIRE(os_channel_accept_child(ch, g.p, child_end, 10000) == 0);
 
 	// The wake the child signals back.

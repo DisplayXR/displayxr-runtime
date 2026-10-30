@@ -99,6 +99,15 @@ struct os_process_spawn_info
 
 	//! Optional: append the child's stdout + stderr to this file (UTF-8 path). NULL = inherit / discard.
 	const char *log_path;
+
+	/*!
+	 * macOS: make the child its own "responsible process" for privacy (TCC)
+	 * checks. Without it a camera opened in the child is charged to the parent:
+	 * the prompt names the parent, and a parent with no usage string for that
+	 * resource (a LaunchAgent daemon) is denied outright. The child then needs
+	 * its own usage string (an embedded Info.plist). Ignored elsewhere.
+	 */
+	bool disclaim_responsibility;
 };
 
 //! Start a child. Its stdin is the null device.
