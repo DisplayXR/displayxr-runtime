@@ -972,7 +972,10 @@ rig_distance(const struct xrt_vec3 *a, const struct xrt_vec3 *b)
  *   1. `xrt_system_roles::rig` resolves to that device (the arbiter walk).
  *   2. The HEAD's pose -- which IS the composed rig -- changes over a 1.6 s
  *      window and every sample is finite (the composer really took the
- *      provider's navigation frame as the rig source).
+ *      provider's navigation frame as the rig source). Judged against the
+ *      provider's own pose: a still head fails only when the provider moved.
+ *      A user-driven provider (touch, a pad) is idle in a headless run, so
+ *      head and provider both still is "at rest", reported and passed.
  *   3. If the device fired at least two recenters during that window (watched
  *      on its own durable RECENTER timestamp -- never inferred from an env
  *      knob, so a real provider that recenters only on user intent stays
@@ -1067,12 +1070,38 @@ probe_rig_role(struct cli_query_result *r, struct cli_query_handles *h, struct x
 	uint32_t count = 0;
 	bool finite = true;
 
+	// The provider's own N(t), read next to every head sample. It is what
+	// tells a broken composition (the provider moved, the head did not) from
+	// a rig at rest (nobody touched the screen / the stick): a user-driven
+	// provider is idle during a headless run, and that is not a fault.
+	struct xrt_vec3 nav_first = {0};
+	bool nav_have_first = false;
+	float nav_travel = 0.0f;
+
 	for (int i = 0; i < CLI_RIG_SAMPLES; i++) {
 		struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
 		if (xrt_device_get_tracked_pose(head, XRT_INPUT_GENERIC_HEAD_POSE, (int64_t)os_monotonic_get_ns(),
 		                                &rel) == XRT_SUCCESS) {
 			finite = finite && rig_pose_finite(&rel.pose);
 			samples[count++] = rel.pose.position;
+		}
+
+		// After the head poll, so this reads the pose the composer was just
+		// handed. Navigation pose reads are side-effect free (sim-input,
+		// touch-input and gamepad all only sample).
+		struct xrt_space_relation nav_rel = XRT_SPACE_RELATION_ZERO;
+		if (xrt_device_get_tracked_pose(nav, XRT_INPUT_GENERIC_NAVIGATION_POSE, (int64_t)os_monotonic_get_ns(),
+		                                &nav_rel) == XRT_SUCCESS &&
+		    rig_pose_finite(&nav_rel.pose)) {
+			if (!nav_have_first) {
+				nav_first = nav_rel.pose.position;
+				nav_have_first = true;
+			} else {
+				const float d = rig_distance(&nav_first, &nav_rel.pose.position);
+				if (d > nav_travel) {
+					nav_travel = d;
+				}
+			}
 		}
 
 		// The head poll above is what drives the composer's own
@@ -1099,7 +1128,13 @@ probe_rig_role(struct cli_query_result *r, struct cli_query_handles *h, struct x
 		}
 	}
 	r->rig_travel_m = travel;
-	r->rig_moves_ok = finite && count >= 2 && travel > 1e-4f;
+	r->rig_nav_travel_m = nav_travel;
+	// A still head is a fault only when the provider moved: then the composer
+	// did not take its frame as the rig source. Both still = a rig at rest
+	// (a user-driven provider with no input during the window), which says
+	// nothing about composition either way.
+	r->rig_at_rest = finite && count >= 2 && travel <= 1e-4f && nav_have_first && nav_travel <= 1e-4f;
+	r->rig_moves_ok = finite && count >= 2 && (travel > 1e-4f || r->rig_at_rest);
 
 	// A recenter lands the rig on `rig_initial` EXACTLY (the one deliberate
 	// jump), so two or more recenters put the same value in the sample set
@@ -1125,8 +1160,13 @@ probe_rig_role(struct cli_query_result *r, struct cli_query_handles *h, struct x
 
 	if (!r->rig_moves_ok) {
 		snprintf(r->rig_note, sizeof(r->rig_note),
-		         "FAIL: rig role on '%s' but the head %s (travel %.4f m over %u samples)", r->rig_nav_str,
-		         finite ? "never moved" : "went non-finite", (double)travel, count);
+		         "FAIL: rig role on '%s' but the head %s (head %.4f m, provider %.4f m over %u samples)",
+		         r->rig_nav_str, finite ? "never moved" : "went non-finite", (double)travel, (double)nav_travel,
+		         count);
+	} else if (r->rig_at_rest) {
+		snprintf(r->rig_note, sizeof(r->rig_note),
+		         "rig held by '%s': at rest (no navigation input in %u samples; composition not exercised)",
+		         r->rig_nav_str, count);
 	} else if (!r->rig_recenter_ok) {
 		snprintf(r->rig_note, sizeof(r->rig_note),
 		         "FAIL: %u recenter(s) fired on '%s' but the head never returned to one pose",
@@ -1320,6 +1360,20 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 
 	struct xrt_system_roles roles = XRT_SYSTEM_ROLES_INIT;
 	xrt_system_devices_get_roles(h->xsysd, &roles);
+
+	// A provider is asserted only on the hands it SUPPLIED. One controller
+	// is a complete provider: Android touch-input supplies a single
+	// ANY_HAND_CONTROLLER (it fills left, per the builder), a navigation- or
+	// gamepad-only provider supplies none, and the side it leaves is the
+	// floor's (qwerty) by design, not a role the provider failed to fill.
+	if (!claimed_left) {
+		r->input_left_ok = true;
+		snprintf(r->input_left_str, sizeof(r->input_left_str), "%s", "n/a (not supplied by the provider)");
+	}
+	if (!claimed_right) {
+		r->input_right_ok = true;
+		snprintf(r->input_right_str, sizeof(r->input_right_str), "%s", "n/a (not supplied by the provider)");
+	}
 
 	if (claimed_left && roles.left >= 0 && (uint32_t)roles.left < h->xsysd->xdev_count) {
 		struct xrt_device *xdev = h->xsysd->xdevs[roles.left];
@@ -2798,7 +2852,11 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	if (r->rig_evaluated) {
 		PT("device:       %s\n", r->rig_nav_str);
 		PT("role:         %s\n", r->rig_role_ok ? "held (xrt_system_roles::rig)" : "NOT HELD");
-		PT("head travel:  %.4f m%s\n", (double)r->rig_travel_m, r->rig_moves_ok ? "" : "  (STALLED)");
+		PT("head travel:  %.4f m%s\n", (double)r->rig_travel_m,
+		   !r->rig_moves_ok ? "  (STALLED)"
+		   : r->rig_at_rest ? "  (at rest: no navigation input)"
+		                    : "");
+		PT("nav travel:   %.4f m\n", (double)r->rig_nav_travel_m);
 		PT("recenters:    %u%s\n", r->rig_recenter_seen,
 		   !r->rig_recenter_expected ? "  (none to assert)"
 		   : r->rig_recenter_ok      ? "  (returned to rig_initial)"
@@ -3199,6 +3257,8 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddBoolToObject(rg, "role_ok", r->rig_role_ok);
 			cJSON_AddBoolToObject(rg, "moves_ok", r->rig_moves_ok);
 			cJSON_AddNumberToObject(rg, "head_travel_m", (double)r->rig_travel_m);
+			cJSON_AddNumberToObject(rg, "nav_travel_m", (double)r->rig_nav_travel_m);
+			cJSON_AddBoolToObject(rg, "at_rest", r->rig_at_rest);
 			cJSON_AddNumberToObject(rg, "recenters", (double)r->rig_recenter_seen);
 			cJSON_AddBoolToObject(rg, "recenter_expected", r->rig_recenter_expected);
 			cJSON_AddBoolToObject(rg, "recenter_ok", r->rig_recenter_ok);

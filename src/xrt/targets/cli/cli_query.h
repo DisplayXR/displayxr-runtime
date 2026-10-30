@@ -444,12 +444,14 @@ struct cli_query_result
 	bool rig_nav_present;       //!< a NAVIGATION device is in xsysd->xdevs
 	bool rig_evaluated;         //!< checks ran (a navigation device exists)
 	bool rig_role_ok;           //!< xrt_system_roles::rig points at that device
-	bool rig_moves_ok;          //!< the head pose changed over the window and stayed finite
+	bool rig_moves_ok;          //!< head moved (or head and provider both at rest) and stayed finite
 	bool rig_recenter_expected; //!< >= 2 scripted recenters fired during the window
 	bool rig_recenter_ok;       //!< …and the head returned to one identical pose each time
 	uint32_t rig_recenter_seen; //!< recenter timestamp advances observed
 	uint32_t rig_repeat_max;    //!< largest exact-repeat count among the sampled head poses
 	float rig_travel_m;         //!< furthest the head got from its first sample
+	float rig_nav_travel_m;     //!< furthest the navigation device's own pose got from its first sample
+	bool rig_at_rest;           //!< head AND provider both still: no navigation input, composition not exercised
 	char rig_nav_str[256];
 	char rig_note[224];
 
