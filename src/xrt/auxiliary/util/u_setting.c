@@ -226,8 +226,19 @@ env_get_raw(char *chars, size_t char_count, const char *name)
 	}
 
 	struct android_read_arg a = {.chars = chars, .char_count = char_count};
+	if (char_count > 0) {
+		chars[0] = '\0';
+	}
 	__system_property_read_callback(pi, &android_on_property_read, &a);
 
+	// A system property cannot be deleted short of a reboot: "clearing" one
+	// (`setprop debug.xrt.NAME ""`) leaves it present with an EMPTY value. Read
+	// as present, an empty value parses as TRUE for every bool knob, so a
+	// cleared DXR_STEREO_CAMERA_DEV_ALLOW stayed ON (found on a tablet, A2).
+	// Empty = unset, as the person who cleared it meant.
+	if (char_count == 0 || chars[0] == '\0') {
+		return NULL;
+	}
 	return chars;
 
 #else
