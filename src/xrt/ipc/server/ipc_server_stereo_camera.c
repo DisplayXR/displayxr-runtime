@@ -3368,7 +3368,21 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 		return XRT_SUCCESS;
 	}
 	snprintf(exe, sizeof(exe), "%s", s->exe);
+	const bool needs_presenting = s->needs_presenting;
+	const long peer_uid = s->peer_uid;
 	os_mutex_unlock(&m->lock);
+
+	// A2 front gate first: an app that may not take the front camera now is
+	// not asked for consent it could not use (checked again below).
+	if (!u_camera_consent_user_facing_gate(needs_presenting, true,
+	                                       !needs_presenting ||
+	                                           uid_presenting(ics, peer_uid, (int64_t)os_monotonic_get_ns()))) {
+		U_LOG_W(
+		    "stereo_camera_stream_start: stream %llu refused for pid %ld — a user-facing camera needs a live "
+		    "weave from the same app in this process (BUSY)",
+		    (unsigned long long)stream_id, ics->peer_pid);
+		return XRT_ERROR_STEREO_CAMERA_BUSY;
+	}
 
 	// Spec §7.1: start is THE authorisation point. Lock released — the tray
 	// prompt may block for up to a minute.
