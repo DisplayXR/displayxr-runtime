@@ -733,9 +733,15 @@ Terminal's grant). `aux_os_uvc` has no macOS capture backend, so `SOURCE=webcam`
 an out-of-tree provider with its own AVFoundation capture (the open camera tracking provider) runs
 there today. `displayxr-tracking-host` carries its own usage string, embedded in the bare executable
 as a `__TEXT,__info_plist` section (`src/xrt/targets/tracking_host/Info.plist.in`, bundle id
-`com.displayxr.tracking-host`). That string is necessary but not yet sufficient under the service:
-the service spawns the host with fork + exec, so the host inherits the service's responsibility and
-TCC consults the service (or whatever launched it) — see §10 item 1.
+`com.displayxr.tracking-host`). The service spawns the host with its responsibility **disclaimed**
+(`os_process_spawn_info.disclaim_responsibility`: `posix_spawn` +
+`responsibility_spawnattrs_setdisclaim`, macOS only), so TCC asks about the host itself — the prompt
+names it and shows its string. Without that, a fork + exec child inherits the service's
+responsibility, and a LaunchAgent-started service (no usage string) is denied without a prompt. In
+the `.pkg` both the host and `displayxr-cli` (whose `tracking calibrate` hosts a provider) are
+signed with `installer/macos/entitlements/camera-host.entitlements`: the hardened runtime refuses
+AVFoundation capture without `com.apple.security.device.camera`. A dev build is ad-hoc signed, so
+macOS asks again for the host after each rebuild.
 
 Dev trees stage it next to sim-input (`scripts/build_macos.sh`, `scripts/build_linux.sh`); the CI
 end-to-end arm is `tests_oxr_view_space_viewer_tracking`.
@@ -773,10 +779,8 @@ apps beside a service reading the page instead of opening the camera again.
 
 1. **Out-of-process hosting — open ends**: the service's host is spawned per service run, so a
    tracking registration change still applies at the next service start (item 5); the macOS host
-   carries its own `NSCameraUsageDescription` (embedded `__info_plist`), but TCC asks the RESPONSIBLE
-   process, which for a fork + exec child of the service is the service — the host must be spawned
-   with responsibility disclaimed (`posix_spawn` + `responsibility_spawnattrs_setdisclaim`, macOS
-   only, in `os_process_spawn`) before the prompt and the grant name the host (§8);
+   carries its own `NSCameraUsageDescription` (embedded `__info_plist`) and is spawned with
+   responsibility disclaimed, so the grant is the host's (§8);
    `tracking calibrate --watch` still hosts its own provider rather than reading the page (item 4);
    an in-process app that starts *before* the service has created the page keeps its own
    provider for its instance (the decision is static per instance); Windows hardware runs of the

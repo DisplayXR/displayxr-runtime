@@ -423,6 +423,10 @@ spawn_locked(struct target_viewer_host *h, uint64_t now)
 	si.kill_on_parent_exit = true;
 	si.channel_child_handle = child_handle;
 	si.log_path = host_log_path();
+	// macOS: the host, not the service, owns the camera grant. It carries the
+	// usage string (embedded Info.plist); a LaunchAgent-started service has none
+	// and would get the camera denied without a prompt.
+	si.disclaim_responsibility = true;
 
 	struct os_process *proc = NULL;
 	if (os_process_spawn(&si, &proc) != 0) {

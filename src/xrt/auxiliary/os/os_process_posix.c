@@ -32,7 +32,14 @@
 #include <sys/prctl.h>
 #endif
 #if defined(__APPLE__)
+#include <spawn.h>
 #include <sys/event.h>
+
+// libSystem, no public header (Chromium, LLDB and Qt Creator use the same
+// declaration). Weak: a system without it spawns without disclaiming.
+extern int
+responsibility_spawnattrs_setdisclaim(posix_spawnattr_t *attrs, int disclaim) __attribute__((weak_import));
+extern char **environ;
 #endif
 
 //! Most descriptors one message may carry.
@@ -157,6 +164,52 @@ struct os_process
 	int32_t exit_code;
 };
 
+#if defined(__APPLE__)
+/*!
+ * posix_spawn with the responsibility disclaimed (fork + exec cannot express
+ * it). The same child layout as the fork path: stdin /dev/null, stdout +
+ * stderr the log (or /dev/null), the channel at OS_CHANNEL_CHILD_FD, and
+ * POSIX_SPAWN_CLOEXEC_DEFAULT closes every other descriptor.
+ */
+static int
+spawn_disclaimed(const struct os_process_spawn_info *info, char **argv, int devnull, int log, int ch, pid_t *out_pid)
+{
+	posix_spawn_file_actions_t fa;
+	posix_spawnattr_t attr;
+	if (posix_spawn_file_actions_init(&fa) != 0) {
+		return -1;
+	}
+	if (posix_spawnattr_init(&attr) != 0) {
+		posix_spawn_file_actions_destroy(&fa);
+		return -1;
+	}
+	int out = log >= 0 ? log : devnull;
+	int rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+	if (rc == 0) {
+		rc = responsibility_spawnattrs_setdisclaim(&attr, 1);
+	}
+	if (rc == 0 && devnull >= 0) {
+		rc = posix_spawn_file_actions_adddup2(&fa, devnull, 0);
+	}
+	if (rc == 0 && out >= 0) {
+		rc = posix_spawn_file_actions_adddup2(&fa, out, 1);
+	}
+	if (rc == 0 && out >= 0) {
+		rc = posix_spawn_file_actions_adddup2(&fa, out, 2);
+	}
+	if (rc == 0 && ch >= 0) {
+		rc = ch == OS_CHANNEL_CHILD_FD ? posix_spawn_file_actions_addinherit_np(&fa, ch)
+		                               : posix_spawn_file_actions_adddup2(&fa, ch, OS_CHANNEL_CHILD_FD);
+	}
+	if (rc == 0) {
+		rc = posix_spawn(out_pid, info->exe_path, &fa, &attr, argv, environ);
+	}
+	posix_spawnattr_destroy(&attr);
+	posix_spawn_file_actions_destroy(&fa);
+	return rc == 0 ? 0 : -1;
+}
+#endif
+
 int
 os_process_spawn(const struct os_process_spawn_info *info, struct os_process **out_proc)
 {
@@ -191,6 +244,29 @@ os_process_spawn(const struct os_process_spawn_info *info, struct os_process **o
 	}
 #if defined(__linux__)
 	pid_t parent = getpid();
+#endif
+
+#if defined(__APPLE__)
+	// The channel is a high socketpair fd; one in 0..2 would be overwritten by
+	// the stdio dup2s, so that (theoretical) case keeps the fork path.
+	if (info->disclaim_responsibility && responsibility_spawnattrs_setdisclaim != NULL && (ch < 0 || ch > 2)) {
+		pid_t spid = 0;
+		int src = spawn_disclaimed(info, argv, devnull, log, ch, &spid);
+		if (devnull >= 0) {
+			close(devnull);
+		}
+		if (log >= 0) {
+			close(log);
+		}
+		free(argv);
+		if (src != 0) {
+			free(p);
+			return OS_PROCESS_ERR_FAILED;
+		}
+		p->pid = spid;
+		*out_proc = p;
+		return 0;
+	}
 #endif
 
 	pid_t pid = fork();
