@@ -104,6 +104,79 @@ public final class StereoCameraConsent {
     private static final AtomicBoolean watching = new AtomicBoolean(false);
     private static volatile String stopAction = null;
 
+    /*
+     * Suspend state = screen locked OR consumer app not in the foreground. Measured on a retail
+     * Android 12 tablet: the OS does NOT take the camera from the satellite when its client goes
+     * to the background (a reopen in the background succeeded and streamed at full rate), so the
+     * runtime keeps its own foreground rule. The signal is this process's own importance: a
+     * satellite serves one package, bound with BIND_IMPORTANT | BIND_ABOVE_CLIENT, so it is
+     * BOUND_TOP (IMPORTANCE_FOREGROUND) exactly while that package is the top app, and drops to
+     * its own foreground-service level otherwise. Polled only while a stream is started.
+     */
+    private static final long FOREGROUND_POLL_MS = 500;
+
+    private static volatile boolean screenLocked = false;
+    private static volatile boolean consumerBackground = false;
+    private static volatile boolean lastReported = false;
+    private static volatile boolean polling = false;
+    private static Handler watchHandler = null;
+
+    private static synchronized void reportSuspend(String why) {
+        boolean s = screenLocked || consumerBackground;
+        if (s != lastReported) {
+            lastReported = s;
+            nativeSetLocked(s, why);
+        }
+    }
+
+    private static final Runnable foregroundPoll =
+            new Runnable() {
+                @Override
+                public void run() {
+                    if (!polling) {
+                        return;
+                    }
+                    android.app.ActivityManager.RunningAppProcessInfo info =
+                            new android.app.ActivityManager.RunningAppProcessInfo();
+                    android.app.ActivityManager.getMyMemoryState(info);
+                    boolean bg =
+                            info.importance
+                                    > android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND;
+                    if (bg != consumerBackground) {
+                        consumerBackground = bg;
+                        Log.w(
+                                TAG,
+                                "consumer app "
+                                        + (bg ? "left the foreground" : "back in the foreground")
+                                        + " (runtime process importance "
+                                        + info.importance
+                                        + ")");
+                        reportSuspend(bg ? "consumer app not in the foreground" : "consumer app in the foreground");
+                    }
+                    Handler h = watchHandler;
+                    if (h != null) {
+                        h.postDelayed(this, FOREGROUND_POLL_MS);
+                    }
+                }
+            };
+
+    private static void setPolling(boolean on) {
+        Handler h = watchHandler;
+        if (h == null || on == polling) {
+            return;
+        }
+        polling = on;
+        if (on) {
+            h.post(foregroundPoll);
+        } else {
+            h.removeCallbacks(foregroundPoll);
+            if (consumerBackground) {
+                consumerBackground = false;
+                reportSuspend("no stream: foreground rule idle");
+            }
+        }
+    }
+
     private StereoCameraConsent() {}
 
     /** The JSON store's directory (camera_consent.json), shared by every process of the runtime. */
@@ -460,6 +533,7 @@ public final class StereoCameraConsent {
             return;
         }
         int id = NOTIF_IN_USE_BASE + (Process.myPid() & 0xf);
+        setPolling(streams > 0);
         if (streams <= 0) {
             nm.cancel(id);
             return;
@@ -514,6 +588,7 @@ public final class StereoCameraConsent {
         HandlerThread ht = new HandlerThread("dxr-camera-watch");
         ht.start();
         Handler h = new Handler(ht.getLooper());
+        watchHandler = h;
 
         BroadcastReceiver lock =
                 new BroadcastReceiver() {
@@ -521,13 +596,16 @@ public final class StereoCameraConsent {
                     public void onReceive(Context c, Intent intent) {
                         String a = intent.getAction();
                         if (Intent.ACTION_SCREEN_OFF.equals(a)) {
-                            nativeSetLocked(true, "screen off");
+                            screenLocked = true;
+                            reportSuspend("screen off");
                         } else if (Intent.ACTION_USER_PRESENT.equals(a)) {
-                            nativeSetLocked(false, "user present (unlocked)");
+                            screenLocked = false;
+                            reportSuspend("user present (unlocked)");
                         } else if (Intent.ACTION_SCREEN_ON.equals(a)) {
                             KeyguardManager km = c.getSystemService(KeyguardManager.class);
                             if (km == null || !km.isKeyguardLocked()) {
-                                nativeSetLocked(false, "screen on, no keyguard");
+                                screenLocked = false;
+                                reportSuspend("screen on, no keyguard");
                             }
                         }
                     }
@@ -560,7 +638,8 @@ public final class StereoCameraConsent {
         KeyguardManager km = app.getSystemService(KeyguardManager.class);
         boolean locked = (pm != null && !pm.isInteractive()) || (km != null && km.isKeyguardLocked());
         if (locked) {
-            nativeSetLocked(true, "locked at start");
+            screenLocked = true;
+            reportSuspend("locked at start");
         }
         Log.i(TAG, "watching screen lock; stop action " + stopAction);
     }
