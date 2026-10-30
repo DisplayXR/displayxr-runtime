@@ -224,7 +224,13 @@ jobs:
       # error (2 s stall, #754 back-off) instead of waiting ~30 s for the plug-in
       # watchdog; CNSDK #757: a tracking-camera override uses that camera's pose.
       # No API, loader or INTRODUCED_IN change. (v0.10.84 = #757 only, no release.)
-      CNSDK_TAG: v0.10.85
+      # v0.10.87: matches leia-plugin v2.19.3 (built against
+      # cnsdk-android-0.10.87+211.ec09441.zip). CNSDK #761: the display service
+      # sends one lens command at a time, >= 100 ms apart (a burst after a service
+      # restart left the panel in 3D while every state said 2D), SPR wake guard
+      # keyed on the phone-class product name; CNSDK #759: lls_gyro weave predictor
+      # default, 40 ms weave horizon. No loader API change. (v0.10.86 = #761 only.)
+      CNSDK_TAG: v0.10.87
 
     steps:
 
