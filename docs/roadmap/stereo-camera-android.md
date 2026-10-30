@@ -682,3 +682,42 @@ CLOCK_MONOTONIC, the domain of `base::TimeTicks`" is therefore true only after c
 plug-in must convert BOOTTIME → MONOTONIC (the offset only grows across suspend, so sample it per
 open) before filling `time_ns`, or `captureTimeIsExposure` timestamps drift by the device's total
 suspend time.
+
+### 12.7 Proposed spec change and open decisions (from the B2a revision)
+
+**R1: frame orientation (proposed spec v7, NOT implemented in A0/A1 docs-only phase).** Add
+`XrStereoCameraOrientationDXR { XrStructureType type; const void* next; uint32_t
+frameOrientationDegrees; }`, chained on `XrStereoCameraPropertiesDXR::next`. The value is the
+clockwise rotation (0/90/180/270) that makes the **published** SBS frame upright in the device's
+**natural** orientation: Camera2 `SENSOR_ORIENTATION` composed with any rotation the runtime or
+plug-in already applied. The runtime publishes frames unrotated in the sensor's landscape (§11.1),
+so on Android the value is the sensor orientation. It changes nothing about the pixels. It tells
+the consumer how to turn them, and when a 90/270 turn would make the baseline vertical (portrait →
+mono, §5).
+
+Checked against the browser's interim rule (landscape-natural → 0; portrait-natural → 270 front /
+90 rear), using what A0a measured on Lume Pad 2 (portrait-natural, panel 1600×2560):
+
+| Pair | Camera2 ids | `SENSOR_ORIENTATION` (measured) | Rule says | Match |
+|---|---|---|---|---|
+| Front | 5 (logical), 1 and 3 (physical) | **270** on all three | 270 | yes |
+| Rear | 4 (logical), 0 and 2 (physical) | **90** on all three | 90 | yes |
+
+Camera2 defines `SENSOR_ORIENTATION` as the clockwise rotation that makes the output upright in
+the native orientation, for front and back cameras alike, so the measured values are R1's values
+as long as the runtime publishes unrotated frames. NP02J (landscape-natural) should read 0. Its
+sensor orientation was not re-measured in A0, so confirm it there. Where the field is filled:
+the plug-in fills a new `xrt_plugin_stereo_camera_info` field (appended, `struct_size`-gated,
+announced by a new `XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_*` macro), and the service copies it into
+the chained struct. **Decision:** adopt R1 as spec v7 at A1/B2a time.
+
+**Open decisions for the owner:**
+
+- **R2, colour range.** A spec colour-range field per camera, or a fixed contract that Android
+  frames are full-range BT.601 (JFIF, as the HAL configures them, §12.6 #2). **Either way (A1
+  item):** `u_stereo_camera.c`'s NV12→RGB leg (today limited-range coefficients) must handle full
+  range, and the sim's GRAY8→NV12 output must be labelled consistently.
+- **R3, a SIM camera source in the service.** Move the pattern generator from
+  `drivers/sim_display/` to `auxiliary/util/` and add `XRT_STEREO_CAMERA_SOURCE_SIM` behind
+  `debug.xrt.DXR_STEREO_CAMERA_SIM`, so a vendor-plug-in runtime can serve a fake camera
+  (§12.6 #4).
