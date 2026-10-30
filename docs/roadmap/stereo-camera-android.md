@@ -1,6 +1,6 @@
 # Stereo camera on Android tablets — design proposal
 
-**Status:** proposal (2026-10-06), design only — nothing here is built. Decision record:
+**Status:** proposal (2026-10-06), design only. Phase A0 (read-only characteristics + bound-service probe) ran on a Lume Pad 2 on 2026-10-30: results in §11, the A1 plan in §12. Decision record:
 [ADR-043](../adr/ADR-043-stereo-camera-source.md). Extension:
 [`XR_DXR_stereo_camera`](../specs/extensions/XR_DXR_stereo_camera.md). Parent plan:
 [stereo-camera-source.md](stereo-camera-source.md) §C (Android) and its phases A1/B2, which this
@@ -64,7 +64,7 @@ the vendor SDK or tracking service that nothing in code or docs settles.
 | F3 | The rear pair does not conflict with tracking | Measured, NP02J |
 | F4 | The vendor's own stereo app reaches the pair through a private camera wrapper over plain Camera2, not through the vendor SDK. The vendor SDK supplies calibration and face tracking, not frames | Measured |
 | F5 | Feeding a 640×480 left-lens stream from the same logical camera into the vendor SDK's in-app face tracking worked in a standalone probe app. The hand-off runs face detection **on the caller's thread** (~119 ms); on the camera thread it dragged the pair to 24 fps, so it must run on a worker behind a latest-frame slot | Measured (probe app). The vendor SDK header says the external-frame sink works only with the in-app tracking runtime, and that tracking must be re-enabled for a newly attached sink to apply (*inferred from the header text; not run in a service process*) |
-| F6 | The plug-in uses the **in-service** tracking runtime today, deliberately: in-app tracking "failed to license on the Lume Pad ('Invalid Device')" | plug-in: `src/drv_leia_android/leia_cnsdk.cpp:1097-1102` |
+| F6 | The plug-in uses the **in-service** tracking runtime today, deliberately: in-app tracking "failed to license on the Lume Pad ('Invalid Device')". **Stale (A0b, §11.3):** at SDK 0.10.85 in-app tracking initialises with no license requirement in a non-Activity service process on Lume Pad 2 | plug-in: `src/drv_leia_android/leia_cnsdk.cpp:1097-1102` |
 | F7 | The plug-in contains no Android camera code | plug-in: no `ACamera`/`AImageReader`/`Camera2` hit on `origin/main` |
 | F8 | The Android browser reaches the runtime **out of process**. The browser process's Java calls the runtime's `Client.blockingConnect` and passes the socket fd down. The GPU process adopts it via `DXR_IPC_FD` and opens a `PRESENT_OWNER` session (`XR_DXR_weave`) on that connection | browser: `patches/0084-…runtime-fd-co.patch` (`DisplayXrRuntimeConnector.java`), `patches/0085-…GPU-pro.patch` (`gpu_main.cc` `setenv("DXR_IPC_FD")`), `patches/0088-…present-owner-weave-session…patch`; runtime: [android-ipc-fd-adoption.md](../specs/runtime/android-ipc-fd-adoption.md) |
 | F9 | That connection lands in a **satellite** compositor process (`:dxr0..3`), one per client package. A second connection from the same package is routed to the **same** satellite ("reuse") | `src/xrt/ipc/android/src/main/java/org/freedesktop/monado/ipc/SlotBroker.kt:54-67`; manifest `src/xrt/ipc/android/src/main/AndroidManifest.xml:55-78` |
@@ -272,7 +272,7 @@ environment vtable. `persistentId` = HMAC(secret, device ‖ package ‖ cert) (
 | 4 Delegating client | installer-written list | a list **built into the runtime APK**, keyed by package + certificate digest (an APK cannot be modified by another installer). The DisplayXR Browser is the v1 entry; its per-origin prompt is the consent |
 | 5 OS camera switch | Windows ConsentStore | **The peer uid must hold `CAMERA`** (`checkPermission(CAMERA, pid, uid)`) and its camera app-op must not be ignored (`AppOpsManager.checkOpNoThrow`) → else `PERMISSION_INSUFFICIENT` |
 | 6–7 Stored decision / Allow once | registry / JSON | JSON in the runtime app's private storage (the POSIX store, `u_file_*_in_config_dir`), keyed per §4.1 |
-| 8 Prompt | tray dialog | **Deferred.** A service starting a consent Activity runs into background-activity-launch rules (*inferred*). v1 Android = delegating clients + stored decisions only (set from the runtime's settings Activity or the CLI-equivalent), and everything else `CONSENT_REFUSED`. Native-app prompting waits for a demand |
+| 8 Prompt | tray dialog | **Built in A2 (§13), superseding "deferred".** A runtime-owned consent activity (not exported) names the app label + package: Allow / Only this time / Don't allow. A notification opens it if a background start is blocked. Stored per package + certificate; revoked from the DisplayXR app's 3D camera card or over adb |
 
 ### 4.3 What Android already enforces, and what the runtime keeps
 
@@ -281,7 +281,7 @@ environment vtable. `persistentId` = HMAC(secret, device ‖ package ‖ cert) (
 | Camera only while the user is looking | While-in-use: a background uid's camera client is disconnected. Under option R the owner is the satellite, which holds while-in-use **only because the foreground browser bound it with `BIND_INCLUDE_CAPABILITIES`** (F10). So when the browser leaves the foreground, the OS takes the camera from the satellite. *Inferred; A1 gate checks it.* **Consequence:** the satellite must **not** declare `foregroundServiceType="camera"` (today it declares `connectedDevice\|mediaPlayback`, `AndroidManifest.xml:55-78`). That would let it keep the camera in the background, and the runtime would then have to re-implement the foreground rule itself | Spec §7.2 on Android: today `pid_has_visible_window()` falls to `return true` off Windows/macOS (r3: `ipc_server_stereo_camera.c:601-614`), so the runtime has no rule of its own. Keep the OS as the gate and treat a camera disconnect as `SUSPENDED`. The spec/roadmap's `android_package_is_visible` suggestion is **wrong**: that host slot answers *package visibility* (`<queries>`), not foreground (`xrt_plugin.h:566-605`) |
 | Lock screen | The foreground app stops, so the same disconnect applies | nothing extra |
 | In-use indicator | Status-bar privacy dot (Android 12+), attributed to the **runtime** package, not the browser. Chromium shows its own tab indicator | A notification "3D camera in use by <browser>" with a **Stop** action (= spec §7.4 "Stop camera sharing"). This is the runtime's in-use indicator on Android, and the only place a user sees *who* receives the frames |
-| Runtime's own `CAMERA` permission | Required; it is a runtime permission, so the user grants it to the **runtime app** once (from its Activity) | Request it at first use, through the runtime's settings Activity; until it is granted, report the cameras as `UNAVAILABLE` |
+| Runtime's own `CAMERA` permission | Required; it is a runtime permission, so the user grants it to the **runtime app** once (from its Activity) | **A2:** requested at the first *allowed* start through the consent activity (or the Dashboard's 3D camera card); refused → `PERMISSION_INSUFFICIENT` |
 | Fingerprinting | — | Unchanged (§7.5, keyed per §4.1); the browser coarsens the hint |
 
 Under option V the tracking service is the OS-visible client and none of this changes on the
@@ -319,9 +319,9 @@ orientation, which on NP02J is landscape (`ROTATION_0` = landscape). Rules:
 
 | | NP02J (Nubia Pad 3D II) | Lume Pad 2 |
 |---|---|---|
-| Baselines | front 25 mm, rear 45 mm | front 15 mm, rear 25 mm |
-| Pair topology (logical ids, 1280×720 NV12 ×2) | **Measured** (F1) | **Not measured** — ids, sizes, sync unknown |
-| In-app tracking (needed by option R) | worked in a probe app (F5) | **failed to license** in the plug-in (F6) — option R may be unavailable; rear pair still fine |
+| Baselines | front 25 mm, rear 45 mm | front 15 mm, rear **30 mm** (factory calibration, §11.1; was listed as 25) |
+| Pair topology (logical ids, 1280×720 NV12 ×2) | **Measured** (F1) | **Measured** (§11.1): same ids as NP02J, 29.6 fps, identical per-pair timestamps |
+| In-app tracking (needed by option R) | worked in a probe app (F5) | **Initialises with no license gate from a service process** (§11.2); faces from it still to be confirmed (§11.4) |
 | Disparity of a face at 0.6 m, *inferred* f ≈ 1000 px at 1280 px width | ≈ 42 px front | ≈ 25 px front |
 
 15 mm is still a usable call stereo base at arm's length, but noisier. vrefine's ≥ 50 matches gate
@@ -467,5 +467,273 @@ That decides whether A3 is scheduled at all. A1, A2 and B2a are useful in either
 - Every vendor-SDK behaviour in §1.3 marked vendor-unconfirmed. Vendor-SDK API presence was
   checked against a local 0.10.71 checkout of the vendor SDK, which is not the vendor's main
   branch.
-- Lume Pad 2's camera topology (only NP02J was probed).
+- Lume Pad 2's camera topology: probed in A0 (§11). NP02J was not re-probed in A0.
 - Tablet CPU cost of rectification (scaled from M1 Pro numbers, §3.2).
+
+---
+
+## 11. A0 results — Lume Pad 2, 2026-10-30
+
+Device: Lume Pad 2, retail user build (Android 12, SDK 31), DisplayXR runtime v2.57.2, vendor SDK
+services 0.10.85. **No nubia Pad 3D II (NP02J) was available**, so every NP02J cell below is
+still the 2026-09-26 data (F1–F5). *Measured* = seen on the device today. *Read* = taken from
+`dumpsys media.camera` or vendor-SDK source at 0.10.85. *Inferred* = reasoning.
+
+### 11.1 A0a — what the device says about its cameras (opens no camera)
+
+Topology (*measured*, `dumpsys media.camera` + `CameraManager`). It matches NP02J:
+
+| Camera2 id | Kind | Facing | Sensor orientation | Active array | Physical ids | Sync type |
+|---|---|---|---|---|---|---|
+| 0 | physical | back | 90 | 4656×3496 | — | — |
+| 2 | physical | back | 90 | 4656×3496 | — | — |
+| 1 | physical | front | 270 | 3264×2448 | — | — |
+| 3 | physical | front | 270 | 3264×2448 | — | — |
+| 4 | **logical** (hidden) | back | 90 | 4656×3496 | 0, 2 | `APPROXIMATE` |
+| 5 | **logical** (hidden) | front | 270 | 3264×2448 | 1, 3 | `APPROXIMATE` |
+
+`getCameraIdList()` returns `[0, 1]` only. Timestamp source is `REALTIME` on every id. AE target
+ranges include `[30,30]`. YUV_420_888 1280×720 and 640×480 outputs are listed for every id.
+
+Calibration: where each value really lives:
+
+| Source | What it holds on this device | Usable? |
+|---|---|---|
+| Camera2 standard keys (`LENS_INTRINSIC_CALIBRATION`, `LENS_DISTORTION`, `LENS_POSE_*`) | **Nominal placeholders.** f = focal length ÷ pixel pitch (3620 px back, 1990 px front, at the full array), principal point at the exact centre (0,0 on the logical ids), distortion all zero. Both lenses of a pair report the same `LENS_POSE_ROTATION`. `LENS_POSE_TRANSLATION` is (1.1, −10, 0) mm on ids 0 and 1 and zero on ids 2–5, so it describes no baseline | **No.** §3.1 source 2 (vendor-neutral Camera2 calibration) is **not available** on this OEM |
+| Vendor SDK device config (`leia_device_config_get_camera_data`) | One record only: the tracking camera's translation from the display centre, (−7.5, 91.5, 0) mm, and rotation 0. **Intrinsics are zero.** The config is format **v3**, which does not carry per-lens intrinsics. The SDK's C API can return intrinsics only for v4 configs | **No** for stereo; yes for camera-to-display placement |
+| **OEM vendor tags in `CameraCharacteristics`** (a factory EEPROM block, one for the front pair on ids 1/5, one for the rear pair on ids 0/4; readable with **no camera open**) | Both lenses' fx fy cx cy at the full array, 8 distortion coefficients each (rational/RADTAN8 layout), the 3×3 R and the T between the lenses, **and** a precomputed rectification (R1, R2, P1, P2) | **Yes. This is the calibration.** The vendor's own tracker already reads it for its intrinsics (the in-service tracker logs fx 338.6 / fy 345.6 at 640×480, which is exactly this block scaled). Its layout is vendor-private and is parsed **only in the plug-in** (ADR-019); it is documented in the plug-in repo, not here |
+
+What the factory block says (*read*, numbers rounded):
+
+| Pair | f (px, full array) | Baseline \|T\| | Rotation between lenses | Rectified f |
+|---|---|---|---|---|
+| Front (1, 3), 3264×2448 | 1727 / 1762 and 1724 / 1759 | **14.99 mm** | ≈ 0.46° (mostly roll) | 1782 px |
+| Rear (0, 2), 4656×3496 | 3668 / 3670 and 3663 / 3665 | **30.03 mm** | ≈ 0.3° | 3750 px |
+
+So the front baseline confirms the 15 mm figure in §3.3/§5. **The rear baseline is 30 mm, not
+the 25 mm in §3.3/§5.** The calibrated value is authoritative (§3.3); fix the hint table.
+
+Scaled to the 1280×720 eye stream (a 16:9 centre crop of the 4:3 array, *inferred*: the stream
+crop region was not read), the front pair is f ≈ 677 px and a face at 0.6 m sits at
+≈ 677 × 15 / 600 ≈ **17 px** of disparity, not the ≈ 25 px §5 inferred from f ≈ 1000 px.
+
+Which lens is "main" in the block: the vendor tracker takes the **main** intrinsics for camera 1.
+So main = 1 (front) and, by the same layout, main = 0 (rear) (*inferred*). T = (+15, 0, 0) with a
+positive P2 x-offset means the second lens sits at −x in the main lens's frame (*inferred*:
+the sign convention is not documented). The eye-order gate in §3.3 still decides; nothing here
+replaces it.
+
+Orientation (*measured*): the Lume Pad 2's **natural orientation is portrait** (panel
+1600×2560, `rotation 0` = portrait). The vendor SDK's config has no natural-orientation field
+and assumes landscape. The front sensors are mounted at 270° and the rear at 90°, so each eye's
+native 1280×720 frame is upright in **landscape**. The baseline lies along the sensor x axis, so it
+is horizontal in landscape too. Consequence for §5: the rule "publish upright in the device's
+natural orientation" is **wrong for this device**: in portrait-natural it would make the stereo
+pair vertical. Replace it with: *publish in the orientation in which the baseline is horizontal
+(the sensor's own landscape), turned 0° or 180° so that it is upright in landscape*. This is the
+same thing on NP02J, which is landscape-natural.
+
+Stream combinations (*measured*, A0b): **2 × 1280×720 YUV + a 640×480 YUV on one of the same
+physical lenses is NOT a supported combination.** The session configures, delivers a few frames,
+then the camera HAL aborts (a gralloc size check on the second YUV output of the same lens), the
+provider process restarts, and every camera disappears and reappears 5 s later. The device
+recovered on its own. The tracking service reopened its camera on the next request, with no
+lasting effect. Do not ship that configuration. Two working alternatives:
+
+1. **No third stream (measured, works):** the tracking frame is cut from one eye's Y plane. The
+   in-app detector **accepts only 640×480**: a 2× decimated 640×360 is refused ("camera format …
+   not supported by the compiled-in face detector", a fatal tracking event). A **centre 4:3 crop
+   (960×720) decimated by 1.5 → 640×480** is accepted, with the factory intrinsics rescaled for
+   the crop (fx 451.5, fy 460.8, cx 318.0, cy 234.9). This costs horizontal field of view against
+   the tracker's own full-array 640×480.
+2. Eyes as `PRIVATE`/GPU outputs and the tracking stream as YUV. The vendor's own camera app
+   appears to use this shape (GPU preview surfaces + a YUV face stream). **Not tried.** It is the
+   natural shape for A4's AHardwareBuffer path.
+
+### 11.2 A0b — the bound-service probe
+
+A throwaway APK, not merged anywhere. An Activity binds a service in **another process** with
+`BIND_AUTO_CREATE | BIND_IMPORTANT | BIND_ABOVE_CLIENT | BIND_INCLUDE_CAPABILITIES`, the same
+flags as the runtime's satellite binding (F10). That process has no Activity. It loads the vendor
+core through the same loader the plug-in uses (0.10.85), with the service `Context`, in-app
+tracking runtime, and a shared-camera sink. It opens logical camera 5 with physical outputs 3
+and 1 at 1280×720 YUV, feeds the sink from a worker behind a latest-frame slot, runs 60 s,
+closes, switches the same core to in-service tracking, and times the hand-back.
+
+| Gate (§7 A0b) | Result on Lume Pad 2 | Verified how |
+|---|---|---|
+| (1a) In-app tracking **initialises and licenses in a service process** | **Yes.** Core init 57–109 ms, `inAppSupported=1`, `licenseRequired=0`, runtime = in-app, sink active. The tracking engine logs "Initialized: with shared camera" and delivers frames to the frame listener for the whole 60 s. No license error of any kind | *measured* |
+| (1b) In-app tracking **reports faces** from the eye-derived frames | **Not yet verified.** 640×360 frames are refused by the detector; 640×480 crops are accepted (no format error), but nobody was in front of the tablet during those runs (the in-service tracker saw no face either, before and after). See §11.4 | *measured* (format), faces open |
+| (2) Pair at 30.00 fps | **29.6 fps per eye**, and **every frame pair has identical sensor timestamps** (skew 0 µs, 29.59 matched pairs/s over 60 s), even though the HAL advertises `APPROXIMATE` sync. AE was set to `[30,30]`. That is 29.6, not 30.00 (*measured*). Whether 30.00 needs a fixed frame duration was not tried | *measured* |
+| (2b) Tracking hand-off cost | Detection runs on the caller's thread, as F5 said. The worker fed **~4–6 frames/s** with **no face present**, and the per-call cost grew to ~250 ms. The pair rate was unaffected (the hand-off never runs on the camera thread) | *measured* |
+| (3) After close, the tracking service serves faces again within 5 s, no reboot | **Yes for re-acquiring the camera.** After close, the same core switched back to in-service tracking (disable → set runtime → enable, 13–18 ms). `CameraService` shows the tracking service connecting camera 1 **≈ 50 ms** after our close. Its frames arrived at ~90/s within 1.3 s. In the one run where a person was present (after the HAL-abort run), the first in-service **face** arrived **768 ms** after close, and 2,572 of the next 2,614 frames had a face. **F2's "never reacquires" did not reproduce**: the client re-request is enough | *measured* (face hand-back once, camera hand-back ×3) |
+
+### 11.3 The licensing question (F6)
+
+**F6 is stale.** Why our process "failed to license" and the vendor's camera app does not:
+
+- The "Invalid Device" message is the **blink** face detector's online-license error. Blink's
+  license is chosen per device **model** inside the vendor SDK, and it is the same file the
+  vendor's camera app ships (byte-identical, *read*). Nothing in it is keyed on the calling
+  package (*read*: no package/app id in the license path).
+- F6's comment was written during the move off SDK 0.7.28 (June 2026). Since then, the
+  0.10.x service core loads its face detector from the **tracking-service package**. On this
+  device at 0.10.85 that detector is a TFLite face model, not blink, and the core reports
+  `licenseRequired=0` (*measured*).
+- The probe ran the in-app runtime in a non-Activity service process of a third-party,
+  debug-signed package and got no license error (*measured*).
+
+So the earlier failure was the old SDK and its detector, not the package, the process type, or the
+API. Why exactly 0.7.28 rejected this device was not re-tested (*inferred*: the old SDK, before
+the per-model license switch arrived in 0.8.1, or a since-replaced detector). **Action:** remove
+the "Invalid Device" rationale from `leia_cnsdk.cpp` when A3 touches it. The in-service default
+stays right for normal weaving.
+
+Also from the vendor SDK source (*read*): the in-app engine takes its camera intrinsics from the
+sink (`on_intrinsics_change`), not from the v3 config (whose intrinsics are zero). So the owner
+**must** push intrinsics derived from the factory block. The probe pushed the 640×480 values
+the tracking service itself uses.
+
+### 11.4 Still open after A0
+
+- **(1b) faces from in-app tracking on eye-derived 640×480 crops**: needs a person in front of the
+  tablet for one 60 s run. It is the last A0b gate. If the cropped field of view or the
+  decimation hurts detection, alternative 2 above (PRIVATE eyes + a full-array YUV tracking
+  stream) is the fallback.
+- **Pose continuity** in-app vs in-service (§1.3 row 3): not measured (needs a face).
+- **Live core switch without re-creating the interlacer** (§1.3 row 2): the probe's core had no
+  interlacer. A3 must test it with a weaving core.
+- **NP02J**: not attached today. Repeat A0a (factory block present? same layout?) and the
+  combination check there before A3.
+- **Rear pair**: topology and calibration read, never opened today. F3 (no conflict with tracking)
+  is still NP02J-only evidence.
+
+---
+
+## 12. A1 plan — rear pair end to end (no code yet)
+
+Scope as in §7: rear pair → plug-in Camera2 source → runtime service rectifier → ring → a minimal
+`CAMERA_CONSUMER` test client. The OpenXR surface and the plug-in ABI do not change (§6).
+
+### 12.1 Plug-in (`displayxr-leia-plugin`, Android arm only)
+
+| File | Change |
+|---|---|
+| `src/drv_leia_android/leia_stereo_camera_android.{h,cpp}` **(new)** | NDK Camera2 source. `ACameraManager_openCamera` on the **logical** rear id. Two `ACaptureSessionOutput`s with `ACameraOutputTarget` on physical ids, `AImageReader` 1280×720 `AIMAGE_FORMAT_YUV_420_888`, maxImages 4. TEMPLATE_PREVIEW, AE `[30,30]`. Pairing by **equal sensor timestamp** (measured equal on LP2). Pack the two Y/UV planes into one SBS NV12 buffer (one copy; `xrt_plugin_stereo_camera_frame`). `wait_frame` blocks on a condvar with the timeout; `release_frame` recycles the buffer. Camera thread → pack only; nothing else on it. **No third stream** (the measured HAL abort, §11.1) |
+| `src/drv_leia_android/leia_camera_calib_android.{h,c}` **(new)** + host test | Read and parse the OEM factory calibration block from `ACameraMetadata` (vendor tag lookup by name through `ACameraMetadata_getAllTags` + the vendor-tag section). Convert it to `xrt_plugin_stereo_camera_calibration` at the 1280×720 crop (rescale **and** crop by the stream's `SCALER_CROP_REGION`), `RADTAN8`, `rotation_right_from_left` / `translation_right_from_left_mm` in the spec's convention, auto-swapping halves on the sign of T.x like the Windows plug-in. Pure parse/convert half host-tested, like `leia_stereo_camera_parse.c` (test vectors captured from this device's dump, kept in the plug-in repo). No block → `XRT_ERROR_FEATURE_NOT_SUPPORTED` → RAW only |
+| `src/drv_leia_android/leia_plugin_android.c` | Fill the stereo-camera slots under `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA`. `enumerate` returns the rear pair only in A1 (no `USER_FACING`), `device_identity` = a hash of the factory block's fuse/serial (*vendor detail stays in the plug-in*), `max_frame_rate` 0 until measured, `monitor_id` = the built-in display. The front pair is **not** enumerated until A3 |
+| `src/drv_leia_android/CMakeLists.txt` | Add the sources. Link `camera2ndk` + `mediandk` (both already in the system image; the vendor core links them too) |
+| `docs/` (plug-in repo) | The factory-block layout and the lens ↔ id map (main = 0 rear / 1 front), cited from §11 here |
+
+Logical/physical ids: hard-coded for Lume Pad 2 / NP02J in A1 (same on both). Discover them from
+the characteristics (`LOGICAL_MULTI_CAMERA` + facing) and use the hard-coded ids only as a
+fallback, as the vendor's camera library does. The vendor SDK publishes no id (§8.2 Q8 still open).
+
+### 12.2 Runtime (`displayxr-runtime`)
+
+| File | Change |
+|---|---|
+| `src/xrt/ipc/server/ipc_server_stereo_camera.c` | Android: the POSIX wake pipe and memfd paths already compile off Windows. Verify them in the satellite (`:dxrN`) process. Rectify with the row-split `u_stereo_rectify_lut_apply_rows` on two threads (§3.2); budget ≤ 8 ms/frame |
+| `src/xrt/auxiliary/util/u_stereo_rectify.c` | Nothing expected: RADTAN8 exists. Add a host test with the LP2 rear block's numbers converted (lives in `tests/tests_stereo_camera.cpp`), so a conversion regression shows up off-device |
+| `src/xrt/ipc/android/src/main/AndroidManifest.xml` | `<uses-permission android:name="android.permission.CAMERA"/>` on the runtime package. **No** `foregroundServiceType="camera"` (§4.3). The runtime asks for `CAMERA` from its own Activity once; until granted, cameras enumerate `UNAVAILABLE` |
+| `src/xrt/targets/openxr_android/...` (the runtime's settings Activity) | A "Grant camera" control for that permission (minimal; full privacy UI is A2) |
+| `docs/specs/extensions/XR_DXR_stereo_camera.md` | §3/§5 orientation rule from §11.1 (baseline-horizontal, not natural orientation) |
+| A2 dependency | Until A2, the Android consent environment must at least refuse an empty-exe peer (it does, spec §7.1 step 3), so A1 testing uses the dev override property on a debuggable runtime build only |
+
+### 12.3 Test client
+
+`test_apps/camera/camera_probe_android` **(new)**: a NativeActivity `CAMERA_CONSUMER` that runs
+`displayxr-cli camera probe`'s logic on Android. It enumerates, opens the rear camera, logs
+fps / rectified row residual / disparity sign / `captureTime` deltas for N seconds, and writes one
+SBS frame to app storage for eyeballing. Built by the existing Android test-app lane.
+
+### 12.4 Gate (unchanged from §7, plus what A0 added)
+
+Rear: residual median ≤ 0.5 px, edge columns ≤ 1 px. Positive disparity on a near object. 30 fps
+source. ≤ 8 ms rectify. A running 3D app's tracking and weave unaffected. **Plus:** the
+configured session has exactly two outputs (no HAL abort class), and the baseline the camera
+reports is 30 mm on Lume Pad 2.
+
+### 12.5 What blocks A1
+
+Nothing from A0: the rear pair needs no tracking hand-over, and the calibration exists. Two
+things to settle in A1 itself: the stream `SCALER_CROP_REGION` (for the crop-aware rescale), and
+a runtime `CAMERA` permission flow on a retail build.
+
+### 12.6 Answers to the browser's runtime asks (B2a, browser-pvt#306)
+
+From runtime `origin/main` (02d65628c) unless marked. **Decision** = for the project owner.
+
+| # | Ask | Answer |
+|---|---|---|
+| 1 | Frame contract: upright in natural orientation, never mirrored, baseline horizontal there | **Never mirrored, left eye left: yes (spec, unchanged).** "Natural orientation" is **wrong on Lume Pad 2**, which is portrait-natural (§11.1). Contract: frames are upright in the orientation where the **baseline is horizontal** (landscape on both tablets). The browser device does the 180° and portrait→mono policy (§5). Spec text change in A1 (§12.2) |
+| 2 | NV12 range | **Camera2 delivers full-range BT.601**: the HAL configures the YUV streams with `HAL_DATASPACE_V0_JFIF` (*measured*, camera HAL log). The runtime's NV12→RGB leg assumes **limited** range (`u_stereo_camera.h:172`, the 298/409/516 coefficients in `u_stereo_camera.c`). The sim's GRAY8→NV12 copies grey 0–255 verbatim into Y with neutral 128 chroma (`u_stereo_camera.c`, "copied verbatim"): full-range values in a buffer the runtime itself would read as limited. **Proposal:** the frame contract says full-range BT.601 (JFIF) on Android. The browser tags the `VideoFrame` full-range. The runtime's own NV12→RGB leg is fixed to match, or the spec gains a range field. **Decision** (spec field vs fixed contract) |
+| 3 | A second, camera-only connection from the browser process, landing in the same satellite, without tearing anything down on close | **Nothing in the runtime refuses it.** (a) The broker reuses the satellite for the same package and keys each claim on a per-`Client` token (`SlotBroker.kt:74-77` reuse, `:97-110` token set; `Client.java:114` one `slotToken` per `Client`). It frees the slot only when the last token goes (`SlotBroker.kt:150-160`), so closing the camera connection does not release the weave's claim. (b) The server admits any number of connections per process. `CAMERA_CONSUMER` is not counted against the `PRESENT_OWNER` quota (`ipc_server_handler.c:341-349`), and its class is accepted unverified because it can do nothing but camera calls (`:279-284`, session create refused at `:2719-2723`). (c) No "one connection per process" rule exists in `ipc/client` or `ipc/android`, and no `-2` return in either. The `-2` in `android-pitfalls.md` item 4 is most likely `XR_ERROR_RUNTIME_FAILURE` (-2) from an `xrCreateInstance` whose connect failed, not a policy. **Not run on a device**: B2a should prove it once (weave live, open + close the camera connection, weave continues) |
+| 4 | Sim fake on a vendor-plug-in runtime | Today the stream manager has exactly two source kinds: the active DP's plug-in slots and the service's own UVC source (`ipc_server_stereo_camera.c:95-101`, `:398`, `src_open` `:985`). A third service-owned **sim** source behind a property is the right shape. But the pattern generator lives in `drivers/sim_display/`, which the service must not link (ADR-019 / ADR-054 §1: no `drv_sim_*` identifiers in the service, CI-asserted on Windows). So: move `sim_display_stereo_camera_pattern.c` to `auxiliary/util/` and add `XRT_STEREO_CAMERA_SOURCE_SIM`. Property: `debug.xrt.DXR_STEREO_CAMERA_SIM=1`. Android maps every `debug_get_*("NAME")` to the system property `debug.xrt.NAME` (`u_debug.c:43`), so any `DXR_*` knob is set as `adb shell setprop debug.xrt.DXR_… 1` in the **runtime's** process. **Decision** (the source move) |
+| 5 | A2 consent keyed on the camera connection's own uid; browser on the built-in delegating list; honour the decline bit | **Agree** (§4.1/§4.2 already propose it). Caveat: an fd-adopted connection's `SO_PEERCRED` is the fd's **creator**, not the adopter (`ipc_client_connection.c:95-98`), so the consent subject is whichever process created the socket pair. If the browser process creates it, that is the browser's app uid either way |
+| 6 | Option R's "live weave" check per package, not per connection | **Agree.** The satellite is per package (F9), and the camera connection carries no session by contract |
+| 7 | `XR_KHR_convert_timespec_time` on camera-consumer instances | **Already advertised on Android** to every instance: `XR_USE_TIMESPEC` is defined unconditionally (`xrt_openxr_includes.h:16`) and the extension is gated only on non-Win32 (`oxr_extension_support.h:137`). It is not per client class. **But see the clock trap below** |
+| 8 | `platformDeviceHint` empty on Android | **Agree, "".** Its job is cross-source de-duplication against a platform device. The logical ids are hidden from Chromium (F1), so there is nothing to match |
+| 9 | OS takes the camera (background, sensor-privacy toggle): pause or end? | **Pause: `SUSPENDED`, the stream stays started.** The spec defines SUSPENDED as "temporarily no frames: … privacy lock, session locked" (`XR_DXR_stereo_camera.h:162-163`), and §4.3 maps the OS disconnect to it. **Eviction by another app's higher-priority client** is different. It ends the stream with `SOURCE_BUSY` (`:415-418`), because nothing guarantees it comes back. **Decision** only if the owner prefers ending on background |
+
+**Clock trap (new, measured).** Both tablets' cameras report timestamp source `REALTIME`, which
+is `elapsedRealtimeNanos` = **`CLOCK_BOOTTIME`**, not `CLOCK_MONOTONIC`. §2.1's "captureTime is
+CLOCK_MONOTONIC, the domain of `base::TimeTicks`" is therefore true only after conversion. The
+plug-in must convert BOOTTIME → MONOTONIC (the offset only grows across suspend, so sample it per
+open) before filling `time_ns`, or `captureTimeIsExposure` timestamps drift by the device's total
+suspend time.
+
+### 12.7 Proposed spec change and open decisions (from the B2a revision)
+
+**R1: frame orientation (proposed spec v7, NOT implemented in A0/A1 docs-only phase).** Add
+`XrStereoCameraOrientationDXR { XrStructureType type; const void* next; uint32_t
+frameOrientationDegrees; }`, chained on `XrStereoCameraPropertiesDXR::next`. The value is the
+clockwise rotation (0/90/180/270) that makes the **published** SBS frame upright in the device's
+**natural** orientation: Camera2 `SENSOR_ORIENTATION` composed with any rotation the runtime or
+plug-in already applied. The runtime publishes frames unrotated in the sensor's landscape (§11.1),
+so on Android the value is the sensor orientation. It changes nothing about the pixels. It tells
+the consumer how to turn them, and when a 90/270 turn would make the baseline vertical (portrait →
+mono, §5).
+
+Checked against the browser's interim rule (landscape-natural → 0; portrait-natural → 270 front /
+90 rear), using what A0a measured on Lume Pad 2 (portrait-natural, panel 1600×2560):
+
+| Pair | Camera2 ids | `SENSOR_ORIENTATION` (measured) | Rule says | Match |
+|---|---|---|---|---|
+| Front | 5 (logical), 1 and 3 (physical) | **270** on all three | 270 | yes |
+| Rear | 4 (logical), 0 and 2 (physical) | **90** on all three | 90 | yes |
+
+Camera2 defines `SENSOR_ORIENTATION` as the clockwise rotation that makes the output upright in
+the native orientation, for front and back cameras alike, so the measured values are R1's values
+as long as the runtime publishes unrotated frames. NP02J (landscape-natural) should read 0. Its
+sensor orientation was not re-measured in A0, so confirm it there. Where the field is filled:
+the plug-in fills a new `xrt_plugin_stereo_camera_info` field (appended, `struct_size`-gated,
+announced by a new `XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_*` macro), and the service copies it into
+the chained struct. **Decision:** adopt R1 as spec v7 at A1/B2a time.
+
+**Open decisions for the owner:**
+
+- **R2, colour range.** A spec colour-range field per camera, or a fixed contract that Android
+  frames are full-range BT.601 (JFIF, as the HAL configures them, §12.6 #2). **Either way (A1
+  item):** `u_stereo_camera.c`'s NV12→RGB leg (today limited-range coefficients) must handle full
+  range, and the sim's GRAY8→NV12 output must be labelled consistently.
+- **R3, a SIM camera source in the service.** Move the pattern generator from
+  `drivers/sim_display/` to `auxiliary/util/` and add `XRT_STEREO_CAMERA_SOURCE_SIM` behind
+  `debug.xrt.DXR_STEREO_CAMERA_SIM`, so a vendor-plug-in runtime can serve a fake camera
+  (§12.6 #4).
+
+---
+
+## 13. A2 as built (runtime PR #2479)
+
+What changed against §4, by David's decisions of 2026-10-31. Normative text: spec §7.1.2 / §7.2 / §7.3.
+
+| Topic | §4 said | A2 does |
+|---|---|---|
+| Identity | (package, cert SHA-256) of the `SO_PEERCRED` uid | As proposed: subject `android:<package>@<current cert sha256>`. A shared-uid set is named by its shared-user name. Several signers → refused. The policy is unchanged and keyed on the subject |
+| Trusted list | built into the APK, package + digest | As proposed. v1 = `org.chromium.chrome` + `d52153793c7a403f3cd733032ed43314f26a7748f6d5c0a2b5e12847ff0df5b2` (the DisplayXR Browser release cert). **New:** a listed package signed by anyone else is *refused* (not prompted), so a rebuild cannot pass for the release; the dev override still admits it (CI test browsers are debug-signed). Key rotation keeps trust via `hasSigningCertificate` |
+| Prompt (row 8) | deferred | **Built** (see the row above) |
+| Front camera (§1.2) | refuse without a live weave in the owning satellite | `BUSY` unless the same uid has a weave submit in the last 1 s, or a visible session, in the same runtime process. A started front stream pauses and is told `SUSPENDED` while that stops. The dev override lifts it |
+| Foreground (§4.3) | OS gate, disconnect → `SUSPENDED` | **§4.3's inference is wrong on Lume Pad 2 (measured).** With the client in the background the camera service did not disconnect the satellite, and a reopen streamed at 30 fps for 44 s. So the runtime keeps its own rule: while a stream is started, the satellite polls its own importance (`BOUND_TOP` = client is the top app), and background or screen off/keyguard suspends its streams (`SUSPENDED`). An OS disconnect (where enforced, or sensor privacy) also stays `SUSPENDED` with the streams kept. Still no camera-type FGS |
+| Indicator / Stop | notification with Stop | As proposed: ongoing "3D camera in use — Used by <label>", Stop → `USER_STOPPED` |
+| Store | private-storage JSON | `<filesDir>/displayxr/camera_consent.json` (POSIX store format), shared by the satellites and the Dashboard. The JSON delegating list is ignored on Android |
