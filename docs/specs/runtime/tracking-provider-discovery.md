@@ -108,7 +108,8 @@ The primary screen's viewer source is decided at system creation and is **static
 a provider enabled, disabled or preferred later takes effect at the next app launch (the same rule
 as `dp set`) — in the service, at the next service start (§4a). Other screens follow the display
 topology (§4b). The chosen provider is started on the first viewer request and stopped at system
-teardown.
+teardown — or, when the service hosts it out of process, when nobody has asked for a viewer for
+about 15 s (§4a idle stop), and started again on the next request.
 
 ## 4. Arbitration (trunk policy)
 
@@ -176,7 +177,7 @@ will deliver it.
 **Lifetime in the service.** The decision is made when the service creates its system and is
 static for that service run (the scan is one-shot per process; the advertisement every client
 reads is static per instance). The provider starts on the first IPC locate that needs it and stops
-at system teardown. The service subscribes the tracking class to its policy watch only to say,
+at system teardown, or earlier at the §4a idle stop (out-of-process hosting). The service subscribes the tracking class to its policy watch only to say,
 once, that a registration / preference change applies at the next service start.
 
 Not covered by the service splice yet: a workspace tile framed from **another presenter's** screen
@@ -251,13 +252,21 @@ macOS `~/Library/Logs/DisplayXR/DisplayXR_tracking-host.log`; Linux
 **Supervision** (`targets/common/target_viewer_host.c`; the pure state machine is pinned by
 `tests/tests_viewer_pose_page.cpp`). The service spawns the host **on demand** — the first viewer
 request of an IPC client, or a reader's `demand_ns` on the page — never at load (the camera opens
-only when somebody needs a viewer), and keeps it until system teardown. One supervisor thread,
+only when somebody needs a viewer). Demand is renewed, not latched: the service re-asserts its own
+at most once a second while it asks for viewers, and a reader's `demand_ns` counts while it is
+younger than 5 s. **Idle stop:** once neither has been fresh for 10 s (about 15 s after the last
+viewer request — the last app closed, an in-process app stopped asking) the host is stopped in
+order, so a webcam provider frees the camera; the next demand spawns it again (owner state
+`idle` meanwhile). Time the machine spent asleep counts neither as idle time nor as heartbeat
+silence. One supervisor thread,
 one 100 ms tick: reap, the producer's hello (its pid + generation in the producer block), a
-heartbeat watchdog (3 s silent → killed, counted as a crash). Restart after an abnormal exit with a
+heartbeat watchdog (3 s silent → killed, counted as a crash; after a suspend the host first gets
+3 s to beat). Restart after an abnormal exit with a
 backoff of 0.5 s doubling to 30 s (reset after 60 s running); 5 abnormal exits within 2 min →
 FAILED, retried after 10 min; exit 10 / 2 / 13 → FAILED at once (a respawn would say the same).
-One WARN per spawn, exit and restart — never per frame. Orderly stop: the stop byte, 3 s grace,
-then terminate.
+One WARN per spawn, exit, restart and idle stop — never per frame. Orderly stop (idle stop and
+teardown): the stop byte, 3 s grace, then terminate; an idle stop that had to be killed is not a
+crash.
 
 **Fallbacks.** No host binary beside the service (`DXR_TRACKING_HOST_EXE` names another, `none`
 forces this) → the provider runs **in the service** and its sink still writes the page, so
