@@ -845,6 +845,9 @@ struct xrt_plugin_host_iface
 #define XRT_PLUGIN_STEREO_CAMERA_CALIBRATED (1u << 2)
 #define XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED (1u << 3)
 #define XRT_PLUGIN_STEREO_CAMERA_MONOCHROME (1u << 4)
+//! Service-set (spec v7): a RECTIFIED stream delivers rectified frames. A
+//! plug-in never sets it; the service clears it and derives it per camera.
+#define XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE (1u << 5)
 
 //! Pixel formats a plug-in delivers (values equal XrStereoCameraFormatDXR).
 enum xrt_plugin_stereo_camera_format

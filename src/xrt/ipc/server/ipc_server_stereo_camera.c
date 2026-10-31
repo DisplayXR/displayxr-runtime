@@ -2908,7 +2908,9 @@ ipc_handle_stereo_camera_get_properties(volatile struct ipc_client_state *ics,
 	snprintf(out_props->display_name, sizeof(out_props->display_name), "%s", cam->info.display_name);
 	snprintf(out_props->platform_device_hint, sizeof(out_props->platform_device_hint), "%s",
 	         cam->info.platform_device_hint);
-	out_props->flags = cam->info.flags;
+	// Spec v7: RECTIFIABLE is the service's promise, never the plug-in's claim.
+	out_props->flags = (cam->info.flags & ~XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE) |
+	                   (camera_can_rectify(cam) ? XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE : 0u);
 	out_props->state = effective_state_locked(m, cam);
 	out_props->view_count = 2;
 	out_props->eye_width = cam->info.eye_width;

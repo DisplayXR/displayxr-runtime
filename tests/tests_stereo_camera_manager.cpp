@@ -98,6 +98,9 @@ TEST_CASE("manager + UVC fake: enumerate and calibration", "[stereo_camera_manag
 	CHECK(std::string(p.display_name) == "Test SBS webcam");
 	CHECK((p.flags & XRT_PLUGIN_STEREO_CAMERA_CALIBRATED) == 0);
 	CHECK((p.flags & XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED) == 0);
+	// Spec v7: not CALIBRATED, yet the service rectifies the nominal model, so a
+	// RECTIFIED stream delivers rectified frames and the camera says so up front.
+	CHECK((p.flags & XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE) != 0);
 	CHECK(p.eye_width == 640);
 	CHECK(p.eye_height == 480);
 	CHECK(p.view_count == 2);
