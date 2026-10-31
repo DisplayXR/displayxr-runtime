@@ -228,6 +228,44 @@ displayxr-cli camera probe --decline-delegation          # as a browser in autom
 ```
 
 `DXR_STEREO_CAMERA_DEV_ALLOW=1` on the service skips consent for everything (loud WARN) — use
-it on a dev box when you are iterating on frames, not on the consent path. The full env-var
+it on a dev box when you are iterating on frames, not on the consent path. On Android it does
+**not** lift the front-camera rule below. The full env-var
 census is in
 [`docs/roadmap/control-panel-performance-settings.md`](../roadmap/control-panel-performance-settings.md).
+
+## 7. Android
+
+The rules are the same; the mechanics differ. The normative table is spec §7.1.2.
+
+- **Who you are** is your package plus the SHA-256 of your APK signing certificate. That comes from
+  your connection's uid, never from anything you send. Debug and release builds are therefore
+  different apps to the consent store.
+- **You need `CAMERA` yourself.** Declare it and request it like any camera app; without it a start
+  returns `XR_ERROR_PERMISSION_INSUFFICIENT`. The runtime also needs `CAMERA`, because it opens the
+  camera on your behalf. It asks the user once, at your first allowed start.
+- **First start:** the runtime shows *"Allow <your app> to use the 3D camera?"* naming your app
+  label and package. The start call blocks until the user answers, for up to 60 s. Allow and Don't
+  allow are remembered; Only this time lasts while your process runs, or until the user presses Stop. Only the DisplayXR
+  Browser's release build (`org.chromium.chrome` with its release certificate) skips the dialog,
+  because its per-origin prompt is the consent. Any other build under that package name is
+  **refused** outright, so use `debug.xrt.DXR_STEREO_CAMERA_DEV_ALLOW=1` to develop a browser.
+- **The front camera** starts only while your app presents woven 3D in the runtime (a live
+  `XR_DXR_weave` submit, or a visible session). Otherwise the start returns
+  `XR_ERROR_STEREO_CAMERA_BUSY_DXR`. This holds under `DXR_STEREO_CAMERA_DEV_ALLOW` too, so a camera
+  probe with no weave running gets `BUSY` on the front pair; test it on a rear camera, or from an
+  app that weaves. Rear cameras have no such rule.
+- **Background and lock:** when your app leaves the foreground, or the screen locks, the runtime
+  pauses the stream (it does not rely on the OS for this). Either way the camera reads `SUSPENDED`, your stream
+  stays started, and frames resume when you come back. Do not end your track on `SUSPENDED`.
+- **The user's controls:** the notification *"3D camera in use"* has a **Stop** action, which ends
+  your stream with `USER_STOPPED`. The DisplayXR app's **3D camera** card lists stored decisions;
+  a tap forgets one. Over adb:
+
+```sh
+RT=org.freedesktop.monado.openxr_runtime.out_of_process   # your runtime package
+adb shell am broadcast -a org.displayxr.stereo_camera.CONSENT --es op list \
+    -n $RT/org.freedesktop.monado.ipc.StereoCameraConsentStore\$Receiver
+adb shell am broadcast -a org.displayxr.stereo_camera.CONSENT --es op revoke --es package com.example.app \
+    -n $RT/org.freedesktop.monado.ipc.StereoCameraConsentStore\$Receiver
+adb shell setprop debug.xrt.DXR_STEREO_CAMERA 0            # kill switch (runtime processes started after it)
+```

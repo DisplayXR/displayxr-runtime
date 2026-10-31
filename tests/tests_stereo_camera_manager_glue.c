@@ -245,7 +245,10 @@ scm_fake_plugin_enumerate_calls(void)
 }
 
 static struct scm_fixture *
-create_with(const struct u_stereo_uvc_config *cfg, struct xrt_instance *xinst, int32_t rescan_period_ms)
+create_with(const struct u_stereo_uvc_config *cfg,
+            struct xrt_instance *xinst,
+            int32_t rescan_period_ms,
+            int32_t dev_override)
 {
 	struct scm_fixture *f = (struct scm_fixture *)calloc(1, sizeof(*f));
 	if (f == NULL) {
@@ -260,6 +263,7 @@ create_with(const struct u_stereo_uvc_config *cfg, struct xrt_instance *xinst, i
 	o.consent_env = &k_env;
 	o.uvc_config = &f->cfg; // an empty config (count 0) = no UVC camera
 	o.rescan_period_ms = rescan_period_ms;
+	o.dev_override = dev_override;
 	f->mgr = ipc_server_stereo_camera_create_ex(xinst, &o);
 	f->server.stereo_camera = f->mgr;
 	f->ics.server = &f->server;
@@ -277,11 +281,17 @@ create_with(const struct u_stereo_uvc_config *cfg, struct xrt_instance *xinst, i
 struct scm_fixture *
 scm_create(const struct u_stereo_uvc_config *cfg)
 {
-	return create_with(cfg, NULL, 0);
+	return create_with(cfg, NULL, 0, 0);
 }
 
 struct scm_fixture *
 scm_create_fake_plugin(void)
+{
+	return scm_create_fake_plugin_ex(0);
+}
+
+struct scm_fixture *
+scm_create_fake_plugin_ex(int32_t dev_override)
 {
 	memset(&g_fake_iface, 0, sizeof(g_fake_iface));
 	g_fake_iface.struct_size = (uint32_t)sizeof(g_fake_iface);
@@ -293,7 +303,7 @@ scm_create_fake_plugin(void)
 	g_fake_iface.stereo_camera_close = fake_close;
 	memset(&g_fake_xinst, 0, sizeof(g_fake_xinst));
 	g_fake_xinst.get_active_plugin = fake_get_active_plugin;
-	return create_with(NULL, &g_fake_xinst, -1); // the test drives every rescan
+	return create_with(NULL, &g_fake_xinst, -1, dev_override); // the test drives every rescan
 }
 
 static struct
@@ -331,7 +341,7 @@ scm_create_claiming_plugin(const struct u_stereo_uvc_config *cfg)
 	g_fake_iface.get_claimed_cameras = fake_get_claimed_cameras; // no camera slots at all
 	memset(&g_fake_xinst, 0, sizeof(g_fake_xinst));
 	g_fake_xinst.get_active_plugin = fake_get_active_plugin;
-	return create_with(cfg, &g_fake_xinst, -1);
+	return create_with(cfg, &g_fake_xinst, -1, 0);
 }
 
 bool
@@ -477,4 +487,28 @@ scm_stream_destroy(struct scm_fixture *f, uint64_t id)
 {
 	unmap(f);
 	return ipc_handle_stereo_camera_stream_destroy(&f->ics, id);
+}
+
+void
+scm_set_front_rule(bool enabled)
+{
+	if (!enabled) {
+		ipc_server_stereo_camera_set_platform(NULL);
+		return;
+	}
+	struct ipc_server_stereo_camera_platform p;
+	memset(&p, 0, sizeof(p));
+	p.user_facing_requires_presenting = true;
+	ipc_server_stereo_camera_set_platform(&p);
+}
+
+void
+scm_set_live_weave(struct scm_fixture *f, bool live)
+{
+	// The front rule scans the server's connection table for the peer's uid:
+	// one other connection of the same app that submits weaves.
+	volatile struct ipc_client_state *o = &f->server.threads[0].ics;
+	o->server_thread_index = 0;
+	o->peer_uid = f->ics.peer_uid;
+	o->last_weave_ns = live ? (int64_t)os_monotonic_get_ns() : 0;
 }

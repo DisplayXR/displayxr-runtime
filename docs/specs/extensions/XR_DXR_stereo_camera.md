@@ -488,8 +488,40 @@ trusted, is an ordinary window-bearing app there too.
 A refused stream stays created and may be started again (e.g. after `displayxr-cli camera allow`).
 The policy is pure (two injected vtables) and unit-tested with fakes in `tests_camera_consent`.
 
-**Android** (A1, not built): CAMERA permission of the peer uid + the runtime app's consent
-activity per package; `android_package_is_visible` for §7.2.
+#### 7.1.2 Android (A2, as built)
+
+On Android the runtime **is** the OS-visible camera client: a display plug-in that sources the
+device's own pair opens it with Camera2 inside the runtime satellite that serves the consumer
+(stereo-camera-android §1.2, option R; design in draft PR [#1834](https://github.com/DisplayXR/displayxr-runtime/pull/1834)). Every app's
+executable is the zygote's `app_process`, so the identity is not a path. It is a **subject**
+derived from the connection's `SO_PEERCRED` uid by the runtime's Java side
+(`StereoCameraConsent.peerIdentity`): `android:<package>@<SHA-256 of the current APK signing
+certificate>` (`util/u_camera_consent_android.h`). A shared-uid set is named by its shared-user
+name. The policy itself is unchanged and keyed on the subject. Stored decisions, "Allow once"
+and `persistentId` (§7.5) therefore follow package **and** certificate: a reinstall signed by
+someone else inherits nothing.
+
+| # | Android |
+|---|---|
+| 1 | `debug.xrt.DXR_STEREO_CAMERA=0` (the kill switch, read in the runtime's process) or the sharing toggle in the store |
+| 2 | `debug.xrt.DXR_STEREO_CAMERA_DEV_ALLOW=1`: developer override, logged loudly at service start and once per run at first use. It also admits an unverifiable peer (row 3), so a debug-signed build of a trusted package works. It does **not** lift the front-camera rule (§7.2): a `USER_FACING` camera still needs a live weave. Never on a user's device |
+| 3 | No single valid package for the uid, no readable signing certificate, several signers, or **a package on the built-in trusted list signed with a different certificate** (a rebuild cannot pass for the listed client). All of these are refused with `CONSENT_REFUSED`, without a prompt |
+| 4 | The peer package must hold `CAMERA` (`PackageManager.checkPermission`), and its camera app-op must be `MODE_ALLOWED` or `MODE_FOREGROUND` ("only while using the app" is enough). Otherwise `XR_ERROR_PERMISSION_INSUFFICIENT`. This applies to the trusted browser too |
+| 5, 7 | Stored decisions in `<files dir>/displayxr/camera_consent.json` (app-private, the POSIX store format) |
+| 6 | **The built-in trusted list** (`u_camera_consent_android_builtin_trusted`): entries are package **and** certificate digest, compiled into the runtime. Any delegating list in the JSON store is ignored on Android. v1 list: `org.chromium.chrome` signed with the DisplayXR Browser release certificate, SHA-256 `d52153793c7a403f3cd733032ed43314f26a7748f6d5c0a2b5e12847ff0df5b2` (`CN=DisplayXR Browser, O=DisplayXR, C=US`). Its own per-origin prompt is the consent. The decline bit (§2a) is honoured |
+| 9 | A runtime-owned dialog (`CameraConsentActivity`, not exported). It names the app label **and** package, and offers **Allow / Only this time / Don't allow**. If a background activity start is blocked, a heads-up notification opens it on tap. Dismissing it, or 60 s without an answer, refuses this time and stores nothing |
+| after 9 | The runtime package must hold `CAMERA` itself. If it does not, the first allowed start shows Android's permission request from the same activity (or the DisplayXR app's **3D camera** card). If the user refuses, the start returns `XR_ERROR_PERMISSION_INSUFFICIENT` |
+
+**Revoking.** The DisplayXR app's **3D camera** card lists every stored decision; a tap forgets
+it, and the app is asked again next time. adb, guarded by `android.permission.DUMP` (the shell
+holds it, no third-party app can):
+
+```
+adb shell am broadcast -a org.displayxr.stereo_camera.CONSENT --es op list \
+    -n <runtime package>/org.freedesktop.monado.ipc.StereoCameraConsentStore\$Receiver
+... --es op revoke --es package com.example.app     # every certificate of that package
+... --es op revoke-all
+```
 
 ### 7.2 Foreground rule
 
@@ -504,10 +536,28 @@ frame with a 250 ms cache:
 - **Delegating clients** follow their own visibility rule (a capturing tab keeps its indicator;
   closing it stops the track) — only when the stream's start was allowed by delegation (§7.1.1). **`CAMERA_CONSUMER` and `DIAG`** have no window by contract and
   are exempt — they were granted explicit consent instead.
+- **Android:** the runtime keeps its own foreground rule. Do not rely on the OS: on a retail
+  Android 12 tablet the camera service did not take the camera from the satellite when its client
+  went to the background, and a reopen in the background streamed at full rate (measured). While a
+  stream is started, the satellite polls its own process importance. A satellite serves one
+  package, bound with `BIND_IMPORTANT | BIND_ABOVE_CLIENT`, so it is `IMPORTANCE_FOREGROUND`
+  (`BOUND_TOP`) exactly while that package is the top app. Anything lower suspends every stream in
+  that satellite (`SUSPENDED`, no frames), and they resume on return. The satellite still has
+  **no** `foregroundServiceType="camera"`. A source that had delivered and then lost its device to
+  the OS (where the OS does enforce while-in-use, or sensor privacy) is also reported `SUSPENDED`,
+  not `UNAVAILABLE`, while the service retries, and its started streams are kept.
+  **Front camera (option R):** a `USER_FACING` camera
+  starts only for a consumer whose uid presents woven 3D in the same runtime process (a weave
+  submit within the last second, or a visible session). Otherwise the start returns
+  `XR_ERROR_STEREO_CAMERA_BUSY_DXR`. A started front stream gets no frames, and its connection is
+  told `SUSPENDED`, while that stops being true. While the front pair is open it is also what keeps
+  the display tracking the viewer, so an app in the background can never take it. The rule holds
+  under the developer override too (§7.1.2 row 2). Rear cameras have no such rule.
 - **Session lock:** every stream is suspended while the OS session is locked or switched away
   (Windows `WM_WTSSESSION_CHANGE` lock / console or remote disconnect, plus `SM_REMOTESESSION` at
-  start; macOS `com.apple.screenIsLocked` and `NSWorkspaceSessionDidResignActive`), and resumes on
-  unlock. Enumerated and event-reported state is `SUSPENDED` meanwhile (§7.6).
+  start; macOS `com.apple.screenIsLocked` and `NSWorkspaceSessionDidResignActive`; Android
+  `ACTION_SCREEN_OFF`, then `ACTION_USER_PRESENT`, or `ACTION_SCREEN_ON` with no keyguard), and
+  resumes on unlock. Enumerated and event-reported state is `SUSPENDED` meanwhile (§7.6).
 
 ### 7.3 Indicator
 
@@ -515,7 +565,10 @@ While any stream is started, the service shows an in-use indicator: Windows tray
 dot, tooltip and menu line *"3D camera in use by <app>"* (executable base names), one balloon on
 the transition; macOS menu-bar icon with a red dot, tooltip and menu line. The indicator is owned
 by the runtime because the camera LED, if any, is lit by tracking and says nothing about who is
-receiving frames.
+receiving frames. Android: an ongoing notification *"3D camera in use — Used by <app label>"* with
+a **Stop** action (= §7.4 "Stop camera sharing"), posted by the runtime process that serves the
+stream. The status-bar privacy dot names the runtime, not the consumer, so the notification is
+the only place the user sees who receives the frames.
 
 ### 7.4 Kill switches
 
@@ -947,6 +1000,7 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
+| 6 (A2, Android) | No API change. The Android rows of §7: the consent identity is the peer uid's package + signing-certificate digest, the trusted list is built into the runtime, and the consent dialog, the in-use notification with Stop, the lock watch, and "the OS took the camera" = `SUSPENDED` are runtime-owned. A front camera needs a live weave from the same app (`BUSY` otherwise), with or without the developer override |
 | 6 | `XR_STEREO_CAMERA_STREAM_END_REASON_SOURCE_BUSY_DXR` = 4 (appended, nothing renumbered). A started stream whose source cannot start — the device is held by another process, errors on its first read (Media Foundation's shape for a busy UVC device), or (UVC source) delivers nothing within 5 s of opening — ends with this reason and the camera reads `UNAVAILABLE` until the service's retry succeeds; a new start meanwhile is `XR_ERROR_STEREO_CAMERA_BUSY_DXR` (a browser maps both to `NotReadableError`). Before this the stream stayed started at 0 fps with no error (runtime #2221). A source that stops after it delivered is unchanged (its streams wait through the retry). |
 | 5 | `XrStereoCameraDisplayDXR` (`XR_TYPE_STEREO_CAMERA_DISPLAY_DXR` = 1004999317), chained on `XrStereoCameraPropertiesDXR::next`: the `XrDisplayDXR::displayId` of the screen a camera belongs to, 0 = unknown (§3). Plug-in contract (§9): appended `xrt_plugin_stereo_camera_info::monitor_id` (`XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID`). A display topology change wakes the re-enumeration at once. `displayxr-cli camera list` prints the display. Nothing renumbered, no struct changes size (#1961) |
 | 4 | No struct change. The camera list is live (§3): the service re-enumerates its sources during its run (on enumerate, at most once a second, and every ~2 s while a client listens), keeping each camera's index / `cameraId` / `persistentId`; new cameras are appended, vanished ones stay listed as `UNAVAILABLE` (streams end with `SOURCE_LOST`, start is `BUSY`) and come back with their id. `XrEventDataStereoCamerasChangedDXR` is delivered (it was reserved) to every instance that enumerated. Plug-in contract (§9): `enumerate` may be called repeatedly; calibration is per camera index, not "the active device" (#1961) |

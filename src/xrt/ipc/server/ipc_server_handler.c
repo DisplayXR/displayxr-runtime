@@ -7840,6 +7840,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_height = h;
 	*out_fence_value = fv;
 	*out_eyes = eyes;
+	// Stereo camera A2: this uid presents woven 3D (the front-camera gate).
+	ics->last_weave_ns = (int64_t)os_monotonic_get_ns();
 	return XRT_SUCCESS;
 #else
 	// No weave engine in this build (e.g. desktop Linux until #1699 R2). The

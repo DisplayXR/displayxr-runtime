@@ -507,6 +507,15 @@ u_camera_consent_store_set_delegating(const char *exe, bool delegating, const ch
 void
 u_camera_consent_store_list(void (*cb)(void *ctx, char kind, const char *exe, const char *value), void *ctx);
 
+/*!
+ * POSIX: keep the user store (camera_consent.json) in @p dir instead of the
+ * XDG config dir. Android sets the runtime app's private files dir here at
+ * service start (app processes have no $HOME). NULL / "" = back to XDG.
+ * Windows: no-op. Call before the first store access.
+ */
+void
+u_camera_consent_store_set_user_dir(const char *dir);
+
 //! Where the user store lives (for messages); false if unknown.
 bool
 u_camera_consent_store_path(char *out, size_t cap);
