@@ -80,6 +80,10 @@ SCAM_PIN(XR_STEREO_CAMERA_FORMAT_BGRA8_DXR, XRT_STEREO_CAMERA_FORMAT_BGRA8, 3);
 SCAM_PIN(XR_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY_DXR, XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY, 1);
 #undef SCAM_PIN
 _Static_assert(XR_STEREO_CAMERA_RING_SLOTS_DXR == XRT_STEREO_CAMERA_RING_SLOTS, "ring slots");
+_Static_assert(XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR == XRT_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN,
+               "frame orientation unknown");
+_Static_assert(XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR == 0xFFFFFFFFu, "frame orientation unknown literal");
+_Static_assert(XR_TYPE_STEREO_CAMERA_ORIENTATION_DXR == 1004999318, "orientation struct type");
 _Static_assert(XR_STEREO_CAMERA_PERSISTENT_ID_MAX_SIZE_DXR ==
                    sizeof(((struct xrt_stereo_camera_properties *)0)->persistent_id),
                "id size");
@@ -239,6 +243,12 @@ oxr_xrEnumerateStereoCamerasDXR(XrInstance instance,
 		    OXR_GET_OUTPUT_FROM_CHAIN(o, XR_TYPE_STEREO_CAMERA_DISPLAY_DXR, XrStereoCameraDisplayDXR);
 		if (disp != NULL) {
 			disp->displayId = p.display_id;
+		}
+		// Spec v7: how the published frame is turned, when the app chained it.
+		XrStereoCameraOrientationDXR *orient =
+		    OXR_GET_OUTPUT_FROM_CHAIN(o, XR_TYPE_STEREO_CAMERA_ORIENTATION_DXR, XrStereoCameraOrientationDXR);
+		if (orient != NULL) {
+			orient->frameOrientationDegrees = p.frame_orientation_deg;
 		}
 	}
 	return XR_SUCCESS;

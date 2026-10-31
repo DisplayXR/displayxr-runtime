@@ -95,6 +95,10 @@ extern "C" {
 //     only rectified frames (a browser) can leave the camera out of its list before
 //     any calibration query or stream start. CALIBRATED alone does not imply it: a
 //     calibrated pair whose geometry the service's rectifier rejected is RAW-only.
+//     Also XrStereoCameraOrientationDXR (appended), chained on
+//     XrStereoCameraPropertiesDXR::next: the clockwise turn that makes the published
+//     frame upright in the device's NATURAL orientation (Camera2 SENSOR_ORIENTATION
+//     semantics), or XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR.
 #define XR_DXR_stereo_camera_SPEC_VERSION 7
 #define XR_DXR_STEREO_CAMERA_EXTENSION_NAME "XR_DXR_stereo_camera"
 
@@ -135,6 +139,13 @@ extern "C" {
 // Spec v5 (#1961) — appended.
 //! Chain on XrStereoCameraPropertiesDXR::next: which display the camera belongs to.
 #define XR_TYPE_STEREO_CAMERA_DISPLAY_DXR                   ((XrStructureType)1004999317)
+// Spec v7 — appended.
+//! Chain on XrStereoCameraPropertiesDXR::next: how the published frame is turned.
+#define XR_TYPE_STEREO_CAMERA_ORIENTATION_DXR               ((XrStructureType)1004999318)
+//! XrStereoCameraOrientationDXR::frameOrientationDegrees when the runtime does
+//! not know the frame orientation. Pre-set it before enumerating (a runtime older
+//! than v7 leaves the struct untouched): 0 is a real value.
+#define XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR      0xFFFFFFFFu
 
 //! Size of XrStereoCameraPropertiesDXR::persistentId, NUL included.
 #define XR_STEREO_CAMERA_PERSISTENT_ID_MAX_SIZE_DXR 64
@@ -274,6 +285,30 @@ typedef struct XrStereoCameraDisplayDXR {
     //! xrEnumerateDisplaysDXR.
     uint64_t displayId;
 } XrStereoCameraDisplayDXR;
+
+/*!
+ * Spec v7: chain on XrStereoCameraPropertiesDXR::next to learn how the published
+ * side-by-side frame is turned relative to the device. Filled by
+ * xrEnumerateStereoCamerasDXR.
+ *
+ * frameOrientationDegrees is 0, 90, 180 or 270: the CLOCKWISE rotation that makes
+ * the published frame (the whole side-by-side image) upright in the device's
+ * NATURAL orientation (display rotation 0) — Camera2's SENSOR_ORIENTATION meaning,
+ * applied to the frame as delivered. It is fixed per camera and never follows the
+ * current display rotation; a consumer composes that itself. A frame already
+ * upright in the natural orientation reports 0.
+ *
+ * XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR = the runtime does not know (the
+ * source did not say). The consumer MUST set frameOrientationDegrees to
+ * XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR before the call: a runtime older
+ * than v7 leaves the struct untouched, and a zero-initialised struct would then
+ * read as "upright in the natural orientation".
+ */
+typedef struct XrStereoCameraOrientationDXR {
+    XrStructureType type; //!< XR_TYPE_STEREO_CAMERA_ORIENTATION_DXR
+    void* XR_MAY_ALIAS next;
+    uint32_t frameOrientationDegrees;
+} XrStereoCameraOrientationDXR;
 
 typedef struct XrStereoCameraIntrinsicsDXR {
     //! The image these numbers describe (per eye).

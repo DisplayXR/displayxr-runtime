@@ -134,6 +134,7 @@ static struct
 	char identity[XRT_STEREO_CAMERA_MAX_CAMERAS][128];
 	char name[XRT_STEREO_CAMERA_MAX_CAMERAS][128];
 	uint64_t monitor[XRT_STEREO_CAMERA_MAX_CAMERAS];
+	uint32_t orientation[XRT_STEREO_CAMERA_MAX_CAMERAS]; //!< plug-in enum; 0 = do not write the field
 	uint32_t enumerate_calls;
 } g_fake;
 
@@ -161,6 +162,12 @@ fake_enumerate(struct xrt_plugin_instance *inst, uint32_t capacity, struct xrt_p
 		const size_t need = offsetof(struct xrt_plugin_stereo_camera_info, monitor_id) + sizeof(o->monitor_id);
 		if (o->struct_size >= need) {
 			o->monitor_id = g_fake.monitor[i];
+		}
+		// Spec v7, same gate; 0 = behave like a plug-in that predates the field.
+		const size_t need_o =
+		    offsetof(struct xrt_plugin_stereo_camera_info, frame_orientation) + sizeof(o->frame_orientation);
+		if (o->struct_size >= need_o && g_fake.orientation[i] != 0) {
+			o->frame_orientation = g_fake.orientation[i];
 		}
 	}
 	return g_fake.count;
@@ -227,6 +234,15 @@ scm_fake_plugin_set(const char *const *identities, const char *const *names, uin
 		snprintf(g_fake.identity[i], sizeof(g_fake.identity[i]), "%s", identities[i]);
 		snprintf(g_fake.name[i], sizeof(g_fake.name[i]), "%s", names[i]);
 		g_fake.monitor[i] = 0;
+		g_fake.orientation[i] = 0;
+	}
+}
+
+void
+scm_fake_plugin_set_orientations(const uint32_t *plugin_values, uint32_t count)
+{
+	for (uint32_t i = 0; i < XRT_STEREO_CAMERA_MAX_CAMERAS; i++) {
+		g_fake.orientation[i] = i < count ? plugin_values[i] : 0;
 	}
 }
 
