@@ -2789,7 +2789,9 @@ ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_
 #endif
 	u_camera_consent_init(&m->consent, store, store_ctx, env, env_ctx);
 	m->consent.kill_switch = !debug_get_bool_option_stereo_camera_enabled();
-	m->consent.dev_override = debug_get_bool_option_stereo_camera_dev_allow();
+	m->consent.dev_override = opts != NULL && opts->dev_override != 0
+	                              ? opts->dev_override > 0
+	                              : debug_get_bool_option_stereo_camera_dev_allow();
 	m->consent.prompt_enabled = debug_get_bool_option_stereo_camera_prompt();
 	m->consent.prompt_timeout_ms = PROMPT_TIMEOUT_MS;
 	long dev_timeout = debug_get_num_option_stereo_camera_prompt_timeout_ms();
@@ -2812,7 +2814,7 @@ ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_
 		U_LOG_W(
 		    "stereo camera: ******** DXR_STEREO_CAMERA_DEV_ALLOW=1 — DEVELOPER OVERRIDE: every peer gets the "
 		    "camera WITHOUT consent, identity or OS-permission checks (Android: "
-		    "debug.xrt.DXR_STEREO_CAMERA_DEV_ALLOW). "
+		    "debug.xrt.DXR_STEREO_CAMERA_DEV_ALLOW). The front-camera rule (a live weave) still applies. "
 		    "Never on a user's device. ********");
 	}
 
@@ -3313,9 +3315,11 @@ ipc_handle_stereo_camera_stream_create(volatile struct ipc_client_state *ics,
 	snprintf(slot->exe, sizeof(slot->exe), "%s", exe);
 	slot->peer_pid = ics->peer_pid;
 	slot->peer_uid = ics->peer_uid;
-	// The developer override lifts this gate too (camera probes without a weave).
-	slot->needs_presenting = g_platform.user_facing_requires_presenting && !m->consent.dev_override &&
-	                         (cam->info.flags & XRT_PLUGIN_STEREO_CAMERA_USER_FACING) != 0;
+	// The developer override does NOT lift this gate (decided 2026-10-31): the
+	// front pair feeds the display's head tracking, so even a dev box never
+	// lets an app without a live weave take it.
+	slot->needs_presenting =
+	    g_platform.user_facing_requires_presenting && (cam->info.flags & XRT_PLUGIN_STEREO_CAMERA_USER_FACING) != 0;
 	slot->client_class = ics->client_state.client_class;
 	slot->delegating = delegating;
 	*out_stream_id = slot->id;

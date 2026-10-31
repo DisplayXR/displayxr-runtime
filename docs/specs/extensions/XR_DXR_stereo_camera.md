@@ -504,7 +504,7 @@ someone else inherits nothing.
 | # | Android |
 |---|---|
 | 1 | `debug.xrt.DXR_STEREO_CAMERA=0` (the kill switch, read in the runtime's process) or the sharing toggle in the store |
-| 2 | `debug.xrt.DXR_STEREO_CAMERA_DEV_ALLOW=1`: developer override, logged loudly at service start and once per run at first use. It also admits an unverifiable peer (row 3), so a debug-signed build of a trusted package works, and it lifts the front-camera gate (§7.2). Never on a user's device |
+| 2 | `debug.xrt.DXR_STEREO_CAMERA_DEV_ALLOW=1`: developer override, logged loudly at service start and once per run at first use. It also admits an unverifiable peer (row 3), so a debug-signed build of a trusted package works. It does **not** lift the front-camera rule (§7.2): a `USER_FACING` camera still needs a live weave. Never on a user's device |
 | 3 | No single valid package for the uid, no readable signing certificate, several signers, or **a package on the built-in trusted list signed with a different certificate** (a rebuild cannot pass for the listed client). All of these are refused with `CONSENT_REFUSED`, without a prompt |
 | 4 | The peer package must hold `CAMERA` (`PackageManager.checkPermission`), and its camera app-op must be `MODE_ALLOWED` or `MODE_FOREGROUND` ("only while using the app" is enough). Otherwise `XR_ERROR_PERMISSION_INSUFFICIENT`. This applies to the trusted browser too |
 | 5, 7 | Stored decisions in `<files dir>/displayxr/camera_consent.json` (app-private, the POSIX store format) |
@@ -551,8 +551,8 @@ frame with a 250 ms cache:
   submit within the last second, or a visible session). Otherwise the start returns
   `XR_ERROR_STEREO_CAMERA_BUSY_DXR`. A started front stream gets no frames, and its connection is
   told `SUSPENDED`, while that stops being true. While the front pair is open it is also what keeps
-  the display tracking the viewer, so an app in the background can never take it. Rear cameras
-  have no such rule.
+  the display tracking the viewer, so an app in the background can never take it. The rule holds
+  under the developer override too (§7.1.2 row 2). Rear cameras have no such rule.
 - **Session lock:** every stream is suspended while the OS session is locked or switched away
   (Windows `WM_WTSSESSION_CHANGE` lock / console or remote disconnect, plus `SM_REMOTESESSION` at
   start; macOS `com.apple.screenIsLocked` and `NSWorkspaceSessionDidResignActive`; Android
@@ -1000,7 +1000,7 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
-| 6 (A2, Android) | No API change. The Android rows of §7: the consent identity is the peer uid's package + signing-certificate digest, the trusted list is built into the runtime, and the consent dialog, the in-use notification with Stop, the lock watch, and "the OS took the camera" = `SUSPENDED` are runtime-owned. A front camera needs a live weave from the same app (`BUSY` otherwise) |
+| 6 (A2, Android) | No API change. The Android rows of §7: the consent identity is the peer uid's package + signing-certificate digest, the trusted list is built into the runtime, and the consent dialog, the in-use notification with Stop, the lock watch, and "the OS took the camera" = `SUSPENDED` are runtime-owned. A front camera needs a live weave from the same app (`BUSY` otherwise), with or without the developer override |
 | 6 | `XR_STEREO_CAMERA_STREAM_END_REASON_SOURCE_BUSY_DXR` = 4 (appended, nothing renumbered). A started stream whose source cannot start — the device is held by another process, errors on its first read (Media Foundation's shape for a busy UVC device), or (UVC source) delivers nothing within 5 s of opening — ends with this reason and the camera reads `UNAVAILABLE` until the service's retry succeeds; a new start meanwhile is `XR_ERROR_STEREO_CAMERA_BUSY_DXR` (a browser maps both to `NotReadableError`). Before this the stream stayed started at 0 fps with no error (runtime #2221). A source that stops after it delivered is unchanged (its streams wait through the retry). |
 | 5 | `XrStereoCameraDisplayDXR` (`XR_TYPE_STEREO_CAMERA_DISPLAY_DXR` = 1004999317), chained on `XrStereoCameraPropertiesDXR::next`: the `XrDisplayDXR::displayId` of the screen a camera belongs to, 0 = unknown (§3). Plug-in contract (§9): appended `xrt_plugin_stereo_camera_info::monitor_id` (`XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID`). A display topology change wakes the re-enumeration at once. `displayxr-cli camera list` prints the display. Nothing renumbered, no struct changes size (#1961) |
 | 4 | No struct change. The camera list is live (§3): the service re-enumerates its sources during its run (on enumerate, at most once a second, and every ~2 s while a client listens), keeping each camera's index / `cameraId` / `persistentId`; new cameras are appended, vanished ones stay listed as `UNAVAILABLE` (streams end with `SOURCE_LOST`, start is `BUSY`) and come back with their id. `XrEventDataStereoCamerasChangedDXR` is delivered (it was reserved) to every instance that enumerated. Plug-in contract (§9): `enumerate` may be called repeatedly; calibration is per camera index, not "the active device" (#1961) |

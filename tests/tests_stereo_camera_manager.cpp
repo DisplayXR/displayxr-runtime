@@ -421,6 +421,54 @@ TEST_CASE("re-enumeration: a vanished camera ends its streams", "[stereo_camera_
 	scm_destroy(f);
 }
 
+TEST_CASE("A2 front-camera rule: no live weave is BUSY, with or without the developer override",
+          "[stereo_camera_manager][android]")
+{
+	// The fake plug-in's cameras are USER_FACING. Decision 2026-10-31: the
+	// developer override (DXR_STEREO_CAMERA_DEV_ALLOW) admits a debug-signed
+	// browser but no longer lifts this rule.
+	const char *ids_a[] = {"test:front"};
+	const char *names_a[] = {"Front 3D camera"};
+	for (int32_t dev : {1, -1}) {
+		DYNAMIC_SECTION("dev override " << (dev > 0 ? "on" : "off"))
+		{
+			scm_fake_plugin_set(ids_a, names_a, 1);
+			scm_set_front_rule(true);
+			scm_fixture *f = scm_create_fake_plugin_ex(dev);
+			REQUIRE(f != nullptr);
+			REQUIRE(scm_count(f) == 1);
+			const props_t a = props_at(f, 0);
+			xrt_stereo_camera_stream_request req = {a.id, XRT_STEREO_CAMERA_OUTPUT_RAW,
+			                                        XRT_STEREO_CAMERA_FORMAT_GRAY8,
+			                                        XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY, 0.0f};
+			uint64_t sid = 0;
+			REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+			// No connection of this app weaves: the front camera is BUSY.
+			scm_set_live_weave(f, false);
+			CHECK(scm_stream_start(f, sid) == XRT_ERROR_STEREO_CAMERA_BUSY);
+			// The same app presents woven 3D (a submit within the last second): it starts.
+			scm_set_live_weave(f, true);
+			CHECK(scm_stream_start(f, sid) == XRT_SUCCESS);
+			CHECK(scm_stream_destroy(f, sid) == XRT_SUCCESS);
+			scm_destroy(f);
+			scm_set_front_rule(false);
+		}
+	}
+	// Without the platform rule (desktop) a user-facing camera has no such gate.
+	scm_fake_plugin_set(ids_a, names_a, 1);
+	scm_fixture *f = scm_create_fake_plugin_ex(-1);
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1);
+	xrt_stereo_camera_stream_request req = {props_at(f, 0).id, XRT_STEREO_CAMERA_OUTPUT_RAW,
+	                                        XRT_STEREO_CAMERA_FORMAT_GRAY8,
+	                                        XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY, 0.0f};
+	uint64_t sid = 0;
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	CHECK(scm_stream_start(f, sid) == XRT_SUCCESS);
+	CHECK(scm_stream_destroy(f, sid) == XRT_SUCCESS);
+	scm_destroy(f);
+}
+
 TEST_CASE("re-enumeration: each camera reports its screen, and a move is a change", "[stereo_camera_manager][rescan]")
 {
 	const char *ids_ab[] = {"test:A", "test:B"};
