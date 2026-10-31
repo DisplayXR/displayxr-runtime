@@ -228,7 +228,8 @@ displayxr-cli camera probe --decline-delegation          # as a browser in autom
 ```
 
 `DXR_STEREO_CAMERA_DEV_ALLOW=1` on the service skips consent for everything (loud WARN) — use
-it on a dev box when you are iterating on frames, not on the consent path. The full env-var
+it on a dev box when you are iterating on frames, not on the consent path. On Android it does
+**not** lift the front-camera rule below. The full env-var
 census is in
 [`docs/roadmap/control-panel-performance-settings.md`](../roadmap/control-panel-performance-settings.md).
 
@@ -250,9 +251,11 @@ The rules are the same; the mechanics differ. The normative table is spec §7.1.
   **refused** outright, so use `debug.xrt.DXR_STEREO_CAMERA_DEV_ALLOW=1` to develop a browser.
 - **The front camera** starts only while your app presents woven 3D in the runtime (a live
   `XR_DXR_weave` submit, or a visible session). Otherwise the start returns
-  `XR_ERROR_STEREO_CAMERA_BUSY_DXR`. Rear cameras have no such rule.
-- **Background and lock:** when you leave the foreground the OS takes the camera away, and when the
-  screen locks the runtime pauses the stream. Either way the camera reads `SUSPENDED`, your stream
+  `XR_ERROR_STEREO_CAMERA_BUSY_DXR`. This holds under `DXR_STEREO_CAMERA_DEV_ALLOW` too, so a camera
+  probe with no weave running gets `BUSY` on the front pair; test it on a rear camera, or from an
+  app that weaves. Rear cameras have no such rule.
+- **Background and lock:** when your app leaves the foreground, or the screen locks, the runtime
+  pauses the stream (it does not rely on the OS for this). Either way the camera reads `SUSPENDED`, your stream
   stays started, and frames resume when you come back. Do not end your track on `SUSPENDED`.
 - **The user's controls:** the notification *"3D camera in use"* has a **Stop** action, which ends
   your stream with `USER_STOPPED`. The DisplayXR app's **3D camera** card lists stored decisions;

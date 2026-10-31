@@ -76,6 +76,22 @@ scm_fake_plugin_enumerate_calls(void);
 struct scm_fixture *
 scm_create_fake_plugin(void);
 
+//! Same, with the developer override forced: > 0 on, < 0 off, 0 = from the env.
+struct scm_fixture *
+scm_create_fake_plugin_ex(int32_t dev_override);
+
+/*
+ * A2 front-camera rule (option R): the platform flag that makes a
+ * USER_FACING camera (the fake plug-in's cameras are) need a live weave, and
+ * a second connection of the fixture's app that is / is not weaving.
+ * scm_set_front_rule(false) clears the platform hooks again.
+ */
+void
+scm_set_front_rule(bool enabled);
+
+void
+scm_set_live_weave(struct scm_fixture *f, bool live);
+
 /*
  * ADR-043 Amendment 5: a fake display plug-in with NO camera slots that only
  * DECLARES the cameras its display owns (get_claimed_cameras), next to the

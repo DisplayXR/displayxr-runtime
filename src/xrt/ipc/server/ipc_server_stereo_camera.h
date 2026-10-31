@@ -69,6 +69,12 @@ struct ipc_server_stereo_camera_options
 	 * @ref ipc_server_stereo_camera_rescan itself).
 	 */
 	int32_t rescan_period_ms;
+	/*!
+	 * The developer override (consent row 2): 0 = from
+	 * DXR_STEREO_CAMERA_DEV_ALLOW (the default); > 0 forces it on, < 0 off
+	 * (tests). It never lifts the front-camera rule.
+	 */
+	int32_t dev_override;
 };
 
 struct ipc_server_stereo_camera *
@@ -168,7 +174,8 @@ struct ipc_server_stereo_camera_platform
 	 * Option R (§1.2): a USER_FACING camera starts only for a peer whose uid
 	 * presents woven 3D in this process (a weave submit in the last second,
 	 * or a visible session), else BUSY; a started one delivers no frames and
-	 * reads SUSPENDED while that stops being true.
+	 * reads SUSPENDED while that stops being true. The developer override
+	 * (DXR_STEREO_CAMERA_DEV_ALLOW) does not lift it.
 	 */
 	bool user_facing_requires_presenting;
 	/*!
