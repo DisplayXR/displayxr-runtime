@@ -81,6 +81,11 @@
         <package android:name="com.leialoft.display.config" />
         <package android:name="com.leia.headtrackingservice" />
         <package android:name="com.leiainc.media.service" />
+        <!-- The vendor plug-in's stereo camera source reads a user stereo
+             calibration from this app's read-only ContentProvider; under
+             package visibility the provider does not resolve without it, and
+             the plug-in falls back to the factory calibration. -->
+        <package android:name="com.leiainc.calibrationapp" />
     </queries>
 
     <application
