@@ -101,6 +101,8 @@ TEST_CASE("manager + UVC fake: enumerate and calibration", "[stereo_camera_manag
 	// Spec v7: not CALIBRATED, yet the service rectifies the nominal model, so a
 	// RECTIFIED stream delivers rectified frames and the camera says so up front.
 	CHECK((p.flags & XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE) != 0);
+	// Spec v7: a desktop SBS webcam claims no frame orientation.
+	CHECK(p.frame_orientation_deg == XRT_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN);
 	CHECK(p.eye_width == 640);
 	CHECK(p.eye_height == 480);
 	CHECK(p.view_count == 2);
@@ -458,6 +460,61 @@ TEST_CASE("re-enumeration: each camera reports its screen, and a move is a chang
 	CHECK(scm_rescan(f));
 	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
 	CHECK(p.display_id == 0);
+	scm_destroy(f);
+}
+
+TEST_CASE("spec v7: properties carry the frame orientation, unknown when the plug-in is silent",
+          "[stereo_camera_manager][orientation]")
+{
+	const char *ids_ab[] = {"test:front", "test:rear"};
+	const char *names_ab[] = {"3D Camera", "3D Camera, rear"};
+	scm_fake_plugin_set(ids_ab, names_ab, 2);
+
+	// A plug-in that does not write the field (or predates it): UNKNOWN, never 0,
+	// so a consumer keeps its own fallback.
+	scm_fixture *f = scm_create_fake_plugin();
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 2);
+	xrt_stereo_camera_properties p;
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+	CHECK(p.frame_orientation_deg == XRT_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN);
+	REQUIRE(scm_properties(f, 1, &p) == XRT_SUCCESS);
+	CHECK(p.frame_orientation_deg == XRT_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN);
+	scm_destroy(f);
+
+	// A portrait-natural tablet: unturned frames, front sensor 270, rear 90.
+	const uint32_t tablet[] = {XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_270,
+	                           XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_90};
+	scm_fake_plugin_set(ids_ab, names_ab, 2);
+	scm_fake_plugin_set_orientations(tablet, 2);
+	f = scm_create_fake_plugin();
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 2); // enumerated: this instance now hears CAMERAS_CHANGED
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+	CHECK(p.frame_orientation_deg == 270);
+	REQUIRE(scm_properties(f, 1, &p) == XRT_SUCCESS);
+	CHECK(p.frame_orientation_deg == 90);
+	CHECK(drain(f, XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) == 0);
+	CHECK_FALSE(scm_rescan(f));
+
+	// The plug-in learns / changes it (a pair it now turns upright itself): 0 is
+	// a real value, and the change is reported like a label change.
+	const uint32_t turned[] = {XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_0,
+	                           XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_90};
+	scm_fake_plugin_set_orientations(turned, 2);
+	CHECK(scm_rescan(f));
+	CHECK(drain(f, XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) == 1);
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+	CHECK(p.frame_orientation_deg == 0);
+
+	// A value outside the enum is a plug-in bug: unknown, never a turn.
+	const uint32_t bogus[] = {7u, XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_180};
+	scm_fake_plugin_set_orientations(bogus, 2);
+	CHECK(scm_rescan(f));
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+	CHECK(p.frame_orientation_deg == XRT_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN);
+	REQUIRE(scm_properties(f, 1, &p) == XRT_SUCCESS);
+	CHECK(p.frame_orientation_deg == 180);
 	scm_destroy(f);
 }
 

@@ -31,6 +31,9 @@ extern "C" {
 #define XRT_STEREO_CAMERA_MAX_STREAMS_PER_CAMERA 8
 //! Slots in a stream's ring: latest + pinned + one to write.
 #define XRT_STEREO_CAMERA_RING_SLOTS 3
+//! xrt_stereo_camera_properties::frame_orientation_deg when not known
+//! (= XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR).
+#define XRT_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN 0xFFFFFFFFu
 
 enum xrt_stereo_camera_state
 {
@@ -107,6 +110,11 @@ struct xrt_stereo_camera_properties
 	uint64_t supported_formats;    //!< XRT_STEREO_CAMERA_BIT(format)
 	uint64_t supported_transports; //!< XRT_STEREO_CAMERA_BIT(transport)
 	uint64_t display_id;           //!< xrt_screen::id of the camera's screen, 0 = unknown (#1961)
+	//! Spec v7: clockwise degrees (0/90/180/270) that make the published frame
+	//! upright in the device's natural orientation, or
+	//! XRT_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN.
+	uint32_t frame_orientation_deg;
+	uint32_t reserved1;
 };
 
 struct xrt_stereo_camera_intrinsics

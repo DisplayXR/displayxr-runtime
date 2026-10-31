@@ -964,6 +964,23 @@ baseline_mm(const struct xrt_plugin_stereo_camera_calibration *c)
 	return sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
 }
 
+/*!
+ * Spec v7: the plug-in's frame orientation (0 = unknown) as the degrees apps
+ * see. Anything outside the enum is a plug-in bug and reads as unknown rather
+ * than as a turn a consumer would apply.
+ */
+static uint32_t
+frame_orientation_deg(uint32_t plugin_value)
+{
+	switch (plugin_value) {
+	case XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_0: return 0;
+	case XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_90: return 90;
+	case XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_180: return 180;
+	case XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_270: return 270;
+	default: return XRT_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN;
+	}
+}
+
 
 /*
  *
@@ -2308,6 +2325,16 @@ refresh_camera_locked(struct ipc_server_stereo_camera *m, struct scam_camera *ca
 		cam->info.monitor_id = c->info.monitor_id;
 		changed = true;
 	}
+	if (cam->info.frame_orientation != c->info.frame_orientation) {
+		// Spec v7: a property the plug-in may only learn late (e.g. once it
+		// read the sensor's characteristics); reported like the screen.
+		U_LOG_W("stereo camera %llu \"%s\": frame orientation %u -> %u deg cw",
+		        (unsigned long long)cam->camera_id, cam->info.display_name,
+		        frame_orientation_deg(cam->info.frame_orientation),
+		        frame_orientation_deg(c->info.frame_orientation));
+		cam->info.frame_orientation = c->info.frame_orientation;
+		changed = true;
+	}
 	if (c->info.max_frame_rate > 0.0f && c->info.max_frame_rate <= 1000.0f) {
 		cam->info.max_frame_rate = c->info.max_frame_rate; // a rate the source learned since
 	}
@@ -2918,6 +2945,7 @@ ipc_handle_stereo_camera_get_properties(volatile struct ipc_client_state *ics,
 	out_props->max_frame_rate = source_rate_hz(cam);
 	out_props->source = cam->source;
 	out_props->display_id = cam->info.monitor_id;
+	out_props->frame_orientation_deg = frame_orientation_deg(cam->info.frame_orientation);
 	if (cam->have_calib) {
 		// Spec §3: per eye, RECTIFIED (the service's rectified focal when it
 		// rectifies; the plug-in's own for a natively rectified source).
