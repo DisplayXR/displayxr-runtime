@@ -2328,8 +2328,9 @@ refresh_camera_locked(struct ipc_server_stereo_camera *m, struct scam_camera *ca
 	if (cam->info.frame_orientation != c->info.frame_orientation) {
 		// Spec v7: a property the plug-in may only learn late (e.g. once it
 		// read the sensor's characteristics); reported like the screen.
-		U_LOG_W("stereo camera %llu \"%s\": frame orientation %u -> %u deg cw", (unsigned long long)cam->camera_id,
-		        cam->info.display_name, frame_orientation_deg(cam->info.frame_orientation),
+		U_LOG_W("stereo camera %llu \"%s\": frame orientation %u -> %u deg cw",
+		        (unsigned long long)cam->camera_id, cam->info.display_name,
+		        frame_orientation_deg(cam->info.frame_orientation),
 		        frame_orientation_deg(c->info.frame_orientation));
 		cam->info.frame_orientation = c->info.frame_orientation;
 		changed = true;
