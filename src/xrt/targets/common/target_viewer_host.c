@@ -95,6 +95,9 @@ target_vhost_sup_config_defaults(struct target_vhost_sup_config *cfg)
 	cfg->crash_loop_window_ns = 120 * SEC;
 	cfg->failed_retry_ns = 600 * SEC;
 	cfg->hello_timeout_ns = 10 * SEC;
+	cfg->idle_stop_ns = 10 * SEC;
+	cfg->stop_grace_ns = 3 * SEC;
+	cfg->suspend_gap_ns = 2 * SEC;
 }
 
 void
@@ -117,9 +120,7 @@ target_vhost_sup_init(struct target_vhost_sup *s, const struct target_vhost_sup_
 void
 target_vhost_sup_set_demand(struct target_vhost_sup *s, bool demand)
 {
-	if (demand) {
-		s->demand = true; // latches: the provider then runs until teardown
-	}
+	s->demand = demand;
 }
 
 void
@@ -165,7 +166,8 @@ target_vhost_sup_exited(struct target_vhost_sup *s, uint64_t now_ns, int32_t cod
 	if (s->state == TARGET_VHOST_SUP_STOPPED) {
 		return false;
 	}
-	if (requested && code == TARGET_VHOST_EXIT_ORDERLY) {
+	if ((requested && code == TARGET_VHOST_EXIT_ORDERLY) || s->state == TARGET_VHOST_SUP_STOPPING) {
+		// Asked to stop (an idle stop that had to be killed included): not a crash.
 		s->state = TARGET_VHOST_SUP_IDLE;
 		return false;
 	}
@@ -201,6 +203,17 @@ target_vhost_sup_stop(struct target_vhost_sup *s)
 enum target_vhost_sup_action
 target_vhost_sup_tick(struct target_vhost_sup *s, uint64_t now_ns)
 {
+	// The machine slept between ticks: that time is not idle time.
+	if (s->ticked && s->cfg.suspend_gap_ns > 0 && now_ns - s->last_tick_ns > s->cfg.suspend_gap_ns) {
+		s->last_demand_ns += now_ns - s->last_tick_ns;
+	}
+	s->ticked = true;
+	s->last_tick_ns = now_ns;
+	if (s->demand) {
+		s->last_demand_ns = now_ns;
+	}
+	const bool idle = !s->demand && s->cfg.idle_stop_ns > 0 && now_ns - s->last_demand_ns >= s->cfg.idle_stop_ns;
+
 	switch (s->state) {
 	case TARGET_VHOST_SUP_IDLE:
 		if (s->demand) {
@@ -212,8 +225,32 @@ target_vhost_sup_tick(struct target_vhost_sup *s, uint64_t now_ns)
 		if (now_ns - s->spawned_ns > s->cfg.hello_timeout_ns) {
 			return TARGET_VHOST_SUP_ACTION_KILL;
 		}
+		if (idle) {
+			s->state = TARGET_VHOST_SUP_STOPPING;
+			s->stop_ns = now_ns;
+			s->idle_stops++;
+			return TARGET_VHOST_SUP_ACTION_STOP;
+		}
+		return TARGET_VHOST_SUP_ACTION_NONE;
+	case TARGET_VHOST_SUP_RUNNING:
+		if (idle) {
+			s->state = TARGET_VHOST_SUP_STOPPING;
+			s->stop_ns = now_ns;
+			s->idle_stops++;
+			return TARGET_VHOST_SUP_ACTION_STOP;
+		}
+		return TARGET_VHOST_SUP_ACTION_NONE;
+	case TARGET_VHOST_SUP_STOPPING:
+		if (now_ns - s->stop_ns > s->cfg.stop_grace_ns) {
+			s->stop_ns = now_ns; // one kill per grace period
+			return TARGET_VHOST_SUP_ACTION_KILL;
+		}
 		return TARGET_VHOST_SUP_ACTION_NONE;
 	case TARGET_VHOST_SUP_BACKOFF:
+		if (idle) {
+			s->state = TARGET_VHOST_SUP_IDLE; // nobody wants it any more: no respawn
+			return TARGET_VHOST_SUP_ACTION_NONE;
+		}
 		if (s->demand && now_ns >= s->next_spawn_ns) {
 			s->spawns++;
 			return TARGET_VHOST_SUP_ACTION_SPAWN;
@@ -227,7 +264,6 @@ target_vhost_sup_tick(struct target_vhost_sup *s, uint64_t now_ns)
 			return TARGET_VHOST_SUP_ACTION_SPAWN;
 		}
 		return TARGET_VHOST_SUP_ACTION_NONE;
-	case TARGET_VHOST_SUP_RUNNING:
 	case TARGET_VHOST_SUP_STOPPED:
 	default: return TARGET_VHOST_SUP_ACTION_NONE;
 	}
@@ -240,6 +276,7 @@ target_vhost_sup_page_state(enum target_vhost_sup_state st)
 	case TARGET_VHOST_SUP_IDLE: return U_VPP_STATE_IDLE;
 	case TARGET_VHOST_SUP_STARTING: return U_VPP_STATE_STARTING;
 	case TARGET_VHOST_SUP_RUNNING: return U_VPP_STATE_RUNNING;
+	case TARGET_VHOST_SUP_STOPPING: return U_VPP_STATE_IDLE; // going idle
 	case TARGET_VHOST_SUP_BACKOFF: return U_VPP_STATE_BACKOFF;
 	case TARGET_VHOST_SUP_FAILED: return U_VPP_STATE_FAILED;
 	case TARGET_VHOST_SUP_STOPPED:
@@ -328,7 +365,9 @@ struct target_viewer_host
 
 	// Under oth's lock.
 	struct target_vhost_sup sup;
-	bool demand;
+	int64_t demand_ns; //!< the service's own last demand (0 = none)
+	int64_t last_tick_ns;
+	int64_t hb_grace_until_ns; //!< after a suspend: no heartbeat kill before this
 	struct os_process *proc;
 	struct os_channel *chan;
 	uint32_t generation;
@@ -447,6 +486,7 @@ spawn_locked(struct target_viewer_host *h, uint64_t now)
 	}
 	h->proc = proc;
 	h->chan = chan;
+	h->stop_requested = false;
 	U_LOG_W("viewer tracking host: started pid %ld for provider '%s' (generation %u%s)", os_process_pid(proc),
 	        h->provider_id, h->generation, h->sup.restarts > 0 ? ", restart" : "");
 	(void)now;
@@ -460,7 +500,13 @@ child_exited_locked(struct target_viewer_host *h, uint64_t now, int32_t code, co
 	const long pid = h->proc != NULL ? os_process_pid(h->proc) : 0;
 	close_child_locked(h);
 	const bool requested = h->stop_requested;
+	const bool idle_stop = h->sup.state == TARGET_VHOST_SUP_STOPPING;
 	const bool crash = target_vhost_sup_exited(&h->sup, now, code, requested);
+	if (idle_stop) {
+		U_LOG_W("viewer tracking host: pid %ld stopped (%s) — idle, no viewer requested for %llu s", pid,
+		        target_vhost_exit_str(code), (unsigned long long)(h->sup.cfg.idle_stop_ns / SEC));
+		return;
+	}
 	if (h->sup.state == TARGET_VHOST_SUP_STOPPED || (requested && code == TARGET_VHOST_EXIT_ORDERLY)) {
 		return;
 	}
@@ -488,13 +534,36 @@ kill_child_locked(struct target_viewer_host *h, uint64_t now, const char *why)
 	child_exited_locked(h, now, code, why);
 }
 
+//! Ask the host to stop in order; the reap in a later tick finds the exit.
+static void
+request_stop_locked(struct target_viewer_host *h)
+{
+	if (h->proc == NULL) {
+		return;
+	}
+	h->stop_requested = true;
+	const uint8_t cmd = VHOST_CMD_STOP;
+	if (os_channel_send(h->chan, &cmd, 1, NULL, 0) != 0) {
+		U_LOG_W("viewer tracking host: pid %ld: could not send stop (it is killed after the grace)",
+		        os_process_pid(h->proc));
+	}
+}
+
 static void
 tick_locked(struct target_viewer_host *h)
 {
 	const uint64_t now = (uint64_t)os_monotonic_get_ns();
+	// A long gap between ticks = the machine slept, and the host with it: its
+	// heartbeat is as old as the sleep. Give it time to beat before judging.
+	if (h->last_tick_ns != 0 && h->sup.cfg.suspend_gap_ns > 0 &&
+	    (int64_t)now - h->last_tick_ns > (int64_t)h->sup.cfg.suspend_gap_ns) {
+		h->hb_grace_until_ns = (int64_t)now + VHOST_HEARTBEAT_KILL_NS;
+	}
+	h->last_tick_ns = (int64_t)now;
 	const int64_t page_demand = u_vpp_read_demand(h->page);
 	const bool reader_demand = page_demand > 0 && (int64_t)now - page_demand < U_VPP_DEMAND_FRESH_NS;
-	target_vhost_sup_set_demand(&h->sup, h->demand || reader_demand);
+	const bool own_demand = h->demand_ns > 0 && (int64_t)now - h->demand_ns < U_VPP_DEMAND_FRESH_NS;
+	target_vhost_sup_set_demand(&h->sup, own_demand || reader_demand);
 
 	if (h->proc != NULL) {
 		int32_t code = 0;
@@ -510,7 +579,7 @@ tick_locked(struct target_viewer_host *h)
 			}
 		} else if (h->sup.state == TARGET_VHOST_SUP_RUNNING) {
 			const int64_t hb = u_vpp_read_heartbeat(h->page);
-			if ((int64_t)now - hb > VHOST_HEARTBEAT_KILL_NS) {
+			if ((int64_t)now - hb > VHOST_HEARTBEAT_KILL_NS && (int64_t)now >= h->hb_grace_until_ns) {
 				U_LOG_W("viewer tracking host: pid %ld silent for %lld ms (no heartbeat) — killing it",
 				        os_process_pid(h->proc), (long long)(((int64_t)now - hb) / (int64_t)MS));
 				kill_child_locked(h, now, "watchdog");
@@ -520,7 +589,10 @@ tick_locked(struct target_viewer_host *h)
 
 	switch (target_vhost_sup_tick(&h->sup, now)) {
 	case TARGET_VHOST_SUP_ACTION_SPAWN: target_vhost_sup_spawned(&h->sup, now, spawn_locked(h, now)); break;
-	case TARGET_VHOST_SUP_ACTION_KILL: kill_child_locked(h, now, "no hello"); break;
+	case TARGET_VHOST_SUP_ACTION_KILL:
+		kill_child_locked(h, now, h->sup.state == TARGET_VHOST_SUP_STOPPING ? "ignored stop" : "no hello");
+		break;
+	case TARGET_VHOST_SUP_ACTION_STOP: request_stop_locked(h); break;
 	case TARGET_VHOST_SUP_ACTION_NONE:
 	default: break;
 	}
@@ -585,7 +657,7 @@ target_viewer_host_demand(struct target_viewer_host *h)
 		return;
 	}
 	os_thread_helper_lock(&h->oth);
-	h->demand = true;
+	h->demand_ns = os_monotonic_get_ns();
 	os_thread_helper_unlock(&h->oth);
 }
 

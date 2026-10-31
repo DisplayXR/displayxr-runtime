@@ -436,6 +436,15 @@ make_sup()
 	return s;
 }
 
+//! Tick every 100 ms over [from, to), as the manager does: nothing may happen there.
+void
+tick_quietly(target_vhost_sup *s, uint64_t from, uint64_t to)
+{
+	for (uint64_t t = from; t < to; t += 100 * 1000 * 1000ull) {
+		REQUIRE(target_vhost_sup_tick(s, t) == TARGET_VHOST_SUP_ACTION_NONE);
+	}
+}
+
 } // namespace
 
 TEST_CASE("viewer host supervisor: lazy spawn, hello, orderly stop", "[vhost_sup]")
@@ -450,11 +459,132 @@ TEST_CASE("viewer host supervisor: lazy spawn, hello, orderly stop", "[vhost_sup
 	target_vhost_sup_hello(&s, 3);
 	CHECK(s.state == TARGET_VHOST_SUP_RUNNING);
 	CHECK(target_vhost_sup_page_state(s.state) == U_VPP_STATE_RUNNING);
-	// Demand latches: a later "no demand" does not stop it.
-	target_vhost_sup_set_demand(&s, false);
-	CHECK(s.demand);
+	// Teardown's requested orderly exit is not a crash.
 	CHECK_FALSE(target_vhost_sup_exited(&s, 4, TARGET_VHOST_EXIT_ORDERLY, true));
 	CHECK(s.restarts == 0);
+}
+
+TEST_CASE("viewer host supervisor: idle stop frees the provider, the next demand respawns", "[vhost_sup]")
+{
+	auto s = make_sup();
+	const uint64_t tick = 100 * 1000 * 1000ull;
+	uint64_t now = 0;
+	target_vhost_sup_set_demand(&s, true);
+	REQUIRE(target_vhost_sup_tick(&s, now) == TARGET_VHOST_SUP_ACTION_SPAWN);
+	target_vhost_sup_spawned(&s, now, true);
+	target_vhost_sup_hello(&s, now);
+
+	// Demand for a while, then the last reader leaves at t = 5 s.
+	for (; now < 5 * kSec; now += tick) {
+		CHECK(target_vhost_sup_tick(&s, now) == TARGET_VHOST_SUP_ACTION_NONE);
+	}
+	target_vhost_sup_set_demand(&s, false);
+	const uint64_t last = now - tick;
+	// Not before idle_stop_ns of no demand.
+	for (; now < last + 10 * kSec; now += tick) {
+		REQUIRE(target_vhost_sup_tick(&s, now) == TARGET_VHOST_SUP_ACTION_NONE);
+	}
+	CHECK(s.state == TARGET_VHOST_SUP_RUNNING);
+	REQUIRE(target_vhost_sup_tick(&s, now) == TARGET_VHOST_SUP_ACTION_STOP);
+	CHECK(s.state == TARGET_VHOST_SUP_STOPPING);
+	CHECK(s.idle_stops == 1);
+	CHECK(target_vhost_sup_page_state(s.state) == U_VPP_STATE_IDLE);
+	CHECK(target_vhost_sup_tick(&s, now + tick) == TARGET_VHOST_SUP_ACTION_NONE); // asked once
+	// It exits in order: IDLE, not a crash, and no respawn without demand.
+	CHECK_FALSE(target_vhost_sup_exited(&s, now + 2 * tick, TARGET_VHOST_EXIT_ORDERLY, true));
+	CHECK(s.state == TARGET_VHOST_SUP_IDLE);
+	CHECK(s.restarts == 0);
+	CHECK(target_vhost_sup_tick(&s, now + 60 * kSec) == TARGET_VHOST_SUP_ACTION_NONE);
+	// The next demand spawns it again at once (no backoff).
+	now += 61 * kSec;
+	target_vhost_sup_set_demand(&s, true);
+	CHECK(target_vhost_sup_tick(&s, now) == TARGET_VHOST_SUP_ACTION_SPAWN);
+
+	// A host that ignores the stop is killed after the grace, and that is not a crash either.
+	auto k = make_sup();
+	target_vhost_sup_set_demand(&k, true);
+	REQUIRE(target_vhost_sup_tick(&k, 0) == TARGET_VHOST_SUP_ACTION_SPAWN);
+	target_vhost_sup_spawned(&k, 0, true);
+	target_vhost_sup_hello(&k, 0);
+	target_vhost_sup_set_demand(&k, false);
+	tick_quietly(&k, tick, 10 * kSec);
+	REQUIRE(target_vhost_sup_tick(&k, 10 * kSec) == TARGET_VHOST_SUP_ACTION_STOP);
+	tick_quietly(&k, 10 * kSec + tick, 13 * kSec + 1);
+	CHECK(target_vhost_sup_tick(&k, 13 * kSec + 1) == TARGET_VHOST_SUP_ACTION_KILL);
+	CHECK_FALSE(target_vhost_sup_exited(&k, 13 * kSec + 2, 30, true));
+	CHECK(k.state == TARGET_VHOST_SUP_IDLE);
+	CHECK(k.restarts == 0);
+
+	// Demand back before the idle window ends: it keeps running.
+	auto b = make_sup();
+	target_vhost_sup_set_demand(&b, true);
+	REQUIRE(target_vhost_sup_tick(&b, 0) == TARGET_VHOST_SUP_ACTION_SPAWN);
+	target_vhost_sup_spawned(&b, 0, true);
+	target_vhost_sup_hello(&b, 0);
+	target_vhost_sup_set_demand(&b, false);
+	tick_quietly(&b, tick, 9 * kSec);
+	target_vhost_sup_set_demand(&b, true);
+	tick_quietly(&b, 9 * kSec, 9 * kSec + tick);
+	target_vhost_sup_set_demand(&b, false);
+	tick_quietly(&b, 9 * kSec + tick, 19 * kSec);
+	CHECK(target_vhost_sup_tick(&b, 19 * kSec) == TARGET_VHOST_SUP_ACTION_STOP);
+
+	// A host in backoff that nobody wants any more goes IDLE instead of respawning.
+	auto o = make_sup();
+	target_vhost_sup_set_demand(&o, true);
+	REQUIRE(target_vhost_sup_tick(&o, 0) == TARGET_VHOST_SUP_ACTION_SPAWN);
+	target_vhost_sup_spawned(&o, 0, true);
+	CHECK(target_vhost_sup_exited(&o, kSec, 139, false));
+	REQUIRE(o.state == TARGET_VHOST_SUP_BACKOFF);
+	target_vhost_sup_set_demand(&o, false);
+	tick_quietly(&o, kSec, 11 * kSec + tick);
+	CHECK(o.state == TARGET_VHOST_SUP_IDLE);
+
+	// idle_stop_ns = 0: runs until teardown (the old behaviour).
+	target_vhost_sup_config cfg;
+	target_vhost_sup_config_defaults(&cfg);
+	cfg.idle_stop_ns = 0;
+	target_vhost_sup z;
+	target_vhost_sup_init(&z, &cfg);
+	target_vhost_sup_set_demand(&z, true);
+	REQUIRE(target_vhost_sup_tick(&z, 0) == TARGET_VHOST_SUP_ACTION_SPAWN);
+	target_vhost_sup_spawned(&z, 0, true);
+	target_vhost_sup_hello(&z, 0);
+	target_vhost_sup_set_demand(&z, false);
+	tick_quietly(&z, tick, 60 * kSec);
+	CHECK(z.state == TARGET_VHOST_SUP_RUNNING);
+}
+
+TEST_CASE("viewer host supervisor: time asleep is not idle time", "[vhost_sup]")
+{
+	auto s = make_sup();
+	const uint64_t tick = 100 * 1000 * 1000ull;
+	target_vhost_sup_set_demand(&s, true);
+	REQUIRE(target_vhost_sup_tick(&s, 0) == TARGET_VHOST_SUP_ACTION_SPAWN);
+	target_vhost_sup_spawned(&s, 0, true);
+	target_vhost_sup_hello(&s, 0);
+	CHECK(target_vhost_sup_tick(&s, tick) == TARGET_VHOST_SUP_ACTION_NONE);
+	// The machine sleeps for 20 min with an app open. On wake the app's demand is
+	// as old as the sleep, and is renewed within a few ticks: no stop meanwhile.
+	uint64_t now = tick + 1200 * kSec;
+	target_vhost_sup_set_demand(&s, false);
+	for (uint64_t t = now; t < now + 2 * kSec; t += tick) {
+		REQUIRE(target_vhost_sup_tick(&s, t) == TARGET_VHOST_SUP_ACTION_NONE);
+	}
+	target_vhost_sup_set_demand(&s, true);
+	CHECK(target_vhost_sup_tick(&s, now + 2 * kSec) == TARGET_VHOST_SUP_ACTION_NONE);
+	CHECK(s.state == TARGET_VHOST_SUP_RUNNING);
+	// Without demand after the wake, the idle window still runs out (awake time only).
+	auto w = make_sup();
+	target_vhost_sup_set_demand(&w, true);
+	REQUIRE(target_vhost_sup_tick(&w, 0) == TARGET_VHOST_SUP_ACTION_SPAWN);
+	target_vhost_sup_spawned(&w, 0, true);
+	target_vhost_sup_hello(&w, 0);
+	target_vhost_sup_set_demand(&w, false);
+	tick_quietly(&w, tick, 5 * kSec);             // idle 5 s awake
+	now = 5 * kSec - tick + 1200 * kSec;          // then 20 min asleep
+	tick_quietly(&w, now, now + 5 * kSec + tick); // 4.9 s + 5.1 s awake = the 10 s window
+	CHECK(target_vhost_sup_tick(&w, now + 5 * kSec + tick) == TARGET_VHOST_SUP_ACTION_STOP);
 }
 
 TEST_CASE("viewer host supervisor: backoff doubles to the cap, resets after a healthy run", "[vhost_sup]")
