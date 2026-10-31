@@ -331,14 +331,14 @@ jobs:
           tar -xzf _plugin/*.tar.gz -C _plugin
           PLUGIN_SO=$(find _plugin -name libdxrp050_leia_cnsdk.so | head -1)
           test -n "$PLUGIN_SO" || { echo "::error::tarball has no libdxrp050_leia_cnsdk.so"; exit 1; }
-          # THROWAWAY e2e branch only (never merge): plug-in .so from leia-plugin #487+#488 e2e CI (tmp/android-scam-user-calib-r1-e2e d37a81d, runtime-pinned 045796e82).
+          # THROWAWAY e2e branch only (never merge): plug-in .so from leia-plugin #487+#488 e2e CI (tmp/android-scam-user-calib-r1-e2e ff1eccb, runtime-pinned 045796e82).
           mkdir -p _plugin_pr
-          GH_TOKEN="$LEIA_TOKEN" gh run download 41162640703 -R DisplayXR/displayxr-leia-plugin \
+          GH_TOKEN="$LEIA_TOKEN" gh run download 41164848650 -R DisplayXR/displayxr-leia-plugin \
               -n DisplayXR-Leia-CNSDK-android-arm64-v8a -D _plugin_pr
           for t in _plugin_pr/*.tar.gz; do [ -f "$t" ] && tar -xzf "$t" -C _plugin_pr; done
           PLUGIN_SO=$(find _plugin_pr -name libdxrp050_leia_cnsdk.so | head -1)
           test -n "$PLUGIN_SO" || { echo "::error::artifact has no libdxrp050_leia_cnsdk.so"; exit 1; }
-          echo "E2E: plug-in from leia-plugin run 41162640703: $PLUGIN_SO"
+          echo "E2E: plug-in from leia-plugin run 41164848650: $PLUGIN_SO"
 
           # 2. CNSDK, for the AAR (Java glue + the two transitive .so).
           mkdir -p _cnsdk_zip _cnsdk
