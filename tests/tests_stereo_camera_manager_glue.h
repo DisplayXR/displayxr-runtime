@@ -70,6 +70,12 @@ scm_fake_plugin_set(const char *const *identities, const char *const *names, uin
 void
 scm_fake_plugin_set_monitors(const uint64_t *monitor_ids, uint32_t count);
 
+//! Spec v7: the xrt_plugin_stereo_camera_frame_orientation each listed camera
+//! writes (0 = the field is not written, like an older plug-in); reset by
+//! scm_fake_plugin_set.
+void
+scm_fake_plugin_set_orientations(const uint32_t *plugin_values, uint32_t count);
+
 uint32_t
 scm_fake_plugin_enumerate_calls(void);
 

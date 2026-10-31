@@ -880,6 +880,23 @@ enum xrt_plugin_stereo_camera_wait
 };
 
 /*!
+ * @ref xrt_plugin_stereo_camera_info::frame_orientation: the clockwise turn that
+ * makes the frame the plug-in delivers (the whole side-by-side image) upright in
+ * the device's NATURAL orientation — Camera2 SENSOR_ORIENTATION semantics for the
+ * delivered frame, after any turn the plug-in itself applied. Fixed per camera.
+ * 0 = UNKNOWN on purpose, so a plug-in that does not write the field (or predates
+ * it) reads as unknown and consumers keep their own fallback.
+ */
+enum xrt_plugin_stereo_camera_frame_orientation
+{
+	XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN = 0,
+	XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_0 = 1,   //!< already upright in the natural orientation
+	XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_90 = 2,  //!< turn 90 deg clockwise to make it upright
+	XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_180 = 3, //!< turn 180 deg
+	XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_270 = 4, //!< turn 270 deg clockwise
+};
+
+/*!
  * One camera, as a plug-in describes it. The runtime sets @ref struct_size to
  * its own size before the call; the plug-in must not write past it.
  */
@@ -921,6 +938,19 @@ struct xrt_plugin_stereo_camera_info
 	 * a display. Apps see it as XrStereoCameraDisplayDXR::displayId.
 	 */
 	uint64_t monitor_id;
+
+	/*
+	 * Appended (XR_DXR_stereo_camera v7), gated by @ref struct_size like
+	 * monitor_id. Announced by
+	 * @ref XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION.
+	 */
+
+	/*!
+	 * @ref xrt_plugin_stereo_camera_frame_orientation of the delivered frame;
+	 * 0 (UNKNOWN) when the plug-in does not know. Apps see it as
+	 * XrStereoCameraOrientationDXR::frameOrientationDegrees.
+	 */
+	uint32_t frame_orientation;
 };
 
 /*!
@@ -1938,6 +1968,14 @@ xrt_plugin_iface_has_describe_settings(const struct xrt_plugin_iface *iface)
  * against an older runtime header can #ifdef-guard filling it.
  */
 #define XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID 1
+
+/*!
+ * Defined when @ref xrt_plugin_stereo_camera_info carries @ref
+ * xrt_plugin_stereo_camera_info::frame_orientation (XR_DXR_stereo_camera v7)
+ * and this header defines @ref xrt_plugin_stereo_camera_frame_orientation, so a
+ * plug-in built against an older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION 1
 
 /*!
  * Defined when @ref xrt_plugin_iface carries @ref

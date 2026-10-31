@@ -300,6 +300,10 @@ cmd_list(struct ipc_connection *ipc_c, bool json)
 		// Spec v5: the screen it belongs to, as `displays` prints ids (0 = unknown).
 		char disp[24];
 		snprintf(disp, sizeof(disp), "0x%016llx", (unsigned long long)p.display_id);
+		// Spec v7: clockwise turn to upright in the natural orientation (JSON null = unknown).
+		const bool orient_known = p.frame_orientation_deg != XRT_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN;
+		char orient[16];
+		snprintf(orient, sizeof(orient), "%u", p.frame_orientation_deg);
 		if (json) {
 			printf(
 			    "%s{\"id\": %llu, \"name\": \"%s\", \"source\": \"%s\", \"persistentId\": \"%s\", "
@@ -307,17 +311,22 @@ cmd_list(struct ipc_connection *ipc_c, bool json)
 			    "\"flags\": \"%s\", \"viewCount\": %u, \"eyeWidth\": %u, \"eyeHeight\": %u, "
 			    "\"maxFrameRate\": %.2f, \"baselineMm\": %.2f, \"horizontalFovDeg\": %.2f, "
 			    "\"formats\": \"0x%llx\", \"transports\": \"0x%llx\", \"platformDeviceHint\": \"%s\", "
-			    "\"displayId\": \"%s\"}",
+			    "\"displayId\": \"%s\", \"frameOrientationDeg\": %s}",
 			    i ? ", " : "", (unsigned long long)p.camera_id, p.display_name, source, p.persistent_id,
 			    state_str(p.state), flags, p.view_count, p.eye_width, p.eye_height, p.max_frame_rate,
 			    p.baseline_mm, p.horizontal_fov_deg, (unsigned long long)p.supported_formats,
-			    (unsigned long long)p.supported_transports, hint, disp);
+			    (unsigned long long)p.supported_transports, hint, disp, orient_known ? orient : "null");
 		} else {
 			printf("  [%llu] \"%s\"  %s  (source: %s)\n", (unsigned long long)p.camera_id, p.display_name,
 			       state_str(p.state), source);
 			printf("       persistentId %s\n", p.persistent_id);
 			printf("       display      %s\n", p.display_id != 0 ? disp : "unknown");
 			printf("       flags        %s\n", flags);
+			if (orient_known) {
+				printf("       orientation  turn %s deg cw to upright (natural orientation)\n", orient);
+			} else {
+				printf("       orientation  unknown\n");
+			}
 			char rate[64];
 			if (p.max_frame_rate > 0.0f) {
 				snprintf(rate, sizeof(rate), "%.1f Hz", p.max_frame_rate);

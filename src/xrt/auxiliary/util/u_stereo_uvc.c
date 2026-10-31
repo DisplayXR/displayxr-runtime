@@ -1690,6 +1690,10 @@ u_stereo_uvc_enumerate(struct u_stereo_uvc *uvc, uint32_t capacity, struct xrt_p
 		info.eye_height = c->eye_h;
 		info.max_frame_rate = c->mode.fps; // the negotiated mode's rate; the service measures the real one
 		info.native_format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12;
+		// Spec v7: frame_orientation stays UNKNOWN. A desktop SBS webcam has no
+		// "natural orientation" the service can know (it is clamped on a monitor
+		// in whatever way the user mounted it), so it claims nothing.
+		info.frame_orientation = XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN;
 		size_t n = (sz == 0 || sz > sizeof(info)) ? sizeof(info) : sz;
 		memcpy(&out[i], &info, n);
 		out[i].struct_size = sz;

@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_stereo_camera` |
-| **Spec Version** | 4 |
+| **Spec Version** | 7 |
 | **Extension Type** | Instance extension, service path only (an in-process instance enumerates zero cameras) |
 | **Header** | [`src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h`](../../../src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h) (+ its `index.json` catalog note) |
 | **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **R2 implemented**: the service-side rectifier (`u_stereo_rectify`, CPU) — RECTIFIED frames + rectified calibration from any CALIBRATED source, golden-tested against OpenCV, and a distorted sim fake with ground truth. **Not yet:** consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports (the rectifier has the seam), state-change events, the Leia provider (L1), the browser (B1). **Amendment 4 implemented** (2026-10-07): a vendor-neutral, service-owned source for plain UVC side-by-side stereo webcams (§9a) — Windows Media Foundation; desktop Linux V4L2 since 2026-10-18 (§9a; no SBS webcam has run on it yet). Provisional type values `1004999300–310` (relocated from `290–300` when `XR_DXR_weave` v14 took `290`; `XR_DXR_lift` holds `270–289`), pending Khronos registry |
@@ -194,6 +194,47 @@ change of it is a change of the list (one `XrEventDataStereoCamerasChangedDXR`).
 than v5 leaves the struct untouched, so set `displayId` to 0 before the call. It is chained, not
 appended to `XrStereoCameraPropertiesDXR`, because growing a public struct would break apps
 built against the older size.
+
+**How the published frame is turned (spec v7).** Chain `XrStereoCameraOrientationDXR` on a
+camera's `XrStereoCameraPropertiesDXR::next` and `xrEnumerateStereoCamerasDXR` fills it:
+
+```c
+#define XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR 0xFFFFFFFFu
+typedef struct XrStereoCameraOrientationDXR {
+    XrStructureType type;              // XR_TYPE_STEREO_CAMERA_ORIENTATION_DXR (1004999318)
+    void* XR_MAY_ALIAS next;
+    uint32_t frameOrientationDegrees;  // 0 / 90 / 180 / 270, or ..._UNKNOWN_DXR
+} XrStereoCameraOrientationDXR;
+```
+
+`frameOrientationDegrees` is the **clockwise** rotation that makes the published side-by-side
+frame (the whole image, as `xrAcquireStereoCameraFrameDXR` delivers it) upright in the device's
+**natural orientation** (display rotation 0). It has exactly the meaning of Android Camera2's
+`SENSOR_ORIENTATION`, applied to the published frame rather than to the sensor: if the source
+already turned its eyes, the value is what remains after that turn. It is **fixed per camera and
+never follows the current display rotation**; a consumer combines it with the rotation it is
+held in (e.g. Chromium's user-facing `(S + R) % 360`, rear `(S − R) % 360`). A frame that is
+already upright in the natural orientation reports 0.
+
+- It does not change what "left" means: the left half is always the lens on the camera's own
+  left (§4), and the published frame is the orientation in which that pair is side by side.
+- `XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR` (`0xFFFFFFFF`) = the runtime does not know:
+  the source did not say (a plug-in that predates the field, or does not fill it), and the UVC
+  source of §9a. A consumer then uses its own rule (on Android, the CDD rule that a camera's long
+  edge follows the screen's long edge).
+- **The consumer MUST set `frameOrientationDegrees` to
+  `XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR` before the call.** A runtime older than v7
+  leaves the chained struct untouched; a consumer that zero-initialises it would read 0
+  ("upright in the natural orientation") from such a runtime, which is wrong on every
+  portrait-natural tablet. With the pre-set, "old runtime" and "not known" are the same answer.
+- A change of it (a source that learns it late) is a change of the list, like the display: one
+  `XrEventDataStereoCamerasChangedDXR`.
+
+What the Leia Android plug-in reports (the reference case): a portrait-natural tablet publishes
+its pairs unturned in the sensor's landscape, so the front pair reports **270** and the rear pair
+**90** (their sensor orientations); a phone-class device whose front lenses are stacked along
+the sensor's y axis turns each eye by the sensor orientation before packing, so its pair is
+upright in natural portrait and reports **0**.
 
 ## 4. Calibration
 
@@ -652,7 +693,18 @@ appended at any time; one that goes away may be dropped from the list (the servi
 `XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID`) is the `xrt_display_descriptor::monitor_id` of
 the screen the camera belongs to, as this plug-in claimed it, or 0. Write it only when the
 runtime's `struct_size` covers it; a plug-in built against an older header simply leaves it 0.
-Apps see it as `XrStereoCameraDisplayDXR::displayId`. Enumerate/calibration are cheap and
+Apps see it as `XrStereoCameraDisplayDXR::displayId`.
+
+`xrt_plugin_stereo_camera_info::frame_orientation` (appended, spec v7; announced by
+`XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION`) is an
+`enum xrt_plugin_stereo_camera_frame_orientation`: `UNKNOWN = 0`, `_0 = 1`, `_90 = 2`,
+`_180 = 3`, `_270 = 4` — the clockwise turn that makes the frame the plug-in delivers upright in
+the device's natural orientation, after any turn the plug-in applied itself (§3). The encoding
+is offset on purpose so that **0 is unknown**: a plug-in built against an older header, or one
+that does not write the field, reads as unknown and the runtime reports
+`XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR`; a value outside the enum is treated the same.
+Same `struct_size` gate as `monitor_id`. The plug-in knows the value (the sensor's mounting and
+whether it turns the frame before packing); the runtime never derives it. Enumerate/calibration are cheap and
 callable from any thread. `SUSPENDED` from `wait_frame` maps to the camera state (§3). The
 plug-in owns decoding its transport and resolving calibration for its own device; the runtime
 owns threads, fan-out, rectification, format conversion, transport, consent and indicator.
@@ -676,6 +728,10 @@ rectifier. Code: `auxiliary/util/u_stereo_uvc.{h,c}` (config, matching, SBS spli
 model, calibration files, the fake backend — pure, tested on every OS by `tests_stereo_uvc`),
 `auxiliary/os/os_uvc_capture*.{h,c,cpp}` (the OS call), and the `src_*` dispatch in
 `ipc_server_stereo_camera.c` (the only place the manager tells the two sources apart).
+
+**Frame orientation (spec v7): UNKNOWN.** A desktop stereo webcam has no natural orientation the
+service can know — it sits on a monitor however the user mounted it — so the source claims
+nothing and consumers apply their own default (on the desktop, none).
 
 **Opt-in only.** With no config the source enumerates nothing and touches no device. The SERVICE
 reads, once at start:
@@ -862,7 +918,8 @@ The whole path (enumerate → consent → start → acquire → rectify) then ru
 ## 11. Probe and diagnostics
 
 ```
-displayxr-cli camera list [--json]                    # properties + state + source (plugin|uvc) of every camera
+displayxr-cli camera list [--json]                    # properties + state + source (plugin|uvc) + display +
+                                                      # frame orientation (v7; JSON frameOrientationDeg, null = unknown)
 displayxr-cli camera uvc-devices [--modes] [--decoder]  # §9a: UVC webcam config + devices + decode path (local)
 displayxr-cli camera uvc-decode-bench <file>          # §9a: a media file through the webcam decode path
 displayxr-cli camera calib <id> [--raw|--rectified] [--json]
@@ -952,7 +1009,7 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
-| 7 | `XR_STEREO_CAMERA_RECTIFIABLE_BIT_DXR` = `0x20` (appended): set by the runtime exactly when a RECTIFIED stream of the camera delivers rectified frames (natively rectified, or the service's rectifier accepted the calibration at registration). It is the pre-start signal a rectified-only consumer needs: `CALIBRATED` stays set on a pair whose geometry the rectifier rejected, and the RECTIFIED calibration query is a consent point, so neither can be used to filter a camera list. A plug-in's own value of the bit is ignored. No struct change, nothing renumbered |
+| 7 | `XR_STEREO_CAMERA_RECTIFIABLE_BIT_DXR` = `0x20` (appended): set by the runtime exactly when a RECTIFIED stream of the camera delivers rectified frames (natively rectified, or the service's rectifier accepted the calibration at registration). It is the pre-start signal a rectified-only consumer needs: `CALIBRATED` stays set on a pair whose geometry the rectifier rejected, and the RECTIFIED calibration query is a consent point, so neither can be used to filter a camera list. A plug-in's own value of the bit is ignored. Also `XrStereoCameraOrientationDXR` (`XR_TYPE_STEREO_CAMERA_ORIENTATION_DXR` = 1004999318), chained on `XrStereoCameraPropertiesDXR::next`: the clockwise rotation (0/90/180/270) that makes the published frame upright in the device's natural orientation, Camera2 `SENSOR_ORIENTATION` semantics, or `XR_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN_DXR` (`0xFFFFFFFF`); the consumer pre-sets UNKNOWN (§3). Plug-in contract (§9): appended `xrt_plugin_stereo_camera_info::frame_orientation` (0 = unknown, `XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION`); the UVC source reports UNKNOWN (§9a). `displayxr-cli camera list` prints it. No public struct changes size, nothing renumbered |
 | 6 | `XR_STEREO_CAMERA_STREAM_END_REASON_SOURCE_BUSY_DXR` = 4 (appended, nothing renumbered). A started stream whose source cannot start — the device is held by another process, errors on its first read (Media Foundation's shape for a busy UVC device), or (UVC source) delivers nothing within 5 s of opening — ends with this reason and the camera reads `UNAVAILABLE` until the service's retry succeeds; a new start meanwhile is `XR_ERROR_STEREO_CAMERA_BUSY_DXR` (a browser maps both to `NotReadableError`). Before this the stream stayed started at 0 fps with no error (runtime #2221). A source that stops after it delivered is unchanged (its streams wait through the retry). |
 | 5 | `XrStereoCameraDisplayDXR` (`XR_TYPE_STEREO_CAMERA_DISPLAY_DXR` = 1004999317), chained on `XrStereoCameraPropertiesDXR::next`: the `XrDisplayDXR::displayId` of the screen a camera belongs to, 0 = unknown (§3). Plug-in contract (§9): appended `xrt_plugin_stereo_camera_info::monitor_id` (`XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID`). A display topology change wakes the re-enumeration at once. `displayxr-cli camera list` prints the display. Nothing renumbered, no struct changes size (#1961) |
 | 4 | No struct change. The camera list is live (§3): the service re-enumerates its sources during its run (on enumerate, at most once a second, and every ~2 s while a client listens), keeping each camera's index / `cameraId` / `persistentId`; new cameras are appended, vanished ones stay listed as `UNAVAILABLE` (streams end with `SOURCE_LOST`, start is `BUSY`) and come back with their id. `XrEventDataStereoCamerasChangedDXR` is delivered (it was reserved) to every instance that enumerated. Plug-in contract (§9): `enumerate` may be called repeatedly; calibration is per camera index, not "the active device" (#1961) |
