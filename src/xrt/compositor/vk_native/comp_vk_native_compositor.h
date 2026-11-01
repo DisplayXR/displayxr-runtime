@@ -312,6 +312,26 @@ void
 comp_vk_native_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode);
 
 /*!
+ * Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h): hold
+ * the panel in hardware 2D and present the flat view over the whole output with
+ * no weave (@p hold), or release the hold and restore the session's own
+ * hardware state. Same degrade and the same runtime hold as the desktop-Linux
+ * refuse-rather-than-resample path (#1595): the frame collapses to tile 0, the
+ * display processor takes its mono passthrough, and a session request made
+ * while held is recorded and applied on release.
+ *
+ * Applied at the start of the next composed frame (the same place the #1595
+ * degrade is decided). Called on transitions only.
+ *
+ * @return true when this compositor enacts it (desktop Linux today); false
+ *         elsewhere, and the caller then leaves the session alone.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_compositor_set_mono_2d_hold(struct xrt_compositor *xc, bool hold);
+
+/*!
  * Set the system devices for the debug GUI (needed for qwerty driver support).
  *
  * @param xc The compositor.

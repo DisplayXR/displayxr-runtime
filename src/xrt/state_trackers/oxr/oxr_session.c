@@ -226,6 +226,8 @@ oxr_workspace_modal_win32_fini(struct oxr_session *sess);
 DEBUG_GET_ONCE_NUM_OPTION(ipd, "OXR_DEBUG_IPD_MM", 63)
 DEBUG_GET_ONCE_NUM_OPTION(wait_frame_sleep, "OXR_DEBUG_WAIT_FRAME_EXTRA_SLEEP_MS", 0)
 DEBUG_GET_ONCE_BOOL_OPTION(frame_timing_spew, "OXR_FRAME_TIMING_SPEW", false)
+// Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h). Kill switch.
+DEBUG_GET_ONCE_BOOL_OPTION(mono_auto_2d, "DXR_MONO_AUTO_2D", true)
 DEBUG_GET_ONCE_BOOL_OPTION(hand_tracking_prioritize_conforming, "OXR_HAND_TRACKING_PRIORITIZE_CONFORMING", false)
 
 /*
@@ -871,6 +873,185 @@ oxr_session_set_eye_tracking_mode(struct oxr_session *sess, uint32_t mode)
 	if (!sess->is_bridge_relay) {
 		comp_ipc_client_compositor_set_eye_tracking_mode(&sess->xcn->base, mode);
 	}
+}
+
+/*
+ *
+ * Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h).
+ *
+ */
+
+/*!
+ * Ask the session's compositor to hold the panel in hardware 2D with the flat
+ * view filling the output and no weave (@p hold), or to release that hold and
+ * restore the session's own hardware state. Returns false when the compositor
+ * cannot enact it; the detector then stays off for the session.
+ *
+ * Deliberately NOT @ref oxr_session_request_display_mode: that is the
+ * HARDWARE-only override (#542) — the lens drops but the DP keeps weaving the
+ * atlas, which is exactly the soft picture this exists to remove. The hold
+ * also has to restore the session's choice rather than force 3D, which is what
+ * the compositor's runtime hold (util/u_display_mode_hold.h) already does for
+ * the refuse-rather-than-resample degrade; auto-2D is a second reason for the
+ * same hold.
+ */
+static bool
+mono_auto_2d_dispatch(struct oxr_session *sess, bool hold)
+{
+	if (sess->xcn == NULL) {
+		return false;
+	}
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		return comp_vk_native_compositor_set_mono_2d_hold(&sess->xcn->base, hold);
+	}
+#endif
+	// Every other compositor: not wired yet (a follow-up per compositor). The
+	// service weave route already has its own caller-driven flat path
+	// (XR_DXR_weave v13 MONO); the in-process D3D11/D3D12/GL/Metal compositors
+	// would each need the tile-0 collapse vk_native has.
+	(void)hold;
+	return false;
+}
+
+//! The session's own display-mode authority and the compositor's support.
+static bool
+mono_auto_2d_eligible(struct oxr_session *sess)
+{
+	if (!debug_get_bool_option_mono_auto_2d()) {
+		return false;
+	}
+	if (sess->display_mode_explicit || sess->mono_auto_2d_unsupported) {
+		return false;
+	}
+	// A session already in a 2D mode is flat by its own choice: nothing to do,
+	// and auto-2D must never be what turns it back to 3D.
+	if (!sess->hardware_display_3d) {
+		return false;
+	}
+	// Orchestrators drive the panel for others; service-mode sessions do not
+	// own it (the panel lease does).
+	if (sess->is_active_workspace_controller || sess->is_bridge_relay) {
+		return false;
+	}
+	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode) {
+		return false;
+	}
+	// A display-zones app mixes 2D and 3D regions itself (ADR-027); a frame of
+	// it is never "one flat picture" for the runtime to decide about.
+	if (sess->sys->inst->extensions.DXR_display_zones) {
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * This frame is one flat picture: every layer is a projection layer and every
+ * projection layer's views (>= 2) name the same swapchain, array index and
+ * image rect. Anything else is placed in depth by the compositor, so the frame
+ * is not flat even if the projection under it is.
+ */
+static bool
+mono_auto_2d_frame_is_flat(const XrFrameEndInfo *frameEndInfo)
+{
+	if (frameEndInfo->layerCount == 0) {
+		return false;
+	}
+	for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
+		const XrCompositionLayerBaseHeader *layer = frameEndInfo->layers[i];
+		if (layer == NULL || layer->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+			return false;
+		}
+		const XrCompositionLayerProjection *proj = (const XrCompositionLayerProjection *)layer;
+		if (proj->viewCount < 2 || proj->viewCount > XRT_MAX_VIEWS || proj->views == NULL) {
+			return false;
+		}
+		struct u_mono_view_ref refs[XRT_MAX_VIEWS];
+		for (uint32_t v = 0; v < proj->viewCount; v++) {
+			const XrSwapchainSubImage *si = &proj->views[v].subImage;
+			refs[v].swapchain = (uint64_t)(uintptr_t)si->swapchain;
+			refs[v].array_index = si->imageArrayIndex;
+			refs[v].x = si->imageRect.offset.x;
+			refs[v].y = si->imageRect.offset.y;
+			refs[v].w = si->imageRect.extent.width;
+			refs[v].h = si->imageRect.extent.height;
+		}
+		if (!u_mono_views_identical(refs, proj->viewCount)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void
+mono_auto_2d_push_event(struct oxr_logger *log, struct oxr_session *sess, bool hardware_3d)
+{
+	// The event type belongs to XR_DXR_display_info: never queue it for an
+	// instance that did not enable the extension (the client class this
+	// exists for usually has not).
+	if (sess->sys->inst->extensions.DXR_display_info) {
+		oxr_event_push_XrEventDataHardwareDisplayStateChanged(log, sess, hardware_3d ? XR_TRUE : XR_FALSE);
+	}
+}
+
+void
+oxr_session_mono_auto_2d_frame(struct oxr_logger *log,
+                               struct oxr_session *sess,
+                               const XrFrameEndInfo *frameEndInfo,
+                               uint64_t now_ns)
+{
+	const bool eligible = mono_auto_2d_eligible(sess);
+	if (!eligible && !sess->mono_auto_2d.active) {
+		return; // a session that opted out pays nothing per frame
+	}
+	const bool flat = eligible && mono_auto_2d_frame_is_flat(frameEndInfo);
+
+	switch (u_mono_auto_2d_step(&sess->mono_auto_2d, eligible, flat, now_ns, U_MONO_AUTO_2D_ENTER_NS)) {
+	case U_MONO_AUTO_2D_ENTER:
+		if (!mono_auto_2d_dispatch(sess, true)) {
+			(void)u_mono_auto_2d_release(&sess->mono_auto_2d);
+			sess->mono_auto_2d_unsupported = true;
+			U_LOG_W(
+			    "auto-2D: this session submits the same image for every view, but its compositor cannot "
+			    "present it flat - staying 3D (auto-2D is wired on the in-process Vulkan compositor on "
+			    "desktop Linux only)");
+			return;
+		}
+		U_LOG_W(
+		    "auto-2D: ENTER - every view of the projection layer has referenced the same swapchain, "
+		    "imageArrayIndex and imageRect for %u ms: hardware 2D, the flat view fills the output, no "
+		    "weave (DXR_MONO_AUTO_2D=0 disables)",
+		    (unsigned)(U_MONO_AUTO_2D_ENTER_NS / 1000000ull));
+		mono_auto_2d_push_event(log, sess, false);
+		break;
+	case U_MONO_AUTO_2D_LEAVE:
+		(void)mono_auto_2d_dispatch(sess, false);
+		U_LOG_W("auto-2D: LEAVE - %s: restoring the session's hardware %s",
+		        eligible ? "the views differ again (or a non-projection layer joined the frame)"
+		                 : "the session is no longer eligible",
+		        sess->hardware_display_3d ? "3D" : "2D");
+		if (sess->hardware_display_3d) {
+			mono_auto_2d_push_event(log, sess, true);
+		}
+		break;
+	case U_MONO_AUTO_2D_NONE:
+	default: break;
+	}
+}
+
+bool
+oxr_session_mono_auto_2d_explicit(struct oxr_logger *log, struct oxr_session *sess, bool push_event)
+{
+	sess->display_mode_explicit = true;
+	if (!u_mono_auto_2d_release(&sess->mono_auto_2d)) {
+		return false;
+	}
+	(void)mono_auto_2d_dispatch(sess, false);
+	U_LOG_W("auto-2D: LEAVE - the app made an explicit display-mode request; auto-2D stays off for this session");
+	if (push_event && sess->hardware_display_3d) {
+		mono_auto_2d_push_event(log, sess, true);
+	}
+	return true;
 }
 #endif // OXR_HAVE_DXR_display_info
 

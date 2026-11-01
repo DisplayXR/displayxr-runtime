@@ -832,9 +832,19 @@ struct comp_vk_native_compositor
 	 */
 	bool linux_surface_not_1to1;
 	/*!
+	 * Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h):
+	 * what the state tracker last asked for (@ref
+	 * comp_vk_native_compositor_set_mono_2d_hold, app thread, plain write),
+	 * and the state applied at the top of the composed frame. Applied, it is
+	 * the same degrade as @ref linux_surface_not_1to1: hardware 2D through the
+	 * hold below, the frame collapsed to tile 0, no weave.
+	 */
+	bool mono_2d_wanted;
+	bool mono_2d_hold;
+	/*!
 	 * The session's own hardware 2D/3D choice, and whether a runtime degrade
-	 * (today only @ref vk_linux_update_surface_not_1to1) is holding the panel
-	 * in 2D over it. Every request through
+	 * (@ref vk_linux_update_surface_not_1to1, or auto-2D on a flat submission
+	 * — @ref mono_2d_hold) is holding the panel in 2D over it. Every request through
 	 * @ref comp_vk_native_compositor_request_display_mode records the choice;
 	 * while held it is not forwarded, and releasing the hold restores it —
 	 * never a forced 3D. Under a vendor where the first explicit lens call
@@ -5540,6 +5550,18 @@ static void
 vk_linux_apply_not_1to1(struct comp_vk_native_compositor *c, bool not_1to1);
 
 /*!
+ * Whether this frame is collapsed to flat 2D for a runtime reason: a surface
+ * that cannot be presented 1:1 (#1595/#1831), or auto-2D on a flat stereo
+ * submission (util/u_mono_auto_2d.h). Either way the frame is tile 0, the DP
+ * takes its mono passthrough, and there is no weave.
+ */
+static inline bool
+vk_linux_collapsed_2d(const struct comp_vk_native_compositor *c)
+{
+	return c->linux_surface_not_1to1 || c->mono_2d_hold;
+}
+
+/*!
  * Refuse rather than resample, desktop-Linux edition (#1595).
  *
  * ## The rule
@@ -5691,12 +5713,48 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
  * the Wayland and X11 arms.
  */
 static void
+vk_linux_apply_hold(struct comp_vk_native_compositor *c);
+
+static void
 vk_linux_apply_not_1to1(struct comp_vk_native_compositor *c, bool not_1to1)
 {
 	if (not_1to1 == c->linux_surface_not_1to1) {
 		return;
 	}
 	c->linux_surface_not_1to1 = not_1to1;
+	vk_linux_apply_hold(c);
+}
+
+/*!
+ * Auto-2D on a flat stereo submission: apply the state tracker's last request
+ * (comp_vk_native_compositor_set_mono_2d_hold) at the top of the composed
+ * frame, beside the #1595 gate. Transitions only. The state tracker logs the
+ * edge; this logs nothing.
+ */
+static void
+vk_linux_update_mono_2d(struct comp_vk_native_compositor *c)
+{
+	const bool want = c->mono_2d_wanted;
+	if (want == c->mono_2d_hold) {
+		return;
+	}
+	c->mono_2d_hold = want;
+	vk_linux_apply_hold(c);
+}
+
+/*!
+ * Enter or leave the runtime hardware-2D hold. The hold is the OR of every
+ * runtime reason (NOT_1TO1, auto-2D), so one reason clearing while the other
+ * stands keeps the panel 2D, and only the last one out restores the session's
+ * own choice.
+ */
+static void
+vk_linux_apply_hold(struct comp_vk_native_compositor *c)
+{
+	const bool hold = vk_linux_collapsed_2d(c);
+	if (hold == c->display_mode_hold.held) {
+		return;
+	}
 
 	// Same degrade the Android arm performs: ask the panel for hardware 2D and
 	// release this session's lens preference, because the Leia DP only ever
@@ -5709,8 +5767,8 @@ vk_linux_apply_not_1to1(struct comp_vk_native_compositor *c, bool not_1to1)
 	// weaver for good, so if the clear edge did not ask for the lens back,
 	// nobody ever would. While the hold is on, the session's own requests are
 	// recorded, not forwarded (comp_vk_native_compositor_request_display_mode).
-	(void)vk_dp_request_display_mode(c, u_display_mode_hold_set(&c->display_mode_hold, not_1to1));
-	if (not_1to1) {
+	(void)vk_dp_request_display_mode(c, u_display_mode_hold_set(&c->display_mode_hold, hold));
+	if (hold) {
 		xrt_display_processor_on_pause(c->display_processor);
 	} else {
 		xrt_display_processor_on_resume(c->display_processor);
@@ -5981,7 +6039,10 @@ vk_compute_effective_layout(struct comp_vk_native_compositor *c)
 	// session that cannot be 1:1 collapses to TILE 0 — still a full stereo
 	// pair painted at view_w x view_h, with the right view dropped, so the
 	// tile keeps its own width and the DP takes its mono passthrough.
-	if (c->linux_surface_not_1to1 && view_w > 0 && view_h > 0) {
+	// Auto-2D on a flat stereo submission takes the same collapse: every view
+	// is the same image, so tile 0 IS the picture, painted over the output by
+	// the DP's mono passthrough with no weave.
+	if (vk_linux_collapsed_2d(c) && view_w > 0 && view_h > 0) {
 		c->eff_layout.views = 1;
 		c->eff_layout.cols = 1;
 		c->eff_layout.rows = 1;
@@ -6368,7 +6429,7 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 	struct xrt_segment_metrics m;
 	memset(&m, 0, sizeof(m));
 #ifdef XRT_OS_LINUX_DESKTOP
-	const bool collapsed_2d = c->linux_surface_not_1to1;
+	const bool collapsed_2d = vk_linux_collapsed_2d(c);
 #else
 	const bool collapsed_2d = false;
 #endif
@@ -12610,6 +12671,8 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		// #1831: the X11 arm. One-shot after its first evaluation.
 		vk_x11_update_not_1to1(c);
 	}
+	// Auto-2D on a flat stereo submission: same position, same reason.
+	vk_linux_update_mono_2d(c);
 #endif
 
 	// Per-frame effective CONTENT layout (#542): tile grid/dims from the
@@ -17418,8 +17481,8 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 #else
 	const bool origin_from_x11 = true;
 #endif
-	if (c->linux_surface_not_1to1) {
-		return; // degraded to 2D (either arm); there is no phase to anchor
+	if (vk_linux_collapsed_2d(c)) {
+		return; // degraded to 2D (either arm, or auto-2D); there is no phase to anchor
 	}
 	if (origin_from_x11 && !vk_x11_present_origin_is_panel_native(c)) {
 		return; // display-scoped weaving; the DP's origin stays (0,0)
@@ -17502,12 +17565,33 @@ comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool e
 	if (!u_display_mode_hold_request(&c->display_mode_hold, enable_3d)) {
 		U_LOG_W(
 		    "vk_native: hardware %s requested while the runtime holds the panel in 2D "
-		    "(NOT_1TO1) — recorded, applied when the hold clears",
-		    enable_3d ? "3D" : "2D");
+		    "(%s) — recorded, applied when the hold clears",
+		    enable_3d ? "3D" : "2D", c->linux_surface_not_1to1 ? "NOT_1TO1" : "auto-2D, flat submission");
 		return true;
 	}
 #endif
 	return vk_dp_request_display_mode(c, enable_3d);
+}
+
+bool
+comp_vk_native_compositor_set_mono_2d_hold(struct xrt_compositor *xc, bool hold)
+{
+	if (xc == NULL) {
+		return false;
+	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Recorded here (the app thread, inside xrEndFrame), applied by
+	// vk_linux_update_mono_2d at the top of the composed frame under the
+	// compositor lock, where the #1595 hold is decided too. Plain write, the
+	// convention for these one-writer flags (no C11 atomics in portable code).
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	c->mono_2d_wanted = hold;
+	return true;
+#else
+	// The runtime hold and the tile-0 collapse exist only on desktop Linux.
+	(void)hold;
+	return false;
+#endif
 }
 
 void
