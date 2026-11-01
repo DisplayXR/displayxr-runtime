@@ -405,20 +405,17 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 
 #ifdef XRT_OS_ANDROID
 	/*
-	 * Vendor display processors are created below, on THIS thread, and some
-	 * vendor SDKs post their async init to the calling thread's Looper — with
-	 * no Looper the init tears down immediately and the DP never comes up
-	 * (#510 M2). `native_app_glue`'s android_main thread and a Java UI thread
-	 * both have one; a bare pthread render thread (the engine shape) does not.
-	 * In-process the runtime has no hook on the app's main thread to marshal
-	 * onto (that hook, android_main_thread_dispatch_init(), is installed by the
-	 * SERVICE's own JNI entry point), so name the condition instead of hanging.
+	 * Vendor display processors may post their async init to the calling
+	 * thread's Looper (#510 M2). A bare pthread render thread (the engine
+	 * shape) has none, and the DP used to stay down silently. The compositor
+	 * now runs the DP factory on a Looper thread — this thread's own if it has
+	 * one, otherwise a runtime-owned one (#2490) — so any thread may call
+	 * xrCreateSession, and a DP that still fails fails the create (below).
 	 */
 	if (ALooper_forThread() == NULL) {
-		U_LOG_W("Android: xrCreateSession is running on a thread with NO ALooper. A vendor display "
-		        "processor whose init posts to the calling thread's Looper will not come up. Call "
-		        "xrCreateSession from your Activity's main thread or from native_app_glue's "
-		        "android_main thread.");
+		U_LOG_I(
+		    "Android: xrCreateSession on a thread with no ALooper; the display processor will be "
+		    "created on the runtime looper thread.");
 	}
 
 	/*
@@ -553,6 +550,16 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	    !sys->inst->extensions.KHR_vulkan_enable2,
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
+#ifdef XRT_OS_ANDROID
+		if (xret == XRT_ERROR_DEVICE_CREATION_FAILED && dp_factory_vk != NULL) {
+			// #2490: the display processor did not come up; nothing would
+			// reach the panel, so say so instead of running dark.
+			return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
+			                 "Failed to create VK native compositor: the display processor failed to "
+			                 "initialize (%d); see logcat for the vendor plug-in's reason",
+			                 xret);
+		}
+#endif
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create VK native compositor: %d", xret);
 	}

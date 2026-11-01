@@ -807,8 +807,9 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	// The DP that weaves. Same Vulkan plug-in factory the per-session Android
 	// render path drives; the vendor DP takes no window (pure offscreen weaver)
 	// and renders into whatever we hand it via set_target_color_view. Its async
-	// init must be kicked off from a Looper-bearing thread, and we are on an IPC
-	// handler thread — so hop to the service main thread (#510 M2).
+	// init must be kicked off from a Looper-bearing thread, and we may be on an IPC
+	// handler thread or a bare app thread — so hop to a Looper thread (#510 M2,
+	// #2490).
 	// One DP by design (#2218 item 6 audit): an Android device has one panel;
 	// per-screen weaving is the desktop-Linux engine's (comp_multi_weave_linux.c).
 	xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)mc->msc->base.info.dp_factory_vk;
@@ -823,9 +824,11 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	    .out_xdp = &mc->weave.dp,
 	    .result = XRT_SUCCESS,
 	};
-	android_run_on_main_thread_blocking(weave_run_dp_factory_on_main_thread, &ctx);
-	if (ctx.result != XRT_SUCCESS || mc->weave.dp == NULL) {
-		U_LOG_E("weave(#1036): Vulkan DP factory failed: %d", ctx.result);
+	// In-process (no service main thread) this lands on the caller's Looper
+	// or, when the caller has none, the runtime-owned looper thread (#2490).
+	xrt_result_t hop = android_run_on_looper_thread_timeout(weave_run_dp_factory_on_main_thread, &ctx, 0);
+	if (hop != XRT_SUCCESS || ctx.result != XRT_SUCCESS || mc->weave.dp == NULL) {
+		U_LOG_E("weave(#1036): Vulkan DP factory failed: hop %d, factory %d", hop, ctx.result);
 		return false;
 	}
 

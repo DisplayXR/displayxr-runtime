@@ -125,6 +125,8 @@
 // android_globals (XR_DXR_android_surface_binding); we consume it for both the
 // DP weave phase and the per-window Kooima canvas.
 #include "android/android_globals.h"
+// #2490: vendor DP init on a Looper thread.
+#include "android/android_main_thread.h"
 // #1401: the container-scaled tell itself, shared with the state tracker.
 #include "android/android_mini_window_tell.h"
 
@@ -14201,6 +14203,28 @@ apply_window_pos_override(int32_t *left, int32_t *top)
 #endif
 
 
+#ifdef XRT_OS_ANDROID
+//! Arguments for running the Vulkan DP factory on a Looper thread (#2490).
+struct vk_dp_factory_call
+{
+	xrt_dp_factory_vk_fn_t factory;
+	void *vk_bundle;
+	void *cmd_pool;
+	void *window_handle;
+	int32_t target_format;
+	struct xrt_display_processor **out_xdp;
+	xrt_result_t result;
+};
+
+static void
+vk_dp_factory_call_run(void *data)
+{
+	struct vk_dp_factory_call *call = (struct vk_dp_factory_call *)data;
+	call->result =
+	    call->factory(call->vk_bundle, call->cmd_pool, call->window_handle, call->target_format, call->out_xdp);
+}
+#endif
+
 /*!
  * Create the session's VULKAN display processor on the app device.
  *
@@ -14365,15 +14389,49 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 			    (void *)c->repaint_queue, (void *)saved_main_queue);
 		}
 		c->dp_create_attempted = true;
+#ifdef XRT_OS_ANDROID
+		/*
+		 * #2490: a vendor DP may post its async init to the calling thread's
+		 * Looper. This runs on the app thread that called xrCreateSession,
+		 * which often has none (an engine render thread), and then the DP
+		 * silently never came up. Run the factory on a Looper thread: the
+		 * caller's own if it has one, otherwise the runtime-owned one. The
+		 * call is synchronous, so the queue swap above still brackets it.
+		 */
+		struct vk_dp_factory_call call = {
+		    .factory = factory,
+		    .vk_bundle = &c->vk,
+		    .cmd_pool = (void *)(uintptr_t)c->cmd_pool,
+		    .window_handle = dp_window_handle,
+		    .target_format = (int32_t)VK_FORMAT_B8G8R8A8_UNORM,
+		    .out_xdp = &c->display_processor,
+		    .result = XRT_ERROR_DEVICE_CREATION_FAILED,
+		};
+		xrt_result_t hop = android_run_on_looper_thread_timeout(vk_dp_factory_call_run, &call, 0);
+		xrt_result_t dp_ret = hop != XRT_SUCCESS ? hop : call.result;
+#else
 		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool, dp_window_handle,
 		                              (int32_t)VK_FORMAT_B8G8R8A8_UNORM, &c->display_processor);
+#endif
 		c->vk.main_queue->queue = saved_main_queue;
 		// #1484: a fresh DP's colour state is unknown; the weave sites assert it.
 		c->dp_atlas_encoding_latched = -1;
 		c->pq_dp_asked = NULL; // #2340: nor been asked about PQ
 		if (dp_ret != XRT_SUCCESS) {
-			U_LOG_W("VK display processor factory failed (error %d), continuing without", (int)dp_ret);
 			c->display_processor = NULL;
+#ifdef XRT_OS_ANDROID
+			/*
+			 * #2490: on Android the DP is the only thing that puts pixels on
+			 * the panel for this compositor; "continuing without" meant a
+			 * session that accepts frames and shows nothing. Fail the create
+			 * so xrCreateSession reports it.
+			 */
+			U_LOG_E("VK display processor factory failed (error %d): failing session creation",
+			        (int)dp_ret);
+			return XRT_ERROR_DEVICE_CREATION_FAILED;
+#else
+			U_LOG_W("VK display processor factory failed (error %d), continuing without", (int)dp_ret);
+#endif
 		} else {
 			U_LOG_W("VK display processor created via factory");
 			// Weave scope, once — see the D3D11 leg. VK output is a window.

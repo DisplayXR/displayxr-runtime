@@ -144,8 +144,10 @@ multi_dp_factory_create(xrt_dp_factory_vk_fn_t factory,
 	    .out_xdp = out_xdp,
 	    .result = XRT_SUCCESS,
 	};
+	// Service: the main Looper. In-process: the caller's Looper if it has
+	// one, else the runtime-owned looper thread (#2490).
 	xrt_result_t ret =
-	    android_run_on_main_thread_timeout(run_dp_factory_on_main_thread, &ctx, 2000 * U_TIME_1MS_IN_NS);
+	    android_run_on_looper_thread_timeout(run_dp_factory_on_main_thread, &ctx, 2000 * U_TIME_1MS_IN_NS);
 	return ret == XRT_SUCCESS ? ctx.result : ret;
 #else
 	return factory(vk_bundle, vk_cmd_pool, window_handle, target_format, out_xdp);
@@ -2138,8 +2140,33 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 			                            (int32_t)ct->format,                            // target_format
 			                            &mc->session_render.display_processor);         // out_xdp
 			if (dp_ret != XRT_SUCCESS) {
-				U_LOG_W("Display processor factory failed: %d (continuing without)", dp_ret);
 				mc->session_render.display_processor = NULL;
+#ifdef XRT_OS_ANDROID
+				if (!android_main_thread_dispatch_is_initialized()) {
+					/*
+					 * #2490: in-process there is nothing else that would
+					 * weave, so running on would accept frames and show a
+					 * black panel. Tell the app instead: the session is
+					 * lost. (The service keeps its #1007 behaviour — a
+					 * busy main Looper must not cost the client its
+					 * session.)
+					 */
+					U_LOG_E(
+					    "Display processor factory failed: %d — no weave is possible; raising "
+					    "session loss",
+					    dp_ret);
+					union xrt_session_event xse = XRT_STRUCT_INIT;
+					xse.type = XRT_SESSION_EVENT_LOSS_PENDING;
+					xse.loss_pending.loss_time_ns = os_monotonic_get_ns();
+					(void)multi_compositor_push_event(mc, &xse);
+					union xrt_session_event lost = XRT_STRUCT_INIT;
+					lost.type = XRT_SESSION_EVENT_LOST;
+					(void)multi_compositor_push_event(mc, &lost);
+				} else
+#endif
+				{
+					U_LOG_W("Display processor factory failed: %d (continuing without)", dp_ret);
+				}
 			} else {
 				U_LOG_W("Created display processor via factory for HWND %p",
 				        mc->session_render.external_window_handle);
