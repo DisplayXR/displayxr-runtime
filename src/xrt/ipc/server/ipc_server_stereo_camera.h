@@ -22,6 +22,7 @@
 #pragma once
 
 #include "xrt/xrt_instance.h"
+#include "xrt/xrt_stereo_camera.h"
 #include "util/u_camera_consent.h"
 #include "util/u_stereo_uvc.h"
 
@@ -212,7 +213,9 @@ struct ipc_server_stereo_camera_status
 	uint32_t started_streams; //!< > 0 = "3D camera in use"
 	bool sharing_enabled;     //!< the user's persistent toggle
 	bool locked;              //!< OS session locked: every stream suspended
-	char consumers[256];      //!< "browser.exe, call-app.exe" (base names / Android packages, de-duplicated)
+	char consumers[256];      //!< "browser.exe, call-app.exe" (base names / Android packages, de-duplicated;
+	                          //!< an in-process component by its display name)
+	uint32_t component_streams; //!< of started_streams: in-process consumers (input providers)
 };
 
 //! false = no manager (service still starting).
@@ -233,6 +236,87 @@ ipc_server_stereo_camera_set_session_locked(bool locked, const char *why);
 
 bool
 ipc_server_stereo_camera_is_session_locked(void);
+
+
+/*
+ *
+ * In-process consumers (the input host iface's shared-camera slot,
+ * `xrt_input_plugin_host_iface::open_shared_camera`): an input provider
+ * loaded in the service reads the display's shared camera straight from this
+ * manager — a CAMERA_CONSUMER stream with no connection (never an IPC
+ * self-connection). Same ring, layout, wake handle and start path as the IPC
+ * form; consent subject "<service exe>#<provider id>"; the kill switch, the
+ * sharing toggle, the session lock and the indicator apply; it counts
+ * against the CAMERA_CONSUMER quota; the foreground rule exempts it (no
+ * window). These address the process's one manager and are safe from any
+ * thread; an open may block (an unverified provider is prompted).
+ *
+ */
+
+struct ipc_server;
+struct ipc_server_stereo_camera_internal;
+
+//! Give the manager its server, so in-process consumers share the CAMERA_CONSUMER quota with connections.
+void
+ipc_server_stereo_camera_attach_server(struct ipc_server_stereo_camera *mgr, struct ipc_server *s);
+
+//! How many in-process consumers are open (the connection quota counts them too).
+uint32_t
+ipc_server_stereo_camera_internal_consumer_count(void);
+
+struct ipc_server_stereo_camera_internal_request
+{
+	const char *provider_id;  //!< the provider's iface id (consent subject suffix), required
+	const char *display_name; //!< what the prompt / tray name it by (NULL = provider_id)
+	/*!
+	 * The host's verdict on the provider binary (ADR-054 N4b signed /
+	 * allowlisted / platform-trusted): consent step 4a, ALLOWED with no
+	 * prompt and no store read. false = the ordinary per-subject path.
+	 */
+	bool component_trusted;
+	uint64_t camera_id;   //!< 0 = the active display's own camera
+	uint32_t output;      //!< enum xrt_stereo_camera_output: RECTIFIED only
+	float max_frame_rate; //!< 0 = the source's rate
+};
+
+struct ipc_server_stereo_camera_internal_info
+{
+	struct xrt_stereo_camera_properties props;
+	struct xrt_stereo_camera_calibration calib; //!< RECTIFIED; zeroed when the camera has none
+	struct xrt_stereo_camera_stream_layout layout;
+	const uint8_t *map; //!< the ring (layout.section_size bytes), valid until close
+	//! The stream's wake (manager-owned, valid until close; never close it).
+	xrt_graphics_sync_handle_t wake;
+};
+
+struct ipc_server_stereo_camera_internal_frame
+{
+	struct xrt_stereo_camera_frame_info info;
+	const uint8_t *plane[2]; //!< into the ring; [1] NULL for a one-plane format
+};
+
+xrt_result_t
+ipc_server_stereo_camera_internal_open(const struct ipc_server_stereo_camera_internal_request *req,
+                                       struct ipc_server_stereo_camera_internal_info *out_info,
+                                       struct ipc_server_stereo_camera_internal **out);
+
+/*!
+ * XRT_SUCCESS + a frame, XRT_TIMEOUT (nothing newer within @p timeout_ms), or
+ * XRT_ERROR_STEREO_CAMERA_STREAM_ENDED. @p out_state (may be NULL): the
+ * camera state as an app is told it (enum xrt_stereo_camera_state).
+ */
+xrt_result_t
+ipc_server_stereo_camera_internal_acquire(struct ipc_server_stereo_camera_internal *c,
+                                          uint32_t timeout_ms,
+                                          struct ipc_server_stereo_camera_internal_frame *out_frame,
+                                          uint32_t *out_state);
+
+void
+ipc_server_stereo_camera_internal_release(struct ipc_server_stereo_camera_internal *c, uint64_t frame_index);
+
+//! Stop + free; NULL is ignored. Safe after the manager is gone.
+void
+ipc_server_stereo_camera_internal_close(struct ipc_server_stereo_camera_internal *c);
 
 #ifdef __cplusplus
 }

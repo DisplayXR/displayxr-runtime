@@ -30,6 +30,8 @@
 
 #include "tests_stereo_camera_manager_glue.h"
 
+#include "server/ipc_server_stereo_camera.h" // the in-process consumer API
+
 #include "os/os_time.h"
 #include "util/u_stereo_camera.h"
 
@@ -748,4 +750,177 @@ TEST_CASE(
 			u_stereo_uvc_fake_set_fault(U_STEREO_UVC_FAKE_FAULT_UNSET);
 		}
 	}
+}
+
+
+/*
+ *
+ * In-process consumers (the input host iface's shared-camera slot): a
+ * CAMERA_CONSUMER stream with no connection, on the same ring / layout /
+ * wake as the IPC form, counted in the status and the quota.
+ *
+ */
+
+namespace {
+
+ipc_server_stereo_camera_internal_request
+internal_request(const char *id = "sim-input", bool trusted = true)
+{
+	ipc_server_stereo_camera_internal_request rq{};
+	rq.provider_id = id;
+	rq.display_name = "DisplayXR Sim Input";
+	rq.component_trusted = trusted;
+	rq.camera_id = 0; // the active display's camera (here: the only one)
+	rq.output = XRT_STEREO_CAMERA_OUTPUT_RECTIFIED;
+	rq.max_frame_rate = 0.0f;
+	return rq;
+}
+
+//! Acquire until a frame arrives or @p budget_ms passes.
+xrt_result_t
+acquire_one(ipc_server_stereo_camera_internal *h,
+            ipc_server_stereo_camera_internal_frame *fr,
+            uint32_t *state,
+            int budget_ms = 3000)
+{
+	xrt_result_t r = XRT_TIMEOUT;
+	for (int waited = 0; waited < budget_ms && r == XRT_TIMEOUT; waited += 100) {
+		r = ipc_server_stereo_camera_internal_acquire(h, 100, fr, state);
+	}
+	return r;
+}
+
+} // namespace
+
+TEST_CASE("manager + UVC fake: an in-process consumer gets the IPC stream's layout and frames",
+          "[stereo_camera_manager][internal]")
+{
+	u_stereo_uvc_config cfg = fake_config();
+	scm_fixture *f = scm_create(&cfg);
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1);
+
+	ipc_server_stereo_camera_internal_request rq = internal_request();
+	ipc_server_stereo_camera_internal_info info;
+	ipc_server_stereo_camera_internal *h = nullptr;
+	REQUIRE(ipc_server_stereo_camera_internal_open(&rq, &info, &h) == XRT_SUCCESS);
+	REQUIRE(h != nullptr);
+	CHECK(ipc_server_stereo_camera_internal_consumer_count() == 1);
+
+	// The same values a CAMERA_CONSUMER connection gets from get_properties /
+	// get_calibration / get_section.
+	CHECK(info.props.source == XRT_STEREO_CAMERA_SOURCE_UVC);
+	CHECK(info.props.eye_width == 640);
+	CHECK(info.calib.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED);
+	CHECK(info.calib.baseline_mm == Catch::Approx(60.0f));
+	CHECK(info.layout.width == 1280);
+	CHECK(info.layout.height == 480);
+	CHECK(info.layout.format == XRT_STEREO_CAMERA_FORMAT_GRAY8);
+	CHECK(info.layout.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED);
+	CHECK(info.layout.transport == XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY);
+	CHECK(info.layout.slot_count == U_STEREO_CAMERA_RING_SLOTS);
+	CHECK(info.layout.slot_stride >= 1280ull * 480ull);
+	CHECK(info.layout.slot_stride % 4096 == 0);
+	CHECK(info.layout.section_size == info.layout.slot_stride * U_STEREO_CAMERA_RING_SLOTS);
+	REQUIRE(info.map != nullptr);
+
+	// The tray counts it and names it by the provider's display name.
+	ipc_server_stereo_camera_status st;
+	REQUIRE(ipc_server_stereo_camera_get_status(&st));
+	CHECK(st.started_streams == 1);
+	CHECK(st.component_streams == 1);
+	CHECK(std::string(st.consumers).find("DisplayXR Sim Input") != std::string::npos);
+
+	ipc_server_stereo_camera_internal_frame fr;
+	uint32_t state = 0;
+	REQUIRE(acquire_one(h, &fr, &state) == XRT_SUCCESS);
+	CHECK(state == XRT_STEREO_CAMERA_STATE_AVAILABLE);
+	CHECK(fr.info.width == 1280);
+	CHECK(fr.info.height == 480);
+	CHECK(fr.info.format == XRT_STEREO_CAMERA_FORMAT_GRAY8);
+	CHECK(fr.info.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED);
+	CHECK(fr.info.frame_index > 0);
+	CHECK(fr.info.row_pitch[0] >= 1280);
+	CHECK(fr.info.slot < U_STEREO_CAMERA_RING_SLOTS);
+	// Planes at slot * slot_stride + plane_offset — exactly the IPC consumer's arithmetic.
+	CHECK(fr.plane[0] == info.map + fr.info.slot * info.layout.slot_stride + fr.info.plane_offset[0]);
+	CHECK(fr.plane[1] == nullptr);
+	ipc_server_stereo_camera_internal_release(h, fr.info.frame_index);
+	// A second frame is a newer one.
+	ipc_server_stereo_camera_internal_frame fr2;
+	REQUIRE(acquire_one(h, &fr2, &state) == XRT_SUCCESS);
+	CHECK(fr2.info.frame_index > fr.info.frame_index);
+
+	SECTION("session lock: no frames, state SUSPENDED; unlock resumes")
+	{
+		ipc_server_stereo_camera_set_session_locked(true, "test");
+		xrt_result_t r = XRT_SUCCESS;
+		for (int i = 0; i < 10 && r == XRT_SUCCESS; i++) { // drain anything published before the lock
+			r = ipc_server_stereo_camera_internal_acquire(h, 200, &fr, &state);
+		}
+		CHECK(r == XRT_TIMEOUT);
+		CHECK(state == XRT_STEREO_CAMERA_STATE_SUSPENDED);
+		ipc_server_stereo_camera_set_session_locked(false, "test");
+		CHECK(acquire_one(h, &fr, &state) == XRT_SUCCESS);
+	}
+	SECTION("sharing off ends the stream; a new open is DISABLED")
+	{
+		REQUIRE(ipc_server_stereo_camera_set_sharing(false, "test"));
+		CHECK(ipc_server_stereo_camera_internal_acquire(h, 100, &fr, &state) ==
+		      XRT_ERROR_STEREO_CAMERA_STREAM_ENDED);
+		ipc_server_stereo_camera_internal *h2 = nullptr;
+		CHECK(ipc_server_stereo_camera_internal_open(&rq, &info, &h2) == XRT_ERROR_STEREO_CAMERA_DISABLED);
+		CHECK(h2 == nullptr);
+		CHECK(ipc_server_stereo_camera_internal_consumer_count() == 1); // the ended one is still open
+		REQUIRE(ipc_server_stereo_camera_set_sharing(true, "test"));
+	}
+	SECTION("the CAMERA_CONSUMER quota (4) holds, RAW is refused")
+	{
+		ipc_server_stereo_camera_internal *more[3] = {};
+		for (auto &m : more) {
+			ipc_server_stereo_camera_internal_info i2;
+			REQUIRE(ipc_server_stereo_camera_internal_open(&rq, &i2, &m) == XRT_SUCCESS);
+		}
+		ipc_server_stereo_camera_internal_info i5;
+		ipc_server_stereo_camera_internal *fifth = nullptr;
+		CHECK(ipc_server_stereo_camera_internal_open(&rq, &i5, &fifth) == XRT_ERROR_CLIENT_LIMIT_REACHED);
+		for (auto &m : more) {
+			ipc_server_stereo_camera_internal_close(m);
+		}
+		ipc_server_stereo_camera_internal_request raw = internal_request();
+		raw.output = XRT_STEREO_CAMERA_OUTPUT_RAW;
+		CHECK(ipc_server_stereo_camera_internal_open(&raw, &i5, &fifth) == XRT_ERROR_NOT_AUTHORIZED);
+		CHECK(ipc_server_stereo_camera_internal_consumer_count() == 1);
+	}
+
+	ipc_server_stereo_camera_internal_close(h);
+	CHECK(ipc_server_stereo_camera_internal_consumer_count() == 0);
+	REQUIRE(ipc_server_stereo_camera_get_status(&st));
+	CHECK(st.started_streams == 0);
+	scm_destroy(f);
+}
+
+TEST_CASE("manager: an in-process consumer outlives the manager safely", "[stereo_camera_manager][internal]")
+{
+	u_stereo_uvc_config cfg = fake_config();
+	scm_fixture *f = scm_create(&cfg);
+	REQUIRE(f != nullptr);
+	ipc_server_stereo_camera_internal_request rq = internal_request();
+	ipc_server_stereo_camera_internal_info info;
+	ipc_server_stereo_camera_internal *h = nullptr;
+	REQUIRE(ipc_server_stereo_camera_internal_open(&rq, &info, &h) == XRT_SUCCESS);
+
+	// Service shutdown destroys the manager before the input providers' devices.
+	scm_destroy(f);
+	CHECK(ipc_server_stereo_camera_internal_consumer_count() == 0);
+	ipc_server_stereo_camera_internal_frame fr;
+	uint32_t state = 0;
+	CHECK(ipc_server_stereo_camera_internal_acquire(h, 50, &fr, &state) == XRT_ERROR_STEREO_CAMERA_STREAM_ENDED);
+	CHECK(state == XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+	ipc_server_stereo_camera_internal_release(h, 1);
+	ipc_server_stereo_camera_internal_close(h); // frees the handle, touches no manager
+
+	// And with no manager at all an open is "unavailable", not a crash.
+	ipc_server_stereo_camera_internal *h2 = nullptr;
+	CHECK(ipc_server_stereo_camera_internal_open(&rq, &info, &h2) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
 }

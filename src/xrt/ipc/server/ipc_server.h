@@ -1058,6 +1058,14 @@ uint32_t
 ipc_server_client_class_quota(const struct ipc_server *s, uint32_t client_class);
 
 /*!
+ * How many admitted connections hold @p client_class right now (takes the
+ * global state lock). The stereo camera manager uses it for the CAMERA_CONSUMER
+ * quota its in-process consumers share with connections.
+ */
+uint32_t
+ipc_server_client_class_count(struct ipc_server *s, uint32_t client_class);
+
+/*!
  * Function pointer the IPC server calls to learn whether the active
  * workspace controller advertises Tier 1 file-dialog support (registry
  * value `SupportsFileDialog = REG_DWORD 1` under its registration).
