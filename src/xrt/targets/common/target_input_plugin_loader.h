@@ -376,6 +376,50 @@ target_input_plugin_set_display_geometry(const struct xrt_input_host_display_geo
 const struct xrt_input_plugin_host_iface *
 target_input_plugin_get_host_iface(void);
 
+/*
+ *
+ * Shared stereo camera (the host iface's open_shared_camera slots, ADR-043 /
+ * tracking-provider-discovery.md §10 item 2).
+ *
+ */
+
+/*!
+ * What implements the host iface's shared-camera slots. This library is
+ * linked into both the service and the in-process runtime, but the camera
+ * manager exists only in the service (the IPC server), so the service
+ * registers its implementation here (`targets/service/main.c`); with nothing
+ * registered — the in-process runtime — every open returns
+ * `XRT_ERROR_FEATURE_NOT_SUPPORTED`.
+ *
+ * The loader resolves the calling provider by its id first (unknown id =
+ * `XRT_ERROR_NOT_AUTHORIZED`) and passes its display name and its ADR-054 N4b
+ * verdict (`enum target_component_provenance`) to @ref open; it hands the
+ * ops FULL-size structs and copies the provider's `struct_size` prefix in and
+ * out, so an implementation never deals with ABI versions. @p impl is the
+ * implementation's own per-stream handle.
+ */
+struct target_input_shared_camera_ops
+{
+	xrt_result_t (*open)(void *ctx,
+	                     const char *provider_id,
+	                     const char *display_name,
+	                     uint32_t provenance,
+	                     struct xrt_input_host_camera_open *inout,
+	                     void **out_impl);
+	xrt_result_t (*acquire)(
+	    void *ctx, void *impl, uint32_t timeout_ms, struct xrt_input_host_camera_frame *out, uint32_t *out_state);
+	void (*release)(void *ctx, void *impl, uint64_t frame_index);
+	void (*close)(void *ctx, void *impl);
+};
+
+/*!
+ * Register (or clear, NULL) the shared-camera implementation. @p ops must stay
+ * valid for the process lifetime (static storage). Register before providers
+ * open a camera; streams already open keep the ops they were opened with.
+ */
+void
+target_input_plugin_loader_set_shared_camera_ops(const struct target_input_shared_camera_ops *ops, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif
