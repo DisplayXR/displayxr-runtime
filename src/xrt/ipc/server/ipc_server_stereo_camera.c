@@ -191,6 +191,16 @@ DEBUG_GET_ONCE_NUM_OPTION(stereo_camera_prompt_timeout_ms, "DXR_STEREO_CAMERA_PR
 #define VISIBILITY_TTL_NS (250ll * 1000 * 1000) //!< foreground-rule cache per stream
 //! A2 front-camera gate: a weave submit this recent means "presents woven 3D".
 #define PRESENTING_WINDOW_NS (1000ll * 1000 * 1000)
+/*!
+ * A2 front-camera gate at start: how long a start waits for the app's first
+ * weave before it is refused. A browser asks for the camera while the page
+ * that will show it is still loading (or right as it returns from the
+ * background), ~100 ms before its first weave submit; a one-shot check
+ * refused it and the page fell back to another camera. An app that never
+ * weaves still gets BUSY, after this long.
+ */
+#define PRESENTING_GRACE_NS (3000ll * 1000 * 1000)
+#define PRESENTING_POLL_NS (50ll * 1000 * 1000)
 #define PROMPT_TIMEOUT_MS 60000u                //!< an unanswered consent prompt = refused
 #define PROMPT_TIMEOUT_MIN_MS 1000u             //!< DXR_STEREO_CAMERA_PROMPT_TIMEOUT_MS clamp (dev only)
 #define PROMPT_TIMEOUT_MAX_MS 600000u
@@ -807,6 +817,30 @@ uid_presenting(volatile struct ipc_client_state *ics, long uid, int64_t now)
 		}
 	}
 	return false;
+}
+
+/*!
+ * uid_presenting(), waiting up to PRESENTING_GRACE_NS for it to become true.
+ * Called without the manager lock, on the requesting connection's own thread
+ * (a start already blocks there for the consent prompt).
+ */
+static bool
+uid_presenting_within_grace(volatile struct ipc_client_state *ics, long uid)
+{
+	const int64_t t0 = (int64_t)os_monotonic_get_ns();
+	int64_t now = t0;
+	while (!uid_presenting(ics, uid, now)) {
+		if (now - t0 >= PRESENTING_GRACE_NS) {
+			return false;
+		}
+		os_nanosleep(PRESENTING_POLL_NS);
+		now = (int64_t)os_monotonic_get_ns();
+	}
+	if (now != t0) {
+		U_LOG_W("stereo_camera_stream_start: the app started presenting %.0f ms after asking for the front camera",
+		        (double)(now - t0) / 1e6);
+	}
+	return true;
 }
 
 //! Is @p exe a registered consent-delegating client (cheap store read)?
@@ -3407,14 +3441,15 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 	os_mutex_unlock(&m->lock);
 
 	// A2 front gate first: an app that may not take the front camera now is
-	// not asked for consent it could not use (checked again below).
+	// not asked for consent it could not use (checked again below). The app
+	// gets PRESENTING_GRACE_NS to start weaving: it typically asks just before
+	// its first weave submit.
 	if (!u_camera_consent_user_facing_gate(needs_presenting, true,
-	                                       !needs_presenting ||
-	                                           uid_presenting(ics, peer_uid, (int64_t)os_monotonic_get_ns()))) {
+	                                       !needs_presenting || uid_presenting_within_grace(ics, peer_uid))) {
 		U_LOG_W(
 		    "stereo_camera_stream_start: stream %llu refused for pid %ld — a user-facing camera needs a live "
-		    "weave from the same app in this process (BUSY)",
-		    (unsigned long long)stream_id, ics->peer_pid);
+		    "weave from the same app in this process, none within %lld ms (BUSY)",
+		    (unsigned long long)stream_id, ics->peer_pid, PRESENTING_GRACE_NS / (1000ll * 1000));
 		return XRT_ERROR_STEREO_CAMERA_BUSY;
 	}
 
