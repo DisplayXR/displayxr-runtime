@@ -46,7 +46,7 @@ static const struct knob g_knobs[] = {
     {{"TRACKING_SWAY_PERIOD_MS", XRT_COMPONENT_SETTING_TYPE_INT, "4000", "fake tracking: sway period (>= 100)"},
      "FAKE_TRACKING_SWAY_PERIOD_MS"},
     // Panel geometry + output.
-    {{"OUTPUT", XRT_COMPONENT_SETTING_TYPE_ENUM, "blend",
+    {{"OUTPUT", XRT_COMPONENT_SETTING_TYPE_ENUM, "anaglyph",
       "initial output mode: 2d|passthrough, anaglyph, sbs, squeezed|squeezed_sbs, quad, interlaced, blend"},
      "OUTPUT"},
     {{"FORCE_MODE", XRT_COMPONENT_SETTING_TYPE_INT, "-1",
