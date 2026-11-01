@@ -50,6 +50,11 @@
  *                           thumb+index pinch, or never pinching.
  *   - `HAND_DISTANCE_M` = m — circle centres in front of the glass (0.25).
  *
+ * `SOURCE` = script | shared-camera — what presence follows (default script:
+ * always present). shared-camera is the reference consumer of the host
+ * iface's shared-camera slot (`sim_input_shared_camera.h`): presence follows
+ * the display's shared stereo camera, the hands stay scripted.
+ *
  * @author David Fattal
  * @ingroup drv_sim_input
  */
@@ -64,6 +69,7 @@
 
 #include "sim_input_interface.h"
 #include "sim_input_settings.h"
+#include "sim_input_shared_camera.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -100,6 +106,9 @@ sim_input_plugin_probe(struct xrt_input_plugin_instance **out_inst)
 
 /*! The host iface (process-lifetime runtime storage, §4b.6); set at negotiate. */
 static const struct xrt_input_plugin_host_iface *g_host = NULL;
+
+/*! SOURCE=shared-camera: presence follows the shared camera's frames. */
+static bool g_source_shared_camera = false;
 
 /*!
  * The physical display height from the host's display geometry (the display
@@ -190,6 +199,20 @@ sim_input_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 		    (double)sim_input_hand_radius(display_h, distance, viewer_z), (double)hand_scale, (double)gain);
 	}
 
+	/* SOURCE: what presence follows. shared-camera opens the display's shared
+	 * stereo camera here, on demand (never in probe), and presence follows its
+	 * frames; the hand script below is the same either way. */
+	if (sim_input_setting("SOURCE", v, sizeof(v)) && strcmp(v, "script") != 0) {
+		if (strcmp(v, "shared-camera") == 0) {
+			g_source_shared_camera = true;
+			U_LOG_W(
+			    "sim-input: SOURCE=shared-camera - presence follows the display's shared stereo camera.");
+			sim_input_shared_camera_start(g_host);
+		} else {
+			U_LOG_W("sim-input: SOURCE='%s' is not script|shared-camera - using script.", v);
+		}
+	}
+
 	struct xrt_device *left = sim_input_create_controller(XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, &lcfg);
 	struct xrt_device *right = sim_input_create_controller(XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER, &rcfg);
 	struct xrt_device *navdev = NULL;
@@ -225,13 +248,20 @@ sim_input_plugin_destroy(struct xrt_input_plugin_instance *inst)
 {
 	(void)inst;
 	/* No instance state — devices are destroyed by the runtime via
-	 * their own xrt_device::destroy. */
+	 * their own xrt_device::destroy. The shared-camera stream (if any) is
+	 * the provider's own: close it. */
+	sim_input_shared_camera_stop();
 }
 
 static enum xrt_input_provider_presence
 sim_input_plugin_get_presence(struct xrt_input_plugin_instance *inst)
 {
 	(void)inst;
+	/* SOURCE=shared-camera: present exactly while the display's shared
+	 * camera delivers frames (the poll thread's verdict; non-blocking). */
+	if (g_source_shared_camera) {
+		return sim_input_shared_camera_presence();
+	}
 	/* Simulated hardware is present exactly when it was asked for, and
 	 * probe() already enforced the opt-in — so once we are loaded at all,
 	 * the answer is yes, and the roles stay with us rather than bouncing

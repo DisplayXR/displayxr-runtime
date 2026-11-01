@@ -45,6 +45,11 @@ static const struct xrt_component_setting_desc g_descs[] = {
      "the hand's own size, in display heights per metre of real hand (joint offsets about the wrist/palm and "
      "joint radii), the Ultraleap relative mapping's gain: a 10 cm hand shows as 0.25 x the display height. "
      "Display-metric, never the window. <= 0 = 1:1 metres. The circle centres and radius do not change"},
+    {"SOURCE", XRT_COMPONENT_SETTING_TYPE_ENUM, "script",
+     "what the provider's presence follows: script (always present once enabled) | shared-camera (the "
+     "display's shared stereo camera through the host's open_shared_camera slot: PRESENT while its frames "
+     "flow, ABSENT while no 3D session holds the display's tracker or the camera is unavailable; the hands "
+     "stay scripted either way)"},
 };
 
 //! KEY -> the DXR_SIM_INPUT* variable it replaces (one release; removed with the next major cleanup).
