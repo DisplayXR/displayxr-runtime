@@ -177,7 +177,7 @@ will deliver it.
 **Lifetime in the service.** The decision is made when the service creates its system and is
 static for that service run (the scan is one-shot per process; the advertisement every client
 reads is static per instance). The provider starts on the first IPC locate that needs it and stops
-at system teardown, or earlier at the §4a idle stop (out-of-process hosting). The service subscribes the tracking class to its policy watch only to say,
+at system teardown, or earlier at the §4a idle stop (hosted out of process or in the service). The service subscribes the tracking class to its policy watch only to say,
 once, that a registration / preference change applies at the next service start.
 
 Not covered by the service splice yet: a workspace tile framed from **another presenter's** screen
@@ -271,7 +271,10 @@ crash.
 **Fallbacks.** No host binary beside the service (`DXR_TRACKING_HOST_EXE` names another, `none`
 forces this) → the provider runs **in the service** and its sink still writes the page, so
 in-process apps beside it still share it (a 100 ms thread there beats the heartbeat and answers
-readers' demand); `status` says `hosting: "service"`. No page (creation failed, Android) → the
+readers' demand); `status` says `hosting: "service"`. The same idle stop applies there: the
+service's own viewer requests and fresh reader demand renew it, and after 10 s without either
+(time asleep not counted) the thread calls the provider's `stop()` and the page's owner state goes
+back to idle, with one WARN; the next request calls `start()` again. No page (creation failed, Android) → the
 pre-page behaviour: service and in-process apps host their own. No service → in-process load.
 
 ### 4b. Per screen: read the segment DP of THAT screen

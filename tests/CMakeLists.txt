@@ -975,6 +975,9 @@ if(TARGET tests_oxr_view_space)
 	# POSIX only: discovery there reads XRT_PLUGIN_SEARCH_PATH, while Windows
 	# discovery is registry-only, so the arms would find no provider and fail
 	# (CI's per-class conformance step covers the Windows registry path).
+	# XRT_PREFERRED_TRACKING_PLUGIN_ID pins sim-tracking: the search path ADDS a
+	# directory, it does not hide the system one, so a provider installed on the
+	# box (open-tracking, probe order 100) would otherwise outrank it.
 	if(NOT WIN32 AND TARGET drv_sim_tracking_plugin AND TARGET drv_sim_display_plugin)
 		set(_viewer_dir "${CMAKE_CURRENT_BINARY_DIR}/viewer_tracking_plugins/$<CONFIG>")
 		file(GENERATE
@@ -987,7 +990,7 @@ if(TARGET tests_oxr_view_space)
 		     )
 		add_dependencies(tests_oxr_view_space drv_sim_tracking_plugin drv_sim_display_plugin)
 		add_test(NAME tests_oxr_view_space_viewer_tracking
-		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1 XRT_PREFERRED_TRACKING_PLUGIN_ID=sim-tracking
 		                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_PERIOD_MS=2000
 		                 DXR_TRACKING_SIM_TRACKING_AMPLITUDE_M=0.1 DXR_VIEWER_POSE_PAGE=none
 		                 $<TARGET_FILE:tests_oxr_view_space> "[viewer_tracking]" --success --allow-running-no-tests
@@ -1008,7 +1011,7 @@ if(TARGET tests_oxr_view_space)
 				)
 			add_dependencies(tests_tracking_host displayxr-tracking-host drv_sim_tracking_plugin)
 			add_test(NAME tests_tracking_host
-			         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1
+			         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1 XRT_PREFERRED_TRACKING_PLUGIN_ID=sim-tracking
 			                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_SCRIPT=sweep
 			                 DXR_TRACKING_SIM_TRACKING_PERIOD_MS=500 DXR_TRACKING_SIM_TRACKING_AMPLITUDE_M=0.1
 			                 $<TARGET_FILE:tests_tracking_host> --success
@@ -1035,7 +1038,7 @@ if(TARGET tests_oxr_view_space)
 			set(_calib_cli "DXR_CALIB_E2E_CLI=$<TARGET_FILE:cli>")
 		endif()
 		add_test(NAME tests_tracking_calibrate_e2e
-		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1 XRT_PREFERRED_TRACKING_PLUGIN_ID=sim-tracking
 		                 "DXR_CALIB_E2E_OUT=${_calib_pairs}" ${_calib_cli} $<TARGET_FILE:tests_tracking_calibrate_e2e>
 		                 --success
 		         )
@@ -1050,7 +1053,7 @@ if(TARGET tests_oxr_view_space)
 			# No calibration stored (a config dir that does not exist): the hello's camera_pose is
 			# the default prior, the layout prior the Dashboard sizes its targets from.
 			add_test(NAME tracking_calibrate_cli_watch
-			         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1
+			         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1 XRT_PREFERRED_TRACKING_PLUGIN_ID=sim-tracking
 			                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_CAMERA=1
 			                 "XDG_CONFIG_HOME=${CMAKE_CURRENT_BINARY_DIR}/tracking_calibrate_cli_none"
 			                 $<TARGET_FILE:cli> tracking calibrate --screen E2E-1 --watch --json --count 3
