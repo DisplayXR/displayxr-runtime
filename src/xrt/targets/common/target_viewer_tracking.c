@@ -1092,8 +1092,16 @@ start_locked(void)
 	}
 #ifdef VT_HAVE_PAGE
 	if (g_hosting == VT_HOSTING_OWNER_HOST) {
-		if (!g_started && g_host != NULL) {
+		if (g_host == NULL) {
+			return;
+		}
+		// Renewed while viewers are requested: the host is stopped when idle.
+		const int64_t now = (int64_t)os_monotonic_get_ns();
+		if (!g_started || now - g_last_demand_post_ns >= (int64_t)1000 * 1000 * 1000) {
 			target_viewer_host_demand(g_host);
+			g_last_demand_post_ns = now;
+		}
+		if (!g_started) {
 			g_started = true;
 			U_LOG_W(
 			    "viewer tracking: provider '%s' requested on demand (first viewer request) — hosted in "
@@ -1271,9 +1279,10 @@ target_viewer_tracking_provider_running(uint32_t *out_status)
 	bool page_started = started;
 	if (hosting == VT_HOSTING_OWNER_HOST || hosting == VT_HOSTING_READER) {
 		// Started by anyone: this process's demand, or (the page is shared)
-		// another reader's — the host's / owner's state says.
+		// another reader's — the host's / owner's state says, also after an
+		// idle stop of a host this process once asked for.
 		struct u_vpp_owner_status o;
-		if (!page_started && g_shm.map != NULL && u_vpp_read_owner(g_shm.map, &o)) {
+		if (g_shm.map != NULL && u_vpp_read_owner(g_shm.map, &o)) {
 			page_started = o.state == U_VPP_STATE_STARTING || o.state == U_VPP_STATE_RUNNING ||
 			               o.state == U_VPP_STATE_BACKOFF;
 		}

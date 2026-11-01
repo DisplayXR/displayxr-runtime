@@ -19,7 +19,10 @@
  *    first demand, restart with a backoff of 0.5 s doubling to 30 s (reset
  *    after 60 s running), a crash-loop cutoff (5 abnormal exits in 2 min →
  *    FAILED), terminal exits (the provider is not usable / bad arguments →
- *    FAILED at once). FAILED is retried after 10 min.
+ *    FAILED at once). FAILED is retried after 10 min. An idle stop: no
+ *    demand for 10 s stops the host in order (a webcam provider then frees
+ *    the camera); the next demand spawns it again. Time the machine spent
+ *    asleep does not count toward it.
  *
  *  - **The manager** (@ref target_viewer_host): owns the
  *    `displayxr-tracking-host` child, its control channel and the
@@ -93,6 +96,7 @@ enum target_vhost_sup_state
 	TARGET_VHOST_SUP_BACKOFF = 3,  //!< after an abnormal exit; respawns at next_spawn_ns
 	TARGET_VHOST_SUP_FAILED = 4,   //!< crash loop / terminal exit; retried after failed_retry_ns
 	TARGET_VHOST_SUP_STOPPED = 5,  //!< shutting down; never respawns
+	TARGET_VHOST_SUP_STOPPING = 6, //!< idle stop asked; IDLE once it exits (killed after stop_grace_ns)
 };
 
 struct target_vhost_sup_config
@@ -104,6 +108,9 @@ struct target_vhost_sup_config
 	uint64_t crash_loop_window_ns; //!< 2 min
 	uint64_t failed_retry_ns;      //!< 10 min
 	uint64_t hello_timeout_ns;     //!< 10 s without a producer hello = a crash (the manager kills it)
+	uint64_t idle_stop_ns;         //!< 10 s with no demand stops the host (0 = never: runs until teardown)
+	uint64_t stop_grace_ns;        //!< 3 s for an idle stop before the manager kills the host
+	uint64_t suspend_gap_ns;       //!< 2 s between ticks = the machine slept; that time is not idle time
 };
 
 #define TARGET_VHOST_SUP_HISTORY 8u
@@ -112,7 +119,11 @@ struct target_vhost_sup
 {
 	struct target_vhost_sup_config cfg;
 	enum target_vhost_sup_state state;
-	bool demand;
+	bool demand;             //!< wanted now (set every tick by the manager)
+	uint64_t last_demand_ns; //!< the last tick that saw demand (shifted past a suspend)
+	uint64_t last_tick_ns;
+	bool ticked;
+	uint64_t stop_ns; //!< when the idle stop was asked
 	uint64_t spawned_ns;
 	uint64_t running_since_ns;
 	uint64_t next_spawn_ns;
@@ -122,6 +133,7 @@ struct target_vhost_sup
 	uint32_t crash_head;
 	uint32_t restarts; //!< abnormal exits so far
 	uint32_t spawns;   //!< spawns issued
+	uint32_t idle_stops; //!< idle stops issued
 	int32_t last_exit; //!< INT32_MIN = none
 };
 
@@ -129,7 +141,8 @@ enum target_vhost_sup_action
 {
 	TARGET_VHOST_SUP_ACTION_NONE = 0,
 	TARGET_VHOST_SUP_ACTION_SPAWN = 1, //!< start the host; report target_vhost_sup_spawned()
-	TARGET_VHOST_SUP_ACTION_KILL = 2,  //!< the host never said hello: terminate it (report the exit after)
+	TARGET_VHOST_SUP_ACTION_KILL = 2,  //!< no hello / an ignored stop: terminate it (report the exit after)
+	TARGET_VHOST_SUP_ACTION_STOP = 3,  //!< idle: ask the host to stop in order (report the exit after)
 };
 
 void
@@ -139,7 +152,10 @@ target_vhost_sup_config_defaults(struct target_vhost_sup_config *cfg);
 void
 target_vhost_sup_init(struct target_vhost_sup *s, const struct target_vhost_sup_config *cfg);
 
-//! Demand latches (a viewer was requested; the provider then runs until teardown).
+/*!
+ * Whether a viewer is wanted now; the manager sets it before every tick.
+ * Not latching: once it has been false for idle_stop_ns the host is stopped.
+ */
 void
 target_vhost_sup_set_demand(struct target_vhost_sup *s, bool demand);
 
@@ -163,7 +179,10 @@ target_vhost_sup_exited(struct target_vhost_sup *s, uint64_t now_ns, int32_t cod
 void
 target_vhost_sup_stop(struct target_vhost_sup *s);
 
-//! Advance time; returns the ONE action to perform now.
+/*!
+ * Advance time; returns the ONE action to perform now. A gap between ticks
+ * longer than suspend_gap_ns (the machine slept) is not counted as idle time.
+ */
 enum target_vhost_sup_action
 target_vhost_sup_tick(struct target_vhost_sup *s, uint64_t now_ns);
 
@@ -213,7 +232,11 @@ struct target_viewer_host_status
 struct target_viewer_host *
 target_viewer_host_create(const struct target_viewer_host_config *cfg);
 
-//! A viewer is needed: spawn the host (idempotent, non-blocking: the thread spawns).
+/*!
+ * A viewer is needed now: spawn the host (non-blocking: the thread spawns).
+ * Not latching: call it again at least every few seconds while a viewer is
+ * wanted (U_VPP_DEMAND_FRESH_NS); without it the host is stopped when idle.
+ */
 void
 target_viewer_host_demand(struct target_viewer_host *h);
 
