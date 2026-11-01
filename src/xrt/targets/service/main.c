@@ -29,6 +29,7 @@
 
 #include "server/ipc_server_interface.h"
 #include "server/ipc_server.h"
+#include "server/ipc_server_stereo_camera.h" // the shared-camera host slot (in-process consumers)
 #include "service_client_class.h" // #960
 
 #ifdef XRT_OS_WINDOWS
@@ -109,6 +110,110 @@ display_followup_to_reprobe(const char *reason)
 {
 	// Debounced by the worker; a no-op until ipc_server_main started it.
 	ipc_server_request_display_reprobe(reason);
+}
+
+/*
+ * The input host iface's shared-camera slots (tracking-provider-discovery.md
+ * §10 item 2): an input provider in this process reads the display's shared
+ * stereo camera IN-PROCESS from the camera manager (never an IPC
+ * self-connection). The loader (targets/common, also in the in-process
+ * runtime) cannot link the IPC server, so the service registers the
+ * implementation here; the manager is created later inside ipc_server_main
+ * and these calls resolve it at call time ("unavailable" until then).
+ *
+ * The provenance -> consent mapping lives here, between the two layers: a
+ * binary the N4b gate classified signed / allowlisted / platform-trusted is a
+ * trusted component (consent step 4a, no prompt); unverified (reachable only
+ * with Trust Enforce = 0) and dev-override are prompted like an app — unless
+ * the camera's own developer override is set, which allows everyone.
+ */
+static xrt_result_t
+shcam_open(void *ctx,
+           const char *provider_id,
+           const char *display_name,
+           uint32_t provenance,
+           struct xrt_input_host_camera_open *inout,
+           void **out_impl)
+{
+	(void)ctx;
+	const bool trusted = provenance == TARGET_COMPONENT_PROVENANCE_SIGNED ||
+	                     provenance == TARGET_COMPONENT_PROVENANCE_ALLOWLISTED ||
+	                     provenance == TARGET_COMPONENT_PROVENANCE_PLATFORM_TRUSTED;
+	const struct ipc_server_stereo_camera_internal_request req = {
+	    .provider_id = provider_id,
+	    .display_name = display_name,
+	    .component_trusted = trusted,
+	    .camera_id = inout->camera_id,
+	    .output = inout->output,
+	    .max_frame_rate = inout->max_frame_rate,
+	};
+	struct ipc_server_stereo_camera_internal_info info;
+	struct ipc_server_stereo_camera_internal *c = NULL;
+	xrt_result_t xret = ipc_server_stereo_camera_internal_open(&req, &info, &c);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (!trusted) {
+		U_LOG_W(
+		    "shared camera: provider '%s' provenance %s — consented like an app, not as a trusted component",
+		    provider_id, target_component_provenance_str(provenance));
+	}
+	inout->props = info.props;
+	inout->calib = info.calib;
+	inout->layout = info.layout;
+	inout->wake = info.wake;
+	*out_impl = c;
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+shcam_acquire(void *ctx, void *impl, uint32_t timeout_ms, struct xrt_input_host_camera_frame *out, uint32_t *out_state)
+{
+	(void)ctx;
+	struct ipc_server_stereo_camera_internal_frame f;
+	xrt_result_t xret = ipc_server_stereo_camera_internal_acquire((struct ipc_server_stereo_camera_internal *)impl,
+	                                                              timeout_ms, &f, out_state);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	out->frame_index = f.info.frame_index;
+	out->timestamp_ns = f.info.capture_time_ns;
+	out->time_is_exposure = f.info.time_is_exposure != 0;
+	out->width = f.info.width;
+	out->height = f.info.height;
+	out->format = f.info.format;
+	out->calibration_generation = f.info.calibration_generation;
+	out->plane[0] = f.plane[0];
+	out->plane[1] = f.plane[1];
+	out->row_pitch[0] = f.info.row_pitch[0];
+	out->row_pitch[1] = f.info.row_pitch[1];
+	return XRT_SUCCESS;
+}
+
+static void
+shcam_release(void *ctx, void *impl, uint64_t frame_index)
+{
+	(void)ctx;
+	ipc_server_stereo_camera_internal_release((struct ipc_server_stereo_camera_internal *)impl, frame_index);
+}
+
+static void
+shcam_close(void *ctx, void *impl)
+{
+	(void)ctx;
+	ipc_server_stereo_camera_internal_close((struct ipc_server_stereo_camera_internal *)impl);
+}
+
+static void
+register_shared_camera(void)
+{
+	static const struct target_input_shared_camera_ops ops = {
+	    .open = shcam_open,
+	    .acquire = shcam_acquire,
+	    .release = shcam_release,
+	    .close = shcam_close,
+	};
+	target_input_plugin_loader_set_shared_camera_ops(&ops, NULL);
 }
 
 static void
@@ -541,6 +646,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
 	register_status_provider();
 	register_display_followup();
+	register_shared_camera();
 	// #2250: the service may re-key a per-user screen preference stored under a legacy key.
 	target_plugin_set_screen_key_rekey(true);
 	// ADR-053 (#2005): the conversion core + the v3 lift handlers' route to it.
@@ -713,6 +819,7 @@ main(int argc, char *argv[])
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
 	register_status_provider();
 	register_display_followup();
+	register_shared_camera();
 	// #2250: the service may re-key a per-user screen preference stored under a legacy key.
 	target_plugin_set_screen_key_rekey(true);
 	// ADR-053 (#2005): the conversion core + the v3 lift handlers' route to it.

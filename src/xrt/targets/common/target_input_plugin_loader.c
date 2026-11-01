@@ -145,6 +145,10 @@ static struct input_provider_slot
 	struct xrt_input_plugin_instance *inst;
 	uint32_t probe_order;
 	char row_id[64]; //!< the registration id (row), not iface->id (N3b)
+	//! What the shared-camera slot passes on: the row's display name and the
+	//! binary's ADR-054 N4b verdict (enum target_component_provenance) at load.
+	char display_name[128];
+	uint32_t provenance;
 } g_input_providers[TARGET_COMPONENT_MAX_ENTRIES];
 
 static int g_input_provider_count = 0;
@@ -157,7 +161,7 @@ static void
 input_note_provider(const struct xrt_input_plugin_iface *iface,
                     struct xrt_input_plugin_instance *inst,
                     uint32_t order,
-                    const char *row_id)
+                    const struct target_component_entry *e)
 {
 	if (iface == NULL || g_input_provider_count >= TARGET_COMPONENT_MAX_ENTRIES) {
 		return;
@@ -166,7 +170,10 @@ input_note_provider(const struct xrt_input_plugin_iface *iface,
 	slot->iface = iface;
 	slot->inst = inst;
 	slot->probe_order = order;
-	snprintf(slot->row_id, sizeof(slot->row_id), "%s", row_id != NULL ? row_id : "");
+	snprintf(slot->row_id, sizeof(slot->row_id), "%s", e->id);
+	snprintf(slot->display_name, sizeof(slot->display_name), "%s",
+	         iface->display_name != NULL && iface->display_name[0] != '\0' ? iface->display_name : e->display_name);
+	slot->provenance = e->provenance;
 }
 
 
@@ -275,6 +282,150 @@ input_host_get_setting(const char *id, const char *key, char *buf, uint32_t buf_
 	return target_component_get_setting(&g_input_class, id, key, buf, buf_size, NULL);
 }
 
+/*
+ *
+ * Shared stereo camera slots: forwarded to what the service registered
+ * (target_input_plugin_loader_set_shared_camera_ops); nothing registered —
+ * the in-process runtime — means "no camera manager in this process".
+ *
+ */
+
+static const struct target_input_shared_camera_ops *volatile g_shcam_ops = NULL;
+static void *volatile g_shcam_ctx = NULL;
+
+//! The host's per-stream record behind the opaque handle a provider holds.
+struct xrt_input_host_camera
+{
+	const struct target_input_shared_camera_ops *ops;
+	void *ctx;
+	void *impl;
+};
+
+void
+target_input_plugin_loader_set_shared_camera_ops(const struct target_input_shared_camera_ops *ops, void *ctx)
+{
+	g_shcam_ctx = ctx;
+	g_shcam_ops = ops;
+}
+
+//! The resident provider calling with @p id (its iface id, else its row id), or NULL.
+static const struct input_provider_slot *
+input_provider_by_id(const char *id)
+{
+	if (id == NULL || id[0] == '\0') {
+		return NULL;
+	}
+	for (int p = 0; p < g_input_provider_count; p++) {
+		const struct input_provider_slot *slot = &g_input_providers[p];
+		if (slot->iface != NULL && slot->iface->id != NULL && strcmp(slot->iface->id, id) == 0) {
+			return slot;
+		}
+	}
+	for (int p = 0; p < g_input_provider_count; p++) {
+		if (strcmp(g_input_providers[p].row_id, id) == 0) {
+			return &g_input_providers[p];
+		}
+	}
+	return NULL;
+}
+
+static xrt_result_t
+input_host_open_shared_camera(const char *provider_id,
+                              struct xrt_input_host_camera_open *inout,
+                              struct xrt_input_host_camera **out_cam)
+{
+	if (out_cam == NULL) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	*out_cam = NULL;
+	// The in fields must be covered; out fields the provider's size does not
+	// cover are simply not written back.
+	if (inout == NULL || inout->struct_size < offsetof(struct xrt_input_host_camera_open, props)) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	const struct input_provider_slot *slot = input_provider_by_id(provider_id);
+	if (slot == NULL) {
+		U_LOG_W("input plugin loader: open_shared_camera from unknown provider id '%s' — refused.",
+		        provider_id != NULL ? provider_id : "(null)");
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+	const struct target_input_shared_camera_ops *ops = g_shcam_ops;
+	void *ctx = g_shcam_ctx;
+	if (ops == NULL || ops->open == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // no camera manager in this process
+	}
+
+	struct xrt_input_host_camera_open full;
+	memset(&full, 0, sizeof(full));
+	const uint32_t caller_size = inout->struct_size;
+	const size_t copy = caller_size < sizeof(full) ? caller_size : sizeof(full);
+	memcpy(&full, inout, copy);
+	full.struct_size = (uint32_t)sizeof(full);
+
+	struct xrt_input_host_camera *cam = (struct xrt_input_host_camera *)calloc(1, sizeof(*cam));
+	if (cam == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	void *impl = NULL;
+	xrt_result_t xret = ops->open(ctx, provider_id, slot->display_name, slot->provenance, &full, &impl);
+	if (xret != XRT_SUCCESS) {
+		free(cam);
+		return xret;
+	}
+	cam->ops = ops;
+	cam->ctx = ctx;
+	cam->impl = impl;
+	memcpy(inout, &full, copy);
+	inout->struct_size = caller_size;
+	*out_cam = cam;
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+input_host_camera_acquire(struct xrt_input_host_camera *cam,
+                          uint32_t timeout_ms,
+                          struct xrt_input_host_camera_frame *out,
+                          uint32_t *out_state)
+{
+	if (out_state != NULL) {
+		*out_state = XRT_STEREO_CAMERA_STATE_UNAVAILABLE;
+	}
+	if (cam == NULL || cam->ops->acquire == NULL) {
+		return XRT_ERROR_STEREO_CAMERA_STREAM_ENDED;
+	}
+	struct xrt_input_host_camera_frame full;
+	memset(&full, 0, sizeof(full));
+	full.struct_size = (uint32_t)sizeof(full);
+	xrt_result_t xret = cam->ops->acquire(cam->ctx, cam->impl, timeout_ms, &full, out_state);
+	if (out != NULL && out->struct_size >= sizeof(uint32_t)) {
+		const uint32_t caller_size = out->struct_size;
+		const size_t copy = caller_size < sizeof(full) ? caller_size : sizeof(full);
+		memcpy(out, &full, copy);
+		out->struct_size = caller_size;
+	}
+	return xret;
+}
+
+static void
+input_host_camera_release(struct xrt_input_host_camera *cam, uint64_t frame_index)
+{
+	if (cam != NULL && cam->ops->release != NULL) {
+		cam->ops->release(cam->ctx, cam->impl, frame_index);
+	}
+}
+
+static void
+input_host_close_shared_camera(struct xrt_input_host_camera *cam)
+{
+	if (cam == NULL) {
+		return;
+	}
+	if (cam->ops->close != NULL) {
+		cam->ops->close(cam->ctx, cam->impl);
+	}
+	free(cam);
+}
+
 /*!
  * Fill @ref g_input_host once and hand it out. Called from
  * `input_try_load_one` immediately before `negotiate`.
@@ -298,6 +449,12 @@ input_host_iface(void)
 		// hand-tracking provider reading a webcam gets the pose head tracking
 		// calibrated (tracking-provider-discovery.md §6).
 		g_input_host.get_camera_pose = target_camera_pose_host_get;
+		// The display's shared stereo camera as a hands source: forwarded to the
+		// service's camera manager when it registered one, else "unavailable".
+		g_input_host.open_shared_camera = input_host_open_shared_camera;
+		g_input_host.camera_acquire = input_host_camera_acquire;
+		g_input_host.camera_release = input_host_camera_release;
+		g_input_host.close_shared_camera = input_host_close_shared_camera;
 		g_input_host_filled = true;
 	}
 	return &g_input_host;
@@ -583,7 +740,7 @@ input_discover_all(void)
 		if (iface != NULL) {
 			// Keep going: every claiming provider is a live
 			// candidate the arbiter can fall back to.
-			input_note_provider(iface, inst, is_pref ? 0 : e->probe_order, e->id);
+			input_note_provider(iface, inst, is_pref ? 0 : e->probe_order, e);
 			continue;
 		}
 		if (declined) {
