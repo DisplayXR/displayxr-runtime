@@ -658,8 +658,9 @@ identically. `tracking_calibrate_cli_solve`, `tracking_calibrate_cli_watch` and
 - A provider on a **plain colour webcam** opens it itself, on demand (§3), subject to the OS camera
   permission and the runtime's tracker-camera denylist (ADR-043 Amendment 5: never a display's
   claimed tracker camera).
-- A provider on **the display's shared stereo camera** is an ADR-043 camera consumer (follow-up,
-  §10). Being a consumer does **not** keep the display's tracker running: the shared display stream
+- A provider on **the display's shared stereo camera** is an ADR-043 camera consumer (§10 item 2;
+  as built, an **input** provider through the input host iface, `input-provider-discovery.md`
+  §4d). Being a consumer does **not** keep the display's tracker running: the shared display stream
   carries frames **only while the display itself is tracking a viewer** (a 3D session on that
   screen). Such a provider therefore works only during 3D sessions on that screen — exactly where
   the display's own eyes win the viewer role anyway — unless the display vendor adds a camera-only
@@ -792,10 +793,12 @@ apps beside a service reading the page instead of opening the camera again.
    responsibility disclaimed, so the grant is the host's (§8);
    `tracking calibrate --watch` still hosts its own provider rather than reading the page (item 4);
    an in-process app that starts *before* the service has created the page keeps its own
-   provider for its instance (the decision is static per instance); Windows hardware runs of the
-   host (the `Local\` page across integrity levels, the job object) are owed by the Windows box.
-2. **Provider as an ADR-043 camera consumer** (with the §7 constraint) — through a reserved host
-   slot.
+   provider for its instance (the decision is static per instance).
+2. ~~**Provider as an ADR-043 camera consumer** (with the §7 constraint) — through a reserved host
+   slot~~ — **done**: the shared camera is an **input**-provider source, through the input host
+   iface's shared-camera slots (`input-provider-discovery.md` §4d) under the `component` consent
+   verdict of ADR-043 Amendment 6; a viewer provider on this camera stays out per §7, and the
+   tracking host iface's reserved slots are untouched.
 3. **`screen_hint` contract** for a provider that measures several screens natively (one camera per
    screen, or a calibrated multi-screen rig): today every sample is in the primary's display space
    and the trunk maps it (§4b); a provider-supplied hint would bypass the mapping for its screen.
