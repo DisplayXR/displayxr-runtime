@@ -34,11 +34,13 @@
 #include "util/u_stereo_camera.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -472,6 +474,36 @@ TEST_CASE("A2 front-camera rule: no live weave is BUSY, with or without the deve
 	CHECK(scm_stream_start(f, sid) == XRT_SUCCESS);
 	CHECK(scm_stream_destroy(f, sid) == XRT_SUCCESS);
 	scm_destroy(f);
+}
+
+TEST_CASE("A2 front-camera rule: a weave that starts just after the request lets the start through",
+          "[stereo_camera_manager][android]")
+{
+	// A browser asks for the front camera while its page is still loading (or
+	// right as it returns from the background), ~100 ms before its first weave
+	// submit. The start waits a short grace for that weave instead of refusing.
+	const char *ids_a[] = {"test:front"};
+	const char *names_a[] = {"Front 3D camera"};
+	scm_fake_plugin_set(ids_a, names_a, 1);
+	scm_set_front_rule(true);
+	scm_fixture *f = scm_create_fake_plugin_ex(-1);
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1);
+	xrt_stereo_camera_stream_request req = {props_at(f, 0).id, XRT_STEREO_CAMERA_OUTPUT_RAW,
+	                                        XRT_STEREO_CAMERA_FORMAT_GRAY8,
+	                                        XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY, 0.0f};
+	uint64_t sid = 0;
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	scm_set_live_weave(f, false);
+	std::thread weaver([f] {
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		scm_set_live_weave(f, true);
+	});
+	CHECK(scm_stream_start(f, sid) == XRT_SUCCESS);
+	weaver.join();
+	CHECK(scm_stream_destroy(f, sid) == XRT_SUCCESS);
+	scm_destroy(f);
+	scm_set_front_rule(false);
 }
 
 TEST_CASE("re-enumeration: each camera reports its screen, and a move is a change", "[stereo_camera_manager][rescan]")
