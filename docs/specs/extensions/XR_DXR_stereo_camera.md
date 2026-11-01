@@ -488,7 +488,12 @@ a Deny is. An installer's machine-wide registration never touches the user's sto
 Deny keeps winning. `camera deny` on a delegating executable notes that the Deny wins.
 
 This table is the one statement of the order; `u_camera_consent.h`, the developer guide and the
-roadmap refer to it.
+roadmap refer to it. One consumer does not enter it through these entry points: an input provider
+inside the service opening the shared camera through the input host iface
+(`docs/specs/runtime/input-provider-discovery.md` §4d) is judged by the `component` verdict of
+ADR-043 Amendment 6 — row 1 and the session-lock suspend still apply, a provider the provenance
+gate admitted as signed / allowlisted / platform-trusted is allowed without a prompt, and any other
+provider is evaluated per executable through this table like an app.
 
 #### 7.1.1 Trusting a delegating entry (spec v3)
 

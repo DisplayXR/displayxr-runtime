@@ -891,6 +891,107 @@ applied separately at view level and never enters N), and, optionally, an
 emulated `khr/simple_controller` pair driven by the pad's buttons so the app
 gets `xrSyncActions` controllers for the first time.
 
+## 4d. Shared stereo camera — hands from the display's tracker camera
+
+**Normative.** A hands provider may read the display's own stereo tracker camera — the ADR-043
+camera the display plug-in exposes — instead of a camera of its own. That camera streams only
+while a 3D session on its screen holds the display's tracker (`tracking-provider-discovery.md`
+§7), so it is a **hands** source, never a viewer source, and its consumer is an input provider.
+Input providers run inside the service process on every desktop OS, so the open is **in-process**,
+straight into the service's camera manager; it never goes over IPC (a provider connecting to its
+own service as a `CAMERA_CONSUMER` would be a self-connection, and the consent prompt would name
+the service).
+
+### 4d.1 Host slots
+
+Four slots on `struct xrt_input_plugin_host_iface`, carved append-only from the reserved slots
+(size and offsets unchanged, API major stays 1; NULL on an older runtime, announced by
+`XRT_INPUT_PLUGIN_HOST_HAS_SHARED_CAMERA` — cover-check `struct_size` before use):
+
+| Slot | Contract |
+|---|---|
+| `open_shared_camera(provider_id, req, out)` | Opens a RECTIFIED stream on the requested camera and returns an opaque `struct xrt_input_host_camera *`. `provider_id` is the provider's iface `id`; consent and the in-use indicator key on it (§4d.3). Fails when no camera manager exists in the process, no matching camera exists, sharing is off, or consent refuses. |
+| `camera_acquire(cam, timeout_ms, frame, out_state)` | Waits up to `timeout_ms` for the next frame. On a frame it fills `*frame` and reports the stream as flowing in `*out_state`; otherwise `*out_state` says why there is none (WAITING — the display has no tracking party — or suspended / ended). |
+| `camera_release(cam, frame_index)` | Returns the frame's slot. The plane pointers of `frame_index` are valid from `camera_acquire` until this call and not after. |
+| `close_shared_camera(cam)` | Stops the stream and frees the handle. |
+
+`struct xrt_input_host_camera_open` is in/out — what the provider asks for, then what it got:
+
+| Field | Dir | Meaning |
+|---|---|---|
+| `struct_size` | in | `sizeof` the caller's struct (prefix semantics) |
+| `camera_id` | in | the camera to open; 0 = the camera of the screen the session is on |
+| `max_frame_rate` | in | an upper bound; 0 = the camera's own rate |
+| `output` | in | RECTIFIED only; RAW is refused, as for every non-plug-in consumer |
+| `props`, `calib` | out | `struct xrt_stereo_camera_properties` and `struct xrt_stereo_camera_calibration` of the opened stream (rectified calibration) |
+| `layout` | out | `struct xrt_stereo_camera_stream_layout` of the stream's ring — the IPC transport's layout, so a provider is one transport away from the IPC form |
+| `wake` | out | `xrt_graphics_sync_handle_t` signalled on each new frame, for a provider that waits on its own thread instead of polling `camera_acquire` |
+
+`struct xrt_input_host_camera_frame` is what `camera_acquire` fills:
+
+| Field | Meaning |
+|---|---|
+| `struct_size` | prefix semantics, as above |
+| `frame_index`, `timestamp_ns`, `time_is_exposure` | monotonic frame counter (the key for `camera_release`), the frame time in the runtime's monotonic domain, and whether that time is the exposure (true) or the arrival (false) |
+| `width`, `height`, `format` | full side-by-side size; `format` is GRAY8 |
+| `plane[2]`, `row_pitch[2]` | plane 0 is the full rectified side-by-side image (left eye = left half) with its row pitch; plane 1 is the second plane of a two-plane format, NULL for GRAY8 |
+| `calibration_generation` | moves when the stream's calibration changes |
+
+The layout is the IPC transport's (ADR-043: planes at the slot's offset, per-plane row pitch,
+calibration, a wake handle), so a provider written against the slot is one transport away from the
+IPC form if it is ever hosted out of process.
+
+### 4d.2 Provider contract
+
+- `probe()` **never** opens the camera (§3 — probe is cheap and side-effect free).
+  `create_devices()` opens it through `open_shared_camera`, on demand, and `destroy()` closes it.
+- Frames are rectified GRAY8 side by side at the display tracker's native rate. The provider takes
+  `props` / `calib` once from the open and re-reads them when a frame's `calibration_generation`
+  differs from the one it holds.
+- The camera's pose relative to the panel is the **display vendor's** calibration, carried in
+  `props` / `calib`: no `CAMERA_POSE_<n>` setting, no `get_camera_pose` lookup and no
+  `tracking-provider-discovery.md` §6 solve — this is the display's own tracker camera, not a
+  webcam on the bezel.
+- Hand poses go out through the existing hands path (§4a anchoring, rig-local devices, §4b.4); the
+  slot changes only where the landmarks come from.
+- Presence follows the stream, so the hands exist only while a 3D session on that screen is
+  tracking the user:
+
+| Slot state | Provider presence | Arbiter effect (§4) |
+|---|---|---|
+| Slots NULL (older runtime), or `open_shared_camera` fails | `XRT_INPUT_PROVIDER_PRESENCE_ABSENT` | the hands go to the next present candidate (e.g. a cabled Ultraleap), else the floor |
+| `camera_acquire` reports WAITING (no 3D party holds the display's tracker) | `ABSENT` — the rig releases the hands rather than freezing the last pose | same fall-through |
+| frames flowing | `XRT_INPUT_PROVIDER_PRESENCE_PRESENT` | the provider holds the hand roles at the next presence poll (≤ ~250 ms, §4b.2) |
+| suspended or ended (sharing turned off, session locked, stream ended) | `ABSENT` | same fall-through; PRESENT again when frames flow |
+
+### 4d.3 Consent
+
+The open is evaluated by the **`component`** consent verdict of
+[ADR-043 *Amendment 6*](../../adr/ADR-043-stereo-camera-source.md): sharing off → refused and a
+locked session → suspended, as for an app; a provider the ADR-054 N4b provenance gate admitted as
+`signed` / `allowlisted` / `platform-trusted` is allowed with no per-executable prompt and no store
+lookup; any other classification (`unverified`, loadable only under `Trust\Enforce` = 0, or
+`dev-override`) is evaluated per executable like an app, prompt included. The in-use indicator
+fires with the provider's `display_name` (*"3D camera in use by <provider display name>"*). The
+stream is visibility-exempt (no window, like a `CAMERA_CONSUMER`) and counts against the
+`CAMERA_CONSUMER` quota.
+
+### 4d.4 In-process runtimes
+
+An app that runs the runtime **in-process** loads its input providers into the app (*Host process*, at the top of
+this spec), where there is no camera manager. The slots are still present, `open_shared_camera`
+fails as unavailable, and the provider reports `ABSENT` for the life of the instance — the hands
+fall to the next candidate. The in-process runtime never reaches for the service's camera over IPC
+on the provider's behalf.
+
+### 4d.5 Testing without hardware
+
+`sim_input` exercises the contract with `SOURCE` = `shared-camera` (§5): it opens the slot at
+`create_devices` and drives its scripted hands only while frames flow — `PRESENT` with frames,
+`ABSENT` on WAITING, suspend, end or a failed open — logging one WARN per transition with the frame
+count, so the fall-through and the hand-back can be watched in the service log with any 3D session
+as the tracking party. The default `SOURCE` = `script` never touches the camera.
+
 ## 5. In-tree reference providers
 
 | Provider | Status | Purpose |
@@ -951,6 +1052,7 @@ new):
 | `PINCH` | enum | `wave` | `wave` — the #825 open→fist curl wave (3 s), both hands staggered half a cycle; `hold` — thumb and index tips held pinched (≈ 6.5 mm apart), other fingers relaxed; `open` — every finger relaxed, never a pinch. `HANDS=right PINCH=hold` is a single sustained pinch whose root moves on the circle: a one-hand drag. |
 | `HAND_DISTANCE_M` | float | `0.25` | distance of the circle centres in front of the glass, metres; ≤ 0 / unparseable = the default |
 | `HAND_SCALE_H_PER_M` | float | `2.5` | the hand's **own** size, in display heights per metre of real hand: joint offsets about the root (wrist / palm) and joint radii (and joint linear velocities relative to the root) scale by `gain·H`. The default is the Ultraleap provider's relative-mapping gain, so the sim hand is drawn the way the reference viewer app shows a Leap hand — a 10 cm hand on a 0.194 m panel shows as 0.25·H ≈ 4.9 cm. ≤ 0 = 1:1 metres (the pre-gain behaviour). The circle centres and radius are unchanged (the circle is already in display heights) |
+| `SOURCE` | enum | `script` | `script` — the scripted hands above, always present; `shared-camera` — open the display's shared stereo camera through the host slots (§4d) and report the scripted hands `PRESENT` only while frames flow, `ABSENT` otherwise (no 3D party, suspended, ended, or the open failed, e.g. in an in-process runtime), one WARN per transition. The poses stay scripted; the camera only gates presence |
 
 **The sim hands are display-metric and do not follow the window canvas.**
 `H` in the placement and in `HAND_SCALE_H_PER_M` is the PHYSICAL display

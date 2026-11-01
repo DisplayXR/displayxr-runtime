@@ -289,3 +289,60 @@ others' trackers are covered by the built-in list only. The Leia plug-in still h
 the slot (its known-camera table and name rule map onto it directly). `displayxr-cli camera
 uvc-devices` applies the built-in list only (it cannot see the service's plug-in).
 
+
+## Amendment 6 (2026-11-01) — a `component` consent verdict for in-service input providers
+
+Every consumer the decision and Amendments 1–5 consider is a **peer executable**: an app or a
+browser that connects to the service, whose verified executable path is what consent keys on —
+stored Allow / Deny, delegation, the prompt's wording. A hands provider on the display's shared
+stereo camera is not one. Input providers are loaded **inside the service process** on every
+desktop OS (ADR-034), and the shared camera streams only while a 3D session on that screen holds
+the display's tracker (tracking-provider spec §7), so the camera is a hands source and its
+consumer is an input provider. Routing that provider through the ordinary path would mean the
+service connecting to itself as an IPC `CAMERA_CONSUMER`: a self-connection on its own IPC thread
+pool, and a peer executable that is the service — so the prompt would read *"displayxr-service
+wants to use the 3D camera"*, a question about the runtime the user cannot meaningfully answer.
+
+**Decision.** An in-service input provider opens the shared camera **in-process**, through a host
+slot on the input host iface (`open_shared_camera` / `camera_acquire` / `camera_release` /
+`close_shared_camera`, input-provider spec §4d), straight into the camera manager's source
+dispatch — never over IPC. Consent gets a new verdict, **`component`**:
+
+1. **Still applied first**, exactly as for an app: sharing off (`DXR_STEREO_CAMERA=0` or the
+   "Share the 3D camera" toggle) → `DISABLED`; a locked or switched-away session → the stream is
+   suspended.
+2. **A provider the ADR-054 N4b provenance gate admitted as `signed`, `allowlisted` or
+   `platform-trusted` is allowed** — no per-executable prompt, no store lookup, no store entry.
+   The gate has already decided, by signature or by an administrator's allowlist, that this binary
+   is a component of the installation; asking the user again about the same binary under the
+   service's name would add a dialog and no information.
+3. **Any other classification is evaluated like an app.** An `unverified` provider — loadable only
+   while `HKLM\Software\DisplayXR\Trust\Enforce` = 0 — and a `dev-override` one go through the
+   ordinary per-executable evaluation of spec §7.1, prompt included, so a provider nobody vouched
+   for stays visible to the user.
+4. **The in-use indicator fires** for the provider's stream like any other, naming the provider:
+   *"3D camera in use by <provider display name>"* (the `display_name` from its iface).
+5. **The stream is visibility-exempt** (the provider has no window, like a `CAMERA_CONSUMER`) and
+   **counts against the `CAMERA_CONSUMER` quota**. Output is RECTIFIED only; RAW is refused.
+
+The in-process slot returns the same stream layout the IPC transport does (frame planes, row
+pitches, calibration, a wake handle), so a provider written against it is one transport away from
+the IPC form.
+
+**What this is not.** It is **not** a viewer (tracking) provider on this camera: without a
+camera-only wake from the display vendor the stream exists only when the display is already
+tracking the viewer, so a viewer provider on it would add nothing (tracking-provider spec §7). If a
+vendor adds that wake, the tracking provider runs in the out-of-process tracking host and takes
+the ordinary IPC `CAMERA_CONSUMER` route as that host executable, with its consent entry seeded by
+the installer — no prompt, and no `component` verdict, which applies to in-service input providers
+only. Nor does the verdict skip the prompt for an unproven binary: rule 3 is the guard.
+
+**Consequences.** **+** Hands from the display's own tracker camera with no prompt about the
+runtime and no IPC self-connection. **+** The user-visible privacy contract is unchanged: the
+indicator, the sharing toggle and the session-lock suspend cover the provider's stream exactly as
+they cover an app's; what the verdict removes is a prompt the user could only answer about
+DisplayXR itself. **−** Trust for these streams now rests on the provenance gate: weakening N4b
+(a broader allowlist, `Enforce` = 0 left on) widens who gets the camera without asking, which is
+why an unverified provider falls back to the prompt rather than to the verdict. **−** The
+`component` verdict is a second consent entry point beside the §7.1 table; the input-provider spec
+§4d and this amendment are its statement.
