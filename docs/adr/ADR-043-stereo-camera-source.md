@@ -296,9 +296,9 @@ Every consumer the decision and Amendments 1–5 consider is a **peer executable
 browser that connects to the service, whose verified executable path is what consent keys on —
 stored Allow / Deny, delegation, the prompt's wording. A hands provider on the display's shared
 stereo camera is not one. Input providers are loaded **inside the service process** on every
-desktop OS (ADR-034), and the shared camera streams only while a 3D session on that screen holds
-the display's tracker (tracking-provider spec §7), so the camera is a hands source and its
-consumer is an input provider. Routing that provider through the ordinary path would mean the
+desktop OS (ADR-034), and the shared camera is the display's own tracker camera — whether it streams without a 3D
+session is the vendor's behaviour (tracking-provider spec §7) — so the camera is a hands source
+and its consumer is an input provider. Routing that provider through the ordinary path would mean the
 service connecting to itself as an IPC `CAMERA_CONSUMER`: a self-connection on its own IPC thread
 pool, and a peer executable that is the service — so the prompt would read *"displayxr-service
 wants to use the 3D camera"*, a question about the runtime the user cannot meaningfully answer.
@@ -329,9 +329,10 @@ The in-process slot returns the same stream layout the IPC transport does (frame
 pitches, calibration, a wake handle), so a provider written against it is one transport away from
 the IPC form.
 
-**What this is not.** It is **not** a viewer (tracking) provider on this camera: without a
-camera-only wake from the display vendor the stream exists only when the display is already
-tracking the viewer, so a viewer provider on it would add nothing (tracking-provider spec §7). If a
+**What this is not.** It is **not** a viewer (tracking) provider on this camera: on a display whose camera runs only while it tracks a viewer the stream exists only when the
+display is already tracking, and on one that streams on open the display's own tracker already
+serves the viewer role — a viewer provider on it adds nothing either way (tracking-provider spec
+§7). If a
 vendor adds that wake, the tracking provider runs in the out-of-process tracking host and takes
 the ordinary IPC `CAMERA_CONSUMER` route as that host executable, with its consent entry seeded by
 the installer — no prompt, and no `component` verdict, which applies to in-service input providers

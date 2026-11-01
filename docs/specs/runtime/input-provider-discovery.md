@@ -894,9 +894,11 @@ gets `xrSyncActions` controllers for the first time.
 ## 4d. Shared stereo camera — hands from the display's tracker camera
 
 **Normative.** A hands provider may read the display's own stereo tracker camera — the ADR-043
-camera the display plug-in exposes — instead of a camera of its own. That camera streams only
-while a 3D session on its screen holds the display's tracker (`tracking-provider-discovery.md`
-§7), so it is a **hands** source, never a viewer source, and its consumer is an input provider.
+camera the display plug-in exposes — instead of a camera of its own. Whether that camera streams without a 3D session is the display vendor's behaviour
+(`tracking-provider-discovery.md` §7: an older Leia SR delivered frames only while a 3D session
+held the display's tracker; the current one streams on open), so a provider on it follows the
+stream's state. Either way it is a **hands** source, never a viewer source, and its consumer is
+an input provider.
 Input providers run inside the service process on every desktop OS, so the open is **in-process**,
 straight into the service's camera manager; it never goes over IPC (a provider connecting to its
 own service as a `CAMERA_CONSUMER` would be a self-connection, and the consent prompt would name
@@ -954,13 +956,14 @@ IPC form if it is ever hosted out of process.
   webcam on the bezel.
 - Hand poses go out through the existing hands path (§4a anchoring, rig-local devices, §4b.4); the
   slot changes only where the landmarks come from.
-- Presence follows the stream, so the hands exist only while a 3D session on that screen is
-  tracking the user:
+- Presence follows the stream: on a display that delivers frames only while a 3D session holds
+  its tracker, the hands exist only during such sessions; on one that streams on open, they are
+  present whenever the camera is shared:
 
 | Slot state | Provider presence | Arbiter effect (§4) |
 |---|---|---|
 | Slots NULL (older runtime), or `open_shared_camera` fails | `XRT_INPUT_PROVIDER_PRESENCE_ABSENT` | the hands go to the next present candidate (e.g. a cabled Ultraleap), else the floor |
-| `camera_acquire` reports WAITING (no 3D party holds the display's tracker) | `ABSENT` — the rig releases the hands rather than freezing the last pose | same fall-through |
+| `camera_acquire` reports WAITING (the display delivers frames only with a 3D party, and none holds its tracker) | `ABSENT` — the rig releases the hands rather than freezing the last pose | same fall-through |
 | frames flowing | `XRT_INPUT_PROVIDER_PRESENCE_PRESENT` | the provider holds the hand roles at the next presence poll (≤ ~250 ms, §4b.2) |
 | suspended or ended (sharing turned off, session locked, stream ended) | `ABSENT` | same fall-through; PRESENT again when frames flow |
 
@@ -989,8 +992,9 @@ on the provider's behalf.
 `sim_input` exercises the contract with `SOURCE` = `shared-camera` (§5): it opens the slot at
 `create_devices` and drives its scripted hands only while frames flow — `PRESENT` with frames,
 `ABSENT` on WAITING, suspend, end or a failed open — logging one WARN per transition with the frame
-count, so the fall-through and the hand-back can be watched in the service log with any 3D session
-as the tracking party. The default `SOURCE` = `script` never touches the camera.
+count, so the fall-through and the hand-back can be watched in the service log (on a display that
+streams on open, the WAITING leg shows only as the open handshake; the FLOWING leg and the role
+hand-over still show). The default `SOURCE` = `script` never touches the camera.
 
 ## 5. In-tree reference providers
 
