@@ -170,6 +170,7 @@ struct CameraConsentJni
 	jmethodID prompt = nullptr;         //!< int prompt(Context, String, String, int)
 	jmethodID in_use = nullptr;         //!< void inUseChanged(Context, int, String)
 	jmethodID has_cert = nullptr;       //!< boolean hasSigningCertificate(Context, String, String)
+	jmethodID foreground = nullptr;     //!< static boolean consumerInForeground()
 } g_cam;
 
 JNIEnv *
@@ -314,6 +315,23 @@ cam_ensure_service_camera(void * /*ctx*/, uint32_t timeout_ms)
 	return ok == JNI_TRUE;
 }
 
+bool
+cam_consumer_foreground(void * /*ctx*/)
+{
+	bool attached = false;
+	JNIEnv *env = cam_env(&attached);
+	if (env == nullptr || g_cam.foreground == nullptr) {
+		return false;
+	}
+	jboolean ok = env->CallStaticBooleanMethod(g_cam.cls, g_cam.foreground);
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		ok = JNI_FALSE;
+	}
+	cam_env_done(env, attached);
+	return ok == JNI_TRUE;
+}
+
 enum u_camera_consent_prompt_answer
 cam_prompt(void * /*ctx*/, const char *subject, const char *app_name, long /*pid*/, uint32_t timeout_ms)
 {
@@ -389,6 +407,7 @@ cam_consent_init(JNIEnv *env, JavaVM *vm, jobject context)
 	g_cam.has_cert = env->GetStaticMethodID(g_cam.cls, "hasSigningCertificate",
 	                                        "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Z");
 	jmethodID start_watching = env->GetStaticMethodID(g_cam.cls, "startWatching", "(Landroid/content/Context;)V");
+	g_cam.foreground = env->GetStaticMethodID(g_cam.cls, "consumerInForeground", "()Z");
 	if (env->ExceptionCheck() || store_dir == nullptr || start_watching == nullptr) {
 		env->ExceptionClear();
 		U_LOG_E(
@@ -416,6 +435,7 @@ cam_consent_init(JNIEnv *env, JavaVM *vm, jobject context)
 	p.prompt = cam_prompt;
 	p.ensure_service_camera = cam_ensure_service_camera;
 	p.user_facing_requires_presenting = true; // option R (stereo-camera-android §1.2)
+	p.consumer_foreground = cam_consumer_foreground;
 	p.gave_up_is_suspended = true;            // the OS takes the camera in the background
 	ipc_server_stereo_camera_set_platform(&p);
 	ipc_server_stereo_camera_set_indicator_provider(cam_indicator, nullptr);

@@ -173,11 +173,20 @@ struct ipc_server_stereo_camera_platform
 	/*!
 	 * Option R (§1.2): a USER_FACING camera starts only for a peer whose uid
 	 * presents woven 3D in this process (a weave submit in the last second,
-	 * or a visible session), else BUSY; a started one delivers no frames and
-	 * reads SUSPENDED while that stops being true. The developer override
-	 * (DXR_STEREO_CAMERA_DEV_ALLOW) does not lift it.
+	 * a visible session, or a weave present-owner connection while
+	 * @ref consumer_foreground says its app is on top), else BUSY; a started
+	 * one delivers no frames and reads SUSPENDED while that stops being true.
+	 * The developer override (DXR_STEREO_CAMERA_DEV_ALLOW) does not lift it.
 	 */
 	bool user_facing_requires_presenting;
+	/*!
+	 * Is this process's consumer app on top right now, with the screen
+	 * unlocked? (Android: the satellite serves one package and is BOUND_TOP
+	 * exactly while that package is the top app.) Lets a weave present-owner
+	 * take the front camera before its first weave submit, which needs the
+	 * camera's frames. NULL = no such signal. Called without the manager lock.
+	 */
+	bool (*consumer_foreground)(void *ctx);
 	/*!
 	 * A source that gave up after it had delivered (the OS took the camera:
 	 * app in the background, sensor privacy) keeps its started streams
