@@ -54,12 +54,15 @@ struct fake_store
 	uint8_t secret[32] = {1, 2, 3};
 	int sets = 0;
 	bool set_fails = false;
+	//! Store reads (get + get_delegation): a trusted component must cause none.
+	int reads = 0;
 };
 
 bool
 fs_get(void *ctx, const char *exe, u_camera_consent_stored *out)
 {
 	auto *s = (fake_store *)ctx;
+	s->reads++;
 	auto it = s->apps.find(exe);
 	if (it == s->apps.end()) {
 		return false;
@@ -85,6 +88,7 @@ fs_set(void *ctx, const char *exe, u_camera_consent_stored v)
 bool
 fs_get_delegation(void *ctx, const char *exe, u_camera_consent_delegation *out)
 {
+	((fake_store *)ctx)->reads++;
 	auto &m = ((fake_store *)ctx)->delegating.m;
 	auto it = m.find(exe);
 	if (it == m.end()) {
@@ -331,7 +335,8 @@ TEST_CASE("camera consent: DECLINE_DELEGATION skips the delegation step", "[came
 	}
 	SECTION("unknown flag bits are ignored")
 	{
-		auto d = r.eval(b, 100, 0xfffffffeu);
+		// Bits 0 (DECLINE_DELEGATION) and 1 (COMPONENT_TRUSTED, host-set only) are defined.
+		auto d = r.eval(b, 100, 0xfffffffcu);
 		CHECK(d.why == U_CAMERA_CONSENT_WHY_DELEGATING);
 	}
 	SECTION("an unregistered executable is unaffected by the flag")
@@ -1392,4 +1397,152 @@ TEST_CASE("android consent: the user-facing gate", "[camera_consent][android]")
 	CHECK_FALSE(u_camera_consent_user_facing_gate(true, true, false)); // front, no live weave
 	CHECK(u_camera_consent_user_facing_gate(true, false, false));      // rear: no rule
 	CHECK(u_camera_consent_user_facing_gate(false, true, false));      // platform without the rule
+}
+
+
+/*
+ *
+ * Step 4a: an in-process runtime component (an input provider on the input
+ * host iface's shared-camera slot). The host maps the N4b provenance verdict
+ * to the flag: signed / allowlisted / platform-trusted set it, unverified and
+ * dev-override do not. The subject is "<service exe>#<provider id>".
+ *
+ */
+
+namespace {
+
+const char *const kComponent = "C:\\Program Files\\DisplayXR\\Runtime\\displayxr-service.exe#sim-input";
+
+//! What the service's shim does with a provenance verdict (main.c shcam_open).
+enum class prov
+{
+	signed_,
+	allowlisted,
+	platform_trusted,
+	dev_override,
+	unverified,
+};
+
+uint32_t
+flags_for(prov p)
+{
+	return (p == prov::signed_ || p == prov::allowlisted || p == prov::platform_trusted)
+	           ? U_CAMERA_CONSENT_FLAG_COMPONENT_TRUSTED
+	           : 0u;
+}
+
+} // namespace
+
+TEST_CASE("camera consent: a trusted component is ALLOWED with no prompt and no store read",
+          "[camera_consent][component]")
+{
+	for (prov p : {prov::signed_, prov::allowlisted, prov::platform_trusted}) {
+		rig r;
+		r.env.answer = U_CAMERA_CONSENT_PROMPT_DENY; // would refuse, were it asked
+		// Even a stored Deny for the subject is not read: the N4b gate is the consent.
+		r.store.apps[kComponent] = U_CAMERA_CONSENT_STORED_DENY;
+		const u_camera_consent_decision d = r.eval(kComponent, 4242, flags_for(p));
+		CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_COMPONENT);
+		CHECK_FALSE(d.delegating);
+		CHECK_FALSE(d.delegated);
+		CHECK(r.env.prompts == 0);
+		CHECK(r.store.reads == 0);
+		CHECK(r.store.sets == 0);
+	}
+}
+
+TEST_CASE("camera consent: an unverified or dev-override component is prompted like an app",
+          "[camera_consent][component]")
+{
+	for (prov p : {prov::unverified, prov::dev_override}) {
+		rig r;
+		r.env.answer = U_CAMERA_CONSENT_PROMPT_ALLOW_ONCE;
+		const u_camera_consent_decision d = r.eval(kComponent, 4242, flags_for(p));
+		CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_ALLOW_ONCE);
+		CHECK(r.env.prompts == 1);
+		CHECK(r.env.last_exe == kComponent);
+		CHECK(r.store.reads > 0); // the ordinary path: delegation list + stored decision
+
+		// Deny is stored against the component subject, then final.
+		rig r2;
+		r2.env.answer = U_CAMERA_CONSENT_PROMPT_DENY;
+		CHECK(r2.eval(kComponent, 4242, flags_for(p)).verdict == U_CAMERA_CONSENT_REFUSED);
+		CHECK(r2.store.apps[kComponent] == U_CAMERA_CONSENT_STORED_DENY);
+		CHECK(r2.eval(kComponent, 4242, flags_for(p)).why == U_CAMERA_CONSENT_WHY_STORED_DENY);
+		CHECK(r2.env.prompts == 1);
+	}
+}
+
+TEST_CASE("camera consent: an unverified component on a headless host is refused, not allowed",
+          "[camera_consent][component]")
+{
+	rig r;
+	r.env.answer = U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	const u_camera_consent_decision d = r.eval(kComponent, 4242, flags_for(prov::unverified));
+	CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE);
+}
+
+TEST_CASE("camera consent: the kill switch and sharing off disable a trusted component first",
+          "[camera_consent][component]")
+{
+	SECTION("kill switch")
+	{
+		rig r;
+		r.c.kill_switch = true;
+		const u_camera_consent_decision d = r.eval(kComponent, 4242, U_CAMERA_CONSENT_FLAG_COMPONENT_TRUSTED);
+		CHECK(d.verdict == U_CAMERA_CONSENT_DISABLED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_KILL_SWITCH);
+		CHECK(r.env.prompts == 0);
+	}
+	SECTION("sharing toggle off")
+	{
+		rig r;
+		r.store.sharing = false;
+		const u_camera_consent_decision d = r.eval(kComponent, 4242, U_CAMERA_CONSENT_FLAG_COMPONENT_TRUSTED);
+		CHECK(d.verdict == U_CAMERA_CONSENT_DISABLED);
+		CHECK(d.why == U_CAMERA_CONSENT_WHY_SHARING_OFF);
+		CHECK(r.env.prompts == 0);
+	}
+	SECTION("both off beat the dev override too")
+	{
+		rig r;
+		r.c.dev_override = true;
+		r.store.sharing = false;
+		CHECK(r.eval(kComponent, 4242, U_CAMERA_CONSENT_FLAG_COMPONENT_TRUSTED).verdict ==
+		      U_CAMERA_CONSENT_DISABLED);
+	}
+}
+
+TEST_CASE("camera consent: the OS camera switch still refuses a trusted component", "[camera_consent][component]")
+{
+	rig r;
+	r.env.os_allowed = false;
+	const u_camera_consent_decision d = r.eval(kComponent, 4242, U_CAMERA_CONSENT_FLAG_COMPONENT_TRUSTED);
+	CHECK(d.verdict == U_CAMERA_CONSENT_OS_DENIED);
+	CHECK(r.store.reads == 0);
+	CHECK(r.env.prompts == 0);
+}
+
+TEST_CASE("camera consent: the dev override allows an unverified component without a prompt",
+          "[camera_consent][component]")
+{
+	rig r;
+	r.c.dev_override = true;
+	const u_camera_consent_decision d = r.eval(kComponent, 4242, flags_for(prov::dev_override));
+	CHECK(d.verdict == U_CAMERA_CONSENT_ALLOWED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_DEV_OVERRIDE);
+	CHECK(r.env.prompts == 0);
+}
+
+TEST_CASE("camera consent: the component flag never rescues a missing identity", "[camera_consent][component]")
+{
+	rig r;
+	const u_camera_consent_decision d = r.eval("", 4242, U_CAMERA_CONSENT_FLAG_COMPONENT_TRUSTED);
+	CHECK(d.verdict == U_CAMERA_CONSENT_REFUSED);
+	CHECK(d.why == U_CAMERA_CONSENT_WHY_NO_IDENTITY);
+	CHECK(std::string(u_camera_consent_why_str(U_CAMERA_CONSENT_WHY_COMPONENT)).find("component") !=
+	      std::string::npos);
 }

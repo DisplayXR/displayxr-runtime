@@ -77,6 +77,8 @@ u_camera_consent_why_str(enum u_camera_consent_why why)
 	case U_CAMERA_CONSENT_WHY_PROMPT_DENY: return "prompt: Deny (stored)";
 	case U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE: return "no consent prompt available (headless / prompt off)";
 	case U_CAMERA_CONSENT_WHY_PROMPT_TIMEOUT: return "the consent prompt was not answered";
+	case U_CAMERA_CONSENT_WHY_COMPONENT:
+		return "trusted runtime component (provenance signed / allowlisted / platform-trusted)";
 	default: return "?";
 	}
 }
@@ -246,6 +248,20 @@ u_camera_consent_evaluate(struct u_camera_consent *c,
 	// 3. no identity, no consent: nothing to store a decision against.
 	if (!exe_known(exe)) {
 		decide(out, U_CAMERA_CONSENT_REFUSED, U_CAMERA_CONSENT_WHY_NO_IDENTITY);
+		return;
+	}
+	// 4 + 4a. a trusted in-process component (an input provider the N4b gate
+	//    admitted as signed / allowlisted / platform-trusted): the OS switch
+	//    still applies, then it is ALLOWED — no store read (neither the
+	//    delegating lists nor a stored decision), no prompt. Never a
+	//    delegating client: it does not expose the camera to third parties.
+	if ((flags & U_CAMERA_CONSENT_FLAG_COMPONENT_TRUSTED) != 0) {
+		if (c->env != NULL && c->env->os_camera_allowed != NULL &&
+		    !c->env->os_camera_allowed(c->env_ctx, exe)) {
+			decide(out, U_CAMERA_CONSENT_OS_DENIED, U_CAMERA_CONSENT_WHY_OS_DENIED);
+			return;
+		}
+		decide(out, U_CAMERA_CONSENT_ALLOWED, U_CAMERA_CONSENT_WHY_COMPONENT);
 		return;
 	}
 	// A fact about the executable, reported whatever the verdict (the service

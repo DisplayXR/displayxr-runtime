@@ -22,6 +22,13 @@
  *   2. DXR_STEREO_CAMERA_DEV_ALLOW=1 (dev override, logged once) -> ALLOWED
  *   3. no verifiable peer executable                           -> REFUSED
  *   4. OS camera privacy denies this executable                -> OS_DENIED
+ *   4a. a TRUSTED in-process runtime component — an input provider whose
+ *      binary the ADR-054 N4b provenance gate admitted as signed /
+ *      allowlisted / platform-trusted, opening the camera through the input
+ *      host iface (U_CAMERA_CONSENT_FLAG_COMPONENT_TRUSTED)   -> ALLOWED
+ *      (no store read, no prompt: the gate that let the binary into the
+ *      process is the consent; an unverified / dev-override binary is NOT
+ *      flagged and goes on to 5..9 like an app)
  *   5. stored per-app Deny                                     -> REFUSED
  *   6. registered consent-delegating client (a browser)         -> ALLOWED
  *      (its own per-origin prompt + indicator is the consent) — unless the
@@ -96,6 +103,14 @@ extern "C" {
  */
 //! The client declined delegation for this instance (XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR).
 #define U_CAMERA_CONSENT_FLAG_DECLINE_DELEGATION (1u << 0)
+/*!
+ * Step 4a: the peer is an in-process runtime COMPONENT (an input provider
+ * on the input host iface's shared-camera slot) whose binary the ADR-054 N4b
+ * provenance gate classified signed / allowlisted / platform-trusted. Only
+ * the host sets it, from the loader's own verdict — never from a client
+ * claim. Steps 1-4 still apply before it.
+ */
+#define U_CAMERA_CONSENT_FLAG_COMPONENT_TRUSTED (1u << 1)
 
 //! Which list a delegating entry came from.
 enum u_camera_consent_delegation_scope
@@ -169,6 +184,8 @@ enum u_camera_consent_why
 	U_CAMERA_CONSENT_WHY_PROMPT_DENY,
 	U_CAMERA_CONSENT_WHY_PROMPT_UNAVAILABLE,
 	U_CAMERA_CONSENT_WHY_PROMPT_TIMEOUT,
+	//! Step 4a: a trusted in-process runtime component (appended: values above unchanged).
+	U_CAMERA_CONSENT_WHY_COMPONENT,
 };
 
 struct u_camera_consent_decision
