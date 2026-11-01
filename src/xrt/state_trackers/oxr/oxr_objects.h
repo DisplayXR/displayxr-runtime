@@ -3572,6 +3572,9 @@ struct oxr_session
 	 * on release.
 	 */
 	struct u_mono_auto_2d mono_auto_2d;
+	//! The active rendering mode's view count at auto-2D ENTER: what
+	//! xrLocateViews keeps reporting while the hold is on (presentation-only).
+	uint32_t mono_auto_2d_view_count;
 	//! The app chose a display mode itself (xrRequestDisplayModeDXR or
 	//! xrRequestDisplayRenderingModeDXR): auto-2D stays out of its way for
 	//! the rest of the session.

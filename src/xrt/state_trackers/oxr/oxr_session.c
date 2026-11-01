@@ -1007,7 +1007,17 @@ oxr_session_mono_auto_2d_frame(struct oxr_logger *log,
 	const bool flat = eligible && mono_auto_2d_frame_is_flat(frameEndInfo);
 
 	switch (u_mono_auto_2d_step(&sess->mono_auto_2d, eligible, flat, now_ns, U_MONO_AUTO_2D_ENTER_NS)) {
-	case U_MONO_AUTO_2D_ENTER:
+	case U_MONO_AUTO_2D_ENTER: {
+		// Snapshot the view count the app renders now: auto-2D is
+		// presentation-only, xrLocateViews keeps this set while held.
+		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+		sess->mono_auto_2d_view_count = 0;
+		if (head != NULL && head->hmd != NULL &&
+		    head->hmd->active_rendering_mode_index < head->rendering_mode_count) {
+			sess->mono_auto_2d_view_count =
+			    head->rendering_modes[head->hmd->active_rendering_mode_index].view_count;
+		}
+	}
 		if (!mono_auto_2d_dispatch(sess, true)) {
 			(void)u_mono_auto_2d_release(&sess->mono_auto_2d);
 			sess->mono_auto_2d_unsupported = true;
@@ -3658,6 +3668,25 @@ locate_views_one(struct oxr_logger *log,
 	    ? xdev->rendering_modes[active_mode_idx].view_count
 	    : view_count;
 
+#ifdef OXR_HAVE_DXR_display_info
+	// Auto-2D is presentation-only: the vk_native hold never touches the
+	// rendering mode, but if anything moved the device to a narrower mode
+	// while the hold is on, the app keeps the view count it was rendering at
+	// ENTER — a 1-view count here would collapse every view to the centre eye
+	// (below) and lock the hold in.
+	if (sess->mono_auto_2d.active && sess->mono_auto_2d_view_count > active_view_count) {
+		static bool warned_view_count = false;
+		if (!warned_view_count) {
+			warned_view_count = true;
+			U_LOG_W(
+			    "auto-2D: the active rendering mode reports %u view(s) while the auto-2D hold is on - "
+			    "xrLocateViews keeps the %u-view set the session rendered at ENTER. Logged once.",
+			    (unsigned)active_view_count, (unsigned)sess->mono_auto_2d_view_count);
+		}
+		active_view_count = sess->mono_auto_2d_view_count;
+	}
+#endif
+
 	// #1486: the eye-padding and fov save/restore loops below are bounded by
 	// active_view_count, and some of them land in the app's views[]. A mode
 	// wider than the app's view configuration (a 4-view Quad mode under
@@ -4094,6 +4123,28 @@ locate_views_one(struct oxr_logger *log,
 	}
 
 	bool have_eyes = got_eye_positions && eye_pos.valid;
+
+#ifdef OXR_HAVE_DXR_display_info
+	// Auto-2D is presentation-only (util/u_mono_auto_2d.h): while its hold
+	// keeps the panel 2D the app must go on rendering its per-eye 3D views,
+	// or it renders identical eyes, keeps submitting a flat picture and the
+	// hold never releases. A DP in hardware 2D may report one centred eye;
+	// restore the stereo set around it BEFORE the #615 guard below would
+	// duplicate that eye into every view. The raw-eye channel is filled from
+	// this set too, so it stays per-eye as well.
+	if (sess->mono_auto_2d.active && have_eyes &&
+	    u_mono_auto_2d_keep_eye_set(&eye_pos, active_view_count, sess->ipd_meters)) {
+		static bool warned_keep_eyes = false;
+		if (!warned_keep_eyes) {
+			warned_keep_eyes = true;
+			U_LOG_W(
+			    "auto-2D: the display processor reports a collapsed eye set in hardware 2D - "
+			    "xrLocateViews keeps the session's per-eye %u-view set around it (auto-2D is "
+			    "presentation-only). Logged once.",
+			    (unsigned)active_view_count);
+		}
+	}
+#endif
 
 	// #615 eye-set/mode coherence guard at a rendering-mode switch.
 	//

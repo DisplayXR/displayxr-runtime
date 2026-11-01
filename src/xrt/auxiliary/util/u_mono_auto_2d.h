@@ -42,6 +42,8 @@
 
 #pragma once
 
+#include "xrt/xrt_display_metrics.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -164,6 +166,59 @@ u_mono_auto_2d_release(struct u_mono_auto_2d *s)
 	s->active = false;
 	s->flat_run = false;
 	return was;
+}
+
+/*!
+ * Auto-2D is PRESENTATION-ONLY: while it is engaged the session's render input
+ * (xrLocateViews poses, FOVs, raw eyes) must stay the per-eye 3D set the app
+ * was rendering, or the app renders identical eyes, keeps submitting a flat
+ * picture, and auto-2D never releases (a lock-in for any stereo app that shows
+ * one flat screen).
+ *
+ * The hold puts the panel in hardware 2D, and a display processor in 2D may
+ * report a single centred eye (count 1) or several coincident ones. This
+ * restores a stereo set around that eye: the eyes' centroid, with the same
+ * column pattern as the untracked nominal set (even views at -ipd/2, odd views
+ * at +ipd/2 along x). A set that already covers @p view_count views with
+ * distinct eyes is left untouched — byte for byte.
+ *
+ * @return true when @p e was rewritten.
+ */
+static inline bool
+u_mono_auto_2d_keep_eye_set(struct xrt_eye_positions *e, uint32_t view_count, float ipd_m)
+{
+	const uint32_t cap = (uint32_t)(sizeof(e->eyes) / sizeof(e->eyes[0]));
+	if (e == NULL || view_count < 2 || view_count > cap || e->count == 0 || e->count > cap) {
+		return false;
+	}
+	bool distinct = false;
+	for (uint32_t i = 1; i < e->count && !distinct; i++) {
+		const float dx = e->eyes[i].x - e->eyes[0].x;
+		const float dy = e->eyes[i].y - e->eyes[0].y;
+		const float dz = e->eyes[i].z - e->eyes[0].z;
+		distinct = (dx * dx + dy * dy + dz * dz) > 1e-10f; // > 10 um apart
+	}
+	if (e->count >= view_count && distinct) {
+		return false;
+	}
+
+	struct xrt_eye_position c = {0.0f, 0.0f, 0.0f};
+	for (uint32_t i = 0; i < e->count; i++) {
+		c.x += e->eyes[i].x;
+		c.y += e->eyes[i].y;
+		c.z += e->eyes[i].z;
+	}
+	const float inv = 1.0f / (float)e->count;
+	c.x *= inv;
+	c.y *= inv;
+	c.z *= inv;
+	for (uint32_t i = 0; i < view_count; i++) {
+		e->eyes[i].x = c.x + ((i % 2) == 0 ? -ipd_m / 2.0f : ipd_m / 2.0f);
+		e->eyes[i].y = c.y;
+		e->eyes[i].z = c.z;
+	}
+	e->count = view_count;
+	return true;
 }
 
 #ifdef __cplusplus

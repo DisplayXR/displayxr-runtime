@@ -993,6 +993,11 @@ frame is flat" in core OpenXR, and the runtime listens for it:
   the flat view over the whole output with **no weave** — the effect of
   `xrRequestDisplayModeDXR(2D)` plus the flat presentation a 2D mode gets.
 - The **first** frame that is not flat returns the panel to the session's own state at once.
+- It is **presentation-only**. While the panel is held in 2D, `xrLocateViews` keeps reporting the
+  session's per-eye 3D views: the poses, the FOVs, the `XR_DXR_view_rig` raw eyes and the view
+  count the app was rendering. If a display processor in hardware 2D reports one centred eye,
+  the runtime rebuilds the stereo set around it. Without this the app would render identical
+  eyes, keep submitting a flat picture, and never leave 2D.
 - It never overrides the application. A session that has called `xrRequestDisplayModeDXR` or
   `xrRequestDisplayRenderingModeDXR` even once is left alone for the rest of the session (an
   engaged auto-2D is released by that call); so is a session already in a 2D mode, a

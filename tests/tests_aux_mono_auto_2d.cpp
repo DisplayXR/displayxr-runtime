@@ -15,6 +15,7 @@
 
 #include "util/u_mono_auto_2d.h"
 
+
 namespace {
 
 constexpr uint64_t MS = 1000ull * 1000ull;
@@ -31,6 +32,22 @@ view(uint64_t sc, uint32_t idx, int32_t x, int32_t y, int32_t w, int32_t h)
 	v.w = w;
 	v.h = h;
 	return v;
+}
+
+//! Field-wise equality (no memcmp: the struct has padding).
+bool
+same_set(const xrt_eye_positions &a, const xrt_eye_positions &b)
+{
+	if (a.count != b.count || a.valid != b.valid || a.is_tracking != b.is_tracking ||
+	    a.timestamp_ns != b.timestamp_ns) {
+		return false;
+	}
+	for (uint32_t i = 0; i < 8; i++) {
+		if (a.eyes[i].x != b.eyes[i].x || a.eyes[i].y != b.eyes[i].y || a.eyes[i].z != b.eyes[i].z) {
+			return false;
+		}
+	}
+	return true;
 }
 
 } // namespace
@@ -176,4 +193,85 @@ TEST_CASE("u_mono_auto_2d_release: reports whether the caller must restore", "[m
 	// Released: the next stereo frame has nothing to leave.
 	CHECK(u_mono_auto_2d_step(&s, true, false, t, U_MONO_AUTO_2D_ENTER_NS) == U_MONO_AUTO_2D_NONE);
 	CHECK_FALSE(u_mono_auto_2d_release(&s));
+}
+
+/*
+ * Presentation-only: while the auto-2D hold is on, the render input the app
+ * gets from xrLocateViews must stay its per-eye 3D set. Otherwise the app
+ * renders identical eyes, keeps submitting a flat picture, and the hold never
+ * releases (the lock-in a live run found).
+ */
+TEST_CASE("u_mono_auto_2d_keep_eye_set: a normal per-eye set is left exactly as it is", "[mono_auto_2d]")
+{
+	xrt_eye_positions e{};
+	e.count = 2;
+	e.eyes[0] = {-0.031f, 0.012f, 0.62f};
+	e.eyes[1] = {0.034f, 0.010f, 0.61f};
+	e.valid = true;
+	e.is_tracking = true;
+	e.timestamp_ns = 1234;
+	xrt_eye_positions before = e;
+
+	CHECK_FALSE(u_mono_auto_2d_keep_eye_set(&e, 2, 0.063f));
+	CHECK(same_set(e, before));
+
+	// Four distinct eyes for a 4-view mode: also untouched.
+	xrt_eye_positions q{};
+	q.count = 4;
+	for (uint32_t i = 0; i < 4; i++) {
+		q.eyes[i] = {-0.05f + 0.033f * (float)i, 0.0f, 0.6f};
+	}
+	xrt_eye_positions qb = q;
+	CHECK_FALSE(u_mono_auto_2d_keep_eye_set(&q, 4, 0.063f));
+	CHECK(same_set(q, qb));
+}
+
+TEST_CASE("u_mono_auto_2d_keep_eye_set: a collapsed 2D eye set is restored to stereo", "[mono_auto_2d]")
+{
+	const float ipd = 0.064f;
+
+	// A display processor in hardware 2D reporting ONE centred eye.
+	xrt_eye_positions e{};
+	e.count = 1;
+	e.eyes[0] = {0.01f, 0.02f, 0.6f};
+	REQUIRE(u_mono_auto_2d_keep_eye_set(&e, 2, ipd));
+	CHECK(e.count == 2);
+	CHECK(e.eyes[0].x == Catch::Approx(0.01f - ipd / 2));
+	CHECK(e.eyes[1].x == Catch::Approx(0.01f + ipd / 2));
+	CHECK(e.eyes[0].y == Catch::Approx(0.02f));
+	CHECK(e.eyes[1].z == Catch::Approx(0.6f));
+	// Restored once, it is a normal set: a second pass leaves it alone.
+	xrt_eye_positions again = e;
+	CHECK_FALSE(u_mono_auto_2d_keep_eye_set(&again, 2, ipd));
+
+	// Two coincident eyes (count right, separation zero).
+	xrt_eye_positions c{};
+	c.count = 2;
+	c.eyes[0] = c.eyes[1] = {0.0f, 0.0f, 0.55f};
+	REQUIRE(u_mono_auto_2d_keep_eye_set(&c, 2, ipd));
+	CHECK(c.eyes[1].x - c.eyes[0].x == Catch::Approx(ipd));
+
+	// A 4-view mode: the nominal column pattern around the centroid.
+	xrt_eye_positions m{};
+	m.count = 1;
+	m.eyes[0] = {0.0f, 0.0f, 0.6f};
+	REQUIRE(u_mono_auto_2d_keep_eye_set(&m, 4, ipd));
+	CHECK(m.count == 4);
+	CHECK(m.eyes[0].x == Catch::Approx(-ipd / 2));
+	CHECK(m.eyes[1].x == Catch::Approx(ipd / 2));
+	CHECK(m.eyes[2].x == Catch::Approx(-ipd / 2));
+	CHECK(m.eyes[3].x == Catch::Approx(ipd / 2));
+}
+
+TEST_CASE("u_mono_auto_2d_keep_eye_set: nothing to do outside a multi-view mode", "[mono_auto_2d]")
+{
+	xrt_eye_positions e{};
+	e.count = 1;
+	e.eyes[0] = {0.0f, 0.0f, 0.6f};
+	xrt_eye_positions before = e;
+	CHECK_FALSE(u_mono_auto_2d_keep_eye_set(&e, 1, 0.063f));
+	CHECK_FALSE(u_mono_auto_2d_keep_eye_set(&e, 9, 0.063f));
+	CHECK(same_set(e, before));
+	xrt_eye_positions none{};
+	CHECK_FALSE(u_mono_auto_2d_keep_eye_set(&none, 2, 0.063f));
 }
