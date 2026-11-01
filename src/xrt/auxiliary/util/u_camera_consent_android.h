@@ -163,7 +163,8 @@ u_camera_consent_store_android_init(struct u_camera_consent_store_android *s,
 /*!
  * Spec §7.2a (Android, option R): may a USER_FACING camera start for a peer?
  * Only while that peer's package presents woven 3D in this service process
- * (a live weave or a visible session), so an app in the background can never
+ * (a live weave, a visible session, or a weave present-owner while its app
+ * is on top), so an app in the background can never
  * take the camera the display's head tracking depends on. Any other camera:
  * always. Pure — the caller supplies @p presenting.
  */

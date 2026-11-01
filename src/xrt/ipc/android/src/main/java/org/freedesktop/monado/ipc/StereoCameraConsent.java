@@ -160,6 +160,22 @@ public final class StereoCameraConsent {
                 }
             };
 
+    /**
+     * Is this satellite's consumer app on top right now, with the screen unlocked? Same signal as
+     * the foreground poll (this process's own importance), asked once by native at a front-camera
+     * start, so a weave present-owner can take the front camera before its first weave submit.
+     */
+    public static boolean consumerInForeground() {
+        if (screenLocked) {
+            return false;
+        }
+        android.app.ActivityManager.RunningAppProcessInfo info =
+                new android.app.ActivityManager.RunningAppProcessInfo();
+        android.app.ActivityManager.getMyMemoryState(info);
+        return info.importance
+                <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND;
+    }
+
     private static void setPolling(boolean on) {
         Handler h = watchHandler;
         if (h == null || on == polling) {

@@ -505,6 +505,15 @@ scm_stream_destroy(struct scm_fixture *f, uint64_t id)
 	return ipc_handle_stereo_camera_stream_destroy(&f->ics, id);
 }
 
+static bool g_scm_foreground = false;
+
+static bool
+scm_consumer_foreground(void *ctx)
+{
+	(void)ctx;
+	return g_scm_foreground;
+}
+
 void
 scm_set_front_rule(bool enabled)
 {
@@ -515,6 +524,8 @@ scm_set_front_rule(bool enabled)
 	struct ipc_server_stereo_camera_platform p;
 	memset(&p, 0, sizeof(p));
 	p.user_facing_requires_presenting = true;
+	p.consumer_foreground = scm_consumer_foreground;
+	g_scm_foreground = false;
 	ipc_server_stereo_camera_set_platform(&p);
 }
 
@@ -527,4 +538,16 @@ scm_set_live_weave(struct scm_fixture *f, bool live)
 	o->server_thread_index = 0;
 	o->peer_uid = f->ics.peer_uid;
 	o->last_weave_ns = live ? (int64_t)os_monotonic_get_ns() : 0;
+}
+
+void
+scm_set_present_owner(struct scm_fixture *f, bool present_owner, bool foreground)
+{
+	volatile struct ipc_client_state *o = &f->server.threads[0].ics;
+	o->server_thread_index = 0;
+	o->peer_uid = f->ics.peer_uid;
+	o->last_weave_ns = 0;
+	o->client_state.client_class =
+	    present_owner ? XRT_CLIENT_CLASS_PRESENT_OWNER : XRT_CLIENT_CLASS_CAMERA_CONSUMER;
+	g_scm_foreground = foreground;
 }

@@ -593,8 +593,12 @@ frame with a 250 ms cache:
   the OS (where the OS does enforce while-in-use, or sensor privacy) is also reported `SUSPENDED`,
   not `UNAVAILABLE`, while the service retries, and its started streams are kept.
   **Front camera (option R):** a `USER_FACING` camera
-  starts only for a consumer whose uid presents woven 3D in the same runtime process (a weave
-  submit within the last second, or a visible session). Otherwise the start returns
+  starts only for a consumer whose uid presents woven 3D in the same runtime process: a weave
+  submit within the last second, a visible session, or an `XR_DXR_weave` present-owner connection
+  while the satellite's own importance says its app is on top and the screen is unlocked. The last
+  case is a call page: its only 3D content is the camera preview, so it cannot submit a weave
+  before it has frames. A start waits up to 3 s for one of these to become true (a browser asks
+  ~100 ms before its first weave when it returns from the background). Otherwise the start returns
   `XR_ERROR_STEREO_CAMERA_BUSY_DXR`. A started front stream gets no frames, and its connection is
   told `SUSPENDED`, while that stops being true. While the front pair is open it is also what keeps
   the display tracking the viewer, so an app in the background can never take it. The rule holds

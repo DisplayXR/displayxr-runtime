@@ -792,12 +792,20 @@ peer_identity(volatile struct ipc_client_state *ics, char *out, size_t cap)
 
 /*!
  * A2 front-camera gate (§1.2 option R): does any connection of @p uid in this
- * process present woven 3D — a weave submit within PRESENTING_WINDOW_NS, or a
- * visible session? Reads other connections' fields racily (the per-frame
- * pattern of input focus); a stale read errs for one frame at most.
+ * process present woven 3D — a weave submit within PRESENTING_WINDOW_NS, a
+ * visible session, or a weave present-owner connection of an app that is on
+ * top? A present-owner whose only 3D content is the camera itself (a call
+ * page's preview) cannot submit a weave before it has frames, so it would
+ * never pass a weave-only rule.
+ *
+ * @p fg says whether the app is on top: -1 = ask the platform now (a start;
+ * no manager lock held), 1 = treat as on top (per frame: a stream in the
+ * background is already suspended by the platform's own foreground rule).
+ * Reads other connections' fields racily (the per-frame pattern of input
+ * focus); a stale read errs for one frame at most.
  */
 static bool
-uid_presenting(volatile struct ipc_client_state *ics, long uid, int64_t now)
+uid_presenting(volatile struct ipc_client_state *ics, long uid, int64_t now, int fg)
 {
 	struct ipc_server *vs = ics != NULL ? ics->server : NULL;
 	if (vs == NULL || uid < 0) {
@@ -815,6 +823,17 @@ uid_presenting(volatile struct ipc_client_state *ics, long uid, int64_t now)
 		if (o->xc != NULL && o->client_state.session_active && o->client_state.session_visible) {
 			return true;
 		}
+		if (o->client_state.client_class == XRT_CLIENT_CLASS_PRESENT_OWNER) {
+			if (fg < 0) {
+				fg = (g_platform_set && g_platform.consumer_foreground != NULL &&
+				      g_platform.consumer_foreground(g_platform.ctx))
+				         ? 1
+				         : 0;
+			}
+			if (fg > 0) {
+				return true;
+			}
+		}
 	}
 	return false;
 }
@@ -829,7 +848,7 @@ uid_presenting_within_grace(volatile struct ipc_client_state *ics, long uid)
 {
 	const int64_t t0 = (int64_t)os_monotonic_get_ns();
 	int64_t now = t0;
-	while (!uid_presenting(ics, uid, now)) {
+	while (!uid_presenting(ics, uid, now, -1)) {
 		if (now - t0 >= PRESENTING_GRACE_NS) {
 			return false;
 		}
@@ -907,7 +926,7 @@ client_visible_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s,
 		if (s->vis_checked_ns != 0 && now - s->vis_checked_ns < VISIBILITY_TTL_NS) {
 			return s->visible;
 		}
-		bool v = uid_presenting(s->ics, s->peer_uid, now);
+		bool v = uid_presenting(s->ics, s->peer_uid, now, 1);
 		if (s->vis_checked_ns == 0 || v != s->visible) {
 			if (s->vis_checked_ns != 0 || !v) {
 				U_LOG_W("stereo camera: stream %llu (%s) %s — front camera follows the live weave",
@@ -3493,9 +3512,12 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 	// A2 (§1.2 option R): the front camera feeds the display's head tracking
 	// while it is open, so only an app that presents woven 3D here may take
 	// it — never one in the background. BUSY (the browser: NotReadableError).
+	// Under the lock the platform is not asked whether the app is on top (pass
+	// 1 did, just before consent); one that left meanwhile is suspended by the
+	// platform's foreground rule once its stream starts.
 	if (!u_camera_consent_user_facing_gate(s->needs_presenting, true,
 	                                       !s->needs_presenting ||
-	                                           uid_presenting(ics, s->peer_uid, (int64_t)os_monotonic_get_ns()))) {
+	                                           uid_presenting(ics, s->peer_uid, (int64_t)os_monotonic_get_ns(), 1))) {
 		os_mutex_unlock(&m->lock);
 		U_LOG_W(
 		    "stereo camera %llu: stream %llu start refused for %s — a user-facing camera needs a live "

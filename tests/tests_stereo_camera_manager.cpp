@@ -506,6 +506,35 @@ TEST_CASE("A2 front-camera rule: a weave that starts just after the request lets
 	scm_set_front_rule(false);
 }
 
+TEST_CASE("A2 front-camera rule: a weave present-owner on top starts before its first weave",
+          "[stereo_camera_manager][android]")
+{
+	// A call page's only 3D content is the camera preview, so the browser
+	// cannot submit a weave before it has frames. Its present-owner connection
+	// counts while the app is on top; not on top, it stays BUSY.
+	const char *ids_a[] = {"test:front"};
+	const char *names_a[] = {"Front 3D camera"};
+	scm_fake_plugin_set(ids_a, names_a, 1);
+	scm_set_front_rule(true);
+	scm_fixture *f = scm_create_fake_plugin_ex(-1);
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1);
+	xrt_stereo_camera_stream_request req = {props_at(f, 0).id, XRT_STEREO_CAMERA_OUTPUT_RAW,
+	                                        XRT_STEREO_CAMERA_FORMAT_GRAY8,
+	                                        XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY, 0.0f};
+	uint64_t sid = 0;
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	scm_set_present_owner(f, true, false);
+	CHECK(scm_stream_start(f, sid) == XRT_ERROR_STEREO_CAMERA_BUSY);
+	scm_set_present_owner(f, false, true);
+	CHECK(scm_stream_start(f, sid) == XRT_ERROR_STEREO_CAMERA_BUSY);
+	scm_set_present_owner(f, true, true);
+	CHECK(scm_stream_start(f, sid) == XRT_SUCCESS);
+	CHECK(scm_stream_destroy(f, sid) == XRT_SUCCESS);
+	scm_destroy(f);
+	scm_set_front_rule(false);
+}
+
 TEST_CASE("re-enumeration: each camera reports its screen, and a move is a change", "[stereo_camera_manager][rescan]")
 {
 	const char *ids_ab[] = {"test:A", "test:B"};

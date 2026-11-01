@@ -99,6 +99,14 @@ void
 scm_set_live_weave(struct scm_fixture *f, bool live);
 
 /*
+ * The second connection of the fixture's app is (or is not) a weave
+ * present-owner that has not submitted a weave yet, and the platform says
+ * the app is (or is not) on top. Call after scm_set_front_rule(true).
+ */
+void
+scm_set_present_owner(struct scm_fixture *f, bool present_owner, bool foreground);
+
+/*
  * ADR-043 Amendment 5: a fake display plug-in with NO camera slots that only
  * DECLARES the cameras its display owns (get_claimed_cameras), next to the
  * UVC source on @p cfg (a "fake" config; the synthetic device's id is
