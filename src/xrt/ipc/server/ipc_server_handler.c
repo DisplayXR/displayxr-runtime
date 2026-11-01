@@ -22,6 +22,7 @@
 
 #include "server/ipc_server.h"
 #include "server/ipc_server_peer_creds.h"
+#include "server/ipc_server_stereo_camera.h" // in-process camera consumers share the CAMERA_CONSUMER quota
 #include "util/u_exe_basename.h"
 #include "server/ipc_server_interface.h"
 #include "shared/ipc_lift_caps.h"
@@ -383,6 +384,15 @@ count_class_locked(struct ipc_server *s, volatile struct ipc_client_state *ics, 
 			n++;
 		}
 	}
+	return n;
+}
+
+uint32_t
+ipc_server_client_class_count(struct ipc_server *s, uint32_t client_class)
+{
+	os_mutex_lock(&s->global_state.lock);
+	uint32_t n = count_class_locked(s, NULL, client_class);
+	os_mutex_unlock(&s->global_state.lock);
 	return n;
 }
 
@@ -2579,6 +2589,11 @@ ipc_handle_instance_describe_client(volatile struct ipc_client_state *ics,
 		os_mutex_lock(&s->global_state.lock);
 		uint32_t in_use = verified == XRT_CLIENT_CLASS_PRESENT_OWNER ? count_present_owners_locked(s, ics, exe)
 		                                                           : count_class_locked(s, ics, verified);
+		if (verified == XRT_CLIENT_CLASS_CAMERA_CONSUMER) {
+			// The service's in-process camera consumers (input providers on the
+			// shared-camera host slot) take from the same quota.
+			in_use += ipc_server_stereo_camera_internal_consumer_count();
+		}
 		uint32_t quota = ipc_server_client_class_quota(s, verified);
 		bool refused = quota != 0 && in_use >= quota;
 		if (!refused) {

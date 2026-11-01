@@ -49,6 +49,23 @@ ipc_server_client_class_str(uint32_t client_class)
 	return "TEST";
 }
 
+// The CAMERA_CONSUMER quota the in-process consumers share with connections:
+// no connections here, the real quota (4).
+uint32_t
+ipc_server_client_class_count(struct ipc_server *s, uint32_t client_class)
+{
+	(void)s;
+	(void)client_class;
+	return 0;
+}
+
+uint32_t
+ipc_server_client_class_quota(const struct ipc_server *s, uint32_t client_class)
+{
+	(void)s;
+	return client_class == XRT_CLIENT_CLASS_CAMERA_CONSUMER ? 4u : 0u;
+}
+
 #ifdef XRT_OS_MACOS
 bool
 ipc_server_macos_pid_app_visible(long pid)

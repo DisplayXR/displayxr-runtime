@@ -665,6 +665,9 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 
 	// XR_DXR_stereo_camera (ADR-043): the service owns every plug-in camera.
 	s->stereo_camera = ipc_server_stereo_camera_create(s->xinst);
+	// In-process consumers (the input host iface shared-camera slot) share the
+	// CAMERA_CONSUMER quota with connections.
+	ipc_server_stereo_camera_attach_server(s->stereo_camera, s);
 
 	// ADR-051 D3: the display status snapshot + generation counters.
 	ipc_server_status_init(s);
