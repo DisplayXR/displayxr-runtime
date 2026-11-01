@@ -33,6 +33,7 @@
 #include "util/u_device.h"
 #include "util/u_cursor_depth.h"
 #include "util/u_tracking_any.h"
+#include "util/u_mono_auto_2d.h"
 
 #include "math/m_view_rig_point.h"
 
@@ -1007,6 +1008,28 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
  */
 void
 oxr_session_push_rendering_mode_ipc(struct oxr_session *sess, uint32_t mode_index);
+
+/*!
+ * Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h): call
+ * once per submitted frame, after the layers are verified. Classifies the
+ * frame, runs the hysteresis and, on an edge, asks the compositor to hold the
+ * panel in 2D (flat, no weave) or to release the hold. One WARN per edge.
+ */
+void
+oxr_session_mono_auto_2d_frame(struct oxr_logger *log,
+                               struct oxr_session *sess,
+                               const XrFrameEndInfo *frameEndInfo,
+                               uint64_t now_ns);
+
+/*!
+ * The app made an explicit display-mode choice: mark the session so auto-2D
+ * never engages again, and release it if it is engaged. With @p push_event the
+ * hardware-state event is sent when the release moves the panel back to 3D;
+ * the explicit-request callers that send their own event pass false.
+ * Returns true when auto-2D was engaged.
+ */
+bool
+oxr_session_mono_auto_2d_explicit(struct oxr_logger *log, struct oxr_session *sess, bool push_event);
 
 /*!
  * Push the session's eye-tracking control mode (MANAGED=0 / MANUAL=1) to the
@@ -3540,6 +3563,25 @@ struct oxr_session
 
 	//! True if display hardware is currently in 3D mode.
 	bool hardware_display_3d;
+
+	/*!
+	 * Auto hardware 2D while the session submits one flat picture for every
+	 * view (util/u_mono_auto_2d.h, oxr_session_mono_auto_2d_frame). While
+	 * engaged the panel is 2D but @ref hardware_display_3d keeps the
+	 * session's own choice: the compositor holds 2D over it and restores it
+	 * on release.
+	 */
+	struct u_mono_auto_2d mono_auto_2d;
+	//! The active rendering mode's view count at auto-2D ENTER: what
+	//! xrLocateViews keeps reporting while the hold is on (presentation-only).
+	uint32_t mono_auto_2d_view_count;
+	//! The app chose a display mode itself (xrRequestDisplayModeDXR or
+	//! xrRequestDisplayRenderingModeDXR): auto-2D stays out of its way for
+	//! the rest of the session.
+	bool display_mode_explicit;
+	//! The session's compositor cannot enact auto-2D (said once, then the
+	//! detector is off for the session).
+	bool mono_auto_2d_unsupported;
 
 	//! Active eye tracking mode (0=MANAGED, 1=MANUAL). Default: 0 (MANAGED).
 	uint32_t eye_tracking_mode;

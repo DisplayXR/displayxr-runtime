@@ -1420,12 +1420,21 @@ oxr_xrRequestDisplayModeDXR(XrSession session, XrDisplayModeDXR displayMode)
 	// woven atlas flat (blurry), and an app fading its parallax to zero
 	// converges back to a sharp image — the MANUAL tracking-loss transition.
 	bool want_3d = (displayMode == XR_DISPLAY_MODE_3D_DXR);
-	bool changed = (sess->hardware_display_3d != want_3d);
+	// Auto-2D (util/u_mono_auto_2d.h) may be holding the panel 2D over the
+	// session's recorded 3D: compare against what the panel really shows.
+	const bool auto_2d_engaged = sess->mono_auto_2d.active;
+	bool changed = ((auto_2d_engaged ? false : sess->hardware_display_3d) != want_3d);
 
 	XrResult res = oxr_session_request_display_mode(&log, sess, want_3d);
 	if (res != XR_SUCCESS) {
 		return res;
 	}
+
+	// An explicit choice wins over auto-2D for the rest of the session. The
+	// request above is recorded under the compositor's hold, so releasing the
+	// hold after it applies the app's choice in one step (no 3D blip on the
+	// way to an explicit 2D). This entry point sends its own event below.
+	(void)oxr_session_mono_auto_2d_explicit(&log, sess, /*push_event=*/false);
 
 	// oxr_session_request_display_mode records the new state on success;
 	// surface the flip to the app the same way a mode-driven change does.
@@ -1484,6 +1493,12 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 	struct oxr_session *sess;
 	struct oxr_logger log;
 	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestDisplayRenderingModeDXR");
+
+	// An explicit mode choice: auto-2D (util/u_mono_auto_2d.h) stays out of
+	// this session's way from here on, whatever the outcome below. An engaged
+	// hold is released after the request is applied (end of this function);
+	// on the early-return paths the next xrEndFrame releases it.
+	sess->display_mode_explicit = true;
 
 	// Workspace/IPC mode: the workspace controller drives rendering mode changes, not the app.
 	// The app receives mode changes via XrEventDataRenderingModeChanged events
@@ -1680,6 +1695,11 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 		oxr_event_push_XrEventDataHardwareDisplayStateChanged(
 			&log, sess, mode->hardware_display_3d ? XR_TRUE : XR_FALSE);
 	}
+
+	// 7. Release an engaged auto-2D hold now that the mode's own hardware
+	//    state is recorded under it: the panel goes straight to that state.
+	//    Sends the 3D event when the release turns the panel back to 3D.
+	(void)oxr_session_mono_auto_2d_explicit(&log, sess, /*push_event=*/true);
 
 	return XR_SUCCESS;
 }

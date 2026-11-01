@@ -458,6 +458,7 @@ library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, contr
 | `DXR_LINUX_DIRECT_SCANOUT` | `compositor/vk_native/comp_vk_native_compositor.c:5845` | `getenv` | off | App | 1 | Opt-in RandR direct-scanout present path on Linux |
 | `DXR_WINDOW_POS` | `compositor/vk_native/comp_vk_native_compositor.c:5248` | `getenv` | plug-in reported | App | 1 | `"x,y"` override for the self-owned window position (#715) |
 | `DXR_WINDOW_FULLSCREEN` | `compositor/vk_native/comp_vk_native_window_xcb.c:273` | `getenv` | on | App | 1 | `=0` opts out of EWMH fullscreen placement (Linux XCB) |
+| `DXR_MONO_AUTO_2D` | `state_trackers/oxr/oxr_session.c` (`mono_auto_2d_eligible`, consulted by `oxr_session_mono_auto_2d_frame` at every `xrEndFrame`) | `DEBUG_GET_ONCE_BOOL` | **on** (kill switch) | App | 1 | Kill switch for automatic hardware 2D when a stereo session submits one flat picture (every projection view on the same swapchain, `imageArrayIndex` and `imageRect`; projection layers only) for 0.5 s; the first differing frame returns to 3D. Never engages for a session that called `xrRequestDisplayModeDXR` or `xrRequestDisplayRenderingModeDXR`. `0` keeps such frames woven. Enacted by the in-process Vulkan compositor on desktop Linux; rule in `util/u_mono_auto_2d.h`, spec in [XR_DXR_display_info](../specs/extensions/XR_DXR_display_info.md) § *Automatic 2D on a flat stereo submission* |
 
 ### Native-Wayland window drag (#1748)
 

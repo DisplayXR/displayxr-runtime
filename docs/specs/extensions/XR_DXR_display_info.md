@@ -978,6 +978,43 @@ override the automatic behavior. Use cases include:
 - Deferring 3D mode activation until the application has finished loading.
 - Implementing a user-facing 2D/3D toggle.
 
+#### Automatic 2D on a flat stereo submission (runtime behaviour, no new API)
+
+Some clients cannot reach `xrRequestDisplayModeDXR` at all — for example a client behind a
+compatibility layer whose OpenXR thunk forwards only Khronos functions, so
+`xrGetInstanceProcAddr("xrRequestDisplayModeDXR")` fails. Such a client can still say "this
+frame is flat" in core OpenXR, and the runtime listens for it:
+
+- A frame is **flat** when every layer it submits is an `XrCompositionLayerProjection` and every
+  view of each one (two or more) references the **same swapchain, the same `imageArrayIndex` and
+  the same `imageRect`**. Any other layer type in the frame (quad, cylinder, equirect, cube,
+  window-space, Local2D) makes it not flat: those layers are placed in depth by the compositor.
+- After **0.5 s** of continuous flat frames the runtime puts the panel in hardware 2D and presents
+  the flat view over the whole output with **no weave** — the effect of
+  `xrRequestDisplayModeDXR(2D)` plus the flat presentation a 2D mode gets.
+- The **first** frame that is not flat returns the panel to the session's own state at once.
+- It is **presentation-only**. While the panel is held in 2D, `xrLocateViews` keeps reporting the
+  session's per-eye 3D views: the poses, the FOVs, the `XR_DXR_view_rig` raw eyes and the view
+  count the app was rendering. If a display processor in hardware 2D reports one centred eye,
+  the runtime rebuilds the stereo set around it. Without this the app would render identical
+  eyes, keep submitting a flat picture, and never leave 2D.
+- It never overrides the application. A session that has called `xrRequestDisplayModeDXR` or
+  `xrRequestDisplayRenderingModeDXR` even once is left alone for the rest of the session (an
+  engaged auto-2D is released by that call); so is a session already in a 2D mode, a
+  display-zones session, a workspace controller, a bridge relay, and any service-mode session.
+- An instance that enabled this extension receives `XrEventDataHardwareDisplayStateChangedDXR`
+  on each automatic edge, as for an explicit request. `hardware_display_3d` as the application
+  requested it is not rewritten: the automatic hold sits on top of it and restores it.
+- Kill switch: `DXR_MONO_AUTO_2D=0` (application process environment). One `auto-2D: ENTER` /
+  `auto-2D: LEAVE` WARN per edge.
+- Wired today on the in-process Vulkan compositor on desktop Linux (the same tile-0 collapse and
+  runtime hold its refuse-rather-than-resample degrade uses). On every other compositor the
+  detector logs once that it cannot present the frame flat and stays off for that session.
+
+Rule code: `src/xrt/auxiliary/util/u_mono_auto_2d.h` (pure, unit-tested in
+`tests/tests_aux_mono_auto_2d.cpp`), driven from `oxr_session_mono_auto_2d_frame()` at
+`xrEndFrame`.
+
 #### Smooth transitions are the application's job
 
 A rendering-mode request takes effect in **one frame**. From the frame the new mode lands, the

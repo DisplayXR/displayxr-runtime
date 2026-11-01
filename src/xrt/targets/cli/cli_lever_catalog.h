@@ -9,7 +9,7 @@
  * Edit the census and re-run the script; the lint workflow runs it with
  * --check, which also fails when a name here no longer occurs in src/xrt.
  *
- * 70 levers: 51 Tier 1 (next launch), 19 Tier 2 (service-scoped).
+ * 71 levers: 52 Tier 1 (next launch), 19 Tier 2 (service-scoped).
  *
  * This is a DESCRIPTION of the levers, not a way to set them: only the names
  * u_setting_is_managed() accepts resolve from the per-user / machine stores.
@@ -61,6 +61,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_LEGACY_CAMERA_RIG", 1, "App", "Per-executable JSON profile, otherwise qwerty defaults", "Inline camera-rig JSON or a UTF-8 file path; seeds instance-wide native legacy camera tuning and Space reset."},
 	{"DXR_LINUX_DIRECT_SCANOUT", 1, "App", "off", "Opt-in RandR direct-scanout present path on Linux"},
 	{"DXR_MAX_CLIENTS", 1, "Svc", "0 = auto", "#959 admitted-client cap. Read once at service start"},
+	{"DXR_MONO_AUTO_2D", 1, "App", "on (kill switch)", "Kill switch for automatic hardware 2D when a stereo session submits one flat picture (every projection view on the same swapchain, imageArrayIndex and imageRect; projection layers only) for 0.5 s..."},
 	{"DXR_PRESENT_OPAQUE", 1, "App", "off", "Opaque flip chain instead of the composed chain."},
 	{"DXR_SPLIT_D3D12_HYBRID_REROUTE", 1, "App", "on on a cross-adapter box (a false spelling kills; DXR_HUB=0 also kills it when this is unset)", "#2375: hybrid d3d12 sessions weave through the D3D11 hub by default, with legs still open (single-dGPU #2371, Unreal, 2D-to-3D and view-count keys, eye-tracking change)."},
 	{"DXR_SPLIT_INGRESS", 1, "App", "adaptive", "adaptive reads a still source in place; staged pins the PR 3-5 per-frame copy."},

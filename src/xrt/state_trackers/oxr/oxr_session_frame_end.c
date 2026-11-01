@@ -3344,6 +3344,15 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	// Do state change if needed.
 	do_synchronize_state_change(log, sess);
 
+#ifdef OXR_HAVE_DXR_display_info
+	// Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h):
+	// every view of the projection layer names the same swapchain image ->
+	// after a short hysteresis the compositor holds the panel 2D, flat, no
+	// weave. Decided BEFORE this frame's layers reach the compositor, so the
+	// edge frame itself is presented in the new state.
+	oxr_session_mono_auto_2d_frame(log, sess, frameEndInfo, (uint64_t)os_monotonic_get_ns());
+#endif
+
 	struct xrt_pose inv_offset = {0};
 	math_pose_invert(&xdev->tracking_origin->initial_offset, &inv_offset);
 
