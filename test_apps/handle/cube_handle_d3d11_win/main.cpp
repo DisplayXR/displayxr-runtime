@@ -190,6 +190,32 @@ static bool SetupActionSpaces(XrSession session)
     return true;
 }
 
+// Pad diagnostics: one WARN per button rising edge (names the button the
+// runtime delivered), plus a 2 s window-title toast when the reset fires.
+static HWND g_padToastHwnd = nullptr;
+static double g_padToastUntilSec = 0.0;
+static void LogGamepadEdges(const dxr::GamepadSample& s)
+{
+    static dxr::GamepadSample prev;
+    struct { bool now, was; const char* name; } b[] = {
+        {s.resetView, prev.resetView, "menu/click (Options) -> reset view"},
+        {s.toggleRig, prev.toggleRig, "view/click (Create) -> toggle rig"},
+        {s.toggleParallax, prev.toggleParallax, "y/click (triangle) -> toggle parallax"},
+        {s.fullscreen, prev.fullscreen, "x/click (square) -> fullscreen"},
+        {s.ascend, prev.ascend, "shoulder_right -> ascend"},
+        {s.descend, prev.descend, "shoulder_left -> descend"},
+    };
+    for (auto& e : b) {
+        if (e.now && !e.was) LOG_WARN("gamepad: button down: %s (active=%d)", e.name, (int)s.active);
+    }
+    static bool wasActive = false;
+    if (s.active != wasActive) {
+        LOG_WARN("gamepad: action set %s", s.active ? "ACTIVE (pad present, session focused)" : "inactive");
+        wasActive = s.active;
+    }
+    prev = s;
+}
+
 //! Per-frame: one sync for the hand + gamepad sets, the gamepad poll into
 //! @p input, then (actions mode) read state + locate the grip spaces.
 static void UpdateActions(XrSession session, XrSpace baseSpace, XrTime displayTime, InputState& input)
@@ -217,7 +243,18 @@ static void UpdateActions(XrSession session, XrSpace baseSpace, XrTime displayTi
         if (XR_FAILED(sr)) {
             dxr::GamepadActionsApply(g_gamepad, dxr::GamepadSample{}, InputStateNowSec(), input);
         } else {
-            dxr::GamepadActionsPoll(session, g_gamepad, input);
+            dxr::GamepadSample sample;
+            dxr::GamepadActionsRead(session, g_gamepad, sample);
+            LogGamepadEdges(sample);
+            const bool resetBefore = input.resetViewRequested;
+            dxr::GamepadActionsApply(g_gamepad, sample, InputStateNowSec(), input);
+            if (input.resetViewRequested && !resetBefore) {
+                LOG_WARN("gamepad: RESET VIEW requested by the pad (menu/click)");
+                g_padToastUntilSec = InputStateNowSec() + 2.0;
+                if (g_padToastHwnd) {
+                    SetWindowTextW(g_padToastHwnd, L"RESET VIEW (gamepad)");
+                }
+            }
         }
     }
     if (!g_actionsMode) {
@@ -1352,6 +1389,11 @@ static void RenderOneFrame(RenderState& rs) {
 
     // Update performance stats
     UpdatePerformanceStats(*rs.perfStats);
+
+    if (g_padToastUntilSec != 0.0 && InputStateNowSec() > g_padToastUntilSec) {
+        g_padToastUntilSec = 0.0;
+        if (g_padToastHwnd) SetWindowTextW(g_padToastHwnd, WINDOW_TITLE);
+    }
 
     // Update input-based camera movement (clears resetViewRequested internally)
     UpdateCameraMovement(g_inputState, rs.perfStats->deltaTime, rs.xr->displayHeightM);
@@ -2658,6 +2700,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Create window FIRST (needed for XR_DXR_win32_window_binding)
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
+    g_padToastHwnd = hwnd;
     if (!hwnd) {
         LOG_ERROR("Failed to create window");
         ShutdownLogging();
