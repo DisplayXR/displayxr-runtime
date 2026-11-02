@@ -66,6 +66,19 @@ for that descriptor:
   core's eye mapping for an eye at the joint, with the eye-pair factors neutral
   (`m_view_rig_point.h`). `tests_view_rig_point` pins it bit-for-bit against
   the core across a sweep of canvases, poses and tunables.
+- **Display-relative (`RIG_LOCAL`) hand sources are canvas-relative**
+  ([ADR-034 Amendment 7](../../adr/ADR-034-input-provider-plugins.md),
+  2026-11-03; runtime spec: `input-provider-discovery.md` §4b.4). For such a
+  source in a session that owns its canvas (an external window), the joint's
+  display-plane pose `L` is read as fractions of the physical display height
+  and applied to the canvas: the canvas-frame point fed to the row above is
+  `s · L` with `s` = canvas height / physical display height, origin at the
+  canvas centre, instead of `L` minus the canvas centre; radius and linear
+  velocity are scaled by `s` as well, before the rig's own factor; orientation
+  is unchanged. A hand on the scene full screen stays on it in a window, at the
+  window's scale. A full-display canvas (`s` = 1, centred) is unchanged, and so
+  is every session with no canvas of its own; stage-anchored hand sources keep
+  the row above as written.
 
 **Which canvas — joints are consistent with the most recent view locate.** The
 canvas and the physical display plane come from the session's most recent
