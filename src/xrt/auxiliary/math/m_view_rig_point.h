@@ -58,6 +58,13 @@ struct m_view_rig_canvas
 	//! The nominal viewer (display space) — the camera rig's z reference.
 	float nominal_y_m;
 	float nominal_z_m;
+	/*!
+	 * Height of the PHYSICAL display the canvas sits on (metres, in the
+	 * canvas's orientation — after the same portrait swap). The RIG_LOCAL
+	 * scale is `height_m / display_height_m` (@ref m_view_rig_canvas_scale);
+	 * 0 = unknown = scale 1.
+	 */
+	float display_height_m;
 };
 
 /*!
@@ -139,6 +146,63 @@ m_view_rig_map_relation(const struct m_view_rig_canvas *canvas,
                         float radius,
                         struct xrt_space_relation *out,
                         float *out_radius);
+
+/*
+ *
+ * RIG_LOCAL is canvas-relative (input-provider-discovery.md §4b.4, ADR-034
+ * Amendment 7): a rig-local pose L (metres relative to the PHYSICAL display
+ * plane) is read as fractions of the physical display height and applied to
+ * the app's canvas — origin at the canvas centre, positions, radii and linear
+ * velocities scaled by s = canvas height / physical display height,
+ * orientations untouched. A full-display canvas has s = 1 and its centre at
+ * the display centre, so it is unchanged.
+ *
+ */
+
+/*!
+ * The RIG_LOCAL scale of @p canvas: `height_m / display_height_m`. 1 when the
+ * canvas is invalid, either height is unknown, or the ratio is within 1e-4 of
+ * 1 (a full-display canvas whose two heights come from different sources must
+ * not move by float noise).
+ */
+float
+m_view_rig_canvas_scale(const struct m_view_rig_canvas *canvas);
+
+/*!
+ * The canvas as a pose in display space: @ref m_view_rig_canvas::center and,
+ * when @ref m_view_rig_canvas::has_orientation, its orientation (else identity).
+ */
+void
+m_view_rig_canvas_pose(const struct m_view_rig_canvas *canvas, struct xrt_pose *out);
+
+/*!
+ * Where the canvas centre lands: the pose (in the frame @p plane_origin is
+ * given in) that a rig-local frame is placed on for a session that owns its
+ * canvas. The canvas pose on the physical plane @p plane_origin
+ * (`plane_origin o canvas_pose`), mapped through @p rig the way a joint is
+ * (@ref m_view_rig_map_relation: the canvas point 0 through the shared core,
+ * orientation `rig.pose.orientation`). @p rig NULL / NONE = no rig.
+ */
+void
+m_view_rig_canvas_plane(const struct m_view_rig_canvas *canvas,
+                        const struct m_view_rig *rig,
+                        const struct xrt_pose *plane_origin,
+                        struct xrt_pose *out);
+
+/*!
+ * Scale one relation uniformly about @p origin (same frame as the relation):
+ * `p' = origin + s (p - origin)`, linear velocity and @p radius times @p s;
+ * orientation, angular velocity and flags kept. This is the step that turns a
+ * rigid RIG_LOCAL placement `plane o L` into `plane o (s L)`. @p s == 1 copies
+ * the relation and radius bit for bit.
+ */
+void
+m_view_rig_scale_relation(const struct xrt_vec3 *origin,
+                          float s,
+                          const struct xrt_space_relation *in,
+                          float radius,
+                          struct xrt_space_relation *out,
+                          float *out_radius);
 
 #ifdef __cplusplus
 }
