@@ -347,3 +347,51 @@ DisplayXR itself. **−** Trust for these streams now rests on the provenance ga
 why an unverified provider falls back to the prompt rather than to the verdict. **−** The
 `component` verdict is a second consent entry point beside the §7.1 table; the input-provider spec
 §4d and this amendment are its statement.
+
+## Amendment 7 (2026-11-02) — a derived head pose is not camera data
+
+A community add-on for modded games asked (discussion #2466, question 4) whether it may
+republish the display's **tracked viewer pose** to OpenTrack / FreeTrack — loopback UDP or a
+local shared-memory block — so that the many games which already read a head tracker get
+look-around and lean from the display's own eye tracker, with no webcam or IR clip. The question
+behind it: does this ADR's consent gate cover that export?
+
+**It does not, and it should not.** ADR-043 gates **camera frames**: pixels, per-eye imagery and
+the calibration that makes them a camera. The Context section is explicit about why — those
+frames bypass the OS camera privacy model, and an image of the user is the datum worth
+protecting. A head pose derived from tracking is a different datum. It is the same six numbers
+the runtime already hands every session through `xrLocateViews` to drive the rig; nothing of
+what the tracker *saw* is in it, and a page or app that holds a pose has learned nothing a
+tracked 3D session had not already told it. Routing it through a camera prompt would ask the
+user to consent to a camera that is not being shared.
+
+**Decision.** Exporting a tracking-derived head pose to a consumer outside the OpenXR session is
+allowed, under four rules. They are the contract for the next app that asks, so it does not
+reopen the question:
+
+1. **Off by default.** The user turns the export on in the exporting app's own settings. No
+   runtime default, no installer flag, no profile key turns it on for them.
+2. **One head pose only.** Position and orientation of the viewer, with the timestamp the target
+   protocol needs. No images, and no per-eye data beyond what the pose needs.
+3. **Local machine only.** The receiver runs on the same PC (loopback UDP, local shared memory).
+   The export never leaves the machine.
+4. **It stops when the session ends.** The pose flows only while the exporting app holds a live
+   XR session; closing the session closes the export.
+
+**Who implements it.** The exporting app, not the runtime. The runtime adds no OpenTrack or
+FreeTrack sink and runs no exporter of its own: the pose it publishes is the one the session
+already receives, and the four rules bind whoever forwards it. A runtime-side export, if demand
+ever justifies one, would be bound by the same four rules and recorded as its own decision.
+
+**What this is not.** It opens no camera. Anything that needs pixels — frames, a face crop, a
+per-eye image — is camera data and goes through the stereo camera path and its consent table
+(§7.1), exactly as before. Nor does it change what a 3D session learns: an app on the display
+already receives the viewer pose; this amendment only says what it may do with it off-session.
+
+**Consequences.** **+** Games that read OpenTrack / FreeTrack get the display's tracker without
+a second tracking device, and the add-on community gets one answer instead of a per-app ruling.
+**+** The camera consent gate stays about cameras: no prompt is widened, no verdict is added.
+**−** A pose is still a signal about the user's presence and position; rules 1 and 3 — the user's
+own switch, and never off the machine — are the mitigation, and the reason neither is optional.
+**−** The runtime cannot enforce the rules inside a third-party app. They are a documented
+contract (here, and on the mod-authors page #2466 proposes), not a runtime check.
