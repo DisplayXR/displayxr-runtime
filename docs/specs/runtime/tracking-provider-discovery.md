@@ -660,11 +660,13 @@ identically. `tracking_calibrate_cli_solve`, `tracking_calibrate_cli_watch` and
   claimed tracker camera).
 - A provider on **the display's shared stereo camera** is an ADR-043 camera consumer (§10 item 2;
   as built, an **input** provider through the input host iface, `input-provider-discovery.md`
-  §4d). Being a consumer does **not** keep the display's tracker running: the shared display stream
-  carries frames **only while the display itself is tracking a viewer** (a 3D session on that
-  screen). Such a provider therefore works only during 3D sessions on that screen — exactly where
-  the display's own eyes win the viewer role anyway — unless the display vendor adds a camera-only
-  wake (frames without a weaver). That makes the shared camera a hands source, not a viewer source:
+  §4d). Whether a consumer keeps the display's camera running is the **vendor's** behaviour, and it
+  has changed between versions: an older Leia SR delivered frames **only while the display
+  itself was tracking a viewer** (a 3D session on that screen; WAITING otherwise), while LeiaSR
+  3054 with plug-in 2.19.2 streams from the moment a consumer opens the camera, with no 3D
+  session at all (measured 2026-11-01). A provider on it must follow the stream's state rather
+  than assume either. On a display of the first kind it works only during 3D sessions on that
+  screen — exactly where the display's own eyes win the viewer role anyway. That makes the shared camera a hands source, not a viewer source:
   the viewer role is served from a plain webcam (on a display that does not track, there is no
   shared tracker stream to consume).
 
