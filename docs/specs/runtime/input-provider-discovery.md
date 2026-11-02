@@ -667,24 +667,56 @@ changes. Anchoring happens after the head's own tracking origin is settled and
 before the space overseer freezes each origin offset into a space; a head with
 no valid pose anchors at identity.
 
-**Where RIG_LOCAL lands, per session.** `L` is relative to the display plane
-**the session sees** — the same plane `xrLocateViews` reports as
+**Where RIG_LOCAL lands, per session.** `L` is relative to the **virtual**
+display plane **the session sees** — the app's canvas (its window on the
+panel), mapped through its `XR_DXR_view_rig` if it chains one (for a camera rig
+that is the convergence plane) — the same plane `xrLocateViews` reports as
 `XrViewDisplayRawDXR::displayPlanePose` and `XR_DXR_display_info`'s DISPLAY
-space resolves to:
+space resolves to. The provider still publishes `L` in physical metres about
+the physical display; the runtime reads it as fractions of the physical display
+height `H_phys` and applies it to the canvas (*ADR-034 Amendment 7*,
+2026-11-03):
 
-| Session | Its display plane | A RIG_LOCAL pose `L` is located at | Follows rig motion? |
+```
+s        = canvas.height_m / H_phys          (1 when unknown)
+p_canvas = s · L.position                    origin at the CANVAS centre, canvas axes
+radius, linear velocity  × s                 (on top of a rig's own length scale)
+orientation, angular velocity                unchanged
+```
+
+So a hand that sits on the cube full screen sits on the cube in a window, and
+its size follows the window. A full-display canvas has `s = 1` and its centre
+at the display centre, so it is unchanged bit for bit; so is every session with
+no canvas of its own (runtime-window, bridge relay: `s = 1`, the plane as
+before).
+
+| Session | Its display plane `P` | A RIG_LOCAL pose `L` is located at | Follows rig motion? |
 |---|---|---|---|
 | Runtime-window (`_hosted`, legacy, headless without `XR_DXR_display_info`) — in-process or IPC | the head **device** pose, `rig(t)` (the head device *is* the display; qwerty / the composer move it) | `rig(t) ∘ L` | yes — WASD / mouse-look / a navigating provider carry the hands (*Amendment 2*) |
-| External-window (`_handle`, `_texture`, the Unity / Unreal providers) — in-process or IPC | the **identity at the head's tracking origin** (the app owns its camera) | `T_origin ∘ L` | no — the plane does not move for these sessions, so neither do the hands; an app that navigates declares it through `XR_DXR_view_rig` |
+| External-window (`_handle`, `_texture`, the Unity / Unreal providers) — in-process or IPC | the **canvas** pose (its centre offset + orientation) on the physical plane, which is the identity at the head's tracking origin (the app owns its camera) | `T_origin ∘ P ∘ (s L)` | no — the plane does not move for these sessions, so neither do the hands; an app that navigates declares it through `XR_DXR_view_rig` |
 | Bridge relay (`XR_DXR_display_info` + headless) | the identity at the head's tracking origin | `T_origin ∘ L` | no |
-| Any non-bridge session whose latest `xrLocateViews` chained an `XR_DXR_view_rig` descriptor | where the **rig** puts the physical plane: `P` = display point 0 mapped through the rig, unscaled (for a full-canvas display rig, its `pose` — the `displayPlanePose` it reports) | `T_origin ∘ P ∘ L` | with the rig — the app's views are in that frame |
+| Any non-bridge session whose latest `xrLocateViews` chained an `XR_DXR_view_rig` descriptor | where the **rig** puts the plane, unscaled: for an external-window session the **canvas centre** mapped through the rig (`m_view_rig_canvas_plane`; for a full-canvas display rig, its `pose` — the `displayPlanePose` it reports), for a runtime-window one display point 0 mapped through the rig | `T_origin ∘ P ∘ (s L)` (`s = 1` for a runtime-window session) | with the rig — the app's views are in that frame |
 
 The space graph is session-agnostic and resolves every RIG_LOCAL pose to the
-first row's `rig(t) ∘ L`. For the other two rows the state tracker re-bases it
+first row's `rig(t) ∘ L`. For the other rows the state tracker re-bases it
 (`oxr_space.c::rig_local_plane_correction`, applied in `xrLocateSpace(s)` and
 in the hand-joint base): `C = T_origin ∘ P ∘ inv(head_pose(t)) ∘ inv(T_origin)`,
-left-multiplied, in the locate's base space, with `P` = identity for the
-external-window / bridge-relay rows and the rig plane for the last row.
+left-multiplied, in the locate's base space, then — a uniform scale is not a
+pose — the result is scaled by `s` about `T_origin ∘ P`
+(`m_view_rig_scale_relation`; for hand joints after the joints are composed
+onto the rigidly placed hand, radii included). A RIG_LOCAL **base** space gets
+the inverse: its own origin lands at the scaled `C` and the target is
+re-expressed in it; a RIG_LOCAL target in a RIG_LOCAL base cancels as before.
+The canvas and `s` are the latest view locate's (in service mode the server's
+canvas, with `H_phys` the client's view of the session's display); before the
+session's first view locate, the session's own canvas in-process, and the
+physical plane (`s = 1`) in service mode. `H_phys` is the window metrics'
+display height (the screen the canvas is on), swapped by the #499 portrait rule
+like the canvas; a ratio within 1e-4 of 1 is taken as exactly 1. A **rotated**
+canvas (a workspace tile) reads `L` in the canvas axes — position and
+orientation — so the hand keeps its place on the canvas as the canvas turns.
+Stage-anchored (`OTHER` / `NONE`) sources are untouched in every session: they
+are real-world tracked objects with mount offsets, not display-relative.
 
 The rig row exists because `T_origin` is **not** the LOCAL origin: LOCAL sits
 at the builder's 1.6 m stage offset above the head's tracking origin, so an
@@ -696,10 +728,16 @@ wrists at y ≈ −1.56 instead of +0.04). `P` is recorded by each view locate
 by one that chains nothing; it goes through the same point core as spec-4
 rig-scoped joints (`m_view_rig_map_relation`), so for an unscaled rig
 base-space joints equal the rig-frame ones, and the spec-4 mapping undoes `P`
-rather than the physical plane for RIG_LOCAL sources. A hand locate **before**
+rather than the physical plane for RIG_LOCAL sources (for an external-window
+session `P ∘ inv(canvas pose)`, which hands the canvas rebase the point
+`canvas ∘ (s L)` and so the canvas point `s L`). A hand locate **before**
 the session's first rigged view locate still sees the physical plane — locate
 views first each frame. Pinned by `tests_oxr_view_space_rig_hands` ("RIG_LOCAL
-hands follow the display plane a chained XR_DXR_view_rig puts in LOCAL"). It has to be per session: one
+hands follow the display plane a chained XR_DXR_view_rig puts in LOCAL"); the
+windowed placement (canvas centre + `s L`, radii and velocities × `s`, the
+spec-4 joint = the canvas point `s L` through the rig) by `tests_view_rig_point`
+("RIG_LOCAL is canvas-relative"), because the external-window class cannot
+come up headlessly. It has to be per session: one
 graph serves sessions of both kinds (several IPC clients), and an
 external-window session flips the head device into `EXT_APP_MODE` — which
 replaces the fly-camera pose with the display plug-in's static nominal viewer —
@@ -1058,12 +1096,17 @@ new):
 | `HAND_SCALE_H_PER_M` | float | `2.5` | the hand's **own** size, in display heights per metre of real hand: joint offsets about the root (wrist / palm) and joint radii (and joint linear velocities relative to the root) scale by `gain·H`. The default is the Ultraleap provider's relative-mapping gain, so the sim hand is drawn the way the reference viewer app shows a Leap hand — a 10 cm hand on a 0.194 m panel shows as 0.25·H ≈ 4.9 cm. ≤ 0 = 1:1 metres (the pre-gain behaviour). The circle centres and radius are unchanged (the circle is already in display heights) |
 | `SOURCE` | enum | `script` | `script` — the scripted hands above, always present; `shared-camera` — open the display's shared stereo camera through the host slots (§4d) and report the scripted hands `PRESENT` only while frames flow, `ABSENT` otherwise (no 3D party, suspended, ended, or the open failed, e.g. in an in-process runtime), one WARN per transition. The poses stay scripted; the camera only gates presence |
 
-**The sim hands are display-metric and do not follow the window canvas.**
-`H` in the placement and in `HAND_SCALE_H_PER_M` is the PHYSICAL display
-height, never the window or canvas, so resizing or moving an app's window
-neither moves nor resizes the hands — the same as a real Leap seen through the
-window as a portal (the Ultraleap provider's relative mapping is display-metric
-in the same way).
+**The sim hands are published display-metric; the runtime maps them onto the
+canvas.** `H` in the placement and in `HAND_SCALE_H_PER_M` is the PHYSICAL
+display height, never the window or canvas — a provider never knows the app's
+window (the Ultraleap provider's relative mapping is display-metric in the same
+way). Since *ADR-034 Amendment 7* (2026-11-03) the runtime reads those poses
+relative to the app's **virtual** display plane (§4b.4): in a windowed
+external-window app the hands sit at the same place **on the canvas** as full
+screen and scale with the window's height, the way the reference viewer app
+parents its Leap rig to its virtual display rig. (Until then the window was a
+portal: the hands kept their physical place and size on the panel, so a window
+in a corner showed none.) Full screen nothing changes.
 
 Pinned by `tests/tests_sim_input_hands.cpp` (the pure script: placement, the
 pinch-hold tip gap through the real `u_hand_simulation`, the hand scale — 0.25·H

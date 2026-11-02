@@ -657,3 +657,23 @@ an app could not offer its user a choice, and a user could not pin one app to on
 - The trunk rule this generalises (ADR-054 decision 8): every class keeps all installed components
   resident; selection scope is per class — display processors per screen, conversion providers per
   task and per stream, input providers per role family and per client.
+
+## Amendment 7 — RIG_LOCAL poses are relative to the app's virtual display plane (2026-11-03)
+
+**Status:** Accepted (David, 2026-11-03, at the display; reverses the 2026-10-20 "window is a portal"
+rule). A `RIG_LOCAL` pose `L` (§4b.4 of the spec: metres about the *physical* display centre) is now
+read relative to the app's **virtual** display plane — its canvas, the window on the panel, mapped
+through its `XR_DXR_view_rig` if it chains one (for a camera rig, the convergence plane): `L` is
+taken as fractions of the physical display height `H_phys` and applied to the canvas, `p_canvas =
+s · L` with `s = canvas height / H_phys`, origin at the **canvas centre**; joint radii and linear
+velocities scale by `s` too (on top of a rig's own length scale), orientations do not. **Why:** a
+hand that sits on the scene full screen must sit on it in a window, and its size must follow the
+window — that is how the reference viewer app behaves, because it parents its hand-tracking rig to
+its virtual display rig, and under the portal rule a window in a corner showed no hands at all.
+**What changes:** external-window (`_handle` / `_texture`, engine plug-in) sessions, in the
+action-space re-base (grip / aim, hand joints without a descriptor) and in spec-4 rig-scoped hand
+joints alike, so one provider's hands and controllers keep agreeing. **What does not:** a
+full-display canvas (`s = 1`, centred: bit-for-bit as before); sessions with no canvas of their own
+(runtime-window `_hosted` / legacy, bridge relay); stage-anchored (`OTHER` / `NONE`) sources
+everywhere — they are real-world tracked objects with mount offsets — and the provider contract
+itself: providers keep publishing physical display-plane metres and never learn the window.
