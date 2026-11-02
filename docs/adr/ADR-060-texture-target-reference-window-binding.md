@@ -273,7 +273,9 @@ binding.
 - #2378: the hub's client-presents route suppresses repaint, because the caller has no release fence it can wait on between frames.
 - #2382: D3D12 texture sessions honour the v9 binding (sub-rect phase and target state) on the hub route. Today the reroute derives the target from the `windowHandle`'s client area.
 - #2399: the native texture path's woven readback is bistable in the cube region.
-- GL texture sessions on the hub (#2366). Vulkan needs a Windows shared-texture export first (R8).
+- GL texture sessions on the hub. The GL shim (#2366) landed without texture mode, so a GL texture
+  session stays on the GL compositor's own legs (`shared_texture_session`). Vulkan needs a Windows
+  shared-texture export first (R8).
 - The spanning arm (a target across a 3D and a 2D screen) has not run on hardware yet; it needs a machine with a LeiaSR panel and a second monitor.
 - The cocoa pair for macOS (decision 1). Not started.
 

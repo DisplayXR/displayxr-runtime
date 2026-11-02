@@ -33,7 +33,7 @@ App (any graphics API)
    Display
 ```
 
-Every graphics API gets its own native compositor — no Vulkan intermediary, no interop overhead. Vendor-specific processing (interlacing, lenticular weaving) is isolated in the display processor layer.
+Every graphics API gets its own native compositor — no Vulkan intermediary. On Windows the in-process compositors can hand the weave and present to one D3D11 hub ([ADR-059](docs/adr/ADR-059-d3d11-hub-compositor-windows.md)), which imports their atlas at a single shared-texture boundary. Vendor-specific processing (interlacing, lenticular weaving) is isolated in the display processor layer.
 
 | API | Windows | macOS | Linux | Android |
 |-----|---------|-------|-------|---------|

@@ -28,7 +28,7 @@ App (any graphics API)
    Display
 ```
 
-Each graphics API gets a native compositor — no interop, no Vulkan intermediary.
+Each graphics API gets a native compositor — no Vulkan intermediary; on Windows the in-process tiers can weave + present through one D3D11 hub, importing their atlas at one shared-texture boundary (ADR-059).
 
 - Layer boundaries, the vendor-isolation rule, and "must NOT contain" constraints: `docs/architecture/separation-of-concerns.md`
 - Why per-API compositors: `docs/adr/ADR-001-native-compositors-per-graphics-api.md`. Compositor never weaves (that's the DP's job): `docs/adr/ADR-007-compositor-never-weaves.md`

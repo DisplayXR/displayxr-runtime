@@ -1,6 +1,7 @@
 # ADR-035: The Service Owns Arbitration, Runs One Compositor Pipeline, and Isolates Its Satellites
 
-**Status:** Accepted (design; implementation phased in epic #974, issues #950–#973 — nothing in this ADR is shipped at the date below)
+**Status:** Accepted (design; implementation phased in epic #974, issues #950–#973 — nothing in this ADR was shipped at the date below).
+**Shipped since:** Phases 0–3 of #974 — forensics and per-client telemetry (#950–#953), IPC core hardening including server-derived identity (#954–#959), the arbitration contract (client classes #960, the panel lease #961, one focus authority #962, the transition fixes #963) and D3, one compositor pipeline (#964–#967). Open: Phase 4, isolation and supervision (#968–#971), and Phase 5, Android alignment (#972, #973). [ADR-059](ADR-059-d3d11-hub-compositor-windows.md) Amendment 3 adds a third presenter strategy, client-presents, under D3.
 **Date:** 2026-08-16
 
 ## Context

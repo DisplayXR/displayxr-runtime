@@ -5,10 +5,28 @@ source: "#2317"
 ---
 # ADR-059: One D3D11 hub compositor on Windows; the per-API in-process compositors become import shims
 
-**Status:** Accepted (David, 2026-10-24; proposed the same day). Phase 1 of epic #2317 is
-implemented default-OFF behind `DXR_HUB=1` (PR #2321) with its A/B harness (PR #2323); Phase 2
-has landed the planes through the hub (#2335). Defaults still flip only per API behind the
-acceptance gates below. Related: [ADR-001](ADR-001-native-compositors-per-graphics-api.md) (amended, not
+**Status:** Accepted (David, 2026-10-24; proposed the same day). Phase 1 of epic #2317 landed
+default-OFF behind `DXR_HUB=1` (PR #2321) with its A/B harness (PR #2323). Defaults have since
+flipped per API, each behind the acceptance gates below:
+
+- **In-process D3D11, cross-adapter (hybrid) box:** the hub is the default since step 2 (PR #2363);
+  `DXR_HUB=0` is the kill switch (`hub placement: hub=0 reason=disabled_by_env`). On a single
+  adapter the hub engages only with `DXR_HUB=1` (`reason=same_adapter_opt_in` otherwise); the
+  single-dGPU acceptance run (#2371) has passed, the default flip there has not landed yet.
+- **In-process D3D12, hybrid box:** the #1264 reroute onto the hub is the default since #2375
+  (PR #2381, `reason=hybrid_reroute_default_on`). `DXR_SPLIT_D3D12_HYBRID_REROUTE=0` is the route's
+  own kill switch; with it unset, `DXR_HUB=0` kills the route too; `DXR_SPLIT_D3D12_ROUTE=own`
+  keeps the own-legs arm. On a single adapter the tier already rode this fill arm (ADR-039, #1264).
+- **In-process Vulkan:** the fill arm that lived in `comp_vk_native_split.cpp` *is* the hub
+  (extracted into `compositor/hub_d3d11/` by PR #2321), so the VK tier's output-device split runs
+  on it wherever the split engages. The VK tier does not read `DXR_HUB`; its kill switch is the
+  split's, `DXR_WEAVE_ON_SCANOUT=0`.
+- **OpenGL:** an opt-in shim (P3, PR #2366), exactly `DXR_HUB=1` on every topology; otherwise
+  `hub placement: hub=0 reason=not_requested`.
+- **Texture-class sessions:** the client-presents strategy (Amendment 3, PR #2380), only with
+  `DXR_HUB=1` (`reason=shared_texture_session` for every texture session it does not take).
+
+Related: [ADR-001](ADR-001-native-compositors-per-graphics-api.md) (amended, not
 superseded), [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md)
 D3, [ADR-037](ADR-037-adapter-placement-policy-hybrid-devices.md),
 [ADR-039](ADR-039-one-fill-engine-for-every-tier.md),
@@ -230,11 +248,19 @@ ADR-037/#918 (all-scanout 16.0 ms, all-dGPU 42.1 ms, split 16.6 ms motion-to-pho
 
 ## Phasing
 
-See #2317 for the checklist. P1 (extraction, D3D11 shim, D rows, harness) is done default-off.
-P2: the hub becomes the one implementation (planes through the hub, DIRECT ingress for every
-shim, one late-weave gate/repaint/presenter/placement/mask/capture, colour at the boundary).
-P3: GL shim. P4: engines + browser regression. P5: per-API default flips with kill switches,
-retire native legs after one release, converge the service onto the hub library.
+See #2317 for the checklist. Status per phase:
+
+- **P1 — done** (PR #2321, harness PR #2323): extraction, D3D11 shim, D rows, harness.
+- **P2 — landed** (P2a DIRECT ingress for the D3D12 reroute and the Vulkan deposit; P2b planes
+  through the hub, PR #2335; P2c the hub as the one implementation, PR #2345 and Amendment 2):
+  planes through the hub, DIRECT ingress for every shim, one late-weave gate/repaint/presenter/
+  placement/mask/capture, colour at the boundary.
+- **P3 — landed** (PR #2366): the GL shim, opt-in (`DXR_HUB=1`).
+- **P4 — partial:** Unity engine repeats ran for the D3D12 flip (#2375); the Unreal check is
+  deferred (see the table below).
+- **P5 — in progress:** the hybrid defaults flipped for D3D11 (PR #2363) and D3D12 (#2375,
+  PR #2381), each with a kill switch. Open: the single-adapter D3D11 default, a GL default,
+  retiring the native legs after one release, and converging the service onto the hub library.
 
 ## Acceptance for flipping a default (per API)
 
@@ -350,7 +376,9 @@ same on both tiers. Under `DXR_HUB=1` both tiers print `hub placement: hub=0 rea
 - **D3D12 has no v9 target binding yet.** On D3D12 the target is the `windowHandle`'s whole client
   area. A sub-rect target therefore phases from the client-area corner, and no
   `XrWin32TextureTargetStateDXR` is produced (#2382).
-- **OpenGL texture mode** is not carried; it waits for the GL shim (#2366).
+- **OpenGL texture mode** is not carried. The GL shim (#2366) landed without it: a GL session
+  with a shared texture is refused (`shared_texture_session`) and stays on the GL compositor's own
+  legs.
 
 ## References
 

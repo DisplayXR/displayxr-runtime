@@ -26,6 +26,17 @@ the #868 repaint fill
 [ADR-037](ADR-037-adapter-placement-policy-hybrid-devices.md),
 [ADR-029], [`docs/reference/motion-to-photon-levers.md`](../reference/motion-to-photon-levers.md)
 
+**Update (ADR-059, epic #2317).** The "d3d11 fill arm" this ADR names was extracted from the
+Vulkan tree into `compositor/hub_d3d11/` (`comp_hub_d3d11`, PR #2321) and is now the D3D11 hub of
+[ADR-059](ADR-059-d3d11-hub-compositor-windows.md). Two statements above are superseded:
+
+- The own-legs arm is no longer the D3D12 *hybrid* path. A hybrid D3D12 session rides the hub by
+  default since #2375 (PR #2381). `DXR_SPLIT_D3D12_HYBRID_REROUTE=0` or `DXR_SPLIT_D3D12_ROUTE=own`
+  keeps the own-legs arm, and so does `DXR_HUB=0` while the route knob is unset.
+- The gl tier is no longer only proposed. It has an opt-in hub shim (exactly `DXR_HUB=1`, PR #2366).
+
+`DXR_SPLIT_SAME_ADAPTER` keeps its meaning for every tier.
+
 ## Context
 
 ### The law this serves

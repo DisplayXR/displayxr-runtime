@@ -29,7 +29,11 @@ src/xrt/
 │   ├── d3d12/                 Native D3D12 compositor (Windows)
 │   ├── metal/                 Native Metal compositor (macOS)
 │   ├── gl/                    Native OpenGL compositor (Windows + macOS)
-│   ├── vk_native/             Native Vulkan compositor (Windows + macOS)
+│   ├── vk_native/             Native Vulkan compositor (Windows, macOS, Linux, Android)
+│   ├── hub_d3d11/             Windows D3D11 hub: weave + present for in-process tiers (ADR-059)
+│   ├── xbridge/               Cross-adapter atlas transport + output-device split gate
+│   ├── d3d_shared/            HLSL shared by the D3D11 and D3D12 compositors
+│   ├── vk_conv/               Vulkan GPU glue for the conversion core (ADR-053)
 │   ├── client/                Client-side API glue (GL, Vulkan, D3D11, D3D12)
 │   ├── render/                Vulkan render helpers
 │   ├── shaders/               GLSL shader sources
