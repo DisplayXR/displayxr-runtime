@@ -12,6 +12,7 @@
 
 #include "math/m_api.h"
 #include "math/m_space.h"
+#include "math/m_view_rig_point.h"
 
 #include "util/u_debug.h"
 #include "util/u_misc.h"
@@ -170,10 +171,9 @@ space_is_rig_local(const struct oxr_space *spc)
  * EXT_APP_MODE flips the head pose at xrCreateSession, after the builder ran).
  *
  * A session whose latest xrLocateViews chained an XR_DXR_view_rig sees the
- * plane where its RIG puts it instead (P = oxr_session_get_rig_plane_origin,
- * tracking-origin space) — in every session class but the bridge relay, whose
- * descriptors are inert. Its views are in that frame, so its hands and
- * controllers must be too:
+ * plane where its RIG puts it instead (P, tracking-origin space) — in every
+ * session class but the bridge relay, whose descriptors are inert. Its views
+ * are in that frame, so its hands and controllers must be too:
  *
  *     C_B = T_B_origin o P o inv(head_pose(t)) o inv(T_B_origin)
  *
@@ -181,16 +181,35 @@ space_is_rig_local(const struct oxr_space *spc)
  * external-window rig app that poses its display rig at the LOCAL origin —
  * the normal shape: Unity, Unreal, the cube apps — saw its RIG_LOCAL hands at
  * T_B_origin o L, i.e. LOCAL's 1.6 m stage height BELOW its views.
+ *
+ * RIG_LOCAL is relative to the app's VIRTUAL display plane — its canvas
+ * (ADR-034 Amendment 7). For a session that owns its canvas (an external
+ * window) P is the CANVAS centre (through the rig when one is chained) and L
+ * is scaled about it by s = canvas height / physical display height, so a
+ * hand on the cube full screen is on the cube in a window, at the window's
+ * scale. The target lands at
+ *
+ *     T_B_origin o P o (s L)
+ *
+ * A uniform scale about a point is not a pose, so it is returned apart:
+ * @p out_c is the rigid correction (s = 1) and @p out_plane_base the plane
+ * T_B_origin o P in the base, about whose position the rigid result is
+ * scaled by @p out_s (m_view_rig_scale_relation). A full-display canvas has
+ * s = 1 and P at the display centre: unchanged. Which P and s a session gets:
+ * oxr_session_get_rig_local_plane.
  */
 static bool
 rig_local_plane_correction(struct oxr_session *sess,
                            struct xrt_space *xbase,
                            const struct xrt_pose *base_offset,
                            int64_t at_timestamp_ns,
-                           struct xrt_pose *out_c)
+                           struct xrt_pose *out_c,
+                           struct xrt_pose *out_plane_base,
+                           float *out_s)
 {
 	struct xrt_pose plane = XRT_POSE_IDENTITY;
-	const bool rig_plane = oxr_session_get_rig_plane_origin(sess, &plane);
+	float s = 1.0f;
+	const bool rig_plane = oxr_session_get_rig_local_plane(sess, &plane, &s);
 	if (!rig_plane && !sess->has_external_window && !sess->is_bridge_relay) {
 		return false; // The plane IS the head device pose: the graph is right.
 	}
@@ -221,18 +240,28 @@ rig_local_plane_correction(struct oxr_session *sess,
 	math_pose_transform(&inv_hp, &inv_origin, &tmp);
 	math_pose_transform(&plane, &tmp, &tmp2);
 	math_pose_transform(&T_B_origin.pose, &tmp2, out_c);
+	math_pose_transform(&T_B_origin.pose, &plane, out_plane_base);
+	*out_s = s;
 	return true;
 }
 
 /*!
  * Apply the RIG_LOCAL re-base to @p rel (target located in base, both as the
- * space graph saw them). A rig-local TARGET is moved by C, a rig-local BASE by
- * inv(C); both rig-local, or neither, cancels.
+ * space graph saw them). A rig-local TARGET is moved by C and then (unless
+ * @p rigid_target) scaled by s about the plane; a rig-local BASE gets the
+ * inverse: the base's own origin lands at C, scaled the same way (F), and the
+ * target is re-expressed in it, inv(F) o rel. Both rig-local, or neither,
+ * cancels (one provider's poses relative to each other stay rigid).
+ *
+ * @p rigid_target: the target is a device ORIGIN onto which the caller still
+ * composes the tracked poses (hand joints), so the scale is applied by the
+ * caller to the composed result (oxr_space_rig_local_scale).
  */
 static void
 rig_local_rebase(struct oxr_session *sess,
                  bool target_rig_local,
                  bool base_rig_local,
+                 bool rigid_target,
                  struct xrt_space *xbase,
                  const struct xrt_pose *base_offset,
                  int64_t at_timestamp_ns,
@@ -241,11 +270,20 @@ rig_local_rebase(struct oxr_session *sess,
 	if (target_rig_local == base_rig_local || rel->relation_flags == 0) {
 		return;
 	}
-	struct xrt_pose c;
-	if (!rig_local_plane_correction(sess, xbase, base_offset, at_timestamp_ns, &c)) {
+	struct xrt_pose c, plane_base;
+	float s = 1.0f;
+	if (!rig_local_plane_correction(sess, xbase, base_offset, at_timestamp_ns, &c, &plane_base, &s)) {
 		return;
 	}
 	if (base_rig_local) {
+		if (s != 1.0f) {
+			// Where the base's own origin lands: C o identity, scaled.
+			struct xrt_space_relation at = {0};
+			at.pose = c;
+			struct xrt_space_relation scaled;
+			m_view_rig_scale_relation(&plane_base.position, s, &at, 0.0f, &scaled, NULL);
+			c = scaled.pose;
+		}
 		struct xrt_pose inv;
 		math_pose_invert(&c, &inv);
 		c = inv;
@@ -254,6 +292,11 @@ rig_local_rebase(struct oxr_session *sess,
 	m_relation_chain_push_relation(&xrc, rel);
 	m_relation_chain_push_pose(&xrc, &c);
 	m_relation_chain_resolve(&xrc, rel);
+	if (!base_rig_local && !rigid_target && s != 1.0f) {
+		struct xrt_space_relation scaled;
+		m_view_rig_scale_relation(&plane_base.position, s, rel, 0.0f, &scaled, NULL);
+		*rel = scaled;
+	}
 }
 
 static XrResult
@@ -645,7 +688,7 @@ oxr_spaces_locate(struct oxr_logger *log,
 			// RIG_LOCAL devices sit on THIS session's display plane.
 			const bool base_rl = space_is_rig_local(baseSpc);
 			for (uint32_t i = 0; i < spc_count; i++) {
-				rig_local_rebase(baseSpc->sess, space_is_rig_local(spcs[i]), base_rl, xbase,
+				rig_local_rebase(baseSpc->sess, space_is_rig_local(spcs[i]), base_rl, false, xbase,
 				                 &base_offset, (int64_t)at_timestamp_ns, &results[i]);
 			}
 		}
@@ -805,8 +848,8 @@ oxr_space_locate(
 		    &result);                    //
 
 		// RIG_LOCAL devices sit on THIS session's display plane.
-		rig_local_rebase(spc->sess, space_is_rig_local(spc), space_is_rig_local(baseSpc), xbase, &base_offset,
-		                 (int64_t)at_timestamp_ns, &result);
+		rig_local_rebase(spc->sess, space_is_rig_local(spc), space_is_rig_local(baseSpc), false, xbase,
+		                 &base_offset, (int64_t)at_timestamp_ns, &result);
 	}
 
 	/*
@@ -950,9 +993,39 @@ oxr_space_locate_device(struct oxr_logger *log,
 	    out_relation);                //
 
 	// RIG_LOCAL devices sit on THIS session's display plane (the hand-joint
-	// base goes through here).
-	rig_local_rebase(baseSpc->sess, xdev_is_rig_local(xdev), space_is_rig_local(baseSpc), xbase, &base_offset,
+	// base goes through here). Rigid for the device origin: the canvas scale
+	// belongs to what the caller composes onto it (oxr_space_rig_local_scale).
+	rig_local_rebase(baseSpc->sess, xdev_is_rig_local(xdev), space_is_rig_local(baseSpc), true, xbase, &base_offset,
 	                 (int64_t)at_timestamp_ns, out_relation);
 
 	return ret;
+}
+
+bool
+oxr_space_rig_local_scale(
+    struct oxr_logger *log, struct oxr_space *baseSpc, XrTime time, struct xrt_vec3 *out_origin, float *out_scale)
+{
+	*out_scale = 1.0f;
+	if (space_is_rig_local(baseSpc)) {
+		return false; // The source's own placement cancels in a rig-local base.
+	}
+	struct xrt_space *xbase = NULL;
+	(void)get_xrt_space(log, baseSpc, &xbase);
+	if (xbase == NULL) {
+		return false;
+	}
+	const int64_t at_timestamp_ns =
+	    (int64_t)time_state_ts_to_monotonic_ns(baseSpc->sess->sys->inst->timekeeping, time);
+	struct xrt_pose base_offset = XRT_POSE_IDENTITY;
+	oxr_space_ref_offset(baseSpc, &base_offset);
+
+	struct xrt_pose c, plane_base;
+	float s = 1.0f;
+	if (!rig_local_plane_correction(baseSpc->sess, xbase, &base_offset, at_timestamp_ns, &c, &plane_base, &s) ||
+	    s == 1.0f) {
+		return false;
+	}
+	*out_origin = plane_base.position;
+	*out_scale = s;
+	return true;
 }

@@ -91,6 +91,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <math.h>
 
 // Vendor-neutral display metric types (eye positions, window metrics, Kooima FOV)
 #include "xrt/xrt_display_metrics.h"
@@ -3424,11 +3425,18 @@ session_record_rig_canvas(struct oxr_session *sess,
 	bool rig_plane_valid = false;
 	struct xrt_pose rig_plane = XRT_POSE_IDENTITY;
 	if (rig_origin != NULL && rig_origin->kind != M_VIEW_RIG_NONE && !sess->is_bridge_relay) {
-		struct xrt_space_relation at_plane = XRT_SPACE_RELATION_ZERO;
-		at_plane.pose = *plane_origin;
-		struct xrt_space_relation mapped;
-		m_view_rig_map_relation(canvas, rig_origin, plane_origin, &at_plane, 0.0f, &mapped, NULL);
-		rig_plane = mapped.pose;
+		if (sess->has_external_window) {
+			// RIG_LOCAL is canvas-relative (ADR-034 Amendment 7): a session
+			// that owns its canvas places L on the CANVAS centre through
+			// the rig — the point a full-display canvas has at display 0.
+			m_view_rig_canvas_plane(canvas, rig_origin, plane_origin, &rig_plane);
+		} else {
+			struct xrt_space_relation at_plane = XRT_SPACE_RELATION_ZERO;
+			at_plane.pose = *plane_origin;
+			struct xrt_space_relation mapped;
+			m_view_rig_map_relation(canvas, rig_origin, plane_origin, &at_plane, 0.0f, &mapped, NULL);
+			rig_plane = mapped.pose;
+		}
 		rig_plane_valid = true;
 	}
 
@@ -3440,6 +3448,25 @@ session_record_rig_canvas(struct oxr_session *sess,
 	sess->rig_canvas.rig_plane_valid = rig_plane_valid;
 	sess->rig_canvas.rig_plane_origin = rig_plane;
 	os_mutex_unlock(&sess->rig_canvas.lock);
+}
+
+/*!
+ * The physical display height, in the orientation of a canvas the SERVICE
+ * resolved (@p canvas_w_m x @p canvas_h_m) — the RIG_LOCAL scale reference
+ * (ADR-034 Amendment 7) for a canvas whose wire record carries no display
+ * size. A canvas that is the display transposed (the #499 portrait swap)
+ * takes the display's width. 0 = unknown (scale 1).
+ */
+static float
+rig_canvas_display_height_m(struct oxr_session *sess, float canvas_w_m, float canvas_h_m)
+{
+	float w = 0.0f, h = 0.0f;
+	if (!oxr_session_get_display_dimensions(sess, &w, &h) || !(w > 0.0f) || !(h > 0.0f)) {
+		return 0.0f;
+	}
+	const bool transposed =
+	    fabsf(canvas_w_m - h) <= 1e-4f * h && fabsf(canvas_h_m - w) <= 1e-4f * w && fabsf(w - h) > 1e-4f * h;
+	return transposed ? w : h;
 }
 
 //! A view locate that chains no rig: RIG_LOCAL goes back to the physical plane.
@@ -3466,18 +3493,6 @@ session_view_rig_to_m(const struct oxr_view_rig_state *vr,
 	out->m2v = vr->m2v;
 	out->inv_convergence_distance = vr->inv_convergence_distance;
 	out->half_tan_vfov = vr->half_tan_vfov;
-}
-
-bool
-oxr_session_get_rig_plane_origin(struct oxr_session *sess, struct xrt_pose *out_plane_origin)
-{
-	os_mutex_lock(&sess->rig_canvas.lock);
-	const bool valid = sess->rig_canvas.rig_plane_valid;
-	if (valid) {
-		*out_plane_origin = sess->rig_canvas.rig_plane_origin;
-	}
-	os_mutex_unlock(&sess->rig_canvas.lock);
-	return valid;
 }
 
 /*!
@@ -3510,6 +3525,7 @@ locate_resolve_canvas(struct oxr_session *sess,
 	float eye_offset_z = 0.0f;
 	struct xrt_quat win_orient = {0, 0, 0, 1}; // identity
 	bool win_has_orientation = false;
+	bool window_canvas = false;
 
 	struct xrt_window_metrics wm = {0};
 	bool have_wm = false;
@@ -3551,6 +3567,7 @@ locate_resolve_canvas(struct oxr_session *sess,
 		// offset eyes to be relative to window center (not display center)
 		screen_width_m = wm.window_width_m;
 		screen_height_m = wm.window_height_m;
+		window_canvas = true;
 		eye_offset_x = wm.window_center_offset_x_m;
 		eye_offset_y = wm.window_center_offset_y_m;
 		eye_offset_z = wm.window_center_offset_z_m;
@@ -3594,6 +3611,24 @@ locate_resolve_canvas(struct oxr_session *sess,
 		}
 	}
 
+	// The physical display the canvas sits on, in the canvas's orientation:
+	// the RIG_LOCAL scale reference (canvas height / display height, ADR-034
+	// Amendment 7). A full-display canvas IS the display (scale exactly 1);
+	// a window canvas takes the metrics' display, swapped by the same #499
+	// rule when its pixel orientation disagrees with its metres.
+	float display_height_m = screen_height_m;
+	if (window_canvas) {
+		float dw = wm.display_width_m;
+		float dh = wm.display_height_m;
+		if (wm.display_pixel_width > 0 && wm.display_pixel_height > 0 && dw > 0.0f && dh > 0.0f &&
+		    (wm.display_pixel_width >= wm.display_pixel_height) != (dw >= dh)) {
+			const float tmp = dw;
+			dw = dh;
+			dh = tmp;
+		}
+		display_height_m = dh; // 0 (unknown) = scale 1
+	}
+
 	memset(out, 0, sizeof(*out));
 	out->wm = wm;
 	out->have_wm = have_wm;
@@ -3603,6 +3638,61 @@ locate_resolve_canvas(struct oxr_session *sess,
 	out->canvas.center = (struct xrt_vec3){eye_offset_x, eye_offset_y, eye_offset_z};
 	out->canvas.orientation = win_orient;
 	out->canvas.has_orientation = win_has_orientation;
+	out->canvas.display_height_m = display_height_m;
+}
+
+bool
+oxr_session_get_rig_local_plane(struct oxr_session *sess, struct xrt_pose *out_plane, float *out_scale)
+{
+	*out_plane = (struct xrt_pose)XRT_POSE_IDENTITY;
+	*out_scale = 1.0f;
+
+	struct m_view_rig_canvas canvas;
+	os_mutex_lock(&sess->rig_canvas.lock);
+	const bool rig_plane = sess->rig_canvas.rig_plane_valid;
+	if (rig_plane) {
+		*out_plane = sess->rig_canvas.rig_plane_origin;
+	}
+	bool have_canvas = sess->rig_canvas.valid;
+	if (have_canvas) {
+		canvas = sess->rig_canvas.canvas;
+	}
+	os_mutex_unlock(&sess->rig_canvas.lock);
+
+	// Only a session that owns its canvas maps RIG_LOCAL onto it (ADR-034
+	// Amendment 7); a runtime-window session's canvas is the display it was
+	// already on, and a bridge relay keeps the physical plane.
+	if (!sess->has_external_window || sess->is_bridge_relay) {
+		return rig_plane;
+	}
+	if (!have_canvas) {
+		// Before the first view locate: the session's own canvas, through the
+		// helper the views use (in-process only — service mode never derives
+		// a window rect locally; it keeps the physical plane until a view
+		// locate records the service's canvas).
+		const bool service_mode = sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
+		if (service_mode) {
+			return rig_plane;
+		}
+		struct oxr_locate_canvas lc;
+		locate_resolve_canvas(sess, NULL,
+#ifdef OXR_HAVE_DXR_display_zones
+		                      NULL,
+#endif
+		                      false, &lc);
+		canvas = lc.canvas;
+		have_canvas = canvas.valid;
+	}
+	if (!have_canvas || !canvas.valid) {
+		return rig_plane;
+	}
+	*out_scale = m_view_rig_canvas_scale(&canvas);
+	if (!rig_plane) {
+		// The physical plane is the identity at the head's tracking origin
+		// for these sessions (xrLocateViews' default display plane).
+		m_view_rig_canvas_pose(&canvas, out_plane);
+	}
+	return rig_plane;
 }
 
 static XrResult
@@ -4651,6 +4741,10 @@ locate_views_one(struct oxr_logger *log,
 				    .has_orientation = reply.canvas.has_orientation != 0,
 				    .nominal_y_m = reply.canvas.nominal_y_m,
 				    .nominal_z_m = reply.canvas.nominal_z_m,
+				    // The RIG_LOCAL scale reference: this client's view
+				    // of the physical display (the wire carries none).
+				    .display_height_m =
+				        rig_canvas_display_height_m(sess, reply.canvas.width_m, reply.canvas.height_m),
 				};
 				// Only for a rig THIS app chained (the server also
 				// synthesises a camera rig from qwerty for unchained
@@ -8176,12 +8270,27 @@ hand_joints_resolve_rig(struct oxr_logger *log,
 		// The plane the base-space joints sit on: the rig plane when the
 		// latest view locate chained a rig (RIG_LOCAL lands there,
 		// oxr_space.c), else the physical one. Either way undoing it
-		// recovers the same display-plane point L, so the spec-4 mapping
+		// recovers the same display-space point, so the spec-4 mapping
 		// below is unchanged by which plane RIG_LOCAL landed on.
 		// Stage-anchored (non-RIG_LOCAL) sources never moved: physical.
-		plane_origin = (source_rig_local && sess->rig_canvas.rig_plane_valid)
-		                   ? sess->rig_canvas.rig_plane_origin
-		                   : sess->rig_canvas.plane_origin;
+		if (source_rig_local && sess->rig_canvas.rig_plane_valid) {
+			plane_origin = sess->rig_canvas.rig_plane_origin;
+			if (sess->has_external_window) {
+				// A canvas-owning session put RIG_LOCAL at
+				// rig_plane o (s L), rig_plane = the CANVAS centre
+				// through the rig (ADR-034 Amendment 7). Undoing
+				// rig_plane o inverse(canvas pose) yields the display
+				// point canvas_pose o (s L), which the canvas rebase
+				// in the mapping turns back into s L.
+				struct xrt_pose cp, cp_inv, undo;
+				m_view_rig_canvas_pose(out_canvas, &cp);
+				math_pose_invert(&cp, &cp_inv);
+				math_pose_transform(&plane_origin, &cp_inv, &undo);
+				plane_origin = undo;
+			}
+		} else {
+			plane_origin = sess->rig_canvas.plane_origin;
+		}
 		*out_canvas_age_ns = (int64_t)(at_time - sess->rig_canvas.display_time);
 	}
 	os_mutex_unlock(&sess->rig_canvas.lock);
@@ -8204,6 +8313,7 @@ hand_joints_resolve_rig(struct oxr_logger *log,
 				out_canvas->valid = w > 0.0f && h > 0.0f;
 				out_canvas->width_m = w;
 				out_canvas->height_m = h;
+				out_canvas->display_height_m = h; // the full display: scale 1
 			}
 		}
 		oxr_session_get_nominal_viewer(sess, &out_canvas->nominal_y_m, &out_canvas->nominal_z_m);
@@ -8362,6 +8472,19 @@ oxr_session_hand_joints(struct oxr_logger *log,
 		data_source_state->isActive = XR_TRUE;
 	}
 
+	// RIG_LOCAL is canvas-relative (ADR-034 Amendment 7): oxr_space_locate_device
+	// placed the source rigidly at the session's plane, so a session that owns
+	// a canvas of a different height still owes the joints the canvas scale —
+	// positions about the canvas centre, radii, linear velocities. s = 1 (full
+	// display, runtime-window, bridge relay, a RIG_LOCAL base) is a no-op.
+	const bool source_rig_local = data_source->xdev->tracking_origin != NULL &&
+	                              data_source->xdev->tracking_origin->type == XRT_TRACKING_TYPE_RIG_LOCAL;
+	struct xrt_vec3 rl_origin = {0.0f, 0.0f, 0.0f};
+	float rl_scale = 1.0f;
+	if (source_rig_local && !oxr_space_rig_local_scale(log, baseSpc, at_time, &rl_origin, &rl_scale)) {
+		rl_scale = 1.0f;
+	}
+
 	// XR_DXR_view_rig spec 4 (#2189): a rig chained on the locate info returns
 	// the joints in the RIG frame — the transform its views get. Nothing
 	// chained: base-space metres, exactly as before.
@@ -8372,10 +8495,8 @@ oxr_session_hand_joints(struct oxr_logger *log,
 	struct m_view_rig rig;
 	if (inst->extensions.DXR_view_rig && view_rig_parse_chain(&sess->joint_rig, locateInfo) != OXR_VIEW_RIG_NONE) {
 		int64_t age_ns = -1;
-		rig_joints = hand_joints_resolve_rig(
-		    log, sess, baseSpc, at_time, &rig_canvas, &rig_plane_base, &rig, &age_ns,
-		    data_source->xdev->tracking_origin != NULL &&
-		        data_source->xdev->tracking_origin->type == XRT_TRACKING_TYPE_RIG_LOCAL);
+		rig_joints = hand_joints_resolve_rig(log, sess, baseSpc, at_time, &rig_canvas, &rig_plane_base, &rig,
+		                                     &age_ns, source_rig_local);
 		// Per session, on every verdict change (never per frame).
 		const int32_t verdict = rig_joints ? 1 : 0;
 		if (verdict != sess->rig_joints_verdict) {
@@ -8410,6 +8531,13 @@ oxr_session_hand_joints(struct oxr_logger *log,
 		m_relation_chain_push_relation(&chain, &r);
 		m_relation_chain_push_relation(&chain, &T_base_hand);
 		m_relation_chain_resolve(&chain, &result);
+
+		if (rl_scale != 1.0f) {
+			struct xrt_space_relation scaled;
+			m_view_rig_scale_relation(&rl_origin, rl_scale, &result, locations->jointLocations[i].radius,
+			                          &scaled, &locations->jointLocations[i].radius);
+			result = scaled;
+		}
 
 #ifdef OXR_HAVE_DXR_view_rig
 		if (rig_joints) {

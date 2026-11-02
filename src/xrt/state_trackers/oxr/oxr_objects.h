@@ -1321,6 +1321,21 @@ oxr_space_locate_device(struct oxr_logger *log,
                         struct xrt_space_relation *out_relation);
 
 /*!
+ * The canvas scale a RIG_LOCAL device located in @p baseSpc still owes on top
+ * of the rigid placement @ref oxr_space_locate_device applies (ADR-034
+ * Amendment 7): a relation rigidly placed at `plane o L` becomes
+ * `plane o (s L)` by m_view_rig_scale_relation about @p out_origin (the
+ * plane's position in @p baseSpc) with @p out_scale = s. For a relation that
+ * is only composed AFTER the device is located — hand joints.
+ *
+ * Returns false (and @p out_scale = 1) when nothing is owed: no re-base for
+ * the session, s = 1, or a RIG_LOCAL base space (its own placement cancels).
+ */
+bool
+oxr_space_rig_local_scale(
+    struct oxr_logger *log, struct oxr_space *baseSpc, XrTime time, struct xrt_vec3 *out_origin, float *out_scale);
+
+/*!
  * #1502: the offset the space overseer must be handed for @p spc.
  *
  * This is the app's `poseInReferenceSpace` for every space but VIEW; for VIEW
@@ -1342,13 +1357,24 @@ void
 oxr_session_get_view_space_offset(struct oxr_session *sess, struct xrt_pose *out_offset);
 
 /*!
- * The display plane the session's most recent rigged view locate put in the
- * head's tracking-origin space (see oxr_session::rig_canvas::rig_plane_origin).
- * Returns false when the latest view locate chained no rig (or the session is
- * a bridge relay, whose descriptors are inert).
+ * Where this session places a RIG_LOCAL pose L (input-provider-discovery.md
+ * §4b.4): L lands at `out_plane o (s L)` in the head's tracking-origin space,
+ * s = @p out_scale.
+ *
+ * - The latest view locate chained a rig: @p out_plane is where that rig put
+ *   the display plane (oxr_session::rig_canvas::rig_plane_origin — the CANVAS
+ *   centre for a session that owns its canvas). Returns true.
+ * - No rig, a session that owns its canvas (external window, not a bridge
+ *   relay): the canvas pose on the physical plane (identity at the head's
+ *   tracking origin for these sessions). Returns false.
+ * - Otherwise identity. Returns false.
+ *
+ * @p out_scale is the canvas's RIG_LOCAL scale (m_view_rig_canvas_scale) for
+ * a session that owns its canvas, else 1. The canvas is the latest view
+ * locate's; before the first one, the session's own (in-process only).
  */
 bool
-oxr_session_get_rig_plane_origin(struct oxr_session *sess, struct xrt_pose *out_plane_origin);
+oxr_session_get_rig_local_plane(struct oxr_session *sess, struct xrt_pose *out_plane, float *out_scale);
 
 /*!
  * #1502: publish the session's VIEW-space eye-centroid offset (thread safe).
@@ -3248,11 +3274,14 @@ struct oxr_session
 		struct xrt_pose plane_origin;
 		/*!
 		 * Where the rig chained on that same view locate puts the
-		 * physical display plane's origin, in the tracking-origin space
-		 * (unscaled: the pose of display point 0 through the rig) — the
-		 * display plane the SESSION sees once it declares a rig. RIG_LOCAL
-		 * devices land on it (oxr_space.c, rig_local_plane_correction).
-		 * Cleared by a view locate that chains no rig.
+		 * display plane, in the tracking-origin space (unscaled) — the
+		 * display plane the SESSION sees once it declares a rig. For a
+		 * session that owns its canvas (external window) it is the
+		 * CANVAS centre through the rig (m_view_rig_canvas_plane), for
+		 * any other session the physical display point 0 through the rig.
+		 * RIG_LOCAL devices land on it (oxr_space.c,
+		 * rig_local_plane_correction). Cleared by a view locate that
+		 * chains no rig.
 		 */
 		bool rig_plane_valid;
 		struct xrt_pose rig_plane_origin;
