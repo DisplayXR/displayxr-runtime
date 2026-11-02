@@ -1206,7 +1206,7 @@ fill_display_dxr(struct oxr_system *sys, const struct xrt_screen *scr, XrDisplay
 	const struct xrt_screen_info *si = &scr->info;
 
 	d->type = XR_TYPE_DISPLAY_DXR;
-	// d->next is the app's; nothing is chained on XrDisplayDXR in v22.
+	// d->next is the app's: left as it is, only XrDisplayStableKeyDXR (v24) on it is written.
 	d->displayId = scr->id;
 
 	d->info.type = XR_TYPE_DISPLAY_INFO_DXR;
@@ -1255,6 +1255,12 @@ fill_display_dxr(struct oxr_system *sys, const struct xrt_screen *scr, XrDisplay
 
 	(void)snprintf(d->vendorPluginId, sizeof(d->vendorPluginId), "%s", scr->plugin_id);
 	(void)snprintf(d->deviceName, sizeof(d->deviceName), "%s", scr->device_name);
+
+	XrDisplayStableKeyDXR *stable_key =
+	    OXR_GET_OUTPUT_FROM_CHAIN(d, XR_TYPE_DISPLAY_STABLE_KEY_DXR, XrDisplayStableKeyDXR);
+	if (stable_key != NULL) {
+		(void)snprintf(stable_key->key, sizeof(stable_key->key), "%s", scr->key);
+	}
 }
 
 XrResult

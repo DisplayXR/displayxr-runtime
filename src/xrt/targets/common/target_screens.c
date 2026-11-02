@@ -100,6 +100,7 @@ build_from_entry(const struct xrt_dp_registry_entry *e,
 	s->desktop_width = e->pixel_width;
 	s->desktop_height = e->pixel_height;
 	(void)snprintf(s->plugin_id, sizeof(s->plugin_id), "%s", e->plugin_id);
+	(void)target_plugin_get_monitor_key(e->monitor_id, s->key, sizeof(s->key), NULL, 0);
 
 	struct xrt_display_descriptor desc;
 	struct os_display_edid_monitor mon;

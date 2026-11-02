@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_info 1
-#define XR_DXR_display_info_SPEC_VERSION 23
+#define XR_DXR_display_info_SPEC_VERSION 24
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -667,7 +667,7 @@ typedef struct XrViewActivityStateDXR {
 // Type values 1004999214-1004999217 (display_info's 210-219 decade, see
 // README.md): 214-216 per-display enumeration (multi-screen M1), 217 the
 // per-view display bindings chained on XrViewState (multi-screen M3);
-// 218 is the v23 displays-changed event (below); 219 is free.
+// 218 is the v23 displays-changed event, 219 the v24 stable key (both below).
 #define XR_TYPE_DISPLAY_DXR                       ((XrStructureType)1004999214)
 #define XR_TYPE_DISPLAY_SPACE_CREATE_INFO_DXR     ((XrStructureType)1004999215)
 #define XR_TYPE_SESSION_DISPLAY_BINDING_DXR       ((XrStructureType)1004999216)
@@ -890,6 +890,43 @@ typedef struct XrViewDisplayBindingsDXR {
     uint32_t                    bindingCountOutput;   //!< Number of bindings (or the required capacity)
     XrViewDisplayBindingDXR*    bindings;             //!< Array of bindingCapacityInput entries; may be NULL when the capacity is 0
 } XrViewDisplayBindingsDXR;
+
+// ---- v24: Stable per-display key ----
+
+#define XR_TYPE_DISPLAY_STABLE_KEY_DXR ((XrStructureType)1004999219)
+
+//! Size of XrDisplayStableKeyDXR::key, in bytes, including the NUL.
+#define XR_MAX_DISPLAY_KEY_SIZE_DXR 64
+
+/*!
+ * @brief A key to store per-panel data under (v24). Chained on XrDisplayDXR::next.
+ *
+ * XrDisplayDXR::displayId is good for one enumeration; on some platforms it
+ * changes when the user rearranges monitors. This key is what to persist a
+ * panel's calibration or preferences under: it survives a reboot and a desktop
+ * rearrangement, and is the same in every process. It is the key
+ * `displayxr-cli displays --claims` prints. Treat it as an opaque string, safe
+ * to use as a file name.
+ *
+ * What it identifies depends on what the panel reports:
+ * - EDID serial present: `<PNP>-<PROD>-<SERIAL>`. Survives moving the cable,
+ *   unless the panel reports a different EDID product code per input.
+ * - No EDID serial, a vendor plug-in reports the panel's own serial:
+ *   `<PNP>-<vendor serial>`. Survives moving the cable.
+ * - Neither: the form above with `@<OS output name>` appended, so it follows
+ *   the port. Also appended when two connected monitors would otherwise share
+ *   a key.
+ *
+ * Set `type` and zero the rest. A runtime older than v24 leaves it untouched,
+ * so `key` stays "". "" also means the runtime could not identify the display
+ * (a synthesized display, when monitors cannot be enumerated). Fall back to
+ * XrDisplayDXR::deviceName then.
+ */
+typedef struct XrDisplayStableKeyDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_STABLE_KEY_DXR
+    void* XR_MAY_ALIAS          next;
+    char                        key[XR_MAX_DISPLAY_KEY_SIZE_DXR]; //!< NUL-terminated; "" = unknown.
+} XrDisplayStableKeyDXR;
 
 // ---- v23: Display topology change event (display hotplug, ADR-047 Amendment 8) ----
 

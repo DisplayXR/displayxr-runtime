@@ -258,6 +258,28 @@ TEST_CASE("a FALLBACK claim's metres give way to the EDID's, the default screen'
 	CHECK(hdmi->info.source == XRT_SCREEN_INFO_SOURCE_DERIVED);
 }
 
+TEST_CASE("every screen carries the loader's stable key; a synthesized screen has none")
+{
+	fixture f;
+	xrt_screen_list list{};
+	target_screens_build(&f.reg, "vendor", &f.sys, &list);
+	REQUIRE(list.count == 3);
+	for (uint32_t i = 0; i < list.count; i++) {
+		char want[XRT_SCREEN_NAME_MAX] = {};
+		REQUIRE(target_plugin_get_monitor_key(list.screens[i].id, want, sizeof(want), NULL, 0));
+		CHECK(want[0] != '\0');
+		CHECK(std::string(list.screens[i].key) == want);
+	}
+	// B and C are identical panels with no serial: the key still tells them apart.
+	CHECK(std::string(list.screens[1].key) != list.screens[2].key);
+
+	xrt_dp_factory_registry empty{};
+	xrt_screen_list synth{};
+	target_screens_build(&empty, "vendor", &f.sys, &synth);
+	REQUIRE(synth.count == 1);
+	CHECK(synth.screens[0].key[0] == '\0');
+}
+
 TEST_CASE("empty registry: one synthesized system screen, or nothing when the system knows nothing")
 {
 	fixture f;
