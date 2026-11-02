@@ -951,6 +951,11 @@ struct late_weave_governor
 	// next tick) — it only absorbs the jitter.
 	int slip_marks = 0;
 	int slip_count = 0;
+	//! #2402: the first 120-mark window after the chain comes up is start-up
+	//! (first weave, DP bind, hub stage A) and routinely holds the ~10 slipped
+	//! marks the rule needs, so it escalated 3 of 33 otherwise identical
+	//! runs to depth 2 for a whole probe dwell. Judge from the second window.
+	bool slip_warmup = true;
 	// Adaptive tick-align (the composed-chain freshness stage): aligning the
 	// weave to the compositor tick buys a constant prediction phase, but it
 	// also serializes each frame's whole GPU chain into exactly one period —
@@ -1290,10 +1295,16 @@ struct late_weave_governor
 				slip_count++;
 			}
 			if (slip_marks >= 120) {
-				const bool slipping = slip_count >= 10; // ~8%
+				// #2402: the start-up window is judged as neither — not an
+				// escalation, not a clean window for the return probe.
+				const bool judged = !slip_warmup;
+				const bool slipping = judged && slip_count >= 10; // ~8%
+				slip_warmup = false;
 				slip_marks = 0;
 				slip_count = 0;
-				clean_windows = slipping ? 0 : clean_windows + 1;
+				if (judged) {
+					clean_windows = slipping ? 0 : clean_windows + 1;
+				}
 				if (slipping) {
 					// Cap: one banked token above what the frame cost needs.
 					int cap = LATE_WEAVE_MAX_DEPTH;
