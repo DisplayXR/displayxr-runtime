@@ -259,6 +259,11 @@ struct HandsState {
     bool active[2] = {false, false};
     XrHandJointLocationEXT joints[2][XR_HAND_JOINT_COUNT_EXT];
     uint64_t locateCount = 0;
+    // XR_DXR_view_rig spec 4: the frame's rig descriptor was chained on the
+    // locate, so the joints (and radii) are already in the rig frame = the
+    // app's world; the marker draw then skips markerWorldPose.
+    bool rigScoped = false;
+    bool rigLogged = false;
 };
 static HandsState g_hands;
 
@@ -308,9 +313,22 @@ static bool SetupHands(XrInstance instance, XrSystemId systemId, XrSession sessi
     return true;
 }
 
-//! Per-frame: locate all joints of both hands at display time.
-static void UpdateHands(XrSpace baseSpace, XrTime displayTime)
+//! Per-frame: locate all joints of both hands at display time. @p rigDescriptor
+//! is the frame's XrDisplayRigDXR / XrCameraRigDXR (or NULL): chained on
+//! XrHandJointsLocateInfoEXT::next (XR_DXR_view_rig spec 4) the runtime returns
+//! the joints in the RIG frame, scaled by the rig's metres-to-virtual, so a
+//! hand on the cube full screen is on the cube in a window at the window's
+//! scale. Without it the joints are LOCAL metres, which this app drew as
+//! world units: a second, accidental window scale on top of the runtime's.
+static void UpdateHands(XrSpace baseSpace, XrTime displayTime, const void *rigDescriptor)
 {
+    g_hands.rigScoped = rigDescriptor != nullptr;
+    if (!g_hands.rigLogged) {
+        g_hands.rigLogged = true;
+        LOG_INFO("hands: %s", g_hands.rigScoped
+                              ? "rig-scoped joints (XR_DXR_view_rig spec 4 chained on the locate)"
+                              : "LOCAL-space joints (no rig chained)");
+    }
     for (int hand = 0; hand < 2; hand++) {
         g_hands.active[hand] = false;
         if (g_hands.tracker[hand] == XR_NULL_HANDLE) {
@@ -318,6 +336,7 @@ static void UpdateHands(XrSpace baseSpace, XrTime displayTime)
         }
 
         XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+        li.next = rigDescriptor;
         li.baseSpace = baseSpace;
         li.time = displayTime;
 
@@ -1439,9 +1458,6 @@ static void RenderOneFrame(RenderState& rs) {
         if (BeginFrame(xr, frameState)) {
                 // #823 actions mode: sync + locate the controllers for this
                 // frame's display time; the marker draws read g_actions.
-                if (g_handsMode) {
-                    UpdateHands(xr.localSpace, frameState.predictedDisplayTime);
-                }
                 if (g_actionsMode) {
                     UpdateActions(xr.session, xr.localSpace, frameState.predictedDisplayTime);
                 }
@@ -1568,6 +1584,18 @@ static void RenderOneFrame(RenderState& rs) {
                             displayRig.perspectiveFactor = g_inputState.viewParams.perspectiveFactor;
                             locateInfo.next = &displayRig;
                         }
+                    }
+
+                    // #825 hands mode: locate the joints with the SAME rig the
+                    // views get (XR_DXR_view_rig spec 4), so they come back in
+                    // the rig frame. The rig structs' own next stays NULL: the
+                    // cursor chain below goes in front of them on locateInfo.
+                    if (g_handsMode) {
+                        const void *handsRig = nullptr;
+                        if (useAppProjection) {
+                            handsRig = rigCamera ? (const void *)&cameraRig : (const void *)&displayRig;
+                        }
+                        UpdateHands(xr.localSpace, frameState.predictedDisplayTime, handsRig);
                     }
 
                     // XR_DXR_cursor_depth (ADR-046): hint from the previous
@@ -2199,7 +2227,10 @@ static void RenderOneFrame(RenderState& rs) {
                                             continue;
                                         }
                                         float s = jl.radius > 0.001f ? jl.radius : 0.008f;
-                                        const XrPosef jp = markerWorldPose(jl.pose);
+                                        // Rig-scoped joints are already in the
+                                        // app's world (radius too).
+                                        const XrPosef jp =
+                                            g_hands.rigScoped ? jl.pose : markerWorldPose(jl.pose);
                                         XMVECTOR q = XMVectorSet(jp.orientation.x, jp.orientation.y,
                                                                  jp.orientation.z, jp.orientation.w);
                                         XMMATRIX world = XMMatrixScaling(s, s, s) *
