@@ -5,7 +5,7 @@
  * @brief The view rig's point mapping (XR_DXR_view_rig spec 4, #2189) is the
  *        shared core's eye mapping — one implementation in practice.
  *
- * Three groups:
+ * Four groups:
  *  - EQUIVALENCE: across a sweep of canvases (full display, offset window,
  *    rotated canvas, portrait swap), rig poses and tunables, a point mapped by
  *    m_view_rig_map_canvas_point is BIT-IDENTICAL to the displayxr-common
@@ -16,6 +16,10 @@
  *    virtualDisplayHeight scale k scales positions and radii by k; a camera rig
  *    maps by metersToVirtual about the nominal plane; no rig = unchanged;
  *    velocities and orientations follow the rig rotation.
+ *  - RIG_LOCAL is canvas-relative (ADR-034 Amendment 7): a full-display canvas
+ *    is unchanged bit for bit; a smaller canvas puts L at its centre + s L
+ *    (s = canvas / display height) with radii and velocities times s, and the
+ *    spec-4 joint is the canvas point s L through the rig.
  */
 
 #include "math/m_api.h"
@@ -336,5 +340,189 @@ TEST_CASE("view rig joints: the issue's cases", "[view_rig_point]")
 		rig.perspective_factor = 1.0f;
 		m_view_rig_map_relation(&c, &rig, &moved, &in_moved, 0.01f, &out, &radius);
 		check_near(out.pose.position, in.pose.position, 1e-5f);
+	}
+}
+
+namespace {
+
+/*!
+ * The oxr layer's RIG_LOCAL placement for a session that owns its canvas
+ * (oxr_space.c rig_local_rebase + oxr_session.c hand joints): the rig-local
+ * pose L placed RIGIDLY on the canvas plane P, then scaled by s about P.
+ */
+xrt_space_relation
+place_rig_local(const m_view_rig_canvas &c,
+                const m_view_rig *rig,
+                const xrt_pose &phys_plane,
+                const xrt_space_relation &L,
+                float radius,
+                float *out_radius,
+                xrt_pose *out_plane = nullptr)
+{
+	xrt_pose P;
+	m_view_rig_canvas_plane(&c, rig, &phys_plane, &P);
+	if (out_plane != nullptr) {
+		*out_plane = P;
+	}
+	xrt_space_relation rigid = L;
+	math_pose_transform(&P, &L.pose, &rigid.pose);
+	math_quat_rotate_vec3(&P.orientation, &L.linear_velocity, &rigid.linear_velocity);
+	math_quat_rotate_vec3(&P.orientation, &L.angular_velocity, &rigid.angular_velocity);
+	xrt_space_relation out;
+	m_view_rig_scale_relation(&P.position, m_view_rig_canvas_scale(&c), &rigid, radius, &out, out_radius);
+	return out;
+}
+
+} // namespace
+
+TEST_CASE("RIG_LOCAL is canvas-relative: the canvas scale", "[view_rig_point][rig_local_canvas]")
+{
+	m_view_rig_canvas c = canvas_full();
+	CHECK(m_view_rig_canvas_scale(&c) == 1.0f); // display height unknown
+	c.display_height_m = kH;
+	CHECK(m_view_rig_canvas_scale(&c) == 1.0f); // the full display
+	c.display_height_m = kH * (1.0f + 5e-5f);
+	CHECK(m_view_rig_canvas_scale(&c) == 1.0f); // float noise between two sources snaps to 1
+	c.height_m = kH * 0.5f;
+	c.display_height_m = kH;
+	CHECK(m_view_rig_canvas_scale(&c) == Catch::Approx(0.5f));
+	c.valid = false;
+	CHECK(m_view_rig_canvas_scale(&c) == 1.0f);
+}
+
+TEST_CASE("RIG_LOCAL is canvas-relative: placement (ADR-034 Amendment 7)", "[view_rig_point][rig_local_canvas]")
+{
+	const xrt_pose phys = {{0, 0, 0, 1}, {0, 0, 0}}; // the physical plane at the head's tracking origin
+	const xrt_space_relation L = joint({0.04f, -0.03f, 0.25f});
+	const float r = 0.01f;
+
+	SECTION("a full-display canvas is unchanged bit for bit")
+	{
+		m_view_rig_canvas c = canvas_full();
+		c.display_height_m = kH;
+		REQUIRE(m_view_rig_canvas_scale(&c) == 1.0f);
+
+		// No rig: the plane is the physical plane, and nothing is scaled.
+		xrt_pose P;
+		m_view_rig_canvas_plane(&c, nullptr, &phys, &P);
+		CHECK(std::memcmp(&P, &phys, sizeof(P)) == 0);
+		xrt_space_relation out;
+		float out_r = 0.0f;
+		m_view_rig_scale_relation(&P.position, 1.0f, &L, r, &out, &out_r);
+		CHECK(std::memcmp(&out, &L, sizeof(out)) == 0);
+		CHECK(out_r == r);
+
+		// A rig: the canvas plane is exactly the plane the pre-amendment
+		// runtime used (display point 0 through the rig).
+		m_view_rig rig{};
+		rig.kind = M_VIEW_RIG_DISPLAY;
+		rig.pose = {quat_axis_angle(0, 1, 0, 0.4f), {0.4f, 0.3f, -0.35f}};
+		rig.virtual_display_height = c.height_m * 3.0f;
+		rig.perspective_factor = 1.0f;
+		const xrt_pose posed = {quat_axis_angle(1, 0, 0, 0.1f), {0.0f, -1.6f, 0.2f}};
+		xrt_space_relation at_plane{};
+		at_plane.pose = posed;
+		xrt_space_relation old_plane;
+		m_view_rig_map_relation(&c, &rig, &posed, &at_plane, 0.0f, &old_plane, nullptr);
+		m_view_rig_canvas_plane(&c, &rig, &posed, &P);
+		CHECK(std::memcmp(&P, &old_plane.pose, sizeof(P)) == 0);
+	}
+
+	SECTION("a half-height canvas in a corner: L lands at centre + s L, radius and velocity scaled")
+	{
+		m_view_rig_canvas c = canvas_full();
+		c.width_m = kW * 0.5f;
+		c.height_m = kH * 0.5f;
+		c.center = {kW * 0.25f, kH * 0.25f, 0.0f}; // the top-right quarter of the panel
+		c.display_height_m = kH;
+		const float s = m_view_rig_canvas_scale(&c);
+		REQUIRE(s == Catch::Approx(0.5f));
+
+		float out_r = 0.0f;
+		const xrt_space_relation out = place_rig_local(c, nullptr, phys, L, r, &out_r);
+		check_near(out.pose.position,
+		           {c.center.x + s * L.pose.position.x, c.center.y + s * L.pose.position.y,
+		            c.center.z + s * L.pose.position.z},
+		           1e-6f);
+		CHECK(out_r == Catch::Approx(r * s));
+		check_near(out.linear_velocity,
+		           {L.linear_velocity.x * s, L.linear_velocity.y * s, L.linear_velocity.z * s}, 1e-6f);
+		// Orientations are not scaled (nor rotated, on a flat canvas).
+		CHECK(std::memcmp(&out.pose.orientation, &L.pose.orientation, sizeof(xrt_quat)) == 0);
+		check_near(out.angular_velocity, L.angular_velocity, 1e-6f);
+
+		// The point at the physical display centre (L = 0) lands at the canvas centre.
+		const xrt_space_relation at0 = place_rig_local(c, nullptr, phys, joint({0, 0, 0}), r, &out_r);
+		check_near(at0.pose.position, c.center, 1e-7f);
+	}
+
+	SECTION("a rotated canvas: L is read in the canvas axes")
+	{
+		m_view_rig_canvas c = canvas_full();
+		c.height_m = kH * 0.5f;
+		c.width_m = kW * 0.5f;
+		c.center = {-0.05f, 0.02f, 0.01f};
+		c.orientation = quat_axis_angle(0, 1, 0, 0.3f);
+		c.has_orientation = true;
+		c.display_height_m = kH;
+		const float s = m_view_rig_canvas_scale(&c);
+		float out_r = 0.0f;
+		const xrt_space_relation out = place_rig_local(c, nullptr, phys, L, r, &out_r);
+		// Back into the canvas frame: s L.
+		xrt_vec3 back;
+		m_view_rig_canvas_rebase(&c, &out.pose.position, &back);
+		check_near(back, {s * L.pose.position.x, s * L.pose.position.y, s * L.pose.position.z}, 1e-6f);
+	}
+
+	SECTION("with a rig, the spec-4 joint is the canvas point s L through the rig")
+	{
+		m_view_rig_canvas c = canvas_full();
+		c.width_m = kW * 0.5f;
+		c.height_m = kH * 0.5f;
+		c.center = {-kW * 0.25f, -kH * 0.25f, 0.0f};
+		c.display_height_m = kH;
+		const float s = m_view_rig_canvas_scale(&c);
+
+		for (const float k : {1.0f, 4.0f}) {
+			CAPTURE(k);
+			m_view_rig rig{};
+			rig.kind = M_VIEW_RIG_DISPLAY;
+			rig.pose = {quat_axis_angle(0, 1, 0, 0.4f), {0.4f, 0.3f, -0.35f}};
+			rig.virtual_display_height = c.height_m * k;
+			rig.perspective_factor = 1.0f;
+
+			// Base space (action spaces, joints without a descriptor).
+			float base_r = 0.0f;
+			xrt_pose P;
+			const xrt_space_relation base = place_rig_local(c, &rig, phys, L, r, &base_r, &P);
+
+			// Spec 4: undo P o inverse(canvas pose), then the ordinary mapping.
+			xrt_pose cp, cp_inv, undo;
+			m_view_rig_canvas_pose(&c, &cp);
+			math_pose_invert(&cp, &cp_inv);
+			math_pose_transform(&P, &cp_inv, &undo);
+			xrt_space_relation scoped;
+			float scoped_r = 0.0f;
+			m_view_rig_map_relation(&c, &rig, &undo, &base, base_r, &scoped, &scoped_r);
+
+			const xrt_vec3 sL = {s * L.pose.position.x, s * L.pose.position.y, s * L.pose.position.z};
+			xrt_vec3 want;
+			m_view_rig_map_canvas_point(&c, &rig, &sL, &want);
+			check_near(scoped.pose.position, want, 1e-5f);
+			CHECK(scoped_r == Catch::Approx(r * s * m_view_rig_length_scale(&c, &rig)));
+			// Orientation: the rig's rotation of L's, nothing else.
+			xrt_quat want_q;
+			math_quat_rotate(&rig.pose.orientation, &L.pose.orientation, &want_q);
+			CHECK(std::fabs(scoped.pose.orientation.x - want_q.x) < 1e-5f);
+			CHECK(std::fabs(scoped.pose.orientation.y - want_q.y) < 1e-5f);
+			CHECK(std::fabs(scoped.pose.orientation.z - want_q.z) < 1e-5f);
+			CHECK(std::fabs(scoped.pose.orientation.w - want_q.w) < 1e-5f);
+
+			if (k == 1.0f) {
+				// An unscaled rig: base-space hands ARE the rig-frame hands.
+				check_near(base.pose.position, scoped.pose.position, 1e-5f);
+				CHECK(base_r == Catch::Approx(scoped_r));
+			}
+		}
 	}
 }

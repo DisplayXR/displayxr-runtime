@@ -11,6 +11,8 @@
 
 #include "displayxr_math_xrt.h"
 
+#include <math.h>
+
 void
 m_view_rig_canvas_rebase(const struct m_view_rig_canvas *canvas, const struct xrt_vec3 *p_display, struct xrt_vec3 *out)
 {
@@ -122,6 +124,79 @@ m_view_rig_map_relation(const struct m_view_rig_canvas *canvas,
 	math_quat_rotate_vec3(&total, &in_base->linear_velocity, &lv);
 	out->linear_velocity = (struct xrt_vec3){lv.x * s, lv.y * s, lv.z * s};
 	math_quat_rotate_vec3(&total, &in_base->angular_velocity, &out->angular_velocity);
+	if (out_radius != NULL) {
+		*out_radius = radius * s;
+	}
+}
+
+float
+m_view_rig_canvas_scale(const struct m_view_rig_canvas *canvas)
+{
+	if (canvas == NULL || !canvas->valid || !(canvas->height_m > 0.0f) || !(canvas->display_height_m > 0.0f)) {
+		return 1.0f;
+	}
+	const float s = canvas->height_m / canvas->display_height_m;
+	return fabsf(s - 1.0f) <= 1e-4f ? 1.0f : s;
+}
+
+void
+m_view_rig_canvas_pose(const struct m_view_rig_canvas *canvas, struct xrt_pose *out)
+{
+	out->position = canvas->center;
+	out->orientation = canvas->has_orientation ? canvas->orientation : (struct xrt_quat)XRT_QUAT_IDENTITY;
+}
+
+void
+m_view_rig_canvas_plane(const struct m_view_rig_canvas *canvas,
+                        const struct m_view_rig *rig,
+                        const struct xrt_pose *plane_origin,
+                        struct xrt_pose *out)
+{
+	// A full-display canvas IS the physical plane: take it verbatim, so the
+	// result is the pre-amendment plane bit for bit.
+	struct xrt_pose at = *plane_origin;
+	if (canvas->has_orientation || canvas->center.x != 0.0f || canvas->center.y != 0.0f ||
+	    canvas->center.z != 0.0f) {
+		struct xrt_pose canvas_pose;
+		m_view_rig_canvas_pose(canvas, &canvas_pose);
+		math_pose_transform(plane_origin, &canvas_pose, &at);
+	}
+	if (rig == NULL || rig->kind == M_VIEW_RIG_NONE || !canvas->valid) {
+		*out = at;
+		return;
+	}
+	// The canvas centre as a joint: rebases to canvas point 0, orientation
+	// rig * inverse(canvas) * inverse(plane) * (plane * canvas) = the rig's.
+	struct xrt_space_relation in = {0};
+	in.pose = at;
+	struct xrt_space_relation mapped;
+	m_view_rig_map_relation(canvas, rig, plane_origin, &in, 0.0f, &mapped, NULL);
+	*out = mapped.pose;
+}
+
+void
+m_view_rig_scale_relation(const struct xrt_vec3 *origin,
+                          float s,
+                          const struct xrt_space_relation *in,
+                          float radius,
+                          struct xrt_space_relation *out,
+                          float *out_radius)
+{
+	*out = *in;
+	if (out_radius != NULL) {
+		*out_radius = radius;
+	}
+	if (s == 1.0f) {
+		return;
+	}
+	const struct xrt_vec3 p = in->pose.position;
+	out->pose.position = (struct xrt_vec3){
+	    origin->x + s * (p.x - origin->x),
+	    origin->y + s * (p.y - origin->y),
+	    origin->z + s * (p.z - origin->z),
+	};
+	out->linear_velocity =
+	    (struct xrt_vec3){in->linear_velocity.x * s, in->linear_velocity.y * s, in->linear_velocity.z * s};
 	if (out_radius != NULL) {
 		*out_radius = radius * s;
 	}
