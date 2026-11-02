@@ -43,6 +43,8 @@
 #if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
 #include "multi/comp_multi_weave_lift.h"
 #include "multi/comp_multi_weave_capture.h"
+#elif defined(XRT_OS_ANDROID)
+#include "multi/comp_multi_weave_capture.h"
 #endif
 
 #include "render/render_interface.h"
@@ -944,7 +946,18 @@ struct multi_compositor
 		bool overlay_unchanged;
 		float overlay_filter_strength;
 		uint8_t overlay_in_dp; //!< 0 = no overlay seen yet, 1 = runtime blend, 2 = DP composites
+		//! `debug.dxr.overlay_filter_strength` dev override, read once per client
+		//! (a browser restart re-reads it). NaN = unset: pass the app's value.
+		bool filter_strength_override_checked;
+		float filter_strength_override;
 		//! @}
+
+		//! #2501: file-trigger capture (input / atlas / woven / overlay PNGs) —
+		//! comp_multi_weave_capture.h. Guarded by the weave mutex. The tag is the
+		//! client's package name, resolved from its uid by the IPC handler.
+		struct comp_multi_weave_capture capture;
+		bool capture_tag_resolved; //!< capture.tag holds the lookup for capture_tag_uid
+		long capture_tag_uid;
 
 		/*!
 		 * @name sync_file weave (XR_DXR_weave v20)
@@ -1852,6 +1865,15 @@ comp_multi_weave_android_satellite_presented(struct multi_compositor *mc);
  */
 void
 comp_multi_weave_android_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength);
+
+/*!
+ * #2501: tag the client's per-client capture trigger
+ * (`displayxr_atlas_trigger.<package>`, comp_multi_weave_capture.h) with the
+ * package name of @p peer_uid. Resolved once per uid (a JNI call), then cached;
+ * an unknown uid polls only the service-process and global triggers.
+ */
+void
+comp_multi_weave_android_set_capture_uid(struct xrt_compositor *xc, long peer_uid);
 
 /*!
  * XR_DXR_weave v20 sync_file request for the NEXT comp_multi_weave_submit only.

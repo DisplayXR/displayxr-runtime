@@ -13,6 +13,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef XRT_OS_ANDROID
 
@@ -340,6 +341,26 @@ android_globals_get_window_screen_rect(int32_t *out_x,
  */
 bool
 android_globals_get_display_landscape(bool *out_landscape);
+
+/*!
+ * This process's own app directory, resolved through the stored Context:
+ * `getExternalFilesDir(null)` when @p external (e.g.
+ * `/storage/emulated/0/Android/data/<pkg>/files`, reachable by `adb` without
+ * root; the call also creates it), else `getCacheDir()`. Attaches the calling
+ * thread to the VM if needed. false when there is no Context or the call fails
+ * (e.g. external storage unmounted).
+ * @ingroup aux_android
+ */
+bool
+android_globals_get_app_dir(bool external, char *out, size_t out_size);
+
+/*!
+ * `PackageManager.getNameForUid(uid)`: the package name of an app uid (or
+ * `<sharedUserId>:<uid>` for a shared uid). false when unknown.
+ * @ingroup aux_android
+ */
+bool
+android_globals_get_name_for_uid(long uid, char *out, size_t out_size);
 
 /*! @} */
 

@@ -465,6 +465,11 @@ if(ANDROID)
 	# no extra link is needed beyond the NDK's libandroid, which aux_android
 	# already carries.
 	target_sources(comp_multi PRIVATE multi/comp_multi_weave_android.c)
+	# #2501: the engine's file-trigger capture (input / atlas / woven / overlay PNGs).
+	target_sources(
+		comp_multi PRIVATE multi/comp_multi_weave_capture.c multi/comp_multi_weave_capture.h
+		)
+	target_link_libraries(comp_multi PRIVATE xrt-external-stb)
 endif()
 
 # Desktop-Linux shared spatial surface (#710, #967): visibility + cursor toggles

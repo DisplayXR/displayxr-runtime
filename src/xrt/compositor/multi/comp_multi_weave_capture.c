@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  File-trigger capture for the service-side weave engines (#2207, #2470).
+ * @brief  File-trigger capture for the service-side weave engines (#2207, #2470, #2501).
  * @ingroup comp_multi
  *
  * See comp_multi_weave_capture.h for the trigger names and the three files.
@@ -25,12 +25,13 @@
 
 
 static const char *const stage_infix[COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT] = {
-    ".input", // the caller's buffer
-    "",       // the DP input keeps the vk_native name: displayxr_atlas[.projection].png
-    ".woven", // post-weave
+    ".input",   // the caller's buffer
+    "",         // the DP input keeps the vk_native name: displayxr_atlas[.projection].png
+    ".woven",   // post-weave
+    ".overlay", // the v4 2D overlay layer (#2501)
 };
 
-static const char *const stage_name[COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT] = {"input", "atlas", "woven"};
+static const char *const stage_name[COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT] = {"input", "atlas", "woven", "overlay"};
 
 static bool
 format_swap_rb(VkFormat format, bool *out_swap)
@@ -295,13 +296,14 @@ comp_multi_weave_capture_finish(struct comp_multi_weave_capture *cap, struct vk_
 	if (ok_any) {
 		U_LOG_W(
 		    "weave capture (#2207) %s (mode=%s, raw_alpha=%d): input %ux%u %s | atlas %ux%u %s | woven %ux%u "
-		    "%s",
+		    "%s | overlay %ux%u %s",
 		    what != NULL ? what : "",
 		    cap->intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY ? "projection" : "post",
 		    (int)keep_alpha,                                                  //
 		    dims[0][0], dims[0][1], written[0][0] != '\0' ? written[0] : "-", //
 		    dims[1][0], dims[1][1], written[1][0] != '\0' ? written[1] : "-", //
-		    dims[2][0], dims[2][1], written[2][0] != '\0' ? written[2] : "-");
+		    dims[2][0], dims[2][1], written[2][0] != '\0' ? written[2] : "-", //
+		    dims[3][0], dims[3][1], written[3][0] != '\0' ? written[3] : "-");
 	} else if (!failed_any) {
 		U_LOG_W("weave capture (#2207): trigger consumed for %s but this submit recorded no stage",
 		        cap->intent.path);

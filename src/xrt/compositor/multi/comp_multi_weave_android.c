@@ -110,6 +110,7 @@ weave_split_enabled(void)
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
+#include <math.h>
 
 /*
  *
@@ -376,9 +377,10 @@ weave_create_local(struct vk_bundle *vk,
 {
 	VkExtent2D extent = {.width = w, .height = h};
 	// COLOR_ATTACHMENT: the rect-scoped un-squeeze draws into the SBS scratch.
+	// TRANSFER_SRC: the #2501 capture reads the DP input back.
 	VkResult ret = vk_create_image_simple(vk, extent, WEAVE_VK_FORMAT,
 	                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-	                                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+	                                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 	                                      out_memory, out_image);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("weave(#1036): vk_create_image_simple(%ux%u) failed: %s", w, h, vk_result_string(ret));
@@ -658,8 +660,11 @@ weave_create_output(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t 
 		return false;
 	}
 
-	if (!weave_import_ahb(vk, (void *)ahb, info.bits, &mc->weave.out_image, &mc->weave.out_memory,
-	                      &mc->weave.out_view, &mc->weave.out_w, &mc->weave.out_h, "output")) {
+	// The VkImage adds TRANSFER_SRC (the satellite present blits from it, the
+	// #2501 capture reads it back); no AHardwareBuffer usage bit is needed for it.
+	if (!weave_import_ahb(vk, (void *)ahb, info.bits | XRT_SWAPCHAIN_USAGE_TRANSFER_SRC, &mc->weave.out_image,
+	                      &mc->weave.out_memory, &mc->weave.out_view, &mc->weave.out_w, &mc->weave.out_h,
+	                      "output")) {
 		u_graphics_buffer_unref(&ahb);
 		return false;
 	}
@@ -1839,6 +1844,118 @@ comp_multi_weave_android_satellite_clear(struct multi_compositor *mc)
 	U_LOG_W("weave satellite(#1277): overlay CLEARED on weave-idle (stale-frame guard)");
 }
 
+/*
+ *
+ * #2501: file-trigger capture (comp_multi_weave_capture.h).
+ *
+ */
+
+/*!
+ * Point `$TMPDIR` — where u_capture_intent resolves the trigger and output
+ * paths — at a directory `adb` can reach, once per process, before the first
+ * poll. An Android service process has no usable `$TMPDIR` (the POSIX fallback
+ * `/tmp` does not exist), and `/data/local/tmp` is not writable by an app uid.
+ * Order: the `debug.dxr.capture_dir` property (a tester's override), then this
+ * package's external files dir (`/sdcard/Android/data/<pkg>/files`, created by
+ * the call, readable and writable by `adb shell` without root), then
+ * an inherited writable `$TMPDIR`, then the cache dir. Logged once.
+ */
+static pthread_once_t weave_capture_dir_once = PTHREAD_ONCE_INIT;
+
+static void
+weave_capture_resolve_dir(void)
+{
+	char dir[MCP_CAPTURE_PATH_MAX] = {0};
+	const char *source = NULL;
+	char prop[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.capture_dir", prop) > 0 && prop[0] != '\0') {
+		snprintf(dir, sizeof(dir), "%s", prop);
+		source = "debug.dxr.capture_dir";
+	} else if (android_globals_get_app_dir(true, dir, sizeof(dir))) {
+		source = "external files dir";
+	} else {
+		const char *tmp = getenv("TMPDIR");
+		if (tmp != NULL && tmp[0] != '\0' && access(tmp, W_OK | X_OK) == 0) {
+			snprintf(dir, sizeof(dir), "%s", tmp);
+			source = "$TMPDIR (inherited)";
+		} else if (android_globals_get_app_dir(false, dir, sizeof(dir))) {
+			source = "cache dir (adb needs run-as)";
+		}
+	}
+	if (source == NULL || dir[0] == '\0') {
+		U_LOG_W(
+		    "weave capture (#2501): no capture directory (no Context, no property) — triggers are not polled");
+		return;
+	}
+	setenv("TMPDIR", dir, 1);
+	U_LOG_W("weave capture (#2501): capture dir %s (%s); touch %s/displayxr_atlas_trigger[.<client-pkg>]", dir,
+	        source, dir);
+}
+
+void
+comp_multi_weave_android_set_capture_uid(struct xrt_compositor *xc, long peer_uid)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	const bool resolved = mc->weave.capture_tag_resolved && mc->weave.capture_tag_uid == peer_uid;
+	os_mutex_unlock(&mc->weave.mutex);
+	if (resolved) {
+		return;
+	}
+	// The JNI lookup runs outside the weave mutex (it may attach this thread).
+	char name[sizeof(mc->weave.capture.tag)] = {0};
+	if (!android_globals_get_name_for_uid(peer_uid, name, sizeof(name))) {
+		name[0] = '\0';
+	}
+	// A shared uid answers "<sharedUserId>:<uid>": not a usable file suffix.
+	if (strchr(name, ':') != NULL || strchr(name, '/') != NULL) {
+		name[0] = '\0';
+	}
+	os_mutex_lock(&mc->weave.mutex);
+	snprintf(mc->weave.capture.tag, sizeof(mc->weave.capture.tag), "%s", name);
+	mc->weave.capture_tag_resolved = true;
+	mc->weave.capture_tag_uid = peer_uid;
+	os_mutex_unlock(&mc->weave.mutex);
+	U_LOG_W("weave capture (#2501): client uid %ld -> per-client trigger tag '%s'", peer_uid,
+	        name[0] != '\0' ? name : "(none: global triggers only)");
+}
+
+/*!
+ * `debug.dxr.overlay_filter_strength` (a float in [0, 1]): a dev override of the
+ * 2D-under-the-lens filter strength the app sent, for A/B runs without an app
+ * rebuild. Unset / empty / out of range = pass the app's value through. Read once
+ * per client (a client restart re-reads it), logged once when set.
+ */
+static float
+weave_filter_strength(struct multi_compositor *mc)
+{
+	if (!mc->weave.filter_strength_override_checked) {
+		mc->weave.filter_strength_override_checked = true;
+		mc->weave.filter_strength_override = NAN;
+		char value[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.overlay_filter_strength", value) > 0 && value[0] != '\0') {
+			char *end = NULL;
+			const float f = strtof(value, &end);
+			if (end != value && f >= 0.0f && f <= 1.0f) {
+				mc->weave.filter_strength_override = f;
+				U_LOG_W(
+				    "weave(#1036) v15: debug.dxr.overlay_filter_strength=%s OVERRIDES the app's 2D "
+				    "filter strength (dev knob)",
+				    value);
+			} else {
+				U_LOG_W("weave(#1036) v15: debug.dxr.overlay_filter_strength='%s' ignored (want 0..1)",
+				        value);
+			}
+		}
+	}
+	return isnan(mc->weave.filter_strength_override) ? mc->weave.overlay_filter_strength
+	                                                 : mc->weave.filter_strength_override;
+}
+
 void
 comp_multi_weave_android_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength)
 {
@@ -2277,6 +2394,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 	bool dp_sync_armed = false;    // the DP took set_weave_sync for the next process_atlas
 	bool atlas_done = false;       // process_atlas ran (the DP consumed the pair)
 	bool dp_dropped = false;       // ... and reported the frame dropped
+	bool capturing = false;        // #2501: this submit consumed a capture trigger
 
 	bool ok = false;
 	do {
@@ -2386,10 +2504,11 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		    (mc->weave.overlay_image == VK_NULL_HANDLE ||
 		     !weave_ahb_matches(mc->weave.overlay_ahb, mc->weave.overlay_ahb_id, (void *)overlay, overlay_id))) {
 			weave_release_overlay(vk, mc);
-			if (weave_import_ahb(vk, (void *)overlay, XRT_SWAPCHAIN_USAGE_SAMPLED,
-			                     &mc->weave.overlay_image, &mc->weave.overlay_memory,
-			                     &mc->weave.overlay_view, &mc->weave.overlay_w, &mc->weave.overlay_h,
-			                     "overlay")) {
+			if (weave_import_ahb(
+			        vk, (void *)overlay,
+			        XRT_SWAPCHAIN_USAGE_SAMPLED | XRT_SWAPCHAIN_USAGE_TRANSFER_SRC, // #2501 capture
+			        &mc->weave.overlay_image, &mc->weave.overlay_memory, &mc->weave.overlay_view,
+			        &mc->weave.overlay_w, &mc->weave.overlay_h, "overlay")) {
 				mc->weave.overlay_ahb = (void *)overlay;
 				mc->weave.overlay_ahb_id = overlay_id;
 				mc->weave.overlay_first_use = true;
@@ -2522,6 +2641,13 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			mc->weave.crop_first_use = true;
 		}
 
+		// #2501: file-trigger capture. One poll per submit (the previous submit's
+		// fence is retired by now); only a submit that consumed a trigger records
+		// readbacks (input / atlas / overlay / woven) and writes the PNGs after
+		// its own completion.
+		pthread_once(&weave_capture_dir_once, weave_capture_resolve_dir);
+		capturing = comp_multi_weave_capture_begin(&mc->weave.capture, vk);
+
 		// ---- Record ----
 		VkCommandBuffer cmd = mc->weave.cmd;
 		vk->vkResetCommandBuffer(cmd, 0);
@@ -2535,6 +2661,16 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 
 		VkImageSubresourceRange range = {
 		    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
+
+		// #2501: the caller's buffer as received. It rests in GENERAL between
+		// submits; a freshly imported one is still UNDEFINED (its first barrier
+		// below discards), so the import frame records no input stage.
+		if (capturing && !mc->weave.in_first_use) {
+			comp_multi_weave_capture_record(&mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_INPUT,
+			                                mc->weave.in_image, mc->weave.in_w, mc->weave.in_h,
+			                                WEAVE_VK_FORMAT, VK_IMAGE_LAYOUT_GENERAL,
+			                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT);
+		}
 
 		VkImage dp_src_image = mc->weave.sbs_image;
 		VkImageView dp_src_view = mc->weave.sbs_view;
@@ -3089,6 +3225,24 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// blend to do exactly what it did before. Per submit (#1835): the import
 		// is cached by AHB pointer, so a submit that chains no overlay must not
 		// hand the DP the last one.
+		// #2501: the atlas the DP is about to consume (SBS scratch / v6 crop / the
+		// zero-copy input, all in SHADER_READ_ONLY here). Recorded before the
+		// self-submitting split, so it reads what the DP reads.
+		if (capturing) {
+			uint32_t src_w = mc->weave.sbs_w, src_h = mc->weave.sbs_h;
+			if (dp_src_image == mc->weave.crop_image) {
+				src_w = mc->weave.crop_w;
+				src_h = mc->weave.crop_h;
+			} else if (dp_src_image == mc->weave.in_image) {
+				src_w = mc->weave.in_w;
+				src_h = mc->weave.in_h;
+			}
+			comp_multi_weave_capture_record(
+			    &mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_ATLAS, dp_src_image, src_w, src_h,
+			    WEAVE_VK_FORMAT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+		}
+
 		struct xrt_display_processor_vk *dp_vk = (struct xrt_display_processor_vk *)mc->weave.dp;
 		bool ov_in_dp = false;
 		if (mc->weave.overlay_image != VK_NULL_HANDLE && mc->weave.overlay_this_submit &&
@@ -3107,8 +3261,16 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			mc->weave.overlay_first_use = false;
 			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 			                         0, 0, NULL, 0, NULL, 1, &ov_to_read);
+			// #2501: the 2D layer exactly as handed to the DP.
+			if (capturing) {
+				comp_multi_weave_capture_record(
+				    &mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_OVERLAY,
+				    mc->weave.overlay_image, mc->weave.overlay_w, mc->weave.overlay_h, WEAVE_VK_FORMAT,
+				    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				    VK_ACCESS_SHADER_READ_BIT);
+			}
 			// v15 strength first: the D3D11 / Linux order.
-			xrt_display_processor_vk_set_overlay_2d_filter_strength(dp_vk, mc->weave.overlay_filter_strength);
+			xrt_display_processor_vk_set_overlay_2d_filter_strength(dp_vk, weave_filter_strength(mc));
 			ov_in_dp = xrt_display_processor_vk_set_overlay_2d(
 			    dp_vk, mc->weave.overlay_view, (VkFormat_XDP)WEAVE_VK_FORMAT, mc->weave.overlay_w,
 			    mc->weave.overlay_h, XRT_ATLAS_ENCODING_ENCODED, mc->weave.overlay_unchanged);
@@ -3284,6 +3446,14 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
 				                         &ov_to_read);
+				// #2501: the 2D layer as the runtime's own blend takes it.
+				if (capturing) {
+					comp_multi_weave_capture_record(
+					    &mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_OVERLAY,
+					    mc->weave.overlay_image, mc->weave.overlay_w, mc->weave.overlay_h,
+					    WEAVE_VK_FORMAT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+					    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+				}
 
 				VkImageMemoryBarrier out_weave_to_blend = {
 				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -3307,6 +3477,17 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				                                  0.0f, 0.0f, 1.0f, 1.0f,                 // src = whole atlas
 				                                  /*unpremultiplied*/ false);
 			}
+		}
+
+		// #2501: the woven output, everything drawn (weave, flat 2D, the overlay
+		// whether the DP or the runtime composited it). Under the self-submit
+		// split `cmd` is the post-weave buffer here, so the copy follows the
+		// DP's own submit in queue order.
+		if (capturing) {
+			comp_multi_weave_capture_record(
+			    &mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_WOVEN, mc->weave.out_image,
+			    mc->weave.out_w, mc->weave.out_h, WEAVE_VK_FORMAT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 		}
 
 		// Output -> GENERAL for the caller's cross-process read.
@@ -3348,7 +3529,9 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			final_waits[final_wait_count] = mc->weave.sync_dp_sem;
 			final_stages[final_wait_count++] = sync_wait_stage;
 		}
-		const bool signal_release = sync_gpu && want_release && !dp_dropped;
+		// #2501: a capturing submit completes synchronously (release -1 is a
+		// valid "already complete" answer) so its readbacks resolve below.
+		const bool signal_release = sync_gpu && want_release && !dp_dropped && !capturing;
 		VkSubmitInfo submit = {
 		    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 		    .waitSemaphoreCount = final_wait_count,
@@ -3418,6 +3601,18 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				    "semaphores recreated",
 				    dropped_logs);
 			}
+		}
+
+		// #2501: the fence above was waited, so every recorded readback is done.
+		if (capturing) {
+			char what[192];
+			snprintf(what, sizeof(what), "backend=android client=%s %s layout, output %ux%u, overlay %s",
+			         mc->weave.capture.tag[0] != 0 ? mc->weave.capture.tag : "?",
+			         nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"), mc->weave.out_w,
+			         mc->weave.out_h,
+			         !mc->weave.overlay_this_submit ? "none"
+			                                        : (ov_in_dp ? "DP-composited" : "runtime-blended"));
+			comp_multi_weave_capture_finish(&mc->weave.capture, vk, what);
 		}
 
 		mc->weave.fence_value++;
@@ -3583,6 +3778,7 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 		weave_release_scratch(vk, mc);
 		weave_release_crop(vk, mc);
 		weave_release_output(vk, mc);
+		comp_multi_weave_capture_release(&mc->weave.capture, vk); // #2501 (queue idle above)
 		if (mc->weave.overlay_blend_initialized) {
 			vk_local2d_composite_fini(&mc->weave.overlay_blend, vk);
 			mc->weave.overlay_blend_initialized = false;

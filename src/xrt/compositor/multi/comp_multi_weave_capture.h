@@ -3,8 +3,9 @@
 /*!
  * @file
  * @brief  File-trigger capture for the service-side weave engines
- *         (XR_DXR_weave): desktop Linux (comp_multi_weave_linux.c, #2207) and
- *         macOS (comp_multi_weave_macos.c over its vk / Metal backends, #2470).
+ *         (XR_DXR_weave): desktop Linux (comp_multi_weave_linux.c, #2207),
+ *         macOS (comp_multi_weave_macos.c over its vk / Metal backends, #2470)
+ *         and Android (comp_multi_weave_android.c, #2501).
  * @ingroup comp_multi
  *
  * The weave engine has no swapchain and no window: a present-owner (the
@@ -24,6 +25,21 @@
  *    rects' views composed in. Pre-weave.
  *  - woven — `displayxr_atlas.woven.png`: the output handed back to the
  *    caller, post-weave, incl. off-panel / flat-region 2D and the v4 overlay.
+ *
+ *  - overlay — `displayxr_atlas.overlay.png`: the v4 2D overlay layer as the
+ *    engine received it (premultiplied; its alpha is the 2D-coverage mask, so
+ *    set `DXR_ATLAS_CAPTURE_RAW_ALPHA=1` to keep it). Written only by an engine
+ *    that records it (Android, #2501) and only on a submit that chained one.
+ *    `woven` against `overlay` shows whether a DP that composites the overlay
+ *    inside the weave changed its pixels.
+ *
+ * Android (#2501): there is no useful `$TMPDIR` in a service process, so the
+ * engine points `$TMPDIR` at a directory `adb` can reach before its first
+ * poll — the `debug.dxr.capture_dir` property if set, else the runtime
+ * package's external files dir (`/sdcard/Android/data/<runtime-pkg>/files`),
+ * else its cache dir — and logs the choice once. The per-client tag is the
+ * client's PACKAGE name (`PackageManager.getNameForUid` of the peer uid), e.g.
+ * `displayxr_atlas_trigger.org.chromium.chrome`.
  *
  * A PROJECTION_ONLY trigger writes the atlas alone, to
  * `displayxr_atlas.projection.png` (the engine has no window-space layers, so
@@ -62,10 +78,11 @@ struct vk_bundle;
 //! The stages one trigger can capture, in file order.
 enum comp_multi_weave_capture_stage
 {
-	COMP_MULTI_WEAVE_CAPTURE_INPUT = 0, //!< the caller's buffer as received
-	COMP_MULTI_WEAVE_CAPTURE_ATLAS = 1, //!< the DP's pre-weave input
-	COMP_MULTI_WEAVE_CAPTURE_WOVEN = 2, //!< the post-weave output
-	COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT = 3,
+	COMP_MULTI_WEAVE_CAPTURE_INPUT = 0,   //!< the caller's buffer as received
+	COMP_MULTI_WEAVE_CAPTURE_ATLAS = 1,   //!< the DP's pre-weave input
+	COMP_MULTI_WEAVE_CAPTURE_WOVEN = 2,   //!< the post-weave output
+	COMP_MULTI_WEAVE_CAPTURE_OVERLAY = 3, //!< the v4 2D overlay layer as received (#2501)
+	COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT = 4,
 };
 
 //! One stage's pixels: a recorded Vulkan readback, or (once resolved / stored) CPU RGBA8.
@@ -98,7 +115,7 @@ struct comp_multi_weave_capture
 bool
 comp_multi_weave_capture_begin(struct comp_multi_weave_capture *cap, struct vk_bundle *vk);
 
-//! Does this submit capture @p stage? (atlas: every mode; input / woven: POST_COMPOSE only.)
+//! Does this submit capture @p stage? (atlas: every mode; input / woven / overlay: POST_COMPOSE only.)
 bool
 comp_multi_weave_capture_wants(const struct comp_multi_weave_capture *cap, enum comp_multi_weave_capture_stage stage);
 
