@@ -1922,6 +1922,10 @@ struct PlaneHands
 {
 	XrVector3f wrist[2];
 	XrVector3f palm[2];
+	//! The palm joint's radius: the RIG_LOCAL canvas scale (ADR-034
+	//! Amendment 7) scales it with the canvas; 1:1 for a session with no
+	//! canvas of its own.
+	float palm_radius[2];
 };
 
 /*!
@@ -1965,6 +1969,7 @@ measure_plane_hands(Runtime &rt, XrSpace base, XrTime t, PlaneHands *out, XrPose
 
 		out->wrist[h] = pmul(inv_plane, locs[XR_HAND_JOINT_WRIST_EXT].pose).position;
 		out->palm[h] = pmul(inv_plane, locs[XR_HAND_JOINT_PALM_EXT].pose).position;
+		out->palm_radius[h] = locs[XR_HAND_JOINT_PALM_EXT].radius;
 		destroyTracker(tracker);
 	}
 	return all_active;
@@ -2037,6 +2042,7 @@ check_same_hands(const char *what, const PlaneHands &a, const PlaneHands &b, flo
 		CAPTURE(what, h);
 		CHECK(vdist(a.wrist[h], b.wrist[h]) < tol_m);
 		CHECK(vdist(a.palm[h], b.palm[h]) < tol_m);
+		CHECK(a.palm_radius[h] == Catch::Approx(b.palm_radius[h]).margin(1e-6));
 	}
 }
 
@@ -2087,6 +2093,17 @@ TEST_CASE("RIG_LOCAL hands sit on the display plane the SESSION sees, in every s
 	check_same_hands("bridge-relay LOCAL vs STAGE", relay.local, relay.stage, kPosTolM);
 	// The classes agree: RIG_LOCAL is the display plane, not the head device pose.
 	check_same_hands("runtime-win vs bridge-relay", hosted.local, relay.local, 0.002f);
+	// Neither class owns a canvas, so the canvas-relative rule (ADR-034
+	// Amendment 7) leaves both at the physical display's scale: the palm
+	// radius is the provider's, unscaled, in both (compared above) and
+	// non-zero. The canvas-owning (external-window) class cannot come up
+	// headlessly; its placement — L at the canvas centre + s L, radii and
+	// velocities times s — is pinned in tests_view_rig_point
+	// ("RIG_LOCAL is canvas-relative: placement").
+	for (int h = 0; h < 2; h++) {
+		CAPTURE(h);
+		CHECK(hosted.local.palm_radius[h] > 0.0f);
+	}
 }
 
 TEST_CASE("RIG_LOCAL hands follow the display plane a chained XR_DXR_view_rig puts in LOCAL",
@@ -2104,7 +2121,10 @@ TEST_CASE("RIG_LOCAL hands follow the display plane a chained XR_DXR_view_rig pu
 	// The external-window class cannot come up headlessly; the runtime-window
 	// class carries the same rule, and a rig posed AWAY from the physical
 	// plane makes a miss unmistakable (before the fix the hands stayed at the
-	// physical plane, ~0.6 m from where the rig shows them).
+	// physical plane, ~0.6 m from where the rig shows them). A canvas-owning
+	// session puts the plane at its CANVAS centre through the rig and scales
+	// L by the canvas (ADR-034 Amendment 7) — the same plane for a
+	// full-display canvas; the windowed case is pinned in tests_view_rig_point.
 	const char *enable = std::getenv("DXR_INPUT_SIM_INPUT_ENABLE");
 	if (enable == nullptr || std::strcmp(enable, "1") != 0) {
 		WARN(
