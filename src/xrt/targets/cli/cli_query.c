@@ -32,6 +32,7 @@
 #include "util/u_git_tag.h"
 #include "util/u_setting.h" // #1252 settings chain (env > per-user > machine)
 #include "util/u_screen_info.h" // multi-screen M1 per-screen info
+#include "util/u_openxr_layers.h"   // Ultraleap implicit-layer advisory
 #include "util/u_status_snapshot.h" // ADR-053 conversion provider row JSON
 #ifdef XRT_OS_WINDOWS
 #include "util/u_windows.h" // #1201 DPI awareness reporting
@@ -1233,6 +1234,59 @@ probe_tracking_providers(struct cli_query_result *r,
 	r->tracking_evaluated = true;
 }
 
+//! Case-insensitive "contains", for spotting an Ultraleap row by id or binary name.
+static bool
+contains_nocase(const char *hay, const char *needle)
+{
+	if (hay == NULL || needle == NULL) {
+		return false;
+	}
+	const size_t n = strlen(needle);
+	for (; *hay != '\0'; hay++) {
+		size_t i = 0;
+		while (i < n && hay[i] != '\0' &&
+		       (hay[i] | 0x20) == (needle[i] | 0x20)) { // ASCII letters only; fine for "ultraleap"
+			i++;
+		}
+		if (i == n) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*!
+ * Ultraleap's implicit OpenXR layer vs DisplayXR's `ultraleap` provider. The
+ * layer is in every OpenXR app (the loader's doing, not ours) and resets the
+ * Leap service to Head-mounted mode, so a desk-mounted Leap read by our
+ * provider comes back L/R-swapped with sideways motion turned into depth.
+ * Selftest runs headless — no loader — so it would never see the layer act;
+ * this reads the registration instead. Advisory: never a failure.
+ */
+static void
+check_ultraleap_layer(struct cli_query_result *r, const struct target_input_plugin_desc *descs, int count)
+{
+	r->input_ultraleap_layer_warn = false;
+	r->input_ultraleap_layer_note[0] = '\0';
+	bool have_provider = false;
+	for (int i = 0; i < count; i++) {
+		if (descs[i].enabled &&
+		    (contains_nocase(descs[i].id, "ultraleap") || contains_nocase(descs[i].binary_path, "ultraleap"))) {
+			have_provider = true;
+			break;
+		}
+	}
+	if (!have_provider) {
+		return;
+	}
+	struct u_openxr_implicit_layer layer;
+	if (!u_openxr_implicit_layer_find(U_OPENXR_LAYER_ULTRALEAP_HAND_TRACKING, &layer) || !layer.active) {
+		return;
+	}
+	r->input_ultraleap_layer_warn = true;
+	u_openxr_layer_ultraleap_advice(&layer, r->input_ultraleap_layer_note, sizeof(r->input_ultraleap_layer_note));
+}
+
 static void
 probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 {
@@ -1265,6 +1319,7 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 			r->input_enabled_count++;
 		}
 	}
+	check_ultraleap_layer(r, descs, r->input_provider_count);
 	// N7: what "nobody holds the hands" means depends on the gate — the
 	// qwerty floor, or no role at all. Either is OK; the note must not claim
 	// a pair that was not published.
@@ -2847,6 +2902,9 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	} else {
 		PT("%s\n", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
 	}
+	if (r->input_ultraleap_layer_warn) {
+		P("WARN: ULTRALEAP_OPENXR_LAYER — %s\n", r->input_ultraleap_layer_note);
+	}
 
 	P(" :: Rig (navigation) role (ADR-034 Amendment 4)\n");
 	if (r->rig_evaluated) {
@@ -3229,6 +3287,9 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddBoolToObject(ip, "hardware_present", r->input_provider_present);
 		cJSON_AddBoolToObject(ip, "evaluated", r->input_evaluated);
 		cJSON_AddStringToObject(ip, "note", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
+		if (r->input_ultraleap_layer_warn) {
+			cJSON_AddStringToObject(ip, "ultraleap_openxr_layer_warning", r->input_ultraleap_layer_note);
+		}
 		if (r->input_evaluated) {
 			cJSON_AddBoolToObject(ip, "active", r->input_provider_active);
 			cJSON_AddStringToObject(ip, "active_id", r->input_provider_id);
@@ -3778,6 +3839,11 @@ cli_query_print_selftest_text(const struct cli_query_result *r)
 		}
 	}
 
+	// Advisory, never the exit code: the layer is a third party's, and the fix is the user's.
+	if (r->input_ultraleap_layer_warn) {
+		P("WARN: ULTRALEAP_OPENXR_LAYER — %s\n", r->input_ultraleap_layer_note);
+	}
+
 	// ADR-045: informational — never changes the verdict or the exit code.
 	print_plugin_states_text(r);
 
@@ -3816,6 +3882,13 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 			cJSON_AddStringToObject(w, "text", text);
 			cJSON_AddItemToArray(warnings, w);
 		}
+	}
+	if (r->input_ultraleap_layer_warn) {
+		cJSON *w = cJSON_CreateObject();
+		cJSON_AddStringToObject(w, "code", "ULTRALEAP_OPENXR_LAYER");
+		cJSON_AddStringToObject(w, "level", "warn");
+		cJSON_AddStringToObject(w, "text", r->input_ultraleap_layer_note);
+		cJSON_AddItemToArray(warnings, w);
 	}
 
 	cJSON_AddStringToObject(root, "dpi_awareness", r->dpi_awareness);

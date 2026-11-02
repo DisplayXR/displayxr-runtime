@@ -246,6 +246,19 @@ store can change what a registered provider is *told*, never which binary
 loads. `u_setting_is_managed`'s allow-list (the runtime-policy `DXR_*`
 levers) is a different store this contract never touches.
 
+**`<id>` is the registration row, and should equal the provider's declared
+id.** The verbs below take — and write under — a row id (the same name
+`Enabled` / `PreferredPlugin` use), while a provider asks with its own
+`iface->id`. Every installer-written row is named after that id, so the two
+agree. A row named otherwise (a dev row once named after the DLL basename,
+`DisplayXR-Ultraleap` for `ultraleap`) is read as a **fallback**: when nothing
+is stored under the provider's id, the host reads the row's stores too — only
+when that row is unambiguous (exactly one resident row carries the iface id,
+or it is the row being negotiated / probed; two rows of one DLL, N3b, never
+read each other's). The loader WARNs once per load when a row's id differs
+from its provider's. `register_dev_plugin.bat input <dll> [id]` names the row
+after the declared id (in-tree DLLs are mapped; pass `[id]` for others).
+
 **Verbs** — one spelling across `dp` / `input` / `conv`
 (`cli_component_options.c`):
 

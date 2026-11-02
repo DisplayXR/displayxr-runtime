@@ -407,6 +407,12 @@ struct cli_query_result
 	char input_left_str[256];
 	char input_right_str[256];
 	char input_note[256];
+	/* Ultraleap's implicit OpenXR layer (XR_APILAYER_ULTRALEAP_hand_tracking)
+	 * is registered + enabled while an `ultraleap` input provider is
+	 * registered: the layer resets the Leap to Head-mounted mode in every
+	 * OpenXR app. A WARNING only, never a selftest failure. */
+	bool input_ultraleap_layer_warn;
+	char input_ultraleap_layer_note[1024];
 
 	/* ADR-054 N6 Part 2: the viewer-tracking class — the scan tally, the
 	 * resident rows in rank order, and the primary screen's viewer source as

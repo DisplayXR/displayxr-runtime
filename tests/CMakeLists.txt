@@ -12,6 +12,7 @@ set(tests
     tests_history_buf
     tests_id_ringbuffer
     tests_json
+    tests_openxr_layers
     tests_lowpass_float
     tests_lowpass_integer
     tests_pacing

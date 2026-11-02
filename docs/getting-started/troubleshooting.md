@@ -520,6 +520,28 @@ provider.
 
 ---
 
+## Leap hands come back left/right-swapped, or moving a hand sideways moves it in depth
+
+**Symptom:** with the `ultraleap` input provider and a Leap Motion on the desk,
+the left hand drives the right one, and a sideways move shows up as depth. The
+Ultraleap Control Panel says Head-mounted mode even after you set Desktop.
+
+**Cause:** Ultraleap's installer registers its own OpenXR API layer,
+`XR_APILAYER_ULTRALEAP_hand_tracking`, as an **implicit** layer
+(`HKLM`/`HKCU\Software\Khronos\OpenXR\1\ApiLayers\Implicit`). The Khronos
+loader puts implicit layers in *every* OpenXR app, whichever runtime is active,
+so it loads into DisplayXR apps (and the DisplayXR Browser) too, and each load
+resets the Leap tracking service to Head-mounted mode. `displayxr-cli selftest`
+runs without the loader, so it cannot see the layer act. It reads the
+registration instead and prints `WARN: ULTRALEAP_OPENXR_LAYER` (never a
+failure). `displayxr-cli info` and the provider's own log do the same.
+
+**Fix:**
+1. Set `DISABLE_XR_APILAYER_ULTRALEAP_HAND_TRACKING_1=1` in the **user**
+   environment. This is the layer manifest's own `disable_environment` switch.
+2. Close every OpenXR app that already loaded the layer (browsers included).
+3. Set Desktop mode again in the Ultraleap Control Panel.
+
 ## Sampling a client window's Win32 state — key on the HWND the runtime names
 
 When diagnosing "the app went dark / stopped weaving" with `IsWindowVisible`,
