@@ -296,10 +296,6 @@ static_assert(sizeof(XrSessionDisplayBindingDXR) == 24, "XrSessionDisplayBinding
 static_assert(offsetof(XrSessionDisplayBindingDXR, type) == 0, "XrSessionDisplayBindingDXR::type moved");
 static_assert(offsetof(XrSessionDisplayBindingDXR, next) == 8, "XrSessionDisplayBindingDXR::next moved");
 static_assert(offsetof(XrSessionDisplayBindingDXR, displayId) == 16, "XrSessionDisplayBindingDXR::displayId moved");
-static_assert(sizeof(XrDisplayStableKeyDXR) == 80, "XrDisplayStableKeyDXR size changed");
-static_assert(offsetof(XrDisplayStableKeyDXR, type) == 0, "XrDisplayStableKeyDXR::type moved");
-static_assert(offsetof(XrDisplayStableKeyDXR, next) == 8, "XrDisplayStableKeyDXR::next moved");
-static_assert(offsetof(XrDisplayStableKeyDXR, key) == 16, "XrDisplayStableKeyDXR::key moved");
 static_assert(sizeof(XrViewDisplayBindingDXR) == 32, "XrViewDisplayBindingDXR size changed");
 static_assert(offsetof(XrViewDisplayBindingDXR, displayId) == 0, "XrViewDisplayBindingDXR::displayId moved");
 static_assert(offsetof(XrViewDisplayBindingDXR, segmentRect) == 8, "XrViewDisplayBindingDXR::segmentRect moved");
@@ -316,6 +312,10 @@ static_assert(offsetof(XrEventDataDisplaysChangedDXR, type) == 0, "XrEventDataDi
 static_assert(offsetof(XrEventDataDisplaysChangedDXR, next) == 8, "XrEventDataDisplaysChangedDXR::next moved");
 static_assert(offsetof(XrEventDataDisplaysChangedDXR, session) == 16, "XrEventDataDisplaysChangedDXR::session moved");
 static_assert(offsetof(XrEventDataDisplaysChangedDXR, displayCount) == 24, "XrEventDataDisplaysChangedDXR::displayCount moved");
+static_assert(sizeof(XrDisplayStableKeyDXR) == 80, "XrDisplayStableKeyDXR size changed");
+static_assert(offsetof(XrDisplayStableKeyDXR, type) == 0, "XrDisplayStableKeyDXR::type moved");
+static_assert(offsetof(XrDisplayStableKeyDXR, next) == 8, "XrDisplayStableKeyDXR::next moved");
+static_assert(offsetof(XrDisplayStableKeyDXR, key) == 16, "XrDisplayStableKeyDXR::key moved");
 #endif
 
 // ---- XR_DXR_view_rig.h

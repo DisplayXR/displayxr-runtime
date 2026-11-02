@@ -891,6 +891,37 @@ typedef struct XrViewDisplayBindingsDXR {
     XrViewDisplayBindingDXR*    bindings;             //!< Array of bindingCapacityInput entries; may be NULL when the capacity is 0
 } XrViewDisplayBindingsDXR;
 
+// ---- v23: Display topology change event (display hotplug, ADR-047 Amendment 8) ----
+
+// Type value 1004999218 (display_info's 210-219 decade, see README.md).
+#define XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR ((XrStructureType)1004999218)
+
+/*!
+ * @brief The system's display list changed while the session ran (v23).
+ *
+ * Queued once per change, to every running session, when a display was
+ * plugged in or removed, was re-claimed by another display processor (a 3D
+ * panel whose vendor service came up after the app started), or moved / changed
+ * mode. The runtime has ALREADY applied it: a window on a newly claimed 3D
+ * panel is woven by that panel's display processor from the next frame, with
+ * no session restart; one on a removed display is no longer woven for it.
+ *
+ * Re-enumerate with xrEnumerateDisplaysDXR to see the new list: an id that is
+ * no longer listed is gone, and a listed id's vendorPluginId / flags / info may
+ * differ. Nothing else is required of the app. XrSystemProperties, the view
+ * configuration view counts (ADR-041) and the swapchain sizing stay fixed for
+ * the session; per-segment views (multi-screen M3) follow the new list within
+ * that fixed view count.
+ *
+ * @extends XrEventDataBaseHeader
+ */
+typedef struct XrEventDataDisplaysChangedDXR {
+    XrStructureType             type;         //!< Must be XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR
+    const void* XR_MAY_ALIAS    next;
+    XrSession                   session;
+    uint32_t                    displayCount; //!< How many displays xrEnumerateDisplaysDXR lists now
+} XrEventDataDisplaysChangedDXR;
+
 // ---- v24: Stable per-display key ----
 
 #define XR_TYPE_DISPLAY_STABLE_KEY_DXR ((XrStructureType)1004999219)
@@ -927,37 +958,6 @@ typedef struct XrDisplayStableKeyDXR {
     void* XR_MAY_ALIAS          next;
     char                        key[XR_MAX_DISPLAY_KEY_SIZE_DXR]; //!< NUL-terminated; "" = unknown.
 } XrDisplayStableKeyDXR;
-
-// ---- v23: Display topology change event (display hotplug, ADR-047 Amendment 8) ----
-
-// Type value 1004999218 (display_info's 210-219 decade, see README.md).
-#define XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR ((XrStructureType)1004999218)
-
-/*!
- * @brief The system's display list changed while the session ran (v23).
- *
- * Queued once per change, to every running session, when a display was
- * plugged in or removed, was re-claimed by another display processor (a 3D
- * panel whose vendor service came up after the app started), or moved / changed
- * mode. The runtime has ALREADY applied it: a window on a newly claimed 3D
- * panel is woven by that panel's display processor from the next frame, with
- * no session restart; one on a removed display is no longer woven for it.
- *
- * Re-enumerate with xrEnumerateDisplaysDXR to see the new list: an id that is
- * no longer listed is gone, and a listed id's vendorPluginId / flags / info may
- * differ. Nothing else is required of the app. XrSystemProperties, the view
- * configuration view counts (ADR-041) and the swapchain sizing stay fixed for
- * the session; per-segment views (multi-screen M3) follow the new list within
- * that fixed view count.
- *
- * @extends XrEventDataBaseHeader
- */
-typedef struct XrEventDataDisplaysChangedDXR {
-    XrStructureType             type;         //!< Must be XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR
-    const void* XR_MAY_ALIAS    next;
-    XrSession                   session;
-    uint32_t                    displayCount; //!< How many displays xrEnumerateDisplaysDXR lists now
-} XrEventDataDisplaysChangedDXR;
 
 #ifndef XR_NO_PROTOTYPES
 XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateDisplaysDXR(
