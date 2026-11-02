@@ -403,8 +403,9 @@ target_viewer_tracking_set_service_process(bool service)
  *    and drains the page into g_ring like any reader.
  *  - OWNER_INPROC: the service without the host binary: the provider runs in
  *    the service, its sink writes the page (so in-process apps beside the
- *    service still share it); a small thread beats the heartbeat and answers
- *    readers' demand.
+ *    service still share it); a small thread beats the heartbeat, answers
+ *    readers' demand and stops the provider when no viewer was requested for
+ *    the host's idle_stop_ns (time asleep not counted), as the host would be.
  *  - READER: an in-process runtime that found a live page: it loads no
  *    provider, posts demand on its first viewer request and drains the page.
  *
@@ -437,6 +438,8 @@ static struct u_vpp_producer g_inproc_producer; //!< OWNER_INPROC: the sink's pa
 static struct os_thread_helper g_inproc_thread;
 static bool g_inproc_thread_running = false;
 static int64_t g_last_demand_post_ns = 0;
+static int64_t g_inproc_demand_ns = 0; //!< OWNER_INPROC: the last viewer request (this service's or a reader's)
+static int64_t g_inproc_tick_ns = 0;   //!< OWNER_INPROC: the thread's previous tick (a long gap = asleep)
 static int64_t g_last_live_check_ns = 0;
 static bool g_live_cached = false;
 static int64_t g_last_reattach_ns = 0;
@@ -1055,19 +1058,51 @@ page_live_locked(int64_t now)
 	return g_live_cached;
 }
 
-//! OWNER_INPROC: heartbeat, producer status and readers' demand, every 100 ms.
+//! OWNER_INPROC: stop the provider, nobody wants a viewer. Caller holds the lock.
+static void
+inproc_idle_stop_locked(int64_t idle_ns)
+{
+	const struct xrt_tracking_plugin_iface *iface = target_tracking_plugin_get_iface(g_provider_index);
+	if (iface != NULL) {
+		iface->stop(target_tracking_plugin_get_instance(g_provider_index));
+	}
+	g_started = false;
+	g_last_demand_post_ns = 0;
+	write_owner_inproc(U_VPP_STATE_IDLE);
+	U_LOG_W(
+	    "viewer tracking: provider '%s' stopped — idle, no viewer requested for %lld s (the next request "
+	    "starts it again)",
+	    g_page_provider, (long long)(idle_ns / ((int64_t)1000 * 1000 * 1000)));
+}
+
+//! OWNER_INPROC: heartbeat, producer status, readers' demand and the idle stop, every 100 ms.
 static void *
 inproc_thread_run(void *ptr)
 {
 	(void)ptr;
+	struct target_vhost_sup_config cfg;
+	target_vhost_sup_config_defaults(&cfg);
 	os_thread_helper_lock(&g_inproc_thread);
 	while (os_thread_helper_is_running_locked(&g_inproc_thread)) {
 		os_thread_helper_unlock(&g_inproc_thread);
 		const int64_t now = (int64_t)os_monotonic_get_ns();
 		lock();
+		// Time asleep is not idle time (CLOCK_MONOTONIC runs through sleep on macOS).
+		if (g_inproc_tick_ns != 0 && cfg.suspend_gap_ns > 0 &&
+		    now - g_inproc_tick_ns > (int64_t)cfg.suspend_gap_ns) {
+			g_inproc_demand_ns += now - g_inproc_tick_ns;
+		}
+		g_inproc_tick_ns = now;
 		const int64_t d = u_vpp_read_demand(g_shm.map);
-		if (!g_started && d > 0 && now - d < U_VPP_DEMAND_FRESH_NS) {
+		const bool reader_demand = d > 0 && now - d < U_VPP_DEMAND_FRESH_NS;
+		if (reader_demand) {
+			g_inproc_demand_ns = now;
+		}
+		if (!g_started && reader_demand) {
 			start_locked(); // a reader beside the service needs a viewer
+		}
+		if (g_started && cfg.idle_stop_ns > 0 && now - g_inproc_demand_ns >= (int64_t)cfg.idle_stop_ns) {
+			inproc_idle_stop_locked(now - g_inproc_demand_ns);
 		}
 		if (g_started) {
 			u_vpp_heartbeat(g_shm.map, now);
@@ -1124,6 +1159,10 @@ start_locked(void)
 			    g_page_provider);
 		}
 		return;
+	}
+	if (g_hosting == VT_HOSTING_OWNER_INPROC) {
+		// Renewed by every viewer request: the inproc thread stops the provider when idle.
+		g_inproc_demand_ns = (int64_t)os_monotonic_get_ns();
 	}
 #endif
 	if (g_started || g_provider_index < 0) {
@@ -1423,6 +1462,8 @@ target_viewer_tracking_shutdown(void)
 	}
 	memset(&g_reader, 0, sizeof(g_reader));
 	g_last_demand_post_ns = 0;
+	g_inproc_demand_ns = 0;
+	g_inproc_tick_ns = 0;
 	g_live_cached = false;
 #endif
 	g_hosting = VT_HOSTING_UNRESOLVED;

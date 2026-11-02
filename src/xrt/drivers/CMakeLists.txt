@@ -631,6 +631,11 @@ else()
 			drv_includes
 		)
 	add_dependencies(drv_sim_tracking_plugin ${RUNTIME_TARGET})
+	if(APPLE)
+		# A process that has not loaded the runtime (displayxr-cli, the tracking
+		# tests) must still resolve @rpath/openxr_displayxr.dylib in the build tree.
+		set_property(TARGET drv_sim_tracking_plugin APPEND PROPERTY BUILD_RPATH "$<TARGET_FILE_DIR:${RUNTIME_TARGET}>")
+	endif()
 	if(MSVC)
 		# SOURCE=webcam's capture backend (aux_os_uvc, Media Foundation): delay-
 		# loaded, as in sim_display, so loading the provider never maps MF and
