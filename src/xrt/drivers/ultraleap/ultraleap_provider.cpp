@@ -443,6 +443,11 @@ ul_process_hand(struct ul_hub *hub, const LEAP_HAND *hand, struct xrt_hand_joint
 	ul_process_joint(hub, hand->pinky.distal.next_joint, hand->pinky.distal.rotation, hand->pinky.distal.width,
 	                 JS(LITTLE_TIP));
 #undef JS
+
+	// The joints above are display-plane poses, but the state tracker
+	// composes hand_pose onto every joint: express them relative to this
+	// frame's palm, which becomes hand_pose (the palm is applied once).
+	ul_map_joints_to_hand_frame(out_set);
 }
 
 
@@ -1077,7 +1082,14 @@ ul_device_get_hand_tracking(struct xrt_device *xdev,
 	bool tracked = dev->tracked;
 	os_mutex_unlock(&dev->hub->mutex);
 
-	// Hand pose rides the same palm history as the grip.
+	// The joints are hand-frame relations to the palm of the latest Leap
+	// frame (ul_process_hand), and the set's hand_pose is that palm. The
+	// root rides the same palm history as the grip instead, sampled at the
+	// requested time (interpolated or predicted with the palm velocity), so
+	// the hand moves as one rigid body without the palm being applied twice.
+	// History and joint set are written together under the hub lock per frame,
+	// so the history's latest sample is the joint set's palm. No history yet:
+	// keep the frame palm (zero flags before the first frame -> inactive).
 	struct xrt_space_relation rel = {};
 	if (m_relation_history_get(dev->history, at_timestamp_ns, &rel) != M_RELATION_HISTORY_RESULT_INVALID) {
 		out_value->hand_pose = rel;

@@ -1182,7 +1182,8 @@ target_sources(
 target_include_directories(
 	tests_ultraleap_map PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/ultraleap
 	)
-target_link_libraries(tests_ultraleap_map PRIVATE xrt-interfaces)
+# aux_math: the hand-frame re-expression (ul_map_joints_to_hand_frame) is pose math.
+target_link_libraries(tests_ultraleap_map PRIVATE xrt-interfaces aux_math)
 # #132 — the touch provider's gesture recogniser + rig/aim math, and the
 # pointer-event ring it is fed from. Compiled straight in for the same reason
 # as tests_sim_input_nav: what is under test is the mapping table (pure

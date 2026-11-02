@@ -8,6 +8,8 @@
 
 #include "ultraleap_map.h"
 
+#include "math/m_api.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -193,4 +195,37 @@ ul_map_orientation(float x, float y, float z, float w)
 	out.z = z;
 	out.w = w;
 	return out;
+}
+
+
+/*
+ *
+ * Hand frame.
+ *
+ */
+
+void
+ul_map_joints_to_hand_frame(struct xrt_hand_joint_set *set)
+{
+	if (set == NULL) {
+		return;
+	}
+	const struct xrt_space_relation palm = set->values.hand_joint_set_default[XRT_HAND_JOINT_PALM].relation;
+	const enum xrt_space_relation_flags need = (enum xrt_space_relation_flags)(
+	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT);
+	if ((palm.relation_flags & need) != need) {
+		return;
+	}
+
+	struct xrt_pose palm_inv;
+	math_pose_invert(&palm.pose, &palm_inv);
+	for (int i = 0; i < XRT_HAND_JOINT_COUNT; i++) {
+		struct xrt_pose *p = &set->values.hand_joint_set_default[i].relation.pose;
+		math_pose_transform(&palm_inv, p, p);
+	}
+	// Exactly the identity, not palm⁻¹ ∘ palm's float residue.
+	set->values.hand_joint_set_default[XRT_HAND_JOINT_PALM].relation.pose = (struct xrt_pose)XRT_POSE_IDENTITY;
+
+	set->hand_pose.pose = palm.pose;
+	set->hand_pose.relation_flags = palm.relation_flags;
 }

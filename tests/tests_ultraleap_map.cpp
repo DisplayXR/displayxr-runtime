@@ -18,6 +18,9 @@
 
 #include "ultraleap_map.h"
 
+#include "math/m_api.h"
+#include "math/m_space.h"
+
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -271,4 +274,151 @@ TEST_CASE("describe_settings declares every key with the compiled defaults", "[u
 	CHECK(std::stof(declared["MOUNT_X_M"]) == UL_MAP_DEFAULT_MOUNT_X_M);
 	CHECK(std::stof(declared["MOUNT_Y_M"]) == UL_MAP_DEFAULT_MOUNT_Y_M);
 	CHECK(std::stof(declared["MOUNT_Z_M"]) == UL_MAP_DEFAULT_MOUNT_Z_M);
+}
+
+
+/*
+ *
+ * Hand frame: joints are relative to hand_pose, which the state tracker
+ * composes on (oxr_session.c, T_xdev_hand). A field run on a Windows 3D panel
+ * found the palm applied twice: two touching index tips came back 7.7 cm apart.
+ *
+ */
+
+namespace {
+
+constexpr enum xrt_space_relation_flags kValid = (enum xrt_space_relation_flags)(
+    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+
+xrt_quat
+axis_angle(xrt_vec3 axis, float rad)
+{
+	const float n = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+	const xrt_vec3 unit = {axis.x / n, axis.y / n, axis.z / n};
+	xrt_quat q;
+	math_quat_from_angle_vector(rad, &unit, &q);
+	return q;
+}
+
+//! A display-plane hand the way ul_process_hand fills it: palm somewhere off the
+//! display centre and turned, every joint at its own display-plane pose.
+xrt_hand_joint_set
+display_plane_hand(xrt_vec3 palm_pos, xrt_quat palm_rot)
+{
+	xrt_hand_joint_set set = {};
+	for (int i = 0; i < XRT_HAND_JOINT_COUNT; i++) {
+		xrt_hand_joint_value &j = set.values.hand_joint_set_default[i];
+		// Hand-local layout: joints spread along -Z (fingers) and X (across the hand).
+		const xrt_pose local = {axis_angle({1.f, 0.f, 0.f}, 0.05f * (float)i),
+		                        {0.004f * (float)(i % 5) - 0.008f, 0.001f * (float)i, -0.004f * (float)i}};
+		const xrt_pose palm = {palm_rot, palm_pos};
+		math_pose_transform(&palm, &local, &j.relation.pose);
+		j.relation.relation_flags = kValid;
+		j.radius = 0.002f + 0.0001f * (float)i;
+	}
+	xrt_hand_joint_value &p = set.values.hand_joint_set_default[XRT_HAND_JOINT_PALM];
+	p.relation.pose = {palm_rot, palm_pos};
+	return set;
+}
+
+//! What the state tracker does per joint: hand_pose then the joint (device = identity here).
+xrt_pose
+compose(const xrt_hand_joint_set &set, int joint)
+{
+	xrt_space_relation out;
+	xrt_relation_chain chain = {};
+	m_relation_chain_push_relation(&chain, &set.values.hand_joint_set_default[joint].relation);
+	m_relation_chain_push_relation(&chain, &set.hand_pose);
+	m_relation_chain_resolve(&chain, &out);
+	return out.pose;
+}
+
+float
+dist(xrt_vec3 a, xrt_vec3 b)
+{
+	return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z));
+}
+
+} // namespace
+
+TEST_CASE("hand frame: palm becomes the root, composing it back reproduces the display-plane joints", "[ultraleap_map]")
+{
+	const xrt_vec3 palm_pos = {0.06f, -0.02f, 0.05f};
+	const xrt_quat palm_rot = axis_angle({0.3f, 1.f, 0.2f}, 0.9f);
+	const xrt_hand_joint_set before = display_plane_hand(palm_pos, palm_rot);
+
+	xrt_hand_joint_set set = before;
+	ul_map_joints_to_hand_frame(&set);
+
+	// hand_pose = the palm; the palm joint = exactly the identity.
+	CHECK(set.hand_pose.relation_flags == kValid);
+	CHECK(set.hand_pose.pose.position.x == palm_pos.x);
+	CHECK(set.hand_pose.pose.position.y == palm_pos.y);
+	CHECK(set.hand_pose.pose.position.z == palm_pos.z);
+	CHECK(set.hand_pose.pose.orientation.w == palm_rot.w);
+	const xrt_pose &pj = set.values.hand_joint_set_default[XRT_HAND_JOINT_PALM].relation.pose;
+	CHECK(pj.position.x == 0.f);
+	CHECK(pj.position.y == 0.f);
+	CHECK(pj.position.z == 0.f);
+	CHECK(pj.orientation.w == 1.f);
+
+	for (int i = 0; i < XRT_HAND_JOINT_COUNT; i++) {
+		INFO("joint " << i);
+		const xrt_hand_joint_value &b = before.values.hand_joint_set_default[i];
+		const xrt_hand_joint_value &a = set.values.hand_joint_set_default[i];
+		// Flags and radii untouched.
+		CHECK(a.relation.relation_flags == b.relation.relation_flags);
+		CHECK(a.radius == b.radius);
+		// hand_pose ∘ joint == the display-plane joint (the palm applied once).
+		const xrt_pose c = compose(set, i);
+		CHECK(c.position.x == Catch::Approx(b.relation.pose.position.x).margin(kEps));
+		CHECK(c.position.y == Catch::Approx(b.relation.pose.position.y).margin(kEps));
+		CHECK(c.position.z == Catch::Approx(b.relation.pose.position.z).margin(kEps));
+		// Same rotation up to sign.
+		const float dot =
+		    c.orientation.x * b.relation.pose.orientation.x + c.orientation.y * b.relation.pose.orientation.y +
+		    c.orientation.z * b.relation.pose.orientation.z + c.orientation.w * b.relation.pose.orientation.w;
+		CHECK(std::fabs(dot) == Catch::Approx(1.f).margin(kEps));
+	}
+}
+
+TEST_CASE("hand frame: two touching fingertips stay touching (the palm-applied-twice regression)", "[ultraleap_map]")
+{
+	// Left and right hands either side of the display centre, index tips meeting at one point.
+	const xrt_vec3 meet = {0.0f, 0.01f, 0.04f};
+	xrt_hand_joint_set left = display_plane_hand({-0.05f, 0.f, 0.03f}, axis_angle({0.f, 0.f, 1.f}, -0.4f));
+	xrt_hand_joint_set right = display_plane_hand({0.05f, 0.f, 0.03f}, axis_angle({0.f, 0.f, 1.f}, 0.4f));
+	left.values.hand_joint_set_default[XRT_HAND_JOINT_INDEX_TIP].relation.pose.position = meet;
+	right.values.hand_joint_set_default[XRT_HAND_JOINT_INDEX_TIP].relation.pose.position = meet;
+
+	// The bug: display-plane joints with hand_pose = palm compose the palm twice.
+	xrt_hand_joint_set bad_l = left;
+	xrt_hand_joint_set bad_r = right;
+	bad_l.hand_pose = bad_l.values.hand_joint_set_default[XRT_HAND_JOINT_PALM].relation;
+	bad_r.hand_pose = bad_r.values.hand_joint_set_default[XRT_HAND_JOINT_PALM].relation;
+	CHECK(dist(compose(bad_l, XRT_HAND_JOINT_INDEX_TIP).position,
+	           compose(bad_r, XRT_HAND_JOINT_INDEX_TIP).position) > 0.05f);
+
+	ul_map_joints_to_hand_frame(&left);
+	ul_map_joints_to_hand_frame(&right);
+	const xrt_vec3 tl = compose(left, XRT_HAND_JOINT_INDEX_TIP).position;
+	const xrt_vec3 tr = compose(right, XRT_HAND_JOINT_INDEX_TIP).position;
+	CHECK(dist(tl, tr) == Catch::Approx(0.f).margin(kEps));
+	CHECK(tl.x == Catch::Approx(meet.x).margin(kEps));
+	CHECK(tl.y == Catch::Approx(meet.y).margin(kEps));
+	CHECK(tl.z == Catch::Approx(meet.z).margin(kEps));
+}
+
+TEST_CASE("hand frame: an empty (never-tracked) set is left alone", "[ultraleap_map]")
+{
+	xrt_hand_joint_set set = {};
+	ul_map_joints_to_hand_frame(&set);
+	CHECK(set.hand_pose.relation_flags == 0);
+	for (int i = 0; i < XRT_HAND_JOINT_COUNT; i++) {
+		const xrt_pose &p = set.values.hand_joint_set_default[i].relation.pose;
+		CHECK(p.orientation.w == 0.f); // untouched: not inverted into NaN
+		CHECK(!std::isnan(p.position.x));
+	}
+	ul_map_joints_to_hand_frame(nullptr); // no crash
 }

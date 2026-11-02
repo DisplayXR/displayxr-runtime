@@ -135,6 +135,32 @@ ul_map_radius_from_width_mm(const struct ul_map *map, float width_mm);
 struct xrt_quat
 ul_map_orientation(float x, float y, float z, float w);
 
+/*!
+ * Re-express a joint set filled in the display-plane frame as HAND-frame
+ * relations, and make its palm the set's root.
+ *
+ * The state tracker composes `hand_pose` onto every joint
+ * (`T_base_joint = T_base_xdev ∘ hand_pose ∘ joint`, oxr_session.c), so a
+ * provider's joints are relative to `hand_pose`, not to the device — the
+ * contract `sim_input` follows. A set whose joints are already display-plane
+ * poses AND whose `hand_pose` is the palm applies the palm twice: the hand is
+ * pushed ~2x out from the display centre, rotating it swings the whole hand
+ * about the origin, and touching fingertips of two hands land apart.
+ *
+ * On return `hand_pose` is the input palm relation (pose + flags; the set's
+ * own velocities are untouched) and every joint is `palm⁻¹ ∘ joint`, so the
+ * palm joint is the identity and composing `hand_pose` back reproduces the
+ * input exactly. Joint flags and radii are kept. Joint velocities are not
+ * re-expressed: this provider publishes none (no velocity bits), and the
+ * hand's motion rides on `hand_pose`.
+ *
+ * A palm with no valid orientation or position (an empty, never-filled set)
+ * leaves the set unchanged — there is nothing to be relative to, and the
+ * state tracker reports such a hand inactive anyway.
+ */
+void
+ul_map_joints_to_hand_frame(struct xrt_hand_joint_set *set);
+
 //! The `describe_settings` slot: this provider's declared keys.
 uint32_t
 ul_map_describe_settings(const struct xrt_component_setting_desc **out_descs);
