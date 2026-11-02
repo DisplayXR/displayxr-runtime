@@ -476,6 +476,7 @@ directory from **`$TMPDIR`** — and on macOS `$TMPDIR` is a *per-user*
 | vk_native | `$TMPDIR/displayxr_atlas_trigger` | `$TMPDIR/displayxr_atlas.png` |
 | Linux service weave engine (`XR_DXR_weave`: the DisplayXR Browser, weave probes) | the **service's** `$TMPDIR/displayxr_atlas_trigger` (or `…_trigger.<client-exe>`) | `displayxr_atlas.input.png` (caller's buffer) + `displayxr_atlas.png` (DP input, lifted views in) + `displayxr_atlas.woven.png` (post-weave) |
 | macOS service weave engine (`XR_DXR_weave`, vk and Metal backends) | same as Linux: the **service's** `$TMPDIR` (a `/var/folders/...` path unless you set it) | same three files |
+| Android weave engine (`XR_DXR_weave`, #2501) | `/sdcard/Android/data/<runtime-pkg>/files/displayxr_atlas_trigger.<client-pkg>` (`adb shell touch`; `debug.dxr.capture_dir` overrides the dir, logged once as `weave capture (#2501): capture dir`) | the same three + `displayxr_atlas.<client-pkg>.overlay.png` (the v4 2D layer as received); `adb pull` them. Raw alpha: `setprop debug.xrt.DXR_ATLAS_CAPTURE_RAW_ALPHA 1` before the runtime starts |
 
 ```bash
 rm -f "$TMPDIR/displayxr_atlas.png" "$TMPDIR/displayxr_atlas_trigger"

@@ -7833,6 +7833,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	// v14/v15: same per-submit hints for the Android weave (2D under the lens).
 	comp_multi_weave_android_set_overlay_hints(ics->xc, args->overlay_unchanged != 0,
 	                                           args->overlay_filter_strength);
+	// #2501: the client's package name (from its uid) tags its capture trigger.
+	comp_multi_weave_android_set_capture_uid(ics->xc, ics->peer_uid);
 #elif defined(XRT_OS_MACOS)
 	// #2470: the client's exe basename tags its per-client capture trigger (the #2207 twin).
 	comp_multi_weave_macos_set_capture_tag(ics->xc, (const char *)ics->input_exe_basename);

@@ -16,6 +16,8 @@
 #include <inttypes.h>
 #include <atomic>
 #include <mutex>
+#include <exception>
+#include <stdio.h>
 #include <jni.h>
 #include <wrap/android.app.h>
 #include <android/native_window.h>
@@ -558,4 +560,122 @@ android_globals_self_declares_force_ipc(struct _JavaVM *vm, void *context)
 	}
 	jni::init(vm);
 	return read_self_bool_meta_data("com.displayxr.force_ipc", false, context);
+}
+
+/*!
+ * Copy a java.lang.String into @p out (terminated, truncated). Clears any
+ * pending exception. false for a null string or an empty result.
+ */
+static bool
+copy_jstring(JNIEnv *env, jstring s, char *out, size_t out_size)
+{
+	if (s == nullptr || out == nullptr || out_size == 0) {
+		return false;
+	}
+	const char *utf = env->GetStringUTFChars(s, nullptr);
+	if (utf == nullptr) {
+		if (env->ExceptionCheck()) {
+			env->ExceptionClear();
+		}
+		return false;
+	}
+	snprintf(out, out_size, "%s", utf);
+	env->ReleaseStringUTFChars(s, utf);
+	return out[0] != '\0';
+}
+
+bool
+android_globals_get_app_dir(bool external, char *out, size_t out_size)
+{
+	if (out == nullptr || out_size == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	jobject ctx = (jobject)android_globals_get_context();
+	if (ctx == nullptr || android_globals.vm == nullptr) {
+		return false;
+	}
+	bool ok = false;
+	try {
+		jni::init(android_globals.vm);
+		JNIEnv *env = jni::env(); // attaches this thread if needed
+		if (env == nullptr || env->PushLocalFrame(8) != JNI_OK) {
+			return false;
+		}
+		jclass ctx_cls = env->GetObjectClass(ctx);
+		jobject file = nullptr;
+		if (external) {
+			jmethodID m =
+			    env->GetMethodID(ctx_cls, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;");
+			if (m != nullptr) {
+				file = env->CallObjectMethod(ctx, m, (jstring) nullptr);
+			}
+		} else {
+			jmethodID m = env->GetMethodID(ctx_cls, "getCacheDir", "()Ljava/io/File;");
+			if (m != nullptr) {
+				file = env->CallObjectMethod(ctx, m);
+			}
+		}
+		if (env->ExceptionCheck()) {
+			env->ExceptionClear();
+			file = nullptr;
+		}
+		if (file != nullptr) {
+			jclass file_cls = env->GetObjectClass(file);
+			jmethodID gp = env->GetMethodID(file_cls, "getAbsolutePath", "()Ljava/lang/String;");
+			jstring path = gp != nullptr ? (jstring)env->CallObjectMethod(file, gp) : nullptr;
+			if (env->ExceptionCheck()) {
+				env->ExceptionClear();
+				path = nullptr;
+			}
+			ok = copy_jstring(env, path, out, out_size);
+		}
+		env->PopLocalFrame(nullptr);
+	} catch (std::exception const &) {
+		ok = false;
+	}
+	return ok;
+}
+
+bool
+android_globals_get_name_for_uid(long uid, char *out, size_t out_size)
+{
+	if (out == nullptr || out_size == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	jobject ctx = (jobject)android_globals_get_context();
+	if (uid < 0 || ctx == nullptr || android_globals.vm == nullptr) {
+		return false;
+	}
+	bool ok = false;
+	try {
+		jni::init(android_globals.vm);
+		JNIEnv *env = jni::env();
+		if (env == nullptr || env->PushLocalFrame(8) != JNI_OK) {
+			return false;
+		}
+		jclass ctx_cls = env->GetObjectClass(ctx);
+		jmethodID get_pm =
+		    env->GetMethodID(ctx_cls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+		jobject pm = get_pm != nullptr ? env->CallObjectMethod(ctx, get_pm) : nullptr;
+		if (env->ExceptionCheck()) {
+			env->ExceptionClear();
+			pm = nullptr;
+		}
+		if (pm != nullptr) {
+			jclass pm_cls = env->GetObjectClass(pm);
+			jmethodID m = env->GetMethodID(pm_cls, "getNameForUid", "(I)Ljava/lang/String;");
+			jstring name = m != nullptr ? (jstring)env->CallObjectMethod(pm, m, (jint)uid) : nullptr;
+			if (env->ExceptionCheck()) {
+				env->ExceptionClear();
+				name = nullptr;
+			}
+			ok = copy_jstring(env, name, out, out_size);
+		}
+		env->PopLocalFrame(nullptr);
+	} catch (std::exception const &) {
+		ok = false;
+	}
+	return ok;
 }
