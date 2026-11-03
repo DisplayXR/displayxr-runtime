@@ -60,6 +60,30 @@
 
 DEBUG_GET_ONCE_BOOL_OPTION(ipc_ignore_version, "IPC_IGNORE_VERSION", false)
 
+#ifdef XRT_OS_LINUX_DESKTOP
+#include "os/os_time.h"
+#include "util/u_time.h"
+#include <sys/time.h> // struct timeval (SO_RCVTIMEO / SO_SNDTIMEO)
+
+/*
+ * #2515: an opt-in bound on connect + handshake (ipc_client_connection_set_
+ * handshake_timeout_ms). 0 = block forever, the default for every client.
+ */
+static volatile uint32_t g_handshake_timeout_ms = 0;
+static volatile bool g_handshake_timed_out = false;
+
+//! Apply (ms > 0) or clear (ms == 0) the per-call send/receive timeouts on @p fd.
+static void
+ipc_client_set_socket_timeouts(int fd, uint32_t ms)
+{
+	struct timeval tv;
+	tv.tv_sec = (time_t)(ms / 1000u);
+	tv.tv_usec = (suseconds_t)((ms % 1000u) * 1000u);
+	(void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	(void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+#endif
+
 #ifdef XRT_OS_ANDROID
 
 #include <pthread.h>
@@ -837,6 +861,14 @@ ipc_client_posix_dial(struct ipc_connection *ipc_c)
 
 	int socket = ret;
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2515: SO_SNDTIMEO also bounds connect() on a unix stream socket (a
+	// full backlog of a service that no longer accepts).
+	if (g_handshake_timeout_ms > 0) {
+		ipc_client_set_socket_timeouts(socket, g_handshake_timeout_ms);
+	}
+#endif
+
 	char sock_file[PATH_MAX];
 
 	ssize_t size = u_file_get_path_in_runtime_dir(XRT_IPC_MSG_SOCK_FILENAME, sock_file, PATH_MAX);
@@ -1112,6 +1144,26 @@ ipc_client_connection_disable_service_launch(void)
 #endif
 }
 
+void
+ipc_client_connection_set_handshake_timeout_ms(uint32_t timeout_ms)
+{
+#ifdef XRT_OS_LINUX_DESKTOP
+	g_handshake_timeout_ms = timeout_ms;
+#else
+	(void)timeout_ms;
+#endif
+}
+
+bool
+ipc_client_connection_handshake_timed_out(void)
+{
+#ifdef XRT_OS_LINUX_DESKTOP
+	return g_handshake_timed_out;
+#else
+	return false;
+#endif
+}
+
 xrt_result_t
 ipc_client_connection_init(struct ipc_connection *ipc_c,
                            enum u_logging_level log_level,
@@ -1123,6 +1175,12 @@ ipc_client_connection_init(struct ipc_connection *ipc_c,
 	ipc_c->imc.ipc_handle = XRT_IPC_HANDLE_INVALID;
 	ipc_c->imc.log_level = log_level;
 	ipc_c->ism_handle = XRT_SHMEM_HANDLE_INVALID;
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	const uint32_t hs_timeout_ms = g_handshake_timeout_ms;
+	const uint64_t hs_start_ns = os_monotonic_get_ns();
+	g_handshake_timed_out = false;
+#endif
 
 	// Must be done first.
 	int ret = os_mutex_init(&ipc_c->mutex);
@@ -1181,9 +1239,25 @@ ipc_client_connection_init(struct ipc_connection *ipc_c,
 		goto err_fini; // Already logged.
 	}
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2515: the bound covers the handshake only; later calls (a consent
+	// prompt, a long-poll) may legitimately wait longer.
+	if (hs_timeout_ms > 0) {
+		ipc_client_set_socket_timeouts(ipc_c->imc.ipc_handle, 0);
+	}
+#endif
+
 	return XRT_SUCCESS;
 
 err_fini:
+#ifdef XRT_OS_LINUX_DESKTOP
+	// A failure that took the whole bound is the service not answering, not
+	// one of the immediate failures (refused, version skew).
+	if (hs_timeout_ms > 0 &&
+	    os_monotonic_get_ns() - hs_start_ns >= (uint64_t)hs_timeout_ms * U_TIME_1MS_IN_NS * 9u / 10u) {
+		g_handshake_timed_out = true;
+	}
+#endif
 	ipc_client_connection_fini(ipc_c);
 
 	return xret;

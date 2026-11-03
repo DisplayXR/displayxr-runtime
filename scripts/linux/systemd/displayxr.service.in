@@ -20,12 +20,28 @@ Requires=displayxr.socket
 After=displayxr.socket
 ConditionUser=!root
 
+# Hang bounds (#2515): a service that wedges must not keep this unit "active
+# (running)" with the activated socket attached to a process that never accepts
+# again (every later client then hangs). The service feeds WATCHDOG=1 from its
+# IPC main loop (never from a timer thread), so a wedged main loop is killed
+# after WatchdogSec= and the next client's connect starts a fresh one. The
+# watchdog also covers startup before the first ping (plug-in discovery and a
+# vendor display processor's bring-up can take seconds), hence 60 s, not less.
+# It sends
+# STOPPING=1 when its exit path starts, which ends the watchdog and arms
+# TimeoutStopSec=: a teardown / exit() that hangs is SIGTERMed, then SIGKILLed.
+# The protocol is spoken without libsystemd (no new dependency). Type stays
+# simple: the service also sends READY=1, which Type=simple ignores.
+
 [Service]
 Type=simple
 ExecStart=@SERVICE_BIN@
 Environment=IPC_EXIT_WHEN_IDLE=1 IPC_EXIT_WHEN_IDLE_DELAY_MS=30000
 Restart=on-failure
 RestartSec=2
+NotifyAccess=main
+WatchdogSec=60s
+TimeoutStopSec=10s
 
 [Install]
 Also=displayxr.socket

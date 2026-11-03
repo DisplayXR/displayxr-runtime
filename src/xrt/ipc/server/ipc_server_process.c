@@ -32,6 +32,7 @@
 #include "util/u_git_tag.h"
 #include "util/u_setting.h"
 #include "util/u_exe_basename.h"
+#include "util/u_sd_notify.h" // #2515: systemd WATCHDOG=1 / STOPPING=1 (desktop Linux; no-op elsewhere)
 
 #include "shared/ipc_app_group.h" // input focus follows the application
 #include "util/u_session.h"        // #2262: the server pushes the sibling's FOCUSED state itself
@@ -1297,6 +1298,14 @@ main_loop(struct ipc_server *s)
 
 		// Check polling.
 		ipc_server_mainloop_poll(s, &s->ml);
+
+#ifdef XRT_OS_LINUX_DESKTOP
+		// #2515: the systemd watchdog is fed from THIS loop, never from a timer
+		// thread, so a main loop that wedges stops the pings and systemd kills
+		// the service (socket activation then starts a fresh one). Rate-limited
+		// to half of WatchdogSec inside; a no-op when not under a watchdog.
+		u_sd_notify_watchdog_tick(os_monotonic_get_ns());
+#endif
 	}
 
 	return 0;
@@ -2151,12 +2160,25 @@ ipc_server_main(int argc, char **argv, const struct ipc_server_main_info *ismi)
 	// Print a very clear service started message.
 	print_linux_end_user_started_information(log_level);
 #endif
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2515: the unit is Type=simple, for which systemd ignores READY=1; it is
+	// sent anyway so the unit could become Type=notify without a code change.
+	(void)u_sd_notify_send("READY=1");
+#endif
 	// ADR-045 R-c: world-event re-probe worker (the service host feeds it).
 	g_allow_adoption_restart = ismi->allow_adoption_restart;
 	reprobe_start(s);
 
 	// Main loop.
 	ret = main_loop(s);
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2515: the exit path starts here. STOPPING=1 moves the unit to
+	// "deactivating", which ends the watchdog and arms TimeoutStopSec=, so a
+	// teardown or exit() that hangs (a plug-in destructor, an SDK crash handler
+	// deadlocked in malloc) is killed instead of holding the activated socket.
+	(void)u_sd_notify_send("STOPPING=1");
+#endif
 
 	reprobe_stop();
 

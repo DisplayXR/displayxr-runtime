@@ -361,7 +361,7 @@ never claim a mode the runtime is not in, and "Custom" falls out for free.
 ## Appendix A — census
 
 Every `DXR_*` name read at runtime under `src/xrt`, with its read site, mechanism, default
-and tier. **110 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
+and tier. **112 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
 `bg2d_int_knob()` rather than a literal `getenv` at the listed line.
 
 Process column: **App** = the runtime DLL, loaded into the OpenXR app's process ·
@@ -627,6 +627,8 @@ setting, never `getenv`): `displayxr-cli input …` surfaces both.
 | `DXR_STEREO_CAMERA_UVC_ADAPTER` | `auxiliary/os/os_uvc_capture_mf.cpp` (`choose_adapter`, `getenv` per open) | unset (= the capable adapter with the most dedicated memory) | Svc | 1 | ADR-043 Amendment 4: description substring of the adapter the hardware MJPEG decode runs on (e.g. `Intel` for the iGPU) |
 | `DXR_DISPLAY_HOTPLUG` | `targets/common/target_display_hotplug.c` (`target_display_hotplug_enabled`, at system create) | `getenv` once per system | **on** in-process on macOS, Windows and desktop Linux (#2305); off on Android and in the Windows / desktop-Linux service, which re-probes on its own OS events | App | 1 | Opt-out (`0`) / force-on (`1`) for the in-process display-hotplug sweep (ADR-047 Amendment 8): a monitor or panel plugged, unplugged, moved or re-moded while the app runs re-resolves the per-screen claim registry, re-binds segment DPs, refreshes the `XR_DXR_display_info` panel rect and raises `XrEventDataDisplaysChangedDXR`. The session's own DP is never swapped |
 | `DXR_DISPLAY_HOTPLUG_POLL_MS` | same file (`target_display_hotplug_start`) | `getenv` once per system | 500 | App | 4 | Period of the cheap topology-signature poll (Windows `EnumDisplayDevicesW`, Linux DRM connector state, the macOS / X11 monitor list — never an EDID read); `0` = no poll (macOS keeps its CoreGraphics notification). A change must hold for two polls before it triggers a sweep (cable-blink filter) |
+| `DXR_SERVICE_EXIT_FAST` | `targets/service/main.c` (`DEBUG_GET_ONCE_BOOL_OPTION`, read once at the end of the POSIX `main()`) | on | Svc | 4 | #2515, desktop Linux only: after the orderly teardown the service flushes stdio and leaves with `_exit()`, so no `atexit` handler or shared-object destructor (a vendor plug-in's ELF destructor, run from `_dl_fini`) can crash or deadlock the exit and leave systemd holding the activated socket for a dead process. `0` = return from `main()` as before. A safety lever for diagnosis, not a setting |
+| `DXR_CLI_IPC_TIMEOUT_MS` | `targets/cli/cli_ipc.c` (`DEBUG_GET_ONCE_NUM_OPTION`, applied to every CLI service connect) | 5000 | CLI | 4 | #2515, desktop Linux only: bound on the DIAG connect + IPC handshake (per socket call, `SO_SNDTIMEO`/`SO_RCVTIMEO`, cleared once the handshake succeeds). On expiry the CLI names the wedged service and the recovery (`systemctl --user restart displayxr.service`) instead of hanging. `0` = wait forever |
 | `DXR_ULTRALEAP_SETTLE_MS` | `drivers/ultraleap/ultraleap_provider.cpp:1023` | `getenv` at provider init | `UL_SETTLE_DEFAULT_MS` | Both | 1 | How long to wait for a definitive Leap "attached" answer before role arbitration |
 
 ### Test / dev — never exposed
