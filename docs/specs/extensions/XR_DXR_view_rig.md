@@ -3,10 +3,10 @@
 | | |
 |---|---|
 | **Name** | `XR_DXR_view_rig` |
-| **Spec version** | 4 |
+| **Spec version** | 5 |
 | **Header** | [`src/external/openxr_includes/openxr/XR_DXR_view_rig.h`](../../../src/external/openxr_includes/openxr/XR_DXR_view_rig.h) |
 | **Type values** | `1004999140`–`142` ([registry](../../../src/external/openxr_includes/openxr/README.md)) |
-| **Decision** | [ADR-024](../../adr/ADR-024-raw-vs-render-ready-views.md) (raw vs render-ready views, W7 of #396); spec 4: #2189 |
+| **Decision** | [ADR-024](../../adr/ADR-024-raw-vs-render-ready-views.md) (raw vs render-ready views, W7 of #396); spec 4: #2189; spec 5: camera-rig joints at the convergence plane |
 
 ## 1. What it is
 
@@ -51,12 +51,28 @@ for that descriptor:
 | | Position | Radius, linear velocity | Orientation, angular velocity |
 |---|---|---|---|
 | Display rig | display space → canvas frame (minus the canvas centre, inverse canvas orientation) → × `perspectiveFactor` × `virtualDisplayHeight` / canvas height → placed at `pose` | × the same factor | rotated by `pose` × inverse(canvas orientation) × inverse(display plane) |
-| Camera rig | canvas frame → × `metersToVirtual` about the nominal viewer plane (`z` − nominal z) → placed at `pose` | × `metersToVirtual` | as above |
+| Camera rig (spec 5) | canvas frame → × `V / canvas height` → placed on the **glass plane**: `pose` moved `1 / convergenceDiopters` along the camera's forward (−Z) axis, so the physical glass sits at zero parallax. `V = 2 · tan(verticalFov / 2) / convergenceDiopters` is the camera's virtual screen height at that plane | × `V / canvas height` | as above |
+| Camera rig, `convergenceDiopters` = 0 | no glass plane at infinity: the spec-4 mapping, × `metersToVirtual` about the nominal viewer plane (`z` − nominal z) → placed at `pose` | × `metersToVirtual` | as above |
 | Nothing chained | base-space metres, unchanged | unchanged | unchanged |
 
 - The eye-pair tunables (`ipdFactor`, `parallaxFactor`) act on the eye pair, not
-  on points, and do not apply. The camera frustum (`convergenceDiopters`,
-  `verticalFov`) does not move a point either.
+  on points, and do not apply. Under a camera rig `metersToVirtual` scales the
+  eye, not the glass, so it does not move a joint either (except at infinite
+  convergence).
+- **Why the glass, not the viewer, anchors a camera rig (spec 5).** A hand
+  touching the glass must show at zero parallax, over the pixel it covers —
+  what the viewer actually sees — and that is how a display rig has always
+  behaved: its glass is its `pose`, scaled by `virtualDisplayHeight` / canvas
+  height. The camera rig's equivalent display rig is the shared core's
+  camera → display conversion (`dxr_view_rig_camera_to_display`, the one a rig
+  toggle uses): plane at the convergence distance, `virtualDisplayHeight = V`.
+  Joints take exactly that plane and height with `perspectiveFactor` 1, so they
+  can never disagree with the frustum the views get. Spec 4 instead mapped the
+  joint as an eye — `metersToVirtual` about the nominal viewer — which put the
+  glass at the **nominal viewer distance** (e.g. 0.6 m) in front of the camera
+  at metric scale. In a camera-centric scene with convergence 0.5 and a
+  ≈ 0.58 m virtual screen on a 0.19 m-tall panel, a hand in front of the glass
+  rendered 6–10 cm behind zero parallax and about 3× too small.
 - The rig `pose` is taken in `XrHandJointsLocateInfoEXT::baseSpace`. For views
   it is taken in `XrViewLocateInfo::space`, so use the same space for both.
 - Hands stay rig-relative (ADR-034 Amendment 2: they follow the rig, never head
@@ -64,8 +80,9 @@ for that descriptor:
   its views are in.
 - One implementation: the point mapping is the shared `displayxr-common`
   core's eye mapping for an eye at the joint, with the eye-pair factors neutral
-  (`m_view_rig_point.h`). `tests_view_rig_point` pins it bit-for-bit against
-  the core across a sweep of canvases, poses and tunables.
+  (`m_view_rig_point.h`) — for a camera rig, through the core's own
+  camera → display conversion. `tests_view_rig_point` pins it bit-for-bit
+  against the core across a sweep of canvases, poses and tunables.
 - **Display-relative (`RIG_LOCAL`) hand sources are canvas-relative**
   ([ADR-034 Amendment 7](../../adr/ADR-034-input-provider-plugins.md),
   2026-11-03; runtime spec: `input-provider-discovery.md` §4b.4). For such a
@@ -107,7 +124,18 @@ older than spec 4 ignores a rig chained on `XrHandJointsLocateInfoEXT` and
 returns base-space joints with no error. A consumer must read `XR_DXR_view_rig`'s
 `extensionVersion` from `xrEnumerateInstanceExtensionProperties` and rely on
 rig-frame joints only when it is **≥ 4**; below that, keep joints in base space
-or skip rig-scoped hand features.
+or skip rig-scoped hand features. **Camera rigs need ≥ 5**: a spec-4 runtime
+(v2.47.1 – v2.59.x) returns camera-rig joints about the nominal viewer at
+`metersToVirtual` scale (see above). Against spec 4, either chain only display
+rigs and map camera-rig joints app-side with the spec-5 rule, or accept the old
+placement. Display-rig joints are identical in 4 and 5.
+
+**`RIG_LOCAL` action spaces follow.** A session that declares a rig sees the
+display-relative (`RIG_LOCAL`) plane where the rig puts the physical plane
+(`input-provider-discovery.md` §4b.4) — computed by the same point mapping. So
+under a camera rig at spec 5 that plane, and the controllers and descriptor-less
+hands placed on it, sit at the convergence plane rather than the nominal viewer
+distance; they stay metric (unscaled), as under a display rig.
 
 ## 3. Camera-rig gain: `metersToVirtual`, `convergenceDiopters` and `verticalFov` (#2422)
 
@@ -213,3 +241,4 @@ axis about 12 m behind the camera. That is a telephoto view that keeps the
 | 1–2 | `XrDisplayRigDXR`, `XrCameraRigDXR`, `XrViewDisplayRawDXR`, `xrSetWorkspaceViewRigDXR` (#396 W7; ADR-024). The version continues the pre-rename `XR_EXT_*` numbering (#738) |
 | 3 | `XrCameraRigDXR::metersToVirtual` |
 | 4 | The rig descriptors are valid on `XrHandJointsLocateInfoEXT::next`: rig-frame hand joints, radii and velocities (#2189) |
+| 5 | Camera-rig hand joints put the physical glass on the convergence plane (zero parallax), scaled by the camera's virtual screen height / canvas height — the display rig's rule for the camera rig's own virtual screen. Spec 4 anchored them at the nominal viewer, metric. Behaviour change, so the version moves: a consumer can tell which placement it gets. Display rigs unchanged |

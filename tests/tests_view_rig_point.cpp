@@ -9,12 +9,17 @@
  *  - EQUIVALENCE: across a sweep of canvases (full display, offset window,
  *    rotated canvas, portrait swap), rig poses and tunables, a point mapped by
  *    m_view_rig_map_canvas_point is BIT-IDENTICAL to the displayxr-common
- *    core's eye_world for an eye at that point (count 1, ipd = parallax = 1),
- *    for both rig kinds; and matches the core's two-eye output to float noise.
+ *    core's eye_world for an eye at that point (count 1, ipd = parallax = 1)
+ *    for a display rig, and for a camera rig (spec 5) to the display core's
+ *    eye_world under the core's own camera -> display conversion of that rig
+ *    (the glass at the convergence plane, x V / H); and matches the core's
+ *    two-eye output to float noise.
  *  - The canvas rebase is the step the view locate applies to eyes.
  *  - The issue's joint cases: an unscaled centred display rig is the identity;
  *    virtualDisplayHeight scale k scales positions and radii by k; a camera rig
- *    maps by metersToVirtual about the nominal plane; no rig = unchanged;
+ *    puts the glass at its convergence plane, scaled by its virtual screen
+ *    height / canvas height (metersToVirtual about the nominal plane only at
+ *    infinite convergence); no rig = unchanged;
  *    velocities and orientations follow the rig rotation.
  *  - RIG_LOCAL is canvas-relative (ADR-034 Amendment 7): a full-display canvas
  *    is unchanged bit for bit; a smaller canvas puts L at its centre + s L
@@ -95,6 +100,8 @@ points()
 	return {{0, 0, 0}, {0.032f, 0.01f, 0.6f}, {-0.1f, 0.05f, 0.25f}, {0.12f, -0.08f, -0.04f}, {0.0f, 0.0f, 1.2f}};
 }
 
+const xrt_vec3 kZero = {0.0f, 0.0f, 0.0f};
+
 bool
 bit_equal(const xrt_vec3 &a, const xrt_vec3 &b)
 {
@@ -151,12 +158,15 @@ TEST_CASE("view rig point: a display-rig point is the core's eye, bit for bit", 
 	}
 }
 
-TEST_CASE("view rig point: a camera-rig point is the core's eye, bit for bit", "[view_rig_point]")
+TEST_CASE("view rig point: a camera-rig point is the core's glass, bit for bit", "[view_rig_point]")
 {
+	// Spec 5: the camera rig's glass is the shared core's camera -> display
+	// conversion (plane + virtual height), mapped by the display core with
+	// perspective 1. Convergence at infinity keeps the camera core's eye mapping.
 	for (const auto &c : canvases()) {
 		for (const auto &pose : poses()) {
 			for (float m2v : {1.0f, 0.01f, 100.0f, 0.0f /* unset = 1 */}) {
-				for (float invd : {0.0f, 2.0f}) {
+				for (float invd : {0.0f, 2.0f, 0.5f}) {
 					m_view_rig rig{};
 					rig.kind = M_VIEW_RIG_CAMERA;
 					rig.pose = pose;
@@ -171,25 +181,140 @@ TEST_CASE("view rig point: a camera-rig point is the core's eye, bit for bit", "
 
 						const xrt_vec3 nominal = {0, c.nominal_y_m, c.nominal_z_m};
 						const dxr_screen scr = {c.width_m, c.height_m};
-						const dxr_camera3d_tunables ct = {1.0f, 1.0f, invd, 0.3249f, m2v};
 						dxr_xrt_view v;
-						dxr_xrt_camera3d_compute_views(&pc, 1, &nominal, &scr, &ct, &pose, &v);
-						CHECK(bit_equal(mine, v.eye_world));
+						if (invd > 0.0f) {
+							dxr_camera_rig cr{};
+							std::memcpy(&cr.pose, &pose, sizeof(cr.pose));
+							cr.ipd_factor = 1.0f;
+							cr.parallax_factor = 1.0f;
+							cr.inv_convergence_distance = invd;
+							cr.half_tan_vfov = 0.3249f;
+							cr.m2v = m2v > 0.0f ? m2v : 1.0f;
+							const dxr_rig_display_info info = {
+							    c.height_m, c.width_m / c.height_m, c.nominal_z_m};
+							dxr_display_rig dr{};
+							dxr_view_rig_camera_to_display(&cr, &info, &dr);
+							const dxr_display3d_tunables dt = {1.0f, 1.0f, 1.0f,
+							                                   dr.virtual_display_height};
+							xrt_pose glass;
+							std::memcpy(&glass, &dr.pose, sizeof(glass));
+							dxr_xrt_display3d_compute_views(&pc, 1, &nominal, &scr, &dt,
+							                                &glass, &v);
+							CHECK(bit_equal(mine, v.eye_world));
 
-						// Closed form: pose * (m2v * (x, y, z - nominal_z)); convergence never
-						// moves a point.
-						const float s = m2v > 0.0f ? m2v : 1.0f;
-						CHECK(m_view_rig_length_scale(&c, &rig) == Catch::Approx(s));
-						xrt_vec3 local = {pc.x * s, pc.y * s, (pc.z - c.nominal_z_m) * s},
-						         expect;
-						math_quat_rotate_vec3(&pose.orientation, &local, &expect);
-						expect = {expect.x + pose.position.x, expect.y + pose.position.y,
-						          expect.z + pose.position.z};
-						check_near(mine, expect, 1e-4f * (1.0f + s));
+							// Closed form: pose * (s x, s y, s z - 1/invd), s = V / H,
+							// V = 2 tan(vFOV/2) / invd.
+							const float s = 2.0f * 0.3249f / invd / c.height_m;
+							CHECK(m_view_rig_length_scale(&c, &rig) == Catch::Approx(s));
+							xrt_vec3 local = {pc.x * s, pc.y * s, pc.z * s - 1.0f / invd},
+							         expect;
+							math_quat_rotate_vec3(&pose.orientation, &local, &expect);
+							expect = {expect.x + pose.position.x,
+							          expect.y + pose.position.y,
+							          expect.z + pose.position.z};
+							check_near(mine, expect, 1e-4f * (1.0f + s + 1.0f / invd));
+						} else {
+							const dxr_camera3d_tunables ct = {1.0f, 1.0f, invd, 0.3249f,
+							                                  m2v};
+							dxr_xrt_camera3d_compute_views(&pc, 1, &nominal, &scr, &ct,
+							                               &pose, &v);
+							CHECK(bit_equal(mine, v.eye_world));
+
+							// Closed form: pose * (m2v * (x, y, z - nominal_z)).
+							const float s = m2v > 0.0f ? m2v : 1.0f;
+							CHECK(m_view_rig_length_scale(&c, &rig) == Catch::Approx(s));
+							xrt_vec3 local = {pc.x * s, pc.y * s,
+							                  (pc.z - c.nominal_z_m) * s},
+							         expect;
+							math_quat_rotate_vec3(&pose.orientation, &local, &expect);
+							expect = {expect.x + pose.position.x,
+							          expect.y + pose.position.y,
+							          expect.z + pose.position.z};
+							check_near(mine, expect, 1e-4f * (1.0f + s));
+						}
 					}
 				}
 			}
 		}
+	}
+}
+
+TEST_CASE("view rig point: a camera rig puts the glass at its convergence plane", "[view_rig_point]")
+{
+	// The camera-centric scene the fix was reported on: convergence 0.5 (2 dp),
+	// a vertical FOV giving a ~0.58 m virtual screen, on a 15.6" panel whose
+	// nominal viewer is 0.6 m away. Camera at the base origin, looking -Z.
+	const m_view_rig_canvas c = canvas_full();
+	const float conv = 0.5f;
+	const float vfov = 1.05f; // ~60 deg
+	const float htan = std::tan(vfov * 0.5f);
+	const float V = 2.0f * htan * conv;
+	const float s = V / c.height_m;
+	m_view_rig rig{};
+	rig.kind = M_VIEW_RIG_CAMERA;
+	rig.pose = {{0, 0, 0, 1}, {0, 0, 0}};
+	rig.m2v = 1.0f;
+	rig.inv_convergence_distance = 1.0f / conv;
+	rig.half_tan_vfov = htan;
+
+	SECTION("the glass centre lands at z = -convergence, in front of the camera")
+	{
+		xrt_vec3 out;
+		m_view_rig_map_canvas_point(&c, &rig, &kZero, &out);
+		check_near(out, {0.0f, 0.0f, -conv}, 1e-5f);
+	}
+	SECTION("a glass point lands on the virtual screen, x V / H: the pixel it covers")
+	{
+		// The top-right corner of the panel is the top-right corner of the
+		// frustum at the convergence plane.
+		const xrt_vec3 corner = {c.width_m * 0.5f, c.height_m * 0.5f, 0.0f};
+		xrt_vec3 out;
+		m_view_rig_map_canvas_point(&c, &rig, &corner, &out);
+		check_near(out, {corner.x * s, V * 0.5f, -conv}, 1e-5f);
+		CHECK(out.y / -out.z == Catch::Approx(htan)); // on the frustum's top edge
+	}
+	SECTION("a hand 5 cm in front of the glass is s x 5 cm in front of the convergence plane")
+	{
+		const xrt_vec3 hand = {0.02f, -0.01f, 0.05f};
+		xrt_vec3 out;
+		m_view_rig_map_canvas_point(&c, &rig, &hand, &out);
+		check_near(out, {0.02f * s, -0.01f * s, -conv + 0.05f * s}, 1e-5f);
+		CHECK(m_view_rig_length_scale(&c, &rig) == Catch::Approx(s));
+	}
+	SECTION("m_view_rig_camera_glass reports the plane and the scale")
+	{
+		xrt_pose glass;
+		float gs = 0.0f;
+		REQUIRE(m_view_rig_camera_glass(&c, &rig, &glass, &gs));
+		check_near(glass.position, {0.0f, 0.0f, -conv}, 1e-5f);
+		CHECK(gs == Catch::Approx(s));
+		m_view_rig at_inf = rig;
+		at_inf.inv_convergence_distance = 0.0f;
+		CHECK_FALSE(m_view_rig_camera_glass(&c, &at_inf, nullptr, nullptr));
+		m_view_rig display = rig;
+		display.kind = M_VIEW_RIG_DISPLAY;
+		CHECK_FALSE(m_view_rig_camera_glass(&c, &display, nullptr, nullptr));
+	}
+	SECTION("metersToVirtual moves the eyes, not the glass")
+	{
+		m_view_rig scaled = rig;
+		scaled.m2v = 25.0f;
+		const xrt_vec3 hand = {0.03f, 0.02f, 0.04f};
+		xrt_vec3 a, b;
+		m_view_rig_map_canvas_point(&c, &rig, &hand, &a);
+		m_view_rig_map_canvas_point(&c, &scaled, &hand, &b);
+		check_near(a, b, 1e-5f);
+	}
+	SECTION("a posed camera: the glass is 1/convergenceDiopters along its forward axis")
+	{
+		m_view_rig posed = rig;
+		posed.pose = {quat_axis_angle(0, 1, 0, 0.6f), {1.0f, 1.5f, 2.0f}};
+		xrt_vec3 out;
+		m_view_rig_map_canvas_point(&c, &posed, &kZero, &out);
+		const xrt_vec3 fwd = {0.0f, 0.0f, -conv};
+		xrt_vec3 want;
+		math_quat_rotate_vec3(&posed.pose.orientation, &fwd, &want);
+		check_near(out, {1.0f + want.x, 1.5f + want.y, 2.0f + want.z}, 1e-5f);
 	}
 }
 
@@ -300,19 +425,41 @@ TEST_CASE("view rig joints: the issue's cases", "[view_rig_point]")
 		           {in.linear_velocity.x * k, in.linear_velocity.y * k, in.linear_velocity.z * k}, 1e-5f);
 		check_near(out.angular_velocity, in.angular_velocity, 1e-6f); // rotation-only: unscaled
 	}
-	SECTION("a camera rig maps by metersToVirtual about the nominal viewer plane")
+	SECTION("a camera rig at infinite convergence maps by metersToVirtual about the nominal viewer plane")
 	{
 		const float m = 20.0f;
 		m_view_rig rig{};
 		rig.kind = M_VIEW_RIG_CAMERA;
 		rig.pose = {{0, 0, 0, 1}, {0.0f, 1.6f, 4.0f}};
 		rig.m2v = m;
+		rig.inv_convergence_distance = 0.0f;
+		rig.half_tan_vfov = 0.3249f;
 		m_view_rig_map_relation(&c, &rig, &plane, &in, 0.01f, &out, &radius);
 		check_near(out.pose.position,
 		           {in.pose.position.x * m, 1.6f + in.pose.position.y * m,
 		            4.0f + (in.pose.position.z - c.nominal_z_m) * m},
 		           1e-4f);
 		CHECK(radius == Catch::Approx(0.01f * m));
+	}
+	SECTION("a camera rig puts the glass at its convergence plane; radius and velocity x V / H")
+	{
+		const float conv = 0.5f, htan = 0.5774f; // 60 deg vFOV
+		const float s = 2.0f * htan * conv / c.height_m;
+		m_view_rig rig{};
+		rig.kind = M_VIEW_RIG_CAMERA;
+		rig.pose = {{0, 0, 0, 1}, {0.0f, 1.6f, 4.0f}};
+		rig.m2v = 1.0f;
+		rig.inv_convergence_distance = 1.0f / conv;
+		rig.half_tan_vfov = htan;
+		m_view_rig_map_relation(&c, &rig, &plane, &in, 0.01f, &out, &radius);
+		check_near(
+		    out.pose.position,
+		    {in.pose.position.x * s, 1.6f + in.pose.position.y * s, 4.0f - conv + in.pose.position.z * s},
+		    1e-4f);
+		CHECK(radius == Catch::Approx(0.01f * s));
+		check_near(out.linear_velocity,
+		           {in.linear_velocity.x * s, in.linear_velocity.y * s, in.linear_velocity.z * s}, 1e-5f);
+		check_near(out.angular_velocity, in.angular_velocity, 1e-6f);
 	}
 	SECTION("a rotated rig rotates orientation and both velocities")
 	{
