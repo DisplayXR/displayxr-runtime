@@ -391,12 +391,17 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 	// unreliable on composition swapchains.
 	if (dxr_late_weave_enabled()) {
 		desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-		if (use_transparent) {
-			// bc=2 cannot realize governor depths 3–4: Present would block
-			// on buffer availability, the interval never improves, and the
-			// governor escalates and sticks at max. Match the opaque path.
-			desc.BufferCount = 3;
-		}
+		// A waitable chain needs one buffer more than the deepest governor
+		// level it must realize. With bc=2 any depth above 1 is a lie: the
+		// waitable hands out a second token, the second Present finds no free
+		// buffer, and the #925 bound below turns Present(DO_NOT_WAIT) into a
+		// Present + Sleep(1) retry loop for a whole period on EVERY frame —
+		// ~85 % of a core on the app's main thread and R one frame late,
+		// until the governor's probe dwell (30 s) returns it to depth 1
+		// (#2402: 3 of 33 single-GPU runs, latched by start-up jitter on the
+		// first slip window). The composition chain carried this fix since
+		// the live-path late-weave landed; the opaque HWND chain did not.
+		desc.BufferCount = 3;
 	}
 	target->swapchain_flags = desc.Flags;
 
