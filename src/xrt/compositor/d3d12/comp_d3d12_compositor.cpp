@@ -2269,9 +2269,10 @@ d3d12_reroute_wire(struct comp_d3d12_compositor *c, struct xrt_device *xdev, boo
 		}
 	}
 	/*
-	 * #2317 P2a: on one adapter the hub can read the deposit ring DIRECT (no
-	 * transport copy; DXR_HUB_INGRESS=direct opts in, the hub's ingress policy
-	 * decides). A HYBRID reroute (the default on a cross-adapter box, #2375)
+	 * #2317 P2a: on one adapter the hub reads the deposit ring DIRECT (no
+	 * transport copy; the default for this producer since #2518, the hub's
+	 * ingress policy decides, DXR_HUB_INGRESS=xbridge forces the bridge). A
+	 * HYBRID reroute (the default on a cross-adapter box, #2375)
 	 * always takes xbridge (ingress_reason=cross_adapter). DIRECT reads are released
 	 * on the hub's own consumer fence, which this queue must open to order a
 	 * slot rewrite after them — no open, no DIRECT. #2370: under
@@ -2403,6 +2404,10 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	// that signals the deposit fence, and a list that rewrites a plane waits
 	// out the hub's last plane read (comp_d3d12_deposit_plane_wait_hub).
 	si.ring_direct_planes = true;
+	// #2518: ...and takes DIRECT by default on one adapter (render == scanout):
+	// the staged ring's per-frame app-queue copy stalled the #2362 drain on a
+	// same-adapter hybrid laptop. DXR_HUB_INGRESS=xbridge forces the bridge.
+	si.ring_direct_default = true;
 	si.render_packed_luid =
 	    ((uint64_t)(uint32_t)app_luid.HighPart << 32) | (uint64_t)(uint32_t)app_luid.LowPart;
 	si.display_screen_left = display_screen_left;
@@ -2788,6 +2793,10 @@ d3d12_reroute_stage_a_client(struct comp_d3d12_compositor *c, struct xrt_device 
 	si.app_timeline_semaphores = true;
 	si.ring_direct = true;
 	si.ring_direct_planes = true;
+	// #2518: ...and takes DIRECT by default on one adapter (render == scanout):
+	// the staged ring's per-frame app-queue copy stalled the #2362 drain on a
+	// same-adapter hybrid laptop. DXR_HUB_INGRESS=xbridge forces the bridge.
+	si.ring_direct_default = true;
 	si.render_packed_luid =
 	    ((uint64_t)(uint32_t)app_luid.HighPart << 32) | (uint64_t)(uint32_t)app_luid.LowPart;
 	si.preferred_width = c->settings.preferred.width;

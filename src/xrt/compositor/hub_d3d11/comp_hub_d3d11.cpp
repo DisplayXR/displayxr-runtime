@@ -170,6 +170,8 @@ struct comp_hub_d3d11
 	bool stable_atlas;
 	//! #2317 P2a: @ref comp_hub_d3d11_info::ring_direct.
 	bool ring_direct;
+	//! #2518: @ref comp_hub_d3d11_info::ring_direct_default.
+	bool ring_direct_default;
 	//! #2317 P2c: @ref comp_hub_d3d11_info::ring_direct_planes.
 	bool ring_direct_planes;
 	//! #2317 P1c: @ref comp_hub_d3d11_set_predicted_display_time.
@@ -1782,6 +1784,7 @@ split_stage_a_client(const struct comp_hub_d3d11_info *info,
 	s->same_adapter = true;
 	s->stable_atlas = info->stable_atlas;
 	s->ring_direct = info->ring_direct;
+	s->ring_direct_default = info->ring_direct_default;
 	s->ring_direct_planes = info->ring_direct_planes;
 	s->direct.cur = -1;
 
@@ -1966,6 +1969,7 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
 	s->same_adapter = gate.same_adapter;
 	s->stable_atlas = info->stable_atlas;
 	s->ring_direct = info->ring_direct;
+	s->ring_direct_default = info->ring_direct_default;
 	s->ring_direct_planes = info->ring_direct_planes;
 	s->direct.cur = -1;
 	wcsncpy_s(s->out_desc, sdesc.Description, _TRUNCATE);
@@ -2248,13 +2252,16 @@ comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11
 		s->ingress_reason = COMP_HUB_INGRESS_REASON_FORCED;
 	} else if (!s->stable_atlas && !s->ring_direct) {
 		s->ingress_reason = COMP_HUB_INGRESS_REASON_PRODUCER;
-	} else if (!s->stable_atlas && !split_direct_forced_on()) {
+	} else if (!s->stable_atlas && !s->ring_direct_default && !split_direct_forced_on()) {
 		/*
-		 * #2317: DIRECT is OPT-IN for the ring producers (the D3D12 reroute,
-		 * the VK split) until a single-dGPU desktop has run VK fence-mode
-		 * DIRECT and Unreal; the default flip is a one-line follow-up here.
-		 * The D3D11 shim's stable atlas keeps DIRECT: DXR_HUB=1 is itself the
-		 * opt-in, and that path is measured.
+		 * #2317: DIRECT is OPT-IN for a ring producer that does not declare
+		 * ring_direct_default (the VK split) until a single-dGPU desktop has
+		 * run VK fence-mode DIRECT. The D3D12 reroute declares it since #2518:
+		 * Unreal on a same-adapter hybrid laptop paid the staged ring's
+		 * app-queue copy on every frame (the #2362 drain blocked ~96 % of
+		 * frames and the weave picked the previous slot ~99 %), and DIRECT
+		 * removed both. The D3D11 shim's stable atlas keeps DIRECT: DXR_HUB=1
+		 * is itself the opt-in, and that path is measured.
 		 */
 		s->ingress_reason = COMP_HUB_INGRESS_REASON_DEFAULT_XBRIDGE;
 	} else if (split_wire_direct(s, handoff)) {
