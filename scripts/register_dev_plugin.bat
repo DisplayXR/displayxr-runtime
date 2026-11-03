@@ -17,7 +17,12 @@ REM Usage:
 REM   scripts\register_dev_plugin.bat                  :: register dev sim-display (fallback, no hardware)
 REM   scripts\register_dev_plugin.bat leia <dll>       :: register a dev-built Leia plug-in (ProbeOrder 50)
 REM   scripts\register_dev_plugin.bat unregister-sim   :: remove the dev sim-display entry
-REM   scripts\register_dev_plugin.bat input <dll>      :: register an INPUT provider (ADR-034), ProbeOrder 50
+REM   scripts\register_dev_plugin.bat input <dll> [id] :: register an INPUT provider (ADR-034), ProbeOrder 50.
+REM                                                       The row id must be the provider's DECLARED id
+REM                                                       (iface->id) -- it is what `displayxr-cli input
+REM                                                       set/enable/prefer` take. Known in-tree DLLs map
+REM                                                       to theirs (DisplayXR-Ultraleap -> ultraleap);
+REM                                                       pass [id] for any other, else the DLL basename.
 REM   scripts\register_dev_plugin.bat input sim        :: register the dev SIMULATED input provider
 REM                                                       (ProbeOrder 200). Synthetic controllers, NOT a
 REM                                                       product path -- it also needs DXR_SIM_INPUT=1 in
@@ -130,8 +135,17 @@ goto :list
 
 :input
 REM Register an input-provider plug-in (ADR-034 / #823). Pass a DLL path to
-REM register a vendor provider (uses the DLL basename minus extension as the
-REM id, ProbeOrder 50), or the literal `sim` for the freshly-built sim-input.
+REM register a vendor provider (ProbeOrder 50), or the literal `sim` for the
+REM freshly-built sim-input.
+REM
+REM The row id is the provider's DECLARED id: the CLI (`input set <id> ...`)
+REM writes settings under the row while the provider asks for them under its
+REM own id, so a row named after the DLL basename (`DisplayXR-Ultraleap`, the
+REM old behaviour) left `input set ultraleap` "not registered" and
+REM `input set DisplayXR-Ultraleap` written where the provider never looked
+REM (the loader now also falls back to the row, and WARNs on the mismatch).
+REM An optional third argument names the id; the in-tree providers are mapped
+REM here; anything else falls back to the basename.
 REM
 REM `sim` used to be the no-argument DEFAULT here. It is not any more: a
 REM leftover sim-input registration is exactly what puts phantom controllers
@@ -151,18 +165,25 @@ if "!DLL!"=="" (
 )
 if /I "!DLL!"=="sim" (
     set "DLL=!REPO!\_package\bin\plugins\DisplayXR-SimInput.dll"
+    set "IPID=sim-input"
     set "IPKEY=HKLM\Software\DisplayXR\InputProviders\sim-input"
     set "IPNAME=DisplayXR Sim Input"
     set "IPORDER=200"
     set "IPSIM=1"
 ) else if /I "!DLL!"=="gamepad" (
     set "DLL=!REPO!\_package\bin\plugins\DisplayXR-Gamepad.dll"
+    set "IPID=gamepad"
     set "IPKEY=HKLM\Software\DisplayXR\InputProviders\gamepad"
     set "IPNAME=DisplayXR Gamepad"
     set "IPORDER=150"
     set "IPSIM="
 ) else (
     for %%F in ("!DLL!") do set "IPID=%%~nF"
+    REM In-tree providers: the id each one declares, e.g. UL_PROVIDER_ID.
+    if /I "!IPID!"=="DisplayXR-Ultraleap" set "IPID=ultraleap"
+    if /I "!IPID!"=="DisplayXR-SimInput" set "IPID=sim-input"
+    if /I "!IPID!"=="DisplayXR-Gamepad" set "IPID=gamepad"
+    if defined ARG3 set "IPID=!ARG3!"
     set "IPKEY=HKLM\Software\DisplayXR\InputProviders\!IPID!"
     set "IPNAME=Input Provider (dev)"
     set "IPORDER=50"
@@ -175,7 +196,7 @@ if not exist "!DLL!" (
 reg add "!IPKEY!" /v Binary      /t REG_SZ    /d "!DLL!"      /f >nul || goto :regfail
 reg add "!IPKEY!" /v ProbeOrder  /t REG_DWORD /d !IPORDER!    /f >nul || goto :regfail
 reg add "!IPKEY!" /v DisplayName /t REG_SZ    /d "!IPNAME!"   /f >nul || goto :regfail
-echo Registered input provider (ProbeOrder !IPORDER!):
+echo Registered input provider '!IPID!' (ProbeOrder !IPORDER!):
 echo   !DLL!
 set "ALLOW_FILE=!DLL!"
 set "ALLOW_NOTE=input provider"

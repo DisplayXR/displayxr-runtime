@@ -276,10 +276,19 @@ input_host_get_display_geometry(struct xrt_input_host_display_geometry *inout)
  * process's environment, the per-user overlay, the row's `Settings\*` /
  * manifest `settings`. Never the provider's own getenv.
  */
+static const char *
+input_settings_fallback_row(const char *id);
+
 static bool
 input_host_get_setting(const char *id, const char *key, char *buf, uint32_t buf_size)
 {
-	return target_component_get_setting(&g_input_class, id, key, buf, buf_size, NULL);
+	if (target_component_get_setting(&g_input_class, id, key, buf, buf_size, NULL)) {
+		return true;
+	}
+	// Nothing under the provider's own id: its registration row, when that
+	// is named differently (see input_settings_fallback_row).
+	const char *row = input_settings_fallback_row(id);
+	return row != NULL && target_component_get_setting(&g_input_class, row, key, buf, buf_size, NULL);
 }
 
 /*
@@ -327,6 +336,52 @@ input_provider_by_id(const char *id)
 		}
 	}
 	return NULL;
+}
+
+/*!
+ * The row being loaded by @ref input_try_load_one (negotiate + probe), whose
+ * slot is not noted yet. Discovery is one pass on one thread.
+ */
+static const char *g_input_loading_row = NULL;
+
+/*!
+ * A provider asks for its settings with its OWN id (iface->id), but
+ * `displayxr-cli input set <id>` only accepts — and writes under — a
+ * REGISTRATION row id, as `Enabled` / `PreferredPlugin` do. Every
+ * installer-written row is named after the provider's id, so the two agree;
+ * a dev row named after the DLL (`register_dev_plugin.bat input
+ * …\DisplayXR-Ultraleap.dll` before it learnt the declared id) did not, and
+ * `input set DisplayXR-Ultraleap …` landed where the provider never looked.
+ *
+ * So when nothing is stored under @p id, the row is read too — but only when
+ * that row is unambiguous: exactly one resident row carries this iface id
+ * (two rows of one DLL share it, N3b, and must not read each other's
+ * settings), or, during negotiate / probe, the row being loaded. NULL = no
+ * distinct row to fall back to.
+ */
+static const char *
+input_settings_fallback_row(const char *id)
+{
+	if (id == NULL || id[0] == '\0') {
+		return NULL;
+	}
+	const char *row = NULL;
+	int matches = 0;
+	for (int p = 0; p < g_input_provider_count; p++) {
+		const struct input_provider_slot *slot = &g_input_providers[p];
+		if (slot->iface != NULL && slot->iface->id != NULL && strcmp(slot->iface->id, id) == 0) {
+			row = slot->row_id;
+			matches++;
+		}
+	}
+	if (matches == 0 && g_input_loading_row != NULL) {
+		row = g_input_loading_row;
+		matches = 1;
+	}
+	if (matches != 1 || row == NULL || strcmp(row, id) == 0) {
+		return NULL;
+	}
+	return row;
 }
 
 static xrt_result_t
@@ -567,9 +622,9 @@ target_input_plugin_get_host_iface(void)
  * XRT_ERROR_PROBER_NOT_SUPPORTED — as opposed to a load / ABI fault.
  */
 static const struct xrt_input_plugin_iface *
-input_try_load_one(struct target_component_entry *e,
-                   struct xrt_input_plugin_instance **out_inst,
-                   bool *out_declined)
+input_try_load_one_inner(struct target_component_entry *e,
+                         struct xrt_input_plugin_instance **out_inst,
+                         bool *out_declined)
 {
 	*out_inst = NULL;
 	*out_declined = false;
@@ -620,9 +675,26 @@ input_try_load_one(struct target_component_entry *e,
 	    "plugin_api=%u probe_order=%u path=%s",
 	    iface->id ? iface->id : e->id, iface->display_name ? iface->display_name : e->display_name,
 	    iface->vendor ? iface->vendor : e->vendor, e->version, plugin_version, e->probe_order, e->binary_path);
+	if (iface->id != NULL && strcmp(iface->id, e->id) != 0) {
+		U_LOG_W(
+		    "input plugin loader:   row '%s' holds provider id '%s': `displayxr-cli input set/enable/prefer` "
+		    "take the ROW id ('%s'); its settings are read under '%s' first, then '%s'. Register the row under "
+		    "'%s' to make the two agree.",
+		    e->id, iface->id, e->id, iface->id, e->id, iface->id);
+	}
 
 	/* Module handle intentionally leaked, same lifetime rule as the DP
 	 * loader — the devices' vtables live in the provider binary. */
+	return iface;
+}
+
+//! @ref input_try_load_one_inner with the row published to the settings slot for negotiate + probe.
+static const struct xrt_input_plugin_iface *
+input_try_load_one(struct target_component_entry *e, struct xrt_input_plugin_instance **out_inst, bool *out_declined)
+{
+	g_input_loading_row = e->id;
+	const struct xrt_input_plugin_iface *iface = input_try_load_one_inner(e, out_inst, out_declined);
+	g_input_loading_row = NULL;
 	return iface;
 }
 

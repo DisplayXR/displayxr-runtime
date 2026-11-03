@@ -121,6 +121,8 @@ add_library(
 	u_limited_unique_id.h
 	u_live_stats.cpp
 	u_live_stats.h
+	u_openxr_layers.c
+	u_openxr_layers.h
 	u_logging.c
 	u_logging.h
 	u_file_logging.c

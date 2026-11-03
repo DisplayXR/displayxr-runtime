@@ -38,6 +38,10 @@
 
 #include "util/u_logging.h"
 
+#include "util/u_logging.h"
+#include "util/u_openxr_layers.h"
+
+#include <stdbool.h>
 #include <stddef.h>
 
 
@@ -93,10 +97,34 @@ ul_plugin_display_height_m(void)
  *
  */
 
+/*!
+ * Ultraleap's own implicit OpenXR layer resets the Leap service to
+ * Head-mounted mode in every OpenXR app — this one too — which swaps the
+ * hands of a desk-mounted Leap. Nothing here can stop it; say so once per
+ * process, with the workaround. Windows only (the lookup is a no-op elsewhere).
+ */
+static void
+ul_plugin_warn_implicit_layer(void)
+{
+	static bool s_checked = false;
+	if (s_checked) {
+		return;
+	}
+	s_checked = true;
+	struct u_openxr_implicit_layer layer;
+	if (!u_openxr_implicit_layer_find(U_OPENXR_LAYER_ULTRALEAP_HAND_TRACKING, &layer) || !layer.active) {
+		return;
+	}
+	char advice[1024];
+	u_openxr_layer_ultraleap_advice(&layer, advice, sizeof(advice));
+	U_LOG_W("ultraleap: %s", advice);
+}
+
 static xrt_result_t
 ul_plugin_probe(struct xrt_input_plugin_instance **out_inst)
 {
 	*out_inst = NULL;
+	ul_plugin_warn_implicit_layer();
 	return XRT_SUCCESS;
 }
 
