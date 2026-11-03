@@ -625,6 +625,13 @@ client_loop(volatile struct ipc_client_state *ics)
 void
 ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_state *ics)
 {
+	// ADR-061: an app share of this session ends (SOURCE_LOST) and its tap is
+	// detached BEFORE the compositor it reads goes away.
+	if (ics->xs != NULL) {
+		ipc_server_stereo_camera_app_session_ending(ics);
+	}
+	ics->app_share_opt_out = false;
+
 	// Destroy the compositor BEFORE dropping our xscs swapchain
 	// references (#238). The compositor's destroy path runs under its
 	// own render_mutex (close-button fix in commit 30e5648a1) and

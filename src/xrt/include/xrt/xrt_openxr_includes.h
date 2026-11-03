@@ -90,5 +90,6 @@ typedef __eglMustCastToProperFunctionPointerType (*PFNEGLGETPROCADDRESSPROC)(con
 #include "openxr/XR_DXR_weave.h"
 #include "openxr/XR_DXR_lift.h"
 #include "openxr/XR_DXR_stereo_camera.h"
+#include "openxr/XR_DXR_app_share.h"
 #include "openxr/XR_DXR_desktop_control.h"
 #include "openxr/XR_DXR_input_providers.h"

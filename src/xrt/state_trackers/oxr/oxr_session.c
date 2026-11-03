@@ -7773,6 +7773,20 @@ oxr_session_create(struct oxr_logger *log,
 	xsi.rear_depth_budget_requested = sys->inst->extensions.DXR_depth_budget;
 #endif
 
+#ifdef OXR_HAVE_DXR_app_share
+	// XR_DXR_app_share spec §5: the app's own opt-out from every share. It
+	// travels on the session's IPC connection; an in-process session is never
+	// listed by the service in this build (the share link is P2).
+	if (sys->inst->extensions.DXR_app_share) {
+		const XrSessionShareabilityDXR *sh =
+		    OXR_GET_INPUT_FROM_CHAIN(createInfo, XR_TYPE_SESSION_SHAREABILITY_DXR, XrSessionShareabilityDXR);
+		if (sh != NULL && sh->shareable == XR_FALSE) {
+			xsi.app_share_not_shareable = true;
+			U_LOG_W("XR_DXR_app_share: this session opted out of app share (XrSessionShareabilityDXR)");
+		}
+	}
+#endif
+
 	U_LOG_W("xsi after parsing: external_window=%p, readback=%p, shared_tex=%p",
 	        xsi.external_window_handle, (void *)xsi.readback_callback, xsi.shared_texture_handle);
 

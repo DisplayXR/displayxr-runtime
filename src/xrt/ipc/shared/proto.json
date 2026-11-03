@@ -1345,7 +1345,17 @@
 		],
 		"out": [
 			{"name": "ready", "type": "bool"},
-			{"name": "frame", "type": "struct xrt_stereo_camera_frame_info"}
+			{"name": "frame", "type": "struct xrt_stereo_camera_frame_info"},
+			{"name": "app", "type": "struct xrt_app_share_frame_info"}
+		]
+	},
+
+	"stereo_camera_get_app_source": {
+		"in": [
+			{"name": "camera_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "info", "type": "struct xrt_app_share_source_info"}
 		]
 	},
 

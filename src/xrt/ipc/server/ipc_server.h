@@ -283,6 +283,13 @@ struct ipc_client_state
 	uint64_t stereo_camera_owner;
 
 	/*!
+	 * ADR-061: the session opted out of app share (XrSessionShareabilityDXR
+	 * shareable = XR_FALSE, xrt_session_info::app_share_not_shareable). Set at
+	 * session create; the camera manager never lists such a session.
+	 */
+	bool app_share_opt_out;
+
+	/*!
 	 * ADR-047 Amendment 7: this connection's session-level tracking state —
 	 * the OR over every DP presenting for it, debounced on a screen
 	 * hand-over (util/u_tracking_any.h). One for the eye query its
