@@ -1,6 +1,6 @@
 # ADR-049: In-process lift rides the service — one conversion module per machine, reached over a lift-only connection
 
-**Status:** Proposed (2026-10-08) · Phase 1 implemented (runtime routing) · **generalised by [ADR-053](ADR-053-conversion-providers.md) (Accepted 2026-10-12; recorded in its *Amendments* section, rules now in the [spec](../specs/extensions/XR_DXR_lift.md) §2.2, §4.5 and §5.4):** the lift-only connection applies to every in-process session on every graphics API, and both follow-ups (submit-side fence, lift adapter LUID) are resolved by lift spec 4 · extends
+**Status:** Proposed (2026-10-08) · Phase 1 implemented (runtime routing) · **Amendment 1** (2026-11-03): the lift link becomes the per-session service link of [ADR-061](ADR-061-3d-screen-share.md) · **generalised by [ADR-053](ADR-053-conversion-providers.md) (Accepted 2026-10-12; recorded in its *Amendments* section, rules now in the [spec](../specs/extensions/XR_DXR_lift.md) §2.2, §4.5 and §5.4):** the lift-only connection applies to every in-process session on every graphics API, and both follow-ups (submit-side fence, lift adapter LUID) are resolved by lift spec 4 · extends
 [ADR-042](ADR-042-vendor-2d3d-conversion-supersedes-default.md) ·
 spec: [XR_DXR_lift.md](../specs/extensions/XR_DXR_lift.md) §2, §5.3, §10 · issue #1862, epic #1858
 
@@ -194,3 +194,23 @@ far more than the sub-millisecond IPC hop A and B save, and C needs nothing from
   costs the provider its zero-copy D3D12 swapchain and the in-process compositor it is built
   around; lift should not decide how an app renders.
 - **Reuse the session's compositor connection.** An in-process session has none.
+
+## Amendment 1 (2026-11-03, ADR-061) — the lift link becomes one service link per in-process session
+
+[ADR-061](ADR-061-3d-screen-share.md) (3D screen share) needs the same thing this ADR built for
+lift — a sessionless connection from an in-process session to the service — to offer the
+session's pre-weave views as a share source. Two such connections per session would spend two
+`APP` slots on one app. So `ipc_client_lift_link` is generalised into **`ipc_client_service_link`**
+(ADR-061 decision 16):
+
+- **One connection per in-process session**, named `<exe> (in-process)` (was
+  `<exe> (in-process lift)`), declaring its capabilities at registration: `{lift}`, `{share}` or
+  both. The service treats a link without `share` exactly as it treated the lift link.
+- **Lift behaviour is unchanged.** Decisions 1–6 above hold as written — routing in `oxr_lift.c`,
+  `ACTIVATING` / `UNAVAILABLE` states, the 6 s wait in `xrCreateLiftStreamDXR`, the 5 s retry,
+  "connection loss never loses the session", the D3D12 result and input rules.
+- **What changes:** when sharing is on (the default; `DXR_APP_SHARE=0` turns it off), the link is
+  opened at `xrBeginSession` rather than at the session's first lift call, and a later lift call
+  finds it already connected. With sharing off, it opens on the first lift call, as before.
+- Consequence "an extra sessionless `APP` connection per lifting in-process session" now reads
+  "per in-process session that lifts **or** shares" — still one, never two.
