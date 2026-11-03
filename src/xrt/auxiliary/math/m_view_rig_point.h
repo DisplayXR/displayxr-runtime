@@ -101,16 +101,46 @@ struct m_view_rig
 	float virtual_display_height; //!< app units; m2v = this / canvas height
 	float perspective_factor;
 	// Camera rig.
-	float m2v;                      //!< meters -> world units (<= 0 treated as 1)
-	float inv_convergence_distance; //!< frustum only: does not move a point
-	float half_tan_vfov;            //!< frustum only: does not move a point
+	float m2v;                      //!< meters -> world units (<= 0 treated as 1); eyes only
+	float inv_convergence_distance; //!< 1 / convergence distance (world units): where the glass lands
+	float half_tan_vfov;            //!< tan(vFOV/2): sizes the virtual screen at the glass
 };
 
 /*!
- * Canvas frame -> rig frame for ONE point: the shared core's eye mapping for an
- * eye at @p p_canvas with the eye-pair factors (ipd, parallax) neutral —
- * `dxr_xrt_display3d_compute_views` / `dxr_xrt_camera3d_compute_views` with a
- * count of one. So a point maps exactly as an eye there would.
+ * Where a camera rig puts the physical glass (XR_DXR_view_rig spec 5): the
+ * camera rig's own virtual screen, from the shared core's camera -> display conversion
+ * (`dxr_view_rig_camera_to_display`, the one rig toggles use) — the plane at
+ * `pose` moved `1 / inv_convergence_distance` along the camera's forward axis
+ * (zero parallax), height `V = 2 half_tan_vfov / inv_convergence_distance`.
+ * @p out_scale = V / canvas height: the metres -> rig-units factor a point at
+ * the glass gets, so a hand on the glass lands on the pixel the viewer sees
+ * it over. False when @p rig is not a camera rig, the convergence is at
+ * infinity (inv_convergence_distance <= 0) or the canvas is degenerate; the
+ * camera rig then keeps the viewer-relative mapping (x metersToVirtual about
+ * the nominal viewer plane).
+ */
+bool
+m_view_rig_camera_glass(const struct m_view_rig_canvas *canvas,
+                        const struct m_view_rig *rig,
+                        struct xrt_pose *out_glass_pose,
+                        float *out_scale);
+
+/*!
+ * Canvas frame -> rig frame for ONE point.
+ *
+ * Display rig: the shared core's eye mapping for an eye at @p p_canvas with the
+ * eye-pair factors (ipd, parallax) neutral — `dxr_xrt_display3d_compute_views`
+ * with a count of one, so a point maps exactly as an eye there would.
+ *
+ * Camera rig (spec 5): the same display-core mapping for the camera rig's
+ * glass (@ref m_view_rig_camera_glass) with perspectiveFactor 1 — the glass lands
+ * on the convergence plane, scaled by virtual screen height / canvas height,
+ * exactly as a display rig's glass lands on its plane. (Before spec 5 a camera
+ * rig mapped a point as an eye — x metersToVirtual about the nominal viewer —
+ * which put the glass a nominal viewer distance in front of the camera at
+ * metric scale, not at zero parallax; that remains the fallback when the
+ * convergence is at infinity.)
+ *
  * M_VIEW_RIG_NONE copies the point.
  */
 void
@@ -122,7 +152,9 @@ m_view_rig_map_canvas_point(const struct m_view_rig_canvas *canvas,
 /*!
  * The uniform length scale the rig applies to a point (radii, linear
  * velocities): display rig `perspectiveFactor x virtualDisplayHeight / canvas
- * height`, camera rig `metersToVirtual` (<= 0 = 1). 1 for NONE.
+ * height`, camera rig its virtual screen height / canvas height
+ * (@ref m_view_rig_camera_glass; `metersToVirtual`, <= 0 = 1, when the
+ * convergence is at infinity). 1 for NONE.
  */
 float
 m_view_rig_length_scale(const struct m_view_rig_canvas *canvas, const struct m_view_rig *rig);

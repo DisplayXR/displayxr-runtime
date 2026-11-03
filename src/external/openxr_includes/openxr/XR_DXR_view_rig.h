@@ -45,12 +45,16 @@
  * returns the joints in the rig frame — exactly the transform the views get for
  * that descriptor: display rig: display-space metres -> app units by
  * virtualDisplayHeight / the session's resolved canvas height, times
- * perspectiveFactor, placed at the rig pose; camera rig: metersToVirtual about
- * the nominal viewer plane, placed at the camera pose. Joint radii and linear
+ * perspectiveFactor, placed at the rig pose; camera rig (spec 5): the glass
+ * lands on the convergence plane, 1 / convergenceDiopters in front of the
+ * camera (zero parallax), scaled by the camera's virtual screen height there,
+ * 2 tan(verticalFov / 2) / convergenceDiopters, over the canvas height — so a
+ * hand on the glass sits on the pixel it covers, as under a display rig (spec
+ * 4 used metersToVirtual about the nominal viewer plane; that remains the
+ * mapping when convergenceDiopters is 0). Joint radii and linear
  * velocities scale by the same factor; orientations and angular velocities are
  * rotated into the rig frame. The eye-pair tunables (ipdFactor, parallaxFactor)
- * and the camera frustum (convergence, vertical FOV) do not move a point and do
- * not apply. The canvas is the one the session's most recent xrLocateViews
+ * do not move a point and do not apply. The canvas is the one the session's most recent xrLocateViews
  * resolved (in service mode, the one the service resolved for it), so joints
  * are consistent with the latest views; chain the same descriptor on both. The
  * rig pose is taken in XrHandJointsLocateInfoEXT::baseSpace. A locate that
@@ -75,7 +79,12 @@ extern "C" {
 #define XR_DXR_view_rig 1
 // Spec 4 (#2189): the rig descriptors are also valid on
 // XrHandJointsLocateInfoEXT::next — joints are returned in the rig frame.
-#define XR_DXR_view_rig_SPEC_VERSION 4
+// Spec 5: under an XrCameraRigDXR those joints put the physical glass on the
+// convergence plane (zero parallax), scaled by the camera's virtual screen
+// height / canvas height — as a display rig puts it on its plane. Spec 4
+// runtimes mapped camera-rig joints about the nominal viewer at
+// metersToVirtual scale; display-rig joints are unchanged.
+#define XR_DXR_view_rig_SPEC_VERSION 5
 #define XR_DXR_VIEW_RIG_EXTENSION_NAME "XR_DXR_view_rig"
 
 // Reserved 1004999xxx range, next free block after mcp_tools (…130-132).
