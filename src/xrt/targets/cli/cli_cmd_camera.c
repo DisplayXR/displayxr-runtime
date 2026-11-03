@@ -40,8 +40,23 @@
  *                                                concatenated .mjpeg stream) through the identical
  *                                                webcam decode / readback / split path, no camera
  *
- * `list` prints each camera's source: "plugin" (the display plug-in's slots) or
- * "uvc" (the service's own side-by-side webcam source; Amendment 4).
+ * `list` prints each camera's source: "plugin" (the display plug-in's slots),
+ * "uvc" (the service's own side-by-side webcam source; Amendment 4), "app" or
+ * "app-link" (ADR-061: a running app's pre-weave views — XR_DXR_app_share; the
+ * CLI declares it, so it sees app entries like an extension-enabled consumer).
+ *
+ * ADR-061 aliases (`displayxr-cli share ...`):
+ *   share list [--json]                          `camera list` restricted to app entries,
+ *                                                plus each app's XR_DXR_app_share description
+ *   share probe [<id>] [--frames N] [--seconds S] [--out DIR]
+ *                                                `camera probe` of an app entry (the first one
+ *                                                when no id): RECTIFIED NV12, rate, disparity,
+ *                                                and the frame metadata — zeroDisparityShiftFrac
+ *                                                must be 0 (spec v1; exit 5 otherwise). On the
+ *                                                DXR_APP_SHARE_FAKE source it also measures the
+ *                                                zero-disparity band (|d| <= 0.5 px)
+ *   share settings [prompt always|per-app-run] [resolution 720p|1080p]
+ *                                                LOCAL: the per-user share.* settings (no service)
  *
  * `list` / `calib` / `probe` connect as the CAMERA_CONSUMER class (ADR-043 R3)
  * — the same class a browser's video-capture utility declares — so the CLI
@@ -94,6 +109,7 @@
 #include "util/u_logging.h"
 #include "util/u_stereo_camera.h"
 #include "util/u_stereo_uvc.h"
+#include "util/u_app_share_fake.h"
 #include "os/os_uvc_capture.h"
 
 #include "client/ipc_client_connection.h"
@@ -173,6 +189,7 @@ flags_str(uint64_t f, char *out, size_t cap)
 	    {XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED, "NATIVELY_RECTIFIED"},
 	    {XRT_PLUGIN_STEREO_CAMERA_MONOCHROME, "MONOCHROME"},
 	    {XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE, "RECTIFIABLE"},
+	    {XRT_STEREO_CAMERA_APP_CONTENT, "APP_CONTENT"},
 	};
 	for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
 		if (f & k[i].bit) {
@@ -223,7 +240,9 @@ cam_connect(struct ipc_connection *ipc_c, uint32_t client_class, uint64_t client
 	struct xrt_instance_info ii = {0};
 	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
 	ii.app_info.declared_client_class = client_class;
-	ii.app_info.stereo_camera_client_flags = client_flags;
+	// ADR-061: the CLI is an XR_DXR_app_share consumer too (`camera list` tags
+	// app entries, `share list|probe` addresses them).
+	ii.app_info.stereo_camera_client_flags = client_flags | XRT_STEREO_CAMERA_CLIENT_INTERNAL_APP_SHARE;
 	xrt_result_t xret = cli_ipc_connect(ipc_c, U_LOGGING_ERROR, &ii);
 	if (xret != XRT_SUCCESS) {
 		printf("displayxr-cli camera: not connected to the service (xrt_result=%d).\n", (int)xret);
@@ -263,8 +282,43 @@ cam_sharing_is_off(void)
  *
  */
 
+static const char *
+cam_source_str(uint32_t source)
+{
+	switch (source) {
+	case XRT_STEREO_CAMERA_SOURCE_UVC: return "uvc";
+	case XRT_STEREO_CAMERA_SOURCE_APP: return "app";
+	case XRT_STEREO_CAMERA_SOURCE_APP_LINK: return "app-link";
+	default: return "plugin";
+	}
+}
+
+static const char *
+availability_str(uint32_t a)
+{
+	switch (a) {
+	case XRT_APP_SHARE_AVAILABLE: return "available";
+	case XRT_APP_SHARE_UNAVAILABLE_NO_TAP: return "no share tap on this platform";
+	case XRT_APP_SHARE_UNAVAILABLE_EXITED: return "app exited";
+	case XRT_APP_SHARE_UNAVAILABLE_NO_COMPOSITOR: return "no projection compositor to tap";
+	case XRT_APP_SHARE_UNAVAILABLE_UNSUPPORTED_API: return "graphics API has no tap";
+	case XRT_APP_SHARE_UNAVAILABLE_SHARED_TEXTURE: return "shared-texture session (needs DXR_HUB=1)";
+	case XRT_APP_SHARE_UNAVAILABLE_SPLIT_DISABLED: return "split kill-switched";
+	case XRT_APP_SHARE_UNAVAILABLE_LEGACY_STANDALONE: return "DXR_LEGACY_STANDALONE";
+	case XRT_APP_SHARE_UNAVAILABLE_OTHER_ADAPTER: return "renders on another adapter";
+	case XRT_APP_SHARE_UNAVAILABLE_LINK_NOT_READY: return "in-process service link not ready";
+	default: return "unavailable";
+	}
+}
+
+static bool
+source_is_app(uint32_t source)
+{
+	return source == XRT_STEREO_CAMERA_SOURCE_APP || source == XRT_STEREO_CAMERA_SOURCE_APP_LINK;
+}
+
 static int
-cmd_list(struct ipc_connection *ipc_c, bool json)
+cmd_list(struct ipc_connection *ipc_c, bool json, bool apps_only)
 {
 	uint32_t n = 0;
 	xrt_result_t xret = ipc_client_stereo_camera_count(ipc_c, &n);
@@ -272,21 +326,26 @@ cmd_list(struct ipc_connection *ipc_c, bool json)
 		printf("stereo_camera_count failed: %d%s\n", (int)xret, result_hint(xret));
 		return 2;
 	}
+	uint32_t shown = 0;
 	if (json) {
 		printf("{\"cameras\": [");
-	} else {
-		printf("%u stereo camera(s)\n", n);
+	} else if (!apps_only) {
+		printf("%u stereo camera(s) (app entries included)\n", n);
 	}
 	for (uint32_t i = 0; i < n; i++) {
 		struct xrt_stereo_camera_properties p;
 		xret = ipc_client_stereo_camera_get_properties(ipc_c, i, &p);
-		if (xret != XRT_SUCCESS) {
+		if (xret != XRT_SUCCESS || (apps_only && !source_is_app(p.source))) {
 			continue;
 		}
+		const bool is_app = source_is_app(p.source);
+		struct xrt_app_share_source_info ai;
+		memset(&ai, 0, sizeof(ai));
+		const bool have_ai = is_app && ipc_client_stereo_camera_get_app_source(ipc_c, p.camera_id, &ai) == XRT_SUCCESS;
 		char flags[160];
 		flags_str(p.flags, flags, sizeof(flags));
 		// Amendment 4: which source the service reads it from ("plugin" / "uvc").
-		const char *source = p.source == XRT_STEREO_CAMERA_SOURCE_UVC ? "uvc" : "plugin";
+		const char *source = cam_source_str(p.source);
 		// A device id (Windows symbolic link) carries backslashes: JSON-escape them.
 		char hint[2 * sizeof(p.platform_device_hint)];
 		size_t hn = 0;
@@ -311,11 +370,23 @@ cmd_list(struct ipc_connection *ipc_c, bool json)
 			    "\"flags\": \"%s\", \"viewCount\": %u, \"eyeWidth\": %u, \"eyeHeight\": %u, "
 			    "\"maxFrameRate\": %.2f, \"baselineMm\": %.2f, \"horizontalFovDeg\": %.2f, "
 			    "\"formats\": \"0x%llx\", \"transports\": \"0x%llx\", \"platformDeviceHint\": \"%s\", "
-			    "\"displayId\": \"%s\", \"frameOrientationDeg\": %s}",
-			    i ? ", " : "", (unsigned long long)p.camera_id, p.display_name, source, p.persistent_id,
+			    "\"displayId\": \"%s\", \"frameOrientationDeg\": %s",
+			    shown ? ", " : "", (unsigned long long)p.camera_id, p.display_name, source, p.persistent_id,
 			    state_str(p.state), flags, p.view_count, p.eye_width, p.eye_height, p.max_frame_rate,
 			    p.baseline_mm, p.horizontal_fov_deg, (unsigned long long)p.supported_formats,
 			    (unsigned long long)p.supported_transports, hint, disp, orient_known ? orient : "null");
+			if (have_ai) {
+				printf(", \"app\": {\"pid\": %llu, \"executable\": \"%s\", \"applicationName\": \"%s\", "
+				       "\"instance\": %u, \"availability\": \"%s\", \"window\": [%d, %d, %u, %u], "
+				       "\"contentEye\": [%u, %u], \"viewCount\": %u, \"activeViewCount\": %u, "
+				       "\"zeroDisparityShiftFrac\": %.4f, \"encodingIsLinear\": %s}",
+				       (unsigned long long)ai.pid, ai.executable_name, ai.application_name,
+				       ai.instance_ordinal, availability_str(ai.availability), ai.window_x, ai.window_y,
+				       ai.window_width, ai.window_height, ai.content_eye_width, ai.content_eye_height,
+				       ai.view_count, ai.active_view_count, ai.zero_disparity_shift_frac,
+				       ai.encoding_is_linear ? "true" : "false");
+			}
+			printf("}");
 		} else {
 			printf("  [%llu] \"%s\"  %s  (source: %s)\n", (unsigned long long)p.camera_id, p.display_name,
 			       state_str(p.state), source);
@@ -348,7 +419,22 @@ cmd_list(struct ipc_connection *ipc_c, bool json)
 			printf("       formats      0x%llx  transports 0x%llx  platform hint \"%s\"\n",
 			       (unsigned long long)p.supported_formats, (unsigned long long)p.supported_transports,
 			       p.platform_device_hint);
+			if (have_ai) {
+				printf("       app          %s (pid %llu, copy #%u) \"%s\" — %s\n", ai.executable_name,
+				       (unsigned long long)ai.pid, ai.instance_ordinal, ai.application_name,
+				       availability_str(ai.availability));
+				printf("       app views    %u (active %u), content %ux%u per view, window %d,%d %ux%u, "
+				       "zero-disparity shift %.4f, %s source\n",
+				       ai.view_count, ai.active_view_count, ai.content_eye_width, ai.content_eye_height,
+				       ai.window_x, ai.window_y, ai.window_width, ai.window_height,
+				       ai.zero_disparity_shift_frac, ai.encoding_is_linear ? "LINEAR" : "encoded");
+			}
 		}
+		shown++;
+	}
+	if (apps_only && !json) {
+		printf("%u app share source(s)%s\n", shown,
+		       shown == 0 ? " — no shareable app is running (or the service lists none: DXR_APP_SHARE=0)" : "");
 	}
 	if (json) {
 		printf("]}\n");
@@ -711,8 +797,39 @@ measure_rows(const uint8_t *gray,
 	out->modes = out->mode_count[1] > 0 ? 2 : 1;
 }
 
+/*!
+ * ADR-061: |disparity| (px) in the DXR_APP_SHARE_FAKE zero-disparity band of
+ * a GRAY8 SBS frame — the median of a row of blocks inside the band. false =
+ * the band is too small to measure.
+ */
+static bool
+measure_fake_band(const uint8_t *gray, uint32_t pitch, uint32_t eye_w, uint32_t h, float *out_abs_d)
+{
+	uint32_t y0 = 0, y1 = 0;
+	u_app_share_fake_band(h, &y0, &y1);
+	const uint32_t bh = 16;
+	if (y1 < y0 + bh + 6) {
+		return false;
+	}
+	const uint32_t by = y0 + (y1 - y0 - bh) / 2;
+	float v[64];
+	int n = 0;
+	for (uint32_t bx = 16; bx + 32 + 16 < eye_w && n < 64; bx += 48) {
+		float dx = 0.0f, dy = 0.0f;
+		if (u_stereo_camera_estimate_offset(gray, pitch, eye_w, h, bx, by, 32, bh, 8, 2, &dx, &dy)) {
+			v[n++] = dx < 0.0f ? -dx : dx;
+		}
+	}
+	if (n == 0) {
+		return false;
+	}
+	qsort(v, (size_t)n, sizeof(v[0]), cmp_float);
+	*out_abs_d = v[n / 2];
+	return true;
+}
+
 static int
-cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
+cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv, bool apps_only)
 {
 	uint64_t id = 0;
 	uint32_t output = XRT_STEREO_CAMERA_OUTPUT_RECTIFIED;
@@ -763,10 +880,14 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 		if (ipc_client_stereo_camera_count(ipc_c, &n) == XRT_SUCCESS) {
 			for (uint32_t i = 0; i < n && !found; i++) {
 				if (ipc_client_stereo_camera_get_properties(ipc_c, i, &props) == XRT_SUCCESS &&
-				    (id == 0 || props.camera_id == id)) {
+				    (id == 0 || props.camera_id == id) && (!apps_only || source_is_app(props.source))) {
 					found = true;
 				}
 			}
+		}
+		if (!found && id == 0 && apps_only) {
+			printf("share probe: no app share source is listed (no shareable app running?).\n");
+			return 3;
 		}
 		if (!found && id == 0) {
 			if (cam_sharing_is_off()) {
@@ -840,6 +961,12 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 	int64_t t_first = 0, t_last = 0;
 	struct xrt_stereo_camera_frame_info last;
 	memset(&last, 0, sizeof(last));
+	// ADR-061: an app entry's per-frame metadata (valid = 0 for a camera).
+	const bool is_app = source_is_app(props.source);
+	struct xrt_app_share_frame_info last_app, first_app;
+	memset(&last_app, 0, sizeof(last_app));
+	memset(&first_app, 0, sizeof(first_app));
+	uint32_t generations = 0;
 	while ((seconds > 0.0f || got < frames) && os_monotonic_get_ns() < deadline && !ended) {
 		// R3: the service's events (state changes, a stream it ended) are
 		// polled like xrPollEvent would; printed with the time since start.
@@ -874,7 +1001,8 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 		wakes++;
 		bool ready = false;
 		struct xrt_stereo_camera_frame_info fi;
-		xret = ipc_client_stereo_camera_acquire(ipc_c, sid, &ready, &fi, NULL);
+		struct xrt_app_share_frame_info afi;
+		xret = ipc_client_stereo_camera_acquire(ipc_c, sid, &ready, &fi, &afi);
 		if (xret == XRT_ERROR_STEREO_CAMERA_STREAM_ENDED) {
 			printf("acquire: %d%s\n", (int)xret, result_hint(xret));
 			ended = true;
@@ -898,6 +1026,15 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 		last_index = fi.frame_index;
 		t_last = now;
 		last = fi;
+		if (afi.valid) {
+			if (got == 0) {
+				first_app = afi;
+			}
+			if (got > 0 && afi.content_generation != last_app.content_generation) {
+				generations++;
+			}
+			last_app = afi;
+		}
 		got++;
 	}
 	// One last drain: a stream the service ended queued its STREAM_ENDED event
@@ -931,6 +1068,22 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 	    not_ready, events, ended ? " — STREAM ENDED BY THE SERVICE" : "");
 	printf("measured delivery rate: %.2f Hz over %.2f s\n", rate, span);
 
+	bool app_ok = true;
+	if (got > 0 && is_app) {
+		// ADR-061 spec §4: the frame metadata.
+		printf(
+		    "app frame metadata: %s — content %d,%d %ux%u per eye, mono %s, generation %u (%u change(s) seen), "
+		    "zeroDisparityShiftFrac %.4f, commit -> acquire %.2f ms\n",
+		    last_app.valid ? "present" : "MISSING", last_app.content_x, last_app.content_y,
+		    last_app.content_width, last_app.content_height, last_app.mono ? "yes" : "no",
+		    last_app.content_generation, generations, last_app.zero_disparity_shift_frac,
+		    last_app.commit_time_ns > 0 ? (double)(t_last - last_app.commit_time_ns) * 1e-6 : 0.0);
+		(void)first_app;
+		const float zs = last_app.zero_disparity_shift_frac;
+		app_ok = last_app.valid && (zs < 0 ? -zs : zs) < 1e-6f;
+		printf("zero-disparity plane (metadata): %s — spec v1 frames are display-referred (shift 0)\n",
+		       app_ok ? "PASS" : "FAIL");
+	}
 	if (got > 0) {
 		const uint8_t *slot = map.ptr + (uint64_t)last.slot * lay.slot_stride;
 		printf(
@@ -950,6 +1103,21 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 		if (gray != NULL &&
 		    u_stereo_camera_convert(last.format, src, last.row_pitch, XRT_STEREO_CAMERA_FORMAT_GRAY8, gray, &gl,
 		                            last.width, last.height)) {
+			if (is_app) {
+				struct xrt_app_share_source_info ai;
+				float band = 0.0f;
+				if (ipc_client_stereo_camera_get_app_source(ipc_c, id, &ai) == XRT_SUCCESS &&
+				    strcmp(ai.executable_name, "displayxr-app-share-fake") == 0) {
+					if (measure_fake_band(gray, gl.pitch[0], last.width / 2, last.height, &band)) {
+						const bool band_ok = band <= 0.5f;
+						app_ok = app_ok && band_ok;
+						printf("zero-disparity band (DXR_APP_SHARE_FAKE): |d| median %.3f px — %s\n", band,
+						       band_ok ? "PASS (<= 0.5 px)" : "FAIL");
+					} else {
+						printf("zero-disparity band (DXR_APP_SHARE_FAKE): too small to measure\n");
+					}
+				}
+			}
 			char disp[256];
 			rp.max_d = max_d_arg > 0 ? max_d_arg : probe_max_disparity(&props, last.width / 2);
 			report_disparity(gray, gl.pitch[0], last.width / 2, last.height, rp.max_d, disp, sizeof(disp));
@@ -1085,6 +1253,10 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 	}
 	if (got == 0) {
 		return 9;
+	}
+	if (is_app && !app_ok) {
+		printf("share probe: FAIL — the frames are not display-referred as spec v1 requires\n");
+		return 5;
 	}
 	if (require_rectified) {
 		if (last.output != XRT_STEREO_CAMERA_OUTPUT_RECTIFIED) {
@@ -1770,17 +1942,67 @@ cli_cmd_camera(int argc, const char **argv)
 	}
 	int ret;
 	if (strcmp(sub, "list") == 0) {
-		ret = cmd_list(&ipc_c, json);
+		ret = cmd_list(&ipc_c, json, false);
 	} else if (strcmp(sub, "calib") == 0 && argc >= 4) {
 		uint32_t output = cli_has_flag(argc, argv, "--rectified") ? XRT_STEREO_CAMERA_OUTPUT_RECTIFIED
 		                                                          : XRT_STEREO_CAMERA_OUTPUT_RAW;
 		ret = cmd_calib(&ipc_c, strtoull(argv[3], NULL, 10), output, json);
 	} else if (strcmp(sub, "probe") == 0) {
-		ret = cmd_probe(&ipc_c, argc, argv);
+		ret = cmd_probe(&ipc_c, argc, argv, false);
 	} else {
 		usage();
 		ret = 1;
 	}
+	ipc_client_connection_fini(&ipc_c);
+	return ret;
+}
+
+static void
+share_settings_print(void)
+{
+	struct u_app_share_settings st;
+	u_app_share_settings_load(&st);
+	char path[1024] = "";
+	(void)u_camera_consent_store_path(path, sizeof(path));
+	printf("share.prompt     %s\nshare.resolution %s\n(per-user consent store, namespace \"share\"%s%s)\n",
+	       u_app_share_prompt_mode_str(st.prompt), u_app_share_resolution_str(st.resolution), path[0] ? ": " : "",
+	       path);
+}
+
+/*!
+ * ADR-061: `displayxr-cli share list|probe|settings` — aliases of `camera
+ * list|probe` restricted to app entries, plus the local share.* settings.
+ */
+int
+cli_cmd_share(int argc, const char **argv)
+{
+	const char *sub = argc >= 3 ? argv[2] : "list";
+	if (strcmp(sub, "settings") == 0) {
+		for (int i = 3; i + 1 < argc; i += 2) {
+			if (!u_app_share_settings_set(argv[i], argv[i + 1])) {
+				printf("share settings: cannot set %s = %s (prompt always|per-app-run, resolution "
+				       "720p|1080p)\n",
+				       argv[i], argv[i + 1]);
+				return 1;
+			}
+			printf("share.%s = %s\n", argv[i], argv[i + 1]);
+		}
+		share_settings_print();
+		return 0;
+	}
+	if (strcmp(sub, "list") != 0 && strcmp(sub, "probe") != 0) {
+		printf(
+		    "usage: displayxr-cli share list [--json]\n"
+		    "       displayxr-cli share probe [<id>] [--frames N] [--seconds S] [--out DIR]\n"
+		    "       displayxr-cli share settings [prompt always|per-app-run] [resolution 720p|1080p]\n");
+		return 1;
+	}
+	struct ipc_connection ipc_c = {0};
+	if (!cam_connect(&ipc_c, XRT_CLIENT_CLASS_CAMERA_CONSUMER, XRT_STEREO_CAMERA_CLIENT_CONSUMER_ONLY)) {
+		return 2;
+	}
+	int ret = strcmp(sub, "list") == 0 ? cmd_list(&ipc_c, cli_has_flag(argc, argv, "--json"), true)
+	                                   : cmd_probe(&ipc_c, argc, argv, true);
 	ipc_client_connection_fini(&ipc_c);
 	return ret;
 }
@@ -1795,6 +2017,15 @@ cli_cmd_camera(int argc, const char **argv)
 	(void)argc;
 	(void)argv;
 	printf("displayxr-cli camera: this build has no IPC client (XRT_FEATURE_SERVICE off).\n");
+	return 1;
+}
+
+int
+cli_cmd_share(int argc, const char **argv)
+{
+	(void)argc;
+	(void)argv;
+	printf("displayxr-cli share: this build has no IPC client (XRT_FEATURE_SERVICE off).\n");
 	return 1;
 }
 
