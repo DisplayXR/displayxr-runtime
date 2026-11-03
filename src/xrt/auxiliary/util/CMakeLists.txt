@@ -51,6 +51,8 @@ add_library(
 	u_builders.h
 	u_capture_dims.c
 	u_capture_dims.h
+	u_app_share_fake.c
+	u_app_share_fake.h
 	u_camera_consent.c
 	u_camera_consent.h
 	u_camera_consent_android.c
