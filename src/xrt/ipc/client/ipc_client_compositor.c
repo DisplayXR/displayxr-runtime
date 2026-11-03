@@ -593,6 +593,37 @@ comp_ipc_client_system_compositor_get_predicted_eye_positions(struct xrt_system_
 }
 
 /*
+ * XR_DXR_display_info v25 (XrViewLocateFixedViewerDXR): the service frames
+ * this client's views and hosts the viewer-tracking provider, so the hint has
+ * to cross the wire. Same gating contracts as the eye-position pair above.
+ */
+bool
+comp_ipc_client_compositor_set_fixed_viewer(struct xrt_compositor *xc, bool fixed)
+{
+	if (xc == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return false;
+	}
+	return ipc_call_compositor_set_fixed_viewer(icc->ipc_c, fixed) == XRT_SUCCESS;
+}
+
+bool
+comp_ipc_client_system_compositor_set_fixed_viewer(struct xrt_system_compositor *xsysc, bool fixed)
+{
+	if (xsysc == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = container_of(xsysc, struct ipc_client_compositor, system);
+	if (icc->ipc_c == NULL) {
+		return false;
+	}
+	return ipc_call_compositor_set_fixed_viewer(icc->ipc_c, fixed) == XRT_SUCCESS;
+}
+
+/*
  * Phase 2 — workspace_sync_fence bridges (D3D11 client compositor only).
  * Same gating contract: only safe to call when `xc` is an ipc_client_compositor.
  *

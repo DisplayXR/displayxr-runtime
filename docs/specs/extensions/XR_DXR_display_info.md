@@ -1403,6 +1403,74 @@ compositor that segments today. IPC/service sessions never segment: their tables
 always one set, `bindingCountOutput` 0. The rendering mode is session-wide, so every
 segment carries the same view count.
 
+### Fixed-viewer locates — `XrViewLocateFixedViewerDXR` (v25)
+
+```c
+#define XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR ((XrStructureType)1004999430)
+
+typedef struct XrViewLocateFixedViewerDXR {
+    XrStructureType             type;        // XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR
+    const void* XR_MAY_ALIAS    next;
+    XrBool32                    fixedViewer; // XR_TRUE = locate for the nominal viewer; ask for no viewer
+} XrViewLocateFixedViewerDXR;
+```
+
+Chained on `XrViewLocateInfo::next` at `xrLocateViews`. It tells the runtime that what this
+locate's views will render **does not depend on where the viewer is** — a flat or stereo video,
+a stereo photo: the picture is the same whoever looks.
+
+Every app calls `xrLocateViews`, so the runtime cannot infer this; it has to be said. Saying
+it matters because asking for a viewer is not free. On a display that does not track the
+viewer itself (sim_display, a passive lenticular or barrier panel) with a viewer-tracking
+provider enabled (ADR-054 N6: `sim-tracking` with `SOURCE=webcam`, an open camera tracker),
+the provider starts on the first locate that asks for a viewer and opens its camera. A video
+player that never chains this struct turns the webcam on just to play a movie.
+
+**Semantics (per call).** With `fixedViewer = XR_TRUE`, that one call:
+
+- locates the views for the display's **nominal viewer** — the eye set straight in front of
+  the display centre at its nominal distance (`XrDisplayInfoDXR::nominalViewerPositionInDisplaySpace`'s
+  z), one IPD apart, exactly what an untracked display without a provider returns. The views
+  are fixed: the same every frame for the same canvas;
+- **posts no viewer-tracking demand**: neither the display processor's eyes nor a provider are
+  asked. A provider is never started on the call's behalf; one started by other locates (other
+  calls, sessions or apps) keeps running for them, and once nothing asks for a viewer it stops
+  after its idle timeout (10 s, `docs/specs/runtime/tracking-provider-discovery.md` §4a);
+- reports `XrViewEyeTrackingStateDXR::isTracking = XR_FALSE` when chained (the views follow
+  no viewer) and does not advance the session's tracking state: a fixed-viewer locate never
+  raises `XrEventDataEyeTrackingStateChangedDXR`, so an app that alternates the hint does not
+  see an event per toggle;
+- reports the nominal eyes in a chained `XrViewDisplayRawDXR` (`isTracking = XR_FALSE`).
+
+`XrViewState::viewStateFlags`, `XrViewActivityStateDXR`, view display bindings and every
+other output are filled exactly as usual. `fixedViewer = XR_FALSE`, or not chaining the
+struct, is the pre-v25 behaviour. Only the call that chains it is affected: the hint is not
+sticky, and other sessions and apps are untouched.
+
+**On a display that tracks the viewer itself** (Leia SR and the like) the weave keeps using the
+display's tracked eyes — interlacing is the display's business and the hint does not reach it
+(ADR-033). Only the returned views are the nominal ones, so the app renders one fixed stereo
+pair regardless of where the viewer stands.
+
+**With `XR_DXR_view_rig`.** A chained display or camera rig still applies; it is framed
+around the nominal eyes instead of tracked ones.
+
+**Across processes.** For an IPC client the service computes the views and hosts the
+provider, so the runtime forwards the hint to the service (once per change, before the locate
+it applies to); the service then frames that client's views, raw eyes and per-screen segment
+eyes for the nominal viewer and asks the provider nothing on its behalf.
+
+**Gate and compatibility.** Honoured only when the instance enabled `XR_DXR_display_info`.
+A runtime older than v25 ignores the struct (an unknown input in the chain), so an app may
+chain it unconditionally; check `XrExtensionProperties::extensionVersion >= 25` for
+`XR_DXR_display_info` to know it is honoured.
+
+**When to chain it.** Content rendered from a fixed image pair: video (2D, side-by-side,
+top-bottom), stereo photos, a flat UI. Do **not** chain it for content rendered from a 3D scene
+(a model, a Gaussian splat, a game): there look-around is the point, and the views should
+follow the viewer. An app that shows both kinds chains it per frame, only while the
+viewer-independent content is on screen.
+
 ### Example Code: Querying Display Mode Support and Requesting 2D
 
 > ⚠️ **These inline examples predate the multiview model and the v13 header — read with care.**
@@ -2669,6 +2737,7 @@ the property) silently ignore the call — graceful degradation.
 | 22 | 2026-10-07 | David Fattal | **Per-display enumeration** (multi-screen M1, ADR-047): added `XrDisplayDXR` (`1004999214`) + `xrEnumerateDisplaysDXR`, `XrDisplaySpaceCreateInfoDXR` (`1004999215`) + `xrCreateDisplaySpaceDXR`, `XrSessionDisplayBindingDXR` (`1004999216`, chained on `XrSessionCreateInfo`), `XrDisplayFlagsDXR`; multi-screen M3 (same version, append-only) adds `XrViewDisplayBindingsDXR` (`1004999217`, chained on `XrViewState`), per-segment views for `PRIMARY_MULTIVIEW_DXR` sessions and a reported multiview count of device max × the system's view-set capacity (1, or 2 on desktop Linux with two DP-backed screens). Append-only: `XrSystemProperties` keeps describing the system-default display. v22 limits: every DISPLAY space is the session's single display plane; a binding to a non-default display changes the session's display-scoped Kooima inputs only, not which DP weaves. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 22`).** |
 | 23 | 2026-10-10 | David Fattal | **Display hotplug** (ADR-047 Amendment 8): added `XrEventDataDisplaysChangedDXR` (`1004999218`), queued to every running session once per display-list change (a display plugged in or removed, re-claimed by another display processor, or moved), after the runtime applied it. The runtime now keeps the per-monitor claims live: a 3D panel plugged in while an app runs is woven by its own display processor within about a second (two seconds when its vendor service must authenticate it first), with no session restart. Additive: an app that ignores the event is unaffected. |
 | 24 | 2026-11-03 | David Fattal | **Stable per-display key**: added `XrDisplayStableKeyDXR` (`1004999219`), chained on `XrDisplayDXR::next`, a key to persist per-panel data under. Append-only: `XrDisplayDXR` is unchanged. |
+| 25 | 2026-11-03 | David Fattal | **Fixed-viewer locates**: added `XrViewLocateFixedViewerDXR` (`1004999430`, the first value of display_info's second decade — 210–219 is full), chained on `XrViewLocateInfo` at `xrLocateViews`. A locate that sets `fixedViewer` is framed for the nominal viewer and posts no viewer-tracking demand, so a viewer-tracking provider (a webcam tracker) is not started for viewer-independent content such as video. Per call; also carried to the service for IPC clients. Additive: new chained input struct only. |
 
 > The `XR_DXR_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do

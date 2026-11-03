@@ -625,6 +625,10 @@ client_loop(volatile struct ipc_client_state *ics)
 void
 ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_state *ics)
 {
+	// XR_DXR_display_info v25: the hint is the session's; a next session on
+	// this connection starts asking for a viewer again until it says otherwise.
+	ics->fixed_viewer = false;
+
 	// Destroy the compositor BEFORE dropping our xscs swapchain
 	// references (#238). The compositor's destroy path runs under its
 	// own render_mutex (close-button fix in commit 30e5648a1) and
