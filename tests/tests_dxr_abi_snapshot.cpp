@@ -176,7 +176,7 @@ static_assert(offsetof(XrAndroidInputEventDXR, eventTimeNs) == 48, "XrAndroidInp
 #endif // defined(__ANDROID__)
 
 // ---- XR_DXR_display_info.h
-static_assert(XR_DXR_display_info_SPEC_VERSION == 23, "XR_DXR_display_info_SPEC_VERSION moved");
+static_assert(XR_DXR_display_info_SPEC_VERSION == 24, "XR_DXR_display_info_SPEC_VERSION moved");
 static_assert(XR_TYPE_DISPLAY_INFO_DXR == (XrStructureType)1004999003, "XR_TYPE_DISPLAY_INFO_DXR renumbered");
 static_assert(XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR == (XrStructureType)1004999210, "XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR renumbered");
 static_assert(XR_TYPE_DISPLAY_DESKTOP_INFO_DXR == (XrStructureType)1004999211, "XR_TYPE_DISPLAY_DESKTOP_INFO_DXR renumbered");
@@ -194,6 +194,7 @@ static_assert(XR_TYPE_DISPLAY_SPACE_CREATE_INFO_DXR == (XrStructureType)10049992
 static_assert(XR_TYPE_SESSION_DISPLAY_BINDING_DXR == (XrStructureType)1004999216, "XR_TYPE_SESSION_DISPLAY_BINDING_DXR renumbered");
 static_assert(XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR == (XrStructureType)1004999217, "XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR renumbered");
 static_assert(XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR == (XrStructureType)1004999218, "XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR renumbered");
+static_assert(XR_TYPE_DISPLAY_STABLE_KEY_DXR == (XrStructureType)1004999219, "XR_TYPE_DISPLAY_STABLE_KEY_DXR renumbered");
 #if UINTPTR_MAX == UINT64_MAX
 static_assert(sizeof(XrDisplayInfoDXR) == 56, "XrDisplayInfoDXR size changed");
 static_assert(offsetof(XrDisplayInfoDXR, type) == 0, "XrDisplayInfoDXR::type moved");
@@ -311,6 +312,10 @@ static_assert(offsetof(XrEventDataDisplaysChangedDXR, type) == 0, "XrEventDataDi
 static_assert(offsetof(XrEventDataDisplaysChangedDXR, next) == 8, "XrEventDataDisplaysChangedDXR::next moved");
 static_assert(offsetof(XrEventDataDisplaysChangedDXR, session) == 16, "XrEventDataDisplaysChangedDXR::session moved");
 static_assert(offsetof(XrEventDataDisplaysChangedDXR, displayCount) == 24, "XrEventDataDisplaysChangedDXR::displayCount moved");
+static_assert(sizeof(XrDisplayStableKeyDXR) == 80, "XrDisplayStableKeyDXR size changed");
+static_assert(offsetof(XrDisplayStableKeyDXR, type) == 0, "XrDisplayStableKeyDXR::type moved");
+static_assert(offsetof(XrDisplayStableKeyDXR, next) == 8, "XrDisplayStableKeyDXR::next moved");
+static_assert(offsetof(XrDisplayStableKeyDXR, key) == 16, "XrDisplayStableKeyDXR::key moved");
 #endif
 
 // ---- XR_DXR_view_rig.h

@@ -127,7 +127,7 @@ head device stays the active plug-in's. The service re-reads the preference on
 every re-probe (§4.2) and recreates a changed **secondary** screen's segment
 DPs; the primary DP never swaps live, so the primary screen's choice applies at
 the next session / service start. The screen key is the EDID form
-`<PNP>-<PROD>-<SERIAL>[@<device>]`, except that a screen whose EDID serial is 0
+`<PNP>-<PROD>-<SERIAL>[@<device>]`, except that a screen
 is keyed `<PNP>-<vendor serial>` as soon as any plug-in's claim on it (above
 `FALLBACK`) carries a serial — the product code and device name can change
 with the cable or port, the vendor serial cannot (#2250). A preference stored

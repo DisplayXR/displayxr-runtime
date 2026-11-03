@@ -2614,6 +2614,8 @@ static struct
 	char key[TARGET_SCREEN_KEY_MAX];
 	//! The EDID-form key (pre-#2250); equals @ref key unless a vendor serial keys the monitor.
 	char legacy_key[TARGET_SCREEN_KEY_MAX];
+	//! The EDID-form key with the serial taken as 0: the key on Windows before enumeration read the serial.
+	char pre_serial_key[TARGET_SCREEN_KEY_MAX];
 	//! Sanitised vendor serial from a claim (target_screen_key_serial_pick), "" = none; kept across re-probes.
 	char vendor_serial[TARGET_SCREEN_KEY_SERIAL_MAX + 1];
 	//! OS device name the key was qualified with (Windows GDI name, else output / connector).
@@ -2641,6 +2643,7 @@ monitor_side_rebuild_keys(void)
 	struct target_screen_key_input key_in[XRT_DP_REGISTRY_MAX_ENTRIES];
 	char keys[XRT_DP_REGISTRY_MAX_ENTRIES][TARGET_SCREEN_KEY_MAX];
 	char legacy[XRT_DP_REGISTRY_MAX_ENTRIES][TARGET_SCREEN_KEY_MAX];
+	char pre_serial[XRT_DP_REGISTRY_MAX_ENTRIES][TARGET_SCREEN_KEY_MAX];
 	const uint32_t n = g_monitor_side_count;
 	for (uint32_t i = 0; i < n; i++) {
 		key_in[i].manufacturer_id = g_monitor_side[i].mon.manufacturer_id;
@@ -2650,7 +2653,10 @@ monitor_side_rebuild_keys(void)
 		key_in[i].vendor_serial = g_monitor_side[i].vendor_serial;
 	}
 	target_screen_keys_build_ex(key_in, n, keys, legacy);
+	target_screen_keys_build_pre_serial(key_in, n, pre_serial);
 	for (uint32_t i = 0; i < n; i++) {
+		(void)snprintf(g_monitor_side[i].pre_serial_key, sizeof(g_monitor_side[i].pre_serial_key), "%s",
+		               pre_serial[i]);
 		(void)snprintf(g_monitor_side[i].key, sizeof(g_monitor_side[i].key), "%s", keys[i]);
 		(void)snprintf(g_monitor_side[i].legacy_key, sizeof(g_monitor_side[i].legacy_key), "%s", legacy[i]);
 	}
@@ -3635,7 +3641,9 @@ screen_pref_has(const char *key, void *userdata)
 /*!
  * The per-screen preference for a monitor, by its current key, else by its
  * EDID-form @p legacy_key (#2250: a preference stored before the key moved to
- * the vendor serial keeps applying). A per-user legacy match is re-keyed in
+ * the vendor serial keeps applying), else by @p pre_serial_key (one stored
+ * while Windows enumeration did not read the EDID serial). An older-key match
+ * from the per-user store is re-keyed in
  * the store (one WARN; the next probe matches the current key directly) — but
  * only in a process that opted in (@ref target_plugin_set_screen_key_rekey:
  * the service and the CLI; an app never rewrites the user's settings file).
@@ -3645,10 +3653,19 @@ screen_pref_has(const char *key, void *userdata)
  * @ref g_refresh_mutex (it also guards the WARN latch).
  */
 static bool
-screen_pref_lookup(const char *key, const char *legacy_key, char *buf, size_t cap, enum u_setting_source *out_source)
+screen_pref_lookup(const char *key,
+                   const char *legacy_key,
+                   const char *pre_serial_key,
+                   char *buf,
+                   size_t cap,
+                   enum u_setting_source *out_source)
 {
 	struct screen_pref_probe probe = {buf, cap, U_SETTING_SOURCE_DEFAULT};
-	const enum target_screen_key_match m = target_screen_key_pref_match(key, legacy_key, screen_pref_has, &probe);
+	enum target_screen_key_match m = target_screen_key_pref_match(key, legacy_key, screen_pref_has, &probe);
+	if (m == TARGET_SCREEN_KEY_MATCH_NONE) {
+		m = target_screen_key_pref_match(key, pre_serial_key, screen_pref_has, &probe);
+		legacy_key = pre_serial_key;
+	}
 	*out_source = probe.source;
 	if (m == TARGET_SCREEN_KEY_MATCH_NONE) {
 		buf[0] = '\0';
@@ -3663,7 +3680,7 @@ screen_pref_lookup(const char *key, const char *legacy_key, char *buf, size_t ca
 	    u_setting_user_set_preferred_plugin_for_screen(legacy_key, NULL)) {
 		U_LOG_W(
 		    "plugin loader: per-screen preference '%s' -> '%s' re-keyed to '%s' (per-user store): the screen "
-		    "is now keyed by its vendor serial, which survives a cable or port change (#2250)",
+		    "is now keyed by its serial",
 		    legacy_key, buf, key);
 		return true;
 	}
@@ -3687,8 +3704,8 @@ screen_pref_lookup(const char *key, const char *legacy_key, char *buf, size_t ca
 		hint = " — re-keying the per-user store failed";
 	}
 	U_LOG_W(
-	    "plugin loader: per-screen preference '%s' -> '%s' (%s) matched by the screen's legacy EDID key; its "
-	    "key is now '%s' (vendor serial, #2250)%s",
+	    "plugin loader: per-screen preference '%s' -> '%s' (%s) matched by the screen's older key; its "
+	    "key is now '%s'%s",
 	    legacy_key, buf, u_setting_source_str(probe.source), key, hint);
 	return true;
 }
@@ -3883,17 +3900,19 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		// monitor's stable key (env > per-user file > machine).
 		const char *screen_key = "";
 		const char *legacy_key = "";
+		const char *pre_serial_key = "";
 		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
 			if (g_monitor_side[i].monitor_id == desc->monitor_id) {
 				screen_key = g_monitor_side[i].key;
 				legacy_key = g_monitor_side[i].legacy_key;
+				pre_serial_key = g_monitor_side[i].pre_serial_key;
 				break;
 			}
 		}
 		char screen_pref[64] = {0};
 		enum u_setting_source pref_source = U_SETTING_SOURCE_DEFAULT;
 		const bool have_screen_pref =
-		    screen_pref_lookup(screen_key, legacy_key, screen_pref, sizeof(screen_pref), &pref_source);
+		    screen_pref_lookup(screen_key, legacy_key, pre_serial_key, screen_pref, sizeof(screen_pref), &pref_source);
 
 		const int pin_idx = target_screen_pin_find(&pins, desc->monitor_id, out_name, conn_name);
 		const char *pin_plugin = pin_idx >= 0 ? pins.pin[pin_idx].plugin_id : NULL;

@@ -448,12 +448,30 @@ TEST_CASE("screen key: a vendor serial keys a zero-EDID-serial screen across inp
 		CHECK(std::string(keys[1]) == std::string(legacy[1]));
 	}
 
-	SECTION("a non-zero EDID serial keeps the EDID form whatever the claim serial")
+	SECTION("the vendor serial wins over a non-zero EDID serial: one key across inputs")
 	{
-		const target_screen_key_input in[] = {{sam, 0x785F, 0x0000ABCD, "\\\\.\\DISPLAY5", "VN022513ET0212"}};
-		target_screen_keys_build_ex(in, 1, keys, legacy);
-		CHECK(std::string(keys[0]) == "SAM-785F-0000ABCD");
+		const target_screen_key_input hdmi[] = {{sam, 0x785F, 0x0000ABCD, "\\\\.\\DISPLAY5", "VN022513ET0212"}};
+		const target_screen_key_input dp[] = {{sam, 0x7860, 0x0000ABCD, "\\\\.\\DISPLAY6", "VN022513ET0212"}};
+		target_screen_keys_build_ex(hdmi, 1, keys, legacy);
+		CHECK(std::string(keys[0]) == "SAM-VN022513ET0212");
 		CHECK(std::string(legacy[0]) == "SAM-785F-0000ABCD");
+		target_screen_keys_build_ex(dp, 1, keys, legacy);
+		CHECK(std::string(keys[0]) == "SAM-VN022513ET0212");
+		CHECK(std::string(legacy[0]) == "SAM-7860-0000ABCD");
+	}
+
+	SECTION("the key from before Windows read the EDID serial")
+	{
+		const target_screen_key_input in[] = {
+		    {sam, 0x785F, 0x0000ABCD, "\\\\.\\DISPLAY1", nullptr},
+		    {sam, 0x7860, 0, "\\\\.\\DISPLAY2", "VN1"},
+		};
+		char before[4][TARGET_SCREEN_KEY_MAX];
+		target_screen_keys_build_ex(in, 2, keys, legacy);
+		target_screen_keys_build_pre_serial(in, 2, before);
+		CHECK(std::string(keys[0]) == "SAM-785F-0000ABCD");
+		CHECK(std::string(before[0]) == "SAM-785F-00000000@DISPLAY1");
+		CHECK(std::string(before[1]) == "SAM-7860-00000000@DISPLAY2");
 	}
 
 	SECTION("the legacy form is exactly target_screen_keys_build")
@@ -470,8 +488,8 @@ TEST_CASE("screen key: a vendor serial keys a zero-EDID-serial screen across inp
 			CHECK(std::string(plain[i]) == std::string(legacy[i]));
 		}
 		CHECK(std::string(keys[0]) == "SAM-VN1");
-		CHECK(std::string(keys[1]) == "SAM-785F-01010101@DISPLAY1");
-		CHECK(std::string(keys[2]) == "SAM-785F-01010101@DISPLAY3");
+		CHECK(std::string(keys[1]) == "SAM-785F-01010101");
+		CHECK(std::string(keys[2]) == "SAM-VN2");
 	}
 
 	SECTION("two screens reporting the same vendor serial are both qualified")

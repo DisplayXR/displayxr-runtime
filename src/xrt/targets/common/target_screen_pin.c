@@ -372,8 +372,7 @@ static void
 key_base_ex(const struct target_screen_key_input *m, bool use_vendor, char *out, size_t cap, bool *out_vendor_form)
 {
 	char vs[TARGET_SCREEN_KEY_SERIAL_MAX + 1];
-	const bool vendor =
-	    use_vendor && m->serial == 0 && target_screen_key_sanitize_serial(m->vendor_serial, vs, sizeof(vs));
+	const bool vendor = use_vendor && target_screen_key_sanitize_serial(m->vendor_serial, vs, sizeof(vs));
 	if (out_vendor_form != NULL) {
 		*out_vendor_form = vendor;
 	}
@@ -429,6 +428,25 @@ target_screen_keys_build(const struct target_screen_key_input *in, uint32_t n, c
 		return;
 	}
 	keys_build_form(in, n, false, out);
+}
+
+void
+target_screen_keys_build_pre_serial(const struct target_screen_key_input *in,
+                                    uint32_t n,
+                                    char (*out)[TARGET_SCREEN_KEY_MAX])
+{
+	if (in == NULL || out == NULL) {
+		return;
+	}
+	struct target_screen_key_input zeroed[TARGET_SCREEN_KEYS_MAX];
+	if (n > TARGET_SCREEN_KEYS_MAX) {
+		n = TARGET_SCREEN_KEYS_MAX;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		zeroed[i] = in[i];
+		zeroed[i].serial = 0;
+	}
+	keys_build_form(zeroed, n, false, out);
 }
 
 static bool

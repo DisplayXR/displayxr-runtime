@@ -239,6 +239,9 @@ target_screen_collect_candidates(const struct target_screen_source_claims *sourc
 //! Size of a screen key, incl. the NUL.
 #define TARGET_SCREEN_KEY_MAX 64
 
+//! Most monitors @ref target_screen_keys_build_pre_serial handles (= XRT_DP_REGISTRY_MAX_ENTRIES).
+#define TARGET_SCREEN_KEYS_MAX 16
+
 /*!
  * One monitor's identity, as the key derivation sees it.
  */
@@ -277,15 +280,14 @@ target_screen_keys_build(const struct target_screen_key_input *in, uint32_t n, c
 
 /*!
  * @ref target_screen_keys_build with the vendor-serial rule (#2250). A monitor
- * whose EDID serial is 0 and whose @ref target_screen_key_input::vendor_serial
- * is non-empty is keyed `"<PNP>-<vendor serial>"` instead: the product code
+ * whose @ref target_screen_key_input::vendor_serial is non-empty is keyed
+ * `"<PNP>-<vendor serial>"` instead, whatever its EDID serial: the product code
  * and the `"@<device>"` qualifier are dropped, because both can move with the
  * cable (a panel can report a different EDID product code per input) while the
  * vendor serial names the panel itself. It is still `"@<device>"`-qualified
  * when two monitors of @p in would get the same key. The serial is reduced by
  * @ref target_screen_key_sanitize_serial; one that reduces to nothing keeps
- * the EDID form. A monitor with a non-zero EDID serial keeps the EDID form
- * whatever its vendor serial.
+ * the EDID form.
  *
  * @p legacy_out (may be NULL) receives every monitor's EDID-form key — exactly
  * what @ref target_screen_keys_build gives — so a preference stored under it
@@ -296,6 +298,17 @@ target_screen_keys_build_ex(const struct target_screen_key_input *in,
                             uint32_t n,
                             char (*out)[TARGET_SCREEN_KEY_MAX],
                             char (*legacy_out)[TARGET_SCREEN_KEY_MAX]);
+
+/*!
+ * The EDID-form key each monitor had while Windows enumeration did not read the
+ * EDID serial: @ref target_screen_keys_build with every serial taken as 0. A
+ * preference stored back then is under this key, so it is still looked up.
+ * At most @ref TARGET_SCREEN_KEYS_MAX monitors. Pure.
+ */
+void
+target_screen_keys_build_pre_serial(const struct target_screen_key_input *in,
+                                    uint32_t n,
+                                    char (*out)[TARGET_SCREEN_KEY_MAX]);
 
 //! Longest vendor serial a key keeps (characters), so a key has room for `"@<device>"`.
 #define TARGET_SCREEN_KEY_SERIAL_MAX 40

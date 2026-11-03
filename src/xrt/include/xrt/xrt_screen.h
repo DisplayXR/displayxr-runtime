@@ -158,6 +158,12 @@ struct xrt_screen
 	//! the desktop rect, which is logical on a scaled desktop. 0 = unknown.
 	uint32_t preferred_width;
 	uint32_t preferred_height;
+
+	//! Stable screen key: the identity per-screen preferences are stored under
+	//! (`target_screen_keys_build_ex`, what `displayxr-cli displays --claims`
+	//! prints). Unlike @ref id it survives a reboot and a desktop rearrangement.
+	//! "" = unknown (a synthesized screen). `XrDisplayStableKeyDXR` reports it.
+	char key[XRT_SCREEN_NAME_MAX];
 };
 
 /*!

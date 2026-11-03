@@ -8,7 +8,7 @@
 | **Authors** | The DisplayXR Project |
 | **Date** | 2026-02-13 |
 | **Revision** | 0.2 |
-| **Status** | Implemented (`SPEC_VERSION` 23). `XrStructureType` values are provisional (1004999xxx) until Khronos registration |
+| **Status** | Implemented (`SPEC_VERSION` 24). `XrStructureType` values are provisional (1004999xxx) until Khronos registration |
 | **Extension Names** | `XR_DXR_win32_window_binding`, `XR_DXR_android_surface_binding`, `XR_DXR_cocoa_window_binding`, `XR_DXR_display_info` |
 | **OpenXR Version** | 1.0 |
 | **Extension Type** | Instance extensions |
@@ -1279,6 +1279,20 @@ from the connector's mode, view scale 1, no eye tracking, and a nominal viewer c
 at the distance that gives the display the same vertical FOV as the system default's
 nominal viewer. The list is identical in-process and over IPC (the service answers a
 dedicated message).
+
+**Stable key (v24).** `displayId` is not something to persist. To keep per-panel data (a
+calibration, a preference), chain `XrDisplayStableKeyDXR` (`XR_TYPE_DISPLAY_STABLE_KEY_DXR`,
+`1004999219`) on `XrDisplayDXR::next`: `key` receives the same string
+`displayxr-cli displays --claims` prints, which survives a reboot and a desktop rearrangement
+and is the same in every process. It is opaque and safe as a file name. With a panel serial
+from the vendor plug-in it is `<PNP>-<vendor serial>`, which survives moving the cable.
+Otherwise, with an EDID serial, it is `<PNP>-<PROD>-<SERIAL>`, which survives moving the cable
+unless the panel reports a different EDID product code per input. With neither,
+`@<OS output name>` is appended and the key follows the port; the same suffix separates two
+connected monitors that would otherwise share a key. A runtime older than v24 leaves the
+struct untouched, and `""` also means the display could not be identified, so zero it and fall
+back to `deviceName`. A window's panel is the entry whose `desktopRect` contains it; re-read
+the list on `XrEventDataDisplaysChangedDXR`.
 
 **DISPLAY spaces.** `xrCreateDisplaySpaceDXR` creates a reference-space-like `XrSpace`
 for one display: origin at the display's centre, +X right, +Y up, +Z toward the viewer
@@ -2654,6 +2668,7 @@ the property) silently ignore the call — graceful degradation.
 | 21 | 2026-09-18 | David Fattal | **Fixed view count, per-frame activity** (ADR-041 Model E, #1528 / #1486): added `XrViewActivityStateDXR` (`1004999213`, chained on `XrViewState` at `xrLocateViews`). The located view count is fixed for the session (2 under `PRIMARY_STEREO`, the device maximum under `PRIMARY_MULTIVIEW_DXR`); `activeViewCount` says how many carry the active mode's views, the inactive tail is located at view 0's pose and ignored. `xrEndFrame`'s `viewCount` must equal the located count — an app rendering only the active views aliases the tail onto view 0's subimage. The pre-v21 1-view 2D submission stays accepted (deprecated, `DXR_UNDER_SUBMIT`). Additive: new chained struct only. |
 | 22 | 2026-10-07 | David Fattal | **Per-display enumeration** (multi-screen M1, ADR-047): added `XrDisplayDXR` (`1004999214`) + `xrEnumerateDisplaysDXR`, `XrDisplaySpaceCreateInfoDXR` (`1004999215`) + `xrCreateDisplaySpaceDXR`, `XrSessionDisplayBindingDXR` (`1004999216`, chained on `XrSessionCreateInfo`), `XrDisplayFlagsDXR`; multi-screen M3 (same version, append-only) adds `XrViewDisplayBindingsDXR` (`1004999217`, chained on `XrViewState`), per-segment views for `PRIMARY_MULTIVIEW_DXR` sessions and a reported multiview count of device max × the system's view-set capacity (1, or 2 on desktop Linux with two DP-backed screens). Append-only: `XrSystemProperties` keeps describing the system-default display. v22 limits: every DISPLAY space is the session's single display plane; a binding to a non-default display changes the session's display-scoped Kooima inputs only, not which DP weaves. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 22`).** |
 | 23 | 2026-10-10 | David Fattal | **Display hotplug** (ADR-047 Amendment 8): added `XrEventDataDisplaysChangedDXR` (`1004999218`), queued to every running session once per display-list change (a display plugged in or removed, re-claimed by another display processor, or moved), after the runtime applied it. The runtime now keeps the per-monitor claims live: a 3D panel plugged in while an app runs is woven by its own display processor within about a second (two seconds when its vendor service must authenticate it first), with no session restart. Additive: an app that ignores the event is unaffected. |
+| 24 | 2026-11-03 | David Fattal | **Stable per-display key**: added `XrDisplayStableKeyDXR` (`1004999219`), chained on `XrDisplayDXR::next`, a key to persist per-panel data under. Append-only: `XrDisplayDXR` is unchanged. |
 
 > The `XR_DXR_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do
