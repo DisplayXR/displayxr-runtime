@@ -275,6 +275,13 @@ uniformly to grip/aim action spaces, `xrLocateSpace`, and the hand-joint base
    locomotion semantics (move the player, not the hands) and yields the rule
    exactly.
 
+   *Note (2026-10):* the Ultraleap provider no longer uses a stage mount
+   offset. Like `sim_input` (#2191) it now publishes display-plane-relative
+   (`RIG_LOCAL`, Amendment 4 §3) poses, placed by a relative mapping in
+   display heights by default (input-provider-discovery.md §5), so the
+   y≈1.45 figure above is historical — the delta rule itself is unchanged and
+   still governs every `OTHER` / `NONE` origin.
+
 3. **Mechanically:** `u_space_overseer` gains a `U_SPACE_TYPE_RIG` node
    parented to the root, whose relation resolves to that delta, plus
    `u_space_overseer_set_rig_source()` /
