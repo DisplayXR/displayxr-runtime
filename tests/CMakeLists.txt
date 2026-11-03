@@ -119,6 +119,7 @@ set(tests
     tests_target_screen_pin
     tests_u_setting_per_screen
     tests_u_file_socket_path
+    tests_u_sd_notify
     tests_u_eye_history
     tests_sim_eyes
     tests_dp_eye_positions_at

@@ -41,6 +41,14 @@ cli_service_pipe_present(void);
 xrt_result_t
 cli_ipc_connect(struct ipc_connection *ipc_c, enum u_logging_level log_level, const struct xrt_instance_info *ii);
 
+/*!
+ * #2515: did the last @ref cli_ipc_connect fail because a service accepted the
+ * connection but never answered the handshake (it is wedged)? The connect has
+ * already printed the recovery hint. Desktop Linux only; false elsewhere.
+ */
+bool
+cli_ipc_service_wedged(void);
+
 //! What @ref cli_ipc_poke_component_reselect got back.
 enum cli_ipc_poke_result
 {

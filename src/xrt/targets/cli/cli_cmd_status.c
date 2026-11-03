@@ -472,7 +472,9 @@ status_watch(uint32_t interval_ms, bool json)
 				// last service snapshot is older than the grace period).
 				const bool grace_over =
 				    lost_ns != 0 && now - lost_ns >= (uint64_t)STATUS_LOST_GRACE_MS * U_TIME_1MS_IN_NS;
-				if (!showing_headless && (!printed_any || grace_over)) {
+				// #2515: not while the service is wedged (see the one-shot path);
+				// keep polling until it is restarted.
+				if (!showing_headless && (!printed_any || grace_over) && !cli_ipc_service_wedged()) {
 					note_headless(why);
 					status_build_headless(snap);
 					if (!status_print(snap, json, true, redraw)) {
@@ -571,6 +573,15 @@ cli_cmd_status(int argc, const char **argv)
 	}
 	xrt_result_t why = XRT_SUCCESS;
 	if (!status_fetch_service(snap, &why)) {
+#ifdef CLI_HAVE_IPC
+		if (cli_ipc_service_wedged()) {
+			// #2515: cli_ipc_connect named the wedged service and the recovery.
+			// No headless fallback: it would open the same plug-in the wedged
+			// service still holds, and could hang on it the same way.
+			free(snap);
+			return 3;
+		}
+#endif
 		note_headless(why);
 		status_build_headless(snap);
 	}

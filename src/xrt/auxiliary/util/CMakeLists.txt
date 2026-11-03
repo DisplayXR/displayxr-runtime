@@ -158,6 +158,8 @@ add_library(
 	u_resampler.h
 	u_sandbox.c
 	u_sandbox.h
+	u_sd_notify.c
+	u_sd_notify.h
 	u_session.c
 	u_session.h
 	u_setting.c

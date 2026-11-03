@@ -23,6 +23,17 @@
 #include <windows.h>
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+#include "util/u_debug.h"
+
+/*
+ * #2515: a service that wedged on its way out (or anywhere else) can leave the
+ * activated socket accepting connections nobody answers; the handshake then
+ * blocked forever and the CLI just hung. Bound it (0 = wait forever, as before).
+ */
+DEBUG_GET_ONCE_NUM_OPTION(cli_ipc_timeout_ms, "DXR_CLI_IPC_TIMEOUT_MS", 5000)
+#endif
+
 bool
 cli_service_pipe_present(void)
 {
@@ -46,7 +57,33 @@ cli_ipc_connect(struct ipc_connection *ipc_c, enum u_logging_level log_level, co
 	if (!cli_service_pipe_present()) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return ipc_client_connection_init(ipc_c, log_level, ii);
+#ifdef XRT_OS_LINUX_DESKTOP
+	const int64_t timeout_ms = debug_get_num_option_cli_ipc_timeout_ms();
+	ipc_client_connection_set_handshake_timeout_ms(timeout_ms > 0 ? (uint32_t)timeout_ms : 0);
+#endif
+	const xrt_result_t xret = ipc_client_connection_init(ipc_c, log_level, ii);
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (xret != XRT_SUCCESS && ipc_client_connection_handshake_timed_out()) {
+		// Once per process: `status --watch` reconnects in a loop.
+		static bool said = false;
+		if (!said) {
+			said = true;
+			fprintf(stderr,
+			        "displayxr-cli: displayxr-service accepted the connection but did not answer the IPC "
+			        "handshake within %lld ms — the service is wedged (#2515).\n"
+			        "  Recover with: systemctl --user restart displayxr.service\n"
+			        "  (DXR_CLI_IPC_TIMEOUT_MS=<ms> changes this bound; 0 waits forever.)\n",
+			        (long long)timeout_ms);
+		}
+	}
+#endif
+	return xret;
+}
+
+bool
+cli_ipc_service_wedged(void)
+{
+	return ipc_client_connection_handshake_timed_out();
 }
 
 enum cli_ipc_poke_result

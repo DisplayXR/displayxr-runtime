@@ -728,6 +728,19 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 // launch hotkey (service_hotkey_linux.c). Kept apart from the macOS blocks.
 #include "service_config.h"
 #include "service_orchestrator.h"
+#include "util/u_debug.h"
+#include "util/u_sd_notify.h" // #2515: systemd notify protocol, no libsystemd
+#include <stdio.h>            // fflush
+#include <unistd.h>           // _exit
+
+/*!
+ * #2515: leave with _exit() after the orderly teardown, so no atexit handler or
+ * shared-object destructor (a vendor plug-in's ELF destructor, run from
+ * _dl_fini after the SDK's own statics are gone) can crash or deadlock the
+ * process on its way out and leave systemd holding the activated socket for a
+ * dead service. DXR_SERVICE_EXIT_FAST=0 restores the plain return from main().
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(service_exit_fast, "DXR_SERVICE_EXIT_FAST", true)
 // ADR-051 D6: DRM connector hotplug -> the display re-probe worker.
 #include "service_drm_hotplug_linux.h"
 // #2251: Mutter MonitorsChanged (a live display-scale change) -> the same worker.
@@ -744,6 +757,12 @@ drm_hotplug_to_reprobe(const char *reason)
 int
 main(int argc, char *argv[])
 {
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2515: cache + unset NOTIFY_SOCKET / WATCHDOG_* before any thread or
+	// child process starts (the watchdog is fed from the IPC main loop).
+	u_sd_notify_init();
+#endif
+
 	// #950 exit tripwire (see the Windows entry point for the ordering rule).
 	u_file_logging_init();
 	u_crash_guard_install_exit_tripwire();
@@ -867,6 +886,27 @@ main(int argc, char *argv[])
 #endif
 
 	u_crash_guard_mark_orderly_exit();
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2515: everything the service owns is torn down explicitly above — the
+	// IPC server (clients joined, system devices + xrt_instance destroyed, which
+	// destroys the plug-in instances; listening socket closed, and unlinked when
+	// this process bound it), the conversion + component-watch cores, metrics,
+	// the hotplug feeders and the orchestrator. Satellites (conversion host,
+	// viewer-tracking host) die with their parent (kill_on_parent_exit). What
+	// atexit would still do is the #950 tripwire (a no-op once the exit is
+	// marked orderly) and the platform file logger (a stub here: logs go to
+	// stderr / the journal). So flush stdio and leave without running any
+	// atexit handler or shared-object destructor.
+	if (debug_get_bool_option_service_exit_fast()) {
+		U_LOG_W(
+		    "Service exit: leaving with _exit(%d), skipping atexit + shared-object destructors (#2515; "
+		    "DXR_SERVICE_EXIT_FAST=0 to return normally).",
+		    ret);
+		fflush(NULL);
+		_exit(ret);
+	}
+#endif
 	return ret;
 }
 

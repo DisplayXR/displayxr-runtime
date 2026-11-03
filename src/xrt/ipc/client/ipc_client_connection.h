@@ -165,6 +165,28 @@ void
 ipc_client_connection_disable_service_launch(void);
 
 /*!
+ * Process-wide: bound the connect + handshake of every following
+ * ipc_client_connection_init() to about @p timeout_ms per socket call (#2515);
+ * 0 (the default) blocks forever, as every app client does. Meant for
+ * diagnostics (displayxr-cli), which must not hang on a wedged service that
+ * still holds its listening socket. Only the handshake is bounded: the
+ * timeouts are cleared once it succeeds. Desktop Linux only; a no-op elsewhere.
+ *
+ * @ingroup ipc_client
+ */
+void
+ipc_client_connection_set_handshake_timeout_ms(uint32_t timeout_ms);
+
+/*!
+ * True when the last ipc_client_connection_init() on this process failed
+ * because the service did not answer within the handshake timeout (#2515).
+ *
+ * @ingroup ipc_client
+ */
+bool
+ipc_client_connection_handshake_timed_out(void);
+
+/*!
  * Set up the basics of the client connection: socket and shared mem
  * @param ipc_c     Empty IPC connection struct
  * @param log_level Log level for IPC messages
