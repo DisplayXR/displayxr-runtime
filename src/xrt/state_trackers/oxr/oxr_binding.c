@@ -787,9 +787,13 @@ oxr_action_get_current_interaction_profile(struct oxr_logger *log,
 		                 "xrAttachSessionActionSets has not been "
 		                 "called on this session.");
 	}
+	XrPath *logged_profile = NULL;
+	bool *logged_once = NULL;
 #define IDENTIFY_TOP_LEVEL_PATH(X)                                                                                     \
 	if (topLevelUserPath == inst->path_cache.X) {                                                                  \
 		interactionProfile->interactionProfile = sess->X;                                                      \
+		logged_profile = &sess->logged_interaction_profile.X;                                                  \
+		logged_once = &sess->logged_interaction_profile.X##_logged;                                            \
 	} else
 
 	OXR_FOR_EACH_VALID_SUBACTION_PATH(IDENTIFY_TOP_LEVEL_PATH)
@@ -799,7 +803,11 @@ oxr_action_get_current_interaction_profile(struct oxr_logger *log,
 	}
 #undef IDENTIFY_TOP_LEVEL_PATH
 
-	{
+	// Log only when this top-level path's answer changes (#2428).
+	if (!*logged_once || *logged_profile != interactionProfile->interactionProfile) {
+		*logged_once = true;
+		*logged_profile = interactionProfile->interactionProfile;
+
 		const char *top_str = NULL;
 		size_t top_len = 0;
 		oxr_path_get_string(log, inst, topLevelUserPath, &top_str, &top_len);

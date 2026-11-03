@@ -3791,6 +3791,21 @@ struct oxr_session
 	 */
 
 	/*!
+	 * The answer xrGetCurrentInteractionProfile last logged for each top-level
+	 * path, so its [DIAG] line fires when the answer changes, not on every
+	 * call: apps poll it every frame (#2428).
+	 */
+	struct
+	{
+#define OXR_PATH_MEMBER(X)                                                                                             \
+	XrPath X;                                                                                                      \
+	bool X##_logged;
+
+		OXR_FOR_EACH_VALID_SUBACTION_PATH(OXR_PATH_MEMBER)
+#undef OXR_PATH_MEMBER
+	} logged_interaction_profile;
+
+	/*!
 	 * IPD, to be expanded to a proper 3D relation.
 	 */
 	float ipd_meters;
