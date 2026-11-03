@@ -186,6 +186,20 @@ ul_map_radius_from_width_mm(const struct ul_map *map, float width_mm)
 	return (width_mm / 1000.0f) * 0.5f * map->scale;
 }
 
+float
+ul_map_palm_radius_from_width_mm(const struct ul_map *map, float palm_width_mm)
+{
+	const float w = palm_width_mm > 0.0f ? palm_width_mm : UL_MAP_TYPICAL_PALM_WIDTH_MM;
+	return (w / 1000.0f) * UL_MAP_PALM_RADIUS_PER_WIDTH * map->scale;
+}
+
+float
+ul_map_wrist_radius_from_width_mm(const struct ul_map *map, float arm_width_mm)
+{
+	const float w = arm_width_mm > 0.0f ? arm_width_mm : UL_MAP_TYPICAL_ARM_WIDTH_MM;
+	return (w / 1000.0f) * UL_MAP_WRIST_RADIUS_PER_WIDTH * map->scale;
+}
+
 struct xrt_quat
 ul_map_orientation(float x, float y, float z, float w)
 {

@@ -127,9 +127,44 @@ ul_map_position_mm(const struct ul_map *map, float x_mm, float y_mm, float z_mm)
 struct xrt_vec3
 ul_map_velocity_mm_s(const struct ul_map *map, float x_mm_s, float y_mm_s, float z_mm_s);
 
-//! A Leap bone width (millimetres) → joint radius in display-plane metres.
+//! A Leap finger-bone width (millimetres) → joint radius in display-plane metres (half the width: a finger is ~round).
 float
 ul_map_radius_from_width_mm(const struct ul_map *map, float width_mm);
+
+/*!
+ * Palm-thickness fraction of the palm width for the PALM joint radius.
+ *
+ * XR_EXT_hand_tracking's `radius` is the distance from the joint to the
+ * surface of the skin — a sphere fitting the hand's THICKNESS at the joint.
+ * The finger joints get that from their bone's width (a finger is roughly
+ * round, so half its width is its half-thickness), but the palm and the wrist
+ * are flat: Leap's `palm.width` (~85 mm, knuckle to knuckle) and `arm.width`
+ * (~60 mm across the wrist) are their WIDE dimension, and half of either gave
+ * a ~4 cm palm and ~3 cm wrist sphere that swallows the hand (partner rerun,
+ * Unity Joint Spheres, 2026-11-03).
+ *
+ * Adult anthropometry: palm thickness at the metacarpals ~25-30 mm for a hand
+ * breadth of ~80-90 mm (thickness/breadth ~0.3), so the half-thickness is
+ * ~0.15 of the palm width (85 mm → 12.8 mm). The wrist is less flat
+ * (depth/breadth ~0.6, ~35-40 mm deep for ~55-65 mm broad), so its
+ * half-thickness is ~0.3 of the arm width (60 mm → 18 mm). Like every other
+ * radius, both are then scaled by the mapping's gain.
+ */
+#define UL_MAP_PALM_RADIUS_PER_WIDTH 0.15f
+//! Wrist-thickness fraction of the arm width for the WRIST joint radius (see the palm's).
+#define UL_MAP_WRIST_RADIUS_PER_WIDTH 0.30f
+//! Typical adult palm width, used when Leap reports a non-positive one.
+#define UL_MAP_TYPICAL_PALM_WIDTH_MM 85.0f
+//! Typical adult wrist (arm) width, used when Leap reports a non-positive one.
+#define UL_MAP_TYPICAL_ARM_WIDTH_MM 60.0f
+
+//! Leap `palm.width` (mm) → PALM joint radius (half palm THICKNESS), display-plane metres.
+float
+ul_map_palm_radius_from_width_mm(const struct ul_map *map, float palm_width_mm);
+
+//! Leap `arm.width` (mm) → WRIST joint radius (half wrist THICKNESS), display-plane metres.
+float
+ul_map_wrist_radius_from_width_mm(const struct ul_map *map, float arm_width_mm);
 
 //! A Leap orientation → display-plane orientation (axis-identity: passes through).
 struct xrt_quat
