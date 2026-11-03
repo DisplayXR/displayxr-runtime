@@ -25,6 +25,7 @@
 #include <xrt/xrt_config_os.h>
 #include <xrt/xrt_results.h>
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef XRT_OS_ANDROID
@@ -47,7 +48,8 @@ android_main_thread_dispatch_init(void);
  * completes.
  *
  * If dispatch has not been initialized, or the caller is already the main thread,
- * @p fn is invoked inline on the calling thread (graceful fallback).
+ * @p fn is invoked inline on the calling thread (graceful fallback). Code that
+ * needs a Looper in every configuration wants @ref android_run_on_looper_thread_timeout.
  *
  * @param fn   the callback to run on the main thread.
  * @param data opaque argument forwarded to @p fn.
@@ -70,6 +72,38 @@ android_run_on_main_thread_blocking(void (*fn)(void *), void *data);
  */
 xrt_result_t
 android_run_on_main_thread_timeout(void (*fn)(void *), void *data, int64_t timeout_ns);
+
+/*!
+ * Whether @ref android_main_thread_dispatch_init succeeded in this process
+ * (true in the out-of-process service, false in-process).
+ * @ingroup aux_android
+ */
+bool
+android_main_thread_dispatch_is_initialized(void);
+
+/*!
+ * Run @p fn (@p data) on a thread that owns a pumped ALooper, and wait for it.
+ * Use this for anything (notably a vendor display-processor factory) whose
+ * init posts to the calling thread's Looper (#510 M2, #2490).
+ *
+ * Where it runs, in order:
+ *  1. main-thread dispatch initialized (service): on the Android main thread,
+ *     exactly like @ref android_run_on_main_thread_timeout;
+ *  2. the caller already owns an ALooper (native_app_glue, a UI thread):
+ *     inline;
+ *  3. otherwise (a bare render thread, the compositor worker): on a
+ *     runtime-owned looper thread, started on first use, attached to the VM
+ *     when one is published, and pumped for the life of the process.
+ *
+ * @param timeout_ns same contract as @ref android_run_on_main_thread_timeout
+ *                   (0 or negative = wait forever).
+ * @return XRT_SUCCESS once @p fn has run; XRT_TIMEOUT if it was abandoned;
+ *         XRT_ERROR_THREADING_INIT_FAILURE if no looper thread could be made
+ *         (@p fn has not run).
+ * @ingroup aux_android
+ */
+xrt_result_t
+android_run_on_looper_thread_timeout(void (*fn)(void *), void *data, int64_t timeout_ns);
 
 #ifdef __cplusplus
 }

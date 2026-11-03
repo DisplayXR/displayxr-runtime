@@ -11,6 +11,9 @@
 #ifdef XRT_OS_ANDROID
 
 #include "util/u_logging.h"
+#include "android/android_globals.h"
+
+#include <jni.h>
 
 #include <android/looper.h>
 
@@ -63,21 +66,32 @@ task_unref(struct main_thread_task *task)
 	}
 }
 
-static struct
+/*!
+ * One Looper we can post tasks to: a self-pipe whose read end is registered on
+ * that Looper with an fd callback. Two instances exist — the service main
+ * thread (@ref g_dispatch) and the runtime-owned looper thread (@ref g_worker).
+ */
+struct looper_dispatch
 {
 	bool initialized;
 	ALooper *looper;
 	int pipe_read;
 	int pipe_write;
-	pthread_t main_thread;
+	pthread_t thread;
 	pthread_mutex_t submit_lock;
-} g_dispatch = {
-    .initialized = false,
-    .looper = NULL,
-    .pipe_read = -1,
-    .pipe_write = -1,
-    .submit_lock = PTHREAD_MUTEX_INITIALIZER,
 };
+
+#define LOOPER_DISPATCH_INIT                                                                                           \
+	{                                                                                                              \
+		.initialized = false, .looper = NULL, .pipe_read = -1, .pipe_write = -1,                               \
+		.submit_lock = PTHREAD_MUTEX_INITIALIZER,                                                              \
+	}
+
+//! The Android main thread (service / diag targets only).
+static struct looper_dispatch g_dispatch = LOOPER_DISPATCH_INIT;
+
+//! The runtime-owned looper thread (lazily started, process lifetime).
+static struct looper_dispatch g_worker = LOOPER_DISPATCH_INIT;
 
 /*!
  * ALooper fd callback — runs on the main thread when the pipe becomes readable.
@@ -119,6 +133,41 @@ on_pipe_readable(int fd, int events, void *data)
 	return 1; // keep the fd registered
 }
 
+/*!
+ * Register a self-pipe on @p looper (owned by the calling thread) so tasks can
+ * be posted to it. Returns false and leaves @p d untouched on failure.
+ */
+static bool
+looper_dispatch_attach(struct looper_dispatch *d, ALooper *looper, const char *name)
+{
+	int fds[2];
+	if (pipe(fds) != 0) {
+		U_LOG_E("android_main_thread: %s: pipe() failed: %s", name, strerror(errno));
+		return false;
+	}
+
+	// Read end non-blocking so the drain loop terminates cleanly on EAGAIN.
+	int flags = fcntl(fds[0], F_GETFL, 0);
+	fcntl(fds[0], F_SETFL, flags | O_NONBLOCK);
+
+	ALooper_acquire(looper);
+	int ret = ALooper_addFd(looper, fds[0], ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT, on_pipe_readable, NULL);
+	if (ret != 1) {
+		U_LOG_E("android_main_thread: %s: ALooper_addFd failed (%d)", name, ret);
+		ALooper_release(looper);
+		close(fds[0]);
+		close(fds[1]);
+		return false;
+	}
+
+	d->looper = looper;
+	d->pipe_read = fds[0];
+	d->pipe_write = fds[1];
+	d->thread = pthread_self();
+	d->initialized = true;
+	return true;
+}
+
 void
 android_main_thread_dispatch_init(void)
 {
@@ -128,54 +177,144 @@ android_main_thread_dispatch_init(void)
 
 	ALooper *looper = ALooper_forThread();
 	if (looper == NULL) {
-		U_LOG_W("android_main_thread: no Looper on the calling thread; main-thread "
-		        "dispatch disabled (callbacks will run inline)");
+		U_LOG_W(
+		    "android_main_thread: no Looper on the calling thread; main-thread "
+		    "dispatch disabled (callbacks will run on the runtime looper thread)");
 		return;
 	}
 
-	int fds[2];
-	if (pipe(fds) != 0) {
-		U_LOG_E("android_main_thread: pipe() failed: %s", strerror(errno));
-		return;
+	if (looper_dispatch_attach(&g_dispatch, looper, "main")) {
+		U_LOG_W("android_main_thread: main-thread dispatch ready (pipe r=%d w=%d)", g_dispatch.pipe_read,
+		        g_dispatch.pipe_write);
 	}
-
-	// Read end non-blocking so the drain loop terminates cleanly on EAGAIN.
-	int flags = fcntl(fds[0], F_GETFL, 0);
-	fcntl(fds[0], F_SETFL, flags | O_NONBLOCK);
-
-	ALooper_acquire(looper);
-	int ret = ALooper_addFd(looper, fds[0], ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT,
-	                        on_pipe_readable, NULL);
-	if (ret != 1) {
-		U_LOG_E("android_main_thread: ALooper_addFd failed (%d)", ret);
-		ALooper_release(looper);
-		close(fds[0]);
-		close(fds[1]);
-		return;
-	}
-
-	g_dispatch.looper = looper;
-	g_dispatch.pipe_read = fds[0];
-	g_dispatch.pipe_write = fds[1];
-	g_dispatch.main_thread = pthread_self();
-	g_dispatch.initialized = true;
-
-	U_LOG_W("android_main_thread: main-thread dispatch ready (pipe r=%d w=%d)", fds[0], fds[1]);
 }
 
-xrt_result_t
-android_run_on_main_thread_timeout(void (*fn)(void *), void *data, int64_t timeout_ns)
+bool
+android_main_thread_dispatch_is_initialized(void)
 {
-	if (fn == NULL) {
-		return XRT_SUCCESS;
+	return g_dispatch.initialized;
+}
+
+
+/*
+ *
+ * Runtime-owned looper thread (#2490).
+ *
+ * In-process there is no service JNI entry point to install main-thread
+ * dispatch, so a display processor was created on whatever thread asked for
+ * it — often an app render thread or the compositor worker, neither of which
+ * owns an ALooper. A vendor DP that posts its async init to the calling
+ * thread's Looper then never came up, silently. This thread owns an ALooper
+ * and pumps it for the life of the process, so such an init (and any later
+ * callback the DP posts to the same Looper) always gets serviced.
+ *
+ */
+
+struct worker_start
+{
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	bool done;
+	bool ok;
+};
+
+static void *
+looper_worker_main(void *ptr)
+{
+	struct worker_start *start = (struct worker_start *)ptr;
+
+	pthread_setname_np(pthread_self(), "dxr-dp-looper");
+
+	/*
+	 * Attach to the VM if the process published one: a display processor's
+	 * init may make JNI calls on this thread. A natively attached thread
+	 * resolves classes through the system class loader, so anything that
+	 * needs application classes must cache them up front (JNI_OnLoad) — the
+	 * same constraint as any other runtime worker thread.
+	 */
+	JavaVM *vm = (JavaVM *)android_globals_get_vm();
+	if (vm != NULL) {
+		JNIEnv *env = NULL;
+		JavaVMAttachArgs args = {.version = JNI_VERSION_1_6, .name = "dxr-dp-looper", .group = NULL};
+		if ((*vm)->AttachCurrentThread(vm, &env, &args) != JNI_OK) {
+			U_LOG_W("android_main_thread: looper thread could not attach to the VM; continuing unattached");
+		}
 	}
 
-	// Not initialized, or we're already on the main thread → run inline (no
-	// marshaling needed, and avoids deadlocking on ourselves).
-	if (!g_dispatch.initialized || pthread_equal(pthread_self(), g_dispatch.main_thread)) {
-		fn(data);
-		return XRT_SUCCESS;
+	ALooper *looper = ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
+	bool ok = looper != NULL && looper_dispatch_attach(&g_worker, looper, "looper-thread");
+
+	pthread_mutex_lock(&start->lock);
+	start->ok = ok;
+	start->done = true;
+	pthread_cond_signal(&start->cond);
+	pthread_mutex_unlock(&start->lock);
+	// `start` belongs to the starter's frame: not touched past this point.
+
+	if (!ok) {
+		U_LOG_E("android_main_thread: runtime looper thread failed to set up its ALooper");
+		return NULL;
 	}
+
+	U_LOG_I("android_main_thread: runtime looper thread ready (pipe r=%d w=%d)", g_worker.pipe_read,
+	        g_worker.pipe_write);
+
+	// Process lifetime: a display processor may post to this Looper at any
+	// time after its init, so it is never torn down.
+	for (;;) {
+		ALooper_pollOnce(-1, NULL, NULL, NULL);
+	}
+	return NULL;
+}
+
+static pthread_mutex_t g_worker_start_lock = PTHREAD_MUTEX_INITIALIZER;
+
+//! Start the runtime looper thread once. Returns whether it is usable.
+static bool
+looper_worker_ensure(void)
+{
+	pthread_mutex_lock(&g_worker_start_lock);
+	if (g_worker.initialized) {
+		pthread_mutex_unlock(&g_worker_start_lock);
+		return true;
+	}
+
+	struct worker_start start = {.done = false, .ok = false};
+	pthread_mutex_init(&start.lock, NULL);
+	pthread_cond_init(&start.cond, NULL);
+
+	pthread_t thread;
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	int err = pthread_create(&thread, &attr, looper_worker_main, &start);
+	pthread_attr_destroy(&attr);
+
+	bool ok = false;
+	if (err != 0) {
+		U_LOG_E("android_main_thread: pthread_create for the runtime looper thread failed: %s", strerror(err));
+	} else {
+		pthread_mutex_lock(&start.lock);
+		while (!start.done) {
+			pthread_cond_wait(&start.cond, &start.lock);
+		}
+		ok = start.ok;
+		pthread_mutex_unlock(&start.lock);
+	}
+
+	pthread_cond_destroy(&start.cond);
+	pthread_mutex_destroy(&start.lock);
+	pthread_mutex_unlock(&g_worker_start_lock);
+	return ok;
+}
+
+/*!
+ * Post @p fn to the Looper behind @p d and wait for it (see the header for the
+ * timeout contract). @p d must be initialized and not the calling thread's.
+ */
+static xrt_result_t
+looper_dispatch_run(struct looper_dispatch *d, void (*fn)(void *), void *data, int64_t timeout_ns)
+{
 
 	struct main_thread_task *task = calloc(1, sizeof(*task));
 	if (task == NULL) {
@@ -195,9 +334,9 @@ android_run_on_main_thread_timeout(void (*fn)(void *), void *data, int64_t timeo
 	pthread_condattr_destroy(&cattr);
 
 	// Serialize submissions so two posters can't interleave their pointer writes.
-	pthread_mutex_lock(&g_dispatch.submit_lock);
-	ssize_t n = write(g_dispatch.pipe_write, &task, sizeof(task));
-	pthread_mutex_unlock(&g_dispatch.submit_lock);
+	pthread_mutex_lock(&d->submit_lock);
+	ssize_t n = write(d->pipe_write, &task, sizeof(task));
+	pthread_mutex_unlock(&d->submit_lock);
 
 	if (n != (ssize_t)sizeof(task)) {
 		U_LOG_E("android_main_thread: failed to post task (%zd, %s); running inline", n,
@@ -233,7 +372,7 @@ android_run_on_main_thread_timeout(void (*fn)(void *), void *data, int64_t timeo
 			task->state = TASK_ABANDONED;
 			ret = XRT_TIMEOUT;
 			U_LOG_E(
-			    "android_main_thread: main thread did not pick up the task within %.0f ms - "
+			    "android_main_thread: target Looper did not pick up the task within %.0f ms - "
 			    "abandoned (#1007)",
 			    (double)timeout_ns / 1e6);
 			break;
@@ -252,6 +391,64 @@ android_run_on_main_thread_timeout(void (*fn)(void *), void *data, int64_t timeo
 
 	task_unref(task);
 	return ret;
+}
+
+xrt_result_t
+android_run_on_main_thread_timeout(void (*fn)(void *), void *data, int64_t timeout_ns)
+{
+	if (fn == NULL) {
+		return XRT_SUCCESS;
+	}
+
+	// Not initialized, or we're already on the main thread → run inline (no
+	// marshaling needed, and avoids deadlocking on ourselves).
+	if (!g_dispatch.initialized || pthread_equal(pthread_self(), g_dispatch.thread)) {
+		fn(data);
+		return XRT_SUCCESS;
+	}
+	return looper_dispatch_run(&g_dispatch, fn, data, timeout_ns);
+}
+
+xrt_result_t
+android_run_on_looper_thread_timeout(void (*fn)(void *), void *data, int64_t timeout_ns)
+{
+	if (fn == NULL) {
+		return XRT_SUCCESS;
+	}
+
+	// 1. Service / diag: the Java main Looper, as before (#510 M2).
+	if (g_dispatch.initialized) {
+		if (pthread_equal(pthread_self(), g_dispatch.thread)) {
+			fn(data);
+			return XRT_SUCCESS;
+		}
+		return looper_dispatch_run(&g_dispatch, fn, data, timeout_ns);
+	}
+
+	// Already on the runtime looper thread (nested call): inline.
+	if (g_worker.initialized && pthread_equal(pthread_self(), g_worker.thread)) {
+		fn(data);
+		return XRT_SUCCESS;
+	}
+
+	// 2. In-process, and the caller already owns a Looper (native_app_glue's
+	//    android_main, an Activity's UI thread): keep running inline there —
+	//    that is the configuration that has always worked.
+	if (ALooper_forThread() != NULL) {
+		fn(data);
+		return XRT_SUCCESS;
+	}
+
+	// 3. In-process from a thread with no Looper (#2490): hop to the
+	//    runtime-owned looper thread.
+	if (!looper_worker_ensure()) {
+		U_LOG_E(
+		    "android_main_thread: no Looper on the calling thread and the runtime looper thread is "
+		    "unavailable");
+		return XRT_ERROR_THREADING_INIT_FAILURE;
+	}
+	U_LOG_I("android_main_thread: calling thread has no ALooper; running on the runtime looper thread");
+	return looper_dispatch_run(&g_worker, fn, data, timeout_ns);
 }
 
 xrt_result_t
