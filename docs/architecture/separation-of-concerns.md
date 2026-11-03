@@ -1,7 +1,7 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-10-08
+updated: 2026-11-02
 ---
 # Separation of Concerns: App → OXR → Compositor → Driver/DP
 
@@ -36,6 +36,7 @@ This document defines what each architectural layer owns and what must not cross
 - Calls `xdp->process_atlas()` to transform atlas → display output
 - Eye position pass-through from display processor to OXR
 - Window management (uses app-provided handle or creates own)
+- **Windows: the D3D11 hub ([ADR-059](../adr/ADR-059-d3d11-hub-compositor-windows.md))**: an in-process tier may hand the DP call, the present and the window target to `compositor/hub_d3d11/`. The tier then renders its atlas into a shared deposit and the hub weaves and presents (the decision is logged on a `hub placement:` line). The hub is a compositor like the others and obeys the same must-NOT rules below
 - **Window placement on macOS (Metal, [ADR-050](../adr/ADR-050-macos-runtime-owns-window-placement.md))**: owns the drag / resize gesture of the bound window — the move is phase-snapped by the DP (`snap_window_rect`) and applied in the same Core Animation transaction as the frame woven for it; the DP is told the applied origin (`set_present_origin`). The compositor owns *when* and *where* a window lands; the DP owns *which* positions preserve the phase. Never a phase computation in the runtime
 - **Must NOT contain**: OpenXR extension logic, vendor-specific interlacing, mode enumeration
 

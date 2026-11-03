@@ -303,7 +303,7 @@ themselves on top of the throttle — double pacing; on vsync-blocking tiers the
 off its slots to cycle + stride, measured 14/s on a 20/s schedule), and animation steps
 by `predictedDisplayTime` deltas, which stride honestly. Releases sit on a fixed grid —
 never re-anchored — so a late app converges back onto its slots. Measured precursors
-**Supported tier: the #918 split's d3d11 fill arm — hybrid AND, since ADR-039 Phase A,
+**Supported tier: the #918 split's d3d11 fill arm (now `comp_hub_d3d11`, ADR-059) — hybrid AND, since ADR-039 Phase A,
 same-adapter** — the hybrid acceptance record is steady 60.0 presents across long runs,
 exact weave/repaint pair, GPU 25.5→19.0%, and the eyeball verdicts "tracking is great no
 stutter very good experience" / "looks great this run"; the same-adapter record (#1264,
@@ -715,8 +715,11 @@ woven frame, and every repaint tick, crosses inside `Present`. Measured on the r
 purely on re-transfer.
 
 The **output-device split** (above) is that scanout-local pipeline, and since #918 Phase 3 it is
-the DEFAULT rather than a flag. It runs on the D3D11 windowed path, on the in-process D3D12 path
-(projection-only), and on **both** of the
+the DEFAULT rather than a flag. In-process, a window-bound D3D11 or D3D12 session on a hybrid box
+weaves and presents through the D3D11 hub, `comp_hub_d3d11` (ADR-059: D3D11 since #2363, D3D12
+since #2375), and the Vulkan tier's split is the same hub. Sessions the hub refuses (on D3D11,
+a `_hosted` window or a transparent session) and sessions under a kill switch run the tier's own-legs split. The
+service runs its own split on **both** of the
 D3D11 service's paths — the DIRECT path (PR 3) and the COMPOSE path with a workspace controller
 attached (PR 4). So a forced-IPC `_handle` app, a hosted client presenting through the service
 window, and the shell composing several of them all weave and present on the scanout adapter, and
@@ -750,13 +753,14 @@ stack (all six share flavours fail at the open call, both directions), so the tr
 `SHARED | SHARED_CROSS_ADAPTER` heap with D3D11 on both ends; KMT handles share no pixels on some
 integrated drivers, so use NT handles.
 
-There is still **no hybrid-specific default** — unflagged, you get the dGPU column with a
-cross-adapter copy. #918 stays **open** on Phase 3, which owns default-on, and default-on has a
-hard external gate: **SR Platform ≥ 1.37.0+1498**. Below that the scanout weave emits
-transparent-black bursts while nobody is tracked (#1134, closed — a non-monotonic pulse-animation
-clock in the vendor weavers, fixed as LeiaSR#190 and verified 0/40 against 8/40 pre-fix). Until
-Phase 3 lands, read the split as the lever to try first when a hybrid box shows a ~2.5-frame
-residual, not as tuning advice.
+So the hybrid column has its own default: the scanout-local pipeline, with no flag. #918 is
+closed: its Phase 3 made the split the default, and #2363 / #2375 then moved the in-process half
+onto the D3D11 hub. The split still needs **SR Platform ≥ 1.37.0+1498** on Leia hardware. Below
+that the scanout weave emits transparent-black bursts while nobody is tracked (#1134, closed — a
+non-monotonic pulse-animation clock in the vendor weavers, fixed as LeiaSR#190 and verified 0/40
+against 8/40 pre-fix). To tell which pipeline a session got, read its `hub placement:` line
+(in-process) or its `weave placement:` / `[RENDER] split=` lines; `DXR_HUB=0` and
+`DXR_WEAVE_ON_SCANOUT=0` are the A/B controls.
 
 ## Measuring any of this
 
