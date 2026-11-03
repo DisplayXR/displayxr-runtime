@@ -130,6 +130,10 @@ cli_cmd_lift(int argc, const char **argv);
 int
 cli_cmd_camera(int argc, const char **argv);
 
+//! `share` — XR_DXR_app_share (ADR-061): `share list|probe` aliases of `camera` for app entries, `share settings`.
+int
+cli_cmd_share(int argc, const char **argv);
+
 //! `desktop` — XR_DXR_desktop_control (ADR-056): `desktop status|stop|resume|allow|deny|forget|audit`
 //! over the user's store and audit log (local; never a backend, never the desktop).
 int
