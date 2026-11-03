@@ -669,6 +669,10 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 	// In-process consumers (the input host iface shared-camera slot) share the
 	// CAMERA_CONSUMER quota with connections.
 	ipc_server_stereo_camera_attach_server(s->stereo_camera, s);
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// ADR-061: the D3D11 service compositor's pre-weave tap.
+	ipc_server_share_tap_d3d11_install(s);
+#endif
 
 	// ADR-051 D3: the display status snapshot + generation counters.
 	ipc_server_status_init(s);
