@@ -816,6 +816,23 @@
 #define OXR_EXTENSION_SUPPORT_DXR_stereo_camera(_)
 #endif
 
+/*
+ * XR_DXR_app_share
+ *
+ * Hand-added DisplayXR extension (keep when regenerating). 3D screen share
+ * (ADR-061): running apps' pre-weave views listed as stereo-camera sources of
+ * kind app. Requires XR_DXR_stereo_camera (checked at xrCreateInstance).
+ * Advertised wherever the stereo camera is: an app entry the service cannot
+ * tap is listed UNAVAILABLE with a reason, never hidden.
+ */
+#if defined(XR_DXR_app_share) && defined(XR_DXR_stereo_camera)
+#define OXR_HAVE_DXR_app_share
+#define OXR_EXTENSION_SUPPORT_DXR_app_share(_) \
+    _(DXR_app_share, DXR_APP_SHARE)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_app_share(_)
+#endif
+
 
 /*
  * XR_DXR_desktop_control
@@ -1371,6 +1388,7 @@
     OXR_EXTENSION_SUPPORT_DXR_weave(_) \
     OXR_EXTENSION_SUPPORT_DXR_lift(_) \
     OXR_EXTENSION_SUPPORT_DXR_stereo_camera(_) \
+    OXR_EXTENSION_SUPPORT_DXR_app_share(_) \
     OXR_EXTENSION_SUPPORT_DXR_workspace_file_dialog(_) \
     OXR_EXTENSION_SUPPORT_DXR_mcp_tools(_) \
     OXR_EXTENSION_SUPPORT_DXR_desktop_control(_) \

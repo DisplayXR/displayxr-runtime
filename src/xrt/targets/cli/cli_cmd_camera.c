@@ -874,7 +874,7 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 		wakes++;
 		bool ready = false;
 		struct xrt_stereo_camera_frame_info fi;
-		xret = ipc_client_stereo_camera_acquire(ipc_c, sid, &ready, &fi);
+		xret = ipc_client_stereo_camera_acquire(ipc_c, sid, &ready, &fi, NULL);
 		if (xret == XRT_ERROR_STEREO_CAMERA_STREAM_ENDED) {
 			printf("acquire: %d%s\n", (int)xret, result_hint(xret));
 			ended = true;

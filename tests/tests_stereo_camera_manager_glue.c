@@ -133,6 +133,8 @@ struct scm_fixture
 	const uint8_t *map;
 	uint64_t map_size;
 	uint64_t slot_stride;
+	//! ADR-061: the app metadata of the last acquired frame.
+	struct xrt_app_share_frame_info last_app;
 #ifdef XRT_OS_WINDOWS
 	HANDLE section;
 #else
@@ -501,7 +503,7 @@ scm_acquire(struct scm_fixture *f,
             struct xrt_stereo_camera_frame_info *out_frame,
             const uint8_t **out_slot)
 {
-	xrt_result_t xret = ipc_handle_stereo_camera_acquire(&f->ics, id, out_ready, out_frame);
+	xrt_result_t xret = ipc_handle_stereo_camera_acquire(&f->ics, id, out_ready, out_frame, &f->last_app);
 	*out_slot = NULL;
 	if (xret == XRT_SUCCESS && *out_ready && f->map != NULL) {
 		*out_slot = f->map + (uint64_t)out_frame->slot * f->slot_stride;

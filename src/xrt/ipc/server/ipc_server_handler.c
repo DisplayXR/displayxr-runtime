@@ -2759,9 +2759,11 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 
 	ics->client_state.session_overlay = xsi->is_overlay;
 	ics->client_state.z_order = xsi->z_order;
+	ics->app_share_opt_out = xsi->app_share_not_shareable; // ADR-061 spec §5
 
 	ics->xs = xs;
 	ics->xc = xcn != NULL ? &xcn->base : NULL;
+	ipc_server_stereo_camera_apps_changed(ics->server->stereo_camera); // ADR-061: a new shareable session?
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// #1018: hand the compositor this client's OS-derived pid so the
@@ -2822,7 +2824,9 @@ ipc_handle_session_begin(volatile struct ipc_client_state *ics)
 	    .meta_body_tracking_calibration_enabled = ics->client_state.info.meta_body_tracking_calibration_enabled,
 	};
 
-	return xrt_comp_begin_session(ics->xc, &begin_session_info);
+	xrt_result_t xret = xrt_comp_begin_session(ics->xc, &begin_session_info);
+	ipc_server_stereo_camera_apps_changed(ics->server->stereo_camera); // ADR-061
+	return xret;
 }
 
 xrt_result_t
@@ -2840,7 +2844,9 @@ ipc_handle_session_end(volatile struct ipc_client_state *ics)
 		return XRT_ERROR_IPC_COMPOSITOR_NOT_CREATED;
 	}
 
-	return xrt_comp_end_session(ics->xc);
+	xrt_result_t xret = xrt_comp_end_session(ics->xc);
+	ipc_server_stereo_camera_apps_changed(ics->server->stereo_camera); // ADR-061
+	return xret;
 }
 
 xrt_result_t

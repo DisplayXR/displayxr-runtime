@@ -134,14 +134,35 @@ xrt_result_t
 ipc_client_stereo_camera_acquire(struct ipc_connection *ipc_c,
                                  uint64_t stream_id,
                                  bool *out_ready,
-                                 struct xrt_stereo_camera_frame_info *out_frame)
+                                 struct xrt_stereo_camera_frame_info *out_frame,
+                                 struct xrt_app_share_frame_info *out_app)
 {
 	*out_ready = false;
 	U_ZERO(out_frame);
+	struct xrt_app_share_frame_info app = {0};
 	if (ipc_c == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return ipc_call_stereo_camera_acquire(ipc_c, stream_id, out_ready, out_frame);
+	xrt_result_t xret = ipc_call_stereo_camera_acquire(ipc_c, stream_id, out_ready, out_frame, &app);
+	if (out_app != NULL) {
+		*out_app = app;
+	}
+	return xret;
+}
+
+xrt_result_t
+ipc_client_stereo_camera_get_app_source(struct ipc_connection *ipc_c,
+                                        uint64_t camera_id,
+                                        struct xrt_app_share_source_info *out_info)
+{
+	U_ZERO(out_info);
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	xrt_result_t xret = ipc_call_stereo_camera_get_app_source(ipc_c, camera_id, out_info);
+	out_info->executable_name[sizeof(out_info->executable_name) - 1] = '\0';
+	out_info->application_name[sizeof(out_info->application_name) - 1] = '\0';
+	return xret;
 }
 
 xrt_result_t
@@ -259,9 +280,16 @@ static xrt_result_t
 c_acquire(struct xrt_stereo_camera_client *c,
           uint64_t stream_id,
           bool *out_ready,
-          struct xrt_stereo_camera_frame_info *out_frame)
+          struct xrt_stereo_camera_frame_info *out_frame,
+          struct xrt_app_share_frame_info *out_app)
 {
-	return ipc_client_stereo_camera_acquire(conn(c), stream_id, out_ready, out_frame);
+	return ipc_client_stereo_camera_acquire(conn(c), stream_id, out_ready, out_frame, out_app);
+}
+
+static xrt_result_t
+c_get_app_source(struct xrt_stereo_camera_client *c, uint64_t camera_id, struct xrt_app_share_source_info *out)
+{
+	return ipc_client_stereo_camera_get_app_source(conn(c), camera_id, out);
 }
 
 static xrt_result_t
@@ -296,6 +324,7 @@ ipc_client_stereo_camera_client_create(struct ipc_connection *ipc_c)
 	c->base.stream_stop = c_stream_stop;
 	c->base.stream_get_transport = c_stream_get_transport;
 	c->base.acquire = c_acquire;
+	c->base.get_app_source = c_get_app_source;
 	c->base.stats = c_stats;
 	c->base.poll_event = c_poll_event;
 	c->base.control = c_control;
