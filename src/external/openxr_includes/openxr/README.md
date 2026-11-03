@@ -59,7 +59,8 @@ Rules:
 | 1004999410–419 | `XR_DXR_input_providers` | 410 = `XR_TYPE_INPUT_PROVIDER_PROPERTIES_DXR`, 411 = `XR_TYPE_INPUT_PROVIDER_PREFERENCE_INFO_DXR`, 412 = `XR_TYPE_EVENT_DATA_INPUT_PROVIDERS_CHANGED_DXR` (spec v1, ADR-034 Amendment 5, #2181). 370–399 deliberately skipped: it is the natural continuation of `XR_DXR_lift`'s 340–369 block, which the lift spec 5 work (#2178) may still claim |
 | 1004999420–429 | `XR_DXR_desktop_control` (v2+ additions) | 420 = `XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR` (spec v2, the consent dialog's parent window — ADR-056 Amendment 1). A fresh decade because 400–409 is full and 410–419 is `XR_DXR_input_providers`'. 421 = `XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR` (spec v3, PROPOSED — modifiers held around a click / drag / scroll, ADR-056 Amendment 3); 422–429 free |
 | 1004999370–379 | `XR_DXR_swapchain_color_encoding` | 370 = `XR_TYPE_SWAPCHAIN_COLOR_ENCODING_CREATE_INFO_DXR` (spec v1, ADR-044 Amendment 1); 371–379 free |
-| 1004999380–399, 1004999430+ | **next free** | |
+| 1004999430–439 | `XR_DXR_display_info` (v25+ additions) | 430 = `XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR` (spec v25 — chained on `XrViewLocateInfo`: locate for the nominal viewer and post no viewer-tracking demand). A fresh decade because 210–219 is full; 431–439 free for it |
+| 1004999380–399, 1004999440+ | **next free** | |
 
 `XR_DXR_android_surface_binding` was implemented in #1037 and now has its own
 header and decade — see the row above for why its create-info type value sits

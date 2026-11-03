@@ -100,6 +100,13 @@ struct ipc_client_state
 	//! Is the inputs and outputs active.
 	bool io_active;
 
+	//! XR_DXR_display_info v25: this client's locates are fixed-viewer
+	//! (XrViewLocateFixedViewerDXR) — its views are framed for the nominal
+	//! viewer and it asks the viewer tracking for nothing, so no viewer-
+	//! tracking provider is started for it. Set by compositor_set_fixed_viewer
+	//! on change; cleared with the session.
+	bool fixed_viewer;
+
 	//! Number of swapchains in use by client
 	uint32_t swapchain_count;
 
