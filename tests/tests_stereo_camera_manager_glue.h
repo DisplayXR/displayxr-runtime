@@ -130,6 +130,68 @@ scm_poll_event(struct scm_fixture *f, struct xrt_stereo_camera_event *out);
 xrt_result_t
 scm_set_sharing(struct scm_fixture *f, bool enabled);
 
+/*
+ * ADR-061 app share: a manager over the fake plug-in (its camera list from
+ * scm_fake_plugin_set) with app entries, fake app connections in the server's
+ * connection table, a scripted share prompt and an optional fake share tap.
+ */
+struct scm_app_options
+{
+	int32_t dev;         //!< DXR_APP_SHARE_DEV: > 0 on, < 0 off
+	int32_t fake;        //!< DXR_APP_SHARE_FAKE: > 0 on, < 0 off
+	int32_t linger_ms;   //!< 0 = 10 s
+	int32_t prompt_mode; //!< 1 = always, 2 = per-app-run
+	bool consumer_sees_apps; //!< the consumer enabled XR_DXR_app_share
+};
+
+struct scm_fixture *
+scm_create_apps(const struct scm_app_options *o);
+
+//! The consumer connection's internal XR_DXR_app_share flag.
+void
+scm_set_consumer_sees_apps(struct scm_fixture *f, bool on);
+
+//! A connection with a session + compositor in server slot @p slot (1..).
+void
+scm_app_connect(struct scm_fixture *f, uint32_t slot, uint32_t client_id, long pid, const char *name, uint32_t cls,
+                bool opted_out);
+
+//! The connection in @p slot loses its session (and goes away).
+void
+scm_app_disconnect(struct scm_fixture *f, uint32_t slot);
+
+//! What the service does at session teardown, before the compositor goes.
+void
+scm_app_session_ending(struct scm_fixture *f, uint32_t slot);
+
+bool
+scm_rescan_apps(struct scm_fixture *f);
+
+xrt_result_t
+scm_app_source(struct scm_fixture *f, uint64_t camera_id, struct xrt_app_share_source_info *out);
+
+//! The app metadata of the last scm_acquire'd frame.
+struct xrt_app_share_frame_info
+scm_last_app(struct scm_fixture *f);
+
+//! The scripted share prompt's answer; returns how often it was shown so far.
+void
+scm_set_share_answer(int answer);
+int
+scm_share_prompts(void);
+
+//! A fake share tap (platform hooks): AVAILABLE, frames from the synthetic pattern. false clears.
+void
+scm_set_tap(bool enabled);
+int
+scm_tap_attached(void); //!< currently attached taps
+
+uint32_t
+scm_stop_all(void);
+
+bool
+scm_status(uint32_t *out_share_streams, char *out_shares, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

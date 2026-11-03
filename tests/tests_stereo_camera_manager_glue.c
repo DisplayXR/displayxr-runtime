@@ -20,6 +20,7 @@
 #include "xrt/xrt_plugin.h"
 #include "os/os_time.h"
 #include "util/u_camera_consent.h"
+#include "util/u_app_share_fake.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -279,11 +280,34 @@ scm_fake_plugin_enumerate_calls(void)
 	return g_fake.enumerate_calls;
 }
 
+static enum u_camera_consent_prompt_answer
+scm_share_prompt(void *ctx, const char *consumer_exe, long consumer_pid, const char *app_name, const char *app_exe,
+                 uint32_t timeout_ms);
+
+static struct scm_fixture *
+create_with_apps(const struct u_stereo_uvc_config *cfg,
+                 struct xrt_instance *xinst,
+                 int32_t rescan_period_ms,
+                 int32_t dev_override,
+                 const struct scm_app_options *ao);
+
 static struct scm_fixture *
 create_with(const struct u_stereo_uvc_config *cfg,
             struct xrt_instance *xinst,
             int32_t rescan_period_ms,
             int32_t dev_override)
+{
+	// Existing tests: no app entries, whatever the environment says.
+	const struct scm_app_options none = {.dev = -1, .fake = -1};
+	return create_with_apps(cfg, xinst, rescan_period_ms, dev_override, &none);
+}
+
+static struct scm_fixture *
+create_with_apps(const struct u_stereo_uvc_config *cfg,
+                 struct xrt_instance *xinst,
+                 int32_t rescan_period_ms,
+                 int32_t dev_override,
+                 const struct scm_app_options *ao)
 {
 	struct scm_fixture *f = (struct scm_fixture *)calloc(1, sizeof(*f));
 	if (f == NULL) {
@@ -299,8 +323,22 @@ create_with(const struct u_stereo_uvc_config *cfg,
 	o.uvc_config = &f->cfg; // an empty config (count 0) = no UVC camera
 	o.rescan_period_ms = rescan_period_ms;
 	o.dev_override = dev_override;
+	o.app_share_dev = ao->dev;
+	o.app_share_fake = ao->fake;
+	o.app_linger_ms = ao->linger_ms;
+	o.share_prompt_mode = ao->prompt_mode;
+	o.share_resolution = 1; // 720p, whatever the user store says
+	o.share_prompt = scm_share_prompt;
 	f->mgr = ipc_server_stereo_camera_create_ex(xinst, &o);
 	f->server.stereo_camera = f->mgr;
+	ipc_server_stereo_camera_attach_server(f->mgr, &f->server);
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		f->server.threads[i].ics.server_thread_index = -1; // no connection
+		f->server.threads[i].ics.server = &f->server;
+	}
+	if (ao->consumer_sees_apps) {
+		f->ics.client_state.info.stereo_camera_client_flags |= XRT_STEREO_CAMERA_CLIENT_INTERNAL_APP_SHARE;
+	}
 	f->ics.server = &f->server;
 	f->ics.client_state.client_class = XRT_CLIENT_CLASS_CAMERA_CONSUMER;
 #ifdef XRT_OS_WINDOWS
@@ -569,4 +607,235 @@ scm_set_present_owner(struct scm_fixture *f, bool present_owner, bool foreground
 	o->client_state.client_class =
 	    present_owner ? XRT_CLIENT_CLASS_PRESENT_OWNER : XRT_CLIENT_CLASS_CAMERA_CONSUMER;
 	g_scm_foreground = foreground;
+}
+
+
+/*
+ * ADR-061 app share.
+ */
+
+static int g_share_answer = U_CAMERA_CONSENT_PROMPT_ALLOW;
+static int g_share_prompts = 0;
+
+static enum u_camera_consent_prompt_answer
+scm_share_prompt(void *ctx, const char *consumer_exe, long consumer_pid, const char *app_name, const char *app_exe,
+                 uint32_t timeout_ms)
+{
+	(void)ctx;
+	(void)consumer_exe;
+	(void)consumer_pid;
+	(void)app_name;
+	(void)app_exe;
+	(void)timeout_ms;
+	g_share_prompts++;
+	return (enum u_camera_consent_prompt_answer)g_share_answer;
+}
+
+void
+scm_set_share_answer(int answer)
+{
+	g_share_answer = answer;
+	g_share_prompts = 0;
+}
+
+int
+scm_share_prompts(void)
+{
+	return g_share_prompts;
+}
+
+struct scm_fixture *
+scm_create_apps(const struct scm_app_options *o)
+{
+	memset(&g_fake_iface, 0, sizeof(g_fake_iface));
+	g_fake_iface.struct_size = (uint32_t)sizeof(g_fake_iface);
+	g_fake_iface.stereo_camera_enumerate = fake_enumerate;
+	g_fake_iface.stereo_camera_get_calibration = fake_get_calibration;
+	g_fake_iface.stereo_camera_open = fake_open;
+	g_fake_iface.stereo_camera_wait_frame = fake_wait_frame;
+	g_fake_iface.stereo_camera_release_frame = fake_release_frame;
+	g_fake_iface.stereo_camera_close = fake_close;
+	memset(&g_fake_xinst, 0, sizeof(g_fake_xinst));
+	g_fake_xinst.get_active_plugin = fake_get_active_plugin;
+	g_share_prompts = 0;
+	return create_with_apps(NULL, &g_fake_xinst, -1, -1, o);
+}
+
+void
+scm_set_consumer_sees_apps(struct scm_fixture *f, bool on)
+{
+	if (on) {
+		f->ics.client_state.info.stereo_camera_client_flags |= XRT_STEREO_CAMERA_CLIENT_INTERNAL_APP_SHARE;
+	} else {
+		f->ics.client_state.info.stereo_camera_client_flags &= ~XRT_STEREO_CAMERA_CLIENT_INTERNAL_APP_SHARE;
+	}
+}
+
+void
+scm_app_connect(struct scm_fixture *f, uint32_t slot, uint32_t client_id, long pid, const char *name, uint32_t cls,
+                bool opted_out)
+{
+	volatile struct ipc_client_state *o = &f->server.threads[slot].ics;
+	o->server_thread_index = (int)slot;
+	o->peer_pid = pid;
+	o->client_state.id = client_id;
+	o->client_state.client_class = cls;
+	snprintf((char *)o->client_state.info.application_name, sizeof(o->client_state.info.application_name), "%s",
+	         name);
+	// Never dereferenced by the manager: it only asks "is there a session + compositor?".
+	o->xs = (struct xrt_session *)(uintptr_t)0x1000;
+	o->xc = (struct xrt_compositor *)(uintptr_t)0x2000;
+	o->app_share_opt_out = opted_out;
+}
+
+void
+scm_app_disconnect(struct scm_fixture *f, uint32_t slot)
+{
+	volatile struct ipc_client_state *o = &f->server.threads[slot].ics;
+	o->xs = NULL;
+	o->xc = NULL;
+	o->server_thread_index = -1;
+}
+
+void
+scm_app_session_ending(struct scm_fixture *f, uint32_t slot)
+{
+	ipc_server_stereo_camera_app_session_ending(&f->server.threads[slot].ics);
+}
+
+bool
+scm_rescan_apps(struct scm_fixture *f)
+{
+	return ipc_server_stereo_camera_rescan_apps(f->mgr);
+}
+
+xrt_result_t
+scm_app_source(struct scm_fixture *f, uint64_t camera_id, struct xrt_app_share_source_info *out)
+{
+	return ipc_handle_stereo_camera_get_app_source(&f->ics, camera_id, out);
+}
+
+struct xrt_app_share_frame_info
+scm_last_app(struct scm_fixture *f)
+{
+	return f->last_app;
+}
+
+/*
+ * The fake share tap: what the Windows service compositor will supply.
+ */
+
+static int g_tap_attached = 0;
+
+static bool
+tap_query(void *ctx, uint32_t client_id, struct xrt_app_share_source_info *io, int64_t *out_last_commit_ns)
+{
+	(void)ctx;
+	(void)client_id;
+	io->availability = XRT_APP_SHARE_AVAILABLE;
+	io->content_eye_width = 1600;
+	io->content_eye_height = 900;
+	io->window_x = 10;
+	io->window_y = 20;
+	io->window_width = 1600;
+	io->window_height = 900;
+	io->view_count = 4;
+	io->active_view_count = 2;
+	*out_last_commit_ns = 0;
+	return true;
+}
+
+static xrt_result_t
+tap_attach(void *ctx, uint32_t client_id, uint32_t eye_w, uint32_t eye_h, float fps, void **out_tap)
+{
+	(void)ctx;
+	(void)client_id;
+	*out_tap = u_app_share_fake_create(eye_w, eye_h, fps);
+	if (*out_tap == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	g_tap_attached++;
+	return XRT_SUCCESS;
+}
+
+static uint32_t
+tap_wait(void *ctx,
+         void *tap,
+         int64_t timeout_ns,
+         struct xrt_plugin_stereo_camera_frame *out,
+         struct xrt_app_share_frame_info *info)
+{
+	(void)ctx;
+	struct u_app_share_fake_frame ff;
+	if (!u_app_share_fake_next((struct u_app_share_fake *)tap, timeout_ns, &ff)) {
+		return XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT;
+	}
+	out->sequence = ff.sequence;
+	out->time_ns = ff.time_ns;
+	out->width = ff.width;
+	out->height = ff.height;
+	out->format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12;
+	out->planes[0] = ff.planes[0];
+	out->planes[1] = ff.planes[1];
+	out->pitches[0] = ff.pitches[0];
+	out->pitches[1] = ff.pitches[1];
+	// A 16:9 source letterboxed nowhere, but report a sub-rect + mono to see it carried.
+	info->content_x = 0;
+	info->content_y = 8;
+	info->content_width = ff.width / 2;
+	info->content_height = ff.height - 16;
+	info->mono = 1;
+	info->content_generation = 3;
+	info->zero_disparity_shift_frac = 0.0f;
+	info->commit_time_ns = ff.time_ns;
+	return XRT_PLUGIN_STEREO_CAMERA_WAIT_OK;
+}
+
+static void
+tap_detach(void *ctx, void *tap)
+{
+	(void)ctx;
+	struct u_app_share_fake *f = (struct u_app_share_fake *)tap;
+	u_app_share_fake_destroy(&f);
+	g_tap_attached--;
+}
+
+void
+scm_set_tap(bool enabled)
+{
+	if (!enabled) {
+		ipc_server_stereo_camera_set_platform(NULL);
+		return;
+	}
+	struct ipc_server_stereo_camera_platform p;
+	memset(&p, 0, sizeof(p));
+	p.share_tap_query = tap_query;
+	p.share_tap_attach = tap_attach;
+	p.share_tap_wait_frame = tap_wait;
+	p.share_tap_detach = tap_detach;
+	ipc_server_stereo_camera_set_platform(&p);
+}
+
+int
+scm_tap_attached(void)
+{
+	return g_tap_attached;
+}
+
+uint32_t
+scm_stop_all(void)
+{
+	return ipc_server_stereo_camera_stop_all("test");
+}
+
+bool
+scm_status(uint32_t *out_share_streams, char *out_shares, size_t cap)
+{
+	struct ipc_server_stereo_camera_status st;
+	if (!ipc_server_stereo_camera_get_status(&st)) {
+		return false;
+	}
+	*out_share_streams = st.share_streams;
+	snprintf(out_shares, cap, "%s", st.shares);
+	return true;
 }

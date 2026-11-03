@@ -2292,6 +2292,12 @@ camera_thread(void *ptr)
 
 		switch (w) {
 		case XRT_PLUGIN_STEREO_CAMERA_WAIT_OK: {
+			if (cam_is_app(cam) && !cam->app.live) {
+				// ADR-061: a frame that was in flight when the app went: never
+				// published (it would flip the entry back to AVAILABLE).
+				src_release_frame(m, cam, src);
+				break;
+			}
 			cam->streamed = true;
 			// R2: rectify once per source frame, outside the lock (only this
 			// thread touches cam->rect after create), only if someone wants it.
@@ -4129,7 +4135,7 @@ fill_properties_locked(struct ipc_server_stereo_camera *m,
 		out_props->platform_device_hint[0] = '\0';
 		out_props->flags = XRT_STEREO_CAMERA_APP_CONTENT | XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED |
 		                   XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE;
-		out_props->state = effective_state_locked(m, cam);
+		out_props->state = cam->app.live ? effective_state_locked(m, cam) : XRT_STEREO_CAMERA_STATE_UNAVAILABLE;
 		out_props->view_count = 2;
 		out_props->eye_width = cam->info.eye_width;
 		out_props->eye_height = cam->info.eye_height;

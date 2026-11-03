@@ -33,7 +33,10 @@
 #include "server/ipc_server_stereo_camera.h" // the in-process consumer API
 
 #include "os/os_time.h"
+#include "util/u_app_share_fake.h"
+#include "util/u_camera_consent.h"
 #include "util/u_stereo_camera.h"
+#include "xrt/xrt_instance.h"
 
 #include <algorithm>
 #include <chrono>
@@ -923,4 +926,453 @@ TEST_CASE("manager: an in-process consumer outlives the manager safely", "[stere
 	// And with no manager at all an open is "unavailable", not a crash.
 	ipc_server_stereo_camera_internal *h2 = nullptr;
 	CHECK(ipc_server_stereo_camera_internal_open(&rq, &info, &h2) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
+}
+
+
+/*
+ *
+ * ADR-061: the app-share source kind — app entries in their own table after
+ * every camera, the visibility gate, rescan exclusions, the exited-app linger,
+ * UNAVAILABLE reasons, the share consent at start, and frames + metadata from
+ * the service's synthetic source and from a (fake) platform share tap.
+ *
+ */
+
+namespace {
+
+constexpr long kAppPid = 4000001; // never a real process: its exe resolves to nothing ("pid-4000001")
+
+xrt_stereo_camera_stream_request
+share_req(uint64_t id)
+{
+	return {id, XRT_STEREO_CAMERA_OUTPUT_RECTIFIED, XRT_STEREO_CAMERA_FORMAT_NV12,
+	        XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY, 0.0f};
+}
+
+//! All properties the consumer sees, in enumeration order.
+std::vector<xrt_stereo_camera_properties>
+listing(scm_fixture *f)
+{
+	std::vector<xrt_stereo_camera_properties> v;
+	uint32_t n = scm_count(f);
+	for (uint32_t i = 0; i < n; i++) {
+		xrt_stereo_camera_properties p;
+		if (scm_properties(f, i, &p) == XRT_SUCCESS) {
+			v.push_back(p);
+		}
+	}
+	return v;
+}
+
+bool
+is_app(const xrt_stereo_camera_properties &p)
+{
+	return (p.flags & XRT_STEREO_CAMERA_APP_CONTENT) != 0;
+}
+
+//! Signed SAD block disparity (right x - left x) of one row band of an NV12/GRAY8 SBS luma plane.
+int
+band_disparity(const uint8_t *y, uint32_t pitch, uint32_t ew, uint32_t y0, uint32_t h, int range)
+{
+	int best = 0;
+	uint64_t best_sad = UINT64_MAX;
+	for (int d = -range; d <= range; d++) {
+		uint64_t sad = 0;
+		for (uint32_t r = y0; r < y0 + h; r++) {
+			for (uint32_t x = (uint32_t)range + 8; x + (uint32_t)range + 8 < ew; x++) {
+				int a = y[(size_t)r * pitch + x];
+				int b = y[(size_t)r * pitch + ew + (uint32_t)((int)x + d)];
+				sad += (uint64_t)(a > b ? a - b : b - a);
+			}
+		}
+		if (sad < best_sad) {
+			best_sad = sad;
+			best = d;
+		}
+	}
+	return best;
+}
+
+} // namespace
+
+TEST_CASE("app share: own table after every camera, visible only with the extension", "[stereo_camera_manager][app_share]")
+{
+	const char *ids[] = {"cam-a", "cam-b"};
+	const char *names[] = {"Front", "Rear"};
+	scm_fake_plugin_set(ids, names, 2);
+	scm_app_options o = {};
+	o.dev = -1;
+	o.fake = -1;
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+	scm_app_connect(f, 1, 11, kAppPid, "Model Viewer", XRT_CLIENT_CLASS_APP, false);
+	scm_rescan_apps(f);
+
+	// A plain camera consumer never sees an app.
+	CHECK(scm_count(f) == 2);
+
+	scm_set_consumer_sees_apps(f, true);
+	auto v = listing(f);
+	REQUIRE(v.size() == 3);
+	CHECK(!is_app(v[0]));
+	CHECK(!is_app(v[1]));
+	CHECK(std::string(v[0].display_name) == "Front"); // cameras keep their indices
+	const auto &a = v[2];
+	CHECK(is_app(a));
+	CHECK(a.source == XRT_STEREO_CAMERA_SOURCE_APP);
+	CHECK(std::string(a.display_name) == "Model Viewer");
+	CHECK((a.flags & XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED) != 0);
+	CHECK((a.flags & XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE) != 0);
+	CHECK((a.flags & (XRT_PLUGIN_STEREO_CAMERA_CALIBRATED | XRT_PLUGIN_STEREO_CAMERA_USER_FACING)) == 0);
+	CHECK(a.baseline_mm == 0.0f);
+	CHECK(a.horizontal_fov_deg == 0.0f);
+	CHECK(a.eye_width == 1280);
+	CHECK(a.eye_height == 720);
+	CHECK(a.max_frame_rate == 30.0f);
+	CHECK(a.view_count == 2);
+	CHECK(a.supported_formats == XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_FORMAT_NV12));
+	CHECK(a.camera_id != v[0].camera_id);
+	CHECK(a.camera_id != v[1].camera_id);
+	CHECK(std::string(a.persistent_id).rfind("dxrcam-", 0) == 0);
+
+	// No tap on this platform (no hooks): listed UNAVAILABLE with that reason, start is BUSY.
+	CHECK(a.state == XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+	xrt_app_share_source_info ai;
+	REQUIRE(scm_app_source(f, a.camera_id, &ai) == XRT_SUCCESS);
+	CHECK(ai.availability == XRT_APP_SHARE_UNAVAILABLE_NO_TAP);
+	CHECK(ai.pid == (uint64_t)kAppPid);
+	CHECK(std::string(ai.application_name) == "Model Viewer");
+	CHECK(ai.source == XRT_STEREO_CAMERA_SOURCE_APP);
+	CHECK(scm_app_source(f, v[0].camera_id, &ai) == XRT_ERROR_INPUT_UNSUPPORTED); // a camera is not an app
+	scm_set_share_answer(U_CAMERA_CONSENT_PROMPT_ALLOW);
+	uint64_t sid = 0;
+	auto req = share_req(a.camera_id);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	CHECK(scm_stream_start(f, sid) == XRT_ERROR_STEREO_CAMERA_BUSY);
+	CHECK(scm_share_prompts() == 0); // never prompted for something that cannot be shared
+
+	// Spec §9: RAW / another format / calibration are unsupported on an app entry.
+	auto raw = share_req(a.camera_id);
+	raw.output = XRT_STEREO_CAMERA_OUTPUT_RAW;
+	uint64_t bad = 0;
+	CHECK(scm_stream_create(f, &raw, &bad) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
+	auto gray = share_req(a.camera_id);
+	gray.format = XRT_STEREO_CAMERA_FORMAT_GRAY8;
+	CHECK(scm_stream_create(f, &gray, &bad) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
+	xrt_stereo_camera_calibration c;
+	CHECK(scm_calibration(f, a.camera_id, XRT_STEREO_CAMERA_OUTPUT_RECTIFIED, &c) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
+
+	// A consumer that does not see apps cannot address one by id either.
+	scm_set_consumer_sees_apps(f, false);
+	CHECK(scm_stream_create(f, &req, &bad) == XRT_ERROR_INPUT_UNSUPPORTED);
+	scm_destroy(f);
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+}
+
+TEST_CASE("app share: rescan exclusions", "[stereo_camera_manager][app_share]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_app_options o = {};
+	o.dev = -1;
+	o.fake = -1;
+	o.consumer_sees_apps = true;
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+	scm_app_connect(f, 1, 1, kAppPid + 1, "Shared App", XRT_CLIENT_CLASS_APP, false);
+	scm_app_connect(f, 2, 2, kAppPid + 2, "Shell", XRT_CLIENT_CLASS_CONTROLLER, false);
+	scm_app_connect(f, 3, 3, kAppPid + 3, "Diag", XRT_CLIENT_CLASS_DIAG, false);
+	scm_app_connect(f, 4, 4, kAppPid + 4, "Capture", XRT_CLIENT_CLASS_CAMERA_CONSUMER, false);
+	scm_app_connect(f, 5, 5, kAppPid + 5, "Browser", XRT_CLIENT_CLASS_PRESENT_OWNER, false);
+	scm_app_connect(f, 6, 6, kAppPid + 6, "Private", XRT_CLIENT_CLASS_APP, true); // opted out
+	scm_app_connect(f, 7, 7, kAppPid + 7, "Headless", XRT_CLIENT_CLASS_APP, false);
+	scm_app_disconnect(f, 7);                                                     // no session / compositor
+	scm_app_connect(f, 8, 8, 0, "No pid", XRT_CLIENT_CLASS_APP, false); // no OS-derived pid: skipped
+	scm_rescan_apps(f);
+	auto v = listing(f);
+	REQUIRE(v.size() == 1);
+	CHECK(std::string(v[0].display_name) == "Shared App");
+	scm_destroy(f);
+}
+
+TEST_CASE("app share: an exited app lingers UNAVAILABLE, then leaves; its id comes back", "[stereo_camera_manager][app_share]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_set_tap(true);
+	scm_app_options o = {};
+	o.dev = 1; // no prompt
+	o.fake = -1;
+	o.linger_ms = 300;
+	o.consumer_sees_apps = true;
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+	scm_app_connect(f, 1, 21, kAppPid, "Viewer", XRT_CLIENT_CLASS_APP, false);
+	scm_rescan_apps(f);
+	auto v = listing(f);
+	REQUIRE(v.size() == 1);
+	const uint64_t id = v[0].camera_id;
+	CHECK(v[0].state == XRT_STEREO_CAMERA_STATE_AVAILABLE); // a tap says it can be shared
+	xrt_app_share_source_info ai;
+	REQUIRE(scm_app_source(f, id, &ai) == XRT_SUCCESS);
+	CHECK(ai.availability == XRT_APP_SHARE_AVAILABLE);
+	CHECK(ai.view_count == 4);
+	CHECK(ai.active_view_count == 2);
+	CHECK(ai.content_eye_width == 1600);
+	CHECK(ai.window_width == 1600);
+
+	uint64_t sid = 0;
+	auto req = share_req(id);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	xrt_stereo_camera_event ev;
+	while (scm_poll_event(f, &ev)) {
+	}
+
+	// The session ends: SOURCE_LOST at once, the tap detached before this returns.
+	const int64_t t0 = os_monotonic_get_ns();
+	while (scm_tap_attached() == 0 && os_monotonic_get_ns() - t0 < 2000ll * 1000 * 1000) {
+		os_nanosleep(5 * 1000 * 1000);
+	}
+	CHECK(scm_tap_attached() == 1);
+	scm_app_session_ending(f, 1);
+	CHECK(scm_tap_attached() == 0);
+	bool lost = false;
+	while (scm_poll_event(f, &ev)) {
+		lost |= ev.kind == XRT_STEREO_CAMERA_EVENT_STREAM_ENDED && ev.stream_id == sid &&
+		        ev.value == XRT_STEREO_CAMERA_END_SOURCE_LOST;
+	}
+	CHECK(lost);
+	bool ready = false;
+	xrt_stereo_camera_frame_info fi;
+	const uint8_t *slot = nullptr;
+	CHECK(scm_acquire(f, sid, &ready, &fi, &slot) == XRT_ERROR_STEREO_CAMERA_STREAM_ENDED);
+	scm_app_disconnect(f, 1);
+	scm_rescan_apps(f);
+	v = listing(f);
+	REQUIRE(v.size() == 1); // still listed while it lingers
+	CHECK(v[0].camera_id == id);
+	CHECK(v[0].state == XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+	REQUIRE(scm_app_source(f, id, &ai) == XRT_SUCCESS);
+	CHECK(ai.availability == XRT_APP_SHARE_UNAVAILABLE_EXITED);
+	uint64_t sid2 = 0;
+	REQUIRE(scm_stream_create(f, &req, &sid2) == XRT_SUCCESS);
+	CHECK(scm_stream_start(f, sid2) == XRT_ERROR_STEREO_CAMERA_BUSY);
+	scm_stream_destroy(f, sid2);
+	scm_stream_destroy(f, sid);
+
+	os_nanosleep(350ll * 1000 * 1000);
+	CHECK(scm_rescan_apps(f));
+	CHECK(listing(f).empty()); // the linger is over
+
+	// The same executable + instance gets its id back within the service run.
+	scm_app_connect(f, 2, 22, kAppPid, "Viewer", XRT_CLIENT_CLASS_APP, false);
+	scm_rescan_apps(f);
+	v = listing(f);
+	REQUIRE(v.size() == 1);
+	CHECK(v[0].camera_id == id);
+	scm_destroy(f);
+	scm_set_tap(false);
+}
+
+TEST_CASE("app share: the gate — extension flag vs DXR_APP_SHARE_DEV, and the share prompt", "[stereo_camera_manager][app_share]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_set_tap(true);
+	SECTION("DEV: listed to a plain consumer, started without a prompt")
+	{
+		scm_app_options o = {};
+		o.dev = 1;
+		o.fake = -1;
+		scm_fixture *f = scm_create_apps(&o);
+		REQUIRE(f != nullptr);
+		scm_app_connect(f, 1, 31, kAppPid, "Viewer", XRT_CLIENT_CLASS_APP, false);
+		scm_rescan_apps(f);
+		auto v = listing(f); // no XR_DXR_app_share
+		REQUIRE(v.size() == 1);
+		scm_set_share_answer(U_CAMERA_CONSENT_PROMPT_DENY);
+		uint64_t sid = 0;
+		auto req = share_req(v[0].camera_id);
+		REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+		CHECK(scm_stream_start(f, sid) == XRT_SUCCESS);
+		CHECK(scm_share_prompts() == 0);
+		uint32_t shares = 0;
+		char names[256] = {0};
+		REQUIRE(scm_status(&shares, names, sizeof(names)));
+		CHECK(shares == 1);
+		CHECK(std::string(names) == "Viewer"); // the tray reads "Sharing Viewer"
+		CHECK(scm_stop_all() == 1);            // "Stop camera sharing" stops shares too
+		REQUIRE(scm_status(&shares, names, sizeof(names)));
+		CHECK(shares == 0);
+		scm_destroy(f);
+	}
+	SECTION("extension: the prompt runs per start; Deny refuses; per-app-run remembers")
+	{
+		scm_app_options o = {};
+		o.dev = -1;
+		o.fake = -1;
+		o.consumer_sees_apps = true;
+		o.prompt_mode = 1; // always
+		scm_fixture *f = scm_create_apps(&o);
+		REQUIRE(f != nullptr);
+		scm_app_connect(f, 1, 41, kAppPid, "Viewer", XRT_CLIENT_CLASS_APP, false);
+		scm_rescan_apps(f);
+		auto v = listing(f);
+		REQUIRE(v.size() == 1);
+		auto req = share_req(v[0].camera_id);
+		uint64_t sid = 0;
+		REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+		scm_set_share_answer(U_CAMERA_CONSENT_PROMPT_DENY);
+		CHECK(scm_stream_start(f, sid) == XRT_ERROR_STEREO_CAMERA_CONSENT_REFUSED);
+		scm_set_share_answer(U_CAMERA_CONSENT_PROMPT_ALLOW);
+		CHECK(scm_stream_start(f, sid) == XRT_SUCCESS);
+		scm_stream_destroy(f, sid);
+		REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+		CHECK(scm_stream_start(f, sid) == XRT_SUCCESS);
+		CHECK(scm_share_prompts() == 2); // always: asked again
+		scm_destroy(f);
+	}
+	SECTION("sharing off: zero entries, DISABLED")
+	{
+		scm_app_options o = {};
+		o.dev = 1;
+		o.fake = -1;
+		scm_fixture *f = scm_create_apps(&o);
+		REQUIRE(f != nullptr);
+		scm_app_connect(f, 1, 51, kAppPid, "Viewer", XRT_CLIENT_CLASS_APP, false);
+		scm_rescan_apps(f);
+		auto v = listing(f);
+		REQUIRE(v.size() == 1);
+		uint64_t sid = 0;
+		auto req = share_req(v[0].camera_id);
+		REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+		REQUIRE(scm_set_sharing(f, false) == XRT_SUCCESS);
+		CHECK(scm_count(f) == 0);
+		CHECK(scm_stream_start(f, sid) == XRT_ERROR_STEREO_CAMERA_DISABLED);
+		REQUIRE(scm_set_sharing(f, true) == XRT_SUCCESS);
+		scm_destroy(f);
+	}
+	scm_set_tap(false);
+}
+
+TEST_CASE("app share: the synthetic source — frames, metadata, display-referred disparity", "[stereo_camera_manager][app_share]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_app_options o = {};
+	o.dev = 1;
+	o.fake = 1;
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+	auto v = listing(f);
+	REQUIRE(v.size() == 1);
+	CHECK(is_app(v[0]));
+	CHECK(v[0].state == XRT_STEREO_CAMERA_STATE_AVAILABLE);
+	xrt_app_share_source_info ai;
+	REQUIRE(scm_app_source(f, v[0].camera_id, &ai) == XRT_SUCCESS);
+	CHECK(std::string(ai.executable_name) == "displayxr-app-share-fake");
+	CHECK(ai.availability == XRT_APP_SHARE_AVAILABLE);
+
+	uint64_t sid = 0;
+	auto req = share_req(v[0].camera_id);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	xrt_stereo_camera_stream_layout lay;
+	REQUIRE(scm_stream_map(f, sid, &lay) == XRT_SUCCESS);
+	CHECK(lay.width == 2560);
+	CHECK(lay.height == 720);
+	CHECK(lay.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED);
+
+	uint32_t frames = 0;
+	uint64_t last_index = 0;
+	xrt_stereo_camera_frame_info fi = {};
+	const uint8_t *slot = nullptr;
+	const int64_t t_end = os_monotonic_get_ns() + 5ll * 1000 * 1000 * 1000;
+	while (frames < 10 && os_monotonic_get_ns() < t_end) {
+		bool ready = false;
+		REQUIRE(scm_acquire(f, sid, &ready, &fi, &slot) == XRT_SUCCESS);
+		if (!ready) {
+			os_nanosleep(5 * 1000 * 1000);
+			continue;
+		}
+		CHECK(fi.frame_index > last_index);
+		last_index = fi.frame_index;
+		frames++;
+	}
+	REQUIRE(frames == 10);
+	REQUIRE(slot != nullptr);
+	CHECK(fi.format == XRT_STEREO_CAMERA_FORMAT_NV12);
+	CHECK(fi.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED);
+	const xrt_app_share_frame_info app = scm_last_app(f);
+	CHECK(app.valid == 1);
+	CHECK(app.content_x == 0);
+	CHECK(app.content_width == 1280);
+	CHECK(app.content_height == 720);
+	CHECK(app.mono == 0);
+	CHECK(app.content_generation == 1);
+	CHECK(app.zero_disparity_shift_frac == 0.0f);
+	CHECK(app.commit_time_ns > 0);
+
+	// The zero-disparity band reads 0; the ramp is right-minus-left positive below it, negative above.
+	const uint8_t *y = slot + fi.plane_offset[0];
+	uint32_t b0 = 0, b1 = 0;
+	u_app_share_fake_band(720, &b0, &b1);
+	CHECK(band_disparity(y, fi.row_pitch[0], 1280, b0 + 4, 16, 40) == 0);
+	const int d_bottom = band_disparity(y, fi.row_pitch[0], 1280, 680, 8, 40);
+	const int d_top = band_disparity(y, fi.row_pitch[0], 1280, 32, 8, 40);
+	CHECK(d_bottom == Catch::Approx(u_app_share_fake_disparity_px(1280, 720, 684)).margin(1.0));
+	CHECK(d_top == Catch::Approx(u_app_share_fake_disparity_px(1280, 720, 36)).margin(1.0));
+	CHECK(d_bottom > 10);
+	CHECK(d_top < -10);
+	std::printf("[manager app share] fake: %u frames, band d = 0, top d = %d px, bottom d = %d px\n", frames, d_top,
+	            d_bottom);
+	scm_stream_destroy(f, sid);
+	scm_destroy(f);
+}
+
+TEST_CASE("app share: frames + metadata through a platform share tap", "[stereo_camera_manager][app_share]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_set_tap(true);
+	scm_app_options o = {};
+	o.dev = -1;
+	o.fake = -1;
+	o.consumer_sees_apps = true;
+	o.prompt_mode = 2; // per-app-run
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+	scm_app_connect(f, 1, 61, kAppPid, "Viewer", XRT_CLIENT_CLASS_APP, false);
+	scm_rescan_apps(f);
+	auto v = listing(f);
+	REQUIRE(v.size() == 1);
+	scm_set_share_answer(U_CAMERA_CONSENT_PROMPT_ALLOW);
+	uint64_t sid = 0;
+	auto req = share_req(v[0].camera_id);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	xrt_stereo_camera_stream_layout lay;
+	REQUIRE(scm_stream_map(f, sid, &lay) == XRT_SUCCESS);
+	bool ready = false;
+	xrt_stereo_camera_frame_info fi = {};
+	const uint8_t *slot = nullptr;
+	const int64_t t_end = os_monotonic_get_ns() + 5ll * 1000 * 1000 * 1000;
+	while (!ready && os_monotonic_get_ns() < t_end) {
+		REQUIRE(scm_acquire(f, sid, &ready, &fi, &slot) == XRT_SUCCESS);
+		if (!ready) {
+			os_nanosleep(5 * 1000 * 1000);
+		}
+	}
+	REQUIRE(ready);
+	const xrt_app_share_frame_info app = scm_last_app(f);
+	CHECK(app.valid == 1);
+	CHECK(app.content_y == 8);
+	CHECK(app.content_height == 704);
+	CHECK(app.mono == 1);
+	CHECK(app.content_generation == 3);
+	// per-app-run: a second start of the same app by the same consumer is not prompted.
+	scm_stream_destroy(f, sid);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	CHECK(scm_share_prompts() == 1);
+	scm_stream_destroy(f, sid);
+	scm_destroy(f);
+	CHECK(scm_tap_attached() == 0); // every attach was detached
+	scm_set_tap(false);
 }
