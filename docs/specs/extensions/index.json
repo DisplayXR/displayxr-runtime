@@ -160,7 +160,7 @@
     "XR_DXR_app_share": {
       "group": "capture",
       "title": "3D App Share",
-      "summary": "3D screen share: a running DisplayXR app's pre-weave left/right views offered as one more XR_DXR_stereo_camera source, display-referred side-by-side frames with per-frame content metadata, behind a per-start runtime share prompt (proposed, ADR-061)"
+      "summary": "3D screen share: a running DisplayXR app's pre-weave left/right views offered as one more XR_DXR_stereo_camera source, display-referred side-by-side frames with per-frame content metadata, behind a per-start runtime share prompt (ADR-061; not implemented yet)"
     },
     "XR_DXR_swapchain_color_encoding": {
       "group": "rendering",

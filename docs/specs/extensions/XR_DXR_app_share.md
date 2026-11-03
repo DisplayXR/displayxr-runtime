@@ -6,7 +6,7 @@
 | **Spec Version** | 1 |
 | **Extension Type** | Instance extension, **requires** [`XR_DXR_stereo_camera`](XR_DXR_stereo_camera.md); service path only for the consumer (an in-process instance enumerates zero sources, as for cameras) |
 | **Header** | [`src/external/openxr_includes/openxr/XR_DXR_app_share.h`](../../../src/external/openxr_includes/openxr/XR_DXR_app_share.h) (+ its `index.json` catalog note) |
-| **Status** | **PROPOSED — not implemented.** Phases in [ADR-061](../../adr/ADR-061-3d-screen-share.md#phases-and-effort). Provisional type values `1004999430–432` (decade `430–439`), pending the Khronos registry |
+| **Status** | **Accepted design (ADR-061, 2026-11-03) — not implemented.** Phases in [ADR-061](../../adr/ADR-061-3d-screen-share.md#phases-and-effort). Provisional type values `1004999430–432` (decade `430–439`), pending the Khronos registry |
 | **Decision record** | [ADR-061](../../adr/ADR-061-3d-screen-share.md) |
 | **Builds on** | [ADR-043](../../adr/ADR-043-stereo-camera-source.md) (the stereo camera stack), [ADR-030](../../adr/ADR-030-crop-before-dp-zero-copy-only-when-swapchain-equals-atlas.md) (crop), [ADR-041](../../adr/ADR-041-fixed-view-count-with-per-frame-activity.md) (view count), [ADR-044](../../adr/ADR-044-colour-contract-per-backend.md) (colour), [ADR-049](../../adr/ADR-049-in-process-lift-rides-the-service.md) (the in-process link), [ADR-059](../../adr/ADR-059-d3d11-hub-compositor-windows.md) (the in-process tap point) |
 
@@ -42,12 +42,12 @@ connection (an internal `xrt_application_info` client flag, see ADR-061 decision
 | `persistentId` | keyed hash of (app executable path, instance ordinal, consumer executable) with the per-user secret of stereo camera §7.5 — stable across runs for "the first model viewer", distinct for a second concurrent copy, different for every consumer |
 | `platformDeviceHint` | `""` |
 | `viewCount` | 2 (the stream is always a pair; the app's own count is in the chained struct) |
-| `eyeExtent` | the stream's fixed per-eye size: 1280×720 by default, 1920×1080 when the user opted in (`share.resolution`, §8) |
-| `maxFrameRate` | 30 (60 with the opt-in); the service decimates the app's commit rate, never interpolates |
+| `eyeExtent` | the stream's fixed per-eye size from the user setting `share.resolution` (§8): 1280×720 (`720p`, default) or 1920×1080 (`1080p`, the maximum) |
+| `maxFrameRate` | 30 for `720p`, up to 60 for `1080p`; the service decimates the app's commit rate, never interpolates |
 | `baselineMm`, `horizontalFovDeg` | 0 — not a camera; the geometry is display-referred (§4) |
 | `supportedFormats` | `NV12` only |
 | `supportedTransports` | `SHARED_MEMORY` only (`D3D11_TEXTURE` stays specified-not-implemented, ADR-061 decision 5) |
-| `state` | `AVAILABLE` while the app commits frames; `SUSPENDED` after 1 s without a commit (minimised, paused, hidden by its own choice); `UNAVAILABLE` when the app cannot be tapped (§3) or has exited |
+| `state` | `AVAILABLE` while the app commits frames; `SUSPENDED` after 1 s without a commit (minimised, paused, hidden by its own choice); `UNAVAILABLE` when the app cannot be tapped (§3, listed with a reason so it can be diagnosed — ADR-061 decision 18) or has exited |
 
 Chain `XrAppShareSourcePropertiesDXR` on `XrStereoCameraPropertiesDXR::next` to read the app's
 process id, executable name, application name, window rect, per-view content size, view
@@ -56,7 +56,7 @@ state. A runtime fills it only for an `APP_CONTENT` entry; test the flag, not th
 
 **Which apps are listed.** Every connection with a running session — service-composited apps
 (under a workspace controller, `XRT_FORCE_MODE=ipc`, `DISPLAYXR_WORKSPACE_SESSION=1`) and
-in-process apps reached through their share link (ADR-061 decision 9) — **except**:
+in-process apps reached through their in-process service link (`ipc_client_service_link`, the ADR-049 lift link generalised — ADR-049 Amendment 1, ADR-061 decisions 9 and 16) — **except**:
 
 - `CONTROLLER`, `DIAG`, `CAMERA_CONSUMER` and `PRESENT_OWNER` clients. A present-owner is a
   browser: its pages carry other origins' content, which no one consented to share;
@@ -98,7 +98,7 @@ bottom-up; converted to NV12, BT.709 limited range. A LINEAR atlas is encoded fi
 Frames are the stereo camera's `XrStereoCameraFrameDXR`: `extent` = 2·`eyeExtent`, `format`
 NV12, `output` `RECTIFIED`, `captureTimeIsExposure` `XR_FALSE` (the time is the tap's).
 
-**`RECTIFIED` means display-referred here.** For a camera, RECTIFIED is a parallel pair with zero
+**`RECTIFIED` means display-referred here** (v1; a distinct `OUTPUT_DISPLAY_REFERRED` output is deferred to spec v2, ADR-061 decision 20). For a camera, RECTIFIED is a parallel pair with zero
 disparity at infinity. An app's views are the runtime's off-axis (Kooima) projection: row-aligned
 like a rectified pair, but with **zero disparity at the sender's display plane**. A consumer that
 applies a camera convergence crop (`f·B/(2Z)`, RFC 0002) to an `APP_CONTENT` stream doubles the
@@ -163,8 +163,8 @@ What is **not** in the list, on purpose:
   prompt: the browser's per-origin camera prompt cannot name the app being shared, and the app is
   not the browser's to give away. `XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR` is moot.
 - **No stored decision by default.** The user setting `share.prompt` = `always` (default) |
-  `per-app-run` (one Allow covers the same consumer and the same app until that app exits). There
-  is no "always allow" and no stored Deny.
+  `per-app-run` (one Allow covers the same consumer and the same app until that app exits — the
+  documented booth / kiosk setting). There is no "always allow" and no stored Deny.
 - **Not lifted by `DXR_STEREO_CAMERA_DEV_ALLOW`.** Only `DXR_APP_SHARE_DEV=1` (§10) skips it.
 - **No OS camera privacy switch:** no camera is opened.
 
@@ -194,16 +194,20 @@ app entries it adds:
 | `track.getSettings().displayxrStereo` | `{ source: 'app', appName, zeroDisparityShiftFrac, ... }` beside the existing camera fields |
 
 The page's own picker lists these devices; there is no `getDisplayMedia` integration and no
-Chromium picker change. A page that wants "share an app" filters `enumerateDevices()` on the
-`dxr-app:` prefix after it holds camera permission. A started track ends when the stream ends
+Chromium picker change. **App devices are listed only once the page holds camera permission**
+(ADR-061 decision 17): before that a page sees no `dxr-app:` device at all, not even an unlabelled
+one, so the device count never reveals how many DisplayXR apps are running. A page that wants
+"share an app" asks for the camera first, then filters `enumerateDevices()` on the `dxr-app:`
+prefix. A started track ends when the stream ends
 (app exit, kill switch, Deny on a later restart).
 
 ## 8. Stream parameters
 
 - **Format:** NV12, BT.709, limited range. Planes and pitches per `XrStereoCameraFrameDXR`.
-- **Size:** fixed per entry (`eyeExtent`), letterboxed; it never follows the app's window.
-  Default 2×1280×720 @ 30 Hz (~83 MB/s through the ring); `share.resolution = 1080p` gives
-  2×1920×1080 @ up to 60 Hz (~187 MB/s at 30 Hz). A consumer's `maxFrameRate` lowers the cap.
+- **Size:** fixed per entry (`eyeExtent`), letterboxed; it never follows the app's window. A
+  **user setting** in v1, `share.resolution`: `720p` (default, 2×1280×720 @ 30 Hz, ~83 MB/s through
+  the ring) | `1080p` (2×1920×1080, the maximum, up to 60 Hz; ~187 MB/s at 30 Hz). A consumer's
+  `maxFrameRate` can only lower the rate. A consumer-requested size is deferred to spec v2.
 - **Latency:** the readback is a non-blocking staging ring; a frame reaches the ring one to three
   app commits after it was rendered. The source app never waits for the tap.
 
@@ -238,4 +242,5 @@ Chromium picker change. A page that wants "share an app" filters `enumerateDevic
 
 | Version | Change |
 |---|---|
-| 1 | Initial: app entries in the stereo camera enumeration, `XrAppShareSourcePropertiesDXR`, `XrAppShareFrameInfoDXR`, `XrSessionShareabilityDXR`, `XR_STEREO_CAMERA_APP_CONTENT_BIT_DXR`. PROPOSED (ADR-061) |
+| 1 | Initial: app entries in the stereo camera enumeration, `XrAppShareSourcePropertiesDXR`, `XrAppShareFrameInfoDXR`, `XrSessionShareabilityDXR`, `XR_STEREO_CAMERA_APP_CONTENT_BIT_DXR`. Design accepted (ADR-061), not implemented |
+| 2 (planned) | `XR_STEREO_CAMERA_OUTPUT_DISPLAY_REFERRED_DXR`; a consumer-requested stream size (ADR-061 decisions 20, 21) |

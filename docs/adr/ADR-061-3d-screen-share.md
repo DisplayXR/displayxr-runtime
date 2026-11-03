@@ -1,15 +1,17 @@
 ---
-status: Proposed
+status: Accepted
 date: 2026-11-03
 ---
 # ADR-061: 3D screen share — a running app's pre-weave views are a stereo-camera source of kind app
 
-**Status:** Proposed (2026-11-03). Not implemented. Introduces
+**Status:** Accepted (2026-11-03; approved by David as recommended — the six open questions of the
+draft are resolved as decisions 16–21). Not implemented. Introduces
 [`XR_DXR_app_share`](../specs/extensions/XR_DXR_app_share.md) (spec v1, a thin extension that
 depends on [`XR_DXR_stereo_camera`](../specs/extensions/XR_DXR_stereo_camera.md)). Extends
 [ADR-043](ADR-043-stereo-camera-source.md) with a third source kind; amends the
 [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) D2 lease table
-(decision 11). Related: [ADR-007](ADR-007-compositor-never-weaves.md),
+(decision 11) and [ADR-049](ADR-049-in-process-lift-rides-the-service.md) (Amendment 1 there: one
+service link, decision 16). Related: [ADR-007](ADR-007-compositor-never-weaves.md),
 [ADR-019](ADR-019-vendor-plugin-aux-boundary.md), [ADR-023](ADR-023-unified-atlas-capture.md),
 [ADR-030](ADR-030-crop-before-dp-zero-copy-only-when-swapchain-equals-atlas.md),
 [ADR-041](ADR-041-fixed-view-count-with-per-frame-activity.md),
@@ -137,11 +139,13 @@ tap in the D3D11 service (service-composited apps) or by a share link from the a
      the commit forces `zc_reason = "share_tap"` (one more non-proxy guard of the ADR-030 kind);
    - **a client that does not own the panel** (`pipeline_client_texture_flat_locked`) must still
      get its per-client atlas written each commit; the P1 spike proves it.
-9. **In-process apps** — `ipc_client_share_link`, modelled on the ADR-049 lift link
-   (decisions 1–4 there): a sessionless `APP` connection named `<exe> (in-process share)`,
-   opened lazily at `xrBeginSession` on a background thread, default **on** (`DXR_APP_SHARE=0`
-   kills it), never launching the service, retried at most every 5 s; idle cost one pipe and one
-   registration, no per-frame work. The service lists it as `SOURCE_APP_LINK`. When a stream
+9. **In-process apps** — the share capability of the in-process **service link**
+   (`ipc_client_service_link`, decision 16), the ADR-049 lift link generalised: one sessionless
+   `APP` connection per in-process session, opened lazily on a background thread at
+   `xrBeginSession` while sharing is on (default **on**; `DXR_APP_SHARE=0` turns the share
+   capability off), never launching the service, retried at most every 5 s; idle cost one pipe and
+   one registration, no per-frame work. The service lists a link that declares `share` as
+   `SOURCE_APP_LINK`. When a stream
    starts, the service queues `SHARE_REQUESTED` on the link; the app's compositor then copies its
    pre-weave content each frame into a 3-texture NT-shared ring with a shared `ID3D11Fence` it
    created, at the ADR-059 D3D11 fill arm — one tap point for D3D11, D3D12 and Vulkan sessions.
@@ -189,6 +193,35 @@ tap in the D3D11 service (service-composited apps) or by a share link from the a
 15. **Vendor neutrality.** The tap uses only the OS video processor; tests use the service fake and
     sim_display; no vendor code or name anywhere (ADR-019).
 
+### Resolved at acceptance (the draft's open questions, approved by David 2026-11-03)
+
+16. **One service link per in-process session.** The ADR-049 lift link is generalised into
+    `ipc_client_service_link`: one sessionless `APP` connection per in-process session, named
+    `<exe> (in-process)`, that declares its capabilities at registration — `{lift}`, `{share}` or
+    both. Lift behaviour is unchanged (ADR-049 decisions 1–6: the same calls, states, waits,
+    retry and loss rules); what changes is that a session that also shares opens the link at
+    `xrBeginSession` instead of at its first lift call, and lift and share ride the same
+    connection, so an in-process session costs **one** `APP` slot, never two. Recorded as
+    ADR-049 Amendment 1 (append-only).
+17. **The browser lists `dxr-app:` devices only once the page holds camera permission.** Before
+    that a page sees no app device at all — not even an unlabelled one — so the device count never
+    leaks how many DisplayXR apps are running. (The browser's ordinary cameras keep upstream
+    behaviour.)
+18. **Untappable sessions are listed `UNAVAILABLE` with a reason** (`gl`, `texture_session`,
+    `split_disabled`, `legacy_standalone`, `adapter_mismatch`; an opted-out session is not
+    listed at all, §5 of the spec). The reason shows in `displayxr-cli share list` and the
+    service log, so a booth operator can see why an app cannot be shared instead of wondering
+    where it went.
+19. **`share.prompt` defaults to `always`.** `per-app-run` (one Allow covers the same consumer and
+    the same app until that app exits) is the documented booth / kiosk setting. No value stores an
+    "always allow" or a Deny.
+20. **v1 keeps `RECTIFIED` + `APP_CONTENT`.** It works with the shipping browser, which asks only
+    for `RECTIFIED`. A distinct `XR_STEREO_CAMERA_OUTPUT_DISPLAY_REFERRED_DXR` output is deferred to
+    `XR_DXR_app_share` spec v2.
+21. **Resolution is a user setting in v1.** `share.resolution` = `720p` (default, 2×1280×720 @ 30
+    Hz) | `1080p` (2×1920×1080, the maximum, up to 60 Hz); a consumer's `maxFrameRate` can only
+    lower the rate. Consumer-requested resolution (a chained create-info struct) is deferred to
+    spec v2.
 ## Corrections to the design pass (found against `main` ed979674e)
 
 | Design-pass assumption | Code | Resolution in this ADR |
@@ -215,15 +248,14 @@ tap in the D3D11 service (service-composited apps) or by a share link from the a
   in-process app): ~83 MB/s by default. Measured in P1 against a ≤0.5 ms app frame-time budget.
 - **−** The shared views are the **sender's** views: they follow the sender's tracked eyes
   (look-around, IPD) and the sender's display geometry; receivers see the viewpoint move.
-- **−** Every in-process session now holds a second sessionless connection (lift link + share
-  link) when both are active; both count against the service's `APP` budget
-  (`IPC_MAX_CLIENTS` = 32).
+- **−** Every in-process session that shares now holds a sessionless service link from
+  `xrBeginSession` on (one `APP` slot of `IPC_MAX_CLIENTS` = 32; a session that also lifts reuses
+  it, decision 16).
 - **−** The meaning of `RECTIFIED` forks by source kind; a consumer that ignores `APP_CONTENT` (and
   applies a camera convergence crop) converges wrongly. The dependent-extension gate (decision 3)
   confines that to consumers that asked for apps.
-- **−** Listing apps as devices tells a page how many DisplayXR apps run (device count) before
-  any permission; the browser should list `dxr-app:` devices only once the page holds camera
-  permission (open question 2).
+- **−** App devices exist for a page only after it holds camera permission (decision 17), so a
+  page must ask for the camera before it can offer "Share 3D".
 - **−** Two prompts on the sender for one share in the browser: the page's camera permission
   (once per origin) and the runtime's share prompt (each start).
 
@@ -246,7 +278,7 @@ Agent-days; Windows-bound work is marked **[win]**.
 |---|---|---|
 | **P0** | This ADR + spec + header | done (this PR) |
 | **P1 spike [win]** | Minimal service tap + `SOURCE_APP` behind `DXR_APP_SHARE_DEV=1`. `cube_handle_d3d11_win` under `XRT_FORCE_MODE=ipc` → `displayxr-cli camera list` / `camera probe --format nv12 --frames 300`; shipping browser 1.9.1 + a localhost page: `enumerateDevices` → `<video>` + a loopback `RTCPeerConnection` with `getStats`. **Exit:** ≥ 28 fps over 60 s at 2×1280×720; app frame time +≤ 0.5 ms; correct eye order and crop; colours within ±2 after NV12; frames flow while the browser has focus, under the shell AND under forced IPC; loopback ≥ 24 fps without CPU limitation; the track ends on app exit. Also settles the TYPELESS-input question and the non-owner atlas write | 4–5 |
-| **P2 runtime v1** | Service tap productised **[win]** (3–4); APP source, own table, rescan, share consent + prompt + indicator, IPC (3–4); extension, state tracker, service fake, tests, CLI (3); in-process share link + fill-arm tap **[win]** (7–9) | 16–20 |
+| **P2 runtime v1** | Service tap productised **[win]** (3–4); APP source, own table, rescan, share consent + prompt + indicator, IPC (3–4); extension, state tracker, service fake, tests, CLI (3); in-process share link + fill-arm tap **[win]** (7–9; includes generalising the lift link into the service link) | 16–20 |
 | **P3 browser** | Capture component: `dxr-app:` devices, label, `displayxrStereo.source/appName/zeroDisparityShiftFrac`, list-after-permission, enable `XR_DXR_app_share` (3–4) + a ~2 h build + a hardware check | 4–5 |
 | **P4 SDK + chat app** | Web SDK content tile (display-referred: no camera convergence) and the `displayxr-chat` "Share 3D" UI; runs in parallel from P1 against the dev-exposed device | parallel |
 | **P5 end to end [win]** | Two Windows endpoints, offline LAN, service-composited and in-process apps | 1–2 |
@@ -256,19 +288,7 @@ Release order: runtime → browser (with the runtime floor) → SDK → app.
 
 ## Open questions
 
-1. **One link or two.** Should the in-process share link and the ADR-049 lift link be one
-   sessionless "service link" per in-process session (one connection, one registration), rather
-   than two?
-2. **Enumeration exposure in the browser.** List `dxr-app:` devices only after the page holds
-   camera permission (no count leak), or always (labels are hidden before permission anyway)?
-3. **Untappable sessions.** List them `UNAVAILABLE` with a reason (this ADR), or omit them so the
-   picker only shows what works?
-4. **Prompt default.** `always` (this ADR) or `per-app-run` as the default for `share.prompt`?
-5. **`RECTIFIED` fork vs a new output.** Keep `RECTIFIED` + `APP_CONTENT` (works with the shipping
-   browser, which only asks for `RECTIFIED`), or add an `OUTPUT_DISPLAY_REFERRED` value to
-   `XrStereoCameraOutputDXR` (cleaner, needs a browser change before anything flows)?
-6. **Resolution control.** A user setting (`share.resolution`), or a consumer request at stream
-   creation (a chained create-info struct in spec v2)?
+None. The draft's six were resolved at acceptance (decisions 16–21).
 
 ## References
 

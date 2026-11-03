@@ -42,7 +42,7 @@
  *
  * Spec: docs/specs/extensions/XR_DXR_app_share.md. Decision: ADR-061.
  *
- * Version history: 1 = initial (PROPOSED, not implemented).
+ * Version history: 1 = initial (design accepted, ADR-061; not implemented).
  */
 #ifndef XR_DXR_APP_SHARE_H
 #define XR_DXR_APP_SHARE_H 1
