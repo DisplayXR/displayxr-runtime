@@ -229,6 +229,41 @@ comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc, struct xrt_c
 void
 comp_d3d11_service_compositor_set_client_pid(struct xrt_compositor *xc, long pid);
 
+struct xrt_app_share_source_info;
+struct xrt_app_share_frame_info;
+struct xrt_plugin_stereo_camera_frame;
+
+/*!
+ * ADR-061: what the share tap knows about this client's session, for the enumeration.
+ * @p out_last_commit_ns: os_monotonic, 0 = nothing committed yet.
+ */
+bool
+comp_d3d11_service_share_query(struct xrt_compositor *xc,
+                               struct xrt_app_share_source_info *io_info,
+                               int64_t *out_last_commit_ns);
+
+/*!
+ * ADR-061: start tapping this client: side-by-side NV12, @p eye_w x @p eye_h per eye, at most
+ * @p fps. The handle stays valid after the compositor is gone (waits then return WAIT_ERROR);
+ * always pass it to @ref comp_d3d11_service_share_detach.
+ */
+xrt_result_t
+comp_d3d11_service_share_attach(struct xrt_compositor *xc, uint32_t eye_w, uint32_t eye_h, float fps, void **out_tap);
+
+/*!
+ * ADR-061: the next tapped frame (XRT_PLUGIN_STEREO_CAMERA_WAIT_*). The planes stay valid until
+ * the next wait.
+ */
+uint32_t
+comp_d3d11_service_share_wait_frame(void *tap,
+                                    int64_t timeout_ns,
+                                    struct xrt_plugin_stereo_camera_frame *out_frame,
+                                    struct xrt_app_share_frame_info *out_info);
+
+//! ADR-061: stop tapping; @p tap is freed.
+void
+comp_d3d11_service_share_detach(void *tap);
+
 /*!
  * Get window metrics from the active D3D11 service compositor.
  *

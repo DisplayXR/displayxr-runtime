@@ -305,6 +305,11 @@ struct ipc_server_stereo_camera_platform
 	void *ctx;
 };
 
+//! ADR-061: install the D3D11 service compositor's share tap hooks.
+struct ipc_server;
+void
+ipc_server_share_tap_d3d11_install(struct ipc_server *s);
+
 //! Install (or clear, NULL) the platform hooks. The struct is copied.
 void
 ipc_server_stereo_camera_set_platform(const struct ipc_server_stereo_camera_platform *p);
