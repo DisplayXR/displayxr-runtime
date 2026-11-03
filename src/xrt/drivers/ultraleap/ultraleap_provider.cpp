@@ -389,6 +389,12 @@ ul_process_hand(struct ul_hub *hub, const LEAP_HAND *hand, struct xrt_hand_joint
 	ul_process_joint(hub, hand->palm.position, hand->palm.orientation, hand->palm.width, JS(PALM));
 	// wrist is the next_joint of the arm
 	ul_process_joint(hub, hand->arm.next_joint, hand->arm.rotation, hand->arm.width, JS(WRIST));
+	// Palm and wrist are flat: their radius is half their THICKNESS, not half
+	// the width Leap reports (which made ~4 cm / ~3 cm spheres). ultraleap_map.h.
+	out_set->values.hand_joint_set_default[XRT_HAND_JOINT_PALM].radius =
+	    ul_map_palm_radius_from_width_mm(&hub->map, hand->palm.width);
+	out_set->values.hand_joint_set_default[XRT_HAND_JOINT_WRIST].radius =
+	    ul_map_wrist_radius_from_width_mm(&hub->map, hand->arm.width);
 	// thumb
 	ul_process_joint(hub, hand->thumb.proximal.prev_joint, hand->thumb.proximal.rotation,
 	                 hand->thumb.proximal.width, JS(THUMB_METACARPAL));

@@ -176,6 +176,64 @@ TEST_CASE("relative mapping: radii and linear velocities scale by the gain, rota
 	CHECK(r.w == q.w);
 }
 
+TEST_CASE("palm and wrist radii are half their thickness, not half their width", "[ultraleap_map]")
+{
+	ul_map phys;
+	{
+		ul_map_config cfg;
+		ul_map_config_defaults(&cfg);
+		cfg.mode = UL_MAPPING_PHYSICAL;
+		ul_map_resolve(&cfg, kH156, &phys);
+	}
+
+	// Typical adult hand: palm 85 mm wide, wrist 60 mm wide.
+	const float palm_r = ul_map_palm_radius_from_width_mm(&phys, 85.f);
+	const float wrist_r = ul_map_wrist_radius_from_width_mm(&phys, 60.f);
+	CHECK(palm_r == Catch::Approx(0.01275f).margin(1e-6f));
+	CHECK(wrist_r == Catch::Approx(0.018f).margin(1e-6f));
+
+	// Physically sensible: 1-2 cm, and well under the old width/2 (42.5 / 30 mm).
+	CHECK(palm_r > 0.010f);
+	CHECK(palm_r < 0.015f);
+	CHECK(wrist_r > 0.010f);
+	CHECK(wrist_r < 0.020f);
+	CHECK(palm_r < 0.5f * ul_map_radius_from_width_mm(&phys, 85.f));
+	CHECK(wrist_r < 0.7f * ul_map_radius_from_width_mm(&phys, 60.f));
+
+	// The palm is not thicker than the wrist; both are thicker than a finger (~16 mm wide -> 8 mm).
+	CHECK(palm_r < wrist_r);
+	CHECK(palm_r > ul_map_radius_from_width_mm(&phys, 16.f));
+
+	// A missing width (0 / negative) uses the typical hand, never a zero or negative radius.
+	CHECK(ul_map_palm_radius_from_width_mm(&phys, 0.f) == Catch::Approx(palm_r).margin(1e-7f));
+	CHECK(ul_map_wrist_radius_from_width_mm(&phys, -1.f) == Catch::Approx(wrist_r).margin(1e-7f));
+
+	// Relative mapping: scaled by the same gain as every other radius and joint offset.
+	const ul_map rel = resolve_defaults(kH156);
+	CHECK(ul_map_palm_radius_from_width_mm(&rel, 85.f) == Catch::Approx(palm_r * rel.scale).margin(1e-7f));
+	CHECK(ul_map_wrist_radius_from_width_mm(&rel, 60.f) == Catch::Approx(wrist_r * rel.scale).margin(1e-7f));
+}
+
+TEST_CASE("relative mapping: the gain is one uniform scale, so hand contact is preserved", "[ultraleap_map]")
+{
+	// Hand-internal distances, distances between two hands and radii all scale by the
+	// same factor: two fingertips touching in Leap space (centres 2 tip radii apart)
+	// stay exactly touching after the mapping, at any anchor. Gaining only the
+	// placement while keeping fingers metric would make them overlap (gain < 1)
+	// or separate (gain > 1).
+	for (float h : {kH156, kH32}) {
+		const ul_map m = resolve_defaults(h);
+		const float tip_width_mm = 16.f; // a typical index distal bone
+		const xrt_vec3 a = map_pos(m, {-8.f, 230.f, 10.f});
+		const xrt_vec3 b = map_pos(m, {8.f, 230.f, 10.f}); // centres 16 mm apart = 2 radii
+		const float r = ul_map_radius_from_width_mm(&m, tip_width_mm);
+		const float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+		const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+		CHECK(d == Catch::Approx(0.016f * m.scale).margin(1e-6f));
+		CHECK(d == Catch::Approx(2.f * r).margin(1e-6f));
+	}
+}
+
 TEST_CASE("relative mapping: unknown display height uses the nominal panel", "[ultraleap_map]")
 {
 	const ul_map unknown = resolve_defaults(0.f);
