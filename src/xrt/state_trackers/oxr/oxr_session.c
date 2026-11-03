@@ -7776,7 +7776,7 @@ oxr_session_create(struct oxr_logger *log,
 #ifdef OXR_HAVE_DXR_app_share
 	// XR_DXR_app_share spec §5: the app's own opt-out from every share. It
 	// travels on the session's IPC connection; an in-process session is never
-	// listed by the service in this build (the share link is P2).
+	// listed by the service in this build (the in-process service link share capability is P2).
 	if (sys->inst->extensions.DXR_app_share) {
 		const XrSessionShareabilityDXR *sh =
 		    OXR_GET_INPUT_FROM_CHAIN(createInfo, XR_TYPE_SESSION_SHAREABILITY_DXR, XrSessionShareabilityDXR);

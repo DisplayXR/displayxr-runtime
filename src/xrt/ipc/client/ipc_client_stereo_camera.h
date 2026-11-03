@@ -74,11 +74,13 @@ ipc_client_stereo_camera_acquire(struct ipc_connection *ipc_c,
 /*!
  * ADR-061: the XR_DXR_app_share description of APP_CONTENT entry @p camera_id.
  *
- * Reserved for the in-process share link (ADR-061 decision 9, P2 — NOT in
- * this build; the names are taken so the protocol grows without a rename):
- * `share_link_register`, `share_link_poll` (SHARE_REQUESTED / SHARE_STOPPED),
- * `share_link_publish_ring`. They ride the ADR-049 sessionless service link
- * generalised into `ipc_client_service_link` with capabilities {lift, share}.
+ * Reserved for P2 (ADR-061 decision 9, ADR-049 Amendment 1 — NOT in this
+ * build): the in-process side is `ipc_client_service_link`, the ADR-049 lift
+ * link generalised into ONE sessionless service link per in-process session
+ * with capabilities {lift, share}. Its share messages are reserved as
+ * `service_link_share_poll` (SHARE_REQUESTED / SHARE_STOPPED) and
+ * `service_link_share_publish_ring`; the service lists such an app as
+ * XRT_STEREO_CAMERA_SOURCE_APP_LINK.
  */
 xrt_result_t
 ipc_client_stereo_camera_get_app_source(struct ipc_connection *ipc_c,
