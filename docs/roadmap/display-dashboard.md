@@ -506,7 +506,7 @@ Every screen has a `key` that survives a reboot, unlike the per-boot `monitor_id
 ```
 <PNP>-<PROD>-<SERIAL>            e.g.  AUO-B194-0000ABCD
 <PNP>-<PROD>-<SERIAL>@<device>   when the EDID serial is 0, or two screens would collide
-<PNP>-<vendor serial>            EDID serial 0 and a claim carries a vendor serial (#2250)
+<PNP>-<vendor serial>            a claim carries a vendor serial, whatever the EDID serial (#2250)
 ```
 
 `<PNP>` is the 3-letter EDID manufacturer code, `<PROD>` the product code as 4 upper-case
@@ -515,7 +515,7 @@ hex digits, `<SERIAL>` the EDID serial as 8. `<device>` is the OS device name �
 the Linux connector, the macOS display UUID. On the two-panel rig both serials are 0:
 `AUO-B194-00000000@DISPLAY1`, `ACR-0001-00000000@DISPLAY5`.
 
-**Vendor serial (#2250).** A screen whose EDID serial is 0 is keyed
+**Vendor serial (#2250).** A screen is keyed
 `<PNP>-<vendor serial>` (e.g. `SAM-VN022513ET0212`, qualified with `@<device>` only on a
 collision) when a plug-in's claim on it carries a serial — the highest-confidence claim
 above `FALLBACK`, whichever plug-in wins the screen — because a panel can report a
@@ -523,7 +523,9 @@ different EDID product code per input and the device name can move with the port
 the vendor serial names the panel. A preference stored under the EDID ("legacy") key keeps
 matching: the service and the CLI re-key a per-user one in place with one WARN; an app, or an env / machine one, is WARNed
 once per process, `dp use --screen <legacy key>` stores under the current key, and
-`dp reset --screen` clears either spelling. Derivation: `target_screen_keys_build_ex`
+`dp reset --screen` clears either spelling. Windows enumeration did not read the EDID serial
+at first, so a screen there may have a preference stored under `<PNP>-<PROD>-00000000@<device>`;
+that key is looked up and re-keyed the same way. Derivation: `target_screen_keys_build_ex`
 (`targets/common/target_screen_pin.h`), unit-tested.
 
 It appears as `screens[*].key` in the snapshot, `claims[*].key` in

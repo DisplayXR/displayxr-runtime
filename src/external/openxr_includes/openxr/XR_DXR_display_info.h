@@ -940,13 +940,13 @@ typedef struct XrEventDataDisplaysChangedDXR {
  * to use as a file name.
  *
  * What it identifies depends on what the panel reports:
- * - EDID serial present: `<PNP>-<PROD>-<SERIAL>`. Survives moving the cable,
- *   unless the panel reports a different EDID product code per input.
- * - No EDID serial, a vendor plug-in reports the panel's own serial:
- *   `<PNP>-<vendor serial>`. Survives moving the cable.
- * - Neither: the form above with `@<OS output name>` appended, so it follows
- *   the port. Also appended when two connected monitors would otherwise share
- *   a key.
+ * - A vendor plug-in reports the panel's own serial: `<PNP>-<vendor serial>`.
+ *   Survives moving the cable.
+ * - Otherwise, EDID serial present: `<PNP>-<PROD>-<SERIAL>`. Survives moving
+ *   the cable, unless the panel reports a different EDID product code per input.
+ * - Neither: `<PNP>-<PROD>-00000000@<OS output name>`, so it follows the port.
+ * `@<OS output name>` is also appended when two connected monitors would
+ * otherwise share a key.
  *
  * Set `type` and zero the rest. A runtime older than v24 leaves it untouched,
  * so `key` stays "". "" also means the runtime could not identify the display

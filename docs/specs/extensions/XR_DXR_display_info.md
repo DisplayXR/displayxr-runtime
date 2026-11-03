@@ -1284,10 +1284,10 @@ dedicated message).
 calibration, a preference), chain `XrDisplayStableKeyDXR` (`XR_TYPE_DISPLAY_STABLE_KEY_DXR`,
 `1004999219`) on `XrDisplayDXR::next`: `key` receives the same string
 `displayxr-cli displays --claims` prints, which survives a reboot and a desktop rearrangement
-and is the same in every process. It is opaque and safe as a file name. With an EDID serial
-it is `<PNP>-<PROD>-<SERIAL>`, which survives moving the cable unless the panel reports a
-different EDID product code per input. With no EDID serial and a panel serial from the vendor
-plug-in it is `<PNP>-<vendor serial>`, which survives moving the cable. With neither,
+and is the same in every process. It is opaque and safe as a file name. With a panel serial
+from the vendor plug-in it is `<PNP>-<vendor serial>`, which survives moving the cable.
+Otherwise, with an EDID serial, it is `<PNP>-<PROD>-<SERIAL>`, which survives moving the cable
+unless the panel reports a different EDID product code per input. With neither,
 `@<OS output name>` is appended and the key follows the port; the same suffix separates two
 connected monitors that would otherwise share a key. A runtime older than v24 leaves the
 struct untouched, and `""` also means the display could not be identified, so zero it and fall

@@ -509,8 +509,8 @@ target_plugin_get_monitor_record(uint64_t monitor_id,
  * The stable screen key of a monitor from the last
  * @ref target_plugin_build_descriptors (display dashboard phase 7):
  * `"<PNP>-<PROD>-<SERIAL>"`, `"@<device>"`-qualified when the serial is 0 or
- * two monitors would collide; `"<PNP>-<vendor serial>"` when the EDID serial
- * is 0 and a plug-in's claim carries a vendor serial (#2250 —
+ * two monitors would collide; `"<PNP>-<vendor serial>"` when a plug-in's
+ * claim carries a vendor serial (#2250 —
  * `target_screen_keys_build_ex`; known after the first
  * @ref target_plugin_resolve_displays, then remembered across re-probes). The
  * identity a per-screen display-processor preference is stored under — unlike
