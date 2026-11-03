@@ -1407,8 +1407,9 @@ src_open(struct ipc_server_stereo_camera *m, const struct src_open_args *a, void
 		return g_platform.share_tap_attach(g_platform.ctx, a->app_client_id, a->eye_w, a->eye_h, a->fps, out);
 	}
 	if (a->source == XRT_STEREO_CAMERA_SOURCE_APP_LINK) {
-		// ADR-061 decision 9 (P2): the in-process share link is not in this
-		// build; such entries are listed UNAVAILABLE and never get here.
+		// ADR-061 decision 9 (P2): the share capability of the in-process
+		// service link (ipc_client_service_link) is not in this build; such
+		// entries are never listed, so nothing gets here.
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	struct xrt_plugin_stereo_camera *pc = NULL;
