@@ -167,7 +167,12 @@ struct xrt_app_share_source_info
 	//! The app's window in desktop pixels; width/height 0 when it has none.
 	int32_t window_x, window_y;
 	uint32_t window_width, window_height;
-	//! Per-view content size at the source (before scaling to the stream's eye extent).
+	/*!
+	 * Per-view content size at the source: the active mode's content
+	 * dimensions of ONE view (before scaling to the stream's eye extent). It
+	 * is not the atlas tile: tiles sit at the atlas's slot stride (atlas size
+	 * / grid), which is larger whenever the content is smaller than its slot.
+	 */
 	uint32_t content_eye_width, content_eye_height;
 	uint32_t view_count;        //!< views the app submits (the fixed count, ADR-041)
 	uint32_t active_view_count; //!< views active in its current mode (1 = mono)
@@ -186,7 +191,14 @@ struct xrt_app_share_source_info
  */
 struct xrt_app_share_frame_info
 {
-	//! The content inside ONE eye half (left-half coordinates); outside is letterbox.
+	/*!
+	 * Where the delivered view sits inside ONE eye half of the DELIVERED frame,
+	 * in that half's pixels (origin top-left of the left half; the right half
+	 * is the same rect offset by the eye width): the view's content, scaled to
+	 * fit the eye extent preserving aspect; outside is letterbox black. Never
+	 * an atlas / slot / source coordinate — the tap cuts each view from its
+	 * tile at the slot stride before scaling, and nothing of that reaches here.
+	 */
 	int32_t content_x, content_y;
 	uint32_t content_width, content_height;
 	uint32_t mono;               //!< one view in both halves
