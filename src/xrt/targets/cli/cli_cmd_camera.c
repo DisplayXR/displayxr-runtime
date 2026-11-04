@@ -282,6 +282,38 @@ cam_sharing_is_off(void)
  *
  */
 
+/*!
+ * JSON-escape @p in into @p out (backslash, quote, control characters as
+ * \u00XX). Device hints carry backslashes; app entries carry app-controlled
+ * names (ADR-061) — a name must never be able to break or inject JSON.
+ * Truncates (never splits an escape) when @p cap is too small.
+ */
+static void
+json_escape(const char *in, char *out, size_t cap)
+{
+	size_t n = 0;
+	for (const unsigned char *c = (const unsigned char *)in; *c != '\0'; c++) {
+		char esc[8];
+		size_t len;
+		if (*c == '\\' || *c == '"') {
+			esc[0] = '\\';
+			esc[1] = (char)*c;
+			len = 2;
+		} else if (*c < 0x20) {
+			len = (size_t)snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)*c);
+		} else {
+			esc[0] = (char)*c;
+			len = 1;
+		}
+		if (n + len + 1 > cap) {
+			break;
+		}
+		memcpy(out + n, esc, len);
+		n += len;
+	}
+	out[n] = '\0';
+}
+
 static const char *
 cam_source_str(uint32_t source)
 {
@@ -346,16 +378,12 @@ cmd_list(struct ipc_connection *ipc_c, bool json, bool apps_only)
 		flags_str(p.flags, flags, sizeof(flags));
 		// Amendment 4: which source the service reads it from ("plugin" / "uvc").
 		const char *source = cam_source_str(p.source);
-		// A device id (Windows symbolic link) carries backslashes: JSON-escape them.
-		char hint[2 * sizeof(p.platform_device_hint)];
-		size_t hn = 0;
-		for (const char *c = p.platform_device_hint; *c != '\0' && hn + 2 < sizeof(hint); c++) {
-			if (*c == '\\' || *c == '"') {
-				hint[hn++] = '\\';
-			}
-			hint[hn++] = *c;
-		}
-		hint[hn] = '\0';
+		// A device id (Windows symbolic link) carries backslashes; an app entry's
+		// name is the app's own (ADR-061): JSON-escape both.
+		char hint[6 * sizeof(p.platform_device_hint)];
+		json_escape(p.platform_device_hint, hint, sizeof(hint));
+		char name_j[6 * sizeof(p.display_name)];
+		json_escape(p.display_name, name_j, sizeof(name_j));
 		// Spec v5: the screen it belongs to, as `displays` prints ids (0 = unknown).
 		char disp[24];
 		snprintf(disp, sizeof(disp), "0x%016llx", (unsigned long long)p.display_id);
@@ -371,16 +399,19 @@ cmd_list(struct ipc_connection *ipc_c, bool json, bool apps_only)
 			    "\"maxFrameRate\": %.2f, \"baselineMm\": %.2f, \"horizontalFovDeg\": %.2f, "
 			    "\"formats\": \"0x%llx\", \"transports\": \"0x%llx\", \"platformDeviceHint\": \"%s\", "
 			    "\"displayId\": \"%s\", \"frameOrientationDeg\": %s",
-			    shown ? ", " : "", (unsigned long long)p.camera_id, p.display_name, source, p.persistent_id,
+			    shown ? ", " : "", (unsigned long long)p.camera_id, name_j, source, p.persistent_id,
 			    state_str(p.state), flags, p.view_count, p.eye_width, p.eye_height, p.max_frame_rate,
 			    p.baseline_mm, p.horizontal_fov_deg, (unsigned long long)p.supported_formats,
 			    (unsigned long long)p.supported_transports, hint, disp, orient_known ? orient : "null");
 			if (have_ai) {
+				char exe_j[6 * sizeof(ai.executable_name)], app_j[6 * sizeof(ai.application_name)];
+				json_escape(ai.executable_name, exe_j, sizeof(exe_j));
+				json_escape(ai.application_name, app_j, sizeof(app_j));
 				printf(", \"app\": {\"pid\": %llu, \"executable\": \"%s\", \"applicationName\": \"%s\", "
 				       "\"instance\": %u, \"availability\": \"%s\", \"window\": [%d, %d, %u, %u], "
 				       "\"contentEye\": [%u, %u], \"viewCount\": %u, \"activeViewCount\": %u, "
 				       "\"zeroDisparityShiftFrac\": %.4f, \"encodingIsLinear\": %s}",
-				       (unsigned long long)ai.pid, ai.executable_name, ai.application_name,
+				       (unsigned long long)ai.pid, exe_j, app_j,
 				       ai.instance_ordinal, availability_str(ai.availability), ai.window_x, ai.window_y,
 				       ai.window_width, ai.window_height, ai.content_eye_width, ai.content_eye_height,
 				       ai.view_count, ai.active_view_count, ai.zero_disparity_shift_frac,
@@ -885,8 +916,16 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv, bool apps_o
 				}
 			}
 		}
-		if (!found && id == 0 && apps_only) {
-			printf("share probe: no app share source is listed (no shareable app running?).\n");
+		if (!found && apps_only) {
+			// Never fall through to a camera: `share probe <camera id>` must not
+			// open (and prompt for) a real camera stream.
+			if (id != 0) {
+				printf("share probe: %llu is not an app share source this consumer sees (a camera? use "
+				       "`camera probe`).\n",
+				       (unsigned long long)id);
+			} else {
+				printf("share probe: no app share source is listed (no shareable app running?).\n");
+			}
 			return 3;
 		}
 		if (!found && id == 0) {
@@ -1978,6 +2017,10 @@ cli_cmd_share(int argc, const char **argv)
 {
 	const char *sub = argc >= 3 ? argv[2] : "list";
 	if (strcmp(sub, "settings") == 0) {
+		if ((argc - 3) % 2 != 0) {
+			printf("usage: displayxr-cli share settings [prompt always|per-app-run] [resolution 720p|1080p]\n");
+			return 1;
+		}
 		for (int i = 3; i + 1 < argc; i += 2) {
 			if (!u_app_share_settings_set(argv[i], argv[i + 1])) {
 				printf("share settings: cannot set %s = %s (prompt always|per-app-run, resolution "
