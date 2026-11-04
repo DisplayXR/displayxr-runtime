@@ -50,8 +50,10 @@
  *
  * Hot-path cost: one trigger poll per weave submit (a few stat calls). Only a
  * submit that consumed a trigger records the readback copies into its own
- * command buffer (host-visible staging buffers), waits its own fence, and
- * encodes the PNGs — one WARN per completed capture.
+ * command buffer (host-visible staging buffers) and waits its own fence; the
+ * PNGs are encoded on a detached worker thread (stb takes ~2 s per 2560x1600
+ * stage, which held the submit for seconds before #2536), each written to
+ * `<name>.tmp` and renamed into place — one WARN once the last file landed.
  *
  * Two ways to fill a stage: a Vulkan readback recorded into the frame's
  * command buffer (@ref comp_multi_weave_capture_record, resolved to CPU pixels
@@ -167,8 +169,11 @@ comp_multi_weave_capture_resolve(struct comp_multi_weave_capture *cap, struct vk
 /*!
  * After the submit that recorded the copies has COMPLETED (caller waited its
  * fence): resolve any recorded buffer (@p vk may be NULL when nothing is
- * recorded-but-unresolved), encode every filled stage's PNG, free everything,
- * emit one WARN, and consume the intent. @p what names the frame in the WARN.
+ * recorded-but-unresolved), hand every filled stage's pixels to a worker
+ * thread that encodes the PNGs (off the weave path, #2536; inline only if no
+ * thread can be started), free everything else and consume the intent. The
+ * worker emits the one WARN after the last file is renamed into place. @p what
+ * names the frame in the WARN.
  */
 void
 comp_multi_weave_capture_finish(struct comp_multi_weave_capture *cap, struct vk_bundle *vk, const char *what);
