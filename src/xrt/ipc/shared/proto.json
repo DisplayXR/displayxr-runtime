@@ -1682,5 +1682,40 @@
 		"out": [
 			{"name": "created", "type": "struct xrt_conv_wire_stream_created"}
 		]
+	},
+
+	"service_link_register": {
+		"in": [
+			{"name": "reg", "type": "struct xrt_share_link_registration"}
+		]
+	},
+
+	"service_link_share_poll": {
+		"out": [
+			{"name": "poll", "type": "struct xrt_share_link_poll"}
+		]
+	},
+
+	"service_link_share_publish_ring": {
+		"in": [
+			{"name": "desc", "type": "struct xrt_share_link_ring_desc"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"service_link_share_publish_fence": {
+		"in": [
+			{"name": "generation", "type": "uint32_t"}
+		],
+		"in_handles": {"type": "xrt_graphics_sync_handle_t"}
+	},
+
+	"service_link_share_frame_ready": {
+		"in": [
+			{"name": "frame", "type": "struct xrt_share_link_frame"}
+		],
+		"out": [
+			{"name": "poll", "type": "struct xrt_share_link_poll"}
+		]
 	}
 }

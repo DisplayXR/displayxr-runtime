@@ -28,6 +28,7 @@
 #include "xrt/xrt_display_status.h"
 #include "xrt/xrt_conv_wire.h"
 #include "xrt/xrt_stereo_camera.h"
+#include "xrt/xrt_share_link.h"
 #include "xrt/xrt_screen.h"
 #include "xrt/xrt_input_selection.h"
 #include "xrt/xrt_config_build.h"

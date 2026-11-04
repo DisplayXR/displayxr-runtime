@@ -11,7 +11,7 @@
  *  - the generated wire calls (`ipc_call_lift_*`, the blob send/receive pair
  *    and `ipc_receive`), which ipc_client_lift.c calls — every message an app's
  *    lift call puts on the wire lands in the trace, with its arguments;
- *  - the ADR-049 lift-only link (`ipc_client_lift_link_*`), which oxr_lift.c
+ *  - the ADR-049 lift-only link (`ipc_client_service_link_*`), which oxr_lift.c
  *    calls for an in-process D3D11 / D3D12 session — its state is scripted;
  *  - `comp_ipc_client_compositor_lift_connection`, the IPC session's bridge.
  *
@@ -34,7 +34,7 @@
 
 #include "shared/ipc_protocol.h"
 #include "client/ipc_client.h"
-#include "client/ipc_client_lift_link.h"
+#include "client/ipc_client_service_link.h"
 #include "ipc_client_generated.h"
 
 #include <stdarg.h>
@@ -111,13 +111,32 @@ static bool s_conn_init;
 
 static struct
 {
-	enum ipc_client_lift_link_state state;
+	enum ipc_client_service_link_state state;
 	uint32_t gen;
 	int created;
 } s_link;
 
 //! The one link object the fake hands out (opaque to oxr_lift.c).
 static int s_link_object;
+//! ADR-061: the caps the link was created with (LIFT; SHARE when DXR_APP_SHARE allows it).
+static uint32_t s_link_caps;
+
+uint32_t
+ipc_client_service_link_caps(const struct ipc_client_service_link *link)
+{
+	(void)link;
+	return s_link_caps;
+}
+
+// ADR-061: the share registration a SHARE link stores at create (never on the
+// wire here: the lift traces stay exactly the ADR-049 sequence).
+void
+ipc_client_service_link_set_registration(struct ipc_client_service_link *link,
+                                         const struct xrt_share_link_registration *reg)
+{
+	(void)link;
+	(void)reg;
+}
 
 void
 lf_reset(void)
@@ -127,7 +146,7 @@ lf_reset(void)
 	s_svc.next_stream_id = 0x51;
 	s_svc.next_frame_id = 1;
 	memset(&s_link, 0, sizeof(s_link));
-	s_link.state = IPC_CLIENT_LIFT_LINK_CONNECTING;
+	s_link.state = IPC_CLIENT_SERVICE_LINK_CONNECTING;
 	if (!s_conn_init) {
 		memset(&s_conn, 0, sizeof(s_conn));
 		os_mutex_init(&s_conn.mutex);
@@ -208,7 +227,7 @@ lf_last_submit_view_count(void)
 void
 lf_set_link(int state, uint32_t gen)
 {
-	s_link.state = (enum ipc_client_lift_link_state)state;
+	s_link.state = (enum ipc_client_service_link_state)state;
 	s_link.gen = gen;
 }
 
@@ -309,22 +328,23 @@ comp_ipc_client_compositor_lift_connection(struct xrt_compositor *xc)
 
 /*
  *
- * Seam 2: the ADR-049 lift-only link (ipc_client_lift_link.c in the runtime).
+ * Seam 2: the ADR-049 lift-only link (ipc_client_service_link.c in the runtime).
  *
  */
 
 xrt_result_t
-ipc_client_lift_link_create(const char *label, struct ipc_client_lift_link **out_link)
+ipc_client_service_link_create(const char *label, uint32_t caps, struct ipc_client_service_link **out_link)
 {
 	(void)label;
+	s_link_caps = caps;
 	s_link.created++;
 	trace("link:create");
-	*out_link = (struct ipc_client_lift_link *)&s_link_object;
+	*out_link = (struct ipc_client_service_link *)&s_link_object;
 	return XRT_SUCCESS;
 }
 
 void
-ipc_client_lift_link_destroy(struct ipc_client_lift_link **link_ptr)
+ipc_client_service_link_destroy(struct ipc_client_service_link **link_ptr)
 {
 	if (link_ptr == NULL || *link_ptr == NULL) {
 		return;
@@ -334,45 +354,45 @@ ipc_client_lift_link_destroy(struct ipc_client_lift_link **link_ptr)
 }
 
 static struct ipc_connection *
-link_acquire(const char *what, uint32_t timeout_ms, enum ipc_client_lift_link_state *out_state, uint32_t *out_gen)
+link_acquire(const char *what, uint32_t timeout_ms, enum ipc_client_service_link_state *out_state, uint32_t *out_gen)
 {
 	trace("link:%s(timeout_ms=%u) -> %s gen=%u", what, timeout_ms,
-	      s_link.state == IPC_CLIENT_LIFT_LINK_CONNECTING  ? "CONNECTING"
-	      : s_link.state == IPC_CLIENT_LIFT_LINK_CONNECTED ? "CONNECTED"
-	      : s_link.state == IPC_CLIENT_LIFT_LINK_FAILED    ? "FAILED"
-	                                                       : "DEAD",
+	      s_link.state == IPC_CLIENT_SERVICE_LINK_CONNECTING  ? "CONNECTING"
+	      : s_link.state == IPC_CLIENT_SERVICE_LINK_CONNECTED ? "CONNECTED"
+	      : s_link.state == IPC_CLIENT_SERVICE_LINK_FAILED    ? "FAILED"
+	                                                          : "DEAD",
 	      s_link.gen);
 	*out_state = s_link.state;
 	*out_gen = s_link.gen;
-	return s_link.state == IPC_CLIENT_LIFT_LINK_CONNECTED ? &s_conn : NULL;
+	return s_link.state == IPC_CLIENT_SERVICE_LINK_CONNECTED ? &s_conn : NULL;
 }
 
 struct ipc_connection *
-ipc_client_lift_link_acquire(struct ipc_client_lift_link *link,
-                             enum ipc_client_lift_link_state *out_state,
-                             uint32_t *out_gen)
+ipc_client_service_link_acquire(struct ipc_client_service_link *link,
+                                enum ipc_client_service_link_state *out_state,
+                                uint32_t *out_gen)
 {
 	(void)link;
 	return link_acquire("acquire", 0, out_state, out_gen);
 }
 
 struct ipc_connection *
-ipc_client_lift_link_acquire_wait(struct ipc_client_lift_link *link,
-                                  uint32_t timeout_ms,
-                                  enum ipc_client_lift_link_state *out_state,
-                                  uint32_t *out_gen)
+ipc_client_service_link_acquire_wait(struct ipc_client_service_link *link,
+                                     uint32_t timeout_ms,
+                                     enum ipc_client_service_link_state *out_state,
+                                     uint32_t *out_gen)
 {
 	(void)link;
 	return link_acquire("acquire_wait", timeout_ms, out_state, out_gen);
 }
 
 void
-ipc_client_lift_link_release(struct ipc_client_lift_link *link, uint32_t gen, bool ipc_failed)
+ipc_client_service_link_release(struct ipc_client_service_link *link, uint32_t gen, bool ipc_failed)
 {
 	(void)link;
 	trace("link:release(gen=%u, ipc_failed=%d)", gen, ipc_failed ? 1 : 0);
 	if (ipc_failed && gen == s_link.gen) {
-		s_link.state = IPC_CLIENT_LIFT_LINK_DEAD;
+		s_link.state = IPC_CLIENT_SERVICE_LINK_DEAD;
 	}
 }
 

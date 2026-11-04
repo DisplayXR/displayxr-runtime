@@ -73,6 +73,7 @@
 #endif
 
 #include "oxr_objects.h"
+#include "oxr_service_link.h"
 #include "oxr_session_window_binding.h"
 #include "oxr_workspace_window_linux.h"
 #include "oxr_mcp_tools.h"
@@ -1621,6 +1622,10 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 	oxr_android_window_hint_reemit(log, sess);
 #endif
 
+	// ADR-061 arm 2: an in-process session offers itself for sharing over its
+	// service link (background connect; no-op for IPC sessions / sharing off).
+	oxr_service_link_session_begin(sess);
+
 	return oxr_session_success_result(sess);
 }
 
@@ -1736,6 +1741,9 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess)
 		return oxr_error(log, ret, "Frame sync object refused to let us end session, probably not running");
 	}
 	sess->has_ended_once = false;
+
+	// ADR-061 arm 2: no longer listed as a share source (the link stays for lift).
+	oxr_service_link_session_end(sess);
 
 	return oxr_session_success_result(sess);
 }
@@ -6391,9 +6399,12 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	// MCP tool handler stops reading.
 	oxr_mcp_tools_detach_session(sess);
 
+	// ADR-061 arm 2: the compositor's share tap must not reach the link past here.
+	oxr_service_link_session_fini(sess);
+
 #ifdef OXR_HAVE_DXR_lift
 	// ADR-049: the lift streams (children) are already destroyed; close the
-	// in-process session's lift-only service connection behind them.
+	// in-process session's service link behind them.
 	oxr_lift_session_fini(sess);
 #endif
 
@@ -7775,8 +7786,8 @@ oxr_session_create(struct oxr_logger *log,
 
 #ifdef OXR_HAVE_DXR_app_share
 	// XR_DXR_app_share spec §5: the app's own opt-out from every share. It
-	// travels on the session's IPC connection; an in-process session is never
-	// listed by the service in this build (the in-process service link share capability is P2).
+	// travels on the session's IPC connection, or in the registration of an
+	// in-process session's service link (ADR-061 arm 2).
 	if (sys->inst->extensions.DXR_app_share) {
 		const XrSessionShareabilityDXR *sh =
 		    OXR_GET_INPUT_FROM_CHAIN(createInfo, XR_TYPE_SESSION_SHAREABILITY_DXR, XrSessionShareabilityDXR);
@@ -7956,6 +7967,9 @@ oxr_session_create(struct oxr_logger *log,
 #else
 	const bool desktop_linux = false;
 #endif
+	// ADR-061 spec §5: an in-process session sends the opt-out on its service link.
+	sess->app_share_opt_out = xsi.app_share_not_shareable;
+
 	sess->has_external_window =
 	    oxr_session_has_external_window_binding(desktop_linux, sess->has_external_window, &xsi);
 

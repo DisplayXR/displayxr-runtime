@@ -17,7 +17,24 @@ extern "C" {
 #endif
 
 struct oxr_session;
-struct ipc_client_lift_link;
+struct xrt_share_link_registration;
+
+/*! ADR-061 arm 2: does this session offer its pre-weave views over its
+ *  service link? In-process, on a platform with a link, and DXR_APP_SHARE
+ *  is not 0 in the app's environment. */
+bool
+oxr_service_link_share_wanted(struct oxr_session *sess);
+
+/*! The capabilities (enum xrt_share_link_caps) the session's link declares:
+ *  LIFT when the instance enabled XR_DXR_lift, SHARE when sharing is wanted. */
+uint32_t
+oxr_service_link_caps(struct oxr_session *sess);
+
+/*! The session's `service_link_register` payload (tap fields left 0: the
+ *  compositor's share tap owns them). */
+void
+oxr_service_link_fill_registration(struct oxr_session *sess, bool running, struct xrt_share_link_registration *out);
+struct ipc_client_service_link;
 
 /*! ADR-049: an in-process session that reaches the conversion service over a
  *  lift-only connection — any in-process native compositor on Windows,
@@ -30,9 +47,9 @@ oxr_conv_inprocess_eligible(struct oxr_session *sess);
 bool
 oxr_conv_v3_eligible(struct oxr_session *sess);
 
-/*! The session's lift link, created on first use (no connect yet). NULL where
- *  no lift link exists (Android). */
-struct ipc_client_lift_link *
+/*! The session's service link (ADR-049 Amendment 1: {lift, share}), created
+ *  on first use (no connect yet). NULL where no link exists (Android). */
+struct ipc_client_service_link *
 oxr_conv_link_get(struct oxr_session *sess);
 
 /*! XrLiftImageKindDXR masks (1 << kind) this session can hand in / take out:

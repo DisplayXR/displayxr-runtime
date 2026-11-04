@@ -53,6 +53,8 @@ add_library(
 	u_capture_dims.h
 	u_app_share_fake.c
 	u_app_share_fake.h
+	u_share_link.c
+	u_share_link.h
 	u_camera_consent.c
 	u_camera_consent.h
 	u_camera_consent_android.c

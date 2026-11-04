@@ -23,6 +23,8 @@
 
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_stereo_camera.h"
+#include "xrt/xrt_share_link.h"
+#include "xrt/xrt_handles.h"
 #include "util/u_camera_consent.h"
 #include "util/u_stereo_uvc.h"
 #include "xrt/xrt_plugin.h"
@@ -84,8 +86,15 @@ struct ipc_server_stereo_camera_options
 	 */
 	//! DXR_APP_SHARE_DEV: 0 = from the env, > 0 on, < 0 off.
 	int32_t app_share_dev;
-	//! DXR_APP_SHARE_FAKE: 0 = from the env, > 0 on, < 0 off.
+	//! DXR_APP_SHARE_FAKE (the synthetic service-composited app): 0 = from the env, > 0 on, < 0 off.
 	int32_t app_share_fake;
+	/*!
+	 * DXR_APP_SHARE_FAKE=link (or =both): a synthetic IN-PROCESS registrant
+	 * over the share-link core — it registers, answers SHARE_REQUESTED with a
+	 * CPU ring and posts frame_ready at the stream rate, exactly as an app's
+	 * service link would (ADR-061 arm 2). 0 = from the env, > 0 on, < 0 off.
+	 */
+	int32_t app_share_fake_link;
 	//! How long an exited app's entry stays listed UNAVAILABLE, ms (0 = 10000).
 	int32_t app_linger_ms;
 	//! `share.prompt`: 0 = the user store, 1 = always, 2 = per-app-run.
@@ -300,6 +309,64 @@ struct ipc_server_stereo_camera_platform
 	void (*share_tap_release_frame)(void *ctx, void *tap);
 	//! Stop tapping; @p tap is freed. Always called once per successful attach.
 	void (*share_tap_detach)(void *ctx, void *tap);
+	/*! @} */
+
+	/*!
+	 * @name ADR-061 arm 2: the share LINK (an IN-PROCESS app's published ring)
+	 *
+	 * An in-process app copies its pre-weave views into a 3-texture NT-shared
+	 * ring with a shared fence (compositor/xbridge/comp_xbridge_share_tap.h)
+	 * and posts `service_link_share_frame_ready` per frame; these hooks turn
+	 * that ring into the same SBS NV12 frame the share tap above produces
+	 * (ADR-061 decision 6 — the Windows D3D11 service fills them with the
+	 * tap's own NV12 pass). All NULL = this service cannot import a ring:
+	 * every in-process app entry is listed UNAVAILABLE ("no tap"). Called on
+	 * the app entry's camera thread, never with a manager lock held.
+	 * @{
+	 */
+	/*!
+	 * The adapter the service publishes (`client_d3d_deviceLUID`, ADR-037 §7)
+	 * — a ring on another adapter cannot be opened, so such an entry is listed
+	 * UNAVAILABLE (OTHER_ADAPTER). false = unknown (no adapter check).
+	 */
+	bool (*share_link_adapter_luid)(void *ctx, uint8_t out_luid[XRT_LUID_SIZE]);
+	/*!
+	 * Open a published ring. Takes ownership of every handle (closes them on
+	 * failure too): @p textures (@p texture_count, XRT_SHARE_LINK_RING_SLOTS
+	 * on Windows) and @p fence (may be invalid). @p eye_w x @p eye_h: the
+	 * stream's per-eye extent every converted frame must have.
+	 */
+	xrt_result_t (*share_link_import)(void *ctx,
+	                                  const struct xrt_share_link_ring_desc *desc,
+	                                  const xrt_graphics_buffer_handle_t *textures,
+	                                  uint32_t texture_count,
+	                                  xrt_graphics_sync_handle_t fence,
+	                                  uint32_t eye_w,
+	                                  uint32_t eye_h,
+	                                  void **out_import);
+	/*!
+	 * Convert slot @p frame->slot once the ring's fence reached
+	 * @p frame->fence_value (a GPU-side wait — never a CPU wait on the app):
+	 * the content rect of each half (the frame's when its width is non-zero,
+	 * else the ring's), scaled to fit the eye extent preserving aspect,
+	 * letterboxed, flipped per flip_y, encoded if linear, NV12 BT.601 full
+	 * range. May be pipelined like the tap (a non-blocking readback ring):
+	 * XRT_PLUGIN_STEREO_CAMERA_WAIT_OK = @p out_frame holds the newest
+	 * FINISHED conversion (planes valid until share_link_release_frame) and
+	 * @p out_info its metadata (content rect in delivered-eye pixels, mono,
+	 * content generation, zeroDisparityShiftFrac, commit time);
+	 * WAIT_TIMEOUT = nothing finished yet; WAIT_ERROR = the ring is unusable
+	 * (the stream ends SOURCE_LOST).
+	 */
+	uint32_t (*share_link_convert)(void *ctx,
+	                               void *import,
+	                               const struct xrt_share_link_frame *frame,
+	                               struct xrt_plugin_stereo_camera_frame *out_frame,
+	                               struct xrt_app_share_frame_info *out_info);
+	//! Done with the frame of the last OK convert (may be NULL).
+	void (*share_link_release_frame)(void *ctx, void *import);
+	//! Close an imported ring; @p import is freed. Once per successful import.
+	void (*share_link_unimport)(void *ctx, void *import);
 	/*! @} */
 
 	void *ctx;
