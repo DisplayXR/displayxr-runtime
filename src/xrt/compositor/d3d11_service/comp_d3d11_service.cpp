@@ -23348,20 +23348,16 @@ svc_read_done_note_drop(struct d3d11_service_compositor *c, const char *why, uin
 static const char *const svc_share_tap_hlsl = R"(
 Texture2D<float4> atlas : register(t0);
 SamplerState lin : register(s0);
-cbuffer C : register(b0) { float2 uv0; float2 uv_scale; float2 uv_min; float2 uv_max; float2 half_texel; float is_linear; float pad; };
+cbuffer C : register(b0) { float2 uv0; float2 uv_scale; float2 uv_min; float2 uv_max; float2 half_texel; float2 pad; };
 struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };
 V vs(uint i : SV_VertexID) {
   V o; float2 t = float2((i << 1) & 2, i & 2);
   o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t; return o;
 }
-float3 fetch(float2 uv) {
-  float3 c = atlas.SampleLevel(lin, clamp(uv, uv_min, uv_max), 0).rgb;
-  if (is_linear > 0.5) {
-    c = saturate(c);
-    c = c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-  }
-  return c;
-}
+float3 fetch(float2 uv) { return atlas.SampleLevel(lin, clamp(uv, uv_min, uv_max), 0).rgb; }
+// A linear atlas first goes through this into an `_SRGB` target: the hardware
+// applies the encode, never a copy of the curve in a shader (ADR-021 2).
+float4 ps_copy(V i) : SV_Target { return float4(fetch(uv0 + i.uv * uv_scale), 1.0); }
 static const float3 KY = float3(0.299, 0.587, 0.114);
 float ps_y(V i) : SV_Target { return dot(fetch(uv0 + i.uv * uv_scale), KY); }
 float2 ps_uv(V i) : SV_Target {
@@ -23375,7 +23371,7 @@ float2 ps_uv(V i) : SV_Target {
 struct svc_share_tap_cb
 {
 	float uv0[2], uv_scale[2], uv_min[2], uv_max[2], half_texel[2];
-	float is_linear, pad;
+	float pad[2];
 };
 
 #define SVC_SHARE_TAP_RING 3
@@ -23389,8 +23385,12 @@ struct svc_share_tap
 
 	// GPU side: commit thread, under immediate_ctx_mutex.
 	wil::com_ptr<ID3D11VertexShader> vs;
-	wil::com_ptr<ID3D11PixelShader> ps_y, ps_uv;
+	wil::com_ptr<ID3D11PixelShader> ps_y, ps_uv, ps_copy;
 	wil::com_ptr<ID3D11SamplerState> sampler;
+	//! The encode step for a linear atlas: written through `_SRGB`, read as UNORM.
+	wil::com_ptr<ID3D11Texture2D> enc_tex;
+	wil::com_ptr<ID3D11RenderTargetView> enc_rtv;
+	wil::com_ptr<ID3D11ShaderResourceView> enc_srv;
 	wil::com_ptr<ID3D11Buffer> cb;
 	wil::com_ptr<ID3D11Texture2D> tex_y, tex_uv;
 	wil::com_ptr<ID3D11RenderTargetView> rtv_y, rtv_uv;
@@ -23443,6 +23443,32 @@ svc_share_tap_create_gpu(struct d3d11_service_system *sys, struct svc_share_tap 
 	hr = D3DCompile(svc_share_tap_hlsl, strlen(svc_share_tap_hlsl), nullptr, nullptr, nullptr, "ps_uv", "ps_5_0", 0, 0,
 	                b.put(), nullptr);
 	if (FAILED(hr) || FAILED(dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, t->ps_uv.put()))) {
+		return false;
+	}
+	b.reset();
+	hr = D3DCompile(svc_share_tap_hlsl, strlen(svc_share_tap_hlsl), nullptr, nullptr, nullptr, "ps_copy", "ps_5_0", 0, 0,
+	                b.put(), nullptr);
+	if (FAILED(hr) || FAILED(dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, t->ps_copy.put()))) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC et = {};
+	et.Width = t->eye_w * 2;
+	et.Height = t->eye_h;
+	et.MipLevels = 1;
+	et.ArraySize = 1;
+	et.SampleDesc.Count = 1;
+	et.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+	et.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	D3D11_RENDER_TARGET_VIEW_DESC er = {};
+	er.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	er.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+	D3D11_SHADER_RESOURCE_VIEW_DESC es = {};
+	es.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	es.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	es.Texture2D.MipLevels = 1;
+	if (FAILED(dev->CreateTexture2D(&et, nullptr, t->enc_tex.put())) ||
+	    FAILED(dev->CreateRenderTargetView(t->enc_tex.get(), &er, t->enc_rtv.put())) ||
+	    FAILED(dev->CreateShaderResourceView(t->enc_tex.get(), &es, t->enc_srv.put()))) {
 		return false;
 	}
 	D3D11_SAMPLER_DESC sd = {};
@@ -23552,6 +23578,7 @@ svc_share_tap_draw_eye(struct d3d11_service_system *sys,
                        uint32_t atlas_h,
                        bool flip_y,
                        bool is_linear,
+                       ID3D11ShaderResourceView *atlas_srv,
                        const struct xrt_app_share_frame_info *info)
 {
 	ID3D11DeviceContext *ctx = sys->context.get();
@@ -23573,12 +23600,39 @@ svc_share_tap_draw_eye(struct d3d11_service_system *sys,
 	// Half a stream pixel, in atlas uv: the block one chroma sample averages.
 	cb.half_texel[0] = 0.5f * ((float)cw / aw) / (float)info->content_width;
 	cb.half_texel[1] = 0.5f * ((float)ch / ah) / (float)info->content_height;
-	cb.is_linear = is_linear ? 1.0f : 0.0f;
 	ctx->UpdateSubresource(t->cb.get(), 0, nullptr, &cb, 0, 0);
 
 	const float x = (float)(eye * t->eye_w + (uint32_t)info->content_x), y = (float)info->content_y;
 	const float w = (float)info->content_width, h = (float)info->content_height;
 	D3D11_VIEWPORT vy = {x, y, w, h, 0.0f, 1.0f};
+	ID3D11ShaderResourceView *src = atlas_srv;
+	if (is_linear) {
+		// Encode this eye through the `_SRGB` target, then convert from the result.
+		ID3D11RenderTargetView *enc = t->enc_rtv.get();
+		ID3D11ShaderResourceView *none = nullptr;
+		ctx->PSSetShaderResources(0, 1, &atlas_srv);
+		ctx->OMSetRenderTargets(1, &enc, nullptr);
+		ctx->RSSetViewports(1, &vy);
+		ctx->PSSetShader(t->ps_copy.get(), nullptr, 0);
+		ctx->Draw(3, 0);
+		ID3D11RenderTargetView *null_rtv = nullptr;
+		ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+		ctx->PSSetShaderResources(0, 1, &none);
+		const float sw = (float)(t->eye_w * 2), sh = (float)t->eye_h;
+		cb.uv0[0] = x / sw;
+		cb.uv0[1] = y / sh;
+		cb.uv_scale[0] = w / sw;
+		cb.uv_scale[1] = h / sh;
+		cb.uv_min[0] = (x + 0.5f) / sw;
+		cb.uv_min[1] = (y + 0.5f) / sh;
+		cb.uv_max[0] = (x + w - 0.5f) / sw;
+		cb.uv_max[1] = (y + h - 0.5f) / sh;
+		cb.half_texel[0] = 0.5f / sw;
+		cb.half_texel[1] = 0.5f / sh;
+		ctx->UpdateSubresource(t->cb.get(), 0, nullptr, &cb, 0, 0);
+		src = t->enc_srv.get();
+	}
+	ctx->PSSetShaderResources(0, 1, &src);
 	ID3D11RenderTargetView *rtv = t->rtv_y.get();
 	ctx->OMSetRenderTargets(1, &rtv, nullptr);
 	ctx->RSSetViewports(1, &vy);
@@ -23703,8 +23757,8 @@ svc_share_tap_commit(struct d3d11_service_system *sys,
 			        ad.Width, ad.Height, (int)ad.Format, cw, ch, cols, views, vl, vr, info.content_x, info.content_y, w, h,
 			        (int)c->atlas_flip_y, (int)is_linear);
 		}
-		svc_share_tap_draw_eye(sys, t, 0, vl, cols, rows, cw, ch, ad.Width, ad.Height, c->atlas_flip_y, is_linear, &info);
-		svc_share_tap_draw_eye(sys, t, 1, vr, cols, rows, cw, ch, ad.Width, ad.Height, c->atlas_flip_y, is_linear, &info);
+		svc_share_tap_draw_eye(sys, t, 0, vl, cols, rows, cw, ch, ad.Width, ad.Height, c->atlas_flip_y, is_linear, srv, &info);
+		svc_share_tap_draw_eye(sys, t, 1, vr, cols, rows, cw, ch, ad.Width, ad.Height, c->atlas_flip_y, is_linear, srv, &info);
 
 		ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
 		ID3D11ShaderResourceView *null_srv = nullptr;
