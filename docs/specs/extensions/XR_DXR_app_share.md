@@ -111,7 +111,7 @@ Chain `XrAppShareFrameInfoDXR` on `XrStereoCameraFrameDXR::next` at acquire:
 | `contentRect` | the content inside one eye half, left-half coordinates; outside it is letterbox |
 | `mono` | `XR_TRUE`: one view in both halves (a 2D mode) |
 | `contentGeneration` | bumps whenever `contentRect`, `mono` or the app's view layout changed |
-| `zeroDisparityShiftFrac` | the horizontal disparity, as a fraction of `contentRect.extent.width` (right minus left), of a point on the sender's display plane. **0 in v1, always.** A receiver shifts each eye by half of it, in opposite directions, to put the sender's display plane at its own zero-disparity plane |
+| `zeroDisparityShiftFrac` | the horizontal disparity, as a fraction of the delivered per-eye width (`eyeExtent.width`, what the receiver decodes; right minus left), of a point on the sender's display plane. **0 in v1, always.** A receiver shifts each eye by half of it, in opposite directions, to put the sender's display plane at its own zero-disparity plane |
 | `sourceCommitTime` | when the app's frame was committed (runtime clock) |
 
 The service sends no measured disparity: synthetic content has a known zero plane, and an app that
