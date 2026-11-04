@@ -1508,3 +1508,462 @@ TEST_CASE("app share: enumerate-driven rescans are throttled, apps_changed is no
 	CHECK(scm_count(f) == 1);
 	scm_destroy(f);
 }
+
+
+/*
+ *
+ * ADR-061 arm 2: in-process apps over their service links (SOURCE_APP_LINK).
+ *
+ */
+
+namespace {
+
+constexpr long kLinkPid = 4000101; // never a real process ("pid-4000101")
+
+xrt_share_link_registration
+link_reg(const char *name, bool running = true, bool tap = true)
+{
+	xrt_share_link_registration r = {};
+	r.caps = XRT_SHARE_LINK_CAP_SHARE;
+	std::snprintf(r.app_name, sizeof(r.app_name), "%s", name);
+	r.tier = XRT_SHARE_LINK_TIER_D3D11;
+	r.tap_available = tap ? 1u : 0u;
+	r.session_running = running ? 1u : 0u;
+	return r;
+}
+
+//! The app entries the consumer sees, keyed by display name.
+const xrt_stereo_camera_properties *
+find_named(const std::vector<xrt_stereo_camera_properties> &v, const char *name)
+{
+	for (const auto &p : v) {
+		if (std::string(p.display_name) == name) {
+			return &p;
+		}
+	}
+	return nullptr;
+}
+
+//! Poll the link until the service asks for @p state (the camera thread opens asynchronously).
+bool
+link_wait_state(scm_fixture *f, uint32_t slot, uint32_t state, xrt_share_link_poll *out, int64_t ms = 4000)
+{
+	const int64_t t_end = os_monotonic_get_ns() + ms * 1000 * 1000;
+	while (os_monotonic_get_ns() < t_end) {
+		REQUIRE(scm_link_poll(f, slot, out) == XRT_SUCCESS);
+		if (out->state == state) {
+			return true;
+		}
+		os_nanosleep(5 * 1000 * 1000);
+	}
+	return false;
+}
+
+xrt_share_link_ring_desc
+link_ring(uint32_t generation, uint32_t stream_generation, uint32_t content_w, uint32_t content_h)
+{
+	xrt_share_link_ring_desc d = {};
+	d.generation = generation;
+	d.stream_generation = stream_generation;
+	d.format = 28; // DXGI_FORMAT_R8G8B8A8_UNORM, as the Windows tap would publish
+	d.slot_width = 2 * content_w;
+	d.slot_height = content_h;
+	d.content_width = content_w;
+	d.content_height = content_h;
+	d.slot_count = XRT_SHARE_LINK_RING_SLOTS;
+	return d;
+}
+
+/*!
+ * Post frame_ready for ring @p generation until @p want frames were acquired
+ * (as the app's compositor would, once per frame), or the time runs out.
+ */
+uint32_t
+link_pump(scm_fixture *f, uint32_t slot, uint64_t sid, uint32_t generation, uint32_t content_gen, uint32_t want)
+{
+	uint32_t got = 0, n = 0;
+	const int64_t t_end = os_monotonic_get_ns() + 5ll * 1000 * 1000 * 1000;
+	while (got < want && os_monotonic_get_ns() < t_end) {
+		xrt_share_link_frame fr = {};
+		fr.generation = generation;
+		fr.slot = n++ % XRT_SHARE_LINK_RING_SLOTS;
+		fr.fence_value = n;
+		fr.commit_ns = os_monotonic_get_ns();
+		fr.content_generation = content_gen;
+		xrt_share_link_poll p = {};
+		REQUIRE(scm_link_frame_ready(f, slot, &fr, &p) == XRT_SUCCESS);
+		os_nanosleep(4 * 1000 * 1000);
+		bool ready = false;
+		xrt_stereo_camera_frame_info fi = {};
+		const uint8_t *s = nullptr;
+		REQUIRE(scm_acquire(f, sid, &ready, &fi, &s) == XRT_SUCCESS);
+		got += ready ? 1u : 0u;
+	}
+	return got;
+}
+
+} // namespace
+
+TEST_CASE("app share link: registration, reasons, churn", "[stereo_camera_manager][app_share_link]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	const uint8_t svc_luid[XRT_LUID_SIZE] = {1, 2, 3, 4, 5, 6, 7, 8};
+	scm_set_link_importer(true, svc_luid);
+	scm_app_options o = {};
+	o.dev = -1;
+	o.fake = -1;
+	o.linger_ms = 300;
+	o.consumer_sees_apps = true;
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+
+	// A: tappable, on the service's adapter -> AVAILABLE.
+	scm_link_connect(f, 1, 101, kLinkPid + 1, XRT_CLIENT_CLASS_APP);
+	auto a = link_reg("Link A");
+	std::memcpy(a.luid, svc_luid, XRT_LUID_SIZE);
+	a.luid_valid = 1;
+	REQUIRE(scm_link_register(f, 1, &a) == XRT_SUCCESS);
+	// B: OpenGL -> UNAVAILABLE (unsupported API), whatever the tap says.
+	scm_link_connect(f, 2, 102, kLinkPid + 2, XRT_CLIENT_CLASS_APP);
+	auto b = link_reg("Link B");
+	b.tier = XRT_SHARE_LINK_TIER_GL;
+	REQUIRE(scm_link_register(f, 2, &b) == XRT_SUCCESS);
+	// C: opted out -> never listed.
+	scm_link_connect(f, 3, 103, kLinkPid + 3, XRT_CLIENT_CLASS_APP);
+	auto c = link_reg("Link C");
+	c.opt_out = 1;
+	REQUIRE(scm_link_register(f, 3, &c) == XRT_SUCCESS);
+	// D: session not running -> not listed.
+	scm_link_connect(f, 4, 104, kLinkPid + 4, XRT_CLIENT_CLASS_APP);
+	auto d = link_reg("Link D", false);
+	REQUIRE(scm_link_register(f, 4, &d) == XRT_SUCCESS);
+	// E: another adapter -> UNAVAILABLE (other adapter).
+	scm_link_connect(f, 5, 105, kLinkPid + 5, XRT_CLIENT_CLASS_APP);
+	auto e = link_reg("Link E");
+	const uint8_t other[XRT_LUID_SIZE] = {9, 9, 9, 9, 9, 9, 9, 9};
+	std::memcpy(e.luid, other, XRT_LUID_SIZE);
+	e.luid_valid = 1;
+	REQUIRE(scm_link_register(f, 5, &e) == XRT_SUCCESS);
+	// F: no tap (macOS / Linux / a Windows session before its tap) -> UNAVAILABLE (no tap).
+	scm_link_connect(f, 6, 106, kLinkPid + 6, XRT_CLIENT_CLASS_APP);
+	auto ff = link_reg("Link F", true, false);
+	REQUIRE(scm_link_register(f, 6, &ff) == XRT_SUCCESS);
+	// G: the fill arm declined a texture-class session -> that reason, verbatim.
+	scm_link_connect(f, 7, 107, kLinkPid + 7, XRT_CLIENT_CLASS_APP);
+	auto g = link_reg("Link G", true, false);
+	g.tap_unavailable_reason = XRT_APP_SHARE_UNAVAILABLE_SHARED_TEXTURE;
+	REQUIRE(scm_link_register(f, 7, &g) == XRT_SUCCESS);
+	// A browser's connection may not register a share link at all.
+	scm_link_connect(f, 8, 108, kLinkPid + 8, XRT_CLIENT_CLASS_PRESENT_OWNER);
+	auto h = link_reg("Link H");
+	CHECK(scm_link_register(f, 8, &h) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
+	// A lift-only link registers nothing that is listed.
+	scm_link_connect(f, 9, 109, kLinkPid + 9, XRT_CLIENT_CLASS_APP);
+	auto l = link_reg("Link L");
+	l.caps = XRT_SHARE_LINK_CAP_LIFT;
+	REQUIRE(scm_link_register(f, 9, &l) == XRT_SUCCESS);
+
+	scm_rescan_apps(f);
+	auto v = listing(f);
+	CHECK(v.size() == 5); // A B E F G
+	struct expect
+	{
+		const char *name;
+		uint32_t availability;
+		uint32_t state;
+	} want[] = {
+	    {"Link A", XRT_APP_SHARE_AVAILABLE, XRT_STEREO_CAMERA_STATE_AVAILABLE},
+	    {"Link B", XRT_APP_SHARE_UNAVAILABLE_UNSUPPORTED_API, XRT_STEREO_CAMERA_STATE_UNAVAILABLE},
+	    {"Link E", XRT_APP_SHARE_UNAVAILABLE_OTHER_ADAPTER, XRT_STEREO_CAMERA_STATE_UNAVAILABLE},
+	    {"Link F", XRT_APP_SHARE_UNAVAILABLE_NO_TAP, XRT_STEREO_CAMERA_STATE_UNAVAILABLE},
+	    {"Link G", XRT_APP_SHARE_UNAVAILABLE_SHARED_TEXTURE, XRT_STEREO_CAMERA_STATE_UNAVAILABLE},
+	};
+	for (const auto &w : want) {
+		INFO(w.name);
+		const auto *p = find_named(v, w.name);
+		REQUIRE(p != nullptr);
+		CHECK(is_app(*p));
+		CHECK(p->state == w.state);
+		xrt_app_share_source_info ai;
+		REQUIRE(scm_app_source(f, p->camera_id, &ai) == XRT_SUCCESS);
+		CHECK(ai.availability == w.availability);
+		CHECK(ai.source == XRT_STEREO_CAMERA_SOURCE_APP_LINK);
+	}
+	CHECK(find_named(v, "Link C") == nullptr);
+	CHECK(find_named(v, "Link D") == nullptr);
+	CHECK(find_named(v, "Link L") == nullptr);
+
+	// Churn: re-registering the same connection never duplicates; a session
+	// end lingers UNAVAILABLE; the same exe + instance gets its id back.
+	const uint64_t id_a = find_named(v, "Link A")->camera_id;
+	REQUIRE(scm_link_register(f, 1, &a) == XRT_SUCCESS);
+	scm_rescan_apps(f);
+	CHECK(listing(f).size() == 5);
+	auto a_end = a;
+	a_end.session_running = 0;
+	REQUIRE(scm_link_register(f, 1, &a_end) == XRT_SUCCESS);
+	scm_rescan_apps(f);
+	v = listing(f);
+	REQUIRE(find_named(v, "Link A") != nullptr);
+	CHECK(find_named(v, "Link A")->state == XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+	REQUIRE(scm_link_register(f, 1, &a) == XRT_SUCCESS);
+	scm_rescan_apps(f);
+	v = listing(f);
+	REQUIRE(find_named(v, "Link A") != nullptr);
+	CHECK(find_named(v, "Link A")->camera_id == id_a);
+	CHECK(find_named(v, "Link A")->state == XRT_STEREO_CAMERA_STATE_AVAILABLE);
+
+	// The opt-out arriving later delists at once (no linger).
+	auto b_out = b;
+	b_out.opt_out = 1;
+	REQUIRE(scm_link_register(f, 2, &b_out) == XRT_SUCCESS);
+	scm_rescan_apps(f);
+	CHECK(find_named(listing(f), "Link B") == nullptr);
+
+	// Disconnects: lingered, then gone.
+	for (uint32_t s = 1; s <= 9; s++) {
+		scm_link_disconnect(f, s);
+	}
+	scm_rescan_apps(f);
+	os_nanosleep(350ll * 1000 * 1000);
+	scm_rescan_apps(f);
+	CHECK(listing(f).empty());
+
+	// No importer in this service (macOS / Linux): a tappable link is "no tap".
+	scm_set_link_importer(false, nullptr);
+	scm_link_connect(f, 1, 111, kLinkPid + 11, XRT_CLIENT_CLASS_APP);
+	auto m = link_reg("Link M");
+	REQUIRE(scm_link_register(f, 1, &m) == XRT_SUCCESS);
+	scm_rescan_apps(f);
+	v = listing(f);
+	REQUIRE(v.size() == 1);
+	xrt_app_share_source_info ai;
+	REQUIRE(scm_app_source(f, v[0].camera_id, &ai) == XRT_SUCCESS);
+	CHECK(ai.availability == XRT_APP_SHARE_UNAVAILABLE_NO_TAP);
+	scm_link_disconnect(f, 1);
+	scm_destroy(f);
+}
+
+TEST_CASE("app share link: start -> SHARE_REQUESTED -> ring -> frames; resize; stop -> SHARE_STOPPED",
+          "[stereo_camera_manager][app_share_link]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_set_link_importer(true, nullptr);
+	scm_app_options o = {};
+	o.dev = -1;
+	o.fake = -1;
+	o.consumer_sees_apps = true;
+	o.prompt_mode = 1; // always
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+	scm_link_connect(f, 1, 201, kLinkPid + 21, XRT_CLIENT_CLASS_APP);
+	// lift + share on ONE connection: a link that also lifts is the same app entry.
+	auto r = link_reg("Shared Viewer");
+	r.caps = XRT_SHARE_LINK_CAP_LIFT | XRT_SHARE_LINK_CAP_SHARE;
+	REQUIRE(scm_link_register(f, 1, &r) == XRT_SUCCESS);
+	scm_rescan_apps(f);
+	auto v = listing(f);
+	REQUIRE(v.size() == 1);
+	const uint64_t id = v[0].camera_id;
+	xrt_share_link_poll p = {};
+	REQUIRE(scm_link_poll(f, 1, &p) == XRT_SUCCESS);
+	CHECK(p.state == XRT_SHARE_LINK_STATE_NONE); // nobody shares it yet
+
+	// The consent arm is the camera's share prompt: a Deny never reaches the app.
+	scm_set_share_answer(U_CAMERA_CONSENT_PROMPT_DENY);
+	uint64_t sid = 0;
+	auto req = share_req(id);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	CHECK(scm_stream_start(f, sid) != XRT_SUCCESS);
+	REQUIRE(scm_link_poll(f, 1, &p) == XRT_SUCCESS);
+	CHECK(p.state == XRT_SHARE_LINK_STATE_NONE);
+	scm_stream_destroy(f, sid);
+
+	scm_set_share_answer(U_CAMERA_CONSENT_PROMPT_ALLOW);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	xrt_stereo_camera_stream_layout lay;
+	REQUIRE(scm_stream_map(f, sid, &lay) == XRT_SUCCESS);
+	REQUIRE(link_wait_state(f, 1, XRT_SHARE_LINK_STATE_SHARE_REQUESTED, &p));
+	CHECK(p.eye_w == 1280);
+	CHECK(p.eye_h == 720);
+	CHECK(p.fps > 0.0f);
+	const uint32_t sg = p.stream_generation;
+	CHECK(sg >= 1);
+
+	// A ring for an older stream generation is dropped, never imported.
+	auto stale = link_ring(7, sg - 1, 1600, 900);
+	REQUIRE(scm_link_publish_ring(f, 1, &stale) == XRT_SUCCESS);
+	auto ring1 = link_ring(1, sg, 1600, 900);
+	REQUIRE(scm_link_publish_ring(f, 1, &ring1) == XRT_SUCCESS);
+	CHECK(link_pump(f, 1, sid, 1, 1, 5) == 5);
+	CHECK(scm_link_imports() == 1);
+	CHECK(scm_link_last_import_generation() == 1);
+	CHECK(scm_link_last_import_slot_width() == 3200);
+	xrt_app_share_frame_info app = scm_last_app(f);
+	CHECK(app.valid == 1);
+	CHECK(app.content_width == 1280);
+	CHECK(app.content_generation == 1);
+
+	// Resize: the app re-creates its ring (generation 2); frames of ring 1 are
+	// dropped, ring 2 is imported and the old one released.
+	auto ring2 = link_ring(2, sg, 1920, 1080);
+	REQUIRE(scm_link_publish_ring(f, 1, &ring2) == XRT_SUCCESS);
+	CHECK(link_pump(f, 1, sid, 2, 2, 3) == 3);
+	CHECK(scm_link_imports() == 2);
+	CHECK(scm_link_live_imports() == 1);
+	CHECK(scm_link_last_import_generation() == 2);
+	app = scm_last_app(f);
+	CHECK(app.content_generation == 2);
+
+	// Stop: once the source closes (after the camera linger) the link hears
+	// SHARE_STOPPED exactly once, then NONE; the import is released.
+	scm_stream_destroy(f, sid);
+	REQUIRE(link_wait_state(f, 1, XRT_SHARE_LINK_STATE_SHARE_STOPPED, &p, 6000));
+	REQUIRE(scm_link_poll(f, 1, &p) == XRT_SUCCESS);
+	CHECK(p.state == XRT_SHARE_LINK_STATE_NONE);
+	CHECK(scm_link_live_imports() == 0);
+
+	// A new start bumps the stream generation.
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	REQUIRE(link_wait_state(f, 1, XRT_SHARE_LINK_STATE_SHARE_REQUESTED, &p));
+	CHECK(p.stream_generation > sg);
+	scm_stream_destroy(f, sid);
+	scm_link_disconnect(f, 1);
+	scm_destroy(f);
+	CHECK(scm_link_live_imports() == 0);
+	scm_set_link_importer(false, nullptr);
+}
+
+TEST_CASE("app share link: the app exits mid-stream -> SOURCE_LOST", "[stereo_camera_manager][app_share_link]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_set_link_importer(true, nullptr);
+	scm_app_options o = {};
+	o.dev = 1; // no prompt
+	o.fake = -1;
+	o.linger_ms = 300;
+	o.consumer_sees_apps = true;
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+	scm_link_connect(f, 1, 301, kLinkPid + 31, XRT_CLIENT_CLASS_APP);
+	auto r = link_reg("Leaving App");
+	REQUIRE(scm_link_register(f, 1, &r) == XRT_SUCCESS);
+	scm_rescan_apps(f);
+	auto v = listing(f);
+	REQUIRE(v.size() == 1);
+	const uint64_t id = v[0].camera_id;
+	uint64_t sid = 0;
+	auto req = share_req(id);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	xrt_stereo_camera_stream_layout lay;
+	REQUIRE(scm_stream_map(f, sid, &lay) == XRT_SUCCESS);
+	xrt_share_link_poll p = {};
+	REQUIRE(link_wait_state(f, 1, XRT_SHARE_LINK_STATE_SHARE_REQUESTED, &p));
+	auto ring = link_ring(1, p.stream_generation, 1280, 720);
+	REQUIRE(scm_link_publish_ring(f, 1, &ring) == XRT_SUCCESS);
+	REQUIRE(link_pump(f, 1, sid, 1, 1, 3) == 3);
+	xrt_stereo_camera_event ev;
+	while (scm_poll_event(f, &ev)) {
+	}
+
+	// The app process exits: its link connection closes.
+	scm_link_disconnect(f, 1);
+	bool lost = false;
+	while (scm_poll_event(f, &ev)) {
+		lost |= ev.kind == XRT_STEREO_CAMERA_EVENT_STREAM_ENDED && ev.stream_id == sid &&
+		        ev.value == XRT_STEREO_CAMERA_END_SOURCE_LOST;
+	}
+	CHECK(lost);
+	bool ready = false;
+	xrt_stereo_camera_frame_info fi;
+	const uint8_t *slot = nullptr;
+	CHECK(scm_acquire(f, sid, &ready, &fi, &slot) == XRT_ERROR_STEREO_CAMERA_STREAM_ENDED);
+	v = listing(f);
+	REQUIRE(v.size() == 1); // lingers UNAVAILABLE
+	CHECK(v[0].state == XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+	xrt_app_share_source_info ai;
+	REQUIRE(scm_app_source(f, id, &ai) == XRT_SUCCESS);
+	CHECK(ai.availability == XRT_APP_SHARE_UNAVAILABLE_EXITED);
+	scm_stream_destroy(f, sid);
+	const int64_t t_end = os_monotonic_get_ns() + 3ll * 1000 * 1000 * 1000;
+	while (scm_link_live_imports() != 0 && os_monotonic_get_ns() < t_end) {
+		os_nanosleep(5 * 1000 * 1000);
+	}
+	CHECK(scm_link_live_imports() == 0); // the camera thread closed the source
+	scm_destroy(f);
+	scm_set_link_importer(false, nullptr);
+}
+
+TEST_CASE("app share link: the DXR_APP_SHARE_FAKE=link registrant end to end",
+          "[stereo_camera_manager][app_share_link]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_app_options o = {};
+	o.dev = 1;
+	o.fake = -1;
+	o.fake_link = 1;
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+	// The registrant registers from its own thread; the rescan lists it.
+	std::vector<xrt_stereo_camera_properties> v;
+	const int64_t t_list = os_monotonic_get_ns() + 3ll * 1000 * 1000 * 1000;
+	while (v.empty() && os_monotonic_get_ns() < t_list) {
+		scm_rescan_apps(f);
+		v = listing(f);
+		if (v.empty()) {
+			os_nanosleep(10 * 1000 * 1000);
+		}
+	}
+	REQUIRE(v.size() == 1);
+	CHECK(is_app(v[0]));
+	CHECK(v[0].state == XRT_STEREO_CAMERA_STATE_AVAILABLE);
+	xrt_app_share_source_info ai;
+	REQUIRE(scm_app_source(f, v[0].camera_id, &ai) == XRT_SUCCESS);
+	CHECK(ai.source == XRT_STEREO_CAMERA_SOURCE_APP_LINK);
+	CHECK(ai.availability == XRT_APP_SHARE_AVAILABLE);
+	CHECK(std::string(ai.executable_name) == "displayxr-app-share-fake-link");
+
+	uint64_t sid = 0;
+	auto req = share_req(v[0].camera_id);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	xrt_stereo_camera_stream_layout lay;
+	REQUIRE(scm_stream_map(f, sid, &lay) == XRT_SUCCESS);
+	CHECK(lay.width == 2560);
+	CHECK(lay.height == 720);
+	uint32_t frames = 0;
+	uint64_t last_index = 0;
+	xrt_stereo_camera_frame_info fi = {};
+	const uint8_t *slot = nullptr;
+	const int64_t t_end = os_monotonic_get_ns() + 8ll * 1000 * 1000 * 1000;
+	while (frames < 10 && os_monotonic_get_ns() < t_end) {
+		bool ready = false;
+		REQUIRE(scm_acquire(f, sid, &ready, &fi, &slot) == XRT_SUCCESS);
+		if (!ready) {
+			os_nanosleep(5 * 1000 * 1000);
+			continue;
+		}
+		CHECK(fi.frame_index > last_index);
+		last_index = fi.frame_index;
+		frames++;
+	}
+	REQUIRE(frames == 10);
+	const xrt_app_share_frame_info app = scm_last_app(f);
+	CHECK(app.valid == 1);
+	CHECK(app.content_width == 1280);
+	CHECK(app.content_height == 720);
+	CHECK(app.commit_time_ns > 0);
+	// The CPU ring carried the synthetic pattern through unchanged: its zero-disparity band reads 0.
+	const uint8_t *y = slot + fi.plane_offset[0];
+	uint32_t b0 = 0, b1 = 0;
+	u_app_share_fake_band(720, &b0, &b1);
+	CHECK(band_disparity(y, fi.row_pitch[0], 1280, b0 + 4, 16, 40) == 0);
+	const int d_bottom = band_disparity(y, fi.row_pitch[0], 1280, 680, 8, 40);
+	CHECK(d_bottom == Catch::Approx(u_app_share_fake_disparity_px(1280, 720, 684)).margin(1.0));
+	std::printf("[manager app share link] fake link: %u frames, bottom d = %d px\n", frames, d_bottom);
+	scm_stream_destroy(f, sid);
+	scm_destroy(f);
+}

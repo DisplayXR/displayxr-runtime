@@ -325,6 +325,7 @@ create_with_apps(const struct u_stereo_uvc_config *cfg,
 	o.dev_override = dev_override;
 	o.app_share_dev = ao->dev;
 	o.app_share_fake = ao->fake;
+	o.app_share_fake_link = ao->fake_link != 0 ? ao->fake_link : -1;
 	o.app_linger_ms = ao->linger_ms;
 	o.share_prompt_mode = ao->prompt_mode;
 	o.share_resolution = 1; // 720p, whatever the user store says
@@ -846,6 +847,216 @@ int
 scm_tap_attached(void)
 {
 	return g_tap_attached;
+}
+
+/*
+ * ADR-061 arm 2: service links.
+ */
+
+void
+scm_link_connect(struct scm_fixture *f, uint32_t slot, uint32_t client_id, long pid, uint32_t cls)
+{
+	volatile struct ipc_client_state *o = &f->server.threads[slot].ics;
+	o->server_thread_index = (int)slot;
+	o->peer_pid = pid;
+	o->client_state.id = client_id;
+	o->client_state.client_class = cls;
+	o->xs = NULL; // sessionless: the session is in the app process
+	o->xc = NULL;
+	o->app_share_opt_out = false;
+}
+
+xrt_result_t
+scm_link_register(struct scm_fixture *f, uint32_t slot, const struct xrt_share_link_registration *reg)
+{
+	return ipc_handle_service_link_register(&f->server.threads[slot].ics, reg);
+}
+
+xrt_result_t
+scm_link_poll(struct scm_fixture *f, uint32_t slot, struct xrt_share_link_poll *out)
+{
+	return ipc_handle_service_link_share_poll(&f->server.threads[slot].ics, out);
+}
+
+xrt_result_t
+scm_link_publish_ring(struct scm_fixture *f, uint32_t slot, const struct xrt_share_link_ring_desc *desc)
+{
+	return ipc_handle_service_link_share_publish_ring(&f->server.threads[slot].ics, desc, NULL, 0);
+}
+
+xrt_result_t
+scm_link_frame_ready(struct scm_fixture *f,
+                     uint32_t slot,
+                     const struct xrt_share_link_frame *frame,
+                     struct xrt_share_link_poll *out)
+{
+	return ipc_handle_service_link_share_frame_ready(&f->server.threads[slot].ics, frame, out);
+}
+
+void
+scm_link_disconnect(struct scm_fixture *f, uint32_t slot)
+{
+	volatile struct ipc_client_state *o = &f->server.threads[slot].ics;
+	ipc_server_client_stereo_camera_release(o);
+	o->server_thread_index = -1;
+}
+
+struct fake_import
+{
+	struct u_app_share_fake *gen;
+	uint32_t eye_w, eye_h;
+};
+
+static int g_link_imports = 0;
+static int g_link_live = 0;
+static uint32_t g_link_last_gen = 0;
+static uint32_t g_link_last_slot_w = 0;
+static uint8_t g_link_luid[XRT_LUID_SIZE];
+static bool g_link_luid_known = false;
+
+static bool
+link_adapter_luid(void *ctx, uint8_t out[XRT_LUID_SIZE])
+{
+	(void)ctx;
+	if (!g_link_luid_known) {
+		return false;
+	}
+	memcpy(out, g_link_luid, XRT_LUID_SIZE);
+	return true;
+}
+
+static xrt_result_t
+link_import(void *ctx,
+            const struct xrt_share_link_ring_desc *desc,
+            const xrt_graphics_buffer_handle_t *textures,
+            uint32_t texture_count,
+            xrt_graphics_sync_handle_t fence,
+            uint32_t eye_w,
+            uint32_t eye_h,
+            void **out_import)
+{
+	(void)ctx;
+	(void)textures;
+	(void)texture_count;
+	(void)fence;
+	struct fake_import *imp = (struct fake_import *)calloc(1, sizeof(*imp));
+	if (imp == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	imp->gen = u_app_share_fake_create(eye_w, eye_h, 1000.0f);
+	imp->eye_w = eye_w;
+	imp->eye_h = eye_h;
+	if (imp->gen == NULL) {
+		free(imp);
+		return XRT_ERROR_ALLOCATION;
+	}
+	g_link_imports++;
+	g_link_live++;
+	g_link_last_gen = desc->generation;
+	g_link_last_slot_w = desc->slot_width;
+	*out_import = imp;
+	return XRT_SUCCESS;
+}
+
+static uint32_t
+link_convert(void *ctx,
+             void *import,
+             const struct xrt_share_link_frame *frame,
+             struct xrt_plugin_stereo_camera_frame *out,
+             struct xrt_app_share_frame_info *info)
+{
+	(void)ctx;
+	struct fake_import *imp = (struct fake_import *)import;
+	struct u_app_share_fake_frame ff;
+	if (!u_app_share_fake_next(imp->gen, 50ll * 1000 * 1000, &ff)) {
+		return XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT;
+	}
+	out->sequence = ff.sequence;
+	out->time_ns = frame->commit_ns;
+	out->width = ff.width;
+	out->height = ff.height;
+	out->format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12;
+	out->planes[0] = ff.planes[0];
+	out->planes[1] = ff.planes[1];
+	out->pitches[0] = ff.pitches[0];
+	out->pitches[1] = ff.pitches[1];
+	info->content_x = 0;
+	info->content_y = 0;
+	info->content_width = imp->eye_w;
+	info->content_height = imp->eye_h;
+	info->mono = frame->mono;
+	info->content_generation = frame->content_generation;
+	info->zero_disparity_shift_frac = frame->zero_disparity_shift_frac;
+	info->commit_time_ns = frame->commit_ns;
+	return XRT_PLUGIN_STEREO_CAMERA_WAIT_OK;
+}
+
+static void
+link_release_frame(void *ctx, void *import)
+{
+	(void)ctx;
+	(void)import;
+	// Never called with the manager lock held (this takes it).
+	(void)ipc_server_stereo_camera_is_session_locked();
+}
+
+static void
+link_unimport(void *ctx, void *import)
+{
+	(void)ctx;
+	struct fake_import *imp = (struct fake_import *)import;
+	u_app_share_fake_destroy(&imp->gen);
+	free(imp);
+	g_link_live--;
+}
+
+void
+scm_set_link_importer(bool enabled, const uint8_t *service_luid)
+{
+	if (!enabled) {
+		ipc_server_stereo_camera_set_platform(NULL);
+		return;
+	}
+	g_link_imports = 0;
+	g_link_live = 0;
+	g_link_last_gen = 0;
+	g_link_last_slot_w = 0;
+	g_link_luid_known = service_luid != NULL;
+	if (service_luid != NULL) {
+		memcpy(g_link_luid, service_luid, XRT_LUID_SIZE);
+	}
+	struct ipc_server_stereo_camera_platform p;
+	memset(&p, 0, sizeof(p));
+	p.share_link_adapter_luid = link_adapter_luid;
+	p.share_link_import = link_import;
+	p.share_link_convert = link_convert;
+	p.share_link_release_frame = link_release_frame;
+	p.share_link_unimport = link_unimport;
+	ipc_server_stereo_camera_set_platform(&p);
+}
+
+int
+scm_link_imports(void)
+{
+	return g_link_imports;
+}
+
+int
+scm_link_live_imports(void)
+{
+	return g_link_live;
+}
+
+uint32_t
+scm_link_last_import_generation(void)
+{
+	return g_link_last_gen;
+}
+
+uint32_t
+scm_link_last_import_slot_width(void)
+{
+	return g_link_last_slot_w;
 }
 
 uint32_t
