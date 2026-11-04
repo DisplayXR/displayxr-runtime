@@ -1856,6 +1856,13 @@ link_share_open(
 static void
 link_share_close(struct ipc_server_stereo_camera *m, struct scam_link_src *src)
 {
+	// Release the service's references to the app's ring FIRST, then tell the
+	// app SHARE_STOPPED: once it hears that it may free the ring.
+	if (src->imported && !src->fake && g_platform_set && g_platform.share_link_unimport != NULL) {
+		g_platform.share_link_unimport(g_platform.ctx, src->import); // validated with import at install
+	}
+	src->imported = false;
+	src->import = NULL;
 	os_mutex_lock(&m->link_lock);
 	struct scam_link *l = link_find_locked(m, src->client_id);
 	if (l != NULL && l->stream_generation == src->stream_generation &&
@@ -1865,9 +1872,6 @@ link_share_close(struct ipc_server_stereo_camera *m, struct scam_link_src *src)
 	}
 	os_cond_broadcast(&m->link_cond);
 	os_mutex_unlock(&m->link_lock);
-	if (src->imported && !src->fake && g_platform_set && g_platform.share_link_unimport != NULL) {
-		g_platform.share_link_unimport(g_platform.ctx, src->import);
-	}
 	U_LOG_W("app share: SHARE_STOPPED on service link %u (stream generation %u)", src->client_id,
 	        src->stream_generation);
 	free(src->cpu_frame);
