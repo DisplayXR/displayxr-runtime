@@ -34,9 +34,14 @@
 #endif
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#ifdef XRT_OS_MACOS
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+#include "util/u_handles.h"
 
 /*
  * What ipc_server_stereo_camera.c needs from the rest of ipc_server (which
@@ -878,10 +883,60 @@ scm_link_poll(struct scm_fixture *f, uint32_t slot, struct xrt_share_link_poll *
 	return ipc_handle_service_link_share_poll(&f->server.threads[slot].ics, out);
 }
 
+//! A real, closable stand-in for a shared texture handle (the importer below only closes it).
+static xrt_graphics_buffer_handle_t
+dummy_buffer_handle(void)
+{
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	return CreateEventW(NULL, FALSE, FALSE, NULL);
+#elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+	const uint8_t b = 0;
+	return (xrt_graphics_buffer_handle_t)CFDataCreate(NULL, &b, 1);
+#elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
+	return open("/dev/null", O_RDONLY);
+#else
+	return XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+#endif
+}
+
+static xrt_graphics_sync_handle_t
+dummy_sync_handle(void)
+{
+#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+	return CreateEventW(NULL, FALSE, FALSE, NULL);
+#elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
+	return open("/dev/null", O_RDONLY);
+#else
+	return XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+#endif
+}
+
+xrt_result_t
+scm_link_publish_ring_n(struct scm_fixture *f,
+                        uint32_t slot,
+                        const struct xrt_share_link_ring_desc *desc,
+                        uint32_t texture_count)
+{
+	xrt_graphics_buffer_handle_t tex[XRT_SHARE_LINK_RING_SLOTS + 1];
+	uint32_t n = texture_count > XRT_SHARE_LINK_RING_SLOTS + 1 ? XRT_SHARE_LINK_RING_SLOTS + 1 : texture_count;
+	for (uint32_t i = 0; i < n; i++) {
+		tex[i] = dummy_buffer_handle();
+	}
+	// The handler owns the received handles (as the transport hands them over).
+	return ipc_handle_service_link_share_publish_ring(&f->server.threads[slot].ics, desc, tex, n);
+}
+
 xrt_result_t
 scm_link_publish_ring(struct scm_fixture *f, uint32_t slot, const struct xrt_share_link_ring_desc *desc)
 {
-	return ipc_handle_service_link_share_publish_ring(&f->server.threads[slot].ics, desc, NULL, 0);
+	return scm_link_publish_ring_n(f, slot, desc, desc->slot_count);
+}
+
+xrt_result_t
+scm_link_publish_fence(struct scm_fixture *f, uint32_t slot, uint32_t generation)
+{
+	xrt_graphics_sync_handle_t h = dummy_sync_handle();
+	return ipc_handle_service_link_share_publish_fence(&f->server.threads[slot].ics, generation, &h, 1);
 }
 
 xrt_result_t
@@ -908,6 +963,9 @@ struct fake_import
 };
 
 static int g_link_imports = 0;
+static bool g_link_import_fails = false;
+static uint32_t g_link_last_tex_count = 0;
+static bool g_link_last_had_fence = false;
 static int g_link_live = 0;
 static uint32_t g_link_last_gen = 0;
 static uint32_t g_link_last_slot_w = 0;
@@ -936,9 +994,17 @@ link_import(void *ctx,
             void **out_import)
 {
 	(void)ctx;
-	(void)textures;
-	(void)texture_count;
-	(void)fence;
+	// The contract: import owns every handle, on success and on failure.
+	g_link_last_tex_count = texture_count;
+	g_link_last_had_fence = xrt_graphics_sync_handle_is_valid(fence);
+	for (uint32_t i = 0; i < texture_count; i++) {
+		xrt_graphics_buffer_handle_t h = textures[i];
+		u_graphics_buffer_unref(&h);
+	}
+	u_graphics_sync_unref(&fence);
+	if (g_link_import_fails) {
+		return XRT_ERROR_ALLOCATION;
+	}
 	struct fake_import *imp = (struct fake_import *)calloc(1, sizeof(*imp));
 	if (imp == NULL) {
 		return XRT_ERROR_ALLOCATION;
@@ -1011,6 +1077,46 @@ link_unimport(void *ctx, void *import)
 }
 
 void
+scm_set_link_import_fails(bool fails)
+{
+	g_link_import_fails = fails;
+}
+
+uint32_t
+scm_link_last_import_texture_count(void)
+{
+	return g_link_last_tex_count;
+}
+
+bool
+scm_link_last_import_had_fence(void)
+{
+	return g_link_last_had_fence;
+}
+
+void
+scm_set_link_partial_hooks(void)
+{
+	// An import without an unimport: the manager must refuse the ring hooks whole.
+	struct ipc_server_stereo_camera_platform p;
+	memset(&p, 0, sizeof(p));
+	p.share_link_import = link_import;
+	p.share_link_convert = link_convert;
+	ipc_server_stereo_camera_set_platform(&p);
+}
+
+void
+scm_link_register_as(struct scm_fixture *f,
+                     uint32_t slot,
+                     uint32_t client_id,
+                     const struct xrt_share_link_registration *reg,
+                     xrt_result_t *out)
+{
+	f->server.threads[slot].ics.client_state.id = client_id;
+	*out = ipc_handle_service_link_register(&f->server.threads[slot].ics, reg);
+}
+
+void
 scm_set_link_importer(bool enabled, const uint8_t *service_luid)
 {
 	if (!enabled) {
@@ -1019,6 +1125,9 @@ scm_set_link_importer(bool enabled, const uint8_t *service_luid)
 	}
 	g_link_imports = 0;
 	g_link_live = 0;
+	g_link_import_fails = false;
+	g_link_last_tex_count = 0;
+	g_link_last_had_fence = false;
 	g_link_last_gen = 0;
 	g_link_last_slot_w = 0;
 	g_link_luid_known = service_luid != NULL;

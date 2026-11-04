@@ -175,3 +175,66 @@ TEST_CASE("xbridge share tap: the portable surface reports no tap", "[share_link
 	u_share_link_uninstall(&l);
 	u_share_link_reset();
 }
+
+TEST_CASE("u_share_link: set_tap without an adapter clears a stale one", "[share_link]")
+{
+	u_share_link_reset();
+	const uint8_t luid[XRT_LUID_SIZE] = {1, 2, 3, 4, 5, 6, 7, 8};
+	u_share_link_set_tap(true, 0, luid, true);
+	u_share_link_set_tap(false, XRT_APP_SHARE_UNAVAILABLE_OTHER_ADAPTER, nullptr, false);
+	fake_link l;
+	u_share_link_install(&k_sink, &l); // the replay carries the CURRENT state
+	CHECK_FALSE(l.luid_valid);
+	CHECK(l.reason == XRT_APP_SHARE_UNAVAILABLE_OTHER_ADAPTER);
+	u_share_link_uninstall(&l);
+	u_share_link_reset();
+}
+
+TEST_CASE("u_share_link poll cache: SHARE_STOPPED is reported exactly once", "[share_link]")
+{
+	u_share_link_poll_cache c;
+	u_share_link_poll_cache_reset(&c);
+	xrt_share_link_poll out;
+	CHECK_FALSE(u_share_link_poll_cache_take(&c, &out));
+
+	xrt_share_link_poll req = {};
+	req.state = XRT_SHARE_LINK_STATE_SHARE_REQUESTED;
+	req.stream_generation = 3;
+	u_share_link_poll_cache_merge(&c, &req);
+	REQUIRE(u_share_link_poll_cache_take(&c, &out));
+	CHECK(out.state == XRT_SHARE_LINK_STATE_SHARE_REQUESTED);
+	REQUIRE(u_share_link_poll_cache_take(&c, &out)); // REQUESTED persists
+	CHECK(out.state == XRT_SHARE_LINK_STATE_SHARE_REQUESTED);
+
+	// A STOPPED (say, a frame_ready reply) followed by the poll's NONE before
+	// anyone read it: the STOPPED survives, and is taken once.
+	xrt_share_link_poll stop = {};
+	stop.state = XRT_SHARE_LINK_STATE_SHARE_STOPPED;
+	stop.stream_generation = 3;
+	xrt_share_link_poll none = {};
+	u_share_link_poll_cache_merge(&c, &stop);
+	u_share_link_poll_cache_merge(&c, &none);
+	REQUIRE(u_share_link_poll_cache_take(&c, &out));
+	CHECK(out.state == XRT_SHARE_LINK_STATE_SHARE_STOPPED);
+	REQUIRE(u_share_link_poll_cache_take(&c, &out));
+	CHECK(out.state == XRT_SHARE_LINK_STATE_NONE);
+
+	// The same STOPPED arriving again (poll AND a frame_ready reply) after it
+	// was taken is not a second report.
+	u_share_link_poll_cache_merge(&c, &stop);
+	REQUIRE(u_share_link_poll_cache_take(&c, &out));
+	CHECK(out.state == XRT_SHARE_LINK_STATE_NONE);
+
+	// A new stream supersedes an unread STOPPED; its own stop is reported.
+	stop.stream_generation = 4;
+	u_share_link_poll_cache_merge(&c, &stop);
+	req.stream_generation = 5;
+	u_share_link_poll_cache_merge(&c, &req);
+	REQUIRE(u_share_link_poll_cache_take(&c, &out));
+	CHECK(out.state == XRT_SHARE_LINK_STATE_SHARE_REQUESTED);
+	CHECK(out.stream_generation == 5);
+	stop.stream_generation = 5;
+	u_share_link_poll_cache_merge(&c, &stop);
+	REQUIRE(u_share_link_poll_cache_take(&c, &out));
+	CHECK(out.state == XRT_SHARE_LINK_STATE_SHARE_STOPPED);
+}

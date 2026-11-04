@@ -212,9 +212,41 @@ scm_link_register(struct scm_fixture *f, uint32_t slot, const struct xrt_share_l
 xrt_result_t
 scm_link_poll(struct scm_fixture *f, uint32_t slot, struct xrt_share_link_poll *out);
 
-//! A ring with no handles (the fake importer below needs none).
+//! A ring with one stand-in texture handle per slot (the fake importer closes them).
 xrt_result_t
 scm_link_publish_ring(struct scm_fixture *f, uint32_t slot, const struct xrt_share_link_ring_desc *desc);
+
+//! Same, with exactly @p texture_count handles (to exercise the n == slot_count rule).
+xrt_result_t
+scm_link_publish_ring_n(struct scm_fixture *f,
+                        uint32_t slot,
+                        const struct xrt_share_link_ring_desc *desc,
+                        uint32_t texture_count);
+
+//! A stand-in fence handle for ring @p generation.
+xrt_result_t
+scm_link_publish_fence(struct scm_fixture *f, uint32_t slot, uint32_t generation);
+
+//! Register in @p slot as connection @p client_id (table-capacity tests).
+void
+scm_link_register_as(struct scm_fixture *f,
+                     uint32_t slot,
+                     uint32_t client_id,
+                     const struct xrt_share_link_registration *reg,
+                     xrt_result_t *out);
+
+//! The fake importer refuses every ring from now on (it still closes the handles).
+void
+scm_set_link_import_fails(bool fails);
+
+uint32_t
+scm_link_last_import_texture_count(void);
+bool
+scm_link_last_import_had_fence(void);
+
+//! Install an incomplete share_link_* table (import + convert, no unimport).
+void
+scm_set_link_partial_hooks(void);
 
 xrt_result_t
 scm_link_frame_ready(struct scm_fixture *f,

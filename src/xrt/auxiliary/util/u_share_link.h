@@ -93,6 +93,35 @@ u_share_link_publish_ring(const struct xrt_share_link_ring_desc *desc,
 xrt_result_t
 u_share_link_frame_ready(const struct xrt_share_link_frame *frame, struct xrt_share_link_poll *out_poll);
 
+/*!
+ * The single-report rule of the share poll (ADR-061 arm 2), shared by the
+ * client link and its tests: answers from the service (polls and every
+ * frame_ready reply) are MERGED in, the consumer TAKES them out. A
+ * SHARE_STOPPED is reported to the consumer exactly once: a later NONE never
+ * hides it before it was taken, taking it turns the cache to NONE, and the
+ * same STOPPED arriving again (by poll AND reply) is not reported twice. A new
+ * SHARE_REQUESTED (a new stream) supersedes an unread STOPPED — the consumer
+ * re-creates its ring for the new stream generation either way.
+ */
+struct u_share_link_poll_cache
+{
+	struct xrt_share_link_poll poll;
+	bool valid;
+	//! The stream generation of the last STOPPED taken: a repeat of it is never reported again.
+	uint32_t stopped_taken_generation;
+	bool stopped_taken;
+};
+
+void
+u_share_link_poll_cache_reset(struct u_share_link_poll_cache *c);
+
+void
+u_share_link_poll_cache_merge(struct u_share_link_poll_cache *c, const struct xrt_share_link_poll *in);
+
+//! false (and @p out NONE) until the first merge.
+bool
+u_share_link_poll_cache_take(struct u_share_link_poll_cache *c, struct xrt_share_link_poll *out);
+
 //! Tests: forget the sink and the tap state.
 void
 u_share_link_reset(void);

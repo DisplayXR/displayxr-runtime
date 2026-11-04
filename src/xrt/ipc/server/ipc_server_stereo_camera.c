@@ -199,6 +199,8 @@ DEBUG_GET_ONCE_OPTION(app_share_fake, "DXR_APP_SHARE_FAKE", NULL)
 #define APP_ID_MEMORY 32                              //!< (exe, ordinal) -> camera_id, per service run
 //! ADR-061 arm 2: registered in-process service links (one per connection, plus the fake).
 #define LINK_MAX (IPC_MAX_CLIENTS + 1)
+//! A ring that declares a fence is imported once it arrives; past this, the share fails loudly.
+#define LINK_FENCE_WAIT_NS (2000ll * 1000 * 1000)
 //! The synthetic link registrant's connection id (never a real client id: those count up from 1).
 #define FAKE_LINK_CLIENT_ID 0xFA4E0001u
 #define MAX_STREAMS (TOTAL_SLOTS * XRT_STEREO_CAMERA_MAX_STREAMS_PER_CAMERA)
@@ -496,6 +498,7 @@ struct scam_link
 	bool fence_pending;
 	uint32_t fence_generation;
 	xrt_graphics_sync_handle_t fence;
+	int64_t ring_ns; //!< when the pending ring arrived (the fence wait is time-boxed from here)
 	//! The content size of the last ring (the entry's content_eye_width/height).
 	uint32_t content_w, content_h;
 
@@ -750,6 +753,24 @@ ipc_server_stereo_camera_set_platform(const struct ipc_server_stereo_camera_plat
 		return;
 	}
 	g_platform = *p;
+	// ADR-061 arm 2: the ring hooks come as a set (an import without an
+	// unimport would leak every ring). A partial table is refused whole.
+	const bool any = p->share_link_import != NULL || p->share_link_convert != NULL ||
+	                 p->share_link_unimport != NULL || p->share_link_release_frame != NULL;
+	const bool all =
+	    p->share_link_import != NULL && p->share_link_convert != NULL && p->share_link_unimport != NULL;
+	if (any && !all) {
+		U_LOG_E(
+		    "app share: the platform's share_link_* hooks are incomplete (import %s, convert %s, unimport %s) "
+		    "— "
+		    "refused; in-process app entries are listed \"no tap\"",
+		    p->share_link_import != NULL ? "set" : "NULL", p->share_link_convert != NULL ? "set" : "NULL",
+		    p->share_link_unimport != NULL ? "set" : "NULL");
+		g_platform.share_link_import = NULL;
+		g_platform.share_link_convert = NULL;
+		g_platform.share_link_unimport = NULL;
+		g_platform.share_link_release_frame = NULL;
+	}
 	g_platform_set = true;
 }
 
@@ -1459,6 +1480,8 @@ static void
 notify_cameras_changed_locked(struct ipc_server_stereo_camera *m);
 static void
 share_forget_drain(struct ipc_server_stereo_camera *m);
+static uint32_t
+app_end_streams_locked(struct ipc_server_stereo_camera *m, struct scam_camera *cam);
 static void
 fake_link_start(struct ipc_server_stereo_camera *m);
 static void
@@ -1478,6 +1501,12 @@ struct scam_link_src
 	//! The fake: the frame copied out of its CPU ring under link_lock.
 	uint8_t *cpu_frame;
 	size_t cpu_size;
+	/*!
+	 * The ring cannot be used (import failed, its fence never came): the
+	 * stream ends SOURCE_LOST and the app hears SHARE_STOPPED instead of an
+	 * endless wait. Camera thread only.
+	 */
+	bool fatal;
 };
 
 //! Caller holds link_lock.
@@ -1572,7 +1601,7 @@ link_register(struct ipc_server_stereo_camera *m,
 			os_mutex_unlock(&m->link_lock);
 			U_LOG_W("app share: more than %d service links — connection %u not registered", LINK_MAX,
 			        client_id);
-			return XRT_ERROR_IPC_FAILURE;
+			return XRT_ERROR_CLIENT_LIMIT_REACHED; // a refusal, never "the pipe died"
 		}
 		memset(l, 0, sizeof(*l));
 		l->used = true;
@@ -1653,10 +1682,20 @@ link_publish_ring(struct ipc_server_stereo_camera *m,
 	                                                 desc->slot_width <= 16384 && desc->slot_height <= 16384));
 	os_mutex_lock(&m->link_lock);
 	struct scam_link *l = link_find_locked(m, client_id);
-	if (l == NULL || !shape_ok) {
+	// A real app's ring has one texture per slot; only the service's own fake
+	// (DXR_APP_SHARE_FAKE=link) publishes a CPU ring without handles.
+	const bool handles_ok = l != NULL && (l->fake ? n == 0 : n == desc->slot_count);
+	if (l == NULL || !shape_ok || !handles_ok) {
 		os_mutex_unlock(&m->link_lock);
+		if (l != NULL && shape_ok && !handles_ok) {
+			U_LOG_W(
+			    "app share: service link %u published a ring with %u texture(s) for %u slot(s) — refused",
+			    client_id, n, desc->slot_count);
+		}
 		link_close_handles(tex, n, NULL);
-		return l == NULL ? XRT_ERROR_IPC_FAILURE : XRT_ERROR_FEATURE_NOT_SUPPORTED;
+		// Logical refusals are never XRT_ERROR_IPC_FAILURE: the client reads that
+		// as "the pipe died" and would drop its live lift streams.
+		return l == NULL ? XRT_ERROR_OUTPUT_REQUEST_FAILURE : XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	if (l->state != XRT_SHARE_LINK_STATE_SHARE_REQUESTED || desc->stream_generation != l->stream_generation) {
 		os_mutex_unlock(&m->link_lock);
@@ -1670,6 +1709,7 @@ link_publish_ring(struct ipc_server_stereo_camera *m,
 	memcpy(l->tex, tex, sizeof(tex[0]) * n);
 	l->tex_count = n;
 	l->ring_pending = true;
+	l->ring_ns = os_monotonic_get_ns();
 	l->content_w = desc->content_width;
 	l->content_h = desc->content_height;
 	if (l->fence_pending && l->fence_generation != desc->generation) {
@@ -1693,7 +1733,7 @@ link_publish_fence(struct ipc_server_stereo_camera *m,
 	if (l == NULL) {
 		os_mutex_unlock(&m->link_lock);
 		u_graphics_sync_unref(&fence);
-		return XRT_ERROR_IPC_FAILURE;
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown link: a refusal, not a dead pipe
 	}
 	if (l->fence_pending) {
 		u_graphics_sync_unref(&l->fence);
@@ -1717,7 +1757,7 @@ link_frame_ready(struct ipc_server_stereo_camera *m,
 	struct scam_link *l = link_find_locked(m, client_id);
 	if (l == NULL) {
 		os_mutex_unlock(&m->link_lock);
-		return XRT_ERROR_IPC_FAILURE;
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown link: a refusal, not a dead pipe
 	}
 	if (l->state == XRT_SHARE_LINK_STATE_SHARE_REQUESTED) {
 		l->frame = *frame; // latest-wins
@@ -1852,10 +1892,23 @@ link_share_wait_frame(struct ipc_server_stereo_camera *m,
 			os_mutex_unlock(&m->link_lock);
 			return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR; // the link or the request is gone
 		}
-		// A new ring for this stream, complete with its fence (a ring without
-		// textures — the fake's CPU ring — needs none).
-		if (l->ring_pending &&
-		    (l->tex_count == 0 || (l->fence_pending && l->fence_generation == l->ring.generation))) {
+		// A new ring for this stream, complete with its fence when it declares
+		// one (has_fence). The fence wait is time-boxed: a fence that never
+		// comes (a failed publish_fence) fails the stream loudly.
+		const bool fence_ok =
+		    l->ring.has_fence == 0 || (l->fence_pending && l->fence_generation == l->ring.generation);
+		if (l->ring_pending && !fence_ok && os_monotonic_get_ns() - l->ring_ns > LINK_FENCE_WAIT_NS) {
+			const uint32_t g = l->ring.generation;
+			link_drop_pending_locked(l);
+			os_mutex_unlock(&m->link_lock);
+			U_LOG_W(
+			    "app share: link %u ring generation %u declared a fence that never arrived within %lld ms "
+			    "— the share ends (SOURCE_LOST)",
+			    src->client_id, g, (long long)(LINK_FENCE_WAIT_NS / 1000000));
+			src->fatal = true;
+			return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
+		}
+		if (l->ring_pending && fence_ok) {
 			struct xrt_share_link_ring_desc desc = l->ring;
 			xrt_graphics_buffer_handle_t tex[XRT_SHARE_LINK_RING_SLOTS];
 			const uint32_t n = l->tex_count;
@@ -1869,7 +1922,8 @@ link_share_wait_frame(struct ipc_server_stereo_camera *m,
 			l->tex_count = 0;
 			os_mutex_unlock(&m->link_lock);
 
-			if (src->imported && !src->fake && g_platform.share_link_unimport != NULL) {
+			if (src->imported && !src->fake) {
+				// The hook table is validated whole at install: unimport comes with import.
 				g_platform.share_link_unimport(g_platform.ctx, src->import);
 			}
 			src->imported = false;
@@ -1885,6 +1939,20 @@ link_share_wait_frame(struct ipc_server_stereo_camera *m,
 				                                                 src->eye_w, src->eye_h, &imp);
 				src->imported = xret == XRT_SUCCESS && imp != NULL;
 				src->import = imp;
+				if (!src->imported) {
+					U_LOG_W(
+					    "app share: link %u ring generation %u (%ux%u, format 0x%x) import FAILED "
+					    "(%d) — "
+					    "the share ends (SOURCE_LOST)",
+					    src->client_id, desc.generation, desc.slot_width, desc.slot_height,
+					    desc.format, (int)xret);
+					if (xret == XRT_SUCCESS && imp != NULL) {
+						g_platform.share_link_unimport(g_platform.ctx, imp);
+					}
+					src->import = NULL;
+					src->fatal = true;
+					return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
+				}
 				U_LOG_W("app share: link %u ring generation %u (%ux%u, format 0x%x) %s (%d)",
 				        src->client_id, desc.generation, desc.slot_width, desc.slot_height, desc.format,
 				        src->imported ? "imported" : "import FAILED", (int)xret);
@@ -2964,6 +3032,16 @@ camera_thread(void *ptr)
 				// app is gone (SOURCE_LOST) or the next start may try again.
 				m->apps_dirty = true;
 				os_cond_broadcast(&m->watch_cond);
+			}
+			if (cam->source == XRT_STEREO_CAMERA_SOURCE_APP_LINK && ((struct scam_link_src *)src)->fatal) {
+				// Arm 2: the app's ring is unusable (import failed / no fence): end
+				// the share instead of reopening into the same failure. The close
+				// below queues SHARE_STOPPED on the link.
+				const uint32_t ended = app_end_streams_locked(m, cam);
+				U_LOG_W(
+				    "app share %llu \"%s\": the app's ring could not be used — %u stream(s) ended "
+				    "SOURCE_LOST",
+				    (unsigned long long)cam->camera_id, cam->info.display_name, ended);
 			}
 			if (g_platform.gave_up_is_suspended && cam->streamed) {
 				// A2 (Android): a source that delivered and then lost the device
@@ -4873,7 +4951,7 @@ ipc_handle_service_link_share_publish_fence(volatile struct ipc_client_state *ic
 		u_graphics_sync_unref(&h); // one fence per ring
 	}
 	if (handle_count == 0) {
-		return XRT_ERROR_IPC_FAILURE; // malformed: the wire is not trusted
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // malformed, refused (not a dead pipe)
 	}
 	if (m == NULL) {
 		xrt_graphics_sync_handle_t h = handles[0];
@@ -4893,9 +4971,8 @@ ipc_handle_service_link_share_frame_ready(volatile struct ipc_client_state *ics,
 	if (m == NULL) {
 		return XRT_SUCCESS;
 	}
-	xrt_result_t xret = link_frame_ready(m, ics->client_state.id, frame, out_poll);
-	// An unregistered link (sharing off service-side) just keeps hearing NONE.
-	return xret == XRT_ERROR_IPC_FAILURE ? XRT_SUCCESS : xret;
+	// An unregistered link (sharing off service-side) gets the refusal and a NONE poll.
+	return link_frame_ready(m, ics->client_state.id, frame, out_poll);
 }
 
 
