@@ -14,6 +14,8 @@
 #include "util/u_image_capture.h"
 #include "vk/vk_helpers.h"
 
+#include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -107,6 +109,53 @@ comp_multi_weave_capture_wants(const struct comp_multi_weave_capture *cap, enum 
 	return true;
 }
 
+/*
+ * The readback lands in memory the CPU then reads every byte of. Plain
+ * HOST_VISIBLE | HOST_COHERENT is write-combined (uncached) on most GPUs,
+ * where CPU reads run at a few MB/s: resolving three 1280x720 stages took
+ * 1.2 s on an Intel iGPU, and seconds at 2560x1600 (#2536). Prefer a
+ * HOST_CACHED type and fall back to the uncached one where a device has no
+ * cached + coherent type.
+ */
+static bool
+staging_buffer_init(struct vk_bundle *vk, VkDeviceSize bytes, VkBuffer *out_buffer, VkDeviceMemory *out_memory)
+{
+	VkBufferCreateInfo bci = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+	    .size = bytes,
+	    .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	};
+	if (vk->vkCreateBuffer(vk->device, &bci, NULL, out_buffer) != VK_SUCCESS) {
+		return false;
+	}
+	VkMemoryRequirements req;
+	vk->vkGetBufferMemoryRequirements(vk->device, *out_buffer, &req);
+
+	const VkMemoryPropertyFlags uncached =
+	    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	uint32_t type = UINT32_MAX;
+	if (!vk_get_memory_type(vk, req.memoryTypeBits, uncached | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &type) &&
+	    !vk_get_memory_type(vk, req.memoryTypeBits, uncached, &type)) {
+		vk->vkDestroyBuffer(vk->device, *out_buffer, NULL);
+		return false;
+	}
+	VkMemoryAllocateInfo mai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = req.size,
+	    .memoryTypeIndex = type,
+	};
+	if (vk->vkAllocateMemory(vk->device, &mai, NULL, out_memory) != VK_SUCCESS) {
+		vk->vkDestroyBuffer(vk->device, *out_buffer, NULL);
+		return false;
+	}
+	if (vk->vkBindBufferMemory(vk->device, *out_buffer, *out_memory, 0) != VK_SUCCESS) {
+		vk->vkFreeMemory(vk->device, *out_memory, NULL);
+		vk->vkDestroyBuffer(vk->device, *out_buffer, NULL);
+		return false;
+	}
+	return true;
+}
+
 bool
 comp_multi_weave_capture_record(struct comp_multi_weave_capture *cap,
                                 struct vk_bundle *vk,
@@ -136,9 +185,7 @@ comp_multi_weave_capture_record(struct comp_multi_weave_capture *cap,
 	}
 
 	const VkDeviceSize bytes = (VkDeviceSize)w * (VkDeviceSize)h * 4;
-	if (!vk_buffer_init(vk, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-	                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &t->buffer,
-	                    &t->memory)) {
+	if (!staging_buffer_init(vk, bytes, &t->buffer, &t->memory)) {
 		U_LOG_W("weave capture (#2207): %s staging buffer (%ux%u) allocation failed", stage_name[stage], w, h);
 		t->buffer = VK_NULL_HANDLE;
 		t->memory = VK_NULL_HANDLE;
@@ -256,6 +303,89 @@ comp_multi_weave_capture_resolve(struct comp_multi_weave_capture *cap, struct vk
 	}
 }
 
+/*
+ * The PNG encode runs on a detached worker, not on the weave path: stbi
+ * encodes a 2560x1600 stage in about two seconds, so three stages written
+ * inline held one xrWeaveSubmitDXR for 5-7 s and the caller's frames went
+ * late or flat for that long (#2536). The worker owns the pixels and the
+ * paths; nothing in it touches the capture or Vulkan. Each file is written
+ * to "<path>.tmp" and renamed, so a reader polling for it never sees a
+ * partial PNG, and the one WARN is emitted after the last rename (a script
+ * can wait on the WARN, or on the files). Jobs are serialised so two
+ * back-to-back captures never write the same path at once.
+ */
+struct capture_write_job
+{
+	char path[COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT][MCP_CAPTURE_PATH_MAX + 16]; //!< "" = stage not filled
+	uint8_t *rgba[COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT];
+	uint32_t w[COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT], h[COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT];
+	char what[96];
+	bool projection;
+	bool keep_alpha;
+};
+
+static pthread_mutex_t g_capture_write_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool
+write_png_atomic(const char *path, uint32_t w, uint32_t h, const uint8_t *rgba)
+{
+	char tmp[MCP_CAPTURE_PATH_MAX + 32];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	if (stbi_write_png(tmp, (int)w, (int)h, 4, rgba, (int)w * 4) == 0) {
+		remove(tmp);
+		return false;
+	}
+	if (rename(tmp, path) != 0) {
+		remove(tmp);
+		return false;
+	}
+	return true;
+}
+
+static void
+capture_write_job_run(struct capture_write_job *job)
+{
+	pthread_mutex_lock(&g_capture_write_lock);
+	uint32_t dims[COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT][2] = {{0}};
+	bool ok_any = false;
+	for (uint32_t i = 0; i < COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT; i++) {
+		if (job->path[i][0] == '\0') {
+			continue;
+		}
+		if (job->rgba[i] != NULL && write_png_atomic(job->path[i], job->w[i], job->h[i], job->rgba[i])) {
+			dims[i][0] = job->w[i];
+			dims[i][1] = job->h[i];
+			ok_any = true;
+		} else {
+			U_LOG_W("weave capture (#2207): writing the %s stage to %s FAILED", stage_name[i],
+			        job->path[i]);
+			job->path[i][0] = '\0';
+		}
+		free(job->rgba[i]);
+		job->rgba[i] = NULL;
+	}
+	pthread_mutex_unlock(&g_capture_write_lock);
+
+	if (ok_any) {
+		U_LOG_W(
+		    "weave capture (#2207) %s (mode=%s, raw_alpha=%d): input %ux%u %s | atlas %ux%u %s | woven %ux%u "
+		    "%s | overlay %ux%u %s",
+		    job->what, job->projection ? "projection" : "post", (int)job->keep_alpha, //
+		    dims[0][0], dims[0][1], job->path[0][0] != '\0' ? job->path[0] : "-",     //
+		    dims[1][0], dims[1][1], job->path[1][0] != '\0' ? job->path[1] : "-",     //
+		    dims[2][0], dims[2][1], job->path[2][0] != '\0' ? job->path[2] : "-",     //
+		    dims[3][0], dims[3][1], job->path[3][0] != '\0' ? job->path[3] : "-");
+	}
+	free(job);
+}
+
+static void *
+capture_write_thread(void *arg)
+{
+	capture_write_job_run((struct capture_write_job *)arg);
+	return NULL;
+}
+
 void
 comp_multi_weave_capture_finish(struct comp_multi_weave_capture *cap, struct vk_bundle *vk, const char *what)
 {
@@ -264,49 +394,40 @@ comp_multi_weave_capture_finish(struct comp_multi_weave_capture *cap, struct vk_
 	}
 	comp_multi_weave_capture_resolve(cap, vk, true);
 
-	const bool keep_alpha = u_image_capture_raw_alpha();
-	char written[COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT][MCP_CAPTURE_PATH_MAX + 16];
-	uint32_t dims[COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT][2] = {{0}};
-	bool ok_any = false;
-	bool failed_any = false;
-
+	struct capture_write_job *job = calloc(1, sizeof(*job));
+	bool any = false;
 	for (uint32_t i = 0; i < COMP_MULTI_WEAVE_CAPTURE_STAGE_COUNT; i++) {
-		written[i][0] = '\0';
 		struct comp_multi_weave_capture_target *t = &cap->target[i];
-		if (!t->recorded) {
+		if (job == NULL || !t->recorded) {
 			continue;
 		}
-		char path[MCP_CAPTURE_PATH_MAX + 16];
-		u_capture_intent_sibling_path(cap->intent.path, stage_infix[i], path, sizeof(path));
-
-		const bool ok =
-		    t->rgba != NULL && stbi_write_png(path, (int)t->w, (int)t->h, 4, t->rgba, (int)t->w * 4) != 0;
-		if (ok) {
-			snprintf(written[i], sizeof(written[i]), "%s", path);
-			dims[i][0] = t->w;
-			dims[i][1] = t->h;
-			ok_any = true;
-		} else {
-			failed_any = true;
-			U_LOG_W("weave capture (#2207): writing the %s stage to %s FAILED", stage_name[i], path);
-		}
+		u_capture_intent_sibling_path(cap->intent.path, stage_infix[i], job->path[i], sizeof(job->path[i]));
+		job->rgba[i] = t->rgba; // the job owns the pixels from here
+		job->w[i] = t->w;
+		job->h[i] = t->h;
+		t->rgba = NULL;
+		any = true;
 	}
 	comp_multi_weave_capture_release(cap, vk);
 
-	if (ok_any) {
-		U_LOG_W(
-		    "weave capture (#2207) %s (mode=%s, raw_alpha=%d): input %ux%u %s | atlas %ux%u %s | woven %ux%u "
-		    "%s | overlay %ux%u %s",
-		    what != NULL ? what : "",
-		    cap->intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY ? "projection" : "post",
-		    (int)keep_alpha,                                                  //
-		    dims[0][0], dims[0][1], written[0][0] != '\0' ? written[0] : "-", //
-		    dims[1][0], dims[1][1], written[1][0] != '\0' ? written[1] : "-", //
-		    dims[2][0], dims[2][1], written[2][0] != '\0' ? written[2] : "-", //
-		    dims[3][0], dims[3][1], written[3][0] != '\0' ? written[3] : "-");
-	} else if (!failed_any) {
+	if (job == NULL) {
+		U_LOG_W("weave capture (#2207): out of memory for %s — nothing written", cap->intent.path);
+	} else if (!any) {
 		U_LOG_W("weave capture (#2207): trigger consumed for %s but this submit recorded no stage",
 		        cap->intent.path);
+		free(job);
+	} else {
+		snprintf(job->what, sizeof(job->what), "%s", what != NULL ? what : "");
+		job->projection = cap->intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY;
+		job->keep_alpha = u_image_capture_raw_alpha();
+		pthread_t thread;
+		if (pthread_create(&thread, NULL, capture_write_thread, job) == 0) {
+			pthread_detach(thread);
+		} else {
+			capture_write_job_run(job); // no thread: write inline, as before
+		}
 	}
-	u_capture_intent_complete(&cap->intent, NULL, ok_any);
+	// Consumed now (the pixels are already copied out); the trigger path never
+	// carries an MCP waiter on this route, so there is no status to hold back.
+	u_capture_intent_complete(&cap->intent, NULL, any);
 }
