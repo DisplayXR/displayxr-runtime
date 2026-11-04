@@ -93,12 +93,7 @@ struct ipc_server_stereo_camera_options
 	//! `share.resolution`: 0 = the user store, 1 = 720p, 2 = 1080p.
 	int32_t share_resolution;
 	//! The share prompt (NULL = the one the host installed, if any).
-	enum u_camera_consent_prompt_answer (*share_prompt)(void *ctx,
-	                                                    const char *consumer_exe,
-	                                                    long consumer_pid,
-	                                                    const char *app_name,
-	                                                    const char *app_exe,
-	                                                    uint32_t timeout_ms);
+	u_app_share_prompt_fn share_prompt;
 	void *share_prompt_ctx;
 };
 
@@ -187,15 +182,8 @@ ipc_server_stereo_camera_set_prompt_provider(ipc_server_stereo_camera_prompt_fn 
  * DXR_APP_SHARE_DEV=1 (the camera prompt is never borrowed for it: its text
  * would misdescribe what is shared).
  */
-typedef enum u_camera_consent_prompt_answer (*ipc_server_stereo_camera_share_prompt_fn)(void *ctx,
-                                                                                        const char *consumer_exe,
-                                                                                        long consumer_pid,
-                                                                                        const char *app_name,
-                                                                                        const char *app_exe,
-                                                                                        uint32_t timeout_ms);
-
 void
-ipc_server_stereo_camera_set_share_prompt_provider(ipc_server_stereo_camera_share_prompt_fn fn, void *ctx);
+ipc_server_stereo_camera_set_share_prompt_provider(u_app_share_prompt_fn fn, void *ctx);
 
 /*!
  * A notice for the user, no answer expected (Windows: a tray balloon). Raised

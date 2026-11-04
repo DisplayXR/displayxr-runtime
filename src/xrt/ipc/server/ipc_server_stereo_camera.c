@@ -625,6 +625,13 @@ struct ipc_server_stereo_camera
 	uint32_t app_id_next;
 	//! The share policy (its own decisions; shares the camera's kill switch / toggle).
 	struct u_app_share_consent share;
+	/*!
+	 * App keys (camera ids) whose app went: their per-app-run grants are
+	 * forgotten under consent_lock once the manager lock is released
+	 * (share_forget_drain) — the two locks are never held together.
+	 */
+	uint64_t share_forget[APP_MAX * 2];
+	uint32_t share_forget_count;
 	int32_t share_prompt_override; //!< options: 0 = store, 1 = always, 2 = per-app-run
 	int32_t share_resolution_override;
 	bool have_share_prompt_seam; //!< options supplied a share prompt
@@ -655,7 +662,7 @@ static ipc_server_stereo_camera_indicator_fn g_indicator_fn = NULL;
 static void *g_indicator_ctx = NULL;
 static ipc_server_stereo_camera_notice_fn g_notice_fn = NULL;
 static void *g_notice_ctx = NULL;
-static ipc_server_stereo_camera_share_prompt_fn g_share_prompt_fn = NULL;
+static u_app_share_prompt_fn g_share_prompt_fn = NULL;
 static void *g_share_prompt_ctx = NULL;
 //! A2: platform identity / permission hooks (Android), copied at set time.
 static struct ipc_server_stereo_camera_platform g_platform;
@@ -2294,8 +2301,11 @@ camera_thread(void *ptr)
 		case XRT_PLUGIN_STEREO_CAMERA_WAIT_OK: {
 			if (cam_is_app(cam) && !cam->app.live) {
 				// ADR-061: a frame that was in flight when the app went: never
-				// published (it would flip the entry back to AVAILABLE).
+				// published (it would flip the entry back to AVAILABLE). The tap's
+				// release hook is never called with the manager lock held.
+				os_mutex_unlock(&m->lock);
 				src_release_frame(m, cam, src);
+				os_mutex_lock(&m->lock);
 				break;
 			}
 			cam->streamed = true;
@@ -2320,7 +2330,14 @@ camera_thread(void *ptr)
 				rfp = ok ? &rf : NULL;
 			}
 			publish_locked(m, cam, &f, rfp, now);
-			src_release_frame(m, cam, src);
+			if (cam_is_app(cam)) {
+				// ADR-061: platform share-tap hooks never run under the manager lock.
+				os_mutex_unlock(&m->lock);
+				src_release_frame(m, cam, src);
+				os_mutex_lock(&m->lock);
+			} else {
+				src_release_frame(m, cam, src);
+			}
 			break;
 		}
 		case XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT:
@@ -3246,6 +3263,12 @@ app_mark_gone_locked(
 	cam->app.live = false;
 	cam->app.exited_ns = now;
 	cam->app.desc.availability = XRT_APP_SHARE_UNAVAILABLE_EXITED;
+	// Its per-app-run grants die with it (applied by share_forget_drain).
+	if (m->share_forget_count < sizeof(m->share_forget) / sizeof(m->share_forget[0])) {
+		m->share_forget[m->share_forget_count++] = cam->camera_id;
+	} else {
+		m->share_forget[0] = UINT64_MAX; // overflow: forget everything (a grant only saves a prompt)
+	}
 	uint32_t ended = app_end_streams_locked(m, cam);
 	set_state_locked(cam, XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
 	if (delist) {
@@ -3256,6 +3279,33 @@ app_mark_gone_locked(
 	        (unsigned long long)cam->camera_id, cam->info.display_name, cam->app.pid, why,
 	        delist ? " and unlisted" : " (listed while it lingers)", ended);
 	return true;
+}
+
+/*!
+ * Apply the pending per-app-run grant forgets (ADR-061 spec §6: a grant
+ * lasts until the shared app exits). Call with NO lock held.
+ */
+static void
+share_forget_drain(struct ipc_server_stereo_camera *m)
+{
+	uint64_t keys[APP_MAX * 2];
+	os_mutex_lock(&m->lock);
+	const uint32_t n = m->share_forget_count;
+	memcpy(keys, m->share_forget, sizeof(keys[0]) * n);
+	m->share_forget_count = 0;
+	os_mutex_unlock(&m->lock);
+	if (n == 0) {
+		return;
+	}
+	os_mutex_lock(&m->consent_lock);
+	for (uint32_t i = 0; i < n; i++) {
+		if (keys[i] == UINT64_MAX) {
+			u_app_share_consent_forget_all(&m->share);
+		} else {
+			u_app_share_consent_forget_app(&m->share, keys[i]);
+		}
+	}
+	os_mutex_unlock(&m->consent_lock);
 }
 
 //! Describe a candidate through the platform tap (no manager lock held).
@@ -3288,8 +3338,19 @@ app_query(struct app_cand *c)
 }
 
 //! Fill a fresh app slot from @p c (manager lock held; the slot is unreferenced).
+/*!
+ * Fill a fresh app slot from @p c (manager lock held; the slot is
+ * unreferenced). @p w / @p h / @p fps: the share stream size, resolved from
+ * `share.resolution` BEFORE the lock was taken (it may read the user store).
+ */
 static void
-app_insert_locked(struct ipc_server_stereo_camera *m, struct scam_camera *cam, const struct app_cand *c, int64_t now)
+app_insert_locked(struct ipc_server_stereo_camera *m,
+                  struct scam_camera *cam,
+                  const struct app_cand *c,
+                  int64_t now,
+                  uint32_t w,
+                  uint32_t h,
+                  float fps)
 {
 	uint32_t ordinal = 0;
 	for (bool clash = true; clash; ordinal++) {
@@ -3303,9 +3364,20 @@ app_insert_locked(struct ipc_server_stereo_camera *m, struct scam_camera *cam, c
 			break;
 		}
 	}
-	uint32_t w = 0, h = 0;
-	float fps = 0.0f;
-	app_stream_extent(m, &w, &h, &fps);
+	// ADR-061 spec §2: one cameraId per running app. The same (exe, ordinal)
+	// relaunching while its old entry still lingers takes the id over (via
+	// app_id_for_locked) and the lingering entry leaves the list now — never
+	// two listed rows with one cameraId.
+	for (uint32_t i = 0; i < APP_MAX; i++) {
+		struct scam_camera *o = &m->apps[i];
+		if (o != cam && o->app.listed && !o->app.live && o->app.ordinal == ordinal &&
+		    strcmp(o->app.exe_path, c->exe_path) == 0) {
+			o->app.listed = false;
+			U_LOG_W("app share %llu \"%s\": relaunched while its exited entry lingered — the new instance "
+			        "takes the id, the old entry leaves the list",
+			        (unsigned long long)o->camera_id, o->info.display_name);
+		}
+	}
 
 	cam->source = XRT_STEREO_CAMERA_SOURCE_APP;
 	cam->source_index = 0;
@@ -3374,7 +3446,10 @@ app_insert_fake_locked(struct ipc_server_stereo_camera *m)
 	c.q.active_view_count = 2;
 	struct scam_camera *cam = &m->apps[0];
 	cam->index = APP_SLOT_BASE;
-	app_insert_locked(m, cam, &c, os_monotonic_get_ns());
+	uint32_t w = 0, h = 0;
+	float fps = 0.0f;
+	app_stream_extent(m, &w, &h, &fps); // create time: no manager lock is held yet
+	app_insert_locked(m, cam, &c, os_monotonic_get_ns(), w, h, fps);
 	cam->app.fake = true;
 	cam->app.desc.content_eye_width = cam->info.eye_width;
 	cam->app.desc.content_eye_height = cam->info.eye_height;
@@ -3397,12 +3472,30 @@ app_class_shareable(uint32_t cls)
  * with only app_rescan_lock held. Returns true if anything a client sees changed.
  */
 static bool
-rescan_apps(struct ipc_server_stereo_camera *m)
+rescan_apps(struct ipc_server_stereo_camera *m, bool force)
 {
 	if (!m->apps_enabled) {
 		return false;
 	}
 	os_mutex_lock(&m->app_rescan_lock);
+	if (!force) {
+		// An enumerate-driven rescan runs at most once a second (like rescan());
+		// a pending apps_changed() is not held back by it.
+		os_mutex_lock(&m->lock);
+		const int64_t t = os_monotonic_get_ns();
+		const bool skip =
+		    !m->apps_dirty && m->last_app_rescan_ns != 0 && t - m->last_app_rescan_ns < RESCAN_MIN_INTERVAL_NS;
+		os_mutex_unlock(&m->lock);
+		if (skip) {
+			os_mutex_unlock(&m->app_rescan_lock);
+			return false;
+		}
+	}
+	// The share stream size of any NEW entry: resolved before the manager lock
+	// (`share.resolution` may read the registry / the user's JSON store).
+	uint32_t ext_w = 0, ext_h = 0;
+	float ext_fps = 0.0f;
+	app_stream_extent(m, &ext_w, &ext_h, &ext_fps);
 
 	// 1. Candidates (no manager lock). Other connections' fields are read
 	//    racily, the uid_presenting pattern; the next tick corrects a stale read.
@@ -3521,7 +3614,7 @@ rescan_apps(struct ipc_server_stereo_camera *m)
 			        c->app_name, c->pid);
 			break;
 		}
-		app_insert_locked(m, slot, c, now);
+		app_insert_locked(m, slot, c, now, ext_w, ext_h, ext_fps);
 		changed = true;
 	}
 	m->last_app_rescan_ns = now;
@@ -3531,6 +3624,7 @@ rescan_apps(struct ipc_server_stereo_camera *m)
 	os_mutex_unlock(&m->lock);
 	free(cands);
 	os_mutex_unlock(&m->app_rescan_lock);
+	share_forget_drain(m);
 	if (ended_any) {
 		indicator_changed(m);
 	}
@@ -3540,7 +3634,7 @@ rescan_apps(struct ipc_server_stereo_camera *m)
 bool
 ipc_server_stereo_camera_rescan_apps(struct ipc_server_stereo_camera *m)
 {
-	return m != NULL && rescan_apps(m);
+	return m != NULL && rescan_apps(m, true);
 }
 
 void
@@ -3588,6 +3682,7 @@ ipc_server_stereo_camera_app_session_ending(volatile struct ipc_client_state *ic
 		notify_cameras_changed_locked(m);
 	}
 	os_mutex_unlock(&m->lock);
+	share_forget_drain(m);
 	if (any) {
 		indicator_changed(m);
 	}
@@ -3609,8 +3704,16 @@ watch_thread(void *ptr)
 	while (!m->shutting_down) {
 		// ADR-061: the app table ticks at 1 Hz (and at once on apps_changed);
 		// the camera sources keep their own period.
+		// The 1 Hz app tick only while it has something to do: a pending
+		// apps_changed(), a listening consumer, or a listed live app (its exit
+		// must end streams / start the linger). Otherwise the camera period.
 		uint64_t wait_ns = m->rescan_period_ns;
-		if (m->apps_enabled && wait_ns > (uint64_t)APP_TICK_NS) {
+		bool apps_live_now = false;
+		for (uint32_t i = 0; i < APP_MAX; i++) {
+			apps_live_now |= m->apps[i].app.listed && !m->apps[i].app.fake;
+		}
+		if (m->apps_enabled && (m->apps_dirty || has_listener_locked(m) || apps_live_now) &&
+		    wait_ns > (uint64_t)APP_TICK_NS) {
 			wait_ns = (uint64_t)APP_TICK_NS;
 		}
 		if (!m->apps_dirty && !m->rescan_soon) {
@@ -3638,7 +3741,7 @@ watch_thread(void *ptr)
 			(void)rescan(m, soon, false);
 		}
 		if (apps_due) {
-			(void)rescan_apps(m);
+			(void)rescan_apps(m, true);
 		}
 		os_mutex_lock(&m->lock);
 	}
@@ -4021,7 +4124,7 @@ ipc_handle_stereo_camera_count(volatile struct ipc_client_state *ics, uint32_t *
 	// ADR-061: a consumer that sees apps gets the current app set (cheap: the
 	// connection table plus one platform query per app).
 	if (client_sees_apps(m, ics)) {
-		(void)rescan_apps(m);
+		(void)rescan_apps(m, false); // throttled: at most once a second per enumerate burst
 	}
 	os_mutex_lock(&m->lock);
 	// #1961: a connection that enumerated LISTENS from now on — it is told
@@ -5007,7 +5110,7 @@ ipc_server_stereo_camera_set_prompt_provider(ipc_server_stereo_camera_prompt_fn 
 }
 
 void
-ipc_server_stereo_camera_set_share_prompt_provider(ipc_server_stereo_camera_share_prompt_fn fn, void *ctx)
+ipc_server_stereo_camera_set_share_prompt_provider(u_app_share_prompt_fn fn, void *ctx)
 {
 	g_share_prompt_ctx = ctx;
 	g_share_prompt_fn = fn;

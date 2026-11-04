@@ -1376,3 +1376,135 @@ TEST_CASE("app share: frames + metadata through a platform share tap", "[stereo_
 	CHECK(scm_tap_attached() == 0); // every attach was detached
 	scm_set_tap(false);
 }
+
+TEST_CASE("app share: a relaunch INSIDE the linger keeps one row per cameraId", "[stereo_camera_manager][app_share]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_set_tap(true);
+	scm_app_options o = {};
+	o.dev = 1;
+	o.fake = -1;
+	o.linger_ms = 10000; // the relaunch happens well inside it
+	o.consumer_sees_apps = true;
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+	scm_app_connect(f, 1, 71, kAppPid, "Viewer", XRT_CLIENT_CLASS_APP, false);
+	scm_rescan_apps(f);
+	auto v = listing(f);
+	REQUIRE(v.size() == 1);
+	const uint64_t id = v[0].camera_id;
+
+	// Exit, and the same executable comes straight back (a new session / process).
+	scm_app_session_ending(f, 1);
+	scm_app_disconnect(f, 1);
+	scm_rescan_apps(f);
+	REQUIRE(listing(f).size() == 1); // lingering
+	scm_app_connect(f, 2, 72, kAppPid, "Viewer", XRT_CLIENT_CLASS_APP, false);
+	scm_rescan_apps(f);
+	v = listing(f);
+	REQUIRE(v.size() == 1); // never two rows with one cameraId
+	CHECK(v[0].camera_id == id);
+	CHECK(v[0].state == XRT_STEREO_CAMERA_STATE_AVAILABLE);
+	xrt_app_share_source_info ai;
+	REQUIRE(scm_app_source(f, id, &ai) == XRT_SUCCESS);
+	CHECK(ai.availability == XRT_APP_SHARE_AVAILABLE); // the live one, not the dead one
+	uint64_t sid = 0;
+	auto req = share_req(id);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	CHECK(scm_stream_start(f, sid) == XRT_SUCCESS); // not BUSY on a live app
+	scm_stream_destroy(f, sid);
+	scm_destroy(f);
+	scm_set_tap(false);
+}
+
+TEST_CASE("app share: a per-app-run grant dies with the app", "[stereo_camera_manager][app_share]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_set_tap(true);
+	scm_app_options o = {};
+	o.dev = -1;
+	o.fake = -1;
+	o.consumer_sees_apps = true;
+	o.prompt_mode = 2; // per-app-run
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+	scm_set_share_answer(U_CAMERA_CONSENT_PROMPT_ALLOW);
+	scm_app_connect(f, 1, 81, kAppPid, "Viewer", XRT_CLIENT_CLASS_APP, false);
+	scm_rescan_apps(f);
+	auto v = listing(f);
+	REQUIRE(v.size() == 1);
+	auto req = share_req(v[0].camera_id);
+	uint64_t sid = 0;
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	scm_stream_destroy(f, sid);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	scm_stream_destroy(f, sid);
+	CHECK(scm_share_prompts() == 1); // the grant covered the second start
+
+	// The app exits and comes back with the SAME pid (pid reuse) and the same id:
+	// the old grant must not silently re-share it.
+	scm_app_session_ending(f, 1);
+	scm_app_disconnect(f, 1);
+	scm_rescan_apps(f);
+	scm_app_connect(f, 2, 82, kAppPid, "Viewer", XRT_CLIENT_CLASS_APP, false);
+	scm_rescan_apps(f);
+	v = listing(f);
+	REQUIRE(v.size() == 1);
+	CHECK(v[0].camera_id == req.camera_id);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	CHECK(scm_share_prompts() == 2);
+	scm_stream_destroy(f, sid);
+	scm_destroy(f);
+	scm_set_tap(false);
+}
+
+TEST_CASE("app share: the tap's release hook runs without the manager lock", "[stereo_camera_manager][app_share]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_set_tap(true);
+	scm_app_options o = {};
+	o.dev = 1;
+	o.fake = -1;
+	o.consumer_sees_apps = true;
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+	scm_app_connect(f, 1, 91, kAppPid, "Viewer", XRT_CLIENT_CLASS_APP, false);
+	scm_rescan_apps(f);
+	auto v = listing(f);
+	REQUIRE(v.size() == 1);
+	auto req = share_req(v[0].camera_id);
+	uint64_t sid = 0;
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	const int before = scm_tap_releases();
+	const int64_t t_end = os_monotonic_get_ns() + 3ll * 1000 * 1000 * 1000;
+	while (scm_tap_releases() < before + 3 && os_monotonic_get_ns() < t_end) {
+		os_nanosleep(10 * 1000 * 1000);
+	}
+	CHECK(scm_tap_releases() >= before + 3); // the published path
+	// The in-flight frame of an app that went (the other release site).
+	scm_app_session_ending(f, 1);
+	scm_stream_destroy(f, sid);
+	scm_destroy(f);
+	scm_set_tap(false);
+}
+
+TEST_CASE("app share: enumerate-driven rescans are throttled, apps_changed is not", "[stereo_camera_manager][app_share]")
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_app_options o = {};
+	o.dev = -1;
+	o.fake = -1;
+	o.consumer_sees_apps = true;
+	scm_fixture *f = scm_create_apps(&o);
+	REQUIRE(f != nullptr);
+	CHECK(scm_count(f) == 0); // this enumerate rescanned (first time)
+	scm_app_connect(f, 1, 101, kAppPid, "Viewer", XRT_CLIENT_CLASS_APP, false);
+	CHECK(scm_count(f) == 0); // within a second: no rescan on enumerate
+	scm_apps_changed(f);      // a session began: the next enumerate rescans
+	CHECK(scm_count(f) == 1);
+	scm_destroy(f);
+}
