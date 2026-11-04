@@ -23338,6 +23338,9 @@ svc_read_done_note_drop(struct d3d11_service_compositor *c, const char *why, uin
  * and a third of the GPU cost on the render adapter, and it needs neither a video
  * device nor an NV12 render target.
  *
+ * BT.601 full range (JPEG): the colour contract of the stereo-camera transport, the
+ * one the browser applies to every runtime camera device.
+ *
  */
 
 static const char *const svc_share_tap_hlsl = R"(
@@ -23357,13 +23360,13 @@ float3 fetch(float2 uv) {
   }
   return c;
 }
-static const float3 KY = float3(0.2126, 0.7152, 0.0722);
-float ps_y(V i) : SV_Target { return 16.0 / 255.0 + dot(fetch(uv0 + i.uv * uv_scale), KY) * 219.0 / 255.0; }
+static const float3 KY = float3(0.299, 0.587, 0.114);
+float ps_y(V i) : SV_Target { return dot(fetch(uv0 + i.uv * uv_scale), KY); }
 float2 ps_uv(V i) : SV_Target {
   float2 u = uv0 + i.uv * uv_scale, d = half_texel;
   float3 c = 0.25 * (fetch(u + float2(-d.x, -d.y)) + fetch(u + float2(d.x, -d.y)) + fetch(u + float2(-d.x, d.y)) + fetch(u + float2(d.x, d.y)));
   float y = dot(c, KY);
-  return float2(128.0 / 255.0 + (c.b - y) / 1.8556 * 224.0 / 255.0, 128.0 / 255.0 + (c.r - y) / 1.5748 * 224.0 / 255.0);
+  return float2(128.0 / 255.0 + (c.b - y) / 1.772, 128.0 / 255.0 + (c.r - y) / 1.402);
 }
 )";
 
@@ -23630,6 +23633,10 @@ svc_share_tap_commit(struct d3d11_service_system *sys,
 	if (due && sl.busy) {
 		t->n_ring_full++;
 	}
+	if (t->n_commit == 0) {
+		U_LOG_W("ADR-061 share tap: first commit: srv %d, content %ux%u, grid %ux%u, views %u, %s", srv != nullptr, cw, ch,
+		        cols, rows, views, sys->workspace_mode ? "workspace" : "direct");
+	}
 	if (due && !sl.busy && srv != nullptr && c->render.atlas_texture != nullptr && cw > 0 && ch > 0 && views > 0 &&
 	    cols > 0 && rows > 0) {
 		D3D11_TEXTURE2D_DESC ad = {};
@@ -23677,7 +23684,7 @@ svc_share_tap_commit(struct d3d11_service_system *sys,
 		ctx->OMSetDepthStencilState(nullptr, 0);
 		ID3D11RenderTargetView *null_rtv = nullptr;
 		ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
-		const FLOAT black_y[4] = {16.0f / 255.0f, 0, 0, 0};
+		const FLOAT black_y[4] = {0, 0, 0, 0};
 		const FLOAT black_uv[4] = {128.0f / 255.0f, 128.0f / 255.0f, 0, 0};
 		ctx->ClearRenderTargetView(t->rtv_y.get(), black_y);
 		ctx->ClearRenderTargetView(t->rtv_uv.get(), black_uv);
@@ -27219,9 +27226,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// ADR-061: the atlas is final. Not on a zero-copy frame, which never wrote
 		// it (the first commit after an attach can still be one).
 		c->share_last_commit_ns.store((int64_t)os_monotonic_get_ns(), std::memory_order_relaxed);
-		c->share_active_views.store(eff_view_count, std::memory_order_relaxed);
+		// A frame that packed through another path leaves eff_view_count unset; the
+		// published grid is what the atlas holds then.
+		const uint32_t share_views =
+		    eff_view_count != 0 ? eff_view_count : c->pipe_tile_columns * c->pipe_tile_rows;
+		c->share_active_views.store(share_views, std::memory_order_relaxed);
 		if (!use_zero_copy) {
-			svc_share_tap_commit(sys, c, eff_view_count, c->pipe_tile_columns, c->pipe_tile_rows, content_view_w,
+			svc_share_tap_commit(sys, c, share_views, c->pipe_tile_columns, c->pipe_tile_rows, content_view_w,
 			                     content_view_h);
 		}
 

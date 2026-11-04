@@ -118,7 +118,8 @@ tap in the D3D11 service (service-composited apps) or by a share link from the a
    `atlas_flip_y`. Conversion is `ID3D11VideoContext::VideoProcessorBlt` per eye into the halves of
    an NV12 texture, input colour space from the atlas's recorded encoding state
    (`RGB_FULL_G22_NONE_P709` encoded; `G10` if linear — ADR-044 encode-if-linear), output BT.709
-   limited. Per-frame metadata (`XrAppShareFrameInfoDXR`) rides the **acquire reply**, not the ring:
+   limited. *(As built: a pixel shader into R8 + R8G8 targets, output BT.601 full range, the
+   stereo-camera transport's contract; see the spec §8.)* Per-frame metadata (`XrAppShareFrameInfoDXR`) rides the **acquire reply**, not the ring:
    the ring section has no header to extend (see *Corrections*).
 7. **Convergence is metadata, never measured.** `zeroDisparityShiftFrac = 0` in v1: the frame is
    display-referred. Consequently, for an `APP_CONTENT` stream `RECTIFIED` means "row-aligned, zero

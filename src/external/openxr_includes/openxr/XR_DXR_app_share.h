@@ -106,7 +106,7 @@ typedef struct XrAppShareSourcePropertiesDXR {
     //! See XrAppShareFrameInfoDXR; the value at enumeration time.
     float zeroDisparityShiftFrac;
     //! XR_TRUE when the source atlas held LINEAR values (ADR-044). Diagnostic:
-    //! delivered frames are always BT.709-encoded NV12.
+    //! delivered frames are always gamma-encoded NV12, BT.601 full range.
     XrBool32 encodingIsLinear;
 } XrAppShareSourcePropertiesDXR;
 

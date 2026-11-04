@@ -91,7 +91,7 @@ Both taps produce the same frame: the views are taken from the atlas the display
 would weave, cropped to the active mode's content dimensions (ADR-030); with `viewCount > 2` the
 middle pair; with one active view (ADR-041) that view in both halves; scaled to fit `eyeExtent`
 preserving aspect, letterboxed black; alpha dropped; Y-flipped when the source atlas is
-bottom-up; converted to NV12, BT.709 limited range. A LINEAR atlas is encoded first (ADR-044).
+bottom-up; converted to NV12, BT.601 full range (§8). A LINEAR atlas is encoded first (ADR-044).
 
 ## 4. Frames and their metadata
 
@@ -203,7 +203,9 @@ prefix. A started track ends when the stream ends
 
 ## 8. Stream parameters
 
-- **Format:** NV12, BT.709, limited range. Planes and pitches per `XrStereoCameraFrameDXR`.
+- **Format:** NV12, BT.601 full range (JPEG), the colour contract the browser applies to every
+  runtime camera device; receivers decode it as any webcam. Planes and pitches per
+  `XrStereoCameraFrameDXR`.
 - **Size:** fixed per entry (`eyeExtent`), letterboxed; it never follows the app's window. A
   **user setting** in v1, `share.resolution`: `720p` (default, 2×1280×720 @ 30 Hz, ~83 MB/s through
   the ring) | `1080p` (2×1920×1080, the maximum, up to 60 Hz; ~187 MB/s at 30 Hz). A consumer's

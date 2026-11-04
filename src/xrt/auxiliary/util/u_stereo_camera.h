@@ -169,7 +169,7 @@ bool
 u_stereo_camera_layout(uint32_t format, uint32_t width, uint32_t height, struct u_stereo_camera_planes *out);
 
 /*!
- * Convert one SBS image between formats. BT.601 limited range for the
+ * Convert one SBS image between formats. BT.601 full range (JPEG) for the
  * luma<->RGB legs; a GRAY8 source becomes NV12 with neutral (128) chroma.
  * @return false on an unsupported pair or bad arguments.
  */
