@@ -95,6 +95,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [Writing a Driver](guides/writing-driver.md) — driver framework basics
 - **[ADR-034: Input-Provider Plug-ins](adr/ADR-034-input-provider-plugins.md)** — the second plug-in type: tracked motion controllers from an external DLL ([discovery contract](specs/runtime/input-provider-discovery.md) · [iface reference](reference/xrt_input_plugin_iface.md))
 - [OpenVR titles via OpenComposite](guides/openvr-titles-via-opencomposite.md) — how SteamVR-era titles reach the runtime + its motion controllers
+- [Porting a native Android game to the weave extension](guides/android-game-stereo-port.md) — real two-eye rendering for a game with no source: twins, replay, camera classification, the frame boundary, what is reusable
 
 ### Integrated vendors (`vendors/`)
 
