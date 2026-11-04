@@ -186,6 +186,15 @@ scm_set_tap(bool enabled);
 int
 scm_tap_attached(void); //!< currently attached taps
 
+//! Release-hook calls of the fake tap. The hook takes the manager lock itself
+//! (through a status read), so a call made WITH the lock held deadlocks the test.
+int
+scm_tap_releases(void);
+
+//! What the service calls when a session is created / begun / ended.
+void
+scm_apps_changed(struct scm_fixture *f);
+
 uint32_t
 scm_stop_all(void);
 

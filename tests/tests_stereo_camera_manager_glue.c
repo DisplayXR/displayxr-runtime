@@ -791,6 +791,31 @@ tap_wait(void *ctx,
 	return XRT_PLUGIN_STEREO_CAMERA_WAIT_OK;
 }
 
+static int g_tap_releases = 0;
+
+static void
+tap_release(void *ctx, void *tap)
+{
+	(void)ctx;
+	(void)tap;
+	// The contract: never called with the manager lock held. This takes it (a
+	// non-recursive mutex): a violation hangs here instead of passing.
+	(void)ipc_server_stereo_camera_is_session_locked();
+	g_tap_releases++;
+}
+
+int
+scm_tap_releases(void)
+{
+	return g_tap_releases;
+}
+
+void
+scm_apps_changed(struct scm_fixture *f)
+{
+	ipc_server_stereo_camera_apps_changed(f->mgr);
+}
+
 static void
 tap_detach(void *ctx, void *tap)
 {
@@ -812,6 +837,7 @@ scm_set_tap(bool enabled)
 	p.share_tap_query = tap_query;
 	p.share_tap_attach = tap_attach;
 	p.share_tap_wait_frame = tap_wait;
+	p.share_tap_release_frame = tap_release;
 	p.share_tap_detach = tap_detach;
 	ipc_server_stereo_camera_set_platform(&p);
 }
