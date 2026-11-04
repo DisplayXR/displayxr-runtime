@@ -837,7 +837,23 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	mc->weave.engine_initialized = true;
 	mc->weave.engine_failed = false;
 	U_LOG_W("weave(#1036): Android weave engine initialized (RGBA8, AHardwareBuffer, synchronous)");
+	if (mc->weave.eye_tracking_mode_plus1 != 0) {
+		const uint32_t mode = mc->weave.eye_tracking_mode_plus1 - 1;
+		xrt_display_processor_set_eye_tracking_mode(mc->weave.dp, mode);
+		U_LOG_W("weave(#1036): eye-tracking mode %u applied at engine bring-up", mode);
+	}
 	return true;
+}
+
+void
+comp_multi_weave_android_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode)
+{
+	mc->weave.eye_tracking_mode_plus1 = mode + 1;
+	if (mc->weave.dp != NULL) {
+		xrt_display_processor_set_eye_tracking_mode(mc->weave.dp, mode);
+	}
+	U_LOG_W("weave(#1036): eye-tracking mode %u requested (%s)", mode,
+	        mc->weave.dp != NULL ? "applied to the weave DP" : "held until the engine is up");
 }
 
 
@@ -3788,6 +3804,13 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 			mc->weave.unsqueeze_initialized = false;
 		}
 		if (mc->weave.dp != NULL) {
+			// The vendor's no-face policy can be per device core, not per DP:
+			// hand MANAGED back so a MANUAL client doesn't leave it off for
+			// whoever weaves next.
+			if (mc->weave.eye_tracking_mode_plus1 > 1) {
+				xrt_display_processor_set_eye_tracking_mode(mc->weave.dp, 0);
+			}
+			mc->weave.eye_tracking_mode_plus1 = 0;
 			xrt_display_processor_destroy(&mc->weave.dp);
 		}
 		if (mc->weave.render_pass != VK_NULL_HANDLE) {

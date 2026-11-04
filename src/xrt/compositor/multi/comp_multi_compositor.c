@@ -2793,6 +2793,16 @@ multi_compositor_vtable_request_rendering_mode(struct xrt_compositor *xc,
 void
 multi_compositor_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode)
 {
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_ANDROID)
+	// A weave-only client (XR_DXR_weave present-owner) has no session_render, so
+	// the gate below dropped its MANAGED/MANUAL request. Its DP is the weave
+	// engine's own instance: hold the mode and apply it there, now if the engine
+	// is up, otherwise at bring-up (comp_multi_weave_android.c).
+	if (mc != NULL && !mc->session_render.initialized) {
+		comp_multi_weave_android_set_eye_tracking_mode(mc, mode);
+		return;
+	}
+#endif
 	if (mc == NULL || !mc->session_render.initialized) {
 		return;
 	}
