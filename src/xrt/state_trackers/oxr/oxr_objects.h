@@ -144,7 +144,7 @@ struct oxr_xdev_list;
 struct oxr_plane_detector_ext;
 struct oxr_local_3d_zone_ext;
 struct oxr_lift_stream_dxr;
-struct ipc_client_lift_link;
+struct ipc_client_service_link;
 struct oxr_stereo_camera_stream_dxr;
 
 #define XRT_MAX_HANDLE_CHILDREN 256
@@ -3016,12 +3016,23 @@ struct oxr_session
 	bool is_gl_native_compositor;
 
 	/*!
-	 * XR_DXR_lift for an IN-PROCESS session (ADR-049): the lift-only service
-	 * connection, created on the first lift call and freed after the
-	 * session's lift streams (its children). NULL on IPC sessions, whose
-	 * lift calls ride the session's own connection.
+	 * An IN-PROCESS session's service link (ADR-049 + Amendment 1, ADR-061
+	 * decision 16): ONE sessionless service connection carrying its lift
+	 * calls and, when sharing is on, its share capability. Created on the
+	 * first lift call or at xrBeginSession (sharing), whichever comes first;
+	 * freed after the session's lift streams (its children). NULL on IPC
+	 * sessions, whose lift calls ride the session's own connection.
 	 */
-	struct ipc_client_lift_link *lift_link;
+	struct ipc_client_service_link *service_link;
+
+	/*!
+	 * ADR-061 spec §5: the app chained XrSessionShareabilityDXR shareable =
+	 * XR_FALSE. Travels in the service link's registration for an in-process
+	 * session (an IPC session sends it at session create).
+	 */
+	bool app_share_opt_out;
+	//! ADR-061 arm 2: the session installed its service link as the process's share sink.
+	bool share_sink_installed;
 
 	/*!
 	 * XR_DXR_lift: the conversion module's maxViews as the last successful

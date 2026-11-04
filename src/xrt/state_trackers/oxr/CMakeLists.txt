@@ -67,6 +67,8 @@ add_library(
 	oxr_conv.c
 	oxr_conv_gpu.h
 	oxr_conv_gpu_d3d.c
+	oxr_service_link.c
+	oxr_service_link.h
 	oxr_conv_map.h
 	oxr_lift_rules.h
 	oxr_stereo_camera.c

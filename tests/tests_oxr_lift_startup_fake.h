@@ -72,7 +72,7 @@ lf_set_output_realloc_next(bool realloc);
 uint32_t
 lf_last_submit_view_count(void);
 
-//! The ADR-049 link's state (enum ipc_client_lift_link_state) and generation.
+//! The ADR-049 link's state (enum ipc_client_service_link_state) and generation.
 void
 lf_set_link(int state, uint32_t gen);
 
