@@ -220,7 +220,7 @@ clamp_u8(int v)
 static inline uint8_t
 luma_601(int r, int g, int b)
 {
-	return clamp_u8(16 + ((66 * r + 129 * g + 25 * b + 128) >> 8));
+	return clamp_u8((77 * r + 150 * g + 29 * b + 128) >> 8);
 }
 
 bool
@@ -295,12 +295,12 @@ u_stereo_camera_convert(uint32_t src_format,
 			const uint8_t *uv = s1 + (size_t)(y / 2) * src_pitches[1];
 			uint8_t *o = d0 + (size_t)y * dl->pitch[0];
 			for (uint32_t x = 0; x < width; x++) {
-				int c = (int)ys[x] - 16;
+				int c = (int)ys[x];
 				int dd = (int)uv[x & ~1u] - 128;
 				int e = (int)uv[(x & ~1u) + 1] - 128;
-				o[4 * x + 2] = clamp_u8((298 * c + 409 * e + 128) >> 8);
-				o[4 * x + 1] = clamp_u8((298 * c - 100 * dd - 208 * e + 128) >> 8);
-				o[4 * x + 0] = clamp_u8((298 * c + 516 * dd + 128) >> 8);
+				o[4 * x + 2] = clamp_u8((256 * c + 359 * e + 128) >> 8);
+				o[4 * x + 1] = clamp_u8((256 * c - 88 * dd - 183 * e + 128) >> 8);
+				o[4 * x + 0] = clamp_u8((256 * c + 454 * dd + 128) >> 8);
 				o[4 * x + 3] = 255;
 			}
 		}
@@ -340,8 +340,8 @@ u_stereo_camera_convert(uint32_t src_format,
 				bb = (bb + 2) / 4;
 				gg = (gg + 2) / 4;
 				rr = (rr + 2) / 4;
-				o[x] = clamp_u8(128 + ((-38 * rr - 74 * gg + 112 * bb + 128) >> 8));
-				o[x + 1] = clamp_u8(128 + ((112 * rr - 94 * gg - 18 * bb + 128) >> 8));
+				o[x] = clamp_u8(128 + ((-43 * rr - 85 * gg + 128 * bb + 128) >> 8));
+				o[x + 1] = clamp_u8(128 + ((128 * rr - 107 * gg - 21 * bb + 128) >> 8));
 			}
 		}
 		return true;

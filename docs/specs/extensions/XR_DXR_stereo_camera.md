@@ -374,7 +374,10 @@ are skipped, never queued (the ring never builds a backlog; `frameIndex` gaps sa
 
 ### 5.3 Transport
 
-**Shared memory (required).** On the first `xrStartStereoCameraStreamDXR` the stream exposes,
+**Colour.** NV12 frames are BT.601 full range (JPEG), on every source: the contract the browser's
+camera device applies, and why a grey sensor's values can be NV12 luma unchanged.
+
+**Shared memory (required). On the first `xrStartStereoCameraStreamDXR` the stream exposes,
 through `XrStereoCameraStreamTransportDXR` (chained on a `xrGetStereoCameraStreamInfoDXR` call):
 
 - a read-only section (Windows) / sealed memfd (Android, POSIX) holding a 3-slot ring sized for
