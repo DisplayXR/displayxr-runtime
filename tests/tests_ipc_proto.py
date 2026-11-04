@@ -42,6 +42,11 @@ SPEC4_CONV_CALLS = ['conv_get_generation', 'conv_enum_task', 'conv_request_warm'
 #: desc has no room for a provider id, so the hinted create is its own call).
 SPEC5_CONV_CALLS = ['conv_enum_candidates', 'conv_stream_create_v5']
 
+#: ADR-061 arm 2 / ADR-049 Amendment 1: the in-process service link's share
+#: messages, appended LAST (after lift spec 5's two) in this order.
+SERVICE_LINK_CALLS = ['service_link_register', 'service_link_share_poll', 'service_link_share_publish_ring',
+                      'service_link_share_publish_fence', 'service_link_share_frame_ready']
+
 #: ADR-034 Amendment 5 (#2181): per-client input selection, appended after the spec-4 family.
 INPUT_SELECTION_CALLS = ['input_providers_enumerate', 'input_set_provider_preference', 'system_get_input_holders']
 
@@ -177,7 +182,8 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
                  "workspace_set_window_placement", "workspace_get_window_placement",
                  "workspace_set_overlay_on_screen", "conv_hint_interest", "compositor_set_cursor_draw_request",
                  "compositor_set_cursor_measure_request", "system_request_component_reselect",
-                 "conv_warm") + tuple(SPEC4_CONV_CALLS) + tuple(INPUT_SELECTION_CALLS) + tuple(SPEC5_CONV_CALLS)
+                 "conv_warm") + tuple(SPEC4_CONV_CALLS) + tuple(INPUT_SELECTION_CALLS) + tuple(SPEC5_CONV_CALLS) + \
+            tuple(SERVICE_LINK_CALLS)
         self.assertTrue(all(n.startswith("system_get_") or n in later
                             for n in names[i + 3:]), names[i + 3:])
         enable = self._call("compositor_segments_enable")
@@ -347,11 +353,49 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertIn("ipc_handle_system_get_conv_provider_row(", text)
         self.assertIn("ipc_handle_system_get_conv_task_row(", text)
 
-    def _names_before_spec5(self):
-        """Command names up to lift spec 5's two calls (#2178), appended LAST."""
+    def _names_before_service_link(self):
+        """Command names up to the service link's share calls (ADR-061 arm 2), appended LAST."""
         names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-len(SERVICE_LINK_CALLS):], SERVICE_LINK_CALLS)
+        return names[:-len(SERVICE_LINK_CALLS)]
+
+    def _names_before_spec5(self):
+        """Command names up to lift spec 5's two calls (#2178); only the service link's follow them."""
+        names = self._names_before_service_link()
         self.assertEqual(names[-len(SPEC5_CONV_CALLS):], SPEC5_CONV_CALLS)
         return names[:-len(SPEC5_CONV_CALLS)]
+
+    def test_service_link_calls_are_appended(self):
+        # ADR-061 arm 2 (ADR-049 Amendment 1): the in-process service link's
+        # registration and share messages ride at the very END, so every
+        # earlier command keeps its enum value. The ring's textures and its
+        # fence travel on two messages: a message carries one handle type.
+        names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-len(SERVICE_LINK_CALLS):], SERVICE_LINK_CALLS)
+        reg = self._call("service_link_register")
+        self.assertEqual([(a.name, a.typename) for a in reg.in_args],
+                         [("reg", "struct xrt_share_link_registration")])
+        self.assertEqual(reg.out_args, [])
+        poll = self._call("service_link_share_poll")
+        self.assertEqual(poll.in_args, [])
+        self.assertEqual([(a.name, a.typename) for a in poll.out_args], [("poll", "struct xrt_share_link_poll")])
+        ring = self._call("service_link_share_publish_ring")
+        self.assertEqual([(a.name, a.typename) for a in ring.in_args],
+                         [("desc", "struct xrt_share_link_ring_desc")])
+        self.assertTrue(ring.in_handles)
+        self.assertFalse(ring.out_handles)
+        fence = self._call("service_link_share_publish_fence")
+        self.assertEqual([(a.name, a.typename) for a in fence.in_args], [("generation", "uint32_t")])
+        self.assertTrue(fence.in_handles)
+        ready = self._call("service_link_share_frame_ready")
+        self.assertEqual([(a.name, a.typename) for a in ready.in_args], [("frame", "struct xrt_share_link_frame")])
+        self.assertEqual([(a.name, a.typename) for a in ready.out_args],
+                         [("poll", "struct xrt_share_link_poll")])
+        for call in (reg, poll, ready):
+            self.assertFalse(call.in_handles or call.out_handles or call.varlen, call.name)
+        text = self._generate("generate_server_c", "ipc_server_generated.c")
+        for name in SERVICE_LINK_CALLS:
+            self.assertIn("ipc_handle_%s(" % name, text)
 
     def _names_before_input_selection(self):
         """Command names up to #2181's input-selection family (only spec 5 follows it)."""
@@ -396,7 +440,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # change restarts) and the hinted create ride at the very END (after
         # #2181's input-selection family), so every earlier call keeps its enum
         # value and wire form.
-        names = [c.name for c in self.p.calls]
+        names = self._names_before_service_link()
         self.assertEqual(names[-len(SPEC5_CONV_CALLS):], SPEC5_CONV_CALLS)
         enum = self._call("conv_enum_candidates")
         self.assertEqual([(a.name, a.typename) for a in enum.in_args], [("task", "uint32_t"), ("index", "uint32_t")])
