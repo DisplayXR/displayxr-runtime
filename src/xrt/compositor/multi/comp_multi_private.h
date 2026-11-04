@@ -795,6 +795,10 @@ struct multi_compositor
 		struct os_mutex mutex; //!< Serializes submits + teardown for this client.
 
 		bool engine_initialized;
+		//! Eye-tracking mode (XrEyeTrackingModeDXR) the client asked for, +1 (0 = never asked).
+		//! A weave-only client has no session_render DP, so the request is held here
+		//! and applied to @ref dp when it exists (and again at engine bring-up).
+		uint32_t eye_tracking_mode_plus1;
 		bool engine_failed; //!< One-shot: don't retry a hopeless bring-up every frame.
 		VkCommandPool cmd_pool;
 		VkCommandBuffer cmd;
@@ -1846,6 +1850,13 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
  */
 void
 comp_multi_weave_android_satellite_clear(struct multi_compositor *mc);
+
+/*!
+ * Hold the client's eye-tracking mode (MANAGED/MANUAL) for a weave-only session
+ * and apply it to the weave engine's DP (now, or at engine bring-up).
+ */
+void
+comp_multi_weave_android_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode);
 
 /*!
  * Has THIS client painted the satellite overlay and not cleared it since?
