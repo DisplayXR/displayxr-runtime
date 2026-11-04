@@ -1499,6 +1499,8 @@ struct d3d11_service_compositor
 	//! only mislabels one listing).
 	std::atomic<int64_t> share_last_commit_ns{0};
 	std::atomic<uint32_t> share_active_views{0};
+	//! ADR-061: the unset-view-count fallback has been logged for this client.
+	bool share_views_fallback_logged = false;
 
 	//! App-initiated rendering-mode request (#575). The client's
 	//! xrRequestDisplayRenderingModeDXR crosses IPC into the
@@ -27230,6 +27232,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// published grid is what the atlas holds then.
 		const uint32_t share_views =
 		    eff_view_count != 0 ? eff_view_count : c->pipe_tile_columns * c->pipe_tile_rows;
+		if (eff_view_count == 0 && !c->share_views_fallback_logged && c->share_tap_active.load(std::memory_order_relaxed)) {
+			c->share_views_fallback_logged = true;
+			U_LOG_W("ADR-061 share tap: frame left the view count unset; using the published %ux%u grid",
+			        c->pipe_tile_columns, c->pipe_tile_rows);
+		}
 		c->share_active_views.store(share_views, std::memory_order_relaxed);
 		if (!use_zero_copy) {
 			svc_share_tap_commit(sys, c, share_views, c->pipe_tile_columns, c->pipe_tile_rows, content_view_w,
