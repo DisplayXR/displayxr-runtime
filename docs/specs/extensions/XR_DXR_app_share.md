@@ -85,7 +85,7 @@ end, and a 1 Hz tick while any consumer has enumerated.
 | Service-composited (`_ipc`, any app under a workspace controller, forced IPC) | the D3D11 service, after the per-client atlas is final in `compositor_layer_commit` | Windows v1; macOS P6 |
 | In-process D3D11, D3D12, Vulkan on Windows, whose frames ride the D3D11 fill arm (`compositor/xbridge/`, ADR-039 / ADR-059) | the app process copies its pre-weave content into an NT-shared ring the service imports, over a sessionless share link | Windows v1 |
 | In-process sessions the fill arm declines (OpenGL; a shared-texture session without `DXR_HUB=1`; a kill-switched split; `DXR_LEGACY_STANDALONE`) | none | listed `UNAVAILABLE` (§9) |
-| macOS / Linux in-process | none in v1 | listed `UNAVAILABLE` (no tap) while sharing is on — the service link registers, nothing can import its views (§3a) |
+| macOS / Linux in-process | none in v1 | not listed — the session never dials the service to share (§3a) |
 
 Both taps produce the same frame: the views are taken from the atlas the display processor
 would weave, cropped to the active mode's content dimensions (ADR-030); with `viewCount > 2` the
@@ -101,22 +101,27 @@ import are the remaining half (the hook contracts below are what it fills).
 **The link.** Every in-process session holds at most one sessionless `APP` connection to the
 service, its *service link* (`ipc_client_service_link.c`), named `<exe> (in-process)`. Its
 capabilities are fixed when it is created: `lift` when the instance enabled `XR_DXR_lift`, `share`
-when sharing is on in the app's environment (`DXR_APP_SHARE`, default on; `0` in the app's own
-environment = it never offers itself). A `share` link is opened at `xrBeginSession` in the
-background — never launching the service, retried at most every 5 s — and registers
+only where a tap can exist — a Windows D3D11, D3D12 or Vulkan in-process session, the tiers that
+feed the D3D11 fill arm — and while sharing is on in the app's environment (`DXR_APP_SHARE`,
+default on; `0` = it never offers itself). OpenGL and macOS / Linux sessions never declare it, so
+they spend no connection on sharing. A `share` link's worker thread dials once the session runs
+**and** its compositor reported its tap state (a tap, or the reason it has none) — in the
+background, never launching the service, re-dialling a failed connect every 5 s — and registers
 (`service_link_register`): capabilities, executable and pid (diagnostics only — the listed pid and
 executable are OS-derived from the connection), the `XrApplicationInfo` name, the §5 opt-out, the
 graphics tier (D3D11 / D3D12 / Vulkan / GL / Metal), the adapter LUID its ring would live on (zero
 off Windows), whether its compositor can tap, and whether the session is running. It re-registers
-on every change; `xrEndSession` sends "not running". A session that also lifts uses the same
-connection.
+on every change; `xrEndSession` sends "not running". All of that, and the share poll, run on the
+link's worker: no OpenXR call and no compositor frame ever waits on the service for them. A session
+that also lifts uses the same connection.
 
 **Listing.** The service lists a registered `share` link with a running session as an app entry of
 source `app-link` — `AVAILABLE` only when the compositor can tap, the LUID matches the adapter the
 service publishes, and the service can import a ring; otherwise `UNAVAILABLE` with the reason:
 `graphics API has no tap` (OpenGL), the fill arm's own reason (a shared-texture session without
 `DXR_HUB=1`, a kill-switched split, `DXR_LEGACY_STANDALONE`), `renders on another adapter`, or
-`no tap` (macOS, Linux, and Windows until its tap lands). An opted-out session is not listed.
+`no tap` (Windows until its tap lands, or a service without an importer). An opted-out session is
+not listed.
 Closing the link (the app exits) ends a running stream `SOURCE_LOST` and starts the entry's
 10-second linger.
 
@@ -125,8 +130,13 @@ Closing the link (the app exits) ends a running stream `SOURCE_LOST` and starts 
 | Message | Direction | What |
 |---|---|---|
 | `service_link_share_poll` | app → service | `NONE`, `SHARE_REQUESTED` (with the stream's per-eye extent, rate and a stream generation that bumps on every start) or `SHARE_STOPPED` (once, then `NONE`). The app's compositor calls it every frame through `u_share_link_poll`; the IPC round trip happens at most every 250 ms, so an idle link costs a few small calls a second and nothing per frame |
-| `service_link_share_publish_ring` + `service_link_share_publish_fence` | app → service | the ring for one stream generation: three NT-shared textures, each holding the left view in its left half and the right view in its right half at their content size (unscaled — the service scales and letterboxes), plus one shared `ID3D11Fence`. A new ring (a new generation) replaces the old one, e.g. when the app's content size changes; a ring for an older stream generation is dropped |
-| `service_link_share_frame_ready` | app → service | slot *N* of ring *G* is finished once the fence reaches value *V*; latest-wins. The reply is the poll's answer, so a sharing app needs no separate poll |
+| `service_link_share_publish_ring` + `service_link_share_publish_fence` | app → service | the ring for one stream generation: exactly one NT-shared texture per slot (three), each holding the left view in its left half and the right view in its right half at their content size (unscaled — the service scales and letterboxes), plus — when the ring says `has_fence` — one shared `ID3D11Fence`. A ring is imported at once without a fence, or once its fence arrived; a declared fence that does not arrive within 2 s, or an import that fails, ends the stream `SOURCE_LOST` and the app hears `SHARE_STOPPED`. A new ring (a new generation) replaces the old one, e.g. when the app's content size changes; a ring for an older stream generation is dropped |
+| `service_link_share_frame_ready` | app → service | slot *N* of ring *G* is finished once the fence reaches value *V*; latest-wins. The reply is the poll's answer; `SHARE_STOPPED` is reported to the compositor exactly once across poll and reply |
+
+A refusal (an unknown link, a malformed ring, a full link table) comes back as
+`XRT_ERROR_OUTPUT_REQUEST_FAILURE` / `XRT_ERROR_FEATURE_NOT_SUPPORTED` /
+`XRT_ERROR_CLIENT_LIMIT_REACHED` — never `XRT_ERROR_IPC_FAILURE`, which the link reserves for a dead
+pipe (and which would drop the session's lift streams with it).
 
 **Hook surfaces** (where the Windows half plugs in):
 
@@ -137,8 +147,9 @@ Closing the link (the app exits) ends a running stream `SOURCE_LOST` and starts 
   Built on every platform; the body reports "no tap" until the Windows ring lands.
 - *Service side*, `struct ipc_server_stereo_camera_platform`: `share_link_adapter_luid`,
   `share_link_import`, `share_link_convert`, `share_link_release_frame`, `share_link_unimport` —
-  the same NV12 pass as the service-composited tap (§3, decision 6). All `NULL` = no importer:
-  every `app-link` entry is `no tap`.
+  the same NV12 pass as the service-composited tap (§3, decision 6). Import, convert and unimport
+  come as a set: a partial table is refused whole (logged). All `NULL` = no importer: every
+  `app-link` entry is `no tap`.
 
 ## 4. Frames and their metadata
 

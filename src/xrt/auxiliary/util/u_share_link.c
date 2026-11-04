@@ -71,6 +71,10 @@ u_share_link_set_tap(bool available, uint32_t unavailable_reason, const uint8_t 
 	if (luid_valid && luid != NULL) {
 		memcpy(g_tap_luid, luid, XRT_LUID_SIZE);
 		g_tap_luid_valid = true;
+	} else {
+		// No adapter now: a stale one must not be reported (or replayed) any more.
+		memset(g_tap_luid, 0, sizeof(g_tap_luid));
+		g_tap_luid_valid = false;
 	}
 	if (g_installed) {
 		g_sink.set_tap(g_ctx, g_tap_available, g_tap_reason, g_tap_luid, g_tap_luid_valid);
@@ -141,4 +145,42 @@ u_share_link_reset(void)
 	memset(g_tap_luid, 0, sizeof(g_tap_luid));
 	g_tap_luid_valid = false;
 	pthread_mutex_unlock(&g_lock);
+}
+
+void
+u_share_link_poll_cache_reset(struct u_share_link_poll_cache *c)
+{
+	memset(c, 0, sizeof(*c));
+}
+
+void
+u_share_link_poll_cache_merge(struct u_share_link_poll_cache *c, const struct xrt_share_link_poll *in)
+{
+	if (in->state == XRT_SHARE_LINK_STATE_SHARE_STOPPED && c->stopped_taken &&
+	    in->stream_generation <= c->stopped_taken_generation) {
+		return; // that stop was already reported
+	}
+	const bool unread_stop = c->valid && c->poll.state == XRT_SHARE_LINK_STATE_SHARE_STOPPED;
+	if (unread_stop && in->state == XRT_SHARE_LINK_STATE_NONE) {
+		c->valid = true; // keep the STOPPED until the consumer took it
+		return;
+	}
+	c->poll = *in;
+	c->valid = true;
+}
+
+bool
+u_share_link_poll_cache_take(struct u_share_link_poll_cache *c, struct xrt_share_link_poll *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!c->valid) {
+		return false;
+	}
+	*out = c->poll;
+	if (c->poll.state == XRT_SHARE_LINK_STATE_SHARE_STOPPED) {
+		c->stopped_taken = true;
+		c->stopped_taken_generation = c->poll.stream_generation;
+		c->poll.state = XRT_SHARE_LINK_STATE_NONE; // reported once
+	}
+	return true;
 }

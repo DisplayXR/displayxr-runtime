@@ -15,6 +15,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
+#include "util/u_share_link.h"
 
 #include "client/ipc_client.h"
 #include "client/ipc_client_connection.h"
@@ -66,19 +67,24 @@ struct ipc_client_service_link
 	/*
 	 * ADR-061 share capability (SHARE links only). The registration is
 	 * versioned: @ref reg_seq bumps on every change, @ref reg_sent_seq is what
-	 * the CURRENT connection last acknowledged (reset per connection), and one
-	 * sender at a time (@ref reg_sending) sends the newest copy until they meet.
+	 * the CURRENT connection last acknowledged (reset per connection). Only
+	 * the SHARE WORKER sends it (and polls): no API thread, no compositor
+	 * thread ever waits on the service for registration or the poll.
 	 */
 	struct xrt_share_link_registration reg;
 	uint64_t reg_seq;
 	uint64_t reg_sent_seq;
 	uint32_t reg_sent_gen; //!< the connection generation reg_sent_seq belongs to
-	bool reg_sending;
 
-	//! The last answer of the service (poll or frame_ready reply) and when to ask again.
-	struct xrt_share_link_poll poll;
-	bool poll_valid;
+	//! The service's answers (worker polls + frame_ready replies), single-report STOPPED.
+	struct u_share_link_poll_cache poll;
 	uint64_t next_poll_ns;
+
+	//! The share worker (SHARE links): connects / retries, flushes the registration, polls.
+	struct os_thread worker;
+	struct os_cond worker_cond;
+	bool worker_started;
+	bool worker_stop;
 };
 
 /*!
@@ -167,14 +173,20 @@ connect_run(void *ptr)
 		// not retried on this connection (the service will not take it).
 		link->reg_sent_seq = registered ? sent_seq : link->reg_seq;
 		link->reg_sent_gen = link->gen;
-		link->poll_valid = false;
+		u_share_link_poll_cache_reset(&link->poll);
 		link->next_poll_ns = 0;
 		U_LOG_I("[service-link] in-process: service connection up (generation %u, caps 0x%x)", link->gen,
 		        link->caps);
+		if (link->worker_started) {
+			os_cond_signal(&link->worker_cond); // flush / poll on the new connection
+		}
 	} else {
 		free(c); // init already finalised a half-made connection
 		link->state = IPC_CLIENT_SERVICE_LINK_FAILED;
 		link->retry_after_ns = os_monotonic_get_ns() + SERVICE_LINK_RETRY_NS;
+		if (link->worker_started) {
+			os_cond_signal(&link->worker_cond); // it schedules the retry
+		}
 		if (!link->warned_unavailable) {
 			link->warned_unavailable = true;
 			// Once until the next successful connect: the retries are quiet.
@@ -245,6 +257,9 @@ maybe_start_connect_locked(struct ipc_client_service_link *link)
 	link->thread_needs_join = true;
 }
 
+static void *
+share_worker_run(void *ptr);
+
 xrt_result_t
 ipc_client_service_link_create(const char *label, uint32_t caps, struct ipc_client_service_link **out_link)
 {
@@ -260,6 +275,20 @@ ipc_client_service_link_create(const char *label, uint32_t caps, struct ipc_clie
 	snprintf(link->label, sizeof(link->label), "%s", label != NULL ? label : "in-process");
 	link->caps = caps;
 	link->reg.caps = caps;
+	if ((caps & XRT_SHARE_LINK_CAP_SHARE) != 0) {
+		if (os_cond_init(&link->worker_cond) != 0) {
+			os_mutex_destroy(&link->mtx);
+			free(link);
+			return XRT_ERROR_ALLOCATION;
+		}
+		if (os_thread_init(&link->worker) == 0 && os_thread_start(&link->worker, share_worker_run, link) == 0) {
+			link->worker_started = true;
+		} else {
+			U_LOG_E(
+			    "[service-link] in-process: could not start the share worker; this session is not "
+			    "offered for sharing");
+		}
+	}
 	*out_link = link;
 	return XRT_SUCCESS;
 }
@@ -272,6 +301,20 @@ ipc_client_service_link_destroy(struct ipc_client_service_link **link_ptr)
 	}
 	struct ipc_client_service_link *link = *link_ptr;
 	*link_ptr = NULL;
+
+	// The share worker first: it may hold the connection for one call.
+	if (link->worker_started) {
+		os_mutex_lock(&link->mtx);
+		link->worker_stop = true;
+		os_cond_signal(&link->worker_cond);
+		os_mutex_unlock(&link->mtx);
+		os_thread_join(&link->worker);
+		os_thread_destroy(&link->worker);
+		link->worker_started = false;
+	}
+	if ((link->caps & XRT_SHARE_LINK_CAP_SHARE) != 0) {
+		os_cond_destroy(&link->worker_cond);
+	}
 
 	// An in-flight connect is bounded by the connect's own retry windows.
 	if (link->thread_needs_join) {
@@ -370,7 +413,11 @@ ipc_client_service_link_caps(const struct ipc_client_service_link *link)
 
 /*
  *
- * ADR-061: the share capability.
+ * ADR-061: the share capability. Every call an app / compositor thread makes
+ * here only takes the mutex; the share worker does the waiting on the
+ * service (connect + 5 s retry, registration, the 250 ms poll). Only
+ * frame_ready (one per published frame while a stream runs) and the ring
+ * publish run on the caller's thread, because they carry its frame.
  *
  */
 
@@ -381,59 +428,114 @@ link_shares(const struct ipc_client_service_link *link)
 }
 
 /*!
- * Send the newest registration on the current connection until what it
- * acknowledged catches up. Call WITHOUT the mutex. One sender at a time; a
- * concurrent change only bumps reg_seq and the running sender picks it up.
+ * Caller holds mtx. Does the session want the service to know about it? Only
+ * while it runs AND its compositor spoke (a tap, or a reason it has none):
+ * until then nothing would be listed that the user could act on, so no
+ * connection (no APP slot) is spent on it (review #2533 item 5).
  */
-static void
-reg_flush(struct ipc_client_service_link *link)
+static bool
+share_wants_connection_locked(const struct ipc_client_service_link *link)
 {
+	return link->reg.session_running != 0 &&
+	       (link->reg.tap_available != 0 || link->reg.tap_unavailable_reason != 0);
+}
+
+static bool
+reg_dirty_locked(const struct ipc_client_service_link *link)
+{
+	return link->reg_sent_gen != link->gen || link->reg_sent_seq != link->reg_seq;
+}
+
+static void *
+share_worker_run(void *ptr)
+{
+	struct ipc_client_service_link *link = (struct ipc_client_service_link *)ptr;
 	os_mutex_lock(&link->mtx);
-	if (link->reg_sending) {
-		os_mutex_unlock(&link->mtx);
-		return;
-	}
-	link->reg_sending = true;
-	while (link->state == IPC_CLIENT_SERVICE_LINK_CONNECTED && link->conn != NULL &&
-	       (link->reg_sent_gen != link->gen || link->reg_sent_seq != link->reg_seq)) {
-		struct xrt_share_link_registration reg = link->reg;
-		const uint64_t seq = link->reg_seq;
-		const uint32_t gen = link->gen;
-		struct ipc_connection *c = link->conn;
-		link->users++;
-		os_mutex_unlock(&link->mtx);
-		xrt_result_t xret = ipc_call_service_link_register(c, &reg);
-		ipc_client_service_link_release(link, gen, xret == XRT_ERROR_IPC_FAILURE);
-		os_mutex_lock(&link->mtx);
-		if (gen != link->gen) {
-			continue; // a new connection registers itself
+	while (!link->worker_stop) {
+		const uint64_t now = os_monotonic_get_ns();
+		const bool want = share_wants_connection_locked(link);
+		if (want && link->state != IPC_CLIENT_SERVICE_LINK_CONNECTED) {
+			// The documented retry: a FAILED link re-dials every 5 s, a DEAD one
+			// once its last user let go (maybe_start_connect_locked's rules).
+			maybe_start_connect_locked(link);
+		} else {
+			join_finished_locked(link);
+			reap_dead_locked(link);
 		}
-		link->reg_sent_gen = gen;
-		// A refusal is not retried on this connection (an older service).
-		link->reg_sent_seq = seq;
-		if (xret != XRT_SUCCESS) {
-			break;
+
+		const bool connected = link->state == IPC_CLIENT_SERVICE_LINK_CONNECTED && link->conn != NULL;
+		if (connected && reg_dirty_locked(link)) {
+			struct xrt_share_link_registration reg = link->reg;
+			const uint64_t seq = link->reg_seq;
+			const uint32_t gen = link->gen;
+			struct ipc_connection *c = link->conn;
+			link->users++;
+			os_mutex_unlock(&link->mtx);
+			xrt_result_t xret = ipc_call_service_link_register(c, &reg);
+			ipc_client_service_link_release(link, gen, xret == XRT_ERROR_IPC_FAILURE);
+			os_mutex_lock(&link->mtx);
+			if (gen == link->gen) {
+				link->reg_sent_gen = gen;
+				link->reg_sent_seq = seq; // a refusal is not retried on this connection
+				if (xret != XRT_SUCCESS && xret != XRT_ERROR_IPC_FAILURE) {
+					U_LOG_W(
+					    "[service-link] in-process: the service refused the share registration "
+					    "(%d)",
+					    (int)xret);
+				}
+			}
+			continue;
 		}
+		if (connected && link->reg.session_running != 0 && now >= link->next_poll_ns) {
+			const uint32_t gen = link->gen;
+			struct ipc_connection *c = link->conn;
+			link->users++;
+			link->next_poll_ns = now + SHARE_POLL_INTERVAL_NS;
+			os_mutex_unlock(&link->mtx);
+			struct xrt_share_link_poll p;
+			memset(&p, 0, sizeof(p));
+			xrt_result_t xret = ipc_call_service_link_share_poll(c, &p);
+			ipc_client_service_link_release(link, gen, xret == XRT_ERROR_IPC_FAILURE);
+			os_mutex_lock(&link->mtx);
+			if (xret == XRT_SUCCESS && gen == link->gen) {
+				u_share_link_poll_cache_merge(&link->poll, &p);
+			}
+			continue;
+		}
+
+		// Sleep until the next poll / retry is due, or something changed.
+		uint64_t wait_ns = SHARE_POLL_INTERVAL_NS;
+		if (want && link->state == IPC_CLIENT_SERVICE_LINK_FAILED && link->retry_after_ns > now) {
+			wait_ns = link->retry_after_ns - now;
+		} else if (want && link->state == IPC_CLIENT_SERVICE_LINK_CONNECTING) {
+			wait_ns = 50ull * 1000 * 1000; // the connect thread finishes on its own; look again soon
+		} else if (connected && link->next_poll_ns > now && link->reg.session_running != 0) {
+			wait_ns = link->next_poll_ns - now;
+		}
+		os_cond_wait_timeout_ns(&link->worker_cond, &link->mtx, wait_ns);
 	}
-	link->reg_sending = false;
 	os_mutex_unlock(&link->mtx);
+	return NULL;
+}
+
+//! Caller holds mtx.
+static void
+worker_wake_locked(struct ipc_client_service_link *link)
+{
+	if (link->worker_started) {
+		os_cond_signal(&link->worker_cond);
+	}
 }
 
 void
 ipc_client_service_link_kick(struct ipc_client_service_link *link)
 {
-	if (link == NULL) {
+	if (!link_shares(link)) {
 		return;
 	}
-	enum ipc_client_service_link_state state = IPC_CLIENT_SERVICE_LINK_CONNECTING;
-	uint32_t gen = 0;
-	struct ipc_connection *c = ipc_client_service_link_acquire(link, &state, &gen);
-	if (c != NULL) {
-		ipc_client_service_link_release(link, gen, false);
-	}
-	if (link_shares(link)) {
-		reg_flush(link);
-	}
+	os_mutex_lock(&link->mtx);
+	worker_wake_locked(link);
+	os_mutex_unlock(&link->mtx);
 }
 
 void
@@ -454,8 +556,8 @@ ipc_client_service_link_set_registration(struct ipc_client_service_link *link,
 	link->reg.luid_valid = keep.luid_valid;
 	memcpy(link->reg.luid, keep.luid, sizeof(link->reg.luid));
 	link->reg_seq++;
+	worker_wake_locked(link); // the worker sends it; this thread never waits on the service
 	os_mutex_unlock(&link->mtx);
-	reg_flush(link);
 }
 
 void
@@ -477,26 +579,18 @@ ipc_client_service_link_set_tap(struct ipc_client_service_link *link,
 		changed |= r->luid_valid == 0 || memcmp(r->luid, luid, XRT_LUID_SIZE) != 0;
 		memcpy(r->luid, luid, XRT_LUID_SIZE);
 		r->luid_valid = 1;
+	} else {
+		changed |= r->luid_valid != 0; // a stale adapter is cleared, not kept
+		memset(r->luid, 0, sizeof(r->luid));
+		r->luid_valid = 0;
 	}
 	r->tap_available = a;
 	r->tap_unavailable_reason = why;
 	if (changed) {
 		link->reg_seq++;
+		worker_wake_locked(link);
 	}
 	os_mutex_unlock(&link->mtx);
-	if (changed) {
-		reg_flush(link);
-	}
-}
-
-//! Caller holds mtx: what the cache says, consuming a one-shot SHARE_STOPPED.
-static void
-poll_from_cache_locked(struct ipc_client_service_link *link, struct xrt_share_link_poll *out)
-{
-	*out = link->poll;
-	if (link->poll.state == XRT_SHARE_LINK_STATE_SHARE_STOPPED) {
-		link->poll.state = XRT_SHARE_LINK_STATE_NONE;
-	}
 }
 
 bool
@@ -508,44 +602,11 @@ ipc_client_service_link_share_poll(struct ipc_client_service_link *link, struct 
 	if (!link_shares(link) || out == NULL) {
 		return false;
 	}
-	os_mutex_lock(&link->mtx);
-	const bool connected = link->state == IPC_CLIENT_SERVICE_LINK_CONNECTED && link->conn != NULL;
-	const bool dirty = link->reg_sent_gen != link->gen || link->reg_sent_seq != link->reg_seq;
-	if (!connected) {
-		os_mutex_unlock(&link->mtx);
-		return false;
-	}
-	const uint64_t now = os_monotonic_get_ns();
-	if (link->poll_valid && now < link->next_poll_ns) {
-		poll_from_cache_locked(link, out);
-		os_mutex_unlock(&link->mtx);
-		return true;
-	}
-	struct ipc_connection *c = link->conn;
-	const uint32_t gen = link->gen;
-	link->users++;
-	link->next_poll_ns = now + SHARE_POLL_INTERVAL_NS;
-	os_mutex_unlock(&link->mtx);
-
-	if (dirty) {
-		reg_flush(link);
-	}
-	struct xrt_share_link_poll p;
-	memset(&p, 0, sizeof(p));
-	xrt_result_t xret = ipc_call_service_link_share_poll(c, &p);
-	ipc_client_service_link_release(link, gen, xret == XRT_ERROR_IPC_FAILURE);
-
+	// Never an IPC call: the worker polls; this reads its newest answer.
 	os_mutex_lock(&link->mtx);
 	bool ok = false;
-	if (xret == XRT_SUCCESS && gen == link->gen) {
-		// A one-shot STOPPED is never lost to a later NONE before it was read.
-		if (!(link->poll_valid && link->poll.state == XRT_SHARE_LINK_STATE_SHARE_STOPPED &&
-		      p.state == XRT_SHARE_LINK_STATE_NONE)) {
-			link->poll = p;
-		}
-		link->poll_valid = true;
-		poll_from_cache_locked(link, out);
-		ok = true;
+	if (link->state == IPC_CLIENT_SERVICE_LINK_CONNECTED && link->conn != NULL) {
+		ok = u_share_link_poll_cache_take(&link->poll, out);
 	}
 	os_mutex_unlock(&link->mtx);
 	return ok;
@@ -582,10 +643,15 @@ ipc_client_service_link_share_publish_ring(struct ipc_client_service_link *link,
 	if (c == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	xrt_result_t xret = ipc_call_service_link_share_publish_ring(c, desc, textures, texture_count);
-	if (xret == XRT_SUCCESS && xrt_graphics_sync_handle_is_valid(fence)) {
-		xret = ipc_call_service_link_share_publish_fence(c, desc->generation, &fence, 1);
+	struct xrt_share_link_ring_desc d = *desc;
+	d.has_fence = xrt_graphics_sync_handle_is_valid(fence) ? 1u : 0u;
+	xrt_result_t xret = ipc_call_service_link_share_publish_ring(c, &d, textures, texture_count);
+	if (xret == XRT_SUCCESS && d.has_fence != 0) {
+		// A failure here leaves the ring waiting for a fence that never comes:
+		// the service time-boxes that and ends the share (SHARE_STOPPED).
+		xret = ipc_call_service_link_share_publish_fence(c, d.generation, &fence, 1);
 	}
+	// Only a dead pipe kills the link; a refusal is just reported.
 	ipc_client_service_link_release(link, gen, xret == XRT_ERROR_IPC_FAILURE);
 	return xret;
 }
@@ -610,17 +676,15 @@ ipc_client_service_link_share_frame_ready(struct ipc_client_service_link *link,
 	memset(&p, 0, sizeof(p));
 	xrt_result_t xret = ipc_call_service_link_share_frame_ready(c, frame, &p);
 	ipc_client_service_link_release(link, gen, xret == XRT_ERROR_IPC_FAILURE);
-	if (xret == XRT_SUCCESS) {
-		os_mutex_lock(&link->mtx);
-		if (gen == link->gen) {
-			link->poll = p;
-			link->poll_valid = true;
-			link->next_poll_ns = os_monotonic_get_ns() + SHARE_POLL_INTERVAL_NS;
-		}
-		os_mutex_unlock(&link->mtx);
-		if (out_poll != NULL) {
-			*out_poll = p;
-		}
+	os_mutex_lock(&link->mtx);
+	if (xret == XRT_SUCCESS && gen == link->gen) {
+		u_share_link_poll_cache_merge(&link->poll, &p);
+		link->next_poll_ns = os_monotonic_get_ns() + SHARE_POLL_INTERVAL_NS;
 	}
+	if (out_poll != NULL) {
+		// The same single-report rule as the poll: a STOPPED is taken here once.
+		(void)u_share_link_poll_cache_take(&link->poll, out_poll);
+	}
+	os_mutex_unlock(&link->mtx);
 	return xret;
 }

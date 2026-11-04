@@ -145,8 +145,8 @@ struct xrt_share_link_poll
  * `service_link_share_publish_ring`: the app's ring, sent with its
  * @ref XRT_SHARE_LINK_RING_SLOTS NT-shared textures (Windows; no handles for
  * the fake / test rings). The ring's shared fence follows in
- * `service_link_share_publish_fence` with the same @ref generation; the ring
- * is imported once both arrived.
+ * `service_link_share_publish_fence` with the same @ref generation when
+ * @ref has_fence says so; the ring is imported once both arrived.
  *
  * Each slot texture is @ref slot_width x @ref slot_height: the left view in
  * the left half, the right view in the right half, each at
@@ -168,6 +168,15 @@ struct xrt_share_link_ring_desc
 	uint32_t flip_y;             //!< the views are bottom-up (atlas_flip_y)
 	uint32_t encoding_is_linear; //!< the texels are LINEAR, encode them (ADR-044)
 	uint32_t slot_count;         //!< XRT_SHARE_LINK_RING_SLOTS (0 = withdraw the ring)
+	/*!
+	 * A `service_link_share_publish_fence` of this generation follows; the
+	 * service imports the ring once it arrived (time-boxed — a fence that
+	 * never comes ends the share). 0 = no fence: imported at once (frames are
+	 * then read as complete when frame_ready arrives). The client link sets
+	 * it from the fence it is given.
+	 */
+	uint32_t has_fence;
+	uint32_t reserved;
 };
 
 /*!

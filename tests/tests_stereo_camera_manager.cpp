@@ -1967,3 +1967,173 @@ TEST_CASE("app share link: the DXR_APP_SHARE_FAKE=link registrant end to end",
 	scm_stream_destroy(f, sid);
 	scm_destroy(f);
 }
+
+namespace {
+
+//! One started share of a fresh link in slot 1; returns the stream id and the stream generation.
+uint64_t
+link_started(scm_fixture *f, uint32_t client_id, const char *name, uint32_t *out_sg)
+{
+	scm_link_connect(f, 1, client_id, kLinkPid + client_id, XRT_CLIENT_CLASS_APP);
+	auto r = link_reg(name);
+	REQUIRE(scm_link_register(f, 1, &r) == XRT_SUCCESS);
+	scm_rescan_apps(f);
+	auto v = listing(f);
+	REQUIRE(v.size() == 1);
+	uint64_t sid = 0;
+	auto req = share_req(v[0].camera_id);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	xrt_stereo_camera_stream_layout lay;
+	REQUIRE(scm_stream_map(f, sid, &lay) == XRT_SUCCESS);
+	xrt_share_link_poll p = {};
+	REQUIRE(link_wait_state(f, 1, XRT_SHARE_LINK_STATE_SHARE_REQUESTED, &p));
+	*out_sg = p.stream_generation;
+	xrt_stereo_camera_event ev;
+	while (scm_poll_event(f, &ev)) {
+	}
+	return sid;
+}
+
+//! The share ended SOURCE_LOST and the app heard SHARE_STOPPED.
+void
+check_share_failed(scm_fixture *f, uint64_t sid)
+{
+	xrt_share_link_poll p = {};
+	CHECK(link_wait_state(f, 1, XRT_SHARE_LINK_STATE_SHARE_STOPPED, &p, 6000));
+	bool lost = false;
+	xrt_stereo_camera_event ev;
+	while (scm_poll_event(f, &ev)) {
+		lost |= ev.kind == XRT_STEREO_CAMERA_EVENT_STREAM_ENDED && ev.stream_id == sid &&
+		        ev.value == XRT_STEREO_CAMERA_END_SOURCE_LOST;
+	}
+	CHECK(lost);
+	bool ready = false;
+	xrt_stereo_camera_frame_info fi;
+	const uint8_t *slot = nullptr;
+	CHECK(scm_acquire(f, sid, &ready, &fi, &slot) == XRT_ERROR_STEREO_CAMERA_STREAM_ENDED);
+}
+
+scm_fixture *
+link_fixture()
+{
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	scm_app_options o = {};
+	o.dev = 1;
+	o.fake = -1;
+	o.consumer_sees_apps = true;
+	return scm_create_apps(&o);
+}
+
+} // namespace
+
+TEST_CASE("app share link: a ring needs one texture per slot; a declared fence is awaited",
+          "[stereo_camera_manager][app_share_link]")
+{
+	scm_set_link_importer(true, nullptr);
+	scm_fixture *f = link_fixture();
+	REQUIRE(f != nullptr);
+	uint32_t sg = 0;
+	const uint64_t sid = link_started(f, 401, "Fenced App", &sg);
+
+	// No textures for a 3-slot ring from a real app: refused, nothing imported.
+	auto bare = link_ring(1, sg, 1280, 720);
+	CHECK(scm_link_publish_ring_n(f, 1, &bare, 0) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
+	CHECK(scm_link_publish_ring_n(f, 1, &bare, 2) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
+	os_nanosleep(150ll * 1000 * 1000);
+	CHECK(scm_link_imports() == 0);
+
+	// A ring that declares its fence is imported only with it, and the importer gets it.
+	auto fenced = link_ring(2, sg, 1280, 720);
+	fenced.has_fence = 1;
+	REQUIRE(scm_link_publish_ring(f, 1, &fenced) == XRT_SUCCESS);
+	os_nanosleep(200ll * 1000 * 1000);
+	CHECK(scm_link_imports() == 0); // still waiting for the fence
+	REQUIRE(scm_link_publish_fence(f, 1, 2) == XRT_SUCCESS);
+	CHECK(link_pump(f, 1, sid, 2, 1, 3) == 3);
+	CHECK(scm_link_imports() == 1);
+	CHECK(scm_link_last_import_texture_count() == XRT_SHARE_LINK_RING_SLOTS);
+	CHECK(scm_link_last_import_had_fence());
+
+	// A declared fence that never comes: the share ends loudly, not an endless wait.
+	auto orphan = link_ring(3, sg, 1280, 720);
+	orphan.has_fence = 1;
+	REQUIRE(scm_link_publish_ring(f, 1, &orphan) == XRT_SUCCESS);
+	check_share_failed(f, sid);
+	CHECK(scm_link_imports() == 1);
+	scm_stream_destroy(f, sid);
+	scm_link_disconnect(f, 1);
+	scm_destroy(f);
+	CHECK(scm_link_live_imports() == 0);
+	scm_set_link_importer(false, nullptr);
+}
+
+TEST_CASE("app share link: a failed import ends the share SOURCE_LOST and tells the app",
+          "[stereo_camera_manager][app_share_link]")
+{
+	scm_set_link_importer(true, nullptr);
+	scm_set_link_import_fails(true);
+	scm_fixture *f = link_fixture();
+	REQUIRE(f != nullptr);
+	uint32_t sg = 0;
+	const uint64_t sid = link_started(f, 402, "Broken Ring", &sg);
+	auto ring = link_ring(1, sg, 1280, 720);
+	REQUIRE(scm_link_publish_ring(f, 1, &ring) == XRT_SUCCESS);
+	check_share_failed(f, sid);
+	CHECK(scm_link_imports() == 0);
+	CHECK(scm_link_last_import_texture_count() == XRT_SHARE_LINK_RING_SLOTS); // handed over, and closed
+	scm_stream_destroy(f, sid);
+	scm_link_disconnect(f, 1);
+	scm_destroy(f);
+	scm_set_link_importer(false, nullptr);
+}
+
+TEST_CASE("app share link: logical refusals are never a dead pipe", "[stereo_camera_manager][app_share_link]")
+{
+	scm_set_link_importer(true, nullptr);
+	scm_fixture *f = link_fixture();
+	REQUIRE(f != nullptr);
+	// A connection that never registered a share link (a lift-only link).
+	scm_link_connect(f, 1, 501, kLinkPid + 501, XRT_CLIENT_CLASS_APP);
+	xrt_share_link_frame fr = {};
+	xrt_share_link_poll p = {};
+	CHECK(scm_link_frame_ready(f, 1, &fr, &p) == XRT_ERROR_OUTPUT_REQUEST_FAILURE);
+	CHECK(p.state == XRT_SHARE_LINK_STATE_NONE);
+	auto ring = link_ring(1, 1, 64, 64);
+	CHECK(scm_link_publish_ring(f, 1, &ring) == XRT_ERROR_OUTPUT_REQUEST_FAILURE);
+	CHECK(scm_link_publish_fence(f, 1, 1) == XRT_ERROR_OUTPUT_REQUEST_FAILURE);
+	REQUIRE(scm_link_poll(f, 1, &p) == XRT_SUCCESS);
+	CHECK(p.state == XRT_SHARE_LINK_STATE_NONE);
+
+	// The link table full: a refusal with its own code.
+	auto r = link_reg("Many");
+	xrt_result_t xret = XRT_SUCCESS;
+	uint32_t ok = 0;
+	for (uint32_t id = 600; id < 600 + 64 && xret == XRT_SUCCESS; id++) {
+		scm_link_register_as(f, 1, id, &r, &xret);
+		ok += xret == XRT_SUCCESS ? 1u : 0u;
+	}
+	CHECK(xret == XRT_ERROR_CLIENT_LIMIT_REACHED);
+	CHECK(ok >= 32);
+	scm_destroy(f); // frees every registered link
+	scm_set_link_importer(false, nullptr);
+}
+
+TEST_CASE("app share link: an incomplete ring hook table is refused whole", "[stereo_camera_manager][app_share_link]")
+{
+	scm_set_link_partial_hooks();
+	scm_fixture *f = link_fixture();
+	REQUIRE(f != nullptr);
+	scm_link_connect(f, 1, 701, kLinkPid + 701, XRT_CLIENT_CLASS_APP);
+	auto r = link_reg("Half Hooks");
+	REQUIRE(scm_link_register(f, 1, &r) == XRT_SUCCESS);
+	scm_rescan_apps(f);
+	auto v = listing(f);
+	REQUIRE(v.size() == 1);
+	xrt_app_share_source_info ai;
+	REQUIRE(scm_app_source(f, v[0].camera_id, &ai) == XRT_SUCCESS);
+	CHECK(ai.availability == XRT_APP_SHARE_UNAVAILABLE_NO_TAP); // never imported, never leaked
+	scm_link_disconnect(f, 1);
+	scm_destroy(f);
+	scm_set_link_importer(false, nullptr);
+}

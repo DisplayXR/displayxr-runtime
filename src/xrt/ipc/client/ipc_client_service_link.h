@@ -17,10 +17,14 @@
  *
  *  - LIFT only: exactly the ADR-049 lift link. It opens on the first lift
  *    call, sends the conversion prewarm hint, and never registers.
- *  - SHARE (with or without LIFT): it is opened at xrBeginSession
- *    (ipc_client_service_link_kick) and registers itself
- *    (`service_link_register`) on every connect and whenever the registration
- *    changes; the compositor's share tap then polls it and publishes frames.
+ *  - SHARE (with or without LIFT): a share WORKER thread owns everything that
+ *    waits on the service for the share capability — it dials once the
+ *    session runs AND its compositor reported a tap (or a reason it has
+ *    none), retries a failed dial every 5 s, sends the registration
+ *    (`service_link_register`) on every connect and change, and polls every
+ *    250 ms. The app's API thread and the compositor's per-frame poll only
+ *    take a mutex; only frame_ready and the ring publish (which carry the
+ *    compositor's frame) run on the caller's thread.
  *
  * The link never blocks the caller on the connect: the first use starts a
  * background connect (a pipe open, the version-tag handshake, at worst the
@@ -131,17 +135,15 @@ ipc_client_service_link_release(struct ipc_client_service_link *link, uint32_t g
  */
 
 /*!
- * Start the background connect if none is in flight and one is due, and flush
- * a pending registration. Never blocks on the connect. What xrBeginSession
- * calls on a sharing session.
+ * Wake the share worker (it connects when the session runs and the compositor
+ * reported its tap state). Never blocks. What xrBeginSession calls.
  */
 void
 ipc_client_service_link_kick(struct ipc_client_service_link *link);
 
 /*!
- * Replace the registration (`service_link_register`). The link always sends
- * the newest one: now, from the calling thread, when connected (one IPC round
- * trip — never call per frame), else right after the next connect.
+ * Replace the registration (`service_link_register`). The share worker sends
+ * the newest one (this call never waits on the service).
  * @ref xrt_share_link_registration::caps is overwritten with the link's.
  */
 void
@@ -150,7 +152,8 @@ ipc_client_service_link_set_registration(struct ipc_client_service_link *link,
 
 /*!
  * The compositor's tap flag and adapter (comp_xbridge_share_tap.h), merged
- * into the registration; re-sent only when they changed.
+ * into the registration; re-sent (by the worker) only when they changed.
+ * @p luid_valid false clears a previously reported adapter.
  * @p unavailable_reason: enum xrt_app_share_availability when not available.
  */
 void
@@ -161,13 +164,10 @@ ipc_client_service_link_set_tap(struct ipc_client_service_link *link,
                                 bool luid_valid);
 
 /*!
- * What the service asks of this link. Cheap enough to call every frame: it
- * makes the IPC round trip (`service_link_share_poll`) at most every 250 ms
- * and otherwise returns the cached answer, which every
- * ipc_client_service_link_share_frame_ready() reply also refreshes — so a
- * sharing client costs one call per published frame and an idle one four
- * small calls a second at most, none while the link is not connected.
- * SHARE_STOPPED is reported once, then NONE.
+ * What the service asks of this link — the newest answer the worker's
+ * 250 ms poll or a frame_ready reply brought, read under a mutex: never an
+ * IPC call, safe every frame. SHARE_STOPPED is reported exactly once across
+ * this call and frame_ready's @p out_poll, then NONE.
  *
  * @return true if @p out is valid (connected, registered); false = NONE.
  */
@@ -176,7 +176,8 @@ ipc_client_service_link_share_poll(struct ipc_client_service_link *link, struct 
 
 /*!
  * Publish the ring (`service_link_share_publish_ring`, then
- * `service_link_share_publish_fence` when @p fence is valid). @p textures:
+ * `service_link_share_publish_fence` when @p fence is valid — the ring's
+ * `has_fence` is set from it). @p textures:
  * @p texture_count (0 or XRT_SHARE_LINK_RING_SLOTS) shared handles the
  * caller keeps owning — the transport duplicates them into the service.
  */
@@ -189,7 +190,9 @@ ipc_client_service_link_share_publish_ring(struct ipc_client_service_link *link,
 
 /*!
  * One finished frame (`service_link_share_frame_ready`). @p out_poll (may be
- * NULL): the service's answer, the same as a poll would give.
+ * NULL): the service's answer, under the same single-report rule as the
+ * poll. Only XRT_ERROR_IPC_FAILURE (a dead pipe) affects the link; a
+ * refusal (XRT_ERROR_OUTPUT_REQUEST_FAILURE, …) is just returned.
  */
 xrt_result_t
 ipc_client_service_link_share_frame_ready(struct ipc_client_service_link *link,

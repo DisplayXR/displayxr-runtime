@@ -8,13 +8,15 @@
  * @ingroup oxr_main
  *
  * While sharing is on (DXR_APP_SHARE != 0 in the app's environment, the
- * default), an in-process session opens its service link at xrBeginSession
- * (in the background, never launching the service), registers itself as a
- * share source, and installs the link as the process's share sink
- * (util/u_share_link.h) so its compositor's share tap reaches it. xrEndSession
- * re-registers "not running" (the service stops listing it) and removes the
- * sink; the link itself lives until the session is destroyed, because the
- * session's lift streams may still ride it.
+ * default) and the session is one a tap can serve (Windows D3D11 / D3D12 /
+ * Vulkan in-process), xrBeginSession hands the link its "running"
+ * registration and installs it as the process's share sink
+ * (util/u_share_link.h) so its compositor's share tap reaches it. Nothing here
+ * waits on the service: the link's worker dials (once the compositor reported
+ * its tap state), registers and polls. xrEndSession re-registers "not
+ * running" (the service stops listing it) and removes the sink; the link
+ * itself lives until the session is destroyed, because the session's lift
+ * streams may still ride it.
  */
 
 #include "oxr_objects.h"
@@ -82,7 +84,7 @@ oxr_service_link_session_begin(struct oxr_session *sess)
 		u_share_link_install(&k_sink, link);
 		sess->share_sink_installed = true;
 	}
-	// Background connect; the registration goes out once it is up.
+	// The worker connects / registers in the background; this never blocks.
 	ipc_client_service_link_kick(link);
 	U_LOG_I("app share: in-process session offered for sharing over its service link%s",
 	        sess->app_share_opt_out ? " (opted out: registered, never listed)" : "");

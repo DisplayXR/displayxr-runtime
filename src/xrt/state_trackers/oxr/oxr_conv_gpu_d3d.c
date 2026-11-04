@@ -139,15 +139,26 @@ link_cas(struct ipc_client_service_link **p,
 }
 #endif
 
+#if defined(XRT_OS_WINDOWS)
 // ADR-061: the client-side read of the service's own kill switch, so an
 // opted-out machine's apps never open a link just to share.
 DEBUG_GET_ONCE_BOOL_OPTION(app_share_link, "DXR_APP_SHARE", true)
+#endif
 
 bool
 oxr_service_link_share_wanted(struct oxr_session *sess)
 {
-#if defined(OXR_CONV_HAVE_LINK)
-	return sess != NULL && session_is_inprocess(sess) && debug_get_bool_option_app_share_link();
+#if defined(XRT_OS_WINDOWS)
+	// Only where a tap can exist: the D3D11 fill arm (comp_xbridge_share_tap.h)
+	// that the D3D11, D3D12 and Vulkan in-process tiers feed. GL has none; nor
+	// has macOS / Linux in v1 — those never dial the service to share (an APP
+	// slot of IPC_MAX_CLIENTS each, and a socket activation on Linux, for
+	// nothing; review #2533 item 5). Even here the link dials only once the
+	// compositor reported its tap state (ipc_client_service_link.c).
+	return sess != NULL &&
+	       (sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor ||
+	        sess->is_vk_native_compositor) &&
+	       debug_get_bool_option_app_share_link();
 #else
 	(void)sess;
 	return false;
