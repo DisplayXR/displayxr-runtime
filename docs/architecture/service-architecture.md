@@ -355,6 +355,7 @@ per call site from three client-controlled signals (§4.1). This table is what t
 | **MCP adapter / voice** | not OpenXR clients | per-app / shell pipes | — | 0 | — | unaffected |
 | **Input providers, vendor DP** | in-process DLLs | — | — | 0 | roles via the arbiter (`target_input_arbiter.c`) | **they are the service** |
 | **Unity/Unreal under the shell** | env → IPC | ordinary slot | tile | 1 | — | `INSTANCE_LOST` |
+| **In-process session's service link** (ADR-049 + Amendment 1, ADR-061 arm 2) | in-process app, a second **sessionless** `APP` connection `<exe> (in-process)` (`ipc_client_service_link.c`): on the first lift call, or at `xrBeginSession` while sharing is on (`DXR_APP_SHARE`, default on) | `service_link_register {caps lift/share, …}` (share links only); listed by the camera manager as `SOURCE_APP_LINK` | none of its own: lift calls; when shared, a 3-texture NT ring + fence published once, then one `service_link_share_frame_ready` per frame | 1 per in-process session that lifts **or** shares (never 2) | none | the app's session is unaffected; lift streams / the share are lost, the link reconnects |
 
 ### 2.3 Slot arithmetic against the target scenario
 

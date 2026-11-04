@@ -214,3 +214,18 @@ session's pre-weave views as a share source. Two such connections per session wo
   finds it already connected. With sharing off, it opens on the first lift call, as before.
 - Consequence "an extra sessionless `APP` connection per lifting in-process session" now reads
   "per in-process session that lifts **or** shares" — still one, never two.
+
+**As built (2026-11-03, portable half of ADR-061 arm 2).** `ipc_client_lift_link` is renamed
+`ipc_client_service_link` with no aliases (nothing outside this repository links the IPC client);
+its capabilities (`XRT_SHARE_LINK_CAP_LIFT` / `_SHARE`, `xrt/xrt_share_link.h`) are fixed when the
+link is created: LIFT when the instance enabled `XR_DXR_lift`, SHARE when the session is
+in-process and `DXR_APP_SHARE` is not `0` in the **app's** environment (read client-side too, so an
+opted-out machine's apps never open a link just to share). A LIFT-only link is byte-for-byte the
+link above: lazy, prewarm hint on connect, no registration. A SHARE link is opened at
+`xrBeginSession` (`oxr_service_link.c`), sends `service_link_register` on every connect and again
+on any change (`xrEndSession` sends "not running"), and carries the share messages. The names
+differ from ADR-061 decision 12's sketch (`share_link_*`): the wire set is
+`service_link_register`, `service_link_share_poll`, `service_link_share_publish_ring`,
+`service_link_share_publish_fence` (the fence travels on its own message because a message carries
+one handle type) and `service_link_share_frame_ready`, whose reply is the poll state so a sharing
+client needs no separate poll. The app's log lines now read `[service-link] …`.

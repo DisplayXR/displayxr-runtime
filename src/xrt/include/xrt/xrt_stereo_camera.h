@@ -113,8 +113,8 @@ enum xrt_stereo_camera_source
 	//! service compositor (or the service-side synthetic DXR_APP_SHARE_FAKE).
 	XRT_STEREO_CAMERA_SOURCE_APP = 2,
 	//! ADR-061 decision 9: an IN-PROCESS app's pre-weave views over its
-	//! in-process service link (ipc_client_service_link, ADR-049 Amendment 1;
-	//! P2 — never listed by this build).
+	//! in-process service link (ipc_client_service_link, ADR-049 Amendment 1),
+	//! imported through the platform's share_link_* hooks.
 	XRT_STEREO_CAMERA_SOURCE_APP_LINK = 3,
 };
 
@@ -141,7 +141,7 @@ enum xrt_app_share_availability
 	XRT_APP_SHARE_UNAVAILABLE_LEGACY_STANDALONE = 7,
 	//! The app renders on another adapter than the one the service publishes.
 	XRT_APP_SHARE_UNAVAILABLE_OTHER_ADAPTER = 8,
-	//! An in-process app over its service link: the share capability is not implemented yet (P2).
+	//! Reserved (was: the in-process share capability not implemented); not reported by this build.
 	XRT_APP_SHARE_UNAVAILABLE_LINK_NOT_READY = 9,
 	//! The platform tap declined for a reason of its own.
 	XRT_APP_SHARE_UNAVAILABLE_OTHER = 10,
