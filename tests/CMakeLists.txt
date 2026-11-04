@@ -146,6 +146,7 @@ set(tests
     tests_m_matrix_projection
     tests_stereo_camera
     tests_camera_consent
+    tests_share_link
     tests_stereo_rectify
     tests_stereo_vrefine
     tests_stereo_uvc
@@ -467,6 +468,11 @@ foreach(testname ${tests})
 endforeach()
 
 # For tests that require more than just aux_util, link those other libs down here.
+
+# ADR-061 arm 2: the compositor share tap's hook surface over util/u_share_link,
+# compiled straight in (portable C) so the test does not need the compositor module.
+target_sources(tests_share_link PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/xbridge/comp_xbridge_share_tap.c)
+target_include_directories(tests_share_link PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/xbridge)
 
 target_include_directories(tests_oxr_session_window_binding PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
 

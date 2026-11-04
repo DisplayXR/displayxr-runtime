@@ -10,6 +10,7 @@
 
 #include "xrt/xrt_stereo_camera.h"
 #include "util/u_stereo_uvc.h"
+#include "xrt/xrt_share_link.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -142,6 +143,7 @@ struct scm_app_options
 	int32_t linger_ms;   //!< 0 = 10 s
 	int32_t prompt_mode; //!< 1 = always, 2 = per-app-run
 	bool consumer_sees_apps; //!< the consumer enabled XR_DXR_app_share
+	int32_t fake_link;       //!< DXR_APP_SHARE_FAKE=link: > 0 on, < 0 off (0 = off here)
 };
 
 struct scm_fixture *
@@ -194,6 +196,53 @@ scm_tap_releases(void);
 //! What the service calls when a session is created / begun / ended.
 void
 scm_apps_changed(struct scm_fixture *f);
+
+/*
+ * ADR-061 arm 2: in-process service links, driven through their IPC handlers
+ * (service_link_*) on a sessionless connection in server slot @p slot.
+ */
+
+//! A sessionless connection (an in-process app's service link) in slot @p slot.
+void
+scm_link_connect(struct scm_fixture *f, uint32_t slot, uint32_t client_id, long pid, uint32_t cls);
+
+xrt_result_t
+scm_link_register(struct scm_fixture *f, uint32_t slot, const struct xrt_share_link_registration *reg);
+
+xrt_result_t
+scm_link_poll(struct scm_fixture *f, uint32_t slot, struct xrt_share_link_poll *out);
+
+//! A ring with no handles (the fake importer below needs none).
+xrt_result_t
+scm_link_publish_ring(struct scm_fixture *f, uint32_t slot, const struct xrt_share_link_ring_desc *desc);
+
+xrt_result_t
+scm_link_frame_ready(struct scm_fixture *f,
+                     uint32_t slot,
+                     const struct xrt_share_link_frame *frame,
+                     struct xrt_share_link_poll *out);
+
+//! The link's connection closes (what the service does at client teardown).
+void
+scm_link_disconnect(struct scm_fixture *f, uint32_t slot);
+
+/*!
+ * A fake ring importer (the share_link_* platform hooks): frames come from the
+ * synthetic pattern at the stream extent, metadata from the frame_ready.
+ * @p service_luid: the adapter the service "publishes" (NULL = unknown).
+ * false clears the platform hooks.
+ */
+void
+scm_set_link_importer(bool enabled, const uint8_t *service_luid);
+
+int
+scm_link_imports(void); //!< successful imports so far
+int
+scm_link_live_imports(void); //!< imports not yet unimported
+uint32_t
+scm_link_last_import_generation(void);
+uint32_t
+scm_link_last_import_slot_width(void);
 
 uint32_t
 scm_stop_all(void);
