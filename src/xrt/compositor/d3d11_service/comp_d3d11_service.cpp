@@ -31607,6 +31607,43 @@ weave_seg_publish(struct d3d11_service_compositor *c,
 }
 
 /*!
+ * The session whose windowless weave DP weaves @p c's window, for a drag snap.
+ *
+ * ADR-060 R2 moved a present-owner's weave off the panel DP onto its own
+ * windowless DP. A present-owner can hold two sessions on one window: the
+ * browser's GPU process weaves, and its browser process only snaps, from the
+ * window's message loop. The lens and viewing distance a snap needs live on the
+ * weaver that weaves, so the snap session has to find that one. The panel DP
+ * has not woven this window and can only decline.
+ *
+ * Returns @p c itself when it weaves windowless, the sibling on the same window
+ * that does, or NULL when the window is not woven windowless (the panel DP's
+ * job, as before R2).
+ *
+ * Holding render_mutex.
+ */
+static struct d3d11_service_compositor *
+svc_weave_snap_owner(struct d3d11_service_compositor *c)
+{
+	if (c->render.weave_dp_windowless && c->render.weave_dp != nullptr) {
+		return c;
+	}
+	HWND wnd = c->render.weave_hwnd;
+	struct d3d11_multi_compositor *mc = c->sys->multi_comp;
+	if (wnd == nullptr || mc == nullptr) {
+		return nullptr;
+	}
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		struct d3d11_service_compositor *o = mc->clients[i].compositor;
+		if (o != nullptr && o != c && o->render.weave_hwnd == wnd && o->render.weave_dp_windowless &&
+		    o->render.weave_dp != nullptr) {
+			return o;
+		}
+	}
+	return nullptr;
+}
+
+/*!
  * The display processor whose lattice a drag snap of the present-owner's
  * window uses (#1884): the majority screen's segment DP at the PROPOSED
  * position, with the handle owner's hysteresis — NULL for the primary screen
@@ -33096,13 +33133,23 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
 	// weave_hwnd, so the snap is against the right window.
 	struct xrt_display_processor_d3d11 *sdp = panel_dp(c->sys, c);
 
+	// ADR-060 R2: a windowless weave DP is what actually weaves this window, on
+	// this session or on a sibling session bound to the same window, so that
+	// weaver answers. The panel DP has no viewing distance for it and declines,
+	// which leaves the window on raw drag positions (visible 3D judder).
+	struct d3d11_service_compositor *owner = svc_weave_snap_owner(c);
+	if (owner != nullptr) {
+		sdp = owner->render.weave_dp;
+	}
+
 	// #1884 (ADR-047 Amendment 4): a present-owner whose window is woven per
 	// screen snaps to the lattice of the screen holding the majority of the
 	// window at the proposed position (the handle owner's hysteresis, so a
 	// drag across the seam does not flip lattices under the cursor). That
 	// screen's segment DP answers; a DP without snap support falls back to the
 	// panel DP below, which is the pre-#1884 answer.
-	struct xrt_display_processor_d3d11 *seg_dp = weave_seg_snap_dp(c, target_x, target_y);
+	struct d3d11_service_compositor *seg_owner = owner != nullptr ? owner : c;
+	struct xrt_display_processor_d3d11 *seg_dp = weave_seg_snap_dp(seg_owner, target_x, target_y);
 	if (seg_dp != nullptr) {
 		int32_t gx = target_x, gy = target_y;
 		if (xrt_display_processor_d3d11_snap_window_rect(seg_dp, origin_x, origin_y, target_x, target_y, &gx,
