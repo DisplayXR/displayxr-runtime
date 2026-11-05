@@ -11,6 +11,12 @@
 
 //! SHA-256 of the DisplayXR Browser's release signing certificate (public).
 #define U_CAMERA_CONSENT_ANDROID_BROWSER_CERT "d52153793c7a403f3cd733032ed43314f26a7748f6d5c0a2b5e12847ff0df5b2"
+//! SHA-256 of the certificate the DisplayXR Browser's own Android build lane
+//! (displayxr-browser-pvt `build-box-android.yml`) signs every CI artifact with.
+//! Read from the `browser-android-apk` artifact of run 41879465529 (Chromium
+//! 156.0.8078.80, source 0305906a). A tablet carrying a CI build instead of a
+//! release used to lose the "3D Camera" with no prompt at all (2026-11-04).
+#define U_CAMERA_CONSENT_ANDROID_BROWSER_CI_CERT "32a2fc74d731105859e5a85df16d95f102d85b22099b8064c5d8915c61dad1e0"
 
 #include <stdio.h>
 #include <string.h>
@@ -31,6 +37,16 @@ static const struct u_camera_consent_android_trusted k_builtin[] = {
         .package = "org.chromium.chrome",
         .cert_sha256 = U_CAMERA_CONSENT_ANDROID_BROWSER_CERT,
         .what = "DisplayXR Browser (release signing certificate)",
+    },
+    {
+        // The same browser as its own build lane signs it: the artifact every
+        // dev / test tablet gets between releases. Same package, same
+        // per-origin prompt and indicator; a different signer. The list
+        // matches an entry as package AND digest, so this is a second
+        // allowed signer for org.chromium.chrome, not a package-only rule.
+        .package = "org.chromium.chrome",
+        .cert_sha256 = U_CAMERA_CONSENT_ANDROID_BROWSER_CI_CERT,
+        .what = "DisplayXR Browser (build-lane CI signing certificate)",
     },
 };
 
