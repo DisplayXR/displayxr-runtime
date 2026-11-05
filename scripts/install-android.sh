@@ -239,6 +239,30 @@ else
     echo "      Grant by hand: adb shell appops set $PKG SYSTEM_ALERT_WINDOW allow" >&2
 fi
 
+# ---- 3b. the runtime's OWN runtime permissions ---------------------------------
+# A fresh install (and every reinstall under a different signer) leaves the
+# runtime without android.permission.CAMERA. Without it the camera service hides
+# the vendor calibration keys, the plug-in reads "factory block MISSING" and
+# advertises the stereo pairs as uncalibrated (flags without CALIBRATED /
+# RECTIFIABLE), and the DisplayXR Browser lists NO 3D camera at all — silently
+# (NP02J, 2026-11-04: a hand `adb install` of the runtime cost a whole evening).
+# Grant it here and VERIFY, because a `pm grant` can fail quietly on OEM builds.
+echo
+echo ">> [3b] granting CAMERA / POST_NOTIFICATIONS to $PKG"
+for perm in android.permission.CAMERA android.permission.POST_NOTIFICATIONS; do
+    adbsh shell pm grant "$PKG" "$perm" >/dev/null 2>&1 || true
+done
+if adbsh shell dumpsys package "$PKG" 2>/dev/null | grep -q "android.permission.CAMERA: granted=true"; then
+    echo "     CAMERA granted (verified)."
+else
+    echo "ERROR: $PKG does not hold android.permission.CAMERA after 'pm grant'." >&2
+    echo "       The 3D cameras will NOT be listed by the DisplayXR Browser until it does." >&2
+    echo "       Grant by hand and re-check:" >&2
+    echo "         adb shell pm grant $PKG android.permission.CAMERA" >&2
+    echo "         adb shell dumpsys package $PKG | grep 'CAMERA: granted'" >&2
+    exit 1
+fi
+
 # ---- 4. apps ----------------------------------------------------------------
 echo
 if [ $# -eq 0 ]; then
@@ -279,6 +303,9 @@ fi
 # sim-display. Read it back rather than declaring success from here.
 echo
 echo ">> installed. Verify on the device:"
+echo "   0. (done above) $PKG holds android.permission.CAMERA — without it the"
+echo "      browser lists no 3D camera. Re-check after ANY hand install:"
+echo "        adb shell dumpsys package $PKG | grep 'CAMERA: granted'"
 echo "   1. Open the 'DisplayXR' app — the dashboard runs the self-test."
 echo "   2. It must report PASS, and the active plug-in must NOT be 'sim-display'"
 echo "      on a vendor display. A failing 'vendor_dp' check means a vendor"
