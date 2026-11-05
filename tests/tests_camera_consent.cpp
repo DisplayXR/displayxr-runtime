@@ -1280,6 +1280,25 @@ TEST_CASE("android consent: the built-in list is well-formed", "[camera_consent]
 		CHECK(u_camera_consent_android_digest_normalize(list[i].cert_sha256, d));
 	}
 	CHECK(std::string(list[0].package) == kBrowserPkg);
+
+	// Both DisplayXR Browser signers (release and the build lane's CI key) are
+	// trusted for the same package; any other signer of that package is still a
+	// certificate mismatch, never package-only trust.
+	uint32_t browser_entries = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		if (std::string(list[i].package) != kBrowserPkg) {
+			continue;
+		}
+		browser_entries++;
+		const u_camera_consent_android_trusted *hit = nullptr;
+		CHECK(u_camera_consent_android_trust_lookup(list, n, kBrowserPkg, list[i].cert_sha256, &hit) ==
+		      U_CAMERA_CONSENT_ANDROID_TRUSTED);
+		CHECK(hit == &list[i]);
+	}
+	CHECK(browser_entries >= 2);
+	CHECK(u_camera_consent_android_trust_lookup(list, n, kBrowserPkg,
+	                                            "0000000000000000000000000000000000000000000000000000000000000000",
+	                                            nullptr) == U_CAMERA_CONSENT_ANDROID_PACKAGE_ONLY);
 }
 
 TEST_CASE("android consent: the trusted browser needs no prompt, only CAMERA", "[camera_consent][android]")
