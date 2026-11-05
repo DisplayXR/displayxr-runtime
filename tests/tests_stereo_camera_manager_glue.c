@@ -475,6 +475,7 @@ scm_destroy(struct scm_fixture *f)
 		return;
 	}
 	unmap(f);
+	ipc_server_client_stereo_camera_link_release(&f->ics);
 	ipc_server_client_stereo_camera_release(&f->ics);
 	ipc_server_stereo_camera_destroy(&f->mgr);
 	free(f);
@@ -952,6 +953,7 @@ void
 scm_link_disconnect(struct scm_fixture *f, uint32_t slot)
 {
 	volatile struct ipc_client_state *o = &f->server.threads[slot].ics;
+	ipc_server_client_stereo_camera_link_release(o);
 	ipc_server_client_stereo_camera_release(o);
 	o->server_thread_index = -1;
 }

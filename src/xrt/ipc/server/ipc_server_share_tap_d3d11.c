@@ -82,6 +82,44 @@ tap_detach(void *ctx, void *tap)
 	comp_d3d11_service_share_detach(tap);
 }
 
+static bool
+link_adapter_luid(void *ctx, uint8_t out_luid[XRT_LUID_SIZE])
+{
+	return comp_d3d11_service_share_link_adapter_luid(((struct ipc_server *)ctx)->xsysc, out_luid);
+}
+
+static xrt_result_t
+link_import(void *ctx,
+            const struct xrt_share_link_ring_desc *desc,
+            const xrt_graphics_buffer_handle_t *textures,
+            uint32_t texture_count,
+            xrt_graphics_sync_handle_t fence,
+            uint32_t eye_w,
+            uint32_t eye_h,
+            void **out_import)
+{
+	return comp_d3d11_service_share_link_import(((struct ipc_server *)ctx)->xsysc, desc, textures, texture_count, fence,
+	                                            eye_w, eye_h, out_import);
+}
+
+static uint32_t
+link_convert(void *ctx,
+             void *import,
+             const struct xrt_share_link_frame *frame,
+             struct xrt_plugin_stereo_camera_frame *out_frame,
+             struct xrt_app_share_frame_info *out_info)
+{
+	(void)ctx;
+	return comp_d3d11_service_share_link_convert(import, frame, out_frame, out_info);
+}
+
+static void
+link_unimport(void *ctx, void *import)
+{
+	(void)ctx;
+	comp_d3d11_service_share_link_unimport(import);
+}
+
 void
 ipc_server_share_tap_d3d11_install(struct ipc_server *s)
 {
@@ -91,6 +129,10 @@ ipc_server_share_tap_d3d11_install(struct ipc_server *s)
 	p.share_tap_wait_frame = tap_wait_frame;
 	p.share_tap_release_frame = tap_release_frame;
 	p.share_tap_detach = tap_detach;
+	p.share_link_adapter_luid = link_adapter_luid;
+	p.share_link_import = link_import;
+	p.share_link_convert = link_convert;
+	p.share_link_unimport = link_unimport;
 	p.ctx = s;
 	ipc_server_stereo_camera_set_platform(&p);
 }

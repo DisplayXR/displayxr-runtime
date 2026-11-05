@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  ADR-061 arm 2: the in-process share tap at the D3D11 fill arm — the
- *         hook surface the fill arm calls (the Windows body is pending).
+ *         hook surface the fill arm calls (Windows body: comp_xbridge_share_tap_win.cpp).
  * @ingroup comp_xbridge
  *
  * An in-process session's pre-weave views reach a 3D-screen-share consumer
@@ -68,8 +68,9 @@
  *   is destroyed: release the ring and fence (no wait: the service holds its
  *   own references), u_share_link_set_tap(false, NO_TAP), free the tap.
  *
- * Off Windows (and on Windows until the body lands) begin reports "no tap"
- * and the session is listed UNAVAILABLE (no_tap) by the service.
+ * Off Windows begin reports "no tap" and the session is listed UNAVAILABLE
+ * (no_tap) by the service. On Windows a fill arm that never calls begin (a
+ * D3D12 or Vulkan tier on its own legs, not the hub) reports the same.
  */
 
 #pragma once
@@ -113,6 +114,14 @@ struct comp_xbridge_share_tap_frame
 	bool encoding_is_linear;
 	int64_t commit_ns; //!< os_monotonic
 	float zero_disparity_shift_frac;
+	/*!
+	 * Where tiles sit. The hub's producers pack them at the view size (the hub
+	 * crops the top-left content box); 0 = the slot stride, atlas / grid.
+	 */
+	uint32_t tile_stride_x, tile_stride_y;
+	void *wait_fence;          //!< `ID3D11Fence *` to wait before reading @ref atlas, or NULL
+	uint64_t wait_fence_value; //!< the value @ref wait_fence reaches once the atlas is written
+	void *keyed_mutex;         //!< `IDXGIKeyedMutex *` guarding @ref atlas (key 0), or NULL
 };
 
 /*!

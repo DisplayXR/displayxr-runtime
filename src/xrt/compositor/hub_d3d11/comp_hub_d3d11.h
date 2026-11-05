@@ -1074,6 +1074,14 @@ void
 comp_hub_d3d11_set_atlas_encoding(struct comp_hub_d3d11 *split, enum xrt_atlas_encoding encoding);
 
 /*!
+ * ADR-061 arm 2: this producer's frames cannot be shared; the hub reports
+ * @p reason (enum xrt_app_share_availability) instead of offering its share tap.
+ * Call before the first @ref comp_hub_d3d11_submit_atlas.
+ */
+void
+comp_hub_d3d11_decline_share_tap(struct comp_hub_d3d11 *split, uint32_t reason);
+
+/*!
  * XR_DXR_depth_budget - one background preview from the split's weaver.
  *
  * The rear-depth policy needs the desktop UNDER the app window, and under the

@@ -133,6 +133,13 @@ ipc_server_stereo_camera_rescan(struct ipc_server_stereo_camera *mgr);
 void
 ipc_server_stereo_camera_rescan_soon(struct ipc_server_stereo_camera *mgr);
 
+/*!
+ * ADR-061 arm 2: a closing connection's service link and the share on it. Called once at
+ * client teardown, BEFORE client_state is zeroed: the link is keyed by its id.
+ */
+void
+ipc_server_client_stereo_camera_link_release(volatile struct ipc_client_state *ics);
+
 //! Destroy every stream @p ics created. Called once at client teardown.
 void
 ipc_server_client_stereo_camera_release(volatile struct ipc_client_state *ics);

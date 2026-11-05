@@ -251,6 +251,42 @@ xrt_result_t
 comp_d3d11_service_share_attach(struct xrt_compositor *xc, uint32_t eye_w, uint32_t eye_h, float fps, void **out_tap);
 
 /*!
+ * ADR-061 arm 2: the adapter an in-process app's ring must be on to be opened here.
+ * false = unknown.
+ */
+bool
+comp_d3d11_service_share_link_adapter_luid(struct xrt_system_compositor *xsysc, uint8_t out_luid[XRT_LUID_SIZE]);
+
+/*!
+ * ADR-061 arm 2: open an in-process app's published ring. Takes ownership of every handle
+ * (closed on failure too). @p eye_w x @p eye_h: the stream's per-eye extent.
+ */
+xrt_result_t
+comp_d3d11_service_share_link_import(struct xrt_system_compositor *xsysc,
+                                     const struct xrt_share_link_ring_desc *desc,
+                                     const xrt_graphics_buffer_handle_t *textures,
+                                     uint32_t texture_count,
+                                     xrt_graphics_sync_handle_t fence,
+                                     uint32_t eye_w,
+                                     uint32_t eye_h,
+                                     void **out_import);
+
+/*!
+ * ADR-061 arm 2: queue the conversion of one ring slot (a GPU-side wait on its fence) and hand
+ * back the newest FINISHED one: XRT_PLUGIN_STEREO_CAMERA_WAIT_OK, or WAIT_TIMEOUT when none is
+ * yet. Never blocks on the app. The planes stay valid until the next call.
+ */
+uint32_t
+comp_d3d11_service_share_link_convert(void *import,
+                                      const struct xrt_share_link_frame *frame,
+                                      struct xrt_plugin_stereo_camera_frame *out_frame,
+                                      struct xrt_app_share_frame_info *out_info);
+
+//! ADR-061 arm 2: close an imported ring; @p import is freed.
+void
+comp_d3d11_service_share_link_unimport(void *import);
+
+/*!
  * ADR-061: the next tapped frame (XRT_PLUGIN_STEREO_CAMERA_WAIT_*). The planes stay valid until
  * the next wait.
  */

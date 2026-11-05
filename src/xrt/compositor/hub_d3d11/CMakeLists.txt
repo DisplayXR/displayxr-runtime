@@ -40,6 +40,7 @@ if(WIN32 AND XRT_HAVE_D3D11)
 		PRIVATE
 			aux_d3d
 			comp_xbridge
+			comp_xbridge_share_tap
 			comp_d3d11
 			comp_d3d11_segs
 			d3d11

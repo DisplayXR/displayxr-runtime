@@ -100,6 +100,10 @@ common_shutdown(volatile struct ipc_client_state *ics)
 	// rows stayed listed forever (win-box row 6, 2026-10-19).
 	ipc_server_client_input_release(ics);
 
+	// ADR-061 arm 2: so is a service link (client_state.id again): unregistered
+	// after the memset, a crashed in-process app stayed listed AVAILABLE forever.
+	ipc_server_client_stereo_camera_link_release(ics);
+
 	/*
 	 * Remove the thread from the server.
 	 */

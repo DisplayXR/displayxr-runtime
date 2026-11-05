@@ -23647,6 +23647,102 @@ svc_share_tap_draw_eye(struct d3d11_service_system *sys,
 }
 
 /*!
+ * Convert one view pair into the stream's NV12 and queue its readback (caller holds
+ * immediate_ctx_mutex and checked the write slot is free): the commit tap's pass and an
+ * imported ring's (ADR-061 decision 6).
+ */
+static void
+svc_share_tap_submit(struct d3d11_service_system *sys,
+                     struct svc_share_tap *t,
+                     uint32_t vl,
+                     uint32_t vr,
+                     bool mono,
+                     uint32_t cols,
+                     uint32_t rows,
+                     uint32_t cw,
+                     uint32_t ch,
+                     uint32_t atlas_w,
+                     uint32_t atlas_h,
+                     int format,
+                     bool flip_y,
+                     bool is_linear,
+                     ID3D11ShaderResourceView *srv,
+                     int64_t t0,
+                     float shift_frac)
+{
+	auto &sl = t->slot[t->write_idx];
+	// Fit the view into one eye half, aspect preserved, on chroma-aligned edges.
+	const float fit = fmin((float)t->eye_w / (float)cw, (float)t->eye_h / (float)ch);
+	uint32_t w = (uint32_t)((float)cw * fit + 0.5f) & ~1u, h = (uint32_t)((float)ch * fit + 0.5f) & ~1u;
+	w = w > t->eye_w ? t->eye_w : w;
+	h = h > t->eye_h ? t->eye_h : h;
+	struct xrt_app_share_frame_info info = {};
+	info.content_x = (int32_t)(((t->eye_w - w) / 2) & ~1u);
+	info.content_y = (int32_t)(((t->eye_h - h) / 2) & ~1u);
+	info.content_width = w;
+	info.content_height = h;
+	info.mono = mono ? 1u : 0u;
+	info.zero_disparity_shift_frac = shift_frac; // the app's views are display-referred as packed
+	info.valid = 1;
+	info.commit_time_ns = t0;
+	const struct xrt_app_share_frame_info &li = t->last_info;
+	info.content_generation = li.content_generation;
+	if (li.content_x != info.content_x || li.content_y != info.content_y || li.content_width != w ||
+	    li.content_height != h || li.mono != info.mono) {
+		info.content_generation++;
+	}
+	t->last_info = info;
+
+	ID3D11DeviceContext *ctx = sys->context.get();
+	// Every piece of state this pass reads: the context is shared and nothing
+	// else may be assumed about what a previous draw left bound.
+	ctx->IASetInputLayout(nullptr);
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	ctx->VSSetShader(t->vs.get(), nullptr, 0);
+	ctx->GSSetShader(nullptr, nullptr, 0);
+	ctx->RSSetState(nullptr);
+	ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+	ctx->OMSetDepthStencilState(nullptr, 0);
+	ID3D11RenderTargetView *null_rtv = nullptr;
+	ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+	const FLOAT black_y[4] = {0, 0, 0, 0};
+	const FLOAT black_uv[4] = {128.0f / 255.0f, 128.0f / 255.0f, 0, 0};
+	ctx->ClearRenderTargetView(t->rtv_y.get(), black_y);
+	ctx->ClearRenderTargetView(t->rtv_uv.get(), black_uv);
+	ctx->PSSetShaderResources(0, 1, &srv);
+	ID3D11SamplerState *smp = t->sampler.get();
+	ctx->PSSetSamplers(0, 1, &smp);
+	ID3D11Buffer *cbuf = t->cb.get();
+	ctx->PSSetConstantBuffers(0, 1, &cbuf);
+
+	if (t->n_submit == 0) {
+		U_LOG_W("ADR-061 share tap: first frame: atlas %ux%u fmt %d, content %ux%u, cols %u, views %u (pair %u,%u), "
+		        "eye rect %d,%d %ux%u, flip %d, linear %d",
+		        atlas_w, atlas_h, format, cw, ch, cols, cols * rows, vl, vr, info.content_x, info.content_y, w, h,
+		        (int)flip_y, (int)is_linear);
+	}
+	svc_share_tap_draw_eye(sys, t, 0, vl, cols, rows, cw, ch, atlas_w, atlas_h, flip_y, is_linear, srv, &info);
+	svc_share_tap_draw_eye(sys, t, 1, vr, cols, rows, cw, ch, atlas_w, atlas_h, flip_y, is_linear, srv, &info);
+
+	ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	ctx->PSSetShaderResources(0, 1, &null_srv);
+	ID3D11Buffer *null_cb = nullptr;
+	ctx->PSSetConstantBuffers(0, 1, &null_cb);
+
+	ctx->CopyResource(sl.y.get(), t->tex_y.get());
+	ctx->CopyResource(sl.uv.get(), t->tex_uv.get());
+	ctx->Flush();
+	sl.busy = true;
+	sl.commit_ns = t0;
+	sl.info = info;
+	t->write_idx = (t->write_idx + 1) % SVC_SHARE_TAP_RING;
+	// Fell behind (the app stalled): restart the schedule, no catching up.
+	t->next_due_ns = t->next_due_ns + t->period_ns < t0 ? t0 + t->period_ns : t->next_due_ns + t->period_ns;
+	t->n_submit++;
+}
+
+/*!
  * The per-commit tap: the atlas this commit packed is final. Decimate, convert the
  * pair, queue the readback, pick up finished ones.
  */
@@ -23697,29 +23793,6 @@ svc_share_tap_commit(struct d3d11_service_system *sys,
 	    cols > 0 && rows > 0) {
 		D3D11_TEXTURE2D_DESC ad = {};
 		c->render.atlas_texture->GetDesc(&ad);
-
-		// Fit the view into one eye half, aspect preserved, on chroma-aligned edges.
-		const float fit = fmin((float)t->eye_w / (float)cw, (float)t->eye_h / (float)ch);
-		uint32_t w = (uint32_t)((float)cw * fit + 0.5f) & ~1u, h = (uint32_t)((float)ch * fit + 0.5f) & ~1u;
-		w = w > t->eye_w ? t->eye_w : w;
-		h = h > t->eye_h ? t->eye_h : h;
-		struct xrt_app_share_frame_info info = {};
-		info.content_x = (int32_t)(((t->eye_w - w) / 2) & ~1u);
-		info.content_y = (int32_t)(((t->eye_h - h) / 2) & ~1u);
-		info.content_width = w;
-		info.content_height = h;
-		info.mono = views == 1 ? 1u : 0u;
-		info.zero_disparity_shift_frac = 0.0f; // the app's views are display-referred as packed
-		info.valid = 1;
-		info.commit_time_ns = t0;
-		const struct xrt_app_share_frame_info &li = t->last_info;
-		info.content_generation = li.content_generation;
-		if (li.content_x != info.content_x || li.content_y != info.content_y || li.content_width != w ||
-		    li.content_height != h || li.mono != info.mono) {
-			info.content_generation++;
-		}
-		t->last_info = info;
-
 		uint32_t vl = 0, vr = 0;
 		if (views > 2) {
 			vl = views / 2 - 1;
@@ -23727,55 +23800,8 @@ svc_share_tap_commit(struct d3d11_service_system *sys,
 		} else if (views == 2) {
 			vr = 1;
 		}
-
-		ID3D11DeviceContext *ctx = sys->context.get();
-		// Every piece of state this pass reads: the context is shared and nothing
-		// else may be assumed about what a previous draw left bound.
-		ctx->IASetInputLayout(nullptr);
-		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		ctx->VSSetShader(t->vs.get(), nullptr, 0);
-		ctx->GSSetShader(nullptr, nullptr, 0);
-		ctx->RSSetState(nullptr);
-		ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
-		ctx->OMSetDepthStencilState(nullptr, 0);
-		ID3D11RenderTargetView *null_rtv = nullptr;
-		ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
-		const FLOAT black_y[4] = {0, 0, 0, 0};
-		const FLOAT black_uv[4] = {128.0f / 255.0f, 128.0f / 255.0f, 0, 0};
-		ctx->ClearRenderTargetView(t->rtv_y.get(), black_y);
-		ctx->ClearRenderTargetView(t->rtv_uv.get(), black_uv);
-		ctx->PSSetShaderResources(0, 1, &srv);
-		ID3D11SamplerState *smp = t->sampler.get();
-		ctx->PSSetSamplers(0, 1, &smp);
-		ID3D11Buffer *cbuf = t->cb.get();
-		ctx->PSSetConstantBuffers(0, 1, &cbuf);
-
-		const bool is_linear = !c->atlas_holds_srgb_bytes;
-		if (t->n_submit == 0) {
-			U_LOG_W("ADR-061 share tap: first frame: atlas %ux%u fmt %d, content %ux%u, cols %u, views %u (pair %u,%u), "
-			        "eye rect %d,%d %ux%u, flip %d, linear %d",
-			        ad.Width, ad.Height, (int)ad.Format, cw, ch, cols, views, vl, vr, info.content_x, info.content_y, w, h,
-			        (int)c->atlas_flip_y, (int)is_linear);
-		}
-		svc_share_tap_draw_eye(sys, t, 0, vl, cols, rows, cw, ch, ad.Width, ad.Height, c->atlas_flip_y, is_linear, srv, &info);
-		svc_share_tap_draw_eye(sys, t, 1, vr, cols, rows, cw, ch, ad.Width, ad.Height, c->atlas_flip_y, is_linear, srv, &info);
-
-		ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
-		ID3D11ShaderResourceView *null_srv = nullptr;
-		ctx->PSSetShaderResources(0, 1, &null_srv);
-		ID3D11Buffer *null_cb = nullptr;
-		ctx->PSSetConstantBuffers(0, 1, &null_cb);
-
-		ctx->CopyResource(sl.y.get(), t->tex_y.get());
-		ctx->CopyResource(sl.uv.get(), t->tex_uv.get());
-		ctx->Flush();
-		sl.busy = true;
-		sl.commit_ns = t0;
-		sl.info = info;
-		t->write_idx = (t->write_idx + 1) % SVC_SHARE_TAP_RING;
-		// Fell behind (the app stalled): restart the schedule, no catching up.
-		t->next_due_ns = t->next_due_ns + t->period_ns < t0 ? t0 + t->period_ns : t->next_due_ns + t->period_ns;
-		t->n_submit++;
+		svc_share_tap_submit(sys, t, vl, vr, views == 1, cols, rows, cw, ch, ad.Width, ad.Height, (int)ad.Format,
+		                     c->atlas_flip_y, !c->atlas_holds_srgb_bytes, srv, t0, 0.0f);
 	}
 
 	const int64_t dt = os_monotonic_get_ns() - t0;
@@ -37067,6 +37093,161 @@ comp_d3d11_service_share_detach(void *tap)
 	        (unsigned long long)t->n_ring_full, (double)t->ns_commit_total / n * 1e-6, (double)t->ns_commit_max * 1e-6,
 	        (double)t->ns_harvest_total / n * 1e-6);
 	delete handle;
+}
+
+//! ADR-061 arm 2: an in-process app's ring, opened on the service device.
+struct svc_share_import
+{
+	struct d3d11_service_system *sys = nullptr;
+	struct xrt_share_link_ring_desc desc = {};
+	wil::com_ptr<ID3D11Texture2D> tex[XRT_SHARE_LINK_RING_SLOTS];
+	wil::com_ptr<ID3D11ShaderResourceView> srv[XRT_SHARE_LINK_RING_SLOTS];
+	wil::com_ptr<ID3D11Fence> fence;
+	wil::com_ptr<ID3D11DeviceContext4> ctx4;
+	std::shared_ptr<struct svc_share_tap> tap;
+	uint64_t n_frames = 0, n_ring_full = 0, n_ok = 0;
+};
+
+bool
+comp_d3d11_service_share_link_adapter_luid(struct xrt_system_compositor *xsysc, uint8_t out_luid[XRT_LUID_SIZE])
+{
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (sys == nullptr || !sys->base.info.client_d3d_deviceLUID_valid) {
+		return false;
+	}
+	std::memcpy(out_luid, sys->base.info.client_d3d_deviceLUID.data, XRT_LUID_SIZE);
+	return true;
+}
+
+xrt_result_t
+comp_d3d11_service_share_link_import(struct xrt_system_compositor *xsysc,
+                                     const struct xrt_share_link_ring_desc *desc,
+                                     const xrt_graphics_buffer_handle_t *textures,
+                                     uint32_t texture_count,
+                                     xrt_graphics_sync_handle_t fence,
+                                     uint32_t eye_w,
+                                     uint32_t eye_h,
+                                     void **out_import)
+{
+	// Every handle is ours from here, whatever happens.
+	struct handles_closer
+	{
+		const xrt_graphics_buffer_handle_t *t;
+		uint32_t n;
+		xrt_graphics_sync_handle_t f;
+		~handles_closer()
+		{
+			for (uint32_t i = 0; i < n; i++) {
+				if (t[i] != nullptr && t[i] != INVALID_HANDLE_VALUE) {
+					CloseHandle(t[i]);
+				}
+			}
+			if (f != nullptr && f != INVALID_HANDLE_VALUE) {
+				CloseHandle(f);
+			}
+		}
+	} closer{textures, texture_count, fence};
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (sys == nullptr || desc == nullptr || out_import == nullptr || texture_count != XRT_SHARE_LINK_RING_SLOTS ||
+	    desc->slot_count != XRT_SHARE_LINK_RING_SLOTS || desc->content_width == 0 || desc->content_height == 0 ||
+	    desc->slot_width < desc->content_width * 2 || desc->slot_height < desc->content_height || eye_w < 16 ||
+	    eye_h < 16 || (eye_w & 1) != 0 || (eye_h & 1) != 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	wil::com_ptr<ID3D11Device1> dev1;
+	if (FAILED(sys->device->QueryInterface(IID_PPV_ARGS(dev1.put())))) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	auto imp = std::make_unique<struct svc_share_import>();
+	imp->sys = sys;
+	imp->desc = *desc;
+	for (uint32_t i = 0; i < XRT_SHARE_LINK_RING_SLOTS; i++) {
+		HRESULT hr = dev1->OpenSharedResource1(textures[i], IID_PPV_ARGS(imp->tex[i].put()));
+		if (SUCCEEDED(hr)) {
+			hr = sys->device->CreateShaderResourceView(imp->tex[i].get(), nullptr, imp->srv[i].put());
+		}
+		if (FAILED(hr)) {
+			U_LOG_W("ADR-061 share link: slot %u of ring %u will not open (0x%08lx): is it on this adapter?", i,
+			        desc->generation, (unsigned long)hr);
+			return XRT_ERROR_IPC_FAILURE;
+		}
+	}
+	if (fence != nullptr && fence != INVALID_HANDLE_VALUE) {
+		wil::com_ptr<ID3D11Device5> dev5;
+		if (FAILED(sys->device->QueryInterface(IID_PPV_ARGS(dev5.put()))) ||
+		    FAILED(dev5->OpenSharedFence(fence, IID_PPV_ARGS(imp->fence.put()))) ||
+		    FAILED(sys->context->QueryInterface(IID_PPV_ARGS(imp->ctx4.put())))) {
+			U_LOG_W("ADR-061 share link: the fence of ring %u will not open", desc->generation);
+			return XRT_ERROR_IPC_FAILURE;
+		}
+	}
+	auto tp = std::make_shared<struct svc_share_tap>();
+	tp->eye_w = eye_w;
+	tp->eye_h = eye_h;
+	if (!svc_share_tap_create_gpu(sys, tp.get())) {
+		U_LOG_W("ADR-061 share link: GPU resources failed");
+		return XRT_ERROR_ALLOCATION;
+	}
+	imp->tap = std::move(tp);
+	*out_import = imp.release();
+	return XRT_SUCCESS;
+}
+
+uint32_t
+comp_d3d11_service_share_link_convert(void *import,
+                                      const struct xrt_share_link_frame *frame,
+                                      struct xrt_plugin_stereo_camera_frame *out_frame,
+                                      struct xrt_app_share_frame_info *out_info)
+{
+	struct svc_share_import *imp = static_cast<struct svc_share_import *>(import);
+	struct svc_share_tap *t = imp->tap.get();
+	struct d3d11_service_system *sys = imp->sys;
+	if (frame->slot >= XRT_SHARE_LINK_RING_SLOTS) {
+		return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
+	}
+	const uint32_t cw = frame->content_width != 0 ? frame->content_width : imp->desc.content_width;
+	const uint32_t ch = frame->content_width != 0 ? frame->content_height : imp->desc.content_height;
+	{
+		std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+		svc_share_tap_harvest(sys, t);
+		if (t->slot[t->write_idx].busy) {
+			imp->n_ring_full++;
+		} else {
+			if (imp->fence && imp->ctx4 && frame->fence_value != 0) {
+				imp->ctx4->Wait(imp->fence.get(), frame->fence_value);
+			}
+			// The two halves as a 2x1 atlas. A mono frame reads the left half twice.
+			svc_share_tap_submit(sys, t, 0, frame->mono != 0 ? 0 : 1, frame->mono != 0, 2, 1, cw, ch,
+			                     imp->desc.slot_width, imp->desc.slot_height, (int)imp->desc.format,
+			                     imp->desc.flip_y != 0, imp->desc.encoding_is_linear != 0,
+			                     imp->srv[frame->slot].get(), frame->commit_ns, frame->zero_disparity_shift_frac);
+			imp->n_frames++;
+		}
+	}
+	const uint32_t w = comp_d3d11_service_share_wait_frame(&imp->tap, 0, out_frame, out_info);
+	if (w == XRT_PLUGIN_STEREO_CAMERA_WAIT_OK) {
+		imp->n_ok++;
+	}
+	return w;
+}
+
+void
+comp_d3d11_service_share_link_unimport(void *import)
+{
+	struct svc_share_import *imp = static_cast<struct svc_share_import *>(import);
+	if (imp == nullptr) {
+		return;
+	}
+	U_LOG_W("ADR-061 share link: ring %u closed: %llu frames queued, %llu delivered, %llu skipped (ring full)",
+	        imp->desc.generation, (unsigned long long)imp->n_frames, (unsigned long long)imp->n_ok,
+	        (unsigned long long)imp->n_ring_full);
+	{
+		// The tap's GPU objects were last used under this lock.
+		std::lock_guard<std::mutex> ctx_lock(imp->sys->immediate_ctx_mutex);
+		imp->tap.reset();
+	}
+	delete imp;
 }
 
 bool
