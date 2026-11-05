@@ -1058,6 +1058,13 @@ nothing need the runtime to measure it.
    max), 0.03–0.05 ms when the patch is unchanged and the cached result is reused, and 0.01–0.33
    ms for the GPU copy. Frame time showed no measurable change. A GPU matcher stays an option if
    a profile ever shows the CPU cost.
+
+   *Correction (2026-11-04):* "never stalls" holds for GPU waits only, and the figures above do
+   not cover a discrete GPU. The CPU match runs on the commit thread, and on Vulkan its readback
+   took the first `HOST_VISIBLE|HOST_COHERENT` type, which is uncached on an RTX 3080. A
+   fullscreen 8K video in the media player dropped from 60 to about 9 fps with a viewer tracked
+   and the pointer over the canvas. The readback now prefers `HOST_CACHED`, the matcher itself
+   was not the cost, and `DXR_CURSOR_MEASURE=0` declines every measured request.
 2. **Work in on-screen pixels.** Stereo media has no scene geometry, so none is invented. The
    measured on-screen disparity (px, panel scale) becomes the content disparity directly, and
    §A.1 applies in pixels:

@@ -230,6 +230,7 @@ DEBUG_GET_ONCE_NUM_OPTION(wait_frame_sleep, "OXR_DEBUG_WAIT_FRAME_EXTRA_SLEEP_MS
 DEBUG_GET_ONCE_BOOL_OPTION(frame_timing_spew, "OXR_FRAME_TIMING_SPEW", false)
 // Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h). Kill switch.
 DEBUG_GET_ONCE_BOOL_OPTION(mono_auto_2d, "DXR_MONO_AUTO_2D", true)
+DEBUG_GET_ONCE_BOOL_OPTION(cursor_measure, "DXR_CURSOR_MEASURE", true)
 DEBUG_GET_ONCE_BOOL_OPTION(hand_tracking_prioritize_conforming, "OXR_HAND_TRACKING_PRIORITIZE_CONFORMING", false)
 
 /*
@@ -2882,6 +2883,10 @@ oxr_session_cursor_depth_measured(struct oxr_session *sess,
                                   uint32_t active_view_count,
                                   float *out_disparity)
 {
+	// Kill switch: decline as "no content", which the spec allows and leaves the OS cursor.
+	if (!debug_get_bool_option_cursor_measure()) {
+		return false;
+	}
 	if (!sess->cursor_measure.announced) {
 		sess->cursor_measure.announced = true;
 		U_LOG_W(
