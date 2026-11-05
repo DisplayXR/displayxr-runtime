@@ -799,6 +799,17 @@ struct multi_compositor
 		//! A weave-only client has no session_render DP, so the request is held here
 		//! and applied to @ref dp when it exists (and again at engine bring-up).
 		uint32_t eye_tracking_mode_plus1;
+		/*!
+		 * Hardware 2D/3D as last CONFIRMED by @ref dp and reported to this
+		 * client's session (comp_multi_weave_android_request_display_mode).
+		 * Stored inverted so the zero-initialised struct means 3D, the state
+		 * every session starts in. The standing WISH is mc->hardware_display_3d.
+		 */
+		bool hw_2d_confirmed;
+		//! The client sent a hardware request before @ref dp existed: apply the
+		//! standing wish at engine bring-up. A client that never asks keeps the
+		//! DP's own default (3D), exactly as before.
+		bool display_mode_requested;
 		bool engine_failed; //!< One-shot: don't retry a hopeless bring-up every frame.
 		VkCommandPool cmd_pool;
 		VkCommandBuffer cmd;
@@ -1857,6 +1868,19 @@ comp_multi_weave_android_satellite_clear(struct multi_compositor *mc);
  */
 void
 comp_multi_weave_android_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode);
+
+/*!
+ * Hardware 2D/3D request for an Android XR_DXR_weave present-owner (the twin of
+ * comp_multi_weave_linux_request_display_mode): a weave-only session has no
+ * session_render, so multi_compositor_request_display_mode routes here and the
+ * request reaches the weave engine's own DP, inline on the IPC thread under
+ * mc->weave.mutex. Before the engine exists the wish is recorded and applied at
+ * engine bring-up. Emits XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE once
+ * the DP accepted a change (a DP without the slot is mode-neutral and counts as
+ * accepted).
+ */
+bool
+comp_multi_weave_android_request_display_mode(struct multi_compositor *mc, bool enable_3d);
 
 /*!
  * Has THIS client painted the satellite overlay and not cleared it since?
