@@ -734,6 +734,63 @@ weave_run_dp_factory_on_main_thread(void *data)
 }
 
 /*!
+ * Apply a HARDWARE 2D/3D request to the engine's own DP and, once the DP
+ * confirmed a CHANGE, tell this client's session (#961: the event follows the
+ * DP, never the bookkeeping). The Android twin of the desktop-Linux engine's
+ * weave_apply_display_mode_locked. Call with mc->weave.mutex held and
+ * mc->weave.dp non-NULL.
+ *
+ * The vendor call is cheap and thread-safe for the IPC thread: the CNSDK DP
+ * only records the wish (an atomic) and its weave loop switches the backlight
+ * on the next process_atlas, which is why the event carries the REQUESTED state
+ * once the DP accepted it, never a read-back (logged as information only).
+ *
+ * A DP without a request_display_mode slot is mode-neutral (sim_display): the
+ * request counts as accepted. A DP that HAS the slot and returns false rejected
+ * it — nothing is recorded or reported, so the session never believes in a
+ * panel state the hardware did not reach.
+ */
+static bool
+weave_apply_display_mode_locked(struct multi_compositor *mc, bool want_3d, const char *why)
+{
+	struct xrt_display_processor *dp = mc->weave.dp;
+	const bool has_slot = XRT_DP_HAS_SLOT(dp, request_display_mode) && dp->request_display_mode != NULL;
+	const bool accepted = has_slot ? xrt_display_processor_request_display_mode(dp, want_3d) : true;
+	if (!accepted) {
+		U_LOG_W(
+		    "weave(#1036): the display processor REJECTED hardware %s (%s) — panel state unchanged, no "
+		    "event sent",
+		    want_3d ? "3D" : "2D", why);
+		return false;
+	}
+
+	const bool prev_3d = !mc->weave.hw_2d_confirmed;
+	mc->weave.hw_2d_confirmed = !want_3d;
+	if (prev_3d == want_3d) {
+		return true; // already there as far as THIS client knows: silent, no event
+	}
+
+	// One WARN per transition (a human-rate event: a page's 2D/3D toggle).
+	bool panel_3d = false;
+	const bool have_readback = xrt_display_processor_get_hardware_3d_state(dp, &panel_3d);
+	U_LOG_W("weave(#1036): hardware %s -> %s (%s) on the weave engine's display processor (%s); DP readback: %s",
+	        prev_3d ? "3D" : "2D", want_3d ? "3D" : "2D", why,
+	        has_slot ? "request_display_mode accepted" : "mode-neutral DP, nothing to switch",
+	        have_readback ? (panel_3d ? "3D (may lag — the backlight switches on the next weave)"
+	                                  : "2D (may lag — the backlight switches on the next weave)")
+	                      : "none (the DP has no get_hardware_3d_state)");
+
+	union xrt_session_event xse = {0};
+	xse.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
+	xse.hardware_display_state_change.hardware_display_3d = want_3d;
+	const xrt_result_t xret = multi_compositor_push_event(mc, &xse);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_W("weave(#1036): could not push the hardware-state event to the session: %d", xret);
+	}
+	return true;
+}
+
+/*!
  * One-time engine bring-up: command pool + buffer, fence, render pass
  * (compatible with the DP's own — same single RGBA8 color attachment), and the
  * DP instance from the plug-in's Vulkan factory.
@@ -842,6 +899,13 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 		xrt_display_processor_set_eye_tracking_mode(mc->weave.dp, mode);
 		U_LOG_W("weave(#1036): eye-tracking mode %u applied at engine bring-up", mode);
 	}
+	if (mc->weave.display_mode_requested) {
+		// A hardware request arrived before the DP existed: apply the standing
+		// wish now. Only when the client asked — one that never did keeps the
+		// DP's own default, as before. Runs under mc->weave.mutex (submit path).
+		(void)weave_apply_display_mode_locked(mc, mc->hardware_display_3d,
+		                                      "deferred request, applied at engine bring-up");
+	}
 	return true;
 }
 
@@ -854,6 +918,29 @@ comp_multi_weave_android_set_eye_tracking_mode(struct multi_compositor *mc, uint
 	}
 	U_LOG_W("weave(#1036): eye-tracking mode %u requested (%s)", mode,
 	        mc->weave.dp != NULL ? "applied to the weave DP" : "held until the engine is up");
+}
+
+bool
+comp_multi_weave_android_request_display_mode(struct multi_compositor *mc, bool enable_3d)
+{
+	if (mc == NULL || mc->msc == NULL) {
+		return false;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	mc->hardware_display_3d = enable_3d; // the standing wish
+	bool ok = true;
+	if (mc->weave.dp != NULL) {
+		ok = weave_apply_display_mode_locked(mc, enable_3d, "xrRequestDisplayModeDXR");
+	} else {
+		mc->weave.display_mode_requested = true;
+		U_LOG_W(
+		    "weave(#1036): hardware %s requested before the weave engine exists — recorded, applied when "
+		    "the engine comes up",
+		    enable_3d ? "3D" : "2D");
+	}
+	os_mutex_unlock(&mc->weave.mutex);
+	return ok;
 }
 
 

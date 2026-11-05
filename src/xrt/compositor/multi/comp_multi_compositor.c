@@ -2692,6 +2692,18 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 		return comp_multi_weave_macos_request_display_mode(mc, enable_3d);
 	}
 #endif
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_ANDROID)
+	// The Android twin: the DisplayXR Browser's weaving session lives in its GPU
+	// process and is a weave-only present-owner, so it has no session_render
+	// either and the gate below dropped every hardware request — a page's
+	// requestRenderingMode / setStereoEnabled(false) never turned the lens off
+	// and no event came back (browser-pvt#334). Its DP is the weave engine's
+	// (mc->weave.dp). Only a client that has touched the weave service (bind
+	// comes first) is routed here, so an app-class session keeps its old path.
+	if (mc != NULL && !mc->session_render.initialized && mc->weave.mutex_initialized) {
+		return comp_multi_weave_android_request_display_mode(mc, enable_3d);
+	}
+#endif
 #ifdef COMP_MULTI_SHARED_SURFACE
 	// D-5 (#967): a shared-surface client has no per-session DP; its wish is
 	// applied to the ONE shared display processor by the render thread
