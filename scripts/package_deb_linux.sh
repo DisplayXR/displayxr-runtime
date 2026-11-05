@@ -209,6 +209,16 @@ if ! grep -q 'Hybrid mode: XR_DXR_weave present-owner' <<<"$RUNTIME_STRINGS"; th
     echo "       Build with scripts/build_linux.sh --hybrid." >&2
     exit 1
 fi
+# #2355: the runtime must carry the qwerty driver. Without it nothing binds a
+# pose source to the display head, so a legacy/hosted app's head sits at the
+# display's static pose (0.1 m above STAGE, 1.5 m under LOCAL) and the legacy
+# camera rig compiles out — silently: every app still starts. Its HMD reseed
+# log line is the marker that drv_qwerty is linked in.
+if ! grep -q 'qwerty: HMD pose reseeded' <<<"$RUNTIME_STRINGS"; then
+    echo "error: $RUNTIME_SO has no qwerty driver (legacy apps would get a floor-level head, #2355)." >&2
+    echo "       Build with scripts/build_linux.sh (qwerty is ON unless --no-qwerty)." >&2
+    exit 1
+fi
 
 SYSTEMD_SRC="$ROOT/scripts/linux/systemd"
 for f in displayxr.socket displayxr.service.in; do

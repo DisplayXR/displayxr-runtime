@@ -1289,7 +1289,7 @@ step/next/drive scripts, `capture_dpi_aware.ps1`, `bar_profile.ps1`,
 ### 12.1 Build
 
 ```bash
-./scripts/build_linux.sh --qwerty      # qwerty is OFF by default; without it there is no select
+./scripts/build_linux.sh               # qwerty is ON by default (#2355); a --no-qwerty tree has no select
 ./scripts/fetch_build_cts.sh           # needs git-lfs: the CTS keeps its reference images in LFS
 ```
 

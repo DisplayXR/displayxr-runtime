@@ -28,8 +28,8 @@
 #     separate process: scripts/cts_drive.py (focus, key/click injection,
 #     capture, pixel oracles, per-case log). --interactive only sets the spec,
 #     the names, the environment and the no-timeout the procedure asks for.
-#     It needs a tree built with `./scripts/build_linux.sh --qwerty` — the
-#     default build has no qwerty, hence no controllers and no select action at
+#     It needs a tree built with qwerty (the build_linux.sh default since
+#     #2355) — a `--no-qwerty` tree has no controllers and no select action at
 #     all; the QWERTY line printed below says which tree this is, and
 #     --interactive refuses to start without it. Procedure, traps and the
 #     Linux harness: docs/reference/cts-interactive-procedure.md § 12.
@@ -454,7 +454,7 @@ if [ -n "$INTERACTIVE" ]; then
   QWERTY_STATE="$(sed -n 's/^XRT_BUILD_DRIVER_QWERTY:BOOL=//p' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null)"
   if [ "$QWERTY_STATE" != "ON" ]; then
     echo "ERROR: --interactive needs a qwerty tree (XRT_BUILD_DRIVER_QWERTY=${QWERTY_STATE:-unknown} in $BUILD_DIR)." >&2
-    echo "       Rebuild with ./scripts/build_linux.sh --qwerty — without it there is no controller and no select." >&2
+    echo "       Rebuild with ./scripts/build_linux.sh (qwerty is the default; drop --no-qwerty) — without it there is no controller and no select." >&2
     exit 1
   fi
   echo "INTERACTIVE: $INTERACTIVE  SIM_DISPLAY_OUTPUT=$SIM_DISPLAY_OUTPUT  DXR_QTRACE=$DXR_QTRACE"
@@ -466,7 +466,7 @@ echo "RUNTIME:  XR_RUNTIME_JSON=$XR_RUNTIME_JSON"
 echo "PLUGINS:  XRT_PLUGIN_SEARCH_PATH=${XRT_PLUGIN_SEARCH_PATH:-(unset)} DXR_PLUGIN_EXCLUSIVE=${DXR_PLUGIN_EXCLUSIVE:-(unset)} DXR_INPUT_PROVIDERS=$DXR_INPUT_PROVIDERS"
 echo "DISPLAY:  $DISPLAY"
 QWERTY_STATE="$(sed -n 's/^XRT_BUILD_DRIVER_QWERTY:BOOL=//p' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null)"
-echo "QWERTY:   ${QWERTY_STATE:-unknown} (interactive categories need ON: build_linux.sh --qwerty)"
+echo "QWERTY:   ${QWERTY_STATE:-unknown} (interactive categories need ON: the build_linux.sh default)"
 
 # ---- run ---------------------------------------------------------------------
 # OpenXR-CTS renamed --apiVersion -> --minApiVersion in openxr-cts-1.1.44+; the
