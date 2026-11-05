@@ -1889,6 +1889,7 @@ struct comp_vk_native_compositor
 		struct u_cursor_measure_result result;
 		uint32_t stat_n, stat_reused;
 		uint64_t stat_cpu_ns, stat_cpu_max_ns;
+		bool warned_uncached;
 		double stat_gpu_ns, stat_gpu_max_ns;
 	} cursor_measure;
 	//! Guards cursor_measure.result: the locate may run on another thread.
@@ -12066,10 +12067,24 @@ vk_cursor_measure_ensure_buffer(struct comp_vk_native_compositor *c, uint32_t s,
 	}
 	VkMemoryRequirements mreq;
 	vk->vkGetBufferMemoryRequirements(vk->device, c->cursor_measure.slot[s].buf, &mreq);
-	uint32_t mem_type = 0;
-	if (!vk_native_find_host_visible_memory_type(vk, mreq.memoryTypeBits, &mem_type)) {
-		vk_cursor_measure_free_buffer(vk, c, s);
-		return false;
+	// The matcher reads this memory on the CPU inside xrEndFrame, so it has to be
+	// HOST_CACHED: a plain HOST_VISIBLE|HOST_COHERENT type is typically write-combined,
+	// and the first one on an NVIDIA discrete GPU. Reading a fullscreen 8K patch from it
+	// cost about 90 ms a frame (same class as the capture fix, #2536).
+	uint32_t mem_type = UINT32_MAX;
+	const VkMemoryPropertyFlags uncached =
+	    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if (!vk_get_memory_type(vk, mreq.memoryTypeBits, uncached | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &mem_type)) {
+		if (!vk_get_memory_type(vk, mreq.memoryTypeBits, uncached, &mem_type)) {
+			vk_cursor_measure_free_buffer(vk, c, s);
+			return false;
+		}
+		if (!c->cursor_measure.warned_uncached) {
+			c->cursor_measure.warned_uncached = true;
+			U_LOG_W("cursor_measure: no HOST_CACHED readback memory on this GPU - the CPU match reads "
+			        "uncached memory and may slow the frame; DXR_CURSOR_MEASURE=0 turns measuring off "
+			        "(one-time warning)");
+		}
 	}
 	VkMemoryAllocateInfo ai = {
 	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
