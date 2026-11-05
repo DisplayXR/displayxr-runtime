@@ -64,6 +64,7 @@
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_display_processor.h"
+#include "xrt/xrt_session.h"
 
 #include "xrt/xrt_display_processor_vk.h"
 #include "xrt/xrt_display_metrics.h"
