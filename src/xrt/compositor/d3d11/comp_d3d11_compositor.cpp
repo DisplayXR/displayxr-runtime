@@ -76,6 +76,8 @@
 #include "util/u_color_encoding.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "comp_xbridge_share_tap.h"
+#include "xrt/xrt_stereo_camera.h"
 #include "util/u_capture_dims.h"
 #include "util/u_repaint_gate.h"
 #include "util/u_fill_thread_win.h"
@@ -911,6 +913,10 @@ struct comp_d3d11_compositor
 	//! Per-frame capture intent populated at top of layer_commit. See
 	//! u_capture_intent.h.
 	struct u_capture_intent capture_intent;
+
+	//! ADR-061 arm 2: the share tap of a session weaving on its own legs (the hub has its own).
+	struct comp_xbridge_share_tap *share_tap;
+	bool share_tap_begun;
 
 	/*!
 	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
@@ -3183,6 +3189,48 @@ d3d11_route_effective_layout(struct comp_d3d11_compositor *c, uint32_t layer_vie
 	}
 }
 
+/*!
+ * ADR-061 arm 2: offer this frame's atlas to a sharing consumer. Tiles sit at the view
+ * size (d3d11_crop_atlas_for_dp keeps the top-left content box).
+ */
+static void
+d3d11_share_tap_commit(struct comp_d3d11_compositor *c,
+                       void *atlas_srv,
+                       uint32_t cols,
+                       uint32_t rows,
+                       uint32_t view_w,
+                       uint32_t view_h)
+{
+	if (!c->share_tap_begun) {
+		c->share_tap_begun = true;
+		struct comp_xbridge_share_tap_info ti = {};
+		ti.device = c->device;
+		ti.context = c->context;
+		xbridge_share_tap_begin(&ti, &c->share_tap);
+	}
+	if (c->share_tap == nullptr) {
+		return;
+	}
+	ID3D11Resource *res = nullptr;
+	static_cast<ID3D11ShaderResourceView *>(atlas_srv)->GetResource(&res);
+	if (res == nullptr) {
+		return;
+	}
+	struct comp_xbridge_share_tap_frame tf = {};
+	tf.atlas = res;
+	tf.tile_columns = cols;
+	tf.tile_rows = rows;
+	tf.view_count = cols * rows;
+	tf.active_view_count = cols * rows;
+	tf.content_width = view_w;
+	tf.content_height = view_h;
+	tf.tile_stride_x = view_w;
+	tf.tile_stride_y = view_h;
+	tf.commit_ns = (int64_t)os_monotonic_get_ns();
+	xbridge_share_tap_commit(c->share_tap, &tf);
+	res->Release();
+}
+
 //! The projection-class layer's submitted view count (what routing may index).
 static uint32_t
 d3d11_projection_layer_view_count(const struct comp_layer_accum *layers)
@@ -3322,6 +3370,14 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	// misaligned (big disparity). See the offscreen path above (#431).
 	uint32_t content_w = tile_columns * view_width;
 	uint32_t content_h = tile_rows * view_height;
+
+	// ADR-061 arm 2: an app frame's atlas, final, on the device that rendered it. A
+	// repaint replays a frame already offered. Under the legacy split this SRV is on
+	// the output adapter, which is not the one the ring can be shared from.
+	if (!is_repaint && !c->split_active && atlas_srv != nullptr) {
+		d3d11_share_tap_commit(c, atlas_srv, tile_columns, tile_rows, view_width, view_height);
+	}
+
 	if (!zero_copy && !c->split_active) {
 		atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
 	}
@@ -6376,6 +6432,8 @@ static void
 d3d11_compositor_destroy(struct xrt_compositor *xc)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+	xbridge_share_tap_end(&c->share_tap);
 
 	// #868: join the repaint loop FIRST — it touches the device context, the
 	// target and the display processor under c->mutex, so it must be stopped

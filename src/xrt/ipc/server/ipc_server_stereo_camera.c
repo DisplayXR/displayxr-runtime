@@ -4862,13 +4862,19 @@ stream_destroy_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s)
 }
 
 void
-ipc_server_client_stereo_camera_release(volatile struct ipc_client_state *ics)
+ipc_server_client_stereo_camera_link_release(volatile struct ipc_client_state *ics)
 {
 	struct ipc_server_stereo_camera *m = mgr_of(ics);
 	if (m != NULL) {
 		// ADR-061 arm 2: a closing in-process service link takes its share with it.
 		link_unregister(m, ics->client_state.id);
 	}
+}
+
+void
+ipc_server_client_stereo_camera_release(volatile struct ipc_client_state *ics)
+{
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
 	if (m == NULL || ics->stereo_camera_owner == 0) {
 		return;
 	}

@@ -629,6 +629,10 @@ oxr_instance_create(struct oxr_logger *log,
 	 */
 
 	xret = xrt_instance_create(&i_info, &inst->xinst);
+	if (xret == XRT_SUCCESS && inst->xinst != NULL) {
+		// Nothing below the state tracker stores it: the service link names the app from here.
+		inst->xinst->instance_info = i_info;
+	}
 	if (xret == XRT_ERROR_CLIENT_LIMIT_REACHED) {
 		// #960: the service refused us at the class quota / client cap.
 		ret = oxr_error(log, XR_ERROR_LIMIT_REACHED,
