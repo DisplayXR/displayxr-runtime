@@ -31748,6 +31748,78 @@ svc_weave_capture_dump_srv(struct d3d11_service_system *sys, ID3D11ShaderResourc
 	res->Release();
 }
 
+/*!
+ * How far a weave tile's edge pixels reach into the SBS atlas around the tile when a 2D layer
+ * is composited in the weave. A lens-period box is a few window pixels (about 4 at the edge on
+ * the 8K Leia panel) and anything wider only costs fill, because the opaque page covers it.
+ */
+#define WEAVE_TILE_EDGE_UNDERLAY_PX 16.0f
+
+/*!
+ * Extend one view's tile outward in the SBS atlas by repeating its edge pixels.
+ *
+ * The page layer has an alpha-0 hole where the tile is, and a DP that band-limits that layer for
+ * its lens (ADR-027 Amendment) softens the hole's edge, so coverage falls below 1 just OUTSIDE
+ * the tile. The DP blends layer + (1 - coverage) * woven there, and without this the woven side
+ * is the atlas's cleared (0,0,0,0): every windowed tile gets a dark line around it, at any page
+ * colour, scaling with the filter strength. With the tile's own colour underneath the blend stays
+ * continuous; everywhere the page is opaque this margin is covered and never seen.
+ *
+ * Call before ANY tile is drawn, so a neighbouring tile overwrites the margin. Corners come from
+ * the left and right strips, stretched over the extra rows.
+ *
+ * @param src_x,src_y,src_w,src_h The view's pixels in the caller's input (half the rect's width).
+ * @param tile_x                  Where this view's tile starts in the atlas (0, or win_w).
+ * @param rx,ry,rw,rh             The rect in window pixels, as the tile itself is drawn.
+ */
+static void
+weave_extend_tile_edges(struct d3d11_service_system *sys,
+                        struct d3d11_client_render_resources *res,
+                        ID3D11ShaderResourceView *src_srv,
+                        float src_x,
+                        float src_y,
+                        float src_w,
+                        float src_h,
+                        float src_tex_w,
+                        float src_tex_h,
+                        float tile_x,
+                        float rx,
+                        float ry,
+                        float rw,
+                        float rh,
+                        float win_w,
+                        float win_h,
+                        ID3D11RenderTargetView *rtv)
+{
+	// A span this narrow reads one texel centre with the linear sampler: a clamp, with no bleed
+	// from whatever the input holds beyond the rect.
+	const float texel = 0.01f;
+	const float near_edge = 0.5f - texel / 2.0f;
+	const float far_edge = 1.0f - near_edge;
+
+	// Clamped to this view's own tile: the atlas holds both views side by side.
+	const float left = (rx - WEAVE_TILE_EDGE_UNDERLAY_PX > 0.0f) ? rx - WEAVE_TILE_EDGE_UNDERLAY_PX : 0.0f;
+	const float right =
+	    (rx + rw + WEAVE_TILE_EDGE_UNDERLAY_PX < win_w) ? rx + rw + WEAVE_TILE_EDGE_UNDERLAY_PX : win_w;
+	const float top = (ry - WEAVE_TILE_EDGE_UNDERLAY_PX > 0.0f) ? ry - WEAVE_TILE_EDGE_UNDERLAY_PX : 0.0f;
+	const float bottom =
+	    (ry + rh + WEAVE_TILE_EDGE_UNDERLAY_PX < win_h) ? ry + rh + WEAVE_TILE_EDGE_UNDERLAY_PX : win_h;
+	const float atlas_w = win_w * 2.0f;
+
+	const auto strip = [&](float sx, float sy, float sw, float sh, float dx, float dy, float dw, float dh) {
+		if (dw <= 0.0f || dh <= 0.0f) {
+			return;
+		}
+		blit_to_atlas_texture(sys, res, src_srv, sx, sy, sw, sh, src_tex_w, src_tex_h, tile_x + dx, dy, dw, dh,
+		                      /*is_srgb*/ false, /*blend*/ nullptr, rtv, atlas_w, win_h);
+	};
+
+	strip(src_x + near_edge, src_y, texel, src_h, left, top, rx - left, bottom - top);
+	strip(src_x + src_w - far_edge, src_y, texel, src_h, rx + rw, top, right - (rx + rw), bottom - top);
+	strip(src_x, src_y + near_edge, src_w, texel, rx, top, rw, ry - top);
+	strip(src_x, src_y + src_h - far_edge, src_w, texel, rx, ry + rh, rw, bottom - (ry + rh));
+}
+
 bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                xrt_graphics_buffer_handle_t in_handle,
@@ -32764,6 +32836,29 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 		const float src_tw = (float)idesc.Width;
 		const float src_th = (float)idesc.Height;
+		// Under a 2D layer the DP softens each tile's hole edge: give that edge the tile's own
+		// colour to blend with, not the cleared atlas. All margins first, so tiles overwrite them.
+		if (ov_srv != nullptr) {
+			for (uint32_t i = 0; i < rect_count; i++) {
+				const float rw = (float)rects[i].extent.w;
+				const float rh = (float)rects[i].extent.h;
+				const float rx = (float)rects[i].offset.w;
+				const float ry = (float)rects[i].offset.h;
+				bool lifted = false; // a lift-flagged rect holds 2D, not SBS, and draws from its stream
+				for (uint32_t k = 0; k < lift_count; k++) {
+					lifted = lifted || lift_rects[k].rect_index == i;
+				}
+				if (rw <= 0.0f || rh <= 0.0f || lifted) {
+					continue;
+				}
+				weave_extend_tile_edges(sys, &c->render, in_srv, rx, ry, rw / 2.0f, rh, src_tw, src_th,
+				                        0.0f, rx, ry, rw, rh, (float)win_w, (float)win_h,
+				                        c->render.weave_sbs_rtv.get());
+				weave_extend_tile_edges(sys, &c->render, in_srv, rx + rw / 2.0f, ry, rw / 2.0f, rh, src_tw,
+				                        src_th, (float)win_w, rx, ry, rw, rh, (float)win_w,
+				                        (float)win_h, c->render.weave_sbs_rtv.get());
+			}
+		}
 		for (uint32_t i = 0; i < rect_count; i++) {
 			const float rw = (float)rects[i].extent.w;
 			const float rh = (float)rects[i].extent.h;
