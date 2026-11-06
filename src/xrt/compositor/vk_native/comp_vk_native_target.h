@@ -49,6 +49,18 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
                               bool transparent_background,
                               struct comp_vk_native_target **out_target);
 
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * Whether the compositor's (the app's) VkInstance can create an XCB surface.
+ * False when VK_KHR_xcb_surface is not enabled on it — the target then falls
+ * back to an Xlib surface over the same X11 window (#2322).
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_target_instance_has_xcb_surface(struct comp_vk_native_compositor *c);
+#endif
+
 /*!
  * Create a target from an already-built VkSurfaceKHR (direct-scanout path,
  * ST-5539). The window backend owns the surface — the target borrows it and
