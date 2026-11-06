@@ -30,6 +30,8 @@ add_library(
 	u_conv_viewsyn.h
 	u_cursor_depth.c
 	u_cursor_depth.h
+	u_stereo_comfort.c
+	u_stereo_comfort.h
 	u_lift_autoconv.c
 	u_lift_autoconv.h
 	u_lift_cursor.c

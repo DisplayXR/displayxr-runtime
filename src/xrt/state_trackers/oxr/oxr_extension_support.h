@@ -703,6 +703,21 @@
 
 
 /*
+ * XR_DXR_stereo_comfort
+ *
+ * Hand-added DisplayXR extension. No entry points: an optional next-chain input
+ * on XrViewLocateInfo and a next-chain output on XrViewState.
+ */
+#if defined(XR_DXR_stereo_comfort)
+#define OXR_HAVE_DXR_stereo_comfort
+#define OXR_EXTENSION_SUPPORT_DXR_stereo_comfort(_) \
+    _(DXR_stereo_comfort, DXR_STEREO_COMFORT)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_stereo_comfort(_)
+#endif
+
+
+/*
  * XR_DXR_cursor_depth
  *
  * Hand-added DisplayXR extension (ADR-046). No entry points: a next-chain
@@ -1383,6 +1398,7 @@
     OXR_EXTENSION_SUPPORT_DXR_view_rig(_) \
     OXR_EXTENSION_SUPPORT_DXR_depth_budget(_) \
     OXR_EXTENSION_SUPPORT_DXR_cursor_depth(_) \
+    OXR_EXTENSION_SUPPORT_DXR_stereo_comfort(_) \
     OXR_EXTENSION_SUPPORT_DXR_swapchain_color_encoding(_) \
     OXR_EXTENSION_SUPPORT_DXR_display_zones(_) \
     OXR_EXTENSION_SUPPORT_DXR_weave(_) \

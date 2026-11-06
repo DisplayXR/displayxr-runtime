@@ -231,6 +231,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(frame_timing_spew, "OXR_FRAME_TIMING_SPEW", false)
 // Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h). Kill switch.
 DEBUG_GET_ONCE_BOOL_OPTION(mono_auto_2d, "DXR_MONO_AUTO_2D", true)
 DEBUG_GET_ONCE_BOOL_OPTION(cursor_measure, "DXR_CURSOR_MEASURE", true)
+DEBUG_GET_ONCE_OPTION(comfort_zone, "DXR_COMFORT_ZONE", NULL)
+DEBUG_GET_ONCE_FLOAT_OPTION(comfort_depth_scale, "DXR_COMFORT_DEPTH_SCALE", 1.0f)
 DEBUG_GET_ONCE_BOOL_OPTION(hand_tracking_prioritize_conforming, "OXR_HAND_TRACKING_PRIORITIZE_CONFORMING", false)
 
 /*
@@ -2204,6 +2206,78 @@ adjust_fov(const struct xrt_fov *original_fov, const struct xrt_quat *original_r
 	    .angle_down = original_fov->angle_down + euler_angles.x,
 	};
 }
+
+#ifdef OXR_HAVE_DXR_stereo_comfort
+/*
+ * XR_DXR_stereo_comfort - the comfort zone for the current viewer.
+ *
+ * V: the tracked eyes' mean distance from the display plane (the app's raw
+ * block when it chains one and it is tracking - that covers IPC - else the
+ * in-process cache), else the nominal viewer. Zone: the app's request, else
+ * DXR_COMFORT_ZONE (shibata | percival | <diopters>), else Shibata, the web
+ * SDK's default. DXR_COMFORT_DEPTH_SCALE (0, 1] is the user's preference.
+ */
+static void
+oxr_session_fill_stereo_comfort(struct oxr_session *sess,
+                                const XrViewLocateInfo *info,
+                                const void *view_raw_ptr,
+                                XrStereoComfortDXR *out)
+{
+	enum u_stereo_comfort_zone zone = U_STEREO_COMFORT_ZONE_SHIBATA;
+	float custom = 0.0f;
+	(void)u_stereo_comfort_parse_zone(debug_get_option_comfort_zone(), &zone, &custom);
+
+	const XrStereoComfortRequestDXR *req =
+	    OXR_GET_INPUT_FROM_CHAIN(info, XR_TYPE_STEREO_COMFORT_REQUEST_DXR, XrStereoComfortRequestDXR);
+	if (req != NULL) {
+		if (req->zone == XR_STEREO_COMFORT_ZONE_SHIBATA_DXR) {
+			zone = U_STEREO_COMFORT_ZONE_SHIBATA;
+		} else if (req->zone == XR_STEREO_COMFORT_ZONE_PERCIVAL_DXR) {
+			zone = U_STEREO_COMFORT_ZONE_PERCIVAL;
+		} else if (req->zone == XR_STEREO_COMFORT_ZONE_CUSTOM_DXR && req->customDiopters > 0.0f) {
+			zone = U_STEREO_COMFORT_ZONE_CUSTOM;
+			custom = req->customDiopters;
+		}
+	}
+
+	float viewer = 0.0f;
+	bool tracked = false;
+#ifdef OXR_HAVE_DXR_view_rig
+	const XrViewDisplayRawDXR *raw = (const XrViewDisplayRawDXR *)view_raw_ptr;
+	if (raw != NULL && raw->isTracking && raw->eyeCountOutput > 0) {
+		float zsum = 0.0f;
+		for (uint32_t i = 0; i < raw->eyeCountOutput; i++) {
+			zsum += raw->rawEyes[i].z;
+		}
+		viewer = zsum / (float)raw->eyeCountOutput;
+		tracked = viewer > 0.0f;
+	}
+#else
+	(void)view_raw_ptr;
+#endif
+	if (!tracked && sess->comfort_eye_tracked && sess->comfort_eye_z_m > 0.0f) {
+		viewer = sess->comfort_eye_z_m;
+		tracked = true;
+	}
+	if (!tracked) {
+		oxr_session_get_nominal_viewer(sess, NULL, &viewer);
+	}
+
+	struct u_stereo_comfort c;
+	u_stereo_comfort_compute(zone, custom, viewer, debug_get_float_option_comfort_depth_scale(), &c);
+
+	out->zone = c.zone == U_STEREO_COMFORT_ZONE_PERCIVAL ? XR_STEREO_COMFORT_ZONE_PERCIVAL_DXR
+	            : c.zone == U_STEREO_COMFORT_ZONE_CUSTOM ? XR_STEREO_COMFORT_ZONE_CUSTOM_DXR
+	                                                     : XR_STEREO_COMFORT_ZONE_SHIBATA_DXR;
+	out->viewerDistanceMeters = c.viewer_m;
+	out->viewerTracked = tracked ? XR_TRUE : XR_FALSE;
+	out->frontDiopters = c.front_diopters;
+	out->behindDiopters = c.behind_diopters;
+	out->frontDisparityMeters = c.front_disparity_m;
+	out->behindDisparityMeters = c.behind_disparity_m;
+	out->userDepthScale = c.user_scale;
+}
+#endif
 
 #ifdef OXR_HAVE_DXR_depth_budget
 /*
@@ -4342,6 +4416,20 @@ locate_views_one(struct oxr_logger *log,
 		// synthesizes eyes; multi-view fill is the DP's responsibility.
 		// Captured before the legacy-2D center override below (a render-side
 		// concept, not a raw input).
+#ifdef OXR_HAVE_DXR_stereo_comfort
+		// XR_DXR_stereo_comfort: remember the tracked viewer distance even when
+		// the app chains no raw block (eyes are display-space, +z toward the viewer).
+		if (have_eye_positions && have_eyes && eye_pos.is_tracking && eye_count > 0) {
+			float zsum = 0.0f;
+			for (uint32_t ei = 0; ei < eye_count; ei++) {
+				zsum += adj_eyes[ei].z;
+			}
+			sess->comfort_eye_z_m = zsum / (float)eye_count;
+			sess->comfort_eye_tracked = true;
+		} else {
+			sess->comfort_eye_tracked = false;
+		}
+#endif
 		if (view_raw != NULL && have_eye_positions) {
 			uint32_t raw_count = eye_count;
 			if (raw_count > XR_VIEW_RIG_MAX_RAW_EYES_DXR) {
@@ -4881,6 +4969,22 @@ locate_views_one(struct oxr_logger *log,
 				view_raw->sampleTimeNs = 0;
 				view_raw->isTracking = XR_FALSE;
 			}
+		}
+	}
+#endif
+
+#ifdef OXR_HAVE_DXR_stereo_comfort
+	// XR_DXR_stereo_comfort: after every eye writer (in-process above, the
+	// service's raw reply on IPC), so the raw block is final here.
+	if (sess->sys->inst->extensions.DXR_stereo_comfort) {
+		XrStereoComfortDXR *comfort =
+		    OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_STEREO_COMFORT_DXR, XrStereoComfortDXR);
+		if (comfort != NULL) {
+#ifdef OXR_HAVE_DXR_view_rig
+			oxr_session_fill_stereo_comfort(sess, viewLocateInfo, view_raw, comfort);
+#else
+			oxr_session_fill_stereo_comfort(sess, viewLocateInfo, NULL, comfort);
+#endif
 		}
 	}
 #endif

@@ -72,6 +72,7 @@ set(tests
     tests_aux_color_encoding
     tests_aux_grip_surface
     tests_aux_cursor_depth
+    tests_aux_stereo_comfort
     tests_aux_lift_cursor
     tests_aux_lift_autoconv
     tests_aux_rear_budget
