@@ -73,7 +73,7 @@ jobs:
 
   Build:
     needs: DetectChanges
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - uses: actions/checkout@v5
@@ -109,13 +109,13 @@ jobs:
 
   BuildInstaller:
     # Sequential after Build so a compile failure fails fast and we
-    # don't waste a second macos-14 runner on broken code. Both jobs
-    # use macos-14; the duplicated configure/build is the cost of
+    # don't waste a second macos-15 runner on broken code. Both jobs
+    # use macos-15; the duplicated configure/build is the cost of
     # keeping `Build` as a stable RelWithDebInfo+SERVICE+HYBRID compile
     # check while `BuildInstaller` exercises the Debug + plug-in path
     # that ships in the .pkg.
     needs: [DetectChanges, Build]
-    runs-on: macos-14
+    runs-on: macos-15
     # GH_TOKEN exposes the workflow's GITHUB_TOKEN to the gh CLI AND to
     # softprops/action-gh-release (which prefers $GH_TOKEN over the
     # action's `token:` input when set). Without this, the action falls
