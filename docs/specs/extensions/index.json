@@ -82,6 +82,11 @@
       "title": "Depth-Aware Cursor",
       "summary": "Opt-in: the app reports the nearest content under the cursor at xrLocateViews; the runtime places a cursor sprite just in front of it (and, since v5, draws it, with the app's own sprite or the OS cursor's look; since v8 also on any woven rect, so a web page's cursor is drawn by the runtime with the browser's real cursor), so the pointer never sits behind 3D content"
     },
+    "XR_DXR_stereo_comfort": {
+      "group": "rendering",
+      "title": "Stereo Comfort Zone",
+      "summary": "Opt-in: xrLocateViews reports the comfort zone for the current viewer (diopter bounds in front of and behind the glass, and the matching on-glass disparity, at the tracked or nominal viewing distance, with the user's depth preference applied), so an app sizes its eye separation from the display instead of a hard-coded percentage"
+    },
     "XR_DXR_weave": {
       "group": "rendering",
       "title": "Window Weave Service",

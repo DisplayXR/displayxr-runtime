@@ -32,6 +32,7 @@
 #include "util/u_screen_home.h"
 #include "util/u_device.h"
 #include "util/u_cursor_depth.h"
+#include "util/u_stereo_comfort.h"
 #include "util/u_tracking_any.h"
 #include "util/u_mono_auto_2d.h"
 
@@ -3394,6 +3395,12 @@ struct oxr_session
 	//! only by a locate that chains an XrCursorDepthHintDXR - a session that
 	//! never sends a hint never steps it.
 	struct u_cursor_depth_filter cursor_depth_filter;
+#ifdef OXR_HAVE_DXR_stereo_comfort
+	//! XR_DXR_stereo_comfort: the last tracked eyes' mean distance from the
+	//! display plane (in-process locate), for a locate that chains no raw block.
+	float comfort_eye_z_m;
+	bool comfort_eye_tracked;
+#endif
 	//! XR_DXR_cursor_depth v3: HYBRID anchor state, beside the filter and
 	//! under the same rule (only a hinted locate touches it). Dropped
 	//! whenever the filter re-primes.
