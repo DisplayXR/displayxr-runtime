@@ -132,6 +132,13 @@ if(XRT_FEATURE_HYBRID_MODE)
 	endif()
 elseif(XRT_FEATURE_IPC_CLIENT)
 	target_link_libraries(${RUNTIME_TARGET} PUBLIC st_oxr ipc_client comp_client comp_multi)
+	# st_oxr, comp_multi and comp_vk_native call into qwerty behind
+	# XRT_BUILD_DRIVER_QWERTY but link only drv_qwerty_includes: the symbols
+	# normally arrive through target_lists, which an IPC-only runtime does not
+	# link. Link the driver itself so a qwerty build of --service links (#2355).
+	if(XRT_BUILD_DRIVER_QWERTY AND TARGET drv_qwerty)
+		target_link_libraries(${RUNTIME_TARGET} PUBLIC drv_qwerty)
+	endif()
 else()
 	target_link_libraries(
 		${RUNTIME_TARGET}
