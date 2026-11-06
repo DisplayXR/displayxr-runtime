@@ -66,6 +66,7 @@ issues: [439, 396]
 >   `SHADER_READ_ONLY_OPTIMAL` when process_atlas' command buffer executes. First producer: the
 >   desktop-Linux weave engine (`comp_multi_weave_linux.c`); off-panel bands and flat regions
 >   painted after the weave get the layer redrawn over them, so 2D stays readable across a seam. 2D-*under*-3D (`set_background_2d`) is unchanged.
+> - Hole-edge contract: a DP that band-limits the layer softens each alpha-0 hole's edge, so coverage drops below 1 just **outside** the tile and the DP blends the atlas in there. The atlas must therefore be continuous past the tile, not the cleared (0,0,0,0), or every windowed tile gets a dark line at any page colour. The D3D11 batch weave repeats each tile's edge pixels 16 px outward whenever a layer is present (`weave_extend_tile_edges`); the opaque page covers that margin everywhere the filter does not reach.
 > - Browser use (decided 2026-10): the layer is the **whole flat page** with the woven tiles
 >   as alpha-0 holes, not only the 2D lifted over tiles — the aliasing users saw was page text
 >   around the canvas. While any tile exists the browser submits every frame; a submit whose
