@@ -1134,6 +1134,78 @@ glue_viewsyn_draw(d3d11_lift *l,
 	return true;
 }
 
+static uint32_t
+dxgi_texel_bytes(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_R32_FLOAT: return 4;
+	case DXGI_FORMAT_R8_UNORM: return 1;
+	case DXGI_FORMAT_R16_FLOAT:
+	case DXGI_FORMAT_R16_UNORM: return 2;
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+	default: return 0;
+	}
+}
+
+/*!
+ * S5 input that is CPU memory, uploaded into a one-shot texture (parity with
+ * the Vulkan glue, which stages CPU inputs into scratch). A CPU-input provider
+ * (Open Conversion) is handed the colour as CPU bytes, and that same image is
+ * what S5 synthesises from: without this, glue_find() fails, S5 returns false
+ * and every composed frame is dropped with nothing logged. Created with its
+ * data so no context is touched here; the caller releases it after the draw.
+ */
+static bool
+viewsyn_cpu_upload(d3d11_lift *l, const struct xrt_conv_image *img, glue_img *out)
+{
+	if (img->memory_kind != XRT_CONV_MEM_CPU || img->cpu_ptr == nullptr || img->width == 0 || img->height == 0) {
+		return false;
+	}
+	const DXGI_FORMAT f = conv_fmt_to_dxgi(img->format);
+	const uint32_t bpp = dxgi_texel_bytes(f);
+	if (bpp == 0) {
+		return false;
+	}
+	const uint64_t row = (uint64_t)img->width * bpp;
+	const uint64_t stride = img->row_stride != 0 ? img->row_stride : row;
+	if (stride < row || (img->byte_size != 0 && stride * (img->height - 1) + row > img->byte_size)) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = img->width;
+	td.Height = img->height;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = f;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA sd = {};
+	sd.pSysMem = img->cpu_ptr;
+	sd.SysMemPitch = (UINT)stride;
+	glue_img g;
+	if (FAILED(l->svc_device->CreateTexture2D(&td, &sd, &g.tex))) {
+		return false;
+	}
+	D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
+	vd.Format = typed_srv_format(f);
+	vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	vd.Texture2D.MipLevels = 1;
+	if (FAILED(l->svc_device->CreateShaderResourceView(g.tex, &vd, &g.srv))) {
+		glue_img_release(g);
+		return false;
+	}
+	g.w = img->width;
+	g.h = img->height;
+	g.dxgi = f;
+	*out = g;
+	return true;
+}
+
 //! S5: the reference view synthesis on the service device.
 static bool
 glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
@@ -1144,7 +1216,9 @@ glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
 		return false;
 	}
 	glue_img c, d, t;
-	bool ok = glue_find(l, req->color->import_key, &c) && glue_find(l, req->depth->import_key, &d) &&
+	bool c_tmp = false, d_tmp = false;
+	bool ok = (glue_find(l, req->color->import_key, &c) || (c_tmp = viewsyn_cpu_upload(l, req->color, &c))) &&
+	          (glue_find(l, req->depth->import_key, &d) || (d_tmp = viewsyn_cpu_upload(l, req->depth, &d))) &&
 	          glue_find(l, req->target->import_key, &t);
 	std::lock_guard<std::mutex> vg(l->viewsyn_mtx);
 	if (ok && l->viewsyn == nullptr && !l->viewsyn_tried) {
@@ -1197,6 +1271,12 @@ glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
 	}
 	if (held_c) {
 		img_release(c.km, req->color);
+	}
+	if (c_tmp) {
+		glue_img_release(c);
+	}
+	if (d_tmp) {
+		glue_img_release(d);
 	}
 	glue_leave(l);
 	return ok;
