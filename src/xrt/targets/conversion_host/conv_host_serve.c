@@ -865,6 +865,12 @@ input_get_locked(struct conv_host_serve *s,
 		out->sync.import_key = ((uint64_t)0x5Cu << 56) | sync_idx;
 		out->sync.acquire_value = fence_value;
 		out->sync.release_value = 0;
+	} else if (out->memory_kind != XRT_CONV_MEM_CPU && out->sync.kind == XRT_CONV_SYNC_KEYED_MUTEX) {
+		// A keyed mutex lives on the image itself: no separate handle travels, so
+		// sync_handle is 0, yet the provider must still acquire it. Reading a
+		// keyed-mutex texture without AcquireSync returns zeros: every converted
+		// frame came back black (the service hands its core images over keyed).
+		out->sync.handle = 0;
 	} else if (out->memory_kind == XRT_CONV_MEM_CPU || in->sync_handle == 0) {
 		out->sync.kind = XRT_CONV_SYNC_NONE;
 	} else {
