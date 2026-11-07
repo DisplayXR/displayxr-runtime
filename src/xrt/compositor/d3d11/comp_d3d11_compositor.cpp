@@ -7801,6 +7801,13 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		d3d11_compositor_destroy(&c->base.base);
 		return xret;
 	}
+	// #2564: bound the atlas's grow headroom by the worst case across modes.
+	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
+		uint32_t cap_w = 0, cap_h = 0;
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes, c->xdev->rendering_mode_count, &cap_w,
+		                              &cap_h);
+		comp_d3d11_renderer_set_atlas_cap(c->renderer, cap_w, cap_h);
+	}
 
 	/*
 	 * #918 Phase 2a — the masked 2D-over-3D composite unit, on the OUTPUT device.

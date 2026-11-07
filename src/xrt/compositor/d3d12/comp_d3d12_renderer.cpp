@@ -19,6 +19,7 @@
 #include "util/u_cursor_depth.h"
 
 #include "util/comp_layer_accum.h"
+#include "util/u_tiling.h"
 // #1580: the ONE per-view camera every layer type is projected through, plus
 // the composition policy (eye visibility, quad facing, the blend rule) that
 // goes with it. Shared across every backend so the answer cannot depend on
@@ -543,6 +544,11 @@ struct comp_d3d12_renderer
 	uint32_t atlas_alloc_width;
 	uint32_t atlas_alloc_height;
 
+	//! #2564: worst-case atlas extent across the device's modes; a grow adds
+	//! headroom up to it (u_tiling_grow_atlas_extent). 0 = no cap known.
+	uint32_t atlas_cap_width;
+	uint32_t atlas_cap_height;
+
 	/*!
 	 * #1264 heavy-d3d12 reroute: the atlas is an EXTERNAL, imported resource
 	 * (a D3D11 deposit slot opened via OpenSharedHandle) the renderer does
@@ -760,8 +766,11 @@ create_atlas_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32
 	// Content packs top-left; d3d12_crop_atlas_for_dp rect-crops it back out.
 	uint32_t content_w = r->tile_columns * width;       // Atlas: tile_columns views across
 	uint32_t content_h = r->tile_rows * r->view_height; // Atlas: tile_rows views tall
-	uint32_t alloc_w = content_w > r->atlas_alloc_width ? content_w : r->atlas_alloc_width;
-	uint32_t alloc_h = content_h > r->atlas_alloc_height ? content_h : r->atlas_alloc_height;
+	// #2564: a grow adds headroom (1.5x, 256 px aligned, capped at the
+	// worst case across modes) so a window resize drag does not reallocate on
+	// every step. The first allocation (nothing allocated yet) stays exact.
+	uint32_t alloc_w = u_tiling_grow_atlas_extent(r->atlas_alloc_width, content_w, r->atlas_cap_width);
+	uint32_t alloc_h = u_tiling_grow_atlas_extent(r->atlas_alloc_height, content_h, r->atlas_cap_height);
 
 	D3D12_HEAP_PROPERTIES heap_props = {};
 	heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -4672,6 +4681,15 @@ comp_d3d12_renderer_set_external_atlas(struct comp_d3d12_renderer *renderer,
 	return XRT_SUCCESS;
 }
 
+extern "C" void
+comp_d3d12_renderer_set_atlas_cap(struct comp_d3d12_renderer *renderer, uint32_t cap_width, uint32_t cap_height)
+{
+	if (renderer != nullptr) {
+		renderer->atlas_cap_width = cap_width;
+		renderer->atlas_cap_height = cap_height;
+	}
+}
+
 extern "C" xrt_result_t
 comp_d3d12_renderer_resize(struct comp_d3d12_renderer *renderer,
                            uint32_t new_view_width,
@@ -4720,12 +4738,11 @@ comp_d3d12_renderer_resize(struct comp_d3d12_renderer *renderer,
 		return XRT_SUCCESS;
 	}
 
-	// TEMP #602 instrumentation — counts genuine atlas (re)allocations; should
-	// stay tiny (≈ startup/warmup) and NOT climb per-frame. Remove before merge.
-	static uint32_t s_realloc_count = 0;
-	U_LOG_W("#602 D3D12 atlas (re)alloc #%u: view %ux%u -> %ux%u, tex_h %u -> %u", ++s_realloc_count,
-	        renderer->view_width, renderer->view_height, new_view_width, new_view_height,
-	        renderer->texture_height, new_texture_height);
+	// One WARN per genuine realloc: rare by construction (#602 high-water
+	// mark, #2564 headroom), so a climbing count is itself the regression.
+	U_LOG_W("D3D12 atlas realloc: alloc %ux%u, content now %ux%u (view %ux%u, cap %ux%u)",
+	        renderer->atlas_alloc_width, renderer->atlas_alloc_height, req_w, req_h, new_view_width,
+	        new_view_height, renderer->atlas_cap_width, renderer->atlas_cap_height);
 
 	// Genuine grow (first allocation / display-mode change / content larger
 	// than any seen before). Release the old resource and recreate; the

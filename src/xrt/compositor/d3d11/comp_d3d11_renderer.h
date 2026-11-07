@@ -377,6 +377,17 @@ void *
 comp_d3d11_renderer_get_atlas_texture(struct comp_d3d11_renderer *renderer);
 
 /*!
+ * #2564: the worst-case atlas extent (u_tiling_compute_system_atlas over the
+ * device's modes). A genuine atlas grow adds headroom up to it, so a window
+ * resize drag costs one or two reallocations instead of one per step.
+ * 0 = no cap known (the grow still never goes below what the content needs).
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_renderer_set_atlas_cap(struct comp_d3d11_renderer *renderer, uint32_t cap_width, uint32_t cap_height);
+
+/*!
  * Resize the renderer's atlas texture to match a new view size.
  *
  * Recreates the atlas texture, SRV, RTV, depth texture, and DSV at the

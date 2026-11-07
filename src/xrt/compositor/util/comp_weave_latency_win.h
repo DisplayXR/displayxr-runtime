@@ -1133,6 +1133,55 @@ struct late_weave_governor
 	 * probe-dwell doubling pins it there for minutes after restore. Treat
 	 * it exactly like the pause: reset the signal, contribute nothing.
 	 */
+	/*!
+	 * #2564: the window is being resized. A resize drag runs the app inside
+	 * the window manager's modal size loop: frames arrive in bursts with
+	 * 40-130 ms gaps, under the 250 ms pause rule in on_mark, so they read
+	 * as saturation and vsync slips. Measured on cube_handle_d3d11_win: one
+	 * drag escalated 2 -> 3 (slip-rate), the return probe then "failed" and
+	 * doubled the dwell 30 -> 300 s, and the session sat at depth 3 (weave to
+	 * scanout 31 -> 48 ms) for minutes after the drag ended. The 3D stuttered
+	 * for as long as it stayed there.
+	 *
+	 * None of that is pipeline load, so hold: reset the signal now and
+	 * contribute nothing to it (no escalation, no probe, no dwell change)
+	 * until @ref kResizeHoldNs after the LAST resize. Call on every swapchain
+	 * resize; a drag renews the hold on each step.
+	 */
+	static constexpr double kResizeHoldNs = 500e6;
+	uint64_t resize_hold_until_qpc = 0;
+	bool resize_hold_logged = false;
+
+	//! #2564: is a resize hold in force right now? The target also skips its
+	//! stage-2 scanout wait while it is: ResizeBuffers makes the chain's
+	//! frame statistics disjoint, so that wait can only run to its bound.
+	bool
+	in_resize_hold() const
+	{
+		if (resize_hold_until_qpc == 0) {
+			return false;
+		}
+		LARGE_INTEGER now_li;
+		QueryPerformanceCounter(&now_li);
+		return (uint64_t)now_li.QuadPart < resize_hold_until_qpc;
+	}
+
+	void
+	on_resize(uint64_t freq_hz)
+	{
+		LARGE_INTEGER now_li;
+		QueryPerformanceCounter(&now_li);
+		resize_hold_until_qpc =
+		    (uint64_t)now_li.QuadPart + (uint64_t)(kResizeHoldNs * (double)freq_hz / 1e9);
+		on_wait_timeout();
+		if (!resize_hold_logged) {
+			resize_hold_logged = true;
+			U_LOG_W("Late-weave governor: window resize -- depth %d held while resizing and %.0f ms "
+			        "after; a drag's frame cadence is not a saturation signal (#2564; logged once)",
+			        effective, kResizeHoldNs / 1e6);
+		}
+	}
+
 	void
 	on_wait_timeout()
 	{
@@ -1171,6 +1220,16 @@ struct late_weave_governor
 		LARGE_INTEGER now_li;
 		QueryPerformanceCounter(&now_li);
 		const uint64_t now = (uint64_t)now_li.QuadPart;
+
+		// #2564: inside a resize hold the cadence says nothing about load.
+		if (resize_hold_until_qpc != 0) {
+			if (now < resize_hold_until_qpc) {
+				on_wait_timeout();
+				wait_frame_qpc = 0;
+				return 0;
+			}
+			resize_hold_until_qpc = 0;
+		}
 
 		double dt_ns = 0.0;
 		if (last_mark_qpc != 0 && now > last_mark_qpc) {
