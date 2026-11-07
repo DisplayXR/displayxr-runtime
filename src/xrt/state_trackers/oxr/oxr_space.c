@@ -210,7 +210,7 @@ rig_local_plane_correction(struct oxr_session *sess,
 	struct xrt_pose plane = XRT_POSE_IDENTITY;
 	float s = 1.0f;
 	const bool rig_plane = oxr_session_get_rig_local_plane(sess, &plane, &s);
-	if (!rig_plane && !sess->has_external_window && !sess->is_bridge_relay) {
+	if (!rig_plane && !oxr_session_views_display_relative(sess)) {
 		return false; // The plane IS the head device pose: the graph is right.
 	}
 	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
@@ -561,7 +561,7 @@ oxr_space_display_create(struct oxr_logger *log,
 	 */
 	struct xrt_space *xspace = NULL;
 	xrt_result_t xret;
-	if (!sess->has_external_window && !sess->is_bridge_relay) {
+	if (!oxr_session_views_display_relative(sess)) {
 		xret = xrt_space_overseer_create_pose_space(sess->sys->xso, head, XRT_INPUT_GENERIC_HEAD_POSE, &xspace);
 		OXR_CHECK_XRET(log, sess, xret, xrt_space_overseer_create_pose_space);
 	} else {

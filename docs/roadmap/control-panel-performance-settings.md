@@ -361,7 +361,7 @@ never claim a mode the runtime is not in, and "Custom" falls out for free.
 ## Appendix A — census
 
 Every `DXR_*` name read at runtime under `src/xrt`, with its read site, mechanism, default
-and tier. **112 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
+and tier. **113 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
 `bg2d_int_knob()` rather than a literal `getenv` at the listed line.
 
 Process column: **App** = the runtime DLL, loaded into the OpenXR app's process ·
@@ -373,6 +373,7 @@ library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, contr
 | Var | Read site | Mechanism | Default | Proc | Tier | What it does |
 |---|---|---|---|---|---|---|
 | `DXR_LEGACY_CAMERA_RIG` | `auxiliary/util/u_camera_profile.c` | Process environment at the first eligible session per instance (Windows: `GetEnvironmentVariableW`) | Per-executable JSON profile, otherwise qwerty defaults | App | 1 | Inline camera-rig JSON or a UTF-8 file path; seeds instance-wide native legacy camera tuning and Space reset. [Profile contract](../specs/runtime/legacy-camera-profile.md). Excludes display-aware and headless-only/external-only/workspace-only instances; headless siblings of an eligible native session share its tuning |
+| `DXR_HOSTED_RAW_VIEWS` | `state_trackers/oxr/oxr_session.c` (`oxr_session_create`, sets `oxr_session::hosted_raw_views`; read through `oxr_session_views_display_relative()`) | `DEBUG_GET_ONCE_BOOL` | off | App | 4 | #2322 opt-in: an **in-process hosted** session of an app that enabled `XR_DXR_display_info` takes the RAW view contract of an external-window session, so `XrView.pose` is the display processor's eyes relative to the display plane (identity orientation) instead of the render-ready `T_base_head` chain, and the display plane space / RIG_LOCAL hands follow it. For a launcher that runs a display-aware Windows app under a translation layer: the app does its own view math but cannot hand over a native window. Ignored (one WARN) for a legacy app, a bridge relay and an IPC session. Tier 4 because it changes an app's view contract: only the launcher of an app known to consume RAW views may set it. Default hosted behaviour and its rationale: [ADR-024](../adr/ADR-024-raw-vs-render-ready-views.md) Amendment 1 point 3 |
 
 ### Weave / present pipeline
 

@@ -3259,6 +3259,17 @@ struct oxr_session
 	//! view poses like a handle app (display-local, no world_head_pos offset).
 	bool is_bridge_relay;
 
+	//! True for an in-process HOSTED session (the runtime owns the window)
+	//! of an app that enabled XR_DXR_display_info, when the process opted in
+	//! with DXR_HOSTED_RAW_VIEWS=1 (#2322). Such a session takes the RAW view
+	//! contract of an external-window session (ADR-024 Amendment 1): XrView.pose
+	//! is the display processor's eyes relative to the display plane, identity
+	//! orientation. For a Windows app under a translation layer that cannot
+	//! hand over a native window but does its own view math. Off by default:
+	//! a hosted session keeps render-ready views. Read through
+	//! oxr_session_views_display_relative(), never on its own.
+	bool hosted_raw_views;
+
 	//! XR_DXR_view_rig (#396 W7): per-session rig parse state. A rig chained
 	//! on a locate drives the view math for that locate (lifting the
 	//! external-window display-centric forcing); locates that chain nothing
@@ -3860,6 +3871,18 @@ struct oxr_session
 	void *workspace_modal_cbt_hook;     //!< HHOOK, opaque to portable code.
 #endif
 };
+
+/*!
+ * True when this session's views are DISPLAY-PLANE-RELATIVE (the RAW contract,
+ * ADR-024 Amendment 1): its display plane is the identity at the head's
+ * tracking origin instead of the head device pose. External-window sessions,
+ * bridge relays, and hosted sessions that opted into raw views (#2322).
+ */
+static inline bool
+oxr_session_views_display_relative(const struct oxr_session *sess)
+{
+	return sess->has_external_window || sess->is_bridge_relay || sess->hosted_raw_views;
+}
 
 /*!
  * Returns XR_SUCCESS or XR_SESSION_LOSS_PENDING as appropriate.

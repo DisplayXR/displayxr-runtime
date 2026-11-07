@@ -137,6 +137,19 @@ patched one class with a per-class constant.
    tracked eyes: `XrViewDisplayRawDXR` on `XrViewState::next` is filled
    whenever eye positions exist, with no window condition, which is the
    channel this ADR reserves for aware consumers that do their own math.
+   *Opt-in for hosted sessions (#2322):* a launcher that knows its app wants
+   RAW `XrView.pose` and cannot bind a window (a display-aware Windows app
+   under a translation layer) sets `DXR_HOSTED_RAW_VIEWS=1`. An in-process
+   hosted session of an app that enabled `XR_DXR_display_info` then joins the
+   display-relative class (`oxr_session_views_display_relative()`): RAW views,
+   the display plane at the identity, RIG_LOCAL hands on that plane. It is an
+   opt-in and not a rule keyed on what the app enables or chains, because both
+   candidate signals are already taken: `XR_DXR_display_info` alone is what
+   in-tree hosted extension apps enable while rendering from render-ready
+   views (`cube_hosted_metal_macos`), and `XrViewDisplayRawDXR` is a result
+   channel that by this ADR never changes `XrView`, which consumers that read
+   both rely on. Legacy, bridge-relay and IPC sessions ignore it (over IPC
+   the server's per-view poses for a hosted client are head-local).
 4. **No reference space is redefined per session class.** LOCAL stays the
    root + (0, 1.6, 0) of upstream Monado — what legacy VR titles expect: STAGE at
    the floor, the head standing at 1.6 m — and the qwerty rig is seeded at the same
