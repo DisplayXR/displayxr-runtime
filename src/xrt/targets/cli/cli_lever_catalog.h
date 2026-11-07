@@ -9,7 +9,7 @@
  * Edit the census and re-run the script; the lint workflow runs it with
  * --check, which also fails when a name here no longer occurs in src/xrt.
  *
- * 72 levers: 53 Tier 1 (next launch), 19 Tier 2 (service-scoped).
+ * 73 levers: 54 Tier 1 (next launch), 19 Tier 2 (service-scoped).
  *
  * This is a DESCRIPTION of the levers, not a way to set them: only the names
  * u_setting_is_managed() accepts resolve from the per-user / machine stores.
@@ -57,6 +57,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_HUB", 1, "App", "on (cross-adapter and single adapter; =0 kills)", "#2317 step 2 (ADR-059 decision 4): the in-process D3D11 leg weaves and presents through the D3D11 hub (comp_hub_d3d11) for every session that passes its create-time checks, on the cross-adapter..."},
 	{"DXR_L2D_CLIP", 1, "App", "on", "#862 clips the Local2D composite to non-identity pixels"},
 	{"DXR_LATE_WEAVE", 1, "App + Svc", "on", "Weave as late as possible before scanout."},
+	{"DXR_LATE_WEAVE_SCANOUT_WAIT", 1, "App", "auto: stage 2 on only for a chain DXGI reports scanning out directly (OVERLAY/independent flip, 30 consecutive frames), off while COMPOSED or unknown; 0 forces off, 1 forces on", "#2564: the stage-2 scanout wait cannot help a DWM-composed window (the present after scanout always misses DWM's vblank pickup) and was the source of depth-1 30 fps, governor churn and resize-drag..."},
 	{"DXR_LATE_WEAVE_SLIP_CAP", 1, "App + Svc", "on (0 = pre-2026-09 policy)", "Damps governor depth flapping: slip-rate escalation capped at needed_depth()+1, return probe needs 3 clean slip windows, slip re-escalation within two dwells of a probe doubles the dwell (30 -> 60..."},
 	{"DXR_LEGACY_CAMERA_RIG", 1, "App", "Per-executable JSON profile, otherwise qwerty defaults", "Inline camera-rig JSON or a UTF-8 file path; seeds instance-wide native legacy camera tuning and Space reset."},
 	{"DXR_LINUX_DIRECT_SCANOUT", 1, "App", "off", "Opt-in RandR direct-scanout present path on Linux"},
