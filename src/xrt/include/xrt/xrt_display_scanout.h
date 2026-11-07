@@ -118,8 +118,16 @@ struct xrt_dp_scanout_caps
 	//! weave needs 1:1 pixels), so nothing changes for it.
 	uint32_t flags;
 
+	//! @ref xrt_dp_stereo_layout, as `uint32_t` for a fixed-width ABI: what the
+	//! DP's output is, for a stereo desktop compositor. Carved out of the first
+	//! word of `reserved[]`: same size and offsets, and a plug-in built before
+	//! the field existed wrote 0 here, an ordinary weave, so nothing changes
+	//! for it. A value the runtime does not recognise is read as 0 (see
+	//! @ref xrt_dp_stereo_layout_clamp), the way `weave_scope` is clamped.
+	uint32_t stereo_layout;
+
 	//! Reserved for future scanout capabilities. Plug-ins MUST write 0.
-	uint32_t reserved[5];
+	uint32_t reserved[4];
 };
 
 /*!
@@ -157,6 +165,53 @@ struct xrt_dp_scanout_caps
  * @ingroup xrt_iface
  */
 #define XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN (1u << 1)
+
+/*!
+ * What a DP's output is, for a stereo desktop compositor. Stored in
+ * @ref xrt_dp_scanout_caps::stereo_layout as a `uint32_t`.
+ *
+ * The values are the 3D_Structure numbers of HDMI 1.4b (the 3D_Structure field of
+ * the HDMI Vendor-Specific InfoFrame, section 8.2.3; the same numbers the Linux
+ * kernel names in `enum hdmi_3d_structure`, include/linux/hdmi.h), so one number
+ * names one layout in every API that carries it. Only the values this runtime acts on
+ * are named; any other value is read as @ref XRT_DP_STEREO_LAYOUT_WEAVE.
+ *
+ * **0 is not HDMI's 0.** In HDMI 1.4b the value 0 is 3D_Structure "Frame
+ * packing". Here 0 means "an ordinary weave, nothing for a stereo compositor",
+ * because that is what every plug-in built before this field already writes
+ * there. The runtime acts on no frame packing output today; whoever adds one
+ * gives it a value of its own (or moves this field to a version of its own)
+ * instead of reusing 0.
+ *
+ * @ingroup xrt_iface
+ */
+enum xrt_dp_stereo_layout
+{
+	/*! An ordinary weave (or anything else the window shows as it is). **The
+	 *  default**: a plug-in built before the field, an absent or NULL
+	 *  `get_scanout_caps` slot, and every value this runtime does not know. */
+	XRT_DP_STEREO_LAYOUT_WEAVE = 0,
+
+	/*! HDMI 1.4b 3D_Structure value 3, "Side-by-Side (Full)": THIS instance's
+	 *  output, in its current mode, is the views placed side by side, view 0
+	 *  (the left eye) first, each at the resolution its tile was rendered at,
+	 *  untouched. The DP keeps no knowledge of the screen: a stereo desktop
+	 *  compositor resizes the views once and turns them into what each output
+	 *  needs (a 3D television's HDMI 3D mode, anaglyph on a 2D monitor, the
+	 *  left view alone on a plain 2D output).
+	 *
+	 *  When the DP reports it and the window system offers a stereo
+	 *  declaration, the runtime presents a target as wide as the views laid
+	 *  side by side (twice the window's width for two views) and declares the
+	 *  window as holding them, once; the window keeps its size on screen. Where
+	 *  no declaration is offered the target stays the window's size and the
+	 *  runtime says so in its log, so the window shows the two views side by
+	 *  side, flat.
+	 *
+	 *  Set per INSTANCE and per MODE (re-read when the rendering mode changes,
+	 *  like @ref XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE). */
+	XRT_DP_STEREO_LAYOUT_SIDE_BY_SIDE_FULL = 3,
+};
 
 /*!
  * Size of the V1 caps shape. Plug-ins accept any caller `struct_size >= ` this
@@ -208,6 +263,23 @@ xrt_dp_weave_scope_clamp(uint32_t raw)
 	case XRT_DP_WEAVE_SCOPE_REGION: return XRT_DP_WEAVE_SCOPE_REGION;
 	case XRT_DP_WEAVE_SCOPE_SCANOUT: return XRT_DP_WEAVE_SCOPE_SCANOUT;
 	default: return XRT_DP_WEAVE_SCOPE_CANVAS;
+	}
+}
+
+/*!
+ * Normalise a raw `stereo_layout` word to a layout this runtime understands.
+ * A plug-in built against a NEWER header may report a layout this runtime has
+ * never heard of; the safe reading of "unknown layout" is 0, an ordinary
+ * weave, because that is the behaviour every path already implements.
+ *
+ * @ingroup xrt_iface
+ */
+static inline enum xrt_dp_stereo_layout
+xrt_dp_stereo_layout_clamp(uint32_t raw)
+{
+	switch (raw) {
+	case XRT_DP_STEREO_LAYOUT_SIDE_BY_SIDE_FULL: return XRT_DP_STEREO_LAYOUT_SIDE_BY_SIDE_FULL;
+	default: return XRT_DP_STEREO_LAYOUT_WEAVE;
 	}
 }
 

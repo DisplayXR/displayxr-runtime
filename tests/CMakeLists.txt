@@ -32,6 +32,7 @@ set(tests
     tests_dp_weave_scope
     tests_dp_windowless_d3d11
     tests_dp_vk_snap_window_rect
+    tests_dp_full_sbs
     tests_weave_snap_grid
     tests_lift_mailbox
     tests_sim_conversion
