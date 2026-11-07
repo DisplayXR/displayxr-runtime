@@ -23,6 +23,21 @@ feeder (`src/xrt/compositor/vk_native/comp_vk_native_present_feedback.c`, #902):
 late weave aims at. Ubuntu 22.04 ships version 1 of this protocol; the vendored
 copy is version 2, and the feeder binds whichever the compositor offers.
 
+`kde-stereo-content-v1.xml` is not part of wayland-protocols: it is KDE's
+stereo declaration as Stereo KWin implements it (Sparky Stereo OS), copied
+verbatim from [libstereo-declare](https://github.com/Sparky-OS/libstereo-declare)
+(`protocol/kde-stereo-content-v1.xml`, commit `fe4b338`), MIT-CMU licensed
+(Daniel Campos Ramos; the copyright block at the top is the original one). The
+Vulkan compositor uses it (`comp_vk_native_wl_stereo.c`) when a display
+processor's output is full side by side (`xrt_dp_scanout_caps::stereo_layout` = 3):
+the app's surface is declared value 3, side by side with full width per eye, left
+first, so a stereo compositor shows each half to its own eye. The protocol was born in
+KDE (Stereo KWin is its first consumer) and keeps its name; any compositor can
+implement it unchanged, and it carries one value, so a `stereo_layout` other than 3
+puts nothing on the wire. The runtime binds
+version 2, the first in which a declared surface without a viewport destination
+is one view wide; a compositor without the global is told nothing.
+
 ## Why vendored
 
 `libwayland-dev` ships `wayland-scanner` but not the protocol XML, and the

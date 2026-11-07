@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="kde_stereo_content_v1">
+  <copyright><![CDATA[
+    SPDX-FileCopyrightText: 2026 Daniel Campos Ramos <Capitain_Jack@yahoo.com>
+
+    SPDX-License-Identifier: MIT-CMU
+    ]]></copyright>
+
+<interface name="kde_stereo_content_manager_v1" version="3">
+  <description summary="declare stereo content of surfaces">
+    A program tells the compositor that a surface's picture holds two
+    views, one per eye, packed full side by side, with the left eye first.
+    The compositor renders the declared surface once per eye with that
+    eye's view. The global being present announces support.
+
+    Since version 3, a program may also follow a surface's desktop depth
+    with get_depth, to draw the elements inside the surface at their own
+    depths.
+
+    Clients may use this protocol to declare stereo content. The version 1
+    wire values are stable; future requests must use a new interface version.
+    Destroying the manager does not affect declarations it created.
+  </description>
+
+  <request name="destroy" type="destructor">
+    <description summary="Destroy the stereo content manager."/>
+  </request>
+
+  <request name="create">
+    <description summary="Create a stereo content declaration for a surface">
+      Creates a kde_stereo_content_v1 object for the given surface. The
+      declaration is none until set_content is called. If the surface
+      already has a declaration, the already_declared error is raised.
+    </description>
+    <arg name="id" type="new_id" interface="kde_stereo_content_v1"/>
+    <arg name="surface" type="object" interface="wl_surface"/>
+  </request>
+
+  <enum name="error">
+    <entry name="already_declared" value="0" summary="the surface already has a stereo content declaration"/>
+  </enum>
+
+  <request name="get_depth" since="3">
+    <description summary="Follow and describe a surface's desktop depth">
+      Creates a kde_stereo_depth_v1 object for the given surface. A surface
+      may have any number of them, made by any part of the client, such as
+      a toolkit and its style, and independently of its stereo content
+      declaration.
+    </description>
+    <arg name="id" type="new_id" interface="kde_stereo_depth_v1"/>
+    <arg name="surface" type="object" interface="wl_surface"/>
+  </request>
+</interface>
+
+<interface name="kde_stereo_content_v1" version="3">
+  <description summary="stereo content declaration of one surface">
+    The declaration of one surface, created with
+    kde_stereo_content_manager_v1.create.
+
+    Since version 2, a surface declared side_by_side_full is one eye
+    wide and its buffer holds both eyes: unless a wp_viewport destination
+    is set, the surface's size is half the width the buffer would give it
+    (after the buffer scale, the buffer transform and a viewport source)
+    by the full height. A viewport destination, when set, is the size of
+    one eye. With version 1 the surface's size follows its buffer as for
+    any other surface, so a client that declares at version 1 maps the
+    buffer onto one eye's size itself, for example with a viewport.
+
+    Version 3 changes nothing in this interface.
+  </description>
+
+  <enum name="error">
+    <entry name="no_surface" value="0" summary="the surface no longer exists"/>
+  </enum>
+
+  <request name="destroy" type="destructor">
+    <description summary="Remove the declaration">
+      Resets the content to none on the next wl_surface commit. The surface
+      may receive a new declaration immediately.
+    </description>
+  </request>
+
+  <enum name="content">
+    <description summary="full side-by-side packing of the two views">
+      The value matches the X11 property _KDE_NET_WM_STEREO_CONTENT.
+    </description>
+    <entry name="none" value="0" summary="no stereo content"/>
+    <entry name="side_by_side_full" value="3" summary="side by side, full width per eye, left first"/>
+  </enum>
+
+  <request name="set_content">
+    <description summary="Declare the surface's stereo content">
+      Takes effect with the next commit of the surface. Unknown values
+      are treated as none. Declaring none clears the format and does not
+      destroy the declaration object.
+    </description>
+    <arg name="content" type="uint" enum="content" summary="packing and eye order"/>
+  </request>
+
+</interface>
+
+<interface name="kde_stereo_depth_v1" version="3">
+  <description summary="desktop depth of one surface">
+    The compositor shows the desktop's own surfaces at depth levels: the
+    active window at the screen, the windows lying behind it sunk, menus,
+    tooltips and popups popped. This object lets a client show depth
+    inside a surface as well, by drawing the surface's elements once per
+    eye at their own depths and handing the two views over full side by
+    side, declared with kde_stereo_content_v1:
+
+    - the compositor tells the client when the elements inside the surface
+      may be shown in depth, and which of the surface's edges lie on its
+      output's edge;
+    - the client marks such a pair as the desktop's own depth rather than
+      stereo content;
+    - a popup surface may declare its place.
+
+    The depth limits are the user's settings; the client reads them itself.
+
+    A surface may have any number of these objects. The depth state is sent
+    to each of them. The surface is marked as desktop depth while any of
+    its objects marks it, and its place is the one set most recently by any
+    of its objects that has one.
+
+    When the surface is destroyed, the object becomes inert: its requests
+    are ignored and no further event is sent.
+  </description>
+
+  <enum name="edge" bitfield="true">
+    <description summary="edges of a surface"/>
+    <entry name="left" value="1" summary="the left edge"/>
+    <entry name="top" value="2" summary="the top edge"/>
+    <entry name="right" value="4" summary="the right edge"/>
+    <entry name="bottom" value="8" summary="the bottom edge"/>
+  </enum>
+
+  <request name="destroy" type="destructor">
+    <description summary="Destroy the object">
+      The desktop depth mark and the place this object set are withdrawn
+      on the next wl_surface commit.
+    </description>
+  </request>
+
+  <event name="depth_state">
+    <description summary="Whether the surface may show depth inside it now">
+      Sent once after the object is created and again whenever either
+      value changes.
+
+      awake is nonzero while elements drawn inside the surface may be shown
+      in depth: the surface is on an output that shows stereo, and it is
+      awake, as the active window on top of what it overlaps, a popup, a
+      panel or a desktop widget is, rather than one of the windows lying
+      flat behind the active one. While the surface is not awake the client
+      draws it as for a 2D output.
+
+      output_edges are the edges of the surface, for a window those of its
+      frame, that touch an edge of its output. Nothing at such an edge comes
+      nearer than the screen.
+    </description>
+    <arg name="awake" type="uint" summary="nonzero while depth may be shown inside the surface"/>
+    <arg name="output_edges" type="uint" enum="edge" summary="the surface's edges on its output's edge"/>
+  </event>
+
+  <request name="set_desktop_depth">
+    <description summary="Mark the surface's pair as the desktop's own depth">
+      Nonzero marks the full side-by-side pair the surface shows, declared
+      with kde_stereo_content_v1 by this client or its graphics library, as
+      the desktop's own elements drawn once per eye rather than stereo
+      content: where the compositor treats stereo content differently, for
+      example in switching a display into a 3D mode, in stereo screenshots
+      or in estimating the depth of content, the surface counts as part of
+      the desktop. The compositor still shows each view in its eye. Zero
+      withdraws the mark.
+
+      Takes effect with the next wl_surface commit.
+    </description>
+    <arg name="desktop_depth" type="uint" summary="nonzero marks the pair, zero withdraws the mark"/>
+  </request>
+
+  <request name="set_place">
+    <description summary="Declare the place of a popup surface">
+      Declares where a popup surface (a menu, tooltip, popup or dialog) sits
+      in depth, as a fraction of the user's limits: -1 is the sunk limit, 0
+      the screen and 1 the popped limit; values beyond are limited to that
+      range. The compositor places the surface there under its own rules: a
+      surface at its output's edge stays at the screen, and a popup is never
+      behind the surface it was opened from. Without a place the compositor
+      places the surface itself. The place of a surface that is not a popup
+      is ignored.
+
+      Takes effect with the next wl_surface commit.
+    </description>
+    <arg name="depth" type="fixed" summary="the place, from -1 to 1 of the user's limits"/>
+  </request>
+
+  <request name="unset_place">
+    <description summary="Withdraw the declared place">
+      Withdraws the place this object set. Takes effect with the next
+      wl_surface commit.
+    </description>
+  </request>
+</interface>
+
+</protocol>
