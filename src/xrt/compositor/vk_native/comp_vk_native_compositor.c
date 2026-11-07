@@ -5936,8 +5936,14 @@ vk_full_sbs_refresh_locked(struct comp_vk_native_compositor *c)
 	if (c->display_processor != c->full_sbs.read_dp || idx != c->full_sbs.read_mode_index) {
 		c->full_sbs.read_dp = c->display_processor;
 		c->full_sbs.read_mode_index = idx;
+		// A 2D rendering mode (qwerty's V toggle, an app's request) hands the
+		// DP one view, which it passes through: no stereo pair, whatever the
+		// DP's own output setting is.
+		const struct xrt_rendering_mode *mode =
+		    (c->xdev != NULL && idx < c->xdev->rendering_mode_count) ? &c->xdev->rendering_modes[idx] : NULL;
+		const bool mode_is_stereo = mode == NULL || (mode->hardware_display_3d && mode->view_count >= 2);
 		c->full_sbs.dp_wants =
-		    c->display_processor != NULL &&
+		    c->display_processor != NULL && mode_is_stereo &&
 		    xrt_display_processor_vk_outputs_full_sbs((struct xrt_display_processor_vk *)c->display_processor);
 
 		bool declare = false;
