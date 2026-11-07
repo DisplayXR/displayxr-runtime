@@ -144,42 +144,10 @@ static bool g_repaint_holds_token = false;
  * compositor mutex. An unlocked present path would need an atomic here.
  */
 static bool g_app_holds_token = false;
-/*!
- * #2564: frame-latency tokens the semaphore holds beyond the governor's
- * current depth. Raising the depth (SetMaximumFrameLatency) hands the
- * semaphore the extra tokens; LOWERING it takes none back. Left alone, each
- * lowering leaves a permanent surplus: the stage-1 wait returns a frame early
- * forever, the app runs a frame ahead, and Present() blocks a full refresh
- * instead of the waitable. The weave then samples the eye a frame early (late
- * weave lost) and the forward horizon drifts. Measured after a resize drag
- * walked the governor 2 -> 1 -> 2 -> 3 -> 2: mark->present-return went from
- * 1.7 ms to 15.6 ms and stayed there. weave_mark pays this debt with
- * non-blocking takes before its wait. App thread only, under c->mutex.
- */
-static uint32_t g_lw_token_debt = 0;
-//! #2564: stage-2 gate state, see lw_stage2_allowed().
-static int g_stage2_override = -1; // -1 unprobed, 0 force off, 1 force on, 2 auto
-static int g_chain_composed = -1;  // -1 unknown, 0 direct, 1 composed by DWM
-static uint64_t g_chain_mode_probe_ns = 0;
-static uint32_t g_chain_direct_streak = 0; // consecutive direct-scanout readings
-static UINT g_chain_mode_last_pc = 0;      // PresentCount of the last reading
-//! #2564: the max frame latency last APPLIED to the chain (0 = none yet).
-static int g_lw_applied_latency = 0;
-
-//! #2564: apply a new max frame latency and account the semaphore change.
-static void
-lw_apply_latency(IDXGISwapChain2 *sc2, int lat)
-{
-	sc2->SetMaximumFrameLatency((UINT)lat);
-	if (g_lw_applied_latency > 0 && lat < g_lw_applied_latency) {
-		g_lw_token_debt += (uint32_t)(g_lw_applied_latency - lat);
-	} else if (g_lw_applied_latency > 0 && lat > g_lw_applied_latency) {
-		// A raise is paid in tokens by DXGI, which offsets anything owed.
-		const uint32_t up = (uint32_t)(lat - g_lw_applied_latency);
-		g_lw_token_debt = (g_lw_token_debt > up) ? g_lw_token_debt - up : 0;
-	}
-	g_lw_applied_latency = lat;
-}
+//! #2564: frame-latency token ledger and stage-2 gate for this chain (see
+//! comp_weave_latency_win.h). One target per process on this path.
+static late_weave_token_ledger g_lw_ledger_d3d11;
+static late_weave_stage2_gate g_lw_stage2_d3d11;
 // A repaint has been marked and its present is next on the repaint thread;
 // that present (and only a present on that thread) settles the token.
 static bool g_repaint_present_pending = false;
@@ -464,10 +432,10 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 		if (SUCCEEDED(target->swapchain->QueryInterface(__uuidof(IDXGISwapChain2),
 		                                                reinterpret_cast<void **>(&sc2)))) {
 			const int lat = g_lw_gov_d3d11.base_latency();
-			// #2564: a fresh chain owes no tokens.
-			g_lw_applied_latency = 0;
-			g_lw_token_debt = 0;
-			lw_apply_latency(sc2, lat);
+			// #2564: a fresh chain owes no tokens and has no presentation mode yet.
+			g_lw_ledger_d3d11.reset();
+			g_lw_stage2_d3d11.reset();
+			g_lw_ledger_d3d11.apply(sc2, lat);
 			g_frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
 			// #1571: a fresh semaphore owes nobody anything. These statics
 			// outlive a session (one target per process on this path), so a
@@ -617,12 +585,8 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 		// #1571: the semaphore is gone; no token is outstanding against it.
 		g_app_holds_token = false;
 		g_repaint_holds_token = false;
-		g_lw_token_debt = 0;
-		g_lw_applied_latency = 0;
-		g_chain_composed = -1;
-		g_chain_mode_probe_ns = 0;
-		g_chain_direct_streak = 0;
-		g_chain_mode_last_pc = 0;
+		g_lw_ledger_d3d11.reset();
+		g_lw_stage2_d3d11.reset();
 	}
 
 	if (target->rtv != nullptr) {
@@ -891,88 +855,6 @@ comp_d3d11_target_app_take_wait_instant(void)
 	return g_app_wait_instant.exchange(0, std::memory_order_relaxed);
 }
 
-/*!
- * #2564: may the stage-2 scanout wait run on this chain right now?
- *
- * Stage 2 waits until the previous present is ON THE GLASS, then lets this
- * frame weave. That only works when the chain scans out directly (DXGI
- * presentation mode OVERLAY / independent flip): the present then makes the
- * next vblank. When DWM composes the chain (any ordinary window), DWM picks
- * presents up AT the vblank, so a present made just after scanout always
- * misses it and lands two vblanks out. Measured on the 8K Leia box
- * (cube_handle_d3d11_win, windowed): depth 1 with stage 2 runs at exactly
- * 30 fps; the governor backs off to depth 2, probes back to 1 every dwell
- * and stutters each time; and during a resize drag stage 2 times out (frame
- * statistics go disjoint). Each of those moves weave->scanout by a whole
- * refresh, and the eye predictor then aims a refresh off until it re-learns:
- * the visible 3D stutter. With stage 2 off on that chain, depth 1 holds 60 fps
- * at a constant 33 ms weave->scanout, through drags.
- *
- * So: on only once DXGI reports the chain scanning out directly (OVERLAY /
- * independent flip), off while it is COMPOSED and off while the mode is still
- * unknown. Unknown-means-off matters: the statistics need a few presents, and
- * one second of stage 2 at depth 1 on a composed chain was enough to send the
- * governor to depth 2 before the first answer (then 50 ms weave->scanout until
- * the next return probe). And ON is asymmetric: the very first reading came
- * back "independent flip" before any present had been composed, so ON needs
- * the same direct-scanout answer for 30 consecutive frames with PresentCount
- * advancing, while one COMPOSED answer turns it OFF at once. Probed every
- * frame until settled, then once a second,
- * because the mode follows the window (a full-screen window can be promoted to
- * independent flip). DXR_LATE_WEAVE_SCANOUT_WAIT=0 forces it off, =1 on.
- */
-
-static bool
-lw_stage2_allowed(struct comp_d3d11_target *target)
-{
-	if (g_stage2_override < 0) {
-		const char *e = getenv("DXR_LATE_WEAVE_SCANOUT_WAIT");
-		g_stage2_override = (e != nullptr && e[0] == '0') ? 0 : (e != nullptr && e[0] == '1') ? 1 : 2;
-		if (g_stage2_override != 2) {
-			U_LOG_W("Late-weave: stage-2 scanout wait forced %s (DXR_LATE_WEAVE_SCANOUT_WAIT)",
-			        g_stage2_override == 1 ? "ON" : "OFF");
-		}
-	}
-	if (g_stage2_override != 2) {
-		return g_stage2_override == 1;
-	}
-	const uint64_t now = os_monotonic_get_ns();
-	const bool settling = g_chain_composed < 0 || (g_chain_direct_streak > 0 && g_chain_composed != 0);
-	if (settling || now - g_chain_mode_probe_ns > 1000000000ull) {
-		g_chain_mode_probe_ns = now;
-		IDXGISwapChainMedia *media = nullptr;
-		if (SUCCEEDED(target->swapchain->QueryInterface(__uuidof(IDXGISwapChainMedia),
-		                                                reinterpret_cast<void **>(&media)))) {
-			DXGI_FRAME_STATISTICS_MEDIA st = {};
-			if (SUCCEEDED(media->GetFrameStatisticsMedia(&st)) && st.PresentCount != 0) {
-				// COMPOSITION_FAILURE also means DWM composes the chain.
-				const bool direct = st.CompositionMode == DXGI_FRAME_PRESENTATION_MODE_OVERLAY ||
-				                    st.CompositionMode == DXGI_FRAME_PRESENTATION_MODE_NONE;
-				int verdict = g_chain_composed;
-				if (!direct) {
-					g_chain_direct_streak = 0;
-					verdict = 1;
-				} else if (st.PresentCount != g_chain_mode_last_pc) {
-					if (++g_chain_direct_streak >= 30) {
-						verdict = 0;
-					}
-				}
-				g_chain_mode_last_pc = st.PresentCount;
-				if (verdict != g_chain_composed && verdict >= 0) {
-					U_LOG_W("Late-weave: chain presentation mode %s -> stage-2 scanout wait %s (#2564)",
-					        verdict == 1 ? "COMPOSED (DWM)"
-					                     : (st.CompositionMode == DXGI_FRAME_PRESENTATION_MODE_OVERLAY
-					                            ? "OVERLAY"
-					                            : "independent flip"),
-					        verdict == 1 ? "OFF" : "ON");
-					g_chain_composed = verdict;
-				}
-			}
-			media->Release();
-		}
-	}
-	return g_chain_composed == 0;
-}
 
 extern "C" void
 comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicted_display_time_ns, bool mode_3d)
@@ -1022,24 +904,8 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 				        drained);
 			}
 		}
-		// #2564: pay back tokens a governor depth decrease left behind.
-		// Non-blocking: a token only appears as a present retires, so the
-		// debt is settled over the next few frames, never by a stall here.
-		if (g_lw_token_debt > 0) {
-			uint32_t paid = 0;
-			while (g_lw_token_debt > 0 &&
-			       WaitForSingleObjectEx(g_frame_latency_waitable, 0, FALSE) == WAIT_OBJECT_0) {
-				g_lw_token_debt--;
-				paid++;
-			}
-			static bool logged_debt = false;
-			if (!logged_debt && paid > 0) {
-				logged_debt = true;
-				U_LOG_W("Late-weave: drained %u surplus waitable token(s) left by a governor depth "
-				        "decrease (#2564; logged once)",
-				        paid);
-			}
-		}
+		// #2564: take back tokens a governor depth decrease left behind.
+		g_lw_ledger_d3d11.pay(g_frame_latency_waitable, "d3d11");
 		const uint64_t wait_t0 = os_monotonic_get_ns();
 		if (g_app_holds_token) {
 			// #1571: the previous app frame took a token here and then
@@ -1108,7 +974,7 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 				                                  : "none (waitable only)");
 			}
 		} else if (g_scanout_stats_strikes >= 0 && !g_lw_gov_d3d11.in_resize_hold() &&
-		           lw_stage2_allowed(target)) {
+		           g_lw_stage2_d3d11.allowed(target->swapchain, "d3d11")) {
 			// #2564: not during a resize. ResizeBuffers makes the frame
 			// statistics disjoint, so this wait ran to its 3-period bound
 			// on most drag steps (a ~50 ms hitch each, 40 fps for the whole
@@ -1155,7 +1021,7 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 			IDXGISwapChain2 *sc2 = nullptr;
 			if (SUCCEEDED(target->swapchain->QueryInterface(
 			        __uuidof(IDXGISwapChain2), reinterpret_cast<void **>(&sc2)))) {
-				lw_apply_latency(sc2, g_lw_gov_d3d11.effective);
+				g_lw_ledger_d3d11.apply(sc2, g_lw_gov_d3d11.effective);
 				sc2->Release();
 			}
 			static bool logged_backoff = false, logged_return = false;
