@@ -240,7 +240,28 @@ struct core_weave_state
 	uint32_t cap_logged_w = 0, cap_logged_h = 0;
 	bool has_last_params = false;
 	xrt_dp_lift_params last_params = {};
+	//! A CPU-input provider's slot (Open Conversion): the snapshot is drawn
+	//! here, then read back into the slot's bytes. Lazily sized to the slot.
+	ID3D11Texture2D *cpu_rt = nullptr;
+	ID3D11RenderTargetView *cpu_rtv = nullptr;
+	IDXGIKeyedMutex *cpu_km = nullptr;
+	ID3D11Texture2D *cpu_staging = nullptr;
+	uint32_t cpu_w = 0, cpu_h = 0;
 };
+
+//! Release a weave state's COM objects (caller holds the service context mutex).
+static inline void
+core_weave_state_release(core_weave_state &ws)
+{
+	for (auto &r : ws.lb_rb) {
+		rel(r.staging);
+	}
+	rel(ws.cpu_rtv);
+	rel(ws.cpu_km);
+	rel(ws.cpu_rt);
+	rel(ws.cpu_staging);
+	ws.cpu_w = ws.cpu_h = 0;
+}
 
 struct d3d11_lift
 {
