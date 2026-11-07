@@ -15110,6 +15110,14 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		    // deposit timeline before the handoff and waits out the hub's last
 		    // plane read (vk_split_stage_planes).
 		    .ring_direct_planes = true,
+		    // ...and takes DIRECT by default on one adapter, as the D3D12
+		    // reroute has since #2518. The opt-in waited for a single-dGPU
+		    // desktop to run VK fence-mode DIRECT, which #2371 accepted
+		    // (2026-11-02); re-checked on an RTX 3080 at 8K (Media Player Pro,
+		    // panels up, 60 fps, km=0): the staged ring's copies took ~43 % of
+		    // the copy engine and ~6 % without them.
+		    // DXR_HUB_INGRESS=xbridge still forces the bridge.
+		    .ring_direct_default = true,
 		    .render_packed_luid = c->render_packed_luid,
 		    .display_screen_left = display_screen_left,
 		    .display_screen_top = display_screen_top,
