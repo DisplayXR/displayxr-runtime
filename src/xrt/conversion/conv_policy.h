@@ -233,8 +233,36 @@ struct conv_policy_conv_in
 	//! The bound capability row is validated against the stereo corpus AND
 	//! declares SUGGESTS_CONVERGENCE: its hint may be used.
 	bool hint_allowed;
+	//! The bound capability owns AUTO (conv_policy_provider_owns_auto_convergence):
+	//! neither the observer nor the hint is consulted; only the app's plane is.
+	bool provider_owns_auto;
 	const struct xrt_conv_depth_info *last; //!< last published result's depth (NULL = none)
 };
+
+/*!
+ * One convergence owner per stream (ADR-053 Amendment 1): true when the bound
+ * capability declares XRT_CONV_CAP_AUTO_CONVERGENCE and produces the views
+ * itself. A composed binding (depth-only provider + the runtime's reference
+ * view synthesis) never does: the provider's convergence never reaches the
+ * runtime's synthesis, so the runtime keeps the plane there.
+ */
+bool
+conv_policy_provider_owns_auto_convergence(uint32_t cap_flags, bool composed);
+
+/*!
+ * Keep the content range of a stream's last depth across frames that carry
+ * none. The range comes from CPU samples (S6), and the depth readback is
+ * rate-limited (one staging copy in flight per stream), so most frames reach
+ * S6 without samples and a provider that reports no range of its own then
+ * publishes zeros. Without a range the convergence mapping fails, and a
+ * per-frame alternation of "range / no range" turned into an alternation of
+ * convergence source (observer DECODED / provider AUTO). When @p next has no
+ * range and @p prev (same depth kind) has one, @p prev's range fields are
+ * copied into @p next; a fresh range always replaces the carried one.
+ * @return true when @p next carries a range afterwards.
+ */
+bool
+conv_policy_depth_carry_range(struct xrt_conv_depth_info *next, const struct xrt_conv_depth_info *prev);
 
 struct conv_policy_conv_out
 {
@@ -243,7 +271,8 @@ struct conv_policy_conv_out
 };
 
 /*! Fill params->convergence_mode / convergence. Order: app, observer,
- *  validated hint, AUTO. A relative plane without a last range is AUTO. */
+ *  validated hint, AUTO; with provider_owns_auto: app, AUTO. A relative plane
+ *  without a last range is AUTO. */
 void
 conv_policy_convergence(const struct conv_policy_conv_in *in,
                         struct xrt_conv_params *params,

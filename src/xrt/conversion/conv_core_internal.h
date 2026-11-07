@@ -113,8 +113,14 @@ struct conv_stream
 	struct conv_policy_view_state vstate;
 	struct conv_observer observer;
 	bool has_observer;
+	//! The last depth this stream's provider wrote; its content range is
+	//! carried across frames that reach S6 without samples
+	//! (conv_policy_depth_carry_range).
 	struct xrt_conv_depth_info last_depth;
 	bool has_last_depth;
+	//! Who owns AUTO convergence, as last logged (CONV_STREAM_CONV_OWNER_*;
+	//! dispatcher thread only): one WARN per stream, again only on a change.
+	uint32_t conv_owner_logged;
 
 	/* Still-image dedupe (PHOTO; dispatcher thread only): what the latest
 	 * published result was converted from. */

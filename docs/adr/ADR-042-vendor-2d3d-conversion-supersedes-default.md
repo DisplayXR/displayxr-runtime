@@ -138,6 +138,11 @@ new field, and a plug-in that already honours a caller-set convergence needs not
 skipping its own auto pass. Details and parameters: `XR_DXR_lift.md` §4.4;
 `DXR_LIFT_AUTO_CONVERGENCE=module` restores the module's own auto for A/B.
 
+*Narrowed by [ADR-053](ADR-053-conversion-providers.md) Amendment 1 (2026-11-08):* when a
+conversion provider declares `XRT_CONV_CAP_AUTO_CONVERGENCE`, its own auto-convergence owns
+AUTO and the runtime's measurement does not run for that stream. The runtime does not choose
+between methods on the user's behalf. App-set convergence still wins.
+
 ## Alternatives rejected
 
 - **The module weaves its own output.** Two weavers per panel, calibration duplicated, and a

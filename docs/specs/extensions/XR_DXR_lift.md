@@ -569,6 +569,11 @@ auto-convergence no longer runs for that stream.
   A/B. The choice is logged once (WARN); each stream logs its first lock (WARN) and its
   convergence / target / subject / confidence / cut count every 5 s (INFO, in the per-stream
   stats).
+- **Provider-owned AUTO (ADR-053 Amendment 1):** on a conversion provider whose capability
+  declares `XRT_CONV_CAP_AUTO_CONVERGENCE`, none of the above runs for that stream. AUTO reaches
+  the provider every frame, whatever this switch says, and an app-set plane still wins. The
+  runtime does not choose between auto-convergence methods for the user. Each stream logs its
+  convergence owner once (WARN).
 
 ### 4.5 Platform-neutral images and explicit sync (spec 4)
 
