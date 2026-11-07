@@ -204,10 +204,14 @@ static const char *optional_vk_instance_extensions[] = {
 // VK_KHR_SWAPCHAIN_EXTENSION_NAME
 static const char *required_vk_device_extensions[] = {
     VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,      //
-    VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,            //
     VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,           //
-    VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,        //
     VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, //
+#if !defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+    // Windows: optional-if-present, with the Win32 trio — see
+    // optional_filtered_device_extensions[] below.
+    VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,     //
+    VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME, //
+#endif
 
 // Platform version of "external_memory"
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
@@ -290,6 +294,16 @@ static const char *optional_filtered_device_extensions[] = {
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,    //
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME, //
     VK_KHR_EXTERNAL_FENCE_WIN32_EXTENSION_NAME,     //
+    /*
+     * The base sync pair, optional on Windows for the same reason as the trio:
+     * only the IPC client imports semaphores/fences, and it already fails with
+     * a named error without the Win32 variants. Both are core since Vulkan 1.1,
+     * and the Qualcomm Adreno X driver (Windows on ARM, Vulkan 1.4) does not
+     * list either name — requiring them failed vkCreateDevice with
+     * VK_ERROR_EXTENSION_NOT_PRESENT for every Vulkan app on Snapdragon.
+     */
+    VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME, //
+    VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,     //
 };
 
 /*!
@@ -301,7 +315,7 @@ static const char *optional_filtered_device_extensions[] = {
  */
 DEBUG_GET_ONCE_BOOL_OPTION(vk_require_optional_filtered, "DXR_VK_REQUIRE_WIN32_EXTERNAL", false)
 #define OXR_OPTIONAL_FILTERED_ENV "DXR_VK_REQUIRE_WIN32_EXTERNAL"
-#define OXR_OPTIONAL_FILTERED_WHAT "Win32 external memory/semaphore/fence"
+#define OXR_OPTIONAL_FILTERED_WHAT "external semaphore/fence + Win32 external memory/semaphore/fence"
 /*!
  * On Windows #1539 moved the trio OUT of `required_vk_device_extensions[]`, so
  * the kill switch has to put it back there for `xrCreateVulkanDeviceKHR` too.
@@ -361,6 +375,8 @@ static const char *optional_device_extensions[] = {
      */
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
     VK_KHR_EXTERNAL_FENCE_WIN32_EXTENSION_NAME,
+    // Base pair: core since 1.1, unlisted by Adreno X (see the filtered list).
+    VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME, VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,
 
 #else
 #error "Need port!"
