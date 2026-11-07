@@ -130,6 +130,7 @@ set(tests
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
     tests_oxr_tracking_properties_rule
+    tests_oxr_hosted_raw_views_rule
     tests_oxr_input_providers_rule
     tests_xrt_active_mode_scale
     tests_input_arbiter_rig
@@ -1310,6 +1311,12 @@ target_link_libraries(tests_oxr_mode_fillable_rule PRIVATE xrt-interfaces)
 # it needs no xrt-interfaces either -- the include is the whole dependency.
 target_include_directories(
 	tests_oxr_tracking_properties_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+
+# #2322 — which hosted sessions DXR_HOSTED_RAW_VIEWS reaches: header-only and
+# bool-only like the rule above, so the include is the whole dependency.
+target_include_directories(
+	tests_oxr_hosted_raw_views_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 
 # ADR-034 Amendment 5 (#2181) — XR_DXR_input_providers event discipline: the
