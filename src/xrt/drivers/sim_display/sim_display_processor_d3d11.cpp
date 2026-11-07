@@ -348,6 +348,7 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	if (tile_columns * tile_rows <= 1) {
 		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
 	}
+	mode = sim_display_pipeline_mode(mode);
 	// #817: no phase-sensitive interlace on this backend yet — see the helper.
 	if (sim_interlaced_fallback_to_anaglyph(mode, "D3D11")) {
 		mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
@@ -1122,6 +1123,7 @@ sim_display_processor_d3d11_create_bound(enum sim_display_output_mode mode,
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" :
 	        mode == SIM_DISPLAY_OUTPUT_INTERLACED     ? "Interlaced (anaglyph fallback)" :
+	        mode == SIM_DISPLAY_OUTPUT_FULL_SBS       ? "Full SBS (flat: no stereo declaration on this backend)" :
 	        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH    ? "Passthrough" : "Blend");
 
 	*out_xdp = &sdp->base;

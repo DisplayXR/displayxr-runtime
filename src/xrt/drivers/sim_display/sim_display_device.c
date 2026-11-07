@@ -132,7 +132,8 @@ sim_display_set_output_mode(enum sim_display_output_mode mode)
 		        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 		        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
 		        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" :
-		        mode == SIM_DISPLAY_OUTPUT_INTERLACED     ? "Interlaced" : "Blend");
+		        mode == SIM_DISPLAY_OUTPUT_INTERLACED     ? "Interlaced" :
+		        mode == SIM_DISPLAY_OUTPUT_FULL_SBS       ? "Full SBS" : "Blend");
 	}
 }
 
@@ -544,6 +545,9 @@ sim_display_hmd_set_property(struct xrt_device *xdev,
 		case 5:
 			internal_mode = SIM_DISPLAY_OUTPUT_INTERLACED;
 			break;
+		case 6:
+			internal_mode = SIM_DISPLAY_OUTPUT_FULL_SBS;
+			break;
 		default:
 			return XRT_ERROR_NOT_IMPLEMENTED;
 		}
@@ -573,6 +577,7 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
 		case SIM_DISPLAY_OUTPUT_SQUEEZED_SBS: *out_value = 3; break;
 		case SIM_DISPLAY_OUTPUT_QUAD:         *out_value = 4; break;
 		case SIM_DISPLAY_OUTPUT_INTERLACED:   *out_value = 5; break;
+		case SIM_DISPLAY_OUTPUT_FULL_SBS:     *out_value = 6; break;
 		default:                              *out_value = 0; break;
 		}
 		return XRT_SUCCESS;
@@ -621,10 +626,12 @@ sim_display_hmd_create(void)
 			else if (strcmp(mode_str, "interlaced") == 0 || strcmp(mode_str, "interlace") == 0)
 				// #817: the one phase-sensitive mode — see the enum doc.
 				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_INTERLACED);
+			else if (strcmp(mode_str, "sbs_full") == 0 || strcmp(mode_str, "full_sbs") == 0)
+				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_FULL_SBS);
 			else
 				U_LOG_W("sim_display: unknown SIM_DISPLAY_OUTPUT '%s' (want "
-				        "2d|anaglyph|sbs|squeezed|quad|blend|interlaced) — keeping the anaglyph "
-				        "default",
+				        "2d|anaglyph|sbs|squeezed|quad|blend|interlaced|sbs_full) — keeping the "
+				        "anaglyph default",
 				        mode_str);
 		}
 	}
@@ -798,10 +805,10 @@ sim_display_hmd_create(void)
 	snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Sim 3D Display");
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "sim_display_0");
 
-	// Rendering modes: sim_display supports 6 modes (2D + 3 stereo + quad + interlaced).
+	// Rendering modes: sim_display supports 7 modes (2D + 3 stereo + quad + interlaced + full SBS).
 	// Order: 0=2D, 1=Anaglyph (default 3D), 2=Cropped SBS, 3=Squeezed SBS, 4=Quad,
-	//        5=Interlaced (#817 phase-sensitive weave proxy)
-	hmd->base.rendering_mode_count = 6;
+	//        5=Interlaced (#817 phase-sensitive weave proxy), 6=Full SBS (for a stereo compositor)
+	hmd->base.rendering_mode_count = 7;
 
 	// Mode 0: 2D (mono, full resolution, 1×1 tile)
 	hmd->base.rendering_modes[0].mode_index = 0;
@@ -866,6 +873,21 @@ sim_display_hmd_create(void)
 	hmd->base.rendering_modes[5].tile_columns = 2;
 	hmd->base.rendering_modes[5].tile_rows = 1;
 
+	// Full SBS for a stereo desktop compositor: two views, each at the full
+	// window size (scale 1.0 x 1.0), 2x1 tiles handed over side by side as
+	// they are. The DP reports stereo_layout 3; the
+	// runtime presents a target twice the window's width and declares it.
+	// Position-preserving geometry, like Anaglyph: each view sees the whole
+	// window (the Kooima screen is the full display, not half of it).
+	hmd->base.rendering_modes[6].mode_index = 6;
+	snprintf(hmd->base.rendering_modes[6].mode_name, XRT_DEVICE_NAME_LEN, "Full SBS");
+	hmd->base.rendering_modes[6].view_count = 2;
+	hmd->base.rendering_modes[6].view_scale_x = 1.0f;
+	hmd->base.rendering_modes[6].view_scale_y = 1.0f;
+	hmd->base.rendering_modes[6].hardware_display_3d = true;
+	hmd->base.rendering_modes[6].tile_columns = 2;
+	hmd->base.rendering_modes[6].tile_rows = 1;
+
 	// Per-mode tracking capability (#441): sim_display has no real eye
 	// tracker, so every mode stays untracked (mode_flags/reserved are
 	// zero from the calloc'd device). Under the dev-only
@@ -901,6 +923,7 @@ sim_display_hmd_create(void)
 		case SIM_DISPLAY_OUTPUT_SQUEEZED_SBS: default_mode = 3; break;
 		case SIM_DISPLAY_OUTPUT_QUAD:         default_mode = 4; break;
 		case SIM_DISPLAY_OUTPUT_INTERLACED:   default_mode = 5; break;
+		case SIM_DISPLAY_OUTPUT_FULL_SBS:     default_mode = 6; break;
 		default:                              default_mode = 0; break;
 		}
 
@@ -910,10 +933,11 @@ sim_display_hmd_create(void)
 		// this mode against every later request (plug-in-wide, any app).
 		int32_t forced = (int32_t)debug_get_num_option_sim_display_force_mode();
 		if (forced >= 0 && (uint32_t)forced < hmd->base.rendering_mode_count) {
-			static const enum sim_display_output_mode idx_to_internal[6] = {
+			static const enum sim_display_output_mode idx_to_internal[7] = {
 			    SIM_DISPLAY_OUTPUT_PASSTHROUGH, SIM_DISPLAY_OUTPUT_ANAGLYPH,
 			    SIM_DISPLAY_OUTPUT_SBS,         SIM_DISPLAY_OUTPUT_SQUEEZED_SBS,
-			    SIM_DISPLAY_OUTPUT_QUAD,        SIM_DISPLAY_OUTPUT_INTERLACED};
+			    SIM_DISPLAY_OUTPUT_QUAD,        SIM_DISPLAY_OUTPUT_INTERLACED,
+			    SIM_DISPLAY_OUTPUT_FULL_SBS};
 			default_mode = (uint32_t)forced;
 			sim_display_set_output_mode(idx_to_internal[default_mode]);
 			U_LOG_W("sim_display: SIM_DISPLAY_FORCE_MODE=%d — pinning active mode "
