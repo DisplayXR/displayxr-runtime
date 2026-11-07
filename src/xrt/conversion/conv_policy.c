@@ -297,6 +297,32 @@ conv_policy_depth_range(const struct xrt_conv_depth_info *di, float *out_near, f
 	return true;
 }
 
+bool
+conv_policy_depth_carry_range(struct xrt_conv_depth_info *next, const struct xrt_conv_depth_info *prev)
+{
+	if (next == NULL) {
+		return false;
+	}
+	float n, f;
+	if (conv_policy_depth_range(next, &n, &f)) {
+		return true; // this frame's own range wins
+	}
+	if (prev == NULL || prev->kind != next->kind || !conv_policy_depth_range(prev, &n, &f)) {
+		return false;
+	}
+	next->range_min = prev->range_min;
+	next->range_max = prev->range_max;
+	next->range_p05 = prev->range_p05;
+	next->range_p95 = prev->range_p95;
+	return true;
+}
+
+bool
+conv_policy_provider_owns_auto_convergence(uint32_t cap_flags, bool composed)
+{
+	return !composed && (cap_flags & XRT_CONV_CAP_AUTO_CONVERGENCE) != 0;
+}
+
 static int
 cmp_float(const void *pa, const void *pb)
 {
@@ -426,14 +452,17 @@ conv_policy_convergence(const struct conv_policy_conv_in *in,
 	params->convergence = 0.0f;
 
 	float decoded = 0.0f;
+	// One owner per stream: a provider that owns AUTO gets AUTO unless the app
+	// set a plane; the runtime's estimator and the D10 hint stay out of it.
+	const bool runtime_may_set = !in->app_set && !in->provider_owns_auto;
 	if (in->app_set && conv_policy_convergence_to_decoded(in->app_rel01, in->last, &decoded)) {
 		o.source = CONV_CONVERGENCE_SRC_APP;
 		o.rel01 = clamp01(in->app_rel01);
-	} else if (!in->app_set && in->observer_valid &&
+	} else if (runtime_may_set && in->observer_valid &&
 	           conv_policy_convergence_to_decoded(in->observer_rel01, in->last, &decoded)) {
 		o.source = CONV_CONVERGENCE_SRC_OBSERVER;
 		o.rel01 = clamp01(in->observer_rel01);
-	} else if (!in->app_set && in->hint_allowed && in->last != NULL && (in->last->suggest_flags & 1u) != 0 &&
+	} else if (runtime_may_set && in->hint_allowed && in->last != NULL && (in->last->suggest_flags & 1u) != 0 &&
 	           isfinite(in->last->suggested_convergence)) {
 		decoded = in->last->suggested_convergence; // already in decoded units
 		o.source = CONV_CONVERGENCE_SRC_HINT;

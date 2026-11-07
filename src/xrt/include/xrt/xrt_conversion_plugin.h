@@ -345,6 +345,16 @@ struct xrt_conv_state
  *  Same footing as the grandfathered dp-lift adapter, whose exemption had the
  *  same reason (the user installed the module). */
 #define XRT_CONV_CAP_LICENSED_LOCAL_INSTALL (1u << 10)
+/*! The provider runs its own auto-convergence when params.convergence_mode
+ *  is XRT_CONV_CONVERGENCE_AUTO, and so owns convergence whenever the app
+ *  leaves it AUTO. A stream bound to such a capability (provider-produced
+ *  views, not composed) gets no runtime convergence observer and no D10 hint:
+ *  params carry AUTO unless the APP set a plane, which still wins (DECODED).
+ *  The runtime does not judge whose auto-convergence is better; the provider
+ *  the user installed decides. The runtime's observer runs only for providers
+ *  that do not declare this. One convergence owner per stream (ADR-053
+ *  Amendment 1). Append-only: an older provider simply does not set it. */
+#define XRT_CONV_CAP_AUTO_CONVERGENCE (1u << 11)
 /*! @} */
 
 /*! One capability = (task × model × backend × device). Top-level: the

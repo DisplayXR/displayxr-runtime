@@ -289,6 +289,34 @@ hosting, provider enumeration in the app API, and the reserved tasks. Deliverabl
 risks and the must-verify list per phase:
 [roadmap/conversion-providers.md](../roadmap/conversion-providers.md).
 
+## Amendment 1 — a provider that declares auto-convergence owns AUTO (2026-11-08)
+
+Decision 4 makes convergence a runtime stage. That stays true for the plane an **app** sets, and
+for providers with no auto-convergence of their own. It does not license the runtime to override a
+provider the user installed. **The runtime does not pick an auto-convergence method for the user.**
+
+- A capability that declares `XRT_CONV_CAP_AUTO_CONVERGENCE` owns convergence whenever the app
+  leaves it AUTO. Its streams get no runtime convergence observer and no D10 hint: the provider
+  receives `XRT_CONV_CONVERGENCE_AUTO` on every frame. The runtime does not judge which method
+  is better.
+- The runtime's observer runs only for providers that do not declare the flag, exactly as before.
+- An app-set plane still wins over both, handed over as `DECODED`.
+- A composed binding (a depth-only provider plus the runtime's reference view synthesis) keeps
+  the runtime's plane. The provider's convergence never reaches that synthesis.
+- **One owner per stream, every frame.** The owner is evaluated per frame from the bound row, so
+  a rebind or a refined describe moves it. One WARN per stream names the owner. The flag is
+  append-only and needs no ABI bump: an older provider does not set it.
+
+Why: on a panel, a lifted video stream on a provider with its own auto-convergence "pumped".
+Two planes alternated every one or two frames. The runtime observer's plane needs the last
+result's content range, which S6 computes from CPU samples. The depth readback is rate-limited,
+so most frames reach S6 without samples, and the stream's last depth was overwritten with a zero
+range on those frames. The observer's value then could not be decoded, the frame fell through to
+AUTO (the provider's own estimate), and the next frame with samples switched back. Independent
+of who owns AUTO, the stream now keeps the last valid content range across frames that carry
+none (`conv_policy_depth_carry_range`; a fresh range always replaces it, and a different depth
+kind never inherits it). A single frame without range data can no longer change the source.
+
 ## Amendments to earlier records
 
 Recorded here so ADR-042 and ADR-049 stay readable as written; each points at the section of

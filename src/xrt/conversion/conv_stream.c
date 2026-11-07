@@ -47,6 +47,34 @@ signal_lane_locked(struct conv_core *core, uint32_t provider)
 	}
 }
 
+/*! @name Who owns AUTO convergence (conv_stream::conv_owner_logged) @{ */
+#define CONV_STREAM_CONV_OWNER_PROVIDER 1u //!< the capability declares XRT_CONV_CAP_AUTO_CONVERGENCE
+#define CONV_STREAM_CONV_OWNER_RUNTIME 2u  //!< the runtime's S7 observer
+#define CONV_STREAM_CONV_OWNER_DEFAULT 3u  //!< no observer (off / module A/B): AUTO goes through
+/*! @} */
+
+/*!
+ * ONE WARN per stream naming the owner of AUTO convergence; again only if it
+ * changes (a rebind, a refined describe). Dispatcher thread only.
+ */
+static void
+note_convergence_owner(struct conv_stream *st, bool provider_owns)
+{
+	const uint32_t owner = provider_owns      ? CONV_STREAM_CONV_OWNER_PROVIDER
+	                       : st->has_observer ? CONV_STREAM_CONV_OWNER_RUNTIME
+	                                          : CONV_STREAM_CONV_OWNER_DEFAULT;
+	if (owner == st->conv_owner_logged) {
+		return;
+	}
+	st->conv_owner_logged = owner;
+	U_LOG_W("[conv] stream %llu: AUTO convergence owner = %s (an app-set plane still wins)",
+	        (unsigned long long)st->id,
+	        owner == CONV_STREAM_CONV_OWNER_PROVIDER
+	            ? "provider (capability declares AUTO_CONVERGENCE; runtime observer off)"
+	        : owner == CONV_STREAM_CONV_OWNER_RUNTIME ? "runtime observer"
+	                                                  : "provider default (no runtime observer)");
+}
+
 static struct conv_stream *
 find_locked(struct conv_core *core, uint64_t id)
 {
@@ -290,10 +318,12 @@ do_rebind(struct conv_core *core, struct conv_stream *st)
 
 	struct conv_pipeline pipe;
 	bool ok = false;
+	bool provider_owns = false; // the convergence owner follows the new binding
 	os_mutex_lock(&core->registry_mtx);
 	struct xrt_conv_capability cap;
 	if (conv_core_row_cap_locked(core, to.provider, to.cap_id, &cap)) {
 		const bool ready = conv_core_row_state_locked(core, to.provider, to.cap_id) == XRT_CONV_STATE_READY;
+		provider_owns = conv_policy_provider_owns_auto_convergence(cap.flags, to.composed);
 		ok = conv_pipeline_compose(&st->req, &cap, to.composed, ready, &pipe) == XRT_SUCCESS;
 		conv_core_request_warm_locked(core, to.provider, to.cap_id, CONV_EV_CREATE_REQUESTED);
 	}
@@ -309,6 +339,20 @@ do_rebind(struct conv_core *core, struct conv_stream *st)
 		st->bind = to;
 		st->pipe = pipe;
 		st->unsatisfied = false;
+		// An observer only when the stream asked for one and the new provider
+		// does not own AUTO (one owner per stream).
+		const bool want_observer = st->req.observers && !provider_owns;
+		if (want_observer && !st->has_observer) {
+			st->has_observer =
+			    core->cfg.create_convergence_observer(core->cfg.observer_ud, &st->observer) &&
+			    st->observer.ops != NULL;
+		} else if (!want_observer && st->has_observer) {
+			if (st->observer.ops->destroy != NULL) {
+				st->observer.ops->destroy(st->observer.ctx);
+			}
+			memset(&st->observer, 0, sizeof(st->observer));
+			st->has_observer = false;
+		}
 	} else {
 		st->unsatisfied = true;
 	}
@@ -821,6 +865,9 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 	                 (core->reg.providers[s.bind.provider].flags & CONV_PROV_LEGACY_UNITS) != 0;
 	os_mutex_unlock(&core->registry_mtx);
 	os_mutex_unlock(&core->streams_mtx);
+	// Evaluated per frame from the bound row, so a describe refined after
+	// create (or a rebind) moves the owner without recreating the stream.
+	const bool provider_owns = conv_policy_provider_owns_auto_convergence(s.cap_flags, s.bind.composed);
 
 	const uint64_t t0 = now_ns();
 	uint64_t placed_eyes_ns = t0; // ADR-058: refined to the S3 eyes' sample time
@@ -884,8 +931,9 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			vin.now_ns = t0;
 			conv_policy_viewpoints(&vin, &st->vstate, pa, NULL);
 
+			note_convergence_owner(st, provider_owns);
 			float obs = 0.0f;
-			const bool obs_valid = st->has_observer && st->observer.ops->value != NULL &&
+			const bool obs_valid = !provider_owns && st->has_observer && st->observer.ops->value != NULL &&
 			                       st->observer.ops->value(st->observer.ctx, t0, &obs);
 			struct conv_policy_conv_in cin;
 			memset(&cin, 0, sizeof(cin));
@@ -894,6 +942,7 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			cin.observer_valid = obs_valid;
 			cin.observer_rel01 = obs;
 			cin.hint_allowed = s.validated && (s.cap_flags & XRT_CONV_CAP_SUGGESTS_CONVERGENCE) != 0;
+			cin.provider_owns_auto = provider_owns;
 			cin.last = st->has_last_depth ? &st->last_depth : NULL;
 			conv_policy_convergence(&cin, pa, NULL);
 			if (s.legacy_units) {
@@ -956,13 +1005,19 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 		ok = r == XRT_SUCCESS;
 
 		// S7: observers, on the same inference only.
-		if (ok && (s.pipe.stages & CONV_STAGE_S7_OBSERVERS) != 0 && st->has_observer) {
+		// Not for a stream whose provider owns AUTO: one owner per stream.
+		if (ok && (s.pipe.stages & CONV_STAGE_S7_OBSERVERS) != 0 && st->has_observer && !provider_owns) {
 			conv_policy_observe(&st->observer, &pf->result.depth_info, &pf->samples, s.frame.active, t0);
 		}
 		conv_pipeline_frame_release(&core->cfg.readback, pf);
-		// The provider's depth, published or observer-only (#2003).
+		// The provider's depth, published or observer-only (#2003). A frame
+		// that reached S6 without samples (the readback is rate-limited) keeps
+		// the previous range: a range that blinks per frame flipped the
+		// convergence source per frame (observer DECODED <-> provider AUTO).
 		if (ok && (pf->provider_out.written & XRT_CONV_OUT_DEPTH) != 0) {
-			st->last_depth = pf->result.depth_info;
+			struct xrt_conv_depth_info di = pf->result.depth_info;
+			conv_policy_depth_carry_range(&di, st->has_last_depth ? &st->last_depth : NULL);
+			st->last_depth = di;
 			st->has_last_depth = true;
 		}
 		// #2030: CPU-memory views / depth reach GPU-only consumers.
@@ -1391,6 +1446,10 @@ conv_core_stream_create(struct conv_core *core,
 	}
 	struct xrt_conv_capability cap;
 	conv_core_row_cap_locked(core, b.provider, b.cap_id, &cap);
+	// The provider owns AUTO: no runtime observer for this stream. req.observers
+	// stays as asked: the observer-only depth it requests also maps an app-set
+	// plane into decoded units and feeds the lifted-rect cursor (#2003).
+	const bool provider_owns = conv_policy_provider_owns_auto_convergence(cap.flags, b.composed);
 	const xrt_result_t cr = conv_pipeline_compose(&req, &cap, b.composed, state == XRT_CONV_STATE_READY, &pipe);
 	if (cr != XRT_SUCCESS) {
 		os_mutex_unlock(&core->registry_mtx);
@@ -1447,7 +1506,7 @@ conv_core_stream_create(struct conv_core *core,
 			st->out[i].reg_idx[k] = CONV_REG_NONE;
 		}
 	}
-	if (req.observers) {
+	if (req.observers && !provider_owns) {
 		st->has_observer = core->cfg.create_convergence_observer(core->cfg.observer_ud, &st->observer) &&
 		                   st->observer.ops != NULL;
 		if (st->has_observer) {
