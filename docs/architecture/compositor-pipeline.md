@@ -42,7 +42,7 @@ sessions take the hub:
 
 | Tier | Default | Kill switch / opt-in |
 |---|---|---|
-| D3D11 (`_handle`) | hub on a cross-adapter box; own legs on a single adapter (`same_adapter_opt_in`) | `DXR_HUB=0` kills; `DXR_HUB=1` also engages on a single adapter |
+| D3D11 (`_handle`) | hub on a cross-adapter box and on a single adapter (DIRECT ingress there; ADR-059 Amendment 4) | `DXR_HUB=0` kills (back to the tier's own legs) |
 | D3D12 | hub on a hybrid box (`hybrid_reroute_default_on`); the same fill arm on a single adapter (ADR-039) | `DXR_SPLIT_D3D12_HYBRID_REROUTE=0` (route kill switch); `DXR_HUB=0` while that is unset; `DXR_SPLIT_D3D12_ROUTE=own` keeps the own-legs arm |
 | Vulkan | the tier's output-device split *is* the hub, wherever the split engages | does not read `DXR_HUB`; `DXR_WEAVE_ON_SCANOUT=0` kills the split |
 | OpenGL | own legs | exactly `DXR_HUB=1` opts in |

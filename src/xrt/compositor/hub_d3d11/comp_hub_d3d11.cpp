@@ -5705,9 +5705,10 @@ comp_hub_d3d11_render_diag(struct comp_hub_d3d11 *s)
 	                                                                 : "none";
 
 	U_LOG_W(
-	    "[RENDER] split=1 xb_kb=%llu xb_degraded=%d no_slot=%llu out_crop=%llu ingress=%s "
+	    "[RENDER] split=1 xb_kb=%llu xb_degraded=%d xb_same_adapter=%d no_slot=%llu out_crop=%llu ingress=%s "
 	    "ing_direct=%llu ing_staged=%llu ing_rebind=%llu ing_churn=%llu ing_leak=%llu window_s=10",
 	    (unsigned long long)(xb_bytes / 1024u), (int)comp_xbridge_is_degraded(s->xbridge),
+	    (int)comp_xbridge_is_same_adapter(s->xbridge),
 	    (unsigned long long)s->no_slot, (unsigned long long)s->out_crop, ing_name, (unsigned long long)ing.direct,
 	    (unsigned long long)ing.staged, (unsigned long long)ing.rebind, (unsigned long long)ing.churn,
 	    (unsigned long long)ing.leak);

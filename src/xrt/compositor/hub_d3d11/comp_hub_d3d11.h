@@ -301,10 +301,10 @@ struct comp_hub_d3d11_info
 
 	/*!
 	 * #2317 step 2: decline a SAME-ADAPTER engage with
-	 * @ref COMP_HUB_REASON_SAME_ADAPTER_OPT_IN. The D3D11 shim sets it when the
-	 * hub engages by default (no explicit `DXR_HUB=1`): the default-on scope is
-	 * the cross-adapter (hybrid) topology until the single-dGPU desktop run of
-	 * ADR-059's acceptance lands. Zero for every other caller (unchanged).
+	 * @ref COMP_HUB_REASON_SAME_ADAPTER_OPT_IN. No in-tree caller sets it since
+	 * ADR-059 Amendment 4: the D3D11 shim set it (default-on scope = cross-adapter)
+	 * until the single-dGPU run (#2371) passed. Kept for a future shim that needs
+	 * the same staged rollout.
 	 */
 	bool same_adapter_needs_opt_in;
 };
