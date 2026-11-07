@@ -442,6 +442,44 @@ TEST_CASE("xb_plane_catchup_source picks the newest written slot, never an older
 	CHECK(xb_plane_catchup_source(seq0, n, 3, 0) == 2);
 }
 
+TEST_CASE("xb_gate_decide: the bandwidth gate's verdict")
+{
+	constexpr uint64_t G = 2000ull * 1000ull * 1000ull; // gate
+	constexpr uint64_t F = 250ull * 1000ull * 1000ull;  // plane floor
+	constexpr uint64_t GB = 1000ull * 1000ull * 1000ull;
+
+	SECTION("inside budget, nothing latched: nothing to do")
+	{
+		CHECK(xb_gate_decide(G, G / 2, false, G, F) == XB_GATE_NONE);
+	}
+	SECTION("over budget because of the planes: latch")
+	{
+		CHECK(xb_gate_decide(3 * GB, 2 * GB, false, G, F) == XB_GATE_LATCH);
+	}
+	SECTION("over budget on the atlas alone: no lever")
+	{
+		CHECK(xb_gate_decide(3 * GB, F / 2, false, G, F) == XB_GATE_ATLAS_ONLY);
+	}
+	SECTION("8K regression: atlas alone over budget, latched UI goes idle -> releases")
+	{
+		// 3.1 GB/s atlas, an idle UI plane: the old "total under budget" rule never fired.
+		CHECK(xb_gate_decide(3100 * 1000ull * 1000ull, 10ull * 1000ull * 1000ull, true, G, F) == XB_GATE_SETTLED);
+	}
+	SECTION("latched and the plane is still busy over a heavy atlas: hold, never release")
+	{
+		CHECK(xb_gate_decide(3 * GB + GB, GB, true, G, F) == XB_GATE_LATCH);
+	}
+	SECTION("latched, total under budget but full rate would not fit: hold")
+	{
+		// 1.9 GB/s now with a 0.5 GB/s half-rate plane = 2.4 GB/s at full rate.
+		CHECK(xb_gate_decide(1900ull * 1000ull * 1000ull, GB / 2, true, G, F) == XB_GATE_NONE);
+	}
+	SECTION("latched and full rate would fit: release")
+	{
+		CHECK(xb_gate_decide(GB, GB / 2, true, G, F) == XB_GATE_SETTLED);
+	}
+}
+
 /*
  * #1663 — the bridge's ingress format decision.
  *

@@ -451,6 +451,14 @@ struct comp_xbridge
 	uint64_t gate_under_since_ns;
 	//! One WARN for the over-budget-but-not-the-planes case, ever.
 	bool gate_atlas_only_warned;
+	/*!
+	 * Producer and consumer are the SAME adapter (the LUIDs match). The gate
+	 * protects a cross-adapter link; on one adapter the "transport" is a copy
+	 * within that GPU's own memory, a fraction of a percent of its bandwidth, so
+	 * halving a plane there buys nothing and costs the 2D update rate. The gate
+	 * is off for such a bridge (DXR_XBRIDGE_GATE_SAME_ADAPTER=1 forces it on).
+	 */
+	bool same_adapter;
 
 	// --- ingress ---------------------------------------------------------
 	int ingress_mode;
@@ -1965,12 +1973,24 @@ xb_record_plane(struct comp_xbridge *xb, uint32_t p, uint64_t seq, int xa, int e
  *  - throttling only happens when the PLANES contribute meaningfully to it
  *    (@ref XB_GATE_PLANE_FLOOR_BYTES_PER_S), so an over-budget atlas alone never
  *    throttles a plane;
- *  - the latch is NOT permanent — it clears when the transport has stayed inside
- *    budget for @ref XB_GATE_UNLATCH_NS, and a plane re-bind clears its own.
+ *  - the latch is NOT permanent — it clears when the transport WOULD fit at full
+ *    plane rate, or the planes have gone idle, for @ref XB_GATE_UNLATCH_NS (the
+ *    rule is xb_gate_decide; "total back under budget" could never hold once the
+ *    atlas alone exceeded it, which pinned an 8K session at half rate), and a
+ *    plane re-bind clears its own.
+ *
+ * A same-adapter bridge has no cross-adapter link and never latches.
  */
 static void
 xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_bytes, uint64_t seq)
 {
+	if (xb->same_adapter) {
+		// No cross-adapter link to protect (see `same_adapter`): never latch.
+		for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
+			xb->plane[p].gate_bytes = 0;
+		}
+		return;
+	}
 	const uint64_t now = os_monotonic_get_ns();
 	xb->gate_atlas_bytes += atlas_bytes;
 	xb->gate_plane_bytes += plane_bytes;
@@ -2002,21 +2022,21 @@ xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_
 		xb->plane[p].gate_bytes = 0;
 	}
 
-	if (total_rate <= XB_BANDWIDTH_GATE_BYTES_PER_S) {
-		// UN-LATCH. A latched plane runs at half rate for as long as the
-		// pressure lasts, not for the rest of the session — a resize or a
-		// fullscreen burst must not permanently halve the 2D update rate of a
-		// session that spends the next hour idle.
+	const enum xb_gate_action act = xb_gate_decide(total_rate, plane_rate, any_latched,
+	                                               XB_BANDWIDTH_GATE_BYTES_PER_S, XB_GATE_PLANE_FLOOR_BYTES_PER_S);
+	if (act == XB_GATE_SETTLED) {
+		// UN-LATCH once settled for the dwell. A latched plane runs at half rate
+		// for as long as the pressure lasts, not for the rest of the session.
 		if (xb->gate_under_since_ns == 0) {
 			xb->gate_under_since_ns = now;
-		} else if (any_latched && now - xb->gate_under_since_ns >= XB_GATE_UNLATCH_NS) {
+		} else if (now - xb->gate_under_since_ns >= XB_GATE_UNLATCH_NS) {
 			for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
 				xb->plane[p].half_rate = false;
 			}
 			xb->gate_under_since_ns = 0;
 			U_LOG_W(
-			    "%s: transport has been inside the %.1f GB/s gate for %llu s — "
-			    "releasing the half-rate latch on every plane (#918 Phase 2a)",
+			    "%s: transport would fit the %.1f GB/s gate at full plane rate, or the planes went idle, for "
+			    "%llu s — releasing the half-rate latch on every plane (#918 Phase 2a)",
 			    XB_TAG(xb), (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9,
 			    (unsigned long long)(XB_GATE_UNLATCH_NS / 1000000000ull));
 		}
@@ -2024,7 +2044,7 @@ xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_
 	}
 	xb->gate_under_since_ns = 0;
 
-	if (plane_rate < XB_GATE_PLANE_FLOOR_BYTES_PER_S) {
+	if (act == XB_GATE_ATLAS_ONLY) {
 		// Over budget, but not because of the planes. Halving one would cost
 		// the 2D update rate and buy nothing measurable.
 		if (!xb->gate_atlas_only_warned) {
@@ -2038,8 +2058,8 @@ xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_
 		}
 		return;
 	}
-	if (worst >= COMP_XBRIDGE_PLANE_COUNT) {
-		return; // every live plane is already latched
+	if (act != XB_GATE_LATCH || worst >= COMP_XBRIDGE_PLANE_COUNT) {
+		return; // nothing to do, or every live plane is already latched
 	}
 	xb->plane[worst].half_rate = true;
 	xb->plane[worst].half_rate_parity = seq & 1ull;
@@ -2334,6 +2354,22 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 			        xb_hr(hr, b, sizeof(b)));
 			*out_reason = "D3D12CreateDevice failed";
 			goto fail;
+		}
+	}
+
+	{
+		const LUID pl = xb->prod_dev->GetAdapterLuid();
+		const LUID cl = xb->cons_dev->GetAdapterLuid();
+		xb->same_adapter = pl.LowPart == cl.LowPart && pl.HighPart == cl.HighPart;
+		const char *force = getenv("DXR_XBRIDGE_GATE_SAME_ADAPTER");
+		if (xb->same_adapter && force != nullptr && force[0] == '1') {
+			xb->same_adapter = false;
+		}
+		if (xb->same_adapter) {
+			U_LOG_W("%s: producer and consumer share one adapter — the %.1f GB/s cross-adapter bandwidth gate "
+			        "is off for this bridge (planes always run at full rate; DXR_XBRIDGE_GATE_SAME_ADAPTER=1 "
+			        "forces it on)",
+			        XB_TAG(xb), (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9);
 		}
 	}
 
