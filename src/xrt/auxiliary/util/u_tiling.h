@@ -525,6 +525,57 @@ u_tiling_compute_window_scaled_view(uint32_t disp_px_w,
 	return ratio;
 }
 
+/*!
+ * The extent to allocate along one axis when a high-water-mark atlas (#602)
+ * must grow: what @p req asks for, plus headroom (#2564).
+ *
+ * Growing to exactly @p req made a window resize drag re-allocate the atlas on
+ * every step that set a new high-water mark: 24 reallocs in about a second,
+ * each a fresh (often NT-shared) texture plus views that the split's bridge
+ * then re-opens, and the 3D stuttered for the length of the drag. Growing
+ * geometrically, by 1.5x and rounded up to 256 px, makes a whole drag cost one
+ * or two reallocs.
+ *
+ * @p cap is the worst-case atlas extent across the device's modes (from
+ * u_tiling_compute_system_atlas()): the headroom never goes past it, so the
+ * allocation never exceeds what a full-display session would allocate anyway.
+ * The result is never below @p req, though, because a window larger than the
+ * display can ask for more than the cap. Pass 0 for no cap.
+ *
+ * @param cur  Current allocated extent (0 if nothing is allocated yet).
+ * @param req  Extent the content needs now.
+ * @param cap  Worst-case extent, or 0 for none.
+ * @return     @p cur when @p req fits, otherwise the grown extent.
+ */
+static inline uint32_t
+u_tiling_grow_atlas_extent(uint32_t cur, uint32_t req, uint32_t cap)
+{
+	if (req <= cur) {
+		return cur;
+	}
+	// The first allocation is exact: there is no drag yet to absorb, and a
+	// session that never resizes keeps its allocation shape unchanged.
+	if (cur == 0) {
+		return req;
+	}
+	uint64_t grown = (uint64_t)cur + cur / 2;
+	if (grown < req) {
+		grown = req;
+	}
+	grown = (grown + 255u) & ~(uint64_t)255u;
+	if (cap > 0 && grown > cap) {
+		grown = cap;
+	}
+	if (grown < req) {
+		grown = req;
+	}
+	// D3D11/D3D12 maximum 2D texture extent.
+	if (grown > 16384u) {
+		grown = req > 16384u ? req : 16384u;
+	}
+	return (uint32_t)grown;
+}
+
 #ifdef __cplusplus
 }
 #endif

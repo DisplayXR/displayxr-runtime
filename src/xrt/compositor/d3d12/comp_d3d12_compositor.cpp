@@ -8354,6 +8354,12 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		d3d12_compositor_destroy(&c->base.base);
 		return xret;
 	}
+	// #2564: bound the atlas's grow headroom by the worst case across modes.
+	if (xdev != NULL && xdev->rendering_mode_count > 0) {
+		uint32_t cap_w = 0, cap_h = 0;
+		u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &cap_w, &cap_h);
+		comp_d3d12_renderer_set_atlas_cap(c->renderer, cap_w, cap_h);
+	}
 
 	// Expose current window-scaled capture dims to xrCaptureAtlasDXR (#431).
 	u_capture_dims_set_provider(d3d12_compositor_capture_dims_provider, c);
