@@ -648,14 +648,17 @@ struct comp_vk_native_compositor
 	 * (xrt_dp_scanout_caps::stereo_layout = 3). @ref full_sbs.dp_wants is the
 	 * DP's answer, read when the DP or the head's rendering mode changes (the
 	 * DP pointer and mode index it was read at are kept), never per frame.
-	 * @ref full_sbs.presented: the window is declared and the target is as
-	 * wide as the views side by side (twice the window), see
-	 * @ref vk_output_views_across. @ref full_sbs.refused names why a wanted
-	 * declaration was not made (logged once per reason).
+	 * @ref full_sbs.declared: the window is declared. @ref full_sbs.presented:
+	 * the target is as wide as the views side by side (twice the window), see
+	 * @ref vk_output_views_across; on Wayland as soon as the window is
+	 * declared, on X11 once the window manager holds the declared window at
+	 * both views' width. @ref full_sbs.refused names why a wanted declaration
+	 * was not made (logged once per reason).
 	 */
 	struct
 	{
 		bool dp_wants;
+		bool declared;
 		bool presented;
 		const struct xrt_display_processor *read_dp;
 		uint32_t read_mode_index;
@@ -2944,8 +2947,11 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 
 			// #602: extension apps' atlas is owned by layer_commit; only legacy
 			// apps need the window-derived resize here (see Windows branch).
+			// Each view is half the target: half the window, or the whole
+			// window while it is presented full side by side (a declared X11
+			// window's size is then one view, vk_full_sbs_refresh_locked).
 			if (c->legacy_app_tile_scaling) {
-				uint32_t new_vw = new_width / 2;
+				uint32_t new_vw = new_width * vk_output_views_across(c) / 2;
 				uint32_t new_vh = new_height;
 				uint32_t tc, tr;
 				comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
@@ -5904,9 +5910,21 @@ vk_dp_refresh_resample_caps(struct comp_vk_native_compositor *c)
  * declared: when the declaration cannot be made the target stays the window's
  * size and the log says why, so the two views show side by side, flat.
  *
+ * Two kinds of window are declared. The app's native Wayland surface
+ * (kde_stereo_content_v1) takes the wider buffer with the commit that carries
+ * it, so it is presented two views wide as soon as it is declared. The
+ * runtime's own X11 window (`_KDE_NET_WM_STEREO_CONTENT` = 3, on a window
+ * manager announcing version 3 or later) is made twice as wide by the window
+ * manager when it reads the declaration, which can be seconds later; a Vulkan
+ * X11 swapchain is only ever the window's current size, so the target becomes
+ * two views wide when the window has become so
+ * (comp_vk_native_window_xcb_full_sbs_doubled), and the window's size the
+ * compositor follows is then one view (comp_vk_native_window_xcb_get_dimensions).
+ *
  * The DP is asked again only when the DP or the head's rendering mode changed
- * (sim_display's answer follows its output mode), never per frame. One WARN per
- * transition and one per refusal reason. Caller holds c->mutex (or is in
+ * (sim_display's answer follows its output mode), never per frame; the X11
+ * window's doubling is read every call (a flag the event pump keeps). One WARN
+ * per transition and one per refusal reason. Caller holds c->mutex (or is in
  * create, before any other thread exists); call it before the target's size is
  * read for the frame, and before the target is created.
  */
@@ -5915,70 +5933,131 @@ vk_full_sbs_refresh_locked(struct comp_vk_native_compositor *c)
 {
 	const uint32_t idx =
 	    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : UINT32_MAX;
-	if (c->display_processor == c->full_sbs.read_dp && idx == c->full_sbs.read_mode_index) {
-		return;
-	}
-	c->full_sbs.read_dp = c->display_processor;
-	c->full_sbs.read_mode_index = idx;
-	c->full_sbs.dp_wants =
-	    c->display_processor != NULL &&
-	    xrt_display_processor_vk_outputs_full_sbs((struct xrt_display_processor_vk *)c->display_processor);
+	if (c->display_processor != c->full_sbs.read_dp || idx != c->full_sbs.read_mode_index) {
+		c->full_sbs.read_dp = c->display_processor;
+		c->full_sbs.read_mode_index = idx;
+		c->full_sbs.dp_wants =
+		    c->display_processor != NULL &&
+		    xrt_display_processor_vk_outputs_full_sbs((struct xrt_display_processor_vk *)c->display_processor);
 
-	bool declare = false;
-	const char *refused = NULL;
-	if (c->full_sbs.dp_wants) {
-		const char *env = getenv("DXR_STEREO_DECLARE");
-		if (env != NULL && env[0] == '0') {
-			refused = "DXR_STEREO_DECLARE=0 turns the declaration off";
-		} else {
+		bool declare = false;
+		const char *refused = NULL;
+		uint32_t x11_supported = 0;
+		(void)x11_supported;
+		if (c->full_sbs.dp_wants) {
+			const char *env = getenv("DXR_STEREO_DECLARE");
+			if (env != NULL && env[0] == '0') {
+				refused = "DXR_STEREO_DECLARE=0 turns the declaration off";
+			} else {
 #if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_STEREO)
-			if (c->use_wayland) {
-				declare = c->wl_stereo != NULL;
-				refused = declare ? NULL : c->wl_stereo_missing;
-			} else
-#endif
-			{
-				refused = "the window is not a native Wayland surface (only those are declared so far)";
-#if defined(XRT_HAVE_WAYLAND) && !defined(DXR_HAVE_WL_STEREO)
 				if (c->use_wayland) {
-					refused =
-					    "this runtime was built without wayland-scanner, so it cannot declare";
-				}
+					declare = c->wl_stereo != NULL;
+					refused = declare ? NULL : c->wl_stereo_missing;
+				} else
 #endif
+#ifdef XRT_OS_LINUX_DESKTOP
+				    if (c->xcb_window != NULL) {
+					refused =
+					    comp_vk_native_window_xcb_full_sbs_refusal(c->xcb_window, &x11_supported);
+					declare = refused == NULL;
+				} else if (!c->owns_window && c->xcb_handle.connection != NULL) {
+					refused =
+					    "the window is the app's own X11 window (XR_DXR_xlib_window_binding), "
+					    "and on X11 only the runtime's own window is declared so far";
+				} else
+#endif
+				{
+					refused =
+					    "the window is neither a native Wayland surface nor the runtime's own "
+					    "X11 window";
+#if defined(XRT_HAVE_WAYLAND) && !defined(DXR_HAVE_WL_STEREO)
+					if (c->use_wayland) {
+						refused =
+						    "this runtime was built without wayland-scanner, so it "
+						    "cannot declare";
+					}
+#endif
+				}
+			}
+		}
+
+		if (refused != NULL && refused != c->full_sbs.refused) {
+			U_LOG_W(
+			    "FULL_SBS: the display processor's output is full side by side for a stereo compositor, "
+			    "but %s — presenting it in the window as it is: the two views side by side, flat, "
+			    "nothing declared",
+			    refused);
+		}
+		c->full_sbs.refused = refused;
+
+		if (declare != c->full_sbs.declared) {
+			c->full_sbs.declared = declare;
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_STEREO)
+			// Takes effect with the surface's next commit: the present that
+			// carries the first buffer of the new width (the resize below
+			// comes first).
+			if (c->use_wayland) {
+				comp_vk_native_wl_stereo_set_full_sbs(c->wl_stereo, declare);
+			}
+#endif
+#ifdef XRT_OS_LINUX_DESKTOP
+			if (c->xcb_window != NULL) {
+				comp_vk_native_window_xcb_set_full_sbs(c->xcb_window, declare);
+				if (declare) {
+					U_LOG_W(
+					    "FULL_SBS: the runtime's X11 window is declared full side by side, "
+					    "left view first (_KDE_NET_WM_STEREO_CONTENT = 3; the window manager "
+					    "announces version %u); it keeps its %ux%u px on screen, and both "
+					    "views are presented once the window manager has made the X window "
+					    "twice as wide",
+					    x11_supported, c->settings.preferred.width, c->settings.preferred.height);
+				}
+			}
+#endif
+			if (!declare) {
+				U_LOG_W("FULL_SBS: the declaration is withdrawn");
 			}
 		}
 	}
 
-	if (refused != NULL && refused != c->full_sbs.refused) {
-		U_LOG_W(
-		    "FULL_SBS: the display processor's output is full side by side for a stereo compositor, but %s "
-		    "— presenting it in the window as it is: the two views side by side, flat, nothing declared",
-		    refused);
+	// What the target holds follows what the window shows: a declared Wayland
+	// surface at once, a declared X11 window once the window manager holds it
+	// at both views' width.
+	bool presented = c->full_sbs.declared;
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (presented && c->xcb_window != NULL) {
+		presented = comp_vk_native_window_xcb_full_sbs_doubled(c->xcb_window);
 	}
-	c->full_sbs.refused = refused;
-	if (declare == c->full_sbs.presented) {
+#endif
+	if (presented == c->full_sbs.presented) {
 		return;
 	}
-
-#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_STEREO)
-	// Takes effect with the surface's next commit: the present that carries
-	// the first buffer of the new width (the resize below comes first).
-	comp_vk_native_wl_stereo_set_full_sbs(c->wl_stereo, declare);
+	c->full_sbs.presented = presented;
+	if (presented) {
+#ifdef XRT_OS_LINUX_DESKTOP
+		if (c->xcb_window != NULL) {
+			U_LOG_W(
+			    "FULL_SBS: the window manager holds the declared X11 window at both views' width; "
+			    "presenting %ux%u px, the two views at the window's %ux%u each",
+			    c->settings.preferred.width * 2, c->settings.preferred.height, c->settings.preferred.width,
+			    c->settings.preferred.height);
+		} else
 #endif
-	c->full_sbs.presented = declare;
-	if (declare) {
-		uint32_t version = 0;
+		{
+			uint32_t version = 0;
 #if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_STEREO)
-		version = comp_vk_native_wl_stereo_version(c->wl_stereo);
+			version = comp_vk_native_wl_stereo_version(c->wl_stereo);
 #endif
-		U_LOG_W(
-		    "FULL_SBS: the window is declared full side by side, left view first (kde_stereo_content_v1 "
-		    "version %u, value 3); presenting %ux%u px, the two views at the window's %ux%u each",
-		    version, c->settings.preferred.width * 2, c->settings.preferred.height, c->settings.preferred.width,
-		    c->settings.preferred.height);
+			U_LOG_W(
+			    "FULL_SBS: the window is declared full side by side, left view first "
+			    "(kde_stereo_content_v1 version %u, value 3); presenting %ux%u px, the two views at "
+			    "the window's %ux%u each",
+			    version, c->settings.preferred.width * 2, c->settings.preferred.height,
+			    c->settings.preferred.width, c->settings.preferred.height);
+		}
 	} else {
-		U_LOG_W("FULL_SBS: the declaration is withdrawn; presenting the window's own %ux%u px again",
-		        c->settings.preferred.width, c->settings.preferred.height);
+		U_LOG_W("FULL_SBS: presenting the window's own %ux%u px again", c->settings.preferred.width,
+		        c->settings.preferred.height);
 	}
 	vk_output_follow_window_locked(c, c->settings.preferred.width, c->settings.preferred.height);
 }
