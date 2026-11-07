@@ -336,6 +336,15 @@ struct xrt_conv_state
  *  without the user's per-provider consent (host->get_consent(
  *  XRT_CONV_CONSENT_OFFBOX)) the provider reports it DISABLED. */
 #define XRT_CONV_CAP_REMOTE (1u << 9)
+/*! The model is a runtime the USER installed on this box separately, under
+ *  its own licence (e.g. Leia's NeurD runtime), and the provider found a
+ *  valid copy of it: that install is the opt-in, so selection admits this
+ *  capability without AllowResearchOnly even when its licence class is
+ *  RESEARCH_ONLY / UNKNOWN. Set it ONLY while that install is present and
+ *  usable; never for a model the runtime or the provider fetches itself.
+ *  Same footing as the grandfathered dp-lift adapter, whose exemption had the
+ *  same reason (the user installed the module). */
+#define XRT_CONV_CAP_LICENSED_LOCAL_INSTALL (1u << 10)
 /*! @} */
 
 /*! One capability = (task × model × backend × device). Top-level: the

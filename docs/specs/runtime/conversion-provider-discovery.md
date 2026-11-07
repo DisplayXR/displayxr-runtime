@@ -238,7 +238,7 @@ every `FAILED(DEVICE_LOST)`. `sim-conversion`'s `SCRATCH_TOUCH` setting exercise
 | Root value | Type | Default | Meaning |
 |---|---|---|---|
 | `PreferredProvider\<task>` | REG_SZ | — | `"<provider-id>[/<cap_id or model_id>]"`, task names as `views-mono`, `depth-video`, … Written by `displayxr-cli conv use` to HKCU (per user, no admin, as `dp use`); `--machine` writes HKLM. |
-| `AllowResearchOnly` | DWORD | 0 | 1 lets selection consider `RESEARCH_ONLY` and `UNKNOWN` licence classes. HKCU or HKLM. **Signed installers never write it**, and never pre-fetch a non-commercial blob. |
+| `AllowResearchOnly` | DWORD | 0 | 1 lets selection consider `RESEARCH_ONLY` and `UNKNOWN` licence classes. HKCU or HKLM. **Signed installers never write it**, and never pre-fetch a non-commercial blob. Not needed for a capability flagged `XRT_CONV_CAP_LICENSED_LOCAL_INSTALL` (below). |
 | `Prewarm\<task>` | DWORD | 1 for `views-mono` and `depth-video`; else 0 | which tasks are prewarmed (§4.2); 0 opts out |
 | `PrewarmOn` | REG_SZ | `interest` on mains power / desktop; `first-create` on battery | `interest` / `first-create` / `start` (kiosk opt-in); §4.2 |
 | `KeepAliveSec` | DWORD | **0 = never** | idle eviction of prewarm-task models. Job-only models evict after **600 s** idle. Nothing is evicted while a stream or job is bound. A reload is always reported WARMING with progress |
@@ -275,7 +275,7 @@ The reference view synthesis is a pipeline stage, not a row (§6.2).
 Selection runs per task, at stream / job create (ADR-053 decision 2).
 
 1. **Candidates.** Every capability with the task, from providers that are enabled, negotiated at ABI 1 and probed OK, and whose provider status is not `PLATFORM_ABSENT` or `INCOMPATIBLE` — plus every runtime-composable pipeline (e.g. `VIEWS_MONO` = a depth capability + the reference view-synthesis stage).
-2. **Filter.** Licence gate (`AllowResearchOnly`), then input kind, lane, `min_views ≤ view_count ≤ max_views`, and `EXPLICIT_VIEWPOINTS` for `VIEWS_*`.
+2. **Filter.** Licence gate (`AllowResearchOnly`; skipped for the grandfathered `dp-lift` adapter and for a capability flagged `XRT_CONV_CAP_LICENSED_LOCAL_INSTALL`), then input kind, lane, `min_views ≤ view_count ≤ max_views`, and `EXPLICIT_VIEWPOINTS` for `VIEWS_*`.
 3. **Order.**
    - `PreferredProvider\<task>`: HKCU, then HKLM (HKLM only under `Policy\Lock`).
    - ProbeOrder ascending.
@@ -963,3 +963,9 @@ Per [`debug-logging.md`](../../reference/debug-logging.md):
 - [`input-provider-discovery.md`](input-provider-discovery.md) — the second plug-in type; shape of this spec.
 - [ADR-019](../../adr/ADR-019-vendor-plugin-aux-boundary.md), [ADR-020](../../adr/ADR-020-plugin-abi-compatibility-policy.md), [ADR-034](../../adr/ADR-034-input-provider-plugins.md), [ADR-035](../../adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md), [ADR-038](../../adr/ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md), [ADR-040](../../adr/ADR-040-rear-depth-budget.md), [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md), [ADR-045](../../adr/ADR-045-plugins-always-loadable-and-report-platform-state.md), [ADR-046](../../adr/ADR-046-depth-aware-cursor.md), [ADR-048](../../adr/ADR-048-lift-viewpoint-policy.md), [ADR-049](../../adr/ADR-049-in-process-lift-rides-the-service.md), [ADR-051](../../adr/ADR-051-display-status-model-and-dashboard.md).
 - [`service-architecture.md`](../../architecture/service-architecture.md) — threads, locks, failure domains; the satellite shape.
+
+## Licence gate: a model the user installed
+
+A capability may set `XRT_CONV_CAP_LICENSED_LOCAL_INSTALL` when its model is a runtime the **user installed on this box separately, under its own licence**, and the provider has found a valid, usable copy of it (Leia's `leia-conversion` sets it while the NeurD runtime is installed at a supported version). Selection then admits the capability without `AllowResearchOnly`, whatever its licence class. The install is the opt-in: it is the reason the grandfathered `dp-lift` adapter was exempt, carried over to the provider that supersedes it.
+
+Rules: set it only while that install is present and usable, so selection falls through to the next candidate (e.g. Open Conversion) the moment it is not. Never set it for a model the runtime or the provider fetches itself (`USES_MODEL_STORE`, `NEEDS_NETWORK_TO_WARM`); those stay behind `AllowResearchOnly`. The status snapshot reports the provider as `licence_exempt`, and no `CONV_RESEARCH_MODEL_ENABLED` warning is raised for it.
