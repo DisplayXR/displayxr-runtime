@@ -30011,6 +30011,23 @@ svc_weave_cursor_lift_mask(const struct xrt_lift_weave_rect *lift_rects, uint32_
 }
 
 /*!
+ * The converter's viewpoints follow the viewer only through the eyes snapshot
+ * the conversion core reads (G7: every eye query this service answers is
+ * published there). A present-owner that converts a video asks for no eyes
+ * itself, so the snapshot went stale (2 s) and the policy fell back to the
+ * fixed nominal viewer: no look-around, where the old in-DP lift read the
+ * tracker on every frame. Query, and so publish, the weaving client's eyes on
+ * every lifted weave. The DP answers from its cached eye pair. Caller holds
+ * render_mutex (recursive).
+ */
+static void
+lift_refresh_eyes(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	struct xrt_eye_positions eyes = {};
+	(void)comp_d3d11_service_get_predicted_eye_positions_full_for_client(&sys->base, &c->base.base, &eyes);
+}
+
+/*!
  * Batch (v3) layout: rect @p rect is window-sized-input pixels holding a 2D
  * frame. Snapshot it, then blit the stream's latest pair into the left / right
  * tiles of the SBS scratch at the rect's position (or the 2D frame into both,
@@ -30047,6 +30064,7 @@ lift_weave_rect_batch(struct d3d11_service_system *sys,
 		return true; // nothing visible to lift; nothing to weave either
 	}
 	uint64_t frame_id = 0;
+	lift_refresh_eyes(sys, c);
 	struct xrt_lift_rect_frame frame;
 	lift_rect_frame(sys, &c->base.base, &rect, win_w, win_h, &frame);
 	d3d11_lift_rect_match_views(lift, owner, b->stream_id, 2); // the batch layout weaves a pair
@@ -30156,6 +30174,7 @@ lift_weave_rects_nview(struct d3d11_service_system *sys,
 	ID3D11ShaderResourceView *crop_srv = c->render.weave_crop_srv.get();
 	ID3D11RenderTargetView *crop_rtv = c->render.weave_crop_rtv.get();
 
+	lift_refresh_eyes(sys, c);
 	for (uint32_t k = 0; k < binding_count; k++) {
 		const struct xrt_lift_weave_rect *b = &bindings[k];
 		if (b->rect_index >= rect_count) {
