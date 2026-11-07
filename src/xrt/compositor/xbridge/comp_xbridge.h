@@ -955,6 +955,15 @@ bool
 comp_xbridge_is_degraded(struct comp_xbridge *xb);
 
 /*!
+ * True when producer and consumer are the same adapter (LUIDs match): the
+ * bridge then copies every app frame within one GPU. Diagnostic only — the
+ * `[RENDER]` row's `xb_same_adapter`, so a staged single-GPU session is visible
+ * without measuring the copy engine.
+ */
+bool
+comp_xbridge_is_same_adapter(struct comp_xbridge *xb);
+
+/*!
  * Stop submitting, join the watchdog and drain the queues under a bounded CPU
  * wait. Call before tearing down the DP / target / devices.
  */

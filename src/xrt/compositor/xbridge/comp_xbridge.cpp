@@ -459,6 +459,11 @@ struct comp_xbridge
 	 * is off for such a bridge (DXR_XBRIDGE_GATE_SAME_ADAPTER=1 forces it on).
 	 */
 	bool same_adapter;
+	//! The LUIDs match, whatever the gate override says. A bridge on one adapter
+	//! copies every app frame (atlas + planes) within that GPU for nothing: the
+	//! consumer could read the producer's texture in place (the hub's DIRECT
+	//! ingress). Reported once at create and on the [RENDER] row.
+	bool luid_same;
 
 	// --- ingress ---------------------------------------------------------
 	int ingress_mode;
@@ -2361,6 +2366,7 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 		const LUID pl = xb->prod_dev->GetAdapterLuid();
 		const LUID cl = xb->cons_dev->GetAdapterLuid();
 		xb->same_adapter = pl.LowPart == cl.LowPart && pl.HighPart == cl.HighPart;
+		xb->luid_same = xb->same_adapter;
 		const char *force = getenv("DXR_XBRIDGE_GATE_SAME_ADAPTER");
 		if (xb->same_adapter && force != nullptr && force[0] == '1') {
 			xb->same_adapter = false;
@@ -2370,6 +2376,20 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 			        "is off for this bridge (planes always run at full rate; DXR_XBRIDGE_GATE_SAME_ADAPTER=1 "
 			        "forces it on)",
 			        XB_TAG(xb), (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9);
+		}
+		if (xb->luid_same) {
+			/*
+			 * The slow path, made loud. Both field incidents of this class
+			 * (#2518 D3D12, #2563 VK: a weaker single GPU at 8K lost 20 fps to
+			 * these copies, and the staged pick also weaves a frame stale,
+			 * ADR-059 Amendment 1) were invisible in the log and found by
+			 * measuring the GPU copy engine by hand.
+			 */
+			U_LOG_W("%s: SAME-ADAPTER BRIDGE — every app frame is copied through the bridge on one GPU "
+			        "(staged ingress: copy-engine load scales with the atlas and planes, and the weave reads "
+			        "one frame stale). The hub reads it in place on one adapter (DIRECT ingress); if this "
+			        "session should be on the hub, check its `hub placement:` / `ingress_reason` line",
+			        XB_TAG(xb));
 		}
 	}
 
@@ -4151,6 +4171,12 @@ extern "C" bool
 comp_xbridge_is_degraded(struct comp_xbridge *xb)
 {
 	return xb != nullptr && xb->degraded.load(std::memory_order_relaxed);
+}
+
+extern "C" bool
+comp_xbridge_is_same_adapter(struct comp_xbridge *xb)
+{
+	return xb != nullptr && xb->luid_same;
 }
 
 

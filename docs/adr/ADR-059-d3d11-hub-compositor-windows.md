@@ -10,9 +10,10 @@ default-OFF behind `DXR_HUB=1` (PR #2321) with its A/B harness (PR #2323). Defau
 flipped per API, each behind the acceptance gates below:
 
 - **In-process D3D11, cross-adapter (hybrid) box:** the hub is the default since step 2 (PR #2363);
-  `DXR_HUB=0` is the kill switch (`hub placement: hub=0 reason=disabled_by_env`). On a single
-  adapter the hub engages only with `DXR_HUB=1` (`reason=same_adapter_opt_in` otherwise); the
-  single-dGPU acceptance run (#2371) has passed, the default flip there has not landed yet.
+  `DXR_HUB=0` is the kill switch (`hub placement: hub=0 reason=disabled_by_env`). **On a single
+  adapter too since Amendment 4** (the #2371 gate had passed; the flip lagged it by a week), with
+  DIRECT ingress. Before that a single adapter declined with `reason=same_adapter_opt_in` and the
+  session took the tier's own ADR-039 split, which copies every frame through the staged bridge.
 - **In-process D3D12, hybrid box:** the #1264 reroute onto the hub is the default since #2375
   (PR #2381, `reason=hybrid_reroute_default_on`). `DXR_SPLIT_D3D12_HYBRID_REROUTE=0` is the route's
   own kill switch; with it unset, `DXR_HUB=0` kills the route too; `DXR_SPLIT_D3D12_ROUTE=own`
@@ -20,7 +21,8 @@ flipped per API, each behind the acceptance gates below:
 - **In-process Vulkan:** the fill arm that lived in `comp_vk_native_split.cpp` *is* the hub
   (extracted into `compositor/hub_d3d11/` by PR #2321), so the VK tier's output-device split runs
   on it wherever the split engages. The VK tier does not read `DXR_HUB`; its kill switch is the
-  split's, `DXR_WEAVE_ON_SCANOUT=0`.
+  split's, `DXR_WEAVE_ON_SCANOUT=0`. On a single adapter its ingress is DIRECT by default since
+  #2563 (runtime v2.66.1); `DXR_HUB_INGRESS=xbridge` forces the staged bridge.
 - **OpenGL:** an opt-in shim (P3, PR #2366), exactly `DXR_HUB=1` on every topology; otherwise
   `hub placement: hub=0 reason=not_requested`.
 - **Texture-class sessions:** the client-presents strategy (Amendment 3, PR #2380), only with
@@ -276,6 +278,23 @@ engaged on the hybrid, repaint cadence preserved under the frame divisor, the fu
 | D3D11 in-process | hybrid | hub (#2363, `DXR_HUB=0` kills) | #2363 harness + tracked-viewer eyeball (#2375) | single-dGPU desktop (#2371) |
 | D3D12 in-process (the #1264 reroute) | hybrid | hub (#2375). Kill: `DXR_SPLIT_D3D12_HYBRID_REROUTE` set to a false spelling; unset, `DXR_HUB=0` kills it too (`hub_disabled_by_env`); any non-false value of the route knob engages it even under `DXR_HUB=0` | #2374 harness (n=3, full rate); #2376 fallback to own-legs; #2375 hybrid-laptop gates passed: rep-3 repeat, soak, refusal/retire, events, Unity engine repeats, reduced test matrix, tracked-viewer eyeball | single-dGPU desktop (#2371); Unreal engine check: same-adapter hybrid laptop A/B done (#2518: staged ingress stalled the #2362 drain on ~96 % of frames, DIRECT ingress is the D3D12 reroute's default on one adapter since then; a tracked-viewer full-panel run on DIRECT is still open); mode switch PARTIAL (2D→3D and 1/2/3 keys unexercised); eye-tracking state change unexercised; ADR-044 raw-alpha oracle OPEN |
 
+### A passed gate opens its flip
+
+Each gate exists to unblock specific defaults. When the gate's issue closes, the flips it unblocks
+are opened as PRs in the same week, or the gate issue says why not. This rule is here because the
+single-dGPU gate (#2371) closed on 2026-11-02 and two of its three flips did not follow: the VK
+deposit stayed on staged ingress until a station at 8K lost 20 fps to it (#2563), and the D3D11
+single-adapter default waited for Amendment 4. Only D3D12's (#2518) had landed, also after a field
+report. Track the unblocked defaults here:
+
+| gate | defaults it unblocks | landed |
+|---|---|---|
+| single-dGPU desktop run (#2371, accepted 2026-11-02) | D3D12 reroute DIRECT ingress on one adapter | #2523 (v2.62.0) |
+| | VK deposit DIRECT ingress on one adapter | #2563 (v2.66.1) |
+| | D3D11 hub on one adapter (`same_adapter_needs_opt_in` off) | Amendment 4 |
+| GL hub validation (open) | GL hub default (today exactly `DXR_HUB=1`) | — |
+| #2337 (GPU-wait the in-flight slot) | cross-adapter DIRECT-equivalent freshness | — |
+
 ## Amendment 1 (2026-10-24) — bridge ingress is one frame stale; direct ingress is a frame fresher
 
 The measurements above said the DIRECT and xbridge ingress modes were "within noise". That is
@@ -379,6 +398,31 @@ same on both tiers. Under `DXR_HUB=1` both tiers print `hub placement: hub=0 rea
 - **OpenGL texture mode** is not carried. The GL shim (#2366) landed without it: a GL session
   with a shared texture is refused (`shared_texture_session`) and stays on the GL compositor's own
   legs.
+
+## Amendment 4 (2026-11-07) — one adapter never copies a frame by default
+
+**Field data.** A single-GPU Leia station (RTX A4000, 8K panel, runtime v2.65.0) ran Media Player
+Pro (VK) with its panels up at 40 fps: the VK deposit's default staged ingress copied the 8K atlas
+plus every Local2D plane through the bridge on that one GPU, and the copy engine saturated
+(123–152 %). `DXR_HUB_INGRESS=direct` gave 60/56 fps with the copy engine at 0, and a live DeckLink
+feed held 60. On an RTX 3080 the same session held 60 either way, but the copy engine read 43 %
+staged against 6 % DIRECT — the cost was there, just absorbed. Turning the split off instead
+(`DXR_SPLIT_SAME_ADAPTER=0`) is not the answer: it dropped 7.4 % of live frames against 1.4 %.
+
+**Decision.** On a single adapter no in-process route copies a full frame by default:
+
+- **VK:** DIRECT ingress by default (#2563).
+- **D3D12:** DIRECT ingress by default (#2523).
+- **D3D11:** the hub engages on one adapter by default (`same_adapter_needs_opt_in = false`), so
+  the tier's own ADR-039 split, which bridged every frame, is no longer the single-adapter default.
+  `DXR_HUB=0` restores it.
+- **GL:** unchanged — no same-adapter split, so no copy; its hub stays opt-in.
+
+**Visibility.** Every bridge created on one adapter logs one `SAME-ADAPTER BRIDGE` WARN, and the
+`[RENDER]` row carries `xb_same_adapter`, so a session that still lands on the copying path (a kill
+switch, a refusal, a texture-class session) is visible in the log instead of only on a GPU counter.
+`scripts/measure_hub_ingress.ps1` measures fps plus the app's GPU 3D and COPY engine load per
+environment arm, with the route lines from the log; use it for any change to these defaults.
 
 ## References
 

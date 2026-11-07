@@ -4860,9 +4860,14 @@ d3d11_make_dp(struct comp_d3d11_compositor *c,
  * split gate's own parser so its false spellings match DXR_WEAVE_ON_SCANOUT's.
  *
  * - unset / empty: DEFAULT — the hub engages for a session that passes the
- *   create-time checks in @ref d3d11_hub_stage_a ON THE CROSS-ADAPTER (hybrid)
- *   TOPOLOGY. A single adapter declines with `same_adapter_opt_in` until the
- *   single-dGPU desktop run of ADR-059's acceptance lands.
+ *   create-time checks in @ref d3d11_hub_stage_a, on a cross-adapter (hybrid)
+ *   box AND on a single adapter. The single adapter used to decline with
+ *   `same_adapter_opt_in` until the single-dGPU desktop run of ADR-059's
+ *   acceptance; #2371 accepted it (2026-11-02). Declining left a one-GPU session
+ *   on this tier's own ADR-039 split, which hands every app frame over through
+ *   the staged comp_xbridge copy — the cost #2518 (D3D12) and #2563 (VK) removed
+ *   from the other tiers. On one adapter the hub takes DIRECT ingress (the
+ *   stable atlas, read in place), so the flip removes the copy.
  * - a false spelling (`0`, `f…`, `n…`, `off`): the KILL SWITCH — the tier's own
  *   legs, exactly as before the flip (`reason=disabled_by_env`).
  * - anything else (`1`): FORCED — engages on a single adapter too (the P1b..P2c
@@ -5040,8 +5045,11 @@ d3d11_hub_stage_a(struct comp_d3d11_compositor *c,
 	si.preferred_width = c->settings.preferred.width;
 	si.preferred_height = c->settings.preferred.height;
 	si.stable_atlas = true;
-	// #2317 step 2 review: default-on scope = cross-adapter until the desktop run.
-	si.same_adapter_needs_opt_in = (d3d11_hub_policy() != D3D11_HUB_POLICY_FORCED);
+	// #2317 step 2 review scoped the default to cross-adapter until the
+	// single-dGPU desktop run; #2371 accepted that run, so a single adapter
+	// engages by default too (see @ref d3d11_hub_policy). The client-presents
+	// strategy keeps its own explicit DXR_HUB=1 gate above.
+	si.same_adapter_needs_opt_in = false;
 
 	const char *short_reason = nullptr;
 	if (comp_hub_d3d11_stage_a(&si, &c->hub.split, &short_reason) != XRT_SUCCESS || c->hub.split == nullptr) {
