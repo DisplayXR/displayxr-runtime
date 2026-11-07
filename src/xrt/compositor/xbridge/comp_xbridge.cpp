@@ -404,6 +404,13 @@ struct comp_xbridge
 		ID3D12Resource *eg_12[XB_EGRESS_RING];
 		//! Content generation each slot's pixels carry (0 = never written).
 		uint64_t slot_seq[XB_EGRESS_RING];
+		//! Monotonic transport order of each slot's pixels (`copy_n` at the copy
+		//! that wrote them) — the half-rate catch-up's notion of "newest", since
+		//! `slot_seq` is a content hash and has no order.
+		uint64_t slot_copy_n[XB_EGRESS_RING];
+		uint64_t copy_n;
+		//! One WARN the first time a half-rate skip catches up locally.
+		bool catchup_warned;
 		//! Dirty box each slot still owes, accumulated across the frames it was
 		//! not the write slot. Empty (w==0) means "already current".
 		int32_t pend_x[XB_EGRESS_RING], pend_y[XB_EGRESS_RING];
@@ -1216,6 +1223,7 @@ xb_release_plane(struct comp_xbridge *xb, uint32_t p, bool drained)
 			pl.eg_tex[i] = nullptr;
 		}
 		pl.slot_seq[i] = 0;
+		pl.slot_copy_n[i] = 0;
 		pl.pend_w[i] = 0;
 		pl.pend_h[i] = 0;
 	}
@@ -1837,8 +1845,57 @@ xb_record_plane(struct comp_xbridge *xb, uint32_t p, uint64_t seq, int xa, int e
 	 */
 	const struct xb_plane_box owed = xb_plane_pend_box(pl, eg);
 	const struct xb_plane_box staged = {pl.stage_x, pl.stage_y, pl.stage_w, pl.stage_h};
-	if (xb_plane_decide(pl.slot_seq[eg], pl.stage_seq, &owed, &staged, pl.half_rate, seq, pl.half_rate_parity) !=
-	    XB_PLANE_COPY) {
+	const enum xb_plane_action act =
+	    xb_plane_decide(pl.slot_seq[eg], pl.stage_seq, &owed, &staged, pl.half_rate, seq, pl.half_rate_parity);
+	if (act == XB_PLANE_SKIP_HALF_RATE) {
+		/*
+		 * Catch the slot up from the newest transported slot, on the consumer
+		 * queue alone — never across the adapter link the gate is protecting.
+		 * Without this the slot shows content three frames old while the frame
+		 * before it showed one frame old: the 2D band steps back in time on
+		 * every skipped frame (see xb_plane_catchup_source).
+		 *
+		 * Only the box this slot owes can differ from the source slot: outside
+		 * it nothing changed since this slot's generation, and the source's
+		 * generation is newer still. After the copy the two slots hold
+		 * identical pixels, so this slot inherits the source's generation,
+		 * debt and transport order verbatim. Both egress textures are
+		 * simultaneous-access COMMON, and the source slot's own copy was an
+		 * earlier ExecuteCommandLists on this same queue, so no barrier.
+		 */
+		const int src = xb_plane_catchup_source(pl.slot_seq, pl.slot_copy_n, XB_EGRESS_RING, eg);
+		uint32_t lim_w = 0, lim_h = 0;
+		xb_plane_limits(pl.src_w, pl.src_h, pl.alloc_w, pl.alloc_h, &lim_w, &lim_h);
+		const struct xb_plane_box b = xb_plane_box_snap_clamp(&owed, lim_w, lim_h);
+		if (src >= 0 && pl.eg_12[src] != nullptr && pl.eg_12[eg] != nullptr && !xb_plane_box_empty(&b)) {
+			D3D12_BOX box{};
+			box.left = (UINT)b.x;
+			box.top = (UINT)b.y;
+			box.front = 0;
+			box.right = (UINT)b.x + b.w;
+			box.bottom = (UINT)b.y + b.h;
+			box.back = 1;
+			D3D12_TEXTURE_COPY_LOCATION dst = sub_loc(pl.eg_12[eg]);
+			D3D12_TEXTURE_COPY_LOCATION from = sub_loc(pl.eg_12[src]);
+			xb->cons_list->CopyTextureRegion(&dst, (UINT)b.x, (UINT)b.y, 0, &from, &box);
+			pl.slot_seq[eg] = pl.slot_seq[src];
+			pl.slot_copy_n[eg] = pl.slot_copy_n[src];
+			pl.pend_x[eg] = pl.pend_x[src];
+			pl.pend_y[eg] = pl.pend_y[src];
+			pl.pend_w[eg] = pl.pend_w[src];
+			pl.pend_h[eg] = pl.pend_h[src];
+			if (!pl.catchup_warned) {
+				pl.catchup_warned = true;
+				U_LOG_W("%s: %s plane at half rate — skipped frames now repeat the newest transported "
+				        "content via an output-device slot copy instead of showing an older slot (no "
+				        "cross-adapter traffic)",
+				        XB_TAG(xb), xb_plane_name(p));
+			}
+		}
+		pl.skips++;
+		return 0;
+	}
+	if (act != XB_PLANE_COPY) {
 		/*
 		 * Skipped. Leave `slot_seq` ALONE in every skip case: advancing it would
 		 * mark the slot as carrying this generation's pixels when no copy ever
@@ -1881,6 +1938,7 @@ xb_record_plane(struct comp_xbridge *xb, uint32_t p, uint64_t seq, int xa, int e
 	}
 
 	pl.slot_seq[eg] = pl.stage_seq;
+	pl.slot_copy_n[eg] = ++pl.copy_n;
 	pl.pend_w[eg] = 0;
 	pl.pend_h[eg] = 0;
 	pl.copies++;

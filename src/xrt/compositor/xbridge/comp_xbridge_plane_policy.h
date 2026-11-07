@@ -222,6 +222,38 @@ xb_plane_slot_is_valid(bool live, bool staged, uint64_t slot_seq, uint64_t stage
 	return live && staged && slot_seq != 0 && slot_seq == stage_seq;
 }
 
+/*!
+ * Which slot a HALF-RATE skip catches up from, on the output device alone.
+ *
+ * A half-rate skip used to leave the write slot holding whatever it was last
+ * given — with a ring of 3 and a copy every other seq, that is the content of
+ * three frames ago, while the slot before it carries one frame ago. The consume
+ * half composites whatever the slot holds (its recipe's plane_seq matches the
+ * slot, so the stale-plane test passes), so the visible 2D band ran
+ * 0, -2, 2, 0, 4, 2, ...: a progress bar or a cursor stepping BACK in time on
+ * every skipped frame, not merely updating at half rate.
+ *
+ * The gate exists to save the cross-adapter hop. A slot-to-slot copy between two
+ * egress textures never crosses it, so a skip can still be made to show the
+ * newest transported content. This returns the slot holding it: the one with
+ * the highest @p slot_copy_n (a per-plane monotonic transport counter; content
+ * seqs are hashes and cannot be ordered), provided it is strictly newer than
+ * @p eg itself and has ever been written. -1 means nothing to catch up from.
+ */
+static inline int
+xb_plane_catchup_source(const uint64_t *slot_seq, const uint64_t *slot_copy_n, int ring, int eg)
+{
+	int best = -1;
+	uint64_t best_n = slot_copy_n[eg];
+	for (int i = 0; i < ring; i++) {
+		if (i != eg && slot_seq[i] != 0 && slot_copy_n[i] > best_n) {
+			best = i;
+			best_n = slot_copy_n[i];
+		}
+	}
+	return best;
+}
+
 #ifdef __cplusplus
 }
 #endif
