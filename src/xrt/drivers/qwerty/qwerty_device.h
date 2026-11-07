@@ -65,6 +65,8 @@ struct qwerty_system
 
 	// Camera-centric state (user adjusts when camera_mode=true)
 	float cam_spread_factor;   //!< Absolute eye scale; profile may seed it independently of parallax.
+	float cam_spread_base;     //!< The seeded (profile) spread: qwerty_set_depth's strength 1.
+	float cam_parallax_base;   //!< The seeded (profile) parallax factor.
 	float cam_parallax_factor; //!< Absolute parallax scale; the combined keyboard control couples both.
 	float cam_convergence;     //!< [0,2] diopters, default 0.5
 	float cam_half_tan_vfov;   //!< default 0.3249 — derived only, not user-adjustable
