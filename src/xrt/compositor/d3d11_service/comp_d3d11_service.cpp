@@ -195,6 +195,10 @@ static weave_latency_log g_weave_latency_standalone;
 // path honors the knob only (its pacing is the device queue cap inside a
 // synchronous RPC — no per-frame pacer to govern).
 static late_weave_governor g_lw_gov_workspace;
+//! #2564: the workspace chain's frame-latency token ledger (see
+//! comp_weave_latency_win.h): every governor decrease used to strand its
+//! surplus tokens in the waitable for the life of the chain.
+static late_weave_token_ledger g_lw_ledger_workspace;
 
 /*
  * Late-weave phase 1 (DXR_LATE_WEAVE=1). Flattens the present queue
@@ -11163,6 +11167,9 @@ try {
 			// The service window's own token (if any) stays until spent.
 		} else if (mc->frame_latency_waitable) {
 			// (app token, if any, stays until spent or re-keyed — see above)
+			// #2564: take back tokens a governor depth decrease left behind,
+			// before the wait that would otherwise return a frame early.
+			g_lw_ledger_workspace.pay(mc->frame_latency_waitable, "workspace");
 			HANDLE waits[2] = {mc->frame_latency_waitable, mc->render_wakeup_event};
 			// #964: when the SERVICE WINDOW is not the active presenter it is
 			// hidden, and a hidden swap chain's waitable stops signaling — the
@@ -11200,7 +11207,7 @@ try {
 				wil::com_ptr<IDXGISwapChain2> sc2;
 				if (mc->swap_chain &&
 				    SUCCEEDED(mc->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
-					sc2->SetMaximumFrameLatency((UINT)g_lw_gov_workspace.effective);
+					g_lw_ledger_workspace.apply(sc2.get(), g_lw_gov_workspace.effective);
 				}
 				static bool logged_backoff = false, logged_return = false;
 				bool &logged = (tr > 0) ? logged_backoff : logged_return;
@@ -11700,7 +11707,9 @@ multi_compositor_create_service_chain(struct d3d11_service_system *sys,
 		wil::com_ptr<IDXGISwapChain2> sc2;
 		if (SUCCEEDED(mc->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
 			const int lat = g_lw_gov_workspace.base_latency();
-			sc2->SetMaximumFrameLatency(lat);
+			// #2564: a fresh chain owes no tokens.
+			g_lw_ledger_workspace.reset();
+			g_lw_ledger_workspace.apply(sc2.get(), lat);
 			mc->frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
 			U_LOG_W("Late-weave: workspace swap chain waitable, max latency %d%s (waitable=%p)", lat,
 			        (lat == 1 && g_lw_gov_workspace.auto_backoff == 1) ? " + saturation auto-backoff" : "",
