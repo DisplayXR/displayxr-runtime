@@ -2265,8 +2265,9 @@ comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11
 	} else if (!s->stable_atlas && !s->ring_direct_default && !split_direct_forced_on()) {
 		/*
 		 * #2317: DIRECT is OPT-IN for a ring producer that does not declare
-		 * ring_direct_default (the VK split) until a single-dGPU desktop has
-		 * run VK fence-mode DIRECT. The D3D12 reroute declares it since #2518:
+		 * ring_direct_default. Both ring producers declare it now: the VK
+		 * split since a single-dGPU desktop ran VK fence-mode DIRECT (RTX
+		 * 3080, 8K; see comp_vk_native_compositor.c), the D3D12 reroute since #2518:
 		 * Unreal on a same-adapter hybrid laptop paid the staged ring's
 		 * app-queue copy on every frame (the #2362 drain blocked ~96 % of
 		 * frames and the weave picked the previous slot ~99 %), and DIRECT
