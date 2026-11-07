@@ -223,6 +223,33 @@ xb_plane_slot_is_valid(bool live, bool staged, uint64_t slot_seq, uint64_t stage
 }
 
 /*!
+ * Whether a slot's plane may be COMPOSITED: valid (it holds exactly the staged
+ * generation), or — on a half-rate plane — it holds the NEWEST generation ever
+ * transported (`slot_copy_n == newest_copy_n`, which a catch-up establishes).
+ *
+ * Without the second clause every half-rate skip stamped the plane invalid, the
+ * consume half bailed the composite, and that frame went out with no 2D at all:
+ * panels and UI blinked at half the frame rate, and a vendor weaver keyed to the
+ * 2D regions blinked with them. A newest-transported plane is one frame behind
+ * the 3D at most — the documented cost of half rate — and is coherent pixels of
+ * a single generation, so compositing it is the honest picture, not a stale one.
+ */
+static inline bool
+xb_plane_slot_is_presentable(bool live,
+                             bool staged,
+                             uint64_t slot_seq,
+                             uint64_t stage_seq,
+                             bool half_rate,
+                             uint64_t slot_copy_n,
+                             uint64_t newest_copy_n)
+{
+	if (xb_plane_slot_is_valid(live, staged, slot_seq, stage_seq)) {
+		return true;
+	}
+	return half_rate && live && staged && slot_seq != 0 && slot_copy_n != 0 && slot_copy_n == newest_copy_n;
+}
+
+/*!
  * Which slot a HALF-RATE skip catches up from, on the output device alone.
  *
  * A half-rate skip used to leave the write slot holding whatever it was last

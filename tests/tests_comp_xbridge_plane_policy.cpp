@@ -344,7 +344,7 @@ TEST_CASE("a freshly authored plane transports on its own frame and lands on the
  * backwards on every skipped frame. The catch-up copies the newest slot locally.
  */
 static void
-run_half_rate_ring(bool catchup, uint64_t *out_backsteps, uint64_t *out_max_lag)
+run_half_rate_ring(bool catchup, uint64_t *out_backsteps, uint64_t *out_max_lag, uint64_t *out_blanks = nullptr)
 {
 	constexpr int kRing = 3;
 	uint64_t slot_seq[kRing] = {0, 0, 0};
@@ -357,6 +357,7 @@ run_half_rate_ring(bool catchup, uint64_t *out_backsteps, uint64_t *out_max_lag)
 	uint64_t shown_prev = 0;
 	*out_backsteps = 0;
 	*out_max_lag = 0;
+	uint64_t blanks = 0;
 	for (uint64_t seq = 1; seq <= 60; seq++) {
 		const int eg = (int)(seq % kRing);
 		// Content changes every frame; the generation IS the frame number here so
@@ -380,6 +381,11 @@ run_half_rate_ring(bool catchup, uint64_t *out_backsteps, uint64_t *out_max_lag)
 				pend[eg] = pend[src];
 			}
 		}
+		// A frame whose plane is not presentable composites NO 2D at all (a blink).
+		if (copy_n > 0 &&
+		    !xb_plane_slot_is_presentable(true, true, slot_seq[eg], stage_seq, true, slot_copy_n[eg], copy_n)) {
+			blanks++;
+		}
 		// The consume half shows whatever the slot holds once it holds anything.
 		const uint64_t shown = slot_seq[eg];
 		if (shown == 0) {
@@ -392,6 +398,9 @@ run_half_rate_ring(bool catchup, uint64_t *out_backsteps, uint64_t *out_max_lag)
 			*out_max_lag = seq - shown;
 		}
 		shown_prev = shown;
+	}
+	if (out_blanks != nullptr) {
+		*out_blanks = blanks;
 	}
 }
 
@@ -407,6 +416,17 @@ TEST_CASE("a half-rate plane never steps back in time")
 	CHECK(back == 0);
 	// Half rate costs at most one frame of lag, never the ring's depth.
 	CHECK(lag <= 1);
+}
+
+TEST_CASE("a half-rate plane never blinks: every frame after the first copy composites")
+{
+	uint64_t back = 0, lag = 0, blanks = 0;
+	// Pre-fix: a skipped slot was stamped invalid and its frame went out without 2D.
+	run_half_rate_ring(/*catchup=*/false, &back, &lag, &blanks);
+	CHECK(blanks > 0);
+
+	run_half_rate_ring(/*catchup=*/true, &back, &lag, &blanks);
+	CHECK(blanks == 0);
 }
 
 TEST_CASE("xb_plane_catchup_source picks the newest written slot, never an older one")
