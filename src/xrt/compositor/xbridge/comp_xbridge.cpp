@@ -3733,7 +3733,8 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 		 * is what let a stale 2D band composite under a current frame with
 		 * nothing anywhere able to tell.
 		 */
-		if (xb_plane_slot_is_valid(pl.live, pl.staged, pl.slot_seq[eg], pl.stage_seq)) {
+		if (xb_plane_slot_is_presentable(pl.live, pl.staged, pl.slot_seq[eg], pl.stage_seq, pl.half_rate,
+		                                 pl.slot_copy_n[eg], pl.copy_n)) {
 			xb->eg_recipe[eg].plane_valid |= (1u << p);
 		}
 	}
