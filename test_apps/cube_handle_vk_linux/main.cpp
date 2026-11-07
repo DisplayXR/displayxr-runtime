@@ -157,6 +157,13 @@ static uint32_t g_testResizeH = 0;
 static bool g_testResizeDone = false;
 static uint64_t g_frameCounter = 0;
 
+// TEST HOOK, off unless DXR_CUBE_TEST_EYE_COLORS=1 is set. Each view's tile is
+// cleared to its own colour before the scene is drawn: view 0 (the left eye)
+// red, view 1 (the right eye) blue. A capture of any output stage can then tell
+// which eye a view reached by its colour, e.g. the two halves a stereo
+// compositor shows from a full side-by-side display processor.
+static bool g_testEyeColors = false;
+
 //! Non-volatile mirror of g_running that the window helper can write through a
 //! plain bool*; copied back into g_running right after each pump.
 static bool g_windowRunning = true;
@@ -1762,6 +1769,17 @@ static void RenderScene(
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &scissor);
 
+        if (g_testEyeColors && eye < 2) {
+            // TEST HOOK: view 0 red, view 1 blue (0 and 1 are the same in
+            // every encoding, so no sRGB conversion is needed).
+            VkClearAttachment clear = {};
+            clear.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            clear.colorAttachment = 0;
+            clear.clearValue.color = {{eye == 0 ? 1.0f : 0.0f, 0.0f, eye == 0 ? 0.0f : 1.0f, 1.0f}};
+            VkClearRect rect = {scissor, 0, 1};
+            vkCmdClearAttachments(cmd, 1, &clear, 1, &rect);
+        }
+
         float vp[16];
         mat4_multiply(vp, e.projMat, e.viewMat);
 
@@ -2922,6 +2940,10 @@ static void PrintUsage(const char* argv0) {
         "                                        via xrSetWaylandSurfaceGeometryDXR, to\n"
         "                                        exercise the runtime's resize-follow\n"
         "                                        without a user dragging a window edge.\n"
+        "     DXR_CUBE_TEST_EYE_COLORS=1         TEST HOOK, off by default. Clears view 0\n"
+        "                                        (left eye) red and view 1 (right eye)\n"
+        "                                        blue under the scene, so a capture tells\n"
+        "                                        which eye each view reached.\n"
         "     DXR_X11_WM_DECORATIONS=1           X11 windowed: keep the WM's title bar and\n"
         "                                        let the WM own the drag (the old\n"
         "                                        behaviour). Default is undecorated +\n"
@@ -3009,6 +3031,14 @@ int main(int argc, char** argv) {
             winTop  = xr.displayScreenTop  + oy;
             cubeWindowRequested = true;
             LOG_INFO("DXR_CUBE_WINDOW override: %ux%u at panel-relative (%d,%d)", w, h, ox, oy);
+        }
+    }
+
+    if (const char* cenv = getenv("DXR_CUBE_TEST_EYE_COLORS")) {
+        g_testEyeColors = cenv[0] == '1';
+        if (g_testEyeColors) {
+            LOG_WARN("DXR_CUBE_TEST_EYE_COLORS=1 — TEST HOOK armed; view 0 (left eye) is cleared red, "
+                     "view 1 (right eye) blue");
         }
     }
 
