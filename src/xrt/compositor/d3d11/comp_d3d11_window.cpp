@@ -39,6 +39,7 @@
 #include <windows.h>
 #include <windowsx.h> // GET_X_LPARAM, GET_Y_LPARAM
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -46,6 +47,40 @@
 
 // Environment variable to start in windowed mode
 DEBUG_GET_ONCE_BOOL_OPTION(start_windowed, "XRT_COMPOSITOR_START_WINDOWED", false)
+
+// Where a hosted (runtime-owned) in-process window goes: "auto" (default)
+// embeds it over the app's own main window (owned by it, covering its
+// client area) when the app has one, else falls back to the panel-fullscreen window; "embed" is auto that
+// keeps looking for a main window that appears later; "fullscreen" restores
+// the pre-embedding behaviour.
+DEBUG_GET_ONCE_OPTION(hosted_window, "DXR_HOSTED_WINDOW", "auto")
+
+// The app's own UI strips the embedded 3D view leaves uncovered, so it fills
+// just the app's viewer: "left,top,right,bottom" of the app window's client
+// area in 96-DPI units (scaled by the window's DPI), e.g. "0,33.4,0,0" for a
+// menu bar. Default: the whole client area.
+DEBUG_GET_ONCE_OPTION(hosted_inset, "DXR_HOSTED_INSET", "0,0,0,0")
+
+// An app whose viewer moves inside its window (docked panels) publishes the
+// viewer's rect itself, live, as this property on its main window: physical
+// pixels of its client area packed as x | y << 16 | width << 32 | height << 48
+// (SetPropW(main_hwnd, L"DXR_HostedViewRect", (HANDLE)packed); 0 or removed =
+// back to DXR_HOSTED_INSET). Read with GetPropW, which sends the app nothing.
+static const wchar_t *const kHostedViewRectProp = L"DXR_HostedViewRect";
+
+// Apps that draw their menus and dialogs inside the client area (Substance
+// Modeler) would have them hidden under the embedded 3D view. With this on
+// (default), a click on the app's own uncovered client area (its menu bar)
+// hides the 3D view so that UI shows; Esc, or a few seconds with no input,
+// brings it back.
+DEBUG_GET_ONCE_BOOL_OPTION(hosted_ui_peek, "DXR_HOSTED_UI_PEEK", true)
+
+// Who gets mouse input over an embedded 3D view: "runtime" (default: the
+// runtime's own camera/hand controls, qwerty) or "app": the 3D view never
+// takes focus and passes the mouse through to the app window under it, so
+// apps whose 3D follows their own desktop camera (ParaView, Slicer) keep
+// their native navigation, picking and widgets. Keys then stay with the app.
+DEBUG_GET_ONCE_OPTION(hosted_input, "DXR_HOSTED_INPUT", "runtime")
 
 // Marker for SendInput-injected mouse events — WndProc skips re-forwarding these.
 // Used to break the loop: WndProc→SendInput→WM_LBUTTONDOWN→WndProc.
@@ -156,6 +191,49 @@ struct comp_d3d11_window
 	//! style/geometry path — the window is a real, showable presenter surface
 	//! that simply starts out invisible. See comp_d3d11_window_set_visible.
 	bool start_hidden;
+
+	/*!
+	 * Embed a hosted window into the app's own main window (DXR_HOSTED_WINDOW).
+	 * Legacy apps (no XR_DXR_*_window_binding) get a runtime-created window;
+	 * embedding makes it a borderless window owned by the app's window and
+	 * covering its client area (see embed_adopt for why not WS_CHILD), so
+	 * the 3D shows inside the app and several apps weave side by side, each in
+	 * its own window. Set by comp_d3d11_window_create only — the service's
+	 * windows (comp_d3d11_window_create_ex) are never embedded.
+	 */
+	bool embed_requested;
+
+	//! Keep searching for a host after creation ("embed"; window thread only).
+	bool embed_keep_looking;
+
+	//! The app window this one is a child of, NULL = top-level (window thread writes).
+	volatile HWND embed_host;
+
+	//! Out-of-context hook following the host's moves / resizes (window thread only).
+	HWINEVENTHOOK embed_hook;
+
+	//! "embed" mode searches so far (window thread only).
+	int embed_search_tries;
+
+	//! DXR_HOSTED_INSET, 96-DPI units: left, top, right, bottom (set before thread start).
+	float embed_inset[4];
+
+	//! F11 while embedded: cover the whole panel instead of the app's viewer (window thread).
+	volatile LONG embed_fullscreen;
+
+	//! The host's DXR_HostedViewRect as last applied (window thread).
+	uint64_t embed_view_rect;
+
+	//! UI peek (DXR_HOSTED_UI_PEEK): the 3D view is hidden so the app's own
+	//! menus and dialogs show; button/key states for edge detection (window thread).
+	bool embed_ui_peek;
+	bool embed_peeking;
+	bool peek_lbutton_down;
+	bool peek_escape_down;
+	DWORD peek_hover_since; //!< GetTickCount when the cursor reached the app's UI; 0 = not there
+
+	//! DXR_HOSTED_INPUT=app: mouse passes through to the host, never focused (set before thread start).
+	bool embed_input_to_app;
 
 	//! Window thread handle
 	HANDLE thread_handle;
@@ -630,6 +708,337 @@ set_fullscreen(HWND hWnd, bool fullscreen)
 	}
 }
 
+/*
+ *
+ * Embedding a hosted window into the app's own window (DXR_HOSTED_WINDOW).
+ *
+ */
+
+//! WM_TIMER id: look again for a host window ("embed" mode).
+#define DXR_EMBED_SEARCH_TIMER 0xE3B0
+//! How often, and for how long, "embed" mode keeps looking.
+#define DXR_EMBED_SEARCH_PERIOD_MS 500
+#define DXR_EMBED_SEARCH_TRIES 60
+//! WM_TIMER id and period: re-read the app's published viewer rect.
+#define DXR_EMBED_RECT_TIMER 0xE3B1
+#define DXR_EMBED_RECT_PERIOD_MS 250
+//! WM_TIMER id and period: watch for clicks on the app's own UI (UI peek).
+#define DXR_EMBED_PEEK_TIMER 0xE3B2
+#define DXR_EMBED_PEEK_PERIOD_MS 50
+//! UI peek ends after this long with no keyboard or mouse input.
+#define DXR_EMBED_PEEK_IDLE_MS 4000
+//! UI peek starts after the cursor rests this long on the app's own UI strip.
+#define DXR_EMBED_PEEK_HOVER_MS 150
+
+//! The window this thread embeds — WinEvent callbacks carry no context, and
+//! each comp_d3d11_window has its own thread.
+static thread_local struct comp_d3d11_window *t_embed_window = NULL;
+
+struct embed_search
+{
+	DWORD pid;
+	HWND best;
+	LONG best_area;
+};
+
+/*!
+ * The app's main window: a visible, unowned, non-tool top-level window of
+ * this process that is not one of ours, at least 320x240, the largest one.
+ */
+static BOOL CALLBACK
+embed_find_cb(HWND h, LPARAM lp)
+{
+	struct embed_search *es = (struct embed_search *)lp;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(h, &pid);
+	if (pid != es->pid || !IsWindowVisible(h) || IsIconic(h) || GetWindow(h, GW_OWNER) != NULL) {
+		return TRUE;
+	}
+	if ((GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) {
+		return TRUE;
+	}
+	// A main window has a caption or at least a title; untitled visible
+	// top-levels are splash screens, message-only helpers, WebView hosts.
+	// InternalGetWindowText, not GetWindowText: the latter SENDS WM_GETTEXT to
+	// the window's thread, which may be blocked waiting on us (see embed_adopt).
+	WCHAR text[2];
+	if ((GetWindowLongW(h, GWL_STYLE) & WS_CAPTION) != WS_CAPTION && InternalGetWindowText(h, text, 2) == 0) {
+		return TRUE;
+	}
+	WCHAR cls[64];
+	if (GetClassNameW(h, cls, 64) > 0 && wcscmp(cls, szWindowClass) == 0) {
+		return TRUE;
+	}
+	RECT rc;
+	if (!GetClientRect(h, &rc) || rc.right < 320 || rc.bottom < 240) {
+		return TRUE;
+	}
+	const LONG area = rc.right * rc.bottom;
+	if (area > es->best_area) {
+		es->best = h;
+		es->best_area = area;
+	}
+	return TRUE;
+}
+
+static HWND
+embed_find_host(void)
+{
+	struct embed_search es = {GetCurrentProcessId(), NULL, 0};
+	EnumWindows(embed_find_cb, (LPARAM)&es);
+	return es.best;
+}
+
+/*!
+ * Cover the app's viewer: the rect the app publishes as DXR_HostedViewRect, else
+ * the host's client area minus DXR_HOSTED_INSET, in screen coordinates (we are
+ * owned, not a child) — or, after F11, the whole
+ * monitor the host is on. @p hwnd is ours: w->hwnd is only published once
+ * creation finishes, after the first fit.
+ */
+static void
+embed_fit(struct comp_d3d11_window *w, HWND hwnd)
+{
+	HWND host = w->embed_host;
+	if (host == NULL || hwnd == NULL) {
+		return;
+	}
+	const uint64_t view = (uint64_t)(uintptr_t)GetPropW(host, kHostedViewRectProp);
+	w->embed_view_rect = view;
+	if (InterlockedCompareExchange(&w->embed_fullscreen, 0, 0) != 0) {
+		MONITORINFO mi = {sizeof(mi)};
+		if (GetMonitorInfo(MonitorFromWindow(host, MONITOR_DEFAULTTONEAREST), &mi)) {
+			SetWindowPos(hwnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top,
+			             mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+			             SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+		}
+		return;
+	}
+	RECT rc;
+	POINT origin = {0, 0};
+	if (!GetClientRect(host, &rc) || !ClientToScreen(host, &origin)) {
+		return;
+	}
+	LONG l, t, cw, ch;
+	if (view != 0) {
+		// Clamped to the client area: the app's rect may lag a resize.
+		l = (LONG)(view & 0xFFFF);
+		t = (LONG)((view >> 16) & 0xFFFF);
+		cw = (LONG)((view >> 32) & 0xFFFF);
+		ch = (LONG)((view >> 48) & 0xFFFF);
+		cw = l + cw > rc.right ? rc.right - l : cw;
+		ch = t + ch > rc.bottom ? rc.bottom - t : ch;
+	} else {
+		const float scale = (float)GetDpiForWindow(host) / 96.0f;
+		l = (LONG)(w->embed_inset[0] * scale + 0.5f);
+		t = (LONG)(w->embed_inset[1] * scale + 0.5f);
+		const LONG r = (LONG)(w->embed_inset[2] * scale + 0.5f);
+		const LONG b = (LONG)(w->embed_inset[3] * scale + 0.5f);
+		cw = rc.right - l - r;
+		ch = rc.bottom - t - b;
+	}
+	if (cw <= 0 || ch <= 0) {
+		return;
+	}
+	SetWindowPos(hwnd, NULL, origin.x + l, origin.y + t, cw, ch, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+}
+
+/*!
+ * UI peek, polled on the window thread. The cursor resting on (or a click
+ * in) the host's client area directly above us, i.e. its menu bar, hides
+ * the 3D view. On hover, not only on click: an app that stops running
+ * its UI while occluded (Modeler) drops a click that lands while we still
+ * cover it. Esc or a few seconds without input shows the 3D again. Reads
+ * global input state only; sends the app nothing.
+ */
+static void
+embed_peek_tick(struct comp_d3d11_window *w, HWND hwnd)
+{
+	HWND host = w->embed_host;
+	if (host == NULL) {
+		return;
+	}
+	// Bit 0 = "pressed since the last call": catches a press shorter than the poll.
+	const SHORT lstate = GetAsyncKeyState(VK_LBUTTON);
+	const SHORT estate = GetAsyncKeyState(VK_ESCAPE);
+	const bool lbutton = (lstate & 0x8000) != 0;
+	const bool escape = (estate & 0x8000) != 0;
+	const bool clicked = (lbutton && !w->peek_lbutton_down) || (!lbutton && (lstate & 1) != 0);
+	const bool escaped = (escape && !w->peek_escape_down) || (!escape && (estate & 1) != 0);
+	w->peek_lbutton_down = lbutton;
+	w->peek_escape_down = escape;
+
+	if (!w->embed_peeking) {
+		POINT pt;
+		RECT client;
+		RECT ours;
+		POINT local;
+		// The app's own UI strip above the 3D view (its menu bar / toolbar), whose
+		// dropdowns open over the view. Side panels beside the view never need it.
+		const bool on_app_ui = InterlockedCompareExchange(&w->embed_fullscreen, 0, 0) == 0 &&
+		                       GetCursorPos(&pt) && GetAncestor(WindowFromPoint(pt), GA_ROOT) == host &&
+		                       GetWindowRect(hwnd, &ours) && pt.y < ours.top && pt.x >= ours.left &&
+		                       pt.x < ours.right &&
+		                       // The title bar / frame moves the window; only the client area is its UI.
+		                       (local = pt, ScreenToClient(host, &local)) && GetClientRect(host, &client) &&
+		                       PtInRect(&client, local);
+		if (!on_app_ui) {
+			w->peek_hover_since = 0;
+			return;
+		}
+		const DWORD now = GetTickCount();
+		if (w->peek_hover_since == 0) {
+			w->peek_hover_since = now | 1; // never 0 while hovering
+		}
+		if (!clicked && now - w->peek_hover_since < DXR_EMBED_PEEK_HOVER_MS) {
+			return;
+		}
+		w->peek_hover_since = 0;
+		w->embed_peeking = true;
+		ShowWindow(hwnd, SW_HIDE);
+		static bool peek_logged = false;
+		if (!peek_logged) {
+			peek_logged = true;
+			U_LOG_W(
+			    "D3D11 window: UI peek — 3D view hidden for the app's own menus/dialogs (Esc or %d s idle "
+			    "brings it back; DXR_HOSTED_UI_PEEK=0 disables)",
+			    DXR_EMBED_PEEK_IDLE_MS / 1000);
+		}
+		return;
+	}
+
+	LASTINPUTINFO lii = {sizeof(lii)};
+	const bool idle = GetLastInputInfo(&lii) && GetTickCount() - lii.dwTime >= DXR_EMBED_PEEK_IDLE_MS;
+	if (escaped || idle) {
+		w->embed_peeking = false;
+		embed_fit(w, hwnd);
+		ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+	}
+}
+
+static void CALLBACK
+embed_event_cb(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG id_object, LONG id_child, DWORD thread, DWORD time)
+{
+	(void)hook;
+	(void)event;
+	(void)id_child;
+	(void)thread;
+	(void)time;
+	struct comp_d3d11_window *w = t_embed_window;
+	if (w != NULL && hwnd == w->embed_host && id_object == OBJID_WINDOW) {
+		embed_fit(w, w->hwnd);
+	}
+}
+
+/*!
+ * Put @p hwnd over @p host's client area as a borderless window OWNED by
+ * the host: it stays above the app window, minimizes and restores with it,
+ * has no taskbar entry of its own, and follows it through a WinEvent hook.
+ *
+ * Deliberately not SetParent / WS_CHILD and no change to the host's style:
+ * the host lives on the app's UI thread, which is often blocked inside
+ * xrCreateSession waiting for this very window, and both of those send it
+ * synchronous messages (a deadlock until the create times out). Setting an
+ * owner and reading the host's rect send it nothing. Window thread only.
+ */
+static void
+embed_adopt(struct comp_d3d11_window *w, HWND hwnd, HWND host)
+{
+	LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+	style = (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP;
+	SetWindowLongW(hwnd, GWL_STYLE, style);
+	LONG ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) & ~WS_EX_APPWINDOW;
+	if (w->embed_input_to_app) {
+		ex_style |= WS_EX_NOACTIVATE;
+	}
+	SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style);
+	SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, (LONG_PTR)host);
+
+	InterlockedExchange(&w->is_fullscreen, FALSE);
+	InterlockedExchangePointer((volatile PVOID *)&w->embed_host, host);
+	t_embed_window = w;
+
+	DWORD host_pid = 0;
+	const DWORD host_tid = GetWindowThreadProcessId(host, &host_pid);
+	w->embed_hook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, NULL, embed_event_cb,
+	                                host_pid, host_tid, WINEVENT_OUTOFCONTEXT);
+
+	SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+	             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+	embed_fit(w, hwnd);
+	ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+	// A published viewer rect changes without the host window moving.
+	SetTimer(hwnd, DXR_EMBED_RECT_TIMER, DXR_EMBED_RECT_PERIOD_MS, NULL);
+	if (w->embed_ui_peek) {
+		SetTimer(hwnd, DXR_EMBED_PEEK_TIMER, DXR_EMBED_PEEK_PERIOD_MS, NULL);
+	}
+
+	RECT rc = {0};
+	GetClientRect(host, &rc);
+	WCHAR title[128] = L"";
+	InternalGetWindowText(host, title, 128);
+	U_LOG_W(
+	    "D3D11 window: embedded over the app's window %p '%ls' (%ldx%ld client) — DXR_HOSTED_WINDOW=fullscreen "
+	    "restores the panel-fullscreen window",
+	    (void *)host, title, (long)rc.right, (long)rc.bottom);
+}
+
+/*!
+ * DXR_HOSTED_INPUT=app: hand mouse input over the embedded view to the host
+ * window, in the host's client coordinates, as if the 3D view were not there.
+ * Posted, never sent: the host's UI thread may be blocked on this runtime.
+ * Wheel messages already carry screen coordinates. When the app captures the
+ * mouse on a button-down (Qt, Win32 drags do), the rest of the drag goes to it
+ * directly. Window thread only. Returns true when the message was handled.
+ */
+static bool
+embed_route_input_to_app(struct comp_d3d11_window *w, UINT message, WPARAM wParam, LPARAM lParam, LRESULT *result)
+{
+	HWND host = (HWND)InterlockedCompareExchangePointer((volatile PVOID *)&w->embed_host, NULL, NULL);
+	if (!w->embed_input_to_app || host == NULL) {
+		return false;
+	}
+	switch (message) {
+	case WM_MOUSEACTIVATE: *result = MA_NOACTIVATE; return true;
+	case WM_SETCURSOR:
+		// The app can't set the cursor over a window it doesn't own; keep it visible.
+		if (LOWORD(lParam) != HTCLIENT) {
+			return false;
+		}
+		SetCursor(LoadCursor(NULL, IDC_ARROW));
+		*result = TRUE;
+		return true;
+	case WM_MOUSEWHEEL:
+	case WM_MOUSEHWHEEL:
+		PostMessageW(host, message, wParam, lParam);
+		*result = 0;
+		return true;
+	case WM_MOUSEMOVE:
+	case WM_LBUTTONDOWN:
+	case WM_LBUTTONUP:
+	case WM_LBUTTONDBLCLK:
+	case WM_RBUTTONDOWN:
+	case WM_RBUTTONUP:
+	case WM_RBUTTONDBLCLK:
+	case WM_MBUTTONDOWN:
+	case WM_MBUTTONUP:
+	case WM_MBUTTONDBLCLK:
+	case WM_XBUTTONDOWN:
+	case WM_XBUTTONUP:
+	case WM_XBUTTONDBLCLK: {
+		HWND self = w->hwnd;
+		POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+		if (self == NULL || !ClientToScreen(self, &pt) || !ScreenToClient(host, &pt)) {
+			return false;
+		}
+		PostMessageW(host, message, wParam, MAKELPARAM((short)pt.x, (short)pt.y));
+		*result = 0;
+		return true;
+	}
+	default: return false;
+	}
+}
+
 // Forward declaration — defined later in this file alongside the suppress
 // setters so the logic lives in one place. Used by wnd_proc to gate key
 // and mouse forwarding.
@@ -649,6 +1058,11 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	if (!w) {
 		// Window not fully set up yet
 		return DefWindowProcW(hWnd, message, wParam, lParam);
+	}
+
+	LRESULT routed = 0;
+	if (embed_route_input_to_app(w, message, wParam, lParam, &routed)) {
+		return routed;
 	}
 
 	switch (message) {
@@ -785,6 +1199,15 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (wParam == VK_F11) {
 			HWND fwd_check = (HWND)InterlockedCompareExchangePointer(
 			    (volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
+			if (fwd_check == NULL && w->embed_host != NULL) {
+				// Embedded: F11 switches between the app's viewer and the whole panel.
+				LONG fs = !InterlockedCompareExchange(&w->embed_fullscreen, 0, 0);
+				InterlockedExchange(&w->embed_fullscreen, fs);
+				InterlockedExchange(&w->is_fullscreen, fs);
+				embed_fit(w, hWnd);
+				U_LOG_W("D3D11 window: F11 — embedded view %s", fs ? "fullscreen on the panel" : "back in the app's viewer");
+				return 0;
+			}
 			if (fwd_check == NULL) {
 				// Non-workspace mode: toggle fullscreen directly
 				LONG fs = InterlockedCompareExchange(&w->is_fullscreen, 0, 0);
@@ -1014,6 +1437,28 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	} break;
 
 	case WM_TIMER:
+		if (wParam == DXR_EMBED_SEARCH_TIMER) {
+			HWND host = w->embed_host == NULL ? embed_find_host() : NULL;
+			if (host != NULL) {
+				embed_adopt(w, hWnd, host);
+			}
+			if (w->embed_host != NULL || ++w->embed_search_tries >= DXR_EMBED_SEARCH_TRIES) {
+				KillTimer(hWnd, DXR_EMBED_SEARCH_TIMER);
+			}
+			return 0;
+		}
+		if (wParam == DXR_EMBED_PEEK_TIMER) {
+			embed_peek_tick(w, hWnd);
+			return 0;
+		}
+		if (wParam == DXR_EMBED_RECT_TIMER) {
+			HWND host = w->embed_host;
+			if (host != NULL &&
+			    (uint64_t)(uintptr_t)GetPropW(host, kHostedViewRectProp) != w->embed_view_rect) {
+				embed_fit(w, hWnd);
+			}
+			return 0;
+		}
 		// #667: a buffered lone Ctrl was held with no following key — deliver it
 		// to the focused app so apps that bind Ctrl still get it.
 		if (wParam == DXR_KB_FLUSH_TIMER) {
@@ -1648,7 +2093,18 @@ window_thread_body(struct comp_d3d11_window *w)
 		}
 	}
 
-	if (!w->hidden) {
+	HWND embed_host = (w->embed_requested && !w->hidden) ? embed_find_host() : NULL;
+	if (embed_host != NULL) {
+		embed_adopt(w, hwnd, embed_host);
+		if (w->start_hidden) {
+			ShowWindow(hwnd, SW_HIDE);
+		}
+	} else if (w->embed_requested && w->embed_keep_looking && !w->hidden) {
+		// "embed": the app may create its main window after the session.
+		SetTimer(hwnd, DXR_EMBED_SEARCH_TIMER, DXR_EMBED_SEARCH_PERIOD_MS, NULL);
+	}
+
+	if (!w->hidden && embed_host == NULL) {
 		// Check if we should start fullscreen
 		bool start_fullscreen = !debug_get_bool_option_start_windowed();
 		if (start_fullscreen) {
@@ -1693,6 +2149,12 @@ window_thread_body(struct comp_d3d11_window *w)
 	}
 
 	U_LOG_W("D3D11 window thread: Message loop exited");
+
+	if (w->embed_hook != NULL) {
+		UnhookWinEvent(w->embed_hook);
+		w->embed_hook = NULL;
+	}
+	t_embed_window = NULL;
 
 	// Cleanup: unregister window class (must be done on the thread that registered it)
 	if (w->window_class) {
@@ -1742,6 +2204,23 @@ window_thread_func(LPVOID param)
  *
  */
 
+//! How a window is placed relative to the app's own window (DXR_HOSTED_WINDOW).
+enum window_embed_mode
+{
+	WINDOW_EMBED_OFF,    //!< top-level (service windows; "fullscreen")
+	WINDOW_EMBED_AUTO,   //!< child of the app's main window if it has one at creation
+	WINDOW_EMBED_LOOKING //!< as AUTO, and keep looking for a main window that appears later
+};
+
+static xrt_result_t
+window_create_internal(uint32_t width,
+                       uint32_t height,
+                       int32_t screen_left,
+                       int32_t screen_top,
+                       bool start_hidden,
+                       enum window_embed_mode embed,
+                       struct comp_d3d11_window **out);
+
 extern "C" xrt_result_t
 comp_d3d11_window_create(uint32_t width,
                          uint32_t height,
@@ -1749,7 +2228,16 @@ comp_d3d11_window_create(uint32_t width,
                          int32_t screen_top,
                          struct comp_d3d11_window **out)
 {
-	return comp_d3d11_window_create_ex(width, height, screen_left, screen_top, /*start_hidden*/ false, out);
+	// In-process hosted windows only: the service creates its windows
+	// through comp_d3d11_window_create_ex, which never embeds.
+	const char *mode = debug_get_option_hosted_window();
+	enum window_embed_mode embed = WINDOW_EMBED_AUTO;
+	if (mode != NULL && strcmp(mode, "fullscreen") == 0) {
+		embed = WINDOW_EMBED_OFF;
+	} else if (mode != NULL && strcmp(mode, "embed") == 0) {
+		embed = WINDOW_EMBED_LOOKING;
+	}
+	return window_create_internal(width, height, screen_left, screen_top, /*start_hidden*/ false, embed, out);
 }
 
 extern "C" xrt_result_t
@@ -1760,12 +2248,45 @@ comp_d3d11_window_create_ex(uint32_t width,
                             bool start_hidden,
                             struct comp_d3d11_window **out)
 {
+	return window_create_internal(width, height, screen_left, screen_top, start_hidden, WINDOW_EMBED_OFF, out);
+}
+
+static xrt_result_t
+window_create_internal(uint32_t width,
+                       uint32_t height,
+                       int32_t screen_left,
+                       int32_t screen_top,
+                       bool start_hidden,
+                       enum window_embed_mode embed,
+                       struct comp_d3d11_window **out)
+{
 	struct comp_d3d11_window *w = U_TYPED_CALLOC(struct comp_d3d11_window);
 	if (w == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
 
 	w->start_hidden = start_hidden;
+	w->embed_requested = embed != WINDOW_EMBED_OFF;
+	w->embed_keep_looking = embed == WINDOW_EMBED_LOOKING;
+	if (w->embed_requested) {
+		w->embed_ui_peek = debug_get_bool_option_hosted_ui_peek();
+		const char *inset = debug_get_option_hosted_inset();
+		float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		if (inset != NULL && sscanf(inset, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]) == 4 && v[0] >= 0.0f &&
+		    v[1] >= 0.0f && v[2] >= 0.0f && v[3] >= 0.0f) {
+			memcpy(w->embed_inset, v, sizeof(v));
+		} else if (inset != NULL && strcmp(inset, "0,0,0,0") != 0) {
+			U_LOG_W("D3D11 window: DXR_HOSTED_INSET='%s' is not left,top,right,bottom (>= 0) — ignored", inset);
+		}
+		const char *input = debug_get_option_hosted_input();
+		w->embed_input_to_app = input != NULL && strcmp(input, "app") == 0;
+		// With the mouse going to the app, its UI around the view is never covered,
+		// and the strip above the view is often the view's own toolbar (ParaView):
+		// hovering it must not hide the 3D.
+		if (w->embed_input_to_app) {
+			w->embed_ui_peek = false;
+		}
+	}
 	w->instance = GetModuleHandle(NULL);
 	w->requested_width = width > 0 ? width : 1920;
 	w->requested_height = height > 0 ? height : 1080;
