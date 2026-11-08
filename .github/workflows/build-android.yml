@@ -236,7 +236,7 @@ jobs:
       # GL late-latching null/size guard; #770: the service connection rebinds
       # after the head-tracking engine dies (lives in the service APK, so older
       # loaders get it too). (v0.10.92/.93 were intermediate releases.)
-      CNSDK_TAG: v0.10.95
+      CNSDK_TAG: v0.10.98
 
     steps:
 
