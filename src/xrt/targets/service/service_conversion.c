@@ -712,6 +712,18 @@ satellite_host_create(const struct xrt_conversion_plugin_entry *e, struct conv_h
 #endif
 }
 
+//! Whether a satellite proxy is registered for provider @p id (caller holds g.mtx).
+static bool
+sat_registered_locked(const char *id)
+{
+	for (uint32_t j = 0; j < g.sat_count; j++) {
+		if (strcmp(g.sat_ids[j], id) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 //! Negotiate + probe @p e (in-service) or build its satellite proxy, and add
 //! it to the core (no g.mtx: may call a provider).
 static void
@@ -934,12 +946,22 @@ rescan(void)
 #endif
 		if (k >= 0) {
 			if (known_enabled != e->enabled) {
-				if (e->enabled && !known_loaded) {
+				// A satellite-hosted provider is never NEGOTIATED in the
+				// service (its host process negotiates), so "loaded" for it
+				// means "its proxy is registered with the core". Without this
+				// a `conv disable` + `conv enable` of a satellite provider
+				// re-ran add_entry (a second proxy the core rejects) and then
+				// re-enabled it with `false`: it stayed DISABLED until a
+				// service restart.
+				bool hosted = sat != NULL;
+				if (e->enabled && !known_loaded && !hosted) {
 					// Disabled at start, so never loaded: load it now
-					// (negotiate + probe + register), no restart.
+					// (negotiate + probe + register, or build its satellite
+					// proxy), no restart.
 					add_entry(e);
 					os_mutex_lock(&g.mtx);
 					g.entries[k] = *e;
+					hosted = sat_registered_locked(e->id);
 					os_mutex_unlock(&g.mtx);
 				} else {
 					os_mutex_lock(&g.mtx);
@@ -948,7 +970,7 @@ rescan(void)
 				}
 				conv_core_set_provider_enabled(
 				    g.core, e->id,
-				    e->enabled && (known_loaded || e->status == XRT_CONV_LOAD_NEGOTIATED));
+				    e->enabled && (known_loaded || hosted || e->status == XRT_CONV_LOAD_NEGOTIATED));
 				U_LOG_W("[conv] provider %s %s by a registry change (no restart)", e->id,
 				        e->enabled ? "enabled" : "disabled");
 			}
