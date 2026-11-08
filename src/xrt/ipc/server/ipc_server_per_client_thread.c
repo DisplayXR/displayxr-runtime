@@ -629,6 +629,10 @@ client_loop(volatile struct ipc_client_state *ics)
 void
 ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_state *ics)
 {
+	// XR_DXR_display_info v25: the hint is the session's; a next session on
+	// this connection starts asking for a viewer again until it says otherwise.
+	ics->fixed_viewer = false;
+
 	// ADR-061: an app share of this session ends (SOURCE_LOST) and its tap is
 	// detached BEFORE the compositor it reads goes away.
 	if (ics->xs != NULL) {

@@ -182,6 +182,23 @@ void
 comp_ipc_client_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
 
 /*!
+ * XR_DXR_display_info v25 over IPC: tell the service whether this client's
+ * locates are fixed-viewer (XrViewLocateFixedViewerDXR) — framed for the
+ * nominal viewer, asking the service-hosted viewer tracking for nothing. The
+ * service applies it to every view / eye / segment query from this client
+ * until the next call. Sent on change only. The system-compositor variant
+ * serves sessions without a compositor (same contract as the
+ * get_predicted_eye_positions pair). False on a failed call.
+ */
+struct xrt_system_compositor;
+
+bool
+comp_ipc_client_compositor_set_fixed_viewer(struct xrt_compositor *xc, bool fixed);
+
+bool
+comp_ipc_client_system_compositor_set_fixed_viewer(struct xrt_system_compositor *xsysc, bool fixed);
+
+/*!
  * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): hand the service this
  * frame's runtime-drawn cursor request (call it right before the commit it
  * belongs to). The service answers with the outcome of the PREVIOUS request

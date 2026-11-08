@@ -3664,6 +3664,15 @@ struct oxr_session
 	//! screen's DP (the rig's proof that Amendment 7 is live).
 	bool tracking_via_other;
 
+	//! XR_DXR_display_info v25: the app's last xrLocateViews chained
+	//! XrViewLocateFixedViewerDXR with fixedViewer set. Read by the runtime's
+	//! own per-frame locate (oxr_session_frame_view_cameras), which chains
+	//! nothing of the app's, so it asks for a viewer exactly when the app did.
+	bool locate_fixed_viewer;
+	//! What the service was last told about the above (IPC sessions only):
+	//! 0 = nothing yet, 1 = not fixed, 2 = fixed. Sent on change only.
+	uint8_t ipc_fixed_viewer_sent;
+
 	//! Cached rendering mode index for detecting compositor-driven mode changes.
 	uint32_t last_rendering_mode_index;
 

@@ -258,7 +258,10 @@ younger than 5 s. **Idle stop:** once neither has been fresh for 10 s (about 15 
 viewer request — the last app closed, an in-process app stopped asking) the host is stopped in
 order, so a webcam provider frees the camera; the next demand spawns it again (owner state
 `idle` meanwhile). Time the machine spent asleep counts neither as idle time nor as heartbeat
-silence. One supervisor thread,
+silence. A locate that chains `XrViewLocateFixedViewerDXR` (`XR_DXR_display_info` v25 — video
+and other viewer-independent content) is not a viewer request: in-process it never asks the
+arbitration, and an IPC client's hint reaches the service, which then asks nothing on its
+behalf. Such an app alone never starts the provider. One supervisor thread,
 one 100 ms tick: reap, the producer's hello (its pid + generation in the producer block), a
 heartbeat watchdog (3 s silent → killed, counted as a crash; after a suspend the host first gets
 3 s to beat). Restart after an abnormal exit with a

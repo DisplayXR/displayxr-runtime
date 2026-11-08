@@ -194,6 +194,15 @@ comp_ipc_client_system_compositor_get_predicted_eye_positions(struct xrt_system_
                                                               int64_t target_ns,
                                                               struct xrt_eye_positions *out_eyes);
 
+// XR_DXR_display_info v25 over IPC: this client's locates are framed for the
+// nominal viewer and ask the service-hosted viewer tracking for nothing. Same
+// linkage pattern as above; the system-compositor variant serves sessions
+// without an xcn.
+bool
+comp_ipc_client_compositor_set_fixed_viewer(struct xrt_compositor *xc, bool fixed);
+bool
+comp_ipc_client_system_compositor_set_fixed_viewer(struct xrt_system_compositor *xsysc, bool fixed);
+
 #ifdef OXR_HAVE_DXR_view_rig
 // XR_DXR_view_rig over IPC (#396 W7) — same linkage pattern as above; the
 // wire structs come from shared/ipc_protocol.h (include precedent:
@@ -3786,6 +3795,60 @@ oxr_session_get_rig_local_plane(struct oxr_session *sess, struct xrt_pose *out_p
 	return rig_plane;
 }
 
+/*!
+ * XR_DXR_display_info v25: does this locate chain XrViewLocateFixedViewerDXR
+ * with fixedViewer set? Such a locate is framed for the nominal viewer and
+ * asks nothing that tracks a viewer — neither the DP's eyes nor a
+ * viewer-tracking provider (whose start is the demand this hint exists to
+ * withhold: a provider opens its camera on the first request, target_viewer_
+ * tracking.c vt_get_eyes_at). Runtime gate: an instance that did not enable
+ * the extension keeps today's behaviour whatever it chains.
+ */
+static bool
+locate_wants_fixed_viewer(struct oxr_session *sess, const XrViewLocateInfo *info)
+{
+#ifdef OXR_HAVE_DXR_display_info
+	if (!sess->sys->inst->extensions.DXR_display_info) {
+		return false;
+	}
+	const XrViewLocateFixedViewerDXR *fv =
+	    OXR_GET_INPUT_FROM_CHAIN(info, XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR, XrViewLocateFixedViewerDXR);
+	return fv != NULL && fv->fixedViewer != XR_FALSE;
+#else
+	(void)sess;
+	(void)info;
+	return false;
+#endif
+}
+
+/*!
+ * XR_DXR_display_info v25 over IPC: the SERVICE computes this client's views
+ * and hosts the viewer-tracking provider, so it has to know. The flag rides
+ * one call per change (not per locate) and the service applies it to every
+ * view, eye and segment query this client makes until the next change — the
+ * app's own calls are serialised on its connection, so that is exactly the
+ * locate it was set for. Same gate as the #441 IPC tracking-state fetch below.
+ */
+static void
+locate_sync_fixed_viewer_ipc(struct oxr_session *sess, bool fixed)
+{
+	const uint8_t want = fixed ? 2 : 1;
+	if (sess->ipc_fixed_viewer_sent == want) {
+		return;
+	}
+	struct xrt_system_compositor *xsysc = sess->sys->xsysc;
+	if (xsysc == NULL || !xsysc->info.is_service_mode || xsysc->xmcc != NULL || sess->is_d3d11_native_compositor ||
+	    sess->is_d3d12_native_compositor || sess->is_gl_native_compositor || sess->is_vk_native_compositor ||
+	    sess->is_metal_native_compositor) {
+		return;
+	}
+	const bool ok = sess->xcn != NULL ? comp_ipc_client_compositor_set_fixed_viewer(&sess->xcn->base, fixed)
+	                                  : comp_ipc_client_system_compositor_set_fixed_viewer(xsysc, fixed);
+	if (ok) {
+		sess->ipc_fixed_viewer_sent = want;
+	}
+}
+
 static XrResult
 locate_views_one(struct oxr_logger *log,
                  struct oxr_session *sess,
@@ -3800,6 +3863,8 @@ locate_views_one(struct oxr_logger *log,
 	bool print = sess->sys->inst->debug_views;
 	struct xrt_device *xdev = GET_XDEV_BY_ROLE(sess->sys, head);
 	struct oxr_space *baseSpc = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_space *, viewLocateInfo->space);
+	// XR_DXR_display_info v25: framed for the nominal viewer, no viewer asked for.
+	const bool fixed_viewer = locate_wants_fixed_viewer(sess, viewLocateInfo);
 	/*
 	 * #1486: TWO counts, and the distinction is the whole point.
 	 *
@@ -4124,6 +4189,20 @@ locate_views_one(struct oxr_logger *log,
 				    "its views)",
 				    (unsigned long long)seg->screen_id);
 			}
+		}
+	} else if (fixed_viewer) {
+		// XR_DXR_display_info v25: the app said its content does not depend
+		// on the viewer. Neither the DP's eyes (a tracking display keeps them
+		// for its weave, ADR-033) nor a viewer-tracking provider (whose first
+		// request would start it — the camera this hint keeps closed): the
+		// nominal viewer below fills the views.
+		got_eye_positions = false;
+		static bool logged_fixed = false;
+		if (!logged_fixed) {
+			logged_fixed = true;
+			U_LOG_W(
+			    "xrLocateViews: XrViewLocateFixedViewerDXR - views for the nominal viewer, no "
+			    "viewer-tracking demand (XR_DXR_display_info v25). Logged once.");
 		}
 	} else {
 		// N6 Part 1 (#2144): the eyes at the frame's displayTime, not "latest".
@@ -5433,11 +5512,11 @@ locate_views_one(struct oxr_logger *log,
 		// server-computed view poses (the Phase-0 multi-comp regression).
 		// Skipped when the active mode is untracked: the result would be
 		// FALSE either way, so don't pay the round-trip.
-		if (!got_eye_positions && mode_has_tracking &&
-		    sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
-		    !sess->is_d3d11_native_compositor && !sess->is_d3d12_native_compositor &&
-		    !sess->is_gl_native_compositor && !sess->is_vk_native_compositor &&
-		    !sess->is_metal_native_compositor && sess->sys->xsysc->xmcc == NULL) {
+		if (!got_eye_positions && mode_has_tracking && !fixed_viewer && sess->sys->xsysc != NULL &&
+		    sess->sys->xsysc->info.is_service_mode && !sess->is_d3d11_native_compositor &&
+		    !sess->is_d3d12_native_compositor && !sess->is_gl_native_compositor &&
+		    !sess->is_vk_native_compositor && !sess->is_metal_native_compositor &&
+		    sess->sys->xsysc->xmcc == NULL) {
 			struct xrt_eye_positions ipc_eyes;
 			bool got = false;
 			// N6 Part 1 (#2144): ask for the frame's displayTime — the
@@ -5473,7 +5552,17 @@ locate_views_one(struct oxr_logger *log,
 		// hand-over hold when more than one DP presents. A window on one
 		// screen has no other DP: the pass-through, byte for byte. Advanced
 		// only by the locate that owns the session-level side effects.
-		if (seg == NULL || seg->side_effects) {
+		//
+		// XR_DXR_display_info v25: a fixed-viewer locate's views follow no
+		// viewer, so it reports isTracking FALSE and leaves the session's
+		// tracking state (the hand-over hold, the edge event below) to the
+		// locates that do ask for a viewer — an app alternating the hint must
+		// not see an eye-tracking event per toggle.
+		const bool track_side_effects = (seg == NULL || seg->side_effects) && !fixed_viewer;
+		if (fixed_viewer) {
+			is_tracking = false;
+		}
+		if (track_side_effects) {
 			if (!mode_has_tracking) {
 				u_tracking_any_reset(&sess->tracking_any);
 				is_tracking = false;
@@ -5508,7 +5597,7 @@ locate_views_one(struct oxr_logger *log,
 		// sample yet": the first locate establishes the baseline
 		// without firing (apps read the initial state from
 		// XrViewEyeTrackingStateDXR).
-		if (seg == NULL || seg->side_effects) {
+		if (track_side_effects) {
 			if (sess->last_is_tracking >= 0 && (sess->last_is_tracking != 0) != is_tracking) {
 				oxr_event_push_XrEventDataEyeTrackingStateChanged(
 				    log, sess, is_tracking ? XR_TRUE : XR_FALSE,
@@ -5750,6 +5839,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// ADR-047 Amendment 7: no other presenting DP unless the table says so.
 	sess->locate_others_tracked = false;
 	sess->locate_others_count = 0;
+
+	// XR_DXR_display_info v25: record the hint for the runtime's own per-frame
+	// locate, and hand it to the service BEFORE any IPC query below (the
+	// segment table included) so this locate posts no viewer demand there.
+	const bool fixed_viewer = locate_wants_fixed_viewer(sess, viewLocateInfo);
+	sess->locate_fixed_viewer = fixed_viewer;
+	locate_sync_fixed_viewer_ipc(sess, fixed_viewer);
+
 	if (xdev == NULL || xdev->hmd == NULL || !locate_get_segment_metrics(sess, &m)) {
 		// The window is on one screen (or nothing segments it): the
 		// single-screen path, byte for byte.
@@ -5769,7 +5866,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// declared EXTERNAL_OK) takes the provider's eyes, mapped into THAT
 	// screen's display space; a tracking DP keeps its own. In-process only:
 	// over IPC (`seg_ipc`) the service spliced the table it sent.
-	if (!sess->seg_ipc) {
+	if (fixed_viewer) {
+		// XR_DXR_display_info v25: every segment is framed for its screen's
+		// nominal viewer — no DP eyes, and no provider asked (the service
+		// already left its table unspliced for this client).
+		for (uint32_t i = 0; i < m.count && i < XRT_MAX_SEGMENTS; i++) {
+			m.seg[i].have_eyes = false;
+		}
+	} else if (!sess->seg_ipc) {
 		struct xrt_viewer_tracking *vt = sess->sys->xsysd != NULL ? sess->sys->xsysd->viewer_tracking : NULL;
 		const int64_t t =
 		    (int64_t)time_state_ts_to_monotonic_ns(sess->sys->inst->timekeeping, viewLocateInfo->displayTime);
@@ -6132,6 +6236,19 @@ oxr_session_frame_view_cameras(struct oxr_logger *log,
 	    .displayTime = display_time,
 	    .space = XRT_CAST_PTR_TO_OXR_HANDLE(XrSpace, &view_space),
 	};
+#ifdef OXR_HAVE_DXR_display_info
+	// XR_DXR_display_info v25: the app's views were framed for the nominal
+	// viewer, so these cameras are too — and this locate must not be the one
+	// that starts a viewer-tracking provider the app's own locates withheld.
+	const XrViewLocateFixedViewerDXR fixed_viewer = {
+	    .type = XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR,
+	    .next = NULL,
+	    .fixedViewer = XR_TRUE,
+	};
+	if (sess->locate_fixed_viewer) {
+		info.next = &fixed_viewer;
+	}
+#endif
 
 	XrViewState view_state = {.type = XR_TYPE_VIEW_STATE, .next = NULL};
 	XrView views[XRT_MAX_VIEWS];

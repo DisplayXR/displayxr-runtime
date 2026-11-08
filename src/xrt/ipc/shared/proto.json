@@ -495,6 +495,12 @@
 		]
 	},
 
+	"compositor_set_fixed_viewer": {
+		"in": [
+			{"name": "fixed", "type": "bool"}
+		]
+	},
+
 	"compositor_get_predicted_eye_positions": {
 		"in": [
 			{"name": "target_ns", "type": "int64_t"}

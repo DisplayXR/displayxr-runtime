@@ -136,6 +136,11 @@ ipc_viewer_override_eyes(volatile struct ipc_client_state *ics,
                          bool have_dp)
 {
 	struct ipc_server *s = ics != NULL ? ics->server : NULL;
+	// XR_DXR_display_info v25: a fixed-viewer client asks for no viewer —
+	// the provider is never started (or kept alive) on its behalf.
+	if (ics != NULL && ics->fixed_viewer) {
+		return false;
+	}
 	struct xrt_viewer_tracking *vt = (s != NULL && s->xsysd != NULL) ? s->xsysd->viewer_tracking : NULL;
 	const bool spliced = xrt_viewer_tracking_override_eyes(vt, screen_id, target_ns, inout, have_dp);
 	static bool logged = false;
@@ -679,6 +684,25 @@ fill_rig_canvas(struct ipc_info_locate_views_rig *r,
 // that forcing substituted for). `rig_reply` (optional) receives the raw
 // input set (XrViewDisplayRawDXR payload) + the world-space rig eyes. Both
 // NULL on the legacy device_get_view_poses path — zero behavior change.
+/*!
+ * XR_DXR_display_info v25: the nominal viewer's eye pair for a fixed-viewer
+ * client — straight in front of the display centre at @p nominal_z_m, one IPD
+ * apart, untracked. Same rule as the in-process locate (oxr_session.c: the
+ * nominal y never leaks into the eye, only into the parallax pivot).
+ */
+XRT_MAYBE_UNUSED static void
+ipc_fixed_viewer_eyes(const struct xrt_vec3 *eye_relation, float nominal_z_m, struct xrt_eye_positions *out)
+{
+	const float ipd = (eye_relation != NULL && eye_relation->x > 0.0f) ? eye_relation->x : 0.063f;
+	const float z = nominal_z_m > 0.0f ? nominal_z_m : 0.6f;
+	memset(out, 0, sizeof(*out));
+	out->count = 2;
+	out->valid = true;
+	out->is_tracking = false;
+	out->eyes[0] = (struct xrt_eye_position){-ipd * 0.5f, 0.0f, z};
+	out->eyes[1] = (struct xrt_eye_position){ipd * 0.5f, 0.0f, z};
+}
+
 static bool
 ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
                           struct xrt_compositor *xc,
@@ -745,7 +769,19 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// Get eye positions from SR weaver (currently 2 eyes; array for future N-view)
 	struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS] = {0};
 	uint32_t eye_count = (view_count < 2) ? view_count : 2; // DP currently reports max 2
-	if (ws_framed) {
+	// XR_DXR_display_info v25: a fixed-viewer client is framed for the nominal
+	// viewer of the screen it is framed against — never the DP's tracked eyes
+	// (its weave keeps those) and never a provider's.
+	const bool fixed_viewer = ics->fixed_viewer;
+	struct xrt_eye_positions fixed_eyes = {0};
+	if (fixed_viewer) {
+		ipc_fixed_viewer_eyes(fallback_eye_relation,
+		                      ws_framed ? ws_nominal.z : s->xsysc->info.nominal_viewer_z_m, &fixed_eyes);
+		for (uint32_t i = 0; i < eye_count; i++) {
+			raw_eyes[i] =
+			    (struct xrt_vec3){fixed_eyes.eyes[i].x, fixed_eyes.eyes[i].y, fixed_eyes.eyes[i].z};
+		}
+	} else if (ws_framed) {
 		// That screen's eyes, in its own display space (the window metrics
 		// below are in the same space). A one-eye answer is used for both.
 		for (uint32_t i = 0; i < eye_count; i++) {
@@ -803,11 +839,14 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// Timestamp + tracking lock come from the same full DP eye query.
 	if (rig_reply != NULL) {
 		struct xrt_eye_positions full_eyes = {0};
-		if (ws_framed) {
+		if (fixed_viewer) {
+			full_eyes = fixed_eyes; // XR_DXR_display_info v25: the nominal pair
+		} else if (ws_framed) {
 			full_eyes = ws_eyes; // the framing screen's set (ADR-052 D2)
 		}
-		bool have_full = ws_framed || comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(
-		                                  s->xsysc, xc, at_timestamp_ns, &full_eyes);
+		bool have_full = fixed_viewer || ws_framed ||
+		                 comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(
+		                     s->xsysc, xc, at_timestamp_ns, &full_eyes);
 		// ADR-054 N6 Part 2: the raw channel reports the eyes the views
 		// follow — the provider's on a screen routed to it (primary only
 		// here; a workspace tile framed on another screen keeps its DP's).
@@ -1015,6 +1054,10 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		// ADR-054 N6 Part 2: that screen's viewer source — the provider,
 		// mapped into its display space, when the arbitration routed it there.
 		(void)ipc_viewer_override_eyes(ics, zone_screen.screen_id, at_timestamp_ns, &zone_screen.eyes, true);
+		if (fixed_viewer) {
+			// XR_DXR_display_info v25: that screen's nominal viewer.
+			ipc_fixed_viewer_eyes(fallback_eye_relation, zone_screen.nominal_viewer_z_m, &zone_screen.eyes);
+		}
 		const struct xrt_eye_positions *ze = &zone_screen.eyes;
 		const uint32_t zn = ze->count < XRT_MAX_VIEWS ? ze->count : XRT_MAX_VIEWS;
 		for (uint32_t i = 0; i < eye_count; i++) {
@@ -1923,8 +1966,10 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	int64_t sample_time_ns = 0;
 	struct xrt_eye_positions eyes = {0};
 	// N6 Part 1 (#2144): the eyes at the locate's display time, not "latest".
-	bool have_dp_eyes =
-	    multi_compositor_get_eye_positions_at(mc, at_timestamp_ns, &eyes) && eyes.valid && eyes.count > 0;
+	// XR_DXR_display_info v25: a fixed-viewer client's views are the nominal
+	// layout below even on a display that tracks (its weave keeps the DP's).
+	bool have_dp_eyes = !ics->fixed_viewer && multi_compositor_get_eye_positions_at(mc, at_timestamp_ns, &eyes) &&
+	                    eyes.valid && eyes.count > 0;
 	if (have_dp_eyes) {
 		head_eye_count = (eyes.count < XRT_MAX_VIEWS) ? eyes.count : XRT_MAX_VIEWS;
 		for (uint32_t i = 0; i < head_eye_count; i++) {
@@ -3488,6 +3533,23 @@ session_tracking_or(volatile struct ipc_client_state *ics, struct u_tracking_any
 	return u_tracking_any_update(state, os_monotonic_get_ns(), own, others_tracked, others, U_TRACKING_ANY_HOLD_NS);
 }
 #endif
+
+xrt_result_t
+ipc_handle_compositor_set_fixed_viewer(volatile struct ipc_client_state *ics, bool fixed)
+{
+	IPC_TRACE_MARKER();
+
+	// XR_DXR_display_info v25 (XrViewLocateFixedViewerDXR): the client sends
+	// this on change, before the locate it applies to; every view, eye and
+	// segment query it makes from then on is framed for the nominal viewer
+	// and posts no viewer-tracking demand (ipc_viewer_override_eyes).
+	if (ics->fixed_viewer != fixed) {
+		ics->fixed_viewer = fixed;
+		IPC_INFO(ics->server, "client %u: fixed-viewer locates %s (XR_DXR_display_info v25)",
+		         ics->client_state.id, fixed ? "on" : "off");
+	}
+	return XRT_SUCCESS;
+}
 
 xrt_result_t
 ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_state *ics,

@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_info 1
-#define XR_DXR_display_info_SPEC_VERSION 24
+#define XR_DXR_display_info_SPEC_VERSION 25
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -958,6 +958,54 @@ typedef struct XrDisplayStableKeyDXR {
     void* XR_MAY_ALIAS          next;
     char                        key[XR_MAX_DISPLAY_KEY_SIZE_DXR]; //!< NUL-terminated; "" = unknown.
 } XrDisplayStableKeyDXR;
+
+// ---- v25: Fixed-viewer locate hint ----
+
+// Type value 1004999450 (display_info's 450-459 decade, see README.md: the
+// 210-219 decade is full and 430-449 went to app_share / stereo_comfort).
+#define XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR ((XrStructureType)1004999450)
+
+/*!
+ * @brief "This locate's content does not depend on where the viewer is" (v25).
+ *
+ * Chained on XrViewLocateInfo::next in xrLocateViews. With `fixedViewer` =
+ * XR_TRUE, that call locates the views for the display's NOMINAL viewer — the
+ * fixed left/right (or N-view) eye set straight in front of the display at its
+ * nominal distance, as if nothing tracked the viewer — and does not ask for a
+ * viewer at all: no viewer-tracking provider is started or kept alive on its
+ * behalf, so on a display that does not track the viewer itself, a camera a
+ * provider would open for look-around stays closed.
+ *
+ * For content whose picture is fixed regardless of the viewer: a stereo or
+ * flat video, a stereo photo. Content rendered from a 3D scene (a model, a
+ * splat, a game) wants look-around and should NOT chain it.
+ *
+ * Per call: only the xrLocateViews call that chains it is affected, and only
+ * for this session. Other calls, sessions and apps are unaffected. A provider
+ * other locates started keeps running for them; once no locate asks for a
+ * viewer it stops after its idle timeout. `fixedViewer` = XR_FALSE, or not
+ * chaining the struct, is today's behaviour.
+ *
+ * On a display that tracks the viewer itself, the weave keeps using the
+ * tracked eyes (the display's own business); only the returned views are the
+ * nominal ones. A chained XR_DXR_view_rig descriptor still applies, framed
+ * around the nominal eyes. XrViewState flags are unchanged; a chained
+ * XrViewEyeTrackingStateDXR reports isTracking = XR_FALSE for the call (its
+ * views follow no viewer), and the call never raises
+ * XrEventDataEyeTrackingStateChangedDXR. A chained XrViewDisplayRawDXR reports
+ * the nominal eyes with isTracking = XR_FALSE.
+ *
+ * A runtime older than v25 ignores the struct (an unknown chained input), so
+ * an app can chain it unconditionally; check the extension's spec version
+ * (XrExtensionProperties::extensionVersion >= 25) to know it is honoured.
+ *
+ * @extends XrViewLocateInfo
+ */
+typedef struct XrViewLocateFixedViewerDXR {
+    XrStructureType             type;        //!< Must be XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR
+    const void* XR_MAY_ALIAS    next;
+    XrBool32                    fixedViewer; //!< XR_TRUE = locate for the nominal viewer; ask for no viewer
+} XrViewLocateFixedViewerDXR;
 
 #ifndef XR_NO_PROTOTYPES
 XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateDisplaysDXR(

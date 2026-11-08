@@ -2419,3 +2419,74 @@ TEST_CASE("the composed advertisement: sim_display + a usable provider advertise
 	CHECK((int)caps.defaultMode == 0); // MANAGED
 	tear_down(rt);
 }
+
+TEST_CASE("a fixed-viewer locate asks for no viewer: the provider is not started (XR_DXR_display_info v25)",
+          "[oxr][view_space][viewer_tracking][fixed_viewer]")
+{
+	// XrViewLocateFixedViewerDXR: a locate that chains it is framed for the
+	// nominal viewer and posts no viewer-tracking demand. sim_tracking's sweep
+	// (PERIOD_MS=2000, AMPLITUDE_M=0.1) starts at phase 0 when the provider
+	// starts, so the time the provider started is readable off the eyes: had
+	// any fixed locate below started it, the first normal locate a quarter
+	// period later would already see the head ~+AMPLITUDE to the right.
+	if (!viewer_tracking_process()) {
+		WARN("this arm needs the sim-tracking provider - see tests_oxr_view_space_viewer_tracking");
+		SUCCEED("not the viewer-tracking process");
+		return;
+	}
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info || !rt.have_view_rig) {
+		WARN("XR_DXR_display_info or XR_DXR_view_rig not advertised: nothing to read");
+		SUCCEED("nothing to read");
+		tear_down(rt);
+		return;
+	}
+
+	XrViewLocateFixedViewerDXR fixed = {XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR};
+	fixed.fixedViewer = XR_TRUE;
+
+	auto raw_centroid_x = [&](const void *next, XrViewDisplayRawDXR &raw) {
+		(void)rt.views(rt.view, rt.now(), next, &raw);
+		REQUIRE(raw.eyeCountOutput >= 2);
+		float cx = 0.0f;
+		for (uint32_t i = 0; i < raw.eyeCountOutput; i++) {
+			cx += raw.rawEyes[i].x;
+		}
+		return cx / (float)raw.eyeCountOutput;
+	};
+
+	// A quarter period of fixed-viewer locates: the nominal viewer every time.
+	for (int i = 0; i < 10; i++) {
+		XrViewDisplayRawDXR raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+		const float x = raw_centroid_x(&fixed, raw);
+		CHECK(raw.isTracking == XR_FALSE);
+		CHECK(std::fabs(x) < 1e-4f); // sim's nominal x is 0
+		sleep_ms(50);
+	}
+
+	// The first locate that asks for a viewer starts the provider: phase 0.
+	XrViewDisplayRawDXR first = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	const float x_first = raw_centroid_x(nullptr, first);
+	sleep_ms(500); // a quarter of PERIOD_MS=2000
+	XrViewDisplayRawDXR quarter = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	const float x_quarter = raw_centroid_x(nullptr, quarter);
+	std::printf("fixed viewer: first normal locate x %.4f, a quarter period later %.4f (tracking %d)\n", x_first,
+	            x_quarter, (int)quarter.isTracking);
+	CHECK(std::fabs(x_first) < 0.03f); // not already a quarter period in: no fixed locate started it
+	CHECK(quarter.isTracking == XR_TRUE);
+	CHECK(x_quarter - x_first > 0.06f);
+
+	// With the provider running for other locates, a fixed one still gets the
+	// nominal viewer, untracked.
+	XrViewDisplayRawDXR again = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	const float x_again = raw_centroid_x(&fixed, again);
+	CHECK(again.isTracking == XR_FALSE);
+	CHECK(std::fabs(x_again) < 1e-4f);
+
+	tear_down(rt);
+}

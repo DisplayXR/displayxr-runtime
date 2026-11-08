@@ -463,6 +463,25 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   #1612 — and logs it once per session). Do not build on it: the window closes once every demo
   aliases its inactive views.
 
+- **INV-3.5 (advisory) — Viewer-independent content chains `XrViewLocateFixedViewerDXR`.**
+  (`XR_DXR_display_info` v25.) Asking `xrLocateViews` for a viewer is what starts a
+  viewer-tracking provider — on a display that does not track the viewer itself, a webcam
+  tracker opens its camera on the first such locate. A video player (2D, side-by-side,
+  top-bottom), a stereo photo viewer or a flat UI renders the same picture wherever the viewer
+  is, so it should say so and get the nominal viewer's fixed views instead:
+
+  ```c
+  XrViewLocateFixedViewerDXR fixedViewer = {XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR};
+  fixedViewer.fixedViewer = contentIsViewerIndependent ? XR_TRUE : XR_FALSE;
+  locateInfo.next = &fixedViewer; // beside any XR_DXR_view_rig descriptor
+  ```
+
+  Per call, so an app that shows both kinds sets it only while the viewer-independent content
+  is on screen. Never for content rendered from a 3D scene (a model, a splat, a game):
+  look-around is the point there. Gate on the extension's spec version (`>= 25`); an older
+  runtime ignores the struct. Spec: `docs/specs/extensions/XR_DXR_display_info.md`
+  § *Fixed-viewer locates*.
+
 ---
 
 ## 4. Swapchain sizing & tiling
@@ -1181,6 +1200,7 @@ macOS app (no manifest → no Android findings).
 - [ ] (Vulkan) ≥2 frames in flight, ONE `vkQueueSubmit` per frame, no wait on the frame just submitted, no `vkQueueWaitIdle`/`vkDeviceWaitIdle` on the frame path, command buffers allocated once — `dxr::VkFrameRing` (INV-4.10)
 - [ ] (texture) regions declared via display-zones — 3D zones + Local2D zones, not output-rect/surround (INV-5.1/5.3)
 - [ ] (texture) shared surface sized once to worst-case; full composite presented (INV-5.2)
+- [ ] (video / stereo-photo / flat content) `XrViewLocateFixedViewerDXR` chained on the locate while it is on screen, so no viewer tracker starts for it (INV-3.5)
 - [ ] Window-relative Kooima; matrices transposed for DirectX (INV-6.3/6.4)
 - [ ] (agent apps) no MCP tool handler reaches an `xr*Desktop*DXR` call — desktop control is never re-exported (INV-10.4)
 - [ ] Capture via `xrCaptureAtlasDXR`, prefix without extension, mono-guarded; no app-side readback (INV-7.1/7.2/7.3)
