@@ -13,6 +13,7 @@
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_config_build.h"
 #include "xrt/xrt_instance.h"
+#include "xrt/xrt_stereo_camera.h"
 
 #include "math/m_mathinclude.h"
 #include "util/u_var.h"
@@ -334,6 +335,14 @@ oxr_instance_create(struct oxr_logger *log,
 	xrt_result_t xret;
 	XrResult ret;
 
+#ifdef OXR_HAVE_DXR_app_share
+	// XR_DXR_app_share spec §2: a dependent extension of XR_DXR_stereo_camera.
+	if (extensions->DXR_app_share && !extensions->DXR_stereo_camera) {
+		return oxr_error(log, XR_ERROR_EXTENSION_DEPENDENCY_NOT_ENABLED,
+		                 "XR_DXR_app_share requires XR_DXR_stereo_camera to be enabled too");
+	}
+#endif
+
 	OXR_ALLOCATE_HANDLE_OR_RETURN(log, inst, OXR_XR_DEBUG_INSTANCE, oxr_instance_destroy, NULL);
 
 #ifdef XRT_OS_WINDOWS
@@ -574,10 +583,20 @@ oxr_instance_create(struct oxr_logger *log,
 		}
 		// Spec v3: the flags travel to the service as declared (same bit
 		// values as XRT_STEREO_CAMERA_CLIENT_*); it acts on
-		// DECLINE_DELEGATION_BIT and ignores bits it does not know.
+		// DECLINE_DELEGATION_BIT and ignores bits it does not know. Only the
+		// public bits: the high ones are the runtime's own (below).
 		if (ci != NULL) {
-			i_info.app_info.stereo_camera_client_flags = (uint64_t)ci->flags;
+			i_info.app_info.stereo_camera_client_flags =
+			    (uint64_t)ci->flags & XRT_STEREO_CAMERA_CLIENT_PUBLIC_MASK;
 		}
+	}
+#endif
+#ifdef OXR_HAVE_DXR_app_share
+	// ADR-061 decision 3: enabling XR_DXR_app_share IS the declaration that
+	// this instance wants running apps listed — an internal client flag, never
+	// a public bit.
+	if (extensions->DXR_app_share) {
+		i_info.app_info.stereo_camera_client_flags |= XRT_STEREO_CAMERA_CLIENT_INTERNAL_APP_SHARE;
 	}
 #endif
 	// #964 Phase A: is this process part of a workspace session? The workspace
@@ -610,6 +629,10 @@ oxr_instance_create(struct oxr_logger *log,
 	 */
 
 	xret = xrt_instance_create(&i_info, &inst->xinst);
+	if (xret == XRT_SUCCESS && inst->xinst != NULL) {
+		// Nothing below the state tracker stores it: the service link names the app from here.
+		inst->xinst->instance_info = i_info;
+	}
 	if (xret == XRT_ERROR_CLIENT_LIMIT_REACHED) {
 		// #960: the service refused us at the class quota / client cap.
 		ret = oxr_error(log, XR_ERROR_LIMIT_REACHED,

@@ -585,7 +585,7 @@ struct xrt_status_conv_provider
 	bool enabled;                         //!< `Enabled` (after the per-user override).
 	bool fallback;                        //!< FALLBACK provider (sorts last).
 	bool hidden;                          //!< Hidden by another provider's `Supersedes`.
-	bool licence_exempt;                  //!< Grandfathered (the dp-lift adapter): skips the licence gate.
+	bool licence_exempt;                  //!< Skips the licence gate: the dp-lift adapter, or a user-installed model.
 	bool research_opt_in;                 //!< `AllowResearchOnly` is on (machine-wide; repeated per row).
 	bool described;                       //!< Rows exist (live describe or the describe cache).
 	int64_t host_pid;                     //!< Satellite host pid; 0 in-service / not running.

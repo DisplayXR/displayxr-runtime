@@ -83,19 +83,19 @@ TEST_CASE("Malformed or ambiguous profiles never partly apply", "[camera-profile
 
 TEST_CASE("Unknown keys are skipped with a notice and the known keys still apply", "[camera-profile]")
 {
-	// #2450: a profile written for a newer runtime (here the proposed framing
-	// keys) must keep its convergence/FOV/ipdFactor on a runtime that lacks them.
+	// #2450: a profile written for a newer runtime (here two hypothetical
+	// framing keys) must keep its convergence/FOV/ipdFactor on a runtime that lacks them.
 	u_camera_profile profile{};
 	char notice[160]{};
 	REQUIRE(u_camera_profile_parse(
-	    R"({"convergenceMeters":0.8,"pitchDegrees":-30,"verticalFov":1.05,"pullbackMeters":0.6,"ipdFactor":0.05})",
+	    R"({"convergenceMeters":0.8,"rollDegrees":-30,"verticalFov":1.05,"dollyMeters":0.6,"ipdFactor":0.05})",
 	    1, &profile, notice, sizeof(notice)));
 	CHECK(profile.inv_convergence_distance == 1.25f);
 	CHECK(2.0 * std::atan(profile.half_tan_vfov) == Approx(1.05));
 	CHECK(profile.ipd_factor == .05f);
 	CHECK(profile.parallax_factor == 1);
 	CHECK(profile.m2v == 1);
-	CHECK(std::string(notice) == "unknown camera profile key(s) ignored: pitchDegrees, pullbackMeters");
+	CHECK(std::string(notice) == "unknown camera profile key(s) ignored: rollDegrees, dollyMeters");
 
 	// Any value shape is skipped, including the excluded pose vocabulary.
 	REQUIRE(u_camera_profile_parse(R"({"pose":{"x":[1,2]},"note":"text","flag":null})", 1, &profile, notice,
@@ -123,10 +123,10 @@ TEST_CASE("Unknown keys are skipped with a notice and the known keys still apply
 	REQUIRE(u_camera_profile_parse(many.c_str(), 1, &profile, nullptr, 0));
 
 	// The loader returns the notice alongside LOADED, for both override forms.
-	REQUIRE(u_camera_profile_load(nullptr, nullptr, R"({"pitchDegrees":-30,"metersToVirtual":3})", 1, &profile,
+	REQUIRE(u_camera_profile_load(nullptr, nullptr, R"({"rollDegrees":-30,"metersToVirtual":3})", 1, &profile,
 	                              notice, sizeof(notice)) == U_CAMERA_PROFILE_LOADED);
 	CHECK(profile.m2v == 3);
-	CHECK(std::string(notice) == "unknown camera profile key(s) ignored: pitchDegrees");
+	CHECK(std::string(notice) == "unknown camera profile key(s) ignored: rollDegrees");
 }
 
 TEST_CASE("Legal JSON number and key escapes remain supported", "[camera-profile]")
@@ -282,3 +282,33 @@ TEST_CASE("Process lookup uses ProgramData and the actual executable basename", 
 	CHECK(profile.m2v == .25f); // Reads live process environment, not a stale CRT cache.
 }
 #endif
+
+TEST_CASE("pitchDegrees sets the initial camera tilt in radians and is bounded", "[camera-profile]")
+{
+	u_camera_profile profile{};
+	REQUIRE(u_camera_profile_parse("{}", 0, &profile, nullptr, 0));
+	CHECK(profile.pitch_rad == 0);
+	REQUIRE(u_camera_profile_parse(R"({"pitchDegrees":-30})", 0, &profile, nullptr, 0));
+	CHECK(profile.pitch_rad == Approx(-0.5235987756));
+	CHECK(profile.m2v == 1); // other fields keep their defaults
+
+	u_camera_profile untouched = profile;
+	char error[128] = {};
+	CHECK_FALSE(u_camera_profile_parse(R"({"pitchDegrees":95})", 0, &profile, error, sizeof(error)));
+	CHECK(std::string(error).find("pitchDegrees") != std::string::npos);
+	CHECK_FALSE(u_camera_profile_parse(R"({"pitchDegrees":-90})", 0, &profile, nullptr, 0));
+	CHECK_FALSE(u_camera_profile_parse(R"({"pitchDegrees":"down"})", 0, &profile, nullptr, 0));
+	CHECK_FALSE(u_camera_profile_parse(R"({"pitchDegrees":-30,"pitchDegrees":-20})", 0, &profile, nullptr, 0));
+	CHECK(profile.pitch_rad == untouched.pitch_rad);
+}
+
+TEST_CASE("pullbackMeters sets the initial camera distance and is bounded", "[camera-profile]")
+{
+	u_camera_profile profile{};
+	REQUIRE(u_camera_profile_parse("{}", 0, &profile, nullptr, 0));
+	CHECK(profile.pullback_m == 0);
+	REQUIRE(u_camera_profile_parse(R"({"pullbackMeters":0.8,"pitchDegrees":-30})", 0, &profile, nullptr, 0));
+	CHECK(profile.pullback_m == Approx(0.8));
+	CHECK_FALSE(u_camera_profile_parse(R"({"pullbackMeters":-0.1})", 0, &profile, nullptr, 0));
+	CHECK_FALSE(u_camera_profile_parse(R"({"pullbackMeters":11})", 0, &profile, nullptr, 0));
+}

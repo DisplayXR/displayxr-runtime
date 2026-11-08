@@ -514,11 +514,11 @@ target_link_libraries(
 ###
 # Cross-adapter transport (#918) — API-agnostic, linked by every native
 # compositor that can hit the split. Declared BEFORE its consumers so their
-# target_link_libraries() sees a defined target.
+# target_link_libraries() sees a defined target. The directory is entered on
+# every platform for the ADR-061 share tap's portable hook surface
+# (comp_xbridge_share_tap); the transport itself stays Windows + D3D11 only.
 #
-if(WIN32 AND XRT_HAVE_D3D11)
-	add_subdirectory(xbridge)
-endif()
+add_subdirectory(xbridge)
 
 ###
 # Native D3D11 compositor (bypasses Vulkan entirely)

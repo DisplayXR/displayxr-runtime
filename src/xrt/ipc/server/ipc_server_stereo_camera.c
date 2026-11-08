@@ -152,6 +152,8 @@
 #include "util/u_stereo_rectify.h"
 #include "util/u_stereo_uvc.h"
 #include "util/u_stereo_vrefine.h"
+#include "util/u_app_share_fake.h"
+#include "util/u_handles.h"
 #include "os/os_uvc_capture.h"
 
 #include <math.h>
@@ -174,8 +176,34 @@ DEBUG_GET_ONCE_BOOL_OPTION(stereo_camera_refine, "DXR_STEREO_CAMERA_REFINE", tru
 // DEV ONLY (#1842 hardware repro): shorten / lengthen the consent prompt's
 // timeout. Read once at service start; 0 / unset = PROMPT_TIMEOUT_MS.
 DEBUG_GET_ONCE_NUM_OPTION(stereo_camera_prompt_timeout_ms, "DXR_STEREO_CAMERA_PROMPT_TIMEOUT_MS", 0)
+// ADR-061 app share (service environment).
+DEBUG_GET_ONCE_BOOL_OPTION(app_share_enabled, "DXR_APP_SHARE", true)
+DEBUG_GET_ONCE_BOOL_OPTION(app_share_dev, "DXR_APP_SHARE_DEV", false)
+// DXR_APP_SHARE_FAKE: "1" (truthy) = the synthetic service-composited app,
+// "link" = a synthetic in-process registrant over the share-link core (ADR-061
+// arm 2), "both" = both.
+DEBUG_GET_ONCE_OPTION(app_share_fake, "DXR_APP_SHARE_FAKE", NULL)
 
-#define MAX_STREAMS (XRT_STEREO_CAMERA_MAX_CAMERAS * XRT_STEREO_CAMERA_MAX_STREAMS_PER_CAMERA)
+/*!
+ * ADR-061: app entries live in their OWN table (mgr->apps), never in cams[]
+ * (four slots, never reused). A stream's `camera` index addresses both:
+ * [0, MAX_CAMERAS) = cams[], [APP_SLOT_BASE, APP_SLOT_BASE + APP_MAX) =
+ * apps[]. App slots ARE reused, but only once nothing references them.
+ */
+#define APP_MAX 8
+#define APP_SLOT_BASE XRT_STEREO_CAMERA_MAX_CAMERAS
+#define TOTAL_SLOTS (XRT_STEREO_CAMERA_MAX_CAMERAS + APP_MAX)
+#define APP_LINGER_NS_DEFAULT (10000ll * 1000 * 1000) //!< an exited app stays listed UNAVAILABLE this long
+#define APP_TICK_NS (1000ll * 1000 * 1000)            //!< the app rescan tick
+#define APP_CLOSE_WAIT_NS (1000ll * 1000 * 1000)      //!< app_session_ending: bounded wait for the detach
+#define APP_ID_MEMORY 32                              //!< (exe, ordinal) -> camera_id, per service run
+//! ADR-061 arm 2: registered in-process service links (one per connection, plus the fake).
+#define LINK_MAX (IPC_MAX_CLIENTS + 1)
+//! A ring that declares a fence is imported once it arrives; past this, the share fails loudly.
+#define LINK_FENCE_WAIT_NS (2000ll * 1000 * 1000)
+//! The synthetic link registrant's connection id (never a real client id: those count up from 1).
+#define FAKE_LINK_CLIENT_ID 0xFA4E0001u
+#define MAX_STREAMS (TOTAL_SLOTS * XRT_STEREO_CAMERA_MAX_STREAMS_PER_CAMERA)
 #define LINGER_NS (2000ll * 1000 * 1000)
 #define WAIT_TIMEOUT_NS (100ll * 1000 * 1000)
 #define SUSPEND_AFTER_NS (1000ll * 1000 * 1000)
@@ -338,6 +366,8 @@ struct scam_stream
 	struct u_stereo_camera_ring ring;
 	struct u_stereo_camera_decimator dec;
 	struct xrt_stereo_camera_frame_info slot_info[U_STEREO_CAMERA_RING_SLOTS];
+	//! ADR-061: the app metadata of each slot's frame (valid = 0 on a camera stream).
+	struct xrt_app_share_frame_info slot_app[U_STEREO_CAMERA_RING_SLOTS];
 
 #ifdef XRT_OS_WINDOWS
 	//! SYNCHRONIZE-only duplicate handed to the last get_wake reply. The
@@ -419,9 +449,75 @@ struct scam_rectifier
 	bool stable_logged;
 };
 
+/*!
+ * ADR-061: what an app entry adds to a camera. Guarded by the manager lock
+ * except @ref frame (camera thread only).
+ */
+struct scam_app
+{
+	bool listed; //!< in the enumeration (live, or exited and lingering)
+	bool live;   //!< its connection + session are still there
+	bool fake;   //!< DXR_APP_SHARE_FAKE: the service's synthetic source
+	uint32_t client_id;
+	long pid;
+	char exe_path[U_CAMERA_CONSENT_EXE_MAX];
+	uint32_t ordinal; //!< 0 = the first running copy of exe_path
+	int64_t exited_ns;
+	//! The description as the enumeration reports it (availability, window, views, ...).
+	struct xrt_app_share_source_info desc;
+	int64_t last_commit_ns; //!< from share_tap_query; 0 = unknown
+	//! Metadata of the frame src_wait_frame just returned (camera thread only).
+	struct xrt_app_share_frame_info frame;
+};
+
+/*!
+ * ADR-061 arm 2: one registered in-process service link (decision 9, 16).
+ * Guarded by the manager's link_lock.
+ */
+struct scam_link
+{
+	bool used;
+	bool fake; //!< the DXR_APP_SHARE_FAKE=link registrant (CPU ring, no connection)
+	uint32_t client_id;
+	long pid;                                //!< OS-derived (the connection's peer)
+	char exe_path[U_CAMERA_CONSENT_EXE_MAX]; //!< OS-derived at registration
+	struct xrt_share_link_registration reg;
+	bool identity_mismatch_logged;
+
+	// What the service asks of the app (the poll's answer).
+	uint32_t state; //!< enum xrt_share_link_state
+	uint32_t stream_generation;
+	uint32_t eye_w, eye_h;
+	float fps;
+
+	// The newest published ring the source has not taken yet (handles owned).
+	bool ring_pending;
+	struct xrt_share_link_ring_desc ring;
+	xrt_graphics_buffer_handle_t tex[XRT_SHARE_LINK_RING_SLOTS];
+	uint32_t tex_count;
+	bool fence_pending;
+	uint32_t fence_generation;
+	xrt_graphics_sync_handle_t fence;
+	int64_t ring_ns; //!< when the pending ring arrived (the fence wait is time-boxed from here)
+	//! The content size of the last ring (the entry's content_eye_width/height).
+	uint32_t content_w, content_h;
+
+	// The newest frame_ready (latest-wins).
+	uint64_t frame_seq;
+	struct xrt_share_link_frame frame;
+	int64_t last_frame_ns; //!< when frame_ready last arrived (os_monotonic)
+
+	//! The fake's CPU ring: XRT_SHARE_LINK_RING_SLOTS SBS NV12 frames of the ring's slot size.
+	uint8_t *cpu_slots[XRT_SHARE_LINK_RING_SLOTS];
+	size_t cpu_slot_size;
+};
+
+struct scam_link_src;
+struct scam_fake_link;
+
 struct scam_camera
 {
-	uint32_t index; //!< position in mgr->cams (streams key on it)
+	uint32_t index; //!< stream key: position in mgr->cams, or APP_SLOT_BASE + position in mgr->apps
 	//! enum xrt_stereo_camera_source: the plug-in's slots or the service's UVC source.
 	uint32_t source;
 	uint32_t source_index; //!< the camera's index inside its source
@@ -476,6 +572,9 @@ struct scam_camera
 	struct os_thread thread;
 	struct os_cond cond;
 	struct ipc_server_stereo_camera *mgr;
+
+	//! ADR-061: set for an app entry (source APP / APP_LINK).
+	struct scam_app app;
 };
 
 //! Per-connection event queue (R3), keyed by the connection's owner token.
@@ -559,6 +658,49 @@ struct ipc_server_stereo_camera
 	struct ipc_server *server;
 	struct ipc_server_stereo_camera_internal *internal[INTERNAL_MAX];
 	uint32_t internal_busy;
+
+	/*
+	 * ADR-061 app share. apps[] is guarded by @ref lock; app_rescan_lock
+	 * serialises app rescans (taken before lock, never under it).
+	 */
+	struct scam_camera apps[APP_MAX];
+	bool apps_enabled; //!< DXR_APP_SHARE (default on)
+	bool app_dev;      //!< DXR_APP_SHARE_DEV: listed to every camera client, no prompt
+	int64_t app_linger_ns;
+	bool apps_dirty; //!< apps_changed() asked; the watch thread rescans now
+	int64_t last_app_rescan_ns;
+	struct os_mutex app_rescan_lock;
+	struct os_cond app_closed_cond; //!< broadcast when an app source closes
+	struct
+	{
+		char exe[U_CAMERA_CONSENT_EXE_MAX];
+		uint32_t ordinal;
+		uint64_t camera_id;
+	} app_ids[APP_ID_MEMORY];
+	uint32_t app_id_next;
+	//! The share policy (its own decisions; shares the camera's kill switch / toggle).
+	struct u_app_share_consent share;
+	/*!
+	 * App keys (camera ids) whose app went: their per-app-run grants are
+	 * forgotten under consent_lock once the manager lock is released
+	 * (share_forget_drain) — the two locks are never held together.
+	 */
+	uint64_t share_forget[APP_MAX * 2];
+	uint32_t share_forget_count;
+	int32_t share_prompt_override; //!< options: 0 = store, 1 = always, 2 = per-app-run
+	int32_t share_resolution_override;
+	bool have_share_prompt_seam; //!< options supplied a share prompt
+
+	/*
+	 * ADR-061 arm 2: the in-process service links that declared SHARE.
+	 * link_lock is a LEAF: nothing else is ever taken while it is held (the
+	 * manager lock may be held when it is taken, never the reverse).
+	 * link_cond is broadcast on every frame_ready / ring / unregister.
+	 */
+	struct os_mutex link_lock;
+	struct os_cond link_cond;
+	struct scam_link *links; //!< [LINK_MAX]
+	struct scam_fake_link *fake_link;
 };
 
 /*!
@@ -586,6 +728,8 @@ static ipc_server_stereo_camera_indicator_fn g_indicator_fn = NULL;
 static void *g_indicator_ctx = NULL;
 static ipc_server_stereo_camera_notice_fn g_notice_fn = NULL;
 static void *g_notice_ctx = NULL;
+static u_app_share_prompt_fn g_share_prompt_fn = NULL;
+static void *g_share_prompt_ctx = NULL;
 //! A2: platform identity / permission hooks (Android), copied at set time.
 static struct ipc_server_stereo_camera_platform g_platform;
 static bool g_platform_set = false;
@@ -609,6 +753,24 @@ ipc_server_stereo_camera_set_platform(const struct ipc_server_stereo_camera_plat
 		return;
 	}
 	g_platform = *p;
+	// ADR-061 arm 2: the ring hooks come as a set (an import without an
+	// unimport would leak every ring). A partial table is refused whole.
+	const bool any = p->share_link_import != NULL || p->share_link_convert != NULL ||
+	                 p->share_link_unimport != NULL || p->share_link_release_frame != NULL;
+	const bool all =
+	    p->share_link_import != NULL && p->share_link_convert != NULL && p->share_link_unimport != NULL;
+	if (any && !all) {
+		U_LOG_E(
+		    "app share: the platform's share_link_* hooks are incomplete (import %s, convert %s, unimport %s) "
+		    "— "
+		    "refused; in-process app entries are listed \"no tap\"",
+		    p->share_link_import != NULL ? "set" : "NULL", p->share_link_convert != NULL ? "set" : "NULL",
+		    p->share_link_unimport != NULL ? "set" : "NULL");
+		g_platform.share_link_import = NULL;
+		g_platform.share_link_convert = NULL;
+		g_platform.share_link_unimport = NULL;
+		g_platform.share_link_release_frame = NULL;
+	}
 	g_platform_set = true;
 }
 
@@ -644,6 +806,64 @@ owner_of(struct ipc_server_stereo_camera *m, volatile struct ipc_client_state *i
 		ics->stereo_camera_owner = ++m->next_owner;
 	}
 	return ics->stereo_camera_owner;
+}
+
+//! A stream's camera index -> the camera or app entry (see APP_SLOT_BASE).
+static inline struct scam_camera *
+slot_cam(struct ipc_server_stereo_camera *m, uint32_t index)
+{
+	return index < APP_SLOT_BASE ? &m->cams[index] : &m->apps[index - APP_SLOT_BASE];
+}
+
+static inline bool
+cam_is_app(const struct scam_camera *cam)
+{
+	return cam->source == XRT_STEREO_CAMERA_SOURCE_APP || cam->source == XRT_STEREO_CAMERA_SOURCE_APP_LINK;
+}
+
+//! ADR-061 decision 3: does this connection see app entries at all?
+static bool
+client_sees_apps(const struct ipc_server_stereo_camera *m, volatile struct ipc_client_state *ics)
+{
+	return m->apps_enabled && (m->app_dev || (ics->client_state.info.stereo_camera_client_flags &
+	                                          XRT_STEREO_CAMERA_CLIENT_INTERNAL_APP_SHARE) != 0);
+}
+
+//! Is app entry @p cam listed to @p ics (never to the shared app's own process)?
+static bool
+app_listed_for_locked(const struct scam_camera *cam, volatile struct ipc_client_state *ics)
+{
+	return cam->app.listed && (cam->app.pid <= 0 || cam->app.pid != ics->peer_pid);
+}
+
+//! A listed app entry @p ics may see, by camera id (NULL = none).
+static struct scam_camera *
+app_by_id_for_locked(struct ipc_server_stereo_camera *m, volatile struct ipc_client_state *ics, uint64_t id)
+{
+	if (!client_sees_apps(m, ics)) {
+		return NULL;
+	}
+	for (uint32_t i = 0; i < APP_MAX; i++) {
+		struct scam_camera *a = &m->apps[i];
+		if (a->camera_id == id && app_listed_for_locked(a, ics)) {
+			return a;
+		}
+	}
+	return NULL;
+}
+
+//! How many app entries @p ics sees (0 when it does not see apps).
+static uint32_t
+apps_listed_count_locked(struct ipc_server_stereo_camera *m, volatile struct ipc_client_state *ics)
+{
+	if (!client_sees_apps(m, ics)) {
+		return 0;
+	}
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < APP_MAX; i++) {
+		n += app_listed_for_locked(&m->apps[i], ics) ? 1u : 0u;
+	}
+	return n;
 }
 
 static struct scam_camera *
@@ -993,8 +1213,8 @@ client_visible_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s,
 			}
 			struct xrt_stereo_camera_event ev = {
 			    .kind = XRT_STEREO_CAMERA_EVENT_CAMERA_STATE,
-			    .value = v ? m->cams[s->camera].state : XRT_STEREO_CAMERA_STATE_SUSPENDED,
-			    .camera_id = m->cams[s->camera].camera_id,
+			    .value = v ? slot_cam(m, s->camera)->state : XRT_STEREO_CAMERA_STATE_SUSPENDED,
+			    .camera_id = slot_cam(m, s->camera)->camera_id,
 			};
 			if (s->vis_checked_ns != 0 || !v) {
 				evq_push_locked(m, s->owner, &ev);
@@ -1113,6 +1333,11 @@ notify_all_cameras_locked(struct ipc_server_stereo_camera *m)
 	for (uint32_t i = 0; i < m->camera_count; i++) {
 		notify_camera_state_locked(m, &m->cams[i]);
 	}
+	for (uint32_t i = 0; i < APP_MAX; i++) {
+		if (m->apps[i].app.listed) {
+			notify_camera_state_locked(m, &m->apps[i]);
+		}
+	}
 }
 
 static void
@@ -1227,36 +1452,688 @@ frame_orientation_deg(uint32_t plugin_value)
 static const char *
 source_str(uint32_t source)
 {
-	return source == XRT_STEREO_CAMERA_SOURCE_UVC ? "uvc" : "plug-in";
+	switch (source) {
+	case XRT_STEREO_CAMERA_SOURCE_UVC: return "uvc";
+	case XRT_STEREO_CAMERA_SOURCE_APP: return "app";
+	case XRT_STEREO_CAMERA_SOURCE_APP_LINK: return "app-link";
+	default: return "plug-in";
+	}
 }
 
-//! @p source / @p uvc / @p index are the camera's, captured under the manager
-//! lock by the caller (a rescan may update them while this runs unlocked).
+
+/*
+ *
+ * ADR-061 arm 2: the share-link core. An in-process app's service link
+ * (ipc_client_service_link) registers here; its app entry (SOURCE_APP_LINK)
+ * asks for frames by queueing SHARE_REQUESTED, the app publishes a ring and
+ * posts frame_ready, the entry's camera thread imports the ring and converts
+ * through the platform's share_link_* hooks. The IPC handlers below and the
+ * service's own synthetic registrant (DXR_APP_SHARE_FAKE=link) both drive
+ * these functions, so the fake exercises the exact path a real link takes.
+ *
+ */
+
+static bool
+app_mark_gone_locked(
+    struct ipc_server_stereo_camera *m, struct scam_camera *cam, int64_t now, bool delist, const char *why);
+static void
+notify_cameras_changed_locked(struct ipc_server_stereo_camera *m);
+static void
+share_forget_drain(struct ipc_server_stereo_camera *m);
+static uint32_t
+app_end_streams_locked(struct ipc_server_stereo_camera *m, struct scam_camera *cam);
+static void
+fake_link_start(struct ipc_server_stereo_camera *m);
+static void
+fake_link_stop(struct ipc_server_stereo_camera *m);
+
+//! An app entry's open source: one SHARE_REQUESTED stream of one link.
+struct scam_link_src
+{
+	uint32_t client_id;
+	uint32_t stream_generation;
+	uint32_t eye_w, eye_h;
+	bool fake;
+	uint64_t last_seq; //!< the last frame_ready consumed
+	bool imported;
+	void *import; //!< the platform's (NULL for the fake)
+	struct xrt_share_link_ring_desc ring;
+	//! The fake: the frame copied out of its CPU ring under link_lock.
+	uint8_t *cpu_frame;
+	size_t cpu_size;
+	/*!
+	 * The ring cannot be used (import failed, its fence never came): the
+	 * stream ends SOURCE_LOST and the app hears SHARE_STOPPED instead of an
+	 * endless wait. Camera thread only.
+	 */
+	bool fatal;
+};
+
+//! Caller holds link_lock.
+static struct scam_link *
+link_find_locked(struct ipc_server_stereo_camera *m, uint32_t client_id)
+{
+	if (m->links == NULL) {
+		return NULL;
+	}
+	for (uint32_t i = 0; i < LINK_MAX; i++) {
+		if (m->links[i].used && m->links[i].client_id == client_id) {
+			return &m->links[i];
+		}
+	}
+	return NULL;
+}
+
+static void
+link_close_handles(xrt_graphics_buffer_handle_t *tex, uint32_t count, xrt_graphics_sync_handle_t *fence)
+{
+	for (uint32_t i = 0; i < count; i++) {
+		u_graphics_buffer_unref(&tex[i]);
+	}
+	if (fence != NULL) {
+		u_graphics_sync_unref(fence);
+	}
+}
+
+//! Caller holds link_lock: drop a ring / fence nobody took.
+static void
+link_drop_pending_locked(struct scam_link *l)
+{
+	if (l->ring_pending) {
+		link_close_handles(l->tex, l->tex_count, NULL);
+		l->tex_count = 0;
+		l->ring_pending = false;
+	}
+	if (l->fence_pending) {
+		u_graphics_sync_unref(&l->fence);
+		l->fence_pending = false;
+	}
+}
+
+//! Caller holds link_lock.
+static void
+link_free_locked(struct scam_link *l)
+{
+	link_drop_pending_locked(l);
+	for (uint32_t i = 0; i < XRT_SHARE_LINK_RING_SLOTS; i++) {
+		free(l->cpu_slots[i]);
+		l->cpu_slots[i] = NULL;
+	}
+	memset(l, 0, sizeof(*l));
+}
+
+static void
+link_poll_from_locked(struct scam_link *l, struct xrt_share_link_poll *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->state = l->state;
+	out->eye_w = l->eye_w;
+	out->eye_h = l->eye_h;
+	out->fps = l->fps;
+	out->stream_generation = l->stream_generation;
+	if (l->state == XRT_SHARE_LINK_STATE_SHARE_STOPPED) {
+		l->state = XRT_SHARE_LINK_STATE_NONE; // reported once
+	}
+}
+
+/*!
+ * Register (or update) the link of connection @p client_id. @p exe_path /
+ * @p pid: OS-derived. Changes that alter the listing ask for an app rescan.
+ */
 static xrt_result_t
-src_open(struct ipc_server_stereo_camera *m, uint32_t source, struct u_stereo_uvc *uvc, uint32_t index, void **out)
+link_register(struct ipc_server_stereo_camera *m,
+              uint32_t client_id,
+              long pid,
+              const char *exe_path,
+              bool fake,
+              const struct xrt_share_link_registration *reg)
+{
+	bool first = false, relist = false;
+	os_mutex_lock(&m->link_lock);
+	struct scam_link *l = link_find_locked(m, client_id);
+	if (l == NULL) {
+		for (uint32_t i = 0; m->links != NULL && i < LINK_MAX && l == NULL; i++) {
+			if (!m->links[i].used) {
+				l = &m->links[i];
+			}
+		}
+		if (l == NULL) {
+			os_mutex_unlock(&m->link_lock);
+			U_LOG_W("app share: more than %d service links — connection %u not registered", LINK_MAX,
+			        client_id);
+			return XRT_ERROR_CLIENT_LIMIT_REACHED; // a refusal, never "the pipe died"
+		}
+		memset(l, 0, sizeof(*l));
+		l->used = true;
+		l->fake = fake;
+		l->client_id = client_id;
+		l->pid = pid;
+		l->fence = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+		snprintf(l->exe_path, sizeof(l->exe_path), "%s", exe_path != NULL ? exe_path : "");
+		first = true;
+	}
+	const struct xrt_share_link_registration was = l->reg;
+	l->reg = *reg;
+	l->reg.exe[sizeof(l->reg.exe) - 1] = '\0';
+	l->reg.app_name[sizeof(l->reg.app_name) - 1] = '\0';
+	relist = first || was.caps != l->reg.caps || was.opt_out != l->reg.opt_out ||
+	         was.session_running != l->reg.session_running || was.tap_available != l->reg.tap_available ||
+	         was.tap_unavailable_reason != l->reg.tap_unavailable_reason || was.tier != l->reg.tier ||
+	         was.luid_valid != l->reg.luid_valid || memcmp(was.luid, l->reg.luid, sizeof(was.luid)) != 0 ||
+	         strcmp(was.app_name, l->reg.app_name) != 0;
+	bool log_mismatch = false;
+	if (!fake && !l->identity_mismatch_logged && l->reg.pid != 0 && (long)l->reg.pid != pid) {
+		l->identity_mismatch_logged = true;
+		log_mismatch = true;
+	}
+	const struct xrt_share_link_registration r = l->reg;
+	os_mutex_unlock(&m->link_lock);
+
+	if (log_mismatch) {
+		U_LOG_W("app share: service link %u says pid %u, the OS says %ld — the OS-derived one is listed",
+		        client_id, r.pid, pid);
+	}
+	if (first) {
+		U_LOG_W(
+		    "app share: in-process service link %u registered — \"%s\" (%s, pid %ld), caps 0x%x, tier %u, "
+		    "tap %s, session %s%s",
+		    client_id, r.app_name, exe_path != NULL ? exe_path : "?", pid, r.caps, r.tier,
+		    r.tap_available ? "available" : "none", r.session_running ? "running" : "not running",
+		    r.opt_out ? ", OPTED OUT" : "");
+	}
+	if (relist) {
+		ipc_server_stereo_camera_apps_changed(m);
+	}
+	return XRT_SUCCESS;
+}
+
+static void
+link_poll(struct ipc_server_stereo_camera *m, uint32_t client_id, struct xrt_share_link_poll *out)
+{
+	memset(out, 0, sizeof(*out));
+	os_mutex_lock(&m->link_lock);
+	struct scam_link *l = link_find_locked(m, client_id);
+	if (l != NULL) {
+		link_poll_from_locked(l, out);
+	}
+	os_mutex_unlock(&m->link_lock);
+}
+
+//! Takes ownership of @p tex. A ring for a stream that is no longer asked for is dropped (not an error).
+static xrt_result_t
+link_publish_ring(struct ipc_server_stereo_camera *m,
+                  uint32_t client_id,
+                  const struct xrt_share_link_ring_desc *desc,
+                  const xrt_graphics_buffer_handle_t *tex_in,
+                  uint32_t tex_count)
+{
+	xrt_graphics_buffer_handle_t tex[XRT_SHARE_LINK_RING_SLOTS];
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < tex_count; i++) {
+		if (n < XRT_SHARE_LINK_RING_SLOTS) {
+			tex[n++] = tex_in[i];
+		} else {
+			xrt_graphics_buffer_handle_t h = tex_in[i];
+			u_graphics_buffer_unref(&h); // the wire is not trusted
+		}
+	}
+	const bool shape_ok = desc->slot_count <= XRT_SHARE_LINK_RING_SLOTS && (n == 0 || n == desc->slot_count) &&
+	                      (desc->slot_count == 0 || (desc->slot_width >= 2 && desc->slot_height >= 1 &&
+	                                                 desc->slot_width <= 16384 && desc->slot_height <= 16384));
+	os_mutex_lock(&m->link_lock);
+	struct scam_link *l = link_find_locked(m, client_id);
+	// A real app's ring has one texture per slot; only the service's own fake
+	// (DXR_APP_SHARE_FAKE=link) publishes a CPU ring without handles.
+	const bool handles_ok = l != NULL && (l->fake ? n == 0 : n == desc->slot_count);
+	if (l == NULL || !shape_ok || !handles_ok) {
+		os_mutex_unlock(&m->link_lock);
+		if (l != NULL && shape_ok && !handles_ok) {
+			U_LOG_W(
+			    "app share: service link %u published a ring with %u texture(s) for %u slot(s) — refused",
+			    client_id, n, desc->slot_count);
+		}
+		link_close_handles(tex, n, NULL);
+		// Logical refusals are never XRT_ERROR_IPC_FAILURE: the client reads that
+		// as "the pipe died" and would drop its live lift streams.
+		return l == NULL ? XRT_ERROR_OUTPUT_REQUEST_FAILURE : XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	if (l->state != XRT_SHARE_LINK_STATE_SHARE_REQUESTED || desc->stream_generation != l->stream_generation) {
+		os_mutex_unlock(&m->link_lock);
+		link_close_handles(tex, n, NULL); // a stale ring: nobody asks for it any more
+		return XRT_SUCCESS;
+	}
+	if (l->ring_pending) {
+		link_close_handles(l->tex, l->tex_count, NULL);
+	}
+	l->ring = *desc;
+	memcpy(l->tex, tex, sizeof(tex[0]) * n);
+	l->tex_count = n;
+	l->ring_pending = true;
+	l->ring_ns = os_monotonic_get_ns();
+	l->content_w = desc->content_width;
+	l->content_h = desc->content_height;
+	if (l->fence_pending && l->fence_generation != desc->generation) {
+		u_graphics_sync_unref(&l->fence);
+		l->fence_pending = false;
+	}
+	os_cond_broadcast(&m->link_cond);
+	os_mutex_unlock(&m->link_lock);
+	return XRT_SUCCESS;
+}
+
+//! Takes ownership of @p fence.
+static xrt_result_t
+link_publish_fence(struct ipc_server_stereo_camera *m,
+                   uint32_t client_id,
+                   uint32_t generation,
+                   xrt_graphics_sync_handle_t fence)
+{
+	os_mutex_lock(&m->link_lock);
+	struct scam_link *l = link_find_locked(m, client_id);
+	if (l == NULL) {
+		os_mutex_unlock(&m->link_lock);
+		u_graphics_sync_unref(&fence);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown link: a refusal, not a dead pipe
+	}
+	if (l->fence_pending) {
+		u_graphics_sync_unref(&l->fence);
+	}
+	l->fence = fence;
+	l->fence_generation = generation;
+	l->fence_pending = true;
+	os_cond_broadcast(&m->link_cond);
+	os_mutex_unlock(&m->link_lock);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+link_frame_ready(struct ipc_server_stereo_camera *m,
+                 uint32_t client_id,
+                 const struct xrt_share_link_frame *frame,
+                 struct xrt_share_link_poll *out)
+{
+	memset(out, 0, sizeof(*out));
+	os_mutex_lock(&m->link_lock);
+	struct scam_link *l = link_find_locked(m, client_id);
+	if (l == NULL) {
+		os_mutex_unlock(&m->link_lock);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown link: a refusal, not a dead pipe
+	}
+	if (l->state == XRT_SHARE_LINK_STATE_SHARE_REQUESTED) {
+		l->frame = *frame; // latest-wins
+		l->frame_seq++;
+		l->last_frame_ns = os_monotonic_get_ns();
+		os_cond_broadcast(&m->link_cond);
+	}
+	link_poll_from_locked(l, out);
+	os_mutex_unlock(&m->link_lock);
+	return XRT_SUCCESS;
+}
+
+/*!
+ * The link of connection @p client_id went away (its connection closed): its
+ * entry ends SOURCE_LOST (the app is gone, as far as sharing knows), then the
+ * link and every handle it still held are freed. No lock held.
+ */
+static void
+link_unregister(struct ipc_server_stereo_camera *m, uint32_t client_id)
+{
+	os_mutex_lock(&m->link_lock);
+	const bool known = link_find_locked(m, client_id) != NULL;
+	os_mutex_unlock(&m->link_lock);
+	if (!known) {
+		return;
+	}
+	bool any = false;
+	os_mutex_lock(&m->lock);
+	const int64_t now = os_monotonic_get_ns();
+	for (uint32_t i = 0; i < APP_MAX; i++) {
+		struct scam_camera *a = &m->apps[i];
+		if (a->source == XRT_STEREO_CAMERA_SOURCE_APP_LINK && a->app.live && a->app.client_id == client_id) {
+			any |= app_mark_gone_locked(m, a, now, false, "app exited (its service link closed)");
+		}
+	}
+	if (any) {
+		notify_cameras_changed_locked(m);
+	}
+	os_mutex_unlock(&m->lock);
+
+	os_mutex_lock(&m->link_lock);
+	struct scam_link *l = link_find_locked(m, client_id);
+	if (l != NULL) {
+		link_free_locked(l);
+	}
+	os_cond_broadcast(&m->link_cond); // a waiting source sees its link gone
+	os_mutex_unlock(&m->link_lock);
+	share_forget_drain(m);
+	if (any) {
+		indicator_changed(m);
+	}
+}
+
+static xrt_result_t
+link_share_open(
+    struct ipc_server_stereo_camera *m, uint32_t client_id, uint32_t eye_w, uint32_t eye_h, float fps, void **out)
+{
+	struct scam_link_src *src = U_TYPED_CALLOC(struct scam_link_src);
+	if (src == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	os_mutex_lock(&m->link_lock);
+	struct scam_link *l = link_find_locked(m, client_id);
+	if (l == NULL) {
+		os_mutex_unlock(&m->link_lock);
+		free(src);
+		return XRT_ERROR_IPC_FAILURE; // its app went between the listing and the start
+	}
+	if (!l->fake &&
+	    (!g_platform_set || g_platform.share_link_import == NULL || g_platform.share_link_convert == NULL)) {
+		os_mutex_unlock(&m->link_lock);
+		free(src);
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // no importer here (listed UNAVAILABLE, no tap)
+	}
+	link_drop_pending_locked(l); // rings of an earlier stream
+	l->stream_generation++;
+	l->state = XRT_SHARE_LINK_STATE_SHARE_REQUESTED;
+	l->eye_w = eye_w;
+	l->eye_h = eye_h;
+	l->fps = fps;
+	src->client_id = client_id;
+	src->stream_generation = l->stream_generation;
+	src->eye_w = eye_w;
+	src->eye_h = eye_h;
+	src->fake = l->fake;
+	src->last_seq = l->frame_seq;
+	const uint32_t sg = l->stream_generation;
+	os_cond_broadcast(&m->link_cond);
+	os_mutex_unlock(&m->link_lock);
+	U_LOG_W("app share: SHARE_REQUESTED on service link %u (stream generation %u, %ux%u per eye @ %.0f Hz)",
+	        client_id, sg, eye_w, eye_h, fps);
+	*out = src;
+	return XRT_SUCCESS;
+}
+
+static void
+link_share_close(struct ipc_server_stereo_camera *m, struct scam_link_src *src)
+{
+	// Release the service's references to the app's ring FIRST, then tell the
+	// app SHARE_STOPPED: once it hears that it may free the ring.
+	if (src->imported && !src->fake && g_platform_set && g_platform.share_link_unimport != NULL) {
+		g_platform.share_link_unimport(g_platform.ctx, src->import); // validated with import at install
+	}
+	src->imported = false;
+	src->import = NULL;
+	os_mutex_lock(&m->link_lock);
+	struct scam_link *l = link_find_locked(m, src->client_id);
+	if (l != NULL && l->stream_generation == src->stream_generation &&
+	    l->state == XRT_SHARE_LINK_STATE_SHARE_REQUESTED) {
+		l->state = XRT_SHARE_LINK_STATE_SHARE_STOPPED;
+		link_drop_pending_locked(l);
+	}
+	os_cond_broadcast(&m->link_cond);
+	os_mutex_unlock(&m->link_lock);
+	U_LOG_W("app share: SHARE_STOPPED on service link %u (stream generation %u)", src->client_id,
+	        src->stream_generation);
+	free(src->cpu_frame);
+	free(src);
+}
+
+//! Camera thread only. No lock held on entry or exit.
+static uint32_t
+link_share_wait_frame(struct ipc_server_stereo_camera *m,
+                      struct scam_camera *cam,
+                      struct scam_link_src *src,
+                      int64_t timeout_ns,
+                      struct xrt_plugin_stereo_camera_frame *out)
+{
+	const int64_t deadline = os_monotonic_get_ns() + timeout_ns;
+	struct xrt_share_link_frame frame;
+	os_mutex_lock(&m->link_lock);
+	for (;;) {
+		struct scam_link *l = link_find_locked(m, src->client_id);
+		if (l == NULL || l->stream_generation != src->stream_generation ||
+		    l->state != XRT_SHARE_LINK_STATE_SHARE_REQUESTED) {
+			os_mutex_unlock(&m->link_lock);
+			return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR; // the link or the request is gone
+		}
+		// A new ring for this stream, complete with its fence when it declares
+		// one (has_fence). The fence wait is time-boxed: a fence that never
+		// comes (a failed publish_fence) fails the stream loudly.
+		const bool fence_ok =
+		    l->ring.has_fence == 0 || (l->fence_pending && l->fence_generation == l->ring.generation);
+		if (l->ring_pending && !fence_ok && os_monotonic_get_ns() - l->ring_ns > LINK_FENCE_WAIT_NS) {
+			const uint32_t g = l->ring.generation;
+			link_drop_pending_locked(l);
+			os_mutex_unlock(&m->link_lock);
+			U_LOG_W(
+			    "app share: link %u ring generation %u declared a fence that never arrived within %lld ms "
+			    "— the share ends (SOURCE_LOST)",
+			    src->client_id, g, (long long)(LINK_FENCE_WAIT_NS / 1000000));
+			src->fatal = true;
+			return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
+		}
+		if (l->ring_pending && fence_ok) {
+			struct xrt_share_link_ring_desc desc = l->ring;
+			xrt_graphics_buffer_handle_t tex[XRT_SHARE_LINK_RING_SLOTS];
+			const uint32_t n = l->tex_count;
+			memcpy(tex, l->tex, sizeof(tex[0]) * n);
+			xrt_graphics_sync_handle_t fence = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+			if (l->fence_pending) {
+				fence = l->fence;
+				l->fence_pending = false;
+			}
+			l->ring_pending = false;
+			l->tex_count = 0;
+			os_mutex_unlock(&m->link_lock);
+
+			if (src->imported && !src->fake) {
+				// The hook table is validated whole at install: unimport comes with import.
+				g_platform.share_link_unimport(g_platform.ctx, src->import);
+			}
+			src->imported = false;
+			src->import = NULL;
+			if (desc.slot_count == 0) {
+				link_close_handles(tex, n, &fence); // the app withdrew its ring
+			} else if (src->fake) {
+				link_close_handles(tex, n, &fence);
+				src->imported = true;
+			} else {
+				void *imp = NULL;
+				xrt_result_t xret = g_platform.share_link_import(g_platform.ctx, &desc, tex, n, fence,
+				                                                 src->eye_w, src->eye_h, &imp);
+				src->imported = xret == XRT_SUCCESS && imp != NULL;
+				src->import = imp;
+				if (!src->imported) {
+					U_LOG_W(
+					    "app share: link %u ring generation %u (%ux%u, format 0x%x) import FAILED "
+					    "(%d) — "
+					    "the share ends (SOURCE_LOST)",
+					    src->client_id, desc.generation, desc.slot_width, desc.slot_height,
+					    desc.format, (int)xret);
+					if (xret == XRT_SUCCESS && imp != NULL) {
+						g_platform.share_link_unimport(g_platform.ctx, imp);
+					}
+					src->import = NULL;
+					src->fatal = true;
+					return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
+				}
+				U_LOG_W("app share: link %u ring generation %u (%ux%u, format 0x%x) %s (%d)",
+				        src->client_id, desc.generation, desc.slot_width, desc.slot_height, desc.format,
+				        src->imported ? "imported" : "import FAILED", (int)xret);
+			}
+			src->ring = desc;
+			os_mutex_lock(&m->link_lock);
+			continue;
+		}
+		if (src->imported && l->frame_seq != src->last_seq) {
+			src->last_seq = l->frame_seq;
+			if (l->frame.generation == src->ring.generation && l->frame.slot < src->ring.slot_count) {
+				frame = l->frame;
+				if (src->fake) {
+					const uint8_t *slot = l->cpu_slots[frame.slot];
+					if (slot == NULL || l->cpu_slot_size == 0) {
+						continue;
+					}
+					if (src->cpu_size != l->cpu_slot_size) {
+						free(src->cpu_frame);
+						src->cpu_frame = (uint8_t *)malloc(l->cpu_slot_size);
+						src->cpu_size = src->cpu_frame != NULL ? l->cpu_slot_size : 0;
+					}
+					if (src->cpu_frame == NULL) {
+						continue;
+					}
+					memcpy(src->cpu_frame, slot, src->cpu_size);
+				}
+				break;
+			}
+			continue; // a frame of an older ring: dropped
+		}
+		const int64_t now = os_monotonic_get_ns();
+		if (now >= deadline) {
+			os_mutex_unlock(&m->link_lock);
+			return XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT;
+		}
+		os_cond_wait_timeout_ns(&m->link_cond, &m->link_lock, (uint64_t)(deadline - now));
+	}
+	os_mutex_unlock(&m->link_lock);
+
+	memset(&cam->app.frame, 0, sizeof(cam->app.frame));
+	if (src->fake) {
+		// The fake's CPU ring is SBS NV12 at the stream extent by construction.
+		const uint32_t w = src->ring.slot_width, h = src->ring.slot_height;
+		if (w != 2 * src->eye_w || h != src->eye_h || src->cpu_size < (size_t)w * h * 3 / 2) {
+			return XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT; // a ring of an older size
+		}
+		out->sequence = src->last_seq;
+		out->time_ns = frame.commit_ns;
+		out->time_is_exposure = false;
+		out->width = w;
+		out->height = h;
+		out->format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12;
+		out->planes[0] = src->cpu_frame;
+		out->planes[1] = src->cpu_frame + (size_t)w * h;
+		out->pitches[0] = w;
+		out->pitches[1] = w;
+		cam->app.frame.content_x = 0;
+		cam->app.frame.content_y = 0;
+		cam->app.frame.content_width = src->eye_w;
+		cam->app.frame.content_height = src->eye_h;
+		cam->app.frame.mono = frame.mono;
+		cam->app.frame.content_generation = frame.content_generation;
+		cam->app.frame.zero_disparity_shift_frac = frame.zero_disparity_shift_frac;
+		cam->app.frame.commit_time_ns = frame.commit_ns;
+		cam->app.frame.valid = 1;
+		return XRT_PLUGIN_STEREO_CAMERA_WAIT_OK;
+	}
+	uint32_t w = g_platform.share_link_convert(g_platform.ctx, src->import, &frame, out, &cam->app.frame);
+	cam->app.frame.valid = w == XRT_PLUGIN_STEREO_CAMERA_WAIT_OK ? 1u : 0u;
+	return w;
+}
+
+static void
+link_share_release_frame(struct scam_link_src *src)
+{
+	if (!src->fake && src->imported && g_platform_set && g_platform.share_link_release_frame != NULL) {
+		g_platform.share_link_release_frame(g_platform.ctx, src->import);
+	}
+}
+
+/*!
+ * What src_open needs of a camera, captured under the manager lock by the
+ * camera thread (a rescan may update the camera while the open runs unlocked).
+ */
+struct src_open_args
+{
+	uint32_t source;
+	struct u_stereo_uvc *uvc;
+	uint32_t index;
+	// ADR-061 app entries.
+	bool app_fake;
+	uint32_t app_client_id;
+	uint32_t eye_w, eye_h;
+	float fps;
+};
+
+static xrt_result_t
+src_open(struct ipc_server_stereo_camera *m, const struct src_open_args *a, void **out)
 {
 	*out = NULL;
-	if (source == XRT_STEREO_CAMERA_SOURCE_UVC) {
+	if (a->source == XRT_STEREO_CAMERA_SOURCE_UVC) {
 		struct u_stereo_uvc_stream *s = NULL;
-		xrt_result_t xret = u_stereo_uvc_open(uvc, index, &s);
+		xrt_result_t xret = u_stereo_uvc_open(a->uvc, a->index, &s);
 		*out = s;
 		return xret;
 	}
+	if (a->source == XRT_STEREO_CAMERA_SOURCE_APP) {
+		if (a->app_fake) {
+			struct u_app_share_fake *f = u_app_share_fake_create(a->eye_w, a->eye_h, a->fps);
+			*out = f;
+			return f != NULL ? XRT_SUCCESS : XRT_ERROR_ALLOCATION;
+		}
+		if (!g_platform_set || g_platform.share_tap_attach == NULL) {
+			return XRT_ERROR_FEATURE_NOT_SUPPORTED; // no tap on this platform (listed UNAVAILABLE)
+		}
+		return g_platform.share_tap_attach(g_platform.ctx, a->app_client_id, a->eye_w, a->eye_h, a->fps, out);
+	}
+	if (a->source == XRT_STEREO_CAMERA_SOURCE_APP_LINK) {
+		// ADR-061 decision 9: queue SHARE_REQUESTED on the app's service link.
+		return link_share_open(m, a->app_client_id, a->eye_w, a->eye_h, a->fps, out);
+	}
 	struct xrt_plugin_stereo_camera *pc = NULL;
-	xrt_result_t xret = m->iface->stereo_camera_open(m->inst, index, &pc);
+	xrt_result_t xret = m->iface->stereo_camera_open(m->inst, a->index, &pc);
 	*out = pc;
 	return xret;
 }
 
+//! Camera thread only (writes cam->app.frame, which only this thread reads).
 static uint32_t
 src_wait_frame(struct ipc_server_stereo_camera *m,
-               const struct scam_camera *cam,
+               struct scam_camera *cam,
                void *src,
                int64_t timeout_ns,
                struct xrt_plugin_stereo_camera_frame *out)
 {
 	if (cam->source == XRT_STEREO_CAMERA_SOURCE_UVC) {
 		return u_stereo_uvc_wait_frame((struct u_stereo_uvc_stream *)src, timeout_ns, out);
+	}
+	if (cam->source == XRT_STEREO_CAMERA_SOURCE_APP) {
+		memset(&cam->app.frame, 0, sizeof(cam->app.frame));
+		if (cam->app.fake) {
+			struct u_app_share_fake_frame ff;
+			if (!u_app_share_fake_next((struct u_app_share_fake *)src, timeout_ns, &ff)) {
+				return XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT;
+			}
+			out->sequence = ff.sequence;
+			out->time_ns = ff.time_ns;
+			out->time_is_exposure = false;
+			out->width = ff.width;
+			out->height = ff.height;
+			out->format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12;
+			out->planes[0] = ff.planes[0];
+			out->planes[1] = ff.planes[1];
+			out->pitches[0] = ff.pitches[0];
+			out->pitches[1] = ff.pitches[1];
+			// Display-referred and full-frame by construction (spec v1: shift 0).
+			cam->app.frame.content_x = 0;
+			cam->app.frame.content_y = 0;
+			cam->app.frame.content_width = ff.width / 2;
+			cam->app.frame.content_height = ff.height;
+			cam->app.frame.mono = 0;
+			cam->app.frame.content_generation = 1;
+			cam->app.frame.zero_disparity_shift_frac = 0.0f;
+			cam->app.frame.commit_time_ns = ff.time_ns;
+			cam->app.frame.valid = 1;
+			return XRT_PLUGIN_STEREO_CAMERA_WAIT_OK;
+		}
+		if (!g_platform_set || g_platform.share_tap_wait_frame == NULL) {
+			return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
+		}
+		uint32_t w = g_platform.share_tap_wait_frame(g_platform.ctx, src, timeout_ns, out, &cam->app.frame);
+		cam->app.frame.valid = w == XRT_PLUGIN_STEREO_CAMERA_WAIT_OK ? 1u : 0u;
+		return w;
+	}
+	if (cam->source == XRT_STEREO_CAMERA_SOURCE_APP_LINK) {
+		return link_share_wait_frame(m, cam, (struct scam_link_src *)src, timeout_ns, out);
 	}
 	return m->iface->stereo_camera_wait_frame((struct xrt_plugin_stereo_camera *)src, timeout_ns, out);
 }
@@ -1268,6 +2145,16 @@ src_release_frame(struct ipc_server_stereo_camera *m, const struct scam_camera *
 		u_stereo_uvc_release_frame((struct u_stereo_uvc_stream *)src);
 		return;
 	}
+	if (cam->source == XRT_STEREO_CAMERA_SOURCE_APP) {
+		if (!cam->app.fake && g_platform_set && g_platform.share_tap_release_frame != NULL) {
+			g_platform.share_tap_release_frame(g_platform.ctx, src);
+		}
+		return;
+	}
+	if (cam->source == XRT_STEREO_CAMERA_SOURCE_APP_LINK) {
+		link_share_release_frame((struct scam_link_src *)src);
+		return;
+	}
 	m->iface->stereo_camera_release_frame((struct xrt_plugin_stereo_camera *)src);
 }
 
@@ -1276,6 +2163,19 @@ src_close(struct ipc_server_stereo_camera *m, const struct scam_camera *cam, voi
 {
 	if (cam->source == XRT_STEREO_CAMERA_SOURCE_UVC) {
 		u_stereo_uvc_close((struct u_stereo_uvc_stream *)src);
+		return;
+	}
+	if (cam->source == XRT_STEREO_CAMERA_SOURCE_APP) {
+		if (cam->app.fake) {
+			struct u_app_share_fake *f = (struct u_app_share_fake *)src;
+			u_app_share_fake_destroy(&f);
+		} else if (g_platform_set && g_platform.share_tap_detach != NULL) {
+			g_platform.share_tap_detach(g_platform.ctx, src);
+		}
+		return;
+	}
+	if (cam->source == XRT_STEREO_CAMERA_SOURCE_APP_LINK) {
+		link_share_close(m, (struct scam_link_src *)src); // queues SHARE_STOPPED
 		return;
 	}
 	m->iface->stereo_camera_close((struct xrt_plugin_stereo_camera *)src);
@@ -1913,6 +2813,8 @@ publish_locked(struct ipc_server_stereo_camera *m,
 		fi->time_is_exposure = f->time_is_exposure ? 1u : 0u;
 		fi->output = s->output;
 		fi->calibration_generation = cam->calibration_generation;
+		// ADR-061: the per-frame app metadata rides the acquire reply, not the ring.
+		s->slot_app[slot] = cam_is_app(cam) ? cam->app.frame : (struct xrt_app_share_frame_info){0};
 		u_stereo_camera_ring_publish(&s->ring, slot, f->sequence);
 
 		int64_t pub = os_monotonic_get_ns();
@@ -1956,14 +2858,22 @@ camera_thread(void *ptr)
 		int64_t now = os_monotonic_get_ns();
 
 		// Idle: close the source once the linger expires, then sleep until a
-		// stream starts (or the manager shuts down).
-		if (cam->started_count == 0 && (cam->src == NULL || now >= cam->linger_deadline_ns)) {
+		// stream starts (or the manager shuts down). ADR-061: an app entry
+		// whose app is gone closes (detaches its tap) at once — its
+		// compositor is being torn down.
+		const bool app_gone = cam_is_app(cam) && !cam->app.live;
+		if (cam->started_count == 0 && (cam->src == NULL || now >= cam->linger_deadline_ns || app_gone)) {
 			if (cam->src != NULL) {
 				void *src = cam->src;
 				cam->src = NULL;
+				cam->opening = true; // app_session_ending waits until the close is done
 				os_mutex_unlock(&m->lock);
 				src_close(m, cam, src);
 				os_mutex_lock(&m->lock);
+				cam->opening = false;
+				if (cam_is_app(cam)) {
+					os_cond_broadcast(&m->app_closed_cond);
+				}
 				U_LOG_W("stereo camera %llu: source closed (no started stream for %lld ms)",
 				        (unsigned long long)cam->camera_id, (long long)(LINGER_NS / 1000000));
 				cam->last_frame_ns = 0;
@@ -1979,7 +2889,7 @@ camera_thread(void *ptr)
 		}
 
 		if (cam->src == NULL) {
-			if (cam->gone) {
+			if (cam->gone || (cam_is_app(cam) && !cam->app.live)) {
 				// #1961: its source no longer lists it — never open a stale
 				// index (it may name another device now). Start refuses BUSY.
 				os_cond_wait_timeout_ns(&cam->cond, &m->lock, (uint64_t)REOPEN_BACKOFF_NS);
@@ -1990,12 +2900,19 @@ camera_thread(void *ptr)
 				continue;
 			}
 			void *src = NULL;
-			const uint32_t source = cam->source;
-			struct u_stereo_uvc *uvc = cam->uvc;
-			const uint32_t src_index = cam->source_index;
+			const struct src_open_args oa = {
+			    .source = cam->source,
+			    .uvc = cam->uvc,
+			    .index = cam->source_index,
+			    .app_fake = cam->app.fake,
+			    .app_client_id = cam->app.client_id,
+			    .eye_w = cam->info.eye_width,
+			    .eye_h = cam->info.eye_height,
+			    .fps = cam->info.max_frame_rate,
+			};
 			cam->opening = true; // a rescan leaves uvc / source_index alone meanwhile
 			os_mutex_unlock(&m->lock);
-			xrt_result_t xret = src_open(m, source, uvc, src_index, &src);
+			xrt_result_t xret = src_open(m, &oa, &src);
 			os_mutex_lock(&m->lock);
 			cam->opening = false;
 			if (xret != XRT_SUCCESS || src == NULL) {
@@ -2044,6 +2961,15 @@ camera_thread(void *ptr)
 
 		switch (w) {
 		case XRT_PLUGIN_STEREO_CAMERA_WAIT_OK: {
+			if (cam_is_app(cam) && !cam->app.live) {
+				// ADR-061: a frame that was in flight when the app went: never
+				// published (it would flip the entry back to AVAILABLE). The tap's
+				// release hook is never called with the manager lock held.
+				os_mutex_unlock(&m->lock);
+				src_release_frame(m, cam, src);
+				os_mutex_lock(&m->lock);
+				break;
+			}
 			cam->streamed = true;
 			// R2: rectify once per source frame, outside the lock (only this
 			// thread touches cam->rect after create), only if someone wants it.
@@ -2066,7 +2992,14 @@ camera_thread(void *ptr)
 				rfp = ok ? &rf : NULL;
 			}
 			publish_locked(m, cam, &f, rfp, now);
-			src_release_frame(m, cam, src);
+			if (cam_is_app(cam)) {
+				// ADR-061: platform share-tap hooks never run under the manager lock.
+				os_mutex_unlock(&m->lock);
+				src_release_frame(m, cam, src);
+				os_mutex_lock(&m->lock);
+			} else {
+				src_release_frame(m, cam, src);
+			}
 			break;
 		}
 		case XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT:
@@ -2098,6 +3031,22 @@ camera_thread(void *ptr)
 		default:
 			U_LOG_W("stereo camera %llu: %s source reported an error; closing, retry in 1 s",
 			        (unsigned long long)cam->camera_id, source_str(cam->source));
+			if (cam_is_app(cam)) {
+				// ADR-061: the tap lost its compositor; the rescan decides whether the
+				// app is gone (SOURCE_LOST) or the next start may try again.
+				m->apps_dirty = true;
+				os_cond_broadcast(&m->watch_cond);
+			}
+			if (cam->source == XRT_STEREO_CAMERA_SOURCE_APP_LINK && ((struct scam_link_src *)src)->fatal) {
+				// Arm 2: the app's ring is unusable (import failed / no fence): end
+				// the share instead of reopening into the same failure. The close
+				// below queues SHARE_STOPPED on the link.
+				const uint32_t ended = app_end_streams_locked(m, cam);
+				U_LOG_W(
+				    "app share %llu \"%s\": the app's ring could not be used — %u stream(s) ended "
+				    "SOURCE_LOST",
+				    (unsigned long long)cam->camera_id, cam->info.display_name, ended);
+			}
 			if (g_platform.gave_up_is_suspended && cam->streamed) {
 				// A2 (Android): a source that delivered and then lost the device
 				// lost it to the OS (app in the background, sensor privacy):
@@ -2848,6 +3797,642 @@ rescan(struct ipc_server_stereo_camera *m, bool force, bool initial)
 	return changed;
 }
 
+/*
+ *
+ * ADR-061 app entries: the app table, rebuilt from the live connections.
+ *
+ * Rules (spec §2 "Which apps are listed" / "Lifetime of an entry"):
+ *  - a candidate is a connection with a session AND a projection compositor,
+ *    except CONTROLLER, DIAG, CAMERA_CONSUMER and PRESENT_OWNER clients (a
+ *    present-owner is a browser: its pages carry other origins' content) and
+ *    sessions that opted out (XrSessionShareabilityDXR). The consumer's own
+ *    process is filtered per consumer at enumeration time;
+ *  - a candidate the platform cannot tap is LISTED UNAVAILABLE with a reason
+ *    (no tap hooks = "no tap on this platform": the macOS / Linux service);
+ *  - an entry keeps its camera_id while its app runs, and the same
+ *    (executable, instance ordinal) gets the same id back within this service
+ *    run; an exited app's entry stays UNAVAILABLE for app_linger_ns (its
+ *    streams end SOURCE_LOST at once), then leaves the list; an opted-out
+ *    session leaves the list at once;
+ *  - app entries come after every camera, so no camera index moves.
+ * Every change queues XrEventDataStereoCamerasChangedDXR.
+ *
+ */
+
+//! One candidate connection, staged without the manager lock.
+struct app_cand
+{
+	uint32_t client_id;
+	long pid;
+	bool opted_out;
+	char exe_path[U_CAMERA_CONSENT_EXE_MAX];
+	char app_name[XRT_APP_SHARE_APPLICATION_NAME_SIZE];
+	struct xrt_app_share_source_info q; //!< the platform's description
+	int64_t last_commit_ns;
+	bool matched;
+	//! XRT_STEREO_CAMERA_SOURCE_APP (a session on its IPC connection) or _APP_LINK (an in-process service link).
+	uint32_t source;
+	struct xrt_share_link_registration reg; //!< APP_LINK: the link's registration
+	uint32_t link_content_w, link_content_h;
+};
+
+static const char *
+path_base(const char *path)
+{
+	const char *b = path;
+	for (const char *p = path; *p != '\0'; p++) {
+		if (*p == '/' || *p == '\\') {
+			b = p + 1;
+		}
+	}
+	return b;
+}
+
+//! The share stream size + rate of a new app entry (`share.resolution`).
+static void
+app_stream_extent(struct ipc_server_stereo_camera *m, uint32_t *w, uint32_t *h, float *fps)
+{
+	enum u_app_share_resolution r = U_APP_SHARE_RESOLUTION_720P;
+	if (m->share_resolution_override == 1) {
+		r = U_APP_SHARE_RESOLUTION_720P;
+	} else if (m->share_resolution_override == 2) {
+		r = U_APP_SHARE_RESOLUTION_1080P;
+	} else {
+		struct u_app_share_settings st;
+		u_app_share_settings_load(&st);
+		r = st.resolution;
+	}
+	u_app_share_resolution_extent(r, w, h, fps);
+}
+
+//! The camera_id (exe, ordinal) had earlier in this run, or a fresh one remembered for it.
+static uint64_t
+app_id_for_locked(struct ipc_server_stereo_camera *m, const char *exe, uint32_t ordinal)
+{
+	for (uint32_t i = 0; i < APP_ID_MEMORY; i++) {
+		if (m->app_ids[i].camera_id != 0 && m->app_ids[i].ordinal == ordinal &&
+		    strcmp(m->app_ids[i].exe, exe) == 0) {
+			return m->app_ids[i].camera_id;
+		}
+	}
+	uint64_t id = ++m->next_camera_id; // shared with cameras: ids never collide, never reused
+	uint32_t k = m->app_id_next++ % APP_ID_MEMORY;
+	snprintf(m->app_ids[k].exe, sizeof(m->app_ids[k].exe), "%s", exe);
+	m->app_ids[k].ordinal = ordinal;
+	m->app_ids[k].camera_id = id;
+	return id;
+}
+
+//! Is any stream still pointing at app slot @p cam (an ended one waiting for destroy, too)?
+static bool
+app_slot_referenced_locked(struct ipc_server_stereo_camera *m, const struct scam_camera *cam)
+{
+	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
+		if (m->streams[i].used && m->streams[i].camera == cam->index) {
+			return true;
+		}
+	}
+	return cam->src != NULL || cam->opening || cam->started_count > 0;
+}
+
+//! The state an idle app entry reports from its description (a running stream's thread overrides it).
+static uint32_t
+app_idle_state(const struct scam_camera *cam, int64_t now)
+{
+	if (!cam->app.live || cam->app.desc.availability != XRT_APP_SHARE_AVAILABLE) {
+		return XRT_STEREO_CAMERA_STATE_UNAVAILABLE;
+	}
+	if (cam->app.last_commit_ns > 0 && now - cam->app.last_commit_ns > SUSPEND_AFTER_NS) {
+		return XRT_STEREO_CAMERA_STATE_SUSPENDED;
+	}
+	return XRT_STEREO_CAMERA_STATE_AVAILABLE;
+}
+
+//! End every stream of app entry @p cam with SOURCE_LOST; returns how many.
+static uint32_t
+app_end_streams_locked(struct ipc_server_stereo_camera *m, struct scam_camera *cam)
+{
+	uint32_t ended = 0;
+	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
+		struct scam_stream *s = &m->streams[i];
+		if (s->used && s->camera == cam->index && !s->ended) {
+			stream_end_locked(m, s, XRT_STEREO_CAMERA_END_SOURCE_LOST);
+			ended++;
+		}
+	}
+	return ended;
+}
+
+/*!
+ * The app of entry @p cam is gone (exited, session destroyed, or opted out):
+ * UNAVAILABLE, streams SOURCE_LOST, its per-app-run grants die, and the camera
+ * thread detaches the tap. @p delist: leave the list now (opt-out) instead of
+ * after the linger.
+ */
+static bool
+app_mark_gone_locked(
+    struct ipc_server_stereo_camera *m, struct scam_camera *cam, int64_t now, bool delist, const char *why)
+{
+	if (!cam->app.live && (!delist || !cam->app.listed)) {
+		return false;
+	}
+	cam->app.live = false;
+	cam->app.exited_ns = now;
+	cam->app.desc.availability = XRT_APP_SHARE_UNAVAILABLE_EXITED;
+	// Its per-app-run grants die with it (applied by share_forget_drain).
+	if (m->share_forget_count < sizeof(m->share_forget) / sizeof(m->share_forget[0])) {
+		m->share_forget[m->share_forget_count++] = cam->camera_id;
+	} else {
+		m->share_forget[0] = UINT64_MAX; // overflow: forget everything (a grant only saves a prompt)
+	}
+	uint32_t ended = app_end_streams_locked(m, cam);
+	set_state_locked(cam, XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+	if (delist) {
+		cam->app.listed = false;
+	}
+	os_cond_signal(&cam->cond); // the camera thread closes the source now (no linger)
+	U_LOG_W("app share %llu \"%s\" (pid %ld): %s — UNAVAILABLE%s, %u stream(s) ended SOURCE_LOST",
+	        (unsigned long long)cam->camera_id, cam->info.display_name, cam->app.pid, why,
+	        delist ? " and unlisted" : " (listed while it lingers)", ended);
+	return true;
+}
+
+/*!
+ * Apply the pending per-app-run grant forgets (ADR-061 spec §6: a grant
+ * lasts until the shared app exits). Call with NO lock held.
+ */
+static void
+share_forget_drain(struct ipc_server_stereo_camera *m)
+{
+	uint64_t keys[APP_MAX * 2];
+	os_mutex_lock(&m->lock);
+	const uint32_t n = m->share_forget_count;
+	memcpy(keys, m->share_forget, sizeof(keys[0]) * n);
+	m->share_forget_count = 0;
+	os_mutex_unlock(&m->lock);
+	if (n == 0) {
+		return;
+	}
+	os_mutex_lock(&m->consent_lock);
+	for (uint32_t i = 0; i < n; i++) {
+		if (keys[i] == UINT64_MAX) {
+			u_app_share_consent_forget_all(&m->share);
+		} else {
+			u_app_share_consent_forget_app(&m->share, keys[i]);
+		}
+	}
+	os_mutex_unlock(&m->consent_lock);
+}
+
+//! Describe a candidate through the platform tap (no manager lock held).
+static void
+app_query(struct app_cand *c)
+{
+	memset(&c->q, 0, sizeof(c->q));
+	c->q.pid = (uint64_t)c->pid;
+	snprintf(c->q.executable_name, sizeof(c->q.executable_name), "%s", path_base(c->exe_path));
+	snprintf(c->q.application_name, sizeof(c->q.application_name), "%s", c->app_name);
+	c->q.source = XRT_STEREO_CAMERA_SOURCE_APP;
+	c->q.view_count = 2;
+	c->q.active_view_count = 2;
+	c->last_commit_ns = 0;
+	if (!g_platform_set || g_platform.share_tap_query == NULL) {
+		c->q.availability = XRT_APP_SHARE_UNAVAILABLE_NO_TAP;
+		return;
+	}
+	c->q.availability = XRT_APP_SHARE_AVAILABLE;
+	if (!g_platform.share_tap_query(g_platform.ctx, c->client_id, &c->q, &c->last_commit_ns)) {
+		if (c->q.availability == XRT_APP_SHARE_AVAILABLE) {
+			c->q.availability = XRT_APP_SHARE_UNAVAILABLE_NO_COMPOSITOR;
+		}
+	}
+	// The manager's facts win over anything the hook wrote.
+	c->q.pid = (uint64_t)c->pid;
+	snprintf(c->q.executable_name, sizeof(c->q.executable_name), "%s", path_base(c->exe_path));
+	snprintf(c->q.application_name, sizeof(c->q.application_name), "%s", c->app_name);
+	c->q.source = XRT_STEREO_CAMERA_SOURCE_APP;
+}
+
+/*!
+ * Describe an in-process service link (ADR-061 decision 9, spec §3): AVAILABLE
+ * only when the app's compositor can tap (Windows fill arm), its ring lives on
+ * the adapter the service publishes, and this service can import a ring;
+ * otherwise UNAVAILABLE with the reason. No manager lock held.
+ */
+static void
+app_query_link(struct app_cand *c, bool fake)
+{
+	memset(&c->q, 0, sizeof(c->q));
+	c->q.pid = (uint64_t)c->pid;
+	snprintf(c->q.executable_name, sizeof(c->q.executable_name), "%s", path_base(c->exe_path));
+	snprintf(c->q.application_name, sizeof(c->q.application_name), "%s", c->app_name);
+	c->q.source = XRT_STEREO_CAMERA_SOURCE_APP_LINK;
+	c->q.view_count = 2;
+	c->q.active_view_count = 2;
+	c->q.content_eye_width = c->link_content_w;
+	c->q.content_eye_height = c->link_content_h;
+	c->last_commit_ns = 0; // a link reports commits only while it streams
+	const struct xrt_share_link_registration *r = &c->reg;
+	uint8_t svc_luid[XRT_LUID_SIZE] = {0};
+	const bool svc_luid_known = g_platform_set && g_platform.share_link_adapter_luid != NULL &&
+	                            g_platform.share_link_adapter_luid(g_platform.ctx, svc_luid);
+	const bool importer =
+	    fake || (g_platform_set && g_platform.share_link_import != NULL && g_platform.share_link_convert != NULL);
+	if (r->tier == XRT_SHARE_LINK_TIER_GL) {
+		c->q.availability = XRT_APP_SHARE_UNAVAILABLE_UNSUPPORTED_API;
+	} else if (r->tap_available == 0) {
+		c->q.availability =
+		    r->tap_unavailable_reason != 0 ? r->tap_unavailable_reason : XRT_APP_SHARE_UNAVAILABLE_NO_TAP;
+	} else if (r->luid_valid != 0 && svc_luid_known && memcmp(r->luid, svc_luid, XRT_LUID_SIZE) != 0) {
+		c->q.availability = XRT_APP_SHARE_UNAVAILABLE_OTHER_ADAPTER;
+	} else if (!importer) {
+		c->q.availability = XRT_APP_SHARE_UNAVAILABLE_NO_TAP;
+	} else {
+		c->q.availability = XRT_APP_SHARE_AVAILABLE;
+	}
+}
+
+//! Fill a fresh app slot from @p c (manager lock held; the slot is unreferenced).
+/*!
+ * Fill a fresh app slot from @p c (manager lock held; the slot is
+ * unreferenced). @p w / @p h / @p fps: the share stream size, resolved from
+ * `share.resolution` BEFORE the lock was taken (it may read the user store).
+ */
+static void
+app_insert_locked(struct ipc_server_stereo_camera *m,
+                  struct scam_camera *cam,
+                  const struct app_cand *c,
+                  int64_t now,
+                  uint32_t w,
+                  uint32_t h,
+                  float fps)
+{
+	uint32_t ordinal = 0;
+	for (bool clash = true; clash; ordinal++) {
+		clash = false;
+		for (uint32_t i = 0; i < APP_MAX; i++) {
+			const struct scam_camera *o = &m->apps[i];
+			clash |= o != cam && o->app.listed && o->app.live && o->app.ordinal == ordinal &&
+			         strcmp(o->app.exe_path, c->exe_path) == 0;
+		}
+		if (!clash) {
+			break;
+		}
+	}
+	// ADR-061 spec §2: one cameraId per running app. The same (exe, ordinal)
+	// relaunching while its old entry still lingers takes the id over (via
+	// app_id_for_locked) and the lingering entry leaves the list now — never
+	// two listed rows with one cameraId.
+	for (uint32_t i = 0; i < APP_MAX; i++) {
+		struct scam_camera *o = &m->apps[i];
+		if (o != cam && o->app.listed && !o->app.live && o->app.ordinal == ordinal &&
+		    strcmp(o->app.exe_path, c->exe_path) == 0) {
+			o->app.listed = false;
+			U_LOG_W("app share %llu \"%s\": relaunched while its exited entry lingered — the new instance "
+			        "takes the id, the old entry leaves the list",
+			        (unsigned long long)o->camera_id, o->info.display_name);
+		}
+	}
+
+	cam->source = c->q.source == XRT_STEREO_CAMERA_SOURCE_APP_LINK ? XRT_STEREO_CAMERA_SOURCE_APP_LINK
+	                                                               : XRT_STEREO_CAMERA_SOURCE_APP;
+	cam->source_index = 0;
+	cam->uvc = NULL;
+	cam->gone = false;
+	cam->have_calib = false;
+	cam->calib_nominal = false;
+	cam->rect = NULL;
+	cam->calibration_generation = 0;
+	cam->source_rate = 0.0f;
+	cam->last_frame_ns = 0;
+	cam->streamed = false;
+	cam->retry_after_ns = 0;
+	cam->rate_logged = false;
+	u_stereo_camera_rate_meter_restart(&cam->rate_meter);
+	memset(&cam->info, 0, sizeof(cam->info));
+	cam->info.struct_size = (uint32_t)sizeof(cam->info);
+	snprintf(cam->info.display_name, sizeof(cam->info.display_name), "%s",
+	         c->app_name[0] != '\0' ? c->app_name : path_base(c->exe_path));
+	// What persistentId is keyed on (spec §2): executable path + instance ordinal.
+	snprintf(cam->info.device_identity, sizeof(cam->info.device_identity), "app:%s#%u", c->exe_path, ordinal);
+	cam->info.flags = XRT_STEREO_CAMERA_APP_CONTENT | XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED |
+	                  XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE;
+	cam->info.eye_width = w;
+	cam->info.eye_height = h;
+	cam->info.max_frame_rate = fps;
+	cam->info.native_format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12;
+
+	memset(&cam->app, 0, sizeof(cam->app));
+	cam->app.listed = true;
+	cam->app.live = true;
+	cam->app.client_id = c->client_id;
+	cam->app.pid = c->pid;
+	snprintf(cam->app.exe_path, sizeof(cam->app.exe_path), "%s", c->exe_path);
+	cam->app.ordinal = ordinal;
+	cam->app.desc = c->q;
+	cam->app.last_commit_ns = c->last_commit_ns;
+	cam->camera_id = app_id_for_locked(m, c->exe_path, ordinal);
+	cam->app.desc.camera_id = cam->camera_id;
+	cam->app.desc.instance_ordinal = ordinal;
+	cam->mgr = m;
+	cam->state = app_idle_state(cam, now);
+	U_LOG_W("app share %llu: \"%s\" (%s, pid %ld, copy #%u) listed %s%s — stream %ux%u per eye @ %.0f Hz",
+	        (unsigned long long)cam->camera_id, cam->info.display_name, path_base(c->exe_path), c->pid, ordinal,
+	        state_str(cam->state),
+	        cam->app.desc.availability == XRT_APP_SHARE_AVAILABLE            ? ""
+	        : cam->app.desc.availability == XRT_APP_SHARE_UNAVAILABLE_NO_TAP ? " (no share tap on this platform)"
+	                                                                         : " (cannot be tapped)",
+	        w, h, fps);
+}
+
+//! The synthetic DXR_APP_SHARE_FAKE entry (create time, manager lock held).
+static void
+app_insert_fake_locked(struct ipc_server_stereo_camera *m)
+{
+	struct app_cand c;
+	memset(&c, 0, sizeof(c));
+	c.pid = 0;
+	snprintf(c.exe_path, sizeof(c.exe_path), "%s", "displayxr-app-share-fake");
+	snprintf(c.app_name, sizeof(c.app_name), "%s", "DisplayXR app-share fake");
+	c.q.source = XRT_STEREO_CAMERA_SOURCE_APP;
+	snprintf(c.q.executable_name, sizeof(c.q.executable_name), "%s", c.exe_path);
+	snprintf(c.q.application_name, sizeof(c.q.application_name), "%s", c.app_name);
+	c.q.availability = XRT_APP_SHARE_AVAILABLE;
+	c.q.view_count = 2;
+	c.q.active_view_count = 2;
+	struct scam_camera *cam = &m->apps[0];
+	cam->index = APP_SLOT_BASE;
+	uint32_t w = 0, h = 0;
+	float fps = 0.0f;
+	app_stream_extent(m, &w, &h, &fps); // create time: no manager lock is held yet
+	app_insert_locked(m, cam, &c, os_monotonic_get_ns(), w, h, fps);
+	cam->app.fake = true;
+	cam->app.desc.content_eye_width = cam->info.eye_width;
+	cam->app.desc.content_eye_height = cam->info.eye_height;
+	U_LOG_W(
+	    "app share: DXR_APP_SHARE_FAKE=1 — a SYNTHETIC app source (SBS NV12, disparity ramp, zero-disparity band) "
+	    "is listed as app share %llu (diagnostics / CI only)",
+	    (unsigned long long)cam->camera_id);
+}
+
+static bool
+app_class_shareable(uint32_t cls)
+{
+	return cls != XRT_CLIENT_CLASS_CONTROLLER && cls != XRT_CLIENT_CLASS_DIAG &&
+	       cls != XRT_CLIENT_CLASS_CAMERA_CONSUMER && cls != XRT_CLIENT_CLASS_PRESENT_OWNER;
+}
+
+/*!
+ * Rebuild the app table (ADR-061 decision 4). Takes app_rescan_lock then the
+ * manager lock; call with neither held. Exe paths and the platform query run
+ * with only app_rescan_lock held. Returns true if anything a client sees changed.
+ */
+static bool
+rescan_apps(struct ipc_server_stereo_camera *m, bool force)
+{
+	if (!m->apps_enabled) {
+		return false;
+	}
+	os_mutex_lock(&m->app_rescan_lock);
+	if (!force) {
+		// An enumerate-driven rescan runs at most once a second (like rescan());
+		// a pending apps_changed() is not held back by it.
+		os_mutex_lock(&m->lock);
+		const int64_t t = os_monotonic_get_ns();
+		const bool skip =
+		    !m->apps_dirty && m->last_app_rescan_ns != 0 && t - m->last_app_rescan_ns < RESCAN_MIN_INTERVAL_NS;
+		os_mutex_unlock(&m->lock);
+		if (skip) {
+			os_mutex_unlock(&m->app_rescan_lock);
+			return false;
+		}
+	}
+	// The share stream size of any NEW entry: resolved before the manager lock
+	// (`share.resolution` may read the registry / the user's JSON store).
+	uint32_t ext_w = 0, ext_h = 0;
+	float ext_fps = 0.0f;
+	app_stream_extent(m, &ext_w, &ext_h, &ext_fps);
+
+	// 1. Candidates (no manager lock). Other connections' fields are read
+	//    racily, the uid_presenting pattern; the next tick corrects a stale read.
+	struct app_cand *cands = U_TYPED_ARRAY_CALLOC(struct app_cand, IPC_MAX_CLIENTS + LINK_MAX);
+	uint32_t n = 0;
+	struct ipc_server *vs = m->server;
+	if (cands != NULL && vs != NULL) {
+		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+			volatile struct ipc_client_state *o = &vs->threads[i].ics;
+			if (o->server_thread_index < 0 || o->xs == NULL || o->xc == NULL || o->peer_pid <= 0 ||
+			    !app_class_shareable(o->client_state.client_class)) {
+				continue;
+			}
+			struct app_cand *c = &cands[n++];
+			c->client_id = o->client_state.id;
+			c->pid = o->peer_pid;
+			c->opted_out = o->app_share_opt_out;
+			c->source = XRT_STEREO_CAMERA_SOURCE_APP;
+			snprintf(c->app_name, sizeof(c->app_name), "%s",
+			         (const char *)o->client_state.info.application_name);
+		}
+	}
+	// ADR-061 arm 2: in-process sessions over their service links. A link is
+	// sessionless on the service side (no xs / xc), so the loop above never
+	// sees it; its registration says whether its session runs.
+	if (cands != NULL && m->links != NULL) {
+		os_mutex_lock(&m->link_lock);
+		for (uint32_t i = 0; i < LINK_MAX; i++) {
+			const struct scam_link *l = &m->links[i];
+			if (!l->used || (l->reg.caps & XRT_SHARE_LINK_CAP_SHARE) == 0 || l->reg.session_running == 0) {
+				continue;
+			}
+			struct app_cand *c = &cands[n++];
+			c->client_id = l->client_id;
+			c->pid = l->pid;
+			c->opted_out = l->reg.opt_out != 0;
+			c->source = XRT_STEREO_CAMERA_SOURCE_APP_LINK;
+			c->reg = l->reg;
+			c->link_content_w = l->content_w;
+			c->link_content_h = l->content_h;
+			snprintf(c->exe_path, sizeof(c->exe_path), "%s", l->exe_path);
+			snprintf(c->app_name, sizeof(c->app_name), "%s", l->reg.app_name);
+		}
+		os_mutex_unlock(&m->link_lock);
+	}
+	os_mutex_lock(&m->lock);
+	// Who is already known needs no exe lookup or query beyond a refresh.
+	for (uint32_t k = 0; k < n; k++) {
+		cands[k].matched = false;
+		for (uint32_t i = 0; i < APP_MAX; i++) {
+			const struct scam_camera *a = &m->apps[i];
+			if (!a->app.fake && a->app.live && a->app.client_id == cands[k].client_id &&
+			    a->app.pid == cands[k].pid) {
+				snprintf(cands[k].exe_path, sizeof(cands[k].exe_path), "%s", a->app.exe_path);
+				cands[k].matched = true;
+			}
+		}
+	}
+	os_mutex_unlock(&m->lock);
+	for (uint32_t k = 0; k < n; k++) {
+		if (!cands[k].matched && !cands[k].opted_out && cands[k].exe_path[0] == '\0') {
+			ipc_server_peer_exe_path(cands[k].pid, cands[k].exe_path, sizeof(cands[k].exe_path));
+			if (cands[k].exe_path[0] == '\0') {
+				snprintf(cands[k].exe_path, sizeof(cands[k].exe_path), "pid-%ld", cands[k].pid);
+			}
+		}
+		if (cands[k].opted_out) {
+			continue;
+		}
+		if (cands[k].source == XRT_STEREO_CAMERA_SOURCE_APP_LINK) {
+			app_query_link(&cands[k], cands[k].client_id == FAKE_LINK_CLIENT_ID);
+		} else {
+			app_query(&cands[k]);
+		}
+	}
+
+	// 2. Merge (locked).
+	os_mutex_lock(&m->lock);
+	const int64_t now = os_monotonic_get_ns();
+	bool changed = false, ended_any = false;
+	for (uint32_t i = 0; i < APP_MAX; i++) {
+		struct scam_camera *a = &m->apps[i];
+		if (a->app.fake || !a->app.listed) {
+			continue;
+		}
+		if (a->app.live) {
+			struct app_cand *hit = NULL;
+			for (uint32_t k = 0; k < n && hit == NULL; k++) {
+				if (cands[k].client_id == a->app.client_id && cands[k].pid == a->app.pid) {
+					hit = &cands[k];
+				}
+			}
+			if (hit == NULL || hit->opted_out) {
+				changed |= app_mark_gone_locked(m, a, now, hit != NULL,
+				                                hit != NULL ? "opted out (XrSessionShareabilityDXR)"
+				                                            : "app exited");
+				ended_any = true;
+				if (hit != NULL) {
+					hit->matched = true; // consumed: not re-listed
+				}
+				continue;
+			}
+			hit->matched = true;
+			const uint32_t was = a->app.desc.availability;
+			const bool renamed = strcmp(a->app.desc.application_name, hit->q.application_name) != 0;
+			const uint64_t id = a->camera_id;
+			const uint32_t ord = a->app.ordinal;
+			a->app.desc = hit->q;
+			a->app.desc.camera_id = id;
+			a->app.desc.instance_ordinal = ord;
+			a->app.last_commit_ns = hit->last_commit_ns;
+			if (renamed && hit->app_name[0] != '\0') {
+				snprintf(a->info.display_name, sizeof(a->info.display_name), "%s", hit->app_name);
+			}
+			if (was != a->app.desc.availability && a->app.desc.availability != XRT_APP_SHARE_AVAILABLE) {
+				// It can no longer be tapped (another adapter, a kill-switched split): streams end.
+				ended_any |= app_end_streams_locked(m, a) > 0;
+			}
+			if (a->src == NULL && a->started_count == 0) {
+				set_state_locked(a, app_idle_state(a, now));
+			}
+			changed |= renamed || was != a->app.desc.availability;
+		} else if (now - a->app.exited_ns >= m->app_linger_ns) {
+			a->app.listed = false; // the linger is over: it leaves the list
+			changed = true;
+			U_LOG_W("app share %llu \"%s\": left the list (%lld ms after its app exited)",
+			        (unsigned long long)a->camera_id, a->info.display_name,
+			        (long long)(m->app_linger_ns / 1000000));
+		}
+	}
+	for (uint32_t k = 0; k < n; k++) {
+		struct app_cand *c = &cands[k];
+		if (c->matched || c->opted_out) {
+			continue;
+		}
+		struct scam_camera *slot = NULL;
+		for (uint32_t i = 0; i < APP_MAX && slot == NULL; i++) {
+			struct scam_camera *a = &m->apps[i];
+			if (!a->app.listed && !a->app.fake && !app_slot_referenced_locked(m, a)) {
+				slot = a;
+			}
+		}
+		if (slot == NULL) {
+			U_LOG_W("app share: more than %d app entries — \"%s\" (pid %ld) not listed", APP_MAX,
+			        c->app_name, c->pid);
+			break;
+		}
+		app_insert_locked(m, slot, c, now, ext_w, ext_h, ext_fps);
+		changed = true;
+	}
+	m->last_app_rescan_ns = now;
+	if (changed) {
+		notify_cameras_changed_locked(m);
+	}
+	os_mutex_unlock(&m->lock);
+	free(cands);
+	os_mutex_unlock(&m->app_rescan_lock);
+	share_forget_drain(m);
+	if (ended_any) {
+		indicator_changed(m);
+	}
+	return changed;
+}
+
+bool
+ipc_server_stereo_camera_rescan_apps(struct ipc_server_stereo_camera *m)
+{
+	return m != NULL && rescan_apps(m, true);
+}
+
+void
+ipc_server_stereo_camera_apps_changed(struct ipc_server_stereo_camera *m)
+{
+	if (m == NULL || !m->apps_enabled) {
+		return;
+	}
+	os_mutex_lock(&m->lock);
+	m->apps_dirty = true;
+	os_cond_broadcast(&m->watch_cond);
+	os_mutex_unlock(&m->lock);
+}
+
+void
+ipc_server_stereo_camera_app_session_ending(volatile struct ipc_client_state *ics)
+{
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
+	if (m == NULL || !m->apps_enabled) {
+		return;
+	}
+	bool any = false;
+	os_mutex_lock(&m->lock);
+	const int64_t now = os_monotonic_get_ns();
+	for (uint32_t i = 0; i < APP_MAX; i++) {
+		struct scam_camera *a = &m->apps[i];
+		if (a->app.fake || !a->app.live || a->app.client_id != ics->client_state.id ||
+		    a->app.pid != ics->peer_pid) {
+			continue;
+		}
+		any |= app_mark_gone_locked(m, a, now, false, "session ending");
+		// Bounded: the camera thread detaches the tap between two waits.
+		const int64_t deadline = os_monotonic_get_ns() + APP_CLOSE_WAIT_NS;
+		while ((a->src != NULL || a->opening) && !m->shutting_down) {
+			const int64_t t = os_monotonic_get_ns();
+			if (t >= deadline) {
+				U_LOG_W("app share %llu: the tap did not detach within %lld ms of session end",
+				        (unsigned long long)a->camera_id, (long long)(APP_CLOSE_WAIT_NS / 1000000));
+				break;
+			}
+			os_cond_wait_timeout_ns(&m->app_closed_cond, &m->lock, (uint64_t)(deadline - t));
+		}
+	}
+	if (any) {
+		notify_cameras_changed_locked(m);
+	}
+	os_mutex_unlock(&m->lock);
+	share_forget_drain(m);
+	if (any) {
+		indicator_changed(m);
+	}
+}
+
 /*!
  * #1961: the background half of re-enumeration. While at least one
  * connection listens for camera events, re-query the sources every
@@ -2860,17 +4445,48 @@ watch_thread(void *ptr)
 {
 	struct ipc_server_stereo_camera *m = (struct ipc_server_stereo_camera *)ptr;
 	os_mutex_lock(&m->lock);
+	int64_t next_camera_ns = os_monotonic_get_ns() + (int64_t)m->rescan_period_ns;
 	while (!m->shutting_down) {
-		os_cond_wait_timeout_ns(&m->watch_cond, &m->lock, m->rescan_period_ns);
+		// ADR-061: the app table ticks at 1 Hz (and at once on apps_changed);
+		// the camera sources keep their own period.
+		// The 1 Hz app tick only while it has something to do: a pending
+		// apps_changed(), a listening consumer, or a listed live app (its exit
+		// must end streams / start the linger). Otherwise the camera period.
+		uint64_t wait_ns = m->rescan_period_ns;
+		bool apps_live_now = false;
+		for (uint32_t i = 0; i < APP_MAX; i++) {
+			apps_live_now |= m->apps[i].app.listed && !m->apps[i].app.fake;
+		}
+		if (m->apps_enabled && (m->apps_dirty || has_listener_locked(m) || apps_live_now) &&
+		    wait_ns > (uint64_t)APP_TICK_NS) {
+			wait_ns = (uint64_t)APP_TICK_NS;
+		}
+		if (!m->apps_dirty && !m->rescan_soon) {
+			os_cond_wait_timeout_ns(&m->watch_cond, &m->lock, wait_ns);
+		}
 		if (m->shutting_down) {
 			break;
 		}
+		const int64_t now = os_monotonic_get_ns();
 		const bool listening = has_listener_locked(m);
 		const bool soon = m->rescan_soon;
+		const bool cameras_due = soon || now >= next_camera_ns;
 		m->rescan_soon = false;
+		bool apps_live = false;
+		for (uint32_t i = 0; i < APP_MAX; i++) {
+			apps_live |= m->apps[i].app.listed && !m->apps[i].app.fake;
+		}
+		const bool apps_due = m->apps_enabled && (m->apps_dirty || listening || apps_live);
+		m->apps_dirty = false;
+		if (cameras_due) {
+			next_camera_ns = now + (int64_t)m->rescan_period_ns;
+		}
 		os_mutex_unlock(&m->lock);
-		if (listening) {
+		if (listening && cameras_due) {
 			(void)rescan(m, soon, false);
+		}
+		if (apps_due) {
+			(void)rescan_apps(m, true);
 		}
 		os_mutex_lock(&m->lock);
 	}
@@ -2892,6 +4508,17 @@ ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_
 	os_mutex_init(&m->consent_lock);
 	os_mutex_init(&m->rescan_lock);
 	os_cond_init(&m->watch_cond);
+	os_mutex_init(&m->app_rescan_lock);
+	os_cond_init(&m->app_closed_cond);
+	os_mutex_init(&m->link_lock);
+	os_cond_init(&m->link_cond);
+	m->links = U_TYPED_ARRAY_CALLOC(struct scam_link, LINK_MAX);
+	for (uint32_t i = 0; i < APP_MAX; i++) {
+		m->apps[i].index = APP_SLOT_BASE + i;
+		m->apps[i].mgr = m;
+		m->apps[i].source = XRT_STEREO_CAMERA_SOURCE_APP;
+		os_cond_init(&m->apps[i].cond);
+	}
 	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
 		m->streams[i].section = XRT_SHMEM_HANDLE_INVALID;
 		m->streams[i].section_ro = XRT_SHMEM_HANDLE_INVALID;
@@ -2955,6 +4582,42 @@ ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_
 		    t, PROMPT_TIMEOUT_MS);
 	}
 	m->sharing_enabled = u_camera_consent_sharing_enabled(&m->consent);
+
+	// ADR-061 app share: its own policy over the camera's switches.
+	m->apps_enabled = debug_get_bool_option_app_share_enabled();
+	m->app_dev =
+	    opts != NULL && opts->app_share_dev != 0 ? opts->app_share_dev > 0 : debug_get_bool_option_app_share_dev();
+	// DXR_APP_SHARE_FAKE: truthy = the service-composited fake; "link" = the
+	// in-process (service link) fake; "both" = both.
+	const char *fake_env = debug_get_option_app_share_fake();
+	bool env_fake = false, env_fake_link = false;
+	if (fake_env != NULL && fake_env[0] != '\0') {
+		if (strcmp(fake_env, "link") == 0) {
+			env_fake_link = true;
+		} else if (strcmp(fake_env, "both") == 0) {
+			env_fake = env_fake_link = true;
+		} else {
+			env_fake = strcmp(fake_env, "0") != 0 && strcmp(fake_env, "false") != 0 &&
+			           strcmp(fake_env, "off") != 0 && strcmp(fake_env, "no") != 0;
+		}
+	}
+	const bool app_fake = opts != NULL && opts->app_share_fake != 0 ? opts->app_share_fake > 0 : env_fake;
+	const bool app_fake_link =
+	    opts != NULL && opts->app_share_fake_link != 0 ? opts->app_share_fake_link > 0 : env_fake_link;
+	m->app_linger_ns =
+	    opts != NULL && opts->app_linger_ms > 0 ? (int64_t)opts->app_linger_ms * 1000000ll : APP_LINGER_NS_DEFAULT;
+	m->share_prompt_override = opts != NULL ? opts->share_prompt_mode : 0;
+	m->share_resolution_override = opts != NULL ? opts->share_resolution : 0;
+	m->share.camera = &m->consent;
+	m->share.app_share_off = !m->apps_enabled;
+	m->share.dev_gate = m->app_dev;
+	m->share.prompt_enabled = m->consent.prompt_enabled;
+	m->share.prompt_timeout_ms = m->consent.prompt_timeout_ms;
+	if (opts != NULL && opts->share_prompt != NULL) {
+		m->have_share_prompt_seam = true;
+		m->share.prompt = opts->share_prompt;
+		m->share.prompt_ctx = opts->share_prompt_ctx;
+	}
 	g_mgr = m;
 	if (m->consent.dev_override) {
 		U_LOG_W(
@@ -2962,6 +4625,21 @@ ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_
 		    "camera WITHOUT consent, identity or OS-permission checks (Android: "
 		    "debug.xrt.DXR_STEREO_CAMERA_DEV_ALLOW). The front-camera rule (a live weave) still applies. "
 		    "Never on a user's device. ********");
+	}
+
+	if (!m->apps_enabled) {
+		U_LOG_W("app share: disabled by DXR_APP_SHARE=0 — no app is ever listed as a stereo source");
+	} else if (m->app_dev) {
+		U_LOG_W(
+		    "app share: ******** DXR_APP_SHARE_DEV=1 — DEVELOPMENT GATE: running apps are listed to EVERY "
+		    "camera consumer (no XR_DXR_app_share needed) and app shares start WITHOUT the share prompt. "
+		    "Never on a user's machine. ********");
+	}
+	if (m->apps_enabled && app_fake) {
+		app_insert_fake_locked(m);
+	}
+	if (m->apps_enabled && app_fake_link) {
+		fake_link_start(m); // registers itself; the next app rescan lists it
 	}
 
 	if (!debug_get_bool_option_stereo_camera_enabled()) {
@@ -3016,12 +4694,20 @@ ipc_server_stereo_camera_destroy(struct ipc_server_stereo_camera **mgr_ptr)
 	if (m == NULL) {
 		return;
 	}
+	fake_link_stop(m); // its thread drives the link core: gone before anything else
 	os_mutex_lock(&m->lock);
 	m->shutting_down = true;
 	os_cond_broadcast(&m->watch_cond);
 	for (uint32_t i = 0; i < m->camera_count; i++) {
 		os_cond_broadcast(&m->cams[i].cond);
 	}
+	for (uint32_t i = 0; i < APP_MAX; i++) {
+		os_cond_broadcast(&m->apps[i].cond);
+	}
+	os_cond_broadcast(&m->app_closed_cond);
+	os_mutex_lock(&m->link_lock); // a leaf: allowed under the manager lock
+	os_cond_broadcast(&m->link_cond);
+	os_mutex_unlock(&m->link_lock);
 	for (uint32_t i = 0; i < INTERNAL_MAX; i++) {
 		if (m->internal[i] != NULL) {
 			os_cond_broadcast(&m->internal[i]->cond); // a blocked acquire returns ENDED
@@ -3055,6 +4741,15 @@ ipc_server_stereo_camera_destroy(struct ipc_server_stereo_camera **mgr_ptr)
 	// holds rescan_lock until it returns).
 	os_mutex_lock(&m->rescan_lock);
 	os_mutex_unlock(&m->rescan_lock);
+	os_mutex_lock(&m->app_rescan_lock);
+	os_mutex_unlock(&m->app_rescan_lock);
+	for (uint32_t i = 0; i < APP_MAX; i++) {
+		if (m->apps[i].thread_started) {
+			os_thread_join(&m->apps[i].thread);
+			os_thread_destroy(&m->apps[i].thread);
+		}
+		os_cond_destroy(&m->apps[i].cond);
+	}
 	for (uint32_t i = 0; i < m->camera_count; i++) {
 		if (m->cams[i].thread_started) {
 			os_thread_join(&m->cams[i].thread);
@@ -3073,7 +4768,20 @@ ipc_server_stereo_camera_destroy(struct ipc_server_stereo_camera **mgr_ptr)
 	for (uint32_t k = 0; k < UVC_OBJS_MAX; k++) {
 		u_stereo_uvc_destroy(&m->uvc_objs[k]);
 	}
+	if (m->links != NULL) {
+		for (uint32_t i = 0; i < LINK_MAX; i++) {
+			if (m->links[i].used) {
+				link_free_locked(&m->links[i]); // no thread left: no lock needed
+			}
+		}
+		free(m->links);
+		m->links = NULL;
+	}
+	os_cond_destroy(&m->link_cond);
+	os_mutex_destroy(&m->link_lock);
 	os_cond_destroy(&m->watch_cond);
+	os_cond_destroy(&m->app_closed_cond);
+	os_mutex_destroy(&m->app_rescan_lock);
 	os_mutex_destroy(&m->rescan_lock);
 	os_mutex_destroy(&m->consent_lock);
 	os_mutex_destroy(&m->lock);
@@ -3124,13 +4832,13 @@ stream_end_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s, uin
 	if (!s->used || s->ended) {
 		return;
 	}
-	stream_stop_locked(s, &m->cams[s->camera]);
+	stream_stop_locked(s, slot_cam(m, s->camera));
 	s->ended = true;
 	s->end_reason = reason;
 	struct xrt_stereo_camera_event ev = {
 	    .kind = XRT_STEREO_CAMERA_EVENT_STREAM_ENDED,
 	    .value = reason,
-	    .camera_id = m->cams[s->camera].camera_id,
+	    .camera_id = slot_cam(m, s->camera)->camera_id,
 	    .stream_id = s->id,
 	};
 	evq_push_locked(m, s->owner, &ev);
@@ -3143,7 +4851,7 @@ stream_end_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s, uin
 static void
 stream_destroy_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s)
 {
-	stream_stop_locked(s, &m->cams[s->camera]);
+	stream_stop_locked(s, slot_cam(m, s->camera));
 	stream_free_storage(s);
 	memset(s, 0, sizeof(*s));
 	s->section = XRT_SHMEM_HANDLE_INVALID;
@@ -3151,6 +4859,16 @@ stream_destroy_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s)
 #ifndef XRT_OS_WINDOWS
 	s->wake.fds[0] = s->wake.fds[1] = -1;
 #endif
+}
+
+void
+ipc_server_client_stereo_camera_link_release(volatile struct ipc_client_state *ics)
+{
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
+	if (m != NULL) {
+		// ADR-061 arm 2: a closing in-process service link takes its share with it.
+		link_unregister(m, ics->client_state.id);
+	}
 }
 
 void
@@ -3179,6 +4897,274 @@ ipc_server_client_stereo_camera_release(volatile struct ipc_client_state *ics)
 
 /*
  *
+ * ADR-061 arm 2: the service-link IPC handlers (ipc_client_service_link).
+ *
+ */
+
+xrt_result_t
+ipc_handle_service_link_register(volatile struct ipc_client_state *ics, const struct xrt_share_link_registration *reg)
+{
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
+	if (m == NULL || !m->apps_enabled || (reg->caps & XRT_SHARE_LINK_CAP_SHARE) == 0) {
+		// Sharing off service-side (DXR_APP_SHARE=0), or a link that only lifts:
+		// accepted and ignored — the poll answers NONE forever.
+		return XRT_SUCCESS;
+	}
+	if (!app_class_shareable(ics->client_state.client_class)) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // a browser / controller / consumer is never a share source
+	}
+	char exe[U_CAMERA_CONSENT_EXE_MAX] = {0};
+	ipc_server_peer_exe_path(ics->peer_pid, exe, sizeof(exe));
+	if (exe[0] == '\0') {
+		snprintf(exe, sizeof(exe), "pid-%ld", ics->peer_pid);
+	}
+	return link_register(m, ics->client_state.id, ics->peer_pid, exe, false, reg);
+}
+
+xrt_result_t
+ipc_handle_service_link_share_poll(volatile struct ipc_client_state *ics, struct xrt_share_link_poll *out_poll)
+{
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
+	memset(out_poll, 0, sizeof(*out_poll));
+	if (m != NULL) {
+		link_poll(m, ics->client_state.id, out_poll);
+	}
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_service_link_share_publish_ring(volatile struct ipc_client_state *ics,
+                                           const struct xrt_share_link_ring_desc *desc,
+                                           const xrt_graphics_buffer_handle_t *handles,
+                                           uint32_t handle_count)
+{
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
+	if (m == NULL) {
+		for (uint32_t i = 0; i < handle_count; i++) {
+			xrt_graphics_buffer_handle_t h = handles[i];
+			u_graphics_buffer_unref(&h);
+		}
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return link_publish_ring(m, ics->client_state.id, desc, handles, handle_count);
+}
+
+xrt_result_t
+ipc_handle_service_link_share_publish_fence(volatile struct ipc_client_state *ics,
+                                            uint32_t generation,
+                                            const xrt_graphics_sync_handle_t *handles,
+                                            uint32_t handle_count)
+{
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
+	for (uint32_t i = 1; i < handle_count; i++) {
+		xrt_graphics_sync_handle_t h = handles[i];
+		u_graphics_sync_unref(&h); // one fence per ring
+	}
+	if (handle_count == 0) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // malformed, refused (not a dead pipe)
+	}
+	if (m == NULL) {
+		xrt_graphics_sync_handle_t h = handles[0];
+		u_graphics_sync_unref(&h);
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return link_publish_fence(m, ics->client_state.id, generation, handles[0]);
+}
+
+xrt_result_t
+ipc_handle_service_link_share_frame_ready(volatile struct ipc_client_state *ics,
+                                          const struct xrt_share_link_frame *frame,
+                                          struct xrt_share_link_poll *out_poll)
+{
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
+	memset(out_poll, 0, sizeof(*out_poll));
+	if (m == NULL) {
+		return XRT_SUCCESS;
+	}
+	// An unregistered link (sharing off service-side) gets the refusal and a NONE poll.
+	return link_frame_ready(m, ics->client_state.id, frame, out_poll);
+}
+
+
+/*
+ *
+ * ADR-061 arm 2: DXR_APP_SHARE_FAKE=link — a synthetic in-process registrant.
+ * It drives the share-link core exactly as an app's service link does
+ * (register, poll, publish a ring, frame_ready at the stream rate), with a
+ * CPU NV12 ring in place of the app's GPU textures, so the whole arm runs
+ * headless: enumerate -> consent -> start -> SHARE_REQUESTED -> ring ->
+ * frames -> acquire -> stop -> SHARE_STOPPED.
+ *
+ */
+
+struct scam_fake_link
+{
+	struct ipc_server_stereo_camera *m;
+	struct os_thread thread;
+	bool started;
+	bool stop; //!< guarded by the manager's link_lock
+};
+
+//! Copy one fake frame into ring slot @p slot (link_lock taken here).
+static bool
+fake_link_write_slot(struct ipc_server_stereo_camera *m, uint32_t slot, const struct u_app_share_fake_frame *ff)
+{
+	bool ok = false;
+	os_mutex_lock(&m->link_lock);
+	struct scam_link *l = link_find_locked(m, FAKE_LINK_CLIENT_ID);
+	const size_t y = (size_t)ff->width * ff->height;
+	const size_t size = y + y / 2;
+	if (l != NULL && slot < XRT_SHARE_LINK_RING_SLOTS) {
+		if (l->cpu_slot_size != size) {
+			for (uint32_t i = 0; i < XRT_SHARE_LINK_RING_SLOTS; i++) {
+				free(l->cpu_slots[i]);
+				l->cpu_slots[i] = (uint8_t *)calloc(1, size);
+			}
+			l->cpu_slot_size = size;
+		}
+		uint8_t *dst = l->cpu_slots[slot];
+		if (dst != NULL) {
+			for (uint32_t r = 0; r < ff->height; r++) {
+				memcpy(dst + (size_t)r * ff->width, ff->planes[0] + (size_t)r * ff->pitches[0],
+				       ff->width);
+			}
+			for (uint32_t r = 0; r < ff->height / 2; r++) {
+				memcpy(dst + y + (size_t)r * ff->width, ff->planes[1] + (size_t)r * ff->pitches[1],
+				       ff->width);
+			}
+			ok = true;
+		}
+	}
+	os_mutex_unlock(&m->link_lock);
+	return ok;
+}
+
+static bool
+fake_link_should_stop(struct scam_fake_link *fl)
+{
+	os_mutex_lock(&fl->m->link_lock);
+	const bool stop = fl->stop;
+	os_mutex_unlock(&fl->m->link_lock);
+	return stop;
+}
+
+static void *
+fake_link_thread(void *ptr)
+{
+	struct scam_fake_link *fl = (struct scam_fake_link *)ptr;
+	struct ipc_server_stereo_camera *m = fl->m;
+
+	struct xrt_share_link_registration reg;
+	memset(&reg, 0, sizeof(reg));
+	reg.caps = XRT_SHARE_LINK_CAP_SHARE;
+	snprintf(reg.exe, sizeof(reg.exe), "%s", "displayxr-app-share-fake-link");
+	snprintf(reg.app_name, sizeof(reg.app_name), "%s", "DisplayXR app-share fake (in-process)");
+	reg.tap_available = 1;
+	reg.session_running = 1;
+	(void)link_register(m, FAKE_LINK_CLIENT_ID, 0, "displayxr-app-share-fake-link", true, &reg);
+
+	struct u_app_share_fake *gen = NULL;
+	uint32_t ring_generation = 0, ring_stream = 0, ring_w = 0, ring_h = 0, slot = 0;
+	bool have_ring = false;
+	while (!fake_link_should_stop(fl)) {
+		struct xrt_share_link_poll p;
+		link_poll(m, FAKE_LINK_CLIENT_ID, &p);
+		if (p.state != XRT_SHARE_LINK_STATE_SHARE_REQUESTED) {
+			if (gen != NULL) {
+				u_app_share_fake_destroy(&gen);
+				have_ring = false;
+			}
+			os_nanosleep(20 * 1000 * 1000);
+			continue;
+		}
+		if (!have_ring || ring_stream != p.stream_generation || ring_w != p.eye_w || ring_h != p.eye_h) {
+			u_app_share_fake_destroy(&gen);
+			gen = u_app_share_fake_create(p.eye_w, p.eye_h, p.fps > 0.0f ? p.fps : 30.0f);
+			if (gen == NULL) {
+				os_nanosleep(100 * 1000 * 1000);
+				continue;
+			}
+			struct xrt_share_link_ring_desc d;
+			memset(&d, 0, sizeof(d));
+			d.generation = ++ring_generation;
+			d.stream_generation = p.stream_generation;
+			d.format = XRT_SHARE_LINK_FORMAT_CPU_NV12;
+			d.slot_width = 2 * p.eye_w;
+			d.slot_height = p.eye_h;
+			d.content_width = p.eye_w;
+			d.content_height = p.eye_h;
+			d.slot_count = XRT_SHARE_LINK_RING_SLOTS;
+			(void)link_publish_ring(m, FAKE_LINK_CLIENT_ID, &d, NULL, 0);
+			have_ring = true;
+			ring_stream = p.stream_generation;
+			ring_w = p.eye_w;
+			ring_h = p.eye_h;
+		}
+		struct u_app_share_fake_frame ff;
+		if (!u_app_share_fake_next(gen, 50ll * 1000 * 1000, &ff)) {
+			continue;
+		}
+		if (!fake_link_write_slot(m, slot, &ff)) {
+			continue;
+		}
+		struct xrt_share_link_frame f;
+		memset(&f, 0, sizeof(f));
+		f.generation = ring_generation;
+		f.slot = slot;
+		f.fence_value = ff.sequence;
+		f.commit_ns = ff.time_ns;
+		f.content_generation = ring_generation;
+		struct xrt_share_link_poll r;
+		(void)link_frame_ready(m, FAKE_LINK_CLIENT_ID, &f, &r);
+		slot = (slot + 1) % XRT_SHARE_LINK_RING_SLOTS;
+	}
+	u_app_share_fake_destroy(&gen);
+	return NULL;
+}
+
+static void
+fake_link_start(struct ipc_server_stereo_camera *m)
+{
+	struct scam_fake_link *fl = U_TYPED_CALLOC(struct scam_fake_link);
+	if (fl == NULL) {
+		return;
+	}
+	fl->m = m;
+	os_thread_init(&fl->thread);
+	if (os_thread_start(&fl->thread, fake_link_thread, fl) != 0) {
+		U_LOG_W("app share: DXR_APP_SHARE_FAKE=link — the registrant thread failed to start");
+		os_thread_destroy(&fl->thread);
+		free(fl);
+		return;
+	}
+	fl->started = true;
+	m->fake_link = fl;
+	U_LOG_W(
+	    "app share: DXR_APP_SHARE_FAKE=link — a SYNTHETIC in-process registrant (CPU ring over the share-link "
+	    "core) is listed as an app-link source (diagnostics / CI only)");
+}
+
+static void
+fake_link_stop(struct ipc_server_stereo_camera *m)
+{
+	struct scam_fake_link *fl = m->fake_link;
+	if (fl == NULL) {
+		return;
+	}
+	os_mutex_lock(&m->link_lock);
+	fl->stop = true;
+	os_mutex_unlock(&m->link_lock);
+	if (fl->started) {
+		os_thread_join(&fl->thread);
+		os_thread_destroy(&fl->thread);
+	}
+	free(fl);
+	m->fake_link = NULL;
+}
+
+
+/*
+ *
  * IPC handlers.
  *
  */
@@ -3194,13 +5180,19 @@ ipc_handle_stereo_camera_count(volatile struct ipc_client_state *ics, uint32_t *
 	// #1961: an enumerate re-queries the sources (throttled to once a second;
 	// source calls run without the manager lock, so streams never wait).
 	(void)rescan(m, false, false);
+	// ADR-061: a consumer that sees apps gets the current app set (cheap: the
+	// connection table plus one platform query per app).
+	if (client_sees_apps(m, ics)) {
+		(void)rescan_apps(m, false); // throttled: at most once a second per enumerate burst
+	}
 	os_mutex_lock(&m->lock);
 	// #1961: a connection that enumerated LISTENS from now on — it is told
 	// XrEventDataStereoCamerasChangedDXR whenever the list changes, and keeps
 	// the background re-enumeration running while it is connected.
 	(void)evq_for_owner_locked(m, owner_of(m, ics), true);
 	// Spec §2 / §7.4: sharing off = zero cameras, indistinguishable from none.
-	*out_count = m->sharing_enabled ? m->camera_count : 0;
+	// ADR-061: app entries follow every camera.
+	*out_count = m->sharing_enabled ? m->camera_count + apps_listed_count_locked(m, ics) : 0;
 	os_mutex_unlock(&m->lock);
 	return XRT_SUCCESS;
 }
@@ -3234,11 +5226,55 @@ ipc_handle_stereo_camera_get_properties(volatile struct ipc_client_state *ics,
 	peer_identity(ics, exe, sizeof(exe));
 
 	os_mutex_lock(&m->lock);
-	if (index >= m->camera_count) {
+	if (index < m->camera_count) {
+		fill_properties_locked(m, &m->cams[index], exe, out_props);
 		os_mutex_unlock(&m->lock);
+		return XRT_SUCCESS;
+	}
+	// ADR-061: the (index - camera_count)-th app entry this connection sees.
+	uint32_t k = index - m->camera_count;
+	if (client_sees_apps(m, ics)) {
+		for (uint32_t i = 0; i < APP_MAX; i++) {
+			struct scam_camera *a = &m->apps[i];
+			if (!app_listed_for_locked(a, ics)) {
+				continue;
+			}
+			if (k-- == 0) {
+				fill_properties_locked(m, a, exe, out_props);
+				os_mutex_unlock(&m->lock);
+				return XRT_SUCCESS;
+			}
+		}
+	}
+	os_mutex_unlock(&m->lock);
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+}
+
+xrt_result_t
+ipc_handle_stereo_camera_get_app_source(volatile struct ipc_client_state *ics,
+                                        uint64_t camera_id,
+                                        struct xrt_app_share_source_info *out_info)
+{
+	U_ZERO(out_info);
+	struct ipc_server_stereo_camera *m = mgr_of(ics);
+	xrt_result_t auth = require_camera_client(ics, "stereo_camera_get_app_source");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (m == NULL) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
-	fill_properties_locked(m, &m->cams[index], exe, out_props);
+	os_mutex_lock(&m->lock);
+	const struct scam_camera *a = m->sharing_enabled ? app_by_id_for_locked(m, ics, camera_id) : NULL;
+	if (a == NULL) {
+		os_mutex_unlock(&m->lock);
+		return XRT_ERROR_INPUT_UNSUPPORTED; // a camera, or not an app this connection sees
+	}
+	*out_info = a->app.desc;
+	out_info->camera_id = a->camera_id;
+	out_info->pid = a->app.pid > 0 ? (uint64_t)a->app.pid : 0;
+	out_info->source = a->source;
+	out_info->instance_ordinal = a->app.ordinal;
 	os_mutex_unlock(&m->lock);
 	return XRT_SUCCESS;
 }
@@ -3254,6 +5290,25 @@ fill_properties_locked(struct ipc_server_stereo_camera *m,
                        struct xrt_stereo_camera_properties *out_props)
 {
 	out_props->camera_id = cam->camera_id;
+	if (cam_is_app(cam)) {
+		// ADR-061 spec §2: not a camera — display-referred, no geometry, NV12 over shared memory.
+		u_camera_consent_persistent_id(&m->consent, cam->info.device_identity, exe, out_props->persistent_id);
+		snprintf(out_props->display_name, sizeof(out_props->display_name), "%s", cam->info.display_name);
+		out_props->platform_device_hint[0] = '\0';
+		out_props->flags = XRT_STEREO_CAMERA_APP_CONTENT | XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED |
+		                   XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE;
+		out_props->state = cam->app.live ? effective_state_locked(m, cam) : XRT_STEREO_CAMERA_STATE_UNAVAILABLE;
+		out_props->view_count = 2;
+		out_props->eye_width = cam->info.eye_width;
+		out_props->eye_height = cam->info.eye_height;
+		out_props->max_frame_rate = cam->info.max_frame_rate;
+		out_props->source = cam->source;
+		out_props->display_id = 0;
+		out_props->frame_orientation_deg = XRT_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN;
+		out_props->supported_formats = XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_FORMAT_NV12);
+		out_props->supported_transports = XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY);
+		return;
+	}
 	// Spec §7.5: keyed with the per-user secret — a page cannot derive the
 	// device from the id, and two installs never share one.
 	u_camera_consent_persistent_id(&m->consent, cam->info.device_identity, exe, out_props->persistent_id);
@@ -3261,7 +5316,7 @@ fill_properties_locked(struct ipc_server_stereo_camera *m,
 	snprintf(out_props->platform_device_hint, sizeof(out_props->platform_device_hint), "%s",
 	         cam->info.platform_device_hint);
 	// Spec v7: RECTIFIABLE is the service's promise, never the plug-in's claim.
-	out_props->flags = (cam->info.flags & ~XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE) |
+	out_props->flags = (cam->info.flags & ~(XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE | XRT_STEREO_CAMERA_APP_CONTENT)) |
 	                   (camera_can_rectify(cam) ? XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE : 0u);
 	out_props->state = effective_state_locked(m, cam);
 	out_props->view_count = 2;
@@ -3315,6 +5370,8 @@ ipc_handle_stereo_camera_get_calibration(volatile struct ipc_client_state *ics,
 	char exe[512] = {0};
 	peer_identity(ics, exe, sizeof(exe));
 	os_mutex_lock(&m->lock);
+	// ADR-061 spec §6: an app entry has no calibration (its geometry is the
+	// display-referred frame metadata) — refused before any consent prompt.
 	bool known = camera_by_id_locked(m, camera_id) != NULL && m->sharing_enabled;
 	os_mutex_unlock(&m->lock);
 	if (!known) {
@@ -3515,7 +5572,7 @@ stream_layout_locked(struct ipc_server_stereo_camera *m,
 	out_layout->output = s->output;
 	out_layout->transport = s->req.transport;
 	out_layout->max_frame_rate =
-	    s->dec.period_ns > 0 ? (float)(1e9 / (double)s->dec.period_ns) : source_rate_hz(&m->cams[s->camera]);
+	    s->dec.period_ns > 0 ? (float)(1e9 / (double)s->dec.period_ns) : source_rate_hz(slot_cam(m, s->camera));
 	out_layout->section_size = s->section_size;
 	out_layout->slot_stride = s->slot_stride;
 	out_layout->slot_count = U_STEREO_CAMERA_RING_SLOTS;
@@ -3553,9 +5610,22 @@ ipc_handle_stereo_camera_stream_create(volatile struct ipc_client_state *ics,
 
 	os_mutex_lock(&m->lock);
 	struct scam_camera *cam = m->sharing_enabled ? camera_by_id_locked(m, req->camera_id) : NULL;
+	if (cam == NULL && m->sharing_enabled) {
+		cam = app_by_id_for_locked(m, ics, req->camera_id);
+	}
 	if (cam == NULL) {
 		os_mutex_unlock(&m->lock);
 		return m->sharing_enabled ? XRT_ERROR_INPUT_UNSUPPORTED : XRT_ERROR_STEREO_CAMERA_DISABLED;
+	}
+	// ADR-061 spec §9: an app entry is RECTIFIED (display-referred) NV12 over
+	// shared memory, nothing else.
+	if (cam_is_app(cam) &&
+	    (req->output != XRT_STEREO_CAMERA_OUTPUT_RECTIFIED || req->format != XRT_STEREO_CAMERA_FORMAT_NV12)) {
+		os_mutex_unlock(&m->lock);
+		U_LOG_W(
+		    "stereo_camera_stream_create: app share %llu is RECTIFIED NV12 only (asked output %u, format %u)",
+		    (unsigned long long)cam->camera_id, req->output, req->format);
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	// RECTIFIED needs a calibration (CALIBRATED / NATIVELY_RECTIFIED) — or,
 	// Amendment 4, a nominal model the service rectifies (an uncalibrated UVC
@@ -3626,6 +5696,82 @@ ipc_handle_stereo_camera_stream_destroy(volatile struct ipc_client_state *ics, u
 	return XRT_SUCCESS;
 }
 
+/*!
+ * ADR-061: the start of an app-share stream. The share policy decides (the
+ * prompt may block: no manager lock), then the stream starts on the app
+ * entry exactly like a camera stream.
+ */
+static xrt_result_t
+share_stream_start(struct ipc_server_stereo_camera *m,
+                   volatile struct ipc_client_state *ics,
+                   uint64_t stream_id,
+                   const struct u_app_share_request *req)
+{
+	struct u_app_share_decision dec;
+	os_mutex_lock(&m->consent_lock);
+	// The user's `share.prompt` is read per start (a CLI / Dashboard change applies to the next one).
+	if (m->share_prompt_override == 1) {
+		m->share.mode = U_APP_SHARE_PROMPT_ALWAYS;
+	} else if (m->share_prompt_override == 2) {
+		m->share.mode = U_APP_SHARE_PROMPT_PER_APP_RUN;
+	} else {
+		struct u_app_share_settings st;
+		u_app_share_settings_load(&st);
+		m->share.mode = st.prompt;
+	}
+	if (!m->have_share_prompt_seam) {
+		m->share.prompt = g_share_prompt_fn;
+		m->share.prompt_ctx = g_share_prompt_ctx;
+	}
+	u_app_share_consent_evaluate(&m->share, req, &dec);
+	os_mutex_unlock(&m->consent_lock);
+	U_LOG_W("stereo_camera_stream_start: app share \"%s\" for %s (pid %ld) %s — %s", req->app_name,
+	        req->consumer_exe[0] ? req->consumer_exe : "?", req->consumer_pid,
+	        dec.verdict == U_APP_SHARE_ALLOWED ? "ALLOWED" : "REFUSED", u_app_share_why_str(dec.why));
+	switch (dec.verdict) {
+	case U_APP_SHARE_ALLOWED: break;
+	case U_APP_SHARE_DISABLED: return XRT_ERROR_STEREO_CAMERA_DISABLED;
+	case U_APP_SHARE_BUSY: return XRT_ERROR_STEREO_CAMERA_BUSY;
+	case U_APP_SHARE_REFUSED:
+	default: return XRT_ERROR_STEREO_CAMERA_CONSENT_REFUSED;
+	}
+
+	// Pass 2 (locked): the stream or the app may have gone while the prompt was up.
+	os_mutex_lock(&m->lock);
+	struct scam_stream *s = stream_by_id_locked(m, ics, stream_id);
+	if (s == NULL) {
+		os_mutex_unlock(&m->lock);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	if (s->ended) {
+		os_mutex_unlock(&m->lock);
+		return XRT_ERROR_STEREO_CAMERA_STREAM_ENDED;
+	}
+	if (s->started) {
+		os_mutex_unlock(&m->lock);
+		return XRT_SUCCESS;
+	}
+	if (!m->sharing_enabled) {
+		os_mutex_unlock(&m->lock);
+		return XRT_ERROR_STEREO_CAMERA_DISABLED;
+	}
+	struct scam_camera *cam = slot_cam(m, s->camera);
+	if (!cam->app.live || !cam->app.listed || cam->camera_id != req->app_key ||
+	    cam->app.desc.availability != XRT_APP_SHARE_AVAILABLE) {
+		os_mutex_unlock(&m->lock);
+		U_LOG_W("app share %llu: stream %llu start refused — the app left while the prompt was up (BUSY)",
+		        (unsigned long long)req->app_key, (unsigned long long)stream_id);
+		return XRT_ERROR_STEREO_CAMERA_BUSY;
+	}
+	xrt_result_t xret = stream_start_locked(m, s, cam);
+	os_mutex_unlock(&m->lock);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	indicator_changed(m); // the tray shows "Sharing <app>"
+	return XRT_SUCCESS;
+}
+
 xrt_result_t
 ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uint64_t stream_id)
 {
@@ -3656,6 +5802,25 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 	snprintf(exe, sizeof(exe), "%s", s->exe);
 	const bool needs_presenting = s->needs_presenting;
 	const long peer_uid = s->peer_uid;
+	struct scam_camera *cam0 = slot_cam(m, s->camera);
+	if (cam_is_app(cam0)) {
+		// ADR-061: an app share has its own consent (spec §6) and its own start.
+		struct u_app_share_request sreq = {0};
+		char app_name[sizeof(cam0->info.display_name)];
+		char app_exe[U_CAMERA_CONSENT_EXE_MAX];
+		snprintf(app_name, sizeof(app_name), "%s", cam0->info.display_name);
+		snprintf(app_exe, sizeof(app_exe), "%s", cam0->app.fake ? "" : cam0->app.exe_path);
+		sreq.consumer_exe = exe;
+		sreq.consumer_pid = ics->peer_pid;
+		sreq.app_name = app_name;
+		sreq.app_exe = app_exe;
+		sreq.app_pid = cam0->app.pid;
+		sreq.app_key = cam0->camera_id;
+		sreq.source_available =
+		    cam0->app.live && cam0->app.listed && cam0->app.desc.availability == XRT_APP_SHARE_AVAILABLE;
+		os_mutex_unlock(&m->lock);
+		return share_stream_start(m, ics, stream_id, &sreq);
+	}
 	os_mutex_unlock(&m->lock);
 
 	// A2 front gate first: an app that may not take the front camera now is
@@ -3707,7 +5872,7 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 		os_mutex_unlock(&m->lock);
 		return XRT_ERROR_STEREO_CAMERA_DISABLED;
 	}
-	struct scam_camera *cam = &m->cams[s->camera];
+	struct scam_camera *cam = slot_cam(m, s->camera);
 	// A2 (§1.2 option R): the front camera feeds the display's head tracking
 	// while it is open, so only an app that presents woven 3D here may take
 	// it — never one in the background. BUSY (the browser: NotReadableError).
@@ -3756,7 +5921,7 @@ ipc_handle_stereo_camera_stream_stop(volatile struct ipc_client_state *ics, uint
 	os_mutex_lock(&m->lock);
 	struct scam_stream *s = stream_by_id_locked(m, ics, stream_id);
 	if (s != NULL) {
-		stream_stop_locked(s, &m->cams[s->camera]);
+		stream_stop_locked(s, slot_cam(m, s->camera));
 	}
 	os_mutex_unlock(&m->lock);
 	indicator_changed(m);
@@ -3837,10 +6002,12 @@ xrt_result_t
 ipc_handle_stereo_camera_acquire(volatile struct ipc_client_state *ics,
                                  uint64_t stream_id,
                                  bool *out_ready,
-                                 struct xrt_stereo_camera_frame_info *out_frame)
+                                 struct xrt_stereo_camera_frame_info *out_frame,
+                                 struct xrt_app_share_frame_info *out_app)
 {
 	*out_ready = false;
 	U_ZERO(out_frame);
+	U_ZERO(out_app);
 	struct ipc_server_stereo_camera *m = mgr_of(ics);
 	if (m == NULL) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
@@ -3859,6 +6026,7 @@ ipc_handle_stereo_camera_acquire(volatile struct ipc_client_state *ics,
 	uint64_t seq = 0;
 	if (s->started && s->allocated && u_stereo_camera_ring_acquire(&s->ring, &slot, &seq)) {
 		*out_frame = s->slot_info[slot];
+		*out_app = s->slot_app[slot];
 		*out_ready = true;
 	}
 	os_mutex_unlock(&m->lock);
@@ -3881,13 +6049,13 @@ ipc_handle_stereo_camera_stream_stats(volatile struct ipc_client_state *ics,
 		os_mutex_unlock(&m->lock);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
-	out_stats->source_frame_rate = m->cams[s->camera].source_rate;
+	out_stats->source_frame_rate = slot_cam(m, s->camera)->source_rate;
 	out_stats->delivered_frame_rate = s->delivered_rate;
 	out_stats->frames_published = s->ring.published;
 	out_stats->frames_skipped = s->ring.skipped;
 	out_stats->frames_acquired = s->ring.acquired;
 	out_stats->mean_latency_ns = s->latency_count > 0 ? s->latency_sum_ns / s->latency_count : 0;
-	const struct scam_rectifier *r = m->cams[s->camera].rect;
+	const struct scam_rectifier *r = slot_cam(m, s->camera)->rect;
 	if (r != NULL && s->output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED) {
 		const struct u_stereo_vrefine *ref = &r->ref;
 		out_stats->refine_state = !r->refine         ? XRT_STEREO_CAMERA_REFINE_OFF
@@ -4001,6 +6169,13 @@ ipc_server_stereo_camera_set_prompt_provider(ipc_server_stereo_camera_prompt_fn 
 }
 
 void
+ipc_server_stereo_camera_set_share_prompt_provider(u_app_share_prompt_fn fn, void *ctx)
+{
+	g_share_prompt_ctx = ctx;
+	g_share_prompt_fn = fn;
+}
+
+void
 ipc_server_stereo_camera_set_indicator_provider(ipc_server_stereo_camera_indicator_fn fn, void *ctx)
 {
 	g_indicator_ctx = ctx;
@@ -4033,6 +6208,16 @@ ipc_server_stereo_camera_get_status(struct ipc_server_stereo_camera_status *out)
 			continue;
 		}
 		out->started_streams++;
+		const struct scam_camera *sc = slot_cam(m, s->camera);
+		if (cam_is_app(sc)) {
+			// ADR-061: "Sharing <app>" — the shared app, not the consumer, names the share.
+			out->share_streams++;
+			size_t sn = strlen(out->shares);
+			if (strstr(out->shares, sc->info.display_name) == NULL && sn < sizeof(out->shares) - 1) {
+				snprintf(out->shares + sn, sizeof(out->shares) - sn, "%s%s", sn ? ", " : "",
+				         sc->info.display_name);
+			}
+		}
 		// Base name of the executable (Android: the package), de-duplicated, comma
 		// separated; an in-process component by its display name.
 		char label[256];
@@ -4066,6 +6251,7 @@ ipc_server_stereo_camera_stop_all(const char *why)
 	os_mutex_unlock(&m->lock);
 	os_mutex_lock(&m->consent_lock);
 	u_camera_consent_forget_once(&m->consent); // "Allow once" grants die with the stop
+	u_app_share_consent_forget_all(&m->share); // so do per-app-run share grants
 	os_mutex_unlock(&m->consent_lock);
 	U_LOG_W("stereo camera: STOP camera sharing (%s) — %u stream(s) ended", why != NULL ? why : "?", n);
 	indicator_changed(m);
@@ -4441,7 +6627,7 @@ ipc_server_stereo_camera_internal_acquire(struct ipc_server_stereo_camera_intern
 			break;
 		}
 		if (out_state != NULL) {
-			*out_state = effective_state_locked(m, &m->cams[s->camera]);
+			*out_state = effective_state_locked(m, slot_cam(m, s->camera));
 		}
 		int32_t slot = -1;
 		uint64_t seq = 0;

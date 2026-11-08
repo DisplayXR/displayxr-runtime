@@ -17,7 +17,7 @@
 #   sudo apt-get install -y build-essential cmake ninja-build pkg-config \
 #       libvulkan-dev vulkan-validationlayers glslang-tools \
 #       libeigen3-dev libcjson-dev \
-#       libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libxrandr-dev \
+#       libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libx11-dev libx11-xcb-dev libxrandr-dev \
 #       libwayland-dev libdbus-1-dev
 #   # libwayland-dev enables the XR_DXR_wayland_surface_binding present path;
 #   # libdbus-1-dev adds the Wayland window-geometry provider (#817) so
@@ -71,14 +71,24 @@
 #   ./scripts/build_linux.sh --clean     # drop the CMake cache first — REQUIRED
 #                                        # after installing a dependency into a
 #                                        # tree that was already configured
-#   ./scripts/build_linux.sh --qwerty    # build the qwerty keyboard/mouse driver
-#                                        # (#1727): the self-created X11 window
-#                                        # then drives the qwerty HMD + hand
-#                                        # controllers. REQUIRED for the
-#                                        # interactive CTS categories (actions,
-#                                        # scenario need controllers and a select
-#                                        # click). Off by default: the shipped
-#                                        # runtime has no qwerty on Linux.
+#   ./scripts/build_linux.sh --no-qwerty # leave out the qwerty keyboard/mouse
+#                                        # driver. It is ON by default (#2355),
+#                                        # as on Windows and macOS, because the
+#                                        # .deb and the tarball are built by
+#                                        # this script: without qwerty no pose
+#                                        # source is bound to the display head,
+#                                        # so a legacy/hosted app's head sits at
+#                                        # the display's static pose (0.1 m above
+#                                        # STAGE, 1.5 m under LOCAL) and the
+#                                        # legacy camera rig (#1381,
+#                                        # DXR_LEGACY_CAMERA_RIG) compiles out.
+#                                        # qwerty also drives the self-created
+#                                        # X11 window's fly camera + hand
+#                                        # controllers (#1727), which the
+#                                        # interactive CTS categories need. Its
+#                                        # XCB backend needs only <X11/keysym.h>
+#                                        # (a header): no new DT_NEEDED.
+#                                        # (--qwerty is still accepted, a no-op.)
 #   ./scripts/build_linux.sh --apps      # also build the OpenXR loader + the
 #                                        # test apps: cube_hosted_legacy_vk_linux
 #                                        # (hosted, Phase 1b) and cube_handle_vk_linux
@@ -99,7 +109,7 @@ HYBRID_MODE=OFF
 RUN_TEST=ON
 BUILD_APPS=OFF
 CLEAN=OFF
-QWERTY=OFF
+QWERTY=ON
 for arg in "$@"; do
   case "$arg" in
     --service) SERVICE_MODE=ON ;;
@@ -108,6 +118,7 @@ for arg in "$@"; do
     --apps) BUILD_APPS=ON ;;
     --clean) CLEAN=ON ;;
     --qwerty) QWERTY=ON ;;
+    --no-qwerty) QWERTY=OFF ;;
     *) echo "Unknown arg: $arg" >&2; exit 2 ;;
   esac
 done

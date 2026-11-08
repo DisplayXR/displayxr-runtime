@@ -1098,6 +1098,11 @@ struct xrt_session_info
 	//! ask for it.
 	bool rear_depth_budget_requested;
 
+	//! XR_DXR_app_share: the app chained XrSessionShareabilityDXR with
+	//! shareable = XR_FALSE — never list this session as an app-share source
+	//! (ADR-061 spec §5). Read by the service at session create.
+	bool app_share_not_shareable;
+
 	//! Readback callback for offscreen compositing (called with composited RGBA pixels)
 	void (*readback_callback)(const uint8_t *pixels, uint32_t w, uint32_t h, void *userdata);
 	//! Userdata passed to readback_callback

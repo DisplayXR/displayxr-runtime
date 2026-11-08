@@ -607,6 +607,187 @@ u_offbox_consent_set(const char *provider_id, bool granted);
 void
 u_offbox_consent_list(void (*cb)(void *ctx, const char *provider_id), void *ctx);
 
+/*
+ *
+ * App share consent (ADR-061 decision 10, XR_DXR_app_share spec §6).
+ *
+ * A SEPARATE evaluation from the camera table above: no OS camera is opened,
+ * and the content belongs to an app the consumer does not own. Decision order
+ * at every app-share start (first hit wins):
+ *   1. sharing off — the camera kill switch (DXR_STEREO_CAMERA=0), the user's
+ *      "Share the 3D camera with apps" toggle, or DXR_APP_SHARE=0   -> DISABLED
+ *   2. no verifiable consumer identity                              -> REFUSED
+ *   3. the source app opted out, exited, or cannot be tapped        -> BUSY
+ *   4. DXR_APP_SHARE_DEV=1 (development gate, loud WARN)            -> ALLOWED
+ *   5. `share.prompt = per-app-run` and an earlier Allow for this
+ *      consumer + this app instance that is still running          -> ALLOWED
+ *   6. the share prompt ("Share <app> with <consumer>? Deny / Allow"):
+ *      Allow (or Allow once) -> ALLOWED; Deny, no answer, no prompt UI,
+ *      DXR_STEREO_CAMERA_PROMPT=0                                    -> REFUSED
+ * What is NOT in it, on purpose: DXR_STEREO_CAMERA_DEV_ALLOW (it lifts the
+ * camera table only), consent delegation (a browser's per-origin prompt
+ * cannot name the app being shared), the OS camera switch, and any STORED
+ * decision — there is no "always allow" and no stored Deny. The only
+ * persistent state is the two user settings below, in their own namespace of
+ * the consent store, so a camera Allow can never double as a share Allow.
+ *
+ */
+
+//! `share.prompt`: when the share prompt is shown.
+enum u_app_share_prompt_mode
+{
+	U_APP_SHARE_PROMPT_ALWAYS = 0,      //!< every start (default)
+	U_APP_SHARE_PROMPT_PER_APP_RUN = 1, //!< one Allow covers this consumer + app until the app exits (kiosks)
+};
+
+//! `share.resolution`: the fixed per-eye stream size of app entries.
+enum u_app_share_resolution
+{
+	U_APP_SHARE_RESOLUTION_720P = 0,  //!< 2x1280x720 @ 30 Hz (default)
+	U_APP_SHARE_RESOLUTION_1080P = 1, //!< 2x1920x1080 @ up to 60 Hz (opt-in)
+};
+
+struct u_app_share_settings
+{
+	enum u_app_share_prompt_mode prompt;
+	enum u_app_share_resolution resolution;
+};
+
+//! Per-eye size + rate of @p r (720p: 1280x720 @ 30; 1080p: 1920x1080 @ 60).
+void
+u_app_share_resolution_extent(enum u_app_share_resolution r, uint32_t *out_w, uint32_t *out_h, float *out_fps);
+
+const char *
+u_app_share_prompt_mode_str(enum u_app_share_prompt_mode m);
+
+const char *
+u_app_share_resolution_str(enum u_app_share_resolution r);
+
+//! Parse "always" / "per-app-run" (false = unknown, @p out untouched).
+bool
+u_app_share_prompt_mode_parse(const char *s, enum u_app_share_prompt_mode *out);
+
+//! Parse "720p" / "1080p" (false = unknown, @p out untouched).
+bool
+u_app_share_resolution_parse(const char *s, enum u_app_share_resolution *out);
+
+/*!
+ * The user's share settings from the per-user consent store, namespace
+ * "share" (Windows: HKCU\Software\DisplayXR\CameraConsent\Share, REG_SZ
+ * `prompt` / `resolution`; POSIX: camera_consent.json `"share": {"prompt":
+ * ..., "resolution": ...}`). Missing / unreadable / unknown values give the
+ * defaults (always, 720p). Never machine-wide: a policy cannot pre-grant a
+ * share.
+ */
+void
+u_app_share_settings_load(struct u_app_share_settings *out);
+
+//! Write one setting ("prompt" or "resolution"); false = unknown key / value or the store cannot be written.
+bool
+u_app_share_settings_set(const char *key, const char *value);
+
+//! Verdicts of the share evaluation (the camera's three plus BUSY).
+enum u_app_share_verdict
+{
+	U_APP_SHARE_ALLOWED = 0,
+	U_APP_SHARE_REFUSED = 1,  //!< XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR
+	U_APP_SHARE_DISABLED = 2, //!< XR_ERROR_STEREO_CAMERA_DISABLED_DXR
+	U_APP_SHARE_BUSY = 3,     //!< XR_ERROR_STEREO_CAMERA_BUSY_DXR
+};
+
+enum u_app_share_why
+{
+	U_APP_SHARE_WHY_KILL_SWITCH = 0,
+	U_APP_SHARE_WHY_SHARING_OFF,
+	U_APP_SHARE_WHY_APP_SHARE_OFF,
+	U_APP_SHARE_WHY_NO_IDENTITY,
+	U_APP_SHARE_WHY_SOURCE_GONE,
+	U_APP_SHARE_WHY_DEV_GATE,
+	U_APP_SHARE_WHY_RUN_GRANT,
+	U_APP_SHARE_WHY_PROMPT_ALLOW,
+	U_APP_SHARE_WHY_PROMPT_DENY,
+	U_APP_SHARE_WHY_PROMPT_UNAVAILABLE,
+	U_APP_SHARE_WHY_PROMPT_TIMEOUT,
+};
+
+const char *
+u_app_share_why_str(enum u_app_share_why why);
+
+/*!
+ * The share prompt: BLOCK until answered or @p timeout_ms. @p consumer_exe is
+ * the consumer's full path, @p app_name the shared app's display name. Only
+ * ALLOW / ALLOW_ONCE allow; the UI should offer Deny / Allow only.
+ */
+typedef enum u_camera_consent_prompt_answer (*u_app_share_prompt_fn)(void *ctx,
+                                                                     const char *consumer_exe,
+                                                                     long consumer_pid,
+                                                                     const char *app_name,
+                                                                     const char *app_exe,
+                                                                     uint32_t timeout_ms);
+
+//! One app-share start, as the service sees it.
+struct u_app_share_request
+{
+	const char *consumer_exe; //!< OS-derived ("" = none)
+	long consumer_pid;
+	const char *app_name; //!< the shared app's display name
+	const char *app_exe;  //!< the shared app's executable (full path; "" for the fake)
+	long app_pid;
+	//! The app entry's stable key (its camera id): a per-app-run grant is for
+	//! this instance and dies when it exits (u_app_share_consent_forget_app).
+	uint64_t app_key;
+	//! false = opted out / exited / untappable (step 3).
+	bool source_available;
+};
+
+#define U_APP_SHARE_RUN_GRANTS_MAX 16
+
+struct u_app_share_consent
+{
+	//! The camera policy whose kill switch + sharing toggle stop shares too (step 1).
+	struct u_camera_consent *camera;
+	bool app_share_off;  //!< DXR_APP_SHARE=0
+	bool dev_gate;       //!< DXR_APP_SHARE_DEV=1
+	bool prompt_enabled; //!< DXR_STEREO_CAMERA_PROMPT (shared with the camera prompt)
+	uint32_t prompt_timeout_ms;
+	enum u_app_share_prompt_mode mode;
+	u_app_share_prompt_fn prompt; //!< NULL = no UI: refused
+	void *prompt_ctx;
+	bool dev_gate_logged;
+	struct
+	{
+		char consumer[U_CAMERA_CONSENT_EXE_MAX];
+		uint64_t app_key;
+		long app_pid;
+	} grants[U_APP_SHARE_RUN_GRANTS_MAX];
+	uint32_t grant_count;
+};
+
+struct u_app_share_decision
+{
+	enum u_app_share_verdict verdict;
+	enum u_app_share_why why;
+};
+
+/*!
+ * Run the share decision tree. Not thread-safe by itself (the service
+ * serialises on its consent lock, which is never the manager lock: the
+ * prompt blocks).
+ */
+void
+u_app_share_consent_evaluate(struct u_app_share_consent *c,
+                             const struct u_app_share_request *req,
+                             struct u_app_share_decision *out);
+
+//! The app instance @p app_key exited: its per-app-run grants die with it.
+void
+u_app_share_consent_forget_app(struct u_app_share_consent *c, uint64_t app_key);
+
+//! Forget every per-app-run grant ("Stop camera sharing").
+void
+u_app_share_consent_forget_all(struct u_app_share_consent *c);
+
+
 #ifdef __cplusplus
 }
 #endif

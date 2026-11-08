@@ -404,6 +404,13 @@ struct comp_xbridge
 		ID3D12Resource *eg_12[XB_EGRESS_RING];
 		//! Content generation each slot's pixels carry (0 = never written).
 		uint64_t slot_seq[XB_EGRESS_RING];
+		//! Monotonic transport order of each slot's pixels (`copy_n` at the copy
+		//! that wrote them) — the half-rate catch-up's notion of "newest", since
+		//! `slot_seq` is a content hash and has no order.
+		uint64_t slot_copy_n[XB_EGRESS_RING];
+		uint64_t copy_n;
+		//! One WARN the first time a half-rate skip catches up locally.
+		bool catchup_warned;
 		//! Dirty box each slot still owes, accumulated across the frames it was
 		//! not the write slot. Empty (w==0) means "already current".
 		int32_t pend_x[XB_EGRESS_RING], pend_y[XB_EGRESS_RING];
@@ -444,6 +451,19 @@ struct comp_xbridge
 	uint64_t gate_under_since_ns;
 	//! One WARN for the over-budget-but-not-the-planes case, ever.
 	bool gate_atlas_only_warned;
+	/*!
+	 * Producer and consumer are the SAME adapter (the LUIDs match). The gate
+	 * protects a cross-adapter link; on one adapter the "transport" is a copy
+	 * within that GPU's own memory, a fraction of a percent of its bandwidth, so
+	 * halving a plane there buys nothing and costs the 2D update rate. The gate
+	 * is off for such a bridge (DXR_XBRIDGE_GATE_SAME_ADAPTER=1 forces it on).
+	 */
+	bool same_adapter;
+	//! The LUIDs match, whatever the gate override says. A bridge on one adapter
+	//! copies every app frame (atlas + planes) within that GPU for nothing: the
+	//! consumer could read the producer's texture in place (the hub's DIRECT
+	//! ingress). Reported once at create and on the [RENDER] row.
+	bool luid_same;
 
 	// --- ingress ---------------------------------------------------------
 	int ingress_mode;
@@ -1216,6 +1236,7 @@ xb_release_plane(struct comp_xbridge *xb, uint32_t p, bool drained)
 			pl.eg_tex[i] = nullptr;
 		}
 		pl.slot_seq[i] = 0;
+		pl.slot_copy_n[i] = 0;
 		pl.pend_w[i] = 0;
 		pl.pend_h[i] = 0;
 	}
@@ -1837,8 +1858,57 @@ xb_record_plane(struct comp_xbridge *xb, uint32_t p, uint64_t seq, int xa, int e
 	 */
 	const struct xb_plane_box owed = xb_plane_pend_box(pl, eg);
 	const struct xb_plane_box staged = {pl.stage_x, pl.stage_y, pl.stage_w, pl.stage_h};
-	if (xb_plane_decide(pl.slot_seq[eg], pl.stage_seq, &owed, &staged, pl.half_rate, seq, pl.half_rate_parity) !=
-	    XB_PLANE_COPY) {
+	const enum xb_plane_action act =
+	    xb_plane_decide(pl.slot_seq[eg], pl.stage_seq, &owed, &staged, pl.half_rate, seq, pl.half_rate_parity);
+	if (act == XB_PLANE_SKIP_HALF_RATE) {
+		/*
+		 * Catch the slot up from the newest transported slot, on the consumer
+		 * queue alone — never across the adapter link the gate is protecting.
+		 * Without this the slot shows content three frames old while the frame
+		 * before it showed one frame old: the 2D band steps back in time on
+		 * every skipped frame (see xb_plane_catchup_source).
+		 *
+		 * Only the box this slot owes can differ from the source slot: outside
+		 * it nothing changed since this slot's generation, and the source's
+		 * generation is newer still. After the copy the two slots hold
+		 * identical pixels, so this slot inherits the source's generation,
+		 * debt and transport order verbatim. Both egress textures are
+		 * simultaneous-access COMMON, and the source slot's own copy was an
+		 * earlier ExecuteCommandLists on this same queue, so no barrier.
+		 */
+		const int src = xb_plane_catchup_source(pl.slot_seq, pl.slot_copy_n, XB_EGRESS_RING, eg);
+		uint32_t lim_w = 0, lim_h = 0;
+		xb_plane_limits(pl.src_w, pl.src_h, pl.alloc_w, pl.alloc_h, &lim_w, &lim_h);
+		const struct xb_plane_box b = xb_plane_box_snap_clamp(&owed, lim_w, lim_h);
+		if (src >= 0 && pl.eg_12[src] != nullptr && pl.eg_12[eg] != nullptr && !xb_plane_box_empty(&b)) {
+			D3D12_BOX box{};
+			box.left = (UINT)b.x;
+			box.top = (UINT)b.y;
+			box.front = 0;
+			box.right = (UINT)b.x + b.w;
+			box.bottom = (UINT)b.y + b.h;
+			box.back = 1;
+			D3D12_TEXTURE_COPY_LOCATION dst = sub_loc(pl.eg_12[eg]);
+			D3D12_TEXTURE_COPY_LOCATION from = sub_loc(pl.eg_12[src]);
+			xb->cons_list->CopyTextureRegion(&dst, (UINT)b.x, (UINT)b.y, 0, &from, &box);
+			pl.slot_seq[eg] = pl.slot_seq[src];
+			pl.slot_copy_n[eg] = pl.slot_copy_n[src];
+			pl.pend_x[eg] = pl.pend_x[src];
+			pl.pend_y[eg] = pl.pend_y[src];
+			pl.pend_w[eg] = pl.pend_w[src];
+			pl.pend_h[eg] = pl.pend_h[src];
+			if (!pl.catchup_warned) {
+				pl.catchup_warned = true;
+				U_LOG_W("%s: %s plane at half rate — skipped frames now repeat the newest transported "
+				        "content via an output-device slot copy instead of showing an older slot (no "
+				        "cross-adapter traffic)",
+				        XB_TAG(xb), xb_plane_name(p));
+			}
+		}
+		pl.skips++;
+		return 0;
+	}
+	if (act != XB_PLANE_COPY) {
 		/*
 		 * Skipped. Leave `slot_seq` ALONE in every skip case: advancing it would
 		 * mark the slot as carrying this generation's pixels when no copy ever
@@ -1881,6 +1951,7 @@ xb_record_plane(struct comp_xbridge *xb, uint32_t p, uint64_t seq, int xa, int e
 	}
 
 	pl.slot_seq[eg] = pl.stage_seq;
+	pl.slot_copy_n[eg] = ++pl.copy_n;
 	pl.pend_w[eg] = 0;
 	pl.pend_h[eg] = 0;
 	pl.copies++;
@@ -1907,12 +1978,24 @@ xb_record_plane(struct comp_xbridge *xb, uint32_t p, uint64_t seq, int xa, int e
  *  - throttling only happens when the PLANES contribute meaningfully to it
  *    (@ref XB_GATE_PLANE_FLOOR_BYTES_PER_S), so an over-budget atlas alone never
  *    throttles a plane;
- *  - the latch is NOT permanent — it clears when the transport has stayed inside
- *    budget for @ref XB_GATE_UNLATCH_NS, and a plane re-bind clears its own.
+ *  - the latch is NOT permanent — it clears when the transport WOULD fit at full
+ *    plane rate, or the planes have gone idle, for @ref XB_GATE_UNLATCH_NS (the
+ *    rule is xb_gate_decide; "total back under budget" could never hold once the
+ *    atlas alone exceeded it, which pinned an 8K session at half rate), and a
+ *    plane re-bind clears its own.
+ *
+ * A same-adapter bridge has no cross-adapter link and never latches.
  */
 static void
 xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_bytes, uint64_t seq)
 {
+	if (xb->same_adapter) {
+		// No cross-adapter link to protect (see `same_adapter`): never latch.
+		for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
+			xb->plane[p].gate_bytes = 0;
+		}
+		return;
+	}
 	const uint64_t now = os_monotonic_get_ns();
 	xb->gate_atlas_bytes += atlas_bytes;
 	xb->gate_plane_bytes += plane_bytes;
@@ -1944,21 +2027,21 @@ xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_
 		xb->plane[p].gate_bytes = 0;
 	}
 
-	if (total_rate <= XB_BANDWIDTH_GATE_BYTES_PER_S) {
-		// UN-LATCH. A latched plane runs at half rate for as long as the
-		// pressure lasts, not for the rest of the session — a resize or a
-		// fullscreen burst must not permanently halve the 2D update rate of a
-		// session that spends the next hour idle.
+	const enum xb_gate_action act = xb_gate_decide(total_rate, plane_rate, any_latched,
+	                                               XB_BANDWIDTH_GATE_BYTES_PER_S, XB_GATE_PLANE_FLOOR_BYTES_PER_S);
+	if (act == XB_GATE_SETTLED) {
+		// UN-LATCH once settled for the dwell. A latched plane runs at half rate
+		// for as long as the pressure lasts, not for the rest of the session.
 		if (xb->gate_under_since_ns == 0) {
 			xb->gate_under_since_ns = now;
-		} else if (any_latched && now - xb->gate_under_since_ns >= XB_GATE_UNLATCH_NS) {
+		} else if (now - xb->gate_under_since_ns >= XB_GATE_UNLATCH_NS) {
 			for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
 				xb->plane[p].half_rate = false;
 			}
 			xb->gate_under_since_ns = 0;
 			U_LOG_W(
-			    "%s: transport has been inside the %.1f GB/s gate for %llu s — "
-			    "releasing the half-rate latch on every plane (#918 Phase 2a)",
+			    "%s: transport would fit the %.1f GB/s gate at full plane rate, or the planes went idle, for "
+			    "%llu s — releasing the half-rate latch on every plane (#918 Phase 2a)",
 			    XB_TAG(xb), (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9,
 			    (unsigned long long)(XB_GATE_UNLATCH_NS / 1000000000ull));
 		}
@@ -1966,7 +2049,7 @@ xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_
 	}
 	xb->gate_under_since_ns = 0;
 
-	if (plane_rate < XB_GATE_PLANE_FLOOR_BYTES_PER_S) {
+	if (act == XB_GATE_ATLAS_ONLY) {
 		// Over budget, but not because of the planes. Halving one would cost
 		// the 2D update rate and buy nothing measurable.
 		if (!xb->gate_atlas_only_warned) {
@@ -1980,8 +2063,8 @@ xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_
 		}
 		return;
 	}
-	if (worst >= COMP_XBRIDGE_PLANE_COUNT) {
-		return; // every live plane is already latched
+	if (act != XB_GATE_LATCH || worst >= COMP_XBRIDGE_PLANE_COUNT) {
+		return; // nothing to do, or every live plane is already latched
 	}
 	xb->plane[worst].half_rate = true;
 	xb->plane[worst].half_rate_parity = seq & 1ull;
@@ -2276,6 +2359,37 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 			        xb_hr(hr, b, sizeof(b)));
 			*out_reason = "D3D12CreateDevice failed";
 			goto fail;
+		}
+	}
+
+	{
+		const LUID pl = xb->prod_dev->GetAdapterLuid();
+		const LUID cl = xb->cons_dev->GetAdapterLuid();
+		xb->same_adapter = pl.LowPart == cl.LowPart && pl.HighPart == cl.HighPart;
+		xb->luid_same = xb->same_adapter;
+		const char *force = getenv("DXR_XBRIDGE_GATE_SAME_ADAPTER");
+		if (xb->same_adapter && force != nullptr && force[0] == '1') {
+			xb->same_adapter = false;
+		}
+		if (xb->same_adapter) {
+			U_LOG_W("%s: producer and consumer share one adapter — the %.1f GB/s cross-adapter bandwidth gate "
+			        "is off for this bridge (planes always run at full rate; DXR_XBRIDGE_GATE_SAME_ADAPTER=1 "
+			        "forces it on)",
+			        XB_TAG(xb), (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9);
+		}
+		if (xb->luid_same) {
+			/*
+			 * The slow path, made loud. Both field incidents of this class
+			 * (#2518 D3D12, #2563 VK: a weaker single GPU at 8K lost 20 fps to
+			 * these copies, and the staged pick also weaves a frame stale,
+			 * ADR-059 Amendment 1) were invisible in the log and found by
+			 * measuring the GPU copy engine by hand.
+			 */
+			U_LOG_W("%s: SAME-ADAPTER BRIDGE — every app frame is copied through the bridge on one GPU "
+			        "(staged ingress: copy-engine load scales with the atlas and planes, and the weave reads "
+			        "one frame stale). The hub reads it in place on one adapter (DIRECT ingress); if this "
+			        "session should be on the hub, check its `hub placement:` / `ingress_reason` line",
+			        XB_TAG(xb));
 		}
 	}
 
@@ -3675,7 +3789,8 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 		 * is what let a stale 2D band composite under a current frame with
 		 * nothing anywhere able to tell.
 		 */
-		if (xb_plane_slot_is_valid(pl.live, pl.staged, pl.slot_seq[eg], pl.stage_seq)) {
+		if (xb_plane_slot_is_presentable(pl.live, pl.staged, pl.slot_seq[eg], pl.stage_seq, pl.half_rate,
+		                                 pl.slot_copy_n[eg], pl.copy_n)) {
 			xb->eg_recipe[eg].plane_valid |= (1u << p);
 		}
 	}
@@ -4056,6 +4171,12 @@ extern "C" bool
 comp_xbridge_is_degraded(struct comp_xbridge *xb)
 {
 	return xb != nullptr && xb->degraded.load(std::memory_order_relaxed);
+}
+
+extern "C" bool
+comp_xbridge_is_same_adapter(struct comp_xbridge *xb)
+{
+	return xb != nullptr && xb->luid_same;
 }
 
 

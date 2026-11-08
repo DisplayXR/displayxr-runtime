@@ -63,6 +63,12 @@ _Static_assert(XRT_PLUGIN_STEREO_CAMERA_CALIBRATED == 0x4, "flag mirror");
 _Static_assert(XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED == 0x8, "flag mirror");
 _Static_assert(XRT_PLUGIN_STEREO_CAMERA_MONOCHROME == 0x10, "flag mirror");
 _Static_assert(XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE == 0x20, "flag mirror");
+// ADR-061: XR_STEREO_CAMERA_APP_CONTENT_BIT_DXR (XR_DXR_app_share.h), reserved by the stereo camera header.
+_Static_assert(XRT_STEREO_CAMERA_APP_CONTENT == 0x40, "flag mirror");
+_Static_assert(XRT_APP_SHARE_EXECUTABLE_NAME_SIZE == XR_APP_SHARE_EXECUTABLE_NAME_MAX_SIZE_DXR, "exe name size");
+_Static_assert(XRT_APP_SHARE_APPLICATION_NAME_SIZE == XR_MAX_APPLICATION_NAME_SIZE, "app name size");
+_Static_assert((XRT_STEREO_CAMERA_CLIENT_INTERNAL_APP_SHARE & XRT_STEREO_CAMERA_CLIENT_PUBLIC_MASK) == 0,
+               "the internal app-share client flag must never alias a public XrStereoCameraClientFlagsDXR bit");
 // The enum mirrors are pinned the same way, each side against the literal on
 // its own: a direct XR-vs-xrt comparison is "operands are different enum types"
 // (MSVC C5287 at /W4), and MSVC's C front end raises it even through (int)
@@ -104,6 +110,7 @@ verify_encodings(void)
 	       XR_STEREO_CAMERA_NATIVELY_RECTIFIED_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED &&
 	       XR_STEREO_CAMERA_MONOCHROME_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_MONOCHROME &&
 	       XR_STEREO_CAMERA_RECTIFIABLE_BIT_DXR == XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE &&
+	       XR_STEREO_CAMERA_APP_CONTENT_BIT_DXR == XRT_STEREO_CAMERA_APP_CONTENT &&
 	       XR_STEREO_CAMERA_FORMAT_GRAY8_BIT_DXR == XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_FORMAT_GRAY8) &&
 	       XR_STEREO_CAMERA_FORMAT_NV12_BIT_DXR == XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_FORMAT_NV12) &&
 	       XR_STEREO_CAMERA_FORMAT_BGRA8_BIT_DXR == XRT_STEREO_CAMERA_BIT(XRT_STEREO_CAMERA_FORMAT_BGRA8) &&
@@ -250,6 +257,38 @@ oxr_xrEnumerateStereoCamerasDXR(XrInstance instance,
 		if (orient != NULL) {
 			orient->frameOrientationDegrees = p.frame_orientation_deg;
 		}
+#ifdef OXR_HAVE_DXR_app_share
+		// ADR-061: an app entry's description, when the app chained it (spec §2:
+		// filled only for an APP_CONTENT entry; test the flag, not the struct).
+		XrAppShareSourcePropertiesDXR *ap = OXR_GET_OUTPUT_FROM_CHAIN(
+		    o, XR_TYPE_APP_SHARE_SOURCE_PROPERTIES_DXR, XrAppShareSourcePropertiesDXR);
+		if (ap != NULL && inst->extensions.DXR_app_share && (p.flags & XRT_STEREO_CAMERA_APP_CONTENT) != 0 &&
+		    c->get_app_source != NULL) {
+			struct xrt_app_share_source_info ai;
+			xret = c->get_app_source(c, p.camera_id, &ai);
+			if (xret == XRT_ERROR_IPC_FAILURE) {
+				return scam_xret(&log, xret, "xrEnumerateStereoCamerasDXR");
+			}
+			if (xret == XRT_SUCCESS) {
+				ap->processId = ai.pid;
+				memcpy(ap->executableName, ai.executable_name, sizeof(ap->executableName));
+				ap->executableName[sizeof(ap->executableName) - 1] = '\0';
+				memcpy(ap->applicationName, ai.application_name, sizeof(ap->applicationName));
+				ap->applicationName[sizeof(ap->applicationName) - 1] = '\0';
+				ap->windowRect.offset.x = ai.window_x;
+				ap->windowRect.offset.y = ai.window_y;
+				ap->windowRect.extent.width = (int32_t)ai.window_width;
+				ap->windowRect.extent.height = (int32_t)ai.window_height;
+				ap->contentEyeExtent.width = (int32_t)ai.content_eye_width;
+				ap->contentEyeExtent.height = (int32_t)ai.content_eye_height;
+				ap->viewCount = ai.view_count;
+				ap->activeViewCount = ai.active_view_count;
+				ap->zeroDisparityShiftFrac = ai.zero_disparity_shift_frac;
+				ap->encodingIsLinear = ai.encoding_is_linear ? XR_TRUE : XR_FALSE;
+			}
+			// Gone between count and here: the struct stays as the app passed it.
+		}
+#endif
 	}
 	return XR_SUCCESS;
 }
@@ -465,7 +504,8 @@ oxr_xrAcquireStereoCameraFrameDXR(XrStereoCameraStreamDXR stream, XrStereoCamera
 	struct xrt_stereo_camera_client *c = client_of(s->inst);
 	bool ready = false;
 	struct xrt_stereo_camera_frame_info fi;
-	xrt_result_t xret = c->acquire(c, s->id, &ready, &fi);
+	struct xrt_app_share_frame_info app;
+	xrt_result_t xret = c->acquire(c, s->id, &ready, &fi, &app);
 	if (xret != XRT_SUCCESS) {
 		return scam_xret(&log, xret, "xrAcquireStereoCameraFrameDXR");
 	}
@@ -485,6 +525,23 @@ oxr_xrAcquireStereoCameraFrameDXR(XrStereoCameraStreamDXR stream, XrStereoCamera
 	frame->captureTimeIsExposure = fi.time_is_exposure ? XR_TRUE : XR_FALSE;
 	frame->output = (XrStereoCameraOutputDXR)fi.output;
 	frame->calibrationGeneration = fi.calibration_generation;
+#ifdef OXR_HAVE_DXR_app_share
+	// ADR-061 spec §4: per-frame app metadata on an APP_CONTENT stream.
+	XrAppShareFrameInfoDXR *afi =
+	    OXR_GET_OUTPUT_FROM_CHAIN(frame, XR_TYPE_APP_SHARE_FRAME_INFO_DXR, XrAppShareFrameInfoDXR);
+	if (afi != NULL && s->inst->extensions.DXR_app_share && app.valid != 0) {
+		afi->contentRect.offset.x = app.content_x;
+		afi->contentRect.offset.y = app.content_y;
+		afi->contentRect.extent.width = (int32_t)app.content_width;
+		afi->contentRect.extent.height = (int32_t)app.content_height;
+		afi->mono = app.mono ? XR_TRUE : XR_FALSE;
+		afi->contentGeneration = app.content_generation;
+		afi->zeroDisparityShiftFrac = app.zero_disparity_shift_frac;
+		afi->sourceCommitTime = app.commit_time_ns > 0
+		                            ? time_state_monotonic_to_ts_ns(s->inst->timekeeping, app.commit_time_ns)
+		                            : 0;
+	}
+#endif
 	return XR_SUCCESS;
 }
 

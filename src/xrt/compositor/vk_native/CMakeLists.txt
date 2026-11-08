@@ -137,6 +137,12 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 			comp_vk_native_window_xcb.h)
 		target_include_directories(comp_vk_native PRIVATE ${XCB_INCLUDE_DIRS})
 		target_link_libraries(comp_vk_native PRIVATE ${XCB_LIBRARIES})
+		if(XCB_SHAPE_FOUND)
+			# Empty input region for the adopt-own-window child (#2322).
+			target_compile_definitions(comp_vk_native PRIVATE XRT_HAVE_XCB_SHAPE=1)
+			target_include_directories(comp_vk_native PRIVATE ${XCB_SHAPE_INCLUDE_DIRS})
+			target_link_libraries(comp_vk_native PRIVATE ${XCB_SHAPE_LIBRARIES})
+		endif()
 
 		# #902 present-feedback feeder: the desktop-Linux source for the vblank
 		# grid late weave aims at (X11 Present CompleteNotify, encoded in-tree —
@@ -225,9 +231,12 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		endif()
 	endif()
 
-	# Qwerty include path for runtime-side 2D/3D toggle polling
+	# Qwerty for runtime-side 2D/3D toggle polling and the XCB window's input
+	# (qwerty_process_xcb). Link the driver, not just its include path: an
+	# IPC-only runtime (build_linux.sh --service) has no target_lists to bring
+	# the symbols in, and comp_vk_native sits after it on the link line (#2355).
 	if(XRT_BUILD_DRIVER_QWERTY)
-		target_link_libraries(comp_vk_native PRIVATE drv_qwerty_includes)
+		target_link_libraries(comp_vk_native PRIVATE drv_qwerty drv_qwerty_includes)
 		target_compile_definitions(comp_vk_native PRIVATE XRT_BUILD_DRIVER_QWERTY)
 	endif()
 endif()

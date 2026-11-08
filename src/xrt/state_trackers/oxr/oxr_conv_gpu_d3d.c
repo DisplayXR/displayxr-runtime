@@ -34,7 +34,7 @@
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_instance.h"
 
-#include "client/ipc_client_lift_link.h"
+#include "client/ipc_client_service_link.h"
 
 #ifdef XRT_OS_WINDOWS
 #include "xrt/xrt_windows.h"
@@ -48,9 +48,11 @@
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach-o/dyld.h> // _NSGetExecutablePath
 #endif
-#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
-#include <unistd.h> // readlink
+#if (defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)) || defined(XRT_OS_MACOS)
+#include <unistd.h> // readlink, getpid
 #endif
+
+#include "util/u_debug.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -60,7 +62,7 @@
  * Linux (the socket-activated service socket) and macOS (the launchd-started
  * service socket). Never launched: a plain POSIX socket connect does not
  * start a service, and on Windows the link checks the service's singleton
- * first (ipc_client_lift_link.c).
+ * first (ipc_client_service_link.c).
  */
 #if defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS) || (defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID))
 #define OXR_CONV_HAVE_LINK 1
@@ -128,19 +130,105 @@ exe_basename(char *out, size_t size)
 }
 
 //! Pointer compare-and-swap (no <stdatomic.h>: the MinGW / MSVC rule).
-static struct ipc_client_lift_link *
-link_cas(struct ipc_client_lift_link **p, struct ipc_client_lift_link *expected, struct ipc_client_lift_link *desired)
+static struct ipc_client_service_link *
+link_cas(struct ipc_client_service_link **p,
+         struct ipc_client_service_link *expected,
+         struct ipc_client_service_link *desired)
 {
 	return __sync_val_compare_and_swap(p, expected, desired);
 }
 #endif
 
-struct ipc_client_lift_link *
+#if defined(XRT_OS_WINDOWS)
+// ADR-061: the client-side read of the service's own kill switch, so an
+// opted-out machine's apps never open a link just to share.
+DEBUG_GET_ONCE_BOOL_OPTION(app_share_link, "DXR_APP_SHARE", true)
+#endif
+
+bool
+oxr_service_link_share_wanted(struct oxr_session *sess)
+{
+#if defined(XRT_OS_WINDOWS)
+	// Only where a tap can exist: the D3D11 fill arm (comp_xbridge_share_tap.h)
+	// that the D3D11, D3D12 and Vulkan in-process tiers feed. GL has none; nor
+	// has macOS / Linux in v1 — those never dial the service to share (an APP
+	// slot of IPC_MAX_CLIENTS each, and a socket activation on Linux, for
+	// nothing; review #2533 item 5). Even here the link dials only once the
+	// compositor reported its tap state (ipc_client_service_link.c).
+	return sess != NULL &&
+	       (sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor ||
+	        sess->is_vk_native_compositor) &&
+	       debug_get_bool_option_app_share_link();
+#else
+	(void)sess;
+	return false;
+#endif
+}
+
+uint32_t
+oxr_service_link_caps(struct oxr_session *sess)
+{
+	uint32_t caps = 0;
+	if (sess != NULL && sess->sys != NULL && sess->sys->inst != NULL && sess->sys->inst->extensions.DXR_lift) {
+		caps |= XRT_SHARE_LINK_CAP_LIFT;
+	}
+	if (oxr_service_link_share_wanted(sess)) {
+		caps |= XRT_SHARE_LINK_CAP_SHARE;
+	}
+	return caps;
+}
+
+static uint32_t
+session_tier(const struct oxr_session *sess)
+{
+	if (sess->is_d3d11_native_compositor) {
+		return XRT_SHARE_LINK_TIER_D3D11;
+	}
+	if (sess->is_d3d12_native_compositor) {
+		return XRT_SHARE_LINK_TIER_D3D12;
+	}
+	if (sess->is_vk_native_compositor) {
+		return XRT_SHARE_LINK_TIER_VULKAN;
+	}
+	if (sess->is_gl_native_compositor) {
+		return XRT_SHARE_LINK_TIER_GL;
+	}
+	if (sess->is_metal_native_compositor) {
+		return XRT_SHARE_LINK_TIER_METAL;
+	}
+	return XRT_SHARE_LINK_TIER_UNKNOWN;
+}
+
+void
+oxr_service_link_fill_registration(struct oxr_session *sess, bool running, struct xrt_share_link_registration *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->caps = oxr_service_link_caps(sess);
+	out->opt_out = sess->app_share_opt_out ? 1u : 0u;
+	out->tier = session_tier(sess);
+	out->session_running = running ? 1u : 0u;
+#if defined(XRT_OS_WINDOWS)
+	out->pid = (uint32_t)GetCurrentProcessId();
+	char exe[MAX_PATH] = {0};
+	if (GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe)) > 0) {
+		snprintf(out->exe, sizeof(out->exe), "%s", exe);
+	}
+#elif defined(OXR_CONV_HAVE_LINK)
+	out->pid = (uint32_t)getpid();
+	exe_basename(out->exe, sizeof(out->exe));
+#endif
+	if (sess->sys != NULL && sess->sys->inst != NULL && sess->sys->inst->xinst != NULL) {
+		snprintf(out->app_name, sizeof(out->app_name), "%s",
+		         sess->sys->inst->xinst->instance_info.app_info.application_name);
+	}
+}
+
+struct ipc_client_service_link *
 oxr_conv_link_get(struct oxr_session *sess)
 {
 #ifdef XRT_OS_WINDOWS
-	struct ipc_client_lift_link *link = (struct ipc_client_lift_link *)InterlockedCompareExchangePointer(
-	    (PVOID volatile *)&sess->lift_link, NULL, NULL);
+	struct ipc_client_service_link *link = (struct ipc_client_service_link *)InterlockedCompareExchangePointer(
+	    (PVOID volatile *)&sess->service_link, NULL, NULL);
 	if (link != NULL) {
 		return link;
 	}
@@ -154,22 +242,27 @@ oxr_conv_link_get(struct oxr_session *sess)
 		base = slash != NULL ? slash + 1 : exe;
 	}
 	char label[XRT_MAX_APPLICATION_NAME_SIZE];
-	snprintf(label, sizeof(label), "%s (in-process lift)", base);
+	snprintf(label, sizeof(label), "%s (in-process)", base);
 
-	struct ipc_client_lift_link *made = NULL;
-	if (ipc_client_lift_link_create(label, &made) != XRT_SUCCESS) {
+	struct ipc_client_service_link *made = NULL;
+	if (ipc_client_service_link_create(label, oxr_service_link_caps(sess), &made) != XRT_SUCCESS) {
 		return NULL;
 	}
-	// Two threads may race the first lift call of a session: one link wins.
-	link = (struct ipc_client_lift_link *)InterlockedCompareExchangePointer((PVOID volatile *)&sess->lift_link,
-	                                                                        made, NULL);
+	if ((ipc_client_service_link_caps(made) & XRT_SHARE_LINK_CAP_SHARE) != 0) {
+		struct xrt_share_link_registration reg;
+		oxr_service_link_fill_registration(sess, false, &reg); // xrBeginSession says "running"
+		ipc_client_service_link_set_registration(made, &reg);  // not connected yet: stored
+	}
+	// Two threads may race the first use of a session's link: one link wins.
+	link = (struct ipc_client_service_link *)InterlockedCompareExchangePointer(
+	    (PVOID volatile *)&sess->service_link, made, NULL);
 	if (link != NULL) {
-		ipc_client_lift_link_destroy(&made);
+		ipc_client_service_link_destroy(&made);
 		return link;
 	}
 	return made;
 #elif defined(OXR_CONV_HAVE_LINK)
-	struct ipc_client_lift_link *link = link_cas(&sess->lift_link, NULL, NULL);
+	struct ipc_client_service_link *link = link_cas(&sess->service_link, NULL, NULL);
 	if (link != NULL) {
 		return link;
 	}
@@ -178,16 +271,21 @@ oxr_conv_link_get(struct oxr_session *sess)
 	char base[256];
 	exe_basename(base, sizeof(base));
 	char label[XRT_MAX_APPLICATION_NAME_SIZE];
-	snprintf(label, sizeof(label), "%s (in-process lift)", base);
+	snprintf(label, sizeof(label), "%s (in-process)", base);
 
-	struct ipc_client_lift_link *made = NULL;
-	if (ipc_client_lift_link_create(label, &made) != XRT_SUCCESS) {
+	struct ipc_client_service_link *made = NULL;
+	if (ipc_client_service_link_create(label, oxr_service_link_caps(sess), &made) != XRT_SUCCESS) {
 		return NULL;
 	}
-	// Two threads may race the first lift call of a session: one link wins.
-	link = link_cas(&sess->lift_link, NULL, made);
+	if ((ipc_client_service_link_caps(made) & XRT_SHARE_LINK_CAP_SHARE) != 0) {
+		struct xrt_share_link_registration reg;
+		oxr_service_link_fill_registration(sess, false, &reg); // xrBeginSession says "running"
+		ipc_client_service_link_set_registration(made, &reg);  // not connected yet: stored
+	}
+	// Two threads may race the first use of a session's link: one link wins.
+	link = link_cas(&sess->service_link, NULL, made);
 	if (link != NULL) {
-		ipc_client_lift_link_destroy(&made);
+		ipc_client_service_link_destroy(&made);
 		return link;
 	}
 	return made;

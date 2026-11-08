@@ -250,6 +250,12 @@ TEST_CASE("conv_select: licence gate")
 		auto r3 = pick(rows, req(DEPTH));
 		CHECK(r3.row == 1);
 	}
+	SECTION("a capability whose model the user installed is exempt")
+	{
+		rows[0].flags |= XRT_CONV_CAP_LICENSED_LOCAL_INSTALL;
+		auto r6 = pick(rows, req(DEPTH));
+		CHECK(r6.row == 0); // ahead of the commercial row by order, no opt-in
+	}
 	SECTION("a preference cannot bypass the gate")
 	{
 		auto r4 = pick(rows, req(DEPTH), "research");

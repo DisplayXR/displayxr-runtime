@@ -63,11 +63,26 @@ ipc_client_stereo_camera_stream_get_transport(struct ipc_connection *ipc_c,
                                               xrt_shmem_handle_t *out_section,
                                               xrt_graphics_sync_handle_t *out_wake);
 
+//! @p out_app (may be NULL): the frame's XR_DXR_app_share metadata (valid = 0 for a camera).
 xrt_result_t
 ipc_client_stereo_camera_acquire(struct ipc_connection *ipc_c,
                                  uint64_t stream_id,
                                  bool *out_ready,
-                                 struct xrt_stereo_camera_frame_info *out_frame);
+                                 struct xrt_stereo_camera_frame_info *out_frame,
+                                 struct xrt_app_share_frame_info *out_app);
+
+/*!
+ * ADR-061: the XR_DXR_app_share description of APP_CONTENT entry @p camera_id.
+ *
+ * An in-process app is offered by its `ipc_client_service_link` (the ADR-049
+ * lift link generalised into ONE sessionless service link per in-process
+ * session with capabilities {lift, share}, ADR-049 Amendment 1); the service
+ * lists it as XRT_STEREO_CAMERA_SOURCE_APP_LINK.
+ */
+xrt_result_t
+ipc_client_stereo_camera_get_app_source(struct ipc_connection *ipc_c,
+                                        uint64_t camera_id,
+                                        struct xrt_app_share_source_info *out_info);
 
 xrt_result_t
 ipc_client_stereo_camera_stats(struct ipc_connection *ipc_c,

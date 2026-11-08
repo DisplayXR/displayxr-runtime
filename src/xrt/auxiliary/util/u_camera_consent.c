@@ -625,3 +625,217 @@ u_camera_consent_handoff_result_str(enum u_camera_consent_handoff_result r)
 	default: return "?";
 	}
 }
+
+
+/*
+ *
+ * App share consent (ADR-061 decision 10). See u_camera_consent.h.
+ *
+ */
+
+void
+u_app_share_resolution_extent(enum u_app_share_resolution r, uint32_t *out_w, uint32_t *out_h, float *out_fps)
+{
+	if (r == U_APP_SHARE_RESOLUTION_1080P) {
+		*out_w = 1920;
+		*out_h = 1080;
+		*out_fps = 60.0f;
+	} else {
+		*out_w = 1280;
+		*out_h = 720;
+		*out_fps = 30.0f;
+	}
+}
+
+const char *
+u_app_share_prompt_mode_str(enum u_app_share_prompt_mode m)
+{
+	return m == U_APP_SHARE_PROMPT_PER_APP_RUN ? "per-app-run" : "always";
+}
+
+const char *
+u_app_share_resolution_str(enum u_app_share_resolution r)
+{
+	return r == U_APP_SHARE_RESOLUTION_1080P ? "1080p" : "720p";
+}
+
+bool
+u_app_share_prompt_mode_parse(const char *s, enum u_app_share_prompt_mode *out)
+{
+	if (s == NULL) {
+		return false;
+	}
+	if (strcmp(s, "always") == 0) {
+		*out = U_APP_SHARE_PROMPT_ALWAYS;
+		return true;
+	}
+	if (strcmp(s, "per-app-run") == 0) {
+		*out = U_APP_SHARE_PROMPT_PER_APP_RUN;
+		return true;
+	}
+	return false;
+}
+
+bool
+u_app_share_resolution_parse(const char *s, enum u_app_share_resolution *out)
+{
+	if (s == NULL) {
+		return false;
+	}
+	if (strcmp(s, "720p") == 0) {
+		*out = U_APP_SHARE_RESOLUTION_720P;
+		return true;
+	}
+	if (strcmp(s, "1080p") == 0) {
+		*out = U_APP_SHARE_RESOLUTION_1080P;
+		return true;
+	}
+	return false;
+}
+
+const char *
+u_app_share_why_str(enum u_app_share_why why)
+{
+	switch (why) {
+	case U_APP_SHARE_WHY_KILL_SWITCH: return "kill switch (DXR_STEREO_CAMERA=0)";
+	case U_APP_SHARE_WHY_SHARING_OFF: return "camera sharing is off (user toggle)";
+	case U_APP_SHARE_WHY_APP_SHARE_OFF: return "app share is off (DXR_APP_SHARE=0)";
+	case U_APP_SHARE_WHY_NO_IDENTITY: return "no verifiable consumer identity";
+	case U_APP_SHARE_WHY_SOURCE_GONE: return "the shared app opted out, exited or cannot be tapped";
+	case U_APP_SHARE_WHY_DEV_GATE: return "DXR_APP_SHARE_DEV=1 (development gate, no prompt)";
+	case U_APP_SHARE_WHY_RUN_GRANT: return "allowed earlier for this app run (share.prompt=per-app-run)";
+	case U_APP_SHARE_WHY_PROMPT_ALLOW: return "share prompt: Allow";
+	case U_APP_SHARE_WHY_PROMPT_DENY: return "share prompt: Deny";
+	case U_APP_SHARE_WHY_PROMPT_UNAVAILABLE: return "no share prompt available";
+	case U_APP_SHARE_WHY_PROMPT_TIMEOUT: return "share prompt unanswered";
+	default: return "?";
+	}
+}
+
+static void
+share_decide(struct u_app_share_decision *out, enum u_app_share_verdict v, enum u_app_share_why why)
+{
+	out->verdict = v;
+	out->why = why;
+}
+
+static bool
+share_grant_find(const struct u_app_share_consent *c, const struct u_app_share_request *req)
+{
+	for (uint32_t i = 0; i < c->grant_count; i++) {
+		if (c->grants[i].app_key == req->app_key && c->grants[i].app_pid == req->app_pid &&
+		    strcmp(c->grants[i].consumer, req->consumer_exe) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+share_grant_add(struct u_app_share_consent *c, const struct u_app_share_request *req)
+{
+	if (share_grant_find(c, req)) {
+		return;
+	}
+	uint32_t i = c->grant_count;
+	if (i == U_APP_SHARE_RUN_GRANTS_MAX) {
+		// Full: drop the oldest (a grant only ever saves a prompt).
+		memmove(&c->grants[0], &c->grants[1], sizeof(c->grants[0]) * (U_APP_SHARE_RUN_GRANTS_MAX - 1));
+		i = U_APP_SHARE_RUN_GRANTS_MAX - 1;
+	} else {
+		c->grant_count++;
+	}
+	snprintf(c->grants[i].consumer, sizeof(c->grants[i].consumer), "%s", req->consumer_exe);
+	c->grants[i].app_key = req->app_key;
+	c->grants[i].app_pid = req->app_pid;
+}
+
+void
+u_app_share_consent_evaluate(struct u_app_share_consent *c,
+                             const struct u_app_share_request *req,
+                             struct u_app_share_decision *out)
+{
+	memset(out, 0, sizeof(*out));
+	struct u_camera_consent *cam = c->camera;
+
+	// 1. One switch stops cameras and shares alike; DXR_APP_SHARE=0 stops shares alone.
+	if (cam != NULL && cam->kill_switch) {
+		share_decide(out, U_APP_SHARE_DISABLED, U_APP_SHARE_WHY_KILL_SWITCH);
+		return;
+	}
+	if (cam != NULL && !u_camera_consent_sharing_enabled(cam)) {
+		share_decide(out, U_APP_SHARE_DISABLED, U_APP_SHARE_WHY_SHARING_OFF);
+		return;
+	}
+	if (c->app_share_off) {
+		share_decide(out, U_APP_SHARE_DISABLED, U_APP_SHARE_WHY_APP_SHARE_OFF);
+		return;
+	}
+	// 2. Nothing to name in the prompt, nothing to key a grant on.
+	if (!exe_known(req->consumer_exe)) {
+		share_decide(out, U_APP_SHARE_REFUSED, U_APP_SHARE_WHY_NO_IDENTITY);
+		return;
+	}
+	// 3. Never prompt for something that cannot be shared.
+	if (!req->source_available) {
+		share_decide(out, U_APP_SHARE_BUSY, U_APP_SHARE_WHY_SOURCE_GONE);
+		return;
+	}
+	// 4. The development gate (NOT DXR_STEREO_CAMERA_DEV_ALLOW, which never applies here).
+	if (c->dev_gate) {
+		if (!c->dev_gate_logged) {
+			c->dev_gate_logged = true;
+			U_LOG_W(
+			    "app share consent: DXR_APP_SHARE_DEV=1 — app shares start WITHOUT the share prompt "
+			    "(development gate; never set this on a user's machine)");
+		}
+		share_decide(out, U_APP_SHARE_ALLOWED, U_APP_SHARE_WHY_DEV_GATE);
+		return;
+	}
+	// 5. per-app-run: an Allow for this consumer + this running app instance.
+	if (c->mode == U_APP_SHARE_PROMPT_PER_APP_RUN && share_grant_find(c, req)) {
+		share_decide(out, U_APP_SHARE_ALLOWED, U_APP_SHARE_WHY_RUN_GRANT);
+		return;
+	}
+	// 6. The prompt, every start (or the first of this app run).
+	if (!c->prompt_enabled || c->prompt == NULL) {
+		share_decide(out, U_APP_SHARE_REFUSED, U_APP_SHARE_WHY_PROMPT_UNAVAILABLE);
+		return;
+	}
+	enum u_camera_consent_prompt_answer a =
+	    c->prompt(c->prompt_ctx, req->consumer_exe, req->consumer_pid, req->app_name != NULL ? req->app_name : "",
+	              req->app_exe != NULL ? req->app_exe : "", c->prompt_timeout_ms);
+	switch (a) {
+	case U_CAMERA_CONSENT_PROMPT_ALLOW:
+	case U_CAMERA_CONSENT_PROMPT_ALLOW_ONCE:
+		if (c->mode == U_APP_SHARE_PROMPT_PER_APP_RUN) {
+			share_grant_add(c, req);
+		}
+		share_decide(out, U_APP_SHARE_ALLOWED, U_APP_SHARE_WHY_PROMPT_ALLOW);
+		return;
+	case U_CAMERA_CONSENT_PROMPT_DENY: share_decide(out, U_APP_SHARE_REFUSED, U_APP_SHARE_WHY_PROMPT_DENY); return;
+	case U_CAMERA_CONSENT_PROMPT_TIMEOUT:
+		share_decide(out, U_APP_SHARE_REFUSED, U_APP_SHARE_WHY_PROMPT_TIMEOUT);
+		return;
+	case U_CAMERA_CONSENT_PROMPT_UNAVAILABLE:
+	default: share_decide(out, U_APP_SHARE_REFUSED, U_APP_SHARE_WHY_PROMPT_UNAVAILABLE); return;
+	}
+}
+
+void
+u_app_share_consent_forget_app(struct u_app_share_consent *c, uint64_t app_key)
+{
+	uint32_t w = 0;
+	for (uint32_t i = 0; i < c->grant_count; i++) {
+		if (c->grants[i].app_key != app_key) {
+			c->grants[w++] = c->grants[i];
+		}
+	}
+	c->grant_count = w;
+}
+
+void
+u_app_share_consent_forget_all(struct u_app_share_consent *c)
+{
+	c->grant_count = 0;
+}

@@ -17,7 +17,7 @@
  *  - an in-process session (engine apps — the Unity display provider renders
  *    in-process on its own D3D12 device; Vulkan / GL / Metal apps on every
  *    desktop OS) uses a lift-only connection the session owns
- *    (ipc_client_lift_link.c), opened in the background on first use
+ *    (ipc_client_service_link.c), opened in the background on first use
  *    (ADR-049). D3D11 / D3D12 sessions on Windows get results back as the same
  *    NT handles (texture + ID3D11Fence-created shared fence) a D3D12 device
  *    opens with OpenSharedHandle; every other in-process session takes and
@@ -63,7 +63,7 @@
 // st_oxr carries the ipc include path (oxr_workspace.c); these two headers
 // need nothing generated.
 #include "client/ipc_client_lift.h"
-#include "client/ipc_client_lift_link.h"
+#include "client/ipc_client_service_link.h"
 #include "xrt/xrt_conv_wire.h"
 
 #ifdef XRT_OS_WINDOWS
@@ -131,23 +131,23 @@ oxr_lift_session_hint_interest(struct oxr_session *sess)
 		return;
 	}
 	// Start the background connect now; it sends the hint once connected.
-	struct ipc_client_lift_link *link = oxr_conv_link_get(sess);
+	struct ipc_client_service_link *link = oxr_conv_link_get(sess);
 	if (link == NULL) {
 		return;
 	}
-	enum ipc_client_lift_link_state state = IPC_CLIENT_LIFT_LINK_CONNECTING;
+	enum ipc_client_service_link_state state = IPC_CLIENT_SERVICE_LINK_CONNECTING;
 	uint32_t gen = 0;
-	struct ipc_connection *c = ipc_client_lift_link_acquire(link, &state, &gen);
+	struct ipc_connection *c = ipc_client_service_link_acquire(link, &state, &gen);
 	if (c != NULL) {
-		ipc_client_lift_link_release(link, gen, false);
+		ipc_client_service_link_release(link, gen, false);
 	}
 }
 
 void
 oxr_lift_session_fini(struct oxr_session *sess)
 {
-	if (sess != NULL && sess->lift_link != NULL) {
-		ipc_client_lift_link_destroy(&sess->lift_link);
+	if (sess != NULL && sess->service_link != NULL) {
+		ipc_client_service_link_destroy(&sess->service_link);
 	}
 }
 
@@ -157,7 +157,7 @@ struct lift_route
 	struct ipc_connection *c; //!< NULL = no connection right now (in-process only)
 	bool inprocess;           //!< the session's lift-only link (ADR-049)
 	uint32_t gen;             //!< link generation the connection belongs to
-	enum ipc_client_lift_link_state state;
+	enum ipc_client_service_link_state state;
 };
 
 /*!
@@ -173,7 +173,7 @@ lift_route_open(
 	memset(route, 0, sizeof(*route));
 	if (lift_session_is_ipc(sess)) {
 		route->c = comp_ipc_client_compositor_lift_connection(&sess->xcn->base);
-		route->state = IPC_CLIENT_LIFT_LINK_CONNECTED;
+		route->state = IPC_CLIENT_SERVICE_LINK_CONNECTED;
 		return XR_SUCCESS;
 	}
 	if (!oxr_conv_inprocess_eligible(sess)) {
@@ -183,12 +183,12 @@ lift_route_open(
 		                 "desktop Linux and macOS have one)",
 		                 what);
 	}
-	struct ipc_client_lift_link *link = oxr_conv_link_get(sess);
+	struct ipc_client_service_link *link = oxr_conv_link_get(sess);
 	if (link == NULL) {
 		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "%s: could not create the lift service link", what);
 	}
 	route->inprocess = true;
-	route->c = ipc_client_lift_link_acquire_wait(link, wait_ms, &route->state, &route->gen);
+	route->c = ipc_client_service_link_acquire_wait(link, wait_ms, &route->state, &route->gen);
 	return XR_SUCCESS;
 }
 
@@ -196,7 +196,7 @@ static void
 lift_route_close(struct oxr_session *sess, struct lift_route *route, xrt_result_t last_xret)
 {
 	if (route->inprocess && route->c != NULL) {
-		ipc_client_lift_link_release(sess->lift_link, route->gen, last_xret == XRT_ERROR_IPC_FAILURE);
+		ipc_client_service_link_release(sess->service_link, route->gen, last_xret == XRT_ERROR_IPC_FAILURE);
 	}
 	route->c = NULL;
 }
@@ -453,13 +453,13 @@ conv_query_route_open(struct oxr_logger *log, struct oxr_session *sess, struct l
 		return lift_route_open(log, sess, 0, route, what);
 	}
 	memset(route, 0, sizeof(*route));
-	struct ipc_client_lift_link *link = oxr_conv_link_get(sess);
+	struct ipc_client_service_link *link = oxr_conv_link_get(sess);
 	if (link == NULL) {
-		route->state = IPC_CLIENT_LIFT_LINK_FAILED;
+		route->state = IPC_CLIENT_SERVICE_LINK_FAILED;
 		return XR_SUCCESS;
 	}
 	route->inprocess = true;
-	route->c = ipc_client_lift_link_acquire_wait(link, 0, &route->state, &route->gen);
+	route->c = ipc_client_service_link_acquire_wait(link, 0, &route->state, &route->gen);
 	return XR_SUCCESS;
 }
 
@@ -769,7 +769,7 @@ lift_create_task_stream(struct oxr_logger *log,
 	}
 	conv_latch(sess);
 	if (route.c == NULL) {
-		if (route.state == IPC_CLIENT_LIFT_LINK_CONNECTING) {
+		if (route.state == IPC_CLIENT_SERVICE_LINK_CONNECTING) {
 			return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
 			                 "%s: the lift service connection is still being made - retry", what);
 		}
@@ -1133,8 +1133,8 @@ oxr_xrGetLiftPropertiesDXR(XrSession session, XrLiftPropertiesDXR *properties)
 	if (route.c == NULL) {
 		// In-process, no connection right now (ADR-049): a connect in flight
 		// reads ACTIVATING (poll), no service reads UNAVAILABLE (open default).
-		caps.state = route.state == IPC_CLIENT_LIFT_LINK_CONNECTING ? XRT_DP_LIFT_STATE_ACTIVATING
-		                                                            : XRT_DP_LIFT_STATE_UNAVAILABLE;
+		caps.state = route.state == IPC_CLIENT_SERVICE_LINK_CONNECTING ? XRT_DP_LIFT_STATE_ACTIVATING
+		                                                               : XRT_DP_LIFT_STATE_UNAVAILABLE;
 	} else {
 		xrt_result_t xret = ipc_client_lift_get_properties(route.c, &caps);
 		lift_route_close(sess, &route, xret);
@@ -1238,7 +1238,7 @@ oxr_xrCreateLiftStreamDXR(XrSession session, const XrLiftStreamCreateInfoDXR *cr
 		return r;
 	}
 	if (route.c == NULL) {
-		if (route.state == IPC_CLIENT_LIFT_LINK_CONNECTING) {
+		if (route.state == IPC_CLIENT_SERVICE_LINK_CONNECTING) {
 			return oxr_error(
 			    &log, XR_ERROR_RUNTIME_FAILURE,
 			    "xrCreateLiftStreamDXR: the lift service connection is still being made - retry");

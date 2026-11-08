@@ -222,6 +222,114 @@ xb_plane_slot_is_valid(bool live, bool staged, uint64_t slot_seq, uint64_t stage
 	return live && staged && slot_seq != 0 && slot_seq == stage_seq;
 }
 
+/*!
+ * The #918 bandwidth gate's per-second verdict (rates in bytes per second).
+ */
+enum xb_gate_action
+{
+	//! Nothing to do this window.
+	XB_GATE_NONE,
+	//! A latched plane may go back to full rate once this holds for the un-latch
+	//! dwell: the release clock runs.
+	XB_GATE_SETTLED,
+	//! Over budget and the planes are a real share of it: latch the worst plane.
+	XB_GATE_LATCH,
+	//! Over budget, but the atlas is the cost and a plane's rate is no lever.
+	XB_GATE_ATLAS_ONLY,
+};
+
+/*!
+ * The gate's decision, extracted so the rule can be tested without a bridge.
+ *
+ * The release test is the one that was wrong. It used to be "the TOTAL is back
+ * under the gate", which an atlas that alone exceeds the gate (8K stereo is
+ * ~3.1 GB/s at 60 Hz) can never satisfy — the latch then held for the whole
+ * session, and since a latched plane's own traffic dropped under the floor the
+ * moment the UI went idle, nothing could ever release it either. Now a latched
+ * plane is released when EITHER
+ *  - the transport would fit at FULL plane rate (a latched plane carries about
+ *    half its traffic, so full rate is roughly total + plane_rate), or
+ *  - the planes have gone idle (under half the floor): halving an idle plane
+ *    saves nothing, and it is the next burst that must be at full rate.
+ */
+static inline enum xb_gate_action
+xb_gate_decide(uint64_t total_rate, uint64_t plane_rate, bool any_latched, uint64_t gate, uint64_t floor)
+{
+	if (any_latched) {
+		const bool would_fit = total_rate + plane_rate <= gate;
+		const bool idle = plane_rate * 2 < floor;
+		if (would_fit || idle) {
+			return XB_GATE_SETTLED;
+		}
+	}
+	if (total_rate <= gate) {
+		return XB_GATE_NONE;
+	}
+	if (plane_rate < floor) {
+		return XB_GATE_ATLAS_ONLY;
+	}
+	return XB_GATE_LATCH;
+}
+
+/*!
+ * Whether a slot's plane may be COMPOSITED: valid (it holds exactly the staged
+ * generation), or — on a half-rate plane — it holds the NEWEST generation ever
+ * transported (`slot_copy_n == newest_copy_n`, which a catch-up establishes).
+ *
+ * Without the second clause every half-rate skip stamped the plane invalid, the
+ * consume half bailed the composite, and that frame went out with no 2D at all:
+ * panels and UI blinked at half the frame rate, and a vendor weaver keyed to the
+ * 2D regions blinked with them. A newest-transported plane is one frame behind
+ * the 3D at most — the documented cost of half rate — and is coherent pixels of
+ * a single generation, so compositing it is the honest picture, not a stale one.
+ */
+static inline bool
+xb_plane_slot_is_presentable(bool live,
+                             bool staged,
+                             uint64_t slot_seq,
+                             uint64_t stage_seq,
+                             bool half_rate,
+                             uint64_t slot_copy_n,
+                             uint64_t newest_copy_n)
+{
+	if (xb_plane_slot_is_valid(live, staged, slot_seq, stage_seq)) {
+		return true;
+	}
+	return half_rate && live && staged && slot_seq != 0 && slot_copy_n != 0 && slot_copy_n == newest_copy_n;
+}
+
+/*!
+ * Which slot a HALF-RATE skip catches up from, on the output device alone.
+ *
+ * A half-rate skip used to leave the write slot holding whatever it was last
+ * given — with a ring of 3 and a copy every other seq, that is the content of
+ * three frames ago, while the slot before it carries one frame ago. The consume
+ * half composites whatever the slot holds (its recipe's plane_seq matches the
+ * slot, so the stale-plane test passes), so the visible 2D band ran
+ * 0, -2, 2, 0, 4, 2, ...: a progress bar or a cursor stepping BACK in time on
+ * every skipped frame, not merely updating at half rate.
+ *
+ * The gate exists to save the cross-adapter hop. A slot-to-slot copy between two
+ * egress textures never crosses it, so a skip can still be made to show the
+ * newest transported content. This returns the slot holding it: the one with
+ * the highest @p slot_copy_n (a per-plane monotonic transport counter; content
+ * seqs are hashes and cannot be ordered), provided it is strictly newer than
+ * @p eg itself and has ever been written. -1 means nothing to catch up from.
+ */
+static inline int
+xb_plane_catchup_source(const uint64_t *slot_seq, const uint64_t *slot_copy_n, int ring, int eg)
+{
+	int best = -1;
+	uint64_t best_n = slot_copy_n[eg];
+	for (int i = 0; i < ring; i++) {
+		if (i != eg && slot_seq[i] != 0 && slot_copy_n[i] > best_n) {
+			best = i;
+			best_n = slot_copy_n[i];
+		}
+	}
+	return best;
+}
+
 #ifdef __cplusplus
 }
 #endif

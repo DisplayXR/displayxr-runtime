@@ -51,6 +51,7 @@
 #include "comp_d3d11_segments.h"
 #include "xrt/xrt_screen.h"
 #include "xrt/xrt_plugin.h"
+#include "xrt/xrt_stereo_camera.h"
 #include "util/comp_workspace_screens_ipc.h" // ADR-052: the workspace on N screens
 
 #include "comp_d3d11_window.h"
@@ -108,6 +109,7 @@
 #include "stb_image_write.h"
 
 #include <atomic>
+#include <memory>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
@@ -193,6 +195,10 @@ static weave_latency_log g_weave_latency_standalone;
 // path honors the knob only (its pacing is the device queue cap inside a
 // synchronous RPC — no per-frame pacer to govern).
 static late_weave_governor g_lw_gov_workspace;
+//! #2564: the workspace chain's frame-latency token ledger (see
+//! comp_weave_latency_win.h): every governor decrease used to strand its
+//! surplus tokens in the waitable for the life of the chain.
+static late_weave_token_ledger g_lw_ledger_workspace;
 
 /*
  * Late-weave phase 1 (DXR_LATE_WEAVE=1). Flattens the present queue
@@ -1488,6 +1494,17 @@ struct d3d11_service_compositor
 	//! diff the same client's number across the two for an apples-to-
 	//! apples per-app frame-rate comparison.
 	int64_t last_commit_ns;
+
+	//! ADR-061: the attached share tap. Linkage guarded by g_svc_share_mutex;
+	//! @ref share_tap_active is the lock-free per-commit test.
+	std::shared_ptr<struct svc_share_tap> share_tap;
+	std::atomic<bool> share_tap_active{false};
+	//! ADR-061: what the last commit packed, for the enumeration (a stale read
+	//! only mislabels one listing).
+	std::atomic<int64_t> share_last_commit_ns{0};
+	std::atomic<uint32_t> share_active_views{0};
+	//! ADR-061: the unset-view-count fallback has been logged for this client.
+	bool share_views_fallback_logged = false;
 
 	//! App-initiated rendering-mode request (#575). The client's
 	//! xrRequestDisplayRenderingModeDXR crosses IPC into the
@@ -11150,6 +11167,9 @@ try {
 			// The service window's own token (if any) stays until spent.
 		} else if (mc->frame_latency_waitable) {
 			// (app token, if any, stays until spent or re-keyed — see above)
+			// #2564: take back tokens a governor depth decrease left behind,
+			// before the wait that would otherwise return a frame early.
+			g_lw_ledger_workspace.pay(mc->frame_latency_waitable, "workspace");
 			HANDLE waits[2] = {mc->frame_latency_waitable, mc->render_wakeup_event};
 			// #964: when the SERVICE WINDOW is not the active presenter it is
 			// hidden, and a hidden swap chain's waitable stops signaling — the
@@ -11187,7 +11207,7 @@ try {
 				wil::com_ptr<IDXGISwapChain2> sc2;
 				if (mc->swap_chain &&
 				    SUCCEEDED(mc->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
-					sc2->SetMaximumFrameLatency((UINT)g_lw_gov_workspace.effective);
+					g_lw_ledger_workspace.apply(sc2.get(), g_lw_gov_workspace.effective);
 				}
 				static bool logged_backoff = false, logged_return = false;
 				bool &logged = (tr > 0) ? logged_backoff : logged_return;
@@ -11687,7 +11707,9 @@ multi_compositor_create_service_chain(struct d3d11_service_system *sys,
 		wil::com_ptr<IDXGISwapChain2> sc2;
 		if (SUCCEEDED(mc->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
 			const int lat = g_lw_gov_workspace.base_latency();
-			sc2->SetMaximumFrameLatency(lat);
+			// #2564: a fresh chain owes no tokens.
+			g_lw_ledger_workspace.reset();
+			g_lw_ledger_workspace.apply(sc2.get(), lat);
 			mc->frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
 			U_LOG_W("Late-weave: workspace swap chain waitable, max latency %d%s (waitable=%p)", lat,
 			        (lat == 1 && g_lw_gov_workspace.auto_backoff == 1) ? " + saturation auto-backoff" : "",
@@ -23313,6 +23335,492 @@ svc_read_done_note_drop(struct d3d11_service_compositor *c, const char *why, uin
 	}
 }
 
+/*
+ *
+ * ADR-061: the share tap. A client's composed per-client atlas -> a CPU
+ * side-by-side NV12 frame the stereo-camera manager's source thread picks up.
+ *
+ * Runs on the client's commit, under the shared immediate context, and must never
+ * make the app wait: decimated to the stream rate, a GPU convert + copy into a
+ * 3-slot staging ring, harvested with DO_NOT_WAIT on later commits. No free slot =
+ * this frame is not tapped.
+ *
+ * Pixel shader rather than VideoProcessorBlt: measured about half the submit cost
+ * and a third of the GPU cost on the render adapter, and it needs neither a video
+ * device nor an NV12 render target.
+ *
+ * BT.601 full range (JPEG): the colour contract of the stereo-camera transport, the
+ * one the browser applies to every runtime camera device.
+ *
+ */
+
+static const char *const svc_share_tap_hlsl = R"(
+Texture2D<float4> atlas : register(t0);
+SamplerState lin : register(s0);
+cbuffer C : register(b0) { float2 uv0; float2 uv_scale; float2 uv_min; float2 uv_max; float2 half_texel; float2 pad; };
+struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+V vs(uint i : SV_VertexID) {
+  V o; float2 t = float2((i << 1) & 2, i & 2);
+  o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t; return o;
+}
+float3 fetch(float2 uv) { return atlas.SampleLevel(lin, clamp(uv, uv_min, uv_max), 0).rgb; }
+// A linear atlas first goes through this into an `_SRGB` target: the hardware
+// applies the encode, never a copy of the curve in a shader (ADR-021 2).
+float4 ps_copy(V i) : SV_Target { return float4(fetch(uv0 + i.uv * uv_scale), 1.0); }
+static const float3 KY = float3(0.299, 0.587, 0.114);
+float ps_y(V i) : SV_Target { return dot(fetch(uv0 + i.uv * uv_scale), KY); }
+float2 ps_uv(V i) : SV_Target {
+  float2 u = uv0 + i.uv * uv_scale, d = half_texel;
+  float3 c = 0.25 * (fetch(u + float2(-d.x, -d.y)) + fetch(u + float2(d.x, -d.y)) + fetch(u + float2(-d.x, d.y)) + fetch(u + float2(d.x, d.y)));
+  float y = dot(c, KY);
+  return float2(128.0 / 255.0 + (c.b - y) / 1.772, 128.0 / 255.0 + (c.r - y) / 1.402);
+}
+)";
+
+struct svc_share_tap_cb
+{
+	float uv0[2], uv_scale[2], uv_min[2], uv_max[2], half_texel[2];
+	float pad[2];
+};
+
+#define SVC_SHARE_TAP_RING 3
+
+struct svc_share_tap
+{
+	//! Guarded by g_svc_share_mutex; nullptr once the compositor is gone.
+	struct d3d11_service_compositor *owner = nullptr;
+	uint32_t eye_w = 0, eye_h = 0;
+	int64_t period_ns = 0;
+
+	// GPU side: commit thread, under immediate_ctx_mutex.
+	wil::com_ptr<ID3D11VertexShader> vs;
+	wil::com_ptr<ID3D11PixelShader> ps_y, ps_uv, ps_copy;
+	wil::com_ptr<ID3D11SamplerState> sampler;
+	//! The encode step for a linear atlas: written through `_SRGB`, read as UNORM.
+	wil::com_ptr<ID3D11Texture2D> enc_tex;
+	wil::com_ptr<ID3D11RenderTargetView> enc_rtv;
+	wil::com_ptr<ID3D11ShaderResourceView> enc_srv;
+	wil::com_ptr<ID3D11Buffer> cb;
+	wil::com_ptr<ID3D11Texture2D> tex_y, tex_uv;
+	wil::com_ptr<ID3D11RenderTargetView> rtv_y, rtv_uv;
+	struct
+	{
+		wil::com_ptr<ID3D11Texture2D> y, uv;
+		bool busy = false;
+		int64_t commit_ns = 0;
+		struct xrt_app_share_frame_info info = {};
+	} slot[SVC_SHARE_TAP_RING];
+	uint32_t write_idx = 0, read_idx = 0;
+	int64_t next_due_ns = 0;
+	struct xrt_app_share_frame_info last_info = {};
+
+	// CPU side: three NV12 buffers. `back` belongs to the commit thread, `front`
+	// to the consumer, `ready` changes hands under @ref mutex.
+	std::mutex mutex;
+	std::condition_variable cv;
+	std::vector<uint8_t> back, ready, front;
+	uint64_t ready_seq = 0, consumed_seq = 0;
+	int64_t ready_commit_ns = 0;
+	struct xrt_app_share_frame_info ready_info = {};
+	bool alive = true;
+
+	// Stats for the detach line (commit thread).
+	uint64_t n_commit = 0, n_submit = 0, n_harvest = 0, n_ring_full = 0;
+	int64_t ns_commit_total = 0, ns_commit_max = 0, ns_harvest_total = 0;
+};
+
+//! Guards every compositor <-> tap link. Never held across GPU work.
+static std::mutex g_svc_share_mutex;
+
+static bool
+svc_share_tap_create_gpu(struct d3d11_service_system *sys, struct svc_share_tap *t)
+{
+	ID3D11Device *dev = sys->device.get();
+	wil::com_ptr<ID3DBlob> b;
+	HRESULT hr = D3DCompile(svc_share_tap_hlsl, strlen(svc_share_tap_hlsl), nullptr, nullptr, nullptr, "vs", "vs_5_0",
+	                        0, 0, b.put(), nullptr);
+	if (FAILED(hr) || FAILED(dev->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, t->vs.put()))) {
+		return false;
+	}
+	b.reset();
+	hr = D3DCompile(svc_share_tap_hlsl, strlen(svc_share_tap_hlsl), nullptr, nullptr, nullptr, "ps_y", "ps_5_0", 0, 0,
+	                b.put(), nullptr);
+	if (FAILED(hr) || FAILED(dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, t->ps_y.put()))) {
+		return false;
+	}
+	b.reset();
+	hr = D3DCompile(svc_share_tap_hlsl, strlen(svc_share_tap_hlsl), nullptr, nullptr, nullptr, "ps_uv", "ps_5_0", 0, 0,
+	                b.put(), nullptr);
+	if (FAILED(hr) || FAILED(dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, t->ps_uv.put()))) {
+		return false;
+	}
+	b.reset();
+	hr = D3DCompile(svc_share_tap_hlsl, strlen(svc_share_tap_hlsl), nullptr, nullptr, nullptr, "ps_copy", "ps_5_0", 0, 0,
+	                b.put(), nullptr);
+	if (FAILED(hr) || FAILED(dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, t->ps_copy.put()))) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC et = {};
+	et.Width = t->eye_w * 2;
+	et.Height = t->eye_h;
+	et.MipLevels = 1;
+	et.ArraySize = 1;
+	et.SampleDesc.Count = 1;
+	et.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+	et.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	D3D11_RENDER_TARGET_VIEW_DESC er = {};
+	er.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	er.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+	D3D11_SHADER_RESOURCE_VIEW_DESC es = {};
+	es.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	es.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	es.Texture2D.MipLevels = 1;
+	if (FAILED(dev->CreateTexture2D(&et, nullptr, t->enc_tex.put())) ||
+	    FAILED(dev->CreateRenderTargetView(t->enc_tex.get(), &er, t->enc_rtv.put())) ||
+	    FAILED(dev->CreateShaderResourceView(t->enc_tex.get(), &es, t->enc_srv.put()))) {
+		return false;
+	}
+	D3D11_SAMPLER_DESC sd = {};
+	sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sd.MaxLOD = D3D11_FLOAT32_MAX;
+	if (FAILED(dev->CreateSamplerState(&sd, t->sampler.put()))) {
+		return false;
+	}
+	D3D11_BUFFER_DESC bd = {};
+	bd.ByteWidth = sizeof(struct svc_share_tap_cb);
+	bd.Usage = D3D11_USAGE_DEFAULT;
+	bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	if (FAILED(dev->CreateBuffer(&bd, nullptr, t->cb.put()))) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC y = {};
+	y.Width = t->eye_w * 2;
+	y.Height = t->eye_h;
+	y.MipLevels = 1;
+	y.ArraySize = 1;
+	y.SampleDesc.Count = 1;
+	y.Format = DXGI_FORMAT_R8_UNORM;
+	y.BindFlags = D3D11_BIND_RENDER_TARGET;
+	D3D11_TEXTURE2D_DESC uv = y;
+	uv.Width = t->eye_w;
+	uv.Height = t->eye_h / 2;
+	uv.Format = DXGI_FORMAT_R8G8_UNORM;
+	if (FAILED(dev->CreateTexture2D(&y, nullptr, t->tex_y.put())) ||
+	    FAILED(dev->CreateTexture2D(&uv, nullptr, t->tex_uv.put())) ||
+	    FAILED(dev->CreateRenderTargetView(t->tex_y.get(), nullptr, t->rtv_y.put())) ||
+	    FAILED(dev->CreateRenderTargetView(t->tex_uv.get(), nullptr, t->rtv_uv.put()))) {
+		return false;
+	}
+	y.BindFlags = uv.BindFlags = 0;
+	y.Usage = uv.Usage = D3D11_USAGE_STAGING;
+	y.CPUAccessFlags = uv.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	for (auto &sl : t->slot) {
+		if (FAILED(dev->CreateTexture2D(&y, nullptr, sl.y.put())) ||
+		    FAILED(dev->CreateTexture2D(&uv, nullptr, sl.uv.put()))) {
+			return false;
+		}
+	}
+	const size_t size = (size_t)t->eye_w * 2 * t->eye_h * 3 / 2;
+	t->back.resize(size);
+	t->ready.resize(size);
+	t->front.resize(size);
+	return true;
+}
+
+//! Read back every finished slot, oldest first; never waits. Caller holds immediate_ctx_mutex.
+static void
+svc_share_tap_harvest(struct d3d11_service_system *sys, struct svc_share_tap *t)
+{
+	const uint32_t full_w = t->eye_w * 2;
+	while (t->slot[t->read_idx].busy) {
+		auto &sl = t->slot[t->read_idx];
+		D3D11_MAPPED_SUBRESOURCE my = {}, muv = {};
+		HRESULT hr = sys->context->Map(sl.y.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &my);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			return;
+		}
+		if (SUCCEEDED(hr)) {
+			HRESULT huv = sys->context->Map(sl.uv.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &muv);
+			if (huv == DXGI_ERROR_WAS_STILL_DRAWING) {
+				sys->context->Unmap(sl.y.get(), 0);
+				return;
+			}
+			if (SUCCEEDED(huv)) {
+				uint8_t *d = t->back.data();
+				for (uint32_t r = 0; r < t->eye_h; r++) {
+					memcpy(d + (size_t)r * full_w, (const uint8_t *)my.pData + (size_t)r * my.RowPitch, full_w);
+				}
+				d += (size_t)full_w * t->eye_h;
+				for (uint32_t r = 0; r < t->eye_h / 2; r++) {
+					memcpy(d + (size_t)r * full_w, (const uint8_t *)muv.pData + (size_t)r * muv.RowPitch, full_w);
+				}
+				sys->context->Unmap(sl.uv.get(), 0);
+				{
+					std::lock_guard<std::mutex> lk(t->mutex);
+					t->back.swap(t->ready);
+					t->ready_seq++;
+					t->ready_commit_ns = sl.commit_ns;
+					t->ready_info = sl.info;
+				}
+				t->cv.notify_all();
+				t->n_harvest++;
+			}
+			sys->context->Unmap(sl.y.get(), 0);
+		}
+		sl.busy = false;
+		t->read_idx = (t->read_idx + 1) % SVC_SHARE_TAP_RING;
+	}
+}
+
+//! One eye of the stream from tile @p view of the atlas.
+static void
+svc_share_tap_draw_eye(struct d3d11_service_system *sys,
+                       struct svc_share_tap *t,
+                       uint32_t eye,
+                       uint32_t view,
+                       uint32_t cols,
+                       uint32_t rows,
+                       uint32_t cw,
+                       uint32_t ch,
+                       uint32_t atlas_w,
+                       uint32_t atlas_h,
+                       bool flip_y,
+                       bool is_linear,
+                       ID3D11ShaderResourceView *atlas_srv,
+                       const struct xrt_app_share_frame_info *info)
+{
+	ID3D11DeviceContext *ctx = sys->context.get();
+	const uint32_t col = view % cols, row = view / cols;
+	const float aw = (float)atlas_w, ah = (float)atlas_h;
+	// Tiles sit at the SLOT stride (atlas / grid), the formula the write side and
+	// service_crop_atlas_for_dp use, not at the content size: content smaller than
+	// its slot leaves empty atlas between the tiles.
+	const float x0 = (float)(col * (atlas_w / cols)), y0 = (float)(row * (atlas_h / rows));
+	struct svc_share_tap_cb cb = {};
+	cb.uv0[0] = x0 / aw;
+	cb.uv0[1] = (y0 + (flip_y ? (float)ch : 0.0f)) / ah;
+	cb.uv_scale[0] = (float)cw / aw;
+	cb.uv_scale[1] = (flip_y ? -1.0f : 1.0f) * (float)ch / ah;
+	cb.uv_min[0] = (x0 + 0.5f) / aw;
+	cb.uv_min[1] = (y0 + 0.5f) / ah;
+	cb.uv_max[0] = (x0 + (float)cw - 0.5f) / aw;
+	cb.uv_max[1] = (y0 + (float)ch - 0.5f) / ah;
+	// Half a stream pixel, in atlas uv: the block one chroma sample averages.
+	cb.half_texel[0] = 0.5f * ((float)cw / aw) / (float)info->content_width;
+	cb.half_texel[1] = 0.5f * ((float)ch / ah) / (float)info->content_height;
+	ctx->UpdateSubresource(t->cb.get(), 0, nullptr, &cb, 0, 0);
+
+	const float x = (float)(eye * t->eye_w + (uint32_t)info->content_x), y = (float)info->content_y;
+	const float w = (float)info->content_width, h = (float)info->content_height;
+	D3D11_VIEWPORT vy = {x, y, w, h, 0.0f, 1.0f};
+	ID3D11ShaderResourceView *src = atlas_srv;
+	if (is_linear) {
+		// Encode this eye through the `_SRGB` target, then convert from the result.
+		ID3D11RenderTargetView *enc = t->enc_rtv.get();
+		ID3D11ShaderResourceView *none = nullptr;
+		ctx->PSSetShaderResources(0, 1, &atlas_srv);
+		ctx->OMSetRenderTargets(1, &enc, nullptr);
+		ctx->RSSetViewports(1, &vy);
+		ctx->PSSetShader(t->ps_copy.get(), nullptr, 0);
+		ctx->Draw(3, 0);
+		ID3D11RenderTargetView *null_rtv = nullptr;
+		ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+		ctx->PSSetShaderResources(0, 1, &none);
+		const float sw = (float)(t->eye_w * 2), sh = (float)t->eye_h;
+		cb.uv0[0] = x / sw;
+		cb.uv0[1] = y / sh;
+		cb.uv_scale[0] = w / sw;
+		cb.uv_scale[1] = h / sh;
+		cb.uv_min[0] = (x + 0.5f) / sw;
+		cb.uv_min[1] = (y + 0.5f) / sh;
+		cb.uv_max[0] = (x + w - 0.5f) / sw;
+		cb.uv_max[1] = (y + h - 0.5f) / sh;
+		cb.half_texel[0] = 0.5f / sw;
+		cb.half_texel[1] = 0.5f / sh;
+		ctx->UpdateSubresource(t->cb.get(), 0, nullptr, &cb, 0, 0);
+		src = t->enc_srv.get();
+	}
+	ctx->PSSetShaderResources(0, 1, &src);
+	ID3D11RenderTargetView *rtv = t->rtv_y.get();
+	ctx->OMSetRenderTargets(1, &rtv, nullptr);
+	ctx->RSSetViewports(1, &vy);
+	ctx->PSSetShader(t->ps_y.get(), nullptr, 0);
+	ctx->Draw(3, 0);
+	D3D11_VIEWPORT vuv = {x / 2.0f, y / 2.0f, w / 2.0f, h / 2.0f, 0.0f, 1.0f};
+	rtv = t->rtv_uv.get();
+	ctx->OMSetRenderTargets(1, &rtv, nullptr);
+	ctx->RSSetViewports(1, &vuv);
+	ctx->PSSetShader(t->ps_uv.get(), nullptr, 0);
+	ctx->Draw(3, 0);
+}
+
+/*!
+ * Convert one view pair into the stream's NV12 and queue its readback (caller holds
+ * immediate_ctx_mutex and checked the write slot is free): the commit tap's pass and an
+ * imported ring's (ADR-061 decision 6).
+ */
+static void
+svc_share_tap_submit(struct d3d11_service_system *sys,
+                     struct svc_share_tap *t,
+                     uint32_t vl,
+                     uint32_t vr,
+                     bool mono,
+                     uint32_t cols,
+                     uint32_t rows,
+                     uint32_t cw,
+                     uint32_t ch,
+                     uint32_t atlas_w,
+                     uint32_t atlas_h,
+                     int format,
+                     bool flip_y,
+                     bool is_linear,
+                     ID3D11ShaderResourceView *srv,
+                     int64_t t0,
+                     float shift_frac)
+{
+	auto &sl = t->slot[t->write_idx];
+	// Fit the view into one eye half, aspect preserved, on chroma-aligned edges.
+	const float fit = fmin((float)t->eye_w / (float)cw, (float)t->eye_h / (float)ch);
+	uint32_t w = (uint32_t)((float)cw * fit + 0.5f) & ~1u, h = (uint32_t)((float)ch * fit + 0.5f) & ~1u;
+	w = w > t->eye_w ? t->eye_w : w;
+	h = h > t->eye_h ? t->eye_h : h;
+	struct xrt_app_share_frame_info info = {};
+	info.content_x = (int32_t)(((t->eye_w - w) / 2) & ~1u);
+	info.content_y = (int32_t)(((t->eye_h - h) / 2) & ~1u);
+	info.content_width = w;
+	info.content_height = h;
+	info.mono = mono ? 1u : 0u;
+	info.zero_disparity_shift_frac = shift_frac; // the app's views are display-referred as packed
+	info.valid = 1;
+	info.commit_time_ns = t0;
+	const struct xrt_app_share_frame_info &li = t->last_info;
+	info.content_generation = li.content_generation;
+	if (li.content_x != info.content_x || li.content_y != info.content_y || li.content_width != w ||
+	    li.content_height != h || li.mono != info.mono) {
+		info.content_generation++;
+	}
+	t->last_info = info;
+
+	ID3D11DeviceContext *ctx = sys->context.get();
+	// Every piece of state this pass reads: the context is shared and nothing
+	// else may be assumed about what a previous draw left bound.
+	ctx->IASetInputLayout(nullptr);
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	ctx->VSSetShader(t->vs.get(), nullptr, 0);
+	ctx->GSSetShader(nullptr, nullptr, 0);
+	ctx->RSSetState(nullptr);
+	ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+	ctx->OMSetDepthStencilState(nullptr, 0);
+	ID3D11RenderTargetView *null_rtv = nullptr;
+	ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+	const FLOAT black_y[4] = {0, 0, 0, 0};
+	const FLOAT black_uv[4] = {128.0f / 255.0f, 128.0f / 255.0f, 0, 0};
+	ctx->ClearRenderTargetView(t->rtv_y.get(), black_y);
+	ctx->ClearRenderTargetView(t->rtv_uv.get(), black_uv);
+	ctx->PSSetShaderResources(0, 1, &srv);
+	ID3D11SamplerState *smp = t->sampler.get();
+	ctx->PSSetSamplers(0, 1, &smp);
+	ID3D11Buffer *cbuf = t->cb.get();
+	ctx->PSSetConstantBuffers(0, 1, &cbuf);
+
+	if (t->n_submit == 0) {
+		U_LOG_W("ADR-061 share tap: first frame: atlas %ux%u fmt %d, content %ux%u, cols %u, views %u (pair %u,%u), "
+		        "eye rect %d,%d %ux%u, flip %d, linear %d",
+		        atlas_w, atlas_h, format, cw, ch, cols, cols * rows, vl, vr, info.content_x, info.content_y, w, h,
+		        (int)flip_y, (int)is_linear);
+	}
+	svc_share_tap_draw_eye(sys, t, 0, vl, cols, rows, cw, ch, atlas_w, atlas_h, flip_y, is_linear, srv, &info);
+	svc_share_tap_draw_eye(sys, t, 1, vr, cols, rows, cw, ch, atlas_w, atlas_h, flip_y, is_linear, srv, &info);
+
+	ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	ctx->PSSetShaderResources(0, 1, &null_srv);
+	ID3D11Buffer *null_cb = nullptr;
+	ctx->PSSetConstantBuffers(0, 1, &null_cb);
+
+	ctx->CopyResource(sl.y.get(), t->tex_y.get());
+	ctx->CopyResource(sl.uv.get(), t->tex_uv.get());
+	ctx->Flush();
+	sl.busy = true;
+	sl.commit_ns = t0;
+	sl.info = info;
+	t->write_idx = (t->write_idx + 1) % SVC_SHARE_TAP_RING;
+	// Fell behind (the app stalled): restart the schedule, no catching up.
+	t->next_due_ns = t->next_due_ns + t->period_ns < t0 ? t0 + t->period_ns : t->next_due_ns + t->period_ns;
+	t->n_submit++;
+}
+
+/*!
+ * The per-commit tap: the atlas this commit packed is final. Decimate, convert the
+ * pair, queue the readback, pick up finished ones.
+ */
+static void
+svc_share_tap_commit(struct d3d11_service_system *sys,
+                     struct d3d11_service_compositor *c,
+                     uint32_t views,
+                     uint32_t cols,
+                     uint32_t rows,
+                     uint32_t cw,
+                     uint32_t ch)
+{
+	if (!c->share_tap_active.load(std::memory_order_relaxed)) {
+		return;
+	}
+	std::shared_ptr<struct svc_share_tap> tp;
+	{
+		std::lock_guard<std::mutex> lk(g_svc_share_mutex);
+		tp = c->share_tap;
+	}
+	if (!tp) {
+		return;
+	}
+	struct svc_share_tap *t = tp.get();
+	const int64_t t0 = os_monotonic_get_ns();
+
+	std::lock_guard<std::mutex> atlas_lock(c->atlas_submit_mutex);
+	std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+
+	const int64_t th0 = os_monotonic_get_ns();
+	svc_share_tap_harvest(sys, t);
+	t->ns_harvest_total += os_monotonic_get_ns() - th0;
+
+	// Half a commit of slack against a schedule rather than the last submit, so
+	// commit jitter does not cost a frame: a 60 Hz app decimated to 30 keeps every
+	// second frame and the average rate holds.
+	const bool due = t0 >= t->next_due_ns - 8 * 1000 * 1000;
+	auto &sl = t->slot[t->write_idx];
+	ID3D11ShaderResourceView *srv = c->render.atlas_srv.get();
+	if (due && sl.busy) {
+		t->n_ring_full++;
+	}
+	if (t->n_commit == 0) {
+		U_LOG_W("ADR-061 share tap: first commit: srv %d, content %ux%u, grid %ux%u, views %u, %s", srv != nullptr, cw, ch,
+		        cols, rows, views, sys->workspace_mode ? "workspace" : "direct");
+	}
+	if (due && !sl.busy && srv != nullptr && c->render.atlas_texture != nullptr && cw > 0 && ch > 0 && views > 0 &&
+	    cols > 0 && rows > 0) {
+		D3D11_TEXTURE2D_DESC ad = {};
+		c->render.atlas_texture->GetDesc(&ad);
+		uint32_t vl = 0, vr = 0;
+		if (views > 2) {
+			vl = views / 2 - 1;
+			vr = views / 2;
+		} else if (views == 2) {
+			vr = 1;
+		}
+		svc_share_tap_submit(sys, t, vl, vr, views == 1, cols, rows, cw, ch, ad.Width, ad.Height, (int)ad.Format,
+		                     c->atlas_flip_y, !c->atlas_holds_srgb_bytes, srv, t0, 0.0f);
+	}
+
+	const int64_t dt = os_monotonic_get_ns() - t0;
+	t->ns_commit_total += dt;
+	t->n_commit++;
+	if (dt > t->ns_commit_max) {
+		t->ns_commit_max = dt;
+	}
+}
+
 static xrt_result_t
 compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -25228,10 +25736,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// into the atlas, never into the app's image.
 		else if (cursor_frame)
 			zc_reason = "cursor";
+		// ADR-061: the share tap reads the per-client atlas, which zero copy skips.
+		else if (c->share_tap_active.load(std::memory_order_relaxed))
+			zc_reason = "share_tap";
 
 		if (!has_ui_layers && !has_window_space_layers && !zones_frame && !has_local_2d &&
 		    projection_layer_count <= 1 && all_views_zc_eligible && !sys->workspace_mode && !color_blocks_zc &&
-		    proj_view_count == packed_view_count && !cursor_frame) {
+		    proj_view_count == packed_view_count && !cursor_frame &&
+		    !c->share_tap_active.load(std::memory_order_relaxed)) {
 			// Check all views reference the same swapchain image
 			bool all_same = true;
 			for (uint32_t eye = 1; eye < proj_view_count; eye++) {
@@ -26802,6 +27314,24 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			c->pipe_seg_content = c->seg_content_painted;
 		}
 
+		// ADR-061: the atlas is final. Not on a zero-copy frame, which never wrote
+		// it (the first commit after an attach can still be one).
+		c->share_last_commit_ns.store((int64_t)os_monotonic_get_ns(), std::memory_order_relaxed);
+		// A frame that packed through another path leaves eff_view_count unset; the
+		// published grid is what the atlas holds then.
+		const uint32_t share_views =
+		    eff_view_count != 0 ? eff_view_count : c->pipe_tile_columns * c->pipe_tile_rows;
+		if (eff_view_count == 0 && !c->share_views_fallback_logged && c->share_tap_active.load(std::memory_order_relaxed)) {
+			c->share_views_fallback_logged = true;
+			U_LOG_W("ADR-061 share tap: frame left the view count unset; using the published %ux%u grid",
+			        c->pipe_tile_columns, c->pipe_tile_rows);
+		}
+		c->share_active_views.store(share_views, std::memory_order_relaxed);
+		if (!use_zero_copy) {
+			svc_share_tap_commit(sys, c, share_views, c->pipe_tile_columns, c->pipe_tile_rows, content_view_w,
+			                     content_view_h);
+		}
+
 		// #1017: a CLIENT_TEXTURE client weaves HERE, on its own IPC thread —
 		// the one presenter kind the render thread must not finish, because
 		// its fence Signal is a cross-adapter shared-fence call that can block
@@ -27837,6 +28367,22 @@ compositor_destroy(struct xrt_compositor *xc)
 	struct d3d11_service_system *sys = c->sys;
 
 	U_LOG_W("Destroying D3D11 service compositor for client");
+
+	// ADR-061: normally detached already (the session teardown calls the manager
+	// first). If not, the tap outlives this compositor and reports it gone.
+	{
+		std::lock_guard<std::mutex> lk(g_svc_share_mutex);
+		if (c->share_tap) {
+			c->share_tap->owner = nullptr;
+			{
+				std::lock_guard<std::mutex> tl(c->share_tap->mutex);
+				c->share_tap->alive = false;
+			}
+			c->share_tap->cv.notify_all();
+			c->share_tap.reset();
+			c->share_tap_active.store(false);
+		}
+	}
 
 	// If this was the bridge-relay session, clear the global gate so
 	// subsequent non-bridge WebXR / legacy sessions get normal compositor
@@ -29474,6 +30020,23 @@ svc_weave_cursor_lift_mask(const struct xrt_lift_weave_rect *lift_rects, uint32_
 }
 
 /*!
+ * The converter's viewpoints follow the viewer only through the eyes snapshot
+ * the conversion core reads (G7: every eye query this service answers is
+ * published there). A present-owner that converts a video asks for no eyes
+ * itself, so the snapshot went stale (2 s) and the policy fell back to the
+ * fixed nominal viewer: no look-around, where the old in-DP lift read the
+ * tracker on every frame. Query, and so publish, the weaving client's eyes on
+ * every lifted weave. The DP answers from its cached eye pair. Caller holds
+ * render_mutex (recursive).
+ */
+static void
+lift_refresh_eyes(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	struct xrt_eye_positions eyes = {};
+	(void)comp_d3d11_service_get_predicted_eye_positions_full_for_client(&sys->base, &c->base.base, &eyes);
+}
+
+/*!
  * Batch (v3) layout: rect @p rect is window-sized-input pixels holding a 2D
  * frame. Snapshot it, then blit the stream's latest pair into the left / right
  * tiles of the SBS scratch at the rect's position (or the 2D frame into both,
@@ -29510,6 +30073,7 @@ lift_weave_rect_batch(struct d3d11_service_system *sys,
 		return true; // nothing visible to lift; nothing to weave either
 	}
 	uint64_t frame_id = 0;
+	lift_refresh_eyes(sys, c);
 	struct xrt_lift_rect_frame frame;
 	lift_rect_frame(sys, &c->base.base, &rect, win_w, win_h, &frame);
 	d3d11_lift_rect_match_views(lift, owner, b->stream_id, 2); // the batch layout weaves a pair
@@ -29619,6 +30183,7 @@ lift_weave_rects_nview(struct d3d11_service_system *sys,
 	ID3D11ShaderResourceView *crop_srv = c->render.weave_crop_srv.get();
 	ID3D11RenderTargetView *crop_rtv = c->render.weave_crop_rtv.get();
 
+	lift_refresh_eyes(sys, c);
 	for (uint32_t k = 0; k < binding_count; k++) {
 		const struct xrt_lift_weave_rect *b = &bindings[k];
 		if (b->rect_index >= rect_count) {
@@ -31096,6 +31661,43 @@ weave_seg_publish(struct d3d11_service_compositor *c,
 }
 
 /*!
+ * The session whose windowless weave DP weaves @p c's window, for a drag snap.
+ *
+ * ADR-060 R2 moved a present-owner's weave off the panel DP onto its own
+ * windowless DP. A present-owner can hold two sessions on one window: the
+ * browser's GPU process weaves, and its browser process only snaps, from the
+ * window's message loop. The lens and viewing distance a snap needs live on the
+ * weaver that weaves, so the snap session has to find that one. The panel DP
+ * has not woven this window and can only decline.
+ *
+ * Returns @p c itself when it weaves windowless, the sibling on the same window
+ * that does, or NULL when the window is not woven windowless (the panel DP's
+ * job, as before R2).
+ *
+ * Holding render_mutex.
+ */
+static struct d3d11_service_compositor *
+svc_weave_snap_owner(struct d3d11_service_compositor *c)
+{
+	if (c->render.weave_dp_windowless && c->render.weave_dp != nullptr) {
+		return c;
+	}
+	HWND wnd = c->render.weave_hwnd;
+	struct d3d11_multi_compositor *mc = c->sys->multi_comp;
+	if (wnd == nullptr || mc == nullptr) {
+		return nullptr;
+	}
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		struct d3d11_service_compositor *o = mc->clients[i].compositor;
+		if (o != nullptr && o != c && o->render.weave_hwnd == wnd && o->render.weave_dp_windowless &&
+		    o->render.weave_dp != nullptr) {
+			return o;
+		}
+	}
+	return nullptr;
+}
+
+/*!
  * The display processor whose lattice a drag snap of the present-owner's
  * window uses (#1884): the majority screen's segment DP at the PROPOSED
  * position, with the handle owner's hysteresis — NULL for the primary screen
@@ -31198,6 +31800,78 @@ svc_weave_capture_dump_srv(struct d3d11_service_system *sys, ID3D11ShaderResourc
 		tex->Release();
 	}
 	res->Release();
+}
+
+/*!
+ * How far a weave tile's edge pixels reach into the SBS atlas around the tile when a 2D layer
+ * is composited in the weave. A lens-period box is a few window pixels (about 4 at the edge on
+ * the 8K Leia panel) and anything wider only costs fill, because the opaque page covers it.
+ */
+#define WEAVE_TILE_EDGE_UNDERLAY_PX 16.0f
+
+/*!
+ * Extend one view's tile outward in the SBS atlas by repeating its edge pixels.
+ *
+ * The page layer has an alpha-0 hole where the tile is, and a DP that band-limits that layer for
+ * its lens (ADR-027 Amendment) softens the hole's edge, so coverage falls below 1 just OUTSIDE
+ * the tile. The DP blends layer + (1 - coverage) * woven there, and without this the woven side
+ * is the atlas's cleared (0,0,0,0): every windowed tile gets a dark line around it, at any page
+ * colour, scaling with the filter strength. With the tile's own colour underneath the blend stays
+ * continuous; everywhere the page is opaque this margin is covered and never seen.
+ *
+ * Call before ANY tile is drawn, so a neighbouring tile overwrites the margin. Corners come from
+ * the left and right strips, stretched over the extra rows.
+ *
+ * @param src_x,src_y,src_w,src_h The view's pixels in the caller's input (half the rect's width).
+ * @param tile_x                  Where this view's tile starts in the atlas (0, or win_w).
+ * @param rx,ry,rw,rh             The rect in window pixels, as the tile itself is drawn.
+ */
+static void
+weave_extend_tile_edges(struct d3d11_service_system *sys,
+                        struct d3d11_client_render_resources *res,
+                        ID3D11ShaderResourceView *src_srv,
+                        float src_x,
+                        float src_y,
+                        float src_w,
+                        float src_h,
+                        float src_tex_w,
+                        float src_tex_h,
+                        float tile_x,
+                        float rx,
+                        float ry,
+                        float rw,
+                        float rh,
+                        float win_w,
+                        float win_h,
+                        ID3D11RenderTargetView *rtv)
+{
+	// A span this narrow reads one texel centre with the linear sampler: a clamp, with no bleed
+	// from whatever the input holds beyond the rect.
+	const float texel = 0.01f;
+	const float near_edge = 0.5f - texel / 2.0f;
+	const float far_edge = 1.0f - near_edge;
+
+	// Clamped to this view's own tile: the atlas holds both views side by side.
+	const float left = (rx - WEAVE_TILE_EDGE_UNDERLAY_PX > 0.0f) ? rx - WEAVE_TILE_EDGE_UNDERLAY_PX : 0.0f;
+	const float right =
+	    (rx + rw + WEAVE_TILE_EDGE_UNDERLAY_PX < win_w) ? rx + rw + WEAVE_TILE_EDGE_UNDERLAY_PX : win_w;
+	const float top = (ry - WEAVE_TILE_EDGE_UNDERLAY_PX > 0.0f) ? ry - WEAVE_TILE_EDGE_UNDERLAY_PX : 0.0f;
+	const float bottom =
+	    (ry + rh + WEAVE_TILE_EDGE_UNDERLAY_PX < win_h) ? ry + rh + WEAVE_TILE_EDGE_UNDERLAY_PX : win_h;
+	const float atlas_w = win_w * 2.0f;
+
+	const auto strip = [&](float sx, float sy, float sw, float sh, float dx, float dy, float dw, float dh) {
+		if (dw <= 0.0f || dh <= 0.0f) {
+			return;
+		}
+		blit_to_atlas_texture(sys, res, src_srv, sx, sy, sw, sh, src_tex_w, src_tex_h, tile_x + dx, dy, dw, dh,
+		                      /*is_srgb*/ false, /*blend*/ nullptr, rtv, atlas_w, win_h);
+	};
+
+	strip(src_x + near_edge, src_y, texel, src_h, left, top, rx - left, bottom - top);
+	strip(src_x + src_w - far_edge, src_y, texel, src_h, rx + rw, top, right - (rx + rw), bottom - top);
+	strip(src_x, src_y + near_edge, src_w, texel, rx, top, rw, ry - top);
+	strip(src_x, src_y + src_h - far_edge, src_w, texel, rx, ry + rh, rw, bottom - (ry + rh));
 }
 
 bool
@@ -32216,6 +32890,29 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 		const float src_tw = (float)idesc.Width;
 		const float src_th = (float)idesc.Height;
+		// Under a 2D layer the DP softens each tile's hole edge: give that edge the tile's own
+		// colour to blend with, not the cleared atlas. All margins first, so tiles overwrite them.
+		if (ov_srv != nullptr) {
+			for (uint32_t i = 0; i < rect_count; i++) {
+				const float rw = (float)rects[i].extent.w;
+				const float rh = (float)rects[i].extent.h;
+				const float rx = (float)rects[i].offset.w;
+				const float ry = (float)rects[i].offset.h;
+				bool lifted = false; // a lift-flagged rect holds 2D, not SBS, and draws from its stream
+				for (uint32_t k = 0; k < lift_count; k++) {
+					lifted = lifted || lift_rects[k].rect_index == i;
+				}
+				if (rw <= 0.0f || rh <= 0.0f || lifted) {
+					continue;
+				}
+				weave_extend_tile_edges(sys, &c->render, in_srv, rx, ry, rw / 2.0f, rh, src_tw, src_th,
+				                        0.0f, rx, ry, rw, rh, (float)win_w, (float)win_h,
+				                        c->render.weave_sbs_rtv.get());
+				weave_extend_tile_edges(sys, &c->render, in_srv, rx + rw / 2.0f, ry, rw / 2.0f, rh, src_tw,
+				                        src_th, (float)win_w, rx, ry, rw, rh, (float)win_w,
+				                        (float)win_h, c->render.weave_sbs_rtv.get());
+			}
+		}
 		for (uint32_t i = 0; i < rect_count; i++) {
 			const float rw = (float)rects[i].extent.w;
 			const float rh = (float)rects[i].extent.h;
@@ -32585,13 +33282,23 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
 	// weave_hwnd, so the snap is against the right window.
 	struct xrt_display_processor_d3d11 *sdp = panel_dp(c->sys, c);
 
+	// ADR-060 R2: a windowless weave DP is what actually weaves this window, on
+	// this session or on a sibling session bound to the same window, so that
+	// weaver answers. The panel DP has no viewing distance for it and declines,
+	// which leaves the window on raw drag positions (visible 3D judder).
+	struct d3d11_service_compositor *owner = svc_weave_snap_owner(c);
+	if (owner != nullptr) {
+		sdp = owner->render.weave_dp;
+	}
+
 	// #1884 (ADR-047 Amendment 4): a present-owner whose window is woven per
 	// screen snaps to the lattice of the screen holding the majority of the
 	// window at the proposed position (the handle owner's hysteresis, so a
 	// drag across the seam does not flip lattices under the cursor). That
 	// screen's segment DP answers; a DP without snap support falls back to the
 	// panel DP below, which is the pre-#1884 answer.
-	struct xrt_display_processor_d3d11 *seg_dp = weave_seg_snap_dp(c, target_x, target_y);
+	struct d3d11_service_compositor *seg_owner = owner != nullptr ? owner : c;
+	struct xrt_display_processor_d3d11 *seg_dp = weave_seg_snap_dp(seg_owner, target_x, target_y);
 	if (seg_dp != nullptr) {
 		int32_t gx = target_x, gy = target_y;
 		if (xrt_display_processor_d3d11_snap_window_rect(seg_dp, origin_x, origin_y, target_x, target_y, &gx,
@@ -36386,6 +37093,284 @@ comp_d3d11_service_compositor_set_client_pid(struct xrt_compositor *xc, long pid
 	if (c != nullptr) {
 		c->client_pid = pid;
 	}
+}
+
+bool
+comp_d3d11_service_share_query(struct xrt_compositor *xc,
+                               struct xrt_app_share_source_info *io_info,
+                               int64_t *out_last_commit_ns)
+{
+	if (xc == nullptr) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c == nullptr) {
+		return false;
+	}
+	const uint32_t views = c->share_active_views.load(std::memory_order_relaxed);
+	io_info->content_eye_width = c->pipe_content_w;
+	io_info->content_eye_height = c->pipe_content_h;
+	if (views > 0) {
+		io_info->active_view_count = views;
+	}
+	io_info->zero_disparity_shift_frac = 0.0f;
+	io_info->encoding_is_linear = c->atlas_holds_srgb_bytes ? 0u : 1u;
+	HWND hwnd = c->app_hwnd != nullptr ? (HWND)c->app_hwnd : (HWND)c->render.hwnd;
+	RECT r = {};
+	if (hwnd != nullptr && GetWindowRect(hwnd, &r)) {
+		io_info->window_x = r.left;
+		io_info->window_y = r.top;
+		io_info->window_width = (uint32_t)(r.right - r.left);
+		io_info->window_height = (uint32_t)(r.bottom - r.top);
+	}
+	*out_last_commit_ns = c->share_last_commit_ns.load(std::memory_order_relaxed);
+	return true;
+}
+
+xrt_result_t
+comp_d3d11_service_share_attach(struct xrt_compositor *xc, uint32_t eye_w, uint32_t eye_h, float fps, void **out_tap)
+{
+	if (xc == nullptr || eye_w < 16 || eye_h < 16 || (eye_w & 1) != 0 || (eye_h & 1) != 0 || fps <= 0.0f) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	auto tp = std::make_shared<struct svc_share_tap>();
+	tp->eye_w = eye_w;
+	tp->eye_h = eye_h;
+	tp->period_ns = (int64_t)(1e9f / fps);
+	if (!svc_share_tap_create_gpu(c->sys, tp.get())) {
+		U_LOG_W("ADR-061 share tap: GPU resources failed");
+		return XRT_ERROR_ALLOCATION;
+	}
+	{
+		std::lock_guard<std::mutex> lk(g_svc_share_mutex);
+		if (c->share_tap) {
+			U_LOG_W("ADR-061 share tap: client already tapped");
+			return XRT_ERROR_IPC_FAILURE;
+		}
+		tp->owner = c;
+		c->share_tap = tp;
+		c->share_tap_active.store(true);
+	}
+	U_LOG_W("ADR-061 share tap: attached client pid %ld, %ux%u per eye, at most %.1f fps", c->client_pid, eye_w, eye_h,
+	        (double)fps);
+	*out_tap = new std::shared_ptr<struct svc_share_tap>(std::move(tp));
+	return XRT_SUCCESS;
+}
+
+uint32_t
+comp_d3d11_service_share_wait_frame(void *tap,
+                                    int64_t timeout_ns,
+                                    struct xrt_plugin_stereo_camera_frame *out_frame,
+                                    struct xrt_app_share_frame_info *out_info)
+{
+	struct svc_share_tap *t = static_cast<std::shared_ptr<struct svc_share_tap> *>(tap)->get();
+	std::unique_lock<std::mutex> lk(t->mutex);
+	const bool woke = t->cv.wait_for(lk, std::chrono::nanoseconds(timeout_ns),
+	                                 [&] { return !t->alive || t->ready_seq != t->consumed_seq; });
+	if (!t->alive) {
+		return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
+	}
+	if (!woke) {
+		return XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT;
+	}
+	t->front.swap(t->ready);
+	t->consumed_seq = t->ready_seq;
+	const uint32_t full_w = t->eye_w * 2;
+	out_frame->sequence = t->consumed_seq;
+	out_frame->time_ns = t->ready_commit_ns;
+	out_frame->time_is_exposure = false;
+	out_frame->width = full_w;
+	out_frame->height = t->eye_h;
+	out_frame->format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12;
+	out_frame->planes[0] = t->front.data();
+	out_frame->planes[1] = t->front.data() + (size_t)full_w * t->eye_h;
+	out_frame->pitches[0] = full_w;
+	out_frame->pitches[1] = full_w;
+	*out_info = t->ready_info;
+	return XRT_PLUGIN_STEREO_CAMERA_WAIT_OK;
+}
+
+void
+comp_d3d11_service_share_detach(void *tap)
+{
+	auto *handle = static_cast<std::shared_ptr<struct svc_share_tap> *>(tap);
+	struct svc_share_tap *t = handle->get();
+	{
+		std::lock_guard<std::mutex> lk(g_svc_share_mutex);
+		if (t->owner != nullptr) {
+			t->owner->share_tap_active.store(false);
+			t->owner->share_tap.reset();
+			t->owner = nullptr;
+		}
+	}
+	// A commit still inside svc_share_tap_commit holds its own reference, so the
+	// last release may be there.
+	const double n = t->n_commit > 0 ? (double)t->n_commit : 1.0;
+	U_LOG_W("ADR-061 share tap: detached. %llu commits, %llu frames queued, %llu delivered, %llu skipped (ring full); "
+	        "cost per commit avg %.3f ms, max %.3f ms (harvest avg %.3f ms)",
+	        (unsigned long long)t->n_commit, (unsigned long long)t->n_submit, (unsigned long long)t->n_harvest,
+	        (unsigned long long)t->n_ring_full, (double)t->ns_commit_total / n * 1e-6, (double)t->ns_commit_max * 1e-6,
+	        (double)t->ns_harvest_total / n * 1e-6);
+	delete handle;
+}
+
+//! ADR-061 arm 2: an in-process app's ring, opened on the service device.
+struct svc_share_import
+{
+	struct d3d11_service_system *sys = nullptr;
+	struct xrt_share_link_ring_desc desc = {};
+	wil::com_ptr<ID3D11Texture2D> tex[XRT_SHARE_LINK_RING_SLOTS];
+	wil::com_ptr<ID3D11ShaderResourceView> srv[XRT_SHARE_LINK_RING_SLOTS];
+	wil::com_ptr<ID3D11Fence> fence;
+	wil::com_ptr<ID3D11DeviceContext4> ctx4;
+	std::shared_ptr<struct svc_share_tap> tap;
+	uint64_t n_frames = 0, n_ring_full = 0, n_ok = 0;
+};
+
+bool
+comp_d3d11_service_share_link_adapter_luid(struct xrt_system_compositor *xsysc, uint8_t out_luid[XRT_LUID_SIZE])
+{
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (sys == nullptr || !sys->base.info.client_d3d_deviceLUID_valid) {
+		return false;
+	}
+	std::memcpy(out_luid, sys->base.info.client_d3d_deviceLUID.data, XRT_LUID_SIZE);
+	return true;
+}
+
+xrt_result_t
+comp_d3d11_service_share_link_import(struct xrt_system_compositor *xsysc,
+                                     const struct xrt_share_link_ring_desc *desc,
+                                     const xrt_graphics_buffer_handle_t *textures,
+                                     uint32_t texture_count,
+                                     xrt_graphics_sync_handle_t fence,
+                                     uint32_t eye_w,
+                                     uint32_t eye_h,
+                                     void **out_import)
+{
+	// Every handle is ours from here, whatever happens.
+	struct handles_closer
+	{
+		const xrt_graphics_buffer_handle_t *t;
+		uint32_t n;
+		xrt_graphics_sync_handle_t f;
+		~handles_closer()
+		{
+			for (uint32_t i = 0; i < n; i++) {
+				if (t[i] != nullptr && t[i] != INVALID_HANDLE_VALUE) {
+					CloseHandle(t[i]);
+				}
+			}
+			if (f != nullptr && f != INVALID_HANDLE_VALUE) {
+				CloseHandle(f);
+			}
+		}
+	} closer{textures, texture_count, fence};
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (sys == nullptr || desc == nullptr || out_import == nullptr || texture_count != XRT_SHARE_LINK_RING_SLOTS ||
+	    desc->slot_count != XRT_SHARE_LINK_RING_SLOTS || desc->content_width == 0 || desc->content_height == 0 ||
+	    desc->slot_width < desc->content_width * 2 || desc->slot_height < desc->content_height || eye_w < 16 ||
+	    eye_h < 16 || (eye_w & 1) != 0 || (eye_h & 1) != 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	wil::com_ptr<ID3D11Device1> dev1;
+	if (FAILED(sys->device->QueryInterface(IID_PPV_ARGS(dev1.put())))) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	auto imp = std::make_unique<struct svc_share_import>();
+	imp->sys = sys;
+	imp->desc = *desc;
+	for (uint32_t i = 0; i < XRT_SHARE_LINK_RING_SLOTS; i++) {
+		HRESULT hr = dev1->OpenSharedResource1(textures[i], IID_PPV_ARGS(imp->tex[i].put()));
+		if (SUCCEEDED(hr)) {
+			hr = sys->device->CreateShaderResourceView(imp->tex[i].get(), nullptr, imp->srv[i].put());
+		}
+		if (FAILED(hr)) {
+			U_LOG_W("ADR-061 share link: slot %u of ring %u will not open (0x%08lx): is it on this adapter?", i,
+			        desc->generation, (unsigned long)hr);
+			return XRT_ERROR_IPC_FAILURE;
+		}
+	}
+	if (fence != nullptr && fence != INVALID_HANDLE_VALUE) {
+		wil::com_ptr<ID3D11Device5> dev5;
+		if (FAILED(sys->device->QueryInterface(IID_PPV_ARGS(dev5.put()))) ||
+		    FAILED(dev5->OpenSharedFence(fence, IID_PPV_ARGS(imp->fence.put()))) ||
+		    FAILED(sys->context->QueryInterface(IID_PPV_ARGS(imp->ctx4.put())))) {
+			U_LOG_W("ADR-061 share link: the fence of ring %u will not open", desc->generation);
+			return XRT_ERROR_IPC_FAILURE;
+		}
+	}
+	auto tp = std::make_shared<struct svc_share_tap>();
+	tp->eye_w = eye_w;
+	tp->eye_h = eye_h;
+	if (!svc_share_tap_create_gpu(sys, tp.get())) {
+		U_LOG_W("ADR-061 share link: GPU resources failed");
+		return XRT_ERROR_ALLOCATION;
+	}
+	imp->tap = std::move(tp);
+	*out_import = imp.release();
+	return XRT_SUCCESS;
+}
+
+uint32_t
+comp_d3d11_service_share_link_convert(void *import,
+                                      const struct xrt_share_link_frame *frame,
+                                      struct xrt_plugin_stereo_camera_frame *out_frame,
+                                      struct xrt_app_share_frame_info *out_info)
+{
+	struct svc_share_import *imp = static_cast<struct svc_share_import *>(import);
+	struct svc_share_tap *t = imp->tap.get();
+	struct d3d11_service_system *sys = imp->sys;
+	if (frame->slot >= XRT_SHARE_LINK_RING_SLOTS) {
+		return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
+	}
+	const uint32_t cw = frame->content_width != 0 ? frame->content_width : imp->desc.content_width;
+	const uint32_t ch = frame->content_width != 0 ? frame->content_height : imp->desc.content_height;
+	{
+		std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+		svc_share_tap_harvest(sys, t);
+		if (t->slot[t->write_idx].busy) {
+			imp->n_ring_full++;
+		} else {
+			if (imp->fence && imp->ctx4 && frame->fence_value != 0) {
+				imp->ctx4->Wait(imp->fence.get(), frame->fence_value);
+			}
+			// The two halves as a 2x1 atlas. A mono frame reads the left half twice.
+			svc_share_tap_submit(sys, t, 0, frame->mono != 0 ? 0 : 1, frame->mono != 0, 2, 1, cw, ch,
+			                     imp->desc.slot_width, imp->desc.slot_height, (int)imp->desc.format,
+			                     imp->desc.flip_y != 0, imp->desc.encoding_is_linear != 0,
+			                     imp->srv[frame->slot].get(), frame->commit_ns, frame->zero_disparity_shift_frac);
+			imp->n_frames++;
+		}
+	}
+	const uint32_t w = comp_d3d11_service_share_wait_frame(&imp->tap, 0, out_frame, out_info);
+	if (w == XRT_PLUGIN_STEREO_CAMERA_WAIT_OK) {
+		imp->n_ok++;
+	}
+	return w;
+}
+
+void
+comp_d3d11_service_share_link_unimport(void *import)
+{
+	struct svc_share_import *imp = static_cast<struct svc_share_import *>(import);
+	if (imp == nullptr) {
+		return;
+	}
+	U_LOG_W("ADR-061 share link: ring %u closed: %llu frames queued, %llu delivered, %llu skipped (ring full)",
+	        imp->desc.generation, (unsigned long long)imp->n_frames, (unsigned long long)imp->n_ok,
+	        (unsigned long long)imp->n_ring_full);
+	{
+		// The tap's GPU objects were last used under this lock.
+		std::lock_guard<std::mutex> ctx_lock(imp->sys->immediate_ctx_mutex);
+		imp->tap.reset();
+	}
+	delete imp;
 }
 
 bool

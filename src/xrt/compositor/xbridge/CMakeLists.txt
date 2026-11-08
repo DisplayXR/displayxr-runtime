@@ -40,3 +40,17 @@ if(WIN32 AND XRT_HAVE_D3D11)
 	# Consumers include the bridge headers by their bare names.
 	target_include_directories(comp_xbridge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
+
+#
+# ADR-061 arm 2: the in-process share tap. Built everywhere: off Windows the
+# entry points are portable C over util/u_share_link.h reporting "no tap"; the
+# Windows body is the NT-shared ring the fill arm copies its pre-weave views into.
+#
+add_library(comp_xbridge_share_tap STATIC comp_xbridge_share_tap.c comp_xbridge_share_tap.h)
+target_link_libraries(comp_xbridge_share_tap PUBLIC xrt-interfaces PRIVATE aux_util)
+target_include_directories(comp_xbridge_share_tap PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(WIN32 AND XRT_HAVE_D3D11)
+	target_sources(comp_xbridge_share_tap PRIVATE comp_xbridge_share_tap_win.cpp)
+	target_compile_definitions(comp_xbridge_share_tap PRIVATE COMP_XBRIDGE_SHARE_TAP_WIN)
+	target_link_libraries(comp_xbridge_share_tap PRIVATE aux_os d3d11 dxgi WIL::WIL)
+endif()

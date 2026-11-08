@@ -569,6 +569,11 @@ auto-convergence no longer runs for that stream.
   A/B. The choice is logged once (WARN); each stream logs its first lock (WARN) and its
   convergence / target / subject / confidence / cut count every 5 s (INFO, in the per-stream
   stats).
+- **Provider-owned AUTO (ADR-053 Amendment 1):** on a conversion provider whose capability
+  declares `XRT_CONV_CAP_AUTO_CONVERGENCE`, none of the above runs for that stream. AUTO reaches
+  the provider every frame, whatever this switch says, and an app-set plane still wins. The
+  runtime does not choose between auto-convergence methods for the user. Each stream logs its
+  convergence owner once (WARN).
 
 ### 4.5 Platform-neutral images and explicit sync (spec 4)
 
@@ -995,12 +1000,14 @@ UI rates.
 - **Streams belong to the IPC connection**, not the session, and die with it; the calls need no
   compositor session, which is what lets `displayxr-cli lift` drive them headless — and what lets
   an in-process session use lift (ADR-049): it opens a sessionless `APP` connection named
-  `<exe> (in-process lift)` (`ipc_client_lift_link.c`, background connect, never launches the
-  service, retried at most every 5 s) and runs the same calls on it. Lines in the app's log:
-  `[lift] in-process: no conversion service (...); in-process conversion unavailable, retrying
-  quietly ...` (one WARN, then the retries log nothing until a connect succeeds),
-  `[lift] in-process: lift-only service connection up (generation N)` (INFO), and
-  `... connection (generation N) is gone ...` (WARN).
+  `<exe> (in-process)` — the session's **service link** (`ipc_client_service_link.c`, ADR-049
+  Amendment 1: the same connection also carries the session's 3D-screen-share capability,
+  ADR-061 arm 2, so a session that lifts and shares holds one connection, not two) — background
+  connect, never launches the service, retried at most every 5 s, and runs the same calls on it.
+  Lines in the app's log: `[service-link] in-process: no service (...); in-process conversion
+  and sharing unavailable, retrying quietly ...` (one WARN, then the retries log nothing until a
+  connect succeeds), `[service-link] in-process: service connection up (generation N, caps 0x…)`
+  (INFO), and `... connection (generation N) is gone ...` (WARN).
 
 ## 10. Error codes and connection loss
 

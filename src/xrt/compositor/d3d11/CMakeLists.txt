@@ -61,6 +61,7 @@ if(WIN32 AND XRT_HAVE_D3D11)
 			# path at all — see docs/investigations/hybrid-igpu-weave.md).
 			aux_d3d
 			comp_xbridge
+			comp_xbridge_share_tap
 			comp_d3d11_segs
 			# #2317 P1b: the D3D11 hub the DXR_HUB=1 shim hands its atlas to. A
 			# static-library cycle (the hub links comp_d3d11 for comp_d3d11_target),

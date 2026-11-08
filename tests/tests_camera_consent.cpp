@@ -1280,6 +1280,25 @@ TEST_CASE("android consent: the built-in list is well-formed", "[camera_consent]
 		CHECK(u_camera_consent_android_digest_normalize(list[i].cert_sha256, d));
 	}
 	CHECK(std::string(list[0].package) == kBrowserPkg);
+
+	// Both DisplayXR Browser signers (release and the build lane's CI key) are
+	// trusted for the same package; any other signer of that package is still a
+	// certificate mismatch, never package-only trust.
+	uint32_t browser_entries = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		if (std::string(list[i].package) != kBrowserPkg) {
+			continue;
+		}
+		browser_entries++;
+		const u_camera_consent_android_trusted *hit = nullptr;
+		CHECK(u_camera_consent_android_trust_lookup(list, n, kBrowserPkg, list[i].cert_sha256, &hit) ==
+		      U_CAMERA_CONSENT_ANDROID_TRUSTED);
+		CHECK(hit == &list[i]);
+	}
+	CHECK(browser_entries >= 2);
+	CHECK(u_camera_consent_android_trust_lookup(list, n, kBrowserPkg,
+	                                            "0000000000000000000000000000000000000000000000000000000000000000",
+	                                            nullptr) == U_CAMERA_CONSENT_ANDROID_PACKAGE_ONLY);
 }
 
 TEST_CASE("android consent: the trusted browser needs no prompt, only CAMERA", "[camera_consent][android]")
@@ -1545,4 +1564,214 @@ TEST_CASE("camera consent: the component flag never rescues a missing identity",
 	CHECK(d.why == U_CAMERA_CONSENT_WHY_NO_IDENTITY);
 	CHECK(std::string(u_camera_consent_why_str(U_CAMERA_CONSENT_WHY_COMPONENT)).find("component") !=
 	      std::string::npos);
+}
+
+
+/*
+ *
+ * ADR-061: the app-share consent policy (u_app_share_consent_evaluate) — its
+ * own decision tree, separate from the camera table above.
+ *
+ */
+
+namespace {
+
+struct share_prompt_fake
+{
+	u_camera_consent_prompt_answer answer = U_CAMERA_CONSENT_PROMPT_ALLOW;
+	int prompts = 0;
+	std::string last_consumer, last_app;
+};
+
+u_camera_consent_prompt_answer
+sp_prompt(void *ctx, const char *consumer_exe, long consumer_pid, const char *app_name, const char *app_exe, uint32_t t)
+{
+	(void)consumer_pid;
+	(void)app_exe;
+	(void)t;
+	auto *p = (share_prompt_fake *)ctx;
+	p->prompts++;
+	p->last_consumer = consumer_exe;
+	p->last_app = app_name;
+	return p->answer;
+}
+
+struct share_rig
+{
+	rig cam; //!< the camera policy whose kill switch / toggle / store the share consults
+	share_prompt_fake sp;
+	u_app_share_consent s;
+	share_rig()
+	{
+		memset(&s, 0, sizeof(s));
+		s.camera = &cam.c;
+		s.prompt_enabled = true;
+		s.prompt_timeout_ms = 1000;
+		s.mode = U_APP_SHARE_PROMPT_ALWAYS;
+		s.prompt = sp_prompt;
+		s.prompt_ctx = &sp;
+	}
+	u_app_share_decision
+	eval(const char *consumer = "/apps/browser", uint64_t key = 7, long app_pid = 4242, bool available = true)
+	{
+		u_app_share_request r = {};
+		r.consumer_exe = consumer;
+		r.consumer_pid = 100;
+		r.app_name = "Model Viewer";
+		r.app_exe = "/apps/modelviewer";
+		r.app_pid = app_pid;
+		r.app_key = key;
+		r.source_available = available;
+		u_app_share_decision d;
+		u_app_share_consent_evaluate(&s, &r, &d);
+		return d;
+	}
+};
+
+} // namespace
+
+TEST_CASE("app share consent: the prompt runs on EVERY start by default", "[camera_consent][app_share]")
+{
+	share_rig r;
+	auto d1 = r.eval();
+	auto d2 = r.eval();
+	CHECK(d1.verdict == U_APP_SHARE_ALLOWED);
+	CHECK(d1.why == U_APP_SHARE_WHY_PROMPT_ALLOW);
+	CHECK(d2.verdict == U_APP_SHARE_ALLOWED);
+	CHECK(r.sp.prompts == 2); // share.prompt = always: no Allow is remembered
+	CHECK(r.sp.last_consumer == "/apps/browser");
+	CHECK(r.sp.last_app == "Model Viewer");
+	// Nothing is ever written to the camera store.
+	CHECK(r.cam.store.sets == 0);
+	CHECK(r.cam.store.apps.empty());
+
+	r.sp.answer = U_CAMERA_CONSENT_PROMPT_DENY;
+	auto d3 = r.eval();
+	CHECK(d3.verdict == U_APP_SHARE_REFUSED);
+	CHECK(d3.why == U_APP_SHARE_WHY_PROMPT_DENY);
+	r.sp.answer = U_CAMERA_CONSENT_PROMPT_ALLOW;
+	CHECK(r.eval().verdict == U_APP_SHARE_ALLOWED); // no stored Deny either
+	r.sp.answer = U_CAMERA_CONSENT_PROMPT_TIMEOUT;
+	CHECK(r.eval().why == U_APP_SHARE_WHY_PROMPT_TIMEOUT);
+	r.sp.answer = U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	CHECK(r.eval().verdict == U_APP_SHARE_REFUSED);
+}
+
+TEST_CASE("app share consent: per-app-run remembers one Allow until the app exits", "[camera_consent][app_share]")
+{
+	share_rig r;
+	r.s.mode = U_APP_SHARE_PROMPT_PER_APP_RUN;
+	CHECK(r.eval().why == U_APP_SHARE_WHY_PROMPT_ALLOW);
+	auto d = r.eval();
+	CHECK(d.verdict == U_APP_SHARE_ALLOWED);
+	CHECK(d.why == U_APP_SHARE_WHY_RUN_GRANT);
+	CHECK(r.sp.prompts == 1);
+	// Another consumer, another app, or the same app restarted (new pid) is asked again.
+	CHECK(r.eval("/apps/other-call").why == U_APP_SHARE_WHY_PROMPT_ALLOW);
+	CHECK(r.eval("/apps/browser", 8).why == U_APP_SHARE_WHY_PROMPT_ALLOW);
+	CHECK(r.eval("/apps/browser", 7, 5151).why == U_APP_SHARE_WHY_PROMPT_ALLOW);
+	CHECK(r.sp.prompts == 4);
+	// The app exits: its grant goes.
+	u_app_share_consent_forget_app(&r.s, 7);
+	CHECK(r.eval().why == U_APP_SHARE_WHY_PROMPT_ALLOW);
+	CHECK(r.eval().why == U_APP_SHARE_WHY_RUN_GRANT);
+	// "Stop camera sharing" forgets every grant.
+	u_app_share_consent_forget_all(&r.s);
+	CHECK(r.eval().why == U_APP_SHARE_WHY_PROMPT_ALLOW);
+	// A Deny is never remembered.
+	u_app_share_consent_forget_all(&r.s);
+	r.sp.answer = U_CAMERA_CONSENT_PROMPT_DENY;
+	CHECK(r.eval().verdict == U_APP_SHARE_REFUSED);
+	r.sp.answer = U_CAMERA_CONSENT_PROMPT_ALLOW;
+	CHECK(r.eval().verdict == U_APP_SHARE_ALLOWED);
+}
+
+TEST_CASE("app share consent: one switch stops cameras and shares alike", "[camera_consent][app_share]")
+{
+	share_rig r;
+	r.s.dev_gate = true; // even the development gate does not outrank a kill switch
+	SECTION("camera kill switch")
+	{
+		r.cam.c.kill_switch = true;
+		CHECK(r.eval().why == U_APP_SHARE_WHY_KILL_SWITCH);
+		CHECK(r.eval().verdict == U_APP_SHARE_DISABLED);
+	}
+	SECTION("user toggle")
+	{
+		r.cam.store.sharing = false;
+		CHECK(r.eval().why == U_APP_SHARE_WHY_SHARING_OFF);
+	}
+	SECTION("DXR_APP_SHARE=0")
+	{
+		r.s.app_share_off = true;
+		CHECK(r.eval().why == U_APP_SHARE_WHY_APP_SHARE_OFF);
+		CHECK(r.eval().verdict == U_APP_SHARE_DISABLED);
+	}
+	CHECK(r.sp.prompts == 0);
+}
+
+TEST_CASE("app share consent: DXR_STEREO_CAMERA_DEV_ALLOW does NOT lift the share prompt",
+          "[camera_consent][app_share]")
+{
+	share_rig r;
+	r.cam.c.dev_override = true; // the camera table's developer override
+	r.sp.answer = U_CAMERA_CONSENT_PROMPT_DENY;
+	auto d = r.eval();
+	CHECK(d.verdict == U_APP_SHARE_REFUSED);
+	CHECK(d.why == U_APP_SHARE_WHY_PROMPT_DENY);
+	CHECK(r.sp.prompts == 1);
+	// No prompt UI at all: refused, the camera override notwithstanding.
+	r.s.prompt = nullptr;
+	CHECK(r.eval().why == U_APP_SHARE_WHY_PROMPT_UNAVAILABLE);
+	// Only DXR_APP_SHARE_DEV skips it.
+	r.s.dev_gate = true;
+	d = r.eval();
+	CHECK(d.verdict == U_APP_SHARE_ALLOWED);
+	CHECK(d.why == U_APP_SHARE_WHY_DEV_GATE);
+}
+
+TEST_CASE("app share consent: a delegating browser is still prompted", "[camera_consent][app_share]")
+{
+	share_rig r;
+	r.cam.store.delegating.insert("/apps/browser"); // a registered consent-delegating client
+	r.cam.store.apps["/apps/browser"] = U_CAMERA_CONSENT_STORED_ALLOW; // and a stored CAMERA Allow
+	auto d = r.eval();
+	CHECK(d.why == U_APP_SHARE_WHY_PROMPT_ALLOW);
+	CHECK(r.sp.prompts == 1);
+	r.sp.answer = U_CAMERA_CONSENT_PROMPT_DENY;
+	CHECK(r.eval().verdict == U_APP_SHARE_REFUSED); // the camera Allow never doubles as a share Allow
+}
+
+TEST_CASE("app share consent: identity, then source, then prompt", "[camera_consent][app_share]")
+{
+	share_rig r;
+	CHECK(r.eval("").why == U_APP_SHARE_WHY_NO_IDENTITY);
+	CHECK(r.eval("").verdict == U_APP_SHARE_REFUSED);
+	auto d = r.eval("/apps/browser", 7, 4242, false);
+	CHECK(d.verdict == U_APP_SHARE_BUSY);
+	CHECK(d.why == U_APP_SHARE_WHY_SOURCE_GONE);
+	CHECK(r.sp.prompts == 0); // never prompted for something that cannot be shared
+	r.s.prompt_enabled = false; // DXR_STEREO_CAMERA_PROMPT=0
+	CHECK(r.eval().why == U_APP_SHARE_WHY_PROMPT_UNAVAILABLE);
+}
+
+TEST_CASE("app share settings: parse / print / extents", "[camera_consent][app_share]")
+{
+	u_app_share_prompt_mode m = U_APP_SHARE_PROMPT_ALWAYS;
+	CHECK(u_app_share_prompt_mode_parse("per-app-run", &m));
+	CHECK(m == U_APP_SHARE_PROMPT_PER_APP_RUN);
+	CHECK(!u_app_share_prompt_mode_parse("allow", &m));
+	CHECK(std::string(u_app_share_prompt_mode_str(U_APP_SHARE_PROMPT_ALWAYS)) == "always");
+	u_app_share_resolution res = U_APP_SHARE_RESOLUTION_720P;
+	CHECK(u_app_share_resolution_parse("1080p", &res));
+	CHECK(res == U_APP_SHARE_RESOLUTION_1080P);
+	CHECK(!u_app_share_resolution_parse("4k", &res));
+	uint32_t w = 0, h = 0;
+	float fps = 0;
+	u_app_share_resolution_extent(U_APP_SHARE_RESOLUTION_720P, &w, &h, &fps);
+	CHECK((w == 1280 && h == 720 && fps == 30.0f));
+	u_app_share_resolution_extent(U_APP_SHARE_RESOLUTION_1080P, &w, &h, &fps);
+	CHECK((w == 1920 && h == 1080 && fps == 60.0f));
+	CHECK(!u_app_share_settings_set("prompt", "sometimes"));
+	CHECK(!u_app_share_settings_set("colour", "720p"));
 }

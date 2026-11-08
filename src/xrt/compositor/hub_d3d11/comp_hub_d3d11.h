@@ -286,11 +286,25 @@ struct comp_hub_d3d11_info
 	bool ring_direct_planes;
 
 	/*!
+	 * #2518: a RING producer that takes DIRECT ingress BY DEFAULT on one
+	 * adapter (render == scanout). Without it a ring producer stays on xbridge
+	 * (`ingress_reason=default_xbridge`) unless `DXR_HUB_INGRESS=direct` opts
+	 * it in. The D3D12 #1264 reroute sets it: on a same-adapter hybrid laptop
+	 * the staged ring added an app-queue copy per frame that the #2362 drain
+	 * waited on almost every frame, and the 2-deep ring made the weave pick
+	 * the previous slot ~99 % of the time (the Unreal data point of #2375);
+	 * DIRECT removed both. The VK deposit sets it too since its fence-mode
+	 * run on a single dGPU passed (#2371, accepted 2026-11-02). `DXR_HUB_INGRESS=xbridge`
+	 * still forces the bridge.
+	 */
+	bool ring_direct_default;
+
+	/*!
 	 * #2317 step 2: decline a SAME-ADAPTER engage with
-	 * @ref COMP_HUB_REASON_SAME_ADAPTER_OPT_IN. The D3D11 shim sets it when the
-	 * hub engages by default (no explicit `DXR_HUB=1`): the default-on scope is
-	 * the cross-adapter (hybrid) topology until the single-dGPU desktop run of
-	 * ADR-059's acceptance lands. Zero for every other caller (unchanged).
+	 * @ref COMP_HUB_REASON_SAME_ADAPTER_OPT_IN. No in-tree caller sets it since
+	 * ADR-059 Amendment 4: the D3D11 shim set it (default-on scope = cross-adapter)
+	 * until the single-dGPU run (#2371) passed. Kept for a future shim that needs
+	 * the same staged rollout.
 	 */
 	bool same_adapter_needs_opt_in;
 };
@@ -1061,6 +1075,14 @@ void
 comp_hub_d3d11_set_atlas_encoding(struct comp_hub_d3d11 *split, enum xrt_atlas_encoding encoding);
 
 /*!
+ * ADR-061 arm 2: this producer's frames cannot be shared; the hub reports
+ * @p reason (enum xrt_app_share_availability) instead of offering its share tap.
+ * Call before the first @ref comp_hub_d3d11_submit_atlas.
+ */
+void
+comp_hub_d3d11_decline_share_tap(struct comp_hub_d3d11 *split, uint32_t reason);
+
+/*!
  * XR_DXR_depth_budget - one background preview from the split's weaver.
  *
  * The rear-depth policy needs the desktop UNDER the app window, and under the
@@ -1144,11 +1166,13 @@ comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split);
  *
  * On ONE adapter the hub opens each deposit ring slot on its own device and
  * weaves it in place: no comp_xbridge, no transport copy (xbridge's staged
- * ingress paid three: staging, cross-adapter heap, egress). OPT-IN for now:
- * `DXR_HUB_INGRESS=direct` (the default stays xbridge,
- * `ingress_reason=default_xbridge`, until a single-dGPU desktop has run VK
- * fence-mode DIRECT; the flip is tracked in #2317). `DXR_HUB_INGRESS=xbridge`
- * forces the bridge for every producer, the D3D11 shim included.
+ * ingress paid three: staging, cross-adapter heap, egress). The DEFAULT for a
+ * producer that declares @ref comp_hub_d3d11_info::ring_direct_default (the
+ * D3D12 reroute since #2518, on the Unreal data point of #2375; the VK deposit
+ * since its single-dGPU fence-mode run, #2371); OPT-IN via
+ * `DXR_HUB_INGRESS=direct` for any other ring producer
+ * (`ingress_reason=default_xbridge`). `DXR_HUB_INGRESS=xbridge` forces the
+ * bridge for every producer, the D3D11 shim included.
  * Cross-adapter sessions always take xbridge.
  *
  * Synchronisation, all GPU-side (ADR-055):
@@ -1200,8 +1224,10 @@ comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split);
 
 //! `DXR_HUB_INGRESS=xbridge`: the A/B control / kill switch.
 #define COMP_HUB_INGRESS_REASON_FORCED "forced_by_env"
-//! A ring producer on one adapter without `DXR_HUB_INGRESS=direct`: DIRECT is
-//! opt-in for the ring producers until the single-GPU desktop gate (#2317).
+//! A ring producer on one adapter that neither declares
+//! @ref comp_hub_d3d11_info::ring_direct_default nor has `DXR_HUB_INGRESS=direct`:
+//! DIRECT stays opt-in for it (#2317). Both in-tree ring producers default to
+//! DIRECT: the D3D12 reroute since #2518, the VK deposit since #2371.
 #define COMP_HUB_INGRESS_REASON_DEFAULT_XBRIDGE "default_xbridge"
 //! Render and hub devices are on different adapters: xbridge is the transport.
 #define COMP_HUB_INGRESS_REASON_CROSS_ADAPTER "cross_adapter"

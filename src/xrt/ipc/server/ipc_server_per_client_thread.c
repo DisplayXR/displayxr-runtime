@@ -100,6 +100,10 @@ common_shutdown(volatile struct ipc_client_state *ics)
 	// rows stayed listed forever (win-box row 6, 2026-10-19).
 	ipc_server_client_input_release(ics);
 
+	// ADR-061 arm 2: so is a service link (client_state.id again): unregistered
+	// after the memset, a crashed in-process app stayed listed AVAILABLE forever.
+	ipc_server_client_stereo_camera_link_release(ics);
+
 	/*
 	 * Remove the thread from the server.
 	 */
@@ -628,6 +632,13 @@ ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_stat
 	// XR_DXR_display_info v25: the hint is the session's; a next session on
 	// this connection starts asking for a viewer again until it says otherwise.
 	ics->fixed_viewer = false;
+
+	// ADR-061: an app share of this session ends (SOURCE_LOST) and its tap is
+	// detached BEFORE the compositor it reads goes away.
+	if (ics->xs != NULL) {
+		ipc_server_stereo_camera_app_session_ending(ics);
+	}
+	ics->app_share_opt_out = false;
 
 	// Destroy the compositor BEFORE dropping our xscs swapchain
 	// references (#238). The compositor's destroy path runs under its

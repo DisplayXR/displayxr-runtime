@@ -89,6 +89,9 @@ cli_print_help(int argc, const char **argv)
 	P("                      [--frames N] [--seconds S] [--out DIR]' — rate, layout, disparity, PNG.\n");
 	P("                      'camera calibration list|show|set-placement|reset' — where each camera sits\n");
 	P("                      relative to each screen (local store, shared by every provider).\n");
+	P("  share <...>       - 3D screen share (XR_DXR_app_share, ADR-061): 'share list [--json]' and\n");
+	P("                      'share probe [<id>]' = camera list/probe of running-app entries;\n");
+	P("                      'share settings [prompt always|per-app-run] [resolution 720p|1080p]'.\n");
 #ifdef CLI_HAVE_DESKTOP
 	P("  desktop <...>     - Desktop control (XR_DXR_desktop_control, ADR-056), the user's store + audit\n");
 	P("                      log: 'desktop status [--json]', 'desktop stop|resume' (kill switch),\n");
@@ -167,6 +170,9 @@ main(int argc, const char **argv)
 			return cli_cmd_camera_calibration(argc, argv);
 		}
 		return cli_cmd_camera(argc, argv);
+	}
+	if (strcmp(argv[1], "share") == 0) {
+		return cli_cmd_share(argc, argv);
 	}
 #ifdef CLI_HAVE_DESKTOP
 	if (strcmp(argv[1], "desktop") == 0) {

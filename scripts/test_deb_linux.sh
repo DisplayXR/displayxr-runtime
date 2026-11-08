@@ -82,7 +82,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build pkg-config git ca-certificates python3 \
         binutils dpkg-dev fakeroot \
         libvulkan-dev glslang-tools libeigen3-dev libcjson-dev \
-        libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
+        libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libx11-dev libx11-xcb-dev \
         libwayland-dev libdbus-1-dev libxrandr-dev \
     && rm -rf /var/lib/apt/lists/*
 DOCKERFILE

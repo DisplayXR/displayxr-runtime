@@ -173,6 +173,8 @@ static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_MONOCHROME_BIT_DXR = 0x0000
 //! Spec v7: a RECTIFIED stream delivers rectified frames (natively rectified, or
 //! the service rectifies it). Set by the runtime, never by a plug-in.
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_RECTIFIABLE_BIT_DXR = 0x00000020;
+//! 0x00000040 is RESERVED for XR_STEREO_CAMERA_APP_CONTENT_BIT_DXR, defined by the
+//! dependent extension XR_DXR_app_share (ADR-061): never assign it here.
 
 typedef enum XrStereoCameraStateDXR {
     //! Frames flowing, or will flow on start.

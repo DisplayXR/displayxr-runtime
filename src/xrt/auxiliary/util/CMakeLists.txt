@@ -30,6 +30,8 @@ add_library(
 	u_conv_viewsyn.h
 	u_cursor_depth.c
 	u_cursor_depth.h
+	u_stereo_comfort.c
+	u_stereo_comfort.h
 	u_lift_autoconv.c
 	u_lift_autoconv.h
 	u_lift_cursor.c
@@ -51,6 +53,10 @@ add_library(
 	u_builders.h
 	u_capture_dims.c
 	u_capture_dims.h
+	u_app_share_fake.c
+	u_app_share_fake.h
+	u_share_link.c
+	u_share_link.h
 	u_camera_consent.c
 	u_camera_consent.h
 	u_camera_consent_android.c

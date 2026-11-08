@@ -306,6 +306,8 @@ dxr_acquire_timeout_ns(void)
 // carried in struct comp_vk_native_xcb_handle. (VK_USE_PLATFORM_XCB_KHR is
 // defined by CMake via xrt_config_vulkan.h when XRT_HAVE_XCB.)
 #include <vulkan/vulkan_xcb.h>
+#include <X11/Xlib.h>
+#include <vulkan/vulkan_xlib.h> // Xlib surface fallback (#2322)
 #include <xcb/xcb.h>
 #include "comp_vk_native_window_xcb.h"
 // #902: the desktop-Linux vblank-grid source (wp_presentation / X11 Present).
@@ -313,6 +315,34 @@ dxr_acquire_timeout_ns(void)
 #include "util/comp_late_weave_adapt.h"
 #include "util/comp_feedback_pace.h"
 #include "util/comp_late_weave_depth.h"
+
+//! vkCreateXcbSurfaceKHR on this instance, or NULL when VK_KHR_xcb_surface is
+//! not enabled on it (the instance is the app's, vk_init_from_given).
+static PFN_vkCreateXcbSurfaceKHR
+target_xcb_surface_fn(struct vk_bundle *vk)
+{
+	PFN_vkCreateXcbSurfaceKHR fn = vk->vkCreateXcbSurfaceKHR;
+	if (fn == NULL) {
+		fn = (PFN_vkCreateXcbSurfaceKHR)vk->vkGetInstanceProcAddr(vk->instance, "vkCreateXcbSurfaceKHR");
+	}
+	return fn;
+}
+
+//! The Xlib connection the Xlib-surface fallback builds on (#2322). One per
+//! process, opened on first use and kept open: every VkSurfaceKHR built on it
+//! must not outlive it, and a surface is rebuilt per session.
+static Display *
+target_xlib_display(void)
+{
+	static Display *dpy = XOpenDisplay(NULL); // C++11: initialized once, thread-safe
+	return dpy;
+}
+
+extern "C" bool
+comp_vk_native_target_instance_has_xcb_surface(struct comp_vk_native_compositor *c)
+{
+	return target_xcb_surface_fn(comp_vk_native_compositor_get_vk(c)) != NULL;
+}
 
 struct comp_vk_native_target;
 static void
@@ -2032,38 +2062,64 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	const struct comp_vk_native_xcb_handle *xcb_handle =
 	    (const struct comp_vk_native_xcb_handle *)hwnd;
 
-	PFN_vkCreateXcbSurfaceKHR pfnCreateXcbSurface = vk->vkCreateXcbSurfaceKHR;
-	if (pfnCreateXcbSurface == NULL) {
-		pfnCreateXcbSurface = (PFN_vkCreateXcbSurfaceKHR)
-		    vk->vkGetInstanceProcAddr(vk->instance, "vkCreateXcbSurfaceKHR");
-	}
-	if (pfnCreateXcbSurface == NULL) {
-		U_LOG_E("vkCreateXcbSurfaceKHR not available — VK_KHR_xcb_surface must be enabled");
-		free(target);
-		return XRT_ERROR_VULKAN;
-	}
+	PFN_vkCreateXcbSurfaceKHR pfnCreateXcbSurface = target_xcb_surface_fn(vk);
+	const char *surface_kind = "XCB";
+	if (pfnCreateXcbSurface != NULL) {
+		VkXcbSurfaceCreateInfoKHR surface_ci = {
+		    .sType = VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR,
+		    .pNext = NULL,
+		    .flags = 0,
+		    .connection = (xcb_connection_t *)xcb_handle->connection,
+		    .window = (xcb_window_t)xcb_handle->window,
+		};
 
-	VkXcbSurfaceCreateInfoKHR surface_ci = {
-	    .sType = VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR,
-	    .pNext = NULL,
-	    .flags = 0,
-	    .connection = (xcb_connection_t *)xcb_handle->connection,
-	    .window = (xcb_window_t)xcb_handle->window,
-	};
-
-	VkResult res = pfnCreateXcbSurface(vk->instance, &surface_ci, NULL, &target->surface);
-	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to create XCB surface: %d", res);
-		free(target);
-		return XRT_ERROR_VULKAN;
+		VkResult res = pfnCreateXcbSurface(vk->instance, &surface_ci, NULL, &target->surface);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Failed to create XCB surface: %d", res);
+			free(target);
+			return XRT_ERROR_VULKAN;
+		}
+	} else {
+		// The app's VkInstance has no VK_KHR_xcb_surface. A hosted Windows app
+		// running under a translation layer gets a host instance that enables
+		// VK_KHR_xlib_surface only. An X11 window id is the same server object
+		// to both bindings, so build an Xlib surface over the same window (#2322).
+		PFN_vkCreateXlibSurfaceKHR pfnCreateXlibSurface =
+		    (PFN_vkCreateXlibSurfaceKHR)vk->vkGetInstanceProcAddr(vk->instance, "vkCreateXlibSurfaceKHR");
+		Display *dpy = pfnCreateXlibSurface != NULL ? target_xlib_display() : NULL;
+		if (dpy == NULL) {
+			U_LOG_E(
+			    "vkCreateXcbSurfaceKHR not available — VK_KHR_xcb_surface must be enabled "
+			    "(Xlib fallback: vkCreateXlibSurfaceKHR=%p, display=%p)",
+			    (void *)pfnCreateXlibSurface, (void *)dpy);
+			free(target);
+			return XRT_ERROR_VULKAN;
+		}
+		VkXlibSurfaceCreateInfoKHR xlib_ci = {
+		    .sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
+		    .pNext = NULL,
+		    .flags = 0,
+		    .dpy = dpy,
+		    .window = (Window)xcb_handle->window,
+		};
+		VkResult xres = pfnCreateXlibSurface(vk->instance, &xlib_ci, NULL, &target->surface);
+		if (xres != VK_SUCCESS) {
+			U_LOG_E("Failed to create Xlib surface: %d", xres);
+			free(target);
+			return XRT_ERROR_VULKAN;
+		}
+		surface_kind = "Xlib";
+		U_LOG_W(
+		    "VK native target: no VK_KHR_xcb_surface on this instance — created an Xlib surface for window "
+		    "0x%x (#2322)",
+		    (unsigned)xcb_handle->window);
 	}
 
 	VkBool32 present_support = VK_FALSE;
-	vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device,
-	                                          queue_family_index,
-	                                          target->surface, &present_support);
+	vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device, queue_family_index, target->surface,
+		                                 &present_support);
 	if (!present_support) {
-		U_LOG_E("Queue family does not support presentation to XCB surface");
+		U_LOG_E("Queue family does not support presentation to %s surface", surface_kind);
 		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
 		free(target);
 		return XRT_ERROR_VULKAN;

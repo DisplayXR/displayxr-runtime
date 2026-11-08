@@ -23,8 +23,11 @@
 
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_stereo_camera.h"
+#include "xrt/xrt_share_link.h"
+#include "xrt/xrt_handles.h"
 #include "util/u_camera_consent.h"
 #include "util/u_stereo_uvc.h"
+#include "xrt/xrt_plugin.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -73,9 +76,34 @@ struct ipc_server_stereo_camera_options
 	/*!
 	 * The developer override (consent row 2): 0 = from
 	 * DXR_STEREO_CAMERA_DEV_ALLOW (the default); > 0 forces it on, < 0 off
-	 * (tests). It never lifts the front-camera rule.
+	 * (tests). It never lifts the front-camera rule — nor the app-share
+	 * prompt (ADR-061).
 	 */
 	int32_t dev_override;
+
+	/*
+	 * ADR-061 app share. 0 everywhere = the service's real behaviour.
+	 */
+	//! DXR_APP_SHARE_DEV: 0 = from the env, > 0 on, < 0 off.
+	int32_t app_share_dev;
+	//! DXR_APP_SHARE_FAKE (the synthetic service-composited app): 0 = from the env, > 0 on, < 0 off.
+	int32_t app_share_fake;
+	/*!
+	 * DXR_APP_SHARE_FAKE=link (or =both): a synthetic IN-PROCESS registrant
+	 * over the share-link core — it registers, answers SHARE_REQUESTED with a
+	 * CPU ring and posts frame_ready at the stream rate, exactly as an app's
+	 * service link would (ADR-061 arm 2). 0 = from the env, > 0 on, < 0 off.
+	 */
+	int32_t app_share_fake_link;
+	//! How long an exited app's entry stays listed UNAVAILABLE, ms (0 = 10000).
+	int32_t app_linger_ms;
+	//! `share.prompt`: 0 = the user store, 1 = always, 2 = per-app-run.
+	int32_t share_prompt_mode;
+	//! `share.resolution`: 0 = the user store, 1 = 720p, 2 = 1080p.
+	int32_t share_resolution;
+	//! The share prompt (NULL = the one the host installed, if any).
+	u_app_share_prompt_fn share_prompt;
+	void *share_prompt_ctx;
 };
 
 struct ipc_server_stereo_camera *
@@ -105,9 +133,42 @@ ipc_server_stereo_camera_rescan(struct ipc_server_stereo_camera *mgr);
 void
 ipc_server_stereo_camera_rescan_soon(struct ipc_server_stereo_camera *mgr);
 
+/*!
+ * ADR-061 arm 2: a closing connection's service link and the share on it. Called once at
+ * client teardown, BEFORE client_state is zeroed: the link is keyed by its id.
+ */
+void
+ipc_server_client_stereo_camera_link_release(volatile struct ipc_client_state *ics);
+
 //! Destroy every stream @p ics created. Called once at client teardown.
 void
 ipc_server_client_stereo_camera_release(volatile struct ipc_client_state *ics);
+
+/*!
+ * ADR-061: the set of shareable apps may have changed (a client connected,
+ * a session was created / begun / ended). Wakes the background app rescan
+ * now instead of at its next 1 Hz tick. Never blocks; NULL is ignored.
+ */
+void
+ipc_server_stereo_camera_apps_changed(struct ipc_server_stereo_camera *mgr);
+
+/*!
+ * ADR-061: @p ics's session and compositor are about to be destroyed. Its
+ * app entry (if any) turns UNAVAILABLE (listed for 10 s), every stream of it
+ * ends SOURCE_LOST, and its share tap is DETACHED before this returns
+ * (bounded: 1 s), so the platform never taps a compositor being torn down.
+ * Call with no manager lock held, before the compositor goes.
+ */
+void
+ipc_server_stereo_camera_app_session_ending(volatile struct ipc_client_state *ics);
+
+/*!
+ * ADR-061: rebuild the app table from the live connections now (tests; the
+ * service does it on apps_changed and a 1 Hz tick). Returns true if the
+ * listed set or an entry's labels changed.
+ */
+bool
+ipc_server_stereo_camera_rescan_apps(struct ipc_server_stereo_camera *mgr);
 
 
 /*
@@ -129,6 +190,16 @@ typedef enum u_camera_consent_prompt_answer (*ipc_server_stereo_camera_prompt_fn
 
 void
 ipc_server_stereo_camera_set_prompt_provider(ipc_server_stereo_camera_prompt_fn fn, void *ctx);
+
+/*!
+ * ADR-061: the SHARE prompt ("Share <app> with <consumer>? Deny / Allow").
+ * Same blocking contract as the camera prompt; only Allow / Allow once
+ * allow. Without one, every app-share start is refused unless
+ * DXR_APP_SHARE_DEV=1 (the camera prompt is never borrowed for it: its text
+ * would misdescribe what is shared).
+ */
+void
+ipc_server_stereo_camera_set_share_prompt_provider(u_app_share_prompt_fn fn, void *ctx);
 
 /*!
  * A notice for the user, no answer expected (Windows: a tray balloon). Raised
@@ -194,8 +265,124 @@ struct ipc_server_stereo_camera_platform
 	 * SUSPENDED instead of UNAVAILABLE while it retries (Android).
 	 */
 	bool gave_up_is_suspended;
+
+	/*!
+	 * @name ADR-061 share tap (the service compositor's pre-weave tap)
+	 *
+	 * What a service whose compositor can read a client's composed atlas
+	 * supplies (the Windows D3D11 service, decision 8). All NULL = this
+	 * service has no tap: every app entry is listed UNAVAILABLE ("no tap on
+	 * this platform"), which is what the macOS / Linux service does until P6.
+	 * @p client_id is the connection's ipc_app_state::id; the platform
+	 * resolves it under its OWN lock on every call (the manager never hands
+	 * out a compositor pointer), so a client that went away mid-call is an
+	 * error, never a dangling read. None is called with the manager lock held.
+	 * @{
+	 */
+	/*!
+	 * Describe @p client_id's session for the enumeration: availability
+	 * (enum xrt_app_share_availability, with the reason when not
+	 * AVAILABLE), window rect, per-view content size, view count / active
+	 * view count, zeroDisparityShiftFrac, encoding. The manager pre-fills
+	 * names, ids and pid; the hook writes only the fields it knows.
+	 * @p out_last_commit_ns: the client's last layer commit (os_monotonic;
+	 * 0 = unknown) — older than 1 s reads SUSPENDED. false = the client is
+	 * not (or no longer) a tappable session.
+	 */
+	bool (*share_tap_query)(void *ctx,
+	                        uint32_t client_id,
+	                        struct xrt_app_share_source_info *io_info,
+	                        int64_t *out_last_commit_ns);
+	/*!
+	 * Start tapping @p client_id: SBS NV12, @p eye_w x @p eye_h per eye,
+	 * decimated to at most @p fps. Called on the app entry's camera thread
+	 * when its first stream starts. The tap must never make the app wait.
+	 */
+	xrt_result_t (*share_tap_attach)(
+	    void *ctx, uint32_t client_id, uint32_t eye_w, uint32_t eye_h, float fps, void **out_tap);
+	/*!
+	 * The next tapped frame (XRT_PLUGIN_STEREO_CAMERA_WAIT_*), at most
+	 * @p timeout_ns. On OK: @p out_frame is the full SBS NV12 frame
+	 * (2 * eye_w x eye_h, planes valid until share_tap_release_frame) and
+	 * @p out_info its XrAppShareFrameInfoDXR metadata. WAIT_ERROR = the
+	 * client's compositor is gone (the stream then ends SOURCE_LOST).
+	 */
+	uint32_t (*share_tap_wait_frame)(void *ctx,
+	                                 void *tap,
+	                                 int64_t timeout_ns,
+	                                 struct xrt_plugin_stereo_camera_frame *out_frame,
+	                                 struct xrt_app_share_frame_info *out_info);
+	//! Done with the frame of the last OK wait (may be NULL).
+	void (*share_tap_release_frame)(void *ctx, void *tap);
+	//! Stop tapping; @p tap is freed. Always called once per successful attach.
+	void (*share_tap_detach)(void *ctx, void *tap);
+	/*! @} */
+
+	/*!
+	 * @name ADR-061 arm 2: the share LINK (an IN-PROCESS app's published ring)
+	 *
+	 * An in-process app copies its pre-weave views into a 3-texture NT-shared
+	 * ring with a shared fence (compositor/xbridge/comp_xbridge_share_tap.h)
+	 * and posts `service_link_share_frame_ready` per frame; these hooks turn
+	 * that ring into the same SBS NV12 frame the share tap above produces
+	 * (ADR-061 decision 6 — the Windows D3D11 service fills them with the
+	 * tap's own NV12 pass). All NULL = this service cannot import a ring:
+	 * every in-process app entry is listed UNAVAILABLE ("no tap"). Called on
+	 * the app entry's camera thread, never with a manager lock held.
+	 * @{
+	 */
+	/*!
+	 * The adapter the service publishes (`client_d3d_deviceLUID`, ADR-037 §7)
+	 * — a ring on another adapter cannot be opened, so such an entry is listed
+	 * UNAVAILABLE (OTHER_ADAPTER). false = unknown (no adapter check).
+	 */
+	bool (*share_link_adapter_luid)(void *ctx, uint8_t out_luid[XRT_LUID_SIZE]);
+	/*!
+	 * Open a published ring. Takes ownership of every handle (closes them on
+	 * failure too): @p textures (@p texture_count, XRT_SHARE_LINK_RING_SLOTS
+	 * on Windows) and @p fence (may be invalid). @p eye_w x @p eye_h: the
+	 * stream's per-eye extent every converted frame must have.
+	 */
+	xrt_result_t (*share_link_import)(void *ctx,
+	                                  const struct xrt_share_link_ring_desc *desc,
+	                                  const xrt_graphics_buffer_handle_t *textures,
+	                                  uint32_t texture_count,
+	                                  xrt_graphics_sync_handle_t fence,
+	                                  uint32_t eye_w,
+	                                  uint32_t eye_h,
+	                                  void **out_import);
+	/*!
+	 * Convert slot @p frame->slot once the ring's fence reached
+	 * @p frame->fence_value (a GPU-side wait — never a CPU wait on the app):
+	 * the content rect of each half (the frame's when its width is non-zero,
+	 * else the ring's), scaled to fit the eye extent preserving aspect,
+	 * letterboxed, flipped per flip_y, encoded if linear, NV12 BT.601 full
+	 * range. May be pipelined like the tap (a non-blocking readback ring):
+	 * XRT_PLUGIN_STEREO_CAMERA_WAIT_OK = @p out_frame holds the newest
+	 * FINISHED conversion (planes valid until share_link_release_frame) and
+	 * @p out_info its metadata (content rect in delivered-eye pixels, mono,
+	 * content generation, zeroDisparityShiftFrac, commit time);
+	 * WAIT_TIMEOUT = nothing finished yet; WAIT_ERROR = the ring is unusable
+	 * (the stream ends SOURCE_LOST).
+	 */
+	uint32_t (*share_link_convert)(void *ctx,
+	                               void *import,
+	                               const struct xrt_share_link_frame *frame,
+	                               struct xrt_plugin_stereo_camera_frame *out_frame,
+	                               struct xrt_app_share_frame_info *out_info);
+	//! Done with the frame of the last OK convert (may be NULL).
+	void (*share_link_release_frame)(void *ctx, void *import);
+	//! Close an imported ring; @p import is freed. Once per successful import.
+	void (*share_link_unimport)(void *ctx, void *import);
+	/*! @} */
+
 	void *ctx;
 };
+
+//! ADR-061: install the D3D11 service compositor's share tap hooks.
+struct ipc_server;
+void
+ipc_server_share_tap_d3d11_install(struct ipc_server *s);
 
 //! Install (or clear, NULL) the platform hooks. The struct is copied.
 void
@@ -216,6 +403,9 @@ struct ipc_server_stereo_camera_status
 	char consumers[256];      //!< "browser.exe, call-app.exe" (base names / Android packages, de-duplicated;
 	                          //!< an in-process component by its display name)
 	uint32_t component_streams; //!< of started_streams: in-process consumers (input providers)
+	//! ADR-061: of started_streams, app shares; the tray reads "Sharing <shares>".
+	uint32_t share_streams;
+	char shares[256]; //!< the shared apps' display names, de-duplicated
 };
 
 //! false = no manager (service still starting).

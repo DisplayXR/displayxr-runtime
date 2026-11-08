@@ -174,6 +174,14 @@ comp_vk_native_window_xcb_query_refresh_hz(const struct comp_vk_native_xcb_handl
  *                               wired in Phase 1 (desktop WSI usually exposes
  *                               only OPAQUE compositeAlpha). Accepted for API
  *                               parity with the macOS/Windows helpers.
+ * @param adopt_own_window_auto  Default for adopt-own-window mode (#2322): create
+ *                               the window as an input-transparent CHILD of this
+ *                               process's own largest viewable top-level instead
+ *                               of a new top-level, when there is one. The caller
+ *                               passes true for a hosted app whose VkInstance has
+ *                               no VK_KHR_xcb_surface (a hosted Windows app under
+ *                               a translation layer). DXR_XCB_ADOPT_OWN_WINDOW=1
+ *                               forces the mode, =0 disables it.
  * @param out_win                Receives the created window handle.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -184,6 +192,7 @@ comp_vk_native_window_xcb_create(uint32_t width,
                                  int32_t screen_left,
                                  int32_t screen_top,
                                  bool transparent_background,
+                                 bool adopt_own_window_auto,
                                  struct comp_vk_native_window_xcb **out_win);
 
 /*!

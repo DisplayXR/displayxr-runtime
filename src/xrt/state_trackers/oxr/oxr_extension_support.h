@@ -703,6 +703,21 @@
 
 
 /*
+ * XR_DXR_stereo_comfort
+ *
+ * Hand-added DisplayXR extension. No entry points: an optional next-chain input
+ * on XrViewLocateInfo and a next-chain output on XrViewState.
+ */
+#if defined(XR_DXR_stereo_comfort)
+#define OXR_HAVE_DXR_stereo_comfort
+#define OXR_EXTENSION_SUPPORT_DXR_stereo_comfort(_) \
+    _(DXR_stereo_comfort, DXR_STEREO_COMFORT)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_stereo_comfort(_)
+#endif
+
+
+/*
  * XR_DXR_cursor_depth
  *
  * Hand-added DisplayXR extension (ADR-046). No entry points: a next-chain
@@ -814,6 +829,23 @@
     _(DXR_stereo_camera, DXR_STEREO_CAMERA)
 #else
 #define OXR_EXTENSION_SUPPORT_DXR_stereo_camera(_)
+#endif
+
+/*
+ * XR_DXR_app_share
+ *
+ * Hand-added DisplayXR extension (keep when regenerating). 3D screen share
+ * (ADR-061): running apps' pre-weave views listed as stereo-camera sources of
+ * kind app. Requires XR_DXR_stereo_camera (checked at xrCreateInstance).
+ * Advertised wherever the stereo camera is: an app entry the service cannot
+ * tap is listed UNAVAILABLE with a reason, never hidden.
+ */
+#if defined(XR_DXR_app_share) && defined(XR_DXR_stereo_camera)
+#define OXR_HAVE_DXR_app_share
+#define OXR_EXTENSION_SUPPORT_DXR_app_share(_) \
+    _(DXR_app_share, DXR_APP_SHARE)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_app_share(_)
 #endif
 
 
@@ -1366,11 +1398,13 @@
     OXR_EXTENSION_SUPPORT_DXR_view_rig(_) \
     OXR_EXTENSION_SUPPORT_DXR_depth_budget(_) \
     OXR_EXTENSION_SUPPORT_DXR_cursor_depth(_) \
+    OXR_EXTENSION_SUPPORT_DXR_stereo_comfort(_) \
     OXR_EXTENSION_SUPPORT_DXR_swapchain_color_encoding(_) \
     OXR_EXTENSION_SUPPORT_DXR_display_zones(_) \
     OXR_EXTENSION_SUPPORT_DXR_weave(_) \
     OXR_EXTENSION_SUPPORT_DXR_lift(_) \
     OXR_EXTENSION_SUPPORT_DXR_stereo_camera(_) \
+    OXR_EXTENSION_SUPPORT_DXR_app_share(_) \
     OXR_EXTENSION_SUPPORT_DXR_workspace_file_dialog(_) \
     OXR_EXTENSION_SUPPORT_DXR_mcp_tools(_) \
     OXR_EXTENSION_SUPPORT_DXR_desktop_control(_) \

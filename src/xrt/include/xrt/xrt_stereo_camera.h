@@ -72,13 +72,35 @@ enum xrt_stereo_camera_transport
 #define XRT_STEREO_CAMERA_CLIENT_CONSUMER_ONLY (1ull << 0)
 //! XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR: skip consent delegation for this instance.
 #define XRT_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION (1ull << 1)
+//! The public XrStereoCameraClientFlagsDXR bits occupy the low 32; the state
+//! tracker passes only these through from the app's chained struct.
+#define XRT_STEREO_CAMERA_CLIENT_PUBLIC_MASK 0xFFFFFFFFull
+/*!
+ * INTERNAL, never an XR bit (ADR-061 decision 3): the instance enabled
+ * XR_DXR_app_share, so the service also lists running apps (APP_CONTENT
+ * entries) to this connection. Set by the state tracker from the enabled
+ * extension set, never from the app's flags. It only widens what is LISTED:
+ * every app-share start still runs the share prompt, so a forged bit buys
+ * nothing a consumer could not get by enabling the extension.
+ */
+#define XRT_STEREO_CAMERA_CLIENT_INTERNAL_APP_SHARE (1ull << 63)
+
+/*!
+ * XrStereoCameraFlagsDXR bit XR_STEREO_CAMERA_APP_CONTENT_BIT_DXR (0x40,
+ * XR_DXR_app_share): the entry is a running app's pre-weave views, not a
+ * camera. Set by the service only; a plug-in claiming it is ignored.
+ */
+#define XRT_STEREO_CAMERA_APP_CONTENT (1u << 6)
 
 //! Format / transport sets are one bit per enum value: (1 << value).
 #define XRT_STEREO_CAMERA_BIT(v) (1ull << (uint32_t)(v))
 
 /*!
- * Where a camera's frames come from (diagnostics only: `displayxr-cli camera
- * list`; not exposed through the OpenXR API, which is source-neutral).
+ * Where a camera's frames come from (diagnostics: `displayxr-cli camera
+ * list`). The camera kinds are source-neutral in the OpenXR API; the app
+ * kinds are not (ADR-061 decision 7): they surface as
+ * XR_STEREO_CAMERA_APP_CONTENT_BIT_DXR, because a display-referred pair must
+ * not be treated as a camera pair.
  */
 enum xrt_stereo_camera_source
 {
@@ -87,6 +109,104 @@ enum xrt_stereo_camera_source
 	//! The service's own vendor-neutral UVC side-by-side source (ADR-043
 	//! Amendment 4): an opted-in plain stereo webcam.
 	XRT_STEREO_CAMERA_SOURCE_UVC = 1,
+	//! ADR-061: a SERVICE-COMPOSITED app's pre-weave views, tapped in the
+	//! service compositor (or the service-side synthetic DXR_APP_SHARE_FAKE).
+	XRT_STEREO_CAMERA_SOURCE_APP = 2,
+	//! ADR-061 decision 9: an IN-PROCESS app's pre-weave views over its
+	//! in-process service link (ipc_client_service_link, ADR-049 Amendment 1),
+	//! imported through the platform's share_link_* hooks.
+	XRT_STEREO_CAMERA_SOURCE_APP_LINK = 3,
+};
+
+/*!
+ * Why an app entry cannot be shared right now (ADR-061 decision 9, spec §3 /
+ * §9): untappable sessions are LISTED with a reason, never silently omitted.
+ */
+enum xrt_app_share_availability
+{
+	XRT_APP_SHARE_AVAILABLE = 0,
+	//! No share tap on this platform / service build (macOS, Linux until P6).
+	XRT_APP_SHARE_UNAVAILABLE_NO_TAP = 1,
+	//! The app exited (listed for 10 s so a stream ends SOURCE_LOST visibly).
+	XRT_APP_SHARE_UNAVAILABLE_EXITED = 2,
+	//! The session has no projection compositor the tap can read.
+	XRT_APP_SHARE_UNAVAILABLE_NO_COMPOSITOR = 3,
+	//! The app's graphics API has no tap (OpenGL in-process).
+	XRT_APP_SHARE_UNAVAILABLE_UNSUPPORTED_API = 4,
+	//! A shared-texture session the fill arm declines (no DXR_HUB=1).
+	XRT_APP_SHARE_UNAVAILABLE_SHARED_TEXTURE = 5,
+	//! A kill-switched split (DXR_SPLIT_SAME_ADAPTER=0, DXR_WEAVE_ON_SCANOUT=0).
+	XRT_APP_SHARE_UNAVAILABLE_SPLIT_DISABLED = 6,
+	//! DXR_LEGACY_STANDALONE.
+	XRT_APP_SHARE_UNAVAILABLE_LEGACY_STANDALONE = 7,
+	//! The app renders on another adapter than the one the service publishes.
+	XRT_APP_SHARE_UNAVAILABLE_OTHER_ADAPTER = 8,
+	//! Reserved (was: the in-process share capability not implemented); not reported by this build.
+	XRT_APP_SHARE_UNAVAILABLE_LINK_NOT_READY = 9,
+	//! The platform tap declined for a reason of its own.
+	XRT_APP_SHARE_UNAVAILABLE_OTHER = 10,
+};
+
+//! xrt_app_share_source_info::executable_name size (= XR_APP_SHARE_EXECUTABLE_NAME_MAX_SIZE_DXR).
+#define XRT_APP_SHARE_EXECUTABLE_NAME_SIZE 260
+//! xrt_app_share_source_info::application_name size (= XR_MAX_APPLICATION_NAME_SIZE).
+#define XRT_APP_SHARE_APPLICATION_NAME_SIZE 128
+
+/*!
+ * One app entry as XR_DXR_app_share describes it (XrAppShareSourcePropertiesDXR
+ * plus the service's diagnostics). Plain POD: rides the IPC wire as is
+ * (`stereo_camera_get_app_source`).
+ */
+struct xrt_app_share_source_info
+{
+	uint64_t camera_id;
+	//! OS-derived by the service, never app-asserted (0 for the synthetic fake).
+	uint64_t pid;
+	char executable_name[XRT_APP_SHARE_EXECUTABLE_NAME_SIZE]; //!< file name, no directory
+	char application_name[XRT_APP_SHARE_APPLICATION_NAME_SIZE];
+	//! The app's window in desktop pixels; width/height 0 when it has none.
+	int32_t window_x, window_y;
+	uint32_t window_width, window_height;
+	/*!
+	 * Per-view content size at the source: the active mode's content
+	 * dimensions of ONE view (before scaling to the stream's eye extent). It
+	 * is not the atlas tile: tiles sit at the atlas's slot stride (atlas size
+	 * / grid), which is larger whenever the content is smaller than its slot.
+	 */
+	uint32_t content_eye_width, content_eye_height;
+	uint32_t view_count;        //!< views the app submits (the fixed count, ADR-041)
+	uint32_t active_view_count; //!< views active in its current mode (1 = mono)
+	float zero_disparity_shift_frac;
+	uint32_t encoding_is_linear; //!< the source atlas held LINEAR values (ADR-044); diagnostic
+	uint32_t availability;       //!< enum xrt_app_share_availability
+	uint32_t source;             //!< enum xrt_stereo_camera_source (APP / APP_LINK)
+	uint32_t instance_ordinal;   //!< 0 = the first running copy of this executable
+	uint32_t reserved;
+};
+
+/*!
+ * Per-frame app metadata (XrAppShareFrameInfoDXR). Rides the
+ * `stereo_camera_acquire` reply, never the ring (the section has no header).
+ * All zero for a camera frame.
+ */
+struct xrt_app_share_frame_info
+{
+	/*!
+	 * Where the delivered view sits inside ONE eye half of the DELIVERED frame,
+	 * in that half's pixels (origin top-left of the left half; the right half
+	 * is the same rect offset by the eye width): the view's content, scaled to
+	 * fit the eye extent preserving aspect; outside is letterbox black. Never
+	 * an atlas / slot / source coordinate — the tap cuts each view from its
+	 * tile at the slot stride before scaling, and nothing of that reaches here.
+	 */
+	int32_t content_x, content_y;
+	uint32_t content_width, content_height;
+	uint32_t mono;               //!< one view in both halves
+	uint32_t content_generation; //!< bumps when content rect / mono / layout changed
+	float zero_disparity_shift_frac;
+	uint32_t valid; //!< 1 = this is an app frame's metadata
+	//! When the source app's frame was committed (os_monotonic ns; the state tracker converts).
+	int64_t commit_time_ns;
 };
 
 /*!
@@ -293,11 +413,20 @@ struct xrt_stereo_camera_client
 	                                     struct xrt_stereo_camera_stream_layout *out_layout,
 	                                     xrt_shmem_handle_t *out_section,
 	                                     xrt_graphics_sync_handle_t *out_wake);
-	//! @p out_ready false = nothing newer than the last acquire.
+	/*!
+	 * @p out_ready false = nothing newer than the last acquire. @p out_app
+	 * (may be NULL): the frame's XR_DXR_app_share metadata (valid = 0 for a
+	 * camera frame).
+	 */
 	xrt_result_t (*acquire)(struct xrt_stereo_camera_client *c,
 	                        uint64_t stream_id,
 	                        bool *out_ready,
-	                        struct xrt_stereo_camera_frame_info *out_frame);
+	                        struct xrt_stereo_camera_frame_info *out_frame,
+	                        struct xrt_app_share_frame_info *out_app);
+	//! ADR-061: the XR_DXR_app_share description of APP_CONTENT entry @p camera_id.
+	xrt_result_t (*get_app_source)(struct xrt_stereo_camera_client *c,
+	                               uint64_t camera_id,
+	                               struct xrt_app_share_source_info *out_info);
 	xrt_result_t (*stats)(struct xrt_stereo_camera_client *c,
 	                      uint64_t stream_id,
 	                      struct xrt_stereo_camera_stream_stats *out_stats);

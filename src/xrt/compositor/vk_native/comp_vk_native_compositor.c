@@ -1889,6 +1889,7 @@ struct comp_vk_native_compositor
 		struct u_cursor_measure_result result;
 		uint32_t stat_n, stat_reused;
 		uint64_t stat_cpu_ns, stat_cpu_max_ns;
+		bool warned_uncached;
 		double stat_gpu_ns, stat_gpu_max_ns;
 	} cursor_measure;
 	//! Guards cursor_measure.result: the locate may run on another thread.
@@ -12066,10 +12067,24 @@ vk_cursor_measure_ensure_buffer(struct comp_vk_native_compositor *c, uint32_t s,
 	}
 	VkMemoryRequirements mreq;
 	vk->vkGetBufferMemoryRequirements(vk->device, c->cursor_measure.slot[s].buf, &mreq);
-	uint32_t mem_type = 0;
-	if (!vk_native_find_host_visible_memory_type(vk, mreq.memoryTypeBits, &mem_type)) {
-		vk_cursor_measure_free_buffer(vk, c, s);
-		return false;
+	// The matcher reads this memory on the CPU inside xrEndFrame, so it has to be
+	// HOST_CACHED: a plain HOST_VISIBLE|HOST_COHERENT type is typically write-combined,
+	// and the first one on an NVIDIA discrete GPU. Reading a fullscreen 8K patch from it
+	// cost about 90 ms a frame (same class as the capture fix, #2536).
+	uint32_t mem_type = UINT32_MAX;
+	const VkMemoryPropertyFlags uncached =
+	    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if (!vk_get_memory_type(vk, mreq.memoryTypeBits, uncached | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &mem_type)) {
+		if (!vk_get_memory_type(vk, mreq.memoryTypeBits, uncached, &mem_type)) {
+			vk_cursor_measure_free_buffer(vk, c, s);
+			return false;
+		}
+		if (!c->cursor_measure.warned_uncached) {
+			c->cursor_measure.warned_uncached = true;
+			U_LOG_W("cursor_measure: no HOST_CACHED readback memory on this GPU - the CPU match reads "
+			        "uncached memory and may slow the frame; DXR_CURSOR_MEASURE=0 turns measuring off "
+			        "(one-time warning)");
+		}
 	}
 	VkMemoryAllocateInfo ai = {
 	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -15002,8 +15017,14 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			apply_window_pos_override(&win_left, &win_top);
 			U_LOG_I("Creating self-owned XCB window (%ux%u at %d,%d)", win_w, win_h, win_left,
 			        win_top);
+			// No VK_KHR_xcb_surface on the app's instance means the target will
+			// present through the Xlib fallback: a hosted Windows app under a
+			// translation layer, which already owns its own X11 top-level.
+			// Present as a child of that window rather than a second top-level
+			// (#2322).
+			const bool adopt_own_window = !comp_vk_native_target_instance_has_xcb_surface(c);
 			xrt_result_t xret = comp_vk_native_window_xcb_create(
-			    win_w, win_h, win_left, win_top, transparent_background, &c->xcb_window);
+			    win_w, win_h, win_left, win_top, transparent_background, adopt_own_window, &c->xcb_window);
 			if (xret != XRT_SUCCESS) {
 				U_LOG_E("Failed to create self-owned XCB window");
 				free(c);
@@ -15089,6 +15110,14 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		    // deposit timeline before the handoff and waits out the hub's last
 		    // plane read (vk_split_stage_planes).
 		    .ring_direct_planes = true,
+		    // ...and takes DIRECT by default on one adapter, as the D3D12
+		    // reroute has since #2518. The opt-in waited for a single-dGPU
+		    // desktop to run VK fence-mode DIRECT, which #2371 accepted
+		    // (2026-11-02); re-checked on an RTX 3080 at 8K (Media Player Pro,
+		    // panels up, 60 fps, km=0): the staged ring's copies took ~43 % of
+		    // the copy engine and ~6 % without them.
+		    // DXR_HUB_INGRESS=xbridge still forces the bridge.
+		    .ring_direct_default = true,
 		    .render_packed_luid = c->render_packed_luid,
 		    .display_screen_left = display_screen_left,
 		    .display_screen_top = display_screen_top,

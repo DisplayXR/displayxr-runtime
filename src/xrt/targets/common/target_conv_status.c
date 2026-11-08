@@ -837,6 +837,11 @@ target_conv_status_from_registry(const struct conv_registry *reg,
 			copy_str(x->load, sizeof(x->load), "BUILT_IN");
 		}
 		x->licence_exempt = (reg->providers[pi].flags & CONV_PROV_LICENCE_EXEMPT) != 0;
+		for (uint32_t r = 0; r < reg->row_count && !x->licence_exempt; r++) {
+			// A user-installed, separately licensed model (XRT_CONV_CAP_LICENSED_LOCAL_INSTALL).
+			x->licence_exempt = reg->rows[r].provider == pi &&
+			                    (reg->rows[r].cap.flags & XRT_CONV_CAP_LICENSED_LOCAL_INSTALL) != 0;
+		}
 		out->registered++;
 		status_index[pi] = XRT_STATUS_CONV_NO_PROVIDER;
 		if (out->provider_count >= XRT_STATUS_MAX_CONV_PROVIDERS) {

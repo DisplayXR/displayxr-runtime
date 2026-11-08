@@ -983,6 +983,118 @@ TEST_CASE("stream: observer-only depth reaches the service consumer, never the a
 	conv_fake_fini(&f);
 }
 
+TEST_CASE("stream: a provider declaring AUTO_CONVERGENCE owns AUTO; no runtime observer runs", "[conv_lanes]")
+{
+	// One convergence owner per stream (ADR-053 Amendment 1). The observer
+	// here is always valid, so any frame on which the runtime consulted it
+	// would reach the provider as DECODED.
+	struct Obs
+	{
+		std::atomic<int> created{0};
+		std::atomic<int> seen{0};
+	};
+	static const conv_observer_ops ops = {
+	    [](void *) {},
+	    [](void *ctx, const xrt_conv_depth_info *, const conv_depth_samples *, const float *, uint64_t) {
+		    static_cast<Obs *>(ctx)->seen++;
+	    },
+	    [](void *, uint64_t, float *out) -> bool {
+		    *out = 0.3f;
+		    return true;
+	    },
+	    nullptr,
+	};
+	static Obs obs;
+
+	for (const bool owns : {true, false}) {
+		CAPTURE(owns);
+		obs.created = 0;
+		obs.seen = 0;
+		conv_fake_provider f;
+		conv_fake_init(&f, owns ? "owns-auto" : "plain");
+		conv_fake_cap *c = conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM,
+		                                     XRT_CONV_OUT_VIEWS | XRT_CONV_OUT_DEPTH,
+		                                     owns ? XRT_CONV_CAP_AUTO_CONVERGENCE : 0u);
+		c->warm_ms = 0;
+		c->convert_ms = 1;
+		c->cap.depth_kind = XRT_CONV_DEPTH_METRIC;
+		{
+			conv_core_config cfg{};
+			cfg.alloc.alloc = cpu_alloc;
+			cfg.alloc.free = cpu_free;
+			cfg.create_convergence_observer = [](void *ud, conv_observer *out) {
+				static_cast<Obs *>(ud)->created++;
+				out->ops = &ops;
+				out->ctx = ud;
+				return true;
+			};
+			cfg.observer_ud = &obs;
+			cfg.prewarm_on = CONV_PREWARM_FIRST_CREATE;
+			cfg.prewarm_task_mask = 1ull << 63;
+			cfg.rear_cap_m = -1.0f;
+			cfg.tick_ms = 10;
+			conv_core *core = nullptr;
+			REQUIRE(conv_core_create(&cfg, &core) == XRT_SUCCESS);
+			conv_provider_desc pd{};
+			pd.id = f.id;
+			pd.probe_order = 100;
+			pd.enabled = true;
+			pd.iface = &f.iface;
+			pd.inst = conv_fake_inst(&f);
+			REQUIRE(conv_core_add_provider(core, &pd) >= 0);
+
+			auto d = stream_desc(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_OUT_VIEWS, 2);
+			conv_stream_options opts{};
+			opts.auto_convergence = true;
+			opts.eyes_dp = -1;
+			xrt_conv_wire_stream_created cr{};
+			REQUIRE(conv_core_stream_create(core, 1, &d, &opts, &cr) == XRT_SUCCESS);
+			REQUIRE(wait_until(
+			    [&] {
+				    return conv_core_task_state(core, XRT_CONV_TASK_VIEWS_MONO) == XRT_CONV_STATE_READY;
+			    },
+			    3000));
+			CHECK(obs.created.load() == (owns ? 0 : 1));
+
+			auto one = [&](bool app_set, float rel) {
+				// One frame at a time: wait for THIS submit's conversion (the
+				// mailbox is latest-wins), so last_params is this frame's.
+				const uint64_t before = stats(core, cr.stream_id).converted;
+				REQUIRE(submit(core, cr.stream_id, 64, 32, 0, app_set, rel));
+				REQUIRE(wait_until([&] { return stats(core, cr.stream_id).converted > before; }, 3000));
+				conv_result r{};
+				REQUIRE(wait_until(
+				    [&] {
+					    return conv_core_stream_acquire(core, cr.stream_id, false, &r) ==
+					           XRT_SUCCESS;
+				    },
+				    3000));
+				conv_core_stream_release(core, cr.stream_id, r.ring_slot);
+				return f.last_params.convergence_mode;
+			};
+			// Frame 1 has no last range yet: AUTO either way.
+			CHECK(one(false, 0.0f) == XRT_CONV_CONVERGENCE_AUTO);
+			for (int i = 0; i < 4; i++) {
+				CAPTURE(i);
+				CHECK(one(false, 0.0f) ==
+				      (owns ? XRT_CONV_CONVERGENCE_AUTO : XRT_CONV_CONVERGENCE_DECODED));
+			}
+			// The app's plane still wins over both owners.
+			CHECK(one(true, 0.25f) == XRT_CONV_CONVERGENCE_DECODED);
+			if (owns) {
+				CHECK(obs.seen.load() == 0);
+			} else {
+				CHECK(obs.seen.load() >= 1);
+			}
+
+			REQUIRE(conv_core_stream_destroy(core, cr.stream_id) == XRT_SUCCESS);
+			conv_core_destroy(&core);
+		}
+		CHECK(g_live_images.load() == 0);
+		conv_fake_fini(&f);
+	}
+}
+
 TEST_CASE("stream: rebinding on a terminal FAILED is signalled by discontinuity", "[conv_lanes]")
 {
 	conv_fake_provider fa, fb;
@@ -1300,6 +1412,128 @@ TEST_CASE("policy: convergence DECODED mapping round-trips the app's [0,1]", "[c
 	in.last = nullptr; // no range yet: a relative plane cannot be decoded
 	conv_policy_convergence(&in, &p, &o);
 	CHECK(p.convergence_mode == XRT_CONV_CONVERGENCE_AUTO);
+}
+
+TEST_CASE("policy: a provider that owns AUTO gets AUTO every frame; only the app's plane overrides it", "[conv_lanes]")
+{
+	CHECK(conv_policy_provider_owns_auto_convergence(XRT_CONV_CAP_AUTO_CONVERGENCE, false));
+	CHECK_FALSE(conv_policy_provider_owns_auto_convergence(XRT_CONV_CAP_AUTO_CONVERGENCE, true)); // composed
+	CHECK_FALSE(conv_policy_provider_owns_auto_convergence(XRT_CONV_CAP_SUGGESTS_CONVERGENCE, false));
+
+	xrt_conv_depth_info last{};
+	last.kind = XRT_CONV_DEPTH_METRIC;
+	last.range_p05 = 1.0f;
+	last.range_p95 = 4.0f;
+	last.suggest_flags = 1u;
+	last.suggested_convergence = 3.0f;
+	conv_policy_conv_in in{};
+	in.last = &last;
+	in.observer_valid = true; // an observer that WOULD be valid, with a range...
+	in.observer_rel01 = 0.4f;
+	in.hint_allowed = true; // ...and a usable hint
+	in.provider_owns_auto = true;
+	for (int frame = 0; frame < 8; frame++) {
+		CAPTURE(frame);
+		xrt_conv_params p{};
+		conv_policy_conv_out o{};
+		in.observer_rel01 = 0.1f * (float)frame;
+		conv_policy_convergence(&in, &p, &o);
+		CHECK(o.source == CONV_CONVERGENCE_SRC_AUTO);
+		CHECK(p.convergence_mode == XRT_CONV_CONVERGENCE_AUTO);
+		CHECK(p.convergence == 0.0f);
+	}
+	in.app_set = true;
+	in.app_rel01 = 0.5f;
+	xrt_conv_params p{};
+	conv_policy_conv_out o{};
+	conv_policy_convergence(&in, &p, &o);
+	CHECK(o.source == CONV_CONVERGENCE_SRC_APP);
+	CHECK(p.convergence_mode == XRT_CONV_CONVERGENCE_DECODED);
+	CHECK(close_to(p.convergence, 1.6, 1e-6));
+}
+
+TEST_CASE("policy: frames without a range never flip the convergence source (range carried)", "[conv_lanes]")
+{
+	// The live symptom: the depth readback is rate-limited, so most frames
+	// reach S6 with no CPU samples and (for a provider that reports no range
+	// of its own) a zero range. Mirrors conv_stream.c: each frame's depth
+	// becomes the stream's last depth via conv_policy_depth_carry_range, and
+	// the next frame's convergence is computed against it.
+	auto frame_depth = [](bool has_range) {
+		xrt_conv_depth_info d{};
+		d.kind = XRT_CONV_DEPTH_AFFINE_INVERSE;
+		d.value_scale = 1.0f;
+		if (has_range) {
+			d.range_min = 0.05f;
+			d.range_max = 0.95f;
+			d.range_p05 = 0.1f;
+			d.range_p95 = 0.9f;
+		}
+		return d;
+	};
+
+	// Without the carry, the observer's plane blinks DECODED / AUTO per frame.
+	{
+		xrt_conv_depth_info last = frame_depth(true);
+		uint32_t flips = 0, prev = CONV_CONVERGENCE_SRC_OBSERVER;
+		for (int frame = 0; frame < 16; frame++) {
+			conv_policy_conv_in in{};
+			in.observer_valid = true;
+			in.observer_rel01 = 0.48f;
+			in.last = &last;
+			xrt_conv_params p{};
+			conv_policy_conv_out o{};
+			conv_policy_convergence(&in, &p, &o);
+			flips += o.source != prev ? 1u : 0u;
+			prev = o.source;
+			last = frame_depth(frame % 2 == 1); // raw overwrite (the old behaviour)
+		}
+		CHECK(flips > 4u); // the reproduced pumping
+	}
+
+	// With the carry: once a range was seen, the source never changes.
+	xrt_conv_depth_info last{};
+	bool has_last = false;
+	uint32_t first_source = 0xFFFFFFFFu;
+	float first_value = 0.0f;
+	for (int frame = 0; frame < 32; frame++) {
+		CAPTURE(frame);
+		conv_policy_conv_in in{};
+		in.observer_valid = true;
+		in.observer_rel01 = 0.48f;
+		in.last = has_last ? &last : nullptr;
+		xrt_conv_params p{};
+		conv_policy_conv_out o{};
+		conv_policy_convergence(&in, &p, &o);
+		if (has_last) {
+			if (first_source == 0xFFFFFFFFu) {
+				first_source = o.source;
+				first_value = p.convergence;
+			}
+			CHECK(o.source == CONV_CONVERGENCE_SRC_OBSERVER);
+			CHECK(o.source == first_source);
+			CHECK(p.convergence_mode == XRT_CONV_CONVERGENCE_DECODED);
+			CHECK(close_to(p.convergence, first_value, 1e-6)); // same range, same plane
+		}
+		// The provider's depth this frame: range only every third frame.
+		xrt_conv_depth_info d = frame_depth(frame % 3 == 0);
+		conv_policy_depth_carry_range(&d, has_last ? &last : nullptr);
+		last = d;
+		has_last = true;
+	}
+
+	// A fresh range replaces the carried one; another depth kind never inherits it.
+	xrt_conv_depth_info prev = frame_depth(true);
+	xrt_conv_depth_info fresh = frame_depth(true);
+	fresh.range_p05 = 0.2f;
+	CHECK(conv_policy_depth_carry_range(&fresh, &prev));
+	CHECK(fresh.range_p05 == 0.2f);
+	xrt_conv_depth_info other = frame_depth(false);
+	other.kind = XRT_CONV_DEPTH_METRIC;
+	CHECK_FALSE(conv_policy_depth_carry_range(&other, &prev));
+	CHECK(other.range_p05 == 0.0f);
+	xrt_conv_depth_info none = frame_depth(false);
+	CHECK_FALSE(conv_policy_depth_carry_range(&none, nullptr));
 }
 
 TEST_CASE("policy: budget from the range for METRIC kinds only; affine is strength x default", "[conv_lanes]")

@@ -24,6 +24,7 @@
 // #1589/#1610: the shared format-honesty policy (hatch + fast-path predicate).
 #include "util/u_color_encoding.h"
 #include "util/u_logging.h"
+#include "util/u_tiling.h"
 #include "d3d/d3d_dxgi_formats.h"
 #include "math/m_api.h"
 
@@ -150,6 +151,11 @@ struct comp_d3d11_renderer
 	//! reallocating. d3d11_crop_atlas_for_dp rect-crops the content back out.
 	uint32_t atlas_alloc_width;
 	uint32_t atlas_alloc_height;
+
+	//! #2564: worst-case atlas extent across the device's modes; a grow adds
+	//! headroom up to it (u_tiling_grow_atlas_extent). 0 = no cap known.
+	uint32_t atlas_cap_width;
+	uint32_t atlas_cap_height;
 
 	//! When true, view dims are fixed at legacy compromise scale and
 	//! set_tile_layout must not recompute them.
@@ -3027,6 +3033,15 @@ comp_d3d11_renderer_get_atlas_texture(struct comp_d3d11_renderer *renderer)
 	return renderer->atlas_texture;
 }
 
+extern "C" void
+comp_d3d11_renderer_set_atlas_cap(struct comp_d3d11_renderer *renderer, uint32_t cap_width, uint32_t cap_height)
+{
+	if (renderer != nullptr) {
+		renderer->atlas_cap_width = cap_width;
+		renderer->atlas_cap_height = cap_height;
+	}
+}
+
 extern "C" xrt_result_t
 comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
                            uint32_t new_view_width,
@@ -3075,18 +3090,13 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	// Genuine grow: first allocation, a display-mode change, or content larger
 	// than any seen before. High-water-mark — never shrink — so this converges
 	// (content-fit is window-bounded) and stops firing after warmup.
-	uint32_t grow_w = req_w;
-	uint32_t grow_h = req_h;
-	if (have_atlas) {
-		if (renderer->atlas_alloc_width > grow_w) grow_w = renderer->atlas_alloc_width;
-		if (renderer->atlas_alloc_height > grow_h) grow_h = renderer->atlas_alloc_height;
-	}
-
-	// TEMP #602 instrumentation — counts genuine atlas (re)allocations; should
-	// stay tiny (≈ startup/warmup) and NOT climb per-frame. Remove before merge.
-	static uint32_t s_realloc_count = 0;
-	U_LOG_W("#602 D3D11 atlas (re)alloc #%u: %ux%u (view %ux%u, tex_h %u)", ++s_realloc_count, grow_w, grow_h,
-	        new_view_width, new_view_height, new_texture_height);
+	// #2564: grow WITH HEADROOM. Exact-fit growth reallocated on every step of
+	// a window resize drag (each step a new high-water mark), and the 3D
+	// stuttered for as long as the edge was dragged.
+	const uint32_t cur_w = have_atlas ? renderer->atlas_alloc_width : 0;
+	const uint32_t cur_h = have_atlas ? renderer->atlas_alloc_height : 0;
+	uint32_t grow_w = u_tiling_grow_atlas_extent(cur_w, req_w, renderer->atlas_cap_width);
+	uint32_t grow_h = u_tiling_grow_atlas_extent(cur_h, req_h, renderer->atlas_cap_height);
 
 	// Release existing resources
 #define SAFE_RELEASE(x)                                                                                                \
@@ -3177,10 +3187,10 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 		return XRT_ERROR_D3D;
 	}
 
-	U_LOG_W("Renderer resized: atlas alloc now %ux%u (view=%ux%u, tiles=%ux%u, tex_h=%u)",
-	        grow_w, grow_h,
-	        new_view_width, new_view_height,
-	        renderer->tile_columns, renderer->tile_rows, new_texture_height);
+	U_LOG_W("Renderer resized: atlas alloc %ux%u -> %ux%u for content %ux%u (view=%ux%u, tiles=%ux%u, cap %ux%u)",
+	        cur_w, cur_h, grow_w, grow_h, req_w, req_h, new_view_width, new_view_height,
+	        renderer->tile_columns, renderer->tile_rows, renderer->atlas_cap_width,
+	        renderer->atlas_cap_height);
 
 	return XRT_SUCCESS;
 }

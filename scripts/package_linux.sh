@@ -124,6 +124,11 @@ if ! grep -q 'Hybrid mode: XR_DXR_weave present-owner' <<<"$RUNTIME_STRINGS"; th
     echo "error: $RUNTIME_SO is not the hybrid runtime — build with scripts/build_linux.sh --hybrid" >&2
     exit 1
 fi
+# Same qwerty guard as package_deb_linux.sh (#2355).
+if ! grep -q 'qwerty: HMD pose reseeded' <<<"$RUNTIME_STRINGS"; then
+    echo "error: $RUNTIME_SO has no qwerty driver (legacy apps would get a floor-level head, #2355) — build with scripts/build_linux.sh (no --no-qwerty)" >&2
+    exit 1
+fi
 
 # Refuse a runtime without the native-Wayland present path (see the script for
 # why this is a strings check rather than a NEEDED one).

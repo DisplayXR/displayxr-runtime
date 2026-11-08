@@ -2269,9 +2269,10 @@ d3d12_reroute_wire(struct comp_d3d12_compositor *c, struct xrt_device *xdev, boo
 		}
 	}
 	/*
-	 * #2317 P2a: on one adapter the hub can read the deposit ring DIRECT (no
-	 * transport copy; DXR_HUB_INGRESS=direct opts in, the hub's ingress policy
-	 * decides). A HYBRID reroute (the default on a cross-adapter box, #2375)
+	 * #2317 P2a: on one adapter the hub reads the deposit ring DIRECT (no
+	 * transport copy; the default for this producer since #2518, the hub's
+	 * ingress policy decides, DXR_HUB_INGRESS=xbridge forces the bridge). A
+	 * HYBRID reroute (the default on a cross-adapter box, #2375)
 	 * always takes xbridge (ingress_reason=cross_adapter). DIRECT reads are released
 	 * on the hub's own consumer fence, which this queue must open to order a
 	 * slot rewrite after them — no open, no DIRECT. #2370: under
@@ -2403,6 +2404,10 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	// that signals the deposit fence, and a list that rewrites a plane waits
 	// out the hub's last plane read (comp_d3d12_deposit_plane_wait_hub).
 	si.ring_direct_planes = true;
+	// #2518: ...and takes DIRECT by default on one adapter (render == scanout):
+	// the staged ring's per-frame app-queue copy stalled the #2362 drain on a
+	// same-adapter hybrid laptop. DXR_HUB_INGRESS=xbridge forces the bridge.
+	si.ring_direct_default = true;
 	si.render_packed_luid =
 	    ((uint64_t)(uint32_t)app_luid.HighPart << 32) | (uint64_t)(uint32_t)app_luid.LowPart;
 	si.display_screen_left = display_screen_left;
@@ -2788,6 +2793,10 @@ d3d12_reroute_stage_a_client(struct comp_d3d12_compositor *c, struct xrt_device 
 	si.app_timeline_semaphores = true;
 	si.ring_direct = true;
 	si.ring_direct_planes = true;
+	// #2518: ...and takes DIRECT by default on one adapter (render == scanout):
+	// the staged ring's per-frame app-queue copy stalled the #2362 drain on a
+	// same-adapter hybrid laptop. DXR_HUB_INGRESS=xbridge forces the bridge.
+	si.ring_direct_default = true;
 	si.render_packed_luid =
 	    ((uint64_t)(uint32_t)app_luid.HighPart << 32) | (uint64_t)(uint32_t)app_luid.LowPart;
 	si.preferred_width = c->settings.preferred.width;
@@ -3358,9 +3367,10 @@ d3d12_split_render_diag(struct comp_d3d12_compositor *c)
 	c->split_out_crop = 0;
 
 	U_LOG_W(
-	    "[RENDER] split=%d xb_kb=%llu xb_degraded=%d no_slot=%llu out_crop=%llu ingress=%s "
+	    "[RENDER] split=%d xb_kb=%llu xb_degraded=%d xb_same_adapter=%d no_slot=%llu out_crop=%llu ingress=%s "
 	    "ing_direct=%llu ing_staged=%llu ing_rebind=%llu ing_churn=%llu ing_leak=%llu window_s=10",
 	    (int)c->split_active, (unsigned long long)(xb_bytes / 1024u), (int)comp_xbridge_is_degraded(c->xbridge),
+	    (int)comp_xbridge_is_same_adapter(c->xbridge),
 	    (unsigned long long)no_slot, (unsigned long long)out_crop, ing_name, (unsigned long long)ing.direct,
 	    (unsigned long long)ing.staged, (unsigned long long)ing.rebind, (unsigned long long)ing.churn,
 	    (unsigned long long)ing.leak);
@@ -8343,6 +8353,12 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		U_LOG_E("Failed to create D3D12 renderer");
 		d3d12_compositor_destroy(&c->base.base);
 		return xret;
+	}
+	// #2564: bound the atlas's grow headroom by the worst case across modes.
+	if (xdev != NULL && xdev->rendering_mode_count > 0) {
+		uint32_t cap_w = 0, cap_h = 0;
+		u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &cap_w, &cap_h);
+		comp_d3d12_renderer_set_atlas_cap(c->renderer, cap_w, cap_h);
 	}
 
 	// Expose current window-scaled capture dims to xrCaptureAtlasDXR (#431).

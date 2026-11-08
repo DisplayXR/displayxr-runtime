@@ -32,6 +32,7 @@
 #include "util/u_screen_home.h"
 #include "util/u_device.h"
 #include "util/u_cursor_depth.h"
+#include "util/u_stereo_comfort.h"
 #include "util/u_tracking_any.h"
 #include "util/u_mono_auto_2d.h"
 
@@ -144,7 +145,7 @@ struct oxr_xdev_list;
 struct oxr_plane_detector_ext;
 struct oxr_local_3d_zone_ext;
 struct oxr_lift_stream_dxr;
-struct ipc_client_lift_link;
+struct ipc_client_service_link;
 struct oxr_stereo_camera_stream_dxr;
 
 #define XRT_MAX_HANDLE_CHILDREN 256
@@ -3016,12 +3017,23 @@ struct oxr_session
 	bool is_gl_native_compositor;
 
 	/*!
-	 * XR_DXR_lift for an IN-PROCESS session (ADR-049): the lift-only service
-	 * connection, created on the first lift call and freed after the
-	 * session's lift streams (its children). NULL on IPC sessions, whose
-	 * lift calls ride the session's own connection.
+	 * An IN-PROCESS session's service link (ADR-049 + Amendment 1, ADR-061
+	 * decision 16): ONE sessionless service connection carrying its lift
+	 * calls and, when sharing is on, its share capability. Created on the
+	 * first lift call or at xrBeginSession (sharing), whichever comes first;
+	 * freed after the session's lift streams (its children). NULL on IPC
+	 * sessions, whose lift calls ride the session's own connection.
 	 */
-	struct ipc_client_lift_link *lift_link;
+	struct ipc_client_service_link *service_link;
+
+	/*!
+	 * ADR-061 spec §5: the app chained XrSessionShareabilityDXR shareable =
+	 * XR_FALSE. Travels in the service link's registration for an in-process
+	 * session (an IPC session sends it at session create).
+	 */
+	bool app_share_opt_out;
+	//! ADR-061 arm 2: the session installed its service link as the process's share sink.
+	bool share_sink_installed;
 
 	/*!
 	 * XR_DXR_lift: the conversion module's maxViews as the last successful
@@ -3247,6 +3259,17 @@ struct oxr_session
 	//! view poses like a handle app (display-local, no world_head_pos offset).
 	bool is_bridge_relay;
 
+	//! True for an in-process HOSTED session (the runtime owns the window)
+	//! of an app that enabled XR_DXR_display_info, when the process opted in
+	//! with DXR_HOSTED_RAW_VIEWS=1 (#2322). Such a session takes the RAW view
+	//! contract of an external-window session (ADR-024 Amendment 1): XrView.pose
+	//! is the display processor's eyes relative to the display plane, identity
+	//! orientation. For a Windows app under a translation layer that cannot
+	//! hand over a native window but does its own view math. Off by default:
+	//! a hosted session keeps render-ready views. Read through
+	//! oxr_session_views_display_relative(), never on its own.
+	bool hosted_raw_views;
+
 	//! XR_DXR_view_rig (#396 W7): per-session rig parse state. A rig chained
 	//! on a locate drives the view math for that locate (lifting the
 	//! external-window display-centric forcing); locates that chain nothing
@@ -3383,6 +3406,12 @@ struct oxr_session
 	//! only by a locate that chains an XrCursorDepthHintDXR - a session that
 	//! never sends a hint never steps it.
 	struct u_cursor_depth_filter cursor_depth_filter;
+#ifdef OXR_HAVE_DXR_stereo_comfort
+	//! XR_DXR_stereo_comfort: the last tracked eyes' mean distance from the
+	//! display plane (in-process locate), for a locate that chains no raw block.
+	float comfort_eye_z_m;
+	bool comfort_eye_tracked;
+#endif
 	//! XR_DXR_cursor_depth v3: HYBRID anchor state, beside the filter and
 	//! under the same rule (only a hinted locate touches it). Dropped
 	//! whenever the filter re-primes.
@@ -3851,6 +3880,18 @@ struct oxr_session
 	void *workspace_modal_cbt_hook;     //!< HHOOK, opaque to portable code.
 #endif
 };
+
+/*!
+ * True when this session's views are DISPLAY-PLANE-RELATIVE (the RAW contract,
+ * ADR-024 Amendment 1): its display plane is the identity at the head's
+ * tracking origin instead of the head device pose. External-window sessions,
+ * bridge relays, and hosted sessions that opted into raw views (#2322).
+ */
+static inline bool
+oxr_session_views_display_relative(const struct oxr_session *sess)
+{
+	return sess->has_external_window || sess->is_bridge_relay || sess->hosted_raw_views;
+}
 
 /*!
  * Returns XR_SUCCESS or XR_SESSION_LOSS_PENDING as appropriate.

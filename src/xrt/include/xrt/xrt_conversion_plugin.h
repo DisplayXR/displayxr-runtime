@@ -336,6 +336,25 @@ struct xrt_conv_state
  *  without the user's per-provider consent (host->get_consent(
  *  XRT_CONV_CONSENT_OFFBOX)) the provider reports it DISABLED. */
 #define XRT_CONV_CAP_REMOTE (1u << 9)
+/*! The model is a runtime the USER installed on this box separately, under
+ *  its own licence (e.g. Leia's NeurD runtime), and the provider found a
+ *  valid copy of it: that install is the opt-in, so selection admits this
+ *  capability without AllowResearchOnly even when its licence class is
+ *  RESEARCH_ONLY / UNKNOWN. Set it ONLY while that install is present and
+ *  usable; never for a model the runtime or the provider fetches itself.
+ *  Same footing as the grandfathered dp-lift adapter, whose exemption had the
+ *  same reason (the user installed the module). */
+#define XRT_CONV_CAP_LICENSED_LOCAL_INSTALL (1u << 10)
+/*! The provider runs its own auto-convergence when params.convergence_mode
+ *  is XRT_CONV_CONVERGENCE_AUTO, and so owns convergence whenever the app
+ *  leaves it AUTO. A stream bound to such a capability (provider-produced
+ *  views, not composed) gets no runtime convergence observer and no D10 hint:
+ *  params carry AUTO unless the APP set a plane, which still wins (DECODED).
+ *  The runtime does not judge whose auto-convergence is better; the provider
+ *  the user installed decides. The runtime's observer runs only for providers
+ *  that do not declare this. One convergence owner per stream (ADR-053
+ *  Amendment 1). Append-only: an older provider simply does not set it. */
+#define XRT_CONV_CAP_AUTO_CONVERGENCE (1u << 11)
 /*! @} */
 
 /*! One capability = (task × model × backend × device). Top-level: the

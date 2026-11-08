@@ -95,6 +95,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [Writing a Driver](guides/writing-driver.md) — driver framework basics
 - **[ADR-034: Input-Provider Plug-ins](adr/ADR-034-input-provider-plugins.md)** — the second plug-in type: tracked motion controllers from an external DLL ([discovery contract](specs/runtime/input-provider-discovery.md) · [iface reference](reference/xrt_input_plugin_iface.md))
 - [OpenVR titles via OpenComposite](guides/openvr-titles-via-opencomposite.md) — how SteamVR-era titles reach the runtime + its motion controllers
+- [Porting a native Android game to the weave extension](guides/android-game-stereo-port.md) — real two-eye rendering for a game with no source: twins, replay, camera classification, the frame boundary, what is reusable
 
 ### Integrated vendors (`vendors/`)
 
@@ -169,6 +170,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-058](adr/ADR-058-late-view-synthesis-and-depth-reprojection.md) — Late view synthesis and depth reprojection — converted content is placed at the eyes of the frame it is shown in, not the frame it was converted for
 - [ADR-059](adr/ADR-059-d3d11-hub-compositor-windows.md) — One D3D11 hub compositor on Windows; the per-API in-process compositors become import shims
 - [ADR-060](adr/ADR-060-texture-target-reference-window-binding.md) — A texture target is named by a reference window and a rect; its display processor is windowless
+- [ADR-061](adr/ADR-061-3d-screen-share.md) — 3D screen share — a running app's pre-weave views are a stereo-camera source of kind app
 <!-- END ADR INDEX -->
 
 ---

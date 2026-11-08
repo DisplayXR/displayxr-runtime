@@ -961,9 +961,9 @@ typedef struct XrDisplayStableKeyDXR {
 
 // ---- v25: Fixed-viewer locate hint ----
 
-// Type value 1004999430 (display_info's 430-439 decade, see README.md: the
-// 210-219 decade is full).
-#define XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR ((XrStructureType)1004999430)
+// Type value 1004999450 (display_info's 450-459 decade, see README.md: the
+// 210-219 decade is full and 430-449 went to app_share / stereo_comfort).
+#define XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR ((XrStructureType)1004999450)
 
 /*!
  * @brief "This locate's content does not depend on where the viewer is" (v25).

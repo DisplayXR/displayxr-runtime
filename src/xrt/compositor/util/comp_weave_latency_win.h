@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <windows.h>
 #include <dxgi.h>
+#include <dxgi1_3.h> // #2564: IDXGISwapChainMedia (late_weave_stage2_gate)
 
 #include "comp_late_weave_lookahead.h"
 #include "util/u_app_partition.h" // #1339: u_app_partition_divisor()
@@ -900,6 +901,194 @@ struct weave_latency_log
 //! Queue-depth ceiling: covers a 16 ms frame on a 240 Hz panel (ceil(16/4.17)).
 #define LATE_WEAVE_MAX_DEPTH 4
 
+/*!
+ * #2564: frame-latency tokens a waitable chain holds beyond its current depth.
+ *
+ * Raising SetMaximumFrameLatency hands the waitable semaphore the extra
+ * tokens; LOWERING it takes none back. Left alone, every governor decrease
+ * leaves a permanent surplus: the stage-1 wait returns a frame early forever,
+ * the presenter runs a frame ahead and Present() blocks a whole refresh
+ * instead of the waitable, so the weave samples the eye a frame early.
+ * Measured on the D3D11 tier: mark->present-return 1.7 -> 15.6 ms,
+ * permanently, after one 2 -> 1 decrease. Route every SetMaximumFrameLatency
+ * through @ref apply and call @ref pay before each blocking stage-1 wait.
+ * One per chain; the owner serialises the calls (all sites are one thread).
+ */
+struct late_weave_token_ledger
+{
+	int applied = 0;   //!< max latency last applied (0 = none yet)
+	uint32_t debt = 0; //!< surplus tokens still to take back
+	bool logged = false;
+
+	void
+	reset()
+	{
+		applied = 0;
+		debt = 0;
+	}
+
+	//! Apply @p lat to the chain and account the semaphore change.
+	void
+	apply(IDXGISwapChain2 *sc2, int lat)
+	{
+		sc2->SetMaximumFrameLatency((UINT)lat);
+		if (applied > 0 && lat < applied) {
+			debt += (uint32_t)(applied - lat);
+		} else if (applied > 0 && lat > applied) {
+			// A raise is paid in tokens by DXGI, which offsets anything owed.
+			const uint32_t up = (uint32_t)(lat - applied);
+			debt = (debt > up) ? debt - up : 0;
+		}
+		applied = lat;
+	}
+
+	/*!
+	 * Take back owed tokens without blocking: a token only appears as a
+	 * present retires, so the debt is settled over the next few frames,
+	 * never by a stall. Returns how many were taken.
+	 */
+	uint32_t
+	pay(HANDLE waitable, const char *site)
+	{
+		uint32_t paid = 0;
+		while (debt > 0 && waitable != nullptr && WaitForSingleObjectEx(waitable, 0, FALSE) == WAIT_OBJECT_0) {
+			debt--;
+			paid++;
+		}
+		if (paid > 0 && !logged) {
+			logged = true;
+			U_LOG_W("Late-weave (%s): drained %u surplus waitable token(s) left by a governor depth "
+			        "decrease (#2564; logged once)",
+			        site, paid);
+		}
+		return paid;
+	}
+};
+
+/*!
+ * #2564: may the stage-2 scanout wait run on this chain right now?
+ *
+ * Stage 2 waits until the previous present is ON THE GLASS, then lets the
+ * next frame weave. That only works when the chain scans out directly (DXGI
+ * presentation mode OVERLAY / independent flip): the present then makes the
+ * next vblank. When DWM composes the chain (any ordinary window), DWM picks
+ * presents up AT the vblank, so a present made just after scanout always
+ * misses it and lands two vblanks out. Measured on the 8K Leia box
+ * (cube_handle_d3d11_win, windowed): depth 1 with stage 2 ran at exactly
+ * 30 fps, the governor backed off to 2 and stuttered on every return probe,
+ * and resize drags timed stage 2 out; each change moved weave->scanout by a
+ * whole refresh, and the eye predictor aimed a refresh off until it
+ * re-learnt: the visible 3D stutter. With stage 2 off on that chain depth 1
+ * held 60 fps at a constant 33 ms weave->scanout, through drags.
+ *
+ * ON only once GetFrameStatisticsMedia reports direct scanout for 30
+ * consecutive frames with PresentCount advancing (the very first reading,
+ * before any composed present, came back "independent flip"); one COMPOSED
+ * (or COMPOSITION_FAILURE) reading turns it OFF at once; OFF while unknown.
+ * Probed every frame until settled, then once a second (the mode follows the
+ * window). DXR_LATE_WEAVE_SCANOUT_WAIT=0 forces it off, =1 on.
+ */
+struct late_weave_stage2_gate
+{
+	int composed = -1; //!< -1 unknown, 0 direct scanout, 1 composed by DWM
+	uint64_t probe_qpc = 0;
+	uint32_t direct_streak = 0;
+	UINT last_pc = 0;
+	uint32_t unknown_probes = 0; //!< probes with no usable answer (diagnostic)
+	bool unknown_logged = false;
+
+	void
+	reset()
+	{
+		unknown_probes = 0;
+		composed = -1;
+		probe_qpc = 0;
+		direct_streak = 0;
+		last_pc = 0;
+	}
+
+	static int
+	override_mode()
+	{
+		static int mode = -1; // 0 force off, 1 force on, 2 auto
+		if (mode < 0) {
+			const char *e = getenv("DXR_LATE_WEAVE_SCANOUT_WAIT");
+			mode = (e != nullptr && e[0] == '0') ? 0 : (e != nullptr && e[0] == '1') ? 1 : 2;
+			if (mode != 2) {
+				U_LOG_W("Late-weave: stage-2 scanout wait forced %s (DXR_LATE_WEAVE_SCANOUT_WAIT)",
+				        mode == 1 ? "ON" : "OFF");
+			}
+		}
+		return mode;
+	}
+
+	bool
+	allowed(IDXGISwapChain *sc, const char *site)
+	{
+		const int ov = override_mode();
+		if (ov != 2) {
+			return ov == 1;
+		}
+		if (sc == nullptr) {
+			return false;
+		}
+		LARGE_INTEGER now_li, f_li;
+		QueryPerformanceCounter(&now_li);
+		QueryPerformanceFrequency(&f_li);
+		const uint64_t now = (uint64_t)now_li.QuadPart;
+		const bool settling = composed < 0 || (direct_streak > 0 && composed != 0);
+		if (!settling && probe_qpc != 0 && now - probe_qpc < (uint64_t)f_li.QuadPart) {
+			return composed == 0;
+		}
+		probe_qpc = now;
+		IDXGISwapChainMedia *media = nullptr;
+		const HRESULT qhr = sc->QueryInterface(__uuidof(IDXGISwapChainMedia), reinterpret_cast<void **>(&media));
+		if (FAILED(qhr)) {
+			if (composed < 0 && ++unknown_probes == 300 && !unknown_logged) {
+				unknown_logged = true;
+				U_LOG_W("Late-weave (%s): chain has no IDXGISwapChainMedia (hr=0x%08x), presentation mode "
+				        "unknown -- stage-2 scanout wait stays OFF (#2564; DXR_LATE_WEAVE_SCANOUT_WAIT=1 "
+				        "forces it)",
+				        site, (unsigned)qhr);
+			}
+			return composed == 0;
+		}
+		DXGI_FRAME_STATISTICS_MEDIA st = {};
+		const HRESULT mhr = media->GetFrameStatisticsMedia(&st);
+		if (composed < 0 && (FAILED(mhr) || st.PresentCount == 0) && ++unknown_probes == 300 &&
+		    !unknown_logged) {
+			unknown_logged = true;
+			U_LOG_W("Late-weave (%s): presentation mode still unknown after %u frames "
+			        "(GetFrameStatisticsMedia hr=0x%08x PresentCount=%u) -- stage-2 scanout wait stays OFF "
+			        "(#2564; DXR_LATE_WEAVE_SCANOUT_WAIT=1 forces it)",
+			        site, unknown_probes, (unsigned)mhr, st.PresentCount);
+		}
+		if (SUCCEEDED(mhr) && st.PresentCount != 0) {
+			const bool direct = st.CompositionMode == DXGI_FRAME_PRESENTATION_MODE_OVERLAY ||
+			                    st.CompositionMode == DXGI_FRAME_PRESENTATION_MODE_NONE;
+			int verdict = composed;
+			if (!direct) {
+				direct_streak = 0;
+				verdict = 1;
+			} else if (st.PresentCount != last_pc && ++direct_streak >= 30) {
+				verdict = 0;
+			}
+			last_pc = st.PresentCount;
+			if (verdict >= 0 && verdict != composed) {
+				U_LOG_W("Late-weave (%s): chain presentation mode %s -> stage-2 scanout wait %s (#2564)", site,
+				        verdict == 1 ? "COMPOSED (DWM)"
+				                     : (st.CompositionMode == DXGI_FRAME_PRESENTATION_MODE_OVERLAY
+				                            ? "OVERLAY"
+				                            : "independent flip"),
+				        verdict == 1 ? "OFF" : "ON");
+				composed = verdict;
+			}
+		}
+		media->Release();
+		return composed == 0;
+	}
+};
+
 struct late_weave_governor
 {
 	int base = -1;         // DXR_LATE_WEAVE_MAX_LATENCY, probed once (1..MAX)
@@ -1133,6 +1322,55 @@ struct late_weave_governor
 	 * probe-dwell doubling pins it there for minutes after restore. Treat
 	 * it exactly like the pause: reset the signal, contribute nothing.
 	 */
+	/*!
+	 * #2564: the window is being resized. A resize drag runs the app inside
+	 * the window manager's modal size loop: frames arrive in bursts with
+	 * 40-130 ms gaps, under the 250 ms pause rule in on_mark, so they read
+	 * as saturation and vsync slips. Measured on cube_handle_d3d11_win: one
+	 * drag escalated 2 -> 3 (slip-rate), the return probe then "failed" and
+	 * doubled the dwell 30 -> 300 s, and the session sat at depth 3 (weave to
+	 * scanout 31 -> 48 ms) for minutes after the drag ended. The 3D stuttered
+	 * for as long as it stayed there.
+	 *
+	 * None of that is pipeline load, so hold: reset the signal now and
+	 * contribute nothing to it (no escalation, no probe, no dwell change)
+	 * until @ref kResizeHoldNs after the LAST resize. Call on every swapchain
+	 * resize; a drag renews the hold on each step.
+	 */
+	static constexpr double kResizeHoldNs = 500e6;
+	uint64_t resize_hold_until_qpc = 0;
+	bool resize_hold_logged = false;
+
+	//! #2564: is a resize hold in force right now? The target also skips its
+	//! stage-2 scanout wait while it is: ResizeBuffers makes the chain's
+	//! frame statistics disjoint, so that wait can only run to its bound.
+	bool
+	in_resize_hold() const
+	{
+		if (resize_hold_until_qpc == 0) {
+			return false;
+		}
+		LARGE_INTEGER now_li;
+		QueryPerformanceCounter(&now_li);
+		return (uint64_t)now_li.QuadPart < resize_hold_until_qpc;
+	}
+
+	void
+	on_resize(uint64_t freq_hz)
+	{
+		LARGE_INTEGER now_li;
+		QueryPerformanceCounter(&now_li);
+		resize_hold_until_qpc =
+		    (uint64_t)now_li.QuadPart + (uint64_t)(kResizeHoldNs * (double)freq_hz / 1e9);
+		on_wait_timeout();
+		if (!resize_hold_logged) {
+			resize_hold_logged = true;
+			U_LOG_W("Late-weave governor: window resize -- depth %d held while resizing and %.0f ms "
+			        "after; a drag's frame cadence is not a saturation signal (#2564; logged once)",
+			        effective, kResizeHoldNs / 1e6);
+		}
+	}
+
 	void
 	on_wait_timeout()
 	{
@@ -1171,6 +1409,16 @@ struct late_weave_governor
 		LARGE_INTEGER now_li;
 		QueryPerformanceCounter(&now_li);
 		const uint64_t now = (uint64_t)now_li.QuadPart;
+
+		// #2564: inside a resize hold the cadence says nothing about load.
+		if (resize_hold_until_qpc != 0) {
+			if (now < resize_hold_until_qpc) {
+				on_wait_timeout();
+				wait_frame_qpc = 0;
+				return 0;
+			}
+			resize_hold_until_qpc = 0;
+		}
 
 		double dt_ns = 0.0;
 		if (last_mark_qpc != 0 && now > last_mark_qpc) {

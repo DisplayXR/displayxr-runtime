@@ -1063,12 +1063,17 @@ ipc_server_conv_lift_submit_framed(struct ipc_server_conv *sc,
 	if (st.input_scale < 1.0f && fr.focal_px > 0.0f) {
 		fr.focal_px *= (float)sw / (float)args->width; // focal is in INPUT pixels
 	}
-	// ADR-048: the session's window is the lifted rect (svc_lift's frame).
-	if (frame != NULL && frame->valid) {
+	// ADR-048: the session's window is the lifted rect (svc_lift's frame). A
+	// windowless submit (displayxr-cli lift probe) converts against a rect of
+	// its extent's aspect fitted in the panel, as the v4 path does (ADR-053 P5).
+	// Without one a composed stream's view synthesis refuses the frame (no rect,
+	// u_conv_viewsyn_resolve) and every frame failed with nothing logged.
+	struct xrt_lift_rect_frame rect;
+	if (frame != NULL && ipc_server_conv_submit_rect(frame, args->width, args->height, &rect)) {
 		fr.rect_valid = true;
-		memcpy(fr.rect_center, frame->center, sizeof(fr.rect_center));
-		fr.rect_w_m = frame->width_m;
-		fr.rect_h_m = frame->height_m;
+		memcpy(fr.rect_center, rect.center, sizeof(fr.rect_center));
+		fr.rect_w_m = rect.width_m;
+		fr.rect_h_m = rect.height_m;
 	}
 	// The eyes of the DP that owns the session's window (multi-screen M6).
 	if (frame != NULL && frame->eyes_dp_key != 0) {

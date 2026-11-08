@@ -55,6 +55,7 @@
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_display_processor_gl.h"
 #include "xrt/xrt_handles.h"
+#include "xrt/xrt_stereo_camera.h"
 #include "xrt/xrt_config_build.h"
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_limits.h"
@@ -5529,6 +5530,8 @@ gl_hub_stage_a1(struct comp_gl_compositor *c,
 	}
 	c->hub.active = true;
 	c->hub.want_3d = true;
+	// ADR-061 arm 2: no share tap for GL (its atlas orientation is not the hub's to know).
+	comp_hub_d3d11_decline_share_tap(c->hub.split, XRT_APP_SHARE_UNAVAILABLE_UNSUPPORTED_API);
 	return NULL;
 }
 

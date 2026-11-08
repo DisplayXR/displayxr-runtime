@@ -85,6 +85,7 @@ struct cam_prompt_req
 	wchar_t title[256];
 	wchar_t body[512];
 	uint64_t gen; //!< the hand-off generation this dialog answers
+	bool no_once; //!< ADR-061 share prompt: Deny / Allow only, no "Allow once"
 	HFONT font;   //!< the dialog's font (deleted with it), may be NULL
 };
 
@@ -368,6 +369,10 @@ show_context_menu(HWND hwnd)
 		wchar_t line[256];
 		if (!have || cst.camera_count == 0) {
 			wcscpy_s(line, ARRAYSIZE(line), (have && !cst.sharing_enabled) ? L"3D camera: sharing off" : L"3D camera: none");
+		} else if (cst.share_streams > 0 && cst.started_streams == cst.share_streams) {
+			wchar_t what[128];
+			MultiByteToWideChar(CP_UTF8, 0, cst.shares, -1, what, ARRAYSIZE(what));
+			_snwprintf_s(line, ARRAYSIZE(line), _TRUNCATE, L"Sharing %ls", what);
 		} else if (cst.started_streams > 0) {
 			wchar_t who[128];
 			MultiByteToWideChar(CP_UTF8, 0, cst.consumers, -1, who, ARRAYSIZE(who));
@@ -535,8 +540,15 @@ update_camera_indicator(void)
 		NOTIFYICONDATAW n = s_nid;
 		n.uFlags = NIF_INFO;
 		n.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
-		wcscpy_s(n.szInfoTitle, ARRAYSIZE(n.szInfoTitle), L"3D camera in use");
-		_snwprintf_s(n.szInfo, ARRAYSIZE(n.szInfo), _TRUNCATE, L"%ls is receiving frames from the 3D camera.", who);
+		if (st.share_streams > 0 && st.started_streams == st.share_streams) {
+			wchar_t what[256];
+			MultiByteToWideChar(CP_UTF8, 0, st.shares, -1, what, ARRAYSIZE(what));
+			_snwprintf_s(n.szInfoTitle, ARRAYSIZE(n.szInfoTitle), _TRUNCATE, L"Sharing %ls", what);
+			_snwprintf_s(n.szInfo, ARRAYSIZE(n.szInfo), _TRUNCATE, L"%ls is receiving what \u201c%ls\u201d shows.", who, what);
+		} else {
+			wcscpy_s(n.szInfoTitle, ARRAYSIZE(n.szInfoTitle), L"3D camera in use");
+			_snwprintf_s(n.szInfo, ARRAYSIZE(n.szInfo), _TRUNCATE, L"%ls is receiving frames from the 3D camera.", who);
+		}
 		Shell_NotifyIconW(NIM_MODIFY, &n);
 	}
 }
@@ -770,13 +782,18 @@ cam_prompt_show(struct cam_prompt_req *req)
 	                         NULL, hi, NULL);
 	HWND deny = CreateWindowExW(0, L"BUTTON", L"Deny", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, DP(16),
 	                            DP(108), DP(110), DP(30), dlg, (HMENU)(INT_PTR)CAM_BTN_DENY, hi, NULL);
-	HWND once = CreateWindowExW(0, L"BUTTON", L"Allow once", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-	                            DP(206), DP(108), DP(110), DP(30), dlg, (HMENU)(INT_PTR)CAM_BTN_ONCE, hi, NULL);
+	HWND once = NULL;
+	if (!req->no_once) {
+		once = CreateWindowExW(0, L"BUTTON", L"Allow once", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, DP(206),
+		                       DP(108), DP(110), DP(30), dlg, (HMENU)(INT_PTR)CAM_BTN_ONCE, hi, NULL);
+	}
 	HWND allow = CreateWindowExW(0, L"BUTTON", L"Allow", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
 	                             DP(326), DP(108), DP(110), DP(30), dlg, (HMENU)(INT_PTR)CAM_BTN_ALLOW, hi, NULL);
 	HWND ctls[] = {t, b, deny, once, allow};
 	for (size_t i = 0; i < ARRAYSIZE(ctls); i++) {
-		SendMessageW(ctls[i], WM_SETFONT, (WPARAM)font, TRUE);
+		if (ctls[i] != NULL) {
+			SendMessageW(ctls[i], WM_SETFONT, (WPARAM)font, TRUE);
+		}
 	}
 #undef DP
 	s_cam_dlg = dlg;
@@ -796,6 +813,22 @@ cam_prompt_show(struct cam_prompt_req *req)
  * it touch freed memory or answer a different request.
  */
 static enum u_camera_consent_prompt_answer
+tray_prompt_ask(struct cam_prompt_req *req, uint32_t timeout_ms);
+
+//! The file name of @p path (either separator); "" for NULL.
+static const char *
+tray_base_name(const char *path)
+{
+	const char *base = path != NULL ? path : "";
+	for (const char *p = base; *p != '\0'; p++) {
+		if (*p == '\\' || *p == '/') {
+			base = p + 1;
+		}
+	}
+	return base;
+}
+
+static enum u_camera_consent_prompt_answer
 tray_camera_prompt(void *ctx, const char *exe, const char *app_name, long pid, uint32_t timeout_ms)
 {
 	(void)ctx;
@@ -806,12 +839,7 @@ tray_camera_prompt(void *ctx, const char *exe, const char *app_name, long pid, u
 	if (req == NULL) {
 		return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
 	}
-	const char *base = exe != NULL ? exe : "";
-	for (const char *p = base; *p != '\0'; p++) {
-		if (*p == '\\' || *p == '/') {
-			base = p + 1;
-		}
-	}
+	const char *base = tray_base_name(exe);
 	wchar_t wapp[128], wbase[256];
 	MultiByteToWideChar(CP_UTF8, 0, app_name != NULL && app_name[0] ? app_name : "An app", -1, wapp, ARRAYSIZE(wapp));
 	MultiByteToWideChar(CP_UTF8, 0, base[0] ? base : "the app", -1, wbase, ARRAYSIZE(wbase));
@@ -820,6 +848,44 @@ tray_camera_prompt(void *ctx, const char *exe, const char *app_name, long pid, u
 	             L"%ls (pid %ld) will receive frames from the display\u2019s stereo camera. You can stop it at any "
 	             L"time from the DisplayXR tray menu.",
 	             wbase, pid);
+	return tray_prompt_ask(req, timeout_ms);
+}
+
+/*!
+ * ADR-061: the share prompt provider (Deny / Allow only). Same dialog and
+ * hand-off as the camera prompt, so one dialog at a time and a late click is
+ * dropped the same way.
+ */
+static enum u_camera_consent_prompt_answer
+tray_share_prompt(
+    void *ctx, const char *consumer_exe, long consumer_pid, const char *app_name, const char *app_exe, uint32_t timeout_ms)
+{
+	(void)ctx;
+	if (s_tray_hwnd == NULL) {
+		return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	}
+	struct cam_prompt_req *req = (struct cam_prompt_req *)calloc(1, sizeof(*req));
+	if (req == NULL) {
+		return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	}
+	req->no_once = true;
+	const char *consumer = tray_base_name(consumer_exe);
+	const char *app = app_name != NULL && app_name[0] ? app_name : tray_base_name(app_exe);
+	wchar_t wapp[128], wconsumer[256];
+	MultiByteToWideChar(CP_UTF8, 0, app[0] ? app : "this app", -1, wapp, ARRAYSIZE(wapp));
+	MultiByteToWideChar(CP_UTF8, 0, consumer[0] ? consumer : "an app", -1, wconsumer, ARRAYSIZE(wconsumer));
+	_snwprintf_s(req->title, ARRAYSIZE(req->title), _TRUNCATE, L"Share \u201c%ls\u201d with %ls?", wapp, wconsumer);
+	_snwprintf_s(req->body, ARRAYSIZE(req->body), _TRUNCATE,
+	             L"%ls (pid %ld) will receive what \u201c%ls\u201d shows, in 3D. You can stop it at any time from "
+	             L"the DisplayXR tray menu.",
+	             wconsumer, consumer_pid, wapp);
+	return tray_prompt_ask(req, timeout_ms);
+}
+
+//! Hand @p req (heap, ours) to the tray thread and wait; see the comment on tray_camera_prompt.
+static enum u_camera_consent_prompt_answer
+tray_prompt_ask(struct cam_prompt_req *req, uint32_t timeout_ms)
+{
 	HANDLE done = CreateEventW(NULL, TRUE, FALSE, NULL);
 	if (done == NULL) {
 		free(req);
@@ -923,8 +989,9 @@ update_status_tooltip(void)
 	struct ipc_server_stereo_camera_status cst;
 	if (ipc_server_stereo_camera_get_status(&cst) && cst.started_streams > 0) {
 		wchar_t who[96];
-		MultiByteToWideChar(CP_UTF8, 0, cst.consumers, -1, who, ARRAYSIZE(who));
-		_snwprintf_s(wcam, ARRAYSIZE(wcam), _TRUNCATE, L"\n3D camera in use by %ls%ls", who,
+		const bool share_only = cst.share_streams > 0 && cst.started_streams == cst.share_streams;
+		MultiByteToWideChar(CP_UTF8, 0, share_only ? cst.shares : cst.consumers, -1, who, ARRAYSIZE(who));
+		_snwprintf_s(wcam, ARRAYSIZE(wcam), _TRUNCATE, share_only ? L"\nSharing %ls%ls" : L"\n3D camera in use by %ls%ls", who,
 		             cst.locked ? L" (suspended: locked)" : L"");
 	}
 	// Display dashboard phase 8: the configured launch combo, when a workspace
@@ -1344,6 +1411,7 @@ service_tray_init(service_tray_shutdown_cb shutdown_cb,
 	// (process-wide providers, not per manager).
 	if (s_tray_hwnd != NULL) {
 		ipc_server_stereo_camera_set_prompt_provider(tray_camera_prompt, NULL);
+		ipc_server_stereo_camera_set_share_prompt_provider(tray_share_prompt, NULL);
 		ipc_server_stereo_camera_set_indicator_provider(camera_indicator_changed, NULL);
 		ipc_server_stereo_camera_set_notice_provider(tray_camera_notice, NULL);
 	}

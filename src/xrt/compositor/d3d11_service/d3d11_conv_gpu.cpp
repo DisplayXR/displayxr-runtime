@@ -712,9 +712,7 @@ glue_release_all(d3d11_lift *l)
 	}
 	l->glue_rbs.clear();
 	for (auto &kv : l->core_weave) {
-		for (auto &r : kv.second.lb_rb) {
-			rel(r.staging);
-		}
+		core_weave_state_release(kv.second);
 	}
 	l->core_weave.clear();
 	d3d11_conv_viewsyn_destroy(&l->viewsyn);
@@ -1134,6 +1132,78 @@ glue_viewsyn_draw(d3d11_lift *l,
 	return true;
 }
 
+static uint32_t
+dxgi_texel_bytes(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_R32_FLOAT: return 4;
+	case DXGI_FORMAT_R8_UNORM: return 1;
+	case DXGI_FORMAT_R16_FLOAT:
+	case DXGI_FORMAT_R16_UNORM: return 2;
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+	default: return 0;
+	}
+}
+
+/*!
+ * S5 input that is CPU memory, uploaded into a one-shot texture (parity with
+ * the Vulkan glue, which stages CPU inputs into scratch). A CPU-input provider
+ * (Open Conversion) is handed the colour as CPU bytes, and that same image is
+ * what S5 synthesises from: without this, glue_find() fails, S5 returns false
+ * and every composed frame is dropped with nothing logged. Created with its
+ * data so no context is touched here; the caller releases it after the draw.
+ */
+static bool
+viewsyn_cpu_upload(d3d11_lift *l, const struct xrt_conv_image *img, glue_img *out)
+{
+	if (img->memory_kind != XRT_CONV_MEM_CPU || img->cpu_ptr == nullptr || img->width == 0 || img->height == 0) {
+		return false;
+	}
+	const DXGI_FORMAT f = conv_fmt_to_dxgi(img->format);
+	const uint32_t bpp = dxgi_texel_bytes(f);
+	if (bpp == 0) {
+		return false;
+	}
+	const uint64_t row = (uint64_t)img->width * bpp;
+	const uint64_t stride = img->row_stride != 0 ? img->row_stride : row;
+	if (stride < row || (img->byte_size != 0 && stride * (img->height - 1) + row > img->byte_size)) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = img->width;
+	td.Height = img->height;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = f;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA sd = {};
+	sd.pSysMem = img->cpu_ptr;
+	sd.SysMemPitch = (UINT)stride;
+	glue_img g;
+	if (FAILED(l->svc_device->CreateTexture2D(&td, &sd, &g.tex))) {
+		return false;
+	}
+	D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
+	vd.Format = typed_srv_format(f);
+	vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	vd.Texture2D.MipLevels = 1;
+	if (FAILED(l->svc_device->CreateShaderResourceView(g.tex, &vd, &g.srv))) {
+		glue_img_release(g);
+		return false;
+	}
+	g.w = img->width;
+	g.h = img->height;
+	g.dxgi = f;
+	*out = g;
+	return true;
+}
+
 //! S5: the reference view synthesis on the service device.
 static bool
 glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
@@ -1144,7 +1214,9 @@ glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
 		return false;
 	}
 	glue_img c, d, t;
-	bool ok = glue_find(l, req->color->import_key, &c) && glue_find(l, req->depth->import_key, &d) &&
+	bool c_tmp = false, d_tmp = false;
+	bool ok = (glue_find(l, req->color->import_key, &c) || (c_tmp = viewsyn_cpu_upload(l, req->color, &c))) &&
+	          (glue_find(l, req->depth->import_key, &d) || (d_tmp = viewsyn_cpu_upload(l, req->depth, &d))) &&
 	          glue_find(l, req->target->import_key, &t);
 	std::lock_guard<std::mutex> vg(l->viewsyn_mtx);
 	if (ok && l->viewsyn == nullptr && !l->viewsyn_tried) {
@@ -1197,6 +1269,12 @@ glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
 	}
 	if (held_c) {
 		img_release(c.km, req->color);
+	}
+	if (c_tmp) {
+		glue_img_release(c);
+	}
+	if (d_tmp) {
+		glue_img_release(d);
 	}
 	glue_leave(l);
 	return ok;
@@ -2079,9 +2157,7 @@ d3d11_lift_glue_stream_gone(struct d3d11_lift *l, uint64_t wire)
 		d3d11_conv_content_check_forget_stream(l->content_check, wire);
 		auto cw = l->core_weave.find(wire);
 		if (cw != l->core_weave.end()) {
-			for (auto &r : cw->second.lb_rb) {
-				rel(r.staging);
-			}
+			core_weave_state_release(cw->second);
 			l->core_weave.erase(cw);
 		}
 	}
@@ -2096,6 +2172,96 @@ d3d11_lift_glue_stream_gone(struct d3d11_lift *l, uint64_t wire)
  * the core's latest result as d3d11_lift_pin.
  *
  */
+
+/*!
+ * The weave snapshot into a CPU slot (a CPU-input provider, e.g. Open
+ * Conversion): drawn into a per-stream scratch target with the same blit as a
+ * GPU slot, then copied to staging and read back into the slot's bytes. The
+ * core sizes a slot by its provider's import kinds, so without this every
+ * submit to such a stream was refused (glue_find fails on a CPU key) and the
+ * browser's Convert to 3D stayed flat with nothing logged. The Map waits for
+ * the GPU: a cost paid only by CPU-input providers. Caller holds the service
+ * context mutex.
+ */
+static bool
+cpu_snapshot(d3d11_lift *l,
+             core_weave_state &ws,
+             ID3D11ShaderResourceView *src,
+             uint32_t src_tw,
+             uint32_t src_th,
+             uint32_t x,
+             uint32_t y,
+             uint32_t w,
+             uint32_t h,
+             uint32_t dw,
+             uint32_t dh,
+             const struct xrt_conv_image &dst)
+{
+	if (dst.memory_kind != XRT_CONV_MEM_CPU || dst.cpu_ptr == nullptr || dst.width < dw || dst.height < dh ||
+	    (dst.format != XRT_CONV_FMT_RGBA8_UNORM && dst.format != XRT_CONV_FMT_RGBA8_SRGB)) {
+		return false;
+	}
+	const uint64_t row = (uint64_t)dw * 4u;
+	const uint64_t stride = dst.row_stride != 0 ? dst.row_stride : (uint64_t)dst.width * 4u;
+	if (stride < row || (dst.byte_size != 0 && stride * (dh - 1) + row > dst.byte_size)) {
+		return false;
+	}
+	if (ws.cpu_rt == nullptr || ws.cpu_w != dw || ws.cpu_h != dh) {
+		rel(ws.cpu_rtv);
+		rel(ws.cpu_km);
+		rel(ws.cpu_rt);
+		rel(ws.cpu_staging);
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = dw;
+		td.Height = dh;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+		// snapshot_blit takes the target's keyed mutex, as on a glue slot.
+		td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+		D3D11_TEXTURE2D_DESC sd = td;
+		sd.Usage = D3D11_USAGE_STAGING;
+		sd.BindFlags = 0;
+		sd.MiscFlags = 0;
+		sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(l->svc_device->CreateTexture2D(&td, nullptr, &ws.cpu_rt)) ||
+		    FAILED(ws.cpu_rt->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&ws.cpu_km)) ||
+		    FAILED(l->svc_device->CreateRenderTargetView(ws.cpu_rt, nullptr, &ws.cpu_rtv)) ||
+		    FAILED(l->svc_device->CreateTexture2D(&sd, nullptr, &ws.cpu_staging))) {
+			rel(ws.cpu_rtv);
+			rel(ws.cpu_km);
+			rel(ws.cpu_rt);
+			rel(ws.cpu_staging);
+			return false;
+		}
+		ws.cpu_w = dw;
+		ws.cpu_h = dh;
+	}
+	blit_dst bd = {ws.cpu_km, ws.cpu_rtv};
+	if (!snapshot_blit(l, bd, src, src_tw, src_th, x, y, w, h, dw, dh)) {
+		return false;
+	}
+	const HRESULT hr = ws.cpu_km->AcquireSync(0, 4);
+	if (FAILED(hr) || hr == (HRESULT)WAIT_TIMEOUT) {
+		return false;
+	}
+	ID3D11DeviceContext *ctx = l->svc_context;
+	ctx->CopyResource(ws.cpu_staging, ws.cpu_rt);
+	ws.cpu_km->ReleaseSync(0);
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (FAILED(ctx->Map(ws.cpu_staging, 0, D3D11_MAP_READ, 0, &m))) {
+		return false;
+	}
+	for (uint32_t r = 0; r < dh; r++) {
+		memcpy((uint8_t *)dst.cpu_ptr + (size_t)r * stride, (const uint8_t *)m.pData + (size_t)r * m.RowPitch,
+		       (size_t)row);
+	}
+	ctx->Unmap(ws.cpu_staging, 0);
+	return true;
+}
 
 xrt_result_t
 core_weave_submit_locked(d3d11_lift *l,
@@ -2156,10 +2322,16 @@ core_weave_submit_locked(d3d11_lift *l,
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	glue_img gi;
-	bool ok = glue_find(l, slot.images[0].import_key, &gi) && gi.rtv != nullptr;
-	if (ok) {
-		blit_dst dst = {gi.km, gi.rtv};
-		ok = snapshot_blit(l, dst, src, src_tw, src_th, cx, cy, cw, ch, dw, dh);
+	bool ok;
+	if (glue_find(l, slot.images[0].import_key, &gi)) {
+		ok = gi.rtv != nullptr;
+		if (ok) {
+			blit_dst dst = {gi.km, gi.rtv};
+			ok = snapshot_blit(l, dst, src, src_tw, src_th, cx, cy, cw, ch, dw, dh);
+		}
+	} else {
+		// A CPU-input provider's slot is CPU memory: draw, then read back.
+		ok = cpu_snapshot(l, *ws, src, src_tw, src_th, cx, cy, cw, ch, dw, dh, slot.images[0]);
 	}
 	if (ok && letterbox) {
 		letterbox_step(l, *ws, src, x, y, w, h); // measures the WHOLE rect, bars included

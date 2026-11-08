@@ -296,6 +296,19 @@ override, checked **before** the plug-in value (dev boxes, sim_display):
 The same knob and plug-in plumbing apply to the macOS vk_native self-owned
 window (`comp_vk_native_window_macos.m`).
 
+**Hosted Windows apps under a translation layer — adopt-own-window mode (#2322).** A Windows
+OpenXR app run through a compatibility layer reaches the runtime as a hosted app: it has an HWND,
+not an X11 window, so it cannot use `XR_DXR_xlib_window_binding`. Rather than opening a second
+fullscreen top-level that fights the app's own window (the covered one starves under FIFO, and the
+app drops to background mode when the runtime window holds focus), the runtime finds the process's
+own largest viewable top-level (`_NET_WM_PID == getpid()`) and creates its hosted window as a
+**child** of it, with an empty input region (xcb-shape) so input falls through. The mode is
+automatic when the app's `VkInstance` has no `VK_KHR_xcb_surface` — the translation layer's host
+instance enables `VK_KHR_xlib_surface` only — and in that case the Vulkan native target also builds
+its surface with `vkCreateXlibSurfaceKHR` over the same window. `DXR_XCB_ADOPT_OWN_WINDOW=1` forces
+the mode, `=0` disables it. With no viewable window of its own, the process gets the usual
+runtime-owned top-level.
+
 ### Phase 2 — Service / IPC path
 
 **Phase 2a — build-green on Linux CI ✅ (done).** `displayxr-service` + the

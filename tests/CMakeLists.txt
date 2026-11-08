@@ -72,6 +72,7 @@ set(tests
     tests_aux_color_encoding
     tests_aux_grip_surface
     tests_aux_cursor_depth
+    tests_aux_stereo_comfort
     tests_aux_lift_cursor
     tests_aux_lift_autoconv
     tests_aux_rear_budget
@@ -129,6 +130,7 @@ set(tests
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
     tests_oxr_tracking_properties_rule
+    tests_oxr_hosted_raw_views_rule
     tests_oxr_input_providers_rule
     tests_xrt_active_mode_scale
     tests_input_arbiter_rig
@@ -146,6 +148,7 @@ set(tests
     tests_m_matrix_projection
     tests_stereo_camera
     tests_camera_consent
+    tests_share_link
     tests_stereo_rectify
     tests_stereo_vrefine
     tests_stereo_uvc
@@ -467,6 +470,11 @@ foreach(testname ${tests})
 endforeach()
 
 # For tests that require more than just aux_util, link those other libs down here.
+
+# ADR-061 arm 2: the compositor share tap's hook surface over util/u_share_link,
+# compiled straight in (portable C) so the test does not need the compositor module.
+target_sources(tests_share_link PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/xbridge/comp_xbridge_share_tap.c)
+target_include_directories(tests_share_link PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/xbridge)
 
 target_include_directories(tests_oxr_session_window_binding PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
 
@@ -1303,6 +1311,12 @@ target_link_libraries(tests_oxr_mode_fillable_rule PRIVATE xrt-interfaces)
 # it needs no xrt-interfaces either -- the include is the whole dependency.
 target_include_directories(
 	tests_oxr_tracking_properties_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+
+# #2322 — which hosted sessions DXR_HOSTED_RAW_VIEWS reaches: header-only and
+# bool-only like the rule above, so the include is the whole dependency.
+target_include_directories(
+	tests_oxr_hosted_raw_views_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 
 # ADR-034 Amendment 5 (#2181) — XR_DXR_input_providers event discipline: the

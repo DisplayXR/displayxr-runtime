@@ -96,7 +96,9 @@ classes actually diverge in what they get back (the contract is [ADR-024, Amendm
   says where that plane is in the locate space, which is how a RAW app composes anything else it
   located there (grips, hand joints) into its own view. A hosted session with the extension but no
   window binding keeps render-ready `XrView.pose` (the `T_base_head` chain) and reads the tracked
-  eyes from `XrViewDisplayRawDXR`, which is filled whenever eye positions exist.
+  eyes from `XrViewDisplayRawDXR`, which is filled whenever eye positions exist. A launcher can opt
+  such an in-process hosted session into RAW views with `DXR_HOSTED_RAW_VIEWS=1` (#2322; for a
+  display-aware app under a translation layer that cannot hand over its window).
 - **Reference spaces are not redefined per class.** `LOCAL` is Monado's root + (0, 1.6, 0) for
   everyone (what legacy VR titles expect: STAGE at the floor, the head standing at 1.6 m); the
   qwerty rig is seeded at the same height. A hosted legacy title therefore sees its eyes about

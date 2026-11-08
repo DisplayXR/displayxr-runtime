@@ -9,7 +9,7 @@
  * Edit the census and re-run the script; the lint workflow runs it with
  * --check, which also fails when a name here no longer occurs in src/xrt.
  *
- * 71 levers: 52 Tier 1 (next launch), 19 Tier 2 (service-scoped).
+ * 73 levers: 54 Tier 1 (next launch), 19 Tier 2 (service-scoped).
  *
  * This is a DESCRIPTION of the levers, not a way to set them: only the names
  * u_setting_is_managed() accepts resolve from the per-user / machine stores.
@@ -54,9 +54,10 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_DP_FORWARD_HORIZON", 1, "App", "on (kill switch)", "#206: per-weave FORWARD horizon for the vendor eye predictor, computed from the vsync-locked vblank grid (DXGI frame statistics - measured period, not nominal)."},
 	{"DXR_DP_FORWARD_HORIZON_LOOP", 1, "App", "on (kill switch)", "#1435: learns the pipeline's whole-period offset (composition frame on DComp chains, queued frame at governor depth >= 2) from realised flips - mode of the last 32 resolved weaves, >= 24 agreeing..."},
 	{"DXR_FILL_FENCE_PARK", 1, "App", "on (kill switch)", "#1264 S1: a fill's GPU fence wait releases the compositor lock (re-validated on retake; superseded fills are dropped)."},
-	{"DXR_HUB", 1, "App", "on on a cross-adapter box (=0 kills; =1 also engages on one adapter)", "#2317 step 2 (ADR-059 decision 4): the in-process D3D11 leg weaves and presents through the D3D11 hub (comp_hub_d3d11) for every session that passes its create-time checks on the cross-adapter..."},
+	{"DXR_HUB", 1, "App", "on (cross-adapter and single adapter; =0 kills)", "#2317 step 2 (ADR-059 decision 4): the in-process D3D11 leg weaves and presents through the D3D11 hub (comp_hub_d3d11) for every session that passes its create-time checks, on the cross-adapter..."},
 	{"DXR_L2D_CLIP", 1, "App", "on", "#862 clips the Local2D composite to non-identity pixels"},
 	{"DXR_LATE_WEAVE", 1, "App + Svc", "on", "Weave as late as possible before scanout."},
+	{"DXR_LATE_WEAVE_SCANOUT_WAIT", 1, "App", "auto: stage 2 on only for a chain DXGI reports scanning out directly (OVERLAY/independent flip, 30 consecutive frames), off while COMPOSED or unknown; 0 forces off, 1 forces on", "#2564: the stage-2 scanout wait cannot help a DWM-composed window (the present after scanout always misses DWM's vblank pickup) and was the source of depth-1 30 fps, governor churn and resize-drag..."},
 	{"DXR_LATE_WEAVE_SLIP_CAP", 1, "App + Svc", "on (0 = pre-2026-09 policy)", "Damps governor depth flapping: slip-rate escalation capped at needed_depth()+1, return probe needs 3 clean slip windows, slip re-escalation within two dwells of a probe doubles the dwell (30 -> 60..."},
 	{"DXR_LEGACY_CAMERA_RIG", 1, "App", "Per-executable JSON profile, otherwise qwerty defaults", "Inline camera-rig JSON or a UTF-8 file path; seeds instance-wide native legacy camera tuning and Space reset."},
 	{"DXR_LINUX_DIRECT_SCANOUT", 1, "App", "off", "Opt-in RandR direct-scanout present path on Linux"},
@@ -85,6 +86,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_WINDOW_FULLSCREEN", 1, "App", "on", "=0 opts out of EWMH fullscreen placement (Linux XCB)"},
 	{"DXR_WINDOW_POS", 1, "App", "plug-in reported", "\"x,y\" override for the self-owned window position (#715)"},
 	{"DXR_WL_MOVE_SYNC", 1, "App", "on whenever the window-geometry@displayxr.org extension supports it (version 9+, GNOME 45+)", "Move-synchronised re-weave: every commit carries a 1x1 subsurface tag of the position its frame was woven for, and the extension paints each frame of a compositor drag (title bar, Super+drag, the..."},
+	{"DXR_XCB_ADOPT_OWN_WINDOW", 1, "App", "auto (on when the app's VkInstance has no VK_KHR_xcb_surface)", "Hosted window becomes an input-transparent child of the process's own top-level X11 window instead of a second top-level: one presenting surface for a hosted Windows app under a translation layer..."},
 	{"DXR_APP_FRAME_DIVISOR", 2, "App", "off (1)", "#1257 slot partition: xrWaitFrame releases the app every Dth vblank (D=2..8) and the repaint loop fills the other slots at panel rate with a KNOWN N=D schedule - steady output cadence, no..."},
 	{"DXR_COMMIT_PACE", 2, "Svc", "on (1; 0/1/2)", "Commit backpressure. =0 lets a client run free; =2 is the legacy tick-align shape"},
 	{"DXR_DEVICE_REMOVED_EXIT_MS", 2, "Svc", "2000", "Delay before the service exits on an unrecoverable DEVICE_REMOVED"},
@@ -95,7 +97,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_FILL_SHED_FIRE_MS", 2, "App", "off (=<n> arms an n-ms threshold; 6 = measured onset gap)", "#1264 event-absorption shed: after a fill whose fire exceeded the threshold, fills are skipped for 2 panel periods then one probes - breaking the ~105 s event's phase-1 (GPU-slow) -> phase-2 (race..."},
 	{"DXR_HEALTH_MS", 2, "Svc", "10000", "#951 [HEALTH] telemetry cadence; 0 disables"},
 	{"DXR_IDLE_QUIESCE_MS", 2, "Svc", "5000", "#1319 grace after the last client leaves before the panel DP is released (freeing the vendor SR context and the tracking camera) and the render thread parks; 0 disables"},
-	{"DXR_LIFT_AUTO_CONVERGENCE", 2, "Svc", "runtime (module / off / 0 = the module's own)", "XR_DXR_lift (epic #1858): who picks the convergence of a lifted SBS / N-view stream whose app leaves it AUTO."},
+	{"DXR_LIFT_AUTO_CONVERGENCE", 2, "Svc", "runtime (module / off / 0 = the module's own)", "XR_DXR_lift (epic #1858): who picks the convergence of a lifted SBS / N-view stream whose app leaves it AUTO, on a provider that does not declare XRT_CONV_CAP_AUTO_CONVERGENCE."},
 	{"DXR_LIFT_LETTERBOX", 2, "Svc", "on (0 = off)", "XR_DXR_lift (ADR-042): crops a lift-flagged weave rect's snapshot to its ACTIVE area when it holds black letterbox/pillarbox bars (GPU row/column non-black profile, async readback, ~45-frame..."},
 	{"DXR_LIFT_MAX_INPUT_EDGE", 2, "Svc", "1920 (0 = off; 1-255 clamp to 256)", "XR_DXR_lift (ADR-042): caps the long edge of a lift-flagged weave rect's snapshot before the vendor module (aspect kept, dims even, box-filtered)."},
 	{"DXR_REARM_2D_GRACE_MS", 2, "Svc", "750", "#939 how long a REPLAYED hardware-2D wish is held back when a slot regains the panel, so a client that re-asks (the browser, ~300 ms after its tab is uncovered) wins and the SR lens does not..."},

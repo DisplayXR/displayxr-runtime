@@ -58,6 +58,7 @@
 
 #include "comp_split_gate.h"
 #include "comp_xbridge.h"
+#include "comp_xbridge_share_tap.h"
 #include "d3d11/comp_d3d11_outcomp.h"
 #include "d3d11/comp_d3d11_segments.h"
 #include "d3d11/comp_d3d11_target.h"
@@ -170,6 +171,8 @@ struct comp_hub_d3d11
 	bool stable_atlas;
 	//! #2317 P2a: @ref comp_hub_d3d11_info::ring_direct.
 	bool ring_direct;
+	//! #2518: @ref comp_hub_d3d11_info::ring_direct_default.
+	bool ring_direct_default;
 	//! #2317 P2c: @ref comp_hub_d3d11_info::ring_direct_planes.
 	bool ring_direct_planes;
 	//! #2317 P1c: @ref comp_hub_d3d11_set_predicted_display_time.
@@ -519,6 +522,15 @@ struct comp_hub_d3d11
 	//! #2340: the declared atlas encoding, re-sent to a swapped-in DP.
 	enum xrt_atlas_encoding atlas_encoding;
 	bool atlas_encoding_set;
+
+	/*!
+	 * ADR-061 arm 2: the in-process share tap, begun at the first submitted
+	 * atlas (the producer's device is only known there). @ref share_tap_begun
+	 * says begin ran; a NULL tap after that is "no tap".
+	 */
+	struct comp_xbridge_share_tap *share_tap;
+	bool share_tap_begun;
+	uint32_t share_tap_declined; //!< enum xrt_app_share_availability, set by the producer
 	/*! @} */
 
 	uint64_t composites, composite_bails;
@@ -1782,6 +1794,7 @@ split_stage_a_client(const struct comp_hub_d3d11_info *info,
 	s->same_adapter = true;
 	s->stable_atlas = info->stable_atlas;
 	s->ring_direct = info->ring_direct;
+	s->ring_direct_default = info->ring_direct_default;
 	s->ring_direct_planes = info->ring_direct_planes;
 	s->direct.cur = -1;
 
@@ -1966,6 +1979,7 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
 	s->same_adapter = gate.same_adapter;
 	s->stable_atlas = info->stable_atlas;
 	s->ring_direct = info->ring_direct;
+	s->ring_direct_default = info->ring_direct_default;
 	s->ring_direct_planes = info->ring_direct_planes;
 	s->direct.cur = -1;
 	wcsncpy_s(s->out_desc, sdesc.Description, _TRUNCATE);
@@ -2248,13 +2262,17 @@ comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11
 		s->ingress_reason = COMP_HUB_INGRESS_REASON_FORCED;
 	} else if (!s->stable_atlas && !s->ring_direct) {
 		s->ingress_reason = COMP_HUB_INGRESS_REASON_PRODUCER;
-	} else if (!s->stable_atlas && !split_direct_forced_on()) {
+	} else if (!s->stable_atlas && !s->ring_direct_default && !split_direct_forced_on()) {
 		/*
-		 * #2317: DIRECT is OPT-IN for the ring producers (the D3D12 reroute,
-		 * the VK split) until a single-dGPU desktop has run VK fence-mode
-		 * DIRECT and Unreal; the default flip is a one-line follow-up here.
-		 * The D3D11 shim's stable atlas keeps DIRECT: DXR_HUB=1 is itself the
-		 * opt-in, and that path is measured.
+		 * #2317: DIRECT is OPT-IN for a ring producer that does not declare
+		 * ring_direct_default. Both ring producers declare it now: the VK
+		 * split since a single-dGPU desktop ran VK fence-mode DIRECT (RTX
+		 * 3080, 8K; see comp_vk_native_compositor.c), the D3D12 reroute since #2518:
+		 * Unreal on a same-adapter hybrid laptop paid the staged ring's
+		 * app-queue copy on every frame (the #2362 drain blocked ~96 % of
+		 * frames and the weave picked the previous slot ~99 %), and DIRECT
+		 * removed both. The D3D11 shim's stable atlas keeps DIRECT: DXR_HUB=1
+		 * is itself the opt-in, and that path is measured.
 		 */
 		s->ingress_reason = COMP_HUB_INGRESS_REASON_DEFAULT_XBRIDGE;
 	} else if (split_wire_direct(s, handoff)) {
@@ -2294,6 +2312,7 @@ comp_hub_d3d11_destroy(struct comp_hub_d3d11 **split_ptr)
 	    (unsigned long long)s->seq, (unsigned long long)s->no_slot, (unsigned long long)s->stale_refusals,
 	    (unsigned long long)s->inflight_weaves, (unsigned long long)s->out_crop, (unsigned long long)s->composites,
 	    (unsigned long long)s->composite_bails);
+	xbridge_share_tap_end(&s->share_tap);
 	split_overhang_end(s, "the session ends");
 	if (s->clip_episodes > 0) {
 		U_LOG_W("D3D11 hub: %llu frames clipped to the panel over %llu overhang episodes (#1575)",
@@ -3465,6 +3484,42 @@ comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *s,
 	const uint32_t content_h = rows * view_h;
 	if (content_w == 0 || content_h == 0) {
 		return;
+	}
+
+	// ADR-061 arm 2: this atlas is the one the DP will weave. Copied on the
+	// producer's device, the one that can be on the service's adapter; the copy
+	// is cropped by construction (tiles packed at the view size).
+	if (!s->share_tap_begun) {
+		s->share_tap_begun = true;
+		struct comp_xbridge_share_tap_info ti = {};
+		ti.device = handoff->d3d11_device;
+		ti.context = handoff->d3d11_context;
+		ti.unavailable_reason = s->share_tap_declined;
+		xbridge_share_tap_begin(&ti, &s->share_tap);
+	}
+	if (s->share_tap != nullptr) {
+		struct comp_xbridge_share_tap_frame tf = {};
+		tf.atlas = handoff->texture;
+		tf.atlas_width = handoff->width;
+		tf.atlas_height = handoff->height;
+		tf.format = handoff->dxgi_format;
+		tf.tile_columns = cols;
+		tf.tile_rows = rows;
+		tf.view_count = cols * rows;
+		tf.active_view_count = cols * rows;
+		tf.content_width = view_w;
+		tf.content_height = view_h;
+		tf.tile_stride_x = view_w;
+		tf.tile_stride_y = view_h;
+		tf.encoding_is_linear = s->atlas_encoding_set && s->atlas_encoding == XRT_ATLAS_ENCODING_LINEAR;
+		tf.commit_ns = (int64_t)os_monotonic_get_ns();
+		// A stable atlas was written on this very context, in order.
+		if (!s->stable_atlas) {
+			tf.wait_fence = handoff->fence;
+			tf.wait_fence_value = handoff->fence_value;
+			tf.keyed_mutex = handoff->keyed_mutex;
+		}
+		xbridge_share_tap_commit(s->share_tap, &tf);
 	}
 
 	/*
@@ -5650,9 +5705,10 @@ comp_hub_d3d11_render_diag(struct comp_hub_d3d11 *s)
 	                                                                 : "none";
 
 	U_LOG_W(
-	    "[RENDER] split=1 xb_kb=%llu xb_degraded=%d no_slot=%llu out_crop=%llu ingress=%s "
+	    "[RENDER] split=1 xb_kb=%llu xb_degraded=%d xb_same_adapter=%d no_slot=%llu out_crop=%llu ingress=%s "
 	    "ing_direct=%llu ing_staged=%llu ing_rebind=%llu ing_churn=%llu ing_leak=%llu window_s=10",
 	    (unsigned long long)(xb_bytes / 1024u), (int)comp_xbridge_is_degraded(s->xbridge),
+	    (int)comp_xbridge_is_same_adapter(s->xbridge),
 	    (unsigned long long)s->no_slot, (unsigned long long)s->out_crop, ing_name, (unsigned long long)ing.direct,
 	    (unsigned long long)ing.staged, (unsigned long long)ing.rebind, (unsigned long long)ing.churn,
 	    (unsigned long long)ing.leak);
@@ -5815,6 +5871,14 @@ comp_hub_d3d11_accepts_atlas_encoding(struct comp_hub_d3d11 *s, enum xrt_atlas_e
 }
 
 extern "C" void
+comp_hub_d3d11_decline_share_tap(struct comp_hub_d3d11 *s, uint32_t reason)
+{
+	if (s != nullptr) {
+		s->share_tap_declined = reason;
+	}
+}
+
+extern "C" void
 comp_hub_d3d11_set_atlas_encoding(struct comp_hub_d3d11 *s, enum xrt_atlas_encoding encoding)
 {
 	if (s == nullptr) {
@@ -5845,6 +5909,13 @@ comp_hub_d3d11_get_background_preview(struct comp_hub_d3d11 *s, struct xrt_dp_ba
 }
 
 #else /* !(XRT_OS_WINDOWS && XRT_HAVE_D3D11) */
+
+extern "C" void
+comp_hub_d3d11_decline_share_tap(struct comp_hub_d3d11 *split, uint32_t reason)
+{
+	(void)split;
+	(void)reason;
+}
 
 extern "C" xrt_result_t
 comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,

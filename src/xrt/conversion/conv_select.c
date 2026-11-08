@@ -167,8 +167,11 @@ filter_row(const struct conv_select_row *r, const struct conv_select_request *re
 	if (r->hidden) {
 		return CONV_ROW_DROP_HIDDEN;
 	}
-	if ((r->provider_flags & CONV_PROV_LICENCE_EXEMPT) == 0 && licence_needs_opt_in(r->licence_class) &&
-	    !pol->allow_research_only) {
+	// Exempt: the grandfathered legacy adapter, or a capability whose model
+	// the user installed separately under its own licence.
+	const bool exempt = (r->provider_flags & CONV_PROV_LICENCE_EXEMPT) != 0 ||
+	                    (r->flags & XRT_CONV_CAP_LICENSED_LOCAL_INSTALL) != 0;
+	if (!exempt && licence_needs_opt_in(r->licence_class) && !pol->allow_research_only) {
 		return CONV_ROW_DROP_LICENCE;
 	}
 	if (req->input_kind != 0 && (r->input_kinds & req->input_kind) == 0) {

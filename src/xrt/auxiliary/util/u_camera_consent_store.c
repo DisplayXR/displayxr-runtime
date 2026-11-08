@@ -18,6 +18,9 @@
  *                              Never itself an entry, whatever its data.
  *     OffBox\      REG_DWORD   value NAME = conversion provider id, 1 = the user granted it
  *                              consent to send pictures off this machine (ADR-057 §2)
+ *     Share\       REG_SZ      `prompt` = always | per-app-run, `resolution` = 720p | 1080p —
+ *                              the app-share settings (ADR-061 decision 10). Never a decision:
+ *                              no app is ever pre-allowed to be shared.
  *   HKLM\Software\DisplayXR\CameraConsent\Delegating   same shape, written by installers
  *   The OS camera privacy switch is read from CapabilityAccessManager\ConsentStore\webcam
  *   (HKLM global policy, HKCU global, NonPackaged = desktop apps, and the per-app entry
@@ -26,7 +29,8 @@
  * POSIX — JSON, mode 0600, in the user config dir ($XDG_CONFIG_HOME/displayxr or
  * ~/.config/monado, like every other runtime file): camera_consent.json
  *   {"sharing": true, "secret": "<64 hex>", "apps": {"<exe>": "allow"|"deny"},
- *    "delegating": ["<exe>", ...], "offbox": {"<provider id>": "granted"}}
+ *    "delegating": ["<exe>", ...], "offbox": {"<provider id>": "granted"},
+ *    "share": {"prompt": "always"|"per-app-run", "resolution": "720p"|"1080p"}}
  * plus the system delegating list an installer may write:
  *   Linux  /etc/displayxr/camera-delegating.json
  *   macOS  /Library/Application Support/DisplayXR/camera-delegating.json
@@ -561,6 +565,59 @@ u_offbox_consent_list(void (*cb)(void *ctx, const char *provider_id), void *ctx)
 		}
 	}
 	RegCloseKey(k);
+}
+
+#define SHARE_KEY CONSENT_KEY L"\\Share"
+
+static void
+share_settings_apply(struct u_app_share_settings *out, const char *prompt, const char *resolution)
+{
+	(void)u_app_share_prompt_mode_parse(prompt, &out->prompt);
+	(void)u_app_share_resolution_parse(resolution, &out->resolution);
+}
+
+void
+u_app_share_settings_load(struct u_app_share_settings *out)
+{
+	out->prompt = U_APP_SHARE_PROMPT_ALWAYS;
+	out->resolution = U_APP_SHARE_RESOLUTION_720P;
+	wchar_t wp[32] = {0}, wr[32] = {0};
+	char p8[32] = {0}, r8[32] = {0};
+	if (reg_read_string_w(HKEY_CURRENT_USER, SHARE_KEY, L"prompt", wp, 32)) {
+		w_to_u8(wp, (int)wcslen(wp), p8, sizeof(p8));
+	}
+	if (reg_read_string_w(HKEY_CURRENT_USER, SHARE_KEY, L"resolution", wr, 32)) {
+		w_to_u8(wr, (int)wcslen(wr), r8, sizeof(r8));
+	}
+	share_settings_apply(out, p8, r8);
+}
+
+bool
+u_app_share_settings_set(const char *key, const char *value)
+{
+	struct u_app_share_settings probe;
+	const wchar_t *name = NULL;
+	if (key != NULL && strcmp(key, "prompt") == 0 && u_app_share_prompt_mode_parse(value, &probe.prompt)) {
+		name = L"prompt";
+	} else if (key != NULL && strcmp(key, "resolution") == 0 &&
+	           u_app_share_resolution_parse(value, &probe.resolution)) {
+		name = L"resolution";
+	} else {
+		return false;
+	}
+	wchar_t *w = u8_to_w(value);
+	if (w == NULL) {
+		return false;
+	}
+	HKEY k;
+	bool ok = false;
+	if (RegCreateKeyExW(HKEY_CURRENT_USER, SHARE_KEY, 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) == ERROR_SUCCESS) {
+		ok = RegSetValueExW(k, name, 0, REG_SZ, (const BYTE *)w, (DWORD)((wcslen(w) + 1) * sizeof(wchar_t))) ==
+		     ERROR_SUCCESS;
+		RegCloseKey(k);
+	}
+	free(w);
+	return ok;
 }
 
 //! Set (non-empty @p signer_u8) or delete the "<id>.signer" companion of entry @p id (open key @p k).
@@ -1223,6 +1280,52 @@ u_offbox_consent_list(void (*cb)(void *ctx, const char *provider_id), void *ctx)
 		}
 	}
 	cJSON_Delete(root);
+}
+
+void
+u_app_share_settings_load(struct u_app_share_settings *out)
+{
+	out->prompt = U_APP_SHARE_PROMPT_ALWAYS;
+	out->resolution = U_APP_SHARE_RESOLUTION_720P;
+	cJSON *root = load_user(false);
+	if (root == NULL) {
+		return;
+	}
+	const cJSON *share = cJSON_GetObjectItem(root, "share");
+	const cJSON *p = cJSON_GetObjectItemCaseSensitive(share, "prompt");
+	const cJSON *r = cJSON_GetObjectItemCaseSensitive(share, "resolution");
+	if (cJSON_IsString(p)) {
+		(void)u_app_share_prompt_mode_parse(p->valuestring, &out->prompt);
+	}
+	if (cJSON_IsString(r)) {
+		(void)u_app_share_resolution_parse(r->valuestring, &out->resolution);
+	}
+	cJSON_Delete(root);
+}
+
+bool
+u_app_share_settings_set(const char *key, const char *value)
+{
+	struct u_app_share_settings probe;
+	if (key == NULL ||
+	    !((strcmp(key, "prompt") == 0 && u_app_share_prompt_mode_parse(value, &probe.prompt)) ||
+	      (strcmp(key, "resolution") == 0 && u_app_share_resolution_parse(value, &probe.resolution)))) {
+		return false;
+	}
+	cJSON *root = load_user(true);
+	if (root == NULL) {
+		return false;
+	}
+	cJSON *obj = cJSON_GetObjectItem(root, "share");
+	if (obj == NULL || !cJSON_IsObject(obj)) {
+		cJSON_DeleteItemFromObject(root, "share");
+		obj = cJSON_AddObjectToObject(root, "share");
+	}
+	cJSON_DeleteItemFromObjectCaseSensitive(obj, key);
+	cJSON_AddStringToObject(obj, key, value);
+	const bool ok = save_user(root);
+	cJSON_Delete(root);
+	return ok;
 }
 
 bool

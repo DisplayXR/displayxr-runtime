@@ -195,7 +195,7 @@ static_assert(XR_TYPE_SESSION_DISPLAY_BINDING_DXR == (XrStructureType)1004999216
 static_assert(XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR == (XrStructureType)1004999217, "XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR renumbered");
 static_assert(XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR == (XrStructureType)1004999218, "XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR renumbered");
 static_assert(XR_TYPE_DISPLAY_STABLE_KEY_DXR == (XrStructureType)1004999219, "XR_TYPE_DISPLAY_STABLE_KEY_DXR renumbered");
-static_assert(XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR == (XrStructureType)1004999430, "XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR renumbered");
+static_assert(XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR == (XrStructureType)1004999450, "XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR renumbered");
 #if UINTPTR_MAX == UINT64_MAX
 static_assert(sizeof(XrDisplayInfoDXR) == 56, "XrDisplayInfoDXR size changed");
 static_assert(offsetof(XrDisplayInfoDXR, type) == 0, "XrDisplayInfoDXR::type moved");

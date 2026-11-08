@@ -73,6 +73,8 @@
 #endif
 
 #include "oxr_objects.h"
+#include "oxr_hosted_raw_views_rule.h"
+#include "oxr_service_link.h"
 #include "oxr_session_window_binding.h"
 #include "oxr_workspace_window_linux.h"
 #include "oxr_mcp_tools.h"
@@ -238,6 +240,12 @@ DEBUG_GET_ONCE_NUM_OPTION(wait_frame_sleep, "OXR_DEBUG_WAIT_FRAME_EXTRA_SLEEP_MS
 DEBUG_GET_ONCE_BOOL_OPTION(frame_timing_spew, "OXR_FRAME_TIMING_SPEW", false)
 // Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h). Kill switch.
 DEBUG_GET_ONCE_BOOL_OPTION(mono_auto_2d, "DXR_MONO_AUTO_2D", true)
+// #2322: a hosted session of an XR_DXR_display_info app takes the RAW view
+// contract (oxr_session_views_display_relative). Opt-in; see the census.
+DEBUG_GET_ONCE_BOOL_OPTION(hosted_raw_views, "DXR_HOSTED_RAW_VIEWS", false)
+DEBUG_GET_ONCE_BOOL_OPTION(cursor_measure, "DXR_CURSOR_MEASURE", true)
+DEBUG_GET_ONCE_OPTION(comfort_zone, "DXR_COMFORT_ZONE", NULL)
+DEBUG_GET_ONCE_FLOAT_OPTION(comfort_depth_scale, "DXR_COMFORT_DEPTH_SCALE", 1.0f)
 DEBUG_GET_ONCE_BOOL_OPTION(hand_tracking_prioritize_conforming, "OXR_HAND_TRACKING_PRIORITIZE_CONFORMING", false)
 
 /*
@@ -1630,6 +1638,10 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 	oxr_android_window_hint_reemit(log, sess);
 #endif
 
+	// ADR-061 arm 2: an in-process session offers itself for sharing over its
+	// service link (background connect; no-op for IPC sessions / sharing off).
+	oxr_service_link_session_begin(sess);
+
 	return oxr_session_success_result(sess);
 }
 
@@ -1745,6 +1757,9 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess)
 		return oxr_error(log, ret, "Frame sync object refused to let us end session, probably not running");
 	}
 	sess->has_ended_once = false;
+
+	// ADR-061 arm 2: no longer listed as a share source (the link stays for lift).
+	oxr_service_link_session_end(sess);
 
 	return oxr_session_success_result(sess);
 }
@@ -2204,6 +2219,78 @@ adjust_fov(const struct xrt_fov *original_fov, const struct xrt_quat *original_r
 	    .angle_down = original_fov->angle_down + euler_angles.x,
 	};
 }
+
+#ifdef OXR_HAVE_DXR_stereo_comfort
+/*
+ * XR_DXR_stereo_comfort - the comfort zone for the current viewer.
+ *
+ * V: the tracked eyes' mean distance from the display plane (the app's raw
+ * block when it chains one and it is tracking - that covers IPC - else the
+ * in-process cache), else the nominal viewer. Zone: the app's request, else
+ * DXR_COMFORT_ZONE (shibata | percival | <diopters>), else Shibata, the web
+ * SDK's default. DXR_COMFORT_DEPTH_SCALE (0, 1] is the user's preference.
+ */
+static void
+oxr_session_fill_stereo_comfort(struct oxr_session *sess,
+                                const XrViewLocateInfo *info,
+                                const void *view_raw_ptr,
+                                XrStereoComfortDXR *out)
+{
+	enum u_stereo_comfort_zone zone = U_STEREO_COMFORT_ZONE_SHIBATA;
+	float custom = 0.0f;
+	(void)u_stereo_comfort_parse_zone(debug_get_option_comfort_zone(), &zone, &custom);
+
+	const XrStereoComfortRequestDXR *req =
+	    OXR_GET_INPUT_FROM_CHAIN(info, XR_TYPE_STEREO_COMFORT_REQUEST_DXR, XrStereoComfortRequestDXR);
+	if (req != NULL) {
+		if (req->zone == XR_STEREO_COMFORT_ZONE_SHIBATA_DXR) {
+			zone = U_STEREO_COMFORT_ZONE_SHIBATA;
+		} else if (req->zone == XR_STEREO_COMFORT_ZONE_PERCIVAL_DXR) {
+			zone = U_STEREO_COMFORT_ZONE_PERCIVAL;
+		} else if (req->zone == XR_STEREO_COMFORT_ZONE_CUSTOM_DXR && req->customDiopters > 0.0f) {
+			zone = U_STEREO_COMFORT_ZONE_CUSTOM;
+			custom = req->customDiopters;
+		}
+	}
+
+	float viewer = 0.0f;
+	bool tracked = false;
+#ifdef OXR_HAVE_DXR_view_rig
+	const XrViewDisplayRawDXR *raw = (const XrViewDisplayRawDXR *)view_raw_ptr;
+	if (raw != NULL && raw->isTracking && raw->eyeCountOutput > 0) {
+		float zsum = 0.0f;
+		for (uint32_t i = 0; i < raw->eyeCountOutput; i++) {
+			zsum += raw->rawEyes[i].z;
+		}
+		viewer = zsum / (float)raw->eyeCountOutput;
+		tracked = viewer > 0.0f;
+	}
+#else
+	(void)view_raw_ptr;
+#endif
+	if (!tracked && sess->comfort_eye_tracked && sess->comfort_eye_z_m > 0.0f) {
+		viewer = sess->comfort_eye_z_m;
+		tracked = true;
+	}
+	if (!tracked) {
+		oxr_session_get_nominal_viewer(sess, NULL, &viewer);
+	}
+
+	struct u_stereo_comfort c;
+	u_stereo_comfort_compute(zone, custom, viewer, debug_get_float_option_comfort_depth_scale(), &c);
+
+	out->zone = c.zone == U_STEREO_COMFORT_ZONE_PERCIVAL ? XR_STEREO_COMFORT_ZONE_PERCIVAL_DXR
+	            : c.zone == U_STEREO_COMFORT_ZONE_CUSTOM ? XR_STEREO_COMFORT_ZONE_CUSTOM_DXR
+	                                                     : XR_STEREO_COMFORT_ZONE_SHIBATA_DXR;
+	out->viewerDistanceMeters = c.viewer_m;
+	out->viewerTracked = tracked ? XR_TRUE : XR_FALSE;
+	out->frontDiopters = c.front_diopters;
+	out->behindDiopters = c.behind_diopters;
+	out->frontDisparityMeters = c.front_disparity_m;
+	out->behindDisparityMeters = c.behind_disparity_m;
+	out->userDepthScale = c.user_scale;
+}
+#endif
 
 #ifdef OXR_HAVE_DXR_depth_budget
 /*
@@ -2883,6 +2970,10 @@ oxr_session_cursor_depth_measured(struct oxr_session *sess,
                                   uint32_t active_view_count,
                                   float *out_disparity)
 {
+	// Kill switch: decline as "no content", which the spec allows and leaves the OS cursor.
+	if (!debug_get_bool_option_cursor_measure()) {
+		return false;
+	}
 	if (!sess->cursor_measure.announced) {
 		sess->cursor_measure.announced = true;
 		U_LOG_W(
@@ -4015,7 +4106,7 @@ locate_views_one(struct oxr_logger *log,
 	bool qwerty_display = false;
 	if (rig_camera || rig_display) {
 		active_rig = &sess->view_rig;
-	} else if (have_view_state && !sess->has_external_window) {
+	} else if (have_view_state && !sess->has_external_window && !sess->hosted_raw_views) {
 		qwerty_rig = (struct oxr_view_rig_state){
 		    .type = view_state.camera_mode ? OXR_VIEW_RIG_CAMERA : OXR_VIEW_RIG_DISPLAY,
 		    .ipd_factor = view_state.ipd_factor,
@@ -4233,7 +4324,7 @@ locate_views_one(struct oxr_logger *log,
 		// identity pose so the app can still render - it does its own Kooima
 		// projection via its HWND / forwards raw display-local eyes to a
 		// browser app.
-		if (T_base_xdev.relation_flags == 0 && (sess->has_external_window || sess->is_bridge_relay)) {
+		if (T_base_xdev.relation_flags == 0 && oxr_session_views_display_relative(sess)) {
 			T_base_xdev.pose = (struct xrt_pose)XRT_POSE_IDENTITY;
 			T_base_xdev.relation_flags = (enum xrt_space_relation_flags)(
 			    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
@@ -4263,7 +4354,7 @@ locate_views_one(struct oxr_logger *log,
 	// Bridge-relay sessions (headless, XR_DXR_display_info) forward raw
 	// DP-tracked eye positions to a browser app; treat them like handle
 	// apps (display-local views) and keep the display plane at the origin.
-	if (!sess->has_external_window && !sess->is_bridge_relay) {
+	if (!oxr_session_views_display_relative(sess)) {
 		struct xrt_space_relation display_relation = XRT_SPACE_RELATION_ZERO;
 		xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &display_relation);
 		world_head_pos = display_relation.pose.position;
@@ -4408,6 +4499,20 @@ locate_views_one(struct oxr_logger *log,
 		// synthesizes eyes; multi-view fill is the DP's responsibility.
 		// Captured before the legacy-2D center override below (a render-side
 		// concept, not a raw input).
+#ifdef OXR_HAVE_DXR_stereo_comfort
+		// XR_DXR_stereo_comfort: remember the tracked viewer distance even when
+		// the app chains no raw block (eyes are display-space, +z toward the viewer).
+		if (have_eye_positions && have_eyes && eye_pos.is_tracking && eye_count > 0) {
+			float zsum = 0.0f;
+			for (uint32_t ei = 0; ei < eye_count; ei++) {
+				zsum += adj_eyes[ei].z;
+			}
+			sess->comfort_eye_z_m = zsum / (float)eye_count;
+			sess->comfort_eye_tracked = true;
+		} else {
+			sess->comfort_eye_tracked = false;
+		}
+#endif
 		if (view_raw != NULL && have_eye_positions) {
 			uint32_t raw_count = eye_count;
 			if (raw_count > XR_VIEW_RIG_MAX_RAW_EYES_DXR) {
@@ -4678,7 +4783,7 @@ locate_views_one(struct oxr_logger *log,
 			// verbatim whatever the locate space (displayPlanePose says where
 			// that plane is in the locate space). FOVs come from the device.
 			// Skip in IPC/workspace mode: the server provides them in view poses.
-			if ((sess->has_external_window || sess->is_bridge_relay) && !have_eye_override && have_eyes) {
+			if (oxr_session_views_display_relative(sess) && !have_eye_override && have_eyes) {
 				for (uint32_t ei = 0; ei < eye_count; ei++) {
 					view_eye_world[ei] = (struct xrt_vec3){
 					    adj_eyes[ei].x, adj_eyes[ei].y, adj_eyes[ei].z};
@@ -4686,7 +4791,6 @@ locate_views_one(struct oxr_logger *log,
 				have_eye_override = true;
 				raw_eye_override = true;
 			}
-
 		}
 	}
 
@@ -4951,6 +5055,22 @@ locate_views_one(struct oxr_logger *log,
 	}
 #endif
 
+#ifdef OXR_HAVE_DXR_stereo_comfort
+	// XR_DXR_stereo_comfort: after every eye writer (in-process above, the
+	// service's raw reply on IPC), so the raw block is final here.
+	if (sess->sys->inst->extensions.DXR_stereo_comfort) {
+		XrStereoComfortDXR *comfort =
+		    OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_STEREO_COMFORT_DXR, XrStereoComfortDXR);
+		if (comfort != NULL) {
+#ifdef OXR_HAVE_DXR_view_rig
+			oxr_session_fill_stereo_comfort(sess, viewLocateInfo, view_raw, comfort);
+#else
+			oxr_session_fill_stereo_comfort(sess, viewLocateInfo, NULL, comfort);
+#endif
+		}
+	}
+#endif
+
 #ifdef OXR_HAVE_DXR_depth_budget
 	// XR_DXR_depth_budget: one event per locate, now that every writer (the
 	// client-side pre-fill above and, on IPC, the service's reply) is done.
@@ -5070,7 +5190,7 @@ locate_views_one(struct oxr_logger *log,
 		// T_xdev_head-only chain / the non-Windows service-mode skip): it
 		// re-added the standing height for one class of in-tree test cube, and
 		// those cubes now simply locate in STAGE.
-		const bool server_display_relative = sess->has_external_window || sess->is_bridge_relay;
+		const bool server_display_relative = oxr_session_views_display_relative(sess);
 		if (server_display_relative && !have_eyes && !have_eye_override) {
 			// Use server poses directly (display-plane-relative)
 			result.pose = view_pose;
@@ -5158,7 +5278,7 @@ locate_views_one(struct oxr_logger *log,
 					tracked_eye = (struct xrt_vec3){0, 0, 0.5f};
 				}
 
-				if (!sess->has_external_window && !sess->is_bridge_relay) {
+				if (!oxr_session_views_display_relative(sess)) {
 					// DISPLAY MODE (runtime window): compose the tracked eye
 					// on the display-plane pose (tracking-origin space).
 					struct xrt_vec3 rotated_eye;
@@ -6508,9 +6628,12 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	// MCP tool handler stops reading.
 	oxr_mcp_tools_detach_session(sess);
 
+	// ADR-061 arm 2: the compositor's share tap must not reach the link past here.
+	oxr_service_link_session_fini(sess);
+
 #ifdef OXR_HAVE_DXR_lift
 	// ADR-049: the lift streams (children) are already destroyed; close the
-	// in-process session's lift-only service connection behind them.
+	// in-process session's service link behind them.
 	oxr_lift_session_fini(sess);
 #endif
 
@@ -7712,9 +7835,10 @@ seed_legacy_camera_profile(struct oxr_session *sess, bool profile_external_bindi
 	if (applied) {
 		U_LOG_W(
 		    "Legacy camera profile: ipd=%.6g parallax=%.6g convergenceDiopters=%.6g verticalFov=%.6g "
-		    "metersToVirtual=%.6g",
+		    "metersToVirtual=%.6g pitchDegrees=%.6g pullbackMeters=%.6g",
 		    profile.ipd_factor, profile.parallax_factor, profile.inv_convergence_distance,
-		    2.0f * atanf(profile.half_tan_vfov), profile.m2v);
+		    2.0f * atanf(profile.half_tan_vfov), profile.m2v, profile.pitch_rad * (180.0f / 3.14159265f),
+		    profile.pullback_m);
 	}
 }
 #endif
@@ -7890,6 +8014,20 @@ oxr_session_create(struct oxr_logger *log,
 	xsi.rear_depth_budget_requested = sys->inst->extensions.DXR_depth_budget;
 #endif
 
+#ifdef OXR_HAVE_DXR_app_share
+	// XR_DXR_app_share spec §5: the app's own opt-out from every share. It
+	// travels on the session's IPC connection, or in the registration of an
+	// in-process session's service link (ADR-061 arm 2).
+	if (sys->inst->extensions.DXR_app_share) {
+		const XrSessionShareabilityDXR *sh =
+		    OXR_GET_INPUT_FROM_CHAIN(createInfo, XR_TYPE_SESSION_SHAREABILITY_DXR, XrSessionShareabilityDXR);
+		if (sh != NULL && sh->shareable == XR_FALSE) {
+			xsi.app_share_not_shareable = true;
+			U_LOG_W("XR_DXR_app_share: this session opted out of app share (XrSessionShareabilityDXR)");
+		}
+	}
+#endif
+
 	U_LOG_W("xsi after parsing: external_window=%p, readback=%p, shared_tex=%p",
 	        xsi.external_window_handle, (void *)xsi.readback_callback, xsi.shared_texture_handle);
 
@@ -8059,6 +8197,9 @@ oxr_session_create(struct oxr_logger *log,
 #else
 	const bool desktop_linux = false;
 #endif
+	// ADR-061 spec §5: an in-process session sends the opt-out on its service link.
+	sess->app_share_opt_out = xsi.app_share_not_shareable;
+
 	sess->has_external_window =
 	    oxr_session_has_external_window_binding(desktop_linux, sess->has_external_window, &xsi);
 
@@ -8097,6 +8238,32 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 	sess->is_bridge_relay = xsi.is_bridge_relay;
+
+#ifdef OXR_HAVE_DXR_display_info
+	// #2322: the raw view contract for a hosted session, by explicit opt-in.
+	// Only an in-process hosted session of a display-aware app qualifies: a
+	// legacy app has no use for display-relative eyes, and over IPC the
+	// server's per-view poses for a hosted client are head-local, not
+	// plane-relative (the client cannot pass them through).
+	{
+		const bool service_mode = sys->xsysc != NULL && sys->xsysc->info.is_service_mode;
+		if (oxr_hosted_raw_views_eligible(debug_get_bool_option_hosted_raw_views(), sess->has_external_window,
+		                                  sess->is_bridge_relay, service_mode,
+		                                  sys->inst->extensions.DXR_display_info)) {
+			sess->hosted_raw_views = true;
+			U_LOG_W(
+			    "DXR_HOSTED_RAW_VIEWS: this hosted session takes the RAW view contract - XrView.pose is "
+			    "the display processor's eyes relative to the display plane, identity orientation "
+			    "(ADR-024 Amendment 1, #2322)");
+		} else if (debug_get_bool_option_hosted_raw_views() && !sess->has_external_window) {
+			U_LOG_W(
+			    "DXR_HOSTED_RAW_VIEWS is set but ignored for this session (display_info=%d, "
+			    "service_mode=%d, bridge_relay=%d): only an in-process hosted session of an "
+			    "XR_DXR_display_info app takes it",
+			    (int)sys->inst->extensions.DXR_display_info, (int)service_mode, (int)sess->is_bridge_relay);
+		}
+	}
+#endif
 
 #ifdef OXR_HAVE_DXR_display_info
 	if (bound_display_id != 0) {
@@ -8434,7 +8601,7 @@ hand_joints_resolve_rig(struct oxr_logger *log,
 			}
 		}
 		oxr_session_get_nominal_viewer(sess, &out_canvas->nominal_y_m, &out_canvas->nominal_z_m);
-		if (!sess->has_external_window && !sess->is_bridge_relay) {
+		if (!oxr_session_views_display_relative(sess)) {
 			struct xrt_space_relation dr = XRT_SPACE_RELATION_ZERO;
 			const int64_t t_ns = time_state_ts_to_monotonic_ns(sess->sys->inst->timekeeping, at_time);
 			xrt_device_get_tracked_pose(head, XRT_INPUT_GENERIC_HEAD_POSE, t_ns, &dr);
@@ -8454,7 +8621,7 @@ hand_joints_resolve_rig(struct oxr_logger *log,
 	const enum xrt_space_relation_flags valid =
 	    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
 	if ((T_base_origin.relation_flags & valid) != valid) {
-		if (!(sess->has_external_window || sess->is_bridge_relay)) {
+		if (!oxr_session_views_display_relative(sess)) {
 			return false;
 		}
 		T_base_origin.pose = (struct xrt_pose)XRT_POSE_IDENTITY; // as the view locate does for these

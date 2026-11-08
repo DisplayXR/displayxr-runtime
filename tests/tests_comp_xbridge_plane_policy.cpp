@@ -338,6 +338,149 @@ TEST_CASE("a freshly authored plane transports on its own frame and lands on the
 }
 
 /*
+ * A latched (half-rate) plane must never show content OLDER than the frame
+ * before it. The bug: with a ring of 3 and a copy every other seq, a skipped
+ * slot kept content from three frames back, so a moving progress bar stepped
+ * backwards on every skipped frame. The catch-up copies the newest slot locally.
+ */
+static void
+run_half_rate_ring(bool catchup, uint64_t *out_backsteps, uint64_t *out_max_lag, uint64_t *out_blanks = nullptr)
+{
+	constexpr int kRing = 3;
+	uint64_t slot_seq[kRing] = {0, 0, 0};
+	uint64_t slot_copy_n[kRing] = {0, 0, 0};
+	struct xb_plane_box pend[kRing];
+	for (int i = 0; i < kRing; i++) {
+		pend[i] = box(0, 0, 256, 256);
+	}
+	uint64_t copy_n = 0;
+	uint64_t shown_prev = 0;
+	*out_backsteps = 0;
+	*out_max_lag = 0;
+	uint64_t blanks = 0;
+	for (uint64_t seq = 1; seq <= 60; seq++) {
+		const int eg = (int)(seq % kRing);
+		// Content changes every frame; the generation IS the frame number here so
+		// "older" is directly comparable (the real seqs are hashes).
+		const uint64_t stage_seq = seq;
+		const struct xb_plane_box staged = box(0, 0, 256, 16);
+		for (int i = 0; i < kRing; i++) {
+			xb_plane_box_union(&pend[i], &staged);
+		}
+		const enum xb_plane_action act = xb_plane_decide(slot_seq[eg], stage_seq, &pend[eg], &staged,
+		                                                 /*half_rate=*/true, seq, /*parity=*/0);
+		if (act == XB_PLANE_COPY) {
+			slot_seq[eg] = stage_seq;
+			slot_copy_n[eg] = ++copy_n;
+			pend[eg] = box(0, 0, 0, 0);
+		} else if (act == XB_PLANE_SKIP_HALF_RATE && catchup) {
+			const int src = xb_plane_catchup_source(slot_seq, slot_copy_n, kRing, eg);
+			if (src >= 0) {
+				slot_seq[eg] = slot_seq[src];
+				slot_copy_n[eg] = slot_copy_n[src];
+				pend[eg] = pend[src];
+			}
+		}
+		// A frame whose plane is not presentable composites NO 2D at all (a blink).
+		if (copy_n > 0 &&
+		    !xb_plane_slot_is_presentable(true, true, slot_seq[eg], stage_seq, true, slot_copy_n[eg], copy_n)) {
+			blanks++;
+		}
+		// The consume half shows whatever the slot holds once it holds anything.
+		const uint64_t shown = slot_seq[eg];
+		if (shown == 0) {
+			continue;
+		}
+		if (shown < shown_prev) {
+			(*out_backsteps)++;
+		}
+		if (seq - shown > *out_max_lag) {
+			*out_max_lag = seq - shown;
+		}
+		shown_prev = shown;
+	}
+	if (out_blanks != nullptr) {
+		*out_blanks = blanks;
+	}
+}
+
+TEST_CASE("a half-rate plane never steps back in time")
+{
+	uint64_t back = 0, lag = 0;
+
+	// The pre-fix behaviour, kept as a record of the failure mode.
+	run_half_rate_ring(/*catchup=*/false, &back, &lag);
+	CHECK(back > 0);
+
+	run_half_rate_ring(/*catchup=*/true, &back, &lag);
+	CHECK(back == 0);
+	// Half rate costs at most one frame of lag, never the ring's depth.
+	CHECK(lag <= 1);
+}
+
+TEST_CASE("a half-rate plane never blinks: every frame after the first copy composites")
+{
+	uint64_t back = 0, lag = 0, blanks = 0;
+	// Pre-fix: a skipped slot was stamped invalid and its frame went out without 2D.
+	run_half_rate_ring(/*catchup=*/false, &back, &lag, &blanks);
+	CHECK(blanks > 0);
+
+	run_half_rate_ring(/*catchup=*/true, &back, &lag, &blanks);
+	CHECK(blanks == 0);
+}
+
+TEST_CASE("xb_plane_catchup_source picks the newest written slot, never an older one")
+{
+	const uint64_t seq[3] = {11, 22, 33};
+	const uint64_t n[3] = {5, 7, 6};
+	CHECK(xb_plane_catchup_source(seq, n, 3, 0) == 1);
+	CHECK(xb_plane_catchup_source(seq, n, 3, 2) == 1);
+	// The write slot is already the newest: nothing to catch up from.
+	CHECK(xb_plane_catchup_source(seq, n, 3, 1) == -1);
+	// A never-written slot is not a source however its counter reads.
+	const uint64_t seq0[3] = {11, 0, 33};
+	CHECK(xb_plane_catchup_source(seq0, n, 3, 0) == 2);
+}
+
+TEST_CASE("xb_gate_decide: the bandwidth gate's verdict")
+{
+	constexpr uint64_t G = 2000ull * 1000ull * 1000ull; // gate
+	constexpr uint64_t F = 250ull * 1000ull * 1000ull;  // plane floor
+	constexpr uint64_t GB = 1000ull * 1000ull * 1000ull;
+
+	SECTION("inside budget, nothing latched: nothing to do")
+	{
+		CHECK(xb_gate_decide(G, G / 2, false, G, F) == XB_GATE_NONE);
+	}
+	SECTION("over budget because of the planes: latch")
+	{
+		CHECK(xb_gate_decide(3 * GB, 2 * GB, false, G, F) == XB_GATE_LATCH);
+	}
+	SECTION("over budget on the atlas alone: no lever")
+	{
+		CHECK(xb_gate_decide(3 * GB, F / 2, false, G, F) == XB_GATE_ATLAS_ONLY);
+	}
+	SECTION("8K regression: atlas alone over budget, latched UI goes idle -> releases")
+	{
+		// 3.1 GB/s atlas, an idle UI plane: the old "total under budget" rule never fired.
+		CHECK(xb_gate_decide(3100 * 1000ull * 1000ull, 10ull * 1000ull * 1000ull, true, G, F) == XB_GATE_SETTLED);
+	}
+	SECTION("latched and the plane is still busy over a heavy atlas: hold, never release")
+	{
+		CHECK(xb_gate_decide(3 * GB + GB, GB, true, G, F) == XB_GATE_LATCH);
+	}
+	SECTION("latched, total under budget but full rate would not fit: hold")
+	{
+		// 1.9 GB/s now with a 0.5 GB/s half-rate plane = 2.4 GB/s at full rate.
+		CHECK(xb_gate_decide(1900ull * 1000ull * 1000ull, GB / 2, true, G, F) == XB_GATE_NONE);
+	}
+	SECTION("latched and full rate would fit: release")
+	{
+		CHECK(xb_gate_decide(GB, GB / 2, true, G, F) == XB_GATE_SETTLED);
+	}
+}
+
+/*
  * #1663 — the bridge's ingress format decision.
  *
  * The guard around it is a throttled U_LOG_E on a live bridge, so on hardware
