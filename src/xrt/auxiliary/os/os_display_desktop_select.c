@@ -269,8 +269,20 @@ os_display_desktop_select_claim(const struct os_display_panel_claim *claims,
 	}
 
 	// Several claimed monitors (two panels of one vendor): a verified one,
-	// then the panel's own pixel size, then the added (non-primary) monitor —
-	// a 3D panel is a second screen on every real rig — then registry order.
+	// then the panel's own pixel size, then a verified panel AT the reported
+	// (0, 0) origin, then the added (non-primary) monitor — a 3D panel is a
+	// second screen on most rigs — then registry order.
+	//
+	// The (0, 0) term (#2577): (0, 0) is both "no origin" and the desktop
+	// origin, so it cannot settle the agree case above. But when the primary
+	// monitor is itself a verified panel sitting there, a plug-in that reads
+	// its origin from EDID (Windows) reported exactly that monitor, and the
+	// session's own DP weaves it. Letting "non-primary" win then hands the
+	// panel rect, window placement and the head screen to the OTHER panel,
+	// while the head DP still weaves the first — no segment DP is ever built
+	// for the second screen. Verified claims only: an EDID-table match at the
+	// origin is a laptop screen as often as a panel (#430's shape).
+	const bool origin_unset = !have_origin;
 	int32_t best = -1;
 	int best_score = -1;
 	for (uint32_t i = 0; i < count; i++) {
@@ -280,8 +292,9 @@ os_display_desktop_select_claim(const struct os_display_panel_claim *claims,
 		}
 		const bool size_match = hint != NULL && hint->pixel_width > 0 && hint->pixel_height > 0 &&
 		                        c->width == hint->pixel_width && c->height == hint->pixel_height;
-		const int score =
-		    (c->incumbent ? 8 : 0) + (c->verified ? 4 : 0) + (size_match ? 2 : 0) + (!c->is_primary ? 1 : 0);
+		const bool verified_at_origin = origin_unset && c->verified && claim_contains(c, 0, 0);
+		const int score = (c->incumbent ? 16 : 0) + (c->verified ? 8 : 0) + (size_match ? 4 : 0) +
+		                  (verified_at_origin ? 2 : 0) + (!c->is_primary ? 1 : 0);
 		if (score > best_score) {
 			best = (int32_t)i;
 			best_score = score;
