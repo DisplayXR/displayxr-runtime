@@ -39,9 +39,26 @@ sim_display supports several output modes for visualizing stereo content on a 2D
 - **Interlaced** — 1-pixel-period column interlace: view 0 on even panel
   columns, view 1 on odd, both sampled at the same UV. The only
   phase-sensitive mode — see the next section.
+- **Full SBS** (`SIM_DISPLAY_OUTPUT=sbs_full`, rendering mode 6) — for a stereo
+  desktop compositor. Both views are rendered at the window's full resolution
+  (view scale 1.0 x 1.0, 2x1 tiles) and handed over side by side, left first, as
+  they are. The DP reports `stereo_layout` 3 (HDMI 1.4b 3D_Structure "Side-by-Side (Full)"), so the Vulkan
+  compositor presents a buffer twice the window's width and declares the
+  window full side by side (`kde_stereo_content_v1`, value 3, on a native
+  Wayland surface; `_KDE_NET_WM_STEREO_CONTENT` = 3 on the runtime's own X11
+  window, which the window manager then makes twice as wide); the compositor
+  (Stereo KWin) shows each view to its eye and turns the pair into what each
+  output needs: a 3D television's HDMI 3D mode, anaglyph on a 2D monitor, the
+  left view alone on a plain 2D output. Without such a compositor nothing is
+  declared, the buffer stays the window's size and the window shows the two
+  views side by side, flat; the runtime's log says why (`FULL_SBS:` lines).
+  `DXR_STEREO_DECLARE=0` turns the declaration off for a comparison.
+  `SIM_DISPLAY_STEREO_LAYOUT=<n>` makes the DP claim another number instead
+  (it changes what the DP claims, not what it renders): the runtime reads a
+  number it does not know as 0 and declares nothing.
 
 Mode is selected at driver init time
-(`SIM_DISPLAY_OUTPUT=2d|anaglyph|sbs|squeezed|quad|blend|interlaced`). See
+(`SIM_DISPLAY_OUTPUT=2d|anaglyph|sbs|squeezed|quad|blend|interlaced|sbs_full`). See
 `sim_display_processor.c` for the mode dispatch and `shaders/` for the
 per-mode compositing kernels.
 

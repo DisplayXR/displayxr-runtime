@@ -423,6 +423,57 @@ as "needs 1:1"). A lenticular weave leaves it clear; the runtime then paints fla
 segment whose screen is resampled, and the #1595 / #1831 session gates degrade as before.
 sim_display sets it for every output but INTERLACED.
 
+**Output for a stereo desktop compositor.** A DP whose output is the views placed side by side,
+view 0 (left eye) first, each at the resolution its tile was rendered at and otherwise untouched,
+says so with `xrt_dp_scanout_caps::stereo_layout = 3` (per instance and per mode, re-read when the
+rendering mode changes, like the resample bit). The field is the first word of the former
+`reserved[]`: same size and offsets, and a plug-in built before the field wrote 0 there.
+
+| `stereo_layout` | Meaning |
+|---|---|
+| `0` (`XRT_DP_STEREO_LAYOUT_WEAVE`) | An ordinary weave, or anything else the window shows as it is. The default, and the reading of every value the runtime does not know. |
+| `3` (`XRT_DP_STEREO_LAYOUT_SIDE_BY_SIDE_FULL`) | Full side by side, view 0 first, each view at its own resolution. |
+
+The numbers are the 3D_Structure numbers of HDMI 1.4b (the 3D_Structure field of the HDMI
+Vendor-Specific InfoFrame, section 8.2.3; Linux names them in `enum hdmi_3d_structure`,
+`include/linux/hdmi.h`), so one number names one layout in every API that carries it. **0 is not
+HDMI's 0**: in HDMI 1.4b the value 0 is 3D_Structure "Frame packing", while here 0 means an
+ordinary weave, because that is what every plug-in built before the field already writes. The
+runtime acts on no frame packing output, so nothing collides today; whoever adds one gives it a
+value of its own instead of reusing 0.
+
+A value the runtime does not know is read as 0, the way `weave_scope` is clamped
+(`xrt_dp_stereo_layout_clamp`). Only 3 declares anything to a compositor.
+
+**The declaration is vendor neutral.** The runtime only declares a layout and never weaves
+(ADR-007): it tells the desktop compositor "this window holds the two views, side by side, left
+first", and the compositor does the rest. The declaration is KDE's stereo content protocol, where
+it was born and where Stereo KWin (Sparky Stereo OS) is its first consumer. The protocol keeps its
+name and its wire format, and any other compositor can implement it unchanged: a client that
+speaks it then works on every compositor that does, with no change. The protocol carries one
+value, full side by side; every other layout is the compositor's output filters' work, so a
+`stereo_layout` other than 3 puts nothing on the wire.
+
+With 3 the Vulkan compositor presents a target as wide as the views side by side (twice the window
+for two views), hands the DP that whole target as its canvas, and declares the app's native
+Wayland surface to the desktop compositor as full side by side (`kde_stereo_content_v1`, value 3,
+the value of HDMI 1.4b's 3D structure "Side-by-Side (Full)"). A stereo compositor such as Stereo
+KWin shows each view to its eye and turns the pair into what each output needs; the window keeps
+its size on screen. The runtime's own X11 window (a plain OpenXR app's, under X or Xwayland) is
+declared too when the window manager announces version 3 or later of the X11 declaration on the
+root window (`_KDE_NET_WM_STEREO_CONTENT_SUPPORTED`): the runtime sets `_KDE_NET_WM_STEREO_CONTENT`
+= 3 on it, and the window manager keeps the window's place on screen while making the X window
+twice as wide, possibly seconds later. A Vulkan X11 swapchain is always the window's current size,
+so the target becomes two views wide only once the X window is; until then, and after a
+withdrawal, the window is presented at its own size. The layout counts only in a rendering mode
+with two or more views on a 3D display state: a 2D mode (qwerty's V, an app's request) hands the DP
+one view, and the declaration is withdrawn. Where no declaration is offered (another compositor, an
+app's own X11 window, a window manager without the announcement, `DXR_STEREO_DECLARE=0`) the target
+stays the window's size and the runtime logs why in a `FULL_SBS:` line, so the two views show side
+by side, flat. sim_display reports 3 for `SIM_DISPLAY_OUTPUT=sbs_full` (rendering mode 6, view
+scale 1.0 x 1.0, 2x1 tiles); `SIM_DISPLAY_STEREO_LAYOUT=<n>` makes it claim another number, to
+exercise the reading of a layout the runtime does not know.
+
 ### `create_dp_metal_for_screen` (multi-screen on macOS)
 
 ```c
