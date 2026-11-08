@@ -161,7 +161,11 @@ main(int argc, char *argv[])
 	conv_host_provider_config_from_registration(args.provider_id, opened_luid);
 	struct conv_host_provider provider;
 	int code = conv_host_provider_load(&provider, args.provider_id, args.binary_path, reason, sizeof(reason));
-	if (code != CONV_HOST_EXIT_ORDERLY) {
+	if (code == CONV_HOST_EXIT_PROBE_DECLINED) {
+		// Expected for an opt-in provider: not an error.
+		U_LOG_W("conversion host: provider '%s' not loaded: %s", args.provider_id, reason);
+		conv_host_provider_unload(&provider);
+	} else if (code != CONV_HOST_EXIT_ORDERLY) {
 		U_LOG_E("conversion host: provider '%s' not loaded: %s", args.provider_id, reason);
 		conv_host_provider_unload(&provider);
 	} else {

@@ -149,6 +149,7 @@ classify_exit(struct conv_supervisor *s, uint64_t now_ns, int32_t code)
 		return;
 	case CONV_HOST_EXIT_ABI_REJECT: go_failed(s, now_ns, XRT_CONV_FAIL_VERSION, 0, "abi_reject"); return;
 	case CONV_HOST_EXIT_NEGOTIATE_FAILED: go_failed(s, now_ns, XRT_CONV_FAIL_LOAD, 0, "negotiate_failed"); return;
+	case CONV_HOST_EXIT_PROBE_DECLINED: go_failed(s, now_ns, XRT_CONV_FAIL_LOAD, 0, "probe_declined"); return;
 	case CONV_HOST_EXIT_LICENCE: go_failed(s, now_ns, XRT_CONV_FAIL_LICENCE, 1, "licence"); return;
 	case CONV_HOST_EXIT_NO_DEVICE: go_failed(s, now_ns, XRT_CONV_FAIL_PLATFORM, 1, "no_device"); return;
 	case CONV_HOST_EXIT_ELEVATED: go_failed(s, now_ns, XRT_CONV_FAIL_PLATFORM, 0, "elevated"); return;

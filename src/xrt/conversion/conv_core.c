@@ -414,7 +414,7 @@ host_event_locked(struct conv_core *core, const struct conv_host_evq_entry *e, u
 		hs->down = crash || update;
 		hs->rewarm = false;
 		hs->restarts++;
-		// A declined probe (exit 11) or an ABI reject (10) is not a crash (#2246).
+		// A declined probe (exit 16), a failed negotiate (11) or an ABI reject (10) is not a crash (#2246).
 		const char *how = crash ? conv_host_exit_label(e->detail) : update ? "closed for update" : NULL;
 		U_LOG_W(
 		    "[conv] provider %s: host process exited (code %d%s%s); streams stay, outputs keep their last "
