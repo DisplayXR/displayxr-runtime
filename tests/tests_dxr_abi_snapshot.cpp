@@ -324,7 +324,7 @@ static_assert(offsetof(XrViewLocateFixedViewerDXR, fixedViewer) == 16, "XrViewLo
 #endif
 
 // ---- XR_DXR_view_rig.h
-static_assert(XR_DXR_view_rig_SPEC_VERSION == 4, "XR_DXR_view_rig_SPEC_VERSION moved");
+static_assert(XR_DXR_view_rig_SPEC_VERSION == 5, "XR_DXR_view_rig_SPEC_VERSION moved");
 static_assert(XR_TYPE_DISPLAY_RIG_DXR == (XrStructureType)1004999140, "XR_TYPE_DISPLAY_RIG_DXR renumbered");
 static_assert(XR_TYPE_CAMERA_RIG_DXR == (XrStructureType)1004999141, "XR_TYPE_CAMERA_RIG_DXR renumbered");
 static_assert(XR_TYPE_VIEW_DISPLAY_RAW_DXR == (XrStructureType)1004999142, "XR_TYPE_VIEW_DISPLAY_RAW_DXR renumbered");

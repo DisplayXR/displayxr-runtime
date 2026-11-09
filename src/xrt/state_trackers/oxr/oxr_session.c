@@ -3518,8 +3518,8 @@ session_record_rig_canvas(struct oxr_session *sess,
 	 * hands and controllers coincide with its views in base space, and equal
 	 * the spec-4 rig-frame joints for that rig. The mapping is the shared
 	 * point core (m_view_rig_map_relation), the one the joints use, so the
-	 * canvas centre / orientation and a camera rig's nominal-viewer offset
-	 * come out exactly as for a joint. Bridge relays keep the physical plane:
+	 * canvas centre / orientation and a camera rig's glass (its convergence
+	 * plane, XR_DXR_view_rig spec 5) come out exactly as for a joint. Bridge relays keep the physical plane:
 	 * their descriptors are inert.
 	 */
 	bool rig_plane_valid = false;

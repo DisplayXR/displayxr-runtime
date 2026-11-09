@@ -12,6 +12,7 @@
 #include "displayxr_math_xrt.h"
 
 #include <math.h>
+#include <string.h>
 
 void
 m_view_rig_canvas_rebase(const struct m_view_rig_canvas *canvas, const struct xrt_vec3 *p_display, struct xrt_vec3 *out)
@@ -30,6 +31,75 @@ m_view_rig_canvas_rebase(const struct m_view_rig_canvas *canvas, const struct xr
 	}
 }
 
+/*!
+ * A camera rig's glass, as the equivalent display rig: the shared core's
+ * camera -> display conversion (dxr_view_rig_camera_to_display) puts the
+ * virtual display plane at the convergence plane (camera pose moved
+ * 1 / convergenceDiopters along the camera's forward axis) with
+ * virtualDisplayHeight = 2 tan(vFOV/2) / convergenceDiopters, the frustum's own
+ * virtual screen. Points then map through the display core with
+ * perspectiveFactor 1: scale = that height / canvas height, glass at zero
+ * parallax. Only the plane and its height are taken from the conversion — the
+ * converted perspective / ipd / parallax are the eye-pair match, which a point
+ * does not use. False (legacy viewer-relative mapping) when the convergence is
+ * at infinity or the canvas / FOV are degenerate.
+ */
+static bool
+camera_glass_rig(const struct m_view_rig_canvas *canvas,
+                 const struct m_view_rig *rig,
+                 struct xrt_pose *out_pose,
+                 float *out_vdh)
+{
+	if (!(rig->inv_convergence_distance > 0.0f) || !(rig->half_tan_vfov > 0.0f) || !(canvas->height_m > 0.0f) ||
+	    !(canvas->width_m > 0.0f) || !(canvas->nominal_z_m > 0.0f)) {
+		return false;
+	}
+	dxr_camera_rig cr;
+	memset(&cr, 0, sizeof(cr));
+	memcpy(&cr.pose, &rig->pose, sizeof(cr.pose)); // layout-identical (displayxr_math_xrt.c asserts)
+	cr.ipd_factor = 1.0f;
+	cr.parallax_factor = 1.0f;
+	cr.inv_convergence_distance = rig->inv_convergence_distance;
+	cr.half_tan_vfov = rig->half_tan_vfov;
+	cr.m2v = rig->m2v > 0.0f ? rig->m2v : 1.0f;
+	const dxr_rig_display_info info = {
+	    .physical_height_m = canvas->height_m,
+	    .aspect = canvas->width_m / canvas->height_m,
+	    .nominal_distance_m = canvas->nominal_z_m,
+	};
+	dxr_display_rig dr;
+	(void)dxr_view_rig_camera_to_display(&cr, &info, &dr);
+	if (!(dr.virtual_display_height > 0.0f)) {
+		return false;
+	}
+	memcpy(out_pose, &dr.pose, sizeof(*out_pose));
+	*out_vdh = dr.virtual_display_height;
+	return true;
+}
+
+bool
+m_view_rig_camera_glass(const struct m_view_rig_canvas *canvas,
+                        const struct m_view_rig *rig,
+                        struct xrt_pose *out_glass_pose,
+                        float *out_scale)
+{
+	if (rig == NULL || rig->kind != M_VIEW_RIG_CAMERA || canvas == NULL || !canvas->valid) {
+		return false;
+	}
+	struct xrt_pose pose;
+	float vdh = 0.0f;
+	if (!camera_glass_rig(canvas, rig, &pose, &vdh)) {
+		return false;
+	}
+	if (out_glass_pose != NULL) {
+		*out_glass_pose = pose;
+	}
+	if (out_scale != NULL) {
+		*out_scale = vdh / canvas->height_m;
+	}
+	return true;
+}
+
 void
 m_view_rig_map_canvas_point(const struct m_view_rig_canvas *canvas,
                             const struct m_view_rig *rig,
@@ -43,7 +113,22 @@ m_view_rig_map_canvas_point(const struct m_view_rig_canvas *canvas,
 	const struct xrt_vec3 nominal = {0.0f, canvas->nominal_y_m, canvas->nominal_z_m};
 	const dxr_screen scr = {canvas->width_m, canvas->height_m};
 	struct dxr_xrt_view v;
-	if (rig->kind == M_VIEW_RIG_CAMERA) {
+	struct xrt_pose glass_pose;
+	float glass_vdh = 0.0f;
+	if (rig->kind == M_VIEW_RIG_CAMERA && camera_glass_rig(canvas, rig, &glass_pose, &glass_vdh)) {
+		// The glass at the convergence plane (zero parallax), scaled by the
+		// frustum's virtual screen height / canvas height — the display rig's
+		// mapping for the camera rig's own virtual screen.
+		const dxr_display3d_tunables dt = {
+		    .ipd_factor = 1.0f,
+		    .parallax_factor = 1.0f,
+		    .perspective_factor = 1.0f,
+		    .virtual_display_height = glass_vdh,
+		};
+		dxr_xrt_display3d_compute_views(p_canvas, 1, &nominal, &scr, &dt, &glass_pose, &v);
+	} else if (rig->kind == M_VIEW_RIG_CAMERA) {
+		// Convergence at infinity: no glass plane to put the panel on. The
+		// camera core's eye mapping (viewer-relative, x metersToVirtual).
 		const dxr_camera3d_tunables ct = {
 		    .ipd_factor = 1.0f,
 		    .parallax_factor = 1.0f,
@@ -71,6 +156,10 @@ m_view_rig_length_scale(const struct m_view_rig_canvas *canvas, const struct m_v
 		return 1.0f;
 	}
 	if (rig->kind == M_VIEW_RIG_CAMERA) {
+		float s = 1.0f;
+		if (m_view_rig_camera_glass(canvas, rig, NULL, &s)) {
+			return s;
+		}
 		return rig->m2v > 0.0f ? rig->m2v : 1.0f;
 	}
 	// The core's display-rig eye scale: perspective x m2v, m2v = vH / canvas height.

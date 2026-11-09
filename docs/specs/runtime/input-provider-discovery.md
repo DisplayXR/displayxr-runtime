@@ -747,7 +747,9 @@ rather than the physical plane for RIG_LOCAL sources (for an external-window
 session `P ∘ inv(canvas pose)`, which hands the canvas rebase the point
 `canvas ∘ (s L)` and so the canvas point `s L`). A hand locate **before**
 the session's first rigged view locate still sees the physical plane — locate
-views first each frame. Pinned by `tests_oxr_view_space_rig_hands` ("RIG_LOCAL
+views first each frame. Under a camera rig, `P` is the camera's glass — the
+convergence plane, `XR_DXR_view_rig` spec 5 — not the nominal viewer distance
+in front of the camera, because it is that same point mapping. Pinned by `tests_oxr_view_space_rig_hands` ("RIG_LOCAL
 hands follow the display plane a chained XR_DXR_view_rig puts in LOCAL"); the
 windowed placement (canvas centre + `s L`, radii and velocities × `s`, the
 spec-4 joint = the canvas point `s L` through the rig) by `tests_view_rig_point`
