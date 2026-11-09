@@ -1367,6 +1367,23 @@ struct d3d11_service_compositor
 	//! is sticky (`weave_dp_refused`) and the frames are 60+/s.
 	std::atomic<bool> weave_dp_missing_logged{false};
 
+	//! Weave-idle release: monotonic ns of this present-owner's last
+	//! xrWeaveSubmitDXR (0 = never). Written by the submit (IPC thread), read by
+	//! the render thread — see pipeline_weave_idle_release_if_due.
+	std::atomic<int64_t> weave_last_submit_ns{0};
+	//! Weave-idle release: the DPs were released because this present-owner
+	//! stopped weaving. Render thread only, under render_mutex.
+	bool weave_idle_released = false;
+	//! Weave-idle release: the release also retired a panel DP that lived on
+	//! the service window (the #1172/#939 ingest-DP case), so the resume must
+	//! put one back there. Render thread only, under render_mutex.
+	bool weave_idle_rebind_panel = false;
+	//! Weave-idle release: guards `render.weave_dp` between its lazy create in
+	//! svc_ensure_client_weave_dp (IPC thread, deliberately OUTSIDE render_mutex)
+	//! and the idle release (render thread). The render thread only ever
+	//! try_locks it, so it can never wait on a vendor DP create (#925).
+	std::mutex weave_dp_mutex;
+
 	//! #964: pacing state for this client's presenter when it is an APP_HWND —
 	//! a foreign, frequently occluded window the render thread must never
 	//! block on. `last_flat_present_ns` rate-limits the unfocused flat-2D
@@ -5911,6 +5928,9 @@ svc_ensure_client_weave_dp(struct d3d11_service_system *sys, struct d3d11_servic
 	if (!svc_client_wants_ingest_dp(sys, c) || service_device_removed(sys)) {
 		return;
 	}
+	// Weave-idle release: the render thread may free weave_dp when this client
+	// stops weaving; hold it off for the whole check-or-create below.
+	std::lock_guard<std::mutex> weave_dp_guard(c->weave_dp_mutex);
 
 	HWND hwnd = c->render.weave_hwnd != nullptr ? c->render.weave_hwnd : c->render.hwnd;
 	if (hwnd == nullptr || !IsWindow(hwnd)) {
@@ -12710,6 +12730,105 @@ pipeline_idle_quiesce_if_due(struct d3d11_service_system *sys, struct d3d11_mult
 }
 
 /*!
+ * Weave-idle release: #1319's quiesce for a present-owner that is CONNECTED but
+ * no longer weaving.
+ *
+ * #1319 only fires with zero clients. The DisplayXR Browser keeps its
+ * XR_DXR_weave session for the life of the process, and only submits while a
+ * page has an inline-3D tile (Viz returns before any xrWeaveSubmitDXR when the
+ * last tile is gone; the runtime refuses a zero-rect batch anyway). So after
+ * its last 3D page the browser stays a client forever, this pipeline keeps the
+ * panel DP bound to its window every frame, and the SR context behind that DP
+ * keeps the eye-tracking camera streaming (LED lit) on a 2D page.
+ *
+ * Once the focused PRESENTER_SELF client has not submitted for the #1319 grace
+ * window (DXR_IDLE_QUIESCE_MS, default 5000; 0 disables both), release every
+ * DP it holds the camera through: the panel DP (retired into the graveyard, so
+ * a lock-free reader still inside a bounded call stays safe; the per-frame sweep
+ * destroys it after the graveyard grace) and its own #1172/#939 ingest DP.
+ * Unlike #1319 the render thread keeps running: the client is still here.
+ *
+ * Coming back needs no resume path: the next submit stamps
+ * `weave_last_submit_ns` before anything else, svc_ensure_client_weave_dp
+ * rebuilds the ingest DP on the submitting thread, and the next render tick
+ * sees the fresh stamp, clears the latch and binds the panel DP as usual. A
+ * submit that lands before that rebind returns false (the client keeps its last
+ * frame and retries), the same degrade as the #1172 tripwire.
+ *
+ * Render thread, under render_mutex. Returns true while the client is released
+ * (the caller must not bind a DP to it this frame).
+ */
+static bool
+pipeline_weave_idle_release_if_due(struct d3d11_service_system *sys,
+                                   struct d3d11_multi_compositor *mc,
+                                   struct d3d11_service_compositor *fc)
+{
+	if (sys == nullptr || mc == nullptr || fc == nullptr) {
+		return false;
+	}
+	const int64_t grace_ns = dxr_idle_quiesce_ns();
+	const int64_t last_ns = fc->weave_last_submit_ns.load(std::memory_order_acquire);
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	// A workspace controller owns the panel; a client that has never woven has
+	// nothing of its own to release yet.
+	const bool idle = grace_ns > 0 && !sys->workspace_mode && last_ns != 0 && now_ns - last_ns >= grace_ns;
+	if (!idle) {
+		if (fc->weave_idle_released) {
+			fc->weave_idle_released = false;
+			// Only the ingest-DP branch keeps the panel DP off the client's
+			// window; everywhere else the ordinary per-frame bind restores it.
+			fc->weave_idle_rebind_panel =
+			    fc->weave_idle_rebind_panel && svc_client_wants_ingest_dp(sys, fc);
+			U_LOG_W("[pipeline] weave-idle: '%s' is weaving again — rebinding its display processors",
+			        fc->slot_app_name);
+		}
+		return false;
+	}
+	if (fc->weave_idle_released) {
+		return true;
+	}
+	// The ingest DP is created OUTSIDE render_mutex (svc_ensure_client_weave_dp);
+	// never wait for that create here, just try again next frame.
+	std::unique_lock<std::mutex> dp_guard(fc->weave_dp_mutex, std::try_to_lock);
+	if (!dp_guard.owns_lock()) {
+		return false;
+	}
+	if (fc->render.weave_dp != nullptr) {
+		(void)DP_REQUEST_DISPLAY_MODE(fc->render.weave_dp, false);
+		xrt_display_processor_d3d11_destroy(&fc->render.weave_dp);
+		fc->render.weave_dp = nullptr;
+		fc->render.weave_dp_hwnd = nullptr;
+		fc->render.weave_dp_refused = false;
+		fc->render.weave_dp_windowless = false;
+		fc->render.weave_dp_origin_valid = false;
+		fc->render.weave_dp_client_presents = -1;
+		fc->render.weave_dp_encoding = -1;
+	}
+	dp_guard.unlock();
+	fc->weave_idle_rebind_panel = false;
+	if (mc->display_processor != nullptr) {
+		if (mc->window != nullptr) {
+			comp_d3d11_window_set_workspace_dp(mc->window, nullptr);
+		}
+		struct xrt_display_processor_d3d11 *dead = mc->display_processor;
+		HWND dead_hwnd = mc->panel_dp_hwnd;
+		ID3D11Device *dead_dev = mc->panel_dp_device;
+		fc->weave_idle_rebind_panel = (dead_hwnd != nullptr && dead_hwnd == mc->hwnd);
+		mc->display_processor = nullptr;
+		mc->panel_dp_hwnd = nullptr;
+		mc->panel_dp_device = nullptr;
+		pipeline_dp_forget_beliefs(mc);
+		pipeline_dp_retire(mc, dead, dead_hwnd, dead_dev); // drops the lens vote now
+	}
+	fc->weave_idle_released = true;
+	U_LOG_W(
+	    "[pipeline] weave-idle: '%s' has not woven for %lld ms — display processors released, eye-tracking "
+	    "camera off until its next weave (DXR_IDLE_QUIESCE_MS)",
+	    fc->slot_app_name, (long long)((now_ns - last_ns) / 1000000LL));
+	return true;
+}
+
+/*!
  * #1002: THE defined action for a lost device — exit so the connect ladder
  * brings the service back on a fresh one.
  *
@@ -15616,6 +15735,23 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		// CLIENT presents. Here we only bind the panel to its window.
 		mc->pace_app_waitable = nullptr;
 		mc->pace_app_sc = nullptr;
+		// Weave-idle release: a present-owner that stopped weaving (the browser
+		// on a 2D page) must not keep the panel DP — and the camera behind it —
+		// bound by merely being focused. Bind nothing while it is released; its
+		// next submit brings it back on the following tick.
+		if (kind == PRESENTER_SELF && pipeline_weave_idle_release_if_due(sys, mc, fc)) {
+			sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
+			for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+				if (s == focused || !pipeline_slot_presenting(&mc->clients[s])) {
+					continue;
+				}
+				struct d3d11_service_compositor *oc = mc->clients[s].compositor;
+				if (oc->presenter == PRESENTER_APP_HWND) {
+					pipeline_flat_present(sys, oc);
+				}
+			}
+			return;
+		}
 		// A present-owner composes the woven output over its OWN window content
 		// (displayxr-browser: page below, inline-3D tiles above, alpha outside
 		// the tiles). The DP must alpha-gate only -- never compose-under a
@@ -15655,8 +15791,19 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			 * false, so this is a transition, not a steady state — the log is
 			 * throttled anyway because a bind can legitimately defer.
 			 */
-			if (mc->panel_dp_hwnd != nullptr && mc->panel_dp_hwnd != mc->hwnd && mc->hwnd != nullptr &&
-			    !IsWindow(mc->panel_dp_hwnd)) {
+			if (fc->weave_idle_rebind_panel && mc->hwnd != nullptr) {
+				// Weave-idle release retired the panel DP that lived on the
+				// service window; this client weaves again, so put it back
+				// there. The bind can defer while the retired one still owns
+				// the window (~250 ms), hence the latch clears only once bound.
+				pipeline_bind_panel_dp(sys, mc, mc->hwnd, /*client_presents*/ false,
+				                       /*force_recreate*/ false,
+				                       svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW));
+				if (mc->display_processor != nullptr) {
+					fc->weave_idle_rebind_panel = false;
+				}
+			} else if (mc->panel_dp_hwnd != nullptr && mc->panel_dp_hwnd != mc->hwnd &&
+			           mc->hwnd != nullptr && !IsWindow(mc->panel_dp_hwnd)) {
 				static int64_t s_last_dead_log_ns = 0;
 				const int64_t dead_now_ns = (int64_t)os_monotonic_get_ns();
 				if (dead_now_ns - s_last_dead_log_ns > 5LL * 1000000000LL) {
@@ -31947,6 +32094,9 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	if (sys == nullptr) {
 		return false;
 	}
+	// Weave-idle release: stamp BEFORE any exit, so a submit that fails because
+	// its DP was just released still wakes the render thread's rebind.
+	c->weave_last_submit_ns.store((int64_t)os_monotonic_get_ns(), std::memory_order_release);
 
 	// XR_DXR_lift (ADR-042): take this submit's lift-flagged rects NOW, so every
 	// exit path below consumes them (a set is valid for exactly one submit).
