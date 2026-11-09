@@ -121,6 +121,10 @@ struct conv_stream
 	//! Who owns AUTO convergence, as last logged (CONV_STREAM_CONV_OWNER_*;
 	//! dispatcher thread only): one WARN per stream, again only on a change.
 	uint32_t conv_owner_logged;
+	//! The viewpoints sit on one point (baseline under CONV_VIEWER_COLLAPSED_M,
+	//! back above CONV_VIEWER_SEPARATED_M: hysteresis), as last logged
+	//! (dispatcher thread only). Its views are then identical: no parallax.
+	bool viewer_collapsed;
 
 	/* Still-image dedupe (PHOTO; dispatcher thread only): what the latest
 	 * published result was converted from. */

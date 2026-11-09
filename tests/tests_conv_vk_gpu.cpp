@@ -2088,6 +2088,194 @@ TEST_CASE("vk_conv_weave: a lifted batch rect -- flat, capped snapshot, woven re
 	CHECK(ipc_server_conv_lift_stream_destroy(sc, 1, wire) == XRT_SUCCESS);
 }
 
+TEST_CASE("vk_conv_weave: a lifted batch rect's two tiles differ for a separated viewer, match for a collapsed one",
+          "[conv_vk_gpu][weave_rects][weave_parallax]")
+{
+	// The desktop-Linux Convert to 3D path end to end, minus the IPC: a CPU
+	// depth provider composed with the Vulkan glue's reference view
+	// synthesis, a batch-layout lifted rect, the per-DP eyes the weave engine
+	// publishes. The other weave tests feed a flat or bar-only rect, so a
+	// result drawn with no parallax (or never drawn: the flat fallback puts
+	// the same 2D frame in both tiles) passed them. Here the rect is textured
+	// and the provider's depth is a ramp, so the two tiles must differ.
+	//
+	// And the converse, by design: a MANAGED display collapses the viewer's
+	// eye pair while nobody is tracked, every viewpoint then sits on one
+	// point and the two tiles are the same image (the panel shows 2D anyway).
+	// That is the capture a lift that never ran also gives, so the stream
+	// says so in its stats (and one WARN per transition).
+	WeaveRig rig;
+	if (!rig.init()) {
+		SKIP("no Vulkan device / CPU transport available");
+	}
+	struct vk_bundle *vk = rig.x.vk.get();
+	ipc_server_conv *sc = rig.sc;
+	ipc_server_conv_set_weave_rects(sc, true);
+	uint64_t wire = 0;
+	REQUIRE(ipc_server_conv_lift_stream_create(sc, 1, XRT_DP_LIFT_MODE_SBS, 0, 1.0f, 0, 0, &wire) == XRT_SUCCESS);
+	uint64_t core_id = 0;
+	uint32_t mode = 0;
+	REQUIRE(weave_resolve(sc, 1, wire, &core_id, &mode));
+
+	vk_conv_weave *w = nullptr;
+	REQUIRE(vk_conv_weave_create(vk, rig.x.g, &w));
+	vk_conv_weave_bridge b{};
+	b.core = rig.core;
+	b.resolve = weave_resolve;
+	b.match_weave = weave_match;
+	b.fit_rect = ipc_server_conv_submit_rect;
+	b.ud = sc;
+	vk_conv_weave_set_bridge(w, &b);
+	vk_conv_weave_client *c = vk_conv_weave_client_create(w, vk);
+	REQUIRE(c != nullptr);
+
+	// Window-sized BGRA input: grey outside, a hashed texture inside the rect
+	// (every horizontal shift changes most pixels).
+	const uint32_t W = 640, H = 360;
+	const int32_t RX = 64, RY = 36;
+	const uint32_t RW = 512, RH = 288;
+	std::vector<uint8_t> src((size_t)W * H * 4);
+	for (uint32_t y = 0; y < H; y++) {
+		for (uint32_t x = 0; x < W; x++) {
+			uint8_t *p = &src[((size_t)y * W + x) * 4];
+			const bool in_rect = (int32_t)x >= RX && x < RX + RW && (int32_t)y >= RY && y < RY + RH;
+			uint32_t h = (x / 3) * 2654435761u ^ (y / 3) * 40503u;
+			h ^= h >> 13;
+			p[0] = in_rect ? (uint8_t)(h & 0xFF) : 96;
+			p[1] = in_rect ? (uint8_t)((h >> 8) & 0xFF) : 96;
+			p[2] = in_rect ? (uint8_t)((h >> 16) & 0xFF) : 96;
+			p[3] = 255;
+		}
+	}
+	Image in_img, sbs;
+	REQUIRE(make_image(vk, in_img, W, H, 1, VK_FORMAT_B8G8R8A8_UNORM));
+	REQUIRE(make_image(vk, sbs, 2 * W, H, 1, VK_FORMAT_R8G8B8A8_UNORM));
+	vk_cmd_pool pool{};
+	REQUIRE(vk_cmd_pool_init(vk, &pool, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT) == VK_SUCCESS);
+	REQUIRE(upload(vk, &pool, in_img, src.data(), src.size()));
+	std::vector<uint8_t> zeros((size_t)2 * W * H * 4, 0);
+	REQUIRE(upload(vk, &pool, sbs, zeros.data(), zeros.size()));
+
+	const uint64_t dp_key = 0x5150; // the weave engine's DP (comp_multi_conv_eyes_publish)
+	xrt_lift_weave_rect binding{};
+	binding.stream_id = wire;
+	binding.rect_index = 0;
+	vk_conv_weave_rect r{};
+	r.binding = &binding;
+	r.owner = 1;
+	r.src = {in_img.image, VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_B8G8R8A8_UNORM, W, H};
+	r.x = RX;
+	r.y = RY;
+	r.w = RW;
+	r.h = RH;
+	r.dst = {sbs.image, VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_R8G8B8A8_UNORM, 2 * W, H};
+	r.views = 2;
+	r.tile_columns = 2;
+	r.tile_w = W;
+	r.tile_h = H;
+	r.batch = true;
+	r.frame.valid = true;
+	r.frame.width_m = 0.30f;
+	r.frame.height_m = 0.16875f;
+	r.frame.eyes_dp_key = dp_key;
+
+	auto publish = [&](float half_ipd_m, bool tracking) {
+		xrt_eye_positions e{};
+		e.valid = true;
+		e.is_tracking = tracking;
+		e.count = 2;
+		e.eyes[0].x = -half_ipd_m;
+		e.eyes[0].z = 0.6f;
+		e.eyes[1].x = half_ipd_m;
+		e.eyes[1].z = 0.6f;
+		ipc_server_conv_eyes_publish(sc, dp_key, &e);
+	};
+	auto weave = [&]() {
+		vk_conv_weave_begin(w, c);
+		const bool rec =
+		    run_cmd(vk, &pool, [&](VkCommandBuffer cmd) { return vk_conv_weave_record(w, c, cmd, &r); });
+		vk_conv_weave_complete(w, c);
+		return rec;
+	};
+	// Weave until three more conversions than @p after landed: the snapshots
+	// already queued or converting when the eyes changed placed their views
+	// for the old eyes, the third saw the new ones. Then one more weave draws
+	// the newest result, and the stats say what that result was placed for.
+	auto weave_until_converted = [&](uint64_t after) {
+		conv_stream_stats ss{};
+		for (int i = 0; i < 2000; i++) {
+			REQUIRE(weave());
+			REQUIRE(conv_core_stream_get_stats(rig.core, core_id, &ss) == XRT_SUCCESS);
+			if (ss.converted >= after + 3) {
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		}
+		REQUIRE(ss.converted >= after + 3);
+		REQUIRE(wait_until(
+		    [&] {
+			    return conv_core_stream_get_stats(rig.core, core_id, &ss) == XRT_SUCCESS &&
+			           ss.submitted == ss.converted + ss.dropped + ss.failed + ss.deduped;
+		    },
+		    3000));       // nothing still converting
+		REQUIRE(weave()); // sample the newest result (and submit one more snapshot)
+		return ss;
+	};
+	std::vector<uint8_t> out((size_t)2 * W * H * 4);
+	// Mean and max |L - R| over the rect, both tiles in register.
+	auto tile_diff = [&](double *out_max) {
+		REQUIRE(readback(vk, &pool, sbs, out.data(), out.size()));
+		double sum = 0.0, mx = 0.0;
+		for (uint32_t y = RY; y < RY + RH; y++) {
+			for (uint32_t x = RX; x < RX + RW; x++) {
+				const uint8_t *l = &out[((size_t)y * 2 * W + x) * 4];
+				const uint8_t *rr = &out[((size_t)y * 2 * W + W + x) * 4];
+				for (int k = 0; k < 3; k++) {
+					const double d = std::abs((int)l[k] - (int)rr[k]);
+					sum += d;
+					mx = d > mx ? d : mx;
+				}
+			}
+		}
+		*out_max = mx;
+		return sum / ((double)RW * RH * 3.0);
+	};
+
+	// 1. A tracked viewer, eyes 64 mm apart: the woven tiles differ.
+	publish(0.032f, true);
+	conv_stream_stats ss = weave_until_converted(0);
+	vk_conv_weave_stats st{};
+	REQUIRE(vk_conv_weave_client_stats(c, wire, &st));
+	REQUIRE(st.woven_result);
+	CHECK(st.result_views == 2u);
+	double mx = 0.0;
+	const double separated = tile_diff(&mx);
+	INFO("separated viewer: mean |L-R| " << separated << ", max " << mx);
+	CHECK(separated > 4.0);
+	CHECK_FALSE(ss.viewer_collapsed);
+	CHECK(ss.collapsed_conversions == 0u);
+
+	// 2. Nobody tracked, the MANAGED collapse: one point, identical tiles.
+	publish(0.0f, false);
+	ss = weave_until_converted(ss.converted);
+	const double collapsed = tile_diff(&mx);
+	INFO("collapsed viewer: mean |L-R| " << collapsed << ", max " << mx);
+	CHECK(collapsed == 0.0);
+	CHECK(ss.viewer_collapsed);
+	CHECK(ss.collapsed_conversions >= 1u);
+
+	// 3. The viewer is back: parallax again, and the flag clears.
+	publish(0.032f, true);
+	ss = weave_until_converted(ss.converted);
+	CHECK(tile_diff(&mx) > 4.0);
+	CHECK_FALSE(ss.viewer_collapsed);
+
+	vk_conv_weave_client_destroy(w, c);
+	vk_conv_weave_destroy(&w);
+	vk_cmd_pool_destroy(vk, &pool);
+	CHECK(ipc_server_conv_lift_stream_destroy(sc, 1, wire) == XRT_SUCCESS);
+}
+
 TEST_CASE("vk_conv_weave: the snapshot goes GPU -> GPU when the binding takes a GPU kind, host path otherwise",
           "[conv_vk_gpu][weave_rects][weave_gpu_snap]")
 {

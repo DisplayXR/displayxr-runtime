@@ -84,6 +84,16 @@
  * service log's "lift rect: stream ... snapshot" / "... woven" lines are what
  * prove a result. --service-log=PATH greps them (snapshot + woven required).
  *
+ * Parallax, not just a result: --lift-image=PPM puts a picture in rect A
+ * (no colour verdict then), --lift-rect=X,Y,W,H moves / sizes it,
+ * --lift-frames=N runs N lifted submits, --lift-hint=video|photo and
+ * --lift-priority=0..3 match a browser's stream, and --lift-capture touches the
+ * service's per-exe weave-capture trigger 30 submits before the end, so
+ * $TMPDIR/displayxr_atlas.weave_probe_vk_linux.png (the service's TMPDIR) is
+ * the DP input with the lifted views written in: compare its two tiles inside
+ * the rect. --dmabuf --lift runs the same lift on the stage-B (dma-buf +
+ * sync_file) input, the browser's shape, with no pixel verdict.
+ *
  * Run (service already started with the sim display plug-in):
  *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=build/_plugins \
  *     build/src/xrt/targets/service/displayxr-service &
@@ -153,6 +163,18 @@ static const XrRect2Di kOverlayBar = {{200, 30}, {800, 40}};
 static XrOffset2Di kWinOrigin = {64, 48}; // --bind-origin=X,Y overrides it
 // --bind-logical=LX,LY,SCALE: chain an XrWeaveWindowLogicalOriginDXR (v12) on the first bind.
 static bool g_bind_logical = false;
+// --lift-* (see the header): the lift leg's input, length and capture.
+static XrInstance g_xr_instance = XR_NULL_HANDLE; //!< for --dmabuf --lift
+static bool g_dmabuf_lift = false;                //!< --dmabuf --lift: rect A lifted, stage-B input
+static const char *g_lift_image = nullptr;        //!< --lift-image=PPM
+static int g_lift_frames = 90;                    //!< --lift-frames=N
+static bool g_lift_capture = false;               //!< --lift-capture
+static XrRect2Di g_lift_rect = {};                //!< --lift-rect=X,Y,W,H: rect A for the lift leg only
+static int g_lift_hint = 0;                       //!< --lift-hint=video|photo (XrLiftContentHintDXR)
+static int g_lift_priority = -1;                  //!< --lift-priority=0..3 (xrSetLiftStreamPriorityDXR)
+static bool read_ppm(const char *path, std::vector<uint8_t> &rgb, int &w, int &h);
+//! --lift-capture: touch the service's per-exe weave-capture trigger (the service's TMPDIR = ours).
+static void lift_capture_trigger(int frame);
 static XrOffset2Di g_bind_logical_origin = {0, 0};
 static float g_bind_logical_scale = 0.0f;
 // --move-to=X,Y,LX,LY,SCALE (repeatable, up to 4; #2218 item 6): re-bind the window
@@ -844,6 +866,73 @@ run_dmabuf(Vk &vk,
 	}
 
 	XrRect2Di rects[2] = {kRectA, kRectB};
+	// --dmabuf --lift: rect A holds a 2D picture lifted on a spec-3 SBS stream,
+	// with a stage-B (dma-buf + sync_file) input, the browser's shape. No pixel
+	// verdict here: the service's weave capture and log are the evidence.
+	XrLiftStreamDXR lift_stream = XR_NULL_HANDLE;
+	PFN_xrDestroyLiftStreamDXR pfn_lift_destroy = nullptr;
+	XrLiftOptionsDXR lift_opt = {XR_TYPE_LIFT_OPTIONS_DXR};
+	XrWeaveRectLiftDXR lift_rect = {XR_TYPE_WEAVE_RECT_LIFT_DXR};
+	XrWeaveSubmitLiftRectsDXR lift_rects = {XR_TYPE_WEAVE_SUBMIT_LIFT_RECTS_DXR};
+	if (g_dmabuf_lift) {
+		PFN_xrGetLiftPropertiesDXR pfn_props = nullptr;
+		PFN_xrCreateLiftStreamDXR pfn_create = nullptr;
+		xrGetInstanceProcAddr(g_xr_instance, "xrGetLiftPropertiesDXR", (PFN_xrVoidFunction *)&pfn_props);
+		xrGetInstanceProcAddr(g_xr_instance, "xrCreateLiftStreamDXR", (PFN_xrVoidFunction *)&pfn_create);
+		xrGetInstanceProcAddr(g_xr_instance, "xrDestroyLiftStreamDXR", (PFN_xrVoidFunction *)&pfn_lift_destroy);
+		XrLiftPropertiesDXR props = {XR_TYPE_LIFT_PROPERTIES_DXR};
+		for (int i = 0; pfn_props != nullptr && i < 100; i++) {
+			if (XR_SUCCEEDED(pfn_props(session, &props)) && props.state == XR_LIFT_STATE_READY_DXR &&
+			    (props.supportedModes & XR_LIFT_MODE_SBS_BIT_DXR) != 0) {
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		}
+		XrLiftStreamCreateInfoDXR ci = {XR_TYPE_LIFT_STREAM_CREATE_INFO_DXR};
+		ci.mode = XR_LIFT_MODE_SBS_DXR;
+		ci.contentHint = (XrLiftContentHintDXR)g_lift_hint;
+		ci.inputScale = 1.0f;
+		if (pfn_create == nullptr || pfn_lift_destroy == nullptr ||
+		    XR_FAILED(pfn_create(session, &ci, &lift_stream))) {
+			LOG("dma-buf lift FAIL: no SBS lift stream");
+			return false;
+		}
+		std::vector<uint8_t> pic;
+		int pw = 0, ph = 0;
+		const bool have_pic = g_lift_image != nullptr && read_ppm(g_lift_image, pic, pw, ph);
+		for (int i = 0; i < 2; i++) {
+			uint8_t *px = (uint8_t *)staging[i].map;
+			const bool rgba = fourcc[i] == kWeaveFourccABGR8888;
+			for (int y = kRectA.offset.y; y < kRectA.offset.y + kRectA.extent.height; y++) {
+				for (int x = kRectA.offset.x; x < kRectA.offset.x + kRectA.extent.width; x++) {
+					uint8_t r = 0x80, g = 0x80, b = 0x80;
+					if (have_pic) {
+						const int sx = (x - kRectA.offset.x) * pw / kRectA.extent.width;
+						const int sy = (y - kRectA.offset.y) * ph / kRectA.extent.height;
+						const uint8_t *q = &pic[((size_t)sy * pw + sx) * 3];
+						r = q[0], g = q[1], b = q[2];
+					}
+					uint8_t *o = &px[((size_t)y * kWinW + x) * 4];
+					o[0] = rgba ? r : b;
+					o[1] = g;
+					o[2] = rgba ? b : r;
+					o[3] = 0xFF;
+				}
+			}
+		}
+		lift_opt.convergence = XR_LIFT_CONVERGENCE_AUTO_DXR;
+		lift_opt.strength = 1.0f;
+		lift_opt.inpaint = XR_TRUE;
+		lift_opt.viewpointSource = XR_LIFT_VIEWPOINT_SOURCE_TRACKED_DXR;
+		lift_opt.viewCount = 2;
+		lift_rect.next = &lift_opt;
+		lift_rect.rectIndex = 0; // rect A
+		lift_rect.stream = lift_stream;
+		lift_rects.liftCount = 1;
+		lift_rects.lifts = &lift_rect;
+		LOG("dma-buf lift: rect A (%d,%d %dx%d) lifted (%s)", kRectA.offset.x, kRectA.offset.y,
+		    kRectA.extent.width, kRectA.extent.height, have_pic ? "picture" : "grey");
+	}
 	DmabufImage output;
 	uint64_t last_fv = 0;
 	int probe_fds_early = -1, svc_fds_early = -1;
@@ -873,6 +962,13 @@ run_dmabuf(Vk &vk,
 		in_desc.next = &ov_desc;
 		ov.next = &in_desc;
 		batch.next = &ov;
+		if (g_dmabuf_lift) {
+			lift_rects.next = &ov; // submit -> batch -> lifts -> ov -> ...
+			batch.next = &lift_rects;
+			if (g_lift_capture && frame == (frames > 30 ? frames - 30 : 0)) {
+				lift_capture_trigger(frame);
+			}
+		}
 		XrWeaveSubmitInfoDXR submit = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
 		submit.next = &batch;
 		submit.firstChunk = XR_TRUE;
@@ -954,7 +1050,7 @@ run_dmabuf(Vk &vk,
 		const bool b_ok = k == 0 ? cyan(br, bg, bb) : red(br, bg, bb);
 		const bool ov_ok = vr > 150 && vb > 150 && vg < 80 && va > 200;
 		const bool gap_ok = ga < 40 && aa > 200;
-		const bool ok = a_ok && b_ok && ov_ok && gap_ok;
+		const bool ok = g_dmabuf_lift || (a_ok && b_ok && ov_ok && gap_ok);
 		if (!ok) {
 			if (bad_frames < 5) {
 				LOG("frame %d (parity %d) WRONG: rectA (%u,%u,%u) rectB (%u,%u,%u) bar (%u,%u,%u,a=%u) "
@@ -974,6 +1070,13 @@ run_dmabuf(Vk &vk,
 			probe_fds_early = count_fds(0);
 			svc_fds_early = service_pid > 0 ? count_fds(service_pid) : -1;
 		}
+	}
+	if (g_dmabuf_lift) {
+		if (lift_stream != XR_NULL_HANDLE) {
+			pfn_lift_destroy(lift_stream);
+		}
+		LOG("dma-buf lift: %d frames submitted (see the service log and capture)", frames);
+		return pass;
 	}
 	int probe_fds_late = count_fds(0);
 	int svc_fds_late = service_pid > 0 ? count_fds(service_pid) : -1;
@@ -1802,6 +1905,38 @@ lift_log_mark(const char *path)
 	return end > 0 ? end : 0;
 }
 
+//! A binary P6 PPM (maxval 255) into RGB bytes; false on anything else.
+static bool
+read_ppm(const char *path, std::vector<uint8_t> &rgb, int &w, int &h)
+{
+	FILE *f = fopen(path, "rb");
+	if (f == nullptr) {
+		return false;
+	}
+	int maxval = 0;
+	const bool hdr = fscanf(f, "P6 %d %d %d", &w, &h, &maxval) == 3 && fgetc(f) != EOF && w > 0 && h > 0 &&
+	                 maxval == 255;
+	bool ok = false;
+	if (hdr) {
+		rgb.resize((size_t)w * h * 3);
+		ok = fread(rgb.data(), 1, rgb.size(), f) == rgb.size();
+	}
+	fclose(f);
+	return ok;
+}
+
+static void
+lift_capture_trigger(int frame)
+{
+	const char *t = getenv("TMPDIR");
+	const std::string trig = std::string(t != nullptr ? t : "/tmp") + "/displayxr_atlas_trigger.weave_probe_vk_linux";
+	FILE *tf = fopen(trig.c_str(), "w");
+	if (tf != nullptr) {
+		fclose(tf);
+	}
+	LOG("lift: capture trigger %s (frame %d)", trig.c_str(), frame);
+}
+
 //! --service-log: the service's "lift rect: stream" lines since @p from (snapshot + woven required).
 static bool
 lift_log_check(const char *path, long from)
@@ -1845,6 +1980,7 @@ run_lift(Vk &vk,
 {
 	bool lift_ok = true;
 	const long log_from = service_log != nullptr ? lift_log_mark(service_log) : 0;
+	const XrRect2Di kRectA = g_lift_rect.extent.width > 0 ? g_lift_rect : ::kRectA;
 
 	// Put rect A's centre on the panel's centre. A lifted rect's TRACKED
 	// viewpoints are the eyes rebased to the rect centre, so the views' shift
@@ -1889,8 +2025,15 @@ run_lift(Vk &vk,
 		    (unsigned long long)props.supportedModes, (int)props.state, props.maxViews, props.backend);
 		XrLiftStreamCreateInfoDXR ci = {XR_TYPE_LIFT_STREAM_CREATE_INFO_DXR};
 		ci.mode = XR_LIFT_MODE_SBS_DXR;
+		ci.contentHint = (XrLiftContentHintDXR)g_lift_hint;
 		ci.inputScale = 1.0f;
 		XrResult cr = pfn_create(session, &ci, &stream);
+		PFN_xrSetLiftStreamPriorityDXR pfn_prio = nullptr;
+		xrGetInstanceProcAddr(instance, "xrSetLiftStreamPriorityDXR", (PFN_xrVoidFunction *)&pfn_prio);
+		if (XR_SUCCEEDED(cr) && g_lift_priority >= 0 && pfn_prio != nullptr) {
+			LOG("lift: priority %d -> %d", g_lift_priority,
+			    (int)pfn_prio(stream, (XrLiftPriorityDXR)g_lift_priority));
+		}
 		if (XR_FAILED(cr)) {
 			LOG("lift FAIL: xrCreateLiftStreamDXR(SBS) -> %d (service needs a provider: "
 			    "DXR_CONV_SIM_CONVERSION_ENABLE=1)",
@@ -1912,13 +2055,26 @@ run_lift(Vk &vk,
 		}
 		fill_sbs_rect(px, kWinW, kRectB, /*left*/ 0x00, /*right*/ 0xFF); // -> CYAN after anaglyph
 		const int half = kRectA.extent.width / 2;
+		std::vector<uint8_t> pic;
+		int pw = 0, ph = 0;
+		if (g_lift_image != nullptr && !read_ppm(g_lift_image, pic, pw, ph)) {
+			LOG("lift FAIL: --lift-image=%s is not a binary P6 PPM (maxval 255)", g_lift_image);
+			lift_ok = false;
+		}
 		for (int y = kRectA.offset.y; y < kRectA.offset.y + kRectA.extent.height; y++) {
 			for (int x = kRectA.offset.x; x < kRectA.offset.x + kRectA.extent.width; x++) {
+				if (!pic.empty()) {
+					const int sx = (x - kRectA.offset.x) * pw / kRectA.extent.width;
+					const int sy = (y - kRectA.offset.y) * ph / kRectA.extent.height;
+					const uint8_t *q = &pic[((size_t)sy * pw + sx) * 3];
+					put_px(px, kWinW, x, y, q[0], q[1], q[2]);
+					continue;
+				}
 				const bool left = (x - kRectA.offset.x) < half;
 				put_px(px, kWinW, x, y, left ? 0xFF : 0x00, 0x00, left ? 0x00 : 0xFF);
 			}
 		}
-		if (!create_exported_image(vk, kWinW, kWinH, lin) || !upload_and_release(vk, lin, px)) {
+		if (!lift_ok || !create_exported_image(vk, kWinW, kWinH, lin) || !upload_and_release(vk, lin, px)) {
 			LOG("lift FAIL: input image setup");
 			lift_ok = false;
 		}
@@ -1947,11 +2103,14 @@ run_lift(Vk &vk,
 		lsubmit.next = &lbatch;
 		lsubmit.inputTexture = (void *)(intptr_t)lin.fd;
 		lsubmit.firstChunk = XR_TRUE;
-		const int kLiftFrames = 90; // ~1.5 s: results land well before
+		const int kLiftFrames = g_lift_frames; // default 90 (~1.5 s): results land well before
 		int accepted = 0;
 		Image lout;
 		uint32_t lw = 0, lh = 0;
 		for (int frame = 0; frame < kLiftFrames && lift_ok; frame++) {
+			if (g_lift_capture && frame == (kLiftFrames > 30 ? kLiftFrames - 30 : 0)) {
+				lift_capture_trigger(frame);
+			}
 			XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
 			XrResult r = pfn_submit(session, &lsubmit, &out);
 			if (XR_FAILED(r)) {
@@ -1996,10 +2155,15 @@ run_lift(Vk &vk,
 			uint8_t r, g, b, a;
 			sample(px, kWinW, qx, qy, &r, &g, &b, &a);
 			const bool red = r > 150 && g < 80 && b < 80;
-			LOG("lift rect A quarter @(%d,%d) = (%u,%u,%u) want red (lifted 2D; magenta = woven as SBS) -> "
-			    "%s",
-			    qx, qy, r, g, b, red ? "OK" : "WRONG");
-			lift_ok = red;
+			if (g_lift_image != nullptr) {
+				LOG("lift rect A quarter @(%d,%d) = (%u,%u,%u) (a picture: no colour check)", qx, qy, r, g,
+				    b);
+			} else {
+				LOG("lift rect A quarter @(%d,%d) = (%u,%u,%u) want red (lifted 2D; magenta = woven as "
+				    "SBS) -> %s",
+				    qx, qy, r, g, b, red ? "OK" : "WRONG");
+				lift_ok = red;
+			}
 			const int bx = kRectB.offset.x + kRectB.extent.width / 2;
 			const int by = kRectB.offset.y + kRectB.extent.height / 2;
 			sample(px, kWinW, bx, by, &r, &g, &b, &a);
@@ -2060,6 +2224,22 @@ main(int argc, char **argv)
 			do_lift = true;
 		} else if (strncmp(argv[i], "--service-log=", 14) == 0) {
 			lift_log = argv[i] + 14;
+		} else if (strncmp(argv[i], "--lift-image=", 13) == 0) {
+			g_lift_image = argv[i] + 13;
+		} else if (strncmp(argv[i], "--lift-frames=", 14) == 0) {
+			g_lift_frames = atoi(argv[i] + 14) > 0 ? atoi(argv[i] + 14) : 90;
+		} else if (strncmp(argv[i], "--lift-rect=", 12) == 0 &&
+		           sscanf(argv[i] + 12, "%d,%d,%d,%d", &g_lift_rect.offset.x, &g_lift_rect.offset.y,
+		                  &g_lift_rect.extent.width, &g_lift_rect.extent.height) == 4) {
+			// rect A of the lift leg (inside the window, clear of rect B)
+		} else if (strcmp(argv[i], "--lift-hint=video") == 0) {
+			g_lift_hint = XR_LIFT_CONTENT_HINT_VIDEO_DXR;
+		} else if (strcmp(argv[i], "--lift-hint=photo") == 0) {
+			g_lift_hint = XR_LIFT_CONTENT_HINT_PHOTO_DXR;
+		} else if (strncmp(argv[i], "--lift-priority=", 16) == 0) {
+			g_lift_priority = atoi(argv[i] + 16);
+		} else if (strcmp(argv[i], "--lift-capture") == 0) {
+			g_lift_capture = true;
 		} else if (strncmp(argv[i], "--bind-origin=", 14) == 0 &&
 		           sscanf(argv[i] + 14, "%d,%d", &kWinOrigin.x, &kWinOrigin.y) == 2) {
 			// The bound windowOriginOnScreen (weave geometry frame: device px,
@@ -2076,7 +2256,9 @@ main(int argc, char **argv)
 			g_move_count++;
 		} else {
 			LOG("usage: %s [--frames=N] [--service-pid=PID] [--dump-dir=DIR] [--dmabuf [--no-release-wait] "
-			    "[--linear]] [--span2d] [--flat-regions] [--lift [--service-log=PATH]] [--bind-origin=X,Y] "
+			    "[--linear]] [--span2d] [--flat-regions] [--lift [--service-log=PATH] [--lift-image=PPM] "
+			    "[--lift-rect=X,Y,W,H] [--lift-frames=N] [--lift-hint=video|photo] [--lift-priority=P] "
+			    "[--lift-capture]] [--bind-origin=X,Y] "
 			    "[--bind-logical=LX,LY,SCALE] [--move-to=X,Y,LX,LY,SCALE]...",
 			    argv[0]);
 			return 2;
@@ -2085,7 +2267,9 @@ main(int argc, char **argv)
 	if (frames < 20) {
 		frames = 20;
 	}
-	if (do_lift && (dmabuf || span2d || flat_regions)) {
+	if (do_lift && dmabuf && !span2d && !flat_regions) {
+		g_dmabuf_lift = true; // the stage-B lift leg (run_dmabuf)
+	} else if (do_lift && (dmabuf || span2d || flat_regions)) {
 		LOG("--lift runs on the stage-A run (not with --dmabuf / --span2d / --flat-regions)");
 		return 2;
 	}
@@ -2150,6 +2334,7 @@ main(int argc, char **argv)
 	ici.enabledExtensionNames = enabled.data();
 	XrInstance instance = XR_NULL_HANDLE;
 	XR_CHECK(xrCreateInstance(&ici, &instance));
+	g_xr_instance = instance;
 
 	XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO};
 	sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
