@@ -63,6 +63,17 @@ comp_ipc_client_compositor_set_view_routing(struct xrt_compositor *xc, const str
 DEBUG_GET_ONCE_BOOL_OPTION(views_change_event, "DXR_VIEWS_CHANGE_EVENT", true)
 
 /*
+ * A legacy app (no XR_DXR_display_info) reaching us through an OpenXR
+ * translation layer can submit a non-projection layer whose struct arrived
+ * garbled (a quad with a non-unit orientation, an out-of-range array index)
+ * while its projection layer is fine. The spec answer is to refuse the frame,
+ * which for such an app means every frame is refused and the display stays
+ * black. Drop just the bad layer instead. DXR_STRICT_LAYERS=1 restores the
+ * refusal; extension apps always get it.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(strict_layers, "DXR_STRICT_LAYERS", false)
+
+/*
  * ADR-041 staging switch for the fixed-view-count submission contract.
  *
  *   0 = strict     every view configuration submits exactly the located count.
@@ -3276,6 +3287,11 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	}
 #endif
 
+	const bool drop_invalid_layers =
+	    !sess->sys->inst->extensions.DXR_display_info && !debug_get_bool_option_strict_layers();
+	bool layer_dropped[XRT_MAX_LAYERS] = {0};
+	uint32_t dropped_count = 0;
+
 	for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
 		const XrCompositionLayerBaseHeader *layer = frameEndInfo->layers[i];
 		if (layer == NULL) {
@@ -3326,13 +3342,33 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			break;
 #endif // OXR_HAVE_DXR_local_3d_zone
 		default:
-			return oxr_error(log, XR_ERROR_LAYER_INVALID,
-			                 "(frameEndInfo->layers[%u]->type) layer type not supported (%u)", i,
-			                 layer->type);
+			res =
+			    oxr_error(log, XR_ERROR_LAYER_INVALID,
+			              "(frameEndInfo->layers[%u]->type) layer type not supported (%u)", i, layer->type);
+			break;
 		}
 
 		if (res != XR_SUCCESS) {
-			return res;
+			if (!drop_invalid_layers || layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION ||
+			    i >= XRT_MAX_LAYERS) {
+				return res;
+			}
+			layer_dropped[i] = true;
+			dropped_count++;
+		}
+	}
+
+	if (dropped_count > 0) {
+		if (dropped_count == frameEndInfo->layerCount) {
+			return oxr_error(log, XR_ERROR_LAYER_INVALID, "every layer of this frame is invalid");
+		}
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W(
+			    "legacy session: dropping %u invalid non-projection layer(s) of %u instead of refusing "
+			    "the frame (DXR_STRICT_LAYERS=1 refuses); logged once",
+			    dropped_count, frameEndInfo->layerCount);
 		}
 	}
 
@@ -3503,6 +3539,9 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
 		const XrCompositionLayerBaseHeader *layer = frameEndInfo->layers[i];
 		assert(layer != NULL);
+		if (i < XRT_MAX_LAYERS && layer_dropped[i]) {
+			continue;
+		}
 
 		switch (layer->type) {
 		case XR_TYPE_COMPOSITION_LAYER_PROJECTION:
