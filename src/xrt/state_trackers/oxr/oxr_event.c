@@ -23,6 +23,13 @@
 #include <string.h>
 #include <stdlib.h>
 
+/*
+ * Display events are gated on the extension that defines them. The OpenXR spec
+ * forbids returning an event structure from an extension the application did
+ * not enable, and these events fire on their own (the panel goes 3D, a viewer
+ * is found or lost). An app that never enabled the extension, such as a legacy
+ * app behind a translation layer, can fail on an event type it does not know.
+ */
 
 /*
  *
@@ -454,6 +461,10 @@ oxr_event_push_XrEventDataRenderingModeChanged(struct oxr_logger *log,
 	XrEventDataRenderingModeChangedDXR *changed;
 	struct oxr_event *event = NULL;
 
+	if (!inst->extensions.DXR_display_info) {
+		return XR_SUCCESS; // the app did not enable it, see the top of the file
+	}
+
 	ALLOC(log, inst, &event, &changed);
 
 	changed->type = XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR;
@@ -484,6 +495,10 @@ oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
 	XrEventDataEyeTrackingStateChangedDXR *changed;
 	struct oxr_event *event = NULL;
 
+	if (!inst->extensions.DXR_display_info) {
+		return XR_SUCCESS; // the app did not enable it, see the top of the file
+	}
+
 	ALLOC(log, inst, &event, &changed);
 
 	changed->type = XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR;
@@ -509,6 +524,10 @@ oxr_event_push_XrEventDataDisplaysChangedDXR(struct oxr_logger *log, struct oxr_
 	struct oxr_instance *inst = sess->sys->inst;
 	XrEventDataDisplaysChangedDXR *changed;
 	struct oxr_event *event = NULL;
+
+	if (!inst->extensions.DXR_display_info) {
+		return XR_SUCCESS; // the app did not enable it, see the top of the file
+	}
 
 	ALLOC(log, inst, &event, &changed);
 
@@ -607,6 +626,10 @@ oxr_event_push_XrEventDataRearDepthBudgetStateChanged(struct oxr_logger *log,
 	XrEventDataRearDepthBudgetStateChangedDXR *changed;
 	struct oxr_event *event = NULL;
 
+	if (!inst->extensions.DXR_depth_budget) {
+		return XR_SUCCESS; // the app did not enable it, see the top of the file
+	}
+
 	ALLOC(log, inst, &event, &changed);
 
 	changed->type = XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR;
@@ -639,6 +662,10 @@ oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(struct oxr_logger *log,
 	struct oxr_instance *inst = sess->sys->inst;
 	XrEventDataLocal3DZoneViewSizeChangedDXR *changed;
 	struct oxr_event *event = NULL;
+
+	if (!(inst->extensions.DXR_local_3d_zone || inst->extensions.DXR_display_zones)) {
+		return XR_SUCCESS; // the app did not enable it, see the top of the file
+	}
 
 	ALLOC(log, inst, &event, &changed);
 
@@ -745,6 +772,10 @@ oxr_event_push_XrEventDataHardwareDisplayStateChanged(struct oxr_logger *log,
 	XrEventDataHardwareDisplayStateChangedDXR *changed;
 	struct oxr_event *event = NULL;
 
+	if (!(inst->extensions.DXR_display_info || inst->extensions.DXR_weave)) {
+		return XR_SUCCESS; // the app did not enable it, see the top of the file
+	}
+
 	ALLOC(log, inst, &event, &changed);
 
 	changed->type = XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_DXR;
@@ -772,6 +803,10 @@ oxr_event_push_XrEventDataDisplayModeRequestDenied(struct oxr_logger *log,
 	struct oxr_instance *inst = sess->sys->inst;
 	XrEventDataDisplayModeRequestDeniedDXR *denied;
 	struct oxr_event *event = NULL;
+
+	if (!inst->extensions.DXR_display_info) {
+		return XR_SUCCESS; // the app did not enable it, see the top of the file
+	}
 
 	ALLOC(log, inst, &event, &denied);
 
