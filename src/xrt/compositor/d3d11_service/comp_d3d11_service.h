@@ -56,6 +56,13 @@ struct ipc_file_picker_result_path;
  * @param xdev The head device to render for.
  * @param xsysd System devices for qwerty input support (may be NULL).
  * @param usys System used to fan out session events (may be NULL).
+ * @param panel_screen_left The head panel's origin as the active plug-in
+ *        reported it (`xrt_plugin_display_info::display_screen_left`), 0 when
+ *        unknown. `xrt_system_compositor_info::display_screen_left/top` is only
+ *        filled after this returns, so the adapter selection and the
+ *        output-device split, which run here, read the panel's monitor from
+ *        this instead of from a desktop-origin zero.
+ * @param panel_screen_top Same, top edge.
  * @param[out] out_xsysc Pointer to receive the system compositor.
  * @return XRT_SUCCESS on success.
  *
@@ -65,6 +72,8 @@ xrt_result_t
 comp_d3d11_service_create_system(struct xrt_device *xdev,
                                  struct xrt_system_devices *xsysd,
                                  struct u_system *usys,
+                                 int32_t panel_screen_left,
+                                 int32_t panel_screen_top,
                                  struct xrt_system_compositor **out_xsysc);
 
 /*!

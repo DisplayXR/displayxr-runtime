@@ -1886,6 +1886,13 @@ struct d3d11_service_system
 	//! Base system compositor - must be first!
 	struct xrt_system_compositor base;
 
+	//! The head panel's origin as the plug-in reported it at create time
+	//! (see @ref comp_d3d11_service_create_system). `base.info`'s origin is
+	//! still zero while create_system runs, so the create-time adapter and
+	//! split decisions read the panel's monitor from here.
+	int32_t create_panel_left = 0;
+	int32_t create_panel_top = 0;
+
 	//! spec_version 13: controller-pushed cursor sprite source. The controller
 	//! creates a session-global swapchain (xrCreateWorkspaceCursorSwapchainDXR),
 	//! renders its sprite into it, and points the runtime at it via
@@ -2800,18 +2807,19 @@ service_split_stage_a(struct d3d11_service_system *sys,
 
 	/*
 	 * The panel's screen ORIGIN. At this point in create_system
-	 * `sys->base.info.display_screen_left/top` are still the pre-DP zeros — the
-	 * real values arrive with the first display processor, which needs a window,
-	 * which needs a client. That is not the problem it looks like: the service's
-	 * display processor is created for COMP_DP_PRIMARY_MONITOR (see every
-	 * `comp_dp_factory_for_window` call in this file), and a 0,0 origin plus
-	 * `MONITOR_DEFAULTTONEAREST` resolves to exactly that monitor. If the
-	 * service ever drives a non-primary panel this has to move to the first
-	 * DP-backed frame; today it would be resolving a monitor the service never
-	 * presents to.
+	 * `sys->base.info.display_screen_left/top` are still zero: the instance
+	 * fills them only after the system compositor exists. The service's display
+	 * processor is created for COMP_DP_PRIMARY_MONITOR, which is the ACTIVE
+	 * PLUG-IN's panel (`xrt_dp_registry_primary_entry`), not the Windows
+	 * primary monitor; a zero origin + `MONITOR_DEFAULTTONEAREST` resolved the
+	 * Windows primary instead, so on a rig whose head panel is not the monitor
+	 * at the desktop origin the split chose its output adapter for a monitor
+	 * the service never presents to. The instance now hands in the origin the
+	 * plug-in reported (#2577 follow-up); (0, 0), unknown or the panel really
+	 * at the origin, resolves exactly as before.
 	 */
-	const int32_t panel_left = sys->base.info.display_screen_left;
-	const int32_t panel_top = sys->base.info.display_screen_top;
+	const int32_t panel_left = sys->create_panel_left;
+	const int32_t panel_top = sys->create_panel_top;
 
 	if (comp_split_gate_env_requested()) {
 		const uint64_t stage_a_start_ns = os_monotonic_get_ns();
@@ -34090,13 +34098,18 @@ extern "C" xrt_result_t
 comp_d3d11_service_create_system(struct xrt_device *xdev,
                                  struct xrt_system_devices *xsysd,
                                  struct u_system *usys,
+                                 int32_t panel_screen_left,
+                                 int32_t panel_screen_top,
                                  struct xrt_system_compositor **out_xsysc)
 {
-	U_LOG_W("Creating D3D11 service system compositor (xsysd=%p usys=%p)", (void *)xsysd, (void *)usys);
+	U_LOG_W("Creating D3D11 service system compositor (xsysd=%p usys=%p, plug-in panel origin %d,%d)",
+	        (void *)xsysd, (void *)usys, (int)panel_screen_left, (int)panel_screen_top);
 
 	// Allocate system compositor
 	struct d3d11_service_system *sys = new d3d11_service_system();
 	std::memset(&sys->base, 0, sizeof(sys->base));
+	sys->create_panel_left = panel_screen_left;
+	sys->create_panel_top = panel_screen_top;
 
 	sys->xdev = xdev;
 	sys->usys = usys;
@@ -34171,19 +34184,17 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	{
 		/*
 		 * Panel rect. Only `DXR_D3D_FORCE_GPU=scanout` reads it. The extent
-		 * comes from the device; the ORIGIN is still the pre-DP zero (the real
-		 * one arrives with the first display processor, which needs a window,
-		 * which needs a client), and 0,0 + MONITOR_DEFAULTTONEAREST resolves to
-		 * the primary monitor — which is the monitor the service's DP is
-		 * created for. Same reasoning and same limitation as
-		 * service_split_stage_a(), deliberately spelled the same way.
+		 * comes from the device; the ORIGIN is the one the plug-in reported,
+		 * handed in by the instance because `base.info`'s is still zero here.
+		 * Same reasoning as service_split_stage_a(), deliberately spelled the
+		 * same way.
 		 */
 		const uint32_t panel_w = (xdev != nullptr && xdev->hmd != nullptr) ? xdev->hmd->screens[0].w_pixels : 0;
 		const uint32_t panel_h = (xdev != nullptr && xdev->hmd != nullptr) ? xdev->hmd->screens[0].h_pixels : 0;
 
-		xrt::auxiliary::d3d::RenderAdapterChoice ingest = xrt::auxiliary::d3d::getRenderAdapter(
-		    sys->base.info.display_screen_left, sys->base.info.display_screen_top, panel_w, panel_h,
-		    D3D_FEATURE_LEVEL_11_0, U_LOGGING_INFO);
+		xrt::auxiliary::d3d::RenderAdapterChoice ingest =
+		    xrt::auxiliary::d3d::getRenderAdapter(sys->create_panel_left, sys->create_panel_top, panel_w,
+		                                          panel_h, D3D_FEATURE_LEVEL_11_0, U_LOGGING_INFO);
 
 		/*
 		 * Assert §2's answer against the preference this site used to hardcode

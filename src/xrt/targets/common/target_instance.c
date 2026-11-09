@@ -1346,6 +1346,11 @@ t_instance_create_system(struct xrt_instance *xinst,
 	// in the normal case.
 	uint64_t scanout_adapter_luid = 0;
 	uint64_t render_adapter_luid = 0;
+	// The head panel's origin as the plug-in reports it, for the service
+	// compositor's create-time adapter + split decisions (the system info's
+	// origin is filled only after the compositor exists). 0,0 = unknown.
+	int32_t create_panel_left = 0;
+	int32_t create_panel_top = 0;
 	{
 		const struct xrt_plugin_iface *rr_plugin = target_plugin_get_active();
 		struct xrt_plugin_display_info rr_pdi;
@@ -1355,6 +1360,8 @@ t_instance_create_system(struct xrt_instance *xinst,
 			}
 			scanout_adapter_luid = resolve_scanout_adapter_luid(&rr_pdi);
 			render_adapter_luid = resolve_render_adapter_luid(&rr_pdi);
+			create_panel_left = rr_pdi.display_screen_left;
+			create_panel_top = rr_pdi.display_screen_top;
 		} else {
 			resolve_scanout_adapter_luid(NULL);
 			render_adapter_luid = resolve_render_adapter_luid(NULL);
@@ -1378,7 +1385,7 @@ t_instance_create_system(struct xrt_instance *xinst,
 	// Try D3D11 service compositor first (preferred for Windows service mode)
 	if (xret == XRT_SUCCESS && xsysc == NULL && debug_get_bool_option_use_d3d11_service()) {
 		U_LOG_W("Using D3D11 service compositor");
-		xret = comp_d3d11_service_create_system(head, xsysd, usys, &xsysc);
+		xret = comp_d3d11_service_create_system(head, xsysd, usys, create_panel_left, create_panel_top, &xsysc);
 		if (xret == XRT_SUCCESS && xsysc != NULL) {
 			U_LOG_W("Service compositor ready: D3D11 service compositor (pure D3D11, no Vulkan)");
 		}
