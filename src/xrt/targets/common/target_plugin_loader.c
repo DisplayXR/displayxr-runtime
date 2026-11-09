@@ -2685,6 +2685,7 @@ target_plugin_note_active_panel(const struct xrt_plugin_display_info *pdi)
 	g_active_panel_hint.pixel_height = pdi->display_pixel_height;
 	g_active_panel_hint.width_m = pdi->display_width_m;
 	g_active_panel_hint.height_m = pdi->display_height_m;
+	g_active_panel_hint.origin_valid = (pdi->display_flags & XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID) != 0;
 	g_active_panel_valid = pdi->display_pixel_width > 0 && pdi->display_pixel_height > 0;
 	if (g_refresh_mutex_initialized) {
 		os_mutex_unlock(&g_refresh_mutex);
@@ -3146,9 +3147,10 @@ panel_monitor_index(const struct xrt_display_descriptor *descs,
 		}
 	}
 
-	// Rule 1: the plug-in placed its panel. Trust a non-(0,0) origin that
-	// falls inside a monitor whose own origin is a real desktop position.
-	if (hint->screen_left != 0 || hint->screen_top != 0) {
+	// Rule 1: the plug-in placed its panel. Trust a non-(0,0) origin (or a
+	// (0, 0) it vouched for, #2577) that falls inside a monitor whose own
+	// origin is a real desktop position.
+	if (hint->origin_valid || hint->screen_left != 0 || hint->screen_top != 0) {
 		for (uint32_t i = 0; i < n; i++) {
 			const struct os_display_desktop_info *m = &mons[i];
 			if (origin_known[i] && hint->screen_left >= m->left &&

@@ -227,9 +227,11 @@ Fields to populate:
 | `nominal_viewer_x_m`, `nominal_viewer_y_m`, `nominal_viewer_z_m` | meters (float) | Default viewer position relative to display center. Drives Kooima projection defaults when the app has no head tracking. |
 | `display_pixel_width`, `display_pixel_height` | pixels (uint32) | Native panel resolution |
 | `recommended_view_scale_x`, `recommended_view_scale_y` | float, 1.0 = native | Vendor-recommended per-view scaling. <1.0 means downscale. **Baseline hint only** — see the rule below. |
-| `display_screen_left`, `display_screen_top` | virtual-screen coords (int32) | Display top-left in Windows-style virtual-screen pixels. Used to position workspace windows. Both 0 = "no preference / display origin == desktop origin" (sim-display picks this). |
+| `display_screen_left`, `display_screen_top` | virtual-screen coords (int32) | Display top-left in Windows-style virtual-screen pixels. Used to position workspace windows. Both 0 = "no preference" (sim-display picks this) unless `display_flags` carries `XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID`. |
 | `supported_eye_tracking_modes` | bitmask | bit 0 = MANAGED, bit 1 = MANUAL, `0` = no eye tracking. A typical hardware DP is MANAGED-only; the reference simulator (sim_display) declares `0` — its positions are nominal, not tracked (`SIM_DISPLAY_FAKE_TRACKING=1` dev toggle re-enables MANUAL for testing). Must be non-zero iff at least one `xrt_rendering_mode` sets `XRT_RENDERING_MODE_FLAG_HAS_TRACKING` in `mode_flags` (ABI v3, #441). |
 | `default_eye_tracking_mode` | enum | 0 = MANAGED, 1 = MANUAL. |
+| `refresh_mhz` | milli-Hz (uint32) | Panel refresh rate; `0` = unknown. |
+| `display_flags` | bitmask (uint32) | `XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID` (bit 0): `display_screen_left/top` is a real position **even when it is (0, 0)** — set it whenever the origin came from an identified monitor. Without it (0, 0) reads as "no preference" and the runtime picks the panel's monitor by claim / size heuristics, which with two panels of one vendor and the primary at the desktop origin chose the wrong one (#2577). `#ifdef XRT_PLUGIN_HAS_DISPLAY_ORIGIN_VALID`. |
 
 **The view-scale rule — one derivation, never two.**
 `xrt_rendering_mode::view_scale_x/y` (your device's mode table) is the **single
