@@ -205,6 +205,12 @@ struct conv_stream_stats
 	 *  0 / 0 before the first result. */
 	uint64_t content_age_ns;
 	uint64_t placement_age_ns;
+	/*! The latest conversion placed every view on one point (its baseline
+	 *  collapsed: a MANAGED display collapses the viewer's eye pair while
+	 *  nobody is tracked), so its views are identical -- no parallax. And how
+	 *  many conversions came out that way. Diagnostics only. */
+	bool viewer_collapsed;
+	uint64_t collapsed_conversions;
 };
 
 //! Per-stream options the v3 handlers / service add to the wire descriptor.

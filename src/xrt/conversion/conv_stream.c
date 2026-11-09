@@ -75,6 +75,53 @@ note_convergence_owner(struct conv_stream *st, bool provider_owns)
 	                                                  : "provider default (no runtime observer)");
 }
 
+/*
+ * A view set whose viewpoints all sit on one point synthesises the same image
+ * N times. That is the right answer while a MANAGED display has collapsed the
+ * viewer's eye pair (nobody tracked: the panel itself shows 2D), but in a
+ * capture it reads exactly like a lift that never ran -- the two tiles of the
+ * DP input are bit-identical. Hysteresis keeps a collapse animation from
+ * logging twice.
+ */
+#define CONV_VIEWER_COLLAPSED_M 0.0005f
+#define CONV_VIEWER_SEPARATED_M 0.002f
+
+/*!
+ * ONE WARN per transition between "the viewpoints collapsed onto one point"
+ * and "separated again". Dispatcher thread only; @p eyes is the snapshot the
+ * policy just used.
+ */
+static void
+note_viewer_collapse(struct conv_stream *st, const struct xrt_conv_params *pa, const struct conv_eyes *eyes)
+{
+	if (pa->viewpoint_count < 2) {
+		return; // depth / splat streams, or a single view: nothing to separate
+	}
+	const float b = pa->baseline_m;
+	const bool collapsed = st->viewer_collapsed ? !(b > CONV_VIEWER_SEPARATED_M) : b < CONV_VIEWER_COLLAPSED_M;
+	if (collapsed == st->viewer_collapsed) {
+		return;
+	}
+	st->viewer_collapsed = collapsed;
+	if (!collapsed) {
+		U_LOG_W("[conv] stream %llu: viewpoints separated again (baseline %.1f mm): parallax back",
+		        (unsigned long long)st->id, b * 1000.0f);
+		return;
+	}
+	const char *why = pa->viewpoint_source == XRT_CONV_VIEWPOINTS_EXPLICIT ? "the app's own viewpoints"
+	                  : pa->viewpoint_source == XRT_CONV_VIEWPOINTS_DISPLAY_RIG ||
+	                          pa->viewpoint_source == XRT_CONV_VIEWPOINTS_CAMERA_RIG
+	                      ? "the app's rig"
+	                  : !eyes->valid      ? "no fresh eyes"
+	                  : eyes->is_tracking ? "the display's eye pair, tracked"
+	                                      : "the display's eye pair, NOT tracked (a MANAGED display collapses it "
+	                                        "while nobody is in front of the camera)";
+	U_LOG_W(
+	    "[conv] stream %llu: the %u viewpoints collapsed onto one point (baseline %.2f mm; from %s) -- its views "
+	    "are identical, no parallax, until they separate again",
+	    (unsigned long long)st->id, pa->viewpoint_count, b * 1000.0f, why);
+}
+
 static struct conv_stream *
 find_locked(struct conv_core *core, uint64_t id)
 {
@@ -930,6 +977,7 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			vin.eyes = &eyes;
 			vin.now_ns = t0;
 			conv_policy_viewpoints(&vin, &st->vstate, pa, NULL);
+			note_viewer_collapse(st, pa, &eyes);
 
 			note_convergence_owner(st, provider_owns);
 			float obs = 0.0f;
@@ -1062,6 +1110,10 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			republish_latest_locked(st, &meta, &s.frame);
 			st->stats.deduped++;
 		} else if (ok) {
+			st->stats.viewer_collapsed = st->viewer_collapsed;
+			if (st->viewer_collapsed) {
+				st->stats.collapsed_conversions++;
+			}
 			o->written = pf->result.written;
 			o->provider_written = pf->provider_out.written;
 			o->views_info = pf->result.views_info;

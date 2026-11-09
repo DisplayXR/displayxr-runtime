@@ -879,6 +879,16 @@ So position and size are always this frame's, and only the depth is one conversi
 A v6 frame carrying lift rects never takes the zero-copy path (the service writes into its crop
 copy, never the caller's texture).
 
+**Identical views are not always a lift that failed.** The views are placed for the viewer the
+display reports (TRACKED). A MANAGED display collapses the viewer's eye pair onto one point while
+nobody is tracked (`docs/specs/vendor/eye-tracking-modes.md`); every viewpoint then sits on that
+point, and the two tiles of the DP input are both the 2D frame, bit for bit -- exactly what a rect
+woven flat looks like in a capture. The panel shows 2D in that state anyway. The service says
+which it is: one WARN per transition, `[conv] stream N: the 2 viewpoints collapsed onto one point
+(... from the display's eye pair, NOT tracked ...)` and `viewpoints separated again`, and the
+stream's stats carry `viewer_collapsed` / `collapsed_conversions`. Check that line (and that
+someone is in front of the camera) before reading identical tiles as a lift fault.
+
 **Platforms.**
 
 | Service | Lifted weave rects |
@@ -886,7 +896,7 @@ copy, never the caller's texture).
 | Windows (D3D11 service) | yes |
 | macOS, Vulkan weave backend (`DXR_WEAVE_MAC_BACKEND=vk`, or `auto` with a plug-in that exports a Vulkan DP) | yes. The snapshot reaches a CPU-lane provider through host memory; same policy as Windows |
 | macOS, Metal weave backend (`DXR_WEAVE_MAC_BACKEND=metal`, or `auto` with a plug-in that exports only a Metal DP) | yes. Same policy and same CPU-lane snapshot as the Vulkan backend. The result is the IOSurface the conversion glue exported, sampled in Metal. A result with no IOSurface export (device-private or layered) is woven flat |
-| desktop Linux (the Vulkan weave engine) | yes (same code as macOS Vulkan; not yet run on hardware) |
+| desktop Linux (the Vulkan weave engine) | yes (same code as macOS Vulkan). Run end to end on an Intel iGPU with a CPU-input depth provider through the service: stage-A and stage-B (dma-buf) inputs, letterboxed and full-window rects, photo and video hints |
 
 No cursor is drawn on the POSIX weave engines yet: the lift cursor mask is 0 (not drawn), and the
 app falls back to the OS cursor (`XR_DXR_cursor_depth` §2.7).
