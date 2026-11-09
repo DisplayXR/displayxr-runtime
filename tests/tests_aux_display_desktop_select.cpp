@@ -286,6 +286,39 @@ TEST_CASE("claim select: several claims — verified, then the panel's size, the
 	CHECK(os_display_desktop_select_claim(by_order, 2, &h, nullptr) == 0);
 }
 
+/*
+ * #2577: the primary monitor is itself a verified panel at (0, 0), a second
+ * verified panel of the same size sits beside it, and the plug-in reports the
+ * head panel's origin as (0, 0) (the primary). "Non-primary" used to break the
+ * tie and the head screen became the second panel, while the session's DP
+ * wove the first.
+ */
+TEST_CASE("claim select: #2577 repro — two verified panels, origin (0, 0) keeps the panel at the origin")
+{
+	const os_display_panel_hint h = panel_hint(); // (0, 0), 3840x2160
+	const os_display_panel_claim claims[] = {claim(0, 3840, 2160, true, true), claim(3840, 3840, 2160, true)};
+	CHECK(os_display_desktop_select_claim(claims, 2, &h, nullptr) == 0);
+
+	// Registry order does not matter.
+	const os_display_panel_claim swapped[] = {claim(3840, 3840, 2160, true), claim(0, 3840, 2160, true, true)};
+	CHECK(os_display_desktop_select_claim(swapped, 2, &h, nullptr) == 1);
+
+	// The incumbent (#2305) still outranks it: a live session keeps its panel.
+	os_display_panel_claim live[] = {claim(0, 3840, 2160, true, true), claim(3840, 3840, 2160, true)};
+	live[1].incumbent = true;
+	CHECK(os_display_desktop_select_claim(live, 2, &h, nullptr) == 1);
+
+	// The panel's own size still outranks it.
+	const os_display_panel_claim by_size[] = {claim(0, 2560, 1600, true, true), claim(2560, 3840, 2160, true)};
+	CHECK(os_display_desktop_select_claim(by_size, 2, &h, nullptr) == 1);
+
+	// An EDID-level claim at the origin does not get the term (#430's shape:
+	// the laptop screen) — the verified panel elsewhere wins as before.
+	const os_display_panel_claim edid_at_origin[] = {claim(0, 3840, 2160, false, true),
+	                                                 claim(3840, 3840, 2160, true)};
+	CHECK(os_display_desktop_select_claim(edid_at_origin, 2, &h, nullptr) == 1);
+}
+
 TEST_CASE("claim select: an overriding origin only ever lands on a VERIFIED claim")
 {
 	os_display_panel_hint h = panel_hint();
