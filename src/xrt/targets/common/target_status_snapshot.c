@@ -213,6 +213,7 @@ resolve_system(struct xrt_system_devices *xsysd, struct target_screens_system *s
 	    .pixel_height = info.display_pixel_height,
 	    .width_m = info.display_width_m,
 	    .height_m = info.display_height_m,
+	    .origin_valid = (info.display_flags & XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID) != 0,
 	};
 	struct os_display_desktop_info desk;
 	struct os_display_panel_match match;

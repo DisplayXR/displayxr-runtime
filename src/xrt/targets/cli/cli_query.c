@@ -2256,6 +2256,7 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 		    .pixel_height = info.display_pixel_height,
 		    .width_m = info.display_width_m,
 		    .height_m = info.display_height_m,
+		    .origin_valid = (info.display_flags & XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID) != 0,
 		};
 		// The claim rule first, exactly as fill_display_desktop_info runs it
 		// (displayxr-leia-plugin#430), over the registry probe_dp_selection

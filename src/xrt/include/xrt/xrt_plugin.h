@@ -142,7 +142,38 @@ struct xrt_plugin_display_info
 	 *  swapchain compositor to source vblank from. Append-only (struct_size
 	 *  guards older plug-ins that don't write it). */
 	uint32_t refresh_mhz;
+
+	/*! `XRT_PLUGIN_DISPLAY_FLAG_*` bits qualifying the fields above. 0 from
+	 *  every plug-in built before the field existed (the runtime zeroes the
+	 *  struct and an older plug-in never writes this far), which reads as
+	 *  exactly the old contract. Append-only. */
+	uint32_t display_flags;
+
+	/*! Reserved for alignment. Must be 0. */
+	uint32_t reserved_1;
 };
+
+/*!
+ * `xrt_plugin_display_info::display_flags`: `display_screen_left/top` is a
+ * real position, even when it is (0, 0).
+ *
+ * Without the bit, (0, 0) has to mean "no preference" — sim_display reports
+ * it, and so does a plug-in that could not resolve its panel — so the runtime
+ * cannot tell it apart from a panel that IS the monitor at the desktop
+ * origin, and falls back to claim, size and primary heuristics. With two
+ * panels of one vendor and the primary one at (0, 0), those heuristics picked
+ * the other panel as the head screen (#2577). A plug-in that set its origin
+ * from an identified monitor (EDID record, SR enumeration, verified claim)
+ * sets the bit; one that defaulted the fields leaves it clear.
+ */
+#define XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID (1u << 0)
+
+/*!
+ * Defined when this header carries `xrt_plugin_display_info::display_flags`
+ * and @ref XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID: a plug-in built
+ * against an older header can `#ifdef` its use.
+ */
+#define XRT_PLUGIN_HAS_DISPLAY_ORIGIN_VALID 1
 
 
 /*

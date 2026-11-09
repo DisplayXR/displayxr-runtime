@@ -413,3 +413,57 @@ TEST_CASE("claim select: origin_on_claim is exactly select_claim's 'the two agre
 	h.screen_top = 2160;
 	CHECK_FALSE(os_display_desktop_origin_on_claim(back, 1, &h));
 }
+
+/*
+ * #2577 follow-up: the origin-valid bit. A plug-in that set its origin from an
+ * identified monitor vouches for (0, 0), which then IS an origin — the
+ * monitor at the desktop origin — instead of "no preference".
+ */
+TEST_CASE("claim select: an origin-valid (0, 0) on a claimed panel is the agree case")
+{
+	os_display_panel_hint h = panel_hint();
+	h.origin_valid = true;
+
+	// Two verified panels of one size, the primary at (0, 0): the origin rule
+	// stays in charge (it resolves the primary), whatever the scoring says.
+	const os_display_panel_claim claims[] = {claim(0, 3840, 2160, true, true), claim(3840, 3840, 2160, true)};
+	CHECK(os_display_desktop_origin_on_claim(claims, 2, &h));
+	CHECK(os_display_desktop_select_claim(claims, 2, &h, nullptr) == -1);
+
+	// Even with the other panel as the incumbent (the origin rule always
+	// outranked the incumbent when the two agree).
+	os_display_panel_claim live[] = {claim(0, 3840, 2160, true, true), claim(3840, 3840, 2160, true)};
+	live[1].incumbent = true;
+	CHECK(os_display_desktop_select_claim(live, 2, &h, nullptr) == -1);
+}
+
+TEST_CASE("claim select: an origin-valid (0, 0) on no claim yields to a VERIFIED claim only")
+{
+	os_display_panel_hint h = panel_hint();
+	h.origin_valid = true;
+
+	// The laptop is at (0, 0) and unclaimed; the plug-in's vouched origin
+	// contradicts its own verified claim, which wins as for any other origin.
+	const os_display_panel_claim verified[] = {claim(2560, 3840, 2160, true)};
+	bool overrides = false;
+	CHECK_FALSE(os_display_desktop_origin_on_claim(verified, 1, &h));
+	CHECK(os_display_desktop_select_claim(verified, 1, &h, &overrides) == 0);
+	CHECK(overrides);
+
+	// An EDID-level claim does not outrank it: the origin rule keeps it.
+	const os_display_panel_claim edid_only[] = {claim(2560, 3840, 2160, false)};
+	overrides = true;
+	CHECK(os_display_desktop_select_claim(edid_only, 1, &h, &overrides) == -1);
+	CHECK_FALSE(overrides);
+}
+
+TEST_CASE("claim select: without the bit (0, 0) keeps the old 'no origin' reading")
+{
+	// The #430 shape, unchanged for plug-ins built before the bit.
+	const os_display_panel_claim claims[] = {claim(-3840, 3840, 2160, true)};
+	const os_display_panel_hint h = panel_hint();
+	CHECK_FALSE(os_display_desktop_origin_on_claim(claims, 1, &h));
+	bool overrides = true;
+	CHECK(os_display_desktop_select_claim(claims, 1, &h, &overrides) == 0);
+	CHECK_FALSE(overrides);
+}

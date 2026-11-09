@@ -217,7 +217,8 @@ claim_contains(const struct os_display_panel_claim *c, int32_t x, int32_t y)
 static bool
 hint_has_origin(const struct os_display_panel_hint *hint)
 {
-	return hint != NULL && (hint->screen_left != 0 || hint->screen_top != 0);
+	// (0, 0) is "no preference" unless the plug-in vouched for it (#2577).
+	return hint != NULL && (hint->origin_valid || hint->screen_left != 0 || hint->screen_top != 0);
 }
 
 bool
@@ -282,6 +283,10 @@ os_display_desktop_select_claim(const struct os_display_panel_claim *claims,
 	// while the head DP still weaves the first — no segment DP is ever built
 	// for the second screen. Verified claims only: an EDID-table match at the
 	// origin is a laptop screen as often as a panel (#430's shape).
+	//
+	// A plug-in that sets the origin-valid bit never needs this term: its
+	// (0, 0) is an origin, so with a panel there the agree case above already
+	// returned. The term stays for plug-ins built before the bit.
 	const bool origin_unset = !have_origin;
 	int32_t best = -1;
 	int best_score = -1;
@@ -362,8 +367,9 @@ os_display_desktop_info_for_panel(const struct os_display_panel_hint *hint,
 
 	// Rule 1: a position the plug-in actually reported. (0, 0) is defined as
 	// "no preference", so it is NOT a position — that is the whole reason the
-	// size rules below exist.
-	if (h.screen_left != 0 || h.screen_top != 0) {
+	// size rules below exist — unless the plug-in set the origin-valid bit:
+	// then it is the monitor at the desktop origin (#2577).
+	if (hint_has_origin(&h)) {
 		match.rule = OS_DISPLAY_DESKTOP_RULE_ORIGIN;
 		bool ok = os_display_desktop_info_at(h.screen_left, h.screen_top, out_info);
 		if (!ok) {

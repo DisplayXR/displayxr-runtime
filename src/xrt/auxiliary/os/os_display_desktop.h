@@ -251,6 +251,7 @@ enum os_display_desktop_rule
 struct os_display_panel_hint
 {
 	//! Panel origin in virtual-desktop coordinates; (0, 0) = "no preference"
+	//! unless @ref origin_valid is set
 	//! (`xrt_plugin_display_info::display_screen_left/top`).
 	int32_t screen_left;
 	int32_t screen_top;
@@ -263,6 +264,11 @@ struct os_display_panel_hint
 	//! Physical panel size in metres. 0 = unknown.
 	float width_m;
 	float height_m;
+
+	//! @ref screen_left / @ref screen_top is a real position even when it is
+	//! (0, 0): the plug-in set `XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID`.
+	//! False keeps the old reading, (0, 0) = "no preference" (#2577).
+	bool origin_valid;
 };
 
 /*!
@@ -315,7 +321,8 @@ os_display_desktop_enumerate(struct os_display_desktop_info *out_infos, uint32_t
  *    — the active plug-in's own per-monitor claim, which aux_os cannot see:
  *    see @ref os_display_desktop_select_claim. This function never returns it.
  * 1. @ref OS_DISPLAY_DESKTOP_RULE_ORIGIN — the hint carries a non-(0,0)
- *    position. Trust it; this is the Windows path and it is unchanged.
+ *    position, or (0, 0) with @ref os_display_panel_hint::origin_valid set.
+ *    Trust it; this is the Windows path and it is unchanged.
  * 2. @ref OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE — a monitor's connector is
  *    running the panel's native mode (desktop Linux; #1831). Scale-proof.
  * 3. @ref OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH — a monitor whose device mode is
@@ -395,7 +402,8 @@ struct os_display_panel_claim
  * exposed for host tests; the caller builds @p claims from the claim registry
  * and resolves the pick by OS identity (@ref os_display_desktop_info_for_device).
  *
- * - No reported origin ((0, 0)): the claim wins over the size rules and the
+ * - No reported origin ((0, 0) without
+ *   @ref os_display_panel_hint::origin_valid): the claim wins over the size rules and the
  *   primary fallback. Among several claims: the incumbent (the monitor the
  *   panel rect was on before a hotplug re-resolve), then a VERIFIED one, then
  *   one whose rect is the panel's pixel size, then a non-primary one, then
@@ -420,7 +428,8 @@ os_display_desktop_select_claim(const struct os_display_panel_claim *claims,
  * Does the plug-in's reported origin lie on one of the monitors it claims?
  * That is the one case in which @ref os_display_desktop_select_claim declines
  * although claims exist (the two sources agree, so the origin rule stays in
- * charge). Pure; the same "(0, 0) = no origin" reading as the selector.
+ * charge). Pure; the same reading of (0, 0) as the selector ("no origin"
+ * unless @ref os_display_panel_hint::origin_valid is set).
  *
  * A hotplug re-resolve (#2305) needs to tell this apart from "no claim at
  * all": here the claimed panel is where the plug-in says it is; there the

@@ -371,7 +371,8 @@ plugin_display_info_geometry_differs(const struct xrt_plugin_display_info *a, co
 	       a->display_pixel_width != b->display_pixel_width || a->display_pixel_height != b->display_pixel_height ||
 	       a->nominal_viewer_x_m != b->nominal_viewer_x_m || a->nominal_viewer_y_m != b->nominal_viewer_y_m ||
 	       a->nominal_viewer_z_m != b->nominal_viewer_z_m || a->display_screen_left != b->display_screen_left ||
-	       a->display_screen_top != b->display_screen_top;
+	       a->display_screen_top != b->display_screen_top ||
+	       ((a->display_flags ^ b->display_flags) & XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID) != 0;
 }
 
 /*!
@@ -1065,6 +1066,10 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	    have_plugin_origin ? g_display_info_applied.display_screen_left : info->display_screen_left;
 	const int32_t plugin_top =
 	    have_plugin_origin ? g_display_info_applied.display_screen_top : info->display_screen_top;
+	// Only the plug-in's own answer can vouch for (0, 0) (#2577); the
+	// fallback above is the published field, which says nothing about it.
+	const bool plugin_origin_valid = have_plugin_origin && (g_display_info_applied.display_flags &
+	                                                        XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID) != 0;
 	const struct os_display_panel_hint hint = {
 	    .screen_left = plugin_left,
 	    .screen_top = plugin_top,
@@ -1072,6 +1077,7 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	    .pixel_height = info->display_pixel_height,
 	    .width_m = info->display_width_m,
 	    .height_m = info->display_height_m,
+	    .origin_valid = plugin_origin_valid,
 	};
 
 	// The claim rule first (displayxr-leia-plugin#430): the monitor the
