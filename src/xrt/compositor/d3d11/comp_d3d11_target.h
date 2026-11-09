@@ -330,6 +330,25 @@ comp_d3d11_target_resize(struct comp_d3d11_target *target,
                          uint32_t width,
                          uint32_t height);
 
+/*!
+ * Has the device this target presents on been removed or reset?
+ *
+ * Latched (never clears) the first time Present or ResizeBuffers fails with
+ * DXGI_ERROR_DEVICE_REMOVED / DEVICE_RESET / DEVICE_HUNG, or with any error
+ * while ID3D11Device::GetDeviceRemovedReason reports a removal. The latch is
+ * logged once with the removal reason. From then on the target makes no
+ * further calls into the dead device: acquire, present and resize fail fast,
+ * and acquire paces the app thread to about one display period so a frame
+ * loop over a dead chain cannot spin. Recovery means a new session — this
+ * target is never recreated in place.
+ *
+ * NULL-safe (returns false).
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_target_is_device_lost(struct comp_d3d11_target *target);
+
 #ifdef __cplusplus
 }
 #endif

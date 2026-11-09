@@ -199,6 +199,7 @@ u_pp_xrt_result(struct u_pp_delegate dg, xrt_result_t xret)
 	case XRT_ERROR_STEREO_CAMERA_DISABLED:               DG("XRT_ERROR_STEREO_CAMERA_DISABLED"); return;
 	case XRT_ERROR_STEREO_CAMERA_BUSY:                   DG("XRT_ERROR_STEREO_CAMERA_BUSY"); return;
 	case XRT_ERROR_STEREO_CAMERA_STREAM_ENDED:           DG("XRT_ERROR_STEREO_CAMERA_STREAM_ENDED"); return;
+	case XRT_ERROR_COMPOSITOR_DEVICE_LOST:               DG("XRT_ERROR_COMPOSITOR_DEVICE_LOST"); return;
 	case XRT_ERROR_NO_IMAGE_AVAILABLE:                   DG("XRT_ERROR_NO_IMAGE_AVAILABLE"); return;
 	case XRT_ERROR_VULKAN:                               DG("XRT_ERROR_VULKAN"); return;
 	case XRT_ERROR_OPENGL:                               DG("XRT_ERROR_OPENGL"); return;

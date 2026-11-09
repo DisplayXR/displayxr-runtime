@@ -288,7 +288,84 @@ struct comp_d3d11_target
 	IDCompositionDevice *dcomp_device;
 	IDCompositionTarget *dcomp_target;
 	IDCompositionVisual *dcomp_visual;
+
+	//! The device was removed/reset under this chain (see
+	//! @ref comp_d3d11_target_is_device_lost). Latched, never cleared.
+	bool device_lost;
+	//! Rate limit for the "still lost" WARN, and the frames it summarises.
+	uint64_t lost_last_log_ns;
+	uint64_t lost_frames_skipped;
 };
+
+static bool
+target_hr_is_device_loss(HRESULT hr)
+{
+	return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG;
+}
+
+/*!
+ * A Present / ResizeBuffers failure: decide whether it means the device is
+ * gone and, the first time it does, latch and log it ONCE with the removal
+ * reason. Any failure is checked against GetDeviceRemovedReason, because a
+ * removal can surface first as a different error code. Returns the latch.
+ */
+static bool
+target_check_device_lost(struct comp_d3d11_target *target, HRESULT hr, const char *where)
+{
+	if (target->device_lost) {
+		return true;
+	}
+	const HRESULT reason = (target->dev != nullptr) ? target->dev->GetDeviceRemovedReason() : S_OK;
+	if (!target_hr_is_device_loss(hr) && reason == S_OK) {
+		return false;
+	}
+	target->device_lost = true;
+	target->lost_last_log_ns = os_monotonic_get_ns();
+	target->lost_frames_skipped = 0;
+	U_LOG_E(
+	    "d3d11 target: the output device is LOST (%s failed: hr=0x%08x, GetDeviceRemovedReason=0x%08x). "
+	    "Presenting stops and the session is reported lost; the device is not recreated in place. "
+	    "Typical cause: a display hotplug or a driver reset/TDR. (logged once)",
+	    where, (unsigned)hr, (unsigned)reason);
+	// The chain will never retire another present, so no token is owed or
+	// carried: a carry here would make every later weave_mark skip its wait.
+	g_app_holds_token = false;
+	g_repaint_holds_token = false;
+	g_repaint_present_pending = false;
+	return true;
+}
+
+/*!
+ * While lost: stand in for the pacing the dead chain no longer provides, on the
+ * APP thread only (the repaint thread is idle once nothing weaves, and must not
+ * sleep under the compositor lock on the app's behalf). One display period,
+ * the governor's measured one when known, else 60 Hz. Also emits the
+ * rate-limited reminder — never a per-frame log.
+ */
+static void
+target_lost_pace(struct comp_d3d11_target *target)
+{
+	target->lost_frames_skipped++;
+	const uint64_t now = os_monotonic_get_ns();
+	if (now - target->lost_last_log_ns >= 30ULL * 1000000000ULL) {
+		target->lost_last_log_ns = now;
+		U_LOG_W("d3d11 target: output device still lost — %llu frames skipped; end the session to recover",
+		        (unsigned long long)target->lost_frames_skipped);
+	}
+	if (g_repaint_thread_id != 0 && GetCurrentThreadId() == g_repaint_thread_id) {
+		return;
+	}
+	g_app_holds_token = false;
+	const double p = g_lw_gov_d3d11.period_ns;
+	const int64_t period_ns = (p > 1e6 && p < 1e9) ? (int64_t)p : (int64_t)(1000000000LL / 60);
+	os_nanosleep(period_ns);
+}
+
+extern "C" bool
+comp_d3d11_target_is_device_lost(struct comp_d3d11_target *target)
+{
+	return target != nullptr && target->device_lost;
+}
 
 static xrt_result_t
 create_rtv(struct comp_d3d11_target *target)
@@ -624,6 +701,18 @@ comp_d3d11_target_acquire(struct comp_d3d11_target *target, uint32_t *out_index)
 	*out_index = 0;
 	target->current_index = 0;
 
+	// Lost device: fail fast without touching it, and pace the app thread
+	// so a frame loop over the dead chain cannot spin.
+	if (target->device_lost) {
+		target_lost_pace(target);
+		return XRT_ERROR_D3D;
+	}
+	// A failed resize released the back buffer and RTV; there is nothing to
+	// clear or bind until a resize succeeds.
+	if (target->rtv == nullptr) {
+		return XRT_ERROR_D3D;
+	}
+
 	// Bind the render target
 	target->ctx->OMSetRenderTargets(1, &target->rtv, nullptr);
 
@@ -772,7 +861,9 @@ d3d11_target_repaint_pace_on(IDXGISwapChain1 *swapchain)
 extern "C" bool
 comp_d3d11_target_repaint_admit(struct comp_d3d11_target *target)
 {
-	(void)target;
+	if (target != nullptr && target->device_lost) {
+		return false; // nothing can present on a dead chain
+	}
 	if (g_repaint_queue_cap < 0) {
 		const char *e = getenv("DXR_WEAVE_REPAINT_QUEUE_CAP");
 		g_repaint_queue_cap = (e != nullptr && e[0] == '0') ? 0 : 1;
@@ -1109,6 +1200,11 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 	// to a 50 ms (~3 vsync) deadline, then drop the frame. A jammed chain
 	// degrades to slow frames; the app's render thread (and its IPC) stays
 	// alive. Mirrors the service's standalone commit path.
+	// Lost device: no Present into the dead chain (it would fail anyway and,
+	// before this latch, logged an ERROR per frame).
+	if (target->device_lost) {
+		return XRT_ERROR_D3D;
+	}
 	HRESULT hr;
 	// Present watchdog (#1000): stamp entry so the sampling thread can name a
 	// Present call that never returns (in-driver cross-adapter wait — the
@@ -1180,11 +1276,16 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 		target->swapchain->GetLastPresentCount(&g_last_present_count);
 	}
 	if (FAILED(hr)) {
-		U_LOG_E("Present failed: 0x%08x", hr);
-
-		// Check for device removed
-		if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
-			return XRT_ERROR_D3D;
+		// A removed/reset device latches and logs once (with the reason);
+		// anything else is rate-limited — never an ERROR per frame.
+		if (!target_check_device_lost(target, hr, "Present")) {
+			static std::atomic<int64_t> s_last_fail_log_ns{0};
+			const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+			int64_t prev_ns = s_last_fail_log_ns.load(std::memory_order_relaxed);
+			if (now_ns - prev_ns > 1000000000LL &&
+			    s_last_fail_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+				U_LOG_E("Present failed: 0x%08x (rate-limited, at most once per second)", (unsigned)hr);
+			}
 		}
 		return XRT_ERROR_D3D;
 	}
@@ -1229,7 +1330,15 @@ comp_d3d11_target_resize(struct comp_d3d11_target *target,
                          uint32_t width,
                          uint32_t height)
 {
-	if (width == target->width && height == target->height) {
+	// Lost device: ResizeBuffers on it can only fail. The caller sees the
+	// failure and @ref comp_d3d11_target_is_device_lost says why.
+	if (target->device_lost) {
+		return XRT_ERROR_D3D;
+	}
+	// Same size is a no-op ONLY while the chain still has its buffers: a
+	// failed resize released them, and returning to the old size must still
+	// run ResizeBuffers + create_rtv, or the target stays bufferless.
+	if (width == target->width && height == target->height && target->rtv != nullptr) {
 		return XRT_SUCCESS;
 	}
 
@@ -1256,7 +1365,9 @@ comp_d3d11_target_resize(struct comp_d3d11_target *target,
 	                                               DXGI_FORMAT_UNKNOWN,
 	                                               target->swapchain_flags);
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to resize swapchain: 0x%08x", hr);
+		if (!target_check_device_lost(target, hr, "ResizeBuffers")) {
+			U_LOG_E("Failed to resize swapchain: 0x%08x", (unsigned)hr);
+		}
 		return XRT_ERROR_D3D;
 	}
 

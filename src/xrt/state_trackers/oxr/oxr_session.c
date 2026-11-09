@@ -1862,6 +1862,16 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 		session_begin_runtime_exit(log, sess);
 	}
 
+	// In-process device loss (XRT_ERROR_COMPOSITOR_DEVICE_LOST, armed from
+	// xrWaitFrame): the transition the out-of-process path gets from
+	// XRT_SESSION_EVENT_LOSS_PENDING. Once, and never over EXITING.
+	if (sess->runtime_loss_pending) {
+		sess->runtime_loss_pending = false;
+		if (sess->state != XR_SESSION_STATE_LOSS_PENDING && sess->state != XR_SESSION_STATE_EXITING) {
+			oxr_session_change_state(log, sess, XR_SESSION_STATE_LOSS_PENDING, 0);
+		}
+	}
+
 #ifdef XRT_OS_MACOS
 	// Skip macOS event pump if the compositor has already been destroyed
 	// or the session has ended (IDLE/EXITING). After xrEndSession calls
@@ -6373,6 +6383,20 @@ do_wait_frame_and_checks(struct oxr_logger *log,
 		// Quiet after the first frame: the app keeps calling xrWaitFrame
 		// until it has drained the event and ended the session.
 		return XR_ERROR_RUNTIME_FAILURE;
+	}
+	// The in-process compositor's presenting device was removed or reset.
+	// Unlike the window-closed case this IS a lost session: flag it (every
+	// later frame/session call then returns XR_ERROR_SESSION_LOST through
+	// OXR_VERIFY_SESSION_NOT_LOST) and let the next xrPollEvent queue the
+	// LOSS_PENDING transition, so the app destroys and recreates the session.
+	// Not OXR_CHECK_XRET: that would report XR_ERROR_INSTANCE_LOST.
+	if (xret == XRT_ERROR_COMPOSITOR_DEVICE_LOST) {
+		if (!sess->has_lost) {
+			sess->runtime_loss_pending = true;
+			sess->has_lost = true;
+			oxr_warn(log, "The compositor's graphics device was lost — the session is lost");
+		}
+		return XR_ERROR_SESSION_LOST;
 	}
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_wait_frame);
 

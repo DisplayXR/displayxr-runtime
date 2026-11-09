@@ -4086,10 +4086,19 @@ comp_hub_d3d11_resize_target(struct comp_hub_d3d11 *s, uint32_t width, uint32_t 
 	 */
 	const xrt_result_t xret = comp_d3d11_target_resize(s->target, width, height);
 	if (xret != XRT_SUCCESS) {
-		U_LOG_E(
-		    "VK output-device split: the scanout swapchain REFUSED %ux%u (%d) and stays at %ux%u — "
-		    "the present will keep the OLD geometry (#1178)",
-		    width, height, (int)xret, cur_w, cur_h);
+		// A lost device was already logged once by the target, with its
+		// removal reason. Anything else the caller retries next frame, so
+		// rate-limit rather than log an ERROR per attempt.
+		static uint64_t s_last_refused_log_ns = 0;
+		const uint64_t now_ns = os_monotonic_get_ns();
+		if (!comp_d3d11_target_is_device_lost(s->target) &&
+		    (s_last_refused_log_ns == 0 || now_ns - s_last_refused_log_ns > 5ULL * U_TIME_1S_IN_NS)) {
+			s_last_refused_log_ns = now_ns;
+			U_LOG_E(
+			    "VK output-device split: the scanout swapchain REFUSED %ux%u (%d) and stays at %ux%u — "
+			    "retried on the next frame (#1178; rate-limited)",
+			    width, height, (int)xret, cur_w, cur_h);
+		}
 		return false;
 	}
 
@@ -5350,6 +5359,12 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 }
 
 extern "C" bool
+comp_hub_d3d11_is_device_lost(struct comp_hub_d3d11 *s)
+{
+	return s != nullptr && s->target != nullptr && comp_d3d11_target_is_device_lost(s->target);
+}
+
+extern "C" bool
 comp_hub_d3d11_is_client_presents(struct comp_hub_d3d11 *s)
 {
 	return s != nullptr && s->client_presents;
@@ -6163,6 +6178,13 @@ comp_hub_d3d11_has_weave_slot(struct comp_hub_d3d11 *split)
 
 extern "C" bool
 comp_hub_d3d11_is_client_presents(struct comp_hub_d3d11 *split)
+{
+	(void)split;
+	return false;
+}
+
+extern "C" bool
+comp_hub_d3d11_is_device_lost(struct comp_hub_d3d11 *split)
 {
 	(void)split;
 	return false;
