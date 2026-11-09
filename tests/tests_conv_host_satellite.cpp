@@ -397,12 +397,12 @@ TEST_CASE("conv_host: exit codes before and at load", "[conv_host]")
 		CHECK(h.wait_exit(20000) == CONV_HOST_EXIT_NEGOTIATE_FAILED);
 	}
 
-	SECTION("probe declines (ENABLE unset) -> 11")
+	SECTION("probe declines (ENABLE unset) -> 16")
 	{
 		set_env("DXR_CONV_SIM_CONVERSION_ENABLE", "0");
 		Host h;
 		REQUIRE(h.spawn(sim_args(h)));
-		CHECK(h.wait_exit(20000) == CONV_HOST_EXIT_NEGOTIATE_FAILED);
+		CHECK(h.wait_exit(20000) == CONV_HOST_EXIT_PROBE_DECLINED);
 		set_env("DXR_CONV_SIM_CONVERSION_ENABLE", "1");
 	}
 

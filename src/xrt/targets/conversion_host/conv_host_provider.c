@@ -315,6 +315,11 @@ conv_host_provider_load(struct conv_host_provider *p,
 		        (unsigned long long)(probe_us / 1000u), (unsigned long long)(probe_us % 1000u),
 		        probe_us > 100000u ? " (over the 100 ms probe budget)" : "");
 	}
+	if (pr == XRT_ERROR_PROBER_NOT_SUPPORTED) {
+		(void)snprintf(out_reason, reason_size,
+		               "probe declined (an opt-in provider not enabled, or nothing to serve on this machine)");
+		return CONV_HOST_EXIT_PROBE_DECLINED;
+	}
 	if (pr != XRT_SUCCESS) {
 		(void)snprintf(out_reason, reason_size, "probe returned %d", (int)pr);
 		return CONV_HOST_EXIT_NEGOTIATE_FAILED;

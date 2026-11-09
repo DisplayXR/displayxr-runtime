@@ -6,7 +6,7 @@
  *
  * The table itself is the wire header's (conv_host_wire.h, shared with the
  * supervisor): 0 orderly, 10 ABI reject (also: hello refused), 11 negotiate /
- * describe failed, 12 licence, 13 no usable device, 14 elevated, 20 closed for
+ * describe failed, 16 probe declined, 12 licence, 13 no usable device, 14 elevated, 20 closed for
  * update, 30 watchdog (supervisor-side), plus 2 (bad command line) and 15
  * (unusable control channel), documented there.
  *
@@ -27,6 +27,7 @@ conv_host_exit_str(int code)
 	case CONV_HOST_EXIT_USAGE: return "usage";
 	case CONV_HOST_EXIT_ABI_REJECT: return "abi-reject";
 	case CONV_HOST_EXIT_NEGOTIATE_FAILED: return "negotiate-failed";
+	case CONV_HOST_EXIT_PROBE_DECLINED: return "probe-declined";
 	case CONV_HOST_EXIT_LICENCE: return "licence";
 	case CONV_HOST_EXIT_NO_DEVICE: return "no-device";
 	case CONV_HOST_EXIT_ELEVATED: return "elevated";
