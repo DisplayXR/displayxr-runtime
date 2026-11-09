@@ -12450,6 +12450,27 @@ dxr_idle_quiesce_ns()
 	return ns;
 }
 
+//! Weave-idle release (#2582): how long a weave present-owner (the DisplayXR
+//! Browser) may go without an xrWeaveSubmitDXR before its display processors —
+//! and the eye-tracking camera behind them — are released while it stays
+//! connected. Its own knob, NOT DXR_IDLE_QUIESCE_MS: 0 here keeps the camera on
+//! between 3D pages without also disabling the #1319 no-client release, and
+//! DXR_IDLE_QUIESCE_MS=0 no longer disables this one. DXR_WEAVE_IDLE_MS.
+static int64_t
+dxr_weave_idle_ns()
+{
+	static int64_t ns = -1;
+	if (ns < 0) {
+		const char *e = getenv("DXR_WEAVE_IDLE_MS");
+		int64_t ms = (e != nullptr && e[0] != '\0') ? atoll(e) : 5000;
+		if (ms < 0) {
+			ms = 0;
+		}
+		ns = ms * 1000000LL;
+	}
+	return ns;
+}
+
 /*!
  * #964: park a retired panel DP instead of destroying it. Caller holds
  * render_mutex and has ALREADY published its replacement (or nullptr).
@@ -12741,8 +12762,9 @@ pipeline_idle_quiesce_if_due(struct d3d11_service_system *sys, struct d3d11_mult
  * panel DP bound to its window every frame, and the SR context behind that DP
  * keeps the eye-tracking camera streaming (LED lit) on a 2D page.
  *
- * Once the focused PRESENTER_SELF client has not submitted for the #1319 grace
- * window (DXR_IDLE_QUIESCE_MS, default 5000; 0 disables both), release every
+ * Once the focused PRESENTER_SELF client has not submitted for the weave-idle
+ * window (DXR_WEAVE_IDLE_MS, default 5000; 0 disables this release only — the
+ * #1319 no-client release keeps its own DXR_IDLE_QUIESCE_MS), release every
  * DP it holds the camera through: the panel DP (retired into the graveyard, so
  * a lock-free reader still inside a bounded call stays safe; the per-frame sweep
  * destroys it after the graveyard grace) and its own #1172/#939 ingest DP.
@@ -12766,7 +12788,7 @@ pipeline_weave_idle_release_if_due(struct d3d11_service_system *sys,
 	if (sys == nullptr || mc == nullptr || fc == nullptr) {
 		return false;
 	}
-	const int64_t grace_ns = dxr_idle_quiesce_ns();
+	const int64_t grace_ns = dxr_weave_idle_ns();
 	const int64_t last_ns = fc->weave_last_submit_ns.load(std::memory_order_acquire);
 	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
 	// A workspace controller owns the panel; a client that has never woven has
@@ -12823,7 +12845,7 @@ pipeline_weave_idle_release_if_due(struct d3d11_service_system *sys,
 	fc->weave_idle_released = true;
 	U_LOG_W(
 	    "[pipeline] weave-idle: '%s' has not woven for %lld ms — display processors released, eye-tracking "
-	    "camera off until its next weave (DXR_IDLE_QUIESCE_MS)",
+	    "camera off until its next weave (DXR_WEAVE_IDLE_MS)",
 	    fc->slot_app_name, (long long)((now_ns - last_ns) / 1000000LL));
 	return true;
 }
@@ -34664,6 +34686,27 @@ comp_d3d11_service_is_d3d11_service(struct xrt_system_compositor *xsysc)
  * subsequent call into the DP against compositor_destroy's teardown (#363
  * use-after-free).
  */
+/*!
+ * True while any connected client is weave-idle released (#2582), i.e. it has
+ * no display processor on purpose. Caller MUST hold sys->render_mutex (the
+ * flag is written by the render thread under it).
+ */
+static bool
+svc_any_client_weave_idle_released(struct d3d11_service_system *sys)
+{
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return false;
+	}
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		const struct d3d11_multi_client_slot *slot = &mc->clients[i];
+		if (slot->active && slot->compositor != nullptr && slot->compositor->weave_idle_released) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static struct xrt_display_processor_d3d11 *
 resolve_eye_display_processor(struct d3d11_service_system *sys, struct xrt_compositor *xc)
 {
@@ -34900,6 +34943,18 @@ comp_d3d11_service_get_predicted_eye_positions_full_for_client(struct xrt_system
 			svc_publish_eyes(sys, dp, out_eyes);
 			return true;
 		}
+	}
+
+	// Expected, not exceptional, while a weave present-owner is weave-idle
+	// released (#2582): its DPs are gone on purpose, and the browser asks for
+	// eyes just before the first submit that rebuilds them. INFO, and it does
+	// not consume the one-shot WARN below, which stays for the real case.
+	if (svc_any_client_weave_idle_released(sys)) {
+		U_LOG_I(
+		    "comp_d3d11_service_get_predicted_eye_positions: no display processor while weave-idle "
+		    "released (caller_xc=%p)",
+		    (void *)xc);
+		return false;
 	}
 
 	// Log if no DP could be resolved at all. Note this is now a genuinely
