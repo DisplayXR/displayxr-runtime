@@ -91,7 +91,7 @@ means deleting the static and reading a service-held snapshot — mechanically c
 
 `DXR_COMMIT_PACE` · `DXR_FENCE_WAIT_MS` · `DXR_EVICT_IDLE_MS` · `DXR_EVICT_ENDED_MS` ·
 `DXR_DP_GRAVEYARD_MS` · `DXR_DEVICE_REMOVED_EXIT_MS` · `DXR_HEALTH_MS` ·
-`DXR_IDLE_QUIESCE_MS` · `DXR_LIFT_MAX_INPUT_EDGE` · `DXR_LIFT_LETTERBOX` ·
+`DXR_IDLE_QUIESCE_MS` · `DXR_WEAVE_IDLE_MS` · `DXR_LIFT_MAX_INPUT_EDGE` · `DXR_LIFT_LETTERBOX` ·
 `DXR_LIFT_AUTO_CONVERGENCE`.
 
 Semantic caveat: `DXR_COMMIT_PACE` changes backpressure discipline; flipping it under a
@@ -620,6 +620,7 @@ setting, never `getenv`): `displayxr-cli input …` surfaces both.
 | `DXR_EVICT_ENDED_MS` | `compositor/d3d11_service/comp_d3d11_service.cpp:13505` | `getenv`, `static` cached | 2000 | Svc | 2 | Grace before an ended-session slot is evicted (0 disables) |
 | `DXR_DP_GRAVEYARD_MS` | `compositor/d3d11_service/comp_d3d11_service.cpp:10086` | `getenv`, `static` cached | 2000 | Svc | 2 | How long a torn-down DP is kept alive to outlive an in-flight swap |
 | `DXR_IDLE_QUIESCE_MS` | `compositor/d3d11_service/comp_d3d11_service.cpp:10136` | `getenv`, `static` cached | 5000 | Svc | 2 | #1319 grace after the last client leaves before the panel DP is released (freeing the vendor SR context and the tracking camera) and the render thread parks; 0 disables |
+| `DXR_WEAVE_IDLE_MS` | `compositor/d3d11_service/comp_d3d11_service.cpp` (`dxr_weave_idle_ns`, consumed by `pipeline_weave_idle_release_if_due`) | `getenv`, `static` cached | 5000 | Svc | 2 | #2582 grace before a connected weave present-owner (the DisplayXR Browser) that has stopped submitting has its display processors released, so the tracking camera turns off between 3D pages; the next submit rebuilds them. 0 disables this release only (the #1319 no-client release keeps `DXR_IDLE_QUIESCE_MS`) |
 | `DXR_REARM_2D_GRACE_MS` | `compositor/d3d11_service/comp_d3d11_service.cpp` (`dxr_rearm_2d_grace_ns`, consumed by `pipeline_rearm_focus_wish` / `pipeline_apply_deferred_rearm`) | `getenv`, `static` cached | 750 | Svc | 2 | #939 how long a REPLAYED hardware-2D wish is held back when a slot regains the panel, so a client that re-asks (the browser, ~300 ms after its tab is uncovered) wins and the SR lens does not round-trip 3D→2D→3D on every focus trade; at the deadline the slot's then-current wish is applied. 0 = replay immediately (pre-#939) |
 | `DXR_DEVICE_REMOVED_EXIT_MS` | `compositor/d3d11_service/comp_d3d11_service.cpp:10279` | `getenv`, `static` cached | 2000 | Svc | 2 | Delay before the service exits on an unrecoverable `DEVICE_REMOVED` |
 | `DXR_HEALTH_MS` | `ipc/server/ipc_server_process.c:82` | `DEBUG_GET_ONCE_NUM` | 10000 | Svc | 2 | #951 `[HEALTH]` telemetry cadence; 0 disables |
