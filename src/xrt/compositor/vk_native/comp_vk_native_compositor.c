@@ -12880,9 +12880,11 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	}
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
 	// A DP or mode change may turn full side by side on or off, which resizes
 	// the target: before its dimensions are read for this frame.
 	vk_full_sbs_refresh_locked(c);
+#endif
 
 	// Get target dimensions
 	uint32_t tgt_width = c->settings.preferred.width;
@@ -15535,9 +15537,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
+#ifdef XRT_OS_LINUX_DESKTOP
 	// Before the target: a full side-by-side DP's first buffer is already
 	// both views wide, and declared, when the app's window first maps.
 	vk_full_sbs_refresh_locked(c);
+#endif
 
 	/*
 	 * Create output target (VkSwapchainKHR) for presentation. See
