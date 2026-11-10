@@ -27,6 +27,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <chrono>
@@ -1582,6 +1583,13 @@ static bool CreateSwapchainFramebuffers(VkRenderer& renderer,
     return true;
 }
 
+// TEST HOOK, off unless DXR_CUBE_TEST_EYE_COLORS=1 is set. Each view's tile is
+// cleared to its own colour before the scene is drawn: view 0 (the left eye)
+// red, view 1 (the right eye) blue. A capture of any output stage can then tell
+// which eye a view reached by its colour, e.g. the two halves a stereo
+// compositor shows of the runtime's window. Same hook as cube_handle_vk_linux.
+static bool g_testEyeColors = false;
+
 static void RenderScene(
     VkRenderer& renderer, uint32_t imageIndex,
     const EyeRenderParams* eyes, int eyeCount)
@@ -1629,6 +1637,17 @@ static void RenderScene(
         VkRect2D scissor = {{(int32_t)e.viewportX, (int32_t)e.viewportY}, {e.width, e.height}};
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        if (g_testEyeColors && eye < 2) {
+            // TEST HOOK: view 0 red, view 1 blue (0 and 1 are the same in
+            // every encoding, so no sRGB conversion is needed).
+            VkClearAttachment clear = {};
+            clear.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            clear.colorAttachment = 0;
+            clear.clearValue.color = {{eye == 0 ? 1.0f : 0.0f, 0.0f, eye == 0 ? 0.0f : 1.0f, 1.0f}};
+            VkClearRect rect = {scissor, 0, 1};
+            vkCmdClearAttachments(cmd, 1, &clear, 1, &rect);
+        }
 
         float vp[16];
         mat4_multiply(vp, e.projMat, e.viewMat);
@@ -2313,6 +2332,14 @@ int main() {
     signal(SIGTERM, SignalHandler);
 
     LOG_INFO("=== Sim Cube OpenXR (Vulkan) ===");
+
+    if (const char* cenv = getenv("DXR_CUBE_TEST_EYE_COLORS")) {
+        g_testEyeColors = cenv[0] == '1';
+        if (g_testEyeColors) {
+            LOG_WARN("DXR_CUBE_TEST_EYE_COLORS=1 — TEST HOOK armed; view 0 (left eye) is cleared red, "
+                     "view 1 (right eye) blue");
+        }
+    }
 
     // Initialize OpenXR
     AppXrSession xr = {};

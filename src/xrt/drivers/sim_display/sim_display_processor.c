@@ -208,6 +208,7 @@ struct sim_display_processor
 	//! get_scanout_caps: last flags reported (log on change only).
 	bool caps_reported;
 	uint32_t caps_last_flags;
+	uint32_t caps_last_stereo_layout;
 };
 
 static inline struct sim_display_processor *
@@ -349,6 +350,7 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 	if (tile_columns * tile_rows <= 1) {
 		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
 	}
+	mode = sim_display_pipeline_mode(mode);
 	VkPipeline active_pipeline = sdp->pipelines[mode];
 	if (sim_zone_substitute_position_preserving(mode, sdp->zone_active, "VK")) {
 		active_pipeline = sdp->pipelines[SIM_DISPLAY_OUTPUT_ANAGLYPH];
@@ -883,6 +885,12 @@ sim_dp_set_present_origin(struct xrt_display_processor_vk *xdp, int32_t panel_x,
  * default) and, for multi-screen M2's per-segment 1:1 gate, whether the
  * output survives a display-server resample. Every sim output does except
  * INTERLACED, whose 1-pixel period is exactly what a resample destroys.
+ * FULL_SBS also says its output is full side by side for a stereo
+ * compositor (stereo_layout = XRT_DP_STEREO_LAYOUT_SIDE_BY_SIDE_FULL, HDMI
+ * 1.4b 3D_Structure 3), which the runtime presents twice the window's width
+ * and declares. SIM_DISPLAY_STEREO_LAYOUT claims another number instead (what
+ * the DP claims, not what it renders), to exercise the runtime's reading of a
+ * layout it does not know.
  * Read from the CURRENT output mode on every call (the 1/2/3 keys can change
  * it), so the runtime re-queries when it re-evaluates a segment. Logs on
  * change only.
@@ -895,19 +903,35 @@ sim_dp_get_scanout_caps(struct xrt_display_processor_vk *xdp, struct xrt_dp_scan
 		return false;
 	}
 	const enum xrt_dp_weave_scope scope = sim_scanout_scope_from_env();
-	const bool interlaced = sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_INTERLACED;
-	const uint32_t flags = interlaced ? 0u : XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE;
+	const enum sim_display_output_mode mode = sim_display_get_output_mode();
+	const bool interlaced = mode == SIM_DISPLAY_OUTPUT_INTERLACED;
+	uint32_t flags = interlaced ? 0u : XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE;
+	uint32_t stereo_layout =
+	    mode == SIM_DISPLAY_OUTPUT_FULL_SBS ? XRT_DP_STEREO_LAYOUT_SIDE_BY_SIDE_FULL : XRT_DP_STEREO_LAYOUT_WEAVE;
+	const long claimed = sim_display_setting_num("STEREO_LAYOUT", -1);
+	if (claimed >= 0 && claimed <= (long)UINT32_MAX) {
+		stereo_layout = (uint32_t)claimed;
+	}
 	out_caps->weave_scope = (uint32_t)scope;
 	out_caps->flags = flags;
+	out_caps->stereo_layout = stereo_layout;
 	for (size_t i = 0; i < sizeof(out_caps->reserved) / sizeof(out_caps->reserved[0]); i++) {
 		out_caps->reserved[i] = 0;
 	}
-	if (!sdp->caps_reported || sdp->caps_last_flags != flags) {
+	if (!sdp->caps_reported || sdp->caps_last_flags != flags || sdp->caps_last_stereo_layout != stereo_layout) {
 		sdp->caps_reported = true;
 		sdp->caps_last_flags = flags;
-		U_LOG_I("sim_display VK DP %p: weave scope '%s', %s", (void *)sdp, xrt_dp_weave_scope_name(scope),
+		sdp->caps_last_stereo_layout = stereo_layout;
+		U_LOG_I("sim_display VK DP %p: weave scope '%s', %s%s", (void *)sdp, xrt_dp_weave_scope_name(scope),
 		        interlaced ? "INTERLACED needs 1:1 pixels (a resample destroys the pattern)"
-		                   : "output survives a display-server resample");
+		                   : "output survives a display-server resample",
+		        stereo_layout == XRT_DP_STEREO_LAYOUT_SIDE_BY_SIDE_FULL
+		            ? ", output is full side by side for a stereo compositor"
+		            : "");
+		if (claimed >= 0) {
+			U_LOG_I("sim_display VK DP %p: SIM_DISPLAY_STEREO_LAYOUT claims stereo_layout %u", (void *)sdp,
+			        stereo_layout);
+		}
 	}
 	return true;
 }
@@ -1388,6 +1412,7 @@ sim_display_processor_create_impl(enum sim_display_output_mode mode,
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_QUAD            ? "Quad" :
 	        mode == SIM_DISPLAY_OUTPUT_INTERLACED      ? "Interlaced" :
+	        mode == SIM_DISPLAY_OUTPUT_FULL_SBS        ? "Full SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH     ? "Passthrough" : "Blend");
 
 	if (sdp->screen_bound) {

@@ -79,7 +79,10 @@ TEST_CASE("dp_weave_scope: flags were carved out of reserved[0] (multi-screen M2
 	// A plug-in built before `flags` wrote 0 into reserved[0] at this offset,
 	// which reads as "needs 1:1" — the behaviour it always had.
 	CHECK(offsetof(struct xrt_dp_scanout_caps, flags) == 8);
-	CHECK(offsetof(struct xrt_dp_scanout_caps, reserved) == 12);
+	// `stereo_layout` took the next word of reserved[] (tests_dp_full_sbs), so what is still reserved starts after
+	// it.
+	CHECK(offsetof(struct xrt_dp_scanout_caps, stereo_layout) == 12);
+	CHECK(offsetof(struct xrt_dp_scanout_caps, reserved) == 16);
 	CHECK(sizeof(struct xrt_dp_scanout_caps) == XRT_DP_SCANOUT_CAPS_SIZE_V1);
 }
 
