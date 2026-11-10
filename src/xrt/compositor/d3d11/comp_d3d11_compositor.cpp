@@ -1965,6 +1965,14 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 		return XRT_ERROR_COMPOSITOR_WINDOW_CLOSED;
 	}
 
+	// The presenting device was removed/reset (display hotplug, driver
+	// reset) — on this tier's own target or on the hub's: report the session
+	// lost rather than commit frames that can never present.
+	if ((c->target != nullptr && comp_d3d11_target_is_device_lost(c->target)) ||
+	    (c->hub.split != nullptr && comp_hub_d3d11_is_device_lost(c->hub.split))) {
+		return XRT_ERROR_COMPOSITOR_DEVICE_LOST;
+	}
+
 	// During drag, synchronize with the window thread's WM_PAINT cycle.
 	// This ensures the window position is stable between weave() and Present(),
 	// so the interlacing pattern matches the actual displayed position.

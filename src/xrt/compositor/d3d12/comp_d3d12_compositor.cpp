@@ -3562,6 +3562,11 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 		U_LOG_I("Window closed - requesting session exit");
 		return XRT_ERROR_COMPOSITOR_WINDOW_CLOSED;
 	}
+	// The #1264 reroute's hub lost its output device (display hotplug, driver
+	// reset): report the session lost rather than commit frames forever.
+	if (c->reroute.split != nullptr && comp_hub_d3d11_is_device_lost(c->reroute.split)) {
+		return XRT_ERROR_COMPOSITOR_DEVICE_LOST;
+	}
 
 	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
 

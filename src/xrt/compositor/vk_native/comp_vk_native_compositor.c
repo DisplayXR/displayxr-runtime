@@ -2498,6 +2498,14 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 		U_LOG_I("Window closed - requesting session exit");
 		return XRT_ERROR_COMPOSITOR_WINDOW_CLOSED;
 	}
+	// The hub's output device was removed/reset (display hotplug, driver
+	// reset): every weave now fails fast, so report the session lost rather
+	// than commit black frames forever. Read without c->mutex, as the hub
+	// reads further down this function already are; the latch only ever goes
+	// false -> true.
+	if (c->split != NULL && comp_hub_d3d11_is_device_lost(c->split)) {
+		return XRT_ERROR_COMPOSITOR_DEVICE_LOST;
+	}
 #endif
 
 #ifdef XRT_OS_MACOS
@@ -2679,9 +2687,14 @@ vk_repaint_disarm_locked(struct comp_vk_native_compositor *c)
  * added to this function or it will present at the wrong size — and the tripwire
  * in `comp_hub_d3d11_weave_and_present` says so out loud if one ever is not.
  *
+ * Returns false only when the split's scanout chain refused the size for a
+ * reason OTHER than a lost device — the caller then leaves the preferred size
+ * unapplied so the next begin_frame retries. A lost device returns true: there
+ * is nothing to retry, and wait_frame reports the session lost.
+ *
  * Caller MUST hold c->mutex.
  */
-static void
+static bool
 vk_output_follow_window_locked(struct comp_vk_native_compositor *c, uint32_t width, uint32_t height)
 {
 #ifdef XRT_OS_WINDOWS
@@ -2689,8 +2702,10 @@ vk_output_follow_window_locked(struct comp_vk_native_compositor *c, uint32_t wid
 		// The scanout chain is the runtime's own, on the runtime's own
 		// device; no Vulkan object is involved and there is nothing to
 		// drain on the app's Vulkan device.
-		(void)comp_hub_d3d11_resize_target(c->split, width, height);
-		return;
+		if (comp_hub_d3d11_resize_target(c->split, width, height)) {
+			return true;
+		}
+		return comp_hub_d3d11_is_device_lost(c->split);
 	}
 #endif
 
@@ -2714,6 +2729,7 @@ vk_output_follow_window_locked(struct comp_vk_native_compositor *c, uint32_t wid
 		 */
 		c->vk.vkDeviceWaitIdle(c->vk.device);
 	}
+	return true;
 }
 
 static bool
@@ -2783,9 +2799,14 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 
 				// #1178: whichever surface owns the present — the Vulkan
 				// swapchain, or the split's chain on the scanout adapter.
-				vk_output_follow_window_locked(c, new_width, new_height);
-				c->settings.preferred.width = new_width;
-				c->settings.preferred.height = new_height;
+				// A refused resize (not a lost device) leaves the preferred
+				// size unapplied so the next frame retries it; marking it
+				// applied anyway left the chain bufferless with no retry.
+				const bool followed = vk_output_follow_window_locked(c, new_width, new_height);
+				if (followed) {
+					c->settings.preferred.width = new_width;
+					c->settings.preferred.height = new_height;
+				}
 
 				// #602: the atlas is owned by layer_commit for extension apps
 				// (it allocates the stable mode atlas and derives the scaled
@@ -2793,7 +2814,7 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 				// layer_commit view resize — need the window-derived atlas
 				// resize here. Driving it for extension apps fed a raw window
 				// height the high-water then ratcheted on (→ device loss).
-				if (c->legacy_app_tile_scaling) {
+				if (followed && c->legacy_app_tile_scaling) {
 					uint32_t new_vw = new_width / 2;
 					uint32_t new_vh = new_height;
 					uint32_t tc, tr;

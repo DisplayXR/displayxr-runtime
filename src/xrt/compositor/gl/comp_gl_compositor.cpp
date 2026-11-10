@@ -2899,6 +2899,13 @@ gl_compositor_predict_frame(struct xrt_compositor *xc,
 			U_LOG_I("Window closed - requesting session exit");
 			return XRT_ERROR_COMPOSITOR_WINDOW_CLOSED;
 		}
+#ifdef XRT_GL_HUB
+		// The hub's output device was removed/reset: report the session
+		// lost instead of committing frames that can never present.
+		if (c->hub.split != NULL && comp_hub_d3d11_is_device_lost(c->hub.split)) {
+			return XRT_ERROR_COMPOSITOR_DEVICE_LOST;
+		}
+#endif
 	}
 #endif
 

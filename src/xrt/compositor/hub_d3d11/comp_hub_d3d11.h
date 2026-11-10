@@ -923,6 +923,19 @@ bool
 comp_hub_d3d11_has_weave_slot(struct comp_hub_d3d11 *split);
 
 /*!
+ * Has the hub's OUTPUT device been removed or reset (a display hotplug, a
+ * driver reset)? Latched by the hub's scanout target the first time a Present
+ * or ResizeBuffers reports it (see comp_d3d11_target_is_device_lost). Once
+ * true, @ref comp_hub_d3d11_weave_and_present returns false every frame
+ * without touching the device; the caller tells this apart from a #918 F4
+ * "nothing to weave" frame by asking here, and reports the session lost.
+ * The hub is not rebuilt in place. False for the client-presents strategy
+ * (no scanout target) and for NULL.
+ */
+bool
+comp_hub_d3d11_is_device_lost(struct comp_hub_d3d11 *split);
+
+/*!
  * #1339: @ref comp_d3d11_target_repaint_admit on the arm's own target — the
  * fill arm presents through its d3d11 flip chain, so THAT queue is the one a
  * repaint must not deepen. false = skip this repaint tick.

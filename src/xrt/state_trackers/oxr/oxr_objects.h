@@ -3761,6 +3761,17 @@ struct oxr_session
 	 */
 	bool runtime_exit_pending;
 
+	/*!
+	 * The in-process native compositor reported its graphics device lost
+	 * (@ref XRT_ERROR_COMPOSITOR_DEVICE_LOST from xrWaitFrame — a display
+	 * hotplug or driver reset under the presenting device). `has_lost` is set
+	 * at the same moment; this flag is consumed once by the next
+	 * @ref oxr_session_poll, which queues the XR_SESSION_STATE_LOSS_PENDING
+	 * state change — the same transition the out-of-process path gets from
+	 * @ref XRT_SESSION_EVENT_LOSS_PENDING. Out-of-process sessions never set it.
+	 */
+	bool runtime_loss_pending;
+
 	struct
 	{
 		int64_t waited;

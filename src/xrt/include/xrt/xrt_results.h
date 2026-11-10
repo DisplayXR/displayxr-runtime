@@ -355,4 +355,19 @@ typedef enum xrt_result
 	 * XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR.
 	 */
 	XRT_ERROR_STEREO_CAMERA_STREAM_ENDED = -48,
+
+	/*!
+	 * The graphics device an IN-PROCESS native compositor presents on was
+	 * removed or reset (display hotplug, driver reset/TDR) and the compositor
+	 * cannot present any more. The session is gone; the instance is not.
+	 *
+	 * Rides the same channel as @ref XRT_ERROR_COMPOSITOR_WINDOW_CLOSED: only
+	 * @ref xrt_compositor::wait_frame returns it (the in-process native
+	 * compositors have no session event sink), and the state tracker maps it
+	 * to the OpenXR loss sequence — `has_lost` + XR_ERROR_SESSION_LOST from
+	 * that call on, and an XR_SESSION_STATE_LOSS_PENDING state change queued
+	 * for the next xrPollEvent. Do NOT use @ref XRT_ERROR_IPC_FAILURE for
+	 * this: that reports XR_ERROR_INSTANCE_LOST, and the instance is fine.
+	 */
+	XRT_ERROR_COMPOSITOR_DEVICE_LOST = -49,
 } xrt_result_t;
