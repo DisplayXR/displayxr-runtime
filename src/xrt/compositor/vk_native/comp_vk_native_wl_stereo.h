@@ -17,6 +17,16 @@
  * library beyond libwayland-client. On a compositor without the global (GNOME,
  * an unpatched KWin) nothing is declared and the caller says so.
  *
+ * A surface has at most one declaration. Making a second one for the same
+ * surface raises the protocol's `already_declared` error, and a Wayland
+ * protocol error is fatal to the client's connection: the compositor
+ * disconnects the app, not only the declaration. This file makes exactly one
+ * per surface, on the first declaration, and reuses it for every later change
+ * (withdrawing is `set_content(none)`, not destroying and making again). An app
+ * that declares the same surface itself on the same connection must not be
+ * combined with a runtime that declares it: the later create ends the app's
+ * connection.
+ *
  * Wayland only. Requests go out on the app's connection through a private
  * queue, like the move-sync tag (comp_vk_native_wl_move_sync): the declaration
  * takes effect with the surface's next commit, the one the WSI makes inside
