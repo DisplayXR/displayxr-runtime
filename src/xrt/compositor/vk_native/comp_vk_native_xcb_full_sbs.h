@@ -26,6 +26,16 @@
  * is half the X window's width. Undeclared, every ConfigureNotify counts as
  * before.
  *
+ * Withdrawing the declaration is a transient of its own: the window manager
+ * halves the X window again, so for a few frames the swapchain (twice the
+ * window's width, created while the window was doubled) no longer matches the
+ * window, and vkAcquireNextImageKHR or vkQueuePresentKHR return
+ * VK_ERROR_OUT_OF_DATE_KHR ("the surface has changed in such a way that it is no
+ * longer compatible with the swapchain", Vulkan 1.3, vkQueuePresentKHR). That
+ * is expected, not a fault: the compositor recreates the swapchain at the
+ * window's new size on each one, and the churn ends when the window's size is
+ * steady.
+ *
  * @ingroup comp_vk_native
  */
 
