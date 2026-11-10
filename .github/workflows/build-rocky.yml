@@ -1,0 +1,164 @@
+name: Build Rocky Linux
+
+# Rocky Linux 9 / RHEL 9 coverage. Film and VFX studios (Pixar, Disney
+# Animation, Weta FX, DreamWorks, Lightstorm) run artist workstations on
+# RHEL-family Linux pinned to the VFX Reference Platform, not Ubuntu.
+#
+# build-linux.yml builds every Linux artifact on ubuntu:22.04 (glibc 2.35).
+# RHEL 9 ships glibc 2.34, so those artifacts cannot load there: install.sh
+# refuses the host (GLIBC_FLOOR), and the .deb does not apply at all.
+#
+# Rocky9:       build + package in rockylinux:9, install from the tarball,
+#               selftest from the installed XDG paths, record the glibc floor.
+# Rocky9Apps:   the --apps build (OpenXR loader + Vulkan test apps) with GL/EGL
+#               dev libs, mirroring build-linux.yml's Selftest job.
+# CrossInstall: install the Rocky-built tarball into PRISTINE rockylinux:9 and
+#               ubuntu:22.04 containers (runtime libs only) and selftest there.
+#               If both pass, one tarball built on Rocky 9 covers both.
+#
+# Not a required check yet: it starts as an advisory lane.
+
+on:
+  workflow_dispatch: {}
+  pull_request: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Build deps for Rocky 9. CRB carries ninja-build / eigen3-devel; EPEL carries
+  # cjson-devel. GL/EGL dev libs are added only in Rocky9Apps (same split as
+  # build-linux.yml: the shipped artifact deliberately has no GL).
+  ROCKY_BUILD_DEPS: >-
+    gcc gcc-c++ make cmake ninja-build pkgconf-pkg-config git python3
+    file binutils tar gzip findutils which diffutils
+    vulkan-loader-devel vulkan-headers vulkan-validation-layers glslang
+    eigen3-devel cjson-devel systemd-devel
+    libxcb-devel libX11-devel libXrandr-devel wayland-devel dbus-devel
+
+jobs:
+  Rocky9:
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    steps:
+      - name: Install dependencies (CRB + EPEL)
+        run: |
+          dnf -y install dnf-plugins-core epel-release
+          dnf config-manager --set-enabled crb
+          dnf -y install $ROCKY_BUILD_DEPS
+          cmake --version | head -1
+          gcc --version | head -1
+          ldd --version | head -1
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0 # git describe needs tags for the tarball version
+
+      - name: Build (shipped hybrid configuration) + selftest
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          CMAKE_BUILD_TYPE=Release ./scripts/build_linux.sh --hybrid
+
+      - name: Package tarball
+        run: ./scripts/package_linux.sh --no-build
+
+      - name: glibc floor must load on RHEL 9 (<= 2.34)
+        run: |
+          tar -C /tmp -xzf dist/displayxr-runtime-linux-*.tar.gz
+          FLOOR="$(cat /tmp/displayxr-runtime-linux-*/GLIBC_FLOOR)"
+          echo "glibc floor: $FLOOR"
+          if [ "$(printf '%s\n%s\n' "$FLOOR" 2.34 | sort -V | tail -1)" != "2.34" ]; then
+            echo "::error::glibc floor $FLOOR is above RHEL 9's 2.34"
+            exit 1
+          fi
+          echo "### Rocky 9 tarball glibc floor: \`$FLOOR\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install from tarball + selftest from installed paths
+        run: |
+          export HOME="${HOME:-/root}"
+          cd /tmp/displayxr-runtime-linux-*/
+          ./install.sh --no-gnome-extension
+          unset XRT_PLUGIN_SEARCH_PATH
+          "$HOME/.local/share/displayxr/bin/displayxr-cli" info
+          "$HOME/.local/share/displayxr/bin/displayxr-cli" selftest
+          ./uninstall.sh
+          test ! -f "$HOME/.config/openxr/1/active_runtime.json"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: displayxr-runtime-rocky9-tarball
+          path: dist/displayxr-runtime-linux-*.tar.gz
+          if-no-files-found: error
+
+  Rocky9Apps:
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    steps:
+      - name: Install dependencies (CRB + EPEL, + GL/EGL for the apps)
+        run: |
+          dnf -y install dnf-plugins-core epel-release
+          dnf config-manager --set-enabled crb
+          dnf -y install $ROCKY_BUILD_DEPS \
+            mesa-libGL-devel mesa-libEGL-devel libglvnd-devel libXxf86vm-devel
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Build + selftest + OpenXR loader + test apps
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ./scripts/build_linux.sh --apps
+
+  CrossInstall:
+    name: CrossInstall (${{ matrix.image }})
+    needs: Rocky9
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["rockylinux:9", "ubuntu:22.04"]
+    steps:
+      - name: Install runtime libraries only (no -devel)
+        run: |
+          if command -v dnf >/dev/null; then
+            dnf -y install epel-release
+            dnf -y install vulkan-loader cjson libxcb libX11 libXrandr dbus-libs \
+              systemd-libs binutils tar gzip findutils
+          else
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends libvulkan1 libcjson1 \
+              libxcb1 libxcb-randr0 libxcb-shape0 libx11-6 libx11-xcb1 libxrandr2 libwayland-client0 \
+              libdbus-1-3 libudev1 binutils
+          fi
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: displayxr-runtime-rocky9-tarball
+          path: dist
+
+      - name: ldd -r on every shipped ELF + install + selftest
+        run: |
+          export HOME="${HOME:-/root}"
+          tar -C /tmp -xzf dist/displayxr-runtime-linux-*.tar.gz
+          cd /tmp/displayxr-runtime-linux-*/
+          rc=0
+          for f in $(find bin lib -type f); do
+            if file "$f" 2>/dev/null | grep -q ELF || head -c4 "$f" | grep -q ELF; then
+              if ldd -r "$f" 2>&1 | grep -E "not found|undefined symbol"; then
+                echo "::error::unresolved dependency in $f"; rc=1
+              fi
+            fi
+          done
+          [ "$rc" = 0 ] || exit 1
+          ./install.sh --no-gnome-extension
+          unset XRT_PLUGIN_SEARCH_PATH
+          "$HOME/.local/share/displayxr/bin/displayxr-cli" selftest
