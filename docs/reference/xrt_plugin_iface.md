@@ -447,8 +447,9 @@ A value the runtime does not know is read as 0, the way `weave_scope` is clamped
 
 **The declaration is vendor neutral.** The runtime only declares a layout and never weaves
 (ADR-007): it tells the desktop compositor "this window holds the two views, side by side, left
-first", and the compositor does the rest. The declaration is KDE's stereo content protocol, where
-it was born and where Stereo KWin (Sparky Stereo OS) is its first consumer. The protocol keeps its
+first", and the compositor does the rest. The declaration is the `kde_stereo_content_v1` protocol,
+which lives today in Sparky Stereo OS's Stereo KWin (our fork of KWin; it is not in upstream
+plasma-wayland-protocols, see `src/external/wayland-protocols/README.md`). The protocol keeps its
 name and its wire format, and any other compositor can implement it unchanged: a client that
 speaks it then works on every compositor that does, with no change. The protocol carries one
 value, full side by side; every other layout is the compositor's output filters' work, so a
