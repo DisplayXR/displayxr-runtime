@@ -187,6 +187,13 @@ sanitize_pe_data_dir(const IMAGE_NT_HEADERS64 *nt, uint32_t idx, uint32_t *out_r
 static bool
 sanitize_unwind_shape_is_tracer_unsafe(const uint8_t *d, uint64_t n, const IMAGE_NT_HEADERS64 *nt)
 {
+#if !defined(_M_X64)
+	// x64 UNWIND_INFO shape only; ARM64 .pdata is a different format.
+	(void)d;
+	(void)n;
+	(void)nt;
+	return false;
+#else
 	uint32_t rva = 0;
 	uint32_t size = 0;
 	if (!sanitize_pe_data_dir(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION, &rva, &size)) {
@@ -215,6 +222,7 @@ sanitize_unwind_shape_is_tracer_unsafe(const uint8_t *d, uint64_t n, const IMAGE
 		}
 	}
 	return false;
+#endif
 }
 
 
