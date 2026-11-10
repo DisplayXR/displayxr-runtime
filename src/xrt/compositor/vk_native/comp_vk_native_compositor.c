@@ -665,10 +665,9 @@ struct comp_vk_native_compositor
 		const char *refused;
 	} full_sbs;
 #if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_STEREO)
-	//! The app surface's stereo declaration (NULL: the compositor takes none).
+	//! The app surface's stereo declaration. Its registry is bound lazily, on the
+	//! first declaration (comp_vk_native_wl_stereo_set_full_sbs).
 	struct comp_vk_native_wl_stereo *wl_stereo;
-	//! Why @ref wl_stereo is NULL, from comp_vk_native_wl_stereo_create.
-	const char *wl_stereo_missing;
 #endif
 
 	/*!
@@ -5957,8 +5956,10 @@ vk_full_sbs_refresh_locked(struct comp_vk_native_compositor *c)
 			} else {
 #if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_STEREO)
 				if (c->use_wayland) {
+					// Whether the compositor takes it is known at the first
+					// declaration (below): the registry is bound then, not before.
 					declare = c->wl_stereo != NULL;
-					refused = declare ? NULL : c->wl_stereo_missing;
+					refused = declare ? NULL : "there is no Wayland surface to declare";
 				} else
 #endif
 #ifdef XRT_OS_LINUX_DESKTOP
@@ -5987,6 +5988,18 @@ vk_full_sbs_refresh_locked(struct comp_vk_native_compositor *c)
 			}
 		}
 
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_STEREO)
+		// The first declaration binds the compositor's stereo registry; a compositor
+		// without it refuses here, and the refusal is logged like any other.
+		if (c->use_wayland && c->wl_stereo != NULL && declare != c->full_sbs.declared) {
+			const char *bind_refusal = NULL;
+			if (!comp_vk_native_wl_stereo_set_full_sbs(c->wl_stereo, declare, &bind_refusal)) {
+				declare = false;
+				refused = bind_refusal;
+			}
+		}
+#endif
+
 		if (refused != NULL && refused != c->full_sbs.refused) {
 			U_LOG_W(
 			    "FULL_SBS: the display processor's output is full side by side for a stereo compositor, "
@@ -6002,9 +6015,7 @@ vk_full_sbs_refresh_locked(struct comp_vk_native_compositor *c)
 			// Takes effect with the surface's next commit: the present that
 			// carries the first buffer of the new width (the resize below
 			// comes first).
-			if (c->use_wayland) {
-				comp_vk_native_wl_stereo_set_full_sbs(c->wl_stereo, declare);
-			}
+			// (the Wayland request was sent above, where the bind could refuse)
 #endif
 #ifdef XRT_OS_LINUX_DESKTOP
 			if (c->xcb_window != NULL) {
@@ -15150,11 +15161,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		c->wl_declared_height = wl->height;
 		U_LOG_I("Using app-provided Wayland surface (XR_DXR_wayland_surface_binding)");
 #ifdef DXR_HAVE_WL_STEREO
-		// Bound now, used only if a display processor's output is full side
-		// by side (vk_full_sbs_refresh_locked); declares nothing by itself.
-		c->wl_stereo = comp_vk_native_wl_stereo_create(wl->display, wl->surface, &c->wl_stereo_missing);
-		U_LOG_I("Stereo declaration: %s",
-		        c->wl_stereo != NULL ? "the compositor takes kde_stereo_content_v1" : c->wl_stereo_missing);
+		// Prepared now, bound and used only if a display processor's output is
+		// full side by side (vk_full_sbs_refresh_locked): no request goes out
+		// before that, so a session that never presents full side by side adds
+		// no traffic on the app's connection.
+		c->wl_stereo = comp_vk_native_wl_stereo_create(wl->display, wl->surface);
 #endif
 		if (wl->width > 0 && wl->height > 0) {
 			U_LOG_W("Wayland surface geometry declared by the app: %ux%u @ %u mHz", wl->width, wl->height,

@@ -38,26 +38,33 @@ extern "C" {
 struct comp_vk_native_wl_stereo;
 
 /*!
- * Bind the compositor's stereo declaration global on @p wl_display (the app's
- * connection, through a private event queue) for @p wl_surface, the surface
- * the runtime presents to. Declares nothing yet.
+ * Prepare the declaration of @p wl_surface, the surface the runtime presents to,
+ * on @p wl_display (the app's connection). Sends nothing: the compositor's
+ * globals are asked for on the first comp_vk_native_wl_stereo_set_full_sbs(true),
+ * so a session that never presents full side by side adds no traffic.
  *
- * @param[out] out_reason Set to a static sentence when NULL is returned: why
- *                        this compositor cannot take the declaration.
- * @return NULL when the compositor offers no usable declaration.
+ * @return NULL only without a display or a surface, or out of memory.
  */
 struct comp_vk_native_wl_stereo *
-comp_vk_native_wl_stereo_create(void *wl_display, void *wl_surface, const char **out_reason);
+comp_vk_native_wl_stereo_create(void *wl_display, void *wl_surface);
 
 /*!
  * Declare the surface full side by side (@p full_sbs true) or nothing. Takes
  * effect with the surface's next commit; call it before the present that
  * carries the first buffer of the new layout.
+ *
+ * The first call with true binds the stereo registry (through a private
+ * event queue, one roundtrip) and makes the surface's declaration object.
+ *
+ * @param[out] out_reason Set to a static sentence when false is returned: why
+ *                        this compositor cannot take the declaration. A
+ *                        failed bind is not retried.
+ * @return false when nothing could be declared.
  */
-void
-comp_vk_native_wl_stereo_set_full_sbs(struct comp_vk_native_wl_stereo *s, bool full_sbs);
+bool
+comp_vk_native_wl_stereo_set_full_sbs(struct comp_vk_native_wl_stereo *s, bool full_sbs, const char **out_reason);
 
-//! The version of `kde_stereo_content_manager_v1` that was bound.
+//! The version of `kde_stereo_content_manager_v1` that was bound (0 before the first declaration).
 uint32_t
 comp_vk_native_wl_stereo_version(const struct comp_vk_native_wl_stereo *s);
 

@@ -37,6 +37,10 @@ struct comp_vk_native_wl_stereo
 	uint32_t version;
 
 	struct wl_surface *surface;
+	//! The registry was asked for the compositor's globals (once, on the first set_full_sbs(true)).
+	bool bound;
+	//! Why binding failed, a static sentence; NULL while it has not or succeeded.
+	const char *missing;
 	//! The surface's declaration object, made on the first set_full_sbs.
 	struct kde_stereo_content_v1 *declaration;
 	bool full_sbs;
@@ -70,73 +74,90 @@ static const struct wl_registry_listener wl_stereo_registry_listener = {
 };
 
 struct comp_vk_native_wl_stereo *
-comp_vk_native_wl_stereo_create(void *wl_display, void *wl_surface, const char **out_reason)
+comp_vk_native_wl_stereo_create(void *wl_display, void *wl_surface)
 {
-	const char *reason = "no Wayland surface to declare";
-	struct comp_vk_native_wl_stereo *s = NULL;
 	if (wl_display == NULL || wl_surface == NULL) {
-		goto fail;
+		return NULL;
 	}
-	reason = "out of memory";
-	s = U_TYPED_CALLOC(struct comp_vk_native_wl_stereo);
+	struct comp_vk_native_wl_stereo *s = U_TYPED_CALLOC(struct comp_vk_native_wl_stereo);
 	if (s == NULL) {
-		goto fail;
+		return NULL;
 	}
 	s->display = (struct wl_display *)wl_display;
 	s->surface = (struct wl_surface *)wl_surface;
+	return s;
+}
+
+//! Ask the compositor for its stereo declaration global, once; sets s->missing when it has none.
+static bool
+wl_stereo_bind(struct comp_vk_native_wl_stereo *s)
+{
+	if (s->bound) {
+		return s->manager != NULL;
+	}
+	s->bound = true;
 
 	// A private queue: the app dispatches the default queue on its own thread,
 	// and none of our objects' events may ever reach its listeners.
-	reason = "could not make a private Wayland event queue";
+	s->missing = "could not make a private Wayland event queue";
 	s->queue = wl_display_create_queue(s->display);
 	s->wrapper = wl_proxy_create_wrapper(s->display);
 	if (s->queue == NULL || s->wrapper == NULL) {
-		goto fail;
+		return false;
 	}
 	wl_proxy_set_queue((struct wl_proxy *)s->wrapper, s->queue);
 	s->registry = wl_display_get_registry(s->wrapper);
 	wl_registry_add_listener(s->registry, &wl_stereo_registry_listener, s);
-	reason = "the Wayland roundtrip for the compositor's globals failed";
+	s->missing = "the Wayland roundtrip for the compositor's globals failed";
 	if (wl_display_roundtrip_queue(s->display, s->queue) < 0) {
-		goto fail;
+		return false;
 	}
 	if (s->manager == NULL) {
-		reason = s->offered_version == 0
-		             ? "the compositor offers no kde_stereo_content_manager_v1 (no stereo declaration: "
-		               "not Stereo KWin)"
-		             : "the compositor offers kde_stereo_content_manager_v1 version 1 only, where a declared "
-		               "surface keeps its buffer's width (version 2 or later is needed)";
-		goto fail;
+		s->missing = s->offered_version == 0
+		                 ? "the compositor offers no kde_stereo_content_manager_v1 (no stereo declaration: "
+		                   "not Stereo KWin)"
+		                 : "the compositor offers kde_stereo_content_manager_v1 version 1 only, where a "
+		                   "declared surface keeps its buffer's width (version 2 or later is needed)";
+		return false;
 	}
-	return s;
-
-fail:
-	if (out_reason != NULL) {
-		*out_reason = reason;
-	}
-	comp_vk_native_wl_stereo_destroy(&s);
-	return NULL;
+	s->missing = NULL;
+	return true;
 }
 
-void
-comp_vk_native_wl_stereo_set_full_sbs(struct comp_vk_native_wl_stereo *s, bool full_sbs)
+bool
+comp_vk_native_wl_stereo_set_full_sbs(struct comp_vk_native_wl_stereo *s, bool full_sbs, const char **out_reason)
 {
-	if (s == NULL || s->manager == NULL) {
-		return;
+	if (s == NULL) {
+		if (out_reason != NULL) {
+			*out_reason = "no Wayland surface to declare";
+		}
+		return false;
 	}
 	if (s->declaration == NULL) {
 		if (!full_sbs) {
-			return; // never declared: already none
+			return true; // never declared: already none
+		}
+		// The first declaration is the first time the registry is touched: a
+		// session that never presents full side by side adds no traffic.
+		if (!wl_stereo_bind(s)) {
+			if (out_reason != NULL) {
+				*out_reason = s->missing;
+			}
+			return false;
 		}
 		s->declaration = kde_stereo_content_manager_v1_create(s->manager, s->surface);
 		if (s->declaration == NULL) {
-			return;
+			if (out_reason != NULL) {
+				*out_reason = "the compositor could not make the declaration object";
+			}
+			return false;
 		}
 	}
 	kde_stereo_content_v1_set_content(s->declaration, full_sbs ? KDE_STEREO_CONTENT_V1_CONTENT_SIDE_BY_SIDE_FULL
 	                                                           : KDE_STEREO_CONTENT_V1_CONTENT_NONE);
 	s->full_sbs = full_sbs;
 	wl_display_flush(s->display);
+	return true;
 }
 
 uint32_t
