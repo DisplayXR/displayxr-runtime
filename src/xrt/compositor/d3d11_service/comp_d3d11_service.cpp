@@ -8174,6 +8174,16 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			// DEVICE-WIDE and this device also owns the service window's
 			// waitable chain, which is what actually paces the render thread.
 			sc_desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+			// #2564: DXGI_SCALING_NONE, not the default STRETCH. During a resize
+			// drag DWM keeps showing the last presented buffer until a frame of
+			// the new size arrives, and STRETCH rescales it to the new window,
+			// which rescales the interlace pattern: the 3D breaks up on every
+			// drag step, at a steady 60 fps and constant weave timing. NONE shows
+			// the stale frame 1:1 from the top-left, still correctly woven.
+			// Found on Leia SR's own D3D12 sample (LeiaSR#854) and A/B'd on the
+			// panel. HWND chains only: CreateSwapChainForComposition requires
+			// STRETCH.
+			sc_desc.Scaling = DXGI_SCALING_NONE;
 
 			hr = svc_out_factory(sys)->CreateSwapChainForHwnd(svc_out_device(sys), res->hwnd, &sc_desc,
 			                                                  nullptr, nullptr, res->swap_chain.put());
