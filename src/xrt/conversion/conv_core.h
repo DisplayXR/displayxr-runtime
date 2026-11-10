@@ -234,6 +234,22 @@ conv_core_enum_candidates(struct conv_core *core, uint32_t task, struct xrt_conv
 uint32_t
 conv_core_v3_state(struct conv_core *core, uint32_t v3_modes, bool photo_content);
 
+/*!
+ * A v3 caller asked about @p v3_modes (same bits as conv_core_v3_state):
+ * re-warm every selected row an orderly host exit left EVICTED, and return
+ * how many warms it requested.
+ *
+ * Why: an idle exit evicts READY rows, and an orderly exit is respawned only
+ * by the next demand (a warm or a create). EVICTED reads ACTIVATING to a v3
+ * caller, and a caller that gates its first create on READY (the DisplayXR
+ * Browser's "Convert to 3D") never makes one, so it would wait forever. A
+ * properties query from a lift client is that demand. Rows that are WARMING
+ * already, cold INSTALLED rows (the PrewarmOn policy's call) and terminal rows
+ * are left alone, so a repeated poll requests nothing.
+ */
+uint32_t
+conv_core_v3_rewarm_evicted(struct conv_core *core, uint32_t v3_modes, bool photo_content);
+
 /*! Every registered provider is described (live or cached) or terminal.
  *  The v3 adapter (#2005) routes a properties query to the core while this
  *  is false even before any row exists (cold boot: ACTIVATING, not

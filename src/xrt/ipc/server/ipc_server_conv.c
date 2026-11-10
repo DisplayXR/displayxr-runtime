@@ -735,6 +735,10 @@ ipc_server_conv_lift_properties(struct ipc_server_conv *sc, struct xrt_dp_lift_c
 		v3_modes |= CONV_V3_MODE_GAUSSIANS;
 		out->modes |= XRT_DP_LIFT_MODE_GAUSSIANS;
 	}
+	// An idle-evicted row reads ACTIVATING, and a caller that waits for READY
+	// before its first create would wait forever: this query is the demand
+	// that respawns the host.
+	conv_core_v3_rewarm_evicted(core, v3_modes, false);
 	out->state = conv_core_v3_state(core, v3_modes, false);
 
 	struct xrt_conv_wire_task_desc views, depth;
