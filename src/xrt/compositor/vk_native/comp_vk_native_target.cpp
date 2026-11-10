@@ -1528,6 +1528,16 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 	if (present_opaque) {
 		DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs_desc = {};
 		fs_desc.Windowed = TRUE;
+		// #2564: DXGI_SCALING_NONE, not the default STRETCH. During a resize
+		// drag DWM keeps showing the last presented buffer until a frame of
+		// the new size arrives, and STRETCH rescales it to the new window,
+		// which rescales the interlace pattern: the 3D breaks up on every
+		// drag step, at a steady 60 fps and constant weave timing. NONE shows
+		// the stale frame 1:1 from the top-left, still correctly woven.
+		// Found on Leia SR's own D3D12 sample (LeiaSR#854) and A/B'd on the
+		// panel. HWND chains only: CreateSwapChainForComposition requires
+		// STRETCH.
+		desc.Scaling = DXGI_SCALING_NONE;
 		hr = dxgi_factory->CreateSwapChainForHwnd(target->dcomp_dx_device, hwnd, &desc, &fs_desc,
 		                                           NULL, &target->dcomp_swapchain);
 		if (SUCCEEDED(hr)) {

@@ -469,6 +469,16 @@ comp_d3d12_target_create(void *hwnd,
 		        "(FLIP_DISCARD + PREMULTIPLIED, bc=%u)",
 		        (unsigned)BACK_BUFFER_COUNT);
 	} else {
+		// #2564: DXGI_SCALING_NONE, not the default STRETCH. During a resize
+		// drag DWM keeps showing the last presented buffer until a frame of
+		// the new size arrives, and STRETCH rescales it to the new window,
+		// which rescales the interlace pattern: the 3D breaks up on every
+		// drag step, at a steady 60 fps and constant weave timing. NONE shows
+		// the stale frame 1:1 from the top-left, still correctly woven.
+		// Found on Leia SR's own D3D12 sample (LeiaSR#854) and A/B'd on the
+		// panel. HWND chains only: CreateSwapChainForComposition requires
+		// STRETCH.
+		desc.Scaling = DXGI_SCALING_NONE;
 		hr = factory->CreateSwapChainForHwnd(target->queue, swapchain_hwnd, &desc, &fs_desc, nullptr,
 		                                     &swapchain1);
 
