@@ -21,6 +21,7 @@
 #include "client/ipc_client_connection.h"
 #include "client/ipc_client_lift.h"
 #include "client/ipc_client_service_link.h"
+#include "shared/ipc_shmem.h"
 
 #include "ipc_client_generated.h"
 
@@ -36,6 +37,29 @@
 #define SERVICE_LINK_RETRY_NS (5ull * 1000 * 1000 * 1000)
 //! ADR-061: the share poll makes its IPC round trip at most this often.
 #define SHARE_POLL_INTERVAL_NS (250ull * 1000 * 1000)
+
+/*!
+ * Release what ipc_client_connection_init left in @p c and free it.
+ *
+ * ipc_client_connection_fini closes the pipe but not the shared memory the
+ * handshake mapped (the instance unmaps it itself, after fini), so every owner
+ * of a connection must. Without this the link leaked one Section handle and
+ * one mapped view per connect: every 5 s retry against a service that refuses
+ * the handshake (a git-tag mismatch) adds one, for as long as the app runs.
+ * @p finalised: init failed and already ran fini.
+ */
+static void
+connection_free(struct ipc_connection *c, bool finalised)
+{
+	if (c == NULL) {
+		return;
+	}
+	if (!finalised) {
+		ipc_client_connection_fini(c);
+	}
+	ipc_shmem_destroy(&c->ism_handle, (void **)&c->ism, sizeof(struct ipc_shared_memory));
+	free(c);
+}
 
 struct ipc_client_service_link
 {
@@ -181,7 +205,7 @@ connect_run(void *ptr)
 			os_cond_signal(&link->worker_cond); // flush / poll on the new connection
 		}
 	} else {
-		free(c); // init already finalised a half-made connection
+		connection_free(c, true); // init already finalised a half-made connection
 		link->state = IPC_CLIENT_SERVICE_LINK_FAILED;
 		link->retry_after_ns = os_monotonic_get_ns() + SERVICE_LINK_RETRY_NS;
 		if (link->worker_started) {
@@ -222,8 +246,7 @@ static void
 reap_dead_locked(struct ipc_client_service_link *link)
 {
 	if (link->state == IPC_CLIENT_SERVICE_LINK_DEAD && link->users == 0 && link->conn != NULL) {
-		ipc_client_connection_fini(link->conn);
-		free(link->conn);
+		connection_free(link->conn, false);
 		link->conn = NULL;
 	}
 }
@@ -325,8 +348,7 @@ ipc_client_service_link_destroy(struct ipc_client_service_link **link_ptr)
 	if (link->conn != NULL) {
 		// Closing the pipe is what tells the service to drop every stream
 		// this connection owns (streams belong to the connection).
-		ipc_client_connection_fini(link->conn);
-		free(link->conn);
+		connection_free(link->conn, false);
 		link->conn = NULL;
 	}
 	os_mutex_destroy(&link->mtx);

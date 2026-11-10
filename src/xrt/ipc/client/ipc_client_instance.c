@@ -306,6 +306,8 @@ ipc_instance_create(const struct xrt_instance_info *i_info, struct xrt_instance 
 
 	xret = ipc_client_connection_init(&ii->ipc_c, debug_get_log_option_ipc_log(), i_info);
 	if (xret != XRT_SUCCESS) {
+		// init ran fini, which leaves the handshake's shared memory mapped.
+		ipc_shmem_destroy(&ii->ipc_c.ism_handle, (void **)&ii->ipc_c.ism, sizeof(struct ipc_shared_memory));
 #ifdef XRT_OS_ANDROID
 		android_instance_base_cleanup(&(ii->android), &(ii->base));
 #endif
