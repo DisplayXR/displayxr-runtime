@@ -2950,6 +2950,56 @@ TEST_CASE("satellite: an orderly (idle) exit is not a crash; describe goes throu
 	conv_fake_fini(&f);
 }
 
+TEST_CASE("satellite: a v3 lift query re-warms an idle-evicted row, so ACTIVATING is not a dead end",
+          "[conv_lanes]")
+{
+	// The DisplayXR Browser gates its first lift create on READY. After the
+	// host's idle exit the row is EVICTED, which reads ACTIVATING, and an
+	// orderly exit is respawned only by the next demand -- so before this fix
+	// "Convert to 3D" spun forever once the browser had been idle 10 minutes.
+	conv_fake_provider f;
+	conv_fake_init(&f, "sat");
+	conv_fake_cap *c =
+	    conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	c->warm_ms = 5;
+	{
+		Core core(false);
+		FakeSat *sat = add_satellite(core, f, 100);
+		conv_core_warm_task(core.c, XRT_CONV_TASK_VIEWS_MONO);
+		REQUIRE(wait_until([&] { return views_state(core) == XRT_CONV_STATE_READY; }, 2000));
+
+		sat->die(0); // CONV_HOST_EXIT_ORDERLY (idle)
+		REQUIRE(wait_until([&] { return views_state(core) == XRT_CONV_STATE_EVICTED; }, 2000));
+		CHECK(conv_core_v3_state(core.c, CONV_V3_MODE_SBS, false) == CONV_V3_STATE_ACTIVATING);
+
+		sat->unlatch(); // the supervisor spawns on the next demand
+		// SBS and NVIEW both map to VIEWS_MONO: one warm, not two.
+		CHECK(conv_core_v3_rewarm_evicted(core.c, CONV_V3_MODE_SBS | CONV_V3_MODE_NVIEW, false) == 1u);
+		REQUIRE(wait_until([&] { return views_state(core) == XRT_CONV_STATE_READY; }, 2000));
+		CHECK(conv_core_v3_state(core.c, CONV_V3_MODE_SBS, false) == CONV_V3_STATE_READY);
+		// READY (or WARMING) is not EVICTED: a repeated poll requests nothing.
+		CHECK(conv_core_v3_rewarm_evicted(core.c, CONV_V3_MODE_SBS, false) == 0u);
+	}
+	conv_fake_fini(&f);
+}
+
+TEST_CASE("v3 lift query leaves a cold INSTALLED row to the prewarm policy", "[conv_lanes]")
+{
+	conv_fake_provider f;
+	conv_fake_init(&f, "sat");
+	conv_fake_cap *c =
+	    conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	c->warm_ms = 5;
+	{
+		Core core(false);
+		add_satellite(core, f, 100);
+		REQUIRE(views_state(core) == XRT_CONV_STATE_INSTALLED);
+		CHECK(conv_core_v3_rewarm_evicted(core.c, 0, false) == 0u);
+		CHECK(views_state(core) == XRT_CONV_STATE_INSTALLED);
+	}
+	conv_fake_fini(&f);
+}
+
 TEST_CASE("satellite: a host failed terminally drives its cold rows FAILED, so v3 reads UNAVAILABLE (#2279)",
           "[conv_lanes]")
 {

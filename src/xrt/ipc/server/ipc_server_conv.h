@@ -346,7 +346,9 @@ ipc_server_conv_owns_stream(struct ipc_server_conv *sc, uint64_t stream_id);
  * XrLiftPropertiesDXR for a v3 caller, from the core (roadmap §7.3):
  *  - state: conv_core_v3_state over DEPTH | SBS | NVIEW (ACTIVATING while
  *    discovery is unsettled or any backing task is non-terminal,
- *    UNAVAILABLE only when settled with no candidate, else READY);
+ *    UNAVAILABLE only when settled with no candidate, else READY); a selected
+ *    row an idle host exit left EVICTED is re-warmed first
+ *    (conv_core_v3_rewarm_evicted), so ACTIVATING is never a dead end;
  *  - modes: every mode whose backing task has a non-terminal candidate;
  *    NVIEW only when maxViews > 2;
  *  - max_views / max_streams / typical latency from VIEWS_MONO, else DEPTH;

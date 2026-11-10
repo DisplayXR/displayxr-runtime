@@ -1114,6 +1114,40 @@ conv_core_v3_state(struct conv_core *core, uint32_t v3_modes, bool photo_content
 	return conv_legacy_v3_state(states, n, settled);
 }
 
+uint32_t
+conv_core_v3_rewarm_evicted(struct conv_core *core, uint32_t v3_modes, bool photo_content)
+{
+	if (core == NULL) {
+		return 0;
+	}
+	if (v3_modes == 0) {
+		v3_modes = CONV_V3_MODE_DEPTH | CONV_V3_MODE_SBS | CONV_V3_MODE_NVIEW | CONV_V3_MODE_GAUSSIANS;
+	}
+	uint32_t warmed = 0;
+	os_mutex_lock(&core->registry_mtx);
+	for (uint32_t bit = 1; bit <= CONV_V3_MODE_GAUSSIANS; bit <<= 1) {
+		if ((v3_modes & bit) == 0) {
+			continue;
+		}
+		const uint32_t task = conv_legacy_mode_task(bit, photo_content);
+		struct conv_binding b;
+		uint32_t s = 0;
+		if (task == XRT_CONV_TASK_NONE || !select_simple_locked(core, task, NULL, &b, &s) ||
+		    s != XRT_CONV_STATE_EVICTED) {
+			continue;
+		}
+		// SBS and NVIEW share VIEWS_MONO: the first warm moves the row to
+		// WARMING, so the second mode reads it as such and requests nothing.
+		conv_core_request_warm_locked(core, b.provider, b.cap_id, CONV_EV_WARM_REQUESTED);
+		U_LOG_W("[conv] v3 lift query: %s cap %u (%s) was evicted by an idle host exit; re-warming -> %s",
+		        core->reg.providers[b.provider].id, b.cap_id, conv_task_name(task),
+		        conv_state_name(conv_core_row_state_locked(core, b.provider, b.cap_id)));
+		warmed++;
+	}
+	os_mutex_unlock(&core->registry_mtx);
+	return warmed;
+}
+
 bool
 conv_core_discovery_settled(struct conv_core *core)
 {
