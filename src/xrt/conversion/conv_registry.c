@@ -11,6 +11,8 @@
 #include <string.h>
 
 // xrt_conv_provider_status::state shares xrt_plugin_platform_state values.
+#define CONV_PLATFORM_STATE_UNKNOWN 0u
+#define CONV_PLATFORM_STATE_READY 1u
 #define CONV_PLATFORM_STATE_PLATFORM_ABSENT 2u
 #define CONV_PLATFORM_STATE_INCOMPATIBLE 5u
 
@@ -662,6 +664,15 @@ conv_registry_cache_load(struct conv_registry *reg, const uint8_t *buf, size_t l
 		if (p->described || strcmp(p->binary_path, path) != 0 || p->binary_size != bsize ||
 		    p->binary_mtime != bmtime) {
 			continue; // live already, or a different binary: re-describe on demand
+		}
+		if (platform_state != CONV_PLATFORM_STATE_READY && platform_state != CONV_PLATFORM_STATE_UNKNOWN) {
+			// #2596: the binary key says the capabilities are current, but the
+			// platform state is a fact about the machine (is NeurD / the SR
+			// platform installed and running?) that changes without the
+			// provider binary changing. A provider that said "unavailable"
+			// re-describes at start: one probe (<= 100 ms) instead of being
+			// pinned unavailable until its DLL is replaced.
+			continue;
 		}
 
 		struct xrt_conv_capability caps[XRT_CONV_MAX_CAPABILITIES];
