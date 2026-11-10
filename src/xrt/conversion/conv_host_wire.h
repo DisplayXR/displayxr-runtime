@@ -151,6 +151,11 @@ extern "C" {
 #define CONV_HOST_EXIT_ORDERLY 0
 #define CONV_HOST_EXIT_ABI_REJECT 10
 #define CONV_HOST_EXIT_NEGOTIATE_FAILED 11 //!< negotiate or describe failed
+//! The provider's probe declined (XRT_ERROR_PROBER_NOT_SUPPORTED): an opt-in
+//! provider that is not enabled (sim-conversion without ENABLE=1), or one with
+//! nothing to serve on this machine. Not a load failure; latched the same way
+//! (no respawn until a configuration change) but reported as declined.
+#define CONV_HOST_EXIT_PROBE_DECLINED 16
 #define CONV_HOST_EXIT_LICENCE 12
 #define CONV_HOST_EXIT_NO_DEVICE 13 //!< no usable device on the given adapter
 #define CONV_HOST_EXIT_ELEVATED 14  //!< refused to run elevated

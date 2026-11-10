@@ -42,7 +42,7 @@
     (defined(__STDC_ENDIAN_NATIVE__) && __STDC_ENDIAN_NATIVE__ == __STDC_ENDIAN_LITTLE__) ||                           \
     defined(__LITTLE_ENDIAN__) || defined(__ARMEL__) || defined(__THUMBEL__) || defined(__AARCH64EL__) ||              \
     defined(_MIPSEL) || defined(__MIPSEL) || defined(__MIPSEL__) || defined(__x86_64__) || defined(_M_X64) ||          \
-    defined(i386) || defined(__i386__) || defined(__i386) || defined(_M_IX86)
+    defined(i386) || defined(__i386__) || defined(__i386) || defined(_M_IX86) || defined(_M_ARM64)
 
 #undef XRT_BIG_ENDIAN
 
@@ -55,8 +55,8 @@
  */
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(_ARCH_PPC64) || defined(__s390x__) ||    \
-    (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8)
+#if defined(__x86_64__) || defined(_M_X64) || defined(_M_ARM64) || defined(__aarch64__) || defined(_ARCH_PPC64) ||   \
+    defined(__s390x__) || (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8)
 #define XRT_64_BIT
 #else
 #define XRT_32_BIT

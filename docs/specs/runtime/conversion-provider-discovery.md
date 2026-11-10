@@ -514,6 +514,7 @@ Both hostings implement the same service-side **host interface** (describe, warm
   | 13 | no usable device on `--adapter-luid` | same |
   | 14 | refused to run elevated | same |
   | 15 | the inherited control channel is unusable | crash accounting |
+  | 16 | the provider's probe declined (`XRT_ERROR_PROBER_NOT_SUPPORTED`): an opt-in provider not enabled (sim-conversion without `ENABLE=1`), or nothing to serve here. Not an error: the host logs it at WARN | `FAILED` (`probe_declined`) until a configuration change |
   | 20 | closed for update (§3.8) | no backoff, no crash accounting; respawn only per §3.8 |
   | 30 | killed by the supervisor (call watchdog, hello timeout, heartbeat silence) | crash accounting |
   | other | crash; the host wrote a minidump | backoff, crash-loop cutoff |

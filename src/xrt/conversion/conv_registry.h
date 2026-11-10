@@ -238,7 +238,10 @@ conv_registry_cache_save(const struct conv_registry *reg, uint8_t *buf, size_t b
  * (binary path, size, mtime) match a cache record. Restored rows are
  * re-validated and start INSTALLED (from_cache = true), so a cold boot can
  * answer and select before any provider is loaded. A live describe later
- * replaces them.
+ * replaces them. A record whose provider reported its platform unavailable
+ * (any platform state but READY / UNKNOWN) is not restored, so that provider
+ * re-describes: the platform can be installed without the binary changing
+ * (#2596).
  *
  * @return providers restored (≥ 0), or a CONV_CACHE_ERR_* value.
  */

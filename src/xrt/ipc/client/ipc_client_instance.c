@@ -265,8 +265,7 @@ ipc_client_instance_destroy(struct xrt_instance *xinst)
 	timeEndPeriod(1);
 #endif
 
-	ipc_shmem_destroy(&ii->ipc_c.ism_handle, (void **)&ii->ipc_c.ism, sizeof(struct ipc_shared_memory));
-
+	// ipc_client_connection_fini above already released the shared memory.
 	free(ii);
 }
 

@@ -27,6 +27,7 @@
 #include "util/u_system_helpers.h"
 
 #include "shared/ipc_utils.h"
+#include "shared/ipc_shmem.h"
 #include "shared/ipc_protocol.h"
 #include "client/ipc_client_connection.h"
 
@@ -1266,9 +1267,11 @@ err_fini:
 void
 ipc_client_connection_fini(struct ipc_connection *ipc_c)
 {
-	if (ipc_c->ism_handle != XRT_SHMEM_HANDLE_INVALID) {
-		/// @todo how to tear down the shared memory?
-	}
+	// The handshake's shared memory: unmap the view and close the section, so
+	// every owner of a connection (the instance, the in-process service link,
+	// init's own failure path) releases it the same way. Safe when nothing was
+	// mapped, and when called twice (the handle and pointer are reset).
+	ipc_shmem_destroy(&ipc_c->ism_handle, (void **)&ipc_c->ism, sizeof(struct ipc_shared_memory));
 	ipc_message_channel_close(&ipc_c->imc);
 	os_mutex_destroy(&ipc_c->mutex);
 

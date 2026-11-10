@@ -517,7 +517,23 @@ target_display_hotplug_request(enum target_hotplug_source src, const char *reaso
 void
 target_display_hotplug_plugin_request(const char *reason)
 {
-	target_display_hotplug_request(TARGET_HOTPLUG_SOURCE_PLUGIN, reason != NULL ? reason : "plug-in");
+	const char *why = reason != NULL ? reason : "plug-in";
+
+	// A process that feeds its own re-probe (the service on Windows and
+	// desktop Linux, #2305) never starts a monitor, so a latched request
+	// would never be served: a panel the plug-in authenticated after the
+	// hotplug (Leia EDID_ONLY -> FPC_VERIFIED, leia #483) kept its
+	// provisional claim in the published screen table. Hand it to the
+	// host's re-probe instead, like a follow-up.
+	pthread_mutex_lock(&g_hp_lock);
+	const target_display_followup_sink_fn sink = g_hp == NULL ? g_followup_sink : NULL;
+	pthread_mutex_unlock(&g_hp_lock);
+	if (sink != NULL) {
+		U_LOG_W("display hotplug: plug-in request (%s) -> the host's display re-probe", why);
+		sink(why);
+		return;
+	}
+	target_display_hotplug_request(TARGET_HOTPLUG_SOURCE_PLUGIN, why);
 }
 
 void

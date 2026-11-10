@@ -34,8 +34,29 @@
 
 //! A failed connect is retried no more often than this.
 #define SERVICE_LINK_RETRY_NS (5ull * 1000 * 1000 * 1000)
+//! A service that refused the handshake for a version skew will not change its
+//! mind until it is restarted or upgraded: re-dial it far less often.
+#define SERVICE_LINK_SKEW_RETRY_NS (60ull * 1000 * 1000 * 1000)
 //! ADR-061: the share poll makes its IPC round trip at most this often.
 #define SHARE_POLL_INTERVAL_NS (250ull * 1000 * 1000)
+
+/*!
+ * Finalise (unless init already did) and free a connection. fini releases the
+ * handshake's shared memory too; before it did, every 5 s retry against a
+ * service that refused the handshake leaked one Section handle and its view.
+ * @p finalised: init failed and already ran fini.
+ */
+static void
+connection_free(struct ipc_connection *c, bool finalised)
+{
+	if (c == NULL) {
+		return;
+	}
+	if (!finalised) {
+		ipc_client_connection_fini(c);
+	}
+	free(c);
+}
 
 struct ipc_client_service_link
 {
@@ -181,9 +202,15 @@ connect_run(void *ptr)
 			os_cond_signal(&link->worker_cond); // flush / poll on the new connection
 		}
 	} else {
-		free(c); // init already finalised a half-made connection
+		const char *why = c == NULL ? "service not running"
+		                  : xret == XRT_ERROR_IPC_VERSION_SKEW ? "service version differs"
+		                                                        : "connect refused or failed";
+		const uint64_t retry_ns =
+		    xret == XRT_ERROR_IPC_VERSION_SKEW ? SERVICE_LINK_SKEW_RETRY_NS : SERVICE_LINK_RETRY_NS;
+		connection_free(c, true); // init already finalised a half-made connection
+		c = NULL;
 		link->state = IPC_CLIENT_SERVICE_LINK_FAILED;
-		link->retry_after_ns = os_monotonic_get_ns() + SERVICE_LINK_RETRY_NS;
+		link->retry_after_ns = os_monotonic_get_ns() + retry_ns;
 		if (link->worker_started) {
 			os_cond_signal(&link->worker_cond); // it schedules the retry
 		}
@@ -194,8 +221,7 @@ connect_run(void *ptr)
 			    "[service-link] in-process: no service (%s); in-process conversion and sharing "
 			    "unavailable, "
 			    "retrying quietly every %u s",
-			    c == NULL ? "service not running" : "connect refused or failed",
-			    (unsigned)(SERVICE_LINK_RETRY_NS / 1000000000ull));
+			    why, (unsigned)(retry_ns / 1000000000ull));
 		}
 	}
 	link->connect_done = true;
@@ -222,8 +248,7 @@ static void
 reap_dead_locked(struct ipc_client_service_link *link)
 {
 	if (link->state == IPC_CLIENT_SERVICE_LINK_DEAD && link->users == 0 && link->conn != NULL) {
-		ipc_client_connection_fini(link->conn);
-		free(link->conn);
+		connection_free(link->conn, false);
 		link->conn = NULL;
 	}
 }
@@ -325,8 +350,7 @@ ipc_client_service_link_destroy(struct ipc_client_service_link **link_ptr)
 	if (link->conn != NULL) {
 		// Closing the pipe is what tells the service to drop every stream
 		// this connection owns (streams belong to the connection).
-		ipc_client_connection_fini(link->conn);
-		free(link->conn);
+		connection_free(link->conn, false);
 		link->conn = NULL;
 	}
 	os_mutex_destroy(&link->mtx);

@@ -680,3 +680,39 @@ TEST_CASE("hotplug platform signature: this host's read is stable while nothing 
 	CHECK(os_display_topology_hash(e1, n1) == os_display_topology_hash(e2, n2));
 	CHECK(target_display_topology_signature() == target_display_topology_signature());
 }
+
+namespace {
+
+int g_sink_calls = 0;
+char g_sink_reason[96];
+
+void
+record_sink(const char *reason)
+{
+	g_sink_calls++;
+	(void)snprintf(g_sink_reason, sizeof(g_sink_reason), "%s", reason != nullptr ? reason : "");
+}
+
+} // namespace
+
+TEST_CASE("hotplug plug-in request: with no monitor it reaches the host's re-probe sink", "[target][hotplug]")
+{
+	// The service never starts a monitor (it feeds its own re-probe, #2305),
+	// so a plug-in's request_display_rescan (Leia EDID_ONLY -> FPC_VERIFIED)
+	// must go to the sink, not into a latch nothing will serve.
+	g_sink_calls = 0;
+	g_sink_reason[0] = '\0';
+	target_display_hotplug_set_followup_sink(record_sink);
+	target_display_hotplug_plugin_request("panel authenticated");
+	CHECK(g_sink_calls == 1);
+	CHECK(std::strcmp(g_sink_reason, "panel authenticated") == 0);
+
+	target_display_hotplug_plugin_request(nullptr);
+	CHECK(g_sink_calls == 2);
+	CHECK(std::strcmp(g_sink_reason, "plug-in") == 0);
+
+	// No sink (an in-process app before system create): latched, as before.
+	target_display_hotplug_set_followup_sink(nullptr);
+	target_display_hotplug_plugin_request("panel authenticated");
+	CHECK(g_sink_calls == 2);
+}

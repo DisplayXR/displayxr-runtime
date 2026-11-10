@@ -439,6 +439,41 @@ TEST_CASE("conv_registry: provider status (FALLBACK, platform absent)")
 	g_status_fake = nullptr;
 }
 
+TEST_CASE("conv_registry: describe cache does not pin a platform-unavailable provider (#2596)")
+{
+	// leia-conversion described while NeurD was not installed (PLATFORM_ABSENT);
+	// installing NeurD changes nothing about the plug-in DLL, so a cache keyed on
+	// the binary alone kept it unavailable across every service restart.
+	auto live = new_registry();
+	fake fa, fr;
+	fa.caps = {cap(1, XRT_CONV_TASK_DEPTH_VIDEO)};
+	fr.caps = {cap(2, XRT_CONV_TASK_DEPTH_VIDEO)};
+	auto da = desc("absent", 50, &fa, nullptr, "C:\\providers\\absent.dll");
+	auto dr = desc("ready", 200, &fr, nullptr, "C:\\providers\\ready.dll");
+	conv_registry_add(live.get(), &da);
+	conv_registry_add(live.get(), &dr);
+	fa.status_state = 2; // PLATFORM_ABSENT
+	g_status_fake = &fa;
+	conv_registry_describe(live.get(), 0, S);
+	g_status_fake = nullptr; // no status slot answer: UNKNOWN, cached as before
+	conv_registry_describe(live.get(), 1, S);
+	REQUIRE(live->providers[0].platform_state == 2u);
+
+	std::vector<uint8_t> buf(conv_registry_cache_save(live.get(), nullptr, 0));
+	conv_registry_cache_save(live.get(), buf.data(), buf.size());
+
+	auto cold = new_registry();
+	auto ca = desc("absent", 50, nullptr, nullptr, "C:\\providers\\absent.dll");
+	auto cr = desc("ready", 200, nullptr, nullptr, "C:\\providers\\ready.dll");
+	conv_registry_add(cold.get(), &ca);
+	conv_registry_add(cold.get(), &cr);
+	CHECK(conv_registry_cache_load(cold.get(), buf.data(), buf.size(), S) == 1);
+	CHECK_FALSE(cold->providers[0].described); // re-describes at start
+	CHECK(cold->providers[1].described);
+	CHECK(cold->providers[1].from_cache);
+	CHECK_FALSE(conv_registry_discovery_settled(cold.get()));
+}
+
 TEST_CASE("conv_registry: Supersedes hides only the named provider id")
 {
 	auto reg = new_registry();

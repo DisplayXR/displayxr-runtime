@@ -303,7 +303,10 @@ target_display_hotplug_request(enum target_hotplug_source src, const char *reaso
 
 /*!
  * The `xrt_plugin_host_iface::request_display_rescan` slot: a plug-in says its
- * displays may have changed.
+ * displays may have changed. With no monitor running and a follow-up sink set
+ * (the service, which feeds its own re-probe) it goes to that sink, since a
+ * latched request would never be served there; otherwise as
+ * @ref target_display_hotplug_request.
  */
 void
 target_display_hotplug_plugin_request(const char *reason);
