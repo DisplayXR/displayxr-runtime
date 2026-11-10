@@ -40,7 +40,11 @@ sim_display supports several output modes for visualizing stereo content on a 2D
   columns, view 1 on odd, both sampled at the same UV. The only
   phase-sensitive mode — see the next section.
 - **Full SBS** (`SIM_DISPLAY_OUTPUT=sbs_full`, rendering mode 6) — for a stereo
-  desktop compositor. Both views are rendered at the window's full resolution
+  desktop compositor. Registered only on desktop Linux and only when
+  `SIM_DISPLAY_OUTPUT=sbs_full` asks for it: the swapchain is sized to the worst
+  case across all modes (ADR-010), and this mode is twice the panel's width, so
+  everywhere else the list stays the six modes above and the worst-case atlas is
+  the panel's size (`tests_sim_display_modes` pins it). Both views are rendered at the window's full resolution
   (view scale 1.0 x 1.0, 2x1 tiles) and handed over side by side, left first, as
   they are. The DP reports `stereo_layout` 3 (HDMI 1.4b 3D_Structure "Side-by-Side (Full)"), so the Vulkan
   compositor presents a buffer twice the window's width and declares the

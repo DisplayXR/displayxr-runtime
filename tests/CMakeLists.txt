@@ -126,6 +126,7 @@ set(tests
     tests_u_sd_notify
     tests_u_eye_history
     tests_sim_eyes
+    tests_sim_display_modes
     tests_dp_eye_positions_at
     tests_dp_snap_window_rect
     tests_dp_atlas_encoding_query
@@ -2104,6 +2105,12 @@ target_link_libraries(tests_sim_tracking_webcam PRIVATE aux_os aux_os_uvc xrt-in
 target_sources(tests_sim_eyes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_eyes.c)
 target_include_directories(tests_sim_eyes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
 target_link_libraries(tests_sim_eyes PRIVATE xrt-interfaces)
+
+# ADR-010: sim_display's rendering-mode table and the worst-case atlas it gives,
+# pinned host-side (the table compiles into the plug-in).
+target_sources(tests_sim_display_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_modes.c)
+target_include_directories(tests_sim_display_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
+target_link_libraries(tests_sim_display_modes PRIVATE xrt-interfaces)
 
 # ADR-043: the sim_display FAKE stereo camera's scene is pinned host-side next to
 # the ring / conversion / disparity-probe tests (it compiles into the plug-in).

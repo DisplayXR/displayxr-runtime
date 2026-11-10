@@ -471,7 +471,9 @@ one view, and the declaration is withdrawn. Where no declaration is offered (ano
 app's own X11 window, a window manager without the announcement, `DXR_STEREO_DECLARE=0`) the target
 stays the window's size and the runtime logs why in a `FULL_SBS:` line, so the two views show side
 by side, flat. sim_display reports 3 for `SIM_DISPLAY_OUTPUT=sbs_full` (rendering mode 6, view
-scale 1.0 x 1.0, 2x1 tiles); `SIM_DISPLAY_STEREO_LAYOUT=<n>` makes it claim another number, to
+scale 1.0 x 1.0, 2x1 tiles, registered only on desktop Linux and only when that setting asks
+for it, because its atlas is twice the panel's width and every mode counts in the worst-case
+swapchain); `SIM_DISPLAY_STEREO_LAYOUT=<n>` makes it claim another number, to
 exercise the reading of a layout the runtime does not know.
 
 ### `create_dp_metal_for_screen` (multi-screen on macOS)

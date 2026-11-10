@@ -110,6 +110,8 @@ set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_device.c
 	sim_display/sim_display_eyes.c
 	sim_display/sim_display_eyes.h
+	sim_display/sim_display_modes.c
+	sim_display/sim_display_modes.h
 	sim_display/sim_display_interface.h
 	sim_display/sim_display_settings.c
 	sim_display/sim_display_settings.h
