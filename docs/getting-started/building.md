@@ -110,14 +110,18 @@ Builds the runtime, OpenXR loader, and test apps. The macOS Vulkan native compos
 
 ### Linux
 
-> **Ubuntu 22.04, 24.04 and 26.04 are supported.** On 22.04, use an X11
-> session: GNOME 42 does not implement the Wayland fractional-scale protocol
+> **Ubuntu 22.04, 24.04 and 26.04 are supported. Native Wayland on GNOME is
+> the primary, hardware-validated target (24.04 and 26.04); X11/XWayland is the
+> legacy path.** On 22.04, use an X11 session: GNOME 42 does not implement the Wayland fractional-scale protocol
 > (`wp_fractional_scale_v1`), so a native-Wayland window cannot be guaranteed
 > 1:1 with the panel on a scaled desktop. Packages are built on 22.04 and
 > CI-verified to install and headlessly self-test on all three releases.
 > Hardware validation to date is on 24.04 and 26.04.
 >
-> Linux is Vulkan-only (native compositor over an X11/XCB surface). Every `v*`
+> Linux is Vulkan-only. Apps bind a native-Wayland `wl_surface`
+> (`XR_DXR_wayland_surface_binding`) or, on X11/XWayland, an X11 window
+> (`XR_DXR_xlib_window_binding`); the service window picks native Wayland when
+> the compositor offers fractional scaling, else X11. Every `v*`
 > release attaches a `displayxr-runtime_<ver>_amd64.deb`; the user-level
 > tarball from `scripts/package_linux.sh` is the other supported install.
 > Phase status and the exact CI gates: `docs/roadmap/linux-support.md`.
