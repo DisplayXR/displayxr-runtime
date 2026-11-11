@@ -2020,6 +2020,17 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
 			U_LOG_W("VK output-device split: could not create the scanout-adapter swapchain (%d)",
 			        (int)xret);
 			reason = "scanout swapchain creation failed";
+		} else {
+			/*
+			 * #2603: on two adapters, a GPU timeout/reset can leave this
+			 * chain's Present blocked inside the scanout driver forever, with
+			 * the app thread holding the compositor lock inside xrEndFrame.
+			 * Bound it: past 5 s the target latches lost, and the session is
+			 * reported lost instead of the app hanging. One adapter returns
+			 * the loss as an error, which #2588 already handles, so the
+			 * default there is no worker; DXR_PRESENT_WEDGE_MS=N opts it in.
+			 */
+			comp_d3d11_target_set_present_bound(s->target, s->same_adapter ? 0 : 5000);
 		}
 	}
 
@@ -2317,6 +2328,22 @@ comp_hub_d3d11_destroy(struct comp_hub_d3d11 **split_ptr)
 	if (s->clip_episodes > 0) {
 		U_LOG_W("D3D11 hub: %llu frames clipped to the panel over %llu overhang episodes (#1575)",
 		        (unsigned long long)s->clip_frames, (unsigned long long)s->clip_episodes);
+	}
+
+	if (comp_d3d11_target_is_present_wedged(s->target)) {
+		/*
+		 * #2603: a Present on the scanout chain never returned, and the
+		 * worker that made it is still inside the driver with the output
+		 * device. Every release below (the bridge's quiesce, the weaver, the
+		 * output context's ClearState/Flush, the chain) calls into that device
+		 * and would block behind it, turning a lost session back into a hung
+		 * app at xrDestroySession. Leave the whole output side, and this
+		 * struct (the bridge's threads may still reference it), allocated:
+		 * the app ends its session and exits.
+		 */
+		U_LOG_W("D3D11 hub: the scanout Present is wedged — leaving the output device, its weaver, bridge "
+		        "and chain unreleased so teardown cannot hang (#2603)");
+		return;
 	}
 
 	split_release_out(s);
@@ -3181,6 +3208,10 @@ comp_hub_d3d11_clear_zone_wish(struct comp_hub_d3d11 *s)
 		return;
 	}
 	s->direct.publish_pending = false; // a withdrawn wish owes no publish
+	// #2603: the weavers live on a device a wedged Present still holds.
+	if (comp_d3d11_target_is_present_wedged(s->target)) {
+		return;
+	}
 	// #2342 P2c (#2218 #4): every segment DP that holds a published crop too.
 	// Idempotent; a manager with nothing published is a no-op.
 	if (s->mutexes_init) {
@@ -5050,6 +5081,20 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 		(void)canvas;
 		return split_weave_client(s, is_repaint);
 	}
+	/*
+	 * Lost output device: no work on it at all, on either ingress. The direct
+	 * path's keyed-mutex AcquireSync and the bridge path's slot wait, content
+	 * probe and crop all run on the output device before the target's acquire,
+	 * and after a wedged Present (#2603) any call into it blocks behind the
+	 * abandoned worker. The target's acquire only paces the thread (one
+	 * display period) and fails, without touching the device.
+	 */
+	if (s != nullptr && comp_d3d11_target_is_device_lost(s->target)) {
+		uint32_t lost_index = 0;
+		(void)comp_d3d11_target_acquire(s->target, &lost_index);
+		s->no_slot++;
+		return false;
+	}
 	if (s != nullptr && s->direct.active) {
 		return split_weave_direct(s, is_repaint, canvas);
 	}
@@ -5913,6 +5958,11 @@ extern "C" bool
 comp_hub_d3d11_get_background_preview(struct comp_hub_d3d11 *s, struct xrt_dp_background_preview *out_preview)
 {
 	if (s == nullptr || out_preview == nullptr) {
+		return false;
+	}
+	// #2603: the weaver's preview reads back on the output device, which a
+	// wedged Present still holds. A lost device has no preview either way.
+	if (comp_d3d11_target_is_device_lost(s->target)) {
 		return false;
 	}
 	// Pixels only. The inline wrapper already answers false for a plug-in whose
