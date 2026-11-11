@@ -32,6 +32,11 @@
 // regardless of their alpha mode). See the use_transparent gate below.
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
+// #2603: the bound on a Present that runs on the bounded present worker (see
+// comp_d3d11_target_set_present_bound). Unset (-1) = the caller's default,
+// 0 = no worker (Present on the calling thread, as before), N = N ms.
+DEBUG_GET_ONCE_NUM_OPTION(present_wedge_ms, "DXR_PRESENT_WEDGE_MS", -1)
+
 #include "util/comp_weave_latency_win.h"
 #include "util/comp_frame_witness.h"
 
@@ -295,6 +300,26 @@ struct comp_d3d11_target
 	//! Rate limit for the "still lost" WARN, and the frames it summarises.
 	uint64_t lost_last_log_ns;
 	uint64_t lost_frames_skipped;
+
+	/*
+	 * #2603 bounded present. When the worker runs, the Present call itself is
+	 * made on pw_thread and the caller (the app or repaint thread, holding the
+	 * compositor lock as before) waits for it at most present_bound_ms. The
+	 * caller still blocks for exactly as long as the Present takes, so pacing
+	 * and the thread-keyed token accounting below are unchanged; only a
+	 * Present that never returns is cut off. 0 = no worker.
+	 */
+	uint32_t present_bound_ms;
+	HANDLE pw_thread;
+	HANDLE pw_req;  //!< auto-reset: one request
+	HANDLE pw_done; //!< auto-reset: its result is in pw_hr
+	HANDLE pw_exit; //!< manual-reset: worker leaves
+	uint32_t pw_sync_interval;
+	HRESULT pw_hr;
+	//! A Present that never came back. device_lost is latched with it, and
+	//! nothing may touch this chain, its device or its context again: the
+	//! worker is still inside the driver, holding them. Destroy leaks them.
+	bool present_wedged;
 };
 
 static bool
@@ -365,6 +390,163 @@ extern "C" bool
 comp_d3d11_target_is_device_lost(struct comp_d3d11_target *target)
 {
 	return target != nullptr && target->device_lost;
+}
+
+extern "C" bool
+comp_d3d11_target_is_present_wedged(struct comp_d3d11_target *target)
+{
+	return target != nullptr && target->present_wedged;
+}
+
+/*!
+ * The Present call itself: the #925 S1 bounded DO_NOT_WAIT loop, stamped for
+ * the #1000 watchdog. Runs on the calling thread, or on the #2603 worker.
+ */
+static HRESULT
+target_present_call(struct comp_d3d11_target *target, uint32_t sync_interval)
+{
+	HRESULT hr;
+	// Present watchdog (#1000): stamp entry so the sampling thread can name a
+	// Present call that never returns (in-driver cross-adapter wait — the
+	// DO_NOT_WAIT bound below never sees it). seq before enter: the watchdog
+	// keys re-warn state on seq, and a stale seq with a fresh enter would
+	// suppress the first warning of a new incident.
+	g_present_wd_seq.fetch_add(1, std::memory_order_relaxed);
+	g_present_wd_enter_ns.store((int64_t)os_monotonic_get_ns(), std::memory_order_release);
+	if (sync_interval == 0) {
+		hr = target->swapchain->Present(0, 0); // immediate — never blocks on the chain
+	} else {
+		int64_t deadline_ns = (int64_t)os_monotonic_get_ns() + 50LL * 1000000LL;
+		for (;;) {
+			hr = target->swapchain->Present(sync_interval, DXGI_PRESENT_DO_NOT_WAIT);
+			if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+				break;
+			}
+			if ((int64_t)os_monotonic_get_ns() >= deadline_ns) {
+				static std::atomic<int64_t> s_last_drop_log_ns{0};
+				int64_t now_ns = (int64_t)os_monotonic_get_ns();
+				int64_t prev_ns = s_last_drop_log_ns.load(std::memory_order_relaxed);
+				if (now_ns - prev_ns > 1000000000LL &&
+				    s_last_drop_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+					U_LOG_W("d3d11 target present: frame dropped after 50 ms — "
+					        "DWM not consuming flips (#924/#925)");
+				}
+				break;
+			}
+			Sleep(1);
+		}
+	}
+	g_present_wd_enter_ns.store(0, std::memory_order_release);
+	return hr;
+}
+
+/*
+ * #2603 — the bounded present worker.
+ *
+ * After a GPU timeout/reset (TDR) on a two-GPU box, the hub's Present on the
+ * scanout adapter's chain can block forever inside the driver: Suki's full
+ * dumps show the app thread in igd10umt64xe's condition-variable wait under
+ * dxgi!CDXGISwapChain::Present, with every driver worker idle — the wake-up
+ * was lost in the reset, so the call never returns. #2588's latch runs only
+ * when Present RETURNS an error, and the #1000 watchdog can only log; the app
+ * thread is stuck inside xrEndFrame holding the compositor lock, so the app
+ * hangs ("not responding") instead of seeing its session lost.
+ *
+ * So the call moves to a worker and the caller waits for it with a bound.
+ * Healthy, the caller blocks for exactly the Present's own duration (one
+ * request, one done; the pair of events is the whole hand-off), so the pacing
+ * this Present provides and every caller-thread-keyed rule below are as
+ * before. Past the bound the target latches LOST and WEDGED, the caller
+ * returns, xrWaitFrame reports the session lost (#2588's channel), and the
+ * worker is abandoned inside the driver. Nothing may touch the chain, its
+ * device or its context again: the worker still holds them, and with the
+ * weaver's multithread protection on, any immediate-context call would block
+ * behind it. Destroy therefore leaks them instead of releasing them.
+ */
+static DWORD WINAPI
+present_worker_proc(LPVOID param)
+{
+	auto *target = static_cast<comp_d3d11_target *>(param);
+	HANDLE waits[2] = {target->pw_exit, target->pw_req};
+	for (;;) {
+		const DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+		if (w != WAIT_OBJECT_0 + 1) {
+			return 0;
+		}
+		target->pw_hr = target_present_call(target, target->pw_sync_interval);
+		SetEvent(target->pw_done);
+	}
+}
+
+static void
+target_close_present_worker_handles(struct comp_d3d11_target *target)
+{
+	HANDLE *hs[] = {&target->pw_thread, &target->pw_req, &target->pw_done, &target->pw_exit};
+	for (HANDLE *h : hs) {
+		if (*h != nullptr) {
+			CloseHandle(*h);
+			*h = nullptr;
+		}
+	}
+}
+
+extern "C" void
+comp_d3d11_target_set_present_bound(struct comp_d3d11_target *target, uint32_t default_ms)
+{
+	if (target == nullptr || target->pw_thread != nullptr) {
+		return;
+	}
+	const int64_t env_ms = debug_get_num_option_present_wedge_ms();
+	const uint32_t ms = env_ms >= 0 ? (uint32_t)env_ms : default_ms;
+	if (ms == 0) {
+		if (env_ms == 0 && default_ms != 0) {
+			U_LOG_W("d3d11 target: bounded present OFF (DXR_PRESENT_WEDGE_MS=0) — a Present that never "
+			        "returns hangs the app (#2603)");
+		}
+		return;
+	}
+	target->pw_req = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	target->pw_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	target->pw_exit = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (target->pw_req != nullptr && target->pw_done != nullptr && target->pw_exit != nullptr) {
+		target->pw_thread = CreateThread(nullptr, 0, present_worker_proc, target, 0, nullptr);
+	}
+	if (target->pw_thread == nullptr) {
+		target_close_present_worker_handles(target);
+		U_LOG_W("d3d11 target: bounded present worker failed to start — Present stays on the calling "
+		        "thread (#2603)");
+		return;
+	}
+	target->present_bound_ms = ms;
+	U_LOG_W("d3d11 target: Present runs on a bounded worker (%u ms%s) — a Present that never returns "
+	        "ends the session instead of hanging the app (#2603)",
+	        ms, env_ms >= 0 ? ", DXR_PRESENT_WEDGE_MS" : "");
+}
+
+/*!
+ * The worker's Present did not come back within the bound: latch LOST and
+ * WEDGED, once. No call into the device here — not even
+ * GetDeviceRemovedReason: the worker is inside the driver with the device.
+ */
+static void
+target_mark_present_wedged(struct comp_d3d11_target *target)
+{
+	target->present_wedged = true;
+	if (!target->device_lost) {
+		target->device_lost = true;
+		target->lost_last_log_ns = os_monotonic_get_ns();
+		target->lost_frames_skipped = 0;
+	}
+	U_LOG_E("d3d11 target: Present has not returned after %u ms — the output device is treated as LOST "
+	        "(#2603). Typical cause: a GPU timeout/reset (TDR) the driver never wakes the present from. "
+	        "The presenting thread is abandoned and the session is reported lost; the chain, its device "
+	        "and context are left untouched so teardown cannot block on them. (logged once)",
+	        target->present_bound_ms);
+	// As in target_check_device_lost: the chain retires nothing more, so no
+	// token is owed or carried.
+	g_app_holds_token = false;
+	g_repaint_holds_token = false;
+	g_repaint_present_pending = false;
 }
 
 static xrt_result_t
@@ -674,6 +856,27 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 		g_repaint_holds_token = false;
 		g_lw_ledger_d3d11.reset();
 		g_lw_stage2_d3d11.reset();
+	}
+
+	if (target->present_wedged) {
+		// #2603: the worker is still inside the driver's Present on this
+		// chain. Releasing the chain (or anything bound to its device) would
+		// block behind it — or free what it is using. Leave the chain, its
+		// buffers, the worker and the target itself allocated; the process
+		// is expected to end its session and exit.
+		U_LOG_W("d3d11 target: leaving the wedged chain and its present worker unreleased (#2603)");
+		*target_ptr = nullptr;
+		return;
+	}
+	if (target->pw_thread != nullptr) {
+		SetEvent(target->pw_exit);
+		if (WaitForSingleObject(target->pw_thread, 2000) != WAIT_OBJECT_0) {
+			// A worker that cannot leave is mid-Present: same as wedged.
+			U_LOG_W("d3d11 target: present worker did not exit — leaving the chain unreleased (#2603)");
+			*target_ptr = nullptr;
+			return;
+		}
+		target_close_present_worker_handles(target);
 	}
 
 	if (target->rtv != nullptr) {
@@ -1216,37 +1419,21 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 		return XRT_ERROR_D3D;
 	}
 	HRESULT hr;
-	// Present watchdog (#1000): stamp entry so the sampling thread can name a
-	// Present call that never returns (in-driver cross-adapter wait — the
-	// DO_NOT_WAIT bound below never sees it). seq before enter: the watchdog
-	// keys re-warn state on seq, and a stale seq with a fresh enter would
-	// suppress the first warning of a new incident.
-	g_present_wd_seq.fetch_add(1, std::memory_order_relaxed);
-	g_present_wd_enter_ns.store((int64_t)os_monotonic_get_ns(), std::memory_order_release);
-	if (sync_interval == 0) {
-		hr = target->swapchain->Present(0, 0); // immediate — never blocks on the chain
-	} else {
-		int64_t deadline_ns = (int64_t)os_monotonic_get_ns() + 50LL * 1000000LL;
-		for (;;) {
-			hr = target->swapchain->Present(sync_interval, DXGI_PRESENT_DO_NOT_WAIT);
-			if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
-				break;
-			}
-			if ((int64_t)os_monotonic_get_ns() >= deadline_ns) {
-				static std::atomic<int64_t> s_last_drop_log_ns{0};
-				int64_t now_ns = (int64_t)os_monotonic_get_ns();
-				int64_t prev_ns = s_last_drop_log_ns.load(std::memory_order_relaxed);
-				if (now_ns - prev_ns > 1000000000LL &&
-				    s_last_drop_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
-					U_LOG_W("d3d11 target present: frame dropped after 50 ms — "
-					        "DWM not consuming flips (#924/#925)");
-				}
-				break;
-			}
-			Sleep(1);
+	if (target->pw_thread != nullptr) {
+		// #2603: the call runs on the bounded worker; this thread waits for
+		// it exactly as long as it takes, up to the bound. Anything but a
+		// clean done (a timeout, or a failed wait with the worker possibly
+		// still presenting) is treated as wedged: never touch the chain again.
+		target->pw_sync_interval = sync_interval;
+		SetEvent(target->pw_req);
+		if (WaitForSingleObject(target->pw_done, target->present_bound_ms) != WAIT_OBJECT_0) {
+			target_mark_present_wedged(target);
+			return XRT_ERROR_D3D;
 		}
+		hr = target->pw_hr;
+	} else {
+		hr = target_present_call(target, sync_interval);
 	}
-	g_present_wd_enter_ns.store(0, std::memory_order_release);
 	if (SUCCEEDED(hr)) {
 		// Witness counts frames that actually reached the chain — the 50 ms
 		// drop path above intentionally shows up as a lower weave/s.

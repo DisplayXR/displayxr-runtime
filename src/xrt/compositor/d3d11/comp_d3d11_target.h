@@ -349,6 +349,36 @@ comp_d3d11_target_resize(struct comp_d3d11_target *target,
 bool
 comp_d3d11_target_is_device_lost(struct comp_d3d11_target *target);
 
+/*!
+ * #2603: make this target's Present on a dedicated worker thread, with the
+ * caller waiting for it at most @p default_ms (0 = no worker). A set
+ * `DXR_PRESENT_WEDGE_MS` overrides the default either way (0 = off, N = on
+ * with N ms). Healthy, the caller blocks exactly as long as the
+ * Present takes, as before. A Present that does not return within the bound
+ * latches the target LOST (see @ref comp_d3d11_target_is_device_lost) and
+ * WEDGED (@ref comp_d3d11_target_is_present_wedged), and the caller returns.
+ *
+ * For a chain whose Present can block forever inside the driver after a GPU
+ * reset (the hub's scanout chain on a two-GPU box). Call once, after create,
+ * before the first present. NULL-safe.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_target_set_present_bound(struct comp_d3d11_target *target, uint32_t default_ms);
+
+/*!
+ * #2603: a Present on this target never returned (see
+ * @ref comp_d3d11_target_set_present_bound). The device and context it
+ * presented on are still in use by the abandoned worker: the owner must not
+ * call into them again, including at teardown — leak them instead.
+ * Implies @ref comp_d3d11_target_is_device_lost. NULL-safe (returns false).
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_target_is_present_wedged(struct comp_d3d11_target *target);
+
 #ifdef __cplusplus
 }
 #endif
