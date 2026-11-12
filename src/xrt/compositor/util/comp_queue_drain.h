@@ -41,9 +41,15 @@
  * ## Verdict
  *
  * The residual feed is several presents stale, so a drain is judged on the
- * first sample whose present sequence is at or after the drained present
- * (@ref comp_queue_drain::settle_seq); everything older predates it and is
- * ignored. Residual down by >= half a period: DRAINED, and the next trigger
+ * first @ref COMP_QD_TRIGGER_SAMPLES samples whose present sequence is at or
+ * after the drained present (@ref comp_queue_drain::settle_seq); everything
+ * older predates it and is ignored. Queue depth is a FLOOR effect and the
+ * residual jitters by ~6-7 ms within a steady state (about the half-period
+ * bar itself), so one sample against one sample would let a single slow
+ * frame call a real drain a failure and learn a floor that is queue. MINIMA
+ * are compared instead: the min of the last 3 valid samples before the take
+ * against the min of the first 3 after it.
+ * Min down by >= half a period: DRAINED, and the next trigger
  * may fire at once, so a deep queue drains one slot per settle. Otherwise
  * NOT_QUEUE: what we were at is the pipeline's floor, not queueing; it is
  * learned (threshold = floor + margin) and the machine backs off 5 s,
@@ -127,8 +133,11 @@ struct comp_queue_drain
 
 	//! Samples for presents before this sequence predate the last drain.
 	uint64_t settle_seq;
-	//! Residual when the drain was taken; 0 = judge leniently.
+	//! Min of the recent residuals when the drain was taken; 0 = judge leniently.
 	uint64_t pre_drain_residual_ns;
+	//! Post-settle samples collected so far for the verdict, and their min.
+	uint32_t post_n;
+	uint64_t post_min_ns;
 	//! When the drain was taken (for the no-sample timeout).
 	uint64_t wait_start_ns;
 
@@ -145,6 +154,11 @@ struct comp_queue_drain
 	//! Drains judged DRAINED/LENIENT since the last sample at/below threshold.
 	uint32_t success_run;
 
+	//! The last COMP_QD_TRIGGER_SAMPLES valid residuals (since the last
+	//! period change / reset / take): the pre-drain baseline is their min.
+	uint64_t recent_ns[COMP_QD_TRIGGER_SAMPLES];
+	uint32_t recent_n;   //!< valid entries, <= COMP_QD_TRIGGER_SAMPLES
+	uint32_t recent_pos; //!< next slot to write
 	//! Last valid residual sample and the period it was read against.
 	uint64_t last_residual_ns;
 	uint64_t last_period_ns;
@@ -173,6 +187,26 @@ static inline double
 comp_queue_drain_threshold(const struct comp_queue_drain *d)
 {
 	return d->floor_periods > 0.0 ? d->floor_periods + COMP_QD_FLOOR_MARGIN : COMP_QD_DEFAULT_THRESHOLD;
+}
+
+static inline void
+comp_queue_drain_clear_recent_(struct comp_queue_drain *d)
+{
+	d->recent_n = 0;
+	d->recent_pos = 0;
+}
+
+//! Min of the recent residual ring; 0 when empty.
+static inline uint64_t
+comp_queue_drain_recent_min(const struct comp_queue_drain *d)
+{
+	uint64_t m = 0;
+	for (uint32_t i = 0; i < d->recent_n; i++) {
+		if (m == 0 || d->recent_ns[i] < m) {
+			m = d->recent_ns[i];
+		}
+	}
+	return m;
 }
 
 static inline void
@@ -233,6 +267,7 @@ comp_queue_drain_on_period_change(struct comp_queue_drain *d, uint64_t old_ns, u
 	d->block_count = 0;
 	d->success_run = 0;
 	d->no_sample_since_change = true;
+	comp_queue_drain_clear_recent_(d); // old-rate samples are no baseline
 	d->pending = false;
 	d->pending_reason = COMP_QD_REASON_NONE;
 	if (old_ns != 0 && new_ns != 0 && (double)new_ns > (double)old_ns * COMP_QD_RATE_DROP_RATIO) {
@@ -259,18 +294,30 @@ comp_queue_drain_on_residual(
 	d->last_residual_ns = residual_ns;
 	d->last_period_ns = period_ns;
 	d->no_sample_since_change = false;
+	d->recent_ns[d->recent_pos] = residual_ns;
+	d->recent_pos = (d->recent_pos + 1) % COMP_QD_TRIGGER_SAMPLES;
+	if (d->recent_n < COMP_QD_TRIGGER_SAMPLES) {
+		d->recent_n++;
+	}
 	const double periods = (double)residual_ns / (double)period_ns;
 
 	if (d->state == COMP_QD_WAIT_RESULT) {
+		if (d->post_n == 0 || residual_ns < d->post_min_ns) {
+			d->post_min_ns = residual_ns;
+		}
+		if (++d->post_n < COMP_QD_TRIGGER_SAMPLES) {
+			return COMP_QD_VERDICT_NONE; // judged on the min of 3
+		}
+		const uint64_t post = d->post_min_ns;
 		enum comp_queue_drain_verdict v;
 		if (d->pre_drain_residual_ns == 0) {
 			v = COMP_QD_VERDICT_LENIENT;
-		} else if ((double)d->pre_drain_residual_ns - (double)residual_ns >=
+		} else if ((double)d->pre_drain_residual_ns - (double)post >=
 		           COMP_QD_SUCCESS_DROP * (double)period_ns) {
 			v = COMP_QD_VERDICT_DRAINED;
 		} else {
 			// What we were at is the pipeline's floor, not queue.
-			d->floor_periods = periods;
+			d->floor_periods = (double)post / (double)period_ns;
 			comp_queue_drain_enter_backoff_(d, now_ns);
 			return COMP_QD_VERDICT_NOT_QUEUE;
 		}
@@ -333,13 +380,14 @@ comp_queue_drain_on_acquire_block(struct comp_queue_drain *d, uint64_t block_ns,
  * Take an armed request, just before a weave. True exactly once per request
  * and only when idle: the caller then sleeps one refresh period.
  *
+ * The pre-drain baseline is the min of the recent residual ring (0 = none:
+ * only a rate drop is honoured then, judged leniently).
+ *
  * @param next_seq the sequence the upcoming present will carry.
- * @param last_residual_ns the residual currently published (0 = none yet).
  */
 static inline bool
 comp_queue_drain_take(struct comp_queue_drain *d,
                       uint64_t next_seq,
-                      uint64_t last_residual_ns,
                       uint64_t now_ns,
                       enum comp_queue_drain_reason *out_reason)
 {
@@ -353,7 +401,7 @@ comp_queue_drain_take(struct comp_queue_drain *d,
 	const enum comp_queue_drain_reason reason = d->pending_reason;
 	d->pending = false;
 	d->pending_reason = COMP_QD_REASON_NONE;
-	uint64_t pre = last_residual_ns;
+	uint64_t pre = comp_queue_drain_recent_min(d);
 	if (reason == COMP_QD_REASON_RATE_DROP && d->no_sample_since_change) {
 		// The published residual was measured at the old rate: comparing
 		// against it could call a real drain a failure and learn a floor
@@ -364,6 +412,11 @@ comp_queue_drain_take(struct comp_queue_drain *d,
 		return false; // nothing to judge against; only a rate drop is certain
 	}
 	d->pre_drain_residual_ns = pre;
+	d->post_n = 0;
+	d->post_min_ns = 0;
+	// From here the ring holds post-settle samples only, so the next
+	// trigger's baseline cannot include a pre-drain one.
+	comp_queue_drain_clear_recent_(d);
 	d->settle_seq = next_seq;
 	d->wait_start_ns = now_ns;
 	d->state = COMP_QD_WAIT_RESULT;

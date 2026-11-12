@@ -226,8 +226,10 @@ it again (measured on a phone-class device: weave→present ~2.2 periods at 90 H
 drain (`util/comp_queue_drain.h`) sleeps **one extra period** before one weave when the queue is
 provably deep — a longer period was just measured, the #206 residual sat above threshold (learned
 floor + 0.75 periods, 2.5 while none is known) for 3 samples, or acquire blocked > ¼ period 3 times
-in a row (with a floor known, only together with a residual above it) — then judges it on the first
-residual of a present at or after the drained one. Down ≥ ½ period: it was queue, and the next drain
+in a row (with a floor known, only together with a residual above it) — then judges it on the min of
+the first 3 residuals of presents at or after the drained one against the min of the last 3 before it
+(minima, because queue depth is a floor effect and the residual jitters ~6-7 ms, about the bar
+itself). Min down ≥ ½ period: it was queue, and the next drain
 may follow at once (one slot per settle). Otherwise the residual is the pipeline's floor: learned,
 backoff 5 s doubling to 60 s; the floor is forgotten on any period change. Logs are events only:
 `#2629: queue drain: skipping one vblank (…)`, `#2629: queue drain: drained — …`,

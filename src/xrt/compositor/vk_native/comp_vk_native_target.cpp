@@ -3001,26 +3001,31 @@ target_queue_drain_on_residual(struct comp_vk_native_target *target, uint32_t pr
 	const uint64_t pre = target->qdrain.pre_drain_residual_ns;
 	const enum comp_queue_drain_verdict v =
 	    comp_queue_drain_on_residual(&target->qdrain, present_id, r, period_ns, now_ns);
-	const double per = period_ns != 0 ? (double)r / (double)period_ns : 0.0;
+	// Verdicts are on minima: the post-settle min of 3 against the pre-drain
+	// min of 3 (comp_queue_drain.h).
+	const uint64_t post = target->qdrain.post_min_ns;
+	const double per = period_ns != 0 ? (double)post / (double)period_ns : 0.0;
 	switch (v) {
 	case COMP_QD_VERDICT_DRAINED:
-		U_LOG_W("#2629: queue drain: drained — now %.1f ms = %.2f periods (was %.1f ms)", r / 1e6, per,
-		        pre / 1e6);
+		U_LOG_W("#2629: queue drain: drained — post min %.1f ms = %.2f periods (pre min %.1f ms)", post / 1e6,
+		        per, pre / 1e6);
 		break;
 	case COMP_QD_VERDICT_LENIENT:
-		U_LOG_W("#2629: queue drain: drained (no pre-drain residual to compare) — now %.1f ms = %.2f periods",
-		        r / 1e6, per);
+		U_LOG_W(
+		    "#2629: queue drain: drained (no pre-drain residual to compare) — post min %.1f ms = %.2f periods",
+		    post / 1e6, per);
 		break;
 	case COMP_QD_VERDICT_NOT_QUEUE:
 		U_LOG_W(
-		    "#2629: queue drain: not queue — %.1f ms (was %.1f ms): floor learned %.2f periods, backoff %.0f s",
-		    r / 1e6, pre / 1e6, target->qdrain.floor_periods, target->qdrain.applied_backoff_ns / 1e9);
+		    "#2629: queue drain: not queue — post min %.1f ms (pre min %.1f ms): floor learned %.2f periods, "
+		    "backoff %.0f s",
+		    post / 1e6, pre / 1e6, target->qdrain.floor_periods, target->qdrain.applied_backoff_ns / 1e9);
 		break;
 	case COMP_QD_VERDICT_CAPPED:
 		U_LOG_W(
-		    "#2629: queue drain: %d drains in a row without the residual settling (now %.1f ms = %.2f "
+		    "#2629: queue drain: %d drains in a row without the residual settling (post min %.1f ms = %.2f "
 		    "periods) — backoff %.0f s",
-		    COMP_QD_MAX_SUCCESS_RUN, r / 1e6, per, target->qdrain.applied_backoff_ns / 1e9);
+		    COMP_QD_MAX_SUCCESS_RUN, post / 1e6, per, target->qdrain.applied_backoff_ns / 1e9);
 		break;
 	default: break;
 	}
@@ -3966,14 +3971,16 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 				enum comp_queue_drain_reason reason = COMP_QD_REASON_NONE;
 				const uint64_t next_seq =
 				    (uint32_t)(target->display_timing_present_id + 1); // presentID is 32-bit
-				if (comp_queue_drain_take(&target->qdrain, next_seq, target->residual_ns, drain_now_ns,
-				                          &reason)) {
+				if (comp_queue_drain_take(&target->qdrain, next_seq, drain_now_ns, &reason)) {
+					// Baseline = min of the last 3 residuals (0 = none: a
+					// rate drop judged leniently).
+					const uint64_t pre = target->qdrain.pre_drain_residual_ns;
 					U_LOG_W(
-					    "#2629: queue drain: skipping one vblank (%s, residual %.1f ms = %.2f "
+					    "#2629: queue drain: skipping one vblank (%s, residual min %.1f ms = %.2f "
 					    "periods, "
 					    "threshold %.2f)",
-					    comp_queue_drain_reason_str(reason), target->residual_ns / 1e6,
-					    (double)target->residual_ns / (double)period_ns,
+					    comp_queue_drain_reason_str(reason), pre / 1e6,
+					    (double)pre / (double)period_ns,
 					    comp_queue_drain_threshold(&target->qdrain));
 					os_nanosleep((int64_t)period_ns);
 				}

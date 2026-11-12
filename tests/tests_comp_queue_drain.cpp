@@ -25,6 +25,18 @@ periods(double n, uint64_t p = P60)
 }
 
 /*!
+ * Feed the three post-settle samples a verdict is judged on (their min),
+ * starting at @p seq. The first two must not produce a verdict.
+ */
+static comp_queue_drain_verdict
+settle3(comp_queue_drain *d, uint64_t &seq, uint64_t a, uint64_t b, uint64_t c, uint64_t now, uint64_t p = P60)
+{
+	CHECK(comp_queue_drain_on_residual(d, seq++, a, p, now) == COMP_QD_VERDICT_NONE);
+	CHECK(comp_queue_drain_on_residual(d, seq++, b, p, now) == COMP_QD_VERDICT_NONE);
+	return comp_queue_drain_on_residual(d, seq++, c, p, now);
+}
+
+/*!
  * The grid tier as the vk_native target wires it, against a FIFO model:
  * the residual of a present is (floor + queued slots) periods, a drain lowers
  * the queue by one slot when there is one, and residual samples arrive
@@ -38,7 +50,8 @@ struct sim
 	int queued = 0;
 	uint64_t now = 10 * S;
 	uint64_t seq = 1;
-	uint64_t published = 0; //!< what the target publishes as residual_ns
+	//! Alternating +/- jitter on every residual sample, ns.
+	uint64_t jitter = 0;
 	size_t lag = 4;
 	std::deque<std::pair<uint64_t, uint64_t>> inflight;
 	std::vector<comp_queue_drain_reason> taken;
@@ -54,19 +67,20 @@ struct sim
 	{
 		now += period;
 		comp_queue_drain_reason r = COMP_QD_REASON_NONE;
-		if (comp_queue_drain_take(&d, seq, published, now, &r)) {
+		if (comp_queue_drain_take(&d, seq, now, &r)) {
 			taken.push_back(r);
 			now += period; // the skipped vblank
 			if (queued > 0) {
 				queued--;
 			}
 		}
-		inflight.emplace_back(seq, periods(floor + queued, period));
+		uint64_t res = periods(floor + queued, period);
+		res = (seq & 1) ? res + jitter : res - jitter;
+		inflight.emplace_back(seq, res);
 		seq++;
 		while (inflight.size() > lag) {
 			const auto s = inflight.front();
 			inflight.pop_front();
-			published = s.second;
 			const comp_queue_drain_verdict v =
 			    comp_queue_drain_on_residual(&d, s.first, s.second, period, now);
 			if (v != COMP_QD_VERDICT_NONE) {
@@ -97,7 +111,6 @@ TEST_CASE("queue drain: 90->60 fill drains one slot per settle, then stops at th
 {
 	sim s;
 	s.floor = 2.8;         // above the 2.5 default threshold: the last probe must fail
-	s.published = 24 * MS; // the 90 Hz residual, still published
 	s.queued = 3;          // filled while the tier kept the 11.1 ms cadence
 	comp_queue_drain_on_period_change(&s.d, P90, P60, s.now);
 	CHECK(s.d.pending);
@@ -133,7 +146,6 @@ TEST_CASE("queue drain: a rate drop with a 60 Hz sample in hand is judged agains
 	s.queued = 2;
 	comp_queue_drain_on_period_change(&s.d, P90, P60, s.now);
 	// One post-change sample arrives before the take.
-	s.published = periods(4.0);
 	comp_queue_drain_on_residual(&s.d, 0, periods(4.0), P60, s.now);
 	s.run(200);
 	REQUIRE(s.verdicts.size() >= 1);
@@ -154,7 +166,7 @@ TEST_CASE("queue drain: samples from before settle_seq are ignored")
 	}
 	REQUIRE(d.pending);
 	comp_queue_drain_reason r = COMP_QD_REASON_NONE;
-	REQUIRE(comp_queue_drain_take(&d, 100, periods(5.0), now, &r));
+	REQUIRE(comp_queue_drain_take(&d, 100, now, &r));
 	CHECK(r == COMP_QD_REASON_RESIDUAL);
 	CHECK(d.settle_seq == 100);
 
@@ -164,7 +176,8 @@ TEST_CASE("queue drain: samples from before settle_seq are ignored")
 	CHECK(d.state == COMP_QD_WAIT_RESULT);
 	CHECK(d.floor_periods == 0.0);
 
-	CHECK(comp_queue_drain_on_residual(&d, 100, periods(4.0), P60, now) == COMP_QD_VERDICT_DRAINED);
+	uint64_t seq = 100;
+	CHECK(settle3(&d, seq, periods(4.0), periods(4.0), periods(4.0), now) == COMP_QD_VERDICT_DRAINED);
 	CHECK(d.state == COMP_QD_IDLE);
 }
 
@@ -201,7 +214,7 @@ TEST_CASE("queue drain: a period change forgets the floor; a shorter one arms no
 		CHECK(s.d.floor_periods == 0.0);
 		CHECK(s.d.state == COMP_QD_IDLE);
 		CHECK_FALSE(s.d.pending);
-		CHECK_FALSE(comp_queue_drain_take(&s.d, s.seq, s.published, s.now, nullptr));
+		CHECK_FALSE(comp_queue_drain_take(&s.d, s.seq, s.now, nullptr));
 	}
 	SECTION("longer period: floor forgotten and a rate-drop drain armed")
 	{
@@ -209,7 +222,7 @@ TEST_CASE("queue drain: a period change forgets the floor; a shorter one arms no
 		CHECK(s.d.floor_periods == 0.0);
 		CHECK(s.d.pending);
 		comp_queue_drain_reason r = COMP_QD_REASON_NONE;
-		CHECK(comp_queue_drain_take(&s.d, s.seq, s.published, s.now, &r));
+		CHECK(comp_queue_drain_take(&s.d, s.seq, s.now, &r));
 		CHECK(r == COMP_QD_REASON_RATE_DROP);
 	}
 	SECTION("a change under 20 % longer arms nothing")
@@ -235,7 +248,7 @@ TEST_CASE("queue drain: acquire blocking arms a drain; with a floor known it nee
 		comp_queue_drain_on_acquire_block(&d, periods(0.5), P60, now);
 		CHECK(d.pending);
 		comp_queue_drain_reason r = COMP_QD_REASON_NONE;
-		CHECK(comp_queue_drain_take(&d, 2, periods(2.0), now, &r));
+		CHECK(comp_queue_drain_take(&d, 2, now, &r));
 		CHECK(r == COMP_QD_REASON_ACQUIRE_BLOCK);
 	}
 	SECTION("a short acquire resets the run")
@@ -252,7 +265,7 @@ TEST_CASE("queue drain: acquire blocking arms a drain; with a floor known it nee
 		for (int i = 0; i < 3; i++) {
 			comp_queue_drain_on_acquire_block(&d, periods(0.5), P60, now);
 		}
-		REQUIRE(comp_queue_drain_take(&d, 2, periods(2.0), now, nullptr));
+		REQUIRE(comp_queue_drain_take(&d, 2, now, nullptr));
 		for (int i = 0; i < 5; i++) {
 			comp_queue_drain_on_acquire_block(&d, periods(0.5), P60, now);
 		}
@@ -263,12 +276,13 @@ TEST_CASE("queue drain: acquire blocking arms a drain; with a floor known it nee
 		for (int i = 0; i < 3; i++) {
 			comp_queue_drain_on_acquire_block(&d, periods(0.5), P60, now);
 		}
-		REQUIRE(comp_queue_drain_take(&d, 2, periods(2.0), now, nullptr));
+		REQUIRE(comp_queue_drain_take(&d, 2, now, nullptr));
 		// Residual did not move: floor 2.0 learned, backoff.
-		REQUIRE(comp_queue_drain_on_residual(&d, 2, periods(2.0), P60, now) == COMP_QD_VERDICT_NOT_QUEUE);
+		uint64_t seq = 2;
+		REQUIRE(settle3(&d, seq, periods(2.0), periods(2.0), periods(2.0), now) == COMP_QD_VERDICT_NOT_QUEUE);
 		REQUIRE(d.floor_periods == Catch::Approx(2.0).margin(0.01));
 		now += COMP_QD_BACKOFF_BASE_NS + 1;
-		comp_queue_drain_on_residual(&d, 3, periods(2.0), P60, now);
+		comp_queue_drain_on_residual(&d, seq++, periods(2.0), P60, now);
 		for (int i = 0; i < 10; i++) {
 			comp_queue_drain_on_acquire_block(&d, periods(0.5), P60, now);
 		}
@@ -276,7 +290,7 @@ TEST_CASE("queue drain: acquire blocking arms a drain; with a floor known it nee
 		CHECK_FALSE(d.pending);
 
 		// Residual now above floor + 0.75: the block counts again.
-		comp_queue_drain_on_residual(&d, 4, periods(3.0), P60, now);
+		comp_queue_drain_on_residual(&d, seq++, periods(3.0), P60, now);
 		for (int i = 0; i < 3; i++) {
 			comp_queue_drain_on_acquire_block(&d, periods(0.5), P60, now);
 		}
@@ -298,11 +312,12 @@ TEST_CASE("queue drain: backoff doubles from 5 s to a 60 s cap; a success resets
 		for (int i = 0; i < 3; i++) {
 			comp_queue_drain_on_residual(&d, seq++, periods(level), P60, now);
 		}
-		REQUIRE(comp_queue_drain_take(&d, seq, periods(level), now, nullptr));
-		REQUIRE(comp_queue_drain_on_residual(&d, seq++, periods(level), P60, now) == COMP_QD_VERDICT_NOT_QUEUE);
+		REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
+		REQUIRE(settle3(&d, seq, periods(level), periods(level), periods(level), now) ==
+		        COMP_QD_VERDICT_NOT_QUEUE);
 		CHECK(d.applied_backoff_ns == want * S);
 		// Not before expiry.
-		CHECK_FALSE(comp_queue_drain_take(&d, seq, periods(level), now + want * S - 1, nullptr));
+		CHECK_FALSE(comp_queue_drain_take(&d, seq, now + want * S - 1, nullptr));
 		now += want * S + 1;
 		level += 1.0;
 	}
@@ -311,8 +326,9 @@ TEST_CASE("queue drain: backoff doubles from 5 s to a 60 s cap; a success resets
 	for (int i = 0; i < 3; i++) {
 		comp_queue_drain_on_residual(&d, seq++, periods(level), P60, now);
 	}
-	REQUIRE(comp_queue_drain_take(&d, seq, periods(level), now, nullptr));
-	REQUIRE(comp_queue_drain_on_residual(&d, seq++, periods(level - 1.0), P60, now) == COMP_QD_VERDICT_DRAINED);
+	REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
+	REQUIRE(settle3(&d, seq, periods(level - 1.0), periods(level - 1.0), periods(level - 1.0), now) ==
+	        COMP_QD_VERDICT_DRAINED);
 	CHECK(d.backoff_ns == COMP_QD_BACKOFF_BASE_NS);
 }
 
@@ -324,13 +340,16 @@ TEST_CASE("queue drain: a drain with no verdict sample for 2 s falls back to idl
 	for (uint64_t i = 1; i <= 3; i++) {
 		comp_queue_drain_on_residual(&d, i, periods(5.0), P60, now);
 	}
-	REQUIRE(comp_queue_drain_take(&d, 4, periods(5.0), now, nullptr));
+	REQUIRE(comp_queue_drain_take(&d, 4, now, nullptr));
 	CHECK(d.state == COMP_QD_WAIT_RESULT);
 
 	// 1.9 s: still waiting.
-	CHECK_FALSE(comp_queue_drain_take(&d, 5, periods(5.0), now + 1900 * MS, nullptr));
+	CHECK_FALSE(comp_queue_drain_take(&d, 5, now + 1900 * MS, nullptr));
 	CHECK(d.state == COMP_QD_WAIT_RESULT);
-	// 2.1 s, any entry point: back to idle, no verdict, no floor.
+	// Two of the three verdict samples, then silence: still no verdict.
+	CHECK(comp_queue_drain_on_residual(&d, 4, periods(5.0), P60, now) == COMP_QD_VERDICT_NONE);
+	CHECK(comp_queue_drain_on_residual(&d, 5, periods(5.0), P60, now) == COMP_QD_VERDICT_NONE);
+	// 2.1 s after the take, any entry point: back to idle, no verdict, no floor.
 	comp_queue_drain_on_acquire_block(&d, 0, P60, now + 2100 * MS);
 	CHECK(d.state == COMP_QD_IDLE);
 	CHECK(d.timeouts == 1);
@@ -351,8 +370,8 @@ TEST_CASE("queue drain: at most 8 successful drains in a row without a sample at
 		for (int i = 0; i < 3; i++) {
 			comp_queue_drain_on_residual(&d, seq++, periods(5.0), P60, now);
 		}
-		REQUIRE(comp_queue_drain_take(&d, seq, periods(5.0), now, nullptr));
-		last = comp_queue_drain_on_residual(&d, seq++, periods(4.0), P60, now);
+		REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
+		last = settle3(&d, seq, periods(4.0), periods(4.0), periods(4.0), now);
 		if (last == COMP_QD_VERDICT_DRAINED) {
 			drained++;
 		}
@@ -373,8 +392,8 @@ TEST_CASE("queue drain: at most 8 successful drains in a row without a sample at
 			for (int i = 0; i < 3; i++) {
 				comp_queue_drain_on_residual(&d2, seq++, periods(5.0), P60, now);
 			}
-			REQUIRE(comp_queue_drain_take(&d2, seq, periods(5.0), now, nullptr));
-			CHECK(comp_queue_drain_on_residual(&d2, seq++, periods(4.0), P60, now) ==
+			REQUIRE(comp_queue_drain_take(&d2, seq, now, nullptr));
+			CHECK(settle3(&d2, seq, periods(4.0), periods(4.0), periods(4.0), now) ==
 			      COMP_QD_VERDICT_DRAINED);
 		}
 		CHECK(d2.state == COMP_QD_IDLE);
@@ -390,12 +409,13 @@ TEST_CASE("queue drain: only a rate drop is honoured without a residual; reset c
 		comp_queue_drain_on_acquire_block(&d, periods(0.5), P60, now);
 	}
 	REQUIRE(d.pending);
-	CHECK_FALSE(comp_queue_drain_take(&d, 1, 0, now, nullptr));
+	CHECK_FALSE(comp_queue_drain_take(&d, 1, now, nullptr));
 	CHECK_FALSE(d.pending);
 
 	comp_queue_drain_on_period_change(&d, P90, P60, now);
-	REQUIRE(comp_queue_drain_take(&d, 1, 0, now, nullptr));
-	CHECK(comp_queue_drain_on_residual(&d, 1, periods(3.0), P60, now) == COMP_QD_VERDICT_LENIENT);
+	REQUIRE(comp_queue_drain_take(&d, 1, now, nullptr));
+	uint64_t seq = 1;
+	CHECK(settle3(&d, seq, periods(3.0), periods(3.0), periods(3.0), now) == COMP_QD_VERDICT_LENIENT);
 	CHECK(d.floor_periods == 0.0);
 
 	comp_queue_drain_reset(&d);
@@ -403,4 +423,88 @@ TEST_CASE("queue drain: only a rate drop is honoured without a residual; reset c
 	CHECK_FALSE(d.pending);
 	CHECK(d.settle_seq == 0);
 	CHECK(d.backoff_ns == COMP_QD_BACKOFF_BASE_NS);
+}
+
+// Measured: the residual jitters ~6-7 ms within a steady state, about the
+// half-period success bar itself. Verdicts compare minima of 3 for that.
+static constexpr uint64_t J = 3 * MS;
+
+TEST_CASE("queue drain: a real one-slot drain under +/-3 ms jitter is judged DRAINED")
+{
+	comp_queue_drain d;
+	comp_queue_drain_reset(&d);
+	const uint64_t now = 10 * S;
+	uint64_t seq = 1;
+	comp_queue_drain_on_residual(&d, seq++, periods(4.0) + J, P60, now);
+	comp_queue_drain_on_residual(&d, seq++, periods(4.0) - J, P60, now);
+	comp_queue_drain_on_residual(&d, seq++, periods(4.0) + J, P60, now);
+	REQUIRE(d.pending);
+	REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
+	CHECK(d.pre_drain_residual_ns == periods(4.0) - J);
+	CHECK(settle3(&d, seq, periods(3.0) - J, periods(3.0) + J, periods(3.0) - J, now) == COMP_QD_VERDICT_DRAINED);
+	CHECK(d.floor_periods == 0.0);
+
+	SECTION("the sim agrees, jitter on every sample")
+	{
+		sim s;
+		s.jitter = J;
+		s.floor = 2.0;
+		s.queued = 2;
+		s.run_for(5 * S);
+		CHECK(s.queued == 0);
+		for (auto v : s.verdicts) {
+			CHECK(v == COMP_QD_VERDICT_DRAINED);
+		}
+		CHECK(s.d.floor_periods == 0.0);
+	}
+}
+
+TEST_CASE("queue drain: a no-op drain under the same jitter is judged NOT_QUEUE")
+{
+	comp_queue_drain d;
+	comp_queue_drain_reset(&d);
+	const uint64_t now = 10 * S;
+	uint64_t seq = 1;
+	comp_queue_drain_on_residual(&d, seq++, periods(3.0) + J, P60, now);
+	comp_queue_drain_on_residual(&d, seq++, periods(3.0) - J, P60, now);
+	comp_queue_drain_on_residual(&d, seq++, periods(3.0) + J, P60, now);
+	REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
+	CHECK(settle3(&d, seq, periods(3.0) + J, periods(3.0) - J, periods(3.0) + J, now) == COMP_QD_VERDICT_NOT_QUEUE);
+	CHECK(d.floor_periods == Catch::Approx((double)(periods(3.0) - J) / P60).margin(0.001));
+	CHECK(d.state == COMP_QD_BACKOFF);
+}
+
+TEST_CASE("queue drain: one slow first post-settle sample does not fail a real drain")
+{
+	comp_queue_drain d;
+	comp_queue_drain_reset(&d);
+	const uint64_t now = 10 * S;
+	uint64_t seq = 1;
+	for (int i = 0; i < 3; i++) {
+		comp_queue_drain_on_residual(&d, seq++, periods(4.0), P60, now);
+	}
+	REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
+	// +12 ms on the first: alone it shows a 4.7 ms drop, under the 8.3 ms bar.
+	CHECK(settle3(&d, seq, periods(3.0) + 12 * MS, periods(3.0), periods(3.0), now) == COMP_QD_VERDICT_DRAINED);
+	CHECK(d.floor_periods == 0.0);
+}
+
+TEST_CASE("queue drain: after a drain the baseline holds post-settle samples only")
+{
+	comp_queue_drain d;
+	comp_queue_drain_reset(&d);
+	const uint64_t now = 10 * S;
+	uint64_t seq = 1;
+	for (int i = 0; i < 3; i++) {
+		comp_queue_drain_on_residual(&d, seq++, periods(5.0), P60, now);
+	}
+	REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
+	CHECK(d.recent_n == 0);
+	REQUIRE(settle3(&d, seq, periods(4.0), periods(4.0), periods(4.0), now) == COMP_QD_VERDICT_DRAINED);
+	// Three more over threshold arm the next drain; its baseline is 4.0, not 5.0.
+	for (int i = 0; i < 3; i++) {
+		comp_queue_drain_on_residual(&d, seq++, periods(4.0), P60, now);
+	}
+	REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
+	CHECK(d.pre_drain_residual_ns == periods(4.0));
 }
