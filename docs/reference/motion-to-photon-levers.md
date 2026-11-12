@@ -250,18 +250,31 @@ but the queue refilled, and at 60 Hz it could not drain at all: the tier slept o
 vblank was further than its budget, the budget (a high-water of the weave cost) included a blocking
 acquire, so on a full queue the budget reached a period, the tier stopped pacing and the producer
 free-ran into the queue. With the cap the tier books, at every present, the vblank that frame will
-be SHOWN at (FIFO, from where its present actually returned), and each weave: takes the usual
-late-weave aim when the next vblank is reachable; **weaves at once** when it is not (throughput
-first — round 1 slept toward the vblank after and halved a 90 Hz app to 65.7 weaves/s); and is
-pushed past the booked vblank only when, at its budget, it would land on it (that sleep may reach 2
-periods: the producer is ahead of the panel there, and a shorter cap left it weaving early forever
-after one overrun). Booking from the actual present return is what keeps an overrun from colliding
+be SHOWN at (FIFO, from where its present actually returned), and each weave takes the usual
+late-weave aim when the next vblank is reachable, and is pushed past the booked vblank only when,
+at its budget, it would land on it (that sleep may reach 2 periods: the producer is ahead of the
+panel there, and a shorter cap left it weaving early forever after one overrun). A **late** weave
+(next vblank out of reach) depends on the pacing mode (`util/comp_grid_pace_mode.h`): **AIM**, the
+default, sleeps toward the vblank after (19 ms at 60 Hz on an app that fits the period, but an app
+whose render + weave exceeds the period is held to one weave per two vblanks — 65.7 weaves/s at
+90 Hz); **THROUGHPUT** weaves at once (80.9 weaves/s there, but each weave up to a period early: on
+the 60 Hz app it put the residual at 20/36 ms alternating and fed a drain loop). Over 1 s windows
+the controller moves AIM → THROUGHPUT only when weaves/vblank < 0.9 **and** > 10 % of weaves took
+the late sleep; the probe's first window must beat that AIM rate by 5 % or it returns to AIM with a
+backoff (5 s doubling to 60 s); a proven THROUGHPUT stays until the refresh period changes. Each
+change logs one `#2629: grid pacing …` WARN. The drain's floor is per mode (forgotten on a mode
+change), and in THROUGHPUT only the absolute 2.5-period threshold (or a probed floor above it)
+applies, so early weaves never read as a backlog; as a backstop, more than 3 drains in 5 s whose
+level does not stay down back off (`#2629: queue drain: more than 3 drains in 5 s …`). With the cap
+on, the weave budget is the **p90 of the last 32 weave costs** rather than a decaying high-water
+(which one long frame tripled: 3.45 → 12.80 ms in one 60 Hz phase). Booking from the actual present return is what keeps an overrun from colliding
 with the next weave — the media player at 30 fps with repaint filling every other vblank regained a
 queued frame ~7 s in on round 1. The acquire's duration, and on a repaint (runtime-owned queue) the
 host wait on the acquired image, are subtracted from the weave cost. App frames and repaints share
 the cap; a producer slower than the panel never meets the push. With `DXR_WEAVE_CADENCE_TRACE=1` /
-`debug.dxr.weave_cadence_trace 1` the 5 s `#206` line carries `cap aimed N now N pushed N skipped N,
-budget …, acquire …, repaint wait … | drain floor … (passive|probed), threshold …, drains N`.
+`debug.dxr.weave_cadence_trace 1` the 5 s `#206` line carries `pacing AIM|THROUGHPUT (weaves/vblank
+AIM … THROUGHPUT …, probes N) | cap aimed N late N now N pushed N skipped N, budget …, acquire …,
+repaint wait … | drain floor … (passive|probed), threshold …, drains N`.
 Kill switch `setprop debug.dxr.grid_rate_cap 0` restores the old aim **and** the old weave cost
 exactly, so `queue_drain 0` + `grid_rate_cap 0` pace like v2.66.15 (only the reported #206
 residual differs). Also from #2629: the published #206 horizon on Android starts

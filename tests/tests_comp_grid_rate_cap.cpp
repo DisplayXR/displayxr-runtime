@@ -15,6 +15,10 @@ static constexpr uint64_t MS = 1000ULL * 1000ULL;
 static constexpr uint64_t P60 = 16666666ULL;
 static constexpr uint64_t P90 = 11111111ULL;
 static constexpr uint64_t ANCHOR = 1000 * MS;
+//! Most cases below are mode-independent or THROUGHPUT's late rule; the AIM
+//! late rule has its own cases.
+static constexpr bool THR = true;
+static constexpr bool AIM = false;
 
 static comp_vblank_grid
 grid(uint64_t period)
@@ -73,7 +77,7 @@ struct run_result
  */
 template <typename F, typename C>
 static run_result
-run(uint64_t period, uint64_t budget_ns, int frames, F frame_of, C cost_of)
+run_mode(bool thr, uint64_t period, uint64_t budget_ns, int frames, F frame_of, C cost_of)
 {
 	comp_vblank_grid g = grid(period);
 	run_result r;
@@ -83,7 +87,7 @@ run(uint64_t period, uint64_t budget_ns, int frames, F frame_of, C cost_of)
 	for (int i = 0; i < frames; i++) {
 		uint64_t sleep_ns = 0;
 		comp_grid_rate_cap_kind k = COMP_GRID_CAP_NONE;
-		REQUIRE(comp_grid_rate_cap_target(&g, now, budget_ns, shown, &sleep_ns, &k) != 0);
+		REQUIRE(comp_grid_rate_cap_target(&g, now, budget_ns, shown, thr, &sleep_ns, &k) != 0);
 		r.kinds.push_back(k);
 		now += sleep_ns + cost_of(i); // weave, then the present returns
 		shown = comp_grid_rate_cap_on_present(&g, shown, now);
@@ -93,6 +97,13 @@ run(uint64_t period, uint64_t budget_ns, int frames, F frame_of, C cost_of)
 	}
 	r.elapsed_ns = now - t0;
 	return r;
+}
+
+template <typename F, typename C>
+static run_result
+run(uint64_t period, uint64_t budget_ns, int frames, F frame_of, C cost_of)
+{
+	return run_mode(THR, period, budget_ns, frames, frame_of, cost_of);
 }
 
 //! The pre-cap grid tier on the same producer (v2.66.15): elapsed ns.
@@ -124,27 +135,34 @@ TEST_CASE("grid rate cap: the three aims")
 
 	SECTION("reachable: the usual late-weave sleep")
 	{
-		CHECK(comp_grid_rate_cap_target(&g, now, 5 * MS, 0, &sleep_ns, &k) == vb(2));
+		CHECK(comp_grid_rate_cap_target(&g, now, 5 * MS, 0, THR, &sleep_ns, &k) == vb(2));
 		CHECK(k == COMP_GRID_CAP_AIMED);
 		CHECK(sleep_ns == vb(2) - 5 * MS - now);
 	}
 	SECTION("not reachable, not taken: weave NOW")
 	{
 		const uint64_t late = vb(2) - 3 * MS;
-		CHECK(comp_grid_rate_cap_target(&g, late, 5 * MS, vb(1), &sleep_ns, &k) == vb(3));
+		CHECK(comp_grid_rate_cap_target(&g, late, 5 * MS, vb(1), THR, &sleep_ns, &k) == vb(3));
 		CHECK(k == COMP_GRID_CAP_NOW);
 		CHECK(sleep_ns == 0);
 	}
+	SECTION("not reachable, AIM mode: LATE, sleep toward the vblank after")
+	{
+		const uint64_t late = vb(2) - 3 * MS;
+		CHECK(comp_grid_rate_cap_target(&g, late, 5 * MS, vb(1), AIM, &sleep_ns, &k) == vb(3));
+		CHECK(k == COMP_GRID_CAP_LATE);
+		CHECK(sleep_ns == vb(3) - 5 * MS - late);
+	}
 	SECTION("next vblank already shows the previous frame: pushed")
 	{
-		CHECK(comp_grid_rate_cap_target(&g, now, 5 * MS, vb(2), &sleep_ns, &k) == vb(3));
+		CHECK(comp_grid_rate_cap_target(&g, now, 5 * MS, vb(2), THR, &sleep_ns, &k) == vb(3));
 		CHECK(k == COMP_GRID_CAP_PUSHED);
 		CHECK(sleep_ns == vb(3) - 5 * MS - now); // 26 ms: a push may sleep up to two periods
 	}
 	SECTION("untrusted grid: no aim")
 	{
 		comp_vblank_grid u = {};
-		CHECK(comp_grid_rate_cap_target(&u, now, 5 * MS, 0, &sleep_ns, &k) == 0);
+		CHECK(comp_grid_rate_cap_target(&u, now, 5 * MS, 0, THR, &sleep_ns, &k) == 0);
 		CHECK(k == COMP_GRID_CAP_NONE);
 		CHECK(sleep_ns == 0);
 	}
@@ -238,7 +256,7 @@ TEST_CASE("grid rate cap: two weaves inside one period get consecutive vblanks")
 	REQUIRE(shown == vb(6, P90));
 	// A repaint 0.5 ms later would land on vb(6) too: pushed to vb(7).
 	const uint64_t now = vb(5, P90) + 2 * MS + MS / 2;
-	CHECK(comp_grid_rate_cap_target(&g, now, 3 * MS, shown, &s2, &k) == vb(7, P90));
+	CHECK(comp_grid_rate_cap_target(&g, now, 3 * MS, shown, THR, &s2, &k) == vb(7, P90));
 	CHECK(k == COMP_GRID_CAP_PUSHED);
 	CHECK(s2 == vb(7, P90) - 3 * MS - now);
 
@@ -248,7 +266,7 @@ TEST_CASE("grid rate cap: two weaves inside one period get consecutive vblanks")
 		// the previous frame's vblank.
 		const uint64_t later = vb(6, P90) + 3 * MS;
 		uint64_t s3 = 0;
-		comp_grid_rate_cap_target(&g, later, 3 * MS, shown, &s3, &k);
+		comp_grid_rate_cap_target(&g, later, 3 * MS, shown, THR, &s3, &k);
 		CHECK(k != COMP_GRID_CAP_PUSHED);
 	}
 }
@@ -259,11 +277,11 @@ TEST_CASE("grid rate cap: a stale shown vblank is ignored")
 	uint64_t sleep_ns = 0;
 	comp_grid_rate_cap_kind k = COMP_GRID_CAP_NONE;
 	const uint64_t now = vb(10) + 1 * MS;
-	const uint64_t natural = comp_grid_rate_cap_target(&g, now, 5 * MS, 0, &sleep_ns, nullptr);
-	CHECK(comp_grid_rate_cap_target(&g, now, 5 * MS, vb(5), &sleep_ns, &k) == natural);
+	const uint64_t natural = comp_grid_rate_cap_target(&g, now, 5 * MS, 0, THR, &sleep_ns, nullptr);
+	CHECK(comp_grid_rate_cap_target(&g, now, 5 * MS, vb(5), THR, &sleep_ns, &k) == natural);
 	CHECK(k == COMP_GRID_CAP_AIMED);
 	// Shown at a vblank already past: no push either.
-	CHECK(comp_grid_rate_cap_target(&g, now, 5 * MS, vb(10), &sleep_ns, &k) == natural);
+	CHECK(comp_grid_rate_cap_target(&g, now, 5 * MS, vb(10), THR, &sleep_ns, &k) == natural);
 	CHECK(k == COMP_GRID_CAP_AIMED);
 }
 
@@ -272,11 +290,40 @@ TEST_CASE("grid rate cap: after a period change the caller's reset gives the nat
 	comp_vblank_grid g = grid(P90);
 	uint64_t sleep_ns = 0;
 	const uint64_t now = vb(3, P90) + 1 * MS;
-	REQUIRE(comp_grid_rate_cap_target(&g, now, 3 * MS, 0, &sleep_ns, nullptr) == vb(4, P90));
+	REQUIRE(comp_grid_rate_cap_target(&g, now, 3 * MS, 0, THR, &sleep_ns, nullptr) == vb(4, P90));
 	// The panel drops to 60 Hz; the target resets its shown vblank to 0.
 	REQUIRE(comp_vblank_grid_set_period(&g, P60));
 	comp_grid_rate_cap_kind k = COMP_GRID_CAP_NONE;
-	CHECK(comp_grid_rate_cap_target(&g, now, 3 * MS, 0, &sleep_ns, &k) == vb(3, P60));
+	CHECK(comp_grid_rate_cap_target(&g, now, 3 * MS, 0, THR, &sleep_ns, &k) == vb(3, P60));
 	CHECK(k == COMP_GRID_CAP_AIMED);
 	CHECK(sleep_ns == vb(3, P60) - 3 * MS - now);
+}
+
+TEST_CASE("grid rate cap: AIM halves an app that overruns the period; THROUGHPUT does not")
+{
+	// The device trade (model viewer at 90 Hz): 7 ms of app work + 5 ms of
+	// weave on an 11.1 ms panel.
+	auto fr = [](int) { return 7 * MS; };
+	auto co = [](int) { return 5 * MS; };
+	const run_result aim = run_mode(AIM, P90, 6 * MS, 180, fr, co);
+	const run_result thr = run_mode(THR, P90, 6 * MS, 180, fr, co);
+	const double aim_s = 180.0 / ((double)aim.elapsed_ns / 1e9);
+	const double thr_s = 180.0 / ((double)thr.elapsed_ns / 1e9);
+	CHECK(aim_s < 50.0);
+	CHECK(thr_s > aim_s * 1.4);
+	CHECK(total(fifo_waits(aim.made, P90)) == 0);
+}
+
+TEST_CASE("grid rate cap: AIM keeps an app that fits the period at the panel rate, aimed")
+{
+	const run_result r = run_mode(
+	    AIM, P60, 4 * MS, 120, [](int) { return 6 * MS; }, [](int) { return 3 * MS; });
+	const double per_s = 120.0 / ((double)r.elapsed_ns / 1e9);
+	CHECK(per_s == Catch::Approx(60.0).margin(1.0));
+	int now_ = 0;
+	for (auto k : r.kinds) {
+		now_ += k == COMP_GRID_CAP_NOW ? 1 : 0;
+	}
+	CHECK(now_ == 0);
+	CHECK(total(fifo_waits(r.made, P60)) == 0);
 }

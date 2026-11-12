@@ -26,13 +26,18 @@
  * fill the queue whatever the budget says. A producer slower than the panel
  * (a 60 Hz repaint on a 90 Hz panel, a slow app) never meets the push.
  *
- * THROUGHPUT FIRST (device round 2). Round 1 also slept toward the vblank
- * AFTER an unreachable one; that delayed the app's submit thread (under the
- * compositor lock) until its next frame missed too — one weave per two
- * vblanks, 65.7 weaves/s on a 90 Hz panel. Now, when the next vblank is not
- * reachable and not taken, the weave starts at once, as before the cap. The
- * only sleep beyond the usual late-weave aim is the push (see the cap in
- * @ref comp_grid_rate_cap_target).
+ * A LATE weave (the next vblank is out of reach) has two answers, chosen by
+ * the pacing mode (comp_grid_pace_mode.h, device rounds 2-3):
+ *
+ *  - AIM (default): sleep toward the vblank after, minus the budget — the
+ *    late weave is as fresh as an aimed one. Measured: 19 ms at 60 Hz. But
+ *    on an app whose render + weave exceeds the period the sleep blocks its
+ *    submit thread (under the compositor lock) until its next frame misses
+ *    too: 65.7 weaves/s on a 90 Hz panel.
+ *  - THROUGHPUT: weave at once, as before the cap. 80.9 weaves/s at 90 Hz,
+ *    but a weave up to a period early: ~2 periods weave->present with an
+ *    EMPTY queue, and on a 60 Hz app that fits the period it made the
+ *    residual alternate 20/36 ms.
  *
  * WHY THE BOOKKEEPING IS THE SHOWN VBLANK (device round 2). Round 1 kept the
  * vblank it AIMED at. A weave that overruns returns its present after that,
@@ -66,7 +71,8 @@ enum comp_grid_rate_cap_kind
 {
 	COMP_GRID_CAP_NONE = 0, //!< grid not trusted: no aim
 	COMP_GRID_CAP_AIMED,    //!< the next vblank, reachable: the usual late-weave sleep
-	COMP_GRID_CAP_NOW,      //!< the next vblank is not reachable: weave at once
+	COMP_GRID_CAP_LATE,     //!< not reachable, AIM mode: sleep toward the vblank after
+	COMP_GRID_CAP_NOW,      //!< not reachable, THROUGHPUT mode: weave at once
 	COMP_GRID_CAP_PUSHED,   //!< the next vblank already shows the previous frame: one later
 };
 
@@ -82,6 +88,7 @@ comp_grid_rate_cap_fresh_(uint64_t shown_ns, uint64_t now_ns, uint64_t p)
  * @param last_shown_ns the vblank the previous frame will be shown at
  *        (from @ref comp_grid_rate_cap_on_present; 0 = none).
  * @param out_sleep_ns sleep before starting the weave (0 = start now).
+ * @param throughput THROUGHPUT mode: a late weave starts at once.
  * @param out_kind which case applied (may be NULL).
  * @return the target vblank, or 0 when the grid is not trusted (no aim).
  */
@@ -90,6 +97,7 @@ comp_grid_rate_cap_target(const struct comp_vblank_grid *g,
                           uint64_t now_ns,
                           uint64_t budget_ns,
                           uint64_t last_shown_ns,
+                          bool throughput,
                           uint64_t *out_sleep_ns,
                           enum comp_grid_rate_cap_kind *out_kind)
 {
@@ -133,10 +141,16 @@ comp_grid_rate_cap_target(const struct comp_vblank_grid *g,
 		kind = COMP_GRID_CAP_AIMED;
 		target = next;
 		sleep_ns = next - budget_ns - now_ns;
-	} else {
-		// Not reachable and not taken: weave at once (throughput first).
+	} else if (throughput) {
+		// Not reachable and not taken: weave at once.
 		kind = COMP_GRID_CAP_NOW;
 		target = est;
+	} else {
+		// Not reachable: aim at the vblank after, as late as the budget
+		// allows (under a period: est is the first vblank past now + budget).
+		kind = COMP_GRID_CAP_LATE;
+		target = est;
+		sleep_ns = est - budget_ns - now_ns;
 	}
 	if (out_sleep_ns != NULL) {
 		// A wrong anchor must cost a frame, never a stall: one period at

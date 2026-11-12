@@ -122,6 +122,12 @@ extern "C" {
 #define COMP_QD_BACKOFF_MAX_NS (60ULL * 1000ULL * 1000ULL * 1000ULL)
 //! A drain without a verdict sample for this long returns to idle.
 #define COMP_QD_RESULT_TIMEOUT_NS (2ULL * 1000ULL * 1000ULL * 1000ULL)
+//! Rebounds: a drain whose baseline is back up >= this many periods above
+//! the last drain's result means the level did not stay down...
+#define COMP_QD_REBOUND_PERIODS 0.5
+//! ...and more than this many such drains in the window is not the queue.
+#define COMP_QD_MAX_REBOUNDS 3
+#define COMP_QD_REBOUND_WINDOW_NS (5ULL * 1000ULL * 1000ULL * 1000ULL)
 
 enum comp_queue_drain_state
 {
@@ -201,6 +207,17 @@ struct comp_queue_drain
 
 	//! Totals, for diagnostics.
 	uint32_t drains_taken;
+
+	//! THROUGHPUT pacing: late weaves start early and sit ~2 periods with an
+	//! empty queue, so only the absolute threshold applies (and a probed
+	//! floor above it).
+	bool absolute_only;
+	//! The last DRAINED post-drain min (0 = none since the last reset).
+	uint64_t last_drained_post_ns;
+	//! When recent drains rebounded (ring), and how often that backed off.
+	uint64_t rebound_ns[COMP_QD_MAX_REBOUNDS + 1];
+	uint32_t rebound_pos;
+	uint32_t rebound_backoffs;
 	uint32_t timeouts;
 };
 
@@ -220,6 +237,12 @@ comp_queue_drain_reset(struct comp_queue_drain *d)
 static inline double
 comp_queue_drain_threshold(const struct comp_queue_drain *d)
 {
+	if (d->absolute_only) {
+		// THROUGHPUT pacing: a passive floor (from early weaves) explains
+		// nothing; only the absolute threshold, or a probed floor above it.
+		const double t = d->floor_probed ? d->floor_periods + COMP_QD_FLOOR_MARGIN : 0.0;
+		return t > COMP_QD_DEFAULT_THRESHOLD ? t : COMP_QD_DEFAULT_THRESHOLD;
+	}
 	if (d->floor_periods <= 0.0) {
 		return COMP_QD_DEFAULT_THRESHOLD;
 	}
@@ -304,6 +327,8 @@ comp_queue_drain_on_period_change(struct comp_queue_drain *d, uint64_t old_ns, u
 	d->blk_min_ns = 0;
 	d->prev_blk_min_ns = 0;
 	d->state = COMP_QD_IDLE; // a pending verdict would compare across rates
+	d->last_drained_post_ns = 0;
+	memset(d->rebound_ns, 0, sizeof(d->rebound_ns));
 	d->backoff_ns = COMP_QD_BACKOFF_BASE_NS;
 	d->backoff_until_ns = 0;
 	d->over_count = 0;
@@ -316,6 +341,33 @@ comp_queue_drain_on_period_change(struct comp_queue_drain *d, uint64_t old_ns, u
 	if (old_ns != 0 && new_ns != 0 && (double)new_ns > (double)old_ns * COMP_QD_RATE_DROP_RATIO) {
 		comp_queue_drain_arm_(d, COMP_QD_REASON_RATE_DROP);
 	}
+}
+
+/*!
+ * The grid tier's pacing mode changed (comp_grid_pace_mode.h). The floor is
+ * per mode (an AIM floor says nothing about THROUGHPUT's early weaves, and
+ * back), so it is forgotten; @p absolute_only is THROUGHPUT.
+ */
+static inline void
+comp_queue_drain_on_mode_change(struct comp_queue_drain *d, bool absolute_only)
+{
+	if (d == NULL) {
+		return;
+	}
+	d->absolute_only = absolute_only;
+	d->floor_periods = 0.0;
+	d->floor_probed = false;
+	d->blk_n = 0;
+	d->blk_min_ns = 0;
+	d->prev_blk_min_ns = 0;
+	d->over_count = 0;
+	d->last_drained_post_ns = 0;
+	if (d->state == COMP_QD_WAIT_RESULT) {
+		d->state = COMP_QD_IDLE; // the verdict would compare across modes
+	}
+	d->pending = false;
+	d->pending_reason = COMP_QD_REASON_NONE;
+	comp_queue_drain_clear_recent_(d);
 }
 
 /*!
@@ -376,6 +428,7 @@ comp_queue_drain_on_residual(
 		} else if ((double)d->pre_drain_residual_ns - (double)post >=
 		           COMP_QD_SUCCESS_DROP * (double)period_ns) {
 			v = COMP_QD_VERDICT_DRAINED;
+			d->last_drained_post_ns = post;
 		} else {
 			const double post_periods = (double)post / (double)period_ns;
 			comp_queue_drain_enter_backoff_(d, now_ns);
@@ -479,6 +532,27 @@ comp_queue_drain_take(struct comp_queue_drain *d,
 	}
 	if (pre == 0 && reason != COMP_QD_REASON_RATE_DROP) {
 		return false; // nothing to judge against; only a rate drop is certain
+	}
+	if (reason != COMP_QD_REASON_RATE_DROP && d->last_drained_post_ns != 0 && d->last_period_ns != 0 &&
+	    (double)pre >= (double)d->last_drained_post_ns + COMP_QD_REBOUND_PERIODS * (double)d->last_period_ns) {
+		// The level the last drain reached did not stay down. A deep queue
+		// drains one slot per settle with each baseline at the last result;
+		// a level that keeps coming back is not the queue.
+		d->rebound_ns[d->rebound_pos] = now_ns;
+		d->rebound_pos = (d->rebound_pos + 1) % (COMP_QD_MAX_REBOUNDS + 1);
+		uint32_t recent = 0;
+		for (uint32_t i = 0; i < COMP_QD_MAX_REBOUNDS + 1; i++) {
+			if (d->rebound_ns[i] != 0 && now_ns - d->rebound_ns[i] <= COMP_QD_REBOUND_WINDOW_NS) {
+				recent++;
+			}
+		}
+		if (recent > COMP_QD_MAX_REBOUNDS) {
+			memset(d->rebound_ns, 0, sizeof(d->rebound_ns));
+			d->last_drained_post_ns = 0;
+			d->rebound_backoffs++;
+			comp_queue_drain_enter_backoff_(d, now_ns);
+			return false;
+		}
 	}
 	d->pre_drain_residual_ns = pre;
 	d->post_n = 0;

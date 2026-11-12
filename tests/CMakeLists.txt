@@ -68,6 +68,7 @@ set(tests
     tests_comp_late_weave_depth
     tests_comp_queue_drain
     tests_comp_grid_rate_cap
+    tests_comp_grid_pace_mode
     tests_comp_zone_tier1
     tests_comp_swapchain_ring
     tests_aux_bg_neutrality
@@ -1387,6 +1388,8 @@ target_include_directories(tests_comp_late_weave_depth PRIVATE ${PROJECT_SOURCE_
 target_include_directories(tests_comp_queue_drain PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #2629: grid late-weave one-weave-per-vblank target. Header-only.
 target_include_directories(tests_comp_grid_rate_cap PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #2629: grid late-weave AIM/THROUGHPUT pacing + weave budget. Header-only.
+target_include_directories(tests_comp_grid_pace_mode PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #1748 -- the move-sync tag encode is a header-only function in vk_native.
 target_include_directories(tests_comp_wl_move_sync_tag PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #2356 -- which frames may take the non-blocking hand-off. Header-only.

@@ -51,6 +51,7 @@ static std::atomic<uint32_t> g_vk_repaint_presents_since_app{0};
 #include "util/comp_residual_window.h"
 #include "util/comp_queue_drain.h"
 #include "util/comp_grid_rate_cap.h"
+#include "util/comp_grid_pace_mode.h"
 #include "util/comp_frame_witness.h"
 static comp_frame_witness g_frame_witness_vk{"vk"};
 
@@ -750,8 +751,14 @@ struct comp_vk_native_target
 	//! #2629: this frame's host wait on the acquired image (dummy submit +
 	//! vkQueueWaitIdle), runtime-owned queue only (a repaint).
 	uint64_t acquire_wait_ns;
+	//! #2629: AIM/THROUGHPUT pacing for late weaves, and the p90 weave
+	//! budget that replaces the high-water while the rate cap is on
+	//! (comp_grid_pace_mode.h).
+	struct comp_grid_pace pace;
+	struct comp_weave_budget wbudget;
+	uint32_t qd_rebound_logged;
 	//! #2629: 5 s cadence-trace tallies (DXR_WEAVE_CADENCE_TRACE).
-	uint32_t cap_aimed, cap_now, cap_pushed, cap_late;
+	uint32_t cap_aimed, cap_now, cap_pushed, cap_late, cap_late_sleep;
 	uint64_t cap_acq_sum_ns, cap_wait_sum_ns, cap_budget_sum_ns;
 	uint32_t cap_acq_n, cap_wait_n, cap_budget_n;
 	//! #2629: the grid tier's FIFO queue drain (comp_queue_drain.h).
@@ -1108,6 +1115,8 @@ create_swapchain(struct comp_vk_native_target *target)
 	target->residual_start_ns = 0;
 	target->acquire_ns = 0;
 	target->lw_last_shown_vblank_ns = 0;
+	// (The pacing mode and the weave budget describe the app and the panel,
+	// not this swapchain: kept across a recreate, reset on a period change.)
 #endif
 	if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
 		image_count = caps.maxImageCount;
@@ -1890,6 +1899,8 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	target->height = height;
 #ifdef XRT_OS_ANDROID
 	target->last_display_landscape = -1; // unknown until a rect is published (#1074)
+	comp_grid_pace_reset(&target->pace); // #2629
+	comp_weave_budget_reset(&target->wbudget);
 #endif
 	target->queue_family_index = queue_family_index;
 	target->transparent_background = transparent_background;
@@ -2330,6 +2341,8 @@ comp_vk_native_target_create_from_surface(struct comp_vk_native_compositor *c,
 	target->height = height;
 #ifdef XRT_OS_ANDROID
 	target->last_display_landscape = -1; // unknown until a rect is published (#1074)
+	comp_grid_pace_reset(&target->pace); // #2629
+	comp_weave_budget_reset(&target->wbudget);
 #endif
 	target->queue_family_index = queue_family_index;
 	target->surface = surface;
@@ -2673,7 +2686,7 @@ target_log_residual(struct comp_vk_native_target *target)
 			    comp_residual_window_take(&target->residual_win, target->vblank_grid.period_ns);
 			// #2119: the present_wait depth governor's state rides along, so
 			// one line says whether the residual moved with the depth.
-			char gov[384] = "";
+			char gov[512] = "";
 #ifdef XRT_OS_LINUX_DESKTOP
 			if (target->pw_pace_inited) {
 				snprintf(
@@ -2687,16 +2700,21 @@ target_log_residual(struct comp_vk_native_target *target)
 #endif
 #ifdef XRT_OS_ANDROID
 			// #2629: what the rate cap and the drain did over the window.
-			snprintf(gov, sizeof(gov),
-			         " | cap aimed %u now %u pushed %u skipped %u, budget %.2f ms, acquire %.2f ms, "
-			         "repaint wait %.2f ms | drain floor %.2f periods (%s), threshold %.2f, drains %u",
-			         target->cap_aimed, target->cap_now, target->cap_pushed, target->cap_late,
-			         target->cap_budget_n ? target->cap_budget_sum_ns / 1e6 / target->cap_budget_n : 0.0,
-			         target->cap_acq_n ? target->cap_acq_sum_ns / 1e6 / target->cap_acq_n : 0.0,
-			         target->cap_wait_n ? target->cap_wait_sum_ns / 1e6 / target->cap_wait_n : 0.0,
-			         target->qdrain.floor_periods, target->qdrain.floor_probed ? "probed" : "passive",
-			         comp_queue_drain_threshold(&target->qdrain), target->qdrain.drains_taken);
+			snprintf(
+			    gov, sizeof(gov),
+			    " | pacing %s (weaves/vblank AIM %.2f THROUGHPUT %.2f, probes %u) | cap aimed %u late %u "
+			    "now %u pushed %u skipped %u, budget %.2f ms, acquire %.2f ms, repaint wait %.2f ms | "
+			    "drain floor %.2f periods (%s), threshold %.2f, drains %u",
+			    comp_grid_pace_mode_str(target->pace.mode), target->pace.aim_rate, target->pace.thr_rate,
+			    target->pace.probes, target->cap_aimed, target->cap_late_sleep, target->cap_now,
+			    target->cap_pushed, target->cap_late,
+			    target->cap_budget_n ? target->cap_budget_sum_ns / 1e6 / target->cap_budget_n : 0.0,
+			    target->cap_acq_n ? target->cap_acq_sum_ns / 1e6 / target->cap_acq_n : 0.0,
+			    target->cap_wait_n ? target->cap_wait_sum_ns / 1e6 / target->cap_wait_n : 0.0,
+			    target->qdrain.floor_periods, target->qdrain.floor_probed ? "probed" : "passive",
+			    comp_queue_drain_threshold(&target->qdrain), target->qdrain.drains_taken);
 			target->cap_aimed = target->cap_now = target->cap_pushed = target->cap_late = 0;
+			target->cap_late_sleep = 0;
 			target->cap_acq_sum_ns = target->cap_wait_sum_ns = target->cap_budget_sum_ns = 0;
 			target->cap_acq_n = target->cap_wait_n = target->cap_budget_n = 0;
 #endif
@@ -3165,7 +3183,16 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 					if (prev != 0 && dxr_queue_drain_enabled()) {
 						comp_queue_drain_on_period_change(
 						    &target->qdrain, prev, target->vblank_grid.period_ns, probe_now_ns);
+						target->qdrain.absolute_only = false; // pacing returns to AIM
 					}
+					// #2629: a new rate re-probes AIM; the weave cost of the old
+					// rate says little about the new one's deadline.
+					if (prev != 0 &&
+					    comp_grid_pace_on_period_change(&target->pace) == COMP_PACE_EV_RESET_AIM) {
+						U_LOG_W(
+						    "#2629: grid pacing THROUGHPUT -> AIM (refresh period changed)");
+					}
+					comp_weave_budget_reset(&target->wbudget);
 #endif
 				}
 			} else {
@@ -4002,22 +4029,50 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 			 * so once the budget reaches a period (a blocking acquire used to
 			 * inflate it) the tier stops pacing and the producer free-runs
 			 * into a full FIFO queue. With the cap: the usual late-weave aim
-			 * when the next vblank is reachable, weave at once when it is not
-			 * (throughput first), and a push past the vblank the previous
-			 * present will be shown at when this one would land on it.
-			 * App frames and repaints alike; the shown vblank is booked at
-			 * present (comp_grid_rate_cap_on_present).
+			 * when the next vblank is reachable; when it is not, AIM mode
+			 * sleeps toward the vblank after and THROUGHPUT mode weaves at
+			 * once (comp_grid_pace_mode.h picks, from measured weave rates);
+			 * and a push past the vblank the previous present will be shown
+			 * at when this one would land on it. App frames and repaints
+			 * alike; the shown vblank is booked at present
+			 * (comp_grid_rate_cap_on_present).
 			 */
 			if (dxr_grid_rate_cap_enabled()) {
 				uint64_t cap_sleep_ns = 0;
 				enum comp_grid_rate_cap_kind kind = COMP_GRID_CAP_NONE;
-				const uint64_t aim =
-				    comp_grid_rate_cap_target(&target->vblank_grid, now_ns, budget_ns,
-				                              target->lw_last_shown_vblank_ns, &cap_sleep_ns, &kind);
+				const bool throughput = target->pace.mode == COMP_PACE_THROUGHPUT;
+				const uint64_t aim = comp_grid_rate_cap_target(&target->vblank_grid, now_ns, budget_ns,
+				                                               target->lw_last_shown_vblank_ns,
+				                                               throughput, &cap_sleep_ns, &kind);
 				if (aim != 0) {
 					rate_capped = true;
 					if (cap_sleep_ns != 0) {
 						os_nanosleep((int64_t)cap_sleep_ns);
+					}
+					const bool late = kind == COMP_GRID_CAP_LATE || kind == COMP_GRID_CAP_NOW;
+					target->cap_late_sleep += kind == COMP_GRID_CAP_LATE ? 1 : 0;
+					const enum comp_grid_pace_event ev = comp_grid_pace_on_weave(
+					    &target->pace, late, os_monotonic_get_ns(), period_ns);
+					if (ev != COMP_PACE_EV_NONE) {
+						// Rare by construction: a probe at most every 5-60 s,
+						// a verdict one window after it.
+						const char *what =
+						    ev == COMP_PACE_EV_PROBE    ? "AIM -> THROUGHPUT (probe)"
+						    : ev == COMP_PACE_EV_PROVEN ? "THROUGHPUT proven, staying"
+						                                : "THROUGHPUT -> AIM (no gain)";
+						U_LOG_W(
+						    "#2629: grid pacing %s — weaves/vblank AIM %.2f, THROUGHPUT %.2f; "
+						    "late %.0f%% of "
+						    "weaves; next probe backoff %.0f s",
+						    what, target->pace.aim_rate, target->pace.thr_rate,
+						    target->pace.last_late_share * 100.0,
+						    target->pace.backoff_ns / 1e9);
+						if (ev == COMP_PACE_EV_PROBE || ev == COMP_PACE_EV_REJECTED) {
+							// The drain's floor is per mode: early THROUGHPUT
+							// weaves are not a backlog (#2629 round 3).
+							comp_queue_drain_on_mode_change(
+							    &target->qdrain, target->pace.mode == COMP_PACE_THROUGHPUT);
+						}
 					}
 					target->cap_aimed += kind == COMP_GRID_CAP_AIMED ? 1 : 0;
 					target->cap_now += kind == COMP_GRID_CAP_NOW ? 1 : 0;
@@ -4069,7 +4124,17 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 				enum comp_queue_drain_reason reason = COMP_QD_REASON_NONE;
 				const uint64_t next_seq =
 				    (uint32_t)(target->display_timing_present_id + 1); // presentID is 32-bit
-				if (comp_queue_drain_take(&target->qdrain, next_seq, drain_now_ns, &reason)) {
+				const bool took =
+				    comp_queue_drain_take(&target->qdrain, next_seq, drain_now_ns, &reason);
+				if (target->qdrain.rebound_backoffs != target->qd_rebound_logged) {
+					target->qd_rebound_logged = target->qdrain.rebound_backoffs;
+					U_LOG_W(
+					    "#2629: queue drain: more than %d drains in 5 s without the level staying "
+					    "down — "
+					    "not the queue; backoff %.0f s",
+					    COMP_QD_MAX_REBOUNDS, target->qdrain.applied_backoff_ns / 1e9);
+				}
+				if (took) {
 					// Baseline = min of the last 3 residuals (0 = none: a
 					// rate drop judged leniently).
 					const uint64_t pre = target->qdrain.pre_drain_residual_ns;
@@ -5045,7 +5110,18 @@ comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
 #endif
 			// Ignore absurd samples: a preempted thread or a swapchain
 			// recreate mid-frame is not a weave cost.
-			if (cost < 100ULL * 1000 * 1000) {
+#ifdef XRT_OS_ANDROID
+			// #2629: with the rate cap, the budget is the p90 of the last 32
+			// weave costs — a deadline estimate one long frame cannot
+			// triple (the high-water went 3.45 -> 12.80 ms in one phase).
+			if (dxr_grid_rate_cap_enabled()) {
+				if (cost < 100ULL * 1000 * 1000) {
+					comp_weave_budget_add(&target->wbudget, cost);
+					target->weave_cost_ns = target->wbudget.p90_ns;
+				}
+			} else
+#endif
+			    if (cost < 100ULL * 1000 * 1000) {
 				if (cost > target->weave_cost_ns) {
 					target->weave_cost_ns = cost;
 				} else {

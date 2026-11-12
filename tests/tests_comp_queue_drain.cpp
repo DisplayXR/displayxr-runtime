@@ -377,7 +377,9 @@ TEST_CASE("queue drain: at most 8 successful drains in a row without a sample at
 		if (last == COMP_QD_VERDICT_DRAINED) {
 			drained++;
 		}
-		now += 100 * MS;
+		// Spaced 2 s apart, so the rebound backstop (more than 3 in 5 s,
+		// below) is not what stops it.
+		now += 2 * S;
 	}
 	CHECK(drained == COMP_QD_MAX_SUCCESS_RUN - 1);
 	CHECK(last == COMP_QD_VERDICT_CAPPED);
@@ -397,6 +399,7 @@ TEST_CASE("queue drain: at most 8 successful drains in a row without a sample at
 			REQUIRE(comp_queue_drain_take(&d2, seq, now, nullptr));
 			CHECK(settle3(&d2, seq, periods(4.0), periods(4.0), periods(4.0), now) ==
 			      COMP_QD_VERDICT_DRAINED);
+			now += 2 * S;
 		}
 		CHECK(d2.state == COMP_QD_IDLE);
 	}
@@ -667,4 +670,53 @@ TEST_CASE("queue drain: a passive floor learned on a full queue still lets it dr
 	s.run_for(5 * S);
 	CHECK(s.queued == 0);
 	CHECK(s.d.floor_periods == Catch::Approx(1.8).margin(0.01));
+}
+
+TEST_CASE("queue drain: more than 3 drains in 5 s whose level does not stay down back off")
+{
+	// Round 3 on the device: drained to 19 ms, back at 33-36 ms ~200 ms later,
+	// 26 drains in 25 s. A deep queue's drains each start where the last one
+	// ended; these start where the last one began.
+	comp_queue_drain d;
+	comp_queue_drain_reset(&d);
+	uint64_t now = 10 * S;
+	uint64_t seq = 1;
+	// The aimed floor, 1.15 periods: threshold 1.9.
+	for (int i = 0; i < 6; i++) {
+		comp_queue_drain_on_residual(&d, seq++, periods(1.15), P60, now);
+	}
+	int taken = 0;
+	for (int trial = 0; trial < 10; trial++) {
+		for (int i = 0; i < 3; i++) {
+			comp_queue_drain_on_residual(&d, seq++, periods(2.05), P60, now);
+		}
+		if (!comp_queue_drain_take(&d, seq, now, nullptr)) {
+			break;
+		}
+		taken++;
+		REQUIRE(settle3(&d, seq, periods(1.15), periods(1.15), periods(1.15), now) == COMP_QD_VERDICT_DRAINED);
+		now += 300 * MS;
+	}
+	CHECK(taken == COMP_QD_MAX_REBOUNDS + 1); // the first drain is no rebound
+	CHECK(d.rebound_backoffs == 1);
+	CHECK(d.state == COMP_QD_BACKOFF);
+
+	SECTION("a deep queue draining one slot per settle is not a rebound")
+	{
+		comp_queue_drain q;
+		comp_queue_drain_reset(&q);
+		uint64_t s2 = 1;
+		double level = 7.0;
+		for (int k = 0; k < 4; k++) {
+			for (int i = 0; i < 3; i++) {
+				comp_queue_drain_on_residual(&q, s2++, periods(level), P60, now);
+			}
+			REQUIRE(comp_queue_drain_take(&q, s2, now, nullptr));
+			level -= 1.0;
+			REQUIRE(settle3(&q, s2, periods(level), periods(level), periods(level), now) ==
+			        COMP_QD_VERDICT_DRAINED);
+			now += 100 * MS;
+		}
+		CHECK(q.rebound_backoffs == 0);
+	}
 }
