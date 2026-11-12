@@ -68,6 +68,16 @@ struct comp_vk_native_swapchain
 	 */
 	uint64_t stamp_serial[MAX_SWAPCHAIN_IMAGES];
 
+	/*!
+	 * Per image, the serial of the last DEFERRED compose that reads it (0 =
+	 * none): on the hub DIRECT route the renderer no longer host-waits its
+	 * compose submit, so xrWaitSwapchainImage waits it instead, for an image
+	 * that submit samples (comp_vk_native_renderer_wait_image_read). Written at
+	 * commit and read at wait_image/destroy, both under the renderer's
+	 * deferred-compose lock.
+	 */
+	uint64_t compose_serial[MAX_SWAPCHAIN_IMAGES];
+
 	//! VkImages.
 	VkImage images[MAX_SWAPCHAIN_IMAGES];
 
@@ -339,6 +349,22 @@ comp_vk_native_swapchain_note_stamp(struct xrt_swapchain *xsc, uint32_t index, u
 	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
 	if (index < sc->image_count && serial > sc->stamp_serial[index]) {
 		sc->stamp_serial[index] = serial;
+	}
+}
+
+uint64_t
+comp_vk_native_swapchain_get_compose_serial(struct xrt_swapchain *xsc, uint32_t index)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	return index < sc->image_count ? sc->compose_serial[index] : 0;
+}
+
+void
+comp_vk_native_swapchain_note_compose(struct xrt_swapchain *xsc, uint32_t index, uint64_t serial)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	if (index < sc->image_count && serial > sc->compose_serial[index]) {
+		sc->compose_serial[index] = serial;
 	}
 }
 
@@ -837,7 +863,9 @@ comp_vk_native_swapchain_is_true_srgb(struct xrt_swapchain *xsc)
  *
  * One scratch per swapchain (not per image slot) is enough: its only reader is
  * the compose blit recorded right after the copy in the SAME command buffer,
- * and comp_vk_native_renderer_draw() waits that submit idle before returning.
+ * and comp_vk_native_renderer_draw() waits that submit idle before returning
+ * (on the hub DIRECT route: retires it at the top of the NEXT draw, before
+ * any copy into the scratch is recorded).
  * The weave reads the renderer's atlas, never this scratch, so no later
  * commit's copy can overwrite it while anything still reads it (#1935).
  */

@@ -131,6 +131,64 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *renderer,
                               const struct comp_vk_native_eff_layout *layout);
 
 /*!
+ * Deferred compose wait — the D3D11 hub DIRECT route only.
+ *
+ * By default every compose submit (comp_vk_native_renderer_draw) is waited on
+ * the host before draw returns (#837/#1917). On an in-order app queue that wait
+ * also covers the app's own GPU work for the frame. When the compositor sets
+ * @p defer for a frame, the submit is NOT waited: the hub orders its read on
+ * the GPU (the deposit timeline), and the host-side guarantees the wait gave
+ * are kept by other means:
+ *  - the NEXT draw (and every renderer mutator) retires the previous deferred
+ *    frame first — its compose fence AND the frame's tail fence (see
+ *    comp_vk_native_renderer_fence_frame), so command buffer, descriptor pool,
+ *    private compose target, sRGB scratch and every per-frame framebuffer are
+ *    idle before they are reset or rewritten (depth-1, as before, one frame
+ *    later);
+ *  - xrWaitSwapchainImage / swapchain destroy wait the compose that reads that
+ *    image (comp_vk_native_renderer_wait_image_read).
+ * Set per frame, before comp_vk_native_renderer_draw. Default false.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_renderer_set_defer_wait(struct comp_vk_native_renderer *renderer, bool defer);
+
+/*!
+ * Fence everything submitted on the app queue so far for a deferred frame —
+ * an empty submit carrying the renderer's tail fence, issued after the frame's
+ * last Vulkan pass (window-space, PQ, planes). No-op when this frame's compose
+ * was host-waited. Commit thread.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_renderer_fence_frame(struct comp_vk_native_renderer *renderer);
+
+/*!
+ * Host-wait the outstanding deferred frame, if any (compose + tail fences).
+ * Commit thread, or under the compositor's lock; unbounded, like the per-frame
+ * wait it replaces. Call before anything that assumes the previous frame's
+ * Vulkan work retired (e.g. leaving the hub).
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_renderer_finish_deferred(struct comp_vk_native_renderer *renderer);
+
+/*!
+ * App thread (xrWaitSwapchainImage; @p index UINT32_MAX = swapchain destroy):
+ * wait, bounded, for the deferred compose that reads image @p index of @p xsc.
+ * Returns at once when that compose retired or was never deferred.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_renderer_wait_image_read(struct comp_vk_native_renderer *renderer,
+                                        struct xrt_swapchain *xsc,
+                                        uint32_t index);
+
+/*!
  * Get the atlas VkImageView (tile_columns * view_width x tile_rows * height).
  *
  * @param renderer The renderer.

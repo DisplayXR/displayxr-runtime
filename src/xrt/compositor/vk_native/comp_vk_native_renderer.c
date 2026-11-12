@@ -49,6 +49,8 @@
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
+#include "util/u_time.h"
+#include "os/os_threading.h"
 
 #include "math/m_api.h"
 
@@ -232,8 +234,43 @@ struct comp_vk_native_renderer
 	 * source image are done, which is what the blit depended on anyway.
 	 * Created once (lazily), reset after each wait — never created or
 	 * destroyed per frame.
+	 *
+	 * On the D3D11 hub DIRECT route the wait is DEFERRED to the next draw
+	 * (see @ref defer); the guarantees above then hold one frame later.
 	 */
 	VkFence draw_fence;
+
+	/*!
+	 * Deferred compose wait (D3D11 hub DIRECT route only; see
+	 * comp_vk_native_renderer_set_defer_wait). When @ref requested, the compose
+	 * submit still carries draw_fence but draw does not wait it; the next draw
+	 * (or mutator) retires it, together with @ref tail_fence, which an empty
+	 * submit after the frame's last Vulkan pass signals.
+	 *
+	 * @ref mutex guards everything below except @ref requested and
+	 * @ref frame_layers (commit thread only), AND every operation on draw_fence
+	 * and tail_fence while a deferred frame can be outstanding: the app thread
+	 * waits them from xrWaitSwapchainImage, and vkQueueSubmit / vkResetFences
+	 * need the fence externally synchronised. It is a leaf lock.
+	 */
+	struct
+	{
+		bool requested;
+		//! The layers of the draw in progress, for tagging (draw call only).
+		struct comp_layer_accum *frame_layers;
+
+		struct os_mutex mutex;
+		bool mutex_ok;
+		//! Last serial handed out (monotone, never 0 once used).
+		uint64_t serial;
+		//! Serial of the outstanding deferred compose, 0 = none.
+		uint64_t pending;
+		//! The tail fence was submitted for @ref pending.
+		bool tail_armed;
+		VkFence tail_fence;
+		//! Highest serial known retired.
+		uint64_t retired;
+	} defer;
 
 	//! Number of tile columns in the atlas (default 2 for stereo).
 	uint32_t tile_columns;
@@ -1077,6 +1114,9 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 
 	r->vk = vk;
 	r->format = atlas_format_from_env();
+	// Deferred compose wait: without its lock the renderer simply never
+	// defers (set_defer_wait refuses), so a failure here is not fatal.
+	r->defer.mutex_ok = os_mutex_init(&r->defer.mutex) == 0;
 	r->tile_columns = 2;
 	r->tile_rows = 1;
 
@@ -1162,6 +1202,15 @@ comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 	if (r->draw_fence != VK_NULL_HANDLE) {
 		vk->vkDestroyFence(vk->device, r->draw_fence, NULL);
 		r->draw_fence = VK_NULL_HANDLE;
+	}
+	// After the vkDeviceWaitIdle above: nothing deferred is still pending.
+	if (r->defer.tail_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, r->defer.tail_fence, NULL);
+		r->defer.tail_fence = VK_NULL_HANDLE;
+	}
+	if (r->defer.mutex_ok) {
+		os_mutex_destroy(&r->defer.mutex);
+		r->defer.mutex_ok = false;
 	}
 
 	free(r);
@@ -2129,10 +2178,201 @@ renderer_begin_draw_cmd(struct comp_vk_native_renderer *r, VkCommandBuffer *out_
 	return VK_SUCCESS;
 }
 
+/*
+ *
+ * Deferred compose wait (D3D11 hub DIRECT route) — see
+ * comp_vk_native_renderer_set_defer_wait for the contract.
+ *
+ */
+
+//! Bound on an APP-thread wait for a deferred compose (xrWaitSwapchainImage).
+#define VK_DEFER_IMAGE_WAIT_NS (2ULL * U_TIME_1S_IN_NS)
+
+/*!
+ * defer.mutex held. Retire the outstanding deferred frame: wait its compose
+ * fence and (if submitted) its tail fence, then reset both for reuse.
+ * Unbounded, exactly like the per-frame wait it replaces — it only ever runs
+ * one frame LATER than that wait did, by which time the fences are normally
+ * long signalled.
+ */
+static void
+defer_retire_locked(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+	if (r->defer.pending == 0) {
+		return;
+	}
+	VkResult wres = vk->vkWaitForFences(vk->device, 1, &r->draw_fence, VK_TRUE, UINT64_MAX);
+	vk->vkResetFences(vk->device, 1, &r->draw_fence);
+	if (wres != VK_SUCCESS) {
+		U_LOG_E("VK compose: waiting the deferred compose fence failed: %d", wres);
+	}
+	if (r->defer.tail_armed) {
+		wres = vk->vkWaitForFences(vk->device, 1, &r->defer.tail_fence, VK_TRUE, UINT64_MAX);
+		vk->vkResetFences(vk->device, 1, &r->defer.tail_fence);
+		if (wres != VK_SUCCESS) {
+			U_LOG_E("VK compose: waiting the deferred frame's tail fence failed: %d", wres);
+		}
+	}
+	r->defer.retired = r->defer.pending;
+	r->defer.pending = 0;
+	r->defer.tail_armed = false;
+}
+
+void
+comp_vk_native_renderer_finish_deferred(struct comp_vk_native_renderer *r)
+{
+	if (r == NULL || !r->defer.mutex_ok) {
+		return;
+	}
+	os_mutex_lock(&r->defer.mutex);
+	defer_retire_locked(r);
+	os_mutex_unlock(&r->defer.mutex);
+}
+
+void
+comp_vk_native_renderer_set_defer_wait(struct comp_vk_native_renderer *r, bool defer)
+{
+	if (r == NULL) {
+		return;
+	}
+	r->defer.requested = defer && r->defer.mutex_ok;
+}
+
+static void
+defer_note(struct xrt_swapchain *xsc, const struct xrt_sub_image *sub, uint64_t serial)
+{
+	if (xsc != NULL) {
+		comp_vk_native_swapchain_note_compose(xsc, sub->image_index, serial);
+	}
+}
+
+/*!
+ * defer.mutex held: tag every app swapchain image this frame references with
+ * @p serial. Deliberately every layer type, not only what the compose pass
+ * itself samples: the window-space, Local2D and plane passes that follow it
+ * on the hub route read app images too, and the tail fence covers them, so
+ * the app's next xrWaitSwapchainImage on any of them is ordered after the
+ * whole frame. (Same enumeration as the #2095 weave-sync tagging.)
+ */
+static void
+defer_tag_layer_reads_locked(struct comp_layer_accum *layers, uint64_t serial)
+{
+	if (layers == NULL) {
+		return;
+	}
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		const struct comp_layer *l = &layers->layers[i];
+		const struct xrt_layer_data *d = &l->data;
+		switch (d->type) {
+		case XRT_LAYER_PROJECTION:
+			for (uint32_t v = 0; v < d->view_count && v < XRT_MAX_VIEWS; v++) {
+				defer_note(l->sc_array[v], &d->proj.v[v].sub, serial);
+			}
+			break;
+		case XRT_LAYER_PROJECTION_DEPTH:
+			for (uint32_t v = 0; v < d->view_count && v < XRT_MAX_VIEWS; v++) {
+				defer_note(l->sc_array[v], &d->depth.v[v].sub, serial);
+				defer_note(l->sc_array[XRT_MAX_VIEWS + v], &d->depth.d[v].sub, serial);
+			}
+			break;
+		case XRT_LAYER_ZONE_3D:
+			for (uint32_t v = 0; v < d->view_count && v < XRT_MAX_VIEWS; v++) {
+				defer_note(l->sc_array[v], &d->zone_3d.proj.v[v].sub, serial);
+			}
+			break;
+		case XRT_LAYER_QUAD: defer_note(l->sc_array[0], &d->quad.sub, serial); break;
+		case XRT_LAYER_CUBE: defer_note(l->sc_array[0], &d->cube.sub, serial); break;
+		case XRT_LAYER_CYLINDER: defer_note(l->sc_array[0], &d->cylinder.sub, serial); break;
+		case XRT_LAYER_EQUIRECT1: defer_note(l->sc_array[0], &d->equirect1.sub, serial); break;
+		case XRT_LAYER_EQUIRECT2: defer_note(l->sc_array[0], &d->equirect2.sub, serial); break;
+		case XRT_LAYER_WINDOW_SPACE: defer_note(l->sc_array[0], &d->window_space.sub, serial); break;
+		case XRT_LAYER_LOCAL_2D: defer_note(l->sc_array[0], &d->local_2d.sub, serial); break;
+		default: break;
+		}
+	}
+}
+
+void
+comp_vk_native_renderer_fence_frame(struct comp_vk_native_renderer *r)
+{
+	if (r == NULL || !r->defer.mutex_ok) {
+		return;
+	}
+	struct vk_bundle *vk = r->vk;
+	os_mutex_lock(&r->defer.mutex);
+	if (r->defer.pending != 0 && !r->defer.tail_armed) {
+		if (r->defer.tail_fence == VK_NULL_HANDLE) {
+			VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+			if (vk->vkCreateFence(vk->device, &fci, NULL, &r->defer.tail_fence) != VK_SUCCESS) {
+				r->defer.tail_fence = VK_NULL_HANDLE;
+			}
+		}
+		// An empty batch: the fence signals once every submission before it
+		// on this queue has completed — the compose AND the window-space, PQ
+		// and plane passes that followed it this frame.
+		if (r->defer.tail_fence != VK_NULL_HANDLE &&
+		    vk->vkQueueSubmit(vk->main_queue->queue, 0, NULL, r->defer.tail_fence) == VK_SUCCESS) {
+			r->defer.tail_armed = true;
+		} else {
+			// No tail: retire what we can see right now rather than let the
+			// next frame rewrite passes nothing fenced. Host wait, as before.
+			vk->vkQueueWaitIdle(vk->main_queue->queue);
+			defer_retire_locked(r);
+		}
+	}
+	os_mutex_unlock(&r->defer.mutex);
+}
+
+void
+comp_vk_native_renderer_wait_image_read(struct comp_vk_native_renderer *r, struct xrt_swapchain *xsc, uint32_t index)
+{
+	if (r == NULL || xsc == NULL || !r->defer.mutex_ok) {
+		return;
+	}
+	struct vk_bundle *vk = r->vk;
+	os_mutex_lock(&r->defer.mutex);
+	uint64_t tag = 0;
+	if (index == UINT32_MAX) {
+		for (uint32_t i = 0; i < xsc->image_count; i++) {
+			const uint64_t t = comp_vk_native_swapchain_get_compose_serial(xsc, i);
+			tag = t > tag ? t : tag;
+		}
+	} else {
+		tag = comp_vk_native_swapchain_get_compose_serial(xsc, index);
+	}
+	// Only the outstanding frame can still be reading: anything older was
+	// retired (in order) before a newer deferred frame was recorded.
+	if (tag != 0 && tag > r->defer.retired && tag == r->defer.pending) {
+		// Wait without resetting: the commit thread owns retirement and resets.
+		const uint64_t bound = index == UINT32_MAX ? UINT64_MAX : VK_DEFER_IMAGE_WAIT_NS;
+		VkResult wres = vk->vkWaitForFences(vk->device, 1, &r->draw_fence, VK_TRUE, bound);
+		if (wres == VK_SUCCESS && r->defer.tail_armed) {
+			wres = vk->vkWaitForFences(vk->device, 1, &r->defer.tail_fence, VK_TRUE, bound);
+		}
+		if (wres != VK_SUCCESS) {
+			static bool s_warned = false;
+			if (!s_warned) {
+				s_warned = true;
+				U_LOG_W(
+				    "VK compose: xrWaitSwapchainImage waited %llu ms for the deferred compose reading "
+				    "this image and it has not retired (%d) - proceeding (one-time warning)",
+				    (unsigned long long)(VK_DEFER_IMAGE_WAIT_NS / U_TIME_1MS_IN_NS), wres);
+			}
+		}
+	}
+	os_mutex_unlock(&r->defer.mutex);
+}
+
 /*!
  * Submit draw_cmd on the main queue with draw_fence, and wait for THAT submit
  * only (see draw_fence). On a failed submit nothing is pending and the fence
  * is unsignalled, so the next frame can reset both.
+ *
+ * Deferred frames (defer.requested, the hub DIRECT route): the same submit,
+ * NOT waited. It is recorded as the outstanding deferred frame and the
+ * frame's app images are tagged with its serial, all under defer.mutex so the
+ * app thread sees the tags and the pending fence together.
  */
 static VkResult
 renderer_submit_draw_and_wait(struct comp_vk_native_renderer *r, VkSubmitInfo *submit_info, const char *label)
@@ -2147,6 +2387,26 @@ renderer_submit_draw_and_wait(struct comp_vk_native_renderer *r, VkSubmitInfo *s
 			r->draw_fence = VK_NULL_HANDLE;
 			return res;
 		}
+	}
+
+	if (r->defer.requested) {
+		os_mutex_lock(&r->defer.mutex);
+		// Retired at the top of draw; belt and braces, a no-op normally.
+		defer_retire_locked(r);
+		const uint64_t serial = ++r->defer.serial;
+		defer_tag_layer_reads_locked(r->defer.frame_layers, serial);
+#ifdef XRT_OS_ANDROID
+		res = comp_vk_native_queue_submit_retry(vk, vk->main_queue->queue, submit_info, r->draw_fence, label);
+#else
+		(void)label;
+		res = vk->vkQueueSubmit(vk->main_queue->queue, 1, submit_info, r->draw_fence);
+#endif
+		if (res == VK_SUCCESS) {
+			r->defer.pending = serial;
+			r->defer.tail_armed = false;
+		}
+		os_mutex_unlock(&r->defer.mutex);
+		return res;
 	}
 
 #ifdef XRT_OS_ANDROID
@@ -2254,7 +2514,10 @@ comp_vk_native_renderer_set_cursor_default_image(struct comp_vk_native_renderer 
 	VkResult res;
 
 	// A new size needs a new image. Only ever called between draws, and every
-	// draw waits its own fence, so nothing in flight references the old one.
+	// draw waits its own fence (or, deferred, is retired just below), so
+	// nothing in flight references the old one — nor reads the staging buffer
+	// the upload below rewrites.
+	comp_vk_native_renderer_finish_deferred(r);
 	if (r->cursor.default_image != VK_NULL_HANDLE &&
 	    (r->cursor.default_w != width || r->cursor.default_h != height)) {
 		vk->vkDestroyImageView(vk->device, r->cursor.default_view, NULL);
@@ -3411,7 +3674,8 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	}
 
 	// renderer_submit_draw_and_wait() waited draw_fence: the atlas is
-	// complete and draw_cmd is idle for the next reset.
+	// complete and draw_cmd is idle for the next reset. (Deferred frames: the
+	// next draw retires it first; the hub orders its read on the GPU.)
 
 	static bool zones_draw_logged = false;
 	if (!zones_draw_logged) {
@@ -3813,6 +4077,16 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	(void)right_eye;
 
 	/*
+	 * Deferred compose wait: retire the previous deferred frame (if any)
+	 * BEFORE anything below resets draw_cmd, the descriptor pool, the private
+	 * compose target or a swapchain's sRGB scratch — every one of which the
+	 * previous frame's GPU work may still be using. Normally already
+	 * signalled: the app has submitted a whole frame since.
+	 */
+	comp_vk_native_renderer_finish_deferred(r);
+	r->defer.frame_layers = layers;
+
+	/*
 	 * VK-0 (#1178) — take the next deposit slot for this APP frame.
 	 *
 	 * Only here: a repaint replays the atlas the last app frame left behind
@@ -4208,7 +4482,8 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	}
 
 	// renderer_submit_draw_and_wait() waited draw_fence: the atlas is
-	// complete and draw_cmd is idle for the next reset.
+	// complete and draw_cmd is idle for the next reset. (Deferred frames: the
+	// next draw retires it first; the hub orders its read on the GPU.)
 
 	return XRT_SUCCESS;
 }
@@ -4751,6 +5026,9 @@ comp_vk_native_renderer_resize(struct comp_vk_native_renderer *r,
                                 uint32_t new_atlas_height)
 {
 	struct vk_bundle *vk = r->vk;
+
+	// Deferred compose wait: a mutator retires the outstanding frame first.
+	comp_vk_native_renderer_finish_deferred(r);
 
 	if (new_view_width < 64) new_view_width = 64;
 	if (new_view_height < 64) new_view_height = 64;
