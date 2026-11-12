@@ -73,7 +73,7 @@ xrCreateLiftStreamDXR(session, &ci, &stream);
 | In-process Vulkan session on macOS | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | the service's tasks over a lift-only connection (a plain socket connect: the service is never launched for it; no service = no tasks), with `imageKinds` = `exportKinds` = `IOSURFACE`, `CPU` (IOSURFACE only when the service's Vulkan glue takes it, §4.5) |
 | In-process Vulkan session on desktop Linux | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | the same kind of lift-only connection, with `imageKinds` = `OPAQUE_FD`, `DMABUF`, `CPU` and `exportKinds` = `OPAQUE_FD`, `CPU` (the fd kinds only when the service's glue takes them, §4.5) |
 | In-process GL / Metal session on desktop Linux or macOS | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | the same kind of lift-only connection, with `imageKinds` = `exportKinds` = `CPU` |
-| IPC session on desktop Linux or macOS | the service's view: modes 0 / `UNAVAILABLE` (the POSIX service has no D3D11 textures to serve spec 3 with) | one element per task, `imageKinds` = `exportKinds` = `CPU` |
+| IPC session on desktop Linux or macOS | the service's view, narrowed to what the POSIX CPU route serves with no D3D11 textures: SBS / NVIEW as weave-rect streams, and GAUSSIANS when a provider serves `SPLATS_MONO` (its submits chain a `CPU` `XrLiftFrameImagesDXR` image, §5.2); DEPTH is spec 4 only there | one element per task, `imageKinds` = `exportKinds` = `CPU` |
 | Any other in-process session (Android) | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | nothing known yet (no lift-only connection on that platform; the transport lands without a spec bump, ADR-053 P5) |
 | A service with no provider (no plug-in registered, or `DXR_LIFT=0`) | `XR_SUCCESS`, `supportedModes = 0`, `UNAVAILABLE` | `countOutput = 0` |
 
@@ -677,6 +677,14 @@ per-stream **export texture** and signals the export **fence**:
    blob in the service.
 2. Capacity ≥ `byteCountOutput` → the latched blob's bytes (the SAME frame, even if a newer one
    finished in between); the latch is consumed.
+
+**The photo, by platform.** On Windows a GAUSSIANS submit passes the photo as the v3
+`inputTexture` (a D3D11 shared texture the service reads back). A POSIX service has no texture to
+read back, so there the submit chains `XrLiftFrameImagesDXR` with one `COLOR` image of kind `CPU`
+(RGBA8 / BGRA8, `syncKind` NONE or CPU_COMPLETE) and `inputTexture` NULL; any other kind is
+refused (`XR_ERROR_VALIDATION_FAILURE` client-side for a kind not offered, a non-fatal
+`XR_ERROR_RUNTIME_FAILURE` otherwise). The rest of the contract is unchanged: one latest-wins
+`SPLATS_MONO` job per submit, the blob through `xrAcquireLiftBlobDXR`.
 
 A non-zero capacity smaller than the blob is `XR_ERROR_SIZE_INSUFFICIENT` (latch kept).
 `XR_LIFT_NOT_READY_DXR` when nothing newer than the last blob handed out exists. A texture
