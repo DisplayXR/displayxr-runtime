@@ -34,8 +34,9 @@ plug-in (see *How do display vendors integrate?*).
 
 ### Which operating systems and graphics APIs?
 
-- **OS:** Windows, macOS, Android and Linux all ship. On Linux (Vulkan-only, X11/XCB),
-  **Ubuntu 22.04, 24.04 and 26.04 are supported** — on 22.04, use an X11 session, because
+- **OS:** Windows, macOS, Android and Linux all ship. On Linux (Vulkan-only; native Wayland on GNOME is
+  the primary target, X11/XWayland the legacy path), **Ubuntu 22.04, 24.04 and 26.04 are
+  supported**, hardware-validated on 24.04 and 26.04 — on 22.04, use an X11 session, because
   GNOME 42 does not implement the Wayland fractional-scale protocol and a native-Wayland
   window cannot then be guaranteed 1:1 with the panel on a scaled desktop. Packages are
   built on 22.04 and CI-verified to install and headlessly self-test on all three;
