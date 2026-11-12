@@ -88,6 +88,10 @@ extern "C" {
 #define COMP_QD_TRIGGER_SAMPLES 3
 //! An acquire longer than this many periods blocked on a full queue.
 #define COMP_QD_ACQUIRE_BLOCK 0.25
+//! A post-drain min above this many periods is not learned as a floor:
+//! measured pipeline floors are 1.4-3.4 periods, so it is queue the drain
+//! could not reach (a producer refilling the slot at once), not the pipeline.
+#define COMP_QD_MAX_PLAUSIBLE_FLOOR 3.5
 //! "Successful" drains allowed in a row without a sample at/below threshold.
 #define COMP_QD_MAX_SUCCESS_RUN 8
 
@@ -114,10 +118,11 @@ enum comp_queue_drain_reason
 enum comp_queue_drain_verdict
 {
 	COMP_QD_VERDICT_NONE = 0,
-	COMP_QD_VERDICT_DRAINED,   //!< residual fell: it was queue
-	COMP_QD_VERDICT_LENIENT,   //!< no pre-drain residual to judge against: counted as drained
-	COMP_QD_VERDICT_NOT_QUEUE, //!< residual did not fall: floor learned, backing off
-	COMP_QD_VERDICT_CAPPED,    //!< too many drains in a row: backing off
+	COMP_QD_VERDICT_DRAINED,     //!< residual fell: it was queue
+	COMP_QD_VERDICT_LENIENT,     //!< no pre-drain residual to judge against: counted as drained
+	COMP_QD_VERDICT_NOT_QUEUE,   //!< residual did not fall: floor learned, backing off
+	COMP_QD_VERDICT_IMPLAUSIBLE, //!< did not fall, but too high to be a floor: not learned, backing off
+	COMP_QD_VERDICT_CAPPED,      //!< too many drains in a row: backing off
 };
 
 struct comp_queue_drain
@@ -316,9 +321,16 @@ comp_queue_drain_on_residual(
 		           COMP_QD_SUCCESS_DROP * (double)period_ns) {
 			v = COMP_QD_VERDICT_DRAINED;
 		} else {
-			// What we were at is the pipeline's floor, not queue.
-			d->floor_periods = (double)post / (double)period_ns;
+			const double post_periods = (double)post / (double)period_ns;
 			comp_queue_drain_enter_backoff_(d, now_ns);
+			if (post_periods > COMP_QD_MAX_PLAUSIBLE_FLOOR) {
+				// Did not fall, but no pipeline we know sits this high: a
+				// refilled queue, not a floor. Learning it would block
+				// draining until the next period change.
+				return COMP_QD_VERDICT_IMPLAUSIBLE;
+			}
+			// What we were at is the pipeline's floor, not queue.
+			d->floor_periods = post_periods;
 			return COMP_QD_VERDICT_NOT_QUEUE;
 		}
 		d->state = COMP_QD_IDLE;

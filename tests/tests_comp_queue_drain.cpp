@@ -313,8 +313,10 @@ TEST_CASE("queue drain: backoff doubles from 5 s to a 60 s cap; a success resets
 			comp_queue_drain_on_residual(&d, seq++, periods(level), P60, now);
 		}
 		REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
-		REQUIRE(settle3(&d, seq, periods(level), periods(level), periods(level), now) ==
-		        COMP_QD_VERDICT_NOT_QUEUE);
+		const comp_queue_drain_verdict v =
+		    settle3(&d, seq, periods(level), periods(level), periods(level), now);
+		// Levels above 3.5 periods back off the same way without learning.
+		REQUIRE((v == COMP_QD_VERDICT_NOT_QUEUE || v == COMP_QD_VERDICT_IMPLAUSIBLE));
 		CHECK(d.applied_backoff_ns == want * S);
 		// Not before expiry.
 		CHECK_FALSE(comp_queue_drain_take(&d, seq, now + want * S - 1, nullptr));
@@ -507,4 +509,41 @@ TEST_CASE("queue drain: after a drain the baseline holds post-settle samples onl
 	}
 	REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
 	CHECK(d.pre_drain_residual_ns == periods(4.0));
+}
+
+TEST_CASE("queue drain: a no-op drain far above any plausible floor backs off without learning it")
+{
+	comp_queue_drain d;
+	comp_queue_drain_reset(&d);
+	uint64_t now = 10 * S;
+	uint64_t seq = 1;
+	// The 60 Hz device case: 4.81 periods before, 4.45 after (the queue refilled).
+	for (int i = 0; i < 3; i++) {
+		comp_queue_drain_on_residual(&d, seq++, periods(4.81), P60, now);
+	}
+	REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
+	CHECK(settle3(&d, seq, periods(4.45), periods(4.6), periods(4.5), now) == COMP_QD_VERDICT_IMPLAUSIBLE);
+	CHECK(d.floor_periods == 0.0);
+	CHECK(d.state == COMP_QD_BACKOFF);
+	CHECK(d.applied_backoff_ns == COMP_QD_BACKOFF_BASE_NS);
+
+	// After the backoff the default threshold still applies, so it probes again.
+	now += COMP_QD_BACKOFF_BASE_NS + 1;
+	for (int i = 0; i < 3; i++) {
+		comp_queue_drain_on_residual(&d, seq++, periods(4.8), P60, now);
+	}
+	CHECK(d.pending);
+
+	SECTION("3.4 periods is still a plausible floor and is learned")
+	{
+		comp_queue_drain d2;
+		comp_queue_drain_reset(&d2);
+		uint64_t s2 = 1;
+		for (int i = 0; i < 3; i++) {
+			comp_queue_drain_on_residual(&d2, s2++, periods(3.4), P60, now);
+		}
+		REQUIRE(comp_queue_drain_take(&d2, s2, now, nullptr));
+		CHECK(settle3(&d2, s2, periods(3.4), periods(3.4), periods(3.4), now) == COMP_QD_VERDICT_NOT_QUEUE);
+		CHECK(d2.floor_periods == Catch::Approx(3.4).margin(0.01));
+	}
 }

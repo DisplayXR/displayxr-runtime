@@ -50,6 +50,7 @@ static std::atomic<uint32_t> g_vk_repaint_presents_since_app{0};
 #include "util/comp_vblank_grid.h"
 #include "util/comp_residual_window.h"
 #include "util/comp_queue_drain.h"
+#include "util/comp_grid_rate_cap.h"
 #include "util/comp_frame_witness.h"
 static comp_frame_witness g_frame_witness_vk{"vk"};
 
@@ -268,6 +269,28 @@ dxr_queue_drain_enabled(void)
 			U_LOG_W(
 			    "#2629: queue drain OFF (debug.dxr.queue_drain=0) — a FIFO queue filled by a "
 			    "refresh-rate drop stays full");
+		}
+	}
+	return cached != 0 && dxr_late_weave_enabled();
+}
+
+/*!
+ * #2629: one weave per vblank in the grid tier (comp_grid_rate_cap.h).
+ * Default ON; `setprop debug.dxr.grid_rate_cap 0` restores the old aim (sleep
+ * only while the next vblank is further than the budget, which stops pacing
+ * once the budget reaches a period). Off with late weave. Read once.
+ */
+static bool
+dxr_grid_rate_cap_enabled(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		char prop[PROP_VALUE_MAX] = {0};
+		cached = (__system_property_get("debug.dxr.grid_rate_cap", prop) > 0 && prop[0] == '0') ? 0 : 1;
+		if (cached == 0) {
+			U_LOG_W(
+			    "#2629: grid rate cap OFF (debug.dxr.grid_rate_cap=0) — the grid tier stops pacing once "
+			    "its weave budget reaches a period");
 		}
 	}
 	return cached != 0 && dxr_late_weave_enabled();
@@ -709,11 +732,20 @@ struct comp_vk_native_target
 	/*!
 	 * #2629: when the swapchain image for this weave was acquired — the start
 	 * of the published #206 horizon (post-acquire weave start -> actual
-	 * present). weave_start_ns stays pre-acquire: it budgets the aim sleep,
-	 * and that budget must keep covering a blocking acquire. 0 = no acquire
-	 * ran for this frame (a held image), fall back to weave_start_ns.
+	 * present). weave_start_ns stays pre-acquire, but with the grid rate cap
+	 * on the acquire's own duration (@ref acquire_ns) is subtracted from
+	 * weave_cost_ns: a blocking acquire on a full queue must not inflate the
+	 * aim budget, or the tier stops pacing and the queue stays full. This
+	 * stamp itself is unconditional (it changes what is reported, not
+	 * pacing). 0 = no acquire ran for this
+	 * frame (a held image), fall back to weave_start_ns.
 	 */
 	uint64_t residual_start_ns;
+	//! #2629: how long this frame's vkAcquireNextImageKHR call(s) took.
+	uint64_t acquire_ns;
+	//! #2629: the vblank the previous grid-tier weave aimed at (0 = none),
+	//! for one weave per vblank (comp_grid_rate_cap.h).
+	uint64_t lw_last_target_vblank_ns;
 	//! #2629: the grid tier's FIFO queue drain (comp_queue_drain.h).
 	struct comp_queue_drain qdrain;
 	//! The swapchain's real image count has been logged (queue depth).
@@ -1066,6 +1098,8 @@ create_swapchain(struct comp_vk_native_target *target)
 	// learned about this one's floor.
 	comp_queue_drain_reset(&target->qdrain);
 	target->residual_start_ns = 0;
+	target->acquire_ns = 0;
+	target->lw_last_target_vblank_ns = 0;
 #endif
 	if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
 		image_count = caps.maxImageCount;
@@ -3021,6 +3055,12 @@ target_queue_drain_on_residual(struct comp_vk_native_target *target, uint32_t pr
 		    "backoff %.0f s",
 		    post / 1e6, pre / 1e6, target->qdrain.floor_periods, target->qdrain.applied_backoff_ns / 1e9);
 		break;
+	case COMP_QD_VERDICT_IMPLAUSIBLE:
+		U_LOG_W(
+		    "#2629: queue drain: not drained (%.2f periods is not a plausible floor; not learned) — post min "
+		    "%.1f ms (pre min %.1f ms), backoff %.0f s",
+		    per, post / 1e6, pre / 1e6, target->qdrain.applied_backoff_ns / 1e9);
+		break;
 	case COMP_QD_VERDICT_CAPPED:
 		U_LOG_W(
 		    "#2629: queue drain: %d drains in a row without the residual settling (post min %.1f ms = %.2f "
@@ -3097,6 +3137,8 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 #ifdef XRT_OS_ANDROID
 					// #2629: a slower panel means the tier wove at the old,
 					// faster cadence until now and filled the FIFO queue.
+					// The previous aim is on the old grid.
+					target->lw_last_target_vblank_ns = 0;
 					if (prev != 0 && dxr_queue_drain_enabled()) {
 						comp_queue_drain_on_period_change(
 						    &target->qdrain, prev, target->vblank_grid.period_ns, probe_now_ns);
@@ -3929,7 +3971,32 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 			may_aim = target->lw_lead.initialised;
 			budget_ns += target->lw_lead.lead_ns;
 #endif
-			if (may_aim && next_vblank > now_ns + budget_ns) {
+			bool rate_capped = false;
+#ifdef XRT_OS_ANDROID
+			/*
+			 * #2629: aim at a VBLANK, at most one weave per vblank. The old
+			 * condition below sleeps only while the next vblank is further
+			 * than the budget, so once the budget reaches a period (a
+			 * blocking acquire used to inflate it) the tier stops pacing and
+			 * the producer free-runs into a full FIFO queue. Applies to app
+			 * frames and repaints alike; a producer already slower than the
+			 * panel never meets the push.
+			 */
+			if (dxr_grid_rate_cap_enabled()) {
+				uint64_t cap_sleep_ns = 0;
+				const uint64_t aim =
+				    comp_grid_rate_cap_target(&target->vblank_grid, now_ns, budget_ns,
+				                              target->lw_last_target_vblank_ns, &cap_sleep_ns);
+				if (aim != 0) {
+					rate_capped = true;
+					if (cap_sleep_ns != 0) {
+						os_nanosleep((int64_t)cap_sleep_ns);
+					}
+					target->lw_last_target_vblank_ns = aim;
+				}
+			}
+#endif
+			if (!rate_capped && may_aim && next_vblank > now_ns + budget_ns) {
 				uint64_t sleep_ns = next_vblank - budget_ns - now_ns;
 				// Never sleep past one period, whatever the grid says. A
 				// wrong anchor must cost at most a frame, not a stall — the
@@ -3975,14 +4042,23 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 					// Baseline = min of the last 3 residuals (0 = none: a
 					// rate drop judged leniently).
 					const uint64_t pre = target->qdrain.pre_drain_residual_ns;
+					char base[64];
+					if (pre != 0) {
+						snprintf(base, sizeof(base), "%.1f ms = %.2f periods", pre / 1e6,
+						         (double)pre / (double)period_ns);
+					} else {
+						snprintf(base, sizeof(base), "n/a");
+					}
 					U_LOG_W(
-					    "#2629: queue drain: skipping one vblank (%s, residual min %.1f ms = %.2f "
-					    "periods, "
-					    "threshold %.2f)",
-					    comp_queue_drain_reason_str(reason), pre / 1e6,
-					    (double)pre / (double)period_ns,
+					    "#2629: queue drain: skipping one vblank (%s, residual min %s, threshold "
+					    "%.2f)",
+					    comp_queue_drain_reason_str(reason), base,
 					    comp_queue_drain_threshold(&target->qdrain));
 					os_nanosleep((int64_t)period_ns);
+					// The weave now makes the vblank after the one aimed at.
+					if (target->lw_last_target_vblank_ns != 0) {
+						target->lw_last_target_vblank_ns += period_ns;
+					}
 				}
 			}
 #endif
@@ -4449,6 +4525,7 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 			// #2629: no acquire runs for a held image; its residual starts
 			// at weave_start_ns, not at the dropped fill's old acquire.
 			target->residual_start_ns = 0;
+			target->acquire_ns = 0;
 #endif
 			target->current_index = target->held_index;
 			*out_index = target->current_index;
@@ -4460,12 +4537,14 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 	// to ensure the image is actually available before the compositor renders.
 #ifdef XRT_OS_ANDROID
 	target->residual_start_ns = 0; // set again once the acquire succeeds
+	target->acquire_ns = 0;
 	uint64_t acq_begin_ns = os_monotonic_get_ns();
 #endif
 	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain, dxr_acquire_timeout_ns(), acq_sem,
 	                                         VK_NULL_HANDLE, &target->current_index);
 #ifdef XRT_OS_ANDROID
 	uint64_t acq_end_ns = os_monotonic_get_ns();
+	target->acquire_ns = acq_end_ns - acq_begin_ns;
 #endif
 	target_note_swap_result(target, res, TARGET_SWAP_ACQUIRE);
 	if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
@@ -4557,6 +4636,7 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 		                                VK_NULL_HANDLE, &target->current_index);
 #ifdef XRT_OS_ANDROID
 		acq_end_ns = os_monotonic_get_ns();
+		target->acquire_ns += acq_end_ns - acq_begin_ns;
 #endif
 		target_note_swap_result(target, res, TARGET_SWAP_ACQUIRE_RETRY);
 		if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
@@ -4885,7 +4965,17 @@ comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
 		 * without chasing individual dips.
 		 */
 		if (target->weave_start_ns != 0) {
-			const uint64_t cost = os_monotonic_get_ns() - target->weave_start_ns;
+			uint64_t cost = os_monotonic_get_ns() - target->weave_start_ns;
+#ifdef XRT_OS_ANDROID
+			// #2629: a blocking acquire is the queue, not the weave. Left in,
+			// it inflated the budget until the grid tier stopped pacing.
+			// Part of the rate cap: debug.dxr.grid_rate_cap 0 keeps the old
+			// cost (acquire included) so the off arm is the old pacing exactly.
+			if (dxr_grid_rate_cap_enabled() && target->acquire_ns < cost) {
+				cost -= target->acquire_ns;
+			}
+			target->acquire_ns = 0;
+#endif
 			// Ignore absurd samples: a preempted thread or a swapchain
 			// recreate mid-frame is not a weave cost.
 			if (cost < 100ULL * 1000 * 1000) {

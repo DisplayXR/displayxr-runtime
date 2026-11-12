@@ -234,7 +234,21 @@ may follow at once (one slot per settle). Otherwise the residual is the pipeline
 backoff 5 s doubling to 60 s; the floor is forgotten on any period change. Logs are events only:
 `#2629: queue drain: skipping one vblank (…)`, `#2629: queue drain: drained — …`,
 `#2629: queue drain: not queue — … floor learned …`. Kill switch `setprop debug.dxr.queue_drain 0`
-(and off whenever late weave is). Also from #2629: the published #206 horizon on Android starts
+(and off whenever late weave is). A no-op drain whose post-drain min is above 3.5 periods learns
+nothing (`not drained (N periods is not a plausible floor; not learned)`; measured floors are
+1.4–3.4) and just backs off.
+
+**One weave per vblank (#2629, `util/comp_grid_rate_cap.h`).** On device the drain worked at 90 Hz
+but the queue refilled, and at 60 Hz it could not drain at all: the tier slept only while the next
+vblank was further than its budget, the budget (a high-water of the weave cost) included a blocking
+acquire, so on a full queue the budget reached a period, the tier stopped pacing and the producer
+free-ran into the queue. Now each weave aims at the first vblank it can make (`now + budget`),
+pushed to the next one when the previous weave already aimed there (sleep capped at 2 periods), and
+the acquire's duration is subtracted from the weave cost. App frames and repaints share the cap; a
+producer already slower than the panel (a 60 Hz repaint on a 90 Hz panel) never meets the push.
+Kill switch `setprop debug.dxr.grid_rate_cap 0` restores the old aim **and** the old weave cost
+exactly, so `queue_drain 0` + `grid_rate_cap 0` pace like v2.66.15 (only the reported #206
+residual differs). Also from #2629: the published #206 horizon on Android starts
 **after** `vkAcquireNextImageKHR` returns (post-acquire weave start → actual present), since a
 blocking acquire precedes the eye sample; and `setprop debug.dxr.vk_min_images 1` (default off,
 an A/B knob) requests `minImageCount` instead of `+1` under late weave, visible in the
