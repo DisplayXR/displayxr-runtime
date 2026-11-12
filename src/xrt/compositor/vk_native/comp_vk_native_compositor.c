@@ -188,10 +188,11 @@ DEBUG_GET_ONCE_BOOL_OPTION(local2d_clip, "DXR_L2D_CLIP", true)
 DEBUG_GET_ONCE_BOOL_OPTION(lazy_transparency, "DXR_LAZY_TRANSPARENCY", true)
 // D3D11 hub DIRECT route: do not host-wait the compose submit in layer_commit
 // (the hub already GPU-waits the deposit timeline); retire it one frame later
-// instead. DXR_VK_HUB_DEFER_COMPOSE_WAIT=0 restores the per-frame host wait.
+// instead. OPT-IN for now (DXR_VK_HUB_DEFER_COMPOSE_WAIT=1) until it has run on
+// Windows hardware; unset or 0 keeps the per-frame host wait.
 // Windows-only in effect (the hub is). See comp_vk_native_renderer_set_defer_wait.
 #ifdef XRT_OS_WINDOWS
-DEBUG_GET_ONCE_BOOL_OPTION(vk_hub_defer_compose_wait, "DXR_VK_HUB_DEFER_COMPOSE_WAIT", true)
+DEBUG_GET_ONCE_BOOL_OPTION(vk_hub_defer_compose_wait, "DXR_VK_HUB_DEFER_COMPOSE_WAIT", false)
 #endif
 
 // Frame pipelining (#837): per-stage CPU timing of the windowed layer_commit
@@ -12465,7 +12466,7 @@ vk_hub_compose_wait_decide(struct comp_vk_native_compositor *c)
 		static const char *const why[] = {
 		    "DEFERRED (hub DIRECT ingress, fence-mode deposit; the next frame retires it, "
 		    "xrWaitSwapchainImage waits it per image)",
-		    "host wait per frame (DXR_VK_HUB_DEFER_COMPOSE_WAIT=0)",
+		    "host wait per frame (default; DXR_VK_HUB_DEFER_COMPOSE_WAIT=1 defers it)",
 		    "host wait per frame (hub ingress is not DIRECT)",
 		    "host wait per frame (deposit has no timeline / hub consumer fence)",
 		};
