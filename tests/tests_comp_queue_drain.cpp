@@ -153,7 +153,7 @@ TEST_CASE("queue drain: a rate drop with a 60 Hz sample in hand is judged agains
 	CHECK(s.queued == 0);
 	// 2.0 periods is under the default threshold: nothing probes the floor.
 	CHECK(s.taken.size() == 2);
-	CHECK(s.d.floor_periods == 0.0);
+	CHECK_FALSE(s.d.floor_probed); // passive floor only
 }
 
 TEST_CASE("queue drain: samples from before settle_seq are ignored")
@@ -444,7 +444,7 @@ TEST_CASE("queue drain: a real one-slot drain under +/-3 ms jitter is judged DRA
 	REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
 	CHECK(d.pre_drain_residual_ns == periods(4.0) - J);
 	CHECK(settle3(&d, seq, periods(3.0) - J, periods(3.0) + J, periods(3.0) - J, now) == COMP_QD_VERDICT_DRAINED);
-	CHECK(d.floor_periods == 0.0);
+	CHECK_FALSE(d.floor_probed);
 
 	SECTION("the sim agrees, jitter on every sample")
 	{
@@ -457,7 +457,7 @@ TEST_CASE("queue drain: a real one-slot drain under +/-3 ms jitter is judged DRA
 		for (auto v : s.verdicts) {
 			CHECK(v == COMP_QD_VERDICT_DRAINED);
 		}
-		CHECK(s.d.floor_periods == 0.0);
+		CHECK_FALSE(s.d.floor_probed);
 	}
 }
 
@@ -488,7 +488,7 @@ TEST_CASE("queue drain: one slow first post-settle sample does not fail a real d
 	REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
 	// +12 ms on the first: alone it shows a 4.7 ms drop, under the 8.3 ms bar.
 	CHECK(settle3(&d, seq, periods(3.0) + 12 * MS, periods(3.0), periods(3.0), now) == COMP_QD_VERDICT_DRAINED);
-	CHECK(d.floor_periods == 0.0);
+	CHECK_FALSE(d.floor_probed);
 }
 
 TEST_CASE("queue drain: after a drain the baseline holds post-settle samples only")
@@ -523,7 +523,7 @@ TEST_CASE("queue drain: a no-op drain far above any plausible floor backs off wi
 	}
 	REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
 	CHECK(settle3(&d, seq, periods(4.45), periods(4.6), periods(4.5), now) == COMP_QD_VERDICT_IMPLAUSIBLE);
-	CHECK(d.floor_periods == 0.0);
+	CHECK_FALSE(d.floor_probed); // passive 4.81 at most, threshold capped at 2.5
 	CHECK(d.state == COMP_QD_BACKOFF);
 	CHECK(d.applied_backoff_ns == COMP_QD_BACKOFF_BASE_NS);
 
@@ -546,4 +546,125 @@ TEST_CASE("queue drain: a no-op drain far above any plausible floor backs off wi
 		CHECK(settle3(&d2, s2, periods(3.4), periods(3.4), periods(3.4), now) == COMP_QD_VERDICT_NOT_QUEUE);
 		CHECK(d2.floor_periods == Catch::Approx(3.4).margin(0.01));
 	}
+}
+
+// #2629 device round 2: a one-frame backlog sits ~1 period above the floor,
+// under the absolute 2.5-period threshold. The floor is learned passively.
+
+TEST_CASE("queue drain: a passive floor exposes a one-frame backlog at 60 Hz")
+{
+	sim s;
+	s.jitter = J;
+	s.floor = 1.15; // measured: ~19 ms at 60 Hz
+	s.queued = 0;
+	s.run_for(1 * S);
+	REQUIRE(s.d.floor_periods > 0.0);
+	CHECK_FALSE(s.d.floor_probed);
+	// Jitter-aware: the floor estimate is a block min, ~floor - J.
+	CHECK(s.d.floor_periods == Catch::Approx((periods(1.15) - J) / (double)P60).margin(0.02));
+	CHECK(s.taken.empty());
+
+	// One frame gets queued (a missed weave): 2.15 periods, under 2.5.
+	s.queued = 1;
+	s.run_for(1 * S);
+	REQUIRE(s.taken.size() == 1);
+	CHECK(s.taken[0] == COMP_QD_REASON_RESIDUAL);
+	REQUIRE(s.verdicts.size() == 1);
+	CHECK(s.verdicts[0] == COMP_QD_VERDICT_DRAINED);
+	CHECK(s.queued == 0);
+
+	// Back at the floor: nothing more.
+	s.run_for(10 * S);
+	CHECK(s.taken.size() == 1);
+}
+
+TEST_CASE("queue drain: one lucky low sample does not pin the floor")
+{
+	comp_queue_drain d;
+	comp_queue_drain_reset(&d);
+	const uint64_t now = 10 * S;
+	uint64_t seq = 1;
+	// Steady at 2.0 periods, one sample at 0.9 in the middle.
+	for (int i = 0; i < 30; i++) {
+		const uint64_t r = (i == 13) ? periods(0.9) : periods(2.0);
+		comp_queue_drain_on_residual(&d, seq++, r, P60, now);
+	}
+	CHECK(d.floor_periods == Catch::Approx(2.0).margin(0.001));
+
+	SECTION("two disjoint blocks at a lower level do lower it")
+	{
+		for (int i = 0; i < 6; i++) {
+			comp_queue_drain_on_residual(&d, seq++, periods(1.2), P60, now);
+		}
+		CHECK(d.floor_periods == Catch::Approx(1.2).margin(0.001));
+	}
+	SECTION("an implausibly low level (a feed error) is never a floor")
+	{
+		for (int i = 0; i < 6; i++) {
+			comp_queue_drain_on_residual(&d, seq++, periods(0.3), P60, now);
+		}
+		CHECK(d.floor_periods == Catch::Approx(2.0).margin(0.001));
+	}
+}
+
+TEST_CASE("queue drain: the passive floor resets on a period change")
+{
+	comp_queue_drain d;
+	comp_queue_drain_reset(&d);
+	const uint64_t now = 10 * S;
+	uint64_t seq = 1;
+	for (int i = 0; i < 6; i++) {
+		comp_queue_drain_on_residual(&d, seq++, periods(1.5, P90), P90, now);
+	}
+	REQUIRE(d.floor_periods == Catch::Approx(1.5).margin(0.001));
+	comp_queue_drain_on_period_change(&d, P90, P60, now);
+	CHECK(d.floor_periods == 0.0);
+	CHECK(comp_queue_drain_threshold(&d) == COMP_QD_DEFAULT_THRESHOLD);
+	// Half a block from before the change does not combine with the new rate.
+	CHECK(d.prev_blk_min_ns == 0);
+	CHECK(d.blk_n == 0);
+}
+
+TEST_CASE("queue drain: a backlog a failed probe learned is unlocked by a later lower level")
+{
+	// The 90 Hz device case: drain at 2.56, "not queue — floor 2.51".
+	comp_queue_drain d;
+	comp_queue_drain_reset(&d);
+	uint64_t now = 10 * S;
+	uint64_t seq = 1;
+	for (int i = 0; i < 3; i++) {
+		comp_queue_drain_on_residual(&d, seq++, periods(2.56, P90), P90, now);
+	}
+	REQUIRE(comp_queue_drain_take(&d, seq, now, nullptr));
+	REQUIRE(settle3(&d, seq, periods(2.51, P90), periods(2.51, P90), periods(2.51, P90), now, P90) ==
+	        COMP_QD_VERDICT_NOT_QUEUE);
+	REQUIRE(d.floor_probed);
+	REQUIRE(comp_queue_drain_threshold(&d) == Catch::Approx(3.26).margin(0.01));
+
+	// Later the pipeline holds 1.5 periods (the backlog cleared some other way).
+	now += COMP_QD_BACKOFF_BASE_NS + 1;
+	for (int i = 0; i < 6; i++) {
+		comp_queue_drain_on_residual(&d, seq++, periods(1.5, P90), P90, now);
+	}
+	CHECK(d.floor_periods == Catch::Approx(1.5).margin(0.001));
+	CHECK_FALSE(d.floor_probed);
+	// A backlog at 2.5 periods is visible again.
+	for (int i = 0; i < 3; i++) {
+		comp_queue_drain_on_residual(&d, seq++, periods(2.5, P90), P90, now);
+	}
+	CHECK(d.pending);
+	CHECK(d.pending_reason == COMP_QD_REASON_RESIDUAL);
+}
+
+TEST_CASE("queue drain: a passive floor learned on a full queue still lets it drain")
+{
+	// Steady 4.8 periods from the first sample (the queue filled before the
+	// rate was known): the passive floor is 4.8, but its threshold is capped
+	// at the default, so the queue is still drained.
+	sim s;
+	s.floor = 1.8;
+	s.queued = 3;
+	s.run_for(5 * S);
+	CHECK(s.queued == 0);
+	CHECK(s.d.floor_periods == Catch::Approx(1.8).margin(0.01));
 }

@@ -28,9 +28,30 @@
  *  - RATE_DROP: the period got more than 20 % longer. The fill above is
  *    certain to have happened, so no evidence is waited for.
  *  - RESIDUAL: the measured weave->scanout residual sat above a threshold for
- *    @ref COMP_QD_TRIGGER_SAMPLES consecutive samples. The threshold is the
- *    learned floor + @ref COMP_QD_FLOOR_MARGIN, or
+ *    @ref COMP_QD_TRIGGER_SAMPLES consecutive samples (their min above it).
+ *    The threshold is the floor + @ref COMP_QD_FLOOR_MARGIN, or
  *    @ref COMP_QD_DEFAULT_THRESHOLD periods while no floor is known.
+ *
+ * ## The floor
+ *
+ * A one-frame backlog sits ~1 period above the pipeline floor — 2.15
+ * periods on a 1.15-period floor at 60 Hz — under any absolute threshold, so
+ * the floor is learned PASSIVELY (#2629, device round 2): per refresh period,
+ * the lowest level the residual has held. A level is the min of a block of
+ * @ref COMP_QD_TRIGGER_SAMPLES consecutive samples — the same statistic the
+ * trigger uses, so jitter affects both alike — and it only lowers the floor
+ * once two consecutive, DISJOINT blocks both reached it (the floor candidate
+ * is the higher of the two block minima). A single lucky low sample sits in
+ * one block only and cannot pin the floor; nor can anything under
+ * @ref COMP_QD_MIN_PLAUSIBLE_FLOOR periods.
+ *
+ * A passive floor may have been learned with the queue already full (a rate
+ * drop fills it before the first sample at the new rate), so while the floor
+ * is passive the threshold never exceeds the default — a deep queue still
+ * drains. A NOT_QUEUE verdict PROBES the floor: it is raised to the
+ * post-drain level and the threshold may then sit above the default. A later
+ * sustained lower level lowers it again, so a backlog a failed probe learned
+ * cannot stay locked in. The floor resets on a period change.
  *  - ACQUIRE_BLOCK: acquire blocked for more than a quarter period
  *    @ref COMP_QD_TRIGGER_SAMPLES times in a row. On a FIFO swapchain that
  *    means the queue is full. A GPU-bound app's acquire blocks naturally, so
@@ -80,6 +101,8 @@ extern "C" {
 #define COMP_QD_RATE_DROP_RATIO 1.2
 //! Residual threshold in periods while no floor is known.
 #define COMP_QD_DEFAULT_THRESHOLD 2.5
+//! A passive floor candidate under this many periods is a feed error.
+#define COMP_QD_MIN_PLAUSIBLE_FLOOR 0.5
 //! Threshold above a learned floor, in periods.
 #define COMP_QD_FLOOR_MARGIN 0.75
 //! A drain worked when the residual fell by at least this many periods.
@@ -133,8 +156,14 @@ struct comp_queue_drain
 	bool pending;
 	enum comp_queue_drain_reason pending_reason;
 
-	//! Learned pipeline floor in periods; 0 = unknown.
+	//! Pipeline floor in periods (passive or probed); 0 = unknown.
 	double floor_periods;
+	//! The floor came from a NOT_QUEUE probe (may then exceed the default).
+	bool floor_probed;
+	//! Passive floor: the current block of samples and the previous block.
+	uint32_t blk_n;
+	uint64_t blk_min_ns;
+	uint64_t prev_blk_min_ns; //!< 0 = no previous block
 
 	//! Samples for presents before this sequence predate the last drain.
 	uint64_t settle_seq;
@@ -191,7 +220,12 @@ comp_queue_drain_reset(struct comp_queue_drain *d)
 static inline double
 comp_queue_drain_threshold(const struct comp_queue_drain *d)
 {
-	return d->floor_periods > 0.0 ? d->floor_periods + COMP_QD_FLOOR_MARGIN : COMP_QD_DEFAULT_THRESHOLD;
+	if (d->floor_periods <= 0.0) {
+		return COMP_QD_DEFAULT_THRESHOLD;
+	}
+	const double t = d->floor_periods + COMP_QD_FLOOR_MARGIN;
+	// A passive floor may be a full queue's level: never above the default.
+	return (!d->floor_probed && t > COMP_QD_DEFAULT_THRESHOLD) ? COMP_QD_DEFAULT_THRESHOLD : t;
 }
 
 static inline void
@@ -265,6 +299,10 @@ comp_queue_drain_on_period_change(struct comp_queue_drain *d, uint64_t old_ns, u
 	}
 	(void)now_ns;
 	d->floor_periods = 0.0;
+	d->floor_probed = false;
+	d->blk_n = 0;
+	d->blk_min_ns = 0;
+	d->prev_blk_min_ns = 0;
 	d->state = COMP_QD_IDLE; // a pending verdict would compare across rates
 	d->backoff_ns = COMP_QD_BACKOFF_BASE_NS;
 	d->backoff_until_ns = 0;
@@ -306,6 +344,24 @@ comp_queue_drain_on_residual(
 	}
 	const double periods = (double)residual_ns / (double)period_ns;
 
+	// Passive floor: disjoint blocks of COMP_QD_TRIGGER_SAMPLES samples.
+	if (d->blk_n == 0 || residual_ns < d->blk_min_ns) {
+		d->blk_min_ns = residual_ns;
+	}
+	if (++d->blk_n >= COMP_QD_TRIGGER_SAMPLES) {
+		if (d->prev_blk_min_ns != 0) {
+			const uint64_t cand = d->blk_min_ns > d->prev_blk_min_ns ? d->blk_min_ns : d->prev_blk_min_ns;
+			const double cand_periods = (double)cand / (double)period_ns;
+			if (cand_periods >= COMP_QD_MIN_PLAUSIBLE_FLOOR &&
+			    (d->floor_periods <= 0.0 || cand_periods < d->floor_periods)) {
+				d->floor_periods = cand_periods;
+				d->floor_probed = false;
+			}
+		}
+		d->prev_blk_min_ns = d->blk_min_ns;
+		d->blk_n = 0;
+	}
+
 	if (d->state == COMP_QD_WAIT_RESULT) {
 		if (d->post_n == 0 || residual_ns < d->post_min_ns) {
 			d->post_min_ns = residual_ns;
@@ -331,6 +387,7 @@ comp_queue_drain_on_residual(
 			}
 			// What we were at is the pipeline's floor, not queue.
 			d->floor_periods = post_periods;
+			d->floor_probed = true;
 			return COMP_QD_VERDICT_NOT_QUEUE;
 		}
 		d->state = COMP_QD_IDLE;

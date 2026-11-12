@@ -224,28 +224,44 @@ image count. The period is re-read every ~500 ms; when the panel drops (90 → 6
 the faster cadence until then and fills the queue, and producing at the display rate never empties
 it again (measured on a phone-class device: weave→present ~2.2 periods at 90 Hz, ~4 at 60 Hz). The
 drain (`util/comp_queue_drain.h`) sleeps **one extra period** before one weave when the queue is
-provably deep — a longer period was just measured, the #206 residual sat above threshold (learned
-floor + 0.75 periods, 2.5 while none is known) for 3 samples, or acquire blocked > ¼ period 3 times
+provably deep — a longer period was just measured, the #206 residual sat above threshold (floor +
+0.75 periods, 2.5 while none is known) for 3 samples, or acquire blocked > ¼ period 3 times
 in a row (with a floor known, only together with a residual above it) — then judges it on the min of
 the first 3 residuals of presents at or after the drained one against the min of the last 3 before it
 (minima, because queue depth is a floor effect and the residual jitters ~6-7 ms, about the bar
 itself). Min down ≥ ½ period: it was queue, and the next drain
-may follow at once (one slot per settle). Otherwise the residual is the pipeline's floor: learned,
-backoff 5 s doubling to 60 s; the floor is forgotten on any period change. Logs are events only:
+may follow at once (one slot per settle). Otherwise the residual is the pipeline's floor: the floor
+is raised to it (probed), backoff 5 s doubling to 60 s. **The floor is also learned passively**
+(device round 2): a one-frame backlog sits ~1 period above the floor (36 ms on a 19 ms floor at
+60 Hz, 2.15 periods) — under any absolute threshold — so the floor is the lowest level the residual
+has held this refresh period, a level being the min of a block of 3 samples that two consecutive,
+disjoint blocks both reached (one lucky low sample cannot set it; nothing under 0.5 period counts).
+While the floor is only passive the threshold never exceeds 2.5 periods, because a passive floor
+may have been learned on an already-full queue; a later sustained lower level lowers a probed floor
+again. The floor resets on any period change. Logs are events only:
 `#2629: queue drain: skipping one vblank (…)`, `#2629: queue drain: drained — …`,
 `#2629: queue drain: not queue — … floor learned …`. Kill switch `setprop debug.dxr.queue_drain 0`
 (and off whenever late weave is). A no-op drain whose post-drain min is above 3.5 periods learns
 nothing (`not drained (N periods is not a plausible floor; not learned)`; measured floors are
 1.4–3.4) and just backs off.
 
-**One weave per vblank (#2629, `util/comp_grid_rate_cap.h`).** On device the drain worked at 90 Hz
+**One frame per vblank (#2629, `util/comp_grid_rate_cap.h`).** On device the drain worked at 90 Hz
 but the queue refilled, and at 60 Hz it could not drain at all: the tier slept only while the next
 vblank was further than its budget, the budget (a high-water of the weave cost) included a blocking
 acquire, so on a full queue the budget reached a period, the tier stopped pacing and the producer
-free-ran into the queue. Now each weave aims at the first vblank it can make (`now + budget`),
-pushed to the next one when the previous weave already aimed there (sleep capped at 2 periods), and
-the acquire's duration is subtracted from the weave cost. App frames and repaints share the cap; a
-producer already slower than the panel (a 60 Hz repaint on a 90 Hz panel) never meets the push.
+free-ran into the queue. With the cap the tier books, at every present, the vblank that frame will
+be SHOWN at (FIFO, from where its present actually returned), and each weave: takes the usual
+late-weave aim when the next vblank is reachable; **weaves at once** when it is not (throughput
+first — round 1 slept toward the vblank after and halved a 90 Hz app to 65.7 weaves/s); and is
+pushed past the booked vblank only when, at its budget, it would land on it (that sleep may reach 2
+periods: the producer is ahead of the panel there, and a shorter cap left it weaving early forever
+after one overrun). Booking from the actual present return is what keeps an overrun from colliding
+with the next weave — the media player at 30 fps with repaint filling every other vblank regained a
+queued frame ~7 s in on round 1. The acquire's duration, and on a repaint (runtime-owned queue) the
+host wait on the acquired image, are subtracted from the weave cost. App frames and repaints share
+the cap; a producer slower than the panel never meets the push. With `DXR_WEAVE_CADENCE_TRACE=1` /
+`debug.dxr.weave_cadence_trace 1` the 5 s `#206` line carries `cap aimed N now N pushed N skipped N,
+budget …, acquire …, repaint wait … | drain floor … (passive|probed), threshold …, drains N`.
 Kill switch `setprop debug.dxr.grid_rate_cap 0` restores the old aim **and** the old weave cost
 exactly, so `queue_drain 0` + `grid_rate_cap 0` pace like v2.66.15 (only the reported #206
 residual differs). Also from #2629: the published #206 horizon on Android starts
