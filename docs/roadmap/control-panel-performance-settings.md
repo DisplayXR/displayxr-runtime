@@ -574,6 +574,16 @@ the weave as per-eye crosstalk. Screenshots cannot see it — it is HWC-level
 blending. The shipping fix is a trusted-overlay or per-package exemption, filed
 as `docs/specs/vendor/oem-android-platform-requirements.md` §R6.
 
+#### Android vk_native grid late-weave properties (#2629) — sysprop-only
+
+Read once per process in `compositor/vk_native/comp_vk_native_target.cpp`, and inert
+whenever late weave is off (`DXR_LATE_WEAVE` / `debug.dxr.late_weave` = 0).
+
+| Property | Read site | Grammar | Default | Tier | What it does |
+|---|---|---|---|---|---|
+| `debug.dxr.queue_drain` | `comp_vk_native_target.cpp` (`dxr_queue_drain_enabled`) | `0` = off; anything else (incl. unset) = on | **on** | 4 | Kill switch for the grid tier's FIFO queue drain (`util/comp_queue_drain.h`): skip one vblank when the present queue is provably deep (a slower refresh period, the #206 residual above the learned floor, or acquire blocking), verify the residual fell, learn the floor and back off when it did not. `0` logs `#2629: queue drain OFF` once. Diagnostic / rollback only |
+| `debug.dxr.vk_min_images` | `comp_vk_native_target.cpp` (`dxr_vk_min_images_enabled`) | `1` = on; anything else off | off | 4 | A/B knob: the target swapchain requests `minImageCount` instead of `minImageCount + 1` — one fewer FIFO slot to fill. Off because the `+1` is acquire throughput and its cost on a GPU-bound app is unmeasured. The choice is in the `#2068: VK native swapchain — N images …, requested …` line |
+
 ### Input (ADR-034 / ADR-054) — runtime policy, registry / file gates, not env vars
 
 Class gates the **runtime** reads about the input class (never a component

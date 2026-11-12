@@ -49,6 +49,7 @@ static std::atomic<uint32_t> g_vk_repaint_presents_since_app{0};
 // Windows-only latency harness cannot measure.
 #include "util/comp_vblank_grid.h"
 #include "util/comp_residual_window.h"
+#include "util/comp_queue_drain.h"
 #include "util/comp_frame_witness.h"
 static comp_frame_witness g_frame_witness_vk{"vk"};
 
@@ -248,6 +249,46 @@ dxr_surface_lost_latch_enabled(void)
 		cached = (__system_property_get("debug.dxr.surface_lost_latch", prop) > 0 && prop[0] == '0') ? 0 : 1;
 	}
 	return cached != 0;
+}
+
+/*!
+ * #2629: the grid tier's FIFO queue drain (comp_queue_drain.h) — skip one
+ * vblank when the present queue is provably deep. Default ON wherever the
+ * grid late-weave tier runs; `setprop debug.dxr.queue_drain 0` disables it.
+ * Late weave off ⟹ drain off (it lives inside that tier). Read once.
+ */
+static bool
+dxr_queue_drain_enabled(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		char prop[PROP_VALUE_MAX] = {0};
+		cached = (__system_property_get("debug.dxr.queue_drain", prop) > 0 && prop[0] == '0') ? 0 : 1;
+		if (cached == 0) {
+			U_LOG_W(
+			    "#2629: queue drain OFF (debug.dxr.queue_drain=0) — a FIFO queue filled by a "
+			    "refresh-rate drop stays full");
+		}
+	}
+	return cached != 0 && dxr_late_weave_enabled();
+}
+
+/*!
+ * #2629 A/B knob: `setprop debug.dxr.vk_min_images 1` makes swapchain
+ * creation request the surface's minImageCount instead of +1 while late weave
+ * is on — one fewer FIFO slot an unpaced producer can fill. Default OFF: the
+ * +1 exists for acquire throughput, and on a GPU-bound app that cost is
+ * unmeasured. Read once.
+ */
+static bool
+dxr_vk_min_images_enabled(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		char prop[PROP_VALUE_MAX] = {0};
+		cached = (__system_property_get("debug.dxr.vk_min_images", prop) > 0 && prop[0] == '1') ? 1 : 0;
+	}
+	return cached != 0 && dxr_late_weave_enabled();
 }
 #endif
 
@@ -664,6 +705,21 @@ struct comp_vk_native_target
 	//! trace reports a distribution rather than the last sample.
 	struct comp_residual_window residual_win;
 
+#ifdef XRT_OS_ANDROID
+	/*!
+	 * #2629: when the swapchain image for this weave was acquired — the start
+	 * of the published #206 horizon (post-acquire weave start -> actual
+	 * present). weave_start_ns stays pre-acquire: it budgets the aim sleep,
+	 * and that budget must keep covering a blocking acquire. 0 = no acquire
+	 * ran for this frame (a held image), fall back to weave_start_ns.
+	 */
+	uint64_t residual_start_ns;
+	//! #2629: the grid tier's FIFO queue drain (comp_queue_drain.h).
+	struct comp_queue_drain qdrain;
+	//! The swapchain's real image count has been logged (queue depth).
+	bool swapchain_depth_logged;
+#endif
+
 #ifdef XRT_OS_LINUX_DESKTOP
 	/*!
 	 * #902 desktop Linux: the window system's presentation feedback, the grid
@@ -998,6 +1054,19 @@ create_swapchain(struct comp_vk_native_target *target)
 		image_count = (caps.minImageCount > want) ? caps.minImageCount : want;
 	}
 #endif
+#ifdef XRT_OS_ANDROID
+	// #2629 A/B (debug.dxr.vk_min_images=1, default off): request the floor,
+	// one fewer FIFO slot for the grid tier to fill. Not the default — the +1
+	// is acquire throughput, unmeasured on GPU-bound apps.
+	const bool min_images = dxr_vk_min_images_enabled();
+	if (min_images) {
+		image_count = caps.minImageCount;
+	}
+	// A new swapchain starts with an empty queue: nothing to drain, nothing
+	// learned about this one's floor.
+	comp_queue_drain_reset(&target->qdrain);
+	target->residual_start_ns = 0;
+#endif
 	if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
 		image_count = caps.maxImageCount;
 	}
@@ -1166,15 +1235,22 @@ create_swapchain(struct comp_vk_native_target *target)
 		U_LOG_E("Failed to get swapchain images: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
-#ifdef XRT_OS_LINUX_DESKTOP
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_ANDROID)
 	// #2068: the FIFO queue an unpaced producer can fill is this deep — the
 	// number the weave->scanout residual is read against. Once per target.
 	if (!target->swapchain_depth_logged) {
 		target->swapchain_depth_logged = true;
-		U_LOG_W("#2068: VK native swapchain — %u images (surface minImageCount %u, maxImageCount %u), "
-		        "FIFO, %ux%u",
-		        target->image_count, caps.minImageCount, caps.maxImageCount, target->width,
-		        target->height);
+		const char *requested = "";
+#ifdef XRT_OS_ANDROID
+		// #2629: say which request the debug.dxr.vk_min_images A/B made.
+		requested = min_images ? ", requested minImageCount (debug.dxr.vk_min_images=1)"
+		                       : ", requested minImageCount+1";
+#endif
+		U_LOG_W(
+		    "#2068: VK native swapchain — %u images (surface minImageCount %u, maxImageCount %u), "
+		    "FIFO, %ux%u%s",
+		    target->image_count, caps.minImageCount, caps.maxImageCount, target->width, target->height,
+		    requested);
 	}
 #endif
 
@@ -2912,6 +2988,45 @@ target_present_wait_fn(struct comp_vk_native_target *target)
 }
 #endif
 
+#ifdef XRT_OS_ANDROID
+/*!
+ * #2629: feed one #206 residual sample to the queue drain and log its
+ * verdict. Event lines only: a verdict follows a drain, and drains are
+ * bounded by the machine's backoff and run cap.
+ */
+static void
+target_queue_drain_on_residual(struct comp_vk_native_target *target, uint32_t present_id, uint64_t r, uint64_t now_ns)
+{
+	const uint64_t period_ns = target->vblank_grid.period_ns;
+	const uint64_t pre = target->qdrain.pre_drain_residual_ns;
+	const enum comp_queue_drain_verdict v =
+	    comp_queue_drain_on_residual(&target->qdrain, present_id, r, period_ns, now_ns);
+	const double per = period_ns != 0 ? (double)r / (double)period_ns : 0.0;
+	switch (v) {
+	case COMP_QD_VERDICT_DRAINED:
+		U_LOG_W("#2629: queue drain: drained — now %.1f ms = %.2f periods (was %.1f ms)", r / 1e6, per,
+		        pre / 1e6);
+		break;
+	case COMP_QD_VERDICT_LENIENT:
+		U_LOG_W("#2629: queue drain: drained (no pre-drain residual to compare) — now %.1f ms = %.2f periods",
+		        r / 1e6, per);
+		break;
+	case COMP_QD_VERDICT_NOT_QUEUE:
+		U_LOG_W(
+		    "#2629: queue drain: not queue — %.1f ms (was %.1f ms): floor learned %.2f periods, backoff %.0f s",
+		    r / 1e6, pre / 1e6, target->qdrain.floor_periods, target->qdrain.applied_backoff_ns / 1e9);
+		break;
+	case COMP_QD_VERDICT_CAPPED:
+		U_LOG_W(
+		    "#2629: queue drain: %d drains in a row without the residual settling (now %.1f ms = %.2f "
+		    "periods) — backoff %.0f s",
+		    COMP_QD_MAX_SUCCESS_RUN, r / 1e6, per, target->qdrain.applied_backoff_ns / 1e9);
+		break;
+	default: break;
+	}
+}
+#endif
+
 static void
 target_feed_vblank_grid(struct comp_vk_native_target *target)
 {
@@ -2974,6 +3089,14 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 					U_LOG_W("#902: display-timing grid — refresh %.3f ms (%.2f Hz)%s",
 					        rc.refreshDuration / 1e6, 1e9 / (double)rc.refreshDuration,
 					        prev == 0 ? " [initial]" : " [CHANGED]");
+#ifdef XRT_OS_ANDROID
+					// #2629: a slower panel means the tier wove at the old,
+					// faster cadence until now and filled the FIFO queue.
+					if (prev != 0 && dxr_queue_drain_enabled()) {
+						comp_queue_drain_on_period_change(
+						    &target->qdrain, prev, target->vblank_grid.period_ns, probe_now_ns);
+					}
+#endif
 				}
 			} else {
 				U_LOG_W("#902: display-timing reported an implausible refresh "
@@ -3084,6 +3207,11 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 		target->residual_ns = r;
 		target->residual_samples++;
 		comp_residual_window_add(&target->residual_win, r);
+#ifdef XRT_OS_ANDROID
+		if (dxr_queue_drain_enabled()) {
+			target_queue_drain_on_residual(target, timings[i].presentID, r, now_ns);
+		}
+#endif
 	}
 
 	target_log_residual(target);
@@ -3823,6 +3951,34 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 				    "weave budget %.3f ms (no present_wait on this device; grid source: %s)",
 				    period_ns / 1e6, budget_ns / 1e6, grid_source);
 			}
+#ifdef XRT_OS_ANDROID
+			/*
+			 * #2629 QUEUE DRAIN. Weaving at the panel rate can never shrink
+			 * the FIFO queue (a rate drop fills it, and nothing here waits on
+			 * a previous present), so when the drain machine says the queue
+			 * is deep, sleep one extra period: the display consumes one more
+			 * buffer than we produce. The upcoming counted present carries
+			 * display_timing_present_id + 1 — the sequence its verdict sample
+			 * will be tagged with.
+			 */
+			if (dxr_queue_drain_enabled()) {
+				const uint64_t drain_now_ns = os_monotonic_get_ns();
+				enum comp_queue_drain_reason reason = COMP_QD_REASON_NONE;
+				const uint64_t next_seq =
+				    (uint32_t)(target->display_timing_present_id + 1); // presentID is 32-bit
+				if (comp_queue_drain_take(&target->qdrain, next_seq, target->residual_ns, drain_now_ns,
+				                          &reason)) {
+					U_LOG_W(
+					    "#2629: queue drain: skipping one vblank (%s, residual %.1f ms = %.2f "
+					    "periods, "
+					    "threshold %.2f)",
+					    comp_queue_drain_reason_str(reason), target->residual_ns / 1e6,
+					    (double)target->residual_ns / (double)period_ns,
+					    comp_queue_drain_threshold(&target->qdrain));
+					os_nanosleep((int64_t)period_ns);
+				}
+			}
+#endif
 		}
 		target->weave_start_ns = os_monotonic_get_ns();
 	}
@@ -4282,6 +4438,11 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 		target->held_valid = false;
 		if (target->held_generation == target->generation && target->swapchain != VK_NULL_HANDLE &&
 		    target->held_index < target->image_count) {
+#ifdef XRT_OS_ANDROID
+			// #2629: no acquire runs for a held image; its residual starts
+			// at weave_start_ns, not at the dropped fill's old acquire.
+			target->residual_start_ns = 0;
+#endif
 			target->current_index = target->held_index;
 			*out_index = target->current_index;
 			return XRT_SUCCESS;
@@ -4290,8 +4451,15 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 
 	// Use the semaphore for acquire, then do a dummy submit that waits on it
 	// to ensure the image is actually available before the compositor renders.
+#ifdef XRT_OS_ANDROID
+	target->residual_start_ns = 0; // set again once the acquire succeeds
+	uint64_t acq_begin_ns = os_monotonic_get_ns();
+#endif
 	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain, dxr_acquire_timeout_ns(), acq_sem,
 	                                         VK_NULL_HANDLE, &target->current_index);
+#ifdef XRT_OS_ANDROID
+	uint64_t acq_end_ns = os_monotonic_get_ns();
+#endif
 	target_note_swap_result(target, res, TARGET_SWAP_ACQUIRE);
 	if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
 		// Swapchain invalidated (window resize, minimize, etc.) — recreate and retry
@@ -4375,8 +4543,14 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 		// as a failure would strand that signal (#2095 review) — the next
 		// frame presents it and the swapchain is recreated on the following
 		// acquire if it is still suboptimal.
+#ifdef XRT_OS_ANDROID
+		acq_begin_ns = os_monotonic_get_ns(); // the recreate is not an acquire block
+#endif
 		res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain, dxr_acquire_timeout_ns(), acq_sem,
 		                                VK_NULL_HANDLE, &target->current_index);
+#ifdef XRT_OS_ANDROID
+		acq_end_ns = os_monotonic_get_ns();
+#endif
 		target_note_swap_result(target, res, TARGET_SWAP_ACQUIRE_RETRY);
 		if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
 			U_LOG_E("Failed to acquire after swapchain recreation: %d", res);
@@ -4439,6 +4613,17 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 		U_LOG_E("Failed to acquire swapchain image: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
+
+#ifdef XRT_OS_ANDROID
+	// #2629 Part 2: the #206 horizon starts HERE, after the acquire — a full
+	// FIFO queue blocks the acquire, and the eye sample is taken after it.
+	target->residual_start_ns = acq_end_ns;
+	// #2629: a blocking acquire on a FIFO swapchain means the queue is full.
+	if (dxr_queue_drain_enabled()) {
+		comp_queue_drain_on_acquire_block(&target->qdrain, acq_end_ns - acq_begin_ns,
+		                                  target->vblank_grid.period_ns, acq_end_ns);
+	}
+#endif
 
 	if (acquire_sem != VK_NULL_HANDLE) {
 		// #2095 / ADR-055: the caller's semaphore now carries one pending
@@ -4624,6 +4809,15 @@ comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
 		const uint32_t slot = present_time.presentID % 16;
 		target->residual_ring[slot].id = present_time.presentID;
 		target->residual_ring[slot].weave_start_ns = target->weave_start_ns;
+#ifdef XRT_OS_ANDROID
+		// #2629: on Android the published #206 horizon is post-acquire weave
+		// start -> actual present (a blocking acquire is not horizon the eye
+		// sample has to cover). weave_start_ns when no acquire ran (held image).
+		if (target->residual_start_ns != 0) {
+			target->residual_ring[slot].weave_start_ns = target->residual_start_ns;
+		}
+		target->residual_start_ns = 0;
+#endif
 	}
 
 #ifdef XRT_OS_LINUX_DESKTOP

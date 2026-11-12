@@ -217,6 +217,27 @@ reach 4; converging dwell) but cannot remove it while slip escalation exists; wh
 slip escalation should be **off by default** (keeping only the starvation backoff for genuinely
 serialized pipelines) is the open product decision, recorded on the issue.
 
+**Android (Vulkan, grid tier) — FIFO queue drain (#2629).** Android has no `VK_KHR_present_wait`,
+so its late weave is the grid tier on `VK_GOOGLE_display_timing`: it sleeps toward the next
+predicted vblank but never waits on a previous present, so nothing bounds the FIFO queue except the
+image count. The period is re-read every ~500 ms; when the panel drops (90 → 60 Hz) the tier keeps
+the faster cadence until then and fills the queue, and producing at the display rate never empties
+it again (measured on a phone-class device: weave→present ~2.2 periods at 90 Hz, ~4 at 60 Hz). The
+drain (`util/comp_queue_drain.h`) sleeps **one extra period** before one weave when the queue is
+provably deep — a longer period was just measured, the #206 residual sat above threshold (learned
+floor + 0.75 periods, 2.5 while none is known) for 3 samples, or acquire blocked > ¼ period 3 times
+in a row (with a floor known, only together with a residual above it) — then judges it on the first
+residual of a present at or after the drained one. Down ≥ ½ period: it was queue, and the next drain
+may follow at once (one slot per settle). Otherwise the residual is the pipeline's floor: learned,
+backoff 5 s doubling to 60 s; the floor is forgotten on any period change. Logs are events only:
+`#2629: queue drain: skipping one vblank (…)`, `#2629: queue drain: drained — …`,
+`#2629: queue drain: not queue — … floor learned …`. Kill switch `setprop debug.dxr.queue_drain 0`
+(and off whenever late weave is). Also from #2629: the published #206 horizon on Android starts
+**after** `vkAcquireNextImageKHR` returns (post-acquire weave start → actual present), since a
+blocking acquire precedes the eye sample; and `setprop debug.dxr.vk_min_images 1` (default off,
+an A/B knob) requests `minImageCount` instead of `+1` under late weave, visible in the
+`#2068: VK native swapchain — N images …, requested …` line.
+
 ### `DXR_WEAVE_REPAINT` — **default ON** (#868)
 
 Re-weaves the last atlas at the display rate while the app is between frames, **with a fresh eye
