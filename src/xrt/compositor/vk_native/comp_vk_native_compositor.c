@@ -186,6 +186,14 @@ DEBUG_GET_ONCE_BOOL_OPTION(local2d_clip, "DXR_L2D_CLIP", true)
 // set_transparency_active; DXR_LAZY_TRANSPARENCY=0 keeps it active for the
 // whole session (the pre-slot behaviour) for A/B measurement.
 DEBUG_GET_ONCE_BOOL_OPTION(lazy_transparency, "DXR_LAZY_TRANSPARENCY", true)
+// D3D11 hub DIRECT route: do not host-wait the compose submit in layer_commit
+// (the hub already GPU-waits the deposit timeline); retire it one frame later
+// instead. OPT-IN for now (DXR_VK_HUB_DEFER_COMPOSE_WAIT=1) until it has run on
+// Windows hardware; unset or 0 keeps the per-frame host wait.
+// Windows-only in effect (the hub is). See comp_vk_native_renderer_set_defer_wait.
+#ifdef XRT_OS_WINDOWS
+DEBUG_GET_ONCE_BOOL_OPTION(vk_hub_defer_compose_wait, "DXR_VK_HUB_DEFER_COMPOSE_WAIT", false)
+#endif
 
 // Frame pipelining (#837): per-stage CPU timing of the windowed layer_commit
 // path — where does the non-GPU-busy frame time go? Accumulates per stage and
@@ -447,6 +455,14 @@ struct comp_vk_native_compositor
 	 * NULL while the split is active.
 	 */
 	const char *split_off_reason;
+
+	/*!
+	 * The compose-wait mode last logged for the hub route (0 = never logged,
+	 * else 1 + enum vk_hub_compose_wait). One WARN when the split is first
+	 * driven, then only on a change (e.g. the hub leaving DIRECT) — never per
+	 * frame.
+	 */
+	int hub_compose_wait_logged;
 
 	/*!
 	 * Kept so the RETIRE can build the Vulkan weaver the split skipped, and
@@ -7798,6 +7814,12 @@ comp_vk_native_compositor_wait_swapchain_read(struct comp_vk_native_compositor *
 	// #2356: the commit-time window-space stamp (not part of the #2095 ring).
 	vk_ws_stamp_wait_image(c, xsc, index);
 
+	// The hub route's deferred compose (no-op unless one reads this image and
+	// has not retired).
+	if (c->renderer != NULL) {
+		comp_vk_native_renderer_wait_image_read(c->renderer, xsc, index);
+	}
+
 	// `created` is set once, under c->mutex, by the first chained frame; the
 	// app thread reads it bare. Benign: an image can only have been tagged
 	// by a chained frame, and that frame's commit happens-before the app's
@@ -12394,6 +12416,69 @@ comp_vk_native_compositor_get_cursor_measure_result(struct xrt_compositor *xc, s
 	return out->valid;
 }
 
+/*
+ * ── Deferred compose wait on the D3D11 hub DIRECT route ─────────────────────
+ *
+ * comp_vk_native_renderer_draw host-waited its compose submit every frame
+ * (#837, #1917). The app queue is in order, so that wait also covered the
+ * app's own GPU work for the frame — on an 8K single-GPU station, ~5.5 ms of
+ * xrEndFrame spent before the weave. On the hub's DIRECT ingress nothing in the
+ * frame path needs it: the hub GPU-waits the deposit timeline value the
+ * compose (and every later pass) signals (comp_hub_d3d11.cpp, "THE ordering
+ * edge"), and the compose GPU-waits the hub's slot release. What the host wait
+ * still gave — idle command buffer / descriptor pool / compose target /
+ * framebuffers for the next frame, and app images free once
+ * xrWaitSwapchainImage returns — is kept by the renderer's deferred mode
+ * (comp_vk_native_renderer_set_defer_wait).
+ *
+ * Gated to exactly that route: a split, DIRECT, a fence-mode deposit (a
+ * timeline AND the hub's consumer fence imported — the keyed-mutex ring's
+ * slot reuse relies on the host wait, see vk_split_cmd_ring_take), no
+ * client-presented shared texture. Everything else keeps the host wait.
+ */
+enum vk_hub_compose_wait
+{
+	VK_HUB_COMPOSE_WAIT_DEFERRED = 0,
+	VK_HUB_COMPOSE_WAIT_HOST_KILLSWITCH,
+	VK_HUB_COMPOSE_WAIT_HOST_NOT_DIRECT,
+	VK_HUB_COMPOSE_WAIT_HOST_NO_FENCE,
+};
+
+static bool
+vk_hub_compose_wait_decide(struct comp_vk_native_compositor *c)
+{
+#ifdef XRT_OS_WINDOWS
+	if (c->split == NULL || c->renderer == NULL || c->has_shared_texture) {
+		return false;
+	}
+	enum vk_hub_compose_wait m = VK_HUB_COMPOSE_WAIT_DEFERRED;
+	struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
+	if (!debug_get_bool_option_vk_hub_defer_compose_wait()) {
+		m = VK_HUB_COMPOSE_WAIT_HOST_KILLSWITCH;
+	} else if (!comp_hub_d3d11_is_direct(c->split)) {
+		m = VK_HUB_COMPOSE_WAIT_HOST_NOT_DIRECT;
+	} else if (dep == NULL || comp_vk_deposit_get_timeline(dep) == VK_NULL_HANDLE ||
+	           comp_vk_deposit_get_hub_timeline(dep) == VK_NULL_HANDLE) {
+		m = VK_HUB_COMPOSE_WAIT_HOST_NO_FENCE;
+	}
+	if (c->hub_compose_wait_logged != 1 + (int)m) {
+		c->hub_compose_wait_logged = 1 + (int)m;
+		static const char *const why[] = {
+		    "DEFERRED (hub DIRECT ingress, fence-mode deposit; the next frame retires it, "
+		    "xrWaitSwapchainImage waits it per image)",
+		    "host wait per frame (default; DXR_VK_HUB_DEFER_COMPOSE_WAIT=1 defers it)",
+		    "host wait per frame (hub ingress is not DIRECT)",
+		    "host wait per frame (deposit has no timeline / hub consumer fence)",
+		};
+		U_LOG_W("VK hub: compose fence wait = %s", why[m]);
+	}
+	return m == VK_HUB_COMPOSE_WAIT_DEFERRED;
+#else
+	(void)c;
+	return false;
+#endif
+}
+
 static xrt_result_t
 vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
                                   xrt_graphics_sync_handle_t sync_handle,
@@ -12954,6 +13039,14 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 
 	// Render projection layers to atlas texture (skip if zero-copy)
 	xrt_result_t xret = XRT_SUCCESS;
+	// D3D11 hub DIRECT route: the compose submit is not host-waited (decided
+	// per frame; every other route keeps the wait). A frame that skips the
+	// draw (zero-copy) retires a deferred predecessor here instead, since the
+	// draw is where that normally happens and the passes below assume it.
+	comp_vk_native_renderer_set_defer_wait(c->renderer, !zero_copy && vk_hub_compose_wait_decide(c));
+	if (zero_copy) {
+		comp_vk_native_renderer_finish_deferred(c->renderer);
+	}
 	if (!zero_copy) {
 		if (cursor_draw.active) {
 			// Consumed by the draw below (drawn last in its compose pass,
@@ -13258,6 +13351,15 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		 * slot's recipe.
 		 */
 		vk_split_stage_planes(c, tgt_width, tgt_height);
+
+		/*
+		 * Deferred compose wait: the planes were this frame's LAST Vulkan
+		 * submit (compose, window-space, PQ, planes). Fence them all with one
+		 * empty submit, so the next frame retires the whole frame — not just
+		 * the compose — before it rewrites anything those passes used. No-op
+		 * when this frame's compose was host-waited.
+		 */
+		comp_vk_native_renderer_fence_frame(c->renderer);
 
 		/*
 		 * VK-1b-2 — the diagnostic HUD. Nothing crosses the bridge for it:
@@ -14628,11 +14730,18 @@ vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, con
 		return;
 	}
 
+	// Deferred compose wait: the outstanding frame's compose GPU-waits a slot
+	// release on the hub's consumer fence. Retire it while the hub (which
+	// queued that signal) is still alive, before the fence is unbound below.
+	if (c->renderer != NULL) {
+		comp_vk_native_renderer_finish_deferred(c->renderer);
+	}
 	comp_hub_d3d11_retire(&c->split, why, short_reason);
 	c->split_off_reason = short_reason;
 	// #2317 P2a: the hub (and the consumer fence it owned) is gone; nothing
 	// more is owed. Safe: every submit that waited on it has completed (the
-	// per-frame draw-fence wait), and the retire runs under c->mutex.
+	// per-frame draw-fence wait, or the deferred frame retired above), and the
+	// retire runs under c->mutex.
 	if (c->renderer != NULL) {
 		(void)comp_vk_deposit_bind_consumer_fence(comp_vk_native_renderer_get_deposit(c->renderer), NULL);
 	}
@@ -19427,6 +19536,8 @@ vk_split_cmd_ring_take(struct comp_vk_native_compositor *c,
 			// per-frame CPU wait (#837), so an entry submitted last frame
 			// has retired by the time this frame asks for it. If #837's
 			// wait is removed, this branch needs a real retirement test.
+			// (The hub route's deferred compose wait is gated OFF for
+			// fence-less deposits for exactly this reason.)
 			*next = (i + 1) % VK_SPLIT_PLANE_CMD_RING;
 			return (int32_t)i;
 		}

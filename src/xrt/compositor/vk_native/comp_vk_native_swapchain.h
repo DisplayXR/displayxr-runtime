@@ -164,6 +164,26 @@ void
 comp_vk_native_swapchain_note_stamp(struct xrt_swapchain *xsc, uint32_t index, uint64_t serial);
 
 /*!
+ * The serial of the last DEFERRED compose (hub DIRECT route,
+ * `DXR_VK_HUB_DEFER_COMPOSE_WAIT`) whose GPU work reads image @p index
+ * (0 = none). Call under the renderer's deferred-compose lock — see
+ * comp_vk_native_renderer_wait_image_read().
+ *
+ * @ingroup comp_vk_native
+ */
+uint64_t
+comp_vk_native_swapchain_get_compose_serial(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
+ * Record that deferred compose @p serial reads image @p index (monotone).
+ * Same lock rule.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_swapchain_note_compose(struct xrt_swapchain *xsc, uint32_t index, uint64_t serial);
+
+/*!
  * #1559: true when this swapchain's `VkImage`s really are in the `*_SRGB`
  * format the app asked for, rather than the UNORM sibling the runtime reads.
  *
