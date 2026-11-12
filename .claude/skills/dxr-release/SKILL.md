@@ -626,7 +626,9 @@ if [ "$COMPONENT" = unity ]; then
     mkdir -p "$D/x"; tar xzf "$D/$TGZ" -C "$D/x"
     # Glob-and-test, never `ls` (an `ls -F` alias appends `/` here and `*` on executables).
     PKGDIR=""
-    for d in "$D"/x/com.displayxr.unity-*; do [ -d "$d" ] && { PKGDIR="$d"; break; }; done
+    # `package/` is the npm layout Unity's tarball install needs (displayxr-unity#452);
+    # releases through v2.36.0 used com.displayxr.unity-X.Y.Z/. The repack keeps whichever.
+    for d in "$D"/x/package "$D"/x/com.displayxr.unity-*; do [ -d "$d" ] && { PKGDIR="$d"; break; }; done
     DLL="$PKGDIR/$DLL_REL"
     if [ ! -f "$DLL" ]; then
       echo "⚠ $DLL_REL not found in $TGZ — ships unsigned."
@@ -699,6 +701,17 @@ if [ "$COMPONENT" = unity ]; then
         git commit -q -m "Sign displayxr_unity.dll for ${NEW_TAG} (Leia EV)" || echo "(upm already signed)"
         git push -f origin upm
         git tag -f "upm/${NEW_TAG}" && git push -f origin "upm/${NEW_TAG}"
+        # Move the release tag too: it sits on main's release commit, whose committed
+        # DLL is UNSIGNED, so a `#vX.Y.Z` git install got the unsigned DLL (found on
+        # v2.36.0). build-native.yml (displayxr-unity#452+) recognises a tag on this
+        # "Sign displayxr_unity.dll for" commit and builds/releases nothing. A upm
+        # branch cut BEFORE #452 has no such guard and the push would re-run the
+        # release over the signed upm — so check for the guard first.
+        if git show HEAD:.github/workflows/build-native.yml | grep -q 'repoint=true'; then
+          git tag -f "$NEW_TAG" HEAD && git push -f origin "refs/tags/$NEW_TAG"
+        else
+          echo "⚠ $NEW_TAG left on main's release commit: this upm branch predates the re-point guard (displayxr-unity#452)."
+        fi
         UNITY_SIGNED=yes
         echo "✅ unity: signed displayxr_unity.dll (Authenticode $DLL_STATUS) re-injected into the .tgz asset + upm branch."
       fi
