@@ -64,6 +64,7 @@ set(tests
     tests_comp_present_feedback
     tests_comp_late_weave_adapt
     tests_comp_residual_window
+    tests_comp_weave_present_feedback
     tests_comp_feedback_pace
     tests_comp_late_weave_depth
     tests_comp_queue_drain
@@ -1380,6 +1381,10 @@ target_include_directories(tests_comp_present_feedback PRIVATE ${PROJECT_SOURCE_
 target_include_directories(tests_comp_late_weave_adapt PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #2068: windowed #206 residual statistics. Header-only.
 target_include_directories(tests_comp_residual_window PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# XR_DXR_weave v21: the #206 residual from a present-owner's present feedback. Header-only.
+target_include_directories(
+	tests_comp_weave_present_feedback PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+)
 # #2068: feedback pacing (wait / slip / backoff). Header-only.
 target_include_directories(tests_comp_feedback_pace PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #2119: present_wait depth governor (lag floor + slip machine). Header-only.

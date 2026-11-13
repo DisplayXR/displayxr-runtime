@@ -751,6 +751,32 @@ to its newest sample. No env var: the target is the app's own `displayTime`, so 
 moves `xrWaitFrame`'s predicted display time moves a slot-implementing DP's eyes with it. Server-side
 weave-time queries (the weave engines' own per-frame eye reads) still use "latest" — Part 1b.
 
+### Present-owner route (`XR_DXR_weave`) — the horizon comes from the caller's present feedback (v21)
+
+The DisplayXR Browser route weaves in the service and **the browser presents**, so the runtime
+never sees the frame reach the screen and, until `XR_DXR_weave` v21, never called
+`set_predicted_scanout` there: the DP predicted across its own fixed default while the real
+weave-to-present interval on Android was measured at about 33 ms at 90 Hz and 61 ms at 60 Hz
+(several refresh periods, and different per refresh rate — the "fixed constant standing in for a
+platform-varying quantity" shape above).
+
+From v21 the caller chains `XrWeaveSubmitPresentFeedbackDXR` ("the frame with `fenceValue` F was
+presented at `CLOCK_MONOTONIC` time T"). The Android weave engine subtracts the weave start it
+stamped for F (immediately before `process_atlas`, the same anchor the in-process Vulkan route
+uses for its #206 residual), keeps the **median of the last 9** accepted residuals and publishes
+it to the DP before every weave. No report for 1 s, or none yet, publishes 0 = unknown, so the DP
+falls back to its default instead of a stale value. The runtime owns the prediction; the caller
+only reports timestamps.
+
+| | |
+|---|---|
+| Default | on, but inert until the caller reports (a caller that never chains the struct gets the pre-v21 frame) |
+| Kill switch | `debug.dxr.weave_present_feedback=0` (Android system property, read once per process) |
+| Where | `compositor/multi/comp_multi_weave_android.c`; filter `compositor/util/comp_weave_present_feedback.h` |
+| Log | `#206: weave->scanout residual over 5 s (present feedback) — n=… median … min … max … rejected …` (INFO, every 5 s) |
+| Platforms | Android. The Windows / macOS / desktop-Linux weave engines accept the struct and ignore it |
+| Spec | `docs/specs/extensions/XR_DXR_weave.md` §5b-feedback |
+
 ### Adjacent levers that change the picture
 
 | Lever | Default | Note |

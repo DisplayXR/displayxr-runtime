@@ -1141,6 +1141,20 @@ comp_ipc_client_compositor_weave_cursor_request(struct xrt_compositor *xc, const
 }
 
 xrt_result_t
+comp_ipc_client_compositor_weave_present_feedback(struct xrt_compositor *xc,
+                                                  const struct xrt_weave_present_feedback *feedback)
+{
+	if (xc == NULL || feedback == NULL || feedback->entry_count > XRT_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_weave_present_feedback(icc->ipc_c, feedback);
+}
+
+xrt_result_t
 comp_ipc_client_compositor_weave_cursor_sprite_texture(struct xrt_compositor *xc,
                                                        xrt_graphics_buffer_handle_t handle,
                                                        const struct xrt_weave_cursor_sprite_texture *info)

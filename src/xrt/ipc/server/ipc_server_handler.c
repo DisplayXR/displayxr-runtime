@@ -7976,6 +7976,39 @@ ipc_handle_weave_cursor_request(volatile struct ipc_client_state *ics, const str
 #endif
 }
 
+/*
+ *
+ * XR_DXR_weave v21: present feedback. A present-owner reports when earlier
+ * woven frames of this session were presented; the Android weave engine turns
+ * that into the #206 weave->scanout horizon it publishes to its display
+ * processor. Applied at once (it describes EARLIER submits, so there is
+ * nothing to stage). Only a caller that chained
+ * XrWeaveSubmitPresentFeedbackDXR sends it. Every other platform's engine
+ * has no use for it: accepted, ignored.
+ *
+ */
+
+xrt_result_t
+ipc_handle_weave_present_feedback(volatile struct ipc_client_state *ics,
+                                  const struct xrt_weave_present_feedback *feedback)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_present_owner(ics, "weave_present_feedback");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+	if (feedback->entry_count > XRT_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES) {
+		return XRT_ERROR_IPC_FAILURE; // untrusted wire
+	}
+#if defined(XRT_OS_ANDROID) && defined(COMP_MULTI_HAVE_WEAVE)
+	comp_multi_weave_android_present_feedback(ics->xc, feedback);
+#endif
+	return XRT_SUCCESS;
+}
+
 xrt_result_t
 ipc_handle_weave_cursor_sprite_texture(volatile struct ipc_client_state *ics,
                                        const struct xrt_weave_cursor_sprite_texture *info,
