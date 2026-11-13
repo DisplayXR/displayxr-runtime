@@ -473,6 +473,55 @@ cpu_io_export_cpu(void *ud,
  *
  */
 
+xrt_result_t
+ipc_server_conv_cpu_io_read_input(const struct conv_input_import *in, uint8_t **out_pixels)
+{
+	*out_pixels = NULL;
+	xrt_graphics_buffer_handle_t h = in->handle;
+	xrt_graphics_buffer_handle_t sh = in->sync_handle;
+	u_graphics_buffer_unref(&sh); // CPU bytes are complete at the call: no fence
+	if (in->kind != CONV_INPUT_CPU) {
+		u_graphics_buffer_unref(&h);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	const uint32_t x = in->x, y = in->y, w = in->w, hh = in->h, pitch = in->cpu_row_pitch;
+	if (w == 0 || hh == 0 || pitch < (x + w) * 4u) {
+		u_graphics_buffer_unref(&h);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	// The wire is not trusted: the section must hold the whole region.
+	const uint64_t need = (uint64_t)pitch * (y + hh - 1) + (uint64_t)(x + w) * 4u;
+	struct ipc_cpu_buffer_map m;
+	const bool mapped = ipc_cpu_buffer_map(h, need, false, &m);
+	u_graphics_buffer_unref(&h); // the mapping keeps the section alive
+	if (!mapped) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	uint8_t *px = malloc((size_t)w * hh * 4u);
+	if (px == NULL) {
+		ipc_cpu_buffer_unmap(&m);
+		return XRT_ERROR_ALLOCATION;
+	}
+	const uint8_t *base = (const uint8_t *)m.ptr + (size_t)y * pitch + (size_t)x * 4u;
+	for (uint32_t yy = 0; yy < hh; yy++) {
+		const uint8_t *src = base + (size_t)yy * pitch;
+		uint8_t *dst = px + (size_t)yy * w * 4u;
+		if (!in->cpu_bgra) {
+			memcpy(dst, src, (size_t)w * 4u);
+			continue;
+		}
+		for (uint32_t xx = 0; xx < w; xx++) {
+			dst[4 * xx + 0] = src[4 * xx + 2];
+			dst[4 * xx + 1] = src[4 * xx + 1];
+			dst[4 * xx + 2] = src[4 * xx + 0];
+			dst[4 * xx + 3] = src[4 * xx + 3];
+		}
+	}
+	ipc_cpu_buffer_unmap(&m);
+	*out_pixels = px;
+	return XRT_SUCCESS;
+}
+
 bool
 ipc_server_conv_cpu_io_supported(void)
 {
