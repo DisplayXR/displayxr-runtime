@@ -108,6 +108,9 @@
 static_assert(sizeof(XrWeaveSnapGridPointDXR) == 2 && offsetof(XrWeaveSnapGridPointDXR, dy) == 1,
               "XrWeaveSnapGridPointDXR must be the {int8 dx, int8 dy} pair u_snap_grid writes");
 static_assert(XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR == U_SNAP_GRID_MAX_POINTS, "grid point bound mismatch");
+// Spec v21: the present-feedback entries are copied one for one onto the wire struct.
+static_assert(XR_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES_DXR == XRT_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES,
+              "present feedback entry bound mismatch");
 static_assert(XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR == U_SNAP_GRID_MAX_AXIS, "grid axis bound mismatch");
 static_assert(XR_WEAVE_SNAP_GRID_NO_DELTA_DXR == U_SNAP_GRID_NO_DELTA, "grid sentinel mismatch");
 // Spec v19 (#1884): the per-screen table is the per-segment views' table.
@@ -187,6 +190,14 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 
 xrt_result_t
 comp_ipc_client_compositor_weave_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req);
+
+#ifdef XRT_OS_ANDROID
+// Spec v21 present feedback, same file + pattern as above. Android only: the
+// one engine that acts on it.
+xrt_result_t
+comp_ipc_client_compositor_weave_present_feedback(struct xrt_compositor *xc,
+                                                  const struct xrt_weave_present_feedback *feedback);
+#endif
 
 xrt_result_t
 comp_ipc_client_compositor_weave_cursor_sprite_texture(struct xrt_compositor *xc,
@@ -785,6 +796,21 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		overlay_filter_strength = ovf->filterStrength;
 	}
 
+	// Spec v21: a chained XrWeaveSubmitPresentFeedbackDXR reports when earlier
+	// woven frames were presented. Validated on every platform; sent to the
+	// service (below, right before the submit) only on Android, whose engine is
+	// the one that acts on it — elsewhere it is accepted and ignored. The
+	// entries themselves are never an error: an unusable one is dropped by the
+	// engine.
+	const XrWeaveSubmitPresentFeedbackDXR *pfb = OXR_GET_INPUT_FROM_CHAIN(
+	    submitInfo, XR_TYPE_WEAVE_SUBMIT_PRESENT_FEEDBACK_DXR, XrWeaveSubmitPresentFeedbackDXR);
+	if (pfb != NULL && pfb->entryCount > XR_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES_DXR) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrWeaveSubmitDXR: XrWeaveSubmitPresentFeedbackDXR::entryCount (%u) must be "
+		                 "0..XR_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES_DXR (%u)",
+		                 pfb->entryCount, (uint32_t)XR_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES_DXR);
+	}
+
 	// Spec v6 (#774): a chained XrWeaveSubmitLayoutDXR declares that the input
 	// is a worst-case-sized N-view atlas (tiles packed contiguously from the
 	// top-left at contentViewWidth/Height) instead of per-rect squeezed SBS.
@@ -1154,6 +1180,28 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			OXR_CHECK_XRET_MSG(&log, sess, cx, "xrWeaveSubmitDXR: cursor request failed (xrt_result=%d)", (int)cx);
 		}
 		cursor_requested = cx == XRT_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_OS_ANDROID
+	// Spec v21: hand the present feedback to the engine by its own call right
+	// before the submit (same connection, same order), so this submit's weave
+	// already predicts with it. A submit without entries sends nothing — a
+	// pre-v21 caller's messages are unchanged. Best effort: only a dead
+	// connection fails the submit.
+	if (pfb != NULL && pfb->entryCount > 0) {
+		struct xrt_weave_present_feedback xfb;
+		memset(&xfb, 0, sizeof(xfb));
+		xfb.entry_count = pfb->entryCount;
+		for (uint32_t i = 0; i < pfb->entryCount; i++) {
+			xfb.entries[i].fence_value = pfb->entries[i].fenceValue;
+			xfb.entries[i].actual_present_time_ns = pfb->entries[i].actualPresentTimeNs;
+		}
+		xrt_result_t fx = comp_ipc_client_compositor_weave_present_feedback(&sess->xcn->base, &xfb);
+		if (fx == XRT_ERROR_IPC_FAILURE) {
+			OXR_CHECK_XRET_MSG(&log, sess, fx, "xrWeaveSubmitDXR: present feedback failed (xrt_result=%d)",
+			                   (int)fx);
+		}
 	}
 #endif
 

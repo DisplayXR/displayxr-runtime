@@ -125,6 +125,28 @@ struct xrt_weave_cursor_request
 	struct xrt_weave_cursor_rect rects[XRT_WEAVE_CURSOR_MAX_RECTS];
 };
 
+//! Mirrors XR_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES_DXR.
+#define XRT_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES 4
+
+/*!
+ * Present feedback for earlier woven frames of a present-owner session
+ * (XrWeaveSubmitPresentFeedbackDXR, XR_DXR_weave spec v21): which submit (the
+ * fence value it returned) and when its pixels were presented (monotonic ns).
+ * POD for the IPC wire.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_weave_present_feedback
+{
+	uint32_t entry_count; //!< 0..XRT_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES
+	uint32_t reserved;
+	struct
+	{
+		uint64_t fence_value;
+		int64_t actual_present_time_ns;
+	} entries[XRT_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES];
+};
+
 /*!
  * The texture carrier's description (XrCursorDepthWeaveSpriteDXR with kind
  * TEXTURE); the shared handle travels beside it. Sent only on a sprite change.
