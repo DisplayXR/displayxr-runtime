@@ -217,6 +217,72 @@ reach 4; converging dwell) but cannot remove it while slip escalation exists; wh
 slip escalation should be **off by default** (keeping only the starvation backoff for genuinely
 serialized pipelines) is the open product decision, recorded on the issue.
 
+**Android (Vulkan, grid tier) — FIFO queue drain (#2629).** Android has no `VK_KHR_present_wait`,
+so its late weave is the grid tier on `VK_GOOGLE_display_timing`: it sleeps toward the next
+predicted vblank but never waits on a previous present, so nothing bounds the FIFO queue except the
+image count. The period is re-read every ~500 ms; when the panel drops (90 → 60 Hz) the tier keeps
+the faster cadence until then and fills the queue, and producing at the display rate never empties
+it again (measured on a phone-class device: weave→present ~2.2 periods at 90 Hz, ~4 at 60 Hz). The
+drain (`util/comp_queue_drain.h`) sleeps **one extra period** before one weave when the queue is
+provably deep — a longer period was just measured, the #206 residual sat above threshold (floor +
+0.75 periods, 2.5 while none is known) for 3 samples, or acquire blocked > ¼ period 3 times
+in a row (with a floor known, only together with a residual above it) — then judges it on the min of
+the first 3 residuals of presents at or after the drained one against the min of the last 3 before it
+(minima, because queue depth is a floor effect and the residual jitters ~6-7 ms, about the bar
+itself). Min down ≥ ½ period: it was queue, and the next drain
+may follow at once (one slot per settle). Otherwise the residual is the pipeline's floor: the floor
+is raised to it (probed), backoff 5 s doubling to 60 s. **The floor is also learned passively**
+(device round 2): a one-frame backlog sits ~1 period above the floor (36 ms on a 19 ms floor at
+60 Hz, 2.15 periods) — under any absolute threshold — so the floor is the lowest level the residual
+has held this refresh period, a level being the min of a block of 3 samples that two consecutive,
+disjoint blocks both reached (one lucky low sample cannot set it; nothing under 0.5 period counts).
+While the floor is only passive the threshold never exceeds 2.5 periods, because a passive floor
+may have been learned on an already-full queue; a later sustained lower level lowers a probed floor
+again. The floor resets on any period change. Logs are events only:
+`#2629: queue drain: skipping one vblank (…)`, `#2629: queue drain: drained — …`,
+`#2629: queue drain: not queue — … floor learned …`. Kill switch `setprop debug.dxr.queue_drain 0`
+(and off whenever late weave is). A no-op drain whose post-drain min is above 3.5 periods learns
+nothing (`not drained (N periods is not a plausible floor; not learned)`; measured floors are
+1.4–3.4) and just backs off.
+
+**One frame per vblank (#2629, `util/comp_grid_rate_cap.h`).** On device the drain worked at 90 Hz
+but the queue refilled, and at 60 Hz it could not drain at all: the tier slept only while the next
+vblank was further than its budget, the budget (a high-water of the weave cost) included a blocking
+acquire, so on a full queue the budget reached a period, the tier stopped pacing and the producer
+free-ran into the queue. With the cap the tier books, at every present, the vblank that frame will
+be SHOWN at (FIFO, from where its present actually returned), and each weave takes the usual
+late-weave aim when the next vblank is reachable, and is pushed past the booked vblank only when,
+at its budget, it would land on it (that sleep may reach 2 periods: the producer is ahead of the
+panel there, and a shorter cap left it weaving early forever after one overrun). A **late** weave
+(next vblank out of reach) depends on the pacing mode (`util/comp_grid_pace_mode.h`): **AIM**, the
+default, sleeps toward the vblank after (19 ms at 60 Hz on an app that fits the period, but an app
+whose render + weave exceeds the period is held to one weave per two vblanks — 65.7 weaves/s at
+90 Hz); **THROUGHPUT** weaves at once (80.9 weaves/s there, but each weave up to a period early: on
+the 60 Hz app it put the residual at 20/36 ms alternating and fed a drain loop). Over 1 s windows
+the controller moves AIM → THROUGHPUT only when weaves/vblank < 0.9 **and** > 10 % of weaves took
+the late sleep; the probe's first window must beat that AIM rate by 5 % or it returns to AIM with a
+backoff (5 s doubling to 60 s); a proven THROUGHPUT stays until the refresh period changes. Each
+change logs one `#2629: grid pacing …` WARN. The drain's floor is per mode (forgotten on a mode
+change), and in THROUGHPUT only the absolute 2.5-period threshold (or a probed floor above it)
+applies, so early weaves never read as a backlog; as a backstop, more than 3 drains in 5 s whose
+level does not stay down back off (`#2629: queue drain: more than 3 drains in 5 s …`). With the cap
+on, the weave budget is the **p90 of the last 32 weave costs** rather than a decaying high-water
+(which one long frame tripled: 3.45 → 12.80 ms in one 60 Hz phase). Booking from the actual present return is what keeps an overrun from colliding
+with the next weave — the media player at 30 fps with repaint filling every other vblank regained a
+queued frame ~7 s in on round 1. The acquire's duration, and on a repaint (runtime-owned queue) the
+host wait on the acquired image, are subtracted from the weave cost. App frames and repaints share
+the cap; a producer slower than the panel never meets the push. With `DXR_WEAVE_CADENCE_TRACE=1` /
+`debug.dxr.weave_cadence_trace 1` the 5 s `#206` line carries `pacing AIM|THROUGHPUT (weaves/vblank
+AIM … THROUGHPUT …, probes N) | cap aimed N late N now N pushed N skipped N, budget …, acquire …,
+repaint wait … | drain floor … (passive|probed), threshold …, drains N`.
+Kill switch `setprop debug.dxr.grid_rate_cap 0` restores the old aim **and** the old weave cost
+exactly, so `queue_drain 0` + `grid_rate_cap 0` pace like v2.66.15 (only the reported #206
+residual differs). Also from #2629: the published #206 horizon on Android starts
+**after** `vkAcquireNextImageKHR` returns (post-acquire weave start → actual present), since a
+blocking acquire precedes the eye sample; and `setprop debug.dxr.vk_min_images 1` (default off,
+an A/B knob) requests `minImageCount` instead of `+1` under late weave, visible in the
+`#2068: VK native swapchain — N images …, requested …` line.
+
 ### `DXR_WEAVE_REPAINT` — **default ON** (#868)
 
 Re-weaves the last atlas at the display rate while the app is between frames, **with a fresh eye
