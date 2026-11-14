@@ -363,6 +363,8 @@ oxr_system_fill_in(
 	float view_scale_y = info->recommended_view_scale_y;
 	// #2641: the client size of the window a legacy hosted session will adopt (0 = none).
 	int32_t adopt_w = 0, adopt_h = 0;
+	// #2641: the legacy 3D mode's own per-view scale (what an extension app is told), 0 = unknown.
+	float adopt_scale_x = 0.0f, adopt_scale_y = 0.0f;
 
 #ifdef OXR_HAVE_DXR_display_info
 	// Legacy app compromise: apps without XR_DXR_display_info can't adapt to
@@ -473,6 +475,8 @@ oxr_system_fill_in(
 				                                     &why)) {
 					adopt_w = adopt_h = 0;
 				}
+				adopt_scale_x = mode3d->view_scale_x;
+				adopt_scale_y = mode3d->view_scale_y;
 			}
 #endif
 			if (probe_only) {
@@ -530,12 +534,17 @@ oxr_system_fill_in(
 		w = imin(w, w_max);
 		h = imin(h, h_max);
 
-		// #2641: the adopted window, under the same compromise scale, never
-		// above the panel-derived size.
+		// #2641: the adopted window, never above the panel-derived size. The
+		// scale is the 3D mode's own (the tile the weave consumes, and what an
+		// extension app in the same window renders), not the compromise: the
+		// compromise keeps full height for a 2D mode this session can only
+		// reach by showing one eye, at twice the pixels per frame.
 		if (info->legacy_app_tile_scaling && adopt_w > 0 && adopt_h > 0) {
 			const uint32_t pw = w, ph = h;
-			const uint32_t ww = (uint32_t)((float)adopt_w * view_scale_x * scale);
-			const uint32_t wh = (uint32_t)((float)adopt_h * view_scale_y * scale);
+			const float sx = adopt_scale_x > 0.0f ? adopt_scale_x : view_scale_x;
+			const float sy = adopt_scale_y > 0.0f ? adopt_scale_y : view_scale_y;
+			const uint32_t ww = (uint32_t)((float)adopt_w * sx * scale);
+			const uint32_t wh = (uint32_t)((float)adopt_h * sy * scale);
 			if (ww > 0 && wh > 0) {
 				w = imin(w, ww);
 				h = imin(h, wh);
@@ -543,9 +552,9 @@ oxr_system_fill_in(
 			if (i == 0) {
 				U_LOG_W(
 				    "Legacy view size from the window this hosted session will adopt (%dx%d client): "
-				    "%ux%u per view instead of the panel's %ux%u (compromise %.2fx%.2f; "
-				    "DXR_LEGACY_VIEW_SIZE_FROM_WINDOW=0 keeps the panel's, #2641)",
-				    (int)adopt_w, (int)adopt_h, w, h, pw, ph, view_scale_x, view_scale_y);
+				    "%ux%u per view instead of the panel's %ux%u (the 3D mode's scale %.2fx%.2f, "
+				    "compromise %.2fx%.2f; DXR_LEGACY_VIEW_SIZE_FROM_WINDOW=0 keeps the panel's, #2641)",
+				    (int)adopt_w, (int)adopt_h, w, h, pw, ph, sx, sy, view_scale_x, view_scale_y);
 			}
 		}
 
