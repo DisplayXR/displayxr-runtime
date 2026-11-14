@@ -17,6 +17,8 @@ add_library(
 	comp_hub_d3d11 STATIC
 	comp_hub_d3d11.cpp
 	comp_hub_d3d11.h
+	comp_hub_d3d11_auto_stereo.cpp
+	comp_hub_d3d11_auto_stereo.h
 	comp_hub_d3d11_handoff.h
 	)
 
