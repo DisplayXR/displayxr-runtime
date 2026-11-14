@@ -135,6 +135,26 @@ comp_d3d11_window_create_ex(uint32_t width,
                             struct comp_d3d11_window **out);
 
 /*!
+ * Create the window for an in-process HOSTED session (#2637).
+ *
+ * Applies `DXR_WIN32_ADOPT_OWN_WINDOW` (unset = auto, 1 = force, 0 = off):
+ * when the process already owns its own top-level window (auto: exactly one,
+ * on the 3D panel's monitor, not exclusive full-screen), the window is an
+ * owned, non-activating, click-through popup tracking that window's client
+ * area, sized to it, instead of a full-screen top-level, so the 3D picture
+ * and the app's input focus are in one place. Otherwise identical to
+ * @ref comp_d3d11_window_create (same arguments, same fallback geometry).
+ * Logs the decision once. For the in-process D3D11/D3D12 hosted path only:
+ * never the service, shared-texture or window-bound sessions.
+ */
+xrt_result_t
+comp_d3d11_window_create_hosted(uint32_t width,
+                                uint32_t height,
+                                int32_t screen_left,
+                                int32_t screen_top,
+                                struct comp_d3d11_window **out);
+
+/*!
  * Show or hide the window asynchronously (#964).
  *
  * Uses ShowWindowAsync so the caller — typically the compositor render thread

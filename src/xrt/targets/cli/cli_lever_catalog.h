@@ -9,7 +9,7 @@
  * Edit the census and re-run the script; the lint workflow runs it with
  * --check, which also fails when a name here no longer occurs in src/xrt.
  *
- * 74 levers: 54 Tier 1 (next launch), 20 Tier 2 (service-scoped).
+ * 75 levers: 55 Tier 1 (next launch), 20 Tier 2 (service-scoped).
  *
  * This is a DESCRIPTION of the levers, not a way to set them: only the names
  * u_setting_is_managed() accepts resolve from the per-user / machine stores.
@@ -83,6 +83,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_WEAVE_ON_SCANOUT", 1, "App", "on (kill switch)", "Kill switch for the ADR-037 output-device split."},
 	{"DXR_WEAVE_REPAINT", 1, "App", "on", "Master switch for #868 repaint. Decides whether the repaint thread is spawned"},
 	{"DXR_WEAVE_SINGLE_THREAD", 1, "App", "on (Android; and vulkan_enable1 apps whose repaint shares the app's queue, #2393), off elsewhere", "#1196 pins the DP weave to one thread where the DP is proven thread-affine"},
+	{"DXR_WIN32_ADOPT_OWN_WINDOW", 1, "App", "auto (on for an in-process hosted D3D11 / D3D12 session whose process owns exactly one visible, unowned, non-tool top-level window on the 3D panel's monitor that is not exclusive full-screen)", "Windows twin of DXR_XCB_ADOPT_OWN_WINDOW (#2637): the hosted window becomes an owned, non-activating, click-through popup tracking the app's own window's client area (WinEvent hooks; no..."},
 	{"DXR_WINDOW_FULLSCREEN", 1, "App", "on", "=0 opts out of EWMH fullscreen placement (Linux XCB)"},
 	{"DXR_WINDOW_POS", 1, "App", "plug-in reported", "\"x,y\" override for the self-owned window position (#715)"},
 	{"DXR_WL_MOVE_SYNC", 1, "App", "on whenever the window-geometry@displayxr.org extension supports it (version 9+, GNOME 45+)", "Move-synchronised re-weave: every commit carries a 1x1 subsurface tag of the position its frame was woven for, and the extension paints each frame of a compositor drag (title bar, Super+drag, the..."},
