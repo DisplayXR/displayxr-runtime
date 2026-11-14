@@ -4350,7 +4350,9 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		// holds c->mutex, so a token taken before the lock could be the one
 		// the app is about to block on. Under an ENGAGED partition the
 		// schedule owns the slots; leave it.
-		if (c->repaint.partition.next_release_ns == 0 && !comp_d3d11_target_repaint_admit(c->target)) {
+		// #2635: never under a re-entrant Present hook, partition or not.
+		if (comp_d3d11_target_repaint_forbidden(c->target) ||
+		    (c->repaint.partition.next_release_ns == 0 && !comp_d3d11_target_repaint_admit(c->target))) {
 			c->repaint.bail_gate++;
 			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;

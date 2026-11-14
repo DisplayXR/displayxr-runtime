@@ -66,6 +66,7 @@ set(tests
     tests_comp_residual_window
     tests_comp_feedback_pace
     tests_comp_late_weave_depth
+    tests_comp_present_hook
     tests_comp_queue_drain
     tests_comp_grid_rate_cap
     tests_comp_grid_pace_mode
@@ -1384,6 +1385,8 @@ target_include_directories(tests_comp_residual_window PRIVATE ${PROJECT_SOURCE_D
 target_include_directories(tests_comp_feedback_pace PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #2119: present_wait depth governor (lag floor + slip machine). Header-only.
 target_include_directories(tests_comp_late_weave_depth PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #2635: present-hook re-entry detection (detour decode + stack match). Header-only.
+target_include_directories(tests_comp_present_hook PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #2629: grid late-weave FIFO queue drain. Header-only.
 target_include_directories(tests_comp_queue_drain PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #2629: grid late-weave one-weave-per-vblank target. Header-only.
