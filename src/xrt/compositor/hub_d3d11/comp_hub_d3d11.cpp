@@ -5695,6 +5695,12 @@ comp_hub_d3d11_repaint(struct comp_hub_d3d11 *s, bool partition_engaged, const s
 	if (!comp_hub_d3d11_has_weave_slot(s)) {
 		return COMP_HUB_D3D11_REPAINT_NO_FRAME;
 	}
+	// #2635: the app presents through a Present hook that also hooks this
+	// chain — a repaint present from this thread would deadlock against it.
+	// Ahead of the partition test: an engaged partition skips admission.
+	if (s->target != nullptr && comp_d3d11_target_repaint_forbidden(s->target)) {
+		return COMP_HUB_D3D11_REPAINT_NOT_ADMITTED;
+	}
 	// #1339 under the lock, as natively: the app frame waits on the same
 	// waitable while holding it, so a token taken outside could be the app's.
 	if (!partition_engaged && !comp_hub_d3d11_repaint_admit(s)) {
