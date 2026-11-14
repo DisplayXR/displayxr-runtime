@@ -2077,6 +2077,39 @@ adopt_enum_proc(HWND hwnd, LPARAM lparam)
 	return TRUE;
 }
 
+extern "C" bool
+comp_d3d11_window_predict_adopt(
+    int32_t screen_left, int32_t screen_top, int32_t *out_w, int32_t *out_h, const char **out_why)
+{
+	const enum comp_adopt_mode mode = comp_adopt_mode_parse(debug_get_option_win32_adopt_own_window());
+	const char *why = NULL;
+	int pick = -1;
+	struct adopt_enum *e = U_TYPED_CALLOC(struct adopt_enum);
+	if (e == NULL) {
+		why = "out of memory";
+	} else {
+		e->pid = GetCurrentProcessId();
+		// The same decision comp_d3d11_window_create_hosted takes, in the same
+		// (host) DPI space, so the size predicted here is the client it adopts.
+		const POINT panel_pt = {(LONG)screen_left + 1, (LONG)screen_top + 1};
+		e->panel = MonitorFromPoint(panel_pt, MONITOR_DEFAULTTOPRIMARY);
+		e->foreground = GetForegroundWindow();
+		if (mode != COMP_ADOPT_MODE_OFF) {
+			EnumWindows(adopt_enum_proc, (LPARAM)e);
+		}
+		pick = comp_adopt_choose(mode, e->cand, e->count, &why);
+		if (pick >= 0) {
+			*out_w = e->cand[pick].w;
+			*out_h = e->cand[pick].h;
+		}
+		free(e);
+	}
+	if (out_why != NULL) {
+		*out_why = why;
+	}
+	return pick >= 0;
+}
+
 extern "C" xrt_result_t
 comp_d3d11_window_create_hosted(uint32_t width,
                                 uint32_t height,
