@@ -27,6 +27,7 @@
 #include "xrt/xrt_system.h"
 #include "xrt/xrt_display_processor_d3d11.h"
 #include "xrt/xrt_config_build.h"
+#include "../util/comp_adopt_window_policy.h"
 
 // Include qwerty interface for Win32 input handling (conditional on qwerty driver being built)
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -46,6 +47,9 @@
 
 // Environment variable to start in windowed mode
 DEBUG_GET_ONCE_BOOL_OPTION(start_windowed, "XRT_COMPOSITOR_START_WINDOWED", false)
+
+// #2637: hosted-window adoption (auto / 1 / 0). See util/comp_adopt_window_policy.h.
+DEBUG_GET_ONCE_OPTION(win32_adopt_own_window, "DXR_WIN32_ADOPT_OWN_WINDOW", NULL)
 
 // Marker for SendInput-injected mouse events — WndProc skips re-forwarding these.
 // Used to break the loop: WndProc→SendInput→WM_LBUTTONDOWN→WndProc.
@@ -156,6 +160,21 @@ struct comp_d3d11_window
 	//! style/geometry path — the window is a real, showable presenter surface
 	//! that simply starts out invisible. See comp_d3d11_window_set_visible.
 	bool start_hidden;
+
+	/*
+	 * #2637 adopt-own-window. Non-NULL: this window is an owned,
+	 * non-activating, click-through popup over adopt_target's client area
+	 * (the app's own top-level window) instead of a full-screen top-level.
+	 * Set before the window thread starts; adopt_target is cleared (window
+	 * thread only) when the app's window is destroyed.
+	 */
+	HWND adopt_target;
+	//! Latched with adopt_target at create; never cleared.
+	bool adopted;
+	//! WinEvent hooks tracking adopt_target (window thread only).
+	HWINEVENTHOOK adopt_hook_loc;
+	HWINEVENTHOOK adopt_hook_min;
+	HWINEVENTHOOK adopt_hook_destroy;
 
 	//! Window thread handle
 	HANDLE thread_handle;
@@ -649,6 +668,18 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	if (!w) {
 		// Window not fully set up yet
 		return DefWindowProcW(hWnd, message, wParam, lParam);
+	}
+
+	// #2637: an adopted popup never takes input or activation — the app's own
+	// window under it keeps both. WS_EX_TRANSPARENT | WS_EX_LAYERED already
+	// make it hit-test-invisible system-wide; these are belt and braces.
+	if (w->adopted) {
+		if (message == WM_NCHITTEST) {
+			return HTTRANSPARENT;
+		}
+		if (message == WM_MOUSEACTIVATE) {
+			return MA_NOACTIVATE;
+		}
 	}
 
 	switch (message) {
@@ -1544,6 +1575,118 @@ window_release(struct comp_d3d11_window *w)
 	free(w);
 }
 
+/*
+ * #2637 adopt-own-window: tracking the app's window.
+ *
+ * WinEvent hooks, out of context, delivered to THIS (window) thread's message
+ * loop: no subclassing of the app's window procedure, no AttachThreadInput,
+ * nothing injected into the app's thread. An owned popup already follows its
+ * owner's z-order, hides when the owner minimises and comes back on restore;
+ * what it does not follow is the owner's position and size, so that is all
+ * the hooks do. Measured on a hybrid laptop before this was written: the
+ * popup's flip-model chain presents (composition mode OVERLAY), hit tests at
+ * its centre return the app's window, the app keeps the foreground, and an
+ * owner destroyed from its own thread leaves the popup alive with its owner
+ * cleared (a WS_CHILD of a cross-thread parent is destroyed with it instead,
+ * and is not hit-test-transparent across threads).
+ */
+static struct comp_d3d11_window *volatile g_adopt_window = NULL; // one per process; window thread only
+
+static bool
+adopt_client_screen_rect(HWND target, RECT *out)
+{
+	RECT rc = {0};
+	POINT org = {0, 0};
+	if (!GetClientRect(target, &rc) || !ClientToScreen(target, &org)) {
+		return false;
+	}
+	OffsetRect(&rc, org.x, org.y);
+	*out = rc;
+	return rc.right > rc.left && rc.bottom > rc.top;
+}
+
+static void
+adopt_follow(struct comp_d3d11_window *w, HWND target)
+{
+	if (IsIconic(target)) {
+		return; // the owned popup is already hidden with its owner
+	}
+	RECT rc;
+	RECT cur = {0};
+	if (!adopt_client_screen_rect(target, &rc)) {
+		return;
+	}
+	GetWindowRect(w->hwnd, &cur);
+	if (EqualRect(&rc, &cur)) {
+		return;
+	}
+	SetWindowPos(w->hwnd, NULL, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+	             SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+}
+
+static void CALLBACK
+adopt_win_event(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG id_object, LONG id_child, DWORD tid, DWORD time)
+{
+	(void)hook;
+	(void)id_child;
+	(void)tid;
+	(void)time;
+	struct comp_d3d11_window *w = g_adopt_window;
+	if (w == NULL || w->hwnd == NULL || hwnd == NULL || hwnd != w->adopt_target || id_object != OBJID_WINDOW) {
+		return;
+	}
+	if (event == EVENT_OBJECT_DESTROY) {
+		// The system clears a cross-thread owned popup's owner rather than
+		// destroying it, so ours outlives the app's window: hide it and let
+		// the session's own teardown destroy it in order.
+		w->adopt_target = NULL;
+		ShowWindow(w->hwnd, SW_HIDE);
+		U_LOG_W("D3D11 window: the adopted app window was destroyed — 3D window hidden until the session ends "
+		        "(#2637)");
+		return;
+	}
+	if (event == EVENT_SYSTEM_MINIMIZESTART) {
+		return;
+	}
+	adopt_follow(w, hwnd);
+}
+
+static void
+adopt_hooks_install(struct comp_d3d11_window *w)
+{
+	DWORD pid = 0;
+	const DWORD tid = GetWindowThreadProcessId(w->adopt_target, &pid);
+	g_adopt_window = w;
+	w->adopt_hook_loc = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, NULL,
+	                                    adopt_win_event, pid, tid, WINEVENT_OUTOFCONTEXT);
+	w->adopt_hook_min = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, NULL, adopt_win_event,
+	                                    pid, tid, WINEVENT_OUTOFCONTEXT);
+	w->adopt_hook_destroy = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY, NULL, adopt_win_event, pid,
+	                                        tid, WINEVENT_OUTOFCONTEXT);
+	if (w->adopt_hook_loc == NULL || w->adopt_hook_min == NULL || w->adopt_hook_destroy == NULL) {
+		U_LOG_W("D3D11 window: adopt-own-window could not hook the app window's moves (err %lu) — the 3D window "
+		        "stays where it was placed (#2637)",
+		        GetLastError());
+	}
+	// It may have moved between the placement and the hooks.
+	adopt_follow(w, w->adopt_target);
+}
+
+static void
+adopt_hooks_remove(struct comp_d3d11_window *w)
+{
+	HWINEVENTHOOK *hs[] = {&w->adopt_hook_loc, &w->adopt_hook_min, &w->adopt_hook_destroy};
+	for (HWINEVENTHOOK *h : hs) {
+		if (*h != NULL) {
+			UnhookWinEvent(*h);
+			*h = NULL;
+		}
+	}
+	if (g_adopt_window == w) {
+		g_adopt_window = NULL;
+	}
+}
+
 /*!
  * Window thread function.
  *
@@ -1610,13 +1753,26 @@ window_thread_body(struct comp_d3d11_window *w)
 	// shared-texture mode, never shown, and has no business in the taskbar.
 	DWORD ex_style = w->hidden ? 0 : WS_EX_APPWINDOW;
 
+	// #2637: an adopted window is an owned popup over the app's client area —
+	// non-activating, click-through (LAYERED + TRANSPARENT is the system-wide
+	// hit-test pass-through; an HTTRANSPARENT answer alone does not cross
+	// threads), and out of Alt-Tab (TOOLWINDOW): the app's window is the one
+	// the user switches to. Never topmost: the owner relation keeps it just
+	// above the app's window and below everything above that.
+	HWND owner = NULL;
+	if (w->adopted) {
+		style = WS_POPUP;
+		ex_style = WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW;
+		owner = w->adopt_target;
+	}
+
 	U_LOG_W("D3D11 window thread: Creating %s window at (%d, %d) size %ux%u",
 	        w->hidden ? "hidden" : "visible",
 	        (int)rc.left, (int)rc.top, w->requested_width, w->requested_height);
 
 	HWND hwnd =
 	    CreateWindowExW(ex_style, szWindowClass, L"DisplayXR \u2014 D3D11 Native Compositor", style, rc.left,
-	                    rc.top, rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, w->instance, NULL);
+	                    rc.top, rc.right - rc.left, rc.bottom - rc.top, owner, NULL, w->instance, NULL);
 
 	if (hwnd == NULL) {
 		DWORD err = GetLastError();
@@ -1633,6 +1789,10 @@ window_thread_body(struct comp_d3d11_window *w)
 	// Associate window data before showing
 	SetPropW(hwnd, szWindowData, w);
 	SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)w);
+	if (w->adopted) {
+		// A layered window shows nothing until its attributes are set.
+		SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+	}
 
 	// Verify the window actually landed where we asked. Win32 occasionally
 	// nudges overlapped windows at negative coordinates to the primary monitor.
@@ -1648,7 +1808,10 @@ window_thread_body(struct comp_d3d11_window *w)
 		}
 	}
 
-	if (!w->hidden) {
+	if (w->adopted) {
+		// No fullscreen pass, no activation: shown over the app's window.
+		ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+	} else if (!w->hidden) {
 		// Check if we should start fullscreen
 		bool start_fullscreen = !debug_get_bool_option_start_windowed();
 		if (start_fullscreen) {
@@ -1685,6 +1848,10 @@ window_thread_body(struct comp_d3d11_window *w)
 
 	U_LOG_W("D3D11 window thread: Window created successfully, HWND=%p", (void *)hwnd);
 
+	if (w->adopted) {
+		adopt_hooks_install(w);
+	}
+
 	// Message loop — blocks on GetMessage, exits on WM_QUIT (posted by WM_DESTROY → PostQuitMessage)
 	MSG msg;
 	while (GetMessageW(&msg, NULL, 0, 0) > 0) {
@@ -1693,6 +1860,7 @@ window_thread_body(struct comp_d3d11_window *w)
 	}
 
 	U_LOG_W("D3D11 window thread: Message loop exited");
+	adopt_hooks_remove(w); // #2637: on the thread that installed them
 
 	// Cleanup: unregister window class (must be done on the thread that registered it)
 	if (w->window_class) {
@@ -1752,19 +1920,22 @@ comp_d3d11_window_create(uint32_t width,
 	return comp_d3d11_window_create_ex(width, height, screen_left, screen_top, /*start_hidden*/ false, out);
 }
 
-extern "C" xrt_result_t
-comp_d3d11_window_create_ex(uint32_t width,
-                            uint32_t height,
-                            int32_t screen_left,
-                            int32_t screen_top,
-                            bool start_hidden,
-                            struct comp_d3d11_window **out)
+static xrt_result_t
+window_create_impl(uint32_t width,
+                   uint32_t height,
+                   int32_t screen_left,
+                   int32_t screen_top,
+                   bool start_hidden,
+                   HWND adopt_target,
+                   struct comp_d3d11_window **out)
 {
 	struct comp_d3d11_window *w = U_TYPED_CALLOC(struct comp_d3d11_window);
 	if (w == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
 
+	w->adopt_target = adopt_target;
+	w->adopted = adopt_target != NULL;
 	w->start_hidden = start_hidden;
 	w->instance = GetModuleHandle(NULL);
 	w->requested_width = width > 0 ? width : 1920;
@@ -1839,6 +2010,115 @@ comp_d3d11_window_create_ex(uint32_t width,
 	        w->start_hidden ? " (hidden)" : "");
 	*out = w;
 	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_window_create_ex(uint32_t width,
+                            uint32_t height,
+                            int32_t screen_left,
+                            int32_t screen_top,
+                            bool start_hidden,
+                            struct comp_d3d11_window **out)
+{
+	return window_create_impl(width, height, screen_left, screen_top, start_hidden, NULL, out);
+}
+
+/*
+ * #2637: enumerate the adoptable windows of this process.
+ */
+#define ADOPT_MAX_CANDIDATES 16
+
+struct adopt_enum
+{
+	DWORD pid;
+	HMONITOR panel;
+	HWND foreground;
+	HWND hwnds[ADOPT_MAX_CANDIDATES];
+	struct comp_adopt_candidate cand[ADOPT_MAX_CANDIDATES];
+	int count;
+};
+
+static BOOL CALLBACK
+adopt_enum_proc(HWND hwnd, LPARAM lparam)
+{
+	struct adopt_enum *e = (struct adopt_enum *)lparam;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid != e->pid || !IsWindowVisible(hwnd) || IsIconic(hwnd) || GetWindow(hwnd, GW_OWNER) != NULL) {
+		return TRUE;
+	}
+	const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+	if ((ex & WS_EX_TOOLWINDOW) != 0) {
+		return TRUE;
+	}
+	WCHAR cls[64] = {0};
+	GetClassNameW(hwnd, cls, 64);
+	if (wcscmp(cls, szWindowClass) == 0) {
+		return TRUE; // ours (another session's runtime window)
+	}
+	RECT rc;
+	if (!adopt_client_screen_rect(hwnd, &rc) || e->count >= ADOPT_MAX_CANDIDATES) {
+		return TRUE;
+	}
+	struct comp_adopt_candidate *c = &e->cand[e->count];
+	c->x = rc.left;
+	c->y = rc.top;
+	c->w = rc.right - rc.left;
+	c->h = rc.bottom - rc.top;
+	const HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+	c->on_panel = mon == e->panel;
+	c->foreground = hwnd == e->foreground;
+	MONITORINFO mi = {sizeof(mi)};
+	RECT wr = {0};
+	c->exclusive_fullscreen = (ex & WS_EX_TOPMOST) != 0 && GetMonitorInfoW(mon, &mi) && GetWindowRect(hwnd, &wr) &&
+	                          EqualRect(&wr, &mi.rcMonitor);
+	e->hwnds[e->count] = hwnd;
+	e->count++;
+	return TRUE;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_window_create_hosted(uint32_t width,
+                                uint32_t height,
+                                int32_t screen_left,
+                                int32_t screen_top,
+                                struct comp_d3d11_window **out)
+{
+	const enum comp_adopt_mode mode = comp_adopt_mode_parse(debug_get_option_win32_adopt_own_window());
+	struct adopt_enum *e = U_TYPED_CALLOC(struct adopt_enum);
+	if (e == NULL) {
+		return comp_d3d11_window_create(width, height, screen_left, screen_top, out);
+	}
+	e->pid = GetCurrentProcessId();
+	// Same space as every other geometry read on this path: the host's DPI
+	// awareness (docs/reference/dpi-awareness.md) — the compositor reads the
+	// window's client rect in it too, so nothing here may pin a different one.
+	const POINT panel_pt = {(LONG)screen_left + 1, (LONG)screen_top + 1};
+	e->panel = MonitorFromPoint(panel_pt, MONITOR_DEFAULTTOPRIMARY);
+	e->foreground = GetForegroundWindow();
+	if (mode != COMP_ADOPT_MODE_OFF) {
+		EnumWindows(adopt_enum_proc, (LPARAM)e);
+	}
+	const char *why = NULL;
+	const int pick = comp_adopt_choose(mode, e->cand, e->count, &why);
+	if (pick < 0) {
+		U_LOG_W("D3D11 window: hosted session keeps its own full-screen window — not adopting the app's window: "
+		        "%s (%d candidate window(s); DXR_WIN32_ADOPT_OWN_WINDOW=%s, #2637)",
+		        why, e->count, comp_adopt_mode_str(mode));
+		free(e);
+		return comp_d3d11_window_create(width, height, screen_left, screen_top, out);
+	}
+	const HWND target = e->hwnds[pick];
+	const struct comp_adopt_candidate c = e->cand[pick];
+	free(e);
+	char title[128] = {0};
+	GetWindowTextA(target, title, (int)sizeof(title));
+	U_LOG_W("D3D11 window: hosted session ADOPTS the app's own window %p \"%s\" — client (%d,%d %dx%d) %s; the 3D "
+	        "window is an owned click-through popup over it, input and focus stay with the app "
+	        "(DXR_WIN32_ADOPT_OWN_WINDOW=%s: %s, #2637)",
+	        (void *)target, title, (int)c.x, (int)c.y, (int)c.w, (int)c.h,
+	        c.on_panel ? "on the 3D panel" : "NOT on the 3D panel", comp_adopt_mode_str(mode), why);
+	return window_create_impl((uint32_t)c.w, (uint32_t)c.h, c.x, c.y, false, target, out);
 }
 
 extern "C" void

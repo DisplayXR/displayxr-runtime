@@ -7947,7 +7947,8 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			win_h = 1080;
 		}
 		U_LOG_I("No window handle provided, creating self-owned window (%ux%u)", win_w, win_h);
-		xrt_result_t xret = comp_d3d11_window_create(
+		// #2637: adopts the app's own top-level window when it has one.
+		xrt_result_t xret = comp_d3d11_window_create_hosted(
 		    win_w, win_h, display_screen_left, display_screen_top, &c->own_window);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create self-owned window");

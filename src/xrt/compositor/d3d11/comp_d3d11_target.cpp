@@ -345,6 +345,9 @@ struct comp_d3d11_target
 	uint64_t reentry_next_sample_ns;
 	bool reentry_inline_logged; //!< "Present moves off the worker" WARN, once
 	bool present_thread_logged; //!< first-Present thread-id WARN, once
+	//! Presents already made on the #2603 worker: the "moves off the worker"
+	//! WARN is true only when re-entry latches after at least one of them.
+	uint64_t presents_on_worker;
 };
 
 static bool
@@ -1629,7 +1632,8 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 		        (unsigned long)GetCurrentThreadId(), (unsigned long)target_presenting_tid(target, inline_present),
 		        inline_present ? "inline" : "#2603 bounded worker", target->present_reentrant ? 1 : 0);
 	}
-	if (target->present_reentrant && target->pw_thread != nullptr && !target->reentry_inline_logged) {
+	if (target->present_reentrant && target->pw_thread != nullptr && target->presents_on_worker > 0 &&
+	    !target->reentry_inline_logged) {
 		target->reentry_inline_logged = true;
 		U_LOG_W("d3d11 target: present-hook re-entry — Present moves off the #2603 worker (tid=%lu) onto "
 		        "the app's thread (tid=%lu) for the rest of the session (#2635)",
@@ -1652,6 +1656,7 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 			return XRT_ERROR_D3D;
 		}
 		hr = target->pw_hr;
+		target->presents_on_worker++;
 	} else {
 		hr = target_present_call(target, sync_interval);
 	}
