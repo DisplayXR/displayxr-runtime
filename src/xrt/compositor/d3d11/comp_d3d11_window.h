@@ -147,6 +147,15 @@ comp_d3d11_window_create_ex(uint32_t width,
  * Logs the decision once. For the in-process D3D11/D3D12 hosted path only:
  * never the service, shared-texture or window-bound sessions.
  */
+/*!
+ * #2641: would @ref comp_d3d11_window_create_hosted adopt one of this process's
+ * windows right now? Runs the same enumeration and decision (no window is
+ * created) and returns that window's client size. @p out_why says why (not).
+ */
+bool
+comp_d3d11_window_predict_adopt(
+    int32_t screen_left, int32_t screen_top, int32_t *out_w, int32_t *out_h, const char **out_why);
+
 xrt_result_t
 comp_d3d11_window_create_hosted(uint32_t width,
                                 uint32_t height,

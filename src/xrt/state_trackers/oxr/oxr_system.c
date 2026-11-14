@@ -31,6 +31,10 @@
 #include "oxr_legacy_mode_rule.h"
 #include "oxr_tracking_properties_rule.h"
 
+#if defined(XRT_OS_WINDOWS) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
+#include "d3d11/comp_d3d11_window.h"
+#endif
+
 
 DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "OXR_VIEWPORT_SCALE_PERCENTAGE", 100)
 
@@ -64,6 +68,13 @@ oxr_system_views_change_live_enabled(void)
  * release. This is the ONLY translation unit that reads it.
  */
 DEBUG_GET_ONCE_BOOL_OPTION(view_config_legacy, "DXR_VIEW_CONFIG_LEGACY", false)
+
+/*
+ * #2641: a legacy hosted D3D11 / D3D12 session that will adopt the app's own
+ * window sizes its views from that window's client area, not the panel. `0`
+ * keeps the panel-derived compromise size.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(legacy_view_size_from_window, "DXR_LEGACY_VIEW_SIZE_FROM_WINDOW", true)
 
 
 
@@ -350,6 +361,8 @@ oxr_system_fill_in(
 	 */
 	float view_scale_x = info->recommended_view_scale_x;
 	float view_scale_y = info->recommended_view_scale_y;
+	// #2641: the client size of the window a legacy hosted session will adopt (0 = none).
+	int32_t adopt_w = 0, adopt_h = 0;
 
 #ifdef OXR_HAVE_DXR_display_info
 	// Legacy app compromise: apps without XR_DXR_display_info can't adapt to
@@ -438,6 +451,30 @@ oxr_system_fill_in(
 			info->legacy_app_tile_scaling = true;
 			info->legacy_view_scale_x = view_scale_x;
 			info->legacy_view_scale_y = view_scale_y;
+#if defined(XRT_OS_WINDOWS) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
+			/*
+			 * #2641: the views are sized here, at xrCreateInstance, but the
+			 * hosted window is adopted at xrCreateSession. Take the same
+			 * adoption decision now (the app's window already exists when an
+			 * injector drives a running game) and size the views from the
+			 * window that will show them; otherwise they are the panel's.
+			 */
+			bool d3d_binding = false;
+#ifdef OXR_HAVE_KHR_D3D11_enable
+			d3d_binding = d3d_binding || inst->extensions.KHR_D3D11_enable;
+#endif
+#ifdef OXR_HAVE_KHR_D3D12_enable
+			d3d_binding = d3d_binding || inst->extensions.KHR_D3D12_enable;
+#endif
+			if (!probe_only && d3d_binding && debug_get_bool_option_legacy_view_size_from_window()) {
+				const char *why = NULL;
+				if (!comp_d3d11_window_predict_adopt(info->display_screen_left,
+				                                     info->display_screen_top, &adopt_w, &adopt_h,
+				                                     &why)) {
+					adopt_w = adopt_h = 0;
+				}
+			}
+#endif
 			if (probe_only) {
 				U_LOG_I("Probe instance (no extensions enabled): provisional "
 				        "compromise view scale %.2fx%.2f computed - NOT used for "
@@ -492,6 +529,25 @@ oxr_system_fill_in(
 
 		w = imin(w, w_max);
 		h = imin(h, h_max);
+
+		// #2641: the adopted window, under the same compromise scale, never
+		// above the panel-derived size.
+		if (info->legacy_app_tile_scaling && adopt_w > 0 && adopt_h > 0) {
+			const uint32_t pw = w, ph = h;
+			const uint32_t ww = (uint32_t)((float)adopt_w * view_scale_x * scale);
+			const uint32_t wh = (uint32_t)((float)adopt_h * view_scale_y * scale);
+			if (ww > 0 && wh > 0) {
+				w = imin(w, ww);
+				h = imin(h, wh);
+			}
+			if (i == 0) {
+				U_LOG_W(
+				    "Legacy view size from the window this hosted session will adopt (%dx%d client): "
+				    "%ux%u per view instead of the panel's %ux%u (compromise %.2fx%.2f; "
+				    "DXR_LEGACY_VIEW_SIZE_FROM_WINDOW=0 keeps the panel's, #2641)",
+				    (int)adopt_w, (int)adopt_h, w, h, pw, ph, view_scale_x, view_scale_y);
+			}
+		}
 
 		if (i == 0 && info->legacy_app_tile_scaling) {
 			U_LOG_I("Compromise view[0] (provisional): raw w=%u h=%u (disp=%ux%u scale=%.2fx%.2f dbg_scale=%.2f) "

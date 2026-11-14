@@ -9,7 +9,7 @@
  * Edit the census and re-run the script; the lint workflow runs it with
  * --check, which also fails when a name here no longer occurs in src/xrt.
  *
- * 77 levers: 57 Tier 1 (next launch), 20 Tier 2 (service-scoped).
+ * 78 levers: 58 Tier 1 (next launch), 20 Tier 2 (service-scoped).
  *
  * This is a DESCRIPTION of the levers, not a way to set them: only the names
  * u_setting_is_managed() accepts resolve from the per-user / machine stores.
@@ -62,6 +62,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_LEGACY_AUTO_2D", 1, "App", "off (the per-executable profile's auto2d, default false)", "#2639: 1 / 0 turns automatic 2D on / off for a LEGACY session on the D3D11 hub: while both eyes show one flat picture (identical, or identical up to one horizontal shift) the lens goes 2D and the..."},
 	{"DXR_LEGACY_AUTO_CONVERGENCE", 1, "App", "off (the profile's autoConvergence, default false)", "#2640: 1 / 0 turns automatic re-convergence on / off for a LEGACY session on the D3D11 hub: a horizontal image shift of the two views before the display processor puts the scene's centre-weighted..."},
 	{"DXR_LEGACY_CAMERA_RIG", 1, "App", "Per-executable JSON profile, otherwise qwerty defaults", "Inline camera-rig JSON or a UTF-8 file path; seeds instance-wide native legacy camera tuning and Space reset."},
+	{"DXR_LEGACY_VIEW_SIZE_FROM_WINDOW", 1, "App", "on", "#2641: a legacy instance with a D3D11 / D3D12 binding whose process already owns the window a hosted session will adopt (DXR_WIN32_ADOPT_OWN_WINDOW, #2637) is told to render views sized from that..."},
 	{"DXR_LINUX_DIRECT_SCANOUT", 1, "App", "off", "Opt-in RandR direct-scanout present path on Linux"},
 	{"DXR_MAX_CLIENTS", 1, "Svc", "0 = auto", "#959 admitted-client cap. Read once at service start"},
 	{"DXR_MONO_AUTO_2D", 1, "App", "on (kill switch)", "Kill switch for automatic hardware 2D when a stereo session submits one flat picture (every projection view on the same swapchain, imageArrayIndex and imageRect; projection layers only) for 0.5 s..."},
