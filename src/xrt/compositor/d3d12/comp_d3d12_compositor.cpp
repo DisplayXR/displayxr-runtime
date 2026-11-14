@@ -43,6 +43,7 @@ struct comp_hub_d3d11; // the reroute fields exist either way; the code does not
 #include "xrt/xrt_display_metrics.h"
 
 #include "util/u_logging.h"
+#include "util/u_camera_profile.h"
 #include "util/u_setting.h"
 #include "util/u_weave_scope.h"
 #include "util/u_debug.h"
@@ -8855,6 +8856,16 @@ comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
 	c->legacy_app_tile_scaling = legacy;
 	c->legacy_view_scale_x = scale_x;
 	c->legacy_view_scale_y = scale_y;
+
+	// #2639 / #2640: a LEGACY session's automatic 2D / re-convergence, on the
+	// hub this session weaves through (default off: profile or env enables it).
+	if (legacy && c->reroute.split != nullptr) {
+		struct u_legacy_stereo_auto auto_cfg;
+		const char *auto_source = nullptr;
+		if (u_legacy_stereo_auto_load_for_process(&auto_cfg, &auto_source)) {
+			comp_hub_d3d11_set_legacy_auto_stereo(c->reroute.split, &auto_cfg, auto_source);
+		}
+	}
 	if (c->renderer != nullptr) {
 		comp_d3d12_renderer_set_legacy_app_tile_scaling(c->renderer, legacy);
 	}

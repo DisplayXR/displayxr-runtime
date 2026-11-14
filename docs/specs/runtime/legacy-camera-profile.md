@@ -127,6 +127,91 @@ Baseline conversion uses a fixed reference rather than a per-frame division by
 tracked eye separation. The selected world scale therefore stays constant when
 the viewer changes. No tracked-IPD normalization switch is provided.
 
+## Automatic 2D and automatic re-convergence
+
+Issues [#2639](https://github.com/DisplayXR/displayxr-runtime/issues/2639) and
+[#2640](https://github.com/DisplayXR/displayxr-runtime/issues/2640). The same record
+carries two switches that are not camera tuning: they act on the PICTURES a legacy
+session submits, so they need no cooperation from the app. Both are **off** unless
+enabled, and only a LEGACY session (no `XR_DXR_display_info`) is ever touched: a
+display-aware app owns its own display mode and rig.
+
+```json
+{
+  "auto2d": true,
+  "autoConvergence": true,
+  "maxShiftFraction": 0.03,
+  "maxBehindFraction": 0.03,
+  "maxFrontFraction": 0.02
+}
+```
+
+| Field | Meaning | Default |
+| --- | --- | --- |
+| `auto2d` | Hardware 2D (left eye alone) while both eyes show one flat picture | `false` |
+| `autoConvergence` | Horizontal image shift that keeps the scene's subject near the screen plane | `false` |
+| `maxShiftFraction` | Largest applied shift, either sign, fraction of the eye image width, `[0, 0.2]` | `0.03` |
+| `maxBehindFraction` | Comfort: the far content (p95 of the measured disparities) at most this far behind the screen, `[0, 0.2]` | `0.03` |
+| `maxFrontFraction` | Comfort: the near content (p5) at most this far in front, `[0, 0.2]` | `0.02` |
+
+`auto2d` / `autoConvergence` take `true`, `false`, `0` or `1`; anything else, or a
+fraction outside its range, rejects the record like any other invalid value. The
+process environment variables `DXR_LEGACY_AUTO_2D` and `DXR_LEGACY_AUTO_CONVERGENCE`
+(`1`/`on`/`true` or `0`/`off`/`false`) win over the record's switches when set; the
+bounds always come from the record. Unlike the camera tuning, these are read for every
+eligible session (at its creation), not once per instance.
+
+**Where it runs.** On the D3D11 hub (`compositor/hub_d3d11/`): the in-process D3D11
+tier and the D3D12 tier's reroute, which is the route a legacy hosted D3D12 app that
+adopts its own window takes. The policy (`auxiliary/util/u_stereo_auto.h`) is pure and
+host-tested (`tests_aux_stereo_auto`) so other tiers can adopt it; the tiers' own
+weave legs, Vulkan, OpenGL, Metal, IPC/service sessions and client-presents texture
+sessions are not wired yet and stay as they were.
+
+**The probe.** At most ten times a second, on app frames only, the hub copies the
+stereo atlas into a mip-chained scratch, generates its mips and copies one small level
+(each eye 256–511 px wide) into a staging texture, which it reads on a later frame with
+`D3D11_MAP_FLAG_DO_NOT_WAIT`. Nothing on the frame path waits for the GPU. A worker
+thread reduces each eye to a 256×24 luma grid and runs the policy. Only a 2×1 stereo
+atlas is probed; any other layout (a 2D rendering mode, more views) idles.
+
+**Automatic 2D.** The eyes are flat when they are nearly identical, or when a single
+horizontal shift explains their difference (a menu drawn at one depth). 2D after five
+consecutive flat probes (about half a second), 3D again on the second consecutive
+probe that sees depth, so a cut never flickers the lens. In 2D the hub asks the
+display processor for hardware 2D through its normal display-mode request and hands
+it tile 0 alone, as a 2D rendering mode would; the stereo atlas keeps arriving, so the
+probe sees when the eyes differ again. While 2D is held, the session's own requests
+(begin/end session, the V key) are recorded, not forwarded, and the session's last
+choice is restored when the hold clears — never a forced 3D. Leaving stereo (a 2D
+rendering mode) releases the hold at once.
+
+**Automatic re-convergence.** Every disparity `d` (positive behind the screen) becomes
+`d + Δ`: the left view moves by `−Δ/2`, the right by `+Δ/2`, and the uncovered edge
+strip is black. `Δ` puts the scene's screen-plane estimate at zero — the centre-weighted
+rule of the lift auto-convergence (the blend of the ~p80 of nearness and the dominant
+clump with the far background excluded), on block disparities matched between the two
+grids — then keeps the far and near content inside `maxBehindFraction` /
+`maxFrontFraction` (when both cannot hold, the middle of the two) and `|Δ|` within
+`maxShiftFraction`. The first estimate, a scene cut and a return from automatic 2D
+snap; otherwise a one-second follower with a dead band; flat or ambiguous probes hold.
+Per frame the applied shift moves a few pixels at most. The shift is applied in the
+hub's crop stage, before the display processor; it is vendor-neutral and costs one
+atlas-sized copy per frame while non-zero.
+
+Why a picture shift rather than the rig's `convergenceDiopters`: on a camera rig the
+convergence is the asymmetric frustum the app reads from `xrLocateViews`, and an app
+that caches its field of view at startup ignores a changed frustum. Expressing it
+through the eye poses would mean toe-in (vertical disparity). The shift needs nothing
+from the app.
+
+Log lines (WARN unless noted): `legacy auto-stereo: ON for this legacy session …` once
+per session; `legacy auto-stereo: probing the …` at the first stereo frame;
+`legacy auto-2D: 2D — both eyes show one flat picture …` and
+`legacy auto-2D: back to the session's 3D — the eyes differ again …` per edge;
+`legacy auto-convergence: engaged — screen plane moved by …` once; INFO per scene cut
+and every 5 s while engaged.
+
 ## Disparity does not depend on the display
 
 The profile seeds a **camera** rig, computed by the shared core's camera math
@@ -160,6 +245,10 @@ has to be judged on that panel.
 
 ## Validation
 
+`tests_aux_stereo_auto` covers the automatic-2D detector (flat, flat at one depth,
+two depths, uncorrelated eyes), the hysteresis, the disparity estimate, the comfort
+clamp and cap, the temporal policy (first estimate, slow follow, cut snap, flat hold)
+and the profile keys above.
 `tests_camera_profile` covers parsing, defaults, scalar bounds, alias conversions
 for 16:9 and 16:10 canvases, file/override precedence, invalid data, skipped
 unknown fields and their notice, size limits and Unicode paths.

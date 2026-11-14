@@ -56,6 +56,7 @@
 #include <d3d11_4.h>
 #include <dxgi1_4.h>
 
+#include "comp_hub_d3d11_auto_stereo.h"
 #include "comp_split_gate.h"
 #include "comp_xbridge.h"
 #include "comp_xbridge_share_tap.h"
@@ -138,6 +139,19 @@ struct comp_hub_d3d11
 	 * when the window returns. Under dp_mutex.
 	 */
 	bool seg_primary_uncovered;
+
+	/*!
+	 * #2639 / #2640: legacy automatic 2D + re-convergence (NULL = off, the
+	 * default). @ref auto_held: automatic 2D holds the lens in 2D over the
+	 * session's @ref mode_3d, which keeps recording the session's own requests
+	 * and is restored when the hold clears (the util/u_display_mode_hold.h
+	 * rule: never a forced 3D). Written under dp_mutex.
+	 */
+	struct comp_hub_auto_stereo *auto_stereo;
+	bool auto_held;
+	bool auto_conv_logged;
+	uint32_t auto_cuts_logged;
+	uint64_t auto_log_ns;
 
 	//! @name The SCANOUT adapter — everything the weave and the present touch.
 	//! @{
@@ -1242,6 +1256,9 @@ split_release_direct(struct comp_hub_d3d11 *s)
 static void
 split_release_out(struct comp_hub_d3d11 *s)
 {
+	// #2639: its GPU objects live on out_dev; its worker is joined here.
+	comp_hub_auto_stereo_destroy(&s->auto_stereo);
+	s->auto_held = false;
 	split_release_direct(s);
 	if (s->xbridge != NULL) {
 		comp_xbridge_quiesce(s->xbridge);
@@ -1349,13 +1366,20 @@ split_destroy_mutexes(struct comp_hub_d3d11 *s)
  * re-sent at once. Sends it on a coverage edge, or always with @p force (a
  * freshly swapped-in DP). One WARN per edge. Weave thread.
  */
+//! The lens the session's DPs are asked for: its own mode unless automatic 2D holds 2D (#2639).
+static inline bool
+split_lens_3d(const struct comp_hub_d3d11 *s)
+{
+	return s->mode_3d && !s->auto_held;
+}
+
 static void
 split_seg_primary_lens(struct comp_hub_d3d11 *s, bool force)
 {
 	const bool uncovered = !comp_d3d11_segments_primary_covered(s->segments);
 	os_mutex_lock(&s->dp_mutex);
 	const bool edge = uncovered != s->seg_primary_uncovered;
-	const bool want = s->mode_3d && !uncovered;
+	const bool want = split_lens_3d(s) && !uncovered;
 	if (edge || force) {
 		s->seg_primary_uncovered = uncovered;
 		if (s->dp != nullptr) {
@@ -1522,7 +1546,7 @@ split_segments_update(struct comp_hub_d3d11 *s, uint32_t tgt_w, uint32_t tgt_h, 
 			split = comp_d3d11_segments_update(s->segments, &win, &canvas, s->out_ctx, mode_index);
 			// Every segment DP follows the session's 2D/3D mode on the
 			// screens the window covers, 2D on one it left (#2247).
-			comp_d3d11_segments_set_display_mode(s->segments, s->mode_3d);
+			comp_d3d11_segments_set_display_mode(s->segments, split_lens_3d(s));
 		}
 	}
 	// #2247: the primary screen's lens follows coverage too (edges only).
@@ -4572,6 +4596,98 @@ split_pdt_get(struct comp_hub_d3d11 *s, uint64_t seq)
  * so a content box smaller than the texture is cropped on THIS device, the same
  * single copy the tier's own single-device path pays.
  */
+/*!
+ * #2639 / #2640: a legacy session's automatic 2D and automatic re-convergence,
+ * on the weave thread, right before the DP reads the atlas (crop-before-DP:
+ * the compositor never weaves). Enacts a pending 2D/3D edge first — the lens
+ * through the DP's request_display_mode, held over the session's own choice —
+ * then lets comp_hub_auto_stereo_frame poll / issue its probe and replace the
+ * DP input with tile 0 (2D) or the shifted copy. Returns true when the input
+ * changed. A no-op unless comp_hub_d3d11_set_legacy_auto_stereo enabled it.
+ */
+static bool
+split_auto_stereo_apply(struct comp_hub_d3d11 *s,
+                        bool is_repaint,
+                        uint64_t seq,
+                        ID3D11ShaderResourceView **srv,
+                        uint32_t *cols,
+                        uint32_t *rows,
+                        uint32_t *view_w,
+                        uint32_t *view_h)
+{
+	struct comp_hub_auto_stereo *as = s->auto_stereo;
+	if (as == nullptr) {
+		return false;
+	}
+	bool flat = false;
+	if (!is_repaint && comp_hub_auto_stereo_lens_edge(as, s->mode_3d, *cols, *rows, &flat)) {
+		os_mutex_lock(&s->dp_mutex);
+		s->auto_held = flat;
+		const bool want_3d = s->mode_3d && !flat;
+		const bool ok = s->dp != nullptr && xrt_display_processor_d3d11_request_display_mode(
+		                                        s->dp, want_3d && !s->seg_primary_uncovered);
+		os_mutex_unlock(&s->dp_mutex);
+		if (comp_d3d11_segments_enabled(s->segments)) {
+			comp_d3d11_segments_set_display_mode(s->segments, want_3d);
+		}
+		comp_hub_auto_stereo_lens_commit(as, flat);
+		struct comp_hub_auto_stereo_stats st = {};
+		comp_hub_auto_stereo_get_stats(as, &st);
+		if (flat) {
+			U_LOG_W(
+			    "legacy auto-2D: 2D — both eyes show one flat picture (eye difference %.1f, %.1f after the "
+			    "best shift of %.1f px; probe %llu): hardware 2D and the left eye alone%s (#2639)",
+			    st.unshifted, st.best, st.best_shift_frac * (double)*view_w, (unsigned long long)st.probes,
+			    ok ? "" : " — the display processor did not take the lens request");
+		} else {
+			U_LOG_W(
+			    "legacy auto-2D: back to the session's %s — %s (eye difference %.1f, %.1f after the best "
+			    "shift; probe %llu)%s (#2639)",
+			    want_3d ? "3D" : "2D",
+			    s->mode_3d && *cols == 2 && *rows == 1 ? "the eyes differ again"
+			                                           : "the session left stereo",
+			    st.unshifted, st.best, (unsigned long long)st.probes,
+			    ok ? "" : " — the display processor did not take the lens request");
+		}
+	}
+	struct comp_hub_auto_stereo_view v = {*srv, *cols, *rows, *view_w, *view_h};
+	const bool changed = comp_hub_auto_stereo_frame(as, s->out_dev, s->out_ctx, is_repaint, seq, s->mode_3d, &v);
+	if (!is_repaint) {
+		// Re-convergence: one WARN when it first moves the picture, INFO per
+		// scene cut and every 5 s while engaged (never per frame).
+		struct comp_hub_auto_stereo_stats st = {};
+		comp_hub_auto_stereo_get_stats(as, &st);
+		const int32_t px = (int32_t)lround((double)st.shift * (double)*view_w);
+		const uint64_t now = os_monotonic_get_ns();
+		if (!s->auto_conv_logged && px != 0) {
+			s->auto_conv_logged = true;
+			s->auto_log_ns = now;
+			U_LOG_W(
+			    "legacy auto-convergence: engaged — screen plane moved by %+d px (%.4f of the eye width, "
+			    "%u confident blocks) with a horizontal shift before the display processor (#2640)",
+			    px, (double)st.shift, st.blocks);
+		} else if (st.cuts != s->auto_cuts_logged) {
+			s->auto_cuts_logged = st.cuts;
+			s->auto_log_ns = now;
+			U_LOG_I("legacy auto-convergence: scene cut %u — shift snapped to %+d px (%u blocks)", st.cuts,
+			        px, st.blocks);
+		} else if (s->auto_conv_logged && now - s->auto_log_ns > 5ull * 1000ull * 1000ull * 1000ull) {
+			s->auto_log_ns = now;
+			U_LOG_I("legacy auto-convergence: shift %+d px (%.4f), %u blocks, %llu probes, %u cuts", px,
+			        (double)st.shift, st.blocks, (unsigned long long)st.probes, st.cuts);
+		}
+	}
+	if (!changed) {
+		return false;
+	}
+	*srv = v.srv;
+	*cols = v.cols;
+	*rows = v.rows;
+	*view_w = v.view_w;
+	*view_h = v.view_h;
+	return true;
+}
+
 static bool
 split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_rect *canvas)
 {
@@ -4594,10 +4710,10 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 		s->no_slot++;
 		return false;
 	}
-	const uint32_t weave_cols = s->gen_cols != 0 ? s->gen_cols : 1;
-	const uint32_t weave_rows = s->gen_rows != 0 ? s->gen_rows : 1;
-	const uint32_t weave_view_w = d.content_w / weave_cols;
-	const uint32_t weave_view_h = d.content_h / weave_rows;
+	uint32_t weave_cols = s->gen_cols != 0 ? s->gen_cols : 1;
+	uint32_t weave_rows = s->gen_rows != 0 ? s->gen_rows : 1;
+	uint32_t weave_view_w = d.content_w / weave_cols;
+	uint32_t weave_view_h = d.content_h / weave_rows;
 	if (weave_view_w == 0 || weave_view_h == 0) {
 		s->no_slot++;
 		return false;
@@ -4670,13 +4786,13 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 	const bool seg_split = split_segments_update(s, tgt_w, tgt_h, &seg_window);
 
 	if (is_repaint) {
-		comp_d3d11_target_weave_mark_repaint(s->target, s->mode_3d);
+		comp_d3d11_target_weave_mark_repaint(s->target, split_lens_3d(s));
 	} else {
 		// #2317 P1c: the caller's xrWaitFrame promise for THIS frame (#2327:
 		// looked up by the woven frame's seq), so the DXR_WEAVE_LATENCY_CSV
 		// site emits the D (prediction error) rows the tiers' own sites do.
 		// 0 (never set) keeps the old no-D-row behaviour.
-		comp_d3d11_target_weave_mark(s->target, split_pdt_get(s, d.frame_seq), s->mode_3d);
+		comp_d3d11_target_weave_mark(s->target, split_pdt_get(s, d.frame_seq), split_lens_3d(s));
 	}
 
 	xrt_display_processor_d3d11_set_frame_timing(s->dp, comp_d3d11_target_get_measured_weave_ns(s->target),
@@ -4700,6 +4816,14 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 	struct xrt_rect cv = {};
 	if (canvas != nullptr) {
 		cv = *canvas;
+	}
+	// #2639 / #2640: a legacy session's automatic 2D / re-convergence — the
+	// one-view crop or the shifted copy, before the DP (off = no-op).
+	uint32_t cap_w = d.content_w, cap_h = d.content_h;
+	if (split_auto_stereo_apply(s, is_repaint, d.frame_seq, &atlas_srv, &weave_cols, &weave_rows, &weave_view_w,
+	                            &weave_view_h)) {
+		cap_w = weave_cols * weave_view_w;
+		cap_h = weave_rows * weave_view_h;
 	}
 	if (seg_split) {
 		struct comp_d3d11_segments_frame sf = {};
@@ -4732,7 +4856,7 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 	}
 	// #2342 P2c: an armed capture's DP input — read before the consumer signal
 	// below releases the atlas back to the producer.
-	split_capture_dp_input(s, is_repaint, atlas_srv, d.content_w, d.content_h);
+	split_capture_dp_input(s, is_repaint, atlas_srv, cap_w, cap_h);
 
 	{
 		auto *dst = static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(s->target));
@@ -5178,10 +5302,10 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 	 * window, and cropping it to the current frame's box would slice the tiles
 	 * at the wrong stride.
 	 */
-	const uint32_t weave_cols = s->gen_cols != 0 ? s->gen_cols : 1;
-	const uint32_t weave_rows = s->gen_rows != 0 ? s->gen_rows : 1;
-	const uint32_t weave_view_w = slot_cw / weave_cols;
-	const uint32_t weave_view_h = slot_ch / weave_rows;
+	uint32_t weave_cols = s->gen_cols != 0 ? s->gen_cols : 1;
+	uint32_t weave_rows = s->gen_rows != 0 ? s->gen_rows : 1;
+	uint32_t weave_view_w = slot_cw / weave_cols;
+	uint32_t weave_view_h = slot_ch / weave_rows;
 	if (weave_view_w == 0 || weave_view_h == 0) {
 		s->no_slot++;
 		return false;
@@ -5215,7 +5339,7 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 	// Late-weave pacing + the weave-latency harness mark, on the scanout
 	// adapter where the present now happens.
 	if (is_repaint) {
-		comp_d3d11_target_weave_mark_repaint(s->target, s->mode_3d);
+		comp_d3d11_target_weave_mark_repaint(s->target, split_lens_3d(s));
 	} else {
 		// #2317 P1c: the caller's xrWaitFrame promise for this frame, so the
 		// DXR_WEAVE_LATENCY_CSV site emits the D (prediction error) rows the
@@ -5227,7 +5351,7 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 		uint64_t slot_seq = 0;
 		const uint64_t pdt =
 		    comp_xbridge_slot_seq(s->xbridge, slot, &slot_seq) ? split_pdt_get(s, slot_seq) : 0;
-		comp_d3d11_target_weave_mark(s->target, pdt, s->mode_3d);
+		comp_d3d11_target_weave_mark(s->target, pdt, split_lens_3d(s));
 	}
 
 	/*
@@ -5291,6 +5415,19 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 	 * pixels they belong to, so the weave phase is the window's as always. The
 	 * target outside it is cleared — those window pixels are off the panel.
 	 */
+	// #2639 / #2640: a legacy session's automatic 2D / re-convergence — the
+	// one-view crop or the shifted copy, before the DP (off = no-op).
+	uint32_t cap_w = slot_cw, cap_h = slot_ch;
+	{
+		uint64_t as_seq = 0;
+		(void)comp_xbridge_slot_seq(s->xbridge, slot, &as_seq);
+		if (split_auto_stereo_apply(s, is_repaint, as_seq, &atlas_srv, &weave_cols, &weave_rows, &weave_view_w,
+		                            &weave_view_h)) {
+			cap_w = weave_cols * weave_view_w;
+			cap_h = weave_rows * weave_view_h;
+		}
+	}
+
 	struct comp_xbridge_tile_clip slot_clip = {};
 	const bool slot_clipped = comp_xbridge_slot_tile_clip(s->xbridge, slot, &slot_clip);
 	if (slot_clipped) {
@@ -5375,7 +5512,7 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *s, bool is_repaint, cons
 		                                          (uint32_t)cv.extent.h);
 	}
 	// #2342 P2c: an armed capture's DP input (the slot's content box).
-	split_capture_dp_input(s, is_repaint, atlas_srv, slot_cw, slot_ch);
+	split_capture_dp_input(s, is_repaint, atlas_srv, cap_w, cap_h);
 
 	/*
 	 * VK-1b-2 — the masked 2D-over-3D composite, then the HUD, both on the OUT
@@ -5896,6 +6033,13 @@ comp_hub_d3d11_request_display_mode(struct comp_hub_d3d11 *s, bool enable_3d)
 		return false;
 	}
 	os_mutex_lock(&s->dp_mutex);
+	if (s->auto_held) {
+		// #2639: automatic 2D holds the lens — record the session's choice
+		// now, enact it when the hold clears (u_display_mode_hold.h rule).
+		s->mode_3d = enable_3d;
+		os_mutex_unlock(&s->dp_mutex);
+		return true;
+	}
 	// #2247: the primary screen stays 2D while the window has wholly left it;
 	// the weave restores mode_3d when it returns.
 	const bool ok = s->dp != nullptr &&
@@ -5979,7 +6123,37 @@ comp_hub_d3d11_get_background_preview(struct comp_hub_d3d11 *s, struct xrt_dp_ba
 	return ok;
 }
 
+extern "C" void
+comp_hub_d3d11_set_legacy_auto_stereo(struct comp_hub_d3d11 *s,
+                                      const struct u_legacy_stereo_auto *cfg,
+                                      const char *source)
+{
+	if (s == nullptr || cfg == nullptr || s->auto_stereo != nullptr || s->client_presents) {
+		return;
+	}
+	s->auto_stereo = comp_hub_auto_stereo_create(cfg);
+	if (s->auto_stereo == nullptr) {
+		return;
+	}
+	U_LOG_W(
+	    "legacy auto-stereo: ON for this legacy session (%s) — automatic 2D %s, automatic re-convergence %s "
+	    "(max shift %.3f, far content <= %.3f behind, near content <= %.3f in front, fractions of the eye "
+	    "width); measured on the submitted eyes, applied before the display processor (#2639 / #2640)",
+	    source != nullptr ? source : "?", cfg->auto_2d ? "on" : "off", cfg->auto_convergence ? "on" : "off",
+	    (double)cfg->max_shift_fraction, (double)cfg->max_behind_fraction, (double)cfg->max_front_fraction);
+}
+
 #else /* !(XRT_OS_WINDOWS && XRT_HAVE_D3D11) */
+
+extern "C" void
+comp_hub_d3d11_set_legacy_auto_stereo(struct comp_hub_d3d11 *split,
+                                      const struct u_legacy_stereo_auto *cfg,
+                                      const char *source)
+{
+	(void)split;
+	(void)cfg;
+	(void)source;
+}
 
 extern "C" void
 comp_hub_d3d11_decline_share_tap(struct comp_hub_d3d11 *split, uint32_t reason)

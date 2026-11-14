@@ -80,6 +80,7 @@ set(tests
     tests_aux_stereo_comfort
     tests_aux_lift_cursor
     tests_aux_lift_autoconv
+    tests_aux_stereo_auto
     tests_aux_rear_budget
     tests_aux_route_policy
     tests_aux_vk_queue_lock_route

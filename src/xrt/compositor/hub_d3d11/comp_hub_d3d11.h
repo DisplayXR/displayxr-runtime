@@ -134,6 +134,7 @@ struct xrt_segment_metrics;
 struct xrt_system_compositor_info;
 struct comp_segments_content;
 struct comp_hub_d3d11_handoff;
+struct u_legacy_stereo_auto;
 //! XR_DXR_depth_budget - taken by pointer only; see xrt/xrt_display_processor.h.
 struct xrt_dp_background_preview;
 
@@ -520,6 +521,18 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
  */
 bool
 comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *split, const struct comp_hub_d3d11_handoff *handoff);
+
+/*!
+ * #2639 / #2640: turn on a LEGACY session's automatic 2D and/or automatic
+ * re-convergence (util/u_stereo_auto.h, comp_hub_d3d11_auto_stereo.h). Call
+ * once, after Stage A; @p cfg enabling nothing, or a client-presents hub, is a
+ * no-op. @p source names where the switches came from, for the one WARN.
+ * Both stay off unless called: a display-aware session owns its own mode/rig.
+ */
+void
+comp_hub_d3d11_set_legacy_auto_stereo(struct comp_hub_d3d11 *split,
+                                      const struct u_legacy_stereo_auto *cfg,
+                                      const char *source);
 
 /*!
  * Release everything, in the reverse of the create order, and NULL the caller's

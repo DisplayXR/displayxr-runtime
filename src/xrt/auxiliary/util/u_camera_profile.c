@@ -176,6 +176,16 @@ u_camera_profile_parse(const char *json, float aspect, struct u_camera_profile *
 			bit = 32;
 		else if (strcmp(key, "pullbackMeters") == 0)
 			bit = 64;
+		else if (strcmp(key, "auto2d") == 0)
+			bit = 128;
+		else if (strcmp(key, "autoConvergence") == 0)
+			bit = 256;
+		else if (strcmp(key, "maxShiftFraction") == 0)
+			bit = 512;
+		else if (strcmp(key, "maxBehindFraction") == 0)
+			bit = 1024;
+		else if (strcmp(key, "maxFrontFraction") == 0)
+			bit = 2048;
 		if (bit == 0) {
 			note_ignored_key(notice, sizeof(notice), &notice_used, key);
 			continue;
@@ -186,6 +196,24 @@ u_camera_profile_parse(const char *json, float aspect, struct u_camera_profile *
 			break;
 		}
 		seen |= bit;
+		if (bit == 128 || bit == 256) {
+			// The legacy picture policy switches: true/false, or 0/1.
+			bool on;
+			if (cJSON_IsBool(item))
+				on = cJSON_IsTrue(item);
+			else if (cJSON_IsNumber(item) && (item->valuedouble == 0.0 || item->valuedouble == 1.0))
+				on = item->valuedouble == 1.0;
+			else {
+				ok = false;
+				reason = "auto2d / autoConvergence must be true, false, 0 or 1";
+				break;
+			}
+			if (bit == 128)
+				result.stereo.auto_2d = on;
+			else
+				result.stereo.auto_convergence = on;
+			continue;
+		}
 		if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble)) {
 			ok = false;
 			reason = "camera profile values must be finite numbers";
@@ -236,6 +264,19 @@ u_camera_profile_parse(const char *json, float aspect, struct u_camera_profile *
 				break;
 			}
 			result.pullback_m = (float)value;
+		} else if (bit == 512 || bit == 1024 || bit == 2048) {
+			if (!(value >= 0.0 && value <= 0.2)) {
+				ok = false;
+				reason =
+				    "maxShiftFraction / maxBehindFraction / maxFrontFraction must be between 0 and 0.2";
+				break;
+			}
+			if (bit == 512)
+				result.stereo.max_shift_fraction = (float)value;
+			else if (bit == 1024)
+				result.stereo.max_behind_fraction = (float)value;
+			else
+				result.stereo.max_front_fraction = (float)value;
 		} else {
 			if (strcmp(key, "renderedBaselineMeters") == 0) {
 				if (value <= 0) {
@@ -431,4 +472,53 @@ u_camera_profile_load_for_process(float aspect, struct u_camera_profile *out, ch
 		if (*p == '/' || *p == '\\')
 			base = p + 1;
 	return u_camera_profile_load(base, dir, NULL, aspect, out, error, size);
+}
+
+int
+u_legacy_stereo_auto_parse_flag(const char *value)
+{
+	if (value == NULL || value[0] == '\0')
+		return -1;
+	if (strcmp(value, "1") == 0 || strcmp(value, "on") == 0 || strcmp(value, "true") == 0 ||
+	    strcmp(value, "yes") == 0)
+		return 1;
+	if (strcmp(value, "0") == 0 || strcmp(value, "off") == 0 || strcmp(value, "false") == 0 ||
+	    strcmp(value, "no") == 0)
+		return 0;
+	return -1;
+}
+
+bool
+u_legacy_stereo_auto_load_for_process(struct u_legacy_stereo_auto *out, const char **out_source)
+{
+	const struct u_legacy_stereo_auto defaults = U_LEGACY_STEREO_AUTO_DEFAULT;
+	*out = defaults;
+	bool from_profile = false, from_env = false;
+	struct u_camera_profile profile;
+	char error[192] = {0};
+	// The aspect only feeds the horizontalFovDeg alias of the camera tuning,
+	// which this reader does not use; any positive value keeps such a record valid.
+	if (u_camera_profile_load_for_process(1.0f, &profile, error, sizeof(error)) == U_CAMERA_PROFILE_LOADED) {
+		*out = profile.stereo;
+		from_profile = out->auto_2d || out->auto_convergence;
+	}
+	char value[32];
+	int flag =
+	    environment("DXR_LEGACY_AUTO_2D", value, sizeof(value)) ? u_legacy_stereo_auto_parse_flag(value) : -1;
+	if (flag >= 0) {
+		out->auto_2d = flag == 1;
+		from_env = true;
+	}
+	flag = environment("DXR_LEGACY_AUTO_CONVERGENCE", value, sizeof(value)) ? u_legacy_stereo_auto_parse_flag(value)
+	                                                                        : -1;
+	if (flag >= 0) {
+		out->auto_convergence = flag == 1;
+		from_env = true;
+	}
+	if (out_source != NULL)
+		*out_source = from_profile && from_env ? "profile+env"
+		              : from_env               ? "env"
+		              : from_profile           ? "profile"
+		                                       : "default";
+	return out->auto_2d || out->auto_convergence;
 }

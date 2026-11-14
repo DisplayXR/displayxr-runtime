@@ -34,6 +34,8 @@ add_library(
 	u_stereo_comfort.h
 	u_lift_autoconv.c
 	u_lift_autoconv.h
+	u_stereo_auto.c
+	u_stereo_auto.h
 	u_lift_cursor.c
 	u_lift_cursor.h
 	u_lift_depth.c
