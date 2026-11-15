@@ -1092,6 +1092,16 @@ void
 comp_hub_d3d11_set_window_hidden(struct comp_hub_d3d11 *split, bool hidden);
 
 /*!
+ * #2671: the owning compositor's window-visibility tracker, borrowed (NULL =
+ * every part visible; it must outlive the hub or be cleared first). The hub's
+ * segment DPs on other 3D screens then hold their lens at 2D while the
+ * window's part on their screen is hidden (ADR-047 multi-screen). Any thread.
+ */
+struct u_window_visibility;
+void
+comp_hub_d3d11_set_visibility(struct comp_hub_d3d11 *split, const struct u_window_visibility *vis);
+
+/*!
  * #2639: does this hub run a legacy session's automatic 2D? Its decision is
  * presentation-only, so xrLocateViews must hand such a session its per-eye
  * views whatever the lens is doing: a DP in hardware 2D reports one centred

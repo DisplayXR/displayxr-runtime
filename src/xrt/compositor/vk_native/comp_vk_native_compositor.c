@@ -49,6 +49,7 @@
 #include "vk/vk_local2d_composite.h"
 
 #include "util/u_logging.h"
+#include "util/u_window_visibility.h"
 #include "util/u_setting.h"
 #include "util/u_vk_queue_lock.h"
 #include "util/u_weave_scope.h"
@@ -967,6 +968,25 @@ struct comp_vk_native_compositor
 	//! The session's eye-tracking mode, re-sent to a swapped-in primary DP.
 	uint32_t eye_tracking_mode;
 	bool eye_tracking_mode_set;
+
+	/*!
+	 * @name #2671: the lens wish follows whether the window can be seen
+	 * @{
+	 */
+	//! Every pixel of the window on the 3D screen is hidden (minimized,
+	//! cloaked or covered); latched by the tracker's callback under
+	//! dp_swap_mutex. The DP is then asked for 2D whatever the session's mode;
+	//! under the split the hub holds the same latch.
+	bool window_hidden;
+	//! The session's own last 2D/3D request — what a return restores
+	//! (lens-preference-ownership.md). Under dp_swap_mutex.
+	bool session_wants_3d;
+	//! The window went hidden; the next zone publish after it is seen again
+	//! starts from scratch (clear, then publish). Set by the callback.
+	volatile LONG zone_reeval_owed;
+	//! Low-rate visibility tracker (NULL = always visible).
+	struct u_window_visibility *visibility;
+	//! @}
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -6263,6 +6283,18 @@ vk_dp_canvas_rect(struct comp_vk_native_compositor *c)
  * vk_dp_request_display_mode, which applies the same gate. One WARN per edge.
  * Weave thread.
  */
+//! #2671: the session's window is hidden (Windows tracker); never on other platforms yet.
+static inline bool
+vk_window_hidden(const struct comp_vk_native_compositor *c)
+{
+#ifdef XRT_OS_WINDOWS
+	return c->window_hidden;
+#else
+	(void)c;
+	return false;
+#endif
+}
+
 static void
 vk_seg_primary_lens(struct comp_vk_native_compositor *c, struct xrt_display_processor *dp, bool force)
 {
@@ -6275,7 +6307,8 @@ vk_seg_primary_lens(struct comp_vk_native_compositor *c, struct xrt_display_proc
 		return;
 	}
 	c->seg_primary_uncovered = uncovered;
-	const bool want = c->hardware_display_3d && !uncovered;
+	// #2671: and 2D while the window is hidden; the visibility callback restores it.
+	const bool want = c->hardware_display_3d && !uncovered && !vk_window_hidden(c);
 #ifdef XRT_OS_LINUX_DESKTOP
 	const bool held = c->display_mode_hold.held;
 #else
@@ -6471,8 +6504,12 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 	    c->segments, &c->seg_window, &canvas, (int32_t)VK_FORMAT_B8G8R8A8_UNORM, !c->fill_parked,
 	    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : 0);
 	// Every segment DP follows the session's 2D/3D mode on the screens the
-	// window covers, 2D on one it left (#2247) — a DP created by the update
-	// above gets it here, before it weaves.
+	// window covers, 2D on one it left (#2247) or on one where the window's
+	// part is hidden (#2671) — a DP created by the update above gets it here,
+	// before it weaves.
+#ifdef XRT_OS_WINDOWS
+	comp_vk_native_segments_set_visibility(c->segments, c->visibility);
+#endif
 	comp_vk_native_segments_set_display_mode(c->segments, c->hardware_display_3d);
 	return split;
 }
@@ -14004,6 +14041,13 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 
 	U_LOG_I("Destroying VK native compositor");
 
+#ifdef XRT_OS_WINDOWS
+	// #2671: join the visibility tracker before anything its callback touches
+	// (the split, the DP, dp_swap_mutex). No lock is held here, so the join
+	// cannot wait on one. Freed last: the segment manager and the split borrow it.
+	u_window_visibility_stop(c->visibility);
+#endif
+
 	/*
 	 * #1394: a wedged weave thread cannot be joined, and nothing below is
 	 * safe while it lives.
@@ -14298,6 +14342,9 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	// XR_DXR_depth_budget: the runner owns a mutex.
 	comp_rear_budget_fini(&c->rear_budget);
 
+#ifdef XRT_OS_WINDOWS
+	u_window_visibility_destroy(&c->visibility); // #2671: borrowed by nothing now
+#endif
 	free(c);
 }
 
@@ -14580,9 +14627,17 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 	// saving partly bought black de-occlusions. WGC cost is attacked via
 	// capture throttling instead. client_presents=true remains correct for
 	// true client-side presents (#551 IPC) and bandless content.
+#ifdef XRT_OS_WINDOWS
+	// #2671: a DP created while the window is hidden starts at 2D (the
+	// visibility callback could not reach a DP that did not exist yet).
+	if (c->display_processor != NULL && vk_window_hidden(c) && !c->hw3d_request_pending) {
+		(void)xrt_display_processor_request_display_mode(c->display_processor, false);
+	}
+#endif
 	if (c->display_processor != NULL && c->hw3d_request_pending) {
 		c->hw3d_request_pending = false;
-		const bool ok = xrt_display_processor_request_display_mode(c->display_processor, c->hw3d_request_value);
+		const bool ok = xrt_display_processor_request_display_mode(
+		    c->display_processor, c->hw3d_request_value && !c->seg_primary_uncovered && !vk_window_hidden(c));
 		U_LOG_W("HW3D_DBG vk_native: applied deferred enable_3d=%d after DP create -> %d",
 		        (int)c->hw3d_request_value, (int)ok);
 	}
@@ -14771,7 +14826,10 @@ vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, con
 	if (c->renderer != NULL) {
 		comp_vk_native_renderer_finish_deferred(c->renderer);
 	}
+	// #2671: the visibility callback reaches c->split under dp_swap_mutex.
+	os_mutex_lock(&c->dp_swap_mutex);
 	comp_hub_d3d11_retire(&c->split, why, short_reason);
+	os_mutex_unlock(&c->dp_swap_mutex);
 	c->split_off_reason = short_reason;
 	// #2317 P2a: the hub (and the consumer fence it owned) is gone; nothing
 	// more is owed. Safe: every submit that waited on it has completed (the
@@ -14821,6 +14879,40 @@ vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, con
  * Exported functions
  *
  */
+
+#ifdef XRT_OS_WINDOWS
+/*!
+ * #2671: the window's visibility changed (tracker thread, at most a few Hz,
+ * transitions only). Takes dp_swap_mutex like the app-thread request entry
+ * point (vk_dp_request_display_mode) — it guards the primary DP against the
+ * Amendment-2 swap, and the split's retire takes it too — and never c->mutex,
+ * which a wedged weave can hold for good (#1394). Hidden: the lens wish is 2D;
+ * visible: the session's own choice comes back (never a forced 3D).
+ */
+static void
+vk_visibility_changed(void *userdata, bool hidden)
+{
+	struct comp_vk_native_compositor *c = (struct comp_vk_native_compositor *)userdata;
+	os_mutex_lock(&c->dp_swap_mutex);
+	c->window_hidden = hidden;
+	if (hidden) {
+		// A published zone wish is withheld from now on (vk_sync_zone_mask_to_dp).
+		InterlockedExchange(&c->zone_reeval_owed, 1);
+	}
+	if (c->display_processor != NULL) {
+		// A published zone wish owns the lens (ADR-027): seen again, the next
+		// publish restores its verdict, so the session's mode is not re-sent.
+		if (hidden || !c->zone_published) {
+			(void)xrt_display_processor_request_display_mode(
+			    c->display_processor, c->session_wants_3d && !c->seg_primary_uncovered && !hidden);
+		}
+	} else if (c->split != NULL) {
+		comp_hub_d3d11_set_window_hidden(c->split, hidden);
+	}
+	// No DP yet and no split: the lazy create reads window_hidden.
+	os_mutex_unlock(&c->dp_swap_mutex);
+}
+#endif
 
 xrt_result_t
 comp_vk_native_compositor_create(struct xrt_device *xdev,
@@ -16120,6 +16212,17 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// Install MCP capture_frame hook + arm the trigger-file path (#210).
 	mcp_capture_init(&c->mcp_capture);
 	mcp_capture_install(&c->mcp_capture);
+
+#ifdef XRT_OS_WINDOWS
+	// #2671: the window's visibility drives the lens wish. Last, so the DP or
+	// the split exists before the first transition can reach them (a lazy DP
+	// reads the latch at creation); the 3D screen's name arrives with
+	// set_screens. No window, no tracker (NULL = always visible).
+	c->session_wants_3d = true;
+	c->visibility = u_window_visibility_create(c->hwnd, NULL, "vk", vk_visibility_changed, c);
+	// The split's segment DPs on other 3D screens follow the window's part there.
+	comp_hub_d3d11_set_visibility(c->split, c->visibility);
+#endif
 
 	*out_xc = &c->base;
 
@@ -17702,7 +17805,9 @@ vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d)
 	// #2247: the session's DP weaves the primary screen; while the window has
 	// wholly left it, that screen stays 2D (the weave restores the session's
 	// mode when it returns). The split's weaver applies its own gate.
-	const bool dp_3d = enable_3d && !c->seg_primary_uncovered;
+	// #2671: likewise while the window is hidden; the visibility callback
+	// restores the session's choice when it is seen again.
+	const bool dp_3d = enable_3d && !c->seg_primary_uncovered && !vk_window_hidden(c);
 	U_LOG_W("HW3D_DBG vk_native request enable_3d=%d dp=%p has_slot=%d slot=%p", (int)enable_3d,
 	        (void *)c->display_processor,
 	        c->display_processor ? (int)XRT_DP_HAS_SLOT(c->display_processor, request_display_mode) : -1,
@@ -17766,6 +17871,12 @@ comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool e
 		    enable_3d ? "3D" : "2D", c->linux_surface_not_1to1 ? "NOT_1TO1" : "auto-2D, flat submission");
 		return true;
 	}
+#endif
+#ifdef XRT_OS_WINDOWS
+	// #2671: recorded on every route, so a hidden window's return restores it.
+	os_mutex_lock(&c->dp_swap_mutex);
+	c->session_wants_3d = enable_3d;
+	os_mutex_unlock(&c->dp_swap_mutex);
 #endif
 	return vk_dp_request_display_mode(c, enable_3d);
 }
@@ -17921,6 +18032,12 @@ comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
 		return;
 	}
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef XRT_OS_WINDOWS
+	// #2671: the 3D screen the visibility check clips the window to, and every
+	// screen a segment DP may weave (each judged on the window's part there).
+	u_window_visibility_set_panel(c->visibility, info->display_device_name);
+	u_window_visibility_set_screen_list(c->visibility, list);
+#endif
 	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
 	struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
 	if (copy == NULL || info_copy == NULL) {
@@ -21237,11 +21354,32 @@ vk_sync_zone_mask_to_dp(struct comp_vk_native_compositor *c)
 		if (c->zone_published) {
 			xrt_display_processor_clear_local_zone_mask(c->display_processor);
 			c->zone_published = false;
+			// #2671: a clear hands the lens back to the mode authority; while
+			// the window is hidden that stays 2D.
+			if (vk_window_hidden(c)) {
+				(void)xrt_display_processor_request_display_mode(c->display_processor, false);
+			}
 		}
 		return;
 	}
 
 #ifdef XRT_OS_WINDOWS
+	/*
+	 * #2671: no zone wish while the window is hidden. A zone-capable DP turns
+	 * its verdict into a lens request on each content change, which would undo
+	 * the visibility gate's 2D. Withheld, not cleared (a clear hands the lens to
+	 * the mode authority, which may be 3D); the first publish after the window
+	 * is seen again starts from scratch, so the DP re-sends its verdict.
+	 */
+	if (c->window_hidden) {
+		return;
+	}
+	if (InterlockedExchange(&c->zone_reeval_owed, 0) != 0 && c->zone_published) {
+		xrt_display_processor_clear_local_zone_mask(c->display_processor);
+		c->zone_published = false;
+		U_LOG_W("#2671 vk: the window is seen again - the zone wish is re-published from scratch");
+	}
+
 	// Screen-anchor the mask: client-area origin in physical screen pixels
 	// (same HWND clamp as vk_window_region). No HWND → nothing to anchor
 	// to; skip the publish.

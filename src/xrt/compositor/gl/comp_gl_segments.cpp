@@ -30,6 +30,7 @@
 #include "os/os_threading.h"
 #include "os/os_time.h"
 #include "util/u_logging.h"
+#include "util/u_window_visibility.h"
 #include "util/u_misc.h"
 #include "xrt/xrt_plugin.h"
 
@@ -62,6 +63,8 @@ struct seg_screen_state
 	int transparent_latched;             //!< last transparency declared, -1 = none.
 	int mode_sent;                       //!< last 2D/3D mode sent, -1 = none.
 	bool uncovered;                      //!< #2247: the window had wholly left this screen.
+	//! #2671: the window's part on this screen was hidden at the last set_display_mode.
+	bool vis_hidden;
 	bool tolerates_resample;
 	bool has_hwnd; //!< this DP holds the session's window (the owner).
 	struct seg_crop crop;
@@ -86,6 +89,8 @@ struct comp_gl_segments
 	struct comp_segments_lifecycle lc;
 	//! #2247: a screen's lens wish goes 2D only after it has been uncovered for the hand-off dwell.
 	struct comp_segments_cover_dwell cover;
+	//! #2671: the session's visibility tracker (borrowed; NULL = every part visible).
+	const struct u_window_visibility *vis;
 
 	/*
 	 * Who holds the window handle (ADR-047 Amendment 2). Off the primary,
@@ -1265,6 +1270,14 @@ comp_gl_segments_record(struct comp_gl_segments *segs, const struct comp_gl_segm
 }
 
 extern "C" void
+comp_gl_segments_set_visibility(struct comp_gl_segments *segs, const struct u_window_visibility *vis)
+{
+	if (segs != nullptr) {
+		segs->vis = vis;
+	}
+}
+
+extern "C" void
 comp_gl_segments_set_display_mode(struct comp_gl_segments *segs, bool enable_3d)
 {
 	if (segs == nullptr) {
@@ -1280,7 +1293,14 @@ comp_gl_segments_set_display_mode(struct comp_gl_segments *segs, bool enable_3d)
 		// has wholly left for the hand-off's dwell, the session's mode on the
 		// screens it covers (at once when it returns).
 		const bool covered = comp_segments_cover_dwell_covered(&segs->cover, i);
-		const bool want = enable_3d && covered;
+		// #2671: and 2D while the window's part on this screen is hidden
+		// (covered by other windows, or the window minimized); the session's
+		// mode again the moment any pixel there can be seen.
+		const bool part_hidden = u_window_visibility_screen_hidden(segs->vis, segs->bindings[i].device_name);
+		if (part_hidden != st->vis_hidden) {
+			st->vis_hidden = part_hidden;
+		}
+		const bool want = enable_3d && covered && !part_hidden;
 		if (covered == st->uncovered) {
 			st->uncovered = !covered;
 			// A coverage edge for a live DP: lifecycle, not per frame.

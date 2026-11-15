@@ -708,6 +708,13 @@ struct comp_d3d11_compositor
 	//! #2671: low-rate visibility tracker for the window (NULL = always visible).
 	struct u_window_visibility *visibility = nullptr;
 	/*!
+	 * #2671 + ADR-027: the window went hidden while a zone wish may be
+	 * published, so the first publish after it is seen again starts from
+	 * scratch (clear, then publish) and the DP re-sends its verdict. Set by
+	 * the visibility callback, consumed by d3d11_sync_zone_mask_to_dp.
+	 */
+	std::atomic<bool> zone_reeval_owed{false};
+	/*!
 	 * Multi-screen M3: what the app thread reads (xrLocateViews) and hands
 	 * back (xrEndFrame) while the weave thread owns the segment manager —
 	 * a small lock of its own, never c->mutex (the repaint thread holds that
@@ -1148,9 +1155,15 @@ d3d11_visibility_changed(void *userdata, bool hidden)
 	auto *c = static_cast<struct comp_d3d11_compositor *>(userdata);
 	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
 	c->window_hidden = hidden;
+	if (hidden) {
+		// A published zone wish is withheld from now on (d3d11_sync_zone_mask_to_dp).
+		c->zone_reeval_owed = true;
+	}
 	if (c->hub.split != nullptr) {
 		comp_hub_d3d11_set_window_hidden(c->hub.split, hidden);
-	} else if (c->display_processor != nullptr) {
+	} else if (c->display_processor != nullptr && (hidden || !c->zone_published)) {
+		// A published zone wish owns the lens (ADR-027): seen again, the next
+		// publish restores its verdict, so the session's mode is not re-sent.
 		xrt_display_processor_d3d11_request_display_mode(
 		    c->display_processor, c->session_wants_3d.load() && !c->seg_primary_uncovered.load() && !hidden);
 	}
@@ -1743,6 +1756,7 @@ d3d11_tt_weave(struct comp_d3d11_compositor *c,
 				                                : 0;
 				seg_split =
 				    comp_d3d11_segments_update(c->segments, &c->seg_window, &canvas, c->context, mode_index);
+				comp_d3d11_segments_set_visibility(c->segments, c->visibility); // #2671
 				comp_d3d11_segments_set_display_mode(c->segments, c->hardware_display_3d);
 			}
 			d3d11_seg_primary_lens(c, c->display_processor, false);
@@ -3829,7 +3843,9 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 				seg_split = comp_d3d11_segments_update(c->segments, &c->seg_window, &canvas,
 				                                       d3d11_out_context(c), mode_index);
 				// Every segment DP follows the session's 2D/3D mode on the
-				// screens the window covers, 2D on one it left (#2247).
+				// screens the window covers, 2D on one it left (#2247) or on
+				// one where the window's part is hidden (#2671).
+				comp_d3d11_segments_set_visibility(c->segments, c->visibility);
 				comp_d3d11_segments_set_display_mode(c->segments, c->hardware_display_3d);
 			}
 		}
@@ -6489,7 +6505,8 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 
 	// #2671: join the visibility tracker before anything its callback touches
 	// (the hub, the DP). No lock is held here, so the join cannot wait on one.
-	u_window_visibility_destroy(&c->visibility);
+	// Freed last: the segment manager and the hub borrow it until they go.
+	u_window_visibility_stop(c->visibility);
 
 	xbridge_share_tap_end(&c->share_tap);
 
@@ -6682,6 +6699,7 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	comp_rear_budget_fini(&c->rear_budget);
 	u_eye_history_destroy(&c->eye_hist); // N6 Part 1 (#2144)
 	os_precise_sleeper_deinit(&c->unpresented_sleeper); // #2386
+	u_window_visibility_destroy(&c->visibility);        // #2671: borrowed by nothing now
 
 	delete c;
 }
@@ -8021,6 +8039,8 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	{
 		HWND vis_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
 		c->visibility = u_window_visibility_create(vis_hwnd, nullptr, "d3d11", d3d11_visibility_changed, c);
+		// The hub's segment DPs on other 3D screens follow the window's part there.
+		comp_hub_d3d11_set_visibility(c->hub.split, c->visibility);
 	}
 
 	*out_xc = &c->base;
@@ -8672,8 +8692,32 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 			c->zone_published = false;
 			// #2218 (#4): every segment DP too.
 			comp_d3d11_segments_clear_zone_mask(c->segments);
+			// #2671: a clear hands the lens back to the mode authority; while
+			// the window is hidden that stays 2D.
+			if (c->window_hidden.load()) {
+				xrt_display_processor_d3d11_request_display_mode(c->display_processor, false);
+			}
 		}
 		return;
+	}
+
+	/*
+	 * #2671: no zone wish while the window is hidden. A zone-capable DP turns
+	 * its verdict into a lens request on each content change, which would undo
+	 * the visibility gate's 2D. Withheld, not cleared (a clear hands the lens to
+	 * the mode authority, which may be 3D); the first publish after the window
+	 * is seen again starts from scratch, so the DP re-sends its verdict instead
+	 * of keeping the 2D the gate left (its edge test compares against its own
+	 * last verdict, not the lens).
+	 */
+	if (c->window_hidden.load()) {
+		return;
+	}
+	if (c->zone_reeval_owed.exchange(false) && c->zone_published) {
+		xrt_display_processor_d3d11_clear_local_zone_mask(c->display_processor);
+		c->zone_published = false;
+		comp_d3d11_segments_clear_zone_mask(c->segments);
+		U_LOG_W("#2671 d3d11: the window is seen again - the zone wish is re-published from scratch");
 	}
 
 	// Screen-anchor the mask: client-area origin in physical screen pixels
@@ -11623,8 +11667,10 @@ comp_d3d11_compositor_set_screens(struct xrt_compositor *xc,
 		return;
 	}
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
-	// #2671: the 3D screen the visibility check clips the window to.
+	// #2671: the 3D screen the visibility check clips the window to, and every
+	// screen a segment DP may weave (each judged on the window's part there).
 	u_window_visibility_set_panel(c->visibility, info->display_device_name);
+	u_window_visibility_set_screen_list(c->visibility, list);
 	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
 	struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
 	if (copy == nullptr || info_copy == nullptr) {
