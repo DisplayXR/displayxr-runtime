@@ -363,9 +363,15 @@ struct target_viewer_host
 	bool have_geo;
 	int trust_enforce;
 
+	//! Leaf lock for demand_ns only (#2616). target_viewer_host_demand is
+	//! called from xrLocateViews under a global mutex and must never wait on
+	//! oth, which the supervisor holds across spawn and kill. Order: oth, then
+	//! this; nothing is ever taken while holding it.
+	struct os_mutex demand_lock;
+	int64_t demand_ns; //!< the service's own last demand (0 = none); under demand_lock
+
 	// Under oth's lock.
 	struct target_vhost_sup sup;
-	int64_t demand_ns; //!< the service's own last demand (0 = none)
 	int64_t last_tick_ns;
 	int64_t hb_grace_until_ns; //!< after a suspend: no heartbeat kill before this
 	struct os_process *proc;
@@ -562,7 +568,10 @@ tick_locked(struct target_viewer_host *h)
 	h->last_tick_ns = (int64_t)now;
 	const int64_t page_demand = u_vpp_read_demand(h->page);
 	const bool reader_demand = page_demand > 0 && (int64_t)now - page_demand < U_VPP_DEMAND_FRESH_NS;
-	const bool own_demand = h->demand_ns > 0 && (int64_t)now - h->demand_ns < U_VPP_DEMAND_FRESH_NS;
+	os_mutex_lock(&h->demand_lock);
+	const int64_t demand_ns = h->demand_ns;
+	os_mutex_unlock(&h->demand_lock);
+	const bool own_demand = demand_ns > 0 && (int64_t)now - demand_ns < U_VPP_DEMAND_FRESH_NS;
 	target_vhost_sup_set_demand(&h->sup, own_demand || reader_demand);
 
 	if (h->proc != NULL) {
@@ -635,7 +644,12 @@ target_viewer_host_create(const struct target_viewer_host_config *cfg)
 	h->trust_enforce = cfg->trust_enforce;
 	h->last_written_state = UINT32_MAX;
 	target_vhost_sup_init(&h->sup, cfg->sup);
+	if (os_mutex_init(&h->demand_lock) != 0) {
+		free(h);
+		return NULL;
+	}
 	if (os_thread_helper_init(&h->oth) != 0) {
+		os_mutex_destroy(&h->demand_lock);
 		free(h);
 		return NULL;
 	}
@@ -644,6 +658,7 @@ target_viewer_host_create(const struct target_viewer_host_config *cfg)
 	os_thread_helper_unlock(&h->oth);
 	if (os_thread_helper_start(&h->oth, run, h) != 0) {
 		os_thread_helper_destroy(&h->oth);
+		os_mutex_destroy(&h->demand_lock);
 		free(h);
 		return NULL;
 	}
@@ -656,9 +671,12 @@ target_viewer_host_demand(struct target_viewer_host *h)
 	if (h == NULL) {
 		return;
 	}
-	os_thread_helper_lock(&h->oth);
-	h->demand_ns = os_monotonic_get_ns();
-	os_thread_helper_unlock(&h->oth);
+	// #2616: the leaf lock only — never oth, which can be held for seconds
+	// across a spawn or a kill.
+	const int64_t now = os_monotonic_get_ns();
+	os_mutex_lock(&h->demand_lock);
+	h->demand_ns = now;
+	os_mutex_unlock(&h->demand_lock);
 }
 
 void
@@ -706,6 +724,7 @@ target_viewer_host_destroy(struct target_viewer_host **h_ptr)
 	target_vhost_sup_stop(&h->sup);
 	write_owner_locked(h, true);
 	os_thread_helper_destroy(&h->oth);
+	os_mutex_destroy(&h->demand_lock);
 	free(h);
 }
 
