@@ -716,7 +716,13 @@ client_thread_body(void *_ics)
 	client_loop(ics);
 
 	// #1815: the server's shutdown waits on this before joining.
+	// #2611: written under global_state.lock because the connect handler
+	// reads it under that lock to decide whether this slot's thread can be
+	// joined without blocking. This is the thread's last use of the lock.
+	struct ipc_server *s = ics->server;
+	os_mutex_lock(&s->global_state.lock);
 	ics->thread_done = true;
+	os_mutex_unlock(&s->global_state.lock);
 
 	return NULL;
 }

@@ -1923,6 +1923,24 @@ ipc_server_handle_shutdown_signal(struct ipc_server *vs)
 	vs->running = false;
 }
 
+/*!
+ * Undo a connect that was counted but will not get a client thread: close the
+ * handle, give back the count taken for it and restore the idle-exit
+ * timestamp the connect cleared. Called with global_state.lock held.
+ */
+static void
+abort_client_connected_locked(struct ipc_server *vs, xrt_ipc_handle_t ipc_handle, uint64_t prev_disconnect_ns)
+{
+	xrt_ipc_handle_close(ipc_handle);
+
+	vs->global_state.connected_client_count--;
+	ipc_server_status_bump(vs, false);
+
+	if (vs->global_state.connected_client_count == 0) {
+		vs->last_client_disconnect_ns = prev_disconnect_ns;
+	}
+}
+
 void
 ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_handle)
 {
@@ -1989,32 +2007,42 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 
 	// A client connected, so we're no longer in a delayed exit state
 	// (The delay thread will still check the client count before exiting)
+	const uint64_t prev_disconnect_ns = vs->last_client_disconnect_ns;
 	vs->last_client_disconnect_ns = 0;
 
-	// find the next free thread in our array (server_thread_index is -1)
-	// and have it handle this connection
+	// Find the next free thread in our array and have it handle this
+	// connection. A slot is free when server_thread_index is -1 AND its old
+	// thread can be joined without waiting: READY (never used / already
+	// joined), or STOPPING with thread_done set. A STOPPING thread that has not
+	// set thread_done is still tearing down and re-takes global_state.lock
+	// (destroy session/compositor, deactivate session) before it exits, so
+	// joining it here, with the lock held, would deadlock (#2611).
 	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
 		volatile struct ipc_client_state *_cs = &vs->threads[i].ics;
-		if (_cs->server_thread_index < 0) {
+		if (_cs->server_thread_index >= 0) {
+			continue;
+		}
+		enum ipc_thread_state state = vs->threads[i].state;
+		if (state == IPC_THREAD_READY || (state == IPC_THREAD_STOPPING && _cs->thread_done)) {
 			ics = _cs;
 			cs_index = i;
 			break;
 		}
 	}
 	if (ics == NULL) {
-		xrt_ipc_handle_close(ipc_handle);
+		abort_client_connected_locked(vs, ipc_handle, prev_disconnect_ns);
 
 		// Unlock when we are done.
 		os_mutex_unlock(&vs->global_state.lock);
 
-		U_LOG_E("Max client count reached!");
+		U_LOG_E("Max client count reached (or every free slot is still tearing down)!");
 		return;
 	}
 
 	struct ipc_thread *it = &vs->threads[cs_index];
 	if (it->state != IPC_THREAD_READY && it->state != IPC_THREAD_STOPPING) {
 		// we should not get here
-		xrt_ipc_handle_close(ipc_handle);
+		abort_client_connected_locked(vs, ipc_handle, prev_disconnect_ns);
 
 		// Unlock when we are done.
 		os_mutex_unlock(&vs->global_state.lock);
@@ -2081,6 +2109,12 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 
 	xrt_result_t xret = init_shm(vs, ics);
 	if (xret != XRT_SUCCESS) {
+		// #2613: give the slot back (its old thread, if any, was joined
+		// above) so it does not stay STARTING forever, and undo the count.
+		ics->server_thread_index = -1;
+		ics->io_active = false;
+		it->state = IPC_THREAD_READY;
+		abort_client_connected_locked(vs, ipc_handle, prev_disconnect_ns);
 
 		// Unlock when we are done.
 		os_mutex_unlock(&vs->global_state.lock);
