@@ -45,6 +45,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(repaint_under_present_hook, "DXR_REPAINT_UNDER_PRESEN
 #include "util/comp_weave_latency_win.h"
 #include "util/comp_frame_witness.h"
 #include "util/comp_present_hook.h"
+#include "util/comp_child_window_win.h"
 
 // One in-process D3D11 target per compositor per app process — file-scope
 // harness + late-weave state (mirrors comp_d3d12_target.cpp; the target
@@ -284,8 +285,16 @@ struct comp_d3d11_target
 	//! Current back buffer texture.
 	ID3D11Texture2D *back_buffer;
 
-	//! Window handle.
+	//! Window handle: the app's window (or the runtime's own), as handed in.
+	//! The swapchain is bound to it, or to @ref child_ctx's window when this
+	//! one already had a swapchain. Everything outside the target anchors on
+	//! this window, never on the child.
 	HWND hwnd;
+
+	//! The E_ACCESSDENIED fallback: a WS_CHILD over @ref hwnd's whole client
+	//! area that the swapchain is bound to (see util/comp_child_window_win.h).
+	//! NULL on every other path.
+	struct comp_child_window_win *child_ctx;
 
 	//! Current dimensions.
 	uint32_t width;
@@ -879,9 +888,32 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 		desc.Scaling = DXGI_SCALING_NONE;
 		hr = target->factory->CreateSwapChainForHwnd(target->dev, target->hwnd, &desc, &fsDesc, nullptr,
 		                                             &target->swapchain);
+
+		// The window already has a flip-model swapchain (DXGI allows one per
+		// HWND): the app renders into its own window and also bound it, for
+		// example through an injector that calls xrEndFrame from inside the
+		// window's own Present. Present into a WS_CHILD over the window's
+		// client area instead, as the D3D12 target does. The child sits at
+		// the client origin with the client size, so the display processor's
+		// position/phase anchor (the app's window, handed to it separately)
+		// still describes exactly the pixels this chain presents. The app's
+		// window itself is not moved, resized or restyled.
+		if (hr == E_ACCESSDENIED && target->hwnd != nullptr) {
+			U_LOG_W(
+			    "d3d11 target: HWND %p already has a swapchain (E_ACCESSDENIED): presenting into a "
+			    "child window on a dedicated thread instead",
+			    (void *)target->hwnd);
+			target->child_ctx = comp_child_window_win_create(target->hwnd, width, height);
+			if (target->child_ctx != nullptr) {
+				hr = target->factory->CreateSwapChainForHwnd(
+				    target->dev, static_cast<HWND>(comp_child_window_win_hwnd(target->child_ctx)),
+				    &desc, &fsDesc, nullptr, &target->swapchain);
+			}
+		}
 	}
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create swapchain: 0x%08x", hr);
+		comp_child_window_win_destroy(&target->child_ctx);
 		delete target;
 		return XRT_ERROR_D3D;
 	}
@@ -914,7 +946,10 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 	// Disable Alt-Enter fullscreen toggle (HWND-bound only — composition swapchains
 	// have no HWND association).
 	if (!use_transparent) {
-		target->factory->MakeWindowAssociation(target->hwnd, DXGI_MWA_NO_ALT_ENTER);
+		HWND assoc_hwnd = (target->child_ctx != nullptr)
+		                      ? static_cast<HWND>(comp_child_window_win_hwnd(target->child_ctx))
+		                      : target->hwnd;
+		target->factory->MakeWindowAssociation(assoc_hwnd, DXGI_MWA_NO_ALT_ENTER);
 	}
 
 	// Transparent path: bind the composition swapchain to the HWND through DComp.
@@ -975,6 +1010,7 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 		if (target->dcomp_target != nullptr) target->dcomp_target->Release();
 		if (target->dcomp_device != nullptr) target->dcomp_device->Release();
 		target->swapchain->Release();
+		comp_child_window_win_destroy(&target->child_ctx);
 		delete target;
 		return xret;
 	}
@@ -1091,6 +1127,9 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 	if (target->swapchain != nullptr) {
 		target->swapchain->Release();
 	}
+
+	// After the swapchain: a chain must not outlive the window it is bound to.
+	comp_child_window_win_destroy(&target->child_ctx);
 
 	delete target;
 	*target_ptr = nullptr;
@@ -1781,6 +1820,10 @@ comp_d3d11_target_resize(struct comp_d3d11_target *target,
 		target->back_buffer->Release();
 		target->back_buffer = nullptr;
 	}
+
+	// The E_ACCESSDENIED fallback's child follows first, so the chain and
+	// the window it presents into agree on the size (no-op without one).
+	comp_child_window_win_resize(target->child_ctx, width, height);
 
 	// Resize swapchain. Must pass the creation flags — DXGI returns
 	// E_INVALIDARG if they differ (#848, waitable late-weave chains).

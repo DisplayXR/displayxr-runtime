@@ -35,6 +35,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
 #include "util/comp_weave_latency_win.h"
 #include "util/comp_frame_witness.h"
+#include "util/comp_child_window_win.h"
 
 // One in-process D3D12 target per compositor per app process — file-scope
 // harness instance (the target struct is memset after construction, which
@@ -126,8 +127,9 @@ struct comp_d3d12_target
 	//! (measured: waitable-only left R at ~62 ms on this path).
 	UINT last_present_count;
 
-	//! Child window context (non-NULL only when child window fallback is active).
-	struct child_window_context *child_ctx;
+	//! Child window (non-NULL only when the E_ACCESSDENIED fallback is
+	//! active; see util/comp_child_window_win.h).
+	struct comp_child_window_win *child_ctx;
 
 	//! Current dimensions.
 	uint32_t width;
@@ -217,180 +219,6 @@ target_log_failure_rate_limited(const char *what, HRESULT hr)
 	if (now_ns - prev_ns > 1000000000LL && s_last_fail_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
 		U_LOG_E("%s failed: 0x%08x (rate-limited, at most once per second)", what, (unsigned)hr);
 	}
-}
-
-/*
- *
- * Child window with dedicated message-pump thread.
- *
- * When the E_ACCESSDENIED fallback creates a WS_CHILD window, it must live on
- * its own thread with a GetMessage loop. Otherwise, DXGI Present() deadlocks
- * when the parent window enters a modal resize/move loop (the parent's UI
- * thread is blocked, and Present() tries to SendMessage to it).
- *
- */
-
-struct child_window_context
-{
-	HWND parent_hwnd;
-	HWND child_hwnd;
-	uint32_t width;
-	uint32_t height;
-	HANDLE ready_event;
-	HANDLE thread_handle;
-};
-
-static const wchar_t *CHILD_WINDOW_CLASS = L"CompD3D12ChildWindow";
-
-static LRESULT CALLBACK
-child_wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
-{
-	switch (message) {
-	case WM_DESTROY:
-		PostQuitMessage(0);
-		return 0;
-	default:
-		return DefWindowProcW(hWnd, message, wParam, lParam);
-	}
-}
-
-static bool
-ensure_child_window_class_registered()
-{
-	static bool registered = false;
-	if (registered)
-		return true;
-
-	WNDCLASSEXW wc = {};
-	wc.cbSize = sizeof(wc);
-	wc.lpfnWndProc = child_wnd_proc;
-	wc.hInstance = GetModuleHandleW(NULL);
-	wc.lpszClassName = CHILD_WINDOW_CLASS;
-
-	if (RegisterClassExW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-		return false;
-	registered = true;
-	return true;
-}
-
-static DWORD WINAPI
-child_window_thread_func(LPVOID param)
-{
-	struct child_window_context *ctx = (struct child_window_context *)param;
-
-	ensure_child_window_class_registered();
-
-	ctx->child_hwnd = CreateWindowExW(
-	    WS_EX_NOPARENTNOTIFY, CHILD_WINDOW_CLASS, L"",
-	    WS_CHILD | WS_VISIBLE,
-	    0, 0, (int)ctx->width, (int)ctx->height,
-	    ctx->parent_hwnd, NULL, GetModuleHandleW(NULL), NULL);
-
-	SetEvent(ctx->ready_event);
-
-	if (ctx->child_hwnd == nullptr) {
-		U_LOG_E("Child window thread: CreateWindowExW failed: %lu", GetLastError());
-		return 1;
-	}
-
-	U_LOG_I("Child window thread: HWND=%p (parent=%p), running message loop",
-	        (void *)ctx->child_hwnd, (void *)ctx->parent_hwnd);
-
-	MSG msg;
-	while (GetMessageW(&msg, NULL, 0, 0) > 0) {
-		TranslateMessage(&msg);
-		DispatchMessageW(&msg);
-	}
-
-	U_LOG_I("Child window thread: exiting");
-	return 0;
-}
-
-static struct child_window_context *
-create_child_window_threaded(HWND parent, uint32_t width, uint32_t height)
-{
-	auto *ctx = new child_window_context();
-	memset(ctx, 0, sizeof(*ctx));
-	ctx->parent_hwnd = parent;
-	ctx->width = width;
-	ctx->height = height;
-
-	ctx->ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-	if (ctx->ready_event == NULL) {
-		U_LOG_E("Failed to create child window ready event");
-		delete ctx;
-		return nullptr;
-	}
-
-	ctx->thread_handle = CreateThread(NULL, 0, child_window_thread_func, ctx, 0, NULL);
-	if (ctx->thread_handle == NULL) {
-		U_LOG_E("Failed to create child window thread");
-		CloseHandle(ctx->ready_event);
-		delete ctx;
-		return nullptr;
-	}
-
-	// Wait for the child window thread, but pump sent messages.
-	// CreateWindowExW(WS_CHILD) on the child thread sends WM_PARENTNOTIFY
-	// to the parent's thread (this thread) via SendMessage. If we block
-	// with WaitForSingleObject, that SendMessage deadlocks.
-	// MsgWaitForMultipleObjects + QS_SENDMESSAGE lets us process it.
-	DWORD wait;
-	DWORD deadline = GetTickCount() + 5000;
-	for (;;) {
-		DWORD remaining = deadline - GetTickCount();
-		if ((int)remaining <= 0) {
-			wait = WAIT_TIMEOUT;
-			break;
-		}
-		wait = MsgWaitForMultipleObjects(1, &ctx->ready_event, FALSE, remaining, QS_SENDMESSAGE);
-		if (wait == WAIT_OBJECT_0) {
-			break; // Event signaled — child window created
-		}
-		if (wait == WAIT_OBJECT_0 + 1) {
-			// Sent message pending — dispatch it and loop
-			MSG msg;
-			while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE | PM_QS_SENDMESSAGE)) {
-				TranslateMessage(&msg);
-				DispatchMessageW(&msg);
-			}
-			continue;
-		}
-		// Timeout or error
-		break;
-	}
-	CloseHandle(ctx->ready_event);
-	ctx->ready_event = NULL;
-
-	if (wait != WAIT_OBJECT_0 || ctx->child_hwnd == nullptr) {
-		U_LOG_E("Child window thread failed to create HWND");
-		WaitForSingleObject(ctx->thread_handle, 1000);
-		CloseHandle(ctx->thread_handle);
-		delete ctx;
-		return nullptr;
-	}
-
-	return ctx;
-}
-
-static void
-destroy_child_window_threaded(struct child_window_context **ctx_ptr)
-{
-	if (ctx_ptr == nullptr || *ctx_ptr == nullptr)
-		return;
-
-	struct child_window_context *ctx = *ctx_ptr;
-
-	if (ctx->child_hwnd != nullptr) {
-		PostMessage(ctx->child_hwnd, WM_CLOSE, 0, 0);
-	}
-	if (ctx->thread_handle != nullptr) {
-		WaitForSingleObject(ctx->thread_handle, 5000);
-		CloseHandle(ctx->thread_handle);
-	}
-
-	delete ctx;
-	*ctx_ptr = nullptr;
 }
 
 static xrt_result_t
@@ -557,14 +385,14 @@ comp_d3d12_target_create(void *hwnd,
 			        "Creating child window on dedicated thread.",
 			        (void *)target->hwnd);
 
-			target->child_ctx = create_child_window_threaded(target->hwnd, width, height);
+			target->child_ctx = comp_child_window_win_create(target->hwnd, width, height);
 			if (target->child_ctx == nullptr) {
 				target->rtv_heap->Release();
 				delete target;
 				return XRT_ERROR_D3D;
 			}
 
-			swapchain_hwnd = target->child_ctx->child_hwnd;
+			swapchain_hwnd = static_cast<HWND>(comp_child_window_win_hwnd(target->child_ctx));
 
 			hr = factory->CreateSwapChainForHwnd(target->queue, swapchain_hwnd, &desc, &fs_desc, nullptr,
 			                                     &swapchain1);
@@ -576,7 +404,7 @@ comp_d3d12_target_create(void *hwnd,
 
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create swapchain: 0x%08x", hr);
-		destroy_child_window_threaded(&target->child_ctx);
+		comp_child_window_win_destroy(&target->child_ctx);
 		target->rtv_heap->Release();
 		delete target;
 		return XRT_ERROR_D3D;
@@ -588,7 +416,7 @@ comp_d3d12_target_create(void *hwnd,
 	swapchain1->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to get IDXGISwapChain3: 0x%08x", hr);
-		destroy_child_window_threaded(&target->child_ctx);
+		comp_child_window_win_destroy(&target->child_ctx);
 		target->rtv_heap->Release();
 		delete target;
 		return XRT_ERROR_D3D;
@@ -669,7 +497,7 @@ comp_d3d12_target_create(void *hwnd,
 		if (target->dcomp_target != nullptr) target->dcomp_target->Release();
 		if (target->dcomp_device != nullptr) target->dcomp_device->Release();
 		target->swapchain->Release();
-		destroy_child_window_threaded(&target->child_ctx);
+		comp_child_window_win_destroy(&target->child_ctx);
 		target->rtv_heap->Release();
 		delete target;
 		return xret;
@@ -725,7 +553,7 @@ comp_d3d12_target_destroy(struct comp_d3d12_target **target_ptr)
 		target->swapchain->Release();
 	}
 
-	destroy_child_window_threaded(&target->child_ctx);
+	comp_child_window_win_destroy(&target->child_ctx);
 
 	delete target;
 	*target_ptr = nullptr;
@@ -1183,8 +1011,8 @@ comp_d3d12_target_resize_child_window(struct comp_d3d12_target *target,
                                       uint32_t width,
                                       uint32_t height)
 {
-	if (target == nullptr || target->child_ctx == nullptr) {
+	if (target == nullptr) {
 		return;
 	}
-	MoveWindow(target->child_ctx->child_hwnd, 0, 0, (int)width, (int)height, TRUE);
+	comp_child_window_win_resize(target->child_ctx, width, height);
 }
