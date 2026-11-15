@@ -68,6 +68,8 @@ comp_bg2d_capture_stop(void)
 //! Refuse absurd frames rather than trusting a length off the wire.
 #define BG2D_CAPTURE_MAX_DIM 4096u
 #define BG2D_CAPTURE_MAX_BYTES (BG2D_CAPTURE_MAX_DIM * BG2D_CAPTURE_MAX_DIM * 4u)
+//! A row is at most a max-width RGBA row; a wider stride is not a frame we take.
+#define BG2D_CAPTURE_MAX_STRIDE (BG2D_CAPTURE_MAX_DIM * 4u)
 
 struct bg2d_capture
 {
@@ -192,8 +194,12 @@ read_one_frame(struct bg2d_capture *c, int fd, uint32_t version)
 		panel_h = 0;
 	}
 
+	// `stride * h` in 64 bits: in 32 bits a large producer-supplied stride wraps
+	// and can match a small `payload`, which then drives the padded-row reads
+	// below with a stride the payload never accounted for.
 	if (w == 0 || h == 0 || w > BG2D_CAPTURE_MAX_DIM || h > BG2D_CAPTURE_MAX_DIM || format != 0 ||
-	    stride < w * 4u || payload != stride * h || payload > BG2D_CAPTURE_MAX_BYTES) {
+	    stride < w * 4u || stride > BG2D_CAPTURE_MAX_STRIDE || (uint64_t)payload != (uint64_t)stride * h ||
+	    payload > BG2D_CAPTURE_MAX_BYTES) {
 		U_LOG_E("bg2d capture: implausible frame %ux%u stride=%u fmt=%u payload=%u", w, h, stride, format,
 		        payload);
 		return false;
