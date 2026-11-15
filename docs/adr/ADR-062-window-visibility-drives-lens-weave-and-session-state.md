@@ -5,7 +5,7 @@ date: 2026-11-15
 # ADR-062: Window visibility drives the lens, the weave and the session state — one runtime-owned signal
 
 **Status:** Proposed (2026-11-15). Tier 1 shipped (#2671 / #2673, follow-ups #2675, #2676);
-tiers 2 and 4 in progress; tier 3 awaits David's approval (D4). Related: [ADR-007](ADR-007-compositor-never-weaves.md),
+tiers 2 and 4 in progress; tier 3 approved 2026-11-15, being implemented. Related: [ADR-007](ADR-007-compositor-never-weaves.md),
 [ADR-027](ADR-027-display-zones.md) (the zone wish), [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md)
 (the panel lease), [ADR-047](ADR-047-multi-screen-segments-and-per-screen-views.md) (segments),
 [docs/specs/vendor/lens-preference-ownership.md](../specs/vendor/lens-preference-ownership.md),
@@ -126,12 +126,15 @@ proposed extension, `XR_DXR_window_visibility`:
 - an event `XrEventDataWindowVisibilityChangedDXR { visible, reason: MINIMIZED | CLOAKED | COVERED
   | NOT_SHOWN | LOCKED | DISPLAY_OFF }`, delivered to every app that enables the extension;
 - an opt-in flag (on the window-binding struct or a session create flag) asking the runtime to
-  move a hidden session to `SYNCHRONIZED` (`shouldRender = XR_FALSE`) — **VISIBLE only, never
-  FOCUSED**: focus keeps following the OS;
+  move a hidden session to `SYNCHRONIZED` (`shouldRender = XR_FALSE`). In OpenXR `FOCUSED`
+  implies `VISIBLE`, so a demotion always drops focus too; input is protected by two rules
+  instead: a session is **never** demoted while its window is the OS foreground window, and never
+  before its window has been shown once (`NOT_SHOWN`). On the visible edge it returns to
+  `VISIBLE` and then `FOCUSED` as before;
 - an app that does not enable it gets tiers 1–2 only and sees no session-state change;
 - needs a new in-process session-event path (the native compositors push state change events).
 
-**Awaiting David's decision** (new public API surface). Not implemented until approved.
+**Approved by David 2026-11-15.** Being implemented.
 
 ### D5 — Tier 4: the visible-3D-region mask for local-switching panels
 
@@ -158,7 +161,6 @@ mode that reports a zone grid; combining masks across vendor connections is the 
 Reviewed 2026-11-15 by an independent app-developer review: YELLOW overall, RED for tier 3 as
 first written (default-on session-state demotion). Its findings are folded into D1–D5 above.
 
-## Open questions (David)
+## Open questions
 
-1. Approve `XR_DXR_window_visibility` (D4): the event for everyone who enables it, plus the opt-in
-   `SYNCHRONIZED` demotion?
+None. D4 (`XR_DXR_window_visibility`) was approved by David on 2026-11-15.
