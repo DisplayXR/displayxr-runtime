@@ -171,7 +171,7 @@ What `RIG_LOCAL_PHYSICAL` buys a stylus, per session:
 
 | Session | A pose `L` on the glass lands |
 |---|---|
-| A runtime-owned or fullscreen window, no view rig | on the physical display plane, unscaled |
+| No view rig chained (a runtime-owned window, or an app-owned window that chains no `XR_DXR_view_rig`) | on the physical display plane, unscaled |
 | An app-owned window (`_handle`, `_texture`, engine plug-ins) with a display rig (`XR_DXR_view_rig`) | where the app renders that point of the glass: re-based into the canvas like every eye, then the rig's glass scale |
 | A camera rig | the same, against the rig's convergence plane |
 
@@ -197,7 +197,7 @@ If your device also drives the viewpoint (a puck you push around the desk, say),
 ## 8. Poses and time
 
 - **`get_tracked_pose(name, t)` answers for the requested time `t`**, not "the latest sample". Apps ask for their predicted display time; a stylus served late lags visibly behind the nib.
-- **The recommended shape for asynchronously fed hardware:** your transport thread pushes timestamped samples into `m_relation_history` (`src/xrt/auxiliary/math/m_relation_history.h`), and the callback interpolates or predicts for `t` (`m_predict`; `m_filter_one_euro` for jitter). The template ships a minimal header-only version; link the runtime's aux math library when you need the real one.
+- **The recommended shape for asynchronously fed hardware:** your transport thread pushes timestamped samples into `m_relation_history` (`src/xrt/auxiliary/math/m_relation_history.h`), and the callback interpolates or predicts for `t` (`m_predict`; `m_filter_one_euro` for jitter). The template links no runtime library, so it ships a two-sample linear extrapolation in its place; link the runtime's aux math library when you need the real one.
 - **Clock:** the monotonic clock (`os_monotonic_get_ns` domain). Convert your device timestamps once, on arrival.
 - **One latched publication per timestamp.** Serve grip, aim and tip for one `t` from the same sample set; the runtime guarantees nothing across separate calls, and an app reading tip and aim in one frame must see one pen.
 - **Relation flags are honest.** Set `POSITION_VALID | ORIENTATION_VALID` (and the `_TRACKED` bits while the optics see the pen) when you have a pose; clear them when you do not. Losing sight of the pen is *invalid poses*, not *absent hardware*.
@@ -238,7 +238,7 @@ displayxr-cli input set <id> TIP_THRESHOLD 0.05  # per user, no admin (next sess
 displayxr-cli input unset <id> TIP_THRESHOLD
 ```
 
-**Handedness is runtime policy, not your setting.** The user's dominant hand lives in the input class's policy — Windows `HKCU\Software\DisplayXR\InputProviders\Policy\Handedness` (DWORD, 0 = right, 1 = left; HKLM is the machine default; HKCU is ignored under `Policy\Lock` = 1), POSIX a `handedness` file in the per-user manifest directory (first byte `l` or `L` = left), right when absent. Declare your stylus `XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER` and the runtime applies it; one policy then serves every vendor's pen. `host->get_handedness()` lets you read it if your firmware needs to know which hand holds it (grip-pose offsets, for example).
+**Handedness is runtime policy, not your setting.** The user's dominant hand lives in the input class's policy — Windows `HKCU\Software\DisplayXR\InputProviders\Policy\Handedness` (DWORD, 0 = right, 1 = left; HKLM is the machine default; HKCU is ignored under `Policy\Lock` = 1), POSIX a `handedness` file in the per-user manifest directory (first byte `l` or `L` = left), right when absent. Android has no per-user store yet: there the dominant hand is always the right. Declare your stylus `XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER` and the runtime applies it; one policy then serves every vendor's pen. `host->get_handedness()` lets you read it if your firmware needs to know which hand holds it (grip-pose offsets, for example).
 
 On a runtime without `get_handedness` (the slot is NULL), `DOMINANT` claims no role. A provider that must run there too declares `LEFT` or `RIGHT` itself from its own setting — the template's `HAND` key (`auto` / `left` / `right`) does exactly that, and on a newer runtime `auto` defers to the policy.
 
@@ -303,13 +303,13 @@ The rules are the display-processor installer's ([vendor guide §5](vendor-plugi
 Everything below runs on a machine with the runtime installed or built from source, no 3D display needed.
 
 1. **Is it registered?** `displayxr-cli input list [--json]` lists every registered provider without loading any DLL: ProbeOrder, `Enabled` and its source, the preferred provider, the one ranked first.
-2. **Does it load, negotiate, probe and claim the roles?** `displayxr-cli selftest` runs the real loader and arbitration headlessly. With your provider registered and reporting `PRESENT`, it asserts left and right role devices with a valid interaction profile; a provider that fails to load (missing entry point, ABI mismatch, refused provenance) fails the check. Absence never fails it.
+2. **Does it load, negotiate, probe and claim the roles?** `displayxr-cli selftest` runs the real loader and arbitration headlessly. With your provider registered and reporting `PRESENT`, it asserts a hand-controller role device with a valid interaction profile on **each hand your provider supplied** — for a stylus that is one hand; the other stays with the fallback and is reported `n/a`. A provider that fails to load (missing entry point, ABI mismatch, refused provenance) fails the check. Absence never fails it.
 3. **Make yours win.** `displayxr-cli input use <id>` (per user) prefers your provider ahead of ProbeOrder; `input reset` undoes it; `input disable <id>` takes you out. A running service re-ranks live.
 4. **Settings.** `displayxr-cli input options <id>` shows every key you declared and where its value comes from.
 5. **Haptics and hot-plug.** `displayxr-cli input haptic-test [seconds]` pulses the hand-role devices and prints every role `generation_id` change — unplug and replug your dongle while it runs to watch the role move to the fallback and back.
-6. **Compare with the reference stylus.** Enable the in-tree `sim_stylus` provider — opt-in, like `sim_input`: `displayxr-cli input set sim-stylus ENABLE 1` (or `DXR_INPUT_SIM_STYLUS_ENABLE=1` in the hosting process); `displayxr-cli input options sim-stylus` lists its other settings — and run the same checks. It exercises the profile, the dominant-hand type and the glass-registered frame with no hardware. Register yours at a lower ProbeOrder and confirm you win while present and fall back to it when absent.
+6. **Compare with the reference stylus.** Enable the in-tree `sim_stylus` provider (the runtime installer registers it; on a from-source Windows build run `scriptsegister_dev_plugin.bat input stylus` elevated) — opt-in, like `sim_input`: `displayxr-cli input set sim-stylus ENABLE 1` (or `DXR_INPUT_SIM_STYLUS_ENABLE=1` in the hosting process); `displayxr-cli input options sim-stylus` lists its other settings — and run the same checks. It exercises the profile, the dominant-hand type and the glass-registered frame with no hardware. Register yours at a lower ProbeOrder and confirm you win while present and fall back to it when absent.
 7. **Prove an app sees *your* device.** `displayxr-cli input emulated off` withholds the keyboard/mouse emulated pair, so with your provider absent the hand roles read *unassigned* rather than the emulated controllers. `input emulated on` restores it. `HKLM\Software\DisplayXR\Input\ForceQwerty = 1` skips all providers — the fastest way to prove a symptom is yours.
-8. **The handedness flip.** Set `InputProviders\Policy\Handedness` to 1 and confirm `input list` / selftest show your stylus on the left hand; set it back.
+8. **The handedness flip.** Set `HKCU\Software\DisplayXR\InputProviders\Policy\Handedness` to 1 and confirm selftest's left-hand row names your stylus (and the log line `is a dominant-hand tool -> LEFT hand`); delete the value afterwards. `input list` does not load providers, so it cannot show the hand.
 9. **Both paths.** Run your app checks in-process and again with `XRT_FORCE_MODE=ipc` against a running `displayxr-service.exe`; roles, the rig and presence live service-side there. Remember the service reads **its own** environment, not the app's.
 10. **On the glass.** With a real display, touch the nib to known points of the panel (centre, corners) in a windowed app and confirm the app's cursor sits under it; then fly the rig (WASD) and confirm the pen stays on the glass.
 
