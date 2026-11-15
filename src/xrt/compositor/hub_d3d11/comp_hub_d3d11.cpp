@@ -139,6 +139,15 @@ struct comp_hub_d3d11
 	 * when the window returns. Under dp_mutex.
 	 */
 	bool seg_primary_uncovered;
+	/*!
+	 * #2671: every pixel of the session's 3D window is hidden (minimized,
+	 * cloaked or fully covered), latched from the owning compositor's
+	 * u_window_visibility tracker by @ref comp_hub_d3d11_set_window_hidden. The
+	 * DP is asked for 2D whatever @ref mode_3d says while it holds, and gets
+	 * the session's own choice back when the window is seen again. Under
+	 * dp_mutex.
+	 */
+	bool window_hidden;
 
 	/*!
 	 * #2639 / #2640: legacy automatic 2D + re-convergence (NULL = off, the
@@ -1376,13 +1385,20 @@ split_lens_3d(const struct comp_hub_d3d11 *s)
 	return s->mode_3d && !s->auto_held;
 }
 
+//! The primary DP must stay 2D whatever the session wants: the window left the primary (#2247) or is hidden (#2671).
+static inline bool
+split_primary_gate_2d(const struct comp_hub_d3d11 *s)
+{
+	return s->seg_primary_uncovered || s->window_hidden;
+}
+
 static void
 split_seg_primary_lens(struct comp_hub_d3d11 *s, bool force)
 {
 	const bool uncovered = !comp_d3d11_segments_primary_covered(s->segments);
 	os_mutex_lock(&s->dp_mutex);
 	const bool edge = uncovered != s->seg_primary_uncovered;
-	const bool want = split_lens_3d(s) && !uncovered;
+	const bool want = split_lens_3d(s) && !uncovered && !s->window_hidden;
 	if (edge || force) {
 		s->seg_primary_uncovered = uncovered;
 		if (s->dp != nullptr) {
@@ -4628,7 +4644,7 @@ split_auto_stereo_apply(struct comp_hub_d3d11 *s,
 		s->auto_held = flat;
 		const bool want_3d = s->mode_3d && !flat;
 		const bool ok = s->dp != nullptr && xrt_display_processor_d3d11_request_display_mode(
-		                                        s->dp, want_3d && !s->seg_primary_uncovered);
+		                                        s->dp, want_3d && !split_primary_gate_2d(s));
 		os_mutex_unlock(&s->dp_mutex);
 		if (comp_d3d11_segments_enabled(s->segments)) {
 			comp_d3d11_segments_set_display_mode(s->segments, want_3d);
@@ -6053,15 +6069,33 @@ comp_hub_d3d11_request_display_mode(struct comp_hub_d3d11 *s, bool enable_3d)
 		return true;
 	}
 	// #2247: the primary screen stays 2D while the window has wholly left it;
-	// the weave restores mode_3d when it returns.
+	// the weave restores mode_3d when it returns. #2671: likewise while the
+	// window is hidden; comp_hub_d3d11_set_window_hidden restores it.
 	const bool ok = s->dp != nullptr &&
-	                xrt_display_processor_d3d11_request_display_mode(s->dp, enable_3d && !s->seg_primary_uncovered);
+	                xrt_display_processor_d3d11_request_display_mode(s->dp, enable_3d && !split_primary_gate_2d(s));
 	if (ok) {
 		// The weave marks' mode_3d source — see the field doc.
 		s->mode_3d = enable_3d;
 	}
 	os_mutex_unlock(&s->dp_mutex);
 	return ok;
+}
+
+extern "C" void
+comp_hub_d3d11_set_window_hidden(struct comp_hub_d3d11 *s, bool hidden)
+{
+	if (s == nullptr) {
+		return;
+	}
+	os_mutex_lock(&s->dp_mutex);
+	const bool edge = hidden != s->window_hidden;
+	s->window_hidden = hidden;
+	// Under automatic 2D the lens is already held 2D and its release applies
+	// this gate (u_display_mode_hold.h rule); nothing to send.
+	if (edge && !s->auto_held && s->dp != nullptr) {
+		xrt_display_processor_d3d11_request_display_mode(s->dp, s->mode_3d && !split_primary_gate_2d(s));
+	}
+	os_mutex_unlock(&s->dp_mutex);
 }
 
 extern "C" void
@@ -6494,6 +6528,13 @@ comp_hub_d3d11_request_display_mode(struct comp_hub_d3d11 *split, bool enable_3d
 	(void)split;
 	(void)enable_3d;
 	return false;
+}
+
+extern "C" void
+comp_hub_d3d11_set_window_hidden(struct comp_hub_d3d11 *split, bool hidden)
+{
+	(void)split;
+	(void)hidden;
 }
 
 extern "C" void
