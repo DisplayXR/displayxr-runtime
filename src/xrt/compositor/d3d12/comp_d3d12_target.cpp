@@ -33,9 +33,15 @@
 // regardless of their alpha mode). See the use_transparent gate below.
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
+// #2635: repaint even when the app presents through a Present hook that also
+// intercepts our chain (A/B only: that combination is the deadlock). Same
+// knob as the D3D11 target's.
+DEBUG_GET_ONCE_BOOL_OPTION(repaint_under_present_hook, "DXR_REPAINT_UNDER_PRESENT_HOOK", false)
+
 #include "util/comp_weave_latency_win.h"
 #include "util/comp_frame_witness.h"
 #include "util/comp_child_window_win.h"
+#include "util/comp_present_hook_win.h"
 
 // One in-process D3D12 target per compositor per app process — file-scope
 // harness instance (the target struct is memset after construction, which
@@ -59,6 +65,10 @@ static late_weave_stage2_gate g_lw_stage2_d3d12;
 static bool g_d3d12_target_is_composed = false;
 static int g_d3d12_scanout_stats_strikes = 0; //!< consecutive TIMED_OUT; <0 = disabled
 static std::atomic<uint32_t> g_d3d12_repaint_presents_since_app{0};
+// #2635: the #868 repaint thread, recorded at its first repaint mark (0 until
+// then, so every present before it is an app present). Written and read under
+// the compositor mutex, like every present on this target.
+static DWORD g_d3d12_repaint_thread_id = 0;
 
 // Late-weave (DXR_LATE_WEAVE=1): same gate as the D3D11 service / VK native
 // compositors — waitable swapchain, max frame latency 1, weave paced to the
@@ -152,6 +162,18 @@ struct comp_d3d12_target
 	//! @ref comp_d3d12_target_is_device_lost). Latched, never cleared.
 	//! Zero (the memset state) = not lost.
 	bool device_lost;
+
+	/*
+	 * #2635 present-hook re-entry (the D3D11 target's twin). The app calls
+	 * xrEndFrame from inside a third-party IDXGISwapChain::Present hook that
+	 * also intercepts this chain's Present: a repaint presented from the
+	 * repaint thread while it holds the compositor mutex enters the same hook
+	 * and waits for the hook's lock, which the app thread holds while it waits
+	 * for the compositor mutex. Latched, never cleared; sampled on app-thread
+	 * presents until it latches. Zero (the memset state) = not detected.
+	 */
+	bool present_reentrant;
+	uint64_t reentry_next_sample_ns;
 };
 
 static void
@@ -522,6 +544,8 @@ comp_d3d12_target_destroy(struct comp_d3d12_target **target_ptr)
 	// #1456: the join-coverage verdict belongs to this chain; the file-scope
 	// log outlives it and serves the next session in this process.
 	g_weave_latency_d3d12.po_gate_reset();
+	// #2635: the repaint thread is joined before the target goes.
+	g_d3d12_repaint_thread_id = 0;
 
 	release_back_buffers(target);
 
@@ -660,6 +684,7 @@ extern "C" void
 comp_d3d12_target_weave_mark_repaint(struct comp_d3d12_target *target, bool mode_3d)
 {
 	(void)target;
+	g_d3d12_repaint_thread_id = GetCurrentThreadId(); // #2635
 	g_frame_witness_d3d12.count_weave(true, mode_3d);
 	g_weave_latency_d3d12.mark_weave("d3d12", 0, true);
 	// Each repaint's Present releases a waitable token nobody waits for; the
@@ -871,6 +896,34 @@ target_present_call(struct comp_d3d12_target *target, uint32_t sync_interval)
 	return hr;
 }
 
+/*!
+ * #2635: sample on an app-thread present (never the repaint thread); see
+ * util/comp_present_hook_win.h. Rate-limited, and stops once latched.
+ */
+static void
+target_reentry_sample(struct comp_d3d12_target *target)
+{
+	char name[MAX_PATH] = "?";
+	if (!comp_present_hook_win_sample(target->swapchain, &target->present_reentrant,
+	                                  &target->reentry_next_sample_ns, name, sizeof(name))) {
+		return;
+	}
+	const bool overridden = debug_get_bool_option_repaint_under_present_hook();
+	U_LOG_W(
+	    "d3d12 target: the app calls xrEndFrame from inside a Present hook (%s) that also intercepts "
+	    "this chain's Present (app tid=%lu); a Present of this chain from the repaint thread would "
+	    "deadlock against the hook's lock (#2635). %s",
+	    name, (unsigned long)GetCurrentThreadId(),
+	    overridden ? "Repaints stay ON (DXR_REPAINT_UNDER_PRESENT_HOOK=1)."
+	               : "Repaints are OFF for this session (DXR_REPAINT_UNDER_PRESENT_HOOK=1 overrides).");
+}
+
+extern "C" bool
+comp_d3d12_target_repaint_forbidden(struct comp_d3d12_target *target)
+{
+	return target != nullptr && target->present_reentrant && !debug_get_bool_option_repaint_under_present_hook();
+}
+
 extern "C" xrt_result_t
 comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interval)
 {
@@ -878,6 +931,14 @@ comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interv
 	// before this latch it logged an ERROR per frame).
 	if (target->device_lost) {
 		return XRT_ERROR_D3D;
+	}
+
+	// #2635: on the app's own thread, check whether it is calling us from
+	// inside a Present hook that also hooks this chain. The app frame's
+	// present is made under the same compositor-mutex hold that arms the
+	// repaint, so the latch is decided before any repaint can follow it.
+	if (GetCurrentThreadId() != g_d3d12_repaint_thread_id) {
+		target_reentry_sample(target);
 	}
 
 	HRESULT hr = target_present_call(target, sync_interval);
