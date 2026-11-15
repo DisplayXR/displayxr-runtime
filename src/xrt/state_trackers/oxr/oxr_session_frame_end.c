@@ -3167,7 +3167,12 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	 * Early out for headless sessions.
 	 */
 	if (xc == NULL) {
-		U_LOG_W("[frame_end] xc is NULL, headless early-out");
+		// Every xrEndFrame of a headless session lands here: WARN once only.
+		static bool logged_headless = false;
+		if (!logged_headless) {
+			logged_headless = true;
+			U_LOG_W("[frame_end] xc is NULL, headless early-out (logged once)");
+		}
 		sess->frame_started = false;
 
 		os_mutex_lock(&sess->active_wait_frames_lock);
