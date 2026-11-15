@@ -1331,11 +1331,26 @@ static void
 gpu_wait_idle_on(struct comp_d3d12_timeline tl)
 {
 	(*tl.value)++;
-	tl.queue->Signal(tl.fence, *tl.value);
+	HRESULT hr = tl.queue->Signal(tl.fence, *tl.value);
 
-	if (tl.fence->GetCompletedValue() < *tl.value) {
-		tl.fence->SetEventOnCompletion(*tl.value, tl.event);
-		WaitForSingleObject(tl.event, INFINITE);
+	if (SUCCEEDED(hr) && tl.fence->GetCompletedValue() < *tl.value) {
+		hr = tl.fence->SetEventOnCompletion(*tl.value, tl.event);
+		if (SUCCEEDED(hr)) {
+			WaitForSingleObject(tl.event, INFINITE);
+		}
+	}
+	if (FAILED(hr)) {
+		// The INFINITE wait above is safe only when the fence will reach the
+		// value and the event is armed. A failed Signal (the value is never
+		// written) or a failed SetEventOnCompletion (the event never fires)
+		// would hang it forever, so skip the wait instead and say so once.
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W("gpu_wait_idle_on(%s): Signal/SetEventOnCompletion failed (hr=0x%08lx), idle wait "
+			        "skipped",
+			        tl.name, (unsigned long)hr);
+		}
 	}
 	d3d12_report_device_removed_once(tl.device, tl.name);
 }
