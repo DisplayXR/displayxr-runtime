@@ -882,6 +882,10 @@ t_syscomp_destroy_hook(struct xrt_system_compositor *xsysc)
 	if (xsysc != NULL && g_hotplug_info == &xsysc->info) {
 		g_hotplug_info = NULL;
 	}
+	// #2617: the head belongs to the system being torn down; a refresh after
+	// this point must not query the plug-in about it.
+	g_display_info_head = NULL;
+	g_display_info_applied_valid = false;
 	if (g_display_info_mutex_initialized) {
 		os_mutex_unlock(&g_display_info_mutex);
 	}
@@ -897,8 +901,30 @@ t_syscomp_destroy_hook(struct xrt_system_compositor *xsysc)
 }
 
 /*!
+ * Hook @p xsysc's destroy so the file statics that point into it
+ * (g_screens_info, g_hotplug_info, g_display_info_head) are cleared and viewer
+ * tracking is shut down when it goes away. Installed for every system
+ * compositor, whether or not display hotplug runs: with hotplug off (Android,
+ * DXR_DISPLAY_HOTPLUG=0) a second sequential XrInstance otherwise read the
+ * first one's freed info (#2617). Returns true if this call installed it.
+ */
+static bool
+syscomp_destroy_hook_install(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == NULL || xsysc->destroy == NULL || xsysc->destroy == t_syscomp_destroy_hook ||
+	    g_syscomp_destroy_orig != NULL) {
+		return false;
+	}
+	g_syscomp_destroy_orig = xsysc->destroy;
+	xsysc->destroy = t_syscomp_destroy_hook;
+	return true;
+}
+
+/*!
  * Publish the as-created screen table (generation 1) and start the sweep for
- * @p xsysc. Called once the system's registry and desktop rect are built.
+ * @p xsysc. Called once the system's registry and desktop rect are built, after
+ * @ref syscomp_destroy_hook_install. The sweep only starts for the system whose
+ * destroy the hook owns, since the hook is what stops it.
  */
 static void
 display_hotplug_begin(struct xrt_system_compositor *xsysc)
@@ -911,12 +937,8 @@ display_hotplug_begin(struct xrt_system_compositor *xsysc)
 	(void)publish_screens_locked(&xsysc->info, true);
 	os_mutex_unlock(&g_display_info_mutex);
 
-	if (g_hotplug == NULL && g_syscomp_destroy_orig == NULL && xsysc->destroy != NULL) {
+	if (g_hotplug == NULL && xsysc->destroy == t_syscomp_destroy_hook) {
 		g_hotplug = target_display_hotplug_start(hotplug_rebuild_cb, NULL);
-		if (g_hotplug != NULL) {
-			g_syscomp_destroy_orig = xsysc->destroy;
-			xsysc->destroy = t_syscomp_destroy_hook;
-		}
 	}
 }
 
@@ -1499,6 +1521,9 @@ out:
 		if (g_display_info_mutex_initialized) {
 			os_mutex_unlock(&g_display_info_mutex);
 		}
+
+		// #2617: the destroy hook clears the statics above, hotplug or not.
+		(void)syscomp_destroy_hook_install(xsysc);
 
 		// Display hotplug (ADR-047 Amendment 8): generation 1 is the table
 		// just built; the sweep keeps it live from here.

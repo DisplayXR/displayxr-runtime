@@ -206,6 +206,43 @@ comp_d3d12_target_resize(struct comp_d3d12_target *target,
                          uint32_t height);
 
 /*!
+ * True while the target holds every swapchain back buffer. A failed resize
+ * (ResizeBuffers or the back-buffer re-acquire) leaves it with none; the
+ * caller must then retry @ref comp_d3d12_target_resize even at the same size,
+ * and must not record against a null back buffer. NULL-safe (returns false).
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_target_has_back_buffers(struct comp_d3d12_target *target);
+
+/*!
+ * True once a Present / ResizeBuffers / GetBuffer on this target failed with
+ * DXGI_ERROR_DEVICE_REMOVED / DEVICE_RESET / DEVICE_HUNG, or with any error
+ * while ID3D12Device::GetDeviceRemovedReason reports a removal. The latch is
+ * logged once and never cleared: the target stops presenting and the
+ * compositor reports the session lost. NULL-safe (returns false).
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_target_is_device_lost(struct comp_d3d12_target *target);
+
+/*!
+ * #2635: must the #868 repaint thread stay off this chain?
+ *
+ * True once an app-thread present found the app calling xrEndFrame from
+ * inside a third-party IDXGISwapChain::Present hook that also intercepts this
+ * chain's Present (latched for the session; DXR_REPAINT_UNDER_PRESENT_HOOK=1
+ * overrides it for A/B). A repaint present from another thread would then
+ * deadlock against that hook's lock. Caller holds the compositor mutex.
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_target_repaint_forbidden(struct comp_d3d12_target *target);
+
+/*!
  * Check whether the target created a child window fallback.
  *
  * Returns true if the target had to create a WS_CHILD window because the

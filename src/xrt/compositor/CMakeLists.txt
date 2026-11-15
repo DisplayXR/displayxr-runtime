@@ -375,6 +375,14 @@ if(WIN32)
 		comp_win32_window STATIC
 		d3d11/comp_d3d11_window.cpp
 		d3d11/comp_d3d11_window.h
+		# The D3D11 and D3D12 targets' WS_CHILD present window, for an app
+		# window that already has a DXGI swapchain (E_ACCESSDENIED fallback).
+		util/comp_child_window_win.cpp
+		util/comp_child_window_win.h
+		# The same two targets' #2635 present-hook re-entry probe (the live
+		# half of util/comp_present_hook.h).
+		util/comp_present_hook_win.cpp
+		util/comp_present_hook_win.h
 		)
 	target_link_libraries(
 		comp_win32_window

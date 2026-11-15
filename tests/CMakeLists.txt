@@ -67,6 +67,8 @@ set(tests
     tests_comp_weave_present_feedback
     tests_comp_feedback_pace
     tests_comp_late_weave_depth
+    tests_comp_present_hook
+    tests_comp_adopt_window_policy
     tests_comp_queue_drain
     tests_comp_grid_rate_cap
     tests_comp_grid_pace_mode
@@ -79,6 +81,7 @@ set(tests
     tests_aux_stereo_comfort
     tests_aux_lift_cursor
     tests_aux_lift_autoconv
+    tests_aux_stereo_auto
     tests_aux_rear_budget
     tests_aux_route_policy
     tests_aux_vk_queue_lock_route
@@ -104,6 +107,7 @@ set(tests
     tests_aux_display_live_rescale
     tests_aux_weave_flat
     tests_aux_display_mode_hold
+    tests_aux_window_visibility
     tests_aux_mono_auto_2d
     tests_aux_tracking_any
     tests_comp_rear_budget
@@ -1389,6 +1393,10 @@ target_include_directories(
 target_include_directories(tests_comp_feedback_pace PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #2119: present_wait depth governor (lag floor + slip machine). Header-only.
 target_include_directories(tests_comp_late_weave_depth PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #2635: present-hook re-entry detection (detour decode + stack match). Header-only.
+target_include_directories(tests_comp_present_hook PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #2637: hosted-window adoption policy (DXR_WIN32_ADOPT_OWN_WINDOW). Header-only.
+target_include_directories(tests_comp_adopt_window_policy PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #2629: grid late-weave FIFO queue drain. Header-only.
 target_include_directories(tests_comp_queue_drain PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #2629: grid late-weave one-weave-per-vblank target. Header-only.

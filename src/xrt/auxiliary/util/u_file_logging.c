@@ -27,9 +27,16 @@
 #include <sddl.h>
 #include <aclapi.h>
 
-// Log file handle
+// Log file handle. Written once, inside the one-time init; never closed
+// (see u_file_logging_shutdown).
 static FILE *g_log_file = NULL;
-static int g_initialized = 0;
+//! Runs the body of u_file_logging_init exactly once, process-wide (#2612):
+//! concurrent first log lines from several threads used to race a plain int.
+static INIT_ONCE g_init_once = INIT_ONCE_STATIC_INIT;
+//! Set (interlocked) when the one-time init starts; read by set_name.
+static volatile LONG g_initialized = 0;
+//! The footer is written at most once, however often shutdown is called.
+static volatile LONG g_shutdown_done = 0;
 static char g_name_override[96] = {0};
 static char g_log_path[MAX_PATH] = {0};
 
@@ -236,13 +243,17 @@ grant_appcontainer_write_access(const char *dir_path)
 	LocalFree(pSid);
 }
 
-void
-u_file_logging_init(void)
+/*!
+ * The one-time body of u_file_logging_init. Runs under g_init_once: every
+ * other thread calling u_file_logging_init (i.e. every first u_log) waits
+ * until it returns, so nobody sees a half-initialised g_log_file. It must
+ * not log through u_log itself: re-entering InitOnceExecuteOnce from the
+ * initialising thread would deadlock.
+ */
+static void
+file_logging_init_body(void)
 {
-	if (g_initialized) {
-		return;
-	}
-	g_initialized = 1;
+	InterlockedExchange(&g_initialized, 1);
 
 	// Get %LOCALAPPDATA%
 	char local_app_data[MAX_PATH];
@@ -326,10 +337,26 @@ u_file_logging_init(void)
 	atexit(u_file_logging_shutdown);
 }
 
+static BOOL CALLBACK
+file_logging_init_once(PINIT_ONCE once, PVOID param, PVOID *context)
+{
+	(void)once;
+	(void)param;
+	(void)context;
+	file_logging_init_body();
+	return TRUE; // even when no file could be opened: never retry per log line
+}
+
+void
+u_file_logging_init(void)
+{
+	(void)InitOnceExecuteOnce(&g_init_once, file_logging_init_once, NULL, NULL);
+}
+
 void
 u_file_logging_set_name(const char *name)
 {
-	if (g_initialized || name == NULL) {
+	if (InterlockedCompareExchange(&g_initialized, 0, 0) != 0 || name == NULL) {
 		return;
 	}
 	snprintf(g_name_override, sizeof(g_name_override), "%s", name);
@@ -377,16 +404,24 @@ u_file_logging_write_va(const char *func, enum u_logging_level level, const char
 	file_logging_sink(NULL, 0, func, level, format, args, NULL);
 }
 
+/*
+ * Writes the footer and flushes, and deliberately does NOT fclose the file or
+ * reset the init state (#2612): other threads may still be inside the sink
+ * (an fclose under them is a use-after-free of the FILE), and a reset let a
+ * late line during exit open a second, fresh log file. Lines logged after the
+ * footer still land in the same file; the CRT closes it at process exit, and
+ * every line is already flushed as it is written.
+ */
 void
 u_file_logging_shutdown(void)
 {
+	if (InterlockedExchange(&g_shutdown_done, 1) != 0) {
+		return;
+	}
 	if (g_log_file != NULL) {
 		fprintf(g_log_file, "\n=== DisplayXR Log Ended ===\n");
 		fflush(g_log_file);
-		fclose(g_log_file);
-		g_log_file = NULL;
 	}
-	g_initialized = 0;
 }
 
 #else /* !XRT_OS_WINDOWS */

@@ -621,6 +621,46 @@ TEST_CASE("remote provider: every host down = REMOTE_ERROR and FAILED(NETWORK, r
 	CHECK(st.retryable == 1);
 }
 
+TEST_CASE("remote provider: a body cut short of its Content-Length is a failure, never a truncated blob",
+          "[remote_conversion]")
+{
+	if (!have_python()) {
+		SKIP("no Python 3");
+	}
+	{
+		server a;
+		REQUIRE(start_server(a, "--mode truncate"));
+		server_guard ga{a};
+		base_settings(a.base);
+		provider p;
+		REQUIRE(make_provider(p));
+		job_result jr;
+		run_job(p, 1, jr);
+		CHECK(jr.r != XRT_SUCCESS);
+		CHECK(jr.blob.bytes.empty()); // the half body never reached the sink
+		CHECK(jr.sr.refusal_code == XRT_CONV_REFUSAL_REMOTE_ERROR);
+		CHECK(stat_jobs(a) == 1);
+		CHECK(state_of(p, 1).state == XRT_CONV_STATE_FAILED);
+	}
+	// A transfer failure falls through to the next host like any other.
+	server a, b;
+	REQUIRE(start_server(a, "--mode truncate --host-id host-a"));
+	server_guard ga{a};
+	REQUIRE(start_server(b, "--host-id host-b"));
+	server_guard gb{b};
+	base_settings(a.base + "," + b.base);
+	provider p;
+	REQUIRE(make_provider(p));
+	job_result jr;
+	run_job(p, 1, jr);
+	REQUIRE(jr.r == XRT_SUCCESS);
+	CHECK(stat_jobs(a) == 1);
+	CHECK(stat_jobs(b) == 1);
+	CHECK(strstr(jr.sr.build_host_id, "host-b") != nullptr);
+	REQUIRE(jr.blob.bytes.size() > 4);
+	CHECK(memcmp(jr.blob.bytes.data(), "PK", 2) == 0);
+}
+
 TEST_CASE("remote provider: a missing or refused credential is FAILED(LICENCE)", "[remote_conversion]")
 {
 	if (!have_python()) {

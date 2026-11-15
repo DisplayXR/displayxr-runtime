@@ -1229,15 +1229,26 @@ jobs:
           PIN=$(python3 -c 'import json; print(json.load(open("versions.json"))["leia_plugin"])')
           echo "pin=$PIN" >> "$GITHUB_OUTPUT"
 
+      # Gate the TAGGED header (--runtime-tag), not main's: the checkout is
+      # main (the bump commits there), and main may already have moved past
+      # the tag. This job only runs on refs/tags/v*, so GITHUB_REF_NAME is the tag.
       - name: ABI assertion against currently-pinned leia_plugin
         id: abi
         run: |
           set +e
-          python3 scripts/check_plugin_abi.py --leia-tag "${{ steps.leia.outputs.pin }}"
+          python3 scripts/check_plugin_abi.py --leia-tag "${{ steps.leia.outputs.pin }}" --runtime-tag "$GITHUB_REF_NAME"
           echo "rc=$?" >> "$GITHUB_OUTPUT"
 
+      # rc 2 (or anything but 0/1) = the gate could not run: not a mismatch.
+      # Fail loudly, open no issue (#2610).
+      - name: ABI gate could not run
+        if: steps.abi.outputs.rc != '0' && steps.abi.outputs.rc != '1'
+        run: |
+          echo "::error::check_plugin_abi.py could not run (rc=${{ steps.abi.outputs.rc }}): versions.json[runtime] was NOT bumped and no ABI-mismatch issue was opened. See the step log above; re-run this job once the cause is fixed."
+          exit 1
+
       - name: Open ABI-mismatch issue on leia repo
-        if: steps.abi.outputs.rc != '0'
+        if: steps.abi.outputs.rc == '1'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |

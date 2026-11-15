@@ -64,6 +64,7 @@
 #include "os/os_threading.h"
 
 #include "util/u_logging.h"
+#include "util/u_window_visibility.h"
 // #1589/#1610: the two shared colour decisions — the fast-path predicate and
 // the escape hatch. Backend-neutral by design; see its file comment.
 #include "util/u_color_encoding.h"
@@ -1220,6 +1221,22 @@ struct comp_gl_compositor
 	//! and gets the session's mode back when the window returns. Written by
 	//! the weave, read by comp_gl_compositor_request_display_mode.
 	bool seg_primary_uncovered;
+	/*!
+	 * #2671: the session's 3D window is hidden (minimized, cloaked or every
+	 * pixel on the 3D screen covered), latched by @ref visibility's transition
+	 * callback under dp_swap_mutex. The GL DP is then asked for 2D whatever
+	 * the session's mode; under the hub the hub holds the same latch
+	 * (comp_hub_d3d11_set_window_hidden).
+	 */
+	bool window_hidden;
+	//! #2671: the session's own last 2D/3D request — what a hidden window's
+	//! return restores (lens-preference-ownership.md). Under dp_swap_mutex.
+	bool session_wants_3d;
+	//! #2671: the window went hidden; the next zone publish after it is seen
+	//! again starts from scratch (clear, then publish). Set by the callback.
+	volatile LONG zone_reeval_owed;
+	//! #2671: low-rate visibility tracker for the window (NULL = always visible).
+	struct u_window_visibility *visibility;
 	struct os_mutex seg_pub_mutex;
 	struct xrt_segment_metrics seg_pub;               //!< the table the last weave took (count 0 = one view set)
 	struct xrt_segment_view_routing seg_route;        //!< the routing the last locate handed out
@@ -4993,11 +5010,34 @@ gl_sync_zone_mask_to_dp(struct comp_gl_compositor *c)
 		if (c->zone_published) {
 			xrt_display_processor_gl_clear_local_zone_mask(c->display_processor);
 			c->zone_published = false;
+#ifdef XRT_OS_WINDOWS
+			// #2671: a clear hands the lens back to the mode authority; while
+			// the window is hidden that stays 2D.
+			if (c->window_hidden) {
+				xrt_display_processor_gl_request_display_mode(c->display_processor, false);
+			}
+#endif
 		}
 		return;
 	}
 
 #ifdef XRT_OS_WINDOWS
+	/*
+	 * #2671: no zone wish while the window is hidden. A zone-capable DP turns
+	 * its verdict into a lens request on each content change, which would undo
+	 * the visibility gate's 2D. Withheld, not cleared (a clear hands the lens to
+	 * the mode authority, which may be 3D); the first publish after the window
+	 * is seen again starts from scratch, so the DP re-sends its verdict.
+	 */
+	if (c->window_hidden) {
+		return;
+	}
+	if (InterlockedExchange(&c->zone_reeval_owed, 0) != 0 && c->zone_published) {
+		xrt_display_processor_gl_clear_local_zone_mask(c->display_processor);
+		c->zone_published = false;
+		U_LOG_W("#2671 gl: the window is seen again - the zone wish is re-published from scratch");
+	}
+
 	// Screen-anchor the mask: client-area origin in physical screen pixels.
 	// No HWND (offscreen) → nothing to anchor to; skip the publish.
 	HWND wnd = c->hwnd;
@@ -5213,7 +5253,8 @@ gl_seg_primary_lens(struct comp_gl_compositor *c, struct xrt_display_processor_g
 		return;
 	}
 	c->seg_primary_uncovered = uncovered;
-	const bool want = c->hardware_display_3d && !uncovered;
+	// #2671: and 2D while the window is hidden; the visibility callback restores it.
+	const bool want = c->hardware_display_3d && !uncovered && !c->window_hidden;
 	if (dp != NULL) {
 		xrt_display_processor_gl_request_display_mode(dp, want);
 	}
@@ -5221,6 +5262,41 @@ gl_seg_primary_lens(struct comp_gl_compositor *c, struct xrt_display_processor_g
 		U_LOG_W("segments: the window %s the primary screen%s — its lens wish %s (#2247)",
 		        uncovered ? "has been off" : "is back on", uncovered ? " for 0.5 s" : "", want ? "3D" : "2D");
 	}
+}
+
+/*!
+ * #2671: the window's visibility changed (tracker thread, at most a few Hz,
+ * transitions only). Takes dp_swap_mutex like the app-thread request entry
+ * point (comp_gl_compositor_request_display_mode) — the hub's lifetime (a
+ * retire swaps it under this lock) and the primary DP are both guarded by it —
+ * and never c->mutex, so it cannot wait on a weave. Hidden: the lens wish is
+ * 2D; visible: the session's own choice comes back (never a forced 3D).
+ */
+static void
+gl_visibility_changed(void *userdata, bool hidden)
+{
+	struct comp_gl_compositor *c = (struct comp_gl_compositor *)userdata;
+	os_mutex_lock(&c->dp_swap_mutex);
+	c->window_hidden = hidden;
+	if (hidden) {
+		// A published zone wish is withheld from now on (gl_sync_zone_mask_to_dp).
+		InterlockedExchange(&c->zone_reeval_owed, 1);
+	}
+#ifdef XRT_GL_HUB
+	if (c->hub.active && c->hub.split != NULL) {
+		comp_hub_d3d11_set_window_hidden(c->hub.split, hidden);
+		os_mutex_unlock(&c->dp_swap_mutex);
+		return;
+	}
+#endif
+	// Seen again: the session's mode first, always. A published zone wish then
+	// re-sends its own verdict on the next (from-scratch) publish; a publish
+	// the DP accepted but never evaluated must not leave the lens 2D.
+	if (c->display_processor != NULL) {
+		xrt_display_processor_gl_request_display_mode(
+		    c->display_processor, c->session_wants_3d && !c->seg_primary_uncovered && !hidden);
+	}
+	os_mutex_unlock(&c->dp_swap_mutex);
 }
 
 /*!
@@ -5317,7 +5393,9 @@ gl_segments_tick(struct comp_gl_compositor *c, bool eligible, uint32_t present_w
 			    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : 0;
 			seg_split = comp_gl_segments_update(c->segments, &win, &canvas, mode_index);
 			// Every segment DP follows the session's 2D/3D mode on the
-			// screens the window covers, 2D on one it left (#2247).
+			// screens the window covers, 2D on one it left (#2247) or on one
+			// where the window's part is hidden (#2671).
+			comp_gl_segments_set_visibility(c->segments, c->visibility);
 			comp_gl_segments_set_display_mode(c->segments, c->hardware_display_3d);
 		}
 	}
@@ -5606,8 +5684,10 @@ gl_hub_retry_dp(struct comp_gl_compositor *c)
 	os_mutex_lock(&c->dp_swap_mutex);
 	gl_create_gl_dp(c, c->hub.dp_factory_gl, c->hub.dp_window, /*quiet_failure=*/true);
 	if (c->display_processor != NULL) {
-		// The fresh DP has seen none of the session's state.
-		xrt_display_processor_gl_request_display_mode(c->display_processor, c->hub.want_3d);
+		// The fresh DP has seen none of the session's state (#2247/#2671: not
+		// on a primary the window left, nor while the window is hidden).
+		xrt_display_processor_gl_request_display_mode(
+		    c->display_processor, c->hub.want_3d && !c->seg_primary_uncovered && !c->window_hidden);
 		if (c->eye_tracking_mode_set) {
 			xrt_display_processor_gl_set_eye_tracking_mode(c->display_processor, c->eye_tracking_mode);
 		}
@@ -8629,6 +8709,13 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
 
+#ifdef XRT_OS_WINDOWS
+	// #2671: join the visibility tracker before anything its callback touches
+	// (the hub, the DP, dp_swap_mutex). No lock is held here, so the join
+	// cannot wait on one. Freed last: the segment manager and the hub borrow it.
+	u_window_visibility_stop(c->visibility);
+#endif
+
 	// #868: stop the repaint loop FIRST — it holds the GL context and touches
 	// the display processor, both torn down below.
 	os_thread_helper_destroy(&c->repaint_thread);
@@ -8864,6 +8951,9 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	}
 #endif
 
+#ifdef XRT_OS_WINDOWS
+	u_window_visibility_destroy(&c->visibility); // #2671: borrowed by nothing now
+#endif
 	free(c);
 }
 
@@ -9107,6 +9197,9 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	glBindTexture(GL_TEXTURE_2D, 0);
 
 	c->hardware_display_3d = true;
+#ifdef XRT_OS_WINDOWS
+	c->session_wants_3d = true; // #2671: what a hidden window's return restores
+#endif
 
 	// #1610: resolve the one post-4.1 entry point the compose path needs,
 	// once, with the context current. A no-op where GLAD already did it.
@@ -9419,6 +9512,10 @@ comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3
 	// Multi-screen M6: the weave may swap the primary DP (ADR-047 Amendment 2).
 	os_mutex_lock(&c->dp_swap_mutex);
 	bool ok = false;
+#ifdef XRT_OS_WINDOWS
+	// #2671: recorded on every route, so a hidden window's return restores it.
+	c->session_wants_3d = enable_3d;
+#endif
 #ifdef XRT_GL_HUB
 	c->hub.want_3d = enable_3d;
 	if (c->hub.active) {
@@ -9429,8 +9526,9 @@ comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3
 		bool dp_3d = enable_3d;
 #ifdef XRT_OS_WINDOWS
 		// #2247: the primary screen stays 2D while the window has wholly left
-		// it; the weave restores the session's mode when it returns.
-		dp_3d = dp_3d && !c->seg_primary_uncovered;
+		// it; the weave restores the session's mode when it returns. #2671:
+		// likewise while the window is hidden; the visibility callback restores it.
+		dp_3d = dp_3d && !c->seg_primary_uncovered && !c->window_hidden;
 #endif
 		ok = xrt_display_processor_gl_request_display_mode(c->display_processor, dp_3d);
 	}
@@ -9559,6 +9657,10 @@ comp_gl_compositor_set_screens(struct xrt_compositor *xc,
 		return;
 	}
 	struct comp_gl_compositor *c = gl_comp(xc);
+	// #2671: the 3D screen the visibility check clips the window to, and every
+	// screen a segment DP may weave (each judged on the window's part there).
+	u_window_visibility_set_panel(c->visibility, info->display_device_name);
+	u_window_visibility_set_screen_list(c->visibility, list);
 	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
 	struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
 	if (copy == NULL || info_copy == NULL) {
@@ -9824,9 +9926,6 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 #ifdef XRT_OS_WINDOWS
 	os_mutex_init(&c->seg_pub_mutex);
 #endif
-
-	mcp_capture_init(&c->mcp_capture);
-	mcp_capture_install(&c->mcp_capture);
 
 	// Get window dimensions
 	uint32_t width = GL_DEFAULT_WIDTH;
@@ -10142,6 +10241,24 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	// Visibility/focus flags for state transitions
 	xc->info.initial_visible = true;
 	xc->info.initial_focused = true;
+
+	// Install MCP capture_frame hook + arm the trigger-file path (#210).
+	// Last, once nothing below can fail (#2623): the hook is a process
+	// global, and an earlier failure return frees c without uninstalling it.
+	mcp_capture_init(&c->mcp_capture);
+	mcp_capture_install(&c->mcp_capture);
+
+#ifdef XRT_OS_WINDOWS
+	// #2671: the window's visibility drives the lens wish. Last, so the DP or
+	// the hub exists before the first transition can reach them; the 3D
+	// screen's name arrives with set_screens. Texture targets without a
+	// window get no tracker (NULL = always visible).
+	c->visibility = u_window_visibility_create((void *)c->hwnd, NULL, "gl", gl_visibility_changed, c);
+#ifdef XRT_GL_HUB
+	// The hub's segment DPs on other 3D screens follow the window's part there.
+	comp_hub_d3d11_set_visibility(c->hub.split, c->visibility);
+#endif
+#endif
 
 	*out_xcn = &c->base;
 

@@ -1571,10 +1571,11 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 	// case (xrt_display_processor_destroy NULLs the pointer, so at most one
 	// of the two calls acts).
 	//
-	// #1007: never destroy it in place — mc is still in msc->clients[] here,
-	// and the render thread's convergence pass reads the pointer under
-	// list_and_timing_lock. detach_and_destroy unpublishes it under the lock
-	// and destroys it with the lock dropped (CNSDK release can hang, #39).
+	// #1007: never destroy it in place. mc is already off msc->clients[] here
+	// (the #1005 unlist above, under both locks), so no later frame snapshot
+	// reaches it; detach_and_destroy still clears the pointer under
+	// render_lock + list_and_timing_lock, the locks every reader of it holds,
+	// and destroys it with them dropped (CNSDK release can hang, #39).
 	if (!mc->session_render.initialized && mc->session_render.display_processor != NULL) {
 		multi_compositor_detach_and_destroy_dp(mc);
 	}

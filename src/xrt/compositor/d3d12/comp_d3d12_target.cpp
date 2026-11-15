@@ -33,8 +33,15 @@
 // regardless of their alpha mode). See the use_transparent gate below.
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
+// #2635: repaint even when the app presents through a Present hook that also
+// intercepts our chain (A/B only: that combination is the deadlock). Same
+// knob as the D3D11 target's.
+DEBUG_GET_ONCE_BOOL_OPTION(repaint_under_present_hook, "DXR_REPAINT_UNDER_PRESENT_HOOK", false)
+
 #include "util/comp_weave_latency_win.h"
 #include "util/comp_frame_witness.h"
+#include "util/comp_child_window_win.h"
+#include "util/comp_present_hook_win.h"
 
 // One in-process D3D12 target per compositor per app process — file-scope
 // harness instance (the target struct is memset after construction, which
@@ -58,6 +65,10 @@ static late_weave_stage2_gate g_lw_stage2_d3d12;
 static bool g_d3d12_target_is_composed = false;
 static int g_d3d12_scanout_stats_strikes = 0; //!< consecutive TIMED_OUT; <0 = disabled
 static std::atomic<uint32_t> g_d3d12_repaint_presents_since_app{0};
+// #2635: the #868 repaint thread, recorded at its first repaint mark (0 until
+// then, so every present before it is an app present). Written and read under
+// the compositor mutex, like every present on this target.
+static DWORD g_d3d12_repaint_thread_id = 0;
 
 // Late-weave (DXR_LATE_WEAVE=1): same gate as the D3D11 service / VK native
 // compositors — waitable swapchain, max frame latency 1, weave paced to the
@@ -126,8 +137,9 @@ struct comp_d3d12_target
 	//! (measured: waitable-only left R at ~62 ms on this path).
 	UINT last_present_count;
 
-	//! Child window context (non-NULL only when child window fallback is active).
-	struct child_window_context *child_ctx;
+	//! Child window (non-NULL only when the E_ACCESSDENIED fallback is
+	//! active; see util/comp_child_window_win.h).
+	struct comp_child_window_win *child_ctx;
 
 	//! Current dimensions.
 	uint32_t width;
@@ -145,6 +157,23 @@ struct comp_d3d12_target
 	IDCompositionDevice *dcomp_device;
 	IDCompositionTarget *dcomp_target;
 	IDCompositionVisual *dcomp_visual;
+
+	//! The device was removed/reset under this chain (see
+	//! @ref comp_d3d12_target_is_device_lost). Latched, never cleared.
+	//! Zero (the memset state) = not lost.
+	bool device_lost;
+
+	/*
+	 * #2635 present-hook re-entry (the D3D11 target's twin). The app calls
+	 * xrEndFrame from inside a third-party IDXGISwapChain::Present hook that
+	 * also intercepts this chain's Present: a repaint presented from the
+	 * repaint thread while it holds the compositor mutex enters the same hook
+	 * and waits for the hook's lock, which the app thread holds while it waits
+	 * for the compositor mutex. Latched, never cleared; sampled on app-thread
+	 * presents until it latches. Zero (the memset state) = not detected.
+	 */
+	bool present_reentrant;
+	uint64_t reentry_next_sample_ns;
 };
 
 static void
@@ -158,178 +187,60 @@ release_back_buffers(struct comp_d3d12_target *target)
 	}
 }
 
-/*
- *
- * Child window with dedicated message-pump thread.
- *
- * When the E_ACCESSDENIED fallback creates a WS_CHILD window, it must live on
- * its own thread with a GetMessage loop. Otherwise, DXGI Present() deadlocks
- * when the parent window enters a modal resize/move loop (the parent's UI
- * thread is blocked, and Present() tries to SendMessage to it).
- *
- */
-
-struct child_window_context
-{
-	HWND parent_hwnd;
-	HWND child_hwnd;
-	uint32_t width;
-	uint32_t height;
-	HANDLE ready_event;
-	HANDLE thread_handle;
-};
-
-static const wchar_t *CHILD_WINDOW_CLASS = L"CompD3D12ChildWindow";
-
-static LRESULT CALLBACK
-child_wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
-{
-	switch (message) {
-	case WM_DESTROY:
-		PostQuitMessage(0);
-		return 0;
-	default:
-		return DefWindowProcW(hWnd, message, wParam, lParam);
-	}
-}
-
+//! True only while EVERY back buffer is held — a failed resize can leave none, or some.
 static bool
-ensure_child_window_class_registered()
+target_has_back_buffers(const struct comp_d3d12_target *target)
 {
-	static bool registered = false;
-	if (registered)
-		return true;
-
-	WNDCLASSEXW wc = {};
-	wc.cbSize = sizeof(wc);
-	wc.lpfnWndProc = child_wnd_proc;
-	wc.hInstance = GetModuleHandleW(NULL);
-	wc.lpszClassName = CHILD_WINDOW_CLASS;
-
-	if (RegisterClassExW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-		return false;
-	registered = true;
+	for (uint32_t i = 0; i < BACK_BUFFER_COUNT; i++) {
+		if (target->back_buffers[i] == nullptr) {
+			return false;
+		}
+	}
 	return true;
 }
 
-static DWORD WINAPI
-child_window_thread_func(LPVOID param)
+static bool
+target_hr_is_device_loss(HRESULT hr)
 {
-	struct child_window_context *ctx = (struct child_window_context *)param;
-
-	ensure_child_window_class_registered();
-
-	ctx->child_hwnd = CreateWindowExW(
-	    WS_EX_NOPARENTNOTIFY, CHILD_WINDOW_CLASS, L"",
-	    WS_CHILD | WS_VISIBLE,
-	    0, 0, (int)ctx->width, (int)ctx->height,
-	    ctx->parent_hwnd, NULL, GetModuleHandleW(NULL), NULL);
-
-	SetEvent(ctx->ready_event);
-
-	if (ctx->child_hwnd == nullptr) {
-		U_LOG_E("Child window thread: CreateWindowExW failed: %lu", GetLastError());
-		return 1;
-	}
-
-	U_LOG_I("Child window thread: HWND=%p (parent=%p), running message loop",
-	        (void *)ctx->child_hwnd, (void *)ctx->parent_hwnd);
-
-	MSG msg;
-	while (GetMessageW(&msg, NULL, 0, 0) > 0) {
-		TranslateMessage(&msg);
-		DispatchMessageW(&msg);
-	}
-
-	U_LOG_I("Child window thread: exiting");
-	return 0;
+	return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG;
 }
 
-static struct child_window_context *
-create_child_window_threaded(HWND parent, uint32_t width, uint32_t height)
+/*!
+ * A Present / ResizeBuffers / GetBuffer failure: decide whether it means the device is
+ * gone and, the first time it does, latch and log it ONCE with the removal
+ * reason (mirrors comp_d3d11_target.cpp). Any failure is checked against
+ * GetDeviceRemovedReason, because a removal can surface first as a different
+ * error code. Returns the latch.
+ */
+static bool
+target_check_device_lost(struct comp_d3d12_target *target, HRESULT hr, const char *where)
 {
-	auto *ctx = new child_window_context();
-	memset(ctx, 0, sizeof(*ctx));
-	ctx->parent_hwnd = parent;
-	ctx->width = width;
-	ctx->height = height;
-
-	ctx->ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-	if (ctx->ready_event == NULL) {
-		U_LOG_E("Failed to create child window ready event");
-		delete ctx;
-		return nullptr;
+	if (target->device_lost) {
+		return true;
 	}
-
-	ctx->thread_handle = CreateThread(NULL, 0, child_window_thread_func, ctx, 0, NULL);
-	if (ctx->thread_handle == NULL) {
-		U_LOG_E("Failed to create child window thread");
-		CloseHandle(ctx->ready_event);
-		delete ctx;
-		return nullptr;
+	const HRESULT reason = (target->dev != nullptr) ? target->dev->GetDeviceRemovedReason() : S_OK;
+	if (!target_hr_is_device_loss(hr) && reason == S_OK) {
+		return false;
 	}
-
-	// Wait for the child window thread, but pump sent messages.
-	// CreateWindowExW(WS_CHILD) on the child thread sends WM_PARENTNOTIFY
-	// to the parent's thread (this thread) via SendMessage. If we block
-	// with WaitForSingleObject, that SendMessage deadlocks.
-	// MsgWaitForMultipleObjects + QS_SENDMESSAGE lets us process it.
-	DWORD wait;
-	DWORD deadline = GetTickCount() + 5000;
-	for (;;) {
-		DWORD remaining = deadline - GetTickCount();
-		if ((int)remaining <= 0) {
-			wait = WAIT_TIMEOUT;
-			break;
-		}
-		wait = MsgWaitForMultipleObjects(1, &ctx->ready_event, FALSE, remaining, QS_SENDMESSAGE);
-		if (wait == WAIT_OBJECT_0) {
-			break; // Event signaled — child window created
-		}
-		if (wait == WAIT_OBJECT_0 + 1) {
-			// Sent message pending — dispatch it and loop
-			MSG msg;
-			while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE | PM_QS_SENDMESSAGE)) {
-				TranslateMessage(&msg);
-				DispatchMessageW(&msg);
-			}
-			continue;
-		}
-		// Timeout or error
-		break;
-	}
-	CloseHandle(ctx->ready_event);
-	ctx->ready_event = NULL;
-
-	if (wait != WAIT_OBJECT_0 || ctx->child_hwnd == nullptr) {
-		U_LOG_E("Child window thread failed to create HWND");
-		WaitForSingleObject(ctx->thread_handle, 1000);
-		CloseHandle(ctx->thread_handle);
-		delete ctx;
-		return nullptr;
-	}
-
-	return ctx;
+	target->device_lost = true;
+	U_LOG_E(
+	    "d3d12 target: the output device is LOST (%s failed: hr=0x%08x, GetDeviceRemovedReason=0x%08x). "
+	    "Presenting stops and the session is reported lost; the device is not recreated in place. "
+	    "Typical cause: a display hotplug or a driver reset/TDR. (logged once)",
+	    where, (unsigned)hr, (unsigned)reason);
+	return true;
 }
 
+//! Rate-limited (at most once per second) ERROR for a recurring non-loss failure.
 static void
-destroy_child_window_threaded(struct child_window_context **ctx_ptr)
+target_log_failure_rate_limited(const char *what, HRESULT hr)
 {
-	if (ctx_ptr == nullptr || *ctx_ptr == nullptr)
-		return;
-
-	struct child_window_context *ctx = *ctx_ptr;
-
-	if (ctx->child_hwnd != nullptr) {
-		PostMessage(ctx->child_hwnd, WM_CLOSE, 0, 0);
+	static std::atomic<int64_t> s_last_fail_log_ns{0};
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	int64_t prev_ns = s_last_fail_log_ns.load(std::memory_order_relaxed);
+	if (now_ns - prev_ns > 1000000000LL && s_last_fail_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+		U_LOG_E("%s failed: 0x%08x (rate-limited, at most once per second)", what, (unsigned)hr);
 	}
-	if (ctx->thread_handle != nullptr) {
-		WaitForSingleObject(ctx->thread_handle, 5000);
-		CloseHandle(ctx->thread_handle);
-	}
-
-	delete ctx;
-	*ctx_ptr = nullptr;
 }
 
 static xrt_result_t
@@ -339,7 +250,13 @@ acquire_back_buffers(struct comp_d3d12_target *target)
 		HRESULT hr = target->swapchain->GetBuffer(i, __uuidof(ID3D12Resource),
 		                                           reinterpret_cast<void **>(&target->back_buffers[i]));
 		if (FAILED(hr)) {
-			U_LOG_E("Failed to get back buffer %u: 0x%08x", i, hr);
+			// All or nothing: a partial set must not look usable, and
+			// ResizeBuffers (the retry) needs zero outstanding references.
+			target->back_buffers[i] = nullptr;
+			release_back_buffers(target);
+			if (!target_check_device_lost(target, hr, "GetBuffer")) {
+				target_log_failure_rate_limited("GetBuffer (swapchain back buffer)", hr);
+			}
 			return XRT_ERROR_D3D;
 		}
 	}
@@ -490,14 +407,14 @@ comp_d3d12_target_create(void *hwnd,
 			        "Creating child window on dedicated thread.",
 			        (void *)target->hwnd);
 
-			target->child_ctx = create_child_window_threaded(target->hwnd, width, height);
+			target->child_ctx = comp_child_window_win_create(target->hwnd, width, height);
 			if (target->child_ctx == nullptr) {
 				target->rtv_heap->Release();
 				delete target;
 				return XRT_ERROR_D3D;
 			}
 
-			swapchain_hwnd = target->child_ctx->child_hwnd;
+			swapchain_hwnd = static_cast<HWND>(comp_child_window_win_hwnd(target->child_ctx));
 
 			hr = factory->CreateSwapChainForHwnd(target->queue, swapchain_hwnd, &desc, &fs_desc, nullptr,
 			                                     &swapchain1);
@@ -509,7 +426,7 @@ comp_d3d12_target_create(void *hwnd,
 
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create swapchain: 0x%08x", hr);
-		destroy_child_window_threaded(&target->child_ctx);
+		comp_child_window_win_destroy(&target->child_ctx);
 		target->rtv_heap->Release();
 		delete target;
 		return XRT_ERROR_D3D;
@@ -521,7 +438,7 @@ comp_d3d12_target_create(void *hwnd,
 	swapchain1->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to get IDXGISwapChain3: 0x%08x", hr);
-		destroy_child_window_threaded(&target->child_ctx);
+		comp_child_window_win_destroy(&target->child_ctx);
 		target->rtv_heap->Release();
 		delete target;
 		return XRT_ERROR_D3D;
@@ -602,7 +519,7 @@ comp_d3d12_target_create(void *hwnd,
 		if (target->dcomp_target != nullptr) target->dcomp_target->Release();
 		if (target->dcomp_device != nullptr) target->dcomp_device->Release();
 		target->swapchain->Release();
-		destroy_child_window_threaded(&target->child_ctx);
+		comp_child_window_win_destroy(&target->child_ctx);
 		target->rtv_heap->Release();
 		delete target;
 		return xret;
@@ -627,6 +544,8 @@ comp_d3d12_target_destroy(struct comp_d3d12_target **target_ptr)
 	// #1456: the join-coverage verdict belongs to this chain; the file-scope
 	// log outlives it and serves the next session in this process.
 	g_weave_latency_d3d12.po_gate_reset();
+	// #2635: the repaint thread is joined before the target goes.
+	g_d3d12_repaint_thread_id = 0;
 
 	release_back_buffers(target);
 
@@ -658,7 +577,7 @@ comp_d3d12_target_destroy(struct comp_d3d12_target **target_ptr)
 		target->swapchain->Release();
 	}
 
-	destroy_child_window_threaded(&target->child_ctx);
+	comp_child_window_win_destroy(&target->child_ctx);
 
 	delete target;
 	*target_ptr = nullptr;
@@ -765,6 +684,7 @@ extern "C" void
 comp_d3d12_target_weave_mark_repaint(struct comp_d3d12_target *target, bool mode_3d)
 {
 	(void)target;
+	g_d3d12_repaint_thread_id = GetCurrentThreadId(); // #2635
 	g_frame_witness_d3d12.count_weave(true, mode_3d);
 	g_weave_latency_d3d12.mark_weave("d3d12", 0, true);
 	// Each repaint's Present releases a waitable token nobody waits for; the
@@ -929,10 +849,99 @@ comp_d3d12_target_predict_weave_to_scanout_ns(struct comp_d3d12_target *target)
 	return g_weave_latency_d3d12.predict_weave_to_scanout_ns();
 }
 
+/*!
+ * The Present call itself, bounded like the D3D11 target's target_present_call
+ * (#925 S1, comp_d3d11_target.cpp).
+ *
+ * The caller holds the compositor mutex, and a plain Present(1, 0) into a
+ * jammed flip chain can block for minutes there, freezing the app's render
+ * thread and everything waiting on the lock. This Present is deliberately the
+ * frame pacer (Present(1) waits <= 1 vsync when healthy), so keep the pacing
+ * shape but bound the wedge: a non-blocking present retried at ~1 ms cadence
+ * up to a 50 ms (~3 vsync) deadline, then the frame is dropped
+ * (DXGI_ERROR_WAS_STILL_DRAWING is returned, as on D3D11). A jammed chain
+ * degrades to slow frames instead of a hang.
+ *
+ * Not bounded here, as on D3D11 before #2603: a Present that blocks INSIDE the
+ * driver below DXGI's queue check (the in-driver cross-adapter wait the #1000
+ * watchdog names and the #2603 worker cuts off). Neither is ported to D3D12.
+ */
+static HRESULT
+target_present_call(struct comp_d3d12_target *target, uint32_t sync_interval)
+{
+	if (sync_interval == 0) {
+		return target->swapchain->Present(0, 0); // immediate — never blocks on the chain
+	}
+	HRESULT hr;
+	const int64_t deadline_ns = (int64_t)os_monotonic_get_ns() + 50LL * 1000000LL;
+	for (;;) {
+		hr = target->swapchain->Present(sync_interval, DXGI_PRESENT_DO_NOT_WAIT);
+		if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+			break;
+		}
+		if ((int64_t)os_monotonic_get_ns() >= deadline_ns) {
+			static std::atomic<int64_t> s_last_drop_log_ns{0};
+			const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+			int64_t prev_ns = s_last_drop_log_ns.load(std::memory_order_relaxed);
+			if (now_ns - prev_ns > 1000000000LL &&
+			    s_last_drop_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+				U_LOG_W(
+				    "d3d12 target present: frame dropped after 50 ms — "
+				    "DWM not consuming flips (#924/#925)");
+			}
+			break;
+		}
+		Sleep(1);
+	}
+	return hr;
+}
+
+/*!
+ * #2635: sample on an app-thread present (never the repaint thread); see
+ * util/comp_present_hook_win.h. Rate-limited, and stops once latched.
+ */
+static void
+target_reentry_sample(struct comp_d3d12_target *target)
+{
+	char name[MAX_PATH] = "?";
+	if (!comp_present_hook_win_sample(target->swapchain, &target->present_reentrant,
+	                                  &target->reentry_next_sample_ns, name, sizeof(name))) {
+		return;
+	}
+	const bool overridden = debug_get_bool_option_repaint_under_present_hook();
+	U_LOG_W(
+	    "d3d12 target: the app calls xrEndFrame from inside a Present hook (%s) that also intercepts "
+	    "this chain's Present (app tid=%lu); a Present of this chain from the repaint thread would "
+	    "deadlock against the hook's lock (#2635). %s",
+	    name, (unsigned long)GetCurrentThreadId(),
+	    overridden ? "Repaints stay ON (DXR_REPAINT_UNDER_PRESENT_HOOK=1)."
+	               : "Repaints are OFF for this session (DXR_REPAINT_UNDER_PRESENT_HOOK=1 overrides).");
+}
+
+extern "C" bool
+comp_d3d12_target_repaint_forbidden(struct comp_d3d12_target *target)
+{
+	return target != nullptr && target->present_reentrant && !debug_get_bool_option_repaint_under_present_hook();
+}
+
 extern "C" xrt_result_t
 comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interval)
 {
-	HRESULT hr = target->swapchain->Present(sync_interval, 0);
+	// Lost device: no Present into the dead chain (it can only fail, and
+	// before this latch it logged an ERROR per frame).
+	if (target->device_lost) {
+		return XRT_ERROR_D3D;
+	}
+
+	// #2635: on the app's own thread, check whether it is calling us from
+	// inside a Present hook that also hooks this chain. The app frame's
+	// present is made under the same compositor-mutex hold that arms the
+	// repaint, so the latch is decided before any repaint can follow it.
+	if (GetCurrentThreadId() != g_d3d12_repaint_thread_id) {
+		target_reentry_sample(target);
+	}
+
+	HRESULT hr = target_present_call(target, sync_interval);
 	if (SUCCEEDED(hr)) {
 		g_frame_witness_d3d12.count_present();
 	}
@@ -941,7 +950,16 @@ comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interv
 		target->swapchain->GetLastPresentCount(&target->last_present_count);
 	}
 	if (FAILED(hr)) {
-		U_LOG_E("Present failed: 0x%08x", hr);
+		// A frame dropped at the 50 ms bound: already WARNed (rate-limited)
+		// by target_present_call, and not a device loss.
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			return XRT_ERROR_D3D;
+		}
+		// A removed/reset device latches and logs once (with the reason);
+		// anything else is rate-limited — never an ERROR per frame.
+		if (!target_check_device_lost(target, hr, "Present")) {
+			target_log_failure_rate_limited("Present", hr);
+		}
 		return XRT_ERROR_D3D;
 	}
 
@@ -990,7 +1008,16 @@ comp_d3d12_target_resize(struct comp_d3d12_target *target,
                          uint32_t width,
                          uint32_t height)
 {
-	if (width == target->width && height == target->height) {
+	// Lost device: ResizeBuffers on it can only fail. The caller sees the
+	// failure and @ref comp_d3d12_target_is_device_lost says why.
+	if (target->device_lost) {
+		return XRT_ERROR_D3D;
+	}
+	// Same size is a no-op ONLY while the chain still has its buffers: a
+	// failed resize released them, and returning to (or staying at) the old
+	// size must still run ResizeBuffers + acquire, or the target stays
+	// bufferless.
+	if (width == target->width && height == target->height && target_has_back_buffers(target)) {
 		return XRT_SUCCESS;
 	}
 
@@ -1008,7 +1035,10 @@ comp_d3d12_target_resize(struct comp_d3d12_target *target,
 	HRESULT hr = target->swapchain->ResizeBuffers(BACK_BUFFER_COUNT, width, height,
 	                                               DXGI_FORMAT_UNKNOWN, target->swapchain_flags);
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to resize swapchain: 0x%08x", hr);
+		// Retried every frame until it succeeds, so never an ERROR per frame.
+		if (!target_check_device_lost(target, hr, "ResizeBuffers")) {
+			target_log_failure_rate_limited("ResizeBuffers", hr);
+		}
 		return XRT_ERROR_D3D;
 	}
 
@@ -1017,6 +1047,18 @@ comp_d3d12_target_resize(struct comp_d3d12_target *target,
 
 	// Re-acquire back buffers
 	return acquire_back_buffers(target);
+}
+
+extern "C" bool
+comp_d3d12_target_has_back_buffers(struct comp_d3d12_target *target)
+{
+	return target != nullptr && target_has_back_buffers(target);
+}
+
+extern "C" bool
+comp_d3d12_target_is_device_lost(struct comp_d3d12_target *target)
+{
+	return target != nullptr && target->device_lost;
 }
 
 extern "C" bool
@@ -1030,8 +1072,8 @@ comp_d3d12_target_resize_child_window(struct comp_d3d12_target *target,
                                       uint32_t width,
                                       uint32_t height)
 {
-	if (target == nullptr || target->child_ctx == nullptr) {
+	if (target == nullptr) {
 		return;
 	}
-	MoveWindow(target->child_ctx->child_hwnd, 0, 0, (int)width, (int)height, TRUE);
+	comp_child_window_win_resize(target->child_ctx, width, height);
 }

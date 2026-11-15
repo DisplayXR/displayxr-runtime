@@ -1611,10 +1611,19 @@ create_window_on_main_thread(struct comp_metal_compositor *c, uint32_t width, ui
 	}
 
 	[c->window setTitle:@"DisplayXR — Metal Native Compositor"];
+	// #2624: this file is MRR. A user click on the title-bar close button
+	// must not free the window (and with it the content view) while c->window
+	// / c->view / c->metal_layer are still read every frame and destroy still
+	// closes it: NO makes the alloc above the one reference, released in
+	// metal_compositor_destroy (as comp_window_macos.m does since #48).
+	[c->window setReleasedWhenClosed:NO];
 
 	CompMetalView *metalView = [[CompMetalView alloc] initWithFrame:frame];
 	metalView.wantsLayer = YES;
 	[c->window setContentView:metalView];
+	// The window owns the view now; c->view / c->metal_layer are borrows that
+	// stay valid while the window lives (it is never freed before destroy).
+	[metalView release];
 
 	c->view = metalView;
 	c->metal_layer = (CAMetalLayer *)metalView.layer;
@@ -1854,8 +1863,21 @@ metal_swapchain_destroy(struct xrt_swapchain *xsc)
 {
 	struct comp_metal_swapchain *msc = metal_swapchain(xsc);
 
+	// #2621: this file is MRR — `= nil` releases nothing. Each image is +1
+	// from newTextureWithDescriptor: in create_swapchain; nil (never created,
+	// an early create failure) is a no-op release.
 	for (uint32_t i = 0; i < msc->image_count; i++) {
+		[msc->images[i] release];
 		msc->images[i] = nil;
+		// The native handle carries the second IOSurface reference (the
+		// CFRetain in create_swapchain). A Vulkan client's import consumes it
+		// (vk_create_image_from_native -> u_graphics_buffer_unref, which
+		// CFReleases and NULLs this very slot); native Metal and GL-over-Metal
+		// clients never do, so it is still ours here.
+		if (msc->base.images[i].handle != NULL) {
+			CFRelease((CFTypeRef)msc->base.images[i].handle);
+			msc->base.images[i].handle = NULL;
+		}
 		if (msc->iosurfaces[i] != NULL) {
 			CFRelease(msc->iosurfaces[i]);
 			msc->iosurfaces[i] = NULL;
@@ -2659,6 +2681,10 @@ metal_compositor_capture_atlas_to_png(struct comp_metal_compositor *c,
 			ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, rgba, (int)row_pitch) != 0;
 			free(rgba);
 		}
+		// #2624: +1 from newBufferWithLength: (MRR file). The blit that wrote
+		// it has completed (waitUntilCompleted above) and `bgra` is not read
+		// past this point.
+		[staging release];
 	}
 	return ok;
 }
@@ -5055,8 +5081,15 @@ comp_metal_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const s
 	c->cursor_draw.req = *req;
 }
 
+/*
+ * #2622: the frame body. Called only from metal_compositor_layer_commit(),
+ * inside its @autoreleasepool — every autoreleased object this creates (the
+ * drawable, command buffers, render pass descriptors, encoders) is drained
+ * at the end of the frame. Anything it keeps past the frame in a struct
+ * field is +1 (new / alloc / retain), never an autoreleased object.
+ */
 static xrt_result_t
-metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
+metal_compositor_layer_commit_frame(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
 	struct comp_metal_compositor *c = metal_comp(xc);
 
@@ -6296,6 +6329,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					stbi_write_png("/tmp/dxr_atlas.png", (int)cw, (int)ch, 4, out, (int)pitch);
 					free(out);
 				}
+				// #2624: +1 from newBufferWithLength: (MRR file); the blit
+				// completed above and `src` is not read past this point.
+				[stg release];
 				cmd_buf = [c->command_queue commandBuffer];
 			}
 		}
@@ -6636,6 +6672,23 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	return XRT_SUCCESS;
 }
 
+/*
+ * #2622: this file is MRR, and layer_commit runs on the app's frame thread,
+ * which typically has no autorelease pool of its own (a plain pthread / a
+ * render thread never drains one). Without a pool here every autoreleased
+ * per-frame Metal object — the CAMetalDrawable from nextDrawable, the
+ * command buffer, render pass descriptors, encoders — is either logged as
+ * "autoreleased with no pool in place" and leaked, or parked in an
+ * outer pool that is never popped. One pool per frame drains them all.
+ */
+static xrt_result_t
+metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
+{
+	@autoreleasepool {
+		return metal_compositor_layer_commit_frame(xc, sync_handle);
+	}
+}
+
 static void
 metal_compositor_destroy(struct xrt_compositor *xc)
 {
@@ -6828,7 +6881,9 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	//    while all backing resources are still valid.
 	if (c->owns_window && c->window != nil) {
 		if (c->view != nil) {
-			[c->window setContentView:[[NSView alloc] init]];
+			// Autoreleased placeholder (MRR, #2624): the window retains it
+			// and the enclosing @autoreleasepool drops the alloc's +1.
+			[c->window setContentView:[[[NSView alloc] init] autorelease]];
 		}
 		c->view = nil;
 
@@ -6839,6 +6894,8 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 		void (^closeBlock)(void) = ^{
 			[window orderOut:nil];
 			[window close];
+			// releasedWhenClosed is NO (#2624): balance the alloc.
+			[window release];
 		};
 		if ([NSThread isMainThread]) {
 			closeBlock();
@@ -7146,8 +7203,6 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	mcp_capture_init(&c->mcp_capture);
-	mcp_capture_install(&c->mcp_capture);
 	u_eye_history_init(&c->eye_hist); // N6 Part 1 (#2144)
 
 	int ret = os_mutex_init(&c->mutex);
@@ -7399,6 +7454,12 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	info->initial_visible = true;
 	info->initial_focused = true;
 
+	// Install MCP capture_frame hook + arm the trigger-file path (#210).
+	// Last, once nothing below can fail (#2623): the hook is a process
+	// global, and an earlier failure return frees c without uninstalling it.
+	mcp_capture_init(&c->mcp_capture);
+	mcp_capture_install(&c->mcp_capture);
+
 	*out_xc = &c->base;
 
 	U_LOG_W("Metal compositor created: device=%s, atlas=%ux%u (tiles %ux%u)",
@@ -7461,11 +7522,9 @@ comp_metal_compositor_get_display_dimensions(struct xrt_compositor *xc,
 	return xrt_display_processor_metal_get_display_dimensions(c->display_processor, out_width_m, out_height_m);
 }
 
-bool
-comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
-                                         struct xrt_window_metrics *out_metrics)
+static bool
+get_window_metrics_impl(struct comp_metal_compositor *c, struct xrt_window_metrics *out_metrics)
 {
-	struct comp_metal_compositor *c = metal_comp(xc);
 	memset(out_metrics, 0, sizeof(*out_metrics));
 
 	// Compute window metrics compositor-side whenever we have a backing
@@ -7565,6 +7624,19 @@ comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
 	}
 
 	return false;
+}
+
+bool
+comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
+                                         struct xrt_window_metrics *out_metrics)
+{
+	// #2624: called every frame from xrLocateViews (locate_resolve_canvas) on
+	// the APP's thread, which usually has no autorelease pool: view.window,
+	// .screen and friends were autoreleased there and never drained (the
+	// window and its layer were pinned for the life of the process).
+	@autoreleasepool {
+		return get_window_metrics_impl(metal_comp(xc), out_metrics);
+	}
 }
 
 bool

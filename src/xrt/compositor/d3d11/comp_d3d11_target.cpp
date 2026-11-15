@@ -13,6 +13,7 @@
 #include "util/u_logging.h"
 #include "util/u_debug.h"
 #include "util/u_setting.h"
+#include "util/u_time.h"
 
 #include "os/os_time.h"
 
@@ -37,8 +38,14 @@ DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 // 0 = no worker (Present on the calling thread, as before), N = N ms.
 DEBUG_GET_ONCE_NUM_OPTION(present_wedge_ms, "DXR_PRESENT_WEDGE_MS", -1)
 
+// #2635: repaint even when the app presents through a Present hook that also
+// intercepts our chain (A/B only — that combination is the deadlock).
+DEBUG_GET_ONCE_BOOL_OPTION(repaint_under_present_hook, "DXR_REPAINT_UNDER_PRESENT_HOOK", false)
+
 #include "util/comp_weave_latency_win.h"
 #include "util/comp_frame_witness.h"
+#include "util/comp_present_hook_win.h"
+#include "util/comp_child_window_win.h"
 
 // One in-process D3D11 target per compositor per app process — file-scope
 // harness + late-weave state (mirrors comp_d3d12_target.cpp; the target
@@ -190,6 +197,8 @@ static late_weave_governor g_lw_gov_d3d11;
  */
 static std::atomic<int64_t> g_present_wd_enter_ns{0};
 static std::atomic<uint64_t> g_present_wd_seq{0};
+//! #2635: the thread inside the stuck Present (the watchdog names it).
+static std::atomic<unsigned long> g_present_wd_tid{0};
 static HANDLE g_present_wd_thread = nullptr;
 static HANDLE g_present_wd_exit = nullptr;
 
@@ -238,11 +247,16 @@ present_watchdog_thread_proc(LPVOID param)
 		if (stage > warned_stage) {
 			warned_stage = stage;
 			warned_enter_ns = enter_ns;
+			// Two known causes, indistinguishable from here: the driver's
+			// cross-adapter present submission (#1000), or a third-party
+			// Present hook waiting on a lock the app thread holds (#2635).
 			U_LOG_W("d3d11 present watchdog: Present has not returned for %lld ms — "
-			        "blocked inside the driver's cross-adapter present submission; "
-			        "DO_NOT_WAIT cannot bound this mode. c->mutex is held, so the "
-			        "repaint thread is stalled behind it. (#1000)",
-			        (long long)elapsed_ms);
+			        "blocked inside the Present call: the driver's cross-adapter present "
+			        "submission (#1000), or a third-party Present hook waiting on a lock "
+			        "the app's thread holds (#2635); DO_NOT_WAIT cannot bound either. "
+			        "c->mutex is held, so the repaint thread is stalled behind it. "
+			        "(presenting tid=%lu)",
+			        (long long)elapsed_ms, g_present_wd_tid.load(std::memory_order_relaxed));
 		}
 	}
 }
@@ -271,8 +285,16 @@ struct comp_d3d11_target
 	//! Current back buffer texture.
 	ID3D11Texture2D *back_buffer;
 
-	//! Window handle.
+	//! Window handle: the app's window (or the runtime's own), as handed in.
+	//! The swapchain is bound to it, or to @ref child_ctx's window when this
+	//! one already had a swapchain. Everything outside the target anchors on
+	//! this window, never on the child.
 	HWND hwnd;
+
+	//! The E_ACCESSDENIED fallback: a WS_CHILD over @ref hwnd's whole client
+	//! area that the swapchain is bound to (see util/comp_child_window_win.h).
+	//! NULL on every other path.
+	struct comp_child_window_win *child_ctx;
 
 	//! Current dimensions.
 	uint32_t width;
@@ -320,6 +342,21 @@ struct comp_d3d11_target
 	//! nothing may touch this chain, its device or its context again: the
 	//! worker is still inside the driver, holding them. Destroy leaks them.
 	bool present_wedged;
+
+	/*
+	 * #2635 present-hook re-entry. The app calls xrEndFrame from inside a
+	 * third-party IDXGISwapChain::Present hook that also intercepts this
+	 * chain's Present: a repaint presented from another thread while the
+	 * compositor lock is held deadlocks against that hook's lock. Latched,
+	 * never cleared; sampled on app-thread presents until it latches.
+	 */
+	bool present_reentrant;
+	uint64_t reentry_next_sample_ns;
+	bool reentry_inline_logged; //!< "Present moves off the worker" WARN, once
+	bool present_thread_logged; //!< first-Present thread-id WARN, once
+	//! Presents already made on the #2603 worker: the "moves off the worker"
+	//! WARN is true only when re-entry latches after at least one of them.
+	uint64_t presents_on_worker;
 };
 
 static bool
@@ -399,6 +436,45 @@ comp_d3d11_target_is_present_wedged(struct comp_d3d11_target *target)
 }
 
 /*!
+ * #2635: sample on an app-thread present (not the repaint thread); see
+ * util/comp_present_hook_win.h. Rate-limited, and stops once latched.
+ */
+static void
+target_reentry_sample(struct comp_d3d11_target *target)
+{
+	char name[MAX_PATH] = "?";
+	if (!comp_present_hook_win_sample(target->swapchain, &target->present_reentrant,
+	                                  &target->reentry_next_sample_ns, name, sizeof(name))) {
+		return;
+	}
+	const bool overridden = debug_get_bool_option_repaint_under_present_hook();
+	U_LOG_W("d3d11 target: the app calls xrEndFrame from inside a Present hook (%s) that also intercepts "
+	        "this chain's Present (app tid=%lu) — a Present of this chain from any other thread would "
+	        "deadlock against the hook's lock (#2635). Every Present now runs inline on the app's thread "
+	        "inside xrEndFrame (the #2603 bounded-present worker is bypassed for this session). %s",
+	        name, (unsigned long)GetCurrentThreadId(),
+	        overridden ? "Repaints stay ON (DXR_REPAINT_UNDER_PRESENT_HOOK=1)."
+	                   : "Repaints are OFF for this session (DXR_REPAINT_UNDER_PRESENT_HOOK=1 overrides).");
+}
+
+//! The thread that will make this target's Present call: the #2603 worker,
+//! or the caller when the present runs inline.
+static DWORD
+target_presenting_tid(struct comp_d3d11_target *target, bool inline_present)
+{
+	if (!inline_present && target->pw_thread != nullptr) {
+		return GetThreadId(target->pw_thread);
+	}
+	return GetCurrentThreadId();
+}
+
+extern "C" bool
+comp_d3d11_target_repaint_forbidden(struct comp_d3d11_target *target)
+{
+	return target != nullptr && target->present_reentrant && !debug_get_bool_option_repaint_under_present_hook();
+}
+
+/*!
  * The Present call itself: the #925 S1 bounded DO_NOT_WAIT loop, stamped for
  * the #1000 watchdog. Runs on the calling thread, or on the #2603 worker.
  */
@@ -412,6 +488,7 @@ target_present_call(struct comp_d3d11_target *target, uint32_t sync_interval)
 	// keys re-warn state on seq, and a stale seq with a fresh enter would
 	// suppress the first warning of a new incident.
 	g_present_wd_seq.fetch_add(1, std::memory_order_relaxed);
+	g_present_wd_tid.store((unsigned long)GetCurrentThreadId(), std::memory_order_relaxed);
 	g_present_wd_enter_ns.store((int64_t)os_monotonic_get_ns(), std::memory_order_release);
 	if (sync_interval == 0) {
 		hr = target->swapchain->Present(0, 0); // immediate — never blocks on the chain
@@ -689,9 +766,32 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 		desc.Scaling = DXGI_SCALING_NONE;
 		hr = target->factory->CreateSwapChainForHwnd(target->dev, target->hwnd, &desc, &fsDesc, nullptr,
 		                                             &target->swapchain);
+
+		// The window already has a flip-model swapchain (DXGI allows one per
+		// HWND): the app renders into its own window and also bound it, for
+		// example through an injector that calls xrEndFrame from inside the
+		// window's own Present. Present into a WS_CHILD over the window's
+		// client area instead, as the D3D12 target does. The child sits at
+		// the client origin with the client size, so the display processor's
+		// position/phase anchor (the app's window, handed to it separately)
+		// still describes exactly the pixels this chain presents. The app's
+		// window itself is not moved, resized or restyled.
+		if (hr == E_ACCESSDENIED && target->hwnd != nullptr) {
+			U_LOG_W(
+			    "d3d11 target: HWND %p already has a swapchain (E_ACCESSDENIED): presenting into a "
+			    "child window on a dedicated thread instead",
+			    (void *)target->hwnd);
+			target->child_ctx = comp_child_window_win_create(target->hwnd, width, height);
+			if (target->child_ctx != nullptr) {
+				hr = target->factory->CreateSwapChainForHwnd(
+				    target->dev, static_cast<HWND>(comp_child_window_win_hwnd(target->child_ctx)),
+				    &desc, &fsDesc, nullptr, &target->swapchain);
+			}
+		}
 	}
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create swapchain: 0x%08x", hr);
+		comp_child_window_win_destroy(&target->child_ctx);
 		delete target;
 		return XRT_ERROR_D3D;
 	}
@@ -724,7 +824,10 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 	// Disable Alt-Enter fullscreen toggle (HWND-bound only — composition swapchains
 	// have no HWND association).
 	if (!use_transparent) {
-		target->factory->MakeWindowAssociation(target->hwnd, DXGI_MWA_NO_ALT_ENTER);
+		HWND assoc_hwnd = (target->child_ctx != nullptr)
+		                      ? static_cast<HWND>(comp_child_window_win_hwnd(target->child_ctx))
+		                      : target->hwnd;
+		target->factory->MakeWindowAssociation(assoc_hwnd, DXGI_MWA_NO_ALT_ENTER);
 	}
 
 	// Transparent path: bind the composition swapchain to the HWND through DComp.
@@ -785,6 +888,7 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 		if (target->dcomp_target != nullptr) target->dcomp_target->Release();
 		if (target->dcomp_device != nullptr) target->dcomp_device->Release();
 		target->swapchain->Release();
+		comp_child_window_win_destroy(&target->child_ctx);
 		delete target;
 		return xret;
 	}
@@ -901,6 +1005,9 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 	if (target->swapchain != nullptr) {
 		target->swapchain->Release();
 	}
+
+	// After the swapchain: a chain must not outlive the window it is bound to.
+	comp_child_window_win_destroy(&target->child_ctx);
 
 	delete target;
 	*target_ptr = nullptr;
@@ -1076,6 +1183,9 @@ comp_d3d11_target_repaint_admit(struct comp_d3d11_target *target)
 {
 	if (target != nullptr && target->device_lost) {
 		return false; // nothing can present on a dead chain
+	}
+	if (comp_d3d11_target_repaint_forbidden(target)) {
+		return false; // #2635: a repaint present would deadlock against the app's Present hook
 	}
 	if (g_repaint_queue_cap < 0) {
 		const char *e = getenv("DXR_WEAVE_REPAINT_QUEUE_CAP");
@@ -1418,8 +1528,36 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 	if (target->device_lost) {
 		return XRT_ERROR_D3D;
 	}
+	// #2635: on the app's own thread (never the repaint thread), check whether
+	// it is calling us from inside a Present hook that also hooks this chain.
+	// Before the first repaint mark g_repaint_thread_id is 0, so every
+	// present until then is an app present.
+	if (GetCurrentThreadId() != g_repaint_thread_id) {
+		target_reentry_sample(target);
+	}
+	// #2635: under a re-entrant Present hook the call must be made on THIS
+	// thread. The #2603 worker would enter the hook on another thread and wait
+	// for the lock this (app) thread holds while this thread waits for the
+	// worker: a deadlock that #2603 then misreads as a driver wedge (measured:
+	// session lost 5 s after the first frame). Inline gives up #2603's bound
+	// for this session only; a real driver wedge here hangs as before #2603.
+	const bool inline_present = target->pw_thread == nullptr || target->present_reentrant;
+	if (!target->present_thread_logged) {
+		target->present_thread_logged = true;
+		U_LOG_W("d3d11 target: first Present — caller tid=%lu, presenting tid=%lu (%s), present-hook "
+		        "re-entry=%d (#2635)",
+		        (unsigned long)GetCurrentThreadId(), (unsigned long)target_presenting_tid(target, inline_present),
+		        inline_present ? "inline" : "#2603 bounded worker", target->present_reentrant ? 1 : 0);
+	}
+	if (target->present_reentrant && target->pw_thread != nullptr && target->presents_on_worker > 0 &&
+	    !target->reentry_inline_logged) {
+		target->reentry_inline_logged = true;
+		U_LOG_W("d3d11 target: present-hook re-entry — Present moves off the #2603 worker (tid=%lu) onto "
+		        "the app's thread (tid=%lu) for the rest of the session (#2635)",
+		        (unsigned long)GetThreadId(target->pw_thread), (unsigned long)GetCurrentThreadId());
+	}
 	HRESULT hr;
-	if (target->pw_thread != nullptr) {
+	if (!inline_present) {
 		// #2603: the call runs on the bounded worker; this thread waits for
 		// it exactly as long as it takes, up to the bound. Anything but a
 		// clean done (a timeout, or a failed wait with the worker possibly
@@ -1427,10 +1565,15 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 		target->pw_sync_interval = sync_interval;
 		SetEvent(target->pw_req);
 		if (WaitForSingleObject(target->pw_done, target->present_bound_ms) != WAIT_OBJECT_0) {
+			U_LOG_W("d3d11 target: wedge — caller tid=%lu waited on the #2603 worker tid=%lu; "
+			        "present-hook re-entry=%d (#2635/#2603)",
+			        (unsigned long)GetCurrentThreadId(), (unsigned long)GetThreadId(target->pw_thread),
+			        target->present_reentrant ? 1 : 0);
 			target_mark_present_wedged(target);
 			return XRT_ERROR_D3D;
 		}
 		hr = target->pw_hr;
+		target->presents_on_worker++;
 	} else {
 		hr = target_present_call(target, sync_interval);
 	}
@@ -1555,6 +1698,10 @@ comp_d3d11_target_resize(struct comp_d3d11_target *target,
 		target->back_buffer->Release();
 		target->back_buffer = nullptr;
 	}
+
+	// The E_ACCESSDENIED fallback's child follows first, so the chain and
+	// the window it presents into agree on the size (no-op without one).
+	comp_child_window_win_resize(target->child_ctx, width, height);
 
 	// Resize swapchain. Must pass the creation flags — DXGI returns
 	// E_INVALIDARG if they differ (#848, waitable late-weave chains).

@@ -20,6 +20,8 @@ prints ONE line, `PORT <n>`, once it listens, then serves until GET /__quit or
     422             422 {"code": "unrectified_pair", "message": ...}: bad input, never retried
     503             503 on every job (a host that falls through)
     slow            sleeps --delay seconds before answering (cancel / timeout tests)
+    truncate        200 with the full Content-Length and X-DXR-Result, but only half the
+                    body is written before the connection is closed (a truncated transfer)
 --token T makes every request need `Authorization: Bearer T` (401 otherwise).
 --licence commercial|research_only|unknown, --build <commit> set what /v1/describe says.
 """
@@ -27,6 +29,7 @@ prints ONE line, `PORT <n>`, once it listens, then serves until GET /__quit or
 import argparse
 import io
 import json
+import socket
 import sys
 import threading
 import time
@@ -209,7 +212,25 @@ def make_handler(state: State):
             fmt = params.get("format", "sog")
             blob = fake_sog(1179648) if fmt == "sog" else b"ply\nformat binary_little_endian 1.0\nend_header\n"
             result["format"] = fmt
+            if a.mode == "truncate":
+                self._send_truncated(blob, json.dumps(result))
+                return
             self._send(200, blob, "application/octet-stream", {"X-DXR-Result": json.dumps(result)})
+
+        def _send_truncated(self, blob, result):
+            """Declare the whole blob, write half, then close: a graceful early close."""
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("X-DXR-Result", result)
+            self.end_headers()
+            self.close_connection = True
+            try:
+                self.wfile.write(blob[: len(blob) // 2])
+                self.wfile.flush()
+                self.connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
 
     return H
 
@@ -217,7 +238,7 @@ def make_handler(state: State):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=0)
-    ap.add_argument("--mode", default="ok", choices=["ok", "refuse-metric", "422", "503", "slow"])
+    ap.add_argument("--mode", default="ok", choices=["ok", "refuse-metric", "422", "503", "slow", "truncate"])
     ap.add_argument("--delay", type=float, default=5.0)
     ap.add_argument("--token", default="")
     ap.add_argument("--licence", default="commercial", choices=["commercial", "research_only", "unknown"])

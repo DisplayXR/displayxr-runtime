@@ -29,6 +29,7 @@
 // #1589/#1610: the shared format-honesty policy (hatch + fast-path predicate).
 #include "util/u_color_encoding.h"
 #include "util/u_logging.h"
+#include "util/u_window_visibility.h"
 #include "util/u_setting.h"
 #include "util/u_weave_scope.h"
 #include "util/u_tracking_any.h"
@@ -420,6 +421,11 @@ struct d3d11_service_swapchain
 
 	//! Whether this swapchain was created by the service (vs imported from client)
 	bool service_created;
+
+	//! #2620: round-robin cursor of swapchain_acquire_image, per swapchain (it
+	//! was a function static shared by every swapchain of every client). Zero
+	//! (the create memset) = start at image 0.
+	uint32_t next_acquire_index;
 };
 
 //! #1058: bound on the per-frame input-handle set used to infer the frame
@@ -857,6 +863,16 @@ struct d3d11_client_render_resources
 	//! global trigger only. Set per submit from the IPC handler, like the
 	//! POSIX weave engines' #2207 tag.
 	char                                   weave_capture_tag[64];
+	//! #2615: svc_weave_capture_poll's cache, touched only by that function
+	//! (on this client's IPC thread). The candidate trigger paths are built
+	//! for weave_capture_poll_tag and rebuilt only when weave_capture_tag
+	//! changes; the files are stat'ed at most every 250 ms. All-zero (the
+	//! init memset) = not built yet, never polled — the first submit builds
+	//! and polls.
+	char                                   weave_capture_poll_tag[64];
+	char                                   weave_capture_poll_paths[4][MAX_PATH];
+	bool                                   weave_capture_poll_built;
+	int64_t                                weave_capture_poll_last_ns;
 	uint32_t                               weave_crop_w;
 	uint32_t                               weave_crop_h;
 
@@ -4635,6 +4651,13 @@ struct d3d11_multi_compositor
 	//! Focused client index (-1 = none).
 	int32_t focused_slot;
 
+	//! @name #2671 presenter visibility (default policy; render thread only)
+	//! @{
+	struct u_window_visibility *lens_vis; //!< NULL until the first trackable presenter
+	HWND lens_vis_hwnd;                   //!< the window lens_vis tracks (NULL = none)
+	bool lens_hidden_applied;             //!< the hidden gate is engaged
+	//! @}
+
 	//! Phase 2.K: focused-slot value last seen by the public-API drain. The
 	//! drain compares against `focused_slot` and emits a FOCUS_CHANGED event
 	//! to the workspace controller on each transition (TAB cycle, click
@@ -5369,9 +5392,34 @@ multi_compositor_request_mode_flip(struct d3d11_service_system *sys,
  * Logging is rate-limited to one line per second so a persistently failing DP
  * on a per-commit path cannot flood the log.
  */
+/*!
+ * #2671: the default policy's presenter window is hidden (minimized, cloaked or
+ * every pixel on the 3D screen covered). While set, every hardware-3D request
+ * the service makes is sent as 2D, whichever of the many writers makes it (app
+ * request, focus re-arm, DP rebind, zones fallback), while the callers still
+ * record the session's own choice in sys->hardware_display_3d, which
+ * pipeline_lens_visibility_tick re-sends when the window is seen again (the
+ * u_display_mode_hold.h rule: never a forced 3D). Written by the render thread
+ * only, under render_mutex; one panel per service.
+ */
+static std::atomic<bool> g_svc_presenter_hidden{false};
+
+/*!
+ * #2671 + ADR-027: the presenter went hidden while it may hold a published zone
+ * wish. Its publishes are withheld while hidden (a zone-capable DP turns each
+ * new verdict into a lens request), and the first one after the window is
+ * seen again starts from scratch, so the DP re-sends its verdict instead of
+ * keeping the gate's 2D. Set by the render thread, consumed by the publish,
+ * both under render_mutex.
+ */
+static std::atomic<bool> g_svc_zone_reeval_owed{false};
+
 static bool
 dp_request_display_mode_checked(struct xrt_display_processor_d3d11 *xdp, bool enable_3d, const char *func, int line)
 {
+	if (enable_3d && g_svc_presenter_hidden.load(std::memory_order_acquire)) {
+		enable_3d = false;
+	}
 	bool ok = xrt_display_processor_d3d11_request_display_mode(xdp, enable_3d);
 	if (!ok) {
 		static std::atomic<int64_t> last_fail_log_ns{0};
@@ -8811,10 +8859,10 @@ swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_index)
 {
 	struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
 
-	// Simple round-robin for now
-	static uint32_t next_index = 0;
-	*out_index = next_index % sc->image_count;
-	next_index++;
+	// Simple round-robin, per swapchain (#2620: a shared static cursor let
+	// one swapchain's acquires skip images of every other).
+	*out_index = sc->next_acquire_index % sc->image_count;
+	sc->next_acquire_index = (*out_index + 1) % sc->image_count;
 
 	U_LOG_D("[#151] d3d11_service swapchain_acquire_image: index=%u image_count=%u "
 	        "(w=%u h=%u format=%lld bits=0x%x service_created=%d)",
@@ -11649,6 +11697,10 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 	if (mc->capture_render_thread.joinable()) {
 		mc->capture_render_thread.join();
 	}
+	// #2671: the render thread (the tracker's only reader) is joined; join the
+	// tracker's own thread too, and drop the gate with the panel.
+	u_window_visibility_destroy(&mc->lens_vis);
+	g_svc_presenter_hidden.store(false, std::memory_order_release);
 
 	// Restore and stop all capture clients
 	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
@@ -12336,7 +12388,11 @@ capture_slot_update_srv(struct d3d11_service_system *sys, struct d3d11_multi_cli
 		return;
 
 	uint32_t w = 0, h = 0;
-	ID3D11Texture2D *tex = d3d11_capture_get_texture(slot->capture_ctx, &w, &h);
+	// #2620: the capture context hands out a REFERENCED texture, so it stays
+	// alive while the SRV below is created even if a new frame replaces it.
+	wil::com_ptr<ID3D11Texture2D> tex_ref;
+	tex_ref.attach(d3d11_capture_get_texture(slot->capture_ctx, &w, &h));
+	ID3D11Texture2D *tex = tex_ref.get();
 	if (tex == nullptr || w == 0 || h == 0)
 		return;
 
@@ -15563,6 +15619,66 @@ pipeline_segments_weave(struct d3d11_service_system *sys,
 	return true;
 }
 
+/*!
+ * #2671: the presenter's visibility drives the panel's lens wish. Render
+ * thread, under render_mutex, once per tick: one atomic load unless the
+ * tracked window or the hidden state changed. @p hwnd is the window the
+ * default policy presents to, or NULL when the policy does not apply (no
+ * presenter, a present-owner, which runs its own visibility rule, a published
+ * zone wish, or a workspace controller owning the panel).
+ *
+ * Without a controller exactly one client holds the panel (the lease), so
+ * "every 3D window hidden" is "the presenter's window hidden". Hidden: the
+ * panel DP is asked for 2D and the gate in dp_request_display_mode_checked
+ * keeps every later 3D request flat. Seen again (or a new presenter): the gate
+ * drops and the session's recorded hardware state is re-sent. The hardware
+ * flag and the apps' events are untouched: the app is not told (#2671 open
+ * question; no session-state change).
+ */
+static void
+pipeline_lens_visibility_tick(struct d3d11_service_system *sys,
+                              struct d3d11_multi_compositor *mc,
+                              struct d3d11_service_compositor *fc,
+                              HWND hwnd)
+{
+	if (hwnd != mc->lens_vis_hwnd) {
+		mc->lens_vis_hwnd = hwnd;
+		if (mc->lens_vis != nullptr) {
+			u_window_visibility_set_window(mc->lens_vis, hwnd);
+		} else if (hwnd != nullptr) {
+			mc->lens_vis = u_window_visibility_create(hwnd, sys->base.info.display_device_name, "service",
+			                                          nullptr, nullptr);
+		}
+	}
+	const bool hidden = hwnd != nullptr && u_window_visibility_hidden(mc->lens_vis);
+	if (hidden == mc->lens_hidden_applied) {
+		return;
+	}
+	mc->lens_hidden_applied = hidden;
+	struct xrt_display_processor_d3d11 *dp = fc != nullptr ? panel_dp(sys, fc) : mc->display_processor;
+	// On release the session's mode goes first, always; a published zone wish
+	// then re-sends its own verdict on its next (from-scratch) publish.
+	const bool zone_owns = fc != nullptr && fc->zone_published;
+	if (hidden) {
+		g_svc_presenter_hidden.store(true, std::memory_order_release);
+		g_svc_zone_reeval_owed.store(true, std::memory_order_release);
+		if (dp != nullptr) {
+			(void)DP_REQUEST_DISPLAY_MODE(dp, false);
+		}
+	} else {
+		g_svc_presenter_hidden.store(false, std::memory_order_release);
+		if (dp != nullptr && sys->hardware_display_3d) {
+			(void)DP_REQUEST_DISPLAY_MODE(dp, true);
+		}
+		// The vendor lags the command: keep the poll from counter-correcting.
+		stamp_flip_cooldown(sys, sys->hardware_display_3d);
+	}
+	U_LOG_W("#2671 service: presenter window %s, panel lens wish %s", hidden ? "hidden" : "visible (or changed)",
+	        hidden      ? "2D"
+	        : zone_owns ? "the session's mode, then the zone wish (re-published)"
+	                    : (sys->hardware_display_3d ? "the session's 3D" : "the session's 2D"));
+}
+
 static void
 pipeline_default_policy_render(struct d3d11_service_system *sys,
                                struct d3d11_multi_compositor *mc,
@@ -15688,6 +15804,17 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	}
 	if (present_hwnd == nullptr || (kind != PRESENTER_SELF && present_rtv == nullptr)) {
 		kind = PRESENTER_NONE;
+	}
+
+	/* #2671: the lens follows whether any pixel of the presenter is visible.
+	 * Not for a present-owner (own visibility rule) or under a controller's
+	 * foreground override. A zones presenter is included: its wish publish is
+	 * withheld while hidden (service_update_zone_wish_publish). */
+	{
+		const bool policy = forced_focus < 0 && fc != nullptr &&
+		                    (kind == PRESENTER_APP_HWND || kind == PRESENTER_SERVICE_WINDOW ||
+		                     kind == PRESENTER_CLIENT_TEXTURE);
+		pipeline_lens_visibility_tick(sys, mc, fc, policy ? present_hwnd : nullptr);
 	}
 
 	/* (d) The service window is visible only while it IS the presenter — under
@@ -17622,6 +17749,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		pipeline_default_policy_render(sys, mc, /*forced_focus*/ -1);
 		return;
 	}
+
+	// #2671: a controller owns the panel from here; drop a hidden gate the
+	// default policy left engaged (releases to the recorded state).
+	pipeline_lens_visibility_tick(sys, mc, nullptr, nullptr);
 
 	/* #964 Phase A (workspace scope): FOREGROUND OVERRIDE.
 	 *
@@ -22823,6 +22954,11 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 				std::lock_guard<std::mutex> lk(c->seg_mutex);
 				comp_d3d11_segments_clear_zone_mask(c->segments);
 			}
+			// #2671: a clear hands the lens back to the mode authority; while
+			// the presenter is hidden that stays 2D.
+			if (g_svc_presenter_hidden.load(std::memory_order_acquire)) {
+				(void)DP_REQUEST_DISPLAY_MODE(dp, false);
+			}
 			// #1017: never withdraw a panel-wide resource silently — a stale
 			// mask left on the shared DP is invisible otherwise.
 			U_LOG_W("ZONES SVC: wish mask withdrawn from the %s DP (non-zones frame)",
@@ -22880,6 +23016,21 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	ID3D11Device *mask_dev = svc_zone_mask_device(sys, c);
 	if (!svc_zone_mask_publish_device_ok(sys, c, mask_dev)) {
 		return; // #918 tripwire: mask and DP are on different devices
+	}
+
+	// #2671: withheld while the presenter is hidden (the gate holds the panel
+	// 2D); the first publish after it is seen again starts from scratch.
+	if (g_svc_presenter_hidden.load(std::memory_order_acquire)) {
+		return;
+	}
+	if (g_svc_zone_reeval_owed.exchange(false, std::memory_order_acq_rel) && c->zone_published) {
+		xrt_display_processor_d3d11_clear_local_zone_mask(dp);
+		c->zone_published = false;
+		{
+			std::lock_guard<std::mutex> lk(c->seg_mutex);
+			comp_d3d11_segments_clear_zone_mask(c->segments);
+		}
+		U_LOG_W("#2671 service: the presenter is seen again - its zone wish is re-published from scratch");
 	}
 
 	// No flat rects on the zones path: a zones frame's 3D rects ARE the wish, so
@@ -24752,6 +24903,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// Withdrawing the mask (non-zones frames / teardown) re-enables
 		// the poll on the next window.
 		if (got_state && c->zone_published) {
+			got_state = false;
+		}
+		// #2671: the panel is 2D on purpose while the presenter's window is
+		// hidden; neither re-assert the app's 3D nor follow the vendor's 2D
+		// into the app's rendering mode. The release re-sends the app's state.
+		if (got_state && g_svc_presenter_hidden.load(std::memory_order_acquire)) {
 			got_state = false;
 		}
 
@@ -31933,37 +32090,67 @@ weave_seg_snap_dp(struct d3d11_service_compositor *c, int32_t target_x, int32_t 
  *                                                  back to the caller, overlay fallback included)
  *   displayxr_atlas_trigger[.<exe>].projection  -> displayxr_atlas[.<exe>].projection.png (DP input only)
  *
- * Alpha is written as submitted (dxr_diag_dump_tex). Cost on the hot path: up
- * to four GetFileAttributes per submit; the readbacks run only on a submit
- * that consumed a trigger. One WARN per capture names the files.
+ * Alpha is written as submitted (dxr_diag_dump_tex). Cost on the hot path
+ * (#2615, the #925 rank-10 pattern): this runs under render_mutex and
+ * immediate_ctx_mutex, so the candidate paths are cached per client (getenv +
+ * formatting only when the client's tag changes) and the up-to-four
+ * GetFileAttributes run at most every 250 ms per client — plenty for a
+ * hand-armed one-shot trigger. The readbacks run only on a submit that
+ * consumed a trigger. One WARN per capture names the files.
+ *
+ * Kept at its call site, after the input import, rather than hoisted before the
+ * locks: polling earlier would consume (delete) a trigger on submits that are
+ * then refused before any capture point, losing the one-shot capture.
  */
 static bool
-svc_weave_capture_poll(const char *tag, bool *projection_only, char *stem, size_t stem_cap)
+svc_weave_capture_poll(struct d3d11_client_render_resources *res, bool *projection_only, char *stem, size_t stem_cap)
 {
-	const char *tmp = getenv("TEMP");
-	if (tmp == nullptr || tmp[0] == '\0') {
-		return false;
-	}
-	const bool have_tag = tag != nullptr && tag[0] != '\0';
 	struct cand
 	{
 		bool per_exe;
 		bool proj;
 	};
-	const cand order[] = {{true, true}, {true, false}, {false, true}, {false, false}};
-	for (const cand &k : order) {
-		if (k.per_exe && !have_tag) {
-			continue;
+	static const cand order[] = {{true, true}, {true, false}, {false, true}, {false, false}};
+	static_assert(sizeof(order) / sizeof(order[0]) ==
+	                  sizeof(res->weave_capture_poll_paths) / sizeof(res->weave_capture_poll_paths[0]),
+	              "one cached path per candidate");
+
+	const char *tag = res->weave_capture_tag;
+	if (!res->weave_capture_poll_built ||
+	    strncmp(tag, res->weave_capture_poll_tag, sizeof(res->weave_capture_poll_tag)) != 0) {
+		memcpy(res->weave_capture_poll_tag, tag, sizeof(res->weave_capture_poll_tag));
+		res->weave_capture_poll_tag[sizeof(res->weave_capture_poll_tag) - 1] = '\0';
+		res->weave_capture_poll_built = true;
+		const char *tmp = getenv("TEMP");
+		const bool have_tmp = tmp != nullptr && tmp[0] != '\0';
+		const bool have_tag = res->weave_capture_poll_tag[0] != '\0';
+		for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+			char *path = res->weave_capture_poll_paths[i];
+			path[0] = '\0'; // "" = this candidate is not polled
+			if (!have_tmp || (order[i].per_exe && !have_tag)) {
+				continue;
+			}
+			snprintf(path, sizeof(res->weave_capture_poll_paths[i]), "%s\\displayxr_atlas_trigger%s%s%s",
+			         tmp, order[i].per_exe ? "." : "", order[i].per_exe ? res->weave_capture_poll_tag : "",
+			         order[i].proj ? ".projection" : "");
 		}
-		char path[MAX_PATH];
-		snprintf(path, sizeof(path), "%s\\displayxr_atlas_trigger%s%s%s", tmp, k.per_exe ? "." : "",
-		         k.per_exe ? tag : "", k.proj ? ".projection" : "");
-		if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+	}
+
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	if (res->weave_capture_poll_last_ns != 0 && now_ns - res->weave_capture_poll_last_ns < 250LL * 1000000LL) {
+		return false;
+	}
+	res->weave_capture_poll_last_ns = now_ns;
+
+	for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+		const char *path = res->weave_capture_poll_paths[i];
+		if (path[0] == '\0' || GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
 			continue;
 		}
 		DeleteFileA(path);
-		snprintf(stem, stem_cap, "displayxr_atlas%s%s", k.per_exe ? "." : "", k.per_exe ? tag : "");
-		*projection_only = k.proj;
+		snprintf(stem, stem_cap, "displayxr_atlas%s%s", order[i].per_exe ? "." : "",
+		         order[i].per_exe ? res->weave_capture_poll_tag : "");
+		*projection_only = order[i].proj;
 		return true;
 	}
 	return false;
@@ -32084,6 +32271,32 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                uint64_t *out_fence_value,
                                struct xrt_eye_positions *out_eyes)
 {
+	/*
+	 * #2605: this function OWNS the NT input and overlay handles from entry (the
+	 * IPC handler duplicated them into this process and never closes them on
+	 * Windows). Every exit path must either hand a handle to the import cache or
+	 * close it, so both are held here and closed on return unless disarmed. A
+	 * handle is disarmed exactly where the cache adopts it, or where the
+	 * matched-cache branch has already closed this submit's duplicate.
+	 * weave_close_cached ignores null / INVALID / legacy DXGI handles.
+	 */
+	struct weave_handle_owner
+	{
+		HANDLE h;
+		bool is_dxgi;
+		void
+		disarm()
+		{
+			h = nullptr;
+		}
+		~weave_handle_owner()
+		{
+			weave_close_cached(h, is_dxgi);
+		}
+	};
+	weave_handle_owner in_owner{(HANDLE)in_handle, in_is_dxgi};
+	weave_handle_owner ov_owner{(HANDLE)overlay_handle, overlay_is_dxgi};
+
 	// DXR_WEAVE_GPU_TIMING: CPU wall time of the whole synchronous submit.
 	const int64_t t_entry_ns = (int64_t)os_monotonic_get_ns();
 	// v4 Phase 1 composites the whole premul atlas; per-rect scoping is a future hint.
@@ -32420,6 +32633,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		if (in != c->render.weave_input_handle_cached) {
 			weave_close_cached(in, in_is_dxgi); // this submit's duplicate of the cached texture
 		}
+		// Closed above, or the very handle the cache already owns.
+		in_owner.disarm();
 		in = c->render.weave_input_handle_cached; // stable identity for #1058's frame boundary
 	} else {
 		weave_close_cached(c->render.weave_input_handle_cached, c->render.weave_input_cached_is_dxgi);
@@ -32456,6 +32671,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		}
 
 		(void)c->render.weave_input_tex->QueryInterface(IID_PPV_ARGS(c->render.weave_input_km.put()));
+		in_owner.disarm(); // the cache owns it from here
 		c->render.weave_input_handle_cached = in;
 		c->render.weave_input_cached_is_dxgi = in_is_dxgi;
 		U_LOG_W("#625 weave: input import cached (handle=%p %s, %ux%u)", in, in_is_dxgi ? "DXGI" : "NT",
@@ -32472,8 +32688,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// dumps run after the weave (see svc_weave_capture_poll).
 	char cap_stem[96] = {0};
 	bool cap_projection_only = false;
-	const bool cap_armed = svc_weave_capture_poll(c->render.weave_capture_tag, &cap_projection_only, cap_stem,
-	                                              sizeof(cap_stem));
+	const bool cap_armed = svc_weave_capture_poll(&c->render, &cap_projection_only, cap_stem, sizeof(cap_stem));
 	ID3D11ShaderResourceView *cap_dp_srv = nullptr; // the DP input of the path that ran
 
 	// DIAGNOSTIC ONLY (browser#73). Armed by creating
@@ -32582,6 +32797,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			if (ov != c->render.weave_overlay_handle_cached) {
 				weave_close_cached(ov, overlay_is_dxgi);
 			}
+			// Closed above, or the very handle the cache already owns.
+			ov_owner.disarm();
 		} else {
 			weave_close_cached(c->render.weave_overlay_handle_cached, c->render.weave_overlay_cached_is_dxgi);
 			c->render.weave_overlay_handle_cached = nullptr;
@@ -32606,6 +32823,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 				if (SUCCEEDED(hr)) {
 					(void)c->render.weave_overlay_tex->QueryInterface(
 					    IID_PPV_ARGS(c->render.weave_overlay_km.put()));
+					ov_owner.disarm(); // the cache owns it from here
 					c->render.weave_overlay_handle_cached = ov;
 					c->render.weave_overlay_cached_is_dxgi = overlay_is_dxgi;
 					U_LOG_W("#625 weave v4: overlay import cached (handle=%p %s, %ux%u)", ov,

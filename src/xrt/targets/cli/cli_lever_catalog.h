@@ -9,7 +9,7 @@
  * Edit the census and re-run the script; the lint workflow runs it with
  * --check, which also fails when a name here no longer occurs in src/xrt.
  *
- * 74 levers: 54 Tier 1 (next launch), 20 Tier 2 (service-scoped).
+ * 78 levers: 58 Tier 1 (next launch), 20 Tier 2 (service-scoped).
  *
  * This is a DESCRIPTION of the levers, not a way to set them: only the names
  * u_setting_is_managed() accepts resolve from the per-user / machine stores.
@@ -59,7 +59,10 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_LATE_WEAVE", 1, "App + Svc", "on", "Weave as late as possible before scanout."},
 	{"DXR_LATE_WEAVE_SCANOUT_WAIT", 1, "App", "auto: stage 2 on only for a chain DXGI reports scanning out directly (OVERLAY/independent flip, 30 consecutive frames), off while COMPOSED or unknown; 0 forces off, 1 forces on", "#2564: the stage-2 scanout wait cannot help a DWM-composed window (the present after scanout always misses DWM's vblank pickup) and was the source of depth-1 30 fps, governor churn and resize-drag..."},
 	{"DXR_LATE_WEAVE_SLIP_CAP", 1, "App + Svc", "on (0 = pre-2026-09 policy)", "Damps governor depth flapping: slip-rate escalation capped at needed_depth()+1, return probe needs 3 clean slip windows, slip re-escalation within two dwells of a probe doubles the dwell (30 -> 60..."},
+	{"DXR_LEGACY_AUTO_2D", 1, "App", "off (the per-executable profile's auto2d, default false)", "#2639: 1 / 0 turns automatic 2D on / off for a LEGACY session on the D3D11 hub: while both eyes show one flat picture (identical, or identical up to one horizontal shift) the lens goes 2D and the..."},
+	{"DXR_LEGACY_AUTO_CONVERGENCE", 1, "App", "off (the profile's autoConvergence, default false)", "#2640: 1 / 0 turns automatic re-convergence on / off for a LEGACY session on the D3D11 hub: a horizontal image shift of the two views before the display processor puts the scene's centre-weighted..."},
 	{"DXR_LEGACY_CAMERA_RIG", 1, "App", "Per-executable JSON profile, otherwise qwerty defaults", "Inline camera-rig JSON or a UTF-8 file path; seeds instance-wide native legacy camera tuning and Space reset."},
+	{"DXR_LEGACY_VIEW_SIZE_FROM_WINDOW", 1, "App", "on", "#2641: a legacy instance with a D3D11 / D3D12 binding whose process already owns the window a hosted session will adopt (DXR_WIN32_ADOPT_OWN_WINDOW, #2637) is told to render views sized from that..."},
 	{"DXR_LINUX_DIRECT_SCANOUT", 1, "App", "off", "Opt-in RandR direct-scanout present path on Linux"},
 	{"DXR_MAX_CLIENTS", 1, "Svc", "0 = auto", "#959 admitted-client cap. Read once at service start"},
 	{"DXR_MONO_AUTO_2D", 1, "App", "on (kill switch)", "Kill switch for automatic hardware 2D when a stereo session submits one flat picture (every projection view on the same swapchain, imageArrayIndex and imageRect; projection layers only) for 0.5 s..."},
@@ -83,6 +86,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_WEAVE_ON_SCANOUT", 1, "App", "on (kill switch)", "Kill switch for the ADR-037 output-device split."},
 	{"DXR_WEAVE_REPAINT", 1, "App", "on", "Master switch for #868 repaint. Decides whether the repaint thread is spawned"},
 	{"DXR_WEAVE_SINGLE_THREAD", 1, "App", "on (Android; and vulkan_enable1 apps whose repaint shares the app's queue, #2393), off elsewhere", "#1196 pins the DP weave to one thread where the DP is proven thread-affine"},
+	{"DXR_WIN32_ADOPT_OWN_WINDOW", 1, "App", "auto (on for an in-process hosted D3D11 / D3D12 session whose process owns exactly one visible, unowned, non-tool top-level window on the 3D panel's monitor that is not exclusive full-screen)", "Windows twin of DXR_XCB_ADOPT_OWN_WINDOW (#2637): the hosted window becomes an owned, non-activating, click-through popup tracking the app's own window's client area (WinEvent hooks; no..."},
 	{"DXR_WINDOW_FULLSCREEN", 1, "App", "on", "=0 opts out of EWMH fullscreen placement (Linux XCB)"},
 	{"DXR_WINDOW_POS", 1, "App", "plug-in reported", "\"x,y\" override for the self-owned window position (#715)"},
 	{"DXR_WL_MOVE_SYNC", 1, "App", "on whenever the window-geometry@displayxr.org extension supports it (version 9+, GNOME 45+)", "Move-synchronised re-weave: every commit carries a 1x1 subsurface tag of the position its frame was woven for, and the extension paints each frame of a compositor drag (title bar, Super+drag, the..."},

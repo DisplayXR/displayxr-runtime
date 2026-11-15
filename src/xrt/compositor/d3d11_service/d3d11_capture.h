@@ -51,15 +51,15 @@ d3d11_capture_start(struct ID3D11Device *device, HWND hwnd);
 /*!
  * Get the latest captured texture.
  *
- * Returns a pointer to the staging texture containing the most recent
- * captured frame. The texture is owned by the capture context and remains
- * valid until the next call to d3d11_capture_get_texture() or
- * d3d11_capture_stop(). The caller must NOT release it.
+ * Returns the staging texture containing the most recent captured frame,
+ * with a reference added for the caller (taken under the context's lock, so
+ * the FrameArrived callback replacing the texture cannot free it underneath
+ * the caller). The caller MUST Release() it (#2620).
  *
  * @param ctx        Capture context from d3d11_capture_start().
  * @param out_width  Receives texture width in pixels (may be NULL).
  * @param out_height Receives texture height in pixels (may be NULL).
- * @return Latest texture, or NULL if no frame has been captured yet.
+ * @return Latest texture (referenced), or NULL if no frame has been captured yet.
  */
 struct ID3D11Texture2D *
 d3d11_capture_get_texture(struct d3d11_capture_context *ctx,

@@ -79,6 +79,12 @@ A frequent point of confusion — the in-process classes differ in **who owns th
 
 So `NULL` is the **Hosted** path (not Handle) — that's the case that makes the runtime self-create a window. The display processor *normally* receives a real handle: the app's for Handle/Texture, the runtime's self-created window for Hosted. Authoritative branch: the window-handling block in `*_compositor_create` (e.g. `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp`).
 
+### Hosted apps that already own a window (Windows: adopt-own-window, #2637)
+
+A legacy app with no window binding is Hosted, but it may still own a top-level window of its own. The usual case is a desktop game driven through an OpenXR injector. A second, full-screen runtime window would put the 3D picture in one window and the input focus in another. So on Windows the in-process D3D11 and D3D12 hosted paths **adopt** the app's window: the runtime's window becomes an owned, non-activating, click-through popup over the app window's client area and is sized to it. Input, focus, Alt-Tab and the taskbar stay with the app's window. The runtime's window follows the app window's moves, resizes, minimise and restore through out-of-context WinEvent hooks; it never subclasses the app's window procedure or attaches thread input. The display processor's position anchor, the hub's presenter and the canvas are the popup, i.e. the app's client rect. A full-screen borderless app gives the whole panel, the same as before.
+
+`DXR_WIN32_ADOPT_OWN_WINDOW`: unset = auto, `1` = force, `0` = off. Auto adopts only when the process owns exactly one visible, unowned, non-tool top-level window on the 3D panel's monitor that does not look exclusive full-screen; otherwise the session keeps its own full-screen window as before (e.g. `cube_hosted_*`, which own no window). `1` takes the foreground window, else the largest, on any monitor. One WARN at session start names the decision (`hosted session ADOPTS the app's own window …` or `… keeps its own full-screen window — not adopting …: <reason>`). Not on the GL and Vulkan hosted paths yet, and never for Handle, Texture or IPC/workspace sessions. Desktop Linux has the same idea as an input-transparent child window (`DXR_XCB_ADOPT_OWN_WINDOW`, #2322).
+
 ### The HWND is a position/phase anchor — and for texture it is *already optional*
 
 The handle a class passes is **content delivery for Handle/Hosted, but for Texture

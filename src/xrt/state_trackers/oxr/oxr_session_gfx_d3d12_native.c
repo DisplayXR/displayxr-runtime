@@ -167,6 +167,7 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
 		struct xrt_device *head = get_role_head(sess->sys);
 		if (head != NULL) {
 			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+			sess->ext_app_mode_set = true; // cleared at session destroy (#2619)
 		}
 	}
 

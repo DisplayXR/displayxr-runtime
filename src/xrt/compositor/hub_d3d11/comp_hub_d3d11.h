@@ -134,6 +134,7 @@ struct xrt_segment_metrics;
 struct xrt_system_compositor_info;
 struct comp_segments_content;
 struct comp_hub_d3d11_handoff;
+struct u_legacy_stereo_auto;
 //! XR_DXR_depth_budget - taken by pointer only; see xrt/xrt_display_processor.h.
 struct xrt_dp_background_preview;
 
@@ -520,6 +521,18 @@ comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
  */
 bool
 comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *split, const struct comp_hub_d3d11_handoff *handoff);
+
+/*!
+ * #2639 / #2640: turn on a LEGACY session's automatic 2D and/or automatic
+ * re-convergence (util/u_stereo_auto.h, comp_hub_d3d11_auto_stereo.h). Call
+ * once, after Stage A; @p cfg enabling nothing, or a client-presents hub, is a
+ * no-op. @p source names where the switches came from, for the one WARN.
+ * Both stay off unless called: a display-aware session owns its own mode/rig.
+ */
+void
+comp_hub_d3d11_set_legacy_auto_stereo(struct comp_hub_d3d11 *split,
+                                      const struct u_legacy_stereo_auto *cfg,
+                                      const char *source);
 
 /*!
  * Release everything, in the reverse of the create order, and NULL the caller's
@@ -1067,6 +1080,38 @@ comp_hub_d3d11_get_display_pixel_info(
 
 bool
 comp_hub_d3d11_request_display_mode(struct comp_hub_d3d11 *split, bool enable_3d);
+
+/*!
+ * #2671: the session's 3D window is hidden (every pixel minimized, cloaked or
+ * covered) or visible again, from the owning compositor's
+ * u_window_visibility tracker. While hidden the hub's DP is asked for 2D over
+ * the session's own mode; visible again, the session's mode is re-sent at once
+ * (never a forced 3D). Edges only; any thread (takes the DP mutex).
+ */
+void
+comp_hub_d3d11_set_window_hidden(struct comp_hub_d3d11 *split, bool hidden);
+
+/*!
+ * #2671: the owning compositor's window-visibility tracker, borrowed (NULL =
+ * every part visible; it must outlive the hub or be cleared first). The hub's
+ * segment DPs on other 3D screens then hold their lens at 2D while the
+ * window's part on their screen is hidden (ADR-047 multi-screen). Any thread.
+ */
+struct u_window_visibility;
+void
+comp_hub_d3d11_set_visibility(struct comp_hub_d3d11 *split, const struct u_window_visibility *vis);
+
+/*!
+ * #2639: does this hub run a legacy session's automatic 2D? Its decision is
+ * presentation-only, so xrLocateViews must hand such a session its per-eye
+ * views whatever the lens is doing: a DP in hardware 2D reports one centred
+ * eye, and goes on doing so for a few hundred ms after the lens returns to 3D
+ * (the tracker wakes up). An app rendering both views from that one eye
+ * submits a flat picture, which holds the lens in 2D for ever, or sends it
+ * straight back to 2D after every return. Any thread.
+ */
+bool
+comp_hub_d3d11_auto_2d_on(struct comp_hub_d3d11 *split);
 
 void
 comp_hub_d3d11_set_eye_tracking_mode(struct comp_hub_d3d11 *split, uint32_t mode);

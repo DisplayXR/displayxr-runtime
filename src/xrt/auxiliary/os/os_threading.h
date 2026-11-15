@@ -363,6 +363,19 @@ os_thread_join(struct os_thread *ost)
 }
 
 /*!
+ * Detach: the thread's resources are released when it exits, and it must not
+ * be joined afterwards. For fire-and-forget threads only.
+ *
+ * @public @memberof os_thread
+ */
+static inline void
+os_thread_detach(struct os_thread *ost)
+{
+	pthread_detach(ost->thread);
+	U_ZERO(&ost->thread);
+}
+
+/*!
  * Destruction.
  *
  * @public @memberof os_thread

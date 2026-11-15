@@ -109,11 +109,19 @@ create_window_on_main_thread(struct comp_gl_window_macos *win,
 	}
 
 	[win->window setTitle:@"DisplayXR — GL Native Compositor"];
+	// #2624: this file is MRR. A user click on the title-bar close button
+	// must not free the window under us: is_valid reads [window isVisible]
+	// every frame and destroy closes it. NO here makes the alloc above the
+	// one reference, released in comp_gl_window_macos_destroy (same as
+	// comp_window_macos.m #48 and comp_vk_native_window_macos.m #2624).
+	[win->window setReleasedWhenClosed:NO];
 
 	// Create pixel format and GL context
 	NSOpenGLPixelFormat *pf = create_pixel_format();
 	if (pf == nil) {
 		U_LOG_E("Failed to create NSOpenGLPixelFormat");
+		[win->window release];
+		win->window = nil;
 		*out_success = false;
 		return;
 	}
@@ -129,6 +137,10 @@ create_window_on_main_thread(struct comp_gl_window_macos *win,
 	NSOpenGLView *glView = [[NSOpenGLView alloc] initWithFrame:frame pixelFormat:pf];
 	if (glView == nil) {
 		U_LOG_E("Failed to create NSOpenGLView");
+		[share_ctx release];
+		[pf release];
+		[win->window release];
+		win->window = nil;
 		*out_success = false;
 		return;
 	}
@@ -138,8 +150,17 @@ create_window_on_main_thread(struct comp_gl_window_macos *win,
 
 	// Create context sharing with app
 	NSOpenGLContext *ctx = [[NSOpenGLContext alloc] initWithFormat:pf shareContext:share_ctx];
+	// The wrapper retains the APP's CGL context (+1, measured with
+	// CGLGetContextRetainCount, #2624) and the new context does not need it
+	// alive: release it now or the app's context is pinned for good. The
+	// view retains the pixel format it was created with.
+	[share_ctx release];
+	[pf release];
 	if (ctx == nil) {
 		U_LOG_E("Failed to create NSOpenGLContext");
+		[glView release];
+		[win->window release];
+		win->window = nil;
 		*out_success = false;
 		return;
 	}
@@ -159,10 +180,12 @@ create_window_on_main_thread(struct comp_gl_window_macos *win,
 	[glView setFrame:container.bounds];
 	[glView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 	[container addSubview:glView];
+	[glView release]; // container owns it now; win->view is a borrow
 
 	[win->window setContentView:container];
+	[container release]; // the window owns it now
 	win->view = glView;
-	win->gl_context = ctx;
+	win->gl_context = ctx; // +1 from alloc, ours (glView retains its own ref)
 
 	[win->window makeKeyAndOrderFront:nil];
 	[NSApp activateIgnoringOtherApps:YES];
@@ -257,6 +280,7 @@ comp_gl_window_macos_setup_external(void *ns_view,
 				win->gl_context = [[NSOpenGLContext alloc]
 				    initWithFormat:pf
 				     shareContext:share_ctx];
+				[share_ctx release]; // #2624: drops its ref on the app's CGL context
 				[glView setOpenGLContext:win->gl_context];
 				[win->gl_context setView:glView];
 			}
@@ -270,8 +294,10 @@ comp_gl_window_macos_setup_external(void *ns_view,
 			win->gl_context = [[NSOpenGLContext alloc]
 			    initWithFormat:pf
 			     shareContext:share_ctx];
+			[share_ctx release]; // #2624: drops its ref on the app's CGL context
 			[win->gl_context setView:view];
 		}
+		[pf release]; // #2624: +1 from create_pixel_format; contexts don't need it
 
 		if (win->gl_context == nil) {
 			U_LOG_E("Failed to create GL context for external view");
@@ -326,6 +352,7 @@ comp_gl_window_macos_create_offscreen(void *app_cgl_ctx,
 	// Must use matching pixel format for context sharing to work.
 	CGLContextObj share = (CGLContextObj)app_cgl_ctx;
 	CGLPixelFormatObj pf = NULL;
+	bool pf_owned = false; // CGLGetPixelFormat borrows; CGLChoosePixelFormat is +1
 	CGLError err;
 
 	if (share != NULL) {
@@ -349,10 +376,14 @@ comp_gl_window_macos_create_offscreen(void *app_cgl_ctx,
 			free(win);
 			return XRT_ERROR_DEVICE_CREATION_FAILED;
 		}
+		pf_owned = true;
 	}
 
 	CGLContextObj cgl_ctx = NULL;
 	err = CGLCreateContext(pf, share, &cgl_ctx);
+	if (pf_owned) {
+		CGLReleasePixelFormat(pf); // the context keeps its own reference
+	}
 
 	if (err != kCGLNoError || cgl_ctx == NULL) {
 		U_LOG_E("CGLCreateContext failed: %d", err);
@@ -368,6 +399,10 @@ comp_gl_window_macos_create_offscreen(void *app_cgl_ctx,
 		free(win);
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
+	// #2624: initWithCGLContextObj: RETAINS (measured: retain count 1 -> 2), so
+	// drop CGLCreateContext's +1: the wrapper is now the sole owner and the
+	// CGL context dies with it in destroy.
+	CGLReleaseContext(cgl_ctx);
 
 	U_LOG_W("Created offscreen GL context for shared texture mode");
 	*out_win = win;
@@ -485,10 +520,13 @@ comp_gl_window_macos_get_dimensions(struct comp_gl_window_macos *win,
 		return;
 	}
 
-	// Get backing pixel size (Retina-aware)
-	NSRect backing = [win->view convertRectToBacking:win->view.bounds];
-	*out_width = (uint32_t)backing.size.width;
-	*out_height = (uint32_t)backing.size.height;
+	// Get backing pixel size (Retina-aware). Called every frame on the app's
+	// thread, which usually has no autorelease pool (#2624).
+	@autoreleasepool {
+		NSRect backing = [win->view convertRectToBacking:win->view.bounds];
+		*out_width = (uint32_t)backing.size.width;
+		*out_height = (uint32_t)backing.size.height;
+	}
 }
 
 bool
@@ -500,6 +538,9 @@ comp_gl_window_macos_get_screen_position(struct comp_gl_window_macos *win,
 		return false;
 	}
 
+	// Per-frame on the app's thread, which usually has no pool (#2624):
+	// view.window / ns_win.screen return autoreleased objects.
+	@autoreleasepool {
 	NSView *view = win->view;
 	NSWindow *ns_win = view.window != nil ? view.window : win->window;
 	if (ns_win == nil) {
@@ -525,6 +566,7 @@ comp_gl_window_macos_get_screen_position(struct comp_gl_window_macos *win,
 	*out_left_px = (int32_t)left_px;
 	*out_top_px = (int32_t)(top_pts * bs);
 	return true;
+	} // @autoreleasepool
 }
 
 bool
@@ -533,7 +575,11 @@ comp_gl_window_macos_is_valid(struct comp_gl_window_macos *win)
 	if (win == NULL) return false;
 	if (!win->owns_window) return true; // External view — always valid
 	if (win->window == nil) return false;
-	return [win->window isVisible];
+	// Per-frame on the app's thread (#2624). releasedWhenClosed is NO, so the
+	// window is still alive after a user close and reads isVisible == NO.
+	@autoreleasepool {
+		return [win->window isVisible];
+	}
 }
 
 void
@@ -548,14 +594,26 @@ comp_gl_window_macos_destroy(struct comp_gl_window_macos **win_ptr)
 		[NSOpenGLContext clearCurrentContext];
 	}
 
-	if (win->owns_window && win->window != nil) {
-		void (^close_window)(void) = ^{
-			[win->window close];
+	// #2624: release what this file owns (MRR). The context is ours unless it
+	// is the app's own NSOpenGLView context we adopted (#1947). Detach its
+	// drawable on the main thread (AppKit view state) before the release, so
+	// a still-alive view never presents through a freed context. The window
+	// is +1 from alloc with releasedWhenClosed = NO: close, then release.
+	NSOpenGLContext *ctx = win->context_is_app_owned ? nil : win->gl_context;
+	NSWindow *window = win->owns_window ? win->window : nil;
+	if (ctx != nil || window != nil) {
+		void (^teardown)(void) = ^{
+			@autoreleasepool {
+				[ctx clearDrawable];
+				[ctx release];
+				[window close];
+				[window release];
+			}
 		};
 		if ([NSThread isMainThread]) {
-			close_window();
+			teardown();
 		} else {
-			dispatch_sync(dispatch_get_main_queue(), close_window);
+			dispatch_sync(dispatch_get_main_queue(), teardown);
 		}
 	}
 

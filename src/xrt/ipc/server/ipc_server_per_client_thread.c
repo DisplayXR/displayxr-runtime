@@ -215,8 +215,11 @@ common_shutdown(volatile struct ipc_client_state *ics)
 		ics->server->last_client_disconnect_ns = os_monotonic_get_ns();
 
 		struct os_thread thread;
-		os_thread_start(&thread, delayed_exit_thread, (void *)ics->server);
-		// We intentionally don't join this thread - it's fire and forget
+		// Fire and forget: detach it so its resources are released when it
+		// exits instead of leaking one joinable thread per idle period (#2613).
+		if (os_thread_start(&thread, delayed_exit_thread, (void *)ics->server) == 0) {
+			os_thread_detach(&thread);
+		}
 	}
 
 
@@ -716,7 +719,13 @@ client_thread_body(void *_ics)
 	client_loop(ics);
 
 	// #1815: the server's shutdown waits on this before joining.
+	// #2611: written under global_state.lock because the connect handler
+	// reads it under that lock to decide whether this slot's thread can be
+	// joined without blocking. This is the thread's last use of the lock.
+	struct ipc_server *s = ics->server;
+	os_mutex_lock(&s->global_state.lock);
 	ics->thread_done = true;
+	os_mutex_unlock(&s->global_state.lock);
 
 	return NULL;
 }

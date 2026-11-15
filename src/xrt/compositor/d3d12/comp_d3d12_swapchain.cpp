@@ -151,7 +151,7 @@ d3d12_swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_index)
 	}
 
 	U_LOG_E("No FREE swapchain image available (all %u acquired/waited)", sc->image_count);
-	return XRT_ERROR_IPC_FAILURE;
+	return XRT_ERROR_NO_IMAGE_AVAILABLE;
 }
 
 static xrt_result_t
@@ -163,7 +163,7 @@ d3d12_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32
 	if (index >= sc->image_count || sc->img_state[index] != IMG_ACQUIRED) {
 		U_LOG_E("Wait on non-acquired image index %u (state=%u)", index,
 		        index < sc->image_count ? sc->img_state[index] : 0xff);
-		return XRT_ERROR_IPC_FAILURE;
+		return XRT_ERROR_NO_IMAGE_AVAILABLE;
 	}
 
 	sc->img_state[index] = IMG_WAITED;
@@ -189,7 +189,7 @@ d3d12_swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 	if (index >= sc->image_count || sc->img_state[index] != IMG_WAITED) {
 		U_LOG_E("Release on non-waited image index %u (state=%u)", index,
 		        index < sc->image_count ? sc->img_state[index] : 0xff);
-		return XRT_ERROR_IPC_FAILURE;
+		return XRT_ERROR_NO_IMAGE_AVAILABLE;
 	}
 
 	// #2362: sample the app's release value for THIS image now — the app

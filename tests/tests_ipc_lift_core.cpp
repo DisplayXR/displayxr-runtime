@@ -1013,6 +1013,92 @@ TEST_CASE("spec-4 link stream (no window): converts at the submitted extent, aga
 }
 #endif
 
+#ifndef _WIN32
+TEST_CASE("CPU route: the GAUSSIANS photo facade takes a spec-4 CPU image and returns the blob", "[ipc_lift_core]")
+{
+	// POSIX has no v3 texture to read back, so the facade's photo arrives as
+	// a spec-4 CPU image (XrLiftFrameImagesDXR) on a v3 GAUSSIANS stream. The
+	// CPU glue routes the create, advertises the mode, turns the image into
+	// one SPLATS_MONO job and hands the blob back through the v3 acquire.
+	ipc_server_conv_io_ops cpu_io;
+	if (!ipc_server_conv_cpu_io_get(&cpu_io)) {
+		SKIP("no CPU buffer transport on this platform");
+	}
+	conv_fake_provider f;
+	conv_fake_init(&f, "splats");
+	conv_fake_cap *sp =
+	    conv_fake_add_cap(&f, 7, XRT_CONV_TASK_SPLATS_MONO, XRT_CONV_LANE_JOB, XRT_CONV_OUT_SPLAT_BLOB, 0);
+	sp->state = XRT_CONV_STATE_READY;
+	sp->job_blob_format = XRT_CONV_BLOB_PLY_3DGS;
+	sp->job_bytes = 4096 + 100;
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE);
+		REQUIRE(fx.add(f) >= 0);
+		ipc_server_conv_set_io(fx.sc, &cpu_io);
+		REQUIRE(
+		    wait_until([&] { return conv_core_task_has_candidate(fx.core, XRT_CONV_TASK_SPLATS_MONO); }, 3000));
+
+		CHECK(ipc_server_conv_routes_create(fx.sc, XRT_DP_LIFT_MODE_GAUSSIANS, XRT_CONV_CONTENT_PHOTO));
+		xrt_dp_lift_caps caps;
+		ipc_server_conv_lift_properties(fx.sc, &caps);
+		CHECK((caps.modes & XRT_DP_LIFT_MODE_GAUSSIANS) != 0u);
+		CHECK((caps.modes & XRT_DP_LIFT_MODE_DEPTH) == 0u); // DEPTH stays spec 4 on this route
+
+		uint64_t id = 0;
+		REQUIRE(ipc_server_conv_lift_stream_create(fx.sc, 1, XRT_DP_LIFT_MODE_GAUSSIANS, XRT_CONV_CONTENT_PHOTO,
+		                                           1.0f, 0, 0, &id) == XRT_SUCCESS);
+
+		// A BGRA image with a padded row: the region is read, swapped, packed.
+		const uint32_t W = 16, H = 8, PITCH = W * 4 + 32;
+		std::vector<uint8_t> px((size_t)PITCH * H, 0x40);
+		xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		REQUIRE(ipc_cpu_buffer_create(px.size(), &h));
+		conv_input_import in{};
+		in.kind = CONV_INPUT_CPU;
+		in.handle = h;
+		in.sync_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		in.cpu_row_pitch = PITCH;
+		in.cpu_bgra = true;
+		ipc_arg_lift_submit a{};
+		a.stream_id = id;
+		a.source_time = 77;
+		a.width = W;
+		a.height = H;
+		uint64_t fid = 0;
+		REQUIRE(ipc_server_conv_v4_submit(fx.sc, 1, &a, &in, nullptr, &fid) == XRT_SUCCESS);
+		CHECK(fid != 0u);
+
+		bool ready = false;
+		xrt_lift_blob_info info{};
+		uint8_t *bytes = nullptr;
+		REQUIRE(wait_until(
+		    [&] {
+			    REQUIRE(ipc_server_conv_lift_acquire_blob(fx.sc, 1, id, 1ull << 30, &ready, &info,
+			                                              &bytes) == XRT_SUCCESS);
+			    return ready;
+		    },
+		    3000));
+		CHECK(bytes != nullptr);
+		CHECK(info.byte_count == 4196u);
+		CHECK(info.format == (uint32_t)XRT_DP_LIFT_BLOB_PLY_3DGS);
+		CHECK(info.frame_id == fid);
+		CHECK(info.source_time == 77);
+		std::free(bytes);
+
+		// A section too small for the declared region is refused (the wire is not trusted).
+		xrt_graphics_buffer_handle_t small = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		REQUIRE(ipc_cpu_buffer_create(64, &small));
+		in.handle = small;
+		a.height = 4096; // the region needs ~384 KiB; the section is a page at most
+		CHECK(ipc_server_conv_v4_submit(fx.sc, 1, &a, &in, nullptr, &fid) != XRT_SUCCESS);
+
+		CHECK(ipc_server_conv_lift_stream_destroy(fx.sc, 1, id) == XRT_SUCCESS);
+		ipc_server_conv_set_io(fx.sc, nullptr);
+	}
+	conv_fake_fini(&f);
+}
+#endif
+
 TEST_CASE("roadmap 11.2: IPC handle capacity and reply sizes (measured)", "[ipc_lift_core]")
 {
 	// One line per measured limit; the static_asserts above are the gate.

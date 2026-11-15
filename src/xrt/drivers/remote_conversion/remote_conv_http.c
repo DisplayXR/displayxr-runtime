@@ -24,6 +24,9 @@
 #endif
 #include <windows.h>
 #include <winhttp.h>
+#ifndef WINHTTP_QUERY_FLAG_NUMBER64
+#define WINHTTP_QUERY_FLAG_NUMBER64 0x08000000 // winhttp.h, Windows 8 SDK and later
+#endif
 #else
 #include <dlfcn.h>
 #include <pthread.h>
@@ -407,6 +410,17 @@ rc_http_perform(const struct rc_http_request *rq, struct rc_http_response *resp)
 		resp->status = (long)status;
 		os_mutex_unlock(&w.mtx);
 	}
+	// The declared length, when the server sent one: a connection closed early
+	// can read as a clean end of body (got == 0), so the byte count is checked.
+	bool have_length = false;
+	ULONGLONG content_length = 0;
+	if (ok && win_quick_begin(&w)) {
+		DWORD sz = sizeof(content_length);
+		have_length = WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER64,
+		                                  WINHTTP_HEADER_NAME_BY_INDEX, &content_length, &sz,
+		                                  WINHTTP_NO_HEADER_INDEX) != FALSE;
+		os_mutex_unlock(&w.mtx);
+	}
 	if (ok && win_quick_begin(&w)) {
 		DWORD wsz = 0;
 		(void)WinHttpQueryHeaders(req, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, NULL, &wsz,
@@ -426,6 +440,8 @@ rc_http_perform(const struct rc_http_request *rq, struct rc_http_response *resp)
 	}
 	size_t cap = 0;
 	bool too_large = false;
+	bool read_failed = false; //!< WinHttpReadData failed after the status line: the body is incomplete
+	DWORD read_error = 0;
 	uint8_t *chunk = (uint8_t *)malloc(64 * 1024);
 	while (ok && chunk != NULL) {
 		DWORD got = 0;
@@ -434,8 +450,15 @@ rc_http_perform(const struct rc_http_request *rq, struct rc_http_response *resp)
 			break;
 		}
 		ok = WinHttpReadData(req, chunk, 64 * 1024, &got);
+		if (!ok) {
+			read_error = GetLastError();
+		}
 		win_call_end(&w);
-		if (!ok || got == 0) {
+		if (!ok) {
+			read_failed = true;
+			break;
+		}
+		if (got == 0) {
 			break;
 		}
 		if (!buf_append(&resp->body, &resp->body_size, &cap, chunk, got, max)) {
@@ -468,6 +491,16 @@ rc_http_perform(const struct rc_http_request *rq, struct rc_http_response *resp)
 	} else if (!ok && resp->status == 0) {
 		char what[64];
 		(void)snprintf(what, sizeof(what), "WinHTTP error %lu", (unsigned long)GetLastError());
+		set_msg(resp, RC_HTTP_CONNECT, "%s", what);
+	} else if (read_failed) {
+		// A status arrived but the body did not: never report a truncated body as a response.
+		char what[96];
+		(void)snprintf(what, sizeof(what), "body read failed (WinHTTP error %lu)", (unsigned long)read_error);
+		set_msg(resp, RC_HTTP_CONNECT, "%s", what);
+	} else if (have_length && content_length != (ULONGLONG)resp->body_size) {
+		char what[96];
+		(void)snprintf(what, sizeof(what), "truncated body (%llu of %llu bytes)",
+		               (unsigned long long)resp->body_size, (unsigned long long)content_length);
 		set_msg(resp, RC_HTTP_CONNECT, "%s", what);
 	} else {
 		resp->error = RC_HTTP_OK;

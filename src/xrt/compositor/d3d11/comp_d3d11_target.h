@@ -379,6 +379,25 @@ comp_d3d11_target_set_present_bound(struct comp_d3d11_target *target, uint32_t d
 bool
 comp_d3d11_target_is_present_wedged(struct comp_d3d11_target *target);
 
+/*!
+ * #2635: must no repaint present on this target, for the rest of the session?
+ *
+ * Latched when an app-thread present finds the app calling us from inside a
+ * third-party Present hook that also intercepts this chain's Present (the
+ * hook's module is both the owner of our Present entry and on the app's
+ * stack). The hook holds its own lock across the app's Present, so a repaint
+ * presented from another thread while the compositor lock is held deadlocks:
+ * the app waits for the compositor lock, the repaint for the hook's. App
+ * frames are unaffected. `DXR_REPAINT_UNDER_PRESENT_HOOK=1` overrides (A/B).
+ * @ref comp_d3d11_target_repaint_admit already refuses on it; callers that
+ * skip admission (an engaged #1257 partition) must test this themselves.
+ * NULL-safe (returns false).
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_target_repaint_forbidden(struct comp_d3d11_target *target);
+
 #ifdef __cplusplus
 }
 #endif

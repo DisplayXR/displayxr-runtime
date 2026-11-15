@@ -273,13 +273,32 @@ mode_routable(uint32_t mode)
 	return mode == XRT_DP_LIFT_MODE_DEPTH || mode == XRT_DP_LIFT_MODE_SBS || mode == XRT_DP_LIFT_MODE_NVIEW;
 }
 
-//! The GAUSSIANS facade is possible: the glue reads inputs back to the CPU,
+/*!
+ * The glue can hand the GAUSSIANS facade a photo as CPU pixels: a v3 texture
+ * read back (import_input_cpu, the D3D11 glue), or -- the POSIX CPU glue -- a
+ * spec-4 CPU image (XrLiftFrameImagesDXR, ipc_server_conv_v4_submit), which is
+ * already CPU bytes.
+ */
+static bool
+gaussians_input_ok(const struct ipc_server_conv_io_ops *io)
+{
+	if (io->import_input_cpu != NULL) {
+		return true;
+	}
+#if !defined(XRT_OS_WINDOWS)
+	return io->cpu_only;
+#else
+	return false;
+#endif
+}
+
+//! The GAUSSIANS facade is possible: the glue gives the photo as CPU pixels,
 //! and SPLATS_MONO has a non-terminal candidate (a job lane provider).
 static bool
 gaussians_routable(struct ipc_server_conv *sc, const struct ipc_server_conv_io_ops *io)
 {
 	struct xrt_conv_wire_task_desc d;
-	if (io->import_input_cpu == NULL || !task_advertised(sc->core, XRT_CONV_TASK_SPLATS_MONO, &d) ||
+	if (!gaussians_input_ok(io) || !task_advertised(sc->core, XRT_CONV_TASK_SPLATS_MONO, &d) ||
 	    (d.lanes & XRT_CONV_LANE_JOB) == 0) {
 		return false;
 	}
@@ -529,23 +548,31 @@ ipc_server_conv_set_weave_rects(struct ipc_server_conv *sc, bool enabled)
 	os_mutex_unlock(&sc->mtx);
 }
 
-//! The CPU route (POSIX) serves spec 3 only as weave-rect streams: SBS / NVIEW.
+/*!
+ * The CPU route (POSIX) serves spec 3 as weave-rect streams (SBS / NVIEW) and
+ * as the GAUSSIANS photo facade, whose submits carry a spec-4 CPU image
+ * (gaussians_routable still needs a SPLATS_MONO job provider).
+ */
 static bool
 cpu_route_v3_ok(struct ipc_server_conv *sc, uint32_t mode)
 {
+	if (mode == XRT_DP_LIFT_MODE_GAUSSIANS) {
+		return true;
+	}
 	os_mutex_lock(&sc->mtx);
 	const bool on = sc->weave_rects;
 	os_mutex_unlock(&sc->mtx);
 	return on && (mode == XRT_DP_LIFT_MODE_SBS || mode == XRT_DP_LIFT_MODE_NVIEW);
 }
 
-//! The CPU route (POSIX) serves spec 3 only as weave-rect streams: SBS / NVIEW, no aux depth.
+//! The CPU route (POSIX) serves spec 3 as SBS / NVIEW weave-rect streams, no
+//! aux depth, plus GAUSSIANS (set by the caller only when it routes).
 static void
 cpu_route_v3_caps(struct ipc_server_conv *sc, struct xrt_dp_lift_caps *out)
 {
 	struct ipc_server_conv_io_ops io;
 	if (get_io(sc, &io) && io.cpu_only) {
-		out->modes &= XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW;
+		out->modes &= XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW | XRT_DP_LIFT_MODE_GAUSSIANS;
 		out->aux_outputs = 0;
 	}
 }
@@ -897,23 +924,17 @@ ipc_server_conv_lift_submit(struct ipc_server_conv *sc,
 	return ipc_server_conv_lift_submit_framed(sc, client_id, args, handle, is_dxgi, NULL, out_frame_id);
 }
 
-/*! GAUSSIANS facade submit: the photo as decoded CPU pixels, one SPLATS_MONO
- *  job; a newer photo cancels the previous job (latest wins). */
+/*! GAUSSIANS facade job: @p px (args->width x args->height tightly packed
+ *  RGBA8, malloc'd; freed here) as one SPLATS_MONO job; a newer photo cancels
+ *  the previous job (latest wins). */
 static xrt_result_t
-gaussians_submit(struct ipc_server_conv *sc,
-                 const struct ipc_server_conv_io_ops *io,
-                 struct sc_stream *st,
-                 const struct ipc_arg_lift_submit *args,
-                 const struct ipc_lift_params *p,
-                 xrt_graphics_buffer_handle_t handle,
-                 bool is_dxgi,
-                 uint64_t *out_frame_id)
+gaussians_job_submit(struct ipc_server_conv *sc,
+                     struct sc_stream *st,
+                     const struct ipc_arg_lift_submit *args,
+                     const struct ipc_lift_params *p,
+                     uint8_t *px,
+                     uint64_t *out_frame_id)
 {
-	uint8_t *px = NULL;
-	xrt_result_t xret = io->import_input_cpu(io->ud, st->wire_id, handle, is_dxgi, args->width, args->height, &px);
-	if (xret != XRT_SUCCESS || px == NULL) {
-		return xret != XRT_SUCCESS ? xret : XRT_ERROR_WEAVE_REFUSED;
-	}
 	struct conv_job_create_info ji;
 	memset(&ji, 0, sizeof(ji));
 	ji.task = XRT_CONV_TASK_SPLATS_MONO;
@@ -938,7 +959,8 @@ gaussians_submit(struct ipc_server_conv *sc,
 	ji.params.source_time_ns = (uint64_t)args->source_time;
 	ji.params.input_scale = 1.0f;
 	uint64_t job_id = 0;
-	xret = conv_core_job_submit(sc->core, st->client_id, &ji, &job_id); // CPU inputs are copied at submit
+	xrt_result_t xret =
+	    conv_core_job_submit(sc->core, st->client_id, &ji, &job_id); // CPU inputs are copied at submit
 	free(px);
 	if (xret != XRT_SUCCESS) {
 		return xret;
@@ -951,6 +973,26 @@ gaussians_submit(struct ipc_server_conv *sc,
 	st->job_source_time = args->source_time;
 	*out_frame_id = st->job_frame_id;
 	return XRT_SUCCESS;
+}
+
+/*! GAUSSIANS facade submit of a v3 texture: read back to CPU pixels by the
+ *  glue (import_input_cpu), then gaussians_job_submit. */
+static xrt_result_t
+gaussians_submit(struct ipc_server_conv *sc,
+                 const struct ipc_server_conv_io_ops *io,
+                 struct sc_stream *st,
+                 const struct ipc_arg_lift_submit *args,
+                 const struct ipc_lift_params *p,
+                 xrt_graphics_buffer_handle_t handle,
+                 bool is_dxgi,
+                 uint64_t *out_frame_id)
+{
+	uint8_t *px = NULL;
+	xrt_result_t xret = io->import_input_cpu(io->ud, st->wire_id, handle, is_dxgi, args->width, args->height, &px);
+	if (xret != XRT_SUCCESS || px == NULL) {
+		return xret != XRT_SUCCESS ? xret : XRT_ERROR_WEAVE_REFUSED;
+	}
+	return gaussians_job_submit(sc, st, args, p, px, out_frame_id);
 }
 
 xrt_result_t
@@ -2163,6 +2205,52 @@ v4_release_input(const struct ipc_server_conv_io_ops *io, const struct conv_inpu
 	}
 }
 
+/*! The GAUSSIANS facade fed a spec-4 image: CPU only (the pixels the job
+ *  takes); the sticky params as the v3 submit keeps them. Takes @p in. */
+static xrt_result_t
+gaussians_submit_v4(struct ipc_server_conv *sc,
+                    const struct ipc_server_conv_io_ops *io,
+                    struct sc_stream *st,
+                    const struct ipc_arg_lift_submit *args,
+                    const struct conv_input_import *in,
+                    uint64_t *out_frame_id)
+{
+	if (args->has_params != 0) {
+		st->last_params = args->params;
+		st->has_last_params = true;
+	}
+	struct ipc_lift_params p;
+	memset(&p, 0, sizeof(p));
+	p.convergence = -1.0f;
+	p.strength = 1.0f;
+	p.inpaint = 1;
+	if (st->has_last_params) {
+		p = st->last_params;
+	}
+	uint8_t *px = NULL;
+	xrt_result_t xret = XRT_ERROR_INPUT_UNSUPPORTED;
+#if !defined(XRT_OS_WINDOWS)
+	if (in->kind == CONV_INPUT_CPU && io->cpu_only) {
+		struct conv_input_import region = *in;
+		region.w = args->width;
+		region.h = args->height;
+		xret = ipc_server_conv_cpu_io_read_input(&region, &px); // takes the handles
+	} else {
+		v4_release_input(io, in);
+	}
+#else
+	v4_release_input(io, in); // a Windows GAUSSIANS stream takes the v3 texture submit
+	xret = XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+#endif
+	if (xret != XRT_SUCCESS || px == NULL) {
+		store_stream(sc, st);
+		return xret != XRT_SUCCESS ? xret : XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	xret = gaussians_job_submit(sc, st, args, &p, px, out_frame_id);
+	store_stream(sc, st);
+	return xret;
+}
+
 xrt_result_t
 ipc_server_conv_v4_submit(struct ipc_server_conv *sc,
                           uint64_t client_id,
@@ -2181,11 +2269,20 @@ ipc_server_conv_v4_submit(struct ipc_server_conv *sc,
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	struct sc_stream st;
-	if (!find_stream(sc, client_id, args->stream_id, &st) || st.core_id == 0) {
+	if (!find_stream(sc, client_id, args->stream_id, &st)) {
 		v4_release_input(&io, in);
-		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream (or the GAUSSIANS facade): non-fatal
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream: non-fatal
 	}
 	if (args->width == 0 || args->height == 0) {
+		v4_release_input(&io, in);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	if (st.mode == XRT_DP_LIFT_MODE_GAUSSIANS && st.core_id == 0) {
+		// the GAUSSIANS photo facade fed a spec-4 CPU image -- the only
+		// way a POSIX caller can hand it a photo (no v3 texture there).
+		return gaussians_submit_v4(sc, &io, &st, args, in, out_frame_id);
+	}
+	if (st.core_id == 0) {
 		v4_release_input(&io, in);
 		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 	}

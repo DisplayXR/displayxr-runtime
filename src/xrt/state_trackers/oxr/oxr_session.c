@@ -372,9 +372,9 @@ to_string(XrSessionState state)
  * Returns false if eye tracking is not available.
  */
 static bool
-oxr_session_get_predicted_eye_positions(struct oxr_session *sess,
-                                        int64_t target_ns,
-                                        struct xrt_eye_positions *out_eye_pos)
+oxr_session_get_predicted_eye_positions_raw(struct oxr_session *sess,
+                                            int64_t target_ns,
+                                            struct xrt_eye_positions *out_eye_pos)
 {
 	if (sess == NULL || sess->xcn == NULL || out_eye_pos == NULL) {
 		return false;
@@ -429,6 +429,34 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess,
 }
 
 /*!
+ * The eye count comes from the vendor display processor (or a viewer-tracking
+ * provider, or a per-segment table); everything downstream indexes
+ * XRT_MAX_VIEWS-sized arrays with it. Clamp it where it is acquired (#2619).
+ */
+static void
+oxr_session_clamp_eye_count(struct xrt_eye_positions *eye_pos)
+{
+	// eyes[] is declared [8] = XRT_MAX_VIEWS; take the smaller in case either moves.
+	const size_t arr = ARRAY_SIZE(eye_pos->eyes);
+	const uint32_t cap = arr < (size_t)XRT_MAX_VIEWS ? (uint32_t)arr : (uint32_t)XRT_MAX_VIEWS;
+	if (eye_pos->count > cap) {
+		eye_pos->count = cap;
+	}
+}
+
+static bool
+oxr_session_get_predicted_eye_positions(struct oxr_session *sess,
+                                        int64_t target_ns,
+                                        struct xrt_eye_positions *out_eye_pos)
+{
+	const bool got = oxr_session_get_predicted_eye_positions_raw(sess, target_ns, out_eye_pos);
+	if (out_eye_pos != NULL) {
+		oxr_session_clamp_eye_count(out_eye_pos);
+	}
+	return got;
+}
+
+/*!
  * ADR-047 Amendment 8 (#2305): whether this session's compositor has another
  * screen's DP in its primary slot, i.e. the eye source above is that screen's
  * DP. Only the in-process compositors that segment a window (D3D11 and the
@@ -436,6 +464,31 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess,
  * IPC client, whose service splices its views) answers false, and the
  * session's own "home unlisted" state stands alone, as before.
  */
+/*!
+ * #2639: does the hub run automatic 2D for this LEGACY session (measured on
+ * the submitted eyes)? Like the mono auto-2D hold it is presentation-only, so
+ * xrLocateViews keeps the per-eye set whenever the DP's is collapsed.
+ * Only the in-process D3D11 / D3D12 tiers weave through that hub.
+ */
+static bool
+oxr_session_legacy_auto_2d_on(struct oxr_session *sess)
+{
+	if (sess == NULL || sess->xcn == NULL) {
+		return false;
+	}
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		return comp_d3d11_compositor_legacy_auto_2d_on(&sess->xcn->base);
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		return comp_d3d12_compositor_legacy_auto_2d_on(&sess->xcn->base);
+	}
+#endif
+	return false;
+}
+
 static bool
 oxr_session_slot_holds_other_screen(struct oxr_session *sess)
 {
@@ -2437,7 +2490,9 @@ oxr_session_fill_rear_depth_budget(struct oxr_session *sess, XrRearDepthBudgetDX
 static float
 view_rig_clampf(float v, float lo, float hi, bool *clamped)
 {
-	if (v < lo) {
+	// Written as !(v >= lo) so NaN, which compares false both ways, maps to
+	// the low bound instead of passing through (#2619).
+	if (!(v >= lo)) {
 		*clamped = true;
 		return lo;
 	}
@@ -2446,6 +2501,19 @@ view_rig_clampf(float v, float lo, float hi, bool *clamped)
 		return hi;
 	}
 	return v;
+}
+
+/*
+ * Same clamp-never-reject policy for the rig pose's orientation: a quaternion
+ * that is not (within 1 %) a unit quaternion, NaN included, becomes identity.
+ */
+static void
+view_rig_sanitize_orientation(struct xrt_pose *pose, bool *clamped)
+{
+	if (!math_quat_validate_within_1_percent(&pose->orientation)) {
+		pose->orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		*clamped = true;
+	}
 }
 
 /*
@@ -2491,6 +2559,7 @@ view_rig_parse_chain(struct oxr_view_rig_state *rig, const void *chain_head)
 		    {crig->pose.orientation.x, crig->pose.orientation.y, crig->pose.orientation.z,
 		     crig->pose.orientation.w},
 		    {crig->pose.position.x, crig->pose.position.y, crig->pose.position.z}};
+		view_rig_sanitize_orientation(&rig->pose, &clamped);
 		// Camera-rig ipd/parallax are ABSOLUTE eye-separation / parallax scales (a
 		// stereo camera's inter-axial can be any positive value — miniature or
 		// giant scenes, or the display-rig equivalent of a zoomed virtual display
@@ -2514,6 +2583,7 @@ view_rig_parse_chain(struct oxr_view_rig_state *rig, const void *chain_head)
 		    {drig->pose.orientation.x, drig->pose.orientation.y, drig->pose.orientation.z,
 		     drig->pose.orientation.w},
 		    {drig->pose.position.x, drig->pose.position.y, drig->pose.position.z}};
+		view_rig_sanitize_orientation(&rig->pose, &clamped);
 		rig->virtual_display_height = view_rig_clampf(drig->virtualDisplayHeight, 0.01f, 1000.0f, &clamped);
 		// ipd/parallax are NOT clamped to [0,1] here while we are validating the
 		// rig math/transition: a near-convergence camera rig converts to a display
@@ -2569,6 +2639,7 @@ oxr_session_set_workspace_view_rig(struct oxr_logger *log, struct oxr_session *s
 		    {crig->pose.orientation.x, crig->pose.orientation.y, crig->pose.orientation.z,
 		     crig->pose.orientation.w},
 		    {crig->pose.position.x, crig->pose.position.y, crig->pose.position.z}};
+		view_rig_sanitize_orientation(&out.pose, &clamped);
 		// Camera-rig ipd/parallax are ABSOLUTE scales (any positive value), NOT
 		// the display rig's relative [0,1] comfort factor — see the matching note
 		// above. Bounding them to [0,1] truncated the converted rig and shifted
@@ -2591,6 +2662,7 @@ oxr_session_set_workspace_view_rig(struct oxr_logger *log, struct oxr_session *s
 		    {drig->pose.orientation.x, drig->pose.orientation.y, drig->pose.orientation.z,
 		     drig->pose.orientation.w},
 		    {drig->pose.position.x, drig->pose.position.y, drig->pose.position.z}};
+		view_rig_sanitize_orientation(&out.pose, &clamped);
 		out.virtual_display_height = view_rig_clampf(drig->virtualDisplayHeight, 0.01f, 1000.0f, &clamped);
 		// Not clamped to [0,1] — see the matching note in oxr_session_set_view_rig.
 		out.ipd_factor = view_rig_clampf(drig->ipdFactor, 0.0f, 1.0e4f, &clamped);
@@ -4283,6 +4355,9 @@ locate_views_one(struct oxr_logger *log,
 			}
 		}
 	}
+	// #2619: whichever source filled it (a segment's table, the DP, a
+	// viewer-tracking provider), the count indexes XRT_MAX_VIEWS arrays below.
+	oxr_session_clamp_eye_count(&eye_pos);
 
 	// One-shot diagnostic: log stereo gate values for first frames
 	{
@@ -4402,7 +4477,12 @@ locate_views_one(struct oxr_logger *log,
 	// restore the stereo set around it BEFORE the #615 guard below would
 	// duplicate that eye into every view. The raw-eye channel is filled from
 	// this set too, so it stays per-eye as well.
-	if (sess->mono_auto_2d.active && have_eyes &&
+	// The hub's legacy automatic 2D (#2639) decides from the submitted
+	// pictures, so the rule holds for the whole session, not only while it
+	// holds 2D: the DP still reports its one 2D eye for a few hundred ms
+	// after the lens returns to 3D (the tracker wakes up), and flat frames
+	// there send the lens straight back to 2D, about once a second.
+	if ((sess->mono_auto_2d.active || oxr_session_legacy_auto_2d_on(sess)) && have_eyes &&
 	    u_mono_auto_2d_keep_eye_set(&eye_pos, active_view_count, sess->ipd_meters)) {
 		static bool warned_keep_eyes = false;
 		if (!warned_keep_eyes) {
@@ -4472,7 +4552,9 @@ locate_views_one(struct oxr_logger *log,
 			if (seg != NULL) {
 				nominal_z_m = seg->nominal_z_m;
 			}
-			U_LOG_I("Kooima: nominal_z=%.3f", nominal_z_m);
+			if (should_log) {
+				U_LOG_I("Kooima: nominal_z=%.3f", nominal_z_m);
+			}
 			if (nominal_z_m > 0.0f) {
 				float ipd_m = sess->ipd_meters;
 				// Untracked → the eye sits at the REFERENCE: directly in front
@@ -5894,6 +5976,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 			}
 		}
 	}
+	// #2619: each segment's eye count came from its DP (or the service's
+	// table, or a provider); clamp it before anything indexes with it.
+	for (uint32_t i = 0; i < m.count && i < XRT_MAX_SEGMENTS; i++) {
+		oxr_session_clamp_eye_count(&m.seg[i].eyes);
+	}
 
 	const uint32_t mj = oxr_segment_views_majority(&m);
 	// Every locate below that takes the session's own DP (no override) uses
@@ -6716,6 +6803,17 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	}
 	xrt_session_destroy(&sess->xs);
 
+	// #2619: EXT_APP_MODE lives on the head device, which outlives the session.
+	// Hand it back so a later (e.g. hosted) session on the same instance does
+	// not inherit this session's external-window head pose.
+	if (sess->ext_app_mode_set) {
+		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+		if (head != NULL) {
+			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 0);
+		}
+		sess->ext_app_mode_set = false;
+	}
+
 	os_precise_sleeper_deinit(&sess->sleeper);
 	oxr_frame_sync_fini(&sess->frame_sync);
 	os_mutex_destroy(&sess->active_wait_frames_lock);
@@ -7311,6 +7409,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
 				if (head != NULL) {
 					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+					(*out_session)->ext_app_mode_set = true; // cleared at session destroy (#2619)
 				}
 			}
 			return ret;
@@ -7513,6 +7612,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
 				if (head != NULL) {
 					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+					(*out_session)->ext_app_mode_set = true; // cleared at session destroy (#2619)
 				}
 			}
 			// ADR-050: comp_metal presents this session, so it owns the
@@ -7690,6 +7790,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
 				if (head != NULL) {
 					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+					(*out_session)->ext_app_mode_set = true; // cleared at session destroy (#2619)
 				}
 			}
 
@@ -8409,6 +8510,7 @@ oxr_session_create(struct oxr_logger *log,
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 		if (head != NULL) {
 			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+			sess->ext_app_mode_set = true; // cleared at session destroy (#2619)
 		}
 #ifdef XRT_BUILD_DRIVER_QWERTY
 		qwerty_set_process_keys(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, false);

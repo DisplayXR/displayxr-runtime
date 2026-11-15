@@ -831,7 +831,10 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			                 "1..%u",
 			                 lay->viewCount, (uint32_t)XR_WEAVE_MAX_EYES_DXR);
 		}
-		if (lay->viewCount != lay->tileColumns * lay->tileRows) {
+		// Each factor is bounded first so the 32-bit product cannot wrap
+		// (e.g. 0x80000001 * 2 == 2) and let a huge column count through.
+		if (lay->tileColumns > XR_WEAVE_MAX_EYES_DXR || lay->tileRows > XR_WEAVE_MAX_EYES_DXR ||
+		    lay->viewCount != lay->tileColumns * lay->tileRows) {
 			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
 			                 "xrWeaveSubmitDXR: XrWeaveSubmitLayoutDXR::viewCount (%u) must equal "
 			                 "tileColumns * tileRows (%u * %u)",

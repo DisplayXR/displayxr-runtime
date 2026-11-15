@@ -215,8 +215,8 @@ ql_mutex_init(ql_mutex_t *m)
 #define QL_ACTIVATION_IMPLICIT 2
 #define QL_ACTIVATION_LOADER_ENV 3
 
-#define QL_MAX_INSTANCES 8
-#define QL_MAX_DEVICES 8
+//! Initial capacity of the instance / device registries; they GROW (#2618).
+#define QL_REGISTRY_INITIAL_CAP 8
 #define QL_MAX_QUEUES 16
 
 /*
@@ -272,30 +272,121 @@ struct ql_device
 	struct ql_queue queues[QL_MAX_QUEUES];
 };
 
+/*
+ * The registries (#2618). They used to be fixed arrays of 8, and a 9th live
+ * instance or device was silently left unregistered: its proc lookups then
+ * returned NULL, vkGetDeviceQueue returned without calling down, its queue
+ * calls returned VK_ERROR_DEVICE_LOST and its destroy never reached the
+ * driver. Now they grow, under g_registry_lock, so they cannot fill.
+ *
+ * Address stability is the invariant every caller relies on: lookups return
+ * a pointer to an ENTRY, then drop the registry lock and keep using it (its
+ * chained function pointers, its per-queue mutexes). So each registry is an
+ * array of POINTERS to individually allocated entries. A grow reallocates
+ * only the pointer array, which nothing holds across an unlock; the entries
+ * never move. A destroyed entry is zeroed and recycled for the next create
+ * exactly as the static slots were, and is never freed (bounded by the peak
+ * number of live objects; the layer lives for the process).
+ */
 static ql_mutex_t g_registry_lock = QL_MUTEX_INIT;
-static struct ql_instance g_instances[QL_MAX_INSTANCES];
-static struct ql_device g_devices[QL_MAX_DEVICES];
+static struct ql_instance **g_instances; //!< g_instance_count entries, capacity g_instance_cap
+static uint32_t g_instance_count;
+static uint32_t g_instance_cap;
+static struct ql_device **g_devices; //!< g_device_count entries, capacity g_device_cap
+static uint32_t g_device_count;
+static uint32_t g_device_cap;
 
+//! Caller holds g_registry_lock. @p key NULL finds a free (recycled) entry.
 static struct ql_instance *
 ql_instance_find(void *key)
 {
-	for (int i = 0; i < QL_MAX_INSTANCES; i++) {
-		if (g_instances[i].key == key) {
-			return &g_instances[i];
+	for (uint32_t i = 0; i < g_instance_count; i++) {
+		if (g_instances[i]->key == key) {
+			return g_instances[i];
 		}
 	}
 	return NULL;
 }
 
+//! Caller holds g_registry_lock. @p key NULL finds a free (recycled) entry.
 static struct ql_device *
 ql_device_find(void *key)
 {
-	for (int i = 0; i < QL_MAX_DEVICES; i++) {
-		if (g_devices[i].key == key) {
-			return &g_devices[i];
+	for (uint32_t i = 0; i < g_device_count; i++) {
+		if (g_devices[i]->key == key) {
+			return g_devices[i];
 		}
 	}
 	return NULL;
+}
+
+/*!
+ * Caller holds g_registry_lock. Make room for one more pointer in a registry
+ * array, doubling its capacity. On failure nothing changes.
+ */
+static bool
+ql_registry_reserve(void ***array, uint32_t count, uint32_t *cap)
+{
+	if (count < *cap) {
+		return true;
+	}
+	const uint32_t new_cap = *cap == 0 ? QL_REGISTRY_INITIAL_CAP : *cap * 2;
+	if (new_cap <= *cap) {
+		return false; // overflow
+	}
+	void **grown = (void **)realloc(*array, (size_t)new_cap * sizeof(void *));
+	if (grown == NULL) {
+		return false;
+	}
+	*array = grown;
+	*cap = new_cap;
+	return true;
+}
+
+/*!
+ * Caller holds g_registry_lock. A free instance entry: a recycled one, else a
+ * newly allocated (zeroed) one appended to the registry. NULL only when the
+ * host is out of memory.
+ */
+static struct ql_instance *
+ql_instance_alloc(void)
+{
+	struct ql_instance *inst = ql_instance_find(NULL);
+	if (inst != NULL) {
+		return inst;
+	}
+	void **arr = (void **)g_instances;
+	if (!ql_registry_reserve(&arr, g_instance_count, &g_instance_cap)) {
+		return NULL;
+	}
+	g_instances = (struct ql_instance **)arr;
+	inst = (struct ql_instance *)calloc(1, sizeof(*inst));
+	if (inst == NULL) {
+		return NULL;
+	}
+	g_instances[g_instance_count++] = inst;
+	return inst;
+}
+
+//! Caller holds g_registry_lock. As @ref ql_instance_alloc, for devices.
+static struct ql_device *
+ql_device_alloc(void)
+{
+	struct ql_device *d = ql_device_find(NULL);
+	if (d != NULL) {
+		return d;
+	}
+	void **arr = (void **)g_devices;
+	if (!ql_registry_reserve(&arr, g_device_count, &g_device_cap)) {
+		return NULL;
+	}
+	g_devices = (struct ql_device **)arr;
+	d = (struct ql_device *)calloc(1, sizeof(*d));
+	if (d == NULL) {
+		return NULL;
+	}
+	g_devices[g_device_count++] = d;
+	return d;
 }
 
 /*!
@@ -458,7 +549,7 @@ ql_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 	}
 
 	ql_mutex_lock(&g_registry_lock);
-	struct ql_instance *inst = ql_instance_find(NULL); // free slot
+	struct ql_instance *inst = ql_instance_alloc(); // recycled or new entry
 	if (inst != NULL) {
 		inst->key = ql_key(*pInstance);
 		inst->instance = *pInstance;
@@ -469,6 +560,18 @@ ql_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 		inst->activation = activation;
 	}
 	ql_mutex_unlock(&g_registry_lock);
+
+	if (inst == NULL) {
+		// #2618: out of host memory growing the registry. An unregistered
+		// instance would be half-broken (no proc lookups, no destroy), so
+		// undo the create down the chain and fail it.
+		PFN_vkDestroyInstance down = (PFN_vkDestroyInstance)next_gipa(*pInstance, "vkDestroyInstance");
+		if (down != NULL) {
+			down(*pInstance, pAllocator);
+		}
+		*pInstance = VK_NULL_HANDLE;
+		return VK_ERROR_OUT_OF_HOST_MEMORY;
+	}
 
 #ifdef __ANDROID__
 	// One-shot proof-of-load for the #1905 device experiment.
@@ -554,7 +657,7 @@ ql_CreateDevice(VkPhysicalDevice physicalDevice,
 
 	VkDevice dev = *pDevice;
 	ql_mutex_lock(&g_registry_lock);
-	struct ql_device *d = ql_device_find(NULL); // free slot
+	struct ql_device *d = ql_device_alloc(); // recycled or new entry
 	if (d != NULL) {
 		memset(d, 0, sizeof(*d));
 		d->key = ql_key(dev);
@@ -583,10 +686,21 @@ ql_CreateDevice(VkPhysicalDevice physicalDevice,
 	bool per_device = d != NULL && d->per_device;
 	ql_mutex_unlock(&g_registry_lock);
 
+	if (d == NULL) {
+		// #2618: out of host memory growing the registry. An unregistered
+		// device would be broken (NULL procs, DEVICE_LOST queue calls, no
+		// destroy), so undo the create down the chain and fail it.
+		PFN_vkDestroyDevice down = (PFN_vkDestroyDevice)next_gdpa(dev, "vkDestroyDevice");
+		if (down != NULL) {
+			down(dev, pAllocator);
+		}
+		*pDevice = VK_NULL_HANDLE;
+		return VK_ERROR_OUT_OF_HOST_MEMORY;
+	}
+
 #ifdef __ANDROID__
 	QL_LOGW("VK_LAYER_DXR_queue_lock: device %p registered, lock scope %s", (void *)dev,
-	        d == NULL ? "NONE (registry full - calls pass through UNLOCKED)"
-	                  : (per_device ? "per-device (all queues serialized)" : "per-queue"));
+	        per_device ? "per-device (all queues serialized)" : "per-queue");
 #else
 	(void)per_device;
 #endif

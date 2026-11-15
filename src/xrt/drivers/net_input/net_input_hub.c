@@ -15,10 +15,16 @@
  * are written back to the feeder on the same socket.
  *
  * Threading: one hub thread (accept → handshake → read loop, guarded
- * throughout by 500 ms select() timeouts so `os_thread_helper` can stop
+ * throughout by 500 ms select()/poll() timeouts so `os_thread_helper` can stop
  * it). Button/battery state is mutex-copied into the devices'
  * `update_inputs`; `m_relation_history` is internally thread-safe.
- * Haptic sends take the same mutex (socket writes are small and rare).
+ * Haptic sends take the same mutex (socket writes are small and rare) —
+ * the mutex is what keeps client_fd valid, since the hub thread closes the
+ * socket after run_connection returns. Every send is therefore
+ * non-blocking and signal-free (#2606): a feeder that stops reading must
+ * never park an app thread inside the mutex. A would-block haptic is
+ * dropped and counted; a short write shuts the socket down so the feeder
+ * reconnects with a clean stream.
  *
  * Clock mapping: a non-zero feeder timestamp is translated into the
  * provider's monotonic domain with a latency-floor offset estimate
@@ -45,6 +51,9 @@ typedef SOCKET net_input_socket_t;
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+
+#include <errno.h>
+#include <poll.h>
 typedef int net_input_socket_t;
 #define NET_INPUT_INVALID_SOCKET (-1)
 #endif
@@ -66,6 +75,7 @@ typedef int net_input_socket_t;
 #include "net_input_proto.h"
 #include "net_input_interface.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -75,6 +85,23 @@ typedef int net_input_socket_t;
  * Structs and defines.
  *
  */
+
+/*!
+ * How far past the newest sample get_tracked_pose() will extrapolate with
+ * the last velocity (mirrors GAMEPAD_EXTRAPOLATE_MAX_NS): a stalled feeder
+ * must not fling the controller along its last velocity.
+ */
+#define NET_INPUT_EXTRAPOLATE_MAX_NS (50LL * 1000 * 1000)
+
+/*!
+ * A newest sample older than this (against the provider's monotonic clock)
+ * is reported VALID but no longer TRACKED: the feeder still claims the hand
+ * is active but has stopped sending poses.
+ */
+#define NET_INPUT_STALE_NS (250LL * 1000 * 1000)
+
+//! Quaternions shorter than this cannot be normalised; the sample is dropped.
+#define NET_INPUT_MIN_QUAT_LEN 1e-6f
 
 // Indices into base.inputs, matching net_input_inputs_array below.
 #define NET_INPUT_SELECT 0
@@ -95,7 +122,9 @@ struct net_input_device
 	//! NET_INPUT_HAND_LEFT / NET_INPUT_HAND_RIGHT.
 	uint8_t hand;
 
-	//! Thread-safe pose buffer, fed by the hub thread.
+	//! Pose buffer, fed by the hub thread. Internally thread-safe; pushes
+	//! and clears happen under hub->mutex (its own mutex is a leaf) so they
+	//! cannot race device destroy.
 	struct m_relation_history *history;
 
 	//! Guarded by hub->mutex.
@@ -123,9 +152,15 @@ struct net_input_hub
 	int64_t clock_offset_ns;
 	bool have_clock_offset;
 
+	//! State messages rejected for non-finite floats or a degenerate
+	//! quaternion (u_var diagnostic).
+	uint64_t state_reject_count;
+
 	//! Diagnostics (u_var).
 	uint64_t state_msg_count;
 	uint64_t haptic_msg_count;
+	//! Haptics not delivered because the feeder's receive window was full.
+	uint64_t haptic_drop_count;
 
 	struct net_input_device *devices[2];
 
@@ -154,13 +189,45 @@ socket_read(net_input_socket_t id, void *ptr, size_t size)
 	return recv(id, (char *)ptr, (int)size, 0);
 }
 
+//! Non-blocking send: the accepted socket is in FIONBIO mode
+//! (socket_configure_client); Winsock never raises SIGPIPE.
 static inline ssize_t
-socket_write(net_input_socket_t id, const void *ptr, size_t size)
+socket_send_nb(net_input_socket_t id, const void *ptr, size_t size)
 {
 	return send(id, (const char *)ptr, (int)size, 0);
 }
 
+static inline bool
+socket_last_error_would_block(void)
+{
+	int err = WSAGetLastError();
+	return err == WSAEWOULDBLOCK || err == WSAEINTR;
+}
+
+static inline void
+socket_shutdown_both(net_input_socket_t id)
+{
+	shutdown(id, SD_BOTH);
+}
+
+//! Put the accepted socket in non-blocking mode; reads stay select-gated.
+static inline void
+socket_configure_client(net_input_socket_t id)
+{
+	u_long mode = 1;
+	if (ioctlsocket(id, FIONBIO, &mode) != 0) {
+		U_LOG_W("net_input: ioctlsocket(FIONBIO) failed (%d).", WSAGetLastError());
+	}
+}
+
 #else
+
+#if defined(MSG_NOSIGNAL)
+#define NET_INPUT_SEND_FLAGS (MSG_DONTWAIT | MSG_NOSIGNAL)
+#else
+// macOS: no MSG_NOSIGNAL; SO_NOSIGPIPE is set on the accepted socket.
+#define NET_INPUT_SEND_FLAGS (MSG_DONTWAIT)
+#endif
 
 static inline void
 socket_close(net_input_socket_t id)
@@ -174,10 +241,36 @@ socket_read(net_input_socket_t id, void *ptr, size_t size)
 	return read(id, ptr, size);
 }
 
+//! Non-blocking, signal-free send (a dead feeder must not SIGPIPE the host).
 static inline ssize_t
-socket_write(net_input_socket_t id, const void *ptr, size_t size)
+socket_send_nb(net_input_socket_t id, const void *ptr, size_t size)
 {
-	return write(id, ptr, size);
+	return send(id, ptr, size, NET_INPUT_SEND_FLAGS);
+}
+
+static inline bool
+socket_last_error_would_block(void)
+{
+	return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+}
+
+static inline void
+socket_shutdown_both(net_input_socket_t id)
+{
+	shutdown(id, SHUT_RDWR);
+}
+
+static inline void
+socket_configure_client(net_input_socket_t id)
+{
+#if defined(SO_NOSIGPIPE)
+	int on = 1;
+	if (setsockopt(id, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on)) != 0) {
+		U_LOG_W("net_input: setsockopt(SO_NOSIGPIPE) failed (%d).", errno);
+	}
+#else
+	(void)id;
+#endif
 }
 
 #endif
@@ -202,11 +295,23 @@ wait_readable_and_running(struct net_input_hub *hub, net_input_socket_t sock)
 
 	int ret = 0;
 	while (os_thread_helper_is_running(&hub->oth) && ret == 0) {
+#if defined(XRT_OS_WINDOWS)
+		// Winsock fd_set is a socket array, not a bitmap: no FD_SETSIZE
+		// bound on the socket value.
 		struct timeval timeout = {.tv_sec = 0, .tv_usec = 500 * 1000};
 		fd_set set;
 		FD_ZERO(&set);
 		FD_SET(sock, &set);
 		ret = select((int)sock + 1, &set, NULL, NULL, &timeout);
+#else
+		// poll(), not select(): FD_SET on a descriptor >= FD_SETSIZE is
+		// undefined behaviour, and a host process can easily own that many.
+		struct pollfd pfd = {.fd = sock, .events = POLLIN, .revents = 0};
+		ret = poll(&pfd, 1, 500);
+		if (ret < 0 && errno == EINTR) {
+			ret = 0;
+		}
+#endif
 	}
 	return ret > 0;
 }
@@ -221,6 +326,9 @@ read_exact(struct net_input_hub *hub, net_input_socket_t sock, void *out, size_t
 			return false;
 		}
 		ssize_t ret = socket_read(sock, (uint8_t *)out + current, size - current);
+		if (ret < 0 && socket_last_error_would_block()) {
+			continue; // spurious wakeup on a non-blocking socket: wait again
+		}
 		if (ret <= 0) {
 			return false;
 		}
@@ -291,27 +399,78 @@ map_feeder_timestamp(struct net_input_hub *hub, int64_t feeder_ns, int64_t recv_
 	return feeder_ns + hub->clock_offset_ns;
 }
 
+static bool
+floats_finite(const float *v, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (!isfinite(v[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+state_msg_floats_finite(const struct net_input_state_msg *msg)
+{
+	return floats_finite(msg->position, ARRAY_SIZE(msg->position)) &&
+	       floats_finite(msg->orientation, ARRAY_SIZE(msg->orientation)) &&
+	       floats_finite(msg->linear_velocity, ARRAY_SIZE(msg->linear_velocity)) &&
+	       floats_finite(msg->angular_velocity, ARRAY_SIZE(msg->angular_velocity));
+}
+
 static void
 handle_state_msg(struct net_input_hub *hub, const struct net_input_state_msg *msg, int64_t recv_ns)
 {
 	if (msg->hand > NET_INPUT_HAND_RIGHT) {
 		return;
 	}
+
+	// Validate before touching any state: a feeder bug must not put NaN
+	// into the pose history (it would poison interpolation for every
+	// later query) or an unnormalised quaternion into the app's poses.
+	struct xrt_quat q = {msg->orientation[0], msg->orientation[1], msg->orientation[2], msg->orientation[3]};
+	bool valid = state_msg_floats_finite(msg);
+	if (valid && msg->active != 0) {
+		float len = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+		if (!(len >= NET_INPUT_MIN_QUAT_LEN)) {
+			valid = false;
+		} else {
+			q.x /= len;
+			q.y /= len;
+			q.z /= len;
+			q.w /= len;
+		}
+	}
+
+	// Lookup, state writes and the history push all under the mutex:
+	// net_input_device_destroy() clears hub->devices[hand] under the same
+	// mutex before it frees the device and its history, so a device seen
+	// here stays alive until we unlock.
+	os_mutex_lock(&hub->mutex);
 	struct net_input_device *dev = hub->devices[msg->hand];
 	if (dev == NULL) {
+		os_mutex_unlock(&hub->mutex);
+		return;
+	}
+	if (!valid) {
+		hub->state_reject_count++;
+		os_mutex_unlock(&hub->mutex);
 		return;
 	}
 
-	os_mutex_lock(&hub->mutex);
 	dev->active = msg->active != 0;
 	dev->btn_select = (msg->buttons & NET_INPUT_BUTTON_SELECT_BIT) != 0;
 	dev->btn_menu = (msg->buttons & NET_INPUT_BUTTON_MENU_BIT) != 0;
 	dev->battery_pct = msg->battery_pct;
 	hub->state_msg_count++;
 	int64_t ts = map_feeder_timestamp(hub, msg->timestamp_ns, recv_ns);
-	os_mutex_unlock(&hub->mutex);
 
 	if (msg->active == 0) {
+		// Inactive: drop the old track so reactivation never interpolates
+		// from (or extrapolates past) a stale pose.
+		m_relation_history_clear(dev->history);
+		os_mutex_unlock(&hub->mutex);
 		return;
 	}
 
@@ -319,10 +478,7 @@ handle_state_msg(struct net_input_hub *hub, const struct net_input_state_msg *ms
 	rel.pose.position.x = msg->position[0];
 	rel.pose.position.y = msg->position[1];
 	rel.pose.position.z = msg->position[2];
-	rel.pose.orientation.x = msg->orientation[0];
-	rel.pose.orientation.y = msg->orientation[1];
-	rel.pose.orientation.z = msg->orientation[2];
-	rel.pose.orientation.w = msg->orientation[3];
+	rel.pose.orientation = q;
 	rel.linear_velocity.x = msg->linear_velocity[0];
 	rel.linear_velocity.y = msg->linear_velocity[1];
 	rel.linear_velocity.z = msg->linear_velocity[2];
@@ -335,6 +491,7 @@ handle_state_msg(struct net_input_hub *hub, const struct net_input_state_msg *ms
 	    XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
 
 	m_relation_history_push(dev->history, &rel, ts);
+	os_mutex_unlock(&hub->mutex);
 }
 
 /*!
@@ -352,7 +509,7 @@ run_connection(struct net_input_hub *hub, net_input_socket_t client)
 {
 	// Handshake: both sides send immediately, then validate the peer's.
 	struct net_input_hello ours = {.magic = NET_INPUT_MAGIC, .version = NET_INPUT_PROTO_VERSION};
-	if (socket_write(client, &ours, sizeof(ours)) != (ssize_t)sizeof(ours)) {
+	if (socket_send_nb(client, &ours, sizeof(ours)) != (ssize_t)sizeof(ours)) {
 		U_LOG_W("net_input: hello write failed.");
 		return;
 	}
@@ -395,6 +552,7 @@ run_connection(struct net_input_hub *hub, net_input_socket_t client)
 	for (int i = 0; i < 2; i++) {
 		if (hub->devices[i] != NULL) {
 			hub->devices[i]->active = false;
+			m_relation_history_clear(hub->devices[i]->history);
 		}
 	}
 	os_mutex_unlock(&hub->mutex);
@@ -420,6 +578,7 @@ hub_thread(void *ptr)
 			continue;
 		}
 
+		socket_configure_client(client);
 		run_connection(hub, client);
 		socket_close(client);
 	}
@@ -537,13 +696,43 @@ net_input_device_get_tracked_pose(struct xrt_device *xdev,
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 
-	struct xrt_space_relation rel = {0};
-	enum m_relation_history_result res = m_relation_history_get(dev->history, at_timestamp_ns, &rel);
-	if (res == M_RELATION_HISTORY_RESULT_INVALID) {
-		// No samples yet (feeder never connected / hand inactive).
+	os_mutex_lock(&dev->hub->mutex);
+	bool active = dev->active;
+	os_mutex_unlock(&dev->hub->mutex);
+
+	// Inactive hand, or no samples yet (feeder never connected / history
+	// cleared): nothing to report.
+	int64_t newest_ns = 0;
+	struct xrt_space_relation newest = {0};
+	if (!active || !m_relation_history_get_latest(dev->history, &newest_ns, &newest)) {
+		U_ZERO(out_relation);
 		out_relation->pose = (struct xrt_pose)XRT_POSE_IDENTITY;
 		out_relation->relation_flags = 0;
 		return XRT_SUCCESS;
+	}
+
+	// Bounded forward extrapolation (mirrors GAMEPAD_EXTRAPOLATE_MAX_NS).
+	int64_t at_ns = at_timestamp_ns;
+	if (at_ns - newest_ns > NET_INPUT_EXTRAPOLATE_MAX_NS) {
+		at_ns = newest_ns + NET_INPUT_EXTRAPOLATE_MAX_NS;
+	}
+
+	struct xrt_space_relation rel = {0};
+	enum m_relation_history_result res = m_relation_history_get(dev->history, at_ns, &rel);
+	if (res == M_RELATION_HISTORY_RESULT_INVALID) {
+		U_ZERO(out_relation);
+		out_relation->pose = (struct xrt_pose)XRT_POSE_IDENTITY;
+		out_relation->relation_flags = 0;
+		return XRT_SUCCESS;
+	}
+
+	// The feeder says "active" but has stopped sending: keep the last pose
+	// VALID (the controller does not vanish) but stop claiming TRACKED.
+	int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	if (now_ns - newest_ns > NET_INPUT_STALE_NS) {
+		rel.relation_flags =
+		    (enum xrt_space_relation_flags)(rel.relation_flags & ~(XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+		                                                           XRT_SPACE_RELATION_POSITION_TRACKED_BIT));
 	}
 
 	*out_relation = rel;
@@ -575,9 +764,23 @@ net_input_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, 
 	msg.duration_ns = value->vibration.duration_ns;
 
 	os_mutex_lock(&hub->mutex);
+	// Kept under the mutex (it keeps client_fd valid); the send cannot
+	// block, so the critical section stays bounded.
 	if (hub->connected && hub->client_fd != NET_INPUT_INVALID_SOCKET) {
-		(void)socket_write(hub->client_fd, &msg, sizeof(msg));
-		hub->haptic_msg_count++;
+		ssize_t ret = socket_send_nb(hub->client_fd, &msg, sizeof(msg));
+		if (ret == (ssize_t)sizeof(msg)) {
+			hub->haptic_msg_count++;
+		} else if (ret < 0 && socket_last_error_would_block()) {
+			// Feeder not draining: drop this haptic (counted, no WARN —
+			// this can fire once per app haptic call).
+			hub->haptic_drop_count++;
+		} else {
+			// Short write or hard error: the stream is now misframed.
+			// Shut it down so the hub thread's read fails, it closes the
+			// socket, and the feeder reconnects with a clean stream.
+			hub->haptic_drop_count++;
+			socket_shutdown_both(hub->client_fd);
+		}
 	}
 	os_mutex_unlock(&hub->mutex);
 
@@ -696,8 +899,10 @@ net_input_create_devices(uint16_t port, struct xrt_device **out_left, struct xrt
 	}
 
 	u_var_add_root(hub, "Network Input Hub", true);
+	u_var_add_ro_u64(hub, &hub->state_reject_count, "state_reject_count");
 	u_var_add_ro_u64(hub, &hub->state_msg_count, "state_msg_count");
 	u_var_add_ro_u64(hub, &hub->haptic_msg_count, "haptic_msg_count");
+	u_var_add_ro_u64(hub, &hub->haptic_drop_count, "haptic_drop_count");
 	u_var_add_bool(hub, &hub->connected, "connected");
 
 	U_LOG_W("net_input: listening on 127.0.0.1:%u (proto v%u) — feed with scripts/net_input_feeder.py.", hub->port,

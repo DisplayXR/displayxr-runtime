@@ -19,6 +19,7 @@
 #include "os/os_time.h"
 
 #include "util/u_logging.h"
+#include "util/u_window_visibility.h"
 #include "util/u_misc.h"
 
 #include <assert.h>
@@ -77,6 +78,8 @@ struct seg_screen_state
 	int mode_sent;
 	//! #2247: the window had wholly left this screen at the last mode push.
 	bool uncovered;
+	//! #2671: the window's part on this screen was hidden at the last set_display_mode.
+	bool vis_hidden;
 	//! Windows (ADR-047 Amendment 2): this DP holds the session's window —
 	//! it is the owner, and phases from the window, not the present origin.
 	bool has_hwnd;
@@ -125,6 +128,8 @@ struct comp_vk_native_segments
 	struct comp_segments_lifecycle lc;
 	//! #2247: a screen's lens wish goes 2D only after it has been uncovered for the hand-off dwell.
 	struct comp_segments_cover_dwell cover;
+	//! #2671: the session's visibility tracker (borrowed; NULL = every part visible).
+	const struct u_window_visibility *vis;
 	struct comp_segment_table table;
 	struct comp_segment_table logged_table;
 	bool have_logged_table;
@@ -1849,6 +1854,14 @@ comp_vk_native_segments_get_eyes(struct comp_vk_native_segments *segs,
 }
 
 void
+comp_vk_native_segments_set_visibility(struct comp_vk_native_segments *segs, const struct u_window_visibility *vis)
+{
+	if (segs != NULL) {
+		segs->vis = vis;
+	}
+}
+
+void
 comp_vk_native_segments_set_display_mode(struct comp_vk_native_segments *segs, bool enable_3d)
 {
 	if (segs == NULL) {
@@ -1864,7 +1877,14 @@ comp_vk_native_segments_set_display_mode(struct comp_vk_native_segments *segs, b
 		// has wholly left for the hand-off's dwell, the session's mode on the
 		// screens it covers (at once when it returns).
 		const bool covered = comp_segments_cover_dwell_covered(&segs->cover, i);
-		const int want = (enable_3d && covered) ? 1 : 0;
+		// #2671: and 2D while the window's part on this screen is hidden
+		// (covered by other windows, or the window minimized); the session's
+		// mode again the moment any pixel there can be seen.
+		const bool part_hidden = u_window_visibility_screen_hidden(segs->vis, segs->bindings[i].device_name);
+		if (part_hidden != st->vis_hidden) {
+			st->vis_hidden = part_hidden;
+		}
+		const int want = (enable_3d && covered && !part_hidden) ? 1 : 0;
 		if (covered == st->uncovered) {
 			st->uncovered = !covered;
 			// A coverage edge for a live DP: lifecycle, not per frame.

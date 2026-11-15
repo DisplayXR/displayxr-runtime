@@ -31,6 +31,8 @@
 
 #pragma once
 
+#include "xrt/xrt_results.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -116,6 +118,15 @@ ipc_server_conv_cpu_io_gpu_image_kinds(bool export_kinds);
  */
 void
 ipc_server_conv_cpu_io_stream_export(uint64_t wire_id, uint32_t mem_kind);
+
+/*!
+ * A spec-4 CPU image (@p in, CONV_INPUT_CPU: the region in->x/y/w/h of the
+ * section, in->cpu_row_pitch, in->cpu_bgra) as tightly packed RGBA8 pixels in
+ * *out_pixels (malloc'd; the caller frees). The GAUSSIANS photo facade's
+ * input on POSIX. Takes the handles, whatever the outcome.
+ */
+xrt_result_t
+ipc_server_conv_cpu_io_read_input(const struct conv_input_import *in, uint8_t **out_pixels);
 
 /*!
  * Install (or, with NULL, clear) the GPU copies. Copied. Clearing waits for
