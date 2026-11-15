@@ -15445,6 +15445,25 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
+	// Guard: target/swapchain creation above can trigger GPU-driver Vulkan
+	// shader-compiler heap churn that, on some configs (Windows + Leia SR),
+	// reuses the display-processor's heap block and corrupts its vtable. A
+	// call through a garbage vtable slot (e.g. get_display_pixel_info
+	// below) is a hard crash. Validate here and degrade to passthrough
+	// (no weaving) instead of crashing. This runs BEFORE the repaint thread
+	// starts: the thread reads c->display_processor, so clearing it after
+	// the start would race the thread. Do NOT call the DP's destroy — that
+	// pointer may itself be garbage; leak the corrupt object on this path.
+	if (c->display_processor != NULL && !dp_vtable_looks_sane(c->display_processor)) {
+		U_LOG_E("VK display processor vtable corrupt after target creation — "
+		        "disabling DP (output will not be woven). Likely a plug-in built "
+		        "against a different runtime ABI major (ADR-020), or a driver "
+		        "heap-reuse collision.");
+		c->display_processor = NULL;
+		c->dp_atlas_encoding_latched = -1; // #1484
+		c->pq_dp_asked = NULL;             // #2340
+	}
+
 	/*
 	 * #868: the repaint loop, ON by default (DXR_WEAVE_REPAINT=0 disables),
 	 * matching D3D11 and D3D12. Only meaningful with a window target.
@@ -15836,22 +15855,6 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
-	// Guard: target/swapchain creation above can trigger GPU-driver Vulkan
-	// shader-compiler heap churn that, on some configs (Windows + Leia SR),
-	// reuses the display-processor's heap block and corrupts its vtable. A
-	// call through a garbage vtable slot (e.g. get_display_pixel_info just
-	// below) is a hard crash. Validate here and degrade to passthrough
-	// (no weaving) instead of crashing. Do NOT call the DP's destroy — that
-	// pointer may itself be garbage; leak the corrupt object on this path.
-	if (c->display_processor != NULL && !dp_vtable_looks_sane(c->display_processor)) {
-		U_LOG_E("VK display processor vtable corrupt after target creation — "
-		        "disabling DP (output will not be woven). Likely a plug-in built "
-		        "against a different runtime ABI major (ADR-020), or a driver "
-		        "heap-reuse collision.");
-		c->display_processor = NULL;
-		c->dp_atlas_encoding_latched = -1; // #1484
-		c->pq_dp_asked = NULL;             // #2340
-	}
 #ifdef XRT_OS_WINDOWS
 	// #2405: the runtime-owned window phase-snaps while the user drags it, as
 	// on the D3D11 leg (answers "no snap" while no DP exists).
