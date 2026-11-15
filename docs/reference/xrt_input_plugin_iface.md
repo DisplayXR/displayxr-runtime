@@ -322,6 +322,13 @@ origin at the rig nor re-base it, and the pen would sit at the stage origin.
 The run-time signal for both is the same: a NULL or uncovered
 `get_handedness` slot.
 
+The in-tree reference is `src/xrt/drivers/sim_stylus/` (`DisplayXR-SimStylus`,
+id `sim-stylus`): one scripted pen with every input of the profile, the
+dominant-hand declaration with a `HAND` override, a `RIG_LOCAL_PHYSICAL`
+origin, and presence that follows a scripted dock. Its script
+(`sim_stylus_script.c`) is pure and unit-tested; copy the device and plug-in
+files, not the script, when writing a real provider.
+
 ## Device obligations
 
 Devices returned by `create_devices` are ordinary `xrt_device`s. Each

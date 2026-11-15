@@ -93,6 +93,7 @@ add_executable(cube_handle_d3d11_win WIN32
 target_link_libraries(cube_handle_d3d11_win PRIVATE
     sr_common
     OpenXR::openxr_loader
+    d3dcompiler
 )
 
 # Embed manifest (copy to build dir; use relative path to avoid spaces-in-path linker issues)

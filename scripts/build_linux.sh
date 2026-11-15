@@ -259,6 +259,27 @@ else
   echo "Note: DisplayXR-SimInput.so not found — no input provider staged (qwerty keeps the hand roles)."
 fi
 
+# The stylus reference provider (ADR-034 Amendment 8). Inert like sim-input:
+# probe() declines unless DXR_INPUT_SIM_STYLUS_ENABLE=1 (or `displayxr-cli
+# input set sim-stylus ENABLE 1`). ProbeOrder 190, ahead of sim-input.
+SIMSTYLUS_PLUGIN="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimStylus.so" -type f | head -1)"
+if [ -n "$SIMSTYLUS_PLUGIN" ]; then
+  cp "$SIMSTYLUS_PLUGIN" "$PLUGIN_DIR/"
+  cat > "$PLUGIN_DIR/190-sim-stylus-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-stylus",
+        "display_name": "DisplayXR Sim Stylus",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PLUGIN_DIR/DisplayXR-SimStylus.so",
+        "probe_order":  190
+    }
+}
+EOF
+fi
+
 # Viewer-tracking provider (ADR-054 N6 Part 2): the scripted viewer; probe()
 # declines unless `displayxr-cli tracking set sim-tracking ENABLE 1`.
 SIMTRACK_PLUGIN="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimTracking.so" -type f | head -1)"

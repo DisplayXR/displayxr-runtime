@@ -600,6 +600,74 @@ else()
 endif()
 
 ####
+# DisplayXR-SimStylus input-provider plug-in (ADR-034 Amendment 8). The in-tree
+# reference 6-DoF STYLUS: one scripted pen on the MX Ink profile, declared
+# DOMINANT_HAND_CONTROLLER, publishing on a RIG_LOCAL_PHYSICAL origin. Same
+# build model as sim-input; no aux_math (the script keeps its own small
+# quaternion helper), so it links as plain C. probe() declines unless setting
+# ENABLE=1, so staging/registering it is inert. sim_stylus_script.c is pure and
+# also compiled straight into tests_sim_stylus_script.
+if(XRT_FEATURE_OPENXR AND NOT ANDROID)
+add_library(drv_sim_stylus_plugin SHARED
+	sim_stylus/sim_stylus_device.c
+	sim_stylus/sim_stylus_interface.h
+	sim_stylus/sim_stylus_plugin.c
+	sim_stylus/sim_stylus_script.c
+	sim_stylus/sim_stylus_script.h
+	sim_stylus/sim_stylus_settings.c
+	sim_stylus/sim_stylus_settings.h
+	)
+if(XRT_HAVE_LINUX)
+	target_link_libraries(drv_sim_stylus_plugin PRIVATE xrt-interfaces aux_util aux_os drv_includes m)
+else()
+	target_compile_definitions(drv_sim_stylus_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_sim_stylus_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+			drv_includes
+		)
+	add_dependencies(drv_sim_stylus_plugin ${RUNTIME_TARGET})
+	if(APPLE)
+		set_property(TARGET drv_sim_stylus_plugin APPEND PROPERTY BUILD_RPATH "$<TARGET_FILE_DIR:${RUNTIME_TARGET}>")
+	endif()
+endif()
+target_include_directories(drv_sim_stylus_plugin PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/sim_stylus
+	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	)
+set_target_properties(drv_sim_stylus_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-SimStylus"
+	PREFIX ""
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+if(APPLE)
+	target_link_options(drv_sim_stylus_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtInputPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_sim_stylus_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/input_plugin_exports.version")
+endif()
+if(WIN32)
+	install(
+		TARGETS drv_sim_stylus_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+else()
+	install(
+		TARGETS drv_sim_stylus_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+endif() # XRT_FEATURE_OPENXR AND NOT ANDROID - DisplayXR-SimStylus block
+
+####
 # DisplayXR-SimTracking viewer-tracking provider plug-in (ADR-054 §4.1, N6
 # Part 2). The in-tree reference for the fourth class: a scripted viewer with
 # no camera (SCRIPT=sweep|offset), opt-in through its ENABLE setting. Same
@@ -705,7 +773,7 @@ endif() # XRT_FEATURE_OPENXR AND NOT ANDROID — DisplayXR-SimTracking block
 # copy_if_different keeps it a no-op when nothing changed. The manifests stay
 # the script's job — they carry absolute paths and never go stale.
 if(XRT_HAVE_LINUX AND NOT ANDROID)
-	foreach(_dxr_staged_plugin drv_sim_display_plugin drv_sim_input_plugin drv_touch_input_plugin drv_sim_tracking_plugin)
+	foreach(_dxr_staged_plugin drv_sim_display_plugin drv_sim_input_plugin drv_touch_input_plugin drv_sim_tracking_plugin drv_sim_stylus_plugin)
 		add_custom_command(
 			TARGET ${_dxr_staged_plugin}
 			POST_BUILD

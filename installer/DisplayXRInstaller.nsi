@@ -1167,6 +1167,10 @@ client_dll_ok:
 	; -----------------------------------------------------------------
 	SetOutPath "$INSTDIR\plugins"
 	File "${BIN_DIR}\plugins\DisplayXR-SimInput.dll"
+	; The stylus reference provider (ADR-034 Amendment 8): registered like
+	; sim-input and just as inert -- probe() declines unless
+	; `displayxr-cli input set sim-stylus ENABLE 1` / DXR_INPUT_SIM_STYLUS_ENABLE.
+	File "${BIN_DIR}\plugins\DisplayXR-SimStylus.dll"
 	File "${BIN_DIR}\plugins\DisplayXR-SimConversion.dll"
 	; The gamepad input provider (ADR-034 / ADR-054): XInput, presence-gated
 	; — inert until a pad is attached, then the pad takes the gamepad role,
@@ -1198,6 +1202,19 @@ client_dll_ok:
 		"ProbeOrder" 200
 	; Version LAST — the "row complete" marker (input-provider-discovery.md §3).
 	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-input" \
+		"Version" "${VERSION}"
+
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-stylus" \
+		"Binary" "$INSTDIR\plugins\DisplayXR-SimStylus.dll"
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-stylus" \
+		"DisplayName" "DisplayXR Sim Stylus"
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-stylus" \
+		"Vendor" "DisplayXR"
+	; 190: ahead of sim-input (200), so with both enabled the pen takes the
+	; dominant hand and sim-input the other (per-hand arbitration).
+	WriteRegDWORD HKLM "Software\DisplayXR\InputProviders\sim-stylus" \
+		"ProbeOrder" 190
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-stylus" \
 		"Version" "${VERSION}"
 
 	WriteRegStr HKLM "Software\DisplayXR\InputProviders\gamepad" \
@@ -1703,6 +1720,7 @@ Section "Uninstall"
 	; under the same roots belongs to its own installer (#1803), and the
 	; roots themselves are dropped only when nothing else is left in them.
 	DeleteRegKey HKLM "Software\DisplayXR\InputProviders\sim-input"
+	DeleteRegKey HKLM "Software\DisplayXR\InputProviders\sim-stylus"
 	DeleteRegKey HKLM "Software\DisplayXR\InputProviders\gamepad"
 	DeleteRegKey HKLM "Software\DisplayXR\ConversionProviders\sim-conversion"
 	DeleteRegKey /ifempty HKLM "Software\DisplayXR\InputProviders"

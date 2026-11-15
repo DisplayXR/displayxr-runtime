@@ -210,6 +210,27 @@ else
   echo "Note: DisplayXR-SimInput.dylib not found — no input provider in dev tree (qwerty keeps the hand roles)."
 fi
 
+# The stylus reference provider (ADR-034 Amendment 8), inert like sim-input
+# until DXR_INPUT_SIM_STYLUS_ENABLE=1 / `displayxr-cli input set sim-stylus ENABLE 1`.
+SIMSTYLUS_PLUGIN=$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimStylus.dylib" -type f | head -1)
+if [ -n "$SIMSTYLUS_PLUGIN" ] && [ -f "$SIMSTYLUS_PLUGIN" ]; then
+  cp "$SIMSTYLUS_PLUGIN" "$PKG_DIR/lib/displayxr/plugins/"
+  cat > "$PKG_DIR/lib/displayxr/plugins/190-sim-stylus-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-stylus",
+        "display_name": "DisplayXR Sim Stylus",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimStylus.dylib",
+        "probe_order":  190
+    }
+}
+EOF
+  install_name_tool -add_rpath @loader_path/../.. "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimStylus.dylib" 2>/dev/null || true
+fi
+
 # Viewer-tracking provider (ADR-054 N6 Part 2): the scripted viewer. The
 # `-tracking-provider.json` suffix routes it to the tracking loader. Safe to
 # stage: sim-tracking's probe() declines unless its ENABLE setting is on
