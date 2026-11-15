@@ -509,9 +509,15 @@ sim_dp_metal_destroy(struct xrt_display_processor_metal *xdp)
 {
 	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
 
+	// #2624: this file is MRR (no -fobjc-arc) — `= nil` releases nothing. The
+	// pipelines and the sampler are +1 from new*WithDescriptor: in
+	// create_pipelines (nil slots from a partial create release as no-ops).
+	// The device is the compositor's, borrowed via __bridge: not ours.
 	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
+		[sdp->pipelines[i] release];
 		sdp->pipelines[i] = nil;
 	}
+	[sdp->sampler release];
 	sdp->sampler = nil;
 	sdp->device = nil;
 
@@ -529,7 +535,14 @@ sim_dp_metal_destroy(struct xrt_display_processor_metal *xdp)
 static bool
 create_pipelines(struct sim_display_processor_metal *sdp)
 {
+	// #2624: MRR file. Every new*/alloc below is +1. The library, functions
+	// and descriptors are only needed to build the pipeline states (a
+	// pipeline state keeps what it needs itself), so they are released on
+	// every exit; the pipelines and sampler stay in sdp and are released by
+	// sim_dp_metal_destroy (which the caller also runs on failure).
 	NSError *error = nil;
+	bool ok = false;
+	id<MTLFunction> vertex_fn = nil;
 
 	id<MTLLibrary> library = [sdp->device newLibraryWithSource:shader_source
 	                                                   options:nil
@@ -540,10 +553,10 @@ create_pipelines(struct sim_display_processor_metal *sdp)
 		return false;
 	}
 
-	id<MTLFunction> vertex_fn = [library newFunctionWithName:@"fullscreen_vertex"];
+	vertex_fn = [library newFunctionWithName:@"fullscreen_vertex"];
 	if (vertex_fn == nil) {
 		U_LOG_E("sim_display Metal: vertex function not found");
-		return false;
+		goto out;
 	}
 
 	// #817: the interlaced slot builds a second anaglyph pipeline — the mode
@@ -561,7 +574,7 @@ create_pipelines(struct sim_display_processor_metal *sdp)
 		id<MTLFunction> frag_fn = [library newFunctionWithName:frag_names[i]];
 		if (frag_fn == nil) {
 			U_LOG_E("sim_display Metal: %s fragment function not found", mode_names[i]);
-			return false;
+			goto out;
 		}
 
 		MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
@@ -570,10 +583,12 @@ create_pipelines(struct sim_display_processor_metal *sdp)
 		desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
 
 		sdp->pipelines[i] = [sdp->device newRenderPipelineStateWithDescriptor:desc error:&error];
+		[desc release];
+		[frag_fn release];
 		if (sdp->pipelines[i] == nil) {
 			U_LOG_E("sim_display Metal: failed to create %s pipeline: %s",
 			        mode_names[i], error.localizedDescription.UTF8String);
-			return false;
+			goto out;
 		}
 	}
 
@@ -585,12 +600,18 @@ create_pipelines(struct sim_display_processor_metal *sdp)
 	sampler_desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
 
 	sdp->sampler = [sdp->device newSamplerStateWithDescriptor:sampler_desc];
+	[sampler_desc release];
 	if (sdp->sampler == nil) {
 		U_LOG_E("sim_display Metal: failed to create sampler");
-		return false;
+		goto out;
 	}
 
-	return true;
+	ok = true;
+
+out:
+	[vertex_fn release];
+	[library release];
+	return ok;
 }
 
 

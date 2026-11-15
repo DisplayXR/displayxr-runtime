@@ -311,18 +311,23 @@ comp_vk_native_window_macos_get_dimensions(struct comp_vk_native_window_macos *w
 	// explicitly assigned at creation, which decouples it from the layer
 	// bounds — so it goes stale on window resize (#524). Mirrors the
 	// per-frame poll in comp_metal_compositor.m.
-	if (win->view != nil) {
-		NSRect backing = [win->view convertRectToBacking:win->view.bounds];
-		if (backing.size.width > 0 && backing.size.height > 0) {
-			*out_width = (uint32_t)backing.size.width;
-			*out_height = (uint32_t)backing.size.height;
-			return;
+	// Per-frame on the app's thread, which usually has no autorelease pool
+	// (#2624): without one, every view.window / .screen / isVisible reply was
+	// autoreleased into nothing and pinned the window + view for good.
+	@autoreleasepool {
+		if (win->view != nil) {
+			NSRect backing = [win->view convertRectToBacking:win->view.bounds];
+			if (backing.size.width > 0 && backing.size.height > 0) {
+				*out_width = (uint32_t)backing.size.width;
+				*out_height = (uint32_t)backing.size.height;
+				return;
+			}
 		}
-	}
 
-	CGSize size = win->metal_layer.drawableSize;
-	*out_width = (uint32_t)size.width;
-	*out_height = (uint32_t)size.height;
+		CGSize size = win->metal_layer.drawableSize;
+		*out_width = (uint32_t)size.width;
+		*out_height = (uint32_t)size.height;
+	}
 }
 
 void
@@ -332,14 +337,16 @@ comp_vk_native_window_macos_sync_drawable_size(struct comp_vk_native_window_maco
 		return;
 	}
 
-	NSRect backing = [win->view convertRectToBacking:win->view.bounds];
-	CGSize new_size = CGSizeMake(backing.size.width, backing.size.height);
-	if (new_size.width <= 0 || new_size.height <= 0) {
-		return;
-	}
-	if (win->metal_layer.drawableSize.width != new_size.width ||
-	    win->metal_layer.drawableSize.height != new_size.height) {
-		win->metal_layer.drawableSize = new_size;
+	@autoreleasepool { // per-frame, app thread (#2624)
+		NSRect backing = [win->view convertRectToBacking:win->view.bounds];
+		CGSize new_size = CGSizeMake(backing.size.width, backing.size.height);
+		if (new_size.width <= 0 || new_size.height <= 0) {
+			return;
+		}
+		if (win->metal_layer.drawableSize.width != new_size.width ||
+		    win->metal_layer.drawableSize.height != new_size.height) {
+			win->metal_layer.drawableSize = new_size;
+		}
 	}
 }
 
@@ -352,6 +359,10 @@ comp_vk_native_window_macos_get_screen_position(struct comp_vk_native_window_mac
 		return false;
 	}
 
+	// Per-frame on the app's thread, which usually has no autorelease pool
+	// (#2624): without one, every view.window / .screen / isVisible reply was
+	// autoreleased into nothing and pinned the window + view for good.
+	@autoreleasepool {
 	NSView *view = win->view;
 	NSWindow *ns_win = view.window != nil ? view.window : win->window;
 	if (ns_win == nil) {
@@ -376,6 +387,7 @@ comp_vk_native_window_macos_get_screen_position(struct comp_vk_native_window_mac
 	*out_left_px = (int32_t)left_px;
 	*out_top_px = (int32_t)(top_pts * bs);
 	return true;
+	} // @autoreleasepool
 }
 
 bool
@@ -384,7 +396,9 @@ comp_vk_native_window_macos_is_valid(struct comp_vk_native_window_macos *win)
 	if (win == NULL) return false;
 	if (!win->owns_window) return true; // External view — always valid
 	if (win->window == nil) return false;
-	return [win->window isVisible];
+	@autoreleasepool { // per-frame, app thread (#2624)
+		return [win->window isVisible];
+	}
 }
 
 void
