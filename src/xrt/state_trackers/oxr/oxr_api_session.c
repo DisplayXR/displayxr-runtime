@@ -1748,8 +1748,9 @@ oxr_xrEnumerateDisplayRenderingModesDXR(XrSession session,
 
 	uint32_t count = head->rendering_mode_count;
 
-	if (modeCountOutput == NULL) {
-		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "modeCountOutput");
+	OXR_VERIFY_ARG_NOT_NULL(&log, modeCountOutput);
+	if (modeCapacityInput > 0) {
+		OXR_VERIFY_ARG_NOT_NULL(&log, modes);
 	}
 	*modeCountOutput = count;
 
