@@ -2672,6 +2672,10 @@ metal_compositor_capture_atlas_to_png(struct comp_metal_compositor *c,
 			ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, rgba, (int)row_pitch) != 0;
 			free(rgba);
 		}
+		// #2624: +1 from newBufferWithLength: (MRR file). The blit that wrote
+		// it has completed (waitUntilCompleted above) and `bgra` is not read
+		// past this point.
+		[staging release];
 	}
 	return ok;
 }
@@ -6316,6 +6320,9 @@ metal_compositor_layer_commit_frame(struct xrt_compositor *xc, xrt_graphics_sync
 					stbi_write_png("/tmp/dxr_atlas.png", (int)cw, (int)ch, 4, out, (int)pitch);
 					free(out);
 				}
+				// #2624: +1 from newBufferWithLength: (MRR file); the blit
+				// completed above and `src` is not read past this point.
+				[stg release];
 				cmd_buf = [c->command_queue commandBuffer];
 			}
 		}

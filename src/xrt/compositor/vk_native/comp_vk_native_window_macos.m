@@ -137,11 +137,25 @@ create_window_on_main_thread(struct comp_vk_native_window_macos *win,
 		return;
 	}
 
+	// #2624: this file is MRR. The window is +1 from alloc above and owned by
+	// this struct until comp_vk_native_window_macos_destroy releases it.
+	// NSWindow defaults releasedWhenClosed=YES, which would let a click on the
+	// title-bar close button free it (and, with it, the content view below)
+	// while win->window / win->view are still read every frame — the same
+	// dangling-window crash comp_window_macos.m fixed for #48. Keep the
+	// lifetime in our hands: closing only orders the window out (is_valid
+	// then reports it closed and the session exits).
+	[win->window setReleasedWhenClosed:NO];
+
 	[win->window setTitle:@"DisplayXR — VK Native Compositor"];
 
 	CompVkNativeView *vkView = [[CompVkNativeView alloc] initWithFrame:frame];
 	vkView.wantsLayer = YES;
 	[win->window setContentView:vkView];
+	// The window retains its content view; drop our +1 from alloc so the
+	// view is freed with the window. win->view / win->metal_layer stay
+	// borrowed pointers, valid while the window lives (destroy clears them).
+	[vkView release];
 
 	win->view = vkView;
 	win->metal_layer = (CAMetalLayer *)vkView.layer;
@@ -397,6 +411,10 @@ comp_vk_native_window_macos_destroy(struct comp_vk_native_window_macos **win_ptr
 	if (win->owns_window && win->window != nil) {
 		void (^close_window)(void) = ^{
 			[win->window close];
+			// releasedWhenClosed is NO (see create_window_on_main_thread):
+			// balance the alloc here, on the main thread. The window's
+			// dealloc releases its content view (our CompVkNativeView).
+			[win->window release];
 		};
 		if ([NSThread isMainThread]) {
 			close_window();
