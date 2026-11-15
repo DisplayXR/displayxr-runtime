@@ -102,18 +102,46 @@ waitOnFenceWithTimeout(wil::com_ptr<ID3D11Fence> fence,
                        uint64_t value,
                        std::chrono::milliseconds timeout_ms)
 {
-	DWORD dwTimeout = duration_cast<duration<DWORD, std::milli>>(timeout_ms).count();
 	// Have to use this instead of ID3D11DeviceContext4::Wait because the latter has no timeout
 	// parameter.
-	fence->SetEventOnCompletion(value, event.get());
-	if (value <= fence->GetCompletedValue()) {
-		// oh we already reached this value.
+	//
+	// #2620: the event is auto-reset and shared by every call on this thread.
+	// The old shape registered, then returned early when the value was already
+	// reached, leaving the event SIGNALLED by that registration; a pending
+	// registration from an earlier timed-out call can also fire late. Either
+	// way the next call's wait succeeded at once, before ITS value was
+	// reached. So: reset, register (checking the HRESULT), wait, and judge
+	// only by GetCompletedValue(), re-arming until reached or the deadline.
+	if (fence->GetCompletedValue() >= value) {
 		return XRT_SUCCESS;
 	}
-	if (event.wait(dwTimeout)) {
-		return XRT_SUCCESS;
+	const auto deadline = steady_clock::now() + timeout_ms;
+	for (;;) {
+		ResetEvent(event.get());
+		const HRESULT hr = fence->SetEventOnCompletion(value, event.get());
+		if (FAILED(hr)) {
+			static bool s_logged = false;
+			if (!s_logged) {
+				s_logged = true;
+				U_LOG_W("waitOnFenceWithTimeout: SetEventOnCompletion failed: 0x%08lx (logged once)",
+				        hr);
+			}
+			return fence->GetCompletedValue() >= value ? XRT_SUCCESS : XRT_TIMEOUT;
+		}
+		const auto now = steady_clock::now();
+		DWORD wait_ms = 0;
+		if (now < deadline) {
+			const auto left_ms = std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count();
+			wait_ms = left_ms >= (decltype(left_ms))INFINITE ? INFINITE - 1 : (DWORD)left_ms;
+		}
+		(void)WaitForSingleObject(event.get(), wait_ms);
+		if (fence->GetCompletedValue() >= value) {
+			return XRT_SUCCESS;
+		}
+		if (steady_clock::now() >= deadline) {
+			return XRT_TIMEOUT;
+		}
 	}
-	return XRT_TIMEOUT;
 }
 
 } // namespace xrt::auxiliary::d3d::d3d11
