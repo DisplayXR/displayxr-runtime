@@ -772,6 +772,12 @@
 		]
 	},
 
+	"weave_present_feedback": {
+		"in": [
+			{"name": "feedback", "type": "struct xrt_weave_present_feedback"}
+		]
+	},
+
 	"weave_cursor_sprite_texture": {
 		"in": [
 			{"name": "info", "type": "struct xrt_weave_cursor_sprite_texture"}

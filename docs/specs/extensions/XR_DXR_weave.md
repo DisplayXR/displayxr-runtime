@@ -513,6 +513,69 @@ How the service runs it (`comp_multi_weave_android.c`, "sync_file weave"):
   carries the submit + a want-release flag, returning the release fd as its out handle
   (SCM_RIGHTS). A caller that chains nothing sends exactly the pre-v20 `weave_submit`.
 
+### 5b-feedback. Present feedback (v21)
+
+```c
+#define XR_TYPE_WEAVE_SUBMIT_PRESENT_FEEDBACK_DXR ((XrStructureType)1004999293)
+#define XR_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES_DXR 4
+
+typedef struct XrWeavePresentFeedbackEntryDXR {
+    uint64_t fenceValue;          // XrWeaveOutputDXR::fenceValue of an EARLIER submit
+    int64_t  actualPresentTimeNs; // when that frame's pixels were presented, ns
+} XrWeavePresentFeedbackEntryDXR;
+
+typedef struct XrWeaveSubmitPresentFeedbackDXR {   // chain on XrWeaveSubmitInfoDXR::next
+    XrStructureType                type;
+    const void*                    next;
+    uint32_t                       entryCount;     // 0..4
+    XrWeavePresentFeedbackEntryDXR entries[XR_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES_DXR];
+} XrWeaveSubmitPresentFeedbackDXR;
+```
+
+**Why.** A display processor that tracks the viewer predicts where the eyes will be when the woven
+pixels are lit, so it needs the weave-to-scanout interval. A compositor that presents measures
+that itself (the in-process Vulkan route joins its present id to the driver's reported present
+time and publishes the result to the DP's `set_predicted_scanout` slot before each weave, "#206").
+A present-owner route cannot: the runtime weaves into a buffer and the **caller** presents it, so
+the runtime never learns when the frame reached the screen and the DP predicts across a fixed
+guess. On the Android browser route the real interval is several refresh periods and changes with
+the refresh rate, so a constant is wrong in both directions at once.
+
+**Contract.**
+
+| | |
+|---|---|
+| what an entry says | "the frame for which you returned `fenceValue` F was presented at time T" — F from an **earlier** submit on this session, never the one carrying the report |
+| clock | the platform monotonic clock, nanoseconds: `CLOCK_MONOTONIC` on Android (what the platform's frame-timing callbacks report). A caller holding another clock does not send it |
+| which frames | only frames the platform actually reported a present time for. A dropped or replaced frame is never reported; no estimates |
+| how many, how often | 0..4 entries per submit, each frame at most once, any order, any lag (the runtime remembers the last 64 submits). A caller may stop and resume at any time |
+| failure | none. An unusable entry (unknown or already-reported `fenceValue`, a time not after the weave start, an interval above 500 ms) is counted and dropped. Only `entryCount` > 4 is `XR_ERROR_VALIDATION_FAILURE` |
+| who predicts | **the runtime.** The caller hands over raw timestamps; it never sends a latency, a filtered value or a guess |
+| capability | no gate to send (an older runtime skips the unknown struct). `extensionVersion >= 21` says the reports are used |
+| platforms | acted on by the **Android** engine. Windows, macOS and desktop Linux validate `entryCount` and ignore the entries |
+
+**What the Android engine does** (`comp_multi_weave_android.c`, pure logic in
+`compositor/util/comp_weave_present_feedback.h`):
+
+- Each submit stamps its **weave start** (`CLOCK_MONOTONIC`) immediately before the display
+  processor's `process_atlas` — the instant the DP samples the tracker, so the instant its
+  prediction is anchored to — and remembers it against the `fenceValue` it returns (ring of 64).
+- A report resolves to `residual = actualPresentTimeNs - weave start`. The prediction is the
+  **median of the last 9 accepted residuals**: this route's weave start is phase-locked to vsync,
+  so the residual is near-constant, the median drops the odd late frame, and a refresh-rate change
+  is followed once a majority of the window is on the new value (5 reports, complete in 9).
+- Before every `process_atlas` the engine publishes that prediction through the Vulkan DP's
+  `set_predicted_scanout` slot. With **no accepted report in the last second** it publishes 0 —
+  the slot's "unknown" — and the DP uses its own default; a median above the slot's 200 ms bound is
+  not published either (0, plus one WARN). A session that never reports never touches the slot.
+- Wire: the entries ride their own call, `weave_present_feedback`, immediately before the submit
+  on the same connection, and only when a submit carries at least one — a caller that chains
+  nothing sends exactly the pre-v21 messages.
+- Kill switch **`debug.dxr.weave_present_feedback=0`** (read once per process): reports are
+  ignored and nothing is published. Logs, all tagged `#206`: one WARN for the switch, one WARN for
+  a session's first accepted report, and an INFO summary every 5 s (count, median, min, max,
+  rejected).
+
 ## 5c. Desktop Linux platform mapping — the snap (#1588), and a full weave platform (#1699)
 
 Desktop Linux became a **full weave platform in v10** (§5d): the transport, the fences and the
@@ -1220,6 +1283,11 @@ it keeps such an overlay off the wire there instead.
 "one display processor, use the base eyes".
 
 | 20 | No new structure: v10's `XrWeaveSubmitSyncDXR` (acquire `sync_file`, in) and `XrWeaveOutputSyncDXR` (per-frame release `sync_file`, out) are **accepted on Android**, on the AHardwareBuffer submit with no dma-buf descriptor (§5b-sync). A caller that chains the release struct gets the release fence and the submit returns without the service's CPU wait for the weave; a caller that chains neither keeps the synchronous contract. Before v20 the Android runtime refused `XrWeaveSubmitSyncDXR` (`XR_ERROR_VALIDATION_FAILURE`) and wrote -1 into the release struct. |
+
+| 21 | `XrWeaveSubmitPresentFeedbackDXR` (in, per submit): a present-owner reports when earlier woven frames were presented (`fenceValue` + `CLOCK_MONOTONIC` present time, up to 4 per submit), so the runtime measures the weave-to-scanout interval and feeds its display processor's eye prediction instead of a fixed guess (§5b-feedback). Optional, best effort, never fails a submit. Acted on by the Android engine; accepted and ignored elsewhere. |
+
+**v21 needs no gate to send**: an older runtime skips the struct and predicts as before.
+`extensionVersion >= 21` only tells a caller that collecting the present times is worth it.
 
 **v20 is a gate to send**: an Android caller chains `XrWeaveSubmitSyncDXR` only on `extensionVersion >= 20` (an older Android runtime refuses the submit). Chaining `XrWeaveOutputSyncDXR` is harmless on any version — -1 means "already complete".
 

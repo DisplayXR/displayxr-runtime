@@ -241,6 +241,16 @@
  * elsewhere. xrWeaveSnapWindowRectDXR snaps against the lattice of the screen
  * holding the majority of the window (same hysteresis as ADR-047 Amendment 2).
  *
+ * Present feedback (SPEC_VERSION 21). XrWeaveSubmitPresentFeedbackDXR, chained on
+ * the submit, tells the runtime WHEN earlier woven frames reached the screen. A
+ * present-owner presents the woven output itself, so the runtime cannot observe
+ * the weave-to-scanout interval its display processor predicts the viewer's eye
+ * positions across; with the feedback the runtime measures it (present time
+ * minus the time that frame's weave started) and owns the prediction. Optional
+ * and best effort: no report, or none for a while, means the display processor's
+ * own default. Acted on by the Android engine; accepted and ignored elsewhere.
+ * Details on the struct.
+ *
  * Android sync_file fences (SPEC_VERSION 20). No new structure: from v20 the
  * Android engine accepts v10's XrWeaveSubmitSyncDXR and XrWeaveOutputSyncDXR on
  * an AHardwareBuffer submit (no dma-buf descriptor — the AHardwareBuffer IS the
@@ -364,7 +374,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 20
+#define XR_DXR_weave_SPEC_VERSION 21
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -407,6 +417,8 @@ extern "C" {
 #define XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR    ((XrStructureType)1004999291)
 // Spec v19 (#1884): per-screen parts of each weave rect + per-screen eyes.
 #define XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR        ((XrStructureType)1004999292)
+// Spec v21: when earlier woven frames were presented (present-owner -> runtime).
+#define XR_TYPE_WEAVE_SUBMIT_PRESENT_FEEDBACK_DXR  ((XrStructureType)1004999293)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -445,6 +457,11 @@ extern "C" {
 //! planes are offsets into the ONE fd; 4 is the DRM ceiling (Intel CCS modifiers
 //! use 2 for a single-plane RGB format).
 #define XR_WEAVE_DMABUF_MAX_PLANES_DXR 4
+
+//! Upper bound on XrWeaveSubmitPresentFeedbackDXR::entries (spec v21): the
+//! frames one submit can report. A caller that learned of more reports the
+//! newest ones.
+#define XR_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES_DXR 4
 
 //! Upper bound on points one xrWeaveSnapWindowGridDXR evaluates (spec v11), and
 //! on points along either axis. 1024 x 1024 covers a dense device-pixel grid
@@ -1171,6 +1188,62 @@ typedef struct XrWeaveSubmitOverlayFilterDXR {
     const void* XR_MAY_ALIAS next;
     float                    filterStrength; //!< 0 = no lens filtering .. 1 = full; omit = DP default
 } XrWeaveSubmitOverlayFilterDXR;
+
+/*!
+ * @brief One presented frame (spec v21): which submit, and when its pixels were presented.
+ *
+ * @c fenceValue is the XrWeaveOutputDXR::fenceValue the runtime returned for an
+ * EARLIER xrWeaveSubmitDXR on this session — the frame being reported, never
+ * the submit carrying the report. @c actualPresentTimeNs is when that frame's
+ * pixels were presented, as the platform reported it to the present-owner, in
+ * nanoseconds on the clock XrWeaveSubmitPresentFeedbackDXR names.
+ */
+typedef struct XrWeavePresentFeedbackEntryDXR {
+    uint64_t fenceValue;          //!< XrWeaveOutputDXR::fenceValue of the reported frame
+    int64_t  actualPresentTimeNs; //!< when it was presented, ns (CLOCK_MONOTONIC on Android)
+} XrWeavePresentFeedbackEntryDXR;
+
+/*!
+ * @brief Present feedback for earlier woven frames (spec v21).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next. A present-owner presents the woven
+ * output itself, so only it learns when a frame reached the screen. Each entry
+ * hands that back for one earlier submit; the runtime subtracts the time that
+ * frame's weave started and so measures the weave-to-scanout interval its
+ * display processor has to predict the viewer's eye positions across. THE
+ * RUNTIME OWNS THE PREDICTION: the caller reports raw platform timestamps and
+ * never a latency, a filtered value or a guess.
+ *
+ *  - CLOCK. The platform's monotonic clock in nanoseconds: CLOCK_MONOTONIC on
+ *    Android (what the platform's frame-timing / presentation callbacks report
+ *    there). A caller whose platform reports another clock must not send it.
+ *  - WHICH FRAMES. Only frames whose present time the platform actually
+ *    reported. A frame that was dropped or replaced before it reached the
+ *    screen is simply never reported — do not substitute an estimate.
+ *    Each frame at most once; order does not matter; a report may lag its frame
+ *    by any number of submits (the runtime remembers the last 64).
+ *  - OPTIONAL AND BEST EFFORT. A submit may carry 0..
+ *    XR_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES_DXR entries, and a caller may stop
+ *    and resume at any time. An entry the runtime cannot use (an unknown or
+ *    already-reported @c fenceValue, an implausible time) is ignored and never
+ *    fails the submit. Without recent feedback the display processor falls back
+ *    to its own default horizon — exactly the pre-v21 behaviour.
+ *  - VALIDATION. @c entryCount above the bound is
+ *    XR_ERROR_VALIDATION_FAILURE; nothing else in this struct can fail.
+ *
+ * The feedback describes the session's woven frames, so it applies from the
+ * submit that carries it onward. Acted on by the Android engine; every other
+ * platform accepts the struct and ignores it (their weave routes measure the
+ * interval themselves or have no predictor to feed). A pre-v21 runtime skips
+ * the unknown struct, so no version gate is needed to send it;
+ * extensionVersion >= 21 tells a caller the reports are worth collecting.
+ */
+typedef struct XrWeaveSubmitPresentFeedbackDXR {
+    XrStructureType                type;       //!< XR_TYPE_WEAVE_SUBMIT_PRESENT_FEEDBACK_DXR
+    const void* XR_MAY_ALIAS       next;
+    uint32_t                       entryCount; //!< 0..XR_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES_DXR
+    XrWeavePresentFeedbackEntryDXR entries[XR_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES_DXR];
+} XrWeaveSubmitPresentFeedbackDXR;
 
 /*!
  * @brief One screen's segment of the bound window (spec v19, #1884).

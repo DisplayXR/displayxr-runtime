@@ -1024,6 +1024,115 @@ weave_sync_fd_enabled(void)
 	return !off;
 }
 
+/*
+ *
+ * Present feedback (XR_DXR_weave v21) — #206 on the present-owner route.
+ *
+ * The in-process Vulkan compositor measures the weave->scanout residual by
+ * correlating its own presentID with the driver's actualPresentTime, and
+ * publishes it to the DP's set_predicted_scanout slot before each weave
+ * (comp_vk_native_compositor.c, "#206"). This route never presents, so the
+ * same quantity has to come from the caller: it reports "the frame you
+ * returned fenceValue F for was presented at T", and comp_weave_pf pairs F
+ * with the weave start stamped below, right before process_atlas.
+ *
+ */
+
+/*!
+ * `debug.dxr.weave_present_feedback` (default 1): 0 ignores the caller's
+ * present feedback, so nothing is published and the DP keeps its own default
+ * horizon (the pre-v21 frame). Read once per process, logged once.
+ */
+static bool
+weave_present_feedback_enabled(void)
+{
+	static int cached = -1; // benign race: every reader computes the same value
+	if (cached < 0) {
+		char value[PROP_VALUE_MAX] = {0};
+		const bool off =
+		    __system_property_get("debug.dxr.weave_present_feedback", value) > 0 && value[0] == '0';
+		cached = off ? 0 : 1;
+		U_LOG_W("#206: weave present feedback (v21) %s (debug.dxr.weave_present_feedback=%s)",
+		        off ? "IGNORED" : "enabled", value[0] != '\0' ? value : "<unset>");
+	}
+	return cached != 0;
+}
+
+//! Same bound, for the same reason, as the in-process route's publish site.
+#define WEAVE_PF_HORIZON_MAX_NS (200ULL * U_TIME_1MS_IN_NS)
+//! Period of the summary line.
+#define WEAVE_PF_LOG_PERIOD_NS (5ULL * U_TIME_1S_IN_NS)
+
+/*!
+ * Publish the horizon for the weave that starts at @p weave_start_ns. Call
+ * with the weave mutex held, right before process_atlas. A session that never
+ * reported touches nothing.
+ */
+static void
+weave_pf_publish(struct multi_compositor *mc, uint64_t weave_start_ns)
+{
+	if (!mc->weave.pf_seen) {
+		return;
+	}
+	// 0 = unknown (no fresh report): the DP keeps its own heuristic.
+	uint64_t horizon_ns = comp_weave_pf_predict(&mc->weave.pf, weave_start_ns);
+	if (horizon_ns > WEAVE_PF_HORIZON_MAX_NS) {
+		// Lifecycle-rare by construction (a median this large); never per frame.
+		if (horizon_ns != mc->weave.pf_last_bad_ns) {
+			mc->weave.pf_last_bad_ns = horizon_ns;
+			U_LOG_W("#206: weave present feedback — measured weave->scanout residual %" PRIu64
+			        " ms is outside [0, 200] — NOT published; the DP keeps its own heuristic. A "
+			        "value this large means the fenceValue/actualPresentTime correlation is wrong.",
+			        horizon_ns / U_TIME_1MS_IN_NS);
+		}
+		horizon_ns = 0;
+	}
+	xrt_display_processor_vk_set_predicted_scanout((struct xrt_display_processor_vk *)mc->weave.dp, horizon_ns);
+
+	if (weave_start_ns - mc->weave.pf_last_log_ns > WEAVE_PF_LOG_PERIOD_NS) {
+		mc->weave.pf_last_log_ns = weave_start_ns;
+		const struct comp_weave_pf_stats st = comp_weave_pf_take_stats(&mc->weave.pf, weave_start_ns);
+		if (st.accepted != 0 || st.rejected != 0) {
+			U_LOG_I("#206: weave->scanout residual over 5 s (present feedback) — n=%" PRIu64
+			        " median %.2f ms%s, min %.2f ms, max %.2f ms, rejected %" PRIu64,
+			        st.accepted, st.median_ns / 1e6, st.median_ns == 0 ? " (unknown)" : "", st.min_ns / 1e6,
+			        st.max_ns / 1e6, st.rejected);
+		}
+	}
+}
+
+void
+comp_multi_weave_android_present_feedback(struct xrt_compositor *xc, const struct xrt_weave_present_feedback *feedback)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL || feedback == NULL || feedback->entry_count == 0) {
+		return;
+	}
+	if (!weave_present_feedback_enabled()) {
+		return;
+	}
+	const uint32_t count = feedback->entry_count < XRT_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES
+	                           ? feedback->entry_count
+	                           : XRT_WEAVE_PRESENT_FEEDBACK_MAX_ENTRIES;
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	const uint64_t now_ns = os_monotonic_get_ns();
+	mc->weave.pf_seen = true;
+	for (uint32_t i = 0; i < count; i++) {
+		const enum comp_weave_pf_verdict v =
+		    comp_weave_pf_report(&mc->weave.pf, feedback->entries[i].fence_value,
+		                         feedback->entries[i].actual_present_time_ns, now_ns);
+		if (v == COMP_WEAVE_PF_ACCEPTED && !mc->weave.pf_logged_first) {
+			mc->weave.pf_logged_first = true;
+			U_LOG_W("#206: weave present feedback (v21) — first report accepted (fence %" PRIu64
+			        "): weave->scanout residual %.2f ms; the DP's predicted scanout now follows the "
+			        "caller's present times",
+			        feedback->entries[i].fence_value, comp_weave_pf_predict(&mc->weave.pf, now_ns) / 1e6);
+		}
+	}
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
 //! CPU-wait a sync_file (readable once signalled), bounded, and close it.
 static bool
 weave_sync_poll_and_close(int fd)
@@ -2499,6 +2608,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 	bool atlas_done = false;       // process_atlas ran (the DP consumed the pair)
 	bool dp_dropped = false;       // ... and reported the frame dropped
 	bool capturing = false;        // #2501: this submit consumed a capture trigger
+	uint64_t weave_start_ns = 0;   // v21: stamped right before process_atlas
 
 	bool ok = false;
 	do {
@@ -3476,6 +3586,16 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			}
 		}
 
+		// #206 / v21: the weave starts HERE — everything before is the runtime's
+		// own unpack, and the DP samples the tracker inside process_atlas, so
+		// this is the instant its eye prediction is anchored to (the in-process
+		// route stamps its weave start at the same place relative to the weave:
+		// after any wait, before the DP call). Recorded against this submit's
+		// fence value below; the horizon published now is the median of what
+		// the caller reported for earlier frames (0 = unknown, DP default).
+		weave_start_ns = os_monotonic_get_ns();
+		weave_pf_publish(mc, weave_start_ns);
+
 		// ONE process_atlas per submit. Legacy/batch: 2x1 SBS, per-eye dims = the
 		// window. v6: the caller's grid at content_view dims.
 		xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
@@ -3720,6 +3840,8 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		}
 
 		mc->weave.fence_value++;
+		// v21: the caller's present feedback names this frame by this value.
+		comp_weave_pf_record(&mc->weave.pf, mc->weave.fence_value, weave_start_ns);
 		mc->weave.last_submit_ns = os_monotonic_get_ns(); // #1278 idle tracking
 		if (mc->weave.idle_released) {
 			// #1278: weaving resumed after an idle release. The lens re-binds

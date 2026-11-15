@@ -403,6 +403,16 @@ xrt_result_t
 comp_ipc_client_compositor_weave_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req);
 
 /*!
+ * XR_DXR_weave v21: present feedback for earlier woven frames of this
+ * present-owner session (XrWeaveSubmitPresentFeedbackDXR). Sent only by a
+ * submit that chained the struct with at least one entry, and only where the
+ * service's weave engine acts on it (Android) — zero cost otherwise.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_present_feedback(struct xrt_compositor *xc,
+                                                  const struct xrt_weave_present_feedback *feedback);
+
+/*!
  * XR_DXR_cursor_depth v8: hand over the texture carrier of a new sprite
  * generation (the handle is copied, not consumed). Sent on a sprite change only.
  */

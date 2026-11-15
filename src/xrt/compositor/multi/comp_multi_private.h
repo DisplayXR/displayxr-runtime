@@ -45,6 +45,8 @@
 #include "multi/comp_multi_weave_capture.h"
 #elif defined(XRT_OS_ANDROID)
 #include "multi/comp_multi_weave_capture.h"
+#include "util/comp_weave_present_feedback.h"
+#include "xrt/xrt_display_metrics.h"
 #endif
 
 #include "render/render_interface.h"
@@ -973,6 +975,26 @@ struct multi_compositor
 		struct comp_multi_weave_capture capture;
 		bool capture_tag_resolved; //!< capture.tag holds the lookup for capture_tag_uid
 		long capture_tag_uid;
+
+		/*!
+		 * @name Present feedback (XR_DXR_weave v21) — #206 on this route
+		 * The caller presents the woven output, so only it learns when a frame
+		 * reached the screen. It reports that back per fence value
+		 * (comp_multi_weave_android_present_feedback); @c pf pairs each report
+		 * with the weave start recorded for that submit and yields the
+		 * weave->scanout horizon published to the DP before every process_atlas
+		 * (0 = unknown while there is no fresh report). Nothing is published
+		 * until the first report arrives, so a caller that never reports gets
+		 * the pre-v21 frame. `debug.dxr.weave_present_feedback=0` ignores the
+		 * reports. Guarded by the weave mutex.
+		 * @{
+		 */
+		struct comp_weave_pf pf;
+		bool pf_seen;            //!< a report arrived on this session: publish from now on
+		bool pf_logged_first;    //!< the one-time WARN for the first accepted report
+		uint64_t pf_last_log_ns; //!< throttle of the periodic summary
+		uint64_t pf_last_bad_ns; //!< last out-of-bounds horizon logged (not published)
+		//! @}
 
 		/*!
 		 * @name sync_file weave (XR_DXR_weave v20)
@@ -1919,6 +1941,17 @@ comp_multi_weave_android_set_capture_uid(struct xrt_compositor *xc, long peer_ui
  */
 void
 comp_multi_weave_android_set_sync(struct xrt_compositor *xc, int acquire_fence_fd, bool want_release_fence);
+
+/*!
+ * XR_DXR_weave v21 (XrWeaveSubmitPresentFeedbackDXR): when earlier woven
+ * frames of this session were presented, keyed by the fence value their
+ * submit returned. Each usable entry becomes one sample of the weave->scanout
+ * residual (#206) that the next submits publish to the display processor's
+ * set_predicted_scanout slot; unusable entries are counted and dropped.
+ * Ignored with `debug.dxr.weave_present_feedback=0`.
+ */
+void
+comp_multi_weave_android_present_feedback(struct xrt_compositor *xc, const struct xrt_weave_present_feedback *feedback);
 
 /*!
  * Collect the release sync_file of the submit that followed
