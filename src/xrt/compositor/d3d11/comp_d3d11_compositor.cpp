@@ -11243,6 +11243,14 @@ comp_d3d11_compositor_get_eye_positions_at(struct xrt_compositor *xc,
 }
 
 extern "C" bool
+comp_d3d11_compositor_legacy_auto_2d_on(struct xrt_compositor *xc)
+{
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex); // hub.split's lifetime
+	return c->hub.split != nullptr && comp_hub_d3d11_auto_2d_on(c->hub.split);
+}
+
+extern "C" bool
 comp_d3d11_compositor_slot_holds_other_screen(struct xrt_compositor *xc)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);

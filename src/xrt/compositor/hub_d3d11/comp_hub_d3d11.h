@@ -1081,6 +1081,18 @@ comp_hub_d3d11_get_display_pixel_info(
 bool
 comp_hub_d3d11_request_display_mode(struct comp_hub_d3d11 *split, bool enable_3d);
 
+/*!
+ * #2639: does this hub run a legacy session's automatic 2D? Its decision is
+ * presentation-only, so xrLocateViews must hand such a session its per-eye
+ * views whatever the lens is doing: a DP in hardware 2D reports one centred
+ * eye, and goes on doing so for a few hundred ms after the lens returns to 3D
+ * (the tracker wakes up). An app rendering both views from that one eye
+ * submits a flat picture, which holds the lens in 2D for ever, or sends it
+ * straight back to 2D after every return. Any thread.
+ */
+bool
+comp_hub_d3d11_auto_2d_on(struct comp_hub_d3d11 *split);
+
 void
 comp_hub_d3d11_set_eye_tracking_mode(struct comp_hub_d3d11 *split, uint32_t mode);
 

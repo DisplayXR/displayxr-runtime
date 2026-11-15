@@ -256,6 +256,16 @@ bool
 comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d);
 
 /*!
+ * #2639: true when the D3D11 hub this session is rerouted through runs a legacy
+ * session's automatic 2D. xrLocateViews then keeps the per-eye view set
+ * whenever the DP reports a collapsed one. Any thread.
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_compositor_legacy_auto_2d_on(struct xrt_compositor *xc);
+
+/*!
  * Multi-screen M6 (ADR-047 D2 on Windows, D3D12): hand the compositor the
  * system's screen list, so a window that spans several monitors is woven per
  * segment, each by its own screen's display processor, into the one back

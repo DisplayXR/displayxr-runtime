@@ -149,6 +149,8 @@ struct comp_hub_d3d11
 	 */
 	struct comp_hub_auto_stereo *auto_stereo;
 	bool auto_held;
+	//! Automatic 2D is on for this session (set once, before the first frame).
+	bool auto_2d_on;
 	bool auto_conv_logged;
 	uint32_t auto_cuts_logged;
 	uint64_t auto_log_ns;
@@ -1258,6 +1260,7 @@ split_release_out(struct comp_hub_d3d11 *s)
 {
 	// #2639: its GPU objects live on out_dev; its worker is joined here.
 	comp_hub_auto_stereo_destroy(&s->auto_stereo);
+	s->auto_2d_on = false;
 	s->auto_held = false;
 	split_release_direct(s);
 	if (s->xbridge != NULL) {
@@ -6027,6 +6030,15 @@ comp_hub_d3d11_get_display_pixel_info(
 }
 
 extern "C" bool
+comp_hub_d3d11_auto_2d_on(struct comp_hub_d3d11 *s)
+{
+	if (s == nullptr) {
+		return false;
+	}
+	return s->auto_2d_on;
+}
+
+extern "C" bool
 comp_hub_d3d11_request_display_mode(struct comp_hub_d3d11 *s, bool enable_3d)
 {
 	if (s == nullptr) {
@@ -6135,6 +6147,7 @@ comp_hub_d3d11_set_legacy_auto_stereo(struct comp_hub_d3d11 *s,
 	if (s->auto_stereo == nullptr) {
 		return;
 	}
+	s->auto_2d_on = cfg->auto_2d;
 	U_LOG_W(
 	    "legacy auto-stereo: ON for this legacy session (%s) — automatic 2D %s, automatic re-convergence %s "
 	    "(max shift %.3f, far content <= %.3f behind, near content <= %.3f in front, fractions of the eye "
@@ -6551,6 +6564,13 @@ comp_hub_d3d11_is_direct(struct comp_hub_d3d11 *split)
 
 extern "C" bool
 comp_hub_d3d11_has_eye_positions_at(struct comp_hub_d3d11 *split)
+{
+	(void)split;
+	return false;
+}
+
+extern "C" bool
+comp_hub_d3d11_auto_2d_on(struct comp_hub_d3d11 *split)
 {
 	(void)split;
 	return false;

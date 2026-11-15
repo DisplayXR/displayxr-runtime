@@ -8679,6 +8679,19 @@ comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
 }
 
 extern "C" bool
+comp_d3d12_compositor_legacy_auto_2d_on(struct xrt_compositor *xc)
+{
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (c->reroute.active && c->reroute.split != NULL) {
+		return comp_hub_d3d11_auto_2d_on(c->reroute.split);
+	}
+#endif
+	(void)c;
+	return false;
+}
+
+extern "C" bool
 comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
 {
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);

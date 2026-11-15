@@ -310,6 +310,16 @@ bool
 comp_d3d11_compositor_slot_holds_other_screen(struct xrt_compositor *xc);
 
 /*!
+ * #2639: true when the hub this session weaves through runs a legacy session's
+ * automatic 2D (comp_hub_d3d11_auto_2d_on). xrLocateViews then keeps the
+ * per-eye view set whenever the DP reports a collapsed one. Any thread.
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_compositor_legacy_auto_2d_on(struct xrt_compositor *xc);
+
+/*!
  * Get the display dimensions from the display processor.
  *
  * @param xc The compositor.
