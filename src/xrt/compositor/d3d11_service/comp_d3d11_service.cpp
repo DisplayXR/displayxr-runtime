@@ -420,6 +420,11 @@ struct d3d11_service_swapchain
 
 	//! Whether this swapchain was created by the service (vs imported from client)
 	bool service_created;
+
+	//! #2620: round-robin cursor of swapchain_acquire_image, per swapchain (it
+	//! was a function static shared by every swapchain of every client). Zero
+	//! (the create memset) = start at image 0.
+	uint32_t next_acquire_index;
 };
 
 //! #1058: bound on the per-frame input-handle set used to infer the frame
@@ -8821,10 +8826,10 @@ swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_index)
 {
 	struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
 
-	// Simple round-robin for now
-	static uint32_t next_index = 0;
-	*out_index = next_index % sc->image_count;
-	next_index++;
+	// Simple round-robin, per swapchain (#2620: a shared static cursor let
+	// one swapchain's acquires skip images of every other).
+	*out_index = sc->next_acquire_index % sc->image_count;
+	sc->next_acquire_index = (*out_index + 1) % sc->image_count;
 
 	U_LOG_D("[#151] d3d11_service swapchain_acquire_image: index=%u image_count=%u "
 	        "(w=%u h=%u format=%lld bits=0x%x service_created=%d)",
