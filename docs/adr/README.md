@@ -65,3 +65,4 @@
 - [ADR-059](ADR-059-d3d11-hub-compositor-windows.md) — One D3D11 hub compositor on Windows; the per-API in-process compositors become import shims
 - [ADR-060](ADR-060-texture-target-reference-window-binding.md) — A texture target is named by a reference window and a rect; its display processor is windowless
 - [ADR-061](ADR-061-3d-screen-share.md) — 3D screen share — a running app's pre-weave views are a stereo-camera source of kind app
+- [ADR-062](ADR-062-window-visibility-drives-lens-weave-and-session-state.md) — window visibility drives the lens, the weave and the session state — one runtime-owned signal (Proposed)
