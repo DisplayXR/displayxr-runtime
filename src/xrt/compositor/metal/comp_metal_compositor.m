@@ -7183,8 +7183,6 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	mcp_capture_init(&c->mcp_capture);
-	mcp_capture_install(&c->mcp_capture);
 	u_eye_history_init(&c->eye_hist); // N6 Part 1 (#2144)
 
 	int ret = os_mutex_init(&c->mutex);
@@ -7435,6 +7433,12 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	// Native compositor manages its own visibility/focus
 	info->initial_visible = true;
 	info->initial_focused = true;
+
+	// Install MCP capture_frame hook + arm the trigger-file path (#210).
+	// Last, once nothing below can fail (#2623): the hook is a process
+	// global, and an earlier failure return frees c without uninstalling it.
+	mcp_capture_init(&c->mcp_capture);
+	mcp_capture_install(&c->mcp_capture);
 
 	*out_xc = &c->base;
 
