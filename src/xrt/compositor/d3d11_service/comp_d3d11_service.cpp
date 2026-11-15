@@ -15671,12 +15671,9 @@ pipeline_lens_visibility_tick(struct d3d11_service_system *sys,
 		if (dp != nullptr) {
 			(void)DP_REQUEST_DISPLAY_MODE(dp, false);
 		}
-		// ADR-062 D1: the real hardware state, so an app can tell why the
-		// lens went 2D (it made no request; sys->hardware_display_3d keeps
-		// the session's choice).
-		if (sys->hardware_display_3d) {
-			broadcast_hardware_state(sys, false);
-		}
+		// ADR-062 D1: NOT reported as a hardware state change (see
+		// oxr_session_visibility_poll): apps follow that event with their own
+		// mode request, which would make 2D the session's choice for good.
 	} else {
 		g_svc_presenter_hidden.store(false, std::memory_order_release);
 		if (dp != nullptr && sys->hardware_display_3d) {
@@ -15684,9 +15681,6 @@ pipeline_lens_visibility_tick(struct d3d11_service_system *sys,
 		}
 		// The vendor lags the command: keep the poll from counter-correcting.
 		stamp_flip_cooldown(sys, sys->hardware_display_3d);
-		if (sys->hardware_display_3d) {
-			broadcast_hardware_state(sys, true);
-		}
 	}
 	U_LOG_W("#2671 service: presenter window %s, panel lens wish %s", hidden ? "hidden" : "visible (or changed)",
 	        hidden      ? "2D"

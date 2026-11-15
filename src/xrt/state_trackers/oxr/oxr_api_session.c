@@ -1444,6 +1444,7 @@ oxr_xrRequestDisplayModeDXR(XrSession session, XrDisplayModeDXR displayMode)
 	if (window_hidden) {
 		sess->window_hidden_seen = true; // the visible edge reports the 3D
 		if (want_3d && sess->hardware_display_3d && sess->sys->inst->extensions.DXR_display_info) {
+			sess->window_hidden_3d_owed = true;
 			oxr_event_push_XrEventDataDisplayModeRequestDenied(&log, sess, XR_DISPLAY_MODE_INDEX_NONE_DXR,
 			                                                   /*requestedHardware3D=*/1,
 			                                                   XRT_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN);
@@ -1713,6 +1714,7 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 	if (hardware_state_changed && oxr_session_window_hidden(sess)) {
 		sess->window_hidden_seen = true;
 		if (mode->hardware_display_3d) {
+			sess->window_hidden_3d_owed = true;
 			oxr_event_push_XrEventDataDisplayModeRequestDenied(&log, sess, XR_DISPLAY_MODE_INDEX_NONE_DXR,
 			                                                   /*requestedHardware3D=*/1,
 			                                                   XRT_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN);

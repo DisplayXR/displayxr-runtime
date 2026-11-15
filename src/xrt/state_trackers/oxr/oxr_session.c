@@ -1102,6 +1102,14 @@ oxr_session_visibility_poll(struct oxr_logger *log, struct oxr_session *sess)
 		return;
 	}
 	sess->window_hidden_seen = hidden;
+	// A 3D request denied with WINDOW_HIDDEN is owed its answer now: the 3D it
+	// asked for is applied, and this is the app's own request's result.
+	if (!hidden && sess->window_hidden_3d_owed) {
+		sess->window_hidden_3d_owed = false;
+		if (sess->hardware_display_3d && !sess->mono_auto_2d.active) {
+			mono_auto_2d_push_event(log, sess, true);
+		}
+	}
 	// The lens moved only for a session that wants 3D and is not already
 	// flat for another reason (auto-2D holds the panel 2D under its own
 	// events). Never the answer to a request: a 3D request made while hidden
@@ -1109,10 +1117,17 @@ oxr_session_visibility_poll(struct oxr_logger *log, struct oxr_session *sess)
 	if (!sess->hardware_display_3d || sess->mono_auto_2d.active) {
 		return;
 	}
-	U_LOG_W("ADR-062: the session's window is %s - the runtime %s the lens (hardware %s reported; the session's "
-	        "3D choice is kept)",
-	        hidden ? "hidden" : "visible again", hidden ? "drops" : "restores", hidden ? "2D" : "3D");
-	mono_auto_2d_push_event(log, sess, !hidden);
+	/*
+	 * Deliberately NOT reported as a hardware display state change. Apps
+	 * follow that event with their own rendering-mode request (an engine
+	 * provider measured on hardware switched to its 2D mode on the hidden
+	 * edge), which makes 2D the session's own choice, so the visible edge
+	 * restores 2D and the app never returns to 3D. An app that wants to know
+	 * why the lens moved enables XR_DXR_window_visibility and gets its event.
+	 */
+	U_LOG_W("ADR-062: the session's window is %s - the runtime %s the lens (not reported as a hardware state "
+	        "change; the session's 3D choice is kept)",
+	        hidden ? "hidden" : "visible again", hidden ? "drops" : "restores");
 }
 
 void

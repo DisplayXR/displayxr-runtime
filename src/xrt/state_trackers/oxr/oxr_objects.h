@@ -3672,6 +3672,10 @@ struct oxr_session
 	 * compositor restores on return.
 	 */
 	bool window_hidden_seen;
+	//! ADR-062 D1: a 3D request was denied with WINDOW_HIDDEN and is owed its
+	//! answer (a hardware-3D event) when the window is seen again. The only
+	//! visibility edge that is reported as a hardware state change.
+	bool window_hidden_3d_owed;
 
 	//! Active eye tracking mode (0=MANAGED, 1=MANUAL). Default: 0 (MANAGED).
 	uint32_t eye_tracking_mode;
