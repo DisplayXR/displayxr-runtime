@@ -449,6 +449,13 @@ u_window_visibility_get_state(const struct u_window_visibility *wv, struct u_win
 	memset(out, 0, sizeof(*out));
 }
 
+bool
+u_window_visibility_foreground(const struct u_window_visibility *wv)
+{
+	(void)wv;
+	return false;
+}
+
 void
 u_window_visibility_stop(struct u_window_visibility *wv)
 {
