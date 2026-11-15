@@ -1158,9 +1158,11 @@ oxr_xrDestroyWorkspaceClientChromeSwapchainDXR(XrSwapchain swapchain)
 	// swapchain. The runtime is tolerant of a missing entry — if the swapchain
 	// was never registered (e.g. created via xrCreateSwapchain directly), the
 	// unregister is a no-op there. Same _WIN32 gate as the create path.
-	struct xrt_swapchain *inner = workspace_unwrap_client_swapchain(sc->sess, sc->swapchain);
-	uint32_t swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
+	// Only an IPC session's swapchain is an ipc_client swapchain, so check
+	// the session before unwrapping and reading its id.
 	if (session_is_ipc_client(sc->sess)) {
+		struct xrt_swapchain *inner = workspace_unwrap_client_swapchain(sc->sess, sc->swapchain);
+		uint32_t swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
 		(void)comp_ipc_client_compositor_workspace_unregister_chrome_swapchain(
 		    &sc->sess->xcn->base, swapchain_id);
 	}
