@@ -15,10 +15,16 @@
  * are written back to the feeder on the same socket.
  *
  * Threading: one hub thread (accept → handshake → read loop, guarded
- * throughout by 500 ms select() timeouts so `os_thread_helper` can stop
+ * throughout by 500 ms select()/poll() timeouts so `os_thread_helper` can stop
  * it). Button/battery state is mutex-copied into the devices'
  * `update_inputs`; `m_relation_history` is internally thread-safe.
- * Haptic sends take the same mutex (socket writes are small and rare).
+ * Haptic sends take the same mutex (socket writes are small and rare) —
+ * the mutex is what keeps client_fd valid, since the hub thread closes the
+ * socket after run_connection returns. Every send is therefore
+ * non-blocking and signal-free (#2606): a feeder that stops reading must
+ * never park an app thread inside the mutex. A would-block haptic is
+ * dropped and counted; a short write shuts the socket down so the feeder
+ * reconnects with a clean stream.
  *
  * Clock mapping: a non-zero feeder timestamp is translated into the
  * provider's monotonic domain with a latency-floor offset estimate
@@ -45,6 +51,9 @@ typedef SOCKET net_input_socket_t;
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+
+#include <errno.h>
+#include <poll.h>
 typedef int net_input_socket_t;
 #define NET_INPUT_INVALID_SOCKET (-1)
 #endif
@@ -126,6 +135,8 @@ struct net_input_hub
 	//! Diagnostics (u_var).
 	uint64_t state_msg_count;
 	uint64_t haptic_msg_count;
+	//! Haptics not delivered because the feeder's receive window was full.
+	uint64_t haptic_drop_count;
 
 	struct net_input_device *devices[2];
 
@@ -154,13 +165,45 @@ socket_read(net_input_socket_t id, void *ptr, size_t size)
 	return recv(id, (char *)ptr, (int)size, 0);
 }
 
+//! Non-blocking send: the accepted socket is in FIONBIO mode
+//! (socket_configure_client); Winsock never raises SIGPIPE.
 static inline ssize_t
-socket_write(net_input_socket_t id, const void *ptr, size_t size)
+socket_send_nb(net_input_socket_t id, const void *ptr, size_t size)
 {
 	return send(id, (const char *)ptr, (int)size, 0);
 }
 
+static inline bool
+socket_last_error_would_block(void)
+{
+	int err = WSAGetLastError();
+	return err == WSAEWOULDBLOCK || err == WSAEINTR;
+}
+
+static inline void
+socket_shutdown_both(net_input_socket_t id)
+{
+	shutdown(id, SD_BOTH);
+}
+
+//! Put the accepted socket in non-blocking mode; reads stay select-gated.
+static inline void
+socket_configure_client(net_input_socket_t id)
+{
+	u_long mode = 1;
+	if (ioctlsocket(id, FIONBIO, &mode) != 0) {
+		U_LOG_W("net_input: ioctlsocket(FIONBIO) failed (%d).", WSAGetLastError());
+	}
+}
+
 #else
+
+#if defined(MSG_NOSIGNAL)
+#define NET_INPUT_SEND_FLAGS (MSG_DONTWAIT | MSG_NOSIGNAL)
+#else
+// macOS: no MSG_NOSIGNAL; SO_NOSIGPIPE is set on the accepted socket.
+#define NET_INPUT_SEND_FLAGS (MSG_DONTWAIT)
+#endif
 
 static inline void
 socket_close(net_input_socket_t id)
@@ -174,10 +217,36 @@ socket_read(net_input_socket_t id, void *ptr, size_t size)
 	return read(id, ptr, size);
 }
 
+//! Non-blocking, signal-free send (a dead feeder must not SIGPIPE the host).
 static inline ssize_t
-socket_write(net_input_socket_t id, const void *ptr, size_t size)
+socket_send_nb(net_input_socket_t id, const void *ptr, size_t size)
 {
-	return write(id, ptr, size);
+	return send(id, ptr, size, NET_INPUT_SEND_FLAGS);
+}
+
+static inline bool
+socket_last_error_would_block(void)
+{
+	return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+}
+
+static inline void
+socket_shutdown_both(net_input_socket_t id)
+{
+	shutdown(id, SHUT_RDWR);
+}
+
+static inline void
+socket_configure_client(net_input_socket_t id)
+{
+#if defined(SO_NOSIGPIPE)
+	int on = 1;
+	if (setsockopt(id, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on)) != 0) {
+		U_LOG_W("net_input: setsockopt(SO_NOSIGPIPE) failed (%d).", errno);
+	}
+#else
+	(void)id;
+#endif
 }
 
 #endif
@@ -202,11 +271,23 @@ wait_readable_and_running(struct net_input_hub *hub, net_input_socket_t sock)
 
 	int ret = 0;
 	while (os_thread_helper_is_running(&hub->oth) && ret == 0) {
+#if defined(XRT_OS_WINDOWS)
+		// Winsock fd_set is a socket array, not a bitmap: no FD_SETSIZE
+		// bound on the socket value.
 		struct timeval timeout = {.tv_sec = 0, .tv_usec = 500 * 1000};
 		fd_set set;
 		FD_ZERO(&set);
 		FD_SET(sock, &set);
 		ret = select((int)sock + 1, &set, NULL, NULL, &timeout);
+#else
+		// poll(), not select(): FD_SET on a descriptor >= FD_SETSIZE is
+		// undefined behaviour, and a host process can easily own that many.
+		struct pollfd pfd = {.fd = sock, .events = POLLIN, .revents = 0};
+		ret = poll(&pfd, 1, 500);
+		if (ret < 0 && errno == EINTR) {
+			ret = 0;
+		}
+#endif
 	}
 	return ret > 0;
 }
@@ -221,6 +302,9 @@ read_exact(struct net_input_hub *hub, net_input_socket_t sock, void *out, size_t
 			return false;
 		}
 		ssize_t ret = socket_read(sock, (uint8_t *)out + current, size - current);
+		if (ret < 0 && socket_last_error_would_block()) {
+			continue; // spurious wakeup on a non-blocking socket: wait again
+		}
 		if (ret <= 0) {
 			return false;
 		}
@@ -352,7 +436,7 @@ run_connection(struct net_input_hub *hub, net_input_socket_t client)
 {
 	// Handshake: both sides send immediately, then validate the peer's.
 	struct net_input_hello ours = {.magic = NET_INPUT_MAGIC, .version = NET_INPUT_PROTO_VERSION};
-	if (socket_write(client, &ours, sizeof(ours)) != (ssize_t)sizeof(ours)) {
+	if (socket_send_nb(client, &ours, sizeof(ours)) != (ssize_t)sizeof(ours)) {
 		U_LOG_W("net_input: hello write failed.");
 		return;
 	}
@@ -420,6 +504,7 @@ hub_thread(void *ptr)
 			continue;
 		}
 
+		socket_configure_client(client);
 		run_connection(hub, client);
 		socket_close(client);
 	}
@@ -575,9 +660,23 @@ net_input_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, 
 	msg.duration_ns = value->vibration.duration_ns;
 
 	os_mutex_lock(&hub->mutex);
+	// Kept under the mutex (it keeps client_fd valid); the send cannot
+	// block, so the critical section stays bounded.
 	if (hub->connected && hub->client_fd != NET_INPUT_INVALID_SOCKET) {
-		(void)socket_write(hub->client_fd, &msg, sizeof(msg));
-		hub->haptic_msg_count++;
+		ssize_t ret = socket_send_nb(hub->client_fd, &msg, sizeof(msg));
+		if (ret == (ssize_t)sizeof(msg)) {
+			hub->haptic_msg_count++;
+		} else if (ret < 0 && socket_last_error_would_block()) {
+			// Feeder not draining: drop this haptic (counted, no WARN —
+			// this can fire once per app haptic call).
+			hub->haptic_drop_count++;
+		} else {
+			// Short write or hard error: the stream is now misframed.
+			// Shut it down so the hub thread's read fails, it closes the
+			// socket, and the feeder reconnects with a clean stream.
+			hub->haptic_drop_count++;
+			socket_shutdown_both(hub->client_fd);
+		}
 	}
 	os_mutex_unlock(&hub->mutex);
 
@@ -698,6 +797,7 @@ net_input_create_devices(uint16_t port, struct xrt_device **out_left, struct xrt
 	u_var_add_root(hub, "Network Input Hub", true);
 	u_var_add_ro_u64(hub, &hub->state_msg_count, "state_msg_count");
 	u_var_add_ro_u64(hub, &hub->haptic_msg_count, "haptic_msg_count");
+	u_var_add_ro_u64(hub, &hub->haptic_drop_count, "haptic_drop_count");
 	u_var_add_bool(hub, &hub->connected, "connected");
 
 	U_LOG_W("net_input: listening on 127.0.0.1:%u (proto v%u) — feed with scripts/net_input_feeder.py.", hub->port,
