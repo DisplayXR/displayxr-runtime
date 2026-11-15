@@ -436,6 +436,31 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess,
  * IPC client, whose service splices its views) answers false, and the
  * session's own "home unlisted" state stands alone, as before.
  */
+/*!
+ * #2639: does the hub run automatic 2D for this LEGACY session (measured on
+ * the submitted eyes)? Like the mono auto-2D hold it is presentation-only, so
+ * xrLocateViews keeps the per-eye set whenever the DP's is collapsed.
+ * Only the in-process D3D11 / D3D12 tiers weave through that hub.
+ */
+static bool
+oxr_session_legacy_auto_2d_on(struct oxr_session *sess)
+{
+	if (sess == NULL || sess->xcn == NULL) {
+		return false;
+	}
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		return comp_d3d11_compositor_legacy_auto_2d_on(&sess->xcn->base);
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		return comp_d3d12_compositor_legacy_auto_2d_on(&sess->xcn->base);
+	}
+#endif
+	return false;
+}
+
 static bool
 oxr_session_slot_holds_other_screen(struct oxr_session *sess)
 {
@@ -4402,7 +4427,12 @@ locate_views_one(struct oxr_logger *log,
 	// restore the stereo set around it BEFORE the #615 guard below would
 	// duplicate that eye into every view. The raw-eye channel is filled from
 	// this set too, so it stays per-eye as well.
-	if (sess->mono_auto_2d.active && have_eyes &&
+	// The hub's legacy automatic 2D (#2639) decides from the submitted
+	// pictures, so the rule holds for the whole session, not only while it
+	// holds 2D: the DP still reports its one 2D eye for a few hundred ms
+	// after the lens returns to 3D (the tracker wakes up), and flat frames
+	// there send the lens straight back to 2D, about once a second.
+	if ((sess->mono_auto_2d.active || oxr_session_legacy_auto_2d_on(sess)) && have_eyes &&
 	    u_mono_auto_2d_keep_eye_set(&eye_pos, active_view_count, sess->ipd_meters)) {
 		static bool warned_keep_eyes = false;
 		if (!warned_keep_eyes) {
