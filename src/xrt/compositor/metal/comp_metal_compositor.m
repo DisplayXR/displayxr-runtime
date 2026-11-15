@@ -5055,8 +5055,15 @@ comp_metal_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const s
 	c->cursor_draw.req = *req;
 }
 
+/*
+ * #2622: the frame body. Called only from metal_compositor_layer_commit(),
+ * inside its @autoreleasepool — every autoreleased object this creates (the
+ * drawable, command buffers, render pass descriptors, encoders) is drained
+ * at the end of the frame. Anything it keeps past the frame in a struct
+ * field is +1 (new / alloc / retain), never an autoreleased object.
+ */
 static xrt_result_t
-metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
+metal_compositor_layer_commit_frame(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
 	struct comp_metal_compositor *c = metal_comp(xc);
 
@@ -6634,6 +6641,23 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	[zc_raw_view release];
 
 	return XRT_SUCCESS;
+}
+
+/*
+ * #2622: this file is MRR, and layer_commit runs on the app's frame thread,
+ * which typically has no autorelease pool of its own (a plain pthread / a
+ * render thread never drains one). Without a pool here every autoreleased
+ * per-frame Metal object — the CAMetalDrawable from nextDrawable, the
+ * command buffer, render pass descriptors, encoders — is either logged as
+ * "autoreleased with no pool in place" and leaked, or parked in an
+ * outer pool that is never popped. One pool per frame drains them all.
+ */
+static xrt_result_t
+metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
+{
+	@autoreleasepool {
+		return metal_compositor_layer_commit_frame(xc, sync_handle);
+	}
 }
 
 static void
