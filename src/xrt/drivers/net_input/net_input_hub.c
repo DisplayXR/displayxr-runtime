@@ -66,6 +66,7 @@ typedef int net_input_socket_t;
 #include "net_input_proto.h"
 #include "net_input_interface.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -75,6 +76,23 @@ typedef int net_input_socket_t;
  * Structs and defines.
  *
  */
+
+/*!
+ * How far past the newest sample get_tracked_pose() will extrapolate with
+ * the last velocity (mirrors GAMEPAD_EXTRAPOLATE_MAX_NS): a stalled feeder
+ * must not fling the controller along its last velocity.
+ */
+#define NET_INPUT_EXTRAPOLATE_MAX_NS (50LL * 1000 * 1000)
+
+/*!
+ * A newest sample older than this (against the provider's monotonic clock)
+ * is reported VALID but no longer TRACKED: the feeder still claims the hand
+ * is active but has stopped sending poses.
+ */
+#define NET_INPUT_STALE_NS (250LL * 1000 * 1000)
+
+//! Quaternions shorter than this cannot be normalised; the sample is dropped.
+#define NET_INPUT_MIN_QUAT_LEN 1e-6f
 
 // Indices into base.inputs, matching net_input_inputs_array below.
 #define NET_INPUT_SELECT 0
@@ -95,7 +113,9 @@ struct net_input_device
 	//! NET_INPUT_HAND_LEFT / NET_INPUT_HAND_RIGHT.
 	uint8_t hand;
 
-	//! Thread-safe pose buffer, fed by the hub thread.
+	//! Pose buffer, fed by the hub thread. Internally thread-safe; pushes
+	//! and clears happen under hub->mutex (its own mutex is a leaf) so they
+	//! cannot race device destroy.
 	struct m_relation_history *history;
 
 	//! Guarded by hub->mutex.
@@ -122,6 +142,10 @@ struct net_input_hub
 	//! Latency-floor clock-offset estimate (provider_ns - feeder_ns).
 	int64_t clock_offset_ns;
 	bool have_clock_offset;
+
+	//! State messages rejected for non-finite floats or a degenerate
+	//! quaternion (u_var diagnostic).
+	uint64_t state_reject_count;
 
 	//! Diagnostics (u_var).
 	uint64_t state_msg_count;
@@ -291,27 +315,78 @@ map_feeder_timestamp(struct net_input_hub *hub, int64_t feeder_ns, int64_t recv_
 	return feeder_ns + hub->clock_offset_ns;
 }
 
+static bool
+floats_finite(const float *v, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (!isfinite(v[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+state_msg_floats_finite(const struct net_input_state_msg *msg)
+{
+	return floats_finite(msg->position, ARRAY_SIZE(msg->position)) &&
+	       floats_finite(msg->orientation, ARRAY_SIZE(msg->orientation)) &&
+	       floats_finite(msg->linear_velocity, ARRAY_SIZE(msg->linear_velocity)) &&
+	       floats_finite(msg->angular_velocity, ARRAY_SIZE(msg->angular_velocity));
+}
+
 static void
 handle_state_msg(struct net_input_hub *hub, const struct net_input_state_msg *msg, int64_t recv_ns)
 {
 	if (msg->hand > NET_INPUT_HAND_RIGHT) {
 		return;
 	}
+
+	// Validate before touching any state: a feeder bug must not put NaN
+	// into the pose history (it would poison interpolation for every
+	// later query) or an unnormalised quaternion into the app's poses.
+	struct xrt_quat q = {msg->orientation[0], msg->orientation[1], msg->orientation[2], msg->orientation[3]};
+	bool valid = state_msg_floats_finite(msg);
+	if (valid && msg->active != 0) {
+		float len = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+		if (!(len >= NET_INPUT_MIN_QUAT_LEN)) {
+			valid = false;
+		} else {
+			q.x /= len;
+			q.y /= len;
+			q.z /= len;
+			q.w /= len;
+		}
+	}
+
+	// Lookup, state writes and the history push all under the mutex:
+	// net_input_device_destroy() clears hub->devices[hand] under the same
+	// mutex before it frees the device and its history, so a device seen
+	// here stays alive until we unlock.
+	os_mutex_lock(&hub->mutex);
 	struct net_input_device *dev = hub->devices[msg->hand];
 	if (dev == NULL) {
+		os_mutex_unlock(&hub->mutex);
+		return;
+	}
+	if (!valid) {
+		hub->state_reject_count++;
+		os_mutex_unlock(&hub->mutex);
 		return;
 	}
 
-	os_mutex_lock(&hub->mutex);
 	dev->active = msg->active != 0;
 	dev->btn_select = (msg->buttons & NET_INPUT_BUTTON_SELECT_BIT) != 0;
 	dev->btn_menu = (msg->buttons & NET_INPUT_BUTTON_MENU_BIT) != 0;
 	dev->battery_pct = msg->battery_pct;
 	hub->state_msg_count++;
 	int64_t ts = map_feeder_timestamp(hub, msg->timestamp_ns, recv_ns);
-	os_mutex_unlock(&hub->mutex);
 
 	if (msg->active == 0) {
+		// Inactive: drop the old track so reactivation never interpolates
+		// from (or extrapolates past) a stale pose.
+		m_relation_history_clear(dev->history);
+		os_mutex_unlock(&hub->mutex);
 		return;
 	}
 
@@ -319,10 +394,7 @@ handle_state_msg(struct net_input_hub *hub, const struct net_input_state_msg *ms
 	rel.pose.position.x = msg->position[0];
 	rel.pose.position.y = msg->position[1];
 	rel.pose.position.z = msg->position[2];
-	rel.pose.orientation.x = msg->orientation[0];
-	rel.pose.orientation.y = msg->orientation[1];
-	rel.pose.orientation.z = msg->orientation[2];
-	rel.pose.orientation.w = msg->orientation[3];
+	rel.pose.orientation = q;
 	rel.linear_velocity.x = msg->linear_velocity[0];
 	rel.linear_velocity.y = msg->linear_velocity[1];
 	rel.linear_velocity.z = msg->linear_velocity[2];
@@ -335,6 +407,7 @@ handle_state_msg(struct net_input_hub *hub, const struct net_input_state_msg *ms
 	    XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
 
 	m_relation_history_push(dev->history, &rel, ts);
+	os_mutex_unlock(&hub->mutex);
 }
 
 /*!
@@ -395,6 +468,7 @@ run_connection(struct net_input_hub *hub, net_input_socket_t client)
 	for (int i = 0; i < 2; i++) {
 		if (hub->devices[i] != NULL) {
 			hub->devices[i]->active = false;
+			m_relation_history_clear(hub->devices[i]->history);
 		}
 	}
 	os_mutex_unlock(&hub->mutex);
@@ -537,13 +611,43 @@ net_input_device_get_tracked_pose(struct xrt_device *xdev,
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 
-	struct xrt_space_relation rel = {0};
-	enum m_relation_history_result res = m_relation_history_get(dev->history, at_timestamp_ns, &rel);
-	if (res == M_RELATION_HISTORY_RESULT_INVALID) {
-		// No samples yet (feeder never connected / hand inactive).
+	os_mutex_lock(&dev->hub->mutex);
+	bool active = dev->active;
+	os_mutex_unlock(&dev->hub->mutex);
+
+	// Inactive hand, or no samples yet (feeder never connected / history
+	// cleared): nothing to report.
+	int64_t newest_ns = 0;
+	struct xrt_space_relation newest = {0};
+	if (!active || !m_relation_history_get_latest(dev->history, &newest_ns, &newest)) {
+		U_ZERO(out_relation);
 		out_relation->pose = (struct xrt_pose)XRT_POSE_IDENTITY;
 		out_relation->relation_flags = 0;
 		return XRT_SUCCESS;
+	}
+
+	// Bounded forward extrapolation (mirrors GAMEPAD_EXTRAPOLATE_MAX_NS).
+	int64_t at_ns = at_timestamp_ns;
+	if (at_ns - newest_ns > NET_INPUT_EXTRAPOLATE_MAX_NS) {
+		at_ns = newest_ns + NET_INPUT_EXTRAPOLATE_MAX_NS;
+	}
+
+	struct xrt_space_relation rel = {0};
+	enum m_relation_history_result res = m_relation_history_get(dev->history, at_ns, &rel);
+	if (res == M_RELATION_HISTORY_RESULT_INVALID) {
+		U_ZERO(out_relation);
+		out_relation->pose = (struct xrt_pose)XRT_POSE_IDENTITY;
+		out_relation->relation_flags = 0;
+		return XRT_SUCCESS;
+	}
+
+	// The feeder says "active" but has stopped sending: keep the last pose
+	// VALID (the controller does not vanish) but stop claiming TRACKED.
+	int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	if (now_ns - newest_ns > NET_INPUT_STALE_NS) {
+		rel.relation_flags =
+		    (enum xrt_space_relation_flags)(rel.relation_flags & ~(XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+		                                                           XRT_SPACE_RELATION_POSITION_TRACKED_BIT));
 	}
 
 	*out_relation = rel;
@@ -696,6 +800,7 @@ net_input_create_devices(uint16_t port, struct xrt_device **out_left, struct xrt
 	}
 
 	u_var_add_root(hub, "Network Input Hub", true);
+	u_var_add_ro_u64(hub, &hub->state_reject_count, "state_reject_count");
 	u_var_add_ro_u64(hub, &hub->state_msg_count, "state_msg_count");
 	u_var_add_ro_u64(hub, &hub->haptic_msg_count, "haptic_msg_count");
 	u_var_add_bool(hub, &hub->connected, "connected");
