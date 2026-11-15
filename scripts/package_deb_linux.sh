@@ -365,7 +365,8 @@ cat > "$STAGE/usr/lib/displayxr/plugins/200-sim-display.json" <<EOF
         "vendor":       "DisplayXR",
         "version":      "$VERSION",
         "binary_path":  "/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so",
-        "probe_order":  200
+        "probe_order":  200,
+        "sandbox":      {}
     }
 }
 EOF

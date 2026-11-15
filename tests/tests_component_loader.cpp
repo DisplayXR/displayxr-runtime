@@ -190,6 +190,32 @@ TEST_CASE("component loader: optional manifest fields default sensibly", "[compo
 	CHECK(e->reason[0] != '\0');
 }
 
+TEST_CASE("component loader: plugin.sandbox is optional, checked, and flagged when declared", "[component_loader]")
+{
+	const Class cls = plain_class("xrtTestNegotiate", 3);
+	std::unique_ptr<Entry> e(new Entry);
+
+	// Absent: no flag (the plug-in has not said what it needs inside a container).
+	REQUIRE(target_component_parse_manifest_json(
+	    &cls, R"({"file_format_version":"1.0","plugin":{"id":"a","binary_path":"/a.so"}})", "/x/a.json", e.get()));
+	CHECK((e->flags & TARGET_COMPONENT_FLAG_SANDBOX) == 0u);
+
+	// Empty object: declared, needs nothing.
+	REQUIRE(target_component_parse_manifest_json(
+	    &cls, R"({"file_format_version":"1.0","plugin":{"id":"b","binary_path":"/b.so","sandbox":{}}})",
+	    "/x/b.json", e.get()));
+	CHECK((e->flags & TARGET_COMPONENT_FLAG_SANDBOX) != 0u);
+	CHECK((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) == 0u);
+
+	// Full block: paths, environment, host libraries; unknown keys are tolerated (forward compatible).
+	const char *full = R"({"file_format_version":"1.0","plugin":{"id":"c","binary_path":"/c.so","sandbox":{
+	    "filesystems":["/opt/acme","/run/acme"],"env":{"ACME_RUNTIME":"/opt/acme/lib/libacme.so"},
+	    "host_libraries":["libfoo.so.2"],"future_key":42}}})";
+	REQUIRE(target_component_parse_manifest_json(&cls, full, "/x/c.json", e.get()));
+	CHECK((e->flags & TARGET_COMPONENT_FLAG_SANDBOX) != 0u);
+	CHECK(std::string(e->binary_path) == "/c.so");
+}
+
 TEST_CASE("component loader: malformed manifests are rejected with a reason", "[component_loader]")
 {
 	const Class cls = plain_class("xrtTestNegotiate", 3);
@@ -216,6 +242,24 @@ TEST_CASE("component loader: malformed manifests are rejected with a reason", "[
 	     R"({"file_format_version":"1.0","plugin":{"id":"e","binary_path":"/a.so","enabled":"yes"}})", "e"},
 	    {"settings not object",
 	     R"({"file_format_version":"1.0","plugin":{"id":"t","binary_path":"/a.so","settings":[1]}})", "t"},
+	    // plugin.sandbox (plugin-discovery.md §3.1a): optional, but checked when present.
+	    {"sandbox not object",
+	     R"({"file_format_version":"1.0","plugin":{"id":"x1","binary_path":"/a.so","sandbox":true}})", "x1"},
+	    {"sandbox filesystems not array",
+	     R"({"file_format_version":"1.0","plugin":{"id":"x2","binary_path":"/a.so","sandbox":{"filesystems":"/opt"}}})",
+	     "x2"},
+	    {"sandbox relative filesystem",
+	     R"({"file_format_version":"1.0","plugin":{"id":"x3","binary_path":"/a.so","sandbox":{"filesystems":["opt/x"]}}})",
+	     "x3"},
+	    {"sandbox env value not string",
+	     R"({"file_format_version":"1.0","plugin":{"id":"x4","binary_path":"/a.so","sandbox":{"env":{"A":1}}}})",
+	     "x4"},
+	    {"sandbox env not object",
+	     R"({"file_format_version":"1.0","plugin":{"id":"x5","binary_path":"/a.so","sandbox":{"env":["A=1"]}}})",
+	     "x5"},
+	    {"sandbox host library is a path",
+	     R"({"file_format_version":"1.0","plugin":{"id":"x6","binary_path":"/a.so","sandbox":{"host_libraries":["/usr/lib/libz.so.1"]}}})",
+	     "x6"},
 	    // Nothing resolves binary_path against the manifest's directory, so a
 	    // relative one would be searched for by dlopen (ADR-054 N4b review).
 	    {"bare binary name", R"({"file_format_version":"1.0","plugin":{"id":"r1","binary_path":"libacme.so"}})",

@@ -226,7 +226,8 @@ cat > "$PLUGIN_DIR/200-sim-display.json" <<EOF
         "vendor":       "DisplayXR",
         "version":      "dev",
         "binary_path":  "$PLUGIN_DIR/DisplayXR-SimDisplay.so",
-        "probe_order":  200
+        "probe_order":  200,
+        "sandbox":      {}
     }
 }
 EOF

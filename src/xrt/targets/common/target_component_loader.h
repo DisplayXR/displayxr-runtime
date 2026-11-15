@@ -169,6 +169,7 @@ target_plugin_build_discovery_roots(char roots[][PATH_MAX], int max_roots);
 #define TARGET_COMPONENT_FLAG_MALFORMED (1u << 1)       //!< row / manifest unusable; see `reason`
 #define TARGET_COMPONENT_FLAG_PROBE_ORDER_TIE (1u << 2) //!< shares its ProbeOrder with a neighbour; id broke the tie
 #define TARGET_COMPONENT_FLAG_USER_OVERLAY (1u << 3)    //!< `enabled` came from the per-user (HKCU) overlay (N3a)
+#define TARGET_COMPONENT_FLAG_SANDBOX (1u << 4)         //!< the POSIX manifest declares `plugin.sandbox` (§3.1a)
 
 //! One `Settings\<KEY>` value (Windows) / "settings" member (POSIX), as a string.
 struct target_component_setting
