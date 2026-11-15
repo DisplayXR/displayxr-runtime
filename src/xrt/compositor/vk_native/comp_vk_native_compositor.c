@@ -175,6 +175,8 @@
 // #116), so the post-weave Local2D composite must flatten too instead of
 // emitting DWM-dependent alpha.
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
+//! Restore the old per-frame generation bump on the split/hub zone publish (A/B only).
+DEBUG_GET_ONCE_BOOL_OPTION(vk_zone_wish_seq_perframe, "DXR_ZONE_WISH_SEQ_PERFRAME", false)
 // #862 — clip the Local2D composite to the pixels where it is not the
 // identity. On by default; DXR_L2D_CLIP=0 restores the full-region pass for
 // A/B measurement (the win is GPU fill, so compare GPU busy time, not the
@@ -1819,6 +1821,10 @@ struct comp_vk_native_compositor
 	//! NOT per frame (VK re-rasters the wish in-cmd every zones frame;
 	//! identical content keeps its generation so vendors evaluate once).
 	uint64_t zone_publish_seq;
+	//! Split/hub route: content signature of the last published zone wish, so
+	//! zone_publish_seq advances on a CONTENT change only (0 = no wish standing).
+	//! See vk_split_wish_content_sig.
+	uint64_t split_wish_content_sig;
 	//! True while this client's mask is published to the DP — drives the
 	//! clear-on-deactivate edge.
 	bool zone_published;
@@ -19955,6 +19961,52 @@ vk_split_raster_frame_mask(struct comp_vk_native_compositor *c, int32_t proj_idx
 }
 
 /*!
+ * The split/hub route's zone-wish CONTENT signature: the generation the vendor
+ * evaluates must advance when the published geometry changes, and only then.
+ *
+ * This route used to bump zone_publish_seq on every frame. The publish contract
+ * is "republish every frame (the screen anchor rides it), advance the generation
+ * on a content change": a vendor reads the wish back once per generation, and a
+ * non-blocking reader that restarts its readback for each new generation never
+ * finishes one when every frame is new, so the wish was never evaluated and the
+ * lens never followed the zones (the D3D12 reroute's same bug, fixed there with
+ * d3d12_reroute_wish_content_sig; this mirrors it).
+ *
+ * Covers both sources unconditionally: the app-authored plane's content key, and
+ * the auto raster's kind, region and zone rects. NOT the screen anchor (it rides
+ * every publish) and NOT the feather (a composite-only cosmetic; the published
+ * wish is binary). A change in the source the publish does not take mints one
+ * redundant generation, which costs one evaluation; the reverse could leave stale
+ * geometry, so the bias is deliberate.
+ */
+static uint64_t
+vk_split_wish_content_sig(struct comp_vk_native_compositor *c,
+                          uint64_t plane_key,
+                          uint32_t mask_kind,
+                          uint32_t region_w,
+                          uint32_t region_h)
+{
+	uint64_t h = 1469598103934665603ull; // FNV-1a 64 offset basis
+#define WISH_MIX(v) (h = (h ^ (uint64_t)(v)) * 1099511628211ull)
+	WISH_MIX(plane_key);
+	WISH_MIX(mask_kind);
+	WISH_MIX(region_w);
+	WISH_MIX(region_h);
+	for (uint32_t i = 0; i < c->layer_accum.layer_count && i < XRT_MAX_LAYERS; i++) {
+		if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+			continue;
+		}
+		const struct xrt_rect *r = &c->layer_accum.layers[i].data.zone_3d.rect;
+		WISH_MIX((uint32_t)r->offset.w);
+		WISH_MIX((uint32_t)r->offset.h);
+		WISH_MIX((uint32_t)r->extent.w);
+		WISH_MIX((uint32_t)r->extent.h);
+	}
+#undef WISH_MIX
+	return h != 0 ? h : 1; // 0 = no wish standing
+}
+
+/*!
  * Neither plane transports this frame. The recipe then stamps both invalid,
  * which is the honest answer — a slot must never claim pixels it does not have.
  */
@@ -20312,9 +20364,18 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 * rasters one mask per frame.
 	 */
 	if (c->zones_frame && (mask_ok || mask_kind == COMP_HUB_D3D11_MASK_ZONE_BINARY)) {
-		c->zone_publish_seq++;
+		// Publish every frame (the anchor rides it); advance the generation only
+		// on a content change (vk_split_wish_content_sig).
+		const uint64_t sig = vk_split_wish_content_sig(c, mask_ok ? vk_mask_plane_seq(&plmask, amask) : 0,
+		                                               mask_kind, region_w, region_h);
+		if (sig != c->split_wish_content_sig || debug_get_bool_option_vk_zone_wish_seq_perframe()) {
+			c->split_wish_content_sig = sig;
+			c->zone_publish_seq++;
+		}
 		comp_hub_d3d11_publish_zone_wish(c->split, c->zone_publish_seq);
 	} else if (!c->zones_frame) {
+		// Withdrawn, not unchanged: the next wish is a new generation.
+		c->split_wish_content_sig = 0;
 		comp_hub_d3d11_clear_zone_wish(c->split);
 	}
 }
