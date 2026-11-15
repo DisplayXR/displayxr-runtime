@@ -30,6 +30,7 @@
 #include "util/u_color_encoding.h"
 #include "util/u_logging.h"
 #include "util/u_window_visibility.h"
+#include "util/u_window_visibility_report.h"
 #include "util/u_setting.h"
 #include "util/u_weave_scope.h"
 #include "util/u_tracking_any.h"
@@ -4658,6 +4659,10 @@ struct d3d11_multi_compositor
 	bool lens_hidden_applied;             //!< the hidden gate is engaged
 	//! ADR-062 D3 (tier 2): the default policy's skipped-weave ledger (render thread).
 	struct u_window_visibility_skip t2;
+	//! ADR-062 D4 (tier 3): the client last told about its window, and what
+	//! it was told (XRT_SESSION_EVENT_WINDOW_VISIBILITY_CHANGE; render thread).
+	struct d3d11_service_compositor *wv_fc;
+	struct u_wv_report wv_sent;
 	//! @}
 
 	//! Phase 2.K: focused-slot value last seen by the public-API drain. The
@@ -15688,6 +15693,83 @@ pipeline_lens_visibility_tick(struct d3d11_service_system *sys,
 	                    : (sys->hardware_display_3d ? "the session's 3D" : "the session's 2D"));
 }
 
+//! ADR-062 D4: one window-visibility event to @p c's session.
+static void
+push_window_visibility(struct d3d11_service_compositor *c, const struct u_wv_report *r)
+{
+	if (c == nullptr || c->xses == nullptr) {
+		return;
+	}
+	union xrt_session_event xse = {};
+	xse.window_visibility.type = XRT_SESSION_EVENT_WINDOW_VISIBILITY_CHANGE;
+	xse.window_visibility.visible = r->visible;
+	xse.window_visibility.foreground = r->foreground;
+	xse.window_visibility.reason = (uint32_t)r->reason;
+	xse.window_visibility.timestamp_ns = (int64_t)(r->since_ns != 0 ? r->since_ns : os_monotonic_get_ns());
+	(void)xrt_session_event_sink_push(c->xses, &xse);
+}
+
+/*!
+ * ADR-062 D4 (tier 3, XR_DXR_window_visibility): tell the presenter's session
+ * what the default policy sees of its window — visible or not, why, and
+ * whether it is the OS foreground window (the client decides the demotion:
+ * the opt-in and its guards live in the state tracker). Render thread, under
+ * render_mutex, after @ref pipeline_lens_visibility_tick with the same @p hwnd
+ * (NULL: the policy does not apply). Never under a workspace controller.
+ *
+ * Pushes on a change the app would hear (visibility, reason) and, while
+ * hidden, on a foreground change (the guard). A client that stops being the
+ * presenter after it was told "hidden" is told "visible", so it is never left
+ * demoted. One short shared lock per tick; the foreground fact only while
+ * hidden.
+ */
+static void
+pipeline_window_visibility_event_tick(struct d3d11_service_system *sys,
+                                      struct d3d11_multi_compositor *mc,
+                                      struct d3d11_service_compositor *fc,
+                                      HWND hwnd)
+{
+	struct d3d11_service_compositor *target =
+	    (hwnd != nullptr && !sys->workspace_mode && mc->lens_vis != nullptr) ? fc : nullptr;
+	if (target != mc->wv_fc) {
+		struct d3d11_service_compositor *old = mc->wv_fc;
+		if (old != nullptr && !mc->wv_sent.visible) {
+			bool alive = false;
+			for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS && !alive; i++) {
+				alive = mc->clients[i].active && mc->clients[i].compositor == old;
+			}
+			if (alive) {
+				struct u_wv_report vis = {};
+				vis.tracked = true;
+				vis.visible = true;
+				vis.reason = XRT_WINDOW_VISIBILITY_REASON_VISIBLE;
+				push_window_visibility(old, &vis);
+				U_LOG_W("ADR-062 service: the client told its window was hidden is no longer judged "
+				        "(presenter changed or a controller took the panel) - told visible");
+			}
+		}
+		mc->wv_fc = target;
+		mc->wv_sent = {};
+		mc->wv_sent.visible = true;
+		mc->wv_sent.reason = XRT_WINDOW_VISIBILITY_REASON_VISIBLE;
+	}
+	if (target == nullptr) {
+		return;
+	}
+	struct u_wv_report r;
+	u_wv_report_get(mc->lens_vis, &r);
+	if (!r.tracked) {
+		return;
+	}
+	const bool same = u_wv_report_same_for_app(&r, &mc->wv_sent) &&
+	                  (r.visible || r.foreground == mc->wv_sent.foreground);
+	if (same) {
+		return;
+	}
+	push_window_visibility(target, &r);
+	mc->wv_sent = r;
+}
+
 /*!
  * ADR-062 D3: the %TEMP% workspace_screenshot trigger while the presenter is
  * hidden on every screen. Nothing is woven, so there is no post-weave back
@@ -15863,6 +15945,8 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		                    (kind == PRESENTER_APP_HWND || kind == PRESENTER_SERVICE_WINDOW ||
 		                     kind == PRESENTER_CLIENT_TEXTURE);
 		pipeline_lens_visibility_tick(sys, mc, fc, policy ? present_hwnd : nullptr);
+		// ADR-062 D4: tell the presenter's session (XR_DXR_window_visibility).
+		pipeline_window_visibility_event_tick(sys, mc, fc, policy ? present_hwnd : nullptr);
 	}
 
 	/* (d) The service window is visible only while it IS the presenter — under

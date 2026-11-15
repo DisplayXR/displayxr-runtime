@@ -8919,6 +8919,12 @@ comp_d3d12_compositor_window_hidden(struct xrt_compositor *xc)
 	return xc != nullptr && u_window_visibility_hidden(d3d12_comp(xc)->visibility);
 }
 
+extern "C" const struct u_window_visibility *
+comp_d3d12_compositor_window_visibility(struct xrt_compositor *xc)
+{
+	return xc != nullptr ? d3d12_comp(xc)->visibility : nullptr;
+}
+
 extern "C" bool
 comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
 {

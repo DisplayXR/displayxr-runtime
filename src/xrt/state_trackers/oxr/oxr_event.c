@@ -159,6 +159,12 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		XrEventDataDisplayModeRequestDeniedDXR *denied = (XrEventDataDisplayModeRequestDeniedDXR *)type;
 		return denied->session == session;
 	}
+#ifdef OXR_HAVE_DXR_window_visibility
+	case XR_TYPE_EVENT_DATA_WINDOW_VISIBILITY_CHANGED_DXR: {
+		XrEventDataWindowVisibilityChangedDXR *changed = (XrEventDataWindowVisibilityChangedDXR *)type;
+		return changed->session == session;
+	}
+#endif
 #ifdef OXR_HAVE_DXR_local_3d_zone
 	case XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_DXR: {
 		XrEventDataLocal3DZoneViewSizeChangedDXR *changed = (XrEventDataLocal3DZoneViewSizeChangedDXR *)type;
@@ -520,6 +526,39 @@ oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
 
 	return XR_SUCCESS;
 }
+
+#ifdef OXR_HAVE_DXR_window_visibility
+XrResult
+oxr_event_push_XrEventDataWindowVisibilityChangedDXR(struct oxr_logger *log,
+                                                     struct oxr_session *sess,
+                                                     XrBool32 visible,
+                                                     XrWindowVisibilityReasonDXR reason,
+                                                     XrTime time)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataWindowVisibilityChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_WINDOW_VISIBILITY_CHANGED_DXR;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->visible = visible;
+	changed->reason = reason;
+	changed->time = time;
+	event->result = XR_SUCCESS;
+
+	// An edge of a debounced verdict, never per frame.
+	U_LOG_W("OXR EVENT: Window visibility changed: visible=%d reason=%d (ADR-062)", (int)visible, (int)reason);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif
 
 XrResult
 oxr_event_push_XrEventDataDisplaysChangedDXR(struct oxr_logger *log, struct oxr_session *sess, uint32_t displayCount)

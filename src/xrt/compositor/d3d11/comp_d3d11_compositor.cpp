@@ -11750,6 +11750,12 @@ comp_d3d11_compositor_window_hidden(struct xrt_compositor *xc)
 	return xc != nullptr && u_window_visibility_hidden(d3d11_comp(xc)->visibility);
 }
 
+extern "C" const struct u_window_visibility *
+comp_d3d11_compositor_window_visibility(struct xrt_compositor *xc)
+{
+	return xc != nullptr ? d3d11_comp(xc)->visibility : nullptr;
+}
+
 extern "C" void
 comp_d3d11_compositor_set_screens(struct xrt_compositor *xc,
                                   const struct xrt_screen_list *list,

@@ -1130,6 +1130,140 @@ oxr_session_visibility_poll(struct oxr_logger *log, struct oxr_session *sess)
 	        hidden ? "hidden" : "visible again", hidden ? "drops" : "restores");
 }
 
+/*
+ *
+ * ADR-062 D4 (tier 3): XR_DXR_window_visibility.
+ *
+ */
+
+static const char *
+window_visibility_reason_str(enum xrt_window_visibility_reason r)
+{
+	switch (r) {
+	case XRT_WINDOW_VISIBILITY_REASON_VISIBLE: return "visible";
+	case XRT_WINDOW_VISIBILITY_REASON_MINIMIZED: return "minimized";
+	case XRT_WINDOW_VISIBILITY_REASON_CLOAKED: return "cloaked";
+	case XRT_WINDOW_VISIBILITY_REASON_COVERED: return "covered";
+	case XRT_WINDOW_VISIBILITY_REASON_NOT_SHOWN: return "not-shown";
+	case XRT_WINDOW_VISIBILITY_REASON_LOCKED: return "locked";
+	case XRT_WINDOW_VISIBILITY_REASON_DISPLAY_OFF: return "display-off";
+	case XRT_WINDOW_VISIBILITY_REASON_WINDOW_HIDDEN: return "window-hidden";
+	default: return "unknown";
+	}
+}
+
+void
+oxr_session_window_visibility_init(struct oxr_logger *log, struct oxr_session *sess, const XrSessionCreateInfo *createInfo)
+{
+	(void)log;
+	(void)createInfo;
+	memset(&sess->window_visibility, 0, sizeof(sess->window_visibility));
+	sess->window_visibility.last.visible = true;
+	sess->window_visibility.last.reason = XRT_WINDOW_VISIBILITY_REASON_VISIBLE;
+	// AppContainer (WebXR) sessions keep their own state shortcut: untouched.
+	if (sess->is_appcontainer) {
+		return;
+	}
+#ifdef OXR_HAVE_DXR_window_visibility
+	if (sess->sys->inst->extensions.DXR_window_visibility) {
+		sess->window_visibility.active = true;
+		sess->window_visibility.events = true;
+		const XrSessionWindowVisibilityInfoDXR *info = OXR_GET_INPUT_FROM_CHAIN(
+		    createInfo, XR_TYPE_SESSION_WINDOW_VISIBILITY_INFO_DXR, XrSessionWindowVisibilityInfoDXR);
+		sess->window_visibility.opted_in = info != NULL && info->demoteWhenHidden == XR_TRUE;
+		U_LOG_W("XR_DXR_window_visibility: window visibility events on; demotion to SYNCHRONIZED while hidden %s",
+		        sess->window_visibility.opted_in ? "opted in (never while foreground, never before first shown)"
+		                                         : "not asked for");
+	}
+#endif
+	if (!sess->window_visibility.opted_in) {
+		sess->window_visibility.force = u_wv_demote_force_get();
+		if (sess->window_visibility.force != U_WV_DEMOTE_FORCE_OFF) {
+			sess->window_visibility.active = true;
+			U_LOG_W("ADR-062 TEST LEVER %s=%s is ON: this session is demoted to SYNCHRONIZED while its window is "
+			        "%s, although it did not opt in (never while foreground, never before first shown). A "
+			        "compatibility test lever, not a feature: turn it off when done.",
+			        U_WINDOW_VISIBILITY_ENV_DEMOTE_FORCE, u_wv_demote_force_str(sess->window_visibility.force),
+			        sess->window_visibility.force == U_WV_DEMOTE_FORCE_MINIMIZE ? "minimized" : "hidden");
+		}
+	}
+}
+
+void
+oxr_session_window_visibility_apply(struct oxr_logger *log, struct oxr_session *sess, const struct u_wv_report *r)
+{
+	if (!sess->window_visibility.active || r == NULL) {
+		return;
+	}
+	struct u_wv_report *last = &sess->window_visibility.last;
+	if (!u_wv_report_same_for_app(last, r)) {
+#ifdef OXR_HAVE_DXR_window_visibility
+		if (sess->window_visibility.events) {
+			// The tracker's transition time for an edge; now for a reason
+			// that changed while the window stayed hidden.
+			const uint64_t when =
+			    (r->since_ns != 0 && r->since_ns != last->since_ns) ? r->since_ns : os_monotonic_get_ns();
+			oxr_event_push_XrEventDataWindowVisibilityChangedDXR(
+			    log, sess, r->visible ? XR_TRUE : XR_FALSE, (XrWindowVisibilityReasonDXR)r->reason,
+			    time_state_monotonic_to_ts_ns(sess->sys->inst->timekeeping, when));
+		}
+#endif
+	}
+	*last = *r;
+	const bool demote =
+	    u_wv_report_should_demote(sess->window_visibility.opted_in, sess->window_visibility.force, r);
+	if (demote != sess->window_visibility.demoted) {
+		sess->window_visibility.demoted = demote;
+		U_LOG_W("ADR-062: session %s (window %s, %s%s)",
+		        demote ? "demoted: held at SYNCHRONIZED, shouldRender false"
+		               : "released: back to VISIBLE then FOCUSED",
+		        r->visible ? "visible" : "hidden", window_visibility_reason_str(r->reason),
+		        r->foreground ? ", foreground" : "");
+	}
+}
+
+void
+oxr_session_window_visibility_poll(struct oxr_logger *log, struct oxr_session *sess)
+{
+	if (!sess->window_visibility.active || sess->xcn == NULL) {
+		return;
+	}
+	const struct u_window_visibility *wv = NULL;
+	bool native = false;
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		native = true;
+		wv = comp_d3d11_compositor_window_visibility(&sess->xcn->base);
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		native = true;
+		wv = comp_d3d12_compositor_window_visibility(&sess->xcn->base);
+	}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor) {
+		native = true;
+		wv = comp_gl_compositor_window_visibility(&sess->xcn->base);
+	}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		native = true;
+		wv = comp_vk_native_compositor_window_visibility(&sess->xcn->base);
+	}
+#endif
+	// Out-of-process sessions hear the service's events instead; an
+	// in-process session without a tracked window stays visible.
+	if (!native || (wv == NULL && !sess->window_visibility.last.tracked)) {
+		return;
+	}
+	struct u_wv_report r;
+	u_wv_report_get(wv, &r);
+	oxr_session_window_visibility_apply(log, sess, &r);
+}
+
 void
 oxr_session_mono_auto_2d_frame(struct oxr_logger *log,
                                struct oxr_session *sess,
@@ -2123,6 +2257,17 @@ skip_macos_pump:
 			sess->compositor_visible = xse.state.visible;
 			sess->compositor_focused = xse.state.focused;
 			break;
+		case XRT_SESSION_EVENT_WINDOW_VISIBILITY_CHANGE: {
+			// ADR-062 D4: the service's default policy judged the presenter.
+			struct u_wv_report r = {0};
+			r.tracked = true;
+			r.visible = xse.window_visibility.visible;
+			r.foreground = xse.window_visibility.foreground;
+			r.reason = (enum xrt_window_visibility_reason)xse.window_visibility.reason;
+			r.since_ns = (uint64_t)xse.window_visibility.timestamp_ns;
+			oxr_session_window_visibility_apply(log, sess, &r);
+			break;
+		}
 		case XRT_SESSION_EVENT_OVERLAY_CHANGE:
 #ifdef OXR_HAVE_EXTX_overlay
 			oxr_event_push_XrEventDataMainSessionVisibilityChangedEXTX(log, sess, xse.overlay.visible);
@@ -2279,6 +2424,15 @@ skip_macos_pump:
 		}
 	}
 
+	// ADR-062 D4: the in-process window-visibility verdict (a no-op unless
+	// XR_DXR_window_visibility or the test lever covers the session).
+	oxr_session_window_visibility_poll(log, sess);
+
+	// A demoted session (ADR-062 D4) reads as neither visible nor focused:
+	// FOCUSED -> VISIBLE -> SYNCHRONIZED in this poll, and back on release.
+	const bool comp_visible = sess->compositor_visible && !sess->window_visibility.demoted;
+	const bool comp_focused = sess->compositor_focused && !sess->window_visibility.demoted;
+
 	// For AppContainer apps, delay VISIBLE/FOCUSED until the poll AFTER SYNCHRONIZED.
 	if (sess->is_appcontainer && sess->state == XR_SESSION_STATE_SYNCHRONIZED) {
 		if (sess->appcontainer_synchronized_polled) {
@@ -2288,22 +2442,22 @@ skip_macos_pump:
 		} else {
 			sess->appcontainer_synchronized_polled = true;
 		}
-	} else if (!sess->is_appcontainer && sess->state == XR_SESSION_STATE_SYNCHRONIZED && sess->compositor_visible) {
+	} else if (!sess->is_appcontainer && sess->state == XR_SESSION_STATE_SYNCHRONIZED && comp_visible) {
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
 	}
 
-	if (sess->state == XR_SESSION_STATE_VISIBLE && sess->compositor_focused && !sess->is_appcontainer) {
+	if (sess->state == XR_SESSION_STATE_VISIBLE && comp_focused && !sess->is_appcontainer) {
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
 	} else if (sess->is_appcontainer && sess->state == XR_SESSION_STATE_VISIBLE && sess->compositor_focused) {
 		// AppContainer: deliver FOCUSED right after VISIBLE
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
 	}
 
-	if (sess->state == XR_SESSION_STATE_FOCUSED && !sess->compositor_focused) {
+	if (sess->state == XR_SESSION_STATE_FOCUSED && !comp_focused) {
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
 	}
 
-	if (sess->state == XR_SESSION_STATE_VISIBLE && !sess->compositor_visible) {
+	if (sess->state == XR_SESSION_STATE_VISIBLE && !comp_visible) {
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
 	}
 
@@ -8630,6 +8784,9 @@ oxr_session_create(struct oxr_logger *log,
 #else
 	sess->is_appcontainer = false;
 #endif
+
+	// ADR-062 D4: XR_DXR_window_visibility opt-in and the test lever.
+	oxr_session_window_visibility_init(log, sess, createInfo);
 
 	// Initialize compositor visibility/focus from compositor info (IPC long-term fix)
 	// This eliminates the race condition where events must be polled before flags are set

@@ -718,6 +718,21 @@
 
 
 /*
+ * XR_DXR_window_visibility
+ *
+ * Hand-added DisplayXR extension (ADR-062 D4). No entry points: an event and
+ * an optional next-chain input on XrSessionCreateInfo.
+ */
+#if defined(XR_DXR_window_visibility)
+#define OXR_HAVE_DXR_window_visibility
+#define OXR_EXTENSION_SUPPORT_DXR_window_visibility(_) \
+    _(DXR_window_visibility, DXR_WINDOW_VISIBILITY)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_window_visibility(_)
+#endif
+
+
+/*
  * XR_DXR_cursor_depth
  *
  * Hand-added DisplayXR extension (ADR-046). No entry points: a next-chain
@@ -1411,6 +1426,7 @@
     OXR_EXTENSION_SUPPORT_DXR_depth_budget(_) \
     OXR_EXTENSION_SUPPORT_DXR_cursor_depth(_) \
     OXR_EXTENSION_SUPPORT_DXR_stereo_comfort(_) \
+    OXR_EXTENSION_SUPPORT_DXR_window_visibility(_) \
     OXR_EXTENSION_SUPPORT_DXR_swapchain_color_encoding(_) \
     OXR_EXTENSION_SUPPORT_DXR_display_zones(_) \
     OXR_EXTENSION_SUPPORT_DXR_weave(_) \
