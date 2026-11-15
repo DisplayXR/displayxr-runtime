@@ -6771,6 +6771,17 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	}
 	xrt_session_destroy(&sess->xs);
 
+	// #2619: EXT_APP_MODE lives on the head device, which outlives the session.
+	// Hand it back so a later (e.g. hosted) session on the same instance does
+	// not inherit this session's external-window head pose.
+	if (sess->ext_app_mode_set) {
+		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+		if (head != NULL) {
+			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 0);
+		}
+		sess->ext_app_mode_set = false;
+	}
+
 	os_precise_sleeper_deinit(&sess->sleeper);
 	oxr_frame_sync_fini(&sess->frame_sync);
 	os_mutex_destroy(&sess->active_wait_frames_lock);
@@ -7366,6 +7377,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
 				if (head != NULL) {
 					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+					(*out_session)->ext_app_mode_set = true; // cleared at session destroy (#2619)
 				}
 			}
 			return ret;
@@ -7568,6 +7580,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
 				if (head != NULL) {
 					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+					(*out_session)->ext_app_mode_set = true; // cleared at session destroy (#2619)
 				}
 			}
 			// ADR-050: comp_metal presents this session, so it owns the
@@ -7745,6 +7758,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
 				if (head != NULL) {
 					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+					(*out_session)->ext_app_mode_set = true; // cleared at session destroy (#2619)
 				}
 			}
 
@@ -8464,6 +8478,7 @@ oxr_session_create(struct oxr_logger *log,
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 		if (head != NULL) {
 			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+			sess->ext_app_mode_set = true; // cleared at session destroy (#2619)
 		}
 #ifdef XRT_BUILD_DRIVER_QWERTY
 		qwerty_set_process_keys(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, false);

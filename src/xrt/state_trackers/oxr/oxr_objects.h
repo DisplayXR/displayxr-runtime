@@ -3066,6 +3066,10 @@ struct oxr_session
 	//! True if session was created with an external window handle (XR_DXR_win32_window_binding).
 	bool has_external_window;
 
+	//! True once this session set XRT_DEVICE_PROPERTY_EXT_APP_MODE on the shared
+	//! head device; oxr_session_destroy then writes it back to 0 (#2619).
+	bool ext_app_mode_set;
+
 	//! XR_DXR_win32_window_binding v9 (ADR-060): the session was created with an
 	//! XrWin32TextureTargetBindingDXR honoured by its compositor (native D3D11).
 	bool texture_target_bound;
