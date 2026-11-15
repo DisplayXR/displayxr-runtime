@@ -34,6 +34,7 @@ Build apps for 3D displays using the OpenXR standard.
 - [XR_DXR_win32_window_binding](specs/extensions/XR_DXR_win32_window_binding.md) — app-provided Win32 HWND
 - [XR_DXR_cocoa_window_binding](specs/extensions/XR_DXR_cocoa_window_binding.md) — app-provided Cocoa NSView
 - [XR_DXR_xlib_window_binding](specs/extensions/XR_DXR_xlib_window_binding.md) — app-provided X11 window (desktop Linux)
+- [XR_DXR_window_visibility](specs/extensions/XR_DXR_window_visibility.md) — the app is told when nobody can see its window, and may opt in to SYNCHRONIZED while hidden (ADR-062 tier 3)
 - [XR_DXR_spatial_workspace](specs/extensions/XR_DXR_spatial_workspace.md) — workspace controller surface (shell-style apps)
 - [XR_DXR_display_zones](specs/extensions/XR_DXR_display_zones.md) — N 3D zones + 2D zones + wish mask (design sketch, ADR-027)
 - [XR_DXR_depth_budget](specs/extensions/XR_DXR_depth_budget.md) — rear depth budget: how far behind the display plane a transparent app may render (ADR-040)
