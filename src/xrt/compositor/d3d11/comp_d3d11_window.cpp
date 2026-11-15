@@ -1846,6 +1846,14 @@ window_thread_body(struct comp_d3d11_window *w)
 	MemoryBarrier();
 	SetEvent(w->window_ready_event);
 
+	// The creator gave up waiting (window-creation timeout) and set should_exit:
+	// nobody will ever destroy this window, so tear it down through the normal
+	// orderly path, which ends the message loop below and this thread.
+	if (InterlockedCompareExchange(&w->should_exit, 0, 0)) {
+		U_LOG_W("D3D11 window thread: creator timed out; destroying the late window");
+		PostMessageW(hwnd, WM_DXR_DESTROY_WINDOW, 0, 0);
+	}
+
 	U_LOG_W("D3D11 window thread: Window created successfully, HWND=%p", (void *)hwnd);
 
 	if (w->adopted) {
@@ -1980,6 +1988,8 @@ window_create_impl(uint32_t width,
 	w->thread_handle = CreateThread(NULL, 0, window_thread_func, w, 0, &w->thread_id);
 	if (w->thread_handle == NULL) {
 		U_LOG_E("D3D11 window: Failed to create window thread");
+		CloseHandle(w->paint_requested_event);
+		CloseHandle(w->paint_done_event);
 		CloseHandle(w->window_ready_event);
 		free(w);
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -1989,6 +1999,18 @@ window_create_impl(uint32_t width,
 	DWORD wait_result = WaitForSingleObject(w->window_ready_event, 10000);
 	if (wait_result != WAIT_OBJECT_0) {
 		U_LOG_E("D3D11 window: Timeout waiting for window thread to create HWND");
+		// Tell the thread this window is no longer wanted, so a window it
+		// creates late is destroyed and the thread ends instead of pumping
+		// messages for an HWND nobody owns. The thread checks should_exit
+		// right after publishing hwnd; if it already published one, post the
+		// destroy here. Both sides order their write before their read (the
+		// interlocked exchange here, the MemoryBarrier there), so at least one
+		// of them sees the other's write. No extra wait for the caller.
+		InterlockedExchange(&w->should_exit, TRUE);
+		HWND late_hwnd = w->hwnd;
+		if (late_hwnd != NULL) {
+			PostMessageW(late_hwnd, WM_DXR_DESTROY_WINDOW, 0, 0);
+		}
 		// The thread is still running and still references w. Vote and let the
 		// thread free w when it eventually exits (window_release: last voter
 		// frees). Freeing here would be a use-after-free.
