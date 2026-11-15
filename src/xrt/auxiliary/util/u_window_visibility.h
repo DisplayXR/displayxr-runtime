@@ -396,6 +396,220 @@ u_wv_debounce_deadline(const struct u_wv_debounce *d, uint64_t dwell_ns)
 
 /*
  *
+ * ADR-062 D5 (tier 4): the visible region, and the published wish built on it.
+ * Pure: no OS calls, unit-tested (tests/tests_aux_window_visibility.cpp).
+ *
+ */
+
+//! Most rects one visible region holds; past it the region falls back to the whole target.
+#define U_WINDOW_VISIBILITY_REGION_MAX_RECTS 32
+
+/*!
+ * A region: disjoint rects (as produced by @ref u_wv_region_compute; a merge
+ * may overlap them, which a raster does not mind). When @ref whole is set the
+ * region fragmented past @ref U_WINDOW_VISIBILITY_REGION_MAX_RECTS and holds
+ * the whole target instead: the conservative side, which keeps the panel 3D.
+ */
+struct u_wv_region
+{
+	uint32_t count;
+	bool whole;
+	struct u_wv_rect rects[U_WINDOW_VISIBILITY_REGION_MAX_RECTS];
+};
+
+/*!
+ * The part of @p target no occluder covers, as disjoint rects in @p out.
+ * Returns false when it fragments past the cap (or the work list): @p out then
+ * holds @p target alone with `whole` set. An empty target gives an empty region.
+ */
+bool
+u_wv_region_compute(const struct u_wv_rect *target,
+                    const struct u_wv_rect *occluders,
+                    size_t occluder_count,
+                    struct u_wv_region *out);
+
+//! Total area of @p r's rects (overlaps counted twice; computed regions are disjoint).
+uint64_t
+u_wv_region_area(const struct u_wv_region *r);
+
+//! True when every pixel of @p inner is in @p outer. Too fragmented to tell: false.
+bool
+u_wv_region_contains(const struct u_wv_region *outer, const struct u_wv_region *inner);
+
+//! Same rects in the same order (and the same `whole` flag).
+bool
+u_wv_region_equal(const struct u_wv_region *a, const struct u_wv_region *b);
+
+/*!
+ * @p dst grows by every rect of @p add that @p dst does not already contain.
+ * Past the cap @p dst becomes @p whole alone (`whole` set).
+ */
+void
+u_wv_region_merge(struct u_wv_region *dst, const struct u_wv_region *add, const struct u_wv_rect *whole);
+
+//! Shift every rect by (@p dx, @p dy).
+void
+u_wv_region_translate(struct u_wv_region *r, int32_t dx, int32_t dy);
+
+//! @p in clipped to @p clip, empty pieces dropped (in place allowed).
+void
+u_wv_region_clip(const struct u_wv_region *in, const struct u_wv_rect *clip, struct u_wv_region *out);
+
+/*!
+ * The D1 timing applied to a region. A region that only grows is published at
+ * once (visible is reported at once); one that loses pixels keeps the lost
+ * pixels for @p dwell_ns, and while @p hold (a window is moved or sized) the
+ * dwell restarts, so a window dragged across does not flip cells. Pixels that
+ * appear during a dwell are added at once. @p immediate (minimize, cloak,
+ * lock...) publishes @p raw at once.
+ */
+struct u_wv_region_debounce
+{
+	bool init;
+	struct u_wv_region pub;     //!< what readers see
+	struct u_wv_region pending; //!< the shrunk region waiting out the dwell
+	bool pending_active;
+	uint64_t since_ns;
+};
+
+/*!
+ * Feed one raw region (@p whole: the target, for the merge fallback). Returns
+ * true when the published region changed.
+ */
+bool
+u_wv_region_debounce_step(struct u_wv_region_debounce *d,
+                          const struct u_wv_region *raw,
+                          bool immediate,
+                          bool hold,
+                          uint64_t now_ns,
+                          uint64_t dwell_ns,
+                          const struct u_wv_rect *whole);
+
+//! When a pending shrink would be published (absolute ns), or 0.
+static inline uint64_t
+u_wv_region_debounce_deadline(const struct u_wv_region_debounce *d, uint64_t dwell_ns)
+{
+	return d->pending_active ? d->since_ns + dwell_ns : 0;
+}
+
+/*!
+ * A window's visible region as the tracker publishes it
+ * (@ref u_window_visibility_get_region), in WINDOW-CLIENT pixels of a client
+ * area @ref client_w x @ref client_h (physical pixels as the tracker measured
+ * them; a consumer scales to its own mask by these dims).
+ */
+struct u_window_visibility_region
+{
+	//! Content generation: bumps when anything below changes. 0 = nothing published yet.
+	uint64_t gen;
+	//! False: nothing is known (not shown yet, gone, untracked) - treat the whole window as visible.
+	bool known;
+	uint32_t client_w;
+	uint32_t client_h;
+	struct u_wv_region region;
+};
+
+/*!
+ * True when the tier-4 region mask applies to a display processor whose zone
+ * caps report a @p grid_w x @p grid_h cell grid: only a grid larger than 1x1.
+ * A 1x1 (panel-wide) switch keeps the tier-1 boolean lens path, unchanged.
+ */
+static inline bool
+u_wv_region_mask_applies(uint32_t grid_w, uint32_t grid_h)
+{
+	return (uint64_t)grid_w * (uint64_t)grid_h > 1u;
+}
+
+//! What a tier-4 publish is built from.
+enum u_wv_wish_kind
+{
+	U_WV_WISH_EMPTY = 0, //!< nothing 3D: the window is hidden or the session is in 2D mode
+	U_WV_WISH_CUT,       //!< an existing wish mask (zones / sticky), its covered pixels cleared
+	U_WV_WISH_IMPLICIT,  //!< no wish of the app's own: the visible client region, minus flat rects
+};
+
+//! Most rects a wish plan carries in each list.
+#define U_WV_WISH_MAX_RECTS 64
+
+//! The inputs of @ref u_wv_wish_plan_build.
+struct u_wv_wish_input
+{
+	enum u_wv_wish_kind kind;
+	//! The published mask's dims (the CUT source's, or the IMPLICIT raster's).
+	uint32_t mask_w;
+	uint32_t mask_h;
+	//! CUT: the source mask's content generation (pixels the plan cannot see).
+	uint64_t source_seq;
+	//! The visible region; NULL or not known = the whole window is visible.
+	const struct u_window_visibility_region *visible;
+	//! IMPLICIT: rects that stay flat (Local2D layer rects), in client pixels of
+	//! a @ref region_w x @ref region_h client area.
+	const struct u_wv_rect *flat;
+	uint32_t flat_count;
+	uint32_t region_w;
+	uint32_t region_h;
+};
+
+/*!
+ * A plan in MASK pixels: start from the source (CUT) or from all-zero
+ * (EMPTY, IMPLICIT), set @ref on to 1, then set @ref off to 0. Rounding errs
+ * toward 3D: on-rects expand outward, off-rects shrink inward.
+ */
+struct u_wv_wish_plan
+{
+	enum u_wv_wish_kind kind;
+	uint32_t mask_w;
+	uint32_t mask_h;
+	uint32_t on_count;
+	struct u_wv_rect on[U_WV_WISH_MAX_RECTS];
+	uint32_t off_count;
+	struct u_wv_rect off[U_WV_WISH_MAX_RECTS];
+	//! CUT: the covered part fragmented past the cap, so the source is published uncut (the 3D side).
+	bool cut_skipped;
+	//! Content signature: equal plans (and equal sources) sign equal.
+	uint64_t signature;
+};
+
+//! Build the plan for @p in. Pure.
+void
+u_wv_wish_plan_build(const struct u_wv_wish_input *in, struct u_wv_wish_plan *out);
+
+//! True when the plan's mask has no 3D pixel by construction (EMPTY, or IMPLICIT with nothing on).
+static inline bool
+u_wv_wish_plan_is_empty(const struct u_wv_wish_plan *p)
+{
+	return p->kind == U_WV_WISH_EMPTY || (p->kind == U_WV_WISH_IMPLICIT && p->on_count == 0);
+}
+
+/*!
+ * The #2677 publish rule: republish every frame (the screen anchor moves), but
+ * bump the content generation only when the content changed. Zero-init.
+ */
+struct u_wv_wish_seq
+{
+	bool init;
+	uint64_t signature;
+	uint64_t seq;
+};
+
+//! The generation to publish @p signature under; bumps (and sets @p out_changed) on a change.
+static inline uint64_t
+u_wv_wish_seq_step(struct u_wv_wish_seq *s, uint64_t signature, bool *out_changed)
+{
+	const bool changed = !s->init || s->signature != signature;
+	if (changed) {
+		s->init = true;
+		s->signature = signature;
+		s->seq++;
+	}
+	if (out_changed != NULL) {
+		*out_changed = changed;
+	}
+	return s->seq;
+}
+
+/*
+ *
  * The tracker.
  *
  */
@@ -544,6 +758,34 @@ u_window_visibility_set_screens(struct u_window_visibility *wv, const char *cons
  */
 bool
 u_window_visibility_screen_hidden(const struct u_window_visibility *wv, const char *device_name);
+
+/*!
+ * ADR-062 D5 (tier 4): the window's visible region (the uncovered remainder
+ * after the same occluder rules, on the same thread and at the same rate as
+ * the hidden verdict). @p device_name NULL: the whole window (every screen,
+ * the client rect clipped to the desktop); else the window's part on that
+ * screen (the session's 3D screen or one named by
+ * @ref u_window_visibility_set_screens), empty while that screen's part is
+ * hidden. A shrink waits out the hide dwell; growth is at once
+ * (@ref u_wv_region_debounce).
+ *
+ * Returns false (and @p out->known false) for a NULL tracker, a platform
+ * without one, or an unknown screen: the caller treats the whole window as
+ * visible. Any thread: a short shared lock and a copy of a few hundred bytes.
+ */
+bool
+u_window_visibility_get_region(const struct u_window_visibility *wv,
+                               const char *device_name,
+                               struct u_window_visibility_region *out);
+
+/*!
+ * The region's content generation (@ref u_window_visibility_region::gen)
+ * without the copy, so a per-frame reader can skip @ref
+ * u_window_visibility_get_region when nothing moved. 0 for a NULL tracker.
+ * One atomic load.
+ */
+uint64_t
+u_window_visibility_region_gen(const struct u_window_visibility *wv);
 
 struct xrt_screen_list;
 

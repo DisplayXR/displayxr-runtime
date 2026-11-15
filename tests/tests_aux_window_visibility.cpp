@@ -384,3 +384,341 @@ TEST_CASE("tracker: the per-screen API is NULL-safe")
 	const char *names[] = {"DISPLAY2"};
 	u_window_visibility_set_screens(nullptr, names, 1); // no crash
 }
+
+/*
+ *
+ * ADR-062 D5 (tier 4): the visible region and the published wish.
+ *
+ */
+
+namespace {
+
+u_wv_region
+region_of(u_wv_rect target, std::vector<u_wv_rect> occ)
+{
+	u_wv_region r{};
+	u_wv_region_compute(&target, occ.data(), occ.size(), &r);
+	return r;
+}
+
+u_wv_region
+region_list(std::vector<u_wv_rect> rects)
+{
+	u_wv_region r{};
+	for (const auto &x : rects) {
+		r.rects[r.count++] = x;
+	}
+	return r;
+}
+
+u_window_visibility_region
+vis(uint32_t w, uint32_t h, std::vector<u_wv_rect> rects)
+{
+	u_window_visibility_region v{};
+	v.gen = 1;
+	v.known = true;
+	v.client_w = w;
+	v.client_h = h;
+	v.region = region_list(rects);
+	return v;
+}
+
+//! Rasterize a plan on the CPU the way a compositor does: source (or 0), ON = 1, OFF = 0.
+std::vector<uint8_t>
+raster(const u_wv_wish_plan &p, const std::vector<uint8_t> *source)
+{
+	std::vector<uint8_t> m(size_t(p.mask_w) * p.mask_h, 0);
+	if (p.kind == U_WV_WISH_CUT && source != nullptr) {
+		m = *source;
+	}
+	auto fill = [&](const u_wv_rect &r, uint8_t v) {
+		for (int32_t y = r.top; y < r.bottom; y++) {
+			for (int32_t x = r.left; x < r.right; x++) {
+				m[size_t(y) * p.mask_w + size_t(x)] = v;
+			}
+		}
+	};
+	for (uint32_t i = 0; i < p.on_count; i++) {
+		fill(p.on[i], 1);
+	}
+	for (uint32_t i = 0; i < p.off_count; i++) {
+		fill(p.off[i], 0);
+	}
+	return m;
+}
+
+//! The sim_display-style verdict: a cell is 3D when any mask pixel in it is nonzero.
+std::string
+cells(const std::vector<uint8_t> &m, uint32_t w, uint32_t h, uint32_t gw, uint32_t gh)
+{
+	std::string s;
+	for (uint32_t cy = 0; cy < gh; cy++) {
+		for (uint32_t cx = 0; cx < gw; cx++) {
+			char bit = '0';
+			for (uint32_t y = cy * h / gh; y < (cy + 1) * h / gh; y++) {
+				for (uint32_t x = cx * w / gw; x < (cx + 1) * w / gw; x++) {
+					if (m[size_t(y) * w + x] != 0) {
+						bit = '1';
+					}
+				}
+			}
+			s += bit;
+		}
+		if (cy + 1 < gh) {
+			s += '/';
+		}
+	}
+	return s;
+}
+
+} // namespace
+
+TEST_CASE("region: the uncovered remainder, and its area")
+{
+	// Nothing over it: the target itself.
+	u_wv_region a = region_of(R(0, 0, 100, 100), {});
+	REQUIRE(a.count == 1);
+	CHECK(u_wv_region_area(&a) == 10000);
+	CHECK_FALSE(a.whole);
+
+	// The right half covered: the left half remains.
+	u_wv_region b = region_of(R(0, 0, 100, 100), {R(50, -10, 200, 200)});
+	CHECK(u_wv_region_area(&b) == 5000);
+	u_wv_region left = region_list({R(0, 0, 50, 100)});
+	CHECK(u_wv_region_contains(&left, &b));
+	CHECK(u_wv_region_contains(&b, &left));
+
+	// Fully covered: empty.
+	u_wv_region c = region_of(R(0, 0, 100, 100), {R(0, 0, 100, 100)});
+	CHECK(c.count == 0);
+}
+
+TEST_CASE("region: fragmenting past the cap falls back to the whole target")
+{
+	// A grid of small holes punched by many occluders fragments the remainder.
+	std::vector<u_wv_rect> occ;
+	for (int y = 0; y < 20; y++) {
+		for (int x = 0; x < 20; x++) {
+			occ.push_back(R(x * 10, y * 10, x * 10 + 5, y * 10 + 5));
+		}
+	}
+	u_wv_rect t = R(0, 0, 200, 200);
+	u_wv_region r{};
+	CHECK_FALSE(u_wv_region_compute(&t, occ.data(), occ.size(), &r));
+	CHECK(r.whole);
+	REQUIRE(r.count == 1);
+	CHECK(r.rects[0].right == 200);
+}
+
+TEST_CASE("region: merge, clip, translate")
+{
+	u_wv_region a = region_list({R(0, 0, 10, 10)});
+	u_wv_region b = region_list({R(5, 5, 10, 10), R(20, 0, 30, 10)});
+	u_wv_rect whole = R(0, 0, 100, 100);
+	u_wv_region_merge(&a, &b, &whole);
+	CHECK(a.count == 2); // (5,5)-(10,10) was already in
+	CHECK(u_wv_region_contains(&a, &b));
+
+	u_wv_region c{};
+	u_wv_rect clip = R(0, 0, 25, 5);
+	u_wv_region_clip(&a, &clip, &c);
+	CHECK(u_wv_region_area(&c) == 10 * 5 + 5 * 5);
+
+	u_wv_region_translate(&c, 100, 0);
+	CHECK(c.rects[0].left == 100);
+}
+
+TEST_CASE("region dwell: growth at once, a shrink after the dwell, held while dragging")
+{
+	const uint64_t dwell = U_WINDOW_VISIBILITY_HIDE_DWELL_NS;
+	const u_wv_rect whole = R(0, 0, 100, 100);
+	u_wv_region_debounce d{};
+	u_wv_region full = region_list({whole});
+	u_wv_region half = region_list({R(0, 0, 50, 100)});
+
+	CHECK(u_wv_region_debounce_step(&d, &half, false, false, 0, dwell, &whole)); // first: at once
+	CHECK(u_wv_region_equal(&d.pub, &half));
+	CHECK(u_wv_region_debounce_step(&d, &full, false, false, 10 * MS, dwell, &whole)); // grows: at once
+	CHECK(u_wv_region_equal(&d.pub, &full));
+
+	// Covered again: still the full region until the dwell runs out.
+	CHECK_FALSE(u_wv_region_debounce_step(&d, &half, false, false, 20 * MS, dwell, &whole));
+	CHECK(u_wv_region_equal(&d.pub, &full));
+	CHECK(u_wv_region_debounce_deadline(&d, dwell) == 20 * MS + dwell);
+	// A drag holds it, and restarts the dwell.
+	const uint64_t t0 = 20 * MS + dwell;
+	CHECK_FALSE(u_wv_region_debounce_step(&d, &half, false, true, t0, dwell, &whole));
+	CHECK(u_wv_region_equal(&d.pub, &full));
+	CHECK_FALSE(u_wv_region_debounce_step(&d, &half, false, false, t0 + dwell - 1, dwell, &whole));
+	CHECK(u_wv_region_debounce_step(&d, &half, false, false, t0 + dwell, dwell, &whole));
+	CHECK(u_wv_region_equal(&d.pub, &half));
+
+	// Immediate (a minimize): empty at once.
+	u_wv_region none{};
+	CHECK(u_wv_region_debounce_step(&d, &none, true, false, t0 + dwell + MS, dwell, &whole));
+	CHECK(d.pub.count == 0);
+}
+
+TEST_CASE("region dwell: what appears during a shrink's dwell is added at once")
+{
+	const uint64_t dwell = U_WINDOW_VISIBILITY_HIDE_DWELL_NS;
+	const u_wv_rect whole = R(0, 0, 100, 100);
+	u_wv_region_debounce d{};
+	u_wv_region left = region_list({R(0, 0, 50, 100)});
+	u_wv_region right = region_list({R(50, 0, 100, 100)});
+	u_wv_region_debounce_step(&d, &left, false, false, 0, dwell, &whole);
+	// The occluder moved from the right half to the left half.
+	CHECK(u_wv_region_debounce_step(&d, &right, false, false, MS, dwell, &whole));
+	CHECK(u_wv_region_contains(&d.pub, &right)); // the right half is 3D at once
+	CHECK(u_wv_region_contains(&d.pub, &left));  // the left half waits out the dwell
+	CHECK(u_wv_region_debounce_step(&d, &right, false, false, MS + dwell, dwell, &whole));
+	CHECK(u_wv_region_equal(&d.pub, &right));
+}
+
+TEST_CASE("wish: the region mask applies only to a grid larger than 1x1")
+{
+	// The tier-1 boolean path (today's panel-wide switch) is untouched: every
+	// consumer gates its whole tier-4 branch on this predicate.
+	CHECK_FALSE(u_wv_region_mask_applies(1, 1));
+	CHECK_FALSE(u_wv_region_mask_applies(0, 0));
+	CHECK_FALSE(u_wv_region_mask_applies(1, 0));
+	CHECK(u_wv_region_mask_applies(2, 1));
+	CHECK(u_wv_region_mask_applies(1, 2));
+	CHECK(u_wv_region_mask_applies(4, 2));
+}
+
+TEST_CASE("wish: a zones wish intersected with the visible region")
+{
+	// 400x200 client, mask at the same size; zone = left half; the window's
+	// top-left quarter is covered.
+	std::vector<uint8_t> src(400 * 200, 0);
+	for (int y = 0; y < 200; y++) {
+		for (int x = 0; x < 200; x++) {
+			src[size_t(y) * 400 + x] = 255;
+		}
+	}
+	u_window_visibility_region v = vis(400, 200, {R(0, 100, 400, 200), R(100, 0, 400, 100)});
+	u_wv_wish_input in{};
+	in.kind = U_WV_WISH_CUT;
+	in.mask_w = 400;
+	in.mask_h = 200;
+	in.source_seq = 7;
+	in.visible = &v;
+	u_wv_wish_plan p{};
+	u_wv_wish_plan_build(&in, &p);
+	CHECK(p.on_count == 0);
+	CHECK_FALSE(p.cut_skipped);
+	// Grid 4x2: the zone covers columns 0-1, cell (0,0) is covered.
+	CHECK(cells(raster(p, &src), 400, 200, 4, 2) == "0100/1100");
+	// Nothing known: the source verbatim.
+	in.visible = nullptr;
+	u_wv_wish_plan_build(&in, &p);
+	CHECK(p.off_count == 0);
+	CHECK(cells(raster(p, &src), 400, 200, 4, 2) == "1100/1100");
+}
+
+TEST_CASE("wish: a non-zones app's implicit wish is its visible region minus Local2D rects")
+{
+	u_window_visibility_region v = vis(400, 200, {R(0, 0, 200, 200)}); // right half covered
+	u_wv_rect flat = R(0, 100, 100, 200);                              // a Local2D panel, bottom-left cell
+	u_wv_wish_input in{};
+	in.kind = U_WV_WISH_IMPLICIT;
+	in.mask_w = 400;
+	in.mask_h = 200;
+	in.visible = &v;
+	in.flat = &flat;
+	in.flat_count = 1;
+	in.region_w = 400;
+	in.region_h = 200;
+	u_wv_wish_plan p{};
+	u_wv_wish_plan_build(&in, &p);
+	CHECK(cells(raster(p, nullptr), 400, 200, 4, 2) == "1100/0100");
+
+	// Uncovered window, no Local2D: every cell 3D.
+	in.visible = nullptr;
+	in.flat_count = 0;
+	u_wv_wish_plan_build(&in, &p);
+	CHECK(cells(raster(p, nullptr), 400, 200, 4, 2) == "1111/1111");
+
+	// 2D mode or hidden: the empty wish.
+	in.kind = U_WV_WISH_EMPTY;
+	u_wv_wish_plan_build(&in, &p);
+	CHECK(u_wv_wish_plan_is_empty(&p));
+	CHECK(cells(raster(p, nullptr), 400, 200, 4, 2) == "0000/0000");
+}
+
+TEST_CASE("wish: scaling to a smaller mask rounds toward 3D")
+{
+	// Client 1000 wide, mask 100 wide: a visible rect 5..15 covers mask pixels 0..2.
+	u_window_visibility_region v = vis(1000, 100, {R(5, 0, 15, 100)});
+	u_wv_rect flat = R(5, 0, 15, 100); // a flat rect shrinks inward: 1..1 = nothing
+	u_wv_wish_input in{};
+	in.kind = U_WV_WISH_IMPLICIT;
+	in.mask_w = 100;
+	in.mask_h = 10;
+	in.visible = &v;
+	in.flat = &flat;
+	in.flat_count = 1;
+	in.region_w = 1000;
+	in.region_h = 100;
+	u_wv_wish_plan p{};
+	u_wv_wish_plan_build(&in, &p);
+	REQUIRE(p.on_count == 1);
+	CHECK(p.on[0].left == 0);
+	CHECK(p.on[0].right == 2);
+	CHECK(p.off_count == 0);
+}
+
+TEST_CASE("wish: the content signature moves with the content only (republish, bump on change)")
+{
+	u_window_visibility_region v = vis(400, 200, {R(0, 0, 200, 200)});
+	u_wv_wish_input in{};
+	in.kind = U_WV_WISH_IMPLICIT;
+	in.mask_w = 400;
+	in.mask_h = 200;
+	in.visible = &v;
+	u_wv_wish_plan a{}, b{};
+	u_wv_wish_plan_build(&in, &a);
+	// Same content, a new region generation (the tracker re-published): same signature.
+	v.gen = 99;
+	u_wv_wish_plan_build(&in, &b);
+	CHECK(a.signature == b.signature);
+
+	u_wv_wish_seq seq{};
+	bool changed = false;
+	const uint64_t s1 = u_wv_wish_seq_step(&seq, a.signature, &changed);
+	CHECK(changed);
+	CHECK(u_wv_wish_seq_step(&seq, b.signature, &changed) == s1);
+	CHECK_FALSE(changed);
+
+	// A different visible region: a new signature and a bump.
+	v.region = region_list({R(0, 0, 100, 200)});
+	u_wv_wish_plan_build(&in, &b);
+	CHECK(a.signature != b.signature);
+	CHECK(u_wv_wish_seq_step(&seq, b.signature, &changed) == s1 + 1);
+	CHECK(changed);
+
+	// A CUT's source generation is part of its content.
+	in.kind = U_WV_WISH_CUT;
+	in.source_seq = 1;
+	u_wv_wish_plan_build(&in, &a);
+	in.source_seq = 2;
+	u_wv_wish_plan_build(&in, &b);
+	CHECK(a.signature != b.signature);
+	// And the kind is too: an empty wish never signs like an implicit one with nothing on.
+	in.kind = U_WV_WISH_EMPTY;
+	u_wv_wish_plan_build(&in, &a);
+	in.kind = U_WV_WISH_IMPLICIT;
+	v.region.count = 0;
+	u_wv_wish_plan_build(&in, &b);
+	CHECK(a.signature != b.signature);
+}
+
+TEST_CASE("tracker: the region API is NULL-safe and reads 'not known'")
+{
+	u_window_visibility_region r{};
+	r.known = true;
+	CHECK_FALSE(u_window_visibility_get_region(nullptr, nullptr, &r));
+	CHECK_FALSE(r.known);
+	CHECK(u_window_visibility_region_gen(nullptr) == 0);
+}
