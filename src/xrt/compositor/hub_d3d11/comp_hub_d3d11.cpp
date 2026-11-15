@@ -148,6 +148,16 @@ struct comp_hub_d3d11
 	 * dp_mutex.
 	 */
 	bool window_hidden;
+	/*!
+	 * #2671 + ADR-027: a published zone wish was withheld while the window was
+	 * hidden, so the next publish must start from scratch (clear, then publish:
+	 * the DP re-evaluates and sends its verdict). Set at the hidden edge by
+	 * @ref comp_hub_d3d11_set_window_hidden, consumed by the publish.
+	 */
+	volatile LONG zone_reeval_owed;
+	//! #2671: the owning compositor's visibility tracker (borrowed), for the
+	//! segment DPs' per-screen lens (comp_d3d11_segments_set_visibility).
+	const struct u_window_visibility *vis;
 
 	/*!
 	 * #2639 / #2640: legacy automatic 2D + re-convergence (NULL = off, the
@@ -1564,7 +1574,9 @@ split_segments_update(struct comp_hub_d3d11 *s, uint32_t tgt_w, uint32_t tgt_h, 
 			                                : 0;
 			split = comp_d3d11_segments_update(s->segments, &win, &canvas, s->out_ctx, mode_index);
 			// Every segment DP follows the session's 2D/3D mode on the
-			// screens the window covers, 2D on one it left (#2247).
+			// screens the window covers, 2D on one it left (#2247) or on one
+			// where the window's part is hidden (#2671).
+			comp_d3d11_segments_set_visibility(s->segments, s->vis);
 			comp_d3d11_segments_set_display_mode(s->segments, split_lens_3d(s));
 		}
 	}
@@ -3116,6 +3128,28 @@ split_publish_zone_wish_now(struct comp_hub_d3d11 *s, uint64_t seq)
 		return;
 	}
 	/*
+	 * #2671: no zone wish while the window is hidden. A zone-capable DP turns
+	 * its verdict into a lens request on each content change, which would undo
+	 * the gate's 2D. The wish is withheld, not cleared (a clear hands the lens
+	 * back to the mode authority, which may be 3D), and the first publish after
+	 * the window is seen again starts from scratch, so the DP sends its verdict
+	 * again instead of keeping the 2D the gate left (its edge test compares
+	 * against its own last verdict, not the lens).
+	 */
+	if (s->window_hidden) {
+		return;
+	}
+	if (InterlockedExchange(&s->zone_reeval_owed, 0) != 0 && s->zone_published) {
+		if (s->mutexes_init) {
+			os_mutex_lock(&s->seg_mutex);
+			comp_d3d11_segments_clear_zone_mask(s->segments);
+			os_mutex_unlock(&s->seg_mutex);
+		}
+		xrt_display_processor_d3d11_clear_local_zone_mask(s->dp);
+		s->zone_published = false;
+		U_LOG_W("#2671 hub: the window is seen again - the zone wish is re-published from scratch");
+	}
+	/*
 	 * The BINARY raster and nothing else. A feather ramp is a cosmetic composite
 	 * opt-in (#803) and must never reach the vendor as geometry, so a frame whose
 	 * composite sampled the feather mask still publishes the binary one — which
@@ -3267,6 +3301,13 @@ comp_hub_d3d11_clear_zone_wish(struct comp_hub_d3d11 *s)
 	}
 	xrt_display_processor_d3d11_clear_local_zone_mask(s->dp);
 	s->zone_published = false;
+	// #2671: a clear hands the lens back to the mode authority; while the
+	// window is hidden that must stay 2D.
+	os_mutex_lock(&s->dp_mutex);
+	if (s->window_hidden) {
+		xrt_display_processor_d3d11_request_display_mode(s->dp, false);
+	}
+	os_mutex_unlock(&s->dp_mutex);
 }
 
 extern "C" void
@@ -4647,6 +4688,7 @@ split_auto_stereo_apply(struct comp_hub_d3d11 *s,
 		                                        s->dp, want_3d && !split_primary_gate_2d(s));
 		os_mutex_unlock(&s->dp_mutex);
 		if (comp_d3d11_segments_enabled(s->segments)) {
+			comp_d3d11_segments_set_visibility(s->segments, s->vis);
 			comp_d3d11_segments_set_display_mode(s->segments, want_3d);
 		}
 		comp_hub_auto_stereo_lens_commit(as, flat);
@@ -6090,12 +6132,27 @@ comp_hub_d3d11_set_window_hidden(struct comp_hub_d3d11 *s, bool hidden)
 	os_mutex_lock(&s->dp_mutex);
 	const bool edge = hidden != s->window_hidden;
 	s->window_hidden = hidden;
+	if (edge && hidden) {
+		// A published zone wish is withheld from now on; its return re-publishes it.
+		InterlockedExchange(&s->zone_reeval_owed, 1);
+	}
 	// Under automatic 2D the lens is already held 2D and its release applies
-	// this gate (u_display_mode_hold.h rule); nothing to send.
+	// this gate (u_display_mode_hold.h rule); nothing to send. Seen again, the
+	// session's mode goes first, always: a published zone wish re-sends its own
+	// verdict on the next (from-scratch) publish, and a publish the DP accepted
+	// but never evaluated must not leave the lens 2D.
 	if (edge && !s->auto_held && s->dp != nullptr) {
 		xrt_display_processor_d3d11_request_display_mode(s->dp, s->mode_3d && !split_primary_gate_2d(s));
 	}
 	os_mutex_unlock(&s->dp_mutex);
+}
+
+extern "C" void
+comp_hub_d3d11_set_visibility(struct comp_hub_d3d11 *s, const struct u_window_visibility *vis)
+{
+	if (s != nullptr) {
+		s->vis = vis;
+	}
 }
 
 extern "C" void
@@ -6535,6 +6592,13 @@ comp_hub_d3d11_set_window_hidden(struct comp_hub_d3d11 *split, bool hidden)
 {
 	(void)split;
 	(void)hidden;
+}
+
+extern "C" void
+comp_hub_d3d11_set_visibility(struct comp_hub_d3d11 *split, const struct u_window_visibility *vis)
+{
+	(void)split;
+	(void)vis;
 }
 
 extern "C" void

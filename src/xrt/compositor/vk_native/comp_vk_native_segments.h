@@ -331,6 +331,18 @@ void
 comp_vk_native_segments_set_display_mode(struct comp_vk_native_segments *segs, bool enable_3d);
 
 /*!
+ * #2671: the session's window-visibility tracker, borrowed (NULL = every part
+ * visible). @ref comp_vk_native_segments_set_display_mode then also holds a screen's
+ * DP at 2D while the window's part on that screen is hidden
+ * (u_window_visibility_screen_hidden), and restores the session's mode when
+ * it is seen again. Weave thread, before each set_display_mode.
+ */
+struct u_window_visibility;
+void
+comp_vk_native_segments_set_visibility(struct comp_vk_native_segments *segs, const struct u_window_visibility *vis);
+
+
+/*!
  * #2247: does the window cover the PRIMARY screen, per the last update's
  * table and the hand-off's 0.5 s dead band (comp_segments_cover_dwell:
  * uncovered only after that long off it, covered again at once)? True when segmentation is off or the table is empty (no coverage

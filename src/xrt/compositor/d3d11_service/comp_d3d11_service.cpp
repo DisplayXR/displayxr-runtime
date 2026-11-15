@@ -5404,6 +5404,16 @@ multi_compositor_request_mode_flip(struct d3d11_service_system *sys,
  */
 static std::atomic<bool> g_svc_presenter_hidden{false};
 
+/*!
+ * #2671 + ADR-027: the presenter went hidden while it may hold a published zone
+ * wish. Its publishes are withheld while hidden (a zone-capable DP turns each
+ * new verdict into a lens request), and the first one after the window is
+ * seen again starts from scratch, so the DP re-sends its verdict instead of
+ * keeping the gate's 2D. Set by the render thread, consumed by the publish,
+ * both under render_mutex.
+ */
+static std::atomic<bool> g_svc_zone_reeval_owed{false};
+
 static bool
 dp_request_display_mode_checked(struct xrt_display_processor_d3d11 *xdp, bool enable_3d, const char *func, int line)
 {
@@ -15646,8 +15656,12 @@ pipeline_lens_visibility_tick(struct d3d11_service_system *sys,
 	}
 	mc->lens_hidden_applied = hidden;
 	struct xrt_display_processor_d3d11 *dp = fc != nullptr ? panel_dp(sys, fc) : mc->display_processor;
+	// On release the session's mode goes first, always; a published zone wish
+	// then re-sends its own verdict on its next (from-scratch) publish.
+	const bool zone_owns = fc != nullptr && fc->zone_published;
 	if (hidden) {
 		g_svc_presenter_hidden.store(true, std::memory_order_release);
+		g_svc_zone_reeval_owed.store(true, std::memory_order_release);
 		if (dp != nullptr) {
 			(void)DP_REQUEST_DISPLAY_MODE(dp, false);
 		}
@@ -15660,7 +15674,9 @@ pipeline_lens_visibility_tick(struct d3d11_service_system *sys,
 		stamp_flip_cooldown(sys, sys->hardware_display_3d);
 	}
 	U_LOG_W("#2671 service: presenter window %s, panel lens wish %s", hidden ? "hidden" : "visible (or changed)",
-	        hidden ? "2D" : (sys->hardware_display_3d ? "the session's 3D" : "the session's 2D"));
+	        hidden      ? "2D"
+	        : zone_owns ? "the session's mode, then the zone wish (re-published)"
+	                    : (sys->hardware_display_3d ? "the session's 3D" : "the session's 2D"));
 }
 
 static void
@@ -15791,10 +15807,11 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	}
 
 	/* #2671: the lens follows whether any pixel of the presenter is visible.
-	 * Not for a present-owner (own visibility rule), a published zone wish
-	 * (the lens is per zone), or under a controller's foreground override. */
+	 * Not for a present-owner (own visibility rule) or under a controller's
+	 * foreground override. A zones presenter is included: its wish publish is
+	 * withheld while hidden (service_update_zone_wish_publish). */
 	{
-		const bool policy = forced_focus < 0 && fc != nullptr && !fc->zone_published &&
+		const bool policy = forced_focus < 0 && fc != nullptr &&
 		                    (kind == PRESENTER_APP_HWND || kind == PRESENTER_SERVICE_WINDOW ||
 		                     kind == PRESENTER_CLIENT_TEXTURE);
 		pipeline_lens_visibility_tick(sys, mc, fc, policy ? present_hwnd : nullptr);
@@ -22937,6 +22954,11 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 				std::lock_guard<std::mutex> lk(c->seg_mutex);
 				comp_d3d11_segments_clear_zone_mask(c->segments);
 			}
+			// #2671: a clear hands the lens back to the mode authority; while
+			// the presenter is hidden that stays 2D.
+			if (g_svc_presenter_hidden.load(std::memory_order_acquire)) {
+				(void)DP_REQUEST_DISPLAY_MODE(dp, false);
+			}
 			// #1017: never withdraw a panel-wide resource silently — a stale
 			// mask left on the shared DP is invisible otherwise.
 			U_LOG_W("ZONES SVC: wish mask withdrawn from the %s DP (non-zones frame)",
@@ -22994,6 +23016,21 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	ID3D11Device *mask_dev = svc_zone_mask_device(sys, c);
 	if (!svc_zone_mask_publish_device_ok(sys, c, mask_dev)) {
 		return; // #918 tripwire: mask and DP are on different devices
+	}
+
+	// #2671: withheld while the presenter is hidden (the gate holds the panel
+	// 2D); the first publish after it is seen again starts from scratch.
+	if (g_svc_presenter_hidden.load(std::memory_order_acquire)) {
+		return;
+	}
+	if (g_svc_zone_reeval_owed.exchange(false, std::memory_order_acq_rel) && c->zone_published) {
+		xrt_display_processor_d3d11_clear_local_zone_mask(dp);
+		c->zone_published = false;
+		{
+			std::lock_guard<std::mutex> lk(c->seg_mutex);
+			comp_d3d11_segments_clear_zone_mask(c->segments);
+		}
+		U_LOG_W("#2671 service: the presenter is seen again - its zone wish is re-published from scratch");
 	}
 
 	// No flat rects on the zones path: a zones frame's 3D rects ARE the wish, so

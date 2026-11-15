@@ -33,6 +33,7 @@
 #include "os/os_threading.h"
 #include "os/os_time.h"
 #include "util/u_logging.h"
+#include "util/u_window_visibility.h"
 #include "util/u_misc.h"
 #include "xrt/xrt_plugin.h"
 
@@ -71,6 +72,8 @@ struct seg_screen_state
 	int transparent_latched;                //!< last transparency declared, -1 = none.
 	int mode_sent;                          //!< last 2D/3D mode sent, -1 = none.
 	bool uncovered;                         //!< #2247: the window had wholly left this screen.
+	//! #2671: the window's part on this screen was hidden at the last set_display_mode.
+	bool vis_hidden;
 	bool tolerates_resample;
 	struct seg_crop crop;
 	//! #2218 (#4): the zone mask cropped to this segment, and whether this DP
@@ -103,6 +106,8 @@ struct comp_d3d12_segments
 	struct comp_segments_lifecycle lc;
 	//! #2247: a screen's lens wish goes 2D only after it has been uncovered for the hand-off dwell.
 	struct comp_segments_cover_dwell cover;
+	//! #2671: the session's visibility tracker (borrowed; NULL = every part visible).
+	const struct u_window_visibility *vis;
 
 	//! The app thread reads st[i].dp for eyes; the weave creates/destroys it.
 	struct os_mutex dp_mutex;
@@ -665,6 +670,11 @@ comp_d3d12_segments_publish_zone_mask(struct comp_d3d12_segments *segs,
 			continue;
 		}
 		in_table[i] = true;
+		// #2671: no wish for a part nobody can see (set_display_mode holds it
+		// 2D); kept, not cleared, so the return re-evaluates it.
+		if (st->vis_hidden) {
+			continue;
+		}
 		if (!seg_dp_supports_zones(st)) {
 			continue;
 		}
@@ -1025,6 +1035,14 @@ comp_d3d12_segments_record(struct comp_d3d12_segments *segs, const struct comp_d
 }
 
 extern "C" void
+comp_d3d12_segments_set_visibility(struct comp_d3d12_segments *segs, const struct u_window_visibility *vis)
+{
+	if (segs != nullptr) {
+		segs->vis = vis;
+	}
+}
+
+extern "C" void
 comp_d3d12_segments_set_display_mode(struct comp_d3d12_segments *segs, bool enable_3d)
 {
 	if (segs == nullptr) {
@@ -1040,7 +1058,22 @@ comp_d3d12_segments_set_display_mode(struct comp_d3d12_segments *segs, bool enab
 		// has wholly left for the hand-off's dwell, the session's mode on the
 		// screens it covers (at once when it returns).
 		const bool covered = comp_segments_cover_dwell_covered(&segs->cover, i);
-		const bool want = enable_3d && covered;
+		// #2671: and 2D while the window's part on this screen is hidden
+		// (covered by other windows, or the window minimized); the session's
+		// mode again the moment any pixel there can be seen.
+		const bool part_hidden = u_window_visibility_screen_hidden(segs->vis, segs->bindings[i].device_name);
+		if (part_hidden != st->vis_hidden) {
+			st->vis_hidden = part_hidden;
+			// A part seen again re-evaluates its zone wish from scratch: the
+			// publishes were withheld while it was hidden, and the DP's own
+			// edge test would otherwise keep the 2D the gate left behind.
+			if (!part_hidden && st->zone_published) {
+				xrt_display_processor_d3d12_clear_local_zone_mask(st->dp);
+				st->zone_published = false;
+				st->zone_seq_sent = 0;
+			}
+		}
+		const bool want = enable_3d && covered && !part_hidden;
 		if (covered == st->uncovered) {
 			st->uncovered = !covered;
 			// A coverage edge for a live DP: lifecycle, not per frame.
