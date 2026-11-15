@@ -1611,10 +1611,19 @@ create_window_on_main_thread(struct comp_metal_compositor *c, uint32_t width, ui
 	}
 
 	[c->window setTitle:@"DisplayXR — Metal Native Compositor"];
+	// #2624: this file is MRR. A user click on the title-bar close button
+	// must not free the window (and with it the content view) while c->window
+	// / c->view / c->metal_layer are still read every frame and destroy still
+	// closes it: NO makes the alloc above the one reference, released in
+	// metal_compositor_destroy (as comp_window_macos.m does since #48).
+	[c->window setReleasedWhenClosed:NO];
 
 	CompMetalView *metalView = [[CompMetalView alloc] initWithFrame:frame];
 	metalView.wantsLayer = YES;
 	[c->window setContentView:metalView];
+	// The window owns the view now; c->view / c->metal_layer are borrows that
+	// stay valid while the window lives (it is never freed before destroy).
+	[metalView release];
 
 	c->view = metalView;
 	c->metal_layer = (CAMetalLayer *)metalView.layer;
@@ -6872,7 +6881,9 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	//    while all backing resources are still valid.
 	if (c->owns_window && c->window != nil) {
 		if (c->view != nil) {
-			[c->window setContentView:[[NSView alloc] init]];
+			// Autoreleased placeholder (MRR, #2624): the window retains it
+			// and the enclosing @autoreleasepool drops the alloc's +1.
+			[c->window setContentView:[[[NSView alloc] init] autorelease]];
 		}
 		c->view = nil;
 
@@ -6883,6 +6894,8 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 		void (^closeBlock)(void) = ^{
 			[window orderOut:nil];
 			[window close];
+			// releasedWhenClosed is NO (#2624): balance the alloc.
+			[window release];
 		};
 		if ([NSThread isMainThread]) {
 			closeBlock();
@@ -7509,11 +7522,9 @@ comp_metal_compositor_get_display_dimensions(struct xrt_compositor *xc,
 	return xrt_display_processor_metal_get_display_dimensions(c->display_processor, out_width_m, out_height_m);
 }
 
-bool
-comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
-                                         struct xrt_window_metrics *out_metrics)
+static bool
+get_window_metrics_impl(struct comp_metal_compositor *c, struct xrt_window_metrics *out_metrics)
 {
-	struct comp_metal_compositor *c = metal_comp(xc);
 	memset(out_metrics, 0, sizeof(*out_metrics));
 
 	// Compute window metrics compositor-side whenever we have a backing
@@ -7613,6 +7624,19 @@ comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
 	}
 
 	return false;
+}
+
+bool
+comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
+                                         struct xrt_window_metrics *out_metrics)
+{
+	// #2624: called every frame from xrLocateViews (locate_resolve_canvas) on
+	// the APP's thread, which usually has no autorelease pool: view.window,
+	// .screen and friends were autoreleased there and never drained (the
+	// window and its layer were pinned for the life of the process).
+	@autoreleasepool {
+		return get_window_metrics_impl(metal_comp(xc), out_metrics);
+	}
 }
 
 bool
