@@ -174,3 +174,51 @@ TEST_CASE("tracker: NULL window means always visible")
 	u_window_visibility_destroy(&wv);
 	CHECK(wv == nullptr);
 }
+
+TEST_CASE("screens: each screen judges only the window's part on it")
+{
+	// Two side-by-side 3D screens; the window spans the seam at x = 1000.
+	const u_wv_rect left_screen = R(0, 0, 1000, 1000);
+	const u_wv_rect right_screen = R(1000, 0, 2000, 1000);
+	const u_wv_rect client = R(600, 100, 1400, 500);
+
+	// An occluder over the window's right part only.
+	const std::vector<u_wv_rect> occ = {R(990, 50, 1500, 600)};
+	CHECK(u_wv_part_state(&client, &right_screen, occ.data(), occ.size()) == U_WV_PART_HIDDEN);
+	CHECK(u_wv_part_state(&client, &left_screen, occ.data(), occ.size()) == U_WV_PART_VISIBLE);
+
+	// Nothing covers it: visible on both.
+	CHECK(u_wv_part_state(&client, &right_screen, nullptr, 0) == U_WV_PART_VISIBLE);
+	CHECK(u_wv_part_state(&client, &left_screen, nullptr, 0) == U_WV_PART_VISIBLE);
+}
+
+TEST_CASE("screens: a screen the window is not on is OFF, never hidden")
+{
+	const u_wv_rect far_screen = R(3000, 0, 4000, 1000);
+	const u_wv_rect client = R(100, 100, 500, 500);
+	const std::vector<u_wv_rect> occ = {R(-10000, -10000, 10000, 10000)};
+	CHECK(u_wv_part_state(&client, &far_screen, occ.data(), occ.size()) == U_WV_PART_OFF);
+	// Touching edges share no pixel (half-open rects).
+	const u_wv_rect touching = R(500, 0, 900, 1000);
+	CHECK(u_wv_part_state(&client, &touching, occ.data(), occ.size()) == U_WV_PART_OFF);
+	CHECK(u_wv_part_state(nullptr, &touching, nullptr, 0) == U_WV_PART_OFF);
+}
+
+TEST_CASE("screens: a union of occluders hides one screen's part, a sliver keeps it")
+{
+	const u_wv_rect right_screen = R(1000, 0, 2000, 1000);
+	const u_wv_rect client = R(600, 100, 1400, 500);
+	// Two windows that together cover x in [1000, 1400) and leave the left part.
+	const std::vector<u_wv_rect> two = {R(1000, 0, 1200, 1000), R(1200, 0, 1400, 1000)};
+	CHECK(u_wv_part_state(&client, &right_screen, two.data(), two.size()) == U_WV_PART_HIDDEN);
+	// One pixel column left open on the right screen keeps it visible.
+	const std::vector<u_wv_rect> gap = {R(1000, 0, 1200, 1000), R(1201, 0, 1400, 1000)};
+	CHECK(u_wv_part_state(&client, &right_screen, gap.data(), gap.size()) == U_WV_PART_VISIBLE);
+}
+
+TEST_CASE("tracker: the per-screen API is NULL-safe")
+{
+	CHECK_FALSE(u_window_visibility_screen_hidden(nullptr, "DISPLAY2"));
+	const char *names[] = {"DISPLAY2"};
+	u_window_visibility_set_screens(nullptr, names, 1); // no crash
+}

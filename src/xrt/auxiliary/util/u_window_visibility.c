@@ -8,6 +8,7 @@
  */
 
 #include "util/u_window_visibility.h"
+#include "xrt/xrt_screen.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -77,6 +78,37 @@ u_wv_rect_covered(const struct u_wv_rect *target, const struct u_wv_rect *occlud
 		n = m;
 	}
 	return n == 0;
+}
+
+enum u_wv_part
+u_wv_part_state(const struct u_wv_rect *client,
+                const struct u_wv_rect *screen,
+                const struct u_wv_rect *occluders,
+                size_t occluder_count)
+{
+	if (client == NULL || screen == NULL) {
+		return U_WV_PART_OFF;
+	}
+	const struct u_wv_rect part = u_wv_rect_intersect(client, screen);
+	if (u_wv_rect_empty(&part)) {
+		return U_WV_PART_OFF;
+	}
+	return u_wv_rect_covered(&part, occluders, occluder_count) ? U_WV_PART_HIDDEN : U_WV_PART_VISIBLE;
+}
+
+void
+u_window_visibility_set_screen_list(struct u_window_visibility *wv, const struct xrt_screen_list *list)
+{
+	if (wv == NULL) {
+		return;
+	}
+	const char *names[U_WINDOW_VISIBILITY_MAX_SCREENS];
+	uint32_t n = 0;
+	for (uint32_t i = 0;
+	     list != NULL && i < list->count && i < XRT_SCREEN_LIST_MAX && n < U_WINDOW_VISIBILITY_MAX_SCREENS; i++) {
+		names[n++] = list->screens[i].device_name;
+	}
+	u_window_visibility_set_screens(wv, names, n);
 }
 
 /*
@@ -214,6 +246,28 @@ u_window_visibility_set_window(struct u_window_visibility *wv, void *native_wind
 {
 	(void)wv;
 	(void)native_window;
+}
+
+void
+u_window_visibility_set_screens(struct u_window_visibility *wv, const char *const *device_names, uint32_t count)
+{
+	(void)wv;
+	(void)device_names;
+	(void)count;
+}
+
+bool
+u_window_visibility_screen_hidden(const struct u_window_visibility *wv, const char *device_name)
+{
+	(void)wv;
+	(void)device_name;
+	return false;
+}
+
+void
+u_window_visibility_stop(struct u_window_visibility *wv)
+{
+	(void)wv;
 }
 
 void

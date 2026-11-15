@@ -42,6 +42,16 @@
  *   windows of the target's own process or of this process, and click-through
  *   or non-opaque layered windows never occlude.
  *
+ * ## Other 3D screens (ADR-047 multi-screen)
+ *
+ * A window that spans screens has one segment DP per extra 3D screen, and each
+ * screen's lens is its own. @ref u_window_visibility_set_screens names those
+ * screens; the tracker then judges the window's part on each one separately
+ * (same occluders, same dwell) and @ref u_window_visibility_screen_hidden
+ * answers per screen. A screen the window has no part on is never "hidden":
+ * the segment coverage gate (#2247) owns that case. A minimized, invisible or
+ * cloaked window is hidden on every screen.
+ *
  * Other platforms get a tracker that never reports hidden (follow-up: macOS
  * occlusion state, X11/Wayland visibility, Android surface lifecycle).
  *
@@ -159,6 +169,25 @@ enum u_wv_skip
 enum u_wv_skip
 u_wv_classify_occluder(const struct u_wv_window_facts *f, const char *extra_overlay_processes);
 
+//! Where the window's client rect stands on one screen (raw, before the dwell).
+enum u_wv_part
+{
+	U_WV_PART_OFF = 0, //!< no pixel of the window is on this screen
+	U_WV_PART_VISIBLE, //!< some pixel of the window's part on this screen can be seen
+	U_WV_PART_HIDDEN,  //!< the window's part on this screen is entirely covered
+};
+
+/*!
+ * Judge the window's part on one screen: @p client (the client rect, screen
+ * pixels) clipped to @p screen, against @p occluders (any rects; only their
+ * overlap with the part counts). Pure; the tracker's per-screen verdict.
+ */
+enum u_wv_part
+u_wv_part_state(const struct u_wv_rect *client,
+                const struct u_wv_rect *screen,
+                const struct u_wv_rect *occluders,
+                size_t occluder_count);
+
 //! Hide-dwell / instant-show debounce.
 struct u_wv_debounce
 {
@@ -252,6 +281,52 @@ u_window_visibility_set_panel(struct u_window_visibility *wv, const char *panel_
  */
 void
 u_window_visibility_set_window(struct u_window_visibility *wv, void *native_window);
+
+//! Most extra 3D screens one tracker judges (@ref u_window_visibility_set_screens).
+#define U_WINDOW_VISIBILITY_MAX_SCREENS 8
+
+/*!
+ * Name the 3D screens (Windows: GDI device names, `xrt_screen::device_name`)
+ * whose segment DPs take a lens wish of their own; the window's part on each
+ * is judged separately. Replaces the previous list (an unchanged list is a
+ * no-op); every listed screen starts visible. Count 0 (or NULL) clears it.
+ * Names past @ref U_WINDOW_VISIBILITY_MAX_SCREENS are ignored (they read
+ * visible). Any thread; never waits on a check.
+ */
+void
+u_window_visibility_set_screens(struct u_window_visibility *wv, const char *const *device_names, uint32_t count);
+
+/*!
+ * Debounced: the window's part on screen @p device_name has been hidden for
+ * the dwell (or the whole window is minimized, invisible or cloaked). False
+ * for an untracked screen, a screen the window is not on, or a NULL tracker:
+ * the safe direction. Any thread; a shared lock and a short scan, cheap enough
+ * for every weave.
+ */
+bool
+u_window_visibility_screen_hidden(const struct u_window_visibility *wv, const char *device_name);
+
+struct xrt_screen_list;
+
+/*!
+ * @ref u_window_visibility_set_screens from a screen list: every screen's
+ * `device_name`, in list order (the session's own 3D screen may be among them;
+ * it is judged the same way). NULL-safe.
+ */
+void
+u_window_visibility_set_screen_list(struct u_window_visibility *wv, const struct xrt_screen_list *list);
+
+/*!
+ * Stop and join the tracker's thread, but keep the object: every reader (a
+ * segment manager or hub that borrowed the pointer) keeps working and reads
+ * "visible" from then on, and no transition callback runs again. For a
+ * teardown that must silence the callback before the objects it touches go,
+ * while borrowers still hold the pointer; free it later with
+ * @ref u_window_visibility_destroy. Idempotent, NULL-safe; never call it
+ * holding a lock the callback takes.
+ */
+void
+u_window_visibility_stop(struct u_window_visibility *wv);
 
 //! Stop and join the thread, free, and NULL the pointer. NULL-safe.
 void
