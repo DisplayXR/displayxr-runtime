@@ -6271,18 +6271,6 @@ vk_dp_canvas_rect(struct comp_vk_native_compositor *c)
 	return r;
 }
 
-#ifdef VK_NATIVE_HAVE_SEGMENTS
-/*!
- * #2247: the session's DP weaves the primary screen, so its lens wish is the
- * session's mode while the window covers the primary and 2D once the window
- * has been off it for the hand-off's 0.5 s dwell
- * (comp_vk_native_segments_primary_covered); covered again, the session's mode
- * is re-sent at once. Sends @p dp that wish on a coverage edge, or always with
- * @p force (a freshly swapped-in DP). Not while the desktop-Linux NOT_1TO1
- * hold keeps the panel 2D: its release asks for the session's choice through
- * vk_dp_request_display_mode, which applies the same gate. One WARN per edge.
- * Weave thread.
- */
 //! #2671: the session's window is hidden (Windows tracker); never on other platforms yet.
 static inline bool
 vk_window_hidden(const struct comp_vk_native_compositor *c)
@@ -6295,6 +6283,18 @@ vk_window_hidden(const struct comp_vk_native_compositor *c)
 #endif
 }
 
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+/*!
+ * #2247: the session's DP weaves the primary screen, so its lens wish is the
+ * session's mode while the window covers the primary and 2D once the window
+ * has been off it for the hand-off's 0.5 s dwell
+ * (comp_vk_native_segments_primary_covered); covered again, the session's mode
+ * is re-sent at once. Sends @p dp that wish on a coverage edge, or always with
+ * @p force (a freshly swapped-in DP). Not while the desktop-Linux NOT_1TO1
+ * hold keeps the panel 2D: its release asks for the session's choice through
+ * vk_dp_request_display_mode, which applies the same gate. One WARN per edge.
+ * Weave thread.
+ */
 static void
 vk_seg_primary_lens(struct comp_vk_native_compositor *c, struct xrt_display_processor *dp, bool force)
 {
