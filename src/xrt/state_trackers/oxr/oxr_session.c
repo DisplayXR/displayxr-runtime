@@ -2490,7 +2490,9 @@ oxr_session_fill_rear_depth_budget(struct oxr_session *sess, XrRearDepthBudgetDX
 static float
 view_rig_clampf(float v, float lo, float hi, bool *clamped)
 {
-	if (v < lo) {
+	// Written as !(v >= lo) so NaN, which compares false both ways, maps to
+	// the low bound instead of passing through (#2619).
+	if (!(v >= lo)) {
 		*clamped = true;
 		return lo;
 	}
@@ -2499,6 +2501,19 @@ view_rig_clampf(float v, float lo, float hi, bool *clamped)
 		return hi;
 	}
 	return v;
+}
+
+/*
+ * Same clamp-never-reject policy for the rig pose's orientation: a quaternion
+ * that is not (within 1 %) a unit quaternion, NaN included, becomes identity.
+ */
+static void
+view_rig_sanitize_orientation(struct xrt_pose *pose, bool *clamped)
+{
+	if (!math_quat_validate_within_1_percent(&pose->orientation)) {
+		pose->orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		*clamped = true;
+	}
 }
 
 /*
@@ -2544,6 +2559,7 @@ view_rig_parse_chain(struct oxr_view_rig_state *rig, const void *chain_head)
 		    {crig->pose.orientation.x, crig->pose.orientation.y, crig->pose.orientation.z,
 		     crig->pose.orientation.w},
 		    {crig->pose.position.x, crig->pose.position.y, crig->pose.position.z}};
+		view_rig_sanitize_orientation(&rig->pose, &clamped);
 		// Camera-rig ipd/parallax are ABSOLUTE eye-separation / parallax scales (a
 		// stereo camera's inter-axial can be any positive value — miniature or
 		// giant scenes, or the display-rig equivalent of a zoomed virtual display
@@ -2567,6 +2583,7 @@ view_rig_parse_chain(struct oxr_view_rig_state *rig, const void *chain_head)
 		    {drig->pose.orientation.x, drig->pose.orientation.y, drig->pose.orientation.z,
 		     drig->pose.orientation.w},
 		    {drig->pose.position.x, drig->pose.position.y, drig->pose.position.z}};
+		view_rig_sanitize_orientation(&rig->pose, &clamped);
 		rig->virtual_display_height = view_rig_clampf(drig->virtualDisplayHeight, 0.01f, 1000.0f, &clamped);
 		// ipd/parallax are NOT clamped to [0,1] here while we are validating the
 		// rig math/transition: a near-convergence camera rig converts to a display
@@ -2622,6 +2639,7 @@ oxr_session_set_workspace_view_rig(struct oxr_logger *log, struct oxr_session *s
 		    {crig->pose.orientation.x, crig->pose.orientation.y, crig->pose.orientation.z,
 		     crig->pose.orientation.w},
 		    {crig->pose.position.x, crig->pose.position.y, crig->pose.position.z}};
+		view_rig_sanitize_orientation(&out.pose, &clamped);
 		// Camera-rig ipd/parallax are ABSOLUTE scales (any positive value), NOT
 		// the display rig's relative [0,1] comfort factor — see the matching note
 		// above. Bounding them to [0,1] truncated the converted rig and shifted
@@ -2644,6 +2662,7 @@ oxr_session_set_workspace_view_rig(struct oxr_logger *log, struct oxr_session *s
 		    {drig->pose.orientation.x, drig->pose.orientation.y, drig->pose.orientation.z,
 		     drig->pose.orientation.w},
 		    {drig->pose.position.x, drig->pose.position.y, drig->pose.position.z}};
+		view_rig_sanitize_orientation(&out.pose, &clamped);
 		out.virtual_display_height = view_rig_clampf(drig->virtualDisplayHeight, 0.01f, 1000.0f, &clamped);
 		// Not clamped to [0,1] — see the matching note in oxr_session_set_view_rig.
 		out.ipd_factor = view_rig_clampf(drig->ipdFactor, 0.0f, 1.0e4f, &clamped);
