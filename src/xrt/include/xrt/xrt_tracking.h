@@ -66,6 +66,20 @@ enum xrt_tracking_type
 	 * behaviour (ultraleap's ul_mount_offset_default {0, 1.45, -0.10} stays).
 	 */
 	XRT_TRACKING_TYPE_RIG_LOCAL,
+
+	/*!
+	 * PHYSICALLY REGISTERED display-plane poses (ADR-034 Amendment 8): the
+	 * same frame and anchoring as @ref XRT_TRACKING_TYPE_RIG_LOCAL — origin at
+	 * the physical display centre, +X right, +Y up, +Z toward the viewer,
+	 * metres; world = rig(t) o pose — but a session that owns its canvas
+	 * (an external window) reads them as PHYSICAL points of the glass, not as
+	 * fractions of the canvas: a pose on the glass lands exactly where the
+	 * app renders that point of the glass (no canvas rescale, no re-centring
+	 * on the canvas; through a chained XR_DXR_view_rig, the rig's glass
+	 * mapping). For a tool whose contact point with the panel must be honest
+	 * — a stylus. Hands and anything sized to the scene keep RIG_LOCAL.
+	 */
+	XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL,
 };
 
 /*!

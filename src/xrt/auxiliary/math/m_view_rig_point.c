@@ -290,3 +290,75 @@ m_view_rig_scale_relation(const struct xrt_vec3 *origin,
 		*out_radius = radius * s;
 	}
 }
+
+float
+m_view_rig_glass_scale(const struct m_view_rig_canvas *canvas, const struct m_view_rig *rig)
+{
+	if (rig == NULL || rig->kind == M_VIEW_RIG_NONE || canvas == NULL || !canvas->valid) {
+		return 1.0f;
+	}
+	if (rig->kind == M_VIEW_RIG_CAMERA) {
+		// The camera rig's glass scale (its virtual screen height / canvas
+		// height), or metersToVirtual when the convergence is at infinity.
+		return m_view_rig_length_scale(canvas, rig);
+	}
+	// Display rig: the core scales the SCREEN by m2v alone (Kooima Step 4);
+	// perspectiveFactor scales only the eyes (Step 3).
+	if (!(canvas->height_m > 0.0f) || !(rig->virtual_display_height > 0.0f)) {
+		return 1.0f;
+	}
+	return rig->virtual_display_height / canvas->height_m;
+}
+
+void
+m_view_rig_physical_plane(const struct m_view_rig_canvas *canvas,
+                          const struct m_view_rig *rig,
+                          const struct xrt_pose *plane_origin,
+                          struct xrt_pose *out_plane,
+                          struct xrt_pose *out_scale_origin,
+                          float *out_scale)
+{
+	if (rig == NULL || rig->kind == M_VIEW_RIG_NONE || canvas == NULL || !canvas->valid) {
+		// No rig: the views are the DP's raw display-plane eyes, so the
+		// physical plane IS the app's plane. Rigid, unscaled.
+		*out_plane = *plane_origin;
+		*out_scale_origin = *plane_origin;
+		*out_scale = 1.0f;
+		return;
+	}
+
+	// Where the rig puts the canvas centre (Pg): the same point mapping the
+	// views and spec-4 joints use (for a camera rig, its glass).
+	struct xrt_pose pg;
+	m_view_rig_canvas_plane(canvas, rig, plane_origin, &pg);
+
+	// A plane-relative point L is canvas point inverse(canvas_pose) o L
+	// (m_view_rig_canvas_rebase), which the rig puts at Pg o (s . that).
+	// Rigid part: Pg o inverse(canvas_pose); the scale is about Pg.
+	struct xrt_pose canvas_pose, inv_canvas;
+	m_view_rig_canvas_pose(canvas, &canvas_pose);
+	math_pose_invert(&canvas_pose, &inv_canvas);
+	math_pose_transform(&pg, &inv_canvas, out_plane);
+	*out_scale_origin = pg;
+	*out_scale = m_view_rig_glass_scale(canvas, rig);
+}
+
+void
+m_view_rig_map_physical_point(const struct m_view_rig_canvas *canvas,
+                              const struct m_view_rig *rig,
+                              const struct xrt_pose *plane_origin,
+                              const struct xrt_vec3 *p_plane,
+                              struct xrt_vec3 *out)
+{
+	struct xrt_pose plane, scale_origin;
+	float s = 1.0f;
+	m_view_rig_physical_plane(canvas, rig, plane_origin, &plane, &scale_origin, &s);
+
+	struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+	rel.pose.position = *p_plane;
+	struct xrt_space_relation placed = XRT_SPACE_RELATION_ZERO;
+	math_pose_transform(&plane, &rel.pose, &placed.pose);
+	struct xrt_space_relation scaled;
+	m_view_rig_scale_relation(&scale_origin.position, s, &placed, 0.0f, &scaled, NULL);
+	*out = scaled.pose.position;
+}

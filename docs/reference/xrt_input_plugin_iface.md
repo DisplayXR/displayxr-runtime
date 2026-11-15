@@ -68,7 +68,9 @@ struct xrt_input_plugin_host_iface {
     uint32_t host_api_version;
     xrt_result_t (*get_display_geometry)(struct xrt_input_host_display_geometry *inout);
     xrt_component_get_setting_fn_t get_setting; /* N3c: the one options contract, carved from reserved[1] */
-    void *reserved[12];
+    /* ... poll_pointer_events, get_camera_pose, the four shared-camera slots (reserved[2..7]) ... */
+    uint32_t (*get_handedness)(void);           /* ADR-034 Am. 8, carved from reserved[8] */
+    void *reserved[5];
 };
 ```
 
@@ -219,6 +221,20 @@ Two consequences you can rely on: a **non-identity N at alignment is absorbed**
 step moves the rig along its own forward** — `N → N ∘ T(0,0,-1)` walks the rig
 one metre the way your frame points.
 
+### `get_handedness` — the hand a single tool belongs on (ADR-034 Amendment 8)
+
+`host->get_handedness()` returns an `enum xrt_input_handedness`
+(`XRT_INPUT_HANDEDNESS_RIGHT = 0`, `XRT_INPUT_HANDEDNESS_LEFT = 1`). It is
+class policy the runtime owns, not a provider setting: Windows
+`HKCU\Software\DisplayXR\InputProviders\Policy\Handedness` (DWORD, 0 = right,
+1 = left), then the HKLM 64-bit view, HKCU ignored under `Policy\Lock` = 1;
+POSIX a `handedness` file in the per-user manifest dir (first byte `l` / `L` =
+left); Android and absent: right. A provider rarely needs to call it — declare
+the device `XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER` and the builder resolves
+it — but a non-NULL slot is how a provider knows the runtime resolves DOMINANT
+at all (`XRT_INPUT_PLUGIN_HOST_HAS_GET_HANDEDNESS`). Carved from `reserved[8]`
+at an unchanged ABI; NULL on an older runtime.
+
 ## Display-plane-relative devices: `XRT_TRACKING_TYPE_RIG_LOCAL`
 
 A provider that also drives the rig (ADR-034 Amendment 4) **must** publish
@@ -247,13 +263,70 @@ setting its devices' `tracking_origin->type` to
 Anchoring is logged once per origin at init
 (`Rig-local origin '…' anchored at the initial rig (…)`), never per frame.
 
+### Glass-registered devices: `XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL`
+
+A **stylus** (or any tool whose contact point with the panel must be honest)
+publishes on an `XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL` origin instead (ADR-034
+Amendment 8). Same frame, same anchoring, same rig rule as `RIG_LOCAL` — the
+pen is **screen-anchored**: in a runtime-window session the screen is where
+the rig puts it, so the pen follows WASD / mouse-look exactly as the glass
+does. What differs is a session that owns its canvas (an external window,
+the engine plug-ins): `RIG_LOCAL` reads `L` as fractions of the display height
+applied to the canvas (Amendment 7 — right for hands sized to the scene),
+`RIG_LOCAL_PHYSICAL` reads `L` as a **physical point of the glass** and lands
+it where the app renders that point:
+
+| Session | A `RIG_LOCAL_PHYSICAL` pose `L` lands at |
+|---|---|
+| No `XR_DXR_view_rig` chained (any class) | the physical display plane, unscaled — the frame of the DP's raw display-plane eyes |
+| A display rig chained | `Pg ∘ (m2v · inverse(canvas) ∘ L)`: rebased into the canvas like every eye, then the glass scale `m2v = virtualDisplayHeight / canvas height` about the rig's canvas centre `Pg` |
+| A camera rig chained | the same with the rig's glass (its convergence plane) and its virtual screen height / canvas height |
+
+A point **on the glass** is therefore exactly registered under every rig; off
+the glass it is exact whenever the display rig's `perspectiveFactor` is 1 (a
+non-unit factor distorts depth for eyes, not for the screen, so no single
+point can match both). Hand joints from such an origin keep `RIG_LOCAL`
+behaviour — glass registration is for tool poses. Math:
+`m_view_rig_physical_plane` (`auxiliary/math/m_view_rig_point.h`); per-session
+re-base: `oxr_space.c::rig_local_plane_correction`.
+
+### A stylus, end to end
+
+```c
+// One origin, glass-registered (ADR-034 Amendment 8).
+origin->type = XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL;
+
+xdev->name        = XRT_DEVICE_MX_INK_STYLUS;   // /interaction_profiles/logitech/mx_ink_stylus_logitech
+xdev->device_type = XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER; // builder -> LEFT / RIGHT
+// inputs (any subset; the profile's paths bind to whichever exist):
+//   XRT_INPUT_MX_INK_TIP_FORCE, _CLUSTER_MIDDLE_FORCE           (VEC1_ZERO_TO_ONE)
+//   XRT_INPUT_MX_INK_CLUSTER_FRONT_CLICK, _CLUSTER_FRONT_DOUBLE_TAP,
+//   XRT_INPUT_MX_INK_CLUSTER_BACK_CLICK,  _CLUSTER_BACK_DOUBLE_TAP,
+//   XRT_INPUT_MX_INK_DOCKED, XRT_INPUT_MX_INK_SYSTEM_CLICK      (BOOLEAN)
+//   XRT_INPUT_MX_INK_GRIP_POSE, _AIM_POSE, _TIP_POSE            (POSE)
+// output: XRT_OUTPUT_NAME_MX_INK_HAPTIC
+```
+
+The app enables `XR_LOGITECH_mx_ink_stylus_interaction` (advertised by
+default, `XRT_FEATURE_OPENXR_INTERACTION_LOGITECH_MX_INK`) and suggests
+bindings against the profile. `TIP_POSE` follows the extension's frame: origin
+at the sharpest point of the tip, −Z out of the tip along the pen's axis, +Y
+along the input cluster's normal. Report `DOCKED` true just before the pen
+stops tracking. A provider that must also run on a runtime without
+`XRT_INPUT_PLUGIN_HAS_STYLUS` (no profile there) cannot be served the stylus
+profile on it; declare a fallback `binding_profiles` entry (e.g.
+`khr/simple_controller`) if it should still be usable there.
+
 ## Device obligations
 
 Devices returned by `create_devices` are ordinary `xrt_device`s. Each
 self-describes via `device_type`
-(`XRT_DEVICE_TYPE_{LEFT,RIGHT,ANY}_HAND_CONTROLLER` claim a hand role;
-`XRT_DEVICE_TYPE_NAVIGATION` claims the rig role; other types ride
-along without claiming anything) and the interaction profile it binds
+(`XRT_DEVICE_TYPE_{LEFT,RIGHT,ANY}_HAND_CONTROLLER` claim a hand role —
+`ANY` fills the LEFT hand first, so it is for an interchangeable pair, never a
+single pen; `XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER` is a single tool the
+builder resolves in place to RIGHT or LEFT from `get_handedness` before any
+role is read; `XRT_DEVICE_TYPE_NAVIGATION` claims the rig role; other types
+ride along without claiming anything) and the interaction profile it binds
 (`name` + optional `binding_profiles`, from `bindings.json`). The
 provider must implement:
 

@@ -3606,7 +3606,14 @@ session_record_rig_canvas(struct oxr_session *sess,
 	 */
 	bool rig_plane_valid = false;
 	struct xrt_pose rig_plane = XRT_POSE_IDENTITY;
+	// RIG_LOCAL_PHYSICAL (ADR-034 Amendment 8): where the same rig puts the
+	// GLASS, for every session class but the bridge relay.
+	struct xrt_pose phys_plane = XRT_POSE_IDENTITY;
+	struct xrt_pose phys_scale_origin = XRT_POSE_IDENTITY;
+	float phys_scale = 1.0f;
 	if (rig_origin != NULL && rig_origin->kind != M_VIEW_RIG_NONE && !sess->is_bridge_relay) {
+		m_view_rig_physical_plane(canvas, rig_origin, plane_origin, &phys_plane, &phys_scale_origin,
+		                          &phys_scale);
 		if (sess->has_external_window) {
 			// RIG_LOCAL is canvas-relative (ADR-034 Amendment 7): a session
 			// that owns its canvas places L on the CANVAS centre through
@@ -3629,6 +3636,10 @@ session_record_rig_canvas(struct oxr_session *sess,
 	sess->rig_canvas.plane_origin = *plane_origin;
 	sess->rig_canvas.rig_plane_valid = rig_plane_valid;
 	sess->rig_canvas.rig_plane_origin = rig_plane;
+	sess->rig_canvas.phys_plane_valid = rig_plane_valid;
+	sess->rig_canvas.phys_plane_origin = phys_plane;
+	sess->rig_canvas.phys_scale_origin = phys_scale_origin;
+	sess->rig_canvas.phys_scale = phys_scale;
 	os_mutex_unlock(&sess->rig_canvas.lock);
 }
 
@@ -3657,6 +3668,7 @@ session_clear_rig_plane(struct oxr_session *sess)
 {
 	os_mutex_lock(&sess->rig_canvas.lock);
 	sess->rig_canvas.rig_plane_valid = false;
+	sess->rig_canvas.phys_plane_valid = false;
 	os_mutex_unlock(&sess->rig_canvas.lock);
 }
 
@@ -3875,6 +3887,32 @@ oxr_session_get_rig_local_plane(struct oxr_session *sess, struct xrt_pose *out_p
 		m_view_rig_canvas_pose(&canvas, out_plane);
 	}
 	return rig_plane;
+}
+
+bool
+oxr_session_get_rig_local_physical_plane(struct oxr_session *sess,
+                                         struct xrt_pose *out_plane,
+                                         struct xrt_pose *out_scale_origin,
+                                         float *out_scale)
+{
+	*out_plane = (struct xrt_pose)XRT_POSE_IDENTITY;
+	*out_scale_origin = (struct xrt_pose)XRT_POSE_IDENTITY;
+	*out_scale = 1.0f;
+
+	os_mutex_lock(&sess->rig_canvas.lock);
+	const bool valid = sess->rig_canvas.phys_plane_valid;
+	if (valid) {
+		*out_plane = sess->rig_canvas.phys_plane_origin;
+		*out_scale_origin = sess->rig_canvas.phys_scale_origin;
+		*out_scale = sess->rig_canvas.phys_scale;
+	}
+	os_mutex_unlock(&sess->rig_canvas.lock);
+
+	// A ratio within 1e-4 of 1 is exactly 1 (as for the canvas scale).
+	if (fabsf(*out_scale - 1.0f) <= 1e-4f) {
+		*out_scale = 1.0f;
+	}
+	return valid;
 }
 
 /*!
@@ -8887,8 +8925,13 @@ oxr_session_hand_joints(struct oxr_logger *log,
 	// a canvas of a different height still owes the joints the canvas scale —
 	// positions about the canvas centre, radii, linear velocities. s = 1 (full
 	// display, runtime-window, bridge relay, a RIG_LOCAL base) is a no-op.
-	const bool source_rig_local = data_source->xdev->tracking_origin != NULL &&
-	                              data_source->xdev->tracking_origin->type == XRT_TRACKING_TYPE_RIG_LOCAL;
+	// Hand joints from a RIG_LOCAL_PHYSICAL origin stay canvas-relative too
+	// (ADR-034 Amendment 8: the glass registration is for tool poses), the
+	// same kind oxr_space_locate_device placed the source origin with.
+	const bool source_rig_local =
+	    data_source->xdev->tracking_origin != NULL &&
+	    (data_source->xdev->tracking_origin->type == XRT_TRACKING_TYPE_RIG_LOCAL ||
+	     data_source->xdev->tracking_origin->type == XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL);
 	struct xrt_vec3 rl_origin = {0.0f, 0.0f, 0.0f};
 	float rl_scale = 1.0f;
 	if (source_rig_local && !oxr_space_rig_local_scale(log, baseSpc, at_time, &rl_origin, &rl_scale)) {

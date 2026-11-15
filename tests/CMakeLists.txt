@@ -195,6 +195,10 @@ if(TARGET target_lists)
 	# resolve rule (user over machine, under Policy\Lock) and the input
 	# loader's live POSIX per-user file read with HOME redirected.
 	list(APPEND tests tests_input_emulated_controllers)
+	# ADR-034 Amendment 8 -- a single tool declared DOMINANT_HAND_CONTROLLER
+	# resolves by the handedness policy (right by default), never ANY's left
+	# first; the get_handedness host slot sits in the former reserved[8].
+	list(APPEND tests tests_input_handedness)
 	# ADR-034 Amendment 5 (#2181) -- per-client input selection policy: the
 	# per-family precedence (Lock > per-app pin > request > PreferredPlugin),
 	# the exe-basename per-app key, and the live POSIX per-app pin file.
@@ -769,6 +773,9 @@ if(TARGET tests_component_settings)
 endif()
 if(TARGET tests_input_emulated_controllers)
 	target_link_libraries(tests_input_emulated_controllers PRIVATE target_lists xrt-interfaces aux_util)
+endif()
+if(TARGET tests_input_handedness)
+	target_link_libraries(tests_input_handedness PRIVATE target_lists xrt-interfaces)
 endif()
 if(TARGET tests_input_selection_policy)
 	target_link_libraries(tests_input_selection_policy PRIVATE target_lists xrt-interfaces aux_util)

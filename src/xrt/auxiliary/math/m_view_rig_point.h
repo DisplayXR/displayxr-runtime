@@ -236,6 +236,62 @@ m_view_rig_scale_relation(const struct xrt_vec3 *origin,
                           struct xrt_space_relation *out,
                           float *out_radius);
 
+/*
+ *
+ * RIG_LOCAL_PHYSICAL is glass-registered (input-provider-discovery.md §4b.4a,
+ * ADR-034 Amendment 8): a pose L in metres relative to the PHYSICAL display
+ * plane is a physical point of the glass, placed where the session's views put
+ * that point — not rescaled to the canvas. With no rig the views are the DP's
+ * raw display-plane eyes, so L lands on the physical plane unchanged. With a
+ * rig, L is rebased into the canvas frame (as every eye is) and the rig maps
+ * the GLASS: a display rig scales the canvas by m2v = virtualDisplayHeight /
+ * canvas height (Kooima Step 4 — perspectiveFactor scales eyes, not the
+ * screen), a camera rig puts the glass on its convergence plane. A point ON
+ * the glass is therefore exactly registered under any rig; off the glass it
+ * is exact whenever perspectiveFactor is 1.
+ *
+ */
+
+/*!
+ * The uniform scale a rig applies to the GLASS (the canvas plane): display rig
+ * `virtualDisplayHeight / canvas height` (without perspectiveFactor), camera
+ * rig @ref m_view_rig_length_scale. 1 for NONE, an invalid canvas or a
+ * non-positive height.
+ */
+float
+m_view_rig_glass_scale(const struct m_view_rig_canvas *canvas, const struct m_view_rig *rig);
+
+/*!
+ * Where a RIG_LOCAL_PHYSICAL pose lands, split as a rigid placement plus a
+ * uniform scale (a scale about a point is not a pose): a plane-relative pose L
+ * lands at `scale(out_scale_origin.position, out_scale) of (out_plane o L)`,
+ * all in the frame @p plane_origin is given in.
+ *
+ * - No rig (NONE / NULL / invalid canvas): @p out_plane = @p out_scale_origin
+ *   = @p plane_origin, @p out_scale = 1.
+ * - A rig: @p out_scale_origin = Pg, the canvas centre through the rig
+ *   (@ref m_view_rig_canvas_plane); @p out_plane = `Pg o inverse(canvas pose)`;
+ *   @p out_scale = @ref m_view_rig_glass_scale.
+ */
+void
+m_view_rig_physical_plane(const struct m_view_rig_canvas *canvas,
+                          const struct m_view_rig *rig,
+                          const struct xrt_pose *plane_origin,
+                          struct xrt_pose *out_plane,
+                          struct xrt_pose *out_scale_origin,
+                          float *out_scale);
+
+/*!
+ * One plane-relative point through @ref m_view_rig_physical_plane: where the
+ * app renders the physical display-plane point @p p_plane.
+ */
+void
+m_view_rig_map_physical_point(const struct m_view_rig_canvas *canvas,
+                              const struct m_view_rig *rig,
+                              const struct xrt_pose *plane_origin,
+                              const struct xrt_vec3 *p_plane,
+                              struct xrt_vec3 *out);
+
 #ifdef __cplusplus
 }
 #endif

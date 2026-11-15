@@ -44,7 +44,9 @@
                 "slide_meta",
                 "proximity",
                 "proximity_fb",
-                "proximity_meta"
+                "proximity_meta",
+                "double_tap_logitech",
+                "docked_logitech"
             ]
         },
         "subActionPathName": {
@@ -134,6 +136,12 @@
                     "$ref": "#/definitions/monadoBindingDefine"
                 },
                 "proximity_meta": {
+                    "$ref": "#/definitions/monadoBindingDefine"
+                },
+                "double_tap_logitech": {
+                    "$ref": "#/definitions/monadoBindingDefine"
+                },
+                "docked_logitech": {
                     "$ref": "#/definitions/monadoBindingDefine"
                 }
             }

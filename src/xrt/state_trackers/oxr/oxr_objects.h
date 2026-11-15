@@ -1378,6 +1378,24 @@ bool
 oxr_session_get_rig_local_plane(struct oxr_session *sess, struct xrt_pose *out_plane, float *out_scale);
 
 /*!
+ * Where this session places a RIG_LOCAL_PHYSICAL pose L (ADR-034 Amendment 8,
+ * input-provider-discovery.md §4b.4a): a physical point of the glass, at
+ * `scale(out_scale_origin, out_scale) of (out_plane o L)` in the head's
+ * tracking-origin space.
+ *
+ * - The latest view locate chained a rig (not a bridge relay): the rig's glass
+ *   placement (oxr_session::rig_canvas::phys_plane_origin & co.). Returns true.
+ * - Otherwise the physical plane itself: identity, scale 1 — the plane of an
+ *   external-window / bridge-relay session's raw display-plane views. Returns
+ *   false (a runtime-window session then needs no correction at all).
+ */
+bool
+oxr_session_get_rig_local_physical_plane(struct oxr_session *sess,
+                                         struct xrt_pose *out_plane,
+                                         struct xrt_pose *out_scale_origin,
+                                         float *out_scale);
+
+/*!
  * #1502: publish the session's VIEW-space eye-centroid offset (thread safe).
  * Only @ref oxr_session_locate_views calls this.
  */
@@ -3312,6 +3330,17 @@ struct oxr_session
 		 */
 		bool rig_plane_valid;
 		struct xrt_pose rig_plane_origin;
+		/*!
+		 * RIG_LOCAL_PHYSICAL (ADR-034 Amendment 8): where the same rig
+		 * puts the GLASS — a plane-relative pose L lands at
+		 * `scale(phys_scale_origin, phys_scale) of (phys_plane_origin o L)`
+		 * in the tracking-origin space (m_view_rig_physical_plane). Valid
+		 * exactly when @ref rig_plane_valid is; cleared with it.
+		 */
+		bool phys_plane_valid;
+		struct xrt_pose phys_plane_origin;
+		struct xrt_pose phys_scale_origin;
+		float phys_scale;
 	} rig_canvas;
 
 	/*!

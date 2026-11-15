@@ -508,6 +508,27 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    `DXR_SIM_INPUT=1` keeps working for one release as an alias (deprecation
    WARN). Environment caveat unchanged: set a variable process-level — the
    runtime DLL has its own static-CRT environment block.
+7. **A single tool takes the dominant hand (ADR-034 Amendment 8).** A device
+   declared `XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER` — one stylus — is
+   resolved **in place** by `t_builder_add_input_provider_devices()` to
+   `RIGHT_HAND_CONTROLLER` or `LEFT_HAND_CONTROLLER` before it claims a role,
+   so the arbiter, IPC, `displayxr-cli input list` and the state tracker only
+   ever see LEFT / RIGHT. The answer is the **Handedness** class policy, read
+   through the input loader (`target_input_plugin_get_handedness()`), never
+   `getenv`: Windows `InputProviders\Policy\Handedness` (DWORD, 0 = right,
+   1 = left), HKCU first, then the HKLM 64-bit view, HKCU hidden under
+   `Policy\Lock` = 1 — the same root-policy read as `EmulatedControllers`;
+   POSIX a `handedness` file in the per-user manifest dir (first byte `l` /
+   `L` = left); Android and absent: **right**. Read once per provider at
+   build, logged once per device (`… is a dominant-hand tool -> RIGHT hand
+   (Handedness: default)`); a change applies at the next system build. The
+   same answer is offered to providers through the host iface's
+   `get_handedness` slot (§4b.6). `ANY_HAND_CONTROLLER` is unchanged — it
+   fills the LEFT hand first and is for an interchangeable pair; a single pen
+   declared ANY lands on the left hand of every right-handed user. The other
+   hand keeps its own walk (Amendment 3): with a pen on the right, the left
+   hand falls to the next candidate (qwerty, or -1 under
+   `EmulatedControllers = 0`).
 
 ## 4a. Pose anchoring — provider volumes are rig-relative
 
@@ -780,6 +801,57 @@ Then `world = rig(t) ∘ L = T_world_F ∘ P(t) ∘ inv(P(t)) ∘ C_W = T_world_
 the runtime's single alignment maps your entire product world, with no
 provider-side reference frame `P0` and no runtime rig knowledge on your side.
 
+### 4b.4a Glass-registered devices: `XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL`
+
+**Normative** (ADR-034 *Amendment 8*). Implemented in
+`m_view_rig_point.c::m_view_rig_physical_plane` (the math),
+`oxr_session.c::session_record_rig_canvas` (recorded per view locate) and
+`oxr_space.c::rig_local_plane_correction` (the per-session re-base).
+
+A tool whose contact with the panel must be honest — a stylus — publishes on
+an origin of type `XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL`. The provider side is
+identical to `RIG_LOCAL`: physical display-plane metres, origin at the
+physical display centre, +X right, +Y up, +Z toward the viewer; no standing
+height, no mount offset, no rig knowledge. The builder anchors the origin
+exactly like a `RIG_LOCAL` one (`u_builders.c::anchor_rig_local_origins`), so
+the space graph resolves it to `rig(t) ∘ L`.
+
+**The rig rule: screen-anchored.** The pen sits on the screen, and the screen
+is where the rig puts the display plane: in a runtime-window session the pen
+follows WASD / mouse-look / a navigating provider exactly as the glass does
+(*Amendment 2*: voluntary rig motion carries it, eye-tracked parallax does
+not). In an external-window session the plane does not move, and neither does
+the pen.
+
+**What differs from `RIG_LOCAL`:** a session never rescales or re-centres `L`
+onto its canvas. `L` is a **physical point of the glass** and lands where the
+session's views put that point:
+
+| Session | A `RIG_LOCAL_PHYSICAL` pose `L` is located at | Why |
+|---|---|---|
+| Runtime-window, no rig chained | `rig(t) ∘ L` (the graph, unchanged) | the head device pose IS the display plane |
+| External-window or bridge relay, no rig chained | `T_origin ∘ L` — the physical plane, **not** the canvas, unscaled | these sessions' views are the DP's raw display-plane eyes (ADR-024); a pen on the glass is on the pixel under it |
+| Any non-bridge session whose latest `xrLocateViews` chained an `XR_DXR_view_rig` | `T_origin ∘ scale(Pg, k) ∘ (Pg ∘ inverse(canvas) ∘ L)` | rebased into the canvas like every eye, then the rig's **glass** mapping: `Pg` = the canvas centre through the rig (`m_view_rig_canvas_plane`; a camera rig's glass on its convergence plane), `k` = the glass scale — display rig `virtualDisplayHeight / canvas height` (Kooima Step 4, *without* `perspectiveFactor`), camera rig its virtual screen height / canvas height |
+
+Consequences, pinned by `tests_view_rig_point` (`[rig_local_physical]`):
+
+- A point **on the glass** is registered exactly under every rig, every canvas
+  (offset, rotated, portrait) and any `perspectiveFactor`.
+- Off the glass the mapping is the eyes' own (`m_view_rig_map_canvas_point`)
+  whenever `perspectiveFactor` is 1. A non-unit factor scales eyes but not the
+  screen; no single point is then consistent with both eyes, and the runtime
+  keeps the glass exact.
+- Radii and linear velocities scale by `k`; orientations and angular
+  velocities are rotated by `Pg ∘ inverse(canvas)`, never scaled.
+- A `RIG_LOCAL_PHYSICAL` target located in a `RIG_LOCAL` base (a pen in a
+  hand's grip space) is placed on its plane, then re-expressed in the base's:
+  the two kinds do not cancel. Two devices of the same kind do.
+- **Hand joints** from a `RIG_LOCAL_PHYSICAL` origin keep `RIG_LOCAL`
+  behaviour (canvas-relative, Amendment 7); glass registration is for tool
+  poses (grip / aim / tip action spaces, `xrLocateSpace(s)`).
+- Before a session's first rigged view locate, and after a locate that chains
+  nothing, the no-rig row applies.
+
 ### 4b.5 What the runtime does with the role — the composer
 
 The runtime binds a runtime-owned `xrt_device`, the **rig composer**
@@ -874,6 +946,14 @@ same prior head tracking assumes. Store, precedence, placement geometry and the 
 scale: `tracking-provider-discovery.md` §6 (*Camera calibration store*); struct:
 `xrt/xrt_camera_pose.h`. Read it at `create_devices` (or on a slow timer, following `generation`),
 never per frame.
+
+**`host->get_handedness()`** — the user's handedness as `enum xrt_input_handedness`
+(`XRT_INPUT_HANDEDNESS_RIGHT = 0`, `_LEFT = 1`): the Handedness class policy of §4 item 7, the
+same answer the builder resolves a `DOMINANT_HAND_CONTROLLER` with (ADR-034 Amendment 8). Carved
+from the former `reserved[8]` (size and offsets unchanged, API major stays 1; NULL on an older
+runtime, announced by `XRT_INPUT_PLUGIN_HOST_HAS_GET_HANDEDNESS`). A non-NULL slot is how a
+provider knows DOMINANT is resolved at all; on an older runtime a DOMINANT device claims no role,
+so a provider that must support one declares LEFT / RIGHT from its own setting there.
 
 ### 4b.7 Testing without hardware
 

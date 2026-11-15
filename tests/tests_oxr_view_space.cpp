@@ -592,6 +592,9 @@ struct BringUp
 	XrViewConfigurationType begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 	//! #2189: enable XR_EXT_hand_tracking when the runtime advertises it.
 	bool hand_tracking = false;
+	//! ADR-034 Amendment 8: enable XR_LOGITECH_mx_ink_stylus_interaction
+	//! (REQUIRED to be advertised when set).
+	bool mx_ink = false;
 };
 
 //! Returns false (after SKIP-ing the test) when the runtime cannot come up
@@ -634,6 +637,10 @@ bring_up(Runtime &rt, const BringUp &opt = BringUp{})
 	}
 	if (rt.have_display_info) {
 		exts.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+	}
+	if (opt.mx_ink) {
+		REQUIRE(has(XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME));
+		exts.push_back(XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME);
 	}
 	rt.have_hand_tracking = opt.hand_tracking && has(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
 	if (rt.have_hand_tracking) {
@@ -2488,5 +2495,108 @@ TEST_CASE("a fixed-viewer locate asks for no viewer: the provider is not started
 	CHECK(again.isTracking == XR_FALSE);
 	CHECK(std::fabs(x_again) < 1e-4f);
 
+	tear_down(rt);
+}
+
+
+/*
+ * ADR-034 Amendment 8: the stylus profile is wired end to end. The extension
+ * is advertised, and with it enabled every input / output path of
+ * /interaction_profiles/logitech/mx_ink_stylus_logitech binds on both hands
+ * (floats for the forces, booleans for the clicks / double taps / dock, the
+ * three poses, haptics). Without the extension the profile is refused, as the
+ * spec requires of a vendor profile.
+ */
+namespace {
+
+XrResult
+suggest_mx_ink(Runtime &rt, bool expect_ok)
+{
+	auto stringToPath = rt.fn<PFN_xrStringToPath>("xrStringToPath");
+	auto createActionSet = rt.fn<PFN_xrCreateActionSet>("xrCreateActionSet");
+	auto createAction = rt.fn<PFN_xrCreateAction>("xrCreateAction");
+	auto suggest = rt.fn<PFN_xrSuggestInteractionProfileBindings>("xrSuggestInteractionProfileBindings");
+
+	auto path = [&](const char *str) {
+		XrPath out = XR_NULL_PATH;
+		REQUIRE(XR_SUCCEEDED(stringToPath(rt.instance, str, &out)));
+		return out;
+	};
+
+	XrActionSetCreateInfo asci = {XR_TYPE_ACTION_SET_CREATE_INFO};
+	std::snprintf(asci.actionSetName, sizeof(asci.actionSetName), "stylus%d", expect_ok ? 1 : 0);
+	std::snprintf(asci.localizedActionSetName, sizeof(asci.localizedActionSetName), "Stylus");
+	XrActionSet set = XR_NULL_HANDLE;
+	REQUIRE(XR_SUCCEEDED(createActionSet(rt.instance, &asci, &set)));
+
+	const XrPath hands[2] = {path("/user/hand/left"), path("/user/hand/right")};
+	auto action = [&](const char *name, XrActionType type) {
+		XrActionCreateInfo aci = {XR_TYPE_ACTION_CREATE_INFO};
+		std::snprintf(aci.actionName, sizeof(aci.actionName), "%s", name);
+		std::snprintf(aci.localizedActionName, sizeof(aci.localizedActionName), "%s", name);
+		aci.actionType = type;
+		aci.countSubactionPaths = 2;
+		aci.subactionPaths = hands;
+		XrAction a = XR_NULL_HANDLE;
+		REQUIRE(XR_SUCCEEDED(createAction(set, &aci, &a)));
+		return a;
+	};
+
+	struct Binding
+	{
+		const char *component;
+		XrAction action;
+	};
+	const Binding components[] = {
+	    {"/input/tip_logitech/force", action("tip_force", XR_ACTION_TYPE_FLOAT_INPUT)},
+	    {"/input/cluster_middle_logitech/force", action("middle_force", XR_ACTION_TYPE_FLOAT_INPUT)},
+	    {"/input/cluster_front_logitech/click", action("front_click", XR_ACTION_TYPE_BOOLEAN_INPUT)},
+	    {"/input/cluster_front_logitech/double_tap_logitech", action("front_dtap", XR_ACTION_TYPE_BOOLEAN_INPUT)},
+	    {"/input/cluster_back_logitech/click", action("back_click", XR_ACTION_TYPE_BOOLEAN_INPUT)},
+	    {"/input/cluster_back_logitech/double_tap_logitech", action("back_dtap", XR_ACTION_TYPE_BOOLEAN_INPUT)},
+	    {"/input/dock_logitech/docked_logitech", action("docked", XR_ACTION_TYPE_BOOLEAN_INPUT)},
+	    {"/input/system/click", action("system", XR_ACTION_TYPE_BOOLEAN_INPUT)},
+	    {"/input/grip/pose", action("grip", XR_ACTION_TYPE_POSE_INPUT)},
+	    {"/input/aim/pose", action("aim", XR_ACTION_TYPE_POSE_INPUT)},
+	    {"/input/tip_logitech/pose", action("tip", XR_ACTION_TYPE_POSE_INPUT)},
+	    {"/output/haptic", action("haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT)},
+	};
+
+	std::vector<XrActionSuggestedBinding> b;
+	for (const char *hand : {"/user/hand/left", "/user/hand/right"}) {
+		for (const Binding &c : components) {
+			const std::string full = std::string(hand) + c.component;
+			b.push_back({c.action, path(full.c_str())});
+		}
+	}
+	XrInteractionProfileSuggestedBinding sb = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+	sb.interactionProfile = path("/interaction_profiles/logitech/mx_ink_stylus_logitech");
+	sb.countSuggestedBindings = (uint32_t)b.size();
+	sb.suggestedBindings = b.data();
+	return suggest(rt.instance, &sb);
+}
+
+} // namespace
+
+TEST_CASE("XR_LOGITECH_mx_ink_stylus_interaction: every profile path binds (ADR-034 Amendment 8)",
+          "[oxr][view_space][stylus_profile]")
+{
+	Runtime rt;
+	BringUp opt;
+	opt.mx_ink = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	CHECK(suggest_mx_ink(rt, true) == XR_SUCCESS);
+	tear_down(rt);
+}
+
+TEST_CASE("the stylus profile is refused without its extension", "[oxr][view_space][stylus_profile]")
+{
+	Runtime rt;
+	if (!bring_up(rt)) {
+		return;
+	}
+	CHECK(suggest_mx_ink(rt, false) == XR_ERROR_PATH_UNSUPPORTED);
 	tear_down(rt);
 }

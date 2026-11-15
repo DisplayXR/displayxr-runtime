@@ -673,3 +673,123 @@ TEST_CASE("RIG_LOCAL is canvas-relative: placement (ADR-034 Amendment 7)", "[vie
 		}
 	}
 }
+
+
+/*
+ * RIG_LOCAL_PHYSICAL is glass-registered (ADR-034 Amendment 8): a physical
+ * display-plane point lands where the
+ * session's views put that point of the
+ * glass — never rescaled to the canvas.
+ */
+TEST_CASE("RIG_LOCAL_PHYSICAL: no rig is the physical plane, unscaled", "[view_rig_point][rig_local_physical]")
+{
+	for (const auto &c : canvases()) {
+		const xrt_pose plane = {quat_axis_angle(0, 1, 0, 0.3f), {0.2f, 1.1f, -0.4f}};
+		xrt_pose q, origin;
+		float s = 0.0f;
+		m_view_rig none{};
+		m_view_rig_physical_plane(&c, &none, &plane, &q, &origin, &s);
+		CHECK(std::memcmp(&q, &plane, sizeof(q)) == 0);
+		CHECK(std::memcmp(&origin, &plane, sizeof(origin)) == 0);
+		CHECK(s == 1.0f);
+		// Contrast RIG_LOCAL in the same window: it re-centres and rescales.
+		for (const auto &p : points()) {
+			xrt_vec3 got, want;
+			m_view_rig_map_physical_point(&c, &none, &plane, &p, &got);
+			math_pose_transform_point(&plane, &p, &want);
+			check_near(got, want, 1e-6f);
+		}
+	}
+}
+
+TEST_CASE("RIG_LOCAL_PHYSICAL: a pen on the glass lands on the pixel it touches",
+          "[view_rig_point][rig_local_physical]")
+{
+	const xrt_pose plane = {{0, 0, 0, 1}, {0, 0, 0}};
+	for (const auto &c : canvases()) {
+		for (const auto &pose : poses()) {
+			for (float pf : {1.0f, 0.5f, 1.7f}) {
+				for (float k : {1.0f, 3.0f}) {
+					m_view_rig rig{};
+					rig.kind = M_VIEW_RIG_DISPLAY;
+					rig.pose = pose;
+					rig.virtual_display_height = c.height_m * k;
+					rig.perspective_factor = pf;
+					const float m2v = k; // virtualDisplayHeight / canvas height
+
+					CHECK(m_view_rig_glass_scale(&c, &rig) == Catch::Approx(m2v));
+
+					// Glass points: the canvas corners and an interior point,
+					// given on the PHYSICAL plane (canvas pose o canvas point).
+					xrt_pose cp;
+					m_view_rig_canvas_pose(&c, &cp);
+					const xrt_vec3 canvas_pts[] = {
+					    {c.width_m * 0.5f, c.height_m * 0.5f, 0.0f},
+					    {-c.width_m * 0.5f, -c.height_m * 0.5f, 0.0f},
+					    {0.03f, -0.02f, 0.0f},
+					};
+					for (const auto &cpt : canvas_pts) {
+						xrt_vec3 phys;
+						math_pose_transform_point(&cp, &cpt, &phys);
+						xrt_vec3 got;
+						m_view_rig_map_physical_point(&c, &rig, &plane, &phys, &got);
+						// Kooima Step 4: the virtual screen is the canvas x m2v at
+						// the rig pose, whatever perspectiveFactor is.
+						const xrt_vec3 scaled = {cpt.x * m2v, cpt.y * m2v, 0.0f};
+						xrt_vec3 want;
+						math_pose_transform_point(&pose, &scaled, &want);
+						check_near(got, want, 2e-5f);
+					}
+				}
+			}
+		}
+	}
+}
+
+TEST_CASE("RIG_LOCAL_PHYSICAL: with perspectiveFactor 1 any point maps as an eye would",
+          "[view_rig_point][rig_local_physical]")
+{
+	const xrt_pose plane = {{0, 0, 0, 1}, {0, 0, 0}};
+	for (const auto &c : canvases()) {
+		for (const auto &pose : poses()) {
+			m_view_rig rig{};
+			rig.kind = M_VIEW_RIG_DISPLAY;
+			rig.pose = pose;
+			rig.virtual_display_height = c.height_m * 2.5f;
+			rig.perspective_factor = 1.0f;
+			for (const auto &p : points()) {
+				xrt_vec3 got;
+				m_view_rig_map_physical_point(&c, &rig, &plane, &p, &got);
+				// The views' own mapping: canvas rebase, then the core's eye.
+				xrt_vec3 in_canvas, want;
+				m_view_rig_canvas_rebase(&c, &p, &in_canvas);
+				m_view_rig_map_canvas_point(&c, &rig, &in_canvas, &want);
+				check_near(got, want, 2e-5f);
+			}
+		}
+	}
+}
+
+TEST_CASE("RIG_LOCAL_PHYSICAL: a camera rig puts the glass on its convergence plane",
+          "[view_rig_point][rig_local_physical]")
+{
+	const m_view_rig_canvas c = canvas_full();
+	const xrt_pose plane = {{0, 0, 0, 1}, {0, 0, 0}};
+	const float conv = 0.5f;
+	const float htan = std::tan(0.525f);
+	m_view_rig rig{};
+	rig.kind = M_VIEW_RIG_CAMERA;
+	rig.pose = {{0, 0, 0, 1}, {0, 0, 0}};
+	rig.m2v = 1.0f;
+	rig.inv_convergence_distance = 1.0f / conv;
+	rig.half_tan_vfov = htan;
+	const float V = 2.0f * htan * conv;
+
+	CHECK(m_view_rig_glass_scale(&c, &rig) == Catch::Approx(V / c.height_m));
+	const xrt_vec3 corner = {c.width_m * 0.5f, c.height_m * 0.5f, 0.0f};
+	xrt_vec3 got, want;
+	m_view_rig_map_physical_point(&c, &rig, &plane, &corner, &got);
+	m_view_rig_map_canvas_point(&c, &rig, &corner, &want);
+	check_near(got, want, 1e-5f);
+	CHECK(got.y / -got.z == Catch::Approx(htan)); // on the frustum's top edge
+}

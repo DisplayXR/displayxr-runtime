@@ -519,11 +519,55 @@ struct xrt_input_plugin_host_iface
 	void (*close_shared_camera)(struct xrt_input_host_camera *cam);
 
 	/*!
+	 * The user's handedness, as @ref xrt_input_handedness (ADR-034
+	 * Amendment 8): the hand a single tool such as a stylus belongs on.
+	 * Class policy, resolved by the runtime — Windows
+	 * `InputProviders\Policy\Handedness` (DWORD, 0 = right, 1 = left; HKCU
+	 * over HKLM under `Policy\Lock`), POSIX a `handedness` file in the
+	 * per-user manifest dir (first byte `l` / `L` = left), absent = right.
+	 * It is what the builder resolves an
+	 * `XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER` with, so a provider rarely
+	 * needs to call it; a non-NULL slot is also how a provider knows the
+	 * runtime resolves DOMINANT at all. Non-blocking; read at init.
+	 *
+	 * Carved out of the former reserved[8], like the slots above: size and
+	 * every other offset unchanged, the API major stays 1. An older runtime
+	 * leaves it NULL — providers MUST NULL-check (and cover-check
+	 * `struct_size`). Announced by @ref XRT_INPUT_PLUGIN_HOST_HAS_GET_HANDEDNESS.
+	 */
+	uint32_t (*get_handedness)(void);
+
+	/*!
 	 * Reserved space for forward-compatible host-supplied callbacks.
 	 * Providers MUST NOT dereference any reserved slot.
 	 */
-	void *reserved[6];
+	void *reserved[5];
 };
+
+/*!
+ * Values of @ref xrt_input_plugin_host_iface::get_handedness. Fixed values
+ * (ABI): never renumber.
+ */
+enum xrt_input_handedness
+{
+	XRT_INPUT_HANDEDNESS_RIGHT = 0,
+	XRT_INPUT_HANDEDNESS_LEFT = 1,
+};
+
+/*!
+ * Defined when this header carries
+ * @ref xrt_input_plugin_host_iface::get_handedness and the runtime resolves
+ * `XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER` (ADR-034 Amendment 8).
+ */
+#define XRT_INPUT_PLUGIN_HOST_HAS_GET_HANDEDNESS 1
+
+/*!
+ * Defined when this runtime header set carries the stylus pieces of ADR-034
+ * Amendment 8: `XRT_DEVICE_MX_INK_STYLUS` + the `XRT_INPUT_MX_INK_*` inputs
+ * (`xrt_defines.h`), `XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER`, and
+ * `XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL` (`xrt_tracking.h`).
+ */
+#define XRT_INPUT_PLUGIN_HAS_STYLUS 1
 
 /*!
  * Defined when this header carries the
@@ -557,8 +601,8 @@ struct xrt_input_plugin_host_iface
 #define XRT_INPUT_PLUGIN_HOST_HAS_SHARED_CAMERA 1
 
 // The get_display_geometry, get_setting, poll_pointer_events, get_camera_pose,
-// open_shared_camera, camera_acquire, camera_release and close_shared_camera
-// slots were carved out of the former reserved[0] .. [7], in that order: the
+// open_shared_camera, camera_acquire, camera_release, close_shared_camera and
+// get_handedness slots were carved out of the former reserved[0] .. [8], in that order: the
 // host iface's size and every other offset are unchanged, so providers built
 // against the previous header keep working and the API major stays 1.
 // clang-format off
@@ -590,9 +634,13 @@ XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, close_s
                                 offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
                                     7 * sizeof(void *),
                             "xrt_input_plugin_host_iface: close_shared_camera must occupy the former reserved[7]");
-XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, reserved) ==
+XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, get_handedness) ==
                                 offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
                                     8 * sizeof(void *),
+                            "xrt_input_plugin_host_iface: get_handedness must occupy the former reserved[8]");
+XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, reserved) ==
+                                offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
+                                    9 * sizeof(void *),
                             "xrt_input_plugin_host_iface: get_display_geometry must occupy the former reserved[0]");
 XRT_INPUT_PLUGIN_ABI_ASSERT(sizeof(struct xrt_input_plugin_host_iface) ==
                                 2 * sizeof(uint32_t) + 14 * sizeof(void *),
@@ -678,9 +726,28 @@ struct xrt_input_plugin_iface
 	 *
 	 * Each returned device is an ordinary @ref xrt_device that
 	 * self-describes: `device_type`
-	 * (`XRT_DEVICE_TYPE_{LEFT,RIGHT,ANY}_HAND_CONTROLLER`, …) plus the
-	 * interaction profile it binds via `name` / `binding_profiles`
-	 * (an existing profile from `bindings.json`). The device must
+	 * (`XRT_DEVICE_TYPE_{LEFT,RIGHT,ANY,DOMINANT}_HAND_CONTROLLER`, …) plus
+	 * the interaction profile it binds via `name` / `binding_profiles`
+	 * (an existing profile from `bindings.json`).
+	 *
+	 * A single hand-held tool — a stylus — should declare
+	 * `XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER` (ADR-034 Amendment 8): the
+	 * builder resolves it in place to RIGHT or LEFT from the user's
+	 * handedness policy (@ref xrt_input_plugin_host_iface::get_handedness)
+	 * before any role is read. `ANY_HAND_CONTROLLER` always lands on the
+	 * LEFT hand first and is meant for a pair whose sides are
+	 * interchangeable, never for one pen. A provider that must also run on
+	 * a runtime without @ref XRT_INPUT_PLUGIN_HOST_HAS_GET_HANDEDNESS
+	 * (where DOMINANT claims no role) declares LEFT / RIGHT itself, e.g.
+	 * from its own `HAND` setting through `get_setting`.
+	 *
+	 * A stylus binds `XRT_DEVICE_MX_INK_STYLUS`
+	 * (`/interaction_profiles/logitech/mx_ink_stylus_logitech`,
+	 * `XR_LOGITECH_mx_ink_stylus_interaction`) with the
+	 * `XRT_INPUT_MX_INK_*` inputs and `XRT_OUTPUT_NAME_MX_INK_HAPTIC`, and
+	 * publishes its poses on an `XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL`
+	 * origin, so a tip touching the panel lands where the app renders that
+	 * point of the glass (input-provider-discovery.md §4b.4a). The device must
 	 * implement `update_inputs`, `get_tracked_pose` (timestamp-correct
 	 * prediction — push samples into `m_relation_history` and predict
 	 * on demand for asynchronously-fed hardware), `set_output`
