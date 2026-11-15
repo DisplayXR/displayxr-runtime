@@ -158,9 +158,9 @@ oxr_system_fill_in(
 	sys->systemId = systemId;
 	sys->view_count = view_count;
 
-	// #1510: the legacy mode floor is re-decided from scratch on every
-	// fill_in, so clear it here rather than relying on the handle allocation
-	// (this function can run more than once for a system).
+	// #1510: the legacy mode floor is decided from scratch here, so clear it
+	// rather than relying on the handle allocation. (fill_in runs once per
+	// instance, from xrCreateInstance; see the view-scale note below.)
 	sys->legacy_rendering_mode_index = 0;
 	sys->legacy_rendering_mode_forced = false;
 	sys->legacy_mode_unfillable = false;
@@ -351,9 +351,9 @@ oxr_system_fill_in(
 #define imin(a, b) (a < b ? a : b)
 	/*
 	 * Deliberately the DISPLAY-level baseline, not the active mode's scale.
-	 * oxr_system_fill_in() runs exactly once, from xrCreateInstance, before any
-	 * session exists and therefore before any mode change could have happened —
-	 * so the baseline is what it has always read here, and sizing sys->views[]
+	 * oxr_system_fill_in() runs once per instance, from xrCreateInstance (its
+	 * only call site), before any session exists and therefore before any mode
+	 * change could have happened — so the baseline is what it has always read here, and sizing sys->views[]
 	 * from a per-mode number would be a behaviour change dressed up as a
 	 * refactor. The legacy branch below replaces both values with the
 	 * compromise scale anyway (oxr_legacy_compromise_scale), which DOES read the
