@@ -13521,6 +13521,12 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		 * post-compose dispatch.
 		 */
 		const bool t2_skip = comp_hub_d3d11_hidden_skip(c->split, /*pace=*/true);
+		if (t2_skip && c->hub_capture.pending && !c->capture_intent.pending) {
+			// Handed to the hub for this frame: nothing is woven, so the
+			// frame path's own post-compose atlas capture answers it.
+			c->capture_intent = c->hub_capture;
+			c->hub_capture.pending = false;
+		}
 		if (t2_skip && c->capture_intent.pending) {
 			U_LOG_W("ADR-062 vk: capture while the window is hidden on every screen - the atlas only (no weave "
 			        "runs while hidden)");

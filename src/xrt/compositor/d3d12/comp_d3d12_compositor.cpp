@@ -5753,7 +5753,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		}
 		// ADR-062 D3: no re-weave of a window nobody can see; the first tick
 		// after it is seen again re-weaves the retained frame.
-		if (d3d12_t2_skip(c, /*pace=*/false)) {
+		if (!c->has_shared_texture && u_window_visibility_hidden_everywhere(c->visibility)) {
 			c->repaint.bail_gate++;
 			continue;
 		}
@@ -7130,6 +7130,12 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		 * hub's first repaint after the window is seen again re-weaves it.
 		 */
 		if (!c->reroute.client_presents && comp_hub_d3d11_hidden_skip(c->reroute.split, /*pace=*/true)) {
+			// A capture handed to the hub for this frame comes back: nothing is
+			// woven, the tier's own atlas capture answers it.
+			if (c->reroute.capture.pending && !c->capture_intent.pending) {
+				c->capture_intent = c->reroute.capture;
+				c->reroute.capture.pending = false;
+			}
 			c->repaint.tgt_w = tgt_width;
 			c->repaint.tgt_h = tgt_height;
 			c->repaint.view_w = c->eff_layout.tile_w;

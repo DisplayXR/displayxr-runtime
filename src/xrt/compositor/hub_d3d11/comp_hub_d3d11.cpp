@@ -5904,8 +5904,8 @@ comp_hub_d3d11_repaint(struct comp_hub_d3d11 *s, bool partition_engaged, const s
 	}
 	// ADR-062 D3: no re-weave of a window nobody can see. The first tick
 	// after it is seen again re-weaves the retained frame.
-	if (comp_hub_d3d11_hidden_skip(s, /*pace=*/false)) {
-		return COMP_HUB_D3D11_REPAINT_NOT_ADMITTED;
+	if (!s->client_presents && u_window_visibility_hidden_everywhere(s->vis)) {
+		return COMP_HUB_D3D11_REPAINT_NOT_ADMITTED; // not counted: the ledger counts app frames
 	}
 	// #2635: the app presents through a Present hook that also hooks this
 	// chain — a repaint present from this thread would deadlock against it.

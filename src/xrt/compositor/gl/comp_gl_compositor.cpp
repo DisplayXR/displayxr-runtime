@@ -5864,6 +5864,12 @@ gl_hub_commit(struct comp_gl_compositor *c, const struct comp_segments_content *
 	 */
 	if (comp_hub_d3d11_hidden_skip(c->hub.split, /*pace=*/true)) {
 		c->repaint.armed = true;
+		// A capture handed to the hub for this frame comes back: nothing is
+		// woven, the tier's own atlas capture answers it.
+		if (c->hub.capture.pending && !c->capture_intent.pending) {
+			c->capture_intent = c->hub.capture;
+			c->hub.capture.pending = false;
+		}
 		if (c->capture_intent.pending) {
 			U_LOG_W("ADR-062 gl: capture while the window is hidden on every screen - the atlas only (no "
 			        "weave runs while hidden)");
@@ -5934,7 +5940,7 @@ gl_window_present(struct comp_gl_compositor *c, GLuint atlas_for_present, float 
 	// ADR-062 D3 (tier 2): hidden on every screen — no weave, no swap. The
 	// replay stays armed; its first tick after the window is seen again
 	// re-weaves the retained atlas.
-	if (gl_t2_skip(c, !is_repaint)) {
+	if (is_repaint ? u_window_visibility_hidden_everywhere(c->visibility) : gl_t2_skip(c, true)) {
 		if (!is_repaint && c->owns_window && c->own_window != NULL) {
 			comp_d3d11_window_signal_paint_done(c->own_window);
 		}

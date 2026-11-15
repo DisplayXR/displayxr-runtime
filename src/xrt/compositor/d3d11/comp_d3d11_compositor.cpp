@@ -4426,7 +4426,7 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		}
 		// ADR-062 D3: no re-weave of a window nobody can see; the first tick
 		// after it is seen again re-weaves the retained frame.
-		if (d3d11_t2_skip(c)) {
+		if (!c->has_shared_texture && u_window_visibility_hidden_everywhere(c->visibility)) {
 			c->repaint.bail_gate++;
 			continue;
 		}
@@ -5454,6 +5454,12 @@ d3d11_hub_commit(struct comp_d3d11_compositor *c,
 	 * Unpresented, so wait_frame paces the app on the period grid (#2386).
 	 */
 	if (comp_hub_d3d11_hidden_skip(c->hub.split, /*pace=*/false)) {
+		// A capture handed to the hub for this frame comes back: nothing is
+		// woven, the tier's own atlas capture answers it.
+		if (c->hub.capture.pending && !c->capture_intent.pending) {
+			c->capture_intent = c->hub.capture;
+			c->hub.capture.pending = false;
+		}
 		c->repaint.canvas = *eff_canvas;
 		c->repaint.eye_pos = *eye_pos;
 		c->repaint.zero_copy = false;
