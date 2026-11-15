@@ -498,6 +498,14 @@ struct u_window_visibility_state
 	//! The process owning the largest occluder of the last check ("" = none).
 	char occluder[U_WINDOW_VISIBILITY_NAME_MAX];
 	uint64_t since_ns; //!< monotonic time of the last debounced transition (0 = none yet)
+	/*!
+	 * ADR-062 D4 (tier 3): debounced, hidden on every screen the window
+	 * covers — @ref hidden_everywhere without the tier-2 switch, so the app
+	 * is told the same thing whether or not tier 2 is on.
+	 */
+	bool hidden_every_screen;
+	//! ADR-062 D4: why, judged over every screen, as of the last check.
+	enum u_wv_reason reason_every_screen;
 };
 
 /*!
@@ -506,6 +514,15 @@ struct u_window_visibility_state
  */
 void
 u_window_visibility_get_state(const struct u_window_visibility *wv, struct u_window_visibility_state *out);
+
+/*!
+ * ADR-062 D4 (tier 3): the tracked window's root is the OS foreground window
+ * (Windows: GetForegroundWindow's root window equals the target's). Asked on
+ * call, never cached. False for a NULL tracker, no window, or a platform
+ * without the fact. Any thread; a short shared lock and two cheap calls.
+ */
+bool
+u_window_visibility_foreground(const struct u_window_visibility *wv);
 
 /*!
  * Change the 3D screen (a hotplug or a re-resolved panel). Any thread.

@@ -131,6 +131,7 @@ struct u_window_visibility
 	uint32_t screens_gen;
 	//! Published for u_window_visibility_get_state (under panel_lock).
 	enum u_wv_reason pub_reason;
+	enum u_wv_reason pub_reason_all; //!< ADR-062 D4: the every-screen reason
 	char pub_occluder[U_WINDOW_VISIBILITY_NAME_MAX];
 	uint64_t pub_since_ns;
 
@@ -609,6 +610,7 @@ wv_publish(struct u_window_visibility *wv, bool edge, uint64_t now_ns)
 {
 	AcquireSRWLockExclusive(&wv->panel_lock);
 	wv->pub_reason = wv->raw_reason;
+	wv->pub_reason_all = wv->raw_reason_all;
 	memcpy(wv->pub_occluder, wv->occluder, sizeof(wv->pub_occluder));
 	if (edge) {
 		wv->pub_since_ns = now_ns;
@@ -1031,15 +1033,39 @@ u_window_visibility_get_state(const struct u_window_visibility *wv, struct u_win
 	AcquireSRWLockShared(&m->panel_lock);
 	out->tracked = m->thread != NULL;
 	out->reason = m->pub_reason;
+	out->reason_every_screen = m->pub_reason_all;
 	memcpy(out->occluder, m->pub_occluder, sizeof(out->occluder));
 	out->occluder[sizeof(out->occluder) - 1] = '\0';
 	out->since_ns = m->pub_since_ns;
 	ReleaseSRWLockShared(&m->panel_lock);
 	out->hidden = u_window_visibility_hidden(wv);
 	out->hidden_everywhere = u_window_visibility_hidden_everywhere(wv);
+	out->hidden_every_screen = InterlockedCompareExchange(&m->hidden_all, 0, 0) != 0;
 	if (out->reason != U_WV_REASON_COVERED && out->reason != U_WV_REASON_PARTLY_COVERED) {
 		out->occluder[0] = '\0';
 	}
+}
+
+bool
+u_window_visibility_foreground(const struct u_window_visibility *wv)
+{
+	if (wv == NULL) {
+		return false;
+	}
+	struct u_window_visibility *m = (struct u_window_visibility *)wv;
+	AcquireSRWLockShared(&m->panel_lock);
+	const HWND target = m->target;
+	ReleaseSRWLockShared(&m->panel_lock);
+	if (target == NULL) {
+		return false;
+	}
+	const HWND fg = GetForegroundWindow();
+	if (fg == NULL) {
+		return false;
+	}
+	const HWND fg_root = GetAncestor(fg, GA_ROOT);
+	const HWND target_root = GetAncestor(target, GA_ROOT);
+	return target_root != NULL && (fg_root != NULL ? fg_root : fg) == target_root;
 }
 
 static void
