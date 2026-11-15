@@ -9825,9 +9825,6 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	os_mutex_init(&c->seg_pub_mutex);
 #endif
 
-	mcp_capture_init(&c->mcp_capture);
-	mcp_capture_install(&c->mcp_capture);
-
 	// Get window dimensions
 	uint32_t width = GL_DEFAULT_WIDTH;
 	uint32_t height = GL_DEFAULT_HEIGHT;
@@ -10142,6 +10139,12 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	// Visibility/focus flags for state transitions
 	xc->info.initial_visible = true;
 	xc->info.initial_focused = true;
+
+	// Install MCP capture_frame hook + arm the trigger-file path (#210).
+	// Last, once nothing below can fail (#2623): the hook is a process
+	// global, and an earlier failure return frees c without uninstalling it.
+	mcp_capture_init(&c->mcp_capture);
+	mcp_capture_install(&c->mcp_capture);
 
 	*out_xcn = &c->base;
 
