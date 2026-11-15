@@ -996,6 +996,53 @@ comp_d3d12_target_predict_weave_to_scanout_ns(struct comp_d3d12_target *target)
 	return g_weave_latency_d3d12.predict_weave_to_scanout_ns();
 }
 
+/*!
+ * The Present call itself, bounded like the D3D11 target's target_present_call
+ * (#925 S1, comp_d3d11_target.cpp).
+ *
+ * The caller holds the compositor mutex, and a plain Present(1, 0) into a
+ * jammed flip chain can block for minutes there, freezing the app's render
+ * thread and everything waiting on the lock. This Present is deliberately the
+ * frame pacer (Present(1) waits <= 1 vsync when healthy), so keep the pacing
+ * shape but bound the wedge: a non-blocking present retried at ~1 ms cadence
+ * up to a 50 ms (~3 vsync) deadline, then the frame is dropped
+ * (DXGI_ERROR_WAS_STILL_DRAWING is returned, as on D3D11). A jammed chain
+ * degrades to slow frames instead of a hang.
+ *
+ * Not bounded here, as on D3D11 before #2603: a Present that blocks INSIDE the
+ * driver below DXGI's queue check (the in-driver cross-adapter wait the #1000
+ * watchdog names and the #2603 worker cuts off). Neither is ported to D3D12.
+ */
+static HRESULT
+target_present_call(struct comp_d3d12_target *target, uint32_t sync_interval)
+{
+	if (sync_interval == 0) {
+		return target->swapchain->Present(0, 0); // immediate — never blocks on the chain
+	}
+	HRESULT hr;
+	const int64_t deadline_ns = (int64_t)os_monotonic_get_ns() + 50LL * 1000000LL;
+	for (;;) {
+		hr = target->swapchain->Present(sync_interval, DXGI_PRESENT_DO_NOT_WAIT);
+		if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+			break;
+		}
+		if ((int64_t)os_monotonic_get_ns() >= deadline_ns) {
+			static std::atomic<int64_t> s_last_drop_log_ns{0};
+			const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+			int64_t prev_ns = s_last_drop_log_ns.load(std::memory_order_relaxed);
+			if (now_ns - prev_ns > 1000000000LL &&
+			    s_last_drop_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+				U_LOG_W(
+				    "d3d12 target present: frame dropped after 50 ms — "
+				    "DWM not consuming flips (#924/#925)");
+			}
+			break;
+		}
+		Sleep(1);
+	}
+	return hr;
+}
+
 extern "C" xrt_result_t
 comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interval)
 {
@@ -1005,7 +1052,7 @@ comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interv
 		return XRT_ERROR_D3D;
 	}
 
-	HRESULT hr = target->swapchain->Present(sync_interval, 0);
+	HRESULT hr = target_present_call(target, sync_interval);
 	if (SUCCEEDED(hr)) {
 		g_frame_witness_d3d12.count_present();
 	}
@@ -1014,6 +1061,11 @@ comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interv
 		target->swapchain->GetLastPresentCount(&target->last_present_count);
 	}
 	if (FAILED(hr)) {
+		// A frame dropped at the 50 ms bound: already WARNed (rate-limited)
+		// by target_present_call, and not a device loss.
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			return XRT_ERROR_D3D;
+		}
 		// A removed/reset device latches and logs once (with the reason);
 		// anything else is rate-limited — never an ERROR per frame.
 		if (!target_check_device_lost(target, hr, "Present")) {
