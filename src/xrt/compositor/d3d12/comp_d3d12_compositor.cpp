@@ -3503,9 +3503,10 @@ d3d12_visibility_changed(void *userdata, bool hidden)
 		return;
 	}
 #endif
-	// A published zone wish owns the lens (ADR-027): seen again, the next
-	// publish restores its verdict, so the session's mode is not re-sent.
-	if (c->display_processor != nullptr && (hidden || !c->zone_published)) {
+	// Seen again: the session's mode first, always. A published zone wish then
+	// re-sends its own verdict on the next (from-scratch) publish; a publish
+	// the DP accepted but never evaluated must not leave the lens 2D.
+	if (c->display_processor != nullptr) {
 		// A mode switch perturbs the display: drain the present first, as
 		// the request_display_mode entry point does.
 		gpu_wait_idle_out(c);

@@ -1161,9 +1161,10 @@ d3d11_visibility_changed(void *userdata, bool hidden)
 	}
 	if (c->hub.split != nullptr) {
 		comp_hub_d3d11_set_window_hidden(c->hub.split, hidden);
-	} else if (c->display_processor != nullptr && (hidden || !c->zone_published)) {
-		// A published zone wish owns the lens (ADR-027): seen again, the next
-		// publish restores its verdict, so the session's mode is not re-sent.
+	} else if (c->display_processor != nullptr) {
+		// Seen again: the session's mode first, always. A published zone wish
+		// then re-sends its own verdict on the next (from-scratch) publish; a
+		// publish the DP accepted but never evaluated must not leave the lens 2D.
 		xrt_display_processor_d3d11_request_display_mode(
 		    c->display_processor, c->session_wants_3d.load() && !c->seg_primary_uncovered.load() && !hidden);
 	}

@@ -15656,8 +15656,8 @@ pipeline_lens_visibility_tick(struct d3d11_service_system *sys,
 	}
 	mc->lens_hidden_applied = hidden;
 	struct xrt_display_processor_d3d11 *dp = fc != nullptr ? panel_dp(sys, fc) : mc->display_processor;
-	// A published zone wish owns the lens (ADR-027): on release its next
-	// publish restores the verdict, so the session's mode is not re-sent.
+	// On release the session's mode goes first, always; a published zone wish
+	// then re-sends its own verdict on its next (from-scratch) publish.
 	const bool zone_owns = fc != nullptr && fc->zone_published;
 	if (hidden) {
 		g_svc_presenter_hidden.store(true, std::memory_order_release);
@@ -15667,7 +15667,7 @@ pipeline_lens_visibility_tick(struct d3d11_service_system *sys,
 		}
 	} else {
 		g_svc_presenter_hidden.store(false, std::memory_order_release);
-		if (dp != nullptr && sys->hardware_display_3d && !zone_owns) {
+		if (dp != nullptr && sys->hardware_display_3d) {
 			(void)DP_REQUEST_DISPLAY_MODE(dp, true);
 		}
 		// The vendor lags the command: keep the poll from counter-correcting.
@@ -15675,7 +15675,7 @@ pipeline_lens_visibility_tick(struct d3d11_service_system *sys,
 	}
 	U_LOG_W("#2671 service: presenter window %s, panel lens wish %s", hidden ? "hidden" : "visible (or changed)",
 	        hidden      ? "2D"
-	        : zone_owns ? "the zone wish's (re-published)"
+	        : zone_owns ? "the session's mode, then the zone wish (re-published)"
 	                    : (sys->hardware_display_3d ? "the session's 3D" : "the session's 2D"));
 }
 

@@ -5289,9 +5289,10 @@ gl_visibility_changed(void *userdata, bool hidden)
 		return;
 	}
 #endif
-	// A published zone wish owns the lens (ADR-027): seen again, the next
-	// publish restores its verdict, so the session's mode is not re-sent.
-	if (c->display_processor != NULL && (hidden || !c->zone_published)) {
+	// Seen again: the session's mode first, always. A published zone wish then
+	// re-sends its own verdict on the next (from-scratch) publish; a publish
+	// the DP accepted but never evaluated must not leave the lens 2D.
+	if (c->display_processor != NULL) {
 		xrt_display_processor_gl_request_display_mode(
 		    c->display_processor, c->session_wants_3d && !c->seg_primary_uncovered && !hidden);
 	}

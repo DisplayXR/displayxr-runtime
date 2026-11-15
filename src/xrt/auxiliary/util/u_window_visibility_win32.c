@@ -414,7 +414,9 @@ static void
 wv_update_screens(struct u_window_visibility *wv, uint64_t now_ns)
 {
 	char names[U_WINDOW_VISIBILITY_MAX_SCREENS][128];
+	char panel[sizeof(wv->panel)];
 	AcquireSRWLockShared(&wv->panel_lock);
+	memcpy(panel, wv->panel, sizeof(panel));
 	const uint32_t n = wv->screen_count;
 	const bool same_gen = wv->screens_gen == wv->screens_gen_seen;
 	for (uint32_t i = 0; i < n; i++) {
@@ -431,6 +433,10 @@ wv_update_screens(struct u_window_visibility *wv, uint64_t now_ns)
 		    u_wv_debounce_update(&wv->screen_debounce[i], raw, now_ns, U_WINDOW_VISIBILITY_HIDE_DWELL_NS);
 		if (now != was) {
 			InterlockedExchange(&wv->screens[i].hidden, now ? 1 : 0);
+			// The session's own screen already logs through the main transition.
+			if (_stricmp(names[i], panel) == 0) {
+				continue;
+			}
 			U_LOG_W("#2671 %s: the window's part on 3D screen '%s' is %s - that screen's lens wish %s",
 			        wv->who, names[i], now ? "hidden" : "visible again",
 			        now ? "2D" : "back to the session's mode");

@@ -14900,12 +14900,11 @@ vk_visibility_changed(void *userdata, bool hidden)
 		InterlockedExchange(&c->zone_reeval_owed, 1);
 	}
 	if (c->display_processor != NULL) {
-		// A published zone wish owns the lens (ADR-027): seen again, the next
-		// publish restores its verdict, so the session's mode is not re-sent.
-		if (hidden || !c->zone_published) {
-			(void)xrt_display_processor_request_display_mode(
-			    c->display_processor, c->session_wants_3d && !c->seg_primary_uncovered && !hidden);
-		}
+		// Seen again: the session's mode first, always. A published zone wish
+		// then re-sends its own verdict on the next (from-scratch) publish; a
+		// publish the DP accepted but never evaluated must not leave the lens 2D.
+		(void)xrt_display_processor_request_display_mode(
+		    c->display_processor, c->session_wants_3d && !c->seg_primary_uncovered && !hidden);
 	} else if (c->split != NULL) {
 		comp_hub_d3d11_set_window_hidden(c->split, hidden);
 	}

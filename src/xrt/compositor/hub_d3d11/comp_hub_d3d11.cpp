@@ -6137,11 +6137,11 @@ comp_hub_d3d11_set_window_hidden(struct comp_hub_d3d11 *s, bool hidden)
 		InterlockedExchange(&s->zone_reeval_owed, 1);
 	}
 	// Under automatic 2D the lens is already held 2D and its release applies
-	// this gate (u_display_mode_hold.h rule); nothing to send. A published zone
-	// wish owns the lens (ADR-027): seen again, the next publish restores its
-	// verdict, so the session's mode is not re-sent over it.
-	const bool zone_owns = !hidden && s->zone_published;
-	if (edge && !s->auto_held && !zone_owns && s->dp != nullptr) {
+	// this gate (u_display_mode_hold.h rule); nothing to send. Seen again, the
+	// session's mode goes first, always: a published zone wish re-sends its own
+	// verdict on the next (from-scratch) publish, and a publish the DP accepted
+	// but never evaluated must not leave the lens 2D.
+	if (edge && !s->auto_held && s->dp != nullptr) {
 		xrt_display_processor_d3d11_request_display_mode(s->dp, s->mode_3d && !split_primary_gate_2d(s));
 	}
 	os_mutex_unlock(&s->dp_mutex);
