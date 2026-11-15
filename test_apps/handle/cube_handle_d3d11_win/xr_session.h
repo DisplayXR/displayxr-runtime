@@ -16,6 +16,7 @@
 #include <openxr/XR_DXR_local_3d_zone.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_cursor_depth.h>
+#include <openxr/XR_DXR_window_visibility.h>
 
 // INV-1.3 (#715): 3D panel top-left in virtual-desktop pixels (top-down,
 // origin = primary top-left); (0,0) = primary/unknown. Filled by
@@ -58,6 +59,14 @@ extern bool g_submitDepthLayer;
 // swapchain (it allocates at maxImageRect*, which the extension forbids
 // moving, and re-points subImage.imageRect per frame).
 extern bool g_hasViewsChangeExt;
+
+// ADR-062 D4 - XR_DXR_window_visibility verify vehicle. DISPLAYXR_WINDOW_VISIBILITY=1
+// enables the extension (events only); =demote also chains
+// XrSessionWindowVisibilityInfoDXR{demoteWhenHidden=XR_TRUE}. The app logs every
+// shouldRender edge; the runtime logs each event and the shared PollEvents logs
+// the session states it receives. Unset: the extension is not enabled.
+extern bool g_windowVisibilityExt;
+extern bool g_windowVisibilityDemote;
 
 // #1488 — re-enumerate xrEnumerateViewConfigurationViews and LOG_INFO the
 // recommendedImageRect dims when they move, with a running counter. Filters on
