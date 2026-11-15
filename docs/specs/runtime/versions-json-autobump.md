@@ -69,14 +69,19 @@ gated on `Runtime` succeeding. It:
 
 1. Reads the currently-pinned `leia_plugin` field from
    `versions.json`.
-2. Runs `scripts/check_plugin_abi.py --leia-tag <pin>` against the
-   runtime tree being released.
-3. **ABI OK** → bumps `versions.json[runtime]` to `GITHUB_REF_NAME`,
+2. Runs `scripts/check_plugin_abi.py --leia-tag <pin> --runtime-tag
+   "$GITHUB_REF_NAME"`, so the header gated is the **tagged** one being
+   released, not `main`'s (the job checks out `main` to commit the bump,
+   and `main` may already have moved past the tag).
+3. **ABI OK** (rc 0) → bumps `versions.json[runtime]` to `GITHUB_REF_NAME`,
    commits via the `displayxr-publish-bot` GitHub App.
-4. **ABI mismatch** → skips the bump and opens (or comments on) an
+4. **ABI mismatch** (rc 1) → skips the bump and opens (or comments on) an
    issue in `displayxr-leia-plugin` titled *"ABI mismatch: leia
    v1.0.X cannot load runtime v1.Y.Z"* asking for a rebuild. The
    orchestrator stack stays on the last known-good bundle.
+5. **Gate could not run** (rc 2, or any other non-zero) → the job
+   **fails** with an `::error::` annotation. No bump, and **no** issue:
+   a network blip or a missing tag is not evidence of a mismatch.
 
 ## Sibling auto-bump (lives in this repo's `versions-bump.yml`)
 
@@ -415,7 +420,16 @@ ABI version is fully derivable from its source tree at that tag.
 3. Fetches `xrt_plugin.h` at that runtime tag, extracts the same
    macro — that is what the plug-in's `xrtPluginNegotiate()` will
    report.
-4. Exit 0 on match, non-zero on mismatch with a clear diagnostic.
+4. Exits **0** on match, **1** on a real mismatch (with a clear
+   diagnostic), **2** when the check could not run (a fetch failed, a
+   tag or file is missing, a header did not parse). Callers must tell
+   1 and 2 apart (#2610): only 1 opens an issue and skips the bump; any
+   other non-zero fails the job loudly, because a false mismatch issue
+   plus a green, silently skipped bump is worse than a red run.
+
+Fetches from `raw.githubusercontent.com` retry transient failures
+(connection errors, timeouts, HTTP 429 and 5xx) three times with
+backoff; a 404 is an answer and fails at once.
 
 The script runs in two places:
 
@@ -424,8 +438,10 @@ The script runs in two places:
   itself ships a new tag — checks whether the *currently-pinned*
   leia still loads against the new runtime.
 
-If either check fails, the bump is dropped and an issue lands on
-`displayxr-leia-plugin` describing the mismatch and what to rebuild.
+If either check finds a mismatch (rc 1), the bump is dropped and an
+issue lands on `displayxr-leia-plugin` describing the mismatch and what
+to rebuild. If the check cannot run (rc 2), the job fails and no issue
+is opened.
 
 ## Why direct commit (no PR review)
 
@@ -500,6 +516,7 @@ known-good matrix that's been continuously curated by this flow.
 | Two siblings race the same `versions.json` write | `concurrency: versions-bump` serializes them | None needed |
 | ABI mismatch on leia bump | Bump skipped, issue opened on leia repo | Rebuild leia against current runtime, tag a new release |
 | ABI mismatch on runtime self-bump | Bump skipped, issue opened on leia repo | Rebuild leia + tag, *then* re-run `workflow_dispatch` on `versions-bump.yml` with `field=runtime, tag=<this runtime tag>` |
+| ABI gate could not run (rc 2: network after retries, missing tag/file, unparsable header) | Job fails red with `::error::`; no bump, no issue | Fix the cause, then re-run the failed job (runtime self-bump) or the `versions-bump.yml` run (leia bump) |
 | A `versions.json` field is edited by hand and merged as an ordinary PR | `versions-mirror.yml` mirrors it to `displayxr-installer` within ~1 min of the merge | None needed. Before that workflow existed this silently blocked every bundle release (`assert-versions-in-sync`) until the next component bump |
 | Sibling repo forgets the dispatch step | `versions.json` doesn't update | Manual `workflow_dispatch` on `versions-bump.yml` with the field + tag, then fix the sibling repo's release workflow |
 | `displayxr-publish-bot` token expires | All bumps fail with auth error | Rotate the GitHub App's private key per `.secrets/NOTE.md` |
