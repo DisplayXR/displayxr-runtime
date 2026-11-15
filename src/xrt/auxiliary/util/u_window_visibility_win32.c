@@ -404,7 +404,12 @@ wv_check(struct u_window_visibility *wv)
 			root = target;
 		}
 		ws.visible = IsWindowVisible(root) && IsWindowVisible(target);
-		ws.minimized = IsIconic(root) != FALSE;
+		// An OWNED top-level window (an engine's overlay popup owned by its
+		// main window) is hidden, not iconic, when its owner is minimized:
+		// report that as minimized, not as "not visible", so the minimize
+		// rules (ADR-062 D1/D4) apply to it the same as to the owner.
+		HWND root_owner = GetAncestor(target, GA_ROOTOWNER);
+		ws.minimized = IsIconic(root) != FALSE || (root_owner != NULL && root_owner != root && IsIconic(root_owner));
 		ws.cloaked = wv_cloaked(root);
 		if (ws.visible) {
 			wv->ever_shown = true;
