@@ -1854,8 +1854,21 @@ metal_swapchain_destroy(struct xrt_swapchain *xsc)
 {
 	struct comp_metal_swapchain *msc = metal_swapchain(xsc);
 
+	// #2621: this file is MRR — `= nil` releases nothing. Each image is +1
+	// from newTextureWithDescriptor: in create_swapchain; nil (never created,
+	// an early create failure) is a no-op release.
 	for (uint32_t i = 0; i < msc->image_count; i++) {
+		[msc->images[i] release];
 		msc->images[i] = nil;
+		// The native handle carries the second IOSurface reference (the
+		// CFRetain in create_swapchain). A Vulkan client's import consumes it
+		// (vk_create_image_from_native -> u_graphics_buffer_unref, which
+		// CFReleases and NULLs this very slot); native Metal and GL-over-Metal
+		// clients never do, so it is still ours here.
+		if (msc->base.images[i].handle != NULL) {
+			CFRelease((CFTypeRef)msc->base.images[i].handle);
+			msc->base.images[i].handle = NULL;
+		}
 		if (msc->iosurfaces[i] != NULL) {
 			CFRelease(msc->iosurfaces[i]);
 			msc->iosurfaces[i] = NULL;
