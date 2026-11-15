@@ -1065,6 +1065,56 @@ mono_auto_2d_push_event(struct oxr_logger *log, struct oxr_session *sess, bool h
 	}
 }
 
+bool
+oxr_session_window_hidden(struct oxr_session *sess)
+{
+	if (sess == NULL || sess->xcn == NULL) {
+		return false;
+	}
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		return comp_d3d11_compositor_window_hidden(&sess->xcn->base);
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		return comp_d3d12_compositor_window_hidden(&sess->xcn->base);
+	}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor) {
+		return comp_gl_compositor_window_hidden(&sess->xcn->base);
+	}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		return comp_vk_native_compositor_window_hidden(&sess->xcn->base);
+	}
+#endif
+	return false;
+}
+
+void
+oxr_session_visibility_poll(struct oxr_logger *log, struct oxr_session *sess)
+{
+	const bool hidden = oxr_session_window_hidden(sess);
+	if (hidden == sess->window_hidden_seen) {
+		return;
+	}
+	sess->window_hidden_seen = hidden;
+	// The lens moved only for a session that wants 3D and is not already
+	// flat for another reason (auto-2D holds the panel 2D under its own
+	// events). Never the answer to a request: a 3D request made while hidden
+	// gets XR_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN_DXR instead.
+	if (!sess->hardware_display_3d || sess->mono_auto_2d.active) {
+		return;
+	}
+	U_LOG_W("ADR-062: the session's window is %s - the runtime %s the lens (hardware %s reported; the session's "
+	        "3D choice is kept)",
+	        hidden ? "hidden" : "visible again", hidden ? "drops" : "restores", hidden ? "2D" : "3D");
+	mono_auto_2d_push_event(log, sess, !hidden);
+}
+
 void
 oxr_session_mono_auto_2d_frame(struct oxr_logger *log,
                                struct oxr_session *sess,
@@ -1914,6 +1964,9 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	if (sess->runtime_exit_pending) {
 		session_begin_runtime_exit(log, sess);
 	}
+
+	// ADR-062 D1: report a visibility-driven lens edge (in-process sessions).
+	oxr_session_visibility_poll(log, sess);
 
 	// In-process device loss (XRT_ERROR_COMPOSITOR_DEVICE_LOST, armed from
 	// xrWaitFrame): the transition the out-of-process path gets from

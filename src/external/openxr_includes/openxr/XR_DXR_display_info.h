@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_info 1
-#define XR_DXR_display_info_SPEC_VERSION 25
+#define XR_DXR_display_info_SPEC_VERSION 26
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -583,6 +583,7 @@ typedef enum XrDisplayModeDenialReasonDXR {
     XR_DISPLAY_MODE_DENIAL_REASON_DISPLAY_PROCESSOR_REJECTED_DXR = 4, //!< the display hardware refused the state
     XR_DISPLAY_MODE_DENIAL_REASON_RELAY_OWNS_MODE_DXR = 5,            //!< a relay owns this session's mode (mechanism reserved; no relay ships today)
     XR_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL_DXR = 6,    //!< (v20) the session's view configuration reports fewer views than the mode needs
+    XR_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN_DXR = 7,              //!< (v26) the session's window is hidden: the 3D request is recorded and applied when it is seen again
     XR_DISPLAY_MODE_DENIAL_REASON_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrDisplayModeDenialReasonDXR;
 

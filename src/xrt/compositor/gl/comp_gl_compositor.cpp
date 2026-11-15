@@ -1237,6 +1237,8 @@ struct comp_gl_compositor
 	volatile LONG zone_reeval_owed;
 	//! #2671: low-rate visibility tracker for the window (NULL = always visible).
 	struct u_window_visibility *visibility;
+	//! ADR-062 D3 (tier 2): the own legs' skipped-weave ledger (under c->mutex).
+	struct u_window_visibility_skip t2;
 	struct os_mutex seg_pub_mutex;
 	struct xrt_segment_metrics seg_pub;               //!< the table the last weave took (count 0 = one view set)
 	struct xrt_segment_view_routing seg_route;        //!< the routing the last locate handed out
@@ -5853,6 +5855,21 @@ gl_hub_commit(struct comp_gl_compositor *c, const struct comp_segments_content *
 		                           c->hub.capture.path, woven);
 	}
 
+	/*
+	 * ADR-062 D3 (tier 2): hidden on every screen. The atlas was handed over
+	 * (the hub keeps it); nothing is woven or presented, the hub paces this
+	 * frame on the panel's grid, and the replay stays armed so the hub's
+	 * first repaint after the window is seen again re-weaves it. A pending
+	 * capture is answered from the atlas by the frame path's own dispatch.
+	 */
+	if (comp_hub_d3d11_hidden_skip(c->hub.split, /*pace=*/true)) {
+		c->repaint.armed = true;
+		if (c->capture_intent.pending) {
+			U_LOG_W("ADR-062 gl: capture while the window is hidden on every screen - the atlas only (no "
+			        "weave runs while hidden)");
+		}
+		return;
+	}
 	// The GL leg hands its DP no canvas (zeros = the full window); so does this.
 	const struct xrt_rect cv = {};
 	const bool wove = comp_hub_d3d11_weave_and_present(c->hub.split, /*is_repaint=*/false, &cv);
@@ -5887,9 +5904,43 @@ gl_hub_commit(struct comp_gl_compositor *c, const struct comp_segments_content *
  * The one app-owned read in the composite — the Local2D flatten — is the #875
  * deposit half and is skipped here via reuse_twod; see gl_composite_local_2d.
  */
+#ifdef XRT_OS_WINDOWS
+/*!
+ * ADR-062 D3 (tier 2), the own legs: skip this present? With @p pace (an app
+ * frame) the skipped frame is slept onto the panel's period grid, as its
+ * SwapBuffers would have paced it. Under c->mutex.
+ */
+static bool
+gl_t2_skip(struct comp_gl_compositor *c, bool pace)
+{
+	uint64_t period = 0;
+	if (pace && u_window_visibility_hidden_everywhere(c->visibility)) {
+		const float hz = comp_display_refresh_hz_win(c->hwnd);
+		period = hz > 1.0f ? (uint64_t)(1e9 / hz) : 0;
+	}
+	const bool skip = u_window_visibility_skip_step(&c->t2, c->visibility, "gl", period);
+	if (skip && pace && c->capture_intent.pending) {
+		U_LOG_W("ADR-062 gl: capture while the window is hidden on every screen - the atlas only (no weave "
+		        "runs while hidden)");
+	}
+	return skip;
+}
+#endif
+
 static void
 gl_window_present(struct comp_gl_compositor *c, GLuint atlas_for_present, float dt, bool is_repaint)
 {
+#ifdef XRT_OS_WINDOWS
+	// ADR-062 D3 (tier 2): hidden on every screen — no weave, no swap. The
+	// replay stays armed; its first tick after the window is seen again
+	// re-weaves the retained atlas.
+	if (gl_t2_skip(c, !is_repaint)) {
+		if (!is_repaint && c->owns_window && c->own_window != NULL) {
+			comp_d3d11_window_signal_paint_done(c->own_window);
+		}
+		return;
+	}
+#endif
 	// Normal window mode: present to screen
 	// Use actual window backing dimensions
 	uint32_t present_w = c->tile_columns * c->view_width;
@@ -8595,9 +8646,16 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			}
 		}
 
-		// Only a REAL frame resets the quiet-gate.
-		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
-		u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
+		// Only a REAL frame resets the quiet-gate (ADR-062: a frame skipped
+		// while hidden is not one, so the first repaint tick after the window
+		// is seen again re-weaves at once).
+#ifdef XRT_OS_WINDOWS
+		if (!c->t2.hidden)
+#endif
+		{
+			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
+		}
 	}
 
 	// Cache eye positions AFTER process_atlas (which updates the SR weaver's
@@ -9498,6 +9556,17 @@ comp_gl_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t
 	*out_w = c->view_width;
 	*out_h = c->view_height;
 	return true;
+}
+
+bool
+comp_gl_compositor_window_hidden(struct xrt_compositor *xc)
+{
+#ifdef XRT_OS_WINDOWS
+	return xc != NULL && u_window_visibility_hidden(gl_comp(xc)->visibility);
+#else
+	(void)xc;
+	return false;
+#endif
 }
 
 bool

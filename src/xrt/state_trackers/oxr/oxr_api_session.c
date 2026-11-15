@@ -1423,7 +1423,12 @@ oxr_xrRequestDisplayModeDXR(XrSession session, XrDisplayModeDXR displayMode)
 	// Auto-2D (util/u_mono_auto_2d.h) may be holding the panel 2D over the
 	// session's recorded 3D: compare against what the panel really shows.
 	const bool auto_2d_engaged = sess->mono_auto_2d.active;
-	bool changed = ((auto_2d_engaged ? false : sess->hardware_display_3d) != want_3d);
+	// ADR-062 D1: while the session's window is hidden the panel is 2D too; a
+	// 3D request is recorded (the compositor applies it when the window is
+	// seen again) and answered with a WINDOW_HIDDEN denial, never with a
+	// hardware event the app could take for its request's result.
+	const bool window_hidden = oxr_session_window_hidden(sess);
+	bool changed = ((auto_2d_engaged || window_hidden ? false : sess->hardware_display_3d) != want_3d);
 
 	XrResult res = oxr_session_request_display_mode(&log, sess, want_3d);
 	if (res != XR_SUCCESS) {
@@ -1435,6 +1440,17 @@ oxr_xrRequestDisplayModeDXR(XrSession session, XrDisplayModeDXR displayMode)
 	// hold after it applies the app's choice in one step (no 3D blip on the
 	// way to an explicit 2D). This entry point sends its own event below.
 	(void)oxr_session_mono_auto_2d_explicit(&log, sess, /*push_event=*/false);
+
+	if (window_hidden) {
+		sess->window_hidden_seen = true; // the visible edge reports the 3D
+		if (want_3d && sess->hardware_display_3d && sess->sys->inst->extensions.DXR_display_info) {
+			oxr_event_push_XrEventDataDisplayModeRequestDenied(&log, sess, XR_DISPLAY_MODE_INDEX_NONE_DXR,
+			                                                   /*requestedHardware3D=*/1,
+			                                                   XRT_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN);
+		}
+		// A 2D request while hidden leaves the panel where it is: no event.
+		return XR_SUCCESS;
+	}
 
 	// oxr_session_request_display_mode records the new state on success;
 	// surface the flip to the app the same way a mode-driven change does.
@@ -1691,7 +1707,17 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 	}
 
 	// 6. Push hardware display state changed event (only when hardware state flips)
-	if (hardware_state_changed) {
+	// ADR-062 D1: not while the window is hidden — the panel stays 2D; a mode
+	// that wants 3D is answered with a WINDOW_HIDDEN denial of its hardware
+	// half (its content half applied above), and the visible edge reports 3D.
+	if (hardware_state_changed && oxr_session_window_hidden(sess)) {
+		sess->window_hidden_seen = true;
+		if (mode->hardware_display_3d) {
+			oxr_event_push_XrEventDataDisplayModeRequestDenied(&log, sess, XR_DISPLAY_MODE_INDEX_NONE_DXR,
+			                                                   /*requestedHardware3D=*/1,
+			                                                   XRT_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN);
+		}
+	} else if (hardware_state_changed) {
 		oxr_event_push_XrEventDataHardwareDisplayStateChanged(
 			&log, sess, mode->hardware_display_3d ? XR_TRUE : XR_FALSE);
 	}

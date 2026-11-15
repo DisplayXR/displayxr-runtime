@@ -823,6 +823,9 @@ oxr_event_push_XrEventDataDisplayModeRequestDenied(struct oxr_logger *log,
 	case XRT_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL:
 		why = "the session's view configuration cannot fill the mode (#1499)";
 		break;
+	case XRT_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN:
+		why = "the session's window is hidden; the request applies when it is seen again (ADR-062)";
+		break;
 	default: why = "unknown reason"; break;
 	}
 	U_LOG_W("OXR EVENT: Display mode request DENIED (mode=%u hw=%d reason=%u) — %s", requestedModeIndex,

@@ -3390,6 +3390,7 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	// weave. Decided BEFORE this frame's layers reach the compositor, so the
 	// edge frame itself is presented in the new state.
 	oxr_session_mono_auto_2d_frame(log, sess, frameEndInfo, (uint64_t)os_monotonic_get_ns());
+	oxr_session_visibility_poll(log, sess); // ADR-062 D1
 #endif
 
 	struct xrt_pose inv_offset = {0};

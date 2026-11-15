@@ -55,6 +55,7 @@
 #include "util/u_misc.h"
 #include "util/u_status_snapshot.h"
 #include "util/u_time.h"
+#include "util/u_window_visibility.h"
 
 #include "shared/ipc_protocol.h"
 #include "server/ipc_server.h"
@@ -611,6 +612,14 @@ gather_live(struct ipc_server *s, struct ipc_server_status *st, uint64_t now_ns)
 			c->window.height = cs.window.window_pixel_height;
 		}
 		c->owner_screen = cs.owner_screen;
+		if (cs.vis_tracked) {
+			c->visibility.tracked = true;
+			c->visibility.hidden = cs.vis_hidden;
+			c->visibility.hidden_everywhere = cs.vis_hidden_everywhere;
+			(void)snprintf(c->visibility.reason, sizeof(c->visibility.reason), "%s",
+			               u_wv_reason_str((enum u_wv_reason)cs.vis_reason));
+			(void)snprintf(c->visibility.occluder, sizeof(c->visibility.occluder), "%s", cs.vis_occluder);
+		}
 		st->live_metrics[n] = cs.segments;
 		const struct xrt_segment_metrics *m = &cs.segments;
 		const uint32_t nseg = m->count < XRT_STATUS_MAX_SEGMENTS ? m->count : XRT_STATUS_MAX_SEGMENTS;

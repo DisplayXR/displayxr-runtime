@@ -33,6 +33,7 @@
 
 #include "os/os_time.h"
 #include "util/u_time.h"
+#include "util/u_window_visibility.h"
 
 #include <string.h>
 
@@ -158,6 +159,14 @@ struct comp_hub_d3d11
 	//! #2671: the owning compositor's visibility tracker (borrowed), for the
 	//! segment DPs' per-screen lens (comp_d3d11_segments_set_visibility).
 	const struct u_window_visibility *vis;
+	/*!
+	 * ADR-062 D3 (tier 2): the last frame found the window hidden on every
+	 * screen and skipped the weave and present (@ref comp_hub_d3d11_hidden_skip);
+	 * frames skipped since the hidden edge, when it began, and the pacing grid
+	 * of skipped app frames. Under the owning tier's lock (its app frame and
+	 * its repaint loop both hold it).
+	 */
+	struct u_window_visibility_skip t2;
 
 	/*!
 	 * #2639 / #2640: legacy automatic 2D + re-convergence (NULL = off, the
@@ -5893,6 +5902,11 @@ comp_hub_d3d11_repaint(struct comp_hub_d3d11 *s, bool partition_engaged, const s
 	if (!comp_hub_d3d11_has_weave_slot(s)) {
 		return COMP_HUB_D3D11_REPAINT_NO_FRAME;
 	}
+	// ADR-062 D3: no re-weave of a window nobody can see. The first tick
+	// after it is seen again re-weaves the retained frame.
+	if (comp_hub_d3d11_hidden_skip(s, /*pace=*/false)) {
+		return COMP_HUB_D3D11_REPAINT_NOT_ADMITTED;
+	}
 	// #2635: the app presents through a Present hook that also hooks this
 	// chain — a repaint present from this thread would deadlock against it.
 	// Ahead of the partition test: an engaged partition skips admission.
@@ -6153,6 +6167,20 @@ comp_hub_d3d11_set_visibility(struct comp_hub_d3d11 *s, const struct u_window_vi
 	if (s != nullptr) {
 		s->vis = vis;
 	}
+}
+
+extern "C" bool
+comp_hub_d3d11_hidden_skip(struct comp_hub_d3d11 *s, bool pace)
+{
+	// The caller presents a client-presents texture itself: skipping the
+	// weave would leave it presenting stale content (ADR-062 D3 exemption).
+	if (s == nullptr || s->client_presents) {
+		return false;
+	}
+	// An app frame that presents nothing would otherwise free-run: pace it on
+	// the panel's period grid, as a presented frame is paced by its present.
+	const uint64_t period = (pace && s->target != nullptr) ? comp_d3d11_target_get_display_period_ns(s->target) : 0;
+	return u_window_visibility_skip_step(&s->t2, s->vis, "hub", period);
 }
 
 extern "C" void
@@ -6500,6 +6528,14 @@ comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *split, bool is_repaint, 
 	(void)split;
 	(void)is_repaint;
 	(void)canvas;
+	return false;
+}
+
+extern "C" bool
+comp_hub_d3d11_hidden_skip(struct comp_hub_d3d11 *split, bool pace)
+{
+	(void)split;
+	(void)pace;
 	return false;
 }
 

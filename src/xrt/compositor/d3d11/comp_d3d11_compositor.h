@@ -502,6 +502,18 @@ bool
 comp_d3d11_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d);
 
 /*!
+ * ADR-062 D1: the session's window is hidden on its 3D screen (debounced; the
+ * lens wish is 2D while it is). For the state tracker's events: it reports the
+ * visibility-driven lens edges and answers a 3D request made while hidden
+ * with a WINDOW_HIDDEN denial. False when the window is visible, untracked, or
+ * @p xc is NULL. Any thread; one atomic load.
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_compositor_window_hidden(struct xrt_compositor *xc);
+
+/*!
  * Select the eye-tracking control mode (MANAGED=0 / MANUAL=1) on the display
  * processor — the policy counterpart to @ref
  * comp_d3d11_compositor_request_display_mode. No-op if the DP doesn't react.

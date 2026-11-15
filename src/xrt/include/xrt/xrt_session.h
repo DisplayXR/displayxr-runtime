@@ -108,6 +108,10 @@ enum xrt_display_mode_denial_reason
 	//! #1499: the session's view configuration reports fewer views than the
 	//! requested mode needs, so it could not fill the mode's tile grid.
 	XRT_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL = 6,
+	//! ADR-062: the session's window is hidden (minimized, cloaked, covered, the
+	//! session locked or the display off). A hardware-3D request is recorded and
+	//! applied when the window is seen again; this event says it did not apply now.
+	XRT_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN = 7,
 };
 
 /*!

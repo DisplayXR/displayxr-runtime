@@ -575,6 +575,8 @@ struct comp_d3d12_compositor
 	std::atomic<bool> session_wants_3d{true};
 	//! #2671: low-rate visibility tracker for the window (NULL = always visible).
 	struct u_window_visibility *visibility = nullptr;
+	//! ADR-062 D3 (tier 2): the own legs' skipped-weave ledger (under c->mutex).
+	struct u_window_visibility_skip t2 = {};
 	/*!
 	 * #2671 + ADR-027: the window went hidden while a zone wish may be
 	 * published, so the first publish after it is seen again starts from
@@ -4644,6 +4646,40 @@ d3d12_compositor_dispatch_capture(struct comp_d3d12_compositor *c, uint32_t mode
 	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
 }
 
+/*!
+ * ADR-062 D3: a capture asked for while the window is hidden on every screen
+ * still produces output — the atlas (no weave runs while hidden) — and says so.
+ */
+static void
+d3d12_capture_while_hidden(struct comp_d3d12_compositor *c)
+{
+	if (!c->capture_intent.pending) {
+		return;
+	}
+	const bool ok = d3d12_compositor_capture_atlas_to_png(c, c->capture_intent.path);
+	U_LOG_W("ADR-062 d3d12: capture while the window is hidden on every screen - the atlas -> %s%s (no weave runs "
+	        "while hidden, so there is no woven output)",
+	        c->capture_intent.path, ok ? "" : " FAILED");
+	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
+}
+
+/*!
+ * ADR-062 D3 (tier 2), the own legs: skip this frame's weave and present?
+ * Exempt: shared-texture sessions (the app presents). With @p pace an app
+ * frame is slept onto the panel's period grid (nothing else paces it then).
+ * Under c->mutex.
+ */
+static bool
+d3d12_t2_skip(struct comp_d3d12_compositor *c, bool pace)
+{
+	if (c->has_shared_texture) {
+		return false;
+	}
+	const uint64_t period =
+	    (pace && c->display_refresh_rate > 1.0f) ? (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate) : 0;
+	return u_window_visibility_skip_step(&c->t2, c->visibility, "d3d12", period);
+}
+
 
 // #854: write @p dp_resource's SRV into dp_srv_heap, bind the heap on the open
 // cmd_list, and return the GPU handle for process_atlas. The sim DP samples the
@@ -5713,6 +5749,12 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		if (comp_d3d12_target_repaint_forbidden(c->target)) {
 			c->repaint.bail_gate++;
 			u_repaint_trace_bail_gate(&c->repaint.trace);
+			continue;
+		}
+		// ADR-062 D3: no re-weave of a window nobody can see; the first tick
+		// after it is seen again re-weaves the retained frame.
+		if (d3d12_t2_skip(c, /*pace=*/false)) {
+			c->repaint.bail_gate++;
 			continue;
 		}
 
@@ -7081,6 +7123,23 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		                                          c->layer_accum.data.display_time_ns > 0
 		                                              ? (uint64_t)c->layer_accum.data.display_time_ns
 		                                              : c->last_display_time_ns);
+		/*
+		 * ADR-062 D3 (tier 2): hidden on every screen. The atlas was handed to
+		 * the hub (it keeps it); nothing is woven or presented, the hub paces
+		 * this frame on the panel's grid, and the replay stays armed so the
+		 * hub's first repaint after the window is seen again re-weaves it.
+		 */
+		if (!c->reroute.client_presents && comp_hub_d3d11_hidden_skip(c->reroute.split, /*pace=*/true)) {
+			c->repaint.tgt_w = tgt_width;
+			c->repaint.tgt_h = tgt_height;
+			c->repaint.view_w = c->eff_layout.tile_w;
+			c->repaint.view_h = c->eff_layout.tile_h;
+			c->repaint.cols = c->eff_layout.cols;
+			c->repaint.rows = c->eff_layout.rows;
+			c->repaint.armed = true;
+			d3d12_capture_while_hidden(c);
+			return XRT_SUCCESS;
+		}
 		// #2342 P2c: a projection-only intent the native point skipped goes to
 		// the hub too (one consumer either way); then arm the hub's capture.
 		if (c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY &&
@@ -7637,6 +7696,24 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// Atlas barrier, crop, 2D-under flatten, weave, composite, HUD and
 			// present all happen in here — one code path, so a repaint is
 			// constructed exactly the way the app frame it stands in for was.
+			if (d3d12_t2_skip(c, /*pace=*/true)) {
+				// ADR-062 D3 (tier 2): hidden on every screen — the fresh
+				// weave list goes out empty (so the next frame resets a
+				// closed list), nothing is woven or presented; the replay
+				// stays armed for the first repaint after the window is
+				// seen again.
+				ID3D12GraphicsCommandList *wl = d3d12_weave_list(c);
+				wl->Close();
+				ID3D12CommandList *weave_lists[] = {wl};
+				d3d12_out_queue(c)->ExecuteCommandLists(1, weave_lists);
+				d3d12_outcomp_note_execute(c);
+				gpu_wait_idle_out(c);
+				if (c->owns_window && c->own_window != nullptr) {
+					comp_d3d11_window_signal_paint_done(c->own_window);
+				}
+				d3d12_capture_while_hidden(c);
+				return XRT_SUCCESS;
+			}
 			d3d12_dp_weave_and_present(c, false, &back_buffer);
 		} else {
 			c->repaint.armed = false;
@@ -8828,6 +8905,12 @@ comp_d3d12_compositor_legacy_auto_2d_on(struct xrt_compositor *xc)
 #endif
 	(void)c;
 	return false;
+}
+
+extern "C" bool
+comp_d3d12_compositor_window_hidden(struct xrt_compositor *xc)
+{
+	return xc != nullptr && u_window_visibility_hidden(d3d12_comp(xc)->visibility);
 }
 
 extern "C" bool
