@@ -155,7 +155,11 @@ so it is never left demoted.
   no event is sent.
 - A 3D request made while hidden is still answered with
   `XR_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN_DXR` ([XR_DXR_display_info](XR_DXR_display_info.md)
-  v26) and the lens edges are still reported with `XrEventDataHardwareDisplayStateChangedDXR`.
+  v26). The lens edges themselves are **not** reported with
+  `XrEventDataHardwareDisplayStateChangedDXR` (apps follow that event with their own mode request,
+  which would keep them 2D after the window returns); this extension's event is how an app learns
+  why the lens moved. The one hardware event on this path answers a denied 3D request when the
+  window is seen again.
 
 ## 7. Test lever (not a feature)
 
