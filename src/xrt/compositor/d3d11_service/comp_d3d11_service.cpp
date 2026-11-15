@@ -857,6 +857,16 @@ struct d3d11_client_render_resources
 	//! global trigger only. Set per submit from the IPC handler, like the
 	//! POSIX weave engines' #2207 tag.
 	char                                   weave_capture_tag[64];
+	//! #2615: svc_weave_capture_poll's cache, touched only by that function
+	//! (on this client's IPC thread). The candidate trigger paths are built
+	//! for weave_capture_poll_tag and rebuilt only when weave_capture_tag
+	//! changes; the files are stat'ed at most every 250 ms. All-zero (the
+	//! init memset) = not built yet, never polled — the first submit builds
+	//! and polls.
+	char                                   weave_capture_poll_tag[64];
+	char                                   weave_capture_poll_paths[4][MAX_PATH];
+	bool                                   weave_capture_poll_built;
+	int64_t                                weave_capture_poll_last_ns;
 	uint32_t                               weave_crop_w;
 	uint32_t                               weave_crop_h;
 
@@ -31933,37 +31943,67 @@ weave_seg_snap_dp(struct d3d11_service_compositor *c, int32_t target_x, int32_t 
  *                                                  back to the caller, overlay fallback included)
  *   displayxr_atlas_trigger[.<exe>].projection  -> displayxr_atlas[.<exe>].projection.png (DP input only)
  *
- * Alpha is written as submitted (dxr_diag_dump_tex). Cost on the hot path: up
- * to four GetFileAttributes per submit; the readbacks run only on a submit
- * that consumed a trigger. One WARN per capture names the files.
+ * Alpha is written as submitted (dxr_diag_dump_tex). Cost on the hot path
+ * (#2615, the #925 rank-10 pattern): this runs under render_mutex and
+ * immediate_ctx_mutex, so the candidate paths are cached per client (getenv +
+ * formatting only when the client's tag changes) and the up-to-four
+ * GetFileAttributes run at most every 250 ms per client — plenty for a
+ * hand-armed one-shot trigger. The readbacks run only on a submit that
+ * consumed a trigger. One WARN per capture names the files.
+ *
+ * Kept at its call site, after the input import, rather than hoisted before the
+ * locks: polling earlier would consume (delete) a trigger on submits that are
+ * then refused before any capture point, losing the one-shot capture.
  */
 static bool
-svc_weave_capture_poll(const char *tag, bool *projection_only, char *stem, size_t stem_cap)
+svc_weave_capture_poll(struct d3d11_client_render_resources *res, bool *projection_only, char *stem, size_t stem_cap)
 {
-	const char *tmp = getenv("TEMP");
-	if (tmp == nullptr || tmp[0] == '\0') {
-		return false;
-	}
-	const bool have_tag = tag != nullptr && tag[0] != '\0';
 	struct cand
 	{
 		bool per_exe;
 		bool proj;
 	};
-	const cand order[] = {{true, true}, {true, false}, {false, true}, {false, false}};
-	for (const cand &k : order) {
-		if (k.per_exe && !have_tag) {
-			continue;
+	static const cand order[] = {{true, true}, {true, false}, {false, true}, {false, false}};
+	static_assert(sizeof(order) / sizeof(order[0]) ==
+	                  sizeof(res->weave_capture_poll_paths) / sizeof(res->weave_capture_poll_paths[0]),
+	              "one cached path per candidate");
+
+	const char *tag = res->weave_capture_tag;
+	if (!res->weave_capture_poll_built ||
+	    strncmp(tag, res->weave_capture_poll_tag, sizeof(res->weave_capture_poll_tag)) != 0) {
+		memcpy(res->weave_capture_poll_tag, tag, sizeof(res->weave_capture_poll_tag));
+		res->weave_capture_poll_tag[sizeof(res->weave_capture_poll_tag) - 1] = '\0';
+		res->weave_capture_poll_built = true;
+		const char *tmp = getenv("TEMP");
+		const bool have_tmp = tmp != nullptr && tmp[0] != '\0';
+		const bool have_tag = res->weave_capture_poll_tag[0] != '\0';
+		for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+			char *path = res->weave_capture_poll_paths[i];
+			path[0] = '\0'; // "" = this candidate is not polled
+			if (!have_tmp || (order[i].per_exe && !have_tag)) {
+				continue;
+			}
+			snprintf(path, sizeof(res->weave_capture_poll_paths[i]), "%s\\displayxr_atlas_trigger%s%s%s",
+			         tmp, order[i].per_exe ? "." : "", order[i].per_exe ? res->weave_capture_poll_tag : "",
+			         order[i].proj ? ".projection" : "");
 		}
-		char path[MAX_PATH];
-		snprintf(path, sizeof(path), "%s\\displayxr_atlas_trigger%s%s%s", tmp, k.per_exe ? "." : "",
-		         k.per_exe ? tag : "", k.proj ? ".projection" : "");
-		if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+	}
+
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	if (res->weave_capture_poll_last_ns != 0 && now_ns - res->weave_capture_poll_last_ns < 250LL * 1000000LL) {
+		return false;
+	}
+	res->weave_capture_poll_last_ns = now_ns;
+
+	for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+		const char *path = res->weave_capture_poll_paths[i];
+		if (path[0] == '\0' || GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
 			continue;
 		}
 		DeleteFileA(path);
-		snprintf(stem, stem_cap, "displayxr_atlas%s%s", k.per_exe ? "." : "", k.per_exe ? tag : "");
-		*projection_only = k.proj;
+		snprintf(stem, stem_cap, "displayxr_atlas%s%s", order[i].per_exe ? "." : "",
+		         order[i].per_exe ? res->weave_capture_poll_tag : "");
+		*projection_only = order[i].proj;
 		return true;
 	}
 	return false;
@@ -32472,8 +32512,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// dumps run after the weave (see svc_weave_capture_poll).
 	char cap_stem[96] = {0};
 	bool cap_projection_only = false;
-	const bool cap_armed = svc_weave_capture_poll(c->render.weave_capture_tag, &cap_projection_only, cap_stem,
-	                                              sizeof(cap_stem));
+	const bool cap_armed = svc_weave_capture_poll(&c->render, &cap_projection_only, cap_stem, sizeof(cap_stem));
 	ID3D11ShaderResourceView *cap_dp_srv = nullptr; // the DP input of the path that ran
 
 	// DIAGNOSTIC ONLY (browser#73). Armed by creating
