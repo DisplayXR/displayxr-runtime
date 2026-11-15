@@ -924,27 +924,62 @@ def _first_error_line(stderr: str) -> str:
     return "no stderr"
 
 
-def emit_issue(repo: str, findings: list[Finding]) -> bool:
-    """Open/update the drift issue on `repo`. True iff it actually landed."""
-    title = "Drift audit: pin/spec/version drift detected"
-    body = render_body(findings)
-    existing = _gh(
+# Per-repo and aggregate issues share ISSUE_MARKER, and the aggregate one lives
+# on displayxr-runtime next to that repo's own per-repo issue, so an existing
+# issue is matched on the marker AND its exact title.
+ISSUE_TITLE = "Drift audit: pin/spec/version drift detected"
+AGGREGATE_ISSUE_TITLE = "Drift audit: pin/spec/version drift detected across the org"
+ISSUE_LIST_LIMIT = "500"
+
+
+def pick_marked_issue(issues: list[dict], title: str) -> str | None:
+    """The open drift issue to update, from `gh issue list --json number,title,body`.
+
+    Pure. Matches ISSUE_MARKER in the body client-side: GitHub search does not
+    index HTML comments, so `--search ISSUE_MARKER` never matched and every run
+    opened a new duplicate. With duplicates already open, the newest is the one
+    updated, so repeated runs keep updating the same issue.
+    """
+    matches = [
+        i
+        for i in issues
+        if i.get("title") == title and ISSUE_MARKER in (i.get("body") or "")
+    ]
+    if not matches:
+        return None
+    return str(max(int(i["number"]) for i in matches))
+
+
+def find_marked_issue(repo_slug: str, title: str) -> tuple[bool, str | None]:
+    """(ok, number) of the open drift issue on `repo_slug`.
+
+    ok=False when the listing itself failed: the caller must not open a new
+    issue then, or a transient read failure files yet another duplicate.
+    """
+    rc, out, err = _gh_full(
         [
-            "issue",
-            "list",
-            "--repo",
-            f"{ORG}/{repo}",
-            "--state",
-            "open",
-            "--search",
-            ISSUE_MARKER,
-            "--json",
-            "number",
-            "--jq",
-            ".[0].number",
+            "issue", "list", "--repo", repo_slug, "--state", "open",
+            "--limit", ISSUE_LIST_LIMIT, "--json", "number,title,body",
         ]
     )
-    num = (existing or "").strip()
+    if rc != 0:
+        print(f"  FAILED to list open issues on {repo_slug}: {_first_error_line(err)}")
+        return False, None
+    try:
+        issues = json.loads(out or "[]")
+    except json.JSONDecodeError:
+        print(f"  FAILED to parse the open-issue list of {repo_slug}")
+        return False, None
+    return True, pick_marked_issue(issues, title)
+
+
+def emit_issue(repo: str, findings: list[Finding]) -> bool:
+    """Open/update the drift issue on `repo`. True iff it actually landed."""
+    title = ISSUE_TITLE
+    body = render_body(findings)
+    ok, num = find_marked_issue(f"{ORG}/{repo}", title)
+    if not ok:
+        return False
     if num:
         rc, _, err = _gh_full(
             ["issue", "edit", num, "--repo", f"{ORG}/{repo}", "--body", body]
@@ -974,7 +1009,7 @@ def emit_aggregate_issue(by_repo: dict[str, list[Finding]]) -> bool:
     cannot work. It reported success anyway. This fallback always works,
     because a workflow's own token can always file an issue on its own repo.
     """
-    title = "Drift audit: pin/spec/version drift detected across the org"
+    title = AGGREGATE_ISSUE_TITLE
     lines = [
         ISSUE_MARKER,
         "",
@@ -991,13 +1026,9 @@ def emit_aggregate_issue(by_repo: dict[str, list[Finding]]) -> bool:
         lines.append("")
     body = "\n".join(lines)
 
-    existing = _gh(
-        [
-            "issue", "list", "--repo", f"{ORG}/displayxr-runtime", "--state", "open",
-            "--search", ISSUE_MARKER, "--json", "number", "--jq", ".[0].number",
-        ]
-    )
-    num = (existing or "").strip()
+    ok, num = find_marked_issue(f"{ORG}/displayxr-runtime", title)
+    if not ok:
+        return False
     if num:
         rc, _, err = _gh_full(
             ["issue", "edit", num, "--repo", f"{ORG}/displayxr-runtime", "--body", body]

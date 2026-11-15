@@ -368,3 +368,10 @@ jobs:
         # Hermetic. Pins the per-leg "requests modes but never uses dxr::ModeSwitch"
         # check: the runtime never eases a 2D<->3D switch, the app must.
         run: python3 scripts/tests/test_check_displayxr_app_mode_switch.py
+
+      - name: Drift-audit existing-issue lookup unit tests
+        # Hermetic (gh stubbed). Pins that the weekly audit finds its own open
+        # issue by matching the HTML-comment marker in the body client-side
+        # (GitHub search does not index HTML comments, so a --search lookup
+        # never matched and every run opened a duplicate).
+        run: python3 scripts/tests/test_drift_audit.py
