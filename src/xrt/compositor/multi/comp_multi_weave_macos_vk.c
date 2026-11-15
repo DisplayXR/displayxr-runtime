@@ -77,6 +77,22 @@ weave_get_vk(struct multi_compositor *mc)
 }
 
 /*!
+ * vkQueueWaitIdle on the shared main queue, under its mutex (#2625).
+ *
+ * The queue is externally synchronized (Vulkan spec) and shared with the
+ * multi compositor's render thread and other present-owner clients, all of
+ * which submit under vk_queue_lock. Same helper as comp_multi_weave_linux.c.
+ * The mutex is not recursive: never call this with it already held.
+ */
+static void
+weave_queue_wait_idle(struct vk_bundle *vk)
+{
+	vk_queue_lock(vk->main_queue);
+	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	vk_queue_unlock(vk->main_queue);
+}
+
+/*!
  * Import a caller IOSurface as a VkImage usable as a blit source. Same
  * VK_EXT_metal_objects + VK_EXT_external_memory_metal dance as
  * comp_vk_native_compositor.c::import_shared_iosurface.
@@ -566,7 +582,7 @@ weave_eye_stage_get(struct vk_bundle *vk,
 	if (s->image != VK_NULL_HANDLE) {
 		// A resized rect (rare): an earlier submit whose fence wait timed out may
 		// still read the old image — never free it under the GPU.
-		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		weave_queue_wait_idle(vk);
 		weave_eye_stage_release(vk, s);
 	}
 
@@ -975,7 +991,7 @@ static void
 vkb_segs_release(struct vk_bundle *vk, struct multi_compositor *mc)
 {
 	if (mc->weave.segs != NULL) {
-		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		weave_queue_wait_idle(vk);
 		struct comp_vk_native_segments *segs = vkb_segs(mc);
 		comp_vk_native_segments_destroy(&segs);
 		mc->weave.segs = NULL;
@@ -1133,7 +1149,7 @@ vkb_ensure_output(struct multi_compositor *mc, uint32_t want_w, uint32_t want_h,
 	// no scratch.
 	if (mc->weave.out_image == VK_NULL_HANDLE || mc->weave.out_w != want_w || mc->weave.out_h != want_h) {
 		// Never yank resources out from under in-flight GPU work.
-		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		weave_queue_wait_idle(vk);
 		weave_release_output(vk, mc);
 		weave_release_scratch(vk, mc);
 		if (!weave_create_output(vk, mc, want_w, want_h)) {
@@ -1297,7 +1313,7 @@ vkb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_m
 		if (nview && !v6_zero_copy &&
 		    (mc->weave.crop_image == VK_NULL_HANDLE || mc->weave.crop_w != packed_w ||
 		     mc->weave.crop_h != packed_h)) {
-			vk->vkQueueWaitIdle(vk->main_queue->queue);
+			weave_queue_wait_idle(vk);
 			weave_release_crop(vk, mc);
 			if (!weave_create_crop(vk, mc, packed_w, packed_h)) {
 				break;
@@ -1920,7 +1936,7 @@ vkb_fini(struct multi_compositor *mc)
 	if (mc->weave.engine_initialized) {
 		// Nothing may be in flight (submits are synchronous), but a
 		// belt-and-braces idle keeps teardown safe if that changes.
-		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		weave_queue_wait_idle(vk);
 	}
 	// XR_DXR_lift §6: the lifted rects' state (pins, pending snapshots) -- idle above.
 	comp_multi_weave_lift_fini(&mc->weave.lift);
