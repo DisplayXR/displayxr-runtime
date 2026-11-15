@@ -211,6 +211,24 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		return hint->session == session;
 	}
 #endif
+#ifdef OXR_HAVE_DXR_depth_budget
+	case XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR: {
+		XrEventDataRearDepthBudgetStateChangedDXR *changed = (XrEventDataRearDepthBudgetStateChangedDXR *)type;
+		return changed->session == session;
+	}
+#endif
+#ifdef OXR_HAVE_KHR_visibility_mask
+	case XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR: {
+		XrEventDataVisibilityMaskChangedKHR *changed = (XrEventDataVisibilityMaskChangedKHR *)type;
+		return changed->session == session;
+	}
+#endif
+#ifdef OXR_HAVE_EXT_user_presence
+	case XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT: {
+		XrEventDataUserPresenceChangedEXT *changed = (XrEventDataUserPresenceChangedEXT *)type;
+		return changed->session == session;
+	}
+#endif
 	default: return false;
 	}
 }
