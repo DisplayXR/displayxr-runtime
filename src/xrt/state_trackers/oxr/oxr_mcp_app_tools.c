@@ -509,6 +509,14 @@ oxr_xrSubmitMCPToolResultDXR(XrSession session, uint64_t callId, XrBool32 succes
 		pthread_mutex_unlock(&g_lock);
 		return XR_SUCCESS;
 	}
+	if (pc->completed) {
+		// Already answered and not yet consumed by the waiting agent:
+		// keep the first result and take nothing from this call, so the
+		// first result_json is neither overwritten nor leaked.
+		pthread_mutex_unlock(&g_lock);
+		return oxr_error(&log, XR_ERROR_CALL_ORDER_INVALID, "callId %llu was already answered",
+		                 (unsigned long long)callId);
+	}
 	pc->result_json = strdup(resultJson != NULL && resultJson[0] != '\0' ? resultJson : "{}");
 	pc->success = success == XR_TRUE;
 	pc->completed = true;
