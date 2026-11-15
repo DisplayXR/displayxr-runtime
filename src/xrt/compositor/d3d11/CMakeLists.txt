@@ -19,6 +19,8 @@ if(WIN32 AND XRT_HAVE_D3D11)
 		../d3d_shared/comp_masked_composite_shaders.h
 		comp_d3d11_outcomp.cpp
 		comp_d3d11_outcomp.h
+		comp_d3d11_region_wish.cpp
+		comp_d3d11_region_wish.h
 		comp_d3d11_segments.cpp
 		comp_d3d11_segments.h
 		d3d11_layer_shaders.h

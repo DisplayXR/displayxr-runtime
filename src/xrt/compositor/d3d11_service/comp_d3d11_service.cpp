@@ -1713,6 +1713,11 @@ struct d3d11_service_compositor
 	struct xrt_rect wish_flat_rects[WEAVE_WISH_MAX_FLAT_RECTS];
 	uint32_t wish_flat_rect_count;
 
+	//! ADR-062 D5 (tier 4): the publish generation of this client's visible-region
+	//! wish (bumped on a content change only), and the last region read.
+	struct u_wv_wish_seq region_seq = {};
+	struct u_window_visibility_region region_vis = {};
+
 	//! STICKY screen-space flat regions (xrWeaveSetScreenFlatRegionsDXR).
 	//! ABSOLUTE PHYSICAL SCREEN px, latched until the next call — converted to
 	//! window-relative and merged into the flat list at raster time.
@@ -23003,9 +23008,198 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
  * fall back to the tier-1 global hardware 3D request once — the tier-1 block
  * skipped it expecting the mask to drive the panel.
  */
+/*!
+ * ADR-062 D5 (tier 4) on the service's default policy: on a DP whose zone grid
+ * is larger than 1x1, publish the visible part of this client's 3D region.
+ * One presenter holds the panel at a time (the lease), and the tracker
+ * follows that presenter's window, so the region is the presenter's; a
+ * client the tracker does not follow is taken as fully visible.
+ *
+ * Built on this file's own rect raster (wish = ON - flat): a zones frame's
+ * zone rects minus the covered part; a non-zones frame's visible client
+ * region minus its over-Local2D rects (the implicit wish); the empty wish
+ * while the presenter is hidden or the client asked for 2D.
+ *
+ * @return false when tier 4 does not apply (the caller's path runs unchanged).
+ */
+static bool
+service_region_wish_publish(struct d3d11_service_system *sys, struct d3d11_service_compositor *c, bool zones_frame)
+{
+	// The 1x1 answer, once cached, costs no lock (the caps are taken once per client).
+	if (c->wish_caps_valid &&
+	    !u_wv_region_mask_applies(c->wish_caps.zone_grid_width, c->wish_caps.zone_grid_height)) {
+		return false;
+	}
+	struct xrt_display_processor_d3d11 *dp = svc_client_weave_dp(sys, c);
+	if (!service_dp_accepts_zone_mask(dp) || c->zone_mask_dp_rejected) {
+		return false;
+	}
+	HWND wnd = c->render.hwnd != nullptr ? c->render.hwnd : c->app_hwnd;
+	RECT r;
+	POINT origin = {0, 0};
+	if (wnd == nullptr || !IsWindow(wnd) || !GetClientRect(wnd, &r) || r.right <= 0 || r.bottom <= 0 ||
+	    !ClientToScreen(wnd, &origin)) {
+		return false;
+	}
+	const uint32_t w = (uint32_t)r.right;
+	const uint32_t h = (uint32_t)r.bottom;
+
+	render_mutex_fair_lock lock(sys);
+	dp = svc_client_weave_dp(sys, c); // #918 PR 5: re-resolved under the lock
+	if (!service_dp_accepts_zone_mask(dp) || c->zone_mask_dp_rejected) {
+		return false;
+	}
+	const struct xrt_dp_local_zone_caps *caps = service_zone_caps(c, dp);
+	if (caps == nullptr || caps->supported == 0 ||
+	    !u_wv_region_mask_applies(caps->zone_grid_width, caps->zone_grid_height)) {
+		return false;
+	}
+	ID3D11Device *mask_dev = svc_zone_mask_device(sys, c);
+	if (!svc_zone_mask_publish_device_ok(sys, c, mask_dev)) {
+		return true; // #918 tripwire: nothing published, nothing else either
+	}
+
+	// The presenter's region (render thread, under render_mutex, as status reads it).
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	const bool presenter = mc != nullptr && mc->lens_vis != nullptr && wnd == mc->lens_vis_hwnd;
+	if (!presenter) {
+		c->region_vis = {};
+	} else if (u_window_visibility_region_gen(mc->lens_vis) != c->region_vis.gen) {
+		(void)u_window_visibility_get_region(mc->lens_vis, nullptr, &c->region_vis);
+	}
+
+	// The plan in window pixels; the raster below scales to its own mask size.
+	struct u_wv_wish_input in = {};
+	in.mask_w = w;
+	in.mask_h = h;
+	in.visible = &c->region_vis;
+	struct u_wv_rect flat[XRT_MAX_LAYERS];
+	struct xrt_rect on[XRT_MAX_LAYERS];
+	uint32_t on_count = 0;
+	uint64_t zone_sig = 1469598103934665603ull;
+	const bool hidden = presenter && g_svc_presenter_hidden.load(std::memory_order_acquire);
+	// From scratch once the presenter is seen again, never while still hidden.
+	if (!g_svc_presenter_hidden.load(std::memory_order_acquire) &&
+	    g_svc_zone_reeval_owed.exchange(false, std::memory_order_acq_rel) && c->zone_published) {
+		xrt_display_processor_d3d11_clear_local_zone_mask(dp);
+		c->zone_published = false;
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		comp_d3d11_segments_clear_zone_mask(c->segments);
+	}
+	if (hidden || c->hw_override.load(std::memory_order_acquire) == 0 || !sys->hardware_display_3d) {
+		in.kind = U_WV_WISH_EMPTY;
+	} else if (zones_frame) {
+		in.kind = U_WV_WISH_CUT;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && on_count < XRT_MAX_LAYERS; i++) {
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+				continue;
+			}
+			on[on_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
+			const struct xrt_rect *zr = &on[on_count - 1];
+			const uint8_t *b = (const uint8_t *)zr;
+			for (size_t k = 0; k < sizeof(*zr); k++) {
+				zone_sig = (zone_sig ^ b[k]) * 1099511628211ull;
+			}
+		}
+		in.source_seq = zone_sig;
+	} else {
+		in.kind = U_WV_WISH_IMPLICIT;
+		int32_t proj_idx = -1;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+			const enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+			if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+				proj_idx = (int32_t)i;
+				break;
+			}
+		}
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && in.flat_count < XRT_MAX_LAYERS; i++) {
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D ||
+			    (proj_idx >= 0 && (int32_t)i < proj_idx)) {
+				continue;
+			}
+			const struct xrt_rect *lr = &c->layer_accum.layers[i].data.local_2d.rect;
+			flat[in.flat_count++] = {lr->offset.w, lr->offset.h, lr->offset.w + lr->extent.w,
+			                         lr->offset.h + lr->extent.h};
+		}
+		in.flat = flat;
+		in.region_w = w;
+		in.region_h = h;
+	}
+	struct u_wv_wish_plan plan;
+	u_wv_wish_plan_build(&in, &plan);
+
+	// ON / flat lists for the rect raster. EMPTY: the whole window ON and flat
+	// (the raster needs one ON rect; the flat one clears it).
+	struct xrt_rect off[WEAVE_WISH_MAX_FLAT_RECTS];
+	uint32_t off_count = 0;
+	const struct xrt_rect whole = {{0, 0}, {(int32_t)w, (int32_t)h}};
+	if (plan.kind == U_WV_WISH_EMPTY || (plan.kind == U_WV_WISH_CUT && on_count == 0)) {
+		on[0] = whole;
+		on_count = 1;
+		off[off_count++] = whole;
+	} else {
+		if (plan.kind == U_WV_WISH_IMPLICIT) {
+			on_count = 0;
+			for (uint32_t i = 0; i < plan.on_count && on_count < XRT_MAX_LAYERS; i++) {
+				const struct u_wv_rect *x = &plan.on[i];
+				on[on_count++] = {{x->left, x->top}, {x->right - x->left, x->bottom - x->top}};
+			}
+		}
+		// Past the flat budget the rest stays 3D: the safe direction.
+		for (uint32_t i = 0; i < plan.off_count && off_count < WEAVE_WISH_MAX_FLAT_RECTS; i++) {
+			const struct u_wv_rect *x = &plan.off[i];
+			off[off_count++] = {{x->left, x->top}, {x->right - x->left, x->bottom - x->top}};
+		}
+	}
+	if (on_count == 0) { // an implicit wish with nothing visible
+		on[0] = whole;
+		on_count = 1;
+		off_count = 0;
+		off[off_count++] = whole;
+	}
+
+	bool changed = false;
+	const uint64_t seq = u_wv_wish_seq_step(&c->region_seq, plan.signature, &changed);
+	if (changed) {
+		U_LOG_I("ADR-062 tier 4 service: zone wish gen %llu (%s, %u on / %u flat rect(s)%s)",
+		        (unsigned long long)seq,
+		        plan.kind == U_WV_WISH_EMPTY ? "empty" : (plan.kind == U_WV_WISH_CUT ? "cut" : "implicit"),
+		        on_count, off_count, presenter ? "" : ", not the tracked presenter");
+	}
+
+	uint32_t mask_w = w, mask_h = h;
+	ID3D11ShaderResourceView *srv =
+	    service_update_zone_wish_mask(sys, c, dp, on, on_count, off, off_count, w, h, &mask_w, &mask_h);
+	if (srv == nullptr) {
+		return true;
+	}
+	svc_assert_same_device(srv, mask_dev);
+	if (xrt_display_processor_d3d11_publish_local_zone_mask(dp, svc_context_for_device(sys, mask_dev), srv, mask_w,
+	                                                        mask_h, (int32_t)origin.x, (int32_t)origin.y, w, h,
+	                                                        seq)) {
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		if (c->segments != nullptr && c->seg_device == mask_dev) {
+			comp_d3d11_segments_publish_zone_mask(c->segments, svc_context_for_device(sys, mask_dev), srv,
+			                                      mask_w, mask_h, w, h, seq);
+		}
+		if (!c->zone_published) {
+			U_LOG_W("ADR-062 tier 4 service: visible-region wish published to the %s DP (%ux%u @ screen %ld,%ld)",
+			        pipeline_always_on(sys) ? "panel" : "per-client", w, h, origin.x, origin.y);
+		}
+		c->zone_published = true;
+	}
+	return true;
+}
+
 static void
 service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_service_compositor *c, bool zones_frame)
 {
+	// ADR-062 D5: a zone grid larger than 1x1 publishes the visible region
+	// instead; a 1x1 grid (or no zones DP) takes the path below unchanged.
+	if (service_region_wish_publish(sys, c, zones_frame)) {
+		return;
+	}
+
 	// #964 D-4: one DP per panel — the wish goes to the panel DP on the
 	// pipeline path, to the client's own DP on the legacy one.
 	// #1172: and to THIS CLIENT's ingest DP when it has one — the wish IS the

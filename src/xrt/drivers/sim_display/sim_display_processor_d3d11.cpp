@@ -240,7 +240,13 @@ struct sim_display_processor_d3d11_impl
 	//! mask into the zone grid (change-gated log). Staging tex lazily sized.
 	ID3D11Texture2D *zone_staging;
 	uint32_t zone_staging_w, zone_staging_h;
-	char zone_last_map[SIM_ZONE_MAX_CELLS + 1]; //!< Last logged cell map ('0'/'1' row-major).
+	//! Last logged cell map ('0'/'1' row-major, rows split by '/').
+	char zone_last_map[2 * SIM_ZONE_MAX_CELLS + 1];
+	//! ADR-062 D5: the generation the last readback belongs to, and the
+	//! publishes since (a same-generation publish is re-read now and then, to
+	//! catch content that changed without a generation bump).
+	uint64_t zone_dump_seq;
+	uint64_t zone_dump_count;
 
 	//! ADR-027 wish-tint visualization: sim-owned copy of the last published
 	//! wish (the compositor's SRV is call-scoped per the header contract, so
@@ -786,6 +792,16 @@ sim_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 		device->Release();
 		return true;
 	}
+	// One readback per publish generation (the runtime republishes every frame
+	// and bumps the generation only on a content change), plus one every 60
+	// same-generation publishes to check that rule.
+	const bool new_gen = sdp->zone_last_map[0] == '\0' || geo_changed || seq != sdp->zone_dump_seq;
+	sdp->zone_dump_count++;
+	if (!new_gen && (sdp->zone_dump_count % 60) != 0) {
+		res->Release();
+		device->Release();
+		return true;
+	}
 
 	if (sdp->zone_staging == nullptr || sdp->zone_staging_w != mask_width || sdp->zone_staging_h != mask_height) {
 		if (sdp->zone_staging != nullptr) {
@@ -825,11 +841,31 @@ sim_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 	                                      mask_height, &sdp->zone_cfg, map);
 	ctx->Unmap(sdp->zone_staging, 0);
 
-	if (map_ok && strcmp(map, sdp->zone_last_map) != 0) {
-		U_LOG_W("SIM ZONE CELLS [%ux%u]: %s (seq=%llu)", sdp->zone_cfg.grid_w, sdp->zone_cfg.grid_h, map,
-		        (unsigned long long)seq);
-		memcpy(sdp->zone_last_map, map, sizeof(map));
+	if (!map_ok) {
+		return true;
 	}
+	// Rows split by '/', e.g. "1100/0000" for a 4x2 grid (cells over the window's mask).
+	char rows[sizeof(sdp->zone_last_map)];
+	size_t k = 0;
+	for (uint32_t y = 0; y < sdp->zone_cfg.grid_h; y++) {
+		if (y > 0) {
+			rows[k++] = '/';
+		}
+		memcpy(rows + k, map + (size_t)y * sdp->zone_cfg.grid_w, sdp->zone_cfg.grid_w);
+		k += sdp->zone_cfg.grid_w;
+	}
+	rows[k] = '\0';
+	if (strcmp(rows, sdp->zone_last_map) != 0) {
+		if (!new_gen) {
+			U_LOG_W("SIM ZONE GRID: the mask content changed under the same generation %llu - a publish "
+			        "generation must bump on every content change",
+			        (unsigned long long)seq);
+		}
+		U_LOG_W("SIM ZONE GRID %ux%u gen %llu: %s (mask %ux%u at screen %d,%d)", sdp->zone_cfg.grid_w,
+		        sdp->zone_cfg.grid_h, (unsigned long long)seq, rows, mask_width, mask_height, screen_x, screen_y);
+		memcpy(sdp->zone_last_map, rows, k + 1);
+	}
+	sdp->zone_dump_seq = seq;
 	return true;
 }
 
