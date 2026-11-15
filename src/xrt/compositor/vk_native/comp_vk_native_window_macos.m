@@ -310,6 +310,13 @@ comp_vk_native_window_macos_get_layer(struct comp_vk_native_window_macos *win)
 	return (__bridge void *)win->metal_layer;
 }
 
+void *
+comp_vk_native_window_macos_get_view(struct comp_vk_native_window_macos *win)
+{
+	if (win == NULL) return NULL;
+	return (__bridge void *)win->view;
+}
+
 void
 comp_vk_native_window_macos_get_dimensions(struct comp_vk_native_window_macos *win,
                                             uint32_t *out_width,

@@ -70,8 +70,23 @@
  * the segment coverage gate (#2247) owns that case. A minimized, invisible or
  * cloaked window is hidden on every screen.
  *
- * Other platforms get a tracker that never reports hidden (follow-up: macOS
- * occlusion state, X11/Wayland visibility, Android surface lifecycle).
+ * Desktop Linux (X11 and XWayland, u_window_visibility_x11.c): unmapped,
+ * minimized (`WM_STATE` Iconic / `_NET_WM_STATE_HIDDEN`) or on another desktop
+ * is hidden, so is a server-reported `VisibilityNotify(FullyObscured)`, and a
+ * low-rate `_NET_CLIENT_LIST_STACKING` cover check applies the rules above
+ * where X has the same facts. Native Wayland surfaces are not tracked: a
+ * Wayland client cannot see the global stacking order, so they count as
+ * visible.
+ *
+ * macOS (u_window_visibility_macos.m): `NSWindow.occlusionState`, sampled on
+ * the main thread (never waited on), which already folds in minimized, other
+ * Space, hidden app and full cover; it is window-wide, not clipped to the 3D
+ * screen.
+ *
+ * Desktop Linux and macOS judge the whole window for every screen (no segment
+ * DPs there) and report no foreground fact.
+ *
+ * Other platforms (Android) get a tracker that never reports hidden.
  *
  * `DXR_LENS_VISIBILITY=0` turns the policy off (create returns NULL). It,
  * @ref U_WINDOW_VISIBILITY_ENV_OVERLAYS and
@@ -412,9 +427,16 @@ struct u_window_visibility;
 typedef void (*u_window_visibility_change_fn)(void *userdata, bool hidden);
 
 /*!
- * Start tracking @p native_window (Windows: an HWND; the tracker walks from
- * its root window). @p panel_device_name names the 3D screen (Windows: the GDI
- * device name, `xrt_system_compositor_info::display_device_name`); NULL or ""
+ * Start tracking @p native_window. Per platform:
+ * - Windows: an HWND; the tracker walks from its root window.
+ * - desktop Linux: an X11 window XID cast to a pointer
+ *   (`(void *)(uintptr_t)xid`) on the server `$DISPLAY` names; it may be a
+ *   child, the tracker walks up to its managed top-level.
+ * - macOS: an `NSView *` or `NSWindow *` bridged to `void *`.
+ *
+ * @p panel_device_name names the 3D screen,
+ * `xrt_system_compositor_info::display_device_name` (Windows: the GDI device
+ * name; desktop Linux: the RandR monitor name; macOS: ignored); NULL or ""
  * means unknown, and the target is then the whole client rect. @p who labels
  * the transition log lines.
  *
