@@ -315,7 +315,12 @@ along the input cluster's normal. Report `DOCKED` true just before the pen
 stops tracking. A provider that must also run on a runtime without
 `XRT_INPUT_PLUGIN_HAS_STYLUS` (no profile there) cannot be served the stylus
 profile on it; declare a fallback `binding_profiles` entry (e.g.
-`khr/simple_controller`) if it should still be usable there.
+`khr/simple_controller`) if it should still be usable there. On such a
+runtime also publish on a plain `XRT_TRACKING_TYPE_RIG_LOCAL` origin: an older
+runtime does not know `RIG_LOCAL_PHYSICAL`, so it would neither anchor that
+origin at the rig nor re-base it, and the pen would sit at the stage origin.
+The run-time signal for both is the same: a NULL or uncovered
+`get_handedness` slot.
 
 ## Device obligations
 
