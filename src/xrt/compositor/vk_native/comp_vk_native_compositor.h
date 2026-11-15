@@ -311,6 +311,18 @@ bool
 comp_vk_native_compositor_window_hidden(struct xrt_compositor *xc);
 
 /*!
+ * ADR-062 D4 (tier 3, XR_DXR_window_visibility): the session's window
+ * tracker, borrowed for the state tracker's per-poll verdict
+ * (@ref u_wv_report_get). NULL when the window is untracked, on a platform
+ * without a tracker, or @p xc is NULL. Valid while the compositor lives.
+ *
+ * @ingroup comp_vk_native
+ */
+struct u_window_visibility;
+const struct u_window_visibility *
+comp_vk_native_compositor_window_visibility(struct xrt_compositor *xc);
+
+/*!
  * Select the eye-tracking control mode (MANAGED=0 / MANUAL=1) on the display
  * processor — the policy counterpart to @ref
  * comp_vk_native_compositor_request_display_mode. No-op if the DP doesn't react.

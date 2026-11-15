@@ -207,6 +207,8 @@ add_library(
 	u_visibility_mask.h
 	u_window_visibility.c
 	u_window_visibility.h
+	u_window_visibility_report.c
+	u_window_visibility_report.h
 	u_win32_com_guard.cpp
 	u_win32_com_guard.hpp
 	u_worker.c

@@ -33,6 +33,7 @@
 #include "util/u_device.h"
 #include "util/u_cursor_depth.h"
 #include "util/u_stereo_comfort.h"
+#include "util/u_window_visibility_report.h"
 #include "util/u_tracking_any.h"
 #include "util/u_mono_auto_2d.h"
 
@@ -1053,6 +1054,32 @@ void
 oxr_session_visibility_poll(struct oxr_logger *log, struct oxr_session *sess);
 
 /*!
+ * ADR-062 D4 (XR_DXR_window_visibility): read the opt-in
+ * (XrSessionWindowVisibilityInfoDXR) and the debug force lever at session
+ * create. One WARN when the force lever applies to this session.
+ */
+void
+oxr_session_window_visibility_init(struct oxr_logger *log, struct oxr_session *sess, const XrSessionCreateInfo *createInfo);
+
+/*!
+ * ADR-062 D4: take a window-visibility verdict (from the in-process
+ * compositor's tracker, or a service XRT_SESSION_EVENT_WINDOW_VISIBILITY_CHANGE):
+ * queue XrEventDataWindowVisibilityChangedDXR on a change the app has not
+ * heard, and decide the demotion (@ref oxr_session::window_visibility). Under
+ * sessions_mutex (the poll), so the state machine reads a settled flag.
+ */
+void
+oxr_session_window_visibility_apply(struct oxr_logger *log, struct oxr_session *sess, const struct u_wv_report *r);
+
+/*!
+ * ADR-062 D4: the in-process verdict, once per xrPollEvent, for a session the
+ * extension or the force lever covers. A no-op otherwise, and for a session
+ * with no tracked window (out-of-process sessions hear the service instead).
+ */
+void
+oxr_session_window_visibility_poll(struct oxr_logger *log, struct oxr_session *sess);
+
+/*!
  * Push the session's eye-tracking control mode (MANAGED=0 / MANUAL=1) to the
  * display processor (#522). Best-effort policy hint; the DP enacts whatever the
  * vendor advertised. Routed in-process via the native compositor or
@@ -1674,6 +1701,16 @@ oxr_event_push_XrEventDataSessionStateChanged(struct oxr_logger *log,
 
 XrResult
 oxr_event_push_XrEventDataInteractionProfileChanged(struct oxr_logger *log, struct oxr_session *sess);
+
+#ifdef OXR_HAVE_DXR_window_visibility
+//! ADR-062 D4: XrEventDataWindowVisibilityChangedDXR (one WARN per event).
+XrResult
+oxr_event_push_XrEventDataWindowVisibilityChangedDXR(struct oxr_logger *log,
+                                                     struct oxr_session *sess,
+                                                     XrBool32 visible,
+                                                     XrWindowVisibilityReasonDXR reason,
+                                                     XrTime time);
+#endif
 
 XrResult
 oxr_event_push_XrEventDataReferenceSpaceChangePending(struct oxr_logger *log,
@@ -3705,6 +3742,22 @@ struct oxr_session
 	//! answer (a hardware-3D event) when the window is seen again. The only
 	//! visibility edge that is reported as a hardware state change.
 	bool window_hidden_3d_owed;
+
+	/*!
+	 * ADR-062 D4 (XR_DXR_window_visibility). @ref active gates everything:
+	 * a session the extension does not cover and the force lever leaves off
+	 * never sees a session-state change from window visibility.
+	 */
+	struct
+	{
+		bool active;        //!< the extension is enabled, or the force lever applies
+		bool events;        //!< the instance enabled the extension: queue the events
+		bool opted_in;      //!< XrSessionWindowVisibilityInfoDXR::demoteWhenHidden
+		enum u_wv_demote_force force; //!< the debug lever, for a session that did not opt in
+		struct u_wv_report last; //!< what the app was last told (starts visible)
+		//! Held at SYNCHRONIZED: the state machine reads visible/focused as false.
+		bool demoted;
+	} window_visibility;
 
 	//! Active eye tracking mode (0=MANAGED, 1=MANUAL). Default: 0 (MANAGED).
 	uint32_t eye_tracking_mode;

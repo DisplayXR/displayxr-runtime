@@ -108,6 +108,7 @@ set(tests
     tests_aux_weave_flat
     tests_aux_display_mode_hold
     tests_aux_window_visibility
+    tests_aux_window_visibility_report
     tests_aux_mono_auto_2d
     tests_aux_tracking_any
     tests_comp_rear_budget

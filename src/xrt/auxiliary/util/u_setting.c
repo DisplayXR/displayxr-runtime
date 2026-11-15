@@ -88,6 +88,10 @@ static const char *const managed_names[] = {
     "DXR_LENS_VISIBILITY",
     "DXR_LENS_OVERLAY_PROCESSES",
     "DXR_HIDDEN_SKIP_PRESENT",
+    // ADR-062 D4 test lever (debug only): demote sessions that did not enable
+    // XR_DXR_window_visibility (off | minimize | all), for compatibility tests
+    // of unmodified apps. Read in the app process.
+    "DXR_HIDDEN_DEMOTE_FORCE",
 };
 
 #define MANAGED_COUNT ((uint32_t)(sizeof(managed_names) / sizeof(managed_names[0])))

@@ -17885,6 +17885,17 @@ comp_vk_native_compositor_window_hidden(struct xrt_compositor *xc)
 #endif
 }
 
+const struct u_window_visibility *
+comp_vk_native_compositor_window_visibility(struct xrt_compositor *xc)
+{
+#ifdef XRT_OS_WINDOWS
+	return xc != NULL ? vk_comp(xc)->visibility : NULL;
+#else
+	(void)xc;
+	return NULL;
+#endif
+}
+
 bool
 comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
 {

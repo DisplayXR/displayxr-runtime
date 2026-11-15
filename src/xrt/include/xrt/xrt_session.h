@@ -86,6 +86,28 @@ enum xrt_session_event_type
 	//! #961 (XR_DXR_display_info v17): this session's display-mode request was
 	//! denied by the panel-lease holder / policy; targeted, never broadcast.
 	XRT_SESSION_EVENT_DISPLAY_MODE_REQUEST_DENIED = 15,
+
+	//! ADR-062 D4 (XR_DXR_window_visibility): the session's window was hidden
+	//! on every screen it covers, or seen again. Pushed by the D3D11 service's
+	//! default policy to the presenter; in-process sessions read the same
+	//! verdict from their compositor's tracker.
+	XRT_SESSION_EVENT_WINDOW_VISIBILITY_CHANGE = 16,
+};
+
+/*!
+ * ADR-062 D4: why a session's window is (not) visible. Mirrors
+ * XrWindowVisibilityReasonDXR one-to-one.
+ */
+enum xrt_window_visibility_reason
+{
+	XRT_WINDOW_VISIBILITY_REASON_VISIBLE = 0,
+	XRT_WINDOW_VISIBILITY_REASON_MINIMIZED = 1,
+	XRT_WINDOW_VISIBILITY_REASON_CLOAKED = 2,
+	XRT_WINDOW_VISIBILITY_REASON_COVERED = 3,
+	XRT_WINDOW_VISIBILITY_REASON_NOT_SHOWN = 4,
+	XRT_WINDOW_VISIBILITY_REASON_LOCKED = 5,
+	XRT_WINDOW_VISIBILITY_REASON_DISPLAY_OFF = 6,
+	XRT_WINDOW_VISIBILITY_REASON_WINDOW_HIDDEN = 7,
 };
 
 /*!
@@ -267,6 +289,20 @@ struct xrt_session_event_display_mode_request_denied
 };
 
 /*!
+ * ADR-062 D4: window visibility, type @ref XRT_SESSION_EVENT_WINDOW_VISIBILITY_CHANGE.
+ * @p foreground is the OS foreground fact at the time of the push (the
+ * demotion guard); the service re-pushes when it changes while hidden.
+ */
+struct xrt_session_event_window_visibility_change
+{
+	enum xrt_session_event_type type;
+	bool visible;
+	bool foreground;
+	uint32_t reason;                     //!< enum xrt_window_visibility_reason
+	XRT_ALIGNAS(8) int64_t timestamp_ns; //!< monotonic time of the debounced transition
+};
+
+/*!
  * Spatial file-picker completion event, type @ref XRT_SESSION_EVENT_FILE_PICKER_COMPLETE.
  *
  * `path` is plain UTF-8, NUL-terminated within
@@ -306,6 +342,7 @@ union xrt_session_event {
 	struct xrt_session_event_hardware_display_state_change hardware_display_state_change;
 	struct xrt_session_event_file_picker_complete file_picker_complete;
 	struct xrt_session_event_display_mode_request_denied display_mode_request_denied;
+	struct xrt_session_event_window_visibility_change window_visibility;
 };
 
 /*!

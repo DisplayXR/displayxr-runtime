@@ -268,6 +268,18 @@ bool
 comp_d3d12_compositor_window_hidden(struct xrt_compositor *xc);
 
 /*!
+ * ADR-062 D4 (tier 3, XR_DXR_window_visibility): the session's window
+ * tracker, borrowed for the state tracker's per-poll verdict
+ * (@ref u_wv_report_get). NULL when the window is untracked, on a platform
+ * without a tracker, or @p xc is NULL. Valid while the compositor lives.
+ *
+ * @ingroup comp_d3d12
+ */
+struct u_window_visibility;
+const struct u_window_visibility *
+comp_d3d12_compositor_window_visibility(struct xrt_compositor *xc);
+
+/*!
  * #2639: true when the D3D11 hub this session is rerouted through runs a legacy
  * session's automatic 2D. xrLocateViews then keeps the per-eye view set
  * whenever the DP reports a collapsed one. Any thread.
