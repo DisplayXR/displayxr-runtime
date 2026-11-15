@@ -604,7 +604,7 @@ endif()
 # reference 6-DoF STYLUS: one scripted pen on the MX Ink profile, declared
 # DOMINANT_HAND_CONTROLLER, publishing on a RIG_LOCAL_PHYSICAL origin. Same
 # build model as sim-input; no aux_math (the script keeps its own small
-# quaternion helper), so it links as plain C. probe() declines unless setting
+# quaternion helper). probe() declines unless setting
 # ENABLE=1, so staging/registering it is inert. sim_stylus_script.c is pure and
 # also compiled straight into tests_sim_stylus_script.
 if(XRT_FEATURE_OPENXR AND NOT ANDROID)
@@ -639,9 +639,12 @@ target_include_directories(drv_sim_stylus_plugin PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/sim_stylus
 	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
 	)
+# LINKER_LANGUAGE CXX: the sources are C but the static aux_util they pull
+# (u_var.cpp on the ELF static-link path) is C++ — same rule as sim-input.
 set_target_properties(drv_sim_stylus_plugin PROPERTIES
 	OUTPUT_NAME "DisplayXR-SimStylus"
 	PREFIX ""
+	LINKER_LANGUAGE CXX
 	C_VISIBILITY_PRESET hidden
 	CXX_VISIBILITY_PRESET hidden
 	VISIBILITY_INLINES_HIDDEN ON
