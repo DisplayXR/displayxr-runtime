@@ -29,6 +29,7 @@
 // #1589/#1610: the shared format-honesty policy (hatch + fast-path predicate).
 #include "util/u_color_encoding.h"
 #include "util/u_logging.h"
+#include "util/u_window_visibility.h"
 #include "util/u_setting.h"
 #include "util/u_weave_scope.h"
 #include "util/u_tracking_any.h"
@@ -4650,6 +4651,13 @@ struct d3d11_multi_compositor
 	//! Focused client index (-1 = none).
 	int32_t focused_slot;
 
+	//! @name #2671 presenter visibility (default policy; render thread only)
+	//! @{
+	struct u_window_visibility *lens_vis; //!< NULL until the first trackable presenter
+	HWND lens_vis_hwnd;                   //!< the window lens_vis tracks (NULL = none)
+	bool lens_hidden_applied;             //!< the hidden gate is engaged
+	//! @}
+
 	//! Phase 2.K: focused-slot value last seen by the public-API drain. The
 	//! drain compares against `focused_slot` and emits a FOCUS_CHANGED event
 	//! to the workspace controller on each transition (TAB cycle, click
@@ -5384,9 +5392,24 @@ multi_compositor_request_mode_flip(struct d3d11_service_system *sys,
  * Logging is rate-limited to one line per second so a persistently failing DP
  * on a per-commit path cannot flood the log.
  */
+/*!
+ * #2671: the default policy's presenter window is hidden (minimized, cloaked or
+ * every pixel on the 3D screen covered). While set, every hardware-3D request
+ * the service makes is sent as 2D, whichever of the many writers makes it (app
+ * request, focus re-arm, DP rebind, zones fallback), while the callers still
+ * record the session's own choice in sys->hardware_display_3d, which
+ * pipeline_lens_visibility_tick re-sends when the window is seen again (the
+ * u_display_mode_hold.h rule: never a forced 3D). Written by the render thread
+ * only, under render_mutex; one panel per service.
+ */
+static std::atomic<bool> g_svc_presenter_hidden{false};
+
 static bool
 dp_request_display_mode_checked(struct xrt_display_processor_d3d11 *xdp, bool enable_3d, const char *func, int line)
 {
+	if (enable_3d && g_svc_presenter_hidden.load(std::memory_order_acquire)) {
+		enable_3d = false;
+	}
 	bool ok = xrt_display_processor_d3d11_request_display_mode(xdp, enable_3d);
 	if (!ok) {
 		static std::atomic<int64_t> last_fail_log_ns{0};
@@ -11664,6 +11687,10 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 	if (mc->capture_render_thread.joinable()) {
 		mc->capture_render_thread.join();
 	}
+	// #2671: the render thread (the tracker's only reader) is joined; join the
+	// tracker's own thread too, and drop the gate with the panel.
+	u_window_visibility_destroy(&mc->lens_vis);
+	g_svc_presenter_hidden.store(false, std::memory_order_release);
 
 	// Restore and stop all capture clients
 	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
@@ -15582,6 +15609,60 @@ pipeline_segments_weave(struct d3d11_service_system *sys,
 	return true;
 }
 
+/*!
+ * #2671: the presenter's visibility drives the panel's lens wish. Render
+ * thread, under render_mutex, once per tick: one atomic load unless the
+ * tracked window or the hidden state changed. @p hwnd is the window the
+ * default policy presents to, or NULL when the policy does not apply (no
+ * presenter, a present-owner, which runs its own visibility rule, a published
+ * zone wish, or a workspace controller owning the panel).
+ *
+ * Without a controller exactly one client holds the panel (the lease), so
+ * "every 3D window hidden" is "the presenter's window hidden". Hidden: the
+ * panel DP is asked for 2D and the gate in dp_request_display_mode_checked
+ * keeps every later 3D request flat. Seen again (or a new presenter): the gate
+ * drops and the session's recorded hardware state is re-sent. The hardware
+ * flag and the apps' events are untouched: the app is not told (#2671 open
+ * question; no session-state change).
+ */
+static void
+pipeline_lens_visibility_tick(struct d3d11_service_system *sys,
+                              struct d3d11_multi_compositor *mc,
+                              struct d3d11_service_compositor *fc,
+                              HWND hwnd)
+{
+	if (hwnd != mc->lens_vis_hwnd) {
+		mc->lens_vis_hwnd = hwnd;
+		if (mc->lens_vis != nullptr) {
+			u_window_visibility_set_window(mc->lens_vis, hwnd);
+		} else if (hwnd != nullptr) {
+			mc->lens_vis = u_window_visibility_create(hwnd, sys->base.info.display_device_name, "service",
+			                                          nullptr, nullptr);
+		}
+	}
+	const bool hidden = hwnd != nullptr && u_window_visibility_hidden(mc->lens_vis);
+	if (hidden == mc->lens_hidden_applied) {
+		return;
+	}
+	mc->lens_hidden_applied = hidden;
+	struct xrt_display_processor_d3d11 *dp = fc != nullptr ? panel_dp(sys, fc) : mc->display_processor;
+	if (hidden) {
+		g_svc_presenter_hidden.store(true, std::memory_order_release);
+		if (dp != nullptr) {
+			(void)DP_REQUEST_DISPLAY_MODE(dp, false);
+		}
+	} else {
+		g_svc_presenter_hidden.store(false, std::memory_order_release);
+		if (dp != nullptr && sys->hardware_display_3d) {
+			(void)DP_REQUEST_DISPLAY_MODE(dp, true);
+		}
+		// The vendor lags the command: keep the poll from counter-correcting.
+		stamp_flip_cooldown(sys, sys->hardware_display_3d);
+	}
+	U_LOG_W("#2671 service: presenter window %s, panel lens wish %s", hidden ? "hidden" : "visible (or changed)",
+	        hidden ? "2D" : (sys->hardware_display_3d ? "the session's 3D" : "the session's 2D"));
+}
+
 static void
 pipeline_default_policy_render(struct d3d11_service_system *sys,
                                struct d3d11_multi_compositor *mc,
@@ -15707,6 +15788,16 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	}
 	if (present_hwnd == nullptr || (kind != PRESENTER_SELF && present_rtv == nullptr)) {
 		kind = PRESENTER_NONE;
+	}
+
+	/* #2671: the lens follows whether any pixel of the presenter is visible.
+	 * Not for a present-owner (own visibility rule), a published zone wish
+	 * (the lens is per zone), or under a controller's foreground override. */
+	{
+		const bool policy = forced_focus < 0 && fc != nullptr && !fc->zone_published &&
+		                    (kind == PRESENTER_APP_HWND || kind == PRESENTER_SERVICE_WINDOW ||
+		                     kind == PRESENTER_CLIENT_TEXTURE);
+		pipeline_lens_visibility_tick(sys, mc, fc, policy ? present_hwnd : nullptr);
 	}
 
 	/* (d) The service window is visible only while it IS the presenter — under
@@ -17641,6 +17732,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		pipeline_default_policy_render(sys, mc, /*forced_focus*/ -1);
 		return;
 	}
+
+	// #2671: a controller owns the panel from here; drop a hidden gate the
+	// default policy left engaged (releases to the recorded state).
+	pipeline_lens_visibility_tick(sys, mc, nullptr, nullptr);
 
 	/* #964 Phase A (workspace scope): FOREGROUND OVERRIDE.
 	 *
@@ -24771,6 +24866,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// Withdrawing the mask (non-zones frames / teardown) re-enables
 		// the poll on the next window.
 		if (got_state && c->zone_published) {
+			got_state = false;
+		}
+		// #2671: the panel is 2D on purpose while the presenter's window is
+		// hidden; neither re-assert the app's 3D nor follow the vendor's 2D
+		// into the app's rendering mode. The release re-sends the app's state.
+		if (got_state && g_svc_presenter_hidden.load(std::memory_order_acquire)) {
 			got_state = false;
 		}
 

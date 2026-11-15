@@ -43,6 +43,7 @@ struct comp_hub_d3d11; // the reroute fields exist either way; the code does not
 #include "xrt/xrt_display_metrics.h"
 
 #include "util/u_logging.h"
+#include "util/u_window_visibility.h"
 #include "util/u_camera_profile.h"
 #include "util/u_setting.h"
 #include "util/u_weave_scope.h"
@@ -563,6 +564,17 @@ struct comp_d3d12_compositor
 	 * thread; read by the request_display_mode / begin_session paths.
 	 */
 	std::atomic<bool> seg_primary_uncovered{false};
+	/*!
+	 * #2671: the session's 3D window is hidden (minimized, cloaked or every
+	 * pixel on the 3D screen covered), latched by @ref visibility's
+	 * transition callback under c->mutex. The DP is then asked for 2D whatever
+	 * the session's mode; under the #1264 reroute the hub holds the same latch.
+	 */
+	std::atomic<bool> window_hidden{false};
+	//! #2671: the session's own last 2D/3D request — what a window's return restores.
+	std::atomic<bool> session_wants_3d{true};
+	//! #2671: low-rate visibility tracker for the window (NULL = always visible).
+	struct u_window_visibility *visibility = nullptr;
 	/*!
 	 * Multi-screen M3: what the app thread reads (xrLocateViews) and hands
 	 * back (xrEndFrame) while the weave thread owns the segment manager — a
@@ -3461,6 +3473,34 @@ d3d12_compositor_create_semaphore(struct xrt_compositor *xc,
 	return XRT_ERROR_FENCE_CREATE_FAILED;
 }
 
+/*!
+ * #2671: the window's visibility changed (tracker thread, transitions only).
+ * Takes c->mutex — the frame path's lock, which also guards the reroute's
+ * lifetime and the DP swap — so the lens call and its GPU drain never run
+ * beside a frame; the wait is the tracker thread's, never a render's. Hidden:
+ * the lens wish is 2D; visible: the session's own choice comes back.
+ */
+static void
+d3d12_visibility_changed(void *userdata, bool hidden)
+{
+	auto *c = static_cast<struct comp_d3d12_compositor *>(userdata);
+	std::lock_guard<std::mutex> lock(c->mutex);
+	c->window_hidden = hidden;
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (c->reroute.active && c->reroute.split != NULL) {
+		comp_hub_d3d11_set_window_hidden(c->reroute.split, hidden);
+		return;
+	}
+#endif
+	if (c->display_processor != nullptr) {
+		// A mode switch perturbs the display: drain the present first, as
+		// the request_display_mode entry point does.
+		gpu_wait_idle_out(c);
+		xrt_display_processor_d3d12_request_display_mode(
+		    c->display_processor, c->session_wants_3d.load() && !c->seg_primary_uncovered.load() && !hidden);
+	}
+}
+
 static xrt_result_t
 d3d12_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_session_info *info)
 {
@@ -3468,10 +3508,12 @@ d3d12_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 
 	U_LOG_I("D3D12 compositor session begin");
 
-	// Switch display to 3D mode (#2247: not a primary screen the window has left)
+	// Switch display to 3D mode (#2247: not a primary screen the window has
+	// left; #2671: not while the window is hidden)
+	c->session_wants_3d = true;
 	if (c->display_processor != nullptr) {
-		xrt_display_processor_d3d12_request_display_mode(c->display_processor,
-		                                                 !c->seg_primary_uncovered.load());
+		xrt_display_processor_d3d12_request_display_mode(
+		    c->display_processor, !c->seg_primary_uncovered.load() && !c->window_hidden.load());
 	}
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	else if (c->reroute.active && c->reroute.split != NULL) {
@@ -3490,6 +3532,7 @@ d3d12_compositor_end_session(struct xrt_compositor *xc)
 	U_LOG_I("D3D12 compositor session end");
 
 	// Switch display back to 2D mode
+	c->session_wants_3d = false;
 	if (c->display_processor != nullptr) {
 		xrt_display_processor_d3d12_request_display_mode(c->display_processor, false);
 	}
@@ -4925,7 +4968,7 @@ d3d12_segments_tick(struct comp_d3d12_compositor *c,
 		const bool uncovered = !comp_d3d12_segments_primary_covered(c->segments);
 		if (uncovered != c->seg_primary_uncovered.load()) {
 			c->seg_primary_uncovered = uncovered;
-			const bool want = c->hardware_display_3d && !uncovered;
+			const bool want = c->hardware_display_3d && !uncovered && !c->window_hidden.load();
 			// A mode switch perturbs the display: drain the present first, as
 			// the request_display_mode entry point does (an edge, not per frame).
 			gpu_wait_idle_out(c);
@@ -7715,6 +7758,11 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 
 	U_LOG_I("Destroying D3D12 compositor");
 
+	// #2671: join the visibility tracker before anything its callback touches
+	// (the reroute hub, the DP). c->mutex is not held here, so the join cannot
+	// wait on the callback's lock.
+	u_window_visibility_destroy(&c->visibility);
+
 	// #868: stop the repaint loop FIRST. It touches the command list, the
 	// target and the display processor under c->mutex, so it has to be joined
 	// before any of that is torn down — not merely signalled.
@@ -8487,6 +8535,14 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	mcp_capture_init(&c->mcp_capture);
 	mcp_capture_install(&c->mcp_capture);
 
+	// #2671: the window's visibility drives the lens wish. Last, so the DP or
+	// the reroute exists before the first transition; the 3D screen's name
+	// arrives with set_screens.
+	{
+		HWND vis_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+		c->visibility = u_window_visibility_create(vis_hwnd, nullptr, "d3d12", d3d12_visibility_changed, c);
+	}
+
 	*out_xc = &c->base;
 
 	U_LOG_IFL_I(U_LOGGING_INFO, "D3D12 native compositor created successfully (%ux%u)",
@@ -8759,6 +8815,8 @@ comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 	if (d3d12_out_timeline_is_separate(c)) {
 		gpu_wait_idle_app(c);
 	}
+	// #2671: recorded on both routes, so a hidden window's return restores it.
+	c->session_wants_3d = enable_3d;
 
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	if (c->reroute.active && c->reroute.split != NULL) {
@@ -8775,9 +8833,10 @@ comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 	}
 #endif
 	// #2247: the primary screen stays 2D while the window has wholly left it;
-	// the weave restores the session's mode when it returns.
-	return xrt_display_processor_d3d12_request_display_mode(c->display_processor,
-	                                                        enable_3d && !c->seg_primary_uncovered.load());
+	// the weave restores the session's mode when it returns. #2671: likewise
+	// while the window is hidden; the visibility callback restores it.
+	return xrt_display_processor_d3d12_request_display_mode(
+	    c->display_processor, enable_3d && !c->seg_primary_uncovered.load() && !c->window_hidden.load());
 }
 
 extern "C" void
@@ -8790,6 +8849,8 @@ comp_d3d12_compositor_set_screens(struct xrt_compositor *xc,
 		return;
 	}
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	// #2671: the 3D screen the visibility check clips the window to.
+	u_window_visibility_set_panel(c->visibility, info->display_device_name);
 	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
 	struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
 	if (copy == nullptr || info_copy == nullptr) {

@@ -1082,6 +1082,16 @@ bool
 comp_hub_d3d11_request_display_mode(struct comp_hub_d3d11 *split, bool enable_3d);
 
 /*!
+ * #2671: the session's 3D window is hidden (every pixel minimized, cloaked or
+ * covered) or visible again, from the owning compositor's
+ * u_window_visibility tracker. While hidden the hub's DP is asked for 2D over
+ * the session's own mode; visible again, the session's mode is re-sent at once
+ * (never a forced 3D). Edges only; any thread (takes the DP mutex).
+ */
+void
+comp_hub_d3d11_set_window_hidden(struct comp_hub_d3d11 *split, bool hidden);
+
+/*!
  * #2639: does this hub run a legacy session's automatic 2D? Its decision is
  * presentation-only, so xrLocateViews must hand such a session its per-eye
  * views whatever the lens is doing: a DP in hardware 2D reports one centred

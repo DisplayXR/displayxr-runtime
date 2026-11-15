@@ -205,6 +205,8 @@ add_library(
 	u_verify.h
 	u_visibility_mask.c
 	u_visibility_mask.h
+	u_window_visibility.c
+	u_window_visibility.h
 	u_win32_com_guard.cpp
 	u_win32_com_guard.hpp
 	u_worker.c
@@ -235,6 +237,9 @@ if(WIN32)
 	# wintrust + crypt32: Authenticode signer check for user-writable consent-delegating
 	# entries; ole32 (CoTaskMemFree) + uuid (FOLDERID_*): SHGetKnownFolderPath (u_camera_consent_store.c)
 	target_link_libraries(aux_util PRIVATE shell32 advapi32 bcrypt wintrust crypt32 ole32 uuid)
+	# dwmapi: cloaked state + extended frame bounds for the lens visibility policy (#2671)
+	target_sources(aux_util PRIVATE u_window_visibility_win32.c)
+	target_link_libraries(aux_util PRIVATE dwmapi)
 endif()
 
 # WIL is lacking official support on MINGW.
