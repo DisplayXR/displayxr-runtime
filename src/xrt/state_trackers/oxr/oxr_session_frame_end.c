@@ -1459,6 +1459,20 @@ verify_window_space_layer(struct oxr_session *sess,
 		                 "(frameEndInfo->layers[%u]->subImage.swapchain) swapchain is NULL!", layer_index);
 	}
 
+	if (sc->array_layer_count <= ws->subImage.imageArrayIndex) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(frameEndInfo->layers[%u]->subImage.imageArrayIndex == %u) Invalid swapchain array "
+		                 "index for window-space layer (%u).",
+		                 layer_index, ws->subImage.imageArrayIndex, sc->array_layer_count);
+	}
+
+	if (sc->face_count != 1) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(frameEndInfo->layers[%u]->subImage.swapchain) Invalid swapchain face count "
+		                 "(expected 1, got %u)",
+		                 layer_index, sc->face_count);
+	}
+
 	if (!sc->released.yes) {
 		return oxr_error(log, XR_ERROR_LAYER_INVALID,
 		                 "(frameEndInfo->layers[%u]->subImage.swapchain) swapchain has not been released!",
@@ -1487,13 +1501,19 @@ verify_window_space_layer(struct oxr_session *sess,
 		                 sc->width, sc->height);
 	}
 
-	// Validate fractional coordinates
-	if (ws->x < 0.0f || ws->x > 1.0f || ws->y < 0.0f || ws->y > 1.0f ||
-	    ws->width < 0.0f || ws->width > 1.0f || ws->height < 0.0f || ws->height > 1.0f) {
+	// Validate fractional coordinates. Written as !(in range) so NaN fails.
+	if (!(ws->x >= 0.0f && ws->x <= 1.0f) || !(ws->y >= 0.0f && ws->y <= 1.0f) ||
+	    !(ws->width >= 0.0f && ws->width <= 1.0f) || !(ws->height >= 0.0f && ws->height <= 1.0f)) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
 		                 "(frameEndInfo->layers[%u]) window-space coords out of [0,1] range: "
 		                 "x=%f y=%f w=%f h=%f",
 		                 layer_index, ws->x, ws->y, ws->width, ws->height);
+	}
+
+	if (!isfinite(ws->disparity)) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(frameEndInfo->layers[%u]->disparity == %f) must be finite", layer_index,
+		                 ws->disparity);
 	}
 
 	return XR_SUCCESS;
@@ -1537,6 +1557,20 @@ verify_local_2d_layer(struct oxr_session *sess,
 	if (sc == NULL) {
 		return oxr_error(log, XR_ERROR_LAYER_INVALID,
 		                 "(frameEndInfo->layers[%u]->subImage.swapchain) swapchain is NULL!", layer_index);
+	}
+
+	if (sc->array_layer_count <= l2d->subImage.imageArrayIndex) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(frameEndInfo->layers[%u]->subImage.imageArrayIndex == %u) Invalid swapchain array "
+		                 "index for local-2D layer (%u).",
+		                 layer_index, l2d->subImage.imageArrayIndex, sc->array_layer_count);
+	}
+
+	if (sc->face_count != 1) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(frameEndInfo->layers[%u]->subImage.swapchain) Invalid swapchain face count "
+		                 "(expected 1, got %u)",
+		                 layer_index, sc->face_count);
 	}
 
 	if (!sc->released.yes) {
