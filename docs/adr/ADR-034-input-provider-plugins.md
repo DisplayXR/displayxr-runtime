@@ -754,7 +754,9 @@ A 6-DoF tracked stylus is the natural tool for a 3D display — the panel is a s
 - Engine plug-ins still have to surface OpenXR actions for any provider device to reach an engine
   app (epic #2679 items); native OpenXR apps get the stylus now.
 - A provider built against these headers and run on an older runtime finds no stylus profile and no
-  DOMINANT resolution there; `XRT_INPUT_PLUGIN_HAS_STYLUS` / `get_handedness == NULL` tell it so.
+  DOMINANT resolution there. `XRT_INPUT_PLUGIN_HAS_STYLUS` only says what the provider was
+  compiled against; at run time `get_handedness == NULL` (or a `struct_size` that does not cover
+  it) is what tells it so.
 - Handedness is read at system build; a change applies to the next one.
 - Pinned by `tests_view_rig_point` (`[rig_local_physical]`), `tests_input_handedness`,
   `tests_input_host_geometry` and `tests_oxr_view_space` (`[stylus_profile]`: every path binds with
