@@ -36,6 +36,7 @@
 
 #include <mutex>
 #include <atomic>
+#include <memory>
 
 namespace winrt_cap = winrt::Windows::Graphics::Capture;
 namespace winrt_dx = winrt::Windows::Graphics::DirectX;
@@ -72,6 +73,15 @@ struct d3d11_capture_context
 	std::atomic<bool> running{true};
 
 	HWND hwnd;
+
+	// The C API's owning reference. Revoking FrameArrived does not wait for a
+	// callback already running on the free-threaded pool, so the context is
+	// shared-owned: the callback takes a strong reference (from the weak one
+	// it captured) for as long as it runs, and d3d11_capture_stop() drops this
+	// one. Whichever is last frees the context, so a late callback never
+	// touches freed memory. Never captured strongly by the callback: that
+	// would be a cycle through frame_pool.
+	std::shared_ptr<d3d11_capture_context> self;
 };
 
 
@@ -158,7 +168,9 @@ on_frame_arrived(struct d3d11_capture_context *ctx,
 		         ctx->pool_width, ctx->pool_height, new_w, new_h, (void *)ctx->hwnd);
 
 		try {
-			ctx->frame_pool.Recreate(
+			// The pool this callback was raised on, not ctx->frame_pool:
+			// d3d11_capture_stop() may be clearing that member right now.
+			pool.Recreate(
 			    get_winrt_device(ctx->device.get()),
 			    winrt_dx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
 			    1,
@@ -242,6 +254,15 @@ d3d11_capture_start(struct ID3D11Device *device, HWND hwnd)
 	auto ctx = new (std::nothrow) d3d11_capture_context();
 	if (!ctx) return nullptr;
 
+	// Owns ctx until start succeeds (then ctx->self takes over); every early
+	// return below frees it through this.
+	std::shared_ptr<d3d11_capture_context> owner;
+	try {
+		owner.reset(ctx); // deletes ctx itself if the control block can't be allocated
+	} catch (...) {
+		return nullptr;
+	}
+
 	device->AddRef();
 	ctx->device.attach(device);
 	ctx->hwnd = hwnd;
@@ -252,7 +273,6 @@ d3d11_capture_start(struct ID3D11Device *device, HWND hwnd)
 		// Create WinRT device from D3D11 device
 		auto winrt_device = get_winrt_device(device);
 		if (!winrt_device) {
-			delete ctx;
 			return nullptr;
 		}
 
@@ -269,7 +289,6 @@ d3d11_capture_start(struct ID3D11Device *device, HWND hwnd)
 		if (FAILED(hr) || !ctx->item) {
 			U_LOG_E("Capture: CreateForWindow failed (hr=0x%08lx). "
 			         "Window may be protected or elevated.", hr);
-			delete ctx;
 			return nullptr;
 		}
 
@@ -277,7 +296,6 @@ d3d11_capture_start(struct ID3D11Device *device, HWND hwnd)
 		auto size = ctx->item.Size();
 		if (size.Width <= 0 || size.Height <= 0) {
 			U_LOG_E("Capture: window has zero size");
-			delete ctx;
 			return nullptr;
 		}
 
@@ -293,9 +311,13 @@ d3d11_capture_start(struct ID3D11Device *device, HWND hwnd)
 		// Register FrameArrived callback
 		ctx->frame_arrived_revoker = ctx->frame_pool.FrameArrived(
 		    winrt::auto_revoke,
-		    [ctx](const winrt_cap::Direct3D11CaptureFramePool &pool,
-		          const winrt::Windows::Foundation::IInspectable &) {
-			    on_frame_arrived(ctx, pool);
+		    [weak = std::weak_ptr<d3d11_capture_context>(owner)](
+		        const winrt_cap::Direct3D11CaptureFramePool &pool,
+		        const winrt::Windows::Foundation::IInspectable &) {
+			    std::shared_ptr<d3d11_capture_context> strong = weak.lock();
+			    if (strong) {
+				    on_frame_arrived(strong.get(), pool);
+			    }
 		    });
 
 		// Create and start session
@@ -325,15 +347,14 @@ d3d11_capture_start(struct ID3D11Device *device, HWND hwnd)
 		U_LOG_E("Capture: WinRT error 0x%08lx: %ls",
 		         static_cast<unsigned long>(e.code()),
 		         e.message().c_str());
-		delete ctx;
 		return nullptr;
 
 	} catch (...) {
 		U_LOG_E("Capture: unexpected exception");
-		delete ctx;
 		return nullptr;
 	}
 
+	ctx->self = std::move(owner);
 	return ctx;
 }
 
@@ -394,5 +415,8 @@ d3d11_capture_stop(struct d3d11_capture_context *ctx)
 
 	U_LOG_W("Capture: stopped for HWND=%p", (void *)ctx->hwnd);
 
-	delete ctx;
+	// Drop the C API's reference. A FrameArrived callback still running holds
+	// its own; the context is freed when the last one goes.
+	std::shared_ptr<d3d11_capture_context> last = std::move(ctx->self);
+	last.reset();
 }
