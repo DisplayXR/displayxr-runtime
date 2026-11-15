@@ -84,6 +84,17 @@ void *
 comp_vk_native_window_macos_get_layer(struct comp_vk_native_window_macos *win);
 
 /*!
+ * Get the view presented into (the app's NSView, or the self-owned window's
+ * content view), bridged to void*, for the lens visibility tracker (#2671).
+ *
+ * @param win The window handle.
+ *
+ * @return The NSView as void*, or NULL.
+ */
+void *
+comp_vk_native_window_macos_get_view(struct comp_vk_native_window_macos *win);
+
+/*!
  * Get the current backing pixel dimensions.
  *
  * Computed live from the view's bounds (so it tracks window resize, #524);

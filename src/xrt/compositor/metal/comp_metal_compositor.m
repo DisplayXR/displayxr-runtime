@@ -45,6 +45,7 @@
 #include "xrt/xrt_system.h"
 
 #include "util/u_logging.h"
+#include "util/u_window_visibility.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
 #include "os/os_time.h"
@@ -265,6 +266,16 @@ struct comp_metal_compositor
 
 	//! True if running in offscreen mode (hidden window, no visible UI).
 	bool offscreen;
+
+	/*!
+	 * #2671: the window is hidden (minimized, on another Space, its app
+	 * hidden, or fully covered), latched by @ref visibility's transition
+	 * callback (its thread, plain write). The DP is then asked for 2D
+	 * whatever @ref hardware_display_3d says; the frame is still woven.
+	 */
+	bool window_hidden;
+	//! #2671: low-rate visibility tracker for the window (NULL = always visible).
+	struct u_window_visibility *visibility;
 
 	//! True if XR_DXR_cocoa_window_binding requested transparent background.
 	//! Drives atlas clear color (alpha=0 vs alpha=1) so per-pixel alpha from
@@ -6472,8 +6483,8 @@ metal_compositor_layer_commit_frame(struct xrt_compositor *xc, xrt_graphics_sync
 						U_LOG_W("segments: the session DP owns its screen again (same panel replugged) — "
 						        "kept its weaver, re-sent the display mode (3D=%d)",
 						        (int)c->hardware_display_3d);
-						(void)xrt_display_processor_metal_request_display_mode(c->display_processor,
-						                                                       c->hardware_display_3d);
+						(void)xrt_display_processor_metal_request_display_mode(
+						    c->display_processor, c->hardware_display_3d && !c->window_hidden);
 					}
 					c->seg_session_owned = owns;
 				}
@@ -6695,6 +6706,10 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	struct comp_metal_compositor *c = metal_comp(xc);
 
 	U_LOG_I("Destroying Metal compositor");
+
+	// #2671: join the visibility tracker before anything its callback touches
+	// (the DP). It takes no lock, so the join cannot wait on one.
+	u_window_visibility_destroy(&c->visibility);
 
 	// Uninstall the MCP capture hook before we drop any GPU resources —
 	// the MCP thread can no longer request a readback against us after
@@ -7185,6 +7200,9 @@ comp_metal_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint3
 	return true;
 }
 
+static void
+metal_visibility_changed(void *userdata, bool hidden);
+
 xrt_result_t
 comp_metal_compositor_create(struct xrt_device *xdev,
                              void *window_handle,
@@ -7454,6 +7472,15 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	info->initial_visible = true;
 	info->initial_focused = true;
 
+	// #2671: the window's visibility drives the lens wish. Last, so the DP
+	// exists before the first transition. Not for an offscreen (hidden) window
+	// or a headless IOSurface session: nothing there is the window the panel
+	// shows.
+	if (c->view != nil && !c->offscreen) {
+		c->visibility =
+		    u_window_visibility_create((__bridge void *)c->view, NULL, "metal", metal_visibility_changed, c);
+	}
+
 	// Install MCP capture_frame hook + arm the trigger-file path (#210).
 	// Last, once nothing below can fail (#2623): the hook is a process
 	// global, and an earlier failure return frees c without uninstalling it.
@@ -7648,9 +7675,28 @@ comp_metal_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 	if (c->display_processor == NULL) {
 		return false;
 	}
-	// Delegate to display processor (may be a no-op for sim_display)
-	xrt_display_processor_metal_request_display_mode(c->display_processor, enable_3d);
+	// Delegate to display processor (may be a no-op for sim_display).
+	// #2671: 2D while the window is hidden; the visibility callback restores
+	// the session's choice (hardware_display_3d) when it can be seen again.
+	xrt_display_processor_metal_request_display_mode(c->display_processor, enable_3d && !c->window_hidden);
 	return true;
+}
+
+/*!
+ * #2671: the window's visibility changed (the tracker's thread, transitions
+ * only). Takes no lock, like the app-thread request entry point above, so it
+ * never waits on a frame. Hidden: the lens wish is 2D; visible: the session's
+ * own choice comes back, never a forced 3D.
+ */
+static void
+metal_visibility_changed(void *userdata, bool hidden)
+{
+	struct comp_metal_compositor *c = (struct comp_metal_compositor *)userdata;
+	c->window_hidden = hidden;
+	if (c->display_processor != NULL) {
+		xrt_display_processor_metal_request_display_mode(c->display_processor,
+		                                                 c->hardware_display_3d && !hidden);
+	}
 }
 
 /*!

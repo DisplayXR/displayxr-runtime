@@ -3,11 +3,13 @@
 /*!
  * @file
  * @brief  Window visibility for the lens wish (#2671): the portable core, and
- *         the tracker stub for platforms without an implementation.
+ *         the tracker stub for platforms without an implementation (Android
+ *         and anything else that is neither Windows, desktop Linux nor macOS).
  * @ingroup aux_util
  */
 
 #include "util/u_window_visibility.h"
+#include "xrt/xrt_config_os.h"
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"
@@ -377,11 +379,12 @@ u_window_visibility_skip_step(struct u_window_visibility_skip *k,
 
 /*
  *
- * Tracker stub (non-Windows).
+ * Tracker stub. Windows: u_window_visibility_win32.c; desktop Linux and
+ * macOS: u_window_visibility_posix.c over the X11 / AppKit backends.
  *
  */
 
-#ifndef _WIN32
+#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_LINUX_DESKTOP) && !defined(XRT_OS_MACOS)
 
 struct u_window_visibility *
 u_window_visibility_create(void *native_window,

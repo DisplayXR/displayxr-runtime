@@ -68,7 +68,8 @@ reason clears.
 | Deferred request at DP creation (`hw3d_request_pending`) | Only if the session asked for 2D before the DP existed | It is the session's own choice | No change. |
 | Multi-compositor / service path (`multi_compositor_request_display_mode`, IPC) | Only on app request, V key or session end | As above | No change. Its visibility / weave-idle `on_pause` (#1039, #1278) is Android-only. |
 | Multi-screen coverage (#2247, vk_native X11 segments) | Yes, `request_display_mode(false)` to a screen's DP when the window wholly leaves that screen | Yes: the screen's DP is asked for the session's mode when the window covers it again; for the session's own DP the restore is skipped while the NOT_1TO1 hold is on, whose release applies the same coverage gate | New with #2247. |
-| Focus loss, visibility change, tracking loss | No path on desktop Linux reaches the lens | n/a | Nothing to fix. MANAGED tracking loss is the weaver's own output decision, not a lens call. |
+| Window visibility (#2671, vk_native X11: `u_window_visibility`, `vk_visibility_changed`) | Yes, `request_display_mode(false)` once the session's X11 window has been hidden for 500 ms: unmapped, minimized (`WM_STATE` Iconic / `_NET_WM_STATE_HIDDEN`), on another desktop, `VisibilityNotify(FullyObscured)`, or its rect on the 3D screen wholly covered by opaque clients above it in `_NET_CLIENT_LIST_STACKING`. Partial overlap keeps 3D. | Yes: the visible edge (next check, at most 200 ms, earlier on an X event) asks for the **session's own last request**, not 3D. A gate in `vk_dp_request_display_mode` like #2247's, not a hold: the frame is still woven. While the NOT_1TO1 / auto-2D hold is on, neither edge sends anything; the hold's release goes through the same gate. App requests made while hidden are recorded and gated. | New with #2671. The hidden edge is an explicit 2D call, so under a first-call-takes-ownership vendor rule it takes the lens preference like any other 2D (see below); the visible edge is its pair. Native Wayland surfaces are not tracked (no global stacking order), and `DXR_LENS_VISIBILITY=0` turns the policy off. |
+| Focus loss, tracking loss | No path on desktop Linux reaches the lens | n/a | Nothing to fix. MANAGED tracking loss is the weaver's own output decision, not a lens call. |
 
 Out of scope, same shape: the Android `vk_android_update_container_scaled()` degrade also restores
 3D rather than the app's choice on its clear edge. Its CNSDK display processor has a different
@@ -82,6 +83,10 @@ ownership model, so it was left unchanged.
   the geometry extension installed), which covers that. On X11 nothing does: a toggled X11 session
   dragged off the panel keeps the lens in whatever state it last asked for.
 - `xrEndSession` asks for 2D, so a process that runs a second session owns the lens in it.
+- A session whose X11 window is hidden once (minimized, moved to another desktop, or fully
+  covered for 500 ms, #2671) has asked for 2D and owns the lens from then on, exactly like a
+  toggled session. Its return restores the session's choice explicitly, so the lens comes back;
+  what it loses is the weaver's off-panel release for the rest of the process.
 - A context invalidated by an SRService restart is replaced by the plug-in only once no weaver is
   alive on it, i.e. at the next session. The running session keeps a dead context until then.
 
@@ -96,5 +101,9 @@ Not verifiable without the panel, and so still open:
    (`NOT_1TO1 cleared: ... restoring the session's own hardware 3D`).
 3. Same with the app in 2D (V key first): the lens stays off after the clear.
 4. V key during a NOT_1TO1 episode: no lens change until the clear, then the last choice.
-5. Restart SRService between two sessions of one long-lived process with the app having chosen 2D:
+5. #2671, X11: minimize the window, then restore it. The lens drops about 500 ms after the
+   minimize (`#2671 vk_native: the 3D window is hidden (minimized)`) and comes back on restore
+   (`visible again ... back to the session's mode`). Same with a 2D window fully covering it, and
+   no change for a partial cover. With the app in 2D (V key) the restore leaves the lens off.
+6. Restart SRService between two sessions of one long-lived process with the app having chosen 2D:
    the second session's context re-applies 2D (`re-applied to a new SR context`).

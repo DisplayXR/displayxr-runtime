@@ -267,12 +267,23 @@ target_link_libraries(aux_util PRIVATE displayxr::math_core)
 # CoreFoundation needed for CFRetain/CFRelease in u_handles.c (Metal handle ref counting).
 if(APPLE)
 	target_link_libraries(aux_util PRIVATE "-framework CoreFoundation")
+	# The lens visibility policy's macOS tracker (#2671): NSWindow occlusion state.
+	target_sources(
+		aux_util PRIVATE u_window_visibility_posix.c u_window_visibility_posix.h
+				 u_window_visibility_macos.m
+		)
+	target_link_libraries(aux_util PRIVATE "-framework AppKit")
 	# Security: SecItemCopyMatching, the Keychain reader of u_credential.c (ADR-057).
 	target_link_libraries(aux_util PRIVATE "-framework Security")
 endif()
 # u_credential.c loads libsecret at run time (dlopen) on desktop Linux.
 if(XRT_HAVE_LINUX AND NOT ANDROID)
 	target_link_libraries(aux_util PRIVATE ${CMAKE_DL_LIBS})
+	# The lens visibility policy's X11 tracker (#2671); libxcb is dlopen'd.
+	target_sources(
+		aux_util PRIVATE u_window_visibility_posix.c u_window_visibility_posix.h
+				 u_window_visibility_x11.c
+		)
 endif()
 
 # Is basically used everywhere, unavoidable.
