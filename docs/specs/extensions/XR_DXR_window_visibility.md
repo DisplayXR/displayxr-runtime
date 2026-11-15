@@ -7,7 +7,7 @@
 | Type Values | `XR_TYPE_EVENT_DATA_WINDOW_VISIBILITY_CHANGED_DXR` (1004999380) · `XR_TYPE_SESSION_WINDOW_VISIBILITY_INFO_DXR` (1004999381) |
 | Author | The DisplayXR Project |
 | Platform | Windows (in-process D3D11, D3D12, OpenGL and Vulkan sessions, and the service's default policy over IPC). Other platforms advertise the extension and report the window as always visible. |
-| Decision | [ADR-062](../../adr/ADR-062-window-visibility-drives-lens-weave-and-session-state.md) D4 (tier 3), approved 2026-11-15 |
+| Decision | ADR-062 (`docs/adr/ADR-062-window-visibility-drives-lens-weave-and-session-state.md`, #2678) D4 (tier 3), approved 2026-11-15 |
 
 ---
 
