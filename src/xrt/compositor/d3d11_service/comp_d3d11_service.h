@@ -1620,6 +1620,10 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
  * instead of holding the whole panel behind the lens. ADVISORY and HARDWARE-ONLY:
  * nothing here changes a woven pixel (ADR-027 D6 / ADR-030), and
  * @p flat_rect_count 0 with no latch is byte-for-byte the pre-v8 behaviour.
+ *
+ * Handle ownership (#2605): NT @p in_handle and @p overlay_handle are owned by
+ * this call on EVERY return, true or false — each is either adopted by the
+ * per-client import cache or closed. Legacy DXGI handles are never closed.
  */
 bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,

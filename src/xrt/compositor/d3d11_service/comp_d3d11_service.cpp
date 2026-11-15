@@ -32133,6 +32133,32 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                uint64_t *out_fence_value,
                                struct xrt_eye_positions *out_eyes)
 {
+	/*
+	 * #2605: this function OWNS the NT input and overlay handles from entry (the
+	 * IPC handler duplicated them into this process and never closes them on
+	 * Windows). Every exit path must either hand a handle to the import cache or
+	 * close it, so both are held here and closed on return unless disarmed. A
+	 * handle is disarmed exactly where the cache adopts it, or where the
+	 * matched-cache branch has already closed this submit's duplicate.
+	 * weave_close_cached ignores null / INVALID / legacy DXGI handles.
+	 */
+	struct weave_handle_owner
+	{
+		HANDLE h;
+		bool is_dxgi;
+		void
+		disarm()
+		{
+			h = nullptr;
+		}
+		~weave_handle_owner()
+		{
+			weave_close_cached(h, is_dxgi);
+		}
+	};
+	weave_handle_owner in_owner{(HANDLE)in_handle, in_is_dxgi};
+	weave_handle_owner ov_owner{(HANDLE)overlay_handle, overlay_is_dxgi};
+
 	// DXR_WEAVE_GPU_TIMING: CPU wall time of the whole synchronous submit.
 	const int64_t t_entry_ns = (int64_t)os_monotonic_get_ns();
 	// v4 Phase 1 composites the whole premul atlas; per-rect scoping is a future hint.
@@ -32469,6 +32495,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		if (in != c->render.weave_input_handle_cached) {
 			weave_close_cached(in, in_is_dxgi); // this submit's duplicate of the cached texture
 		}
+		// Closed above, or the very handle the cache already owns.
+		in_owner.disarm();
 		in = c->render.weave_input_handle_cached; // stable identity for #1058's frame boundary
 	} else {
 		weave_close_cached(c->render.weave_input_handle_cached, c->render.weave_input_cached_is_dxgi);
@@ -32505,6 +32533,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		}
 
 		(void)c->render.weave_input_tex->QueryInterface(IID_PPV_ARGS(c->render.weave_input_km.put()));
+		in_owner.disarm(); // the cache owns it from here
 		c->render.weave_input_handle_cached = in;
 		c->render.weave_input_cached_is_dxgi = in_is_dxgi;
 		U_LOG_W("#625 weave: input import cached (handle=%p %s, %ux%u)", in, in_is_dxgi ? "DXGI" : "NT",
@@ -32630,6 +32659,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			if (ov != c->render.weave_overlay_handle_cached) {
 				weave_close_cached(ov, overlay_is_dxgi);
 			}
+			// Closed above, or the very handle the cache already owns.
+			ov_owner.disarm();
 		} else {
 			weave_close_cached(c->render.weave_overlay_handle_cached, c->render.weave_overlay_cached_is_dxgi);
 			c->render.weave_overlay_handle_cached = nullptr;
@@ -32654,6 +32685,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 				if (SUCCEEDED(hr)) {
 					(void)c->render.weave_overlay_tex->QueryInterface(
 					    IID_PPV_ARGS(c->render.weave_overlay_km.put()));
+					ov_owner.disarm(); // the cache owns it from here
 					c->render.weave_overlay_handle_cached = ov;
 					c->render.weave_overlay_cached_is_dxgi = overlay_is_dxgi;
 					U_LOG_W("#625 weave v4: overlay import cached (handle=%p %s, %ux%u)", ov,
