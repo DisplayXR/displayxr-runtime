@@ -4552,7 +4552,9 @@ locate_views_one(struct oxr_logger *log,
 			if (seg != NULL) {
 				nominal_z_m = seg->nominal_z_m;
 			}
-			U_LOG_I("Kooima: nominal_z=%.3f", nominal_z_m);
+			if (should_log) {
+				U_LOG_I("Kooima: nominal_z=%.3f", nominal_z_m);
+			}
 			if (nominal_z_m > 0.0f) {
 				float ipd_m = sess->ipd_meters;
 				// Untracked → the eye sits at the REFERENCE: directly in front
