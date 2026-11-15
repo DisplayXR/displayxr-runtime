@@ -372,9 +372,9 @@ to_string(XrSessionState state)
  * Returns false if eye tracking is not available.
  */
 static bool
-oxr_session_get_predicted_eye_positions(struct oxr_session *sess,
-                                        int64_t target_ns,
-                                        struct xrt_eye_positions *out_eye_pos)
+oxr_session_get_predicted_eye_positions_raw(struct oxr_session *sess,
+                                            int64_t target_ns,
+                                            struct xrt_eye_positions *out_eye_pos)
 {
 	if (sess == NULL || sess->xcn == NULL || out_eye_pos == NULL) {
 		return false;
@@ -426,6 +426,34 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess,
 		return multi_compositor_get_eye_positions_at(mc, target_ns, out_eye_pos);
 	}
 	return false;
+}
+
+/*!
+ * The eye count comes from the vendor display processor (or a viewer-tracking
+ * provider, or a per-segment table); everything downstream indexes
+ * XRT_MAX_VIEWS-sized arrays with it. Clamp it where it is acquired (#2619).
+ */
+static void
+oxr_session_clamp_eye_count(struct xrt_eye_positions *eye_pos)
+{
+	// eyes[] is declared [8] = XRT_MAX_VIEWS; take the smaller in case either moves.
+	const size_t arr = ARRAY_SIZE(eye_pos->eyes);
+	const uint32_t cap = arr < (size_t)XRT_MAX_VIEWS ? (uint32_t)arr : (uint32_t)XRT_MAX_VIEWS;
+	if (eye_pos->count > cap) {
+		eye_pos->count = cap;
+	}
+}
+
+static bool
+oxr_session_get_predicted_eye_positions(struct oxr_session *sess,
+                                        int64_t target_ns,
+                                        struct xrt_eye_positions *out_eye_pos)
+{
+	const bool got = oxr_session_get_predicted_eye_positions_raw(sess, target_ns, out_eye_pos);
+	if (out_eye_pos != NULL) {
+		oxr_session_clamp_eye_count(out_eye_pos);
+	}
+	return got;
 }
 
 /*!
@@ -4308,6 +4336,9 @@ locate_views_one(struct oxr_logger *log,
 			}
 		}
 	}
+	// #2619: whichever source filled it (a segment's table, the DP, a
+	// viewer-tracking provider), the count indexes XRT_MAX_VIEWS arrays below.
+	oxr_session_clamp_eye_count(&eye_pos);
 
 	// One-shot diagnostic: log stereo gate values for first frames
 	{
@@ -5923,6 +5954,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 				m.seg[i].have_eyes = true;
 			}
 		}
+	}
+	// #2619: each segment's eye count came from its DP (or the service's
+	// table, or a provider); clamp it before anything indexes with it.
+	for (uint32_t i = 0; i < m.count && i < XRT_MAX_SEGMENTS; i++) {
+		oxr_session_clamp_eye_count(&m.seg[i].eyes);
 	}
 
 	const uint32_t mj = oxr_segment_views_majority(&m);
