@@ -145,6 +145,11 @@ struct comp_d3d12_target
 	IDCompositionDevice *dcomp_device;
 	IDCompositionTarget *dcomp_target;
 	IDCompositionVisual *dcomp_visual;
+
+	//! The device was removed/reset under this chain (see
+	//! @ref comp_d3d12_target_is_device_lost). Latched, never cleared.
+	//! Zero (the memset state) = not lost.
+	bool device_lost;
 };
 
 static void
@@ -155,6 +160,62 @@ release_back_buffers(struct comp_d3d12_target *target)
 			target->back_buffers[i]->Release();
 			target->back_buffers[i] = nullptr;
 		}
+	}
+}
+
+//! True only while EVERY back buffer is held — a failed resize can leave none, or some.
+static bool
+target_has_back_buffers(const struct comp_d3d12_target *target)
+{
+	for (uint32_t i = 0; i < BACK_BUFFER_COUNT; i++) {
+		if (target->back_buffers[i] == nullptr) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+target_hr_is_device_loss(HRESULT hr)
+{
+	return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG;
+}
+
+/*!
+ * A Present / ResizeBuffers / GetBuffer failure: decide whether it means the device is
+ * gone and, the first time it does, latch and log it ONCE with the removal
+ * reason (mirrors comp_d3d11_target.cpp). Any failure is checked against
+ * GetDeviceRemovedReason, because a removal can surface first as a different
+ * error code. Returns the latch.
+ */
+static bool
+target_check_device_lost(struct comp_d3d12_target *target, HRESULT hr, const char *where)
+{
+	if (target->device_lost) {
+		return true;
+	}
+	const HRESULT reason = (target->dev != nullptr) ? target->dev->GetDeviceRemovedReason() : S_OK;
+	if (!target_hr_is_device_loss(hr) && reason == S_OK) {
+		return false;
+	}
+	target->device_lost = true;
+	U_LOG_E(
+	    "d3d12 target: the output device is LOST (%s failed: hr=0x%08x, GetDeviceRemovedReason=0x%08x). "
+	    "Presenting stops and the session is reported lost; the device is not recreated in place. "
+	    "Typical cause: a display hotplug or a driver reset/TDR. (logged once)",
+	    where, (unsigned)hr, (unsigned)reason);
+	return true;
+}
+
+//! Rate-limited (at most once per second) ERROR for a recurring non-loss failure.
+static void
+target_log_failure_rate_limited(const char *what, HRESULT hr)
+{
+	static std::atomic<int64_t> s_last_fail_log_ns{0};
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	int64_t prev_ns = s_last_fail_log_ns.load(std::memory_order_relaxed);
+	if (now_ns - prev_ns > 1000000000LL && s_last_fail_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+		U_LOG_E("%s failed: 0x%08x (rate-limited, at most once per second)", what, (unsigned)hr);
 	}
 }
 
@@ -339,7 +400,13 @@ acquire_back_buffers(struct comp_d3d12_target *target)
 		HRESULT hr = target->swapchain->GetBuffer(i, __uuidof(ID3D12Resource),
 		                                           reinterpret_cast<void **>(&target->back_buffers[i]));
 		if (FAILED(hr)) {
-			U_LOG_E("Failed to get back buffer %u: 0x%08x", i, hr);
+			// All or nothing: a partial set must not look usable, and
+			// ResizeBuffers (the retry) needs zero outstanding references.
+			target->back_buffers[i] = nullptr;
+			release_back_buffers(target);
+			if (!target_check_device_lost(target, hr, "GetBuffer")) {
+				target_log_failure_rate_limited("GetBuffer (swapchain back buffer)", hr);
+			}
 			return XRT_ERROR_D3D;
 		}
 	}
@@ -932,6 +999,12 @@ comp_d3d12_target_predict_weave_to_scanout_ns(struct comp_d3d12_target *target)
 extern "C" xrt_result_t
 comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interval)
 {
+	// Lost device: no Present into the dead chain (it can only fail, and
+	// before this latch it logged an ERROR per frame).
+	if (target->device_lost) {
+		return XRT_ERROR_D3D;
+	}
+
 	HRESULT hr = target->swapchain->Present(sync_interval, 0);
 	if (SUCCEEDED(hr)) {
 		g_frame_witness_d3d12.count_present();
@@ -941,7 +1014,11 @@ comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interv
 		target->swapchain->GetLastPresentCount(&target->last_present_count);
 	}
 	if (FAILED(hr)) {
-		U_LOG_E("Present failed: 0x%08x", hr);
+		// A removed/reset device latches and logs once (with the reason);
+		// anything else is rate-limited — never an ERROR per frame.
+		if (!target_check_device_lost(target, hr, "Present")) {
+			target_log_failure_rate_limited("Present", hr);
+		}
 		return XRT_ERROR_D3D;
 	}
 
@@ -990,7 +1067,16 @@ comp_d3d12_target_resize(struct comp_d3d12_target *target,
                          uint32_t width,
                          uint32_t height)
 {
-	if (width == target->width && height == target->height) {
+	// Lost device: ResizeBuffers on it can only fail. The caller sees the
+	// failure and @ref comp_d3d12_target_is_device_lost says why.
+	if (target->device_lost) {
+		return XRT_ERROR_D3D;
+	}
+	// Same size is a no-op ONLY while the chain still has its buffers: a
+	// failed resize released them, and returning to (or staying at) the old
+	// size must still run ResizeBuffers + acquire, or the target stays
+	// bufferless.
+	if (width == target->width && height == target->height && target_has_back_buffers(target)) {
 		return XRT_SUCCESS;
 	}
 
@@ -1008,7 +1094,10 @@ comp_d3d12_target_resize(struct comp_d3d12_target *target,
 	HRESULT hr = target->swapchain->ResizeBuffers(BACK_BUFFER_COUNT, width, height,
 	                                               DXGI_FORMAT_UNKNOWN, target->swapchain_flags);
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to resize swapchain: 0x%08x", hr);
+		// Retried every frame until it succeeds, so never an ERROR per frame.
+		if (!target_check_device_lost(target, hr, "ResizeBuffers")) {
+			target_log_failure_rate_limited("ResizeBuffers", hr);
+		}
 		return XRT_ERROR_D3D;
 	}
 
@@ -1017,6 +1106,18 @@ comp_d3d12_target_resize(struct comp_d3d12_target *target,
 
 	// Re-acquire back buffers
 	return acquire_back_buffers(target);
+}
+
+extern "C" bool
+comp_d3d12_target_has_back_buffers(struct comp_d3d12_target *target)
+{
+	return target != nullptr && target_has_back_buffers(target);
+}
+
+extern "C" bool
+comp_d3d12_target_is_device_lost(struct comp_d3d12_target *target)
+{
+	return target != nullptr && target->device_lost;
 }
 
 extern "C" bool

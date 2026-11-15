@@ -3568,6 +3568,12 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 	if (c->reroute.split != nullptr && comp_hub_d3d11_is_device_lost(c->reroute.split)) {
 		return XRT_ERROR_COMPOSITOR_DEVICE_LOST;
 	}
+	// #2614: the same for this tier's OWN target (as comp_d3d11_compositor's
+	// wait_frame consults its own): a removed/reset presenting device is a
+	// lost session, not frames committed into a dead chain forever.
+	if (c->target != nullptr && comp_d3d12_target_is_device_lost(c->target)) {
+		return XRT_ERROR_COMPOSITOR_DEVICE_LOST;
+	}
 
 	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
@@ -3665,7 +3671,10 @@ d3d12_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 				uint32_t current_width, current_height;
 				comp_d3d12_target_get_dimensions(c->target, &current_width, &current_height);
 
-				if (new_width != current_width || new_height != current_height) {
+				// #2614: also retry at the SAME size while a previous resize
+				// left the target without its back buffers.
+				if (new_width != current_width || new_height != current_height ||
+				    !comp_d3d12_target_has_back_buffers(c->target)) {
 					U_LOG_I("Window resized: %ux%u -> %ux%u",
 					        current_width, current_height, new_width, new_height);
 
@@ -5056,6 +5065,31 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	rtv_handle.ptr = static_cast<SIZE_T>(rtv_handle_raw);
 	if (out_back_buffer != nullptr) {
 		*out_back_buffer = back_buffer;
+	}
+
+	/*
+	 * #2614: a failed resize (ResizeBuffers or the back-buffer re-acquire)
+	 * leaves the target without back buffers until begin_frame retries it.
+	 * Recording the PRESENT->RENDER_TARGET barrier below against a null
+	 * resource is invalid, so bail before anything touches the back buffer —
+	 * but still submit what is already on the list, exactly as the no-atlas
+	 * branch of layer_commit does, so the list is closed and nothing already
+	 * recorded is lost. No Present: the chain has no buffer we can vouch for.
+	 */
+	if (back_buffer == nullptr) {
+		static bool s_logged = false;
+		if (!s_logged) {
+			s_logged = true;
+			U_LOG_W(
+			    "#2614 d3d12 weave: target has no back buffer (failed resize) — weave and present "
+			    "skipped until the resize is retried (logged once)");
+		}
+		wl->Close();
+		ID3D12CommandList *bail_lists[] = {wl};
+		d3d12_out_queue(c)->ExecuteCommandLists(1, bail_lists);
+		d3d12_outcomp_note_execute(c);
+		gpu_wait_idle_out(c);
+		return XRT_ERROR_D3D;
 	}
 
 	// One-time diagnostic: log back buffer vs viewport dimensions
