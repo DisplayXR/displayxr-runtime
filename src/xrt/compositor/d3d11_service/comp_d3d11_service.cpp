@@ -12341,7 +12341,11 @@ capture_slot_update_srv(struct d3d11_service_system *sys, struct d3d11_multi_cli
 		return;
 
 	uint32_t w = 0, h = 0;
-	ID3D11Texture2D *tex = d3d11_capture_get_texture(slot->capture_ctx, &w, &h);
+	// #2620: the capture context hands out a REFERENCED texture, so it stays
+	// alive while the SRV below is created even if a new frame replaces it.
+	wil::com_ptr<ID3D11Texture2D> tex_ref;
+	tex_ref.attach(d3d11_capture_get_texture(slot->capture_ctx, &w, &h));
+	ID3D11Texture2D *tex = tex_ref.get();
 	if (tex == nullptr || w == 0 || h == 0)
 		return;
 

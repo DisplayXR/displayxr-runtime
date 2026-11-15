@@ -352,7 +352,13 @@ d3d11_capture_get_texture(struct d3d11_capture_context *ctx,
 	if (out_width) *out_width = ctx->width;
 	if (out_height) *out_height = ctx->height;
 
-	return ctx->staging_texture.get();
+	// #2620: referenced under the lock. on_frame_arrived replaces
+	// staging_texture (on a size change) under this same lock, and a raw
+	// pointer handed out here could be released by it before the caller
+	// had finished creating its SRV.
+	ID3D11Texture2D *tex = ctx->staging_texture.get();
+	tex->AddRef();
+	return tex;
 }
 
 
