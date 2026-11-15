@@ -66,3 +66,4 @@
 - [ADR-060](ADR-060-texture-target-reference-window-binding.md) — A texture target is named by a reference window and a rect; its display processor is windowless
 - [ADR-061](ADR-061-3d-screen-share.md) — 3D screen share — a running app's pre-weave views are a stereo-camera source of kind app
 - [ADR-062](ADR-062-window-visibility-drives-lens-weave-and-session-state.md) — Window visibility drives the lens, the weave and the session state — one runtime-owned signal
+- [ADR-063](ADR-063-input-provider-device-abi-hardening.md) — Harden the provider-device ABI — the devices an input provider returns get a versioned contract
