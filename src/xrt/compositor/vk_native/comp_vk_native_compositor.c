@@ -4999,7 +4999,13 @@ vk_native_capture_atlas_to_png(struct comp_vk_native_compositor *c, const char *
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
 	};
-	vk->vkBeginCommandBuffer(cmd, &cbi);
+	if (vk->vkBeginCommandBuffer(cmd, &cbi) != VK_SUCCESS) {
+		U_LOG_E("%s: vkBeginCommandBuffer failed; capture skipped", __func__);
+		vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+		vk->vkFreeMemory(vk->device, staging_mem, NULL);
+		vk->vkDestroyBuffer(vk->device, staging_buf, NULL);
+		return false;
+	}
 
 	// Atlas was sampled by the DP/weaver this frame, so its layout is
 	// SHADER_READ_ONLY_OPTIMAL by the time we're called from layer_commit.
@@ -5041,16 +5047,27 @@ vk_native_capture_atlas_to_png(struct comp_vk_native_compositor *c, const char *
 	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 	                         0, 0, NULL, 0, NULL, 1, &b);
 
-	vk->vkEndCommandBuffer(cmd);
-
 	VkSubmitInfo si = {
 	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 	    .commandBufferCount = 1,
 	    .pCommandBuffers = &cmd,
 	};
-	vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
-	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	VkResult sres = vk->vkEndCommandBuffer(cmd);
+	if (sres == VK_SUCCESS) {
+		sres = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
+	}
+	if (sres == VK_SUCCESS) {
+		sres = vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
 	vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+	if (sres != VK_SUCCESS) {
+		// The copy never ran (or did not finish): the staging buffer holds
+		// garbage, so write no PNG rather than a wrong one.
+		U_LOG_E("%s: readback end/submit/wait failed (%d); capture skipped", __func__, (int)sres);
+		vk->vkFreeMemory(vk->device, staging_mem, NULL);
+		vk->vkDestroyBuffer(vk->device, staging_buf, NULL);
+		return false;
+	}
 
 	// Read pixels and encode PNG.
 	bool ok = false;
@@ -5169,7 +5186,13 @@ vk_native_dump_image_to_png(struct comp_vk_native_compositor *c,
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
 	};
-	vk->vkBeginCommandBuffer(cmd, &cbi);
+	if (vk->vkBeginCommandBuffer(cmd, &cbi) != VK_SUCCESS) {
+		U_LOG_E("%s: vkBeginCommandBuffer failed; capture skipped", __func__);
+		vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+		vk->vkFreeMemory(vk->device, staging_mem, NULL);
+		vk->vkDestroyBuffer(vk->device, staging_buf, NULL);
+		return false;
+	}
 
 	VkImageMemoryBarrier b = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -5196,15 +5219,27 @@ vk_native_dump_image_to_png(struct comp_vk_native_compositor *c,
 	b.dstAccessMask = access;
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, stage, 0, 0, NULL, 0, NULL, 1, &b);
 
-	vk->vkEndCommandBuffer(cmd);
 	VkSubmitInfo si = {
 	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 	    .commandBufferCount = 1,
 	    .pCommandBuffers = &cmd,
 	};
-	vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
-	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	VkResult sres = vk->vkEndCommandBuffer(cmd);
+	if (sres == VK_SUCCESS) {
+		sres = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
+	}
+	if (sres == VK_SUCCESS) {
+		sres = vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
 	vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+	if (sres != VK_SUCCESS) {
+		// The copy never ran (or did not finish): the staging buffer holds
+		// garbage, so write no PNG rather than a wrong one.
+		U_LOG_E("%s: readback end/submit/wait failed (%d); capture skipped", __func__, (int)sres);
+		vk->vkFreeMemory(vk->device, staging_mem, NULL);
+		vk->vkDestroyBuffer(vk->device, staging_buf, NULL);
+		return false;
+	}
 
 	bool ok = false;
 	if (vk->vkMapMemory(vk->device, staging_mem, 0, bytes, 0, (void **)&mapped) == VK_SUCCESS) {
