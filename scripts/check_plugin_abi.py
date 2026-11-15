@@ -13,12 +13,19 @@ This script:
      extracts DXR_RUNTIME_GIT_TAG.
   3. Fetches xrt_plugin.h from THAT runtime tag and extracts the same
      macro — that is what the plug-in's xrtPluginNegotiate() reports.
-  4. Exit 0 on match, non-zero on mismatch with a clear diagnostic the
-     calling workflow can post into an auto-opened issue.
+  4. Exits with one of three codes, which callers MUST tell apart:
+       0  the ABIs match;
+       1  a real mismatch (a clear diagnostic the calling workflow can post
+          into an auto-opened issue);
+       2  the check could not run (network, a missing tag, an unparsable
+          header) - NOT evidence of a mismatch: fail loudly, open no issue.
+     Fetches retry transient failures (connection errors, timeouts, 429,
+     5xx) three times with backoff; a 404 fails at once.
 
 Usage:
     check_plugin_abi.py --leia-tag v1.0.7
     check_plugin_abi.py --leia-tag v1.0.7 --runtime-tree .
+    check_plugin_abi.py --leia-tag v1.0.7 --runtime-tag v2.70.0
 
 Designed to be called from .github/workflows/versions-bump.yml and from
 build-windows.yml's runtime self-bump step. No external deps beyond
@@ -28,7 +35,10 @@ from __future__ import annotations
 
 import argparse
 import re
+import socket
 import sys
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -52,10 +62,33 @@ ABI_HEADERS: dict[str, str] = {
 }
 
 
+# Backoff before each retry of a transient fetch failure (3 retries).
+_FETCH_RETRY_DELAYS_S = (2.0, 5.0, 10.0)
+
+
+def _is_transient_http(code: int) -> bool:
+    return code == 429 or 500 <= code <= 599
+
+
 def _fetch(url: str) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "displayxr-abi-check"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode("utf-8")
+    for attempt in range(len(_FETCH_RETRY_DELAYS_S) + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            # A 404 (missing tag / path) is an answer, not a hiccup.
+            if not _is_transient_http(e.code) or attempt == len(_FETCH_RETRY_DELAYS_S):
+                raise
+            why = f"HTTP {e.code}"
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
+            if attempt == len(_FETCH_RETRY_DELAYS_S):
+                raise
+            why = str(e)
+        delay = _FETCH_RETRY_DELAYS_S[attempt]
+        print(f"fetch {url} failed ({why}); retrying in {delay:g}s", file=sys.stderr)
+        time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def _read_local(path: Path) -> str:
