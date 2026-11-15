@@ -1882,7 +1882,18 @@ static void RenderOneFrame(RenderState& rs) {
     // Only render if session is running
     if (xr.sessionRunning) {
         XrFrameState frameState;
-        if (BeginFrame(xr, frameState)) {
+        const bool frameBegun = BeginFrame(xr, frameState);
+        // ADR-062 D4 verify vehicle: one line per shouldRender edge (never per frame).
+        if (g_windowVisibilityExt) {
+            static int s_lastShouldRender = -1;
+            const int sr = frameState.shouldRender ? 1 : 0;
+            if (sr != s_lastShouldRender) {
+                LOG_INFO("window_visibility: shouldRender %d -> %d (session state %d)", s_lastShouldRender, sr,
+                         (int)xr.sessionState);
+                s_lastShouldRender = sr;
+            }
+        }
+        if (frameBegun) {
                 // #823 actions mode: sync + locate the controllers for this
                 // frame's display time; the marker draws read g_actions.
                 if (g_actionsMode) {

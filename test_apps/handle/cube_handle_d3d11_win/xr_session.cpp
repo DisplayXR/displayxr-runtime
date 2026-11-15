@@ -24,6 +24,9 @@ bool g_hasMxInkExt = false;     // XR_LOGITECH_mx_ink_stylus_interaction enabled
 #define XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME "XR_LOGITECH_mx_ink_stylus_interaction"
 #endif
 bool g_hasViewsChangeExt = false; // #1488
+bool g_windowVisibilityExt = false;    // ADR-062 D4 (DISPLAYXR_WINDOW_VISIBILITY)
+bool g_windowVisibilityDemote = false; // ... =demote: opt in to SYNCHRONIZED while hidden
+static bool s_windowVisibilityAvailable = false;
 bool g_submitDepthLayer = false;  // #1956: DXR_SUBMIT_DEPTH_LAYER=1 + XR_KHR_composition_layer_depth
 
 // #439 Phase 3 — XR_DXR_local_3d_zone harness (see xr_session.h).
@@ -134,6 +137,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             strcmp(ext.extensionName, XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME) == 0) {
             g_hasMxInkExt = true;
         }
+        if (strcmp(ext.extensionName, XR_DXR_WINDOW_VISIBILITY_EXTENSION_NAME) == 0) {
+            s_windowVisibilityAvailable = true;
+        }
         if (strcmp(ext.extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) == 0) {
             // #1956 smoke: only when asked for — submitting depth is opt-in.
             const char* sd = getenv("DXR_SUBMIT_DEPTH_LAYER");
@@ -234,6 +240,20 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             XR_EXT_VIEW_CONFIGURATION_VIEWS_CHANGE_EXTENSION_NAME);
     }
 
+    {
+        const char *wv = getenv("DISPLAYXR_WINDOW_VISIBILITY");
+        if (wv != nullptr && *wv != '\0' && *wv != '0') {
+            if (s_windowVisibilityAvailable) {
+                enabledExtensions.push_back(XR_DXR_WINDOW_VISIBILITY_EXTENSION_NAME);
+                g_windowVisibilityExt = true;
+                g_windowVisibilityDemote = strcmp(wv, "demote") == 0;
+                LOG_INFO("XR_DXR_window_visibility ENABLED (DISPLAYXR_WINDOW_VISIBILITY=%s, demoteWhenHidden=%d)", wv,
+                         g_windowVisibilityDemote ? 1 : 0);
+            } else {
+                LOG_WARN("DISPLAYXR_WINDOW_VISIBILITY set but the runtime does not offer XR_DXR_window_visibility");
+            }
+        }
+    }
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());
     for (const auto& ext : enabledExtensions) {
         LOG_INFO("  %s", ext);
@@ -510,6 +530,15 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
     sessionInfo.next = &d3d11Binding;
+
+    // ADR-062 D4: the opt-in rides on XrSessionCreateInfo (front of the chain).
+    XrSessionWindowVisibilityInfoDXR wvInfo = {XR_TYPE_SESSION_WINDOW_VISIBILITY_INFO_DXR};
+    if (g_windowVisibilityExt) {
+        wvInfo.demoteWhenHidden = g_windowVisibilityDemote ? XR_TRUE : XR_FALSE;
+        wvInfo.next = sessionInfo.next;
+        sessionInfo.next = &wvInfo;
+        LOG_INFO("Chained XrSessionWindowVisibilityInfoDXR (demoteWhenHidden=%d)", (int)wvInfo.demoteWhenHidden);
+    }
     sessionInfo.systemId = xr.systemId;
 
     LOG_INFO("Calling xrCreateSession...");
