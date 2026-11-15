@@ -519,6 +519,11 @@ ipc_client_take_adopted_handle(void)
 #define IPC_CONNECT_STARTING_TOTAL_MS 5000
 #define IPC_CONNECT_STARTING_STEP_MS 250
 
+// #2613: overall limit on waiting for a service THIS process launched to post
+// its pipe. Without it a launched service that stays alive but never opens the
+// pipe (hung in init, pipe stuck busy) kept xrCreateInstance waiting forever.
+#define IPC_SERVICE_LAUNCH_TIMEOUT_MS 30000
+
 //! The service's single-instance mutex (see targets/service/main.c, #975). Held
 //! for the process lifetime, so "can be opened" == "a service process is alive
 //! in this session". Local\ namespace: same-session only, which is exactly the
@@ -658,6 +663,26 @@ ipc_launch_service_process(char *path, STARTUPINFOA *si, PROCESS_INFORMATION *pi
 	return CreateProcessA(NULL, path, NULL, NULL, false, 0, NULL, NULL, si, pi);
 }
 
+/*!
+ * Replace everything after the separator @p sep (a pointer into @p path) with
+ * @p leaf, bounded by @p path_size. Returns false, leaving the path cut at the
+ * separator, when the result would not fit (#2613).
+ */
+static bool
+ipc_service_path_set_leaf(char *path, size_t path_size, char *sep, const char *leaf)
+{
+	size_t used = (size_t)(sep - path) + 1;
+	if (used >= path_size) {
+		return false;
+	}
+	int n = snprintf(sep + 1, path_size - used, "%s", leaf);
+	if (n < 0 || (size_t)n >= path_size - used) {
+		sep[1] = '\0';
+		return false;
+	}
+	return true;
+}
+
 // N.B. quality of life fallback to try launch the XRT_SERVICE_EXECUTABLE if pipe is not found
 static HANDLE
 ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
@@ -683,7 +708,10 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 		return INVALID_HANDLE_VALUE;
 	}
 	char service_path[MAX_PATH];
-	if (!GetModuleFileNameA(hmod, service_path, sizeof(service_path))) {
+	DWORD path_len = GetModuleFileNameA(hmod, service_path, sizeof(service_path));
+	if (path_len == 0 || path_len >= sizeof(service_path)) {
+		// path_len == size: the path was truncated (ERROR_INSUFFICIENT_BUFFER).
+		err = GetLastError();
 		IPC_ERROR(ipc_c, "GetModuleFileNameA failed: %d %s", err, ipc_winerror(err));
 		return INVALID_HANDLE_VALUE;
 	}
@@ -692,12 +720,16 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 		IPC_ERROR(ipc_c, "failed to parse the path %s", service_path);
 		return INVALID_HANDLE_VALUE;
 	}
-	strcpy(p + 1, XRT_SERVICE_EXECUTABLE);
+	// #2613: bounded — a runtime installed near MAX_PATH must fail, not overflow.
+	if (!ipc_service_path_set_leaf(service_path, sizeof(service_path), p, XRT_SERVICE_EXECUTABLE)) {
+		IPC_ERROR(ipc_c, "service path too long next to %s", service_path);
+		return INVALID_HANDLE_VALUE;
+	}
 	STARTUPINFOA si = {.cb = sizeof(si)};
-	PROCESS_INFORMATION pi;
+	PROCESS_INFORMATION pi = {0};
 	if (!ipc_launch_service_process(service_path, &si, &pi)) {
 		char first_path[MAX_PATH];
-		strcpy(first_path, service_path);
+		snprintf(first_path, sizeof(first_path), "%s", service_path);
 		*p = 0;
 		p = strrchr(service_path, '\\');
 		if (!p) {
@@ -706,7 +738,11 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 			         ipc_winerror(err));
 			return INVALID_HANDLE_VALUE;
 		}
-		strcpy(p + 1, "service\\" XRT_SERVICE_EXECUTABLE);
+		if (!ipc_service_path_set_leaf(service_path, sizeof(service_path), p,
+		                               "service\\" XRT_SERVICE_EXECUTABLE)) {
+			IPC_ERROR(ipc_c, "service path too long next to %s", service_path);
+			return INVALID_HANDLE_VALUE;
+		}
 		if (!ipc_launch_service_process(service_path, &si, &pi)) {
 			err = GetLastError();
 			IPC_INFO(ipc_c,
@@ -735,19 +771,25 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 					return INVALID_HANDLE_VALUE;
 				}
 			}
-			// ShellExecuteEx succeeded — fill in pi.hProcess for the wait loop below
+			// ShellExecuteEx succeeded — fill in pi.hProcess for the wait loop below.
+			// sei.hProcess can be NULL (the shell may hand the launch off without
+			// a process handle); the loop then cannot tell whether it exited.
 			pi.hProcess = sei.hProcess;
 			pi.hThread = NULL;
+			pi.dwProcessId = sei.hProcess != NULL ? GetProcessId(sei.hProcess) : 0;
 		}
 	}
-	IPC_INFO(ipc_c, "Launched %s (pid %d)... Waiting for %s...", service_path, pi.dwProcessId, pipe_name);
+	IPC_INFO(ipc_c, "Launched %s (pid %lu)... Waiting for %s...", service_path, (unsigned long)pi.dwProcessId,
+	         pipe_name);
 	if (pi.hThread) {
 		CloseHandle(pi.hThread);
 	}
+	const ULONGLONG wait_start_ms = GetTickCount64();
 	for (int i = 0;; i++) {
 		pipe_inst = CreateFileA(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
 		if (pipe_inst != INVALID_HANDLE_VALUE) {
-			IPC_INFO(ipc_c, "Connected to %s after %d msec on try %d!", pipe_name, i * 100, i + 1);
+			IPC_INFO(ipc_c, "Connected to %s after %llu msec on try %d!", pipe_name,
+			         (unsigned long long)(GetTickCount64() - wait_start_ms), i + 1);
 			break;
 		}
 		err = GetLastError();
@@ -757,6 +799,21 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 			IPC_ERROR(ipc_c, "Connect to %s failed: %d %s", pipe_name, err, ipc_winerror(err));
 			break;
 		}
+		// #2613: an overall deadline, whether or not the launched process is
+		// still alive — a live service that never posts the pipe must fail
+		// xrCreateInstance rather than hang it.
+		const ULONGLONG waited_ms = GetTickCount64() - wait_start_ms;
+		if (waited_ms >= IPC_SERVICE_LAUNCH_TIMEOUT_MS) {
+			IPC_ERROR(ipc_c, "Connect to %s failed: %d %s (no pipe %u ms after launching the service)",
+			          pipe_name, err, ipc_winerror(err), (unsigned)IPC_SERVICE_LAUNCH_TIMEOUT_MS);
+			break;
+		}
+		if (pi.hProcess == NULL) {
+			// No process handle (ShellExecuteEx fallback): cannot observe the
+			// exit, so just pace the poll until the pipe or the deadline.
+			Sleep(100);
+			continue;
+		}
 		// #1058 / browser#92: our child exiting is NOT proof that no service is
 		// coming. It exits immediately on the #975 singleton guard whenever
 		// another instance owns it — which is precisely the case we land in when
@@ -764,7 +821,7 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 		// bounded grace window after the child dies instead of failing
 		// xrCreateInstance the instant it does.
 		if (WaitForSingleObject(pi.hProcess, 100) != WAIT_TIMEOUT) {
-			if (i * 100 >= IPC_CONNECT_STARTING_TOTAL_MS) {
+			if (waited_ms >= IPC_CONNECT_STARTING_TOTAL_MS) {
 				IPC_ERROR(ipc_c, "Connect to %s failed: %d %s (launched service exited)", pipe_name,
 				          err, ipc_winerror(err));
 				break;
@@ -774,7 +831,9 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 			Sleep(100);
 		}
 	}
-	CloseHandle(pi.hProcess);
+	if (pi.hProcess != NULL) {
+		CloseHandle(pi.hProcess);
+	}
 	return pipe_inst;
 }
 #endif

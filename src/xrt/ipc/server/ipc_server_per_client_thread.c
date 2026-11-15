@@ -215,8 +215,11 @@ common_shutdown(volatile struct ipc_client_state *ics)
 		ics->server->last_client_disconnect_ns = os_monotonic_get_ns();
 
 		struct os_thread thread;
-		os_thread_start(&thread, delayed_exit_thread, (void *)ics->server);
-		// We intentionally don't join this thread - it's fire and forget
+		// Fire and forget: detach it so its resources are released when it
+		// exits instead of leaking one joinable thread per idle period (#2613).
+		if (os_thread_start(&thread, delayed_exit_thread, (void *)ics->server) == 0) {
+			os_thread_detach(&thread);
+		}
 	}
 
 
