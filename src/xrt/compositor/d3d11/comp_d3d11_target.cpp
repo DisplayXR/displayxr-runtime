@@ -44,7 +44,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(repaint_under_present_hook, "DXR_REPAINT_UNDER_PRESEN
 
 #include "util/comp_weave_latency_win.h"
 #include "util/comp_frame_witness.h"
-#include "util/comp_present_hook.h"
+#include "util/comp_present_hook_win.h"
 #include "util/comp_child_window_win.h"
 
 // One in-process D3D11 target per compositor per app process — file-scope
@@ -435,139 +435,17 @@ comp_d3d11_target_is_present_wedged(struct comp_d3d11_target *target)
 	return target != nullptr && target->present_wedged;
 }
 
-/*
- * #2635 — present-hook re-entry probe (see util/comp_present_hook.h).
- *
- * Read-only: VirtualQuery before every read of foreign code, module lookups
- * without taking a reference, and nothing is ever written or called.
- */
-static bool
-reentry_readable(uint64_t addr, size_t len)
-{
-	MEMORY_BASIC_INFORMATION mbi = {};
-	if (VirtualQuery(reinterpret_cast<const void *>(addr), &mbi, sizeof(mbi)) != sizeof(mbi)) {
-		return false;
-	}
-	if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-		return false;
-	}
-	const uint64_t end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
-	return addr + len <= end;
-}
-
-static HMODULE
-reentry_module_of(uint64_t addr)
-{
-	HMODULE m = nullptr;
-	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-	                        reinterpret_cast<LPCWSTR>(addr), &m)) {
-		return nullptr;
-	}
-	return m;
-}
-
-static bool
-reentry_module_range(HMODULE m, struct comp_present_hook_range *out)
-{
-	const uint64_t base = reinterpret_cast<uint64_t>(m);
-	if (m == nullptr || !reentry_readable(base, sizeof(IMAGE_DOS_HEADER))) {
-		return false;
-	}
-	const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(m);
-	if (dos->e_magic != IMAGE_DOS_SIGNATURE || !reentry_readable(base + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS))) {
-		return false;
-	}
-	const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
-	if (nt->Signature != IMAGE_NT_SIGNATURE) {
-		return false;
-	}
-	out->base = base;
-	out->end = base + nt->OptionalHeader.SizeOfImage;
-	return true;
-}
-
 /*!
- * Which module, other than the system DXGI, owns the code @p swapchain's
- * Present enters? Follows the vtable slot, then up to a few jump detours
- * (through trampolines in anonymous memory). nullptr = not hooked, or
- * a hook whose code lives in no module (nothing to match a stack against).
- */
-static HMODULE
-reentry_present_hook_owner(IDXGISwapChain1 *swapchain)
-{
-	if (swapchain == nullptr) {
-		return nullptr;
-	}
-	const HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
-	// IDXGISwapChain::Present = vtable slot 8 (IUnknown 3, IDXGIObject 4,
-	// IDXGIDeviceSubObject 1).
-	void **vtbl = *reinterpret_cast<void ***>(swapchain);
-	uint64_t ip = reinterpret_cast<uint64_t>(vtbl[8]);
-	for (int hop = 0; hop < 6 && ip != 0; hop++) {
-		const HMODULE m = reentry_module_of(ip);
-		if (m != nullptr && m != dxgi) {
-			return m; // foreign code: the hook
-		}
-		if (!reentry_readable(ip, COMP_PRESENT_HOOK_DECODE_BYTES)) {
-			return nullptr;
-		}
-		uint64_t next = 0;
-		const enum comp_present_hook_jump j =
-		    comp_present_hook_decode_jump(reinterpret_cast<const uint8_t *>(ip), ip, &next);
-		if (j == COMP_PRESENT_HOOK_JUMP_NONE) {
-			return nullptr; // DXGI's own code (or an unattributable stub)
-		}
-		if (j == COMP_PRESENT_HOOK_JUMP_INDIRECT) {
-			if (!reentry_readable(next, sizeof(uint64_t))) {
-				return nullptr;
-			}
-			next = comp_present_hook_rd64(reinterpret_cast<const uint8_t *>(next));
-		}
-		ip = next;
-	}
-	return nullptr;
-}
-
-/*!
- * Sample on an app-thread present (not the repaint thread): rate-limited to
- * once a second, and stops once latched. Microseconds when it runs.
+ * #2635: sample on an app-thread present (not the repaint thread); see
+ * util/comp_present_hook_win.h. Rate-limited, and stops once latched.
  */
 static void
 target_reentry_sample(struct comp_d3d11_target *target)
 {
-	if (target->present_reentrant) {
-		return;
-	}
-	const uint64_t now = os_monotonic_get_ns();
-	if (now < target->reentry_next_sample_ns) {
-		return;
-	}
-	// An unhooked chain is re-checked once a second (a hook installed later
-	// is rare). A hooked chain is checked on EVERY app present until it
-	// latches: one present handed to another thread while the app sits in the
-	// hook is enough to deadlock, so the check must never lag a present.
-	const HMODULE owner = reentry_present_hook_owner(target->swapchain);
-	struct comp_present_hook_range range = {};
-	if (owner == nullptr || !reentry_module_range(owner, &range)) {
-		target->reentry_next_sample_ns = now + U_TIME_1S_IN_NS;
-		return;
-	}
-	void *raw[62] = {};
-	const USHORT n = RtlCaptureStackBackTrace(0, 62, raw, nullptr);
-	uint64_t frames[62] = {};
-	for (USHORT i = 0; i < n; i++) {
-		frames[i] = reinterpret_cast<uint64_t>(raw[i]);
-	}
-	if (!comp_present_hook_stack_hits(frames, n, &range, 1)) {
-		return;
-	}
-	target->present_reentrant = true;
-	wchar_t wpath[MAX_PATH] = {};
 	char name[MAX_PATH] = "?";
-	if (GetModuleFileNameW(owner, wpath, MAX_PATH) != 0) {
-		const wchar_t *base = wcsrchr(wpath, L'\\');
-		WideCharToMultiByte(CP_UTF8, 0, base != nullptr ? base + 1 : wpath, -1, name, (int)sizeof(name),
-		                    nullptr, nullptr);
+	if (!comp_present_hook_win_sample(target->swapchain, &target->present_reentrant,
+	                                  &target->reentry_next_sample_ns, name, sizeof(name))) {
+		return;
 	}
 	const bool overridden = debug_get_bool_option_repaint_under_present_hook();
 	U_LOG_W("d3d11 target: the app calls xrEndFrame from inside a Present hook (%s) that also intercepts "

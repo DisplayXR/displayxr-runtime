@@ -229,6 +229,20 @@ bool
 comp_d3d12_target_is_device_lost(struct comp_d3d12_target *target);
 
 /*!
+ * #2635: must the #868 repaint thread stay off this chain?
+ *
+ * True once an app-thread present found the app calling xrEndFrame from
+ * inside a third-party IDXGISwapChain::Present hook that also intercepts this
+ * chain's Present (latched for the session; DXR_REPAINT_UNDER_PRESENT_HOOK=1
+ * overrides it for A/B). A repaint present from another thread would then
+ * deadlock against that hook's lock. Caller holds the compositor mutex.
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_target_repaint_forbidden(struct comp_d3d12_target *target);
+
+/*!
  * Check whether the target created a child window fallback.
  *
  * Returns true if the target had to create a WS_CHILD window because the

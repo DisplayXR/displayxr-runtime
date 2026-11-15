@@ -5644,6 +5644,18 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;
 		}
+		// #2635 / #2614: the app calls xrEndFrame from inside a Present hook
+		// that also hooks this chain. This thread holds c->mutex, which the
+		// app's next layer_begin waits for while it holds the hook's lock; a
+		// Present from here would enter the hook and wait for that lock:
+		// deadlock. No repaint for the session (the D3D11 target's rule).
+		// Under the lock: the latch is set by an app present under it.
+		// Partition or not, and ahead of any present-side work.
+		if (comp_d3d12_target_repaint_forbidden(c->target)) {
+			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
+			continue;
+		}
 
 		// #918 D12-3: the repaint replays the weave, so it resets the WEAVE
 		// list — the out device's under the split. This is the arm the split

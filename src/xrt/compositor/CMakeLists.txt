@@ -379,6 +379,10 @@ if(WIN32)
 		# window that already has a DXGI swapchain (E_ACCESSDENIED fallback).
 		util/comp_child_window_win.cpp
 		util/comp_child_window_win.h
+		# The same two targets' #2635 present-hook re-entry probe (the live
+		# half of util/comp_present_hook.h).
+		util/comp_present_hook_win.cpp
+		util/comp_present_hook_win.h
 		)
 	target_link_libraries(
 		comp_win32_window
