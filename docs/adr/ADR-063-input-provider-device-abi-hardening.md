@@ -63,7 +63,9 @@ provider-allocated internal struct.
   Monado-derived features land (body tracking, plane detection and face tracking slots arrived
   this way), and Amendment 8 itself appended enumerators to `xrt_device_name` and
   `xrt_device_type`. Appending at the end of an enum is safe; appending a field in the middle of
-  `xrt_device`, or a slot before `destroy`, is not — and nothing enforces which kind a change is.
+  `xrt_device`, or a slot before `destroy`, is not — and the struct's own convention is the unsafe
+  one ("Add new functions above destroy", so every new slot moves `destroy`). Nothing enforces
+  which kind a change is.
 - **The failure is silent.** A shifted `xrt_device` does not fail negotiation. It fails as a crash
   in `xrSyncActions`, a pose read from the wrong slot, or a device bound to the wrong profile.
   Release builds of a vendor DLL have no symbols, and the crash lands in the runtime.
