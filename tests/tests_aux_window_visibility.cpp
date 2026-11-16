@@ -3,7 +3,8 @@
 /*!
  * @file
  * @brief  The lens visibility policy's pure core (#2671): rect cover,
- *         occluder rules, hide-dwell debounce.
+ *         occluder rules, hide-dwell debounce; and the native-Wayland
+ *         snapshot reader (#2689).
  */
 
 #include "catch_amalgamated.hpp"
@@ -383,4 +384,78 @@ TEST_CASE("tracker: the per-screen API is NULL-safe")
 	CHECK_FALSE(u_window_visibility_screen_hidden(nullptr, "DISPLAY2"));
 	const char *names[] = {"DISPLAY2"};
 	u_window_visibility_set_screens(nullptr, names, 1); // no crash
+}
+
+/*
+ *
+ * #2689: GNOME Shell's window snapshot (native Wayland).
+ *
+ */
+
+TEST_CASE("wayland snapshot: this process's window and its hidden reason")
+{
+	const char *reason = nullptr;
+	const char *visible = R"({"version":1,"windows":[
+		{"pid":42,"focus":true,"frame":[0,0,800,600],"hidden":""}]})";
+	CHECK(u_wv_wl_parse_snapshot(visible, 42, &reason) == U_WV_WL_VISIBLE);
+	CHECK(std::string(reason) == "uncovered");
+
+	const struct
+	{
+		const char *hidden;
+		const char *reason;
+	} cases[] = {
+	    {"minimized", "minimized"},   {"workspace", "on another workspace"},    {"locked", "screen locked"},
+	    {"covered", "fully covered"}, {"something-new", "hidden by the shell"},
+	};
+	for (const auto &c : cases) {
+		const std::string json =
+		    std::string(R"({"version":1,"windows":[{"pid":42,"frame":[0,0,10,10],"hidden":")") + c.hidden +
+		    R"("}]})";
+		CHECK(u_wv_wl_parse_snapshot(json.c_str(), 42, &reason) == U_WV_WL_HIDDEN);
+		CHECK(std::string(reason) == c.reason);
+	}
+}
+
+TEST_CASE("wayland snapshot: an older extension, no window, a payload not understood")
+{
+	const char *reason = nullptr;
+	CHECK(u_wv_wl_parse_snapshot(R"({"version":1,"windows":[{"pid":42,"frame":[0,0,10,10],"minimized":true}]})", 42,
+	                             &reason) == U_WV_WL_NO_FIELD);
+	CHECK(std::string(reason) == "uncovered");
+	CHECK(u_wv_wl_parse_snapshot(R"({"version":1,"windows":[{"pid":7,"frame":[0,0,10,10],"hidden":"covered"}]})",
+	                             42, &reason) == U_WV_WL_NO_WINDOW);
+	CHECK(u_wv_wl_parse_snapshot(R"({"version":1,"windows":[{"pid":42,"frame":[0,0,0,10],"hidden":"covered"}]})",
+	                             42, &reason) == U_WV_WL_NO_WINDOW);
+	CHECK(u_wv_wl_parse_snapshot(R"({"version":1,"windows":[]})", 42, &reason) == U_WV_WL_NO_WINDOW);
+	CHECK(u_wv_wl_parse_snapshot(R"({"version":2,"windows":[{"pid":42,"frame":[0,0,10,10],"hidden":""}]})", 42,
+	                             &reason) == U_WV_WL_UNKNOWN);
+	CHECK(u_wv_wl_parse_snapshot("not json", 42, &reason) == U_WV_WL_UNKNOWN);
+	CHECK(u_wv_wl_parse_snapshot(R"({"version":1})", 42, &reason) == U_WV_WL_UNKNOWN);
+	CHECK(u_wv_wl_parse_snapshot(nullptr, 42, nullptr) == U_WV_WL_UNKNOWN);
+	// No version key: a pre-versioning publisher reads as version 1.
+	CHECK(u_wv_wl_parse_snapshot(R"({"windows":[{"pid":42,"frame":[0,0,10,10],"hidden":""}]})", 42, nullptr) ==
+	      U_WV_WL_VISIBLE);
+}
+
+TEST_CASE("wayland snapshot: the window is picked as the geometry consumer picks it")
+{
+	const char *reason = nullptr;
+	// Focused wins over larger.
+	const char *focus = R"({"version":1,"windows":[
+		{"pid":42,"focus":false,"frame":[0,0,1920,1080],"hidden":"covered"},
+		{"pid":42,"focus":true,"frame":[0,0,100,100],"hidden":""}]})";
+	CHECK(u_wv_wl_parse_snapshot(focus, 42, &reason) == U_WV_WL_VISIBLE);
+	// Neither focused (a minimized window loses focus): the largest.
+	const char *largest = R"({"version":1,"windows":[
+		{"pid":42,"focus":false,"frame":[0,0,100,100],"hidden":""},
+		{"pid":42,"focus":false,"frame":[0,0,1920,1080],"hidden":"minimized"},
+		{"pid":9,"focus":true,"frame":[0,0,1920,1080],"hidden":""}]})";
+	CHECK(u_wv_wl_parse_snapshot(largest, 42, &reason) == U_WV_WL_HIDDEN);
+	CHECK(std::string(reason) == "minimized");
+}
+
+TEST_CASE("wayland tracker: no surface means no tracker")
+{
+	CHECK(u_window_visibility_create_wayland(nullptr, nullptr, "test", nullptr, nullptr) == nullptr);
 }

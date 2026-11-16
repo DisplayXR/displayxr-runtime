@@ -109,8 +109,12 @@ wv_reason_from_label(bool hidden, const char *label)
 		if (strstr(label, "not visible") != NULL) {
 			return U_WV_REASON_NOT_VISIBLE;
 		}
-		if (strstr(label, "another desktop") != NULL) {
+		// X11 says "desktop", the GNOME shell (Wayland, #2689) "workspace".
+		if (strstr(label, "another desktop") != NULL || strstr(label, "another workspace") != NULL) {
 			return U_WV_REASON_CLOAKED;
+		}
+		if (strstr(label, "screen locked") != NULL) {
+			return U_WV_REASON_LOCKED; // #2689: the shell's "locked"
 		}
 		return U_WV_REASON_COVERED; // fully covered / obscured / another Space
 	}
@@ -264,9 +268,14 @@ wv_thread(void *ptr)
 		const enum u_wv_reason r = wv_reason_from_label(raw, reason);
 		const enum u_wv_reason r_all = wv_reason_from_label(raw_all, reason_all);
 		const bool was = wv->debounce.reported_hidden;
-		const bool now = u_wv_debounce_update(&wv->debounce, raw, t, U_WINDOW_VISIBILITY_HIDE_DWELL_NS);
+		// ADR-062 D1 timing, as on Windows: minimized / another desktop or
+		// workspace / locked are reported at once, a cover after the dwell.
+		// No move/size hold here (no backend reports one).
+		const bool now = u_wv_debounce_step(&wv->debounce, raw, u_wv_reason_is_immediate(r), false, t,
+		                                    U_WINDOW_VISIBILITY_HIDE_DWELL_NS);
 		const bool was_all = wv->debounce_all.reported_hidden;
-		const bool now_all = u_wv_debounce_update(&wv->debounce_all, raw_all, t, U_WINDOW_VISIBILITY_HIDE_DWELL_NS);
+		const bool now_all = u_wv_debounce_step(&wv->debounce_all, raw_all, u_wv_reason_is_immediate(r_all),
+		                                        false, t, U_WINDOW_VISIBILITY_HIDE_DWELL_NS);
 		os_mutex_lock(&wv->lock);
 		wv->reason = r;
 		wv->reason_all = r_all;
@@ -314,12 +323,13 @@ wv_pipe_nonblocking(int fds[2])
 	return true;
 }
 
-struct u_window_visibility *
-u_window_visibility_create(void *native_window,
-                           const char *panel_device_name,
-                           const char *who,
-                           u_window_visibility_change_fn on_change,
-                           void *userdata)
+static struct u_window_visibility *
+wv_create(enum u_wv_source source,
+          void *native_window,
+          const char *panel_device_name,
+          const char *who,
+          u_window_visibility_change_fn on_change,
+          void *userdata)
 {
 	if (native_window == NULL) {
 		return NULL;
@@ -333,10 +343,18 @@ u_window_visibility_create(void *native_window,
 		return NULL;
 	}
 
-	struct u_wv_backend *b = u_wv_backend_create();
+	struct u_wv_backend *b = u_wv_backend_create(source);
 	if (b == NULL) {
-		U_LOG_I("#2671 %s: no window-visibility source here — the 3D window counts as always visible",
-		        who != NULL ? who : "window");
+		if (source == U_WV_SOURCE_WAYLAND) {
+			U_LOG_I(
+			    "#2671 %s: no window-visibility source for a native Wayland window here (it needs "
+			    "GNOME Shell and its window-geometry@displayxr.org extension, version 20+) — the 3D "
+			    "window counts as always visible",
+			    who != NULL ? who : "window");
+		} else {
+			U_LOG_I("#2671 %s: no window-visibility source here — the 3D window counts as always visible",
+			        who != NULL ? who : "window");
+		}
 		return NULL;
 	}
 
@@ -377,9 +395,29 @@ u_window_visibility_create(void *native_window,
 	os_thread_name(&wv->thread, "dxr-lens-vis");
 	// Check the first window at once rather than after a full period.
 	wv_wake(wv);
-	U_LOG_I("#2671 %s: tracking 3D window visibility (window %p, 3D screen '%s')", wv->who, native_window,
-	        wv->panel);
+	U_LOG_I("#2671 %s: tracking 3D window visibility (%swindow %p, 3D screen '%s')", wv->who,
+	        source == U_WV_SOURCE_WAYLAND ? "Wayland " : "", native_window, wv->panel);
 	return wv;
+}
+
+struct u_window_visibility *
+u_window_visibility_create(void *native_window,
+                           const char *panel_device_name,
+                           const char *who,
+                           u_window_visibility_change_fn on_change,
+                           void *userdata)
+{
+	return wv_create(U_WV_SOURCE_NATIVE, native_window, panel_device_name, who, on_change, userdata);
+}
+
+struct u_window_visibility *
+u_window_visibility_create_wayland(void *wl_surface,
+                                   const char *panel_device_name,
+                                   const char *who,
+                                   u_window_visibility_change_fn on_change,
+                                   void *userdata)
+{
+	return wv_create(U_WV_SOURCE_WAYLAND, wl_surface, panel_device_name, who, on_change, userdata);
 }
 
 bool

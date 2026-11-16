@@ -148,8 +148,11 @@ wvm_post_sample(DxrLensVisibilityHolder *h)
 }
 
 struct u_wv_backend *
-u_wv_backend_create(void)
+u_wv_backend_create(enum u_wv_source source)
 {
+	if (source != U_WV_SOURCE_NATIVE) {
+		return NULL; // no Wayland here (#2689)
+	}
 	struct u_wv_backend *b = (struct u_wv_backend *)calloc(1, sizeof(*b));
 	if (b == NULL) {
 		return NULL;

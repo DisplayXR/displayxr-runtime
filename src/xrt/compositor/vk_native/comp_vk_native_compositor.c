@@ -16257,8 +16257,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		void *vis_window = NULL;
 #if defined(XRT_OS_LINUX_DESKTOP)
 		// An X11 window (the app's, or ours). A Wayland surface or direct
-		// scanout leaves xcb_handle zeroed: not tracked (a Wayland client
-		// cannot see the global stacking order).
+		// scanout leaves xcb_handle zeroed.
 		if (c->xcb_handle.window != 0) {
 			vis_window = (void *)(uintptr_t)c->xcb_handle.window;
 		}
@@ -16267,7 +16266,20 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			vis_window = comp_vk_native_window_macos_get_view(c->macos_window);
 		}
 #endif
-		c->visibility = u_window_visibility_create(vis_window, NULL, "vk_native", vk_visibility_changed, c);
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND)
+		if (vis_window == NULL && c->use_wayland && c->wayland_handle.surface != NULL) {
+			// #2689: a native Wayland surface cannot see the stacking order
+			// itself; GNOME Shell's window-geometry extension (v20+)
+			// publishes this process's window's "hidden". No GNOME / no or an
+			// older extension: not tracked, the window counts as visible.
+			c->visibility = u_window_visibility_create_wayland(c->wayland_handle.surface, NULL, "vk_native",
+			                                                   vk_visibility_changed, c);
+		} else
+#endif
+		{
+			c->visibility =
+			    u_window_visibility_create(vis_window, NULL, "vk_native", vk_visibility_changed, c);
+		}
 	}
 #endif
 

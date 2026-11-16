@@ -74,9 +74,17 @@
  * minimized (`WM_STATE` Iconic / `_NET_WM_STATE_HIDDEN`) or on another desktop
  * is hidden, so is a server-reported `VisibilityNotify(FullyObscured)`, and a
  * low-rate `_NET_CLIENT_LIST_STACKING` cover check applies the rules above
- * where X has the same facts. Native Wayland surfaces are not tracked: a
- * Wayland client cannot see the global stacking order, so they count as
- * visible.
+ * where X has the same facts.
+ *
+ * Desktop Linux, native Wayland (u_window_visibility_wayland.c, #2689): a
+ * Wayland client cannot see the global stacking order, but GNOME Shell can, and
+ * DisplayXR's own window-geometry@displayxr.org extension (version 20+)
+ * publishes a per-window `hidden` reason (`minimized`, `workspace`, `locked`,
+ * `covered`) computed in gnome-shell with the X11 occluder rules. The tracker
+ * reads it for this process's window, picked the way the vk_native geometry
+ * consumer picks it (@ref u_wv_wl_parse_snapshot). No extension, an older one
+ * (no `hidden`), or another desktop: not tracked, the window counts as
+ * visible. Created with @ref u_window_visibility_create_wayland.
  *
  * macOS (u_window_visibility_macos.m): `NSWindow.occlusionState`, sampled on
  * the main thread (never waited on), which already folds in minimized, other
@@ -409,6 +417,38 @@ u_wv_debounce_deadline(const struct u_wv_debounce *d, uint64_t dwell_ns)
 	return (d->raw_hidden && !d->reported_hidden) ? d->hidden_since_ns + dwell_ns : 0;
 }
 
+//! What GNOME Shell's window snapshot says about one process's window (#2689).
+enum u_wv_wl_state
+{
+	//! Not a snapshot this reader understands (not JSON, no `windows`, a
+	//! schema `version` above 1).
+	U_WV_WL_UNKNOWN = 0,
+	//! No (sized) window of the process in it: not mapped yet, or gone.
+	U_WV_WL_NO_WINDOW,
+	//! The window has no `hidden` key: an extension older than version 20.
+	U_WV_WL_NO_FIELD,
+	//! `hidden` is "": the window can be seen.
+	U_WV_WL_VISIBLE,
+	//! `hidden` names a reason.
+	U_WV_WL_HIDDEN,
+};
+
+/*!
+ * Read a `GetWindows` / `WindowsChanged` payload of the window-geometry
+ * extension (docs/specs/runtime/wayland-window-geometry.md §4.3) for the
+ * window of process @p pid. The window is picked the way
+ * comp_vk_native_wl_geom_get_window_rect picks it, so both read the same
+ * window: owned by @p pid with a non-empty frame, the focused one first, else
+ * the largest frame.
+ *
+ * @p out_reason (optional) gets a static string: for HIDDEN the reason as the
+ * transition line words it ("minimized", "on another workspace", "screen
+ * locked", "fully covered", or "hidden by the shell" for a reason this
+ * reader does not know), else "uncovered".
+ */
+enum u_wv_wl_state
+u_wv_wl_parse_snapshot(const char *json, int32_t pid, const char **out_reason);
+
 /*
  *
  * The tracker.
@@ -455,6 +495,27 @@ u_window_visibility_create(void *native_window,
                            const char *who,
                            u_window_visibility_change_fn on_change,
                            void *userdata);
+
+/*!
+ * #2689: start tracking a native Wayland window (desktop Linux; NULL on every
+ * other platform). @p wl_surface is the app's `wl_surface *` and only names
+ * the target (a different pointer through @ref u_window_visibility_set_window
+ * is a new window): the window itself is this process's, found in GNOME
+ * Shell's window snapshot as @ref u_wv_wl_parse_snapshot picks it. The
+ * tracker opens its own session-bus connection and uses it from its thread
+ * only, so it keeps working while a hidden surface's frame loop is throttled.
+ *
+ * NULL also when the session bus is unreachable or the desktop is not GNOME
+ * (one INFO line). An extension that is absent or older than version 20 gives
+ * a tracker that reports visible until a snapshot with `hidden` arrives (one
+ * INFO line says which). Everything else as @ref u_window_visibility_create.
+ */
+struct u_window_visibility *
+u_window_visibility_create_wayland(void *wl_surface,
+                                   const char *panel_device_name,
+                                   const char *who,
+                                   u_window_visibility_change_fn on_change,
+                                   void *userdata);
 
 /*!
  * Debounced result: true while the window has been hidden for the dwell.
