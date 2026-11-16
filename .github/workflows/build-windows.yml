@@ -341,6 +341,18 @@ jobs:
             exit 1
           }
           Write-Host "PASS: sim-input provider built and exports xrtInputPluginNegotiate."
+          # The stylus reference provider (ADR-034 Amendment 8).
+          $stylusPlugin = "_package/bin/plugins/DisplayXR-SimStylus.dll"
+          if (-not (Test-Path $stylusPlugin)) {
+            Write-Host "::error::$stylusPlugin missing — sim-stylus provider did not build."
+            exit 1
+          }
+          $stylusExports = & dumpbin /exports $stylusPlugin 2>&1 | Select-String -Pattern "xrtInputPluginNegotiate"
+          if (-not $stylusExports) {
+            Write-Host "::error::$stylusPlugin missing xrtInputPluginNegotiate export (ADR-034 contract — exactly one symbol)."
+            exit 1
+          }
+          Write-Host "PASS: sim-stylus provider built and exports xrtInputPluginNegotiate."
           # And the conversion-provider reference (ADR-053 / #2002; required
           # since ADR-054 §2.3: every class ships a reference implementation).
           $convPlugin = "_package/bin/plugins/DisplayXR-SimConversion.dll"
@@ -624,6 +636,7 @@ jobs:
           $simIn   = (Resolve-Path "_package/bin/plugins/DisplayXR-SimInput.dll").Path
           $simConv = (Resolve-Path "_package/bin/plugins/DisplayXR-SimConversion.dll").Path
           $simTr   = (Resolve-Path "_package/bin/plugins/DisplayXR-SimTracking.dll").Path
+          $simSt   = (Resolve-Path "_package/bin/plugins/DisplayXR-SimStylus.dll").Path
           $stubDir = if (Test-Path "build/tests/Release") { "build/tests/Release" } else { "build/tests" }
           $fxDp   = (Resolve-Path "$stubDir/tests_conversion_loader_stub_dp_abi.dll").Path
           $fxIn   = (Resolve-Path "$stubDir/tests_conversion_loader_stub_input_abi.dll").Path
@@ -665,7 +678,7 @@ jobs:
           $allowRoot = "HKLM\Software\DisplayXR\Trust\Allowlist"
           $trustKey = "HKLM\Software\DisplayXR\Trust"
           $hashes = @{}
-          foreach ($b in @($simDp, $simIn, $simConv, $simTr, $fxDp, $fxIn, $fxConv, $fxTr)) {
+          foreach ($b in @($simDp, $simIn, $simConv, $simTr, $simSt, $fxDp, $fxIn, $fxConv, $fxTr)) {
             $hashes[$b] = (Get-FileHash -Path $b -Algorithm SHA256).Hash.ToLower()
           }
           $enforceSet = $false
@@ -965,9 +978,39 @@ jobs:
             $o = Selftest-Json
             Expect ($o.tracking_providers.viewer_source -eq "dp") "tracking: a tracking display beats the provider ($(Tr $o))"
             Remove-Item Env:\DXR_DP_SIM_DISPLAY_TRACKING -ErrorAction SilentlyContinue
+
+            # 6. The stylus reference provider (ADR-034 Amendment 8), on the input class.
+            # sim-stylus declines unless ENABLE; enabled, its one pen (MX Ink profile)
+            # is declared DOMINANT_HAND_CONTROLLER and the builder resolves it in place
+            # from the Handedness policy: RIGHT (type 2) by default, LEFT (type 3) with
+            # InputProviders\Policy\Handedness = 1. Then the class's ABI fixture is
+            # rejected and fallen through with sim-stylus still resident.
+            function Pen($o) { $o.input_providers.devices | Where-Object { $_.str -eq "Simulated Stylus" } | Select-Object -First 1 }
+            function Ranked($o) { @($o.input_providers.ranked) -join "," }
+            Reg-Row $inRoot "sim-stylus" $simSt 190
+            $o = Selftest-Json
+            Expect (($lastExit -eq 0) -and (@($o.input_providers.ranked) -notcontains "sim-stylus") -and ($null -eq (Pen $o))) "stylus: without ENABLE sim-stylus declines its probe (ranked: $(Ranked $o))"
+            reg add "$inRoot\sim-stylus\Settings" /v ENABLE /t REG_SZ /d "1" /f | Out-Null
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "stylus: selftest exit 0 with sim-stylus enabled (got $lastExit)"
+            Expect (@($o.input_providers.ranked) -contains "sim-stylus") "stylus: sim-stylus is resident (ranked: $(Ranked $o))"
+            Expect ([int](Pen $o).type -eq 2) "stylus: the DOMINANT pen resolves to the RIGHT hand by default (type $((Pen $o).type))"
+            reg add "$inRoot\Policy" /v Handedness /t REG_DWORD /d 1 /f | Out-Null
+            $o = Selftest-Json
+            Expect ([int](Pen $o).type -eq 3) "stylus: Handedness=1 puts the pen on the LEFT hand (type $((Pen $o).type))"
+            reg delete "$inRoot\Policy" /v Handedness /f | Out-Null
+            $io = Cli-Json @("input", "options", "sim-stylus")
+            $im = $io.settings | Where-Object { $_.key -eq "MODE" } | Select-Object -First 1
+            Expect (($null -ne $im) -and $im.declared) "stylus: 'input options sim-stylus' lists MODE from the provider's describe_settings"
+            Reg-Row $inRoot "abi-fixture-input" $fxIn 10
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.scan_failed -eq 1) -and (@($o.input_providers.ranked) -contains "sim-stylus") -and ($null -ne (Pen $o))) "stylus: ABI fixture rejected, sim-stylus still resident with its pen (ranked: $(Ranked $o) failed=$($o.input_providers.scan_failed))"
+            reg delete "$inRoot\abi-fixture-input" /f | Out-Null
+            reg delete "$inRoot\sim-stylus" /f | Out-Null
           } finally {
             foreach ($k in @("$dpRoot\sim-display", "$dpRoot\sim-display-alt", "$dpRoot\abi-fixture-dp",
                              "$inRoot\sim-input", "$inRoot\sim-input-alt", "$inRoot\abi-fixture-input",
+                             "$inRoot\sim-stylus",
                              "$cvRoot\sim-conversion", "$cvRoot\abi-fixture-conv",
                              "HKCU\Software\DisplayXR\DisplayProcessors\sim-display",
                              "HKCU\Software\DisplayXR\ConversionProviders\sim-conversion",
@@ -989,7 +1032,7 @@ jobs:
             Write-Host "::error::per-class conformance (ADR-054 N4): $($script:fails.Count) assertion(s) failed — see FAIL lines above."
             exit 1
           }
-          Write-Host "PASS: per-class conformance (ADR-054 N4) — selected / Enabled=0 falls back / Preferred wins / EmulatedControllers gate / ABI mismatch rejected and fallen through."
+          Write-Host "PASS: per-class conformance (ADR-054 N4) — selected / Enabled=0 falls back / Preferred wins / EmulatedControllers gate / ABI mismatch rejected and fallen through / sim-stylus dominant-hand pen."
           # Explicit: the pwsh step otherwise exits with the LAST native command's
           # code, and the finally block's best-effort `reg delete` of an
           # already-removed value legitimately returns 1.

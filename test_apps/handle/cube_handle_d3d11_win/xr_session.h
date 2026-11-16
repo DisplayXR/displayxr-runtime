@@ -39,6 +39,12 @@ extern uint32_t g_cursorDepthSpecVersion;
 // hand-tracking verify vehicle (`--hands` joint markers).
 extern bool g_hasHandTrackingExt;
 
+// XR_LOGITECH_mx_ink_stylus_interaction (ADR-034 Amendment 8): set
+// g_stylusRequested before InitializeOpenXR (`--stylus`); the extension is
+// enabled only then, and g_hasMxInkExt says whether it was.
+extern bool g_stylusRequested;
+extern bool g_hasMxInkExt;
+
 // #1956 — DXR_SUBMIT_DEPTH_LAYER=1 and the runtime advertises
 // XR_KHR_composition_layer_depth: render the scene's depth into an OpenXR
 // depth swapchain and chain XrCompositionLayerDepthInfoKHR on every projection

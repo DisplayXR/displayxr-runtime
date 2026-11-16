@@ -147,6 +147,7 @@ set(tests
     tests_input_arbiter_per_client
     tests_sim_input_nav
     tests_sim_input_hands
+    tests_sim_stylus_script
     tests_gamepad_map
     tests_gamepad_hid_report
     tests_ultraleap_map
@@ -1151,6 +1152,18 @@ target_include_directories(
 			      ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 	)
 target_link_libraries(tests_sim_input_hands PRIVATE xrt-interfaces aux_math)
+
+# ADR-034 Amendment 8 -- the sim_stylus SCRIPT: the tip on / above the glass,
+# the pressure ramp, the pen axes, the button and dock schedules. Pure C,
+# compiled straight in like the hand script.
+target_sources(
+	tests_sim_stylus_script PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_stylus/sim_stylus_script.c
+	)
+target_include_directories(
+	tests_sim_stylus_script PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_stylus
+				${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_sim_stylus_script PRIVATE xrt-interfaces)
 
 # The gamepad input provider's mapping table (drivers/gamepad/gamepad_map.c):
 # stick -> rig velocity with deadzone, the integrator, the button actions.

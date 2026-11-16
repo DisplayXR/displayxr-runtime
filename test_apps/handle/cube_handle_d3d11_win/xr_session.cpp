@@ -16,6 +16,13 @@ bool g_hasViewRigExt = false;
 bool g_hasCursorDepthExt = false;      // XR_DXR_cursor_depth (ADR-046)
 uint32_t g_cursorDepthSpecVersion = 0;
 bool g_hasHandTrackingExt = false;
+bool g_stylusRequested = false; // `--stylus` (main.cpp)
+bool g_hasMxInkExt = false;     // XR_LOGITECH_mx_ink_stylus_interaction enabled
+
+// Older loader headers may predate the extension; its name is all this app needs.
+#ifndef XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME
+#define XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME "XR_LOGITECH_mx_ink_stylus_interaction"
+#endif
 bool g_hasViewsChangeExt = false; // #1488
 bool g_submitDepthLayer = false;  // #1956: DXR_SUBMIT_DEPTH_LAYER=1 + XR_KHR_composition_layer_depth
 
@@ -123,6 +130,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0) {
             g_hasHandTrackingExt = true;
         }
+        if (g_stylusRequested &&
+            strcmp(ext.extensionName, XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME) == 0) {
+            g_hasMxInkExt = true;
+        }
         if (strcmp(ext.extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) == 0) {
             // #1956 smoke: only when asked for — submitting depth is opt-in.
             const char* sd = getenv("DXR_SUBMIT_DEPTH_LAYER");
@@ -192,6 +203,12 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_cursor_depth: %s (v%u)", g_hasCursorDepthExt ? "ENABLED" : "off", g_cursorDepthSpecVersion);
     if (g_hasHandTrackingExt) {
         enabledExtensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+    }
+    if (g_hasMxInkExt) {
+        enabledExtensions.push_back(XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME);
+    }
+    if (g_stylusRequested) {
+        LOG_INFO("XR_LOGITECH_mx_ink_stylus_interaction: %s", g_hasMxInkExt ? "ENABLED" : "NOT FOUND");
     }
     if (g_submitDepthLayer) {
         enabledExtensions.push_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
