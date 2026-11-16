@@ -1033,6 +1033,26 @@ bool
 oxr_session_mono_auto_2d_explicit(struct oxr_logger *log, struct oxr_session *sess, bool push_event);
 
 /*!
+ * ADR-062 D1: is this session's window hidden right now? In-process native
+ * compositors only (their tracker's debounced verdict); false otherwise — an
+ * out-of-process session hears the panel state from the service's events.
+ */
+bool
+oxr_session_window_hidden(struct oxr_session *sess);
+
+/*!
+ * ADR-062 D1 observability: on a visibility edge of an in-process session's
+ * window, report the real hardware state with
+ * XrEventDataHardwareDisplayStateChangedDXR — 2D when the runtime drops the
+ * lens of a session that wants 3D, 3D when it restores it. Called from
+ * xrPollEvent and xrEndFrame; one atomic load when nothing changed. The
+ * session's own choice (@ref oxr_session::hardware_display_3d) is never
+ * changed here.
+ */
+void
+oxr_session_visibility_poll(struct oxr_logger *log, struct oxr_session *sess);
+
+/*!
  * Push the session's eye-tracking control mode (MANAGED=0 / MANUAL=1) to the
  * display processor (#522). Best-effort policy hint; the DP enacts whatever the
  * vendor advertised. Routed in-process via the native compositor or
@@ -3644,6 +3664,18 @@ struct oxr_session
 	//! The session's compositor cannot enact auto-2D (said once, then the
 	//! detector is off for the session).
 	bool mono_auto_2d_unsupported;
+
+	/*!
+	 * ADR-062 D1: the in-process compositor last reported the session's window
+	 * hidden (oxr_session_visibility_poll). While hidden the lens is 2D but
+	 * @ref hardware_display_3d keeps the session's own choice, which the
+	 * compositor restores on return.
+	 */
+	bool window_hidden_seen;
+	//! ADR-062 D1: a 3D request was denied with WINDOW_HIDDEN and is owed its
+	//! answer (a hardware-3D event) when the window is seen again. The only
+	//! visibility edge that is reported as a hardware state change.
+	bool window_hidden_3d_owed;
 
 	//! Active eye tracking mode (0=MANAGED, 1=MANUAL). Default: 0 (MANAGED).
 	uint32_t eye_tracking_mode;

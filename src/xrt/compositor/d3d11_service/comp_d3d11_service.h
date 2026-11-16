@@ -1311,6 +1311,16 @@ struct comp_d3d11_client_status
 	uint64_t owner_screen;
 	//! The segment table the last direct weave took + per-segment eyes (count 0 = one view set).
 	struct xrt_segment_metrics segments;
+	//! ADR-062 D1: the default policy tracks this client's window (it presents for the lease holder).
+	bool vis_tracked;
+	//! ...and it is hidden on the 3D screen (debounced: the lens wish is 2D).
+	bool vis_hidden;
+	//! ...hidden on every screen (tier 2: weave and present skipped).
+	bool vis_hidden_everywhere;
+	//! ...why, as an `enum u_wv_reason` value.
+	uint32_t vis_reason;
+	//! ...the process owning the largest occluder when covered ("" = none).
+	char vis_occluder[64];
 };
 
 /*!

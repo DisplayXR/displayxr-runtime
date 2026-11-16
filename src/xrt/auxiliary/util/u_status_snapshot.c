@@ -1051,6 +1051,17 @@ client_to_cjson(const struct xrt_status_client *c)
 	cJSON_AddNumberToObject(in, "present", (double)c->integrity.present);
 	cJSON_AddNumberToObject(in, "skip", (double)c->integrity.skip);
 	add_str_or_null(in, "weave_placement", c->integrity.weave_placement);
+
+	// ADR-062 D1: null when the runtime does not track this client's window.
+	if (c->visibility.tracked) {
+		cJSON *vi = cJSON_AddObjectToObject(o, "visibility");
+		cJSON_AddBoolToObject(vi, "hidden", c->visibility.hidden);
+		cJSON_AddBoolToObject(vi, "hidden_everywhere", c->visibility.hidden_everywhere);
+		add_str_or_null(vi, "reason", c->visibility.reason);
+		add_str_or_null(vi, "occluder", c->visibility.occluder);
+	} else {
+		cJSON_AddNullToObject(o, "visibility");
+	}
 	return o;
 }
 
@@ -1551,6 +1562,17 @@ format_client(struct text_buf *t, const struct xrt_status_snapshot *snap, const 
 	          c->views.capacity, c->views.reported, (unsigned long long)c->integrity.paint,
 	          (unsigned long long)c->integrity.present, (unsigned long long)c->integrity.skip,
 	          c->integrity.weave_placement[0] != '\0' ? c->integrity.weave_placement : "—");
+	if (c->visibility.tracked) {
+		tb_printf(t, "    visibility: %s (%s%s%s)%s\n",
+		          c->visibility.hidden_everywhere ? "hidden everywhere"
+		          : c->visibility.hidden          ? "hidden"
+		                                          : "visible",
+		          c->visibility.reason, c->visibility.occluder[0] != '\0' ? ", covered by " : "",
+		          c->visibility.occluder,
+		          c->visibility.hidden_everywhere ? " - lens 2D, weave skipped"
+		          : c->visibility.hidden          ? " - lens 2D"
+		                                          : "");
+	}
 }
 
 size_t

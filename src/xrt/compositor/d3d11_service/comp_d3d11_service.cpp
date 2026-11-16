@@ -4656,6 +4656,8 @@ struct d3d11_multi_compositor
 	struct u_window_visibility *lens_vis; //!< NULL until the first trackable presenter
 	HWND lens_vis_hwnd;                   //!< the window lens_vis tracks (NULL = none)
 	bool lens_hidden_applied;             //!< the hidden gate is engaged
+	//! ADR-062 D3 (tier 2): the default policy's skipped-weave ledger (render thread).
+	struct u_window_visibility_skip t2;
 	//! @}
 
 	//! Phase 2.K: focused-slot value last seen by the public-API drain. The
@@ -5530,10 +5532,14 @@ apply_mode_transition(struct d3d11_service_system *sys,
 	}
 	sync_tile_layout(sys);
 	sys->hardware_display_3d = want_3d;
-	if (want_3d != prev_3d) {
+	// ADR-062 D1: while the presenter is hidden the DP was sent 2D (the gate in
+	// dp_request_display_mode_checked), so a 3D state is recorded, not real:
+	// no event now; pipeline_lens_visibility_tick reports 3D on the visible edge.
+	const bool held_2d = want_3d && g_svc_presenter_hidden.load(std::memory_order_acquire);
+	if (want_3d != prev_3d && !held_2d) {
 		broadcast_hardware_state(sys, want_3d);
 	}
-	stamp_flip_cooldown(sys, want_3d);
+	stamp_flip_cooldown(sys, want_3d && !held_2d);
 	return true;
 }
 
@@ -15665,6 +15671,9 @@ pipeline_lens_visibility_tick(struct d3d11_service_system *sys,
 		if (dp != nullptr) {
 			(void)DP_REQUEST_DISPLAY_MODE(dp, false);
 		}
+		// ADR-062 D1: NOT reported as a hardware state change (see
+		// oxr_session_visibility_poll): apps follow that event with their own
+		// mode request, which would make 2D the session's choice for good.
 	} else {
 		g_svc_presenter_hidden.store(false, std::memory_order_release);
 		if (dp != nullptr && sys->hardware_display_3d) {
@@ -15677,6 +15686,45 @@ pipeline_lens_visibility_tick(struct d3d11_service_system *sys,
 	        hidden      ? "2D"
 	        : zone_owns ? "the session's mode, then the zone wish (re-published)"
 	                    : (sys->hardware_display_3d ? "the session's 3D" : "the session's 2D"));
+}
+
+/*!
+ * ADR-062 D3: the %TEMP% workspace_screenshot trigger while the presenter is
+ * hidden on every screen. Nothing is woven, so there is no post-weave back
+ * buffer to dump: the pre-weave atlas is written (the same
+ * workspace_screenshot_atlas*.png) and the skip is said. Same 4 Hz poll
+ * budget as the direct path's. Render thread, under render_mutex.
+ */
+static void
+pipeline_capture_while_hidden(struct d3d11_service_system *sys, struct d3d11_service_compositor *fc)
+{
+	static char trigger[MAX_PATH] = {};
+	static char prefix[MAX_PATH] = {};
+	if (!trigger[0]) {
+		const char *tmp = getenv("TEMP");
+		if (!tmp) {
+			tmp = "C:\\Temp";
+		}
+		snprintf(trigger, sizeof(trigger), "%s\\workspace_screenshot_trigger", tmp);
+		snprintf(prefix, sizeof(prefix), "%s\\workspace_screenshot", tmp);
+	}
+	static int64_t last_poll_ns = 0;
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	if (now_ns - last_poll_ns >= 250LL * 1000000LL) {
+		last_poll_ns = now_ns;
+		if (GetFileAttributesA(trigger) != INVALID_FILE_ATTRIBUTES) {
+			DeleteFileA(trigger);
+			U_LOG_W("workspace_screenshot: post-weave dump SKIPPED - the presenter is hidden on every screen "
+			        "(ADR-062 tier 2: nothing is woven); writing the pre-weave atlas only");
+			{
+				std::lock_guard<std::mutex> alock(sys->active_compositor_mutex);
+				sys->active_compositor = fc;
+			}
+			struct ipc_capture_result dummy = {};
+			comp_d3d11_service_capture_frame(&sys->base, prefix, IPC_CAPTURE_FLAG_PROJECTION_ONLY, &dummy);
+		}
+	}
+	comp_d3d11_service_poll_mcp_capture((struct xrt_system_compositor *)sys);
 }
 
 static void
@@ -15992,6 +16040,27 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 				pipeline_flat_present(sys, oc);
 			}
 		}
+		return;
+	}
+
+	/*
+	 * ADR-062 D3 (tier 2): the presenter's window is hidden on every screen —
+	 * no crop, no weave, no present (ahead of the free-buffer probe, so no
+	 * frame-latency slot is won either). The DP, the swap chains and the
+	 * target stay alive; the panel holds its last frame. The render thread
+	 * falls back to its own tick (no app chain to pace on), and the app's
+	 * frame loop is untouched. The first tick after the window is seen again
+	 * weaves the client's retained atlas. Not under a controller's
+	 * foreground override, and never a present-owner or a client-texture
+	 * presenter (both returned above).
+	 */
+	if (forced_focus < 0 && (kind == PRESENTER_APP_HWND || kind == PRESENTER_SERVICE_WINDOW) &&
+	    u_window_visibility_skip_step(&mc->t2, mc->lens_vis, "service", 0)) {
+		mc->pace_app_waitable = nullptr;
+		mc->pace_app_sc = nullptr;
+		pipeline_segments_keepalive(fc); // #2244: a skipped weave keeps its table fresh
+		sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
+		pipeline_capture_while_hidden(sys, fc);
 		return;
 	}
 
@@ -23255,6 +23324,12 @@ service_apply_pending_mode(struct d3d11_service_system *sys,
 	U_LOG_W("[app_mode] %s IPC client '%s' requested mode (content=%u hw_req=%d) -> target=%d 3D=%d via=queue",
 	        as_service ? "service-driven" : "lease-holding", c->slot_app_name, req_mode, req_hw,
 	        target_idx == UINT32_MAX ? -1 : (int)target_idx, (int)want_3d);
+	// ADR-062 D1: the presenter's window is hidden, so the panel stays 2D: the
+	// 3D is recorded (re-sent on the visible edge) and the requester is told
+	// why, with no hardware event it could take for its request's result.
+	if (!as_service && want_3d && g_svc_presenter_hidden.load(std::memory_order_acquire)) {
+		push_mode_request_denied(c, 0xFFFFFFFFu, 1, XRT_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN);
+	}
 	return true;
 }
 
@@ -39275,6 +39350,19 @@ comp_d3d11_service_get_client_status(struct xrt_system_compositor *xsysc,
 	{
 		std::lock_guard<std::mutex> lk(c->seg_mutex);
 		out->owner_screen = comp_d3d11_segments_get_owner(c->segments);
+	}
+	// ADR-062 D1: the default policy's tracker follows one window, the
+	// presenter's (render thread, under render_mutex, which this holds).
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	HWND wnd = c->render.hwnd != nullptr ? c->render.hwnd : c->app_hwnd;
+	if (mc != nullptr && mc->lens_vis != nullptr && wnd != nullptr && wnd == mc->lens_vis_hwnd) {
+		struct u_window_visibility_state vs;
+		u_window_visibility_get_state(mc->lens_vis, &vs);
+		out->vis_tracked = vs.tracked;
+		out->vis_hidden = vs.hidden;
+		out->vis_hidden_everywhere = vs.hidden_everywhere;
+		out->vis_reason = (uint32_t)vs.reason;
+		(void)snprintf(out->vis_occluder, sizeof(out->vis_occluder), "%s", vs.occluder);
 	}
 	return true;
 }

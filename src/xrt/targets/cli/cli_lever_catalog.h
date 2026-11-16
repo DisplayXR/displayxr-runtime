@@ -9,7 +9,7 @@
  * Edit the census and re-run the script; the lint workflow runs it with
  * --check, which also fails when a name here no longer occurs in src/xrt.
  *
- * 78 levers: 58 Tier 1 (next launch), 20 Tier 2 (service-scoped).
+ * 81 levers: 61 Tier 1 (next launch), 20 Tier 2 (service-scoped).
  *
  * This is a DESCRIPTION of the levers, not a way to set them: only the names
  * u_setting_is_managed() accepts resolve from the per-user / machine stores.
@@ -54,6 +54,7 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_DP_FORWARD_HORIZON", 1, "App", "on (kill switch)", "#206: per-weave FORWARD horizon for the vendor eye predictor, computed from the vsync-locked vblank grid (DXGI frame statistics - measured period, not nominal)."},
 	{"DXR_DP_FORWARD_HORIZON_LOOP", 1, "App", "on (kill switch)", "#1435: learns the pipeline's whole-period offset (composition frame on DComp chains, queued frame at governor depth >= 2) from realised flips - mode of the last 32 resolved weaves, >= 24 agreeing..."},
 	{"DXR_FILL_FENCE_PARK", 1, "App", "on (kill switch)", "#1264 S1: a fill's GPU fence wait releases the compositor lock (re-validated on retake; superseded fills are dropped)."},
+	{"DXR_HIDDEN_SKIP_PRESENT", 1, "App + Svc", "on (kill switch)", "ADR-062 D3 (tier 2): a window hidden on every screen is neither woven nor presented (the weaver, swapchains and target stay alive; the app's pacing is unchanged); 0 keeps weaving and presenting..."},
 	{"DXR_HUB", 1, "App", "on (cross-adapter and single adapter; =0 kills)", "#2317 step 2 (ADR-059 decision 4): the in-process D3D11 leg weaves and presents through the D3D11 hub (comp_hub_d3d11) for every session that passes its create-time checks, on the cross-adapter..."},
 	{"DXR_L2D_CLIP", 1, "App", "on", "#862 clips the Local2D composite to non-identity pixels"},
 	{"DXR_LATE_WEAVE", 1, "App + Svc", "on", "Weave as late as possible before scanout."},
@@ -63,6 +64,8 @@ static const struct cli_lever cli_lever_catalog[] = {
 	{"DXR_LEGACY_AUTO_CONVERGENCE", 1, "App", "off (the profile's autoConvergence, default false)", "#2640: 1 / 0 turns automatic re-convergence on / off for a LEGACY session on the D3D11 hub: a horizontal image shift of the two views before the display processor puts the scene's centre-weighted..."},
 	{"DXR_LEGACY_CAMERA_RIG", 1, "App", "Per-executable JSON profile, otherwise qwerty defaults", "Inline camera-rig JSON or a UTF-8 file path; seeds instance-wide native legacy camera tuning and Space reset."},
 	{"DXR_LEGACY_VIEW_SIZE_FROM_WINDOW", 1, "App", "on", "#2641: a legacy instance with a D3D11 / D3D12 binding whose process already owns the window a hosted session will adopt (DXR_WIN32_ADOPT_OWN_WINDOW, #2637) is told to render views sized from that..."},
+	{"DXR_LENS_OVERLAY_PROCESSES", 1, "App + Svc", "unset (built-in list)", "ADR-062 D1: comma-separated process image names (foo.exe,bar.exe) whose windows never count as occluders, added to the built-in overlay list"},
+	{"DXR_LENS_VISIBILITY", 1, "App + Svc", "on (kill switch)", "ADR-062 D1/D2: a 3D window that is minimized, cloaked, hidden after it was shown, behind a locked session or an off display, or covered (bar 2% of its area) for 1.5 s stops holding the panel's..."},
 	{"DXR_LINUX_DIRECT_SCANOUT", 1, "App", "off", "Opt-in RandR direct-scanout present path on Linux"},
 	{"DXR_MAX_CLIENTS", 1, "Svc", "0 = auto", "#959 admitted-client cap. Read once at service start"},
 	{"DXR_MONO_AUTO_2D", 1, "App", "on (kill switch)", "Kill switch for automatic hardware 2D when a stereo session submits one flat picture (every projection view on the same swapchain, imageArrayIndex and imageRect; projection layers only) for 0.5 s..."},

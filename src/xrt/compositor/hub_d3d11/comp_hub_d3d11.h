@@ -1102,6 +1102,21 @@ void
 comp_hub_d3d11_set_visibility(struct comp_hub_d3d11 *split, const struct u_window_visibility *vis);
 
 /*!
+ * ADR-062 D3 (tier 2): should this frame skip the weave and present? True
+ * while the borrowed tracker reports the window hidden on every screen and
+ * tier 2 is on; never for a client-presents hub (the caller presents its own
+ * texture). The weaver, the target and the swapchains stay alive; the hub's
+ * repaint declines on its own while it holds. With @p pace, a skipped app
+ * frame is slept onto the panel's period grid, so an app that presents
+ * nothing is paced as a presented one; a tier with its own unpresented-frame
+ * pacing passes false. One WARN per edge, the visible one with the count of
+ * frames skipped. Call it under the owning tier's lock, before the capture
+ * arm and before @ref comp_hub_d3d11_weave_and_present.
+ */
+bool
+comp_hub_d3d11_hidden_skip(struct comp_hub_d3d11 *split, bool pace);
+
+/*!
  * #2639: does this hub run a legacy session's automatic 2D? Its decision is
  * presentation-only, so xrLocateViews must hand such a session its per-eye
  * views whatever the lens is doing: a DP in hardware 2D reports one centred

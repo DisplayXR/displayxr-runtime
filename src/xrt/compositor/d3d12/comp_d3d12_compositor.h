@@ -256,6 +256,18 @@ bool
 comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d);
 
 /*!
+ * ADR-062 D1: the session's window is hidden on its 3D screen (debounced; the
+ * lens wish is 2D while it is). For the state tracker's events: it reports the
+ * visibility-driven lens edges and answers a 3D request made while hidden
+ * with a WINDOW_HIDDEN denial. False when the window is visible, untracked, or
+ * @p xc is NULL. Any thread; one atomic load.
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_compositor_window_hidden(struct xrt_compositor *xc);
+
+/*!
  * #2639: true when the D3D11 hub this session is rerouted through runs a legacy
  * session's automatic 2D. xrLocateViews then keeps the per-eye view set
  * whenever the DP reports a collapsed one. Any thread.

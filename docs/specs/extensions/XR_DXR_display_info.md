@@ -8,7 +8,7 @@
 | **Authors** | The DisplayXR Project |
 | **Date** | 2026-02-13 |
 | **Revision** | 0.2 |
-| **Status** | Implemented (`SPEC_VERSION` 24). `XrStructureType` values are provisional (1004999xxx) until Khronos registration |
+| **Status** | Implemented (`SPEC_VERSION` 26). `XrStructureType` values are provisional (1004999xxx) until Khronos registration |
 | **Extension Names** | `XR_DXR_win32_window_binding`, `XR_DXR_android_surface_binding`, `XR_DXR_cocoa_window_binding`, `XR_DXR_display_info` |
 | **OpenXR Version** | 1.0 |
 | **Extension Type** | Instance extensions |
@@ -1127,8 +1127,21 @@ Both entry points return `XR_SUCCESS` at call time (the request was forwarded); 
 | `DISPLAY_PROCESSOR_REJECTED_DXR` | the display hardware refused the state; the runtime's reported mode is unchanged |
 | `RELAY_OWNS_MODE_DXR` | a relay (WebXR bridge) owns this session's mode |
 | `VIEW_CONFIG_CANNOT_FILL_DXR` (v20) | the session's view configuration reports fewer views than the mode needs, so the session could not fill its tile grid — see below |
+| `WINDOW_HIDDEN_DXR` (v26) | the session's window is hidden (minimized, cloaked, covered, the session locked or the display off): a hardware-3D request is **recorded** and applied when the window is seen again — see below |
 
 `isRequestable` on `XrDisplayRenderingModeInfoDXR` remains the advisory hint ("will a request from this session be honoured right now?"); the event is the answer.
+
+### A hidden window does not hold the lens in 3D (v26, ADR-062)
+
+The lens of a switchable panel is panel-wide, so the runtime drops the lens wish of a session whose window nobody can see: minimized, cloaked (another virtual desktop), hidden after it was shown, behind a locked session or an off display (at once), or covered by other windows except for a sliver (less than 2% of its area) for about 1.5 s. A window that has never been shown is not hidden. When the window is seen again the runtime restores **the session's own last request** — never a forced 3D. Under a workspace controller the controller owns the panel and this rule does not apply.
+
+What the app sees:
+
+- **No hardware state event** for these visibility edges. Apps commonly follow `XrEventDataHardwareDisplayStateChangedDXR` with a rendering-mode request of their own (an engine provider switches to its 2D mode), which would make 2D the session's own choice and keep it 2D after the window is seen again — measured on hardware, and the reason this edge is silent. The session's own choice is kept, and `xrRequestDisplayModeDXR` keeps reporting changes against it. An app that wants to know why the lens moved enables `XR_DXR_window_visibility`, whose event carries the visibility and its reason.
+- A **3D request made while the window is hidden** (`xrRequestDisplayModeDXR(3D)`, or the hardware half of `xrRequestDisplayRenderingModeDXR` for a 3D mode) is recorded and answered with **`XrEventDataDisplayModeRequestDeniedDXR`**, `reason = XR_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN_DXR`, `requestedModeIndex = XR_DISPLAY_MODE_INDEX_NONE_DXR` and `requestedHardware3D = 1` (a rendering-mode request's content half is applied and reported as usual). Unlike the other reasons, this request **is** kept: the 3D is applied, and reported with `XrEventDataHardwareDisplayStateChangedDXR(XR_TRUE)`, when the window is seen again. A 2D request while hidden moves nothing and sends no event.
+- While the window is hidden on every screen the runtime also skips its weave and present (ADR-062 tier 2); the session's state, frame pacing and `shouldRender` are unchanged.
+
+`displayxr-cli status` (and the MCP status snapshot) shows a service client's window visibility, its reason and, when covered, the covering process. The switches are persisted settings (`displayxr-cli perf set`): `DXR_LENS_VISIBILITY=0` turns the rule off, `DXR_LENS_OVERLAY_PROCESSES` names extra processes whose windows never cover, `DXR_HIDDEN_SKIP_PRESENT=0` keeps weaving and presenting a hidden window.
 
 ### A session never runs in, or requests, a mode it cannot fill (v20)
 
@@ -2738,6 +2751,7 @@ the property) silently ignore the call — graceful degradation.
 | 23 | 2026-10-10 | David Fattal | **Display hotplug** (ADR-047 Amendment 8): added `XrEventDataDisplaysChangedDXR` (`1004999218`), queued to every running session once per display-list change (a display plugged in or removed, re-claimed by another display processor, or moved), after the runtime applied it. The runtime now keeps the per-monitor claims live: a 3D panel plugged in while an app runs is woven by its own display processor within about a second (two seconds when its vendor service must authenticate it first), with no session restart. Additive: an app that ignores the event is unaffected. |
 | 24 | 2026-11-03 | David Fattal | **Stable per-display key**: added `XrDisplayStableKeyDXR` (`1004999219`), chained on `XrDisplayDXR::next`, a key to persist per-panel data under. Append-only: `XrDisplayDXR` is unchanged. |
 | 25 | 2026-11-03 | David Fattal | **Fixed-viewer locates**: added `XrViewLocateFixedViewerDXR` (`1004999450`, the first value of display_info's second decade — 210–219 is full, and 430–449 went to `XR_DXR_app_share` / `XR_DXR_stereo_comfort`), chained on `XrViewLocateInfo` at `xrLocateViews`. A locate that sets `fixedViewer` is framed for the nominal viewer and posts no viewer-tracking demand, so a viewer-tracking provider (a webcam tracker) is not started for viewer-independent content such as video. Per call; also carried to the service for IPC clients. Additive: new chained input struct only. |
+| 26 | 2026-11-15 | David Fattal | **A hidden window does not hold the lens** (ADR-062 D1): added `XR_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN_DXR` (`7`) to `XrDisplayModeDenialReasonDXR`. The runtime drops the lens wish of a session whose window is hidden, without a hardware state event; a 3D request made while hidden is recorded, answered with the new reason, and applied when the window is seen again. **Enumerant only** — no struct, wire or ABI change. |
 
 > The `XR_DXR_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do

@@ -835,7 +835,9 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 
 	const cJSON *cl = cJSON_GetArrayItem(cJSON_GetObjectItem(d.root, "clients"), 0);
 	CHECK(keys(cl) == V{"id", "pid", "class", "name", "flags", "presenter", "lease", "window", "owner_screen",
-	                    "segments", "views", "integrity"});
+	                    "segments", "views", "integrity", "visibility"});
+	// ADR-062: an untracked window has no visibility block.
+	CHECK(cJSON_IsNull(cJSON_GetObjectItem(cl, "visibility")));
 	CHECK(str(cl, "class") == "APP");
 	CHECK(str(cl, "presenter") == "APP_HWND");
 	CHECK(str(cl, "lease") == "slot");
@@ -853,6 +855,36 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 	CHECK(str(cJSON_GetObjectItem(cl, "integrity"), "weave_placement") == "scanout");
 
 	CHECK(keys(cJSON_GetObjectItem(d.root, "workspace")) == V{"enabled", "controller", "screens"});
+}
+
+TEST_CASE("status: a tracked client window reports its visibility (ADR-062)", "[status][json]")
+{
+	auto s = std::make_unique<xrt_status_snapshot>();
+	std::memset(s.get(), 0, sizeof(*s));
+	s->source = XRT_STATUS_SOURCE_SERVICE;
+	s->client_count = 1;
+	xrt_status_client &c = s->clients[0];
+	c.id = 1;
+	c.visibility.tracked = true;
+	c.visibility.hidden = true;
+	std::snprintf(c.visibility.reason, sizeof(c.visibility.reason), "covered");
+	std::snprintf(c.visibility.occluder, sizeof(c.visibility.occluder), "notepad.exe");
+
+	cJSON *root = u_status_snapshot_to_cjson(s.get());
+	REQUIRE(root != nullptr);
+	const cJSON *cl = cJSON_GetArrayItem(cJSON_GetObjectItem(root, "clients"), 0);
+	const cJSON *vi = cJSON_GetObjectItem(cl, "visibility");
+	REQUIRE(cJSON_IsObject(vi));
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(vi, "hidden")));
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(vi, "hidden_everywhere")));
+	CHECK(std::string(cJSON_GetObjectItem(vi, "reason")->valuestring) == "covered");
+	CHECK(std::string(cJSON_GetObjectItem(vi, "occluder")->valuestring) == "notepad.exe");
+	cJSON_Delete(root);
+
+	std::vector<char> text(64 * 1024);
+	u_status_snapshot_format_text(s.get(), text.data(), text.size());
+	CHECK(std::string(text.data()).find("visibility: hidden (covered, covered by notepad.exe) - lens 2D") !=
+	      std::string::npos);
 }
 
 TEST_CASE("status: the workspace block lists the screens it presents on (ADR-052)", "[status][json]")
@@ -1013,6 +1045,11 @@ worst_case()
 		}
 		c.integrity.paint = ~0ull;
 		fill_long(c.integrity.weave_placement, sizeof(c.integrity.weave_placement));
+		c.visibility.tracked = true;
+		c.visibility.hidden = true;
+		c.visibility.hidden_everywhere = true;
+		fill_long(c.visibility.reason, sizeof(c.visibility.reason));
+		fill_long(c.visibility.occluder, sizeof(c.visibility.occluder));
 	}
 	s->warning_count = XRT_STATUS_MAX_WARNINGS;
 	for (uint32_t w = 0; w < XRT_STATUS_MAX_WARNINGS; w++) {

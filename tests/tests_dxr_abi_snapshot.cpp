@@ -176,7 +176,7 @@ static_assert(offsetof(XrAndroidInputEventDXR, eventTimeNs) == 48, "XrAndroidInp
 #endif // defined(__ANDROID__)
 
 // ---- XR_DXR_display_info.h
-static_assert(XR_DXR_display_info_SPEC_VERSION == 25, "XR_DXR_display_info_SPEC_VERSION moved");
+static_assert(XR_DXR_display_info_SPEC_VERSION == 26, "XR_DXR_display_info_SPEC_VERSION moved");
 static_assert(XR_TYPE_DISPLAY_INFO_DXR == (XrStructureType)1004999003, "XR_TYPE_DISPLAY_INFO_DXR renumbered");
 static_assert(XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR == (XrStructureType)1004999210, "XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR renumbered");
 static_assert(XR_TYPE_DISPLAY_DESKTOP_INFO_DXR == (XrStructureType)1004999211, "XR_TYPE_DISPLAY_DESKTOP_INFO_DXR renumbered");

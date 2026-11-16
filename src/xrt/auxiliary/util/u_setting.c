@@ -79,6 +79,15 @@ static const char *const managed_names[] = {
     // since its hybrid acceptance record; =0 is its kill switch, read once per
     // process with the split gate's parser, the DXR_HUB shape.
     "DXR_SPLIT_D3D12_HYBRID_REROUTE",
+    // ADR-062: the window-visibility policy. The lens switch (=0 keeps a
+    // hidden window's lens wish), the extra overlay processes that never
+    // occlude, and tier 2's kill switch (=0 keeps weaving and presenting a
+    // window hidden on every screen). Read once per process through the
+    // settings chain, in the app and in the service alike, so the Dashboard
+    // can turn them off for apps it never launched.
+    "DXR_LENS_VISIBILITY",
+    "DXR_LENS_OVERLAY_PROCESSES",
+    "DXR_HIDDEN_SKIP_PRESENT",
 };
 
 #define MANAGED_COUNT ((uint32_t)(sizeof(managed_names) / sizeof(managed_names[0])))

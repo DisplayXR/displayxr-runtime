@@ -512,6 +512,21 @@ struct xrt_status_integrity
 };
 
 /*!
+ * A client window's visibility as the runtime judges it (ADR-062 D1): what
+ * drives the lens wish (tier 1) and the skipped weave (tier 2).
+ */
+struct xrt_status_visibility
+{
+	bool tracked;           //!< the runtime tracks this client's window (false: the rest is empty)
+	bool hidden;            //!< hidden on its 3D screen: the lens wish is 2D
+	bool hidden_everywhere; //!< hidden on every screen: weave and present are skipped
+	//! Why, lower-case: "visible", "partly-covered", "covered", "minimized",
+	//! "cloaked", "not-visible", "not-shown", "locked", "display-off", ...
+	char reason[24];
+	char occluder[64]; //!< process owning the largest occluder when covered ("" = none)
+};
+
+/*!
  * One IPC client (phase 2; empty headless).
  */
 struct xrt_status_client
@@ -529,6 +544,7 @@ struct xrt_status_client
 	struct xrt_status_segments segments;   //!< Segment table.
 	struct xrt_status_views views;         //!< View-set counts.
 	struct xrt_status_integrity integrity; //!< Integrity triple + weave placement.
+	struct xrt_status_visibility visibility; //!< ADR-062: window visibility (not tracked: empty).
 };
 
 //! Runtime identity block.

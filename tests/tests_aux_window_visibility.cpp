@@ -10,6 +10,7 @@
 
 #include "util/u_window_visibility.h"
 
+#include <string>
 #include <vector>
 
 namespace {
@@ -122,8 +123,19 @@ TEST_CASE("occluders: the rules that remove false positives")
 
 	f = opaque_window("TaskSwitcherWnd", "explorer.exe");
 	CHECK(u_wv_classify_occluder(&f, nullptr) == U_WV_SKIP_OVERLAY_CLASS);
+	// ADR-062 D1: the taskbar occludes unless it auto-hides.
 	f = opaque_window("Shell_TrayWnd", "explorer.exe");
+	CHECK(u_wv_classify_occluder(&f, nullptr) == U_WV_OCCLUDES);
+	f.taskbar_auto_hide = true;
 	CHECK(u_wv_classify_occluder(&f, nullptr) == U_WV_SKIP_OVERLAY_CLASS);
+	f = opaque_window("Shell_SecondaryTrayWnd", "explorer.exe");
+	CHECK(u_wv_classify_occluder(&f, nullptr) == U_WV_OCCLUDES);
+	f.taskbar_auto_hide = true;
+	CHECK(u_wv_classify_occluder(&f, nullptr) == U_WV_SKIP_OVERLAY_CLASS);
+	// Auto-hide changes nothing for any other window.
+	f = opaque_window();
+	f.taskbar_auto_hide = true;
+	CHECK(u_wv_classify_occluder(&f, nullptr) == U_WV_OCCLUDES);
 
 	f = opaque_window("SomeOverlayClass", "presentmon.EXE");
 	CHECK(u_wv_classify_occluder(&f, nullptr) == U_WV_SKIP_OVERLAY_PROCESS);
@@ -211,9 +223,159 @@ TEST_CASE("screens: a union of occluders hides one screen's part, a sliver keeps
 	// Two windows that together cover x in [1000, 1400) and leave the left part.
 	const std::vector<u_wv_rect> two = {R(1000, 0, 1200, 1000), R(1200, 0, 1400, 1000)};
 	CHECK(u_wv_part_state(&client, &right_screen, two.data(), two.size()) == U_WV_PART_HIDDEN);
-	// One pixel column left open on the right screen keeps it visible.
+	// ADR-062 D1: a one-pixel column left open is a sliver: still hidden...
 	const std::vector<u_wv_rect> gap = {R(1000, 0, 1200, 1000), R(1201, 0, 1400, 1000)};
-	CHECK(u_wv_part_state(&client, &right_screen, gap.data(), gap.size()) == U_WV_PART_VISIBLE);
+	CHECK(u_wv_part_state(&client, &right_screen, gap.data(), gap.size()) == U_WV_PART_HIDDEN);
+	// ...a 100-px strip (25% of the part) keeps it visible.
+	const std::vector<u_wv_rect> strip = {R(1000, 0, 1200, 1000), R(1300, 0, 1400, 1000)};
+	CHECK(u_wv_part_state(&client, &right_screen, strip.data(), strip.size()) == U_WV_PART_VISIBLE);
+}
+
+TEST_CASE("area: the uncovered remainder is measured exactly")
+{
+	uint64_t a = 0;
+	const u_wv_rect t = R(0, 0, 100, 100);
+	CHECK(u_wv_rect_uncovered_area(&t, nullptr, 0, &a));
+	CHECK(a == 10000);
+	const std::vector<u_wv_rect> half = {R(0, 0, 50, 100)};
+	CHECK(u_wv_rect_uncovered_area(&t, half.data(), half.size(), &a));
+	CHECK(a == 5000);
+	// Overlapping occluders are not double-counted.
+	const std::vector<u_wv_rect> two = {R(0, 0, 60, 100), R(40, 0, 100, 90)};
+	CHECK(u_wv_rect_uncovered_area(&t, two.data(), two.size(), &a));
+	CHECK(a == 400); // x in [60,100) by y in [90,100)
+	const u_wv_rect empty = R(5, 5, 5, 5);
+	CHECK(u_wv_rect_uncovered_area(&empty, nullptr, 0, &a));
+	CHECK(a == 0);
+}
+
+TEST_CASE("threshold: 2% of the area or a 4096 px floor, never more than the part")
+{
+	// Big window: 2% wins.
+	CHECK(u_wv_min_visible_area(1920ull * 1080ull) == 1920ull * 1080ull * 20 / 1000);
+	// Small window: the floor wins.
+	CHECK(u_wv_min_visible_area(200ull * 100ull) == 4096);
+	// Tiny window: the part itself, so an uncovered tiny window stays visible.
+	CHECK(u_wv_min_visible_area(30ull * 30ull) == 900);
+	CHECK(u_wv_min_visible_area(0) == 0);
+}
+
+TEST_CASE("threshold: a sliver behind an edge does not hold the window visible")
+{
+	const u_wv_rect win = R(0, 0, 1920, 1080);
+	// Covered but for a 10-px band at the bottom (0.9%): hidden.
+	const std::vector<u_wv_rect> sliver = {R(-10, -10, 2000, 1070)};
+	CHECK(u_wv_rect_mostly_covered(&win, sliver.data(), sliver.size()));
+	// Covered but for a 40-px band (3.7%): visible.
+	const std::vector<u_wv_rect> band = {R(-10, -10, 2000, 1040)};
+	CHECK_FALSE(u_wv_rect_mostly_covered(&win, band.data(), band.size()));
+	// Nothing over it: visible. Empty target: never hidden.
+	CHECK_FALSE(u_wv_rect_mostly_covered(&win, nullptr, 0));
+	const u_wv_rect empty = R(0, 0, 0, 0);
+	CHECK_FALSE(u_wv_rect_mostly_covered(&empty, sliver.data(), sliver.size()));
+	// An uncovered tiny window is visible, a fully covered one hidden.
+	const u_wv_rect tiny = R(0, 0, 20, 20);
+	CHECK_FALSE(u_wv_rect_mostly_covered(&tiny, nullptr, 0));
+	const std::vector<u_wv_rect> all = {R(-1, -1, 21, 21)};
+	CHECK(u_wv_rect_mostly_covered(&tiny, all.data(), all.size()));
+}
+
+TEST_CASE("reason: a window never shown is NOT_SHOWN, never hidden")
+{
+	u_wv_window_state s{};
+	s.exists = true;
+	// Startup: created hidden, the app renders, then ShowWindow.
+	CHECK(u_wv_window_reason(&s) == U_WV_REASON_NOT_SHOWN);
+	CHECK_FALSE(u_wv_reason_is_hidden(U_WV_REASON_NOT_SHOWN));
+	s.minimized = true; // still never shown
+	CHECK(u_wv_window_reason(&s) == U_WV_REASON_NOT_SHOWN);
+	// Shown once, hidden later: hidden at once.
+	s.minimized = false;
+	s.ever_shown = true;
+	CHECK(u_wv_window_reason(&s) == U_WV_REASON_NOT_VISIBLE);
+	CHECK(u_wv_reason_is_immediate(U_WV_REASON_NOT_VISIBLE));
+	s.visible = true;
+	CHECK(u_wv_window_reason(&s) == U_WV_REASON_VISIBLE);
+	s.minimized = true;
+	CHECK(u_wv_window_reason(&s) == U_WV_REASON_MINIMIZED);
+	s.minimized = false;
+	s.cloaked = true;
+	CHECK(u_wv_window_reason(&s) == U_WV_REASON_CLOAKED);
+}
+
+TEST_CASE("reason: lock and display-off hide everything at once, gone hides nothing")
+{
+	u_wv_window_state s{};
+	s.exists = true;
+	s.ever_shown = true;
+	s.visible = true;
+	s.locked = true;
+	CHECK(u_wv_window_reason(&s) == U_WV_REASON_LOCKED);
+	s.locked = false;
+	s.display_off = true;
+	CHECK(u_wv_window_reason(&s) == U_WV_REASON_DISPLAY_OFF);
+	CHECK(u_wv_reason_is_immediate(U_WV_REASON_LOCKED));
+	CHECK(u_wv_reason_is_immediate(U_WV_REASON_DISPLAY_OFF));
+	s.exists = false;
+	CHECK(u_wv_window_reason(&s) == U_WV_REASON_GONE);
+	CHECK_FALSE(u_wv_reason_is_hidden(U_WV_REASON_GONE));
+	// Covered is hidden but waits for the dwell; the visible reasons are not hidden.
+	CHECK(u_wv_reason_is_hidden(U_WV_REASON_COVERED));
+	CHECK_FALSE(u_wv_reason_is_immediate(U_WV_REASON_COVERED));
+	CHECK_FALSE(u_wv_reason_is_hidden(U_WV_REASON_PARTLY_COVERED));
+	CHECK_FALSE(u_wv_reason_is_hidden(U_WV_REASON_OFF_SCREEN));
+	CHECK(std::string(u_wv_reason_str(U_WV_REASON_COVERED)) == "covered");
+	CHECK(std::string(u_wv_reason_str(U_WV_REASON_NOT_SHOWN)) == "not-shown");
+}
+
+TEST_CASE("dwell: covered waits 1.5 s, minimize and lock are immediate")
+{
+	const uint64_t dwell = U_WINDOW_VISIBILITY_HIDE_DWELL_NS;
+	CHECK(dwell == 1500 * MS);
+	u_wv_debounce d{};
+	CHECK_FALSE(u_wv_debounce_step(&d, true, false, false, 0, dwell));
+	CHECK(u_wv_debounce_deadline(&d, dwell) == dwell);
+	CHECK_FALSE(u_wv_debounce_step(&d, true, false, false, 1499 * MS, dwell));
+	CHECK(u_wv_debounce_step(&d, true, false, false, 1500 * MS, dwell));
+	CHECK(u_wv_debounce_deadline(&d, dwell) == 0);
+	CHECK_FALSE(u_wv_debounce_step(&d, false, false, false, 1600 * MS, dwell));
+
+	u_wv_debounce m{};
+	CHECK(u_wv_debounce_step(&m, true, true, false, 5 * MS, dwell));
+	// Visible again is immediate too.
+	CHECK_FALSE(u_wv_debounce_step(&m, false, false, false, 6 * MS, dwell));
+	// A covered run that turns into a minimize hides at once.
+	CHECK_FALSE(u_wv_debounce_step(&m, true, false, false, 10 * MS, dwell));
+	CHECK(u_wv_debounce_step(&m, true, true, false, 20 * MS, dwell));
+}
+
+TEST_CASE("dwell: no covered transition while a window is being moved or sized")
+{
+	const uint64_t dwell = U_WINDOW_VISIBILITY_HIDE_DWELL_NS;
+	u_wv_debounce d{};
+	// A window dragged across the 3D window for 3 s never hides it...
+	for (uint64_t t = 0; t <= 3000; t += 100) {
+		CHECK_FALSE(u_wv_debounce_step(&d, true, false, true, t * MS, dwell));
+	}
+	// ...and the dwell starts when the drag ends.
+	CHECK_FALSE(u_wv_debounce_step(&d, true, false, false, 3100 * MS, dwell));
+	CHECK_FALSE(u_wv_debounce_step(&d, true, false, false, 4499 * MS, dwell));
+	CHECK(u_wv_debounce_step(&d, true, false, false, 4500 * MS, dwell));
+	// Once hidden, a drag does not un-hide it.
+	CHECK(u_wv_debounce_step(&d, true, false, true, 4600 * MS, dwell));
+	// A minimize during a drag still hides at once.
+	u_wv_debounce m{};
+	CHECK(u_wv_debounce_step(&m, true, true, true, 0, dwell));
+}
+
+TEST_CASE("tracker: the tier-2 and state readers are NULL-safe")
+{
+	CHECK_FALSE(u_window_visibility_hidden_everywhere(nullptr));
+	u_window_visibility_state st{};
+	st.tracked = true;
+	u_window_visibility_get_state(nullptr, &st);
+	CHECK_FALSE(st.tracked);
+	CHECK_FALSE(st.hidden);
 }
 
 TEST_CASE("tracker: the per-screen API is NULL-safe")

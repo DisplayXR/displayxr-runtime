@@ -13512,21 +13512,40 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		comp_hub_d3d11_set_predicted_display_time(c->split, c->layer_accum.data.display_time_ns > 0
 		                                                        ? (uint64_t)c->layer_accum.data.display_time_ns
 		                                                        : c->last_display_time_ns);
+		/*
+		 * ADR-062 D3 (tier 2): hidden on every screen. The atlas was handed to
+		 * the hub (it keeps it); nothing is woven or presented, the hub paces
+		 * this frame on the panel's grid, and the replay stays armed so the
+		 * hub's first repaint after the window is seen again re-weaves it. A
+		 * pending capture is answered from the atlas by the frame path's own
+		 * post-compose dispatch.
+		 */
+		const bool t2_skip = comp_hub_d3d11_hidden_skip(c->split, /*pace=*/true);
+		if (t2_skip && c->hub_capture.pending && !c->capture_intent.pending) {
+			// Handed to the hub for this frame: nothing is woven, so the
+			// frame path's own post-compose atlas capture answers it.
+			c->capture_intent = c->hub_capture;
+			c->hub_capture.pending = false;
+		}
+		if (t2_skip && c->capture_intent.pending) {
+			U_LOG_W("ADR-062 vk: capture while the window is hidden on every screen - the atlas only (no weave "
+			        "runs while hidden)");
+		}
 		// #2342 P2c: a projection-only intent the native point skipped (zero-copy)
 		// goes to the hub too (one consumer either way); then arm the hub.
-		if (c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY &&
+		if (!t2_skip && c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY &&
 		    !c->hub_capture.pending) {
 			c->hub_capture = c->capture_intent;
 			c->capture_intent.pending = false;
 		}
-		if (c->hub_capture.pending) {
+		if (!t2_skip && c->hub_capture.pending) {
 			char woven[MCP_CAPTURE_PATH_MAX + 16];
 			u_capture_intent_sibling_path(c->hub_capture.path, ".woven", woven, sizeof(woven));
 			comp_hub_d3d11_capture_arm(c->split, c->hub_capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
 			                           c->hub_capture.path, woven);
 		}
-		const bool wove = comp_hub_d3d11_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
-		{
+		const bool wove = !t2_skip && comp_hub_d3d11_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
+		if (!t2_skip) {
 			bool cap_ok = false;
 			if (comp_hub_d3d11_capture_take(c->split, &cap_ok) && c->hub_capture.pending) {
 				u_capture_intent_complete(&c->hub_capture, &c->mcp_capture, cap_ok);
@@ -13552,7 +13571,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		 * cleared one every time. The repaint stays disarmed for that frame so
 		 * the replay tick cannot pick up a slot the app frame just refused.
 		 */
-		c->repaint.armed = wove;
+		c->repaint.armed = wove || t2_skip;
 		if (wove) {
 			{
 				// #902: the app's own interval, for placing the repaint at
@@ -17853,6 +17872,17 @@ vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d)
 	c->hw3d_request_value = enable_3d;
 	U_LOG_W("HW3D_DBG vk_native: no display processor yet — deferring enable_3d=%d", (int)enable_3d);
 	return true;
+}
+
+bool
+comp_vk_native_compositor_window_hidden(struct xrt_compositor *xc)
+{
+#ifdef XRT_OS_WINDOWS
+	return xc != NULL && u_window_visibility_hidden(vk_comp(xc)->visibility);
+#else
+	(void)xc;
+	return false;
+#endif
 }
 
 bool
