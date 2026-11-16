@@ -13,7 +13,9 @@
  * desktop-position query (#715), which also moves view sizing off the
  * legacy-compromise path, and for the display rendering-mode keys every
  * DisplayXR app has: V cycles to the next mode, 0-8 select mode N (0 = 2D),
- * via xrRequestDisplayRenderingModeDXR. The app is stereo (at most 2 views
+ * via xrRequestDisplayRenderingModeDXR, and T toggles the eye-tracking
+ * preference MANAGED <-> MANUAL (xrRequestEyeTrackingModeDXR), as the Windows
+ * cube apps do. The app is stereo (at most 2 views
  * rendered); tile size and grid follow the ACTIVE mode, so 2D renders one
  * full-window view and the second located view aliases it (ADR-041).
  *
@@ -167,11 +169,15 @@ static bool g_windowRunning = true;
 // input_handler (cycleRenderingModeRequested / absoluteRenderingModeRequested).
 static bool g_cycleRenderingModeRequested = false;       // V
 static int32_t g_absoluteRenderingModeRequested = -1;    // 0-8; -1 = none
+// T: toggle the session's eye-tracking preference MANAGED <-> MANUAL
+// (xrRequestEyeTrackingModeDXR), the same key as the Windows cube apps.
+static bool g_eyeTrackingModeToggleRequested = false;
 
 /*!
  * Key handler, fed by pump_events() so it sees keysyms: DxrKey has no 0 or 4-8.
  *
- * Both backends: V cycles to the next display rendering mode, 0-8 select mode
+ * Both backends: T toggles the eye-tracking preference MANAGED <-> MANUAL.
+ * V cycles to the next display rendering mode, 0-8 select mode
  * N (0 = 2D) when N is below the runtime's mode count (checked in the frame
  * loop). Auto-repeat presses are ignored, so holding V does not spin modes.
  *
@@ -187,6 +193,10 @@ static void OnWindowEvent(const DxrWindowEvent& ev) {
     case XK_v:
     case XK_V:
         g_cycleRenderingModeRequested = true;
+        return;
+    case XK_t:
+    case XK_T:
+        g_eyeTrackingModeToggleRequested = true;
         return;
     case XK_0: case XK_1: case XK_2: case XK_3: case XK_4:
     case XK_5: case XK_6: case XK_7: case XK_8:
@@ -2027,6 +2037,11 @@ struct AppXrSession {
     // XrEventDataRenderingModeChangedDXR — the app never assumes its request
     // landed.
     PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingMode = nullptr;
+    // T key: MANAGED <-> MANUAL. Null when the runtime has no display_info or
+    // the function. The app's own preference is tracked here; isTracking is
+    // logged from XrEventDataEyeTrackingStateChangedDXR.
+    PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingMode = nullptr;
+    XrEyeTrackingModeDXR eyeTrackingMode = XR_EYE_TRACKING_MODE_MANAGED_DXR;
     PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModes = nullptr;
     static constexpr uint32_t kMaxModes = 9; // keys 0-8
     uint32_t renderingModeCount = 0;
@@ -2229,6 +2244,8 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
                               (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingMode);
         xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
                               (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModes);
+        xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
+                              (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingMode);
     }
 
     XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
@@ -2569,6 +2586,32 @@ static void ProcessRenderingModeKeys(AppXrSession& xr) {
              cycle && absolute < 0 ? "V" : "digit", XR_SUCCEEDED(r) ? "ok" : "FAILED");
 }
 
+/*!
+ * T: flip the session's eye-tracking preference MANAGED <-> MANUAL on the
+ * frame-loop thread. The runtime answers XR_ERROR_FEATURE_UNSUPPORTED when the
+ * display processor does not offer MANUAL; the preference only moves on success.
+ */
+static void ProcessEyeTrackingModeKey(AppXrSession& xr) {
+    if (!g_eyeTrackingModeToggleRequested) {
+        return;
+    }
+    g_eyeTrackingModeToggleRequested = false;
+    if (xr.pfnRequestEyeTrackingMode == nullptr || xr.session == XR_NULL_HANDLE) {
+        LOG_INFO("Eye tracking mode key ignored: xrRequestEyeTrackingModeDXR unavailable");
+        return;
+    }
+    const XrEyeTrackingModeDXR want = xr.eyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR
+                                          ? XR_EYE_TRACKING_MODE_MANUAL_DXR
+                                          : XR_EYE_TRACKING_MODE_MANAGED_DXR;
+    const XrResult r = xr.pfnRequestEyeTrackingMode(xr.session, want);
+    if (XR_SUCCEEDED(r)) {
+        xr.eyeTrackingMode = want;
+    }
+    LOG_INFO("Eye tracking mode request (T) -> %s: %s (%d)",
+             want == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
+             XR_SUCCEEDED(r) ? "ok" : "FAILED", (int)r);
+}
+
 static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex)
 {
@@ -2782,6 +2825,16 @@ static bool PollEvents(AppXrSession& xr) {
             const XrDisplayRenderingModeInfoDXR* m = ActiveRenderingMode(xr);
             LOG_INFO("Rendering mode changed: %u -> %u (%s)", modeEvent->previousModeIndex,
                      modeEvent->currentModeIndex, m ? m->modeName : "?");
+            break;
+        }
+        case XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
+            auto* et = (XrEventDataEyeTrackingStateChangedDXR*)&event;
+            const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count();
+            LOG_INFO("Eye tracking state: isTracking=%s mode=%s (t=%lld ms)",
+                     et->isTracking ? "true" : "false",
+                     et->activeMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED", ms);
             break;
         }
         case XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR:
@@ -3312,6 +3365,7 @@ int main(int argc, char** argv) {
         }
         // V / 0-8 → xrRequestDisplayRenderingModeDXR, from the frame loop.
         ProcessRenderingModeKeys(xr);
+        ProcessEyeTrackingModeKey(xr);
 
         // TEST HOOK (DXR_CUBE_TEST_RESIZE, off by default): declare a different
         // surface size once, so the runtime's Wayland resize-follow can be
