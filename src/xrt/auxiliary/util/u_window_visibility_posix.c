@@ -42,6 +42,17 @@
 //! Floor between two checks, whatever wakes the thread.
 #define WV_MIN_INTERVAL_MS 50
 
+/*
+ * The POSIX cadence. Windows dropped to one 500 ms safety poll (#2680) because
+ * its window events do the fast work; the macOS backend has no event fd and
+ * polls, so these keep restore detection at the speed the hardware runs were
+ * judged at.
+ */
+//! Longest gap between checks while the window is visible.
+#define U_WINDOW_VISIBILITY_PERIOD_VISIBLE_MS 200u
+//! Longest gap between checks while it is hidden or going hidden.
+#define U_WINDOW_VISIBILITY_PERIOD_HIDDEN_MS 100u
+
 struct u_window_visibility
 {
 	char who[64];
