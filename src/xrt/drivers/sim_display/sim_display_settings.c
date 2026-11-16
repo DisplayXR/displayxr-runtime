@@ -72,6 +72,10 @@ static const struct knob g_knobs[] = {
      "FAKE_LENS"},
     {{"WEAVE_SCOPE", XRT_COMPONENT_SETTING_TYPE_ENUM, "canvas", "weave scope the DP declares: canvas, region, scanout"},
      "WEAVE_SCOPE"},
+    {{"STEREO_LAYOUT", XRT_COMPONENT_SETTING_TYPE_INT, "-1",
+      "stereo_layout number the Vulkan DP claims instead of its output mode's own (3 = full side by side); -1 = the "
+      "mode's own"},
+     "STEREO_LAYOUT"},
     // Zones (ADR-027).
     {{"ZONE_GRID", XRT_COMPONENT_SETTING_TYPE_STRING, "1x1", "lens cell grid WxH (1..16 cells) for zone tests"},
      "ZONE_GRID"},

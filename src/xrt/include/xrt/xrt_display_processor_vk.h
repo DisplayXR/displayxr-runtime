@@ -1335,6 +1335,39 @@ xrt_display_processor_vk_tolerates_resample(struct xrt_display_processor_vk *xdp
 }
 
 /*!
+ * The DP's output layout in its current mode, for a stereo desktop compositor
+ * (@ref xrt_dp_scanout_caps::stereo_layout, read through
+ * @ref xrt_dp_stereo_layout_clamp). Every "didn't answer" case, and every value
+ * the runtime does not know, is @ref XRT_DP_STEREO_LAYOUT_WEAVE: an ordinary
+ * weave, presented and shown exactly as before the field existed.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline enum xrt_dp_stereo_layout
+xrt_display_processor_vk_stereo_layout(struct xrt_display_processor_vk *xdp)
+{
+	struct xrt_dp_scanout_caps caps;
+	xrt_dp_scanout_caps_init(&caps);
+	if (!xrt_display_processor_vk_get_scanout_caps(xdp, &caps)) {
+		return XRT_DP_STEREO_LAYOUT_WEAVE;
+	}
+	return xrt_dp_stereo_layout_clamp(caps.stereo_layout);
+}
+
+/*!
+ * Is the DP's output, in its current mode, full side by side for a stereo
+ * desktop compositor: @ref xrt_display_processor_vk_stereo_layout is
+ * @ref XRT_DP_STEREO_LAYOUT_SIDE_BY_SIDE_FULL (HDMI 1.4b 3D_Structure 3)?
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_outputs_full_sbs(struct xrt_display_processor_vk *xdp)
+{
+	return xrt_display_processor_vk_stereo_layout(xdp) == XRT_DP_STEREO_LAYOUT_SIDE_BY_SIDE_FULL;
+}
+
+/*!
  * @copydoc xrt_display_processor_vk::get_background_preview
  *
  * Returns false when the slot is absent (older plug-in `struct_size`), NULL,

@@ -41,6 +41,8 @@ struct xrt_eye_positions;
  * - "anaglyph" (default): red-cyan anaglyph stereoscopy
  * - "blend": 50/50 alpha blend of both views
  * - "interlaced": 1-pixel column interlace (phase-sensitive weave proxy, #817)
+ * - "sbs_full": both views side by side, each at full window resolution, for a
+ *   stereo desktop compositor (declared to it as full side by side)
  *
  * Always available as fallback. Use FORCE_SIM_DISPLAY=1 to override vendor drivers.
  */
@@ -80,6 +82,20 @@ enum sim_display_output_mode
 	 * show that geometry is wrong but never that a vendor weave is right.
 	 */
 	SIM_DISPLAY_OUTPUT_INTERLACED = 6,
+	/*!
+	 * Full side by side for a stereo desktop compositor: the two views, each
+	 * rendered at the window's full resolution (view scale 1.0 x 1.0), placed
+	 * side by side, left first, as they are — no crop, no squeeze. The DP
+	 * reports @ref XRT_DP_STEREO_LAYOUT_SIDE_BY_SIDE_FULL for this mode, so the
+	 * runtime presents a target twice the window's width and declares the
+	 * window as holding both views; the compositor shows each view to its eye
+	 * and resizes it once. Without a declaring compositor the target stays the
+	 * window's size and the two views show side by side, flat.
+	 *
+	 * Drawn with the squeezed-SBS pipeline (each tile into its half of the
+	 * target): with the target twice the window's width that is a 1:1 copy.
+	 */
+	SIM_DISPLAY_OUTPUT_FULL_SBS = 7,
 };
 
 /*!

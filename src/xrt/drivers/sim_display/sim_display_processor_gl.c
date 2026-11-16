@@ -345,6 +345,7 @@ sim_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 	if (tile_columns * tile_rows <= 1) {
 		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
 	}
+	mode = sim_display_pipeline_mode(mode);
 	GLuint active_program = sdp->programs[mode];
 	if (sim_zone_substitute_position_preserving(mode, sdp->zone_active, "GL")) {
 		active_program = sdp->programs[SIM_DISPLAY_OUTPUT_ANAGLYPH];
@@ -839,6 +840,7 @@ sim_display_processor_gl_create_bound(enum sim_display_output_mode mode,
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" :
 	        mode == SIM_DISPLAY_OUTPUT_INTERLACED     ? "Interlaced" :
+	        mode == SIM_DISPLAY_OUTPUT_FULL_SBS       ? "Full SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH    ? "Passthrough" : "Blend");
 
 	*out_xdp = &sdp->base;

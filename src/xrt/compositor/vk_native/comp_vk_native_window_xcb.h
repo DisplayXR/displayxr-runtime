@@ -222,11 +222,53 @@ comp_vk_native_window_xcb_get_handle(struct comp_vk_native_window_xcb *win,
 /*!
  * Get the current window size in pixels (live, tracks resize via the last
  * ConfigureNotify; falls back to the created size).
+ *
+ * While the window is declared full side by side and the window manager holds
+ * it at both views' width (comp_vk_native_window_xcb_full_sbs_doubled), this is
+ * the size of one view: the window's place on screen, and the size each view is
+ * rendered at. The X window, and so the swapchain, is twice as wide.
  */
 void
 comp_vk_native_window_xcb_get_dimensions(struct comp_vk_native_window_xcb *win,
                                          uint32_t *out_width,
                                          uint32_t *out_height);
+
+/*!
+ * The version of the stereo declaration the window manager announces on the
+ * root window (`_KDE_NET_WM_STEREO_CONTENT_SUPPORTED`, CARDINAL/32; Stereo
+ * KWin), 0 when it announces none. Read from the X server on every call.
+ */
+uint32_t
+comp_vk_native_window_xcb_stereo_supported(struct comp_vk_native_window_xcb *win);
+
+/*!
+ * Why the window cannot be declared full side by side, or NULL when it can: a
+ * top-level window (not adopt-own-window's child, #2322) on a window manager
+ * announcing version 3 or later of the stereo declaration, which makes a
+ * declared window hold both views (twice its width) while placing it one view
+ * wide. @p out_supported receives the announced version (0: none).
+ */
+const char *
+comp_vk_native_window_xcb_full_sbs_refusal(struct comp_vk_native_window_xcb *win, uint32_t *out_supported);
+
+/*!
+ * Declare the window full side by side, left view first, to a stereo window
+ * manager (`_KDE_NET_WM_STEREO_CONTENT` = 3 on the window, CARDINAL/32), or
+ * remove the declaration. The window manager then makes the X window twice its
+ * place on screen, possibly seconds later; until
+ * comp_vk_native_window_xcb_full_sbs_doubled says so, the window keeps its own
+ * size. Check comp_vk_native_window_xcb_full_sbs_refusal first.
+ */
+void
+comp_vk_native_window_xcb_set_full_sbs(struct comp_vk_native_window_xcb *win, bool declare);
+
+/*!
+ * Whether the window is declared full side by side and the window manager now
+ * holds it at both views' width: the X window is two views wide, its place on
+ * screen one view. Updated by the event pump.
+ */
+bool
+comp_vk_native_window_xcb_full_sbs_doubled(struct comp_vk_native_window_xcb *win);
 
 /*!
  * Get the window's top-left position in root-window (screen) pixels, top-down.

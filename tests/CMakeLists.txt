@@ -32,6 +32,7 @@ set(tests
     tests_dp_weave_scope
     tests_dp_windowless_d3d11
     tests_dp_vk_snap_window_rect
+    tests_dp_full_sbs
     tests_weave_snap_grid
     tests_lift_mailbox
     tests_sim_conversion
@@ -101,6 +102,7 @@ set(tests
     tests_aux_window_replug
     tests_aux_wayland_geom
     tests_comp_wl_move_sync_tag
+    tests_comp_xcb_full_sbs
     tests_comp_vk_async_handoff
     tests_aux_weave_span2d
     tests_aux_weave_present_origin
@@ -133,6 +135,7 @@ set(tests
     tests_u_sd_notify
     tests_u_eye_history
     tests_sim_eyes
+    tests_sim_display_modes
     tests_dp_eye_positions_at
     tests_dp_snap_window_rect
     tests_dp_atlas_encoding_query
@@ -1458,6 +1461,9 @@ target_include_directories(tests_comp_grid_rate_cap PRIVATE ${PROJECT_SOURCE_DIR
 target_include_directories(tests_comp_grid_pace_mode PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #1748 -- the move-sync tag encode is a header-only function in vk_native.
 target_include_directories(tests_comp_wl_move_sync_tag PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# The runtime's own X11 window declared full side by side follows the window
+# manager's doubling. Header-only.
+target_include_directories(tests_comp_xcb_full_sbs PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #2356 -- which frames may take the non-blocking hand-off. Header-only.
 target_include_directories(tests_comp_vk_async_handoff PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # ADR-027 tier-1 dispatch (#1331). Header-only pure logic -- no compositor
@@ -2174,6 +2180,12 @@ target_link_libraries(tests_sim_tracking_webcam PRIVATE aux_os aux_os_uvc xrt-in
 target_sources(tests_sim_eyes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_eyes.c)
 target_include_directories(tests_sim_eyes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
 target_link_libraries(tests_sim_eyes PRIVATE xrt-interfaces)
+
+# ADR-010: sim_display's rendering-mode table and the worst-case atlas it gives,
+# pinned host-side (the table compiles into the plug-in).
+target_sources(tests_sim_display_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_modes.c)
+target_include_directories(tests_sim_display_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
+target_link_libraries(tests_sim_display_modes PRIVATE xrt-interfaces)
 
 # ADR-043: the sim_display FAKE stereo camera's scene is pinned host-side next to
 # the ring / conversion / disparity-probe tests (it compiles into the plug-in).

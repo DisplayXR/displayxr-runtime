@@ -8,6 +8,7 @@
  */
 
 #include "comp_vk_native_window_xcb.h"
+#include "comp_vk_native_xcb_full_sbs.h"
 
 #include "util/u_debug.h"
 #include "util/u_misc.h"
@@ -49,9 +50,11 @@ struct comp_vk_native_window_xcb
 	//! mode; XCB_NONE for the opaque root-visual path. Freed on destroy.
 	xcb_colormap_t colormap;
 
-	//! Live size, seeded at create and updated on ConfigureNotify.
-	uint32_t width;
-	uint32_t height;
+	//! Live size (`full_sbs.width`/`height`), seeded at create and updated on
+	//! ConfigureNotify, and whether the window is declared full side by side to
+	//! a stereo window manager that holds it at both views' width
+	//! (comp_vk_native_window_xcb_set_full_sbs).
+	struct comp_vk_native_xcb_full_sbs full_sbs;
 
 	//! Cleared when the user closes the window (WM_DELETE_WINDOW / DestroyNotify).
 	bool valid;
@@ -502,8 +505,8 @@ create_adopted_child(
 {
 	xcb_connection_t *conn = win->connection;
 	win->adopted_parent = parent;
-	win->width = pw;
-	win->height = ph;
+	win->full_sbs.width = pw;
+	win->full_sbs.height = ph;
 	uint32_t vl[2] = {screen->black_pixel, XCB_EVENT_MASK_STRUCTURE_NOTIFY};
 	xcb_create_window(conn, XCB_COPY_FROM_PARENT, win->window, parent, 0, 0, (uint16_t)pw, (uint16_t)ph, 0,
 	                  XCB_WINDOW_CLASS_INPUT_OUTPUT, XCB_COPY_FROM_PARENT, XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK,
@@ -572,8 +575,8 @@ comp_vk_native_window_xcb_create(uint32_t width,
 	struct comp_vk_native_window_xcb *win = U_TYPED_CALLOC(struct comp_vk_native_window_xcb);
 	win->connection = conn;
 	win->root = screen->root;
-	win->width = width;
-	win->height = height;
+	win->full_sbs.width = width;
+	win->full_sbs.height = height;
 	win->valid = true;
 	os_mutex_init(&win->pump_lock);
 
@@ -1016,19 +1019,26 @@ comp_vk_native_window_xcb_pump(struct comp_vk_native_window_xcb *win)
 			if (win->adopted_parent != XCB_NONE && cfg->window == win->adopted_parent) {
 				// Adopted parent changed size — follow it.
 				if (cfg->width > 0 && cfg->height > 0 &&
-				    (cfg->width != win->width || cfg->height != win->height)) {
+				    (cfg->width != win->full_sbs.width || cfg->height != win->full_sbs.height)) {
 					uint32_t dims[2] = {cfg->width, cfg->height};
 					xcb_configure_window(win->connection, win->window,
 					                     XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, dims);
 					xcb_flush(win->connection);
-					win->width = cfg->width;
-					win->height = cfg->height;
+					win->full_sbs.width = cfg->width;
+					win->full_sbs.height = cfg->height;
 				}
 				break;
 			}
-			if (cfg->width > 0 && cfg->height > 0) {
-				win->width = cfg->width;
-				win->height = cfg->height;
+			// Declared full side by side, a synthetic ConfigureNotify (the
+			// response type's top bit) is the window manager's one-view size,
+			// not the X window's (comp_vk_native_xcb_full_sbs.h).
+			if (comp_vk_native_xcb_full_sbs_configure(&win->full_sbs, (event->response_type & 0x80) != 0,
+			                                          cfg->width, cfg->height)) {
+				U_LOG_W(
+				    "XCB: the window manager holds the window at both views' width: the X window is "
+				    "%ux%u, one view %ux%u",
+				    win->full_sbs.width, win->full_sbs.height, win->full_sbs.width / 2u,
+				    win->full_sbs.height);
 			}
 			break;
 		}
@@ -1072,12 +1082,101 @@ comp_vk_native_window_xcb_get_dimensions(struct comp_vk_native_window_xcb *win,
 		return;
 	}
 	comp_vk_native_window_xcb_pump(win);
+	uint32_t w = 0;
+	uint32_t h = 0;
+	os_mutex_lock(&win->pump_lock);
+	comp_vk_native_xcb_full_sbs_view_size(&win->full_sbs, &w, &h);
+	os_mutex_unlock(&win->pump_lock);
 	if (out_width != NULL) {
-		*out_width = win->width;
+		*out_width = w;
 	}
 	if (out_height != NULL) {
-		*out_height = win->height;
+		*out_height = h;
 	}
+}
+
+uint32_t
+comp_vk_native_window_xcb_stereo_supported(struct comp_vk_native_window_xcb *win)
+{
+	if (win == NULL || win->connection == NULL) {
+		return 0;
+	}
+	xcb_atom_t atom = intern_atom(win->connection, "_KDE_NET_WM_STEREO_CONTENT_SUPPORTED");
+	if (atom == XCB_ATOM_NONE) {
+		return 0;
+	}
+	xcb_get_property_reply_t *pr = xcb_get_property_reply(
+	    win->connection, xcb_get_property(win->connection, 0, win->root, atom, XCB_ATOM_CARDINAL, 0, 1), NULL);
+	uint32_t version = 0;
+	if (pr != NULL && pr->format == 32 && xcb_get_property_value_length(pr) >= 4) {
+		version = *(uint32_t *)xcb_get_property_value(pr);
+	}
+	free(pr);
+	return version;
+}
+
+const char *
+comp_vk_native_window_xcb_full_sbs_refusal(struct comp_vk_native_window_xcb *win, uint32_t *out_supported)
+{
+	const uint32_t supported = comp_vk_native_window_xcb_stereo_supported(win);
+	if (out_supported != NULL) {
+		*out_supported = supported;
+	}
+	if (win == NULL || win->connection == NULL) {
+		return "the runtime has no X11 window";
+	}
+	if (win->adopted_parent != XCB_NONE) {
+		return "the runtime's X11 window is a child of the app's own window (#2322), and only top-level "
+		       "windows are declared so far";
+	}
+	if (supported == 0) {
+		return "the window manager announces no stereo declaration (no _KDE_NET_WM_STEREO_CONTENT_SUPPORTED "
+		       "on the root window)";
+	}
+	if (supported < COMP_VK_NATIVE_XCB_FULL_SBS_MIN_SUPPORTED) {
+		return "the window manager's stereo declaration is older than version 3, from which it makes a "
+		       "declared window hold both views";
+	}
+	return NULL;
+}
+
+void
+comp_vk_native_window_xcb_set_full_sbs(struct comp_vk_native_window_xcb *win, bool declare)
+{
+	if (win == NULL || win->connection == NULL) {
+		return;
+	}
+	xcb_atom_t atom = intern_atom(win->connection, "_KDE_NET_WM_STEREO_CONTENT");
+	if (atom == XCB_ATOM_NONE) {
+		return;
+	}
+	os_mutex_lock(&win->pump_lock);
+	if (declare != win->full_sbs.declared) {
+		if (declare) {
+			// One CARDINAL/32 value, written once; the window manager reads it
+			// from PropertyNotify, whenever it gets to it.
+			const uint32_t value = COMP_VK_NATIVE_XCB_STEREO_CONTENT_SBS_FULL;
+			xcb_change_property(win->connection, XCB_PROP_MODE_REPLACE, win->window, atom,
+			                    XCB_ATOM_CARDINAL, 32, 1, &value);
+		} else {
+			xcb_delete_property(win->connection, win->window, atom);
+		}
+		xcb_flush(win->connection);
+		comp_vk_native_xcb_full_sbs_set_declared(&win->full_sbs, declare);
+	}
+	os_mutex_unlock(&win->pump_lock);
+}
+
+bool
+comp_vk_native_window_xcb_full_sbs_doubled(struct comp_vk_native_window_xcb *win)
+{
+	if (win == NULL) {
+		return false;
+	}
+	os_mutex_lock(&win->pump_lock);
+	const bool doubled = win->full_sbs.declared && win->full_sbs.doubled;
+	os_mutex_unlock(&win->pump_lock);
+	return doubled;
 }
 
 bool

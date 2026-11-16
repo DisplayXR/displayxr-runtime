@@ -232,9 +232,25 @@ sim_zone_downsample_map(const uint8_t *pixels,
 		}                                                                                                      \
 		return (*out_pixel_width > 0 && *out_pixel_height > 0);                                                \
 	}
-//! #842: per-variant pipeline/shader table size — one entry per user-selectable
-//! output mode (enum sim_display_output_mode indexes the table directly).
+//! #842: per-variant pipeline/shader table size — one entry per drawn output
+//! mode (enum sim_display_output_mode indexes the table directly, after
+//! @ref sim_display_pipeline_mode).
 #define SIM_DP_PIPELINE_COUNT 7
+
+/*!
+ * The pipeline an output mode draws with, shared by all five variants.
+ * SIM_DISPLAY_OUTPUT_FULL_SBS has no table entry of its own: it places each
+ * tile, as it is, in its half of the target — the squeezed-SBS kernel. The
+ * difference is the target the runtime hands it (twice the window's width when
+ * it declares the window to a stereo compositor), which turns that kernel into
+ * a 1:1 copy of each view. Every variant maps the mode through here BEFORE it
+ * indexes its table.
+ */
+static inline enum sim_display_output_mode
+sim_display_pipeline_mode(enum sim_display_output_mode mode)
+{
+	return mode == SIM_DISPLAY_OUTPUT_FULL_SBS ? SIM_DISPLAY_OUTPUT_SQUEEZED_SBS : mode;
+}
 
 /*!
  * #842 — position-preserving substitution rule, shared by all five variants.

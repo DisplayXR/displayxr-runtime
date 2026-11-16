@@ -14,6 +14,7 @@
 
 #include "sim_display_interface.h"
 #include "sim_display_eyes.h"
+#include "sim_display_modes.h"
 #include "sim_display_settings.h"
 #include "sim_display_monitor_geometry.h"
 
@@ -132,7 +133,8 @@ sim_display_set_output_mode(enum sim_display_output_mode mode)
 		        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 		        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
 		        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" :
-		        mode == SIM_DISPLAY_OUTPUT_INTERLACED     ? "Interlaced" : "Blend");
+		        mode == SIM_DISPLAY_OUTPUT_INTERLACED     ? "Interlaced" :
+		        mode == SIM_DISPLAY_OUTPUT_FULL_SBS       ? "Full SBS" : "Blend");
 	}
 }
 
@@ -544,6 +546,9 @@ sim_display_hmd_set_property(struct xrt_device *xdev,
 		case 5:
 			internal_mode = SIM_DISPLAY_OUTPUT_INTERLACED;
 			break;
+		case 6:
+			internal_mode = SIM_DISPLAY_OUTPUT_FULL_SBS;
+			break;
 		default:
 			return XRT_ERROR_NOT_IMPLEMENTED;
 		}
@@ -573,6 +578,7 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
 		case SIM_DISPLAY_OUTPUT_SQUEEZED_SBS: *out_value = 3; break;
 		case SIM_DISPLAY_OUTPUT_QUAD:         *out_value = 4; break;
 		case SIM_DISPLAY_OUTPUT_INTERLACED:   *out_value = 5; break;
+		case SIM_DISPLAY_OUTPUT_FULL_SBS:     *out_value = 6; break;
 		default:                              *out_value = 0; break;
 		}
 		return XRT_SUCCESS;
@@ -621,10 +627,20 @@ sim_display_hmd_create(void)
 			else if (strcmp(mode_str, "interlaced") == 0 || strcmp(mode_str, "interlace") == 0)
 				// #817: the one phase-sensitive mode — see the enum doc.
 				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_INTERLACED);
-			else
+			else if (strcmp(mode_str, "sbs_full") == 0 || strcmp(mode_str, "full_sbs") == 0) {
+				if (sim_display_full_sbs_available()) {
+					sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_FULL_SBS);
+				} else {
+					U_LOG_W(
+					    "sim_display: SIM_DISPLAY_OUTPUT '%s' is for a stereo desktop "
+					    "compositor and is only offered on desktop Linux — keeping the "
+					    "anaglyph default",
+					    mode_str);
+				}
+			} else
 				U_LOG_W("sim_display: unknown SIM_DISPLAY_OUTPUT '%s' (want "
-				        "2d|anaglyph|sbs|squeezed|quad|blend|interlaced) — keeping the anaglyph "
-				        "default",
+				        "2d|anaglyph|sbs|squeezed|quad|blend|interlaced|sbs_full) — keeping the "
+				        "anaglyph default",
 				        mode_str);
 		}
 	}
@@ -798,73 +814,13 @@ sim_display_hmd_create(void)
 	snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Sim 3D Display");
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "sim_display_0");
 
-	// Rendering modes: sim_display supports 6 modes (2D + 3 stereo + quad + interlaced).
-	// Order: 0=2D, 1=Anaglyph (default 3D), 2=Cropped SBS, 3=Squeezed SBS, 4=Quad,
-	//        5=Interlaced (#817 phase-sensitive weave proxy)
-	hmd->base.rendering_mode_count = 6;
-
-	// Mode 0: 2D (mono, full resolution, 1×1 tile)
-	hmd->base.rendering_modes[0].mode_index = 0;
-	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "2D");
-	hmd->base.rendering_modes[0].view_count = 1;
-	hmd->base.rendering_modes[0].view_scale_x = 1.0f;
-	hmd->base.rendering_modes[0].view_scale_y = 1.0f;
-	hmd->base.rendering_modes[0].hardware_display_3d = false;
-	hmd->base.rendering_modes[0].tile_columns = 1;
-	hmd->base.rendering_modes[0].tile_rows = 1;
-
-	// Mode 1: Anaglyph (stereo, default 3D, 2×1 tiles = side-by-side half-res)
-	hmd->base.rendering_modes[1].mode_index = 1;
-	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "Anaglyph");
-	hmd->base.rendering_modes[1].view_count = 2;
-	hmd->base.rendering_modes[1].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[1].view_scale_y = 0.5f;
-	hmd->base.rendering_modes[1].hardware_display_3d = true;
-	hmd->base.rendering_modes[1].tile_columns = 2;
-	hmd->base.rendering_modes[1].tile_rows = 1;
-
-	// Mode 2: Cropped SBS (stereo, 1×2 tiles = top-bottom half-res)
-	hmd->base.rendering_modes[2].mode_index = 2;
-	snprintf(hmd->base.rendering_modes[2].mode_name, XRT_DEVICE_NAME_LEN, "Cropped SBS");
-	hmd->base.rendering_modes[2].view_count = 2;
-	hmd->base.rendering_modes[2].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[2].view_scale_y = 0.5f;
-	hmd->base.rendering_modes[2].hardware_display_3d = true;
-	hmd->base.rendering_modes[2].tile_columns = 1;
-	hmd->base.rendering_modes[2].tile_rows = 2;
-
-	// Mode 3: Squeezed SBS (stereo, 2×1 tiles = side-by-side full-height)
-	hmd->base.rendering_modes[3].mode_index = 3;
-	snprintf(hmd->base.rendering_modes[3].mode_name, XRT_DEVICE_NAME_LEN, "Squeezed SBS");
-	hmd->base.rendering_modes[3].view_count = 2;
-	hmd->base.rendering_modes[3].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[3].view_scale_y = 1.0f;
-	hmd->base.rendering_modes[3].hardware_display_3d = true;
-	hmd->base.rendering_modes[3].tile_columns = 2;
-	hmd->base.rendering_modes[3].tile_rows = 1;
-
-	// Mode 4: Quad (4 views, 2x2 grid, each quadrant at half-res)
-	hmd->base.rendering_modes[4].mode_index = 4;
-	snprintf(hmd->base.rendering_modes[4].mode_name, XRT_DEVICE_NAME_LEN, "Quad");
-	hmd->base.rendering_modes[4].view_count = 4;
-	hmd->base.rendering_modes[4].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[4].view_scale_y = 0.5f;
-	hmd->base.rendering_modes[4].hardware_display_3d = true;
-	hmd->base.rendering_modes[4].tile_columns = 2;
-	hmd->base.rendering_modes[4].tile_rows = 2;
-
-	// #817: Interlaced — same atlas geometry as Anaglyph (2 full-canvas views,
-	// position-preserving), but the DP picks the view per PANEL COLUMN, so the
-	// output is sensitive to the weave target's size and its X origin the way a
-	// real lenticular weave is. See enum sim_display_output_mode.
-	hmd->base.rendering_modes[5].mode_index = 5;
-	snprintf(hmd->base.rendering_modes[5].mode_name, XRT_DEVICE_NAME_LEN, "Interlaced");
-	hmd->base.rendering_modes[5].view_count = 2;
-	hmd->base.rendering_modes[5].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[5].view_scale_y = 0.5f;
-	hmd->base.rendering_modes[5].hardware_display_3d = true;
-	hmd->base.rendering_modes[5].tile_columns = 2;
-	hmd->base.rendering_modes[5].tile_rows = 1;
+	// Rendering modes (sim_display_modes.c): 2D, Anaglyph (default 3D), Cropped SBS,
+	// Squeezed SBS, Quad and Interlaced, plus Full SBS (mode 6) when
+	// SIM_DISPLAY_OUTPUT=sbs_full asks for it on desktop Linux. Full SBS is twice
+	// the panel's width, so registering it widens every app's worst-case
+	// swapchain (ADR-010) on every platform: it is left out unless asked for.
+	hmd->base.rendering_mode_count = sim_display_fill_rendering_modes(
+	    hmd->base.rendering_modes, sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_FULL_SBS);
 
 	// Per-mode tracking capability (#441): sim_display has no real eye
 	// tracker, so every mode stays untracked (mode_flags/reserved are
@@ -901,6 +857,7 @@ sim_display_hmd_create(void)
 		case SIM_DISPLAY_OUTPUT_SQUEEZED_SBS: default_mode = 3; break;
 		case SIM_DISPLAY_OUTPUT_QUAD:         default_mode = 4; break;
 		case SIM_DISPLAY_OUTPUT_INTERLACED:   default_mode = 5; break;
+		case SIM_DISPLAY_OUTPUT_FULL_SBS:     default_mode = 6; break;
 		default:                              default_mode = 0; break;
 		}
 
@@ -910,10 +867,11 @@ sim_display_hmd_create(void)
 		// this mode against every later request (plug-in-wide, any app).
 		int32_t forced = (int32_t)debug_get_num_option_sim_display_force_mode();
 		if (forced >= 0 && (uint32_t)forced < hmd->base.rendering_mode_count) {
-			static const enum sim_display_output_mode idx_to_internal[6] = {
+			static const enum sim_display_output_mode idx_to_internal[7] = {
 			    SIM_DISPLAY_OUTPUT_PASSTHROUGH, SIM_DISPLAY_OUTPUT_ANAGLYPH,
 			    SIM_DISPLAY_OUTPUT_SBS,         SIM_DISPLAY_OUTPUT_SQUEEZED_SBS,
-			    SIM_DISPLAY_OUTPUT_QUAD,        SIM_DISPLAY_OUTPUT_INTERLACED};
+			    SIM_DISPLAY_OUTPUT_QUAD,        SIM_DISPLAY_OUTPUT_INTERLACED,
+			    SIM_DISPLAY_OUTPUT_FULL_SBS};
 			default_mode = (uint32_t)forced;
 			sim_display_set_output_mode(idx_to_internal[default_mode]);
 			U_LOG_W("sim_display: SIM_DISPLAY_FORCE_MODE=%d — pinning active mode "

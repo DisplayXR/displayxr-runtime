@@ -215,6 +215,44 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 				)
 		endif()
 
+		# Full side-by-side declaration (xrt_dp_scanout_caps::stereo_layout = 3):
+		# a display processor whose output is the views side by side has the
+		# app's surface declared to a stereo desktop compositor through KDE's
+		# kde_stereo_content_v1, generated from the vendored XML like
+		# wp_presentation above. Only libwayland-client is linked. Without
+		# wayland-scanner the runtime builds as before and says, when such a DP
+		# asks, that this build cannot declare.
+		if(DXR_WAYLAND_SCANNER)
+			set(_vkst_xml "${PROJECT_SOURCE_DIR}/src/external/wayland-protocols/kde-stereo-content-v1.xml")
+			set(_vkst_gen "${CMAKE_CURRENT_BINARY_DIR}/wayland-protocols")
+			set(_vkst_hdr "${_vkst_gen}/kde-stereo-content-v1-client-protocol.h")
+			set(_vkst_src "${_vkst_gen}/kde-stereo-content-v1-protocol.c")
+			add_custom_command(
+				OUTPUT "${_vkst_hdr}"
+				COMMAND ${CMAKE_COMMAND} -E make_directory "${_vkst_gen}"
+				COMMAND "${DXR_WAYLAND_SCANNER}" client-header "${_vkst_xml}" "${_vkst_hdr}"
+				DEPENDS "${_vkst_xml}"
+				VERBATIM
+				)
+			add_custom_command(
+				OUTPUT "${_vkst_src}"
+				COMMAND ${CMAKE_COMMAND} -E make_directory "${_vkst_gen}"
+				COMMAND "${DXR_WAYLAND_SCANNER}" private-code "${_vkst_xml}" "${_vkst_src}"
+				DEPENDS "${_vkst_xml}"
+				VERBATIM
+				)
+			target_sources(
+				comp_vk_native PRIVATE comp_vk_native_wl_stereo.c comp_vk_native_wl_stereo.h
+						       "${_vkst_hdr}" "${_vkst_src}"
+				)
+			target_include_directories(comp_vk_native PRIVATE "${_vkst_gen}")
+			# Source-local, as DXR_HAVE_WP_PRESENTATION: only the compositor
+			# TU calls the declaration.
+			set_source_files_properties(
+				comp_vk_native_compositor.c PROPERTIES COMPILE_DEFINITIONS DXR_HAVE_WL_STEREO
+				)
+		endif()
+
 		if(XRT_HAVE_DBUS)
 			# Wayland window-geometry provider (#817): Wayland never exposes a
 			# surface's absolute position, so windowed weaving reads it from
