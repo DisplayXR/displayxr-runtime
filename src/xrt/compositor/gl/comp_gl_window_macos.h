@@ -191,6 +191,15 @@ bool
 comp_gl_window_macos_is_valid(struct comp_gl_window_macos *win);
 
 /*!
+ * The view the helper renders into: the app's bound NSView, or the runtime's
+ * own NSOpenGLView. Borrowed (bridged, not retained); NULL if none.
+ *
+ * @param win The window handle.
+ */
+void *
+comp_gl_window_macos_get_view(struct comp_gl_window_macos *win);
+
+/*!
  * Get the main screen's Retina backing scale factor.
  *
  * @return The backing scale factor (2.0 on Retina, 1.0 otherwise).

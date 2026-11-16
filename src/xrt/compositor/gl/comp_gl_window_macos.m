@@ -569,6 +569,13 @@ comp_gl_window_macos_get_screen_position(struct comp_gl_window_macos *win,
 	} // @autoreleasepool
 }
 
+void *
+comp_gl_window_macos_get_view(struct comp_gl_window_macos *win)
+{
+	if (win == NULL) return NULL;
+	return (__bridge void *)win->view;
+}
+
 bool
 comp_gl_window_macos_is_valid(struct comp_gl_window_macos *win)
 {
