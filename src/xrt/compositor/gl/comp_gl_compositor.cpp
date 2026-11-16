@@ -1247,6 +1247,23 @@ struct comp_gl_compositor
 	/*! @} */
 #endif
 
+#ifdef __APPLE__
+	/*!
+	 * #2671 (macOS): the bound or own NSView's window is hidden (minimized,
+	 * on another Space, its app hidden, or fully covered), latched by
+	 * @ref visibility's transition callback under dp_swap_mutex. The GL DP is
+	 * then asked for 2D whatever the session's mode; the frame is still
+	 * woven (no tier 2 here, like Metal).
+	 */
+	bool window_hidden;
+	//! #2671: the session's own last 2D/3D request — what a hidden window's
+	//! return restores. Under dp_swap_mutex.
+	bool session_wants_3d;
+	//! #2671: low-rate visibility tracker for the view (NULL = always visible:
+	//! a shared-IOSurface texture session, whose app presents).
+	struct u_window_visibility *visibility;
+#endif
+
 #ifdef XRT_GL_HUB
 	/*!
 	 * @name #2317 P3: the D3D11 hub (DXR_HUB=1)
@@ -8778,6 +8795,10 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	// (the hub, the DP, dp_swap_mutex). No lock is held here, so the join
 	// cannot wait on one. Freed last: the segment manager and the hub borrow it.
 	u_window_visibility_stop(c->visibility);
+#elif defined(__APPLE__)
+	// #2671: join the tracker before anything its callback touches (the DP,
+	// dp_swap_mutex). It retains its view, so the window teardown below is safe.
+	u_window_visibility_stop(c->visibility);
 #endif
 
 	// #868: stop the repaint loop FIRST — it holds the GL context and touches
@@ -9015,7 +9036,7 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	}
 #endif
 
-#ifdef XRT_OS_WINDOWS
+#if defined(XRT_OS_WINDOWS) || defined(__APPLE__)
 	u_window_visibility_destroy(&c->visibility); // #2671: borrowed by nothing now
 #endif
 	free(c);
@@ -9261,7 +9282,7 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	glBindTexture(GL_TEXTURE_2D, 0);
 
 	c->hardware_display_3d = true;
-#ifdef XRT_OS_WINDOWS
+#if defined(XRT_OS_WINDOWS) || defined(__APPLE__)
 	c->session_wants_3d = true; // #2671: what a hidden window's return restores
 #endif
 
@@ -9564,10 +9585,30 @@ comp_gl_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t
 	return true;
 }
 
+#ifdef __APPLE__
+/*!
+ * #2671 (macOS): the view's visibility changed (the tracker's thread,
+ * transitions only). Hidden: the lens wish is 2D; visible: the session's own
+ * choice comes back, never a forced 3D. Under dp_swap_mutex like the app-thread
+ * request, so the two cannot interleave.
+ */
+static void
+gl_visibility_changed_macos(void *userdata, bool hidden)
+{
+	struct comp_gl_compositor *c = (struct comp_gl_compositor *)userdata;
+	os_mutex_lock(&c->dp_swap_mutex);
+	c->window_hidden = hidden;
+	if (c->display_processor != NULL) {
+		xrt_display_processor_gl_request_display_mode(c->display_processor, c->session_wants_3d && !hidden);
+	}
+	os_mutex_unlock(&c->dp_swap_mutex);
+}
+#endif
+
 bool
 comp_gl_compositor_window_hidden(struct xrt_compositor *xc)
 {
-#ifdef XRT_OS_WINDOWS
+#if defined(XRT_OS_WINDOWS) || defined(__APPLE__)
 	return xc != NULL && u_window_visibility_hidden(gl_comp(xc)->visibility);
 #else
 	(void)xc;
@@ -9578,7 +9619,7 @@ comp_gl_compositor_window_hidden(struct xrt_compositor *xc)
 const struct u_window_visibility *
 comp_gl_compositor_window_visibility(struct xrt_compositor *xc)
 {
-#ifdef XRT_OS_WINDOWS
+#if defined(XRT_OS_WINDOWS) || defined(__APPLE__)
 	return xc != NULL ? gl_comp(xc)->visibility : NULL;
 #else
 	(void)xc;
@@ -9598,7 +9639,7 @@ comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3
 	// Multi-screen M6: the weave may swap the primary DP (ADR-047 Amendment 2).
 	os_mutex_lock(&c->dp_swap_mutex);
 	bool ok = false;
-#ifdef XRT_OS_WINDOWS
+#if defined(XRT_OS_WINDOWS) || defined(__APPLE__)
 	// #2671: recorded on every route, so a hidden window's return restores it.
 	c->session_wants_3d = enable_3d;
 #endif
@@ -9615,6 +9656,10 @@ comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3
 		// it; the weave restores the session's mode when it returns. #2671:
 		// likewise while the window is hidden; the visibility callback restores it.
 		dp_3d = dp_3d && !c->seg_primary_uncovered && !c->window_hidden;
+#elif defined(__APPLE__)
+		// #2671: 2D while the window is hidden; the visibility callback
+		// restores the session's choice when it can be seen again.
+		dp_3d = dp_3d && !c->window_hidden;
 #endif
 		ok = xrt_display_processor_gl_request_display_mode(c->display_processor, dp_3d);
 	}
@@ -10344,6 +10389,17 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	// The hub's segment DPs on other 3D screens follow the window's part there.
 	comp_hub_d3d11_set_visibility(c->hub.split, c->visibility);
 #endif
+#elif defined(__APPLE__)
+	// #2671: the view's visibility drives the lens wish (the app's bound
+	// NSView, or the runtime's own window's view). Last, so the DP exists
+	// before the first transition. Not for a shared-IOSurface texture session:
+	// its app presents, and the runtime shows no window of its own.
+	if (!c->has_shared_iosurface && c->macos_window != NULL) {
+		void *vis_view = comp_gl_window_macos_get_view(c->macos_window);
+		if (vis_view != NULL) {
+			c->visibility = u_window_visibility_create(vis_view, NULL, "gl", gl_visibility_changed_macos, c);
+		}
+	}
 #endif
 
 	*out_xcn = &c->base;
