@@ -308,6 +308,28 @@ Everything below runs on a machine with the runtime installed or built from sour
 4. **Settings.** `displayxr-cli input options <id>` shows every key you declared and where its value comes from.
 5. **Haptics and hot-plug.** `displayxr-cli input haptic-test [seconds]` pulses the hand-role devices and prints every role `generation_id` change — unplug and replug your dongle while it runs to watch the role move to the fallback and back.
 6. **Compare with the reference stylus.** Enable the in-tree `sim_stylus` provider (the runtime installer registers it; on a from-source Windows build run `scripts\register_dev_plugin.bat input stylus` elevated) — opt-in, like `sim_input`: `displayxr-cli input set sim-stylus ENABLE 1` (or `DXR_INPUT_SIM_STYLUS_ENABLE=1` in the hosting process); `displayxr-cli input options sim-stylus` lists its other settings — and run the same checks. It exercises the profile, the dominant-hand type and the glass-registered frame with no hardware. Register yours at a lower ProbeOrder and confirm you win while present and fall back to it when absent.
+
+   **Draw with the mouse (Windows).** `MODE=mouse` turns the desktop mouse into the pen, so you (or an app developer evaluating the stylus profile) can draw on the panel by hand and every app — native, engine, or under a workspace controller — sees a real MX Ink stylus:
+
+   ```bat
+   displayxr-cli input set sim-stylus ENABLE 1
+   displayxr-cli input set sim-stylus MODE mouse
+   ```
+
+   Then start the app and turn **Scroll Lock** on: while it is on, the cursor over the panel's monitor is the pen; off, the pen is gone (`get_presence` ABSENT, the hand role falls back). `GATE=none` makes the mouse the pen all the time. The provider only *reads* the mouse — clicks and keys still reach the window under the cursor as usual.
+
+   | input | pen |
+   |---|---|
+   | cursor over the panel | the tip at that point of the glass |
+   | left button held | tip **on** the glass, tip force ramping 0 → 1 over `RAMP_MS` (300) |
+   | left button up | tip hovering at the hover height (`HOVER_HEIGHT_M`, 0.02) |
+   | PageUp / PageDown | hover height ± 5 mm (Shift: 20 mm), 0 – 150 mm |
+   | right / middle button | cluster front / back click; a second press within the system double-click time = the double tap |
+   | Ctrl or X1 held | middle-cluster force ramping 0 → 1 |
+   | X2 | system click |
+   | Home | toggle docked |
+
+   The barrel leans a fixed `TILT_DEG` (30) from the glass normal, toward the viewer, down and to the holding hand's side. The panel's monitor is picked automatically — the one whose physical size (EDID) and aspect match the display, else aspect alone, else the primary; the choice is logged once (`sim-stylus: mouse: the panel is monitor …`) and `SCREEN` overrides it (an index from that list or a device name such as `DISPLAY2`). With the cursor on another monitor the pen is out of range: untracked, but still present, so the role does not flap. Cursor and monitor geometry are read under a pinned per-monitor-v2 DPI context, so the mapping holds in a DPI-unaware host. Elsewhere than Windows `MODE=mouse` logs one WARN and runs `draw`.
 7. **Prove an app sees *your* device.** `displayxr-cli input emulated off` withholds the keyboard/mouse emulated pair, so with your provider absent the hand roles read *unassigned* rather than the emulated controllers. `input emulated on` restores it. `HKLM\Software\DisplayXR\Input\ForceQwerty = 1` skips all providers — the fastest way to prove a symptom is yours.
 8. **The handedness flip.** Set `HKCU\Software\DisplayXR\InputProviders\Policy\Handedness` to 1 and confirm selftest's left-hand row names your stylus (and the log line `is a dominant-hand tool -> LEFT hand`); delete the value afterwards. `input list` does not load providers, so it cannot show the hand.
 9. **Both paths.** Run your app checks in-process and again with `XRT_FORCE_MODE=ipc` against a running `displayxr-service.exe`; roles, the rig and presence live service-side there. Remember the service reads **its own** environment, not the app's.
