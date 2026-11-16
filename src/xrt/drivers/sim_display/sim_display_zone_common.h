@@ -13,7 +13,8 @@
  *    (default 1x1, today's global on/off shape; max 256 cells).
  *  - `SIM_DISPLAY_ZONE_DUMP=1` — read the published mask back and log the
  *    downsampled per-cell map whenever it changes (only on variants with an
- *    easy CPU readback path — D3D11 and GL; the others log-only).
+ *    easy CPU readback path — D3D11 and GL; the others log-only). Defaults
+ *    to on for a grid larger than 1x1 (ADR-062 D5 tests), off for 1x1.
  *  - `SIM_DISPLAY_WISH_QUANTIZE=off|band|cell` — which simulated quantization
  *    the dump/tint REPORTS (advisory quantization is the DP's prerogative,
  *    ADR-027 Decision 6 — this changes only what the sim visualizes):
@@ -92,7 +93,10 @@ sim_zone_config_from_env(struct sim_zone_config *cfg, const char *variant)
 		}
 	}
 
-	cfg->dump = sim_display_setting_on("ZONE_DUMP");
+	// ADR-062 D5: a grid larger than 1x1 exists to be looked at, so it logs its
+	// cell verdicts unless ZONE_DUMP says otherwise.
+	cfg->dump = sim_display_setting_is_set("ZONE_DUMP") ? sim_display_setting_on("ZONE_DUMP")
+	                                                    : (cfg->grid_w * cfg->grid_h > 1);
 
 	char q_env[16];
 	if (sim_display_setting("WISH_QUANTIZE", q_env, sizeof(q_env))) {

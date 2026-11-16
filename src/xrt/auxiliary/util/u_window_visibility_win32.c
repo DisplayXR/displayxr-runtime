@@ -167,6 +167,27 @@ struct u_window_visibility
 	struct u_wv_debounce screen_debounce[U_WINDOW_VISIBILITY_MAX_SCREENS];
 	enum u_wv_part screen_raw[U_WINDOW_VISIBILITY_MAX_SCREENS];
 	uint32_t screens_gen_seen;
+
+	/*
+	 * ADR-062 D5 (tier 4): the visible region. Published under panel_lock
+	 * (pub_region, pub_screen_*); its generation is mirrored in region_gen for
+	 * a lock-free "did anything move" read.
+	 */
+	struct u_window_visibility_region pub_region;
+	//! Client-relative rects of the session's 3D screen (slot 0) and the extra screens.
+	struct u_wv_rect pub_screen_rect[1 + U_WINDOW_VISIBILITY_MAX_SCREENS];
+	bool pub_screen_found[1 + U_WINDOW_VISIBILITY_MAX_SCREENS];
+	volatile LONG64 region_gen;
+	// Thread-private: the last raw region and its debounce.
+	bool raw_region_known;
+	struct u_wv_region raw_region;
+	struct u_wv_rect raw_region_whole; //!< client-relative, the merge fallback
+	uint32_t raw_client_w;
+	uint32_t raw_client_h;
+	struct u_wv_rect raw_screen_rect[1 + U_WINDOW_VISIBILITY_MAX_SCREENS];
+	bool raw_screen_found[1 + U_WINDOW_VISIBILITY_MAX_SCREENS];
+	struct u_wv_region_debounce region_debounce;
+	uint64_t region_gen_next;
 };
 
 // Resolved dynamically, as os_display_desktop_win32.c does: Windows 10 1607+,
@@ -390,6 +411,8 @@ wv_check(struct u_window_visibility *wv)
 	const uint32_t extra = f.count - 1;
 	wv->occluder[0] = '\0';
 	wv->taskbar_auto_hide = -1;
+	wv->raw_region_known = false;
+	memset(&wv->raw_region, 0, sizeof(wv->raw_region));
 
 	HWND target = wv->target;
 	struct u_wv_window_state ws;
@@ -423,6 +446,9 @@ wv_check(struct u_window_visibility *wv)
 		wv->raw_reason = wr;
 		wv->raw_reason_all = wr;
 		wv_screens_raw(wv, extra, u_wv_reason_is_hidden(wr) ? U_WV_PART_HIDDEN : U_WV_PART_OFF);
+		// Tier 4: a hidden window shows nothing (known, empty); one not shown
+		// yet or gone is not known (the whole window: the not-hidden side).
+		wv->raw_region_known = u_wv_reason_is_hidden(wr);
 		return;
 	}
 
@@ -540,6 +566,30 @@ wv_check(struct u_window_visibility *wv)
 
 	const enum u_wv_reason vis = n > 0 ? U_WV_REASON_PARTLY_COVERED : U_WV_REASON_VISIBLE;
 	wv->raw_reason_all = u_wv_rect_mostly_covered(&all, wv->occ, n) ? U_WV_REASON_COVERED : vis;
+
+	// Tier 4: the uncovered remainder, window-client relative, from the same
+	// z-walk. Fragmenting past the cap falls back to the whole part.
+	(void)u_wv_region_compute(&all, wv->occ, n, &wv->raw_region);
+	u_wv_region_translate(&wv->raw_region, -tl.x, -tl.y);
+	wv->raw_region_whole = all;
+	wv->raw_region_whole.left -= tl.x;
+	wv->raw_region_whole.right -= tl.x;
+	wv->raw_region_whole.top -= tl.y;
+	wv->raw_region_whole.bottom -= tl.y;
+	wv->raw_client_w = (uint32_t)(br.x - tl.x);
+	wv->raw_client_h = (uint32_t)(br.y - tl.y);
+	for (uint32_t i = 0; i < 1 + U_WINDOW_VISIBILITY_MAX_SCREENS; i++) {
+		wv->raw_screen_found[i] = i < f.count && f.found[i];
+		if (wv->raw_screen_found[i]) {
+			struct u_wv_rect sr = wv_from_rect(&f.rect[i]);
+			sr.left -= tl.x;
+			sr.right -= tl.x;
+			sr.top -= tl.y;
+			sr.bottom -= tl.y;
+			wv->raw_screen_rect[i] = sr;
+		}
+	}
+	wv->raw_region_known = true;
 	if (u_wv_rect_empty(&t)) {
 		// Nothing on the 3D screen: the multi-screen coverage gate owns that case.
 		wv->raw_reason = U_WV_REASON_OFF_SCREEN;
@@ -601,6 +651,10 @@ wv_next_deadline(const struct u_window_visibility *wv)
 			d = s;
 		}
 	}
+	const uint64_t r = u_wv_region_debounce_deadline(&wv->region_debounce, U_WINDOW_VISIBILITY_HIDE_DWELL_NS);
+	if (r != 0 && (d == 0 || r < d)) {
+		d = r;
+	}
 	return d;
 }
 
@@ -616,6 +670,76 @@ wv_publish(struct u_window_visibility *wv, bool edge, uint64_t now_ns)
 	ReleaseSRWLockExclusive(&wv->panel_lock);
 }
 
+/*!
+ * Tier 4: debounce the raw region and publish it when anything changed (the
+ * region, its known flag, the client size or a screen rect). Tracker thread.
+ */
+static void
+wv_update_region(struct u_window_visibility *wv, uint64_t now_ns, bool immediate, bool hold)
+{
+	const struct u_window_visibility_region *pub = &wv->pub_region;
+	bool changed = pub->gen == 0 || pub->known != wv->raw_region_known;
+	if (!wv->raw_region_known) {
+		wv->region_debounce.init = false;
+	} else {
+		if (pub->client_w != wv->raw_client_w || pub->client_h != wv->raw_client_h) {
+			// A resize re-bases every rect: start over at the new size.
+			wv->region_debounce.init = false;
+			changed = true;
+		}
+		const struct u_wv_region *raw = &wv->raw_region;
+		if (u_wv_region_debounce_step(&wv->region_debounce, raw, immediate, hold, now_ns,
+		                              U_WINDOW_VISIBILITY_HIDE_DWELL_NS, &wv->raw_region_whole)) {
+			changed = true;
+		}
+		for (uint32_t i = 0; !changed && i < 1 + U_WINDOW_VISIBILITY_MAX_SCREENS; i++) {
+			changed = wv->raw_screen_found[i] != wv->pub_screen_found[i] ||
+			          (wv->raw_screen_found[i] &&
+			           memcmp(&wv->raw_screen_rect[i], &wv->pub_screen_rect[i], sizeof(struct u_wv_rect)) != 0);
+		}
+	}
+	if (!changed) {
+		return;
+	}
+	AcquireSRWLockExclusive(&wv->panel_lock);
+	struct u_window_visibility_region *p = &wv->pub_region;
+	p->gen = ++wv->region_gen_next;
+	p->known = wv->raw_region_known;
+	if (p->known) {
+		p->client_w = wv->raw_client_w;
+		p->client_h = wv->raw_client_h;
+		p->region = wv->region_debounce.pub;
+		memcpy(wv->pub_screen_rect, wv->raw_screen_rect, sizeof(wv->pub_screen_rect));
+		memcpy(wv->pub_screen_found, wv->raw_screen_found, sizeof(wv->pub_screen_found));
+	} else {
+		memset(&p->region, 0, sizeof(p->region));
+	}
+	const uint64_t gen = p->gen;
+	const uint32_t count = p->region.count;
+	const bool whole = p->region.whole;
+	const uint64_t area = u_wv_region_area(&p->region);
+	const uint64_t full = (uint64_t)p->client_w * (uint64_t)p->client_h;
+	ReleaseSRWLockExclusive(&wv->panel_lock);
+	InterlockedExchange64(&wv->region_gen, (LONG64)gen);
+	// INFO, not WARN: a region moves with every window drag.
+	U_LOG_I("ADR-062 %s: visible region gen %llu: %s, %u rect(s)%s, %llu of %llu px", wv->who,
+	        (unsigned long long)gen, wv->raw_region_known ? "known" : "unknown (whole window)", count,
+	        whole ? " (fragmented: whole)" : "", (unsigned long long)area, (unsigned long long)full);
+}
+
+//! Readers see "nothing known" from now on (a new window, or the tracker stopped).
+static void
+wv_region_forget(struct u_window_visibility *wv)
+{
+	AcquireSRWLockExclusive(&wv->panel_lock);
+	wv->pub_region.gen = ++wv->region_gen_next;
+	wv->pub_region.known = false;
+	memset(&wv->pub_region.region, 0, sizeof(wv->pub_region.region));
+	const uint64_t gen = wv->pub_region.gen;
+	ReleaseSRWLockExclusive(&wv->panel_lock);
+	InterlockedExchange64(&wv->region_gen, (LONG64)gen);
+}
+
 //! One full check + debounce + transitions. Tracker thread.
 static void
 wv_tick(struct u_window_visibility *wv)
@@ -628,6 +752,7 @@ wv_tick(struct u_window_visibility *wv)
 	const bool hold = wv->movesize_active;
 	const bool immediate = u_wv_reason_is_immediate(wv->raw_reason);
 	wv_update_screens(wv, now_ns, immediate, hold);
+	wv_update_region(wv, now_ns, u_wv_reason_is_immediate(wv->raw_reason_all), hold);
 
 	const bool was = wv->debounce.reported_hidden;
 	const bool now = u_wv_debounce_step(&wv->debounce, u_wv_reason_is_hidden(wv->raw_reason), immediate, hold,
@@ -853,6 +978,8 @@ wv_apply_retarget(struct u_window_visibility *wv)
 	memset(&wv->debounce, 0, sizeof(wv->debounce));
 	memset(&wv->debounce_all, 0, sizeof(wv->debounce_all));
 	memset(wv->screen_debounce, 0, sizeof(wv->screen_debounce));
+	memset(&wv->region_debounce, 0, sizeof(wv->region_debounce));
+	wv_region_forget(wv);
 	wv_screens_raw(wv, U_WINDOW_VISIBILITY_MAX_SCREENS, U_WV_PART_OFF);
 	for (uint32_t i = 0; i < U_WINDOW_VISIBILITY_MAX_SCREENS; i++) {
 		InterlockedExchange(&wv->screens[i].hidden, 0);
@@ -1132,6 +1259,59 @@ u_window_visibility_screen_hidden(const struct u_window_visibility *wv, const ch
 	return hidden;
 }
 
+bool
+u_window_visibility_get_region(const struct u_window_visibility *wv,
+                               const char *device_name,
+                               struct u_window_visibility_region *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (wv == NULL) {
+		return false;
+	}
+	// The lock is taken shared; the state it guards is not changed.
+	struct u_window_visibility *m = (struct u_window_visibility *)wv;
+	bool found = true;
+	AcquireSRWLockShared(&m->panel_lock);
+	*out = m->pub_region;
+	if (device_name != NULL && device_name[0] != '\0') {
+		// Slot 0 is the session's 3D screen, slots 1.. the extra screens.
+		int32_t slot = -1;
+		bool hidden = false;
+		if (m->panel[0] != '\0' && _stricmp(m->panel, device_name) == 0) {
+			slot = 0;
+			hidden = InterlockedCompareExchange(&m->hidden, 0, 0) != 0;
+		}
+		for (uint32_t i = 0; slot < 0 && i < m->screen_count; i++) {
+			if (_stricmp(m->screens[i].name, device_name) == 0) {
+				slot = (int32_t)(1 + i);
+				hidden = InterlockedCompareExchange(&m->screens[i].hidden, 0, 0) != 0;
+			}
+		}
+		if (slot < 0) {
+			found = false;
+		} else if (out->known && hidden) {
+			memset(&out->region, 0, sizeof(out->region));
+		} else if (out->known && m->pub_screen_found[slot]) {
+			u_wv_region_clip(&out->region, &m->pub_screen_rect[slot], &out->region);
+		}
+	}
+	ReleaseSRWLockShared(&m->panel_lock);
+	if (!found) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	return out->known;
+}
+
+uint64_t
+u_window_visibility_region_gen(const struct u_window_visibility *wv)
+{
+	if (wv == NULL) {
+		return 0;
+	}
+	return (uint64_t)InterlockedCompareExchange64((volatile LONG64 *)&wv->region_gen, 0, 0);
+}
+
 void
 u_window_visibility_stop(struct u_window_visibility *wv)
 {
@@ -1147,6 +1327,7 @@ u_window_visibility_stop(struct u_window_visibility *wv)
 	wv->thread = NULL;
 	ReleaseSRWLockExclusive(&wv->panel_lock);
 	// Readers that still hold the pointer see "visible" from here on.
+	wv_region_forget(wv);
 	InterlockedExchange(&wv->hidden_all, 0);
 	InterlockedExchange(&wv->hidden, 0);
 	for (uint32_t i = 0; i < U_WINDOW_VISIBILITY_MAX_SCREENS; i++) {

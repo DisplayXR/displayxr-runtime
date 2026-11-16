@@ -37,6 +37,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_window_visibility.h"
+#include "comp_d3d11_region_wish.h"
 #include "util/u_camera_profile.h"
 #include "util/u_setting.h"
 #include "util/u_weave_scope.h"
@@ -716,6 +717,16 @@ struct comp_d3d11_compositor
 	 * the visibility callback, consumed by d3d11_sync_zone_mask_to_dp.
 	 */
 	std::atomic<bool> zone_reeval_owed{false};
+	/*!
+	 * ADR-062 D5 (tier 4): on a DP whose zone grid is larger than 1x1 the
+	 * published wish is limited to what can be seen (d3d11_sync_region_wish).
+	 * The raster, the last visible region read from the tracker (refetched
+	 * only when its generation moves), and the off switch the teardown sets so
+	 * the final sync withdraws instead of publishing an implicit wish.
+	 */
+	struct comp_d3d11_region_wish region_wish = {};
+	struct u_window_visibility_region region_vis = {};
+	bool region_wish_off = false;
 	/*!
 	 * Multi-screen M3: what the app thread reads (xrLocateViews) and hands
 	 * back (xrEndFrame) while the weave thread owns the segment manager —
@@ -8217,7 +8228,9 @@ d3d11_release_zone_state(struct comp_d3d11_compositor *c)
 	c->frame_wish = nullptr;
 	c->frame_wish_last = nullptr;
 	c->zones_frame = false;
+	c->region_wish_off = true;     // ADR-062 tier 4: the last sync withdraws
 	d3d11_sync_zone_mask_to_dp(c); // withdraw this client's DP zone contribution (#224)
+	comp_d3d11_region_wish_release(&c->region_wish);
 
 	// XR_DXR_display_zones — auto-wish raster set.
 	if (c->wish_mask_staged_srv != nullptr) {
@@ -8693,6 +8706,116 @@ d3d11_zone_mask_stage(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_ma
 	}
 }
 
+/*!
+ * ADR-062 D5 (tier 4) — the publish on a DP whose zone grid is larger than
+ * 1x1: the visible part of this session's 3D region.
+ *
+ *  - hidden, or the session in 2D mode: the empty wish (every cell flat). Not
+ *    withheld as on a 1x1 panel: an all-flat verdict cannot undo the lens 2D;
+ *  - a wish of the app's own (@p srv: a zones frame's wish, or the sticky
+ *    xrSubmitLocal3DZoneDXR mask, which overrides the implicit rule): that
+ *    mask with its covered pixels cleared;
+ *  - none: the implicit wish, the visible client region minus this frame's
+ *    over-Local2D rects (the 2D-under backdrop sits beneath 3D content and is
+ *    not subtracted).
+ *
+ * Republished every frame (the screen anchor), generation bumped on a content
+ * change only. Segment DPs get the same mask cropped to their screens: the
+ * visible region is the whole window's, so each screen's crop is its own
+ * visible part. Caller holds c->mutex; weave thread.
+ */
+static void
+d3d11_sync_region_wish(struct comp_d3d11_compositor *c,
+                       ID3D11ShaderResourceView *srv,
+                       uint32_t mask_w,
+                       uint32_t mask_h,
+                       bool have_content)
+{
+	if (srv == nullptr && have_content) {
+		return; // an authored mask not landed yet: keep the previous publish (#918 review F9)
+	}
+	// Re-publish from scratch once the window is seen again (never while it is
+	// still hidden: the empty wish then goes out on top of the last one).
+	if (!c->window_hidden.load() && c->zone_reeval_owed.exchange(false) && c->zone_published) {
+		xrt_display_processor_d3d11_clear_local_zone_mask(c->display_processor);
+		c->zone_published = false;
+		comp_d3d11_segments_clear_zone_mask(c->segments);
+		U_LOG_W("#2671 d3d11: the window is seen again - the zone wish is re-published from scratch");
+	}
+
+	uint32_t cw = 0, ch = 0;
+	POINT origin = {0, 0};
+	if (!d3d11_client_geometry(c, &cw, &ch, &origin) || cw == 0 || ch == 0) {
+		return; // nothing to anchor to
+	}
+
+	// The tracker's region, refetched only when its generation moved.
+	if (c->visibility == nullptr) {
+		c->region_vis = {};
+	} else if (u_window_visibility_region_gen(c->visibility) != c->region_vis.gen) {
+		(void)u_window_visibility_get_region(c->visibility, nullptr, &c->region_vis);
+	}
+
+	struct u_wv_wish_input in = {};
+	in.visible = &c->region_vis;
+	struct u_wv_rect flat[XRT_MAX_LAYERS];
+	// 2D: the rendering mode is a 2D one, or the session asked for a 2D panel.
+	if (c->window_hidden.load() || !c->hardware_display_3d || !c->session_wants_3d.load()) {
+		in.kind = U_WV_WISH_EMPTY;
+	} else if (srv != nullptr) {
+		in.kind = U_WV_WISH_CUT;
+		in.mask_w = mask_w;
+		in.mask_h = mask_h;
+		in.source_seq = c->zone_publish_seq;
+	} else {
+		in.kind = U_WV_WISH_IMPLICIT;
+		int32_t proj_idx = -1;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+			const enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+			if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+				proj_idx = (int32_t)i;
+				break;
+			}
+		}
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && in.flat_count < XRT_MAX_LAYERS; i++) {
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D ||
+			    (proj_idx >= 0 && (int32_t)i < proj_idx)) {
+				continue;
+			}
+			const struct xrt_rect *r = &c->layer_accum.layers[i].data.local_2d.rect;
+			flat[in.flat_count++] = {r->offset.w, r->offset.h, r->offset.w + r->extent.w,
+			                         r->offset.h + r->extent.h};
+		}
+		in.flat = flat;
+		d3d11_client_region_dims(c, &in.region_w, &in.region_h);
+	}
+	if (in.kind != U_WV_WISH_CUT) {
+		// The runtime's own raster: client-sized, within the DP's stated cap.
+		in.mask_w = cw;
+		in.mask_h = ch;
+		if (c->zone_dp_caps.max_mask_width != 0 && in.mask_w > c->zone_dp_caps.max_mask_width) {
+			in.mask_w = c->zone_dp_caps.max_mask_width;
+		}
+		if (c->zone_dp_caps.max_mask_height != 0 && in.mask_h > c->zone_dp_caps.max_mask_height) {
+			in.mask_h = c->zone_dp_caps.max_mask_height;
+		}
+	}
+
+	uint64_t seq = 0;
+	ID3D11ShaderResourceView *pub = comp_d3d11_region_wish_resolve(&c->region_wish, d3d11_out_device(c),
+	                                                               d3d11_out_context(c), &in, srv, "d3d11", &seq);
+	if (pub == nullptr) {
+		return;
+	}
+	if (xrt_display_processor_d3d11_publish_local_zone_mask(c->display_processor, d3d11_out_context(c), pub,
+	                                                        in.mask_w, in.mask_h, (int32_t)origin.x,
+	                                                        (int32_t)origin.y, cw, ch, seq)) {
+		c->zone_published = true;
+	}
+	comp_d3d11_segments_publish_zone_mask(c->segments, d3d11_out_context(c), pub, in.mask_w, in.mask_h, cw, ch,
+	                                      seq);
+}
+
 static void
 d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 {
@@ -8759,6 +8882,14 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 	if (srv != nullptr && pub_kind == COMP_XBRIDGE_MASK_PLANE) {
 		srv = d3d11_plane_dp_view(c, &c->dp_mask_view, srv, pub_seq, mask_w, mask_h, DXGI_FORMAT_R8_UNORM,
 		                          "zone-mask publish");
+	}
+
+	// ADR-062 D5 (tier 4): only a DP with a zone grid larger than 1x1. A 1x1
+	// grid (a panel-wide switch) takes the path below exactly as before.
+	if (!c->region_wish_off &&
+	    u_wv_region_mask_applies(c->zone_dp_caps.zone_grid_width, c->zone_dp_caps.zone_grid_height)) {
+		d3d11_sync_region_wish(c, srv, mask_w, mask_h, have_content);
+		return;
 	}
 
 	if (srv == nullptr) {
@@ -10775,7 +10906,9 @@ d3d11_hub_stage_planes(struct comp_d3d11_compositor *c, const struct u_canvas_re
 		comp_hub_d3d11_bind_mask_plane(hub, nullptr, 0, 0, 0);
 		comp_hub_d3d11_stage_mask_plane(hub, 0, 0, 0);
 		comp_hub_d3d11_stage_no_composite(hub);
-		comp_hub_d3d11_clear_zone_wish(hub);
+		// ADR-062 D5: no wish of its own - the implicit one on a zone grid
+		// larger than 1x1, the clear (as before) on any other weaver.
+		comp_hub_d3d11_publish_implicit_wish(hub, nullptr, 0, 0, 0);
 		return nullptr;
 	}
 
@@ -10878,7 +11011,11 @@ d3d11_hub_stage_planes(struct comp_d3d11_compositor *c, const struct u_canvas_re
 	const bool mask_is_plane = mask_ok && !zones;
 	if (!zones && !mask_is_plane && over_count == 0) {
 		comp_hub_d3d11_stage_no_composite(hub);
-		comp_hub_d3d11_clear_zone_wish(hub);
+		if (amask == nullptr) {
+			comp_hub_d3d11_publish_implicit_wish(hub, nullptr, 0, region_w, region_h); // ADR-062 D5
+		} else {
+			comp_hub_d3d11_clear_zone_wish(hub);
+		}
 		return failed ? COMP_HUB_REASON_PLANE_UNAVAILABLE : nullptr;
 	}
 
@@ -10976,6 +11113,19 @@ d3d11_hub_stage_planes(struct comp_d3d11_compositor *c, const struct u_canvas_re
 		}
 	} else if (mask_ok) {
 		comp_hub_d3d11_publish_zone_wish(hub, c->zone_publish_seq);
+	} else if (amask == nullptr) {
+		// ADR-062 D5: the implicit wish minus this frame's over-Local2D rects
+		// (on a zone grid larger than 1x1; the clear, as before, elsewhere).
+		struct xrt_rect flat[XRT_MAX_LAYERS];
+		uint32_t flat_count = 0;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && flat_count < XRT_MAX_LAYERS; i++) {
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D ||
+			    (proj_idx >= 0 && (int32_t)i < proj_idx)) {
+				continue;
+			}
+			flat[flat_count++] = c->layer_accum.layers[i].data.local_2d.rect;
+		}
+		comp_hub_d3d11_publish_implicit_wish(hub, flat, flat_count, region_w, region_h);
 	} else {
 		comp_hub_d3d11_clear_zone_wish(hub);
 	}

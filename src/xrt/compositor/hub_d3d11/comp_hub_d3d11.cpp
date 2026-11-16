@@ -62,6 +62,7 @@
 #include "comp_xbridge.h"
 #include "comp_xbridge_share_tap.h"
 #include "d3d11/comp_d3d11_outcomp.h"
+#include "d3d11/comp_d3d11_region_wish.h"
 #include "d3d11/comp_d3d11_segments.h"
 #include "d3d11/comp_d3d11_target.h"
 #include "d3d/d3d_scanout_helpers.hpp"
@@ -159,6 +160,14 @@ struct comp_hub_d3d11
 	//! #2671: the owning compositor's visibility tracker (borrowed), for the
 	//! segment DPs' per-screen lens (comp_d3d11_segments_set_visibility).
 	const struct u_window_visibility *vis;
+	/*!
+	 * ADR-062 D5 (tier 4): the visible-region wish raster on the scanout
+	 * device and the last region read from @ref vis (refetched when its
+	 * generation moves). Used only on a weaver whose zone grid is larger than
+	 * 1x1 (@ref split_region_wish_applies).
+	 */
+	struct comp_d3d11_region_wish region_wish;
+	struct u_window_visibility_region region_vis;
 	/*!
 	 * ADR-062 D3 (tier 2): the last frame found the window hidden on every
 	 * screen and skipped the weave and present (@ref comp_hub_d3d11_hidden_skip);
@@ -1304,6 +1313,7 @@ split_release_out(struct comp_hub_d3d11 *s)
 	comp_d3d11_outcomp_destroy(&s->outcomp);
 	split_release_mask(&s->mask);
 	split_release_mask(&s->wish);
+	comp_d3d11_region_wish_release(&s->region_wish);
 	s->repaint_mask_srv = NULL;
 	if (s->hud_tex != NULL) {
 		s->hud_tex->Release();
@@ -3130,10 +3140,115 @@ comp_hub_d3d11_zone_dp_supported(struct comp_hub_d3d11 *s)
 	return s->zone_dp_state == 1;
 }
 
+//! ADR-062 D5 (tier 4): the scanout weaver has a zone grid larger than 1x1.
+static bool
+split_region_wish_applies(struct comp_hub_d3d11 *s)
+{
+	return comp_hub_d3d11_zone_dp_supported(s) &&
+	       u_wv_region_mask_applies(s->zone_caps.zone_grid_width, s->zone_caps.zone_grid_height);
+}
+
+/*!
+ * ADR-062 D5 (tier 4) — publish the visible part of the session's 3D region
+ * through the scanout weaver (the in-process D3D11 tier's d3d11_sync_region_wish
+ * rule, on the hub's device): @p kind EMPTY (hidden, or the session in 2D),
+ * CUT (@p srv, an existing wish, with its covered pixels cleared) or IMPLICIT
+ * (the visible client region minus @p flat, in client pixels of a
+ * @p region_w x @p region_h area). Segment DPs get the same mask cropped.
+ */
+static void
+split_region_publish(struct comp_hub_d3d11 *s,
+                     enum u_wv_wish_kind kind,
+                     ID3D11ShaderResourceView *srv,
+                     uint32_t mw,
+                     uint32_t mh,
+                     uint64_t source_seq,
+                     const struct u_wv_rect *flat,
+                     uint32_t flat_count,
+                     uint32_t region_w,
+                     uint32_t region_h)
+{
+	RECT r;
+	POINT origin = {0, 0};
+	if (s->hwnd == nullptr || !GetClientRect(s->hwnd, &r) || r.right <= 0 || r.bottom <= 0 ||
+	    !ClientToScreen(s->hwnd, &origin)) {
+		return;
+	}
+	// From scratch once the window is seen again, never while still hidden.
+	if (!s->window_hidden && InterlockedExchange(&s->zone_reeval_owed, 0) != 0 && s->zone_published) {
+		if (s->mutexes_init) {
+			os_mutex_lock(&s->seg_mutex);
+			comp_d3d11_segments_clear_zone_mask(s->segments);
+			os_mutex_unlock(&s->seg_mutex);
+		}
+		xrt_display_processor_d3d11_clear_local_zone_mask(s->dp);
+		s->zone_published = false;
+		U_LOG_W("#2671 hub: the window is seen again - the zone wish is re-published from scratch");
+	}
+	if (s->vis == nullptr) {
+		s->region_vis = {};
+	} else if (u_window_visibility_region_gen(s->vis) != s->region_vis.gen) {
+		(void)u_window_visibility_get_region(s->vis, nullptr, &s->region_vis);
+	}
+
+	struct u_wv_wish_input in = {};
+	in.kind = kind;
+	in.visible = &s->region_vis;
+	in.source_seq = source_seq;
+	in.flat = flat;
+	in.flat_count = flat_count;
+	in.region_w = region_w;
+	in.region_h = region_h;
+	if (kind == U_WV_WISH_CUT) {
+		in.mask_w = mw;
+		in.mask_h = mh;
+	} else {
+		in.mask_w = (uint32_t)r.right;
+		in.mask_h = (uint32_t)r.bottom;
+		if (s->zone_caps.max_mask_width != 0 && in.mask_w > s->zone_caps.max_mask_width) {
+			in.mask_w = s->zone_caps.max_mask_width;
+		}
+		if (s->zone_caps.max_mask_height != 0 && in.mask_h > s->zone_caps.max_mask_height) {
+			in.mask_h = s->zone_caps.max_mask_height;
+		}
+	}
+	uint64_t seq = 0;
+	ID3D11ShaderResourceView *pub =
+	    comp_d3d11_region_wish_resolve(&s->region_wish, s->out_dev, s->out_ctx, &in, srv, "hub", &seq);
+	if (pub == nullptr) {
+		return;
+	}
+	if (xrt_display_processor_d3d11_publish_local_zone_mask(s->dp, s->out_ctx, pub, in.mask_w, in.mask_h,
+	                                                        (int32_t)origin.x, (int32_t)origin.y,
+	                                                        (uint32_t)r.right, (uint32_t)r.bottom, seq)) {
+		s->zone_published = true;
+	}
+	if (s->mutexes_init) {
+		os_mutex_lock(&s->seg_mutex);
+		comp_d3d11_segments_publish_zone_mask(s->segments, s->out_ctx, pub, in.mask_w, in.mask_h,
+		                                      (uint32_t)r.right, (uint32_t)r.bottom, seq);
+		os_mutex_unlock(&s->seg_mutex);
+	}
+}
+
+//! Tier 4: the window is hidden or the session is in 2D, so the wish is empty.
+static bool
+split_region_wish_empty(const struct comp_hub_d3d11 *s)
+{
+	return s->window_hidden || !split_lens_3d(s);
+}
+
 static void
 split_publish_zone_wish_now(struct comp_hub_d3d11 *s, uint64_t seq)
 {
 	if (s == nullptr || s->dp == nullptr || s->hwnd == nullptr || !comp_hub_d3d11_zone_dp_supported(s)) {
+		return;
+	}
+	// ADR-062 D5 (tier 4): a zone grid larger than 1x1 publishes the visible
+	// part instead, and an empty wish (not a withheld one) while hidden.
+	const bool tier4 = split_region_wish_applies(s);
+	if (tier4 && split_region_wish_empty(s)) {
+		split_region_publish(s, U_WV_WISH_EMPTY, nullptr, 0, 0, seq, nullptr, 0, 0, 0);
 		return;
 	}
 	/*
@@ -3145,10 +3260,10 @@ split_publish_zone_wish_now(struct comp_hub_d3d11 *s, uint64_t seq)
 	 * again instead of keeping the 2D the gate left (its edge test compares
 	 * against its own last verdict, not the lens).
 	 */
-	if (s->window_hidden) {
+	if (s->window_hidden && !tier4) {
 		return;
 	}
-	if (InterlockedExchange(&s->zone_reeval_owed, 0) != 0 && s->zone_published) {
+	if (!tier4 && InterlockedExchange(&s->zone_reeval_owed, 0) != 0 && s->zone_published) {
 		if (s->mutexes_init) {
 			os_mutex_lock(&s->seg_mutex);
 			comp_d3d11_segments_clear_zone_mask(s->segments);
@@ -3220,6 +3335,10 @@ split_publish_zone_wish_now(struct comp_hub_d3d11 *s, uint64_t seq)
 	if (srv == nullptr || mw == 0 || mh == 0) {
 		return;
 	}
+	if (tier4) {
+		split_region_publish(s, U_WV_WISH_CUT, srv, mw, mh, seq, nullptr, 0, 0, 0);
+		return;
+	}
 
 	RECT r;
 	POINT origin = {0, 0};
@@ -3279,12 +3398,44 @@ comp_hub_d3d11_publish_zone_wish(struct comp_hub_d3d11 *s, uint64_t seq)
 	 * sideband, so running it a few hundred microseconds later in the same app
 	 * frame changes nothing the vendor can see.
 	 */
-	if (s->direct.active) {
+	if (s->direct.active && !(split_region_wish_applies(s) && split_region_wish_empty(s))) {
 		s->direct.publish_pending = true;
 		s->direct.publish_seq = seq;
 		return;
 	}
 	split_publish_zone_wish_now(s, seq);
+}
+
+extern "C" void
+comp_hub_d3d11_publish_implicit_wish(struct comp_hub_d3d11 *s,
+                                     const struct xrt_rect *flat,
+                                     uint32_t flat_count,
+                                     uint32_t region_w,
+                                     uint32_t region_h)
+{
+	if (s == nullptr) {
+		return;
+	}
+	if (s->dp == nullptr || s->hwnd == nullptr || !split_region_wish_applies(s)) {
+		comp_hub_d3d11_clear_zone_wish(s); // a 1x1 grid (or no zones): exactly as before
+		return;
+	}
+	s->direct.publish_pending = false; // the implicit wish samples no plane: published now
+	// #2603: the weavers live on a device a wedged Present still holds.
+	if (comp_d3d11_target_is_present_wedged(s->target)) {
+		return;
+	}
+	if (split_region_wish_empty(s)) {
+		split_region_publish(s, U_WV_WISH_EMPTY, nullptr, 0, 0, 0, nullptr, 0, 0, 0);
+		return;
+	}
+	struct u_wv_rect r[XRT_MAX_LAYERS];
+	uint32_t n = 0;
+	for (uint32_t i = 0; flat != nullptr && i < flat_count && n < XRT_MAX_LAYERS; i++) {
+		r[n++] = {flat[i].offset.w, flat[i].offset.h, flat[i].offset.w + flat[i].extent.w,
+		          flat[i].offset.h + flat[i].extent.h};
+	}
+	split_region_publish(s, U_WV_WISH_IMPLICIT, nullptr, 0, 0, 0, r, n, region_w, region_h);
 }
 
 extern "C" void
@@ -6628,6 +6779,20 @@ comp_hub_d3d11_set_window_hidden(struct comp_hub_d3d11 *split, bool hidden)
 {
 	(void)split;
 	(void)hidden;
+}
+
+extern "C" void
+comp_hub_d3d11_publish_implicit_wish(struct comp_hub_d3d11 *split,
+                                     const struct xrt_rect *flat,
+                                     uint32_t flat_count,
+                                     uint32_t region_w,
+                                     uint32_t region_h)
+{
+	(void)split;
+	(void)flat;
+	(void)flat_count;
+	(void)region_w;
+	(void)region_h;
 }
 
 extern "C" void

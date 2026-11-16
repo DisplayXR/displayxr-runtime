@@ -797,6 +797,21 @@ void
 comp_hub_d3d11_clear_zone_wish(struct comp_hub_d3d11 *split);
 
 /*!
+ * ADR-062 D5 (tier 4): a frame with no wish of its own (no zones, no sticky
+ * mask). On a weaver whose zone grid is larger than 1x1 this publishes the
+ * implicit wish, the window's visible client region minus @p flat (the
+ * frame's over-Local2D rects, in client pixels of a @p region_w x @p region_h
+ * area), or the empty wish while the window is hidden or the session is in
+ * 2D. On any other weaver it is exactly @ref comp_hub_d3d11_clear_zone_wish.
+ */
+void
+comp_hub_d3d11_publish_implicit_wish(struct comp_hub_d3d11 *split,
+                                     const struct xrt_rect *flat,
+                                     uint32_t flat_count,
+                                     uint32_t region_w,
+                                     uint32_t region_h);
+
+/*!
  * VK-1b-3 — bind the app-AUTHORED (Tier-3) zone mask's transport.
  *
  * The one mask whose pixels the APP drew, and therefore the one that cannot be
