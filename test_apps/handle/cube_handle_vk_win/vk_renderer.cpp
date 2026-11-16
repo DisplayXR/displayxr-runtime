@@ -1482,6 +1482,52 @@ void RenderScene(
             vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.gridVertexBuffer, &offset);
             vkCmdDraw(cmd, renderer.gridVertexCount, 1, 0, 0);
         }
+
+        // `--stylus` (test_apps/common/dxr_stylus.h): the pen's boxes with the
+        // textured cube, its pressure-coloured lines by re-drawing the grid's
+        // first segment with a matrix that maps it onto each line — no extra
+        // pipeline.
+        if (renderer.stylusDraws != nullptr) {
+            const dxr::StylusDraws& sd = *renderer.stylusDraws;
+            VkDeviceSize offset = 0;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
+            if (renderer.texturesLoaded) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    renderer.cubePipelineLayout, 0, 1, &renderer.descriptorSet, 0, nullptr);
+            }
+            vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.cubeVertexBuffer, &offset);
+            vkCmdBindIndexBuffer(cmd, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+            for (int i = 0; i < sd.boxCount; i++) {
+                XMFLOAT4X4 m4;
+                memcpy(&m4, sd.boxes[i].model, sizeof(m4));
+                const XMMATRIX model = XMLoadFloat4x4(&m4);
+                VkCubePushConstants pc = {};
+                XMStoreFloat4x4(&pc.mvp, model * viewMatrix * zoom * projMatrix);
+                XMStoreFloat4x4(&pc.model, model);
+                vkCmdPushConstants(cmd, renderer.cubePipelineLayout,
+                    VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
+                vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+            }
+
+            // The grid's first segment (gridVerts[0..1], built at init).
+            const float segA[3] = {-10.0f, -1.0f, -10.0f};
+            const float segB[3] = {-10.0f, -1.0f, 10.0f};
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.gridPipeline);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.gridVertexBuffer, &offset);
+            for (int i = 0; i < sd.lineCount; i++) {
+                const dxr::StylusLine& l = sd.lines[i];
+                float m[16];
+                dxr::StylusSegmentModel(segA, segB, l.p0, l.p1, m);
+                XMFLOAT4X4 m4;
+                memcpy(&m4, m, sizeof(m4));
+                VkPushConstants pc = {};
+                XMStoreFloat4x4(&pc.transform, XMLoadFloat4x4(&m4) * viewMatrix * zoom * projMatrix);
+                memcpy(pc.color, l.color, sizeof(pc.color));
+                vkCmdPushConstants(cmd, renderer.pipelineLayout,
+                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+                vkCmdDraw(cmd, 2, 1, 0, 0);
+            }
+        }
     }
 
     vkCmdEndRenderPass(cmd);

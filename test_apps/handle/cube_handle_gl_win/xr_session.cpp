@@ -11,6 +11,8 @@
 #include <cstring>
 
 bool g_hasViewRigExt = false;
+bool g_stylusRequested = false; // `--stylus` (main.cpp)
+bool g_hasMxInkExt = false;     // XR_LOGITECH_mx_ink_stylus_interaction enabled
 
 // #439 Phase 3 — XR_DXR_local_3d_zone harness (see xr_session.h).
 ZoneMaskHarness g_zone;
@@ -100,6 +102,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) {
             xr.hasMcpToolsExt = true;
         }
+        if (g_stylusRequested &&
+            strcmp(ext.extensionName, XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME) == 0) {
+            g_hasMxInkExt = true;
+        }
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             g_hasViewRigExt = true;
         }
@@ -133,6 +139,12 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (xr.hasMcpToolsExt) {
         enabledExtensions.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
+    }
+    if (g_hasMxInkExt) {
+        enabledExtensions.push_back(XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME);
+    }
+    if (g_stylusRequested) {
+        LOG_INFO("XR_LOGITECH_mx_ink_stylus_interaction: %s", g_hasMxInkExt ? "ENABLED" : "NOT FOUND");
     }
     if (g_hasViewRigExt) {
         enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);

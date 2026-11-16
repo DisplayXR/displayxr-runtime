@@ -475,6 +475,53 @@ void RenderScene(
         glDrawArrays(GL_LINES, 0, renderer.gridVertexCount);
     }
 
+    // `--stylus` (test_apps/common/dxr_stylus.h): the pen's boxes with the
+    // textured cube, its pressure-coloured lines by re-drawing the grid's
+    // first segment with a matrix that maps it onto each line.
+    if (renderer.stylusDraws != nullptr) {
+        const dxr::StylusDraws& sd = *renderer.stylusDraws;
+        glUseProgram_(renderer.cubeProgram);
+        GLint useLoc = glGetUniformLocation_(renderer.cubeProgram, "useTextures");
+        if (useLoc >= 0) glUniform1i_(useLoc, renderer.texturesLoaded ? 1 : 0);
+        if (renderer.texturesLoaded) {
+            for (int i = 0; i < 3; i++) {
+                glActiveTexture_(GL_TEXTURE0 + i);
+                glBindTexture(GL_TEXTURE_2D, renderer.textures[i]);
+            }
+        }
+        glBindVertexArray_(renderer.cubeVAO);
+        for (int i = 0; i < sd.boxCount; i++) {
+            XMFLOAT4X4 m4;
+            memcpy(&m4, sd.boxes[i].model, sizeof(m4));
+            const XMMATRIX model = XMLoadFloat4x4(&m4);
+            SetMatrix(renderer.cubeProgram, "uTransform", model * viewMatrix * zoom * projMatrix);
+            SetMatrix(renderer.cubeProgram, "uModel", model);
+            glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, 0);
+        }
+        for (int i = 0; i < 3; i++) {
+            glActiveTexture_(GL_TEXTURE0 + i);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
+        glActiveTexture_(GL_TEXTURE0);
+
+        // The grid's first segment (gridVerts[0..1], built at init).
+        const float segA[3] = {-10.0f, -1.0f, -10.0f};
+        const float segB[3] = {-10.0f, -1.0f, 10.0f};
+        glUseProgram_(renderer.gridProgram);
+        GLint colorLoc = glGetUniformLocation_(renderer.gridProgram, "uColor");
+        glBindVertexArray_(renderer.gridVAO);
+        for (int i = 0; i < sd.lineCount; i++) {
+            const dxr::StylusLine& l = sd.lines[i];
+            float m[16];
+            dxr::StylusSegmentModel(segA, segB, l.p0, l.p1, m);
+            XMFLOAT4X4 m4;
+            memcpy(&m4, m, sizeof(m4));
+            SetMatrix(renderer.gridProgram, "uTransform", XMLoadFloat4x4(&m4) * viewMatrix * zoom * projMatrix);
+            if (colorLoc >= 0) glUniform4f_(colorLoc, l.color[0], l.color[1], l.color[2], l.color[3]);
+            glDrawArrays(GL_LINES, 0, 2);
+        }
+    }
+
     glBindVertexArray_(0);
     glUseProgram_(0);
     glDisable(GL_SCISSOR_TEST);

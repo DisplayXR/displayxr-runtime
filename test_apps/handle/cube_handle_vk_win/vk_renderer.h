@@ -13,6 +13,8 @@
 #include <vector>
 #include <vk_frame_ring.h>
 
+#include "dxr_stylus.h" // --stylus draw list (test_apps/common)
+
 struct VkRenderer {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -75,6 +77,9 @@ struct VkRenderer {
 
     // Scene state
     float cubeRotation = 0.0f;
+
+    // `--stylus`: the pen RenderScene draws after the grid (null = none).
+    const dxr::StylusDraws* stylusDraws = nullptr;
 };
 
 // Push constant data for grid: MVP matrix + color (64 bytes)

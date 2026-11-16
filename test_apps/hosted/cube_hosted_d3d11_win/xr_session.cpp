@@ -11,6 +11,9 @@
 #include <cstring>
 #include <vector>
 
+bool g_stylusRequested = false; // `--stylus` (main.cpp)
+bool g_hasMxInkExt = false;     // XR_LOGITECH_mx_ink_stylus_interaction enabled
+
 // Helper macro for XR error checking with logging
 #define XR_CHECK(call) \
     do { \
@@ -77,6 +80,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
+        if (g_stylusRequested &&
+            strcmp(ext.extensionName, XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME) == 0) {
+            g_hasMxInkExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_D3D11_enable: %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
@@ -92,6 +99,12 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     enabledExtensions.push_back(XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
     if (xr.hasDisplayInfoExt) {
         enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+    }
+    if (g_hasMxInkExt) {
+        enabledExtensions.push_back(XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME);
+    }
+    if (g_stylusRequested) {
+        LOG_INFO("XR_LOGITECH_mx_ink_stylus_interaction: %s", g_hasMxInkExt ? "ENABLED" : "NOT FOUND");
     }
 
     LOG_INFO("Enabling %zu extensions:", enabledExtensions.size());

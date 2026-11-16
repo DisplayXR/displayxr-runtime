@@ -11,6 +11,8 @@
 #include <DirectXMath.h>
 #include <vector>
 
+#include "dxr_stylus.h" // --stylus draw list (test_apps/common)
+
 struct GLRenderer {
     // Shader programs
     GLuint cubeProgram = 0;
@@ -41,6 +43,9 @@ struct GLRenderer {
 
     // Scene state
     float cubeRotation = 0.0f;
+
+    // `--stylus`: the pen RenderScene draws after the grid (null = none).
+    const dxr::StylusDraws* stylusDraws = nullptr;
 };
 
 // Initialize OpenGL renderer (create shaders, geometry)
