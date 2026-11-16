@@ -241,6 +241,20 @@ bool
 target_input_plugin_get_emulated_controllers(const char **out_source);
 
 /*!
+ * ADR-034 Amendment 8: the user's handedness — the hand a single tool (a
+ * stylus, `XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER`) belongs on. Class
+ * policy, like EmulatedControllers: Windows `InputProviders\Policy\Handedness`
+ * (DWORD, 0 = right, 1 = left), HKCU over the HKLM 64-bit view under
+ * `Policy\Lock`; POSIX a `handedness` file in the per-user manifest dir
+ * (first byte 'l' / 'L' = left); Android and absent: right. Never `getenv`.
+ *
+ * @p out_source (may be NULL) receives "user" / "machine" / "file" /
+ * "default", as for @ref target_input_plugin_get_emulated_controllers.
+ */
+enum xrt_input_handedness
+target_input_plugin_get_handedness(const char **out_source);
+
+/*!
  * Read the `PreferredPlugin` override (N3a, ADR-054 verb `prefer`; the
  * input twin of DP spec §2.1/§3.3): the id of the provider ranked FIRST,
  * ahead of ProbeOrder, for the hand/rig arbitration. Windows: HKCU

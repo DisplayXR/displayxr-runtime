@@ -43,7 +43,8 @@ apply_offset(struct xrt_vec3 *position, struct xrt_vec3 *offset)
 }
 
 /*!
- * Anchor every `XRT_TRACKING_TYPE_RIG_LOCAL` tracking origin at the INITIAL
+ * Anchor every `XRT_TRACKING_TYPE_RIG_LOCAL` (and `_RIG_LOCAL_PHYSICAL`)
+ * tracking origin at the INITIAL
  * rig (#1380 / ADR-034 Amendment 4).
  *
  * A provider that navigates publishes its controllers and joints
@@ -73,6 +74,18 @@ apply_offset(struct xrt_vec3 *position, struct xrt_vec3 *offset)
  * head's tracking origin, and the state tracker re-bases RIG_LOCAL onto it per
  * session (`oxr_space.c::rig_local_plane_correction`, spec §4b.4).
  */
+/*!
+ * RIG_LOCAL and RIG_LOCAL_PHYSICAL share one frame and one anchoring: they
+ * differ only in how a session that owns its canvas reads them (ADR-034
+ * Amendment 8, `oxr_space.c::rig_local_plane_correction`).
+ */
+static bool
+origin_is_rig_local_family(const struct xrt_tracking_origin *origin)
+{
+	return origin != NULL &&
+	       (origin->type == XRT_TRACKING_TYPE_RIG_LOCAL || origin->type == XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL);
+}
+
 static void
 anchor_rig_local_origins(struct xrt_device *head, struct xrt_device **xdevs, uint32_t xdev_count)
 {
@@ -84,8 +97,7 @@ anchor_rig_local_origins(struct xrt_device *head, struct xrt_device **xdevs, uin
 	// polling the head for a pose is not free.
 	bool any = false;
 	for (uint32_t i = 0; i < xdev_count; i++) {
-		if (xdevs[i] != NULL && xdevs[i]->tracking_origin != NULL &&
-		    xdevs[i]->tracking_origin->type == XRT_TRACKING_TYPE_RIG_LOCAL) {
+		if (xdevs[i] != NULL && origin_is_rig_local_family(xdevs[i]->tracking_origin)) {
 			any = true;
 			break;
 		}
@@ -109,8 +121,7 @@ anchor_rig_local_origins(struct xrt_device *head, struct xrt_device **xdevs, uin
 
 	for (uint32_t i = 0; i < xdev_count; i++) {
 		struct xrt_device *xdev = xdevs[i];
-		if (xdev == NULL || xdev->tracking_origin == NULL ||
-		    xdev->tracking_origin->type != XRT_TRACKING_TYPE_RIG_LOCAL) {
+		if (xdev == NULL || !origin_is_rig_local_family(xdev->tracking_origin)) {
 			continue;
 		}
 

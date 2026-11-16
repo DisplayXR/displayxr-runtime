@@ -774,6 +774,9 @@ enum xrt_device_name
 	XRT_DEVICE_TOUCH_CONTROLLER_RIFT_CV1,
 	XRT_DEVICE_TOUCH_CONTROLLER_QUEST_1_RIFT_S,
 	XRT_DEVICE_TOUCH_CONTROLLER_QUEST_2,
+
+	//! XR_LOGITECH_mx_ink_stylus_interaction: a 6-DoF tracked stylus.
+	XRT_DEVICE_MX_INK_STYLUS,
 };
 
 /*!
@@ -796,6 +799,17 @@ enum xrt_device_type
 	XRT_DEVICE_TYPE_BODY_TRACKER,
 	//! Holds the rig (navigation) role, ADR-034 Amendment 4.
 	XRT_DEVICE_TYPE_NAVIGATION,
+	/*!
+	 * A single hand-held tool (a stylus) that belongs on the user's DOMINANT
+	 * hand. An input provider declares it instead of LEFT / RIGHT when it does
+	 * not know the user's handedness; the input-provider builder resolves it in
+	 * place to @ref XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER or
+	 * @ref XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER from the handedness policy
+	 * before any role is read (ADR-034 Amendment 8). Unlike
+	 * @ref XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER it never means "left first".
+	 * Nothing past the builder ever sees this value.
+	 */
+	XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER,
 };
 
 /*!
@@ -1306,7 +1320,19 @@ enum xrt_input_type
 	_(XRT_INPUT_RIFT_REMOTE_DPAD_UP_CLICK              , XRT_INPUT_NAME(0x0F07, BOOLEAN)) \
 	_(XRT_INPUT_RIFT_REMOTE_DPAD_LEFT_CLICK            , XRT_INPUT_NAME(0x0F08, BOOLEAN)) \
 \
-	_(XRT_INPUT_BLUBUR_S1_MENU_CLICK                   , XRT_INPUT_NAME(0x1000, BOOLEAN))
+	_(XRT_INPUT_BLUBUR_S1_MENU_CLICK                   , XRT_INPUT_NAME(0x1000, BOOLEAN)) \
+\
+	_(XRT_INPUT_MX_INK_SYSTEM_CLICK                    , XRT_INPUT_NAME(0x1100, BOOLEAN)) \
+	_(XRT_INPUT_MX_INK_TIP_FORCE                       , XRT_INPUT_NAME(0x1101, VEC1_ZERO_TO_ONE)) \
+	_(XRT_INPUT_MX_INK_CLUSTER_FRONT_CLICK             , XRT_INPUT_NAME(0x1102, BOOLEAN)) \
+	_(XRT_INPUT_MX_INK_CLUSTER_FRONT_DOUBLE_TAP        , XRT_INPUT_NAME(0x1103, BOOLEAN)) \
+	_(XRT_INPUT_MX_INK_CLUSTER_MIDDLE_FORCE            , XRT_INPUT_NAME(0x1104, VEC1_ZERO_TO_ONE)) \
+	_(XRT_INPUT_MX_INK_CLUSTER_BACK_CLICK              , XRT_INPUT_NAME(0x1105, BOOLEAN)) \
+	_(XRT_INPUT_MX_INK_CLUSTER_BACK_DOUBLE_TAP         , XRT_INPUT_NAME(0x1106, BOOLEAN)) \
+	_(XRT_INPUT_MX_INK_DOCKED                          , XRT_INPUT_NAME(0x1107, BOOLEAN)) \
+	_(XRT_INPUT_MX_INK_GRIP_POSE                       , XRT_INPUT_NAME(0x1108, POSE)) \
+	_(XRT_INPUT_MX_INK_AIM_POSE                        , XRT_INPUT_NAME(0x1109, POSE)) \
+	_(XRT_INPUT_MX_INK_TIP_POSE                        , XRT_INPUT_NAME(0x110A, POSE))
 
 // clang-format on
 
@@ -1989,7 +2015,9 @@ enum xrt_output_name
 	XRT_OUTPUT_NAME_TOUCH_PRO_HAPTIC            = XRT_OUTPUT_NAME(0x0400, VIBRATION),
 	XRT_OUTPUT_NAME_TOUCH_PRO_HAPTIC_TRIGGER    = XRT_OUTPUT_NAME(0x0500, VIBRATION),
 	XRT_OUTPUT_NAME_TOUCH_PRO_HAPTIC_THUMB      = XRT_OUTPUT_NAME(0x0600, VIBRATION),
-	XRT_OUTPUT_NAME_TOUCH_PLUS_HAPTIC           = XRT_OUTPUT_NAME(0x0700, VIBRATION)
+	XRT_OUTPUT_NAME_TOUCH_PLUS_HAPTIC           = XRT_OUTPUT_NAME(0x0700, VIBRATION),
+
+	XRT_OUTPUT_NAME_MX_INK_HAPTIC               = XRT_OUTPUT_NAME(0x0800, VIBRATION)
 	// clang-format on
 };
 

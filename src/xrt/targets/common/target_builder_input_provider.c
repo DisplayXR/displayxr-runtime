@@ -8,6 +8,7 @@
 
 #include "target_builder_input_provider.h"
 #include "target_input_arbiter.h"
+#include "target_input_handedness.h"
 #include "target_input_plugin_loader.h"
 
 #include "xrt/xrt_device.h"
@@ -185,6 +186,11 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 			count = max;
 		}
 
+		// ADR-034 Amendment 8: one handedness read per provider, for any
+		// DOMINANT_HAND_CONTROLLER it supplies (a stylus).
+		const char *hand_source = NULL;
+		const enum xrt_input_handedness handedness = target_input_plugin_get_handedness(&hand_source);
+
 		struct xrt_device *prov_left = NULL;
 		struct xrt_device *prov_right = NULL;
 		struct xrt_device *prov_gamepad = NULL;
@@ -200,6 +206,19 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 			}
 
 			xsysd->xdevs[xsysd->xdev_count++] = xdev;
+
+			// A single tool on the user's dominant hand: resolved IN
+			// PLACE, before any role, IPC export or CLI listing reads
+			// the type, so nothing downstream ever sees DOMINANT.
+			if (xdev->device_type == XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER) {
+				xdev->device_type = t_input_resolve_dominant_hand(xdev->device_type, handedness);
+				U_LOG_W(
+				    "input provider builder: '%s' device '%s' is a dominant-hand tool -> %s hand "
+				    "(Handedness: %s).",
+				    iface->id != NULL ? iface->id : "?", xdev->str,
+				    xdev->device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER ? "LEFT" : "RIGHT",
+				    hand_source != NULL ? hand_source : "default");
+			}
 
 			// An input provider reports physically honest poses in
 			// its own tracking volume (ADR-034); anchoring that
@@ -225,7 +244,7 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 			// Devices self-describe via device_type (ADR-034).
 			// First claimant wins a role; ANY fills whichever hand
 			// is empty (left first, matching reader expectations
-			// elsewhere).
+			// elsewhere). DOMINANT was resolved to LEFT / RIGHT above.
 			switch (xdev->device_type) {
 			case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER:
 				if (prov_left == NULL) {

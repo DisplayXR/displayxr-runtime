@@ -684,3 +684,81 @@ full-display canvas (`s = 1`, centred: bit-for-bit as before); sessions with no 
 (runtime-window `_hosted` / legacy, bridge relay); stage-anchored (`OTHER` / `NONE`) sources
 everywhere — they are real-world tracked objects with mount offsets — and the provider contract
 itself: providers keep publishing physical display-plane metres and never learn the window.
+
+## Amendment 8 — A stylus is a first-class provider device: its profile, its hand, and a glass-registered frame (2026-11-15)
+
+**Status:** Proposed (epic #2679). Additive: no existing provider, profile or session changes.
+
+### What was missing
+
+A 6-DoF tracked stylus is the natural tool for a 3D display — the panel is a surface you can touch
+— but three things stopped a vendor from shipping one as an ordinary input provider:
+
+1. **No profile.** Providers bind a profile that already exists in `bindings.json`, and none
+   describes a pen (analog tip force, pen buttons, a tip pose, haptics). The public Khronos vendor
+   extension `XR_LOGITECH_mx_ink_stylus_interaction` defines exactly that shape and was only present
+   in the vendored headers.
+2. **No honest hand for one device.** `XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER` fills the LEFT hand
+   first; that is right for an interchangeable pair and wrong for a single pen held by a
+   right-handed user. A provider has no way to know the user's handedness.
+3. **No physically registered frame.** Amendment 7 reads a `RIG_LOCAL` pose as fractions of the
+   display height applied to the app's canvas. That is right for hands — they stay on the scene and
+   resize with the window — and wrong for a pen: in a window, a pen tip touching the glass is drawn
+   `s` times closer to the canvas centre than the pixel it touches.
+
+### Decision
+
+1. **The profile is wired, generically.** `XR_LOGITECH_mx_ink_stylus_interaction` is advertised
+   (`XRT_FEATURE_OPENXR_INTERACTION_LOGITECH_MX_INK`, default ON — unlike the headset-controller
+   profiles of #703, a 3D display's provider can serve it) and
+   `/interaction_profiles/logitech/mx_ink_stylus_logitech` is in `bindings.json` with every path the
+   extension defines on `/user/hand/left|right`, bound to `XRT_DEVICE_MX_INK_STYLUS`, the
+   `XRT_INPUT_MX_INK_*` inputs and `XRT_OUTPUT_NAME_MX_INK_HAPTIC`. Any provider device can bind it;
+   nothing in the runtime is specific to one vendor's hardware. Like every vendor profile it is
+   refused unless the app enables its extension.
+2. **A single tool takes the dominant hand.** `XRT_DEVICE_TYPE_DOMINANT_HAND_CONTROLLER` (appended)
+   is resolved by the builder **in place** to RIGHT or LEFT before any role is read, from a
+   **Handedness** class policy (`InputProviders\Policy\Handedness`, 0 = right, 1 = left, default
+   right; the POSIX `handedness` file) read through the input loader like `EmulatedControllers`.
+   Nothing downstream — arbiter, IPC, CLI, state tracker — sees the new value. The same answer is a
+   host-iface slot, `get_handedness`, carved from `reserved[8]` (ADR-020: size and offsets unchanged,
+   **API major stays 1**, no minor exists); its presence is how a provider learns DOMINANT is
+   honoured. The other hand keeps its own Amendment 3 walk.
+3. **A glass-registered frame.** `XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL` (appended) has the
+   `RIG_LOCAL` frame, anchoring and rig rule, so the provider contract is unchanged — physical
+   display-plane metres. A session that owns its canvas reads it as a **physical point of the
+   glass** instead of a canvas fraction: with no `XR_DXR_view_rig`, on the physical display plane
+   unscaled (the frame of the raw display-plane eyes such sessions get); with a rig, rebased into the
+   canvas like every eye and carried by the rig's **glass** mapping — the canvas scaled by
+   `m2v = virtualDisplayHeight / canvas height` about the rig's canvas centre (Kooima Step 4; a
+   camera rig's glass on its convergence plane). The pen is **screen-anchored**: it follows rig
+   motion in a runtime-window session exactly as the screen does, and never follows eye-tracked
+   parallax (Amendment 2 unchanged).
+
+### Why these shapes
+
+- **A new tracking type rather than a flag on RIG_LOCAL.** The origin type is already the per-device
+  frame selector, it already crosses IPC verbatim (`ipc_shared_tracking_origin::type`), and a provider
+  sets it once. A flag would have needed a new field on a struct providers allocate.
+- **Glass scale, not the eye scale.** A display rig scales eyes by `perspectiveFactor · m2v` but the
+  screen by `m2v` alone. A pen's job is the screen: on the glass the frame is exact for every
+  `perspectiveFactor`; off the glass it equals the eyes' mapping whenever the factor is 1, and no
+  single point can satisfy both eyes otherwise.
+- **Hand joints stay canvas-relative.** Amendment 7's reasons still hold for hands; a provider that
+  publishes both a pen and hands uses one origin per frame.
+- **The profile is the existing Khronos one.** Apps and engines already written against it get a pen
+  with no DisplayXR-specific code; a DisplayXR-specific stylus profile would fragment that.
+
+### Consequences
+
+- Engine plug-ins still have to surface OpenXR actions for any provider device to reach an engine
+  app (epic #2679 items); native OpenXR apps get the stylus now.
+- A provider built against these headers and run on an older runtime finds no stylus profile and no
+  DOMINANT resolution there. `XRT_INPUT_PLUGIN_HAS_STYLUS` only says what the provider was
+  compiled against; at run time `get_handedness == NULL` (or a `struct_size` that does not cover
+  it) is what tells it so.
+- Handedness is read at system build; a change applies to the next one.
+- Pinned by `tests_view_rig_point` (`[rig_local_physical]`), `tests_input_handedness`,
+  `tests_input_host_geometry` and `tests_oxr_view_space` (`[stylus_profile]`: every path binds with
+  the extension enabled; the profile is refused without it). Spec: input-provider-discovery.md §4
+  item 7, §4b.4a, §4b.6; reference: `docs/reference/xrt_input_plugin_iface.md`.

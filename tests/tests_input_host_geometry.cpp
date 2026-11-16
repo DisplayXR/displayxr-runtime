@@ -48,6 +48,10 @@ TEST_CASE("input host display geometry")
 	CHECK(host->struct_size == sizeof(struct xrt_input_plugin_host_iface));
 	CHECK(host->host_api_version == XRT_INPUT_PLUGIN_API_VERSION_CURRENT);
 	REQUIRE(host->get_display_geometry != nullptr);
+	// ADR-034 Amendment 8: the handedness slot (carved from reserved[8]).
+	REQUIRE(host->get_handedness != nullptr);
+	const uint32_t hand = host->get_handedness();
+	CHECK((hand == XRT_INPUT_HANDEDNESS_RIGHT || hand == XRT_INPUT_HANDEDNESS_LEFT));
 	for (size_t i = 0; i < sizeof(host->reserved) / sizeof(host->reserved[0]); i++) {
 		CHECK(host->reserved[i] == nullptr);
 	}

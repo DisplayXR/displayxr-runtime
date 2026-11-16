@@ -481,6 +481,13 @@ input_host_close_shared_camera(struct xrt_input_host_camera *cam)
 	free(cam);
 }
 
+//! xrt_input_plugin_host_iface::get_handedness (ADR-034 Amendment 8).
+static uint32_t
+input_host_get_handedness(void)
+{
+	return (uint32_t)target_input_plugin_get_handedness(NULL);
+}
+
 /*!
  * Fill @ref g_input_host once and hand it out. Called from
  * `input_try_load_one` immediately before `negotiate`.
@@ -510,6 +517,8 @@ input_host_iface(void)
 		g_input_host.camera_acquire = input_host_camera_acquire;
 		g_input_host.camera_release = input_host_camera_release;
 		g_input_host.close_shared_camera = input_host_close_shared_camera;
+		// The handedness a DOMINANT_HAND_CONTROLLER resolves with.
+		g_input_host.get_handedness = input_host_get_handedness;
 		g_input_host_filled = true;
 	}
 	return &g_input_host;
@@ -948,6 +957,30 @@ target_input_plugin_get_emulated_controllers(const char **out_source)
 }
 
 /*
+ * ADR-034 Amendment 8: `InputProviders\Policy\Handedness` (DWORD, 0 = right,
+ * 1 = left), HKCU over HKLM under the class's `Policy\Lock` — the same
+ * root-policy read as EmulatedControllers.
+ */
+enum xrt_input_handedness
+target_input_plugin_get_handedness(const char **out_source)
+{
+	uint32_t value = XRT_INPUT_HANDEDNESS_RIGHT;
+	const uint32_t tier = target_component_read_policy_dword(&g_input_class, "Handedness", &value);
+	const char *source = "default";
+	if (tier == TARGET_COMPONENT_SETTING_USER) {
+		source = "user";
+	} else if (tier == TARGET_COMPONENT_SETTING_MACHINE) {
+		source = "machine";
+	} else {
+		value = XRT_INPUT_HANDEDNESS_RIGHT;
+	}
+	if (out_source != NULL) {
+		*out_source = source;
+	}
+	return value == XRT_INPUT_HANDEDNESS_LEFT ? XRT_INPUT_HANDEDNESS_LEFT : XRT_INPUT_HANDEDNESS_RIGHT;
+}
+
+/*
  * N3a: `PreferredPlugin` — HKCU first (per user, `input use <id>`), then the
  * HKLM 64-bit view (`--machine`). Same root value name as the DP loader's
  * §2.1 override, under the InputProviders root. Class selection policy, so
@@ -1126,6 +1159,15 @@ target_input_plugin_get_emulated_controllers(const char **out_source)
 	return true; // no per-user store on Android; the pair is always published
 }
 
+enum xrt_input_handedness
+target_input_plugin_get_handedness(const char **out_source)
+{
+	if (out_source != NULL) {
+		*out_source = "default";
+	}
+	return XRT_INPUT_HANDEDNESS_RIGHT; // no per-user store on Android
+}
+
 bool
 target_input_plugin_get_preferred(char *out, size_t cap)
 {
@@ -1217,6 +1259,35 @@ target_input_plugin_get_emulated_controllers(const char **out_source)
 		*out_source = "file";
 	}
 	return c != '0';
+}
+
+/*
+ * ADR-034 Amendment 8: a `handedness` file next to `force_qwerty`; first byte
+ * 'l' / 'L' = left, anything else = right; absent = right. No machine tier.
+ */
+enum xrt_input_handedness
+target_input_plugin_get_handedness(const char **out_source)
+{
+	if (out_source != NULL) {
+		*out_source = "default";
+	}
+	char dir[PATH_MAX];
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return XRT_INPUT_HANDEDNESS_RIGHT;
+	}
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/handedness", dir);
+
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return XRT_INPUT_HANDEDNESS_RIGHT;
+	}
+	int c = fgetc(f);
+	fclose(f);
+	if (out_source != NULL) {
+		*out_source = "file";
+	}
+	return (c == 'l' || c == 'L') ? XRT_INPUT_HANDEDNESS_LEFT : XRT_INPUT_HANDEDNESS_RIGHT;
 }
 
 /*

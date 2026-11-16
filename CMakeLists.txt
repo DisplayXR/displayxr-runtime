@@ -436,6 +436,10 @@ option(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3 "Enable XR_HTC_vive_focus3_con
 option(XRT_FEATURE_OPENXR_INTERACTION_FB_PROXIMITY "Enable XR_FB_touch_controller_proximity" OFF)
 option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PRO "Enable XR_FB_touch_controller_pro" OFF)
 option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS "Enable XR_META_touch_controller_plus" OFF)
+# ON: a 6-DoF stylus is a device an input provider on a 3D display can serve
+# (ADR-034 Amendment 8). Advertising the extension costs nothing when no
+# provider device carries the profile; apps simply never see it bound.
+option(XRT_FEATURE_OPENXR_INTERACTION_LOGITECH_MX_INK "Enable XR_LOGITECH_mx_ink_stylus_interaction" ON)
 
 # Defaults for OpenXR layer support
 # Off: DisplayXR is a flat lightfield display, not a reprojecting HMD, so a
@@ -726,6 +730,7 @@ message(STATUS "#    FEATURE_OPENXR_HEADLESS:                       ${XRT_FEATUR
 message(STATUS "#    FEATURE_OPENXR_INTERACTION_EXT_EYE_GAZE:       ${XRT_FEATURE_OPENXR_INTERACTION_EXT_EYE_GAZE}")
 message(STATUS "#    FEATURE_OPENXR_INTERACTION_EXT_HAND:           ${XRT_FEATURE_OPENXR_INTERACTION_EXT_HAND}")
 message(STATUS "#    FEATURE_OPENXR_INTERACTION_EXT_PALM_POSE:      ${XRT_FEATURE_OPENXR_INTERACTION_EXT_PALM_POSE}")
+message(STATUS "#    FEATURE_OPENXR_INTERACTION_LOGITECH_MX_INK:    ${XRT_FEATURE_OPENXR_INTERACTION_LOGITECH_MX_INK}")
 message(STATUS "#    FEATURE_OPENXR_INTERACTION_ML2:                ${XRT_FEATURE_OPENXR_INTERACTION_ML2}")
 message(STATUS "#    FEATURE_OPENXR_INTERACTION_MNDX:               ${XRT_FEATURE_OPENXR_INTERACTION_MNDX}")
 message(STATUS "#    FEATURE_OPENXR_INTERACTION_MSFT_HAND:          ${XRT_FEATURE_OPENXR_INTERACTION_MSFT_HAND}")
