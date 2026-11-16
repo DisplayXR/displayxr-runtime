@@ -10397,7 +10397,8 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	if (!c->has_shared_iosurface && c->macos_window != NULL) {
 		void *vis_view = comp_gl_window_macos_get_view(c->macos_window);
 		if (vis_view != NULL) {
-			c->visibility = u_window_visibility_create(vis_view, NULL, "gl", gl_visibility_changed_macos, c);
+			c->visibility =
+			    u_window_visibility_create(vis_view, NULL, "gl", gl_visibility_changed_macos, c);
 		}
 	}
 #endif
