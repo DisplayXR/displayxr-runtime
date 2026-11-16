@@ -460,6 +460,15 @@ struct comp_d3d12_compositor
 		uint64_t app_defer_blocked;
 		uint64_t app_defer_blocked_ns;
 		uint64_t app_fence_diag_ns;
+		/*!
+		 * #2362: set (once, never cleared) when a deferred drain outlived
+		 * its bound (d3d12_app_drain_deferred). From then on the route stops
+		 * queueing Waits on @ref app_fence and the frame exit goes back to
+		 * the immediate gpu_wait_idle_app: the no-fence path, for the rest
+		 * of the session. Written and read under the compositor mutex (every
+		 * drain site holds it).
+		 */
+		bool app_fence_degraded;
 	} reroute;
 
 	/*!
@@ -1450,6 +1459,53 @@ gpu_wait_idle_out(struct comp_d3d12_compositor *c)
  * deferred or the GPU is already past it. Thread-safe (a fence wait with no
  * event, no shared counter).
  */
+/*!
+ * #2362: a deferred drain outlived its bound. Say which stall holds the
+ * runtime queue, release the one that is ours to release, and drop the route
+ * to the no-fence path for the rest of the session.
+ *
+ * Two things can hold @ref comp_d3d12_compositor::command_queue short of the
+ * deferred value @p v:
+ * - the GPU-side Wait(app_fence, app_fence_waited) this route queued
+ *   (d3d12_reroute_wait_app_release), when the app is late to (or never does)
+ *   submit the Signal for a value it already published. Releasing it is ours
+ *   to do: signal that value on the app's fence from the CPU. The reads it was
+ *   ordering run unordered for the frames already queued (at worst a torn
+ *   frame), instead of the app hanging in xrEndFrame forever.
+ * - anything else on the queue (the xbridge cross-adapter copy, #1017; a hung
+ *   GPU). Nothing here can release that; it is only named.
+ * Either way the route degrades: no further Waits on the app fence, and the
+ * frame exit goes back to the immediate gpu_wait_idle_app. One WARN, on the
+ * transition. Caller holds the compositor mutex.
+ */
+static void
+d3d12_app_release_fence_degrade(struct comp_d3d12_compositor *c, uint64_t defer_v, uint32_t bound_ms)
+{
+	if (c->reroute.app_fence_degraded) {
+		return;
+	}
+	c->reroute.app_fence_degraded = true;
+
+	const uint64_t defer_done = c->app_defer_fence->GetCompletedValue();
+	const uint64_t waited = c->reroute.app_fence_waited;
+	const uint64_t app_done = c->reroute.app_fence != nullptr ? c->reroute.app_fence->GetCompletedValue() : 0;
+
+	if (c->reroute.app_fence != nullptr && app_done != UINT64_MAX && app_done < waited) {
+		const HRESULT hr = c->reroute.app_fence->Signal(waited);
+		U_LOG_W("#2362 hub ingest: deferred drain stuck %u ms on the APP RELEASE FENCE (app fence at %llu, "
+		        "this route waits for %llu; deferred %llu/%llu) - released from the CPU (hr=0x%08lx); release "
+		        "fence OFF for this session, frame exit back to the immediate idle-wait",
+		        bound_ms, (unsigned long long)app_done, (unsigned long long)waited,
+		        (unsigned long long)defer_done, (unsigned long long)defer_v, (unsigned long)hr);
+	} else {
+		U_LOG_W("#2362 hub ingest: deferred drain stuck %u ms but the app release fence is complete (app fence "
+		        "at %llu, waited for %llu; deferred %llu/%llu) - the queue is held by OTHER work (xbridge copy "
+		        "#1017 or a GPU hang), still waiting on it; release fence OFF for this session",
+		        bound_ms, (unsigned long long)app_done, (unsigned long long)waited,
+		        (unsigned long long)defer_done, (unsigned long long)defer_v);
+	}
+}
+
 static void
 d3d12_app_drain_deferred(struct comp_d3d12_compositor *c)
 {
@@ -1475,10 +1531,18 @@ d3d12_app_drain_deferred(struct comp_d3d12_compositor *c)
 		if (!warned) {
 			warned = true;
 			U_LOG_W("#2362 hub ingest: a deferred frame drain has blocked 200 ms — the app's release "
-			        "fence is late (a hang here means the app published a value it never submitted); "
-			        "waiting on");
+			        "fence is late; waiting up to the drain bound");
 		}
-		WaitForSingleObject(c->app_defer_event, INFINITE);
+		// The drain cannot simply give up: the caller resets a command
+		// allocator the GPU may still be reading. What it CAN do is find out
+		// what holds the queue and release the part that is ours to release.
+		static const uint32_t bound_ms =
+		    (uint32_t)debug_get_num_option("DXR_D3D12_RELEASE_DRAIN_TIMEOUT_MS", 2000);
+		const uint32_t rest_ms = bound_ms > 200 ? bound_ms - 200 : 0;
+		if (WaitForSingleObject(c->app_defer_event, rest_ms) == WAIT_TIMEOUT) {
+			d3d12_app_release_fence_degrade(c, v, bound_ms);
+			WaitForSingleObject(c->app_defer_event, INFINITE);
+		}
 	}
 	c->reroute.app_defer_blocked++;
 	c->reroute.app_defer_blocked_ns += os_monotonic_get_ns() - t0;
@@ -1520,7 +1584,7 @@ d3d12_cmd_rearm(struct comp_d3d12_compositor *c)
 static void
 d3d12_reroute_wait_app_release(struct comp_d3d12_compositor *c)
 {
-	if (c->reroute.app_fence == nullptr) {
+	if (c->reroute.app_fence == nullptr || c->reroute.app_fence_degraded) {
 		return;
 	}
 	/*
@@ -1570,7 +1634,10 @@ d3d12_reroute_frame_cpu_wait(struct comp_d3d12_compositor *c)
 	// DXR_D3D12_DEFER_IDLE_WAIT=0 keeps the immediate idle-wait while still
 	// consuming the fence (A/B only: what the deferral buys). Default on.
 	static const bool defer = debug_get_bool_option("DXR_D3D12_DEFER_IDLE_WAIT", true);
-	if (c->reroute.app_fence == nullptr || c->app_defer_fence == nullptr || !defer) {
+	if (c->reroute.app_fence == nullptr || c->app_defer_fence == nullptr || !defer ||
+	    c->reroute.app_fence_degraded) {
+		// A degraded route still drains what it deferred before (the queue
+		// is in order, so the idle-wait below covers it).
 		gpu_wait_idle_app(c);
 		return;
 	}
@@ -7223,8 +7290,9 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			const uint64_t fnow = os_monotonic_get_ns();
 			if (fnow - c->reroute.app_fence_diag_ns >= 10ULL * U_TIME_1S_IN_NS) {
 				c->reroute.app_fence_diag_ns = fnow;
-				U_LOG_W("[RENDER] reroute release_fence=app waits=%llu deferred_blocked=%llu "
+				U_LOG_W("[RENDER] reroute release_fence=%s waits=%llu deferred_blocked=%llu "
 				        "deferred_blocked_ms=%.1f (session totals, #2362)",
+				        c->reroute.app_fence_degraded ? "app-degraded" : "app",
 				        (unsigned long long)c->reroute.app_fence_waits,
 				        (unsigned long long)c->reroute.app_defer_blocked,
 				        (double)c->reroute.app_defer_blocked_ns / 1e6);
