@@ -510,6 +510,63 @@ tc_json_str(const cJSON *obj, const char *field, char *dst, size_t dst_size)
 	(void)u_json_get_string_into_array(node, dst, dst_size);
 }
 
+/*!
+ * Checks the optional `plugin.sandbox` object (plugin-discovery.md §3.1a): what a
+ * plug-in needs when the process hosting the runtime runs inside a container.
+ * The runtime never applies it; a container host reads it. A manifest the
+ * runtime accepts is one every container host can read, so its shape is
+ * checked here. NULL = well-formed, else the reason.
+ */
+static const char *
+tc_check_sandbox(const cJSON *sandbox)
+{
+	if (!cJSON_IsObject(sandbox)) {
+		return "'plugin.sandbox' is not an object";
+	}
+	const cJSON *fs = u_json_get(sandbox, "filesystems");
+	if (fs != NULL) {
+		if (!cJSON_IsArray(fs)) {
+			return "'plugin.sandbox.filesystems' is not an array";
+		}
+		const cJSON *p = NULL;
+		cJSON_ArrayForEach(p, fs)
+		{
+			if (!cJSON_IsString(p) || p->valuestring == NULL || p->valuestring[0] != '/') {
+				return "'plugin.sandbox.filesystems' holds something other than absolute paths";
+			}
+		}
+	}
+	const cJSON *env = u_json_get(sandbox, "env");
+	if (env != NULL) {
+		if (!cJSON_IsObject(env)) {
+			return "'plugin.sandbox.env' is not an object";
+		}
+		const cJSON *kv = NULL;
+		cJSON_ArrayForEach(kv, env)
+		{
+			if (kv->string == NULL || kv->string[0] == '\0' || strchr(kv->string, '=') != NULL ||
+			    !cJSON_IsString(kv)) {
+				return "'plugin.sandbox.env' holds a bad name or a non-string value";
+			}
+		}
+	}
+	const cJSON *libs = u_json_get(sandbox, "host_libraries");
+	if (libs != NULL) {
+		if (!cJSON_IsArray(libs)) {
+			return "'plugin.sandbox.host_libraries' is not an array";
+		}
+		const cJSON *l = NULL;
+		cJSON_ArrayForEach(l, libs)
+		{
+			if (!cJSON_IsString(l) || l->valuestring == NULL || l->valuestring[0] == '\0' ||
+			    strchr(l->valuestring, '/') != NULL) {
+				return "'plugin.sandbox.host_libraries' holds something other than library file names";
+			}
+		}
+	}
+	return NULL;
+}
+
 bool
 target_component_parse_manifest_json(const struct target_component_class *cls,
                                      const char *json_text,
@@ -620,6 +677,17 @@ target_component_parse_manifest_json(const struct target_component_class *cls,
 			}
 			out->setting_count++;
 		}
+	}
+
+	const cJSON *sandbox = u_json_get(plugin, "sandbox");
+	if (sandbox != NULL) {
+		const char *why = tc_check_sandbox(sandbox);
+		if (why != NULL) {
+			target_component_mark_malformed(out, why);
+			cJSON_Delete(root);
+			return false;
+		}
+		out->flags |= TARGET_COMPONENT_FLAG_SANDBOX;
 	}
 
 	// Class-private fields; the hook may reject the row.

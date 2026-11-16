@@ -465,6 +465,7 @@ Fields mirror the Windows registry schema:
 | `plugin.uninstall_command` | `UninstallString` | no     | Informational only; the runtime never runs it (§5).                                   |
 | `plugin.settings`     | `Settings\*`       | no       | Object of `"KEY": "value"` (strings; numbers and booleans are accepted and read as strings, `true` = `"1"`) — the machine tier of the plug-in's own settings (§2.3). Overridden per user by `<id>.settings.json` in the per-user manifest dir (what `dp set` writes), and by `DXR_DP_<ID>_<KEY>` in the hosting process's environment. |
 | `plugin.settings_schema` | n/a (the binary's `describe_settings`) | no | Array of `{"key", "type", "default", "help"}` declaring the keys for `dp options`; merged with what the binary itself declares. |
+| `plugin.sandbox`      | n/a                | no       | Object: what the plug-in needs when the process that hosts the runtime runs **inside a container** (§3.1a). Absent = the plug-in has not said, and a container host leaves it out. A wrongly shaped block makes the manifest malformed. |
 
 Discovery roots are searched in priority order — the per-user root
 above first, then the packaged system roots below. Per-user entries with
@@ -482,6 +483,54 @@ When `XRT_PLUGIN_SEARCH_PATH` is set it is prepended (highest priority), so
 a dev build still overrides an installed one; when it is unset, discovery
 falls through to `/usr/lib/displayxr/plugins/` and the install is
 self-sufficient.
+
+### 3.1a `plugin.sandbox`: what a plug-in needs inside a container (POSIX)
+
+A runtime can run inside a container that is not the host: a Windows game under Proton runs in the Steam Linux
+Runtime container (pressure-vessel), and a Flatpak app runs in its sandbox. The container has its own `/usr`, sees
+only some host paths, and has a different set of system libraries. A container host (for example a Steam
+compatibility tool that starts the game with the installed runtime in-process) then has to make the installed
+plug-ins work there, **without knowing which plug-ins are installed or who made them**. The plug-in is the only party
+that knows what it needs, so it says so in its own manifest:
+
+```json
+"sandbox": {
+    "filesystems":    ["/opt/acme", "/run/acme", "/var/lib/acme"],
+    "env":            { "ACME_RUNTIME_PATH": "/opt/acme/lib/libacme_runtime.so" },
+    "host_libraries": ["libfoo.so.2"]
+}
+```
+
+| Key              | Type                          | Meaning |
+| ---------------- | ----------------------------- | ------- |
+| `filesystems`    | array of absolute paths       | Host paths the plug-in reads at run time (its vendor runtime, a state directory with sockets or a service port, a device store with the panel's identity and calibration). The container host shows them **read-only at the same path**. Paths that do not exist on the host are skipped. |
+| `env`            | object, string values         | Environment the plug-in needs in the hosting process, typically where to find a vendor library that the container's `ld.so` cache does not list. Values are literal. |
+| `host_libraries` | array of library file names   | Libraries (file names / sonames, no path) the plug-in's dependencies need from the **host's** system library path and a container runtime may lack. The container host resolves each through the host's `ld.so` cache, copies it to a private directory and appends that directory to the library path. |
+
+`{}` is a complete answer: the plug-in needs nothing beyond its own binary (the sim-display reference plug-in).
+Unknown keys are ignored, so the block can grow without a format version bump. The runtime's loader checks the
+shape (`filesystems` absolute paths, `env` string values with valid names, `host_libraries` names without `/`) and
+marks the manifest malformed otherwise, so a manifest the runtime accepts is one every container host can read; it
+records that the block is present (`TARGET_COMPONENT_FLAG_SANDBOX`) and applies nothing itself.
+
+**What a container host does** (the rule a host must follow to keep the runtime's choice the runtime's):
+
+1. Read the manifests from the discovery roots of §3.1, in that order (per-user first; an id seen in an earlier
+   root shadows later ones), skipping `"enabled": false`.
+2. Bring a plug-in into the container only if its manifest has a `sandbox` object. Copy its manifest to a directory
+   the container sees and point `XRT_PLUGIN_SEARCH_PATH` at it, with `binary_path` rewritten to where the container
+   sees the file (pressure-vessel shows the host's `/usr` at `/run/host/usr`; a binary elsewhere is exposed
+   read-only at its own path). Apply `filesystems`, `env` and `host_libraries` for every plug-in it brings in.
+3. Run the runtime **in-process** in the container only if **every enabled display processor** (manifests without a
+   `-provider.json` suffix) has a `sandbox` object. Otherwise a plug-in the host would have picked is missing in the
+   container and the runtime there would choose differently; the host must instead connect the app to the host's
+   service over IPC (`XRT_FORCE_MODE=ipc`, the service socket exposed), where the host's choice stands.
+4. Never choose a plug-in itself. The per-user root (where `preferred` and `<id>.settings.json` live, §2.3 / §3.3)
+   is under `$HOME`, which containers share, so `displayxr-cli dp use` and `dp set` keep working inside.
+
+The runtime the container loads must be the installed one (its library from the host, through the container's
+OpenXR runtime import), so its plug-in ABI and Vulkan helpers match the installed plug-ins; over IPC it must match
+the service's version anyway (the client/service git-tag gate).
 
 ### 3.2 Android: convention-driven discovery
 
