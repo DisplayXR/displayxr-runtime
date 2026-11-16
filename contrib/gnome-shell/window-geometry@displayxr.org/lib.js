@@ -36,7 +36,8 @@
 // suspend. A weaving app that lives across the lock therefore keeps its
 // geometry publisher and its phase anchor. What runs on the lock screen:
 //   * the geometry snapshot + WindowsChanged (window rects of the user's own
-//     session, on the user's own session bus),
+//     session, on the user's own session bus; from version 20 every entry's
+//     "hidden" is "locked" there),
 //   * CaptureExclusion1 (removing it at lock would make every excluded window
 //     capturable for the length of the lock),
 //   * WindowPlacement1 / move sync (a client moving its OWN window; nothing a
@@ -97,7 +98,9 @@
 //           connection goes away, or until the extension is disabled. See
 //           "Window titles".
 //   Signal  WindowsChanged(s)     same JSON, emitted on any geometry change
-//           (version 18: never with titles — a signal reaches every listener)
+//           (version 18: never with titles — a signal reaches every listener;
+//           version 20: also on a restack, a workspace switch, the lock
+//           screen coming or going and a monitor change, which move "hidden")
 //
 // Service   : org.displayxr.WindowGeometry          (same bus name)
 // Object    : /org/displayxr/CaptureExclusion
@@ -277,7 +280,18 @@
 //                                           // user's "Always on Top")
 //       "maximized": false,                 // ext v16+: maximized both ways
 //                                           // (half-tiled is not)
-//       "fullscreen": false                 // ext v16+
+//       "fullscreen": false,                // ext v16+
+//       "hidden": ""                        // ext v20+: "" when the window
+//                                           // can be seen, else why not:
+//                                           // "locked" | "minimized" |
+//                                           // "workspace" (not on the active
+//                                           // one) | "covered" (its buffer
+//                                           // rect on its monitor is under
+//                                           // other apps' opaque windows, all
+//                                           // but 2 %). See "Whether a window
+//                                           // can be seen" (displayxr-runtime
+//                                           // #2689). A reader that finds no
+//                                           // key treats the window as seen.
 //     }, ...
 //   ]
 // }
@@ -1442,6 +1456,155 @@
         },
     };
 
+    /*
+     * ── Whether a window can be seen (version 20, displayxr-runtime#2689) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_visibility.js drives it.
+     *
+     * A Wayland client cannot learn whether its window is covered: it never
+     * sees the stacking order. The DisplayXR runtime needs exactly that (ADR-062:
+     * while every 3D window is hidden the lenticular lens goes 2D), so each
+     * window entry says it: "hidden" is "" when the window can be seen, else
+     * why not, checked in this order:
+     *   "locked"    the screen is locked (every window),
+     *   "minimized" minimized (by the app, the user or the dock),
+     *   "workspace" not on the active workspace,
+     *   "covered"   its buffer rect, clipped to its monitor, is covered by
+     *               windows higher in the stack, all but a sliver
+     *               (COVER_TOLERANCE of its area, the Windows tracker's rule).
+     * Occluders mirror the runtime's X11 tracker: a window above counts only
+     * when it is shown, not minimized, on the active workspace, of another
+     * process, of a type a user calls a window (normal, dialog, utility,
+     * toolbar, splash — never a dock, the desktop, a notification, a menu, a
+     * tooltip, a combo or drag icon), not the desktop-icons window, and its
+     * actor is opaque (opacity 255). Its FRAME rect counts (a client-side
+     * shadow is not cover). The shell's own chrome (top bar, dash, the
+     * overview, notifications drawn by the shell) is not a window actor and
+     * never counts. Per-pixel translucency inside an opaque actor is not seen:
+     * such a window counts as cover.
+     *
+     * Read-only, like every other field: nothing here touches a window.
+     */
+    const Visibility = {
+        //! Uncovered share of the target at or below which it counts as covered.
+        COVER_TOLERANCE: 0.02,
+
+        //! Work-list cap for the rect subtraction; past it the answer is
+        //! "visible", the safe side (the lens stays 3D).
+        MAX_PIECES: 256,
+
+        //! [x, y, w, h] intersection of two rects, or null when empty.
+        intersect(a, b) {
+            if (!a || !b)
+                return null;
+            const x0 = Math.max(a[0], b[0]), y0 = Math.max(a[1], b[1]);
+            const x1 = Math.min(a[0] + a[2], b[0] + b[2]), y1 = Math.min(a[1] + a[3], b[1] + b[3]);
+            return x1 > x0 && y1 > y0 ? [x0, y0, x1 - x0, y1 - y0] : null;
+        },
+
+        //! Area of @p target not under any of @p occluders (rect subtraction),
+        //! or -1 when the remainder fragments past MAX_PIECES.
+        uncoveredArea(target, occluders) {
+            let pieces = [target];
+            for (const o of occluders) {
+                if (!o || o[2] <= 0 || o[3] <= 0)
+                    continue;
+                const next = [];
+                for (const r of pieces) {
+                    const x = Visibility.intersect(r, o);
+                    if (!x) {
+                        next.push(r);
+                        continue;
+                    }
+                    const rx1 = r[0] + r[2], ry1 = r[1] + r[3];
+                    const xx1 = x[0] + x[2], xy1 = x[1] + x[3];
+                    // Above and below span the piece; left and right sit
+                    // beside the intersection.
+                    const parts = [
+                        [r[0], r[1], r[2], x[1] - r[1]],
+                        [r[0], xy1, r[2], ry1 - xy1],
+                        [r[0], x[1], x[0] - r[0], x[3]],
+                        [xx1, x[1], rx1 - xx1, x[3]],
+                    ];
+                    for (const p of parts) {
+                        if (p[2] > 0 && p[3] > 0)
+                            next.push(p);
+                    }
+                }
+                if (next.length > Visibility.MAX_PIECES)
+                    return -1;
+                pieces = next;
+                if (pieces.length === 0)
+                    return 0;
+            }
+            return pieces.reduce((s, p) => s + p[2] * p[3], 0);
+        },
+
+        //! Whether @p target ([x, y, w, h]) is covered by @p occluders, all
+        //! but @p tolerance of its area. An empty target is not covered
+        //! (nothing to judge).
+        covered(target, occluders, tolerance = Visibility.COVER_TOLERANCE) {
+            if (!target || target[2] <= 0 || target[3] <= 0)
+                return false;
+            const left = Visibility.uncoveredArea(target, occluders);
+            if (left < 0)
+                return false;
+            return left <= tolerance * target[2] * target[3];
+        },
+
+        //! The window types that cover what is below them (@p T: Meta.WindowType).
+        coversType(type, T) {
+            return type === T.NORMAL || type === T.DIALOG || type === T.MODAL_DIALOG ||
+                type === T.UTILITY || type === T.TOOLBAR || type === T.SPLASHSCREEN;
+        },
+
+        /*
+         * Why window @p o ({pid, shown, minimized, onActiveWorkspace, covers,
+         * desktop, opacity}) does not cover a target of process @p pid: '' when
+         * it does. `covers`: Visibility.coversType of its type.
+         */
+        occluderSkip(o, pid) {
+            if (!o.shown)
+                return 'not-shown';
+            if (o.minimized)
+                return 'minimized';
+            if (!o.onActiveWorkspace)
+                return 'workspace';
+            if (o.pid === pid && pid > 0)
+                return 'same-pid';
+            if (!o.covers || o.desktop)
+                return 'type';
+            if (!(o.opacity >= 255))
+                return 'translucent';
+            return '';
+        },
+
+        /*
+         * "hidden" of every window in @p stack, bottom to top (the order of
+         * global.get_window_actors()). Each entry: {pid, shown, minimized,
+         * onActiveWorkspace, covers, desktop, opacity, frame: [x, y, w, h],
+         * target: [x, y, w, h] | null (its buffer rect clipped to its monitor)}.
+         * Returns an array of reasons, index for index.
+         */
+        compute(stack, locked) {
+            return stack.map((w, i) => {
+                if (locked)
+                    return 'locked';
+                if (w.minimized)
+                    return 'minimized';
+                if (!w.onActiveWorkspace)
+                    return 'workspace';
+                const occ = [];
+                for (let j = i + 1; j < stack.length; j++) {
+                    const o = stack[j];
+                    if (Visibility.occluderSkip(o, w.pid) === '' && Visibility.intersect(o.frame, w.target))
+                        occ.push(o.frame);
+                }
+                return occ.length > 0 && Visibility.covered(w.target, occ) ? 'covered' : '';
+            });
+        },
+    };
+
     globalThis.displayxrWindowGeometry = {
         //! gi: {Clutter, GObject, Meta, Gio, GLib} — however the caller's
         //! shell spells the import. Returns {WindowGeometryService}.
@@ -1468,6 +1631,8 @@
         TitleAccess,
         //! The monitor's work area, exported for its unit test.
         WorkArea,
+        //! Whether each window can be seen, exported for its unit test.
+        Visibility,
     };
 
     function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene, Mtk, GdkPixbuf, moveSync = true,
@@ -3727,7 +3892,10 @@
         class WindowGeometryService {
             enable() {
                 this._windowSignals = new Map(); // Meta.Window -> [handler ids]
+                this._actorSignals = new Map(); // Meta.WindowActor -> [handler ids] (v20)
                 this._displaySignals = [];
+                this._otherSignals = []; // v20: [object, handler id] on other emitters
+                this._hiddenCache = null;
                 this._emitQueued = false;
                 // Version 18: the connections that get window titles.
                 this._titleAccess = TitleAccess.newTracker();
@@ -3764,8 +3932,11 @@
                 // hotkey cares; everything else keeps running.
                 this._sessionModeId = 0;
                 if (Main?.sessionMode && typeof Main.sessionMode.connect === 'function') {
-                    this._sessionModeId = Main.sessionMode.connect('updated',
-                        () => this._workspaceHotkey?.setLocked(WorkspaceHotkeyService.sessionLocked()));
+                    this._sessionModeId = Main.sessionMode.connect('updated', () => {
+                        this._workspaceHotkey?.setLocked(WorkspaceHotkeyService.sessionLocked());
+                        // v20: every window's "hidden" is "locked" on the lock screen.
+                        this._queueEmit();
+                    });
                 }
                 this._nameId = Gio.DBus.session.own_name(
                     'org.displayxr.WindowGeometry',
@@ -3788,6 +3959,12 @@
                 } catch (e) {
                     log(`displayxr: no workareas-changed signal (${e}); work_area follows the next emit`);
                 }
+                // v20: "hidden" follows the stacking order, the active workspace
+                // and the monitors, so each of them emits too (coalesced like
+                // every other change; nothing here fires per frame).
+                this._connectOther(display, 'restacked');
+                this._connectOther(global.workspace_manager, 'active-workspace-changed');
+                this._connectOther(Main?.layoutManager, 'monitors-changed');
                 // Interactive grabs (move / resize). Published as `moving` so a
                 // consumer that repositions a window knows to wait for the user
                 // to let go. The signal's argument list grew a `screen`
@@ -3847,6 +4024,13 @@
                 for (const id of this._displaySignals)
                     global.display.disconnect(id);
                 this._displaySignals = [];
+                for (const [actor, ids] of this._actorSignals)
+                    for (const id of ids)
+                        actor.disconnect(id);
+                this._actorSignals.clear();
+                for (const [obj, id] of this._otherSignals)
+                    obj.disconnect(id);
+                this._otherSignals = [];
 
                 if (this._captureExclusion) {
                     this._captureExclusion.destroy();
@@ -3924,7 +4108,123 @@
                         this._queueEmit();
                     }),
                 ];
+                // v20: moved to another workspace (or to all of them); and the
+                // first show, since the actor may not exist yet at
+                // window-created. Guarded: a signal a shell lacks must not
+                // cost the window its other handlers.
+                for (const [signal, fn] of [
+                    ['workspace-changed', () => this._queueEmit()],
+                    ['shown', () => {
+                        this._trackActor(win);
+                        this._queueEmit();
+                    }],
+                ]) {
+                    try {
+                        ids.push(win.connect(signal, fn));
+                    } catch (e) {
+                        log(`displayxr: no window ${signal} signal (${e}); "hidden" follows the next emit`);
+                    }
+                }
                 this._windowSignals.set(win, ids);
+                this._trackActor(win);
+            }
+
+            //! v20: connect @p signal of @p obj (absent on some shells) to an emit.
+            _connectOther(obj, signal) {
+                if (!obj || typeof obj.connect !== 'function')
+                    return;
+                try {
+                    this._otherSignals.push([obj, obj.connect(signal, () => this._queueEmit())]);
+                } catch (e) {
+                    log(`displayxr: no ${signal} signal (${e}); "hidden" follows the next emit`);
+                }
+            }
+
+            /*
+             * v20: what of a window ACTOR moves "hidden". A window that maps
+             * fades in from opacity 0, so the emit at window-created sees it
+             * translucent; the edge where it turns opaque (and back) emits,
+             * not every step of the fade. Also its visibility, and the end of
+             * a map / minimize / unminimize effect.
+             */
+            _trackActor(win) {
+                const actor = win.get_compositor_private?.() ?? null;
+                if (!actor || this._actorSignals.has(actor))
+                    return;
+                let opaque = actor.opacity >= 255;
+                const ids = [
+                    actor.connect('notify::opacity', () => {
+                        const now = actor.opacity >= 255;
+                        if (now !== opaque) {
+                            opaque = now;
+                            this._queueEmit();
+                        }
+                    }),
+                    actor.connect('notify::visible', () => this._queueEmit()),
+                    actor.connect('destroy', () => this._actorSignals.delete(actor)),
+                ];
+                try {
+                    ids.push(actor.connect('effects-completed', () => this._queueEmit()));
+                } catch (e) {
+                    // Not on every shell: the opacity edge covers a map effect.
+                }
+                this._actorSignals.set(actor, ids);
+            }
+
+            //! v20: "hidden" of every window, from one pass over the stack (see
+            //! "Whether a window can be seen").
+            _hiddenMap() {
+                const display = global.display;
+                const T = Meta.WindowType;
+                let ws = null;
+                try {
+                    ws = global.workspace_manager?.get_active_workspace?.() ?? null;
+                } catch (e) {
+                    ws = null;
+                }
+                const wins = [], stack = [];
+                for (const actor of global.get_window_actors()) {
+                    const win = actor.meta_window;
+                    if (!win)
+                        continue;
+                    let onActive = true;
+                    try {
+                        onActive = !ws || win.located_on_workspace(ws);
+                    } catch (e) {
+                        onActive = true;
+                    }
+                    const f = win.get_frame_rect();
+                    const b = win.get_buffer_rect();
+                    const mon = win.get_monitor();
+                    let target = null;
+                    if (mon >= 0) {
+                        const g = display.get_monitor_geometry(mon);
+                        target = Visibility.intersect([b.x, b.y, b.width, b.height],
+                            [g.x, g.y, g.width, g.height]);
+                    }
+                    wins.push(win);
+                    stack.push({
+                        pid: win.get_pid(),
+                        shown: actor.visible === true,
+                        minimized: win.minimized === true,
+                        onActiveWorkspace: onActive,
+                        covers: Visibility.coversType(win.get_window_type(), T),
+                        desktop: PointerPick.isDesktopWindow(win, Meta),
+                        opacity: actor.opacity,
+                        frame: [f.x, f.y, f.width, f.height],
+                        target,
+                    });
+                }
+                const reasons = Visibility.compute(stack, Main?.sessionMode?.isLocked === true);
+                const map = new Map();
+                wins.forEach((w, i) => map.set(w, reasons[i]));
+                return map;
+            }
+
+            //! v20: "hidden" of @p win, from the snapshot's pass when one is running.
+            _hiddenFor(win) {
+                const map = this._hiddenCache ?? this._hiddenMap();
+                return map.get(win) ?? '';
             }
 
             // Coalesce bursts (interactive drags fire position-changed per
@@ -4067,6 +4367,7 @@
                     above: win.is_above(),
                     maximized: PointerPick.isMaximized(win, Meta),
                     fullscreen: win.is_fullscreen() === true,
+                    hidden: this._hiddenFor(win),
                     ...PointerPick.parentOf(win),
                 };
             }
@@ -4079,17 +4380,23 @@
                 const focus = global.display.focus_window;
                 const windows = [];
                 const layout = currentLayoutMode();
-                for (const actor of global.get_window_actors()) {
-                    const win = actor.meta_window;
-                    if (!win)
-                        continue;
-                    const type = win.get_window_type();
-                    if (all ? !PointerPick.inAllWindows(type, Meta) : type !== Meta.WindowType.NORMAL)
-                        continue;
-                    const entry = this._windowEntry(win, focus, layout, titles);
-                    if (all)
-                        entry.window_type = type;
-                    windows.push(entry);
+                // v20: one stacking pass serves every entry's "hidden".
+                this._hiddenCache = this._hiddenMap();
+                try {
+                    for (const actor of global.get_window_actors()) {
+                        const win = actor.meta_window;
+                        if (!win)
+                            continue;
+                        const type = win.get_window_type();
+                        if (all ? !PointerPick.inAllWindows(type, Meta) : type !== Meta.WindowType.NORMAL)
+                            continue;
+                        const entry = this._windowEntry(win, focus, layout, titles);
+                        if (all)
+                            entry.window_type = type;
+                        windows.push(entry);
+                    }
+                } finally {
+                    this._hiddenCache = null;
                 }
                 const snapshot = {version: 1};
                 if (layout !== null)

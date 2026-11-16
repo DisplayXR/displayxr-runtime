@@ -378,6 +378,18 @@ spec, §12.5.
   uses it to keep the window out from under the top bar and the dock. A change
   of the work area alone (the dock switched to auto-hide or back) also emits
   `WindowsChanged`. Additive; the schema stays `version: 1`. See the spec, §4.2.
+- Version 20, no interface change: every window entry gains **`hidden`**: `""`
+  when the window can be seen, else why not: `"locked"` (the screen is locked),
+  `"minimized"`, `"workspace"` (not on the active workspace) or `"covered"` (its
+  buffer rect, clipped to its monitor, is under other apps' opaque windows, all
+  but 2 % of it). Docks, the desktop, notifications, menus, tooltips,
+  translucent windows, the app's own windows and the shell's own chrome (top
+  bar, dash) never cover. A Wayland client cannot learn any of this; the
+  DisplayXR runtime reads it for its own window so the lens goes 2D while a 3D
+  window cannot be seen (ADR-062, DisplayXR/displayxr-runtime#2689).
+  `WindowsChanged` is now also emitted on a restack, a workspace switch, the
+  lock screen coming or going and a monitor change (coalesced, never per
+  frame). Additive; the schema stays `version: 1`. See the spec, §4.3.
 
 Verify the extension survives the lock screen (version 14+): lock from another
 terminal (`loginctl lock-session`) or a remote shell, then
