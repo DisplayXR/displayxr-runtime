@@ -565,7 +565,7 @@ the refresh rate, so a constant is wrong in both directions at once.
   so the residual is near-constant, the median drops the odd late frame, and a refresh-rate change
   is followed once a majority of the window is on the new value (5 reports, complete in 9).
 - Before every `process_atlas` the engine publishes that prediction through the Vulkan DP's
-  `set_predicted_scanout` slot. With **no accepted report in the last second** it publishes 0 —
+  `set_predicted_scanout` slot. Nothing is published until **three reports** have been accepted (at start, and again after a stale reset), so one slow first frame after the tile appears cannot set the horizon on its own. With **no accepted report in the last second** it publishes 0 —
   the slot's "unknown" — and the DP uses its own default; a median above the slot's 200 ms bound is
   not published either (0, plus one WARN). A session that never reports never touches the slot.
 - Wire: the entries ride their own call, `weave_present_feedback`, immediately before the submit

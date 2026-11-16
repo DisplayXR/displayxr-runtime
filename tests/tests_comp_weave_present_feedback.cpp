@@ -76,9 +76,18 @@ TEST_CASE("weave present feedback: steady state predicts the residual")
 	CHECK(s.pf.rejected_total == 0);
 }
 
-TEST_CASE("weave present feedback: the first accepted report is the prediction")
+TEST_CASE("weave present feedback: nothing is published before the minimum report count")
 {
 	Sim s;
+	// The first frame after the tile appears is slow (seen on device: 155 ms).
+	REQUIRE(s.frame(P90, 155 * MS) == COMP_WEAVE_PF_ACCEPTED);
+	CHECK(comp_weave_pf_predict(&s.pf, s.now) == 0);
+	for (int i = 1; i < COMP_WEAVE_PF_MIN_REPORTS - 1; i++) {
+		REQUIRE(s.frame(P90, 33 * MS) == COMP_WEAVE_PF_ACCEPTED);
+		CHECK(comp_weave_pf_predict(&s.pf, s.now) == 0);
+	}
+	// The report that reaches the minimum publishes, and the slow first frame
+	// is outvoted by the median.
 	REQUIRE(s.frame(P90, 33 * MS) == COMP_WEAVE_PF_ACCEPTED);
 	CHECK(comp_weave_pf_predict(&s.pf, s.now) == 33 * MS);
 }
@@ -230,7 +239,12 @@ TEST_CASE("weave present feedback: stale feedback reads unknown, then restarts")
 	REQUIRE(s.now - last > COMP_WEAVE_PF_STALE_NS);
 	CHECK(comp_weave_pf_predict(&s.pf, s.now) == 0);
 
-	// Reports resume at another rate: the old window does not outvote them.
+	// Reports resume at another rate: the old window does not outvote them, and
+	// the reset window needs the minimum count again before it publishes.
+	for (int i = 1; i < COMP_WEAVE_PF_MIN_REPORTS; i++) {
+		REQUIRE(s.frame(P60, 61 * MS) == COMP_WEAVE_PF_ACCEPTED);
+		CHECK(comp_weave_pf_predict(&s.pf, s.now) == 0);
+	}
 	REQUIRE(s.frame(P60, 61 * MS) == COMP_WEAVE_PF_ACCEPTED);
 	CHECK(comp_weave_pf_predict(&s.pf, s.now) == 61 * MS);
 }
