@@ -35,6 +35,77 @@ static const char* APP_NAME = "cube_hosted_d3d11_win";
 // Global state
 static bool g_running = true;
 
+// ============================================================================
+// Stylus mode (ADR-034 Amendment 8) — optional, `--stylus` / DXR_STYLUS=1.
+//
+// Binds /interaction_profiles/logitech/mx_ink_stylus_logitech
+// (XR_LOGITECH_mx_ink_stylus_interaction) through the shared
+// test_apps/common/dxr_stylus.h and draws the pen: the tip marker (grows with
+// tip force), the barrel and the aim ray with the textured cube, plus a
+// three-axis jack at the tip and the ray as lines in the pressure colour
+// (green = hovering, through yellow to red, blue = docked). A rising edge of
+// the front cluster click buzzes that hand. Drive it with the sim-stylus
+// provider (DXR_INPUT_SIM_STYLUS_ENABLE=1) or any stylus input provider.
+// ============================================================================
+
+static bool g_stylusMode = false;
+static dxr::Stylus g_stylus;
+static dxr::StylusDraws g_stylusDraws;
+
+static void StylusLogToApp(bool error, const char *msg)
+{
+    if (error) {
+        LOG_ERROR("%s", msg);
+    } else {
+        LOG_INFO("%s", msg);
+    }
+}
+
+//! The pen in one view: boxes with the shared textured cube, lines with the
+//! renderer's grid shaders re-drawing the grid's first segment (no new pipeline).
+static void DrawStylus(D3D11Renderer &renderer, ID3D11RenderTargetView *rtv, ID3D11DepthStencilView *dsv,
+                       const XMMATRIX &viewMatrix, const XMMATRIX &projMatrix)
+{
+    const dxr::StylusDraws &sd = g_stylusDraws;
+    for (int i = 0; i < sd.boxCount; i++) {
+        XMFLOAT4X4 m4;
+        memcpy(&m4, sd.boxes[i].model, sizeof(m4));
+        XMFLOAT4X4 wvp;
+        XMStoreFloat4x4(&wvp, XMLoadFloat4x4(&m4) * viewMatrix * projMatrix);
+        RenderCubeWithMVP(renderer, rtv, dsv, &wvp.m[0][0]);
+    }
+
+    // The grid's first segment (displayxr-common's grid: i = -10 along Z).
+    const float segA[3] = {-10.0f, -1.0f, -10.0f};
+    const float segB[3] = {-10.0f, -1.0f, 10.0f};
+    ID3D11DeviceContext *ctx = renderer.context.Get();
+    UINT stride = sizeof(float) * 3, offset = 0;
+    ctx->IASetInputLayout(renderer.gridInputLayout.Get());
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+    ctx->IASetVertexBuffers(0, 1, renderer.gridVertexBuffer.GetAddressOf(), &stride, &offset);
+    ctx->VSSetShader(renderer.gridVertexShader.Get(), nullptr, 0);
+    ctx->PSSetShader(GridPixelShaderForTarget(renderer), nullptr, 0);
+    ctx->VSSetConstantBuffers(0, 1, renderer.constantBuffer.GetAddressOf());
+    ctx->PSSetConstantBuffers(0, 1, renderer.constantBuffer.GetAddressOf());
+    for (int i = 0; i < sd.lineCount; i++) {
+        const dxr::StylusLine &l = sd.lines[i];
+        float m[16];
+        dxr::StylusSegmentModel(segA, segB, l.p0, l.p1, m);
+        XMFLOAT4X4 m4;
+        memcpy(&m4, m, sizeof(m4));
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (FAILED(ctx->Map(renderer.constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            return;
+        }
+        ConstantBufferData *cb = (ConstantBufferData *)mapped.pData;
+        XMStoreFloat4x4(&cb->worldViewProj, XMLoadFloat4x4(&m4) * viewMatrix * projMatrix);
+        cb->color = XMFLOAT4(l.color[0], l.color[1], l.color[2], l.color[3]);
+        XMStoreFloat4x4(&cb->model, XMMatrixIdentity());
+        ctx->Unmap(renderer.constantBuffer.Get(), 0);
+        ctx->Draw(2, 0);
+    }
+}
+
 // Performance tracking
 struct PerformanceStats {
     std::chrono::high_resolution_clock::time_point lastTime;
@@ -66,7 +137,6 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hInstance;
     (void)hPrevInstance;
-    (void)lpCmdLine;
     (void)nCmdShow;
 
     // Initialize logging
@@ -81,6 +151,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Initialize OpenXR
     LOG_INFO("Initializing OpenXR...");
     XrSessionManager xr = {};
+    // Stylus mode: `--stylus` on the command line or DXR_STYLUS=1. The
+    // extension is enabled at xrCreateInstance only when asked for.
+    g_stylusMode = (lpCmdLine != nullptr && strstr(lpCmdLine, "--stylus") != nullptr) ||
+                   dxr::StylusRequested(0, nullptr);
+    g_stylusRequested = g_stylusMode;
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
         MessageBox(nullptr, L"Failed to initialize OpenXR", L"Error", MB_OK | MB_ICONERROR);
@@ -131,6 +206,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         CleanupD3D11(renderer);
         ShutdownLogging();
         return 1;
+    }
+
+    // Stylus mode: bind the MX Ink profile. Failure downgrades to the plain cube.
+    if (g_stylusMode) {
+        LOG_INFO("Stylus mode ENABLED (--stylus): logitech/mx_ink_stylus_logitech tip + aim + force + haptic");
+        g_stylus.log = StylusLogToApp;
+        if (!g_hasMxInkExt) {
+            LOG_ERROR("stylus: XR_LOGITECH_mx_ink_stylus_interaction not available on this runtime");
+            g_stylusMode = false;
+        } else if (!dxr::StylusSetup(g_stylus, xr.instance, xr.session, XR_NULL_HANDLE)) {
+            LOG_ERROR("stylus: setup failed - continuing without stylus mode");
+            g_stylusMode = false;
+        }
     }
 
     // Create single swapchain at native display resolution
@@ -195,6 +283,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (xr.sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(xr, frameState)) {
+                // Stylus mode: sync + locate the pen in the views' space.
+                if (g_stylusMode) {
+                    dxr::StylusUpdate(g_stylus, xr.session, xr.localSpace, frameState.predictedDisplayTime,
+                                      XR_NULL_HANDLE);
+                    dxr::StylusBuildDraws(g_stylus, 1.0f, g_stylusDraws);
+                }
                 XrCompositionLayerProjectionView projectionViews[8] = {};
                 uint32_t submitViewCount = 2;
 
@@ -284,6 +378,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                     tileW, tileH,
                                     viewMatrix, projMatrix,
                                     1.0f, 1.6f, -2.0f, 0.3f);
+                                if (g_stylusMode) {
+                                    DrawStylus(renderer, rtv, depthDSV.Get(), viewMatrix, projMatrix);
+                                }
 
                                 // Set up projection view for this eye
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;

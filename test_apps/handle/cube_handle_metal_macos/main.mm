@@ -55,6 +55,7 @@
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
 #include "cursor_depth.h"    // dxr::CursorDepth — XR_DXR_cursor_depth bookkeeping (ADR-046)
 #include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
+#include "dxr_stylus.h"       // --stylus: the shared OpenXR half (ADR-034 Amendment 8)
 
 // ============================================================================
 // Logging
@@ -324,6 +325,8 @@ static void CleanupHands()
 // ============================================================================
 
 static bool g_actionsMode = false;
+// Stylus mode (`--stylus`, below): declared here because --actions defers its attach to it.
+static bool g_stylusMode = false;
 
 struct ActionsState {
     XrActionSet actionSet = XR_NULL_HANDLE;
@@ -342,6 +345,8 @@ struct ActionsState {
     uint64_t hapticsFired = 0;
 };
 static ActionsState g_actions;
+
+static bool CreateActionsSpaces(XrSession session);
 
 static bool SetupActions(XrInstance instance, XrSession session)
 {
@@ -409,6 +414,13 @@ static bool SetupActions(XrInstance instance, XrSession session)
         return false;
     }
 
+    if (g_stylusMode) {
+        // One attach per session: --stylus attaches this set together with its
+        // own and then creates these spaces (CreateActionsSpaces).
+        LOG_INFO("actions: bindings suggested; attach deferred to --stylus");
+        return true;
+    }
+
     XrSessionActionSetsAttachInfo attach = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
     attach.countActionSets = 1;
     attach.actionSets = &g_actions.actionSet;
@@ -416,7 +428,16 @@ static bool SetupActions(XrInstance instance, XrSession session)
         LOG_ERROR("actions: xrAttachSessionActionSets failed");
         return false;
     }
+    if (!CreateActionsSpaces(session)) {
+        return false;
+    }
 
+    LOG_INFO("actions: action set attached (khr/simple_controller, pose + select + haptic)");
+    return true;
+}
+
+static bool CreateActionsSpaces(XrSession session)
+{
     for (int hand = 0; hand < 2; hand++) {
         XrActionSpaceCreateInfo si = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
         si.action = g_actions.poseAction;
@@ -427,8 +448,6 @@ static bool SetupActions(XrInstance instance, XrSession session)
             return false;
         }
     }
-
-    LOG_INFO("actions: action set attached (khr/simple_controller, pose + select + haptic)");
     return true;
 }
 
@@ -508,6 +527,49 @@ static void UpdateActions(XrSession session, XrSpace baseSpace, XrTime displayTi
                  g_actions.pose[1].position.x, g_actions.pose[1].position.y, g_actions.pose[1].position.z,
                  (unsigned long long)g_actions.hapticsFired);
     }
+}
+
+// ============================================================================
+// Stylus mode (ADR-034 Amendment 8) — optional, `--stylus` / DXR_STYLUS=1.
+//
+// Binds /interaction_profiles/logitech/mx_ink_stylus_logitech
+// (XR_LOGITECH_mx_ink_stylus_interaction) on both hands through the shared
+// test_apps/common/dxr_stylus.h and draws, for the hand that holds the pen,
+// the tip marker (grows with tip force), the barrel and the aim ray with the
+// textured cube, plus a three-axis jack at the tip and the ray as lines in the
+// pressure colour (green = hovering, through yellow to red at full pressure,
+// blue = docked), drawn with the grid pipeline. A rising edge of the front
+// cluster click buzzes that hand. Drive it with the sim-stylus provider
+// (DXR_INPUT_SIM_STYLUS_ENABLE=1) or any stylus input provider. Composes with
+// --actions (both action sets are attached together).
+// ============================================================================
+
+static bool g_hasMxInkExt = false; // XR_LOGITECH_mx_ink_stylus_interaction enabled
+static dxr::Stylus g_stylus;
+static dxr::StylusDraws g_stylusDraws;
+
+static void StylusLogToApp(bool error, const char *msg)
+{
+    if (error) {
+        LOG_ERROR("%s", msg);
+    } else {
+        LOG_INFO("%s", msg);
+    }
+}
+
+//! @p extraSet: the --actions set to attach in the same call, or XR_NULL_HANDLE.
+static bool SetupStylus(XrInstance instance, XrSession session, XrActionSet extraSet)
+{
+    if (!g_hasMxInkExt) {
+        LOG_ERROR("stylus: XR_LOGITECH_mx_ink_stylus_interaction not available on this runtime");
+        return false;
+    }
+    g_stylus.log = StylusLogToApp;
+    if (!dxr::StylusSetup(g_stylus, instance, session, extraSet)) {
+        return false;
+    }
+    // The --actions set's spaces wait for this attach (SetupActions deferred it).
+    return extraSet == XR_NULL_HANDLE || CreateActionsSpaces(session);
 }
 
 // ============================================================================
@@ -1246,6 +1308,42 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
             }
         }
 
+        // --- Draw the pen (stylus mode) ---
+        // Boxes with the textured cube; the pressure-coloured jack + ray with
+        // the grid pipeline (two vertices per line, no extra pipeline).
+        if (g_stylusMode) {
+            for (int i = 0; i < g_stylusDraws.boxCount; i++) {
+                CubeUniforms uniforms;
+                mat4_multiply(uniforms.mvp, vp_mat, g_stylusDraws.boxes[i].model);
+                memcpy(uniforms.model, g_stylusDraws.boxes[i].model, sizeof(uniforms.model));
+
+                [enc setRenderPipelineState:r.cubePipeline];
+                [enc setVertexBuffer:r.cubeVertexBuffer offset:0 atIndex:0];
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentTexture:r.textures[0] atIndex:0];
+                [enc setFragmentTexture:r.textures[1] atIndex:1];
+                [enc setFragmentTexture:r.textures[2] atIndex:2];
+                [enc setFragmentSamplerState:r.sampler atIndex:0];
+                [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:36
+                                 indexType:MTLIndexTypeUInt16
+                               indexBuffer:r.cubeIndexBuffer
+                         indexBufferOffset:0];
+            }
+            [enc setRenderPipelineState:r.gridPipeline];
+            for (int i = 0; i < g_stylusDraws.lineCount; i++) {
+                const dxr::StylusLine &l = g_stylusDraws.lines[i];
+                const GridVertex seg[2] = {{{l.p0[0], l.p0[1], l.p0[2]}}, {{l.p1[0], l.p1[1], l.p1[2]}}};
+                GridUniforms uniforms;
+                memcpy(uniforms.mvp, vp_mat, sizeof(uniforms.mvp));
+                memcpy(uniforms.color, l.color, sizeof(uniforms.color));
+                [enc setVertexBytes:seg length:sizeof(seg) atIndex:0];
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:2];
+            }
+        }
+
         // --- Draw grid ---
         {
             const float gridScale = 0.05f;
@@ -1945,6 +2043,8 @@ static bool InitializeOpenXR(AppXrSession &app)
             app.hasLayerDepthExt = true;
         if (strcmp(e.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0)
             g_hasHandTrackingExt = true;
+        if (g_stylusMode && strcmp(e.extensionName, XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME) == 0)
+            g_hasMxInkExt = true;
     }
 
     if (!hasMetalEnable) {
@@ -1980,6 +2080,12 @@ static bool InitializeOpenXR(AppXrSession &app)
     }
     if (g_hasHandTrackingExt) {
         enabledExts.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+    }
+    if (g_hasMxInkExt) {
+        enabledExts.push_back(XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME);
+    }
+    if (g_stylusMode) {
+        LOG_INFO("XR_LOGITECH_mx_ink_stylus_interaction: %s", g_hasMxInkExt ? "ENABLED" : "NOT FOUND");
     }
     if (app.hasCursorDepthExt) {
         const char *opt = getenv("DISPLAYXR_CURSOR_DEPTH");
@@ -2249,6 +2355,27 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
     if (g_actionsMode && !SetupActions(app.instance, app.session)) {
         LOG_ERROR("actions: setup failed — continuing without actions mode");
         g_actionsMode = false;
+    }
+
+    // Stylus mode: bind the MX Ink profile (and attach the --actions set with
+    // it, if any). Failure downgrades to the plain cube.
+    if (g_stylusMode) {
+        LOG_INFO("Stylus mode ENABLED (--stylus): logitech/mx_ink_stylus_logitech tip + aim + force + haptic");
+        if (!SetupStylus(app.instance, app.session, g_actionsMode ? g_actions.actionSet : XR_NULL_HANDLE)) {
+            LOG_ERROR("stylus: setup failed - continuing without stylus mode");
+            g_stylusMode = false;
+            if (g_actionsMode) {
+                // Its attach was deferred to the stylus set; do it alone now.
+                XrSessionActionSetsAttachInfo attach = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+                attach.countActionSets = 1;
+                attach.actionSets = &g_actions.actionSet;
+                if (XR_FAILED(xrAttachSessionActionSets(app.session, &attach)) ||
+                    !CreateActionsSpaces(app.session)) {
+                    LOG_ERROR("actions: late attach failed - continuing without actions mode");
+                    g_actionsMode = false;
+                }
+            }
+        }
     }
 
     // #825 hands mode: create the hand trackers right after session
@@ -3156,6 +3283,10 @@ int main(int argc, char **argv)
         LOG_INFO("Hands mode ENABLED (--hands): XR_EXT_hand_tracking joint markers");
     }
 
+    // Stylus mode: `--stylus` flag or DXR_STYLUS=1. The extension is enabled
+    // at xrCreateInstance only when asked for.
+    g_stylusMode = dxr::StylusRequested(argc, (const char *const *)argv);
+
     // #439 Phase 3 cases 2/3/4 (see the g_l2dPanel globals block).
     {
         const char *e = getenv("DXR_LOCAL2D_PANEL");
@@ -3530,6 +3661,12 @@ int main(int argc, char **argv)
         }
         if (g_handsMode) {
             UpdateHands(app.localSpace, frameState.predictedDisplayTime);
+        }
+        // Stylus mode: after --actions (it re-syncs both sets together).
+        if (g_stylusMode) {
+            dxr::StylusUpdate(g_stylus, app.session, app.localSpace, frameState.predictedDisplayTime,
+                              g_actionsMode ? g_actions.actionSet : XR_NULL_HANDLE);
+            dxr::StylusBuildDraws(g_stylus, 1.0f, g_stylusDraws);
         }
 
         std::vector<XrView> views(app.configViews.size(), {XR_TYPE_VIEW});

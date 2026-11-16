@@ -19,6 +19,7 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_display_info.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
+#include "dxr_stylus.h"      // --stylus: the shared OpenXR half (ADR-034 Amendment 8)
 
 #include <cmath>
 #include <csignal>
@@ -42,6 +43,34 @@
 #define LOG_INFO(fmt, ...) fprintf(stderr, "[INFO] " fmt "\n", ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...) fprintf(stderr, "[WARN] " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+
+// ============================================================================
+// Stylus mode (ADR-034 Amendment 8) — optional, `--stylus` / DXR_STYLUS=1.
+//
+// Binds /interaction_profiles/logitech/mx_ink_stylus_logitech
+// (XR_LOGITECH_mx_ink_stylus_interaction) through the shared
+// test_apps/common/dxr_stylus.h and draws the pen: the tip marker (grows with
+// tip force), the barrel and the aim ray with the textured cube, plus a
+// three-axis jack at the tip and the ray as lines in the pressure colour
+// (green = hovering, through yellow to red, blue = docked), drawn with the
+// grid pipeline. A rising edge of the front cluster click buzzes that hand.
+// Drive it with the sim-stylus provider (DXR_INPUT_SIM_STYLUS_ENABLE=1) or any
+// stylus input provider.
+// ============================================================================
+
+static bool g_stylusMode = false;
+static bool g_hasMxInkExt = false; // XR_LOGITECH_mx_ink_stylus_interaction enabled
+static dxr::Stylus g_stylus;
+static dxr::StylusDraws g_stylusDraws;
+
+static void StylusLogToApp(bool error, const char *msg)
+{
+    if (error) {
+        LOG_ERROR("%s", msg);
+    } else {
+        LOG_INFO("%s", msg);
+    }
+}
 
 #define XR_CHECK(call)                                                         \
     do {                                                                       \
@@ -666,6 +695,42 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
 
             [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:r.gridVertexCount];
         }
+
+        // --- Draw the pen (stylus mode) ---
+        // Boxes with the textured cube; the pressure-coloured jack + ray with
+        // the grid pipeline (two vertices per line, no extra pipeline).
+        if (g_stylusMode) {
+            for (int i = 0; i < g_stylusDraws.boxCount; i++) {
+                CubeUniforms uniforms;
+                mat4_multiply(uniforms.mvp, vp_mat, g_stylusDraws.boxes[i].model);
+                memcpy(uniforms.model, g_stylusDraws.boxes[i].model, sizeof(uniforms.model));
+
+                [enc setRenderPipelineState:r.cubePipeline];
+                [enc setVertexBuffer:r.cubeVertexBuffer offset:0 atIndex:0];
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentTexture:r.textures[0] atIndex:0];
+                [enc setFragmentTexture:r.textures[1] atIndex:1];
+                [enc setFragmentTexture:r.textures[2] atIndex:2];
+                [enc setFragmentSamplerState:r.sampler atIndex:0];
+                [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:36
+                                 indexType:MTLIndexTypeUInt16
+                               indexBuffer:r.cubeIndexBuffer
+                         indexBufferOffset:0];
+            }
+            [enc setRenderPipelineState:r.gridPipeline];
+            for (int i = 0; i < g_stylusDraws.lineCount; i++) {
+                const dxr::StylusLine &l = g_stylusDraws.lines[i];
+                const GridVertex seg[2] = {{{l.p0[0], l.p0[1], l.p0[2]}}, {{l.p1[0], l.p1[1], l.p1[2]}}};
+                GridUniforms uniforms;
+                memcpy(uniforms.mvp, vp_mat, sizeof(uniforms.mvp));
+                memcpy(uniforms.color, l.color, sizeof(uniforms.color));
+                [enc setVertexBytes:seg length:sizeof(seg) atIndex:0];
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:2];
+            }
+        }
     }
 
     [enc endEncoding];
@@ -737,6 +802,8 @@ static bool InitializeOpenXR(AppXrSession &app)
             hasMetalEnable = true;
         if (strcmp(e.extensionName, "XR_DXR_display_info") == 0)
             hasDisplayInfoExt = true;
+        if (g_stylusMode && strcmp(e.extensionName, XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME) == 0)
+            g_hasMxInkExt = true;
     }
 
     if (!hasMetalEnable) {
@@ -748,6 +815,10 @@ static bool InitializeOpenXR(AppXrSession &app)
     std::vector<const char*> enabledExts = {XR_KHR_METAL_ENABLE_EXTENSION_NAME};
     if (hasDisplayInfoExt)
         enabledExts.push_back("XR_DXR_display_info");
+    if (g_hasMxInkExt)
+        enabledExts.push_back(XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME);
+    if (g_stylusMode)
+        LOG_INFO("XR_LOGITECH_mx_ink_stylus_interaction: %s", g_hasMxInkExt ? "ENABLED" : "NOT FOUND");
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "MetalCubeOpenXR",
             XR_MAX_APPLICATION_NAME_SIZE);
@@ -1058,7 +1129,9 @@ static void PollEvents(AppXrSession &app)
 
 int main(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    // Stylus mode: `--stylus` flag or DXR_STYLUS=1. The extension is enabled
+    // at xrCreateInstance only when asked for.
+    g_stylusMode = dxr::StylusRequested(argc, (const char *const *)argv);
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
@@ -1091,6 +1164,19 @@ int main(int argc, char **argv)
     if (!CreateSpaces(app)) {
         LOG_ERROR("Failed to create spaces");
         return 1;
+    }
+
+    // Stylus mode: bind the MX Ink profile. Failure downgrades to the plain cube.
+    if (g_stylusMode) {
+        LOG_INFO("Stylus mode ENABLED (--stylus): logitech/mx_ink_stylus_logitech tip + aim + force + haptic");
+        g_stylus.log = StylusLogToApp;
+        if (!g_hasMxInkExt) {
+            LOG_ERROR("stylus: XR_LOGITECH_mx_ink_stylus_interaction not available on this runtime");
+            g_stylusMode = false;
+        } else if (!dxr::StylusSetup(g_stylus, app.instance, app.session, XR_NULL_HANDLE)) {
+            LOG_ERROR("stylus: setup failed - continuing without stylus mode");
+            g_stylusMode = false;
+        }
     }
 
     if (!CreateSwapchain(app)) {
@@ -1131,6 +1217,13 @@ int main(int argc, char **argv)
         if (XR_FAILED(beginRes)) {
             LOG_WARN("xrBeginFrame failed");
             continue;
+        }
+
+        // Stylus mode: sync + locate the pen in the views' space.
+        if (g_stylusMode) {
+            dxr::StylusUpdate(g_stylus, app.session, app.localSpace, frameState.predictedDisplayTime,
+                              XR_NULL_HANDLE);
+            dxr::StylusBuildDraws(g_stylus, 1.0f, g_stylusDraws);
         }
 
         // Locate views

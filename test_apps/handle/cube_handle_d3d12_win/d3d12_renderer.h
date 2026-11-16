@@ -18,6 +18,8 @@
 #include <wrl/client.h>
 #include <vector>
 
+#include "dxr_stylus.h" // --stylus draw list (test_apps/common)
+
 using Microsoft::WRL::ComPtr;
 
 struct D3D12Renderer {
@@ -71,6 +73,9 @@ struct D3D12Renderer {
 
     // Swapchain format (typed, e.g. DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
     DXGI_FORMAT swapchainFormat = DXGI_FORMAT_UNKNOWN;
+
+    // `--stylus`: the pen RenderScene draws after the grid (null = none).
+    const dxr::StylusDraws* stylusDraws = nullptr;
 };
 
 struct D3D12ConstantBuffer {

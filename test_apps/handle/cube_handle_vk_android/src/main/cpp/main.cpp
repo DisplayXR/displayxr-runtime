@@ -42,6 +42,7 @@
 // (test_apps/common/dxr_view_config.h). Unconditional — it only needs
 // <openxr/openxr.h>.
 #include "dxr_view_config.h"
+#include "dxr_stylus.h" // --stylus: the shared OpenXR half (ADR-034 Amendment 8)
 
 #include <atomic>
 #include <cmath>
@@ -69,6 +70,34 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// ============================================================================
+// Stylus mode (ADR-034 Amendment 8) — optional, `adb shell setprop
+// debug.dxr.stylus 1` before launch (the APK has no command line).
+//
+// Binds /interaction_profiles/logitech/mx_ink_stylus_logitech
+// (XR_LOGITECH_mx_ink_stylus_interaction) through the shared
+// test_apps/common/dxr_stylus.h and draws the pen: the tip marker (grows with
+// tip force), the barrel and the aim ray with the crate cube, plus a three-axis
+// jack at the tip and the ray as lines in the pressure colour (green =
+// hovering, through yellow to red, blue = docked), drawn with the grid
+// pipeline. A rising edge of the front cluster click buzzes that hand.
+// ============================================================================
+
+static bool g_stylus_mode = false;
+static bool g_has_mx_ink = false; // XR_LOGITECH_mx_ink_stylus_interaction enabled
+static dxr::Stylus g_stylus;
+static dxr::StylusDraws g_stylus_draws;
+
+static void
+stylus_log_to_app(bool error, const char *msg)
+{
+	if (error) {
+		LOGE("%s", msg);
+	} else {
+		LOGI("%s", msg);
+	}
+}
 
 // Hardware-bring-up verbose debug. Gated on XRT_DEBUG_ANDROID_VERBOSE
 // passed from build.gradle's debug variant. Compiled out in release.
@@ -491,6 +520,12 @@ create_instance(struct android_app *app)
 	// built without it still brings up (degrading to a default stereo atlas).
 	g_has_display_info = false;
 	g_has_view_rig = false;
+	g_has_mx_ink = false;
+	{
+		char stylus_prop[PROP_VALUE_MAX] = {0};
+		g_stylus_mode = (__system_property_get("debug.dxr.stylus", stylus_prop) > 0 && stylus_prop[0] != '0') ||
+		                dxr::StylusRequested(0, nullptr);
+	}
 	{
 		uint32_t ext_count = 0;
 		if (xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr) == XR_SUCCESS &&
@@ -511,6 +546,10 @@ create_instance(struct android_app *app)
 					} else if (std::strcmp(props_buf[i].extensionName,
 					                       XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
 						g_has_view_rig = true;
+					} else if (g_stylus_mode &&
+					           std::strcmp(props_buf[i].extensionName,
+					                       XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME) == 0) {
+						g_has_mx_ink = true;
 #ifdef CUBE_HAVE_ANDROID_SURFACE_BINDING
 					} else if (std::strcmp(props_buf[i].extensionName,
 					                       XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME) ==
@@ -525,7 +564,7 @@ create_instance(struct android_app *app)
 		     g_has_display_info ? "yes" : "no", g_has_view_rig ? "yes" : "no");
 	}
 
-	const char *extensions[5] = {
+	const char *extensions[6] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 	    // _enable2 lets the runtime help create our VkInstance/VkDevice and is
 	    // the modern replacement for _enable.
@@ -537,6 +576,12 @@ create_instance(struct android_app *app)
 	}
 	if (g_has_view_rig) {
 		extensions[extension_count++] = XR_DXR_VIEW_RIG_EXTENSION_NAME;
+	}
+	if (g_has_mx_ink) {
+		extensions[extension_count++] = XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME;
+	}
+	if (g_stylus_mode) {
+		LOGI("XR_LOGITECH_mx_ink_stylus_interaction: %s", g_has_mx_ink ? "ENABLED" : "NOT FOUND");
 	}
 #ifdef CUBE_HAVE_ANDROID_SURFACE_BINDING
 	if (g_has_surface_binding) {
@@ -1371,6 +1416,26 @@ create_reference_space()
 	XrResult res = xrCreateReferenceSpace(g_session, &ci, &g_app_space);
 	log_xr_result("xrCreateReferenceSpace(LOCAL)", res);
 	return res == XR_SUCCESS;
+}
+
+// Stylus mode: bind the MX Ink profile. Never fails the bring-up: a failure
+// downgrades to the plain cube.
+bool
+setup_stylus()
+{
+	if (!g_stylus_mode || g_stylus.actionSet != XR_NULL_HANDLE) {
+		return true;
+	}
+	LOGI("Stylus mode ENABLED (debug.dxr.stylus): logitech/mx_ink_stylus_logitech tip + aim + force + haptic");
+	g_stylus.log = stylus_log_to_app;
+	if (!g_has_mx_ink) {
+		LOGE("stylus: XR_LOGITECH_mx_ink_stylus_interaction not available on this runtime");
+		g_stylus_mode = false;
+	} else if (!dxr::StylusSetup(g_stylus, g_instance, g_session, XR_NULL_HANDLE)) {
+		LOGE("stylus: setup failed - continuing without stylus mode");
+		g_stylus_mode = false;
+	}
+	return true;
 }
 
 // Initialize the crate cube + grid scene (pipelines, geometry, textures). Runs
@@ -2440,6 +2505,27 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 		const Mat4 cube_mvp = mat4_mul(view_proj, cube_model);
 		crate_scene_draw_cube(g_scene, cmd, cube_mvp.m, cube_model_normals.m);
 
+		// Stylus mode: the pen's boxes with the crate cube; the
+		// pressure-coloured jack + ray by re-drawing the grid's first segment
+		// under a matrix that maps it onto each line (no extra pipeline).
+		if (g_stylus_mode) {
+			for (int b = 0; b < g_stylus_draws.boxCount; b++) {
+				Mat4 box_model;
+				memcpy(box_model.m, g_stylus_draws.boxes[b].model, sizeof(box_model.m));
+				const Mat4 box_mvp = mat4_mul(view_proj, box_model);
+				crate_scene_draw_cube(g_scene, cmd, box_mvp.m, box_model.m);
+			}
+			const float seg_a[3] = {-10.0f, -1.0f, -10.0f};
+			const float seg_b[3] = {-10.0f, -1.0f, 10.0f};
+			for (int l = 0; l < g_stylus_draws.lineCount; l++) {
+				const dxr::StylusLine &line = g_stylus_draws.lines[l];
+				Mat4 seg_model;
+				dxr::StylusSegmentModel(seg_a, seg_b, line.p0, line.p1, seg_model.m);
+				const Mat4 line_mvp = mat4_mul(view_proj, seg_model);
+				crate_scene_draw_grid_range(g_scene, cmd, line_mvp.m, line.color, 0, 2);
+			}
+		}
+
 		// In-frame HUD over the scene in this tile (identity MVP → screen-space
 		// NDC; zero disparity so it sits at the screen plane). Uses the app's
 		// simple pos+color pipeline, re-bound here after the scene pipelines.
@@ -2700,6 +2786,12 @@ render_frame()
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrBeginFrame", res);
 		return false;
+	}
+
+	// Stylus mode: sync + locate the pen in the views' space.
+	if (g_stylus_mode) {
+		dxr::StylusUpdate(g_stylus, g_session, g_app_space, frame_state.predictedDisplayTime, XR_NULL_HANDLE);
+		dxr::StylusBuildDraws(g_stylus, 1.0f, g_stylus_draws);
 	}
 
 	XrCompositionLayerProjectionView projection_views[kMaxViews] = {};
@@ -2997,6 +3089,7 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    query_display_info_and_modes() &&
 			    create_swapchains() &&
 			    create_reference_space() &&
+			    setup_stylus() &&
 			    create_frame_ring() &&
 			    create_render_pass() &&
 			    create_pipeline() &&

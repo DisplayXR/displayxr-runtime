@@ -13,6 +13,14 @@
 #include <d3d11.h>
 #define XR_USE_GRAPHICS_API_D3D11
 #include "xr_session_common.h"
+#include "dxr_stylus.h"
+
+// XR_LOGITECH_mx_ink_stylus_interaction (ADR-034 Amendment 8): set
+// g_stylusRequested before InitializeOpenXR (`--stylus`); the extension is
+// enabled only then, and g_hasMxInkExt says whether it was. The OpenXR half
+// of the mode lives in test_apps/common/dxr_stylus.h.
+extern bool g_stylusRequested;
+extern bool g_hasMxInkExt;
 
 // Initialize OpenXR instance (D3D11 only, no win32_window_binding extension)
 bool InitializeOpenXR(XrSessionManager& xr);

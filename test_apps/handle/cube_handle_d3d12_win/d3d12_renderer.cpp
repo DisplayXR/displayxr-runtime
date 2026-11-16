@@ -1054,6 +1054,55 @@ void RenderScene(
         cmdList->DrawInstanced(renderer.gridVertexCount, 1, 0, 0);
     }
 
+    // `--stylus` (test_apps/common/dxr_stylus.h): the pen's boxes with the
+    // textured cube, its pressure-coloured lines by re-drawing the grid's
+    // first segment with a matrix that maps it onto each line — no extra PSO.
+    if (renderer.stylusDraws != nullptr) {
+        const dxr::StylusDraws& sd = *renderer.stylusDraws;
+        for (int i = 0; i < sd.boxCount; i++) {
+            XMFLOAT4X4 m4;
+            memcpy(&m4, sd.boxes[i].model, sizeof(m4));
+            const XMMATRIX model = XMLoadFloat4x4(&m4);
+            D3D12ConstantBuffer cb;
+            XMStoreFloat4x4(&cb.worldViewProj, model * viewMatrix * zoom * projMatrix);
+            cb.color = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+            XMStoreFloat4x4(&cb.model, model);
+            cmdList->SetGraphicsRootSignature(renderer.cubeRootSignature.Get());
+            const bool textured = renderer.texturesLoaded && renderer.cubePSOTextured;
+            cmdList->SetPipelineState(textured ? renderer.cubePSOTextured.Get() : renderer.cubePSO.Get());
+            cmdList->SetGraphicsRoot32BitConstants(0, sizeof(cb) / 4, &cb, 0);
+            if (renderer.srvHeap) {
+                ID3D12DescriptorHeap* heaps[] = { renderer.srvHeap.Get() };
+                cmdList->SetDescriptorHeaps(1, heaps);
+                cmdList->SetGraphicsRootDescriptorTable(1, renderer.srvHeap->GetGPUDescriptorHandleForHeapStart());
+            }
+            cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmdList->IASetVertexBuffers(0, 1, &renderer.cubeVBV);
+            cmdList->IASetIndexBuffer(&renderer.cubeIBV);
+            cmdList->DrawIndexedInstanced(36, 1, 0, 0, 0);
+        }
+        // The grid's first segment (gridVertices[0..1], built at init).
+        const float segA[3] = {-10.0f, -1.0f, -10.0f};
+        const float segB[3] = {-10.0f, -1.0f, 10.0f};
+        cmdList->SetGraphicsRootSignature(renderer.rootSignature.Get());
+        cmdList->SetPipelineState(renderer.gridPSO.Get());
+        cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
+        cmdList->IASetVertexBuffers(0, 1, &renderer.gridVBV);
+        for (int i = 0; i < sd.lineCount; i++) {
+            const dxr::StylusLine& l = sd.lines[i];
+            float m[16];
+            dxr::StylusSegmentModel(segA, segB, l.p0, l.p1, m);
+            XMFLOAT4X4 m4;
+            memcpy(&m4, m, sizeof(m4));
+            D3D12ConstantBuffer cb;
+            XMStoreFloat4x4(&cb.worldViewProj, XMLoadFloat4x4(&m4) * viewMatrix * zoom * projMatrix);
+            cb.color = XMFLOAT4(l.color[0], l.color[1], l.color[2], l.color[3]);
+            XMStoreFloat4x4(&cb.model, XMMatrixIdentity());
+            cmdList->SetGraphicsRoot32BitConstants(0, sizeof(cb) / 4, &cb, 0);
+            cmdList->DrawInstanced(2, 1, 0, 0);
+        }
+    }
+
     // Transition render target back
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;

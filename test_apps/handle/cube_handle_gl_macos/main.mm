@@ -53,6 +53,7 @@
 #include <openxr/XR_DXR_cursor_depth.h>
 #include "cursor_depth.h" // dxr::CursorDepth — XR_DXR_cursor_depth bookkeeping (ADR-046)
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
+#include "dxr_stylus.h"      // --stylus: the shared OpenXR half (ADR-034 Amendment 8)
 
 // ============================================================================
 // Logging
@@ -61,6 +62,34 @@
 #define LOG_INFO(fmt, ...) fprintf(stderr, "[INFO] " fmt "\n", ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...) fprintf(stderr, "[WARN] " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+
+// ============================================================================
+// Stylus mode (ADR-034 Amendment 8) — optional, `--stylus` / DXR_STYLUS=1.
+//
+// Binds /interaction_profiles/logitech/mx_ink_stylus_logitech
+// (XR_LOGITECH_mx_ink_stylus_interaction) through the shared
+// test_apps/common/dxr_stylus.h and draws the pen: the tip marker (grows with
+// tip force), the barrel and the aim ray with the textured cube, plus a
+// three-axis jack at the tip and the ray as lines in the pressure colour
+// (green = hovering, through yellow to red, blue = docked), drawn with the
+// grid program. A rising edge of the front cluster click buzzes that hand.
+// Drive it with the sim-stylus provider (DXR_INPUT_SIM_STYLUS_ENABLE=1) or any
+// stylus input provider.
+// ============================================================================
+
+static bool g_stylusMode = false;
+static bool g_hasMxInkExt = false; // XR_LOGITECH_mx_ink_stylus_interaction enabled
+static dxr::Stylus g_stylus;
+static dxr::StylusDraws g_stylusDraws;
+
+static void StylusLogToApp(bool error, const char *msg)
+{
+    if (error) {
+        LOG_ERROR("%s", msg);
+    } else {
+        LOG_INFO("%s", msg);
+    }
+}
 
 #define XR_CHECK(call)                                                         \
     do {                                                                       \
@@ -813,6 +842,47 @@ static void RenderScene(GLRenderer &r, GLuint targetTex, uint32_t targetW, uint3
             glDrawArrays(GL_LINES, 0, r.gridVertexCount);
         }
 
+        // --- Draw the pen (stylus mode) ---
+        // Boxes with the textured cube (textures still bound from the cube
+        // draw); the pressure-coloured jack + ray by re-drawing the grid's
+        // first segment with a matrix that maps it onto each line.
+        if (g_stylusMode) {
+            glUseProgram(r.cubeProgram);
+            glUniform2f(r.cubeLocTexSize, (float)r.texSizes[0][0], (float)r.texSizes[0][1]);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_RECTANGLE, r.textures[0]);
+            glUniform1i(r.cubeLocBasecolor, 0);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_RECTANGLE, r.textures[1]);
+            glUniform1i(r.cubeLocNormal, 1);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_RECTANGLE, r.textures[2]);
+            glUniform1i(r.cubeLocAO, 2);
+            glBindVertexArray(r.cubeVAO);
+            for (int i = 0; i < g_stylusDraws.boxCount; i++) {
+                float mvp[16];
+                mat4_multiply(mvp, vp_mat, g_stylusDraws.boxes[i].model);
+                glUniformMatrix4fv(r.cubeLocMVP, 1, GL_FALSE, mvp);
+                glUniformMatrix4fv(r.cubeLocModel, 1, GL_FALSE, g_stylusDraws.boxes[i].model);
+                glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+            }
+
+            // The grid's first segment (BuildGridVertices()[0..1]).
+            const float segA[3] = {-10.0f, 0.0f, -10.0f};
+            const float segB[3] = {-10.0f, 0.0f, 10.0f};
+            glUseProgram(r.gridProgram);
+            glBindVertexArray(r.gridVAO);
+            for (int i = 0; i < g_stylusDraws.lineCount; i++) {
+                const dxr::StylusLine &l = g_stylusDraws.lines[i];
+                float m[16], mvp[16];
+                dxr::StylusSegmentModel(segA, segB, l.p0, l.p1, m);
+                mat4_multiply(mvp, vp_mat, m);
+                glUniformMatrix4fv(r.gridLocMVP, 1, GL_FALSE, mvp);
+                glUniform4f(r.gridLocColor, l.color[0], l.color[1], l.color[2], l.color[3]);
+                glDrawArrays(GL_LINES, 0, 2);
+            }
+        }
+
         // --- Depth-aware cursor, app-drawn (DISPLAYXR_CURSOR_DEPTH_DRAW=app):
         // last, never occluded. In runtime mode the runtime draws it. ---
         if (g_cursorDraw.active && r.cursorVAO != 0) {
@@ -1375,6 +1445,8 @@ static bool InitializeOpenXR(AppXrSession &app)
             app.hasAtlasCaptureExt = true;
         if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0)
             app.hasViewRigExt = true;
+        if (g_stylusMode && strcmp(e.extensionName, XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME) == 0)
+            g_hasMxInkExt = true;
         if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
             app.hasCursorDepthExt = true;
             app.cursorDepthSpecVersion = e.extensionVersion;
@@ -1408,6 +1480,12 @@ static bool InitializeOpenXR(AppXrSession &app)
     }
     if (app.hasViewRigExt) {
         enabledExts.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (g_hasMxInkExt) {
+        enabledExts.push_back(XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME);
+    }
+    if (g_stylusMode) {
+        LOG_INFO("XR_LOGITECH_mx_ink_stylus_interaction: %s", g_hasMxInkExt ? "ENABLED" : "NOT FOUND");
     }
     // XR_DXR_cursor_depth (ADR-046): on by default, DISPLAYXR_CURSOR_DEPTH=0
     // opts out (the runtime then does no cursor work at all).
@@ -2033,7 +2111,9 @@ static void PollEvents(AppXrSession &app)
 
 int main(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    // Stylus mode: `--stylus` flag or DXR_STYLUS=1. The extension is enabled
+    // at xrCreateInstance only when asked for.
+    g_stylusMode = dxr::StylusRequested(argc, (const char *const *)argv);
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
@@ -2093,6 +2173,19 @@ int main(int argc, char **argv)
     if (!CreateSpaces(app)) {
         LOG_ERROR("Failed to create spaces");
         return 1;
+    }
+
+    // Stylus mode: bind the MX Ink profile. Failure downgrades to the plain cube.
+    if (g_stylusMode) {
+        LOG_INFO("Stylus mode ENABLED (--stylus): logitech/mx_ink_stylus_logitech tip + aim + force + haptic");
+        g_stylus.log = StylusLogToApp;
+        if (!g_hasMxInkExt) {
+            LOG_ERROR("stylus: XR_LOGITECH_mx_ink_stylus_interaction not available on this runtime");
+            g_stylusMode = false;
+        } else if (!dxr::StylusSetup(g_stylus, app.instance, app.session, XR_NULL_HANDLE)) {
+            LOG_ERROR("stylus: setup failed - continuing without stylus mode");
+            g_stylusMode = false;
+        }
     }
 
     if (!CreateSwapchain(app)) {
@@ -2263,6 +2356,13 @@ int main(int argc, char **argv)
         XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
         if (XR_FAILED(xrBeginFrame(app.session, &beginInfo))) {
             continue;
+        }
+
+        // Stylus mode: sync + locate the pen in the views' space.
+        if (g_stylusMode) {
+            dxr::StylusUpdate(g_stylus, app.session, app.localSpace, frameState.predictedDisplayTime,
+                              XR_NULL_HANDLE);
+            dxr::StylusBuildDraws(g_stylus, 1.0f, g_stylusDraws);
         }
 
         // Locate views

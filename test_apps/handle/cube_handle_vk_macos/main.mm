@@ -36,6 +36,7 @@
 #include "lift_cpu_probe.h" // --lift: XR_DXR_lift spec 4 over CPU images (POSIX v1)
 #include <openxr/XR_DXR_spatial_workspace.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
+#include "dxr_stylus.h"      // --stylus: the shared OpenXR half (ADR-034 Amendment 8)
 
 #include <algorithm>
 #include <cmath>
@@ -72,6 +73,35 @@
 #define LOG_INFO(fmt, ...)  fprintf(stdout, "[INFO]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+
+// ============================================================================
+// Stylus mode (ADR-034 Amendment 8) — optional, `--stylus` / DXR_STYLUS=1.
+//
+// Binds /interaction_profiles/logitech/mx_ink_stylus_logitech
+// (XR_LOGITECH_mx_ink_stylus_interaction) through the shared
+// test_apps/common/dxr_stylus.h and draws the pen: the tip marker (grows with
+// tip force), the barrel and the aim ray with the textured cube, plus a
+// three-axis jack at the tip and the ray as lines in the pressure colour
+// (green = hovering, through yellow to red, blue = docked), drawn with the
+// cursor-sprite line pipeline (this app's only coloured one; depth test off,
+// so the lines are never occluded). A rising edge of the front cluster click
+// buzzes that hand. Drive it with the sim-stylus provider
+// (DXR_INPUT_SIM_STYLUS_ENABLE=1) or any stylus input provider.
+// ============================================================================
+
+static bool g_stylusMode = false;
+static bool g_hasMxInkExt = false; // XR_LOGITECH_mx_ink_stylus_interaction enabled
+static dxr::Stylus g_stylus;
+static dxr::StylusDraws g_stylusDraws;
+
+static void StylusLogToApp(bool error, const char *msg)
+{
+    if (error) {
+        LOG_ERROR("%s", msg);
+    } else {
+        LOG_INFO("%s", msg);
+    }
+}
 
 //! --lift / DISPLAYXR_LIFT_PROBE=1 (test_apps/common/lift_cpu_probe.h).
 static dxr_test::LiftCpuProbe g_liftProbe;
@@ -2027,6 +2057,43 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
             vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
         }
 
+        // --- The pen (stylus mode) ---
+        // Boxes with the textured cube; the pressure-coloured jack + ray by
+        // re-drawing the cursor sprite's first segment with a matrix that maps
+        // it onto each line (no extra pipeline).
+        if (g_stylusMode) {
+            VkDeviceSize offset = 0;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipelineLayout,
+                0, 1, &renderer.descriptorSet, 0, nullptr);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.cubeVertexBuffer, &offset);
+            vkCmdBindIndexBuffer(cmd, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+            for (int i = 0; i < g_stylusDraws.boxCount; i++) {
+                float pushData[32];
+                mat4_multiply(pushData, vp, g_stylusDraws.boxes[i].model);
+                memcpy(pushData + 16, g_stylusDraws.boxes[i].model, 64);
+                vkCmdPushConstants(cmd, renderer.cubePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 128, pushData);
+                vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+            }
+            if (renderer.cursorPipeline != VK_NULL_HANDLE) {
+                // The cursor sprite's first segment (cursorLines[0..1]).
+                const float segA[3] = {-0.5f, 0.0f, 0.0f};
+                const float segB[3] = {-0.15f, 0.0f, 0.0f};
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cursorPipeline);
+                vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.cursorVertexBuffer, &offset);
+                for (int i = 0; i < g_stylusDraws.lineCount; i++) {
+                    const dxr::StylusLine &l = g_stylusDraws.lines[i];
+                    float m[16];
+                    dxr::StylusSegmentModel(segA, segB, l.p0, l.p1, m);
+                    float pushData[20];
+                    mat4_multiply(pushData, vp, m);
+                    memcpy(pushData + 16, l.color, 16);
+                    vkCmdPushConstants(cmd, renderer.cubePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 80, pushData);
+                    vkCmdDraw(cmd, 2, 1, 0, 0);
+                }
+            }
+        }
+
         // --- Depth-aware cursor (XR_DXR_cursor_depth): last, never occluded ---
         if (g_cursorDraw.active && renderer.cursorPipeline != VK_NULL_HANDLE) {
             float model[16];
@@ -2693,6 +2760,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             xr.hasViewRigExt = true;
         }
+        if (g_stylusMode && strcmp(ext.extensionName, XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME) == 0) {
+            g_hasMxInkExt = true;
+        }
         if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
             xr.hasCursorDepthExt = true;
             xr.cursorDepthSpecVersion = ext.extensionVersion;
@@ -2726,6 +2796,12 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     }
     if (xr.hasViewRigExt) {
         enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (g_hasMxInkExt) {
+        enabledExtensions.push_back(XR_LOGITECH_MX_INK_STYLUS_INTERACTION_EXTENSION_NAME);
+    }
+    if (g_stylusMode) {
+        LOG_INFO("XR_LOGITECH_mx_ink_stylus_interaction: %s", g_hasMxInkExt ? "ENABLED" : "NOT FOUND");
     }
     if (xr.hasCursorDepthExt) {
         const char *opt = getenv("DISPLAYXR_CURSOR_DEPTH");
@@ -4053,6 +4129,9 @@ static void PollForwardedInput(AppXrSession& xr) {
 }
 
 int main(int argc, char** argv) {
+    // Stylus mode: `--stylus` flag or DXR_STYLUS=1. The extension is enabled
+    // at xrCreateInstance only when asked for.
+    g_stylusMode = dxr::StylusRequested(argc, (const char *const *)argv);
     g_liftProbe.enabled = dxr_test::LiftCpuProbe::Requested(argc, argv);
     g_liftProbe.gpu = g_liftProbe.enabled && dxr_test::LiftCpuProbe::RequestedGpu(argc, argv);
     // Ensure logs appear immediately even when piped
@@ -4167,6 +4246,19 @@ int main(int argc, char** argv) {
         vkDestroyDevice(vkDevice, nullptr);
         vkDestroyInstance(vkInstance, nullptr);
         return 1;
+    }
+
+    // Stylus mode: bind the MX Ink profile. Failure downgrades to the plain cube.
+    if (g_stylusMode) {
+        LOG_INFO("Stylus mode ENABLED (--stylus): logitech/mx_ink_stylus_logitech tip + aim + force + haptic");
+        g_stylus.log = StylusLogToApp;
+        if (!g_hasMxInkExt) {
+            LOG_ERROR("stylus: XR_LOGITECH_mx_ink_stylus_interaction not available on this runtime");
+            g_stylusMode = false;
+        } else if (!dxr::StylusSetup(g_stylus, xr.instance, xr.session, XR_NULL_HANDLE)) {
+            LOG_ERROR("stylus: setup failed - continuing without stylus mode");
+            g_stylusMode = false;
+        }
     }
 
     // Step 5: Enumerate swapchain images + init renderer
@@ -4564,6 +4656,12 @@ int main(int argc, char** argv) {
         if (xr.sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(xr, frameState)) {
+                // Stylus mode: sync + locate the pen in the views' space.
+                if (g_stylusMode) {
+                    dxr::StylusUpdate(g_stylus, xr.session, xr.localSpace, frameState.predictedDisplayTime,
+                                      XR_NULL_HANDLE);
+                    dxr::StylusBuildDraws(g_stylus, 1.0f, g_stylusDraws);
+                }
                 bool rendered = false;
                 bool display3D = (xr.currentModeIndex < xr.renderingModeCount)
                     ? xr.renderingModeDisplay3D[xr.currentModeIndex] : true;

@@ -27,6 +27,7 @@
 #include "text_overlay.h"
 #include "tracking_loss_director.h" // MANUAL eye-tracking demo (T + L)
 #include "xr_session.h"
+#include "dxr_stylus.h" // --stylus: the shared OpenXR half (test_apps/common)
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 
@@ -271,31 +272,12 @@ static void UpdateActions(XrSession session, XrSpace baseSpace, XrTime displayTi
 // --actions (both action sets are attached together).
 // ============================================================================
 
-struct StylusState {
-    XrActionSet actionSet = XR_NULL_HANDLE;
-    XrAction tipPoseAction = XR_NULL_HANDLE;
-    XrAction aimPoseAction = XR_NULL_HANDLE;
-    XrAction tipForceAction = XR_NULL_HANDLE;
-    XrAction frontClickAction = XR_NULL_HANDLE;
-    XrAction dockedAction = XR_NULL_HANDLE;
-    XrAction hapticAction = XR_NULL_HANDLE;
-    XrPath handPaths[2] = {XR_NULL_PATH, XR_NULL_PATH}; // 0 = left, 1 = right
-    XrSpace tipSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
-    XrSpace aimSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+// The OpenXR half (action set, bindings, sync, locate, haptics) is shared by
+// every cube app: test_apps/common/dxr_stylus.h. This file adds the drawing.
+static dxr::Stylus g_stylus;
 
-    // Per-frame results consumed by the renderer.
-    bool tipValid[2] = {false, false};
-    bool aimValid[2] = {false, false};
-    XrPosef tip[2];
-    XrPosef aim[2];
-    float force[2] = {0.0f, 0.0f};
-    bool docked[2] = {false, false};
-    bool front[2] = {false, false};
-    bool prevFront[2] = {false, false};
-    uint64_t syncCount = 0;
-    uint64_t hapticsFired = 0;
-
-    // Solid-colour box pipeline (the shared cube shader ignores colour).
+// Solid-colour box pipeline (the shared cube shader ignores colour).
+struct StylusGpu {
     bool gpuReady = false;
     bool gpuFailed = false;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
@@ -304,9 +286,16 @@ struct StylusState {
     Microsoft::WRL::ComPtr<ID3D11Buffer> vb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> cb;
 };
-static StylusState g_stylus;
+static StylusGpu g_stylusGpu;
 
-static bool CreateStylusActionSpaces(XrSession session);
+static void StylusLogToApp(bool error, const char *msg)
+{
+    if (error) {
+        LOG_ERROR("%s", msg);
+    } else {
+        LOG_INFO("%s", msg);
+    }
+}
 
 //! @p extraSet: another action set to attach in the same call (`--actions`), or XR_NULL_HANDLE.
 static bool SetupStylus(XrInstance instance, XrSession session, XrActionSet extraSet)
@@ -315,207 +304,15 @@ static bool SetupStylus(XrInstance instance, XrSession session, XrActionSet extr
         LOG_ERROR("stylus: XR_LOGITECH_mx_ink_stylus_interaction not available on this runtime");
         return false;
     }
-
-    XrActionSetCreateInfo setInfo = {XR_TYPE_ACTION_SET_CREATE_INFO};
-    strncpy_s(setInfo.actionSetName, "stylus", sizeof(setInfo.actionSetName) - 1);
-    strncpy_s(setInfo.localizedActionSetName, "Stylus", sizeof(setInfo.localizedActionSetName) - 1);
-    if (XR_FAILED(xrCreateActionSet(instance, &setInfo, &g_stylus.actionSet))) {
-        LOG_ERROR("stylus: xrCreateActionSet failed");
-        return false;
-    }
-
-    xrStringToPath(instance, "/user/hand/left", &g_stylus.handPaths[0]);
-    xrStringToPath(instance, "/user/hand/right", &g_stylus.handPaths[1]);
-
-    struct Def {
-        XrAction *out;
-        XrActionType type;
-        const char *name;
-        const char *localized;
-    } defs[] = {
-        {&g_stylus.tipPoseAction, XR_ACTION_TYPE_POSE_INPUT, "tip_pose", "Tip Pose"},
-        {&g_stylus.aimPoseAction, XR_ACTION_TYPE_POSE_INPUT, "aim_pose", "Aim Pose"},
-        {&g_stylus.tipForceAction, XR_ACTION_TYPE_FLOAT_INPUT, "tip_force", "Tip Force"},
-        {&g_stylus.frontClickAction, XR_ACTION_TYPE_BOOLEAN_INPUT, "front_click", "Front Button"},
-        {&g_stylus.dockedAction, XR_ACTION_TYPE_BOOLEAN_INPUT, "docked", "Docked"},
-        {&g_stylus.hapticAction, XR_ACTION_TYPE_VIBRATION_OUTPUT, "stylus_haptic", "Stylus Haptic"},
-    };
-    for (const Def &d : defs) {
-        XrActionCreateInfo ai = {XR_TYPE_ACTION_CREATE_INFO};
-        ai.countSubactionPaths = 2;
-        ai.subactionPaths = g_stylus.handPaths;
-        ai.actionType = d.type;
-        strncpy_s(ai.actionName, d.name, sizeof(ai.actionName) - 1);
-        strncpy_s(ai.localizedActionName, d.localized, sizeof(ai.localizedActionName) - 1);
-        if (XR_FAILED(xrCreateAction(g_stylus.actionSet, &ai, d.out))) {
-            LOG_ERROR("stylus: create action '%s' failed", d.name);
-            return false;
-        }
-    }
-
-    struct Bind {
-        XrAction action;
-        const char *suffix;
-    } binds[] = {
-        {g_stylus.tipPoseAction, "/input/tip_logitech/pose"},
-        {g_stylus.aimPoseAction, "/input/aim/pose"},
-        {g_stylus.tipForceAction, "/input/tip_logitech/force"},
-        {g_stylus.frontClickAction, "/input/cluster_front_logitech/click"},
-        {g_stylus.dockedAction, "/input/dock_logitech/docked_logitech"},
-        {g_stylus.hapticAction, "/output/haptic"},
-    };
-    std::vector<XrActionSuggestedBinding> suggested;
-    for (const char *hand : {"/user/hand/left", "/user/hand/right"}) {
-        for (const Bind &b : binds) {
-            XrPath p = XR_NULL_PATH;
-            std::string full = std::string(hand) + b.suffix;
-            xrStringToPath(instance, full.c_str(), &p);
-            suggested.push_back({b.action, p});
-        }
-    }
-    XrPath profile = XR_NULL_PATH;
-    xrStringToPath(instance, "/interaction_profiles/logitech/mx_ink_stylus_logitech", &profile);
-    XrInteractionProfileSuggestedBinding suggest = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
-    suggest.interactionProfile = profile;
-    suggest.suggestedBindings = suggested.data();
-    suggest.countSuggestedBindings = (uint32_t)suggested.size();
-    XrResult r = xrSuggestInteractionProfileBindings(instance, &suggest);
-    if (XR_FAILED(r)) {
-        LOG_ERROR("stylus: suggest bindings for mx_ink_stylus_logitech failed (%d)", (int)r);
-        return false;
-    }
-
-    XrActionSet sets[2] = {g_stylus.actionSet, extraSet};
-    XrSessionActionSetsAttachInfo attach = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
-    attach.countActionSets = extraSet != XR_NULL_HANDLE ? 2 : 1;
-    attach.actionSets = sets;
-    if (XR_FAILED(xrAttachSessionActionSets(session, &attach))) {
-        LOG_ERROR("stylus: xrAttachSessionActionSets failed");
-        return false;
-    }
-
-    if (!CreateStylusActionSpaces(session)) {
+    g_stylus.log = StylusLogToApp;
+    if (!dxr::StylusSetup(g_stylus, instance, session, extraSet)) {
         return false;
     }
     // The --actions set's spaces wait for this attach (SetupActions deferred it).
     if (extraSet != XR_NULL_HANDLE && !CreateActionsSpaces(session)) {
         return false;
     }
-    LOG_INFO("stylus: action set attached (logitech/mx_ink_stylus_logitech: tip + aim pose, tip force, "
-             "front click, dock, haptic)%s",
-             extraSet != XR_NULL_HANDLE ? " together with the --actions set" : "");
     return true;
-}
-
-static bool CreateStylusActionSpaces(XrSession session)
-{
-    for (int hand = 0; hand < 2; hand++) {
-        XrActionSpaceCreateInfo si = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
-        si.subactionPath = g_stylus.handPaths[hand];
-        si.poseInActionSpace.orientation.w = 1.0f;
-        si.action = g_stylus.tipPoseAction;
-        if (XR_FAILED(xrCreateActionSpace(session, &si, &g_stylus.tipSpaces[hand]))) {
-            LOG_ERROR("stylus: create tip space (hand %d) failed", hand);
-            return false;
-        }
-        si.action = g_stylus.aimPoseAction;
-        if (XR_FAILED(xrCreateActionSpace(session, &si, &g_stylus.aimSpaces[hand]))) {
-            LOG_ERROR("stylus: create aim space (hand %d) failed", hand);
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool LocateValid(XrSpace space, XrSpace base, XrTime t, XrPosef *out)
-{
-    XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
-    if (XR_FAILED(xrLocateSpace(space, base, t, &loc))) {
-        return false;
-    }
-    const XrSpaceLocationFlags needed = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
-    if ((loc.locationFlags & needed) != needed) {
-        return false;
-    }
-    *out = loc.pose;
-    return true;
-}
-
-//! Per-frame: sync the stylus set (with the --actions set, if any), read it and locate the pen.
-static void UpdateStylus(XrSession session, XrSpace baseSpace, XrTime displayTime)
-{
-    XrActiveActionSet active[2] = {{g_stylus.actionSet, XR_NULL_PATH}, {g_actions.actionSet, XR_NULL_PATH}};
-    XrActionsSyncInfo syncInfo = {XR_TYPE_ACTIONS_SYNC_INFO};
-    syncInfo.countActiveActionSets = g_actionsMode ? 2 : 1;
-    syncInfo.activeActionSets = active;
-    const XrResult sr = xrSyncActions(session, &syncInfo);
-    if (sr == XR_SESSION_NOT_FOCUSED || XR_FAILED(sr)) {
-        g_stylus.tipValid[0] = g_stylus.tipValid[1] = false;
-        g_stylus.aimValid[0] = g_stylus.aimValid[1] = false;
-        return;
-    }
-    g_stylus.syncCount++;
-    for (int hand = 0; hand < 2; hand++) {
-        g_stylus.prevFront[hand] = g_stylus.front[hand];
-        g_stylus.tipValid[hand] = g_stylus.aimValid[hand] = false;
-        g_stylus.front[hand] = false;
-        g_stylus.docked[hand] = false;
-        g_stylus.force[hand] = 0.0f;
-
-        XrActionStateGetInfo gi = {XR_TYPE_ACTION_STATE_GET_INFO};
-        gi.subactionPath = g_stylus.handPaths[hand];
-
-        gi.action = g_stylus.tipPoseAction;
-        XrActionStatePose ps = {XR_TYPE_ACTION_STATE_POSE};
-        if (XR_FAILED(xrGetActionStatePose(session, &gi, &ps)) || !ps.isActive) {
-            continue;
-        }
-        g_stylus.tipValid[hand] = LocateValid(g_stylus.tipSpaces[hand], baseSpace, displayTime, &g_stylus.tip[hand]);
-        g_stylus.aimValid[hand] = LocateValid(g_stylus.aimSpaces[hand], baseSpace, displayTime, &g_stylus.aim[hand]);
-
-        gi.action = g_stylus.tipForceAction;
-        XrActionStateFloat fs = {XR_TYPE_ACTION_STATE_FLOAT};
-        if (XR_SUCCEEDED(xrGetActionStateFloat(session, &gi, &fs)) && fs.isActive) {
-            g_stylus.force[hand] = fs.currentState;
-        }
-        gi.action = g_stylus.dockedAction;
-        XrActionStateBoolean ds = {XR_TYPE_ACTION_STATE_BOOLEAN};
-        if (XR_SUCCEEDED(xrGetActionStateBoolean(session, &gi, &ds)) && ds.isActive) {
-            g_stylus.docked[hand] = ds.currentState == XR_TRUE;
-        }
-        gi.action = g_stylus.frontClickAction;
-        XrActionStateBoolean cs = {XR_TYPE_ACTION_STATE_BOOLEAN};
-        if (XR_SUCCEEDED(xrGetActionStateBoolean(session, &gi, &cs)) && cs.isActive) {
-            g_stylus.front[hand] = cs.currentState == XR_TRUE;
-        }
-
-        // Rising edge of the front button -> a short buzz on that hand.
-        if (g_stylus.front[hand] && !g_stylus.prevFront[hand]) {
-            XrHapticVibration vib = {XR_TYPE_HAPTIC_VIBRATION};
-            vib.amplitude = 0.6f;
-            vib.frequency = XR_FREQUENCY_UNSPECIFIED;
-            vib.duration = 50 * 1000 * 1000; // 50 ms
-            XrHapticActionInfo hi = {XR_TYPE_HAPTIC_ACTION_INFO};
-            hi.action = g_stylus.hapticAction;
-            hi.subactionPath = g_stylus.handPaths[hand];
-            if (XR_SUCCEEDED(xrApplyHapticFeedback(session, &hi, (const XrHapticBaseHeader *)&vib))) {
-                g_stylus.hapticsFired++;
-            }
-        }
-    }
-
-    // Throttled progress line (~every 2 s at 60 FPS).
-    if (g_stylus.syncCount % 120 == 1) {
-        for (int hand = 0; hand < 2; hand++) {
-            if (!g_stylus.tipValid[hand]) {
-                continue;
-            }
-            LOG_INFO("stylus: sync #%llu %s tip=(%.3f,%.3f,%.3f) force=%.2f docked=%d front=%d haptics=%llu",
-                     (unsigned long long)g_stylus.syncCount, hand == 0 ? "L" : "R", g_stylus.tip[hand].position.x,
-                     g_stylus.tip[hand].position.y, g_stylus.tip[hand].position.z, g_stylus.force[hand],
-                     g_stylus.docked[hand], g_stylus.front[hand], (unsigned long long)g_stylus.hapticsFired);
-        }
-    }
 }
 
 static const char *g_stylusShader = R"(
@@ -533,10 +330,10 @@ float4 PSMain(PSIn i) : SV_TARGET { return float4(color.rgb * i.shade, 1.0); }
 
 static bool EnsureStylusGpu(ID3D11Device *device)
 {
-    if (g_stylus.gpuReady || g_stylus.gpuFailed) {
-        return g_stylus.gpuReady;
+    if (g_stylusGpu.gpuReady || g_stylusGpu.gpuFailed) {
+        return g_stylusGpu.gpuReady;
     }
-    g_stylus.gpuFailed = true; // until proven otherwise
+    g_stylusGpu.gpuFailed = true; // until proven otherwise
     Microsoft::WRL::ComPtr<ID3DBlob> vsb, psb, err;
     if (FAILED(D3DCompile(g_stylusShader, strlen(g_stylusShader), "stylus", nullptr, nullptr, "VSMain", "vs_5_0", 0, 0,
                           &vsb, &err)) ||
@@ -545,15 +342,15 @@ static bool EnsureStylusGpu(ID3D11Device *device)
         LOG_ERROR("stylus: shader compile failed: %s", err ? (const char *)err->GetBufferPointer() : "?");
         return false;
     }
-    if (FAILED(device->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &g_stylus.vs)) ||
-        FAILED(device->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &g_stylus.ps))) {
+    if (FAILED(device->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &g_stylusGpu.vs)) ||
+        FAILED(device->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &g_stylusGpu.ps))) {
         return false;
     }
     D3D11_INPUT_ELEMENT_DESC il[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
-    if (FAILED(device->CreateInputLayout(il, 2, vsb->GetBufferPointer(), vsb->GetBufferSize(), &g_stylus.layout))) {
+    if (FAILED(device->CreateInputLayout(il, 2, vsb->GetBufferPointer(), vsb->GetBufferSize(), &g_stylusGpu.layout))) {
         return false;
     }
 
@@ -587,7 +384,7 @@ static bool EnsureStylusGpu(ID3D11Device *device)
     bd.Usage = D3D11_USAGE_IMMUTABLE;
     bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     D3D11_SUBRESOURCE_DATA init = {verts.data(), 0, 0};
-    if (FAILED(device->CreateBuffer(&bd, &init, &g_stylus.vb))) {
+    if (FAILED(device->CreateBuffer(&bd, &init, &g_stylusGpu.vb))) {
         return false;
     }
     D3D11_BUFFER_DESC cbd = {};
@@ -595,11 +392,11 @@ static bool EnsureStylusGpu(ID3D11Device *device)
     cbd.Usage = D3D11_USAGE_DYNAMIC;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    if (FAILED(device->CreateBuffer(&cbd, nullptr, &g_stylus.cb))) {
+    if (FAILED(device->CreateBuffer(&cbd, nullptr, &g_stylusGpu.cb))) {
         return false;
     }
-    g_stylus.gpuFailed = false;
-    g_stylus.gpuReady = true;
+    g_stylusGpu.gpuFailed = false;
+    g_stylusGpu.gpuReady = true;
     return true;
 }
 
@@ -608,39 +405,23 @@ static void DrawStylusBox(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv,
                           const DirectX::XMMATRIX &wvp, const DirectX::XMFLOAT4 &color)
 {
     D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(ctx->Map(g_stylus.cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+    if (FAILED(ctx->Map(g_stylusGpu.cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         return;
     }
     DirectX::XMStoreFloat4x4((DirectX::XMFLOAT4X4 *)m.pData, wvp);
     memcpy((uint8_t *)m.pData + 64, &color, sizeof(color));
-    ctx->Unmap(g_stylus.cb.Get(), 0);
+    ctx->Unmap(g_stylusGpu.cb.Get(), 0);
 
     ctx->OMSetRenderTargets(1, &rtv, dsv);
     UINT stride = 24, offset = 0;
-    ctx->IASetInputLayout(g_stylus.layout.Get());
+    ctx->IASetInputLayout(g_stylusGpu.layout.Get());
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ctx->IASetVertexBuffers(0, 1, g_stylus.vb.GetAddressOf(), &stride, &offset);
-    ctx->VSSetShader(g_stylus.vs.Get(), nullptr, 0);
-    ctx->PSSetShader(g_stylus.ps.Get(), nullptr, 0);
-    ctx->VSSetConstantBuffers(0, 1, g_stylus.cb.GetAddressOf());
-    ctx->PSSetConstantBuffers(0, 1, g_stylus.cb.GetAddressOf());
+    ctx->IASetVertexBuffers(0, 1, g_stylusGpu.vb.GetAddressOf(), &stride, &offset);
+    ctx->VSSetShader(g_stylusGpu.vs.Get(), nullptr, 0);
+    ctx->PSSetShader(g_stylusGpu.ps.Get(), nullptr, 0);
+    ctx->VSSetConstantBuffers(0, 1, g_stylusGpu.cb.GetAddressOf());
+    ctx->PSSetConstantBuffers(0, 1, g_stylusGpu.cb.GetAddressOf());
     ctx->Draw(36, 0);
-}
-
-//! Tip colour: green (hovering) -> yellow -> red (full pressure); blue while docked.
-static DirectX::XMFLOAT4 StylusTipColor(float force, bool docked)
-{
-    if (docked) {
-        return DirectX::XMFLOAT4(0.2f, 0.4f, 1.0f, 1.0f);
-    }
-    const float f = force < 0.0f ? 0.0f : (force > 1.0f ? 1.0f : force);
-    if (f <= 0.0f) {
-        return DirectX::XMFLOAT4(0.1f, 0.9f, 0.2f, 1.0f);
-    }
-    // 0 -> yellow-green, 0.5 -> yellow, 1 -> red.
-    const float r = f < 0.5f ? 0.6f + 0.8f * f : 1.0f;
-    const float g = f < 0.5f ? 0.9f : 0.9f * (1.0f - (f - 0.5f) * 2.0f);
-    return DirectX::XMFLOAT4(r, g, 0.1f, 1.0f);
 }
 
 // ============================================================================
@@ -1901,7 +1682,8 @@ static void RenderOneFrame(RenderState& rs) {
                 }
                 // Stylus mode: after --actions (it re-syncs both sets together).
                 if (g_stylusMode) {
-                    UpdateStylus(xr.session, xr.localSpace, frameState.predictedDisplayTime);
+                    dxr::StylusUpdate(g_stylus, xr.session, xr.localSpace, frameState.predictedDisplayTime,
+                                      g_actionsMode ? g_actions.actionSet : XR_NULL_HANDLE);
                 }
                 uint32_t modeViewCount = (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount)
                     ? xr.renderingModeViewCounts[xr.currentModeIndex] : 2;
@@ -2727,39 +2509,21 @@ static void RenderOneFrame(RenderState& rs) {
                                 float zoomS = useAppProjection ? 1.0f : g_inputState.viewParams.scaleFactor;
                                 XMMATRIX zoomM = XMMatrixScaling(zoomS, zoomS, 1.0f);
                                 ID3D11DeviceContext *sctx = renderer.context.Get();
+                                // The shared draw list, from the poses in this app's world.
+                                dxr::Stylus sw = g_stylus;
                                 for (int hnd = 0; hnd < 2; hnd++) {
-                                    if (!g_stylus.tipValid[hnd]) {
-                                        continue;
-                                    }
-                                    const XrPosef tp = markerWorldPose(g_stylus.tip[hnd]);
-                                    XMMATRIX tipRT = XMMatrixRotationQuaternion(XMVectorSet(
-                                                         tp.orientation.x, tp.orientation.y, tp.orientation.z,
-                                                         tp.orientation.w)) *
-                                                     XMMatrixTranslation(tp.position.x, tp.position.y, tp.position.z);
-                                    const float s = 0.006f + 0.008f * g_stylus.force[hnd];
+                                    sw.hand[hnd].tip = markerWorldPose(g_stylus.hand[hnd].tip);
+                                    sw.hand[hnd].aim = markerWorldPose(g_stylus.hand[hnd].aim);
+                                }
+                                dxr::StylusDraws sd;
+                                dxr::StylusBuildDraws(sw, 1.0f, sd);
+                                for (int bi = 0; bi < sd.boxCount; bi++) {
+                                    const dxr::StylusBox &bx = sd.boxes[bi];
+                                    XMFLOAT4X4 m4;
+                                    memcpy(&m4, bx.model, sizeof(m4));
                                     DrawStylusBox(sctx, viewRtv, eyeDSV,
-                                                  XMMatrixScaling(s, s, s) * tipRT * viewMatrix * zoomM * projMatrix,
-                                                  StylusTipColor(g_stylus.force[hnd], g_stylus.docked[hnd]));
-                                    // Barrel: +Z of the tip pose is toward the back of the pen.
-                                    DrawStylusBox(sctx, viewRtv, eyeDSV,
-                                                  XMMatrixScaling(0.008f, 0.008f, 0.14f) *
-                                                      XMMatrixTranslation(0.0f, 0.0f, 0.07f + 0.5f * s) * tipRT *
-                                                      viewMatrix * zoomM * projMatrix,
-                                                  XMFLOAT4(0.75f, 0.75f, 0.78f, 1.0f));
-                                    if (g_stylus.aimValid[hnd]) {
-                                        const XrPosef ap = markerWorldPose(g_stylus.aim[hnd]);
-                                        XMMATRIX aimRT = XMMatrixRotationQuaternion(XMVectorSet(
-                                                             ap.orientation.x, ap.orientation.y, ap.orientation.z,
-                                                             ap.orientation.w)) *
-                                                         XMMatrixTranslation(ap.position.x, ap.position.y,
-                                                                             ap.position.z);
-                                        // The aim ray: 12 cm along -Z, out of the tip.
-                                        DrawStylusBox(sctx, viewRtv, eyeDSV,
-                                                      XMMatrixScaling(0.0015f, 0.0015f, 0.12f) *
-                                                          XMMatrixTranslation(0.0f, 0.0f, -0.06f) * aimRT *
-                                                          viewMatrix * zoomM * projMatrix,
-                                                      XMFLOAT4(0.1f, 0.85f, 1.0f, 1.0f));
-                                    }
+                                                  XMLoadFloat4x4(&m4) * viewMatrix * zoomM * projMatrix,
+                                                  XMFLOAT4(bx.color[0], bx.color[1], bx.color[2], bx.color[3]));
                                 }
                             }
 

@@ -11,6 +11,7 @@
 #include <dxgi1_6.h>
 #define XR_USE_GRAPHICS_API_D3D12
 #include "xr_session_common.h"
+#include "dxr_stylus.h"
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_cursor_depth.h>
 #include <openxr/XR_DXR_local_3d_zone.h>
@@ -25,6 +26,13 @@ extern int32_t g_displayScreenTop;
 // (not on the shared XrSessionManager); promote to xr_session_common when
 // more consumers adopt it.
 extern bool g_hasViewRigExt;
+
+// XR_LOGITECH_mx_ink_stylus_interaction (ADR-034 Amendment 8): set
+// g_stylusRequested before InitializeOpenXR (`--stylus`); the extension is
+// enabled only then, and g_hasMxInkExt says whether it was. The OpenXR half
+// of the mode lives in test_apps/common/dxr_stylus.h.
+extern bool g_stylusRequested;
+extern bool g_hasMxInkExt;
 
 // XR_DXR_cursor_depth (ADR-046) available + enabled on the instance, and the
 // spec version the runtime advertises (v5 = the runtime can draw the cursor).

@@ -32,6 +32,33 @@
 
 using namespace DirectX;
 
+// ============================================================================
+// Stylus mode (ADR-034 Amendment 8) — optional, `--stylus` / DXR_STYLUS=1.
+//
+// Binds /interaction_profiles/logitech/mx_ink_stylus_logitech
+// (XR_LOGITECH_mx_ink_stylus_interaction) on both hands through the shared
+// test_apps/common/dxr_stylus.h and draws, for the hand that holds the pen,
+// the tip marker (grows with tip force), the barrel and the aim ray with the
+// textured cube, plus a three-axis jack at the tip and the ray as lines in the
+// pressure colour (green = hovering, through yellow to red at full pressure,
+// blue = docked). A rising edge of the front cluster click buzzes that hand.
+// Drive it with the sim-stylus provider (DXR_INPUT_SIM_STYLUS_ENABLE=1) or
+// any stylus input provider.
+// ============================================================================
+
+static bool g_stylusMode = false;
+static dxr::Stylus g_stylus;
+static dxr::StylusDraws g_stylusDraws;
+
+static void StylusLogToApp(bool error, const char *msg)
+{
+    if (error) {
+        LOG_ERROR("%s", msg);
+    } else {
+        LOG_INFO("%s", msg);
+    }
+}
+
 static const char* APP_NAME = "cube_handle_gl_win";
 
 // HUD overlay fractions: WIDTH_FRACTION anchors how wide the HUD appears on screen;
@@ -848,6 +875,13 @@ static void RenderThreadFunc(
         if (xr->sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(*xr, frameState)) {
+                // Stylus mode: sync + locate the pen at this frame's display time, in
+                // the space the views are located in; RenderScene draws the list.
+                if (g_stylusMode) {
+                    dxr::StylusUpdate(g_stylus, xr->session, xr->localSpace, frameState.predictedDisplayTime, XR_NULL_HANDLE);
+                    dxr::StylusBuildDraws(g_stylus, 1.0f, g_stylusDraws);
+                    renderer->stylusDraws = &g_stylusDraws;
+                }
                 bool rendered = false;
                 bool hudSubmitted = false;
 
@@ -1495,7 +1529,6 @@ static void RenderThreadFunc(
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance;
-    (void)lpCmdLine;
 
     if (!InitializeLogging(APP_NAME)) {
         MessageBox(nullptr, L"Failed to initialize logging", L"Warning", MB_OK | MB_ICONWARNING);
@@ -1569,6 +1602,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Initialize OpenXR (must happen after GL context is current for requirements query)
     XrSessionManager xr = {};
     g_xr = &xr;
+    // Stylus mode: `--stylus` on the command line or DXR_STYLUS=1. The
+    // extension is enabled at xrCreateInstance only when asked for.
+    g_stylusMode = (lpCmdLine != nullptr && strstr(lpCmdLine, "--stylus") != nullptr) ||
+                   dxr::StylusRequested(0, nullptr);
+    g_stylusRequested = g_stylusMode;
+
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
         g_xr = nullptr;
@@ -1613,6 +1652,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         wglDeleteContext(hGLRC);
         ShutdownLogging();
         return 1;
+    }
+
+    // Stylus mode: bind the MX Ink profile. Failure downgrades to the plain cube.
+    if (g_stylusMode) {
+        LOG_INFO("Stylus mode ENABLED (--stylus): logitech/mx_ink_stylus_logitech tip + aim + force + haptic");
+        g_stylus.log = StylusLogToApp;
+        if (!g_hasMxInkExt) {
+            LOG_ERROR("stylus: XR_LOGITECH_mx_ink_stylus_interaction not available on this runtime");
+            g_stylusMode = false;
+        } else if (!dxr::StylusSetup(g_stylus, xr.instance, xr.session, XR_NULL_HANDLE)) {
+            LOG_ERROR("stylus: setup failed - continuing without stylus mode");
+            g_stylusMode = false;
+        }
     }
 
     if (!CreateSwapchain(xr, ArrayLayoutEnabled() ? kArraySlices : 1)) {

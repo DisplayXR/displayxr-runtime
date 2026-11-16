@@ -714,6 +714,21 @@ crate_scene_draw_grid(const CrateScene &s, VkCommandBuffer cmd, const float mvp[
 }
 
 void
+crate_scene_draw_grid_range(const CrateScene &s, VkCommandBuffer cmd, const float mvp[16],
+                            const float color[4], uint32_t first, uint32_t count)
+{
+	GridPush pc = {};
+	memcpy(pc.transform, mvp, sizeof(pc.transform));
+	memcpy(pc.color, color, sizeof(pc.color));
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.grid_pipeline);
+	vkCmdPushConstants(cmd, s.grid_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+	                   0, sizeof(pc), &pc);
+	VkDeviceSize offset = 0;
+	vkCmdBindVertexBuffers(cmd, 0, 1, &s.grid_vbuf, &offset);
+	vkCmdDraw(cmd, count, 1, first, 0);
+}
+
+void
 crate_scene_destroy(CrateScene &s)
 {
 	if (s.device == VK_NULL_HANDLE) {

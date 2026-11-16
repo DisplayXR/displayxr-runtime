@@ -72,5 +72,12 @@ void
 crate_scene_draw_grid(const CrateScene &s, VkCommandBuffer cmd, const float mvp[16],
                       const float color[4]);
 
+// Draw `count` vertices of the grid's line list from `first` with the grid
+// pipeline — the `--stylus` mode re-draws the first segment (vertices 0..1,
+// (-10,-1,-10) -> (-10,-1,10)) under a matrix that maps it onto any line.
+void
+crate_scene_draw_grid_range(const CrateScene &s, VkCommandBuffer cmd, const float mvp[16],
+                            const float color[4], uint32_t first, uint32_t count);
+
 void
 crate_scene_destroy(CrateScene &s);

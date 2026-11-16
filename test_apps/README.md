@@ -143,6 +143,12 @@ On Windows, use the generated run scripts in `_package/`:
 _package\run_cube_handle_d3d11_win.bat
 ```
 
+### Stylus mode (`--stylus`)
+
+These cubes take `--stylus` (or `DXR_STYLUS=1`): `cube_handle_{d3d11,d3d12,gl,vk}_win`, `cube_hosted_d3d11_win`, `cube_handle_{metal,gl,vk}_macos`, `cube_hosted_metal_macos` and `cube_handle_vk_linux`. On `cube_handle_vk_android` there is no command line, so run `adb shell setprop debug.dxr.stylus 1` before launch instead. The mode enables `XR_LOGITECH_mx_ink_stylus_interaction` when the runtime advertises it and binds `/interaction_profiles/logitech/mx_ink_stylus_logitech` on both hands. The bindings are tip pose + force, middle-cluster force, front / back cluster click + double tap, dock, aim + grip pose, and haptic. The app then draws the pen: a tip marker that grows with tip force, the barrel and the aim ray, plus a three-axis jack at the tip and the ray as lines in the pressure colour (green = hovering, through yellow to red at full pressure, blue = docked). A front-button press fires a short haptic pulse. A throttled `stylus: sync …` INFO line logs the tip, forces and buttons.
+
+The OpenXR half (action set, bindings, sync, locate, haptics, draw list) is shared in `common/dxr_stylus.h`. Each app only adds the drawing, through its existing cube and line pipelines. Drive it with the reference provider: register it with `scripts\register_dev_plugin.bat input stylus` and set `DXR_INPUT_SIM_STYLUS_ENABLE=1`. Any stylus input provider works too. `cube_handle_d3d11_win` and `cube_handle_metal_macos` also compose it with `--actions` (both action sets attach together). The zones, texture and legacy cubes do not take the flag.
+
 ### Running in the Shell
 
 The [DisplayXR Shell](https://github.com/DisplayXR/displayxr-shell-releases) launches standard handle apps and manages multi-app compositing via IPC transparently — no app changes needed:
