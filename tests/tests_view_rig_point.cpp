@@ -793,3 +793,57 @@ TEST_CASE("RIG_LOCAL_PHYSICAL: a camera rig puts the glass on its convergence pl
 	check_near(got, want, 1e-5f);
 	CHECK(got.y / -got.z == Catch::Approx(htan)); // on the frustum's top edge
 }
+
+TEST_CASE("RIG_LOCAL_PHYSICAL: in a window the pen stays where it physically is (field case)",
+          "[view_rig_point][rig_local_physical]")
+{
+	// cube_handle_d3d11_win --stylus, 2026-11-15: a 1280x720 window at the
+	// top-left of a 0.3442 x 0.1936 m 3840x2160 panel, a display rig at the
+	// LOCAL origin with virtualDisplayHeight 0.24. The sim-stylus figure-eight
+	// (centred on the PHYSICAL display centre, x amplitude 0.25 x width) was
+	// located at x ~ 0.1 .. 0.74 and drawn at the window's bottom-right edge.
+	// That is the glass registration working: the display centre is below and
+	// right of this window, and the window's glass scale is 0.24 / 0.0645.
+	const float W = 0.3442f, H = 0.1936f;
+	const float mpp_x = W / 3840.0f, mpp_y = H / 2160.0f;
+	m_view_rig_canvas c{};
+	c.valid = true;
+	c.width_m = 1280.0f * mpp_x;
+	c.height_m = 720.0f * mpp_y;
+	// Window centre minus display centre, +Y up.
+	c.center = {(640.0f - 1920.0f) * mpp_x, (1080.0f - 360.0f) * mpp_y, 0.0f};
+	c.nominal_y_m = 0.1f;
+	c.nominal_z_m = 0.6f;
+	c.display_height_m = H;
+
+	m_view_rig rig{};
+	rig.kind = M_VIEW_RIG_DISPLAY;
+	rig.pose = {{0, 0, 0, 1}, {0, 0, 0}};
+	rig.virtual_display_height = 0.24f;
+	rig.perspective_factor = 1.0f;
+	const xrt_pose plane = {{0, 0, 0, 1}, {0, 0, 0}};
+
+	const float k = 0.24f / c.height_m;
+	CHECK(m_view_rig_glass_scale(&c, &rig) == Catch::Approx(k));
+
+	// The window centre is the rig origin; the display centre is k x the
+	// window's offset away, on the far side.
+	xrt_vec3 got;
+	m_view_rig_map_physical_point(&c, &rig, &plane, &c.center, &got);
+	check_near(got, xrt_vec3{0, 0, 0}, 1e-5f);
+	const xrt_vec3 display_centre = {0, 0, 0};
+	m_view_rig_map_physical_point(&c, &rig, &plane, &display_centre, &got);
+	check_near(got, xrt_vec3{-c.center.x * k, -c.center.y * k, 0.0f}, 1e-5f);
+	// Outside the window's virtual half-extent on both axes: bottom-right.
+	CHECK(got.x > 0.5f * c.width_m * k);
+	CHECK(got.y < -0.5f * c.height_m * k);
+
+	// The figure-eight's x extremes (0.25 x W either side of the centre)
+	// span the field report's range.
+	const xrt_vec3 left = {-0.25f * W, 0, 0}, right = {0.25f * W, 0, 0};
+	xrt_vec3 gl, gr;
+	m_view_rig_map_physical_point(&c, &rig, &plane, &left, &gl);
+	m_view_rig_map_physical_point(&c, &rig, &plane, &right, &gr);
+	CHECK(gl.x == Catch::Approx(0.10f).margin(0.01f));
+	CHECK(gr.x == Catch::Approx(0.74f).margin(0.01f));
+}

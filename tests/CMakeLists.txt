@@ -999,6 +999,24 @@ if(TARGET tests_oxr_view_space)
 		                 --success --allow-running-no-tests
 		         )
 	endif()
+	# ADR-034 Amendment 8 -- a RIG_LOCAL_PHYSICAL pen ON the glass is at zero
+	# parallax in the session's own views (LOCAL and STAGE, no rig, a display
+	# rig, a camera rig): the sim-stylus plug-in through a generated manifest,
+	# in its own process for the same one-shot provider scan. Windows discovery
+	# is registry-only, so there the arm finds no pen and SUCCEEDs with a WARN.
+	if(TARGET drv_sim_stylus_plugin)
+		set(_stylus_dir "${CMAKE_CURRENT_BINARY_DIR}/stylus_plugins/$<CONFIG>")
+		file(GENERATE
+		     OUTPUT "${_stylus_dir}/190-sim-stylus-input-provider.json"
+		     CONTENT "{\n  \"file_format_version\": \"1.0\",\n  \"plugin\": {\n    \"id\": \"sim-stylus\",\n    \"display_name\": \"DisplayXR Sim Stylus\",\n    \"binary_path\": \"$<TARGET_FILE:drv_sim_stylus_plugin>\",\n    \"probe_order\": 190\n  }\n}\n"
+		     )
+		add_dependencies(tests_oxr_view_space drv_sim_stylus_plugin)
+		add_test(NAME tests_oxr_view_space_stylus
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_stylus_dir}"
+		                 DXR_INPUT_SIM_STYLUS_ENABLE=1 $<TARGET_FILE:tests_oxr_view_space> "[stylus_glass]"
+		                 --success --allow-running-no-tests
+		         )
+	endif()
 	# ADR-054 N6 Part 2 — the viewer-tracking class end to end: sim_tracking's
 	# scripted sweep drives xrLocateViews through sim_display (EXTERNAL_OK, no
 	# tracker of its own), and XR_DXR_display_info advertises the COMPOSED

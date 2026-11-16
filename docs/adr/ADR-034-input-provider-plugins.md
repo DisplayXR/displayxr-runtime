@@ -734,6 +734,11 @@ A 6-DoF tracked stylus is the natural tool for a 3D display — the panel is a s
    camera rig's glass on its convergence plane). The pen is **screen-anchored**: it follows rig
    motion in a runtime-window session exactly as the screen does, and never follows eye-tracked
    parallax (Amendment 2 unchanged).
+   "The rig" is the one the session's **views** were computed with: a chained `XR_DXR_view_rig`,
+   or, for an unchained runtime-window session, the runtime's fly-camera rig (#595), whose default
+   CAMERA mode makes the head device pose the camera and puts the glass on the convergence plane in
+   front of it. (Corrected 2026-11-15: the first cut registered such a session's pen at the head
+   device pose, which is the eye plane in CAMERA mode.)
 
 ### Why these shapes
 

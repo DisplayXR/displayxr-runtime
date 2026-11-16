@@ -829,7 +829,8 @@ session's views put that point:
 
 | Session | A `RIG_LOCAL_PHYSICAL` pose `L` is located at | Why |
 |---|---|---|
-| Runtime-window, no rig chained | `rig(t) ∘ L` (the graph, unchanged) | the head device pose IS the display plane |
+| Runtime-window, no rig chained, no fly-camera rig | `rig(t) ∘ L` (the graph, unchanged) | the head device pose IS the display plane |
+| Runtime-window, no rig chained, the runtime's fly-camera rig (#595) drives the views | as the rig row below, with the **fly-camera rig** as the rig | in its default CAMERA mode the head device pose is the *camera*, not the glass: the views put the glass on the convergence plane in front of it, so `rig(t) ∘ L` would put a pen on the glass in the eye plane (field report: `cube_hosted_d3d11_win --stylus`, tip unrenderable). In DISPLAY mode the plane is the head pose, scaled by the fly-camera's virtual display height |
 | External-window or bridge relay, no rig chained | `T_origin ∘ L` — the physical plane, **not** the canvas, unscaled | these sessions' views are the DP's raw display-plane eyes (ADR-024); a pen on the glass is on the pixel under it |
 | Any non-bridge session whose latest `xrLocateViews` chained an `XR_DXR_view_rig` | `T_origin ∘ scale(Pg, k) ∘ (Pg ∘ inverse(canvas) ∘ L)` | rebased into the canvas like every eye, then the rig's **glass** mapping: `Pg` = the canvas centre through the rig (`m_view_rig_canvas_plane`; a camera rig's glass on its convergence plane), `k` = the glass scale — display rig `virtualDisplayHeight / canvas height` (Kooima Step 4, *without* `perspectiveFactor`), camera rig its virtual screen height / canvas height |
 
@@ -850,7 +851,22 @@ Consequences, pinned by `tests_view_rig_point` (`[rig_local_physical]`):
   behaviour (canvas-relative, Amendment 7); glass registration is for tool
   poses (grip / aim / tip action spaces, `xrLocateSpace(s)`).
 - Before a session's first rigged view locate, and after a locate that chains
-  nothing, the no-rig row applies.
+  nothing, the no-rig row applies (for a runtime-window session the fly-camera
+  row whenever its views come from that rig).
+- The rig that registers the pen is the rig the views were computed with —
+  chained, or the runtime's fly-camera synthesis. `RIG_LOCAL` sources (hands,
+  controllers) still follow only a *chained* rig; the fly-camera rig does not
+  move them. Pinned end to end by `tests_oxr_view_space_stylus` (a pen on the
+  glass is at **zero parallax** between the session's own two views, in LOCAL
+  and STAGE, with no rig, a display rig and a camera rig).
+- **In a window the pen stays where it physically is.** A pen at the physical
+  display centre lands at the display centre's place in the app's world —
+  outside a window that does not cover it, and spread by the glass scale `k`
+  (`virtualDisplayHeight / canvas height`, ≈ 3.7 for a 1280×720 window with a
+  0.24 m rig on a 0.34 × 0.19 m 4K panel). That is the frame working, not a
+  placement error: an app that wants the pen inside its window either covers
+  the glass the pen moves on or maps it itself; a provider has no session
+  knowledge to re-centre with.
 
 ### 4b.5 What the runtime does with the role — the composer
 

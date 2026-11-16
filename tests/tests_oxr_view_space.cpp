@@ -2600,3 +2600,274 @@ TEST_CASE("the stylus profile is refused without its extension", "[oxr][view_spa
 	CHECK(suggest_mx_ink(rt, false) == XR_ERROR_PATH_UNSUPPORTED);
 	tear_down(rt);
 }
+
+namespace {
+
+//! @p i on the runtime's monotonic clock (the clock the sim-stylus script reads).
+int64_t
+instant_mono_ns(const Instant &i)
+{
+#if defined(_WIN32)
+	LARGE_INTEGER f;
+	QueryPerformanceFrequency(&f);
+	return (int64_t)((double)i.qpc.QuadPart * (1e9 / (double)f.QuadPart));
+#else
+	return (int64_t)i.ts.tv_sec * 1000000000LL + (int64_t)i.ts.tv_nsec;
+#endif
+}
+
+Instant
+instant_add_ms(Instant i, int64_t ms)
+{
+#if defined(_WIN32)
+	LARGE_INTEGER f;
+	QueryPerformanceFrequency(&f);
+	i.qpc.QuadPart += f.QuadPart * ms / 1000;
+#else
+	int64_t ns = (int64_t)i.ts.tv_nsec + ms * 1000000LL;
+	i.ts.tv_sec += (time_t)(ns / 1000000000LL);
+	i.ts.tv_nsec = (long)(ns % 1000000000LL);
+#endif
+	return i;
+}
+
+/*!
+ * An instant ahead at which the default sim-stylus script (MODE=draw,
+ * PERIOD_S=6) has its pen ON the glass, mid-stroke: lap phase in
+ * [0.15, 0.70] of the 0.85 contact window, well clear of its ends.
+ */
+Instant
+instant_pen_on_glass()
+{
+	Instant i = instant_ahead();
+	for (int k = 0; k < 32; k++) {
+		const double t = (double)instant_mono_ns(i) * 1e-9;
+		const double u = std::fmod(t, 6.0) / 6.0;
+		if (u > 0.15 && u < 0.70) {
+			return i;
+		}
+		i = instant_add_ms(i, 250);
+	}
+	return i;
+}
+
+//! The stylus tip pose action, attached, with one action space per hand.
+struct StylusTip
+{
+	XrActionSet set = XR_NULL_HANDLE;
+	XrAction tip = XR_NULL_HANDLE;
+	XrSpace space[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+};
+
+void
+stylus_tip_setup(Runtime &rt, StylusTip &st)
+{
+	auto stringToPath = rt.fn<PFN_xrStringToPath>("xrStringToPath");
+	auto createActionSet = rt.fn<PFN_xrCreateActionSet>("xrCreateActionSet");
+	auto createAction = rt.fn<PFN_xrCreateAction>("xrCreateAction");
+	auto suggest = rt.fn<PFN_xrSuggestInteractionProfileBindings>("xrSuggestInteractionProfileBindings");
+	auto attach = rt.fn<PFN_xrAttachSessionActionSets>("xrAttachSessionActionSets");
+	auto createActionSpace = rt.fn<PFN_xrCreateActionSpace>("xrCreateActionSpace");
+
+	auto path = [&](const char *str) {
+		XrPath out = XR_NULL_PATH;
+		REQUIRE(XR_SUCCEEDED(stringToPath(rt.instance, str, &out)));
+		return out;
+	};
+	const XrPath hands[2] = {path("/user/hand/left"), path("/user/hand/right")};
+
+	XrActionSetCreateInfo asci = {XR_TYPE_ACTION_SET_CREATE_INFO};
+	std::snprintf(asci.actionSetName, sizeof(asci.actionSetName), "stylus_glass");
+	std::snprintf(asci.localizedActionSetName, sizeof(asci.localizedActionSetName), "Stylus glass");
+	REQUIRE(XR_SUCCEEDED(createActionSet(rt.instance, &asci, &st.set)));
+
+	XrActionCreateInfo aci = {XR_TYPE_ACTION_CREATE_INFO};
+	std::snprintf(aci.actionName, sizeof(aci.actionName), "tip");
+	std::snprintf(aci.localizedActionName, sizeof(aci.localizedActionName), "Tip");
+	aci.actionType = XR_ACTION_TYPE_POSE_INPUT;
+	aci.countSubactionPaths = 2;
+	aci.subactionPaths = hands;
+	REQUIRE(XR_SUCCEEDED(createAction(st.set, &aci, &st.tip)));
+
+	const XrActionSuggestedBinding b[2] = {
+	    {st.tip, path("/user/hand/left/input/tip_logitech/pose")},
+	    {st.tip, path("/user/hand/right/input/tip_logitech/pose")},
+	};
+	XrInteractionProfileSuggestedBinding sb = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+	sb.interactionProfile = path("/interaction_profiles/logitech/mx_ink_stylus_logitech");
+	sb.countSuggestedBindings = 2;
+	sb.suggestedBindings = b;
+	REQUIRE(XR_SUCCEEDED(suggest(rt.instance, &sb)));
+
+	XrSessionActionSetsAttachInfo ai = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+	ai.countActionSets = 1;
+	ai.actionSets = &st.set;
+	REQUIRE(XR_SUCCEEDED(attach(rt.session, &ai)));
+
+	for (int h = 0; h < 2; h++) {
+		XrActionSpaceCreateInfo si = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
+		si.action = st.tip;
+		si.subactionPath = hands[h];
+		si.poseInActionSpace = {{0, 0, 0, 1}, {0, 0, 0}};
+		REQUIRE(XR_SUCCEEDED(createActionSpace(rt.session, &si, &st.space[h])));
+	}
+}
+
+void
+stylus_tip_sync(Runtime &rt, StylusTip &st)
+{
+	auto sync = rt.fn<PFN_xrSyncActions>("xrSyncActions");
+	XrActiveActionSet active = {st.set, XR_NULL_PATH};
+	XrActionsSyncInfo si = {XR_TYPE_ACTIONS_SYNC_INFO};
+	si.countActiveActionSets = 1;
+	si.activeActionSets = &active;
+	REQUIRE(XR_SUCCEEDED(sync(rt.session, &si)));
+}
+
+//! The tip in @p base, from whichever hand the stylus is on. False = no pen.
+bool
+stylus_tip_locate(Runtime &rt, StylusTip &st, XrSpace base, XrTime t, XrPosef *out)
+{
+	for (int h = 1; h >= 0; h--) { // the dominant (right) hand first
+		XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
+		REQUIRE(XR_SUCCEEDED(rt.pfnLocateSpace(st.space[h], base, t, &loc)));
+		const XrSpaceLocationFlags need = XR_SPACE_LOCATION_POSITION_VALID_BIT;
+		if ((loc.locationFlags & need) == need) {
+			*out = loc.pose;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*!
+ * Where @p p (in the views' base) projects in view @p v: normalised device
+ * coordinates of the view's own asymmetric frustum, and the depth in front of
+ * the eye (> 0 = in front).
+ */
+void
+project_into_view(const XrView &v, const XrVector3f &p, float *out_ndc_x, float *out_ndc_y, float *out_depth)
+{
+	const XrPosef at = {{0, 0, 0, 1}, p};
+	const XrVector3f e = pmul(pinv(v.pose), at).position;
+	*out_depth = -e.z;
+	const float d = *out_depth != 0.0f ? *out_depth : 1e-9f;
+	const float tx = e.x / d;
+	const float ty = e.y / d;
+	const float tl = std::tan(v.fov.angleLeft), tr = std::tan(v.fov.angleRight);
+	const float td = std::tan(v.fov.angleDown), tu = std::tan(v.fov.angleUp);
+	*out_ndc_x = (2.0f * tx - (tr + tl)) / (tr - tl);
+	*out_ndc_y = (2.0f * ty - (tu + td)) / (tu - td);
+}
+
+//! A pen tip on the glass is at zero parallax: the same NDC in both views.
+void
+check_tip_on_glass(const std::string &what, const std::vector<XrView> &views, const XrPosef &tip)
+{
+	REQUIRE(views.size() >= 2);
+	float x0, y0, z0, x1, y1, z1;
+	project_into_view(views[0], tip.position, &x0, &y0, &z0);
+	project_into_view(views[1], tip.position, &x1, &y1, &z1);
+	std::printf("stylus %-20s tip (%.3f, %.3f, %.3f)  eye0 depth %.3f ndc (%.4f, %.4f)  eye1 depth %.3f ndc "
+	            "(%.4f, %.4f)\n",
+	            what.c_str(), tip.position.x, tip.position.y, tip.position.z, z0, x0, y0, z1, x1, y1);
+	CAPTURE(what, tip.position.x, tip.position.y, tip.position.z, z0, x0, y0, z1, x1, y1);
+	// In front of both eyes, well past the near plane: not in the eye plane.
+	CHECK(z0 > 0.05f);
+	CHECK(z1 > 0.05f);
+	// Zero parallax: the two eyes see the tip at the same pixel.
+	CHECK(std::fabs(x0 - x1) < 0.01f);
+	CHECK(std::fabs(y0 - y1) < 0.01f);
+	// And on the part of the glass the views frame (the figure-eight is
+	// inside the panel and these sessions' canvas is the whole panel).
+	CHECK(std::fabs(x0) < 1.0f);
+	CHECK(std::fabs(y0) < 1.0f);
+}
+
+} // namespace
+
+TEST_CASE("RIG_LOCAL_PHYSICAL: a pen on the glass is at zero parallax in the session's own views",
+          "[oxr][view_space][stylus_glass]")
+{
+	// ADR-034 Amendment 8 / input-provider-discovery.md section 4b.4a: a
+	// glass-registered pose L on the glass (z = 0) lands where the session's
+	// VIEWS put that point of the glass, so both eyes see it at the same pixel,
+	// whatever base the app locates in. Field report (cube_hosted_d3d11_win
+	// --stylus, STAGE): a runtime-window session with nothing chained put the
+	// tip in the EYE plane. Such a session's views come from the runtime's
+	// fly-camera rig (#595, CAMERA mode by default): the head device pose is
+	// the camera, and the glass is the convergence plane in front of it, not
+	// rig(t) o L. The oracle is the views' own projection, not any
+	// runtime-reported plane.
+	const char *enable = std::getenv("DXR_INPUT_SIM_STYLUS_ENABLE");
+	if (enable == nullptr || std::strcmp(enable, "1") != 0) {
+		WARN("this arm needs the sim-stylus provider - see tests_oxr_view_space_stylus in tests/CMakeLists.txt");
+		SUCCEED("not the stylus process");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.mx_ink = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	StylusTip st;
+	stylus_tip_setup(rt, st);
+	stylus_tip_sync(rt, st);
+
+	const Instant at = instant_pen_on_glass();
+	const XrTime t = instant_to_xr(rt, at);
+
+	const Base bases[] = {{"LOCAL", rt.local}, {"STAGE", rt.stage}};
+	bool any = false;
+	for (const Base &b : bases) {
+		// Views first (the frame order every app uses): the locate records
+		// the glass the pen is registered on.
+		const std::vector<XrView> views = rt.views(b.space, t, nullptr, nullptr);
+		XrPosef tip{};
+		if (!stylus_tip_locate(rt, st, b.space, t, &tip)) {
+			continue;
+		}
+		any = true;
+		check_tip_on_glass(std::string("no rig, ") + b.name, views, tip);
+	}
+	if (!any) {
+		WARN("no stylus device bound (Windows discovery is registry-only: register the sim-stylus plug-in)");
+		SUCCEED("no pen to locate");
+		tear_down(rt);
+		return;
+	}
+
+	if (rt.have_view_rig) {
+		// A chained display rig posed away from the physical plane and scaled
+		// (virtual height 1.5 x the canvas): on the glass of THOSE views.
+		XrViewDisplayRawDXR raw0 = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+		(void)rt.views(rt.local, t, nullptr, &raw0);
+		REQUIRE(raw0.canvasSizeMeters.height > 0.0f);
+		XrDisplayRigDXR rig = {XR_TYPE_DISPLAY_RIG_DXR};
+		rig.pose = {qyaw(0.3f), {0.2f, 0.1f, -0.4f}};
+		rig.virtualDisplayHeight = 1.5f * raw0.canvasSizeMeters.height;
+		rig.ipdFactor = 1.0f;
+		rig.parallaxFactor = 1.0f;
+		rig.perspectiveFactor = 1.0f;
+		const std::vector<XrView> views = rt.views(rt.local, t, &rig, nullptr);
+		XrPosef tip{};
+		REQUIRE(stylus_tip_locate(rt, st, rt.local, t, &tip));
+		check_tip_on_glass("display rig, LOCAL", views, tip);
+
+		// A chained camera rig: the glass is its convergence plane.
+		XrCameraRigDXR cam = {XR_TYPE_CAMERA_RIG_DXR};
+		cam.pose = {qyaw(-0.2f), {-0.1f, 0.2f, 0.3f}};
+		cam.ipdFactor = 1.0f;
+		cam.parallaxFactor = 1.0f;
+		cam.convergenceDiopters = 1.0f / 0.8f;
+		cam.verticalFov = 0.6f;
+		cam.metersToVirtual = 1.0f;
+		const std::vector<XrView> cviews = rt.views(rt.local, t, &cam, nullptr);
+		REQUIRE(stylus_tip_locate(rt, st, rt.local, t, &tip));
+		check_tip_on_glass("camera rig, LOCAL", cviews, tip);
+	}
+
+	tear_down(rt);
+}

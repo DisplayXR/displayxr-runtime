@@ -3819,7 +3819,8 @@ session_record_rig_canvas(struct oxr_session *sess,
                           XrTime display_time,
                           const struct m_view_rig_canvas *canvas,
                           const struct xrt_pose *plane_origin,
-                          const struct m_view_rig *rig_origin)
+                          const struct m_view_rig *rig_origin,
+                          const struct m_view_rig *glass_rig)
 {
 	if (canvas == NULL || !canvas->valid) {
 		return;
@@ -3839,14 +3840,24 @@ session_record_rig_canvas(struct oxr_session *sess,
 	 */
 	bool rig_plane_valid = false;
 	struct xrt_pose rig_plane = XRT_POSE_IDENTITY;
-	// RIG_LOCAL_PHYSICAL (ADR-034 Amendment 8): where the same rig puts the
-	// GLASS, for every session class but the bridge relay.
+	// RIG_LOCAL_PHYSICAL (ADR-034 Amendment 8): where the rig the VIEWS were
+	// computed with puts the GLASS, for every session class but the bridge
+	// relay. That is the chained rig when there is one, and otherwise the rig
+	// the runtime synthesises from its fly-camera state for an unchained
+	// runtime-window session (#595): in that session's default CAMERA mode the
+	// head device pose is the camera, not the glass, and the glass is the
+	// convergence plane in front of it — a pen at rig(t) o L would sit in the
+	// eye plane, 1 / convergence in front of the panel it is drawn on.
+	const struct m_view_rig *glass = glass_rig != NULL ? glass_rig : rig_origin;
+	bool phys_plane_valid = false;
 	struct xrt_pose phys_plane = XRT_POSE_IDENTITY;
 	struct xrt_pose phys_scale_origin = XRT_POSE_IDENTITY;
 	float phys_scale = 1.0f;
+	if (glass != NULL && glass->kind != M_VIEW_RIG_NONE && !sess->is_bridge_relay) {
+		m_view_rig_physical_plane(canvas, glass, plane_origin, &phys_plane, &phys_scale_origin, &phys_scale);
+		phys_plane_valid = true;
+	}
 	if (rig_origin != NULL && rig_origin->kind != M_VIEW_RIG_NONE && !sess->is_bridge_relay) {
-		m_view_rig_physical_plane(canvas, rig_origin, plane_origin, &phys_plane, &phys_scale_origin,
-		                          &phys_scale);
 		if (sess->has_external_window) {
 			// RIG_LOCAL is canvas-relative (ADR-034 Amendment 7): a session
 			// that owns its canvas places L on the CANVAS centre through
@@ -3869,7 +3880,7 @@ session_record_rig_canvas(struct oxr_session *sess,
 	sess->rig_canvas.plane_origin = *plane_origin;
 	sess->rig_canvas.rig_plane_valid = rig_plane_valid;
 	sess->rig_canvas.rig_plane_origin = rig_plane;
-	sess->rig_canvas.phys_plane_valid = rig_plane_valid;
+	sess->rig_canvas.phys_plane_valid = phys_plane_valid;
 	sess->rig_canvas.phys_plane_origin = phys_plane;
 	sess->rig_canvas.phys_scale_origin = phys_scale_origin;
 	sess->rig_canvas.phys_scale = phys_scale;
@@ -5008,8 +5019,20 @@ locate_views_one(struct oxr_logger *log,
 					                      : rig_display ? M_VIEW_RIG_DISPLAY
 					                                    : M_VIEW_RIG_NONE,
 					                      &rec_rig_pose, &rec_rig);
+					// The rig the views below are computed with: the chained
+					// one, or the fly-camera synthesis (qwerty_*, #595) for an
+					// unchained runtime-window session. RIG_LOCAL_PHYSICAL
+					// registers on ITS glass (ADR-034 Amendment 8); RIG_LOCAL
+					// keeps following only a chained rig.
+					struct m_view_rig glass_rig = rec_rig;
+					if (glass_rig.kind == M_VIEW_RIG_NONE && active_rig != NULL &&
+					    (qwerty_camera || qwerty_display)) {
+						session_view_rig_to_m(active_rig,
+						                      qwerty_camera ? M_VIEW_RIG_CAMERA : M_VIEW_RIG_DISPLAY,
+						                      &rec_rig_pose, &glass_rig);
+					}
 					session_record_rig_canvas(sess, viewLocateInfo->displayTime, &lc.canvas,
-					                          &phys_plane_origin, &rec_rig);
+					                          &phys_plane_origin, &rec_rig, &glass_rig);
 				}
 				struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS];
 
@@ -5307,7 +5330,7 @@ locate_views_one(struct oxr_logger *log,
 				const struct xrt_pose rec_rig_pose = reply.raw.display_pose;
 				session_view_rig_to_m(&sess->view_rig, applied, &rec_rig_pose, &rec_rig);
 				session_record_rig_canvas(sess, viewLocateInfo->displayTime, &rc, &reply.canvas.plane,
-				                          &rec_rig);
+				                          &rec_rig, NULL);
 			}
 			for (uint32_t i = 0; i < wire_views; i++) {
 				fovs[i] = reply.fovs[i];
