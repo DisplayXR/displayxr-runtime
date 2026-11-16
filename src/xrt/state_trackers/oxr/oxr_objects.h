@@ -3753,7 +3753,8 @@ struct oxr_session
 		bool active;        //!< the extension is enabled, or the force lever applies
 		bool events;        //!< the instance enabled the extension: queue the events
 		bool opted_in;      //!< XrSessionWindowVisibilityInfoDXR::demoteWhenHidden
-		enum u_wv_demote_force force; //!< the debug lever, for a session that did not opt in
+		//! For a session that did not opt in: the default (minimize), off, or the test lever
+		enum u_wv_demote_force force;
 		struct u_wv_report last; //!< what the app was last told (starts visible)
 		//! Held at SYNCHRONIZED: the state machine reads visible/focused as false.
 		bool demoted;

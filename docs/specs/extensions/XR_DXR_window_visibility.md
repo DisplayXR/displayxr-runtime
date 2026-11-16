@@ -113,9 +113,20 @@ In OpenXR `FOCUSED` implies `VISIBLE`, so a demotion always drops focus, and wit
    frame into a hidden window and then calls `ShowWindow` must not be held at `SYNCHRONIZED`
    waiting for a frame it will not render.
 
-A session that does not opt in sees **no session-state change at all** from window visibility.
-The opt-in, the guards and the state machine all run in the app's process (the state tracker),
-in-process and over IPC alike.
+**The default for a session that does not opt in: a minimized window stops rendering.** A session
+that neither enabled the extension nor chained the struct is demoted the same way, with the same
+two guards, but **only while its window is minimized** (`MINIMIZED`): never for covered, cloaked,
+locked or display-off. A minimize is an explicit user act, and every conforming app already keeps
+its frame loop running through `SYNCHRONIZED`. `DXR_HIDDEN_DEMOTE_FORCE=off` turns the default off
+(§7).
+
+**Opting out.** A session that chains `XrSessionWindowVisibilityInfoDXR` with
+`demoteWhenHidden = XR_FALSE` is **never** demoted, not even when minimized, and sees no
+session-state change from window visibility. An app that enables the extension without chaining
+the struct gets the default.
+
+The opt-in, the default, the guards and the state machine all run in the app's process (the state
+tracker), in-process and over IPC alike.
 
 ### Why a session-create struct, not a window-binding flag
 
@@ -161,14 +172,18 @@ so it is never left demoted.
   why the lens moved. The one hardware event on this path answers a denied 3D request when the
   window is seen again.
 
-## 7. Test lever (not a feature)
+## 7. The default and its switch
 
-`DXR_HIDDEN_DEMOTE_FORCE` (a persisted setting, read once per process in the app's process):
-`off` (default) | `minimize` | `all`. It applies the demotion to sessions that did **not** enable
-the extension: only for `MINIMIZED` with `minimize`, for any hidden reason with `all`. The two
-guards still apply. One WARN at session create says it is on. It exists to test unmodified apps
-against a possible future default ("a minimized app stops rendering"); it is not part of this
-extension's contract.
+`DXR_HIDDEN_DEMOTE_FORCE` (a persisted setting, read once per process in the app's process)
+governs sessions that did not opt in or out (§4):
+
+| value | effect |
+|---|---|
+| `minimize` (default) | demoted while `MINIMIZED` only |
+| `off` | the kill switch: no session-state change from visibility (tiers 1 and 2 still run) |
+| `all` | demoted for any hidden reason: a compatibility-test lever, not a feature |
+
+The two guards always apply. One WARN at session create names which of the three is in effect.
 
 ## 8. Verifying it
 
@@ -181,4 +196,4 @@ event (`OXR EVENT: Window visibility changed`) and each demotion edge (`ADR-062:
 
 | Version | Date | Author | Changes |
 |---|---|---|---|
-| 1 | 2026-11-15 | David Fattal | Initial version (ADR-062 D4): the event, the opt-in demotion and its two guards. |
+| 1 | 2026-11-15 | David Fattal | Initial version (ADR-062 D4): the event, the opt-in demotion and its two guards; the minimize-only default for sessions that do not opt in, and the explicit opt-out. |

@@ -35,7 +35,9 @@
  *   never demoted while its window is the OS foreground window, nor before
  *   its window has been shown once (NOT_SHOWN).
  *
- * A session that does not opt in sees no session-state change at all.
+ * A session that does not chain the struct gets the runtime's default: it is
+ * demoted (same guards) only while its window is MINIMIZED. Chaining the
+ * struct with demoteWhenHidden = XR_FALSE opts out: never demoted.
  * `_hosted` sessions (no app window) are judged on the window the runtime
  * created for them, and get the event and the opt-in the same way.
  */
