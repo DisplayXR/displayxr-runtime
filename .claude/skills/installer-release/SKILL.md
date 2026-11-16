@@ -3,6 +3,12 @@ name: installer-release
 description: Cut a DisplayXR meta-installer bundle release. Installer doesn't release on tag push — it's workflow_dispatch-only on publish-bundle.yml. Skill confirms versions.json in-sync with runtime, fires the dispatch with the input tag, watches the build + GH Release land, and reports. Use when bundle is launch-ready, not on every component release.
 ---
 
+<!-- Never put a dollar sign directly before a digit in this file, not even in
+     a shell or awk snippet: Claude Code replaces positional placeholders (dollar
+     + digit) with the skill's arguments before the model reads the file, so a
+     helper's first-argument reference arrives as the version string. Write ${1}
+     in shell and $(2) in awk. -->
+
 # installer-release — meta-installer bundle release
 
 ## When to run this
@@ -249,7 +255,7 @@ carries no version string, so the byte comparison is the identity proof).
 # ── Signing-run identity helpers ────────────────────────────────────────────
 # sign_dispatch <workflow> <marker> [-f k=v ...]  → sets SIGN_RUN ("" = not located)
 sign_dispatch() {
-  local wf="$1" marker="$2" since out id cand st; shift 2
+  local wf="${1}" marker="${2}" since out id cand st; shift 2
   since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   out=$(gh workflow run "$wf" -R "$SIGN_REPO" "$@" 2>&1); printf '%s\n' "$out"
   # 1) The run gh printed. Recent gh prints the new run's URL on dispatch.
@@ -282,7 +288,7 @@ RUNS
 # sign_track <workflow> <marker> [-f k=v ...]  → dispatch, wait, and re-dispatch ONCE if
 # the run was cancelled. Returns 0 only on conclusion=success; SIGN_RUN/SIGN_CONCL set.
 sign_track() {
-  local wf="$1" marker="$2" attempt; shift 2
+  local wf="${1}" marker="${2}" attempt; shift 2
   SIGN_RUN=""; SIGN_CONCL=""
   for attempt in 1 2; do
     sign_dispatch "$wf" "$marker" "$@"
@@ -304,7 +310,7 @@ sign_track() {
 signed_is_our_payload() {
   python3 -I -c 'import sys
 s=open(sys.argv[1],"rb").read(); o=open(sys.argv[2],"rb").read()
-sys.exit(0 if len(s)>len(o) and s[1024:len(o)]==o[1024:] else 1)' "$1" "$2"; }
+sys.exit(0 if len(s)>len(o) and s[1024:len(o)]==o[1024:] else 1)' "${1}" "${2}"; }
 
 if [ "$SIGNED" = yes ]; then
   D=$(mktemp -d)
@@ -423,9 +429,9 @@ if [ "$SIGNED" = yes ]; then
   NEW=$(sha256sum "$SIGNED_EXE" 2>/dev/null | cut -d' ' -f1)
   [ -n "$NEW" ] || NEW=$(shasum -a 256 "$SIGNED_EXE" | cut -d' ' -f1)   # macOS has no sha256sum
   if gh release download "$TAG" -R "$R" -p SHA256SUMS -D "$K" 2>/dev/null && [ -s "$K/SHA256SUMS" ]; then
-    if awk -v f="$EXE" '$2==f || $2=="*"f {n=1} END {exit !n}' "$K/SHA256SUMS"; then
+    if awk -v f="$EXE" '$(2)==f || $(2)=="*"f {n=1} END {exit !n}' "$K/SHA256SUMS"; then
       # Replace ONLY the exe line, in place — keeps the other lines and their order.
-      awk -v f="$EXE" -v h="$NEW" '$2==f || $2=="*"f {print h"  "f; next} {print}' \
+      awk -v f="$EXE" -v h="$NEW" '$(2)==f || $(2)=="*"f {print h"  "f; next} {print}' \
         "$K/SHA256SUMS" > "$K/SHA256SUMS.new" && mv "$K/SHA256SUMS.new" "$K/SHA256SUMS"
       SUMS="refreshed .exe line → $NEW"
     else

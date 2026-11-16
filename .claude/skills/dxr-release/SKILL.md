@@ -3,6 +3,12 @@ name: dxr-release
 description: Tag-and-publish a release for any DisplayXR sibling component (shell, leia-plugin, mcp, browser, gauss & modelviewer & mediaplayer & avatar & earthview demos, unity plugin) FROM the displayxr-runtime hub. Takes an explicit component + version — clones the target repo to a temp dir, tags HEAD, watches the repo's CI, watches the dispatched versions-bump.yml on displayxr-runtime, reports the bump + installer-mirror outcome. Unity is special-cased: its prebuilt displayxr_unity.dll is signed via the sign-artifact folder hook and re-injected into the .tgz + upm branch (no versions-bump). NOT for displayxr-runtime itself (use /release) and NOT for the bundle (use /installer-release).
 ---
 
+<!-- Never put a dollar sign directly before a digit in this file, not even in
+     a shell or awk snippet: Claude Code replaces positional placeholders (dollar
+     + digit) with the skill's arguments before the model reads the file, so a
+     helper's first-argument reference arrives as the version string. Write ${1}
+     in shell and $(2) in awk. -->
+
 # dxr-release — component release driven from the runtime hub
 
 ## Why this is parameterized (not cwd-detecting)
@@ -450,7 +456,7 @@ cat > "$WORK/sign_helpers.sh" <<'SIGN_HELPERS'
 # ── Signing-run identity helpers ────────────────────────────────────────────
 # sign_dispatch <workflow> <marker> [-f k=v ...]  → sets SIGN_RUN ("" = not located)
 sign_dispatch() {
-  local wf="$1" marker="$2" since out id cand st; shift 2
+  local wf="${1}" marker="${2}" since out id cand st; shift 2
   since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   out=$(gh workflow run "$wf" -R "$SIGN_REPO" "$@" 2>&1); printf '%s\n' "$out"
   # 1) The run gh printed. Recent gh prints the new run's URL on dispatch.
@@ -483,7 +489,7 @@ RUNS
 # sign_track <workflow> <marker> [-f k=v ...]  → dispatch, wait, and re-dispatch ONCE if
 # the run was cancelled. Returns 0 only on conclusion=success; SIGN_RUN/SIGN_CONCL set.
 sign_track() {
-  local wf="$1" marker="$2" attempt; shift 2
+  local wf="${1}" marker="${2}" attempt; shift 2
   SIGN_RUN=""; SIGN_CONCL=""
   for attempt in 1 2; do
     sign_dispatch "$wf" "$marker" "$@"
@@ -507,14 +513,14 @@ exe_has_version() {
 d=open(sys.argv[1],"rb").read(); v=sys.argv[2]
 pat=r"(?<![0-9.])"+re.escape(v)+r"(?![0-9])"
 hit=re.search(pat,d.decode("utf-16-le","ignore")) or re.search(pat,d[1:].decode("utf-16-le","ignore")) or re.search(pat.encode(),d)
-sys.exit(0 if hit else 1)' "$1" "$2"; }
+sys.exit(0 if hit else 1)' "${1}" "${2}"; }
 
 # signed_is_our_payload <signed> <original> — <signed> is <original> plus an Authenticode
 # signature (signing rewrites only PE-header fields in the first 1 KiB and appends).
 signed_is_our_payload() {
   python3 -I -c 'import sys
 s=open(sys.argv[1],"rb").read(); o=open(sys.argv[2],"rb").read()
-sys.exit(0 if len(s)>len(o) and s[1024:len(o)]==o[1024:] else 1)' "$1" "$2"; }
+sys.exit(0 if len(s)>len(o) and s[1024:len(o)]==o[1024:] else 1)' "${1}" "${2}"; }
 SIGN_HELPERS
 ```
 
@@ -555,7 +561,7 @@ if [ "$COMPONENT" = unity ]; then
   # and the signer must be Leia. (unity v2.25.2 was released from a Linux box and
   # shipped unsigned for an hour because this helper only knew PowerShell.)
   verify_authenticode_file() {
-    local f="$1" ps="" out
+    local f="${1}" ps="" out
     # PowerShell only on Windows (git-bash: cygpath present). Homebrew pwsh on a
     # Mac has no Get-AuthenticodeSignature and no cygpath, so it must fall to
     # osslsigncode instead of failing every verify.
