@@ -93,6 +93,58 @@ TEST_CASE("segments ipc: routed views land as a mosaic, at the crop's rect")
 	}
 }
 
+TEST_CASE("segments ipc: the routed tile is the canvas at the mode scale, not view 0's slice (#2698)")
+{
+	// The #2698 repro: a 1280x720 window, 609 px on the laptop and 671 px on
+	// the Leia panel, Leia's 0.5 view scale. The app (cube_handle_d3d11_win,
+	// following the XrViewDisplayBindingsDXR contract) renders each segment's
+	// view at its slice of a 640x360 tile: segment 0's views are 305 px wide,
+	// segment 1's 335 px.
+	xrt_segment_view_routing r;
+	std::memset(&r, 0, sizeof(r));
+	r.count = 2;
+	r.rect[0] = {{0, 0}, {609, 720}};
+	r.rect[1] = {{609, 0}, {671, 720}};
+	r.first_view[0] = 0;
+	r.view_count[0] = 2;
+	r.first_view[1] = 2;
+	r.view_count[1] = 2;
+	r.canvas = {{0, 0}, {1280, 720}};
+
+	uint32_t tw = 0, th = 0;
+	REQUIRE(comp_segments_route_tile_size(&r, 0.5f, 0.5f, &tw, &th));
+	CHECK(tw == 640);
+	CHECK(th == 360);
+
+	// On that tile every view is placed 1:1 — its slot is exactly the slice the
+	// app rendered (the app rounds each edge the same way).
+	const uint32_t app_w[4] = {305, 305, 335, 335};
+	const int32_t app_x[4] = {0, 0, 305, 305};
+	for (uint32_t v = 0; v < 4; v++) {
+		comp_segments_route_slot s{};
+		REQUIRE(comp_segments_route_place(&r, 4, 2, tw, th, v, &s));
+		CHECK(s.rect.x == app_x[v]);
+		CHECK(s.rect.w == app_w[v]);
+		CHECK(s.rect.h == 360);
+	}
+
+	// The old service layout: the tile taken from view 0's submitted extent
+	// (segment 0's 305 px slice). Segment 1's 335 px view then lands in a
+	// ~160 px slot — the squeeze the weaver had to upscale back.
+	comp_segments_route_slot old{};
+	REQUIRE(comp_segments_route_place(&r, 4, 2, 305, 360, 2, &old));
+	CHECK(old.rect.w < 335 / 2 + 1);
+
+	// Degenerate inputs leave the caller's unrouted size alone.
+	xrt_segment_view_routing none;
+	std::memset(&none, 0, sizeof(none));
+	CHECK_FALSE(comp_segments_route_tile_size(&none, 0.5f, 0.5f, &tw, &th));
+	CHECK_FALSE(comp_segments_route_tile_size(&r, 0.0f, 0.5f, &tw, &th));
+	xrt_segment_view_routing no_canvas = r;
+	no_canvas.canvas = {{0, 0}, {0, 0}};
+	CHECK_FALSE(comp_segments_route_tile_size(&no_canvas, 0.5f, 0.5f, &tw, &th));
+}
+
 TEST_CASE("segments ipc: hardware 2D packs one tile; each segment's first view lands in it")
 {
 	xrt_segment_view_routing r = two_screen_routing();

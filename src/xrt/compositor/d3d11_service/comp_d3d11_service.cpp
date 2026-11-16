@@ -21739,6 +21739,53 @@ service_ui_pass_layout(struct d3d11_service_system *sys,
 }
 
 /*!
+ * Multi-screen M3: the content size of one view tile of a projection layer —
+ * what the routed mosaic is laid out on and what the DP crop reads.
+ *
+ * Unrouted, it is what view 0 submitted (the bridge's pushed size under the
+ * bridge override). Routed (#2698), view 0 covers only segment 0's slice of
+ * its tile, so its extent is NOT the tile: the tile is the routing's canvas
+ * at the active mode's view scale — the size the app is told to place each
+ * segment's view in, and the one the in-process renderers use. Laying the
+ * mosaic out on view 0's slice squeezed every segment's view to about half
+ * its rendered width before the weaver upscaled it again.
+ *
+ * Not clamped to the atlas slot; the callers clamp.
+ */
+static void
+service_proj_content_tile(const struct d3d11_service_system *sys,
+                          const struct d3d11_service_compositor *c,
+                          const struct comp_layer *layer,
+                          bool bridge_override,
+                          uint32_t active_vw,
+                          uint32_t active_vh,
+                          bool routed,
+                          uint32_t *out_w,
+                          uint32_t *out_h)
+{
+	if (bridge_override) {
+		*out_w = active_vw;
+		*out_h = active_vh;
+		return;
+	}
+	*out_w = static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.w);
+	*out_h = static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.h);
+	if (!routed || sys->xdev == NULL || sys->xdev->hmd == NULL) {
+		return;
+	}
+	const uint32_t mi = sys->xdev->hmd->active_rendering_mode_index;
+	if (mi >= sys->xdev->rendering_mode_count) {
+		return;
+	}
+	const struct xrt_rendering_mode *mode = &sys->xdev->rendering_modes[mi];
+	uint32_t tw = 0, th = 0;
+	if (comp_segments_route_tile_size(&c->seg_route, mode->view_scale_x, mode->view_scale_y, &tw, &th)) {
+		*out_w = tw;
+		*out_h = th;
+	}
+}
+
+/*!
  * Where ONE projection view's pixels come from, and where in the per-client
  * atlas they land.
  *
@@ -21871,10 +21918,8 @@ service_proj_view_blit_resolve(struct d3d11_service_system *sys,
 	 * placed unrouted.
 	 */
 	if (c->seg_route.count > 0 && packed_tiles > 0) {
-		uint32_t tw =
-		    bridge_override ? active_vw : static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.w);
-		uint32_t th =
-		    bridge_override ? active_vh : static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.h);
+		uint32_t tw = 0, th = 0;
+		service_proj_content_tile(sys, c, layer, bridge_override, active_vw, active_vh, true, &tw, &th);
 		if (tw > layout_vw) {
 			tw = layout_vw; // the content clamp the commit applies after the loop
 		}
@@ -26666,16 +26711,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			cursor_tiles_done = true;
 		}
 
-		// Track actual content dimensions for DP crop and multi-comp slot read.
-		if (bridge_override) {
-			// Bridge sample renders at active per-view dims — use those.
-			content_view_w = active_vw;
-			content_view_h = active_vh;
-		} else {
-			// Non-bridge: use Chrome's submitted subImage extent.
-			content_view_w = static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.w);
-			content_view_h = static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.h);
-		}
+		// Track actual content dimensions for DP crop and multi-comp slot read:
+		// the bridge's active per-view dims, else the submitted subImage
+		// extent — or, for a routed mosaic, the routed tile (#2698), so the
+		// segment crop reads the same layout the blits above painted.
+		service_proj_content_tile(sys, c, layer, bridge_override, active_vw, active_vh, c->seg_route_painting,
+		                          &content_view_w, &content_view_h);
 		// Clamp to atlas slot dims (atlas_width / tile_columns). The blit
 		// above placed at most one slot of content per tile; without this
 		// clamp, multi_compositor_render reads past the slot boundary into
