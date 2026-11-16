@@ -15,7 +15,10 @@
  * DisplayXR app has: V cycles to the next mode, 0-8 select mode N (0 = 2D),
  * via xrRequestDisplayRenderingModeDXR, and T toggles the eye-tracking
  * preference MANAGED <-> MANUAL (xrRequestEyeTrackingModeDXR), as the Windows
- * cube apps do. The app is stereo (at most 2 views
+ * cube apps do. In MANUAL the app runs its own tracker-loss transition
+ * (TrackingLossDirector: P cycles converge / lens-2D / off) and draws a
+ * zero-disparity status bar (length = depth; green tracked, amber collapsing,
+ * red flat; blue/red in MANAGED). The app is stereo (at most 2 views
  * rendered); tile size and grid follow the ACTIVE mode, so 2D renders one
  * full-window view and the second located view aliases it (ADR-041).
  *
@@ -172,11 +175,14 @@ static int32_t g_absoluteRenderingModeRequested = -1;    // 0-8; -1 = none
 // T: toggle the session's eye-tracking preference MANAGED <-> MANUAL
 // (xrRequestEyeTrackingModeDXR), the same key as the Windows cube apps.
 static bool g_eyeTrackingModeToggleRequested = false;
+// P: cycle the MANUAL tracking-loss preset (TrackingLossDirector below).
+static bool g_lossPresetCycleRequested = false;
 
 /*!
  * Key handler, fed by pump_events() so it sees keysyms: DxrKey has no 0 or 4-8.
  *
- * Both backends: T toggles the eye-tracking preference MANAGED <-> MANUAL.
+ * Both backends: T toggles the eye-tracking preference MANAGED <-> MANUAL,
+ * P cycles the MANUAL tracking-loss preset (converge / lens-2D / off).
  * V cycles to the next display rendering mode, 0-8 select mode
  * N (0 = 2D) when N is below the runtime's mode count (checked in the frame
  * loop). Auto-repeat presses are ignored, so holding V does not spin modes.
@@ -197,6 +203,10 @@ static void OnWindowEvent(const DxrWindowEvent& ev) {
     case XK_t:
     case XK_T:
         g_eyeTrackingModeToggleRequested = true;
+        return;
+    case XK_p:
+    case XK_P:
+        g_lossPresetCycleRequested = true;
         return;
     case XK_0: case XK_1: case XK_2: case XK_3: case XK_4:
     case XK_5: case XK_6: case XK_7: case XK_8:
@@ -995,6 +1005,124 @@ struct PushConstants {
     float transform[16];
     float color[4];
 };
+
+/*!
+ * MANUAL eye-tracking demo: what an app can do on tracker loss when SR leaves
+ * the transition to it (MANAGED: SR waits ~3 s, then eases to 2D and flips the
+ * lens itself). Driven by XrEventDataEyeTrackingStateChangedDXR edges; output
+ * is the display rig's ipdFactor (the runtime scales each eye about the centre
+ * eye and rebuilds the Kooima frusta, so the Z=0 plane stays pixel-locked while
+ * depth collapses onto it, no swim). Presets (key P):
+ *   CONVERGE (default): hold 250 ms, collapse to ipd 0 over 600 ms, stay flat
+ *            with the lens in 3D. Recover: 150 ms stable, ramp to 1 over 400 ms.
+ *   LENS_2D: on loss request the lens 2D at once (xrRequestDisplayModeDXR) and
+ *            collapse the same way; on recovery lens 3D, then ramp back. The
+ *            CONTENT mode stays tracked, so recovery edges keep arriving.
+ *   OFF:     MANUAL with no app reaction (the raw held weave), for contrast.
+ * Flapping: 3 losses within 5 s need 1 s of stable tracking to come back.
+ * Only active in MANUAL; in MANAGED the factor ramps back to 1 and SR acts.
+ */
+struct TrackingLossDirector {
+    enum Preset { CONVERGE = 0, LENS_2D = 1, OFF = 2, PRESET_COUNT = 3 };
+    enum Phase { TRACKING, HOLD, COLLAPSE, FLAT, RECOVER_WAIT, RECOVER, IDLE };
+    static constexpr float kHoldS = 0.25f, kCollapseS = 0.6f, kRecoverWaitS = 0.15f,
+                           kRecoverS = 0.4f, kFlapWindowS = 5.0f, kFlapWaitS = 1.0f;
+    static constexpr int kFlapLosses = 3;
+
+    Preset preset = CONVERGE;
+    Phase phase = TRACKING;
+    bool tracked = true;
+    float sinceEdge = 1e9f;  // seconds since the last tracking edge
+    float u = 1.0f;          // 1 = full depth, 0 = flat (ipd = smoothstep(u))
+    float clock = 0.0f;
+    float lossTimes[kFlapLosses] = {-1e9f, -1e9f, -1e9f};
+    int lossHead = 0;
+    bool lens2DRequested = false;
+
+    static const char* PresetName(Preset p) {
+        return p == CONVERGE ? "converge" : p == LENS_2D ? "lens-2D" : "off";
+    }
+    static const char* PhaseName(Phase p) {
+        switch (p) {
+        case TRACKING: return "tracking"; case HOLD: return "hold"; case COLLAPSE: return "collapse";
+        case FLAT: return "flat"; case RECOVER_WAIT: return "recover-wait"; case RECOVER: return "recover";
+        default: return "idle";
+        }
+    }
+    float Ipd() const { return u * u * (3.0f - 2.0f * u); }
+    bool Flapping() const {
+        int n = 0;
+        for (float t : lossTimes) n += (clock - t) <= kFlapWindowS ? 1 : 0;
+        return n >= kFlapLosses;
+    }
+    void OnEdge(bool isTracking) {
+        if (isTracking == tracked) return;
+        tracked = isTracking;
+        sinceEdge = 0.0f;
+        if (!isTracking) {
+            lossTimes[lossHead] = clock;
+            lossHead = (lossHead + 1) % kFlapLosses;
+        }
+    }
+    //! Advance by @p dt. @p manual: the session's mode is MANUAL. Returns the
+    //! lens request to issue this frame: -1 none, 0 = 2D, 1 = 3D.
+    int Update(float dt, bool manual) {
+        clock += dt;
+        sinceEdge += dt;
+        const Phase before = phase;
+        int lens = -1;
+        if (!manual || preset == OFF) {
+            u = u + dt / kRecoverS > 1.0f ? 1.0f : u + dt / kRecoverS;
+            if (lens2DRequested) { lens = 1; lens2DRequested = false; }
+            phase = IDLE;
+        } else if (!tracked) {
+            if (preset == LENS_2D && !lens2DRequested) { lens = 0; lens2DRequested = true; }
+            if (sinceEdge < kHoldS && u >= 1.0f) {
+                phase = HOLD;
+            } else {
+                u = u - dt / kCollapseS < 0.0f ? 0.0f : u - dt / kCollapseS;
+                phase = u > 0.0f ? COLLAPSE : FLAT;
+            }
+        } else {
+            const float wait = Flapping() ? kFlapWaitS : kRecoverWaitS;
+            if (u >= 1.0f && !lens2DRequested) {
+                phase = TRACKING;
+            } else if (sinceEdge < wait) {
+                phase = RECOVER_WAIT;
+            } else {
+                if (lens2DRequested) { lens = 1; lens2DRequested = false; }
+                u = u + dt / kRecoverS > 1.0f ? 1.0f : u + dt / kRecoverS;
+                phase = u < 1.0f ? RECOVER : TRACKING;
+            }
+        }
+        if (phase != before) {
+            LOG_INFO("Tracking-loss director: %s -> %s (preset %s, ipd %.2f%s)", PhaseName(before),
+                     PhaseName(phase), PresetName(preset), Ipd(), Flapping() ? ", flapping" : "");
+        }
+        return lens;
+    }
+    //! Zero-disparity status bar: length = current depth, colour = state.
+    void BarColor(bool manual, float rgb[3]) const {
+        auto set = [&](float r, float g, float b) { rgb[0] = r; rgb[1] = g; rgb[2] = b; };
+        if (!manual) { tracked ? set(0.15f, 0.45f, 1.0f) : set(1.0f, 0.15f, 0.15f); return; }   // MANAGED: blue / red
+        if (preset == OFF) { tracked ? set(0.7f, 0.3f, 1.0f) : set(1.0f, 0.15f, 0.15f); return; } // purple / red
+        switch (phase) {
+        case HOLD: case COLLAPSE: set(1.0f, 0.65f, 0.0f); break;       // amber: transition
+        case FLAT: set(1.0f, 0.15f, 0.15f); break;                    // red: flat, no viewer
+        case RECOVER_WAIT: case RECOVER: set(0.6f, 1.0f, 0.2f); break; // yellow-green: coming back
+        default: set(0.1f, 0.9f, 0.3f); break;                         // green: tracked
+        }
+    }
+};
+static TrackingLossDirector g_lossDirector;
+
+//! What RenderScene draws as the status bar (set by the frame loop).
+struct StatusBar {
+    bool enabled = false;
+    float fraction = 1.0f; // 0..1 of the bar's full length
+    float rgb[3] = {0, 1, 0};
+};
+static StatusBar g_statusBar;
 
 struct EyeRenderParams {
     uint32_t viewportX, viewportY, width, height;
@@ -1836,6 +1964,29 @@ static void RenderScene(
             vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.gridVertexBuffer, &offset);
             vkCmdDraw(cmd, renderer.gridVertexCount, 1, 0, 0);
         }
+
+        // Status bar: the SAME pixel rect in every view = zero disparity, so it
+        // sits on the screen plane whatever the eyes do. Top-left of each tile,
+        // 60% of the tile wide at full depth, 3% of it tall.
+        if (g_statusBar.enabled) {
+            const uint32_t h = e.height / 33 > 8 ? e.height / 33 : 8;
+            const uint32_t full = (uint32_t)(e.width * 0.6f);
+            uint32_t w = (uint32_t)(full * g_statusBar.fraction);
+            if (w < h) w = h; // a square stub when flat, so the colour still reads
+            VkClearAttachment ca = {};
+            ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            ca.colorAttachment = 0;
+            for (int i = 0; i < 3; i++) {
+                float c = g_statusBar.rgb[i];
+                ca.clearValue.color.float32[i] = renderer.sceneLinear ? dxr::DisplayReferredToSceneLinear(c) : c;
+            }
+            ca.clearValue.color.float32[3] = 1.0f;
+            VkClearRect cr = {};
+            cr.rect = {{(int32_t)(e.viewportX + e.width / 20), (int32_t)(e.viewportY + e.height / 20)}, {w, h}};
+            cr.baseArrayLayer = 0;
+            cr.layerCount = 1;
+            vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+        }
     }
 
     vkCmdEndRenderPass(cmd);
@@ -2041,6 +2192,7 @@ struct AppXrSession {
     // the function. The app's own preference is tracked here; isTracking is
     // logged from XrEventDataEyeTrackingStateChangedDXR.
     PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingMode = nullptr;
+    PFN_xrRequestDisplayModeDXR pfnRequestDisplayMode = nullptr; // lens only (loss preset lens-2D)
     XrEyeTrackingModeDXR eyeTrackingMode = XR_EYE_TRACKING_MODE_MANAGED_DXR;
     PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModes = nullptr;
     static constexpr uint32_t kMaxModes = 9; // keys 0-8
@@ -2246,6 +2398,8 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
                               (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModes);
         xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
                               (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingMode);
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeDXR",
+                              (PFN_xrVoidFunction*)&xr.pfnRequestDisplayMode);
     }
 
     XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
@@ -2592,6 +2746,13 @@ static void ProcessRenderingModeKeys(AppXrSession& xr) {
  * display processor does not offer MANUAL; the preference only moves on success.
  */
 static void ProcessEyeTrackingModeKey(AppXrSession& xr) {
+    if (g_lossPresetCycleRequested) {
+        g_lossPresetCycleRequested = false;
+        g_lossDirector.preset = (TrackingLossDirector::Preset)((g_lossDirector.preset + 1) %
+                                                               TrackingLossDirector::PRESET_COUNT);
+        LOG_INFO("Tracking-loss preset (P) -> %s%s", TrackingLossDirector::PresetName(g_lossDirector.preset),
+                 xr.eyeTrackingMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "" : " (applies in MANUAL; press T)");
+    }
     if (!g_eyeTrackingModeToggleRequested) {
         return;
     }
@@ -2832,6 +2993,7 @@ static bool PollEvents(AppXrSession& xr) {
             const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                                      std::chrono::steady_clock::now().time_since_epoch())
                                      .count();
+            g_lossDirector.OnEdge(et->isTracking == XR_TRUE);
             LOG_INFO("Eye tracking state: isTracking=%s mode=%s (t=%lld ms)",
                      et->isTracking ? "true" : "false",
                      et->activeMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED", ms);
@@ -3424,10 +3586,25 @@ int main(int argc, char** argv) {
                     // of the panel — identical to cube_handle_vk_win.
                     const bool useDisplayRig = xr.hasViewRig && xr.displayWidthM > 0.0f;
                     XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+                    // MANUAL tracking-loss demo: the director's depth factor
+                    // (1 unless the session is MANUAL and the viewer is lost).
+                    {
+                        const bool manual = xr.eyeTrackingMode == XR_EYE_TRACKING_MODE_MANUAL_DXR;
+                        const int lens = g_lossDirector.Update(deltaTime, manual);
+                        if (lens >= 0 && xr.pfnRequestDisplayMode != nullptr) {
+                            const XrResult lr = xr.pfnRequestDisplayMode(
+                                xr.session, lens ? XR_DISPLAY_MODE_3D_DXR : XR_DISPLAY_MODE_2D_DXR);
+                            LOG_INFO("Tracking-loss director: lens %s request: %s", lens ? "3D" : "2D",
+                                     XR_SUCCEEDED(lr) ? "ok" : "FAILED");
+                        }
+                        g_statusBar.enabled = xr.pfnRequestEyeTrackingMode != nullptr;
+                        g_statusBar.fraction = manual ? g_lossDirector.Ipd() : 1.0f;
+                        g_lossDirector.BarColor(manual, g_statusBar.rgb);
+                    }
                     if (useDisplayRig) {
                         displayRig.pose = XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
                         displayRig.virtualDisplayHeight = kVirtualDisplayHeight;
-                        displayRig.ipdFactor = 1.0f;
+                        displayRig.ipdFactor = g_lossDirector.Ipd();
                         displayRig.parallaxFactor = 1.0f;
                         displayRig.perspectiveFactor = 1.0f;
                         locateInfo.next = &displayRig;
