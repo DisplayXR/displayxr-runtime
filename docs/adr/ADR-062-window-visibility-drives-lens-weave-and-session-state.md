@@ -131,10 +131,19 @@ proposed extension, `XR_DXR_window_visibility`:
   instead: a session is **never** demoted while its window is the OS foreground window, and never
   before its window has been shown once (`NOT_SHOWN`). On the visible edge it returns to
   `VISIBLE` and then `FOCUSED` as before;
-- an app that does not enable it gets tiers 1–2 only and sees no session-state change;
+- an app that does not enable it gets tiers 1–2 only and sees no session-state change (superseded
+  for minimize by the amendment below);
 - needs a new in-process session-event path (the native compositors push state change events).
 
 **Approved by David 2026-11-15.** Being implemented.
+
+**Amendment (David, 2026-11-15): minimize stops rendering by default.** After a compatibility pass
+over unmodified apps (the demos, Unity BiRP/URP/HDRP players, a packaged Unreal app), a session that
+does not opt in is demoted the same way, with the same two guards, but **only while minimized** —
+never for covered, cloaked, locked or display-off. `DXR_HIDDEN_DEMOTE_FORCE=off` is the kill
+switch; an app that chains the opt-in struct with `demoteWhenHidden = XR_FALSE` opts out. The
+first-party engine livelock risk above was checked on the Unreal plug-in: FOCUSED returned cleanly
+after each minimize.
 
 ### D5 — Tier 4: the visible-3D-region mask for local-switching panels
 

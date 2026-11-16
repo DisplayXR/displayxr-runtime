@@ -19,7 +19,7 @@
 #define wvr_stricmp strcasecmp
 #endif
 
-DEBUG_GET_ONCE_OPTION(hidden_demote_force, U_WINDOW_VISIBILITY_ENV_DEMOTE_FORCE, "off")
+DEBUG_GET_ONCE_OPTION(hidden_demote_force, U_WINDOW_VISIBILITY_ENV_DEMOTE_FORCE, U_WINDOW_VISIBILITY_DEMOTE_FORCE_DEFAULT)
 
 enum xrt_window_visibility_reason
 u_wv_report_reason(enum u_wv_reason r)

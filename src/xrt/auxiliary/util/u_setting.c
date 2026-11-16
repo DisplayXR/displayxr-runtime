@@ -88,9 +88,9 @@ static const char *const managed_names[] = {
     "DXR_LENS_VISIBILITY",
     "DXR_LENS_OVERLAY_PROCESSES",
     "DXR_HIDDEN_SKIP_PRESENT",
-    // ADR-062 D4 test lever (debug only): demote sessions that did not enable
-    // XR_DXR_window_visibility (off | minimize | all), for compatibility tests
-    // of unmodified apps. Read in the app process.
+    // ADR-062 D4: demote sessions that did not opt in through
+    // XR_DXR_window_visibility (minimize = default | off = kill switch |
+    // all = compatibility-test lever). Read in the app process.
     "DXR_HIDDEN_DEMOTE_FORCE",
 };
 

@@ -30,13 +30,18 @@ extern "C" {
 #endif
 
 /*!
- * Debug-only test lever (a persisted setting): apply the SYNCHRONIZED
- * demotion to sessions that did NOT enable XR_DXR_window_visibility.
- * `off` (default) | `minimize` (only for MINIMIZED) | `all` (any hidden
- * reason). The two guards still apply. For compatibility tests of
- * unmodified apps; not a feature.
+ * The demotion for sessions that did NOT opt in through XR_DXR_window_visibility
+ * (a persisted setting, read once per process in the app's process):
+ * `minimize` (default: a minimized window stops rendering) | `off` (the kill
+ * switch: no session-state change from visibility) | `all` (any hidden reason;
+ * a compatibility-test lever, not a feature). The two guards always apply. A
+ * session that chains XrSessionWindowVisibilityInfoDXR with
+ * demoteWhenHidden = XR_FALSE opts out explicitly and is never demoted.
  */
 #define U_WINDOW_VISIBILITY_ENV_DEMOTE_FORCE "DXR_HIDDEN_DEMOTE_FORCE"
+
+//! Default of @ref U_WINDOW_VISIBILITY_ENV_DEMOTE_FORCE (ADR-062 D4, approved 2026-11-15).
+#define U_WINDOW_VISIBILITY_DEMOTE_FORCE_DEFAULT "minimize"
 
 //! Values of @ref U_WINDOW_VISIBILITY_ENV_DEMOTE_FORCE.
 enum u_wv_demote_force

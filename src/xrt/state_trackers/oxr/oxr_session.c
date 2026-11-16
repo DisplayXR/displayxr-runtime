@@ -1164,6 +1164,7 @@ oxr_session_window_visibility_init(struct oxr_logger *log, struct oxr_session *s
 	if (sess->is_appcontainer) {
 		return;
 	}
+	bool opted_out = false;
 #ifdef OXR_HAVE_DXR_window_visibility
 	if (sess->sys->inst->extensions.DXR_window_visibility) {
 		sess->window_visibility.active = true;
@@ -1171,20 +1172,30 @@ oxr_session_window_visibility_init(struct oxr_logger *log, struct oxr_session *s
 		const XrSessionWindowVisibilityInfoDXR *info = OXR_GET_INPUT_FROM_CHAIN(
 		    createInfo, XR_TYPE_SESSION_WINDOW_VISIBILITY_INFO_DXR, XrSessionWindowVisibilityInfoDXR);
 		sess->window_visibility.opted_in = info != NULL && info->demoteWhenHidden == XR_TRUE;
+		opted_out = info != NULL && info->demoteWhenHidden != XR_TRUE;
 		U_LOG_W("XR_DXR_window_visibility: window visibility events on; demotion to SYNCHRONIZED while hidden %s",
 		        sess->window_visibility.opted_in ? "opted in (never while foreground, never before first shown)"
-		                                         : "not asked for");
+		        : opted_out                      ? "declined (demoteWhenHidden = XR_FALSE: never demoted)"
+		                                         : "not asked for (the default applies)");
 	}
 #endif
-	if (!sess->window_visibility.opted_in) {
+	if (!sess->window_visibility.opted_in && !opted_out) {
 		sess->window_visibility.force = u_wv_demote_force_get();
-		if (sess->window_visibility.force != U_WV_DEMOTE_FORCE_OFF) {
+		if (sess->window_visibility.force == U_WV_DEMOTE_FORCE_MINIMIZE) {
 			sess->window_visibility.active = true;
-			U_LOG_W("ADR-062 TEST LEVER %s=%s is ON: this session is demoted to SYNCHRONIZED while its window is "
-			        "%s, although it did not opt in (never while foreground, never before first shown). A "
-			        "compatibility test lever, not a feature: turn it off when done.",
-			        U_WINDOW_VISIBILITY_ENV_DEMOTE_FORCE, u_wv_demote_force_str(sess->window_visibility.force),
-			        sess->window_visibility.force == U_WV_DEMOTE_FORCE_MINIMIZE ? "minimized" : "hidden");
+			U_LOG_W("ADR-062: this session stops rendering (SYNCHRONIZED, shouldRender false) while its window is "
+			        "minimized, and resumes when it is restored (never while foreground, never before first "
+			        "shown). The default; %s=off turns it off.",
+			        U_WINDOW_VISIBILITY_ENV_DEMOTE_FORCE);
+		} else if (sess->window_visibility.force == U_WV_DEMOTE_FORCE_ALL) {
+			sess->window_visibility.active = true;
+			U_LOG_W("ADR-062 TEST LEVER %s=all is ON: this session is demoted to SYNCHRONIZED while its window is "
+			        "hidden for any reason, although it did not opt in (never while foreground, never before "
+			        "first shown). A compatibility test lever, not a feature: turn it off when done.",
+			        U_WINDOW_VISIBILITY_ENV_DEMOTE_FORCE);
+		} else {
+			U_LOG_W("ADR-062: %s=off: this session sees no session-state change from window visibility",
+			        U_WINDOW_VISIBILITY_ENV_DEMOTE_FORCE);
 		}
 	}
 }
@@ -2425,7 +2436,7 @@ skip_macos_pump:
 	}
 
 	// ADR-062 D4: the in-process window-visibility verdict (a no-op unless
-	// XR_DXR_window_visibility or the test lever covers the session).
+	// XR_DXR_window_visibility or the minimize default covers the session).
 	oxr_session_window_visibility_poll(log, sess);
 
 	// A demoted session (ADR-062 D4) reads as neither visible nor focused:
@@ -8785,7 +8796,7 @@ oxr_session_create(struct oxr_logger *log,
 	sess->is_appcontainer = false;
 #endif
 
-	// ADR-062 D4: XR_DXR_window_visibility opt-in and the test lever.
+	// ADR-062 D4: XR_DXR_window_visibility opt-in / opt-out and the minimize default.
 	oxr_session_window_visibility_init(log, sess, createInfo);
 
 	// Initialize compositor visibility/focus from compositor info (IPC long-term fix)

@@ -167,4 +167,6 @@ TEST_CASE("window_visibility_report: force lever values", "[window_visibility]")
 	CHECK(u_wv_demote_force_parse("all") == U_WV_DEMOTE_FORCE_ALL);
 	CHECK(u_wv_demote_force_parse("2") == U_WV_DEMOTE_FORCE_ALL);
 	CHECK(std::strcmp(u_wv_demote_force_str(U_WV_DEMOTE_FORCE_ALL), "all") == 0);
+	// ADR-062 D4: the default is "a minimized window stops rendering".
+	CHECK(u_wv_demote_force_parse(U_WINDOW_VISIBILITY_DEMOTE_FORCE_DEFAULT) == U_WV_DEMOTE_FORCE_MINIMIZE);
 }
