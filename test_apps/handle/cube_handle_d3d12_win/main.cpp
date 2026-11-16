@@ -21,6 +21,7 @@
 #include "projection_depth.h"
 #include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
 #include "text_overlay.h"
+#include "tracking_loss_director.h" // MANUAL eye-tracking demo (T + L)
 #include "xr_session.h"
 
 #include <algorithm>
@@ -67,6 +68,11 @@ static XrSessionManager* g_xr = nullptr;
 // note resets whenever the mode changes. Toggle flag is atomic (set on the
 // message-pump thread, consumed on the render thread).
 static std::atomic<bool> g_hwToggleRequested{false};
+// MANUAL eye-tracking demo (tracking_loss_director.h): L cycles the app's
+// tracker-loss preset (converge / lens-2D / off); P is parallax here. The
+// director itself lives on the render thread.
+static std::atomic<bool> g_lossPresetCycleRequested{false};
+static dxr_demo::TrackingLossDirector g_lossDirector;
 static bool g_hwOverrideActive = false;       // render-thread only
 static bool g_hwOverride3D = false;           // render-thread only
 static uint32_t g_hwOverrideModeIndex = 0;    // render-thread only
@@ -352,6 +358,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // mode (xrRequestDisplayModeDXR) — handled on the render thread.
         if (wParam == 'H') {
             g_hwToggleRequested.store(true);
+            return 0;
+        }
+        if (wParam == 'L') {
+            g_lossPresetCycleRequested.store(true);
             return 0;
         }
         break;
@@ -1101,6 +1111,22 @@ static void RenderThreadFunc(
         XrSessionUpdateModeSwitch(*xr, inputSnapshot, perfStats.deltaTime);
 
         // Handle eye tracking mode toggle (T key)
+        // MANUAL eye-tracking demo: the app's own tracker-loss transition (the
+        // display does nothing in MANUAL). Its depth factor multiplies the rig's
+        // ipdFactor below; LENS_2D also asks for the lens.
+        {
+            bool lossCycle = g_lossPresetCycleRequested.exchange(false);
+            dxr_demo::TrackingLossStep(
+                g_lossDirector, perfStats.deltaTime,
+                xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANUAL_DXR, xr->isEyeTracking, &lossCycle,
+                [](const char *line) { LOG_INFO("%s", line); },
+                [xr](int lens) {
+                    return xr->pfnRequestDisplayModeEXT != nullptr && xr->session != XR_NULL_HANDLE &&
+                           XR_SUCCEEDED(xr->pfnRequestDisplayModeEXT(
+                               xr->session, lens ? XR_DISPLAY_MODE_3D_DXR : XR_DISPLAY_MODE_2D_DXR));
+                });
+        }
+
         if (inputSnapshot.eyeTrackingModeToggleRequested) {
             if (xr->pfnRequestEyeTrackingModeEXT && xr->session != XR_NULL_HANDLE) {
                 XrEyeTrackingModeDXR newMode = (xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
@@ -1251,7 +1277,7 @@ static void RenderThreadFunc(
                             displayRig.pose = rigPose;
                             displayRig.virtualDisplayHeight =
                                 inputSnapshot.viewParams.virtualDisplayHeight / inputSnapshot.viewParams.scaleFactor;
-                            displayRig.ipdFactor = inputSnapshot.viewParams.ipdFactor;
+                            displayRig.ipdFactor = inputSnapshot.viewParams.ipdFactor * g_lossDirector.Ipd();
                             displayRig.parallaxFactor = inputSnapshot.viewParams.parallaxFactor;
                             displayRig.perspectiveFactor = inputSnapshot.viewParams.perspectiveFactor;
                             locateInfo.next = &displayRig;

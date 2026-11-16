@@ -25,6 +25,7 @@
 #include "projection_depth.h"
 #include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
 #include "text_overlay.h"
+#include "tracking_loss_director.h" // MANUAL eye-tracking demo (T + L)
 #include "xr_session.h"
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
@@ -832,6 +833,10 @@ static XrSessionManager* g_xr = nullptr;
 // runtime auto-clears the override on the next mode request, so the local
 // note resets whenever the mode changes.
 static bool g_hwToggleRequested = false;
+// MANUAL eye-tracking demo (tracking_loss_director.h): L cycles the app's
+// tracker-loss preset (converge / lens-2D / off); P is parallax here.
+static dxr_demo::TrackingLossDirector g_lossDirector;
+static bool g_lossPresetCycleRequested = false;
 static bool g_hwOverrideActive = false;
 static bool g_hwOverride3D = false;
 static uint32_t g_hwOverrideModeIndex = 0;
@@ -1090,6 +1095,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // mode (xrRequestDisplayModeDXR) — handled in RenderOneFrame.
         if (wParam == 'H') {
             g_hwToggleRequested = true;
+            return 0;
+        }
+        if (wParam == 'L') {
+            g_lossPresetCycleRequested = true;
             return 0;
         }
         break;
@@ -1817,6 +1826,19 @@ static void RenderOneFrame(RenderState& rs) {
         }
     }
 
+    // MANUAL eye-tracking demo: the app's own tracker-loss transition (the
+    // display does nothing in MANUAL). Its depth factor multiplies the rig's
+    // ipdFactor below; LENS_2D also asks for the lens.
+    dxr_demo::TrackingLossStep(
+        g_lossDirector, rs.perfStats->deltaTime,
+        xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANUAL_DXR, xr.isEyeTracking,
+        &g_lossPresetCycleRequested, [](const char *line) { LOG_INFO("%s", line); },
+        [&xr](int lens) {
+            return xr.pfnRequestDisplayModeEXT != nullptr && xr.session != XR_NULL_HANDLE &&
+                   XR_SUCCEEDED(xr.pfnRequestDisplayModeEXT(
+                       xr.session, lens ? XR_DISPLAY_MODE_3D_DXR : XR_DISPLAY_MODE_2D_DXR));
+        });
+
     // #542 'H': hardware-state-only toggle for the current mode.
     {
         // A mode change resets the hardware to the new mode's default —
@@ -1974,7 +1996,7 @@ static void RenderOneFrame(RenderState& rs) {
                     if (useAppProjection) {
                         if (rigCamera) {
                             cameraRig.pose = rigPose;
-                            cameraRig.ipdFactor = g_inputState.viewParams.ipdFactor;
+                            cameraRig.ipdFactor = g_inputState.viewParams.ipdFactor * g_lossDirector.Ipd();
                             cameraRig.parallaxFactor = g_inputState.viewParams.parallaxFactor;
                             cameraRig.convergenceDiopters = g_inputState.viewParams.invConvergenceDistance;
                             cameraRig.verticalFov =
@@ -1988,7 +2010,7 @@ static void RenderOneFrame(RenderState& rs) {
                             displayRig.pose = rigPose;
                             displayRig.virtualDisplayHeight =
                                 g_inputState.viewParams.virtualDisplayHeight / g_inputState.viewParams.scaleFactor;
-                            displayRig.ipdFactor = g_inputState.viewParams.ipdFactor;
+                            displayRig.ipdFactor = g_inputState.viewParams.ipdFactor * g_lossDirector.Ipd();
                             displayRig.parallaxFactor = g_inputState.viewParams.parallaxFactor;
                             displayRig.perspectiveFactor = g_inputState.viewParams.perspectiveFactor;
                             locateInfo.next = &displayRig;
@@ -2588,6 +2610,38 @@ static void RenderOneFrame(RenderState& rs) {
                                     viewMatrix, projMatrix,
                                     useAppProjection ? 1.0f : g_inputState.viewParams.scaleFactor,
                                     0.03f);
+                            }
+
+                            // MANUAL demo status bar: the SAME pixel rect in every
+                            // view = zero disparity (on the screen plane). Length =
+                            // depth factor, colour = state (green tracked, amber
+                            // collapsing, red flat; blue/red in MANAGED).
+                            if (xr.pfnRequestEyeTrackingModeEXT != nullptr) {
+                                const bool manualEt =
+                                    xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANUAL_DXR;
+                                float rgb[3];
+                                g_lossDirector.BarColor(manualEt, rgb);
+                                D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+                                viewRtv->GetDesc(&rd);
+                                const bool srgb = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                                                  rd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+                                const float col[4] = {
+                                    srgb ? dxr_demo::DisplayReferredToLinear(rgb[0]) : rgb[0],
+                                    srgb ? dxr_demo::DisplayReferredToLinear(rgb[1]) : rgb[1],
+                                    srgb ? dxr_demo::DisplayReferredToLinear(rgb[2]) : rgb[2], 1.0f};
+                                const LONG vw = (LONG)vp.Width, vh = (LONG)vp.Height;
+                                const LONG bh = vh / 33 > 8 ? vh / 33 : 8;
+                                LONG bw = (LONG)((float)vw * 0.6f * (manualEt ? g_lossDirector.Ipd() : 1.0f));
+                                if (bw < bh) bw = bh; // a square stub when flat, so the colour still reads
+                                const LONG bx = (LONG)vp.TopLeftX + vw / 20, by = (LONG)vp.TopLeftY + vh / 20;
+                                const D3D11_RECT bar = {bx, by, bx + bw, by + bh};
+                                ID3D11DeviceContext1 *barCtx = nullptr;
+                                if (SUCCEEDED(renderer.context->QueryInterface(
+                                        __uuidof(ID3D11DeviceContext1), (void **)&barCtx)) &&
+                                    barCtx != nullptr) {
+                                    barCtx->ClearView(viewRtv, col, &bar, 1);
+                                    barCtx->Release();
+                                }
                             }
 
                             // #823 actions mode: draw a small marker cube at
