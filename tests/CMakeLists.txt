@@ -148,6 +148,7 @@ set(tests
     tests_sim_input_nav
     tests_sim_input_hands
     tests_sim_stylus_script
+    tests_sim_stylus_mouse
     tests_gamepad_map
     tests_gamepad_hid_report
     tests_ultraleap_map
@@ -1164,6 +1165,19 @@ target_include_directories(
 				${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 	)
 target_link_libraries(tests_sim_stylus_script PRIVATE xrt-interfaces)
+
+# sim_stylus MODE=mouse -- the pure half: monitor pick, pixel -> glass mapping,
+# the pen state machine (force ramp, hover-height steps, double taps, dock,
+# gate) and the Scroll Lock toggle tracker. No OS calls.
+target_sources(
+	tests_sim_stylus_mouse PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_stylus/sim_stylus_mouse.c
+				       ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_stylus/sim_stylus_script.c
+	)
+target_include_directories(
+	tests_sim_stylus_mouse PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_stylus
+			       ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_sim_stylus_mouse PRIVATE xrt-interfaces)
 
 # The gamepad input provider's mapping table (drivers/gamepad/gamepad_map.c):
 # stick -> rig velocity with deadzone, the integrator, the button actions.

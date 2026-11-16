@@ -26,6 +26,8 @@
  *     pressure ramp, then lifts @ref SIM_STYLUS_LIFT_HEIGHT_M off the glass
  *     (force 0) for the rest — one stroke per period.
  *   - `hover`: the same figure, held `HOVER_HEIGHT_M` above the glass, force 0.
+ *   - `mouse`: not scripted — the desktop mouse drives the pen
+ *     (`sim_stylus_mouse.h`); this file only lends it the pen axes and the dock.
  *
  * **Buttons** (`BUTTONS` = 1): short pulses on fixed schedules — front click,
  * back click, front / back double tap and a middle-cluster force ramp — so an
@@ -79,6 +81,8 @@ enum sim_stylus_mode
 {
 	SIM_STYLUS_MODE_DRAW = 0,
 	SIM_STYLUS_MODE_HOVER = 1,
+	//! The desktop mouse drives the pen (Windows; `sim_stylus_mouse.h`). Never evaluated here.
+	SIM_STYLUS_MODE_MOUSE = 2,
 };
 
 //! What the script needs, resolved from the provider's settings once.
@@ -133,7 +137,23 @@ sim_stylus_script_eval(const struct sim_stylus_script_config *cfg, int64_t t_ns,
 bool
 sim_stylus_script_tracked(const struct sim_stylus_script_config *cfg, int64_t t_ns);
 
-//! Parse a `MODE` value ("draw" | "hover"); false leaves @p out unchanged.
+/*!
+ * The pen orientation for a barrel whose back points along @p back_unit (the
+ * pose's +Z; -Z points out of the tip), +Y the world up made orthogonal to it.
+ * @p back_unit must not be parallel to +Y.
+ */
+struct xrt_quat
+sim_stylus_orientation_from_back(struct xrt_vec3 back_unit);
+
+//! @p tip moved @ref SIM_STYLUS_GRIP_OFFSET_M back up the barrel along @p back_unit.
+struct xrt_pose
+sim_stylus_grip_from_tip(const struct xrt_pose *tip, struct xrt_vec3 back_unit);
+
+//! The pen standing tip-down in its dock beside the lower-right corner of a @p width_m x @p height_m display.
+void
+sim_stylus_dock_pose(float width_m, float height_m, struct xrt_pose *out_tip, struct xrt_pose *out_grip);
+
+//! Parse a `MODE` value ("draw" | "hover" | "mouse"); false leaves @p out unchanged.
 bool
 sim_stylus_parse_mode(const char *s, enum sim_stylus_mode *out);
 

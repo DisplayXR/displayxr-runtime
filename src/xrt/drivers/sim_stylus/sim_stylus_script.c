@@ -181,14 +181,30 @@ tip_position(const struct sim_stylus_script_config *cfg, double t_s, bool *out_c
 	return v3(x, y, z);
 }
 
-static struct xrt_pose
-grip_from_tip(const struct xrt_pose *tip, struct xrt_vec3 back_dir)
+struct xrt_pose
+sim_stylus_grip_from_tip(const struct xrt_pose *tip, struct xrt_vec3 back_dir)
 {
 	struct xrt_pose g = *tip;
 	g.position.x += back_dir.x * SIM_STYLUS_GRIP_OFFSET_M;
 	g.position.y += back_dir.y * SIM_STYLUS_GRIP_OFFSET_M;
 	g.position.z += back_dir.z * SIM_STYLUS_GRIP_OFFSET_M;
 	return g;
+}
+
+struct xrt_quat
+sim_stylus_orientation_from_back(struct xrt_vec3 back_unit)
+{
+	return quat_from_z_up(back_unit, v3(0.0f, 1.0f, 0.0f));
+}
+
+void
+sim_stylus_dock_pose(float width_m, float height_m, struct xrt_pose *out_tip, struct xrt_pose *out_grip)
+{
+	// Standing tip-down in a dock beside the panel's lower-right corner.
+	const struct xrt_vec3 back = v3(0.0f, 1.0f, 0.0f);
+	out_tip->position = v3(0.5f * width_m + 0.04f, -0.5f * height_m, 0.03f);
+	out_tip->orientation = quat_from_z_up(back, v3(0.0f, 0.0f, 1.0f));
+	*out_grip = sim_stylus_grip_from_tip(out_tip, back);
 }
 
 void
@@ -201,11 +217,7 @@ sim_stylus_script_eval(const struct sim_stylus_script_config *cfg, int64_t t_ns,
 	const bool docked = docked_at(cfg, t_ns, &in_dock_ns);
 
 	if (docked) {
-		// Standing tip-down in a dock beside the panel's lower-right corner.
-		const struct xrt_vec3 back = v3(0.0f, 1.0f, 0.0f);
-		out->tip.position = v3(0.5f * cfg_width(cfg) + 0.04f, -0.5f * cfg_height(cfg), 0.03f);
-		out->tip.orientation = quat_from_z_up(back, v3(0.0f, 0.0f, 1.0f));
-		out->grip = grip_from_tip(&out->tip, back);
+		sim_stylus_dock_pose(cfg_width(cfg), cfg_height(cfg), &out->tip, &out->grip);
 		out->docked = true;
 		out->tracked = !(cfg->dock_sleep_ms > 0 && in_dock_ns >= cfg->dock_sleep_ms * 1000000LL);
 		return;
@@ -220,8 +232,8 @@ sim_stylus_script_eval(const struct sim_stylus_script_config *cfg, int64_t t_ns,
 	out->tip.position = tip_position(cfg, t_s, &contact, &force);
 	// +Z of the pose is the back direction (-Z points out of the tip); +Y the
 	// cluster's normal, taken as the world up made orthogonal to the barrel.
-	out->tip.orientation = quat_from_z_up(back, v3(0.0f, 1.0f, 0.0f));
-	out->grip = grip_from_tip(&out->tip, back);
+	out->tip.orientation = sim_stylus_orientation_from_back(back);
+	out->grip = sim_stylus_grip_from_tip(&out->tip, back);
 	out->tip_force = force;
 	out->contact = contact;
 	out->tracked = true;
@@ -270,6 +282,10 @@ sim_stylus_parse_mode(const char *s, enum sim_stylus_mode *out)
 	}
 	if (strcmp(s, "hover") == 0) {
 		*out = SIM_STYLUS_MODE_HOVER;
+		return true;
+	}
+	if (strcmp(s, "mouse") == 0) {
+		*out = SIM_STYLUS_MODE_MOUSE;
 		return true;
 	}
 	return false;

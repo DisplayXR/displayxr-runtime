@@ -11,6 +11,11 @@
  * monotonic time, so `get_tracked_pose(at_time_ns)` is exact for any time
  * and runs are reproducible.
  *
+ * `MODE=mouse` replaces the script with the desktop mouse
+ * (`sim_stylus_mouse.h`): every query samples the cursor NOW (a mouse cannot
+ * be predicted), through one process-wide sampler that serialises
+ * `update_inputs` against `get_tracked_pose` on other threads.
+ *
  * Haptics: `set_output` counts vibration events and logs them (the first one
  * as a WARN, the rest at INFO), with the last amplitude / frequency visible
  * through u_var — enough to see an app's `xrApplyHapticFeedback` arrive.
@@ -29,6 +34,7 @@
 #include "util/u_var.h"
 
 #include "sim_stylus_interface.h"
+#include "sim_stylus_mouse.h"
 #include "sim_stylus_script.h"
 
 #include <stdio.h>
@@ -95,6 +101,17 @@ sim_stylus_destroy(struct xrt_device *xdev)
 	u_device_free(&sd->base);
 }
 
+//! The pen at @p t_ns: the script's, or (mouse) the desktop's as of now.
+static void
+eval_pen(const struct sim_stylus_device *sd, int64_t t_ns, struct sim_stylus_state *out)
+{
+	if (sd->cfg.mode == SIM_STYLUS_MODE_MOUSE) {
+		sim_stylus_mouse_os_eval((int64_t)os_monotonic_get_ns(), out);
+		return;
+	}
+	sim_stylus_script_eval(&sd->cfg, t_ns, out);
+}
+
 static xrt_result_t
 sim_stylus_update_inputs(struct xrt_device *xdev)
 {
@@ -102,7 +119,7 @@ sim_stylus_update_inputs(struct xrt_device *xdev)
 	const int64_t now = (int64_t)os_monotonic_get_ns();
 
 	struct sim_stylus_state s;
-	sim_stylus_script_eval(&sd->cfg, now, &s);
+	eval_pen(sd, now, &s);
 
 	for (uint32_t i = 0; i < xdev->input_count; i++) {
 		xdev->inputs[i].active = s.tracked;
@@ -139,7 +156,7 @@ sim_stylus_get_tracked_pose(struct xrt_device *xdev,
 	}
 
 	struct sim_stylus_state s;
-	sim_stylus_script_eval(&sd->cfg, at_timestamp_ns, &s);
+	eval_pen(sd, at_timestamp_ns, &s);
 
 	U_ZERO(out_relation);
 	if (!s.tracked) {

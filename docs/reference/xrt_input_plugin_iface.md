@@ -327,7 +327,9 @@ id `sim-stylus`): one scripted pen with every input of the profile, the
 dominant-hand declaration with a `HAND` override, a `RIG_LOCAL_PHYSICAL`
 origin, and presence that follows a scripted dock. Its script
 (`sim_stylus_script.c`) is pure and unit-tested; copy the device and plug-in
-files, not the script, when writing a real provider.
+files, not the script, when writing a real provider. `MODE=mouse` (Windows)
+replaces the script with the desktop mouse (`sim_stylus_mouse.h`), so a person
+can draw on the panel with no stylus.
 
 ## Device obligations
 

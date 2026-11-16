@@ -375,6 +375,8 @@ sim_display honestly advertises **no** eye tracking (per-mode `has_tracking=fals
 
 **A moving viewer without hardware goes through the viewer-tracking provider class** (ADR-054 N6, spec `docs/specs/runtime/tracking-provider-discovery.md` §8): `displayxr-cli tracking set sim-tracking ENABLE 1` (or `DXR_TRACKING_SIM_TRACKING_ENABLE=1`) drives `xrLocateViews` from a scripted head (`SOURCE=script`, `SCRIPT=sweep|offset`), or with `SOURCE=webcam` from a real webcam face tracker (#1855, moved here from sim_display) that also publishes the camera-space block for calibration. The webcam needs a face estimator built in (`-DXRT_SIM_WEBCAM_ESTIMATOR=onnx`; the default build ships the stub and the provider declines). sim_display's own `WEBCAM_TRACKING` (legacy `SIM_DISPLAY_WEBCAM_TRACKING`) still works for **one release** as a deprecation alias over the same core — sim_display then tracks itself (OWN-like, MANAGED) and logs one WARN pointing to `sim-tracking SOURCE=webcam`.
 
+**A stylus without hardware:** `sim-stylus` (MX Ink profile, dominant hand; `ENABLE 1`) scripts a pen (`MODE=draw|hover`) or, on Windows, `MODE=mouse` makes the desktop mouse the pen over the panel's monitor while Scroll Lock is on (`GATE=none` = always): left button = tip on the glass, PageUp/PageDown = hover height. Keys + settings: `displayxr-cli input options sim-stylus`, `docs/guides/input-provider-onboarding.md` §15.
+
 ### Windows test apps
 `scripts\build_windows.bat test-apps` builds apps and generates run scripts in `_package/` that set `XR_RUNTIME_JSON` to the dev build.
 

@@ -19,7 +19,11 @@
  *     display-plane metres, screen-anchored, glass-registered);
  *   - presence follows the scripted dock (`DOCK_MS` / `DOCK_SLEEP_MS`): a pen
  *     asleep in its dock reports ABSENT, so the dominant hand's role goes back
- *     to the fallback and returns when it undocks.
+ *     to the fallback and returns when it undocks;
+ *   - `MODE=mouse` (Windows): the desktop mouse drives the pen while its gate
+ *     is open (`GATE=scrolllock`, the default: Scroll Lock on), and presence
+ *     follows the gate (`sim_stylus_mouse.h`). Elsewhere it falls back to
+ *     `draw` with one WARN.
  *
  * **NOT a product path.** `probe()` declines unless its `ENABLE` setting is 1:
  * `displayxr-cli input set sim-stylus ENABLE 1` (per user; `--machine` =
@@ -39,6 +43,7 @@
 #include "util/u_logging.h"
 
 #include "sim_stylus_interface.h"
+#include "sim_stylus_mouse.h"
 #include "sim_stylus_script.h"
 #include "sim_stylus_settings.h"
 
@@ -93,6 +98,49 @@ host_handedness(void)
 	return -1;
 }
 
+static const char *
+mode_str(enum sim_stylus_mode mode)
+{
+	switch (mode) {
+	case SIM_STYLUS_MODE_HOVER: return "hover";
+	case SIM_STYLUS_MODE_MOUSE: return "mouse";
+	default: return "draw";
+	}
+}
+
+//! Resolve the mouse-mode settings and start the sampler; false = no sampler on this platform.
+static bool
+start_mouse(const struct sim_stylus_script_config *cfg)
+{
+	struct sim_stylus_mouse_config mc;
+	memset(&mc, 0, sizeof(mc));
+	mc.display_width_m = cfg->display_width_m;
+	mc.display_height_m = cfg->display_height_m;
+	mc.hover_height_m = cfg->hover_height_m;
+	mc.left_handed = cfg->left_handed;
+	mc.tilt_deg = sim_stylus_setting_float("TILT_DEG", SIM_STYLUS_MOUSE_TILT_DEFAULT_DEG);
+	mc.ramp_ms = sim_stylus_setting_ms("RAMP_MS", SIM_STYLUS_MOUSE_RAMP_DEFAULT_MS);
+	mc.double_tap_ms = sim_stylus_mouse_os_double_click_ms();
+	mc.gate = SIM_STYLUS_MOUSE_GATE_SCROLLLOCK;
+
+	char v[64];
+	if (sim_stylus_setting("GATE", v, sizeof(v)) && !sim_stylus_mouse_parse_gate(v, &mc.gate)) {
+		U_LOG_W("sim-stylus: GATE='%s' is not scrolllock|none - using scrolllock.", v);
+	}
+	char screen[64];
+	sim_stylus_setting("SCREEN", screen, sizeof(screen));
+
+	if (!sim_stylus_mouse_os_init(&mc, screen)) {
+		return false;
+	}
+	U_LOG_W("sim-stylus: mouse: gate=%s tilt=%.1f deg ramp=%lld ms double-tap=%lld ms. %s",
+	        mc.gate == SIM_STYLUS_MOUSE_GATE_NONE ? "none" : "scrolllock", (double)mc.tilt_deg,
+	        (long long)mc.ramp_ms, (long long)mc.double_tap_ms,
+	        mc.gate == SIM_STYLUS_MOUSE_GATE_NONE ? "The mouse is the pen whenever it is over the panel."
+	                                              : "Turn Scroll Lock on to pick the pen up.");
+	return true;
+}
+
 static xrt_result_t
 sim_stylus_plugin_probe(struct xrt_input_plugin_instance **out_inst)
 {
@@ -128,7 +176,7 @@ sim_stylus_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 
 	cfg.mode = SIM_STYLUS_MODE_DRAW;
 	if (sim_stylus_setting("MODE", v, sizeof(v)) && !sim_stylus_parse_mode(v, &cfg.mode)) {
-		U_LOG_W("sim-stylus: MODE='%s' is not draw|hover - using draw.", v);
+		U_LOG_W("sim-stylus: MODE='%s' is not draw|hover|mouse - using draw.", v);
 	}
 	cfg.period_s = sim_stylus_setting_float("PERIOD_S", SIM_STYLUS_PERIOD_DEFAULT_S);
 	cfg.hover_height_m = sim_stylus_setting_float("HOVER_HEIGHT_M", SIM_STYLUS_HOVER_HEIGHT_DEFAULT_M);
@@ -167,11 +215,16 @@ sim_stylus_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 	}
 	cfg.left_handed = left;
 
+	if (cfg.mode == SIM_STYLUS_MODE_MOUSE && !start_mouse(&cfg)) {
+		U_LOG_W("sim-stylus: MODE=mouse needs Windows - using draw.");
+		cfg.mode = SIM_STYLUS_MODE_DRAW;
+	}
+
 	U_LOG_W(
 	    "sim-stylus: mode=%s period=%.2f s hover=%.3f m buttons=%d dock_ms=%lld dock_sleep_ms=%lld; display "
 	    "%.3f x %.3f m (%s); hand %s.",
-	    cfg.mode == SIM_STYLUS_MODE_HOVER ? "hover" : "draw", (double)cfg.period_s, (double)cfg.hover_height_m,
-	    cfg.buttons ? 1 : 0, (long long)cfg.dock_ms, (long long)cfg.dock_sleep_ms,
+	    mode_str(cfg.mode), (double)cfg.period_s, (double)cfg.hover_height_m, cfg.buttons ? 1 : 0,
+	    (long long)cfg.dock_ms, (long long)cfg.dock_sleep_ms,
 	    (double)(cfg.display_width_m > 0.0f ? cfg.display_width_m : SIM_STYLUS_DISPLAY_WIDTH_FALLBACK_M),
 	    (double)(cfg.display_height_m > 0.0f ? cfg.display_height_m : SIM_STYLUS_DISPLAY_HEIGHT_FALLBACK_M),
 	    cfg.display_height_m > 0.0f ? "host display geometry" : "fallback", hand_why);
@@ -200,6 +253,11 @@ static enum xrt_input_provider_presence
 sim_stylus_plugin_get_presence(struct xrt_input_plugin_instance *inst)
 {
 	(void)inst;
+	// Mouse: the pen exists while its gate is open.
+	if (g_have_cfg && g_cfg.mode == SIM_STYLUS_MODE_MOUSE) {
+		return sim_stylus_mouse_os_gate_open() ? XRT_INPUT_PROVIDER_PRESENCE_PRESENT
+		                                       : XRT_INPUT_PROVIDER_PRESENCE_ABSENT;
+	}
 	// A pen asleep in its dock is gone; otherwise it is here. Non-blocking:
 	// the same pure schedule the device evaluates.
 	if (g_have_cfg && !sim_stylus_script_tracked(&g_cfg, (int64_t)os_monotonic_get_ns())) {

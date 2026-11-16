@@ -605,12 +605,17 @@ endif()
 # DOMINANT_HAND_CONTROLLER, publishing on a RIG_LOCAL_PHYSICAL origin. Same
 # build model as sim-input; no aux_math (the script keeps its own small
 # quaternion helper). probe() declines unless setting
-# ENABLE=1, so staging/registering it is inert. sim_stylus_script.c is pure and
-# also compiled straight into tests_sim_stylus_script.
+# ENABLE=1, so staging/registering it is inert. sim_stylus_script.c and
+# sim_stylus_mouse.c are pure and also compiled straight into
+# tests_sim_stylus_script / tests_sim_stylus_mouse; sim_stylus_mouse_os.c is
+# the MODE=mouse desktop sampler (Win32 user32/gdi32, stubs elsewhere).
 if(XRT_FEATURE_OPENXR AND NOT ANDROID)
 add_library(drv_sim_stylus_plugin SHARED
 	sim_stylus/sim_stylus_device.c
 	sim_stylus/sim_stylus_interface.h
+	sim_stylus/sim_stylus_mouse.c
+	sim_stylus/sim_stylus_mouse.h
+	sim_stylus/sim_stylus_mouse_os.c
 	sim_stylus/sim_stylus_plugin.c
 	sim_stylus/sim_stylus_script.c
 	sim_stylus/sim_stylus_script.h
@@ -631,6 +636,9 @@ else()
 			drv_includes
 		)
 	add_dependencies(drv_sim_stylus_plugin ${RUNTIME_TARGET})
+	if(WIN32)
+		target_link_libraries(drv_sim_stylus_plugin PRIVATE user32 gdi32)
+	endif()
 	if(APPLE)
 		set_property(TARGET drv_sim_stylus_plugin APPEND PROPERTY BUILD_RPATH "$<TARGET_FILE_DIR:${RUNTIME_TARGET}>")
 	endif()
