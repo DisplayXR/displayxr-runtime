@@ -381,7 +381,7 @@ spec, §12.5.
 - Version 20, no interface change: every window entry gains **`hidden`**: `""`
   when the window can be seen, else why not: `"locked"` (the screen is locked),
   `"minimized"`, `"workspace"` (not on the active workspace) or `"covered"` (its
-  buffer rect, clipped to its monitor, is under other apps' opaque windows, all
+  frame rect (not the buffer rect, which holds a client-side shadow), clipped to its monitor, is under other apps' opaque windows, all
   but 2 % of it). Docks, the desktop, notifications, menus, tooltips,
   translucent windows, the app's own windows and the shell's own chrome (top
   bar, dash) never cover. A Wayland client cannot learn any of this; the

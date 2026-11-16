@@ -162,6 +162,9 @@ check(/Visibility\.compute\(stack, Main\?\.sessionMode\?\.isLocked === true\)/.t
     'the stack is judged with the lock state');
 check(/for \(const actor of global\.get_window_actors\(\)\)[\s\S]{0,400}const f = win\.get_frame_rect\(\);/.test(src),
     'the stack is global.get_window_actors(), bottom to top');
+check(/target = Visibility\.intersect\(\[f\.x, f\.y, f\.width, f\.height\]/.test(src) &&
+    !/target = Visibility\.intersect\(\[b\.x/.test(src),
+    'the covered target is the FRAME rect (a CSD buffer rect holds its shadow)');
 check(/this\._connectOther\(display, 'restacked'\);/.test(src), 'a restack emits');
 check(/this\._connectOther\(global\.workspace_manager, 'active-workspace-changed'\);/.test(src),
     'a workspace switch emits');

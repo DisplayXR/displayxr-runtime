@@ -502,7 +502,7 @@ Checked in this order:
 | `"locked"` | the screen is locked (every window says it) |
 | `"minimized"` | the window is minimized (by the app, the user or the dock) |
 | `"workspace"` | the window is not on the active workspace (`Meta.Window.located_on_workspace`, so a window on all workspaces, or on a secondary monitor with "workspaces on the primary only", is on it) |
-| `"covered"` | its **buffer** rect, clipped to its monitor, is under the windows above it, all but 2 % of its area (the Windows tracker's sliver rule) |
+| `"covered"` | its **frame** rect (not the buffer rect: a client-side window's buffer holds its drop shadow, which no occluder covers), clipped to its monitor, is under the windows above it, all but 2 % of its area (the Windows tracker's sliver rule) |
 | `""` | none of these: the window can be seen |
 
 What covers. The stack is `global.get_window_actors()`, bottom to top, and only

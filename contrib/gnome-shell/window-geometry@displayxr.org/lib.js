@@ -1469,7 +1469,8 @@
      *   "locked"    the screen is locked (every window),
      *   "minimized" minimized (by the app, the user or the dock),
      *   "workspace" not on the active workspace,
-     *   "covered"   its buffer rect, clipped to its monitor, is covered by
+     *   "covered"   its frame rect (not the buffer rect, which holds a
+     *               client-side shadow), clipped to its monitor, is covered by
      *               windows higher in the stack, all but a sliver
      *               (COVER_TOLERANCE of its area, the Windows tracker's rule).
      * Occluders mirror the runtime's X11 tracker: a window above counts only
@@ -4194,12 +4195,16 @@
                         onActive = true;
                     }
                     const f = win.get_frame_rect();
-                    const b = win.get_buffer_rect();
+                    // The FRAME rect is what must be covered, the same rect an
+                    // occluder contributes: a client-side window's buffer rect
+                    // also holds its drop shadow, which no occluder's frame
+                    // covers, so a CSD window exactly overlaid by another
+                    // never read as covered (nested-shell check, #2689).
                     const mon = win.get_monitor();
                     let target = null;
                     if (mon >= 0) {
                         const g = display.get_monitor_geometry(mon);
-                        target = Visibility.intersect([b.x, b.y, b.width, b.height],
+                        target = Visibility.intersect([f.x, f.y, f.width, f.height],
                             [g.x, g.y, g.width, g.height]);
                     }
                     wins.push(win);
