@@ -54,6 +54,12 @@ extern "C" {
 #define COMP_WEAVE_PF_RING 64
 //! Accepted residuals the median is taken over.
 #define COMP_WEAVE_PF_MEDIAN 9
+//! Accepted residuals needed before anything is published. The first frame
+//! after a tile appears (or after a stale gap) is often several times slower
+//! than steady state (buffer/SurfaceView setup); with one sample the "median"
+//! IS that frame, and one weave was seen publishing a 155 ms horizon on device.
+//! Three samples let the median outvote one such outlier.
+#define COMP_WEAVE_PF_MIN_REPORTS 3
 //! A residual above this is a stalled or mis-correlated frame, not a latency.
 #define COMP_WEAVE_PF_MAX_RESIDUAL_NS (500ULL * 1000ULL * 1000ULL)
 //! No accepted report for this long => the prediction is unknown (0).
@@ -192,13 +198,14 @@ comp_weave_pf_report(struct comp_weave_pf *pf, uint64_t fence_value, int64_t act
 /*!
  * The predicted weave->scanout interval for a weave starting at @p now_ns:
  * the median of the accepted window (the upper middle while it holds an even
- * count), or 0 = unknown when nothing was accepted yet or the last accepted
+ * count), or 0 = unknown while fewer than @ref COMP_WEAVE_PF_MIN_REPORTS were
+ * accepted (since start or since the last stale reset) or the last accepted
  * report is older than @ref COMP_WEAVE_PF_STALE_NS.
  */
 static inline uint64_t
 comp_weave_pf_predict(const struct comp_weave_pf *pf, uint64_t now_ns)
 {
-	if (pf == NULL || pf->recent_count == 0) {
+	if (pf == NULL || pf->recent_count < COMP_WEAVE_PF_MIN_REPORTS) {
 		return 0;
 	}
 	if (now_ns > pf->last_accept_ns && now_ns - pf->last_accept_ns > COMP_WEAVE_PF_STALE_NS) {
