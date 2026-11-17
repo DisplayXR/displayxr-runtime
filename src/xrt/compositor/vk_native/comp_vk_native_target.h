@@ -356,6 +356,21 @@ bool
 comp_vk_native_target_images_sampled(struct comp_vk_native_target *target);
 
 /*!
+ * #2708 — true when the present carries per-pixel alpha to the window
+ * system: a transparent compositeAlpha was granted, or the Windows DComp
+ * bridge (either route) presents through its PREMULTIPLIED swapchain. False
+ * when a transparent request fell back to an OPAQUE swapchain — the
+ * compositor then composites as for an opaque present (the Local2D/zones
+ * blend flattens instead of emitting alpha nobody blends). Only meaningful
+ * on a transparent session; always true off Windows, where that fallback is
+ * not acted on.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_target_presents_alpha(struct comp_vk_native_target *target);
+
+/*!
  * Get the target's image-set generation (#602). Bumped each time the target
  * image set is (re)created — the compositor forwards it to the display
  * processor so caches keyed by the target VkImage handle can be invalidated
