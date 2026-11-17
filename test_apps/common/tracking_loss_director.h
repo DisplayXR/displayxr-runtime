@@ -25,7 +25,8 @@
  * Header-only, no dependencies: shared by the Windows cube apps (the Linux
  * cube carries the same logic inline, cube_handle_vk_linux/main.cpp). Each
  * app calls TrackingLossStep once per frame, multiplies Ipd() into its rig's
- * ipdFactor and may draw a zero-disparity status bar with BarColor().
+ * ipdFactor and may draw a zero-disparity status bar with BarColor(), labelled
+ * with BarLabel().
  */
 #pragma once
 
@@ -194,6 +195,39 @@ struct TrackingLossDirector
 		case RECOVER: set(0.6f, 1.0f, 0.2f); break;       // yellow-green: coming back
 		default: set(0.1f, 0.9f, 0.3f); break;            // green: tracked
 		}
+	}
+	/*!
+	 * The status bar's text label, so a viewer can read which mode they are
+	 * in instead of decoding the colour: "MANAGED", "MANAGED - face lost",
+	 * "MANUAL", "MANUAL [lens-2D] - face lost (collapse)", ... The preset is
+	 * named only when it is not the default (converge). Writes into @p buf
+	 * (@p n bytes, 64 is plenty) and returns it. Cheap: one snprintf.
+	 */
+	const char *
+	BarLabel(bool manual, char *buf, size_t n) const
+	{
+		if (buf == nullptr || n == 0) {
+			return "";
+		}
+		if (!manual) {
+			std::snprintf(buf, n, "%s", tracked ? "MANAGED" : "MANAGED - face lost");
+			return buf;
+		}
+		char presetTag[24] = "";
+		if (preset != CONVERGE) {
+			std::snprintf(presetTag, sizeof(presetTag), " [%s]", PresetName(preset));
+		}
+		const char *state = "";
+		switch (phase) {
+		case HOLD: state = " - face lost (hold)"; break;
+		case COLLAPSE: state = " - face lost (collapse)"; break;
+		case FLAT: state = " - face lost (flat)"; break;
+		case RECOVER_WAIT:
+		case RECOVER: state = " - face found (recovering)"; break;
+		default: state = tracked ? "" : " - face lost"; break; // TRACKING, or IDLE (preset off)
+		}
+		std::snprintf(buf, n, "MANUAL%s%s", presetTag, state);
+		return buf;
 	}
 };
 
