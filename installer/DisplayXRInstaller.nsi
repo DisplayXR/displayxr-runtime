@@ -1370,11 +1370,13 @@ client_dll_ok:
 			ReadRegStr $R2 HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime"
 			${If} $R2 != ""
 			${AndIf} ${FileExists} "$R2"
-				Push "$R2"
-				Push "\DisplayXR\"
-				Call StrStr
-				Pop $R3
-				${If} $R3 == ""
+				; WordFind, not this file's StrStr helper: StrStr's epilogue
+				; (Exch $0) trades a value with the caller's stack and so
+				; corrupts it. "E#" sets the error flag when the delimiter
+				; is absent; the match is case-insensitive, like paths.
+				ClearErrors
+				${WordFind} "$R2" "\DisplayXR\" "E#" $R3
+				${If} ${Errors}
 					StrCpy $DxrClaimActiveRuntime 0
 					DetailPrint "ActiveRuntime points at another runtime ($R2); this upgrade leaves it. Switch back with: displayxr-cli runtime activate"
 				${EndIf}
