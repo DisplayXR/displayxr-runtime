@@ -1,6 +1,6 @@
 # dxr-get — fetch, verify and install DisplayXR components
 
-Epic [#2702](https://github.com/DisplayXR/displayxr-runtime/issues/2702) · P1 [#2704](https://github.com/DisplayXR/displayxr-runtime/issues/2704) · P2 [#2705](https://github.com/DisplayXR/displayxr-runtime/issues/2705) · catalog: [component-catalog.md](component-catalog.md)
+Epic [#2702](https://github.com/DisplayXR/displayxr-runtime/issues/2702) · P1 [#2704](https://github.com/DisplayXR/displayxr-runtime/issues/2704) · P2 [#2705](https://github.com/DisplayXR/displayxr-runtime/issues/2705) · catalog: `component-catalog.md` (PR #2706)
 
 `dxr-get.exe` lets one DisplayXR component installer bring in the components it depends on.
 The first user is the DisplayXR Browser installer, which used to leave a box with a missing or
