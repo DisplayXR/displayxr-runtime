@@ -287,6 +287,16 @@ jobs:
         # entry, the workareas-changed emit). Plain gjs.
         run: gjs scripts/test_gnome_extension_work_area.js
 
+      - name: Window visibility
+        # Unit test for Visibility in lib.js (extension version 20, a window
+        # entry's "hidden", runtime#2689): the cover math (2 % sliver
+        # tolerance, clipped to the monitor), which windows cover (not docks,
+        # menus, notifications, the desktop, translucent or same-process
+        # windows), the precedence locked > minimized > workspace > covered,
+        # and the shipped wiring (the entry, the restack / workspace / lock /
+        # monitor emits). Plain gjs.
+        run: gjs scripts/test_gnome_extension_visibility.js
+
   cnsdk-pin-guard:
     runs-on: ubuntu-latest
     steps:

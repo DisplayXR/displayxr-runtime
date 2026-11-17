@@ -482,6 +482,63 @@ older consumer ignores the new key.
 - Version 18 has no `work_area`, and the plug-in then behaves as before.
 - No JS errors in any run.
 
+### 4.3 Whether a window can be seen (extension version 20, #2689)
+
+ADR-062 makes the lens follow 3D-window visibility: while every 3D window is
+hidden the lens wish is 2D, and when one returns the session's own last request
+is sent again. On Windows, X11 and macOS the runtime can tell. A native Wayland
+client cannot: it never sees the stacking order, the active workspace or
+another client's window. GNOME Shell can, so version 20 adds one field to every
+window entry:
+
+```json
+"hidden": ""            // or "locked" | "minimized" | "workspace" | "covered"
+```
+
+Checked in this order:
+
+| value | meaning |
+|---|---|
+| `"locked"` | the screen is locked (every window says it) |
+| `"minimized"` | the window is minimized (by the app, the user or the dock) |
+| `"workspace"` | the window is not on the active workspace (`Meta.Window.located_on_workspace`, so a window on all workspaces, or on a secondary monitor with "workspaces on the primary only", is on it) |
+| `"covered"` | its **frame** rect (not the buffer rect: a client-side window's buffer holds its drop shadow, which no occluder covers), clipped to its monitor, is under the windows above it, all but 2 % of its area (the Windows tracker's sliver rule) |
+| `""` | none of these: the window can be seen |
+
+What covers. The stack is `global.get_window_actors()`, bottom to top, and only
+windows above the target count. A window covers when its actor is shown, it is
+not minimized, it is on the active workspace, it belongs to another process,
+its type is one a user calls a window (normal, dialog, modal dialog, utility,
+toolbar, splash), it is not the desktop-icons window, and its actor is opaque
+(opacity 255; mutter maps X11 `_NET_WM_WINDOW_OPACITY` onto it). Its **frame**
+rect counts, so a client-side shadow is not cover. Docks, the desktop,
+notifications, menus, tooltips, combo popups and drag icons never cover, and
+neither does the shell's own chrome (top bar, dash, the overview, shell
+notifications), which is not a window actor. These mirror the runtime's X11
+tracker (`u_window_visibility_x11.c`). A native Wayland window and an XWayland
+one cover alike: both are window actors.
+
+When it changes. `WindowsChanged` already followed geometry, focus, minimize
+and the work area. From version 20 it also follows a restack (`restacked`), a
+workspace switch (`active-workspace-changed`), a window moved to another
+workspace, the lock screen coming or going (`Main.sessionMode` `updated`), a
+monitor change (`Main.layoutManager` `monitors-changed`), and a window actor
+becoming opaque or translucent, shown or hidden, or ending a map / minimize
+effect (a window maps fading in from opacity 0, so only the edge at 255 emits,
+not each step of the fade). All of it is coalesced to one emit per redraw, as
+before; nothing fires per frame.
+
+Limits, all on the "seen" side (which keeps the lens in 3D): per-pixel
+translucency inside an opaque actor is not seen, so a terminal with a
+transparent background covers; the overview's thumbnails do not hide a
+window; a window on two monitors is judged on its own monitor (the one mutter
+assigns), not on the 3D panel alone. The pure part is `Visibility` in `lib.js`,
+unit-tested by `scripts/test_gnome_extension_visibility.js`.
+
+Additive: no field changed meaning, so the schema stays `version: 1`. A
+consumer that finds no `hidden` (version 19 or older) treats the window as
+seen, which is what it had before.
+
 ## 5. Known limitations / follow-ups (#817)
 
 (Capture-exclusion limitations are listed with it, in §6.6.)
