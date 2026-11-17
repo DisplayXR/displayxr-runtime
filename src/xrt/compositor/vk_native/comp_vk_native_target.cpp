@@ -4270,6 +4270,14 @@ comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target, b
 	// #912/#868 interplay: this repaint's present will release a bridge
 	// waitable token nobody waits for; the app's next acquire drains it.
 	g_vk_repaint_presents_since_app.fetch_add(1, std::memory_order_relaxed);
+	// #1339 on the VK bridge (#2708): stamp the repaint for the bridge
+	// governor too, as the D3D11 target does. Without it an app that slows
+	// down while repaints keep the weave at panel rate (no viewer, SR
+	// services restarting) reads as saturation: the bridge escalated to depth
+	// 4 and stayed there for two hours on the Adreno box, ~3 frames of queue
+	// in front of every repaint. With it the governor holds the base depth
+	// while repaints flow and walks an escalation back one level per mark.
+	g_lw_gov_vk_bridge.note_repaint((uint64_t)now.QuadPart);
 #else
 	(void)target;
 #endif

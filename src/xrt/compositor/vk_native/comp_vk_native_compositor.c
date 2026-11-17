@@ -5330,14 +5330,13 @@ vk_native_dispatch_composite_tap(struct comp_vk_native_compositor *c)
 	char path[600];
 	snprintf(path, sizeof(path), "%s\\displayxr_tap_target.png", out_dir);
 	bool ok_t = vk_native_dump_image_to_png(c, c->tap_target_image, c->tap_target_w, c->tap_target_h,
-	                                        c->tap_target_layout,
-	                                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, false, path);
+	                                        c->tap_target_layout, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                                        u_image_capture_raw_alpha(), path); // #2708: presented alpha
 	snprintf(path, sizeof(path), "%s\\displayxr_tap_weave.png", out_dir);
-	bool ok_w = vk_native_dump_image_to_png(c, c->weave_scratch, c->tap_region_w, c->tap_region_h,
-	                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	                                        VK_ACCESS_SHADER_READ_BIT,
-	                                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, false, path);
+	bool ok_w = vk_native_dump_image_to_png(
+	    c, c->weave_scratch, c->tap_region_w, c->tap_region_h, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, u_image_capture_raw_alpha(), path);
 	snprintf(path, sizeof(path), "%s\\displayxr_tap_twod.png", out_dir);
 	bool ok_2 = vk_native_dump_image_to_png(c, c->local2d_scratch, c->tap_region_w, c->tap_region_h,
 	                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
