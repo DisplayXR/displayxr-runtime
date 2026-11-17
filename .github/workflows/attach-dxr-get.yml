@@ -1,0 +1,67 @@
+# Attach the SIGNED dxr-get.exe to a runtime release (#2704).
+#
+# Component installers (the DisplayXR Browser's first, browser-pvt#367) embed
+# dxr-get.exe from a runtime release asset. CI builds are unsigned, and the
+# signed runtime installer only lands when /release swaps it in (Step 4.5.3),
+# so this runs AFTER that swap: /release dispatches it. It extracts dxr-get.exe
+# from the signed installer (the signing runner signs every inner binary before
+# NSIS packs them) and refuses to upload anything that is not validly signed by
+# "Leia, Inc." -- an unsigned dxr-get on a release would be embedded downstream.
+#
+# Spec: docs/specs/runtime/dxr-get.md.
+
+name: Attach dxr-get
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Runtime release tag (vX.Y.Z) whose signed installer to extract from
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: attach-dxr-get-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  attach:
+    if: github.repository == 'DisplayXR/displayxr-runtime'
+    runs-on: windows-latest
+    steps:
+      - name: Download the signed runtime installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        shell: pwsh
+        run: |
+          if ($env:TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw "tag must be vX.Y.Z, got '$env:TAG'" }
+          $v = $env:TAG.Substring(1)
+          gh release download $env:TAG -R $env:GITHUB_REPOSITORY -p "DisplayXRSetup-$v.exe" -D dl
+          if ($LASTEXITCODE -ne 0) { throw "no DisplayXRSetup-$v.exe on $env:TAG" }
+          $s = Get-AuthenticodeSignature "dl\DisplayXRSetup-$v.exe"
+          if ($s.Status -ne 'Valid' -or $s.SignerCertificate.Subject -notmatch 'CN="?Leia, Inc\."?') {
+            throw "the release's runtime installer is not signed by Leia ($($s.Status)): run /release's signing step first"
+          }
+
+      - name: Extract and verify dxr-get.exe
+        shell: pwsh
+        run: |
+          & "C:\Program Files\7-Zip\7z.exe" e -r -y -oout "dl\DisplayXRSetup-*.exe" dxr-get.exe | Out-Null
+          if (-not (Test-Path out\dxr-get.exe)) { throw "dxr-get.exe not found in the installer (a release before #2704?)" }
+          $s = Get-AuthenticodeSignature out\dxr-get.exe
+          $cn = $s.SignerCertificate.GetNameInfo('SimpleName', $false)
+          if ($s.Status -ne 'Valid' -or $cn -ne 'Leia, Inc.') { throw "dxr-get.exe signature: $($s.Status), signer '$cn' -- refusing to attach" }
+          (Get-FileHash out\dxr-get.exe -Algorithm SHA256).Hash.ToLower() | Tee-Object out\dxr-get.exe.sha256
+          "dxr-get.exe: signed by $cn" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        shell: pwsh
+        run: |
+          gh release upload $env:TAG out\dxr-get.exe --clobber -R $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw "upload failed" }

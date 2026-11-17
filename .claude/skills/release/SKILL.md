@@ -528,6 +528,25 @@ fi
 ```
 No local checkout to restore — nothing was built or checked out on this box.
 
+### Step 4.5.3b: Attach the signed `dxr-get.exe` and refresh the catalog (#2704)
+Only when `SIGNED=yes`. Component installers embed `dxr-get.exe` from this
+release (the DisplayXR Browser's publish workflow downloads the asset), so it must
+be the **signed** copy from inside the signed installer, never a CI build.
+`attach-dxr-get.yml` extracts it on a Windows runner, refuses anything not validly
+signed by `Leia, Inc.`, and uploads it. Then re-sign the component catalog so
+`dxr-get` can see this release without waiting for the weekly run (the catalog
+lists only signed assets, so it has to run after the swap).
+```bash
+if [ "$SIGNED" = yes ]; then
+  gh workflow run attach-dxr-get.yml -R DisplayXR/displayxr-runtime -f tag=[FULL_TAG] \
+    || echo "WARN: could not dispatch attach-dxr-get.yml — attach dxr-get.exe by hand"
+  gh workflow run publish-catalog.yml -R DisplayXR/displayxr-runtime \
+    || echo "WARN: could not dispatch publish-catalog.yml — the weekly run will pick the release up"
+fi
+```
+Report both in the final summary. A failed attach blocks nothing: the browser keeps
+embedding the previous release's `dxr-get.exe`, or falls back to its bundle-link prompt.
+
 ### Step 4.5.4: Scope note
 This phase signs **only the runtime installer**. The vendor plug-in, the Unity
 plug-in, demos, and the shell are signed by **their own** release flows
