@@ -119,6 +119,42 @@ comp_segments_route_place(const struct xrt_segment_view_routing *r,
 }
 
 /*!
+ * The view-tile size a routed frame is laid out on: the routing's canvas at
+ * the active mode's view scale, truncated exactly as
+ * `u_tiling_compute_canvas_view` does (the size the in-process renderers give
+ * their tiles, and the tile the XR_DXR_display_info contract tells the app to
+ * place each segment's view in: `segmentRect.extent × the mode's view scale`).
+ *
+ * #2698: it is NOT any one view's submitted extent. Under per-segment views
+ * view 0 covers only segment 0's slice of its tile, so a compositor that took
+ * the tile size from it laid the whole mosaic out on that slice — every
+ * segment's view squeezed to about half its rendered width, then upscaled
+ * again by the weaver.
+ *
+ * @return false when @p r is unrouted or the canvas / scale is degenerate (the
+ *         caller keeps its unrouted tile size).
+ */
+static inline bool
+comp_segments_route_tile_size(
+    const struct xrt_segment_view_routing *r, float scale_x, float scale_y, uint32_t *out_w, uint32_t *out_h)
+{
+	if (r == NULL || out_w == NULL || out_h == NULL || r->count == 0 || r->count > XRT_MAX_SEGMENTS ||
+	    r->canvas.extent.w <= 0 || r->canvas.extent.h <= 0 || !(scale_x > 0.0f) || !(scale_y > 0.0f)) {
+		return false;
+	}
+	const uint32_t cw = (uint32_t)r->canvas.extent.w;
+	const uint32_t ch = (uint32_t)r->canvas.extent.h;
+	const uint32_t w = (uint32_t)(cw * scale_x);
+	const uint32_t h = (uint32_t)(ch * scale_y);
+	if (w == 0 || h == 0) {
+		return false;
+	}
+	*out_w = w;
+	*out_h = h;
+	return true;
+}
+
+/*!
  * Is any view of @p r routed at all (and so must the unrouted placement of
  * views past the routed ranges be suppressed)? True exactly when
  * @ref comp_segments_route_place would accept the frame.
