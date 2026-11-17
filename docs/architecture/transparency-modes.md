@@ -131,6 +131,40 @@ silhouette intersection until the restarted capture's first trusted frame, then
 compose-under-capture. Windows has the same always-on capture for capable-but-opaque
 apps and is not covered yet (#1690). `DXR_LAZY_TRANSPARENCY=0` restores always-on.
 
+## Vulkan on a GPU without D3D↔VK interop: the CPU-readback route (#2708)
+
+The live VK path on Windows presents through the **DComp bridge**
+(`comp_vk_native_target.cpp`): the compositor renders into D3D11 NT-shared
+textures imported into Vulkan, and a D3D11 premultiplied composition swapchain
+carries the alpha to DWM. The Adreno X2 Vulkan driver (Windows on ARM64) cannot
+import those textures (`vkAllocateMemory` -3 for every handle type), cannot open
+VK-exported memory in D3D, exposes no shareable semaphore, and grants an OPAQUE
+`compositeAlpha` only. Without the bridge a transparent VK app presented opaque:
+black de-occlusions, and the Local2D bubble lost its alpha shape.
+
+When the import is unavailable (no `VK_KHR_external_memory_win32`, or the first
+real import fails) the bridge keeps its swapchain and DComp binding and moves the
+pixels through the CPU instead: the ring images are plain VK-owned images, and
+each present runs `vkCmdCopyImageToBuffer` into one of three host-visible
+(cached where offered) buffers, waits that copy's `VkFence`, and
+`UpdateSubresource`s the bytes into the swapchain back buffer. The bytes are the
+same premultiplied BGRA the zero-copy route copies, so DWM blends the **live**
+desktop with no capture lag. Cost measured on Adreno X2-45: **+1.9 ms per frame
+at 1080p, +7.8 ms at 4K** (x64 under Prism; native ARM64 1.3 / 6.0 ms), with no
+extra frame of latency. One WARN names the route; an INFO every 10 s reports the
+readback time. `DXR_VK_TRANSPARENCY_READBACK=0` is the kill switch;
+`DXR_VK_TRANSPARENCY_READBACK_LAG=1` presents the previous frame's readback (an
+A/B for overlap, one frame later). A GPU whose import works never takes it.
+
+On this route the DP is told the client presents (`client_presents=true`): it
+runs the post-weave alpha-gate and no compose-under-bg, because the runtime's own
+present is transparent. The de-occlusion band (pixels where some views are
+transparent) then carries the weaver's RGB at α=1 rather than a baked desktop.
+Separately, a transparent request that still ends on an OPAQUE swapchain (the
+kill switch, or the bridge failing outright) is now composited as opaque, like
+`DXR_PRESENT_OPAQUE`: the Local2D/zones blend flattens instead of emitting alpha
+nobody blends.
+
 ## Rules (each learned the hard way)
 
 1. **Shaping only punches through what you carve.** Kept surface (OS frame,

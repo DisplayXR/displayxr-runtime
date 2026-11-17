@@ -356,6 +356,33 @@ bool
 comp_vk_native_target_images_sampled(struct comp_vk_native_target *target);
 
 /*!
+ * #2708 — true when the present carries per-pixel alpha to the window
+ * system: a transparent compositeAlpha was granted, or the Windows DComp
+ * bridge (either route) presents through its PREMULTIPLIED swapchain. False
+ * when a transparent request fell back to an OPAQUE swapchain — the
+ * compositor then composites as for an opaque present (the Local2D/zones
+ * blend flattens instead of emitting alpha nobody blends). Only meaningful
+ * on a transparent session; always true off Windows, where that fallback is
+ * not acted on.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_target_presents_alpha(struct comp_vk_native_target *target);
+
+/*!
+ * #2708 — true when the Windows DComp bridge runs its CPU-readback route
+ * (the D3D11 → VK import is unavailable, e.g. Adreno X2). The runtime then
+ * presents true per-pixel alpha with DWM blending the live desktop, so the
+ * display processor is told the client presents (alpha-gate only, no
+ * compose-under-bg). Always false off Windows.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_target_is_readback(struct comp_vk_native_target *target);
+
+/*!
  * Get the target's image-set generation (#602). Bumped each time the target
  * image set is (re)created — the compositor forwards it to the display
  * processor so caches keyed by the target VkImage handle can be invalidated

@@ -162,6 +162,21 @@ dxr_late_weave_enabled();
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
 /*
+ * #2708 — CPU-readback route of the DComp bridge. Engages only when the
+ * D3D11 → VK import is unavailable (Adreno X2: vkAllocateMemory -3 for every
+ * handle type, and the VK swapchain offers OPAQUE compositeAlpha only), so a
+ * transparent VK app still gets live per-pixel alpha through DWM. "0" is the
+ * kill switch back to the opaque-WSI fallback.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(vk_transparency_readback, "DXR_VK_TRANSPARENCY_READBACK", true)
+/*
+ * #2708 A/B: 1 = present the PREVIOUS frame's readback, so this frame's copy
+ * overlaps the next frame instead of stalling the host (one extra frame of
+ * latency). Default 0: wait on this frame's copy and present it.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(vk_transparency_readback_lag, "DXR_VK_TRANSPARENCY_READBACK_LAG", 0)
+
+/*
  * #870/#912 — DXR_VK_BRIDGE_PACING: pace the VK live/DComp path on the
  * bridge's DXGI frame-latency waitable. Intel iGPUs expose NO Vulkan
  * presentation-timing extension (no present_wait / present_id /
@@ -416,6 +431,7 @@ target_present_feedback_create(struct comp_vk_native_target *target, void *hwnd,
 #endif
 
 #define DCOMP_RING 2 // Number of shared back-buffers in the bridge ring
+#define DCOMP_RB_RING 3 // #2708: host-visible readback buffers (CPU-readback route)
 
 // Upper bound on swapchain images we track. The driver may create more than
 // the minImageCount we request (it's a floor, not a cap) — Adreno commonly
@@ -989,7 +1005,46 @@ struct comp_vk_native_target
 	VkImageView dcomp_vk_view[DCOMP_RING];
 	VkDeviceMemory dcomp_vk_memory[DCOMP_RING];
 	uint32_t dcomp_ring_idx;
+
+	/*!
+	 * #2708 — CPU-readback route of the bridge. Set when the D3D11 → VK
+	 * import is unavailable (no VK_KHR_external_memory_win32, or the first
+	 * dcomp_import_one fails — Adreno X2 returns -3 for every handle type).
+	 * The ring images are then plain VK-owned images (still in
+	 * @ref dcomp_vk_image), and each present copies the woven image into a
+	 * host-visible buffer, waits its fence and UpdateSubresource()s the
+	 * bytes into the same premultiplied DComp swapchain. Never set when the
+	 * import works: zero-copy stays the path wherever the driver allows it.
+	 */
+	bool dcomp_readback;
+	VkCommandPool rb_cmd_pool;
+	VkCommandBuffer rb_cmd[DCOMP_RB_RING];
+	VkFence rb_fence[DCOMP_RB_RING];
+	//! Submitted and not yet waited on the host.
+	bool rb_pending[DCOMP_RB_RING];
+	VkBuffer rb_buf[DCOMP_RB_RING];
+	VkDeviceMemory rb_buf_mem[DCOMP_RB_RING];
+	void *rb_map[DCOMP_RB_RING];
+	//! Dimensions of the frame each slot holds (a resize drops pending slots).
+	uint32_t rb_w[DCOMP_RB_RING];
+	uint32_t rb_h[DCOMP_RB_RING];
+	//! Next slot to record into.
+	uint32_t rb_slot;
+	//! Slot memory is HOST_COHERENT (else invalidated after the fence).
+	bool rb_coherent;
+	PFN_vkInvalidateMappedMemoryRanges rb_invalidate;
+	//! 10 s INFO accumulators: copy (submit → fence) and upload ms.
+	uint64_t rb_stat_t0_ns;
+	uint32_t rb_stat_n;
+	double rb_stat_copy_ms;
+	double rb_stat_upload_ms;
+	double rb_stat_max_ms;
 #endif
+
+	//! The present carries alpha to the window system (a transparent
+	//! compositeAlpha, or the DComp bridge). False when a transparent
+	//! request fell back to an OPAQUE swapchain (#2708).
+	bool alpha_capable;
 };
 
 namespace {
@@ -1210,6 +1265,9 @@ create_swapchain(struct comp_vk_native_target *target)
 			        (unsigned)caps.supportedCompositeAlpha);
 		}
 	}
+	// #2708: the compositor reads this to treat a transparent request that
+	// landed on OPAQUE as opaque (flatten the Local2D composite).
+	target->alpha_capable = (composite_alpha != VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR);
 
 	// SAMPLED: the post-weave Local2D composite snapshots the woven target
 	// into its weave scratch with a draw rather than a per-frame
@@ -1349,10 +1407,16 @@ create_swapchain(struct comp_vk_native_target *target)
  *
  */
 
+/*!
+ * Release the size-bound half of the bridge: the ring images (imported or,
+ * on the #2708 readback route, VK-owned), the shared D3D11 textures and the
+ * readback buffers. The caller has drained the GPU (vkDeviceWaitIdle).
+ * Leaves the D3D11 device, the swapchain, the DComp binding and the readback
+ * command pool / fences alone, so a resize keeps the window bound.
+ */
 static void
-dcomp_destroy(struct comp_vk_native_target *target)
+dcomp_release_ring(struct comp_vk_native_target *target)
 {
-	if (target == NULL) return;
 	struct vk_bundle *vk = target->vk;
 
 	for (uint32_t i = 0; i < DCOMP_RING; i++) {
@@ -1376,6 +1440,48 @@ dcomp_destroy(struct comp_vk_native_target *target)
 			target->dcomp_shared_dx[i]->Release();
 			target->dcomp_shared_dx[i] = NULL;
 		}
+		target->views[i] = VK_NULL_HANDLE;
+		target->images[i] = VK_NULL_HANDLE;
+	}
+	for (uint32_t i = 0; i < DCOMP_RB_RING; i++) {
+		if (target->rb_map[i] != NULL) {
+			vk->vkUnmapMemory(vk->device, target->rb_buf_mem[i]);
+			target->rb_map[i] = NULL;
+		}
+		if (target->rb_buf[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyBuffer(vk->device, target->rb_buf[i], NULL);
+			target->rb_buf[i] = VK_NULL_HANDLE;
+		}
+		if (target->rb_buf_mem[i] != VK_NULL_HANDLE) {
+			vk->vkFreeMemory(vk->device, target->rb_buf_mem[i], NULL);
+			target->rb_buf_mem[i] = VK_NULL_HANDLE;
+		}
+		// A frame read back at the old size is never presented.
+		target->rb_pending[i] = false;
+		target->rb_w[i] = 0;
+		target->rb_h[i] = 0;
+	}
+	target->image_count = 0;
+}
+
+static void
+dcomp_destroy(struct comp_vk_native_target *target)
+{
+	if (target == NULL)
+		return;
+	struct vk_bundle *vk = target->vk;
+
+	dcomp_release_ring(target);
+	for (uint32_t i = 0; i < DCOMP_RB_RING; i++) {
+		if (target->rb_fence[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyFence(vk->device, target->rb_fence[i], NULL);
+			target->rb_fence[i] = VK_NULL_HANDLE;
+		}
+		target->rb_cmd[i] = VK_NULL_HANDLE; // freed with the pool
+	}
+	if (target->rb_cmd_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyCommandPool(vk->device, target->rb_cmd_pool, NULL);
+		target->rb_cmd_pool = VK_NULL_HANDLE;
 	}
 	if (target->dcomp_dcomp_visual) { target->dcomp_dcomp_visual->Release(); target->dcomp_dcomp_visual = NULL; }
 	if (target->dcomp_dcomp_target) { target->dcomp_dcomp_target->Release(); target->dcomp_dcomp_target = NULL; }
@@ -1384,6 +1490,7 @@ dcomp_destroy(struct comp_vk_native_target *target)
 	if (target->dcomp_dx_context)   { target->dcomp_dx_context->Release();   target->dcomp_dx_context = NULL; }
 	if (target->dcomp_dx_device)    { target->dcomp_dx_device->Release();    target->dcomp_dx_device = NULL; }
 	target->dcomp_active = false;
+	target->dcomp_readback = false;
 }
 
 // Import a single D3D11 NT-handle-shared texture as a VkImage in the ring.
@@ -1502,6 +1609,340 @@ dcomp_import_one(struct comp_vk_native_target *target,
 	return true;
 }
 
+/*
+ *
+ * #2708 — CPU-readback route.
+ *
+ * When the driver cannot import the D3D11 shared textures (Adreno X2 on
+ * Windows-on-ARM64: vkAllocateMemory -3 for every handle type, VK→D3D open
+ * fails, no shareable semaphores, OPAQUE-only compositeAlpha), the bridge
+ * keeps its D3D11 premultiplied DComp swapchain on the window and moves the
+ * pixels through the CPU instead:
+ *   1. the compositor renders + weaves into a VK-owned ring image (same
+ *      usage, format and layout contract as the imported one);
+ *   2. present records vkCmdCopyImageToBuffer into one of DCOMP_RB_RING
+ *      host-visible buffers (cached memory when the device offers it, the
+ *      CPU reads every byte) and signals a VkFence;
+ *   3. the host waits that fence — this frame's by default, the previous
+ *      frame's with DXR_VK_TRANSPARENCY_READBACK_LAG=1 — and
+ *      UpdateSubresource()s the bytes into the swapchain back buffer, then
+ *      Present + Commit exactly as the zero-copy route does.
+ * The bytes are not converted: the ring holds the same premultiplied BGRA
+ * the zero-copy route CopyResource()s into the same PREMULTIPLIED swapchain.
+ * Measured on Adreno X2-45 (x64 under Prism): +1.9 ms per 1080p frame,
+ * +7.8 ms at 4K.
+ *
+ */
+
+static void
+dcomp_rb_announce(const char *reason)
+{
+	U_LOG_W(
+	    "DComp bridge #2708: D3D11 -> VK import unavailable (%s) — CPU-readback route: VK-owned "
+	    "ring + vkCmdCopyImageToBuffer into %u host-visible buffers, UpdateSubresource into the "
+	    "premultiplied DComp swapchain (live per-pixel alpha, no capture lag; "
+	    "DXR_VK_TRANSPARENCY_READBACK=0 disables, DXR_VK_TRANSPARENCY_READBACK_LAG=%d)",
+	    reason, (unsigned)DCOMP_RB_RING, (int)debug_get_num_option_vk_transparency_readback_lag());
+}
+
+//! Command pool, command buffers and fences — size-independent, built once.
+static bool
+dcomp_rb_init_static(struct comp_vk_native_target *target)
+{
+	struct vk_bundle *vk = target->vk;
+	if (target->rb_cmd_pool != VK_NULL_HANDLE) {
+		return true;
+	}
+
+	VkCommandPoolCreateInfo pool_ci = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+	    .queueFamilyIndex = target->queue_family_index,
+	};
+	VkResult res = vk->vkCreateCommandPool(vk->device, &pool_ci, NULL, &target->rb_cmd_pool);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge #2708: vkCreateCommandPool failed: %d", res);
+		return false;
+	}
+	VkCommandBufferAllocateInfo cb_ai = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	    .commandPool = target->rb_cmd_pool,
+	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+	    .commandBufferCount = DCOMP_RB_RING,
+	};
+	res = vk->vkAllocateCommandBuffers(vk->device, &cb_ai, target->rb_cmd);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge #2708: vkAllocateCommandBuffers failed: %d", res);
+		return false;
+	}
+	for (uint32_t i = 0; i < DCOMP_RB_RING; i++) {
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		res = vk->vkCreateFence(vk->device, &fci, NULL, &target->rb_fence[i]);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("DComp bridge #2708: vkCreateFence[%u] failed: %d", i, res);
+			return false;
+		}
+		target->rb_pending[i] = false;
+	}
+	target->rb_invalidate =
+	    (PFN_vkInvalidateMappedMemoryRanges)vk->vkGetDeviceProcAddr(vk->device, "vkInvalidateMappedMemoryRanges");
+	target->rb_slot = 0;
+	target->rb_stat_t0_ns = 0;
+	return true;
+}
+
+//! A plain VK-owned ring image for slot @p i (the readback route's render target).
+static bool
+dcomp_rb_create_image(struct comp_vk_native_target *target, uint32_t i, uint32_t w, uint32_t h)
+{
+	struct vk_bundle *vk = target->vk;
+
+	VkImageCreateInfo image_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .extent = {w, h, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    // Same usage as the imported ring (dcomp_import_one), so nothing
+	    // downstream can tell the routes apart.
+	    .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+	             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	VkResult res = vk->vkCreateImage(vk->device, &image_ci, NULL, &target->dcomp_vk_image[i]);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge #2708: vkCreateImage[%u] failed: %d", i, res);
+		return false;
+	}
+	VkMemoryRequirements req = {};
+	vk->vkGetImageMemoryRequirements(vk->device, target->dcomp_vk_image[i], &req);
+	uint32_t mti = 0;
+	if (!vk_get_memory_type(vk, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mti) &&
+	    !vk_get_memory_type(vk, req.memoryTypeBits, 0, &mti)) {
+		U_LOG_E("DComp bridge #2708: no memory type for ring image[%u]", i);
+		return false;
+	}
+	VkMemoryAllocateInfo ai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = req.size,
+	    .memoryTypeIndex = mti,
+	};
+	res = vk->vkAllocateMemory(vk->device, &ai, NULL, &target->dcomp_vk_memory[i]);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge #2708: vkAllocateMemory(image[%u]) failed: %d", i, res);
+		return false;
+	}
+	res = vk->vkBindImageMemory(vk->device, target->dcomp_vk_image[i], target->dcomp_vk_memory[i], 0);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge #2708: vkBindImageMemory[%u] failed: %d", i, res);
+		return false;
+	}
+	VkImageViewCreateInfo view_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = target->dcomp_vk_image[i],
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	res = vk->vkCreateImageView(vk->device, &view_ci, NULL, &target->dcomp_vk_view[i]);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge #2708: vkCreateImageView[%u] failed: %d", i, res);
+		return false;
+	}
+	return true;
+}
+
+//! A persistently mapped host-visible readback buffer for slot @p i.
+static bool
+dcomp_rb_create_buffer(struct comp_vk_native_target *target, uint32_t i, VkDeviceSize size)
+{
+	struct vk_bundle *vk = target->vk;
+
+	VkBufferCreateInfo bci = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+	    .size = size,
+	    .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	VkResult res = vk->vkCreateBuffer(vk->device, &bci, NULL, &target->rb_buf[i]);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge #2708: vkCreateBuffer[%u] failed: %d", i, res);
+		return false;
+	}
+	VkMemoryRequirements req = {};
+	vk->vkGetBufferMemoryRequirements(vk->device, target->rb_buf[i], &req);
+
+	// The CPU reads every byte: cached first. Non-coherent memory needs an
+	// invalidate after the fence, so it is only taken when that entry point
+	// resolved.
+	const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+	const VkMemoryPropertyFlags prefs[3] = {
+	    hv | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	    hv | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+	    hv | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	};
+	uint32_t mti = UINT32_MAX;
+	for (uint32_t p = 0; p < 3 && mti == UINT32_MAX; p++) {
+		if (p == 1 && target->rb_invalidate == NULL) {
+			continue;
+		}
+		uint32_t t = 0;
+		if (vk_get_memory_type(vk, req.memoryTypeBits, prefs[p], &t)) {
+			mti = t;
+		}
+	}
+	if (mti == UINT32_MAX) {
+		U_LOG_E("DComp bridge #2708: no host-visible memory type for readback buffer[%u]", i);
+		return false;
+	}
+	const VkMemoryPropertyFlags props = vk->device_memory_props.memoryTypes[mti].propertyFlags;
+	target->rb_coherent = (props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+
+	VkMemoryAllocateInfo ai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = req.size,
+	    .memoryTypeIndex = mti,
+	};
+	res = vk->vkAllocateMemory(vk->device, &ai, NULL, &target->rb_buf_mem[i]);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge #2708: vkAllocateMemory(buffer[%u], %llu bytes) failed: %d", i,
+		        (unsigned long long)req.size, res);
+		return false;
+	}
+	res = vk->vkBindBufferMemory(vk->device, target->rb_buf[i], target->rb_buf_mem[i], 0);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge #2708: vkBindBufferMemory[%u] failed: %d", i, res);
+		return false;
+	}
+	res = vk->vkMapMemory(vk->device, target->rb_buf_mem[i], 0, VK_WHOLE_SIZE, 0, &target->rb_map[i]);
+	if (res != VK_SUCCESS || target->rb_map[i] == NULL) {
+		U_LOG_E("DComp bridge #2708: vkMapMemory[%u] failed: %d", i, res);
+		target->rb_map[i] = NULL;
+		return false;
+	}
+	if (i == 0) {
+		U_LOG_W("DComp bridge #2708: readback buffers %llu bytes each, memory type %u (%s%s)",
+		        (unsigned long long)size, mti,
+		        (props & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0 ? "cached" : "uncached",
+		        target->rb_coherent ? ", coherent" : ", non-coherent + invalidate");
+	}
+	return true;
+}
+
+/*!
+ * Build the size-bound ring at @p w x @p h: the imported shared textures, or
+ * — when the import is unavailable — the readback route's VK-owned images and
+ * host buffers. An import failure on the zero-copy route switches the target
+ * to the readback route (unless DXR_VK_TRANSPARENCY_READBACK=0) instead of
+ * failing, so the capability is probed by the real import once per target.
+ * Publishes the images as the target's own on success.
+ */
+static bool
+dcomp_build_ring(struct comp_vk_native_target *target, uint32_t w, uint32_t h)
+{
+	if (!target->dcomp_readback) {
+		bool ok = true;
+		for (uint32_t i = 0; i < DCOMP_RING && ok; i++) {
+			D3D11_TEXTURE2D_DESC tdesc = {};
+			tdesc.Width = w;
+			tdesc.Height = h;
+			tdesc.MipLevels = 1;
+			tdesc.ArraySize = 1;
+			tdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			tdesc.SampleDesc.Count = 1;
+			tdesc.Usage = D3D11_USAGE_DEFAULT;
+			tdesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+			// NT-handle sharing (CreateSharedHandle + VK import via the NT
+			// D3D11_TEXTURE bit). The legacy KMT path silently yields a
+			// never-updated — hence fully transparent — surface on Intel UHD
+			// 30.0.100.x, while the NT path is the one proven to share pixels
+			// with that driver (it is what the WGC bg-capture import uses).
+			// The keyed mutex is kept: the reader's AcquireSync(0,0) is the
+			// cross-API cache barrier (see present()).
+			tdesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+			HRESULT hr =
+			    target->dcomp_dx_device->CreateTexture2D(&tdesc, NULL, &target->dcomp_shared_dx[i]);
+			if (FAILED(hr)) {
+				U_LOG_W("DComp bridge: CreateTexture2D[%u] failed: 0x%08x", i, hr);
+				ok = false;
+				break;
+			}
+
+			// NT shared handle for the VK import. Ownership stays here — Vulkan
+			// does not adopt NT handles, so it is closed right after the import.
+			IDXGIResource1 *dxgi_res = NULL;
+			hr = target->dcomp_shared_dx[i]->QueryInterface(__uuidof(IDXGIResource1), (void **)&dxgi_res);
+			if (FAILED(hr) || dxgi_res == NULL) {
+				U_LOG_W("DComp bridge: QueryInterface(IDXGIResource1)[%u] failed: 0x%08x", i, hr);
+				ok = false;
+				break;
+			}
+			HANDLE shared_nt = NULL;
+			hr = dxgi_res->CreateSharedHandle(NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+			                                  NULL, &shared_nt);
+			dxgi_res->Release();
+			if (FAILED(hr) || shared_nt == NULL) {
+				U_LOG_W("DComp bridge: CreateSharedHandle[%u] failed: 0x%08x", i, hr);
+				ok = false;
+				break;
+			}
+
+			ok = dcomp_import_one(target, i, target->dcomp_shared_dx[i], shared_nt, w, h,
+			                      VK_FORMAT_B8G8R8A8_UNORM);
+			CloseHandle(shared_nt);
+		}
+		if (!ok) {
+			dcomp_release_ring(target);
+			if (!debug_get_bool_option_vk_transparency_readback()) {
+				U_LOG_W(
+				    "DComp bridge: shared-texture import failed and DXR_VK_TRANSPARENCY_READBACK=0 — "
+				    "falling back to opaque WSI (#2708)");
+				return false;
+			}
+			target->dcomp_readback = true;
+			dcomp_rb_announce("D3D11 shared-texture import failed");
+		}
+	}
+
+	if (target->dcomp_readback) {
+		if (!dcomp_rb_init_static(target)) {
+			dcomp_release_ring(target);
+			return false;
+		}
+		bool ok = true;
+		for (uint32_t i = 0; i < DCOMP_RING && ok; i++) {
+			ok = dcomp_rb_create_image(target, i, w, h);
+		}
+		for (uint32_t i = 0; i < DCOMP_RB_RING && ok; i++) {
+			ok = dcomp_rb_create_buffer(target, i, (VkDeviceSize)w * h * 4);
+		}
+		if (!ok) {
+			dcomp_release_ring(target);
+			return false;
+		}
+	}
+
+	// Match the public target fields so the rest of the compositor sees the
+	// ring images as if they were swapchain images.
+	target->image_count = DCOMP_RING;
+	for (uint32_t i = 0; i < DCOMP_RING; i++) {
+		target->images[i] = target->dcomp_vk_image[i];
+		target->views[i] = target->dcomp_vk_view[i];
+	}
+	target->images_sampled = true; // both routes create the ring SAMPLED
+	target->format = VK_FORMAT_B8G8R8A8_UNORM;
+	target->width = w;
+	target->height = h;
+	target->dcomp_ring_idx = 0;
+	target->current_index = 0;
+	return true;
+}
+
 // Initialize the DComp bridge: D3D11 device, swapchain, DComp visual+target,
 // and the ring of KMT-shared textures imported as VkImages. Returns false
 // (with a U_LOG_W) if any prerequisite is missing — caller falls back to
@@ -1536,11 +1977,19 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 	// VK_KHR_external_memory_win32 — no longer required of every app. Returning
 	// false here takes the caller's existing fall-through to the opaque WSI
 	// path, so a device without it still renders, just without see-through.
+	//
+	// #2708: unless the CPU-readback route can carry it instead — that route
+	// needs no external-memory extension at all.
+	target->dcomp_readback = false;
 	if (!vk_has_external_memory_win32(vk)) {
-		U_LOG_W(
-		    "DComp bridge: VK_KHR_external_memory_win32 not enabled on this VkDevice - "
-		    "transparent background unavailable, falling back to opaque WSI");
-		return false;
+		if (!debug_get_bool_option_vk_transparency_readback()) {
+			U_LOG_W(
+			    "DComp bridge: VK_KHR_external_memory_win32 not enabled on this VkDevice - "
+			    "transparent background unavailable, falling back to opaque WSI");
+			return false;
+		}
+		target->dcomp_readback = true;
+		dcomp_rb_announce("VK_KHR_external_memory_win32 not enabled on this VkDevice");
 	}
 
 	// The bridge's D3D11 device MUST live on the same adapter as the
@@ -1574,10 +2023,19 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 			enum_factory->Release();
 		}
 		if (create_adapter == NULL) {
-			U_LOG_W("DComp bridge: no DXGI adapter matches VkDevice LUID 0x%016llx — "
-			        "falling back to opaque WSI",
-			        (unsigned long long)want_luid);
-			return false;
+			if (!target->dcomp_readback) {
+				U_LOG_W(
+				    "DComp bridge: no DXGI adapter matches VkDevice LUID 0x%016llx — "
+				    "falling back to opaque WSI",
+				    (unsigned long long)want_luid);
+				return false;
+			}
+			// #2708: the readback route shares nothing between the devices
+			// (the bytes cross on the CPU), so any adapter will do.
+			U_LOG_W(
+			    "DComp bridge #2708: no DXGI adapter matches VkDevice LUID 0x%016llx — "
+			    "readback route uses the default D3D11 adapter",
+			    (unsigned long long)want_luid);
 		}
 	} else {
 		U_LOG_W("DComp bridge: VkDevice LUID unavailable — using default D3D11 adapter");
@@ -1730,113 +2188,28 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 		}
 	}
 
-	// Create the ring of KMT-shared D3D11 textures and import each as a VkImage.
-	for (uint32_t i = 0; i < DCOMP_RING; i++) {
-		D3D11_TEXTURE2D_DESC tdesc = {};
-		tdesc.Width = w;
-		tdesc.Height = h;
-		tdesc.MipLevels = 1;
-		tdesc.ArraySize = 1;
-		tdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-		tdesc.SampleDesc.Count = 1;
-		tdesc.Usage = D3D11_USAGE_DEFAULT;
-		tdesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-		// NT-handle sharing (CreateSharedHandle + VK import via the NT
-		// D3D11_TEXTURE bit). The legacy KMT path silently yields a
-		// never-updated — hence fully transparent — surface on Intel UHD
-		// 30.0.100.x, while the NT path is the one proven to share pixels
-		// with that driver (it is what the WGC bg-capture import uses).
-		// The keyed mutex is kept: the reader's AcquireSync(0,0) is the
-		// cross-API cache barrier (see present()).
-		tdesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
-
-		hr = target->dcomp_dx_device->CreateTexture2D(&tdesc, NULL, &target->dcomp_shared_dx[i]);
-		if (FAILED(hr)) {
-			U_LOG_W("DComp bridge: CreateTexture2D[%u] failed: 0x%08x", i, hr);
-			return false;
-		}
-
-		// NT shared handle for the VK import. Ownership stays here — Vulkan
-		// does not adopt NT handles, so it is closed right after the import.
-		IDXGIResource1 *dxgi_res = NULL;
-		hr = target->dcomp_shared_dx[i]->QueryInterface(__uuidof(IDXGIResource1),
-		                                                 (void **)&dxgi_res);
-		if (FAILED(hr) || dxgi_res == NULL) {
-			U_LOG_W("DComp bridge: QueryInterface(IDXGIResource1)[%u] failed: 0x%08x", i, hr);
-			return false;
-		}
-		HANDLE shared_nt = NULL;
-		hr = dxgi_res->CreateSharedHandle(NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-		                                  NULL, &shared_nt);
-		dxgi_res->Release();
-		if (FAILED(hr) || shared_nt == NULL) {
-			U_LOG_W("DComp bridge: CreateSharedHandle[%u] failed: 0x%08x", i, hr);
-			return false;
-		}
-
-		bool imported = dcomp_import_one(target, i, target->dcomp_shared_dx[i], shared_nt,
-		                                  w, h, VK_FORMAT_B8G8R8A8_UNORM);
-		CloseHandle(shared_nt);
-		if (!imported) {
-			return false;
-		}
+	// Build the size-bound ring: imported shared textures, or the #2708
+	// readback route's VK-owned images + host buffers when the import is
+	// unavailable (decided here, by the real import, once per target).
+	if (!dcomp_build_ring(target, w, h)) {
+		return false;
 	}
-
-	// Match the public target fields so the rest of the compositor sees the
-	// imported VkImages as if they were swapchain images.
-	target->image_count = DCOMP_RING;
-	for (uint32_t i = 0; i < DCOMP_RING; i++) {
-		target->images[i] = target->dcomp_vk_image[i];
-		target->views[i] = target->dcomp_vk_view[i];
-	}
-	target->images_sampled = true; // dcomp_import_one creates them SAMPLED
-	target->format = VK_FORMAT_B8G8R8A8_UNORM;
-	target->width = w;
-	target->height = h;
-	target->dcomp_ring_idx = 0;
-	target->current_index = 0;
 	target->dcomp_active = true;
+	// PREMULTIPLIED composition swapchain, unless #833 opaque present.
+	target->alpha_capable = !present_opaque;
 
-	U_LOG_W("DComp bridge active: %ux%u, %u-deep ring, NT shared, "
-	        "PRE_MULTIPLIED + DComp -> HWND",
-	        w, h, (unsigned)DCOMP_RING);
+	U_LOG_W(
+	    "DComp bridge active: %ux%u, %u-deep ring, %s, "
+	    "PRE_MULTIPLIED + DComp -> HWND",
+	    w, h, (unsigned)DCOMP_RING, target->dcomp_readback ? "CPU readback (#2708)" : "NT shared");
 	return true;
 }
 
-// Submit the just-rendered ring slot to DComp: D3D11 acquires sync on the
-// shared texture (which flushes VK writer caches per
-// feedback_acquiresync_load_bearing.md), CopyResource into the next swapchain
-// back buffer, releases sync, Present, Commit.
+//! Present the back buffer both routes filled, then Commit the DComp binding.
 static xrt_result_t
-dcomp_present(struct comp_vk_native_target *target)
+dcomp_present_swap(struct comp_vk_native_target *target)
 {
-	uint32_t idx = target->current_index;
-	if (idx >= DCOMP_RING || target->dcomp_shared_mutex[idx] == NULL) {
-		U_LOG_E("DComp bridge: present called with invalid ring index %u", idx);
-		return XRT_ERROR_VULKAN;
-	}
-
-	// Acquire (key=0) — also flushes VK writer caches into the shared resource.
-	HRESULT hr = target->dcomp_shared_mutex[idx]->AcquireSync(0, INFINITE);
-	if (FAILED(hr)) {
-		U_LOG_E("DComp bridge: AcquireSync[%u] failed: 0x%08x", idx, hr);
-		return XRT_ERROR_VULKAN;
-	}
-
-	ID3D11Texture2D *back = NULL;
-	hr = target->dcomp_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);
-	if (FAILED(hr) || back == NULL) {
-		U_LOG_E("DComp bridge: GetBuffer failed: 0x%08x", hr);
-		target->dcomp_shared_mutex[idx]->ReleaseSync(0);
-		return XRT_ERROR_VULKAN;
-	}
-
-	target->dcomp_dx_context->CopyResource(back, target->dcomp_shared_dx[idx]);
-	back->Release();
-
-	target->dcomp_shared_mutex[idx]->ReleaseSync(0);
-
-	hr = target->dcomp_swapchain->Present(/*SyncInterval*/ 1, /*Flags*/ 0);
+	HRESULT hr = target->dcomp_swapchain->Present(/*SyncInterval*/ 1, /*Flags*/ 0);
 
 	// #870 — probe once whether this swapchain can report scanout truth. On
 	// Intel there is no VK presentation-timing extension, so the weave-latency
@@ -1870,6 +2243,236 @@ dcomp_present(struct comp_vk_native_target *target)
 	}
 	if (target->dcomp_dcomp_device != NULL) { target->dcomp_dcomp_device->Commit(); }
 	return XRT_SUCCESS;
+}
+
+// Zero-copy route — submit the just-rendered ring slot to DComp: D3D11
+// acquires sync on the shared texture (which flushes VK writer caches per
+// feedback_acquiresync_load_bearing.md), CopyResource into the next swapchain
+// back buffer, releases sync, Present, Commit.
+static xrt_result_t
+dcomp_present_shared(struct comp_vk_native_target *target)
+{
+	uint32_t idx = target->current_index;
+	if (idx >= DCOMP_RING || target->dcomp_shared_mutex[idx] == NULL) {
+		U_LOG_E("DComp bridge: present called with invalid ring index %u", idx);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Acquire (key=0) — also flushes VK writer caches into the shared resource.
+	HRESULT hr = target->dcomp_shared_mutex[idx]->AcquireSync(0, INFINITE);
+	if (FAILED(hr)) {
+		U_LOG_E("DComp bridge: AcquireSync[%u] failed: 0x%08x", idx, hr);
+		return XRT_ERROR_VULKAN;
+	}
+
+	ID3D11Texture2D *back = NULL;
+	hr = target->dcomp_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);
+	if (FAILED(hr) || back == NULL) {
+		U_LOG_E("DComp bridge: GetBuffer failed: 0x%08x", hr);
+		target->dcomp_shared_mutex[idx]->ReleaseSync(0);
+		return XRT_ERROR_VULKAN;
+	}
+
+	target->dcomp_dx_context->CopyResource(back, target->dcomp_shared_dx[idx]);
+	back->Release();
+
+	target->dcomp_shared_mutex[idx]->ReleaseSync(0);
+
+	return dcomp_present_swap(target);
+}
+
+//! Host-wait one readback slot (bounded: a lost device must not wedge the frame thread).
+static bool
+dcomp_rb_wait(struct comp_vk_native_target *target, uint32_t s)
+{
+	struct vk_bundle *vk = target->vk;
+	if (!target->rb_pending[s]) {
+		return true;
+	}
+	VkResult res = vk->vkWaitForFences(vk->device, 1, &target->rb_fence[s], VK_TRUE, 1000ull * 1000 * 1000);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge #2708: readback fence[%u] wait failed: %d", s, res);
+		return false;
+	}
+	target->rb_pending[s] = false;
+	return true;
+}
+
+/*!
+ * #2708 readback route — copy the woven ring image to a host buffer, wait its
+ * fence, UpdateSubresource the bytes into the premultiplied DComp swapchain
+ * and present. @p wait_sem (the ADR-055 chain's present semaphore, or
+ * VK_NULL_HANDLE when the caller drained on the host) is waited by the copy,
+ * so a chained frame is consumed here exactly as a WSI present would.
+ */
+static xrt_result_t
+dcomp_present_readback(struct comp_vk_native_target *target, VkQueue queue, VkSemaphore wait_sem)
+{
+	struct vk_bundle *vk = target->vk;
+	const uint32_t idx = target->current_index;
+	if (idx >= DCOMP_RING || target->dcomp_vk_image[idx] == VK_NULL_HANDLE ||
+	    target->rb_cmd_pool == VK_NULL_HANDLE) {
+		U_LOG_E("DComp bridge #2708: present called with invalid ring index %u", idx);
+		return XRT_ERROR_VULKAN;
+	}
+	const uint32_t w = target->width;
+	const uint32_t h = target->height;
+	const uint64_t t0 = os_monotonic_get_ns();
+
+	// Record into the next slot. With the lag A/B the slot may still hold an
+	// unpresented frame from DCOMP_RB_RING frames ago — retire it first.
+	const uint32_t s = target->rb_slot;
+	target->rb_slot = (s + 1) % DCOMP_RB_RING;
+	if (!dcomp_rb_wait(target, s)) {
+		return XRT_ERROR_VULKAN;
+	}
+
+	VkCommandBuffer cmd = target->rb_cmd[s];
+	vk->vkResetCommandBuffer(cmd, 0);
+	VkCommandBufferBeginInfo bi = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &bi);
+
+	// The compositor hands the ring image over in PRESENT_SRC_KHR, the layout
+	// it presents a WSI image in (the DP's weave ends there too).
+	VkImageMemoryBarrier to_src = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask =
+	        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = target->dcomp_vk_image[idx],
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &to_src);
+
+	VkBufferImageCopy region = {};
+	region.bufferRowLength = 0; // tightly packed: w * 4 bytes per row
+	region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	region.imageExtent = {w, h, 1};
+	vk->vkCmdCopyImageToBuffer(cmd, target->dcomp_vk_image[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                           target->rb_buf[s], 1, &region);
+
+	VkBufferMemoryBarrier to_host = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .buffer = target->rb_buf[s],
+	    .offset = 0,
+	    .size = VK_WHOLE_SIZE,
+	};
+	VkImageMemoryBarrier back_to_present = to_src;
+	back_to_present.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	back_to_present.dstAccessMask = 0;
+	back_to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	back_to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 1,
+	                         &to_host, 1, &back_to_present);
+	vk->vkEndCommandBuffer(cmd);
+
+	const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	VkSubmitInfo si = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .waitSemaphoreCount = wait_sem != VK_NULL_HANDLE ? 1u : 0u,
+	    .pWaitSemaphores = wait_sem != VK_NULL_HANDLE ? &wait_sem : NULL,
+	    .pWaitDstStageMask = wait_sem != VK_NULL_HANDLE ? &wait_stage : NULL,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	vk->vkResetFences(vk->device, 1, &target->rb_fence[s]);
+	VkResult res = vk->vkQueueSubmit(queue, 1, &si, target->rb_fence[s]);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge #2708: readback submit failed: %d", res);
+		return XRT_ERROR_VULKAN;
+	}
+	target->rb_pending[s] = true;
+	target->rb_w[s] = w;
+	target->rb_h[s] = h;
+
+	// Which slot reaches the window: this frame's (default), or with the lag
+	// A/B the previous one, so this frame's copy overlaps the next frame. The
+	// first frame (and the first after a resize) has no previous slot.
+	uint32_t p = s;
+	if (debug_get_num_option_vk_transparency_readback_lag() > 0) {
+		const uint32_t prev = (s + DCOMP_RB_RING - 1) % DCOMP_RB_RING;
+		if (target->rb_pending[prev] && target->rb_w[prev] == w && target->rb_h[prev] == h) {
+			p = prev;
+		}
+	}
+	if (!dcomp_rb_wait(target, p)) {
+		return XRT_ERROR_VULKAN;
+	}
+	if (!target->rb_coherent && target->rb_invalidate != NULL) {
+		VkMappedMemoryRange range = {
+		    .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+		    .memory = target->rb_buf_mem[p],
+		    .offset = 0,
+		    .size = VK_WHOLE_SIZE,
+		};
+		target->rb_invalidate(vk->device, 1, &range);
+	}
+	const uint64_t t1 = os_monotonic_get_ns();
+
+	ID3D11Texture2D *back = NULL;
+	HRESULT hr = target->dcomp_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);
+	if (FAILED(hr) || back == NULL) {
+		U_LOG_E("DComp bridge #2708: GetBuffer failed: 0x%08x", hr);
+		return XRT_ERROR_VULKAN;
+	}
+	// Same premultiplied BGRA bytes the zero-copy route CopyResource()s; the
+	// back buffer was sized by ResizeBuffers to the same w x h.
+	target->dcomp_dx_context->UpdateSubresource(back, 0, NULL, target->rb_map[p], target->rb_w[p] * 4, 0);
+	back->Release();
+	const uint64_t t2 = os_monotonic_get_ns();
+
+	// #2708: one INFO per 10 s with the readback cost, never per frame.
+	const double copy_ms = (double)(t1 - t0) / 1e6;
+	const double up_ms = (double)(t2 - t1) / 1e6;
+	if (target->rb_stat_t0_ns == 0) {
+		target->rb_stat_t0_ns = t2;
+	}
+	target->rb_stat_n++;
+	target->rb_stat_copy_ms += copy_ms;
+	target->rb_stat_upload_ms += up_ms;
+	if (copy_ms + up_ms > target->rb_stat_max_ms) {
+		target->rb_stat_max_ms = copy_ms + up_ms;
+	}
+	if (t2 - target->rb_stat_t0_ns >= 10ull * 1000 * 1000 * 1000) {
+		const double n = (double)target->rb_stat_n;
+		U_LOG_I(
+		    "DComp bridge #2708: readback %ux%u over %u frames — copy+fence %.2f ms, upload %.2f ms, "
+		    "total %.2f ms mean (max %.2f ms), lag=%d",
+		    w, h, target->rb_stat_n, target->rb_stat_copy_ms / n, target->rb_stat_upload_ms / n,
+		    (target->rb_stat_copy_ms + target->rb_stat_upload_ms) / n, target->rb_stat_max_ms,
+		    (int)debug_get_num_option_vk_transparency_readback_lag());
+		target->rb_stat_t0_ns = t2;
+		target->rb_stat_n = 0;
+		target->rb_stat_copy_ms = 0.0;
+		target->rb_stat_upload_ms = 0.0;
+		target->rb_stat_max_ms = 0.0;
+	}
+
+	return dcomp_present_swap(target);
+}
+
+static xrt_result_t
+dcomp_present(struct comp_vk_native_target *target, VkQueue queue, VkSemaphore wait_sem)
+{
+	if (target->dcomp_readback) {
+		return dcomp_present_readback(target, queue, wait_sem);
+	}
+	(void)queue;
+	(void)wait_sem;
+	return dcomp_present_shared(target);
 }
 
 #endif // XRT_OS_WINDOWS
@@ -4915,7 +5518,7 @@ comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
 
 #ifdef XRT_OS_WINDOWS
 	if (target->dcomp_active) {
-		return dcomp_present(target);
+		return dcomp_present(target, queue, wait_sem);
 	}
 #endif
 
@@ -5220,6 +5823,28 @@ comp_vk_native_target_images_sampled(struct comp_vk_native_target *target)
 	return target != NULL && target->images_sampled;
 }
 
+bool
+comp_vk_native_target_presents_alpha(struct comp_vk_native_target *target)
+{
+#ifdef XRT_OS_WINDOWS
+	return target != NULL && target->alpha_capable;
+#else
+	(void)target;
+	return true;
+#endif
+}
+
+bool
+comp_vk_native_target_is_readback(struct comp_vk_native_target *target)
+{
+#ifdef XRT_OS_WINDOWS
+	return target != NULL && target->dcomp_active && target->dcomp_readback;
+#else
+	(void)target;
+	return false;
+#endif
+}
+
 xrt_result_t
 comp_vk_native_target_resize(struct comp_vk_native_target *target,
                                uint32_t width,
@@ -5265,17 +5890,9 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 		// the visual was unbound/rebound every frame → the window was fully
 		// transparent for the entire drag. ResizeBuffers preserves the binding.
 
-		// 1. Release only the size-bound ring (VkImages/views/memory + shared D3D11).
-		for (uint32_t i = 0; i < DCOMP_RING; i++) {
-			if (target->dcomp_vk_view[i]) { vk->vkDestroyImageView(vk->device, target->dcomp_vk_view[i], NULL); target->dcomp_vk_view[i] = VK_NULL_HANDLE; }
-			if (target->dcomp_vk_image[i]) { vk->vkDestroyImage(vk->device, target->dcomp_vk_image[i], NULL); target->dcomp_vk_image[i] = VK_NULL_HANDLE; }
-			if (target->dcomp_vk_memory[i]) { vk->vkFreeMemory(vk->device, target->dcomp_vk_memory[i], NULL); target->dcomp_vk_memory[i] = VK_NULL_HANDLE; }
-			if (target->dcomp_shared_mutex[i]) { target->dcomp_shared_mutex[i]->Release(); target->dcomp_shared_mutex[i] = NULL; }
-			if (target->dcomp_shared_dx[i]) { target->dcomp_shared_dx[i]->Release(); target->dcomp_shared_dx[i] = NULL; }
-			target->views[i] = VK_NULL_HANDLE;
-			target->images[i] = VK_NULL_HANDLE;
-		}
-		target->image_count = 0;
+		// 1. Release only the size-bound ring (VkImages/views/memory + shared D3D11,
+		// or the #2708 readback route's VK-owned images + host buffers).
+		dcomp_release_ring(target);
 
 		// 2. Resize the composition swapchain in place. The swapchain object (and
 		// the visual->SetContent binding to it) survives ResizeBuffers; no back
@@ -5289,59 +5906,14 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 			return XRT_ERROR_VULKAN;
 		}
 
-		// 3. Rebuild the ring of NT-handle-shared textures + VkImage imports at
-		// the new size (same sharing mode as dcomp_setup — see the comment
-		// there for why NT and not legacy KMT).
-		for (uint32_t i = 0; i < DCOMP_RING; i++) {
-			D3D11_TEXTURE2D_DESC tdesc = {};
-			tdesc.Width = width;
-			tdesc.Height = height;
-			tdesc.MipLevels = 1;
-			tdesc.ArraySize = 1;
-			tdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-			tdesc.SampleDesc.Count = 1;
-			tdesc.Usage = D3D11_USAGE_DEFAULT;
-			tdesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-			tdesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
-			hr = target->dcomp_dx_device->CreateTexture2D(&tdesc, NULL, &target->dcomp_shared_dx[i]);
-			if (FAILED(hr)) {
-				U_LOG_E("DComp bridge resize: CreateTexture2D[%u] failed: 0x%08x", i, hr);
-				return XRT_ERROR_VULKAN;
-			}
-			IDXGIResource1 *dxgi_res = NULL;
-			hr = target->dcomp_shared_dx[i]->QueryInterface(__uuidof(IDXGIResource1), (void **)&dxgi_res);
-			if (FAILED(hr) || dxgi_res == NULL) {
-				U_LOG_E("DComp bridge resize: QueryInterface(IDXGIResource1)[%u] failed: 0x%08x", i, hr);
-				return XRT_ERROR_VULKAN;
-			}
-			HANDLE shared_nt = NULL;
-			hr = dxgi_res->CreateSharedHandle(NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-			                                  NULL, &shared_nt);
-			dxgi_res->Release();
-			if (FAILED(hr) || shared_nt == NULL) {
-				U_LOG_E("DComp bridge resize: CreateSharedHandle[%u] failed: 0x%08x", i, hr);
-				return XRT_ERROR_VULKAN;
-			}
-			bool imported = dcomp_import_one(target, i, target->dcomp_shared_dx[i], shared_nt,
-			                                  width, height, VK_FORMAT_B8G8R8A8_UNORM);
-			CloseHandle(shared_nt);
-			if (!imported) {
-				U_LOG_E("DComp bridge resize: import ring[%u] failed", i);
-				return XRT_ERROR_VULKAN;
-			}
+		// 3. Rebuild the ring at the new size on the route this target already
+		// took (dcomp_build_ring: NT-shared imports, or the #2708 readback
+		// route) and republish images/views + dims. Visual/target/device
+		// untouched.
+		if (!dcomp_build_ring(target, width, height)) {
+			U_LOG_E("DComp bridge resize: ring rebuild at %ux%u failed", width, height);
+			return XRT_ERROR_VULKAN;
 		}
-
-		// 4. Republish the new images/views + dims. Visual/target/device untouched.
-		target->image_count = DCOMP_RING;
-		for (uint32_t i = 0; i < DCOMP_RING; i++) {
-			target->images[i] = target->dcomp_vk_image[i];
-			target->views[i] = target->dcomp_vk_view[i];
-		}
-		target->format = VK_FORMAT_B8G8R8A8_UNORM;
-		target->width = width;
-		target->height = height;
-		target->dcomp_ring_idx = 0;
-		target->current_index = 0;
 		target->generation++; // #602: image set rebuilt — invalidate DP caches.
 		if (target->dcomp_dcomp_device != NULL) { target->dcomp_dcomp_device->Commit(); }
 		return XRT_SUCCESS;
