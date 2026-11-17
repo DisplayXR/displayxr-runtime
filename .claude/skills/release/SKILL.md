@@ -4,6 +4,12 @@ description: Create a tagged release of the displayxr-runtime repo, monitor the 
 allowed-tools: Read, Grep, Glob, Bash, Agent, Edit, Write
 ---
 
+<!-- Never put a dollar sign directly before a digit in this file, not even in
+     a shell or awk snippet: Claude Code replaces positional placeholders (dollar
+     + digit) with the skill's arguments before the model reads the file, so a
+     helper's first-argument reference arrives as the version string. Write ${1}
+     in shell and $(2) in awk. -->
+
 # Release Skill
 
 Creates a tagged release of the **displayxr-runtime** repo, monitors the Windows + macOS CI builds, and publishes the GitHub Release with both platform installers attached (`DisplayXRSetup-*.exe` and `DisplayXR-Installer.pkg`). Test apps are no longer packaged — CI compiles them as a check on `test_apps/` changes only.
@@ -376,7 +382,7 @@ holds exactly `DisplayXRSetup-<version>.exe` and that exe carries the version st
 # ── Signing-run identity helpers ────────────────────────────────────────────
 # sign_dispatch <workflow> <marker> [-f k=v ...]  → sets SIGN_RUN ("" = not located)
 sign_dispatch() {
-  local wf="$1" marker="$2" since out id cand st; shift 2
+  local wf="${1}" marker="${2}" since out id cand st; shift 2
   since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   out=$(gh workflow run "$wf" -R "$SIGN_REPO" "$@" 2>&1); printf '%s\n' "$out"
   # 1) The run gh printed. Recent gh prints the new run's URL on dispatch.
@@ -409,7 +415,7 @@ RUNS
 # sign_track <workflow> <marker> [-f k=v ...]  → dispatch, wait, and re-dispatch ONCE if
 # the run was cancelled. Returns 0 only on conclusion=success; SIGN_RUN/SIGN_CONCL set.
 sign_track() {
-  local wf="$1" marker="$2" attempt; shift 2
+  local wf="${1}" marker="${2}" attempt; shift 2
   SIGN_RUN=""; SIGN_CONCL=""
   for attempt in 1 2; do
     sign_dispatch "$wf" "$marker" "$@"
@@ -433,7 +439,7 @@ exe_has_version() {
 d=open(sys.argv[1],"rb").read(); v=sys.argv[2]
 pat=r"(?<![0-9.])"+re.escape(v)+r"(?![0-9])"
 hit=re.search(pat,d.decode("utf-16-le","ignore")) or re.search(pat,d[1:].decode("utf-16-le","ignore")) or re.search(pat.encode(),d)
-sys.exit(0 if hit else 1)' "$1" "$2"; }
+sys.exit(0 if hit else 1)' "${1}" "${2}"; }
 
 if sign_track build-signed-release.yml "Checkout DisplayXR/displayxr-runtime @ [FULL_TAG]" \
      -f component=runtime -f repo=DisplayXR/displayxr-runtime -f ref=[FULL_TAG]; then
