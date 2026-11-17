@@ -145,22 +145,28 @@ black de-occlusions, and the Local2D bubble lost its alpha shape.
 When the import is unavailable (no `VK_KHR_external_memory_win32`, or the first
 real import fails) the bridge keeps its swapchain and DComp binding and moves the
 pixels through the CPU instead: the ring images are plain VK-owned images, and
-each present runs `vkCmdCopyImageToBuffer` into one of three host-visible
-(cached where offered) buffers, waits that copy's `VkFence`, and
-`UpdateSubresource`s the bytes into the swapchain back buffer. The bytes are the
-same premultiplied BGRA the zero-copy route copies, so DWM blends the **live**
-desktop with no capture lag. Cost measured on Adreno X2-45: **+1.9 ms per frame
-at 1080p, +7.8 ms at 4K** (x64 under Prism; native ARM64 1.3 / 6.0 ms), with no
-extra frame of latency. One WARN names the route; an INFO every 10 s reports the
-readback time. `DXR_VK_TRANSPARENCY_READBACK=0` is the kill switch;
-`DXR_VK_TRANSPARENCY_READBACK_LAG=1` presents the previous frame's readback (an
-A/B for overlap, one frame later). A GPU whose import works never takes it.
+each present records `vkCmdCopyImageToBuffer` into one of three host-visible
+(cached where offered) buffers with its own `VkFence` and hands the slot to a
+present worker thread, which waits that fence, `UpdateSubresource`s the bytes into
+the swapchain back buffer and presents (the newest finished slot only, if it ever
+falls behind). The frame thread never host-waits the copy of the frame it just
+rendered. The bytes are the same premultiplied BGRA the zero-copy route copies, so
+DWM blends the **live** desktop with no capture lag. Cost measured on Adreno
+X2-45: **+1.9 ms per frame at 1080p, +7.8 ms at 4K** (x64 under Prism; native
+ARM64 1.3 / 6.0 ms), off the frame thread and with no extra frame of latency. One
+WARN names the route; an INFO every 10 s reports the readback time.
+`DXR_VK_TRANSPARENCY_READBACK=0` is the kill switch. A GPU whose import works never
+takes it.
 
-On this route the DP is told the client presents (`client_presents=true`): it
-runs the post-weave alpha-gate and no compose-under-bg, because the runtime's own
-present is transparent. The de-occlusion band (pixels where some views are
-transparent) then carries the weaver's RGB at α=1 rather than a baked desktop.
-Separately, a transparent request that still ends on an OPAQUE swapchain (the
+The DP is configured exactly as on the D3D11 live path (`client_presents=false`):
+it composes the WGC desktop capture **under** the atlas before the weave, so the
+de-occlusion band (pixels where only some views are transparent) carries desktop
+pixels, and its post-weave alpha-gate zeroes the all-views-transparent holes so
+DWM shows the live desktop there. On Adreno the Leia DP cannot import the
+capture's D3D11 texture either, so this needs its CPU staging-upload of the
+capture (leia-plugin#540) **without** forcing the gate to flatten the holes
+(leia-plugin#543); a plug-in without it gates nothing and the window presents
+opaque. Separately, a transparent request that still ends on an OPAQUE swapchain (the
 kill switch, or the bridge failing outright) is now composited as opaque, like
 `DXR_PRESENT_OPAQUE`: the Local2D/zones blend flattens instead of emitting alpha
 nobody blends.

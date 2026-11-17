@@ -6363,24 +6363,6 @@ vk_composite_flattens(struct comp_vk_native_compositor *c)
 	return c->target != NULL && !comp_vk_native_target_presents_alpha(c->target);
 }
 
-/*!
- * #2708 — the `client_presents` argument of the DP's set_transparent_background.
- *
- * True on the DComp bridge's CPU-readback route: the runtime presents true
- * per-pixel alpha and DWM blends the LIVE desktop into the α=0 holes, so the
- * DP must run its post-weave alpha-gate WITHOUT compose-under-bg (a WGC bake
- * that lags the desktop by a capture interval, and whose D3D11 import fails
- * on the very driver this route exists for — leia-plugin#539). Without it a
- * DP whose compose import failed never gates, and the woven output keeps α=1
- * (an opaque black window). False everywhere else — the in-process live
- * default (hybrid: the DP bakes the de-occlusion band, transparency-modes.md).
- */
-static bool
-vk_dp_client_presents(struct comp_vk_native_compositor *c)
-{
-	return c->target != NULL && comp_vk_native_target_is_readback(c->target);
-}
-
 #ifdef XRT_OS_WINDOWS
 /*!
  * ADR-047 Amendment 2 hook (multi-screen M6, Vulkan): install @p dp as the
@@ -6405,8 +6387,7 @@ vk_segments_swap_primary_cb(void *userdata, struct xrt_display_processor *dp)
 	if (dp != NULL) {
 		struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)dp;
 		c->dp_tolerates_resample = xrt_display_processor_vk_tolerates_resample(vdp);
-		xrt_display_processor_vk_set_transparent_background(vdp, c->transparent_background,
-		                                                    vk_dp_client_presents(c)); // #2708
+		xrt_display_processor_vk_set_transparent_background(vdp, c->transparent_background, false);
 		xrt_display_processor_vk_set_shared_texture_present(vdp, c->has_shared_texture);
 		// #2247: the session's mode, but not on a primary screen the window left.
 		vk_seg_primary_lens(c, dp, true);
@@ -14716,11 +14697,11 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 	}
 	if (c->display_processor != NULL) {
 		vk_lazy_transparency_setup(c, transparent_background);
-		// #2708: true on the DComp bridge's CPU-readback route once the target
-		// exists (vk_make_target_vk re-asserts it after creating one).
+		// #2708: also on the DComp bridge's CPU-readback route — the DP still
+		// composes the desktop capture under the atlas (the de-occlusion band
+		// needs desktop pixels before the weave), exactly as on D3D11.
 		xrt_display_processor_vk_set_transparent_background(
-		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background,
-		    vk_dp_client_presents(c));
+		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background, false);
 
 		// #613 / #68 — tell the DP whether the app self-presents only the canvas
 		// (shared-texture apps) vs the full target (handle apps). Gates the
@@ -14853,17 +14834,6 @@ vk_make_target_vk(struct comp_vk_native_compositor *c, void *hwnd, bool transpar
 		if (c->display_refresh_rate > 0.0f) {
 			comp_vk_native_target_set_display_period(c->target,
 			                                         (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
-		}
-		// #2708: the DP was told the transparency mode before the target
-		// existed (vk_make_dp_vk runs first). On the DComp bridge's
-		// CPU-readback route the runtime presents true alpha, so switch the DP
-		// to client-present: alpha-gate only, compose-under-bg off.
-		if (transparent_background && c->display_processor != NULL && vk_dp_client_presents(c)) {
-			xrt_display_processor_vk_set_transparent_background(
-			    (struct xrt_display_processor_vk *)c->display_processor, true, true);
-			U_LOG_W(
-			    "#2708: VK target on the DComp CPU-readback route — DP set to client-present "
-			    "(post-weave alpha-gate, no compose-under-bg; DWM blends the live desktop)");
 		}
 	} else {
 		c->target = NULL;

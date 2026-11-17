@@ -169,12 +169,9 @@ DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
  * kill switch back to the opaque-WSI fallback.
  */
 DEBUG_GET_ONCE_BOOL_OPTION(vk_transparency_readback, "DXR_VK_TRANSPARENCY_READBACK", true)
-/*
- * #2708 A/B: 1 = present the PREVIOUS frame's readback, so this frame's copy
- * overlaps the next frame instead of stalling the host (one extra frame of
- * latency). Default 0: wait on this frame's copy and present it.
- */
-DEBUG_GET_ONCE_NUM_OPTION(vk_transparency_readback_lag, "DXR_VK_TRANSPARENCY_READBACK_LAG", 0)
+
+// #2708: the readback route's present worker (defined with the route below).
+struct dcomp_rb_worker;
 
 /*
  * #870/#912 — DXR_VK_BRIDGE_PACING: pace the VK live/DComp path on the
@@ -1020,8 +1017,14 @@ struct comp_vk_native_target
 	VkCommandPool rb_cmd_pool;
 	VkCommandBuffer rb_cmd[DCOMP_RB_RING];
 	VkFence rb_fence[DCOMP_RB_RING];
-	//! Submitted and not yet waited on the host.
-	bool rb_pending[DCOMP_RB_RING];
+	//! Present worker (thread + slot queue); NULL until the route starts.
+	struct dcomp_rb_worker *rb_worker;
+	//! Per-slot submit counter, and which slot/submit last read each ring
+	//! image (dcomp_rb_wait_image). Frame thread only.
+	uint32_t rb_slot_seq[DCOMP_RB_RING];
+	uint32_t rb_img_slot[DCOMP_RING];
+	uint32_t rb_img_seq[DCOMP_RING];
+	bool rb_img_valid[DCOMP_RING];
 	VkBuffer rb_buf[DCOMP_RB_RING];
 	VkDeviceMemory rb_buf_mem[DCOMP_RB_RING];
 	void *rb_map[DCOMP_RB_RING];
@@ -1033,9 +1036,11 @@ struct comp_vk_native_target
 	//! Slot memory is HOST_COHERENT (else invalidated after the fence).
 	bool rb_coherent;
 	PFN_vkInvalidateMappedMemoryRanges rb_invalidate;
-	//! 10 s INFO accumulators: copy (submit → fence) and upload ms.
+	//! 10 s INFO accumulators (worker thread only): copy (submit → landed)
+	//! and upload ms, and frames superseded by a newer one before presenting.
 	uint64_t rb_stat_t0_ns;
 	uint32_t rb_stat_n;
+	uint32_t rb_stat_skipped;
 	double rb_stat_copy_ms;
 	double rb_stat_upload_ms;
 	double rb_stat_max_ms;
@@ -1456,13 +1461,21 @@ dcomp_release_ring(struct comp_vk_native_target *target)
 			vk->vkFreeMemory(vk->device, target->rb_buf_mem[i], NULL);
 			target->rb_buf_mem[i] = VK_NULL_HANDLE;
 		}
-		// A frame read back at the old size is never presented.
-		target->rb_pending[i] = false;
+		// Callers drained the worker first: nothing queued reads these.
 		target->rb_w[i] = 0;
 		target->rb_h[i] = 0;
 	}
 	target->image_count = 0;
 }
+
+static void
+dcomp_rb_drain(struct comp_vk_native_target *target);
+static void
+dcomp_rb_worker_stop(struct comp_vk_native_target *target);
+static bool
+dcomp_rb_worker_start(struct comp_vk_native_target *target);
+static void
+dcomp_rb_wait_image(struct comp_vk_native_target *target, uint32_t idx);
 
 static void
 dcomp_destroy(struct comp_vk_native_target *target)
@@ -1471,6 +1484,9 @@ dcomp_destroy(struct comp_vk_native_target *target)
 		return;
 	struct vk_bundle *vk = target->vk;
 
+	// #2708: the present worker uses the ring, the swapchain and the D3D11
+	// context — retire it (it presents what is queued) before any of them go.
+	dcomp_rb_worker_stop(target);
 	dcomp_release_ring(target);
 	for (uint32_t i = 0; i < DCOMP_RB_RING; i++) {
 		if (target->rb_fence[i] != VK_NULL_HANDLE) {
@@ -1640,9 +1656,9 @@ dcomp_rb_announce(const char *reason)
 	U_LOG_W(
 	    "DComp bridge #2708: D3D11 -> VK import unavailable (%s) — CPU-readback route: VK-owned "
 	    "ring + vkCmdCopyImageToBuffer into %u host-visible buffers, UpdateSubresource into the "
-	    "premultiplied DComp swapchain (live per-pixel alpha, no capture lag; "
-	    "DXR_VK_TRANSPARENCY_READBACK=0 disables, DXR_VK_TRANSPARENCY_READBACK_LAG=%d)",
-	    reason, (unsigned)DCOMP_RB_RING, (int)debug_get_num_option_vk_transparency_readback_lag());
+	    "premultiplied DComp swapchain on a present worker (live per-pixel alpha, no capture lag, "
+	    "no host wait on the frame thread; DXR_VK_TRANSPARENCY_READBACK=0 disables)",
+	    reason, (unsigned)DCOMP_RB_RING);
 }
 
 //! Command pool, command buffers and fences — size-independent, built once.
@@ -1682,12 +1698,15 @@ dcomp_rb_init_static(struct comp_vk_native_target *target)
 			U_LOG_E("DComp bridge #2708: vkCreateFence[%u] failed: %d", i, res);
 			return false;
 		}
-		target->rb_pending[i] = false;
 	}
 	target->rb_invalidate =
 	    (PFN_vkInvalidateMappedMemoryRanges)vk->vkGetDeviceProcAddr(vk->device, "vkInvalidateMappedMemoryRanges");
 	target->rb_slot = 0;
 	target->rb_stat_t0_ns = 0;
+	if (!dcomp_rb_worker_start(target)) {
+		U_LOG_E("DComp bridge #2708: could not start the present worker");
+		return false;
+	}
 	return true;
 }
 
@@ -2281,50 +2300,248 @@ dcomp_present_shared(struct comp_vk_native_target *target)
 	return dcomp_present_swap(target);
 }
 
-//! Host-wait one readback slot (bounded: a lost device must not wedge the frame thread).
-static bool
-dcomp_rb_wait(struct comp_vk_native_target *target, uint32_t s)
+/*!
+ * #2708 — the readback route's present worker.
+ *
+ * The frame thread never host-waits the copy of the frame it just rendered:
+ * it records + submits the copy (fenced) and hands the slot to this thread,
+ * which waits that fence, UpdateSubresource()s the bytes into the DComp back
+ * buffer and presents. The window therefore gets each frame as soon as its
+ * copy lands (~1-2 ms), with no extra frame of latency and no stall on the
+ * thread that weaves the next frame. If the worker falls behind it presents
+ * only the NEWEST finished slot (an older one would only add latency).
+ *
+ * Owns the D3D11 immediate context and the swapchain while the route is
+ * active; the frame thread touches them only after dcomp_rb_drain() (resize,
+ * destroy).
+ */
+struct dcomp_rb_worker
+{
+	std::thread th;
+	std::mutex mtx;
+	std::condition_variable work_cv; //!< a slot was queued, or stop
+	std::condition_variable idle_cv; //!< a batch retired
+	std::deque<uint32_t> queue;      //!< submitted slots, oldest first
+	bool busy = false;
+	bool stop = false;
+	//! Submitted and not yet retired by the worker (guards slot reuse).
+	bool inflight[DCOMP_RB_RING] = {};
+	//! os_monotonic_get_ns() at submit, for the copy-latency INFO.
+	uint64_t submit_ns[DCOMP_RB_RING] = {};
+	bool error_logged = false;
+};
+
+//! Worker side: present the newest slot of a retired batch.
+static void
+dcomp_rb_present_slot(struct comp_vk_native_target *target, uint32_t p, uint64_t submit_ns)
 {
 	struct vk_bundle *vk = target->vk;
-	if (!target->rb_pending[s]) {
+	if (!target->rb_coherent && target->rb_invalidate != NULL) {
+		VkMappedMemoryRange range = {
+		    .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+		    .memory = target->rb_buf_mem[p],
+		    .offset = 0,
+		    .size = VK_WHOLE_SIZE,
+		};
+		target->rb_invalidate(vk->device, 1, &range);
+	}
+	const uint64_t t1 = os_monotonic_get_ns();
+
+	ID3D11Texture2D *back = NULL;
+	HRESULT hr = target->dcomp_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);
+	if (FAILED(hr) || back == NULL) {
+		U_LOG_E("DComp bridge #2708: GetBuffer failed: 0x%08x", hr);
+		return;
+	}
+	// Same premultiplied BGRA bytes the zero-copy route CopyResource()s. The
+	// slot was copied at the current target size (a resize drains first).
+	D3D11_BOX box = {0, 0, 0, target->rb_w[p], target->rb_h[p], 1};
+	target->dcomp_dx_context->UpdateSubresource(back, 0, &box, target->rb_map[p], target->rb_w[p] * 4, 0);
+	back->Release();
+	const uint64_t t2 = os_monotonic_get_ns();
+	(void)dcomp_present_swap(target);
+
+	// #2708: one INFO per 10 s with the readback cost, never per frame.
+	const double copy_ms = (double)(t1 - submit_ns) / 1e6;
+	const double up_ms = (double)(t2 - t1) / 1e6;
+	if (target->rb_stat_t0_ns == 0) {
+		target->rb_stat_t0_ns = t2;
+	}
+	target->rb_stat_n++;
+	target->rb_stat_copy_ms += copy_ms;
+	target->rb_stat_upload_ms += up_ms;
+	if (copy_ms + up_ms > target->rb_stat_max_ms) {
+		target->rb_stat_max_ms = copy_ms + up_ms;
+	}
+	if (t2 - target->rb_stat_t0_ns >= 10ull * 1000 * 1000 * 1000) {
+		const double n = (double)target->rb_stat_n;
+		U_LOG_I(
+		    "DComp bridge #2708: readback %ux%u over %u presents (%u superseded) — submit->copy landed %.2f "
+		    "ms, "
+		    "upload %.2f ms, total %.2f ms mean (max %.2f ms), off the frame thread",
+		    target->rb_w[p], target->rb_h[p], target->rb_stat_n, target->rb_stat_skipped,
+		    target->rb_stat_copy_ms / n, target->rb_stat_upload_ms / n,
+		    (target->rb_stat_copy_ms + target->rb_stat_upload_ms) / n, target->rb_stat_max_ms);
+		target->rb_stat_t0_ns = t2;
+		target->rb_stat_n = 0;
+		target->rb_stat_skipped = 0;
+		target->rb_stat_copy_ms = 0.0;
+		target->rb_stat_upload_ms = 0.0;
+		target->rb_stat_max_ms = 0.0;
+	}
+}
+
+static void
+dcomp_rb_worker_main(struct comp_vk_native_target *target)
+{
+	struct dcomp_rb_worker *w = target->rb_worker;
+	struct vk_bundle *vk = target->vk;
+	uint32_t batch[DCOMP_RB_RING];
+	uint64_t batch_ns[DCOMP_RB_RING];
+
+	std::unique_lock<std::mutex> lk(w->mtx);
+	for (;;) {
+		w->work_cv.wait(lk, [w] { return w->stop || !w->queue.empty(); });
+		if (w->queue.empty()) {
+			break; // stop, nothing left
+		}
+		uint32_t n = 0;
+		while (!w->queue.empty() && n < DCOMP_RB_RING) {
+			batch[n] = w->queue.front();
+			batch_ns[n] = w->submit_ns[batch[n]];
+			w->queue.pop_front();
+			n++;
+		}
+		w->busy = true;
+		lk.unlock();
+
+		// Retire every slot of the batch (the fence must be waited before the
+		// frame thread may reuse it), present only the newest.
+		bool ok = true;
+		for (uint32_t i = 0; i < n; i++) {
+			VkResult res = vk->vkWaitForFences(vk->device, 1, &target->rb_fence[batch[i]], VK_TRUE,
+			                                   1000ull * 1000 * 1000);
+			if (res != VK_SUCCESS) {
+				ok = false;
+				if (!w->error_logged) {
+					w->error_logged = true;
+					U_LOG_E("DComp bridge #2708: readback fence[%u] wait failed: %d (logged once)",
+					        batch[i], res);
+				}
+			}
+		}
+		if (ok) {
+			target->rb_stat_skipped += n - 1;
+			dcomp_rb_present_slot(target, batch[n - 1], batch_ns[n - 1]);
+		}
+
+		lk.lock();
+		for (uint32_t i = 0; i < n; i++) {
+			w->inflight[batch[i]] = false;
+		}
+		w->busy = false;
+		w->idle_cv.notify_all();
+	}
+}
+
+//! Start the worker once per target (the readback route's static half).
+static bool
+dcomp_rb_worker_start(struct comp_vk_native_target *target)
+{
+	if (target->rb_worker != NULL) {
 		return true;
 	}
-	VkResult res = vk->vkWaitForFences(vk->device, 1, &target->rb_fence[s], VK_TRUE, 1000ull * 1000 * 1000);
-	if (res != VK_SUCCESS) {
-		U_LOG_E("DComp bridge #2708: readback fence[%u] wait failed: %d", s, res);
+	target->rb_worker = new (std::nothrow) dcomp_rb_worker();
+	if (target->rb_worker == NULL) {
 		return false;
 	}
-	target->rb_pending[s] = false;
+	target->rb_worker->th = std::thread(dcomp_rb_worker_main, target);
 	return true;
 }
 
+//! Frame thread: wait until every queued readback has been presented and retired.
+static void
+dcomp_rb_drain(struct comp_vk_native_target *target)
+{
+	struct dcomp_rb_worker *w = target->rb_worker;
+	if (w == NULL) {
+		return;
+	}
+	std::unique_lock<std::mutex> lk(w->mtx);
+	w->idle_cv.wait(lk, [w] { return w->queue.empty() && !w->busy; });
+}
+
+static void
+dcomp_rb_worker_stop(struct comp_vk_native_target *target)
+{
+	struct dcomp_rb_worker *w = target->rb_worker;
+	if (w == NULL) {
+		return;
+	}
+	{
+		std::lock_guard<std::mutex> lk(w->mtx);
+		w->stop = true;
+	}
+	w->work_cv.notify_all();
+	if (w->th.joinable()) {
+		w->th.join();
+	}
+	delete w;
+	target->rb_worker = NULL;
+}
+
 /*!
- * #2708 readback route — copy the woven ring image to a host buffer, wait its
- * fence, UpdateSubresource the bytes into the premultiplied DComp swapchain
- * and present. @p wait_sem (the ADR-055 chain's present semaphore, or
- * VK_NULL_HANDLE when the caller drained on the host) is waited by the copy,
- * so a chained frame is consumed here exactly as a WSI present would.
+ * Frame thread, at acquire: the ring image about to be rendered into must not
+ * still be read by an earlier readback copy. The copy may sit on a different
+ * VkQueue than the next render (the repaint queue), so queue order alone does
+ * not cover it. The copy that last read it is a frame old by now, so this
+ * wait is normally already satisfied.
+ */
+static void
+dcomp_rb_wait_image(struct comp_vk_native_target *target, uint32_t idx)
+{
+	struct vk_bundle *vk = target->vk;
+	if (idx >= DCOMP_RING || !target->rb_img_valid[idx]) {
+		return;
+	}
+	const uint32_t s = target->rb_img_slot[idx];
+	// Only while the slot still holds that copy: a later submit into the slot
+	// (seq moved) means its earlier fence was already retired by the worker.
+	if (target->rb_slot_seq[s] == target->rb_img_seq[idx]) {
+		(void)vk->vkWaitForFences(vk->device, 1, &target->rb_fence[s], VK_TRUE, 1000ull * 1000 * 1000);
+	}
+	target->rb_img_valid[idx] = false;
+}
+
+/*!
+ * #2708 readback route — record + submit the copy of the woven ring image
+ * into a host-visible slot and hand the slot to the present worker. Never
+ * waits on this frame's copy. @p wait_sem (the ADR-055 chain's present
+ * semaphore, or VK_NULL_HANDLE when the caller drained on the host) is waited
+ * by the copy, so a chained frame is consumed here exactly as a WSI present
+ * would.
  */
 static xrt_result_t
 dcomp_present_readback(struct comp_vk_native_target *target, VkQueue queue, VkSemaphore wait_sem)
 {
 	struct vk_bundle *vk = target->vk;
+	struct dcomp_rb_worker *w = target->rb_worker;
 	const uint32_t idx = target->current_index;
-	if (idx >= DCOMP_RING || target->dcomp_vk_image[idx] == VK_NULL_HANDLE ||
+	if (w == NULL || idx >= DCOMP_RING || target->dcomp_vk_image[idx] == VK_NULL_HANDLE ||
 	    target->rb_cmd_pool == VK_NULL_HANDLE) {
 		U_LOG_E("DComp bridge #2708: present called with invalid ring index %u", idx);
 		return XRT_ERROR_VULKAN;
 	}
-	const uint32_t w = target->width;
-	const uint32_t h = target->height;
-	const uint64_t t0 = os_monotonic_get_ns();
+	const uint32_t width = target->width;
+	const uint32_t height = target->height;
 
-	// Record into the next slot. With the lag A/B the slot may still hold an
-	// unpresented frame from DCOMP_RB_RING frames ago — retire it first.
+	// Next slot. Back-pressure only when the worker is a whole ring behind
+	// (the slot's previous copy has not been retired yet).
 	const uint32_t s = target->rb_slot;
 	target->rb_slot = (s + 1) % DCOMP_RB_RING;
-	if (!dcomp_rb_wait(target, s)) {
-		return XRT_ERROR_VULKAN;
+	{
+		std::unique_lock<std::mutex> lk(w->mtx);
+		w->idle_cv.wait(lk, [w, s] { return !w->inflight[s]; });
 	}
 
 	VkCommandBuffer cmd = target->rb_cmd[s];
@@ -2352,10 +2569,11 @@ dcomp_present_readback(struct comp_vk_native_target *target, VkQueue queue, VkSe
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
 	                         NULL, 1, &to_src);
 
+	// The ring image is window-sized, so this IS the window rect.
 	VkBufferImageCopy region = {};
-	region.bufferRowLength = 0; // tightly packed: w * 4 bytes per row
+	region.bufferRowLength = 0; // tightly packed: width * 4 bytes per row
 	region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-	region.imageExtent = {w, h, 1};
+	region.imageExtent = {width, height, 1};
 	vk->vkCmdCopyImageToBuffer(cmd, target->dcomp_vk_image[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                           target->rb_buf[s], 1, &region);
 
@@ -2389,79 +2607,27 @@ dcomp_present_readback(struct comp_vk_native_target *target, VkQueue queue, VkSe
 	    .pCommandBuffers = &cmd,
 	};
 	vk->vkResetFences(vk->device, 1, &target->rb_fence[s]);
+	const uint64_t submit_ns = os_monotonic_get_ns();
 	VkResult res = vk->vkQueueSubmit(queue, 1, &si, target->rb_fence[s]);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("DComp bridge #2708: readback submit failed: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
-	target->rb_pending[s] = true;
-	target->rb_w[s] = w;
-	target->rb_h[s] = h;
+	target->rb_w[s] = width;
+	target->rb_h[s] = height;
+	target->rb_slot_seq[s]++;
+	target->rb_img_slot[idx] = s;
+	target->rb_img_seq[idx] = target->rb_slot_seq[s];
+	target->rb_img_valid[idx] = true;
 
-	// Which slot reaches the window: this frame's (default), or with the lag
-	// A/B the previous one, so this frame's copy overlaps the next frame. The
-	// first frame (and the first after a resize) has no previous slot.
-	uint32_t p = s;
-	if (debug_get_num_option_vk_transparency_readback_lag() > 0) {
-		const uint32_t prev = (s + DCOMP_RB_RING - 1) % DCOMP_RB_RING;
-		if (target->rb_pending[prev] && target->rb_w[prev] == w && target->rb_h[prev] == h) {
-			p = prev;
-		}
+	{
+		std::lock_guard<std::mutex> lk(w->mtx);
+		w->inflight[s] = true;
+		w->submit_ns[s] = submit_ns;
+		w->queue.push_back(s);
 	}
-	if (!dcomp_rb_wait(target, p)) {
-		return XRT_ERROR_VULKAN;
-	}
-	if (!target->rb_coherent && target->rb_invalidate != NULL) {
-		VkMappedMemoryRange range = {
-		    .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-		    .memory = target->rb_buf_mem[p],
-		    .offset = 0,
-		    .size = VK_WHOLE_SIZE,
-		};
-		target->rb_invalidate(vk->device, 1, &range);
-	}
-	const uint64_t t1 = os_monotonic_get_ns();
-
-	ID3D11Texture2D *back = NULL;
-	HRESULT hr = target->dcomp_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);
-	if (FAILED(hr) || back == NULL) {
-		U_LOG_E("DComp bridge #2708: GetBuffer failed: 0x%08x", hr);
-		return XRT_ERROR_VULKAN;
-	}
-	// Same premultiplied BGRA bytes the zero-copy route CopyResource()s; the
-	// back buffer was sized by ResizeBuffers to the same w x h.
-	target->dcomp_dx_context->UpdateSubresource(back, 0, NULL, target->rb_map[p], target->rb_w[p] * 4, 0);
-	back->Release();
-	const uint64_t t2 = os_monotonic_get_ns();
-
-	// #2708: one INFO per 10 s with the readback cost, never per frame.
-	const double copy_ms = (double)(t1 - t0) / 1e6;
-	const double up_ms = (double)(t2 - t1) / 1e6;
-	if (target->rb_stat_t0_ns == 0) {
-		target->rb_stat_t0_ns = t2;
-	}
-	target->rb_stat_n++;
-	target->rb_stat_copy_ms += copy_ms;
-	target->rb_stat_upload_ms += up_ms;
-	if (copy_ms + up_ms > target->rb_stat_max_ms) {
-		target->rb_stat_max_ms = copy_ms + up_ms;
-	}
-	if (t2 - target->rb_stat_t0_ns >= 10ull * 1000 * 1000 * 1000) {
-		const double n = (double)target->rb_stat_n;
-		U_LOG_I(
-		    "DComp bridge #2708: readback %ux%u over %u frames — copy+fence %.2f ms, upload %.2f ms, "
-		    "total %.2f ms mean (max %.2f ms), lag=%d",
-		    w, h, target->rb_stat_n, target->rb_stat_copy_ms / n, target->rb_stat_upload_ms / n,
-		    (target->rb_stat_copy_ms + target->rb_stat_upload_ms) / n, target->rb_stat_max_ms,
-		    (int)debug_get_num_option_vk_transparency_readback_lag());
-		target->rb_stat_t0_ns = t2;
-		target->rb_stat_n = 0;
-		target->rb_stat_copy_ms = 0.0;
-		target->rb_stat_upload_ms = 0.0;
-		target->rb_stat_max_ms = 0.0;
-	}
-
-	return dcomp_present_swap(target);
+	w->work_cv.notify_one();
+	return XRT_SUCCESS;
 }
 
 static xrt_result_t
@@ -4911,6 +5077,10 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 		// flushes the writer caches before D3D11 reads the shared resource.
 		target->dcomp_ring_idx = (target->dcomp_ring_idx + 1) % DCOMP_RING;
 		target->current_index = target->dcomp_ring_idx;
+		if (target->dcomp_readback) {
+			// #2708: an earlier readback copy may still read this image.
+			dcomp_rb_wait_image(target, target->current_index);
+		}
 		*out_index = target->current_index;
 		return XRT_SUCCESS;
 	}
@@ -5834,17 +6004,6 @@ comp_vk_native_target_presents_alpha(struct comp_vk_native_target *target)
 #endif
 }
 
-bool
-comp_vk_native_target_is_readback(struct comp_vk_native_target *target)
-{
-#ifdef XRT_OS_WINDOWS
-	return target != NULL && target->dcomp_active && target->dcomp_readback;
-#else
-	(void)target;
-	return false;
-#endif
-}
-
 xrt_result_t
 comp_vk_native_target_resize(struct comp_vk_native_target *target,
                                uint32_t width,
@@ -5891,8 +6050,14 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 		// transparent for the entire drag. ResizeBuffers preserves the binding.
 
 		// 1. Release only the size-bound ring (VkImages/views/memory + shared D3D11,
-		// or the #2708 readback route's VK-owned images + host buffers).
+		// or the #2708 readback route's VK-owned images + host buffers). The
+		// readback route's worker presents what is queued first; it owns the
+		// swapchain and the D3D11 context until it is idle.
+		dcomp_rb_drain(target);
 		dcomp_release_ring(target);
+		for (uint32_t i = 0; i < DCOMP_RING; i++) {
+			target->rb_img_valid[i] = false;
+		}
 
 		// 2. Resize the composition swapchain in place. The swapchain object (and
 		// the visual->SetContent binding to it) survives ResizeBuffers; no back
