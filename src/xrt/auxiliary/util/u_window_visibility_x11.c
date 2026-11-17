@@ -56,9 +56,9 @@
  *
  * - Without an EWMH window manager there is no stacking list: only signals 1-3.
  * - Under XWayland, native Wayland windows are not X windows: they never
- *   occlude an X11 window here. A pure Wayland app is not tracked at all (a
- *   Wayland client cannot learn the global stacking order, by design; an
- *   app-owned xdg_toplevel's `suspended` state reaches only the app).
+ *   occlude an X11 window here. A pure Wayland app is not this backend's: a
+ *   Wayland client cannot learn the global stacking order, by design, so on
+ *   GNOME it is read from the shell (u_window_visibility_wayland.c, #2689).
  * - Shaped (non-rectangular) and input-only overlays count as their bounding
  *   rect when they have no opacity hint.
  */
@@ -390,7 +390,7 @@ enum wvx_occ_req
 	R_OCC_COUNT,
 };
 
-struct u_wv_backend
+struct u_wv_x11
 {
 	struct wvx_fns f;
 	wvx_conn *conn;
@@ -437,7 +437,7 @@ wvx_discard_error(wvx_generic_error *e)
 
 //! Collect a property reply; NULL on error / absence. Caller frees.
 static wvx_get_property_reply *
-wvx_prop_reply(struct u_wv_backend *b, wvx_cookie c)
+wvx_prop_reply(struct u_wv_x11 *b, wvx_cookie c)
 {
 	wvx_generic_error *e = NULL;
 	wvx_get_property_reply *r = b->f.get_property_reply(b->conn, c, &e);
@@ -451,7 +451,7 @@ wvx_prop_reply(struct u_wv_backend *b, wvx_cookie c)
 
 //! The @p i-th 32-bit item of a format-32 property, false when out of range.
 static bool
-wvx_prop_u32(struct u_wv_backend *b, const wvx_get_property_reply *r, uint32_t i, uint32_t *out)
+wvx_prop_u32(struct u_wv_x11 *b, const wvx_get_property_reply *r, uint32_t i, uint32_t *out)
 {
 	if (r == NULL || r->format != 32) {
 		return false;
@@ -466,7 +466,7 @@ wvx_prop_u32(struct u_wv_backend *b, const wvx_get_property_reply *r, uint32_t i
 }
 
 static uint32_t
-wvx_prop_count32(struct u_wv_backend *b, const wvx_get_property_reply *r)
+wvx_prop_count32(struct u_wv_x11 *b, const wvx_get_property_reply *r)
 {
 	if (r == NULL || r->format != 32) {
 		return 0;
@@ -476,7 +476,7 @@ wvx_prop_count32(struct u_wv_backend *b, const wvx_get_property_reply *r)
 }
 
 static bool
-wvx_prop_has_atom(struct u_wv_backend *b, const wvx_get_property_reply *r, wvx_atom a)
+wvx_prop_has_atom(struct u_wv_x11 *b, const wvx_get_property_reply *r, wvx_atom a)
 {
 	if (a == 0) {
 		return false;
@@ -492,14 +492,14 @@ wvx_prop_has_atom(struct u_wv_backend *b, const wvx_get_property_reply *r, wvx_a
 }
 
 static wvx_cookie
-wvx_get_prop(struct u_wv_backend *b, wvx_window w, enum wvx_atom_id a, wvx_atom type, uint32_t len32)
+wvx_get_prop(struct u_wv_x11 *b, wvx_window w, enum wvx_atom_id a, wvx_atom type, uint32_t len32)
 {
 	return b->f.get_property(b->conn, 0, w, b->atoms[a], type, 0, len32);
 }
 
 //! Select the events that should wake the tracker on @p w (0 mask = none).
 static void
-wvx_select(struct u_wv_backend *b, wvx_window w, uint32_t mask)
+wvx_select(struct u_wv_x11 *b, wvx_window w, uint32_t mask)
 {
 	if (w == 0) {
 		return;
@@ -514,7 +514,7 @@ wvx_select(struct u_wv_backend *b, wvx_window w, uint32_t mask)
  * manages; failing that, the root's child that contains the target.
  */
 static bool
-wvx_resolve_toplevel(struct u_wv_backend *b)
+wvx_resolve_toplevel(struct u_wv_x11 *b)
 {
 	wvx_window w = b->target;
 	wvx_window managed = 0;
@@ -565,7 +565,7 @@ wvx_resolve_toplevel(struct u_wv_backend *b)
 
 //! The 3D screen's rect in root coordinates, by RandR monitor name. False when unknown.
 static bool
-wvx_panel_rect(struct u_wv_backend *b, const char *panel, struct u_wv_rect *out)
+wvx_panel_rect(struct u_wv_x11 *b, const char *panel, struct u_wv_rect *out)
 {
 	if (panel == NULL || panel[0] == '\0') {
 		return false;
@@ -623,7 +623,7 @@ wvx_process_name(uint32_t pid, char *out, size_t out_size)
  * @p t completely. @p out_any says whether any occluder touched it at all.
  */
 static bool
-wvx_covered(struct u_wv_backend *b,
+wvx_covered(struct u_wv_x11 *b,
             const struct u_wv_rect *t,
             const uint32_t *stack,
             uint32_t stack_count,
@@ -790,10 +790,10 @@ wvx_covered(struct u_wv_backend *b,
  *
  */
 
-struct u_wv_backend *
-u_wv_backend_create(void)
+struct u_wv_x11 *
+u_wv_x11_create(void)
 {
-	struct u_wv_backend *b = (struct u_wv_backend *)calloc(1, sizeof(*b));
+	struct u_wv_x11 *b = (struct u_wv_x11 *)calloc(1, sizeof(*b));
 	if (b == NULL) {
 		return NULL;
 	}
@@ -831,7 +831,7 @@ u_wv_backend_create(void)
 }
 
 void
-u_wv_backend_set_target(struct u_wv_backend *b, void *native_window)
+u_wv_x11_set_target(struct u_wv_x11 *b, void *native_window)
 {
 	const wvx_window w = (wvx_window)(uintptr_t)native_window;
 	if (b->target != 0) {
@@ -855,7 +855,7 @@ u_wv_backend_set_target(struct u_wv_backend *b, void *native_window)
 }
 
 bool
-u_wv_backend_check(struct u_wv_backend *b, const char *panel, const char **out_reason)
+u_wv_x11_check(struct u_wv_x11 *b, const char *panel, const char **out_reason)
 {
 	*out_reason = "uncovered";
 	if (b->target == 0) {
@@ -976,13 +976,13 @@ u_wv_backend_check(struct u_wv_backend *b, const char *panel, const char **out_r
 }
 
 int
-u_wv_backend_fd(struct u_wv_backend *b)
+u_wv_x11_fd(struct u_wv_x11 *b)
 {
 	return b->f.get_file_descriptor(b->conn);
 }
 
 void
-u_wv_backend_drain(struct u_wv_backend *b)
+u_wv_x11_drain(struct u_wv_x11 *b)
 {
 	wvx_generic_event *ev;
 	while ((ev = b->f.poll_for_event(b->conn)) != NULL) {
@@ -1009,7 +1009,7 @@ u_wv_backend_drain(struct u_wv_backend *b)
 }
 
 void
-u_wv_backend_destroy(struct u_wv_backend *b)
+u_wv_x11_destroy(struct u_wv_x11 *b)
 {
 	if (b == NULL) {
 		return;

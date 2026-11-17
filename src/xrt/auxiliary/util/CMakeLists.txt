@@ -282,8 +282,16 @@ if(XRT_HAVE_LINUX AND NOT ANDROID)
 	# The lens visibility policy's X11 tracker (#2671); libxcb is dlopen'd.
 	target_sources(
 		aux_util PRIVATE u_window_visibility_posix.c u_window_visibility_posix.h
-				 u_window_visibility_x11.c
+				 u_window_visibility_x11.c u_window_visibility_linux.c
 		)
+	# Its native-Wayland source (#2689): the GNOME Shell extension's window
+	# snapshot over the session bus. The runtime already links libdbus-1 (the
+	# #817 geometry provider); without it Wayland windows stay untracked.
+	if(XRT_HAVE_DBUS)
+		target_sources(aux_util PRIVATE u_window_visibility_wayland.c)
+		target_include_directories(aux_util SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
+		target_link_libraries(aux_util PRIVATE ${DBUS_LIBRARIES})
+	endif()
 endif()
 
 # Is basically used everywhere, unavoidable.

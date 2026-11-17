@@ -9,6 +9,7 @@
  */
 
 #include "util/u_window_visibility.h"
+#include "util/u_json.h"
 #include "xrt/xrt_config_os.h"
 #include "util/u_debug.h"
 #include "util/u_logging.h"
@@ -17,6 +18,104 @@
 
 #include <ctype.h>
 #include <string.h>
+
+/*
+ *
+ * GNOME Shell's window snapshot (#2689).
+ *
+ */
+
+//! The transition-line wording of one extension `hidden` reason.
+static const char *
+wv_wl_reason(const char *hidden)
+{
+	if (strcmp(hidden, "minimized") == 0) {
+		return "minimized";
+	}
+	if (strcmp(hidden, "workspace") == 0) {
+		return "on another workspace";
+	}
+	if (strcmp(hidden, "locked") == 0) {
+		return "screen locked";
+	}
+	if (strcmp(hidden, "covered") == 0) {
+		return "fully covered";
+	}
+	// Additive within the schema: a reason added later still means hidden.
+	return "hidden by the shell";
+}
+
+enum u_wv_wl_state
+u_wv_wl_parse_snapshot(const char *json, int32_t pid, const char **out_reason)
+{
+	const char *reason_dummy = NULL;
+	const char **reason = out_reason != NULL ? out_reason : &reason_dummy;
+	*reason = "uncovered";
+	if (json == NULL) {
+		return U_WV_WL_UNKNOWN;
+	}
+
+	cJSON *root = cJSON_Parse(json);
+	if (root == NULL) {
+		return U_WV_WL_UNKNOWN;
+	}
+	// Same gate as the geometry consumer: additive within version 1, a newer
+	// schema changed the meaning of something and is not read.
+	int version = 0;
+	if (!u_json_get_int(u_json_get(root, "version"), &version)) {
+		version = 1;
+	}
+	const cJSON *windows = u_json_get(root, "windows");
+	if (version > 1 || !cJSON_IsArray(windows)) {
+		cJSON_Delete(root);
+		return U_WV_WL_UNKNOWN;
+	}
+
+	// The pick of comp_vk_native_wl_geom_get_window_rect: this pid, a
+	// non-empty frame, focused first, else the largest frame.
+	const cJSON *best = NULL;
+	bool best_focus = false;
+	int64_t best_area = 0;
+	const cJSON *win = NULL;
+	cJSON_ArrayForEach(win, windows)
+	{
+		int wpid = 0;
+		if (!u_json_get_int(u_json_get(win, "pid"), &wpid) || wpid <= 0 || wpid != pid) {
+			continue;
+		}
+		const cJSON *frame = u_json_get(win, "frame");
+		if (!cJSON_IsArray(frame) || cJSON_GetArraySize(frame) != 4) {
+			continue;
+		}
+		const int64_t w = (int64_t)cJSON_GetArrayItem(frame, 2)->valuedouble;
+		const int64_t h = (int64_t)cJSON_GetArrayItem(frame, 3)->valuedouble;
+		if (w <= 0 || h <= 0) {
+			continue;
+		}
+		bool focus = false;
+		u_json_get_bool(u_json_get(win, "focus"), &focus);
+		if (best == NULL || (focus && !best_focus) || (focus == best_focus && w * h > best_area)) {
+			best = win;
+			best_focus = focus;
+			best_area = w * h;
+		}
+	}
+
+	enum u_wv_wl_state st = U_WV_WL_NO_WINDOW;
+	if (best != NULL) {
+		const cJSON *hidden = u_json_get(best, "hidden");
+		if (!cJSON_IsString(hidden) || hidden->valuestring == NULL) {
+			st = U_WV_WL_NO_FIELD;
+		} else if (hidden->valuestring[0] == '\0') {
+			st = U_WV_WL_VISIBLE;
+		} else {
+			st = U_WV_WL_HIDDEN;
+			*reason = wv_wl_reason(hidden->valuestring);
+		}
+	}
+	cJSON_Delete(root);
+	return st;
+}
 
 /*
  *
@@ -473,4 +572,23 @@ u_window_visibility_destroy(struct u_window_visibility **wv_ptr)
 	}
 }
 
+#endif
+
+// #2689: only the POSIX tracker has a Wayland source; everywhere else there is
+// no native Wayland window to track.
+#if !defined(XRT_OS_LINUX_DESKTOP) && !defined(XRT_OS_MACOS)
+struct u_window_visibility *
+u_window_visibility_create_wayland(void *wl_surface,
+                                   const char *panel_device_name,
+                                   const char *who,
+                                   u_window_visibility_change_fn on_change,
+                                   void *userdata)
+{
+	(void)wl_surface;
+	(void)panel_device_name;
+	(void)who;
+	(void)on_change;
+	(void)userdata;
+	return NULL;
+}
 #endif
