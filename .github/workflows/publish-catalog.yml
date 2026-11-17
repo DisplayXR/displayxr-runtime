@@ -1,0 +1,132 @@
+name: Publish component catalog
+
+# Builds, signs and publishes the DisplayXR component catalog (#2703, epic #2702):
+#   https://updates.displayxr.org/catalog/v1/stable.json (+ .sig)
+# the signed index dxr-get reads to fetch the runtime / Leia plug-in / browser
+# on demand. Spec: docs/specs/runtime/component-catalog.md.
+#
+# Where it lands. updates.displayxr.org is GitHub Pages for DisplayXR/displayxr-browser,
+# deployed by that repo's pages.yml, which publishes the `feed/` directory as the
+# site root (feed/feed.json -> /feed.json). So the catalog is committed to
+# `feed/catalog/v1/` there. The commit deliberately does NOT carry [skip ci]: the
+# Pages deploy is a push-triggered workflow in that repo, and [skip ci] would
+# suppress it, leaving the committed catalog unpublished.
+#
+# Triggers:
+#   - push to main touching versions.json (a pin edited by hand in a PR);
+#   - workflow_run after "Bump versions.json" — sibling bumps commit with [skip ci],
+#     which creates no push run, so the push trigger alone would miss them;
+#   - weekly schedule — re-signs before the 30-day expiry and picks up a signed
+#     asset that replaced an unsigned CI one after the bump;
+#   - workflow_dispatch.
+#
+# A pin whose asset is not (yet) Authenticode-signed by an allowed signer is not
+# listed; the generator then carries forward the previously published, verified
+# windows block for that component (--previous), so a release in mid-signing never
+# makes a component unfetchable.
+#
+# Windows runner: the Authenticode check is Get-AuthenticodeSignature.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - versions.json
+      - scripts/gen_catalog.py
+      - .github/workflows/publish-catalog.yml
+  workflow_run:
+    workflows: ["Bump versions.json"]
+    types: [completed]
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays 06:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never cancel mid-publish; queue. A later run regenerates from current main anyway.
+  group: publish-catalog
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'DisplayXR/displayxr-runtime' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Mint App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          # displayxr-browser: the Pages repo written to.
+          # displayxr-browser-pvt: read-only use — the browser installer's declared
+          # MIN_RUNTIME_VERSION (requires.runtime) lives in the private source repo.
+          repositories: |
+            displayxr-browser
+            displayxr-browser-pvt
+
+      - name: Checkout main
+        uses: actions/checkout@v5
+        with:
+          # Current tip, so concurrent runs converge on the same pins.
+          ref: main
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install cryptography
+        run: python -m pip install --quiet cryptography
+
+      - name: Generate + sign catalog
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DXR_CATALOG_ED25519_KEY: ${{ secrets.DXR_CATALOG_ED25519_KEY }}
+        run: |
+          python scripts/gen_catalog.py generate \
+            --out out \
+            --download-dir "$RUNNER_TEMP/catalog-dl" \
+            --previous https://updates.displayxr.org/catalog/v1/stable.json
+
+      - name: Verify signature
+        run: |
+          python scripts/gen_catalog.py verify out/stable.json
+          echo '### Catalog' >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          python -c "import json;c=json.load(open('out/stable.json'));print(json.dumps({k:{'recommended':v['recommended'],'windows':v.get('windows',{}).get('version'),'requires':v.get('requires')} for k,v in c['components'].items()},indent=1))" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit to displayxr-browser (Pages)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse --short=9 HEAD)
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/DisplayXR/displayxr-browser.git" pages
+          mkdir -p pages/feed/catalog/v1
+          cp out/stable.json out/stable.json.sig pages/feed/catalog/v1/
+          cd pages
+          # Byte-exact: the signature covers these bytes, so no EOL conversion.
+          git config core.autocrlf false
+          git config user.name  "displayxr-publish-bot[bot]"
+          git config user.email "displayxr-publish-bot@users.noreply.github.com"
+          git add feed/catalog/v1/stable.json feed/catalog/v1/stable.json.sig
+          if git diff --cached --quiet; then
+            echo "catalog unchanged"; exit 0
+          fi
+          git commit -m "chore(catalog): publish component catalog from displayxr-runtime@${SHA}" \
+                     -m "Generated by displayxr-runtime publish-catalog.yml (${GITHUB_EVENT_NAME}). Spec: displayxr-runtime/docs/specs/runtime/component-catalog.md."
+          for i in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            git pull --rebase origin main
+          done
+          exit 1
