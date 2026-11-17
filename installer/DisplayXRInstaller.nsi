@@ -875,6 +875,8 @@ FunctionEnd
 
 ; #2075: times the client-DLL write has been retried after losing a race.
 Var DxrDllWriteTries
+Var DxrPrevRuntimeVersion
+Var DxrClaimActiveRuntime
 
 ; Poll ClientDllWritable until the DLL is free or ~30 s pass.
 ; $R0 = "1" free, "0" still held. Short steps on purpose: a respawned
@@ -906,6 +908,11 @@ Section "DisplayXR Runtime" SecRuntime
 	; HKLM\Software\WOW6432Node\DisplayXR\*, breaking the contract with the
 	; 64-bit service which reads via KEY_WOW64_64KEY).
 	SetRegView 64
+
+	; #2704: remember whether this is an upgrade BEFORE anything below
+	; rewrites the Version value -- the ActiveRuntime rule further down
+	; depends on it.
+	ReadRegStr $DxrPrevRuntimeVersion HKLM "Software\DisplayXR\Runtime" "Version"
 
 	SetOutPath "$INSTDIR"
 
@@ -1080,6 +1087,9 @@ client_dll_ok:
 	; self-contained single-file exe. /nonfatal: a build without the .NET SDK
 	; has no dashboard, and the installer still builds.
 	File /nonfatal "${BIN_DIR}\displayxr-cli.exe"
+	; #2704: dxr-get fetches/verifies/installs components from the signed catalog
+	; (docs/specs/runtime/dxr-get.md). Standalone; nothing in the runtime loads it.
+	File /nonfatal "${BIN_DIR}\dxr-get.exe"
 	File /nonfatal "${BIN_DIR}\displayxr-dashboard.exe"
 
 	; Sweep a STRAY vulkan-1.dll left by any pre-#105 install (#1229).
@@ -1335,35 +1345,80 @@ client_dll_ok:
 	${EndIf}
 	DetailPrint "Conversion model store: $R2"
 
-	; Set as active OpenXR runtime (still in 64-bit view from section-start
-	; SetRegView; explicit no-op kept for clarity).
-	WriteRegStr HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime" "$INSTDIR\DisplayXR_win64.json"
+	; #2704 ActiveRuntime rule. A fresh install claims ActiveRuntime, as
+	; always. An UPGRADE does not take it back from another runtime the user
+	; deliberately activated: component installers can now chain this one
+	; silently through dxr-get (e.g. the DisplayXR Browser installing a missing
+	; or old runtime), and silently flipping a user's SteamVR/Oculus selection
+	; is the land-grab the "re-assert at install time only" rule avoids.
+	;   /KEEPACTIVERUNTIME   never write it
+	;   /FORCEACTIVERUNTIME  always write it (the bundle's explicit repair)
+	; A value that is ours (any path containing \DisplayXR\), empty, or that
+	; names a manifest that no longer exists is always (re)claimed.
+	StrCpy $DxrClaimActiveRuntime 1
+	${GetParameters} $R0
+	ClearErrors
+	${GetOptions} $R0 "/KEEPACTIVERUNTIME" $R1
+	${IfNot} ${Errors}
+		StrCpy $DxrClaimActiveRuntime 0
+		DetailPrint "ActiveRuntime left unchanged (/KEEPACTIVERUNTIME)."
+	${Else}
+		ClearErrors
+		${GetOptions} $R0 "/FORCEACTIVERUNTIME" $R1
+		${If} ${Errors}
+		${AndIf} $DxrPrevRuntimeVersion != ""
+			ReadRegStr $R2 HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime"
+			${If} $R2 != ""
+			${AndIf} ${FileExists} "$R2"
+				Push "$R2"
+				Push "\DisplayXR\"
+				Call StrStr
+				Pop $R3
+				${If} $R3 == ""
+					StrCpy $DxrClaimActiveRuntime 0
+					DetailPrint "ActiveRuntime points at another runtime ($R2); this upgrade leaves it. Switch back with: displayxr-cli runtime activate"
+				${EndIf}
+			${EndIf}
+		${EndIf}
+	${EndIf}
 
-	; Advertise ourselves in AvailableRuntimes so OTHER vendors' runtime
-	; switchers can list and select DisplayXR. Writing only ActiveRuntime
-	; makes us the active runtime but leaves us invisible to every tool that
-	; enumerates this key, so a user who switched away had no supported way
-	; back except re-running this installer.
-	WriteRegDWORD HKLM "Software\Khronos\OpenXR\1\AvailableRuntimes" "$INSTDIR\DisplayXR_win64.json" 0
+	${If} $DxrClaimActiveRuntime == 1
+		; Set as active OpenXR runtime (still in 64-bit view from section-start
+		; SetRegView; explicit no-op kept for clarity).
+		WriteRegStr HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime" "$INSTDIR\DisplayXR_win64.json"
 
-	; ...and in the 32-bit view, which 32-bit OpenXR apps read INSTEAD of the
-	; one above. Writing only the 64-bit view leaves a box where 64-bit apps
-	; use one runtime and 32-bit apps use whatever last wrote WOW6432Node —
-	; observed in the field as a machine whose 32-bit value still pointed at a
-	; runtime uninstalled months earlier.
-	SetRegView 32
-	WriteRegStr HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime" "$INSTDIR\DisplayXR_win64.json"
-	WriteRegDWORD HKLM "Software\Khronos\OpenXR\1\AvailableRuntimes" "$INSTDIR\DisplayXR_win64.json" 0
-	SetRegView 64
+		; Advertise ourselves in AvailableRuntimes so OTHER vendors' runtime
+		; switchers can list and select DisplayXR. Writing only ActiveRuntime
+		; makes us the active runtime but leaves us invisible to every tool that
+		; enumerates this key, so a user who switched away had no supported way
+		; back except re-running this installer.
+		WriteRegDWORD HKLM "Software\Khronos\OpenXR\1\AvailableRuntimes" "$INSTDIR\DisplayXR_win64.json" 0
 
-	; A per-user ActiveRuntime silently outranks everything written above, so
-	; a stale HKCU value would make this whole section a no-op from the app's
-	; point of view. Drop it; per-user selection is not something any
-	; DisplayXR component sets.
-	DeleteRegValue HKCU "Software\Khronos\OpenXR\1" "ActiveRuntime"
-	SetRegView 32
-	DeleteRegValue HKCU "Software\Khronos\OpenXR\1" "ActiveRuntime"
-	SetRegView 64
+		; ...and in the 32-bit view, which 32-bit OpenXR apps read INSTEAD of the
+		; one above. Writing only the 64-bit view leaves a box where 64-bit apps
+		; use one runtime and 32-bit apps use whatever last wrote WOW6432Node —
+		; observed in the field as a machine whose 32-bit value still pointed at a
+		; runtime uninstalled months earlier.
+		SetRegView 32
+		WriteRegStr HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime" "$INSTDIR\DisplayXR_win64.json"
+		WriteRegDWORD HKLM "Software\Khronos\OpenXR\1\AvailableRuntimes" "$INSTDIR\DisplayXR_win64.json" 0
+		SetRegView 64
+
+		; A per-user ActiveRuntime silently outranks everything written above, so
+		; a stale HKCU value would make this whole section a no-op from the app's
+		; point of view. Drop it; per-user selection is not something any
+		; DisplayXR component sets.
+		DeleteRegValue HKCU "Software\Khronos\OpenXR\1" "ActiveRuntime"
+		SetRegView 32
+		DeleteRegValue HKCU "Software\Khronos\OpenXR\1" "ActiveRuntime"
+		SetRegView 64
+	${Else}
+		; Still advertise ourselves so other runtimes' switchers can list DisplayXR.
+		WriteRegDWORD HKLM "Software\Khronos\OpenXR\1\AvailableRuntimes" "$INSTDIR\DisplayXR_win64.json" 0
+		SetRegView 32
+		WriteRegDWORD HKLM "Software\Khronos\OpenXR\1\AvailableRuntimes" "$INSTDIR\DisplayXR_win64.json" 0
+		SetRegView 64
+	${EndIf}
 
 	; PATH is intentionally not modified. DisplayXRClient.dll's third-party
 	; transitive deps that previously *required* $INSTDIR on PATH are gone:
@@ -1771,6 +1826,7 @@ Section "Uninstall"
 	; Retired in #1180; kept so uninstalling an older install still cleans it.
 	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
 	Delete "$INSTDIR\displayxr-cli.exe"
+	Delete "$INSTDIR\dxr-get.exe"
 	; Retired (superseded by the Dashboard); kept so uninstalling an older
 	; install still cleans it.
 	Delete "$INSTDIR\displayxr-control-panel.exe"
@@ -1899,4 +1955,4 @@ VIAddVersionKey "CompanyName" "DisplayXR"
 VIAddVersionKey "LegalCopyright" "Copyright (c) 2024-2026 DisplayXR"
 VIAddVersionKey "FileDescription" "DisplayXR OpenXR Runtime Installer"
 VIAddVersionKey "FileVersion" "${VERSION}"
-VIAddVersionKey "ProductVersion" "${VERSION_LABEL}"
+VIAddVersionKey "ProductVersion" "${VERSION_LABEL}"

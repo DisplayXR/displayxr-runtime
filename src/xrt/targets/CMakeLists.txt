@@ -59,6 +59,8 @@ endif()
 
 # DisplayXR Windows components
 if(WIN32)
+	add_subdirectory(get)
+
 	# (The standalone DisplayXRSwitcher was retired in #378 — its
 	# ActiveRuntime-switching function moved into `displayxr-cli runtime
 	# activate` and the DisplayXR Dashboard, src/dashboard/.)
