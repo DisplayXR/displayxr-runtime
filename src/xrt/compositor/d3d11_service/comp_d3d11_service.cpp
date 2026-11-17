@@ -21786,6 +21786,56 @@ service_proj_content_tile(const struct d3d11_service_system *sys,
 }
 
 /*!
+ * Multi-screen M3: is this projection layer painted as a routed mosaic, and on
+ * what tile (@p out_w x @p out_h, clamped to the atlas slot)?
+ *
+ * Decided per LAYER, not per placed view (#2698): a commit whose view blits
+ * are all skipped (a fence not yet signalled, `view_ineligible`) places no
+ * view, yet still publishes the layer's recipe. Deciding routed-ness from the
+ * views that were placed published that commit unrouted at view 0's slice —
+ * one frame the segment DP wove at half width.
+ */
+static bool
+service_proj_route_tile(const struct d3d11_service_system *sys,
+                        const struct d3d11_service_compositor *c,
+                        const struct comp_layer *layer,
+                        bool bridge_override,
+                        uint32_t active_vw,
+                        uint32_t active_vh,
+                        uint32_t packed_tiles,
+                        uint32_t *out_w,
+                        uint32_t *out_h)
+{
+	if (c->seg_route.count == 0 || packed_tiles == 0) {
+		return false;
+	}
+	uint32_t cols = sys->tile_columns > 0 ? sys->tile_columns : 1;
+	uint32_t rows = sys->tile_rows > 0 ? sys->tile_rows : 1;
+	uint32_t slot_w = sys->view_width;
+	uint32_t slot_h = sys->view_height;
+	if (c->render.atlas_texture) {
+		D3D11_TEXTURE2D_DESC atlas_desc = {};
+		c->render.atlas_texture->GetDesc(&atlas_desc);
+		slot_w = atlas_desc.Width / cols;
+		slot_h = atlas_desc.Height / rows;
+	}
+	uint32_t tw = 0, th = 0;
+	service_proj_content_tile(sys, c, layer, bridge_override, active_vw, active_vh, true, &tw, &th);
+	if (tw > slot_w) {
+		tw = slot_w; // the content clamp the commit applies after the loop
+	}
+	if (th > slot_h) {
+		th = slot_h;
+	}
+	if (!comp_segments_route_active(&c->seg_route, layer->data.view_count, packed_tiles, tw, th)) {
+		return false;
+	}
+	*out_w = tw;
+	*out_h = th;
+	return true;
+}
+
+/*!
  * Where ONE projection view's pixels come from, and where in the per-client
  * atlas they land.
  *
@@ -21917,16 +21967,10 @@ service_proj_view_blit_resolve(struct d3d11_service_system *sys,
 	 * commit, a degenerate rect) is dropped for the frame and the views are
 	 * placed unrouted.
 	 */
-	if (c->seg_route.count > 0 && packed_tiles > 0) {
+	{
 		uint32_t tw = 0, th = 0;
-		service_proj_content_tile(sys, c, layer, bridge_override, active_vw, active_vh, true, &tw, &th);
-		if (tw > layout_vw) {
-			tw = layout_vw; // the content clamp the commit applies after the loop
-		}
-		if (th > layout_vh) {
-			th = layout_vh;
-		}
-		if (comp_segments_route_active(&c->seg_route, layer->data.view_count, packed_tiles, tw, th)) {
+		if (service_proj_route_tile(sys, c, layer, bridge_override, active_vw, active_vh, packed_tiles, &tw,
+		                            &th)) {
 			struct comp_segments_route_slot slot;
 			if (!comp_segments_route_place(&c->seg_route, layer->data.view_count, packed_tiles, tw, th, eye,
 			                               &slot)) {
@@ -26715,8 +26759,18 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// the bridge's active per-view dims, else the submitted subImage
 		// extent — or, for a routed mosaic, the routed tile (#2698), so the
 		// segment crop reads the same layout the blits above painted.
-		service_proj_content_tile(sys, c, layer, bridge_override, active_vw, active_vh, c->seg_route_painting,
-		                          &content_view_w, &content_view_h);
+		{
+			uint32_t rtw = 0, rth = 0;
+			if (service_proj_route_tile(sys, c, layer, bridge_override, active_vw, active_vh,
+			                            packed_view_count, &rtw, &rth)) {
+				c->seg_route_painting = true; // #1883 + #2698: even if every blit was skipped
+				content_view_w = rtw;
+				content_view_h = rth;
+			} else {
+				service_proj_content_tile(sys, c, layer, bridge_override, active_vw, active_vh, false,
+				                          &content_view_w, &content_view_h);
+			}
+		}
 		// Clamp to atlas slot dims (atlas_width / tile_columns). The blit
 		// above placed at most one slot of content per tile; without this
 		// clamp, multi_compositor_render reads past the slot boundary into
