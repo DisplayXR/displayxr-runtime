@@ -56,6 +56,8 @@
 #include "cursor_depth.h"    // dxr::CursorDepth — XR_DXR_cursor_depth bookkeeping (ADR-046)
 #include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
 #include "dxr_stylus.h"       // --stylus: the shared OpenXR half (ADR-034 Amendment 8)
+#include "tracking_loss_director.h" // T/L: MANUAL eye-tracking demo (director + status bar)
+#include "bar_label_font.h"          // the status bar's text label (5x7 bitmap font as rects)
 
 // ============================================================================
 // Logging
@@ -1155,6 +1157,121 @@ static void DrawCursorSprite(MetalRenderer &r, id<MTLRenderCommandEncoder> enc, 
     [enc setDepthStencilState:r.depthState];
 }
 
+// MANUAL eye-tracking demo (T: MANAGED <-> MANUAL, L: cycle the tracking-loss
+// preset): the shared director (test_apps/common/tracking_loss_director.h)
+// eases the rig's ipdFactor to 0 on face loss, and a zero-disparity status
+// bar + text label show the mode and phase. Same keys and log lines as
+// cube_handle_d3d11_win.
+static dxr_demo::TrackingLossDirector g_lossDirector;
+static bool g_lossPresetCycleRequested = false;
+
+//! What RenderScene draws as the status bar (set by the frame loop).
+struct StatusBar {
+    bool enabled = false;
+    float fraction = 1.0f; // bar length = depth factor
+    float rgb[3] = {};     // display-referred (the app renders through a UNORM view)
+    char label[64] = "";   // TrackingLossDirector::BarLabel, drawn under the bar
+};
+static StatusBar g_statusBar;
+
+/*!
+ * The status bar + its label for one view: the SAME pixel rects in every view
+ * (zero disparity, so they sit on the screen plane). Rects are drawn as
+ * NDC quads through the grid pipeline (solid colour) with depth off; pixel
+ * edges map to pixel edges, so the 5x7 glyphs stay exact.
+ */
+static void DrawStatusBar(MetalRenderer &r, id<MTLRenderCommandEncoder> enc, const EyeRenderParams &eye)
+{
+    if (!g_statusBar.enabled) {
+        return;
+    }
+    static id<MTLDepthStencilState> noDepth = nil;
+    if (noDepth == nil) {
+        MTLDepthStencilDescriptor *d = [[MTLDepthStencilDescriptor alloc] init];
+        d.depthCompareFunction = MTLCompareFunctionAlways;
+        d.depthWriteEnabled = NO;
+        noDepth = [r.device newDepthStencilStateWithDescriptor:d];
+    }
+    const int vx = (int)eye.viewportX, vy = (int)eye.viewportY;
+    const int vw = (int)eye.width, vh = (int)eye.height;
+    if (vw <= 0 || vh <= 0) {
+        return;
+    }
+    const int tileR = vx + vw, tileB = vy + vh;
+
+    std::vector<GridVertex> verts;
+    struct Batch { size_t first, count; float rgb[3]; };
+    Batch batches[3];
+    int nb = 0;
+    auto add = [&](int x, int y, int w, int h) {
+        if (x + w > tileR) w = tileR - x;
+        if (y + h > tileB) h = tileB - y;
+        if (w <= 0 || h <= 0) return;
+        // Pixel rect -> NDC of this view's viewport (Metal: y down in pixels, up in NDC).
+        const float x0 = (float)(x - vx) / vw * 2.0f - 1.0f, x1 = (float)(x + w - vx) / vw * 2.0f - 1.0f;
+        const float y0 = 1.0f - (float)(y - vy) / vh * 2.0f, y1 = 1.0f - (float)(y + h - vy) / vh * 2.0f;
+        const GridVertex q[6] = {{{x0, y0, 0}}, {{x1, y0, 0}}, {{x0, y1, 0}},
+                                 {{x1, y0, 0}}, {{x1, y1, 0}}, {{x0, y1, 0}}};
+        verts.insert(verts.end(), q, q + 6);
+    };
+    auto begin = [&](float cr, float cg, float cb) {
+        batches[nb] = {verts.size(), 0, {cr, cg, cb}};
+    };
+    auto end = [&]() {
+        batches[nb].count = verts.size() - batches[nb].first;
+        nb++;
+    };
+
+    // The bar: top-left of the view, 60% wide at full depth, 3% tall.
+    const int h = vh / 33 > 8 ? vh / 33 : 8;
+    int w = (int)(vw * 0.6f * g_statusBar.fraction);
+    if (w < h) w = h; // a square stub when flat, so the colour still reads
+    const int bx = vx + vw / 20, by = vy + vh / 20;
+    begin(g_statusBar.rgb[0], g_statusBar.rgb[1], g_statusBar.rgb[2]);
+    add(bx, by, w, h);
+    end();
+
+    // Its label, just under the bar: an opaque dark chip, then white text.
+    const char *label = g_statusBar.label;
+    const int lx = bx, ly = by + h + h / 3;
+    const int unit = dxr_demo::BarFontTextWidth(label, 1);
+    if (unit > 0 && lx < tileR && ly < tileB) {
+        int px = h / 9; // glyph = 7 font pixels, chip = 9: as tall as the bar
+        const int fit = (tileR - lx) / (unit + 4);
+        if (px > fit) px = fit;
+        if (px < 1) px = 1;
+        begin(0.06f, 0.06f, 0.06f);
+        add(lx, ly, dxr_demo::BarFontTextWidth(label, px) + 4 * px, 9 * px);
+        end();
+        begin(1.0f, 1.0f, 1.0f);
+        dxr_demo::BarFontText(label, lx + 2 * px, ly + px, px, add);
+        end();
+    }
+    if (verts.empty()) {
+        return;
+    }
+    id<MTLBuffer> vb = [r.device newBufferWithBytes:verts.data()
+                                             length:verts.size() * sizeof(GridVertex)
+                                            options:MTLResourceStorageModeShared];
+    static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    [enc setDepthStencilState:noDepth];
+    [enc setRenderPipelineState:r.gridPipeline];
+    [enc setVertexBuffer:vb offset:0 atIndex:0];
+    for (int i = 0; i < nb; i++) {
+        if (batches[i].count == 0) continue;
+        GridUniforms u;
+        memcpy(u.mvp, kIdentity, sizeof(u.mvp));
+        u.color[0] = batches[i].rgb[0];
+        u.color[1] = batches[i].rgb[1];
+        u.color[2] = batches[i].rgb[2];
+        u.color[3] = 1.0f;
+        [enc setVertexBytes:&u length:sizeof(u) atIndex:1];
+        [enc setFragmentBytes:&u length:sizeof(u) atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:batches[i].first vertexCount:batches[i].count];
+    }
+    [enc setDepthStencilState:r.depthState];
+}
+
 // depthTarget: nil renders into the app's private depth texture (the
 // default). Non-nil is the XR_KHR_composition_layer_depth swapchain image the
 // app submits (DISPLAYXR_CURSOR_DEPTH_SOURCE=layer), so its depth is STORED.
@@ -1370,6 +1487,9 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
         if (g_cursorDraw.active) {
             DrawCursorSprite(r, enc, vp_mat);
         }
+
+        // --- MANUAL demo status bar + label (zero disparity) ---
+        DrawStatusBar(r, enc, eye);
     }
 
     [enc endEncoding];
@@ -1419,6 +1539,7 @@ struct InputState {
     // runtime's full post-compose atlas use the trigger file
     // $TMPDIR/displayxr_atlas_trigger (see issue #210).
     bool captureAtlasRequested = false;
+    bool eyeTrackingModeToggleRequested = false; // T: MANAGED <-> MANUAL
 };
 // Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
 // against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
@@ -1804,6 +1925,12 @@ static void PumpMacOSEvents()
                     else if ((ch == 'i' || ch == 'I') && !isRepeat) {
                         g_input.captureAtlasRequested = true;
                     }
+                    else if (ch == 't' && !isRepeat) {
+                        g_input.eyeTrackingModeToggleRequested = true;
+                    }
+                    else if (ch == 'l' && !isRepeat) {
+                        g_lossPresetCycleRequested = true;
+                    }
                     else if (ch == 'c' && !isRepeat) {
                         // Disturbance-free rig round-trip — the conversion runs
                         // in UpdateCameraMovement (it has the canvas size).
@@ -1998,7 +2125,10 @@ struct AppXrSession {
     // Eye tracking
     float eyePositions[8][3] = {};  // [view][x,y,z] — raw per-eye positions in display space
     uint32_t eyeCount = 0;          // Number of valid eye positions
-    bool isEyeTracking;
+    bool isEyeTracking = true;
+    uint32_t supportedEyeTrackingModes = 0;
+    uint32_t activeEyeTrackingMode = 0; // XrEyeTrackingModeDXR, from the per-frame chain
+    PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingModeEXT = nullptr;
 
     char systemName[XR_MAX_SYSTEM_NAME_SIZE];
 };
@@ -2202,9 +2332,12 @@ static bool InitializeOpenXR(AppXrSession &app)
         // 3D panel instead of the primary monitor (spec v16, #715).
         XrDisplayDesktopPositionDXR desktopPos = {};
         desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
+        XrEyeTrackingModeCapabilitiesDXR eyeCaps = {};
+        eyeCaps.type = (XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR;
         if (app.hasDisplayInfoExt) {
             sysProps.next = &displayInfo;
-            displayInfo.next = &desktopPos;
+            displayInfo.next = &eyeCaps;
+            eyeCaps.next = &desktopPos;
         }
         if (XR_SUCCEEDED(xrGetSystemProperties(app.instance, app.systemId, &sysProps))) {
             memcpy(app.systemName, sysProps.systemName, sizeof(app.systemName));
@@ -2221,6 +2354,9 @@ static bool InitializeOpenXR(AppXrSession &app)
                 app.recommendedViewScaleY = displayInfo.recommendedViewScaleY;
                 app.displayScreenLeft = desktopPos.left;
                 app.displayScreenTop = desktopPos.top;
+                app.supportedEyeTrackingModes = (uint32_t)eyeCaps.supportedModes;
+                LOG_INFO("Eye tracking: supported=0x%x, default=%u", app.supportedEyeTrackingModes,
+                         (uint32_t)eyeCaps.defaultMode);
                 LOG_INFO("Display desktop position: (%d, %d)", app.displayScreenLeft, app.displayScreenTop);
                 LOG_INFO("Display pixels: %ux%u", app.displayPixelWidth, app.displayPixelHeight);
                 LOG_INFO("Display info: %.3fx%.3f m, scale=%.2fx%.2f, nominal=(%.3f,%.3f,%.3f)",
@@ -2237,6 +2373,10 @@ static bool InitializeOpenXR(AppXrSession &app)
                 (PFN_xrVoidFunction*)&app.pfnRequestDisplayRenderingModeEXT);
             xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesDXR",
                 (PFN_xrVoidFunction*)&app.pfnEnumerateDisplayRenderingModesEXT);
+            if (app.supportedEyeTrackingModes != 0) {
+                xrGetInstanceProcAddr(app.instance, "xrRequestEyeTrackingModeDXR",
+                    (PFN_xrVoidFunction*)&app.pfnRequestEyeTrackingModeEXT);
+            }
         }
         if (app.hasAtlasCaptureExt) {
             xrGetInstanceProcAddr(app.instance, "xrCaptureAtlasDXR",
@@ -3503,6 +3643,41 @@ int main(int argc, char **argv)
         PumpMacOSEvents();
         PollEvents(app);
 
+        // T: flip the session's eye-tracking preference MANAGED <-> MANUAL.
+        if (g_input.eyeTrackingModeToggleRequested) {
+            g_input.eyeTrackingModeToggleRequested = false;
+            if (app.pfnRequestEyeTrackingModeEXT != nullptr && app.session != XR_NULL_HANDLE) {
+                const XrEyeTrackingModeDXR newMode = app.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR
+                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
+                const XrResult etResult = app.pfnRequestEyeTrackingModeEXT(app.session, newMode);
+                LOG_INFO("Eye tracking mode -> %s (%s)",
+                    newMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
+                    XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
+            } else {
+                LOG_INFO("Eye tracking mode key ignored: xrRequestEyeTrackingModeDXR unavailable");
+            }
+        }
+
+        // MANUAL eye-tracking demo: the app's own tracker-loss transition (the
+        // display does nothing in MANUAL). Its depth factor multiplies the
+        // rig's ipdFactor below; LENS_2D also asks for the lens. Fed last
+        // frame's per-frame tracking state.
+        {
+            const bool manualEt = app.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANUAL_DXR;
+            dxr_demo::TrackingLossStep(
+                g_lossDirector, dt, manualEt, app.isEyeTracking, &g_lossPresetCycleRequested,
+                [](const char *line) { LOG_INFO("%s", line); },
+                [&app](int lens) {
+                    return app.pfnRequestDisplayModeEXT != nullptr && app.session != XR_NULL_HANDLE &&
+                           XR_SUCCEEDED(app.pfnRequestDisplayModeEXT(
+                               app.session, lens ? XR_DISPLAY_MODE_3D_DXR : XR_DISPLAY_MODE_2D_DXR));
+                });
+            g_statusBar.enabled = app.pfnRequestEyeTrackingModeEXT != nullptr;
+            g_statusBar.fraction = manualEt ? g_lossDirector.Ipd() : 1.0f;
+            g_lossDirector.BarColor(manualEt, g_statusBar.rgb);
+            g_lossDirector.BarLabel(manualEt, g_statusBar.label, sizeof(g_statusBar.label));
+        }
+
         // Rendering mode requests (V=cycle next, 0-8=jump absolute) go through
         // displayxr-common's dxr::ModeSwitch::step() — the same sequencer the
         // Windows apps drive via XrSessionUpdateModeSwitch: it eases
@@ -3695,7 +3870,7 @@ int main(int argc, char **argv)
             rigPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
             if (rigCamera) {
                 cameraRig.pose = rigPose;
-                cameraRig.ipdFactor = g_input.viewParams.ipdFactor;
+                cameraRig.ipdFactor = g_input.viewParams.ipdFactor * g_lossDirector.Ipd();
                 cameraRig.parallaxFactor = g_input.viewParams.parallaxFactor;
                 cameraRig.convergenceDiopters = g_input.viewParams.invConvergenceDistance;
                 cameraRig.verticalFov =
@@ -3709,7 +3884,7 @@ int main(int argc, char **argv)
                 displayRig.pose = rigPose;
                 displayRig.virtualDisplayHeight =
                     g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
-                displayRig.ipdFactor = g_input.viewParams.ipdFactor;
+                displayRig.ipdFactor = g_input.viewParams.ipdFactor * g_lossDirector.Ipd();
                 displayRig.parallaxFactor = g_input.viewParams.parallaxFactor;
                 displayRig.perspectiveFactor = g_input.viewParams.perspectiveFactor;
                 locateInfo.next = &displayRig;
@@ -3739,9 +3914,23 @@ int main(int argc, char **argv)
         viewActivity.next = &viewBindings;
         viewState.next = &viewActivity;
 
+        // Per-frame eye-tracking state (#441): isTracking + the ACTIVE mode,
+        // which the T toggle and the tracking-loss director read.
+        XrViewEyeTrackingStateDXR eyeTrackingState = {};
+        eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_DXR;
+        if (app.hasDisplayInfoExt) {
+            eyeTrackingState.next = viewState.next;
+            viewState.next = &eyeTrackingState;
+        }
+
         uint32_t viewCount = 0;
         const double tLocate0 = frameStats ? CFAbsoluteTimeGetCurrent() : 0.0;
-        xrLocateViews(app.session, &locateInfo, &viewState, (uint32_t)views.size(), &viewCount, views.data());
+        const XrResult locateResult =
+            xrLocateViews(app.session, &locateInfo, &viewState, (uint32_t)views.size(), &viewCount, views.data());
+        if (XR_SUCCEEDED(locateResult) && app.hasDisplayInfoExt) {
+            app.isEyeTracking = eyeTrackingState.isTracking == XR_TRUE;
+            app.activeEyeTrackingMode = (uint32_t)eyeTrackingState.activeMode;
+        }
         if (frameStats) {
             fstats.locate_ms += (CFAbsoluteTimeGetCurrent() - tLocate0) * 1e3;
         }
