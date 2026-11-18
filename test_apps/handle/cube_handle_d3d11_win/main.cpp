@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <string>
 #include <sstream>
@@ -618,6 +619,117 @@ static bool g_hwToggleRequested = false;
 // tracker-loss preset (converge / lens-2D / off); P is parallax here.
 static dxr_demo::TrackingLossDirector g_lossDirector;
 static bool g_lossPresetCycleRequested = false;
+
+// The status bar's text label (TrackingLossDirector::BarLabel), drawn just
+// under the bar at the SAME pixel rect in every view, so it reads sharp on the
+// screen plane. Rendered with the HUD's DirectWrite path (a private
+// HudRenderer: white Consolas on an opaque dark chip), read back once per
+// label CHANGE into a texture in the swapchain's format, then copied into each
+// view with CopySubresourceRegion — per frame that is one GPU copy per view.
+// The bytes are display-referred, so the raw copy is right for both UNORM and
+// _SRGB swapchains (the hud_renderer.h contract).
+struct BarLabelCache {
+    HudRenderer hud = {};
+    bool hudOk = false;
+    bool disabled = false;      // init failed or unsupported format: stop trying
+    uint32_t chipH = 0;         // chip height the renderer + texture were made for
+    uint32_t texW = 0;
+    DXGI_FORMAT texFormat = DXGI_FORMAT_UNKNOWN;
+    ComPtr<ID3D11Texture2D> tex; // the label, swapchain format, main device
+    std::string text;            // the label currently in tex
+    uint32_t textW = 0;          // its drawn width in pixels (<= texW)
+};
+static BarLabelCache g_barLabel;
+
+static void BarLabelCleanup()
+{
+    g_barLabel.tex.Reset();
+    if (g_barLabel.hudOk) CleanupHudRenderer(g_barLabel.hud);
+    g_barLabel.hudOk = false;
+}
+
+// Make g_barLabel.tex hold @p text, @p chipH pixels tall, in @p texFormat
+// (the swapchain texture's format; @p bgra = its byte order is B8G8R8A8).
+// A no-op when nothing changed. Returns false when there is no label to draw.
+static bool BarLabelUpdate(ID3D11Device* device, ID3D11DeviceContext* context, DXGI_FORMAT texFormat, bool bgra,
+                           uint32_t chipH, const char* text)
+{
+    BarLabelCache& L = g_barLabel;
+    if (L.disabled) return false;
+    chipH = chipH < 14 ? 14 : (chipH > 72 ? 72 : chipH);
+    const float fontPx = (float)chipH * 0.68f;
+    if (chipH != L.chipH || !L.hudOk) {
+        // Window or mode resize only: rebuild the renderer at the new font size.
+        BarLabelCleanup();
+        L.hud = HudRenderer{};
+        L.chipH = chipH;
+        L.texW = chipH * 20; // ~50 Consolas cells at 0.55 em; labels are <= 45
+        // InitializeHudRenderer sizes its normal font as 20 * base / 470 px.
+        L.hudOk = InitializeHudRenderer(L.hud, L.texW, chipH, (uint32_t)(fontPx * 470.0f / 20.0f + 0.5f));
+        if (!L.hudOk) {
+            LOG_WARN("Status bar label: HUD text renderer init failed, the bar stays unlabelled");
+            L.disabled = true;
+            return false;
+        }
+        L.text.clear();
+    }
+    if (L.tex && L.texFormat == texFormat && L.text == text) return true;
+
+    if (!L.tex || L.texFormat != texFormat) {
+        L.tex.Reset();
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = L.texW;
+        td.Height = chipH;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = texFormat;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT; // copy source only
+        if (FAILED(device->CreateTexture2D(&td, nullptr, &L.tex))) {
+            LOG_WARN("Status bar label: texture create failed (format %d), the bar stays unlabelled",
+                     (int)texFormat);
+            L.disabled = true;
+            return false;
+        }
+        L.texFormat = texFormat;
+    }
+
+    // Opaque dark chip + white text: readable whatever the bar colour, and
+    // opaque so the raw copy never punches alpha holes into the atlas.
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(L.hud.device->CreateRenderTargetView(L.hud.renderTex.Get(), nullptr, &rtv))) return false;
+    const float chip[4] = {0.06f, 0.06f, 0.07f, 1.0f};
+    L.hud.context->ClearRenderTargetView(rtv.Get(), chip);
+    const float pad = (float)chipH * 0.3f;
+    const float lineH = fontPx * 1.17f; // Consolas ascent + descent
+    std::wstring wtext(text, text + strlen(text)); // ASCII
+    RenderText(L.hud.overlay, L.hud.device.Get(), L.hud.renderTex.Get(), wtext, pad,
+               ((float)chipH - lineH) * 0.5f, (float)L.texW * 2.0f, (float)chipH, /*useSmallFont=*/false);
+    L.hud.context->CopyResource(L.hud.stagingTex.Get(), L.hud.renderTex.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(L.hud.context->Map(L.hud.stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+    if (bgra) {
+        std::vector<uint8_t> px((size_t)L.texW * chipH * 4);
+        for (uint32_t y = 0; y < chipH; y++) {
+            const uint8_t* s = (const uint8_t*)mapped.pData + (size_t)y * mapped.RowPitch;
+            uint8_t* d = px.data() + (size_t)y * L.texW * 4;
+            for (uint32_t x = 0; x < L.texW; x++, s += 4, d += 4) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = s[3];
+            }
+        }
+        context->UpdateSubresource(L.tex.Get(), 0, nullptr, px.data(), L.texW * 4, 0);
+    } else {
+        context->UpdateSubresource(L.tex.Get(), 0, nullptr, mapped.pData, mapped.RowPitch, 0);
+    }
+    L.hud.context->Unmap(L.hud.stagingTex.Get(), 0);
+    L.text = text;
+    const float w = 2.0f * pad + (float)strlen(text) * fontPx * 0.55f + 2.0f; // Consolas advance = 0.55 em
+    L.textW = w < (float)L.texW ? (uint32_t)w : L.texW;
+    return true;
+}
 static bool g_hwOverrideActive = false;
 static bool g_hwOverride3D = false;
 static uint32_t g_hwOverrideModeIndex = 0;
@@ -2435,6 +2547,31 @@ static void RenderOneFrame(RenderState& rs) {
                                     barCtx->ClearView(viewRtv, col, &bar, 1);
                                     barCtx->Release();
                                 }
+                                // Its text label, just under the bar: the same pixel
+                                // rect in every view too (zero disparity).
+                                const bool rgba = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                                                  rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                                const bool bgra = rd.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                                                  rd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+                                char label[64];
+                                g_lossDirector.BarLabel(manualEt, label, sizeof(label));
+                                D3D11_TEXTURE2D_DESC sd = {};
+                                swapchainTexture->GetDesc(&sd);
+                                if ((rgba || bgra) &&
+                                    BarLabelUpdate(renderer.device.Get(), renderer.context.Get(), sd.Format, bgra,
+                                                   (uint32_t)bh, label)) {
+                                    const LONG lx = bx, ly = by + bh + bh / 3;
+                                    const LONG vr = (LONG)vp.TopLeftX + vw, vb = (LONG)vp.TopLeftY + vh;
+                                    const LONG lw = std::min<LONG>((LONG)g_barLabel.textW, vr - lx);
+                                    const LONG lh = std::min<LONG>((LONG)g_barLabel.chipH, vb - ly);
+                                    if (lw > 0 && lh > 0) {
+                                        const D3D11_BOX box = {0, 0, 0, (UINT)lw, (UINT)lh, 1};
+                                        renderer.context->CopySubresourceRegion(
+                                            swapchainTexture,
+                                            arrayLayout ? D3D11CalcSubresource(0, (UINT)eye, 1) : 0,
+                                            (UINT)lx, (UINT)ly, 0, g_barLabel.tex.Get(), 0, &box);
+                                    }
+                                }
                             }
 
                             // #823 actions mode: draw a small marker cube at
@@ -3250,6 +3387,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     CleanupOpenXR(xr);
     if (hudOk) CleanupHudRenderer(hudRenderer);
+    BarLabelCleanup();
     CleanupD3D11(renderer);
 
     DestroyWindow(hwnd);

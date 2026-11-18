@@ -77,6 +77,7 @@
 #include "dxr_view_config.h"
 #include "dxr_stylus.h" // --stylus: the shared OpenXR half (ADR-034 Amendment 8)
 #include "lift_cpu_probe.h" // --lift: XR_DXR_lift spec 4 over CPU images (POSIX v1)
+#include "bar_label_font.h" // the status bar's text label (5x7 bitmap font as clear rects)
 
 #include <cmath>
 #include <csignal>
@@ -1142,6 +1143,29 @@ struct TrackingLossDirector {
         default: set(0.1f, 0.9f, 0.3f); break;                         // green: tracked
         }
     }
+    //! The bar's text label (mirrors TrackingLossDirector::BarLabel in
+    //! test_apps/common/tracking_loss_director.h): "MANAGED", "MANAGED - face
+    //! lost", "MANUAL", "MANUAL [lens-2D] - face lost (collapse)", ...; the
+    //! preset is named only when it is not the default (converge).
+    const char* BarLabel(bool manual, char* buf, size_t n) const {
+        if (buf == nullptr || n == 0) return "";
+        if (!manual) {
+            snprintf(buf, n, "%s", tracked ? "MANAGED" : "MANAGED - face lost");
+            return buf;
+        }
+        char presetTag[24] = "";
+        if (preset != CONVERGE) snprintf(presetTag, sizeof(presetTag), " [%s]", PresetName(preset));
+        const char* state = "";
+        switch (phase) {
+        case HOLD: state = " - face lost (hold)"; break;
+        case COLLAPSE: state = " - face lost (collapse)"; break;
+        case FLAT: state = " - face lost (flat)"; break;
+        case RECOVER_WAIT: case RECOVER: state = " - face found (recovering)"; break;
+        default: state = tracked ? "" : " - face lost"; break; // TRACKING, or IDLE (preset off)
+        }
+        snprintf(buf, n, "MANUAL%s%s", presetTag, state);
+        return buf;
+    }
 };
 static TrackingLossDirector g_lossDirector;
 
@@ -1150,6 +1174,7 @@ struct StatusBar {
     bool enabled = false;
     float fraction = 1.0f; // 0..1 of the bar's full length
     float rgb[3] = {0, 1, 0};
+    char label[64] = ""; // TrackingLossDirector::BarLabel, drawn under the bar
 };
 static StatusBar g_statusBar;
 
@@ -2015,6 +2040,44 @@ static void RenderScene(
             cr.baseArrayLayer = 0;
             cr.layerCount = 1;
             vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+
+            // Its text label, just under the bar and also the same pixel rect
+            // in every view (zero disparity). No font dependency: the 5x7
+            // bitmap font in test_apps/common/bar_label_font.h emits each
+            // glyph row's lit runs as clear rects, so the label is two more
+            // vkCmdClearAttachments (an opaque dark chip, then white text).
+            const char* label = g_statusBar.label;
+            const int tileR = (int)(e.viewportX + e.width), tileB = (int)(e.viewportY + e.height);
+            const int lx = cr.rect.offset.x, ly = cr.rect.offset.y + (int)h + (int)h / 3;
+            const int unit = dxr_demo::BarFontTextWidth(label, 1);
+            if (unit > 0 && lx < tileR && ly < tileB) {
+                int px = (int)h / 9; // glyph = 7 font pixels, chip = 9: as tall as the bar
+                const int fit = (tileR - lx) / (unit + 4);
+                if (px > fit) px = fit;
+                if (px < 1) px = 1;
+                static VkClearRect rects[1024];
+                int n = 0;
+                auto add = [&](int x, int y, int w, int hh) {
+                    if (x + w > tileR) w = tileR - x;
+                    if (y + hh > tileB) hh = tileB - y;
+                    if (w <= 0 || hh <= 0 || n >= (int)(sizeof(rects) / sizeof(rects[0]))) return;
+                    rects[n].rect = {{x, y}, {(uint32_t)w, (uint32_t)hh}};
+                    rects[n].baseArrayLayer = 0;
+                    rects[n].layerCount = 1;
+                    n++;
+                };
+                add(lx, ly, dxr_demo::BarFontTextWidth(label, px) + 4 * px, 9 * px); // the chip
+                const float chip = 0.06f;
+                for (int i = 0; i < 3; i++) {
+                    ca.clearValue.color.float32[i] =
+                        renderer.sceneLinear ? dxr::DisplayReferredToSceneLinear(chip) : chip;
+                }
+                if (n > 0) vkCmdClearAttachments(cmd, 1, &ca, 1, rects);
+                n = 0;
+                dxr_demo::BarFontText(label, lx + 2 * px, ly + px, px, add);
+                for (int i = 0; i < 3; i++) ca.clearValue.color.float32[i] = 1.0f; // white either way
+                if (n > 0) vkCmdClearAttachments(cmd, 1, &ca, (uint32_t)n, rects);
+            }
         }
 
         // The pen (stylus mode): boxes with the textured cube; the
@@ -3697,6 +3760,7 @@ int main(int argc, char** argv) {
                         g_statusBar.enabled = xr.pfnRequestEyeTrackingMode != nullptr;
                         g_statusBar.fraction = manual ? g_lossDirector.Ipd() : 1.0f;
                         g_lossDirector.BarColor(manual, g_statusBar.rgb);
+                        g_lossDirector.BarLabel(manual, g_statusBar.label, sizeof(g_statusBar.label));
                     }
                     if (useDisplayRig) {
                         displayRig.pose = XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
