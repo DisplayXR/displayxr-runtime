@@ -1722,6 +1722,7 @@ static void RenderOneFrame(RenderState& rs) {
     // MANUAL eye-tracking demo: the app's own tracker-loss transition (the
     // display does nothing in MANUAL). Its depth factor multiplies the rig's
     // ipdFactor below; LENS_2D also asks for the lens.
+    g_lossDirector.SetMode3D(xr.renderingModeCount == 0 || xr.renderingModeDisplay3D[xr.currentModeIndex]);
     dxr_demo::TrackingLossStep(
         g_lossDirector, rs.perfStats->deltaTime,
         xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANUAL_DXR, xr.isEyeTracking,
