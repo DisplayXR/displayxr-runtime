@@ -783,6 +783,33 @@ FunctionEnd
 ; So: close the clients WE own, then refuse to write anything at all -- file
 ; or registry -- if a holder survives.
 
+; #2713: "1" when CloseRuntimeClients actually ended a running
+; displayxr-service.exe, so every abort after that kill can put it back.
+Var DxrServiceWasRunning
+
+; #2713: an aborted install must leave the machine as it found it -- running
+; processes included, not just files. CloseRuntimeClients kills the service
+; before the client-DLL check; without this, an exit-6 / exit-2 abort leaves
+; it down until the next logon and every live client (the Browser, Play's
+; bridge host) loses its compositor mid-session.
+;
+; EVERY Abort after CloseRuntimeClients must call this first. It is also the
+; .onInstFailed backstop, so a future abort path that forgets still restores.
+; Idempotent: it clears the flag, so the backstop never double-launches.
+; /NOSTART is irrelevant here -- it suppresses only the post-INSTALL start;
+; restoring a service the installer itself stopped is not a new start.
+; Medium integrity via explorer.exe, exactly as the success path (#1478).
+; Uses no stack and no registers.
+Function DxrRestoreServiceOnAbort
+	${If} $DxrServiceWasRunning == "1"
+		StrCpy $DxrServiceWasRunning "0"
+		${If} ${FileExists} "$INSTDIR\displayxr-service.exe"
+			DetailPrint "Install aborted -- restarting the DisplayXR Service that was running before (#2713)."
+			Exec 'explorer.exe "$INSTDIR\displayxr-service.exe"'
+		${EndIf}
+	${EndIf}
+FunctionEnd
+
 ; Close every DisplayXR-owned process that could hold the runtime DLL.
 ;
 ; Path-scoped on purpose. The DisplayXR Browser's process is named chrome.exe,
@@ -794,8 +821,16 @@ Function CloseRuntimeClients
 	Push $1
 
 	; The service is ours unconditionally and maps the DLL every time.
+	; #2713: taskkill's own exit code says whether it was running: 0 = ended
+	; (it was running), 128 = no such process. Anything else (access denied,
+	; "error" when taskkill could not start) means we did not stop it, so
+	; there is nothing to restore.
+	StrCpy $DxrServiceWasRunning "0"
 	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
 	Pop $0
+	${If} $0 == "0"
+		StrCpy $DxrServiceWasRunning "1"
+	${EndIf}
 	; ADR-053 P2: conversion hosts die with the service's job object
 	; (KILL_ON_JOB_CLOSE); sweep a straggler so its exe can be replaced.
 	nsExec::ExecToLog 'taskkill /f /im displayxr-conversion-host.exe'
@@ -1009,6 +1044,7 @@ dll_blocked:
 	SetErrorLevel 6
 	DetailPrint "FATAL: DisplayXRClient.dll is in use and cannot be replaced."
 	DetailPrint "Close the programs listed above and run this installer again."
+	Call DxrRestoreServiceOnAbort
 	Abort "DisplayXRClient.dll is in use -- installation aborted, nothing was changed."
 
 dll_writable:
@@ -1032,6 +1068,9 @@ dll_writable:
 	SetErrorLevel 2
 	DetailPrint "FATAL: failed to write DisplayXRClient.dll."
 	MessageBox MB_OK|MB_ICONSTOP "DisplayXR could not replace DisplayXRClient.dll.$\n$\nInstallation has been stopped rather than leave a runtime whose client and service are different builds." /SD IDOK
+	; Nothing was written (the client DLL write is the first File), so the
+	; old service binary is still intact and safe to restart.
+	Call DxrRestoreServiceOnAbort
 	Abort "Failed to write DisplayXRClient.dll -- installation aborted."
 client_dll_ok:
 
@@ -1548,6 +1587,9 @@ client_dll_ok:
 			Exec 'explorer.exe "$INSTDIR\displayxr-service.exe"'
 		${EndIf}
 	skip_service_autostart:
+	; #2713: past every abort point. From here on the post-install start is
+	; governed by /NOSTART alone, so the abort backstop must not fire.
+	StrCpy $DxrServiceWasRunning "0"
 
 	; Save installation log to install directory
 	StrCpy $0 "$INSTDIR\install.log"
@@ -1948,6 +1990,13 @@ Function .onInit
 	${EndIf}
 FunctionEnd
 
+; #2713 backstop: any section Abort lands here. The explicit calls before
+; each Abort have already cleared the flag, so this is a no-op unless a
+; future abort path forgot.
+Function .onInstFailed
+	Call DxrRestoreServiceOnAbort
+FunctionEnd
+
 ;--------------------------------
 ; Version Information
 
@@ -1957,4 +2006,4 @@ VIAddVersionKey "CompanyName" "DisplayXR"
 VIAddVersionKey "LegalCopyright" "Copyright (c) 2024-2026 DisplayXR"
 VIAddVersionKey "FileDescription" "DisplayXR OpenXR Runtime Installer"
 VIAddVersionKey "FileVersion" "${VERSION}"
-VIAddVersionKey "ProductVersion" "${VERSION_LABEL}"
+VIAddVersionKey "ProductVersion" "${VERSION_LABEL}"
