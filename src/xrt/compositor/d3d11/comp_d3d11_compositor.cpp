@@ -496,7 +496,7 @@ struct comp_d3d11_compositor
 		bool pad_logged;
 		bool pad_refused_warned;
 		//! What the last woven bound frame used (under `mutex`).
-		struct comp_d3d11_texture_target_state state;
+		struct comp_texture_target_state state;
 	} tt;
 
 	//! Transparent session (#573): the DP composes-under-bg. With
@@ -1728,7 +1728,7 @@ d3d11_tt_weave(struct comp_d3d11_compositor *c,
 	}
 	uint64_t state = 0;
 	if (r.clamped) {
-		state |= COMP_D3D11_TT_STATE_CLAMPED;
+		state |= COMP_TEXTURE_TARGET_STATE_CLAMPED;
 		if (!c->tt.clamp_warned) {
 			c->tt.clamp_warned = true;
 			U_LOG_W("ADR-060: target rect larger than the shared texture (%ux%u) — woven clamped to %ux%u",
@@ -1742,7 +1742,7 @@ d3d11_tt_weave(struct comp_d3d11_compositor *c,
 	bool seg_split = false;
 	bool any_flat = false;
 	if (c->tt.windowless) {
-		state |= COMP_D3D11_TT_STATE_WINDOWLESS_PHASE;
+		state |= COMP_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE;
 		c->seg_window = r.screen;
 		c->have_seg_window = true;
 		bool seg_would_split = false;
@@ -1766,7 +1766,7 @@ d3d11_tt_weave(struct comp_d3d11_compositor *c,
 		}
 		d3d11_seg_publish(c, seg_split, seg_would_split);
 	} else if (c->tt.anchor_fallback) {
-		state |= COMP_D3D11_TT_STATE_ANCHOR_FALLBACK;
+		state |= COMP_TEXTURE_TARGET_STATE_ANCHOR_FALLBACK;
 	}
 
 	if (seg_split) {
@@ -1790,9 +1790,9 @@ d3d11_tt_weave(struct comp_d3d11_compositor *c,
 		sf.client_presents = true; // the app presents the shared texture
 		sf.out_any_flat = &any_flat;
 		comp_d3d11_segments_record(c->segments, &sf);
-		state |= COMP_D3D11_TT_STATE_SEGMENTED;
+		state |= COMP_TEXTURE_TARGET_STATE_SEGMENTED;
 		if (any_flat) {
-			state |= COMP_D3D11_TT_STATE_FLAT_SEGMENT;
+			state |= COMP_TEXTURE_TARGET_STATE_FLAT_SEGMENT;
 		}
 		c->context->OMSetRenderTargets(1, &c->shared_rtv, nullptr);
 	} else {
@@ -5505,15 +5505,15 @@ d3d11_hub_commit(struct comp_d3d11_compositor *c,
 		if (wove) {
 			bool segmented = false, any_flat = false;
 			comp_hub_d3d11_get_client_weave_state(c->hub.split, &segmented, &any_flat);
-			uint64_t state = COMP_D3D11_TT_STATE_WINDOWLESS_PHASE;
+			uint64_t state = COMP_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE;
 			if (tt_r.clamped) {
-				state |= COMP_D3D11_TT_STATE_CLAMPED;
+				state |= COMP_TEXTURE_TARGET_STATE_CLAMPED;
 			}
 			if (segmented) {
-				state |= COMP_D3D11_TT_STATE_SEGMENTED;
+				state |= COMP_TEXTURE_TARGET_STATE_SEGMENTED;
 			}
 			if (any_flat) {
-				state |= COMP_D3D11_TT_STATE_FLAT_SEGMENT;
+				state |= COMP_TEXTURE_TARGET_STATE_FLAT_SEGMENT;
 			}
 			std::lock_guard<std::mutex> tt_lock(c->tt.mutex);
 			c->tt.state.valid = true;
@@ -6980,7 +6980,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
                              bool transparent_background,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
-                             const struct comp_d3d11_texture_target_info *texture_target,
+                             const struct comp_texture_target_info *texture_target,
                              struct xrt_compositor_native **out_xc)
 {
 	if (d3d11_device == nullptr) {
@@ -11570,7 +11570,7 @@ comp_d3d11_compositor_end_texture_target_locate(struct xrt_compositor *xc)
 
 extern "C" bool
 comp_d3d11_compositor_get_texture_target_state(struct xrt_compositor *xc,
-                                               struct comp_d3d11_texture_target_state *out)
+                                               struct comp_texture_target_state *out)
 {
 	if (xc == nullptr || out == nullptr) {
 		return false;
@@ -11583,8 +11583,8 @@ comp_d3d11_compositor_get_texture_target_state(struct xrt_compositor *xc,
 	*out = c->tt.state;
 	if (!out->valid) {
 		// Nothing woven yet: still say which path the session took.
-		out->flags = c->tt.windowless ? COMP_D3D11_TT_STATE_WINDOWLESS_PHASE
-		                              : (c->tt.anchor_fallback ? COMP_D3D11_TT_STATE_ANCHOR_FALLBACK : 0);
+		out->flags = c->tt.windowless ? COMP_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE
+		                              : (c->tt.anchor_fallback ? COMP_TEXTURE_TARGET_STATE_ANCHOR_FALLBACK : 0);
 	}
 	return true;
 }

@@ -8040,10 +8040,15 @@ oxr_session_create_impl(struct oxr_logger *log,
 			if (xret != XRT_SUCCESS) {
 				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create xrt_session! '%i'", xret);
 			}
+			// XR_DXR_win32_window_binding v9 (ADR-060, #2382): the texture target binding.
+			const void *tt_binding = NULL;
+#ifdef OXR_HAVE_DXR_win32_window_binding
+			tt_binding = oxr_texture_target_find_binding(createInfo);
+#endif
 			return oxr_session_populate_d3d12_native(log, sys, d3d12, xsi->external_window_handle,
 			                                         xsi->shared_texture_handle,
 			                                         xsi->transparent_background_enabled,
-			                                         xsi->bound_display_id,
+			                                         xsi->bound_display_id, tt_binding,
 			                                         *out_session);
 		}
 #else
