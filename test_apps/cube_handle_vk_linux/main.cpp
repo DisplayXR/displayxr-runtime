@@ -1064,6 +1064,8 @@ struct TrackingLossDirector {
     bool tracked = true;
     bool capsTracking = true; // SetCaps: supportedModes != 0
     bool capsManual = true;   // SetCaps: MANUAL bit (0x2)
+    bool mode3D = true;       // SetMode3D: active mode lights the lens (LENS_2D owns it only then)
+    void SetMode3D(bool hardware3D) { mode3D = hardware3D; }
     //! Mirrors TrackingLossDirector::SetCaps (tracking_loss_director.h).
     void SetCaps(unsigned long long supportedModes) {
         capsTracking = supportedModes != 0;
@@ -1108,12 +1110,13 @@ struct TrackingLossDirector {
         sinceEdge += dt;
         const Phase before = phase;
         int lens = -1;
+        if (!mode3D) lens2DRequested = false; // user chose 2D: recovery must not request 3D over it
         if (!manual || preset == OFF) {
             u = u + dt / kRecoverS > 1.0f ? 1.0f : u + dt / kRecoverS;
             if (lens2DRequested) { lens = 1; lens2DRequested = false; }
             phase = IDLE;
         } else if (!tracked) {
-            if (preset == LENS_2D && !lens2DRequested) { lens = 0; lens2DRequested = true; }
+            if (preset == LENS_2D && mode3D && !lens2DRequested) { lens = 0; lens2DRequested = true; }
             if (sinceEdge < kHoldS && u >= 1.0f) {
                 phase = HOLD;
             } else {
@@ -3766,6 +3769,10 @@ int main(int argc, char** argv) {
                     // (1 unless the session is MANUAL and the viewer is lost).
                     {
                         const bool manual = xr.eyeTrackingMode == XR_EYE_TRACKING_MODE_MANUAL_DXR;
+                        {
+                            const XrDisplayRenderingModeInfoDXR* am = ActiveRenderingMode(xr);
+                            g_lossDirector.SetMode3D(am == nullptr || am->hardwareDisplay3D);
+                        }
                         const int lens = g_lossDirector.Update(deltaTime, manual);
                         if (lens >= 0 && xr.pfnRequestDisplayMode != nullptr) {
                             const XrResult lr = xr.pfnRequestDisplayMode(

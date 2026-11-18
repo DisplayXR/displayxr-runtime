@@ -46,6 +46,12 @@ Tracking capability is expressed at **two layers**, which answer different quest
    still eye-tracked) alongside the default tracked 3D mode and untracked export modes
    (SBS, anaglyph). sim_display sets `has_tracking = false` on **all** modes — it reports
    nominal positions, not tracking.
+   **A mode that builds its view from live eye positions must claim `has_tracking`, even if it is
+   flat.** The runtime collapses a 2D mode's eye pair to the live centroid (head-tracked
+   look-around on the flat image), so an unflagged 2D mode reports `isTracking = FALSE` to a
+   viewer who is being tracked. Leia's 2D mode is therefore a "2D tracked" mode on every platform
+   (displayxr-leia-plugin, mode 0). Consequence: switching between Leia's 2D and 3D modes no longer
+   produces an `isTracking` edge, so an app must not read a tracking edge as a 2D/3D signal.
 2. **Per system — `supported_eye_tracking_modes`** (MANAGED/MANUAL bits,
    `xrt_plugin_display_info`): *which control contracts does the vendor offer when tracking
    is in play?* Unchanged by v14.

@@ -66,6 +66,10 @@ struct TrackingLossDirector
 	//! via SetCaps). Defaults keep the old behaviour: a tracking display with MANUAL.
 	bool capsTracking = true;
 	bool capsManual = true;
+	//! The active rendering mode lights the lens (hardwareDisplay3D). The
+	//! LENS_2D preset owns the lens only then: in a mode the user chose as 2D,
+	//! a tracking recovery must not turn the lens back on (SetMode3D).
+	bool mode3D = true;
 	float sinceEdge = 1e9f; // seconds since the last tracking edge
 	float u = 1.0f;         // 1 = full depth, 0 = flat (ipd = smoothstep(u))
 	float clock = 0.0f;
@@ -136,6 +140,11 @@ struct TrackingLossDirector
 		sinceEdge += dt;
 		const Phase before = phase;
 		int lens = -1;
+		if (!mode3D) {
+			// A 2D mode is the user's choice: forget any 2D we asked for, so
+			// recovery does not request 3D over it.
+			lens2DRequested = false;
+		}
 		if (!manual || preset == OFF) {
 			u = u + dt / kRecoverS > 1.0f ? 1.0f : u + dt / kRecoverS;
 			if (lens2DRequested) {
@@ -144,7 +153,7 @@ struct TrackingLossDirector
 			}
 			phase = IDLE;
 		} else if (!tracked) {
-			if (preset == LENS_2D && !lens2DRequested) {
+			if (preset == LENS_2D && mode3D && !lens2DRequested) {
 				lens = 0;
 				lens2DRequested = true;
 			}
@@ -184,6 +193,12 @@ struct TrackingLossDirector
 	{
 		capsTracking = supportedModes != 0;
 		capsManual = (supportedModes & 0x2) != 0;
+	}
+	//! Feed the active rendering mode's hardwareDisplay3D each frame.
+	void
+	SetMode3D(bool hardware3D)
+	{
+		mode3D = hardware3D;
 	}
 	//! Zero-disparity status bar colour (display-referred RGB).
 	void
