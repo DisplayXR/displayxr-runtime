@@ -43,6 +43,9 @@ struct t_instance
 {
 	struct xrt_instance base;
 	struct xrt_prober *xp;
+	//! Created with no app info: the IPC service (or a headless CLI), the
+	//! process that composites and weaves for others (#2066 rung 3 policy).
+	bool no_app_info;
 #ifdef XRT_OS_ANDROID
 	struct android_instance_base android;
 #endif

@@ -15,6 +15,7 @@
 #include "xrt/xrt_screen.h"
 #include "xrt/xrt_config_build.h"
 #include "xrt/xrt_config_os.h"
+#include "xrt/xrt_config_have.h"
 
 
 #include "os/os_time.h"
@@ -61,6 +62,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+#include "os/os_display_edid_linux.h"
+#ifdef XRT_HAVE_VULKAN
+#include "vk/vk_helpers.h"
+#endif
+#endif
 
 #ifdef XRT_OS_ANDROID
 #include "android/android_instance_base.h"
@@ -996,6 +1004,70 @@ resolve_scanout_adapter_luid(const struct xrt_plugin_display_info *pdi)
 }
 
 /*!
+ * #2066 rung 3 (desktop Linux): put this process's Vulkan device on the GPU
+ * that drives the 3D panel.
+ *
+ * Linux has no runtime-side render/scanout split (the Windows ADR-037 twin is
+ * #2066), so on a hybrid laptop the device-type ranking puts the service on the
+ * dGPU while the panel — and the desktop, and the browser's GL — sit on the
+ * iGPU. The weave engine then imports client dma-bufs across drivers and the
+ * client, which takes the service's device via xrGetVulkanGraphicsDevice2KHR,
+ * lands there too. "Weave next to scanout" with no split degenerates to
+ * "everything on the scanout GPU", ADR-037's rung 3.
+ *
+ * Policy only where it is right by default: the process created with no app
+ * info (the IPC service). An in-process app keeps the ranking — it presents
+ * through PRIME, which works, and its render load may need the dGPU — unless
+ * it asks with DXR_VK_FORCE_GPU=scanout. DXR_WEAVE_ON_SCANOUT=0 (the Windows
+ * split's kill switch) turns the policy off; any other DXR_VK_FORCE_GPU value
+ * still wins inside aux_vk, ahead of this hint.
+ *
+ * The panel's card comes from DRM sysfs alone (a connector with the panel's
+ * mode and, where both know it, its EDID size; ambiguous = no answer), so it
+ * works the same on X11 and Wayland and before any monitor resolve has run.
+ */
+static void
+apply_linux_scanout_gpu(const struct t_instance *tinst, const struct xrt_plugin_display_info *pdi)
+{
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID) && defined(XRT_HAVE_VULKAN)
+	const char *force = getenv("DXR_VK_FORCE_GPU");
+	const bool asked = force != NULL && strcmp(force, "scanout") == 0;
+	const char *kill = getenv("DXR_WEAVE_ON_SCANOUT");
+	const bool killed = kill != NULL && strcmp(kill, "0") == 0;
+	if (!(asked || (tinst->no_app_info && !killed))) {
+		return;
+	}
+	if (pdi == NULL || pdi->display_pixel_width == 0 || pdi->display_pixel_height == 0) {
+		if (asked) {
+			U_LOG_W("DXR_VK_FORCE_GPU=scanout: no panel dimensions from the display processor — ignoring");
+		}
+		return;
+	}
+	const uint32_t mm_w = (uint32_t)(pdi->display_width_m * 1000.0f + 0.5f);
+	const uint32_t mm_h = (uint32_t)(pdi->display_height_m * 1000.0f + 0.5f);
+	uint32_t major = 0;
+	uint32_t minor = 0;
+	char connector[32] = "";
+	if (!os_display_drm_panel_node("/sys/class/drm", pdi->display_pixel_width, pdi->display_pixel_height, mm_w,
+	                               mm_h, &major, &minor, connector, sizeof(connector))) {
+		U_LOG_W(
+		    "#2066 scanout GPU: could not name the DRM card driving the %ux%u panel — keeping the "
+		    "device-type ranking",
+		    pdi->display_pixel_width, pdi->display_pixel_height);
+		return;
+	}
+	U_LOG_W(
+	    "#2066 scanout GPU: the panel is on %s (DRM primary node %u:%u) — Vulkan devices in this process "
+	    "prefer it%s",
+	    connector, major, minor, asked ? " (DXR_VK_FORCE_GPU=scanout)" : " (service default)");
+	vk_set_scanout_drm_node(major, minor);
+#else
+	(void)tinst;
+	(void)pdi;
+#endif
+}
+
+/*!
  * ADR-037 §2 (#918): resolve the LUID of the adapter the runtime's capability
  * ranking chose to RENDER on, so the Vulkan device selection down in aux_vk —
  * which can see neither the display-processor plug-in nor DXGI — has something
@@ -1382,6 +1454,7 @@ t_instance_create_system(struct xrt_instance *xinst,
 			}
 			scanout_adapter_luid = resolve_scanout_adapter_luid(&rr_pdi);
 			render_adapter_luid = resolve_render_adapter_luid(&rr_pdi);
+			apply_linux_scanout_gpu(t_instance(xinst), &rr_pdi);
 			create_panel_left = rr_pdi.display_screen_left;
 			create_panel_top = rr_pdi.display_screen_top;
 		} else {
@@ -1688,6 +1761,7 @@ xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xins
 	tinst->base.get_display_generation = t_instance_get_display_generation;
 	tinst->base.get_display_snapshot = t_instance_get_display_snapshot;
 	tinst->xp = xp;
+	tinst->no_app_info = ii == NULL;
 
 	tinst->base.startup_timestamp = os_monotonic_get_ns();
 

@@ -1239,6 +1239,24 @@ VkResult
 vk_select_physical_device(struct vk_bundle *vk, int forced_index);
 
 /*!
+ * Desktop Linux (#2066 rung 3): the DRM primary node (major:minor, as
+ * `VK_EXT_physical_device_drm` reports it) of the GPU that drives the 3D
+ * panel, for EVERY physical-device selection in this process after the call.
+ * Process-wide on purpose: the service builds several bundles (system
+ * compositor, weave engine, ...) and they must all land on the same GPU.
+ *
+ * While set, and when no explicit index / `DXR_VK_FORCE_GPU` value decides
+ * first, selection prefers the device on that node over the device-type
+ * ranking; a node no device reports leaves the ranking's pick. It also gives
+ * `DXR_VK_FORCE_GPU=scanout` its Linux meaning. (0, 0) clears it. No-op off
+ * desktop Linux.
+ *
+ * @ingroup aux_vk
+ */
+void
+vk_set_scanout_drm_node(uint32_t major, uint32_t minor);
+
+/*!
  * Used to enable device features as a argument @ref vk_create_device.
  *
  * @ingroup aux_vk

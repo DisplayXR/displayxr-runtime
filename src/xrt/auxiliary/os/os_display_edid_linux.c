@@ -540,3 +540,129 @@ os_display_edid_find_in_table(const struct os_display_edid_list *list, const uin
 	}
 	return NULL;
 }
+
+
+/*
+ *
+ * The panel's DRM card (#2066 rung 3).
+ *
+ */
+
+static uint32_t
+mm_diff(uint32_t a, uint32_t b)
+{
+	return a > b ? a - b : b - a;
+}
+
+bool
+os_display_drm_panel_card(const struct os_display_drm_connector *drm,
+                          uint32_t drm_count,
+                          uint32_t px_w,
+                          uint32_t px_h,
+                          uint32_t mm_w,
+                          uint32_t mm_h,
+                          char *out_card,
+                          size_t out_card_size,
+                          char *out_connector,
+                          size_t out_connector_size,
+                          uint32_t *out_candidates)
+{
+	char card[32] = "";
+	char first[32] = "";
+	uint32_t candidates = 0;
+	bool two_cards = false;
+
+	for (uint32_t i = 0; drm != NULL && i < drm_count && px_w > 0 && px_h > 0; i++) {
+		const struct os_display_drm_connector *c = &drm[i];
+		if (!c->enabled) {
+			continue;
+		}
+		bool has_mode = false;
+		for (uint32_t m = 0; m < c->mode_count; m++) {
+			if (c->mode_w[m] == px_w && c->mode_h[m] == px_h) {
+				has_mode = true;
+				break;
+			}
+		}
+		if (!has_mode) {
+			continue;
+		}
+		if (c->has_edid && mm_w > 0 && mm_h > 0) {
+			uint32_t ew = 0;
+			uint32_t eh = 0;
+			os_display_edid_parsed_mm(&c->edid, &ew, &eh);
+			if (ew > 0 && eh > 0 &&
+			    (mm_diff(ew, mm_w) > OS_DISPLAY_EDID_JOIN_MM_TOLERANCE ||
+			     mm_diff(eh, mm_h) > OS_DISPLAY_EDID_JOIN_MM_TOLERANCE)) {
+				continue;
+			}
+		}
+
+		// "card1-eDP-1" -> "card1".
+		char this_card[32];
+		(void)snprintf(this_card, sizeof(this_card), "%s", c->name);
+		char *dash = strchr(this_card, '-');
+		if (dash == NULL) {
+			continue;
+		}
+		*dash = '\0';
+
+		if (candidates == 0) {
+			(void)snprintf(card, sizeof(card), "%s", this_card);
+			(void)snprintf(first, sizeof(first), "%s", c->name);
+		} else if (strcmp(card, this_card) != 0) {
+			two_cards = true;
+		}
+		candidates++;
+	}
+
+	if (out_candidates != NULL) {
+		*out_candidates = candidates;
+	}
+	if (candidates == 0 || two_cards) {
+		return false;
+	}
+	if (out_card != NULL && out_card_size > 0) {
+		(void)snprintf(out_card, out_card_size, "%s", card);
+	}
+	if (out_connector != NULL && out_connector_size > 0) {
+		(void)snprintf(out_connector, out_connector_size, "%s", first);
+	}
+	return true;
+}
+
+bool
+os_display_drm_panel_node(const char *root,
+                          uint32_t px_w,
+                          uint32_t px_h,
+                          uint32_t mm_w,
+                          uint32_t mm_h,
+                          uint32_t *out_major,
+                          uint32_t *out_minor,
+                          char *out_connector,
+                          size_t out_connector_size)
+{
+	if (root == NULL || out_major == NULL || out_minor == NULL) {
+		return false;
+	}
+	struct os_display_drm_connector conns[OS_DISPLAY_DRM_MAX_CONNECTORS];
+	const uint32_t n = os_display_drm_read_connectors(root, conns, OS_DISPLAY_DRM_MAX_CONNECTORS);
+
+	char card[32];
+	if (!os_display_drm_panel_card(conns, n, px_w, px_h, mm_w, mm_h, card, sizeof(card), out_connector,
+	                               out_connector_size, NULL)) {
+		return false;
+	}
+
+	char path[512];
+	char line[64];
+	(void)snprintf(path, sizeof(path), "%s/%s/dev", root, card);
+	unsigned major = 0;
+	unsigned minor = 0;
+	if (!read_first_line(path, line, sizeof(line)) || sscanf(line, "%u:%u", &major, &minor) != 2) {
+		return false;
+	}
+	*out_major = major;
+	*out_minor = minor;
+	return true;
+}

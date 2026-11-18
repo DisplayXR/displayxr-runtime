@@ -145,6 +145,54 @@ struct os_display_randr_edid
 uint32_t
 os_display_x11_read_monitor_edids(struct os_display_randr_edid *out, uint32_t max);
 
+/*!
+ * Which DRM card drives the 3D panel (#2066 rung 3, the Linux scanout device).
+ * Pure: no I/O, no logging.
+ *
+ * A connector is a candidate when it is enabled and has the panel's pixel size
+ * among its modes. When both sides know a physical size (the plug-in's
+ * @p mm_w x @p mm_h and the connector's EDID), the two must agree within
+ * @ref OS_DISPLAY_EDID_JOIN_MM_TOLERANCE as well. The answer is the card
+ * prefix ("card1") of the candidates when they ALL sit on one card; anything
+ * else (no candidate, or candidates on two cards — two identical panels on two
+ * GPUs) is no answer, so the caller keeps its normal device choice.
+ *
+ * @param[out] out_card       "card<N>", NUL-terminated, when true is returned.
+ * @param[out] out_connector  The first candidate's full name ("card1-eDP-1"); may be NULL.
+ * @param[out] out_candidates How many connectors qualified; may be NULL.
+ */
+bool
+os_display_drm_panel_card(const struct os_display_drm_connector *drm,
+                          uint32_t drm_count,
+                          uint32_t px_w,
+                          uint32_t px_h,
+                          uint32_t mm_w,
+                          uint32_t mm_h,
+                          char *out_card,
+                          size_t out_card_size,
+                          char *out_connector,
+                          size_t out_connector_size,
+                          uint32_t *out_candidates);
+
+/*!
+ * @ref os_display_drm_panel_card over the live `/sys/class/drm`, then the
+ * card's primary node from `/sys/class/drm/<card>/dev` ("226:1"), which is what
+ * `VK_EXT_physical_device_drm` reports as primaryMajor/primaryMinor.
+ *
+ * @param root  Normally "/sys/class/drm" (a fixture directory in tests).
+ * @return false when the panel's card cannot be named unambiguously.
+ */
+bool
+os_display_drm_panel_node(const char *root,
+                          uint32_t px_w,
+                          uint32_t px_h,
+                          uint32_t mm_w,
+                          uint32_t mm_h,
+                          uint32_t *out_major,
+                          uint32_t *out_minor,
+                          char *out_connector,
+                          size_t out_connector_size);
+
 #ifdef __cplusplus
 }
 #endif

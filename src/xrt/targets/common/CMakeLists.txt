@@ -100,6 +100,12 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 		)
 	target_include_directories(target_instance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+	# #2066 rung 3 (desktop Linux): the panel's DRM node is handed to aux_vk's
+	# physical-device selection (vk_set_scanout_drm_node).
+	if(TARGET aux_vk)
+		target_link_libraries(target_instance PRIVATE aux_vk)
+	endif()
+
 	# DXR_VK_FORCE_GPU=scanout (#918): the panel rect -> scanout adapter LUID
 	# resolver lives in aux_d3d (DXGI). Windows-only.
 	if(WIN32 AND TARGET aux_d3d)

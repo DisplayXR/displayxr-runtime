@@ -174,9 +174,36 @@ a fall back to normal selection**. A copied-around env var can never brick an
 app. The resolution happens only when the keyword is actually requested, so
 the DXGI walk costs nothing otherwise.
 
-**Windows-only semantics.** On macOS / Linux / Android there is no scanout
+**Windows and desktop Linux.** On macOS / Android there is no scanout
 adapter to resolve; `DXR_VK_FORCE_GPU=scanout` WARNs once and is ignored.
 (`DXR_D3D_FORCE_GPU` is Windows-only to begin with.)
+
+### Desktop Linux: the service goes on the panel's GPU by default (#2066 rung 3)
+
+Linux has no render/scanout split yet (#2066 is the ADR-037 twin), so "weave
+next to scanout" degenerates to ADR-037's **rung 3: everything on the scanout
+GPU**. On a hybrid laptop the device-type ranking used to put the
+**service** on the dGPU while the panel, the desktop and a client's GL (the
+DisplayXR Browser) sat on the iGPU. The weave engine then imported client
+dma-bufs across drivers, and the client, which takes the service's device
+through `xrGetVulkanGraphicsDevice2KHR`, followed it onto the dGPU.
+
+- **How the panel's GPU is found:** DRM sysfs alone. A connected, enabled
+  connector with the plug-in's panel mode among its modes and, where both
+  know it, an EDID size within 10 mm (`os_display_drm_panel_node`). The
+  answer is that connector's card's primary node (`/sys/class/drm/cardN/dev`),
+  matched against `VK_EXT_physical_device_drm` (`vk_set_scanout_drm_node`).
+  Candidates on two cards are no answer, and an unresolved panel keeps the
+  ranking. Each outcome is one WARN, `#2066 scanout GPU: ...`.
+- **Where it is policy:** the IPC service, meaning the process created with no
+  app info. It is process-wide, so the system compositor, the weave engine
+  and every other bundle in the service agree.
+- **In-process apps keep the ranking:** they present through PRIME, which
+  works, and their render load may need the dGPU. They get the panel's GPU
+  only with `DXR_VK_FORCE_GPU=scanout`.
+- **Overrides:** any other `DXR_VK_FORCE_GPU` value still decides first.
+  `DXR_WEAVE_ON_SCANOUT=0`, the Windows split's kill switch, turns the
+  service default off.
 
 ## Interaction with the output-device split (`DXR_WEAVE_ON_SCANOUT`)
 

@@ -561,3 +561,94 @@ TEST_CASE("sysfs: reads connected connectors, their EDID, enabled state and mode
 	(void)unlink((root + "/version").c_str());
 	(void)rmdir(root.c_str());
 }
+
+/*
+ * #2066 rung 3: which DRM card drives the panel. Hybrid-laptop shapes: the
+ * panel on the iGPU's eDP (card1) with the dGPU (card0) driving nothing or an
+ * external monitor, and the DS1 on a dGPU HDMI port.
+ */
+TEST_CASE("panel card: the panel's mode + EDID size names its card")
+{
+	const std::vector<uint8_t> edp = edp_no_serial_edid();
+	os_display_drm_connector drm[2] = {
+	    drm_conn("card0-DP-1", edp.data(), edp.size(), 2560, 1440), // dGPU, an external monitor
+	    drm_conn("card1-HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	};
+	char card[32] = "";
+	char conn[32] = "";
+	uint32_t n = 0;
+	REQUIRE(os_display_drm_panel_card(drm, 2, 3840, 2160, 344, 193, card, sizeof(card), conn, sizeof(conn), &n));
+	CHECK(std::string(card) == "card1");
+	CHECK(std::string(conn) == "card1-HDMI-A-1");
+	CHECK(n == 1);
+}
+
+TEST_CASE("panel card: a mode match with the wrong physical size is not the panel")
+{
+	// A 4K desktop monitor on the dGPU (EDID 600x340 mm) next to the 15.6" panel.
+	std::vector<uint8_t> big = edp_no_serial_edid();
+	big[21] = 60;
+	big[22] = 34;
+	os_display_drm_connector drm[2] = {
+	    drm_conn("card0-DP-1", big.data(), big.size(), 3840, 2160),
+	    drm_conn("card1-HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	};
+	char card[32] = "";
+	REQUIRE(os_display_drm_panel_card(drm, 2, 3840, 2160, 344, 193, card, sizeof(card), nullptr, 0, nullptr));
+	CHECK(std::string(card) == "card1");
+}
+
+TEST_CASE("panel card: candidates on two cards are no answer")
+{
+	os_display_drm_connector drm[2] = {
+	    drm_conn("card0-HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	    drm_conn("card1-HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	};
+	char card[32] = "";
+	uint32_t n = 0;
+	CHECK_FALSE(os_display_drm_panel_card(drm, 2, 3840, 2160, 344, 193, card, sizeof(card), nullptr, 0, &n));
+	CHECK(n == 2);
+}
+
+TEST_CASE("panel card: no mode match, a disabled connector, or no panel size are no answer")
+{
+	os_display_drm_connector drm[2] = {
+	    drm_conn("card1-eDP-1", nullptr, 0, 1920, 1080),
+	    drm_conn("card1-HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160, false),
+	};
+	char card[32] = "";
+	CHECK_FALSE(os_display_drm_panel_card(drm, 2, 3840, 2160, 344, 193, card, sizeof(card), nullptr, 0, nullptr));
+	CHECK_FALSE(os_display_drm_panel_card(drm, 2, 0, 0, 0, 0, card, sizeof(card), nullptr, 0, nullptr));
+}
+
+TEST_CASE("panel node: sysfs fixture resolves the card's primary node")
+{
+	char tmpl[] = "/tmp/dxr_drm_node_XXXXXX";
+	REQUIRE(mkdtemp(tmpl) != nullptr);
+	const std::string root = tmpl;
+	const std::string conn = root + "/card1-eDP-1";
+	const std::string card = root + "/card1";
+	REQUIRE(mkdir(conn.c_str(), 0700) == 0);
+	REQUIRE(mkdir(card.c_str(), 0700) == 0);
+	write_text(conn + "/status", "connected\n");
+	write_text(conn + "/enabled", "enabled\n");
+	write_file(conn + "/edid", DS1_EDID, sizeof(DS1_EDID));
+	write_text(conn + "/modes", "3840x2160\n");
+	write_text(card + "/dev", "226:1\n");
+
+	uint32_t major = 0;
+	uint32_t minor = 0;
+	char name[32] = "";
+	REQUIRE(os_display_drm_panel_node(root.c_str(), 3840, 2160, 344, 193, &major, &minor, name, sizeof(name)));
+	CHECK(major == 226);
+	CHECK(minor == 1);
+	CHECK(std::string(name) == "card1-eDP-1");
+
+	for (const char *f : {"/status", "/enabled", "/edid", "/modes"}) {
+		(void)unlink((conn + f).c_str());
+	}
+	(void)unlink((card + "/dev").c_str());
+	(void)rmdir(conn.c_str());
+	(void)rmdir(card.c_str());
+	(void)rmdir(root.c_str());
+}

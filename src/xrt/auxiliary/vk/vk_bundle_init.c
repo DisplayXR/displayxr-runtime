@@ -596,6 +596,81 @@ device_index_by_luid(struct vk_bundle *vk, VkPhysicalDevice *devices, uint32_t d
 }
 
 /*
+ * #2066 rung 3 (desktop Linux): the panel GPU's DRM primary node, set
+ * process-wide by the layer that knows the panel (target_instance). See
+ * vk_set_scanout_drm_node() in vk_helpers.h.
+ */
+static uint32_t g_scanout_drm_major = 0;
+static uint32_t g_scanout_drm_minor = 0;
+static bool g_scanout_drm_set = false;
+
+void
+vk_set_scanout_drm_node(uint32_t major, uint32_t minor)
+{
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+	g_scanout_drm_major = major;
+	g_scanout_drm_minor = minor;
+	g_scanout_drm_set = major != 0 || minor != 0;
+#else
+	(void)major;
+	(void)minor;
+#endif
+}
+
+/*
+ * The device whose VK_EXT_physical_device_drm primary node is the panel's,
+ * or -1. A device that does not expose the extension is never matched (its
+ * VkPhysicalDeviceDrmPropertiesEXT would be undefined).
+ */
+static int
+device_index_by_scanout_drm(struct vk_bundle *vk, VkPhysicalDevice *devices, uint32_t device_count)
+{
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID) && defined(VK_EXT_physical_device_drm)
+	if (!g_scanout_drm_set || vk->vkGetPhysicalDeviceProperties2 == NULL ||
+	    vk->vkEnumerateDeviceExtensionProperties == NULL) {
+		return -1;
+	}
+	for (uint32_t i = 0; i < device_count; i++) {
+		uint32_t n = 0;
+		if (vk->vkEnumerateDeviceExtensionProperties(devices[i], NULL, &n, NULL) != VK_SUCCESS || n == 0) {
+			continue;
+		}
+		VkExtensionProperties *props = U_TYPED_ARRAY_CALLOC(VkExtensionProperties, n);
+		bool has_drm = false;
+		if (vk->vkEnumerateDeviceExtensionProperties(devices[i], NULL, &n, props) == VK_SUCCESS) {
+			for (uint32_t e = 0; e < n; e++) {
+				if (strcmp(props[e].extensionName, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME) == 0) {
+					has_drm = true;
+					break;
+				}
+			}
+		}
+		free(props);
+		if (!has_drm) {
+			continue;
+		}
+		VkPhysicalDeviceDrmPropertiesEXT drm = {
+		    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
+		};
+		VkPhysicalDeviceProperties2 pdp2 = {
+		    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+		    .pNext = &drm,
+		};
+		vk->vkGetPhysicalDeviceProperties2(devices[i], &pdp2);
+		if (drm.hasPrimary == VK_TRUE && (uint32_t)drm.primaryMajor == g_scanout_drm_major &&
+		    (uint32_t)drm.primaryMinor == g_scanout_drm_minor) {
+			return (int)i;
+		}
+	}
+#else
+	(void)vk;
+	(void)devices;
+	(void)device_count;
+#endif
+	return -1;
+}
+
+/*
  * DXR_VK_FORCE_GPU: external override for the physical-device choice, needed
  * because device_type_priority() ranks DISCRETE above INTEGRATED
  * unconditionally and the OS GpuPreference hint only reorders enumeration —
@@ -654,8 +729,21 @@ env_forced_gpu_index(struct vk_bundle *vk, VkPhysicalDevice *devices, uint32_t d
 		VK_WARN(vk,
 		        "DXR_VK_FORCE_GPU=scanout: no Vulkan device on the panel's scanout adapter — using "
 		        "normal selection");
+#elif defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+		// #2066: the panel's DRM card, resolved by target_instance.
+		int drm_index = device_index_by_scanout_drm(vk, devices, device_count);
+		if (drm_index >= 0) {
+			VkPhysicalDeviceProperties pdp;
+			vk->vkGetPhysicalDeviceProperties(devices[drm_index], &pdp);
+			VK_WARN(vk, "DXR_VK_FORCE_GPU=scanout: selecting device %d (%s), the panel's DRM card",
+			        drm_index, pdp.deviceName);
+			return drm_index;
+		}
+		VK_WARN(vk,
+		        "DXR_VK_FORCE_GPU=scanout: the panel's DRM card is unknown or has no Vulkan device — using "
+		        "normal selection");
 #else
-		VK_WARN(vk, "DXR_VK_FORCE_GPU=scanout: Windows-only — ignoring");
+		VK_WARN(vk, "DXR_VK_FORCE_GPU=scanout: Windows and desktop Linux only — ignoring");
 #endif
 		return -1;
 	}
@@ -760,6 +848,31 @@ select_physical_device(struct vk_bundle *vk, int forced_index)
 	} else {
 		VK_DEBUG(vk, "Available GPUs");
 		gpu_index = select_preferred_device(vk, physical_devices, gpu_count);
+
+		/*
+		 * #2066 rung 3 (desktop Linux): "weave next to scanout" with no split.
+		 * Linux has no runtime-side render/scanout split yet, so when the
+		 * layer that knows the panel has named its GPU, everything goes on it
+		 * — otherwise a hybrid laptop puts the weave on the dGPU while the
+		 * panel, the desktop and the browser's GL sit on the iGPU, and the
+		 * dma-buf hand-off crosses drivers. Only set where it is policy (the
+		 * service) or asked for; see target_instance.c.
+		 */
+		int drm_index = device_index_by_scanout_drm(vk, physical_devices, gpu_count);
+		if (drm_index >= 0 && (uint32_t)drm_index != gpu_index) {
+			VkPhysicalDeviceProperties drm_pdp;
+			vk->vkGetPhysicalDeviceProperties(physical_devices[drm_index], &drm_pdp);
+			static bool drm_pick_announced = false;
+			if (!drm_pick_announced) {
+				drm_pick_announced = true;
+				VK_WARN(vk,
+				        "#2066 scanout GPU: selecting device %d (%s), the GPU driving the panel, over "
+				        "the device-type-priority pick %u (no Linux split; DXR_WEAVE_ON_SCANOUT=0 "
+				        "restores the old pick)",
+				        drm_index, drm_pdp.deviceName, gpu_index);
+			}
+			gpu_index = (uint32_t)drm_index;
+		}
 
 		/*
 		 * ADR-037 §2 / #918: "most capable render adapter" is resolved by the
