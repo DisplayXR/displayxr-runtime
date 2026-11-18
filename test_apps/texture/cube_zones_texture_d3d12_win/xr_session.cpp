@@ -349,6 +349,32 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     return true;
 }
 
+bool TextureTargetEnabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* e = getenv("DXR_TEXTURE_TARGET");
+        enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+void TextureTargetInset(int* x, int* y) {
+    static int ix = -1, iy = 0;
+    if (ix < 0) {
+        ix = 0;
+        const char* e = getenv("DXR_TEXTURE_TARGET_INSET");
+        if (e != nullptr && sscanf(e, "%d,%d", &ix, &iy) != 2) { ix = 0; iy = 0; }
+        if (ix < 0) ix = 0;
+        if (iy < 0) iy = 0;
+    }
+    *x = ix;
+    *y = iy;
+}
+
+bool TextureTargetUsable(HWND hwnd) {
+    return TextureTargetEnabled() && hwnd != nullptr && GetAncestor(hwnd, GA_ROOT) == hwnd;
+}
+
 bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueue* queue,
                    HANDLE sharedTextureHandle, HWND appHwnd) {
     LOG_INFO("Creating OpenXR session with D3D12 + shared texture handle + window binding...");
@@ -384,6 +410,37 @@ bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueu
             sessionTarget.transparentBackgroundEnabled = XR_TRUE;
             LOG_INFO("Transparent background ENABLED (zones default; DISPLAYXR_TRANSPARENT_BG=0 to opt out)");
         }
+    }
+
+    // XR_DXR_win32_window_binding v9 (ADR-060) smoke mode: DXR_TEXTURE_TARGET=1
+    // names the texture target (this window + its client area from
+    // DXR_TEXTURE_TARGET_INSET) instead of relying on the HWND anchor;
+    // DXR_TEXTURE_TARGET_NOANCHOR=1 also drops windowHandle, so a DP that
+    // cannot phase windowless weaves display-scoped. main.cpp chains the
+    // per-frame XrWin32TextureTargetFrameDXR.
+    XrWin32TextureTargetBindingDXR textureTarget = {XR_TYPE_WIN32_TEXTURE_TARGET_BINDING_DXR};
+    if (TextureTargetEnabled() && appHwnd && !TextureTargetUsable(appHwnd)) {
+        LOG_WARN("DXR_TEXTURE_TARGET=1 ignored: the bound window %p is not top-level (#740 pane harness)",
+            (void*)appHwnd);
+    }
+    if (TextureTargetUsable(appHwnd) && sharedTextureHandle) {
+        RECT rc = {};
+        GetClientRect(appHwnd, &rc);
+        textureTarget.referenceWindow = (void*)appHwnd;
+        int ix = 0, iy = 0;
+        TextureTargetInset(&ix, &iy);
+        textureTarget.initialTargetRect.offset = {ix, iy};
+        textureTarget.initialTargetRect.extent = {rc.right - ix > 0 ? (int32_t)(rc.right - ix) : 1,
+                                                  rc.bottom - iy > 0 ? (int32_t)(rc.bottom - iy) : 1};
+        sessionTarget.next = &textureTarget;
+        const char* na = getenv("DXR_TEXTURE_TARGET_NOANCHOR");
+        if (na != nullptr && na[0] == '1') {
+            sessionTarget.windowHandle = nullptr;
+        }
+        LOG_INFO("ADR-060 texture target binding: reference window %p, rect (%d,%d) %dx%d, anchor %s",
+            (void*)appHwnd, ix, iy, (int)textureTarget.initialTargetRect.extent.width,
+            (int)textureTarget.initialTargetRect.extent.height,
+            sessionTarget.windowHandle ? "kept (fallback)" : "dropped");
     }
 
     if (xr.hasWin32WindowBindingExt && appHwnd && sharedTextureHandle) {

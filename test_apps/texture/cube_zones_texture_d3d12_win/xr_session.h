@@ -75,3 +75,13 @@ bool GetD3D12GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid);
 // app window (weaver position tracking) via XR_DXR_win32_window_binding.
 bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueue* queue,
                    HANDLE sharedTextureHandle, HWND appHwnd);
+
+// ADR-060 smoke mode (DXR_TEXTURE_TARGET=1): the session names its texture
+// target (parity with cube_zones_texture_d3d11_win, #2382). Only for a
+// top-level bound window: the #740 pane harness binds a WS_CHILD, which a
+// reference window may not be.
+bool TextureTargetEnabled();
+// DXR_TEXTURE_TARGET_INSET=x,y: the target rect (and the blit) start at (x,y) of the client area.
+void TextureTargetInset(int* x, int* y);
+// Is @p hwnd usable as the reference window (TextureTargetEnabled + top-level)?
+bool TextureTargetUsable(HWND hwnd);
