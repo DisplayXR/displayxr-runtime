@@ -1091,6 +1091,11 @@ oxr_session_window_hidden(struct oxr_session *sess)
 		return comp_vk_native_compositor_window_hidden(&sess->xcn->base);
 	}
 #endif
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		return comp_metal_compositor_window_hidden(&sess->xcn->base);
+	}
+#endif
 	return false;
 }
 
@@ -1263,6 +1268,12 @@ oxr_session_window_visibility_poll(struct oxr_logger *log, struct oxr_session *s
 	if (sess->is_vk_native_compositor) {
 		native = true;
 		wv = comp_vk_native_compositor_window_visibility(&sess->xcn->base);
+	}
+#endif
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		native = true;
+		wv = comp_metal_compositor_window_visibility(&sess->xcn->base);
 	}
 #endif
 	// Out-of-process sessions hear the service's events instead; an
