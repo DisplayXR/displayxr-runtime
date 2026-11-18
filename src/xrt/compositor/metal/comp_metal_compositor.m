@@ -7891,6 +7891,18 @@ comp_metal_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t 
 	xrt_display_processor_metal_set_eye_tracking_mode(c->display_processor, mode);
 }
 
+bool
+comp_metal_compositor_window_hidden(struct xrt_compositor *xc)
+{
+	return xc != NULL && u_window_visibility_hidden(metal_comp(xc)->visibility);
+}
+
+const struct u_window_visibility *
+comp_metal_compositor_window_visibility(struct xrt_compositor *xc)
+{
+	return xc != NULL ? metal_comp(xc)->visibility : NULL;
+}
+
 void
 comp_metal_compositor_set_system_devices(struct xrt_compositor *xc,
                                          struct xrt_system_devices *xsysd)

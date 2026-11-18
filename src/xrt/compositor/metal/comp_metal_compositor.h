@@ -234,6 +234,24 @@ void
 comp_metal_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode);
 
 /*!
+ * #2671 / ADR-062: whether the session's window is hidden right now (the
+ * tracker's debounced verdict). False when untracked or @p xc is NULL.
+ */
+bool
+comp_metal_compositor_window_hidden(struct xrt_compositor *xc);
+
+/*!
+ * ADR-062 D4 (tier 3, XR_DXR_window_visibility): the session's window
+ * tracker, borrowed for the state tracker's per-poll verdict
+ * (@ref u_wv_report_get): demotion on minimize and the visibility event.
+ * NULL when the window is untracked or @p xc is NULL. Valid while the
+ * compositor lives.
+ */
+struct u_window_visibility;
+const struct u_window_visibility *
+comp_metal_compositor_window_visibility(struct xrt_compositor *xc);
+
+/*!
  * Runtime-owned window placement on macOS (ADR-050): take over the bound
  * window's title-bar drag, edge / corner resize and zoom, phase-snap every
  * step through the DP's `snap_window_rect` and apply it in the same Core
