@@ -1270,6 +1270,29 @@ xrt_display_processor_d3d12_tolerates_resample(struct xrt_display_processor_d3d1
 	return (caps.flags & XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE) != 0;
 }
 
+/*!
+ * May this instance weave a window it does not hold
+ * (@ref XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN)? Every "didn't answer"
+ * case — NULL DP, absent slot, NULL, false return — is false, so a plug-in
+ * built before the bit keeps its window-bound path. The D3D12 twin of
+ * xrt_display_processor_d3d11_phases_from_present_origin (ADR-060, #2382).
+ *
+ * @public @memberof xrt_display_processor_d3d12
+ */
+static inline bool
+xrt_display_processor_d3d12_phases_from_present_origin(struct xrt_display_processor_d3d12 *xdp)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	struct xrt_dp_scanout_caps caps;
+	xrt_dp_scanout_caps_init(&caps);
+	if (!xrt_display_processor_d3d12_get_scanout_caps(xdp, &caps)) {
+		return false;
+	}
+	return (caps.flags & XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN) != 0;
+}
+
 #ifdef __cplusplus
 }
 #endif

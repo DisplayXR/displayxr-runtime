@@ -11,8 +11,9 @@
  * create-time validation, the per-frame struct on xrEndFrame / xrLocateViews,
  * the state reply on xrWaitFrame and the system property. The geometry itself
  * (one resolve → phase + metrics + segments) is the compositor's
- * (compositor/util/comp_texture_target*.h). Native D3D11 only for now; D3D12,
- * GL and Vulkan get it through the ADR-059 hub (ADR-060 decision 3).
+ * (compositor/util/comp_texture_target*.h). Honoured by the in-process native
+ * D3D11 and D3D12 (#2382) compositors; GL and Vulkan get it through the
+ * ADR-059 hub (ADR-060 decision 3).
  */
 
 #include "xrt/xrt_compiler.h"
@@ -30,6 +31,13 @@
 
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 #include "d3d11/comp_d3d11_compositor.h"
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+#include "d3d12/comp_d3d12_compositor.h"
+#endif
+#if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) || defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR)
+#define OXR_TEXTURE_TARGET_HAVE_COMPOSITOR
+#include "util/comp_texture_target.h"
 #include "util/comp_dp_factory.h"
 #include "xrt/xrt_plugin.h" // XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE
 #endif
@@ -94,12 +102,12 @@ oxr_texture_target_verify_create(struct oxr_logger *log, const XrSessionCreateIn
 	return XR_SUCCESS;
 }
 
-#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+#ifdef OXR_TEXTURE_TARGET_HAVE_COMPOSITOR
 void
-oxr_texture_target_fill_d3d11_info(struct oxr_system *sys,
-                                   const XrWin32TextureTargetBindingDXR *tb,
-                                   uint64_t bound_display_id,
-                                   struct comp_d3d11_texture_target_info *out)
+oxr_texture_target_fill_info(struct oxr_system *sys,
+                             const XrWin32TextureTargetBindingDXR *tb,
+                             uint64_t bound_display_id,
+                             struct comp_texture_target_info *out)
 {
 	memset(out, 0, sizeof(*out));
 	if (tb == NULL) {
@@ -138,6 +146,14 @@ forward_frame(struct oxr_logger *log, struct oxr_session *sess, const XrWin32Tex
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
 		comp_d3d11_compositor_set_texture_target(
+		    &sess->xcn->base, !at_frame_end, tf->referenceWindow, tf->targetRect.offset.x,
+		    tf->targetRect.offset.y, (uint32_t)tf->targetRect.extent.width,
+		    (uint32_t)tf->targetRect.extent.height, (uint64_t)tf->flags);
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor && sess->xcn != NULL) {
+		comp_d3d12_compositor_set_texture_target(
 		    &sess->xcn->base, !at_frame_end, tf->referenceWindow, tf->targetRect.offset.x,
 		    tf->targetRect.offset.y, (uint32_t)tf->targetRect.extent.width,
 		    (uint32_t)tf->targetRect.extent.height, (uint64_t)tf->flags);
@@ -184,6 +200,11 @@ oxr_texture_target_locate_end(struct oxr_session *sess)
 		comp_d3d11_compositor_end_texture_target_locate(&sess->xcn->base);
 	}
 #endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor && sess->xcn != NULL) {
+		comp_d3d12_compositor_end_texture_target_locate(&sess->xcn->base);
+	}
+#endif
 }
 
 void
@@ -192,13 +213,13 @@ oxr_texture_target_note_ignored(struct oxr_session *sess, const XrSessionCreateI
 	if (sess->texture_target_bound || oxr_texture_target_find_binding(createInfo) == NULL) {
 		return;
 	}
-	// Spec v9 is honoured by the in-process D3D11 compositor only (ADR-060
-	// decision 3). An app that dropped windowHandle trusting it would weave
-	// display-scoped with nothing in the log otherwise.
+	// Spec v9 is honoured by the in-process D3D11 and D3D12 (#2382)
+	// compositors only (ADR-060 decision 3). An app that dropped windowHandle
+	// trusting it would weave display-scoped with nothing in the log otherwise.
 	U_LOG_W(
-	    "xrCreateSession: XrWin32TextureTargetBindingDXR IGNORED — only the in-process D3D11 compositor honours "
-	    "the texture target binding (D3D12 / GL / Vulkan arrive via the hub; IPC sessions are not covered by "
-	    "v9). windowHandle, if given, carries the weave as in SPEC_VERSION 8.");
+	    "xrCreateSession: XrWin32TextureTargetBindingDXR IGNORED — only the in-process D3D11 and D3D12 "
+	    "compositors honour the texture target binding (GL / Vulkan arrive via the hub; IPC sessions are not "
+	    "covered by v9). windowHandle, if given, carries the weave as in SPEC_VERSION 8.");
 }
 
 void
@@ -220,10 +241,20 @@ oxr_texture_target_wait(struct oxr_session *sess, XrFrameState *frameState)
 	if (!sess->texture_target_bound) {
 		return;
 	}
+#ifdef OXR_TEXTURE_TARGET_HAVE_COMPOSITOR
+	struct comp_texture_target_state s;
+	bool have = false;
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
-	struct comp_d3d11_texture_target_state s;
-	if (sess->is_d3d11_native_compositor && sess->xcn != NULL &&
-	    comp_d3d11_compositor_get_texture_target_state(&sess->xcn->base, &s)) {
+	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
+		have = comp_d3d11_compositor_get_texture_target_state(&sess->xcn->base, &s);
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor && sess->xcn != NULL) {
+		have = comp_d3d12_compositor_get_texture_target_state(&sess->xcn->base, &s);
+	}
+#endif
+	if (have) {
 		st->flags = (XrWin32TextureTargetStateFlagsDXR)s.flags;
 		if (s.valid) {
 			st->wovenScreenOrigin.x = s.screen_x;
@@ -248,9 +279,11 @@ oxr_texture_target_system_properties(struct oxr_system *sys, XrSystemProperties 
 	}
 	p->supportsTextureTarget = XR_FALSE;
 	p->windowlessPhase = XR_FALSE;
-#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
-	// In-process native D3D11 only: an IPC session's texture class is not
-	// covered by v9 (spec §8).
+#ifdef OXR_TEXTURE_TARGET_HAVE_COMPOSITOR
+	// In-process native D3D11 / D3D12 only: an IPC session's texture class is
+	// not covered by v9 (spec §8). A system property is asked before any
+	// graphics binding exists, so it cannot be answered per API; the
+	// session's state flags are the authority for what its tier did.
 	const bool service_mode = sys->xsysc != NULL && sys->xsysc->info.is_service_mode;
 	p->supportsTextureTarget = service_mode ? XR_FALSE : XR_TRUE;
 	// A PREDICTION from the plug-in-level hint (ADR-060 decision 4); the

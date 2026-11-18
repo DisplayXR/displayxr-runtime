@@ -15,6 +15,7 @@
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_display_metrics.h"
 #include "util/u_rear_budget.h" // XR_DXR_depth_budget: struct u_rear_budget_out
+#include "util/comp_texture_target.h" // ADR-060: comp_texture_target_info / _state
 
 // Forward declarations
 struct comp_d3d12_compositor;
@@ -71,7 +72,11 @@ comp_d3d12_compositor_sample_release_value(struct comp_d3d12_compositor *c);
  *        (`const struct xrt_dp_registry_entry *`, owned by the system
  *        compositor info) — the source of the hub's windowless DP when a
  *        texture session takes the client-presents strategy (`DXR_HUB=1`).
- *        NULL keeps every texture session on this tier's own legs.
+ *        NULL keeps every texture session on this tier's own legs. Also the
+ *        source of a bound texture session's own windowless primary DP
+ *        (ADR-060, `create_dp_d3d12_for_screen`).
+ * @param texture_target ADR-060 texture target binding (XR_DXR_win32_window_binding
+ *        v9, #2382), or NULL. Only meaningful with @p shared_texture_handle.
  *
  * @ingroup comp_d3d12
  */
@@ -87,7 +92,46 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
                              const void *windowless_dp_entry,
+                             const struct comp_texture_target_info *texture_target,
                              struct xrt_compositor_native **out_xc);
+
+/*
+ * ADR-060 — texture target binding (XR_DXR_win32_window_binding v9), the D3D12
+ * twin of the D3D11 tier's entry points (#2382). A shared-texture session
+ * names where its texture is drawn: a reference window (or NULL = desktop px)
+ * plus a rect in its client area, device px. The compositor resolves the pair
+ * at every weave, phases a WINDOWLESS primary DP from it (set_present_origin)
+ * when the DP declares it can, frames the window metrics to it, and reports
+ * what it used. The reference window is only read, never handed to a DP.
+ */
+
+/*!
+ * A frame's target. @p for_locate false: from xrEndFrame — authoritative, what
+ * the weave uses (an omitted struct keeps the last xrEndFrame value). @p
+ * for_locate true: from xrLocateViews — frames only that locate's views (the
+ * window metrics), until @ref comp_d3d12_compositor_end_texture_target_locate.
+ * Ignored unless the session was created bound. @p flags are
+ * XrWin32TextureTargetFrameFlagsDXR (advisory).
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_compositor_set_texture_target(struct xrt_compositor *xc,
+                                         bool for_locate,
+                                         void *reference_window,
+                                         int32_t x,
+                                         int32_t y,
+                                         uint32_t w,
+                                         uint32_t h,
+                                         uint64_t flags);
+
+//! The locate that chained a target returned: metrics fall back to the xrEndFrame slot.
+void
+comp_d3d12_compositor_end_texture_target_locate(struct xrt_compositor *xc);
+
+//! What the most recently woven frame used. @return false when the session is not bound.
+bool
+comp_d3d12_compositor_get_texture_target_state(struct xrt_compositor *xc, struct comp_texture_target_state *out);
 
 /*!
  * Get the predicted eye positions from the display processor.

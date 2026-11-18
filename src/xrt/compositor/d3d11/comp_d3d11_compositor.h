@@ -15,6 +15,7 @@
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_display_metrics.h"
 #include "util/u_rear_budget.h"
+#include "util/comp_texture_target.h" // ADR-060: comp_texture_target_info / _state
 
 // Forward declarations
 struct comp_d3d11_compositor;
@@ -52,7 +53,6 @@ extern "C" {
  *
  * @ingroup comp_d3d11
  */
-struct comp_d3d11_texture_target_info;
 xrt_result_t
 comp_d3d11_compositor_create(struct xrt_device *xdev,
                              void *hwnd,
@@ -62,7 +62,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
                              bool transparent_background,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
-                             const struct comp_d3d11_texture_target_info *texture_target,
+                             const struct comp_texture_target_info *texture_target,
                              struct xrt_compositor_native **out_xc);
 
 /*
@@ -74,23 +74,6 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
  * from it (set_present_origin), frames the window metrics to it, and segments
  * it across screens. The reference window is only read, never handed to a DP.
  */
-
-/*!
- * Create-time binding. @p windowless_dp_entry is the DP registry entry of the
- * session's screen (`const struct xrt_dp_registry_entry *`, owned by the
- * system compositor info, outlives the session), used to make the windowless
- * primary DP through the plug-in's create_dp_d3d11_for_screen.
- *
- * @ingroup comp_d3d11
- */
-struct comp_d3d11_texture_target_info
-{
-	bool bound;
-	void *reference_window;
-	int32_t x, y;
-	uint32_t w, h;
-	const void *windowless_dp_entry;
-};
 
 /*!
  * A frame's target. @p for_locate false: from xrEndFrame — authoritative, what
@@ -116,32 +99,10 @@ comp_d3d11_compositor_set_texture_target(struct xrt_compositor *xc,
 void
 comp_d3d11_compositor_end_texture_target_locate(struct xrt_compositor *xc);
 
-//! XrWin32TextureTargetStateFlagsDXR, same values.
-#define COMP_D3D11_TT_STATE_WINDOWLESS_PHASE 0x1u
-#define COMP_D3D11_TT_STATE_ANCHOR_FALLBACK 0x2u
-#define COMP_D3D11_TT_STATE_SEGMENTED 0x4u
-#define COMP_D3D11_TT_STATE_FLAT_SEGMENT 0x8u
-#define COMP_D3D11_TT_STATE_CLAMPED 0x10u
-
-/*!
- * What the most recently woven frame used (XrWin32TextureTargetStateDXR).
- *
- * @ingroup comp_d3d11
- */
-struct comp_d3d11_texture_target_state
-{
-	bool valid; //!< at least one bound frame was woven
-	uint64_t flags;
-	int32_t screen_x, screen_y;
-	int32_t rect_x, rect_y;
-	uint32_t rect_w, rect_h;
-	int64_t display_time_ns;
-};
-
 //! @return false when the session is not bound.
 bool
 comp_d3d11_compositor_get_texture_target_state(struct xrt_compositor *xc,
-                                               struct comp_d3d11_texture_target_state *out);
+                                               struct comp_texture_target_state *out);
 
 /*
  * XR_DXR_local_3d_zone — authored 2D/3D mask consumer (Phase 1 of unified

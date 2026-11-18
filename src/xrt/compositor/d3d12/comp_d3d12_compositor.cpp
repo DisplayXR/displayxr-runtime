@@ -16,7 +16,8 @@
 #include "comp_d3d12_outcomp.h"
 #include "comp_d3d12_segments.h" // multi-screen M6 (D3D12)
 #include "util/comp_segments_route.h"
-#include "util/comp_texture_target_win32.h" // #2370: the client-presents target read
+#include "util/comp_texture_target_win32.h" // ADR-060 texture target binding (#2382); #2370 client-presents
+#include "util/comp_dp_windowless_d3d12.h"  // ADR-060 windowless DP rule (#2382)
 #include "xrt/xrt_screen.h"
 
 // #918 D12-3 — the output-device split: the activation decision and the
@@ -529,7 +530,52 @@ struct comp_d3d12_compositor
 	uint32_t shared_texture_w, shared_texture_h;
 
 	//! #2370: the session screen's DP registry entry (system-owned), the hub's windowless DP source.
+	//! Also the source of a bound texture session's own windowless primary DP (ADR-060, #2382).
 	const struct xrt_dp_registry_entry *client_entry;
+
+	/*!
+	 * ADR-060 texture target binding (XR_DXR_win32_window_binding v9, #2382 —
+	 * the D3D12 twin of comp_d3d11_compositor::tt): the reference window +
+	 * rect the app draws the shared texture at. TWO slots under `mutex`,
+	 * because an engine locates frame N+1 on its game thread while its render
+	 * thread is inside xrEndFrame N:
+	 *  - `frame`: written only by xrEndFrame; the weave, the canvas, the zone
+	 *    anchor and the state reply read it (resolved live, at weave time);
+	 *  - `locate`: written only by xrLocateViews for the duration of that
+	 *    locate; only the window metrics read it, falling back to `frame`.
+	 * `frame.bound` is set at create and never changes. `windowless` = the
+	 * binding is honoured: the primary DP (this tier's, or the hub's on the
+	 * client-presents route) is windowless and phases from
+	 * set_present_origin. The reference window is only read, never handed to
+	 * a DP.
+	 */
+	struct
+	{
+		std::mutex mutex;
+		struct comp_texture_target frame;
+		struct comp_texture_target locate;
+		bool locate_valid;
+		bool windowless;
+		bool anchor_fallback;
+		//! The windowless primary DP's screen origin, desktop device px.
+		int32_t panel_left;
+		int32_t panel_top;
+		bool clamp_warned;
+		bool origin_logged;
+		int32_t origin_x;
+		int32_t origin_y;
+		//! Anchor fallback: the padded render target the canvas is woven
+		//! into at its offset in the anchor's client area (d3d12_tt_weave).
+		//! Rests in RENDER_TARGET between frames.
+		ID3D12Resource *pad_tex;
+		ID3D12DescriptorHeap *pad_rtv_heap;
+		uint32_t pad_w;
+		uint32_t pad_h;
+		bool pad_logged;
+		bool pad_refused_warned;
+		//! What the last woven bound frame used (under `mutex`).
+		struct comp_texture_target_state state;
+	} tt;
 
 	//! Transparent session (#573): the DP composes-under-bg. With
 	//! DXR_PRESENT_OPAQUE (#833) this also flips the Local2D composite into
@@ -1080,9 +1126,123 @@ static void d3d12_phase_debug_dump(struct comp_d3d12_compositor *c, const char *
 // invalid canvas there would fall back to display dims — the window rect
 // keeps the #464 clamp. Callers in the frame path hold c->mutex, which
 // zone_mask_submit/destroy also take, so the mask cannot flip mid-frame.
+/*
+ *
+ * ADR-060 texture target binding helpers (#2382; the D3D12 twins of the
+ * d3d11_tt_* helpers in comp_d3d11_compositor.cpp).
+ *
+ */
+
+static inline bool
+d3d12_tt_bound(const struct comp_d3d12_compositor *c)
+{
+	return c->tt.frame.bound; // set at create, immutable after
+}
+
+/*!
+ * Resolve the named (reference window, rect) NOW, clamped to the shared
+ * texture. One computation for phase, metrics and canvas (ADR-060 §2).
+ */
+static bool
+d3d12_tt_resolve(struct comp_d3d12_compositor *c,
+                 bool for_locate,
+                 struct comp_texture_target_resolved *out,
+                 struct comp_texture_target *out_named)
+{
+	out->valid = false;
+	if (!d3d12_tt_bound(c)) {
+		return false;
+	}
+	struct comp_texture_target named;
+	{
+		std::lock_guard<std::mutex> lock(c->tt.mutex);
+		named = (for_locate && c->tt.locate_valid) ? c->tt.locate : c->tt.frame;
+	}
+	if (out_named != nullptr) {
+		*out_named = named;
+	}
+	return comp_texture_target_resolve_win32(&named, c->shared_texture_w, c->shared_texture_h, out);
+}
+
+/*!
+ * The window whose monitor answers DPI / refresh questions: our swapchain
+ * window, else the bound reference window, else the anchor.
+ */
+static HWND
+d3d12_geometry_hwnd(struct comp_d3d12_compositor *c)
+{
+	if (c->hwnd != nullptr) {
+		return c->hwnd;
+	}
+	if (d3d12_tt_bound(c)) {
+		std::lock_guard<std::mutex> lock(c->tt.mutex);
+		if (c->tt.frame.ref != nullptr) {
+			return static_cast<HWND>(c->tt.frame.ref);
+		}
+	}
+	return c->app_hwnd;
+}
+
+/*!
+ * The client region zone / Local2D / mask rects are expressed in, and (when
+ * @p out_origin is non-NULL) its origin on the desktop. Under a texture target
+ * binding that region IS the target (ADR-060 §3) — the xrEndFrame slot, or
+ * with @p for_locate the current locate's target if it chained one; otherwise
+ * the window's client area. False when it cannot be resolved.
+ */
+static bool
+d3d12_client_geometry(
+    struct comp_d3d12_compositor *c, uint32_t *out_w, uint32_t *out_h, POINT *out_origin, bool for_locate = false)
+{
+	if (d3d12_tt_bound(c)) {
+		struct comp_texture_target_resolved r;
+		if (!d3d12_tt_resolve(c, for_locate, &r, nullptr)) {
+			return false;
+		}
+		*out_w = r.screen.w;
+		*out_h = r.screen.h;
+		if (out_origin != nullptr) {
+			out_origin->x = r.screen.x;
+			out_origin->y = r.screen.y;
+		}
+		return true;
+	}
+	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	RECT rc;
+	if (wnd == nullptr || !GetClientRect(wnd, &rc) || rc.right <= 0 || rc.bottom <= 0) {
+		return false;
+	}
+	if (out_origin != nullptr) {
+		out_origin->x = 0;
+		out_origin->y = 0;
+		if (!ClientToScreen(wnd, out_origin)) {
+			return false;
+		}
+	}
+	*out_w = (uint32_t)rc.right;
+	*out_h = (uint32_t)rc.bottom;
+	return true;
+}
+
+static bool
+d3d12_window_metrics(struct comp_d3d12_compositor *c, bool for_locate, struct xrt_window_metrics *out_metrics);
+
 static struct u_canvas_rect
 d3d12_effective_canvas(struct comp_d3d12_compositor *c)
 {
+	// ADR-060 §3: under a texture target binding the rect IS the canvas, every
+	// frame, with or without zones (INV-5.6's "zones frame every frame" is the
+	// anchor path's rule only).
+	if (d3d12_tt_bound(c)) {
+		struct u_canvas_rect tgt = {};
+		uint32_t w = 0, h = 0;
+		if (d3d12_client_geometry(c, &w, &h, nullptr)) {
+			tgt.valid = true;
+			tgt.w = w;
+			tgt.h = h;
+		}
+		return tgt;
+	}
 	// #439 Phase 3: Local2D layers supersede the canvas the same way an
 	// authored mask does — the composite writes the whole window region.
 	// XR_DXR_display_zones: a zones frame spans the full client window by
@@ -1752,6 +1912,9 @@ d3d12_test_fake_dp_refuse(void)
  *         SCANOUT device is recoverable (retire the split and try the app
  *         device — ADR-037 §3a), a refusal on the app device is not.
  */
+static void
+d3d12_dp_session_settings(struct comp_d3d12_compositor *c, bool client_presents);
+
 static bool
 d3d12_make_dp(struct comp_d3d12_compositor *c)
 {
@@ -1779,7 +1942,19 @@ d3d12_make_dp(struct comp_d3d12_compositor *c)
 	}
 	U_LOG_W("D3D12 display processor created via factory on %s device (hwnd %p)",
 	        c->split_active ? "the SCANOUT" : "the app", (void *)dp_hwnd);
+	d3d12_dp_session_settings(c, false);
+	return true;
+}
 
+/*!
+ * The session-level settings a freshly created primary DP must be given.
+ * @p client_presents: the app presents the woven texture itself (ADR-060
+ * texture target: `set_transparent_background(..., client_presents = true)`,
+ * as the D3D11 tier's windowless texture DP is told).
+ */
+static void
+d3d12_dp_session_settings(struct comp_d3d12_compositor *c, bool client_presents)
+{
 	// Report the DP's weave scope once (no-op for every GPU weaver, which
 	// reads as canvas). In-process output is a WINDOW's client area, so a
 	// scanout-scoped hardware weaver gets told here that it cannot be correct
@@ -1800,11 +1975,53 @@ d3d12_make_dp(struct comp_d3d12_compositor *c)
 	// Forward session-level transparency (#573 — chroma-key-free).
 	// client_presents=false — DELIBERATELY; #904's true was reverted after a
 	// hardware eyeball. See comp_d3d11_compositor.cpp for the full rationale.
-	xrt_display_processor_d3d12_set_transparent_background(c->display_processor, c->transparent_background, false);
+	xrt_display_processor_d3d12_set_transparent_background(c->display_processor, c->transparent_background,
+	                                                       client_presents);
 
 	// #68: tell the DP whether the app self-presents only the canvas (texture
 	// app) vs the runtime presenting the full target (handle).
 	xrt_display_processor_d3d12_set_shared_texture_present(c->display_processor, c->has_shared_texture);
+}
+
+/*!
+ * ADR-060 §6 (#2382): the primary DP of a bound texture session, made
+ * WINDOWLESS through the session screen's per-screen factory (window = NULL —
+ * the factory the segment manager makes its per-screen DPs with). Kept only
+ * when the plug-in hints windowless phase for that screen AND the DP itself
+ * declares XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN (the authority) — the
+ * one rule, comp_dp_make_windowless_d3d12. Decided once per session.
+ */
+static bool
+d3d12_make_windowless_texture_dp(struct comp_d3d12_compositor *c)
+{
+	const struct xrt_dp_registry_entry *e = c->client_entry;
+	struct xrt_display_processor_d3d12 *dp = nullptr;
+	const char *why = nullptr;
+	xrt_result_t ret = XRT_SUCCESS;
+	if (!comp_dp_make_windowless_d3d12(e, d3d12_out_device(c), d3d12_out_queue(c), &dp, &why, &ret)) {
+		if (strcmp(why, COMP_DP_WINDOWLESS_NO_FACTORY) == 0) {
+			U_LOG_W("ADR-060: texture target bound, but the session screen's plug-in has no per-screen D3D12 "
+			        "factory");
+		} else if (strcmp(why, COMP_DP_WINDOWLESS_NO_HINT) == 0) {
+			U_LOG_W("ADR-060: '%s' does not hint windowless phase for this screen — no windowless texture DP",
+			        e->plugin_id);
+		} else if (strcmp(why, COMP_DP_WINDOWLESS_REFUSED) == 0) {
+			U_LOG_W("ADR-060: windowless texture DP refused by '%s' (error %d)", e->plugin_id, (int)ret);
+		} else {
+			U_LOG_W("ADR-060: '%s' D3D12 DP does not declare PHASE_FROM_PRESENT_ORIGIN — destroyed",
+			        e->plugin_id);
+		}
+		return false;
+	}
+	c->display_processor = dp;
+	c->tt.windowless = true;
+	c->tt.panel_left = e->screen_left;
+	c->tt.panel_top = e->screen_top;
+	d3d12_dp_session_settings(c, true);
+	U_LOG_W(
+	    "ADR-060: texture target bound — WINDOWLESS primary D3D12 DP from '%s' (screen at %d,%d %ux%u), phased "
+	    "from the target's present origin; the reference window %p is read, never handed to the vendor",
+	    e->plugin_id, e->screen_left, e->screen_top, e->pixel_width, e->pixel_height, c->tt.frame.ref);
 	return true;
 }
 
@@ -2426,6 +2643,10 @@ d3d12_reroute_wire(struct comp_d3d12_compositor *c, struct xrt_device *xdev, boo
 	comp_hub_d3d11_log_placement(c->reroute.split, "d3d12");
 	c->reroute.active = true;
 	c->reroute.client_presents = client;
+	if (client && d3d12_tt_bound(c)) {
+		// ADR-060 (#2382): the windowless DP is the hub's; the target-state reply reports it.
+		c->tt.windowless = true;
+	}
 	// #2370: client-presents weaves on the app's adapter (the app presents),
 	// so its `weave placement:` line is the native texture session's.
 	c->split_off_reason = client ? COMP_SPLIT_REASON_SHARED_TEXTURE : NULL;
@@ -2813,16 +3034,26 @@ d3d12_client_presents_requested(void)
 }
 
 /*!
- * #2370: this frame's client-presents target — the app's window client area
- * on the desktop (device px, read under a per-monitor-v2 pin through ADR-060
- * R1's compose, clamped to the shared texture). The D3D12 tier carries no v9
- * target binding yet, so the reference window + rect is the windowHandle anchor
- * and its whole client area (a documented limitation, #2382). False when the
- * window is gone or empty.
+ * #2370: this frame's client-presents target, handed to the hub as data.
+ *
+ * A session bound to an ADR-060 texture target (#2382) names it: the reference
+ * window + rect of the xrEndFrame slot, resolved NOW (one resolve feeds the
+ * hub's phase, canvas and segments — R1's helper, unchanged). An UNBOUND
+ * texture session keeps the pre-v9 reading: the windowHandle anchor and its
+ * whole client area (device px, under a per-monitor-v2 pin, clamped to the
+ * shared texture). False when the window is gone or the target is empty.
+ *
+ * @param[out] out_named  What was named (the state reply's rect offset).
  */
 static bool
-d3d12_client_target(struct comp_d3d12_compositor *c, struct comp_seg_rect *out)
+d3d12_client_target(struct comp_d3d12_compositor *c,
+                    struct comp_texture_target_resolved *out,
+                    struct comp_texture_target *out_named)
 {
+	if (d3d12_tt_bound(c)) {
+		return d3d12_tt_resolve(c, false, out, out_named);
+	}
+	out->valid = false;
 	if (c->app_hwnd == nullptr || !IsWindow(c->app_hwnd) || c->shared_texture_w == 0) {
 		return false;
 	}
@@ -2847,13 +3078,9 @@ d3d12_client_target(struct comp_d3d12_compositor *c, struct comp_seg_rect *out)
 	tt.ref = c->app_hwnd;
 	tt.w = (uint32_t)rc.right;
 	tt.h = (uint32_t)rc.bottom;
-	struct comp_texture_target_resolved r = {};
-	if (!comp_texture_target_compose(&tt, (int32_t)org.x, (int32_t)org.y, c->shared_texture_w,
-	                                 c->shared_texture_h, &r)) {
-		return false;
-	}
-	*out = r.screen;
-	return true;
+	*out_named = tt;
+	return comp_texture_target_compose(&tt, (int32_t)org.x, (int32_t)org.y, c->shared_texture_w,
+	                                   c->shared_texture_h, out);
 }
 
 /*!
@@ -2872,8 +3099,9 @@ d3d12_reroute_stage_a_client(struct comp_d3d12_compositor *c, struct xrt_device 
 	const char *why = nullptr;
 	if (c->transparent_background) {
 		why = "a transparent session (not carried on client-presents yet)";
-	} else if (c->app_hwnd == nullptr) {
-		why = "no windowHandle to phase the texture from (the D3D12 tier has no v9 target binding yet)";
+	} else if (c->app_hwnd == nullptr && !d3d12_tt_bound(c)) {
+		why = "no texture target binding (XR_DXR_win32_window_binding v9) and no windowHandle to phase the "
+		      "texture from";
 	} else if (c->client_entry == nullptr) {
 		why = "no DP registry entry for the session screen";
 	} else if (c->shared_texture_handle == nullptr || c->dp_factory_d3d11 == nullptr) {
@@ -4877,14 +5105,11 @@ d3d12_publish_rear_budget_zones(struct comp_d3d12_compositor *c)
 
 	// The client-window region the zone rects are expressed in — the same
 	// GetClientRect the composite derives its region from.
+	// Under a texture target binding that region is the target (ADR-060).
 	uint32_t win_w = 0, win_h = 0;
-	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
-	if (wnd != nullptr) {
-		RECT r;
-		if (GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
-			win_w = (uint32_t)r.right;
-			win_h = (uint32_t)r.bottom;
-		}
+	if (!d3d12_client_geometry(c, &win_w, &win_h, nullptr)) {
+		win_w = 0;
+		win_h = 0;
 	}
 
 	struct u_bg_rect_norm zones[COMP_REAR_BUDGET_MAX_ZONES];
@@ -4990,6 +5215,255 @@ d3d12_projection_layer_view_count(const struct comp_layer_accum *layers)
 		}
 	}
 	return 0;
+}
+
+/*!
+ * ADR-060 anchor fallback (#2382; the D3D12 twin of d3d11_tt_anchor_pad): the
+ * windowed DP phases render-target pixel p as the anchor window's client pixel
+ * p, but the app draws texel (0,0) of the shared texture at the target's
+ * origin. When that origin is inside the anchor's client area but not at its
+ * corner, weave the canvas at the same offset of a padded render target (the
+ * DP's viewport carries the offset into the phase) and copy it back to (0,0).
+ * Returns true with the offset when the pad is to be used, false to weave
+ * straight into the shared texture (no offset, or one that cannot be
+ * corrected — WARNed once per episode).
+ *
+ * App thread, c->mutex held (layer_commit), the app queue idle (the caller
+ * waited on it before re-arming the list), so a grown pad may replace the old
+ * one at once.
+ */
+static bool
+d3d12_tt_anchor_pad(struct comp_d3d12_compositor *c,
+                    const struct comp_texture_target_resolved *r,
+                    int32_t *out_x,
+                    int32_t *out_y)
+{
+	POINT anchor;
+	SIZE client;
+	if (c->shared_texture == nullptr || !comp_texture_target_client_origin_win32(c->app_hwnd, &anchor, &client)) {
+		return false;
+	}
+	if (!comp_texture_target_anchor_offset(r, anchor.x, anchor.y, (uint32_t)client.cx, (uint32_t)client.cy,
+	                                       D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, out_x, out_y)) {
+		const bool offset = r->screen.x != anchor.x || r->screen.y != anchor.y;
+		if (offset && !c->tt.pad_refused_warned) {
+			c->tt.pad_refused_warned = true;
+			U_LOG_W(
+			    "ADR-060: target at (%d,%d) cannot be phased from the windowHandle anchor "
+			    "(client at %d,%d) — weaving unpadded, the phase is off by the target's offset",
+			    r->screen.x, r->screen.y, (int)anchor.x, (int)anchor.y);
+		}
+		return false;
+	}
+	c->tt.pad_refused_warned = false;
+
+	const uint32_t need_w = (uint32_t)*out_x + r->screen.w;
+	const uint32_t need_h = (uint32_t)*out_y + r->screen.h;
+	if (c->tt.pad_tex == nullptr || c->tt.pad_w < need_w || c->tt.pad_h < need_h) {
+		if (c->tt.pad_tex != nullptr) {
+			c->tt.pad_tex->Release();
+			c->tt.pad_tex = nullptr;
+		}
+		// Grow-only: a drag or resize must not reallocate every frame.
+		D3D12_RESOURCE_DESC desc = c->shared_texture->GetDesc();
+		const DXGI_FORMAT fmt = desc.Format;
+		desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		desc.Alignment = 0;
+		desc.Width = need_w > c->tt.pad_w ? need_w : c->tt.pad_w;
+		desc.Height = need_h > c->tt.pad_h ? need_h : c->tt.pad_h;
+		desc.DepthOrArraySize = 1;
+		desc.MipLevels = 1;
+		desc.SampleDesc.Count = 1;
+		desc.SampleDesc.Quality = 0;
+		desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+		D3D12_HEAP_PROPERTIES hp = {};
+		hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+		HRESULT hr = c->device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &desc,
+		                                                D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+		                                                IID_PPV_ARGS(&c->tt.pad_tex));
+		if (SUCCEEDED(hr) && c->tt.pad_rtv_heap == nullptr) {
+			D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+			hd.NumDescriptors = 1;
+			hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+			hr = c->device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&c->tt.pad_rtv_heap));
+		}
+		if (FAILED(hr)) {
+			if (c->tt.pad_tex != nullptr) {
+				c->tt.pad_tex->Release();
+				c->tt.pad_tex = nullptr;
+			}
+			c->tt.pad_w = 0;
+			c->tt.pad_h = 0;
+			if (!c->tt.pad_refused_warned) {
+				c->tt.pad_refused_warned = true;
+				U_LOG_W("ADR-060: anchor phase pad %ux%u failed (0x%08x) — weaving unpadded", need_w,
+				        need_h, (unsigned)hr);
+			}
+			return false;
+		}
+		c->tt.pad_tex->SetName(L"DXR.texture_target_anchor_pad");
+		D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+		rtv_desc.Format = fmt;
+		rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+		c->device->CreateRenderTargetView(c->tt.pad_tex, &rtv_desc,
+		                                  c->tt.pad_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+		c->tt.pad_w = (uint32_t)desc.Width;
+		c->tt.pad_h = desc.Height;
+	}
+	if (!c->tt.pad_logged) {
+		c->tt.pad_logged = true;
+		U_LOG_W(
+		    "ADR-060: windowHandle anchor phase — canvas woven at (%d,%d) of the anchor's client area "
+		    "(target at (%d,%d) %ux%u, pad %ux%u)",
+		    *out_x, *out_y, r->screen.x, r->screen.y, r->screen.w, r->screen.h, c->tt.pad_w, c->tt.pad_h);
+	}
+	return true;
+}
+
+static inline void
+d3d12_tt_transition(ID3D12GraphicsCommandList *cl,
+                    ID3D12Resource *res,
+                    D3D12_RESOURCE_STATES before,
+                    D3D12_RESOURCE_STATES after)
+{
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = res;
+	b.Transition.StateBefore = before;
+	b.Transition.StateAfter = after;
+	b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	cl->ResourceBarrier(1, &b);
+}
+
+//! Store what a bound frame used — XrWin32TextureTargetStateDXR at the next xrWaitFrame.
+static void
+d3d12_tt_store_state(struct comp_d3d12_compositor *c,
+                     uint64_t flags,
+                     const struct comp_texture_target_resolved *r,
+                     const struct comp_texture_target *woven)
+{
+	std::lock_guard<std::mutex> lock(c->tt.mutex);
+	c->tt.state.valid = true;
+	c->tt.state.flags = flags;
+	c->tt.state.screen_x = r->screen.x;
+	c->tt.state.screen_y = r->screen.y;
+	c->tt.state.rect_x = woven->x;
+	c->tt.state.rect_y = woven->y;
+	c->tt.state.rect_w = r->screen.w;
+	c->tt.state.rect_h = r->screen.h;
+	c->tt.state.display_time_ns = c->layer_accum.data.display_time_ns;
+}
+
+/*!
+ * ADR-060 (#2382): weave a bound texture session's frame into the shared
+ * texture (in RENDER_TARGET and bound as the render target of c->cmd_list on
+ * entry and on return) for the target resolved NOW — one resolve feeds the
+ * phase and the canvas (§2, §3). The D3D12 twin of d3d11_tt_weave, with one
+ * difference: this tier does not segment a texture session across screens
+ * (d3d12_segments_tick is window-bound), so the frame is always woven by the
+ * session screen's one DP and SEGMENTED / FLAT_SEGMENT are never reported
+ * here; the hub's client-presents route (DXR_HUB=1) does segment.
+ *
+ * App thread, c->mutex held (layer_commit).
+ */
+static void
+d3d12_tt_weave(struct comp_d3d12_compositor *c,
+               ID3D12Resource *dp_resource,
+               D3D12_CPU_DESCRIPTOR_HANDLE st_rtv,
+               uint32_t view_width,
+               uint32_t view_height,
+               uint32_t tile_columns,
+               uint32_t tile_rows,
+               uint32_t target_w,
+               uint32_t target_h)
+{
+	struct comp_texture_target_resolved r;
+	struct comp_texture_target woven;
+	if (!d3d12_tt_resolve(c, false, &r, &woven)) {
+		// The reference window died between xrEndFrame's check and now:
+		// leave the texture as it was rather than weave at a stale origin.
+		return;
+	}
+	uint64_t state = 0;
+	if (r.clamped) {
+		state |= COMP_TEXTURE_TARGET_STATE_CLAMPED;
+		if (!c->tt.clamp_warned) {
+			c->tt.clamp_warned = true;
+			U_LOG_W("ADR-060: target rect larger than the shared texture (%ux%u) — woven clamped to %ux%u",
+			        target_w, target_h, r.screen.w, r.screen.h);
+		}
+	} else {
+		c->tt.clamp_warned = false; // one WARN per clamp episode
+	}
+
+	if (c->tt.windowless) {
+		state |= COMP_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE;
+		int32_t ox = 0, oy = 0;
+		comp_texture_target_present_origin(&r, c->tt.panel_left, c->tt.panel_top, &ox, &oy);
+		xrt_display_processor_d3d12_set_present_origin(c->display_processor, ox, oy);
+		if (!c->tt.origin_logged) {
+			c->tt.origin_logged = true;
+			U_LOG_W("ADR-060: windowless texture DP phased from present origin (%d,%d) — target at (%d,%d) "
+			        "%ux%u, screen at (%d,%d)",
+			        ox, oy, r.screen.x, r.screen.y, r.screen.w, r.screen.h, c->tt.panel_left, c->tt.panel_top);
+		} else if (ox != c->tt.origin_x || oy != c->tt.origin_y) {
+			U_LOG_I("ADR-060: present origin -> (%d,%d)", ox, oy);
+		}
+		c->tt.origin_x = ox;
+		c->tt.origin_y = oy;
+	} else if (c->tt.anchor_fallback) {
+		state |= COMP_TEXTURE_TARGET_STATE_ANCHOR_FALLBACK;
+	}
+
+	ID3D12GraphicsCommandList *cl = c->cmd_list;
+	const uint64_t srv = d3d12_bind_dp_atlas_srv(c, dp_resource); // #854: a real SRV
+	const uint32_t fmt = static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM);
+	int32_t pad_x = 0, pad_y = 0;
+	if (c->tt.anchor_fallback && d3d12_tt_anchor_pad(c, &r, &pad_x, &pad_y)) {
+		// The canvas goes in at the anchor offset, starting from what the
+		// shared texture holds (a read-back DP sees the same pixels), and
+		// comes back out at (0,0), where the app reads it.
+		D3D12_TEXTURE_COPY_LOCATION pad_loc = {};
+		pad_loc.pResource = c->tt.pad_tex;
+		pad_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		D3D12_TEXTURE_COPY_LOCATION st_loc = {};
+		st_loc.pResource = c->shared_texture;
+		st_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+		d3d12_tt_transition(cl, c->shared_texture, D3D12_RESOURCE_STATE_RENDER_TARGET,
+		                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+		d3d12_tt_transition(cl, c->tt.pad_tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+		const D3D12_BOX in = {0, 0, 0, r.screen.w, r.screen.h, 1};
+		cl->CopyTextureRegion(&pad_loc, (UINT)pad_x, (UINT)pad_y, 0, &st_loc, &in);
+		d3d12_tt_transition(cl, c->tt.pad_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+		const D3D12_CPU_DESCRIPTOR_HANDLE pad_rtv = c->tt.pad_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+		cl->OMSetRenderTargets(1, &pad_rtv, FALSE, nullptr);
+		xrt_display_processor_d3d12_process_atlas(c->display_processor, cl, dp_resource, srv, pad_rtv.ptr,
+		                                          c->tt.pad_tex, view_width, view_height, tile_columns,
+		                                          tile_rows, fmt, c->tt.pad_w, c->tt.pad_h, pad_x, pad_y,
+		                                          r.screen.w, r.screen.h);
+
+		d3d12_tt_transition(cl, c->tt.pad_tex, D3D12_RESOURCE_STATE_RENDER_TARGET,
+		                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+		d3d12_tt_transition(cl, c->shared_texture, D3D12_RESOURCE_STATE_COPY_SOURCE,
+		                    D3D12_RESOURCE_STATE_COPY_DEST);
+		const D3D12_BOX out = {(UINT)pad_x, (UINT)pad_y, 0, (UINT)pad_x + r.screen.w, (UINT)pad_y + r.screen.h, 1};
+		cl->CopyTextureRegion(&st_loc, 0, 0, 0, &pad_loc, &out);
+		d3d12_tt_transition(cl, c->tt.pad_tex, D3D12_RESOURCE_STATE_COPY_SOURCE,
+		                    D3D12_RESOURCE_STATE_RENDER_TARGET);
+		d3d12_tt_transition(cl, c->shared_texture, D3D12_RESOURCE_STATE_COPY_DEST,
+		                    D3D12_RESOURCE_STATE_RENDER_TARGET);
+		cl->OMSetRenderTargets(1, &st_rtv, FALSE, nullptr);
+	} else {
+		xrt_display_processor_d3d12_process_atlas(c->display_processor, cl, dp_resource, srv, st_rtv.ptr,
+		                                          c->shared_texture, view_width, view_height, tile_columns,
+		                                          tile_rows, fmt, target_w, target_h, 0, 0, r.screen.w,
+		                                          r.screen.h);
+	}
+
+	d3d12_tt_store_state(c, state, &r, &woven);
 }
 
 /*!
@@ -5943,7 +6417,7 @@ d3d12_cursor_resolve(struct comp_d3d12_compositor *c,
 	const float canvas_h_m = (float)canvas_px_h * m_per_px;
 
 	// The panel's DPI sizes the OS cursor (and the arrow fallback).
-	HWND dpi_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	HWND dpi_hwnd = d3d12_geometry_hwnd(c);
 	UINT dpi = dpi_hwnd != nullptr ? GetDpiForWindow(dpi_hwnd) : 0;
 	if (dpi == 0) {
 		dpi = 96;
@@ -6922,7 +7396,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		 * resolver on its eye-only/legacy branches.
 		 */
 		struct xrt_window_metrics canvas = {};
-		const bool have_canvas = comp_d3d12_compositor_get_window_metrics(xc, &canvas);
+		// ADR-060: THIS frame's target (the xrEndFrame slot), never a locate in flight.
+		const bool have_canvas = d3d12_window_metrics(c, /* for_locate */ false, &canvas);
 
 		// XR_DXR_cursor_depth v5: resolve the cursor BEFORE the projection
 		// pass - its sprite's encoding takes part in the frame's compose
@@ -7227,14 +7702,33 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			                           c->reroute.capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
 			                           c->reroute.capture.path, woven);
 		}
+		struct comp_texture_target_resolved tt_r = {};
+		struct comp_texture_target tt_named = {};
 		if (c->reroute.client_presents) {
-			// #2370: this frame's target, read NOW (a drag moves it).
-			struct comp_seg_rect tgt = {};
-			const bool tgt_ok = d3d12_client_target(c, &tgt);
-			comp_hub_d3d11_set_client_target(c->reroute.split, tgt_ok, tgt.x, tgt.y, tgt.w, tgt.h);
+			// #2370: this frame's target, read NOW (a drag moves it). ADR-060
+			// (#2382): the bound target when there is one.
+			const bool tgt_ok = d3d12_client_target(c, &tt_r, &tt_named);
+			comp_hub_d3d11_set_client_target(c->reroute.split, tgt_ok, tt_r.screen.x, tt_r.screen.y,
+			                                 tt_r.screen.w, tt_r.screen.h);
 		}
 		const bool rr_wove =
 		    comp_hub_d3d11_weave_and_present(c->reroute.split, /*is_repaint=*/false, &rr_canvas);
+		if (rr_wove && c->reroute.client_presents && d3d12_tt_bound(c)) {
+			// ADR-060: what the hub's windowless DP wove — the state reply.
+			bool segmented = false, any_flat = false;
+			comp_hub_d3d11_get_client_weave_state(c->reroute.split, &segmented, &any_flat);
+			uint64_t state = COMP_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE;
+			if (tt_r.clamped) {
+				state |= COMP_TEXTURE_TARGET_STATE_CLAMPED;
+			}
+			if (segmented) {
+				state |= COMP_TEXTURE_TARGET_STATE_SEGMENTED;
+			}
+			if (any_flat) {
+				state |= COMP_TEXTURE_TARGET_STATE_FLAT_SEGMENT;
+			}
+			d3d12_tt_store_state(c, state, &tt_r, &tt_named);
+		}
 		{
 			bool cap_ok = false;
 			if (comp_hub_d3d11_capture_take(c->reroute.split, &cap_ok) && c->reroute.capture.pending) {
@@ -7398,21 +7892,27 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 			d3d12_phase_debug_dump(c, "process_atlas_shared_tex");
 
-			xrt_display_processor_d3d12_process_atlas(
-			    c->display_processor,
-			    c->cmd_list,
-			    dp_resource,
-			    d3d12_bind_dp_atlas_srv(c, dp_resource), // #854: real SRV — sim DP binds it; SR weaver ignores it
-			    st_rtv.ptr,
-			    c->shared_texture,
-			    view_width, view_height,
-			    tile_columns, tile_rows,
-			    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM),
-			    dp_target_w, dp_target_h,
-			    eff_canvas.valid ? eff_canvas.x : 0,
-			    eff_canvas.valid ? eff_canvas.y : 0,
-			    eff_canvas.valid ? eff_canvas.w : 0,
-			    eff_canvas.valid ? eff_canvas.h : 0);
+			if (d3d12_tt_bound(c)) {
+				// ADR-060 (#2382): phase and canvas from the target resolved now.
+				d3d12_tt_weave(c, dp_resource, st_rtv, view_width, view_height, tile_columns, tile_rows,
+				               dp_target_w, dp_target_h);
+			} else {
+				xrt_display_processor_d3d12_process_atlas(
+				    c->display_processor,
+				    c->cmd_list,
+				    dp_resource,
+				    d3d12_bind_dp_atlas_srv(c, dp_resource), // #854: real SRV — sim DP binds it; SR weaver ignores it
+				    st_rtv.ptr,
+				    c->shared_texture,
+				    view_width, view_height,
+				    tile_columns, tile_rows,
+				    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM),
+				    dp_target_w, dp_target_h,
+				    eff_canvas.valid ? eff_canvas.x : 0,
+				    eff_canvas.valid ? eff_canvas.y : 0,
+				    eff_canvas.valid ? eff_canvas.w : 0,
+				    eff_canvas.valid ? eff_canvas.h : 0);
+			}
 
 			// XR_DXR_depth_budget — the other arm of this commit (see
 			// d3d12_rear_budget_tick). Mutually exclusive with the windowed
@@ -8068,6 +8568,15 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 		c->shared_texture_rtv_heap->Release();
 		c->shared_texture_rtv_heap = nullptr;
 	}
+	// ADR-060 anchor-fallback pad (#2382).
+	if (c->tt.pad_rtv_heap != nullptr) {
+		c->tt.pad_rtv_heap->Release();
+		c->tt.pad_rtv_heap = nullptr;
+	}
+	if (c->tt.pad_tex != nullptr) {
+		c->tt.pad_tex->Release();
+		c->tt.pad_tex = nullptr;
+	}
 
 	// #439: release the zone-mask scratches + detach any active mask (the
 	// oxr handle owns the mask object itself).
@@ -8164,6 +8673,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
                              const void *windowless_dp_entry,
+                             const struct comp_texture_target_info *texture_target,
                              struct xrt_compositor_native **out_xc)
 {
 	if (d3d12_device == nullptr) {
@@ -8202,6 +8712,21 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->hud_initialized = false;
 	c->last_frame_time_ns = 0;
 	c->smoothed_frame_time_ms = 16.67f;
+
+	// ADR-060 (#2382): latch the texture target binding before anything reads
+	// the window geometry (refresh rate, DP create). Only a shared-texture
+	// session can be bound (oxr validated it).
+	if (texture_target != nullptr && texture_target->bound && shared_texture_handle != nullptr) {
+		c->tt.frame.bound = true;
+		c->tt.frame.ref = texture_target->reference_window;
+		c->tt.frame.x = texture_target->x;
+		c->tt.frame.y = texture_target->y;
+		c->tt.frame.w = texture_target->w;
+		c->tt.frame.h = texture_target->h;
+		U_LOG_W("ADR-060: texture target binding (d3d12) — reference window %p, initial rect (%d,%d %ux%u)%s",
+		        texture_target->reference_window, texture_target->x, texture_target->y, texture_target->w,
+		        texture_target->h, hwnd != nullptr ? ", windowHandle kept as the fallback anchor" : "");
+	}
 
 	// Handle window
 	c->app_hwnd = nullptr;
@@ -8477,7 +9002,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	// on a 165 Hz panel — and this is the Unity/Unreal path.
 	c->display_refresh_rate = 60.0f;
 	{
-		HWND rate_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+		HWND rate_hwnd = d3d12_geometry_hwnd(c);
 		const float hz = comp_display_refresh_hz_win(rate_hwnd);
 		if (hz > 0.0f) {
 			c->display_refresh_rate = hz;
@@ -8549,7 +9074,22 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		// one window — the hard rule d3d12_make_dp's doc carries.
 		U_LOG_I("Skipping app-side display processor (reroute — the d3d11 arm's weaver owns the HWND)");
 	} else if (dp_factory_d3d12 != NULL) {
-		if (!d3d12_make_dp(c) && c->split_active) {
+		// ADR-060 §6 (#2382): a bound texture session tries a windowless DP
+		// first. A texture session never engages the split, so the retire
+		// rung below cannot apply to it.
+		bool made = false;
+		if (d3d12_tt_bound(c)) {
+			made = d3d12_make_windowless_texture_dp(c);
+			if (!made) {
+				c->tt.anchor_fallback = c->app_hwnd != nullptr;
+				U_LOG_W(c->tt.anchor_fallback
+				            ? "ADR-060: texture target cannot phase windowless — the windowHandle anchor carries "
+				              "the weave (SPEC_VERSION 8 path); the rect still defines the canvas"
+				            : "ADR-060: texture target cannot phase windowless and no windowHandle was given — "
+				              "weaving display-scoped (no window phase)");
+			}
+		}
+		if (!made && !d3d12_make_dp(c) && c->split_active) {
 			/*
 			 * ADR-037 §3a — A WEAVER-CREATION FAILURE IS A FALLBACK TRIGGER,
 			 * NEVER A SESSION FAILURE, and "never a session failure" has to
@@ -8857,21 +9397,94 @@ comp_d3d12_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_b
 	return comp_rear_budget_get(&d3d12_comp(xc)->rear_budget, out);
 }
 
-extern "C" bool
-comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
-                                          struct xrt_window_metrics *out_metrics)
+extern "C" void
+comp_d3d12_compositor_set_texture_target(struct xrt_compositor *xc,
+                                         bool for_locate,
+                                         void *reference_window,
+                                         int32_t x,
+                                         int32_t y,
+                                         uint32_t w,
+                                         uint32_t h,
+                                         uint64_t flags)
 {
-	if (xc == nullptr || out_metrics == nullptr) {
-		if (out_metrics != nullptr) {
-			out_metrics->valid = false;
-		}
+	if (xc == nullptr || w == 0 || h == 0) {
+		return;
+	}
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	if (!d3d12_tt_bound(c)) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(c->tt.mutex);
+	if (for_locate) {
+		// Frames only this locate's views; never the weave.
+		c->tt.locate = c->tt.frame;
+		c->tt.locate.ref = reference_window;
+		c->tt.locate.x = x;
+		c->tt.locate.y = y;
+		c->tt.locate.w = w;
+		c->tt.locate.h = h;
+		c->tt.locate.flags = flags;
+		c->tt.locate_valid = true;
+		return;
+	}
+	if (reference_window != c->tt.frame.ref) {
+		// Dock / undock / full screen: takes effect on this frame, nothing recreated.
+		U_LOG_W("ADR-060: texture target reference window %p -> %p", c->tt.frame.ref, reference_window);
+	}
+	c->tt.frame.ref = reference_window;
+	c->tt.frame.x = x;
+	c->tt.frame.y = y;
+	c->tt.frame.w = w;
+	c->tt.frame.h = h;
+	c->tt.frame.flags = flags; // advisory (DRAGGING): reserved, no consumer yet (ADR-060 decision 5)
+}
+
+extern "C" void
+comp_d3d12_compositor_end_texture_target_locate(struct xrt_compositor *xc)
+{
+	if (xc == nullptr) {
+		return;
+	}
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	std::lock_guard<std::mutex> lock(c->tt.mutex);
+	c->tt.locate_valid = false;
+}
+
+extern "C" bool
+comp_d3d12_compositor_get_texture_target_state(struct xrt_compositor *xc, struct comp_texture_target_state *out)
+{
+	if (xc == nullptr || out == nullptr) {
 		return false;
 	}
-
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	if (!d3d12_tt_bound(c)) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(c->tt.mutex);
+	*out = c->tt.state;
+	if (!out->valid) {
+		// Nothing woven yet: still say which path the session took.
+		out->flags = c->tt.windowless ? COMP_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE
+		                              : (c->tt.anchor_fallback ? COMP_TEXTURE_TARGET_STATE_ANCHOR_FALLBACK : 0);
+	}
+	return true;
+}
+
+/*!
+ * The window (bound: the texture target) metrics. @p for_locate: frame them to
+ * the target a locate in flight chained (the oxr locate path), else to the
+ * xrEndFrame slot (the frame being composed) — ADR-060.
+ */
+static bool
+d3d12_window_metrics(struct comp_d3d12_compositor *c, bool for_locate, struct xrt_window_metrics *out_metrics)
+{
+	// ADR-060 §2 (#2382): a bound texture session's metrics are the TARGET's,
+	// computed here — never the DP's own reading of a window it may not even
+	// hold (and the vendor D3D12 DP has no get_window_metrics at all).
+	const bool tt_bound = d3d12_tt_bound(c);
 
 	// Prefer a DP-provided window metrics implementation if one exists.
-	bool ok = xrt_display_processor_d3d12_get_window_metrics(c->display_processor, out_metrics);
+	bool ok = !tt_bound && xrt_display_processor_d3d12_get_window_metrics(c->display_processor, out_metrics);
 	if (!ok) {
 		// No DP implementation (the in-tree sim_display DP and the Leia
 		// plug-in delegate window placement to the runtime). Compute the
@@ -8890,7 +9503,7 @@ comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
 		const bool have_reroute_dp = c->reroute.active && c->reroute.split != NULL;
 		have_dp = have_dp || have_reroute_dp;
 #endif
-		if (!have_dp || metrics_hwnd == nullptr) {
+		if (!have_dp || (metrics_hwnd == nullptr && !tt_bound)) {
 			return false;
 		}
 
@@ -8916,18 +9529,14 @@ comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
 			return false;
 		}
 
-		RECT rect;
-		if (!GetClientRect(metrics_hwnd, &rect)) {
-			return false;
-		}
-		uint32_t win_px_w = static_cast<uint32_t>(rect.right - rect.left);
-		uint32_t win_px_h = static_cast<uint32_t>(rect.bottom - rect.top);
-		if (win_px_w == 0 || win_px_h == 0) {
-			return false;
-		}
-
+		// Window (or, bound, target) client size and desktop origin.
+		uint32_t win_px_w = 0;
+		uint32_t win_px_h = 0;
 		POINT client_origin = {0, 0};
-		ClientToScreen(metrics_hwnd, &client_origin);
+		if (!d3d12_client_geometry(c, &win_px_w, &win_px_h, &client_origin, for_locate) || win_px_w == 0 ||
+		    win_px_h == 0) {
+			return false;
+		}
 
 		float pixel_size_x = disp_w_m / (float)disp_px_w;
 		float pixel_size_y = disp_h_m / (float)disp_px_h;
@@ -8966,6 +9575,18 @@ comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
 	}
 
 	return true;
+}
+
+extern "C" bool
+comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics)
+{
+	if (xc == nullptr || out_metrics == nullptr) {
+		if (out_metrics != nullptr) {
+			out_metrics->valid = false;
+		}
+		return false;
+	}
+	return d3d12_window_metrics(d3d12_comp(xc), /* for_locate */ true, out_metrics);
 }
 
 extern "C" bool
@@ -9755,14 +10376,18 @@ d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c)
 		U_LOG_W("#2671 d3d12: the window is seen again - the zone wish is re-published from scratch");
 	}
 
-	// Screen-anchor the mask: client-area origin in physical screen pixels.
-	// No HWND (pure offscreen) → nothing to anchor to; skip the publish.
-	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
-	RECT r;
+	// Screen-anchor the mask: client-area origin in physical screen pixels
+	// (the texture target's, ADR-060). No HWND and no binding (pure
+	// offscreen) → nothing to anchor to; skip the publish.
+	RECT r = {};
 	POINT origin = {0, 0};
-	if (wnd == nullptr || !GetClientRect(wnd, &r) || r.right <= 0 || r.bottom <= 0 ||
-	    !ClientToScreen(wnd, &origin)) {
-		return;
+	{
+		uint32_t cw = 0, ch = 0;
+		if (!d3d12_client_geometry(c, &cw, &ch, &origin)) {
+			return;
+		}
+		r.right = (LONG)cw;
+		r.bottom = (LONG)ch;
 	}
 
 	bool ok = xrt_display_processor_d3d12_publish_local_zone_mask(c->display_processor, res, mask_w, mask_h,
@@ -10909,12 +11534,12 @@ d3d12_flatten_backdrop_2d(struct comp_d3d12_compositor *c, uint32_t dst_w, uint3
 
 	uint32_t region_w = dst_w;
 	uint32_t region_h = dst_h;
-	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
-	if (wnd != nullptr) {
-		RECT r;
-		if (GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
-			region_w = ((uint32_t)r.right < dst_w) ? (uint32_t)r.right : dst_w;
-			region_h = ((uint32_t)r.bottom < dst_h) ? (uint32_t)r.bottom : dst_h;
+	{
+		// The window's client area, or the texture target's rect (ADR-060).
+		uint32_t cw = 0, ch = 0;
+		if (d3d12_client_geometry(c, &cw, &ch, nullptr)) {
+			region_w = (cw < dst_w) ? cw : dst_w;
+			region_h = (ch < dst_h) ? ch : dst_h;
 		}
 	}
 	if (region_w == 0 || region_h == 0) {
@@ -11250,12 +11875,12 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	// the dst is the window-sized target already.
 	uint32_t region_w = dst_w;
 	uint32_t region_h = dst_h;
-	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
-	if (wnd != nullptr) {
-		RECT r;
-		if (GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
-			region_w = ((uint32_t)r.right < dst_w) ? (uint32_t)r.right : dst_w;
-			region_h = ((uint32_t)r.bottom < dst_h) ? (uint32_t)r.bottom : dst_h;
+	{
+		// The window's client area, or the texture target's rect (ADR-060).
+		uint32_t cw = 0, ch = 0;
+		if (d3d12_client_geometry(c, &cw, &ch, nullptr)) {
+			region_w = (cw < dst_w) ? cw : dst_w;
+			region_h = (ch < dst_h) ? ch : dst_h;
 		}
 	}
 	d3d12_clamp_region_to_panel(c, &region_w, &region_h);
@@ -11923,11 +12548,10 @@ comp_d3d12_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, ui
 	// 0 → runtime chooses: the client-window dims (#464 — the mask is
 	// window-sized by definition), falling back to the render surface.
 	if (w == 0 || h == 0) {
-		HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
-		RECT r;
-		if (wnd != nullptr && GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
-			w = (uint32_t)r.right;
-			h = (uint32_t)r.bottom;
+		uint32_t cw = 0, ch = 0;
+		if (d3d12_client_geometry(c, &cw, &ch, nullptr)) {
+			w = cw;
+			h = ch;
 		} else if (c->shared_texture != nullptr) {
 			D3D12_RESOURCE_DESC td = c->shared_texture->GetDesc();
 			w = (uint32_t)td.Width;

@@ -2294,6 +2294,7 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
                                    void *shared_texture_handle,
                                    bool transparent_background,
                                    uint64_t bound_display_id,
+                                   const void *texture_target_binding,
                                    struct oxr_session *sess);
 #endif
 
@@ -3146,7 +3147,7 @@ struct oxr_session
 	bool ext_app_mode_set;
 
 	//! XR_DXR_win32_window_binding v9 (ADR-060): the session was created with an
-	//! XrWin32TextureTargetBindingDXR honoured by its compositor (native D3D11).
+	//! XrWin32TextureTargetBindingDXR honoured by its compositor (native D3D11 / D3D12).
 	bool texture_target_bound;
 
 	/*!
@@ -5314,14 +5315,15 @@ oxr_texture_target_find_binding(const XrSessionCreateInfo *createInfo);
 //! Spec §3 create-time valid usage (no-op without a binding).
 XrResult
 oxr_texture_target_verify_create(struct oxr_logger *log, const XrSessionCreateInfo *createInfo);
-#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
-struct comp_d3d11_texture_target_info;
+#if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) || defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR)
+struct comp_texture_target_info;
 //! The compositor's create-time binding (zeroed = not bound when @p tb is NULL).
+//! One fill for the native D3D11 and D3D12 (#2382) compositors.
 void
-oxr_texture_target_fill_d3d11_info(struct oxr_system *sys,
-                                   const XrWin32TextureTargetBindingDXR *tb,
-                                   uint64_t bound_display_id,
-                                   struct comp_d3d11_texture_target_info *out);
+oxr_texture_target_fill_info(struct oxr_system *sys,
+                             const XrWin32TextureTargetBindingDXR *tb,
+                             uint64_t bound_display_id,
+                             struct comp_texture_target_info *out);
 #endif
 //! xrEndFrame: validate + forward this frame's XrWin32TextureTargetFrameDXR.
 XrResult

@@ -17,8 +17,8 @@
  * This header is the math, platform-neutral and C-compatible so the unit tests
  * run everywhere. The Win32 read of the reference window lives in
  * comp_texture_target_win32.h. Both are DATA in, DATA out: the native D3D11
- * compositor calls them today and the ADR-059 hub calls them unchanged when it
- * takes texture mode (client-presents presenter strategy).
+ * and D3D12 compositors (#2382) call them, and the ADR-059 hub consumes the
+ * same resolve as data (client-presents presenter strategy).
  *
  * @ingroup comp_util
  */
@@ -60,6 +60,42 @@ struct comp_texture_target_resolved
 	bool clamped;
 	//! The target on the desktop: origin in desktop device px, size = the canvas.
 	struct comp_seg_rect screen;
+};
+
+/*!
+ * The create-time binding, as the state tracker hands it to an in-process
+ * compositor (D3D11, D3D12). @ref windowless_dp_entry is the DP registry entry
+ * of the session's screen (`const struct xrt_dp_registry_entry *`, owned by
+ * the system compositor info, outlives the session), used to make the
+ * windowless primary DP through the plug-in's per-screen factory.
+ */
+struct comp_texture_target_info
+{
+	bool bound;
+	void *reference_window;
+	int32_t x, y;
+	uint32_t w, h;
+	const void *windowless_dp_entry;
+};
+
+//! XrWin32TextureTargetStateFlagsDXR, same values.
+#define COMP_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE 0x1u
+#define COMP_TEXTURE_TARGET_STATE_ANCHOR_FALLBACK 0x2u
+#define COMP_TEXTURE_TARGET_STATE_SEGMENTED 0x4u
+#define COMP_TEXTURE_TARGET_STATE_FLAT_SEGMENT 0x8u
+#define COMP_TEXTURE_TARGET_STATE_CLAMPED 0x10u
+
+/*!
+ * What the most recently woven frame used (XrWin32TextureTargetStateDXR).
+ */
+struct comp_texture_target_state
+{
+	bool valid; //!< at least one bound frame was woven
+	uint64_t flags;
+	int32_t screen_x, screen_y;
+	int32_t rect_x, rect_y;
+	uint32_t rect_w, rect_h;
+	int64_t display_time_ns;
 };
 
 /*!

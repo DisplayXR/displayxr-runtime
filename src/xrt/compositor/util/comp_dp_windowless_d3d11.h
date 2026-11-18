@@ -32,26 +32,14 @@
 #include "xrt/xrt_display_processor_d3d11.h"
 #include "xrt/xrt_plugin.h"
 
+#include "util/comp_dp_windowless_reason.h"
+
 #include <stdio.h>
 #include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/*!
- * @name Why no windowless DP was made — closed tokens
- * @{
- */
-//! No registry entry, no per-screen D3D11 factory, or no screen rect to phase against.
-#define COMP_DP_WINDOWLESS_NO_FACTORY "no_per_screen_factory"
-//! The plug-in did not hint windowless phase for this screen.
-#define COMP_DP_WINDOWLESS_NO_HINT "no_windowless_hint"
-//! The per-screen factory refused (or returned no DP).
-#define COMP_DP_WINDOWLESS_REFUSED "factory_refused"
-//! The DP was made but does not declare PHASE_FROM_PRESENT_ORIGIN; it was destroyed.
-#define COMP_DP_WINDOWLESS_NO_FLAG "no_phase_from_present_origin"
-/*! @} */
 
 /*!
  * Make the windowless DP for registry entry @p e on @p device / @p context.

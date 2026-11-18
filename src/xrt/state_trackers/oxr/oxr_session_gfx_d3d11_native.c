@@ -148,10 +148,10 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 	}
 
 	// XR_DXR_win32_window_binding v9 (ADR-060): the texture target binding.
-	struct comp_d3d11_texture_target_info tt_info = {0};
+	struct comp_texture_target_info tt_info = {0};
 #ifdef OXR_HAVE_DXR_win32_window_binding
-	oxr_texture_target_fill_d3d11_info(sys, (const XrWin32TextureTargetBindingDXR *)texture_target_binding,
-	                                   bound_display_id, &tt_info);
+	oxr_texture_target_fill_info(sys, (const XrWin32TextureTargetBindingDXR *)texture_target_binding,
+	                             bound_display_id, &tt_info);
 #else
 	(void)texture_target_binding;
 #endif
