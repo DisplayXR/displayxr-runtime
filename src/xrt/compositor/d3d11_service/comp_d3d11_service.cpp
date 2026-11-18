@@ -32872,9 +32872,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	uint8_t timing_path = WEAVE_PATH_LEGACY;
 	double ov_acquire_ms = -1.0; // < 0: no overlay this submit
 
-	if (!weave_ensure_output(c, win_w, win_h)) {
-		return false;
-	}
+	// The output is ensured after the input import below: a batch submit's output is sized
+	// from its input (browser-pvt#364).
 
 	// Import the caller's pre-weave SBS input texture (NT or legacy DXGI
 	// handle) — cached by TEXTURE identity (see weave_import_matches): the
@@ -32937,6 +32936,35 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 	D3D11_TEXTURE2D_DESC idesc = {};
 	in_tex->GetDesc(&idesc);
+
+	// browser-pvt#364: a batch submit (rects, no N-view layout) hands the caller's whole-window
+	// frame as its input, laid out at the size the caller composed it at, so the input size IS
+	// that frame's window size — what the spec already says, and what the macOS and desktop-Linux
+	// engines size a batch output from (XR_DXR_weave.md §"Output sizing", v17 overlay note).
+	// GetClientRect above is read at submit time instead, and during a live resize (Windows'
+	// modal sizing loop) the window is already a step ahead of the frame: measured on a 4K
+	// panel at 300%, nearly every frame of a hand corner-drag was off by 10-120 px. The output,
+	// the SBS atlas and the overlay slot were then sized for a window this frame does not have
+	// (the overlay fell to the stretched post-weave blit), and the caller got back a woven
+	// texture of the wrong size for the frame it presents. Weave the frame at its own size; the
+	// window stays the phase / position anchor (the weave starts at the client origin either
+	// way, so every output pixel still lands where it did).
+	const bool batch_frame = rect_count > 0 && !(layout != nullptr && layout->view_count > 0);
+	if (batch_frame && idesc.Width > 0 && idesc.Height > 0 && (idesc.Width != win_w || idesc.Height != win_h)) {
+		static std::atomic<uint64_t> s_frame_sized{0};
+		const uint64_t n = ++s_frame_sized;
+		if (n == 1 || n % 600 == 0) {
+			U_LOG_W(
+			    "weave: batch frame %ux%u woven at its own size (window client %ux%u, a resize "
+			    "in flight) — %llu such submits so far (browser-pvt#364)",
+			    idesc.Width, idesc.Height, win_w, win_h, (unsigned long long)n);
+		}
+		win_w = idesc.Width;
+		win_h = idesc.Height;
+	}
+	if (!weave_ensure_output(c, win_w, win_h)) {
+		return false;
+	}
 
 	// #2289: present-owner capture trigger, decided once per submit; the
 	// dumps run after the weave (see svc_weave_capture_poll).
