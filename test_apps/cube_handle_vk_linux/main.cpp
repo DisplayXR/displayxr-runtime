@@ -1062,6 +1062,13 @@ struct TrackingLossDirector {
     Preset preset = CONVERGE;
     Phase phase = TRACKING;
     bool tracked = true;
+    bool capsTracking = true; // SetCaps: supportedModes != 0
+    bool capsManual = true;   // SetCaps: MANUAL bit (0x2)
+    //! Mirrors TrackingLossDirector::SetCaps (tracking_loss_director.h).
+    void SetCaps(unsigned long long supportedModes) {
+        capsTracking = supportedModes != 0;
+        capsManual = (supportedModes & 0x2) != 0;
+    }
     float sinceEdge = 1e9f;  // seconds since the last tracking edge
     float u = 1.0f;          // 1 = full depth, 0 = flat (ipd = smoothstep(u))
     float clock = 0.0f;
@@ -1134,6 +1141,7 @@ struct TrackingLossDirector {
     //! Zero-disparity status bar: length = current depth, colour = state.
     void BarColor(bool manual, float rgb[3]) const {
         auto set = [&](float r, float g, float b) { rgb[0] = r; rgb[1] = g; rgb[2] = b; };
+        if (!capsTracking) { set(0.5f, 0.5f, 0.5f); return; }                                  // grey: no tracking
         if (!manual) { tracked ? set(0.15f, 0.45f, 1.0f) : set(1.0f, 0.15f, 0.15f); return; }   // MANAGED: blue / red
         if (preset == OFF) { tracked ? set(0.7f, 0.3f, 1.0f) : set(1.0f, 0.15f, 0.15f); return; } // purple / red
         switch (phase) {
@@ -1149,8 +1157,12 @@ struct TrackingLossDirector {
     //! preset is named only when it is not the default (converge).
     const char* BarLabel(bool manual, char* buf, size_t n) const {
         if (buf == nullptr || n == 0) return "";
+        if (!capsTracking) {
+            snprintf(buf, n, "%s", "NO EYE TRACKING");
+            return buf;
+        }
         if (!manual) {
-            snprintf(buf, n, "%s", tracked ? "MANAGED" : "MANAGED - face lost");
+            snprintf(buf, n, "MANAGED%s%s", capsManual ? "" : " (no MANUAL)", tracked ? "" : " - face lost");
             return buf;
         }
         char presetTag[24] = "";
@@ -2323,6 +2335,7 @@ struct AppXrSession {
     PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingMode = nullptr;
     PFN_xrRequestDisplayModeDXR pfnRequestDisplayMode = nullptr; // lens only (loss preset lens-2D)
     XrEyeTrackingModeDXR eyeTrackingMode = XR_EYE_TRACKING_MODE_MANAGED_DXR;
+    uint64_t supportedEyeTrackingModes = 0; // XrEyeTrackingModeCapabilitiesDXR (status bar)
     PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModes = nullptr;
     static constexpr uint32_t kMaxModes = 9; // keys 0-8
     uint32_t renderingModeCount = 0;
@@ -2552,11 +2565,14 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
         // Chain: sysProps -> XrDisplayInfoDXR (physical dims) -> desktop position.
         XrDisplayInfoDXR displayInfo = {XR_TYPE_DISPLAY_INFO_DXR};
+        XrEyeTrackingModeCapabilitiesDXR eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
         XrDisplayDesktopPositionDXR desktopPos = {};
         desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
-        displayInfo.next = &desktopPos;
+        displayInfo.next = &eyeCaps;
+        eyeCaps.next = &desktopPos;
         sysProps.next = &displayInfo;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
+            xr.supportedEyeTrackingModes = (uint64_t)eyeCaps.supportedModes;
             xr.displayScreenLeft = desktopPos.left;
             xr.displayScreenTop = desktopPos.top;
             xr.displayWidthM = displayInfo.displaySizeMeters.width;
@@ -3759,6 +3775,7 @@ int main(int argc, char** argv) {
                         }
                         g_statusBar.enabled = xr.pfnRequestEyeTrackingMode != nullptr;
                         g_statusBar.fraction = manual ? g_lossDirector.Ipd() : 1.0f;
+                        g_lossDirector.SetCaps(xr.supportedEyeTrackingModes);
                         g_lossDirector.BarColor(manual, g_statusBar.rgb);
                         g_lossDirector.BarLabel(manual, g_statusBar.label, sizeof(g_statusBar.label));
                     }

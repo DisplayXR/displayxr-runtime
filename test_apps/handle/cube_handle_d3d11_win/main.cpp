@@ -2521,9 +2521,12 @@ static void RenderOneFrame(RenderState& rs) {
                             // view = zero disparity (on the screen plane). Length =
                             // depth factor, colour = state (green tracked, amber
                             // collapsing, red flat; blue/red in MANAGED).
-                            if (xr.pfnRequestEyeTrackingModeEXT != nullptr) {
+                            // Drawn whenever display_info is there: a display that
+                            // does not track gets a grey "NO EYE TRACKING" bar.
+                            if (xr.hasDisplayInfoExt) {
                                 const bool manualEt =
                                     xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANUAL_DXR;
+                                g_lossDirector.SetCaps(xr.supportedEyeTrackingModes);
                                 float rgb[3];
                                 g_lossDirector.BarColor(manualEt, rgb);
                                 D3D11_RENDER_TARGET_VIEW_DESC rd = {};

@@ -62,6 +62,10 @@ struct TrackingLossDirector
 	Preset preset = CONVERGE;
 	Phase phase = TRACKING;
 	bool tracked = true;
+	//! What the display can do (XrEyeTrackingModeCapabilitiesDXR::supportedModes,
+	//! via SetCaps). Defaults keep the old behaviour: a tracking display with MANUAL.
+	bool capsTracking = true;
+	bool capsManual = true;
 	float sinceEdge = 1e9f; // seconds since the last tracking edge
 	float u = 1.0f;         // 1 = full depth, 0 = flat (ipd = smoothstep(u))
 	float clock = 0.0f;
@@ -170,6 +174,17 @@ struct TrackingLossDirector
 		}
 		return lens;
 	}
+	/*!
+	 * Feed the display's eye-tracking capability (supportedModes bits: 0x1
+	 * MANAGED, 0x2 MANUAL). 0 = the display does not track the viewer, so the
+	 * bar says so instead of reporting a face that can never be found.
+	 */
+	void
+	SetCaps(unsigned long long supportedModes)
+	{
+		capsTracking = supportedModes != 0;
+		capsManual = (supportedModes & 0x2) != 0;
+	}
 	//! Zero-disparity status bar colour (display-referred RGB).
 	void
 	BarColor(bool manual, float rgb[3]) const
@@ -179,6 +194,10 @@ struct TrackingLossDirector
 			rgb[1] = g;
 			rgb[2] = b;
 		};
+		if (!capsTracking) { // grey: the display does not track
+			set(0.5f, 0.5f, 0.5f);
+			return;
+		}
 		if (!manual) { // MANAGED: blue / red
 			tracked ? set(0.15f, 0.45f, 1.0f) : set(1.0f, 0.15f, 0.15f);
 			return;
@@ -198,7 +217,8 @@ struct TrackingLossDirector
 	}
 	/*!
 	 * The status bar's text label, so a viewer can read which mode they are
-	 * in instead of decoding the colour: "MANAGED", "MANAGED - face lost",
+	 * in instead of decoding the colour: "NO EYE TRACKING", "MANAGED",
+ * "MANAGED - face lost", "MANAGED (no MANUAL)",
 	 * "MANUAL", "MANUAL [lens-2D] - face lost (collapse)", ... The preset is
 	 * named only when it is not the default (converge). Writes into @p buf
 	 * (@p n bytes, 64 is plenty) and returns it. Cheap: one snprintf.
@@ -209,8 +229,13 @@ struct TrackingLossDirector
 		if (buf == nullptr || n == 0) {
 			return "";
 		}
+		if (!capsTracking) {
+			std::snprintf(buf, n, "%s", "NO EYE TRACKING");
+			return buf;
+		}
 		if (!manual) {
-			std::snprintf(buf, n, "%s", tracked ? "MANAGED" : "MANAGED - face lost");
+			// "(no MANUAL)": T cannot switch modes on this display.
+			std::snprintf(buf, n, "MANAGED%s%s", capsManual ? "" : " (no MANUAL)", tracked ? "" : " - face lost");
 			return buf;
 		}
 		char presetTag[24] = "";
