@@ -695,12 +695,15 @@ run_installer(const char *name, const wchar_t *path, const cJSON *args)
 	return DXR_GET_OK;
 }
 
-static void
+//! Stops the service and its satellites. Returns true when a running
+//! displayxr-service.exe was found, so a failed install can put it back (#2713).
+static bool
 stop_service(void)
 {
+	bool was_running = false;
 	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 	if (snap == INVALID_HANDLE_VALUE) {
-		return;
+		return false;
 	}
 	PROCESSENTRY32W pe;
 	pe.dwSize = sizeof(pe);
@@ -713,6 +716,9 @@ stop_service(void)
 		    _wcsicmp(pe.szExeFile, L"displayxr-tracking-host.exe") != 0) {
 			continue;
 		}
+		if (_wcsicmp(pe.szExeFile, L"displayxr-service.exe") == 0) {
+			was_running = true;
+		}
 		HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
 		if (h != NULL) {
 			dxr_log("stopping %ls (pid %lu) for the install\n", pe.szExeFile, pe.th32ProcessID);
@@ -722,6 +728,7 @@ stop_service(void)
 		}
 	}
 	CloseHandle(snap);
+	return was_running;
 }
 
 //! Starts the service the way the runtime installer does (#1478): through the
@@ -943,7 +950,7 @@ main(int argc, char **argv)
 		// or a plug-in's DLLs while their installers replace them -- an NSIS /S
 		// install skips a locked file silently -- and the service starts once,
 		// at the end, at the user's integrity level.
-		stop_service();
+		bool was_running = stop_service();
 		for (int i = 0; i < p.n && r == DXR_GET_OK; i++) {
 			if (needs_work(&p.a[i])) {
 				r = run_installer(
@@ -951,7 +958,12 @@ main(int argc, char **argv)
 				    cJSON_GetObjectItemCaseSensitive(win_block(&c, p.a[i].component), "args"));
 			}
 		}
-		if (!no_start) {
+		// #2713: a failed child install (exit 6: a program holds the client
+		// DLL) must leave the machine as it was found -- restart the service
+		// only if it was running before. A successful install starts it as
+		// always. The service is single-instance, so racing the installer's
+		// own restore-on-abort is harmless.
+		if (!no_start && (r == DXR_GET_OK || was_running)) {
 			start_service();
 		}
 	} else if (strcmp(cmd, "fetch") == 0 || strcmp(cmd, "install") == 0) {
