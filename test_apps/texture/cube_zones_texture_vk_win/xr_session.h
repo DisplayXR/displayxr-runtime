@@ -117,3 +117,13 @@ bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
 bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex,
     HANDLE sharedTextureHandle, HWND appHwnd);
+
+// ADR-060 smoke mode (DXR_TEXTURE_TARGET=1): the session names its texture
+// target (parity with cube_zones_texture_d3d12_win, #2721). Only for a
+// top-level bound window: the #740 pane harness binds a WS_CHILD, which a
+// reference window may not be.
+bool TextureTargetEnabled();
+// DXR_TEXTURE_TARGET_INSET=x,y: the target rect (and the blit) start at (x,y) of the client area.
+void TextureTargetInset(int* x, int* y);
+// Is @p hwnd usable as the reference window (TextureTargetEnabled + top-level)?
+bool TextureTargetUsable(HWND hwnd);

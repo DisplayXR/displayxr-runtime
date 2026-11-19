@@ -535,6 +535,87 @@ static bool CreateBlitResources(ID3D11Device* device) {
     return SUCCEEDED(hr);
 }
 
+// ADR-060 smoke mode (#2721, parity with cube_zones_texture_d3d12_win): this
+// frame's texture target — this window's client area from the inset, chained
+// ahead of @p next. The same instance serves every call of the frame (locates,
+// then xrEndFrame), re-pointed right before each.
+static XrWin32TextureTargetFrameDXR g_ttFrame = {XR_TYPE_WIN32_TEXTURE_TARGET_FRAME_DXR};
+static const void* TextureTargetChain(HWND hwnd, const void* next) {
+    if (!TextureTargetUsable(hwnd)) return next;
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    g_ttFrame.next = next;
+    g_ttFrame.referenceWindow = (void*)hwnd;
+    int ix = 0, iy = 0;
+    TextureTargetInset(&ix, &iy);
+    g_ttFrame.targetRect.offset = {ix, iy};
+    g_ttFrame.targetRect.extent = {rc.right - ix > 0 ? (int32_t)(rc.right - ix) : 1,
+                                   rc.bottom - iy > 0 ? (int32_t)(rc.bottom - iy) : 1};
+    g_ttFrame.flags = 0;
+    return &g_ttFrame;
+}
+
+// ADR-060 smoke mode: what the runtime says it wove (xrWaitFrame reply), logged
+// on every change so a drag shows the origin following the window.
+static XrWin32TextureTargetStateDXR g_ttState = {XR_TYPE_WIN32_TEXTURE_TARGET_STATE_DXR};
+static void LogTextureTargetState() {
+    static XrWin32TextureTargetStateDXR last = {XR_TYPE_WIN32_TEXTURE_TARGET_STATE_DXR};
+    static bool logged = false;
+    const XrWin32TextureTargetStateDXR& s = g_ttState;
+    if (logged && s.flags == last.flags && s.wovenScreenOrigin.x == last.wovenScreenOrigin.x &&
+        s.wovenScreenOrigin.y == last.wovenScreenOrigin.y &&
+        s.wovenTargetRect.offset.x == last.wovenTargetRect.offset.x &&
+        s.wovenTargetRect.offset.y == last.wovenTargetRect.offset.y &&
+        s.wovenTargetRect.extent.width == last.wovenTargetRect.extent.width &&
+        s.wovenTargetRect.extent.height == last.wovenTargetRect.extent.height) {
+        return;
+    }
+    logged = true;
+    last = s;
+    LOG_INFO("ADR-060 texture target state: flags=0x%llx [%s%s%s%s%s] wovenScreenOrigin=(%d,%d) "
+             "wovenTargetRect=(%d,%d %dx%d) wovenDisplayTime=%lld",
+        (unsigned long long)s.flags,
+        (s.flags & XR_WIN32_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE_BIT_DXR) ? "WINDOWLESS_PHASE " : "",
+        (s.flags & XR_WIN32_TEXTURE_TARGET_STATE_ANCHOR_FALLBACK_BIT_DXR) ? "ANCHOR_FALLBACK " : "",
+        (s.flags & XR_WIN32_TEXTURE_TARGET_STATE_SEGMENTED_BIT_DXR) ? "SEGMENTED " : "",
+        (s.flags & XR_WIN32_TEXTURE_TARGET_STATE_FLAT_SEGMENT_BIT_DXR) ? "FLAT_SEGMENT " : "",
+        (s.flags & XR_WIN32_TEXTURE_TARGET_STATE_CLAMPED_BIT_DXR) ? "CLAMPED " : "",
+        (int)s.wovenScreenOrigin.x, (int)s.wovenScreenOrigin.y,
+        (int)s.wovenTargetRect.offset.x, (int)s.wovenTargetRect.offset.y,
+        (int)s.wovenTargetRect.extent.width, (int)s.wovenTargetRect.extent.height,
+        (long long)s.wovenDisplayTime);
+}
+
+// BeginFrame (displayxr-common) with the state struct chained on xrWaitFrame's
+// XrFrameState: the shared helper resets the struct, so the smoke mode waits
+// and begins the frame itself. Same calls, same order.
+static bool BeginFrameWithTargetState(XrSessionManager& xr, XrFrameState& frameState) {
+    if (!TextureTargetUsable(xr.windowHandle)) {
+        return BeginFrame(xr, frameState);
+    }
+    frameState = {XR_TYPE_FRAME_STATE};
+    g_ttState = {XR_TYPE_WIN32_TEXTURE_TARGET_STATE_DXR};
+    frameState.next = &g_ttState;
+    XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
+    XrResult result = xrWaitFrame(xr.session, &waitInfo, &frameState);
+    frameState.next = nullptr;
+    if (XR_FAILED(result)) {
+        LOG_WARN("[BeginFrame] xrWaitFrame FAILED: %d - requesting exit", result);
+        xr.exitRequested = true;
+        return false;
+    }
+    LogTextureTargetState();
+    xr.predictedDisplayTime = frameState.predictedDisplayTime;
+    xr.predictedDisplayPeriod = frameState.predictedDisplayPeriod;
+    XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
+    result = xrBeginFrame(xr.session, &beginInfo);
+    if (XR_FAILED(result)) {
+        LOG_WARN("[BeginFrame] xrBeginFrame FAILED: %d", result);
+        return false;
+    }
+    return true;
+}
+
 // Blit the runtime-composited shared texture into the app's window back buffer.
 static void BlitSharedTextureToBackBuffer(ID3D11RenderTargetView* backBufferRTV,
                                           uint32_t winW, uint32_t winH) {
@@ -542,12 +623,19 @@ static void BlitSharedTextureToBackBuffer(ID3D11RenderTargetView* backBufferRTV,
 
     g_d3dContext->OMSetRenderTargets(1, &backBufferRTV, nullptr);
 
-    float vpW = (winW < g_sharedWidth) ? (float)winW : (float)g_sharedWidth;
-    float vpH = (winH < g_sharedHeight) ? (float)winH : (float)g_sharedHeight;
+    // ADR-060 smoke: with DXR_TEXTURE_TARGET_INSET the texture is drawn at the
+    // target rect's offset, the case where the canvas is not the whole window.
+    int ix = 0, iy = 0;
+    if (g_xr != nullptr && TextureTargetUsable(g_xr->windowHandle)) TextureTargetInset(&ix, &iy);
+    if ((uint32_t)ix >= winW || (uint32_t)iy >= winH) { ix = 0; iy = 0; }
+    const uint32_t blitW = winW - (uint32_t)ix;
+    const uint32_t blitH = winH - (uint32_t)iy;
+    float vpW = (blitW < g_sharedWidth) ? (float)blitW : (float)g_sharedWidth;
+    float vpH = (blitH < g_sharedHeight) ? (float)blitH : (float)g_sharedHeight;
 
     D3D11_VIEWPORT vp = {};
-    vp.TopLeftX = 0.0f;
-    vp.TopLeftY = 0.0f;
+    vp.TopLeftX = (float)ix;
+    vp.TopLeftY = (float)iy;
     vp.Width = vpW;
     vp.Height = vpH;
     vp.MaxDepth = 1.0f;
@@ -1109,7 +1197,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         zoneStructs[zi].rect = z.rect;
 
         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
-        locateInfo.next = &zoneStructs[zi];
+        locateInfo.next = TextureTargetChain(xr.windowHandle, &zoneStructs[zi]);
         locateInfo.viewConfigurationType = xr.viewConfigType;
         locateInfo.displayTime = frameState.predictedDisplayTime;
         locateInfo.space = xr.localSpace;
@@ -1305,6 +1393,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
     if (chainZonesEnd) {
         endInfo.next = &zonesEnd;
     }
+    endInfo.next = TextureTargetChain(xr.windowHandle, endInfo.next);
 
     xrEndFrame(xr.session, &endInfo);
 
@@ -1368,7 +1457,7 @@ static void RenderOneFrame(RenderState& rs) {
     }
 
     XrFrameState frameState;
-    if (!BeginFrame(xr, frameState)) {
+    if (!BeginFrameWithTargetState(xr, frameState)) {
         return;
     }
 
@@ -1449,6 +1538,7 @@ static void RenderOneFrame(RenderState& rs) {
             displayRig.perspectiveFactor = g_inputState.viewParams.perspectiveFactor;
             locateInfo.next = &displayRig;
         }
+        locateInfo.next = TextureTargetChain(xr.windowHandle, locateInfo.next);
 
         XrResult lr = xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
         const bool orientationValid =
