@@ -246,7 +246,7 @@ present origin, the window metrics and the segment table from that pair.**
   | ~~GL~~ (via the hub): split `c->hwnd` (today the app HWND in texture mode too, `:8167`) from the reference; metrics `:8838`; segments hook `:5120-5140`; readback upload `:3414-3444` (R7 makes this interop-first) | `comp_gl_compositor.cpp` | 250-350, highest risk |
   | sim-display: the caps bit on its D3D11 DP + the claim hint | done in R2 (`sim_display_processor_d3d11.cpp`, `sim_display_plugin.c`) | 0 |
   | Leia plug-in (L4, not this repo): the claim hint + the D3D11 DP's scanout bit | done: `displayxr-leia-plugin` `feat/l4-phase-from-present-origin` | 0 |
-- **Vulkan is a follow-up.** `vk_native` has the same segment machinery (`comp_vk_native_segments.c:161,508,1255`), but no shared-texture export on Windows (R8). The struct is graphics-API-neutral, so Vulkan adopts it with no spec change.
+- **Vulkan is a follow-up.** `vk_native` has the same segment machinery (`comp_vk_native_segments.c:161,508,1255`). The struct is graphics-API-neutral, so Vulkan adopts it with no spec change. (Correction, #2721: the R8 premise, "no shared-texture export on Windows", was wrong. `vk_native`'s texture mode already imports the app's shared D3D11 texture as a `VkImage` (`import_shared_d3d11_texture`, a KMT handle) and weaves into it, and the GL tier opens the same texture on a D3D11 device and uploads into it. Both tiers honour the binding natively: [Amendment 2](#amendment-2-2721-the-vulkan-and-gl-tiers-honour-the-binding).)
 - **macOS / Linux** keep their window bindings. The struct shape (reference handle + rect) carries over to `XR_DXR_cocoa_window_binding` / `XR_DXR_xlib_window_binding` if an editor preview needs it there. Not part of this ADR.
 
 ## Implementation (as landed, 2026-10-26)
@@ -275,8 +275,9 @@ binding.
 - ~~#2382~~ (landed, see the amendment below): D3D12 texture sessions honour the v9 binding.
 - #2399: the native texture path's woven readback is bistable in the cube region.
 - GL texture sessions on the hub. The GL shim (#2366) landed without texture mode, so a GL texture
-  session stays on the GL compositor's own legs (`shared_texture_session`). Vulkan needs a Windows
-  shared-texture export first (R8).
+  session stays on the GL compositor's own legs (`shared_texture_session`). (The Vulkan half of this
+  line said Vulkan needs a Windows shared-texture export first, R8; it does not, see
+  [Amendment 2](#amendment-2-2721-the-vulkan-and-gl-tiers-honour-the-binding).)
 - The spanning arm (a target across a 3D and a 2D screen) has not run on hardware yet; it needs a machine with a LeiaSR panel and a second monitor.
 - The cocoa pair for macOS (decision 1). Not started.
 
@@ -311,7 +312,8 @@ binding.
 3. **D3D11 native only; D3D12 / GL / Vulkan via the hub** (confirmed with the hub's maintainers,
    2026-10-25; **amended for D3D12 by [Amendment 1](#amendment-1-2382-the-d3d12-tier-honours-the-binding)**,
    which adds a native D3D12 path). R1's binding is shaped as hub-facing data. See §Consequences,
-   "ADR-059 interaction".
+   "ADR-059 interaction". Vulkan and GL are amended the same way by
+   [Amendment 2](#amendment-2-2721-the-vulkan-and-gl-tiers-honour-the-binding).
 4. **The system property is answered from a plug-in-level hint.** As implemented on the R2
    branch, the hint is a claim-mask bit, `XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE` (bit 24 of
    `xrt_display_claim::supported_apis`). That is per monitor, needs no ABI growth, and is copied
@@ -358,3 +360,29 @@ an import shim of the hub with no native port. #2382 amends that for D3D12 only.
   hub route (`DXR_HUB=1`), which weaves with the D3D11 DP.
 - **Verification.** Recorded on the pull request for #2382. Panel acceptance (the woven zone at
   rest, the phase following a drag) is separate from the build and the simulated-display run.
+
+## Amendment 2 (#2721): the Vulkan and GL tiers honour the binding
+
+Amendment 1's reason holds for Vulkan and GL too: a Vulkan or GL texture session is woven on its
+tier's own legs (the GL hub shim carries no texture mode, and the Vulkan hub route is not taken by a
+texture session), so a binding honoured only through the hub is ignored for the default session.
+
+| Part | PR | What it is |
+|---|---|---|
+| Vulkan + GL, R1 shape | #2721 (pending) | `vk_native` and the GL compositor get Amendment 1's shape: the `frame` and `locate` slots, one resolve through `comp_texture_target_resolve_win32`, the target feeding the window metrics, the canvas and the zone anchor, and the state reply. The windowless primary DP is made through `create_dp_vk_for_screen` / `create_dp_gl_for_screen` with no window (`comp_dp_windowless_vk.h`, `comp_dp_windowless_gl.h`, the same hint-then-flag rule) and phased with `set_present_origin`. Without it, the windowHandle anchor carries the weave as in SPEC_VERSION 8 and `ANCHOR_FALLBACK` is reported. A windowless target that touches another screen is filled with the flat left view and reports `FLAT_SEGMENT`, as on D3D12 (`comp_texture_target_screens.h`). sim-display's screen-bound Vulkan and GL DPs set the scanout bit. |
+
+Differences from D3D12:
+- **No padded anchor weave (#2406) on either tier.** Under the anchor fallback a target inset from
+  the anchor's client origin is woven at the anchor's phase; one WARN per episode says so.
+- **GL needs the windowHandle.** The GL tier makes the app's context current on that window's
+  device context, so a GL session that drops `windowHandle` is not bound and logs the binding
+  IGNORED. With a windowHandle the binding moves the canvas, the metrics and the phase to the
+  target; the window stays the context's home and the fallback anchor.
+- **GL vertical phase is a DP property.** The GL tier weaves the canvas at the bottom-left of a
+  panel-sized GL render target and reads those rows back into the shared texture, which the app
+  flips. A windowless GL DP is correct only if it takes its vertical phase from the present origin
+  and the GL viewport as it is. A DP that converts the viewport to a top-left origin using the
+  display height places the canvas wrong for a target shorter than the panel. This needs a panel
+  check per vendor DP.
+- **Zero-copy Vulkan frames** have no atlas to fill flat from, so an off-screen target is woven in
+  that case (one WARN).
