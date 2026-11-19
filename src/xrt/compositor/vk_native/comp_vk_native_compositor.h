@@ -15,6 +15,7 @@
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_display_metrics.h"
 #include "util/u_rear_budget.h" // XR_DXR_depth_budget: struct u_rear_budget_out
+#include "util/comp_texture_target.h" // ADR-060: comp_texture_target_info / _state
 
 // Forward declarations
 struct comp_vk_native_compositor;
@@ -59,6 +60,10 @@ extern "C" {
  *        (XR_KHR_vulkan_enable v1). Known before the compositor exists, so the
  *        weave-thread ownership decision can key on it (#2393); the later
  *        comp_vk_native_compositor_set_vk_device_origin call only logs.
+ * @param texture_target ADR-060 texture target binding (XR_DXR_win32_window_binding
+ *        v9, #2721), or NULL. Windows only, and only meaningful with
+ *        @p shared_texture_handle. Its `windowless_dp_entry` is the source of
+ *        the bound session's windowless primary DP (`create_dp_vk_for_screen`).
  * @param out_xc Pointer to receive the created compositor.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -85,7 +90,47 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  bool app_timeline_semaphores,
                                  bool app_keyed_mutex,
                                  bool app_created_device,
+                                 const struct comp_texture_target_info *texture_target,
                                  struct xrt_compositor_native **out_xc);
+
+/*
+ * ADR-060 — texture target binding (XR_DXR_win32_window_binding v9), the
+ * vk_native twin of the D3D11 / D3D12 tiers' entry points (#2721). A
+ * shared-texture session names where its texture is drawn: a reference window
+ * (or NULL = desktop px) plus a rect in its client area, device px. The
+ * compositor resolves the pair at every weave, phases a WINDOWLESS primary DP
+ * from it (set_present_origin) when the DP declares it can, frames the window
+ * metrics to it, and reports what it used. The reference window is only read,
+ * never handed to a DP. Windows only; no-ops elsewhere.
+ */
+
+/*!
+ * A frame's target. @p for_locate false: from xrEndFrame — authoritative, what
+ * the weave uses (an omitted struct keeps the last xrEndFrame value). @p
+ * for_locate true: from xrLocateViews — frames only that locate's views (the
+ * window metrics), until @ref comp_vk_native_compositor_end_texture_target_locate.
+ * Ignored unless the session was created bound. @p flags are
+ * XrWin32TextureTargetFrameFlagsDXR (advisory).
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_texture_target(struct xrt_compositor *xc,
+                                             bool for_locate,
+                                             void *reference_window,
+                                             int32_t x,
+                                             int32_t y,
+                                             uint32_t w,
+                                             uint32_t h,
+                                             uint64_t flags);
+
+//! The locate that chained a target returned: metrics fall back to the xrEndFrame slot.
+void
+comp_vk_native_compositor_end_texture_target_locate(struct xrt_compositor *xc);
+
+//! What the most recently woven frame used. @return false when the session is not bound.
+bool
+comp_vk_native_compositor_get_texture_target_state(struct xrt_compositor *xc, struct comp_texture_target_state *out);
 
 /*!
  * Get the predicted eye positions from the display processor.

@@ -7664,13 +7664,19 @@ oxr_session_create_impl(struct oxr_logger *log,
 				}
 			}
 
+			// XR_DXR_win32_window_binding v9 (ADR-060, #2721): the texture target binding.
+			const void *tt_binding = NULL;
+#ifdef OXR_HAVE_DXR_win32_window_binding
+			tt_binding = oxr_texture_target_find_binding(createInfo);
+#endif
+
 			// Use GL native compositor — no Vulkan involvement
 			return oxr_session_populate_gl_native(log, sys, ext_window_handle,
 			                                       (void *)opengl_win32->hGLRC,
 			                                       (void *)opengl_win32->hDC,
 			                                       shared_texture_handle,
 			                                       xsi->transparent_background_enabled,
-			                                       xsi->bound_display_id,
+			                                       xsi->bound_display_id, tt_binding,
 			                                       *out_session);
 		}
 #endif
@@ -7877,9 +7883,14 @@ oxr_session_create_impl(struct oxr_logger *log,
 				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
 				                 "Failed to create xrt_session! '%i'", xret);
 			}
+			// XR_DXR_win32_window_binding v9 (ADR-060, #2721): the texture target binding.
+			const void *tt_binding = NULL;
+#ifdef OXR_HAVE_DXR_win32_window_binding
+			tt_binding = oxr_texture_target_find_binding(createInfo);
+#endif
 			return oxr_session_populate_vk_native(
 			    log, sys, vulkan, window_handle, window_is_wayland, shared_texture_handle,
-			    xsi->transparent_background_enabled, xsi->bound_display_id, *out_session);
+			    xsi->transparent_background_enabled, xsi->bound_display_id, tt_binding, *out_session);
 		}
 #endif
 
