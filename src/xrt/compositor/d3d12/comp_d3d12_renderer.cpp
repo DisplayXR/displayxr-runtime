@@ -440,6 +440,11 @@ struct comp_d3d12_renderer
 	//! Blit PSO.
 	ID3D12PipelineState *blit_pso[2];
 
+	//! The opaque blit against a B8G8R8A8_UNORM target: the flat fill of a
+	//! texture app's shared texture (comp_d3d12_renderer_blit_rect_format,
+	//! #2382). Optional — NULL when its creation failed.
+	ID3D12PipelineState *blit_pso_bgra;
+
 	//! Blit PSO blend variants for 3D display zone layers
 	//! (XR_DXR_display_zones, ADR-027): same shaders/root signature as
 	//! blit_pso, alpha-over blend baked into the PSO (D3D12's analog of the
@@ -2502,6 +2507,15 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	 * identical blend states; only the baked RTV format differs, because
 	 * that is the only thing D3D12 will not let a PSO be agnostic about.
 	 */
+	// #2382: the opaque blit once more, against B8G8R8A8_UNORM. Best effort —
+	// only comp_d3d12_renderer_blit_rect_format asks for it, and it reports a
+	// missing pipeline to its caller.
+	pso_desc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+	if (FAILED(device->CreateGraphicsPipelineState(&pso_desc, __uuidof(ID3D12PipelineState),
+	                                               reinterpret_cast<void **>(&r->blit_pso_bgra)))) {
+		r->blit_pso_bgra = nullptr;
+	}
+
 	for (uint32_t rt = 0; rt < 2 && SUCCEEDED(hr); rt++) {
 		pso_desc.RTVFormats[0] = rt == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM : kComposeRtvFormat;
 
@@ -3315,6 +3329,10 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 			r->blit_pso[rt]->Release();
 			r->blit_pso[rt] = nullptr;
 		}
+	}
+	if (r->blit_pso_bgra != nullptr) {
+		r->blit_pso_bgra->Release();
+		r->blit_pso_bgra = nullptr;
 	}
 	if (r->root_signature != nullptr) {
 		r->root_signature->Release();
@@ -5006,19 +5024,52 @@ comp_d3d12_renderer_blit_rect(struct comp_d3d12_renderer *renderer,
                               uint32_t dst_w,
                               uint32_t dst_h)
 {
+	// The DXGI back buffer's format.
+	return comp_d3d12_renderer_blit_rect_format(renderer, cmd_list_ptr, srv_heap, src_srv, src_tex_w, src_tex_h,
+	                                            src_x, src_y, src_w, src_h, rtv,
+	                                            static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM), dst_x, dst_y,
+	                                            dst_w, dst_h);
+}
+
+extern "C" xrt_result_t
+comp_d3d12_renderer_blit_rect_format(struct comp_d3d12_renderer *renderer,
+                                     void *cmd_list_ptr,
+                                     void *srv_heap,
+                                     uint64_t src_srv,
+                                     uint32_t src_tex_w,
+                                     uint32_t src_tex_h,
+                                     int32_t src_x,
+                                     int32_t src_y,
+                                     uint32_t src_w,
+                                     uint32_t src_h,
+                                     uint64_t rtv,
+                                     uint32_t rtv_format,
+                                     int32_t dst_x,
+                                     int32_t dst_y,
+                                     uint32_t dst_w,
+                                     uint32_t dst_h)
+{
 	auto *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
 	auto *heap = static_cast<ID3D12DescriptorHeap *>(srv_heap);
 	if (renderer == nullptr || cmd_list == nullptr || heap == nullptr || src_srv == 0 || rtv == 0 ||
-	    src_tex_w == 0 || src_tex_h == 0 || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 ||
-	    renderer->blit_pso[0] == nullptr) {
+	    src_tex_w == 0 || src_tex_h == 0 || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0) {
+		return XRT_ERROR_D3D12;
+	}
+	// D3D12 bakes the target format into the pipeline: one per served format.
+	ID3D12PipelineState *pso = nullptr;
+	if (rtv_format == static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM)) {
+		pso = renderer->blit_pso[0];
+	} else if (rtv_format == static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM)) {
+		pso = renderer->blit_pso_bgra;
+	}
+	if (pso == nullptr) {
 		return XRT_ERROR_D3D12;
 	}
 
 	ID3D12DescriptorHeap *heaps[] = {heap};
 	cmd_list->SetDescriptorHeaps(1, heaps);
 	cmd_list->SetGraphicsRootSignature(renderer->root_signature);
-	// Index 0 = the R8G8B8A8_UNORM pipeline, the DXGI back buffer's format.
-	cmd_list->SetPipelineState(renderer->blit_pso[0]);
+	cmd_list->SetPipelineState(pso);
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
 	rtv_handle.ptr = static_cast<SIZE_T>(rtv);
 	cmd_list->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
