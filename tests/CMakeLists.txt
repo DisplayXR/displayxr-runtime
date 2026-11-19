@@ -32,6 +32,8 @@ set(tests
     tests_dp_weave_scope
     tests_dp_windowless_d3d11
     tests_dp_windowless_d3d12
+    tests_dp_windowless_vk
+    tests_dp_windowless_gl
     tests_dp_vk_snap_window_rect
     tests_weave_snap_grid
     tests_lift_mailbox
@@ -1522,6 +1524,12 @@ target_link_libraries(tests_dp_windowless_d3d11 PRIVATE xrt-interfaces)
 # #2382: its D3D12 twin (the native D3D12 tier's bound texture session).
 target_include_directories(tests_dp_windowless_d3d12 PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 target_link_libraries(tests_dp_windowless_d3d12 PRIVATE xrt-interfaces)
+
+# #2721: its Vulkan and OpenGL twins (the vk_native / GL tiers' bound texture session).
+target_include_directories(tests_dp_windowless_vk PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_link_libraries(tests_dp_windowless_vk PRIVATE xrt-interfaces)
+target_include_directories(tests_dp_windowless_gl PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_link_libraries(tests_dp_windowless_gl PRIVATE xrt-interfaces)
 
 # ADR-060: the texture target binding's one resolve (header-only math).
 target_include_directories(tests_comp_texture_target PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)

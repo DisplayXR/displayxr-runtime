@@ -4,7 +4,7 @@
  * @file
  * @brief  Why a windowless display processor was not made: the closed tokens
  *         shared by the per-API makers (comp_dp_windowless_d3d11.h,
- *         comp_dp_windowless_d3d12.h).
+ *         comp_dp_windowless_d3d12.h, comp_dp_windowless_vk.h, comp_dp_windowless_gl.h).
  *
  * @ingroup comp_util
  */
