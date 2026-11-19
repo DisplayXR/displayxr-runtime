@@ -99,8 +99,8 @@ typedef struct XrWin32TextureTargetStateDXR {
   reserved for a later version (see the weave service, R2).
 - `initialTargetRect.extent` MUST be > 0 in both axes. Otherwise `XR_ERROR_VALIDATION_FAILURE`.
 - A binding the session cannot honour is **ignored, not an error**: on any session other than
-  the in-process D3D11 and D3D12 compositors (GL, Vulkan, IPC), `xrCreateSession` succeeds, logs
-  one WARN (`XrWin32TextureTargetBindingDXR IGNORED`), and `windowHandle`, if given, carries the
+  the in-process D3D11, D3D12, Vulkan and GL compositors (IPC, or a GL session with no
+  `windowHandle`), `xrCreateSession` succeeds, logs one WARN (`XrWin32TextureTargetBindingDXR IGNORED`), and `windowHandle`, if given, carries the
   weave as in SPEC_VERSION 8.
 - `transparentBackgroundEnabled` keeps its v8 meaning but applies to the app's own present, which
   the runtime does not perform. Under a target binding it only tells the DP the content carries
@@ -245,12 +245,13 @@ DrawSharedSubRect1to1(tf.targetRect);                      // before the editor'
 
 ## 8. Not in this version
 
-- **Vulkan** texture mode (no Windows shared-texture export yet, R8). The structs are
-  API-neutral; adoption needs no spec change.
 - **IPC / service** texture sessions and a **cross-process** reference window. The present-owner
   route for that is `XR_DXR_weave` (`xrWeaveBindWindowDXR`), which phases windowless from the
   window's origin since R2 (#2379).
-- **GL** honouring the binding. GL texture mode is not carried by the ADR-059 hub yet (#2366).
+- **GL texture mode on the ADR-059 hub** (#2366). Vulkan and GL honour the binding on their
+  own legs since #2721 (ADR-060 Amendment 2). GL needs a `windowHandle`, because the app's
+  context is current on that window's device context, and its windowless phase for a target
+  shorter than the panel is unverified on hardware.
   (D3D12 honours the binding since #2382, on its own legs and on the hub's client-presents route,
   `DXR_HUB=1`; see §9. On its own legs a bound D3D12 session is woven by the session screen's one
   display processor: a target that touches another screen is filled flat there, not woven per
