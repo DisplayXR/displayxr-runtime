@@ -13,12 +13,12 @@ add_executable(
 	get_http.c
 	get_verify.c
 	get_detect.c
-	${CMAKE_SOURCE_DIR}/src/external/monocypher/monocypher.c
-	${CMAKE_SOURCE_DIR}/src/external/monocypher/monocypher-ed25519.c
-	${CMAKE_SOURCE_DIR}/src/external/cjson/cjson/cJSON.c
+	${CMAKE_CURRENT_SOURCE_DIR}/../../../external/monocypher/monocypher.c
+	${CMAKE_CURRENT_SOURCE_DIR}/../../../external/monocypher/monocypher-ed25519.c
+	${CMAKE_CURRENT_SOURCE_DIR}/../../../external/cjson/cjson/cJSON.c
 	)
 target_include_directories(
-	dxr-get PRIVATE ${CMAKE_SOURCE_DIR}/src/external/monocypher ${CMAKE_SOURCE_DIR}/src/external/cjson
+	dxr-get PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../external/monocypher ${CMAKE_CURRENT_SOURCE_DIR}/../../../external/cjson
 	)
 target_compile_definitions(dxr-get PRIVATE WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
 target_link_libraries(dxr-get PRIVATE winhttp wintrust crypt32 bcrypt setupapi shell32 ole32 advapi32)
