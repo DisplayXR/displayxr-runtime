@@ -30,8 +30,9 @@
 #include "util/comp_swapchain_ring.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
-#include "util/comp_texture_target_win32.h" // ADR-060 texture target binding (#2721)
-#include "util/comp_dp_windowless_gl.h"     // ADR-060 windowless DP rule (#2721)
+#include "util/comp_texture_target_win32.h"   // ADR-060 texture target binding (#2721)
+#include "util/comp_dp_windowless_gl.h"       // ADR-060 windowless DP rule (#2721)
+#include "util/comp_texture_target_screens.h" // ADR-060 coverage of the 3D screen (#2721)
 // #918 Phase 3 — the shared `weave placement:` line, plus the canonical reason
 // tokens. Header-only from comp_xbridge: this compositor has NO output-device
 // split (ADR-037 §5 — OpenGL exposes no device-selection API at all), so it
@@ -1009,6 +1010,11 @@ struct comp_gl_compositor
 		bool gl_y_warned;
 		int32_t origin_x;
 		int32_t origin_y;
+		//! Windowless path: the target is wholly on another screen since
+		//! this time (0 = it is not), for the lens wish's 0.5 s dwell.
+		uint64_t off_panel_since_ns;
+		//! The last coverage logged (cov + 1).
+		int coverage_logged;
 		//! What the last woven bound frame used (under `mutex`).
 		struct comp_texture_target_state state;
 	} tt;
@@ -1503,6 +1509,63 @@ gl_tt_store_state(struct comp_gl_compositor *c,
 }
 
 /*!
+ * ADR-060 (#2721), windowless path: the lens wish of the DP's screen follows
+ * the target the way the segment manager's primary follows a window (#2247):
+ * 2D once the target has been wholly on another screen for the hand-off's
+ * 0.5 s, back to the session's wish at once. Edges only.
+ */
+static void
+gl_tt_lens_follow(struct comp_gl_compositor *c, enum comp_texture_target_coverage cov)
+{
+	const uint64_t now = os_monotonic_get_ns();
+	if (cov != COMP_TEXTURE_TARGET_COVERAGE_OFF_PANEL) {
+		c->tt.off_panel_since_ns = 0;
+	} else if (c->tt.off_panel_since_ns == 0) {
+		c->tt.off_panel_since_ns = now;
+	}
+	const bool uncovered =
+	    c->tt.off_panel_since_ns != 0 && now - c->tt.off_panel_since_ns >= (uint64_t)U_TIME_1S_IN_NS / 2;
+	if (uncovered == c->seg_primary_uncovered) {
+		return;
+	}
+	// The same latch the request_display_mode entry point reads.
+	c->seg_primary_uncovered = uncovered;
+	const bool want = c->hardware_display_3d && !uncovered && !c->window_hidden;
+	(void)xrt_display_processor_gl_request_display_mode(c->display_processor, want);
+	U_LOG_W("ADR-060: the texture target %s the 3D screen%s — its lens wish %s (gl, #2721)",
+	        uncovered ? "has been off" : "is back on", uncovered ? " for 0.5 s" : "", want ? "3D" : "2D");
+}
+
+/*!
+ * ADR-060 (#2721), windowless path: fill the canvas (GL rows 0..h-1 of the
+ * bound shared present FBO, the region read back) with ONE view of the atlas
+ * — the middle view, the left eye of a stereo pair — linearly scaled, as the
+ * segment manager's flat fill does.
+ */
+static void
+gl_tt_flat(struct comp_gl_compositor *c, GLuint atlas_tex, uint32_t w, uint32_t h)
+{
+	const uint32_t cols = c->eff_cols > 0 ? c->eff_cols : c->tile_columns;
+	const uint32_t rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
+	const uint32_t tw = c->eff_tile_w > 0 ? c->eff_tile_w : c->view_width;
+	const uint32_t th = c->eff_tile_h > 0 ? c->eff_tile_h : c->view_height;
+	if (cols == 0 || rows == 0 || tw == 0 || th == 0) {
+		return;
+	}
+	const uint32_t vi = (cols * rows - 1) / 2;
+	const struct comp_seg_rect tile = {0, 0, tw, th};
+	const struct comp_seg_rect sg = comp_segments_gl_atlas_rect(&tile, vi % cols, vi / cols, rows, tw, th);
+	glDisable(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, c->fbo);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, atlas_tex, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, c->shared_present_fbo);
+	glBlitFramebuffer(sg.x, sg.y, sg.x + (GLint)sg.w, sg.y + (GLint)sg.h, 0, 0, (GLint)w, (GLint)h,
+	                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, c->shared_present_fbo);
+}
+
+/*!
  * ADR-060 (#2721): before a bound frame's weave — resolve the target NOW,
  * phase the windowless DP from it, and say what the frame will report. False
  * when the reference window died since xrEndFrame (the caller weaves at the
@@ -1521,9 +1584,11 @@ static bool
 gl_tt_before_weave(struct comp_gl_compositor *c,
                    struct comp_texture_target_resolved *out_r,
                    struct comp_texture_target *out_named,
-                   uint64_t *out_state)
+                   uint64_t *out_state,
+                   bool *out_flat)
 {
 	*out_state = 0;
+	*out_flat = false;
 	if (!gl_tt_resolve(c, false, out_r, out_named)) {
 		return false;
 	}
@@ -1539,15 +1604,33 @@ gl_tt_before_weave(struct comp_gl_compositor *c,
 	}
 	if (c->tt.windowless && c->display_processor != NULL) {
 		*out_state |= COMP_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE;
+		// This tier weaves a texture session with ONE DP: a target that
+		// touches another screen is filled flat (one view) instead of woven
+		// at an origin the panel does not cover. Judged every frame.
+		const enum comp_texture_target_coverage cov = comp_texture_target_coverage_for_entry(
+		    out_r, c->tt.entry, c->seg_screens, c->seg_pinned_display_id);
+		gl_tt_lens_follow(c, cov);
+		if (c->tt.coverage_logged != (int)cov + 1) {
+			c->tt.coverage_logged = (int)cov + 1;
+			U_LOG_W("ADR-060: texture target at (%d,%d) %ux%u is %s (gl, #2721)", out_r->screen.x,
+			        out_r->screen.y, out_r->screen.w, out_r->screen.h,
+			        comp_texture_target_coverage_str(cov));
+		}
+		if (cov != COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL) {
+			*out_state |= COMP_TEXTURE_TARGET_STATE_FLAT_SEGMENT;
+			*out_flat = true;
+			return true;
+		}
 		int32_t ox = 0, oy = 0;
 		comp_texture_target_present_origin(out_r, c->tt.panel_left, c->tt.panel_top, &ox, &oy);
 		xrt_display_processor_gl_set_present_origin(c->display_processor, ox, oy);
 		if (!c->tt.origin_logged) {
 			c->tt.origin_logged = true;
-			U_LOG_W("ADR-060: windowless texture DP phased from present origin (%d,%d) — target at (%d,%d) "
-			        "%ux%u, screen at (%d,%d)",
-			        ox, oy, out_r->screen.x, out_r->screen.y, out_r->screen.w, out_r->screen.h,
-			        c->tt.panel_left, c->tt.panel_top);
+			U_LOG_W(
+			    "ADR-060: windowless texture DP phased from present origin (%d,%d) — target at (%d,%d) "
+			    "%ux%u, screen at (%d,%d)",
+			    ox, oy, out_r->screen.x, out_r->screen.y, out_r->screen.w, out_r->screen.h,
+			    c->tt.panel_left, c->tt.panel_top);
 		} else if (ox != c->tt.origin_x || oy != c->tt.origin_y) {
 			U_LOG_I("ADR-060: present origin -> (%d,%d)", ox, oy);
 		}
@@ -1569,7 +1652,8 @@ gl_tt_before_weave(struct comp_gl_compositor *c,
 			if (offset && !c->tt.anchor_offset_warned) {
 				c->tt.anchor_offset_warned = true;
 				U_LOG_W(
-				    "ADR-060: target at (%d,%d) is not at the windowHandle anchor's client origin (%d,%d) — "
+				    "ADR-060: target at (%d,%d) is not at the windowHandle anchor's client origin "
+				    "(%d,%d) — "
 				    "the windowed DP phases from the anchor, so the weave phase is off by the target's "
 				    "offset (no padded anchor weave on the GL tier)",
 				    out_r->screen.x, out_r->screen.y, (int)anchor.x, (int)anchor.y);
@@ -5733,15 +5817,18 @@ gl_tt_make_windowless_dp(struct comp_gl_compositor *c)
 	xrt_result_t ret = XRT_SUCCESS;
 	if (!comp_dp_make_windowless_gl(e, &dp, &why, &ret)) {
 		if (strcmp(why, COMP_DP_WINDOWLESS_NO_FACTORY) == 0) {
-			U_LOG_W("ADR-060: texture target bound, but the session screen's plug-in has no per-screen GL "
-			        "factory");
+			U_LOG_W(
+			    "ADR-060: texture target bound, but the session screen's plug-in has no per-screen GL "
+			    "factory");
 		} else if (strcmp(why, COMP_DP_WINDOWLESS_NO_HINT) == 0) {
-			U_LOG_W("ADR-060: '%s' does not hint windowless phase for this screen — no windowless texture DP",
-			        e->plugin_id);
+			U_LOG_W(
+			    "ADR-060: '%s' does not hint windowless phase for this screen — no windowless texture DP",
+			    e->plugin_id);
 		} else if (strcmp(why, COMP_DP_WINDOWLESS_REFUSED) == 0) {
 			U_LOG_W("ADR-060: windowless texture DP refused by '%s' (error %d)", e->plugin_id, (int)ret);
 		} else {
-			U_LOG_W("ADR-060: '%s' GL DP does not declare PHASE_FROM_PRESENT_ORIGIN — destroyed", e->plugin_id);
+			U_LOG_W("ADR-060: '%s' GL DP does not declare PHASE_FROM_PRESENT_ORIGIN — destroyed",
+			        e->plugin_id);
 		}
 		return false;
 	}
@@ -8793,7 +8880,9 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			struct comp_texture_target_resolved tt_r = {};
 			struct comp_texture_target tt_named = {};
 			uint64_t tt_state = 0;
-			const bool tt_ok = gl_tt_bound(c) && gl_tt_before_weave(c, &tt_r, &tt_named, &tt_state);
+			bool tt_flat = false;
+			const bool tt_ok =
+			    gl_tt_bound(c) && gl_tt_before_weave(c, &tt_r, &tt_named, &tt_state, &tt_flat);
 			if (tt_ok) {
 				dp_w = tt_r.screen.w;
 				dp_h = tt_r.screen.h;
@@ -8819,7 +8908,10 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// opaque. Falls back to the plain weave when no composite is
 			// needed (the helper returns false). Both land in
 			// shared_present_fbo (distinct from the c->fbo the crop reuses).
-			if (!gl_composite_local_2d(c, atlas_for_present, c->shared_present_fbo, dp_w, dp_h, /*reuse_twod=*/false)) {
+			if (tt_flat) {
+				gl_tt_flat(c, atlas_for_present, dp_w, dp_h); // ADR-060: off the 3D screen
+			} else if (!gl_composite_local_2d(c, atlas_for_present, c->shared_present_fbo, dp_w, dp_h,
+			                                  /*reuse_twod=*/false)) {
 				gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h, /*seg_split=*/false);
 			}
 
@@ -10325,13 +10417,26 @@ comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
 		return false;
 	}
 
-	// Window (or, bound, the texture target's — ADR-060 §2, framed to a
-	// locate in flight that chained one) client size and desktop origin.
+	// The texture target's (bound — ADR-060 §2, framed to a locate in flight
+	// that chained one) or the window's client size and desktop origin.
 	uint32_t win_px_w = 0;
 	uint32_t win_px_h = 0;
 	POINT client_origin = {0, 0};
-	if (!gl_client_geometry(c, &win_px_w, &win_px_h, &client_origin, /* for_locate */ true) || win_px_w == 0 ||
-	    win_px_h == 0) {
+	if (gl_tt_bound(c)) {
+		if (!gl_client_geometry(c, &win_px_w, &win_px_h, &client_origin, /* for_locate */ true)) {
+			return false;
+		}
+	} else {
+		// Unbound: byte for byte the read this function made before #2721.
+		RECT rect;
+		if (!GetClientRect(c->hwnd, &rect)) {
+			return false;
+		}
+		win_px_w = (uint32_t)(rect.right - rect.left);
+		win_px_h = (uint32_t)(rect.bottom - rect.top);
+		ClientToScreen(c->hwnd, &client_origin);
+	}
+	if (win_px_w == 0 || win_px_h == 0) {
 		return false;
 	}
 
@@ -10587,10 +10692,11 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 			c->tt.frame.w = texture_target->w;
 			c->tt.frame.h = texture_target->h;
 			c->tt.entry = (const struct xrt_dp_registry_entry *)texture_target->windowless_dp_entry;
-			U_LOG_W("ADR-060: texture target binding (gl) — reference window %p, initial rect (%d,%d %ux%u), "
-			        "windowHandle kept as the device-context window and fallback anchor",
-			        texture_target->reference_window, texture_target->x, texture_target->y, texture_target->w,
-			        texture_target->h);
+			U_LOG_W(
+			    "ADR-060: texture target binding (gl) — reference window %p, initial rect (%d,%d %ux%u), "
+			    "windowHandle kept as the device-context window and fallback anchor",
+			    texture_target->reference_window, texture_target->x, texture_target->y, texture_target->w,
+			    texture_target->h);
 		}
 	}
 #elif defined(__APPLE__)
@@ -10695,7 +10801,8 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 			if (!made) {
 				c->tt.anchor_fallback = true; // bound implies a windowHandle on this tier
 				U_LOG_W(
-				    "ADR-060: texture target cannot phase windowless — the windowHandle anchor carries the "
+				    "ADR-060: texture target cannot phase windowless — the windowHandle anchor carries "
+				    "the "
 				    "weave (SPEC_VERSION 8 path); the rect still defines the canvas");
 			}
 		}

@@ -355,6 +355,25 @@ comp_vk_native_renderer_get_deposit(struct comp_vk_native_renderer *renderer);
  *
  * @ingroup comp_vk_native
  */
+/*!
+ * ADR-060 (#2721): blit ONE view tile of the renderer's atlas (@p src_x,
+ * @p src_y, @p src_w x @p src_h, atlas pixels) linearly scaled into the
+ * top-left @p dst_w x @p dst_h of @p dst_image_u64 — the flat fill of a
+ * texture target that left the 3D screen. Same layouts as
+ * @ref comp_vk_native_renderer_blit_to_shared (the destination is left in
+ * GENERAL).
+ */
+void
+comp_vk_native_renderer_blit_view_to_shared(struct comp_vk_native_renderer *r,
+                                            void *cmd_ptr,
+                                            uint64_t dst_image_u64,
+                                            int32_t src_x,
+                                            int32_t src_y,
+                                            uint32_t src_w,
+                                            uint32_t src_h,
+                                            uint32_t dst_w,
+                                            uint32_t dst_h);
+
 void
 comp_vk_native_renderer_blit_to_shared(struct comp_vk_native_renderer *renderer,
                                         void *cmd,
