@@ -896,7 +896,16 @@ sim_dp_get_scanout_caps(struct xrt_display_processor_vk *xdp, struct xrt_dp_scan
 	}
 	const enum xrt_dp_weave_scope scope = sim_scanout_scope_from_env();
 	const bool interlaced = sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_INTERLACED;
-	const uint32_t flags = interlaced ? 0u : XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE;
+	uint32_t flags = interlaced ? 0u : XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE;
+	// ADR-060 (#2721, the Vulkan twin of the D3D11/D3D12 DPs' answer): a
+	// screen-bound instance — the one that confines itself to its canvas —
+	// phases every mode from set_present_origin (INTERLACED included: its
+	// phase is the present origin, never a window it reads), so it is exact
+	// at any origin it is handed, window or not. The unbound DP draws the
+	// whole target and stays window-bound.
+	if (sdp->screen_bound) {
+		flags |= XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN;
+	}
 	out_caps->weave_scope = (uint32_t)scope;
 	out_caps->flags = flags;
 	for (size_t i = 0; i < sizeof(out_caps->reserved) / sizeof(out_caps->reserved[0]); i++) {
