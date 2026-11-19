@@ -234,14 +234,15 @@ present origin, the window metrics and the segment table from that pair.**
        derived from the rect must feed that same table.
 - **Size** (in-process, Windows, excluding tests). After decision 3, about 700-900 lines,
   roughly 1 week, low-medium risk. The D3D12 and GL rows below are kept for the record only:
-  they are NOT done natively, and arrive through the hub.
+  they are NOT done natively, and arrive through the hub. (The D3D12 row was later done natively
+  as well: [Amendment 1](#amendment-1-2382-the-d3d12-tier-honours-the-binding), #2382.)
   | Part | Where | Est. lines |
   |---|---|---|
   | OpenXR: parse the create struct, the per-frame struct on `xrEndFrame` + locate, the system property, the state on `xrWaitFrame` | `oxr_session.c:6929-6965` (create), `oxr_session_frame_end.c:1587-1670` (next to the zones parse), `oxr_session.c:3538-3545` (zone-scoped locate) | 200-250 |
   | xrt plumbing: `xrt_session_info` fields + one per-frame compositor call | `xrt_compositor.h`, `oxr_session.c:553-603` | 60-80 |
   | Shared helper: resolve (ref, rect) under PMv2 → screen rect, metrics, present origin; unit tests | new `compositor/util/comp_texture_target_win32.{c,h}` | 150 + 100 test |
   | D3D11: windowless primary + caps check + fallback; the nine `hwnd ?: app_hwnd` geometry sites → the helper; `d3d11_effective_canvas`; `get_window_metrics`; the shared-texture branch feeds `set_present_origin` and routes a split through the segment manager into `shared_rtv` | `:5852-5862`, `:1213, 3930, 6633, 7627, 8288, 8716, 8871, 9900, 10334`, `:1204-1223`, `:10315-10420`, `:5401-5460`, `:3116-3138` | 250-300 |
-  | ~~D3D12: the same shape~~ (via the hub) | `comp_d3d12_compositor.cpp:959` (canvas), `:1392-1403` (DP create), `:6127` (shared branch), `:7542` (metrics), 15 `app_hwnd` sites, `comp_d3d12_segments.cpp:963` | 250-300 |
+  | ~~D3D12: the same shape~~ (via the hub; native since Amendment 1) | `comp_d3d12_compositor.cpp:959` (canvas), `:1392-1403` (DP create), `:6127` (shared branch), `:7542` (metrics), 15 `app_hwnd` sites, `comp_d3d12_segments.cpp:963` | 250-300 |
   | ~~GL~~ (via the hub): split `c->hwnd` (today the app HWND in texture mode too, `:8167`) from the reference; metrics `:8838`; segments hook `:5120-5140`; readback upload `:3414-3444` (R7 makes this interop-first) | `comp_gl_compositor.cpp` | 250-350, highest risk |
   | sim-display: the caps bit on its D3D11 DP + the claim hint | done in R2 (`sim_display_processor_d3d11.cpp`, `sim_display_plugin.c`) | 0 |
   | Leia plug-in (L4, not this repo): the claim hint + the D3D11 DP's scanout bit | done: `displayxr-leia-plugin` `feat/l4-phase-from-present-origin` | 0 |
@@ -308,7 +309,8 @@ binding.
 2. **`windowHandle` alongside a target binding: allowed,** as the fallback anchor only (§6 of
    the spec).
 3. **D3D11 native only; D3D12 / GL / Vulkan via the hub** (confirmed with the hub's maintainers,
-   2026-10-25). R1's binding is shaped as hub-facing data. See §Consequences,
+   2026-10-25; **amended for D3D12 by [Amendment 1](#amendment-1-2382-the-d3d12-tier-honours-the-binding)**,
+   which adds a native D3D12 path). R1's binding is shaped as hub-facing data. See §Consequences,
    "ADR-059 interaction".
 4. **The system property is answered from a plug-in-level hint.** As implemented on the R2
    branch, the hint is a claim-mask bit, `XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE` (bit 24 of
@@ -342,10 +344,13 @@ an import shim of the hub with no native port. #2382 amends that for D3D12 only.
   hub is unchanged. The create-time binding and the state reply are shared types
   (`comp_texture_target_info`, `comp_texture_target_state`), and the OpenXR glue is one file for
   both tiers.
-- **One difference from D3D11.** On its own legs the D3D12 tier does not segment a texture session
-  across screens (its segment manager is bound to a window the runtime presents to). A target
-  spanning two screens is woven by the session screen's display processor alone, and `SEGMENTED` /
-  `FLAT_SEGMENT` are reported on the hub route only.
+- **One difference from D3D11.** On its own legs the D3D12 tier does not weave a texture session
+  per screen (its segment manager is bound to a window the runtime presents to). On the windowless
+  path the target is tested against the screens every frame: a target that touches another screen,
+  spanning or wholly off the session's screen, is filled with the flat left view and reports
+  `FLAT_SEGMENT` (never `SEGMENTED`); wholly off, the screen's 3D wish is released after the
+  hand-off's 0.5 s. It is never woven with an origin the panel does not cover. The per-screen
+  result of the spec's §5 table is the D3D11 tier's and the hub route's.
 - **Which path a display takes.** The claim hint is per plug-in; the scanout bit is per DP
   instance. sim-display's screen-bound D3D12 DP sets the bit (its output has no position-dependent
   phase), so it weaves windowless. A plug-in whose D3D12 DP does not set the bit gets the anchor

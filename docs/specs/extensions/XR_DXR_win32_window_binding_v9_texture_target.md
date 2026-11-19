@@ -181,6 +181,21 @@ uvScale  = (rect.w / (float)sharedWidth, rect.h / (float)sharedHeight);   // aft
 
 The app needs no special case for any of these. It keeps drawing the sub-rect 1:1.
 
+**The table is what a per-screen weave gives:** the in-process D3D11 compositor and the hub's
+client-presents route. The in-process **D3D12** compositor on its own legs weaves a texture
+session with one display processor (#2382), so there:
+
+| Where the target is | Result in the shared texture (D3D12, own legs, windowless) |
+|---|---|
+| on the session's 3D screen, touching no other screen | woven by that screen's DP |
+| spanning that screen and any other screen (2D or 3D) | the whole canvas is the flat left view; `FLAT_SEGMENT_BIT`, never `SEGMENTED_BIT` |
+| wholly on another screen (2D or 3D) | the flat left view; the 3D wish of the session's screen is released after 0.5 s; `FLAT_SEGMENT_BIT` |
+
+A target that hangs off the desktop's edge touches no other screen and stays woven. The rule is
+not applied to a session pinned to a display, nor on the anchor fallback, where the windowed DP
+judges its own window as in SPEC_VERSION 8. An app that needs the per-screen result on D3D12
+takes the hub route (`DXR_HUB=1`).
+
 ## 6. Capability and fallback
 
 1. The runtime creates the session's primary DP **windowless** through the plug-in's
@@ -238,8 +253,8 @@ DrawSharedSubRect1to1(tf.targetRect);                      // before the editor'
 - **GL** honouring the binding. GL texture mode is not carried by the ADR-059 hub yet (#2366).
   (D3D12 honours the binding since #2382, on its own legs and on the hub's client-presents route,
   `DXR_HUB=1`; see §9. On its own legs a bound D3D12 session is woven by the session screen's one
-  display processor: a target spanning two screens is not segmented there, so `SEGMENTED` and
-  `FLAT_SEGMENT` are reported on the hub route only.)
+  display processor: a target that touches another screen is filled flat there, not woven per
+  screen. §5 has the table.)
 - **A consumer for the drag hint.** The bit is reserved in v9 (ADR-060 decision 5). What the
   runtime does with it (for example, forwarding it to the DP's snap) is left to a later version.
 - **The Cocoa variant** of the same pair, which comes in the next `XR_DXR_cocoa_window_binding`
