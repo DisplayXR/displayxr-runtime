@@ -449,8 +449,8 @@ The binding is honoured only when the display processor phases without a window
 (`XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN`; the Leia plug-in from v2.18.3 with LeiaSR
 1.39.0 or later; and sim-display). Otherwise `windowHandle`, if given, is the **fallback anchor** and the
 session weaves as in v8. The state's `ANCHOR_FALLBACK` bit says which path ran. The in-process
-D3D11 compositor honours v9. On other sessions the binding is ignored with one WARN, and
-D3D12 and GL reach texture mode through the hub (see the full text, §8).
+D3D11 and D3D12 compositors honour v9 (D3D12 since #2382). On other sessions the binding is
+ignored with one WARN (see the full text, §8).
 
 When the binding is chained, the [shared-texture contract](#shared-texture-contract-_texture-mode)
 above still holds: worst-case size, allocated once. Two differences: the read-back UV is

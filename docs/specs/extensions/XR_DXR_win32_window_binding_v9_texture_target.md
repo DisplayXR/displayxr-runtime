@@ -1,6 +1,7 @@
 # XR_DXR_win32_window_binding — SPEC_VERSION 9: texture target binding
 
-> **Shipped in runtime v2.55.0** (in-process D3D11, ADR-060 decision 3). This is the full text of
+> **Shipped in runtime v2.55.0** (in-process D3D11, ADR-060 decision 3); the in-process D3D12
+> compositor honours it since #2382. This is the full text of
 > the texture target binding; [`XR_DXR_win32_window_binding` §3.6](XR_DXR_win32_window_binding.md#36-texture-target-binding-v9)
 > summarises it. Decision record: [ADR-060](../../adr/ADR-060-texture-target-reference-window-binding.md)
 > (#697). The structure-type values 1004999015-018 are DisplayXR-provisional, recorded in
@@ -98,9 +99,9 @@ typedef struct XrWin32TextureTargetStateDXR {
   reserved for a later version (see the weave service, R2).
 - `initialTargetRect.extent` MUST be > 0 in both axes. Otherwise `XR_ERROR_VALIDATION_FAILURE`.
 - A binding the session cannot honour is **ignored, not an error**: on any session other than
-  the in-process D3D11 compositor (D3D12, GL, Vulkan, IPC), `xrCreateSession` succeeds, logs one
-  WARN (`XrWin32TextureTargetBindingDXR IGNORED`), and `windowHandle`, if given, carries the
-  weave as in SPEC_VERSION 8. The D3D12 hub route of §8 is the exception in progress (#2382).
+  the in-process D3D11 and D3D12 compositors (GL, Vulkan, IPC), `xrCreateSession` succeeds, logs
+  one WARN (`XrWin32TextureTargetBindingDXR IGNORED`), and `windowHandle`, if given, carries the
+  weave as in SPEC_VERSION 8.
 - `transparentBackgroundEnabled` keeps its v8 meaning but applies to the app's own present, which
   the runtime does not perform. Under a target binding it only tells the DP the content carries
   alpha (`set_transparent_background(..., client_presents = true)`).
@@ -234,10 +235,11 @@ DrawSharedSubRect1to1(tf.targetRect);                      // before the editor'
 - **IPC / service** texture sessions and a **cross-process** reference window. The present-owner
   route for that is `XR_DXR_weave` (`xrWeaveBindWindowDXR`), which phases windowless from the
   window's origin since R2 (#2379).
-- **D3D12 and GL** honouring the binding. They reach texture mode through the ADR-059 hub's
-  client-presents route (#2380, opt-in with `DXR_HUB=1`): a D3D12 texture session is rerouted
-  there today, with its target taken from the `windowHandle`'s client area; honouring v9 on that
-  route is #2382. GL is not carried yet (#2366).
+- **GL** honouring the binding. GL texture mode is not carried by the ADR-059 hub yet (#2366).
+  (D3D12 honours the binding since #2382, on its own legs and on the hub's client-presents route,
+  `DXR_HUB=1`; see §9. On its own legs a bound D3D12 session is woven by the session screen's one
+  display processor: a target spanning two screens is not segmented there, so `SEGMENTED` and
+  `FLAT_SEGMENT` are reported on the hub route only.)
 - **A consumer for the drag hint.** The bit is reserved in v9 (ADR-060 decision 5). What the
   runtime does with it (for example, forwarding it to the DP's snap) is left to a later version.
 - **The Cocoa variant** of the same pair, which comes in the next `XR_DXR_cocoa_window_binding`
@@ -256,13 +258,25 @@ On `main` since runtime v2.55.0. PRs and verification: [ADR-060 §Implementation
 - **Shared resolve:** `src/xrt/compositor/util/comp_texture_target.h` and `comp_texture_target_win32.h`.
   They take (reference window, rect) in and give the desktop origin, the present origins, the
   window metrics and the segment window out, with every window read pinned to PMv2. The native
-  D3D11 compositor and the hub both call them.
-- **Windowless DP rule:** `src/xrt/compositor/util/comp_dp_windowless_d3d11.h`. The claim hint
-  goes to `create_dp_d3d11_for_screen(window = NULL)`; the DP keeps it if it sets
-  `XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN`, and is destroyed otherwise.
+  D3D11 and D3D12 compositors call them; the hub consumes the resolved rect as data. The
+  create-time binding and the state reply (`comp_texture_target_info`, `comp_texture_target_state`)
+  are shared by both tiers.
+- **Windowless DP rule:** `src/xrt/compositor/util/comp_dp_windowless_d3d11.h` and its twin
+  `comp_dp_windowless_d3d12.h`. The claim hint goes to `create_dp_{d3d11,d3d12}_for_screen(window =
+  NULL)`; the DP keeps it if it sets `XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN`, and is
+  destroyed otherwise. The hint is per plug-in and the bit is per DP instance, so the two APIs can
+  answer differently on one screen: a plug-in whose D3D12 DP does not set the bit gives a D3D12
+  session the anchor fallback while its D3D11 sessions phase windowless.
 - **D3D11 native:** `comp_d3d11_compositor.cpp`. The `frame` and `locate` slots are kept apart (§3),
   and the anchor-fallback padded weave is #2406.
+- **D3D12 native (#2382):** `comp_d3d12_compositor.cpp`, the same shape: the two slots, one resolve,
+  the windowless primary DP (`set_present_origin`) or the anchor fallback with its padded weave,
+  and the target feeding the window metrics, the canvas and the zone anchor. On the hub's
+  client-presents route (`DXR_HUB=1`) the same resolve is handed to the hub, and a bound session
+  no longer needs a `windowHandle` to take that route.
 - **Hub:** `comp_hub_d3d11` client-presents (#2380).
-- **Tests:** `tests_comp_texture_target`, `tests_dp_windowless_d3d11`, `tests_dp_weave_scope`.
+- **Tests:** `tests_comp_texture_target`, `tests_dp_windowless_d3d11`, `tests_dp_windowless_d3d12`,
+  `tests_dp_weave_scope`.
 - **Reference client:** `test_apps/texture/cube_zones_texture_d3d11_win` with `DXR_TEXTURE_TARGET=1`.
-  `DXR_TEXTURE_TARGET_INSET` draws at a sub-rect.
+  `DXR_TEXTURE_TARGET_INSET` draws at a sub-rect. `cube_zones_texture_d3d12_win` takes the same
+  switches (#2382) and logs the `XrWin32TextureTargetStateDXR` reply on every change.

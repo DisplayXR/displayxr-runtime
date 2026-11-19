@@ -392,9 +392,10 @@ same on both tiers. Under `DXR_HUB=1` both tiers print `hub placement: hub=0 rea
   reading it, and the caller has no fence it could wait on between frames. `comp_hub_d3d11_repaint`
   returns `NOT_ADMITTED` and the tiers keep their replay disarmed. The fix is an app-visible release
   fence in a later revision of the ADR-060 binding (#2378).
-- **D3D12 has no v9 target binding yet.** On D3D12 the target is the `windowHandle`'s whole client
-  area. A sub-rect target therefore phases from the client-area corner, and no
-  `XrWin32TextureTargetStateDXR` is produced (#2382).
+- **D3D12 and the v9 target binding (#2382, landed).** A D3D12 session bound to a texture target
+  hands the hub the target's resolved rect, so a sub-rect target phases from the rect, the state
+  struct is produced, and no `windowHandle` is needed. An unbound D3D12 texture session keeps the
+  earlier reading: the `windowHandle`'s whole client area.
 - **OpenGL texture mode** is not carried. The GL shim (#2366) landed without it: a GL session
   with a shared texture is refused (`shared_texture_session`) and stays on the GL compositor's own
   legs.
