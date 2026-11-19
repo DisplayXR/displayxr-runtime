@@ -761,8 +761,17 @@ sim_dp_gl_clear_local_zone_mask(struct xrt_display_processor_gl *xdp)
 static bool
 sim_dp_gl_get_scanout_caps(struct xrt_display_processor_gl *xdp, struct xrt_dp_scanout_caps *out_caps)
 {
-	(void)xdp;
-	return sim_scanout_fill_caps(out_caps, "GL");
+	if (!sim_scanout_fill_caps(out_caps, "GL")) {
+		return false;
+	}
+	// ADR-060 (#2721, the GL twin of the D3D11/D3D12 DPs' answer): a
+	// screen-bound instance phases from set_present_origin and confines its
+	// draw to the canvas it is handed, so it is exact at any origin, window
+	// or not. The unbound DP draws the whole target and stays window-bound.
+	if (sim_dp_gl(xdp)->screen_bound) {
+		out_caps->flags |= XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN;
+	}
+	return true;
 }
 
 
