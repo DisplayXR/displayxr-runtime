@@ -16,6 +16,7 @@
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_defines.h"
+#include "util/comp_texture_target.h" // ADR-060: comp_texture_target_info / _state
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +47,11 @@ struct xrt_rect;
  *                               populated by the vendor plug-in iface). 0 = primary.
  *                               Used only on Windows for self-owned window positioning.
  * @param display_screen_top     Display top-left Y in OS screen coords. 0 = primary.
+ * @param texture_target         ADR-060 texture target binding (XR_DXR_win32_window_binding v9,
+ *                               #2721), or NULL. Windows only, and only meaningful with
+ *                               @p shared_texture_handle AND @p window_handle: the GL tier
+ *                               needs a window for its WGL device context, so a bound
+ *                               session that drops windowHandle is not honoured here.
  * @param out_xcn                Output native compositor.
  * @return XRT_SUCCESS or error.
  *
@@ -62,7 +68,33 @@ comp_gl_compositor_create(struct xrt_device *xdev,
                           bool transparent_background,
                           int32_t display_screen_left,
                           int32_t display_screen_top,
+                          const struct comp_texture_target_info *texture_target,
                           struct xrt_compositor_native **out_xcn);
+
+/*
+ * ADR-060 — texture target binding (XR_DXR_win32_window_binding v9), the GL
+ * twin of the D3D11 / D3D12 tiers' entry points (#2721). Same contract as
+ * comp_vk_native_compositor_set_texture_target and friends. Windows only.
+ */
+
+//! A frame's target (xrEndFrame when @p for_locate is false, else xrLocateViews).
+void
+comp_gl_compositor_set_texture_target(struct xrt_compositor *xc,
+                                      bool for_locate,
+                                      void *reference_window,
+                                      int32_t x,
+                                      int32_t y,
+                                      uint32_t w,
+                                      uint32_t h,
+                                      uint64_t flags);
+
+//! The locate that chained a target returned: metrics fall back to the xrEndFrame slot.
+void
+comp_gl_compositor_end_texture_target_locate(struct xrt_compositor *xc);
+
+//! What the most recently woven frame used. @return false when the session is not bound.
+bool
+comp_gl_compositor_get_texture_target_state(struct xrt_compositor *xc, struct comp_texture_target_state *out);
 
 /*!
  * Set system devices on a GL compositor (for qwerty debug driver etc.).

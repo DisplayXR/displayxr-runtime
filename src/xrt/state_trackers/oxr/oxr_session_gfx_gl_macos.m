@@ -74,6 +74,7 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 	    /*transparent_background*/ false,  // GL transparent present path is deferred (PR #3b §3b)
 	    /*display_screen_left*/ 0,   // macOS: NSOpenGLView positioning, no D3D11 window
 	    /*display_screen_top*/ 0,
+	    /*texture_target*/ NULL, // ADR-060 texture target binding: Windows only
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,

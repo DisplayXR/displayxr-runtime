@@ -81,6 +81,7 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
                                 void *shared_texture_handle,
                                 bool transparent_background,
                                 uint64_t bound_display_id,
+                                const void *texture_target_binding,
                                 struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -103,10 +104,30 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
 	int32_t display_screen_left = (sys->xsysc != NULL) ? sys->xsysc->info.display_screen_left : 0;
 	int32_t display_screen_top = (sys->xsysc != NULL) ? sys->xsysc->info.display_screen_top : 0;
 
+	// XR_DXR_win32_window_binding v9 (ADR-060, #2721): the texture target binding.
+	// The GL tier needs a window for its WGL device context (the app's
+	// context is made current on that window's DC; without one the compositor
+	// would create its own full-screen window), so a bound session that drops
+	// windowHandle is not honoured here: it is left unbound and gets the
+	// IGNORED warning, and the SPEC_VERSION 8 path runs.
+	struct comp_texture_target_info tt_info = {0};
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	if (texture_target_binding != NULL && shared_texture_handle != NULL && window_handle == NULL) {
+		U_LOG_W(
+		    "ADR-060: XrWin32TextureTargetBindingDXR without a windowHandle is not honoured by the GL tier — "
+		    "OpenGL needs a window for its device context; pass windowHandle (it stays a fallback anchor)");
+	} else {
+		oxr_texture_target_fill_info(sys, (const XrWin32TextureTargetBindingDXR *)texture_target_binding,
+		                             bound_display_id, &tt_info);
+	}
+#else
+	(void)texture_target_binding;
+#endif
+
 	// Create the GL native compositor
 	xrt_result_t xret = comp_gl_compositor_create(xdev, window_handle, gl_context, gl_display, dp_factory_gl,
 	                                              dp_factory_d3d11, shared_texture_handle, transparent_background,
-	                                              display_screen_left, display_screen_top, &xcn);
+	                                              display_screen_left, display_screen_top, &tt_info, &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create GL native compositor: %d", xret);
@@ -127,6 +148,7 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
 	sess->compositor = &xcn->base;
 	sess->create_swapchain = oxr_swapchain_gl_create;
 	sess->is_gl_native_compositor = true;
+	sess->texture_target_bound = tt_info.bound && shared_texture_handle != NULL;
 
 	// Native compositor doesn't use multi-compositor event system,
 	// so set visibility/focus flags directly.

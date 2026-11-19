@@ -12,8 +12,8 @@
  * the state reply on xrWaitFrame and the system property. The geometry itself
  * (one resolve → phase + metrics + segments) is the compositor's
  * (compositor/util/comp_texture_target*.h). Honoured by the in-process native
- * D3D11 and D3D12 (#2382) compositors; GL and Vulkan get it through the
- * ADR-059 hub (ADR-060 decision 3).
+ * D3D11, D3D12 (#2382), Vulkan and GL (#2721) compositors; the GL tier needs
+ * the windowHandle as well (its WGL device context).
  */
 
 #include "xrt/xrt_compiler.h"
@@ -35,7 +35,14 @@
 #ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
 #include "d3d12/comp_d3d12_compositor.h"
 #endif
-#if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) || defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR)
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+#include "vk_native/comp_vk_native_compositor.h"
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+#include "gl/comp_gl_compositor.h"
+#endif
+#if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) || defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR) ||                         \
+    defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) || defined(XRT_HAVE_GL_NATIVE_COMPOSITOR)
 #define OXR_TEXTURE_TARGET_HAVE_COMPOSITOR
 #include "util/comp_texture_target.h"
 #include "util/comp_dp_factory.h"
@@ -159,6 +166,22 @@ forward_frame(struct oxr_logger *log, struct oxr_session *sess, const XrWin32Tex
 		    (uint32_t)tf->targetRect.extent.height, (uint64_t)tf->flags);
 	}
 #endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
+		comp_vk_native_compositor_set_texture_target(
+		    &sess->xcn->base, !at_frame_end, tf->referenceWindow, tf->targetRect.offset.x,
+		    tf->targetRect.offset.y, (uint32_t)tf->targetRect.extent.width,
+		    (uint32_t)tf->targetRect.extent.height, (uint64_t)tf->flags);
+	}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor && sess->xcn != NULL) {
+		comp_gl_compositor_set_texture_target(&sess->xcn->base, !at_frame_end, tf->referenceWindow,
+		                                      tf->targetRect.offset.x, tf->targetRect.offset.y,
+		                                      (uint32_t)tf->targetRect.extent.width,
+		                                      (uint32_t)tf->targetRect.extent.height, (uint64_t)tf->flags);
+	}
+#endif
 	return XR_SUCCESS;
 }
 
@@ -205,6 +228,16 @@ oxr_texture_target_locate_end(struct oxr_session *sess)
 		comp_d3d12_compositor_end_texture_target_locate(&sess->xcn->base);
 	}
 #endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
+		comp_vk_native_compositor_end_texture_target_locate(&sess->xcn->base);
+	}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor && sess->xcn != NULL) {
+		comp_gl_compositor_end_texture_target_locate(&sess->xcn->base);
+	}
+#endif
 }
 
 void
@@ -213,12 +246,13 @@ oxr_texture_target_note_ignored(struct oxr_session *sess, const XrSessionCreateI
 	if (sess->texture_target_bound || oxr_texture_target_find_binding(createInfo) == NULL) {
 		return;
 	}
-	// Spec v9 is honoured by the in-process D3D11 and D3D12 (#2382)
-	// compositors only (ADR-060 decision 3). An app that dropped windowHandle
-	// trusting it would weave display-scoped with nothing in the log otherwise.
+	// Spec v9 is honoured by the in-process native compositors only (ADR-060
+	// decision 3; Vulkan and GL since #2721, GL only with a windowHandle). An
+	// app that dropped windowHandle trusting it would weave display-scoped
+	// with nothing in the log otherwise.
 	U_LOG_W(
-	    "xrCreateSession: XrWin32TextureTargetBindingDXR IGNORED — only the in-process D3D11 and D3D12 "
-	    "compositors honour the texture target binding (GL / Vulkan arrive via the hub; IPC sessions are not "
+	    "xrCreateSession: XrWin32TextureTargetBindingDXR IGNORED — only the in-process D3D11, D3D12, Vulkan and "
+	    "GL compositors honour the texture target binding (GL needs a windowHandle too; IPC sessions are not "
 	    "covered by v9). windowHandle, if given, carries the weave as in SPEC_VERSION 8.");
 }
 
@@ -254,6 +288,16 @@ oxr_texture_target_wait(struct oxr_session *sess, XrFrameState *frameState)
 		have = comp_d3d12_compositor_get_texture_target_state(&sess->xcn->base, &s);
 	}
 #endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
+		have = comp_vk_native_compositor_get_texture_target_state(&sess->xcn->base, &s);
+	}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor && sess->xcn != NULL) {
+		have = comp_gl_compositor_get_texture_target_state(&sess->xcn->base, &s);
+	}
+#endif
 	if (have) {
 		st->flags = (XrWin32TextureTargetStateFlagsDXR)s.flags;
 		if (s.valid) {
@@ -280,7 +324,7 @@ oxr_texture_target_system_properties(struct oxr_system *sys, XrSystemProperties 
 	p->supportsTextureTarget = XR_FALSE;
 	p->windowlessPhase = XR_FALSE;
 #ifdef OXR_TEXTURE_TARGET_HAVE_COMPOSITOR
-	// In-process native D3D11 / D3D12 only: an IPC session's texture class is
+	// In-process native D3D11 / D3D12 / Vulkan / GL only: an IPC session's texture class is
 	// not covered by v9 (spec §8). A system property is asked before any
 	// graphics binding exists, so it cannot be answered per API; the
 	// session's state flags are the authority for what its tier did.

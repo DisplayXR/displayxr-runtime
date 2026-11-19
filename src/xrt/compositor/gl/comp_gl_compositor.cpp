@@ -30,6 +30,8 @@
 #include "util/comp_swapchain_ring.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
+#include "util/comp_texture_target_win32.h" // ADR-060 texture target binding (#2721)
+#include "util/comp_dp_windowless_gl.h"     // ADR-060 windowless DP rule (#2721)
 // #918 Phase 3 — the shared `weave placement:` line, plus the canonical reason
 // tokens. Header-only from comp_xbridge: this compositor has NO output-device
 // split (ADR-037 §5 — OpenGL exposes no device-selection API at all), so it
@@ -977,6 +979,40 @@ struct comp_gl_compositor
 	uint32_t shared_width;
 	uint32_t shared_height;
 
+	/*!
+	 * ADR-060 texture target binding (XR_DXR_win32_window_binding v9, #2721 —
+	 * the GL twin of comp_d3d12_compositor::tt): the reference window + rect
+	 * the app draws the shared texture at. TWO slots under `mutex` (frame:
+	 * xrEndFrame, read by the weave / canvas / zone anchor / state reply;
+	 * locate: xrLocateViews, read only by the window metrics). Only taken
+	 * with a windowHandle: this tier needs the window for its WGL device
+	 * context, so the window stays the fallback anchor and the GL context's
+	 * home; the binding moves the canvas, the metrics and (windowless) the
+	 * phase to the target. The reference window is only read.
+	 */
+	struct
+	{
+		struct os_mutex mutex;
+		struct comp_texture_target frame;
+		struct comp_texture_target locate;
+		bool locate_valid;
+		bool windowless;
+		bool anchor_fallback;
+		//! The session screen's DP registry entry (system-owned): the windowless DP source.
+		const struct xrt_dp_registry_entry *entry;
+		//! The windowless primary DP's screen origin, desktop device px.
+		int32_t panel_left;
+		int32_t panel_top;
+		bool clamp_warned;
+		bool origin_logged;
+		bool anchor_offset_warned;
+		bool gl_y_warned;
+		int32_t origin_x;
+		int32_t origin_y;
+		//! What the last woven bound frame used (under `mutex`).
+		struct comp_texture_target_state state;
+	} tt;
+
 	// WGL_NV_DX_interop2 function pointers (used by the DComp transit path)
 	PFN_wglDXOpenDeviceNV pfn_wglDXOpenDeviceNV;
 	PFN_wglDXCloseDeviceNV pfn_wglDXCloseDeviceNV;
@@ -1368,6 +1404,183 @@ gl_comp(struct xrt_compositor *xc)
 {
 	return (struct comp_gl_compositor *)xc;
 }
+
+#ifdef XRT_OS_WINDOWS
+/*
+ *
+ * ADR-060 texture target binding helpers (#2721; the GL twins of the
+ * d3d12_tt_* helpers in comp_d3d12_compositor.cpp).
+ *
+ */
+
+static inline bool
+gl_tt_bound(const struct comp_gl_compositor *c)
+{
+	return c->tt.frame.bound; // set at create, immutable after
+}
+
+/*!
+ * Resolve the named (reference window, rect) NOW, clamped to the shared
+ * texture. One computation for phase, metrics and canvas (ADR-060 §2).
+ */
+static bool
+gl_tt_resolve(struct comp_gl_compositor *c,
+              bool for_locate,
+              struct comp_texture_target_resolved *out,
+              struct comp_texture_target *out_named)
+{
+	out->valid = false;
+	if (!gl_tt_bound(c)) {
+		return false;
+	}
+	struct comp_texture_target named;
+	os_mutex_lock(&c->tt.mutex);
+	named = (for_locate && c->tt.locate_valid) ? c->tt.locate : c->tt.frame;
+	os_mutex_unlock(&c->tt.mutex);
+	if (out_named != NULL) {
+		*out_named = named;
+	}
+	return comp_texture_target_resolve_win32(&named, c->shared_width, c->shared_height, out);
+}
+
+/*!
+ * The client region zone / Local2D / mask rects are expressed in, and (when
+ * @p out_origin is non-NULL) its origin on the desktop. Under a texture target
+ * binding that region IS the target (ADR-060 §3); otherwise the window's
+ * client area. False when it cannot be resolved.
+ */
+static bool
+gl_client_geometry(
+    struct comp_gl_compositor *c, uint32_t *out_w, uint32_t *out_h, POINT *out_origin, bool for_locate = false)
+{
+	if (gl_tt_bound(c)) {
+		struct comp_texture_target_resolved r;
+		if (!gl_tt_resolve(c, for_locate, &r, NULL)) {
+			return false;
+		}
+		*out_w = r.screen.w;
+		*out_h = r.screen.h;
+		if (out_origin != NULL) {
+			out_origin->x = r.screen.x;
+			out_origin->y = r.screen.y;
+		}
+		return true;
+	}
+	RECT rc;
+	if (c->hwnd == NULL || !GetClientRect(c->hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) {
+		return false;
+	}
+	if (out_origin != NULL) {
+		out_origin->x = 0;
+		out_origin->y = 0;
+		if (!ClientToScreen(c->hwnd, out_origin)) {
+			return false;
+		}
+	}
+	*out_w = (uint32_t)rc.right;
+	*out_h = (uint32_t)rc.bottom;
+	return true;
+}
+
+//! Store what a bound frame used — XrWin32TextureTargetStateDXR at the next xrWaitFrame.
+static void
+gl_tt_store_state(struct comp_gl_compositor *c,
+                  uint64_t flags,
+                  const struct comp_texture_target_resolved *r,
+                  const struct comp_texture_target *woven)
+{
+	os_mutex_lock(&c->tt.mutex);
+	c->tt.state.valid = true;
+	c->tt.state.flags = flags;
+	c->tt.state.screen_x = r->screen.x;
+	c->tt.state.screen_y = r->screen.y;
+	c->tt.state.rect_x = woven->x;
+	c->tt.state.rect_y = woven->y;
+	c->tt.state.rect_w = r->screen.w;
+	c->tt.state.rect_h = r->screen.h;
+	c->tt.state.display_time_ns = c->layer_accum.data.display_time_ns;
+	os_mutex_unlock(&c->tt.mutex);
+}
+
+/*!
+ * ADR-060 (#2721): before a bound frame's weave — resolve the target NOW,
+ * phase the windowless DP from it, and say what the frame will report. False
+ * when the reference window died since xrEndFrame (the caller weaves at the
+ * last good geometry and reports nothing for this frame).
+ *
+ * The woven region is the target rect at the BOTTOM-LEFT of the panel-sized
+ * GL render target, GL convention (rows 0..h-1 read back and uploaded top-down,
+ * which the app V-flips) — the same placement this tier's zones frames use.
+ * A windowless DP therefore has to take its vertical phase from the present
+ * origin alone and its viewport as-is; a DP that converts the GL viewport to
+ * a top-left origin with the DISPLAY height (rather than the target's) puts
+ * the canvas at y = display_h - h. That is a vendor DP property this compositor
+ * cannot see, so it is WARNed once and left to a panel check.
+ */
+static bool
+gl_tt_before_weave(struct comp_gl_compositor *c,
+                   struct comp_texture_target_resolved *out_r,
+                   struct comp_texture_target *out_named,
+                   uint64_t *out_state)
+{
+	*out_state = 0;
+	if (!gl_tt_resolve(c, false, out_r, out_named)) {
+		return false;
+	}
+	if (out_r->clamped) {
+		*out_state |= COMP_TEXTURE_TARGET_STATE_CLAMPED;
+		if (!c->tt.clamp_warned) {
+			c->tt.clamp_warned = true;
+			U_LOG_W("ADR-060: target rect larger than the shared texture (%ux%u) — woven clamped to %ux%u",
+			        c->shared_width, c->shared_height, out_r->screen.w, out_r->screen.h);
+		}
+	} else {
+		c->tt.clamp_warned = false; // one WARN per clamp episode
+	}
+	if (c->tt.windowless && c->display_processor != NULL) {
+		*out_state |= COMP_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE;
+		int32_t ox = 0, oy = 0;
+		comp_texture_target_present_origin(out_r, c->tt.panel_left, c->tt.panel_top, &ox, &oy);
+		xrt_display_processor_gl_set_present_origin(c->display_processor, ox, oy);
+		if (!c->tt.origin_logged) {
+			c->tt.origin_logged = true;
+			U_LOG_W("ADR-060: windowless texture DP phased from present origin (%d,%d) — target at (%d,%d) "
+			        "%ux%u, screen at (%d,%d)",
+			        ox, oy, out_r->screen.x, out_r->screen.y, out_r->screen.w, out_r->screen.h,
+			        c->tt.panel_left, c->tt.panel_top);
+		} else if (ox != c->tt.origin_x || oy != c->tt.origin_y) {
+			U_LOG_I("ADR-060: present origin -> (%d,%d)", ox, oy);
+		}
+		c->tt.origin_x = ox;
+		c->tt.origin_y = oy;
+		if (!c->tt.gl_y_warned && out_r->screen.h != c->shared_height) {
+			c->tt.gl_y_warned = true;
+			U_LOG_W(
+			    "ADR-060: GL windowless weave of a %ux%u target in a %ux%u render target, canvas at the GL "
+			    "bottom-left — correct only for a DP that phases vertically from the present origin and "
+			    "takes the GL viewport as-is (not converted with the display height)",
+			    out_r->screen.w, out_r->screen.h, c->shared_width, c->shared_height);
+		}
+	} else if (c->tt.anchor_fallback) {
+		*out_state |= COMP_TEXTURE_TARGET_STATE_ANCHOR_FALLBACK;
+		POINT anchor;
+		if (comp_texture_target_client_origin_win32(c->hwnd, &anchor, NULL)) {
+			const bool offset = out_r->screen.x != anchor.x || out_r->screen.y != anchor.y;
+			if (offset && !c->tt.anchor_offset_warned) {
+				c->tt.anchor_offset_warned = true;
+				U_LOG_W(
+				    "ADR-060: target at (%d,%d) is not at the windowHandle anchor's client origin (%d,%d) — "
+				    "the windowed DP phases from the anchor, so the weave phase is off by the target's "
+				    "offset (no padded anchor weave on the GL tier)",
+				    out_r->screen.x, out_r->screen.y, (int)anchor.x, (int)anchor.y);
+			} else if (!offset) {
+				c->tt.anchor_offset_warned = false; // one WARN per episode
+			}
+		}
+	}
+	return true;
+}
+#endif // XRT_OS_WINDOWS
 
 
 #ifdef XRT_OS_WINDOWS
@@ -5057,13 +5270,18 @@ gl_sync_zone_mask_to_dp(struct comp_gl_compositor *c)
 		U_LOG_W("#2671 gl: the window is seen again - the zone wish is re-published from scratch");
 	}
 
-	// Screen-anchor the mask: client-area origin in physical screen pixels.
-	// No HWND (offscreen) → nothing to anchor to; skip the publish.
-	HWND wnd = c->hwnd;
-	RECT r;
+	// Screen-anchor the mask: client-area origin in physical screen pixels
+	// (the texture target's, ADR-060). No HWND (offscreen) → nothing to
+	// anchor to; skip the publish.
+	RECT r = {};
 	POINT origin = {0, 0};
-	if (wnd == NULL || !GetClientRect(wnd, &r) || r.right <= 0 || r.bottom <= 0 || !ClientToScreen(wnd, &origin)) {
-		return;
+	{
+		uint32_t cw = 0, ch = 0;
+		if (!gl_client_geometry(c, &cw, &ch, &origin)) {
+			return;
+		}
+		r.right = (LONG)cw;
+		r.bottom = (LONG)ch;
 	}
 
 	bool ok = xrt_display_processor_gl_publish_local_zone_mask(c->display_processor, tex, mask_w, mask_h,
@@ -5476,6 +5694,69 @@ gl_compositor_snap_window_rect_cb(void *userdata,
 	return snapped;
 }
 #endif // XRT_OS_WINDOWS
+
+/*!
+ * The session-level settings a freshly created primary DP is given.
+ * @p client_presents: the app presents the woven texture itself (ADR-060
+ * windowless texture DP, as the D3D tiers tell theirs).
+ */
+static void
+gl_dp_session_settings(struct comp_gl_compositor *c, bool client_presents)
+{
+	(void)u_weave_scope_report(xrt_display_processor_gl_get_weave_scope(c->display_processor), "GL",
+	                           /* panel_scoped */ false);
+	xrt_display_processor_gl_set_transparent_background(c->display_processor, c->transparent_background,
+	                                                    client_presents);
+	bool gl_shared_texture_present = false;
+#ifdef XRT_OS_WINDOWS
+	gl_shared_texture_present = c->has_shared_texture;
+#endif
+	xrt_display_processor_gl_set_shared_texture_present(c->display_processor, gl_shared_texture_present);
+}
+
+#ifdef XRT_OS_WINDOWS
+/*!
+ * ADR-060 §6 (#2721): the primary DP of a bound texture session, made
+ * WINDOWLESS on the current GL context through the session screen's
+ * per-screen factory (window = NULL — the factory the GL segment manager
+ * makes its per-screen DPs with). Kept only when the plug-in hints windowless
+ * phase for that screen AND the DP declares
+ * XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN — the one rule,
+ * comp_dp_make_windowless_gl. Decided once per session.
+ */
+static bool
+gl_tt_make_windowless_dp(struct comp_gl_compositor *c)
+{
+	const struct xrt_dp_registry_entry *e = c->tt.entry;
+	struct xrt_display_processor_gl *dp = NULL;
+	const char *why = NULL;
+	xrt_result_t ret = XRT_SUCCESS;
+	if (!comp_dp_make_windowless_gl(e, &dp, &why, &ret)) {
+		if (strcmp(why, COMP_DP_WINDOWLESS_NO_FACTORY) == 0) {
+			U_LOG_W("ADR-060: texture target bound, but the session screen's plug-in has no per-screen GL "
+			        "factory");
+		} else if (strcmp(why, COMP_DP_WINDOWLESS_NO_HINT) == 0) {
+			U_LOG_W("ADR-060: '%s' does not hint windowless phase for this screen — no windowless texture DP",
+			        e->plugin_id);
+		} else if (strcmp(why, COMP_DP_WINDOWLESS_REFUSED) == 0) {
+			U_LOG_W("ADR-060: windowless texture DP refused by '%s' (error %d)", e->plugin_id, (int)ret);
+		} else {
+			U_LOG_W("ADR-060: '%s' GL DP does not declare PHASE_FROM_PRESENT_ORIGIN — destroyed", e->plugin_id);
+		}
+		return false;
+	}
+	c->display_processor = dp;
+	c->tt.windowless = true;
+	c->tt.panel_left = e->screen_left;
+	c->tt.panel_top = e->screen_top;
+	gl_dp_session_settings(c, true);
+	U_LOG_W(
+	    "ADR-060: texture target bound — WINDOWLESS primary GL DP from '%s' (screen at %d,%d %ux%u), phased from "
+	    "the target's present origin; the reference window %p is read, never handed to the vendor",
+	    e->plugin_id, e->screen_left, e->screen_top, e->pixel_width, e->pixel_height, c->tt.frame.ref);
+	return true;
+}
+#endif
 
 static void
 gl_create_gl_dp(struct comp_gl_compositor *c, void *dp_factory_gl, void *dp_window, bool quiet_failure)
@@ -7681,12 +7962,12 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 					// so scale view dims to the actual window client area
 					// (matches the D3D11/D3D12 path) — keeps the atlas content
 					// region, DP input, and atlas capture at window resolution.
+					// Bound texture session: the target's rect (ADR-060).
 					uint32_t win_w = 0, win_h = 0;
 #ifdef XRT_OS_WINDOWS
-					RECT rc;
-					if (c->hwnd != NULL && GetClientRect(c->hwnd, &rc)) {
-						win_w = (uint32_t)(rc.right - rc.left);
-						win_h = (uint32_t)(rc.bottom - rc.top);
+					if (!gl_client_geometry(c, &win_w, &win_h, NULL)) {
+						win_w = 0;
+						win_h = 0;
 					}
 #else
 					comp_gl_window_macos_get_dimensions(c->macos_window, &win_w, &win_h);
@@ -7963,10 +8244,10 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	uint32_t zones_target_h = 0;
 	if (c->zones_frame) {
 #ifdef XRT_OS_WINDOWS
-		RECT zrc;
-		if (c->hwnd != NULL && GetClientRect(c->hwnd, &zrc) && zrc.right > 0 && zrc.bottom > 0) {
-			zones_target_w = (uint32_t)zrc.right;
-			zones_target_h = (uint32_t)zrc.bottom;
+		// The window client area, or the texture target's rect (ADR-060).
+		if (!gl_client_geometry(c, &zones_target_w, &zones_target_h, NULL)) {
+			zones_target_w = 0;
+			zones_target_h = 0;
 		}
 #elif defined(__APPLE__)
 		comp_gl_window_macos_get_dimensions(c->macos_window, &zones_target_w, &zones_target_h);
@@ -8506,7 +8787,17 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// otherwise.
 			uint32_t dp_w = c->shared_width;
 			uint32_t dp_h = c->shared_height;
-			if (c->zones_frame) {
+			// ADR-060 (#2721): a bound session's canvas IS the target rect,
+			// every frame (zones or not); one resolve feeds the canvas, the
+			// windowless phase and the state reply.
+			struct comp_texture_target_resolved tt_r = {};
+			struct comp_texture_target tt_named = {};
+			uint64_t tt_state = 0;
+			const bool tt_ok = gl_tt_bound(c) && gl_tt_before_weave(c, &tt_r, &tt_named, &tt_state);
+			if (tt_ok) {
+				dp_w = tt_r.screen.w;
+				dp_h = tt_r.screen.h;
+			} else if (c->zones_frame) {
 				// XR_DXR_display_zones: the zone PLACEMENT (layer_commit)
 				// scales zone rects into the atlas tile by tile/window, so
 				// the weave OUTPUT must be the window client dims too — NOT
@@ -8539,6 +8830,10 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// which consumes the zone_publish_tex this composite resolved.)
 			glBindFramebuffer(GL_FRAMEBUFFER, c->shared_present_fbo);
 			gl_shared_readback_upload(c, dp_w, dp_h);
+			if (tt_ok) {
+				// This tier does not segment a texture session: never SEGMENTED.
+				gl_tt_store_state(c, tt_state, &tt_r, &tt_named);
+			}
 		} else {
 			// No display processor: simple blit.
 			glViewport(0, 0, c->shared_width, c->shared_height);
@@ -8886,6 +9181,9 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 #endif
 	xrt_display_processor_gl_destroy(&c->display_processor);
 	os_mutex_destroy(&c->dp_swap_mutex);
+#ifdef XRT_OS_WINDOWS
+	os_mutex_destroy(&c->tt.mutex);
+#endif
 	u_eye_history_destroy(&c->eye_hist); // N6 Part 1 (#2144)
 
 	// Destroy HUD
@@ -9392,10 +9690,10 @@ comp_gl_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, uint3
 	// 0 → runtime picks the client-window dims (the mask is window-sized).
 	if (w == 0 || h == 0) {
 #ifdef XRT_OS_WINDOWS
-		RECT r;
-		if (c->hwnd != NULL && GetClientRect(c->hwnd, &r) && r.right > 0 && r.bottom > 0) {
-			w = (uint32_t)r.right;
-			h = (uint32_t)r.bottom;
+		uint32_t cw = 0, ch = 0;
+		if (gl_client_geometry(c, &cw, &ch, NULL)) {
+			w = cw;
+			h = ch;
 		}
 #endif
 		if (w == 0 || h == 0) {
@@ -9902,6 +10200,107 @@ comp_gl_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_
 #endif
 }
 
+void
+comp_gl_compositor_set_texture_target(struct xrt_compositor *xc,
+                                      bool for_locate,
+                                      void *reference_window,
+                                      int32_t x,
+                                      int32_t y,
+                                      uint32_t w,
+                                      uint32_t h,
+                                      uint64_t flags)
+{
+#ifdef XRT_OS_WINDOWS
+	if (xc == NULL || w == 0 || h == 0) {
+		return;
+	}
+	struct comp_gl_compositor *c = gl_comp(xc);
+	if (!gl_tt_bound(c)) {
+		return;
+	}
+	os_mutex_lock(&c->tt.mutex);
+	if (for_locate) {
+		// Frames only this locate's views; never the weave.
+		c->tt.locate = c->tt.frame;
+		c->tt.locate.ref = reference_window;
+		c->tt.locate.x = x;
+		c->tt.locate.y = y;
+		c->tt.locate.w = w;
+		c->tt.locate.h = h;
+		c->tt.locate.flags = flags;
+		c->tt.locate_valid = true;
+		os_mutex_unlock(&c->tt.mutex);
+		return;
+	}
+	if (reference_window != c->tt.frame.ref) {
+		// Dock / undock / full screen: takes effect on this frame, nothing recreated.
+		U_LOG_W("ADR-060: texture target reference window %p -> %p", c->tt.frame.ref, reference_window);
+	}
+	c->tt.frame.ref = reference_window;
+	c->tt.frame.x = x;
+	c->tt.frame.y = y;
+	c->tt.frame.w = w;
+	c->tt.frame.h = h;
+	c->tt.frame.flags = flags; // advisory (DRAGGING): reserved, no consumer yet (ADR-060 decision 5)
+	os_mutex_unlock(&c->tt.mutex);
+#else
+	(void)xc;
+	(void)for_locate;
+	(void)reference_window;
+	(void)x;
+	(void)y;
+	(void)w;
+	(void)h;
+	(void)flags;
+#endif
+}
+
+void
+comp_gl_compositor_end_texture_target_locate(struct xrt_compositor *xc)
+{
+#ifdef XRT_OS_WINDOWS
+	if (xc == NULL) {
+		return;
+	}
+	struct comp_gl_compositor *c = gl_comp(xc);
+	if (!gl_tt_bound(c)) {
+		return;
+	}
+	os_mutex_lock(&c->tt.mutex);
+	c->tt.locate_valid = false;
+	os_mutex_unlock(&c->tt.mutex);
+#else
+	(void)xc;
+#endif
+}
+
+bool
+comp_gl_compositor_get_texture_target_state(struct xrt_compositor *xc, struct comp_texture_target_state *out)
+{
+#ifdef XRT_OS_WINDOWS
+	if (xc == NULL || out == NULL) {
+		return false;
+	}
+	struct comp_gl_compositor *c = gl_comp(xc);
+	if (!gl_tt_bound(c)) {
+		return false;
+	}
+	os_mutex_lock(&c->tt.mutex);
+	*out = c->tt.state;
+	os_mutex_unlock(&c->tt.mutex);
+	if (!out->valid) {
+		// Nothing woven yet: still say which path the session took.
+		out->flags = c->tt.windowless ? COMP_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE
+		                              : (c->tt.anchor_fallback ? COMP_TEXTURE_TARGET_STATE_ANCHOR_FALLBACK : 0);
+	}
+	return true;
+#else
+	(void)xc;
+	(void)out;
+	return false;
+#endif
+}
+
 bool
 comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
                                       struct xrt_window_metrics *out_metrics)
@@ -9926,18 +10325,15 @@ comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
 		return false;
 	}
 
-	RECT rect;
-	if (!GetClientRect(c->hwnd, &rect)) {
-		return false;
-	}
-	uint32_t win_px_w = (uint32_t)(rect.right - rect.left);
-	uint32_t win_px_h = (uint32_t)(rect.bottom - rect.top);
-	if (win_px_w == 0 || win_px_h == 0) {
-		return false;
-	}
-
+	// Window (or, bound, the texture target's — ADR-060 §2, framed to a
+	// locate in flight that chained one) client size and desktop origin.
+	uint32_t win_px_w = 0;
+	uint32_t win_px_h = 0;
 	POINT client_origin = {0, 0};
-	ClientToScreen(c->hwnd, &client_origin);
+	if (!gl_client_geometry(c, &win_px_w, &win_px_h, &client_origin, /* for_locate */ true) || win_px_w == 0 ||
+	    win_px_h == 0) {
+		return false;
+	}
 
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
 	float pixel_size_y = disp_h_m / (float)disp_px_h;
@@ -10039,6 +10435,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
                           bool transparent_background,
                           int32_t display_screen_left,
                           int32_t display_screen_top,
+                          const struct comp_texture_target_info *texture_target,
                           struct xrt_compositor_native **out_xcn)
 {
 	struct comp_gl_compositor *c = U_TYPED_CALLOC(struct comp_gl_compositor);
@@ -10056,6 +10453,9 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	u_eye_history_init(&c->eye_hist); // N6 Part 1 (#2144)
 #ifdef XRT_OS_WINDOWS
 	os_mutex_init(&c->seg_pub_mutex);
+	os_mutex_init(&c->tt.mutex); // ADR-060 texture target slots (#2721)
+#else
+	(void)texture_target; // ADR-060 texture target binding: Windows only
 #endif
 
 	// Get window dimensions
@@ -10175,6 +10575,23 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		c->has_shared_texture = true;
 		U_LOG_W("GL shared-texture present: %ux%u (glReadPixels readback bridge)",
 		         c->shared_width, c->shared_height);
+
+		// ADR-060 (#2721): latch the texture target binding. Only with a
+		// windowHandle (oxr filtered it): the window is this tier's device
+		// context and stays the fallback anchor.
+		if (texture_target != NULL && texture_target->bound && window_handle != NULL) {
+			c->tt.frame.bound = true;
+			c->tt.frame.ref = texture_target->reference_window;
+			c->tt.frame.x = texture_target->x;
+			c->tt.frame.y = texture_target->y;
+			c->tt.frame.w = texture_target->w;
+			c->tt.frame.h = texture_target->h;
+			c->tt.entry = (const struct xrt_dp_registry_entry *)texture_target->windowless_dp_entry;
+			U_LOG_W("ADR-060: texture target binding (gl) — reference window %p, initial rect (%d,%d %ux%u), "
+			        "windowHandle kept as the device-context window and fallback anchor",
+			        texture_target->reference_window, texture_target->x, texture_target->y, texture_target->w,
+			        texture_target->h);
+		}
 	}
 #elif defined(__APPLE__)
 	// macOS: create window/context via NSOpenGLView helper
@@ -10269,7 +10686,23 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 #endif
 	// Under the hub the HWND's weaver is the hub's D3D11 one (one per window).
 	if (!gl_hub_active(c)) {
-		gl_create_gl_dp(c, dp_factory_gl, dp_window, false);
+		bool made = false;
+#ifdef XRT_OS_WINDOWS
+		// ADR-060 §6 (#2721): a bound texture session tries a windowless DP
+		// first (a texture session never takes the hub).
+		if (gl_tt_bound(c)) {
+			made = gl_tt_make_windowless_dp(c);
+			if (!made) {
+				c->tt.anchor_fallback = true; // bound implies a windowHandle on this tier
+				U_LOG_W(
+				    "ADR-060: texture target cannot phase windowless — the windowHandle anchor carries the "
+				    "weave (SPEC_VERSION 8 path); the rect still defines the canvas");
+			}
+		}
+#endif
+		if (!made) {
+			gl_create_gl_dp(c, dp_factory_gl, dp_window, false);
+		}
 	}
 
 	// Transparent-background present path (Windows). Gated on an app-provided
