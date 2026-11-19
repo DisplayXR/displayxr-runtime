@@ -271,7 +271,7 @@ binding.
 **Open follow-ups:**
 - #2407: re-query the scanout caps once the windowless DP is ready, and fall back to the anchor if `PHASE_FROM_PRESENT_ORIGIN` turns out to be lost (the system property is a prediction).
 - #2378: the hub's client-presents route suppresses repaint, because the caller has no release fence it can wait on between frames.
-- #2382: D3D12 texture sessions honour the v9 binding (sub-rect phase and target state) on the hub route. Today the reroute derives the target from the `windowHandle`'s client area.
+- ~~#2382~~ (landed, see the amendment below): D3D12 texture sessions honour the v9 binding.
 - #2399: the native texture path's woven readback is bistable in the cube region.
 - GL texture sessions on the hub. The GL shim (#2366) landed without texture mode, so a GL texture
   session stays on the GL compositor's own legs (`shared_texture_session`). Vulkan needs a Windows
@@ -324,3 +324,32 @@ binding.
    that does not read it. It goes after R2, so that the value is exact.
 7. **R2 split rule: (a).** Every windowless present-owner weave evaluates the split predicate.
    The per-screen weave runs only when the window leaves the primary 3D screen.
+
+## Amendment 1 (#2382): the D3D12 tier honours the binding
+
+Decision 3 said R1 is implemented once, in the native D3D11 compositor, and that D3D12 gets it as
+an import shim of the hub with no native port. #2382 amends that for D3D12 only.
+
+- **Why.** The D3D12 tier takes the hub's client-presents route only when asked (`DXR_HUB=1`).
+  By default a D3D12 texture session is woven on the tier's own legs, so a binding honoured only
+  on the hub route would still be ignored for the default session.
+- **What landed.** The D3D12 compositor has the same shape as R1: the `frame` and `locate` slots,
+  one resolve through `comp_texture_target_resolve_win32`, the windowless primary DP made through
+  `create_dp_d3d12_for_screen(window = NULL)` and phased with `set_present_origin`
+  (`comp_dp_windowless_d3d12.h`, the same hint-then-flag rule), the anchor fallback with the #2406
+  padded weave, and the target feeding the window metrics, the canvas and the zone anchor. On the
+  hub route the tier hands the same resolve to the hub (`comp_hub_d3d11_set_client_target`); the
+  hub is unchanged. The create-time binding and the state reply are shared types
+  (`comp_texture_target_info`, `comp_texture_target_state`), and the OpenXR glue is one file for
+  both tiers.
+- **One difference from D3D11.** On its own legs the D3D12 tier does not segment a texture session
+  across screens (its segment manager is bound to a window the runtime presents to). A target
+  spanning two screens is woven by the session screen's display processor alone, and `SEGMENTED` /
+  `FLAT_SEGMENT` are reported on the hub route only.
+- **Which path a display takes.** The claim hint is per plug-in; the scanout bit is per DP
+  instance. sim-display's screen-bound D3D12 DP sets the bit (its output has no position-dependent
+  phase), so it weaves windowless. A plug-in whose D3D12 DP does not set the bit gets the anchor
+  fallback on native D3D12 even though its D3D11 DP phases windowless; that session can take the
+  hub route (`DXR_HUB=1`), which weaves with the D3D11 DP.
+- **Verification.** Recorded on the pull request for #2382. Panel acceptance (the woven zone at
+  rest, the phase following a drag) is separate from the build and the simulated-display run.
