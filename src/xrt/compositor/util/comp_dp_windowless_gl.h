@@ -81,7 +81,8 @@ comp_dp_make_windowless_gl(const struct xrt_dp_registry_entry *e,
 	snprintf(b.serial, sizeof(b.serial), "%s", e->serial);
 
 	struct xrt_display_processor_gl *dp = NULL;
-	xrt_result_t ret = iface->create_dp_gl_for_screen((struct xrt_plugin_instance *)e->owning_instance, NULL, &b, &dp);
+	xrt_result_t ret =
+	    iface->create_dp_gl_for_screen((struct xrt_plugin_instance *)e->owning_instance, NULL, &b, &dp);
 	if (out_ret != NULL) {
 		*out_ret = ret;
 	}

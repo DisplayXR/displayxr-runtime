@@ -5223,6 +5223,52 @@ comp_vk_native_renderer_blit_to_shared(struct comp_vk_native_renderer *r,
 }
 
 void
+comp_vk_native_renderer_blit_view_to_shared(struct comp_vk_native_renderer *r,
+                                            void *cmd_ptr,
+                                            uint64_t dst_image_u64,
+                                            int32_t src_x,
+                                            int32_t src_y,
+                                            uint32_t src_w,
+                                            uint32_t src_h,
+                                            uint32_t dst_w,
+                                            uint32_t dst_h)
+{
+	struct vk_bundle *vk = r->vk;
+	VkCommandBuffer cmd = (VkCommandBuffer)cmd_ptr;
+	VkImage dst_image = (VkImage)(uintptr_t)dst_image_u64;
+
+	cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	cmd_image_barrier(vk, cmd, dst_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+	                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+	VkImageBlit blit = {
+	    .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	                       .mipLevel = 0,
+	                       .baseArrayLayer = 0,
+	                       .layerCount = 1},
+	    .srcOffsets = {{src_x, src_y, 0}, {src_x + (int32_t)src_w, src_y + (int32_t)src_h, 1}},
+	    .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	                       .mipLevel = 0,
+	                       .baseArrayLayer = 0,
+	                       .layerCount = 1},
+	    .dstOffsets = {{0, 0, 0}, {(int32_t)dst_w, (int32_t)dst_h, 1}},
+	};
+	vk->vkCmdBlitImage(cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+	cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+	                  VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	cmd_image_barrier(vk, cmd, dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+	                  VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+}
+
+void
 comp_vk_native_renderer_get_tile_layout(struct comp_vk_native_renderer *r,
                                          uint32_t *out_tile_columns,
                                          uint32_t *out_tile_rows)
