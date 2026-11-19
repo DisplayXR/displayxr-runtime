@@ -287,6 +287,33 @@ comp_d3d12_renderer_blit_rect(struct comp_d3d12_renderer *renderer,
                               uint32_t dst_h);
 
 /*!
+ * @ref comp_d3d12_renderer_blit_rect into a render target of @p rtv_format
+ * (DXGI_FORMAT). D3D12 bakes the target format into the pipeline, so only the
+ * formats a pipeline exists for are served: R8G8B8A8_UNORM (the back buffer's)
+ * and B8G8R8A8_UNORM (a texture app's shared texture, #2382). Any other format
+ * returns XRT_ERROR_D3D12 and records nothing.
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_renderer_blit_rect_format(struct comp_d3d12_renderer *renderer,
+                                     void *cmd_list,
+                                     void *srv_heap,
+                                     uint64_t src_srv,
+                                     uint32_t src_tex_w,
+                                     uint32_t src_tex_h,
+                                     int32_t src_x,
+                                     int32_t src_y,
+                                     uint32_t src_w,
+                                     uint32_t src_h,
+                                     uint64_t rtv,
+                                     uint32_t rtv_format,
+                                     int32_t dst_x,
+                                     int32_t dst_y,
+                                     uint32_t dst_w,
+                                     uint32_t dst_h);
+
+/*!
  * Get the atlas texture SRV GPU descriptor handle for weaving.
  *
  * @param renderer The renderer.

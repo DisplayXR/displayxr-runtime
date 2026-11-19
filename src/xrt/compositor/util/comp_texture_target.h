@@ -199,6 +199,63 @@ comp_texture_target_anchor_offset(const struct comp_texture_target_resolved *r,
 	return true;
 }
 
+/*!
+ * Where a resolved target sits relative to the ONE screen its display
+ * processor weaves, for a tier that does not weave a texture target per
+ * screen (the D3D12 tier's own legs, #2382).
+ */
+enum comp_texture_target_coverage
+{
+	//! Weave it: the target touches no other screen (it may hang off the
+	//! desktop's edge, exactly like a window does).
+	COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL = 0,
+	//! Partly on the panel, partly on another screen.
+	COMP_TEXTURE_TARGET_COVERAGE_SPANNING,
+	//! On another screen and not on the panel at all.
+	COMP_TEXTURE_TARGET_COVERAGE_OFF_PANEL,
+};
+
+static inline bool
+comp_texture_target_rects_overlap(const struct comp_seg_rect *a, const struct comp_seg_rect *b)
+{
+	if (a->w == 0 || a->h == 0 || b->w == 0 || b->h == 0) {
+		return false;
+	}
+	return (int64_t)a->x < (int64_t)b->x + b->w && (int64_t)b->x < (int64_t)a->x + a->w &&
+	       (int64_t)a->y < (int64_t)b->y + b->h && (int64_t)b->y < (int64_t)a->y + a->h;
+}
+
+/*!
+ * Classify @p r against @p panel (the DP's screen, desktop device px) and the
+ * system's @p others screens (every screen but the panel). Only another
+ * SCREEN takes a target off the weave: a target that touches none of
+ * @p others is ON_PANEL whatever its overlap with the panel, so a
+ * single-screen system never leaves the weave. An invalid resolve or an
+ * unknown panel is ON_PANEL too (nothing to judge against).
+ */
+static inline enum comp_texture_target_coverage
+comp_texture_target_panel_coverage(const struct comp_texture_target_resolved *r,
+                                   const struct comp_seg_rect *panel,
+                                   const struct comp_seg_rect *others,
+                                   uint32_t other_count)
+{
+	if (r == NULL || !r->valid || panel == NULL || panel->w == 0 || panel->h == 0) {
+		return COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL;
+	}
+	bool touches_other = false;
+	for (uint32_t i = 0; others != NULL && i < other_count; i++) {
+		if (comp_texture_target_rects_overlap(&r->screen, &others[i])) {
+			touches_other = true;
+			break;
+		}
+	}
+	if (!touches_other) {
+		return COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL;
+	}
+	return comp_texture_target_rects_overlap(&r->screen, panel) ? COMP_TEXTURE_TARGET_COVERAGE_SPANNING
+	                                                            : COMP_TEXTURE_TARGET_COVERAGE_OFF_PANEL;
+}
+
 #ifdef __cplusplus
 }
 #endif

@@ -495,6 +495,11 @@ struct comp_d3d11_compositor
 		uint32_t pad_h;
 		bool pad_logged;
 		bool pad_refused_warned;
+		//! A pad allocation failed: WARNed once per episode, and not
+		//! retried while the same size is needed (#2382 review).
+		bool pad_alloc_warned;
+		uint32_t pad_fail_w;
+		uint32_t pad_fail_h;
 		//! What the last woven bound frame used (under `mutex`).
 		struct comp_texture_target_state state;
 	} tt;
@@ -1641,6 +1646,9 @@ d3d11_tt_anchor_pad(struct comp_d3d11_compositor *c,
 
 	const uint32_t need_w = (uint32_t)*out_x + r->screen.w;
 	const uint32_t need_h = (uint32_t)*out_y + r->screen.h;
+	if (c->tt.pad_tex == nullptr && c->tt.pad_fail_w == need_w && c->tt.pad_fail_h == need_h) {
+		return nullptr; // this size already failed: no retry (and no WARN) every frame
+	}
 	if (c->tt.pad_tex == nullptr || c->tt.pad_w < need_w || c->tt.pad_h < need_h) {
 		if (c->tt.pad_rtv != nullptr) {
 			c->tt.pad_rtv->Release();
@@ -1676,13 +1684,20 @@ d3d11_tt_anchor_pad(struct comp_d3d11_compositor *c,
 			}
 			c->tt.pad_w = 0;
 			c->tt.pad_h = 0;
-			if (!c->tt.pad_refused_warned) {
-				c->tt.pad_refused_warned = true;
+			c->tt.pad_fail_w = need_w;
+			c->tt.pad_fail_h = need_h;
+			// Its own flag: pad_refused_warned is cleared above on every
+			// frame the offset is correctable, which repeated this WARN.
+			if (!c->tt.pad_alloc_warned) {
+				c->tt.pad_alloc_warned = true;
 				U_LOG_W("ADR-060: anchor phase pad %ux%u failed (0x%08x) — weaving unpadded", need_w,
 				        need_h, (unsigned)hr);
 			}
 			return nullptr;
 		}
+		c->tt.pad_alloc_warned = false; // one WARN per failure episode
+		c->tt.pad_fail_w = 0;
+		c->tt.pad_fail_h = 0;
 		c->tt.pad_w = desc.Width;
 		c->tt.pad_h = desc.Height;
 	}

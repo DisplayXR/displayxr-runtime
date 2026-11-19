@@ -132,3 +132,55 @@ TEST_CASE("texture target: anchor fallback weaves the canvas at the target's off
 	CHECK_FALSE(comp_texture_target_anchor_offset(&r, 0, 0, 0, 0, 2700, &ox, &oy));
 	CHECK_FALSE(comp_texture_target_anchor_offset(nullptr, 0, 0, 0, 0, 16384, &ox, &oy));
 }
+
+TEST_CASE("comp_texture_target: panel coverage for a tier that weaves one screen (#2382)")
+{
+	// A 3D panel at the desktop origin and a 2D monitor to its right.
+	const comp_seg_rect panel = {0, 0, 3840, 2160};
+	const comp_seg_rect others[1] = {{3840, 0, 1920, 1080}};
+	auto at = [](int32_t x, int32_t y) {
+		comp_texture_target tt = bound(0, 0, 1216, 672);
+		comp_texture_target_resolved r{};
+		REQUIRE(comp_texture_target_compose(&tt, x, y, 3840, 2160, &r));
+		return r;
+	};
+
+	comp_texture_target_resolved r = at(976, 100);
+	CHECK(comp_texture_target_panel_coverage(&r, &panel, others, 1) == COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL);
+	// Its right edge exactly on the seam still touches only the panel.
+	r = at(3840 - 1216, 100);
+	CHECK(comp_texture_target_panel_coverage(&r, &panel, others, 1) == COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL);
+	// One pixel over the seam: spanning.
+	r = at(3840 - 1215, 100);
+	CHECK(comp_texture_target_panel_coverage(&r, &panel, others, 1) == COMP_TEXTURE_TARGET_COVERAGE_SPANNING);
+	// Wholly on the 2D monitor.
+	r = at(3840, 100);
+	CHECK(comp_texture_target_panel_coverage(&r, &panel, others, 1) == COMP_TEXTURE_TARGET_COVERAGE_OFF_PANEL);
+
+	// Hanging off the desktop's edge touches no other screen: still woven,
+	// with or without a second screen in the system.
+	r = at(-600, -300);
+	CHECK(comp_texture_target_panel_coverage(&r, &panel, others, 1) == COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL);
+	CHECK(comp_texture_target_panel_coverage(&r, &panel, nullptr, 0) == COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL);
+	// Off every screen, and a single-screen system: nothing takes it off the weave.
+	r = at(9000, 9000);
+	CHECK(comp_texture_target_panel_coverage(&r, &panel, others, 1) == COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL);
+	r = at(3840, 100);
+	CHECK(comp_texture_target_panel_coverage(&r, &panel, nullptr, 0) == COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL);
+
+	// A panel that is not the desktop origin (2D monitor on the left).
+	const comp_seg_rect panel2 = {1920, 0, 3840, 2160};
+	const comp_seg_rect left[1] = {{0, 0, 1920, 1080}};
+	r = at(1000, 100);
+	CHECK(comp_texture_target_panel_coverage(&r, &panel2, left, 1) == COMP_TEXTURE_TARGET_COVERAGE_SPANNING);
+	r = at(100, 100);
+	CHECK(comp_texture_target_panel_coverage(&r, &panel2, left, 1) == COMP_TEXTURE_TARGET_COVERAGE_OFF_PANEL);
+
+	// Nothing to judge against: weave.
+	comp_texture_target_resolved invalid{};
+	CHECK(comp_texture_target_panel_coverage(&invalid, &panel, others, 1) == COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL);
+	const comp_seg_rect none = {0, 0, 0, 0};
+	r = at(3840, 100);
+	CHECK(comp_texture_target_panel_coverage(&r, &none, others, 1) == COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL);
+	CHECK(comp_texture_target_panel_coverage(nullptr, &panel, others, 1) == COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL);
+}
