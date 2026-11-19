@@ -34,6 +34,8 @@
 #include "util/comp_segments_route.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
+#include "util/comp_texture_target_win32.h" // ADR-060 texture target binding (#2721)
+#include "util/comp_dp_windowless_vk.h"     // ADR-060 windowless DP rule (#2721)
 #endif
 
 #include "xrt/xrt_config_os.h"
@@ -638,6 +640,50 @@ struct comp_vk_native_compositor
 
 	//! Shared texture HANDLE (Win32).
 	void *shared_texture_handle;
+
+#ifdef XRT_OS_WINDOWS
+	/*!
+	 * ADR-060 texture target binding (XR_DXR_win32_window_binding v9, #2721 —
+	 * the vk_native twin of comp_d3d12_compositor::tt): the reference window
+	 * + rect the app draws the shared texture at. TWO slots under `mutex`,
+	 * because an engine locates frame N+1 on its game thread while its render
+	 * thread is inside xrEndFrame N:
+	 *  - `frame`: written only by xrEndFrame; the weave, the canvas, the zone
+	 *    anchor and the state reply read it (resolved live, at weave time);
+	 *  - `locate`: written only by xrLocateViews for the duration of that
+	 *    locate; only the window metrics read it, falling back to `frame`.
+	 * `frame.bound` is set at create and never changes. `windowless` = the
+	 * primary DP is windowless and phases from set_present_origin;
+	 * `anchor_fallback` = it is the windowHandle-bound DP of SPEC_VERSION 8.
+	 * The reference window is only read, never handed to a DP.
+	 */
+	struct
+	{
+		struct os_mutex mutex;
+		struct comp_texture_target frame;
+		struct comp_texture_target locate;
+		bool locate_valid;
+		bool windowless;
+		bool anchor_fallback;
+		//! The session screen's DP registry entry (system-owned): the windowless DP source.
+		const struct xrt_dp_registry_entry *entry;
+		//! The windowless primary DP's screen origin, desktop device px.
+		int32_t panel_left;
+		int32_t panel_top;
+		//! The imported shared texture's size (the clamp of every resolve).
+		uint32_t tex_w;
+		uint32_t tex_h;
+		bool clamp_warned;
+		bool origin_logged;
+		bool anchor_offset_warned;
+		//! The resolve the last weave-path metrics read used (weave thread
+		//! only): the state reply reports exactly what the weave was fed.
+		struct comp_texture_target_resolved weave_r;
+		struct comp_texture_target weave_named;
+		//! What the last woven bound frame used (under `mutex`).
+		struct comp_texture_target_state state;
+	} tt;
+#endif
 
 	//! Command pool for display processor factory.
 	VkCommandPool cmd_pool;
@@ -2373,11 +2419,142 @@ import_shared_d3d11_texture(struct comp_vk_native_compositor *c, void *shared_ha
 	}
 
 	c->has_shared_texture = true;
+	c->tt.tex_w = width; // ADR-060: the clamp of every texture target resolve
+	c->tt.tex_h = height;
 
 	U_LOG_W("Shared D3D11 texture imported: %ux%u, VkImage=%p, VkImageView=%p",
 	        width, height, (void *)(uintptr_t)c->shared_image,
 	        (void *)(uintptr_t)c->shared_view);
 	return true;
+}
+#endif // XRT_OS_WINDOWS
+
+#ifdef XRT_OS_WINDOWS
+/*
+ *
+ * ADR-060 texture target binding helpers (#2721; the vk_native twins of the
+ * d3d12_tt_* helpers in comp_d3d12_compositor.cpp).
+ *
+ */
+
+static inline bool
+vk_tt_bound(const struct comp_vk_native_compositor *c)
+{
+	return c->tt.frame.bound; // set at create, immutable after
+}
+
+/*!
+ * Resolve the named (reference window, rect) NOW, clamped to the shared
+ * texture. One computation for phase, metrics and canvas (ADR-060 §2). With
+ * @p remember (the weave path's metrics read, weave thread only) the resolve
+ * is kept for the present origin and the state reply of the same frame.
+ */
+static bool
+vk_tt_resolve(struct comp_vk_native_compositor *c,
+              bool for_locate,
+              bool remember,
+              struct comp_texture_target_resolved *out)
+{
+	out->valid = false;
+	if (!vk_tt_bound(c)) {
+		return false;
+	}
+	struct comp_texture_target named;
+	os_mutex_lock(&c->tt.mutex);
+	named = (for_locate && c->tt.locate_valid) ? c->tt.locate : c->tt.frame;
+	os_mutex_unlock(&c->tt.mutex);
+	const bool ok = comp_texture_target_resolve_win32(&named, c->tt.tex_w, c->tt.tex_h, out);
+	if (ok && remember) {
+		c->tt.weave_r = *out;
+		c->tt.weave_named = named;
+	}
+	return ok;
+}
+
+/*!
+ * The client region zone / Local2D / mask rects are expressed in, and (when
+ * @p out_origin is non-NULL) its origin on the desktop. Under a texture target
+ * binding that region IS the target (ADR-060 §3) — the xrEndFrame slot, or
+ * with @p for_locate the current locate's target if it chained one; otherwise
+ * the window's client area. False when it cannot be resolved.
+ */
+static bool
+vk_client_geometry_ex(struct comp_vk_native_compositor *c,
+                      uint32_t *out_w,
+                      uint32_t *out_h,
+                      POINT *out_origin,
+                      bool for_locate,
+                      bool remember)
+{
+	if (vk_tt_bound(c)) {
+		struct comp_texture_target_resolved r;
+		if (!vk_tt_resolve(c, for_locate, remember, &r)) {
+			return false;
+		}
+		*out_w = r.screen.w;
+		*out_h = r.screen.h;
+		if (out_origin != NULL) {
+			out_origin->x = r.screen.x;
+			out_origin->y = r.screen.y;
+		}
+		return true;
+	}
+	HWND wnd = (HWND)c->hwnd;
+	RECT rc;
+	if (wnd == NULL || !GetClientRect(wnd, &rc) || rc.right <= 0 || rc.bottom <= 0) {
+		return false;
+	}
+	if (out_origin != NULL) {
+		out_origin->x = 0;
+		out_origin->y = 0;
+		if (!ClientToScreen(wnd, out_origin)) {
+			return false;
+		}
+	}
+	*out_w = (uint32_t)rc.right;
+	*out_h = (uint32_t)rc.bottom;
+	return true;
+}
+
+static inline bool
+vk_client_geometry(
+    struct comp_vk_native_compositor *c, uint32_t *out_w, uint32_t *out_h, POINT *out_origin, bool for_locate)
+{
+	return vk_client_geometry_ex(c, out_w, out_h, out_origin, for_locate, false);
+}
+
+/*!
+ * The window whose monitor answers DPI / refresh questions: our window, else
+ * the bound reference window.
+ */
+static HWND
+vk_geometry_hwnd(struct comp_vk_native_compositor *c)
+{
+	if (c->hwnd != NULL || !vk_tt_bound(c)) {
+		return (HWND)c->hwnd;
+	}
+	os_mutex_lock(&c->tt.mutex);
+	HWND ref = (HWND)c->tt.frame.ref;
+	os_mutex_unlock(&c->tt.mutex);
+	return ref;
+}
+
+//! Store what a bound frame used — XrWin32TextureTargetStateDXR at the next xrWaitFrame.
+static void
+vk_tt_store_state(struct comp_vk_native_compositor *c, uint64_t flags)
+{
+	const struct comp_texture_target_resolved *r = &c->tt.weave_r;
+	os_mutex_lock(&c->tt.mutex);
+	c->tt.state.valid = true;
+	c->tt.state.flags = flags;
+	c->tt.state.screen_x = r->screen.x;
+	c->tt.state.screen_y = r->screen.y;
+	c->tt.state.rect_x = c->tt.weave_named.x;
+	c->tt.state.rect_y = c->tt.weave_named.y;
+	c->tt.state.rect_w = r->screen.w;
+	c->tt.state.rect_h = r->screen.h;
+	c->tt.state.display_time_ns = c->layer_accum.data.display_time_ns;
+	os_mutex_unlock(&c->tt.mutex);
 }
 #endif // XRT_OS_WINDOWS
 
@@ -6277,7 +6454,15 @@ vk_dp_canvas_rect(struct comp_vk_native_compositor *c)
 	// recreated at that size, and a canvas larger than the framebuffer is not a
 	// rect any weaver can honour. No clamp when there is no swapchain target
 	// (shared-texture mode), where the client rect IS the answer.
-	if (c->target != NULL) {
+	//
+	// ADR-060 (#2721): under a texture target binding the canvas is the target
+	// rect (0,0,w,h) in the shared texture, already clamped to it by the
+	// resolve; a swapchain made on the anchor window says nothing about it.
+	bool clamp_to_target = c->target != NULL;
+#ifdef XRT_OS_WINDOWS
+	clamp_to_target = clamp_to_target && !vk_tt_bound(c);
+#endif
+	if (clamp_to_target) {
 		uint32_t tw = 0, th = 0;
 		comp_vk_native_target_get_dimensions(c->target, &tw, &th);
 		if (tw > 0 && r.extent.w > (int)tw) {
@@ -8073,12 +8258,10 @@ vk_publish_rear_budget_zones(struct comp_vk_native_compositor *c)
 	// window-sized already.
 	uint32_t win_w = 0, win_h = 0;
 #ifdef XRT_OS_WINDOWS
-	if (c->hwnd != NULL) {
-		RECT r;
-		if (GetClientRect((HWND)c->hwnd, &r) && r.right > 0 && r.bottom > 0) {
-			win_w = (uint32_t)r.right;
-			win_h = (uint32_t)r.bottom;
-		}
+	// Under a texture target binding that region is the target (ADR-060).
+	if (!vk_client_geometry(c, &win_w, &win_h, NULL, false)) {
+		win_w = 0;
+		win_h = 0;
 	}
 #endif
 	if ((win_w == 0 || win_h == 0) && c->target != NULL) {
@@ -13342,6 +13525,33 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 			// above, and this path has no repaint, so it ticks unconditionally.
 			vk_rear_budget_tick(c);
 
+#ifdef XRT_OS_WINDOWS
+			// ADR-060 (#2721): what this bound frame was woven with — the
+			// resolve vk_update_present_origin just took (one resolve feeds
+			// the phase, the canvas and this reply). This tier does not
+			// segment a texture session, so SEGMENTED is never reported.
+			if (vk_tt_bound(c) && c->tt.weave_r.valid) {
+				uint64_t tt_state = 0;
+				if (c->tt.weave_r.clamped) {
+					tt_state |= COMP_TEXTURE_TARGET_STATE_CLAMPED;
+					if (!c->tt.clamp_warned) {
+						c->tt.clamp_warned = true;
+						U_LOG_W("ADR-060: target rect larger than the shared texture (%ux%u) — woven clamped "
+						        "to %ux%u",
+						        c->tt.tex_w, c->tt.tex_h, c->tt.weave_r.screen.w, c->tt.weave_r.screen.h);
+					}
+				} else {
+					c->tt.clamp_warned = false; // one WARN per clamp episode
+				}
+				if (c->tt.windowless) {
+					tt_state |= COMP_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE;
+				} else if (c->tt.anchor_fallback) {
+					tt_state |= COMP_TEXTURE_TARGET_STATE_ANCHOR_FALLBACK;
+				}
+				vk_tt_store_state(c, tt_state);
+			}
+#endif
+
 			if (dp_self_submits) {
 				// DP owns its own submit — nothing left for us to do this
 				// frame except mark woven and clean up.
@@ -14391,6 +14601,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 #endif
 #ifdef XRT_OS_WINDOWS
 	os_mutex_destroy(&c->dp_swap_mutex);
+	os_mutex_destroy(&c->tt.mutex);
 #endif
 	u_eye_history_destroy(&c->eye_hist); // N6 Part 1 (#2144)
 
@@ -14473,6 +14684,51 @@ apply_window_pos_override(int32_t *left, int32_t *top)
 }
 #endif
 
+
+#ifdef XRT_OS_WINDOWS
+/*!
+ * ADR-060 §6 (#2721): the primary DP of a bound texture session, made
+ * WINDOWLESS through the session screen's per-screen factory (window = NULL —
+ * the factory the segment manager makes its per-screen DPs with). Kept only
+ * when the plug-in hints windowless phase for that screen AND the DP itself
+ * declares XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN (the authority) — the
+ * one rule, comp_dp_make_windowless_vk. Decided once per session; c->cmd_pool
+ * exists and the caller holds the runtime-owned queue swap.
+ */
+static bool
+vk_tt_make_windowless_dp(struct comp_vk_native_compositor *c)
+{
+	const struct xrt_dp_registry_entry *e = c->tt.entry;
+	struct xrt_display_processor *dp = NULL;
+	const char *why = NULL;
+	xrt_result_t ret = XRT_SUCCESS;
+	if (!comp_dp_make_windowless_vk(e, &c->vk, (void *)(uintptr_t)c->cmd_pool, (int32_t)VK_FORMAT_B8G8R8A8_UNORM,
+	                                &dp, &why, &ret)) {
+		if (strcmp(why, COMP_DP_WINDOWLESS_NO_FACTORY) == 0) {
+			U_LOG_W("ADR-060: texture target bound, but the session screen's plug-in has no per-screen Vulkan "
+			        "factory");
+		} else if (strcmp(why, COMP_DP_WINDOWLESS_NO_HINT) == 0) {
+			U_LOG_W("ADR-060: '%s' does not hint windowless phase for this screen — no windowless texture DP",
+			        e->plugin_id);
+		} else if (strcmp(why, COMP_DP_WINDOWLESS_REFUSED) == 0) {
+			U_LOG_W("ADR-060: windowless texture DP refused by '%s' (error %d)", e->plugin_id, (int)ret);
+		} else {
+			U_LOG_W("ADR-060: '%s' Vulkan DP does not declare PHASE_FROM_PRESENT_ORIGIN — destroyed",
+			        e->plugin_id);
+		}
+		return false;
+	}
+	c->display_processor = dp;
+	c->tt.windowless = true;
+	c->tt.panel_left = e->screen_left;
+	c->tt.panel_top = e->screen_top;
+	U_LOG_W(
+	    "ADR-060: texture target bound — WINDOWLESS primary Vulkan DP from '%s' (screen at %d,%d %ux%u), phased "
+	    "from the target's present origin; the reference window %p is read, never handed to the vendor",
+	    e->plugin_id, e->screen_left, e->screen_top, e->pixel_width, e->pixel_height, c->tt.frame.ref);
+	return true;
+}
+#endif
 
 /*!
  * Create the session's VULKAN display processor on the app device.
@@ -14638,8 +14894,27 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 			    (void *)c->repaint_queue, (void *)saved_main_queue);
 		}
 		c->dp_create_attempted = true;
-		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool, dp_window_handle,
-		                              (int32_t)VK_FORMAT_B8G8R8A8_UNORM, &c->display_processor);
+		xrt_result_t dp_ret = XRT_SUCCESS;
+		bool made_windowless = false;
+#ifdef XRT_OS_WINDOWS
+		// ADR-060 §6 (#2721): a bound texture session tries a windowless DP
+		// first (on the same runtime-owned queue as the factory DP below).
+		if (vk_tt_bound(c)) {
+			made_windowless = vk_tt_make_windowless_dp(c);
+			if (!made_windowless) {
+				c->tt.anchor_fallback = c->hwnd != NULL;
+				U_LOG_W(c->tt.anchor_fallback
+				            ? "ADR-060: texture target cannot phase windowless — the windowHandle anchor carries "
+				              "the weave (SPEC_VERSION 8 path); the rect still defines the canvas"
+				            : "ADR-060: texture target cannot phase windowless and no windowHandle was given — "
+				              "weaving display-scoped (no window phase)");
+			}
+		}
+#endif
+		if (!made_windowless) {
+			dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool, dp_window_handle,
+			                 (int32_t)VK_FORMAT_B8G8R8A8_UNORM, &c->display_processor);
+		}
 		c->vk.main_queue->queue = saved_main_queue;
 		// #1484: a fresh DP's colour state is unknown; the weave sites assert it.
 		c->dp_atlas_encoding_latched = -1;
@@ -14699,8 +14974,14 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 		// #2708: also on the DComp bridge's CPU-readback route — the DP still
 		// composes the desktop capture under the atlas (the de-occlusion band
 		// needs desktop pixels before the weave), exactly as on D3D11.
+		bool client_presents = false;
+#ifdef XRT_OS_WINDOWS
+		// ADR-060: a windowless texture DP is told the app presents the woven
+		// texture itself, as the D3D11 / D3D12 tiers tell theirs.
+		client_presents = c->tt.windowless;
+#endif
 		xrt_display_processor_vk_set_transparent_background(
-		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background, false);
+		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background, client_presents);
 
 		// #613 / #68 — tell the DP whether the app self-presents only the canvas
 		// (shared-texture apps) vs the full target (handle apps). Gates the
@@ -14989,6 +15270,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  bool app_timeline_semaphores,
                                  bool app_keyed_mutex,
                                  bool app_created_device,
+                                 const struct comp_texture_target_info *texture_target,
                                  struct xrt_compositor_native **out_xc)
 {
 	if (vk_device == NULL) {
@@ -14996,6 +15278,9 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 	(void)window_is_wayland; // consumed only in the XRT_HAVE_WAYLAND Linux path
+#ifndef XRT_OS_WINDOWS
+	(void)texture_target; // ADR-060 texture target binding: Windows only
+#endif
 
 	U_LOG_I("Creating VK native compositor");
 
@@ -15044,6 +15329,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #endif
 #ifdef XRT_OS_WINDOWS
 	os_mutex_init(&c->dp_swap_mutex); // ADR-047 Amendment 2
+	os_mutex_init(&c->tt.mutex);      // ADR-060 texture target slots (#2721)
 #endif
 	u_eye_history_init(&c->eye_hist); // N6 Part 1 (#2144)
 	os_thread_helper_init(&c->repaint_thread);
@@ -15131,6 +15417,22 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			free(c);
 			return XRT_ERROR_VULKAN;
 		}
+	}
+
+	// ADR-060 (#2721): latch the texture target binding before anything reads
+	// the window geometry (refresh rate, DP create). Only a shared-texture
+	// session can be bound (oxr validated it).
+	if (texture_target != NULL && texture_target->bound && c->has_shared_texture) {
+		c->tt.frame.bound = true;
+		c->tt.frame.ref = texture_target->reference_window;
+		c->tt.frame.x = texture_target->x;
+		c->tt.frame.y = texture_target->y;
+		c->tt.frame.w = texture_target->w;
+		c->tt.frame.h = texture_target->h;
+		c->tt.entry = (const struct xrt_dp_registry_entry *)texture_target->windowless_dp_entry;
+		U_LOG_W("ADR-060: texture target binding (vk) — reference window %p, initial rect (%d,%d %ux%u)%s",
+		        texture_target->reference_window, texture_target->x, texture_target->y, texture_target->w,
+		        texture_target->h, hwnd != NULL ? ", windowHandle kept as the fallback anchor" : "");
 	}
 
 	// Handle window
@@ -15535,7 +15837,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	c->display_refresh_rate = 60.0f;
 #ifdef XRT_OS_WINDOWS
 	{
-		const float hz = comp_display_refresh_hz_win(c->hwnd);
+		const float hz = comp_display_refresh_hz_win(vk_geometry_hwnd(c)); // ADR-060: bound = the reference
 		if (hz > 0.0f) {
 			c->display_refresh_rate = hz;
 		}
@@ -16450,7 +16752,109 @@ comp_vk_native_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_re
 static bool
 vk_get_window_metrics(struct comp_vk_native_compositor *c,
                       struct xrt_window_metrics *out_metrics,
-                      bool off_panel_for_projection);
+                      bool off_panel_for_projection,
+                      bool for_locate);
+
+void
+comp_vk_native_compositor_set_texture_target(struct xrt_compositor *xc,
+                                             bool for_locate,
+                                             void *reference_window,
+                                             int32_t x,
+                                             int32_t y,
+                                             uint32_t w,
+                                             uint32_t h,
+                                             uint64_t flags)
+{
+#ifdef XRT_OS_WINDOWS
+	if (xc == NULL || w == 0 || h == 0) {
+		return;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	if (!vk_tt_bound(c)) {
+		return;
+	}
+	os_mutex_lock(&c->tt.mutex);
+	if (for_locate) {
+		// Frames only this locate's views; never the weave.
+		c->tt.locate = c->tt.frame;
+		c->tt.locate.ref = reference_window;
+		c->tt.locate.x = x;
+		c->tt.locate.y = y;
+		c->tt.locate.w = w;
+		c->tt.locate.h = h;
+		c->tt.locate.flags = flags;
+		c->tt.locate_valid = true;
+		os_mutex_unlock(&c->tt.mutex);
+		return;
+	}
+	if (reference_window != c->tt.frame.ref) {
+		// Dock / undock / full screen: takes effect on this frame, nothing recreated.
+		U_LOG_W("ADR-060: texture target reference window %p -> %p", c->tt.frame.ref, reference_window);
+	}
+	c->tt.frame.ref = reference_window;
+	c->tt.frame.x = x;
+	c->tt.frame.y = y;
+	c->tt.frame.w = w;
+	c->tt.frame.h = h;
+	c->tt.frame.flags = flags; // advisory (DRAGGING): reserved, no consumer yet (ADR-060 decision 5)
+	os_mutex_unlock(&c->tt.mutex);
+#else
+	(void)xc;
+	(void)for_locate;
+	(void)reference_window;
+	(void)x;
+	(void)y;
+	(void)w;
+	(void)h;
+	(void)flags;
+#endif
+}
+
+void
+comp_vk_native_compositor_end_texture_target_locate(struct xrt_compositor *xc)
+{
+#ifdef XRT_OS_WINDOWS
+	if (xc == NULL) {
+		return;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	if (!vk_tt_bound(c)) {
+		return;
+	}
+	os_mutex_lock(&c->tt.mutex);
+	c->tt.locate_valid = false;
+	os_mutex_unlock(&c->tt.mutex);
+#else
+	(void)xc;
+#endif
+}
+
+bool
+comp_vk_native_compositor_get_texture_target_state(struct xrt_compositor *xc, struct comp_texture_target_state *out)
+{
+#ifdef XRT_OS_WINDOWS
+	if (xc == NULL || out == NULL) {
+		return false;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	if (!vk_tt_bound(c)) {
+		return false;
+	}
+	os_mutex_lock(&c->tt.mutex);
+	*out = c->tt.state;
+	os_mutex_unlock(&c->tt.mutex);
+	if (!out->valid) {
+		// Nothing woven yet: still say which path the session took.
+		out->flags = c->tt.windowless ? COMP_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE
+		                              : (c->tt.anchor_fallback ? COMP_TEXTURE_TARGET_STATE_ANCHOR_FALLBACK : 0);
+	}
+	return true;
+#else
+	(void)xc;
+	(void)out;
+	return false;
+#endif
+}
 
 bool
 comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
@@ -16460,15 +16864,23 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 		if (out_metrics != NULL) out_metrics->valid = false;
 		return false;
 	}
-	return vk_get_window_metrics(vk_comp(xc), out_metrics, true);
+	// ADR-060: a locate in flight frames its views to the target it chained.
+	return vk_get_window_metrics(vk_comp(xc), out_metrics, true, /* for_locate */ true);
 }
 
+/*!
+ * @p for_locate (Windows, ADR-060 #2721): a bound texture session's metrics
+ * are the target's — the one an xrLocateViews in flight chained when true,
+ * else the xrEndFrame slot (the frame being woven).
+ */
 static bool
 vk_get_window_metrics(struct comp_vk_native_compositor *c,
                       struct xrt_window_metrics *out_metrics,
-                      bool off_panel_for_projection)
+                      bool off_panel_for_projection,
+                      bool for_locate)
 {
 	(void)off_panel_for_projection; // read on the Wayland arm only
+	(void)for_locate;               // read on the Windows arm only
 	memset(out_metrics, 0, sizeof(*out_metrics));
 
 #ifdef XRT_OS_WINDOWS
@@ -16476,7 +16888,9 @@ vk_get_window_metrics(struct comp_vk_native_compositor *c,
 	// adapter, so `display_processor` is legitimately NULL. Gating on it here
 	// would drop windowed weaving back to a display-scoped Kooima (#396 W7)
 	// for exactly the sessions the split is meant to improve.
-	if (!vk_dp_has_any(c) || c->hwnd == NULL) {
+	// ADR-060 (#2721): a bound texture session needs no window — its
+	// metrics are the TARGET's, read below through the one resolve.
+	if (!vk_dp_has_any(c) || (c->hwnd == NULL && !vk_tt_bound(c))) {
 		return false;
 	}
 
@@ -16492,14 +16906,15 @@ vk_get_window_metrics(struct comp_vk_native_compositor *c,
 		return false;
 	}
 
-	RECT rect;
-	if (!GetClientRect((HWND)c->hwnd, &rect)) return false;
-	uint32_t win_px_w = (uint32_t)(rect.right - rect.left);
-	uint32_t win_px_h = (uint32_t)(rect.bottom - rect.top);
-	if (win_px_w == 0 || win_px_h == 0) return false;
-
+	// Window (or, bound, target) client size and desktop origin.
+	uint32_t win_px_w = 0, win_px_h = 0;
 	POINT client_origin = {0, 0};
-	ClientToScreen((HWND)c->hwnd, &client_origin);
+	// The weave path's read (for_locate false) is the frame's one resolve.
+	if (!vk_client_geometry_ex(c, &win_px_w, &win_px_h, &client_origin, for_locate, !for_locate) ||
+	    win_px_w == 0 ||
+	    win_px_h == 0) {
+		return false;
+	}
 
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
 	float pixel_size_y = disp_h_m / (float)disp_px_h;
@@ -17678,6 +18093,61 @@ vk_android_rect_for_weave(struct comp_vk_native_compositor *c,
 }
 #endif
 
+#ifdef XRT_OS_WINDOWS
+/*!
+ * ADR-060 (#2721): the present origin a bound texture session's primary DP is
+ * fed, from metrics @p m that the weave-path resolve framed to the target.
+ *
+ * - Windowless primary DP: the target's origin relative to the DP's screen
+ *   (its registry entry) — what the D3D tiers hand set_present_origin.
+ * - Anchor fallback: today's value, byte for byte — the windowHandle's client
+ *   origin relative to the panel. The windowed DP phases from that window;
+ *   a target inset from it is woven at the anchor's phase (this tier has no
+ *   padded weave yet, unlike D3D11 / D3D12), so that is WARNed once per
+ *   episode.
+ * - Neither: false (no window to phase from; the weave stays display-scoped).
+ */
+static bool
+vk_tt_present_origin(struct comp_vk_native_compositor *c, const struct xrt_window_metrics *m, int *ox, int *oy)
+{
+	if (c->tt.windowless) {
+		const struct comp_texture_target_resolved r = c->tt.weave_r;
+		int32_t x = 0, y = 0;
+		comp_texture_target_present_origin(&r, c->tt.panel_left, c->tt.panel_top, &x, &y);
+		*ox = x;
+		*oy = y;
+		if (!c->tt.origin_logged) {
+			c->tt.origin_logged = true;
+			U_LOG_W("ADR-060: windowless texture DP phased from present origin (%d,%d) — target at (%d,%d) "
+			        "%ux%u, screen at (%d,%d)",
+			        x, y, r.screen.x, r.screen.y, r.screen.w, r.screen.h, c->tt.panel_left, c->tt.panel_top);
+		}
+		return true;
+	}
+	if (!c->tt.anchor_fallback || c->hwnd == NULL) {
+		return false;
+	}
+	POINT anchor;
+	if (!comp_texture_target_client_origin_win32(c->hwnd, &anchor, NULL)) {
+		return false;
+	}
+	*ox = (int)anchor.x - m->display_screen_left;
+	*oy = (int)anchor.y - m->display_screen_top;
+	const bool offset = m->window_screen_left != (int32_t)anchor.x || m->window_screen_top != (int32_t)anchor.y;
+	if (offset && !c->tt.anchor_offset_warned) {
+		c->tt.anchor_offset_warned = true;
+		U_LOG_W(
+		    "ADR-060: target at (%d,%d) is not at the windowHandle anchor's client origin (%d,%d) — the "
+		    "windowed DP phases from the anchor, so the weave phase is off by the target's offset "
+		    "(no padded anchor weave on the Vulkan tier)",
+		    m->window_screen_left, m->window_screen_top, (int)anchor.x, (int)anchor.y);
+	} else if (!offset) {
+		c->tt.anchor_offset_warned = false; // one WARN per episode
+	}
+	return true;
+}
+#endif
+
 static void
 vk_update_present_origin(struct comp_vk_native_compositor *c)
 {
@@ -17735,8 +18205,11 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	return;
 #endif
 
+#ifdef XRT_OS_WINDOWS
+	c->tt.weave_r.valid = false; // ADR-060: re-taken by this frame's metrics read below
+#endif
 	struct xrt_window_metrics m;
-	if (!vk_get_window_metrics(c, &m, false) || !m.valid) {
+	if (!vk_get_window_metrics(c, &m, false, /* for_locate */ false) || !m.valid) {
 		// No live window metrics (headless / no window) — leave the DP
 		// display-scoped (its present origin defaults to (0,0)).
 		return;
@@ -17787,8 +18260,13 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	 * before it moves. The compositor's job is to report where the window
 	 * actually is.
 	 */
-	const int ox = m.window_screen_left - m.display_screen_left;
-	const int oy = m.window_screen_top - m.display_screen_top;
+	int ox = m.window_screen_left - m.display_screen_left;
+	int oy = m.window_screen_top - m.display_screen_top;
+#ifdef XRT_OS_WINDOWS
+	if (vk_tt_bound(c) && !vk_tt_present_origin(c, &m, &ox, &oy)) {
+		return; // bound, no windowless DP and no anchor: display-scoped, nothing to feed
+	}
+#endif
 	// Origin changed ⟹ the window is being dragged: have the target clamp
 	// its bridge queue shallow so the weave phase sampled here is still
 	// where the window IS when the frame reaches glass (#912 drag-shallow;
@@ -19145,6 +19623,21 @@ vk_plane_ensure_fb(struct comp_vk_native_compositor *c,
 static struct u_canvas_rect
 vk_effective_canvas(struct comp_vk_native_compositor *c)
 {
+#ifdef XRT_OS_WINDOWS
+	// ADR-060 §3 (#2721): under a texture target binding the rect IS the
+	// canvas, every frame, with or without zones (INV-5.6's "zones frame
+	// every frame" is the anchor path's rule only).
+	if (vk_tt_bound(c)) {
+		struct u_canvas_rect tgt = {0};
+		uint32_t w = 0, h = 0;
+		if (vk_client_geometry(c, &w, &h, NULL, false)) {
+			tgt.valid = true;
+			tgt.w = w;
+			tgt.h = h;
+		}
+		return tgt;
+	}
+#endif
 	// XR_DXR_display_zones: a zones frame spans the full client window by
 	// definition (each zone rect is its own canvas; the output rect is
 	// inert) — same supersede geometry as the mask/Local2D rules.
@@ -19175,12 +19668,11 @@ vk_window_region(struct comp_vk_native_compositor *c, uint32_t dst_w, uint32_t d
 	*rw = dst_w;
 	*rh = dst_h;
 #ifdef XRT_OS_WINDOWS
-	if (c->hwnd != NULL) {
-		RECT r;
-		if (GetClientRect((HWND)c->hwnd, &r) && r.right > 0 && r.bottom > 0) {
-			*rw = ((uint32_t)r.right < dst_w) ? (uint32_t)r.right : dst_w;
-			*rh = ((uint32_t)r.bottom < dst_h) ? (uint32_t)r.bottom : dst_h;
-		}
+	// The window's client area, or the texture target's rect (ADR-060).
+	uint32_t cw = 0, ch = 0;
+	if (vk_client_geometry(c, &cw, &ch, NULL, false)) {
+		*rw = (cw < dst_w) ? cw : dst_w;
+		*rh = (ch < dst_h) ? ch : dst_h;
 	}
 #endif
 }
@@ -21578,11 +22070,16 @@ vk_sync_zone_mask_to_dp(struct comp_vk_native_compositor *c)
 	// Screen-anchor the mask: client-area origin in physical screen pixels
 	// (same HWND clamp as vk_window_region). No HWND → nothing to anchor
 	// to; skip the publish.
-	HWND wnd = (HWND)c->hwnd;
-	RECT r;
+	// Under a texture target binding the anchor is the target (ADR-060).
+	RECT r = {0};
 	POINT origin = {0, 0};
-	if (wnd == NULL || !GetClientRect(wnd, &r) || r.right <= 0 || r.bottom <= 0 || !ClientToScreen(wnd, &origin)) {
-		return;
+	{
+		uint32_t cw = 0, ch = 0;
+		if (!vk_client_geometry(c, &cw, &ch, &origin, false)) {
+			return;
+		}
+		r.right = (LONG)cw;
+		r.bottom = (LONG)ch;
 	}
 
 	bool ok = xrt_display_processor_publish_local_zone_mask(c->display_processor, view, mask_w, mask_h,
@@ -21746,12 +22243,10 @@ comp_vk_native_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w
 	// 0 → runtime chooses the client-window dims (the mask is window-sized).
 	if (w == 0 || h == 0) {
 #ifdef XRT_OS_WINDOWS
-		if (c->hwnd != NULL) {
-			RECT r;
-			if (GetClientRect((HWND)c->hwnd, &r) && r.right > 0 && r.bottom > 0) {
-				w = (uint32_t)r.right;
-				h = (uint32_t)r.bottom;
-			}
+		uint32_t cw = 0, ch = 0;
+		if (vk_client_geometry(c, &cw, &ch, NULL, false)) {
+			w = cw;
+			h = ch;
 		}
 #endif
 		if (w == 0 || h == 0) {
