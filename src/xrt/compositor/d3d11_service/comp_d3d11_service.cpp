@@ -1395,6 +1395,12 @@ struct d3d11_service_compositor
 	//! the service window (the #1172/#939 ingest-DP case), so the resume must
 	//! put one back there. Render thread only, under render_mutex.
 	bool weave_idle_rebind_panel = false;
+	//! A mode request from this client was denied because there was no panel
+	//! DP (reason NO_DISPLAY_PROCESSOR). In practice: it asked while it was
+	//! weave-idle released, just before the submit that brings the DP back.
+	//! Set by service_apply_pending_mode (any thread). The render thread clears
+	//! it once the panel DP is bound again and replays the standing wish (#964).
+	std::atomic<bool> mode_denied_no_dp{false};
 	//! Weave-idle release: guards `render.weave_dp` between its lazy create in
 	//! svc_ensure_client_weave_dp (IPC thread, deliberately OUTSIDE render_mutex)
 	//! and the idle release (render thread). The render thread only ever
@@ -12852,7 +12858,10 @@ pipeline_idle_quiesce_if_due(struct d3d11_service_system *sys, struct d3d11_mult
  * rebuilds the ingest DP on the submitting thread, and the next render tick
  * sees the fresh stamp, clears the latch and binds the panel DP as usual. A
  * submit that lands before that rebind returns false (the client keeps its last
- * frame and retries), the same degrade as the #1172 tripwire.
+ * frame and retries), the same degrade as the #1172 tripwire. A mode request
+ * that lands before it is denied for the missing DP; the render thread replays
+ * the client's standing wish once the panel DP is bound again
+ * (`mode_denied_no_dp`).
  *
  * Render thread, under render_mutex. Returns true while the client is released
  * (the caller must not bind a DP to it this frame).
@@ -14681,31 +14690,18 @@ pipeline_rearm_apply_now(struct d3d11_service_compositor *nc, int32_t slot, cons
 	}
 }
 
+/*!
+ * The mode half of pipeline_rearm_focus_wish: re-arm @p nc's standing wish into
+ * its pending request and apply it now. Also used on its own when a client's
+ * panel DP is back after a request was denied for the lack of one. Render
+ * thread, under render_mutex.
+ */
 static void
-pipeline_rearm_focus_wish(struct d3d11_multi_compositor *mc, int32_t slot, const char *tag)
+pipeline_rearm_wish(struct d3d11_service_compositor *nc, int32_t slot, const char *tag)
 {
-	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || mc->clients[slot].compositor == nullptr) {
-		return;
-	}
-	struct d3d11_service_compositor *nc = mc->clients[slot].compositor;
-	/* #939: a sticky screen-flat latch this slot carries as it regains the
-	 * panel was set while it was covered (the browser flattens the whole panel
-	 * when its tab is occluded) and is about to be revised — but its first
-	 * submits would publish it as-is and the vendor would evaluate that to a
-	 * 2D verdict, 200+ ms before the client's own 3D re-ask. Suspend it for
-	 * the same grace the 2D wish gets below; the client's next
-	 * xrWeaveSetScreenFlatRegionsDXR ends the suspension early. */
-	{
-		const int64_t flat_grace_ns = dxr_rearm_2d_grace_ns();
-		if (flat_grace_ns > 0 && nc->weave_screen_flat_rect_count > 0) {
-			nc->weave_screen_flat_suspended_until_ns = (int64_t)os_monotonic_get_ns() + flat_grace_ns;
-			U_LOG_W(
-			    "[pipeline] %s -> slot %d: %u sticky screen-flat rect(s) suspended for %lld ms — latched "
-			    "while this slot was covered; its next flat-regions call or the expiry restores them "
-			    "(#939)",
-			    tag, slot, nc->weave_screen_flat_rect_count, (long long)(flat_grace_ns / 1000000LL));
-		}
-	}
+	// This replay covers any request denied for lack of a DP. If the DP is
+	// still missing, the apply below denies again and sets the flag again.
+	nc->mode_denied_no_dp.store(false, std::memory_order_release);
 	int32_t wish_mode = nc->wish_content_mode.load(std::memory_order_acquire);
 	int wish_hw = nc->wish_hw_3d.load(std::memory_order_acquire);
 	if (wish_mode < 0 && wish_hw < 0) {
@@ -14745,6 +14741,34 @@ pipeline_rearm_focus_wish(struct d3d11_multi_compositor *mc, int32_t slot, const
 	}
 	U_LOG_W("[pipeline] %s -> slot %d: re-arming wish content=%d hw=%d", tag, slot, (int)wish_mode, wish_hw);
 	pipeline_rearm_apply_now(nc, slot, tag);
+}
+
+static void
+pipeline_rearm_focus_wish(struct d3d11_multi_compositor *mc, int32_t slot, const char *tag)
+{
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || mc->clients[slot].compositor == nullptr) {
+		return;
+	}
+	struct d3d11_service_compositor *nc = mc->clients[slot].compositor;
+	/* #939: a sticky screen-flat latch this slot carries as it regains the
+	 * panel was set while it was covered (the browser flattens the whole panel
+	 * when its tab is occluded) and is about to be revised — but its first
+	 * submits would publish it as-is and the vendor would evaluate that to a
+	 * 2D verdict, 200+ ms before the client's own 3D re-ask. Suspend it for
+	 * the same grace the 2D wish gets below; the client's next
+	 * xrWeaveSetScreenFlatRegionsDXR ends the suspension early. */
+	{
+		const int64_t flat_grace_ns = dxr_rearm_2d_grace_ns();
+		if (flat_grace_ns > 0 && nc->weave_screen_flat_rect_count > 0) {
+			nc->weave_screen_flat_suspended_until_ns = (int64_t)os_monotonic_get_ns() + flat_grace_ns;
+			U_LOG_W(
+			    "[pipeline] %s -> slot %d: %u sticky screen-flat rect(s) suspended for %lld ms — latched "
+			    "while this slot was covered; its next flat-regions call or the expiry restores them "
+			    "(#939)",
+			    tag, slot, nc->weave_screen_flat_rect_count, (long long)(flat_grace_ns / 1000000LL));
+		}
+	}
+	pipeline_rearm_wish(nc, slot, tag);
 }
 
 /*!
@@ -16111,6 +16135,15 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		} else {
 			pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ true,
 			                       /*force_recreate*/ false, svc_panel_dp_device(sys, kind));
+		}
+		// Weave-idle resume: the browser asks for 3D just BEFORE the first
+		// submit that brings its DPs back, so that request was denied
+		// (NO_DISPLAY_PROCESSOR) and dropped, and the browser does not ask
+		// again. The panel stayed 2D under a 3D page after moving between
+		// pages in one tab. Replay the standing wish once the panel DP is
+		// bound again; a bind that defers just retries next tick.
+		if (fc->mode_denied_no_dp.load(std::memory_order_acquire) && panel_dp(sys, fc) != nullptr) {
+			pipeline_rearm_wish(fc, focused, "panel DP back after a denied request");
 		}
 		sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
 		// Tell the owner it holds the panel, so its next commit weaves.
@@ -23392,6 +23425,12 @@ service_apply_pending_mode(struct d3d11_service_system *sys,
 	struct xrt_display_processor_d3d11 *xdp = panel_dp(sys, c);
 	if (deny == XRT_DISPLAY_MODE_DENIAL_REASON_NONE && (xdp == nullptr || head == nullptr || head->hmd == NULL)) {
 		deny = XRT_DISPLAY_MODE_DENIAL_REASON_NO_DISPLAY_PROCESSOR;
+		// The request is still dropped below, but a missing DP can come back
+		// (weave-idle release): the render thread then replays the standing
+		// wish, which already holds this request (#964).
+		if (xdp == nullptr) {
+			c->mode_denied_no_dp.store(true, std::memory_order_release);
+		}
 	}
 	if (deny != XRT_DISPLAY_MODE_DENIAL_REASON_NONE) {
 		push_mode_request_denied(c, req_mode, req_hw, deny);
