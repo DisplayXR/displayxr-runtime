@@ -174,6 +174,50 @@ terminal or detached — it no longer needs a terminal on stdin, and SIGTERM /
 Ctrl+C stop it cleanly. The tarball's `install.sh` installs the same unit pair
 under `~/.config/systemd/user/` (`--system`: `/usr/local/lib/systemd/user/`).
 
+**A dev service beside an installed runtime.** To point a client at a
+build-tree `displayxr-service` without stopping the installed one (the weave
+probes, `test_apps/probes/weave_probe_vk_linux`, are the usual reason), use
+`scripts/run_dev_service_linux.sh`:
+
+```bash
+./scripts/build_linux.sh --hybrid --apps        # runtime + displayxr-service + probes
+./scripts/run_dev_service_linux.sh &            # dev service, sim-display only
+SVC=$!
+. "$XDG_RUNTIME_DIR/dxr-dev/client.env"         # the client's half, in the shell that runs the client
+build/run_weave_probe_vk_linux.sh --service-pid=$SVC --cursor
+kill $SVC
+```
+
+The script does by hand what a real desktop needs, each step for a reason that
+is in the code:
+
+| Step | Why |
+|---|---|
+| `XDG_RUNTIME_DIR=<real runtime dir>/dxr-dev` for the service **and** the client | The service binds, and a client dials, `$XDG_RUNTIME_DIR/displayxr_comp_ipc` (`u_file_get_path_in_runtime_dir`); nothing else moves the socket. The installed `displayxr.socket` owns that path in the real runtime dir, so the dev pair needs a directory of its own. The pid file goes there too. |
+| An **absolute** `WAYLAND_DISPLAY` (`/run/user/<uid>/wayland-0`) | libwayland resolves a relative name against `XDG_RUNTIME_DIR`, so the changed directory hides the compositor's socket from the service's window, the session-type checks, and any windowed client. |
+| `DBUS_SESSION_BUS_ADDRESS` set explicitly | The runtime's session-bus fallback is `$XDG_RUNTIME_DIR/bus`, which the sub-directory does not have. Desktop sessions export the variable already; the script fills it in when they do not. |
+| A private plug-in dir holding only `200-sim-display.json` and its library, as `XRT_PLUGIN_SEARCH_PATH` | `XRT_PLUGIN_SEARCH_PATH` is put **in front of** the built-in roots (`~/.local/share/DisplayXR/DisplayProcessors`, `/usr/lib/displayxr/plugins`, `/usr/local/share/...`, `/usr/share/...`); it does not replace them. And `build/_plugins` is not sim-display alone: it also holds sim-input, sim-stylus, sim-tracking, gamepad and the conversion plug-ins. The manifest's `binary_path` is absolute, so the copy gets a rewritten one. |
+| `DXR_PLUGIN_EXCLUSIVE=sim-display` | Loads only that display plug-in; an installed vendor plug-in under `/usr/lib/displayxr/plugins` is not even `dlopen`ed. A wrong id loads nothing and the log names the registered ids. |
+| `DXR_CONV_PROVIDERS=0 DXR_INPUT_PROVIDERS=0 DXR_TRACKING_PROVIDERS=0` | `DXR_PLUGIN_EXCLUSIVE` covers the display class only. These are the kill switches of the other three component classes (conversion, input, viewer tracking). |
+| A private `TMPDIR` | Capture triggers (`displayxr_atlas_trigger[.<client-exe>]`) are read from the **service's** `$TMPDIR`; a private one keeps them apart from the installed service's. |
+
+`--no-session-bus` points `DBUS_SESSION_BUS_ADDRESS` at a path that does not
+exist, so the dev service talks to nothing on the session bus: not the GNOME
+Shell extension, not Mutter's `DisplayConfig`. That is a quieter sim-display
+probe run. Do **not** use it when the run depends on what the service gets over
+the bus: the workspace-controller hotkey (the extension grabs it), Mutter's
+display-layout change signal, or the monitors' current mode and scale (without
+the bus the runtime falls back to DRM sysfs, which lists modes and knows no
+scale). The client keeps the real bus either way.
+
+What you do not need: pinning sim-display to 1920x1080. It adopts the box's
+real panel, and the probe takes the panel from `XR_DXR_display_info`. On an
+X11 session add `DXR_WEAVE_CURSOR_POINTER=caller` to the service's environment
+for the probe's `--cursor` legs (the service would read the real pointer
+otherwise); on Wayland the caller is the source without it. In a container
+with no session and nothing installed (CI), none of this is needed:
+`XRT_PLUGIN_SEARCH_PATH=build/_plugins displayxr-service` is enough.
+
 **The Vulkan queue-lock layer (`VK_LAYER_DXR_queue_lock`, #902 / #2036).** On a
 GPU whose graphics family has a single queue (Intel iGPUs), the #868 repaint loop
 can only run by sharing the app's queue, and that needs this layer to serialise

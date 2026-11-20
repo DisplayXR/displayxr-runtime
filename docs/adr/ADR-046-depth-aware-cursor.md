@@ -1925,9 +1925,17 @@ that asked keeps its fallback.
 - **The descriptor lookups: unit-tested** (`tests_oxr_weave_chain`): the input's and the
   sprite's descriptor are each found in all 120 orders of the chain's five links, and neither
   lookup accepts the other's type.
-- **Desktop Linux: compiled on CI, not run.** No Linux panel box was available to this change.
-  The probe's `--cursor` leg and the recipe in the pull request are the acceptance test.
-- **No panel.** Nothing here has been looked at on a tracked 3D display.
+- **Desktop Linux, run with sim-display** (after the merge: Ubuntu 26.04, GNOME on native
+  Wayland, an Intel Arc GPU, sim-display adopting the internal 2880 x 1800 panel; a dev service
+  from the build tree beside the installed runtime, started as
+  `scripts/run_dev_service_linux.sh` now does it). `weave_probe_vk_linux --cursor` passes its
+  four legs with the `OPAQUE_FD` sprite, and `--cursor-dmabuf` passes the same four with the
+  dma-buf sprite (its descriptor chained before the request). On Wayland the engine selects the
+  caller's `sampleUV` as the pointer by itself, with no `DXR_WEAVE_CURSOR_POINTER`. This is a
+  self-checking probe on a simulated display processor, not a hardware validation.
+- **Desktop Linux, not run:** an X11 session (the `XQueryPointer` read, and the caller as the
+  source on X11 through `DXR_WEAVE_CURSOR_POINTER=caller`); the DisplayXR Browser end to end.
+- **No panel.** Nothing here has been looked at on a tracked 3D display, on any OS.
 
 ### Not changed
 
@@ -1938,8 +1946,9 @@ this change does not touch.
 
 1. **`drawnBounds` on a scaled Wayland desktop** are in the pixels of the submitted rects. The
    browser must compare them with the pointer in the same pixels.
-2. **The dma-buf carrier has not been run.** `weave_probe_vk_linux --cursor-dmabuf` sends
-   one (compiled on CI); it waits for a Linux box.
+2. **The dma-buf carrier has been run by the probe only** (`weave_probe_vk_linux
+   --cursor-dmabuf`, a driver-picked modifier on one Intel GPU, see Evidence). A browser's
+   sprite buffer, another driver and a cross-device import have not.
 3. **XWayland detection** is by session type (`XDG_SESSION_TYPE`), read from the service's
    environment. A socket-activated service whose environment lacks it takes the caller path,
    which is always correct.
