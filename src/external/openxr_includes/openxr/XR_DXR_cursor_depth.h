@@ -103,6 +103,21 @@
  * the window pixels the sprite covers, so the caller hides its OS cursor
  * exactly there. New structs only; XR_DXR_weave is required.
  *
+ * Spec v9 (ADR-046 Amendment 5) adds an OPT-IN depth range. The default is
+ * unchanged (never behind the glass, v4). A caller whose content mostly sits
+ * BEHIND the glass - a top-down scene whose ground recedes - can ask the
+ * cursor to follow content on both sides: @ref XrCursorDepthRangeDXR with
+ * XR_CURSOR_DEPTH_RANGE_MODE_BOTH_DXR chained on the hint, or
+ * XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR in the flags of a weave rect entry
+ * (@ref XrCursorDepthWeaveRectDXR) or of a lifted rect
+ * (@ref XrCursorDepthLiftRectDXR). Behind the glass the cursor still floats a
+ * margin in FRONT of the content, never behind it:
+ *   target = d < 0 ? max(d - margin, -0.6) : min(max(d - margin, 0), +0.6).
+ * One new struct; no existing struct changed size (the rect flags were
+ * reserved-must-be-zero words). A runtime older than v9 ignores the struct
+ * and the bit and behaves as FRONT_ONLY, so check the extension's specVersion
+ * (xrEnumerateInstanceExtensionProperties) >= 9 before relying on it.
+ *
  * One call, one space. The hint is chained on XrViewLocateInfo::next and the
  * result on XrViewState::next of the SAME xrLocateViews call, and both are in
  * XrViewLocateInfo::space. The hint normally comes from the previous frame's
@@ -127,7 +142,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_cursor_depth 1
-#define XR_DXR_cursor_depth_SPEC_VERSION 8
+#define XR_DXR_cursor_depth_SPEC_VERSION 9
 #define XR_DXR_CURSOR_DEPTH_EXTENSION_NAME "XR_DXR_cursor_depth"
 
 // Reserved 1004999320-329 (next free decade after stereo_camera's 310-319).
@@ -147,6 +162,10 @@ extern "C" {
 //! Spec v8 (ADR-046 Amendment 4: the runtime draws the web cursor on any weave rect).
 #define XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR ((XrStructureType)1004999328)
 #define XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR ((XrStructureType)1004999329)
+// 320-329 is full: the extension's second decade is 1004999390-399 (allocation
+// registry: README.md in this directory).
+//! Spec v9 (ADR-046 Amendment 5: the opt-in depth range).
+#define XR_TYPE_CURSOR_DEPTH_RANGE_DXR ((XrStructureType)1004999390)
 
 // ---- Input: app chains this on XrViewLocateInfo::next; runtime reads it. ----
 
@@ -322,6 +341,63 @@ typedef struct XrCursorDepthOptionsDXR {
     float                      margin;
 } XrCursorDepthOptionsDXR;
 
+// ---- Spec v9: the depth range (ADR-046 Amendment 5). ----
+
+/*!
+ * @brief Which side of the display plane the cursor may be placed on.
+ */
+typedef enum XrCursorDepthRangeModeDXR {
+    /*!
+     * The default, and spec v4-v8 behaviour: never behind the glass. Content
+     * on or behind the display plane leaves the cursor on the plane (the OS
+     * cursor). Same as not asking.
+     */
+    XR_CURSOR_DEPTH_RANGE_MODE_FRONT_ONLY_DXR = 0,
+    /*!
+     * In front of the glass exactly as FRONT_ONLY, and ALSO behind it: over
+     * content more than a margin behind the plane the cursor is placed a
+     * margin in front of that content (target = content - margin, at most
+     * +0.6 eye baselines of uncrossed disparity). It is never placed behind
+     * the content under it. Content within a margin of the plane, either
+     * side, leaves the cursor on the plane.
+     *
+     * For scenes that live behind the glass (a top-down view whose ground
+     * recedes): with the eyes converged on that ground an on-plane cursor is
+     * seen double and does not point at the thing under it.
+     *
+     * The cursor is then drawn (isActive / willDraw / drawn masks) while its
+     * disparity is at least 0.005 eye baselines off the plane on EITHER side,
+     * and while it crosses the plane toward such a target.
+     */
+    XR_CURSOR_DEPTH_RANGE_MODE_BOTH_DXR = 1,
+    XR_CURSOR_DEPTH_RANGE_MODE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrCursorDepthRangeModeDXR;
+
+/*!
+ * @brief Optional, chained on XrCursorDepthHintDXR::next (spec v9): the depth
+ * range of this locate's placement.
+ *
+ * Absent = FRONT_ONLY. Like the hint it is read only on a locate that chains
+ * the hint, and covers that locate only; an app may change it frame to frame
+ * (the time filter carries the cursor across). A runtime whose
+ * XR_DXR_cursor_depth specVersion is below 9 ignores it (FRONT_ONLY).
+ */
+typedef struct XrCursorDepthRangeDXR {
+    XrStructureType           type;   //!< Must be XR_TYPE_CURSOR_DEPTH_RANGE_DXR
+    const void* XR_MAY_ALIAS  next;
+    //! Unknown values behave as XR_CURSOR_DEPTH_RANGE_MODE_FRONT_ONLY_DXR.
+    XrCursorDepthRangeModeDXR range;
+} XrCursorDepthRangeDXR;
+
+/*!
+ * @brief Spec v9: bit of XrCursorDepthWeaveRectDXR::flags and of
+ * XrCursorDepthLiftRectDXR::flags - this rect's cursor uses
+ * XR_CURSOR_DEPTH_RANGE_MODE_BOTH_DXR. Clear = FRONT_ONLY. Per rect, per
+ * submit. All other bits are reserved and must be 0; a runtime ignores bits
+ * it does not know (one older than v9 ignores this one: FRONT_ONLY).
+ */
+#define XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR 0x00000001u
+
 // ---- Spec v5: the runtime draws the cursor (ADR-046 Amendment 2 B). ----
 
 /*!
@@ -412,7 +488,9 @@ typedef struct XrCursorDepthPlacementDXR {
      * fewer than two active views (2D), a cursor off the canvas, degenerate
      * view geometry, or (spec v4) a filtered disparity above the draw
      * threshold (-0.005: the cursor is on, or within 0.005 baselines of, the
-     * display plane - the OS cursor is the cursor). pose is then identity and
+     * display plane - the OS cursor is the cursor; with the spec v9 BOTH
+     * range the band is +/-0.005, and a cursor crossing it toward a target
+     * outside it stays active). pose is then identity and
      * height 0; disparity and targetDisparity are still filled whenever the
      * geometry was valid (diagnostics).
      */
@@ -435,11 +513,15 @@ typedef struct XrCursorDepthPlacementDXR {
     /*!
      * Filtered disparity, in units of the eye baseline: 0 = on the display
      * plane, < 0 = in front of it (crossed). Never > 0 since spec v4 (never
-     * behind the glass). Diagnostic; the pose already encodes it.
+     * behind the glass) unless the locate asked for the spec v9 BOTH range,
+     * where > 0 = behind it (uncrossed). Diagnostic; the pose already
+     * encodes it.
      */
     float disparity;
     //! Unfiltered target disparity this locate: content - margin, clamped to
-    //! [-0.6, 0]; 0 when the content is on or behind the plane. Diagnostic.
+    //! [-0.6, 0]; 0 when the content is on or behind the plane. With the
+    //! spec v9 BOTH range: clamped to [-0.6, +0.6], 0 for content within a
+    //! margin of the plane. Diagnostic.
     float targetDisparity;
 } XrCursorDepthPlacementDXR;
 
@@ -468,7 +550,9 @@ typedef struct XrCursorDepthPlacementDXR {
 typedef struct XrCursorDepthLiftRectDXR {
     XrStructureType          type;  //!< Must be XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR
     const void* XR_MAY_ALIAS next;
-    uint32_t                 flags; //!< Reserved, must be 0.
+    //! Spec v9: XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR or 0. Other bits
+    //! reserved, must be 0 (v6-v8: the whole word was reserved).
+    uint32_t                 flags;
 } XrCursorDepthLiftRectDXR;
 
 /*!
@@ -553,14 +637,18 @@ typedef struct XrCursorDepthWeaveRectDXR {
     /*!
      * On-screen disparity, in device (panel) pixels, between the two outermost
      * views the caller rendered, of the NEAREST content under the cursor
-     * footprint. Signed: < 0 = crossed = in front of the glass. Raw content
+     * footprint. Signed: < 0 = crossed = in front of the glass, > 0 =
+     * uncrossed = behind it (send it either way: the runtime ignores content
+     * behind the glass unless @c flags asks for the BOTH range). Raw content
      * disparity, not a target: margin, clamp, threshold and smoothing are the
      * runtime's (v4). The runtime converts it with the tracked eyes:
      * d = disparityPx x pitch / eye baseline.
      */
     float      disparityPx;
     XrVector2f sampleUV;    //!< where the page sampled it, rect-normalised, v down (diagnostic)
-    uint32_t   flags;       //!< reserved, must be 0
+    //! Spec v9: XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR or 0. Other bits
+    //! reserved, must be 0 (v8: the whole word was reserved).
+    uint32_t   flags;
 } XrCursorDepthWeaveRectDXR;
 
 /*!

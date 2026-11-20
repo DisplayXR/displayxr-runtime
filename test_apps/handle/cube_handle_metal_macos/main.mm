@@ -1090,9 +1090,15 @@ static void EnsureDepthTexture(MetalRenderer &r, uint32_t w, uint32_t h)
 // Opt out with DISPLAYXR_CURSOR_DEPTH=0;
 // pick the anchor mode with DISPLAYXR_CURSOR_DEPTH_ANCHOR=hybrid|screen|world
 // (unset = the runtime default, HYBRID).
+// Spec v9 (ADR-046 Amendment 5): DISPLAYXR_CURSOR_DEPTH_RANGE=both chains
+// XrCursorDepthRangeDXR so the cursor also follows content BEHIND the glass
+// (unset / front = the default, never behind the glass). DISPLAYXR_CUBE_Z=<m>
+// slides the cube along the locate space's z (negative = away from the
+// viewer, behind the display plane) to give that something to rest on.
 // ============================================================================
 
 static const float kCubeSize = 0.06f;
+static float g_cubeZ = 0.0f; // DISPLAYXR_CUBE_Z: the cube centre's z, locate-space metres
 static const float kCursorHeight = 0.04f; // fraction of canvas height
 
 struct CursorDepthDraw {
@@ -1103,12 +1109,12 @@ struct CursorDepthDraw {
 static CursorDepthDraw g_cursorDraw;
 
 // Slab test against the cube as RenderScene places it: centred at
-// (0, size/2, 0), edge `size`, rotated `rot` about +Y (mat4_rotation_y).
+// (0, size/2, g_cubeZ), edge `size`, rotated `rot` about +Y (mat4_rotation_y).
 static bool RayHitCube(const XrVector3f &o, const XrVector3f &d, float rot, float &tOut)
 {
     const float c = cosf(rot), s = sinf(rot), h = kCubeSize * 0.5f;
     // local = R^T (world - centre); R's columns are (c,0,-s), (0,1,0), (s,0,c).
-    const float ox = o.x, oy = o.y - h, oz = o.z;
+    const float ox = o.x, oy = o.y - h, oz = o.z - g_cubeZ;
     const float lo[3] = {c * ox - s * oz, oy, s * ox + c * oz};
     const float ld[3] = {c * d.x - s * d.z, d.y, s * d.x + c * d.z};
     float t0 = 0.0f, t1 = 1e30f;
@@ -1329,7 +1335,7 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
             float model[16], rotation[16], translation[16], scale[16], tmp[16];
             mat4_scaling(scale, cubeSize);
             mat4_rotation_y(rotation, r.cubeRotation);
-            mat4_translation(translation, 0.0f, cubeHeight, 0.0f);
+            mat4_translation(translation, 0.0f, cubeHeight, g_cubeZ);
             mat4_multiply(tmp, scale, rotation);
             mat4_multiply(model, translation, tmp);
 
@@ -2066,6 +2072,10 @@ struct AppXrSession {
     // OS cursor exactly while XrCursorDepthDrawStateDXR::willDraw. App: draw
     // the crosshair ourselves from the placement (v1-v4 behaviour).
     bool cursorDepthRuntimeDraw = false;
+    // XR_DXR_cursor_depth v9 (ADR-046 Amendment 5): DISPLAYXR_CURSOR_DEPTH_RANGE=
+    // both chains XrCursorDepthRangeDXR(BOTH) on the hint. Unset or "front":
+    // the struct is not chained, and the runtime keeps the cursor in front.
+    bool cursorDepthRangeBoth = false;
     // DISPLAYXR_CURSOR_DEPTH_SPRITE=custom: hand the runtime our own sprite
     // (a cyan ring with a dot) instead of its default look.
     bool cursorDepthCustomSprite = false;
@@ -2253,6 +2263,24 @@ static bool InitializeOpenXR(AppXrSession &app)
                  app.cursorDepthFromLayer   ? "SUBMITTED DEPTH (runtime reads it)"
                  : app.cursorDepthMeasured ? "MEASURED DISPARITY (runtime block-matches the views)"
                                            : "app hit test");
+
+        // Opt-in (spec v9, ADR-046 Amendment 5): the cursor may also follow
+        // content behind the glass. An older runtime would ignore the struct,
+        // so say so instead of silently testing FRONT_ONLY.
+        const char *range = getenv("DISPLAYXR_CURSOR_DEPTH_RANGE");
+        if (range != nullptr && strcmp(range, "both") == 0) {
+            if (app.cursorDepthSpecVersion >= 9) {
+                app.cursorDepthRangeBoth = true;
+            } else {
+                LOG_WARN("DISPLAYXR_CURSOR_DEPTH_RANGE=both needs XR_DXR_cursor_depth v9 (have v%u) - "
+                         "the cursor stays in front of the glass",
+                         app.cursorDepthSpecVersion);
+            }
+        } else if (range != nullptr && range[0] != '\0' && strcmp(range, "front") != 0) {
+            LOG_WARN("DISPLAYXR_CURSOR_DEPTH_RANGE=%s: expected front|both - using front", range);
+        }
+        LOG_INFO("XR_DXR_cursor_depth range: %s",
+                 app.cursorDepthRangeBoth ? "BOTH (in front of and behind the glass)" : "FRONT_ONLY (default)");
 
         // Opt-in (spec v3): pick the anchor mode explicitly.
         const char *anchor = getenv("DISPLAYXR_CURSOR_DEPTH_ANCHOR");
@@ -3573,6 +3601,16 @@ int main(int argc, char **argv)
     // of the hint's chain, which is where the runtime looks for it.
     XrCursorDepthSourceDXR measuredSource = {XR_TYPE_CURSOR_DEPTH_SOURCE_DXR};
     measuredSource.source = XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR;
+    // Spec v9 (ADR-046 Amendment 5): the depth range, chained the same way.
+    XrCursorDepthRangeDXR depthRange = {XR_TYPE_CURSOR_DEPTH_RANGE_DXR};
+    depthRange.range = XR_CURSOR_DEPTH_RANGE_MODE_BOTH_DXR;
+    if (const char *cz = getenv("DISPLAYXR_CUBE_Z")) { // content behind (< 0) or in front of the glass
+        float z = 0.0f;
+        if (sscanf(cz, "%f", &z) == 1 && std::isfinite(z)) {
+            g_cubeZ = z;
+            LOG_INFO("DISPLAYXR_CUBE_Z: cube centre at z = %.3f m", g_cubeZ);
+        }
+    }
     // DISPLAYXR_FRAME_STATS=1: frame interval and xrLocateViews / xrEndFrame
     // CPU time, averaged and logged every 300 frames (the Amendment 3 cost
     // evidence).
@@ -3899,6 +3937,10 @@ int main(int argc, char **argv)
         if (app.cursorDepthMeasured && cursor.enabled()) {
             measuredSource.next = locateInfo.next;
             locateInfo.next = &measuredSource;
+        }
+        if (app.cursorDepthRangeBoth && cursor.enabled()) {
+            depthRange.next = locateInfo.next;
+            locateInfo.next = &depthRange;
         }
         cursor.chain(locateInfo, viewState);
 

@@ -2916,7 +2916,7 @@ TEST_CASE("cursor_weave: a caller depth expires after 500 ms, and belongs to its
 	bool has = false;
 	float px = 0.0f;
 	CHECK_FALSE(u_cursor_weave_memo_get(&m, 0, &r, 0, &has, &px));
-	u_cursor_weave_memo_put(&m, 3, &r, true, -12.5f, 1000 * MS);
+	u_cursor_weave_memo_put(&m, 3, &r, true, -12.5f, 0u, 1000 * MS);
 	REQUIRE(u_cursor_weave_memo_get(&m, 3, &r, 1499 * MS, &has, &px));
 	CHECK(has);
 	CHECK(px == -12.5f);
@@ -2928,7 +2928,7 @@ TEST_CASE("cursor_weave: a caller depth expires after 500 ms, and belongs to its
 	const u_cursor_weave_rect resized = {10, 20, 641, 360};
 	CHECK_FALSE(u_cursor_weave_memo_get(&m, 3, &resized, 1100 * MS, &has, &px)); // another element
 	// A NaN disparity is stored as no content.
-	u_cursor_weave_memo_put(&m, 3, &r, true, NAN, 2000 * MS);
+	u_cursor_weave_memo_put(&m, 3, &r, true, NAN, 0u, 2000 * MS);
 	REQUIRE(u_cursor_weave_memo_get(&m, 3, &r, 2000 * MS, &has, &px));
 	CHECK_FALSE(has);
 }
@@ -3210,4 +3210,527 @@ TEST_CASE("cursor_look: Windows draws a cursor at the pointer size times the DPI
 	// No registry value means the default 32; no DPI means no size.
 	CHECK(u_cursor_os_height_px_win(0, 240, 64, 32) == 80);
 	CHECK(u_cursor_os_height_px_win(32, 0, 32, 32) == 0);
+}
+
+
+/*
+ *
+ * ADR-046 Amendment 5 (spec v9): the opt-in depth range.
+ *
+ */
+
+namespace {
+
+u_cursor_depth_tuning
+tuning_both()
+{
+	u_cursor_depth_tuning t = tuning();
+	t.range = U_CURSOR_DEPTH_RANGE_BOTH;
+	return t;
+}
+
+bool
+same_bits(float a, float b)
+{
+	return std::memcmp(&a, &b, sizeof(a)) == 0;
+}
+
+} // namespace
+
+TEST_CASE("cursor_range: FRONT_ONLY is the default, and a zero-initialised tuning is FRONT_ONLY")
+{
+	CHECK(tuning().range == U_CURSOR_DEPTH_RANGE_FRONT_ONLY);
+	CHECK(tuning().behind_max_disparity == Catch::Approx(U_CURSOR_DEPTH_DEFAULT_BEHIND_MAX));
+	const u_cursor_depth_tuning zero{};
+	CHECK(zero.range == U_CURSOR_DEPTH_RANGE_FRONT_ONLY);
+	CHECK(U_CURSOR_DEPTH_RANGE_FRONT_ONLY == 0);
+	// The recession clamp mirrors the front clamp and stays short of parallel gaze.
+	CHECK(U_CURSOR_DEPTH_DEFAULT_BEHIND_MAX == Catch::Approx(-tuning().min_disparity));
+	CHECK(U_CURSOR_DEPTH_BEHIND_MAX_LIMIT < 1.0f);
+	// An unknown range value is FRONT_ONLY.
+	auto odd = tuning();
+	odd.range = (u_cursor_depth_range)7;
+	CHECK(u_cursor_depth_target(&odd, true, 0.3f) == 0.0f);
+	CHECK_FALSE(u_cursor_depth_should_draw(&odd, 0.3f));
+}
+
+TEST_CASE("cursor_range: FRONT_ONLY - the range fields change nothing, bit for bit")
+{
+	// The tuning as it was before spec v9 (no range fields set by anyone) and
+	// today's default must agree on every input, exactly.
+	const auto now = tuning();
+	u_cursor_depth_tuning legacy{};
+	legacy.margin = U_CURSOR_DEPTH_DEFAULT_MARGIN;
+	legacy.min_disparity = -0.6f;
+	legacy.max_disparity = 0.0f;
+	legacy.draw_threshold = U_CURSOR_DEPTH_DRAW_THRESHOLD;
+	legacy.rise_tau_s = 0.03f;
+	legacy.sink_tau_s = 0.25f;
+	legacy.stale_s = 0.5f;
+	// A FRONT_ONLY tuning with an absurd recession clamp: it must not matter.
+	auto odd = now;
+	odd.behind_max_disparity = 0.9f;
+
+	// The v4 formula, written out: d < 0 ? max(d - margin, -0.6) : 0.
+	const float ds[] = {-5.0f, -0.6f,  -0.585f, -0.4f,   -0.2f, -0.02f, -0.015f, -0.006f, -0.005f, -0.001f, -0.0f,
+	                    0.0f,  0.001f, 0.005f,  0.0151f, 0.02f, 0.3f,   0.6f,    0.95f,   1.5f,    INFINITY};
+	for (float d : ds) {
+		float want = 0.0f;
+		if (d < 0.0f) {
+			want = d - now.margin;
+			want = want < -0.6f ? -0.6f : want;
+			want = want > 0.0f ? 0.0f : want;
+		}
+		CHECK(same_bits(u_cursor_depth_target(&now, true, d), want));
+		CHECK(same_bits(u_cursor_depth_target(&legacy, true, d), want));
+		CHECK(same_bits(u_cursor_depth_target(&odd, true, d), want));
+		CHECK(u_cursor_depth_target(&now, false, d) == 0.0f);
+
+		const bool draw = std::isfinite(d) && d <= -0.005f;
+		CHECK(u_cursor_depth_should_draw(&now, d) == draw);
+		CHECK(u_cursor_depth_should_draw(&legacy, d) == draw);
+		// FRONT_ONLY ignores the target altogether.
+		for (float tgt : {-0.6f, -0.1f, 0.0f, 0.1f, 0.6f, NAN}) {
+			CHECK(u_cursor_depth_should_draw_toward(&now, d, tgt) == draw);
+		}
+	}
+
+	// And through the filter: the same trajectory, sample for sample.
+	u_cursor_depth_filter fa{}, fb{};
+	const float seq[] = {0.0f, -0.3f, -0.3f, 0.2f, 0.2f, -0.05f, 0.0f, 0.0f, -0.6f, 0.5f};
+	uint64_t ns = 0;
+	for (float d : seq) {
+		for (int k = 0; k < 6; k++) {
+			ns += 16 * MS;
+			const float a = u_cursor_depth_filter_step(&fa, &now, u_cursor_depth_target(&now, true, d), ns);
+			const float b =
+			    u_cursor_depth_filter_step(&fb, &legacy, u_cursor_depth_target(&legacy, true, d), ns);
+			CHECK(same_bits(a, b));
+			CHECK(a <= 0.0f); // never behind the glass
+		}
+	}
+}
+
+TEST_CASE("cursor_range: BOTH - in front of the glass it is FRONT_ONLY, bit for bit")
+{
+	const auto front = tuning();
+	const auto both = tuning_both();
+	for (float d : {-5.0f, -0.6f, -0.585f, -0.4f, -0.2f, -0.02f, -0.015f, -0.006f, -0.001f}) {
+		CHECK(same_bits(u_cursor_depth_target(&both, true, d), u_cursor_depth_target(&front, true, d)));
+	}
+	CHECK(u_cursor_depth_target(&both, false, 0.3f) == 0.0f); // nothing under it
+	CHECK(u_cursor_depth_target(&both, true, NAN) == 0.0f);
+	for (float f : {-0.6f, -0.1f, -0.005f}) {
+		CHECK(u_cursor_depth_should_draw(&both, f));
+	}
+}
+
+TEST_CASE("cursor_range: BOTH - behind the glass the cursor floats a margin in FRONT of the content")
+{
+	const auto t = tuning_both();
+	CHECK(u_cursor_depth_target(&t, true, 0.2f) == Catch::Approx(0.2f - t.margin));
+	CHECK(u_cursor_depth_target(&t, true, 0.05f) == Catch::Approx(0.05f - t.margin));
+	// Within a margin of the plane (either side of it, from behind): on the plane.
+	CHECK(u_cursor_depth_target(&t, true, 0.0f) == 0.0f);
+	CHECK(u_cursor_depth_target(&t, true, 0.5f * t.margin) == 0.0f);
+	CHECK(u_cursor_depth_target(&t, true, t.margin) == 0.0f);
+	// Continuous where it leaves the plane.
+	CHECK(u_cursor_depth_target(&t, true, t.margin + 1e-4f) == Catch::Approx(1e-4f).margin(1e-6));
+
+	// The recession clamp: content at, past and far past it; infinity too.
+	CHECK(u_cursor_depth_target(&t, true, 0.6f) == Catch::Approx(0.6f - t.margin));
+	CHECK(u_cursor_depth_target(&t, true, 0.6f + t.margin) == Catch::Approx(0.6f));
+	CHECK(u_cursor_depth_target(&t, true, 0.95f) == Catch::Approx(0.6f));
+	CHECK(u_cursor_depth_target(&t, true, 0.999f) == Catch::Approx(0.6f));
+	CHECK(u_cursor_depth_target(&t, true, 3.0f) == Catch::Approx(0.6f)); // a diverging claim
+	CHECK(u_cursor_depth_target(&t, true, INFINITY) == 0.0f);            // non-finite: no content
+
+	// A tuning cannot push the clamp to parallel gaze, and a bad one is the default.
+	auto wide = t;
+	wide.behind_max_disparity = 5.0f;
+	CHECK(u_cursor_depth_target(&wide, true, 3.0f) == Catch::Approx(U_CURSOR_DEPTH_BEHIND_MAX_LIMIT));
+	wide.behind_max_disparity = -1.0f;
+	CHECK(u_cursor_depth_target(&wide, true, 3.0f) == Catch::Approx(U_CURSOR_DEPTH_DEFAULT_BEHIND_MAX));
+	wide.behind_max_disparity = NAN;
+	CHECK(u_cursor_depth_target(&wide, true, 3.0f) == Catch::Approx(U_CURSOR_DEPTH_DEFAULT_BEHIND_MAX));
+}
+
+TEST_CASE("cursor_range: property - BOTH never puts the cursor behind the content, nor past either clamp")
+{
+	const auto t = tuning_both();
+	for (int i = -2000; i <= 2000; i++) {
+		const float d = (float)i * 0.001f; // -2 .. 2
+		const float tgt = u_cursor_depth_target(&t, true, d);
+		CHECK(tgt >= t.min_disparity);
+		CHECK(tgt <= U_CURSOR_DEPTH_DEFAULT_BEHIND_MAX);
+		CHECK(tgt < 1.0f); // place() divides by 1 - d: never parallel gaze, never divergence
+		if (d >= t.min_disparity + t.margin) {
+			CHECK(tgt <= d); // at or in front of the content (smaller d = nearer)
+		}
+		if (d > t.margin && d - t.margin <= U_CURSOR_DEPTH_DEFAULT_BEHIND_MAX) {
+			CHECK(d - tgt == Catch::Approx(t.margin).margin(1e-6)); // exactly a margin in front
+		}
+	}
+}
+
+TEST_CASE("cursor_range: BOTH - the draw threshold is symmetric about the plane")
+{
+	const auto t = tuning_both();
+	CHECK(u_cursor_depth_should_draw(&t, 0.005f));
+	CHECK(u_cursor_depth_should_draw(&t, 0.3f));
+	CHECK(u_cursor_depth_should_draw(&t, -0.005f));
+	CHECK_FALSE(u_cursor_depth_should_draw(&t, 0.0049f));
+	CHECK_FALSE(u_cursor_depth_should_draw(&t, 0.0f));
+	CHECK_FALSE(u_cursor_depth_should_draw(&t, -0.0049f));
+	CHECK_FALSE(u_cursor_depth_should_draw(&t, NAN));
+	CHECK_FALSE(u_cursor_depth_should_draw(&t, INFINITY));
+	// A custom threshold mirrors too; a bad one is the default.
+	auto wide = t;
+	wide.draw_threshold = -0.02f;
+	CHECK_FALSE(u_cursor_depth_should_draw(&wide, 0.019f));
+	CHECK(u_cursor_depth_should_draw(&wide, 0.02f));
+	wide.draw_threshold = 0.01f;
+	CHECK(u_cursor_depth_should_draw(&wide, 0.005f));
+
+	// In the band, heading for the plane: the OS cursor. Heading through it: keep drawing.
+	CHECK_FALSE(u_cursor_depth_should_draw_toward(&t, 0.002f, 0.0f));
+	CHECK_FALSE(u_cursor_depth_should_draw_toward(&t, -0.002f, 0.004f));
+	CHECK(u_cursor_depth_should_draw_toward(&t, 0.002f, 0.2f));
+	CHECK(u_cursor_depth_should_draw_toward(&t, -0.002f, 0.2f));
+	CHECK(u_cursor_depth_should_draw_toward(&t, 0.002f, -0.2f));
+	CHECK_FALSE(u_cursor_depth_should_draw_toward(&t, 0.002f, NAN));
+	CHECK_FALSE(u_cursor_depth_should_draw_toward(&t, NAN, 0.2f));
+}
+
+TEST_CASE("cursor_range: BOTH - crossing the plane never hands the pointer to the OS cursor mid-flight")
+{
+	const auto t = tuning_both();
+	// Front content (-0.1) -> ground behind the glass (+0.2) -> front again.
+	const float contents[] = {-0.1f, 0.2f, -0.1f};
+	u_cursor_depth_filter f{};
+	uint64_t ns = 0;
+	float prev = 0.0f;
+	bool crossed_up = false, crossed_down = false;
+	for (float content : contents) {
+		const float target = u_cursor_depth_target(&t, true, content);
+		for (int k = 0; k < 500; k++) {
+			ns += 4 * MS; // 250 Hz: several samples land inside the +/-0.005 band
+			const float d = u_cursor_depth_filter_step(&f, &t, target, ns);
+			CHECK(u_cursor_depth_should_draw_toward(&t, d, target));
+			crossed_up |= prev < 0.0f && d >= 0.0f;
+			crossed_down |= prev > 0.0f && d <= 0.0f;
+			prev = d;
+		}
+		CHECK(prev == Catch::Approx(target).margin(2e-3));
+	}
+	CHECK(crossed_up);
+	CHECK(crossed_down);
+
+	// Same rule both sides: toward the viewer is fast (never lag behind
+	// content), away from the viewer is slow.
+	u_cursor_depth_filter rise{}, sink{};
+	(void)u_cursor_depth_filter_step(&rise, &t, 0.4f, 0);
+	(void)u_cursor_depth_filter_step(&sink, &t, 0.1f, 0);
+	const float r = u_cursor_depth_filter_step(&rise, &t, 0.1f, 50 * MS); // a unit rises off the ground
+	const float s = u_cursor_depth_filter_step(&sink, &t, 0.4f, 50 * MS); // back onto the ground
+	CHECK(0.4f - r > 2.0f * (s - 0.1f));
+
+	// Content behind sinks back to the plane (nothing under the pointer): the
+	// cursor is handed back once inside the band, and not before.
+	u_cursor_depth_filter back{};
+	(void)u_cursor_depth_filter_step(&back, &t, 0.2f, 0);
+	bool drawn = true;
+	uint64_t n2 = 0;
+	for (int k = 0; k < 400; k++) {
+		n2 += 16 * MS;
+		const float d = u_cursor_depth_filter_step(&back, &t, 0.0f, n2);
+		const bool now = u_cursor_depth_should_draw_toward(&t, d, 0.0f);
+		CHECK(now == (d >= 0.005f));
+		CHECK((drawn || !now)); // once handed back, it stays handed back
+		drawn = now;
+	}
+	CHECK_FALSE(drawn);
+}
+
+TEST_CASE("cursor_range: placement behind the glass - every anchor mode, apparent size constant")
+{
+	const float d = 0.4f; // t = 1 / 0.6: two thirds of a viewing distance behind the glass
+	const float t = 1.0f / (1.0f - d);
+	const float u = 0.3f, v = 0.4f;
+
+	// SCREEN: on the cyclopean ray, past the canvas; uncrossed on the glass.
+	const HeadGeom h0 = head({0.1f, 0.03f, 0.6f}, u, v);
+	xrt_vec3 cs{};
+	float hs = 0.0f;
+	u_cursor_depth_place(&h0.g, d, 0.03f, &cs, &hs);
+	CHECK(cs.z < 0.0f); // behind the glass (the canvas is z = 0, the viewer at +z)
+	float back = 0.0f;
+	REQUIRE(u_cursor_depth_point_disparity(&h0.g, &cs, &back));
+	CHECK(back == Catch::Approx(d).margin(1e-5));
+	CHECK(
+	    hs ==
+	    Catch::Approx(0.03f * h0.g.canvas_height * t).margin(1e-6)); // grows with distance: constant apparent size
+	CHECK(hs == Catch::Approx(0.03f * H * t).margin(1e-5));
+	const xrt_vec3 il = on_glass(h0.el, cs), ir = on_glass(h0.er, cs);
+	CHECK(ir.x - il.x == Catch::Approx(d * 0.064f).margin(1e-6));   // uncrossed: right image to the right
+	CHECK(ir.x - il.x < 0.064f);                                    // never wider than the eyes
+	require_near(on_glass(h0.g.eye, cs), h0.g.canvas_point, 1e-4f); // on the click point
+
+	// WORLD: straight behind the canvas point along the normal.
+	xrt_vec3 cw{};
+	float hw = 0.0f;
+	u_cursor_depth_place_anchored(&h0.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_WORLD, nullptr, u, v, false, 16 * MS, &cw,
+	                              &hw);
+	CHECK(cw.x == Catch::Approx(h0.g.canvas_point.x).margin(1e-6));
+	CHECK(cw.y == Catch::Approx(h0.g.canvas_point.y).margin(1e-6));
+	CHECK(cw.z == Catch::Approx((1.0f - t) * h0.g.eye_to_canvas).margin(1e-4));
+	CHECK(cw.z < 0.0f);
+	REQUIRE(u_cursor_depth_point_disparity(&h0.g, &cw, &back));
+	CHECK(back == Catch::Approx(d).margin(1e-5));
+	CHECK(hw == hs);
+
+	// HYBRID: SCREEN while the pointer moves; then world-fixed under lateral
+	// head motion (s > 1: further along the anchor-time line of sight).
+	u_cursor_depth_anchor anchor{};
+	xrt_vec3 c0{};
+	float hh = 0.0f;
+	u_cursor_depth_place_anchored(&h0.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, 16 * MS, &c0,
+	                              &hh);
+	require_near(c0, cs, 1e-6f);
+	REQUIRE(anchor.has_anchor);
+	uint64_t now = 16 * MS;
+	for (const xrt_vec3 hp : {xrt_vec3{-0.1f, 0.0f, 0.6f}, xrt_vec3{0.2f, -0.06f, 0.6f}}) {
+		now += 16 * MS;
+		const HeadGeom hg = head(hp, u, v);
+		xrt_vec3 c{};
+		u_cursor_depth_place_anchored(&hg.g, d, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, now,
+		                              &c, &hh);
+		require_near(c, c0, 1e-5f); // world-fixed: parallaxes like the ground it rests on
+		CHECK(c.z < 0.0f);
+	}
+	// A depth change under the still pointer slides it along the anchor-time
+	// line: from the anchor-time eye it stays on the click point, on both
+	// sides of the glass and through it.
+	const HeadGeom h1 = head({0.2f, -0.06f, 0.6f}, u, v);
+	for (float dd : {0.6f, 0.1f, 0.0f, -0.3f}) {
+		now += 16 * MS;
+		xrt_vec3 c{};
+		u_cursor_depth_place_anchored(&h1.g, dd, 0.03f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &anchor, u, v, false, now,
+		                              &c, &hh);
+		require_near(on_glass(h0.g.eye, c), h0.g.canvas_point, 1e-4f);
+		REQUIRE(u_cursor_depth_point_disparity(&h1.g, &c, &back));
+		CHECK(back == Catch::Approx(dd).margin(1e-4));
+	}
+}
+
+TEST_CASE("cursor_range: a placement behind the glass is drawable, uncrossed in the tiles, softened like its mirror")
+{
+	const float u = 0.58f, v = 0.75f;
+	const u_cursor_depth_view views[2] = {kooima({-0.032f, 0.05f, 0.6f}), kooima({0.032f, 0.05f, 0.6f})};
+	u_cursor_depth_geometry g{};
+	REQUIRE(u_cursor_depth_geometry_solve(&views[0], &views[1], u, v, &g));
+
+	u_cursor_draw_view front[2]{}, behind[2]{};
+	for (float d : {-0.6f, 0.6f, U_CURSOR_DEPTH_BEHIND_MAX_LIMIT}) {
+		xrt_vec3 c{};
+		float hgt = 0.0f;
+		u_cursor_depth_place(&g, d, 0.03f, &c, &hgt);
+		const float unit = g.canvas_height / (1.0f - d);
+		u_cursor_draw_view out[2]{};
+		REQUIRE(u_cursor_draw_placement_drawable(views, 2, &c, &g.orientation, unit, out));
+		CHECK(0.5f * (out[0].origin[0] + out[1].origin[0]) == Catch::Approx(u).margin(2e-3));
+		// One t-scaled canvas height spans one tile height at any depth.
+		CHECK(std::fabs(out[0].axis_y[1]) == Catch::Approx(1.0f).margin(2e-3));
+		if (d < 0.0f) {
+			CHECK(out[0].origin[0] > out[1].origin[0]); // crossed
+			front[0] = out[0];
+			front[1] = out[1];
+		} else {
+			CHECK(out[0].origin[0] < out[1].origin[0]); // uncrossed: behind the glass
+			if (d == 0.6f) {
+				behind[0] = out[0];
+				behind[1] = out[1];
+			}
+		}
+	}
+	// +0.6 and -0.6 are the same on-screen separation, opposite sign ...
+	const float sep_f = front[1].origin[0] - front[0].origin[0];
+	const float sep_b = behind[1].origin[0] - behind[0].origin[0];
+	CHECK(sep_b == Catch::Approx(-sep_f).margin(1e-4));
+	CHECK(sep_b * W == Catch::Approx(0.6f * 0.064f).margin(1e-5)); // 60 % of the eye separation
+
+	// ... so the crosstalk softening (|d|, |ghost px|) is the same both sides.
+	u_cursor_soften_params p;
+	u_cursor_soften_params_default(&p);
+	for (float d : {0.004f, 0.015f, 0.03f, 0.2f, 0.6f}) {
+		const float ghost = d * 640.0f;
+		const u_cursor_soften a = u_cursor_draw_soften_sized(-d, -ghost, 32.0f, &p);
+		const u_cursor_soften b = u_cursor_draw_soften_sized(d, ghost, 32.0f, &p);
+		CHECK(a.alpha == b.alpha);
+		CHECK(a.blur_px == b.blur_px);
+	}
+	u_cursor_draw_request req{};
+	req.requested = true;
+	req.view_count = 2;
+	req.view[0] = behind[0];
+	req.view[1] = behind[1];
+	u_cursor_draw_request reqf = req;
+	reqf.view[0] = front[0];
+	reqf.view[1] = front[1];
+	CHECK(u_cursor_draw_ghost_px(&req, 1920.0f, 1080.0f) ==
+	      Catch::Approx(u_cursor_draw_ghost_px(&reqf, 1920.0f, 1080.0f)).margin(1e-2));
+}
+
+TEST_CASE("cursor_range: measured disparity (Amendment 3) - uncrossed values follow the same rule in px")
+{
+	const float ppb = 1000.0f; // px per eye baseline
+	const auto front = tuning();
+	const auto both = tuning_both();
+	const float margin_px = both.margin * ppb;
+	// FRONT_ONLY: unchanged.
+	CHECK(u_cursor_measure_target_px(&front, true, 150.0f, ppb) == 0.0f);
+	CHECK(u_cursor_measure_target_px(&front, true, -20.0f, ppb) == Catch::Approx(-20.0f - margin_px));
+	// BOTH, in front: unchanged, deadband included.
+	CHECK(u_cursor_measure_target_px(&both, true, -20.0f, ppb) == Catch::Approx(-20.0f - margin_px));
+	CHECK(u_cursor_measure_target_px(&both, true, -0.9f * U_CURSOR_MEASURE_DEADBAND * ppb, ppb) == 0.0f);
+	// BOTH, behind: margin in front of the match; matcher noise within a margin of the glass = the glass.
+	CHECK(u_cursor_measure_target_px(&both, true, 150.0f, ppb) == Catch::Approx(150.0f - margin_px));
+	CHECK(u_cursor_measure_target_px(&both, true, 0.0f, ppb) == 0.0f);
+	CHECK(u_cursor_measure_target_px(&both, true, 0.9f * margin_px, ppb) == 0.0f);
+	CHECK(u_cursor_measure_target_px(&both, true, 5000.0f, ppb) == Catch::Approx(0.6f * ppb)); // clamp
+	CHECK(u_cursor_measure_target_px(&both, false, 150.0f, ppb) == 0.0f);                      // not confident
+	for (float m = -700.0f; m <= 900.0f; m += 12.5f) {
+		const float want = (m / ppb > -U_CURSOR_MEASURE_DEADBAND && !(m > 0.0f))
+		                       ? 0.0f
+		                       : u_cursor_depth_target(&both, true, m / ppb);
+		CHECK(u_cursor_measure_target_px(&both, true, m, ppb) / ppb == Catch::Approx(want).margin(1e-6));
+	}
+}
+
+TEST_CASE("cursor_range weave: the rect flag selects the range; no flag is today's behaviour")
+{
+	CHECK(u_cursor_weave_range_from_flags(0u) == U_CURSOR_DEPTH_RANGE_FRONT_ONLY);
+	CHECK(u_cursor_weave_range_from_flags(U_CURSOR_WEAVE_RECT_FLAG_RANGE_BOTH) == U_CURSOR_DEPTH_RANGE_BOTH);
+	CHECK(u_cursor_weave_range_from_flags(0xfffffffeu) == U_CURSOR_DEPTH_RANGE_FRONT_ONLY); // unknown bits ignored
+	CHECK(u_cursor_weave_range_from_flags(0xffffffffu) == U_CURSOR_DEPTH_RANGE_BOTH);
+
+	// The memo carries the flags of the submit that carried the depth.
+	u_cursor_weave_memo m = {};
+	const u_cursor_weave_rect r = {10, 20, 640, 360};
+	u_cursor_weave_memo_put(&m, 1, &r, true, 25.0f, U_CURSOR_WEAVE_RECT_FLAG_RANGE_BOTH, 1000 * MS);
+	CHECK(m.flags == U_CURSOR_WEAVE_RECT_FLAG_RANGE_BOTH);
+	u_cursor_weave_memo_put(&m, 1, &r, true, 25.0f, 0u, 1016 * MS);
+	CHECK(m.flags == 0u);
+
+	float vps[6];
+	weave_eyes(0.0f, vps);
+	// The page says +40 px (uncrossed: behind the glass) at a 0.1 mm pitch.
+	float content_d = 0.0f;
+	REQUIRE(u_cursor_weave_px_to_baselines(40.0f, 0.0001f, u_cursor_weave_baseline(vps, 2), &content_d));
+	CHECK(content_d > 0.0f);
+
+	// No flag: nothing drawn, exactly as spec v8.
+	u_cursor_depth_tuning t;
+	u_cursor_depth_tuning_defaults(&t);
+	t.range = u_cursor_weave_range_from_flags(0u);
+	u_cursor_weave_state a = {};
+	u_cursor_weave_output out;
+	REQUIRE(wstep(&a, &t, weave_input(vps, content_d, true, 100 * MS), &out));
+	CHECK_FALSE(out.draw);
+	CHECK_FALSE(out.report_drawn);
+	CHECK(out.target == 0.0f);
+
+	// The flag: drawn a margin in front of the ground, uncrossed on the panel.
+	t.range = u_cursor_weave_range_from_flags(U_CURSOR_WEAVE_RECT_FLAG_RANGE_BOTH);
+	u_cursor_weave_state b = {};
+	REQUIRE(wstep(&b, &t, weave_input(vps, content_d, true, 100 * MS), &out));
+	CHECK(out.draw);
+	CHECK(out.report_drawn);
+	CHECK(out.target == Catch::Approx(content_d - t.margin));
+	CHECK(out.disparity == Catch::Approx(out.target));
+	const float sep = out.xy[2] - out.xy[0];
+	CHECK(sep > 0.0f); // right view to the right of the left view
+	CHECK(sep == Catch::Approx(out.disparity * kWeaveIpd).margin(1e-6));
+	CHECK(sep / 0.0001f == Catch::Approx(40.0f - t.margin * kWeaveIpd / 0.0001f).margin(1e-3));
+	CHECK(sep < kWeaveIpd);                                                     // never diverging
+	CHECK(0.5f * (out.xy[0] + out.xy[2]) == Catch::Approx(0.01f).margin(1e-6)); // on the pointer
+	CHECK(out.xy[1] == Catch::Approx(-0.02f).margin(1e-6));
+
+	// A page claiming a diverging depth is clamped at +0.6 baselines.
+	u_cursor_weave_state c = {};
+	REQUIRE(wstep(&c, &t, weave_input(vps, 4.0f, true, 100 * MS), &out));
+	CHECK(out.target == Catch::Approx(U_CURSOR_DEPTH_DEFAULT_BEHIND_MAX));
+	CHECK(out.xy[2] - out.xy[0] == Catch::Approx(0.6f * kWeaveIpd).margin(1e-6));
+
+	// Front content with the flag: the v8 result.
+	u_cursor_depth_tuning tf;
+	u_cursor_depth_tuning_defaults(&tf);
+	u_cursor_weave_state d0 = {}, d1 = {};
+	u_cursor_weave_output of, ob;
+	REQUIRE(wstep(&d0, &tf, weave_input(vps, -0.2f, true, 100 * MS), &of));
+	REQUIRE(wstep(&d1, &t, weave_input(vps, -0.2f, true, 100 * MS), &ob));
+	CHECK(of.target == ob.target);
+	CHECK(of.xy[0] == ob.xy[0]);
+	CHECK(of.xy[2] == ob.xy[2]);
+}
+
+TEST_CASE("cursor_range weave: the hand-back works from behind the glass, and a plane crossing keeps the cursor")
+{
+	u_cursor_depth_tuning t;
+	u_cursor_depth_tuning_defaults(&t);
+	t.range = U_CURSOR_DEPTH_RANGE_BOTH;
+	float vps[6];
+	weave_eyes(0.0f, vps);
+	u_cursor_weave_state st = {};
+	u_cursor_weave_output out;
+	uint64_t ns = 100 * MS;
+	REQUIRE(wstep(&st, &t, weave_input(vps, 0.2f, true, ns), &out));
+	REQUIRE(out.draw);
+
+	// The ground gives way to a unit standing in front of the glass: the
+	// runtime cursor is drawn and reported on every frame of the crossing.
+	for (int k = 0; k < 60; k++) {
+		ns += 16 * MS;
+		REQUIRE(wstep(&st, &t, weave_input(vps, -0.1f, true, ns), &out));
+		CHECK(out.draw);
+		CHECK(out.report_drawn);
+	}
+	CHECK(out.disparity < 0.0f);
+
+	// Then nothing under the pointer: it sinks to the plane and is handed
+	// back, "not drawn" reported at least two frames before the draw stops.
+	int first_unreported = -1, first_undrawn = -1;
+	for (int k = 0; k < 400 && first_undrawn < 0; k++) {
+		ns += 16 * MS;
+		REQUIRE(wstep(&st, &t, weave_input(vps, 0.0f, false, ns), &out));
+		if (!out.report_drawn && first_unreported < 0) {
+			first_unreported = k;
+		}
+		if (!out.draw) {
+			first_undrawn = k;
+		}
+	}
+	REQUIRE(first_undrawn > 0);
+	REQUIRE(first_unreported >= 0);
+	CHECK(first_undrawn - first_unreported >= (int)U_CURSOR_WEAVE_HANDBACK_FRAMES);
+
+	// And the same from behind the glass.
+	u_cursor_weave_state sb = {};
+	ns = 100 * MS;
+	REQUIRE(wstep(&sb, &t, weave_input(vps, 0.2f, true, ns), &out));
+	first_unreported = first_undrawn = -1;
+	for (int k = 0; k < 400 && first_undrawn < 0; k++) {
+		ns += 16 * MS;
+		REQUIRE(wstep(&sb, &t, weave_input(vps, 0.0f, false, ns), &out));
+		CHECK(out.disparity >= 0.0f); // sinking toward the plane from behind, never through it
+		if (!out.report_drawn && first_unreported < 0) {
+			first_unreported = k;
+		}
+		if (!out.draw) {
+			first_undrawn = k;
+		}
+	}
+	REQUIRE(first_undrawn > 0);
+	REQUIRE(first_unreported >= 0);
+	CHECK(first_undrawn - first_unreported >= (int)U_CURSOR_WEAVE_HANDBACK_FRAMES);
 }

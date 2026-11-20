@@ -104,7 +104,9 @@ struct xrt_weave_cursor_rect
 	float disparity_px;   //!< device px between the outermost views, < 0 = in front
 	float sample_u;       //!< diagnostic: where the page sampled it (rect-normalised)
 	float sample_v;
-	uint32_t flags; //!< reserved, 0
+	//! XrCursorDepthWeaveRectDXR::flags. Spec v9 (ADR-046 Amendment 5): bit 0 =
+	//! follow content behind the glass too; other bits reserved, ignored.
+	uint32_t flags;
 };
 
 /*!

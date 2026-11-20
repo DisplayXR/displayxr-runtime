@@ -1335,7 +1335,9 @@ struct ipc_lift_weave_rect
 	uint32_t viewpoint_count; //!< XR_DXR_lift v3: EXPLICIT viewpoints staged for it; 0 = tracked
 	struct xrt_lift_rig rig;  //!< XR_DXR_lift v3 app rig; type NONE = none
 	uint32_t depth_cursor;    //!< XR_DXR_cursor_depth v6: draw the depth cursor on this rect
-	uint32_t reserved;
+	//! XrCursorDepthLiftRectDXR::flags (spec v9: bit 0 = both sides of the glass).
+	//! Took the slot of the former reserved word: the layout is unchanged.
+	uint32_t depth_cursor_flags;
 };
 
 /*!

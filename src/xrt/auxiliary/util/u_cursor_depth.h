@@ -27,6 +27,13 @@
  *    disparity is above the draw threshold, -0.005
  *    (u_cursor_depth_should_draw). The filter keeps stepping while nothing
  *    is drawn, so the drawn cursor hands back smoothly;
+ *  - OPT-IN, a second depth range (ADR-046 Amendment 5, spec v9):
+ *    U_CURSOR_DEPTH_RANGE_BOTH also follows content BEHIND the glass. In
+ *    front nothing changes; behind, target = min(max(d - margin, 0), d_max):
+ *    still margin in FRONT of the content, never behind it, never past the
+ *    recession clamp (+0.6), and the OS cursor stays the cursor for content
+ *    within a margin of the plane. The default, FRONT_ONLY, is the policy
+ *    above bit for bit;
  *  - the sprite's height is scaled by t so its apparent size is constant;
  *  - WHERE laterally it goes is the anchor mode (spec v3):
  *      SCREEN  C = E + t (S - E): on the cyclopean ray. Its image on the glass
@@ -86,6 +93,39 @@ extern "C" {
 #define U_CURSOR_DEPTH_DRAW_THRESHOLD (-0.005f)
 
 /*!
+ * Default recession clamp, eye-baseline units (ADR-046 Amendment 5): the most
+ * UNCROSSED disparity the cursor may reach in U_CURSOR_DEPTH_RANGE_BOTH.
+ *
+ * Mirrors the front clamp (-0.6). A disparity in baseline units is linear in
+ * the vergence offset from the glass (offset in dioptres = -d / viewing
+ * distance), so +0.6 asks of the eyes what -0.6 does, in the easier
+ * direction. And it is an ON-SCREEN bound: the two images sit d x baseline
+ * apart on the panel, so d = 1 is parallel gaze (infinity) and d > 1 would be
+ * divergence; 0.6 keeps the cursor's uncrossed separation at 60 % of the view
+ * baseline (39 mm at a 65 mm IPD), whatever the content does. At t = 2.5 the
+ * cursor is 1.5 viewing distances behind the glass.
+ */
+#define U_CURSOR_DEPTH_DEFAULT_BEHIND_MAX 0.6f
+
+//! The hard ceiling of any configured recession clamp: strictly short of
+//! parallel gaze (d = 1), where t = 1 / (1 - d) has no solution.
+#define U_CURSOR_DEPTH_BEHIND_MAX_LIMIT 0.9f
+
+/*!
+ * Which side of the glass the cursor may be placed on (XR_DXR_cursor_depth
+ * spec v9, ADR-046 Amendment 5). The values equal the
+ * XrCursorDepthRangeModeDXR ones.
+ */
+enum u_cursor_depth_range
+{
+	//! Never behind the glass (Amendment 2 A.1). The default, and the value
+	//! of a zero-initialised tuning.
+	U_CURSOR_DEPTH_RANGE_FRONT_ONLY = 0,
+	//! In front of the glass exactly as FRONT_ONLY, and also behind it.
+	U_CURSOR_DEPTH_RANGE_BOTH = 1,
+};
+
+/*!
  * One located view: the pose and fov exactly as xrLocateViews returns them.
  */
 struct u_cursor_depth_view
@@ -128,6 +168,14 @@ struct u_cursor_depth_tuning
 	float sink_tau_s;
 	//! A gap between steps longer than this re-primes (snaps) the filter, seconds.
 	float stale_s;
+	//! Which side of the glass the cursor may go (Amendment 5). FRONT_ONLY
+	//! (0, the default) is the policy of spec v4-v8 unchanged; any value
+	//! other than BOTH behaves as FRONT_ONLY.
+	enum u_cursor_depth_range range;
+	//! BOTH only: the most uncrossed disparity the cursor may reach (> 0;
+	//! default U_CURSOR_DEPTH_DEFAULT_BEHIND_MAX). <= 0 or non-finite selects
+	//! the default; capped at U_CURSOR_DEPTH_BEHIND_MAX_LIMIT.
+	float behind_max_disparity;
 };
 
 /*!
@@ -219,6 +267,13 @@ u_cursor_depth_point_disparity(const struct u_cursor_depth_geometry *g, const st
  * content_disparity < 0 ? max(content_disparity - margin, min_disparity) : 0,
  * and never above 0 for any tuning. 0 (the canvas) when there is no content
  * under the cursor, or the content is on or behind the canvas.
+ *
+ * With t->range == U_CURSOR_DEPTH_RANGE_BOTH (Amendment 5) content behind the
+ * canvas is followed too: for content_disparity >= 0 the target is
+ * min(max(content_disparity - margin, 0), behind_max). So the cursor is
+ * always at least a margin in FRONT of the content (never behind it), stays
+ * on the canvas for content within a margin of it, and for
+ * content_disparity < 0 the result is FRONT_ONLY's, bit for bit.
  */
 float
 u_cursor_depth_target(const struct u_cursor_depth_tuning *t, bool has_content, float content_disparity);
@@ -228,9 +283,24 @@ u_cursor_depth_target(const struct u_cursor_depth_tuning *t, bool has_content, f
  * True only at or in front of the draw threshold. While false the OS cursor
  * is the cursor; keep stepping the filter regardless so the hand-back is
  * smooth.
+ *
+ * With t->range == U_CURSOR_DEPTH_RANGE_BOTH (Amendment 5) the threshold is
+ * symmetric about the plane: true while |filtered_disparity| >= |threshold|.
  */
 bool
 u_cursor_depth_should_draw(const struct u_cursor_depth_tuning *t, float filtered_disparity);
+
+/*!
+ * u_cursor_depth_should_draw() for a cursor heading to @p target (Amendment
+ * 5). FRONT_ONLY: exactly u_cursor_depth_should_draw(t, filtered_disparity);
+ * @p target is ignored. BOTH: also true while the filtered disparity is inside
+ * the dead band but the TARGET is outside it - a cursor in transit through
+ * the plane (content in front -> content behind, or back) crosses the band in
+ * about a frame, and handing the pointer to the OS cursor for that frame
+ * would blink it.
+ */
+bool
+u_cursor_depth_should_draw_toward(const struct u_cursor_depth_tuning *t, float filtered_disparity, float target);
 
 /*!
  * True if the next u_cursor_depth_filter_step() at @p now_ns will re-prime
@@ -1387,6 +1457,8 @@ struct u_cursor_weave_memo
 	int32_t w, h;
 	bool has_content;
 	float disparity_px;
+	//! XrCursorDepthWeaveRectDXR::flags of that submit (spec v9: the range bit).
+	uint32_t flags;
 	uint64_t stamp_ns;
 };
 
@@ -1397,7 +1469,16 @@ u_cursor_weave_memo_put(struct u_cursor_weave_memo *m,
                         const struct u_cursor_weave_rect *rect,
                         bool has_content,
                         float disparity_px,
+                        uint32_t flags,
                         uint64_t now_ns);
+
+//! XrCursorDepthWeaveRectDXR::flags / XrCursorDepthLiftRectDXR::flags bit 0
+//! (XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR): the rect asks for RANGE_BOTH.
+#define U_CURSOR_WEAVE_RECT_FLAG_RANGE_BOTH 0x00000001u
+
+//! The depth range a rect's flags ask for. Unknown bits are ignored.
+enum u_cursor_depth_range
+u_cursor_weave_range_from_flags(uint32_t flags);
 
 /*!
  * The depth for @p rect_index if @p m holds it for a rect of the same size and
