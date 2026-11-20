@@ -17,6 +17,7 @@
 #include "comp_d3d12_segments.h" // multi-screen M6 (D3D12)
 #include "util/comp_segments_route.h"
 #include "util/comp_texture_target_win32.h" // ADR-060 texture target binding (#2382); #2370 client-presents
+#include "util/comp_texture_target_drag_snap_win32.h" // #2725: drag snap of the reference window
 #include "util/comp_dp_windowless_d3d12.h"  // ADR-060 windowless DP rule (#2382)
 #include "xrt/xrt_screen.h"
 
@@ -586,6 +587,10 @@ struct comp_d3d12_compositor
 		bool flat_unavailable_warned;
 		//! What the last woven bound frame used (under `mutex`).
 		struct comp_texture_target_state state;
+		//! #2725: phase-snaps user drags of the reference window while the
+		//! windowless DP weaves the target (NULL: not armed — anchor fallback,
+		//! or a DP without the snap_window_rect slot).
+		struct comp_tt_drag_snap *drag_snap;
 	} tt;
 
 	//! Transparent session (#573): the DP composes-under-bg. With
@@ -1995,6 +2000,29 @@ d3d12_dp_session_settings(struct comp_d3d12_compositor *c, bool client_presents)
 }
 
 /*!
+ * #2725: the texture target's drag snap — the windowless DP's
+ * snap_window_rect, on the reference window's thread. c->display_processor
+ * never changes for a texture session (it never engages the split) and the
+ * snap is destroyed (detached under its exclusive lock) before the DP is.
+ */
+static bool
+d3d12_tt_drag_snap_cb(void *userdata,
+                      int32_t origin_x,
+                      int32_t origin_y,
+                      int32_t target_x,
+                      int32_t target_y,
+                      int32_t *out_x,
+                      int32_t *out_y)
+{
+	auto *c = static_cast<struct comp_d3d12_compositor *>(userdata);
+	if (c == nullptr || c->display_processor == nullptr) {
+		return false;
+	}
+	return xrt_display_processor_d3d12_snap_window_rect(c->display_processor, origin_x, origin_y, target_x,
+	                                                    target_y, out_x, out_y);
+}
+
+/*!
  * ADR-060 §6 (#2382): the primary DP of a bound texture session, made
  * WINDOWLESS through the session screen's per-screen factory (window = NULL —
  * the factory the segment manager makes its per-screen DPs with). Kept only
@@ -2033,6 +2061,13 @@ d3d12_make_windowless_texture_dp(struct comp_d3d12_compositor *c)
 	    "ADR-060: texture target bound — WINDOWLESS primary D3D12 DP from '%s' (screen at %d,%d %ux%u), phased "
 	    "from the target's present origin; the reference window %p is read, never handed to the vendor",
 	    e->plugin_id, e->screen_left, e->screen_top, e->pixel_width, e->pixel_height, c->tt.frame.ref);
+	// #2725: frames are woven for where the target IS and presented by the
+	// app later, so a drag must keep the window on the weave's phase lattice.
+	// Only a DP with the slot is armed: any other leaves the window free.
+	if (XRT_DP_HAS_SLOT(dp, snap_window_rect) && dp->snap_window_rect != nullptr) {
+		c->tt.drag_snap = comp_tt_drag_snap_create(c->tt.frame.ref, c->tt.frame.x, c->tt.frame.y,
+		                                           d3d12_tt_drag_snap_cb, c, "d3d12");
+	}
 	return true;
 }
 
@@ -5548,6 +5583,8 @@ d3d12_tt_weave(struct comp_d3d12_compositor *c,
 		}
 		if (cov != COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL) {
 			if (d3d12_tt_flat(c, dp_resource, st_rtv, view_width, view_height, tile_columns, tile_rows, &r)) {
+				// #2725: filled flat, not phased — nothing to snap.
+				comp_tt_drag_snap_update(c->tt.drag_snap, woven.ref, woven.x, woven.y, false);
 				d3d12_tt_store_state(c, state | COMP_TEXTURE_TARGET_STATE_FLAT_SEGMENT, &r, &woven);
 				return;
 			}
@@ -5561,6 +5598,8 @@ d3d12_tt_weave(struct comp_d3d12_compositor *c,
 		int32_t ox = 0, oy = 0;
 		comp_texture_target_present_origin(&r, c->tt.panel_left, c->tt.panel_top, &ox, &oy);
 		xrt_display_processor_d3d12_set_present_origin(c->display_processor, ox, oy);
+		// #2725: this frame is phased from the target's origin — drags snap.
+		comp_tt_drag_snap_update(c->tt.drag_snap, woven.ref, woven.x, woven.y, true);
 		if (!c->tt.origin_logged) {
 			c->tt.origin_logged = true;
 			U_LOG_W("ADR-060: windowless texture DP phased from present origin (%d,%d) — target at (%d,%d) "
@@ -8695,6 +8734,8 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 
 	// #2405: detach the drag snap before any DP dies.
 	d3d12_set_snap_provider(c, false);
+	// #2725: same for the texture target's reference-window snap.
+	comp_tt_drag_snap_destroy(&c->tt.drag_snap);
 
 	// Multi-screen M6: segment DPs + crop textures, before the primary DP (the
 	// repaint thread is joined and the GPU idle, so no weave is in flight).

@@ -386,3 +386,29 @@ Differences from D3D12:
   check per vendor DP.
 - **Zero-copy Vulkan frames** have no atlas to fill flat from, so an off-screen target is woven in
   that case (one WARN).
+
+## Amendment 3 (#2725): the runtime snaps drags of a windowless target's reference window
+
+Decision 1 said the runtime never subclasses the reference window, and decision 7 left drag snap
+to the vendor. On the panel that left a windowless target broken while its window was dragged
+(D3D12, Vulkan and GL): each frame is phased for where the target was when it was woven, the app
+presents it later, and by then the window has moved. The anchor path never showed it, because there
+the vendor weaver owns the window and snaps its drags. A windowless DP owns no window, so nobody
+snapped.
+
+- **What changes.** While a texture target is bound to a windowless primary DP that has a
+  `snap_window_rect` slot, the runtime subclasses the reference window's top-level (`GA_ROOT`,
+  comctl32 `SetWindowSubclass`, installed on the window's own thread) and snaps every user move
+  inside its modal move loop. The snap is asked at the target's present origin (window origin +
+  client offset + target offset) and the resulting delta is applied to the window. Resizes are not
+  snapped. Shared by the four in-process tiers: `comp_texture_target_drag_snap_win32.{h,c}`.
+- **What does not change.** Phase math stays in the DP: the runtime only asks the existing slot.
+  Nothing is snapped while the frame is not phased from the target's origin (filled flat, woven per
+  screen, off the 3D screen), under the anchor fallback (the vendor weaver snaps there; two snaps
+  on one window disagree, #2593), on the hub's client-presents route, for a window that is not
+  per-monitor DPI aware, or by a DP without the slot or one that declines. In all of those the
+  window moves exactly as before. The window is still never reparented or handed to a DP.
+- **Lifetime.** The subclass leaves on `WM_NCDESTROY` when the app destroys its window first,
+  when the target moves to another reference window, and at session teardown. If the window's
+  thread cannot be reached at teardown, the subclass is left inert and the runtime module stays
+  loaded for the process, so the window can never call into unloaded code.

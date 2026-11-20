@@ -283,6 +283,22 @@ elseif(XRT_HAVE_LINUX AND NOT ANDROID)
 endif()
 
 ###
+# ADR-060 texture target drag phase-snap (#2725): subclasses the app's
+# reference window so user drags of it snap through the windowless display
+# processor's snap_window_rect slot. Shared by the in-process D3D11, D3D12, GL
+# and Vulkan compositors; its own tiny library for the same reason as
+# comp_cursor_look (comp_gl does not link comp_util).
+#
+if(WIN32)
+	add_library(
+		comp_tt_drag_snap STATIC util/comp_texture_target_drag_snap_win32.c
+					 util/comp_texture_target_drag_snap_win32.h
+		)
+	target_link_libraries(comp_tt_drag_snap PUBLIC xrt-interfaces PRIVATE aux_util user32 comctl32)
+	target_include_directories(comp_tt_drag_snap PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
+###
 # Shared desktop-Linux service window (#710, #967): the runtime-owned X11
 # surface (Xorg or XWayland) the service's comp_multi shared spatial surface
 # presents to, plus the comp_target_swapchain it drives. The comp_macos_window

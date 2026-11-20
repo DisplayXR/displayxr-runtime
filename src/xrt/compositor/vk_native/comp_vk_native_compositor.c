@@ -35,6 +35,7 @@
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
 #include "util/comp_texture_target_win32.h"   // ADR-060 texture target binding (#2721)
+#include "util/comp_texture_target_drag_snap_win32.h" // #2725: drag snap of the reference window
 #include "util/comp_dp_windowless_vk.h"       // ADR-060 windowless DP rule (#2721)
 #include "util/comp_texture_target_screens.h" // ADR-060 coverage of the 3D screen (#2721)
 #endif
@@ -692,6 +693,10 @@ struct comp_vk_native_compositor
 		bool flat_unavailable_warned;
 		//! What the last woven bound frame used (under `mutex`).
 		struct comp_texture_target_state state;
+		//! #2725: phase-snaps user drags of the reference window while the
+		//! windowless DP weaves the target (NULL: not armed — anchor fallback,
+		//! or a DP without the snap_window_rect slot).
+		struct comp_tt_drag_snap *drag_snap;
 	} tt;
 #endif
 
@@ -13444,6 +13449,10 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 					                COMP_TEXTURE_TARGET_STATE_FLAT_SEGMENT |
 					                (c->tt.weave_r.clamped ? COMP_TEXTURE_TARGET_STATE_CLAMPED : 0);
 				}
+				// #2725: drags snap while the frame is phased from the
+				// target's origin (anything but the flat fill).
+				comp_tt_drag_snap_update(c->tt.drag_snap, c->tt.weave_named.ref, c->tt.weave_named.x,
+				                         c->tt.weave_named.y, !tt_flat);
 			}
 		}
 #endif
@@ -14618,6 +14627,8 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	if (c->owns_window && c->own_window != NULL) {
 		comp_d3d11_window_set_snap_provider(c->own_window, NULL, NULL);
 	}
+	// #2725: same for the texture target's reference-window snap.
+	comp_tt_drag_snap_destroy(&c->tt.drag_snap);
 #endif
 #ifdef VK_NATIVE_HAVE_SEGMENTS
 	// Multi-screen M2: the segment DPs go first (they share the DP pool). No
@@ -14805,6 +14816,41 @@ apply_window_pos_override(int32_t *left, int32_t *top)
 
 #ifdef XRT_OS_WINDOWS
 /*!
+ * #2725: the texture target's drag snap — the windowless DP's
+ * snap_window_rect, on the reference window's thread. c->display_processor
+ * never changes after the lazy create, and the snap is destroyed (detached
+ * under its exclusive lock) before the DP is.
+ */
+static bool
+vk_tt_drag_snap_cb(void *userdata,
+                   int32_t origin_x,
+                   int32_t origin_y,
+                   int32_t target_x,
+                   int32_t target_y,
+                   int32_t *out_x,
+                   int32_t *out_y)
+{
+	struct comp_vk_native_compositor *c = (struct comp_vk_native_compositor *)userdata;
+	if (c == NULL || c->display_processor == NULL) {
+		return false;
+	}
+	return xrt_display_processor_vk_snap_window_rect((struct xrt_display_processor_vk *)c->display_processor,
+	                                                 origin_x, origin_y, target_x, target_y, out_x, out_y);
+}
+
+//! #2725: does the (Vulkan-variant) DP carry a snap_window_rect slot at all?
+static bool
+vk_dp_has_snap_slot(struct xrt_display_processor *dp)
+{
+	struct xrt_display_processor_vk *v = (struct xrt_display_processor_vk *)dp;
+	if (v == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&v->snap_window_rect + sizeof(v->snap_window_rect);
+	return slot_end <= (const char *)v + v->base.struct_size && v->snap_window_rect != NULL;
+}
+
+/*!
  * ADR-060 §6 (#2721): the primary DP of a bound texture session, made
  * WINDOWLESS through the session screen's per-screen factory (window = NULL —
  * the factory the segment manager makes its per-screen DPs with). Kept only
@@ -14846,6 +14892,17 @@ vk_tt_make_windowless_dp(struct comp_vk_native_compositor *c)
 	    "ADR-060: texture target bound — WINDOWLESS primary Vulkan DP from '%s' (screen at %d,%d %ux%u), phased "
 	    "from the target's present origin; the reference window %p is read, never handed to the vendor",
 	    e->plugin_id, e->screen_left, e->screen_top, e->pixel_width, e->pixel_height, c->tt.frame.ref);
+	// #2725: frames are woven for where the target IS and presented by the
+	// app later, so a drag must keep the window on the weave's phase lattice.
+	// Only a DP with the slot is armed: any other leaves the window free.
+	if (vk_dp_has_snap_slot(dp)) {
+		c->tt.drag_snap = comp_tt_drag_snap_create(c->tt.frame.ref, c->tt.frame.x, c->tt.frame.y,
+		                                           vk_tt_drag_snap_cb, c, "vk");
+	} else {
+		U_LOG_W(
+		    "ADR-060 (#2725, vk): the windowless Vulkan DP has no snap_window_rect slot — drags of the "
+		    "reference window are not phase-snapped");
+	}
 	return true;
 }
 #endif

@@ -240,3 +240,8 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		target_compile_definitions(comp_vk_native PRIVATE XRT_BUILD_DRIVER_QWERTY)
 	endif()
 endif()
+
+# ADR-060 texture target drag phase-snap of the app's reference window (#2725).
+if(WIN32 AND TARGET comp_vk_native)
+	target_link_libraries(comp_vk_native PRIVATE comp_tt_drag_snap)
+endif()
