@@ -52,6 +52,7 @@
  */
 
 #include "oxr_objects.h"
+#include "oxr_weave_chain.h"
 #include "oxr_logger.h"
 #include "oxr_xret.h"
 #include "oxr_weave_latch.h"
@@ -207,6 +208,15 @@ comp_ipc_client_compositor_weave_cursor_sprite_texture(struct xrt_compositor *xc
 xrt_result_t
 comp_ipc_client_compositor_weave_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state);
 
+#ifdef XRT_OS_LINUX_DESKTOP
+struct xrt_weave_dmabuf_desc;
+// XR_DXR_cursor_depth v10: the texture carrier as a dma-buf (desktop Linux).
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_sprite_dmabuf(struct xrt_compositor *xc,
+                                                      const struct xrt_weave_dmabuf_desc *desc,
+                                                      const struct xrt_weave_cursor_sprite_texture *info);
+#endif
+
 xrt_result_t
 comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *xc,
                                                          uint32_t rect_count,
@@ -346,6 +356,19 @@ static_assert(sizeof(XrWeaveOverlayDmabufDescDXR) == sizeof(XrWeaveDmabufDescDXR
 static_assert(offsetof(XrWeaveOverlayDmabufDescDXR, bufferId) == offsetof(XrWeaveDmabufDescDXR, bufferId),
               "dmabuf desc layouts diverged");
 static_assert(XR_WEAVE_DMABUF_MAX_PLANES_DXR == XRT_WEAVE_DMABUF_MAX_PLANES, "plane bound mismatch");
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+// XrCursorDepthWeaveSpriteDmabufDescDXR (XR_DXR_cursor_depth v10) is the same
+// layout under a third structure type, for the same reason.
+static_assert(sizeof(XrCursorDepthWeaveSpriteDmabufDescDXR) == sizeof(XrWeaveDmabufDescDXR),
+              "sprite dmabuf desc layout diverged");
+static_assert(offsetof(XrCursorDepthWeaveSpriteDmabufDescDXR, fd) == offsetof(XrWeaveDmabufDescDXR, fd) &&
+                  offsetof(XrCursorDepthWeaveSpriteDmabufDescDXR, drmModifier) ==
+                      offsetof(XrWeaveDmabufDescDXR, drmModifier) &&
+                  offsetof(XrCursorDepthWeaveSpriteDmabufDescDXR, strides) == offsetof(XrWeaveDmabufDescDXR, strides) &&
+                  offsetof(XrCursorDepthWeaveSpriteDmabufDescDXR, bufferId) == offsetof(XrWeaveDmabufDescDXR, bufferId),
+              "sprite dmabuf desc layout diverged");
+#endif
 
 /*!
  * Validate one v10 input descriptor and convert it (fd included) to the xrt
@@ -861,8 +884,9 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	 * every platform writes -1 into what it has nothing for — so they are read
 	 * unconditionally below.
 	 */
-	const XrWeaveDmabufDescDXR *dmabuf_in =
-	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_WEAVE_DMABUF_DESC_DXR, XrWeaveDmabufDescDXR);
+	// The INPUT's descriptor, by its type, anywhere on the chain. The cursor
+	// sprite's dma-buf has another type (oxr_weave_chain.h) and is never it.
+	const XrWeaveDmabufDescDXR *dmabuf_in = oxr_weave_chain_input_dmabuf(submitInfo);
 	const XrWeaveOverlayDmabufDescDXR *dmabuf_ov = OXR_GET_INPUT_FROM_CHAIN(
 	    submitInfo, XR_TYPE_WEAVE_OVERLAY_DMABUF_DESC_DXR, XrWeaveOverlayDmabufDescDXR);
 	const XrWeaveSubmitSyncDXR *sync_in =
@@ -1128,9 +1152,34 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			                 "xrWeaveSubmitDXR: XrCursorDepthWeaveSpriteDXR::kind (%d) is not a valid kind",
 			                 (int)sp->kind);
 		}
+		bool sprite_texture_missing = sp->texture == NULL;
+#ifdef XRT_OS_LINUX_DESKTOP
+		// Spec v10: a dma-buf carrier is described by its OWN struct type,
+		// XrCursorDepthWeaveSpriteDmabufDescDXR, found by type anywhere on the
+		// submit's chain (oxr_weave_chain.h: a next chain is one list, so the
+		// input's XrWeaveDmabufDescDXR is never taken for it, nor the reverse,
+		// whatever the order of the links). The texture field is then ignored,
+		// exactly as inputTexture is for a dma-buf input.
+		const XrCursorDepthWeaveSpriteDmabufDescDXR *sprite_dmabuf = NULL;
+		if (sp->kind == XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR) {
+			const XrCursorDepthWeaveSpriteDmabufDescDXR *sd = oxr_weave_chain_sprite_dmabuf(submitInfo);
+			const char *why = NULL;
+			const enum oxr_weave_sprite_carrier carrier =
+			    oxr_weave_sprite_carrier_linux(sp->textureKind, sd != NULL, &why);
+			if (carrier == OXR_WEAVE_SPRITE_CARRIER_INVALID) {
+				return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+				                 "xrWeaveSubmitDXR: TEXTURE sprite: %s",
+				                 why != NULL ? why : "invalid carrier");
+			}
+			if (carrier == OXR_WEAVE_SPRITE_CARRIER_DMABUF) {
+				sprite_dmabuf = sd;
+				sprite_texture_missing = false;
+			}
+		}
+#endif
 		if (sp->kind == XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR &&
-		    (sp->texture == NULL || sp->extent.width <= 0 || sp->extent.height <= 0 || sp->extent.width > 256 ||
-		     sp->extent.height > 256 || !weave_handle_kind_ok(sp->textureKind))) {
+		    (sprite_texture_missing || sp->extent.width <= 0 || sp->extent.height <= 0 ||
+		     sp->extent.width > 256 || sp->extent.height > 256 || !weave_handle_kind_ok(sp->textureKind))) {
 			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
 			                 "xrWeaveSubmitDXR: a TEXTURE sprite needs a texture handle this platform accepts and "
 			                 "an extent of 1..256 x 1..256 (got %dx%d, kind %d)",
@@ -1160,8 +1209,10 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			// as sent; the service ignores bits it does not know.
 			xreq.rects[i].flags = e->flags;
 		}
-#if defined(XR_USE_PLATFORM_WIN32)
-		// The texture carrier crosses once per generation, with its handle.
+#if defined(XR_USE_PLATFORM_WIN32) || defined(XR_USE_PLATFORM_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+		// The texture carrier crosses once per generation, with its handle
+		// (Windows since v8; macOS and desktop Linux since v10). The handle
+		// stays the caller's on every platform.
 		if (sp->kind == XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR &&
 		    sp->generation != sess->weave.cursor_tex_generation_sent) {
 			struct xrt_weave_cursor_sprite_texture ti;
@@ -1172,9 +1223,35 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			ti.hot_x = sp->hotSpotPx.x;
 			ti.hot_y = sp->hotSpotPx.y;
 			ti.size_m = sp->sizeMeters;
+#if defined(XR_USE_PLATFORM_WIN32)
 			ti.is_dxgi = sp->textureKind == XR_WEAVE_HANDLE_KIND_D3D11_DXGI_DXR ? 1u : 0u;
 			xrt_result_t tx = comp_ipc_client_compositor_weave_cursor_sprite_texture(
 			    &sess->xcn->base, (xrt_graphics_buffer_handle_t)sp->texture, &ti);
+#elif defined(XR_USE_PLATFORM_MACOS)
+			// An IOSurfaceRef (PLATFORM_DEFAULT = IOSURFACE).
+			xrt_result_t tx = comp_ipc_client_compositor_weave_cursor_sprite_texture(
+			    &sess->xcn->base, (xrt_graphics_buffer_handle_t)(intptr_t)sp->texture, &ti);
+#else
+			// A dma-buf with its descriptor, or (no descriptor) a same-driver
+			// Vulkan OPAQUE_FD passed as (void *)(intptr_t)fd.
+			xrt_result_t tx;
+			if (sprite_dmabuf != NULL) {
+				struct xrt_weave_dmabuf_desc sd;
+				const char *why = NULL;
+				// Same layout as XrWeaveDmabufDescDXR (pinned above): one reader.
+				if (!weave_dmabuf_from_xr((const XrWeaveDmabufDescDXR *)sprite_dmabuf, &sd, &why) ||
+				    sd.width < ti.width || sd.height < ti.height) {
+					return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+					                 "xrWeaveSubmitDXR: the TEXTURE sprite's dma-buf descriptor "
+					                 "is invalid: %s",
+					                 why != NULL ? why : "it is smaller than the sprite's extent");
+				}
+				tx = comp_ipc_client_compositor_weave_cursor_sprite_dmabuf(&sess->xcn->base, &sd, &ti);
+			} else {
+				tx = comp_ipc_client_compositor_weave_cursor_sprite_texture(
+				    &sess->xcn->base, (xrt_graphics_buffer_handle_t)(intptr_t)sp->texture, &ti);
+			}
+#endif
 			if (tx == XRT_ERROR_IPC_FAILURE) {
 				OXR_CHECK_XRET_MSG(&log, sess, tx, "xrWeaveSubmitDXR: cursor sprite texture failed (xrt_result=%d)",
 				                   (int)tx);

@@ -3,8 +3,8 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_cursor_depth` |
-| Spec Version | 9 |
-| Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) · `XR_TYPE_CURSOR_DEPTH_SOURCE_DXR` (1004999322, v2) · `XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR` (1004999323, v3) · `XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR` (1004999324, v5) · `XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR` (1004999325, v5) · `XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR` (1004999326, v6) · `XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR` (1004999327, v6) · `XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR` (1004999328, v8) · `XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR` (1004999329, v8) · `XR_TYPE_CURSOR_DEPTH_RANGE_DXR` (1004999390, v9) |
+| Spec Version | 10 |
+| Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) · `XR_TYPE_CURSOR_DEPTH_SOURCE_DXR` (1004999322, v2) · `XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR` (1004999323, v3) · `XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR` (1004999324, v5) · `XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR` (1004999325, v5) · `XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR` (1004999326, v6) · `XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR` (1004999327, v6) · `XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR` (1004999328, v8) · `XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR` (1004999329, v8) · `XR_TYPE_CURSOR_DEPTH_RANGE_DXR` (1004999390, v9) · `XR_TYPE_CURSOR_DEPTH_WEAVE_SPRITE_DMABUF_DESC_DXR` (1004999391, v10) |
 | Author | The DisplayXR Project |
 | Platform | All. Works on every graphics API, in-process and over IPC; solved in the state tracker. |
 | Decision record | [ADR-046](../../adr/ADR-046-depth-aware-cursor.md) |
@@ -308,7 +308,9 @@ HYBRID anchor, the softening and the drawing.
     (`rectIndex` into `XrWeaveSubmitRectsDXR::rects`), `hasContent` and `disparityPx`: the
     on-screen disparity in device pixels between the two outermost views the caller rendered, of
     the nearest content under the cursor footprint, < 0 in front of the glass, > 0 behind it.
-    Raw, not filtered. `sampleUV` is diagnostic. `flags` (spec v9): 0, or
+    Raw, not filtered. `sampleUV` is where the page sampled it, i.e. the pointer in the rect
+    (rect-normalised, v down): diagnostic where the runtime reads the pointer itself, **the
+    pointer** where it cannot (spec v10, below). `flags` (spec v9): 0, or
     `XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR` (0x1) to let this rect's cursor also follow
     content behind the glass (§2.4a); other bits are reserved and ignored. The runtime remembers
     the flags with the rect's depth.
@@ -318,8 +320,55 @@ HYBRID anchor, the softening and the drawing.
   generation the runtime does not hold draws the default look and reports 0, the cue to resend)
   and `drawnBounds` (window px the drawn sprite covers over all views; zero when none).
 
-Runtime behaviour, D3D11 service (the only weave drawer today; other weave backends report
-nothing drawn):
+Runtime behaviour. Three weave engines draw it, from one shared policy
+(`u_cursor_depth`): the Windows D3D11 service (spec v8) and, from **spec v10**, the desktop-Linux
+engine (Vulkan) and the macOS engine (both its Vulkan and its Metal backend). They differ only in
+the two things a platform decides, the pointer source and the texture carrier (the table below).
+The Android engine has no cursor drawer (touch first, no hover cursor): it accepts a request,
+ignores it, and reports `drawnRectMask` 0 and `spriteGeneration` 0.
+
+| | Windows | macOS | desktop Linux |
+|---|---|---|---|
+| Runtime draws from spec | 8 | 10 | 10 |
+| Pointer | `GetCursorPos` in the submit, mapped into the bound window, only while that window is the topmost under it | `CGEventGetLocation` in the submit (global points × the panel's backing scale), against the geometry bound with `XR_DXR_weave`. No bound geometry: the caller's `sampleUV` | **Wayland: the caller's `sampleUV`** (a client, and the service is one, cannot read the pointer). X11 session: `XQueryPointer` on the root in the submit, against the bound geometry. An XWayland client of a Wayland session: the caller's `sampleUV` |
+| `TEXTURE` carrier (`textureKind`) | `D3D11_NT`, `D3D11_DXGI`; `PLATFORM_DEFAULT` = NT | `IOSURFACE`; `PLATFORM_DEFAULT` = IOSurface. One plane, BGRA8 or RGBA8 | `DMABUF`, described by an **`XrCursorDepthWeaveSpriteDmabufDescDXR`** (1004999391) anywhere on the submit's next chain (`texture` ignored; ARGB8888 / ABGR8888 and their X variants; any modifier the runtime's device imports), or `OPAQUE_FD` (a same-driver Vulkan export of an `extent`-sized `B8G8R8A8_UNORM` image with the stage-A usage set, the fd in `texture`). `PLATFORM_DEFAULT` = `DMABUF` with that descriptor, else `OPAQUE_FD` |
+| `OS_CURSOR` carrier | an `HCURSOR` | not a carrier: the held sprite, else the default look | as macOS |
+| Default look | the mirrored OS cursor | the classic arrow (the service cannot read `NSCursor` off the main thread) | the cursor theme's `left_ptr`, else the arrow |
+
+- **The caller as the pointer source (spec v10).** Where the runtime cannot read the pointer, an
+  entry's `sampleUV` is the pointer. The caller then sends, on **every** submit while the pointer
+  is over a rect, that rect's entry with `sampleUV` = the live pointer in the rect, including on a
+  pointer-driven re-weave whose depth is unchanged. A submit that carries no entry with a
+  `sampleUV` inside its rect has no pointer and draws nothing; the 500 ms carry-over below keeps
+  a depth, it does not supply a pointer. Several entries: the topmost rect wins. Sending the
+  entry on every submit is harmless on the platforms that read the pointer, so a caller need not
+  know which kind it is on. `DXR_WEAVE_CURSOR_POINTER=auto|os|caller` in the service's
+  environment overrides the choice (the probes script the pointer through `caller`).
+- **The sprite's dma-buf descriptor has its own type (desktop Linux).**
+  `XrCursorDepthWeaveSpriteDmabufDescDXR` is `XrWeaveDmabufDescDXR` field for field (`fd`,
+  `width`, `height`, `drmFourcc`, `drmModifier`, `planeCount`, `offsets[4]`, `strides[4]`,
+  `bufferId`) under a different structure type, as `XrWeaveOverlayDmabufDescDXR` is for the
+  overlay. The reason is the chain: `XrCursorDepthWeaveRequestDXR` is itself a link of the
+  submit's next chain, so a descriptor "chained on the request" is on the same list as the
+  submit's input descriptor, and two structs of one type on one list are told apart only by
+  their order. With three types (input, overlay, sprite), each at most once, the runtime finds
+  each by type over the whole chain and **the order of the links never matters**: an
+  `XrWeaveDmabufDescDXR` is always the input and never the sprite, and the sprite's descriptor
+  is never the input. A dma-buf sprite with an `OPAQUE_FD` input, and the reverse, are valid.
+  Rules: `textureKind` `DMABUF` without the descriptor, and `OPAQUE_FD` with it, are
+  `XR_ERROR_VALIDATION_FAILURE`; `PLATFORM_DEFAULT` follows the descriptor. `fd` stays the
+  caller's; `bufferId` is reserved (0); the descriptor is read only on a submit whose sprite
+  kind is `TEXTURE` and ignored on `KEEP` / `DEFAULT` / `NONE`. The image must be at least
+  `extent` in size (the top-left `extent` is used).
+- **The handle stays the caller's** on every platform: the runtime takes its own reference inside
+  the call (unlike a dma-buf *input*, which the runtime owns after a successful submit). The
+  pixels are read (macOS) or copied on the GPU (Linux, Windows) once per generation.
+- **No occlusion test off Windows.** Windows draws only while the bound window is the topmost one
+  under the pointer. macOS and Linux do not test it: the sprite is drawn into the caller's own
+  window content, so whatever covers that window covers the sprite, and the caller hides the OS
+  cursor only while the pointer is routed to it.
+
+The rest is the same on all three:
 
 - **Which rect.** At most one cursor per window: the topmost (last in submit order) rect that
   carries an entry and contains the live pointer (`GetCursorPos`, read in the submit, mapped into
@@ -363,7 +412,15 @@ xrWeaveSubmitDXR(session, &submitInfo, &output);
 // Hide the OS cursor while the pointer is inside state.drawnBounds and state.drawnRectMask != 0.
 ```
 
-Reference harness: `test_apps/probes/weave_rpc_probe_d3d11_win --cursor-depth` (Windows).
+Reference harnesses: `test_apps/probes/weave_rpc_probe_d3d11_win --cursor-depth` (Windows);
+`weave_present_vk_macos --cursor front|rear|U,V [--cursor-both] [--cursor-sprite texture]`
+(macOS, batch layout, either backend through `DXR_WEAVE_MAC_BACKEND`) and
+`weave_probe_vk_macos --cursor` (macOS, v6 layout); `weave_probe_vk_linux --cursor` (OPAQUE_FD sprite) and `--cursor-dmabuf` (dma-buf sprite, its
+descriptor chained before the request) (desktop
+Linux, self-checking: FRONT_ONLY over rear content draws nothing, in front it draws crossed, BOTH
+over rear content draws uncrossed). The engines' capture trigger
+(`$TMPDIR/displayxr_atlas_trigger.<client-exe>` in the service's `$TMPDIR`) shows the sprite in
+every view of the pre-weave atlas.
 
 ## 3. Runtime behaviour
 
@@ -482,3 +539,4 @@ Reference: `test_apps/handle/cube_handle_metal_macos` (`DISPLAYXR_CURSOR_DEPTH_D
 | 7 | **Measured disparity** (ADR-046 Amendment 3, Phase 3b). No new struct: a third `XrCursorDepthSourceDXR` kind, `XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR` (2), for stereo content with no depth. The runtime block-matches a cursor-sized patch between the outermost submitted views (confidence-gated; low confidence = the display plane = the OS cursor). In-process Metal, Vulkan, GL, D3D11 and D3D12 compositors; IPC reports no content. §2.3. |
 | 8 | **The runtime draws the web cursor** (ADR-046 Amendment 4). New structs only: `XrCursorDepthWeaveRequestDXR` (1004999328, on `XrWeaveSubmitInfoDXR`: per-rect depth under the pointer in device pixels + the caller's sprite, an `HCURSOR` or a shared texture) and `XrCursorDepthWeaveStateDXR` (1004999329, on `XrWeaveOutputDXR`: drawn rects, sprite generation, drawn window bounds). The runtime reads the pointer in the submit, applies the one policy with the HYBRID anchor and B.7 softening, and hands back two frames early on sink. D3D11 service. §2.8. |
 | 9 | **Opt-in depth range** (ADR-046 Amendment 5). One new struct, `XrCursorDepthRangeDXR` (**1004999390**, on the hint; the extension's second type decade, 320–329 being full): `XR_CURSOR_DEPTH_RANGE_MODE_FRONT_ONLY_DXR` (0, the default: v4–v8 behaviour, bit for bit) or `XR_CURSOR_DEPTH_RANGE_MODE_BOTH_DXR` (1: the cursor also follows content behind the glass, a margin in front of it, clamp +0.6). The same option on weave rects and lifted rects is `XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR` (0x1) in `XrCursorDepthWeaveRectDXR::flags` / `XrCursorDepthLiftRectDXR::flags`, words that were reserved-must-be-zero. No existing struct changed size. A runtime below v9 ignores the struct and the bit (`FRONT_ONLY`); detect with `extensionVersion` ≥ 9. §2.4a, §3. |
+| 10 | **The POSIX weave engines draw the web cursor** (ADR-046 Amendment 6). A support signal, plus one new struct for the Linux carrier (`XrCursorDepthWeaveSpriteDmabufDescDXR`, **1004999391**); no struct changed size. The desktop-Linux weave engine (Vulkan) and the macOS one (Vulkan and Metal backends) draw the v8 weave-rect cursor from the same shared policy as the D3D11 service, the v9 range flag and the B.7 softening included, and accept the `TEXTURE` sprite: an `IOSURFACE` on macOS; on desktop Linux a `DMABUF` described by an `XrCursorDepthWeaveSpriteDmabufDescDXR` anywhere on the submit's chain (its own type, so it is never confused with the input's `XrWeaveDmabufDescDXR` whatever the chain order), or an `OPAQUE_FD`. The handle stays the caller's. **The pointer:** read by the runtime on Windows, macOS and an X11 session; on Wayland the caller is the source through `sampleUV`, sent live on every submit (§2.8). A weave caller on macOS or desktop Linux may rely on the runtime's cursor at specVersion ≥ 10 (Windows: ≥ 8, unchanged). Android reports the same version and ignores a request. |

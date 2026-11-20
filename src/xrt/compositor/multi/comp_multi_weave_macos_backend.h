@@ -74,6 +74,18 @@ struct comp_multi_weave_macos_params
 	uint64_t lift_owner;
 	const struct xrt_lift_weave_rect *lift_rects;
 	//! @}
+
+	/*!
+	 * XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the weave-rect cursor
+	 * the front end planned for this submit (comp_multi_weave_cursor.h), or
+	 * NULL - then the backend does no cursor work at all. Drawn into the
+	 * atlas the DP consumes (the SBS scratch or the v6 crop; the front end
+	 * never asks for zero-copy on a submit that carries a cursor request),
+	 * after the rects and the lifted views, before the capture's atlas stage
+	 * and the weave. A backend that cannot draw it calls
+	 * comp_multi_weave_cursor_not_drawn(&mc->weave.cursor, ...).
+	 */
+	const struct comp_multi_weave_cursor_draw *cursor;
 };
 
 struct comp_multi_weave_macos_backend
@@ -137,6 +149,10 @@ struct comp_multi_weave_macos_backend
 	                         int32_t target_y,
 	                         int32_t *out_x,
 	                         int32_t *out_y);
+
+	//! XR_DXR_cursor_depth v10: no cursor request for 1 s - release the sprite
+	//! the backend holds for it (its pipeline may stay). NULL = nothing held.
+	void (*cursor_release)(struct multi_compositor *mc);
 
 	//! Release every backend object (the DP first-class: it is destroyed before
 	//! the device objects it was created on).

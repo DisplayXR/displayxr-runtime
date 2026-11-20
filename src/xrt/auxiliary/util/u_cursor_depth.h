@@ -1646,6 +1646,118 @@ u_cursor_weave_sprite_resolve(uint32_t kind, uint64_t generation, uint64_t held_
 bool
 u_cursor_weave_sprite_idle(uint64_t last_request_ns, uint64_t now_ns);
 
+/*
+ *
+ * Spec v10 (ADR-046 Amendment 6): the weave-rect cursor on the POSIX weave
+ * engines (desktop Linux, macOS). Pure helpers the engines share: the pointer
+ * when the caller is its source, the per-view sprite box in the atlas the
+ * display processor consumes, and the CPU copy of a caller's sprite pixels.
+ *
+ */
+
+/*!
+ * The pointer, in bound-window pixels, when the weave CALLER is its source
+ * (a window system whose services cannot read the pointer: Wayland). The
+ * caller reports it as each entry's sampleUV (rect-normalised, v down), on
+ * every submit while the pointer is over the rect: an entry of THIS submit
+ * whose uv lies in [0,1]^2 and whose rect is valid. Several: the topmost rect
+ * (highest index) wins. The 500 ms depth carry-over does not supply a
+ * pointer: a submit with no such entry has none (returns false).
+ *
+ * @param entry_rect_index rect index per entry (@p entry_count of them)
+ * @param entry_uv         (u, v) pairs per entry
+ */
+bool
+u_cursor_weave_caller_pointer(const struct u_cursor_weave_rect *rects,
+                              uint32_t rect_count,
+                              const uint32_t *entry_rect_index,
+                              const float *entry_uv,
+                              uint32_t entry_count,
+                              float *out_px,
+                              float *out_py);
+
+/*!
+ * How the views are laid out in the atlas a weave engine hands the display
+ * processor: view i's tile starts at ((i % columns) * tile_w, (i / columns) *
+ * tile_h) atlas px, and one bound-window pixel is (scale_x, scale_y) atlas px.
+ */
+struct u_cursor_weave_tiles
+{
+	uint32_t columns;
+	float tile_w, tile_h;
+	float scale_x, scale_y;
+};
+
+//! The batch (v3) layout: two window-sized tiles side by side, 1:1.
+void
+u_cursor_weave_tiles_batch(uint32_t win_w, uint32_t win_h, struct u_cursor_weave_tiles *out);
+
+/*!
+ * The spec-v6 N-view atlas: @p columns tiles per row of @p content_view_w x
+ * @p content_view_h px, each showing the whole @p win_w x @p win_h window.
+ * False (and a zeroed layout) on a zero dimension.
+ */
+bool
+u_cursor_weave_tiles_nview(uint32_t columns,
+                           uint32_t content_view_w,
+                           uint32_t content_view_h,
+                           uint32_t win_w,
+                           uint32_t win_h,
+                           struct u_cursor_weave_tiles *out);
+
+//! One view's sprite box (atlas px, y down, unpadded) and its scissor.
+struct u_cursor_weave_quad
+{
+	float x, y, w, h;
+	int32_t clip_x, clip_y, clip_w, clip_h;
+};
+
+/*!
+ * Where view @p view's sprite lands in the atlas: the sprite box (@p spr_w x
+ * @p spr_h window px, hotspot @p hot_x, @p hot_y px from its top-left) placed
+ * with its hotspot at window pixel (@p hot_wx, @p hot_wy), mapped into the
+ * view's tile; the scissor is @p clip_win (the hovered rect, window px)
+ * mapped the same way, floored / ceiled to whole atlas pixels. The same
+ * arithmetic as the D3D11 service's weave-rect cursor.
+ *
+ * @return false if the box misses its scissor (nothing of this view is
+ *         drawn), or on a degenerate / non-finite input.
+ */
+bool
+u_cursor_weave_view_quad(const struct u_cursor_weave_tiles *tiles,
+                         uint32_t view,
+                         float hot_wx,
+                         float hot_wy,
+                         float spr_w,
+                         float spr_h,
+                         float hot_x,
+                         float hot_y,
+                         const struct u_cursor_weave_rect *clip_win,
+                         struct u_cursor_weave_quad *out);
+
+/*!
+ * Pad a sprite box by (@p pad_x, @p pad_y) atlas px on every side so a soft
+ * edge is not cut (B.7): @p out_rect = x, y, w, h of the padded box, and
+ * @p out_uv = the sprite uv of its top-left corner and the uv it spans (the
+ * pad lies outside 0..1; the shader treats those taps as transparent). A
+ * negative or non-finite pad is no pad.
+ */
+void
+u_cursor_weave_quad_pad(
+    const struct u_cursor_weave_quad *q, float pad_x, float pad_y, float out_rect[4], float out_uv[4]);
+
+/*!
+ * Copy a caller's sprite (4 bytes per pixel, rows @p stride bytes apart,
+ * @p swap_rb for a BGRA8 source) into tightly packed RGBA8 @p dst (w * h * 4
+ * bytes). The texture carrier's contract makes the pixels premultiplied and
+ * sRGB-encoded already; nothing is converted but the channel order.
+ *
+ * @return false on a NULL pointer, a zero or > 256 dimension, or a stride
+ *         shorter than a row.
+ */
+bool
+u_cursor_weave_copy_pixels(const uint8_t *src, uint32_t w, uint32_t h, size_t stride, bool swap_rb, uint8_t *dst);
+
 #ifdef __cplusplus
 }
 #endif

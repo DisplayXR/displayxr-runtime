@@ -67,14 +67,15 @@
 
 #define XR_USE_PLATFORM_MACOS 1
 #define XR_USE_GRAPHICS_API_VULKAN 1
-#include <openxr/openxr.h>
-#include <openxr/openxr_platform.h>
-#include <openxr/XR_DXR_weave.h>
+#include <openxr/XR_DXR_cursor_depth.h>
 #include <openxr/XR_DXR_display_info.h>
-#include <openxr/XR_DXR_view_rig.h>
-#include <openxr/XR_DXR_local_3d_zone.h>
 #include <openxr/XR_DXR_display_zones.h>
 #include <openxr/XR_DXR_lift.h>
+#include <openxr/XR_DXR_local_3d_zone.h>
+#include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_weave.h>
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -560,9 +561,18 @@ main(int argc, char **argv)
 	int snap_period = 0; // 0/1 = expect identity
 	const char *views_log = NULL; // --views <service log>
 	bool do_lift = false;         // --lift
+	// --cursor: XR_DXR_cursor_depth v10, the weave-rect cursor on the v6
+	// N-view leg (the crop path: a submit with a cursor request never
+	// weaves the caller's atlas in place). The pointer is scripted through
+	// sampleUV; with no --geometry the service has no window to map the
+	// real pointer into and takes it (else start it with
+	// DXR_WEAVE_CURSOR_POINTER=caller).
+	bool do_cursor = false;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--lift") == 0) {
 			do_lift = true;
+		} else if (strcmp(argv[i], "--cursor") == 0) {
+			do_cursor = true;
 		} else if (strcmp(argv[i], "--views") == 0 && i + 1 < argc) {
 			views_log = argv[++i];
 		} else if (strcmp(argv[i], "--snap") == 0) {
@@ -578,7 +588,8 @@ main(int argc, char **argv)
 			}
 			have_geometry = true;
 		} else {
-			LOG("usage: %s [--geometry ox,oy[,display]] [--snap [period]] [--views <service-log>] [--lift]",
+			LOG("usage: %s [--geometry ox,oy[,display]] [--snap "
+			    "[period]] [--views <service-log>] [--lift]",
 			    argv[0]);
 			return 1;
 		}
@@ -634,6 +645,9 @@ main(int argc, char **argv)
 			return 1;
 		}
 		enabled_list.push_back(XR_DXR_LIFT_EXTENSION_NAME);
+	}
+	if (do_cursor) {
+		enabled_list.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
 	}
 	ici.enabledExtensionCount = (uint32_t)enabled_list.size();
 	ici.enabledExtensionNames = enabled_list.data();
@@ -1002,11 +1016,39 @@ main(int argc, char **argv)
 			v6submit.inputIsDxgi = XR_FALSE;
 			v6submit.firstChunk = XR_TRUE;
 
+			// --cursor: one rect (the whole window = one content
+			// view), the pointer at (0.25, 0.5) over content 30 px
+			// in front, default look.
+			XrRect2Di v6rect = {{0, 0}, {(int32_t)cvw, (int32_t)cvh}};
+			XrWeaveSubmitRectsDXR v6rects = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+			XrCursorDepthWeaveRectDXR crect = {};
+			XrCursorDepthWeaveRequestDXR creq = {(XrStructureType)XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR};
+			XrCursorDepthWeaveStateDXR cstate = {(XrStructureType)XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR};
+			if (do_cursor) {
+				crect.rectIndex = 0;
+				crect.hasContent = XR_TRUE;
+				crect.disparityPx = -30.0f;
+				crect.sampleUV = {0.25f, 0.5f};
+				creq.sprite.kind = XR_CURSOR_DEPTH_WEAVE_SPRITE_DEFAULT_DXR;
+				creq.sprite.generation = 1;
+				creq.rectCount = 1;
+				creq.rects = &crect;
+				v6rects.next = &creq;
+				v6rects.rectCount = 1;
+				v6rects.rects = &v6rect;
+				lay.next = &v6rects;
+			}
+
 			IOSurfaceRef v6out = NULL;
 			uint32_t v6w = 0, v6h = 0;
 			bool v6ok = true;
-			for (int frame = 0; frame < 3; frame++) {
+			for (int frame = 0; frame < (do_cursor ? 150 : 3); frame++) {
 				XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+				if (do_cursor) {
+					cstate.drawnRectMask = 0;
+					out.next = &cstate;
+					std::this_thread::sleep_for(std::chrono::milliseconds(16));
+				}
 				XrResult r = pfn_submit(session, &v6submit, &out);
 				if (XR_FAILED(r)) {
 					LOG("v6 FAIL: xrWeaveSubmitDXR frame %d -> %d", frame, (int)r);
@@ -1041,6 +1083,19 @@ main(int argc, char **argv)
 					LOG("v6 FAIL: could not sample output centre");
 					v6ok = false;
 				}
+			}
+			if (v6ok && do_cursor) {
+				const bool drawn =
+				    (cstate.drawnRectMask & 1u) != 0 && cstate.drawnBounds.extent.width > 0;
+				LOG("v6 cursor: drawnRectMask=0x%x "
+				    "spriteGeneration=%llu drawnBounds=%d,%d "
+				    "%dx%d want drawn "
+				    "around (%u,%u) -> %s",
+				    cstate.drawnRectMask, (unsigned long long)cstate.spriteGeneration,
+				    cstate.drawnBounds.offset.x, cstate.drawnBounds.offset.y,
+				    cstate.drawnBounds.extent.width, cstate.drawnBounds.extent.height, cvw / 4, cvh / 2,
+				    drawn ? "OK" : "WRONG");
+				v6ok = drawn;
 			}
 			LOG("v6 N-view atlas: %s", v6ok ? "PASS" : "FAIL");
 			pass = pass && v6ok;

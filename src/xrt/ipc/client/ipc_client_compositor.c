@@ -1177,6 +1177,30 @@ comp_ipc_client_compositor_weave_cursor_sprite_texture(struct xrt_compositor *xc
 	return ipc_call_weave_cursor_sprite_texture(icc->ipc_c, info, &h, 1);
 }
 
+#ifdef XRT_OS_LINUX_DESKTOP
+static void
+weave_pack_dmabuf(struct ipc_weave_dmabuf *dst, const struct xrt_weave_dmabuf_desc *src);
+
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_sprite_dmabuf(struct xrt_compositor *xc,
+                                                      const struct xrt_weave_dmabuf_desc *desc,
+                                                      const struct xrt_weave_cursor_sprite_texture *info)
+{
+	if (xc == NULL || info == NULL || desc == NULL || desc->fd < 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_weave_dmabuf wire;
+	weave_pack_dmabuf(&wire, desc);
+	// SCM_RIGHTS duplicates the fd into the service: it stays the caller's.
+	xrt_graphics_buffer_handle_t h = desc->fd;
+	return ipc_call_weave_cursor_sprite_dmabuf(icc->ipc_c, info, &wire, &h, 1);
+}
+#endif
+
 xrt_result_t
 comp_ipc_client_compositor_weave_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state)
 {

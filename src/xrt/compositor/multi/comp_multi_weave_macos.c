@@ -90,6 +90,7 @@
 #include <CoreGraphics/CoreGraphics.h>
 
 #include <math.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -576,9 +577,217 @@ weave_capture_iosurface(struct multi_compositor *mc, enum comp_multi_weave_captu
 
 /*
  *
+ * XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the weave-rect cursor.
+ *
+ * The macOS twin of the D3D11 service's svc_weave_cursor_draw. The policy, the
+ * sprite bookkeeping and the per-view boxes are comp_multi_weave_cursor.c's
+ * (shared with desktop Linux); the backend draws them. What is macOS here:
+ *
+ *  - THE POINTER is read inside the submit, as on Windows: CGEventGetLocation
+ *    of a fresh event - the global pointer in points, top-left origin, y down,
+ *    readable from any process of the session with no permission - scaled to
+ *    the bound panel's backing pixels and taken against the geometry the
+ *    caller published (xrWeaveSetWindowGeometryDXR, the same rect the phase
+ *    origin uses). A client that published no geometry has no window to map
+ *    the pointer into: it becomes the pointer source itself (each entry's
+ *    sampleUV), as on Wayland. Windows also tests that the bound window is the
+ *    topmost one under the pointer; macOS does not - the sprite is drawn into
+ *    the caller's own window content, so whatever covers that window covers
+ *    the sprite too, and the caller only hides the OS cursor while the pointer
+ *    is routed to it.
+ *  - THE TEXTURE CARRIER is an IOSurface whose pixels are read on the CPU
+ *    when it arrives (comp_multi_weave_macos_set_cursor_sprite), so both
+ *    backends upload the same bytes.
+ *
+ */
+
+/*!
+ * Consume this submit's cursor request and, if there is one, plan the draw.
+ * Returns true when the submit carries a request (it then never weaves the v6
+ * input in place); @p out_draw.quad_count > 0 when something is to be drawn.
+ * @p fb_w x @p fb_h: the output (= the window for a batch submit).
+ */
+static bool
+weave_cursor_begin_locked(struct multi_compositor *mc,
+                          uint32_t rect_count,
+                          const struct xrt_rect *rects,
+                          const struct xrt_weave_atlas_layout *layout,
+                          uint32_t fb_w,
+                          uint32_t fb_h,
+                          uint32_t lift_count,
+                          const struct xrt_lift_weave_rect *lift_rects,
+                          struct comp_multi_weave_cursor_draw *out_draw)
+{
+	memset(out_draw, 0, sizeof(*out_draw));
+	const struct comp_multi_weave_macos_backend *be = mc->weave.backend;
+	const uint64_t now_ns = os_monotonic_get_ns();
+	struct xrt_weave_cursor_request req;
+	bool released = false;
+	if (!comp_multi_weave_cursor_begin(&mc->weave.cursor, now_ns, &req, &released)) {
+		if (released && be->cursor_release != NULL) {
+			be->cursor_release(mc); // submits are synchronous: nothing is in flight
+		}
+		return false;
+	}
+
+	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+	const bool geo = mc->weave.have_geometry && mc->weave.win_w != 0 && mc->weave.win_h != 0;
+	struct comp_multi_weave_cursor_frame f;
+	memset(&f, 0, sizeof(f));
+	f.client = mc->weave.capture.tag;
+	f.rects = rect_count > 0 ? rects : NULL;
+	f.rect_count = rect_count;
+	f.now_ns = now_ns;
+	f.flat_2d = mc->weave.hw_2d_confirmed;
+	const bool nview = layout != NULL && layout->view_count > 0;
+	if (nview) {
+		// The rects are in window px; the tiles are content views of the window.
+		f.win_w = geo ? mc->weave.win_w : fb_w;
+		f.win_h = geo ? mc->weave.win_h : fb_h;
+		(void)u_cursor_weave_tiles_nview(layout->tile_columns, layout->content_view_w, layout->content_view_h,
+		                                 f.win_w, f.win_h, &f.tiles);
+		f.view_count = layout->view_count;
+	} else {
+		// Batch: the input IS the window, two tiles of it side by side.
+		f.win_w = fb_w;
+		f.win_h = fb_h;
+		u_cursor_weave_tiles_batch(fb_w, fb_h, &f.tiles);
+		f.view_count = 2;
+	}
+	for (uint32_t k = 0; k < lift_count; k++) {
+		if (lift_rects[k].depth_cursor && lift_rects[k].rect_index < 32) {
+			f.lift_rect_mask |= 1u << lift_rects[k].rect_index;
+		}
+	}
+
+	// The weave frame: the window's centre on the panel, display axes, metres -
+	// the same re-base the per-window Kooima uses (ipc_try_get_oop_view_poses).
+	if (info->display_pixel_width > 0 && info->display_width_m > 0.0f) {
+		f.m_per_px = info->display_width_m / (float)info->display_pixel_width;
+		f.width_m = (float)f.win_w * f.m_per_px;
+		f.height_m = (float)f.win_h * f.m_per_px;
+		f.frame_valid = true;
+		int32_t wx = 0, wy = 0;
+		uint32_t ww = 0, wh = 0, pw = 0, ph = 0;
+		if (comp_multi_weave_macos_window_on_panel(mc, &wx, &wy, &ww, &wh, &pw, &ph)) {
+			// +x right in both frames; y negated: screen pixels run down.
+			f.center[0] = ((float)wx + (float)ww * 0.5f - (float)pw * 0.5f) * f.m_per_px;
+			f.center[1] = -(((float)wy + (float)wh * 0.5f - (float)ph * 0.5f) * f.m_per_px);
+		}
+	}
+	const bool have_panel = mc->weave.have_present_origin && mc->weave.present_panel_scale > 0.0;
+	f.backing_scale = have_panel ? (float)mc->weave.present_panel_scale : 0.0f;
+
+	// The pointer (see the block comment above).
+	const bool os_available = geo && have_panel;
+	if (comp_multi_weave_cursor_pointer_is_caller(os_available)) {
+		f.pointer = COMP_MULTI_WEAVE_CURSOR_POINTER_CALLER;
+	} else {
+		f.pointer = COMP_MULTI_WEAVE_CURSOR_POINTER_OS;
+		CGEventRef ev = os_available ? CGEventCreate(NULL) : NULL;
+		if (ev != NULL) {
+			const CGPoint pt = CGEventGetLocation(ev);
+			CFRelease(ev);
+			const double s = mc->weave.present_panel_scale;
+			// Geometry px -> the rects' px (they differ only for a v6 submit
+			// whose caller reported a geometry of another size than its window).
+			const float gx = (float)(pt.x * s - (double)mc->weave.win_x);
+			const float gy = (float)(pt.y * s - (double)mc->weave.win_y);
+			f.os_pointer_read = true;
+			f.os_x = gx * (float)f.win_w / (float)mc->weave.win_w;
+			f.os_y = gy * (float)f.win_h / (float)mc->weave.win_h;
+			f.os_pointer_over_window =
+			    f.os_x >= 0.0f && f.os_y >= 0.0f && f.os_x < (float)f.win_w && f.os_y < (float)f.win_h;
+		}
+	}
+
+	struct xrt_eye_positions eyes;
+	memset(&eyes, 0, sizeof(eyes));
+	if (be->get_eyes(mc, &eyes)) {
+		f.eyes = &eyes;
+	}
+	(void)comp_multi_weave_cursor_plan(&mc->weave.cursor, &req, &f, out_draw);
+	return true;
+}
+
+
+/*
+ *
  * Public entry points (called from ipc_server_handler.c).
  *
  */
+
+void
+comp_multi_weave_set_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL || req == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	comp_multi_weave_cursor_set_request(&mc->weave.cursor, req);
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+void
+comp_multi_weave_get_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state)
+{
+	memset(out_state, 0, sizeof(*out_state));
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL || !mc->weave.mutex_initialized) {
+		return;
+	}
+	os_mutex_lock(&mc->weave.mutex);
+	comp_multi_weave_cursor_get_state(&mc->weave.cursor, out_state);
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+void
+comp_multi_weave_macos_set_cursor_sprite(struct xrt_compositor *xc,
+                                         xrt_graphics_buffer_handle_t handle,
+                                         const struct xrt_weave_cursor_sprite_texture *info)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	IOSurfaceRef surface = (IOSurfaceRef)handle;
+	if (mc == NULL || mc->msc == NULL || surface == NULL || info == NULL) {
+		return;
+	}
+	// Read the carrier's pixels now (the surface is borrowed): 4 bytes per
+	// pixel, one plane, BGRA unless it says RGBA - the rule of the capture's
+	// IOSurface reads. Premultiplied and sRGB-encoded by contract.
+	const OSType fmt = IOSurfaceGetPixelFormat(surface);
+	const uint32_t sw = (uint32_t)IOSurfaceGetWidth(surface), sh = (uint32_t)IOSurfaceGetHeight(surface);
+	struct xrt_weave_cursor_sprite_texture ti = *info;
+	ti.width = ti.width < sw ? ti.width : sw;
+	ti.height = ti.height < sh ? ti.height : sh;
+	if (IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) > 1 || ti.width == 0 ||
+	    ti.height == 0 || ti.width > 256 || ti.height > 256) {
+		U_LOG_W(
+		    "[weave cursor] sprite IOSurface refused: %ux%u, pixel format 0x%08x, %zu bytes/element (need a "
+		    "one-plane BGRA8 / RGBA8 surface of at most 256 x 256)",
+		    sw, sh, (unsigned)fmt, (size_t)IOSurfaceGetBytesPerElement(surface));
+		return;
+	}
+	uint32_t seed = 0;
+	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) {
+		U_LOG_W("[weave cursor] sprite IOSurface could not be locked - keeping the last look");
+		return;
+	}
+	uint8_t *rgba = (uint8_t *)malloc((size_t)ti.width * ti.height * 4);
+	const bool swap_rb = fmt != (OSType)0x52474241; // 'RGBA'; 'BGRA' and unspecified are BGRA
+	const bool copied =
+	    rgba != NULL && u_cursor_weave_copy_pixels((const uint8_t *)IOSurfaceGetBaseAddress(surface), ti.width,
+	                                               ti.height, IOSurfaceGetBytesPerRow(surface), swap_rb, rgba);
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, &seed);
+	if (copied) {
+		weave_ensure_mutex(mc);
+		os_mutex_lock(&mc->weave.mutex);
+		(void)comp_multi_weave_cursor_stage_texture(&mc->weave.cursor, &ti, rgba);
+		os_mutex_unlock(&mc->weave.mutex);
+	}
+	free(rgba);
+}
 
 bool
 comp_multi_weave_bind_window(struct xrt_compositor *xc, uint64_t window_id)
@@ -858,6 +1067,14 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		weave_recheck_panel_locked(mc);
 		weave_resolve_present_origin_locked(mc);
 
+		// XR_DXR_cursor_depth v10: this submit's weave-rect cursor. A submit
+		// that chained no request costs the one test inside (ADR-046 section
+		// 0); one that did never weaves the caller's buffer in place - the
+		// cursor is drawn into the crop copy, never into the caller's input.
+		struct comp_multi_weave_cursor_draw cursor_draw;
+		const bool cursor_requested = weave_cursor_begin_locked(mc, rect_count, rects, layout, want_w, want_h,
+		                                                        lift_count, lift_rects, &cursor_draw);
+
 		const struct comp_multi_weave_macos_params params = {
 		    .rect_count = rect_count,
 		    .rects = rects,
@@ -867,8 +1084,8 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		    .nview = nview,
 		    // A v6 frame carrying lifted rects never samples the caller's
 		    // texture in place: the lift writes into the crop copy (spec §6).
-		    .v6_zero_copy =
-		        nview && lift_count == 0 && (packed_w == mc->weave.in_w && packed_h == mc->weave.in_h),
+		    .v6_zero_copy = nview && lift_count == 0 && !cursor_requested &&
+		                    (packed_w == mc->weave.in_w && packed_h == mc->weave.in_h),
 		    .cvw = cvw,
 		    .cvh = cvh,
 		    .packed_w = packed_w,
@@ -882,6 +1099,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		    .lift_count = lift_count,
 		    .lift_owner = lift_owner,
 		    .lift_rects = lift_rects,
+		    .cursor = cursor_requested && cursor_draw.quad_count > 0 ? &cursor_draw : NULL,
 		};
 		// #2470: the caller's buffer as received (its GPU writes completed
 		// before the submit — the macOS input contract), before any un-squeeze,
@@ -1072,6 +1290,7 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 	}
 	mc->weave.overlay_iosurface_id = 0;
 	comp_multi_weave_capture_release(&mc->weave.capture, NULL); // #2470: CPU pixels only
+	comp_multi_weave_cursor_fini(&mc->weave.cursor);            // the backend's fini released its GPU half
 	mc->weave.backend = NULL;
 	mc->weave.backend_ready = false;
 	os_mutex_unlock(&mc->weave.mutex);

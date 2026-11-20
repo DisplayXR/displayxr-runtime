@@ -137,6 +137,7 @@
 
 #ifdef XRT_OS_LINUX_DESKTOP
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -856,9 +857,12 @@ weave_create_local(
 	// TRANSFER_SRC: a window woven per screen (#2218 item 6) crops each
 	// segment's views OUT of this atlas and flat-blits from it, and the
 	// #2207 capture reads the atlas back.
+	// COLOR_ATTACHMENT: the weave-rect cursor (XR_DXR_cursor_depth v10) is
+	// drawn into this atlas, blended, by a render pass of its own - only on a
+	// submit that carries a cursor request.
 	VkResult ret = vk_create_image_simple(vk, extent, WEAVE_VK_FORMAT,
 	                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-	                                          VK_IMAGE_USAGE_SAMPLED_BIT,
+	                                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 	                                      out_memory, out_image);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): vk_create_image_simple(%ux%u) failed: %s", w, h, vk_result_string(ret));
@@ -981,6 +985,7 @@ static void
 weave_release_scratch(struct vk_bundle *vk, struct multi_compositor *mc)
 {
 	weave_eye_stage_release_all(vk, mc);
+	comp_multi_weave_cursor_vk_invalidate_target(&mc->weave.cursor_vk, vk); // its framebuffer names sbs_view
 	weave_release_local(vk, &mc->weave.sbs_image, &mc->weave.sbs_memory, &mc->weave.sbs_view);
 	mc->weave.sbs_w = 0;
 	mc->weave.sbs_h = 0;
@@ -989,6 +994,7 @@ weave_release_scratch(struct vk_bundle *vk, struct multi_compositor *mc)
 static void
 weave_release_crop(struct vk_bundle *vk, struct multi_compositor *mc)
 {
+	comp_multi_weave_cursor_vk_invalidate_target(&mc->weave.cursor_vk, vk); // ... or crop_view
 	weave_release_local(vk, &mc->weave.crop_image, &mc->weave.crop_memory, &mc->weave.crop_view);
 	mc->weave.crop_w = 0;
 	mc->weave.crop_h = 0;
@@ -2353,6 +2359,312 @@ weave_lift_record_nview(struct multi_compositor *mc,
 	}
 }
 
+/*
+ *
+ * XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the weave-rect cursor.
+ *
+ * The Linux twin of the D3D11 service's svc_weave_cursor_draw. The policy, the
+ * sprite bookkeeping and the per-view boxes are comp_multi_weave_cursor.c's
+ * (shared with macOS); the pass is comp_multi_weave_cursor_vk.c's. What is
+ * Linux here:
+ *
+ *  - THE POINTER. Windows reads it inside the submit (GetCursorPos). On
+ *    Wayland a client - and the service is one - is never told where the
+ *    pointer is outside its own surfaces, so there is nothing to read: the
+ *    caller is the pointer source, through each entry's sampleUV, on every
+ *    submit (spec v10). On an X11 session the service does read it
+ *    (XQueryPointer on the root, through a dlopen()ed libX11 - no link-time
+ *    dependency), in root pixels, against the bound geometry. An XWayland
+ *    client of a Wayland session takes the caller path: XQueryPointer only
+ *    follows the pointer over X11 surfaces there, and its root pixels are not
+ *    the device pixels of a scaled desktop. DXR_WEAVE_CURSOR_POINTER=caller|os
+ *    overrides (the probes script the pointer through `caller`).
+ *  - THE TEXTURE CARRIER. An fd, imported with the engine's own importers
+ *    (the ones the input and the overlay use) and copied into the pass's
+ *    sprite image on the GPU, between the producer-family acquire and release
+ *    the engine already does for every caller buffer.
+ *
+ */
+
+//! dlsym() into a function pointer without ISO C's object-to-function cast (the
+//! os_display_*_linux.c pattern).
+#define WEAVE_DLSYM(lib, fn, name) (*(void **)(&(fn)) = dlsym((lib), (name)))
+
+//! The X11 pointer reader: one connection per service process, opened on first use.
+static struct
+{
+	pthread_mutex_t lock;
+	bool tried;
+	void *lib;
+	void *dpy;
+	unsigned long root;
+	int (*query_pointer)(
+	    void *, unsigned long, unsigned long *, unsigned long *, int *, int *, int *, int *, unsigned int *);
+} g_weave_x11 = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
+//! Is this an X11 session (not XWayland under a Wayland one)?
+static bool
+weave_cursor_session_is_x11(void)
+{
+	const char *type = getenv("XDG_SESSION_TYPE");
+	if (type != NULL && type[0] != '\0') {
+		return strcmp(type, "x11") == 0;
+	}
+	const char *wl = getenv("WAYLAND_DISPLAY");
+	const char *x = getenv("DISPLAY");
+	return (wl == NULL || wl[0] == '\0') && x != NULL && x[0] != '\0';
+}
+
+/*!
+ * The pointer in X root pixels. False when this is not an X11 session, libX11
+ * or the display cannot be opened, or the pointer is on another X screen.
+ */
+static bool
+weave_cursor_x11_pointer(int *out_x, int *out_y)
+{
+	bool ok = false;
+	pthread_mutex_lock(&g_weave_x11.lock);
+	if (!g_weave_x11.tried) {
+		g_weave_x11.tried = true;
+		if (weave_cursor_session_is_x11()) {
+			void *lib = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+			void *(*open_display)(const char *) = NULL;
+			unsigned long (*default_root)(void *) = NULL;
+			if (lib != NULL) {
+				WEAVE_DLSYM(lib, open_display, "XOpenDisplay");
+				WEAVE_DLSYM(lib, default_root, "XDefaultRootWindow");
+				WEAVE_DLSYM(lib, g_weave_x11.query_pointer, "XQueryPointer");
+			}
+			void *dpy = (open_display != NULL && default_root != NULL && g_weave_x11.query_pointer != NULL)
+			                ? open_display(NULL)
+			                : NULL;
+			if (dpy != NULL) {
+				g_weave_x11.lib = lib;
+				g_weave_x11.dpy = dpy;
+				g_weave_x11.root = default_root(dpy);
+			} else {
+				g_weave_x11.query_pointer = NULL;
+				if (lib != NULL) {
+					dlclose(lib);
+				}
+			}
+		}
+		U_LOG_W("[weave cursor] pointer source: %s (ADR-046 Amendment 6)",
+		        g_weave_x11.dpy != NULL
+		            ? "the X server (XQueryPointer on the root, read inside the submit)"
+		            : "the weave caller's sampleUV (no X11 session to read the pointer from: on Wayland a "
+		              "service cannot)");
+	}
+	if (g_weave_x11.dpy != NULL) {
+		unsigned long root = 0, child = 0;
+		int rx = 0, ry = 0, wx = 0, wy = 0;
+		unsigned int mask = 0;
+		if (g_weave_x11.query_pointer(g_weave_x11.dpy, g_weave_x11.root, &root, &child, &rx, &ry, &wx, &wy,
+		                              &mask) != 0) {
+			*out_x = rx;
+			*out_y = ry;
+			ok = true;
+		}
+	}
+	pthread_mutex_unlock(&g_weave_x11.lock);
+	return ok;
+}
+
+//! Close a parked carrier fd.
+static void
+weave_cursor_drop_parked(struct multi_compositor *mc)
+{
+	if (mc->weave.cursor_tex_pending) {
+		weave_close_fd(&mc->weave.cursor_tex_fd);
+		mc->weave.cursor_tex_pending = false;
+	}
+}
+
+/*!
+ * Import the parked texture carrier (the previous frame's GPU work was waited,
+ * so the previous import may go). On failure the staged carrier is forgotten:
+ * the cursor keeps its last look, or the default one.
+ */
+static void
+weave_cursor_import_parked(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (!mc->weave.cursor_tex_pending) {
+		return;
+	}
+	weave_slot_release(vk, &mc->weave.cursor_slot);
+	struct comp_multi_weave_linux_slot *slot = &mc->weave.cursor_slot;
+	const int fd = mc->weave.cursor_tex_fd;
+	bool ok = false;
+	if (mc->weave.cursor_tex_is_dmabuf) {
+		struct xrt_weave_dmabuf_desc desc = mc->weave.cursor_tex_desc;
+		desc.fd = fd;
+		ok = vk_dmabuf_supported(vk) && weave_import_dmabuf(vk, mc, &desc, &slot->image, &slot->memory,
+		                                                    &slot->view, &slot->format, "cursor sprite");
+		slot->ext_queue_family = VK_QUEUE_FAMILY_FOREIGN_EXT;
+		slot->w = desc.width;
+		slot->h = desc.height;
+	} else {
+		struct stat st;
+		ok = fstat(fd, &st) == 0 &&
+		     weave_import_opaque_fd(vk, mc, fd, (uint64_t)st.st_dev, (uint64_t)st.st_ino,
+		                            mc->weave.cursor_tex_w, mc->weave.cursor_tex_h, &slot->image, &slot->memory,
+		                            &slot->view, "cursor sprite");
+		slot->format = WEAVE_VK_FORMAT;
+		slot->ext_queue_family = VK_QUEUE_FAMILY_EXTERNAL;
+		slot->w = mc->weave.cursor_tex_w;
+		slot->h = mc->weave.cursor_tex_h;
+	}
+	weave_cursor_drop_parked(mc); // the import took its own dup()
+	if (!ok) {
+		U_ZERO(slot);
+		comp_multi_weave_cursor_drop_staged(&mc->weave.cursor);
+		U_LOG_W("[weave cursor] the caller's sprite texture could not be imported - keeping the last look");
+		return;
+	}
+	slot->used = true;
+	slot->first_use = true;
+}
+
+/*!
+ * This submit's cursor: consume the request, and if there is one resolve the
+ * frame and plan the draw. Returns true when the submit carries a request (it
+ * then never samples the v6 input in place); @p out_draw.quad_count > 0 when
+ * something is to be drawn.
+ */
+static bool
+weave_cursor_begin(struct vk_bundle *vk,
+                   struct multi_compositor *mc,
+                   uint32_t rect_count,
+                   const struct xrt_rect *rects,
+                   const struct xrt_weave_atlas_layout *layout,
+                   uint32_t fb_w,
+                   uint32_t fb_h,
+                   const struct weave_lift_set *lift,
+                   struct comp_multi_weave_cursor_draw *out_draw)
+{
+	U_ZERO(out_draw);
+	const uint64_t now_ns = os_monotonic_get_ns();
+	struct xrt_weave_cursor_request req;
+	bool released = false;
+	if (!comp_multi_weave_cursor_begin(&mc->weave.cursor, now_ns, &req, &released)) {
+		if (released) {
+			// No request for 1 s: the GPU copies go too (the previous frame was waited).
+			weave_cursor_drop_parked(mc);
+			weave_slot_release(vk, &mc->weave.cursor_slot);
+			comp_multi_weave_cursor_vk_release_sprite(&mc->weave.cursor_vk, vk);
+		}
+		return false;
+	}
+	weave_cursor_import_parked(vk, mc);
+
+	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+	struct comp_multi_weave_cursor_frame f;
+	U_ZERO(&f);
+	f.client = mc->weave.capture.tag;
+	f.rects = rect_count > 0 ? rects : NULL;
+	f.rect_count = rect_count;
+	f.now_ns = now_ns;
+	f.flat_2d = mc->weave.hw_2d_confirmed;
+	weave_lift_window(mc, fb_w, fb_h, &f.win_w, &f.win_h);
+	const bool nview = layout != NULL && layout->view_count > 0;
+	if (nview) {
+		(void)u_cursor_weave_tiles_nview(layout->tile_columns, layout->content_view_w, layout->content_view_h,
+		                                 f.win_w, f.win_h, &f.tiles);
+		f.view_count = layout->view_count;
+	} else {
+		// Batch: the input IS the window, two tiles of it side by side.
+		f.win_w = fb_w;
+		f.win_h = fb_h;
+		u_cursor_weave_tiles_batch(fb_w, fb_h, &f.tiles);
+		f.view_count = 2;
+	}
+	for (uint32_t k = 0; lift != NULL && k < lift->count; k++) {
+		if (lift->rects[k].depth_cursor && lift->rects[k].rect_index < 32) {
+			f.lift_rect_mask |= 1u << lift->rects[k].rect_index;
+		}
+	}
+
+	// The weave frame: the window's centre on the panel, display axes, metres.
+	if (info->display_pixel_width > 0 && info->display_width_m > 0.0f) {
+		f.m_per_px = info->display_width_m / (float)info->display_pixel_width;
+		f.width_m = (float)f.win_w * f.m_per_px;
+		f.height_m = (float)f.win_h * f.m_per_px;
+		f.frame_valid = true;
+		int32_t ox = 0, oy = 0;
+		if (mc->weave.have_geometry && info->display_pixel_height > 0) {
+			(void)weave_panel_relative_origin(mc, &ox, &oy);
+			// +x right in both frames; y negated: screen pixels run down.
+			f.center[0] =
+			    ((float)ox + (float)f.win_w * 0.5f - (float)info->display_pixel_width * 0.5f) * f.m_per_px;
+			f.center[1] = -(((float)oy + (float)f.win_h * 0.5f - (float)info->display_pixel_height * 0.5f) *
+			                f.m_per_px);
+		}
+	}
+	// The default look's raster scale: the window's own scale when the caller
+	// reported one, else the desktop's.
+	f.backing_scale = mc->weave.win_logical.valid && mc->weave.win_logical.scale > 0.0f
+	                      ? mc->weave.win_logical.scale
+	                      : (float)info->display_desktop_scale;
+
+	// The pointer (see the block comment above).
+	int rx = 0, ry = 0;
+	const bool x11 = mc->weave.have_geometry && weave_cursor_x11_pointer(&rx, &ry);
+	if (comp_multi_weave_cursor_pointer_is_caller(x11)) {
+		f.pointer = COMP_MULTI_WEAVE_CURSOR_POINTER_CALLER;
+	} else {
+		f.pointer = COMP_MULTI_WEAVE_CURSOR_POINTER_OS;
+		f.os_pointer_read = x11;
+		f.os_x = (float)(rx - mc->weave.win_x) + 0.5f;
+		f.os_y = (float)(ry - mc->weave.win_y) + 0.5f;
+		f.os_pointer_over_window =
+		    x11 && f.os_x >= 0.0f && f.os_y >= 0.0f && f.os_x < (float)f.win_w && f.os_y < (float)f.win_h;
+	}
+
+	struct xrt_eye_positions eyes;
+	U_ZERO(&eyes);
+	if (xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, &eyes)) {
+		f.eyes = &eyes;
+	}
+	(void)comp_multi_weave_cursor_plan(&mc->weave.cursor, &req, &f, out_draw);
+	return true;
+}
+
+/*!
+ * Record the planned cursor into the atlas the DP is about to sample
+ * (@p image in SHADER_READ_ONLY_OPTIMAL, on entry and exit).
+ */
+static void
+weave_cursor_record(struct vk_bundle *vk,
+                    struct multi_compositor *mc,
+                    VkCommandBuffer cmd,
+                    const struct comp_multi_weave_cursor_draw *draw,
+                    VkImage image,
+                    VkImageView view,
+                    uint32_t w,
+                    uint32_t h)
+{
+	struct comp_multi_weave_linux_slot *slot = &mc->weave.cursor_slot;
+	// The caller's carrier is taken from its producer only for the frame that
+	// copies it into the sprite image.
+	const bool copy = draw->rgba == NULL && slot->used && slot->image != VK_NULL_HANDLE &&
+	                  comp_multi_weave_cursor_vk_needs_pixels(&mc->weave.cursor_vk, draw);
+	struct comp_multi_weave_cursor_vk_source src = {.image = slot->image, .w = slot->w, .h = slot->h};
+	if (copy) {
+		weave_acquire_slot(vk, cmd, slot, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+		slot->first_use = false;
+	}
+	const bool drawn = comp_multi_weave_cursor_vk_draw(
+	    &mc->weave.cursor_vk, vk, cmd, draw, copy ? &src : NULL, image, view, WEAVE_VK_FORMAT, w, h,
+	    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	if (copy) {
+		weave_release_slot(vk, cmd, slot, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+	}
+	if (!drawn) {
+		comp_multi_weave_cursor_not_drawn(&mc->weave.cursor, mc->weave.capture.tag,
+		                                  "the Vulkan pass recorded nothing");
+	}
+}
+
 static bool
 weave_run_frame(struct vk_bundle *vk,
                 struct multi_compositor *mc,
@@ -2450,7 +2762,15 @@ weave_run_frame(struct vk_bundle *vk,
 	// A v6 frame carrying lifted rects never samples the caller's buffer in
 	// place: the lift writes into the crop copy (XR_DXR_lift §6).
 	const bool lift_requested = lift != NULL && lift->count > 0;
-	const bool v6_zero_copy = nview && !lift_requested && (packed_w == in->w && packed_h == in->h);
+	// XR_DXR_cursor_depth v10: this submit's weave-rect cursor. A submit that
+	// chained no request costs the one test inside (ADR-046 section 0); one
+	// that did never samples the caller's buffer in place either - the cursor
+	// is drawn into the crop copy, never into the caller's input.
+	struct comp_multi_weave_cursor_draw cursor_draw;
+	const bool cursor_requested =
+	    weave_cursor_begin(vk, mc, rect_count, rects, layout, want_w, want_h, lift, &cursor_draw);
+	const bool v6_zero_copy =
+	    nview && !lift_requested && !cursor_requested && (packed_w == in->w && packed_h == in->h);
 	if (nview && !v6_zero_copy &&
 	    (mc->weave.crop_image == VK_NULL_HANDLE || mc->weave.crop_w != packed_w || mc->weave.crop_h != packed_h)) {
 		weave_queue_wait_idle(vk);
@@ -2758,6 +3078,15 @@ weave_run_frame(struct vk_bundle *vk,
 		                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
 		                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 		                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	}
+
+	// XR_DXR_cursor_depth v10: the weave-rect cursor, into every view of the
+	// hovered rect in the atlas the DP is about to sample (the SBS scratch or
+	// the v6 crop, both SHADER_READ_ONLY here; never the zero-copy input - a
+	// submit with a request does not take that path). Before the capture's
+	// atlas stage and the self-submitting split, so both see it.
+	if (cursor_requested && cursor_draw.quad_count > 0 && !v6_zero_copy) {
+		weave_cursor_record(vk, mc, cmd, &cursor_draw, dp_src_image, dp_src_view, dp_src_w, dp_src_h);
 	}
 
 	// Output -> COLOR_ATTACHMENT. Fully re-rendered every submit, so the
@@ -3853,6 +4182,64 @@ comp_multi_weave_linux_set_capture_tag(struct xrt_compositor *xc, const char *ta
 }
 
 void
+comp_multi_weave_set_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL || req == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	comp_multi_weave_cursor_set_request(&mc->weave.cursor, req);
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+void
+comp_multi_weave_get_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state)
+{
+	U_ZERO(out_state);
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL || !mc->weave.mutex_initialized) {
+		return;
+	}
+	os_mutex_lock(&mc->weave.mutex);
+	comp_multi_weave_cursor_get_state(&mc->weave.cursor, out_state);
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+void
+comp_multi_weave_linux_set_cursor_sprite(struct xrt_compositor *xc,
+                                         int fd,
+                                         const struct xrt_weave_dmabuf_desc *desc,
+                                         const struct xrt_weave_cursor_sprite_texture *info)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL || info == NULL || fd < 0) {
+		weave_close_fd(&fd);
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	// Latest wins: an unconsumed older carrier is dropped. NULL pixels = the
+	// engine holds this carrier on its GPU (imported by the next submit whose
+	// request names this generation).
+	weave_cursor_drop_parked(mc);
+	if (comp_multi_weave_cursor_stage_texture(&mc->weave.cursor, info, NULL)) {
+		mc->weave.cursor_tex_pending = true;
+		mc->weave.cursor_tex_fd = fd;
+		mc->weave.cursor_tex_is_dmabuf = desc != NULL;
+		if (desc != NULL) {
+			mc->weave.cursor_tex_desc = *desc;
+		}
+		mc->weave.cursor_tex_w = info->width;
+		mc->weave.cursor_tex_h = info->height;
+		fd = -1;
+	}
+	os_mutex_unlock(&mc->weave.mutex);
+	weave_close_fd(&fd);
+}
+
+void
 comp_multi_weave_fini(struct multi_compositor *mc)
 {
 	if (mc == NULL || !mc->weave.mutex_initialized) {
@@ -3870,6 +4257,9 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 		// XR_DXR_lift §6: the lifted rects' state (pins, pending snapshots) -- idle above.
 		comp_multi_weave_lift_fini(&mc->weave.lift);
 		comp_multi_weave_capture_release(&mc->weave.capture, vk); // #2207 (idle above)
+		// XR_DXR_cursor_depth v10: the cursor pass + the imported carrier (idle above).
+		comp_multi_weave_cursor_vk_fini(&mc->weave.cursor_vk, vk);
+		weave_slot_release(vk, &mc->weave.cursor_slot);
 		weave_slots_release_all(vk, mc->weave.in_slots);
 		weave_slots_release_all(vk, mc->weave.ov_slots);
 		weave_release_scratch(vk, mc);
@@ -3903,6 +4293,8 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 	}
 	// fds are process state, not Vulkan state: close them even without a vk.
 	weave_close_fd(&mc->weave.out_fd);
+	weave_cursor_drop_parked(mc);
+	comp_multi_weave_cursor_fini(&mc->weave.cursor);
 	mc->weave.engine_initialized = false;
 	os_mutex_unlock(&mc->weave.mutex);
 	os_mutex_destroy(&mc->weave.mutex);

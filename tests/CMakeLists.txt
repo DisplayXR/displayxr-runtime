@@ -81,6 +81,7 @@ set(tests
     tests_aux_color_encoding
     tests_aux_grip_surface
     tests_aux_cursor_depth
+    tests_oxr_weave_chain
     tests_aux_stereo_comfort
     tests_aux_lift_cursor
     tests_aux_lift_autoconv
@@ -900,6 +901,13 @@ target_include_directories(
 			   ${PROJECT_SOURCE_DIR}/src/xrt/drivers
 	)
 target_link_libraries(tests_rig_composer PRIVATE xrt-interfaces aux_math aux_os)
+
+# XR_DXR_cursor_depth v10: the weave submit's dma-buf descriptor lookups
+# (oxr_weave_chain.h, header-only: the st_oxr include path and nothing else).
+target_include_directories(
+	tests_oxr_weave_chain PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+				      ${PROJECT_SOURCE_DIR}/src/external/openxr_includes
+	)
 
 if(TARGET tests_oxr_view_space)
 	target_include_directories(
