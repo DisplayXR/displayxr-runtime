@@ -118,7 +118,8 @@
  * and the bit and behaves as FRONT_ONLY, so check the extension's specVersion
  * (xrEnumerateInstanceExtensionProperties) >= 9 before relying on it.
  *
- * Spec v10 (ADR-046 Amendment 6) is a SUPPORT SIGNAL, with no new struct and
+ * Spec v10 (ADR-046 Amendment 6) is a SUPPORT SIGNAL, with one new struct
+ * (@ref XrCursorDepthWeaveSpriteDmabufDescDXR, the Linux dma-buf carrier) and
  * no struct that changed size: the desktop-Linux and macOS weave engines draw
  * the v8 weave-rect cursor too (the Vulkan engines and the macOS Metal one),
  * with the same policy, v9 range flag and softening, and accept the TEXTURE
@@ -128,12 +129,15 @@
  *    Windows D3D11_NT / D3D11_DXGI (PLATFORM_DEFAULT = NT), as since v8;
  *    macOS IOSURFACE (PLATFORM_DEFAULT = IOSURFACE): a one-plane BGRA8 or
  *    RGBA8 IOSurface; desktop Linux DMABUF, described by an
- *    XrWeaveDmabufDescDXR chained on XrCursorDepthWeaveRequestDXR::next (the
- *    texture field is then ignored; ARGB8888 / ABGR8888 and their X variants,
- *    any modifier the runtime's device imports), or OPAQUE_FD (a same-driver
- *    Vulkan export of an extent-sized B8G8R8A8_UNORM image, the fd in the
- *    texture field; PLATFORM_DEFAULT = DMABUF when the descriptor is chained,
- *    else OPAQUE_FD). The handle STAYS THE CALLER'S on every platform (the
+ *    @ref XrCursorDepthWeaveSpriteDmabufDescDXR anywhere on the submit's next
+ *    chain (the texture field is then ignored; ARGB8888 / ABGR8888 and their
+ *    X variants, any modifier the runtime's device imports), or OPAQUE_FD (a
+ *    same-driver Vulkan export of an extent-sized B8G8R8A8_UNORM image, the
+ *    fd in the texture field; PLATFORM_DEFAULT = DMABUF when that descriptor
+ *    is chained, else OPAQUE_FD). The sprite's descriptor has its OWN type:
+ *    an XrWeaveDmabufDescDXR on the chain is always the submit's INPUT and
+ *    never the sprite, whatever the order of the links, and the reverse.
+ *    The handle STAYS THE CALLER'S on every platform (the
  *    runtime takes its own reference inside the call), unlike a dma-buf INPUT.
  *    OS_CURSOR stays a Windows carrier: elsewhere it draws the held sprite,
  *    else the default look.
@@ -199,6 +203,8 @@ extern "C" {
 // registry: README.md in this directory).
 //! Spec v9 (ADR-046 Amendment 5: the opt-in depth range).
 #define XR_TYPE_CURSOR_DEPTH_RANGE_DXR ((XrStructureType)1004999390)
+//! Spec v10 (ADR-046 Amendment 6: the TEXTURE sprite as a dma-buf, desktop Linux).
+#define XR_TYPE_CURSOR_DEPTH_WEAVE_SPRITE_DMABUF_DESC_DXR ((XrStructureType)1004999391)
 
 // ---- Input: app chains this on XrViewLocateInfo::next; runtime reads it. ----
 
@@ -652,7 +658,8 @@ typedef struct XrCursorDepthWeaveSpriteDXR {
     uint64_t             osCursor;     //!< OS_CURSOR: the HCURSOR
     void*                texture;      //!< TEXTURE: a shared handle of @c textureKind
     //! TEXTURE: Windows D3D11_NT / D3D11_DXGI; macOS IOSURFACE; desktop Linux
-    //! DMABUF (+ a chained XrWeaveDmabufDescDXR) / OPAQUE_FD; or PLATFORM_DEFAULT.
+    //! DMABUF (+ a chained XrCursorDepthWeaveSpriteDmabufDescDXR) / OPAQUE_FD;
+    //! or PLATFORM_DEFAULT.
     XrWeaveHandleKindDXR textureKind;
     XrExtent2Di          extent;       //!< TEXTURE: px (<= 256 x 256)
     XrVector2f           hotSpotPx;    //!< TEXTURE: px from the top-left
@@ -660,6 +667,51 @@ typedef struct XrCursorDepthWeaveSpriteDXR {
     //! pitch (OS_CURSOR / DEFAULT: the OS cursor's size at the window's DPI).
     float                sizeMeters;
 } XrCursorDepthWeaveSpriteDXR;
+
+/*!
+ * @brief The TEXTURE sprite as a dma-buf (spec v10, desktop Linux).
+ *
+ * Chain it ANYWHERE on the next chain of the XrWeaveSubmitInfoDXR that carries
+ * the XrCursorDepthWeaveRequestDXR whose sprite it describes - before or after
+ * the request, before or after any other struct: a next chain is one list, and
+ * the runtime finds this struct by its type alone. At most one per submit. Its
+ * presence selects the DMABUF carrier for a TEXTURE sprite (textureKind DMABUF
+ * or PLATFORM_DEFAULT; with OPAQUE_FD it is XR_ERROR_VALIDATION_FAILURE), and
+ * XrCursorDepthWeaveSpriteDXR::texture is then ignored. It is read only on a
+ * submit whose sprite kind is TEXTURE (once per generation); on a KEEP,
+ * DEFAULT or NONE submit it is ignored.
+ *
+ * It is NOT an XrWeaveDmabufDescDXR and the runtime never takes one for the
+ * other: XrWeaveDmabufDescDXR on the chain is the submit's INPUT (and
+ * XrWeaveOverlayDmabufDescDXR its overlay), whatever the order of the links.
+ * A dma-buf sprite with an OPAQUE_FD input, and the reverse, are both valid.
+ *
+ * Field for field XrWeaveDmabufDescDXR, with the same meanings (the values
+ * the producer's allocator reports, verbatim), and two differences:
+ *  - @c fd STAYS THE CALLER'S, on success and on failure alike. The runtime
+ *    takes its own reference inside the call; close the fd whenever you like
+ *    afterwards.
+ *  - @c bufferId is reserved and must be 0 (a sprite is imported once per
+ *    generation; there is no import cache to key).
+ * The image: one colour plane of DRM_FORMAT_ARGB8888 / XRGB8888 (BGRA bytes)
+ * or ABGR8888 / XBGR8888 (RGBA bytes), premultiplied, sRGB-encoded, at least
+ * XrCursorDepthWeaveSpriteDXR::extent in size (the top-left extent is used);
+ * @c planeCount counts memory planes, a modifier's auxiliary planes included.
+ * Any modifier the runtime's device imports; never DRM_FORMAT_MOD_INVALID.
+ */
+typedef struct XrCursorDepthWeaveSpriteDmabufDescDXR {
+    XrStructureType          type;        //!< XR_TYPE_CURSOR_DEPTH_WEAVE_SPRITE_DMABUF_DESC_DXR
+    const void* XR_MAY_ALIAS next;
+    int32_t                  fd;          //!< dma-buf fd (>= 0); stays the caller's
+    uint32_t                 width;       //!< pixels, >= sprite.extent.width
+    uint32_t                 height;      //!< pixels, >= sprite.extent.height
+    uint32_t                 drmFourcc;   //!< DRM_FORMAT_* fourcc
+    uint64_t                 drmModifier; //!< DRM format modifier (never DRM_FORMAT_MOD_INVALID)
+    uint32_t                 planeCount;  //!< 1..XR_WEAVE_DMABUF_MAX_PLANES_DXR
+    uint32_t                 offsets[XR_WEAVE_DMABUF_MAX_PLANES_DXR]; //!< per-plane byte offset into @c fd
+    uint32_t                 strides[XR_WEAVE_DMABUF_MAX_PLANES_DXR]; //!< per-plane row pitch, bytes
+    uint64_t                 bufferId;    //!< reserved, must be 0
+} XrCursorDepthWeaveSpriteDmabufDescDXR;
 
 /*!
  * @brief The depth under the pointer for one weave rect (spec v8). A plain

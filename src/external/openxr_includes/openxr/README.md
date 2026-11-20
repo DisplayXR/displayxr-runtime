@@ -63,7 +63,7 @@ Rules:
 | 1004999440–449 | `XR_DXR_stereo_comfort` | 440 = `XR_TYPE_STEREO_COMFORT_DXR` (output on `XrViewState`), 441 = `XR_TYPE_STEREO_COMFORT_REQUEST_DXR` (input on `XrViewLocateInfo`), spec v1; 442–449 free for it |
 | 1004999450–459 | `XR_DXR_display_info` (v25+ additions) | 450 = `XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR` (spec v25 — chained on `XrViewLocateInfo`: locate for the nominal viewer and post no viewer-tracking demand). A fresh decade because 210–219 is full (430–449 went to `XR_DXR_app_share` and `XR_DXR_stereo_comfort`); 451–459 free for it |
 | 1004999380–389 | `XR_DXR_window_visibility` | 380 = `XR_TYPE_EVENT_DATA_WINDOW_VISIBILITY_CHANGED_DXR`, 381 = `XR_TYPE_SESSION_WINDOW_VISIBILITY_INFO_DXR` (spec v1, ADR-062 D4); 382–389 free |
-| 1004999390–399 | `XR_DXR_cursor_depth` (v9+ additions) | 390 = `XR_TYPE_CURSOR_DEPTH_RANGE_DXR` (spec v9, ADR-046 Amendment 5 — the opt-in depth range: cursor in front of the glass only, or on both sides). A second decade: 320–329 is full. 391–399 free |
+| 1004999390–399 | `XR_DXR_cursor_depth` (v9+ additions) | 390 = `XR_TYPE_CURSOR_DEPTH_RANGE_DXR` (spec v9, ADR-046 Amendment 5 — the opt-in depth range: cursor in front of the glass only, or on both sides). A second decade: 320–329 is full. 391 = `XR_TYPE_CURSOR_DEPTH_WEAVE_SPRITE_DMABUF_DESC_DXR` (spec v10, ADR-046 Amendment 6 — the weave-rect cursor's TEXTURE sprite as a dma-buf on desktop Linux; its own type so it can never be confused with the submit input's `XrWeaveDmabufDescDXR` on the same next chain). 392–399 free |
 | 1004999460+ | **next free** | |
 
 `XR_DXR_android_surface_binding` was implemented in #1037 and now has its own

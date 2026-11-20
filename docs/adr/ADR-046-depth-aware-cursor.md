@@ -1765,8 +1765,9 @@ platforms have a weave engine (`comp_multi_weave_macos.c` over a Vulkan and a Me
 
 ### Decision
 
-The POSIX weave engines draw the weave-rect cursor, with **no new API**: the same request, the
-same state, the same contract. The spec version moves to 10 as the support signal a caller
+The POSIX weave engines draw the weave-rect cursor, with the same request, the same state and
+the same contract. The one API addition is a descriptor struct for the Linux texture carrier
+(§4). The spec version moves to 10 as the support signal a caller
 reads (`getCursorDepthSupport()` answers "runtime" on macOS and Linux only at ≥ 10; Windows
 stays ≥ 8). All three engines land together, because the version is one number for the two
 operating systems.
@@ -1850,12 +1851,34 @@ overlay atlas does on each:
   Its pixels are read on the CPU when the carrier arrives, so both backends upload the same
   bytes and the surface is not kept.
 - **Desktop Linux:** a dma-buf (`XR_WEAVE_HANDLE_KIND_DMABUF_DXR`) described by an
-  `XrWeaveDmabufDescDXR` chained on `XrCursorDepthWeaveRequestDXR::next`, or a same-driver
-  Vulkan `OPAQUE_FD`. It is imported by the engine's own importers (the ones the input and the
-  overlay use, so any modifier the device imports) and copied into the pass's sprite image on
-  the GPU, between the producer-family acquire and release the engine already does for every
-  caller buffer. The sprite struct is not chainable and may not grow, so the descriptor rides
-  the request's chain; reusing the existing descriptor type adds no struct.
+  `XrCursorDepthWeaveSpriteDmabufDescDXR` (1004999391) on the submit's next chain, or a
+  same-driver Vulkan `OPAQUE_FD`. It is imported by the engine's own importers (the ones the
+  input and the overlay use, so any modifier the device imports) and copied into the pass's
+  sprite image on the GPU, between the producer-family acquire and release the engine already
+  does for every caller buffer.
+
+**Why the descriptor has its own type.** The sprite struct is not chainable and may not grow,
+so the descriptor has to ride a chain. The first draft of this amendment reused
+`XrWeaveDmabufDescDXR`, "chained on the request's `next`". That was a trap, found by the first
+caller built against it. A next chain is one linked list, and the request is itself a link of
+the submit's chain: "after the request" is not a sub-chain, it is the rest of the submit's
+chain. The input lookup walked the whole chain for the first `XrWeaveDmabufDescDXR`; the sprite
+lookup walked from the request to the end for the first one. So:
+
+| Chain | Input lookup returned | Sprite lookup returned |
+|---|---|---|
+| submit → input desc → request → sprite desc | the input's (right) | the sprite's (right) |
+| submit → request → sprite desc → input desc | **the sprite's** (wrong: the cursor bitmap woven as the page) | the sprite's |
+| submit → request → input desc (no sprite desc, `PLATFORM_DEFAULT` texture sprite) | the input's | **the input's** (wrong: the page as the cursor) |
+| submit → request → input desc, `OPAQUE_FD` sprite | the input's | the input's, then refused as "OPAQUE_FD with a descriptor" (a valid submit rejected) |
+
+It worked only for a caller that happened to chain the request after the input's descriptor.
+The fix follows the overlay's precedent (`XrWeaveOverlayDmabufDescDXR`): the same fields under
+a third structure type. Each of the three types appears at most once, every lookup goes by type
+over the whole chain, and the order of the links is irrelevant. The lookups live in
+`oxr_weave_chain.h` and `tests_oxr_weave_chain` pins them over all 120 orders of the five
+links. An ordering rule (the fallback considered) would have kept a contract that a caller can
+break without any error, and whose failure is a wrong picture.
 
 The handle stays the caller's on every platform. A carrier that cannot be read or imported
 keeps the last look, never a wrong one, and the reported `spriteGeneration` tells the caller.
@@ -1885,9 +1908,11 @@ that asked keeps its fallback.
 - IPC: `weave_cursor_request` / `_sprite_texture` / `_state` reach the POSIX engines; one new
   call, `weave_cursor_sprite_dmabuf`, carries the dma-buf descriptor. No existing wire struct
   changed.
-- State tracker: `oxr_weave.c` sends the texture carrier on macOS and desktop Linux too.
+- State tracker: `oxr_weave.c` sends the texture carrier on macOS and desktop Linux too;
+  `oxr_weave_chain.h` holds the descriptor lookups and the Linux carrier rule
+  (`tests_oxr_weave_chain`).
 - Probes: `weave_present_vk_macos --cursor ...` (batch), `weave_probe_vk_macos --cursor` (v6),
-  `weave_probe_vk_linux --cursor` (self-checking).
+  `weave_probe_vk_linux --cursor` and `--cursor-dmabuf` (self-checking).
 
 ### Evidence
 
@@ -1897,6 +1922,9 @@ that asked keeps its fallback.
   behind, and absent with FRONT_ONLY over the same rear content; `drawnRectMask` and
   `drawnBounds` agree. The Vulkan and the Metal backend produce the same numbers. The v6 crop
   path and the real pointer (`CGEventGetLocation`) were run as well.
+- **The descriptor lookups: unit-tested** (`tests_oxr_weave_chain`): the input's and the
+  sprite's descriptor are each found in all 120 orders of the chain's five links, and neither
+  lookup accepts the other's type.
 - **Desktop Linux: compiled on CI, not run.** No Linux panel box was available to this change.
   The probe's `--cursor` leg and the recipe in the pull request are the acceptance test.
 - **No panel.** Nothing here has been looked at on a tracked 3D display.
@@ -1910,7 +1938,8 @@ this change does not touch.
 
 1. **`drawnBounds` on a scaled Wayland desktop** are in the pixels of the submitted rects. The
    browser must compare them with the pointer in the same pixels.
-2. **The dma-buf carrier has not been exercised.** The Linux probe sends an `OPAQUE_FD`.
+2. **The dma-buf carrier has not been run.** `weave_probe_vk_linux --cursor-dmabuf` sends
+   one (compiled on CI); it waits for a Linux box.
 3. **XWayland detection** is by session type (`XDG_SESSION_TYPE`), read from the service's
    environment. A socket-activated service whose environment lacks it takes the caller path,
    which is always correct.
