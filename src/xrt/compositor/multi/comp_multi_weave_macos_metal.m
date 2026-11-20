@@ -130,6 +130,16 @@ struct weave_metal
 	//! XR_DXR_lift §6: the lifted-rect recorder (lazy, first lifted submit).
 	struct comp_multi_weave_metal_lift *lift;
 	bool lift_failed; //!< creation failed once: rects are woven as drawn
+
+	//! @name XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the weave-rect cursor
+	//! All nil until the first cursor draw (ADR-046 section 0).
+	//! @{
+	id<MTLRenderPipelineState> cursor_pso; //!< premultiplied "over", softened (B.7)
+	bool cursor_failed;                    //!< the pipeline could not be built: never retried
+	id<MTLTexture> cursor_tex;             //!< the sprite, RGBA8 (sRGB-encoded bytes, written as stored)
+	uint32_t cursor_w, cursor_h;
+	uint64_t cursor_serial; //!< the plan's image_serial those pixels are
+	//! @}
 };
 
 static inline struct weave_metal *
@@ -195,6 +205,65 @@ static const char *weave_metal_shader_src =
     "  constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);\n"
     "  return ov.sample(s, in.uv);\n"
     "}\n";
+
+/*
+ * XR_DXR_cursor_depth v10: the weave-rect cursor's shader, compiled on the
+ * first cursor draw only. The Metal in-process compositor's
+ * `cursor_fragment_soft` kernel (and vk_native's zone_blit_soft.frag, the
+ * D3D11 `DXR_SOFTEN` shader): 13 taps - centre, 4 at r/2, 8 at r, sigma 0.6 r -
+ * a tap outside sprite uv 0..1 transparent. The VIEWPORT is the sprite's
+ * blur-padded box in the atlas; the sprite is premultiplied, so the opacity
+ * scales all four channels and the pipeline blends One / OneMinusSrcAlpha.
+ */
+static const char *weave_metal_cursor_src =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct CVOut { float4 pos [[position]]; float2 uv; };\n"
+    "vertex CVOut weave_cursor_vs(uint vid [[vertex_id]]) {\n"
+    "  float2 p = float2(float((vid << 1) & 2), float(vid & 2));\n"
+    "  CVOut o;\n"
+    "  o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
+    "  o.uv = p;\n"
+    "  return o;\n"
+    "}\n"
+    "struct CursorParams { float4 uv_rect; float2 radius; float alpha; float pad; };\n"
+    "static float4 cursor_tap(texture2d<float> t, sampler s, float2 uv) {\n"
+    "  float4 c = t.sample(s, uv);\n"
+    "  bool inside = uv.x >= 0.0 && uv.y >= 0.0 && uv.x <= 1.0 && uv.y <= 1.0;\n"
+    "  return inside ? c : float4(0.0);\n"
+    "}\n"
+    "fragment float4 weave_cursor_fs(CVOut in [[stage_in]],\n"
+    "                                texture2d<float> spr [[texture(0)]],\n"
+    "                                constant CursorParams &p [[buffer(0)]]) {\n"
+    "  constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);\n"
+    "  float2 uv = p.uv_rect.xy + in.uv * p.uv_rect.zw;\n"
+    "  float2 r = p.radius;\n"
+    "  float4 acc = cursor_tap(spr, s, uv);\n"
+    "  float wsum = 1.0;\n"
+    "  if (r.x > 0.0 || r.y > 0.0) {\n"
+    "    const float wi = 0.7066;\n"
+    "    const float wo = 0.2494;\n"
+    "    acc += wi * cursor_tap(spr, s, uv + float2(0.5, 0.0) * r);\n"
+    "    acc += wi * cursor_tap(spr, s, uv + float2(-0.5, 0.0) * r);\n"
+    "    acc += wi * cursor_tap(spr, s, uv + float2(0.0, 0.5) * r);\n"
+    "    acc += wi * cursor_tap(spr, s, uv + float2(0.0, -0.5) * r);\n"
+    "    for (int k = 0; k < 8; k++) {\n"
+    "      float a = 0.3927 + 0.7854 * float(k);\n"
+    "      acc += wo * cursor_tap(spr, s, uv + float2(cos(a), sin(a)) * r);\n"
+    "    }\n"
+    "    wsum += 4.0 * wi + 8.0 * wo;\n"
+    "  }\n"
+    "  return acc / wsum * p.alpha;\n"
+    "}\n";
+
+//! Must match CursorParams above.
+struct weave_cursor_params
+{
+	float uv_rect[4];
+	float radius[2];
+	float alpha;
+	float pad;
+};
 
 struct weave_unsqueeze_params
 {
@@ -644,6 +713,152 @@ weave_metal_encode_unsqueeze(struct multi_compositor *mc,
 
 /*
  *
+ * XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the weave-rect cursor.
+ *
+ * The Metal twin of comp_multi_weave_cursor_vk.c: draws what the front end
+ * planned (comp_multi_weave_cursor.h) into the atlas the DP is about to
+ * consume - one premultiplied, scissored, softened quad per view tile.
+ *
+ */
+
+//! Build the cursor pipeline once, on the first cursor draw.
+static bool
+weave_metal_cursor_ensure(struct weave_metal *wm)
+{
+	if (wm->cursor_pso != nil) {
+		return true;
+	}
+	if (wm->cursor_failed) {
+		return false;
+	}
+	id<MTLDevice> dev = weave_metal_device();
+	NSError *err = nil;
+	id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:weave_metal_cursor_src]
+	                                       options:nil
+	                                         error:&err];
+	id<MTLFunction> vs = lib != nil ? [lib newFunctionWithName:@"weave_cursor_vs"] : nil;
+	id<MTLFunction> fs = lib != nil ? [lib newFunctionWithName:@"weave_cursor_fs"] : nil;
+	if (vs != nil && fs != nil) {
+		MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+		desc.vertexFunction = vs;
+		desc.fragmentFunction = fs;
+		desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		desc.colorAttachments[0].blendingEnabled = YES;
+		desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+		desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+		desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+		desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+		desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		err = nil;
+		wm->cursor_pso = [dev newRenderPipelineStateWithDescriptor:desc error:&err];
+		[desc release];
+	}
+	[vs release];
+	[fs release];
+	[lib release];
+	if (wm->cursor_pso == nil) {
+		wm->cursor_failed = true;
+		U_LOG_W("[weave cursor] the Metal cursor pass could not be created (%s) - the OS cursor stays "
+		        "(ADR-046 Amendment 6)",
+		        err != nil ? [[err localizedDescription] UTF8String] : "?");
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * Encode the planned cursor into @p atlas (BGRA8, a render target), before the
+ * capture's atlas stage and the weave. False if nothing was drawn.
+ */
+static bool
+weave_metal_encode_cursor(struct weave_metal *wm,
+                          id<MTLCommandBuffer> cmd,
+                          id<MTLTexture> atlas,
+                          const struct comp_multi_weave_cursor_draw *d)
+{
+	if (d == NULL || d->quad_count == 0 || d->rgba == NULL || d->image_w == 0 || d->image_h == 0 || atlas == nil ||
+	    !weave_metal_cursor_ensure(wm)) {
+		return false;
+	}
+	// The sprite: re-uploaded only when its pixels changed.
+	if (wm->cursor_tex == nil || wm->cursor_w != d->image_w || wm->cursor_h != d->image_h) {
+		[wm->cursor_tex release];
+		MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                                              width:d->image_w
+		                                                                             height:d->image_h
+		                                                                          mipmapped:NO];
+		td.usage = MTLTextureUsageShaderRead;
+		wm->cursor_tex = [weave_metal_device() newTextureWithDescriptor:td];
+		wm->cursor_w = wm->cursor_tex != nil ? d->image_w : 0;
+		wm->cursor_h = wm->cursor_tex != nil ? d->image_h : 0;
+		wm->cursor_serial = 0;
+		if (wm->cursor_tex == nil) {
+			return false;
+		}
+	}
+	if (wm->cursor_serial != d->image_serial) {
+		[wm->cursor_tex replaceRegion:MTLRegionMake2D(0, 0, d->image_w, d->image_h)
+		                  mipmapLevel:0
+		                    withBytes:d->rgba
+		                  bytesPerRow:(NSUInteger)d->image_w * 4];
+		wm->cursor_serial = d->image_serial;
+	}
+
+	const int32_t tw = (int32_t)[atlas width], th = (int32_t)[atlas height];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = atlas;
+	rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+	[enc setRenderPipelineState:wm->cursor_pso];
+	[enc setFragmentTexture:wm->cursor_tex atIndex:0];
+	uint32_t drawn = 0;
+	for (uint32_t i = 0; i < d->quad_count; i++) {
+		const struct comp_multi_weave_cursor_quad *q = &d->quads[i];
+		// The scissor: the rect's part of this view's tile, inside the atlas
+		// (Metal rejects a scissor that leaves the attachment).
+		int32_t sx0 = q->clip[0] < 0 ? 0 : q->clip[0];
+		int32_t sy0 = q->clip[1] < 0 ? 0 : q->clip[1];
+		int32_t sx1 = q->clip[0] + q->clip[2];
+		int32_t sy1 = q->clip[1] + q->clip[3];
+		sx1 = sx1 > tw ? tw : sx1;
+		sy1 = sy1 > th ? th : sy1;
+		if (sx1 <= sx0 || sy1 <= sy0 || !(q->rect[2] > 0.0f) || !(q->rect[3] > 0.0f)) {
+			continue;
+		}
+		MTLViewport vp = {(double)q->rect[0], (double)q->rect[1], (double)q->rect[2], (double)q->rect[3], 0.0, 1.0};
+		MTLScissorRect sc = {(NSUInteger)sx0, (NSUInteger)sy0, (NSUInteger)(sx1 - sx0), (NSUInteger)(sy1 - sy0)};
+		struct weave_cursor_params cp = {
+		    .uv_rect = {q->uv[0], q->uv[1], q->uv[2], q->uv[3]},
+		    .radius = {d->radius_uv[0], d->radius_uv[1]},
+		    .alpha = d->alpha,
+		};
+		[enc setViewport:vp];
+		[enc setScissorRect:sc];
+		[enc setFragmentBytes:&cp length:sizeof(cp) atIndex:0];
+		[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		drawn++;
+	}
+	[enc endEncoding];
+	return drawn > 0;
+}
+
+//! XR_DXR_cursor_depth v10: the sprite goes after 1 s without a request.
+static void
+mtlb_cursor_release(struct multi_compositor *mc)
+{
+	struct weave_metal *wm = wm_of(mc);
+	if (wm != NULL) {
+		[wm->cursor_tex release];
+		wm->cursor_tex = nil;
+		wm->cursor_w = wm->cursor_h = 0;
+		wm->cursor_serial = 0;
+	}
+}
+
+/*
+ *
  * XR_DXR_lift §6: lifted weave rects (comp_multi_weave_metal_lift, planned by
  * vk_conv_weave through comp_multi_weave_lift).
  *
@@ -995,6 +1210,15 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 			view_count = p->view_count;
 		}
 
+		// XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the weave-rect cursor,
+		// into every view of the hovered rect in the atlas the DP is about to
+		// consume (the SBS scratch or the v6 crop - never the caller's input:
+		// the front end does not ask for zero-copy with a cursor request).
+		if (p->cursor != NULL && atlas != wm->in_tex && !weave_metal_encode_cursor(wm, cmd, atlas, p->cursor)) {
+			comp_multi_weave_cursor_not_drawn(&mc->weave.cursor, mc->weave.capture.tag,
+			                                  "the Metal pass encoded nothing");
+		}
+
 		// #2470: the atlas the DP is about to consume (SBS scratch / v6 crop /
 		// the zero-copy input), lifted views in: one blit into a shared buffer,
 		// read once the command buffer completed. Before the split, so it is
@@ -1251,6 +1475,8 @@ mtlb_fini(struct multi_compositor *mc)
 		[wm->unsqueeze_pso release];
 		[wm->alpha_pso release];
 		[wm->over_pso release];
+		[wm->cursor_pso release];
+		[wm->cursor_tex release];
 		[wm->queue release];
 		free(wm);
 		mc->weave.metal = NULL;
@@ -1276,5 +1502,6 @@ const struct comp_multi_weave_macos_backend comp_multi_weave_macos_backend_metal
     .request_display_mode = mtlb_request_display_mode,
     .get_hardware_3d_state = mtlb_get_hardware_3d_state,
     .snap_window_rect = mtlb_snap_window_rect,
+    .cursor_release = mtlb_cursor_release,
     .fini = mtlb_fini,
 };

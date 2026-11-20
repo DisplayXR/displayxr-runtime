@@ -475,7 +475,10 @@ weave_create_scratch(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t
 	    .tiling = VK_IMAGE_TILING_OPTIMAL,
 	    // TRANSFER_SRC: a window woven per screen (#2218 item 6) crops each
 	    // segment's views OUT of this atlas, and flat-blits from it.
-	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	    // COLOR_ATTACHMENT: the weave-rect cursor (XR_DXR_cursor_depth v10) is
+	    // drawn into this atlas by a render pass of its own, on cursor frames only.
+	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
@@ -613,6 +616,7 @@ static void
 weave_release_scratch(struct vk_bundle *vk, struct multi_compositor *mc)
 {
 	weave_eye_stage_release_all(vk, mc);
+	comp_multi_weave_cursor_vk_invalidate_target(&mc->weave.cursor_vk, vk); // its framebuffer names sbs_view
 	if (mc->weave.sbs_view != VK_NULL_HANDLE) {
 		vk->vkDestroyImageView(vk->device, mc->weave.sbs_view, NULL);
 		mc->weave.sbs_view = VK_NULL_HANDLE;
@@ -646,7 +650,10 @@ weave_create_crop(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t w,
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
 	    .tiling = VK_IMAGE_TILING_OPTIMAL,
 	    // TRANSFER_SRC: the per-screen crop reads from it (#2218 item 6).
-	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	    // COLOR_ATTACHMENT: the weave-rect cursor (XR_DXR_cursor_depth v10) is
+	    // drawn into this atlas by a render pass of its own, on cursor frames only.
+	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
@@ -701,6 +708,7 @@ weave_create_crop(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t w,
 static void
 weave_release_crop(struct vk_bundle *vk, struct multi_compositor *mc)
 {
+	comp_multi_weave_cursor_vk_invalidate_target(&mc->weave.cursor_vk, vk); // ... or crop_view
 	if (mc->weave.crop_view != VK_NULL_HANDLE) {
 		vk->vkDestroyImageView(vk->device, mc->weave.crop_view, NULL);
 		mc->weave.crop_view = VK_NULL_HANDLE;
@@ -1663,6 +1671,23 @@ vkb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_m
 		                         0, NULL, 0, NULL, 1, &sbs_to_read);
 		} // end !nview (legacy/batch SBS record)
 
+		// XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the weave-rect cursor,
+		// into every view of the hovered rect in the atlas the DP is about to
+		// sample (the SBS scratch or the v6 crop, both SHADER_READ_ONLY here;
+		// the front end never asks for zero-copy with a cursor request).
+		// Before the capture's atlas stage, so the capture shows it.
+		if (p->cursor != NULL && !v6_zero_copy) {
+		const uint32_t cw = nview ? mc->weave.crop_w : mc->weave.sbs_w;
+		const uint32_t ch = nview ? mc->weave.crop_h : mc->weave.sbs_h;
+		if (!comp_multi_weave_cursor_vk_draw(
+			&mc->weave.cursor_vk, vk, cmd, p->cursor, NULL, dp_src_image, dp_src_view, WEAVE_VK_FORMAT, cw,
+			ch, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)) {
+			comp_multi_weave_cursor_not_drawn(&mc->weave.cursor, mc->weave.capture.tag,
+				                          "the Vulkan pass recorded nothing");
+		}
+		}
+
 		// Output -> COLOR_ATTACHMENT (fully re-rendered every submit, so the
 		// discard from UNDEFINED is fine).
 		VkImageMemoryBarrier out_to_attach = {
@@ -1926,6 +1951,16 @@ vkb_get_hardware_3d_state(struct multi_compositor *mc, bool *out_is_3d)
 	return mc->weave.dp != NULL && xrt_display_processor_get_hardware_3d_state(mc->weave.dp, out_is_3d);
 }
 
+//! XR_DXR_cursor_depth v10: the sprite goes after 1 s without a request.
+static void
+vkb_cursor_release(struct multi_compositor *mc)
+{
+	struct vk_bundle *vk = weave_get_vk(mc);
+	if (vk != NULL) {
+		comp_multi_weave_cursor_vk_release_sprite(&mc->weave.cursor_vk, vk);
+	}
+}
+
 static void
 vkb_fini(struct multi_compositor *mc)
 {
@@ -1940,6 +1975,7 @@ vkb_fini(struct multi_compositor *mc)
 	}
 	// XR_DXR_lift §6: the lifted rects' state (pins, pending snapshots) -- idle above.
 	comp_multi_weave_lift_fini(&mc->weave.lift);
+	comp_multi_weave_cursor_vk_fini(&mc->weave.cursor_vk, vk); // XR_DXR_cursor_depth v10 (idle above)
 	weave_release_input(vk, mc);
 	weave_release_overlay(vk, mc);
 	weave_release_scratch(vk, mc);
@@ -1989,6 +2025,7 @@ const struct comp_multi_weave_macos_backend comp_multi_weave_macos_backend_vk = 
     .request_display_mode = vkb_request_display_mode,
     .get_hardware_3d_state = vkb_get_hardware_3d_state,
     .snap_window_rect = NULL, // unchanged: no snap on the vk weave path (identity)
+    .cursor_release = vkb_cursor_release,
     .fini = vkb_fini,
 };
 

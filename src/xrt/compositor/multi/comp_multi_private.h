@@ -43,6 +43,8 @@
 #if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
 #include "multi/comp_multi_weave_lift.h"
 #include "multi/comp_multi_weave_capture.h"
+#include "multi/comp_multi_weave_cursor.h"    // XR_DXR_cursor_depth v10: the weave-rect cursor
+#include "multi/comp_multi_weave_cursor_vk.h" // ... and its Vulkan pass
 #elif defined(XRT_OS_ANDROID)
 #include "multi/comp_multi_weave_capture.h"
 #include "util/comp_weave_present_feedback.h"
@@ -758,6 +760,19 @@ struct multi_compositor
 		struct comp_multi_weave_capture capture;
 
 		/*!
+		 * @name XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the weave-rect cursor
+		 * The front end stages the request and plans the draw
+		 * (comp_multi_weave_cursor.h); the backend draws it into the atlas its
+		 * DP consumes - the vk backend through @ref cursor_vk, the Metal
+		 * backend through its own pass. Zeroed, and untouched, for a client
+		 * that never chains a request. Under @ref mutex.
+		 * @{
+		 */
+		struct comp_multi_weave_cursor cursor;
+		struct comp_multi_weave_cursor_vk cursor_vk;
+		//! @}
+
+		/*!
 		 * @name Per-screen display processors (#2218 item 6, ADR-047 D2)
 		 * A bound window not wholly on the system-default screen is woven per
 		 * screen: each screen's part by the DP of THAT screen (a windowless
@@ -1337,6 +1352,28 @@ struct multi_compositor
 		//! #2207: file-trigger capture (input / atlas / woven PNGs) —
 		//! comp_multi_weave_capture.h. Guarded by the weave mutex.
 		struct comp_multi_weave_capture capture;
+
+		/*!
+		 * @name XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the weave-rect cursor
+		 * comp_multi_weave_cursor.h plans it, @ref cursor_vk draws it into the
+		 * SBS scratch / v6 crop before the weave. The caller's texture carrier
+		 * arrives as an fd (a dma-buf with its descriptor, or a same-driver
+		 * OPAQUE_FD): parked in cursor_tex_* by the IPC call, imported into
+		 * @ref cursor_slot by the next submit that carries a request, copied
+		 * into the pass's own sprite image by the draw that first needs it.
+		 * Zeroed, and untouched, for a client that never chains a request.
+		 * Guarded by the weave mutex.
+		 * @{
+		 */
+		struct comp_multi_weave_cursor cursor;
+		struct comp_multi_weave_cursor_vk cursor_vk;
+		bool cursor_tex_pending;   //!< a carrier fd is parked
+		int cursor_tex_fd;         //!< owned while pending
+		bool cursor_tex_is_dmabuf; //!< else OPAQUE_FD
+		struct xrt_weave_dmabuf_desc cursor_tex_desc;
+		uint32_t cursor_tex_w, cursor_tex_h;
+		struct comp_multi_weave_linux_slot cursor_slot; //!< the imported carrier
+		                                                //! @}
 	} weave;
 #endif
 };
@@ -2160,6 +2197,51 @@ comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
                                   int32_t target_y,
                                   int32_t *out_snapped_x,
                                   int32_t *out_snapped_y);
+
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+/*!
+ * @name XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the weave-rect cursor
+ * on the POSIX engines - the twins of comp_d3d11_service_weave_set_cursor_request
+ * / _set_cursor_sprite_texture / _get_cursor_state. Staged for the NEXT weave
+ * submit on the same connection; only a caller that chained
+ * XrCursorDepthWeaveRequestDXR reaches any of them (ADR-046 section 0).
+ * @{
+ */
+void
+comp_multi_weave_set_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req);
+
+//! What the last weave submit's cursor request drew.
+void
+comp_multi_weave_get_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state);
+
+#ifdef XRT_OS_MACOS
+/*!
+ * The TEXTURE sprite carrier on macOS: an IOSurface (BGRA8 or RGBA8, one
+ * plane, premultiplied, sRGB-encoded). @p surface is BORROWED: its pixels are
+ * read here and it is not kept.
+ */
+void
+comp_multi_weave_macos_set_cursor_sprite(struct xrt_compositor *xc,
+                                         xrt_graphics_buffer_handle_t surface,
+                                         const struct xrt_weave_cursor_sprite_texture *info);
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * The TEXTURE sprite carrier on desktop Linux: a dma-buf described by @p desc
+ * (any modifier the service's device imports; ARGB8888 / ABGR8888 and their
+ * X variants), or with @p desc NULL a same-driver Vulkan OPAQUE_FD export of a
+ * info->width x info->height B8G8R8A8_UNORM image created with the stage-A
+ * usage set. @p fd is OWNED from here on (closed once imported or replaced).
+ */
+void
+comp_multi_weave_linux_set_cursor_sprite(struct xrt_compositor *xc,
+                                         int fd,
+                                         const struct xrt_weave_dmabuf_desc *desc,
+                                         const struct xrt_weave_cursor_sprite_texture *info);
+#endif
+/*! @} */
+#endif // XRT_OS_MACOS || XRT_OS_LINUX_DESKTOP
 
 //! Teardown (multi_compositor_destroy). Safe to call when never used.
 void

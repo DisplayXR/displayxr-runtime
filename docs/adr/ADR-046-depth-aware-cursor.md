@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5), §B.7 crosstalk softening of the lifted cursor (2026-10-11; Metal + D3D11 + Vulkan + D3D12 + GL) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · Amendment 4 (the runtime draws the web cursor, 2026-10-13) proposed · Amendment 5 (opt-in depth range: front only, or both sides of the glass, 2026-11-19) proposed, spec v9 · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5), §B.7 crosstalk softening of the lifted cursor (2026-10-11; Metal + D3D11 + Vulkan + D3D12 + GL) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · Amendment 4 (the runtime draws the web cursor, 2026-10-13) proposed · Amendment 5 (opt-in depth range: front only, or both sides of the glass, 2026-11-19) proposed, spec v9 · Amendment 6 (the web cursor on desktop Linux and macOS, 2026-11-19) proposed, spec v10 · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -1748,3 +1748,171 @@ native demo or engine plug-in is affected unless it opts in.
 5. **Panel evidence.** The range has been unit-tested and captured in a simulated-display
    atlas; it has not been looked at on a tracked 3D panel.
 
+---
+
+## Amendment 6 (2026-11-19): the web cursor on desktop Linux and macOS
+
+**Proposed**, built. It is Amendment 4's rollout steps W4 and W5 (the "Platforms" paragraph of
+its §5), done together, and `XR_DXR_cursor_depth` spec v10.
+
+### Why
+
+Amendment 4's weave-rect cursor was drawn by one engine, the Windows D3D11 service. On macOS
+and desktop Linux a page in the DisplayXR Browser fell back to the SDK-drawn sprite, with the
+two defects Amendment 4 exists to remove: the wrong look and the page's frame rate. Both
+platforms have a weave engine (`comp_multi_weave_macos.c` over a Vulkan and a Metal backend,
+`comp_multi_weave_linux.c`), and both already draw the depth cursor for in-process apps.
+
+### Decision
+
+The POSIX weave engines draw the weave-rect cursor, with **no new API**: the same request, the
+same state, the same contract. The spec version moves to 10 as the support signal a caller
+reads (`getCursorDepthSupport()` answers "runtime" on macOS and Linux only at ≥ 10; Windows
+stays ≥ 8). All three engines land together, because the version is one number for the two
+operating systems.
+
+#### 1. One policy, three engines
+
+A new module, `compositor/multi/comp_multi_weave_cursor.{h,c}`, holds everything that is not a
+GPU call, so the engines cannot drift from each other or from Windows. It is the D3D11
+service's `svc_weave_cursor_draw_impl`, function for function: the request staged for the next
+submit, the 500 ms depth memo, the sprite bookkeeping (generations, `KEEP`, the 1 s idle
+release), the pick (topmost rect, lifted rects keep Amendment 1's cursor), `u_cursor_weave_step`
+(the one policy, the filter, the HYBRID anchor, Amendment 5's range flag, the early hand-back),
+`u_cursor_draw_soften_sized` (B.7), the per-view boxes, `drawnRectMask` / `drawnBounds` /
+`spriteGeneration`, the refusal reasons and their one-WARN-per-change log. An engine supplies
+the frame (rects, layout, the window in metres, the eyes, the pointer when it can read one) and
+draws the boxes it gets back.
+
+The per-view box arithmetic moved into `u_cursor_depth` as pure functions
+(`u_cursor_weave_view_quad`, `u_cursor_weave_tiles_batch` / `_nview`,
+`u_cursor_weave_quad_pad`), unit-tested against the service's numbers.
+
+#### 2. The pass
+
+The in-process Vulkan and Metal cursor passes ride their compositor's compose pipeline. A
+weave engine has none (it un-squeezes with blits), so the same quad is a small pass of its own:
+
+- **Vulkan** (`comp_multi_weave_cursor_vk.{h,c}`, shared by the Linux engine and the macOS vk
+  backend): a render pass over the SBS scratch or the v6 crop, `LOAD`, one premultiplied
+  alpha-blended quad per view tile, the viewport the blur-padded sprite box, the scissor the
+  hovered rect in that tile. The fragment shader is `zone_blit_soft.frag`'s 13-tap kernel.
+  Created on the first cursor draw.
+- **Metal** (in `comp_multi_weave_macos_metal.m`): the same quad and kernel as an MSL
+  pipeline, compiled on the first cursor draw.
+
+Both draw after the rects and the lifted views, before the capture's atlas stage and the weave,
+and never into the caller's buffer: a submit that carries a request does not take the v6
+zero-copy path (Amendment 4's rule).
+
+The only change a submit without a request sees: the engines' private scratch and crop images
+are created with `VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT` as well. No pass, no pipeline, no sprite
+and no allocation exists until a request arrives (§0).
+
+#### 3. The pointer
+
+Amendment 4 reads the pointer inside the submit. What a service can read differs:
+
+| Window system | Source | Why |
+|---|---|---|
+| Windows | `GetCursorPos` → the bound window (Amendment 4) | unchanged |
+| macOS | `CGEventGetLocation` of a fresh event, inside the submit: global points, top-left origin, × the bound panel's backing scale, against the geometry bound with `XR_DXR_weave` | readable from any process of the session with no permission; the same rect the phase origin uses |
+| Linux, Wayland | **the caller**: the entry's `sampleUV` | a Wayland client is never told where the pointer is outside its own surfaces, and the service is a client. There is nothing to read |
+| Linux, X11 session | `XQueryPointer` on the root, inside the submit, against the bound geometry; libX11 is `dlopen`ed, never linked | the X server answers any client |
+| Linux, XWayland client of a Wayland session | the caller | `XQueryPointer` follows the pointer only over X11 surfaces there, and its root pixels are not the device pixels of a scaled desktop |
+| macOS, no bound geometry | the caller | no window to map the pointer into |
+
+**The caller as the source.** `sampleUV` was "where the page sampled the depth", a diagnostic.
+That is the pointer in the rect. Spec v10 makes it the pointer wherever the runtime cannot read
+one: the caller sends the hovered rect's entry on every submit with the live pointer in
+`sampleUV`, and a submit with no such entry has no pointer (the 500 ms carry-over keeps a
+depth, not a pointer; otherwise a cursor would stay drawn for half a second after the pointer
+left). The browser already routes every pointer move and already re-weaves on it (Amendment 4
+§4), so the position is as fresh as a submit: one submit behind the runtime-read pointer, and
+the depth filter is unaffected. Sending the entry on every submit is harmless where the
+runtime reads the pointer, so the caller needs no platform switch.
+
+`DXR_WEAVE_CURSOR_POINTER=auto|os|caller` (service environment) overrides the choice; the
+probes use `caller` to script the pointer.
+
+**No occlusion test.** Windows draws only while the bound window is the topmost under the
+pointer. The POSIX engines do not test this. The sprite is drawn into the caller's own window
+content, so a window that covers the caller's covers the sprite as well, and the caller hides
+the OS cursor only while the pointer is routed to it.
+
+#### 4. The TEXTURE carrier
+
+Amendment 4 named the texture carrier and built it for Windows. The browser cannot send an
+`HCURSOR` elsewhere, so the texture is the carrier on both POSIX systems. It travels as the
+overlay atlas does on each:
+
+- **macOS:** an `IOSurface` (`XR_WEAVE_HANDLE_KIND_IOSURFACE_DXR`), one plane, BGRA8 or RGBA8.
+  Its pixels are read on the CPU when the carrier arrives, so both backends upload the same
+  bytes and the surface is not kept.
+- **Desktop Linux:** a dma-buf (`XR_WEAVE_HANDLE_KIND_DMABUF_DXR`) described by an
+  `XrWeaveDmabufDescDXR` chained on `XrCursorDepthWeaveRequestDXR::next`, or a same-driver
+  Vulkan `OPAQUE_FD`. It is imported by the engine's own importers (the ones the input and the
+  overlay use, so any modifier the device imports) and copied into the pass's sprite image on
+  the GPU, between the producer-family acquire and release the engine already does for every
+  caller buffer. The sprite struct is not chainable and may not grow, so the descriptor rides
+  the request's chain; reusing the existing descriptor type adds no struct.
+
+The handle stays the caller's on every platform. A carrier that cannot be read or imported
+keeps the last look, never a wrong one, and the reported `spriteGeneration` tells the caller.
+`OS_CURSOR` stays a Windows carrier.
+
+#### 5. Default look
+
+`comp_cursor_look`, as for every runtime-drawn cursor. The macOS service cannot mirror
+`NSCursor` (AppKit is main-thread-only and the submit runs on an IPC thread), so its default
+look is the classic arrow; Linux uses the cursor theme's `left_ptr`. A browser that sends its
+own bitmap is not affected.
+
+#### 6. Android
+
+Out of scope, as in Amendment 4: touch first, no hover cursor. An Android runtime reports the
+same spec version (it is one header). It accepts a request and its carrier, ignores both
+(closing what it was sent), and reports `drawnRectMask` 0 and `spriteGeneration` 0, so a caller
+that asked keeps its fallback.
+
+### As built
+
+- `u_cursor_depth`: `u_cursor_weave_caller_pointer`, `u_cursor_weave_tiles_batch` / `_nview`,
+  `u_cursor_weave_view_quad`, `u_cursor_weave_quad_pad`, `u_cursor_weave_copy_pixels`; unit
+  tests `cursor_weave posix: ...` in `tests_aux_cursor_depth`.
+- `compositor/multi`: `comp_multi_weave_cursor.{h,c}`, `comp_multi_weave_cursor_vk.{h,c}` (+
+  `shaders/weave_cursor.{vert,frag}` and their pre-compiled SPIR-V headers), the three engines.
+- IPC: `weave_cursor_request` / `_sprite_texture` / `_state` reach the POSIX engines; one new
+  call, `weave_cursor_sprite_dmabuf`, carries the dma-buf descriptor. No existing wire struct
+  changed.
+- State tracker: `oxr_weave.c` sends the texture carrier on macOS and desktop Linux too.
+- Probes: `weave_present_vk_macos --cursor ...` (batch), `weave_probe_vk_macos --cursor` (v6),
+  `weave_probe_vk_linux --cursor` (self-checking).
+
+### Evidence
+
+- **macOS, run** (sim-display, both backends, the pointer scripted through `sampleUV`, the
+  engine's capture trigger): in the pre-weave atlas the sprite sits in both tiles, 29.0 px
+  crossed over content 20 px in front, 10.9 px uncrossed with the BOTH flag over content 20 px
+  behind, and absent with FRONT_ONLY over the same rear content; `drawnRectMask` and
+  `drawnBounds` agree. The Vulkan and the Metal backend produce the same numbers. The v6 crop
+  path and the real pointer (`CGEventGetLocation`) were run as well.
+- **Desktop Linux: compiled on CI, not run.** No Linux panel box was available to this change.
+  The probe's `--cursor` leg and the recipe in the pull request are the acceptance test.
+- **No panel.** Nothing here has been looked at on a tracked 3D display.
+
+### Not changed
+
+§0, the one policy, Amendments 1 to 5's APIs and struct sizes, and the Windows service, which
+this change does not touch.
+
+### Open questions (owner)
+
+1. **`drawnBounds` on a scaled Wayland desktop** are in the pixels of the submitted rects. The
+   browser must compare them with the pointer in the same pixels.
+2. **The dma-buf carrier has not been exercised.** The Linux probe sends an `OPAQUE_FD`.
+3. **XWayland detection** is by session type (`XDG_SESSION_TYPE`), read from the service's
+   environment. A socket-activated service whose environment lacks it takes the caller path,
+   which is always correct.
+4. **The macOS default look** is the arrow, not the mirrored `NSCursor`. Mirroring needs a hop
+   to the main thread.

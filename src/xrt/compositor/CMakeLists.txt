@@ -455,6 +455,14 @@ if(APPLE)
 		comp_multi PRIVATE multi/comp_multi_weave_capture.c multi/comp_multi_weave_capture.h
 		)
 	target_link_libraries(comp_multi PRIVATE xrt-external-stb)
+	# XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the weave-rect cursor -
+	# the shared policy half, the Vulkan pass, and the default look.
+	target_sources(
+		comp_multi
+		PRIVATE multi/comp_multi_weave_cursor.c multi/comp_multi_weave_cursor.h
+			multi/comp_multi_weave_cursor_vk.c multi/comp_multi_weave_cursor_vk.h
+		)
+	target_link_libraries(comp_multi PRIVATE comp_cursor_look)
 	target_link_libraries(
 		comp_multi PRIVATE "-framework IOSurface" "-framework CoreFoundation"
 				   "-framework CoreGraphics"
@@ -507,6 +515,15 @@ if(XRT_FEATURE_COMP_MULTI_WEAVE_LINUX)
 		comp_multi PRIVATE multi/comp_multi_weave_capture.c multi/comp_multi_weave_capture.h
 		)
 	target_link_libraries(comp_multi PRIVATE xrt-external-stb)
+	# XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the weave-rect cursor -
+	# the shared policy half, the Vulkan pass, the default look, and libdl
+	# for the X11 pointer read (libX11 is dlopen()ed, never linked).
+	target_sources(
+		comp_multi
+		PRIVATE multi/comp_multi_weave_cursor.c multi/comp_multi_weave_cursor.h
+			multi/comp_multi_weave_cursor_vk.c multi/comp_multi_weave_cursor_vk.h
+		)
+	target_link_libraries(comp_multi PRIVATE comp_cursor_look ${CMAKE_DL_LIBS})
 endif()
 
 ###

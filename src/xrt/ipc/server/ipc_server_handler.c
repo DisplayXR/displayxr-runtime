@@ -7969,9 +7969,14 @@ ipc_handle_weave_cursor_request(volatile struct ipc_client_state *ics, const str
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	comp_d3d11_service_weave_set_cursor_request(ics->xc, req);
 	return XRT_SUCCESS;
+#elif (defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)) && defined(COMP_MULTI_HAVE_WEAVE)
+	// Spec v10 (ADR-046 Amendment 6): the POSIX weave engines draw it.
+	comp_multi_weave_set_cursor_request(ics->xc, req);
+	return XRT_SUCCESS;
 #else
-	// No weave-rect cursor drawer on this platform yet (macOS, desktop Linux,
-	// Android): the state reports nothing drawn, the caller keeps its fallback.
+	// No weave-rect cursor drawer on this platform (Android: touch first, no
+	// hover cursor): the request is accepted and ignored, the state reports
+	// nothing drawn, the caller keeps its fallback.
 	return XRT_SUCCESS;
 #endif
 }
@@ -8046,9 +8051,76 @@ ipc_handle_weave_cursor_sprite_texture(volatile struct ipc_client_state *ics,
 	// The compositor takes ownership of h (closes it once imported or replaced).
 	comp_d3d11_service_weave_set_cursor_sprite_texture(ics->xc, h, is_dxgi, info);
 	return XRT_SUCCESS;
+#elif defined(XRT_OS_MACOS) && defined(COMP_MULTI_HAVE_WEAVE)
+	// Spec v10: an IOSurface. Its pixels are read now; the received reference
+	// is dropped like every other received handle.
+	comp_multi_weave_macos_set_cursor_sprite(ics->xc, handles[0], info);
+	weave_submit_release_handles(handles, handle_count);
+	return XRT_SUCCESS;
+#elif defined(XRT_OS_LINUX_DESKTOP) && defined(COMP_MULTI_HAVE_WEAVE)
+	// Spec v10: a same-driver OPAQUE_FD (a dma-buf comes with its descriptor,
+	// through weave_cursor_sprite_dmabuf). The engine owns handles[0] from here.
+	comp_multi_weave_linux_set_cursor_sprite(ics->xc, handles[0], NULL, info);
+	if (handle_count > 1) {
+		weave_submit_release_handles(handles + 1, handle_count - 1);
+	}
+	return XRT_SUCCESS;
 #else
 	(void)info;
 	weave_submit_release_handles(handles, handle_count);
+	return XRT_SUCCESS;
+#endif
+}
+
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(COMP_MULTI_HAVE_WEAVE)
+static bool
+weave_unpack_dmabuf(const struct ipc_weave_dmabuf *src, int fd, struct xrt_weave_dmabuf_desc *dst);
+#endif
+
+/*
+ * XR_DXR_cursor_depth v10 (ADR-046 Amendment 6): the TEXTURE sprite carrier as
+ * a dma-buf (desktop Linux) - the fd in handles[0] and what it is. Every other
+ * platform accepts and ignores it (and closes what it was sent).
+ */
+xrt_result_t
+ipc_handle_weave_cursor_sprite_dmabuf(volatile struct ipc_client_state *ics,
+                                      const struct xrt_weave_cursor_sprite_texture *info,
+                                      const struct ipc_weave_dmabuf *dmabuf,
+                                      const xrt_graphics_buffer_handle_t *handles,
+                                      uint32_t handle_count)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_present_owner(ics, "weave_cursor_sprite_dmabuf");
+	if (auth != XRT_SUCCESS || ics->xc == NULL || handle_count < 1) {
+		weave_submit_release_handles(handles, handle_count);
+		return auth != XRT_SUCCESS
+		           ? auth
+		           : (ics->xc == NULL ? XRT_ERROR_IPC_SESSION_NOT_CREATED : XRT_ERROR_IPC_FAILURE);
+	}
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(COMP_MULTI_HAVE_WEAVE)
+	struct xrt_weave_dmabuf_desc desc;
+	if (!weave_unpack_dmabuf(dmabuf, handles[0], &desc) || info->width == 0 || info->height == 0 ||
+	    info->width > 256 || info->height > 256 || desc.width < info->width || desc.height < info->height) {
+		weave_submit_release_handles(handles, handle_count);
+		return XRT_ERROR_IPC_FAILURE; // untrusted wire
+	}
+	// The engine owns handles[0] from here.
+	comp_multi_weave_linux_set_cursor_sprite(ics->xc, handles[0], &desc, info);
+	if (handle_count > 1) {
+		weave_submit_release_handles(handles + 1, handle_count - 1);
+	}
+	return XRT_SUCCESS;
+#else
+	(void)info;
+	(void)dmabuf;
+	weave_submit_release_handles(handles, handle_count);
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	for (uint32_t i = 0; i < handle_count; i++) {
+		if (handles[i] != NULL && ((size_t)handles[i] & 1) == 0) {
+			CloseHandle(handles[i]); // an NT handle duplicated into us
+		}
+	}
+#endif
 	return XRT_SUCCESS;
 #endif
 }
@@ -8067,6 +8139,8 @@ ipc_handle_weave_cursor_state(volatile struct ipc_client_state *ics, struct xrt_
 	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	comp_d3d11_service_weave_get_cursor_state(ics->xc, out_state);
+#elif (defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)) && defined(COMP_MULTI_HAVE_WEAVE)
+	comp_multi_weave_get_cursor_state(ics->xc, out_state);
 #endif
 	return XRT_SUCCESS;
 }

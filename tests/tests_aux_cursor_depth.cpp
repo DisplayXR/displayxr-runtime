@@ -3734,3 +3734,167 @@ TEST_CASE("cursor_range weave: the hand-back works from behind the glass, and a 
 	REQUIRE(first_unreported >= 0);
 	CHECK(first_undrawn - first_unreported >= (int)U_CURSOR_WEAVE_HANDBACK_FRAMES);
 }
+
+
+/*
+ *
+ * Spec v10 (ADR-046 Amendment 6): the POSIX weave engines' shared helpers.
+ *
+ */
+
+TEST_CASE("cursor_weave posix: the caller's sampleUV is the pointer, this submit only, topmost rect wins")
+{
+	const u_cursor_weave_rect rects[3] = {{100, 50, 400, 200}, {300, 100, 200, 100}, {0, 0, 0, 0}};
+	float px = -1.0f, py = -1.0f;
+
+	// One entry: rect origin + uv x size.
+	{
+		const uint32_t idx[1] = {0};
+		const float uv[2] = {0.25f, 0.5f};
+		REQUIRE(u_cursor_weave_caller_pointer(rects, 3, idx, uv, 1, &px, &py));
+		CHECK(px == Catch::Approx(200.0f));
+		CHECK(py == Catch::Approx(150.0f));
+		// It lands inside the rect the pick will choose.
+		CHECK(u_cursor_weave_pick_rect(rects, 3, 0x1u, px, py) == 0);
+	}
+	// uv = 1 stays inside the half-open rect.
+	{
+		const uint32_t idx[1] = {0};
+		const float uv[2] = {1.0f, 1.0f};
+		REQUIRE(u_cursor_weave_caller_pointer(rects, 3, idx, uv, 1, &px, &py));
+		CHECK(px < 500.0f);
+		CHECK(py < 250.0f);
+		CHECK(u_cursor_weave_pick_rect(rects, 3, 0x1u, px, py) == 0);
+	}
+	// Two entries: the topmost rect (highest index), whatever the entry order.
+	{
+		const uint32_t idx[2] = {1, 0};
+		const float uv[4] = {0.5f, 0.5f, 0.1f, 0.1f};
+		REQUIRE(u_cursor_weave_caller_pointer(rects, 3, idx, uv, 2, &px, &py));
+		CHECK(px == Catch::Approx(400.0f));
+		CHECK(py == Catch::Approx(150.0f));
+	}
+	// No entry, a uv outside its rect, a non-finite uv, an index past the
+	// rects, an empty rect: no pointer.
+	{
+		const uint32_t idx[4] = {0, 0, 7, 2};
+		const float uv[8] = {1.5f, 0.5f, NAN, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+		CHECK_FALSE(u_cursor_weave_caller_pointer(rects, 3, idx, uv, 0, &px, &py));
+		CHECK_FALSE(u_cursor_weave_caller_pointer(rects, 3, idx, uv, 4, &px, &py));
+		CHECK_FALSE(u_cursor_weave_caller_pointer(nullptr, 3, idx, uv, 4, &px, &py));
+	}
+}
+
+TEST_CASE("cursor_weave posix: per-view boxes in the batch atlas match the D3D11 service's arithmetic")
+{
+	// Batch: two window-sized tiles side by side, 1:1.
+	u_cursor_weave_tiles t;
+	u_cursor_weave_tiles_batch(1280, 720, &t);
+	CHECK(t.columns == 2);
+	const u_cursor_weave_rect clip = {100, 100, 320, 180};
+	const float spr_w = 24.0f, spr_h = 38.0f, hot_x = 2.0f, hot_y = 3.0f;
+
+	u_cursor_weave_quad q0, q1;
+	// Crossed: the left view's hotspot is right of the right view's.
+	REQUIRE(u_cursor_weave_view_quad(&t, 0, 270.0f, 190.0f, spr_w, spr_h, hot_x, hot_y, &clip, &q0));
+	REQUIRE(u_cursor_weave_view_quad(&t, 1, 250.0f, 190.0f, spr_w, spr_h, hot_x, hot_y, &clip, &q1));
+	// q.x = ox + (wx - hot_x) * sx, ox = view * win_w.
+	CHECK(q0.x == Catch::Approx(268.0f));
+	CHECK(q0.y == Catch::Approx(187.0f));
+	CHECK(q0.w == Catch::Approx(spr_w));
+	CHECK(q0.h == Catch::Approx(spr_h));
+	CHECK(q1.x == Catch::Approx(1280.0f + 248.0f));
+	CHECK(q1.y == Catch::Approx(187.0f));
+	// The scissor is the rect in each tile.
+	CHECK(q0.clip_x == 100);
+	CHECK(q0.clip_y == 100);
+	CHECK(q0.clip_w == 320);
+	CHECK(q0.clip_h == 180);
+	CHECK(q1.clip_x == 1280 + 100);
+	// The disparity survives the mapping, sign included.
+	CHECK((q0.x - 0.0f) - (q1.x - 1280.0f) == Catch::Approx(20.0f));
+
+	// A box wholly outside its rect is not drawn; one straddling the edge is.
+	u_cursor_weave_quad q;
+	CHECK_FALSE(u_cursor_weave_view_quad(&t, 0, 600.0f, 190.0f, spr_w, spr_h, hot_x, hot_y, &clip, &q));
+	CHECK(u_cursor_weave_view_quad(&t, 0, 415.0f, 190.0f, spr_w, spr_h, hot_x, hot_y, &clip, &q));
+	// Degenerate input.
+	CHECK_FALSE(u_cursor_weave_view_quad(&t, 0, NAN, 190.0f, spr_w, spr_h, hot_x, hot_y, &clip, &q));
+	CHECK_FALSE(u_cursor_weave_view_quad(&t, 0, 270.0f, 190.0f, 0.0f, spr_h, hot_x, hot_y, &clip, &q));
+	const u_cursor_weave_rect empty = {100, 100, 0, 180};
+	CHECK_FALSE(u_cursor_weave_view_quad(&t, 0, 270.0f, 190.0f, spr_w, spr_h, hot_x, hot_y, &empty, &q));
+}
+
+TEST_CASE("cursor_weave posix: per-view boxes in a v6 N-view atlas scale with the content view")
+{
+	// 4 views, 2 x 2, each half the window's resolution.
+	u_cursor_weave_tiles t;
+	REQUIRE(u_cursor_weave_tiles_nview(2, 640, 360, 1280, 720, &t));
+	CHECK(t.scale_x == Catch::Approx(0.5f));
+	CHECK(t.scale_y == Catch::Approx(0.5f));
+	const u_cursor_weave_rect clip = {100, 100, 320, 180};
+	u_cursor_weave_quad q;
+	// View 3 = column 1, row 1.
+	REQUIRE(u_cursor_weave_view_quad(&t, 3, 260.0f, 190.0f, 24.0f, 38.0f, 2.0f, 3.0f, &clip, &q));
+	CHECK(q.x == Catch::Approx(640.0f + (260.0f - 2.0f) * 0.5f));
+	CHECK(q.y == Catch::Approx(360.0f + (190.0f - 3.0f) * 0.5f));
+	CHECK(q.w == Catch::Approx(12.0f));
+	CHECK(q.h == Catch::Approx(19.0f));
+	CHECK(q.clip_x == 640 + 50);
+	CHECK(q.clip_y == 360 + 50);
+	CHECK(q.clip_w == 160);
+	CHECK(q.clip_h == 90);
+
+	u_cursor_weave_tiles bad;
+	CHECK_FALSE(u_cursor_weave_tiles_nview(0, 640, 360, 1280, 720, &bad));
+	CHECK_FALSE(u_cursor_weave_tiles_nview(2, 640, 360, 0, 720, &bad));
+}
+
+TEST_CASE("cursor_weave posix: the blur pad keeps the hotspot where it is")
+{
+	const u_cursor_weave_quad q = {200.0f, 100.0f, 24.0f, 40.0f, 0, 0, 0, 0};
+	float rect[4], uv[4];
+	u_cursor_weave_quad_pad(&q, 6.0f, 4.0f, rect, uv);
+	CHECK(rect[0] == Catch::Approx(194.0f));
+	CHECK(rect[1] == Catch::Approx(96.0f));
+	CHECK(rect[2] == Catch::Approx(36.0f));
+	CHECK(rect[3] == Catch::Approx(48.0f));
+	// uv 0..1 still spans exactly the unpadded box.
+	const float x_of_uv0 = rect[0] + (0.0f - uv[0]) / uv[2] * rect[2];
+	const float x_of_uv1 = rect[0] + (1.0f - uv[0]) / uv[2] * rect[2];
+	CHECK(x_of_uv0 == Catch::Approx(200.0f));
+	CHECK(x_of_uv1 == Catch::Approx(224.0f));
+	const float y_of_uv0 = rect[1] + (0.0f - uv[1]) / uv[3] * rect[3];
+	const float y_of_uv1 = rect[1] + (1.0f - uv[1]) / uv[3] * rect[3];
+	CHECK(y_of_uv0 == Catch::Approx(100.0f));
+	CHECK(y_of_uv1 == Catch::Approx(140.0f));
+
+	// No pad (crisp), and a bad pad, leave the box alone.
+	u_cursor_weave_quad_pad(&q, 0.0f, -1.0f, rect, uv);
+	CHECK(rect[0] == Catch::Approx(200.0f));
+	CHECK(rect[2] == Catch::Approx(24.0f));
+	CHECK(uv[0] == Catch::Approx(0.0f));
+	CHECK(uv[2] == Catch::Approx(1.0f));
+	u_cursor_weave_quad_pad(&q, NAN, NAN, rect, uv);
+	CHECK(rect[3] == Catch::Approx(40.0f));
+	CHECK(uv[3] == Catch::Approx(1.0f));
+}
+
+TEST_CASE("cursor_weave posix: a caller's sprite pixels are copied by row stride, BGRA swapped, nothing else")
+{
+	// 2 x 2, stride 12 (4 bytes of row padding).
+	const uint8_t src[24] = {1, 2,  3,  4,  5,  6,  7,  8,  0xEE, 0xEE, 0xEE, 0xEE, //
+	                         9, 10, 11, 12, 13, 14, 15, 16, 0xEE, 0xEE, 0xEE, 0xEE};
+	uint8_t dst[16] = {};
+	REQUIRE(u_cursor_weave_copy_pixels(src, 2, 2, 12, false, dst));
+	const uint8_t want_rgba[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+	CHECK(memcmp(dst, want_rgba, 16) == 0);
+	REQUIRE(u_cursor_weave_copy_pixels(src, 2, 2, 12, true, dst));
+	const uint8_t want_swapped[16] = {3, 2, 1, 4, 7, 6, 5, 8, 11, 10, 9, 12, 15, 14, 13, 16};
+	CHECK(memcmp(dst, want_swapped, 16) == 0);
+
+	CHECK_FALSE(u_cursor_weave_copy_pixels(nullptr, 2, 2, 12, false, dst));
+	CHECK_FALSE(u_cursor_weave_copy_pixels(src, 2, 2, 7, false, dst)); // stride shorter than a row
+	CHECK_FALSE(u_cursor_weave_copy_pixels(src, 257, 2, 2000, false, dst));
+	CHECK_FALSE(u_cursor_weave_copy_pixels(src, 0, 2, 12, false, dst));
+}

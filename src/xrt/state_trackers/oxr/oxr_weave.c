@@ -207,6 +207,15 @@ comp_ipc_client_compositor_weave_cursor_sprite_texture(struct xrt_compositor *xc
 xrt_result_t
 comp_ipc_client_compositor_weave_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state);
 
+#ifdef XRT_OS_LINUX_DESKTOP
+struct xrt_weave_dmabuf_desc;
+// XR_DXR_cursor_depth v10: the texture carrier as a dma-buf (desktop Linux).
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_sprite_dmabuf(struct xrt_compositor *xc,
+                                                      const struct xrt_weave_dmabuf_desc *desc,
+                                                      const struct xrt_weave_cursor_sprite_texture *info);
+#endif
+
 xrt_result_t
 comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *xc,
                                                          uint32_t rect_count,
@@ -1128,9 +1137,34 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			                 "xrWeaveSubmitDXR: XrCursorDepthWeaveSpriteDXR::kind (%d) is not a valid kind",
 			                 (int)sp->kind);
 		}
+		bool sprite_texture_missing = sp->texture == NULL;
+#ifdef XRT_OS_LINUX_DESKTOP
+		// Spec v10: a dma-buf carrier is described by an XrWeaveDmabufDescDXR
+		// chained on the REQUEST; the texture field is then ignored, exactly as
+		// inputTexture is for a dma-buf input.
+		const XrWeaveDmabufDescDXR *sprite_dmabuf =
+		    OXR_GET_INPUT_FROM_CHAIN(creq, XR_TYPE_WEAVE_DMABUF_DESC_DXR, XrWeaveDmabufDescDXR);
+		if (sp->kind == XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR) {
+			if (sp->textureKind == XR_WEAVE_HANDLE_KIND_DMABUF_DXR && sprite_dmabuf == NULL) {
+				return oxr_error(
+				    &log, XR_ERROR_VALIDATION_FAILURE,
+				    "xrWeaveSubmitDXR: a TEXTURE sprite of kind DMABUF needs an XrWeaveDmabufDescDXR "
+				    "chained on XrCursorDepthWeaveRequestDXR::next");
+			}
+			if (sp->textureKind == XR_WEAVE_HANDLE_KIND_OPAQUE_FD_DXR && sprite_dmabuf != NULL) {
+				return oxr_error(
+				    &log, XR_ERROR_VALIDATION_FAILURE,
+				    "xrWeaveSubmitDXR: a TEXTURE sprite of kind OPAQUE_FD must not chain an "
+				    "XrWeaveDmabufDescDXR");
+			}
+			if (sprite_dmabuf != NULL) {
+				sprite_texture_missing = false;
+			}
+		}
+#endif
 		if (sp->kind == XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR &&
-		    (sp->texture == NULL || sp->extent.width <= 0 || sp->extent.height <= 0 || sp->extent.width > 256 ||
-		     sp->extent.height > 256 || !weave_handle_kind_ok(sp->textureKind))) {
+		    (sprite_texture_missing || sp->extent.width <= 0 || sp->extent.height <= 0 ||
+		     sp->extent.width > 256 || sp->extent.height > 256 || !weave_handle_kind_ok(sp->textureKind))) {
 			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
 			                 "xrWeaveSubmitDXR: a TEXTURE sprite needs a texture handle this platform accepts and "
 			                 "an extent of 1..256 x 1..256 (got %dx%d, kind %d)",
@@ -1160,8 +1194,10 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			// as sent; the service ignores bits it does not know.
 			xreq.rects[i].flags = e->flags;
 		}
-#if defined(XR_USE_PLATFORM_WIN32)
-		// The texture carrier crosses once per generation, with its handle.
+#if defined(XR_USE_PLATFORM_WIN32) || defined(XR_USE_PLATFORM_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+		// The texture carrier crosses once per generation, with its handle
+		// (Windows since v8; macOS and desktop Linux since v10). The handle
+		// stays the caller's on every platform.
 		if (sp->kind == XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR &&
 		    sp->generation != sess->weave.cursor_tex_generation_sent) {
 			struct xrt_weave_cursor_sprite_texture ti;
@@ -1172,9 +1208,34 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			ti.hot_x = sp->hotSpotPx.x;
 			ti.hot_y = sp->hotSpotPx.y;
 			ti.size_m = sp->sizeMeters;
+#if defined(XR_USE_PLATFORM_WIN32)
 			ti.is_dxgi = sp->textureKind == XR_WEAVE_HANDLE_KIND_D3D11_DXGI_DXR ? 1u : 0u;
 			xrt_result_t tx = comp_ipc_client_compositor_weave_cursor_sprite_texture(
 			    &sess->xcn->base, (xrt_graphics_buffer_handle_t)sp->texture, &ti);
+#elif defined(XR_USE_PLATFORM_MACOS)
+			// An IOSurfaceRef (PLATFORM_DEFAULT = IOSURFACE).
+			xrt_result_t tx = comp_ipc_client_compositor_weave_cursor_sprite_texture(
+			    &sess->xcn->base, (xrt_graphics_buffer_handle_t)(intptr_t)sp->texture, &ti);
+#else
+			// A dma-buf with its descriptor, or (no descriptor) a same-driver
+			// Vulkan OPAQUE_FD passed as (void *)(intptr_t)fd.
+			xrt_result_t tx;
+			if (sprite_dmabuf != NULL) {
+				struct xrt_weave_dmabuf_desc sd;
+				const char *why = NULL;
+				if (!weave_dmabuf_from_xr(sprite_dmabuf, &sd, &why) || sd.width < ti.width ||
+				    sd.height < ti.height) {
+					return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+					                 "xrWeaveSubmitDXR: the TEXTURE sprite's XrWeaveDmabufDescDXR "
+					                 "is invalid: %s",
+					                 why != NULL ? why : "it is smaller than the sprite's extent");
+				}
+				tx = comp_ipc_client_compositor_weave_cursor_sprite_dmabuf(&sess->xcn->base, &sd, &ti);
+			} else {
+				tx = comp_ipc_client_compositor_weave_cursor_sprite_texture(
+				    &sess->xcn->base, (xrt_graphics_buffer_handle_t)(intptr_t)sp->texture, &ti);
+			}
+#endif
 			if (tx == XRT_ERROR_IPC_FAILURE) {
 				OXR_CHECK_XRET_MSG(&log, sess, tx, "xrWeaveSubmitDXR: cursor sprite texture failed (xrt_result=%d)",
 				                   (int)tx);

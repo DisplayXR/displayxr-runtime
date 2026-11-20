@@ -2329,6 +2329,165 @@ u_cursor_weave_sprite_idle(uint64_t last_request_ns, uint64_t now_ns)
 	return now_ns < last_request_ns || now_ns - last_request_ns > U_CURSOR_WEAVE_SPRITE_IDLE_NS;
 }
 
+
+/*
+ *
+ * Spec v10 (ADR-046 Amendment 6): the POSIX weave engines' shared helpers.
+ *
+ */
+
+bool
+u_cursor_weave_caller_pointer(const struct u_cursor_weave_rect *rects,
+                              uint32_t rect_count,
+                              const uint32_t *entry_rect_index,
+                              const float *entry_uv,
+                              uint32_t entry_count,
+                              float *out_px,
+                              float *out_py)
+{
+	if (rects == NULL || entry_rect_index == NULL || entry_uv == NULL || out_px == NULL || out_py == NULL) {
+		return false;
+	}
+	if (rect_count > U_CURSOR_WEAVE_MAX_RECTS) {
+		rect_count = U_CURSOR_WEAVE_MAX_RECTS;
+	}
+	bool found = false;
+	uint32_t best = 0;
+	for (uint32_t i = 0; i < entry_count; i++) {
+		const uint32_t ri = entry_rect_index[i];
+		const float u = entry_uv[2 * i + 0], v = entry_uv[2 * i + 1];
+		if (ri >= rect_count || rects[ri].w <= 0 || rects[ri].h <= 0) {
+			continue;
+		}
+		if (!isfinite(u) || !isfinite(v) || u < 0.0f || v < 0.0f || u > 1.0f || v > 1.0f) {
+			continue;
+		}
+		if (found && ri < best) {
+			continue; // a rect below the one already found
+		}
+		// Half-open rects: a uv of exactly 1 stays inside its rect.
+		const float fx = u * (float)rects[ri].w, fy = v * (float)rects[ri].h;
+		const float mx = (float)rects[ri].w - 0.5f, my = (float)rects[ri].h - 0.5f;
+		*out_px = (float)rects[ri].x + (fx < mx ? fx : mx);
+		*out_py = (float)rects[ri].y + (fy < my ? fy : my);
+		best = ri;
+		found = true;
+	}
+	return found;
+}
+
+void
+u_cursor_weave_tiles_batch(uint32_t win_w, uint32_t win_h, struct u_cursor_weave_tiles *out)
+{
+	out->columns = 2;
+	out->tile_w = (float)win_w;
+	out->tile_h = (float)win_h;
+	out->scale_x = 1.0f;
+	out->scale_y = 1.0f;
+}
+
+bool
+u_cursor_weave_tiles_nview(uint32_t columns,
+                           uint32_t content_view_w,
+                           uint32_t content_view_h,
+                           uint32_t win_w,
+                           uint32_t win_h,
+                           struct u_cursor_weave_tiles *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (columns == 0 || content_view_w == 0 || content_view_h == 0 || win_w == 0 || win_h == 0) {
+		return false;
+	}
+	out->columns = columns;
+	out->tile_w = (float)content_view_w;
+	out->tile_h = (float)content_view_h;
+	out->scale_x = (float)content_view_w / (float)win_w;
+	out->scale_y = (float)content_view_h / (float)win_h;
+	return true;
+}
+
+bool
+u_cursor_weave_view_quad(const struct u_cursor_weave_tiles *tiles,
+                         uint32_t view,
+                         float hot_wx,
+                         float hot_wy,
+                         float spr_w,
+                         float spr_h,
+                         float hot_x,
+                         float hot_y,
+                         const struct u_cursor_weave_rect *clip_win,
+                         struct u_cursor_weave_quad *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (tiles == NULL || clip_win == NULL || tiles->columns == 0 || !(tiles->scale_x > 0.0f) ||
+	    !(tiles->scale_y > 0.0f) || !(spr_w > 0.0f) || !(spr_h > 0.0f) || !isfinite(hot_wx) || !isfinite(hot_wy) ||
+	    !isfinite(hot_x) || !isfinite(hot_y) || clip_win->w <= 0 || clip_win->h <= 0) {
+		return false;
+	}
+	const float ox = (float)(view % tiles->columns) * tiles->tile_w;
+	const float oy = (float)(view / tiles->columns) * tiles->tile_h;
+	const float sx = tiles->scale_x, sy = tiles->scale_y;
+	out->x = ox + (hot_wx - hot_x) * sx;
+	out->y = oy + (hot_wy - hot_y) * sy;
+	out->w = spr_w * sx;
+	out->h = spr_h * sy;
+	const float c0x = floorf(ox + (float)clip_win->x * sx);
+	const float c0y = floorf(oy + (float)clip_win->y * sy);
+	const float c1x = ceilf(ox + (float)(clip_win->x + clip_win->w) * sx);
+	const float c1y = ceilf(oy + (float)(clip_win->y + clip_win->h) * sy);
+	if (!isfinite(out->x) || !isfinite(out->y) || !isfinite(out->w) || !isfinite(out->h)) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	out->clip_x = (int32_t)c0x;
+	out->clip_y = (int32_t)c0y;
+	out->clip_w = (int32_t)(c1x - c0x);
+	out->clip_h = (int32_t)(c1y - c0y);
+	if (out->clip_w <= 0 || out->clip_h <= 0) {
+		return false;
+	}
+	return out->x < c1x && out->y < c1y && out->x + out->w > c0x && out->y + out->h > c0y;
+}
+
+void
+u_cursor_weave_quad_pad(
+    const struct u_cursor_weave_quad *q, float pad_x, float pad_y, float out_rect[4], float out_uv[4])
+{
+	const float px = isfinite(pad_x) && pad_x > 0.0f && q->w > 0.0f ? pad_x : 0.0f;
+	const float py = isfinite(pad_y) && pad_y > 0.0f && q->h > 0.0f ? pad_y : 0.0f;
+	out_rect[0] = q->x - px;
+	out_rect[1] = q->y - py;
+	out_rect[2] = q->w + 2.0f * px;
+	out_rect[3] = q->h + 2.0f * py;
+	out_uv[0] = q->w > 0.0f ? -px / q->w : 0.0f;
+	out_uv[1] = q->h > 0.0f ? -py / q->h : 0.0f;
+	out_uv[2] = q->w > 0.0f ? 1.0f + 2.0f * px / q->w : 1.0f;
+	out_uv[3] = q->h > 0.0f ? 1.0f + 2.0f * py / q->h : 1.0f;
+}
+
+bool
+u_cursor_weave_copy_pixels(const uint8_t *src, uint32_t w, uint32_t h, size_t stride, bool swap_rb, uint8_t *dst)
+{
+	if (src == NULL || dst == NULL || w == 0 || h == 0 || w > 256 || h > 256 || stride < (size_t)w * 4) {
+		return false;
+	}
+	for (uint32_t y = 0; y < h; y++) {
+		const uint8_t *s = src + (size_t)y * stride;
+		uint8_t *d = dst + (size_t)y * w * 4;
+		if (!swap_rb) {
+			memcpy(d, s, (size_t)w * 4);
+			continue;
+		}
+		for (uint32_t x = 0; x < w; x++) {
+			d[4 * x + 0] = s[4 * x + 2];
+			d[4 * x + 1] = s[4 * x + 1];
+			d[4 * x + 2] = s[4 * x + 0];
+			d[4 * x + 3] = s[4 * x + 3];
+		}
+	}
+	return true;
+}
+
 uint32_t
 u_cursor_os_height_px_win(uint32_t base_size_pt, uint32_t dpi, uint32_t metric_px, uint32_t image_h)
 {

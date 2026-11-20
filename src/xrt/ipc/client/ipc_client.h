@@ -421,6 +421,18 @@ comp_ipc_client_compositor_weave_cursor_sprite_texture(struct xrt_compositor *xc
                                                        xrt_graphics_buffer_handle_t handle,
                                                        const struct xrt_weave_cursor_sprite_texture *info);
 
+#ifdef XRT_OS_LINUX_DESKTOP
+struct xrt_weave_dmabuf_desc;
+/*!
+ * XR_DXR_cursor_depth v10: the texture carrier of a new sprite as a dma-buf
+ * (desktop Linux). @p desc->fd stays the caller's.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_sprite_dmabuf(struct xrt_compositor *xc,
+                                                      const struct xrt_weave_dmabuf_desc *desc,
+                                                      const struct xrt_weave_cursor_sprite_texture *info);
+#endif
+
 //! XR_DXR_cursor_depth v8: what the last weave_submit's cursor request drew.
 xrt_result_t
 comp_ipc_client_compositor_weave_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state);

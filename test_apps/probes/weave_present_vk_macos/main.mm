@@ -38,6 +38,19 @@
  * Flags: --display N  --size WxH (points, default 1280x720)  --secs N (auto-quit)
  *        --sbs-only (present the raw SBS input, no weave)  --ring
  *
+ * The weave-rect cursor (XR_DXR_cursor_depth v10, ADR-046 Amendment 6), without
+ * a browser: --cursor front|rear|U,V chains XrCursorDepthWeaveRequestDXR on
+ * every submit, with the pointer reported in sampleUV (front = over the red
+ * box, 20 px crossed; rear = over the cyan box, 20 px uncrossed; U,V = any
+ * point of the window, then --cursor-disp PX gives the content disparity, < 0
+ * in front). --cursor-both sets the v9 BOTH range flag (follow content behind
+ * the glass too), --cursor-sprite texture sends a generated 48 x 48 magenta
+ * test bitmap as the TEXTURE carrier (an IOSurface) instead of the default
+ * look, --cursor-flat reports hasContent = false. The runtime reads the real
+ * pointer on macOS; start the SERVICE with DXR_WEAVE_CURSOR_POINTER=caller so
+ * it takes the scripted sampleUV instead. What it drew (drawnRectMask,
+ * drawnBounds, spriteGeneration) is logged whenever it changes.
+ *
  * Run: see run_weave_present_leia.sh next to this file (service + presenter, sim or
  * Leia), or with a service already up:
  *   XRT_FORCE_MODE=ipc XR_RUNTIME_JSON=_package/DisplayXR-macOS/openxr_displayxr.json \
@@ -56,6 +69,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_weave.h>
+#include <openxr/XR_DXR_cursor_depth.h>
 
 #include <algorithm>
 #include <cmath>
@@ -85,6 +99,13 @@ struct Options
 	double secs = 0;
 	bool sbs_only = false;
 	bool ring = false;
+	// XR_DXR_cursor_depth v10: the weave-rect cursor.
+	bool cursor = false;
+	float cursor_u = 0.5f, cursor_v = 0.5f;
+	float cursor_disp_px = -20.0f;
+	bool cursor_has_content = true;
+	bool cursor_both = false;
+	bool cursor_texture = false;
 };
 
 struct Xr
@@ -154,14 +175,15 @@ has_ext(const std::vector<VkExtensionProperties> &v, const char *name)
 static bool
 xr_init(Xr &xr)
 {
-	const char *enabled[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_DXR_WEAVE_EXTENSION_NAME};
+	const char *enabled[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_DXR_WEAVE_EXTENSION_NAME,
+	                         XR_DXR_CURSOR_DEPTH_EXTENSION_NAME};
 	XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
 	snprintf(ici.applicationInfo.applicationName, sizeof(ici.applicationInfo.applicationName), "%s",
 	         "DXRWeavePresentMacOS");
 	ici.applicationInfo.applicationVersion = 1;
 	snprintf(ici.applicationInfo.engineName, sizeof(ici.applicationInfo.engineName), "%s", "None");
 	ici.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-	ici.enabledExtensionCount = 2;
+	ici.enabledExtensionCount = g_opt.cursor ? 3 : 2;
 	ici.enabledExtensionNames = enabled;
 	XRB(xrCreateInstance(&ici, &xr.instance));
 
@@ -342,6 +364,41 @@ tag_surface(IOSurfaceRef s, CGDirectDisplayID did)
 	CGColorSpaceRelease(cs);
 }
 
+/*!
+ * The TEXTURE sprite carrier (--cursor-sprite texture): a 48 x 48 premultiplied
+ * BGRA8 IOSurface - a solid magenta disc with a white centre dot (the hotspot,
+ * 24,24) on transparent. Magenta appears nowhere in the scene, so a capture
+ * locates the sprite by colour.
+ */
+static IOSurfaceRef
+create_cursor_sprite(void)
+{
+	const int n = 48;
+	IOSurfaceRef s = create_bgra_surface(n, n);
+	if (s == nullptr) {
+		return nullptr;
+	}
+	IOSurfaceLock(s, 0, nullptr);
+	uint8_t *px = (uint8_t *)IOSurfaceGetBaseAddress(s);
+	const size_t stride = IOSurfaceGetBytesPerRow(s);
+	for (int y = 0; y < n; y++) {
+		for (int x = 0; x < n; x++) {
+			const float dx = (float)x + 0.5f - 24.0f, dy = (float)y + 0.5f - 24.0f;
+			const float r = std::sqrt(dx * dx + dy * dy);
+			uint8_t *p = px + (size_t)y * stride + (size_t)x * 4;
+			if (r < 4.0f) {
+				p[0] = p[1] = p[2] = p[3] = 255; // white dot
+			} else if (r < 20.0f) {
+				p[0] = 255, p[1] = 0, p[2] = 255, p[3] = 255; // B, G, R, A: magenta
+			} else {
+				p[0] = p[1] = p[2] = p[3] = 0; // premultiplied transparent
+			}
+		}
+	}
+	IOSurfaceUnlock(s, 0, nullptr);
+	return s;
+}
+
 struct Rgb
 {
 	uint8_t r, g, b;
@@ -479,6 +536,9 @@ draw_dynamic(Canvas c, uint64_t frame)
 	double _stat_t0;
 	uint64_t _stat_frames;
 	XrWeaveOutputDXR _last_out;
+	IOSurfaceRef _cursor_sprite;
+	XrCursorDepthWeaveStateDXR _cursor_state;
+	bool _cursor_state_logged;
 }
 
 static double
@@ -705,7 +765,51 @@ screen_did(NSScreen *s)
 		submit.rect = whole;
 		submit.firstChunk = XR_TRUE;
 		XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+		// XR_DXR_cursor_depth v10: the weave-rect cursor on the one rect, the
+		// pointer scripted through sampleUV, on every submit.
+		XrCursorDepthWeaveRectDXR crect = {};
+		XrCursorDepthWeaveRequestDXR creq = {(XrStructureType)XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR};
+		XrCursorDepthWeaveStateDXR cstate = {(XrStructureType)XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR};
+		if (g_opt.cursor) {
+			crect.rectIndex = 0;
+			crect.hasContent = g_opt.cursor_has_content ? XR_TRUE : XR_FALSE;
+			crect.disparityPx = g_opt.cursor_disp_px;
+			crect.sampleUV = {g_opt.cursor_u, g_opt.cursor_v};
+			crect.flags = g_opt.cursor_both ? XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR : 0u;
+			creq.rectCount = 1;
+			creq.rects = &crect;
+			creq.sprite.generation = 1;
+			if (g_opt.cursor_texture) {
+				if (_cursor_sprite == nullptr) {
+					_cursor_sprite = create_cursor_sprite();
+				}
+				// The payload once, then KEEP - unless the runtime says it does
+				// not hold generation 1 (its state), then resend.
+				const bool held = _cursor_state_logged && _cursor_state.spriteGeneration == 1;
+				creq.sprite.kind =
+				    held ? XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR : XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR;
+				creq.sprite.texture = (void *)_cursor_sprite;
+				creq.sprite.textureKind = XR_WEAVE_HANDLE_KIND_IOSURFACE_DXR;
+				creq.sprite.extent = {48, 48};
+				creq.sprite.hotSpotPx = {24.0f, 24.0f};
+			} else {
+				creq.sprite.kind = XR_CURSOR_DEPTH_WEAVE_SPRITE_DEFAULT_DXR;
+			}
+			rects.next = &creq;
+			out.next = &cstate;
+		}
 		XrResult r = g_xr.submit(g_xr.session, &submit, &out);
+		if (g_opt.cursor && XR_SUCCEEDED(r) &&
+		    (!_cursor_state_logged || cstate.drawnRectMask != _cursor_state.drawnRectMask ||
+		     cstate.spriteGeneration != _cursor_state.spriteGeneration)) {
+			LOG("cursor state: drawnRectMask=0x%x spriteGeneration=%llu drawnBounds=%d,%d %dx%d", cstate.drawnRectMask,
+			    (unsigned long long)cstate.spriteGeneration, cstate.drawnBounds.offset.x, cstate.drawnBounds.offset.y,
+			    cstate.drawnBounds.extent.width, cstate.drawnBounds.extent.height);
+		}
+		if (g_opt.cursor && XR_SUCCEEDED(r)) {
+			_cursor_state = cstate;
+			_cursor_state_logged = true;
+		}
 		if (XR_FAILED(r)) {
 			if (_fail++ < 5) {
 				LOG("xrWeaveSubmitDXR failed: %d", (int)r);
@@ -784,7 +888,10 @@ screen_did(NSScreen *s)
 static void
 usage(const char *argv0)
 {
-	LOG("usage: %s [--display <CGDirectDisplayID>] [--size WxH] [--secs N] [--sbs-only] [--ring]", argv0);
+	LOG("usage: %s [--display <CGDirectDisplayID>] [--size WxH] [--secs N] [--sbs-only] [--ring]\n"
+	    "          [--cursor front|rear|U,V] [--cursor-disp PX] [--cursor-both] [--cursor-flat]\n"
+	    "          [--cursor-sprite default|texture]",
+	    argv0);
 }
 
 int
@@ -802,6 +909,27 @@ main(int argc, char **argv)
 			}
 		} else if (strcmp(a, "--secs") == 0 && i + 1 < argc) {
 			g_opt.secs = atof(argv[++i]);
+		} else if (strcmp(a, "--cursor") == 0 && i + 1 < argc) {
+			const char *v = argv[++i];
+			g_opt.cursor = true;
+			// The scene's boxes (draw_static): red in front at u ~ 0.208, cyan
+			// behind at u ~ 0.792, both centred on v = 0.375, +-20 view px.
+			if (strcmp(v, "front") == 0) {
+				g_opt.cursor_u = 0.208f, g_opt.cursor_v = 0.375f, g_opt.cursor_disp_px = -20.0f;
+			} else if (strcmp(v, "rear") == 0) {
+				g_opt.cursor_u = 0.792f, g_opt.cursor_v = 0.375f, g_opt.cursor_disp_px = 20.0f;
+			} else if (sscanf(v, "%f,%f", &g_opt.cursor_u, &g_opt.cursor_v) != 2) {
+				usage(argv[0]);
+				return 1;
+			}
+		} else if (strcmp(a, "--cursor-disp") == 0 && i + 1 < argc) {
+			g_opt.cursor_disp_px = (float)atof(argv[++i]);
+		} else if (strcmp(a, "--cursor-both") == 0) {
+			g_opt.cursor_both = true;
+		} else if (strcmp(a, "--cursor-flat") == 0) {
+			g_opt.cursor_has_content = false;
+		} else if (strcmp(a, "--cursor-sprite") == 0 && i + 1 < argc) {
+			g_opt.cursor_texture = strcmp(argv[++i], "texture") == 0;
 		} else if (strcmp(a, "--sbs-only") == 0) {
 			g_opt.sbs_only = true;
 		} else if (strcmp(a, "--ring") == 0) {

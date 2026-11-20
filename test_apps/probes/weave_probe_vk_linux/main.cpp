@@ -41,8 +41,8 @@
  * acquires the output from it in GENERAL.
  *
  * --dmabuf (stage B, spec v10): inputs + overlay are exportable dma-bufs with
- * the driver's DRM format modifier (input[1] in DRM ABGR8888 byte order, so both
- * fourcc mappings run), handed over with XrWeaveDmabufDescDXR /
+ * the driver's DRM format modifier (input[1] in DRM ABGR8888 byte order, so
+ * both fourcc mappings run), handed over with XrWeaveDmabufDescDXR /
  * XrWeaveOverlayDmabufDescDXR and a LIVE acquire sync_file (the probe's upload
  * is not CPU-waited: the service's GPU wait is what orders its read). The two
  * inputs carry OPPOSITE patterns and alternate, the woven output comes back as
@@ -79,10 +79,31 @@
  * macOS probe gets by binding no geometry: TRACKED viewpoints are the eyes
  * rebased to the rect, so an off-axis rect is lifted with a large (correct)
  * shift that moves the quarter point onto the blue half. The window goes back
- * to the stage-A origin afterwards. Run the SERVICE with DXR_CONV_SIM_CONVERSION_ENABLE=1 (a
- * provider) and XRT_LOG=info: the red reads the same flat or woven, so the
- * service log's "lift rect: stream ... snapshot" / "... woven" lines are what
- * prove a result. --service-log=PATH greps them (snapshot + woven required).
+ * to the stage-A origin afterwards. Run the SERVICE with
+ * DXR_CONV_SIM_CONVERSION_ENABLE=1 (a provider) and XRT_LOG=info: the red reads
+ * the same flat or woven, so the service log's "lift rect: stream ... snapshot"
+ * / "... woven" lines are what prove a result. --service-log=PATH greps them
+ * (snapshot + woven required).
+ *
+ * --cursor (XR_DXR_cursor_depth v10, ADR-046 Amendment 6: the weave-rect
+ * cursor on the Linux engine, without a browser): after the stage-A checks,
+ * rects A and B hold a flat dark page and every submit chains
+ * XrCursorDepthWeaveRequestDXR with the pointer scripted at rect A's centre
+ * (sampleUV) and a synthetic content disparity, the sprite a generated 32 x 32
+ * white square handed over as the TEXTURE carrier (a stage-A OPAQUE_FD image).
+ * Under the anaglyph weave the left view's copy reads RED and the right view's
+ * CYAN, so the woven output shows the sprite's disparity and its sign:
+ *   1. FRONT_ONLY over content BEHIND the glass (+60 px): nothing drawn,
+ *      drawnRectMask 0 (the OS cursor stays);
+ *   2. FRONT_ONLY over content IN FRONT (-60 px): drawn, CROSSED (the red
+ *      copy right of the cyan one), drawnRectMask bit 0, drawnBounds set;
+ *   3. the v9 BOTH range over content BEHIND (+60 px): drawn, UNCROSSED;
+ *   4. the runtime's default look (sprite DEFAULT) in front: drawn.
+ * The pointer must come from the caller: automatic on Wayland; on an X11
+ * session start the SERVICE with DXR_WEAVE_CURSOR_POINTER=caller (it would
+ * read the real pointer otherwise). The service's capture trigger
+ * ($TMPDIR/displayxr_atlas_trigger.weave_probe_vk_linux) shows the sprite in
+ * both tiles of the pre-weave atlas.
  *
  * Run (service already started with the sim display plug-in):
  *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=build/_plugins \
@@ -94,12 +115,13 @@
 #include <vulkan/vulkan.h>
 
 #define XR_USE_GRAPHICS_API_VULKAN 1
-#include <openxr/openxr.h>
-#include <openxr/openxr_platform.h>
-#include <openxr/XR_DXR_weave.h>
-#include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_cursor_depth.h>
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_lift.h>
+#include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_weave.h>
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
 
 // The dma-buf transport calls, shared with weave/weave_present_vk_linux.
 #include "weave_dmabuf_vk.h"
@@ -2027,13 +2049,267 @@ run_lift(Vk &vk,
 	return lift_ok;
 }
 
+/*
+ *
+ * --cursor: the weave-rect cursor (XR_DXR_cursor_depth v10, ADR-046 Amendment
+ * 6).
+ *
+ */
+
+//! One leg: @p frames submits with the request, then read the woven output
+//! back.
+struct CursorLeg {
+        const char *name;
+        float disparity_px; //!< the content under the pointer, < 0 in front
+        bool both;          //!< the v9 BOTH range flag
+        bool texture;       //!< the TEXTURE carrier, else the default look
+        int expect; //!< +1 drawn crossed, -1 drawn uncrossed, 0 not drawn, 2
+                    //!< drawn (sign unchecked)
+};
+
+static bool run_cursor(Vk &vk, XrSession session,
+                       PFN_xrWeaveSubmitDXR pfn_submit, Image &fallback_out,
+                       const std::string &dump_dir) {
+        bool ok = true;
+
+        // The page: flat dark grey everywhere, rects A and B squeezed-SBS of
+        // the same grey - so anything lit inside rect A is the cursor.
+        Image cin;
+        {
+                std::vector<uint8_t> px((size_t)kWinW * kWinH * 4);
+                for (uint32_t y = 0; y < kWinH; y++) {
+                        for (uint32_t x = 0; x < kWinW; x++) {
+                                put_px(px, kWinW, (int)x, (int)y, 32, 32, 32);
+                        }
+                }
+                if (!create_exported_image(vk, kWinW, kWinH, cin) ||
+                    !upload_and_release(vk, cin, px)) {
+                        LOG("cursor FAIL: input image setup");
+                        return false;
+                }
+        }
+        // The TEXTURE carrier: 32 x 32 opaque white (premultiplied ==
+        // straight), hotspot at its centre, a stage-A OPAQUE_FD image like
+        // every input.
+        const int kSprite = 32;
+        Image sprite;
+        {
+                std::vector<uint8_t> px((size_t)kSprite * kSprite * 4, 0xFF);
+                if (!create_exported_image(vk, kSprite, kSprite, sprite) ||
+                    !upload_and_release(vk, sprite, px)) {
+                        LOG("cursor FAIL: sprite image setup");
+                        destroy_image(vk, cin);
+                        return false;
+                }
+        }
+
+        const CursorLeg legs[] = {
+            {"FRONT_ONLY over content behind the glass (+60 px)", 60.0f, false,
+             true, 0},
+            {"FRONT_ONLY over content in front (-60 px)", -60.0f, false, true,
+             +1},
+            {"BOTH over content behind the glass (+60 px)", 60.0f, true, true,
+             -1},
+            {"default look over content in front (-60 px)", -60.0f, false,
+             false, 2},
+        };
+        Image cout_img;
+        uint64_t held_generation = 0;
+        int leg_index = 0;
+        for (const CursorLeg &leg : legs) {
+                leg_index++;
+                XrRect2Di rects[2] = {kRectA, kRectB};
+                XrCursorDepthWeaveRectDXR crect = {};
+                crect.rectIndex = 0; // rect A
+                crect.hasContent = XR_TRUE;
+                crect.disparityPx = leg.disparity_px;
+                crect.sampleUV = {
+                    0.5f, 0.5f}; // the scripted pointer: rect A's centre
+                crect.flags =
+                    leg.both ? XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR : 0u;
+                // Generations: 1 = the texture, 2 = the default look.
+                const uint64_t generation = leg.texture ? 1 : 2;
+                XrCursorDepthWeaveStateDXR last = {
+                    (XrStructureType)XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR};
+                uint32_t ow = 0, oh = 0;
+                const int kFrames =
+                    150; // ~2.4 s: the filter settles, also through the plane
+                for (int frame = 0; frame < kFrames && ok; frame++) {
+                        XrCursorDepthWeaveRequestDXR creq = {
+                            (XrStructureType)
+                                XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR};
+                        creq.rectCount = 1;
+                        creq.rects = &crect;
+                        creq.sprite.generation = generation;
+                        if (!leg.texture) {
+                                creq.sprite.kind =
+                                    XR_CURSOR_DEPTH_WEAVE_SPRITE_DEFAULT_DXR;
+                        } else if (held_generation == generation) {
+                                creq.sprite.kind =
+                                    XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR;
+                        } else {
+                                // The payload, until the runtime reports it
+                                // holds it.
+                                creq.sprite.kind =
+                                    XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR;
+                                creq.sprite.texture =
+                                    (void *)(intptr_t)sprite.fd;
+                                creq.sprite.textureKind =
+                                    XR_WEAVE_HANDLE_KIND_OPAQUE_FD_DXR;
+                                creq.sprite.extent = {kSprite, kSprite};
+                                creq.sprite.hotSpotPx = {(float)kSprite * 0.5f,
+                                                         (float)kSprite * 0.5f};
+                        }
+                        XrWeaveSubmitRectsDXR batch = {
+                            (XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+                        batch.next = &creq;
+                        batch.rectCount = 2;
+                        batch.rects = rects;
+                        XrWeaveSubmitInfoDXR submit = {
+                            (XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+                        submit.next = &batch;
+                        submit.inputTexture = (void *)(intptr_t)cin.fd;
+                        submit.firstChunk = XR_TRUE;
+                        XrCursorDepthWeaveStateDXR state = {
+                            (XrStructureType)
+                                XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR};
+                        XrWeaveOutputDXR out = {
+                            (XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+                        out.next = &state;
+                        const XrResult r = pfn_submit(session, &submit, &out);
+                        if (XR_FAILED(r)) {
+                                LOG("cursor FAIL: xrWeaveSubmitDXR leg %d "
+                                    "frame %d -> %d",
+                                    leg_index, frame, (int)r);
+                                ok = false;
+                                break;
+                        }
+                        held_generation = state.spriteGeneration;
+                        last = state;
+                        ow = out.width;
+                        oh = out.height;
+                        if (out.weavedTexture != nullptr) {
+                                if (cout_img.image != VK_NULL_HANDLE) {
+                                        destroy_image(vk, cout_img);
+                                }
+                                if (!import_output_image(
+                                        vk, (int)(intptr_t)out.weavedTexture,
+                                        out.width, out.height, cout_img)) {
+                                        close((int)(intptr_t)out.weavedTexture);
+                                        LOG("cursor FAIL: could not import the "
+                                            "%ux%u output fd",
+                                            out.width, out.height);
+                                        ok = false;
+                                }
+                        }
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(16));
+                }
+                if (!ok) {
+                        break;
+                }
+                Image &from =
+                    cout_img.image != VK_NULL_HANDLE ? cout_img : fallback_out;
+                std::vector<uint8_t> px;
+                if (from.w != kWinW || from.h != kWinH || ow != kWinW ||
+                    oh != kWinH || !readback(vk, from, px)) {
+                        LOG("cursor FAIL: output %ux%u (import %ux%u), want "
+                            "%ux%u, or readback failed",
+                            ow, oh, from.w, from.h, kWinW, kWinH);
+                        ok = false;
+                        break;
+                }
+                char name[64];
+                snprintf(name, sizeof(name), "/weave_probe_linux_cursor_%d.ppm",
+                         leg_index);
+                dump_ppm(px, kWinW, kWinH, dump_dir + name);
+
+                // Inside rect A the page is (32,32,32): the left view's sprite
+                // lights RED (anaglyph: out.r = left.r), the right view's GREEN
+                // + BLUE.
+                double sum_l = 0, sum_r = 0;
+                long n_l = 0, n_r = 0;
+                for (int y = kRectA.offset.y;
+                     y < kRectA.offset.y + kRectA.extent.height; y++) {
+                        for (int x = kRectA.offset.x;
+                             x < kRectA.offset.x + kRectA.extent.width; x++) {
+                                uint8_t r, g, b, a;
+                                sample(px, kWinW, x, y, &r, &g, &b, &a);
+                                if (r > 90) {
+                                        sum_l += x;
+                                        n_l++;
+                                }
+                                if (g > 90) {
+                                        sum_r += x;
+                                        n_r++;
+                                }
+                        }
+                }
+                const bool lit = n_l > 0 && n_r > 0;
+                const double sep =
+                    lit ? sum_l / (double)n_l - sum_r / (double)n_r : 0.0;
+                const bool reported = (last.drawnRectMask & 1u) != 0;
+                bool leg_ok;
+                const char *want;
+                switch (leg.expect) {
+                case 0:
+                        want = "nothing drawn, mask 0";
+                        leg_ok = !reported && n_l == 0 && n_r == 0;
+                        break;
+                case +1:
+                        want = "drawn CROSSED (left copy right of the right "
+                               "copy), mask bit 0, bounds set";
+                        leg_ok = reported && lit && sep > 2.0 &&
+                                 last.drawnBounds.extent.width > 0;
+                        break;
+                case -1:
+                        want = "drawn UNCROSSED (left copy left of the right "
+                               "copy), mask bit 0, bounds set";
+                        leg_ok = reported && lit && sep < -2.0 &&
+                                 last.drawnBounds.extent.width > 0;
+                        break;
+                default:
+                        want = "drawn, mask bit 0";
+                        leg_ok = reported && (n_l > 0 || n_r > 0);
+                        break;
+                }
+                LOG("cursor leg %d (%s): mask=0x%x generation=%llu "
+                    "bounds=%d,%d %dx%d, left-view px %ld, right-view px "
+                    "%ld, left - right = %+.1f px; want %s -> %s",
+                    leg_index, leg.name, last.drawnRectMask,
+                    (unsigned long long)last.spriteGeneration,
+                    last.drawnBounds.offset.x, last.drawnBounds.offset.y,
+                    last.drawnBounds.extent.width,
+                    last.drawnBounds.extent.height, n_l, n_r, sep, want,
+                    leg_ok ? "OK" : "WRONG");
+                ok = ok && leg_ok;
+                if (leg.texture && last.spriteGeneration != 1) {
+                        LOG("cursor leg %d: the runtime does not hold the "
+                            "TEXTURE sprite (generation %llu, want 1) -> WRONG",
+                            leg_index,
+                            (unsigned long long)last.spriteGeneration);
+                        ok = false;
+                }
+        }
+        if (cout_img.image != VK_NULL_HANDLE) {
+                destroy_image(vk, cout_img);
+        }
+        destroy_image(vk, sprite);
+        destroy_image(vk, cin);
+        LOG("cursor: %s", ok ? "PASS" : "FAIL");
+        return ok;
+}
+
 int
 main(int argc, char **argv)
 {
 	int frames = 600;
-	long service_pid = 0;
-	bool dmabuf = false, release_wait = true, force_linear = false, span2d = false, flat_regions = false;
-	bool do_lift = false;           // --lift (XR_DXR_lift weave rects, ADR-053 P5 step C)
+        bool do_cursor =
+            false; // --cursor (XR_DXR_cursor_depth v10: the weave-rect cursor)
+        long service_pid = 0;
+        bool dmabuf = false, release_wait = true, force_linear = false,
+             span2d = false, flat_regions = false;
+        bool do_lift = false;           // --lift (XR_DXR_lift weave rects, ADR-053 P5 step C)
 	const char *lift_log = nullptr; // --service-log=PATH: grep its "lift rect: stream" lines
 	std::string dump_dir = "/tmp";
 	if (const char *t = getenv("TMPDIR")) {
@@ -2056,36 +2332,49 @@ main(int argc, char **argv)
 			span2d = true; // off-panel flat 2D (#1654 on the service path)
 		} else if (strcmp(argv[i], "--flat-regions") == 0) {
 			flat_regions = true; // spec-v8 flat regions painted flat (desktop Linux)
-		} else if (strcmp(argv[i], "--lift") == 0) {
-			do_lift = true;
-		} else if (strncmp(argv[i], "--service-log=", 14) == 0) {
-			lift_log = argv[i] + 14;
-		} else if (strncmp(argv[i], "--bind-origin=", 14) == 0 &&
-		           sscanf(argv[i] + 14, "%d,%d", &kWinOrigin.x, &kWinOrigin.y) == 2) {
-			// The bound windowOriginOnScreen (weave geometry frame: device px,
-			// the window's monitor's logical origin x its scale) — for checking
-			// the service's logged panel-relative present origin on a real layout.
-		} else if (strncmp(argv[i], "--bind-logical=", 15) == 0 &&
-		           sscanf(argv[i] + 15, "%d,%d,%f", &g_bind_logical_origin.x, &g_bind_logical_origin.y,
-		                  &g_bind_logical_scale) == 3) {
-			g_bind_logical = true;
-		} else if (strncmp(argv[i], "--move-to=", 10) == 0 && g_move_count < 4 &&
-		           sscanf(argv[i] + 10, "%d,%d,%d,%d,%f", &g_moves[g_move_count].origin.x,
-		                  &g_moves[g_move_count].origin.y, &g_moves[g_move_count].logical.x,
-		                  &g_moves[g_move_count].logical.y, &g_moves[g_move_count].scale) == 5) {
-			g_move_count++;
-		} else {
-			LOG("usage: %s [--frames=N] [--service-pid=PID] [--dump-dir=DIR] [--dmabuf [--no-release-wait] "
-			    "[--linear]] [--span2d] [--flat-regions] [--lift [--service-log=PATH]] [--bind-origin=X,Y] "
-			    "[--bind-logical=LX,LY,SCALE] [--move-to=X,Y,LX,LY,SCALE]...",
-			    argv[0]);
-			return 2;
-		}
-	}
-	if (frames < 20) {
-		frames = 20;
-	}
-	if (do_lift && (dmabuf || span2d || flat_regions)) {
+                } else if (strcmp(argv[i], "--cursor") == 0) {
+                        do_cursor = true;
+                } else if (strcmp(argv[i], "--lift") == 0) {
+                        do_lift = true;
+                } else if (strncmp(argv[i], "--service-log=", 14) == 0) {
+                        lift_log = argv[i] + 14;
+                } else if (strncmp(argv[i], "--bind-origin=", 14) == 0 &&
+                           sscanf(argv[i] + 14, "%d,%d", &kWinOrigin.x,
+                                  &kWinOrigin.y) == 2) {
+                        // The bound windowOriginOnScreen (weave geometry frame:
+                        // device px, the window's monitor's logical origin x
+                        // its scale) — for checking the service's logged
+                        // panel-relative present origin on a real layout.
+                } else if (strncmp(argv[i], "--bind-logical=", 15) == 0 &&
+                           sscanf(argv[i] + 15, "%d,%d,%f",
+                                  &g_bind_logical_origin.x,
+                                  &g_bind_logical_origin.y,
+                                  &g_bind_logical_scale) == 3) {
+                        g_bind_logical = true;
+                } else if (strncmp(argv[i], "--move-to=", 10) == 0 &&
+                           g_move_count < 4 &&
+                           sscanf(argv[i] + 10, "%d,%d,%d,%d,%f",
+                                  &g_moves[g_move_count].origin.x,
+                                  &g_moves[g_move_count].origin.y,
+                                  &g_moves[g_move_count].logical.x,
+                                  &g_moves[g_move_count].logical.y,
+                                  &g_moves[g_move_count].scale) == 5) {
+                        g_move_count++;
+                } else {
+                        LOG("usage: %s [--frames=N] [--service-pid=PID] "
+                            "[--dump-dir=DIR] [--dmabuf [--no-release-wait] "
+                            "[--linear]] [--span2d] [--flat-regions] [--lift "
+                            "[--service-log=PATH]] [--bind-origin=X,Y] "
+                            "[--bind-logical=LX,LY,SCALE] "
+                            "[--move-to=X,Y,LX,LY,SCALE]...",
+                            argv[0]);
+                        return 2;
+                }
+        }
+        if (frames < 20) {
+                frames = 20;
+        }
+        if (do_lift && (dmabuf || span2d || flat_regions)) {
 		LOG("--lift runs on the stage-A run (not with --dmabuf / --span2d / --flat-regions)");
 		return 2;
 	}
@@ -2093,10 +2382,15 @@ main(int argc, char **argv)
 		LOG("--service-log needs --lift");
 		return 2;
 	}
+        if (do_cursor && (dmabuf || span2d || flat_regions || do_lift)) {
+                LOG("--cursor runs on the stage-A run (not with --dmabuf / "
+                    "--span2d / --flat-regions / --lift)");
+                return 2;
+        }
 
-	// ---- Instance with the weave + vulkan-enable extensions.
-	uint32_t ext_count = 0;
-	XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr));
+        // ---- Instance with the weave + vulkan-enable extensions.
+        uint32_t ext_count = 0;
+        XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr));
 	std::vector<XrExtensionProperties> exts(ext_count, {XR_TYPE_EXTENSION_PROPERTIES});
 	XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, ext_count, &ext_count, exts.data()));
 	bool has_weave = false, has_vk = false, has_rig = false, has_display_info = false, has_lift = false;
@@ -2140,10 +2434,32 @@ main(int argc, char **argv)
 		enabled.push_back(XR_DXR_LIFT_EXTENSION_NAME);
 		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 	}
-	XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
-	snprintf(ici.applicationInfo.applicationName, sizeof(ici.applicationInfo.applicationName), "%s",
-	         "DXRWeaveProbeLinux");
-	ici.applicationInfo.applicationVersion = 1;
+        // --cursor only, so the default run's instance is unchanged.
+        if (do_cursor) {
+                bool has_cursor = false;
+                uint32_t cursor_spec = 0;
+                for (const auto &e : exts) {
+                        if (strcmp(e.extensionName,
+                                   XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
+                                has_cursor = true;
+                                cursor_spec = e.extensionVersion;
+                        }
+                }
+                LOG("XR_DXR_cursor_depth:  %s (specVersion %u; the Linux weave "
+                    "engine draws from 10)",
+                    has_cursor ? "AVAILABLE" : "NOT FOUND", cursor_spec);
+                if (!has_cursor || cursor_spec < 10) {
+                        LOG("--cursor needs XR_DXR_cursor_depth specVersion >= "
+                            "10");
+                        return 1;
+                }
+                enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+        }
+        XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
+        snprintf(ici.applicationInfo.applicationName,
+                 sizeof(ici.applicationInfo.applicationName), "%s",
+                 "DXRWeaveProbeLinux");
+        ici.applicationInfo.applicationVersion = 1;
 	snprintf(ici.applicationInfo.engineName, sizeof(ici.applicationInfo.engineName), "%s", "None");
 	ici.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
 	ici.enabledExtensionCount = (uint32_t)enabled.size();
@@ -2699,14 +3015,16 @@ main(int argc, char **argv)
 			destroy_image(vk, big_ov);
 		}
 	}
-	if (!do_lift) {
-		destroy_image(vk, output); // --lift keeps it (its fallback sample source) until the end
-	}
+        if (!do_lift && !do_cursor) {
+                destroy_image(vk,
+                              output); // --lift / --cursor keep it (their
+                                       // fallback sample source) until the end
+        }
 
-	// ---- Snap through the service's weave DP (identity on sim_display's
-	// default period of 1 — the call must still succeed and return a rect).
-	{
-		XrRect2Di origin = {{kWinOrigin.x, kWinOrigin.y}, {(int32_t)kWinW, (int32_t)kWinH}};
+        // ---- Snap through the service's weave DP (identity on sim_display's
+        // default period of 1 — the call must still succeed and return a rect).
+        {
+                XrRect2Di origin = {{kWinOrigin.x, kWinOrigin.y}, {(int32_t)kWinW, (int32_t)kWinH}};
 		XrRect2Di target = {{kWinOrigin.x + 13, kWinOrigin.y + 7}, {(int32_t)kWinW, (int32_t)kWinH}};
 		XrRect2Di snapped = {};
 		XrResult r = pfn_snap(session, &origin, &target, &snapped);
@@ -2714,9 +3032,9 @@ main(int argc, char **argv)
 		LOG("snap (%d,%d) -> (%d,%d) result=%d -> %s", target.offset.x, target.offset.y, snapped.offset.x,
 		    snapped.offset.y, (int)r, ok ? "OK" : "WRONG");
 		pass = pass && ok;
-	}
+        }
 
-	// ---- Bulk grid snap (spec v11, #1723): the Wayland drag-lattice probe's
+        // ---- Bulk grid snap (spec v11, #1723): the Wayland drag-lattice probe's
 	// grid (129 x 129 at 3 px around the drag start, origin (0, 0)) in ONE
 	// call, against the same points asked one by one. Every grid answer must
 	// equal the per-point answer — identity on sim_display's default period of
@@ -2941,9 +3259,16 @@ main(int argc, char **argv)
 		destroy_image(vk, output);
 	}
 
-	xrDestroySession(session);
-	xrDestroyInstance(instance);
-	destroy_image(vk, input[0]);
+        if (do_cursor) {
+                const bool cursor_ok =
+                    run_cursor(vk, session, pfn_submit, output, dump_dir);
+                pass = pass && cursor_ok;
+                destroy_image(vk, output);
+        }
+
+        xrDestroySession(session);
+        xrDestroyInstance(instance);
+        destroy_image(vk, input[0]);
 	destroy_image(vk, input[1]);
 	destroy_image(vk, overlay);
 	vkDestroyFence(vk.device, vk.fence, nullptr);

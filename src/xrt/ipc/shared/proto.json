@@ -791,6 +791,14 @@
 		]
 	},
 
+	"weave_cursor_sprite_dmabuf": {
+		"in": [
+			{"name": "info", "type": "struct xrt_weave_cursor_sprite_texture"},
+			{"name": "dmabuf", "type": "struct ipc_weave_dmabuf"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
 	"weave_get_output": {
 		"out": [
 			{"name": "have_output", "type": "bool"},
