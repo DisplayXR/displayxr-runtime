@@ -3,8 +3,8 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_cursor_depth` |
-| Spec Version | 7 |
-| Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) · `XR_TYPE_CURSOR_DEPTH_SOURCE_DXR` (1004999322, v2) · `XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR` (1004999323, v3) · `XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR` (1004999324, v5) · `XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR` (1004999325, v5) · `XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR` (1004999326, v6) · `XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR` (1004999327, v6) |
+| Spec Version | 9 |
+| Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) · `XR_TYPE_CURSOR_DEPTH_SOURCE_DXR` (1004999322, v2) · `XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR` (1004999323, v3) · `XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR` (1004999324, v5) · `XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR` (1004999325, v5) · `XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR` (1004999326, v6) · `XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR` (1004999327, v6) · `XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR` (1004999328, v8) · `XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR` (1004999329, v8) · `XR_TYPE_CURSOR_DEPTH_RANGE_DXR` (1004999390, v9) |
 | Author | The DisplayXR Project |
 | Platform | All. Works on every graphics API, in-process and over IPC; solved in the state tracker. |
 | Decision record | [ADR-046](../../adr/ADR-046-depth-aware-cursor.md) |
@@ -18,7 +18,8 @@ glass, that is a **depth violation**: occlusion says the cursor is in front, and
 it is behind. `XR_DXR_cursor_depth` lifts the cursor off the plane. The app reports the nearest
 content under the cursor. The runtime returns a pose and size for a cursor sprite just in front
 of that content, smoothed over time. The app draws the sprite. Content on or behind the plane
-causes no conflict, so there the cursor stays the OS cursor (v4: never behind the glass).
+causes no conflict, so there the cursor stays the OS cursor (v4: never behind the glass). A
+scene that lives behind the glass can opt into a cursor that follows it there too (v9, §2.4a).
 
 > The **app** owns the depth (it knows its scene). The **runtime** owns placement and policy
 > (where, how big, how it moves), so every app's cursor behaves the same. The **app** draws.
@@ -178,6 +179,41 @@ the sprite is drawn.
 
 The same rule, with the same numbers, is implemented by the web SDK's depth cursor.
 
+### 2.4a `XrCursorDepthRangeDXR` (input, spec v9) — the depth range
+
+Optional, chained on `XrCursorDepthHintDXR::next` (`XR_TYPE_CURSOR_DEPTH_RANGE_DXR`,
+1004999390; ADR-046 Amendment 5). Absent = `FRONT_ONLY`. Read only on a locate that chains the
+hint, and it covers that locate only.
+
+| `range` (`XrCursorDepthRangeModeDXR`) | Value | Meaning |
+|---|---|---|
+| `XR_CURSOR_DEPTH_RANGE_MODE_FRONT_ONLY_DXR` | 0 | The default and the v4–v8 behaviour: never behind the glass. |
+| `XR_CURSOR_DEPTH_RANGE_MODE_BOTH_DXR` | 1 | In front exactly as `FRONT_ONLY`; over content more than a margin **behind** the plane, the cursor is placed a margin in front of that content, up to +0.6 eye baselines of uncrossed disparity. |
+
+Unknown values behave as `FRONT_ONLY`. With `BOTH`, `XrCursorDepthPlacementDXR::disparity` and
+`::targetDisparity` may be > 0 (behind the glass), and `isActive` / `willDraw` are true while
+the filtered disparity is at least 0.005 baselines off the plane on either side, or crossing the
+plane toward a target that is.
+
+The weave-rect and lifted-rect cursors (§2.7, §2.8) take the same option as a flag bit,
+`XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR` (0x1), in their entry's `flags`.
+
+**Detecting support.** A runtime whose `XR_DXR_cursor_depth` `extensionVersion` (from
+`xrEnumerateInstanceExtensionProperties`) is below 9 ignores the struct and the bit and behaves
+as `FRONT_ONLY`, without error. Check the version before relying on `BOTH`.
+
+```c
+XrCursorDepthRangeDXR range = {XR_TYPE_CURSOR_DEPTH_RANGE_DXR};
+range.range = XR_CURSOR_DEPTH_RANGE_MODE_BOTH_DXR;
+range.next  = hint.next;   // with any source / options / draw-info structs
+hint.next   = &range;
+```
+
+Use it for scenes that live behind the glass (a top-down view whose ground recedes): with the
+eyes converged on that ground, an on-plane cursor is seen double and does not point at the thing
+under it. Keep withdrawing over anything at the plane (2D zones, UI chrome): report no content
+there, so the OS cursor is the cursor.
+
 ### 2.5 `XrCursorDepthDrawInfoDXR` (input, spec v5) — "runtime, draw the cursor"
 
 Chained on `XrCursorDepthHintDXR::next`, in any order with the other hint structs. Chaining it
@@ -238,7 +274,8 @@ lifted rect's views and the weave path never calls `xrLocateViews`, so these are
 
 - **`XrCursorDepthLiftRectDXR`** (input), chained on `XrWeaveRectLiftDXR::next`: draw the depth
   cursor into this rect's lifted views. Per submit: chain it on every submit for as long as you
-  want it. `flags` is reserved (0). The lift stream must be created with `XrLiftDepthRequestDXR`.
+  want it. `flags` (spec v9): 0, or `XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR` (0x1) so the
+  cursor also follows relief behind the screen (§2.4a). The lift stream must be created with `XrLiftDepthRequestDXR`.
 - **`XrCursorDepthLiftStateDXR`** (output), chained on `XrWeaveOutputDXR::next`: `drawnLiftMask`,
   bit i = `lifts[i]` of this submit got the cursor in the output just woven. Hide the OS cursor
   over a lifted rect only while its bit is set.
@@ -270,8 +307,11 @@ HYBRID anchor, the softening and the drawing.
   - `rects` (`XrCursorDepthWeaveRectDXR`, ≤ `XR_WEAVE_SUBMIT_MAX_RECTS_DXR`): per weave rect
     (`rectIndex` into `XrWeaveSubmitRectsDXR::rects`), `hasContent` and `disparityPx`: the
     on-screen disparity in device pixels between the two outermost views the caller rendered, of
-    the nearest content under the cursor footprint, < 0 in front of the glass. Raw, not filtered.
-    `sampleUV` is diagnostic; `flags` is reserved (0).
+    the nearest content under the cursor footprint, < 0 in front of the glass, > 0 behind it.
+    Raw, not filtered. `sampleUV` is diagnostic. `flags` (spec v9): 0, or
+    `XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR` (0x1) to let this rect's cursor also follow
+    content behind the glass (§2.4a); other bits are reserved and ignored. The runtime remembers
+    the flags with the rect's depth.
 - **`XrCursorDepthWeaveStateDXR`** (output, 1004999329), chained on `XrWeaveOutputDXR::next` of a
   submit that carried a request: `drawnRectMask` (bit i = drawn into `rects[i]`),
   `spriteGeneration` (the sprite the runtime holds, `DEFAULT` and `NONE` included; 0 = none — a `KEEP` whose
@@ -336,6 +376,14 @@ along the display normal measured from the cyclopean eye:
 - margin: 0.015 baseline in front of the content, about 1 mm of crossed on-screen disparity at a 63–65 mm IPD (overridable with `XrCursorDepthOptionsDXR::margin`);
 - lateral anchor: HYBRID unless `XrCursorDepthOptionsDXR` selects another mode (§2.4);
 - clamp: d ∈ [−0.6, 0];
+- **opt-in `BOTH` range** (v9, ADR-046 Amendment 5, §2.4a): target = d < 0 ? max(d − margin, −0.6)
+  : min(max(d − margin, 0), +0.6). In front it is the rule above unchanged; behind, the cursor
+  floats a margin in **front** of the content (never behind it), stays on the plane for content
+  within a margin of it, and the clamp is d ∈ [−0.6, +0.6]. +0.6 mirrors the front clamp and
+  keeps the cursor's uncrossed on-screen separation at 60 % of the baseline (d = 1 would be
+  parallel gaze). The draw threshold becomes |filtered d| ≥ 0.005, and a cursor crossing the
+  plane toward a target outside that band keeps being drawn, so the hand-over to the OS cursor
+  never blinks mid-flight;
 - draw threshold (v4, Amendment 2 A.3): `isActive` only while the filtered d ≤ −0.005 (about 0.3 mm
   on screen at a 65 mm IPD). The filter keeps running while inactive, so the drawn cursor hands
   back to the OS cursor smoothly and returns without a jump. The ADR's additional 0.5-panel-pixel
@@ -433,3 +481,4 @@ Reference: `test_apps/handle/cube_handle_metal_macos` (`DISPLAYXR_CURSOR_DEPTH_D
 | 6 (2026-10-11) | No version bump, no struct change; **default margin halved, 0.03 → 0.015** (ADR-046 Amendment 2 A.2) after the Windows Leia panel check: 0.03 (≈2 mm crossed) floated visibly off the content, 0.015 is ≈1 mm. The margin is a default, not a contract (`XrCursorDepthOptionsDXR::margin` still overrides it), so apps need no change; one that wants the old look chains the options struct with `margin = 0.03`. |
 | 7 | **Measured disparity** (ADR-046 Amendment 3, Phase 3b). No new struct: a third `XrCursorDepthSourceDXR` kind, `XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR` (2), for stereo content with no depth. The runtime block-matches a cursor-sized patch between the outermost submitted views (confidence-gated; low confidence = the display plane = the OS cursor). In-process Metal, Vulkan, GL, D3D11 and D3D12 compositors; IPC reports no content. §2.3. |
 | 8 | **The runtime draws the web cursor** (ADR-046 Amendment 4). New structs only: `XrCursorDepthWeaveRequestDXR` (1004999328, on `XrWeaveSubmitInfoDXR`: per-rect depth under the pointer in device pixels + the caller's sprite, an `HCURSOR` or a shared texture) and `XrCursorDepthWeaveStateDXR` (1004999329, on `XrWeaveOutputDXR`: drawn rects, sprite generation, drawn window bounds). The runtime reads the pointer in the submit, applies the one policy with the HYBRID anchor and B.7 softening, and hands back two frames early on sink. D3D11 service. §2.8. |
+| 9 | **Opt-in depth range** (ADR-046 Amendment 5). One new struct, `XrCursorDepthRangeDXR` (**1004999390**, on the hint; the extension's second type decade, 320–329 being full): `XR_CURSOR_DEPTH_RANGE_MODE_FRONT_ONLY_DXR` (0, the default: v4–v8 behaviour, bit for bit) or `XR_CURSOR_DEPTH_RANGE_MODE_BOTH_DXR` (1: the cursor also follows content behind the glass, a margin in front of it, clamp +0.6). The same option on weave rects and lifted rects is `XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR` (0x1) in `XrCursorDepthWeaveRectDXR::flags` / `XrCursorDepthLiftRectDXR::flags`, words that were reserved-must-be-zero. No existing struct changed size. A runtime below v9 ignores the struct and the bit (`FRONT_ONLY`); detect with `extensionVersion` ≥ 9. §2.4a, §3. |

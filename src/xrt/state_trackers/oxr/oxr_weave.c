@@ -1082,8 +1082,12 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			// XR_DXR_cursor_depth v6 (ADR-046 Amendment 1): the runtime draws
 			// the depth cursor into this rect's lifted views.
 			if (sess->sys->inst->extensions.DXR_cursor_depth) {
-				lr[i].depth_cursor = OXR_GET_INPUT_FROM_CHAIN(e, XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR,
-				                                              XrCursorDepthLiftRectDXR) != NULL;
+				const XrCursorDepthLiftRectDXR *dc = OXR_GET_INPUT_FROM_CHAIN(
+				    e, XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR, XrCursorDepthLiftRectDXR);
+				lr[i].depth_cursor = dc != NULL;
+				// Spec v9 (ADR-046 Amendment 5): the range bit rides the flags.
+				// Unknown bits are carried and ignored, never an error.
+				lr[i].depth_cursor_flags = dc != NULL ? dc->flags : 0u;
 			}
 #endif
 		}
@@ -1152,6 +1156,8 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			xreq.rects[i].disparity_px = e->disparityPx;
 			xreq.rects[i].sample_u = e->sampleUV.x;
 			xreq.rects[i].sample_v = e->sampleUV.y;
+			// Spec v9: bit 0 = XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR. Carried
+			// as sent; the service ignores bits it does not know.
 			xreq.rects[i].flags = e->flags;
 		}
 #if defined(XR_USE_PLATFORM_WIN32)

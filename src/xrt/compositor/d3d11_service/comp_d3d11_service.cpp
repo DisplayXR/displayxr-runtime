@@ -29832,6 +29832,7 @@ static bool
 svc_lift_cursor_draw_impl(struct d3d11_service_system *sys,
                           struct d3d11_service_compositor *c,
                           struct d3d11_lift_pin *pin,
+                          uint32_t cursor_flags,
                           const struct xrt_rect &rect,
                           const struct svc_lift_cursor_view *views,
                           uint32_t view_count,
@@ -29922,9 +29923,12 @@ svc_lift_cursor_draw_impl(struct d3d11_service_system *sys,
 	// ADR-046 Amendment 2 A, the one cursor policy: never behind the glass
 	// (rise only ahead of content that comes out of it), and on the plane the
 	// caller's own OS cursor is the cursor, so nothing is drawn there.
+	// Spec v9 (Amendment 5): a rect that set the range bit also gets the
+	// cursor on content behind the glass.
+	tuning.range = u_cursor_weave_range_from_flags(cursor_flags);
 	const float target = u_cursor_depth_target(&tuning, has_content, content_d);
 	const float d = u_cursor_depth_filter_step(&lc->filter, &tuning, target, now_ns);
-	if (!u_cursor_depth_should_draw(&tuning, d)) {
+	if (!u_cursor_depth_should_draw_toward(&tuning, d, target)) {
 		*why = SVC_LC_ON_PLANE;
 		return false;
 	}
@@ -29992,6 +29996,7 @@ static bool
 svc_lift_cursor_draw(struct d3d11_service_system *sys,
                      struct d3d11_service_compositor *c,
                      struct d3d11_lift_pin *pin,
+                     uint32_t cursor_flags,
                      const struct xrt_rect &rect,
                      const struct svc_lift_cursor_view *views,
                      uint32_t view_count,
@@ -30000,7 +30005,8 @@ svc_lift_cursor_draw(struct d3d11_service_system *sys,
                      float target_h)
 {
 	int why = 0;
-	const bool drawn = svc_lift_cursor_draw_impl(sys, c, pin, rect, views, view_count, rtv, target_w, target_h, &why);
+	const bool drawn = svc_lift_cursor_draw_impl(sys, c, pin, cursor_flags, rect, views, view_count, rtv, target_w,
+	                                             target_h, &why);
 	if (why != c->render.lift_cursor_reason) {
 		c->render.lift_cursor_reason = why;
 		U_LOG_W("[lift cursor] stream %llu: %s", (unsigned long long)pin->stream_id,
@@ -30401,7 +30407,7 @@ svc_weave_cursor_draw_impl(struct d3d11_service_system *sys,
 		const struct xrt_weave_cursor_rect &e = req.rects[i];
 		if (e.rect_index < rect_count) {
 			u_cursor_weave_memo_put(&r->wc_memo[e.rect_index], e.rect_index, &wr[e.rect_index],
-			                        e.has_content != 0, e.disparity_px, now_ns);
+			                        e.has_content != 0, e.disparity_px, e.flags, now_ns);
 		}
 	}
 	uint32_t caller_mask = 0;
@@ -30496,6 +30502,9 @@ svc_weave_cursor_draw_impl(struct d3d11_service_system *sys,
 
 	struct u_cursor_depth_tuning tuning;
 	u_cursor_depth_tuning_defaults(&tuning);
+	// Spec v9 (ADR-046 Amendment 5): the rect's own range, from the flags of
+	// the submit that last carried its depth. No bit = FRONT_ONLY, as before.
+	tuning.range = u_cursor_weave_range_from_flags(r->wc_memo[pick].flags);
 	struct u_cursor_weave_input in = {};
 	in.viewpoints = vps;
 	in.view_count = view_count;
@@ -30776,7 +30785,7 @@ lift_weave_rect_batch(struct d3d11_service_system *sys,
 				cv[eye].clip.bottom = (LONG)y1;
 				cv[eye].src_view = eye == 0 ? vl : vr;
 			}
-			if (svc_lift_cursor_draw(sys, c, &pin, rect, cv, 2, rtv, atw, ath)) {
+			if (svc_lift_cursor_draw(sys, c, &pin, b->depth_cursor_flags, rect, cv, 2, rtv, atw, ath)) {
 				c->render.lift_cursor_mask |= 1u << (uint32_t)(b - bindings);
 			}
 		}
@@ -30903,8 +30912,8 @@ lift_weave_rects_nview(struct d3d11_service_system *sys,
 				}
 				cv[v].src_view = src_v;
 			}
-			if (svc_lift_cursor_draw(sys, c, &pin, r, cv, layout->view_count, crop_rtv, (float)packed_w,
-			                         (float)packed_h)) {
+			if (svc_lift_cursor_draw(sys, c, &pin, b->depth_cursor_flags, r, cv, layout->view_count,
+			                         crop_rtv, (float)packed_w, (float)packed_h)) {
 				c->render.lift_cursor_mask |= 1u << k;
 			}
 		}

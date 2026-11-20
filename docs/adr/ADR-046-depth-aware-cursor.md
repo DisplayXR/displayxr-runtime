@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5), §B.7 crosstalk softening of the lifted cursor (2026-10-11; Metal + D3D11 + Vulkan + D3D12 + GL) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · Amendment 4 (the runtime draws the web cursor, 2026-10-13) proposed · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5), §B.7 crosstalk softening of the lifted cursor (2026-10-11; Metal + D3D11 + Vulkan + D3D12 + GL) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · Amendment 4 (the runtime draws the web cursor, 2026-10-13) proposed · Amendment 5 (opt-in depth range: front only, or both sides of the glass, 2026-11-19) proposed, spec v9 · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -1525,3 +1525,226 @@ late read later; that is a Phase 2 item, not this amendment.
 
 §0 (no request, no work), §A (the one policy), §B (the runtime draws; the caller chooses the
 look), Amendment 1's API, Amendment 3. Hit testing is never moved.
+
+---
+
+## Amendment 5 (2026-11-19): an opt-in depth range — front only (default), or both sides of the glass
+
+**Proposed.** Spec v9. It does not change Amendment 2's policy: it adds a second, opt-in range
+next to it. An app, page or rect that does not ask sees no change at all.
+
+### Why
+
+Amendment 2 A.1 made the cursor **never behind the glass**: over content on or behind the plane
+the OS cursor, on the plane, is the cursor. The reasoning was that an on-plane cursor over
+content behind it is not a depth violation (it occludes what it is in front of), and that a
+cursor behind the glass would sit behind the page, the window chrome and the desktop.
+
+That holds when content mostly pops out. It fails for a scene that **lives behind the glass**.
+The case that raised it is a top-down web game whose ground recedes behind the plane (woven
+through the DisplayXR Browser, where the runtime draws the cursor: Amendment 4). The player's
+eyes are converged on the ground. An on-plane cursor is then *diplopic*: it is seen double, and
+neither image is on the thing under the pointer, because each eye sees the flat cursor over a
+different ground point. The on-screen offset between those two points is the content's
+disparity: at d = +0.2 and a 65 mm IPD, 13 mm. No depth cue is violated, and the pointer still
+does not point.
+
+The owner's request: "the usual goes out but not in ... maybe the 3d cursor opt in should have
+options: out only, both in and out".
+
+§3 as first written already clamped to [−0.6, +0.6] and let the cursor settle onto content
+behind the plane; Amendment 2 narrowed it to [−0.6, 0] for every caller. This amendment gives
+the wider range back to the callers that ask for it, and fixes what the original lacked (a
+margin in front of rear content, a dead band on both sides, a rule for crossing the plane).
+
+### Decision
+
+#### 1. Two ranges
+
+| Range | Value | Behaviour |
+|---|---|---|
+| `FRONT_ONLY` | 0, **the default** | Amendment 2 A.1, bit for bit: `target = d < 0 ? max(d − margin, −0.6) : 0`. |
+| `BOTH` | 1 | In front: identical to `FRONT_ONLY`. Behind: the cursor follows the content, a margin in front of it. |
+
+`BOTH`:
+
+`target = d < 0 ? max(d − margin, −0.6) : min(max(d − margin, 0), +0.6)`
+
+- **Never behind the content.** For rear content the target is `d − margin`: the cursor floats
+  the same margin in **front** of the content (toward the viewer) that it does for content in
+  front of the glass. The rule "the cursor is never behind what it points at" is unchanged; what
+  is relaxed is only "never behind the *glass*".
+- **Within a margin of the plane, the plane.** For 0 ≤ d ≤ margin the target is 0 and the OS
+  cursor is the cursor. So `BOTH` differs from `FRONT_ONLY` only for content more than a margin
+  (0.015 baselines, about 1 mm on screen) behind the plane, and noise around zero from a depth
+  read or the Amendment 3 matcher never draws a sprite. It also keeps the cursor from being
+  drawn *in front* of the plane over content that is behind it.
+- **Front side unchanged.** For d < 0 the result is `FRONT_ONLY`'s, exactly (unit-tested as bit
+  equality), so an app that turns `BOTH` on loses nothing it had.
+
+#### 2. The recession clamp: +0.6 eye baselines
+
+`d` is on-screen disparity in units of the view baseline, so the clamp is already an on-screen
+quantity:
+
+- **Divergence.** The two images of the cursor sit `d × baseline` apart on the panel. d = 1 is
+  parallel gaze (the point at infinity); d > 1 would ask the eyes to diverge. +0.6 keeps the
+  cursor's uncrossed separation at 60 % of the baseline (39 mm at 65 mm), with 40 % of headroom,
+  whatever the content claims. The weave path converts device pixels with the **tracked** eyes'
+  baseline (`d = disparityPx × pitch / baseline`), so there the bound is on the viewer's real
+  eye separation. On the locate path the baseline is the located views', which is the viewer's
+  eyes times the rig's IPD factor: at factors up to 1 / 0.6 ≈ 1.67 the cursor cannot diverge.
+  Beyond the clamp, the bound that matters is the content's own: the target is never more
+  uncrossed than the content minus a margin, so the cursor never adds divergence the scene
+  does not already have.
+- **Symmetry with the front clamp.** d is linear in the vergence offset from the glass
+  (offset in dioptres = −d / viewing distance). +0.6 asks of the eyes exactly what −0.6 does, in
+  the direction that is easier at desk distances. It is also §3's original bound.
+- **Geometry.** `t = 1 / (1 − d)`; d = 0.6 is t = 2.5, 1.5 viewing distances behind the glass.
+  The placement stays well away from the singularity at d = 1; a configured clamp is capped at
+  0.9 in code.
+- **The clamp fails safe.** Content deeper than the clamp leaves the cursor at +0.6, *in front*
+  of it: no violation. (The front clamp fails the other way, a cursor behind content nearer
+  than −0.6; that is existing behaviour and is not changed here.)
+
+Open question for the owner (below): whether the bound should instead be a physical on-screen
+length, which the weave path could apply exactly and the locate path only with display info.
+
+#### 3. Draw threshold, symmetric
+
+`FRONT_ONLY`: unchanged (drawn while the filtered d ≤ −0.005).
+
+`BOTH`: drawn while **|filtered d| ≥ 0.005**. Inside ±0.005 the OS cursor is the cursor, as
+today. One addition: a cursor **in transit through the plane** keeps being drawn. With a 250 ms
+sink constant a cursor travelling from −0.1 to +0.2 spends about 12 ms inside the band, i.e.
+usually exactly one frame; handing the pointer to the OS cursor for that frame (and, on the
+weave path, reporting "not drawn" two frames early) would blink it. So in `BOTH` a sprite is
+also drawn while the filtered value is inside the band and the **target** is outside it
+(`u_cursor_depth_should_draw_toward`). A cursor whose target is the plane is handed back as
+before, once it is inside the band, from either side.
+
+#### 4. Filter
+
+Unchanged, and already right for both sides because it is defined by direction, not by sign:
+moving **toward the viewer** uses the 30 ms constant (never lag behind content that comes
+forward: a unit standing on the receding ground), moving **away** uses 250 ms (no flicker at
+edges). Crossing the plane needs no special case in the filter; §3 above covers the hand-over.
+
+#### 5. Anchor modes
+
+All three hold for t > 1 with the formulas as written; nothing is special-cased.
+
+- **SCREEN**: `C = E + t (S − E)` is past the canvas on the cyclopean ray; its two images
+  straddle the pointer, uncrossed.
+- **WORLD**: `C = S − f (1 − t) e`; (1 − t) is negative, so C is straight **behind** S along
+  the normal.
+- **HYBRID**: `s = 1 − (1 − t) e / e₀` is > 1, further along the anchor-time line of sight. The
+  "C on or behind the eye" re-anchor (`s ≤ 0`) cannot trigger behind the glass. A depth change
+  under a still pointer slides C along that line through the plane and out the other side, so
+  it stays on the click point for the viewer who placed it.
+- **Sprite size**: height × t, as before; the sprite grows with distance so its apparent size is
+  constant.
+- **Drawability** (`u_cursor_draw_placement_drawable`): "in front of every view's eye" is
+  trivially true further away; the per-view map stays within its bounds (one t-scaled canvas
+  height is one tile height at any depth).
+
+#### 6. Softening, measured disparity, occlusion
+
+- **Crosstalk softening (B.7)** is already symmetric: the blur scales with |ghost px| and the
+  opacity with |d|. An uncrossed cursor at +d is softened like a crossed one at −d. No change.
+- **Measured disparity (Amendment 3)**: the matcher already searches both signs and takes the
+  nearest confident match in the footprint. With `BOTH` an uncrossed match is used; the front
+  dead band (0.005) is unchanged and the rear one is the margin (§1).
+- **Occlusion.** The sprite is drawn over the atlas with no depth test, in every view. A cursor
+  placed behind the glass but in front of the content under it is therefore still drawn
+  correctly: nothing nearer covers it, by construction. At a **depth edge** (a near object
+  beside the hotspot) the depth source reports the *nearest* texel or hit in the cursor
+  footprint, so the cursor is already at the near object's depth before its hotspot reaches it,
+  and the 30 ms rise covers the step. The remaining error is the usual one: a sprite larger
+  than the reported footprint, or a caller that samples only the hotspot.
+
+#### 7. 2D zones, HTML chrome, the window edge (Amendment 2's objection)
+
+Amendment 2's objection to a rear cursor was that it would sit behind the page, the chrome and
+the desktop. It does not, for three reasons, none of them new:
+
+- The cursor is drawn **only inside the canvas or rect that asked**, clipped to it in every
+  view, and only while the caller reports content under the pointer. Over HTML chrome, a 2D
+  zone or anything else at the plane the caller reports no content (or sends no entry, or the
+  pointer is not over the rect), the target is 0, and the OS cursor is the cursor. That
+  withdrawal is the caller's existing duty and is unchanged.
+- Chrome that overlaps 3D content is at the plane and so **in front of** a rear cursor; if the
+  caller did not withdraw, the sprite would be drawn over it with uncrossed disparity. This is
+  the same contract as today's front cursor (which would be drawn over chrome too) and the
+  same fix: withdraw.
+- At the rect's edge a rear sprite is **clipped by the rect**, which is what a window does to
+  things behind it: geometrically consistent. (A front sprite clipped by the edge is the
+  classic window violation; `BOTH` adds none of those.)
+
+#### 8. Where the option lives (no existing struct changes size)
+
+| Path | Carrier | Notes |
+|---|---|---|
+| Locate / hint (native apps, engines) | **`XrCursorDepthRangeDXR`**, new, chained on `XrCursorDepthHintDXR::next`: `XrCursorDepthRangeModeDXR range` | `XR_TYPE_CURSOR_DEPTH_RANGE_DXR` = **1004999390**. The extension's decade 320–329 is full (328/329 went to Amendment 4), so it opens a second decade, 390–399, registered in `openxr_includes/openxr/README.md`. |
+| Weave rect (the browser, Amendment 4) | `XrCursorDepthWeaveRectDXR::flags`, bit 0 = **`XR_CURSOR_DEPTH_RECT_RANGE_BOTH_BIT_DXR`** (0x1) | The word was "reserved, must be 0". Per rect, per submit; it is remembered with the rect's depth for the 500 ms the depth stays valid. |
+| Lifted rect (Amendment 1) | `XrCursorDepthLiftRectDXR::flags`, the same bit | Same word, same meaning, for consistency. A lifted picture's relief does go behind the screen. |
+
+Why not `XrCursorDepthOptionsDXR`: it has no spare field, and growing it would break every
+caller compiled against v3–v8. Why a struct and not a new anchor-mode value: range and anchor
+are independent (3 × 2 combinations). Why a flag on the rect entries and not a struct there:
+they are plain array members, not chainable.
+
+`XR_DXR_cursor_depth_SPEC_VERSION` = **9**.
+
+**Older runtimes, and how a caller detects support.** A runtime below v9 does not know the new
+structure type and skips it, and it never validated the rect flags (they were carried and
+ignored), so given the struct or the bit it behaves as `FRONT_ONLY`: no error, the cursor
+simply stays on the plane over rear content. A caller that needs to know checks the extension's
+`extensionVersion` from `xrEnumerateInstanceExtensionProperties` (≥ 9). At run time the
+placement also shows it: `XrCursorDepthPlacementDXR::targetDisparity` is > 0 only under `BOTH`.
+
+#### 9. First principle (§0)
+
+Unchanged. The range is read only behind a hint, a weave request or a lift-rect request that is
+already there; asking for `BOTH` adds no pass, no copy and no state. A caller that sets nothing
+runs the same code path with the same numbers as before spec v9.
+
+### As built
+
+- `u_cursor_depth`: `enum u_cursor_depth_range`, `u_cursor_depth_tuning::range` and
+  `::behind_max_disparity` (a zero-initialised tuning is `FRONT_ONLY`),
+  `u_cursor_depth_target` (§1–2), `u_cursor_depth_should_draw` (§3, symmetric),
+  `u_cursor_depth_should_draw_toward` (§3, transit), `u_cursor_weave_range_from_flags`, the
+  flags on `u_cursor_weave_memo`, `u_cursor_measure_target_px` (§6). Unit tests
+  (`tests_aux_cursor_depth`, `cursor_range: ...`): `FRONT_ONLY` bit-identical, `BOTH` behind,
+  at the clamp, crossing the plane, each anchor mode, drawability, softening symmetry, measured
+  px, the weave flag and its hand-back.
+- State tracker: `oxr_session_fill_cursor_depth` reads `XrCursorDepthRangeDXR` behind the hint
+  (every in-process compositor draws the result through the existing spec v5 path, unchanged);
+  `oxr_weave.c` carries the rect and lift-rect flags.
+- D3D11 service: the weave-rect cursor takes the range from the rect's remembered flags; the
+  lifted-rect cursor from `xrt_lift_weave_rect::depth_cursor_flags` (IPC: the former reserved
+  word of `ipc_lift_weave_rect`, layout unchanged).
+- Reference: `cube_handle_metal_macos`, `DISPLAYXR_CURSOR_DEPTH_RANGE=both` and
+  `DISPLAYXR_CUBE_Z=<metres>` (negative puts the cube behind the plane).
+
+### Not changed
+
+§0, Amendment 2's policy as the default for everyone, the margin, the front clamp, the filter
+constants, the anchor modes, the softening, Amendments 1, 3 and 4's APIs and struct sizes. No
+native demo or engine plug-in is affected unless it opts in.
+
+### Open questions (owner)
+
+1. **Rear clamp.** +0.6 baselines (symmetric, §3's original). Alternatives: a tighter rear
+   bound for comfort on high-crosstalk panels, or a physical on-screen cap in millimetres.
+2. **Content within a margin behind the plane** leaves the OS cursor (§1). The alternative,
+   `target = d − margin` for all d, would draw a sprite slightly in front of the plane over
+   content that is on or just behind it.
+3. **The front-side step at d = 0** (−margin just in front of the plane, 0 on it) is inherited
+   from Amendment 2 and kept so that `BOTH` equals `FRONT_ONLY` in front.
+4. **Per rect or per session on the web.** The runtime takes it per rect per submit, so either
+   SDK shape works.
+5. **Panel evidence.** The range has been unit-tested and captured in a simulated-display
+   atlas; it has not been looked at on a tracked 3D panel.
+

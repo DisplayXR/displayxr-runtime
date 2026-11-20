@@ -159,6 +159,9 @@ struct xrt_lift_weave_rect
 	//! XR_DXR_cursor_depth v6 (ADR-046 Amendment 1): draw the depth-aware
 	//! cursor into this rect's lifted views (XrCursorDepthLiftRectDXR).
 	bool depth_cursor;
+	//! XrCursorDepthLiftRectDXR::flags as sent (spec v9, ADR-046 Amendment 5:
+	//! bit 0 = follow content behind the glass too). Unknown bits are ignored.
+	uint32_t depth_cursor_flags;
 };
 
 //! One stream's counters + effective rate (XrLiftStreamStatsDXR).

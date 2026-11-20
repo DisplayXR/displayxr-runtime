@@ -89,6 +89,30 @@ u_cursor_depth_tuning_defaults(struct u_cursor_depth_tuning *t)
 	t->rise_tau_s = 0.03f;
 	t->sink_tau_s = 0.25f;
 	t->stale_s = 0.5f;
+	// Amendment 5: behind the glass only when the caller asks (spec v9).
+	t->range = U_CURSOR_DEPTH_RANGE_FRONT_ONLY;
+	t->behind_max_disparity = U_CURSOR_DEPTH_DEFAULT_BEHIND_MAX;
+}
+
+// The recession clamp in effect for RANGE_BOTH: (0, U_CURSOR_DEPTH_BEHIND_MAX_LIMIT].
+static float
+behind_max(const struct u_cursor_depth_tuning *t)
+{
+	float m = t->behind_max_disparity;
+	if (!(m > 0.0f) || !isfinite(m)) {
+		m = U_CURSOR_DEPTH_DEFAULT_BEHIND_MAX;
+	}
+	return m < U_CURSOR_DEPTH_BEHIND_MAX_LIMIT ? m : U_CURSOR_DEPTH_BEHIND_MAX_LIMIT;
+}
+
+// The draw threshold in effect (< 0).
+static float
+draw_threshold(const struct u_cursor_depth_tuning *t)
+{
+	// A threshold at or behind the canvas would draw a sprite ON the glass,
+	// where the OS cursor is the cursor (A.3): fall back to the default.
+	return (t->draw_threshold < 0.0f && isfinite(t->draw_threshold)) ? t->draw_threshold
+	                                                                 : U_CURSOR_DEPTH_DRAW_THRESHOLD;
 }
 
 bool
@@ -173,7 +197,20 @@ u_cursor_depth_target(const struct u_cursor_depth_tuning *t, bool has_content, f
 	// the canvas leaves the cursor ON the canvas; only content that comes out
 	// of the screen pushes it forward, margin in front of it.
 	if (!(content_disparity < 0.0f)) {
-		return 0.0f;
+		if (t->range != U_CURSOR_DEPTH_RANGE_BOTH) {
+			return 0.0f;
+		}
+		// Amendment 5, opt-in: follow content behind the glass, still a margin
+		// in FRONT of it. Content within a margin of the plane leaves the
+		// cursor on the plane (the OS cursor), so matcher or depth noise
+		// around zero never draws a sprite; the cursor never goes behind
+		// the content, nor past the recession clamp.
+		float b = content_disparity - t->margin;
+		if (!(b > 0.0f)) {
+			return 0.0f;
+		}
+		const float max_b = behind_max(t);
+		return b < max_b ? b : max_b;
 	}
 	float d = content_disparity - t->margin;
 	if (d < t->min_disparity) {
@@ -192,11 +229,28 @@ u_cursor_depth_target(const struct u_cursor_depth_tuning *t, bool has_content, f
 bool
 u_cursor_depth_should_draw(const struct u_cursor_depth_tuning *t, float filtered_disparity)
 {
-	// A threshold at or behind the canvas would draw a sprite ON the glass,
-	// where the OS cursor is the cursor (A.3): fall back to the default.
-	const float thr = (t->draw_threshold < 0.0f && isfinite(t->draw_threshold)) ? t->draw_threshold
-	                                                                            : U_CURSOR_DEPTH_DRAW_THRESHOLD;
-	return isfinite(filtered_disparity) && filtered_disparity <= thr;
+	const float thr = draw_threshold(t);
+	if (!isfinite(filtered_disparity)) {
+		return false;
+	}
+	if (t->range == U_CURSOR_DEPTH_RANGE_BOTH && filtered_disparity >= -thr) {
+		return true; // Amendment 5: as far behind the plane as the threshold is in front
+	}
+	return filtered_disparity <= thr;
+}
+
+bool
+u_cursor_depth_should_draw_toward(const struct u_cursor_depth_tuning *t, float filtered_disparity, float target)
+{
+	if (u_cursor_depth_should_draw(t, filtered_disparity)) {
+		return true;
+	}
+	if (t->range != U_CURSOR_DEPTH_RANGE_BOTH || !isfinite(filtered_disparity) || !isfinite(target)) {
+		return false;
+	}
+	// In the dead band, but only passing through it.
+	const float thr = draw_threshold(t);
+	return target <= thr || target >= -thr;
 }
 
 bool
@@ -238,7 +292,8 @@ u_cursor_depth_place(const struct u_cursor_depth_geometry *g,
                      struct xrt_vec3 *out_position,
                      float *out_height)
 {
-	// d = 1 - 1/t  <=>  t = 1 / (1 - d). Callers clamp d well below 1.
+	// d = 1 - 1/t  <=>  t = 1 / (1 - d). Callers clamp d well below 1
+	// (u_cursor_depth_target: at most U_CURSOR_DEPTH_BEHIND_MAX_LIMIT).
 	const float t = 1.0f / (1.0f - disparity);
 	if (!(height_fraction > 0.0f) || !isfinite(height_fraction)) {
 		height_fraction = U_CURSOR_DEPTH_DEFAULT_HEIGHT;
@@ -267,7 +322,10 @@ u_cursor_depth_place_anchored(const struct u_cursor_depth_geometry *g,
 	}
 
 	const float t = 1.0f / (1.0f - disparity);
-	// How far C sits in front of the canvas plane, along the normal.
+	// How far C sits in front of the canvas plane, along the normal. Negative
+	// behind it (Amendment 5, t > 1): WORLD then steps back along the normal,
+	// and HYBRID's s exceeds 1 - further along the anchor-time line of sight,
+	// past the canvas - so the same formulas hold on both sides.
 	const float lift = (1.0f - t) * g->eye_to_canvas;
 
 	if (mode == U_CURSOR_DEPTH_ANCHOR_WORLD || anchor == NULL) {
@@ -1722,7 +1780,9 @@ u_cursor_measure_target_px(const struct u_cursor_depth_tuning *t,
 	}
 	const float d = measured_px / px_per_baseline;
 	// Matcher noise on content that sits on the glass is not content in front of it.
-	if (d > -U_CURSOR_MEASURE_DEADBAND) {
+	// (Behind it, RANGE_BOTH's own rule already ignores anything within a
+	// margin of the plane - u_cursor_depth_target.)
+	if (d > -U_CURSOR_MEASURE_DEADBAND && !(t->range == U_CURSOR_DEPTH_RANGE_BOTH && d > 0.0f)) {
 		return 0.0f;
 	}
 	// measured < 0 ? max(measured - margin_px, cap_px) : 0 - A.1 in pixels.
@@ -1987,9 +2047,11 @@ u_cursor_weave_memo_put(struct u_cursor_weave_memo *m,
                         const struct u_cursor_weave_rect *rect,
                         bool has_content,
                         float disparity_px,
+                        uint32_t flags,
                         uint64_t now_ns)
 {
 	m->valid = true;
+	m->flags = flags;
 	m->rect_index = rect_index;
 	m->w = rect != NULL ? rect->w : 0;
 	m->h = rect != NULL ? rect->h : 0;
@@ -1997,6 +2059,13 @@ u_cursor_weave_memo_put(struct u_cursor_weave_memo *m,
 	m->has_content = has_content && isfinite(disparity_px);
 	m->disparity_px = m->has_content ? disparity_px : 0.0f;
 	m->stamp_ns = now_ns;
+}
+
+enum u_cursor_depth_range
+u_cursor_weave_range_from_flags(uint32_t flags)
+{
+	return (flags & U_CURSOR_WEAVE_RECT_FLAG_RANGE_BOTH) != 0 ? U_CURSOR_DEPTH_RANGE_BOTH
+	                                                          : U_CURSOR_DEPTH_RANGE_FRONT_ONLY;
 }
 
 bool
@@ -2137,7 +2206,8 @@ u_cursor_weave_step(struct u_cursor_weave_state *st,
 	st->last_ns = in->now_ns;
 	const uint64_t frame_ns = st->frame_ns != 0 ? st->frame_ns : U_CURSOR_WEAVE_DEFAULT_FRAME_NS;
 
-	// The one policy (Amendment 2 A): never behind the glass, margin, clamp.
+	// The one policy (Amendment 2 A): never behind the glass, margin, clamp -
+	// or, when the rect asked (Amendment 5, t->range), both sides of it.
 	const float target = u_cursor_depth_target(t, in->has_content, in->content_d);
 	const bool reprimed = u_cursor_depth_filter_will_prime(&st->filter, t, in->now_ns);
 	const float d = u_cursor_depth_filter_step(&st->filter, t, target, in->now_ns);
@@ -2177,7 +2247,7 @@ u_cursor_weave_step(struct u_cursor_weave_state *st,
 		return false;
 	}
 
-	out->draw = u_cursor_depth_should_draw(t, d);
+	out->draw = u_cursor_depth_should_draw_toward(t, d, target);
 	if (out->draw) {
 		// Hand back early: if the cursor, still heading for the same target,
 		// would no longer be drawn HANDBACK_FRAMES submits from now, report
@@ -2188,7 +2258,7 @@ u_cursor_weave_step(struct u_cursor_weave_state *st,
 		for (uint32_t k = 1; k <= U_CURSOR_WEAVE_HANDBACK_FRAMES; k++) {
 			pd = u_cursor_depth_filter_step(&f, t, target, in->now_ns + k * frame_ns);
 		}
-		out->report_drawn = u_cursor_depth_should_draw(t, pd);
+		out->report_drawn = u_cursor_depth_should_draw_toward(t, pd, target);
 	}
 	return true;
 }

@@ -3678,6 +3678,13 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
 			tuning.margin = options->margin;
 		}
 	}
+	// Spec v9 (ADR-046 Amendment 5): the depth range, read only behind the
+	// hint. Absent, or any value but BOTH = FRONT_ONLY (never behind the glass).
+	const XrCursorDepthRangeDXR *range =
+	    OXR_GET_INPUT_FROM_CHAIN(hint, XR_TYPE_CURSOR_DEPTH_RANGE_DXR, XrCursorDepthRangeDXR);
+	if (range != NULL && range->range == XR_CURSOR_DEPTH_RANGE_MODE_BOTH_DXR) {
+		tuning.range = U_CURSOR_DEPTH_RANGE_BOTH;
+	}
 
 	float content = 0.0f;
 	bool has_content;
@@ -3714,9 +3721,11 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
 
 	// Amendment 2 A.3: on the plane it is the OS cursor. isActive (= "draw
 	// a sprite, hide the OS cursor") only while the FILTERED disparity is in
-	// front of the draw threshold. The filter and the anchor above stepped
-	// regardless, so the drawn cursor hands back and returns smoothly.
-	if (!u_cursor_depth_should_draw(&tuning, disparity)) {
+	// front of the draw threshold (Amendment 5, RANGE_BOTH: or as far behind
+	// the plane, or crossing it toward a target that is). The filter and the
+	// anchor above stepped regardless, so the drawn cursor hands back and
+	// returns smoothly.
+	if (!u_cursor_depth_should_draw_toward(&tuning, disparity, target)) {
 		return;
 	}
 	out->isActive = XR_TRUE;
