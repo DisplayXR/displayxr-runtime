@@ -31,6 +31,7 @@
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
 #include "util/comp_texture_target_win32.h"   // ADR-060 texture target binding (#2721)
+#include "util/comp_texture_target_drag_snap_win32.h" // #2725: drag snap of the reference window
 #include "util/comp_dp_windowless_gl.h"       // ADR-060 windowless DP rule (#2721)
 #include "util/comp_texture_target_screens.h" // ADR-060 coverage of the 3D screen (#2721)
 // #918 Phase 3 — the shared `weave placement:` line, plus the canonical reason
@@ -1017,6 +1018,10 @@ struct comp_gl_compositor
 		int coverage_logged;
 		//! What the last woven bound frame used (under `mutex`).
 		struct comp_texture_target_state state;
+		//! #2725: phase-snaps user drags of the reference window while the
+		//! windowless DP weaves the target (NULL: not armed — anchor fallback,
+		//! or a DP without the snap_window_rect slot).
+		struct comp_tt_drag_snap *drag_snap;
 	} tt;
 
 	// WGL_NV_DX_interop2 function pointers (used by the DComp transit path)
@@ -1617,6 +1622,8 @@ gl_tt_before_weave(struct comp_gl_compositor *c,
 			        comp_texture_target_coverage_str(cov));
 		}
 		if (cov != COMP_TEXTURE_TARGET_COVERAGE_ON_PANEL) {
+			// #2725: filled flat, not phased — nothing to snap.
+			comp_tt_drag_snap_update(c->tt.drag_snap, out_named->ref, out_named->x, out_named->y, false);
 			*out_state |= COMP_TEXTURE_TARGET_STATE_FLAT_SEGMENT;
 			*out_flat = true;
 			return true;
@@ -1624,6 +1631,8 @@ gl_tt_before_weave(struct comp_gl_compositor *c,
 		int32_t ox = 0, oy = 0;
 		comp_texture_target_present_origin(out_r, c->tt.panel_left, c->tt.panel_top, &ox, &oy);
 		xrt_display_processor_gl_set_present_origin(c->display_processor, ox, oy);
+		// #2725: this frame is phased from the target's origin — drags snap.
+		comp_tt_drag_snap_update(c->tt.drag_snap, out_named->ref, out_named->x, out_named->y, true);
 		if (!c->tt.origin_logged) {
 			c->tt.origin_logged = true;
 			U_LOG_W(
@@ -5800,6 +5809,33 @@ gl_dp_session_settings(struct comp_gl_compositor *c, bool client_presents)
 
 #ifdef XRT_OS_WINDOWS
 /*!
+ * #2725: the texture target's drag snap — the windowless DP's
+ * snap_window_rect, on the reference window's thread. Like the own-window
+ * snap it only TRIES dp_swap_mutex: a drag step that coincides with a primary
+ * DP swap goes unsnapped rather than waiting on the window thread. The snap is
+ * destroyed (detached under its exclusive lock) before the DP is.
+ */
+static bool
+gl_tt_drag_snap_cb(void *userdata,
+                   int32_t origin_x,
+                   int32_t origin_y,
+                   int32_t target_x,
+                   int32_t target_y,
+                   int32_t *out_x,
+                   int32_t *out_y)
+{
+	struct comp_gl_compositor *c = (struct comp_gl_compositor *)userdata;
+	if (c == NULL || os_mutex_trylock(&c->dp_swap_mutex) != 0) {
+		return false;
+	}
+	bool snapped = c->display_processor != NULL &&
+	               xrt_display_processor_gl_snap_window_rect(c->display_processor, origin_x, origin_y, target_x,
+	                                                         target_y, out_x, out_y);
+	os_mutex_unlock(&c->dp_swap_mutex);
+	return snapped;
+}
+
+/*!
  * ADR-060 §6 (#2721): the primary DP of a bound texture session, made
  * WINDOWLESS on the current GL context through the session screen's
  * per-screen factory (window = NULL — the factory the GL segment manager
@@ -5841,6 +5877,13 @@ gl_tt_make_windowless_dp(struct comp_gl_compositor *c)
 	    "ADR-060: texture target bound — WINDOWLESS primary GL DP from '%s' (screen at %d,%d %ux%u), phased from "
 	    "the target's present origin; the reference window %p is read, never handed to the vendor",
 	    e->plugin_id, e->screen_left, e->screen_top, e->pixel_width, e->pixel_height, c->tt.frame.ref);
+	// #2725: frames are woven for where the target IS and presented by the
+	// app later, so a drag must keep the window on the weave's phase lattice.
+	// Only a DP with the slot is armed: any other leaves the window free.
+	if (XRT_DP_HAS_SLOT(dp, snap_window_rect) && dp->snap_window_rect != NULL) {
+		c->tt.drag_snap = comp_tt_drag_snap_create(c->tt.frame.ref, c->tt.frame.x, c->tt.frame.y,
+		                                           gl_tt_drag_snap_cb, c, "gl");
+	}
 	return true;
 }
 #endif
@@ -9248,6 +9291,8 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->owns_window && c->own_window != NULL) {
 		comp_d3d11_window_set_snap_provider(c->own_window, NULL, NULL);
 	}
+	// #2725: same for the texture target's reference-window snap.
+	comp_tt_drag_snap_destroy(&c->tt.drag_snap);
 	// Multi-screen M6: the segment DPs (and their GL objects) go first, on
 	// this context. No hooks: the primary DP is destroyed right below, so the
 	// window is not handed back to it.

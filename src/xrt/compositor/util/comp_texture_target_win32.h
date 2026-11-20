@@ -5,8 +5,11 @@
  * @brief  Texture target binding (ADR-060): the Win32 read of the reference
  *         window (Windows-only, header-only, C-compatible).
  *
- * The reference window is only ever READ (`GetClientRect` is not even needed:
- * the app names the rect) — never subclassed, reparented or handed to a DP.
+ * The reference window is READ here (`GetClientRect` is not even needed:
+ * the app names the rect) — never reparented or handed to a DP. The one
+ * exception to "only read" is the drag phase-snap of a windowless target
+ * (#2725, comp_texture_target_drag_snap_win32.h), which subclasses its
+ * top-level to snap user moves.
  * The read is pinned to DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 on the
  * calling thread, because the runtime runs inside the HOST's process and a
  * DPI-unaware host would otherwise get DPI-virtualised coordinates

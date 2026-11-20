@@ -100,3 +100,8 @@ if(WIN32 AND XRT_HAVE_D3D11)
 	# file(GLOB HLSL_SHADERS shaders/*.hlsl)
 	# install(FILES ${HLSL_SHADERS} DESTINATION share/monado/shaders/d3d11)
 endif()
+
+# ADR-060 texture target drag phase-snap of the app's reference window (#2725).
+if(WIN32 AND TARGET comp_d3d11)
+	target_link_libraries(comp_d3d11 PRIVATE comp_tt_drag_snap)
+endif()

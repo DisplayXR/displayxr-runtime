@@ -69,3 +69,8 @@ if(WIN32 AND XRT_HAVE_D3D12)
 		target_compile_definitions(comp_d3d12 PRIVATE XRT_BUILD_DRIVER_QWERTY)
 	endif()
 endif()
+
+# ADR-060 texture target drag phase-snap of the app's reference window (#2725).
+if(WIN32 AND TARGET comp_d3d12)
+	target_link_libraries(comp_d3d12 PRIVATE comp_tt_drag_snap)
+endif()

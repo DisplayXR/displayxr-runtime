@@ -103,3 +103,8 @@ if(XRT_BUILD_DRIVER_QWERTY)
 	target_link_libraries(comp_gl PRIVATE drv_qwerty_includes)
 	target_compile_definitions(comp_gl PRIVATE XRT_BUILD_DRIVER_QWERTY)
 endif()
+
+# ADR-060 texture target drag phase-snap of the app's reference window (#2725).
+if(WIN32 AND TARGET comp_gl)
+	target_link_libraries(comp_gl PRIVATE comp_tt_drag_snap)
+endif()
