@@ -1061,6 +1061,22 @@ static void SignalHandler(int)
 - (BOOL)wantsUpdateLayer {
     return YES;
 }
+// Camera mouse input lives on the view, not in the event pump: AppKit only
+// hands a view the mouse-downs that land in it, after the window's title bar
+// and resize band and after any local event monitor. So a click the runtime
+// takes as a window move/resize (Metal's runtime-owned placement swallows
+// the edge zone, ADR-050), or AppKit's own native resize, never reaches here
+// and cannot rotate the cube. Reading LeftMouseDown/Dragged in the pump would
+// see those clicks first. Drags arrive here only for a press this view took.
+- (void)mouseDown:(NSEvent *)event {
+    if ([event clickCount] >= 2) g_input.resetViewRequested = true;
+}
+- (void)mouseDragged:(NSEvent *)event {
+    g_input.yaw   -= (float)[event deltaX] * 0.005f;
+    g_input.pitch -= (float)[event deltaY] * 0.005f;
+    if (g_input.pitch > 1.4f) g_input.pitch = 1.4f;
+    if (g_input.pitch < -1.4f) g_input.pitch = -1.4f;
+}
 @end
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
@@ -1163,8 +1179,6 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
 
 static void PumpMacOSEvents()
 {
-    static bool leftDragInContent = false;
-
     @autoreleasepool {
         NSEvent *event;
         while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
@@ -1173,19 +1187,8 @@ static void PumpMacOSEvents()
                                              dequeue:YES]) != nil) {
             NSEventType type = [event type];
 
-            if (type == NSEventTypeLeftMouseDown) {
-                NSPoint loc = [event locationInWindow];
-                NSRect contentRect = g_window ? [[g_window contentView] frame] : NSZeroRect;
-                leftDragInContent = NSMouseInRect(loc, contentRect, NO);
-                if ([event clickCount] >= 2) g_input.resetViewRequested = true;
-            } else if (type == NSEventTypeLeftMouseDragged) {
-                if (leftDragInContent && ([NSEvent pressedMouseButtons] & 1)) {
-                    g_input.yaw   -= (float)[event deltaX] * 0.005f;
-                    g_input.pitch -= (float)[event deltaY] * 0.005f;
-                    if (g_input.pitch > 1.4f) g_input.pitch = 1.4f;
-                    if (g_input.pitch < -1.4f) g_input.pitch = -1.4f;
-                }
-            } else if (type == NSEventTypeScrollWheel) {
+            // Left-button camera input: AppMetalView mouseDown:/mouseDragged:.
+            if (type == NSEventTypeScrollWheel) {
                 float dy = (float)[event scrollingDeltaY];
                 float factor = (dy > 0) ? 1.1f : (1.0f / 1.1f);
                 NSUInteger scrollMods = [event modifierFlags];

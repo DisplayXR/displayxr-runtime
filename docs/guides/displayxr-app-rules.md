@@ -224,6 +224,21 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   displayxr-common's `common/linux/dxr_linux_window.cpp` (`DxrLinuxWindow::create_wayland`); full
   contract: `docs/specs/extensions/XR_DXR_wayland_surface_binding.md`.
 
+  **macOS: read in-window mouse gestures on your NSView, not in the event pump.** A
+  Metal handle session's window is placed by the runtime (ADR-050): it installs an
+  `NSEvent` local monitor that takes the title-bar drag and an 8 pt band either side of
+  each edge as a snapped move/resize, and swallows those events. A local monitor runs
+  inside `-[NSApp sendEvent:]`, so an app that inspects `LeftMouseDown`/`LeftMouseDragged`
+  as it dequeues them (`nextEventMatchingMask:` loop) sees every edge-band press **before**
+  the runtime does, and a resize started a few points inside the content also rotates the
+  camera. Override `mouseDown:` / `mouseDragged:` / `mouseUp:` on the content view instead
+  (keep forwarding every non-key event through `[NSApp sendEvent:]`): AppKit delivers to a
+  view only the presses that survive the monitor, the title bar and its own native resize
+  band, and delivers drags only for a press the view took. This is a convention, not a
+  lint rule. The same applies to the GL and Vulkan compositors (AppKit owns the resize
+  there): a view-based handler also stops a native edge resize from rotating the scene.
+  Reference: the `AppMetalView` / `AppGLView` mouse methods in `test_apps/*/cube_*_macos`.
+
 - **INV-1.4 (Android) — Opt out of view-bounds sandboxing in YOUR manifest.** The runtime
   anchors the weave's interlace phase to your window's on-screen origin, which it learns by
   sampling `View.getLocationOnScreen()` once per frame (ADR-036 D6, #1033 — a pure window

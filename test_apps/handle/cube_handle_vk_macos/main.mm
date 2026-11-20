@@ -2262,6 +2262,22 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
 - (BOOL)wantsUpdateLayer {
     return YES;
 }
+// Camera mouse input lives on the view, not in the event pump: AppKit only
+// hands a view the mouse-downs that land in it, after the window's title bar
+// and resize band and after any local event monitor. So a click the runtime
+// takes as a window move/resize (Metal's runtime-owned placement swallows
+// the edge zone, ADR-050), or AppKit's own native resize, never reaches here
+// and cannot rotate the cube. Reading LeftMouseDown/Dragged in the pump would
+// see those clicks first. Drags arrive here only for a press this view took.
+- (void)mouseDown:(NSEvent *)event {
+    if ([event clickCount] >= 2) g_input.resetViewRequested = true;
+}
+- (void)mouseDragged:(NSEvent *)event {
+    g_input.yaw   -= (float)[event deltaX] * 0.005f;
+    g_input.pitch -= (float)[event deltaY] * 0.005f;
+    if (g_input.pitch > 1.4f) g_input.pitch = 1.4f;
+    if (g_input.pitch < -1.4f) g_input.pitch = -1.4f;
+}
 @end
 
 // NSApplicationDelegate: prevent termination when the window is closed or app
@@ -2493,8 +2509,6 @@ static void ApplyCharKey(unichar ch, bool isDown, bool isRepeat) {
 static void PumpMacOSEvents() {
     // Track whether left-click started in content area vs title bar.
     // Title bar drags should move the window, not rotate the scene.
-    static bool leftDragInContent = false;
-
     @autoreleasepool {
         NSEvent *event;
         while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
@@ -2503,23 +2517,8 @@ static void PumpMacOSEvents() {
                                              dequeue:YES]) != nil) {
             NSEventType type = [event type];
 
-            if (type == NSEventTypeLeftMouseDown) {
-                NSPoint loc = [event locationInWindow];
-                NSRect contentRect = g_window ? [[g_window contentView] frame] : NSZeroRect;
-                leftDragInContent = NSMouseInRect(loc, contentRect, NO);
-                if ([event clickCount] >= 2) g_input.resetViewRequested = true;
-            } else if (type == NSEventTypeLeftMouseDragged) {
-                // Rotate camera only while left button is physically held AND
-                // the drag started in the content area (not the title bar).
-                // Uses event deltas — no persistent drag state that can get
-                // stuck when the window-resize modal loop swallows MouseUp.
-                if (leftDragInContent && ([NSEvent pressedMouseButtons] & 1)) {
-                    g_input.yaw   -= (float)[event deltaX] * 0.005f;
-                    g_input.pitch -= (float)[event deltaY] * 0.005f;
-                    if (g_input.pitch > 1.4f) g_input.pitch = 1.4f;
-                    if (g_input.pitch < -1.4f) g_input.pitch = -1.4f;
-                }
-            } else if (type == NSEventTypeScrollWheel) {
+            // Left-button camera input: AppMetalView mouseDown:/mouseDragged:.
+            if (type == NSEventTypeScrollWheel) {
                 NSUInteger sm = [event modifierFlags];
                 uint32_t mods = 0;
                 if (sm & NSEventModifierFlagShift) mods |= 1u << 0;
