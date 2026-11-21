@@ -394,7 +394,8 @@ public sealed class CatalogPage : Page
         _detail = i.Id;
         _keyFor = null;
         // The licence comes from the component itself: read its class when it is installed.
-        if (i.IsInstalled && i.PolicyClass is { } c) _ = Ctx.LoadPolicyAsync(c);
+        // Posted: this can be reached from inside Key(), and the load announces itself at once.
+        if (i.IsInstalled && i.PolicyClass is { } c) Dispatcher.UIThread.Post(() => _ = Ctx.LoadPolicyAsync(c));
         if (!rebuild) return;
         Update(force: true);
         Dispatcher.UIThread.Post(() => this.BringIntoView(new Rect(0, 0, 1, 1)));
