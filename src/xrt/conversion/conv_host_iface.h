@@ -243,6 +243,26 @@ struct conv_host_ops
 	 *  would block the join forever: the core's watchdog has already stopped.
 	 *  NULL = in-service (the inproc host is unaffected). */
 	void (*begin_shutdown)(struct conv_host *h);
+
+	/*! [C] The provider's licence state (ADR-054 N5), as last reported:
+	 *  in-service from its `get_license_state` slot, satellite from the
+	 *  host's LICENSE_STATE message. @p out is always filled
+	 *  (`not_applicable` when none); the return is that state. NULL = the
+	 *  registry reads the iface instead. get_state already carries the
+	 *  consequence (an unlicensed / expired provider's capabilities read
+	 *  XRT_CONV_STATE_UNLICENSED), so this is for showing, not selecting. */
+	uint32_t (*get_license_state)(struct conv_host *h, struct xrt_component_license_state *out);
+
+	/*! [may block for a few seconds; never on a render / dispatch thread]
+	 *  Hand an activation token to the provider's `activate` slot. true =
+	 *  accepted; @p out_state (may be NULL) gets the state after the call,
+	 *  @p err (may be NULL) the provider's error line, or why it could not be
+	 *  delivered. The token is opaque and never logged. NULL = unsupported. */
+	bool (*activate)(struct conv_host *h,
+	                 const char *token,
+	                 struct xrt_component_license_state *out_state,
+	                 char *err,
+	                 uint32_t err_cap);
 };
 
 /*! Base of every host. */
@@ -284,6 +304,17 @@ static inline xrt_result_t
 conv_host_get_state(struct conv_host *h, uint32_t cap_id, struct xrt_conv_state *out)
 {
 	return h->ops->get_state(h, cap_id, out);
+}
+
+//! The provider's licence state through its host; `not_applicable` for a host without the op.
+static inline uint32_t
+conv_host_get_license_state(struct conv_host *h, struct xrt_component_license_state *out)
+{
+	if (h == NULL || h->ops->get_license_state == NULL) {
+		xrt_component_license_state_init(out);
+		return XRT_COMPONENT_LICENSE_NOT_APPLICABLE;
+	}
+	return h->ops->get_license_state(h, out);
 }
 
 static inline xrt_result_t

@@ -30,6 +30,8 @@
 #include "xrt/xrt_display_status.h"
 #include "xrt/xrt_conversion_plugin.h"
 
+#include "target_component_loader.h" // enum target_component_activate_result
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -255,6 +257,29 @@ target_conv_status_headless_host(void);
  */
 void
 target_conv_status_set_headless_entry(const struct xrt_conversion_plugin_entry *e);
+
+/*!
+ * The licence state of the registered conversion provider @p id (ADR-054
+ * N5): negotiate only (the headless host, so the provider reads its settings;
+ * no probe, no describe), ask its `get_license_state` slot, unload. @p out is
+ * always a valid struct (`not_applicable` when the provider reports none).
+ * False when @p id is not registered or its binary did not load / negotiate.
+ * A lister's call, single-threaded like the headless pass.
+ */
+bool
+target_conv_license_state(const char *id, struct xrt_component_license_state *out);
+
+/*!
+ * Hand @p token to the registered provider @p id's `activate` slot (negotiate
+ * only, headless host): the new state in @p out_state (may be NULL) or its
+ * error line in @p err. The token is opaque and never logged. This reaches
+ * the provider in THIS process; a provider that keeps its activation does so
+ * itself, and one running in the service or its satellite host learns of it
+ * the way it learns of any licence change.
+ */
+enum target_component_activate_result
+target_conv_activate(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap);
 
 struct conv_registry;
 

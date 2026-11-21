@@ -37,6 +37,7 @@
 
 #include "xrt/xrt_camera_pose.h"
 #include "xrt/xrt_component_settings.h"
+#include "xrt/xrt_component_license.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_stereo_camera.h"
 
@@ -807,6 +808,33 @@ struct xrt_input_plugin_iface
 	 * @ref XRT_INPUT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS.
 	 */
 	xrt_component_describe_settings_fn_t describe_settings;
+
+	/*!
+	 * The provider's LICENCE STATE (ADR-054 N5, ADR-064 §5; the one contract
+	 * every class shares, `xrt/xrt_component_license.h`). Answers from
+	 * memory, no instance, any thread. The loader acts on the answer it gets
+	 * after a successful `probe()`: a provider whose state is `unlicensed`
+	 * or `expired` is destroyed and not loaded, exactly like one that
+	 * declined, so the roles go to the next provider; a resident provider
+	 * whose state turns blocking later stops being a candidate at the next
+	 * policy re-read. Optional: NULL (or a provider whose `struct_size`
+	 * predates this slot) has no licence to report (`not_applicable`) and
+	 * nothing changes. Appended under `struct_size` cover (API major stays
+	 * 1); guarded with @ref XRT_INPUT_PLUGIN_IFACE_HAS. Announced by
+	 * @ref XRT_INPUT_PLUGIN_IFACE_HAS_GET_LICENSE_STATE.
+	 */
+	xrt_component_get_license_state_fn_t get_license_state;
+
+	/*!
+	 * Hand the provider an ACTIVATION TOKEN (a pasted key, or a vendor
+	 * checkout's deep-link token): an opaque UTF-8 blob the runtime never
+	 * interprets, logs or stores. Returns the new licence state or an error
+	 * line (`xrt/xrt_component_license.h`). May block for a few seconds.
+	 * Optional; appended under `struct_size` cover (API major stays 1);
+	 * guarded with @ref XRT_INPUT_PLUGIN_IFACE_HAS. Announced by
+	 * @ref XRT_INPUT_PLUGIN_IFACE_HAS_ACTIVATE.
+	 */
+	xrt_component_activate_fn_t activate;
 };
 
 /*!
@@ -815,6 +843,33 @@ struct xrt_input_plugin_iface
  * filling it.
  */
 #define XRT_INPUT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS 1
+
+/*!
+ * Defined when @ref xrt_input_plugin_iface carries `get_license_state`
+ * (ADR-054 N5), so a provider built against an older runtime header can
+ * #ifdef-guard filling it.
+ */
+#define XRT_INPUT_PLUGIN_IFACE_HAS_GET_LICENSE_STATE 1
+
+/*!
+ * Defined when @ref xrt_input_plugin_iface carries `activate` (ADR-054 N5),
+ * so a provider built against an older runtime header can #ifdef-guard
+ * filling it.
+ */
+#define XRT_INPUT_PLUGIN_IFACE_HAS_ACTIVATE 1
+
+/*!
+ * The licence state of @p iface, with the absent-slot rule applied
+ * (`not_applicable` unless the provider says otherwise). @p out is always a
+ * valid, sanitised struct. Returns the state.
+ */
+static inline uint32_t
+xrt_input_plugin_iface_license_state(const struct xrt_input_plugin_iface *iface,
+                                     struct xrt_component_license_state *out)
+{
+	return xrt_component_license_query(
+	    XRT_INPUT_PLUGIN_IFACE_HAS(iface, get_license_state) ? iface->get_license_state : NULL, out);
+}
 
 
 /*

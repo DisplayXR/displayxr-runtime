@@ -324,6 +324,13 @@ conv_registry_describe(struct conv_registry *reg, uint32_t pi, uint64_t now_ns)
 		}
 	}
 
+	// Licence state (ADR-054 N5): through the host for a satellite provider.
+	if (host != NULL) {
+		(void)conv_host_get_license_state(host, &p->license);
+	} else {
+		(void)xrt_conversion_plugin_iface_license_state(iface, &p->license);
+	}
+
 	const bool has_gen = host != NULL || XRT_CONV_IFACE_HAS(iface, get_generation);
 	struct xrt_conv_capability caps[XRT_CONV_MAX_CAPABILITIES];
 	uint32_t n = 0;

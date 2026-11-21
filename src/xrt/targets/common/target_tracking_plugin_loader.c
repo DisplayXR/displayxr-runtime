@@ -295,6 +295,22 @@ tracking_try_load_one(struct target_component_entry *e,
 			return NULL;
 		}
 	}
+	// ADR-054 N5 / ADR-064 §5: the licence state, asked AFTER probe(). An
+	// unlicensed or expired provider is treated like one that declined: it
+	// is not resident, so the next provider in rank serves the viewer. A
+	// provider without the slot reads `not_applicable`.
+	struct xrt_component_license_state license;
+	if (xrt_component_license_blocks(xrt_tracking_plugin_iface_license_state(iface, &license))) {
+		U_LOG_W("tracking plugin loader:   %s: licence: %s — not resident; the next provider is tried.", e->id,
+		        xrt_component_license_state_str(license.state));
+		if (*out_inst != NULL && iface->destroy != NULL) {
+			iface->destroy(*out_inst);
+		}
+		*out_inst = NULL;
+		*out_declined = true;
+		target_component_unload(module);
+		return NULL;
+	}
 	U_LOG_W(
 	    "tracking plugin loader: resident viewer-tracking provider: id=%s name='%s' plugin_api=%u probe_order=%u "
 	    "path=%s",
@@ -398,6 +414,14 @@ target_tracking_plugin_get_row_id(int index)
 }
 
 uint32_t
+target_tracking_plugin_get_license_state(int index, struct xrt_component_license_state *out)
+{
+	tracking_scan();
+	return xrt_tracking_plugin_iface_license_state(
+	    (index >= 0 && index < g_slot_count) ? g_slots[index].iface : NULL, out);
+}
+
+uint32_t
 target_tracking_plugin_get_priority(int index)
 {
 	tracking_scan();
@@ -469,6 +493,101 @@ target_tracking_plugin_enumerate(struct target_tracking_plugin_desc *out, int ma
 	}
 	free(entries);
 	return count;
+}
+
+/*!
+ * Run @p fn on the negotiated-only iface of the registered provider @p id
+ * (quiet load, negotiate, ABI gate, @p fn, unload). False when @p id is not
+ * registered or did not get that far.
+ */
+static bool
+tracking_with_negotiated(const char *id, void (*fn)(const struct xrt_tracking_plugin_iface *iface, void *ud), void *ud)
+{
+	if (id == NULL || id[0] == '\0') {
+		return false;
+	}
+	struct target_component_entry *entries =
+	    (struct target_component_entry *)calloc(TARGET_COMPONENT_MAX_ENTRIES, sizeof(*entries));
+	if (entries == NULL) {
+		return false;
+	}
+	bool done = false;
+	const int count = target_component_enumerate(&g_tracking_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	for (int i = 0; i < count; i++) {
+		struct target_component_entry *e = &entries[i];
+		if ((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0 || strcmp(e->id, id) != 0) {
+			continue;
+		}
+		void *module = NULL;
+		void *entry = NULL;
+		if (target_component_load_binary_ex(&g_tracking_class, e, TARGET_COMPONENT_LOAD_FLAG_QUIET, &module,
+		                                    &entry, NULL, NULL, 0) != TARGET_COMPONENT_LOAD_OK) {
+			break;
+		}
+		struct xrt_tracking_plugin_iface *iface = NULL;
+		uint32_t plugin_version = 0;
+		const xrt_result_t xret = ((xrt_tracking_plugin_negotiate_fn_t)entry)(
+		    XRT_TRACKING_PLUGIN_API_VERSION_CURRENT, target_tracking_plugin_get_host_iface(), &iface,
+		    &plugin_version);
+		if (target_component_abi_gate(&g_tracking_class, e->id, xret, iface, plugin_version, NULL, 0) ==
+		    TARGET_COMPONENT_ABI_OK) {
+			fn(iface, ud);
+			done = true;
+		}
+		target_component_unload(module);
+		break;
+	}
+	free(entries);
+	return done;
+}
+
+static void
+tracking_license_cb(const struct xrt_tracking_plugin_iface *iface, void *ud)
+{
+	(void)xrt_tracking_plugin_iface_license_state(iface, (struct xrt_component_license_state *)ud);
+}
+
+bool
+target_tracking_plugin_license_state(const char *id, struct xrt_component_license_state *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	xrt_component_license_state_init(out);
+	return tracking_with_negotiated(id, tracking_license_cb, out);
+}
+
+struct tracking_activate_args
+{
+	const char *token;
+	struct xrt_component_license_state *out_state;
+	char *err;
+	size_t err_cap;
+	enum target_component_activate_result result;
+};
+
+static void
+tracking_activate_cb(const struct xrt_tracking_plugin_iface *iface, void *ud)
+{
+	struct tracking_activate_args *a = (struct tracking_activate_args *)ud;
+	a->result =
+	    target_component_activate_call(XRT_TRACKING_PLUGIN_IFACE_HAS(iface, activate) ? iface->activate : NULL,
+	                                   a->token, a->out_state, a->err, a->err_cap);
+}
+
+enum target_component_activate_result
+target_tracking_plugin_activate(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap)
+{
+	struct tracking_activate_args a = {token, out_state, err, err_cap, TARGET_COMPONENT_ACTIVATE_NOT_LOADED};
+	if (out_state != NULL) {
+		xrt_component_license_state_init(out_state);
+	}
+	if (err != NULL && err_cap > 0) {
+		err[0] = '\0';
+	}
+	(void)tracking_with_negotiated(id, tracking_activate_cb, &a);
+	return a.result;
 }
 
 int

@@ -450,6 +450,19 @@ target_component_read_policy_dword(const struct target_component_class *cls, con
 #define TARGET_COMPONENT_SETTING_KEY_MAX 64
 //! Size of a setting value buffer, incl. the NUL.
 #define TARGET_COMPONENT_SETTING_VALUE_MAX 256
+/*!
+ * Size of a `secret` setting's value buffer, incl. the NUL (ADR-054 N5). A
+ * licence key does not fit 256 bytes once it is a signed token (an RS256
+ * JWT's signature alone is 342 characters), so a secret may be as long as an
+ * activation token (`XRT_COMPONENT_ACTIVATION_TOKEN_MAX`). Only
+ * @ref target_component_set_secret writes one this long, and only
+ * @ref target_component_get_setting (with a caller buffer this size) reads
+ * it whole: the per-user tier, the environment and the Windows machine tier
+ * carry it; an enumerated row (`target_component_entry::settings`, a POSIX
+ * manifest's `settings` object) keeps the 256-byte cap, and a manifest is
+ * no place for a secret anyway.
+ */
+#define TARGET_COMPONENT_SETTING_SECRET_VALUE_MAX 2048
 //! Size of a `DXR_<CLASS>_<ID>_<KEY>` buffer, incl. the NUL.
 #define TARGET_COMPONENT_SETTING_ENV_MAX 160
 
@@ -564,6 +577,20 @@ enum target_component_store_result
 target_component_set_setting(
     const struct target_component_class *cls, const char *id, const char *key, const char *value, bool machine);
 
+/*!
+ * @ref target_component_set_setting for a setting the component declares as
+ * `secret` (`XRT_COMPONENT_SETTING_TYPE_SECRET`): the same store and tiers,
+ * with the value cap raised to @ref TARGET_COMPONENT_SETTING_SECRET_VALUE_MAX.
+ * On POSIX the per-user file is kept at mode 0600 whatever it holds. The
+ * store does not know which keys are secret: every READER that shows values
+ * (the CLI, the Dashboard through it) redacts by declared type
+ * (@ref target_component_setting_is_secret), and nothing in the runtime logs
+ * a setting value.
+ */
+enum target_component_store_result
+target_component_set_secret(
+    const struct target_component_class *cls, const char *id, const char *key, const char *value, bool machine);
+
 //! Remove `<KEY>` from the per-user (default) or machine store of @p id. Absent is success.
 enum target_component_store_result
 target_component_unset_setting(const struct target_component_class *cls, const char *id, const char *key, bool machine);
@@ -621,6 +648,18 @@ target_component_manifest_settings_schema(const struct target_component_class *c
                                           struct target_component_setting_desc *out,
                                           int max);
 
+/*!
+ * Must the value of @p key never be shown? True when its declared @p type is
+ * `secret` (case-insensitive). With no declaration (@p type NULL or "": the
+ * component could not be loaded to declare, or the key is stored but not
+ * declared), true when the key NAME says credential: it is, or ends in `_` +,
+ * one of KEY, TOKEN, SECRET, PASSWORD, PASSPHRASE. Erring towards hiding an
+ * undeclared key costs a redacted cell; erring the other way prints a licence
+ * key. Pure.
+ */
+bool
+target_component_setting_is_secret(const char *type, const char *key);
+
 struct xrt_component_setting_desc;
 
 /*!
@@ -636,6 +675,51 @@ target_component_merge_setting_descs(struct target_component_setting_desc *out,
                                      int max,
                                      const struct xrt_component_setting_desc *in,
                                      uint32_t n);
+
+
+/*
+ *
+ * Licence state + activation (ADR-054 N5, ADR-064 §5): the shared half of
+ * the two vtable slots every class appends (`xrt/xrt_component_license.h`).
+ * The runtime carries the state and the token; it decides neither.
+ *
+ */
+
+struct xrt_component_license_state;
+
+//! Outcome of handing an activation token to a component. Stable names: @ref target_component_activate_result_str.
+enum target_component_activate_result
+{
+	TARGET_COMPONENT_ACTIVATE_OK = 0,      //!< accepted; the new state was returned
+	TARGET_COMPONENT_ACTIVATE_REFUSED,     //!< the component refused the token (its error line was returned)
+	TARGET_COMPONENT_ACTIVATE_UNSUPPORTED, //!< the component has no `activate` slot
+	TARGET_COMPONENT_ACTIVATE_BAD_TOKEN, //!< empty, or >= XRT_COMPONENT_ACTIVATION_TOKEN_MAX bytes: never delivered
+	TARGET_COMPONENT_ACTIVATE_NOT_LOADED, //!< not registered, or its binary did not load / negotiate
+};
+
+//! "ok" / "refused" / "unsupported" / "bad-token" / "not-loaded".
+const char *
+target_component_activate_result_str(enum target_component_activate_result r);
+
+/*!
+ * Call a class's `activate` slot @p fn (already `struct_size`-gated by the
+ * caller; NULL = UNSUPPORTED) with the shared rules: the token is bounded
+ * (BAD_TOKEN, nothing called), passed through untouched and never logged;
+ * @p out_state (may be NULL) is zero-filled with `struct_size` preset before
+ * the call and sanitised after it; @p err (may be NULL / 0) is cleared before
+ * and NUL-terminated after. Pure apart from the call, so tests pin it with a
+ * fake slot.
+ */
+enum target_component_activate_result
+target_component_activate_call(bool (*fn)(const char *token,
+                                          uint32_t token_size,
+                                          struct xrt_component_license_state *out_state,
+                                          char *out_error,
+                                          uint32_t error_size),
+                               const char *token,
+                               struct xrt_component_license_state *out_state,
+                               char *err,
+                               size_t err_cap);
 
 
 /*

@@ -165,6 +165,10 @@ struct conv_host_serve
 
 	struct os_thread ticker;
 	volatile bool stopping;
+
+	//! ADR-054 N5: the licence state last sent to the service (ticker thread only).
+	bool license_sent;
+	struct xrt_component_license_state license_last;
 };
 
 static struct
@@ -1240,6 +1244,43 @@ dispatch(struct conv_host_serve *s, const struct conv_host_wire_frame *f, const 
 		(void)send_msg(s, f->type | CONV_HOST_MSG_REPLY_BIT, rid, &rep, sizeof(rep));
 		return true;
 	}
+	case CONV_HOST_MSG_ACTIVATE: {
+		// ADR-054 N5: an activation token for the provider. Opaque here too:
+		// handed over, wiped, never logged.
+		struct conv_host_wire_activate *q = calloc(1, sizeof(*q));
+		struct conv_host_wire_activate_reply rep;
+		conv_host_wire_init(&rep, sizeof(rep));
+		rep.result = XRT_ERROR_IPC_FAILURE;
+		if (q != NULL && conv_host_wire_receive(q, sizeof(*q), pl, n) && q->token_bytes > 0 &&
+		    q->token_bytes < sizeof(q->token)) {
+			q->token[q->token_bytes] = '\0';
+			struct xrt_component_license_state st;
+			char err[sizeof(rep.error)] = {0};
+			const struct xrt_conversion_plugin_iface *iface =
+			    s->cfg->provider->entry != NULL ? s->cfg->provider->entry->iface : NULL;
+			if (iface != NULL && XRT_CONV_IFACE_HAS(iface, activate) && s->host->ops->activate != NULL) {
+				rep.accepted =
+				    s->host->ops->activate(s->host, q->token, &st, err, sizeof(err)) ? 1u : 0u;
+				rep.result = XRT_SUCCESS;
+			} else {
+				(void)xrt_conversion_plugin_iface_license_state(iface, &st);
+				rep.result = XRT_ERROR_FEATURE_NOT_SUPPORTED;
+			}
+			rep.state = st.state;
+			rep.source = st.source;
+			rep.activation = st.activation;
+			rep.expiry_unix_s = st.expiry_unix_s;
+			conv_host_wire_set_str(rep.message, sizeof(rep.message), st.message);
+			conv_host_wire_set_str(rep.purchase_url, sizeof(rep.purchase_url), st.purchase_url);
+			conv_host_wire_set_str(rep.error, sizeof(rep.error), err);
+		}
+		if (q != NULL) {
+			memset(q, 0, sizeof(*q));
+			free(q);
+		}
+		(void)send_msg(s, f->type | CONV_HOST_MSG_REPLY_BIT, rid, &rep, sizeof(rep));
+		return true;
+	}
 	case CONV_HOST_MSG_GET_STATE: {
 		struct conv_host_wire_cap_request q;
 		struct conv_host_wire_state_reply rep;
@@ -1671,6 +1712,47 @@ send_state_changed(struct conv_host_serve *s, uint32_t cap_id)
 	(void)send_msg(s, CONV_HOST_MSG_STATE_CHANGED, 0, &sc, sizeof(sc));
 }
 
+/*!
+ * ADR-054 N5: publish the provider's licence state — once at start, then on
+ * every change. A change of the state itself also asks the service to
+ * re-describe (STATE_CHANGED with cap 0), because every capability's
+ * readiness just flipped to or from UNLICENSED: that is the live re-selection,
+ * through the channel's existing message, whether or not the provider thought
+ * to call notify_changed.
+ */
+static void
+publish_license(struct conv_host_serve *s)
+{
+	const struct xrt_conversion_plugin_iface *iface =
+	    s->cfg->provider->entry != NULL ? s->cfg->provider->entry->iface : NULL;
+	struct xrt_component_license_state lic;
+	(void)xrt_conversion_plugin_iface_license_state(iface, &lic);
+	if (!s->license_sent && lic.state == XRT_COMPONENT_LICENSE_NOT_APPLICABLE) {
+		// Nothing to report (every provider without the slot): send nothing,
+		// so the channel carries exactly what it did before the slot existed.
+		s->license_sent = true;
+		s->license_last = lic;
+		return;
+	}
+	if (s->license_sent && memcmp(&lic, &s->license_last, sizeof(lic)) == 0) {
+		return;
+	}
+	const bool state_moved = s->license_sent && xrt_component_license_blocks(lic.state) !=
+	                                                xrt_component_license_blocks(s->license_last.state);
+	struct conv_host_wire_license w;
+	conv_host_wire_init(&w, sizeof(w));
+	conv_host_wire_pack_license(&lic, &w);
+	if (!send_msg(s, CONV_HOST_MSG_LICENSE_STATE, 0, &w, sizeof(w))) {
+		return; // retried at the next tick
+	}
+	s->license_sent = true;
+	s->license_last = lic;
+	if (state_moved) {
+		U_LOG_W("conversion host: licence state is now %s", xrt_component_license_state_str(lic.state));
+		send_state_changed(s, 0);
+	}
+}
+
 static void *
 ticker_thread(void *ptr)
 {
@@ -1678,6 +1760,8 @@ ticker_thread(void *ptr)
 	uint64_t next_hb = 0;
 	while (!s->stopping) {
 		const uint64_t now = os_monotonic_get_ns();
+
+		publish_license(s);
 
 		uint32_t dropped = 0;
 		(void)conv_host_log_drain(forward_log, s, &dropped);

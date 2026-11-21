@@ -33,6 +33,7 @@
 #include "xrt/xrt_input_plugin.h"
 
 #include "target_input_pref.h"
+#include "target_component_loader.h" // enum target_component_activate_result
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -117,6 +118,25 @@ struct target_component_setting_desc;
  */
 int
 target_input_plugin_describe_settings(const char *id, struct target_component_setting_desc *out, int max);
+
+/*!
+ * The licence state of the registered provider @p id (ADR-054 N5): negotiate
+ * only (no probe), ask its `get_license_state` slot, unload. @p out is always
+ * a valid struct (`not_applicable` when the provider reports none). False
+ * when @p id is not registered or its binary did not load / negotiate. A
+ * lister's call, like @ref target_input_plugin_describe_settings.
+ */
+bool
+target_input_plugin_license_state(const char *id, struct xrt_component_license_state *out);
+
+/*!
+ * Hand @p token to the registered provider @p id's `activate` slot (negotiate
+ * only): the new state in @p out_state (may be NULL) or its error line in
+ * @p err. The token is opaque and never logged.
+ */
+enum target_component_activate_result
+target_input_plugin_activate(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap);
 
 /*!
  * How many providers loaded, ABI-passed and probed successfully.

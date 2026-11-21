@@ -123,6 +123,15 @@ struct u_vpp_producer_status
 	char provider_id[U_VPP_ID_MAX];
 	char source[U_VPP_TEXT_MAX];
 	char camera_key[U_VPP_TEXT_MAX];
+	/*!
+	 * The provider's licence state as the host reads it (ADR-054 N5,
+	 * `xrt/xrt_component_license.h` values; 0 = not_applicable). In bytes of
+	 * the producer block that were unused and zero before, so the page
+	 * version is unchanged: an older host leaves them 0.
+	 */
+	uint32_t license_state;
+	uint32_t license_source;       //!< XRT_COMPONENT_LICENSE_SOURCE_* (0 = not stated)
+	int64_t license_expiry_unix_s; //!< seconds since the Unix epoch UTC; 0 = none
 };
 
 //! The geometry block, as copied out by @ref u_vpp_read_geometry.

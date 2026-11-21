@@ -784,6 +784,86 @@ add_hex_id(cJSON *o, const char *key, uint64_t id)
 	cJSON_AddStringToObject(o, key, buf);
 }
 
+void
+u_status_unix_time_str(int64_t unix_s, bool with_time, char *buf, size_t cap)
+{
+	if (buf == NULL || cap == 0) {
+		return;
+	}
+	buf[0] = '\0';
+	// Days from civil, inverted (H. Hinnant's algorithm): no gmtime, so no
+	// CRT difference between MSVC, MinGW and POSIX.
+	int64_t days = unix_s / 86400;
+	int64_t rem = unix_s % 86400;
+	if (rem < 0) {
+		rem += 86400;
+		days -= 1;
+	}
+	const int64_t z = days + 719468;
+	const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+	const int64_t doe = z - era * 146097;
+	const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+	const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	const int64_t mp = (5 * doy + 2) / 153;
+	const int64_t d = doy - (153 * mp + 2) / 5 + 1;
+	const int64_t m = mp < 10 ? mp + 3 : mp - 9;
+	const int64_t y = yoe + era * 400 + (m <= 2 ? 1 : 0);
+	if (y < 1 || y > 9999) {
+		return;
+	}
+	if (with_time) {
+		(void)snprintf(buf, cap, "%04d-%02d-%02dT%02d:%02d:%02dZ", (int)y, (int)m, (int)d, (int)(rem / 3600),
+		               (int)((rem % 3600) / 60), (int)(rem % 60));
+	} else {
+		(void)snprintf(buf, cap, "%04d-%02d-%02d", (int)y, (int)m, (int)d);
+	}
+}
+
+//! `state`, `source`, `expires_unix`: the three keys every `licence` object starts with.
+static void
+licence_core(cJSON *lo, uint32_t state, uint32_t source, int64_t expiry_unix_s)
+{
+	cJSON_AddStringToObject(lo, "state", xrt_component_license_state_str(state));
+	const char *src = xrt_component_license_source_str(source);
+	if (src[0] != '\0') {
+		cJSON_AddStringToObject(lo, "source", src);
+	} else {
+		cJSON_AddNullToObject(lo, "source");
+	}
+	if (expiry_unix_s != 0) {
+		cJSON_AddNumberToObject(lo, "expires_unix", (double)expiry_unix_s);
+	} else {
+		cJSON_AddNullToObject(lo, "expires_unix");
+	}
+}
+
+//! The compact `licence` object of a snapshot row (ADR-054 N5): state, source, expiry.
+static void
+add_licence(cJSON *o, const struct xrt_status_licence *l)
+{
+	licence_core(cJSON_AddObjectToObject(o, "licence"), l->state, l->source, l->expiry_unix_s);
+}
+
+void
+u_status_license_add_cjson(cJSON *row, const struct xrt_component_license_state *lic)
+{
+	cJSON *o = cJSON_AddObjectToObject(row, "licence");
+	licence_core(o, lic->state, lic->source, lic->expiry_unix_s);
+	char iso[32];
+	u_status_unix_time_str(lic->expiry_unix_s, true, iso, sizeof(iso));
+	if (lic->expiry_unix_s != 0 && iso[0] != '\0') {
+		cJSON_AddStringToObject(o, "expires", iso);
+	} else {
+		cJSON_AddNullToObject(o, "expires");
+	}
+	cJSON_AddStringToObject(o, "message", lic->message);
+	cJSON_AddStringToObject(o, "purchase_url", lic->purchase_url);
+	cJSON *act = cJSON_AddObjectToObject(o, "activation");
+	cJSON_AddBoolToObject(act, "key", (lic->activation & XRT_COMPONENT_LICENSE_ACTIVATION_KEY) != 0);
+	cJSON_AddBoolToObject(act, "deep_link", (lic->activation & XRT_COMPONENT_LICENSE_ACTIVATION_DEEP_LINK) != 0);
+	cJSON_AddBoolToObject(o, "blocks", xrt_component_license_blocks(lic->state));
+}
+
 static void
 add_str_or_null(cJSON *o, const char *key, const char *s)
 {
@@ -946,6 +1026,7 @@ screen_to_cjson(const struct xrt_status_screen *s)
 			cJSON_AddNullToObject(vh, "state");
 		}
 		cJSON_AddNumberToObject(vh, "restarts", (double)s->eye_tracking.viewer_host_restarts);
+		add_licence(vh, &s->eye_tracking.viewer_licence); // ADR-054 N5: the serving provider's
 	} else {
 		cJSON_AddNullToObject(et, "viewer_host");
 	}
@@ -1097,6 +1178,7 @@ u_status_conv_provider_to_cjson(const struct xrt_status_conv_provider *p)
 	cJSON_AddNumberToObject(o, "cap_count", (double)p->cap_count);
 	cJSON_AddNumberToObject(o, "bad_descriptors", (double)p->bad_descriptors);
 	add_str_or_null(o, "descriptor_error", p->descriptor_error);
+	add_licence(o, &p->licence);
 	return o;
 }
 
@@ -1269,6 +1351,7 @@ u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 		cJSON_AddStringToObject(o, "hint", p->hint);
 		cJSON_AddBoolToObject(o, "fallback", p->fallback);
 		cJSON_AddNumberToObject(o, "probe_order", (double)p->probe_order);
+		add_licence(o, &p->licence);
 		cJSON_AddItemToArray(pl, o);
 	}
 

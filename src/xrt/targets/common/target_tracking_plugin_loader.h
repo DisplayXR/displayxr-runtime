@@ -25,6 +25,7 @@
 #pragma once
 
 #include "xrt/xrt_tracking_plugin.h"
+#include "target_component_loader.h" // enum target_component_activate_result
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -64,6 +65,28 @@ target_tracking_plugin_enumerate(struct target_tracking_plugin_desc *out, int ma
 //! Declared settings of @p id: manifest `settings_schema` + the binary's `describe_settings` (negotiate only).
 int
 target_tracking_plugin_describe_settings(const char *id, struct target_component_setting_desc *out, int max);
+
+/*!
+ * The licence state of the registered provider @p id (ADR-054 N5): negotiate
+ * only (no probe), ask its `get_license_state` slot, unload. @p out is always
+ * a valid struct (`not_applicable` when the provider reports none). False
+ * when @p id is not registered or its binary did not load / negotiate.
+ */
+bool
+target_tracking_plugin_license_state(const char *id, struct xrt_component_license_state *out);
+
+//! Hand @p token to the registered provider @p id's `activate` slot (negotiate only). The token is never logged.
+enum target_component_activate_result
+target_tracking_plugin_activate(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap);
+
+/*!
+ * The licence state of the RESIDENT provider at @p index of this process's
+ * scan (asked live, from memory): what the satellite host publishes on the
+ * pose page. `not_applicable` for an index out of range.
+ */
+uint32_t
+target_tracking_plugin_get_license_state(int index, struct xrt_component_license_state *out);
 
 /*!
  * `PreferredPlugin`: Windows HKCU (unless `Policy\Lock`) then HKLM

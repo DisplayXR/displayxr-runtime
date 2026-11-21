@@ -57,6 +57,7 @@
 #define PX_ALIGN 4096ull
 
 #define PX_REQUEST_TIMEOUT_MS 5000u    //!< ordinary control requests
+#define PX_ACTIVATE_TIMEOUT_MS 30000u  //!< ACTIVATE: the provider may ask its licence server (ADR-054 N5)
 #define PX_SLICE_MS 50u                //!< worker / supervisor wait slice
 #define PX_FENCE_TIMEOUT_MS 2000u      //!< CPU fence observe per result
 #define PX_SPAWN_EXIT_GRACE_MS 1000u   //!< a host that never connected: did it die on its own?
@@ -288,6 +289,7 @@ struct proxy
 	uint64_t hello_luid;   //!< the adapter the host says it opened
 	bool status_known;
 	struct xrt_conv_provider_status provider_status;
+	struct xrt_component_license_state license; //!< the host's last LICENSE_STATE (zero = not_applicable)
 	uint32_t raised_terminal; //!< supervisor FAILED already reported (by its failed_at_ns)
 	uint64_t raised_terminal_at;
 	uint64_t next_maintenance_ns;
@@ -797,6 +799,25 @@ handle_frame(struct proxy *p,
 				}
 			}
 			os_mutex_unlock(&p->m);
+		}
+		break;
+	}
+	case CONV_HOST_MSG_LICENSE_STATE: {
+		// ADR-054 N5: what the provider says about its licence, for showing.
+		// Selection needs nothing from it: the host already reports the
+		// capabilities UNLICENSED through get_state.
+		struct conv_host_wire_license lw;
+		if (conv_host_wire_receive(&lw, sizeof(lw), payload, bytes)) {
+			struct xrt_component_license_state lic;
+			conv_host_wire_unpack_license(&lw, &lic);
+			os_mutex_lock(&p->m);
+			const bool changed = p->license.state != lic.state;
+			p->license = lic;
+			os_mutex_unlock(&p->m);
+			if (changed) {
+				U_LOG_W("[conv:%s] licence: %s", p->provider_id,
+				        xrt_component_license_state_str(lic.state));
+			}
 		}
 		break;
 	}
@@ -2819,6 +2840,74 @@ px_destroy(struct conv_host **h_ptr)
 	free(p);
 }
 
+static uint32_t
+px_get_license_state(struct conv_host *h, struct xrt_component_license_state *out)
+{
+	struct proxy *p = px(h);
+	os_mutex_lock(&p->m);
+	*out = p->license;
+	os_mutex_unlock(&p->m);
+	out->struct_size = (uint32_t)sizeof(*out);
+	return out->state; // what the host process last reported; not_applicable before its first message
+}
+
+static bool
+px_activate(
+    struct conv_host *h, const char *token, struct xrt_component_license_state *out_state, char *err, uint32_t err_cap)
+{
+	struct proxy *p = px(h);
+	struct xrt_component_license_state local;
+	struct xrt_component_license_state *st = out_state != NULL ? out_state : &local;
+	xrt_component_license_state_init(st);
+	if (err != NULL && err_cap > 0) {
+		err[0] = '\0';
+	}
+	const size_t n = token != NULL ? strlen(token) : 0;
+	if (n == 0 || n >= XRT_COMPONENT_ACTIVATION_TOKEN_MAX) {
+		if (err != NULL && err_cap > 0) {
+			(void)snprintf(err, err_cap, "the token is empty or too long");
+		}
+		return false;
+	}
+	// Heap, not stack: the request is 2 KB and this runs on a caller's thread.
+	struct conv_host_wire_activate *q = calloc(1, sizeof(*q));
+	if (q == NULL) {
+		return false;
+	}
+	conv_host_wire_init(q, sizeof(*q));
+	q->token_bytes = (uint32_t)n;
+	memcpy(q->token, token, n);
+	struct conv_host_wire_activate_reply rep;
+	const xrt_result_t r = px_request(p, CONV_HOST_MSG_ACTIVATE, q, sizeof(*q), NULL, 0, &rep, sizeof(rep),
+	                                  PX_ACTIVATE_TIMEOUT_MS, NULL, NULL, NULL, 0, NULL);
+	memset(q, 0, sizeof(*q)); // the token does not linger in freed memory
+	free(q);
+	if (r != XRT_SUCCESS) {
+		if (err != NULL && err_cap > 0) {
+			(void)snprintf(err, err_cap, "%s",
+			               r == XRT_ERROR_FEATURE_NOT_SUPPORTED
+			                   ? "the provider has no activation slot"
+			                   : "the conversion host is not running or did not answer");
+		}
+		return false;
+	}
+	st->state = rep.state;
+	st->source = rep.source;
+	st->activation = rep.activation;
+	st->expiry_unix_s = rep.expiry_unix_s;
+	conv_host_wire_set_str(st->message, sizeof(st->message), rep.message);
+	conv_host_wire_set_str(st->purchase_url, sizeof(st->purchase_url), rep.purchase_url);
+	xrt_component_license_state_sanitize(st);
+	os_mutex_lock(&p->m);
+	p->license = *st;
+	os_mutex_unlock(&p->m);
+	if (rep.accepted == 0 && err != NULL && err_cap > 0) {
+		rep.error[sizeof(rep.error) - 1] = '\0';
+		(void)snprintf(err, err_cap, "%s", rep.error);
+	}
+	return rep.accepted != 0;
+}
+
 static const struct conv_host_ops k_proxy_ops = {
     .describe_cap = px_describe_cap,
     .get_generation = px_get_generation,
@@ -2836,6 +2925,8 @@ static const struct conv_host_ops k_proxy_ops = {
     .get_epoch = px_get_epoch,
     .is_down = px_is_down,
     .destroy = px_destroy,
+    .get_license_state = px_get_license_state,
+    .activate = px_activate,
 };
 
 

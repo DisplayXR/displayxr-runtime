@@ -113,6 +113,10 @@ struct conv_provider
 	//! reject, the registry on a PLATFORM_ABSENT / INCOMPATIBLE status.
 	bool usable;
 	uint32_t platform_state; //!< xrt_conv_provider_status::state
+	//! ADR-054 N5: the provider's licence state at the last live describe
+	//! (`not_applicable` = nothing to report). For showing: the consequence
+	//! is already in its rows (get_state reads UNLICENSED while it blocks).
+	struct xrt_component_license_state license;
 	//! #2279: the satellite host failed terminally (CONV_HOST_EV_FAILED /
 	//! CRASH_LOOP): its XRT_CONV_FAIL_* reason, 0 = not failed. Set and cleared
 	//! by the core (a configuration change or the host's return clears it).
