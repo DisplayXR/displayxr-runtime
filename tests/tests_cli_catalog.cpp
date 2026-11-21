@@ -120,6 +120,12 @@ struct Host
 	bool have_engine = true;
 	enum cli_catalog_run_status elevated_status = CLI_CATALOG_RUN_OK;
 	int elevated_runs = 0;
+	bool elevated_admin = true; //!< the elevated engine answers as an elevated process
+	bool engine_signed = true;
+	bool self_signed = false; //!< a development CLI
+	std::string engine_cn = "DisplayXR Test";
+	int signer_asks = 0;
+	std::vector<std::string> log_paths;
 	std::vector<std::string> licence_asks;
 
 	static enum cli_catalog_run_status
@@ -133,7 +139,7 @@ struct Host
 		// The consent prompt, granted: the same engine, now answering as an
 		// elevated process, and with nothing to read back but its exit code.
 		REQUIRE_FALSE(r->capture_stdout);
-		set_env("FAKE_DXR_GET_ADMIN", "1");
+		set_env("FAKE_DXR_GET_ADMIN", h->elevated_admin ? "1" : nullptr);
 		const enum cli_catalog_run_status st = cli_catalog_os_run(nullptr, r);
 		set_env("FAKE_DXR_GET_ADMIN", h->admin ? "1" : nullptr);
 		return st;
@@ -143,6 +149,27 @@ struct Host
 	is_interactive(void *ud)
 	{
 		return static_cast<Host *>(ud)->interactive;
+	}
+
+	static bool
+	signer(void *ud, const char *path, char *out, size_t cap)
+	{
+		Host *h = static_cast<Host *>(ud);
+		h->signer_asks++;
+		const bool is_signed = path != nullptr ? h->engine_signed : h->self_signed;
+		(void)snprintf(out, cap, "%s",
+		               !is_signed ? "" : (path != nullptr ? h->engine_cn.c_str() : "DisplayXR Test"));
+		return is_signed;
+	}
+
+	static bool
+	log_create(void *ud, char *path, size_t cap)
+	{
+		if (!cli_catalog_os_log_create(nullptr, path, cap)) {
+			return false;
+		}
+		static_cast<Host *>(ud)->log_paths.push_back(path);
+		return true;
 	}
 
 	static cJSON *
@@ -188,6 +215,9 @@ struct Host
 		ops.run = cli_catalog_os_run;
 		ops.run_elevated = run_elevated;
 		ops.is_interactive = is_interactive;
+		ops.signer = signer;
+		ops.log_create = log_create;
+		ops.log_take = cli_catalog_os_log_take;
 		ops.licence = licence;
 		ops.out = out;
 		ops.err = err;
@@ -220,7 +250,7 @@ has(const std::string &hay, const char *needle)
 
 TEST_CASE("catalog: every exit code has its own one-line message", "[cli][catalog]")
 {
-	const int codes[] = {0, 2, 10, 11, 20, 21, 30, 40, 41, 42, 43, 50, 60, 61, 62, 63};
+	const int codes[] = {0, 2, 10, 11, 20, 21, 30, 40, 41, 42, 43, 50, 60, 61, 62, 63, 64, 65};
 	const std::string unknown = cli_catalog_exit_message(77);
 	for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
 		const std::string a = cli_catalog_exit_message(codes[i]);
@@ -271,6 +301,9 @@ TEST_CASE("catalog: the command line is checked before anything runs", "[cli][ca
 	CHECK_FALSE(parse({"uninstall", "a", "--allow-runtime"}));
 	CHECK_FALSE(parse({"install", "a", "--timeout", "soon"}));
 	CHECK_FALSE(parse({"install", "a", "--frobnicate"}));
+	CHECK(parse({"install", "a", "--elevate", "--allow-unsigned-engine"}));
+	CHECK(req.allow_unsigned_engine);
+	CHECK_FALSE(parse({"list", "--allow-unsigned-engine"}));
 
 	// The defaults: minutes for a listing, hours for what runs installers.
 	REQUIRE(parse({"list"}));
@@ -436,6 +469,7 @@ TEST_CASE("catalog install: elevation is asked for only when it is all that is m
 		Result r = h.run({"install", "open-conv", "--json"});
 		CHECK(r.exit == 50);
 		CHECK(h.elevated_runs == 0);
+		CHECK(h.signer_asks == 0); // nothing is verified unless something is about to be elevated
 		CHECK(r.engine == std::vector<std::string>{"install|open-conv|--no-runtime|--json"});
 		CHECK(r.num({"items", "0", "exit"}) == 50);
 		CHECK(has(r.str({"items", "0", "message"}), "--elevate"));
@@ -450,7 +484,7 @@ TEST_CASE("catalog install: elevation is asked for only when it is all that is m
 		CHECK(h.elevated_runs == 0);
 		CHECK(has(r.err, "needs an elevated process"));
 	}
-	SECTION("--json --elevate: one elevated run of the same command, without --json")
+	SECTION("--json --elevate: one elevated run of the same command, without --json, with a log")
 	{
 		Host h;
 		Result r = h.run({"install", "open-conv", "--json", "--elevate"});
@@ -458,26 +492,31 @@ TEST_CASE("catalog install: elevation is asked for only when it is all that is m
 		CHECK(h.elevated_runs == 1);
 		// The last line is this CLI reading the receipts, to say what to expect.
 		CHECK(r.engine == std::vector<std::string>{"install|open-conv|--no-runtime|--json",
-		                                           "install|open-conv|--no-runtime",
+		                                           "install|open-conv|--no-runtime|--log|<log>",
 		                                           "list|--installed|--json"});
 		CHECK(cJSON_GetArraySize(r.at({"calls"})) == 2);
 		CHECK(r.num({"calls", "0", "exit"}) == 50);
 		CHECK(cJSON_IsTrue(r.at({"calls", "1", "elevated"})));
 		CHECK(cJSON_IsNull(r.at({"calls", "1", "output"})));
+		// The elevated engine's own words, relayed from its log file, which is gone afterwards.
+		CHECK(has(r.str({"calls", "1", "log"}), "open-conv: installed"));
+		REQUIRE(h.log_paths.size() == 1);
+		CHECK_FALSE(std::filesystem::exists(h.log_paths[0]));
 		CHECK(r.num({"items", "0", "exit"}) == 0);
 		CHECK(cJSON_IsTrue(r.at({"items", "0", "elevated"})));
 		CHECK(r.str({"items", "0", "changed", "0"}) == "open-conv");
 		CHECK(r.str({"items", "0", "expect", "0", "class"}) == "conversion_provider");
 		CHECK(has(r.str({"items", "0", "expect", "0", "note"}), "displayxr-cli conv list"));
 	}
-	SECTION("at a terminal: asks, and says so")
+	SECTION("at a terminal: asks, says so, and relays what the engine said")
 	{
 		Host h;
 		h.interactive = true;
 		Result r = h.run({"install", "leia-sr"});
 		CHECK(r.exit == 0);
 		CHECK(h.elevated_runs == 1);
-		CHECK(has(r.err, "asking for elevation"));
+		CHECK(has(r.err, "Asking for elevation"));
+		CHECK(has(r.err, "dxr-get: leia-sr: installed"));
 		CHECK(has(r.out, "leia-sr: installed"));
 		CHECK(has(r.out, "next session")); // a running app keeps its display processor
 	}
@@ -498,6 +537,8 @@ TEST_CASE("catalog install: elevation is asked for only when it is all that is m
 		CHECK(h.elevated_runs == 1);
 		CHECK(has(r.str({"items", "0", "message"}), "declined"));
 		CHECK(cJSON_GetArraySize(r.at({"items", "0", "changed"})) == 0);
+		REQUIRE(h.log_paths.size() == 1);
+		CHECK_FALSE(std::filesystem::exists(h.log_paths[0])); // removed even when nothing wrote to it
 	}
 	SECTION("already elevated: one call does the work")
 	{
@@ -506,6 +547,7 @@ TEST_CASE("catalog install: elevation is asked for only when it is all that is m
 		Result r = h.run({"install", "open-conv", "--json"});
 		CHECK(r.exit == 0);
 		CHECK(h.elevated_runs == 0);
+		CHECK(h.signer_asks == 0);
 		CHECK(cJSON_GetArraySize(r.at({"calls"})) == 1);
 		CHECK(cJSON_IsFalse(r.at({"items", "0", "elevated"})));
 		CHECK(r.str({"items", "0", "changed", "0"}) == "open-conv");
@@ -528,16 +570,170 @@ TEST_CASE("catalog install: elevation is asked for only when it is all that is m
 	}
 }
 
-TEST_CASE("catalog install: the runtime is left alone unless named or allowed", "[cli][catalog]")
+TEST_CASE("catalog: several items are one engine call, and one consent prompt", "[cli][catalog]")
+{
+	SECTION("install: one call with this process's rights, one elevated call for what needs it")
+	{
+		Host h;
+		Result r =
+		    h.run({"install", "open-conv", "browser", "incompat", "nofetch", "leia-sr", "--json", "--elevate"});
+		CHECK(h.elevated_runs == 1);
+		REQUIRE(r.engine.size() == 3);
+		CHECK(r.engine[0] == "install|open-conv|browser|incompat|nofetch|leia-sr|--no-runtime|--json");
+		// Only the two that elevation helps: not the current one, not the refused ones.
+		CHECK(r.engine[1] == "install|open-conv|leia-sr|--no-runtime|--log|<log>");
+		CHECK(r.engine[2] == "list|--installed|--json");
+		CHECK(r.exit == 41); // the first failure, in the order given
+		REQUIRE(cJSON_GetArraySize(r.at({"items"})) == 5);
+		CHECK(r.num({"items", "0", "exit"}) == 0);
+		CHECK(cJSON_IsTrue(r.at({"items", "0", "elevated"})));
+		CHECK(r.num({"items", "1", "exit"}) == 0);
+		CHECK(cJSON_IsFalse(r.at({"items", "1", "elevated"})));
+		CHECK(has(r.str({"items", "1", "message"}), "nothing to do"));
+		CHECK(r.num({"items", "2", "exit"}) == 41);
+		CHECK(r.num({"items", "3", "exit"}) == 40);
+		CHECK(r.num({"items", "4", "exit"}) == 0);
+		CHECK(r.str({"items", "4", "expect", "0", "class"}) == "display_processor");
+		// The engine's several-item document, embedded as it printed it.
+		CHECK(r.num({"calls", "0", "output", "exit"}) == 50);
+		CHECK(r.str({"calls", "0", "output", "items", "2", "result"}) == "incompatible");
+		CHECK(r.str({"calls", "0", "output", "items", "0", "plan", "actions", "0", "action"}) == "install");
+	}
+	SECTION("each item's own exit code comes back from the elevated run's log")
+	{
+		Host h;
+		h.interactive = true;
+		// Elevated, the first is removed and the second still cannot be.
+		Result r = h.run({"uninstall", "leia-sr", "browser", "open-conv", "ghost"});
+		CHECK(h.elevated_runs == 1);
+		CHECK(r.engine == std::vector<std::string>{"list|--installed|--json",
+		                                           "uninstall|leia-sr|browser|open-conv|ghost|--json",
+		                                           "uninstall|leia-sr|open-conv|--log|<log>"});
+		CHECK(r.exit == 43);
+		CHECK(has(r.out, "leia-sr: uninstalled"));
+		CHECK(has(r.out, "open-conv: uninstalled"));
+		CHECK(has(r.err, "one consent prompt for 2 items"));
+		CHECK(has(r.err, "browser"));
+		CHECK(has(r.err, "ghost"));
+		CHECK_FALSE(has(r.err, "result: ")); // the machine-readable lines are not shown to a person
+	}
+	SECTION("a failure inside the elevated run belongs to its item")
+	{
+		Host h;
+		h.elevated_admin = false; // the elevated engine still answers 50: nothing was installed
+		Result r = h.run({"install", "open-conv", "leia-sr", "--json", "--elevate"});
+		CHECK(r.exit == 50);
+		CHECK(r.num({"items", "0", "exit"}) == 50);
+		CHECK(r.num({"items", "1", "exit"}) == 50);
+		CHECK(cJSON_GetArraySize(r.at({"items", "0", "expect"})) == 0);
+	}
+	SECTION("without a prompt allowed, every item that needs one says so")
+	{
+		Host h;
+		Result r = h.run({"install", "open-conv", "leia-sr", "--json"});
+		CHECK(r.exit == 50);
+		CHECK(h.elevated_runs == 0);
+		CHECK(r.engine.size() == 1);
+		CHECK(has(r.str({"items", "1", "message"}), "--elevate"));
+	}
+	SECTION("the result line of an engine log")
+	{
+		char id[64];
+		int code = -1;
+		CHECK(cli_catalog_parse_result_line("result: leia-sr: 0 installed", id, sizeof(id), &code) == 1);
+		CHECK(std::string(id) == "leia-sr");
+		CHECK(code == 0);
+		CHECK(cli_catalog_parse_result_line("result: vendor: hands: 41 incompatible", id, sizeof(id), &code) ==
+		      1);
+		CHECK(std::string(id) == "vendor: hands");
+		CHECK(code == 41);
+		CHECK(cli_catalog_parse_result_line("leia-sr: installed", id, sizeof(id), &code) == 0);
+		CHECK(cli_catalog_parse_result_line("result: no code here", id, sizeof(id), &code) == 0);
+		char tiny[4];
+		CHECK(cli_catalog_parse_result_line("result: leia-sr: 0 installed", tiny, sizeof(tiny), &code) == 0);
+	}
+}
+
+TEST_CASE("catalog: an engine that is not validly signed is never started elevated", "[cli][catalog]")
+{
+	SECTION("unsigned engine: refused, unless explicitly allowed")
+	{
+		Host h;
+		h.engine_signed = false;
+		Result r = h.run({"install", "open-conv", "--json", "--elevate"});
+		CHECK(r.exit == 65);
+		CHECK(h.elevated_runs == 0);
+		CHECK(has(r.str({"items", "0", "message"}), "no valid Authenticode signature"));
+		CHECK(has(r.str({"items", "0", "message"}), "--allow-unsigned-engine"));
+		// It was still run with this process's own rights: that needs no signature.
+		CHECK(r.engine == std::vector<std::string>{"install|open-conv|--no-runtime|--json"});
+
+		// --elevate does not imply it.
+		Result ok = h.run({"install", "open-conv", "--json", "--elevate", "--allow-unsigned-engine"});
+		CHECK(ok.exit == 0);
+		CHECK(h.elevated_runs == 1);
+	}
+	SECTION("unsigned engine: listing and non-elevated runs stay allowed")
+	{
+		Host h;
+		h.engine_signed = false;
+		CHECK(h.run({"list", "--json"}).exit == 0);
+		h.admin = true; // an elevated terminal runs it directly; nothing is relaunched
+		CHECK(h.run({"install", "open-conv", "--json"}).exit == 0);
+		CHECK(h.signer_asks == 0);
+	}
+	SECTION("signed by someone else than this CLI")
+	{
+		Host h;
+		h.self_signed = true;
+		h.engine_cn = "Somebody Else";
+		Result r = h.run({"uninstall", "leia-sr", "--json", "--elevate"});
+		CHECK(r.exit == 65);
+		CHECK(h.elevated_runs == 0);
+		CHECK(has(r.str({"items", "0", "message"}), "Somebody Else"));
+	}
+	SECTION("the rule")
+	{
+		char why[200];
+		CHECK(cli_catalog_engine_trusted(true, "Leia, Inc.", true, "Leia, Inc.", why, sizeof(why)));
+		// A development CLI is unsigned: a validly signed engine has nothing to be compared with.
+		CHECK(cli_catalog_engine_trusted(true, "Leia, Inc.", false, "", why, sizeof(why)));
+		CHECK_FALSE(cli_catalog_engine_trusted(false, "", false, "", why, sizeof(why)));
+		CHECK_FALSE(cli_catalog_engine_trusted(false, "", true, "Leia, Inc.", why, sizeof(why)));
+		CHECK_FALSE(cli_catalog_engine_trusted(true, "Other", true, "Leia, Inc.", why, sizeof(why)));
+		CHECK(has(why, "Other"));
+	}
+}
+
+TEST_CASE("catalog: the runtime itself is never installed or replaced from the CLI", "[cli][catalog]")
 {
 	Host h;
 	h.admin = true;
+	// --no-runtime on every install, whatever is asked.
 	CHECK(h.run({"install", "open-conv"}).engine[0] == "install|open-conv|--no-runtime|--json");
-	CHECK(h.run({"install", "open-conv", "--allow-runtime"}).engine[0] == "install|open-conv|--json");
-	CHECK(h.run({"install", "runtime"}).engine[0] == "install|runtime|--json");
 	CHECK(h.run({"install", "--default"}).engine[0] == "install|--default|--no-runtime|--json");
-	CHECK(h.run({"install", "--default", "--allow-runtime", "--catalog", "x"}).engine[0] ==
-	      "--catalog|x|install|--default|--json");
+	CHECK(h.run({"install", "--default", "--catalog", "x"}).engine[0] ==
+	      "--catalog|x|install|--default|--no-runtime|--json");
+
+	// Naming the runtime: refused before any engine call, and the rest still happens.
+	Result named = h.run({"install", "runtime", "open-conv", "--json"});
+	CHECK(named.exit == 64);
+	CHECK(named.engine[0] == "install|open-conv|--no-runtime|--json");
+	CHECK(named.str({"items", "0", "id"}) == "runtime");
+	CHECK(named.num({"items", "0", "exit"}) == 64);
+	CHECK(has(named.str({"items", "0", "message"}), "runtime installer or the bundle"));
+	CHECK(named.num({"items", "1", "exit"}) == 0);
+
+	Result upd = h.run({"update", "runtime"});
+	CHECK(upd.exit == 64);
+	CHECK(upd.engine == std::vector<std::string>{"outdated|--json"});
+	CHECK(has(upd.err, "runtime installer or the bundle"));
+
+	// --allow-runtime is reserved: nothing runs.
+	Result allow = h.run({"install", "open-conv", "--allow-runtime", "--json"});
+	CHECK(allow.exit == 64);
+	CHECK(allow.engine.empty());
+	CHECK(has(allow.str({"message"}), "not available yet"));
 
 	// The default set reports each plug-in it changed.
 	Result d = h.run({"install", "--default", "--json"});
@@ -546,10 +742,11 @@ TEST_CASE("catalog install: the runtime is left alone unless named or allowed", 
 	CHECK(cJSON_GetArraySize(d.at({"items", "0", "changed"})) == 2);
 	CHECK(d.str({"items", "0", "expect", "1", "class"}) == "display_processor");
 
-	// A refusal because of the runtime says which switch lifts it.
+	// A refusal because of the runtime says what to do.
 	Result inc = h.run({"install", "incompat"});
 	CHECK(inc.exit == 41);
-	CHECK(has(inc.err, "--allow-runtime"));
+	CHECK(has(inc.err, "needs runtime 3.0.0"));
+	CHECK(has(inc.err, "update the runtime first"));
 }
 
 TEST_CASE("catalog: the engine's exit code is the CLI's", "[cli][catalog]")
@@ -572,6 +769,7 @@ TEST_CASE("catalog: the engine's exit code is the CLI's", "[cli][catalog]")
 	// Several items: each is tried, the first failure is the exit code.
 	Result many = h.run({"install", "open-conv", "verify", "dlfail", "browser", "--json"});
 	CHECK(many.exit == 21);
+	CHECK(many.engine[0] == "install|open-conv|verify|dlfail|browser|--no-runtime|--json");
 	CHECK(cJSON_GetArraySize(many.at({"items"})) == 4);
 	CHECK(many.num({"items", "0", "exit"}) == 0);
 	CHECK(many.num({"items", "2", "exit"}) == 20);
@@ -601,16 +799,16 @@ TEST_CASE("catalog uninstall", "[cli][catalog]")
 	CHECK(ok.exit == 0);
 	CHECK(h.elevated_runs == 1);
 	// The class is read from the receipt BEFORE the item is removed.
-	CHECK(ok.engine ==
-	      std::vector<std::string>{"list|--installed|--json", "uninstall|leia-sr|--json", "uninstall|leia-sr"});
+	CHECK(ok.engine == std::vector<std::string>{"list|--installed|--json", "uninstall|leia-sr|--json",
+	                                            "uninstall|leia-sr|--log|<log>"});
 	CHECK(ok.str({"items", "0", "expect", "0", "class"}) == "display_processor");
 	CHECK(has(ok.str({"items", "0", "message"}), "uninstalled"));
 
-	// `--catalog` is of no use to uninstall, but is passed as written.
 	Host a;
 	a.admin = true;
 	Result adm = a.run({"uninstall", "leia-sr", "ghost"});
 	CHECK(adm.exit == 42);
+	CHECK(a.elevated_runs == 0);
 	CHECK(has(adm.out, "leia-sr: uninstalled"));
 	CHECK(has(adm.err, "ghost"));
 }
@@ -626,24 +824,33 @@ TEST_CASE("catalog update is install for what outdated reports", "[cli][catalog]
 		CHECK(r.engine[0] == "outdated|--json");
 		CHECK(r.engine[1] == "install|leia-sr|--no-runtime|--json");
 		for (const std::string &line : r.engine) {
-			CHECK_FALSE(has(line, "install|runtime"));
-			CHECK_FALSE(has(line, "vendor.hands|"));
+			CHECK_FALSE(has(line, "|runtime"));
+			CHECK_FALSE(has(line, "vendor.hands"));
 		}
 		REQUIRE(cJSON_GetArraySize(r.at({"items"})) == 3);
 		CHECK(r.str({"items", "0", "id"}) == "runtime");
 		CHECK(r.str({"items", "0", "action"}) == "none");
-		CHECK(has(r.str({"items", "0", "message"}), "catalog update runtime"));
-		CHECK(r.str({"items", "1", "id"}) == "leia-sr");
-		CHECK(r.str({"items", "1", "action"}) == "install");
-		CHECK(r.str({"items", "2", "action"}) == "none");
+		CHECK(r.num({"items", "0", "exit"}) == 0); // reported, not a failure of --all
+		CHECK(has(r.str({"items", "0", "message"}), "runtime installer or the bundle"));
+		CHECK(r.str({"items", "1", "id"}) == "vendor.hands");
+		CHECK(r.str({"items", "1", "action"}) == "none");
+		CHECK(r.str({"items", "2", "id"}) == "leia-sr");
+		CHECK(r.str({"items", "2", "action"}) == "install");
 	}
-	SECTION("naming the runtime updates it")
+	SECTION("--all with several outdated items: one install call, one consent prompt")
 	{
 		Host h;
-		h.admin = true;
-		Result r = h.run({"update", "runtime", "--json"});
+		Result r = h.run({"update", "--all", "--json", "--elevate", "--catalog", "two"});
 		CHECK(r.exit == 0);
-		CHECK(r.engine[1] == "install|runtime|--json");
+		CHECK(h.elevated_runs == 1);
+		CHECK(r.engine ==
+		      std::vector<std::string>{"--catalog|two|outdated|--json",
+		                               "--catalog|two|install|leia-sr|open-conv|--no-runtime|--json",
+		                               "--catalog|two|install|leia-sr|open-conv|--no-runtime|--log|<log>",
+		                               "list|--installed|--json"});
+		CHECK(r.num({"items", "1", "exit"}) == 0);
+		CHECK(r.num({"items", "2", "exit"}) == 0);
+		CHECK(cJSON_IsTrue(r.at({"items", "2", "elevated"})));
 	}
 	SECTION("an alias names the catalog item")
 	{
@@ -677,13 +884,6 @@ TEST_CASE("catalog update is install for what outdated reports", "[cli][catalog]
 		Result off = h.run({"update", "--all", "--json", "--catalog", "offline"});
 		CHECK(off.exit == 10);
 		CHECK(cJSON_GetArraySize(off.at({"items"})) == 0);
-	}
-	SECTION("elevation, once per item that needs it")
-	{
-		Host h;
-		Result r = h.run({"update", "--all", "--json", "--elevate"});
-		CHECK(r.exit == 0);
-		CHECK(h.elevated_runs == 1);
 	}
 }
 

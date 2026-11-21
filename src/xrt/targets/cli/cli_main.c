@@ -86,8 +86,9 @@ cli_print_help(int argc, const char **argv)
 	P("  catalog <...>     - The DisplayXR Catalog (ADR-064), through the install engine dxr-get:\n");
 	P("                      'catalog list [--installed] [--json]', 'catalog outdated', 'catalog show <id>',\n");
 	P("                      'catalog install <id>... | --default', 'catalog uninstall <id>...',\n");
-	P("                      'catalog update <id>... | --all'. Installing asks for elevation (--elevate\n");
-	P("                      with --json); the runtime itself is left alone unless named.\n");
+	P("                      'catalog update <id>... | --all'. Installing asks for elevation once per\n");
+	P("                      command (--elevate with --json). The runtime itself is never installed or\n");
+	P("                      updated from here: use its installer or the bundle.\n");
 	P("  camera <...>      - Stereo camera sources (XR_DXR_stereo_camera, ADR-043), over IPC (DIAG).\n");
 	P("                      'camera list [--json]', 'camera calib <id> [--raw|--rectified]',\n");
 	P("                      'camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]\n");

@@ -28,6 +28,8 @@
 
 //! The most engine output this CLI keeps (a catalog listing is a few hundred KB at most).
 #define MAX_CAPTURE (16u * 1024u * 1024u)
+//! The most of an engine log this CLI reads back.
+#define MAX_LOG_BYTES (256u * 1024u)
 
 struct capture
 {
@@ -69,6 +71,10 @@ capture_add(struct capture *c, const char *data, size_t n)
 #include <objbase.h>
 #include <io.h>
 #include <wchar.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+#include <softpub.h>
+#include <sddl.h>
 
 #define ENGINE_EXE L"dxr-get.exe"
 
@@ -369,6 +375,138 @@ cli_catalog_os_is_interactive(void *ud)
 	return _isatty(_fileno(stdin)) != 0 && _isatty(_fileno(stderr)) != 0;
 }
 
+/*
+ * The same check dxr-get makes of a downloaded installer (get_verify.c): a
+ * valid Authenticode signature that chains to a trusted root, and the leaf
+ * certificate's display name. No revocation fetch: the check must not wait
+ * on the network, and it runs before a consent prompt that names the
+ * publisher anyway.
+ */
+bool
+cli_catalog_os_signer(void *ud, const char *path, char *signer, size_t cap)
+{
+	(void)ud;
+	if (cap > 0) {
+		signer[0] = '\0';
+	}
+	wchar_t self[MAX_PATH];
+	wchar_t *owned = NULL;
+	const wchar_t *file = self;
+	if (path != NULL) {
+		owned = widen(path);
+		file = owned;
+	} else {
+		const DWORD n = GetModuleFileNameW(NULL, self, MAX_PATH);
+		if (n == 0 || n >= MAX_PATH) {
+			return false;
+		}
+	}
+	if (file == NULL) {
+		return false;
+	}
+
+	WINTRUST_FILE_INFO fi;
+	memset(&fi, 0, sizeof(fi));
+	fi.cbStruct = sizeof(fi);
+	fi.pcwszFilePath = file;
+	WINTRUST_DATA wd;
+	memset(&wd, 0, sizeof(wd));
+	wd.cbStruct = sizeof(wd);
+	wd.dwUIChoice = WTD_UI_NONE;
+	wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+	wd.dwUnionChoice = WTD_CHOICE_FILE;
+	wd.pFile = &fi;
+	wd.dwStateAction = WTD_STATEACTION_VERIFY;
+	wd.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+	GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+	bool ok = false;
+	if (WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &action, &wd) == ERROR_SUCCESS) {
+		CRYPT_PROVIDER_DATA *pd = WTHelperProvDataFromStateData(wd.hWVTStateData);
+		CRYPT_PROVIDER_SGNR *sg = pd != NULL ? WTHelperGetProvSignerFromChain(pd, 0, FALSE, 0) : NULL;
+		CRYPT_PROVIDER_CERT *pc = sg != NULL ? WTHelperGetProvCertFromChain(sg, 0) : NULL;
+		if (pc != NULL && pc->pCert != NULL) {
+			wchar_t name[256];
+			if (CertGetNameStringW(pc->pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, name, 256) > 1) {
+				ok = narrow_out(name, signer, cap);
+			}
+		}
+	}
+	wd.dwStateAction = WTD_STATEACTION_CLOSE;
+	(void)WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &action, &wd);
+	free(owned);
+	return ok;
+}
+
+/*
+ * The file the elevated engine appends its messages to. Created here, new
+ * (never an existing file), in this user's temporary directory, readable and
+ * writable by its owner, administrators and SYSTEM only. The engine opens it
+ * only if it exists and is a plain file.
+ */
+bool
+cli_catalog_os_log_create(void *ud, char *path, size_t cap)
+{
+	(void)ud;
+	wchar_t dir[MAX_PATH], file[MAX_PATH * 2];
+	const DWORD n = GetTempPathW(MAX_PATH, dir);
+	GUID g;
+	if (n == 0 || n >= MAX_PATH || CoCreateGuid(&g) != S_OK) {
+		return false;
+	}
+	wchar_t name[80];
+	(void)_snwprintf(name, 80, L"dxr-get-%08lx%04x%04x%02x%02x%02x%02x.log", (unsigned long)g.Data1, g.Data2,
+	                 g.Data3, g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3]);
+	name[79] = L'\0';
+	file[0] = L'\0';
+	if (!wappend(file, MAX_PATH * 2, dir) || !wappend(file, MAX_PATH * 2, name)) {
+		return false;
+	}
+	SECURITY_ATTRIBUTES sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.nLength = sizeof(sa);
+	// Protected (no inherited entries): the owner, administrators, SYSTEM.
+	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;FA;;;OW)(A;;FA;;;BA)(A;;FA;;;SY)",
+	                                                          SDDL_REVISION_1, &sa.lpSecurityDescriptor, NULL)) {
+		return false;
+	}
+	HANDLE h = CreateFileW(file, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_NEW,
+	                       FILE_ATTRIBUTE_NORMAL, NULL);
+	LocalFree(sa.lpSecurityDescriptor);
+	if (h == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	CloseHandle(h);
+	if (!narrow_out(file, path, cap)) {
+		(void)DeleteFileW(file);
+		return false;
+	}
+	return true;
+}
+
+char *
+cli_catalog_os_log_take(void *ud, const char *path)
+{
+	(void)ud;
+	wchar_t *w = widen(path);
+	if (w == NULL) {
+		return NULL;
+	}
+	struct capture cap = {NULL, 0, 0};
+	HANDLE h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+	                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h != INVALID_HANDLE_VALUE) {
+		char chunk[4096];
+		DWORD got = 0;
+		while (cap.len < MAX_LOG_BYTES && ReadFile(h, chunk, sizeof(chunk), &got, NULL) && got > 0) {
+			capture_add(&cap, chunk, got);
+		}
+		CloseHandle(h);
+	}
+	(void)DeleteFileW(w);
+	free(w);
+	return cap.buf;
+}
+
 #else // !XRT_OS_WINDOWS
 
 #include <errno.h>
@@ -522,6 +660,49 @@ cli_catalog_os_is_interactive(void *ud)
 {
 	(void)ud;
 	return isatty(STDIN_FILENO) != 0 && isatty(STDERR_FILENO) != 0;
+}
+
+bool
+cli_catalog_os_signer(void *ud, const char *path, char *signer, size_t cap)
+{
+	(void)ud;
+	(void)path;
+	if (cap > 0) {
+		signer[0] = '\0';
+	}
+	return false; // no engine, no elevated start, nothing to verify
+}
+
+bool
+cli_catalog_os_log_create(void *ud, char *path, size_t cap)
+{
+	(void)ud;
+	const char *dir = getenv("TMPDIR");
+	(void)snprintf(path, cap, "%s/dxr-get-XXXXXX", dir != NULL && dir[0] != '\0' ? dir : "/tmp");
+	const int fd = mkstemp(path); // created new, mode 0600
+	if (fd < 0) {
+		return false;
+	}
+	close(fd);
+	return true;
+}
+
+char *
+cli_catalog_os_log_take(void *ud, const char *path)
+{
+	(void)ud;
+	struct capture cap = {NULL, 0, 0};
+	FILE *f = fopen(path, "rb");
+	if (f != NULL) {
+		char chunk[4096];
+		size_t got;
+		while (cap.len < MAX_LOG_BYTES && (got = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+			capture_add(&cap, chunk, got);
+		}
+		fclose(f);
+	}
+	(void)unlink(path);
+	return cap.buf;
 }
 
 #endif
