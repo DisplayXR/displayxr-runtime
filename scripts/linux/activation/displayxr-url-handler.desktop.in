@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=DisplayXR Activation
+Comment=Handles displayxr://activate links (licence activation of a DisplayXR component)
+# The registered handler of the displayxr:// URL scheme
+# (docs/specs/runtime/activation-deep-link.md §8). %u is the one link, passed
+# as ONE argument and always last: displayxr-cli never reads it as an option.
+# --notify raises a desktop notification with the outcome (no silent activation).
+Exec=@CLI_BIN@ activate-url --notify %u
+TryExec=@CLI_BIN@
+Terminal=false
+NoDisplay=true
+StartupNotify=false
+MimeType=x-scheme-handler/displayxr;

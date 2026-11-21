@@ -63,6 +63,22 @@ if [ -x "$INSTALL_DIR/bin/displayxr-cli" ]; then
     ln -sfn "$INSTALL_DIR/bin/displayxr-cli" /usr/local/bin/displayxr-cli
 fi
 
+# displayxr:// URL scheme (ADR-064 §5): register the handler bundle with
+# Launch Services so a displayxr://activate link opens it. The bundle is not in
+# /Applications, where Launch Services looks by itself, so it is registered
+# explicitly: for the console user (the Launch Services database is per user;
+# any other user gets it the first time the bundle is seen, or by running the
+# same command), never as root alone.
+ACTIVATE_APP="$INSTALL_DIR/bin/DisplayXRActivate.app"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ -d "$ACTIVATE_APP" ] && [ -x "$LSREGISTER" ]; then
+    ACT_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+    if [ -n "$ACT_USER" ] && [ "$ACT_USER" != "root" ]; then
+        ACT_UID="$(id -u "$ACT_USER" 2>/dev/null || true)"
+        [ -n "$ACT_UID" ] && launchctl asuser "$ACT_UID" sudo -u "$ACT_USER" "$LSREGISTER" -f "$ACTIVATE_APP" >/dev/null 2>&1 || true
+    fi
+fi
+
 # Desktop-capture helper (#2264): load its on-demand agent into the console
 # user's GUI domain now so the Mach service exists without a logout. Loading
 # does not start the helper (no RunAtLoad), and so does not prompt for Screen

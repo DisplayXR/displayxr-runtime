@@ -337,6 +337,24 @@ else
     echo "Warning: DisplayXRDesktopCapture.app not in artifact; transparent sessions on a weaving DP will have no desktop backdrop."
 fi
 
+# --- displayxr:// URL-scheme handler (ADR-064 §5) ---
+# DisplayXRActivate.app declares the displayxr:// scheme (CFBundleURLTypes): a
+# vendor's checkout page returns an activation token through
+# displayxr://activate (docs/specs/runtime/activation-deep-link.md §8). macOS
+# gives a scheme to an app bundle, never to a bare executable, hence a bundle.
+# It is a shim that runs the displayxr-cli beside it, so it ships only where
+# the CLI does; it links system frameworks only and needs no entitlements
+# (the CLI is the process that loads plug-ins). postinstall registers it with
+# Launch Services; uninstall.sh unregisters it.
+ACTIVATE_SRC="$ARTIFACT_DIR/bin/DisplayXRActivate.app"
+if [ -d "$ACTIVATE_SRC" ] && [ -f "$RUNTIME_ROOT/bin/displayxr-cli" ]; then
+    rm -rf "$RUNTIME_ROOT/bin/DisplayXRActivate.app"
+    cp -R "$ACTIVATE_SRC" "$RUNTIME_ROOT/bin/"
+    echo "Staged DisplayXRActivate.app (displayxr:// handler) into the runtime payload."
+else
+    echo "Warning: DisplayXRActivate.app or displayxr-cli not in artifact; the displayxr:// scheme is not shipped (activation by pasted key still works)."
+fi
+
 # --- 1b. Final code signature on the runtime payload (#280) ---
 # MUST stay the last thing that touches the payload's Mach-Os: every
 # install_name_tool above invalidated a signature (the ad-hoc re-signs only

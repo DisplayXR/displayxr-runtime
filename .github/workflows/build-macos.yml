@@ -286,6 +286,12 @@ jobs:
             echo "::error::com.displayxr.desktop-capture.plist (helper LaunchAgent) missing from .pkg payload (#2264)."
             MISSING=1
           fi
+          # ADR-064 §5: the displayxr:// URL-scheme handler bundle, or a vendor
+          # checkout's activation link opens nothing on macOS.
+          if ! grep -q 'DisplayXR/bin/DisplayXRActivate.app/Contents/MacOS/DisplayXRActivate' "$EXPAND_DIR/files"; then
+            echo "::error::DisplayXRActivate.app missing from .pkg payload — displayxr://activate links have no handler (ADR-064 §5)."
+            MISSING=1
+          fi
           # displayxr-cli: the only installed way on macOS to run selftest /
           # status or calibrate a camera (2.57.2 shipped without it).
           if ! grep -q 'DisplayXR/bin/displayxr-cli$' "$EXPAND_DIR/files"; then

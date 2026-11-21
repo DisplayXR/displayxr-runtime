@@ -158,6 +158,10 @@ endif()
 if(TARGET displayxr-conversion-host)
 	add_dependencies(installer displayxr-conversion-host)
 endif()
+# ADR-064 §5: the displayxr:// URL-scheme handler the installer registers.
+if(TARGET displayxr-activate)
+	add_dependencies(installer displayxr-activate)
+endif()
 # Tracking-provider-discovery §4a: the viewer-tracking host ships beside the service.
 if(TARGET displayxr-tracking-host)
 	add_dependencies(installer displayxr-tracking-host)
