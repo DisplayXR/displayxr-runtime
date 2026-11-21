@@ -538,7 +538,7 @@ no output.
 **Not yet (documented gaps).**
 
 - The `displayxr://activate` deep-link handler and the service-side delivery
-  of a token to a provider that is already running (ADR-064 step 7). Today
+  of a token to a provider that is already running (ADR-064's deep-link step). Today
   `activate` reaches the binary in the CLI's process; the satellite channel
   already carries `ACTIVATE` for that step to use.
 - Live re-selection of a display processor or a tracking provider on a
