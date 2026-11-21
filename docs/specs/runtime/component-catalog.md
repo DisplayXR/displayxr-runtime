@@ -81,7 +81,7 @@ Field rules:
   Leia = the `DXR_RUNTIME_GIT_TAG` pin that leia-plugin's `installer/CMakeLists.txt` derives
   `MIN_RUNTIME_VERSION` from. Omitted when it cannot be read — never guessed.
 - `leia_plugin.detect` — one `edid` rule per row of leia-plugin's
-  `src/drv_leia/leia_edid_table.h` at the pinned tag (`man` = EDID bytes 8-9 big-endian,
+  `src/drv_leia/leia_edid_table.h` at the pinned tag (`man` = EDID bytes 8-9 little-endian,
   `prod` = bytes 10-11 little-endian, decimal; `prod < 16` → `low` (generic Acer DS ids),
   else `high`; a row without its own comment inherits the previous row's note), plus the
   fixed SR-platform registry rule. Clients install the plug-in unattended only on a `high` match.
@@ -312,6 +312,14 @@ back to the next URL, names the finished file by its hash so a cached copy is re
 it hashes to the catalog's digest, discards a file whose hash differs, and has no override
 for the hash check. What is new is doing that for more than one asset per item, in a stated
 order, with the total size known up front.
+
+**EDID ids are little-endian words.** In an `edid` rule, `man` and `prod` are the 16-bit
+words at EDID bytes 8-9 and 10-11, **both read little-endian**, written in decimal. That is
+how `dxr-get` reads a monitor (`get_detect.c`: `edid[8] | edid[9] << 8`) and the convention
+of the display plug-in's own table. Dell's bytes `0x10 0xAC` are therefore `man` = `44048`
+(`0xAC10`), and product `0x4147` is `prod` = `16711`. It is not the big-endian word the
+three-letter PNP id is packed in: a rule written from the PNP id would be `4268` (`0x10AC`)
+for Dell and would never match.
 
 `detect` rule kinds: `edid` and `registry_dword_min` (schema 1), plus `registry_sz_min`
 (a dotted version string at or above `min`), `registry_key_exists` and `file_exists` (an
