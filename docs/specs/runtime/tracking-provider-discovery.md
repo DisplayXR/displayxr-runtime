@@ -131,6 +131,13 @@ service's next spawn scans again and falls through. `tracking list` shows a
 `Licence` column and `tracking list --json` a `licence` object per row;
 `tracking activate <id> <token | @file>` hands a token to the `activate` slot.
 
+That includes an activation delivered through the `displayxr://activate` deep
+link (`tracking activate-begin <id>`): the provider runs in
+`displayxr-tracking-host`, which has no control channel, so the token is
+handed to the provider in the handler's own process, the provider keeps it
+in its own storage, and it serves licensed from the next service start
+([activation-deep-link.md](activation-deep-link.md) §6.4).
+
 ## 4. Arbitration (trunk policy)
 
 Per screen, in this order (`target_viewer_arbitrate`, pure, `tests/tests_viewer_arbitration.cpp`):

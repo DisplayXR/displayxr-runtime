@@ -209,6 +209,48 @@ displayxr-cli conv set sim-conversion LICENSE_KEY DXR-SIM-TEST-KEY
 displayxr-cli conv options sim-conversion                      # LICENSE_KEY  secret  <set>
 ```
 
+#### Which activation path, if any
+
+| Your entitlement | What to implement | What the user does |
+|---|---|---|
+| The connected display or device (`source = hardware`), or it came with the machine (`oem`) | `get_license_state` only | nothing: no key, no purchase, no link. This is the common case for a display vendor |
+| A purchased licence, bought on your site | `purchase_url` + the `DEEP_LINK` activation flag + `activate` | clicks Buy / Activate in the Dashboard, pays on your page, and your page returns through `displayxr://activate` |
+| A licence key you issue some other way | a `secret` setting (and / or `activate` with the `KEY` flag) | pastes the key into a masked field |
+
+**Returning from your checkout page.** The Dashboard opens your `purchase_url`
+with three parameters appended: `displayxr_nonce`, `displayxr_item`
+(`<class>/<id>`) and `displayxr_return` (`displayxr://activate`). When the
+purchase is done, navigate the browser to
+`displayxr://activate?nonce=<displayxr_nonce>&token=<token>`; the runtime's
+handler hands `<token>` to your `activate` slot, once. The nonce works one
+time, for fifteen minutes, on the machine that started it, and the token goes
+to your component only. The exact grammar (the token must be fully
+percent-encoded), the limits and a JavaScript snippet are in
+[activation-deep-link.md](../specs/runtime/activation-deep-link.md) §4.
+
+**Make the URL token a one-time redemption code, not a licence key.** A URL
+can end up in browser history, a `Referer` header and operating-system logs.
+Issue a short-lived code your plug-in redeems with your service inside
+`activate` (the slot may block for a few seconds), and keep the resulting
+licence in your own storage. A reusable key belongs only on the pasted-key
+path, in a `secret` setting, never in a URL. The runtime's half is single use
+and writes the token nowhere; what the token is worth afterwards is yours.
+
+**Keep the activation yourself, and always offer a fallback.** The token may
+reach your plug-in in a short-lived handler process, so every later process
+must find it licensed from your own storage. The link works once and only on
+the machine that started it: show the user a code to paste as well.
+
+Try the round trip without hardware:
+
+```powershell
+displayxr-cli conv set sim-conversion LICENSE_SIM unlicensed
+displayxr-cli conv set sim-conversion LICENSE_STORE C:\temp\sim-licence.txt   # the reference provider's own storage
+displayxr-cli conv activate-begin sim-conversion               # prints the URL; copy displayxr_nonce
+displayxr-cli activate-url "displayxr://activate?nonce=<nonce>&token=DXR-SIM-TEST-KEY"
+displayxr-cli conv list                                        # licensed (key), selected again
+```
+
 ### `ProbeOrder` convention
 
 | Range | Meaning | Examples |

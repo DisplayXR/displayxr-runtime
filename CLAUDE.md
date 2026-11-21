@@ -553,6 +553,7 @@ See `docs/README.md` for the full index. By task:
 | Layer boundaries (what goes where) | `docs/architecture/separation-of-concerns.md` |
 | Build a workspace controller (a spatial shell or a vertical) | `docs/specs/runtime/workspace-controller-registration.md` |
 | Add a new display vendor | `docs/guides/vendor-plugin-onboarding.md` → `docs/reference/xrt_plugin_iface.md` + `docs/specs/runtime/plugin-discovery.md` |
+| Licence a component, or return an activation token from a vendor's checkout page (`displayxr://activate`, `<class> activate-begin`, `activate-url`, the URL-scheme handler and its threat model) | `docs/specs/runtime/activation-deep-link.md` → `docs/guides/vendor-plugin-onboarding.md` § *Licensed components* |
 | Add a new input device (controller, stylus, hands, tracker) as an input-provider plug-in | `docs/guides/input-provider-onboarding.md` → `docs/reference/xrt_input_plugin_iface.md` + `docs/specs/runtime/input-provider-discovery.md` |
 | `xrt_plugin_iface` callbacks | `docs/reference/xrt_plugin_iface.md` |
 | Multiview tiling / atlas layout | `docs/specs/runtime/multiview-tiling.md` |

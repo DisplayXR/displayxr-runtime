@@ -483,8 +483,10 @@ capability (`XRT_CONV_STATE_UNLICENSED`).
 
 ### What is deliberately left out
 
-- The `displayxr://activate` deep-link handler and the delivery of a token to a provider that
-  is already running in the service (ADR-064's next step).
+- ~~The `displayxr://activate` deep-link handler and the delivery of a token to a provider that
+  is already running in the service.~~ Landed with ADR-064 step 7
+  ([activation-deep-link.md](../specs/runtime/activation-deep-link.md)); a tracking provider in
+  its host process still learns of an activation at the next service start.
 - Live re-selection of a display processor or a tracking provider when the state changes: it
   applies at the next session / next scan, the rule `Enabled` already follows for a display
   processor (plugin-discovery.md §4.2).
