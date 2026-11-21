@@ -102,7 +102,8 @@ every one of these holds:
    key (the `u_setting` machine/user stores) with a `DXR_<CLASS>_<ID>_<KEY>` environment
    override that always wins, and the component reads them **through the host interface**,
    never from the environment or from ad-hoc vendor keys (ADR-053 §5 already requires this of
-   conversion providers; it becomes the rule for all).
+   conversion providers; it becomes the rule for all). *Amendment 2 adds one setting type,
+   `secret`, to this contract.*
 8. **Selection scope is per class; apps express preferences, never policy** (2026-10-17). The
    trunk keeps every installed, enabled component of a class resident and arbitrates among them;
    the user sets defaults and pins in the Dashboard / CLI (`prefer`); an app may *enumerate* the
@@ -252,7 +253,8 @@ free; `ForceQwerty` stays where it is. Spec: input-provider-discovery.md §4 ite
   override (`DXR_ALLOW_DEV_PLUGIN_PATHS`, #943) stays loud-logged and is refused on elevated
   hosts.
 - Licensing vocabulary (`UNLICENSED`) is extended from conversion to display and input only
-  when a paid plug-in of that class is real (N5) — not pre-emptively.
+  when a paid plug-in of that class is real (N5) — not pre-emptively. *Done, for all four
+  classes: Amendment 2.*
 - The viewer-tracking class waits on the eye-contract change (N6); nothing in 4.1 ships
   before the DP eye query carries a target time.
 - Trade-off accepted: a shared loader is a large refactor of the most load-bearing file in
@@ -267,7 +269,7 @@ free; `ForceQwerty` stays where it is. Spec: input-provider-discovery.md §4 ite
 | N3 | Verbs retrofit — `input enable|disable|use|reset`, DP `Enabled`, `conv set`, live re-select on change (#2025 pattern), dashboard controls; vocabulary fix in CLI/dashboard/live docs | mac |
 | N4 | Per-class conformance in `displayxr-cli selftest` (sequence above) + the CI vendor-identifier guard widened from the runtime DLL's link line to every class loader | win |
 | N4b | Provenance gate at load: signed OR allowlisted; loud-logged dev override; no override on elevated hosts | win |
-| N5 | Licensing state for DP and input — when a paid plug-in exists | — |
+| N5 | Licensing state for DP and input — when a paid plug-in exists. **Done for every class** (Amendment 2): the shared licence-state contract, the `activate` slot, the `secret` setting type | mac |
 | N6 | Eye contract prep (target-time query, pair-relation history) — **done #2166**; then the tracking-provider class + `sim_tracking` — **Part 2 landed (#2144)**, then service hosting + per-screen routing through each screen's DP; next: out-of-process hosting, camera-consumer path, `sim_tracking` webcam mode, calibration | — |
 | N7 | `EmulatedControllers` gate + CLI/dashboard surface | — |
 | N8 | Pose-feed design note (seqlock page, consumer handshake, always-on tracking mode) | — |
@@ -433,3 +435,70 @@ produce the verdicts.
   completion audit, not design; it is tracked as its own issue with a two-vendor crossing
   test on a dual-screen box.
 
+
+## Amendment 2 — Licence state for every class, activation, and the `secret` setting type (2026-11-20)
+
+**Status:** Accepted with the implementation (N5). Triggered by ADR-064 (component catalog and
+third-party trust, draft PR #2732), whose §5 fixes the licence model and whose step for the
+licence-state slot this amendment carries out.
+
+### What was open
+
+N5 said the licensing vocabulary would be extended "when a paid plug-in exists". One does now,
+and the catalog cannot list a paid component of any class unless every class can say whether
+the user is entitled. Until this amendment only the conversion class could, and only per
+capability (`XRT_CONV_STATE_UNLICENSED`).
+
+### Decision
+
+1. **One licence-state contract, shared by all four classes** (`xrt/xrt_component_license.h`).
+   A component reports `licensed`, `trial`, `expired` or `unlicensed`, with an optional source
+   (`hardware`, `key`, `trial`, `oem`), an optional expiry, one line of text, a purchase URL
+   and how it can be activated. `not_applicable` is the state of a component that reports
+   nothing, which is every component that predates the contract.
+2. **Appended slots, no ABI bump** (ADR-020): `get_license_state` and `activate` at the end of
+   each class's vtable, under `struct_size`, each with a `XRT_*_HAS_*` feature macro. The
+   pattern `describe_settings` used (N3c).
+3. **The runtime carries the state; it never computes one.** No DRM, no payment logic and no
+   entitlement check in the trunk. Any hardware or key check lives in the vendor's own binary.
+   This is a stated principle (ADR-064 §5), not a limitation to lift later.
+4. **Selection: blocked means declined.** `unlicensed` and `expired` are treated like each
+   class's existing "declined" case, so selection falls through to the next candidate by the
+   rule the class already has: the display-processor and input loaders skip the plug-in after
+   `probe()`, the tracking scan does not keep the provider resident, and a conversion provider's
+   capabilities read `UNLICENSED` (ADR-053 Amendment 2). `licensed`, `trial` and
+   `not_applicable` are never skipped.
+5. **Activation is a hand-over.** `activate(token)` gives the component an opaque, bounded
+   token (2047 bytes); the runtime does not interpret, log or store it. The CLI verb is
+   `<class> activate <id> <token | @file>`, the fifth verb every class has, next to
+   `list`, `enable|disable`, `prefer` and `options` (§2.6).
+6. **A `secret` setting type** joins the options contract (decision 7): stored through the same
+   store and tiers, read through the same host slot, **never shown** by any reader (`options`,
+   `list`, the status feed, the Dashboard, logs), and allowed 2047 bytes where other values get
+   255, because a licence key is often a signed token.
+7. **Hosted classes report over the channel they have.** The conversion host sends the state
+   and accepts the token over its control channel; the tracking host writes the state into
+   the pose page's producer block. The service never loads a provider binary to ask.
+
+### What is deliberately left out
+
+- The `displayxr://activate` deep-link handler and the delivery of a token to a provider that
+  is already running in the service (ADR-064's next step).
+- Live re-selection of a display processor or a tracking provider when the state changes: it
+  applies at the next session / next scan, the rule `Enabled` already follows for a display
+  processor (plugin-discovery.md §4.2).
+- Entitlement detail (trial, expiry) in the app-facing `XR_DXR_lift` enumeration.
+- The Dashboard's Buy / Activate action. The Dashboard shows a licence chip; the action is
+  ADR-064's Catalog tab.
+
+### Consequences
+
+- A vendor can ship a paid component of any class: install stays free, and an unlicensed one
+  behaves like any component that cannot serve.
+- Every `list --json` row, `selftest --json` and the status feed gain a `licence` object. Keys
+  are only added.
+- The per-class conformance run (N4) gains a cell: the state is reported, an unlicensed
+  provider falls through, activation flips the state, a secret appears in no output. The
+  reference is `sim-conversion` / `sim-tracking` (`LICENSE_SIM`, `LICENSE_KEY`).
+- Spec: plugin-discovery.md §2.3 (secrets) and §2.4 (licence state and activation), with the
+  class sections in the input, conversion and tracking discovery specs.

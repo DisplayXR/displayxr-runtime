@@ -147,6 +147,21 @@ becomes a check). This catches "bumped one, forgot the other."
   *N*; a runtime of major *N* runs any plug-in of major *N*. Crossing *N*
   requires both sides to move and is rejected (not corrupted) in the meantime.
 
+### A worked example across four vtables: the licence slots (2026-11)
+
+Rule 1 was written for the display-processor vtable. The licence-state
+contract (ADR-054 Amendment 2) applies it to all four component classes at
+once, and shows the whole recipe in one change: `get_license_state` and
+`activate` are appended at the END of `xrt_plugin_iface`,
+`xrt_input_plugin_iface`, `xrt_conversion_plugin_iface` and
+`xrt_tracking_plugin_iface`; each is read only when the component's
+`struct_size` covers it and the pointer is not NULL; each is announced by a
+`XRT_*_HAS_GET_LICENSE_STATE` / `XRT_*_HAS_ACTIVATE` macro, which is what the
+downstream `features` repin gate keys on; no class's API major moves; and the
+struct both slots exchange (`xrt_component_license_state`) starts with its own
+`struct_size`, set by the caller, so it can grow the same way. A component
+built before the slots is not touched and reads as "no licence to report".
+
 ## Status / rollout
 
 - **Landed in the v1.5.x line:** rule 4 (compile-time tripwire) + this ADR

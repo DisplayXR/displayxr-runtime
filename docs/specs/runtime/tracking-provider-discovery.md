@@ -111,6 +111,26 @@ topology (§4b). The chosen provider is started on the first viewer request and 
 teardown — or, when the service hosts it out of process, when nobody has asked for a viewer for
 about 15 s (§4a idle stop), and started again on the next request.
 
+### Licence state (ADR-054 N5)
+
+A provider may report a licence state through the optional
+`get_license_state` slot, appended after `describe_settings` with `activate`
+(`XRT_TRACKING_PLUGIN_IFACE_HAS_GET_LICENSE_STATE`,
+`XRT_TRACKING_PLUGIN_IFACE_HAS_ACTIVATE`; the contract every class shares:
+plugin-discovery.md §2.4). The scan asks after a successful `probe()`: a
+provider that says `unlicensed` or `expired` is **not resident**, exactly like
+one that declined, so the next provider in rank serves the viewer, and with
+none left the views stay on the nominal viewer. A provider without the slot
+reads `not_applicable` and is never skipped for it.
+
+The scan runs once per process, so a licence change takes effect at the next
+one: the next process in-process, or the next spawn of
+`displayxr-tracking-host`. The host re-reads the state every tick while it
+serves; when it turns blocking the host stops the provider and exits, and the
+service's next spawn scans again and falls through. `tracking list` shows a
+`Licence` column and `tracking list --json` a `licence` object per row;
+`tracking activate <id> <token | @file>` hands a token to the `activate` slot.
+
 ## 4. Arbitration (trunk policy)
 
 Per screen, in this order (`target_viewer_arbitrate`, pure, `tests/tests_viewer_arbitration.cpp`):
@@ -713,6 +733,8 @@ Settings (`displayxr-cli tracking options sim-tracking`):
 | `RATE_HZ` | 60 | push rate (webcam: how often the tracker is polled; one push per analysed frame while tracking, every tick while lost so the collapse animates) |
 | `CAMERA` | 0 | 1: simulate a webcam — camera-space samples + display output through the host's camera pose (§6) |
 | `CAMERA_KEY` | `sim-tracking:webcam0` | the simulated camera's key |
+| `LICENSE_SIM` | — | the scripted licence state (§3 *Licence state*): `licensed` / `trial` / `expired` / `unlicensed`; unset = no licence to report. `unlicensed` and `expired` make the scan skip the provider |
+| `LICENSE_KEY` | — | a `secret` setting: the fixed test key `DXR-SIM-TEST-KEY` turns `unlicensed` / `expired` into `licensed` by key. `tracking options` shows it as `<set>` / `<unset>` |
 | `CAMERA_TRUE_POSE` | the bezel prior | hidden ground truth `"tx,ty,tz,qx,qy,qz,qw"` the camera measures from |
 | `CAMERA_DEPTH_BIAS` | 1 | reported distance = true × this (a simulated per-user iris error) |
 | `WEBCAM_ESTIMATOR` | auto | `auto` (the built-in estimator) / `none` / the built-in name (`yunet-onnx`) |

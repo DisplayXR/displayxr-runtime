@@ -62,9 +62,11 @@ service RPCs in §5 expose. The last row is what the plug-in slot in §6 carries
                "active_openxr_runtime": "C:\\Program Files\\DisplayXR\\Runtime\\DisplayXR_win64.json" },
   "plugins": [
     { "id": "leia-sr", "name": "DisplayXR Leia SR", "vendor": "Leia Inc.", "version": "2.13.0",
-      "load": "ACTIVE", "platform_state": "READY", "hint": "", "fallback": false, "probe_order": 50 },
+      "load": "ACTIVE", "platform_state": "READY", "hint": "", "fallback": false, "probe_order": 50,
+      "licence": { "state": "licensed", "source": "hardware", "expires_unix": null } },
     { "id": "sim-display", "name": "DisplayXR Sim Display", "version": "2.32.0",
-      "load": "NOT_ATTEMPTED", "platform_state": "UNKNOWN", "fallback": true, "probe_order": 200 }
+      "load": "NOT_ATTEMPTED", "platform_state": "UNKNOWN", "fallback": true, "probe_order": 200,
+      "licence": { "state": "not_applicable", "source": null, "expires_unix": null } }
   ],
   "screens": [
     { "id": "0x8c413a2f61152ce7", "index": 0,
@@ -157,7 +159,8 @@ provider-table change), and the snapshot gains two arrays, appended after `warni
     "licence_exempt": false, "research_opt_in": false, "described": true, "host_pid": 0, "restarts": 0,
     "last_exit_code": 0, "adapter_luid": null, "backend": "cpu", "vram_used_mb": 0,
     "licence_class": "PERMISSIVE", "licence_spdx": "BSL-1.0", "cap_count": 7, "bad_descriptors": 0,
-    "descriptor_error": null }
+    "descriptor_error": null,
+    "licence": { "state": "not_applicable", "source": null, "expires_unix": null } }
 ],
 "conv_tasks": [
   { "provider_index": 0, "provider": "sim-conversion", "task": "views-mono", "cap_id": 3, "composed": false,
@@ -168,6 +171,13 @@ provider-table change), and the snapshot gains two arrays, appended after `warni
 ]
 ```
 
+- `licence` (ADR-054 N5; on `plugins[]`, on `conv_providers[]`, and under a screen's
+  `eye_tracking.viewer_host` for the serving tracking provider): what the component says about
+  the user's entitlement — `state` (`not_applicable` / `licensed` / `trial` / `expired` /
+  `unlicensed`), `source` (`hardware` / `key` / `trial` / `oem` or null) and `expires_unix`
+  (seconds, UTC, or null). Not `licence_class`, which is the terms a model ships under. The
+  message, the purchase URL and the activation methods are in `<class> list --json`, not in
+  the feed (plugin-discovery.md §2.4).
 - `conv_providers[]` (≤ 8): one row per registered provider plus the built-in `dp-lift`
   adapter row. `load` is the loader outcome upper-cased (`NEGOTIATED`, `ABI_MISMATCH`,
   `DISABLED`, `PROBE_DECLINED`, …; `BUILT_IN` for the adapter); `status` is the provider's
