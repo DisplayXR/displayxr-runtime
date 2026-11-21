@@ -488,6 +488,12 @@ if(TARGET aux_desktop)
 	list(APPEND tests tests_desktop_control)
 endif()
 
+# ADR-064 step 4: `displayxr-cli catalog`, the front end over dxr-get, driven
+# against a fake engine. Wherever the CLI is built (every desktop OS).
+if(TARGET cli_catalog)
+	list(APPEND tests tests_cli_catalog)
+endif()
+
 foreach(testname ${tests})
 	add_executable(${testname} ${testname}.cpp)
 	target_link_libraries(${testname} PRIVATE xrt-external-catch2)
@@ -1437,6 +1443,17 @@ target_link_libraries(tests_cli_lever_catalog PRIVATE xrt-interfaces)
 # through a callback table the test fakes), so this runs on every platform.
 target_sources(tests_get_catalog PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/get/get_core.c)
 target_include_directories(tests_get_catalog PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/get)
+
+# ADR-064 step 4: `displayxr-cli catalog`. The fake engine is a test binary the
+# test names in the ops table; the CLI has no such override (cli_catalog.h).
+if(TARGET tests_cli_catalog)
+	add_executable(tests_cli_catalog_fake_get tests_cli_catalog_fake_get.c)
+	target_link_libraries(tests_cli_catalog PRIVATE cli_catalog xrt-external-cjson)
+	target_compile_definitions(
+		tests_cli_catalog PRIVATE "FAKE_DXR_GET=\"$<TARGET_FILE:tests_cli_catalog_fake_get>\""
+		)
+	add_dependencies(tests_cli_catalog tests_cli_catalog_fake_get)
+endif()
 
 # N3a (ADR-054): the `input list` prediction rule — PreferredPlugin over
 # ProbeOrder, Enabled=0 never predicted — and the provider-id check behind
