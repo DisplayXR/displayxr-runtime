@@ -20,10 +20,12 @@
 ;   Call DxrCatInit                  in .onInit
 ;   DXR_CATALOG_UNINSTALL            in the uninstall section
 ;
-; WHAT IS LISTED. `dxr-get list --json` (the items and their state), joined
-; with `dxr-get detect --json` (hardware matches) and the catalog document
-; (`recommended`, sizes, runtime ranges), turned into an INI file by
-; catalog_plan.ps1 (NSIS has no JSON parser). The component list is a fixed
+; WHAT IS LISTED. One call, `dxr-get list --json --assume-runtime <this
+; version> --assume-abi ...`: every catalog item with its state, whether it is
+; recommended, whether this machine's hardware matches it, what would be
+; downloaded, and whether it is compatible with the runtime being installed.
+; catalog_plan.ps1 turns that into an INI file (NSIS has no JSON parser) and
+; decides nothing itself beyond the ticks. The component list is a fixed
 ; set of hidden "slot" sections: NSIS sections exist at compile time, so each
 ; listed item takes one slot, gets its text and flags at run time, and unused
 ; slots stay hidden (a section with an empty name is not shown).
@@ -46,6 +48,9 @@
 ;                        versions.json names) and the keywords `recommended`,
 ;                        `detected`, `default` (= recommended,detected), `none`.
 ;                        Interactive: replaces the default pre-ticks.
+;                        Unattended, exactly `/COMPONENTS=default` is one
+;                        `dxr-get install --default` (what the bundle passes):
+;                        no listing, no PowerShell.
 ;   /CATALOG=<url|file>  another catalog, passed to dxr-get as --catalog. It
 ;                        must still be signed (dxr-get's rule), so this grants
 ;                        nothing; it is for testing.
@@ -53,6 +58,11 @@
 ; So an unattended install with no switch does exactly what it did before this
 ; file existed, which also means a runtime installer that dxr-get itself runs
 ; (`/S /NOSTART`) never calls back into dxr-get.
+;
+; NEVER THE RUNTIME. Every install this file triggers passes `--no-runtime`:
+; dxr-get must not start a second runtime installer from inside this one. An
+; item that needs a newer runtime than this one is refused (exit 41) and
+; reported as skipped.
 ;
 ; WHEN IT IS NOT THERE. If dxr-get.exe was not built, DXR_CATALOG_UI is
 ; undefined and every macro below expands to nothing: the installer is what it
@@ -84,6 +94,33 @@
 		!endif
 	!endif
 !endif
+
+; The class ABI majors of the runtime this installer carries, as
+; "class=N,class=N,": the numbers the main script writes to Runtime\Abi
+; (installer/CMakeLists.txt reads them from the class headers). dxr-get is told
+; them with --assume-abi, since the registry still describes the OLD runtime
+; when the page is shown. A define that is missing is simply not passed.
+!ifdef ABI_DISPLAY_PROCESSOR
+	!define DXR_CAT_ABI_DP "display_processor=${ABI_DISPLAY_PROCESSOR},"
+!else
+	!define DXR_CAT_ABI_DP ""
+!endif
+!ifdef ABI_INPUT_PROVIDER
+	!define DXR_CAT_ABI_IN "input_provider=${ABI_INPUT_PROVIDER},"
+!else
+	!define DXR_CAT_ABI_IN ""
+!endif
+!ifdef ABI_CONVERSION_PROVIDER
+	!define DXR_CAT_ABI_CV "conversion_provider=${ABI_CONVERSION_PROVIDER},"
+!else
+	!define DXR_CAT_ABI_CV ""
+!endif
+!ifdef ABI_TRACKING_PROVIDER
+	!define DXR_CAT_ABI_TR "tracking_provider=${ABI_TRACKING_PROVIDER},"
+!else
+	!define DXR_CAT_ABI_TR ""
+!endif
+!define DXR_CAT_ABI "${DXR_CAT_ABI_DP}${DXR_CAT_ABI_IN}${DXR_CAT_ABI_CV}${DXR_CAT_ABI_TR}"
 
 ; Declared in every build: the page texts below name them.
 Var DxrCatTop          ; text above the component list
@@ -247,7 +284,10 @@ Function DxrCatQuery
 
 	StrCpy $R0 '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\catalog_plan.ps1" -DxrGet "$PLUGINSDIR\dxr-get.exe" -Out "$DxrCatIni" -RuntimeVersion ${VERSION} -Slots ${DXR_CAT_SLOTS}'
 	; An empty quoted argument is dropped by powershell -File, so add these
-	; two only when they have a value.
+	; only when they have a value.
+	!if "${DXR_CAT_ABI}" != ""
+		StrCpy $R0 '$R0 -AssumeAbi "${DXR_CAT_ABI}"'
+	!endif
 	${If} $DxrCatSel != ""
 		StrCpy $R0 '$R0 -Select "$DxrCatSel"'
 	${EndIf}
@@ -405,7 +445,8 @@ Function DxrCatInstallOne
 		StrCpy $R2 " --no-start-service"
 	${EndIf}
 	ClearErrors
-	nsExec::ExecToLog '$R1 install $R8 --yes$R2'
+	; --no-runtime: never a second runtime installer inside this one.
+	nsExec::ExecToLog '$R1 install $R8 --yes --no-runtime$R2'
 	Pop $R3
 	${If} $R3 == 0
 		DetailPrint "Catalog: $R9 - done."
@@ -428,12 +469,55 @@ Function DxrCatInstallOne
 	${ElseIf} $R3 == 40
 		StrCpy $R4 "the catalog has no such component, or no signed Windows build of it"
 	${ElseIf} $R3 == 41
-		StrCpy $R4 "it is not compatible with this version of the DisplayXR Runtime"
+		StrCpy $R4 "it is not compatible with this version of the DisplayXR Runtime, or needs a newer one"
 	${ElseIf} $R3 == 50
 		StrCpy $R4 "dxr-get was not running elevated"
 	${EndIf}
 	DetailPrint "Catalog: $R9 - NOT installed: $R4."
 	StrCpy $DxrCatSkipped "$DxrCatSkipped$R9: $R4$\r$\n"
+FunctionEnd
+
+; Unattended /COMPONENTS=default: `dxr-get install --default`. Scratch: $R1-$R4.
+Function DxrCatInstallDefault
+	StrCpy $DxrCatExe "$INSTDIR\dxr-get.exe"
+	${IfNot} ${FileExists} "$DxrCatExe"
+		DetailPrint "Catalog: dxr-get.exe is not installed; /COMPONENTS=default was not acted on."
+		StrCpy $DxrCatSkipped "$DxrCatSkipped/COMPONENTS=default: dxr-get.exe is not installed$\r$\n"
+		Return
+	${EndIf}
+	StrCpy $R1 '"$DxrCatExe"'
+	${If} $DxrCatUrl != ""
+		StrCpy $R1 '$R1 --catalog "$DxrCatUrl"'
+	${EndIf}
+	StrCpy $R2 ""
+	${GetParameters} $R3
+	ClearErrors
+	${GetOptions} $R3 "/NOSTART" $R4
+	${IfNot} ${Errors}
+		StrCpy $R2 " --no-start-service"
+	${EndIf}
+	ClearErrors
+	DetailPrint "Catalog: installing the default set (dxr-get install --default)"
+	nsExec::ExecToLog '$R1 install --default --yes --no-runtime$R2'
+	Pop $R3
+	${If} $R3 == 0
+		DetailPrint "Catalog: default set - done (items dxr-get skipped are listed above)."
+		Return
+	${EndIf}
+	StrCpy $R4 "dxr-get reported $R3"
+	${If} $R3 == 10
+		StrCpy $R4 "no connection, or the catalog could not be read"
+	${ElseIf} $R3 == 11
+		StrCpy $R4 "the catalog failed its signature check"
+	${ElseIf} $R3 == 20
+		StrCpy $R4 "a download failed"
+	${ElseIf} $R3 == 21
+		StrCpy $R4 "a download failed verification and was discarded"
+	${ElseIf} $R3 == 30
+		StrCpy $R4 "a component's installer reported an error"
+	${EndIf}
+	DetailPrint "Catalog: default set - NOT fully installed: $R4."
+	StrCpy $DxrCatSkipped "$DxrCatSkipped/COMPONENTS=default (the recommended set and what matches this computer's hardware): $R4$\r$\n"
 FunctionEnd
 
 ; Install what was ticked (interactive) or asked for with /COMPONENTS=.
@@ -445,6 +529,13 @@ Function DxrCatInstallChosen
 			Return
 		${EndIf}
 		DetailPrint "Catalog: /COMPONENTS=$DxrCatSel"
+		${If} $DxrCatSel == "default"
+			; The recommended set plus what the hardware matches, resolved and
+			; installed by dxr-get in one call. An item it cannot install here is
+			; skipped in its own report and does not fail the rest (exit 0).
+			Call DxrCatInstallDefault
+			Goto dxr_cat_report
+		${EndIf}
 		Call DxrCatQuery
 	${EndIf}
 
@@ -525,6 +616,7 @@ Function DxrCatInstallChosen
 		StrCpy $DxrCatSkipped "$DxrCatSkipped/COMPONENTS=$DxrCatSel: the component listing could not be run$\r$\n"
 	${EndIf}
 
+	dxr_cat_report:
 	; Report. The file is for an unattended caller; the finish page for a person.
 	${If} $DxrCatSkipped != ""
 		ClearErrors

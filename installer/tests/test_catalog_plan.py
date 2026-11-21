@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Tests for installer/catalog_plan.ps1 (the runtime installer's catalog listing shim).
 
-The shim joins three dxr-get reports (`list --json`, `detect --json`, `catalog`)
-into the INI file installer/Catalog.nsh reads. These tests run it under
-PowerShell (`pwsh`) against a fake dxr-get that answers each verb with a canned
-document in the shape docs/specs/runtime/dxr-get.md gives, and check the
-selection rules: default pre-ticks, /COMPONENTS= tokens, the runtime-range
-filter, and what happens when a report is missing or the catalog is offline.
+The shim turns one `dxr-get list --json --assume-runtime X.Y.Z` report into the
+INI file installer/Catalog.nsh reads. These tests run it under PowerShell
+(`pwsh`) against a fake dxr-get that prints a canned listing in the shape
+docs/specs/runtime/dxr-get.md gives, and check what the shim adds: the call it
+makes, the pre-tick and /COMPONENTS= rules, the row texts, and the offline and
+failure outcomes. Compatibility, detection and sizes are dxr-get's answers and
+are only copied, so they are fixture data here, not logic under test.
 
 Skipped (exit 0) when no PowerShell is on PATH, and on Windows (the fake
 dxr-get is a shell script).
@@ -31,59 +32,35 @@ HERE = Path(__file__).resolve().parent
 SHIM = HERE.parent / "catalog_plan.ps1"
 PWSH = None if os.name == "nt" else shutil.which("pwsh")
 
-# `dxr-get list --json`
+
+def row(id_, name, cls, **kw):
+    r = {"id": id_, "name": name, "class": cls, "registered_id": None, "publisher": "displayxr", "tier": None,
+         "installed": None, "available": "1.0.0", "state": "not_installed", "installable": True, "receipt": False,
+         "aliases": [], "recommended": False, "detected": "none", "size": 0, "download": 0, "compatible": True,
+         "prerequisites": []}
+    r.update(kw)
+    return r
+
+
+# `dxr-get list --json --assume-runtime 2.70.0`
 LIST = {"schema": 2, "items": [
-    {"id": "runtime", "name": "DisplayXR Runtime", "class": "runtime", "registered_id": None, "publisher": "displayxr",
-     "tier": None, "installed": None, "available": "2.70.0", "state": "not_installed", "installable": True, "receipt": False},
-    {"id": "leia-sr", "name": "Leia SR display processor", "class": "display_processor", "registered_id": "leia-sr",
-     "publisher": "displayxr", "tier": None, "installed": None, "available": "2.23.0", "state": "not_installed",
-     "installable": True, "receipt": False},
-    {"id": "open-conversion", "name": "Open conversion provider", "class": "conversion_provider",
-     "registered_id": "open-conversion", "publisher": "displayxr", "tier": None, "installed": "0.1.0",
-     "available": "0.1.1", "state": "outdated", "installable": True, "receipt": False},
-    {"id": "leia-conversion", "name": "Leia conversion provider", "class": "conversion_provider",
-     "registered_id": "leia-conversion", "publisher": "displayxr", "tier": None, "installed": None,
-     "available": "0.1.0", "state": "not_installed", "installable": True, "receipt": False},
-    {"id": "ultraleap", "name": "Ultraleap hands", "class": "input_provider", "registered_id": "ultraleap",
-     "publisher": "displayxr", "tier": None, "installed": None, "available": "0.1.0", "state": "not_installed",
-     "installable": True, "receipt": False},
-    {"id": "browser", "name": "DisplayXR Browser", "class": "app", "registered_id": None, "publisher": "displayxr",
-     "tier": None, "installed": "1.10.5", "available": "1.10.5", "state": "current", "installable": True, "receipt": True},
-    {"id": "unsigned-thing", "name": "No build", "class": "input_provider", "registered_id": "x", "publisher": "displayxr",
-     "tier": None, "installed": None, "available": None, "state": "not_installed", "installable": False, "receipt": False},
-    {"id": "acme.viewer", "name": "Acme Viewer", "class": "app", "registered_id": None, "publisher": "acme",
-     "tier": None, "installed": None, "available": None, "state": "not_installed", "installable": False,
-     "receipt": False, "listing": "https://acme.example/viewer"},
-]}
-
-# `dxr-get detect --json`: keyed by the schema-1 name, with the item id inside.
-DETECT = {
-    "edids": [{"man": 44048, "prod": 16711}],
-    "leia_plugin": {"match": True, "high_confidence": True, "evidence": "display EDID 44048/16711 DELL_8K32", "id": "leia-sr"},
-    "ultraleap": {"match": True, "high_confidence": False, "evidence": "low", "id": "ultraleap"},
-}
-
-
-def asset(size):
-    return {"windows-x64": {"version": "x", "file": "f.exe", "size": size, "sha256": "a" * 64,
-                            "urls": ["https://example.invalid/f.exe"]}}
-
-
-# `dxr-get catalog`: the schema-2 document.
-DOC = {"schema": 2, "serial": 1, "publishers": {}, "items": [
-    {"id": "runtime", "class": "runtime", "name": "DisplayXR Runtime", "version": "2.70.0", "assets": asset(50000000)},
-    {"id": "leia-sr", "aliases": ["leia_plugin"], "class": "display_processor", "name": "Leia SR display processor",
-     "version": "2.23.0", "requires": [{"kind": "runtime", "version": ">=2.66.8"}], "assets": asset(31457280)},
-    {"id": "open-conversion", "aliases": ["conversion_open"], "class": "conversion_provider",
-     "name": "Open conversion provider", "summary": "Open models.", "version": "0.1.1", "assets": asset(15720487),
-     "recommended": True},
-    {"id": "leia-conversion", "aliases": ["leia_conversion"], "class": "conversion_provider",
-     "name": "Leia conversion provider", "version": "0.1.0", "assets": asset(4194304),
-     "requires": [{"kind": "runtime", "version": ">=2.41.0"}, {"kind": "external", "name": "NeurD runtime (Leia)"}]},
-    {"id": "ultraleap", "class": "input_provider", "name": "Ultraleap hands", "version": "0.1.0",
-     "runtime": {"min": "2.69.3", "max": "2.69.3"}, "assets": asset(2097152),
-     "requires": [{"kind": "runtime", "version": ">=2.69.3"}]},
-    {"id": "browser", "class": "app", "name": "DisplayXR Browser", "version": "1.10.5", "assets": asset(209715200)},
+    row("runtime", "DisplayXR Runtime", "runtime", available="2.70.0", size=50000000, download=50000000),
+    row("leia-sr", "Leia SR display processor", "display_processor", aliases=["leia_plugin"], available="2.23.0",
+        detected="high", evidence="display EDID 44048/16711 DELL_8K32", size=31457280, download=31457280),
+    row("open-conversion", "Open conversion provider", "conversion_provider", aliases=["conversion_open"],
+        installed="0.1.0", available="0.1.1", state="outdated", recommended=True, summary="Open models.",
+        size=15720487, download=15720487),
+    row("leia-conversion", "Leia conversion provider", "conversion_provider", aliases=["leia_conversion"],
+        available="0.1.0", size=4194304, download=4194304,
+        prerequisites=[{"name": "NeurD runtime (Leia)", "met": False, "installable": False}]),
+    row("ultraleap", "Ultraleap hands", "input_provider", available="0.1.0", detected="low", size=2097152,
+        download=2097152, compatible=False,
+        incompatible_reason="ultraleap 0.1.0 works with runtime 2.69.3 at most; this machine would have 2.70.0"),
+    row("browser", "DisplayXR Browser", "app", installed="1.10.5", available="1.10.5", state="current",
+        receipt=True, size=209715200),
+    row("unsigned-thing", "No build", "input_provider", available=None, installable=False),
+    row("acme.viewer", "Acme Viewer", "app", publisher="acme", available=None, installable=False,
+        listing="https://acme.example/viewer"),
 ]}
 
 
@@ -93,40 +70,20 @@ class ShimTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="dxr-catplan-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
-    def fake_dxr_get(self, answers: dict) -> Path:
-        """A dxr-get that answers `list`, `detect` and `catalog` with (stdout, exit code)."""
-        for verb, (out, _code) in answers.items():
-            (self.tmp / f"{verb}.out").write_text(out, encoding="utf-8")
-        cases = "\n".join(
-            f'    {verb}) cat "{self.tmp}/{verb}.out"; exit {code} ;;' for verb, (_out, code) in answers.items())
+    def fake_dxr_get(self, stdout: str, code: int) -> Path:
+        """A dxr-get that logs its arguments, prints `stdout` and exits `code`."""
+        (self.tmp / "out.txt").write_text(stdout, encoding="utf-8")
         exe = self.tmp / "dxr-get"
-        exe.write_text(f"""#!/bin/sh
-echo "$@" >> "{self.tmp}/args.txt"
-echo "log line" >&2
-verb=""
-skip=0
-for a in "$@"; do
-  if [ "$skip" = 1 ]; then skip=0; continue; fi
-  case "$a" in
-    --catalog) skip=1 ;;
-    --*) ;;
-    *) [ -z "$verb" ] && verb="$a" ;;
-  esac
-done
-case "$verb" in
-{cases}
-    *) echo "usage" >&2; exit 2 ;;
-esac
-""")
+        exe.write_text(f'#!/bin/sh\necho "$@" >> "{self.tmp}/args.txt"\necho "log line" >&2\n'
+                       f'cat "{self.tmp}/out.txt"\nexit {code}\n')
         exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
         return exe
 
-    def run_shim(self, answers: dict | None = None, **kw) -> configparser.ConfigParser:
-        if answers is None:
-            answers = {"list": (json.dumps(LIST), 0), "detect": (json.dumps(DETECT), 0), "catalog": (json.dumps(DOC), 0)}
+    def run_shim(self, listing=None, code: int = 0, **kw) -> configparser.ConfigParser:
+        stdout = json.dumps(LIST) if listing is None else (listing if isinstance(listing, str) else json.dumps(listing))
         out = self.tmp / "catalog.ini"
         cmd = [PWSH, "-NoProfile", "-NonInteractive", "-File", str(SHIM),
-               "-DxrGet", str(self.fake_dxr_get(answers)), "-Out", str(out)]
+               "-DxrGet", str(self.fake_dxr_get(stdout, code)), "-Out", str(out)]
         kw.setdefault("RuntimeVersion", "2.70.0")
         for k, v in kw.items():
             cmd += ["-" + k, str(v)]
@@ -144,6 +101,23 @@ esac
     def selected(self, **kw) -> set:
         return {k for k, v in self.items(self.run_shim(**kw)).items() if v["selected"] == "1"}
 
+    def calls(self) -> list:
+        return [l.split() for l in (self.tmp / "args.txt").read_text().splitlines()]
+
+    # ---- the one call -----------------------------------------------------------
+    def test_one_list_call_for_the_runtime_being_installed(self):
+        self.run_shim()
+        self.assertEqual(self.calls(), [["list", "--json", "--assume-runtime", "2.70.0"]])
+
+    def test_abi_majors_and_catalog_override_are_passed_on(self):
+        self.run_shim(AssumeAbi="display_processor=5,conversion_provider=1,bad=x,;rm=1", Catalog="C:/x/stable.json")
+        self.assertEqual(self.calls(), [["--catalog", "C:/x/stable.json", "list", "--json", "--assume-runtime", "2.70.0",
+                                         "--assume-abi", "display_processor=5", "--assume-abi", "conversion_provider=1"]])
+
+    def test_without_a_version_nothing_is_assumed(self):
+        self.run_shim(RuntimeVersion="not-a-version", AssumeAbi="display_processor=5")
+        self.assertEqual(self.calls(), [["list", "--json"]])
+
     # ---- the listing ----------------------------------------------------------
     def test_default_preticks(self):
         ini = self.run_shim()
@@ -158,12 +132,14 @@ esac
         self.assertIn("matching hardware was detected", it["leia-sr"]["desc"])
         self.assertIn("Recommended. Open models.", it["open-conversion"]["desc"])
 
-    def test_the_three_reports_are_asked_for_with_the_catalog_override(self):
-        self.run_shim(Catalog="C:/x/stable.json")
-        calls = [l.split() for l in (self.tmp / "args.txt").read_text().splitlines()]
-        self.assertEqual(calls, [["--catalog", "C:/x/stable.json", "list", "--json"],
-                                 ["--catalog", "C:/x/stable.json", "detect", "--json"],
-                                 ["--catalog", "C:/x/stable.json", "catalog"]])
+    def test_download_is_what_is_still_to_fetch(self):
+        lst = copy.deepcopy(LIST)
+        lst["items"][1]["download"] = 0          # the asset is in the download cache
+        lst["items"][3]["download"] = 4194304 + 20971520   # plus a prerequisite's own installer
+        it = self.items(self.run_shim(lst))
+        self.assertEqual(it["leia-sr"]["label"], "Leia SR display processor 2.23.0 (already downloaded)")
+        self.assertEqual(it["leia-sr"]["size_kb"], "0")
+        self.assertEqual(it["leia-conversion"]["label"], "Leia conversion provider 0.1.0 (download 24 MB)")
 
     def test_installed_and_unavailable_items_are_read_only(self):
         it = self.items(self.run_shim())
@@ -179,33 +155,37 @@ esac
         by["leia-sr"].update(installed="2.23.0", state="rebuilt")          # same version, another build
         by["open-conversion"].update(installed="0.2.0", state="newer")     # never downgraded
         by["leia-conversion"].update(installed="0.0.9", available=None, state="installed", installable=False)
-        it = self.items(self.run_shim({"list": (json.dumps(lst), 0), "detect": (json.dumps(DETECT), 0),
-                                       "catalog": (json.dumps(DOC), 0)}))
+        it = self.items(self.run_shim(lst))
         self.assertEqual((it["leia-sr"]["status"], it["leia-sr"]["selected"]), ("outdated", "1"))
         self.assertEqual((it["open-conversion"]["status"], it["open-conversion"]["selected"]), ("current", "0"))
         self.assertEqual(it["leia-conversion"]["status"], "current")
 
-    def test_external_prerequisite_is_named(self):
+    def test_incompatible_is_dxr_gets_verdict_with_its_reason(self):
+        ul = self.items(self.run_shim())["ultraleap"]
+        self.assertEqual((ul["status"], ul["ro"], ul["selected"]), ("unavailable", "1", "0"))
+        self.assertIn("works with runtime 2.69.3 at most", ul["desc"])
+        # An installed item is never called unavailable, whatever `compatible` says.
+        lst = copy.deepcopy(LIST)
+        lst["items"][4].update(installed="0.1.0", state="current")
+        self.assertEqual(self.items(self.run_shim(lst))["ultraleap"]["status"], "current")
+
+    def test_low_confidence_detection_never_ticks(self):
+        lst = copy.deepcopy(LIST)
+        lst["items"][4].update(compatible=True)
+        ul = self.items(self.run_shim(lst))["ultraleap"]
+        self.assertEqual((ul["status"], ul["selected"]), ("missing", "0"))
+
+    def test_unmet_prerequisite_is_named_and_a_met_or_installable_one_is_not(self):
         lc = self.items(self.run_shim())["leia-conversion"]
         self.assertEqual((lc["status"], lc["ro"], lc["selected"]), ("missing", "0", "0"))
-        self.assertIn("Also needs, and does not install: NeurD runtime (Leia).", lc["desc"])
-
-    def test_runtime_range_is_judged_against_the_runtime_being_installed(self):
-        # Built for 2.69.3 exactly: refused on 2.70.0 ...
-        it = self.items(self.run_shim())
-        self.assertEqual(it["ultraleap"]["status"], "unavailable")
-        self.assertIn("built for DisplayXR Runtime 2.69.3", it["ultraleap"]["desc"])
-        # ... offered on 2.69.3, and a low-confidence match never ticks it ...
-        it = self.items(self.run_shim(RuntimeVersion="2.69.3"))
-        self.assertEqual((it["ultraleap"]["status"], it["ultraleap"]["ro"], it["ultraleap"]["selected"]),
-                         ("missing", "0", "0"))
-        # ... and a floor above the runtime being installed is refused too.
-        it = self.items(self.run_shim(RuntimeVersion="2.60.0"))
-        self.assertEqual((it["leia-sr"]["status"], it["leia-sr"]["selected"]), ("unavailable", "0"))
-        self.assertIn("needs DisplayXR Runtime 2.66.8 or newer", it["leia-sr"]["desc"])
+        self.assertIn("Also needs, and does not install: NeurD runtime (Leia) (not found", lc["desc"])
+        lst = copy.deepcopy(LIST)
+        lst["items"][3]["prerequisites"] = [{"name": "A", "met": True, "installable": False},
+                                            {"name": "B", "met": False, "installable": True}]
+        self.assertNotIn("Also needs", self.items(self.run_shim(lst))["leia-conversion"]["desc"])
 
     # ---- /COMPONENTS= -----------------------------------------------------------
-    def test_explicit_selection_replaces_the_default(self):
+    def test_explicit_selection_by_alias_replaces_the_default(self):
         ini = self.run_shim(Select="leia_conversion")
         self.assertEqual({k for k, v in self.items(ini).items() if v["selected"] == "1"}, {"leia-conversion"})
         self.assertEqual(ini["catalog"]["passthrough"], "")
@@ -231,46 +211,31 @@ esac
         self.assertEqual((ini["catalog"]["count"], ini["catalog"]["more"]), ("2", "5"))
         self.assertEqual(set(self.items(ini)), {"leia-sr", "open-conversion"})
 
-    # ---- a report is missing ------------------------------------------------------
-    def test_without_detect_and_document_the_rows_remain_and_nothing_is_ticked(self):
-        ini = self.run_shim({"list": (json.dumps(LIST), 0), "detect": ("", 10), "catalog": ("", 10)})
-        self.assertEqual(ini["catalog"]["state"], "ok")
-        it = self.items(ini)
-        self.assertFalse([k for k, v in it.items() if v["selected"] == "1"])
-        self.assertEqual(it["leia-sr"]["label"], "Leia SR display processor 2.23.0 (download)")
-        self.assertEqual(it["leia-sr"]["size_kb"], "0")
-        # No document, so no range check: dxr-get install is what refuses (exit 41).
-        self.assertEqual(it["ultraleap"]["status"], "missing")
-
-    def test_schema1_document_is_not_used_but_the_legacy_name_from_detect_is(self):
-        v1 = {"schema": 1, "components": {"leia_plugin": {"recommended": "2.23.0"}}}
-        ini = self.run_shim({"list": (json.dumps(LIST), 0), "detect": (json.dumps(DETECT), 0),
-                             "catalog": (json.dumps(v1), 0)}, Select="leia_plugin")
-        self.assertEqual({k for k, v in self.items(ini).items() if v["selected"] == "1"}, {"leia-sr"})
-        self.assertEqual(ini["catalog"]["passthrough"], "")
+    # ---- the other outcomes -----------------------------------------------------
+    def test_schema1_fallback_rows_have_no_recommendation(self):
+        # On the schema-1 fallback dxr-get emits the same fields; nothing is recommended.
+        lst = copy.deepcopy(LIST)
+        lst["items"] = [i for i in lst["items"] if i["id"] in ("runtime", "leia-sr", "browser")]
+        self.assertEqual(self.selected(listing=lst), {"leia-sr"})
 
     def test_offline(self):
-        ini = self.run_shim({"list": ("", 10)}, Select="recommended,leia_plugin")
+        ini = self.run_shim('{"offline":true,"reason":"catalog unreachable or expired"}', 10, Select="recommended,leia_plugin")
         self.assertEqual((ini["catalog"]["state"], ini["catalog"]["count"]), ("offline", "0"))
         self.assertEqual(ini["catalog"]["passthrough"], "leia_plugin")
-        # Offline is decided by the first call: the other two are not made.
-        self.assertEqual(len((self.tmp / "args.txt").read_text().splitlines()), 1)
 
     def test_signature_failure_passes_nothing_through(self):
-        ini = self.run_shim({"list": ("", 11)}, Select="leia_plugin")
+        ini = self.run_shim("", 11, Select="leia_plugin")
         self.assertEqual((ini["catalog"]["state"], ini["catalog"]["passthrough"]), ("error", ""))
 
-    def test_list_that_is_not_the_listing_is_an_error(self):
+    def test_output_that_is_not_the_listing_is_an_error(self):
         for stdout, code in (("usage", 2), ("ID  CLASS  INSTALLED\n", 0), ("{not json", 0), ('{"schema":2}', 0)):
-            ini = self.run_shim({"list": (stdout, code)}, Select="leia_plugin")
+            ini = self.run_shim(stdout, code, Select="leia_plugin")
             self.assertEqual((ini["catalog"]["state"], ini["catalog"]["count"]), ("error", "0"), stdout)
             self.assertEqual(ini["catalog"]["passthrough"], "leia_plugin")
 
     def test_output_is_one_line_per_value(self):
-        lst = {"schema": 2, "items": [{"id": "x", "class": "app", "name": "A\r\n[catalog]\nstate=ok", "installed": None,
-                                       "available": "1.0.0", "state": "not_installed", "installable": True}]}
-        doc = {"schema": 2, "items": [{"id": "x", "summary": "caf\u00e9 \u2014 ok", "assets": asset(10)}]}
-        ini = self.run_shim({"list": (json.dumps(lst), 0), "detect": ("{}", 0), "catalog": (json.dumps(doc), 0)})
+        lst = {"schema": 2, "items": [row("x", "A\r\n[catalog]\nstate=ok", "app", summary="caf\u00e9 \u2014 ok", download=10)]}
+        ini = self.run_shim(lst)
         self.assertEqual(ini["catalog"]["count"], "1")
         self.assertTrue(ini["item1"]["name"].startswith("A [catalog] state=ok"))
         self.assertIn("caf? ? ok", ini["item1"]["desc"])
