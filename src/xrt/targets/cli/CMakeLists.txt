@@ -118,6 +118,14 @@ if(TARGET aux_desktop)
 	target_compile_definitions(cli PRIVATE CLI_HAVE_DESKTOP)
 endif()
 
+# ADR-064 §5: `displayxr-cli activate-url <link>`, the displayxr://activate
+# handler (what the Linux .desktop entry runs; the terminal / test entry elsewhere).
+if(TARGET target_activation)
+	target_sources(cli PRIVATE cli_cmd_activate_url.c)
+	target_link_libraries(cli PRIVATE target_activation)
+	target_compile_definitions(cli PRIVATE CLI_HAVE_ACTIVATION)
+endif()
+
 # #960: `displayxr-cli clients` connects to the live service over IPC (DIAG class).
 # Same gating as targets/diag-lib.
 if(XRT_FEATURE_SERVICE AND XRT_MODULE_IPC)

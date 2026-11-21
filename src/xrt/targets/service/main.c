@@ -62,6 +62,11 @@ workspace_launch_provider(const char *controller_id)
 #include "service_spawn.h"              // its sibling path
 #include "service_conversion.h"         // ADR-053: the conversion core
 #include "service_component_watch.h"    // ADR-054 N3d (#2051): the policy-store watch
+#include "service_component_activate.h" // ADR-064 §5: live activation (the deep-link handler's delivery)
+#include "conversion/conv_core.h"       // conv_core_activate_provider
+#include "shared/ipc_protocol.h"        // enum ipc_component_activate_status
+#include <assert.h>                     // static_assert
+#include "xrt/xrt_component_license.h"
 
 // #950: run ipc_server_main under the structured-exception guard so an
 // exception escaping the main thread is recorded ([TERMINATE]) before it
@@ -299,6 +304,91 @@ component_reselect_provider(uint32_t class_id)
 	                                                                             : XRT_ERROR_NOT_IMPLEMENTED;
 }
 
+/*
+ * ADR-064 §5 (activation-deep-link.md §6): hand an activation token to the
+ * component instance that is LIVE in this process. Runs on the activation
+ * slot's worker thread (it may block inside the component). By class:
+ *  - conversion: through the core, to the provider's host: in-service via its
+ *    `activate` slot, a satellite via the host's ACTIVATE message. The core
+ *    re-describes the provider on acceptance, so selection follows at once;
+ *  - display: the active display processor's slot, then the same re-probe a
+ *    preference change asks for;
+ *  - input: the resident provider's slot, then a policy re-read / re-rank;
+ *  - tracking: NOT_HOSTED. The provider runs in its own host process, chosen
+ *    once per service run, and that host has no control channel: the handler
+ *    delivers in its own process and the provider is licensed at the next
+ *    service start (the documented gap, spec §6.4).
+ * NOT_HOSTED always means "nothing was called": the handler may then deliver
+ * in its own process. The token is never logged here.
+ */
+static enum service_component_activate_delivery
+component_activate_deliver(void *ud,
+                           uint32_t class_id,
+                           const char *id,
+                           const char *token,
+                           uint32_t token_size,
+                           uint32_t *out_result,
+                           struct xrt_component_license_state *out_state,
+                           char *err,
+                           size_t err_cap)
+{
+	(void)ud;
+	(void)token_size;
+	enum target_component_activate_result r = TARGET_COMPONENT_ACTIVATE_NOT_LOADED;
+	switch (class_id) {
+	case TARGET_COMPONENT_CLASS_CONVERSION: {
+		struct conv_core *core = service_conversion_core();
+		if (core == NULL) {
+			return SERVICE_COMPONENT_ACTIVATE_DELIVERY_NOT_HOSTED;
+		}
+		switch (conv_core_activate_provider(core, id, token, out_state, err, (uint32_t)err_cap)) {
+		case CONV_CORE_ACTIVATE_ACCEPTED: r = TARGET_COMPONENT_ACTIVATE_OK; break;
+		case CONV_CORE_ACTIVATE_REFUSED: r = TARGET_COMPONENT_ACTIVATE_REFUSED; break;
+		default: return SERVICE_COMPONENT_ACTIVATE_DELIVERY_NOT_HOSTED;
+		}
+		break;
+	}
+	case TARGET_COMPONENT_CLASS_DISPLAY:
+		r = target_plugin_activate_resident(id, token, out_state, err, err_cap);
+		break;
+	case TARGET_COMPONENT_CLASS_INPUT:
+		r = target_input_plugin_activate_resident(id, token, out_state, err, err_cap);
+		break;
+	default: return SERVICE_COMPONENT_ACTIVATE_DELIVERY_NOT_HOSTED;
+	}
+	if (r == TARGET_COMPONENT_ACTIVATE_NOT_LOADED) {
+		return SERVICE_COMPONENT_ACTIVATE_DELIVERY_NOT_HOSTED;
+	}
+	*out_result = (uint32_t)r;
+	if (r == TARGET_COMPONENT_ACTIVATE_OK && class_id != TARGET_COMPONENT_CLASS_CONVERSION) {
+		(void)service_component_watch_poke(class_id, SERVICE_COMPONENT_WATCH_POKED);
+	}
+	return SERVICE_COMPONENT_ACTIVATE_DELIVERY_CALLED;
+}
+
+// The slot's statuses cross the wire as `enum ipc_component_activate_status`.
+static_assert((int)SERVICE_COMPONENT_ACTIVATE_NONE == (int)IPC_COMPONENT_ACTIVATE_NONE &&
+                  (int)SERVICE_COMPONENT_ACTIVATE_PENDING == (int)IPC_COMPONENT_ACTIVATE_PENDING &&
+                  (int)SERVICE_COMPONENT_ACTIVATE_DONE == (int)IPC_COMPONENT_ACTIVATE_DONE &&
+                  (int)SERVICE_COMPONENT_ACTIVATE_NOT_HOSTED == (int)IPC_COMPONENT_ACTIVATE_NOT_HOSTED &&
+                  (int)SERVICE_COMPONENT_ACTIVATE_BUSY == (int)IPC_COMPONENT_ACTIVATE_BUSY &&
+                  (int)SERVICE_COMPONENT_ACTIVATE_BAD_REQUEST == (int)IPC_COMPONENT_ACTIVATE_BAD_REQUEST &&
+                  (int)SERVICE_COMPONENT_ACTIVATE_UNSUPPORTED == (int)IPC_COMPONENT_ACTIVATE_UNSUPPORTED,
+              "the activation slot's statuses are the IPC protocol's");
+
+static void
+component_activate_poll(uint64_t owner, struct ipc_component_activate_result *out)
+{
+	out->status = service_component_activate_poll(owner, &out->result, &out->state, out->error, sizeof(out->error));
+}
+
+static const struct ipc_server_component_activate_provider g_component_activate_provider = {
+    .put = service_component_activate_put,
+    .commit = service_component_activate_commit,
+    .poll = component_activate_poll,
+    .client_gone = service_component_activate_client_gone,
+};
+
 static void
 register_component_watch(void)
 {
@@ -327,6 +417,10 @@ register_component_watch(void)
 	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_TRACKING, on_tracking_policy_watch, NULL);
 	ipc_server_set_component_reselect_provider(component_reselect_provider);
 	(void)service_component_watch_start();
+	// ADR-064 §5: the deep-link handler's delivery to a live component.
+	if (service_component_activate_start(component_activate_deliver, NULL)) {
+		ipc_server_set_component_activate_provider(&g_component_activate_provider);
+	}
 }
 
 
@@ -691,6 +785,10 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	u_crash_guard_run("service-main", service_main_body, &sma);
 	int ret = sma.ret;
 
+	// ADR-064 §5: no activation reaches a component being torn down (a
+	// delivery still inside a component gets a short grace, then is abandoned).
+	ipc_server_set_component_activate_provider(NULL);
+	service_component_activate_stop(2000);
 	// ADR-054 N3d: no more policy callbacks into the cores being torn down.
 	service_component_watch_stop();
 	// ADR-053: torn down last, after the IPC server (no client can reach it now).
@@ -864,6 +962,10 @@ main(int argc, char *argv[])
 	u_crash_guard_run("service-main", service_main_body, &sma);
 	int ret = sma.ret;
 
+	// ADR-064 §5: no activation reaches a component being torn down (a
+	// delivery still inside a component gets a short grace, then is abandoned).
+	ipc_server_set_component_activate_provider(NULL);
+	service_component_activate_stop(2000);
 	// ADR-054 N3d: no more policy callbacks into the cores being torn down.
 	service_component_watch_stop();
 	// ADR-053: torn down last, after the IPC server (no client can reach it now).

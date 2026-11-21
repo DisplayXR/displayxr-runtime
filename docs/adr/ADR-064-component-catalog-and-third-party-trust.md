@@ -225,10 +225,18 @@ behaves like any provider that cannot serve.
   the transaction.
 - **Activation by deep link.** The Dashboard starts an activation: it creates a single-use
   nonce bound to one item and passes it to the checkout URL. The vendor's page returns with
-  `displayxr://activate?item=…&nonce=…&token=…`. The handler delivers the token **only to
-  the plug-in with that pending nonce**, and treats it as opaque: not parsed, not logged, not
-  stored by the runtime. A link with no pending nonce does nothing, which is what keeps an
-  arbitrary web page from pushing data at a plug-in.
+  `displayxr://activate?nonce=…&token=…` (and optionally `item=…`, which is only a
+  cross-check: the item is the one the nonce was created for, never one the link names). The
+  handler delivers the token **only to the plug-in with that pending nonce**, and treats it
+  as opaque: not parsed, not logged, not stored by the runtime. A link with no pending nonce
+  does nothing, which is what keeps an arbitrary web page from pushing data at a plug-in.
+  The token should be a one-time redemption code the plug-in exchanges with its vendor's
+  service, never a reusable licence key: a URL is not a private channel. Grammar, lifecycle,
+  threat model and what a vendor implements:
+  [activation-deep-link.md](../specs/runtime/activation-deep-link.md).
+- **No link at all for hardware entitlement.** `licensed` with `source = hardware` (or
+  `oem`) involves no nonce, no link and no handler; the deep link and the Buy / Activate
+  action are for `key` and `trial` sources.
 - **Activation by key.** The user pastes a key, stored through the settings contract
   (ADR-054 decision 7) with a new setting type, `secret`: written like any setting, never
   returned by `options`, `status`, logs or the Dashboard (they show *set* / *not set*).
@@ -354,7 +362,7 @@ Each step is one pull request unless noted. Steps 1–4 are Windows.
 | 4 | **`displayxr-cli catalog list|show|install|uninstall|update`**, with an elevation relaunch for the verbs that need one, and `--json` on every verb | new CLI section in dxr-get.md or a `catalog` section in the CLI reference; ADR-054 §2.6 note (the four verbs stay per class; `catalog` is distribution, not selection) |
 | 5 | **POSIX engine.** The same commands on macOS and Linux: `.pkg` / `.deb` assets, a detached Ed25519 signature per asset in place of Authenticode, the receipt under `/var/lib/displayxr/catalog/`; installed binaries pass the gate as `platform-trusted` in the root-owned package locations | dxr-get.md; plugin-discovery.md §4.3 (POSIX has no signer check today) |
 | 6 | **Licence-state slot + `secret` setting type.** *Done (#2736; ADR-054 Amendment 2), with the `activate` slot step 7 delivers tokens through.* The appended slot and feature macro on all four class vtables, carrying state, message, purchase URL and the optional `source` and `expiry`; the fall-through rule in each selection path, `status --json` and `list` columns, `XRT_COMPONENT_SETTING_TYPE_SECRET` with redaction on every read path | ADR-054 (N5 done, and decision 7 gains a type); ADR-020 (one more worked example of an appended slot); ADR-053 (maps `UNLICENSED` onto the shared vocabulary); `xrt_plugin_iface.md`, `xrt_input_plugin_iface.md`; plugin-discovery.md §2.3 and the three provider-discovery specs; the two onboarding guides. ADR-063 needs a note only: the slot is on the provider interface, not on the provider-device descriptor it proposes |
-| 7 | **`displayxr://activate` handler.** Scheme registration by the runtime installer, nonce start / consume RPCs on the service's DIAG channel, token delivery through the plug-in's activation slot | dxr-get.md or a new activation spec; ADR-051 (a Dashboard action that starts a browser flow); service-architecture.md |
+| 7 | **`displayxr://activate` handler.** *Done, with the registration and the browser hop left to the validation checklist of the spec.* Scheme registration by the runtime installers (Windows: a dedicated `displayxr-activate.exe`; macOS: a handler bundle in the `.pkg`; Linux: a `.desktop` entry in the `.deb` and the tarball). `displayxr-cli <class> activate-begin <id>` starts an activation; the nonce is a per-user pending record (the user's profile, 15 minutes, single use) rather than a service RPC, so it works with no service running. The handler parses the link strictly, consumes the nonce and delivers the token through the plug-in's activation slot: to the live instance in a running service (three DIAG calls, a worker thread; a conversion provider's satellite host through its `ACTIVATE` message), else in its own process. Gap: a tracking provider in its host process is licensed at the next service start | [activation-deep-link.md](../specs/runtime/activation-deep-link.md) (new); plugin-discovery.md §2.4; service-architecture.md; ipc-client-classes.md; the vendor onboarding guides |
 | 8 | **Dashboard Catalog tab.** Browse, install, uninstall, update, tier and prerequisite display, Buy / Activate. Renders the CLI's JSON | ADR-051; `src/dashboard/README.md` |
 | 9 | **Catalog-driven bundle** (§8), in `displayxr-installer`, plus the runtime installer pulling the open conversion provider | versions-json-autobump.md (bundle membership stops being five pins read by name); `displayxr-installer` docs; ADR-042 / ADR-053 note on the default converter |
 

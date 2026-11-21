@@ -14,6 +14,8 @@
 
 #include "xrt/xrt_component_license.h"
 #include "util/u_status_snapshot.h" // u_status_license_add_cjson
+#include "util/u_activation_store.h" // activate-begin: the pending-nonce store
+#include "util/u_activation_url.h"   // activate-begin: the purchase URL
 #include "xrt/xrt_config_os.h"
 
 #include <cjson/cJSON.h>
@@ -457,6 +459,12 @@ cli_component_options_usage(const struct cli_component_class *k)
 		P("                               Hand an activation token (a licence key, or the token a vendor's\n");
 		P("                               checkout returned) to the %s. Opaque to the runtime:\n", k->noun);
 		P("                               never parsed, logged or stored by it. @file reads the first line.\n");
+		P("  activate-begin <id> [--json] Start a deep-link activation: a one-time nonce for this %s\n",
+		  k->noun);
+		P("                               (15 minutes, this user) and the vendor's purchase URL to open. "
+		  "The\n");
+		P("                               checkout returns through displayxr://activate (see "
+		  "'activate-url').\n");
 	}
 }
 
@@ -509,6 +517,14 @@ cli_component_options_dispatch(const struct cli_component_class *k, int argc, co
 			return 1;
 		}
 		return cli_component_activate(k, pos[0], pos[1], json);
+	}
+	if (strcmp(verb, "activate-begin") == 0 && k->activate != NULL) {
+		if (np < 1) {
+			P("error: '%s activate-begin' needs a %s id.\n\n", k->verb, k->noun);
+			cli_component_options_usage(k);
+			return 1;
+		}
+		return cli_component_activate_begin(k, pos[0], json);
 	}
 	return -1;
 }
@@ -679,4 +695,109 @@ cli_component_activate(const struct cli_component_class *k, const char *id, cons
 		  id, k->verb);
 		return 1;
 	}
+}
+
+/*
+ *
+ * activate-begin (ADR-064 §5): the pending nonce + the URL to open.
+ *
+ */
+
+int
+cli_component_activate_begin(const struct cli_component_class *k, const char *id, bool json)
+{
+	const char *result = "ok";
+	struct xrt_component_license_state lic;
+	xrt_component_license_state_init(&lic);
+	struct u_activation_record rec;
+	memset(&rec, 0, sizeof(rec));
+	char nonce[U_ACTIVATION_NONCE_CHARS + 1] = {0};
+	char url[1024] = {0};
+
+	// The id must be one the store, the link and the registry all accept, and registered.
+	if (!id_valid(id) || !u_activation_id_valid(id) || (k->registered != NULL && !k->registered(id))) {
+		result = "not-registered";
+	} else if (k->license == NULL || !k->license(id, &lic) ||
+	           (lic.activation & XRT_COMPONENT_LICENSE_ACTIVATION_DEEP_LINK) == 0) {
+		result = "no-deep-link";
+	} else {
+		// Check the vendor's URL BEFORE spending a nonce on it (the probe nonce is all "A"s and goes nowhere).
+		static const char probe[] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+		if (u_activation_purchase_url_build(lic.purchase_url, k->verb, id, probe, url, sizeof(url)) !=
+		    U_ACTIVATION_PURCHASE_OK) {
+			result = "no-purchase-url";
+		}
+	}
+	if (strcmp(result, "ok") == 0) {
+		char dir[1024];
+		enum u_activation_store_result sr = U_ACTIVATION_STORE_IO_ERROR;
+		if (u_activation_store_default_dir(dir, sizeof(dir))) {
+			sr = u_activation_store_begin(dir, k->verb, id, u_activation_now_unix_s(), U_ACTIVATION_TTL_S,
+			                              nonce, &rec);
+		}
+		if (sr == U_ACTIVATION_STORE_TOO_MANY) {
+			result = "too-many";
+		} else if (sr != U_ACTIVATION_STORE_OK) {
+			result = "store-error";
+		} else if (u_activation_purchase_url_build(lic.purchase_url, k->verb, id, nonce, url, sizeof(url)) !=
+		           U_ACTIVATION_PURCHASE_OK) {
+			result = "no-purchase-url"; // cannot happen after the probe; never print a half-built URL
+		}
+	}
+	memset(nonce, 0, sizeof(nonce));
+	const bool ok = strcmp(result, "ok") == 0;
+	if (!ok) {
+		url[0] = '\0';
+	}
+
+	if (json) {
+		cJSON *root = cJSON_CreateObject();
+		cJSON_AddStringToObject(root, "class", k->verb);
+		cJSON_AddStringToObject(root, "id", id != NULL ? id : "");
+		cJSON_AddStringToObject(root, "result", result);
+		cJSON_AddStringToObject(root, "url", url);
+		cJSON_AddStringToObject(root, "return_url", "displayxr://activate");
+		cJSON_AddStringToObject(root, "nonce_id", ok ? rec.nonce_id : "");
+		cJSON_AddNumberToObject(root, "ttl_s", U_ACTIVATION_TTL_S);
+		char when[32];
+		u_status_unix_time_str(rec.expires_unix_s, true, when, sizeof(when));
+		if (ok) {
+			cJSON_AddNumberToObject(root, "expires_unix", (double)rec.expires_unix_s);
+			cJSON_AddStringToObject(root, "expires", when);
+		} else {
+			cJSON_AddNullToObject(root, "expires_unix");
+			cJSON_AddNullToObject(root, "expires");
+		}
+		cli_component_license_json(root, &lic);
+		char *out = cJSON_Print(root);
+		if (out != NULL) {
+			printf("%s\n", out);
+			cJSON_free(out);
+		}
+		cJSON_Delete(root);
+		return ok ? 0 : 1;
+	}
+
+	if (ok) {
+		P("%s: activation started (valid %d minutes, one use). Open this page to buy or activate:\n\n", id,
+		  U_ACTIVATION_TTL_S / 60);
+		P("  %s\n\n", url);
+		P("The vendor's page returns through a displayxr://activate link, which activates this %s.\n", k->noun);
+		return 0;
+	}
+	if (strcmp(result, "not-registered") == 0) {
+		P("FAIL: '%s' is not a registered %s (see '%s list').\n", id != NULL ? id : "", k->noun, k->verb);
+	} else if (strcmp(result, "no-deep-link") == 0) {
+		P("FAIL: '%s' does not take a deep-link activation (see '%s list' for its licence state, and "
+		  "'%s activate %s <key>' for a pasted key).\n",
+		  id, k->verb, k->verb, id);
+	} else if (strcmp(result, "no-purchase-url") == 0) {
+		P("FAIL: '%s' reports no usable purchase URL (it must be an https URL).\n", id);
+	} else if (strcmp(result, "too-many") == 0) {
+		P("FAIL: %d activations are already pending for this user; wait for them to expire (%d minutes).\n",
+		  U_ACTIVATION_MAX_PENDING, U_ACTIVATION_TTL_S / 60);
+	} else {
+		P("FAIL: this user's activation store is not usable; nothing was started.\n");
+	}
+	return 1;
 }

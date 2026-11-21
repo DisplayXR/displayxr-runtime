@@ -1159,6 +1159,33 @@ typedef xrt_result_t (*ipc_server_component_reselect_fn)(uint32_t component_clas
 void
 ipc_server_set_component_reselect_provider(ipc_server_component_reselect_fn fn);
 
+struct ipc_component_activate_result;
+
+/*!
+ * ADR-064 §5 (activation-deep-link.md §6): the functions the IPC server calls
+ * for the three DIAG RPCs `system_component_activate_put|commit|poll`. The
+ * standalone service registers them (service_component_activate.h); a server
+ * without them answers IPC_COMPONENT_ACTIVATE_UNSUPPORTED and the handler
+ * delivers in its own process instead. @p owner identifies the calling
+ * connection. None of them blocks: the component is asked on the provider's
+ * own worker thread.
+ */
+struct ipc_server_component_activate_provider
+{
+	//! Stage @p size bytes at @p offset; returns an `enum ipc_component_activate_status`.
+	uint32_t (*put)(uint64_t owner, uint32_t offset, const uint8_t *bytes, uint32_t size);
+	//! Commit the staged token against (@p component_class, @p id); returns a status.
+	uint32_t (*commit)(uint64_t owner, uint32_t component_class, const char *id, uint32_t token_size);
+	//! The outcome so far, into @p out (zero-filled by the caller).
+	void (*poll)(uint64_t owner, struct ipc_component_activate_result *out);
+	//! The calling connection went away: discard what it staged.
+	void (*client_gone)(uint64_t owner);
+};
+
+//! Register the live-activation provider (a static struct). Pass NULL to clear.
+void
+ipc_server_set_component_activate_provider(const struct ipc_server_component_activate_provider *provider);
+
 /*!
  * Display dashboard phase 8: function pointer the IPC server calls for the
  * DIAG RPC `system_workspace_launch` — spawn workspace controller

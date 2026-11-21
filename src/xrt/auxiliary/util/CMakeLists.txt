@@ -72,6 +72,10 @@ add_library(
 	u_client_class.h
 	u_sha256.c
 	u_sha256.h
+	u_activation_url.c
+	u_activation_url.h
+	u_activation_store.c
+	u_activation_store.h
 	u_stereo_camera.c
 	u_stereo_camera.h
 	u_stereo_rectify.c

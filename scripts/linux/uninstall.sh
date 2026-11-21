@@ -93,6 +93,12 @@ rmdir "$SHARE_ROOT/vulkan/explicit_layer.d" "$SHARE_ROOT/vulkan/implicit_layer.d
 rm -f "$SHARE_ROOT/applications/displayxr-dashboard.desktop" \
     "$SHARE_ROOT/icons/hicolor/256x256/apps/displayxr-dashboard.png"
 
+# The displayxr:// URL-scheme handler entry (ADR-064 §5).
+rm -f "$SHARE_ROOT/applications/displayxr-url-handler.desktop"
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q "$SHARE_ROOT/applications" >/dev/null 2>&1 || true
+fi
+
 if [ "$SYSTEM" = 1 ]; then
     # /usr/local is shared — remove only what install.sh placed.
     rm -f "$PREFIX/bin/displayxr-cli" "$PREFIX/bin/displayxr-service" "$PREFIX/bin/displayxr-conversion-host" "$PREFIX/bin/displayxr-tracking-host" "$PREFIX/bin/displayxr-dashboard" \

@@ -172,6 +172,40 @@ conv_core_set_corpus_validated(struct conv_core *core, const char *provider_id, 
 void
 conv_core_provider_changed(struct conv_core *core, const char *provider_id);
 
+//! What @ref conv_core_activate_provider did with a token.
+enum conv_core_activate_result
+{
+	CONV_CORE_ACTIVATE_ACCEPTED = 0, //!< the provider accepted the token; a re-describe is queued
+	CONV_CORE_ACTIVATE_REFUSED,      //!< the provider (or its host) answered no; @p err says why
+	CONV_CORE_ACTIVATE_NOT_HOSTED,   //!< not delivered: unknown provider, no host, or its host is down / hung
+};
+
+struct xrt_component_license_state;
+
+/*!
+ * Hand an activation token to the LIVE instance of provider @p provider_id
+ * (ADR-054 N5, ADR-064 §5): in-service through its `activate` slot, a
+ * satellite through its host's ACTIVATE message. On acceptance the provider
+ * is re-described at once (conv_core_provider_changed), so a capability that
+ * read UNLICENSED becomes selectable without a restart.
+ *
+ * MAY BLOCK for as long as the provider's `activate` does (a satellite is
+ * bounded by the proxy's ACTIVATE timeout): call it from a worker thread,
+ * never from a render, lane or IPC-dispatch thread. Not re-entrant per
+ * provider: the caller serialises. The token is opaque, never logged, never
+ * kept. NOT_HOSTED means the token went nowhere (safe to deliver another
+ * way); REFUSED after a transport failure means it MAY have been delivered.
+ * @p out_state (may be NULL) gets the state after the call, @p err (may be
+ * NULL / 0) one line.
+ */
+enum conv_core_activate_result
+conv_core_activate_provider(struct conv_core *core,
+                            const char *provider_id,
+                            const char *token,
+                            struct xrt_component_license_state *out_state,
+                            char *err,
+                            uint32_t err_cap);
+
 /*! `conv disable` / `conv enable` for a provider. */
 void
 conv_core_set_provider_enabled(struct conv_core *core, const char *provider_id, bool enabled);

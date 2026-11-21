@@ -1360,6 +1360,23 @@ client_dll_ok:
 	; Create AppData directories
 	CreateDirectory "$APPDATA\DisplayXR"
 
+	; ADR-064 §5: the displayxr:// URL scheme, whose one action is
+	; displayxr://activate (docs/specs/runtime/activation-deep-link.md). A
+	; vendor's checkout page returns an activation token through it. The
+	; handler is a dedicated GUI-subsystem program that takes the link as its
+	; ONE argument: the command is exactly "<exe>" "%1" - both quoted, nothing
+	; after %1, no flags - so a link cannot add arguments, and the program has
+	; no options to add. HKLM\Software\Classes is shared by the 32- and 64-bit
+	; registry views, so it is written once. /nonfatal: a build without the
+	; handler ships no scheme (activation by pasted key still works).
+	File /nonfatal "${BIN_DIR}\displayxr-activate.exe"
+	IfFileExists "$INSTDIR\displayxr-activate.exe" 0 dxr_url_scheme_done
+		WriteRegStr HKLM "Software\Classes\displayxr" "" "URL:DisplayXR Activation"
+		WriteRegStr HKLM "Software\Classes\displayxr" "URL Protocol" ""
+		WriteRegStr HKLM "Software\Classes\displayxr\DefaultIcon" "" '"$INSTDIR\displayxr-activate.exe",0'
+		WriteRegStr HKLM "Software\Classes\displayxr\shell\open\command" "" '"$INSTDIR\displayxr-activate.exe" "%1"'
+	dxr_url_scheme_done:
+
 	; Write registry keys
 	WriteRegStr HKLM "Software\DisplayXR\Runtime" "InstallPath" "$INSTDIR"
 	WriteRegStr HKLM "Software\DisplayXR\Runtime" "Version" "${VERSION}"
@@ -1909,6 +1926,14 @@ Section "Uninstall"
 	; Retired in #1180; kept so uninstalling an older install still cleans it.
 	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
 	Delete "$INSTDIR\displayxr-cli.exe"
+	; ADR-064 §5: the displayxr:// URL scheme goes with its handler - but only
+	; when it still points at THIS install (another product, or a later
+	; DisplayXR install elsewhere, may have taken the scheme since).
+	ReadRegStr $0 HKLM "Software\Classes\displayxr\shell\open\command" ""
+	${If} $0 == '"$INSTDIR\displayxr-activate.exe" "%1"'
+		DeleteRegKey HKLM "Software\Classes\displayxr"
+	${EndIf}
+	Delete "$INSTDIR\displayxr-activate.exe"
 	Delete "$INSTDIR\dxr-get.exe"
 	!insertmacro DXR_CATALOG_UNINSTALL
 	; Retired (superseded by the Dashboard); kept so uninstalling an older

@@ -903,6 +903,57 @@ conv_core_provider_changed(struct conv_core *core, const char *provider_id)
 	os_mutex_unlock(&core->registry_mtx);
 }
 
+enum conv_core_activate_result
+conv_core_activate_provider(struct conv_core *core,
+                            const char *provider_id,
+                            const char *token,
+                            struct xrt_component_license_state *out_state,
+                            char *err,
+                            uint32_t err_cap)
+{
+	struct xrt_component_license_state local;
+	struct xrt_component_license_state *st = out_state != NULL ? out_state : &local;
+	xrt_component_license_state_init(st);
+	if (err != NULL && err_cap > 0) {
+		err[0] = '\0';
+	}
+	if (core == NULL || provider_id == NULL || token == NULL) {
+		return CONV_CORE_ACTIVATE_NOT_HOSTED;
+	}
+	// The host pointer is read under the registry lock and used outside it:
+	// a host is never destroyed before the core is (a re-registered provider's
+	// previous host is leaked until restart, conv_core_add_provider), and the
+	// call may block for seconds, which the registry lock must not.
+	struct conv_host *host = NULL;
+	os_mutex_lock(&core->registry_mtx);
+	const int32_t pi = conv_registry_find_provider(&core->reg, provider_id);
+	if (pi >= 0 && !core->stop) {
+		const struct conv_host_slot *hs = &core->hosts[pi];
+		if (hs->host != NULL && !hs->hung && !hs->down) {
+			host = hs->host;
+		}
+	}
+	os_mutex_unlock(&core->registry_mtx);
+	if (host == NULL) {
+		return CONV_CORE_ACTIVATE_NOT_HOSTED;
+	}
+	if (host->ops->activate == NULL) {
+		if (err != NULL && err_cap > 0) {
+			(void)snprintf(err, err_cap, "the provider's host has no activation path");
+		}
+		(void)conv_host_get_license_state(host, st);
+		return CONV_CORE_ACTIVATE_REFUSED;
+	}
+	const bool ok = host->ops->activate(host, token, st, err, err_cap);
+	xrt_component_license_state_sanitize(st);
+	U_LOG_W("[conv] provider %s: activation %s; licence: %s", provider_id, ok ? "accepted" : "refused",
+	        xrt_component_license_state_str(st->state));
+	if (ok) {
+		conv_core_provider_changed(core, provider_id);
+	}
+	return ok ? CONV_CORE_ACTIVATE_ACCEPTED : CONV_CORE_ACTIVATE_REFUSED;
+}
+
 void
 conv_core_set_provider_enabled(struct conv_core *core, const char *provider_id, bool enabled)
 {
