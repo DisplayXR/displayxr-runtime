@@ -669,6 +669,7 @@ cmd_options_verbs(int argc, const char **argv)
 	    .note_pickup = note_settings_pickup,
 	    .posix_machine_hint = "the manifest's \"settings\" object (NNN-<id>-input-provider.json)",
 	    .activate = input_activate,
+	    .license = target_input_plugin_license_state,
 	};
 	return cli_component_options_dispatch(&k, argc, argv);
 }

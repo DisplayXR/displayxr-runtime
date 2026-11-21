@@ -139,6 +139,11 @@ cli_cmd_share(int argc, const char **argv);
 int
 cli_cmd_desktop(int argc, const char **argv);
 
+//! `activate-url [--json] [--notify] <link>` — the displayxr://activate deep-link handler (ADR-064 §5):
+//! strict parse, consume the pending nonce, hand the token to the one component it was begun for.
+int
+cli_cmd_activate_url(int argc, const char **argv);
+
 /*!
  * True if @p flag appears anywhere in argv[2..]. Commands take raw
  * argc/argv; this is the one shared option-scan (e.g. `--json`).
