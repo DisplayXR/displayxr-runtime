@@ -492,7 +492,11 @@ def _pin_regex(kind: str, key: str) -> re.Pattern:
     if kind == "cmake_set":
         # set(KEY "v1.2.3"   -- keep the literal shape the downstream Rule-5
         # checks regex for; group(2) is the tag.
-        return re.compile(r"(set\(\s*" + k + r'\s+")([^"]+)(")')
+        # Line-anchored (leading whitespace allowed): a comment that QUOTES the
+        # shape -- `# ... regexes set(KEY "vX.Y.Z"` -- is not the pin. Without
+        # the anchor that comment was read as the pin and counted as a second
+        # location to rewrite (displayxr-ultraleap's CMakeLists.txt has one).
+        return re.compile(r"(?m)(^[ \t]*set\(\s*" + k + r'\s+")([^"]+)(")')
     if kind == "yaml_env":
         # KEY: v1.2.3   (line-anchored: a bare "RUNTIME_REF" in prose must not match)
         return re.compile(r"(?m)^(\s*" + k + r":\s*)(\S+)([ \t]*(?:#.*)?)$")

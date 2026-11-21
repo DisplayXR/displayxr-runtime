@@ -171,7 +171,7 @@ def _extract_dxr_runtime_git_tag(leia_cmakelists: str) -> str:
     reports back from xrtPluginNegotiate).
     """
     m = re.search(
-        r'set\s*\(\s*DXR_RUNTIME_GIT_TAG\s+"(v[0-9]+\.[0-9]+\.[0-9]+)"',
+        r'(?m)^[ \t]*set\s*\(\s*DXR_RUNTIME_GIT_TAG\s+"(v[0-9]+\.[0-9]+\.[0-9]+)"',
         leia_cmakelists,
     )
     if not m:

@@ -627,7 +627,8 @@ def cmake_set_value(repo, spec, tag):
     text = repo_file(repo, spec["file"], tag)
     if text is None:
         return None
-    m = re.search(r'set\(\s*' + re.escape(spec["cmake_set"]) + r'\s+"([^"]+)"', text)
+    # Line-anchored: a comment quoting the shape (`# ... set(KEY "vX.Y.Z"`) is not the value.
+    m = re.search(r'(?m)^[ \t]*set\(\s*' + re.escape(spec["cmake_set"]) + r'\s+"([^"]+)"', text)
     if not m or not SEMVER_RE.match(m.group(1)):
         warn(f"{repo}@{tag}: no usable {spec['cmake_set']} in {spec['file']}; omitted, not guessed")
         return None

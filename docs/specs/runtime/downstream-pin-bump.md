@@ -169,7 +169,13 @@ scripts/downstream_pin_bump.py verdict --from v2.69.2 --to v2.69.3 --repo displa
 `"unpublished": true`. `decide` then skips its tracks instead of failing the whole
 run when the pin cannot be read (a repository that is not pushed or not public
 yet), and prints a reminder to remove the flag as soon as the pin *is* readable.
-Without the flag an unreadable pin stays an error, as before.
+Without the flag an unreadable pin stays an error, as before. No entry carries the flag today.
+
+**A comment that quotes the pin is not the pin.** The `cmake_set` matcher is anchored to the
+start of a line (leading whitespace allowed). A `CMakeLists.txt` that documents the shape in a
+comment, as `displayxr-ultraleap`'s does (`# ... regexes set(DXR_RUNTIME_GIT_TAG "vX.Y.Z"`),
+was otherwise read as pinned to `vX.Y.Z`, which fails `decide` for every repo, and counted as
+a second location on rewrite.
 
 **Not visible to the `abi` and `features` gates:** a layout-only coupling with no macro. Leia's Linux
 floor v2.14.6 came from `vk_bundle` ABI-fingerprint fields (#1243) in

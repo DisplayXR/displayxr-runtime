@@ -324,7 +324,7 @@ spec: `docs/specs/runtime/release-signing.md`.
 | `displayxr-leia-plugin` | Public | Leia SR DP plug-in source + `DisplayXRLeiaSRSetup-*.exe`. |
 | `displayxr-conversion-open` | Public | Open-model conversion provider (ADR-053 P4) + `DisplayXROpenConversionSetup-*.exe`; pinned as `conversion_open`. The converter every install gets by default. |
 | `displayxr-leia-conversion` | Public | Leia 2D-to-3D conversion provider (was inside the Leia SR plug-in) + `DisplayXRLeiaConversionSetup-*.exe`. Needs the NeurD runtime, which has its own installer. **No release yet**; field `leia_conversion` is added by its first release. |
-| `displayxr-ultraleap` | Public (not pushed yet, 2026-11) | Ultraleap hands input provider (was `src/xrt/drivers/ultraleap/`) + `DisplayXRUltraleapSetup-*.exe`. Built at one exact runtime release (ADR-063). **No release yet**; field `ultraleap` is added by its first release. |
+| `displayxr-ultraleap` | Public | Ultraleap hands input provider (was `src/xrt/drivers/ultraleap/`) + `DisplayXRUltraleapSetup-*.exe`. Built at one exact runtime release (ADR-063). **No release yet**; field `ultraleap` is added by its first release. |
 | `displayxr-extensions` | Public | OpenXR extension headers, auto-synced from this repo. |
 | `displayxr-demo-*` | Public | Standalone demos (independent evolution; no source-mirror). |
 | `displayxr-browser-pvt` | Private | Chromium fork source that weaves glasses-free inline 3D (`XR_DXR_weave`): patch series, build lanes (`build-box*.yml`, `pipeline.yml`), scripts, internal docs, Android keystore. Windows + Android. Dev issues here. Mirrors the shell split (`displayxr-shell-pvt` → `displayxr-shell-releases`). |

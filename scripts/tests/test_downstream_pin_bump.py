@@ -315,6 +315,32 @@ class LayoutTests(unittest.TestCase):
                         self.assertTrue((REPO_ROOT / h).is_file())
 
 
+class PinLocationTests(unittest.TestCase):
+    """A comment that quotes the pin's shape is not the pin."""
+
+    CMAKE = (
+        '# The runtime pin tooling regexes `set(DXR_RUNTIME_GIT_TAG "vX.Y.Z"`.\n'
+        '#   set(DXR_RUNTIME_GIT_TAG "v0.0.1")   <- an example, commented out\n'
+        'set(DXR_RUNTIME_GIT_TAG "v2.69.3" CACHE STRING\n'
+        '    "runtime tag")\n'
+        'set(DXR_RUNTIME_GIT_TAG_LINUX "v2.60.0")\n'
+        '  set(OTHER "x")\n'
+    )
+
+    def test_read_skips_the_comment(self):
+        self.assertEqual(dpb.read_pin(self.CMAKE, "cmake_set", "DXR_RUNTIME_GIT_TAG"), "v2.69.3")
+
+    def test_rewrite_touches_exactly_the_pin(self):
+        new, n = dpb.rewrite_pin(self.CMAKE, "cmake_set", "DXR_RUNTIME_GIT_TAG", "v2.70.0")
+        self.assertEqual(n, 1)
+        self.assertEqual(new, self.CMAKE.replace('"v2.69.3" CACHE', '"v2.70.0" CACHE'))
+
+    def test_indented_pin_still_matches(self):
+        text = 'if(TRUE)\n\tset(K "v1.0.0")\nendif()\n'
+        self.assertEqual(dpb.read_pin(text, "cmake_set", "K"), "v1.0.0")
+        self.assertEqual(dpb.rewrite_pin(text, "cmake_set", "K", "v1.0.1")[0], text.replace("v1.0.0", "v1.0.1"))
+
+
 class UnpublishedRepoTests(unittest.TestCase):
     """A repo marked unpublished is skipped, not an error, while its pin is unreadable."""
 

@@ -163,7 +163,6 @@
     },
     "displayxr-ultraleap": {
       "role": "Ultraleap hands input provider (first out-of-tree hardware input provider; links runtime aux and returns raw struct xrt_device)",
-      "unpublished": true,
       "tracks": {
         "all": {
           "bump_when": "layout",
