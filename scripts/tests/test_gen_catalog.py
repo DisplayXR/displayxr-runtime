@@ -283,8 +283,17 @@ class Schema2OnlyComponents(unittest.TestCase):
         self.assertEqual(item["requires"][0], {"kind": "runtime", "version": ">=2.41.0"})
         ext = item["requires"][1]
         self.assertEqual((ext["kind"], ext["min_version"]), ("external", "0.4.6"))
-        self.assertNotIn("asset", ext)       # declared and detected only
-        self.assertNotIn("info_url", ext)    # not known, so not written
+        self.assertNotIn("asset", ext)       # declared and detected only: no public NeurD build exists
+        self.assertNotIn("info_url", ext)    # and no public page to point at
+        # The Windows floor and the Windows registry leg: all schema 2 can say today.
+        self.assertEqual(sorted(ext), ["detect", "kind", "min_version", "name"])
+        self.assertEqual(len(ext["detect"]), 1)
+        rule = ext["detect"][0]
+        self.assertEqual((rule["kind"], rule["key"], rule["value"], rule["min"]),
+                         ("registry_sz_min", "HKLM\\SOFTWARE\\LeiaInc\\NeurD", "Version", "0.4.6"))
+        self.assertIn("NEURD_PATH", rule["note"])  # what the rule cannot see is said, not guessed around
+        self.assertNotIn("confidence", rule)
+        self.assertEqual(gen_catalog.validate_rule(rule), (rule, []))
         self.assertNotIn("runtime", item)    # a floor, not a range
 
     def test_ultraleap_is_pinned_to_one_runtime(self):
