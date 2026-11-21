@@ -1,0 +1,105 @@
+{
+ "schema": 1,
+ "source": "headless",
+ "policy": {
+  "policy_lock": false,
+  "preferred": {}
+ },
+ "providers": [
+  {
+   "id": "leia-conversion",
+   "name": "Leia conversion provider",
+   "vendor": "Leia, Inc.",
+   "version": "1.0.0",
+   "load": "ACTIVE",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "signed",
+   "signer": "Leia, Inc.",
+   "built_in": false,
+   "licence": {
+    "state": "licensed",
+    "source": "hardware",
+    "expires_unix": null,
+    "expires": null,
+    "message": "Included with your Leia display",
+    "purchase_url": "",
+    "activation": {
+     "key": false,
+     "deep_link": false
+    },
+    "blocks": false
+   }
+  },
+  {
+   "id": "acme-depth",
+   "name": "Acme Depth Studio",
+   "vendor": "Acme",
+   "version": "1.0.0",
+   "load": "ACTIVE",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "signed",
+   "signer": "Acme",
+   "built_in": false,
+   "licence": {
+    "state": "trial",
+    "source": "trial",
+    "expires_unix": null,
+    "expires": "2026-12-21T00:00:00Z",
+    "message": "30-day trial, every feature unlocked",
+    "purchase_url": "https://store.example.com/depth-studio",
+    "activation": {
+     "key": true,
+     "deep_link": true
+    },
+    "blocks": false
+   }
+  },
+  {
+   "id": "northlight-3d",
+   "name": "Northlight Live 3D",
+   "vendor": "Northlight",
+   "version": "1.0.0",
+   "load": "ACTIVE",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "signed",
+   "signer": "Northlight",
+   "built_in": false,
+   "licence": {
+    "state": "unlicensed",
+    "source": null,
+    "expires_unix": null,
+    "expires": null,
+    "message": "Activate to start converting",
+    "purchase_url": "https://northlight.example.com/buy",
+    "activation": {
+     "key": true,
+     "deep_link": false
+    },
+    "blocks": true
+   }
+  }
+ ],
+ "tasks": [
+  {
+   "task": "depth",
+   "provider": "leia-conversion",
+   "selected": true,
+   "verdict": "selected"
+  },
+  {
+   "task": "depth",
+   "provider": "acme-depth",
+   "selected": false,
+   "verdict": "ready"
+  },
+  {
+   "task": "depth",
+   "provider": "northlight-3d",
+   "selected": false,
+   "verdict": "unlicensed"
+  }
+ ]
+}

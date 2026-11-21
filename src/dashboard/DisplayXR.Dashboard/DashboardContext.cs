@@ -21,12 +21,155 @@ public sealed class DashboardContext
     public static readonly TimeSpan ActionTimeout = TimeSpan.FromSeconds(30);
     public static readonly TimeSpan SelftestTimeout = TimeSpan.FromSeconds(90);
 
-    public DashboardContext(StatusFeed feed, CliProcessSource cli, IProcessSource? runner = null)
+    public DashboardContext(StatusFeed feed, CliProcessSource cli, IProcessSource? runner = null, ICatalogEngine? engine = null)
     {
         Feed = feed;
         CliInfo = cli;
         Cli = runner ?? cli;
         HotkeySuspend = new HotkeySuspend(Cli);
+        Catalog = new CatalogService(engine ?? new DxrGetEngine(cli.CliPath), Cli);
+    }
+
+    // ── Catalog (ADR-064 step 8) ────────────────────────────────────────────
+
+    /// <summary>The install engine and the licence verbs, behind one class (Feed/CatalogService.cs).</summary>
+    public CatalogService Catalog { get; }
+
+    /// <summary>The last read of the catalog: the list, or why there is none.</summary>
+    public CatalogRead? CatalogRead { get; private set; }
+    public bool CatalogLoading { get; private set; }
+    private DateTime? _catalogWhen;
+    private bool _catalogReloadPending;
+
+    /// <summary>The install / update / uninstall in flight (one at a time), and how the last one ended.</summary>
+    public CatalogOperation? CatalogOp { get; private set; }
+    public (string ItemId, CatalogOutcome Outcome)? CatalogResult { get; private set; }
+
+    /// <summary>The key activation in flight, and how the last one ended. Neither ever holds the key.</summary>
+    public string? ActivatingItem { get; private set; }
+    public (string ItemId, ActivationOutcome Outcome)? ActivationResult { get; private set; }
+
+    /// <summary>An item (or a Components row) another page asked the Catalog to open; the Catalog page consumes it.</summary>
+    public CatalogFocus? CatalogFocus { get; set; }
+
+    /// <summary>Open the Catalog on the item behind a Components row.</summary>
+    public void OpenInCatalog(ComponentClass cls, string componentId, string name)
+    {
+        CatalogFocus = new CatalogFocus(null, cls, componentId, name);
+        Navigate("catalog");
+    }
+
+    /// <summary>
+    /// <c>list --json</c> through the engine: on Catalog show when older than 5 min, on Refresh and
+    /// after an operation (<paramref name="force"/>). It reaches the network (bounded by the engine),
+    /// so it is never polled, and never runs on the UI thread.
+    /// </summary>
+    public async Task LoadCatalogAsync(bool force = false)
+    {
+        if (CatalogLoading) { if (force) _catalogReloadPending = true; return; }
+        if (!force && CatalogRead is not null && _catalogWhen is { } t && DateTime.Now - t < TimeSpan.FromMinutes(5)) return;
+        CatalogLoading = true;
+        Bump();
+        try { CatalogRead = await Task.Run(() => Catalog.ListAsync()); }
+        catch (Exception ex)
+        {
+            CatalogRead = Model.CatalogRead.From(-1, "", false, false, ex.Message);
+            DashboardLog.Error("catalog list", ex);
+        }
+        finally
+        {
+            CatalogLoading = false;
+            _catalogWhen = DateTime.Now;
+        }
+        DashboardLog.Info($"catalog: {CatalogRead.Status}, {CatalogRead.List?.Items.Count ?? 0} item(s)");
+        Bump();
+        if (_catalogReloadPending)
+        {
+            _catalogReloadPending = false;
+            await LoadCatalogAsync(force: true);
+        }
+    }
+
+    /// <summary>
+    /// Install, update or uninstall one item: bounded, cancellable (the wait, see
+    /// <see cref="ICatalogEngine.RunElevatedAsync"/>), and always ending in an outcome the page
+    /// shows. Then the catalog, and the item's class rows, are re-read.
+    /// </summary>
+    public async Task RunCatalogAsync(CatalogVerb verb, CatalogItem item)
+    {
+        if (CatalogOp is not null) return;
+        var op = new CatalogOperation(item.Id, item.Name, verb, DateTime.Now);
+        CatalogOp = op;
+        CatalogResult = null;
+        Bump();
+        CatalogOutcome outcome;
+        try
+        {
+            DashboardLog.Info($"catalog: {verb} {item.Id}");
+            void Phase(string p) => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            {
+                if (!ReferenceEquals(CatalogOp, op)) return;
+                op.Phase = p;
+                Bump();
+            });
+            outcome = await Task.Run(() => Catalog.RunAsync(verb, item, Phase, op.StopWaiting.Token));
+        }
+        catch (Exception ex)
+        {
+            outcome = CatalogExit.StartFailed(ex.Message);
+            DashboardLog.Error("catalog operation", ex);
+        }
+        DashboardLog.Info($"catalog: {verb} {item.Id} -> {(outcome.Ok ? "ok" : "not done")} (exit {outcome.ExitCode?.ToString() ?? "-"}): {outcome.Title}");
+        CatalogOp = null;
+        CatalogResult = (item.Id, outcome);
+        op.StopWaiting.Dispose();
+        Bump();
+        await LoadCatalogAsync(force: true);
+        if (outcome.Changed && item.PolicyClass is { } cls) await LoadPolicyAsync(cls, force: true);
+    }
+
+    /// <summary>Stop waiting for the operation in flight. The engine, once elevated, finishes on its own.</summary>
+    public void StopWaitingForCatalog()
+    {
+        try { CatalogOp?.StopWaiting.Cancel(); }
+        catch (ObjectDisposedException) { }
+    }
+
+    public void DismissCatalogResult()
+    {
+        CatalogResult = null;
+        ActivationResult = null;
+        Bump();
+    }
+
+    /// <summary>Deliver a pasted key to an installed component, then re-read its licence. The key is not kept.</summary>
+    public async Task ActivateAsync(CatalogItem item, ComponentClass cls, string key)
+    {
+        if (ActivatingItem is not null) return;
+        ActivatingItem = item.Id;
+        ActivationResult = null;
+        Bump();
+        ActivationOutcome outcome;
+        try { outcome = await Task.Run(() => Catalog.ActivateAsync(cls, item.ComponentId, item.Name, key)); }
+        catch (Exception ex)
+        {
+            outcome = new ActivationOutcome(false, "The key could not be delivered", "Try again.");
+            DashboardLog.Warn($"activate: {ex.GetType().Name}");
+        }
+        DashboardLog.Info($"catalog: activate {item.Id} -> {(outcome.Accepted ? "accepted" : "not accepted")}");
+        ActivatingItem = null;
+        ActivationResult = (item.Id, outcome);
+        Bump();
+        await LoadPolicyAsync(cls, force: true);
+    }
+
+    /// <summary>Buy: the vendor's checkout in the default browser (through <c>activate-begin</c> when the CLI has it).</summary>
+    public async Task BuyAsync(CatalogItem item, ComponentClass cls, Uri purchase, bool deepLink)
+    {
+        Uri url = purchase;
+        try { url = await Task.Run(() => Catalog.PurchaseUrlAsync(cls, item.ComponentId, purchase, deepLink)); }
+        catch (Exception ex) { DashboardLog.Warn($"buy: {ex.GetType().Name}"); }
+        if (!UrlLauncher.Open(url.AbsoluteUri)) Toast("Could not open the browser");
     }
 
     /// <summary>Suspends the service's workspace hotkey while the capture box has focus.</summary>

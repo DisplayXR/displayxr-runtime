@@ -43,6 +43,11 @@ public sealed class FixtureProcessSource : IProcessSource
     private readonly JsonObject? _workspace;
     // input-list.json beside the fixture (#2181): `input list --json` and the per-app pin verbs, simulated.
     private readonly JsonObject? _input;
+    // <verb>-list.json beside the fixture (conv, tracking; input-list.json above): `<verb> list --json`
+    // and `<verb> activate <id> @file --json`, simulated, so the Catalog tab's licence block can be tried.
+    private readonly Dictionary<string, JsonObject> _classLists = new();
+    /// <summary>The key the simulated <c>activate</c> accepts (the sim providers' own test key).</summary>
+    public const string TestKey = "DXR-SIM-TEST-KEY";
     public static readonly TimeSpan Interval = TimeSpan.FromSeconds(2);
 
     public FixtureProcessSource(string path, IProcessSource real)
@@ -76,6 +81,16 @@ public sealed class FixtureProcessSource : IProcessSource
         string il = Path.Combine(dir, "input-list.json");
         try { if (File.Exists(il)) _input = JsonNode.Parse(File.ReadAllText(il)) as JsonObject; }
         catch (Exception ex) { DashboardLog.Warn($"fixture input: {ex.Message}"); }
+        if (_input is not null) _classLists["input"] = _input;
+        foreach (string verb in new[] { "conv", "tracking" })
+        {
+            try
+            {
+                string f = Path.Combine(dir, verb + "-list.json");
+                if (File.Exists(f) && JsonNode.Parse(File.ReadAllText(f)) is JsonObject o) _classLists[verb] = o;
+            }
+            catch (Exception ex) { DashboardLog.Warn($"fixture {verb} list: {ex.Message}"); }
+        }
         DashboardLog.Info($"fixture mode: {_lines.Length} line(s) from {path}; {_screens.Count} keyed screen(s); workspace {(_workspace is null ? "absent" : "simulated")}");
     }
 
@@ -131,6 +146,10 @@ public sealed class FixtureProcessSource : IProcessSource
             return Task.FromResult(new CliResult(0, Apply(_lines[0]), "", false, null));
         if (_workspace is not null && a is ["workspace", ..])
             return Task.FromResult(Workspace(a));
+        if (a is [var cv, "activate" or "activate-begin", ..] && _classLists.ContainsKey(cv))
+            return Task.FromResult(Activate(a));
+        if (a is [var lv, "list", "--json"] && lv != "input" && _classLists.TryGetValue(lv, out var cl))
+            lock (_gate) return Task.FromResult(new CliResult(0, cl.ToJsonString(), "", false, null));
         if (_input is not null && (a is ["input", "list", "--json"] || a is ["input", "use" or "reset", .., "--app", _]))
             return Task.FromResult(Input(a));
         if (_screens.Count > 0 && a is ["dp", ..])
@@ -224,6 +243,42 @@ public sealed class FixtureProcessSource : IProcessSource
                 return new CliResult(0, $"Per-app pin for {rexe} cleared", "", false, null);
             }
             return new CliResult(2, "", $"fixture: unsupported '{string.Join(' ', a)}'", false, null);
+        }
+    }
+
+    /// <summary>
+    /// <c>&lt;verb&gt; activate &lt;id&gt; @file --json</c> against a simulated class list: the file's first
+    /// line is the key; <see cref="TestKey"/> makes the provider <c>licensed</c> (source <c>key</c>),
+    /// anything else is refused. <c>activate-begin</c> is not simulated (exit 2: an older CLI), so Buy
+    /// opens the purchase URL as it is.
+    /// </summary>
+    private CliResult Activate(string[] a)
+    {
+        if (a is not [var verb, "activate", var id, var arg, ..] || !arg.StartsWith('@'))
+            return new CliResult(2, "", $"fixture: unsupported '{string.Join(' ', a)}'", false, null);
+        string key;
+        try { key = File.ReadLines(arg[1..]).FirstOrDefault()?.Trim() ?? ""; }
+        catch (Exception) { return new CliResult(1, "", "error: cannot read the token file.", false, null); }
+        lock (_gate)
+        {
+            var list = _classLists[verb];
+            var row = ((list["providers"] ?? list["plugins"]) as JsonArray)?.OfType<JsonObject>()
+                .FirstOrDefault(p => p["id"]?.GetValue<string>() == id);
+            if (row is null)
+                return new CliResult(1, new JsonObject { ["id"] = id, ["result"] = "not-loaded", ["accepted"] = false, ["error"] = "" }.ToJsonString(), "", false, null);
+            bool ok = key == TestKey;
+            if (ok)
+                row["licence"] = new JsonObject
+                {
+                    ["state"] = "licensed", ["source"] = "key", ["expires"] = null, ["message"] = "Activated with your key",
+                    ["purchase_url"] = "", ["activation"] = new JsonObject { ["key"] = true, ["deep_link"] = false }, ["blocks"] = false,
+                };
+            var o = new JsonObject
+            {
+                ["id"] = id, ["class"] = verb, ["result"] = ok ? "ok" : "refused", ["accepted"] = ok,
+                ["error"] = ok ? "" : "the key was not recognised",
+            };
+            return new CliResult(ok ? 0 : 1, o.ToJsonString(), "", false, null);
         }
     }
 
