@@ -60,11 +60,21 @@ struct Machine
 	std::map<std::string, dxr_receipt> receipts;
 	std::map<std::string, uint64_t> cached; // sha256 -> bytes in the download cache
 
+	// --assume-runtime / --assume-abi, as dxr-get's command line sets them.
+	const char *assume_runtime = nullptr;
+	std::vector<std::pair<const char *, int>> assume_abi;
+
 	dxr_env
 	env()
 	{
 		dxr_env e = {};
 		e.user = this;
+		e.assume_runtime = assume_runtime;
+		for (auto &a : assume_abi) {
+			e.assume_abi[e.n_assume_abi].item_class = a.first;
+			e.assume_abi[e.n_assume_abi].major = a.second;
+			e.n_assume_abi++;
+		}
 		e.reg_sz = [](void *u, const char *p, char *out, size_t n) {
 			auto &m = static_cast<Machine *>(u)->sz;
 			auto it = m.find(p);
@@ -187,7 +197,8 @@ const char *V2 = R"json({
       "installer": { "kind": "exe", "args": ["/S"], "scope": "machine", "elevation": "required" },
       "installed": { "kind": "registry_sz", "path": "HKLM\\Software\\DisplayXR\\Browser\\Version" } } } },
   { "id": "open-conversion", "class": "conversion_provider", "registered_id": "open-conversion",
-    "name": "Open conversion", "publisher": "displayxr", "version": "0.1.1",
+    "name": "Open conversion", "summary": "2D to 3D conversion with open models.", "recommended": true,
+    "publisher": "displayxr", "version": "0.1.1",
     "abi": { "conversion_provider": { "min": 1, "max": 1 } }, "runtime": { "min": "2.45.0" },
     "assets": { "windows-x64": { "version": "0.1.1", "file": "OpenConv-0.1.1.exe", "size": 12000000,
       "sha256": ")json" SHA_OPEN R"json(", "urls": ["https://example.invalid/open.exe"],
@@ -251,12 +262,38 @@ struct Cat
 };
 
 dxr_plan
-plan(Cat &cat, Machine &m, const char *x, dxr_plan_mode mode, const char *min_runtime = nullptr)
+plan(
+    Cat &cat, Machine &m, const char *x, dxr_plan_mode mode, const char *min_runtime = nullptr, bool no_runtime = false)
 {
 	dxr_plan p;
 	dxr_env e = m.env();
-	dxr_make_plan(&cat.c, &e, x, min_runtime, mode, &p);
+	dxr_plan_opts opts = {no_runtime};
+	dxr_make_plan(&cat.c, &e, x, min_runtime, mode, &opts, &p);
 	return p;
+}
+
+dxr_plan
+default_plan(Cat &cat, Machine &m, bool no_runtime = false)
+{
+	dxr_plan p;
+	dxr_env e = m.env();
+	dxr_plan_opts opts = {no_runtime};
+	dxr_make_default_plan(&cat.c, &e, &opts, &p);
+	return p;
+}
+
+// One row of `list --json`, by id. The array stays owned by the caller.
+const cJSON *
+row(const cJSON *arr, const char *id)
+{
+	const cJSON *x;
+	cJSON_ArrayForEach(x, arr)
+	{
+		if (strcmp(cJSON_GetObjectItem(x, "id")->valuestring, id) == 0) {
+			return x;
+		}
+	}
+	return nullptr;
 }
 
 std::string
@@ -1007,7 +1044,7 @@ TEST_CASE("inventory: list, outdated and receipts")
 		return "(absent)";
 	};
 
-	cJSON *all = dxr_list_catalog(&cat.c, &e, false);
+	cJSON *all = dxr_list_catalog(&cat.c, &e, false, false);
 	CHECK(cJSON_GetArraySize(all) == 7); // the unknown-class item is not listed
 	CHECK(state_of(all, "runtime") == "outdated");
 	CHECK(state_of(all, "leia-sr") == "current");
@@ -1034,7 +1071,7 @@ TEST_CASE("inventory: list, outdated and receipts")
 	}
 	cJSON_Delete(all);
 
-	cJSON *out = dxr_list_catalog(&cat.c, &e, true);
+	cJSON *out = dxr_list_catalog(&cat.c, &e, true, false);
 	CHECK(cJSON_GetArraySize(out) == 2);
 	CHECK(state_of(out, "runtime") == "outdated");
 	CHECK(state_of(out, "open-conversion") == "rebuilt");
@@ -1042,7 +1079,7 @@ TEST_CASE("inventory: list, outdated and receipts")
 
 	// A newer runtime than the catalog's is not "outdated".
 	m.sz[RT_VER] = "2.71.0";
-	out = dxr_list_catalog(&cat.c, &e, true);
+	out = dxr_list_catalog(&cat.c, &e, true, false);
 	CHECK(state_of(out, "runtime") == "(absent)");
 	cJSON_Delete(out);
 
@@ -1064,4 +1101,259 @@ TEST_CASE("inventory: list, outdated and receipts")
 	CHECK(dxr_receipt_dependents(rs, 3, "open-conversion", deps, sizeof(deps)) == 1);
 	CHECK(dxr_receipt_dependents(rs, 3, "leia-sr", deps, sizeof(deps)) == 0);
 	CHECK(dxr_receipt_dependents(rs, 3, "open", deps, sizeof(deps)) == 0); // a prefix is not a match
+}
+
+TEST_CASE("list: one call answers a setup page")
+{
+	Cat cat(V2);
+	Machine m;
+	m.sz[RT_VER] = "2.69.3";
+	m.edids = {{44048, 16711}};
+	m.cached[SHA_ACME] = 8000000;
+	dxr_env e = m.env();
+	cJSON *all = dxr_list_catalog(&cat.c, &e, false, false);
+
+	// The fields that were there before are still there, unchanged.
+	const cJSON *leia = row(all, "leia-sr");
+	REQUIRE(leia != nullptr);
+	for (const char *k : {"id", "name", "class", "publisher", "tier", "installed", "available", "state",
+	                      "installable", "receipt"}) {
+		INFO(k);
+		CHECK(cJSON_GetObjectItem(leia, k) != nullptr);
+	}
+	CHECK(std::string(cJSON_GetObjectItem(leia, "state")->valuestring) == "not_installed");
+
+	// Hardware match, the schema-1 name, and what installing it would fetch.
+	CHECK(std::string(cJSON_GetObjectItem(leia, "detected")->valuestring) == "high");
+	CHECK(std::string(cJSON_GetObjectItem(leia, "evidence")->valuestring).find("DELL_8K32") != std::string::npos);
+	CHECK(std::string(cJSON_GetArrayItem(cJSON_GetObjectItem(leia, "aliases"), 0)->valuestring) == "leia_plugin");
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(leia, "recommended")));
+	CHECK(cJSON_GetObjectItem(leia, "size")->valuedouble == 30000000);
+	CHECK(cJSON_GetObjectItem(leia, "download")->valuedouble == 30000000);
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(leia, "compatible")));
+	CHECK(cJSON_GetArraySize(cJSON_GetObjectItem(leia, "prerequisites")) == 0);
+
+	// The recommended flag and the summary come from the catalog.
+	const cJSON *open = row(all, "open-conversion");
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(open, "recommended")));
+	CHECK(std::string(cJSON_GetObjectItem(open, "summary")->valuestring) ==
+	      "2D to 3D conversion with open models.");
+	CHECK(std::string(cJSON_GetObjectItem(open, "detected")->valuestring) == "none");
+	CHECK(cJSON_GetArraySize(cJSON_GetObjectItem(open, "aliases")) == 0);
+
+	// download = the item's asset plus its unmet external prerequisite's asset,
+	// minus what the cache holds. The runtime and other items have their own rows.
+	const cJSON *acme = row(all, "acme.depth-pro");
+	CHECK(cJSON_GetObjectItem(acme, "size")->valuedouble == 18000000);
+	CHECK(cJSON_GetObjectItem(acme, "download")->valuedouble == (18000000 - 8000000) + 20000000);
+	const cJSON *pre = cJSON_GetObjectItem(acme, "prerequisites");
+	REQUIRE(cJSON_GetArraySize(pre) == 1);
+	CHECK(std::string(cJSON_GetObjectItem(cJSON_GetArrayItem(pre, 0), "name")->valuestring) ==
+	      "Acme Depth Runtime");
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(cJSON_GetArrayItem(pre, 0), "met")));
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetArrayItem(pre, 0), "installable")));
+
+	// A detection-only prerequisite is reported with its state, and adds nothing to the download.
+	const cJSON *hands = row(all, "handco.hands");
+	CHECK(cJSON_GetObjectItem(hands, "download")->valuedouble == 2000000);
+	pre = cJSON_GetObjectItem(hands, "prerequisites");
+	REQUIRE(cJSON_GetArraySize(pre) == 1);
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(cJSON_GetArrayItem(pre, 0), "met")));
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(cJSON_GetArrayItem(pre, 0), "installable")));
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(hands, "compatible"))); // 2.69.3 is inside its range
+
+	// The runtime row: outdated, its own download, never judged against itself.
+	const cJSON *rt = row(all, "runtime");
+	CHECK(cJSON_GetObjectItem(rt, "download")->valuedouble == 50000000);
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(rt, "compatible")));
+
+	// A link-out fetches nothing.
+	CHECK(cJSON_GetObjectItem(row(all, "acme.viewer"), "download")->valuedouble == 0);
+	cJSON_Delete(all);
+
+	// A prerequisite that is present is `met`; an installed item fetches nothing.
+	m.keys.insert("HKLM\\SOFTWARE\\Handco\\TrackingService");
+	m.sz[LEIA_VER] = "2.23.0";
+	all = dxr_list_catalog(&cat.c, &e, false, false);
+	pre = cJSON_GetObjectItem(row(all, "handco.hands"), "prerequisites");
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetArrayItem(pre, 0), "met")));
+	CHECK(cJSON_GetObjectItem(row(all, "leia-sr"), "download")->valuedouble == 0);
+	cJSON_Delete(all);
+}
+
+TEST_CASE("--assume-runtime: compatibility with a runtime that is about to be installed")
+{
+	Cat cat(V2);
+	Machine m;
+	m.sz[RT_VER] = "2.60.0";                                                    // what the machine has now
+	m.dword["HKLM\\SOFTWARE\\DisplayXR\\Runtime\\Abi|conversion_provider"] = 9; // what THAT runtime implements
+
+	auto listed = [&](const char *id, const char *key) {
+		dxr_env e = m.env();
+		cJSON *all = dxr_list_catalog(&cat.c, &e, false, true);
+		const cJSON *v = cJSON_GetObjectItem(row(all, id), key);
+		std::string out = cJSON_IsString(v)
+		                      ? v->valuestring
+		                      : (cJSON_IsTrue(v) ? "true" : (cJSON_IsFalse(v) ? "false" : "(absent)"));
+		cJSON_Delete(all);
+		return out;
+	};
+
+	// The runtime installer is laying down 2.70.0: the machine's 2.60.0 and its ABI no longer count.
+	m.assume_runtime = "2.70.0";
+	m.assume_abi = {{"conversion_provider", 1}, {"input_provider", 1}, {"display_processor", 5}};
+	CHECK(listed("runtime", "installed") == "2.70.0");
+	CHECK(listed("open-conversion", "compatible") == "true");
+	CHECK(listed("acme.depth-pro", "compatible") == "true");
+	// Above the item's maximum.
+	CHECK(listed("handco.hands", "compatible") == "false");
+	CHECK(listed("handco.hands", "incompatible_reason").find("2.69.99") != std::string::npos);
+
+	// An older runtime being installed: below a floor, and it is not going to move.
+	m.assume_runtime = "2.50.0";
+	CHECK(listed("acme.depth-pro", "compatible") == "false");
+	CHECK(listed("acme.depth-pro", "incompatible_reason").find("2.60.0") != std::string::npos);
+	CHECK(listed("leia-sr", "compatible") == "false"); // a `requires` floor counts the same
+	CHECK(listed("open-conversion", "compatible") == "true");
+
+	// The class ABI of the assumed runtime is the caller's to state.
+	m.assume_runtime = "2.70.0";
+	m.assume_abi = {{"conversion_provider", 2}};
+	CHECK(listed("open-conversion", "compatible") == "false");
+	CHECK(listed("open-conversion", "incompatible_reason").find("conversion_provider ABI 1") != std::string::npos);
+	// Not stated, and it is exactly the catalog's runtime version: the catalog's runtime item says.
+	m.assume_abi.clear();
+	CHECK(listed("open-conversion", "compatible") == "true");
+
+	// `plan` takes it too: the runtime is treated as present at that version.
+	m.assume_runtime = "2.69.0";
+	dxr_plan p = plan(cat, m, "handco.hands", DXR_PLAN_ENSURE);
+	CHECK(std::string(p.steps[0].installed) == "2.69.0");
+	CHECK(p.steps[0].state == DXR_ST_OK);
+	CHECK(p.gate == DXR_GET_OK);
+}
+
+TEST_CASE("--no-runtime: the runtime is never installed or upgraded")
+{
+	Cat cat(V2);
+	Machine m;
+
+	// The runtime satisfies the item: nothing changes.
+	m.sz[RT_VER] = "2.69.0";
+	dxr_plan p = plan(cat, m, "leia_plugin", DXR_PLAN_INSTALL, nullptr, true);
+	CHECK(p.gate == DXR_GET_OK);
+	CHECK(step(p, "runtime")->state == DXR_ST_OK);
+	CHECK(step(p, "leia-sr")->state == DXR_ST_MISSING);
+	CHECK(p.todo == 1);
+
+	// The item needs a newer runtime: refused with 41, and no runtime installer is planned.
+	m.sz[RT_VER] = "2.60.0";
+	p = plan(cat, m, "leia_plugin", DXR_PLAN_INSTALL, nullptr, true);
+	CHECK(p.gate == DXR_GET_INCOMPATIBLE);
+	CHECK(std::string(p.gate_reason).find("--no-runtime") != std::string::npos);
+	CHECK(std::string(p.gate_reason).find("2.66.8") != std::string::npos);
+	CHECK(std::string(p.gate_reason).find("2.60.0") != std::string::npos);
+	CHECK_FALSE(dxr_step_needs_work(step(p, "runtime")));
+	// Without the switch the same call upgrades the runtime first.
+	p = plan(cat, m, "leia_plugin", DXR_PLAN_INSTALL);
+	CHECK(p.gate == DXR_GET_OK);
+	CHECK(step(p, "runtime")->state == DXR_ST_TOO_OLD);
+
+	// No runtime at all.
+	m.sz.erase(RT_VER);
+	p = plan(cat, m, "browser", DXR_PLAN_ENSURE, nullptr, true);
+	CHECK(p.gate == DXR_GET_INCOMPATIBLE);
+	CHECK(std::string(p.gate_reason).find("not installed") != std::string::npos);
+	for (int i = 0; i < p.n; i++) {
+		CHECK_FALSE((p.steps[i].id == std::string("runtime") && dxr_step_needs_work(&p.steps[i])));
+	}
+
+	// Asking for the runtime itself is refused the same way; at the catalog's version it is a no-op.
+	p = plan(cat, m, "runtime", DXR_PLAN_INSTALL, nullptr, true);
+	CHECK(p.gate == DXR_GET_INCOMPATIBLE);
+	CHECK(p.todo == 0);
+	m.sz[RT_VER] = "2.70.0";
+	p = plan(cat, m, "runtime", DXR_PLAN_INSTALL, nullptr, true);
+	CHECK(p.gate == DXR_GET_OK);
+	CHECK(p.todo == 0);
+}
+
+TEST_CASE("install --default: the recommended set plus high-confidence hardware")
+{
+	Cat cat(V2);
+	Machine m;
+	m.sz[RT_VER] = "2.70.0";
+
+	// No Leia display: the recommended item only.
+	dxr_plan p = default_plan(cat, m);
+	INFO(text(p));
+	REQUIRE(p.n == 2);
+	CHECK(std::string(p.steps[0].component) == "runtime");
+	CHECK(p.steps[0].state == DXR_ST_OK);
+	CHECK(std::string(p.steps[1].component) == "open-conversion");
+	CHECK(p.steps[1].state == DXR_ST_MISSING);
+	CHECK(std::string(p.steps[1].reason).find("recommended") != std::string::npos);
+	CHECK(p.gate == DXR_GET_OK);
+	CHECK(p.todo == 1);
+	CHECK(p.total_size == 12000000);
+
+	// A low-confidence match selects nothing; a high-confidence one adds the plug-in.
+	m.edids = {{1138, 2}};
+	CHECK(default_plan(cat, m).todo == 1);
+	m.edids = {{44048, 16711}};
+	p = default_plan(cat, m);
+	CHECK(p.todo == 2);
+	REQUIRE(step(p, "leia-sr") != nullptr);
+	CHECK(step(p, "leia-sr")->state == DXR_ST_MISSING);
+	CHECK(std::string(step(p, "leia-sr")->reason).find("detected") != std::string::npos);
+	CHECK(p.total_size == 42000000);
+	// It is the same flat plan JSON.
+	std::vector<Scanned> s = installer_scan(json(p));
+	CHECK(s.size() == (size_t)p.n);
+
+	// Skip-if-current: what is at the catalog's version is not downloaded.
+	m.sz["HKLM\\Software\\DisplayXR\\ConversionProviders\\open-conversion\\Version"] = "0.1.1";
+	m.sz[LEIA_VER] = "2.23.0";
+	p = default_plan(cat, m);
+	CHECK(p.todo == 0);
+	CHECK(p.total_download == 0);
+	CHECK(p.gate == DXR_GET_OK);
+	CHECK(step(p, "open-conversion")->current);
+	// Older than the catalog: brought up to it (this is `install`).
+	m.sz[LEIA_VER] = "2.20.0";
+	p = default_plan(cat, m);
+	CHECK(step(p, "leia-sr")->state == DXR_ST_TOO_OLD);
+	CHECK(p.todo == 1);
+
+	// --no-runtime with a runtime too old for the plug-in: the plug-in is skipped
+	// with the reason, the rest of the set still installs, and the plan is not refused.
+	m.sz.erase(LEIA_VER);
+	m.sz.erase("HKLM\\Software\\DisplayXR\\ConversionProviders\\open-conversion\\Version");
+	m.sz[RT_VER] = "2.50.0";
+	p = default_plan(cat, m, true);
+	INFO(text(p));
+	CHECK(p.gate == DXR_GET_OK);
+	CHECK(step(p, "leia-sr")->state == DXR_ST_INCOMPATIBLE);
+	CHECK(std::string(step(p, "leia-sr")->reason).find("--no-runtime") != std::string::npos);
+	CHECK(step(p, "open-conversion")->state == DXR_ST_MISSING); // its floor is 2.45.0
+	CHECK(p.todo == 1);
+	for (int i = 0; i < p.n; i++) {
+		CHECK_FALSE((p.steps[i].id == std::string("runtime") && dxr_step_needs_work(&p.steps[i])));
+	}
+	// Without the switch the runtime is upgraded for the plug-in, and both install.
+	p = default_plan(cat, m);
+	CHECK(step(p, "runtime")->state == DXR_ST_TOO_OLD);
+	CHECK(p.todo == 3);
+
+	// A schema-1 catalog has no recommended flag: only the hardware match is selected.
+	Cat v1(V1);
+	m.sz[RT_VER] = "2.70.0";
+	p = default_plan(v1, m);
+	CHECK(p.todo == 1);
+	CHECK(step(p, "leia-sr") != nullptr);
+	m.edids.clear();
+	p = default_plan(v1, m);
+	CHECK(p.n == 0);
+	CHECK(p.todo == 0);
+	CHECK(text(p).find("Nothing to install.") != std::string::npos);
 }

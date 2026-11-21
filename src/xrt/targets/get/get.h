@@ -97,6 +97,11 @@ dxr_reg_read_dword(const char *subkey, const char *value, uint32_t *out);
 bool
 dxr_reg_read_path_sz(const char *full, char *out, size_t out_size);
 
+//! The same value in the 32-bit registry view. A 32-bit installer (NSIS without SetRegView 64) writes its
+//! Add/Remove Programs entry there.
+bool
+dxr_reg_read_path_sz_32(const char *full, char *out, size_t out_size);
+
 //! true when the `HKLM\\...` key exists (64-bit view).
 bool
 dxr_reg_key_exists(const char *key);

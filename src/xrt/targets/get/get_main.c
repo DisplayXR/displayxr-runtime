@@ -315,9 +315,16 @@ env_cached_bytes(void *u, const char *sha, const char *file, uint64_t size)
 	return got > size ? 0 : got;
 }
 
-static const struct dxr_env k_env = {
-    NULL,      env_reg_sz,  env_reg_dword,    env_reg_key_exists, env_file_exists, env_service_exists,
-    env_edids, env_receipt, env_cached_bytes,
+//! Not const: --assume-runtime / --assume-abi fill in the tail of it.
+static struct dxr_env k_env = {
+    .reg_sz = env_reg_sz,
+    .reg_dword = env_reg_dword,
+    .reg_key_exists = env_reg_key_exists,
+    .file_exists = env_file_exists,
+    .service_exists = env_service_exists,
+    .edids = env_edids,
+    .receipt = env_receipt,
+    .cached_bytes = env_cached_bytes,
 };
 
 /*
@@ -717,7 +724,8 @@ write_receipt(const struct dxr_step *s)
 	const char *kind = jstr(un, "kind"), *path = jstr(un, "path");
 	char cmd[768];
 	if (kind != NULL && strcmp(kind, "registry_command") == 0 && path != NULL &&
-	    dxr_reg_read_path_sz(path, cmd, sizeof(cmd)) && cmd[0] != '\0') {
+	    (dxr_reg_read_path_sz(path, cmd, sizeof(cmd)) || dxr_reg_read_path_sz_32(path, cmd, sizeof(cmd))) &&
+	    cmd[0] != '\0') {
 		size_t l = (size_t)snprintf(r.uninstall, sizeof(r.uninstall), "%s", cmd);
 		const cJSON *a;
 		cJSON_ArrayForEach(a, cJSON_GetObjectItemCaseSensitive(un, "args"))
@@ -831,7 +839,9 @@ static void
 report_offline(const char *cmd, const char *target, bool json)
 {
 	char hint[256];
-	if (target != NULL) {
+	if (target != NULL && strcmp(target, "--default") == 0) {
+		(void)snprintf(hint, sizeof(hint), "dxr-get install --default");
+	} else if (target != NULL) {
 		(void)snprintf(hint, sizeof(hint), "dxr-get %s %s", strcmp(cmd, "plan") == 0 ? "ensure-for" : cmd,
 		               target);
 	} else {
@@ -866,16 +876,22 @@ usage(void)
 	dxr_log(
 	    "dxr-get -- fetch, verify, install and remove DisplayXR components from the signed catalog\n"
 	    "\n"
-	    "  dxr-get [--catalog <url|file>] plan --for <item> [--min-runtime X.Y.Z] [--json]\n"
+	    "  dxr-get [--catalog <url|file>] plan --for <item> | --default [--min-runtime X.Y.Z] [--json]\n"
 	    "  dxr-get [--catalog <url|file>] ensure-for <item> [--min-runtime X.Y.Z] [--yes] [--no-start-service]\n"
 	    "  dxr-get [--catalog <url|file>] fetch <item> [--out <dir>]\n"
-	    "  dxr-get [--catalog <url|file>] install <item> [--yes] [--no-start-service]\n"
+	    "  dxr-get [--catalog <url|file>] install <item> | --default [--yes] [--json] [--no-start-service]\n"
 	    "  dxr-get [--catalog <url|file>] detect [--json]\n"
 	    "  dxr-get [--catalog <url|file>] catalog\n"
 	    "  dxr-get [--catalog <url|file>] list [--json]\n"
 	    "  dxr-get [--catalog <url|file>] outdated [--json]\n"
 	    "  dxr-get list --installed [--json]\n"
 	    "  dxr-get uninstall <id> [--json] [--no-start-service]\n"
+	    "\n"
+	    "  --default            the catalog's recommended items plus high-confidence hardware matches\n"
+	    "  --no-runtime         (plan, ensure-for, install, list) never install or upgrade the runtime\n"
+	    "                       itself; an item that would need it is refused with exit 41\n"
+	    "  --assume-runtime V   (list, plan) answer as if runtime V were installed\n"
+	    "  --assume-abi C=N     with --assume-runtime: that runtime implements major N of class C\n"
 	    "\n"
 	    "items: the ids `dxr-get list` shows (the schema-1 names runtime, leia_plugin, browser still work)\n"
 	    "exit: 0 ok, 2 usage, 10 offline/expired catalog, 11 bad signature, 20 download,\n"
@@ -976,9 +992,9 @@ cmd_list_installed(bool json)
 }
 
 static int
-cmd_list(const struct dxr_catalog *c, bool outdated, bool json)
+cmd_list(const struct dxr_catalog *c, bool outdated, bool json, bool fixed_runtime)
 {
-	cJSON *arr = dxr_list_catalog(c, &k_env, outdated);
+	cJSON *arr = dxr_list_catalog(c, &k_env, outdated, fixed_runtime);
 	if (json) {
 		cJSON *o = cJSON_CreateObject();
 		cJSON_AddNumberToObject(o, "schema", c->schema);
@@ -1087,6 +1103,8 @@ main(int argc, char **argv)
 	const char *catalog_where = getenv("DXR_GET_CATALOG");
 	const char *cmd = NULL, *arg = NULL, *for_c = NULL, *min_runtime = NULL, *out_dir = NULL;
 	bool json = false, yes = false, no_verify = false, no_start = false, installed_only = false;
+	bool use_default = false;
+	struct dxr_plan_opts opts = {false};
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
 		if (strcmp(a, "--catalog") == 0 && i + 1 < argc) {
@@ -1105,6 +1123,24 @@ main(int argc, char **argv)
 			yes = true;
 		} else if (strcmp(a, "--installed") == 0) {
 			installed_only = true;
+		} else if (strcmp(a, "--default") == 0) {
+			use_default = true;
+		} else if (strcmp(a, "--no-runtime") == 0) {
+			opts.no_runtime = true;
+		} else if (strcmp(a, "--assume-runtime") == 0 && i + 1 < argc) {
+			k_env.assume_runtime = argv[++i];
+		} else if (strcmp(a, "--assume-abi") == 0 && i + 1 < argc) {
+			// <class>=<major>, e.g. display_processor=5. argv outlives the run,
+			// so the class name is cut in place.
+			char *eq = strchr(argv[++i], '=');
+			if (eq == NULL || eq == argv[i] || k_env.n_assume_abi >= 8) {
+				usage();
+				return DXR_GET_USAGE;
+			}
+			*eq = '\0';
+			k_env.assume_abi[k_env.n_assume_abi].item_class = argv[i];
+			k_env.assume_abi[k_env.n_assume_abi].major = atoi(eq + 1);
+			k_env.n_assume_abi++;
 		} else if (strcmp(a, "--no-start-service") == 0) {
 			no_start = true;
 		} else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -1154,11 +1190,18 @@ main(int argc, char **argv)
 	}
 	const bool plan_verb = strcmp(cmd, "plan") == 0 || strcmp(cmd, "ensure-for") == 0;
 	const bool item_verb = strcmp(cmd, "fetch") == 0 || strcmp(cmd, "install") == 0;
-	if (!is_known || (plan_verb && for_c == NULL) || (item_verb && arg == NULL)) {
+	// --default stands in for the item, on `plan` and `install` only.
+	const bool default_ok = strcmp(cmd, "plan") == 0 || strcmp(cmd, "install") == 0;
+	if (!is_known || (use_default && (!default_ok || for_c != NULL || arg != NULL)) ||
+	    (!use_default && ((plan_verb && for_c == NULL) || (item_verb && arg == NULL)))) {
 		usage();
 		return DXR_GET_USAGE;
 	}
-	const char *target = plan_verb ? for_c : arg;
+	if (k_env.n_assume_abi > 0 && k_env.assume_runtime == NULL) {
+		dxr_log("--assume-abi needs --assume-runtime\n");
+		return DXR_GET_USAGE;
+	}
+	const char *target = use_default ? "--default" : (plan_verb ? for_c : arg);
 
 	struct dxr_catalog c;
 	bool no_network = false;
@@ -1179,11 +1222,16 @@ main(int argc, char **argv)
 	} else if (strcmp(cmd, "detect") == 0) {
 		r = cmd_detect(&c, json);
 	} else if (strcmp(cmd, "list") == 0 || strcmp(cmd, "outdated") == 0) {
-		r = cmd_list(&c, strcmp(cmd, "outdated") == 0, json);
+		// A runtime that is assumed, or must not be touched, is a fixed one.
+		r = cmd_list(&c, strcmp(cmd, "outdated") == 0, json, opts.no_runtime || k_env.assume_runtime != NULL);
 	} else if (plan_verb) {
 		static struct dxr_plan p;
 		char hint[200];
-		dxr_make_plan(&c, &k_env, for_c, min_runtime, DXR_PLAN_ENSURE, &p);
+		if (use_default) {
+			dxr_make_default_plan(&c, &k_env, &opts, &p);
+		} else {
+			dxr_make_plan(&c, &k_env, for_c, min_runtime, DXR_PLAN_ENSURE, &opts, &p);
+		}
 		if (strcmp(cmd, "plan") == 0) {
 			if (json) {
 				char *s = dxr_plan_json(&p);
@@ -1225,19 +1273,34 @@ main(int argc, char **argv)
 	} else if (strcmp(cmd, "install") == 0) {
 		static struct dxr_plan p;
 		char hint[200];
-		dxr_make_plan(&c, &k_env, arg, min_runtime, DXR_PLAN_INSTALL, &p);
-		dxr_plan_text(&p, stdout);
+		const char *what = use_default ? "the default set" : arg;
+		if (use_default) {
+			// The recommended set plus high-confidence hardware matches. An
+			// item of the set that cannot be installed here is listed as
+			// skipped in the plan and does not fail the rest.
+			dxr_make_default_plan(&c, &k_env, &opts, &p);
+		} else {
+			dxr_make_plan(&c, &k_env, arg, min_runtime, DXR_PLAN_INSTALL, &opts, &p);
+		}
+		if (json) {
+			char *js = dxr_plan_json(&p);
+			printf("%s\n", js);
+			(void)fflush(stdout);
+			cJSON_free(js);
+		} else {
+			dxr_plan_text(&p, stdout);
+		}
 		if (p.gate == DXR_GET_INCOMPATIBLE) {
-			dxr_log("%s: not compatible -- %s\n", arg, p.gate_reason);
+			dxr_log("%s: not compatible -- %s\n", what, p.gate_reason);
 			r = DXR_GET_INCOMPATIBLE;
 			goto done;
 		}
 		if (p.todo == 0 && p.gate == DXR_GET_OK) {
 			for (int i = 0; i < p.n; i++) {
-				if (p.steps[i].is_target) {
+				if (p.steps[i].is_target && p.steps[i].state == DXR_ST_OK) {
 					dxr_log(
 					    "%s: %s installed, catalog has %s -- nothing to do (never downgrades)\n",
-					    arg, p.steps[i].installed,
+					    p.steps[i].component, p.steps[i].installed,
 					    p.steps[i].target ? p.steps[i].target : "no build");
 				}
 			}
@@ -1250,11 +1313,11 @@ main(int argc, char **argv)
 			goto done;
 		}
 		if (p.gate == DXR_GET_NOT_FETCHABLE) {
-			dxr_log("%s: nothing fetchable in the catalog -- %s\n", arg, p.gate_reason);
+			dxr_log("%s: nothing fetchable in the catalog -- %s\n", what, p.gate_reason);
 			r = DXR_GET_NOT_FETCHABLE;
 			goto done;
 		}
-		(void)snprintf(hint, sizeof(hint), "dxr-get install %s", arg);
+		(void)snprintf(hint, sizeof(hint), "dxr-get install %s", use_default ? "--default" : arg);
 		r = execute_plan(&c, &p, no_start, hint);
 	} else { // fetch
 		const cJSON *item = dxr_item_find(&c, arg);

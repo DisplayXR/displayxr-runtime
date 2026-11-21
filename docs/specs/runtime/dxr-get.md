@@ -21,9 +21,9 @@ The code has two halves:
 ## Commands
 
 ```
-dxr-get [--catalog <url|file>] plan --for <item> [--min-runtime X.Y.Z] [--json]
+dxr-get [--catalog <url|file>] plan --for <item> | --default [--min-runtime X.Y.Z] [--json]
 dxr-get [--catalog <url|file>] ensure-for <item> [--min-runtime X.Y.Z] [--yes] [--no-start-service]
-dxr-get [--catalog <url|file>] install <item> [--yes] [--no-start-service]
+dxr-get [--catalog <url|file>] install <item> | --default [--yes] [--json] [--no-start-service]
 dxr-get [--catalog <url|file>] fetch <item> [--out <dir>]
 dxr-get [--catalog <url|file>] detect [--json]
 dxr-get [--catalog <url|file>] catalog
@@ -32,6 +32,15 @@ dxr-get [--catalog <url|file>] outdated [--json]
 dxr-get list --installed [--json]
 dxr-get uninstall <id> [--json] [--no-start-service]
 ```
+
+Options for callers that are themselves installers:
+
+| Option | Verbs | Meaning |
+|---|---|---|
+| `--no-runtime` | `plan`, `ensure-for`, `install`, `list` | never install or upgrade the runtime itself. § The runtime installer |
+| `--assume-runtime X.Y.Z` | `list`, `plan` (accepted by `ensure-for` and `install` too) | answer as if runtime `X.Y.Z` were installed, whatever the machine has |
+| `--assume-abi <class>=<major>` | with `--assume-runtime` | the assumed runtime implements that major of that class ABI. Repeatable |
+| `--default` | `plan`, `install` | stands in for the item: the catalog's recommended set plus hardware matches. § install --default |
 
 `<item>` is a catalog id (`dxr-get list` shows them) or one of an item's `aliases`. The
 schema-1 names `runtime`, `leia_plugin` and `browser` keep working, with either schema.
@@ -44,6 +53,7 @@ path, `detect`, `catalog`, `list`, `outdated` and the `--json` documents.
 | `plan --for X` | yes | no | prints what `ensure-for X` would do. Changes nothing |
 | `ensure-for X` | yes | when something must be installed | installs what X **needs**, not X itself |
 | `install X` | yes | when something must be installed | installs X **and** what it needs |
+| `install --default` | yes | when something must be installed | installs the recommended set and the hardware matches |
 | `fetch X` | yes | no | downloads and verifies X's installer, prints its path |
 | `detect` | yes | no | shows the monitor EDID ids and which items' detect rules match |
 | `catalog` | yes | no | prints the catalog document as fetched |
@@ -85,6 +95,28 @@ stops. It does not install `X` itself (the caller is doing that), and it is not 
 `X`, brought to the catalog's version. It does nothing when `X` is installed at or above the
 catalog's version, and it never downgrades. Hardware detection plays no part: only what `X`
 requires is installed with it.
+
+### install --default
+
+For a bundle or a setup program that has no component page of its own. One call installs:
+
+- every item the catalog marks `recommended` (the open conversion provider), and
+- every item whose `detect` rules match this machine with **high** confidence (the display
+  processor for the panel that is attached),
+
+each with what it requires, in the usual order. The runtime item itself is never part of the
+set; it is installed or upgraded only as a prerequisite, and not at all with `--no-runtime`.
+
+Every candidate is judged alone first. One that cannot be installed here (not compatible with
+the runtime, nothing fetchable, needs a runtime upgrade that `--no-runtime` forbids) is listed
+in the plan as skipped, with the reason, and **does not fail the rest**: the exit code is 0
+when everything that could be installed was. Skip-if-current applies to each item, so a
+second run downloads nothing. With no connection the result is the offline one (exit 10, what
+was skipped, the command to run later). A schema-1 catalog has no `recommended` flag, so on
+the fallback only hardware matches are selected.
+
+`plan --default [--json]` prints the same plan without installing. `install … --json` prints
+the plan as JSON instead of text, for both forms of `install`.
 
 ### plan
 
@@ -157,9 +189,30 @@ but the catalog has no build to compare with). It includes components that were 
 their own installers, because the installed version is read from the machine, not from a
 receipt. `outdated` is the same list filtered to `outdated` and `rebuilt`. Both exit 0.
 
-`--json` gives `{"schema":2,"items":[…]}` or `{"schema":2,"outdated":[…]}`, each entry with
-`id`, `name`, `class`, `registered_id`, `publisher`, `tier`, `installed` (or null),
-`available` (or null), `state`, `installable`, `receipt` and, for a link-out, `listing`.
+`--json` gives `{"schema":2,"items":[…]}` or `{"schema":2,"outdated":[…]}`. One call answers
+a setup page: no second fetch is needed for detection, sizes or compatibility.
+
+| Field | Meaning |
+|---|---|
+| `id`, `name`, `class`, `registered_id`, `publisher`, `tier` | from the catalog item |
+| `installed`, `available` | the installed version and the catalog's, or null |
+| `state` | as above |
+| `installable` | the catalog has a signed Windows build of it |
+| `receipt` | `dxr-get` installed it |
+| `listing` | for a link-out: where to get it |
+| `summary` | the catalog's one-line description, when it has one |
+| `aliases` | other names the item answers to (the schema-1 name). Always an array |
+| `recommended` | the catalog's flag |
+| `detected` | `high`, `low` or `none`: the best confidence among the item's detect rules that match this machine. `evidence` says what matched |
+| `size` | bytes of the item's own asset |
+| `download` | bytes `install <id>` would still fetch **for this item**: its asset plus the installer assets of its unmet external prerequisites, minus what the download cache holds. `0` when nothing would be installed. The runtime and other required items are not included; they have rows of their own |
+| `compatible` | whether `install <id>` would be allowed by the runtime range and class ABI rules (§ Compatibility gating). `incompatible_reason` is the message when it is not |
+| `prerequisites` | one entry per external prerequisite: `name`, `met`, `installable` (it carries its own installer), `info_url` |
+
+`compatible` is judged the way `install` judges it, so by default a runtime that is too old
+for the item is not a reason: `install` would upgrade it. With `--no-runtime` or
+`--assume-runtime` the runtime is taken as fixed, and an item that needs a newer one is not
+compatible. The fields that existed before these were added are unchanged.
 
 `list --installed` reads the install receipts and nothing else. It needs no catalog and no
 network. `--json` gives `{"installed":[…]}` with `id`, `name`, `class`, `publisher`,
@@ -188,6 +241,30 @@ network: everything comes from the receipt.
 
 External prerequisites installed on the way are not uninstalled and get no receipt: they
 have their own licences and other software may depend on them.
+
+## The runtime installer
+
+The runtime installer shows catalog items on its component page and installs the chosen ones
+after its own files are in place. Two options exist for it.
+
+**`--assume-runtime X.Y.Z`** makes `list` and `plan` answer for the runtime that is about to
+be installed instead of the one on the machine: the runtime's installed version is taken to
+be `X.Y.Z`, and the class ABI values in the registry, which describe the runtime installed
+*now*, are ignored. The class ABI of the assumed runtime comes from `--assume-abi
+<class>=<major>` (the installer has those numbers; it writes the same ones to
+`Runtime\Abi`), else from the catalog's runtime item when `X.Y.Z` is exactly the version it
+describes, else it is not checked.
+
+```
+dxr-get list --json --assume-runtime 2.70.0 --assume-abi display_processor=5 --assume-abi conversion_provider=1
+```
+
+**`--no-runtime`** forbids installing or upgrading the runtime itself. `dxr-get` must not
+start a second runtime installer from inside the first. A plan that would need to move the
+runtime is refused instead: exit **41**, with a message that names the version needed, the
+version present and the switch. Nothing is downloaded. An item the present runtime already
+satisfies installs normally. `install runtime --no-runtime` is refused the same way unless
+the runtime is already at the catalog's version.
 
 ## Which catalog
 
@@ -284,7 +361,7 @@ After an item's installer exits 0, `dxr-get` writes a receipt under
 | `SourceUrl` | the asset's first URL |
 | `Sha256`, `File` | the asset's digest and file name |
 | `InstallTime` | UTC, `YYYY-MM-DDTHH:MM:SSZ` |
-| `UninstallCommand` | the complete command line `uninstall` runs. Read **at install time** from where the catalog's `uninstall` rule points (`registry_command`: the registry value, then its `args`). Empty when the catalog gives no `uninstall` rule |
+| `UninstallCommand` | the complete command line `uninstall` runs. Read **at install time** from where the catalog's `uninstall` rule points (`registry_command`: the registry value, then its `args`). The value is looked for in the 64-bit registry view, then in the 32-bit one, because a 32-bit installer writes its Add/Remove Programs entry there. Empty when the catalog gives no `uninstall` rule |
 | `VersionPath` | the registry value that holds the item's installed version |
 | `Requires` | comma-separated ids of the items this one required (`runtime` for a runtime floor) |
 
@@ -297,8 +374,14 @@ gives nothing to read, from the receipt.
 A receipt exists only for what `dxr-get` installed. A component installed by its own
 installer or by the bundle has none: it shows in `list` and `outdated`, not in
 `list --installed`, and `uninstall` answers 42 for it. The generator emits no `uninstall`
-rule for the three first-party components today, so their receipts carry no uninstall
-command and `uninstall` answers 43 for them until the catalog gains the rule.
+rule for the first-party components today, so their receipts carry no uninstall command and
+`uninstall` answers 43 for them until the catalog gains the rule. It is to be added for the
+Leia plug-in and the browser, not for the runtime; the values their installers write are:
+
+| Item | `uninstall.path` | `args` |
+|---|---|---|
+| `leia-sr` | `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRLeiaSR\UninstallString` | `["/S"]` |
+| `browser` | `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXR Browser\UninstallString` | `["/S"]` |
 
 ## Exit codes
 
@@ -401,7 +484,7 @@ Their behaviour and exit codes are the schema-1 tool's, with these deliberate di
 
 | Verb | Before | Now |
 |---|---|---|
-| `install X` | installed X only | installs what X requires first (a missing or too-old runtime), and stops and restarts the service around a component the runtime loads |
+| `install X` | installed X only | installs what X requires first (a missing or too-old runtime; `--no-runtime` turns that into exit 41), and stops and restarts the service around a component the runtime loads |
 | `plan` (text) | printed only what needed work | also prints one line per component that needs nothing |
 | `plan --json` | the schema-1 fields | the same fields in the same order, plus new ones after them |
 | `ensure-for`, `install` | no record | write a receipt per installed item |

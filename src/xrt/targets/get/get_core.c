@@ -428,11 +428,28 @@ dxr_installed_path(const cJSON *item, char *out, size_t out_size)
 	return out[0] != '\0';
 }
 
+//! The installed runtime's version when the catalog has no runtime item to say where it is.
+static bool
+runtime_installed(const struct dxr_env *env, char *out, size_t out_size)
+{
+	out[0] = '\0';
+	if (env->assume_runtime != NULL) {
+		copy(out, out_size, env->assume_runtime);
+		return out[0] != '\0';
+	}
+	return env->reg_sz != NULL && env->reg_sz(env->user, RUNTIME_VERSION_PATH, out, out_size) && out[0] != '\0';
+}
+
 bool
 dxr_installed_version(const struct dxr_env *env, const cJSON *item, char *out, size_t out_size)
 {
 	char path[512];
 	out[0] = '\0';
+	const char *cls = dxr_item_class(item);
+	if (env->assume_runtime != NULL && cls != NULL && strcmp(cls, "runtime") == 0) {
+		copy(out, out_size, env->assume_runtime);
+		return out[0] != '\0';
+	}
 	if (dxr_installed_path(item, path, sizeof(path))) {
 		return env->reg_sz != NULL && env->reg_sz(env->user, path, out, out_size) && out[0] != '\0';
 	}
@@ -648,6 +665,7 @@ struct build
 	const struct dxr_catalog *c;
 	const struct dxr_env *env;
 	struct dxr_plan *p;
+	bool no_runtime;
 	const cJSON *runtime;
 	struct node nodes[DXR_MAX_STEPS];
 	int n;
@@ -850,10 +868,19 @@ static bool
 runtime_abi(struct build *b, const char *item_class, const char *rt_eff, bool rt_moves, int *lo, int *hi)
 {
 	uint32_t v = 0;
-	// The installed runtime publishes its own majors; that is the truth while
-	// the runtime is not being replaced in this pass.
-	if (!rt_moves && b->env->reg_dword != NULL &&
-	    b->env->reg_dword(b->env->user, RUNTIME_ABI_KEY, item_class, &v)) {
+	if (!rt_moves && b->env->assume_runtime != NULL) {
+		// An assumed runtime: only the caller knows what it implements. What
+		// the registry says describes the runtime that is installed NOW.
+		for (int i = 0; i < b->env->n_assume_abi; i++) {
+			if (strcmp(b->env->assume_abi[i].item_class, item_class) == 0) {
+				*lo = *hi = b->env->assume_abi[i].major;
+				return true;
+			}
+		}
+	} else if (!rt_moves && b->env->reg_dword != NULL &&
+	           b->env->reg_dword(b->env->user, RUNTIME_ABI_KEY, item_class, &v)) {
+		// The installed runtime publishes its own majors; that is the truth
+		// while the runtime is not being replaced in this pass.
 		*lo = *hi = (int)v;
 		return true;
 	}
@@ -944,31 +971,62 @@ incompatible(struct build *b,
 	return false;
 }
 
+//! What is still to fetch for each step, and the plan's totals. Run once, when the steps are final.
 static void
-cache_and_totals(struct build *b, struct dxr_step *s)
+cache_and_totals(const struct dxr_env *env, struct dxr_plan *p)
 {
-	s->download = s->size;
-	if (!dxr_step_needs_work(s)) {
-		return;
+	p->total_size = 0;
+	p->total_download = 0;
+	p->todo = 0;
+	for (int i = 0; i < p->n; i++) {
+		struct dxr_step *s = &p->steps[i];
+		s->download = s->size;
+		if (!dxr_step_needs_work(s)) {
+			continue;
+		}
+		const char *sha = jstr(s->asset, "sha256"), *file = jstr(s->asset, "file");
+		if (env->cached_bytes != NULL && sha != NULL && file != NULL) {
+			uint64_t got = env->cached_bytes(env->user, sha, file, (uint64_t)s->size);
+			s->download = (double)got >= s->size ? 0 : s->size - (double)got;
+		}
+		p->total_size += s->size;
+		p->total_download += s->download;
+		p->todo++;
 	}
-	const char *sha = jstr(s->asset, "sha256"), *file = jstr(s->asset, "file");
-	if (b->env->cached_bytes != NULL && sha != NULL && file != NULL) {
-		uint64_t got = b->env->cached_bytes(b->env->user, sha, file, (uint64_t)s->size);
-		s->download = (double)got >= s->size ? 0 : s->size - (double)got;
-	}
-	b->p->total_size += s->size;
-	b->p->total_download += s->download;
-	b->p->todo++;
 }
 
 static void
 push_step(struct build *b, const struct dxr_step *s)
 {
 	if (b->p->n < DXR_MAX_STEPS) {
-		b->p->steps[b->p->n] = *s;
-		cache_and_totals(b, &b->p->steps[b->p->n]);
-		b->p->n++;
+		b->p->steps[b->p->n++] = *s;
 	}
+}
+
+//! `--no-runtime`: the runtime step that would need an installer run is refused instead.
+static void
+refuse_runtime_step(struct build *b, struct dxr_step *s, const char *who)
+{
+	char buf[640];
+	if (b->rt_floor != NULL && s->installed[0] != '\0') {
+		(void)snprintf(buf, sizeof(buf),
+		               "%s needs DisplayXR runtime %s or newer; this machine has %s, and the runtime is not "
+		               "installed or upgraded in this run (--no-runtime)",
+		               who, b->rt_floor, s->installed);
+	} else if (s->installed[0] != '\0') {
+		(void)snprintf(buf, sizeof(buf),
+		               "DisplayXR runtime %s is installed, and the runtime is not upgraded in this run "
+		               "(--no-runtime)",
+		               s->installed);
+	} else {
+		(void)snprintf(buf, sizeof(buf),
+		               "%s needs the DisplayXR runtime, which is not installed, and the runtime is not "
+		               "installed in this run (--no-runtime)",
+		               who);
+	}
+	s->state = DXR_ST_NOT_FETCHABLE;
+	copy(s->reason, sizeof(s->reason), "not installed or upgraded in this run (--no-runtime)");
+	set_gate(b->p, DXR_GET_INCOMPATIBLE, buf);
 }
 
 /*!
@@ -1029,15 +1087,25 @@ plan_externals(struct build *b, const cJSON *item, bool install_assets)
 	}
 }
 
-void
-dxr_make_plan(const struct dxr_catalog *c,
-              const struct dxr_env *env,
-              const char *for_name,
-              const char *min_runtime,
-              enum dxr_plan_mode mode,
-              struct dxr_plan *p)
+/*!
+ * Builds a plan. DXR_PLAN_ENSURE: for the one item @p targets[0] (may be NULL:
+ * an id the catalog does not know still gets its runtime looked at).
+ * DXR_PLAN_INSTALL: for every item of @p targets, each with a reason in
+ * @p whys (may be NULL).
+ */
+static void
+build_plan(const struct dxr_catalog *c,
+           const struct dxr_env *env,
+           const char *for_name,
+           const cJSON *const *targets,
+           const char *const *whys,
+           int n_targets,
+           const char *min_runtime,
+           enum dxr_plan_mode mode,
+           const struct dxr_plan_opts *opts,
+           struct dxr_plan *p)
 {
-	// Too large for the stack of a small tool; the plan is built once per run.
+	// Too large for the stack of a small tool.
 	static struct build bs;
 	struct build *b = &bs;
 	memset(b, 0, sizeof(*b));
@@ -1047,8 +1115,9 @@ dxr_make_plan(const struct dxr_catalog *c,
 	b->c = c;
 	b->env = env;
 	b->p = p;
+	b->no_runtime = opts != NULL && opts->no_runtime;
 	b->runtime = dxr_runtime_item(c);
-	const cJSON *x = dxr_item_find(c, for_name);
+	const cJSON *x = n_targets == 1 ? targets[0] : NULL;
 	char buf[640], note[160];
 
 	if (mode == DXR_PLAN_ENSURE) {
@@ -1074,12 +1143,9 @@ dxr_make_plan(const struct dxr_catalog *c,
 			collect(b, it, NULL, false, false, false, buf);
 		}
 	} else {
-		if (x == NULL) {
-			(void)snprintf(buf, sizeof(buf), "\"%s\" is not in the catalog", for_name ? for_name : "");
-			set_gate(p, DXR_GET_NOT_FETCHABLE, buf);
-			return;
+		for (int i = 0; i < n_targets; i++) {
+			collect(b, targets[i], NULL, true, true, true, whys != NULL && whys[i] != NULL ? whys[i] : "");
 		}
-		collect(b, x, NULL, true, true, true, "");
 		raise_floor(b, min_runtime, false, x);
 	}
 
@@ -1102,16 +1168,18 @@ dxr_make_plan(const struct dxr_catalog *c,
 			if (b->rt_floor != NULL) {
 				(void)snprintf(s.required, sizeof(s.required), ">=%s", b->rt_floor);
 			}
-			const bool have =
-			    env->reg_sz != NULL &&
-			    env->reg_sz(env->user, RUNTIME_VERSION_PATH, s.installed, sizeof(s.installed)) &&
-			    s.installed[0] != '\0';
+			const bool have = runtime_installed(env, s.installed, sizeof(s.installed));
 			if (!have || (b->rt_floor != NULL && dxr_vercmp(s.installed, b->rt_floor) < 0)) {
 				s.state = DXR_ST_NOT_FETCHABLE;
 				copy(s.reason, sizeof(s.reason), "no signed Windows build in the catalog");
 			}
 		}
 		s.needed = true;
+		if (b->no_runtime && dxr_step_needs_work(&s)) {
+			refuse_runtime_step(b, &s,
+			                    b->rt_floor_owner != NULL ? dxr_item_label(b->rt_floor_owner)
+			                                              : (for_name ? for_name : "this item"));
+		}
 		rt_moves = dxr_step_needs_work(&s);
 		copy(rt_eff, sizeof(rt_eff), rt_moves ? s.target : s.installed);
 		if (s.state == DXR_ST_NOT_FETCHABLE) {
@@ -1131,8 +1199,8 @@ dxr_make_plan(const struct dxr_catalog *c,
 		push_step(b, &s);
 	} else if (b->runtime != NULL) {
 		(void)dxr_installed_version(env, b->runtime, rt_eff, sizeof(rt_eff));
-	} else if (env->reg_sz != NULL) {
-		(void)env->reg_sz(env->user, RUNTIME_VERSION_PATH, rt_eff, sizeof(rt_eff));
+	} else {
+		(void)runtime_installed(env, rt_eff, sizeof(rt_eff));
 	}
 
 	// `ensure-for X`: X itself is the caller's to install, but whether it can
@@ -1158,6 +1226,9 @@ dxr_make_plan(const struct dxr_catalog *c,
 			append_reason(&s, nd->why);
 		}
 		if (is_runtime) {
+			if (b->no_runtime && dxr_step_needs_work(&s)) {
+				refuse_runtime_step(b, &s, s.label);
+			}
 			rt_moves = dxr_step_needs_work(&s);
 			copy(rt_eff, sizeof(rt_eff), rt_moves ? s.target : s.installed);
 		} else if (incompatible(b, nd->item, rt_eff, rt_moves, buf, sizeof(buf), note, sizeof(note))) {
@@ -1176,6 +1247,92 @@ dxr_make_plan(const struct dxr_catalog *c,
 		plan_externals(b, nd->item, dxr_step_needs_work(&s));
 		push_step(b, &s);
 	}
+	cache_and_totals(env, p);
+}
+
+void
+dxr_make_plan(const struct dxr_catalog *c,
+              const struct dxr_env *env,
+              const char *for_name,
+              const char *min_runtime,
+              enum dxr_plan_mode mode,
+              const struct dxr_plan_opts *opts,
+              struct dxr_plan *p)
+{
+	const cJSON *x = dxr_item_find(c, for_name);
+	if (mode == DXR_PLAN_INSTALL && x == NULL) {
+		memset(p, 0, sizeof(*p));
+		p->for_name = for_name;
+		p->schema = c->schema;
+		(void)snprintf(p->gate_reason, sizeof(p->gate_reason), "\"%s\" is not in the catalog",
+		               for_name ? for_name : "");
+		p->gate = DXR_GET_NOT_FETCHABLE;
+		return;
+	}
+	build_plan(c, env, for_name, &x, NULL, 1, min_runtime, mode, opts, p);
+}
+
+void
+dxr_make_default_plan(const struct dxr_catalog *c,
+                      const struct dxr_env *env,
+                      const struct dxr_plan_opts *opts,
+                      struct dxr_plan *p)
+{
+	static struct dxr_plan one;
+	static struct dxr_step skipped[DXR_MAX_STEPS];
+	static char whys[DXR_MAX_STEPS][256];
+	const cJSON *targets[DXR_MAX_STEPS];
+	const char *why_ptrs[DXR_MAX_STEPS];
+	int n = 0, n_skipped = 0;
+	const cJSON *it;
+	cJSON_ArrayForEach(it, c->items)
+	{
+		const char *id = dxr_item_id(it);
+		const cJSON *rec = cJSON_GetObjectItemCaseSensitive(it, "recommended");
+		char why[200];
+		if (id == NULL || dxr_item_find(c, id) != it || it == dxr_runtime_item(c) || n >= DXR_MAX_STEPS) {
+			continue;
+		}
+		// Hardware evidence outranks the recommendation as the stated reason.
+		if (dxr_detect_rules(jarr(it, "detect"), env, true, why, sizeof(why))) {
+			(void)snprintf(whys[n], sizeof(whys[n]), "detected: %s", why);
+		} else if (cJSON_IsTrue(rec)) {
+			copy(whys[n], sizeof(whys[n]), "recommended");
+		} else {
+			continue;
+		}
+		// Judged alone first, so one item that cannot be installed here does
+		// not raise a floor, or set a refusal, for the rest of the set.
+		dxr_make_plan(c, env, id, NULL, DXR_PLAN_INSTALL, opts, &one);
+		if (one.gate != DXR_GET_OK) {
+			struct dxr_step *s = &skipped[n_skipped++];
+			memset(s, 0, sizeof(*s));
+			s->hash_match = -1;
+			for (int i = 0; i < one.n; i++) {
+				if (one.steps[i].is_target) {
+					*s = one.steps[i];
+				}
+			}
+			s->item = it;
+			copy(s->component, sizeof(s->component), dxr_item_legacy_name(it));
+			copy(s->id, sizeof(s->id), id);
+			copy(s->label, sizeof(s->label), dxr_item_label(it));
+			s->state = one.gate == DXR_GET_INCOMPATIBLE ? DXR_ST_INCOMPATIBLE : DXR_ST_NOT_FETCHABLE;
+			s->needed = false;
+			s->is_target = true;
+			copy(s->reason, sizeof(s->reason), one.gate_reason);
+			append_reason(s, whys[n]);
+			continue;
+		}
+		targets[n] = it;
+		why_ptrs[n] = whys[n];
+		n++;
+	}
+	build_plan(c, env, "(default)", targets, why_ptrs, n, NULL, DXR_PLAN_INSTALL, opts, p);
+	for (int i = 0; i < n_skipped && p->n < DXR_MAX_STEPS; i++) {
+		p->steps[p->n++] = skipped[i];
+	}
+	cache_and_totals(env, p);
 }
 
 static const char *
@@ -1316,8 +1473,10 @@ dxr_plan_text(const struct dxr_plan *p, FILE *out)
  */
 
 cJSON *
-dxr_list_catalog(const struct dxr_catalog *c, const struct dxr_env *env, bool outdated_only)
+dxr_list_catalog(const struct dxr_catalog *c, const struct dxr_env *env, bool outdated_only, bool fixed_runtime)
 {
+	static struct dxr_plan plan;
+	const struct dxr_plan_opts opts = {fixed_runtime};
 	cJSON *arr = cJSON_CreateArray();
 	const cJSON *it;
 	cJSON_ArrayForEach(it, c->items)
@@ -1376,6 +1535,74 @@ dxr_list_catalog(const struct dxr_catalog *c, const struct dxr_env *env, bool ou
 		if (listing != NULL) {
 			cJSON_AddStringToObject(x, "listing", listing);
 		}
+
+		// What a setup page needs beyond the state, so one call answers it.
+		if (jstr(it, "summary")) {
+			cJSON_AddStringToObject(x, "summary", jstr(it, "summary"));
+		}
+		const cJSON *aliases = jarr(it, "aliases");
+		cJSON_AddItemToObject(x, "aliases", aliases ? cJSON_Duplicate(aliases, 1) : cJSON_CreateArray());
+		cJSON_AddBoolToObject(x, "recommended",
+		                      cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(it, "recommended")));
+		char why[256];
+		const cJSON *rules = jarr(it, "detect");
+		const bool high = dxr_detect_rules(rules, env, true, why, sizeof(why));
+		const bool any = high || dxr_detect_rules(rules, env, false, why, sizeof(why));
+		cJSON_AddStringToObject(x, "detected", high ? "high" : (any ? "low" : "none"));
+		if (any) {
+			cJSON_AddStringToObject(x, "evidence", why);
+		}
+		const cJSON *sz = asset ? cJSON_GetObjectItemCaseSensitive(asset, "size") : NULL;
+		cJSON_AddNumberToObject(x, "size", cJSON_IsNumber(sz) ? sz->valuedouble : 0);
+
+		// `install <id>` is the question: what would it fetch for this item, is
+		// the item compatible with the runtime, what does it need from outside.
+		// The runtime item is the yardstick, not a thing to judge against itself.
+		double download = 0;
+		bool compatible = true;
+		cJSON *pre = cJSON_CreateArray();
+		const char *cls = dxr_item_class(it);
+		if (cls != NULL && strcmp(cls, "runtime") == 0) {
+			if (asset != NULL && (strcmp(state, "not_installed") == 0 || strcmp(state, "outdated") == 0 ||
+			                      strcmp(state, "rebuilt") == 0)) {
+				download = cJSON_IsNumber(sz) ? sz->valuedouble : 0;
+				if (env->cached_bytes != NULL && sha != NULL && jstr(asset, "file") != NULL) {
+					double got = (double)env->cached_bytes(env->user, sha, jstr(asset, "file"),
+					                                       (uint64_t)download);
+					download = got >= download ? 0 : download - got;
+				}
+			}
+		} else {
+			dxr_make_plan(c, env, id, NULL, DXR_PLAN_INSTALL, &opts, &plan);
+			compatible = plan.gate != DXR_GET_INCOMPATIBLE;
+			for (int i = 0; i < plan.n; i++) {
+				// The item's own asset and its external prerequisites' assets;
+				// not the runtime or other items, which have rows of their own.
+				if (plan.steps[i].item == it && dxr_step_needs_work(&plan.steps[i])) {
+					download += plan.steps[i].download;
+				}
+			}
+			for (int i = 0; i < plan.n_prereqs; i++) {
+				const struct dxr_prereq *q = &plan.prereqs[i];
+				if (strcmp(q->for_id, id) != 0) {
+					continue;
+				}
+				cJSON *e = cJSON_CreateObject();
+				cJSON_AddStringToObject(e, "name", q->name);
+				cJSON_AddBoolToObject(e, "met", q->met);
+				cJSON_AddBoolToObject(e, "installable", q->installable);
+				if (q->info_url[0]) {
+					cJSON_AddStringToObject(e, "info_url", q->info_url);
+				}
+				cJSON_AddItemToArray(pre, e);
+			}
+		}
+		cJSON_AddNumberToObject(x, "download", compatible ? download : 0);
+		cJSON_AddBoolToObject(x, "compatible", compatible);
+		if (!compatible) {
+			cJSON_AddStringToObject(x, "incompatible_reason", plan.gate_reason);
+		}
+		cJSON_AddItemToObject(x, "prerequisites", pre);
 		cJSON_AddItemToArray(arr, x);
 	}
 	return arr;

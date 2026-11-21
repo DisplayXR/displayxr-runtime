@@ -89,6 +89,21 @@ struct dxr_env
 	bool (*receipt)(void *user, const char *id, struct dxr_receipt *out);
 	//! Bytes of this asset already in the download cache (complete or partial).
 	uint64_t (*cached_bytes)(void *user, const char *sha256, const char *file, uint64_t size);
+
+	/*!
+	 * `--assume-runtime X.Y.Z`: answer as if this runtime version were the one
+	 * installed, whatever the machine has. For a caller that is about to lay
+	 * that runtime down itself (the runtime installer) and wants to know what
+	 * is compatible with it. NULL = read the machine.
+	 */
+	const char *assume_runtime;
+	//! `--assume-abi <class>=<major>`: the class ABI majors of the assumed runtime.
+	struct
+	{
+		const char *item_class;
+		int major;
+	} assume_abi[8];
+	int n_assume_abi;
 };
 
 /*
@@ -231,6 +246,16 @@ enum dxr_plan_mode
 	DXR_PLAN_INSTALL, //!< X and its prerequisites
 };
 
+struct dxr_plan_opts
+{
+	/*!
+	 * `--no-runtime`: never install or upgrade the runtime itself. A plan that
+	 * would need to is refused (DXR_GET_INCOMPATIBLE) instead. For the runtime
+	 * installer, which must not start a second runtime installer inside itself.
+	 */
+	bool no_runtime;
+};
+
 struct dxr_plan
 {
 	const char *for_name;
@@ -257,7 +282,21 @@ dxr_make_plan(const struct dxr_catalog *c,
               const char *for_name,
               const char *min_runtime,
               enum dxr_plan_mode mode,
+              const struct dxr_plan_opts *opts,
               struct dxr_plan *p);
+
+/*!
+ * `install --default`: the catalog's recommended set plus every item whose
+ * detect rules match this machine with high confidence, and what they
+ * require. Each candidate is judged on its own first: one that cannot be
+ * installed here (not compatible, nothing fetchable) is listed as skipped
+ * and does not fail the others. The runtime item itself is never selected.
+ */
+void
+dxr_make_default_plan(const struct dxr_catalog *c,
+                      const struct dxr_env *env,
+                      const struct dxr_plan_opts *opts,
+                      struct dxr_plan *p);
 
 static inline bool
 dxr_step_needs_work(const struct dxr_step *s)
@@ -276,9 +315,15 @@ dxr_plan_text(const struct dxr_plan *p, FILE *out);
  * Inventory.
  */
 
-//! `list`: every catalog item with its installed state. @p outdated_only: `outdated`.
+/*!
+ * `list`: every catalog item with its installed state, what installing it
+ * would download, whether it is compatible with this machine's runtime, and
+ * whether its detect rules match. @p outdated_only: `outdated`.
+ * @p fixed_runtime: judge compatibility against the runtime as it is (or as
+ * assumed), without counting on an upgrade of it.
+ */
 cJSON *
-dxr_list_catalog(const struct dxr_catalog *c, const struct dxr_env *env, bool outdated_only);
+dxr_list_catalog(const struct dxr_catalog *c, const struct dxr_env *env, bool outdated_only, bool fixed_runtime);
 
 //! `list --installed`: the receipts, no catalog needed.
 cJSON *
