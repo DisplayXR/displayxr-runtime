@@ -21,9 +21,11 @@ detect rules, runtime floor and registry key. A release without one falls back t
 the old per-vendor parsing (Leia: its EDID header and installer CMake), so the
 schema-1 bytes for today's releases are unchanged.
 
-`--out-v2` additionally writes the schema-2 document (ADR-064, spec §Schema 2) for
-the same components. It is derived from the schema-1 catalog of the same run and
-never changes the schema-1 bytes. Nothing publishes it yet.
+`--out-v2` additionally writes the schema-2 document (ADR-064, spec §Schema 2). The
+three schema-1 components are derived from the schema-1 catalog of the same run,
+which is written unchanged; the components in V2_ONLY_COMPONENTS (providers that
+schema 1 cannot describe: an external prerequisite, a maximum runtime) are added
+from their own releases. Nothing publishes it yet.
 
 Signing key: env DXR_CATALOG_ED25519_KEY = base64 of the 32-byte Ed25519 seed.
 The matching public key is hardcoded below (PUBLIC_KEYS) and compiled into dxr-get.
@@ -90,6 +92,50 @@ COMPONENTS = [
         "asset": "DisplayXR-Browser-Setup-{v}.exe",
         "args": ["/S"],
         "registry_version": "HKLM\\Software\\DisplayXR\\Browser\\Version",
+    },
+]
+
+# Components listed in schema 2 ONLY. Schema 1 is frozen at the three above:
+# deployed dxr-get builds know those names and ignore any other, and schema 1
+# cannot say what these need said (an external prerequisite, a maximum runtime).
+# A schema-1 client would read the Ultraleap provider's floor as "any newer
+# runtime", which is exactly what its exact pin forbids (ADR-063).
+#
+# Same keys as COMPONENTS, plus:
+#   asset_re       regex over the release's asset names, for an asset whose name
+#                  carries more than the version ({v} is the escaped version)
+#   floor          where the provider declares its minimum runtime, read at the
+#                  released tag: {"file", "cmake_set": <variable>}
+#   runtime_exact  where the provider pins the ONE runtime it was built at, read
+#                  at the released tag: the item then carries runtime.min == max
+# Nothing here is a version: every number is read from the release.
+V2_ONLY_COMPONENTS = [
+    {
+        "name": "conversion_open",
+        "pin": "conversion_open",
+        "repo": "displayxr-conversion-open",
+        "asset": "DisplayXROpenConversionSetup-{v}.exe",
+        "args": ["/S"],
+        "registry_version": "HKLM\\Software\\DisplayXR\\Plugins\\OpenConversion\\Version",
+    },
+    {
+        "name": "leia_conversion",
+        "pin": "leia_conversion",
+        "repo": "displayxr-leia-conversion",
+        "asset": "DisplayXRLeiaConversionSetup-{v}.exe",
+        "args": ["/S"],
+        "registry_version": "HKLM\\Software\\DisplayXR\\Plugins\\LeiaConversion\\Version",
+        "floor": {"file": "CMakeLists.txt", "cmake_set": "DXR_CONV_MIN_RUNTIME_VERSION"},
+    },
+    {
+        "name": "ultraleap",
+        "pin": "ultraleap",
+        "repo": "displayxr-ultraleap",
+        # DisplayXRUltraleapSetup-<version>.<build>.exe
+        "asset_re": r"DisplayXRUltraleapSetup-{v}\.(\d+)\.exe",
+        "args": ["/S"],
+        "registry_version": "HKLM\\Software\\DisplayXR\\Plugins\\Ultraleap\\Version",
+        "runtime_exact": {"file": "CMakeLists.txt", "cmake_set": "DXR_RUNTIME_GIT_TAG"},
     },
 ]
 
@@ -510,17 +556,20 @@ def fetch_detect_manifest(comp, tag):
 
 
 def windows_block(comp, version, verifier, download_dir, registry_version=None):
-    repo, asset_name = comp["repo"], comp["asset"].format(v=version)
+    repo = comp["repo"]
+    asset_name = comp["asset"].format(v=version) if "asset" in comp else None
     tag = "v" + version
     try:
         rel = api_json(f"/repos/{ORG}/{repo}/releases/tags/{tag}")
     except urllib.error.HTTPError as e:
         warn(f"{comp['name']}: release {repo}@{tag} not found (HTTP {e.code}); no windows block")
         return None
-    asset = next((a for a in rel.get("assets", []) if a.get("name") == asset_name), None)
+    asset = pick_asset(comp, version, rel.get("assets", []))
     if asset is None:
-        warn(f"{comp['name']}: {repo}@{tag} has no asset {asset_name}; no windows block")
+        wanted = asset_name or comp["asset_re"].format(v=re.escape(version))
+        warn(f"{comp['name']}: {repo}@{tag} has no asset {wanted}; no windows block")
         return None
+    asset_name = asset["name"]
 
     dest = os.path.join(download_dir, asset_name)
     if os.path.exists(dest) and os.path.getsize(dest) == asset["size"]:
@@ -556,6 +605,69 @@ def windows_block(comp, version, verifier, download_dir, registry_version=None):
         "args": list(comp["args"]),
         "registry_version": registry_version or comp["registry_version"],
     }
+
+
+def pick_asset(comp, version, assets):
+    """The release asset of a component: an exact name, or the highest build
+    matching `asset_re` (group 1 = the build number)."""
+    if "asset" in comp:
+        name = comp["asset"].format(v=version)
+        return next((a for a in assets if a.get("name") == name), None)
+    rx = re.compile(comp["asset_re"].format(v=re.escape(version)))
+    best = None
+    for a in assets:
+        m = rx.fullmatch(a.get("name", ""))
+        if m and (best is None or int(m.group(1)) > best[0]):
+            best = (int(m.group(1)), a)
+    return best[1] if best else None
+
+
+def cmake_set_value(repo, spec, tag):
+    """The literal a provider's CMake file sets a variable to at a tag, as X.Y.Z, or None."""
+    text = repo_file(repo, spec["file"], tag)
+    if text is None:
+        return None
+    # Line-anchored: a comment quoting the shape (`# ... set(KEY "vX.Y.Z"`) is not the value.
+    m = re.search(r'(?m)^[ \t]*set\(\s*' + re.escape(spec["cmake_set"]) + r'\s+"([^"]+)"', text)
+    if not m or not SEMVER_RE.match(m.group(1)):
+        warn(f"{repo}@{tag}: no usable {spec['cmake_set']} in {spec['file']}; omitted, not guessed")
+        return None
+    return SEMVER_RE.match(m.group(1)).group(1)
+
+
+def build_extra_components(versions, verifier, download_dir):
+    """Schema-2-only components, in the schema-1 component shape plus
+    `runtime_exact`. A component with no pin has no release yet: not listed."""
+    out = {}
+    for comp in V2_ONLY_COMPONENTS:
+        pin = versions.get(comp["pin"])
+        if pin is None:
+            info(f"{comp['name']}: no versions.json pin (no release yet); not listed")
+            continue
+        m = SEMVER_RE.match(pin)
+        if not m:
+            warn(f"versions.json[{comp['pin']}] = {pin!r} is not vX.Y.Z; component skipped")
+            continue
+        version = m.group(1)
+        tag = "v" + version
+        entry = {"recommended": version}
+        if "runtime_exact" in comp:
+            exact = cmake_set_value(comp["repo"], comp["runtime_exact"], tag)
+            if exact is None:
+                # Without the pin the item would read as "any runtime": never list that.
+                warn(f"{comp['name']}: its runtime pin is unreadable at {tag}; not listed")
+                continue
+            entry["runtime_exact"] = exact
+            entry["requires"] = {"runtime": ">=" + exact}
+        elif "floor" in comp:
+            floor = cmake_set_value(comp["repo"], comp["floor"], tag)
+            if floor:
+                entry["requires"] = {"runtime": ">=" + floor}
+        win = windows_block(comp, version, verifier, download_dir)
+        if win:
+            entry["windows"] = win
+        out[comp["name"]] = entry
+    return out
 
 
 def git_head():
@@ -687,6 +799,9 @@ V2_PUBLISHER = "displayxr"
 V2_PLATFORM_WINDOWS = "windows-x64"
 
 # Facts about the first-party components that schema 1 carries only implicitly.
+# `uninstall` is deliberately absent for the runtime: dxr-get never removes the
+# trunk. The three schema-2-only providers get theirs once their installers'
+# key names have been read from a release.
 # Keyed by the schema-1 component name (the versions.json field).
 V2_ITEMS = {
     "runtime": {
@@ -699,11 +814,73 @@ V2_ITEMS = {
         "class": "display_processor",
         "registered_id": "leia-sr",
         "name": "Leia SR display processor",
+        # Where the plug-in's own installer leaves its uninstall command (its
+        # Add/Remove Programs key, installer/DisplayXRLeiaSRInstaller.nsi).
+        "uninstall": {
+            "path": "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DisplayXRLeiaSR\\UninstallString",
+            "args": ["/S"],
+        },
     },
     "browser": {
         "id": "browser",
         "class": "app",
         "name": "DisplayXR Browser",
+        # The browser installer's Add/Remove Programs key (browser-pvt
+        # installer/DisplayXRBrowserInstaller.nsi, `!define ARP`).
+        "uninstall": {
+            "path": "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DisplayXR Browser\\UninstallString",
+            "args": ["/S"],
+        },
+    },
+    # --- schema 2 only (V2_ONLY_COMPONENTS) ---
+    "conversion_open": {
+        "id": "open-conversion",
+        "class": "conversion_provider",
+        "registered_id": "open-conversion",
+        "name": "Open conversion provider",
+        "summary": "2D-to-3D conversion with open models. Needs no vendor software.",
+        # ADR-064 §7: a setup UI pre-ticks it, so "Convert to 3D" exists on a
+        # machine whose display vendor ships no converter.
+        "recommended": True,
+    },
+    "leia_conversion": {
+        "id": "leia-conversion",
+        "class": "conversion_provider",
+        "registered_id": "leia-conversion",
+        "name": "Leia conversion provider",
+        "summary": "2D-to-3D conversion with Leia's NeurD module.",
+        # Declared and detected only (spec § Requires): NeurD has its own
+        # installer, licence and update channel; DisplayXR never fetches it.
+        # No info_url: its download page is not known here, and is not guessed.
+        "external": [
+            {
+                "kind": "external",
+                "name": "NeurD runtime (Leia)",
+                "min_version": "0.4.6",
+                "detect": [
+                    {"kind": "registry_sz_min", "key": "HKLM\\SOFTWARE\\LeiaInc\\NeurD",
+                     "value": "Version", "min": "0.4.6"},
+                ],
+            },
+        ],
+    },
+    "ultraleap": {
+        "id": "ultraleap",
+        "class": "input_provider",
+        "registered_id": "ultraleap",
+        "name": "Ultraleap hands",
+        "summary": "Hand tracking from an Ultraleap camera, as controllers and hand joints.",
+        "external": [
+            {
+                "kind": "external",
+                "name": "Ultraleap tracking software",
+                "detect": [
+                    {"kind": "file_exists",
+                     "path": "C:\\Program Files\\Ultraleap\\LeapSDK\\lib\\x64\\LeapC.dll"},
+                ],
+                "info_url": "https://www.ultraleap.com/downloads/",
+            },
+        ],
     },
 }
 
@@ -717,11 +894,16 @@ V2_REGISTERED_CLASSES = ("display_processor", "input_provider", "conversion_prov
 V2_RESERVED_IDS = ("edids", "usb", "display_plugins")
 V2_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)?$")
 V2_VERSION_REQ_RE = re.compile(r"^>=\d+\.\d+\.\d+$")
+V2_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 
-def v2_asset(win):
-    """Schema-1 `windows` block -> schema-2 asset. Same bytes, same signer, regrouped."""
-    return {
+def v2_asset(win, uninstall=None):
+    """Schema-1 `windows` block -> schema-2 asset. Same bytes, same signer, regrouped.
+
+    `uninstall` is the item's V2_ITEMS rule (schema 1 has no such field): where the
+    component's own installer leaves its uninstall command, which dxr-get copies
+    into the install receipt."""
+    asset = {
         "version": win["version"],
         "file": win["file"],
         "size": win["size"],
@@ -736,16 +918,24 @@ def v2_asset(win):
         },
         "installed": {"kind": "registry_sz", "path": win["registry_version"]},
     }
+    if uninstall:
+        asset["uninstall"] = {"kind": "registry_command", "path": uninstall["path"],
+                              "args": list(uninstall["args"])}
+    return asset
 
 
-def build_catalog_v2(v1, *, manifests=None):
-    """Schema-2 catalog for the components of a schema-1 catalog. Does not modify `v1`.
+def build_catalog_v2(v1, *, manifests=None, extra=None):
+    """Schema-2 catalog for the components of a schema-1 catalog, then `extra`
+    (build_extra_components: the schema-2-only ones). Modifies neither.
 
     `manifests` (component name -> validated displayxr-detect.json, as build_catalog
     collected them) names a display plug-in that V2_ITEMS does not know: its `id`
-    becomes the item id and registered_id, its `label` the item name (#2737)."""
+    becomes the item id and registered_id, its `label` the item name (#2737).
+
+    Both are keyword-only: a caller with one argument (make_test_catalog.py) gets
+    the three schema-1 components and nothing else."""
     items = []
-    for name, comp in v1.get("components", {}).items():
+    for name, comp in list(v1.get("components", {}).items()) + list((extra or {}).items()):
         meta = V2_ITEMS.get(name)
         man = (manifests or {}).get(name)
         if meta is None and comp.get("kind") == "display_plugin" and man and man.get("id"):
@@ -761,15 +951,26 @@ def build_catalog_v2(v1, *, manifests=None):
         if "registered_id" in meta:
             item["registered_id"] = meta["registered_id"]
         item["name"] = meta["name"]
+        if "summary" in meta:
+            item["summary"] = meta["summary"]
         item["publisher"] = V2_PUBLISHER
         item["version"] = comp["recommended"]
+        if "runtime_exact" in comp:
+            # Built at one runtime release and known-good only there (ADR-063).
+            item["runtime"] = {"min": comp["runtime_exact"], "max": comp["runtime_exact"]}
+        requires = []
         floor = comp.get("requires", {}).get("runtime")
         if floor:
-            item["requires"] = [{"kind": "runtime", "version": floor}]
+            requires.append({"kind": "runtime", "version": floor})
+        requires.extend(json.loads(json.dumps(meta.get("external", []))))  # deep copy
+        if requires:
+            item["requires"] = requires
         if "windows" in comp:
-            item["assets"] = {V2_PLATFORM_WINDOWS: v2_asset(comp["windows"])}
+            item["assets"] = {V2_PLATFORM_WINDOWS: v2_asset(comp["windows"], meta.get("uninstall"))}
         if "detect" in comp:
             item["detect"] = [dict(r) for r in comp["detect"]]
+        if meta.get("recommended"):
+            item["recommended"] = True
         items.append(item)
 
     return {
@@ -839,6 +1040,18 @@ def validate_v2(cat):
         pub = publishers.get(item.get("publisher"))
         if pub is None:
             problems.append(f"{where}: publisher {item.get('publisher')!r} is not in publishers")
+        rng = item.get("runtime")
+        if rng is not None:
+            lo, hi = rng.get("min"), rng.get("max")
+            for bound in (lo, hi):
+                if bound is not None and not V2_VERSION_RE.match(str(bound)):
+                    problems.append(f"{where}: runtime bound {bound!r} is not X.Y.Z")
+            if lo and hi and V2_VERSION_RE.match(lo) and V2_VERSION_RE.match(hi) \
+                    and tuple(map(int, lo.split("."))) > tuple(map(int, hi.split("."))):
+                problems.append(f"{where}: runtime.min {lo} is above runtime.max {hi}")
+            stated = [r.get("version") for r in item.get("requires", []) if r.get("kind") == "runtime"]
+            if lo and stated and stated != [">=" + lo]:
+                problems.append(f"{where}: runtime.min {lo} disagrees with requires runtime {stated}")
         for req in item.get("requires", []):
             kind = req.get("kind")
             if kind not in ("runtime", "item", "external"):
@@ -937,7 +1150,9 @@ def cmd_generate(args):
     if args.out_v2:
         if os.path.abspath(args.out_v2) == os.path.abspath(args.out):
             sys.exit("error: --out-v2 must be a different directory from --out")
-        catalog2 = build_catalog_v2(catalog, manifests=MANIFESTS)
+        extra = build_extra_components(versions, VERIFIERS[args.verifier], download_dir)
+        extra = build_extra_components(versions, VERIFIERS[args.verifier], download_dir)
+        catalog2 = build_catalog_v2(catalog, manifests=MANIFESTS, extra=extra)
         problems = validate_v2(catalog2)
         if problems:
             sys.exit("error: generated schema-2 catalog is invalid: " + "; ".join(problems))

@@ -681,10 +681,13 @@ Rules that follow:
   published at its URL for as long as a `dxr-get` that reads only schema 1 is in service (the
   browser installer embeds the `dxr-get` of its pinned runtime). `scripts/tests/test_gen_catalog.py`
   pins the bytes the generator writes for a fixed input.
-- **Schema 2 is derived, not regenerated.** `build_catalog_v2` is a pure function of the
-  schema-1 catalog of the same run: same serial, same assets, same hashes, same signer. It
-  does not download or verify anything a second time, so the two documents cannot disagree
-  about a file.
+- **Schema 2 is derived, not regenerated.** For the three schema-1 components,
+  `build_catalog_v2` is a pure function of the schema-1 catalog of the same run: same
+  serial, same assets, same hashes, same signer. It does not download or verify anything a
+  second time, so the two documents cannot disagree about a file.
+- **Schema 1 stays at three components.** Components that schema 1 cannot describe are
+  listed in schema 2 only (`V2_ONLY_COMPONENTS`, see [Generating it](#generating-it)). They
+  never enter the schema-1 document, so its bytes for a given input do not change.
 - **Serials.** Both documents carry the same serial. A schema-2 client keeps its rollback
   serial in its own value (`CatalogSerialV2`), so an older schema-1 catalog accepted by an
   old `dxr-get` on the same machine can never make it refuse a schema-2 catalog, or the
@@ -722,6 +725,34 @@ python scripts/tests/test_gen_catalog.py
 
 `--out-v2` must be a different directory from `--out`. Without `--out-v2` the generator
 behaves exactly as before; `publish-catalog.yml` does not pass it.
+
+**Components listed in schema 2 only.** `V2_ONLY_COMPONENTS` in the generator holds the
+first-party providers schema 1 has no words for. They are read from their own releases in
+the same run (`build_extra_components`), with the same rule as schema 1: an asset is listed
+only when its Authenticode signature is valid with a listed signer.
+
+| Pin (`versions.json`) | Item `id` | Class | What schema 1 could not say | Where the number comes from |
+|---|---|---|---|---|
+| `conversion_open` | `open-conversion` | `conversion_provider` | `recommended: true`, the converter a setup UI pre-ticks (ADR-064 §7) | no floor is declared by that repository, so none is written |
+| `leia_conversion` | `leia-conversion` | `conversion_provider` | an external prerequisite (the NeurD runtime), declared and detected only | floor = `DXR_CONV_MIN_RUNTIME_VERSION` in its `CMakeLists.txt` at the released tag |
+| `ultraleap` | `ultraleap` | `input_provider` | an **exact** runtime range and an external prerequisite (the Ultraleap tracking software) | `runtime.min == runtime.max` = `DXR_RUNTIME_GIT_TAG` in its `CMakeLists.txt` at the released tag |
+
+Rules that follow from "never guessed":
+
+- A component with no `versions.json` pin has no release yet and is not listed (and costs
+  no network access). `leia_conversion` and `ultraleap` are in that state today
+  (versions-json-autobump.md, "A component with no release yet").
+- If the Ultraleap provider's runtime pin cannot be read at its tag, the item is **not
+  listed at all**: without the range it would read as "works on any runtime".
+- The NeurD prerequisite carries no `info_url`, because its download page is not recorded
+  anywhere this generator reads.
+- The Ultraleap asset name carries a build number (`DisplayXRUltraleapSetup-<v>.<build>.exe`);
+  the highest build of the pinned version is taken.
+- There is no carry-forward for these components yet: it needs a previously *published*
+  schema-2 document, and none exists.
+
+The validator additionally checks `runtime`: both bounds are `X.Y.Z`, `min` is not above
+`max`, and `min` agrees with a `requires` entry of kind `runtime`.
 
 ### Display plug-in detect manifest
 

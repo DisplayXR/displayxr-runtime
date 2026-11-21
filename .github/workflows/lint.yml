@@ -398,3 +398,15 @@ jobs:
         # (docs/specs/runtime/dxr-get.md, "Validating on a test machine").
         # Hermetic; the signing case runs where `cryptography` is installed.
         run: python3 scripts/tests/test_make_test_catalog.py
+
+      - name: versions.json bump writer unit tests
+        # The write step of versions-bump.yml: an existing pin changes one value
+        # and nothing else, and a component with no release yet is ADDED by its
+        # first release's dispatch instead of being refused.
+        run: python3 scripts/tests/test_apply_versions_bump.py
+
+      - name: Component tables agree
+        # components.sh, its setup-displayxr.bat mirror, the bump writer's
+        # first-release list, the ABI gate and the catalog generator each keep
+        # a component table by hand; this is the one place they are compared.
+        run: python3 scripts/tests/test_component_tables.py

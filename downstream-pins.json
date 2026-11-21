@@ -24,15 +24,21 @@
         "              feature macro added/removed/redefined, a vtable (function-pointer) slot added/removed/",
         "              re-signed, or the plug-in ABI. Superset of abi. Catches ADR-020's append-only slot +",
         "              feature macro, which ships WITHOUT an ABI bump and which the abi gate cannot see.",
+        "  layout   -- repin when ANY byte changed in the include closure of the track's layout_headers. For a",
+        "              plug-in that shares raw, unversioned structs with the runtime (an input provider returning",
+        "              struct xrt_device, ADR-063), where a new field or enumerator changes the layout without",
+        "              touching a feature macro, a slot or the ABI major. Coarse on purpose: a comment edit triggers.",
         "  manual   -- human-owned, never touched.",
-        "Both automatic policies skip a release that would only raise the pin (and so the plug-in's runtime",
+        "The automatic policies skip a release that would only raise the pin (and so the plug-in's runtime",
         "floor) for no gain, and never move a pin backwards."
       ],
       "abi_headers": "Optional, abi policy only: the plug-in ABI headers the track is gated on (keys of scripts/check_plugin_abi.py ABI_HEADERS: xrt_plugin.h, xrt_input_plugin.h, xrt_conversion_plugin.h). Default: xrt_plugin.h alone. List xrt_conversion_plugin.h for a repo that ships a conversion provider (ADR-053), so a conversion-ABI major bump repins it.",
       "feature_headers": "Optional, features policy only: the runtime headers whose surface this track compiles against. Defaults to feature_surface.headers. Narrow it to what the track's build actually compiles, or a slot in an API the track never builds raises its floor for nothing.",
+      "layout_headers": "Required, layout policy only: the ROOT headers of the memory the track shares with the runtime. Their include closure (every #include \"xrt/...\", resolved under src/xrt/include) is compared byte for byte. A root may also be a non-xrt path (an aux header whose functions the plug-in imports).",
       "locations": "EVERY file the track's tag appears in. Written in ONE commit -- see atomicity note below.",
       "locations[].kind": "cmake_set  -> matches set(<key> \"<tag>\"   |  yaml_env -> matches <key>: <tag>"
     },
+    "runtime_tag_pins.<repo>.unpublished": "Optional, true: the repository is not readable yet (not pushed, or not public). Its tracks are skipped instead of failing runtime-pin-bump.yml when the pin cannot be read. Remove it once the repo is public; a readable pin is always evaluated normally.",
     "_atomicity": [
       "A track is an ATOMIC GROUP. Each downstream repo runs a 'Rule-5' CI step that",
       "hard-fails when its two pin locations disagree, so a bump MUST write every",
@@ -135,6 +141,45 @@
           "reason": "The repo vendors include/xrt/xrt_conversion_plugin.h, xrt_results.h and xrt_conv_wire.h verbatim and compiles against no runtime source, so the pin is metadata: the runtime tag the vendored headers match (a set(DXR_RUNTIME_GIT_TAG ...) literal in CMakeLists.txt). Gated on the conversion-provider ABI major alone, not on feature macros: the provider reads and writes every struct within its struct_size, so an append-only addition needs no repin. A repin PR must re-vendor the headers from the new tag in the same change; the bump only rewrites the literal.",
           "locations": [
             { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" }
+          ]
+        }
+      }
+    },
+    "displayxr-leia-conversion": {
+      "role": "Leia 2D-to-3D conversion provider (ADR-053), split out of displayxr-leia-plugin: compiles against the runtime's conversion-provider headers, loads the NeurD runtime by path",
+      "tracks": {
+        "all": {
+          "bump_when": "features",
+          "feature_headers": [
+            "src/xrt/include/xrt/xrt_conversion_plugin.h",
+            "src/xrt/include/xrt/xrt_component_settings.h"
+          ],
+          "reason": "The provider compiles against the runtime's conversion-provider contract (FetchContent at DXR_RUNTIME_GIT_TAG) on Windows and Linux from ONE pin: its workflows read the tag out of CMakeLists.txt, so there is one location and one track. The pin is the header the provider compiles against, not a floor (its installer's floor is the separate DXR_CONV_MIN_RUNTIME_VERSION, the first runtime with the conversion ABI), so a repin raises nothing a user sees. Gated on features over the two headers it implements: a conversion-ABI major bump repins it (features is a superset of abi for a header in ABI_HEADERS), and so does an appended slot or feature macro, which ADR-020 adds without an ABI bump and which the provider would otherwise compile out silently. Display-processor headers are deliberately absent: the provider has exactly one export and no display plug-in import.",
+          "locations": [
+            { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" }
+          ]
+        }
+      }
+    },
+    "displayxr-ultraleap": {
+      "role": "Ultraleap hands input provider (first out-of-tree hardware input provider; links runtime aux and returns raw struct xrt_device)",
+      "tracks": {
+        "all": {
+          "bump_when": "layout",
+          "layout_headers": [
+            "src/xrt/include/xrt/xrt_device.h",
+            "src/xrt/include/xrt/xrt_input_plugin.h",
+            "src/xrt/include/xrt/xrt_component_settings.h",
+            "src/xrt/include/xrt/xrt_results.h",
+            "src/xrt/include/xrt/xrt_tracking.h",
+            "src/xrt/auxiliary/util/u_logging.h",
+            "src/xrt/auxiliary/util/u_var.h"
+          ],
+          "reason": "The provider returns raw struct xrt_device, which the input ABI major does not cover (ADR-063): a binary is only known-good on the runtime release it was built at, its catalog item carries that exact runtime range, and its installer refuses any other runtime. So the question on a runtime release is not 'did a feature appear' but 'is the old build still valid', and only byte-identical shared headers answer yes. 'abi' never fires (the input ABI is 1 and stays 1); 'features' is blind to a field added to xrt_device and to an enumerator inserted in xrt_device_name / xrt_device_type / xrt_tracking_type. The roots are the ones the repo's own scripts/runtime_range.py hashes: the headers the runtime reads or writes through, plus the two aux headers whose functions the provider imports from the runtime library on Windows and macOS. A repin PR is therefore a request for a new provider release, not a formality. The repo also repeats the pin in catalog/ultraleap-hands.json, which no location kind can rewrite, so its own 'pin' CI job is red on the automatic PR until that file is edited in the same PR; the runtime's catalog generator derives the range from the CMake pin at the released tag, so the hand-written copy can go.",
+          "locations": [
+            { "file": "CMakeLists.txt",                "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" },
+            { "file": ".github/workflows/build.yml",   "kind": "yaml_env",  "key": "RUNTIME_REF" },
+            { "file": ".github/workflows/release.yml", "kind": "yaml_env",  "key": "RUNTIME_REF" }
           ]
         }
       }

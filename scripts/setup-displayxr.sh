@@ -13,6 +13,8 @@
 #   ./scripts/setup-displayxr.sh                     # runtime (+ bundled sim-display)
 #   ./scripts/setup-displayxr.sh --with mcp          # also DisplayXR MCP Tools
 #   ./scripts/setup-displayxr.sh --with browser      # also DisplayXR Browser (opt-in; Windows-only today)
+#   ./scripts/setup-displayxr.sh --with leia-conversion  # also the Leia conversion provider (opt-in; no macOS build)
+#   ./scripts/setup-displayxr.sh --with ultraleap    # also the Ultraleap hands provider (opt-in; no macOS build)
 #   ./scripts/setup-displayxr.sh --with-demos        # also install each demo's prebuilt release
 #   ./scripts/setup-displayxr.sh --with-demo-sources # also clone each demo's source into demos/
 #   ./scripts/setup-displayxr.sh --dry-run           # print plan, install nothing
@@ -44,6 +46,8 @@ ok()   { printf '%s OK %s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 # --- arg parsing ---
 WITH_MCP=0
 WITH_BROWSER=0
+WITH_LEIA_CONVERSION=0
+WITH_ULTRALEAP=0
 WITH_DEMOS=0
 WITH_DEMO_SOURCES=0
 DRY_RUN=0
@@ -62,6 +66,13 @@ Usage: $0 [flags]
                     today, so this warn+skips here. Opt-in on purpose: it is a
                     separate browser, so you ask for it by name; it is never
                     installed by default.
+  --with leia-conversion
+                    Also install the Leia 2D-to-3D conversion provider. It
+                    needs the NeurD runtime, which has its own installer.
+                    No macOS build, so this warn+skips here.
+  --with ultraleap  Also install the Ultraleap hands input provider. It needs
+                    the Ultraleap tracking software and a camera. No macOS
+                    build, so this warn+skips here.
   --with-demos      Also install each demo's prebuilt release asset
                     (no build needed — same install path as the runtime).
                     Demos without a release asset for this OS are skipped.
@@ -88,8 +99,10 @@ while [ $# -gt 0 ]; do
             case "${1:-}" in
                 mcp)     WITH_MCP=1 ;;
                 browser) WITH_BROWSER=1 ;;
-                "") err "--with requires an argument (one of: mcp, browser)"; exit 2 ;;
-                *)  err "Unknown --with target: $1 (supported: mcp, browser)"; exit 2 ;;
+                leia-conversion) WITH_LEIA_CONVERSION=1 ;;
+                ultraleap) WITH_ULTRALEAP=1 ;;
+                "") err "--with requires an argument (one of: mcp, browser, leia-conversion, ultraleap)"; exit 2 ;;
+                *)  err "Unknown --with target: $1 (supported: mcp, browser, leia-conversion, ultraleap)"; exit 2 ;;
             esac
             ;;
         --with-demos)        WITH_DEMOS=1 ;;
@@ -209,6 +222,8 @@ fi
 COMPONENTS=(runtime)
 [ "$WITH_MCP" -eq 1 ] && COMPONENTS+=(mcp_tools)
 [ "$WITH_BROWSER" -eq 1 ] && COMPONENTS+=(browser)
+[ "$WITH_LEIA_CONVERSION" -eq 1 ] && COMPONENTS+=(leia_conversion)
+[ "$WITH_ULTRALEAP" -eq 1 ] && COMPONENTS+=(ultraleap)
 
 install_component() {
     local name="$1"
@@ -223,6 +238,13 @@ install_component() {
     tag="$(pinned_tag "$pin_key" 2>/dev/null || true)"
 
     if [ -z "$tag" ]; then
+        # A component with no release yet has no pin on purpose
+        # (COMPONENTS_AWAITING_FIRST_RELEASE in lib/components.sh).
+        case " $COMPONENTS_AWAITING_FIRST_RELEASE " in
+            *" $name "*)
+                warn "$name: not released yet (versions.json has no '$pin_key' pin). Skipping."
+                return 0 ;;
+        esac
         err "versions.json has no pin for component '$name'."
         return 1
     fi

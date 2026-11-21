@@ -14,6 +14,8 @@ REM Usage:
 REM   scripts\setup-displayxr.bat                      :: runtime + shell + leia + open conversion
 REM   scripts\setup-displayxr.bat --with mcp           :: also DisplayXR MCP Tools
 REM   scripts\setup-displayxr.bat --with browser       :: also DisplayXR Browser (opt-in)
+REM   scripts\setup-displayxr.bat --with leia-conversion :: also the Leia conversion provider (opt-in)
+REM   scripts\setup-displayxr.bat --with ultraleap     :: also the Ultraleap hands provider (opt-in)
 REM   scripts\setup-displayxr.bat --with-demos         :: also install each demo's prebuilt release
 REM   scripts\setup-displayxr.bat --with-demo-sources  :: also clone each demo's source into demos\
 REM   scripts\setup-displayxr.bat --dry-run            :: print plan, install nothing
@@ -50,6 +52,27 @@ REM are fetched by the runtime model store on first use, not by this installer.
 set "COMPONENT_REPO_conversion_open=DisplayXR/displayxr-conversion-open"
 set "COMPONENT_EXE_conversion_open=DisplayXROpenConversionSetup-*.exe"
 set "COMPONENT_MARKER_conversion_open=HKLM\Software\DisplayXR\ConversionProviders\open-conversion"
+
+REM Leia 2D-to-3D conversion provider (ADR-053), split out of the Leia SR plug-in.
+REM Opt-in only (--with leia-conversion). It needs the NeurD runtime, which has its
+REM own installer and is never fetched here. NOT RELEASED YET: versions.json has no
+REM leia_conversion field until the first release adds it, and until then the flag
+REM warns and skips (COMPONENTS_AWAITING_FIRST_RELEASE below).
+set "COMPONENT_REPO_leia_conversion=DisplayXR/displayxr-leia-conversion"
+set "COMPONENT_EXE_leia_conversion=DisplayXRLeiaConversionSetup-*.exe"
+set "COMPONENT_MARKER_leia_conversion=HKLM\Software\DisplayXR\Plugins\LeiaConversion"
+
+REM Ultraleap hands input provider (ADR-034), moved out of the runtime trunk.
+REM Opt-in only (--with ultraleap). It needs the Ultraleap tracking software and a
+REM camera. NOT RELEASED YET, as above. A build only installs on the runtime release
+REM it was built at (ADR-063): its installer exits 3 on any other runtime.
+set "COMPONENT_REPO_ultraleap=DisplayXR/displayxr-ultraleap"
+set "COMPONENT_EXE_ultraleap=DisplayXRUltraleapSetup-*.exe"
+set "COMPONENT_MARKER_ultraleap=HKLM\Software\DisplayXR\Plugins\Ultraleap"
+
+REM Components that may have NO pin in versions.json yet (no release). Mirrors
+REM COMPONENTS_AWAITING_FIRST_RELEASE in scripts\lib\components.sh; keep in sync.
+set "COMPONENTS_AWAITING_FIRST_RELEASE=leia_conversion ultraleap"
 
 set "COMPONENT_REPO_mcp_tools=DisplayXR/displayxr-mcp"
 set "COMPONENT_EXE_mcp_tools=DisplayXRMCPSetup-*.exe"
@@ -99,6 +122,8 @@ set "COMPONENT_MARKER_earthview_demo=HKLM\Software\DisplayXR\Demos\EarthView"
 REM --- Default flag state ---
 set "WITH_MCP=0"
 set "WITH_BROWSER=0"
+set "WITH_LEIA_CONVERSION=0"
+set "WITH_ULTRALEAP=0"
 set "WITH_DEMOS=0"
 set "WITH_DEMO_SOURCES=0"
 set "DRY_RUN=0"
@@ -121,10 +146,12 @@ exit /b 2
 
 :arg_with
 shift
-if "%~1"=="" echo ERROR: --with requires an argument (one of: mcp, browser) 1>&2 & exit /b 2
+if "%~1"=="" echo ERROR: --with requires an argument (one of: mcp, browser, leia-conversion, ultraleap) 1>&2 & exit /b 2
 if /i "%~1"=="mcp" set "WITH_MCP=1" & shift & goto :argloop
 if /i "%~1"=="browser" set "WITH_BROWSER=1" & shift & goto :argloop
-echo ERROR: Unknown --with target: %~1 (supported: mcp, browser) 1>&2
+if /i "%~1"=="leia-conversion" set "WITH_LEIA_CONVERSION=1" & shift & goto :argloop
+if /i "%~1"=="ultraleap" set "WITH_ULTRALEAP=1" & shift & goto :argloop
+echo ERROR: Unknown --with target: %~1 (supported: mcp, browser, leia-conversion, ultraleap) 1>&2
 exit /b 2
 
 :argdone
@@ -177,6 +204,10 @@ call :read_pin leia_plugin LEIA_TAG
 call :read_pin conversion_open CONVOPEN_TAG
 call :read_pin mcp_tools MCP_TAG
 call :read_pin browser BROWSER_TAG
+REM Not released yet: an absent pin is expected, so these two are read only when
+REM asked for, and :read_pin_optional never raises the exit code.
+if "%WITH_LEIA_CONVERSION%"=="1" call :read_pin_optional leia_conversion LEIACONV_TAG
+if "%WITH_ULTRALEAP%"=="1" call :read_pin_optional ultraleap ULTRALEAP_TAG
 
 REM --- Staging dir ---
 set "STAGING=%TEMP%\dxr-setup-%RANDOM%%RANDOM%"
@@ -189,6 +220,8 @@ call :install_component leia_plugin "%LEIA_TAG%"
 call :install_component conversion_open "%CONVOPEN_TAG%"
 if "%WITH_MCP%"=="1" call :install_component mcp_tools "%MCP_TAG%"
 if "%WITH_BROWSER%"=="1" call :install_component browser "%BROWSER_TAG%"
+if "%WITH_LEIA_CONVERSION%"=="1" call :install_component leia_conversion "%LEIACONV_TAG%"
+if "%WITH_ULTRALEAP%"=="1" call :install_component ultraleap "%ULTRALEAP_TAG%"
 
 REM --- --with-demos: install each demo's prebuilt release asset ---
 REM After the core components so demo installers that require the runtime
@@ -245,6 +278,11 @@ echo   --with browser    Also install the DisplayXR Browser -- a Chromium-based
 echo                     browser that weaves glasses-free inline 3D.
 echo                     ^(Opt-in: it is a separate browser, so you ask for it
 echo                     by name; it is never part of the default install.^)
+echo   --with leia-conversion
+echo                     Also install the Leia 2D-to-3D conversion provider.
+echo                     ^(Opt-in. Needs the NeurD runtime, installed separately.^)
+echo   --with ultraleap  Also install the Ultraleap hands input provider.
+echo                     ^(Opt-in. Needs the Ultraleap tracking software.^)
 echo   --with-demos      Also install each demo's prebuilt release installer
 echo                     ^(no build needed; demos with no Windows asset skip^).
 echo   --with-demo-sources
@@ -264,7 +302,7 @@ echo write to HKLM and Program Files.
 exit /b 0
 
 :usage
-echo Usage: scripts\setup-displayxr.bat [--with mcp^|browser] [--with-demos] [--with-demo-sources] [--dry-run] [--uninstall] [-h^|--help]
+echo Usage: scripts\setup-displayxr.bat [--with mcp^|browser^|leia-conversion^|ultraleap] [--with-demos] [--with-demo-sources] [--dry-run] [--uninstall] [-h^|--help]
 exit /b 0
 
 REM Read a pinned tag from versions.json into the named env var.
@@ -278,6 +316,16 @@ if not defined %_RP_VAR% (
     echo ERROR: versions.json has no pin for '%_RP_KEY%' 1>&2
     set "EXITCODE=1"
 )
+exit /b 0
+
+REM Like :read_pin, for a component that may not be released yet: an absent
+REM pin leaves the variable undefined and is NOT an error. :install_component
+REM then prints its "no pin" warning and skips.
+:read_pin_optional
+set "_RP_KEY=%~1"
+set "_RP_VAR=%~2"
+set "%_RP_VAR%="
+for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$d = ConvertFrom-Json (Get-Content -Raw '%VERSIONS_JSON%'); $v = $d.'%_RP_KEY%'; if ($v) { Write-Output $v }"`) do set "%_RP_VAR%=%%i"
 exit /b 0
 
 REM Delegate to the standalone linker (single source of truth for the
@@ -300,6 +348,7 @@ call set "_IC_MARKER=%%COMPONENT_MARKER_%_IC_NAME%%%"
 
 if "%_IC_TAG%"=="" (
     echo WARN: skipping %_IC_NAME% — no pin in versions.json 1>&2
+    echo       ^(leia_conversion and ultraleap have none until their first release.^) 1>&2
     exit /b 0
 )
 
