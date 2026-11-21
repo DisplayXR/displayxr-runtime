@@ -68,6 +68,9 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		# DComp + WGL_NV_DX_interop2 dependencies for the VK->D3D11 transparent
 		# present bridge. dcomp.h is C++-only, hence the .cpp rename above.
 		target_link_libraries(comp_vk_native PRIVATE d3d11 dxgi dcomp)
+		# Runtime-owned window region for shaped transparent windows (DComp
+		# readback route): cut from each presented frame, applied after its Present.
+		target_sources(comp_vk_native PRIVATE comp_vk_native_region_win.cpp comp_vk_native_region_win.h)
 		# #918 VK-1 (#1178): the in-process Vulkan output-device split. aux_d3d
 		# carries the canonical `weave placement:` formatter and the scanout
 		# adapter resolver; comp_xbridge is now LINKED, not merely included —
