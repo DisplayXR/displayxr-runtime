@@ -23,15 +23,17 @@ The code has two halves:
 ```
 dxr-get [--catalog <url|file>] plan --for <item> | --default [--min-runtime X.Y.Z] [--json]
 dxr-get [--catalog <url|file>] ensure-for <item> [--min-runtime X.Y.Z] [--yes] [--no-start-service]
-dxr-get [--catalog <url|file>] install <item> | --default [--yes] [--json] [--no-start-service]
+dxr-get [--catalog <url|file>] install <item>... | --default [--yes] [--json] [--no-start-service]
 dxr-get [--catalog <url|file>] fetch <item> [--out <dir>]
 dxr-get [--catalog <url|file>] detect [--json]
 dxr-get [--catalog <url|file>] catalog
 dxr-get [--catalog <url|file>] list [--json]
 dxr-get [--catalog <url|file>] outdated [--json]
 dxr-get list --installed [--json]
-dxr-get uninstall <id> [--json] [--no-start-service]
+dxr-get uninstall <id>... [--json] [--no-start-service]
 ```
+
+Every verb also takes `--log <file>` (§ --log).
 
 Options for callers that are themselves installers:
 
@@ -117,6 +119,53 @@ the fallback only hardware matches are selected.
 
 `plan --default [--json]` prints the same plan without installing. `install … --json` prints
 the plan as JSON instead of text, for both forms of `install`.
+
+### Several items
+
+`install` and `uninstall` accept several items on one command line, so that a front end asks
+for elevation once (`displayxr-cli catalog`). **One item is the verb as it always was: its
+stdout, its messages and its exit code are unchanged.** What follows applies only when two or
+more are given (at most 32). The other verbs still take one.
+
+- **Order.** The items are handled one after the other, in the order given.
+- **Each is judged alone.** Every item gets its own plan, made when its turn comes, so it sees
+  what the items before it installed (skip-if-current applies to each). Its verdict is the
+  single-item verb's, in the same order: 41, nothing to do, 50, 40, then the plan runs. One
+  that cannot be installed or removed is reported and skipped, and **the rest proceed**.
+- **Exit code:** the first item exit code that is not 0, in the order given; 0 when none failed.
+- **Unchanged:** `--no-runtime` (it applies to every item), receipts (one per installed item,
+  written as each finishes), the trust rules, downloads, and the service being stopped and
+  started around each item that needs it.
+- **Messages.** The single-item messages, and one line per item when it ends:
+  `result: <id>: <exit code> <word>`. The word is `installed`, `nothing_to_do`, `incompatible`,
+  `needs_elevation`, `not_fetchable` or `failed` for `install`, and `uninstalled` or
+  `not_uninstalled` for `uninstall`. A front end that cannot read the exit code of each item
+  (an elevated run) reads these lines from `--log`.
+- **`--json`.** One document, printed at the end, instead of one per item:
+
+```json
+{"exit":41,"items":[
+  {"id":"open-conv","exit":0,"result":"installed","plan":{"for":"open-conv","schema":2,"gate":0,"actions":[…]}},
+  {"id":"leia-sr","exit":41,"result":"incompatible","plan":{"for":"leia-sr","gate":41,"gate_reason":"…","actions":[…]}}]}
+```
+
+  For `install`, `plan` is the item's single-item `--json` document. For `uninstall`, each entry
+  is the single-item object (`{"id","result","exit","detail"}`).
+- **Offline.** The catalog is read once, before the first item: exit 10 with the offline
+  document, as for one item, and nothing is attempted.
+- `install --default` takes no items, as before.
+
+### --log
+
+`--log <file>` appends every message `dxr-get` writes to stderr to that file as well. It exists
+for a front end that started `dxr-get` elevated and cannot read its output.
+
+- **The file must already exist.** `dxr-get` never creates it, and will not open a directory or
+  a reparse point: it may be running elevated on a path given by a caller that is not. The
+  caller creates the file, with the access it wants, and deletes it.
+- When the file cannot be opened, one message says so and the run goes on with stderr only.
+- stdout (the plan, the `--json` documents) is not copied to it.
+- Nothing `dxr-get` logs is a secret: it handles no credentials, keys or tokens.
 
 ### plan
 
@@ -220,7 +269,7 @@ network. `--json` gives `{"installed":[…]}` with `id`, `name`, `class`, `publi
 
 ### uninstall
 
-`uninstall <id>` removes an item that `dxr-get` installed. It needs no catalog and no
+`uninstall <id>` removes an item that `dxr-get` installed (several ids: § Several items). It needs no catalog and no
 network: everything comes from the receipt.
 
 The checks run in this order, and the first that fails is the answer. What elevation cannot
@@ -516,6 +565,7 @@ Their behaviour and exit codes are the schema-1 tool's, with these deliberate di
 | `ensure-for`, `install` | no record | write a receipt per installed item |
 | `detect --json` | one `leia_plugin` object | the same object (plus its `id`), and one per other item with detect rules; plus `usb` evidence and a `display_plugins` list (#2737) |
 | any | waited for a child installer without limit | waits at most one hour |
+| `install`, `uninstall` | exactly one item; a second was a usage error (exit 2) | several items (§ Several items). One item behaves as before |
 
 ## Validating on a test machine
 
@@ -579,15 +629,15 @@ plug-in's): installing one really runs that installer.
 `displayxr-cli catalog` is the command-line front end (ADR-064 step 4). It holds no catalog
 logic: it runs `dxr-get`, relays its exit code, and wraps its JSON. `catalog` is distribution;
 choosing among installed components stays with the per-class verbs (`dp`, `input`, `conv`,
-`tracking`: ADR-054 §2.6).
+`tracking`: ADR-054 decision 6).
 
 ```
 displayxr-cli catalog list [--installed] [--json]
 displayxr-cli catalog outdated [--json]
 displayxr-cli catalog show <id> [--json]
-displayxr-cli catalog install <id>... | --default [--allow-runtime] [--elevate|--no-elevate] [--json]
-displayxr-cli catalog uninstall <id>... [--elevate|--no-elevate] [--json]
-displayxr-cli catalog update <id>... | --all [--allow-runtime] [--elevate|--no-elevate] [--json]
+displayxr-cli catalog install <id>... | --default [--elevate|--no-elevate] [--allow-unsigned-engine] [--json]
+displayxr-cli catalog uninstall <id>... [--elevate|--no-elevate] [--allow-unsigned-engine] [--json]
+displayxr-cli catalog update <id>... | --all [--elevate|--no-elevate] [--allow-unsigned-engine] [--json]
 ```
 
 Every verb also takes `--catalog <url|file>` (handed to the engine, which still requires a
@@ -599,11 +649,11 @@ signature) and `--timeout <seconds>`.
 | `list --installed` | `list --installed --json` | the receipts; no catalog, no network |
 | `outdated` | `outdated --json` | |
 | `show <id>` | `list --json` | one item, by id or alias. An id the catalog does not list: exit 40 |
-| `install <id>` | `install <id> --no-runtime --json`, then the same without `--json`, elevated, when the first answered 50 | several ids are installed one after the other |
-| `install --default` | `install --default --no-runtime --json` | |
-| `uninstall <id>` | `uninstall <id> --json`, then elevated when the first answered 50 | |
-| `update --all` | `outdated --json`, then `install <id> --no-runtime --json` per row | skips the runtime, and rows the catalog has no build for |
-| `update <id>` | `outdated --json`, then `install` as above | an id that is not outdated is explained from one `list --json`: current (exit 0), not installed (42), not listed (40) |
+| `install <id>...` | `install <ids> --no-runtime --json`; then, for the ids that answered 50, `install <those ids> --no-runtime --log <file>`, elevated | one call for all the ids, and at most one elevated call |
+| `install --default` | `install --default --no-runtime --json`, then elevated as above | |
+| `uninstall <id>...` | `uninstall <ids> --json`; then `uninstall <those ids> --log <file>`, elevated | |
+| `update --all` | `outdated --json`, then `install` as above for every row that can be installed | the runtime row and rows without a build are reported, not installed |
+| `update <id>...` | `outdated --json`, then `install` as above | an id that is not outdated is explained from one `list --json`: current (exit 0), not installed (42), not listed (40) |
 
 **Where the engine is.** `dxr-get.exe` next to `displayxr-cli.exe`, else in the directory named
 by `HKLM\Software\DisplayXR\Runtime\InstallPath`. No environment variable or option names
@@ -611,27 +661,60 @@ another engine, because that path may be started elevated. Without an engine eve
 60 and prints nothing else. On macOS and Linux there is no engine yet (ADR-064 step 5), so
 that is the answer there.
 
-**The runtime.** `install` and `update` pass `--no-runtime` unless the item named is the runtime
-itself (`catalog update runtime`) or `--allow-runtime` is given. An item that needs a newer
-runtime is then refused with exit 41 and a message that names the switch. `update --all` never
-updates the runtime.
+**The runtime itself is not installed, replaced or updated from the CLI.** `install` always
+passes `--no-runtime`, so an item that needs a newer runtime is refused with exit 41 and a
+message that says to update the runtime first. `catalog install runtime` and `catalog update
+runtime` exit **64** without calling the engine; `update --all` reports a newer runtime and
+leaves it. `--allow-runtime` is accepted and answers 64: it is reserved for when this works.
+
+The reason is where the engine runs from. `dxr-get.exe` and `displayxr-cli.exe` are files of
+the runtime's own directory, and both are running while the runtime installer would replace
+them. The installer (`installer/DisplayXRInstaller.nsi`) writes them with a plain `File`
+command. It stops the service and its two satellites, and it probes `DisplayXRClient.dll` for
+being in use before it writes anything (#2713), but it takes no step for a running
+`dxr-get.exe` or `displayxr-cli.exe`: no process check, no rename, no replace-on-reboot. The
+write of a file that is being executed fails, and in a silent install (the mode `dxr-get`
+starts installers in) that failure ends the installer after `DisplayXRClient.dll` and other
+files were already replaced. *This is read from the script; it was not run.* Other installers
+that call `dxr-get` do not have the problem, because they run their own copy from a temporary
+directory. The follow-up is in ADR-064's step table (step 4b): the engine relaunching itself
+from a protected temporary location, or the runtime installer handling its own running tools.
+Until then the runtime is updated with its installer or the bundle.
 
 **Elevation.** The CLI itself is never elevated. A verb that changes the machine first runs the
-engine with the rights the CLI has. The engine answers what elevation cannot fix first (41, 42,
-43, nothing to do), so exit 50 means an elevated run is all that is missing; an already elevated
-terminal does the work in that first call. On 50:
+engine with the rights the CLI has, with every item on one command line. The engine answers
+what elevation cannot fix first (41, 42, 43, nothing to do), so exit 50 for an item means an
+elevated run is all that it is missing; an already elevated terminal does the work in that
+first call. For the items that answered 50:
 
 | Call | What happens |
 |---|---|
-| from a terminal, no `--json` | the engine is started elevated with `ShellExecuteEx` "runas": one consent prompt, which names `dxr-get.exe` |
+| from a terminal, no `--json` | the engine is started elevated with `ShellExecuteEx` "runas": **one consent prompt for the whole command**, which names `dxr-get.exe` |
 | `--json`, or stdin / stderr not a terminal | nothing is started. Exit 50, and the message says to add `--elevate` |
 | `--elevate` | started elevated in both cases |
 | `--no-elevate` | never started elevated |
 
-A plan whose `gate` is 40 is reported as 40 without a prompt (the engine checks for elevation
-before it reports that gate). A declined prompt is exit 50, and nothing was changed. The
-elevated engine runs in its own console window, and only its exit code comes back; the CLI
-prints the one-line meaning of that code. Each item that needs elevation gets its own prompt.
+An item whose plan `gate` is 40 is reported as 40 and is not part of the elevated call (the
+engine checks for elevation before it reports that gate). A declined prompt is exit 50, and
+nothing was changed.
+
+**The engine's signature is checked before every elevated start**, and only then. `dxr-get.exe`
+must carry a valid Authenticode signature that chains to a trusted root (`WinVerifyTrust`, no
+revocation fetch, the check `dxr-get` makes of a downloaded installer). When `displayxr-cli.exe`
+is signed too, the engine's signer must be the CLI's. An unsigned CLI has no signer to compare
+with, and a validly signed engine is then accepted. Otherwise the items that needed elevation
+exit **65** and nothing is started. `--allow-unsigned-engine` lifts the check. It is for
+development builds (CI builds are unsigned), it must be given explicitly, and `--elevate` does
+not imply it. Running an unsigned engine with the rights the CLI already has (`list`, or any
+verb from an elevated terminal) is not affected.
+
+**What the elevated engine said.** An elevated child's output cannot be read, so the CLI
+creates an empty log file, hands it to the engine with `--log`, reads it when the engine has
+exited and deletes it. The file is created new, with a random name, in the user's temporary
+directory, with access for its owner, administrators and SYSTEM only. A person sees the
+engine's messages as `dxr-get: …` lines; with `--json` they are the call's `log` string. With
+several items the engine's exit code is only the first failure, and each item's own code is
+read from its `result:` line in the log.
 
 **Waits are bounded.** 10 minutes for `list`, `show` and `outdated`, 2 hours for the verbs that
 install; `--timeout` changes either. When the bound passes the CLI exits 62. A listing call is
@@ -647,7 +730,7 @@ discovers input and tracking providers at its next launch. An application item r
 ### Exit codes
 
 The engine's codes are returned unchanged (§ Exit codes). With several items, each is tried and
-the exit code is the first failure. The CLI adds:
+the exit code is the first failure in the order given. The CLI adds:
 
 | code | meaning |
 |---|---|
@@ -659,6 +742,8 @@ the exit code is the first failure. The CLI adds:
 | 61 | the engine could not be started |
 | 62 | the engine was still running when the wait ended |
 | 63 | the engine exited 0 without the JSON document the verb needs |
+| 64 | cannot be done from the CLI: installing or updating the runtime itself, or `--allow-runtime` |
+| 65 | `dxr-get.exe` is not validly signed, so it was not started elevated |
 
 ### `--json`
 
@@ -669,13 +754,19 @@ embedded unchanged under `calls[].output`; the CLI renames nothing in them.
 {"schema":1, "verb":"install", "exit":0, "message":"done",
  "engine":"C:\\Program Files\\DisplayXR\\Runtime\\dxr-get.exe",
  "calls":[
-  {"args":["install","leia-sr","--no-runtime","--json"], "exit":50, "message":"needs an elevated process",
-   "elevated":false, "output":{"for":"leia-sr","schema":2,"gate":0,"actions":[…]}},
-  {"args":["install","leia-sr","--no-runtime"], "exit":0, "message":"done", "elevated":true, "output":null}],
+  {"args":["install","leia-sr","open-conv","--no-runtime","--json"], "exit":50,
+   "message":"needs an elevated process", "elevated":false,
+   "output":{"exit":50,"items":[{"id":"leia-sr","exit":50,"result":"needs_elevation","plan":{…}},
+                                {"id":"open-conv","exit":50,"result":"needs_elevation","plan":{…}}]}},
+  {"args":["install","leia-sr","open-conv","--no-runtime","--log","C:\\Users\\…\\dxr-get-….log"],
+   "exit":0, "message":"done", "elevated":true, "output":null,
+   "log":"…\nresult: leia-sr: 0 installed\n…\nresult: open-conv: 0 installed\n"}],
  "items":[
   {"id":"leia-sr", "action":"install", "exit":0, "message":"leia-sr: installed", "elevated":true,
    "changed":["leia-sr"],
-   "expect":[{"id":"leia-sr","class":"display_processor","note":"…"}]}]}
+   "expect":[{"id":"leia-sr","class":"display_processor","note":"…"}]},
+  {"id":"open-conv", "action":"install", "exit":0, "message":"open-conv: installed", "elevated":true,
+   "changed":["open-conv"], "expect":[{"id":"open-conv","class":"conversion_provider","note":"…"}]}]}
 ```
 
 | Field | Meaning |
@@ -683,25 +774,31 @@ embedded unchanged under `calls[].output`; the CLI renames nothing in them.
 | `schema` | the version of this envelope: `1` |
 | `verb`, `exit`, `message` | the verb, the process exit code, and its one-line meaning |
 | `engine` | the engine's path, or null when there is none (then `calls` is empty and `exit` is 60) |
-| `calls[]` | every engine invocation that is part of the answer, in order: `args`, `exit`, `message`, `elevated`, and `output`, the engine's stdout document as it printed it (null when it printed none, and always null for an elevated call) |
+| `calls[]` | every engine invocation that is part of the answer, in order: `args`, `exit`, `message`, `elevated`, and `output`, the engine's stdout document as it printed it (null when it printed none, and always null for an elevated call). An elevated call also has `log`: the engine's messages from its `--log` file, or null |
 | `licences` | `list`, `outdated`, `show`: the licence object of each **installed** plug-in item, keyed by catalog id. It is the `licence` object of `<class> list --json` (ADR-054 Amendment 2). An item that is not installed, not a plug-in, or not registered on this machine has no key |
 | `item` | `show`: the engine's row for that item, or null |
-| `items[]` | `install`, `uninstall`, `update`: one outcome per item: `id` (null for `--default`), `action` (`install`, `uninstall`, or `none` when no engine call was needed), `exit`, `message`, `elevated`, `changed` (the ids the engine installed or removed) and `expect` (what to expect, per changed item of a class the runtime loads) |
+| `items[]` | `install`, `uninstall`, `update`: one outcome per item: `id` (null for `--default`), `action` (`install`, `uninstall`, or `none` when no engine call was made for it), `exit`, `message`, `elevated`, `changed` (the ids the engine installed or removed) and `expect` (what to expect, per changed item of a class the runtime loads). The `none` entries come first, then the items the engine was asked for, in the order given |
 
 For `list` the engine's listing is `calls[0].output` (`{"schema":2,"items":[…]}`), for
 `outdated` it is `{"schema":2,"outdated":[…]}`, and offline it is the engine's
-`{"offline":true,…}` document with `exit` 10.
+`{"offline":true,…}` document with `exit` 10. With one item, `install` and `uninstall` embed
+the engine's single-item document; with several, its `{"exit","items":[…]}` document
+(§ Several items).
 
 The code is `src/xrt/targets/cli/cli_catalog.c` (every decision, no operating-system calls),
-`cli_catalog_os.c` (finding and running the engine) and `cli_cmd_catalog.c` (the licence join).
-`tests/tests_cli_catalog.cpp` drives it against a fake engine on every platform.
+`cli_catalog_os.c` (finding and running the engine, the signature check, the log file) and
+`cli_cmd_catalog.c` (the licence join). `tests/tests_cli_catalog.cpp` drives it against a fake
+engine on every platform.
 
 ## Not implemented yet
 
 - A second, standby catalog root key (ADR-064 §4): it needs a key pair generated offline.
 - Installer kinds other than `exe` (`msi`, `deb`, `pkg`): such an asset is `not_fetchable`.
-- One consent prompt for several items: `displayxr-cli catalog` starts the engine elevated once
-  per item that needs it, because `install` takes one item (§ displayxr-cli catalog).
+- Updating the runtime from the installed tools: `displayxr-cli catalog` refuses it (exit 64),
+  because `dxr-get.exe` runs from the directory the runtime installer has to replace
+  (§ displayxr-cli catalog; ADR-064 step 4b).
+- One stop and start of the service for a several-item run (it is stopped and started around
+  each item that needs it).
 - macOS and Linux (step 5).
 - Progress output a setup UI can render.
 

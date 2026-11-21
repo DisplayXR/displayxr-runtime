@@ -23,7 +23,9 @@
 //! The verbs that run installers: the engine waits up to one hour per installer.
 #define CHANGE_TIMEOUT_MS (2u * 60u * 60u * 1000u)
 
-#define MAX_ENGINE_ARGS 12
+#define MAX_ENGINE_ARGS (10 + CLI_CATALOG_MAX_IDS)
+//! The most of an engine log this CLI relays.
+#define MAX_LOG_LINES 400
 
 /*
  *
@@ -51,6 +53,10 @@ cli_catalog_exit_message(int code)
 	case CLI_CATALOG_EXIT_SPAWN: return "dxr-get could not be started";
 	case CLI_CATALOG_EXIT_TIMEOUT: return "dxr-get was still running when the wait ended";
 	case CLI_CATALOG_EXIT_BAD_OUTPUT: return "dxr-get's output was not the JSON document expected";
+	case CLI_CATALOG_EXIT_NOT_FROM_HERE:
+		return "cannot be done from this CLI: use the DisplayXR runtime installer or the bundle";
+	case CLI_CATALOG_EXIT_ENGINE_UNTRUSTED:
+		return "dxr-get.exe is not validly signed, so it was not started elevated";
 	default: return "dxr-get ended with an exit code this CLI does not know";
 	}
 }
@@ -185,24 +191,32 @@ cli_catalog_print_usage(FILE *f)
 	    "  show <id>                    One item: publisher, tier, versions, compatibility, prerequisites.\n"
 	    "  install <id>... | --default  Install items and what they need. --default: the catalog's\n"
 	    "                               recommended set plus the plug-ins of the hardware that is attached.\n"
+	    "                               The runtime itself is never installed or replaced (--no-runtime is\n"
+	    "                               always passed): an item that needs a newer runtime is refused, 41.\n"
 	    "  uninstall <id>...            Remove items that were installed through the catalog.\n"
 	    "  update <id>... | --all       Install the catalog's version of items 'outdated' reports.\n"
 	    "Options:\n"
 	    "  --json                       One JSON document on stdout: this CLI's envelope around dxr-get's own.\n"
 	    "  --elevate | --no-elevate     install / uninstall / update need an elevated process. From a\n"
-	    "                               terminal the engine is started elevated (one consent prompt per\n"
-	    "                               item that needs it). With --json, or when not at a terminal, it is\n"
-	    "                               not: exit 50, unless --elevate is given. --no-elevate: never.\n"
-	    "  --allow-runtime              Let install / update replace the runtime itself when an item needs a\n"
-	    "                               newer one. Without it such an item is refused (exit 41). Naming the\n"
-	    "                               runtime ('update runtime') implies it for that item.\n"
+	    "                               terminal dxr-get is started elevated: one consent prompt for the\n"
+	    "                               whole command. With --json, or when not at a terminal, it is not:\n"
+	    "                               exit 50, unless --elevate is given. --no-elevate: never.\n"
+	    "  --allow-unsigned-engine      Development builds only. dxr-get.exe is started elevated only when it\n"
+	    "                               carries a valid Authenticode signature (and this CLI's signer, when\n"
+	    "                               the CLI is signed); otherwise exit 65. This lifts that check. It is\n"
+	    "                               never implied by --elevate.\n"
+	    "  --allow-runtime              Not available yet (exit 64). Replacing the runtime as part of an\n"
+	    "                               install needs an engine that does not run from the runtime's own\n"
+	    "                               directory; 'install runtime' and 'update runtime' are refused for\n"
+	    "                               the same reason. Use the runtime installer or the bundle.\n"
 	    "  --timeout <seconds>          How long to wait for the engine (default 600 for list / show /\n"
 	    "                               outdated, 7200 for the verbs that install).\n"
 	    "  --catalog <url|file>         Another catalog, handed to dxr-get; it must still be signed.\n"
 	    "The work is done by dxr-get (Windows; macOS and Linux have no install engine yet). Exit codes are\n"
 	    "dxr-get's: 0 ok, 10 offline, 11 catalog signature, 20 download, 21 verification, 30 installer failed,\n"
 	    "40 not available, 41 not compatible, 42 not installed, 43 cannot uninstall, 50 needs elevation;\n"
-	    "and this CLI's: 60 no engine, 61 engine did not start, 62 timed out, 63 unexpected engine output.\n");
+	    "and this CLI's: 60 no engine, 61 engine did not start, 62 timed out, 63 unexpected engine output,\n"
+	    "64 cannot be done from this CLI (the runtime itself), 65 engine not signed for an elevated start.\n");
 }
 
 static bool
@@ -248,6 +262,8 @@ cli_catalog_parse(int argc, const char **argv, struct cli_catalog_request *out, 
 			out->no_elevate = true;
 		} else if (strcmp(a, "--allow-runtime") == 0) {
 			out->allow_runtime = true;
+		} else if (strcmp(a, "--allow-unsigned-engine") == 0) {
+			out->allow_unsigned_engine = true;
 		} else if (strcmp(a, "--installed") == 0) {
 			out->installed = true;
 		} else if (strcmp(a, "--default") == 0) {
@@ -285,9 +301,10 @@ cli_catalog_parse(int argc, const char **argv, struct cli_catalog_request *out, 
 	if (out->all && v != CLI_CATALOG_VERB_UPDATE) {
 		return fail(err, err_cap, "--all belongs to 'update', not '%s'", out->verb_name);
 	}
-	if ((out->elevate || out->no_elevate || out->allow_runtime) && !changes) {
+	if ((out->elevate || out->no_elevate || out->allow_runtime || out->allow_unsigned_engine) && !changes) {
 		return fail(err, err_cap,
-		            "'%s' changes nothing: --elevate, --no-elevate and --allow-runtime do not apply",
+		            "'%s' changes nothing: --elevate, --no-elevate, --allow-runtime and "
+		            "--allow-unsigned-engine do not apply",
 		            out->verb_name);
 	}
 	if (out->elevate && out->no_elevate) {
@@ -340,9 +357,11 @@ cli_catalog_timeout_ms(const struct cli_catalog_request *req, bool changes_machi
 int
 cli_catalog_engine_args(const struct cli_catalog_request *req,
                         const char *engine_verb,
-                        const char *id,
+                        const char *const *ids,
+                        int n_ids,
                         bool no_runtime,
                         bool json,
+                        const char *log_path,
                         const char **args,
                         int cap)
 {
@@ -360,9 +379,10 @@ cli_catalog_engine_args(const struct cli_catalog_request *req,
 		ADD(req->catalog);
 	}
 	ADD(engine_verb);
-	if (id != NULL) {
-		ADD(id);
-	} else if (strcmp(engine_verb, "install") == 0) {
+	for (int i = 0; i < n_ids; i++) {
+		ADD(ids[i]);
+	}
+	if (n_ids == 0 && strcmp(engine_verb, "install") == 0) {
 		ADD("--default");
 	}
 	if (no_runtime) {
@@ -371,11 +391,62 @@ cli_catalog_engine_args(const struct cli_catalog_request *req,
 	if (json) {
 		ADD("--json");
 	}
+	if (log_path != NULL) {
+		ADD("--log");
+		ADD(log_path);
+	}
 	if (n < cap) {
 		args[n] = NULL;
 	}
 	return n;
 #undef ADD
+}
+
+bool
+cli_catalog_engine_trusted(
+    bool engine_signed, const char *engine_signer, bool self_signed, const char *self_signer, char *why, size_t cap)
+{
+	if (!engine_signed) {
+		(void)snprintf(why, cap, "dxr-get.exe carries no valid Authenticode signature");
+		return false;
+	}
+	// A signed CLI ships with an engine signed by the same publisher. An
+	// unsigned CLI (a development build) has nothing to compare with, and a
+	// validly signed engine is then taken as it is.
+	if (self_signed &&
+	    strcmp(engine_signer != NULL ? engine_signer : "", self_signer != NULL ? self_signer : "") != 0) {
+		(void)snprintf(why, cap, "dxr-get.exe is signed by \"%s\", not by this CLI's signer \"%s\"",
+		               engine_signer != NULL ? engine_signer : "", self_signer != NULL ? self_signer : "");
+		return false;
+	}
+	if (cap > 0) {
+		why[0] = '\0';
+	}
+	return true;
+}
+
+int
+cli_catalog_parse_result_line(const char *line, char *id, size_t id_cap, int *code)
+{
+	static const char prefix[] = "result: ";
+	if (strncmp(line, prefix, sizeof(prefix) - 1) != 0) {
+		return 0;
+	}
+	const char *p = line + sizeof(prefix) - 1;
+	// `<id>: <code> <word>`. The id may itself hold ':', so the code is found from the right.
+	const char *sep = NULL;
+	for (const char *q = p; (q = strstr(q, ": ")) != NULL; q += 2) {
+		if (q[2] >= '0' && q[2] <= '9') {
+			sep = q;
+		}
+	}
+	if (sep == NULL || sep == p || (size_t)(sep - p) >= id_cap) {
+		return 0;
+	}
+	memcpy(id, p, (size_t)(sep - p));
+	id[sep - p] = '\0';
+	*code = atoi(sep + 2);
+	return 1;
 }
 
 /*
@@ -424,7 +495,8 @@ call_engine(struct ctx *c,
             bool changes_machine,
             bool elevated,
             enum cli_catalog_run_status *status,
-            const cJSON **out_doc)
+            const cJSON **out_doc,
+            cJSON **out_rec)
 {
 	struct cli_catalog_run r;
 	memset(&r, 0, sizeof(r));
@@ -474,6 +546,9 @@ call_engine(struct ctx *c,
 	}
 	if (out_doc != NULL) {
 		*out_doc = doc;
+	}
+	if (out_rec != NULL) {
+		*out_rec = rec;
 	}
 	return code;
 }
@@ -732,7 +807,7 @@ engine_rows(struct ctx *c, const char *engine_verb, bool installed, const char *
 	}
 	args[n++] = "--json";
 	const cJSON *doc = NULL;
-	int code = call_engine(c, args, n, false, false, NULL, &doc);
+	int code = call_engine(c, args, n, false, false, NULL, &doc, NULL);
 	*rows = cJSON_GetObjectItemCaseSensitive(doc, key);
 	if (code == 0 && !cJSON_IsArray(*rows)) {
 		code = CLI_CATALOG_EXIT_BAD_OUTPUT;
@@ -891,151 +966,150 @@ print_plan(struct ctx *c, const cJSON *plan)
 	(void)fflush(f);
 }
 
+//! Why the runtime itself is not installed, replaced or updated from here (dxr-get.md § displayxr-cli catalog).
+#define NOT_FROM_HERE                                                                                                  \
+	"the runtime cannot be installed or updated from this CLI: dxr-get runs from the runtime's own directory, "    \
+	"and the runtime installer does not replace a dxr-get.exe or displayxr-cli.exe that is running. Run the "      \
+	"DisplayXR runtime installer or the bundle (https://github.com/DisplayXR/displayxr-runtime/releases)"
+
+//! One item of an `install` / `uninstall` command, from the first engine call to its outcome.
+struct change
+{
+	const char *id;   //!< NULL: `install --default`
+	int code;         //!< its exit code so far
+	bool elevated;    //!< the elevated engine run handled it
+	const cJSON *doc; //!< install: its plan. uninstall: its result object. Owned by a `calls` record
+	char cls[64];     //!< uninstall: the class its receipt recorded, read before the item is removed
+	char msg[600];    //!< a message decided on the way; empty: the default for `code`
+	cJSON *changed;   //!< the ids the engine would install or remove
+};
+
+static const char *
+change_label(const struct change *ch)
+{
+	return ch->id != NULL ? ch->id : "the default set";
+}
+
 /*!
- * One `install` or `uninstall` through the engine, with the elevation step.
- * @p id is NULL for `install --default`. Records the outcome in `items`.
+ * What the engine said about item @p i of @p n. One item: the document is
+ * the answer and @p overall its code. Several: `{"exit","items":[...]}`,
+ * one entry per item in the order given; the entry's `exit` is the item's
+ * code, and for `install` its `plan` is the document.
+ */
+static const cJSON *
+item_answer(const cJSON *out, int n, int i, bool install, int overall, int *code)
+{
+	*code = overall;
+	if (n <= 1) {
+		return out;
+	}
+	const cJSON *entry = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(out, "items"), i);
+	const cJSON *e = cJSON_GetObjectItemCaseSensitive(entry, "exit");
+	if (entry == NULL || !cJSON_IsNumber(e)) {
+		return NULL; // no per-item answer (offline, or the call did not end): the overall code stands
+	}
+	*code = e->valueint;
+	return install ? cJSON_GetObjectItemCaseSensitive(entry, "plan") : entry;
+}
+
+//! The engine may be started elevated: it is validly signed (cli_catalog_engine_trusted).
+static bool
+engine_trusted(struct ctx *c, char *why, size_t cap)
+{
+	const struct cli_catalog_ops *ops = c->ops;
+	if (ops->signer == NULL) {
+		(void)snprintf(why, cap, "the signature of dxr-get.exe cannot be checked here");
+		return false;
+	}
+	char engine_cn[256] = {0}, self_cn[256] = {0};
+	const bool engine_signed = ops->signer(ops->ud, ops->engine, engine_cn, sizeof(engine_cn));
+	const bool self_signed = ops->signer(ops->ud, NULL, self_cn, sizeof(self_cn));
+	return cli_catalog_engine_trusted(engine_signed, engine_cn, self_signed, self_cn, why, cap);
+}
+
+/*!
+ * The elevated engine's log: relay its text to the person (not with
+ * `--json`, where it is the call record's `log`), and take each item's exit
+ * code from its `result:` line.
  */
 static void
-change_item(struct ctx *c, const char *engine_verb, const char *id, bool no_runtime)
+read_engine_log(struct ctx *c, const char *text, struct change *need[], int n_need)
+{
+	if (text == NULL) {
+		return;
+	}
+	int lines = 0;
+	for (const char *p = text; *p != '\0' && lines < MAX_LOG_LINES; lines++) {
+		const char *nl = strchr(p, '\n');
+		size_t len = nl != NULL ? (size_t)(nl - p) : strlen(p);
+		char line[1024];
+		const size_t take = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
+		memcpy(line, p, take);
+		line[take] = '\0';
+		if (take > 0 && line[take - 1] == '\r') {
+			line[take - 1] = '\0';
+		}
+		char id[256];
+		int code = 0;
+		if (cli_catalog_parse_result_line(line, id, sizeof(id), &code)) {
+			for (int i = 0; i < n_need; i++) {
+				if (need[i]->id != NULL && strcmp(need[i]->id, id) == 0) {
+					need[i]->code = code;
+				}
+			}
+		} else if (!c->req->json && line[0] != '\0') {
+			fprintf(c->ops->err, "  dxr-get: %s\n", line);
+		}
+		p += len + (nl != NULL ? 1 : 0);
+	}
+	(void)fflush(c->ops->err);
+}
+
+//! Record one item's outcome in `items`, and say it.
+static void
+emit_change(struct ctx *c, struct change *ch, bool install)
 {
 	const struct cli_catalog_request *req = c->req;
-	const bool install = strcmp(engine_verb, "install") == 0;
-	const char *label = id != NULL ? id : "the default set";
 	FILE *out = c->ops->out, *err = c->ops->err;
-	char msg[600];
-	msg[0] = '\0';
+	const char *label = change_label(ch);
+	const int code = ch->code;
+	const bool did_change = code == 0 && cJSON_GetArraySize(ch->changed) > 0;
 
-	// A receipt is gone once its item is removed: read the class first.
-	const char *removed_class = install ? NULL : receipt_class(c, id);
-	char removed_class_buf[64] = {0};
-	if (removed_class != NULL) {
-		(void)snprintf(removed_class_buf, sizeof(removed_class_buf), "%s", removed_class);
-	}
-
-	// First with this process's rights. The engine answers everything that
-	// elevation cannot fix before it asks for elevation (dxr-get.md), so 50
-	// means an elevated run is all that is missing -- and an already elevated
-	// terminal simply does the work here.
-	const char *args[MAX_ENGINE_ARGS];
-	int n = cli_catalog_engine_args(req, engine_verb, id, no_runtime, true, args, MAX_ENGINE_ARGS);
-	const cJSON *doc = NULL;
-	int code = call_engine(c, args, n, true, false, NULL, &doc);
-	bool elevated = false;
-
-	// The ids the plan changes, kept by value: `doc` belongs to the call record.
-	cJSON *changed = cJSON_CreateArray();
-	if (install) {
-		const cJSON *a;
-		cJSON_ArrayForEach(a, cJSON_GetObjectItemCaseSensitive(doc, "actions"))
-		{
-			const char *action = jstr(a, "action");
-			const char *kind = jstr(a, "kind");
-			if (jstr(a, "id") != NULL && action != NULL && (kind == NULL || strcmp(kind, "item") == 0) &&
-			    (strcmp(action, "install") == 0 || strcmp(action, "upgrade") == 0 ||
-			     strcmp(action, "reinstall") == 0)) {
-				cJSON_AddItemToArray(changed, cJSON_CreateString(jstr(a, "id")));
-			}
-		}
-		if (!req->json && doc != NULL && cJSON_GetObjectItemCaseSensitive(doc, "actions") != NULL) {
-			fprintf(out, "%s:\n", label);
-			print_plan(c, doc);
-		}
-	} else if (id != NULL) {
-		cJSON_AddItemToArray(changed, cJSON_CreateString(id));
-	}
-
-	if (code == CLI_CATALOG_EXIT_NEEDS_ELEVATION) {
-		const cJSON *gate = cJSON_GetObjectItemCaseSensitive(doc, "gate");
-		if (install && cJSON_IsNumber(gate) && gate->valueint == CLI_CATALOG_EXIT_NOT_FETCHABLE) {
-			// The engine checks for elevation before it reports this; an
-			// elevated run would only return 40 after a consent prompt.
-			code = CLI_CATALOG_EXIT_NOT_FETCHABLE;
-			(void)snprintf(msg, sizeof(msg), "%s: %s%s%s", label, cli_catalog_exit_message(code),
-			               jstr(doc, "gate_reason") != NULL ? ": " : "",
-			               jstr(doc, "gate_reason") != NULL ? jstr(doc, "gate_reason") : "");
-		} else if (!may_elevate(c)) {
-			(void)snprintf(msg, sizeof(msg), "%s: %s. Run this from an elevated terminal%s.", label,
-			               cli_catalog_exit_message(code),
-			               req->no_elevate ? "" : ", or add --elevate to be asked for consent");
-		} else {
-			if (!req->json) {
-				fprintf(err,
-				        "%s: asking for elevation to run dxr-get (one consent prompt). Its own window "
-				        "shows the progress.\n",
-				        label);
-				(void)fflush(err);
-			}
-			// The same command, without --json: nothing can be read back from
-			// an elevated child but its exit code.
-			n = cli_catalog_engine_args(req, engine_verb, id, no_runtime, false, args, MAX_ENGINE_ARGS);
-			enum cli_catalog_run_status st = CLI_CATALOG_RUN_OK;
-			code = call_engine(c, args, n, true, true, &st, NULL);
-			elevated = st == CLI_CATALOG_RUN_OK;
-			if (st == CLI_CATALOG_RUN_DECLINED) {
-				(void)snprintf(msg, sizeof(msg),
-				               "%s: the elevation prompt was declined; nothing was changed", label);
-			} else if (st == CLI_CATALOG_RUN_UNSUPPORTED) {
-				(void)snprintf(msg, sizeof(msg), "%s: this platform has no elevated start", label);
-			} else if (st == CLI_CATALOG_RUN_TIMEOUT) {
-				(void)snprintf(msg, sizeof(msg),
-				               "%s: %s. It was not ended: an installer may still be running", label,
-				               cli_catalog_exit_message(code));
-			}
-		}
-	} else if (code == CLI_CATALOG_EXIT_TIMEOUT) {
-		(void)snprintf(msg, sizeof(msg), "%s: %s. It was not ended: an installer may still be running", label,
-		               cli_catalog_exit_message(code));
-	} else if (code == CLI_CATALOG_EXIT_INCOMPATIBLE && install && no_runtime) {
-		const char *why = jstr(doc, "gate_reason");
-		(void)snprintf(
-		    msg, sizeof(msg),
-		    "%s: %s%s%s. If it needs a newer runtime, add --allow-runtime, or update the runtime first", label,
-		    cli_catalog_exit_message(code), why != NULL ? ": " : "", why != NULL ? why : "");
-	}
-
-	const bool did_change = code == 0 && cJSON_GetArraySize(changed) > 0;
-	if (did_change && install) {
-		// The receipts this run read earlier do not know what was just installed.
-		cJSON_Delete(c->receipts);
-		c->receipts = NULL;
-		c->receipts_read = false;
-	}
-	if (msg[0] == '\0') {
+	if (ch->msg[0] == '\0') {
 		if (code != 0) {
-			const char *detail =
-			    install ? jstr(doc, "gate_reason") : (elevated ? NULL : jstr(doc, "detail"));
-			(void)snprintf(msg, sizeof(msg), "%s: %s%s%s", label, cli_catalog_exit_message(code),
+			const char *detail = ch->elevated ? NULL : jstr(ch->doc, install ? "gate_reason" : "detail");
+			(void)snprintf(ch->msg, sizeof(ch->msg), "%s: %s%s%s", label, cli_catalog_exit_message(code),
 			               detail != NULL ? ": " : "", detail != NULL ? detail : "");
 		} else if (!install) {
-			(void)snprintf(msg, sizeof(msg), "%s: uninstalled", label);
+			(void)snprintf(ch->msg, sizeof(ch->msg), "%s: uninstalled", label);
 		} else if (did_change) {
-			(void)snprintf(msg, sizeof(msg), "%s: installed", label);
+			(void)snprintf(ch->msg, sizeof(ch->msg), "%s: installed", label);
 		} else {
-			(void)snprintf(msg, sizeof(msg), "%s: nothing to do, already at the catalog's version", label);
+			(void)snprintf(ch->msg, sizeof(ch->msg), "%s: nothing to do, already at the catalog's version",
+			               label);
 		}
 	}
 
 	cJSON *item = cJSON_CreateObject();
-	if (id != NULL) {
-		cJSON_AddStringToObject(item, "id", id);
+	if (ch->id != NULL) {
+		cJSON_AddStringToObject(item, "id", ch->id);
 	} else {
 		cJSON_AddNullToObject(item, "id");
 	}
-	cJSON_AddStringToObject(item, "action", engine_verb);
+	cJSON_AddStringToObject(item, "action", install ? "install" : "uninstall");
 	cJSON_AddNumberToObject(item, "exit", code);
-	cJSON_AddStringToObject(item, "message", msg);
-	cJSON_AddBoolToObject(item, "elevated", elevated);
+	cJSON_AddStringToObject(item, "message", ch->msg);
+	cJSON_AddBoolToObject(item, "elevated", ch->elevated);
 	cJSON *expect = cJSON_AddArrayToObject(item, "expect");
 	if (!req->json) {
-		fprintf(code == 0 ? out : err, "%s\n", msg);
+		fprintf(code == 0 ? out : err, "%s\n", ch->msg);
 	}
 	if (did_change) {
-		const cJSON *ch;
-		cJSON_ArrayForEach(ch, changed)
+		const cJSON *x;
+		cJSON_ArrayForEach(x, ch->changed)
 		{
-			const char *cid = ch->valuestring;
-			const char *cls =
-			    install ? receipt_class(c, cid) : (removed_class_buf[0] ? removed_class_buf : NULL);
+			const char *cid = x->valuestring;
+			const char *cls = install ? receipt_class(c, cid) : (ch->cls[0] != '\0' ? ch->cls : NULL);
 			const char *note = cli_catalog_expectation(cls);
 			if (note == NULL) {
 				continue;
@@ -1049,21 +1123,193 @@ change_item(struct ctx *c, const char *engine_verb, const char *id, bool no_runt
 				fprintf(out, "  %s: %s\n", cid, note);
 			}
 		}
+		cJSON_AddItemToObject(item, "changed", ch->changed);
+	} else {
+		cJSON_AddArrayToObject(item, "changed");
+		cJSON_Delete(ch->changed);
 	}
-	cJSON_AddItemToObject(item, "changed", did_change ? changed : cJSON_CreateArray());
-	if (!did_change) {
-		cJSON_Delete(changed);
-	}
+	ch->changed = NULL;
 	cJSON_AddItemToArray(c->items, item);
 	note_exit(c, code);
 	(void)fflush(out);
+}
+
+/*!
+ * `install` or `uninstall` of @p n_ids items (none: `install --default`)
+ * through the engine: ONE call with this process's rights, and when some
+ * items need nothing but elevation, ONE elevated call for all of them.
+ */
+static void
+change_items(struct ctx *c, const char *engine_verb, const char *const *ids, int n_ids)
+{
+	const struct cli_catalog_request *req = c->req;
+	const bool install = strcmp(engine_verb, "install") == 0;
+	// The runtime is never installed or replaced from here (NOT_FROM_HERE).
+	const bool no_runtime = install;
+	const int n = n_ids > 0 ? n_ids : 1;
+	FILE *out = c->ops->out, *err = c->ops->err;
+	static struct change ch[CLI_CATALOG_MAX_IDS];
+	memset(ch, 0, sizeof(ch));
+
+	for (int i = 0; i < n; i++) {
+		ch[i].id = n_ids > 0 ? ids[i] : NULL;
+		ch[i].changed = cJSON_CreateArray();
+		if (!install) {
+			// A receipt is gone once its item is removed: read the class first.
+			const char *cls = receipt_class(c, ch[i].id);
+			(void)snprintf(ch[i].cls, sizeof(ch[i].cls), "%s", cls != NULL ? cls : "");
+		}
+	}
+
+	// First with this process's rights. The engine answers everything that
+	// elevation cannot fix before it asks for elevation (dxr-get.md), so 50
+	// means an elevated run is all that is missing -- and an already elevated
+	// terminal simply does the work here.
+	const char *args[MAX_ENGINE_ARGS];
+	int na = cli_catalog_engine_args(req, engine_verb, ids, n_ids, no_runtime, true, NULL, args, MAX_ENGINE_ARGS);
+	const cJSON *answer = NULL;
+	const int overall = call_engine(c, args, na, true, false, NULL, &answer, NULL);
+
+	struct change *need[CLI_CATALOG_MAX_IDS];
+	int n_need = 0;
+	for (int i = 0; i < n; i++) {
+		struct change *x = &ch[i];
+		const char *label = change_label(x);
+		x->doc = item_answer(answer, n, i, install, overall, &x->code);
+		if (install) {
+			const cJSON *a;
+			cJSON_ArrayForEach(a, cJSON_GetObjectItemCaseSensitive(x->doc, "actions"))
+			{
+				const char *action = jstr(a, "action");
+				const char *kind = jstr(a, "kind");
+				if (jstr(a, "id") != NULL && action != NULL &&
+				    (kind == NULL || strcmp(kind, "item") == 0) &&
+				    (strcmp(action, "install") == 0 || strcmp(action, "upgrade") == 0 ||
+				     strcmp(action, "reinstall") == 0)) {
+					cJSON_AddItemToArray(x->changed, cJSON_CreateString(jstr(a, "id")));
+				}
+			}
+			if (!req->json && cJSON_GetObjectItemCaseSensitive(x->doc, "actions") != NULL) {
+				fprintf(out, "%s:\n", label);
+				print_plan(c, x->doc);
+			}
+		} else {
+			cJSON_AddItemToArray(x->changed, cJSON_CreateString(x->id));
+		}
+
+		const cJSON *gate = cJSON_GetObjectItemCaseSensitive(x->doc, "gate");
+		if (x->code == CLI_CATALOG_EXIT_NEEDS_ELEVATION) {
+			if (install && cJSON_IsNumber(gate) && gate->valueint == CLI_CATALOG_EXIT_NOT_FETCHABLE) {
+				// The engine checks for elevation before it reports this; an
+				// elevated run would only return 40 after a consent prompt.
+				x->code = CLI_CATALOG_EXIT_NOT_FETCHABLE;
+			} else {
+				need[n_need++] = x;
+			}
+		} else if (x->code == CLI_CATALOG_EXIT_TIMEOUT) {
+			(void)snprintf(x->msg, sizeof(x->msg),
+			               "%s: %s. It was not ended: an installer may still be running", label,
+			               cli_catalog_exit_message(x->code));
+		} else if (x->code == CLI_CATALOG_EXIT_INCOMPATIBLE && install) {
+			const char *why = jstr(x->doc, "gate_reason");
+			(void)snprintf(x->msg, sizeof(x->msg),
+			               "%s: %s%s%s. If it needs a newer runtime, update the runtime first, with its "
+			               "installer or the bundle",
+			               label, cli_catalog_exit_message(x->code), why != NULL ? ": " : "",
+			               why != NULL ? why : "");
+		}
+	}
+
+	char why[400];
+	if (n_need > 0 && !may_elevate(c)) {
+		for (int i = 0; i < n_need; i++) {
+			(void)snprintf(need[i]->msg, sizeof(need[i]->msg),
+			               "%s: %s. Run this from an elevated terminal%s.", change_label(need[i]),
+			               cli_catalog_exit_message(need[i]->code),
+			               req->no_elevate ? "" : ", or add --elevate to be asked for consent");
+		}
+	} else if (n_need > 0 && !req->allow_unsigned_engine && !engine_trusted(c, why, sizeof(why))) {
+		// Checked before every elevated start, and only then: an unsigned
+		// engine may still be run with the rights this process already has.
+		for (int i = 0; i < n_need; i++) {
+			need[i]->code = CLI_CATALOG_EXIT_ENGINE_UNTRUSTED;
+			(void)snprintf(need[i]->msg, sizeof(need[i]->msg),
+			               "%s: not started elevated: %s. For a development build only: "
+			               "--allow-unsigned-engine",
+			               change_label(need[i]), why);
+		}
+	} else if (n_need > 0) {
+		if (!req->json) {
+			fprintf(
+			    err,
+			    "Asking for elevation to run dxr-get (one consent prompt for %d item%s). Its own window "
+			    "shows the progress.\n",
+			    n_need, n_need == 1 ? "" : "s");
+			(void)fflush(err);
+		}
+		// The engine's messages come back through a file only this user can
+		// open: nothing else can be read from an elevated child.
+		char log_path[1024] = {0};
+		const bool have_log =
+		    c->ops->log_create != NULL && c->ops->log_create(c->ops->ud, log_path, sizeof(log_path));
+		const char *need_ids[CLI_CATALOG_MAX_IDS];
+		int n_need_ids = 0;
+		for (int i = 0; i < n_need; i++) {
+			if (need[i]->id != NULL) {
+				need_ids[n_need_ids++] = need[i]->id;
+			}
+		}
+		// The same command for those items, without --json.
+		na = cli_catalog_engine_args(req, engine_verb, need_ids, n_need_ids, no_runtime, false,
+		                             have_log ? log_path : NULL, args, MAX_ENGINE_ARGS);
+		enum cli_catalog_run_status st = CLI_CATALOG_RUN_OK;
+		cJSON *rec = NULL;
+		const int code = call_engine(c, args, na, true, true, &st, NULL, &rec);
+		char *text = have_log && c->ops->log_take != NULL ? c->ops->log_take(c->ops->ud, log_path) : NULL;
+		if (text != NULL) {
+			cJSON_AddStringToObject(rec, "log", text);
+		} else {
+			cJSON_AddNullToObject(rec, "log");
+		}
+		for (int i = 0; i < n_need; i++) {
+			struct change *x = need[i];
+			x->code = code;
+			x->elevated = st == CLI_CATALOG_RUN_OK;
+			if (st == CLI_CATALOG_RUN_DECLINED) {
+				(void)snprintf(x->msg, sizeof(x->msg),
+				               "%s: the elevation prompt was declined; nothing was changed",
+				               change_label(x));
+			} else if (st == CLI_CATALOG_RUN_UNSUPPORTED) {
+				(void)snprintf(x->msg, sizeof(x->msg), "%s: this platform has no elevated start",
+				               change_label(x));
+			} else if (st == CLI_CATALOG_RUN_TIMEOUT) {
+				(void)snprintf(x->msg, sizeof(x->msg),
+				               "%s: %s. It was not ended: an installer may still be running",
+				               change_label(x), cli_catalog_exit_message(code));
+			}
+		}
+		// Several items: the exit code is the first failure, and each item's
+		// own code is in the log.
+		read_engine_log(c, st == CLI_CATALOG_RUN_OK ? text : NULL, need, n_need);
+		free(text);
+	}
+
+	// The receipts this run read earlier do not know what was just installed.
+	if (install) {
+		cJSON_Delete(c->receipts);
+		c->receipts = NULL;
+		c->receipts_read = false;
+	}
+	for (int i = 0; i < n; i++) {
+		emit_change(c, &ch[i], install);
+	}
 }
 
 //! Record an outcome that needed no engine call (`update` of an item that is current, unknown, ...).
 static void
 note_item(struct ctx *c, const char *id, int code, const char *text)
 {
-	char msg[400];
+	char msg[700];
 	(void)snprintf(msg, sizeof(msg), "%s: %s", id, text);
 	cJSON *item = cJSON_CreateObject();
 	cJSON_AddStringToObject(item, "id", id);
@@ -1087,15 +1333,32 @@ names_runtime(const char *id)
 	return strcmp(id, "runtime") == 0;
 }
 
+static bool
+row_is_runtime(const cJSON *row)
+{
+	const char *cls = jstr(row, "class");
+	return cls != NULL && strcmp(cls, "runtime") == 0;
+}
+
 static int
 do_install(struct ctx *c)
 {
 	const struct cli_catalog_request *req = c->req;
 	if (req->use_default) {
-		change_item(c, "install", NULL, !req->allow_runtime);
+		change_items(c, "install", NULL, 0);
+		return finish(c, NULL, NULL);
 	}
+	const char *ids[CLI_CATALOG_MAX_IDS];
+	int n = 0;
 	for (int i = 0; i < req->n_ids; i++) {
-		change_item(c, "install", req->ids[i], !req->allow_runtime && !names_runtime(req->ids[i]));
+		if (names_runtime(req->ids[i])) {
+			note_item(c, req->ids[i], CLI_CATALOG_EXIT_NOT_FROM_HERE, NOT_FROM_HERE);
+		} else {
+			ids[n++] = req->ids[i];
+		}
+	}
+	if (n > 0) {
+		change_items(c, "install", ids, n);
 	}
 	return finish(c, NULL, NULL);
 }
@@ -1103,17 +1366,8 @@ do_install(struct ctx *c)
 static int
 do_uninstall(struct ctx *c)
 {
-	for (int i = 0; i < c->req->n_ids; i++) {
-		change_item(c, "uninstall", c->req->ids[i], false);
-	}
+	change_items(c, "uninstall", c->req->ids, c->req->n_ids);
 	return finish(c, NULL, NULL);
-}
-
-static bool
-row_is_runtime(const cJSON *row)
-{
-	const char *cls = jstr(row, "class");
-	return cls != NULL && strcmp(cls, "runtime") == 0;
 }
 
 static int
@@ -1126,9 +1380,11 @@ do_update(struct ctx *c)
 	if (c->exit_code != 0) {
 		return finish(c, cli_catalog_exit_message(c->exit_code), NULL);
 	}
+	const char *ids[CLI_CATALOG_MAX_IDS];
+	int n = 0;
 
 	if (req->all) {
-		int n = 0;
+		int seen = 0;
 		const cJSON *x;
 		cJSON_ArrayForEach(x, rows)
 		{
@@ -1136,53 +1392,60 @@ do_update(struct ctx *c)
 			if (id == NULL) {
 				continue;
 			}
-			n++;
-			if (row_is_runtime(x) && !req->allow_runtime) {
-				// The runtime is never touched unless it is named.
-				note_item(c, id, 0,
-				          "a newer runtime is available; --all leaves the runtime alone. Name it to "
-				          "update it: displayxr-cli catalog update runtime");
+			seen++;
+			if (row_is_runtime(x)) {
+				// Reported, not an error: --all means "what can be updated from here".
+				note_item(
+				    c, id, 0,
+				    "a newer runtime is available. It is not updated from this CLI: run the DisplayXR "
+				    "runtime installer or the bundle");
 			} else if (cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(x, "installable"))) {
 				note_item(c, id, 0,
 				          "a newer version exists, but the catalog has no build to install here");
-			} else {
-				change_item(c, "install", id, !req->allow_runtime && !row_is_runtime(x));
+			} else if (n < CLI_CATALOG_MAX_IDS) {
+				ids[n++] = id;
 			}
 		}
-		if (n == 0 && !req->json) {
+		if (seen == 0 && !req->json) {
 			fprintf(c->ops->out, "Everything installed is at the catalog's version.\n");
 		}
-		return finish(c, NULL, NULL);
-	}
-
-	const cJSON *all_rows = NULL; // `list --json`, only when a named item is not outdated
-	bool listed = false;
-	for (int i = 0; i < req->n_ids; i++) {
-		const char *want = req->ids[i];
-		const cJSON *row = find_row(rows, want);
-		if (row != NULL) {
-			// Named, so the runtime itself may be the item.
-			change_item(c, "install", jstr(row, "id"), !req->allow_runtime && !row_is_runtime(row));
-			continue;
-		}
-		if (!listed) {
-			listed = true;
-			if (engine_rows(c, "list", false, "items", &all_rows) != 0) {
-				all_rows = NULL;
+	} else {
+		const cJSON *all_rows = NULL; // `list --json`, only when a named item is not outdated
+		bool listed = false;
+		for (int i = 0; i < req->n_ids; i++) {
+			const char *want = req->ids[i];
+			const cJSON *row = find_row(rows, want);
+			if (names_runtime(want) || (row != NULL && row_is_runtime(row))) {
+				note_item(c, want, CLI_CATALOG_EXIT_NOT_FROM_HERE, NOT_FROM_HERE);
+				continue;
+			}
+			if (row != NULL) {
+				ids[n++] = jstr(row, "id");
+				continue;
+			}
+			if (!listed) {
+				listed = true;
+				if (engine_rows(c, "list", false, "items", &all_rows) != 0) {
+					all_rows = NULL;
+				}
+			}
+			const cJSON *any = find_row(all_rows, want);
+			if (all_rows == NULL) {
+				note_item(c, want, 0, "'outdated' does not report it; nothing to do");
+			} else if (any == NULL) {
+				note_item(c, want, CLI_CATALOG_EXIT_NOT_FETCHABLE,
+				          "the catalog does not list it ('displayxr-cli catalog list')");
+			} else if (!state_is_installed(jstr(any, "state"))) {
+				note_item(c, want, CLI_CATALOG_EXIT_NOT_INSTALLED,
+				          "it is not installed; 'displayxr-cli catalog install' installs it");
+			} else {
+				note_item(c, want, 0, "already at the catalog's version; nothing to do");
 			}
 		}
-		const cJSON *any = find_row(all_rows, want);
-		if (all_rows == NULL) {
-			note_item(c, want, 0, "'outdated' does not report it; nothing to do");
-		} else if (any == NULL) {
-			note_item(c, want, CLI_CATALOG_EXIT_NOT_FETCHABLE,
-			          "the catalog does not list it ('displayxr-cli catalog list')");
-		} else if (!state_is_installed(jstr(any, "state"))) {
-			note_item(c, want, CLI_CATALOG_EXIT_NOT_INSTALLED,
-			          "it is not installed; 'displayxr-cli catalog install' installs it");
-		} else {
-			note_item(c, want, 0, "already at the catalog's version; nothing to do");
-		}
+	}
+	// One engine call for everything that is to be updated.
+	if (n > 0) {
+		change_items(c, "install", ids, n);
 	}
 	return finish(c, NULL, NULL);
 }
@@ -1215,6 +1478,12 @@ cli_catalog_execute(const struct cli_catalog_ops *ops, const struct cli_catalog_
 		                                           : cli_catalog_exit_message(CLI_CATALOG_EXIT_NO_ENGINE));
 		c.exit_code = CLI_CATALOG_EXIT_NO_ENGINE;
 		return finish(&c, msg, NULL);
+	}
+
+	if (req->allow_runtime) {
+		// Reserved. See NOT_FROM_HERE: the engine cannot replace the runtime it runs from.
+		c.exit_code = CLI_CATALOG_EXIT_NOT_FROM_HERE;
+		return finish(&c, "--allow-runtime is not available yet: " NOT_FROM_HERE, NULL);
 	}
 
 	switch (req->verb) {

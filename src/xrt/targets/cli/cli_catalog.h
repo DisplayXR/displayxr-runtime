@@ -63,6 +63,10 @@ enum cli_catalog_exit
 	CLI_CATALOG_EXIT_SPAWN = 61,           //!< dxr-get could not be started
 	CLI_CATALOG_EXIT_TIMEOUT = 62,         //!< dxr-get was still running when the bounded wait ended
 	CLI_CATALOG_EXIT_BAD_OUTPUT = 63,      //!< dxr-get's output was not the JSON document the verb promises
+	//! Refused here: replacing the runtime, whose directory the engine itself runs from.
+	CLI_CATALOG_EXIT_NOT_FROM_HERE = 64,
+	//! dxr-get.exe is not validly signed, so it was not started elevated (`--allow-unsigned-engine`).
+	CLI_CATALOG_EXIT_ENGINE_UNTRUSTED = 65,
 };
 
 //! One line for an exit code, the engine's or the front end's. Never NULL.
@@ -120,6 +124,25 @@ struct cli_catalog_ops
 	bool (*is_interactive)(void *ud);
 
 	/*!
+	 * The Authenticode signer of @p path, or of this executable when @p path
+	 * is NULL: true and its name in @p signer when the file carries a valid
+	 * signature that chains to a trusted root. NULL: nothing can be verified,
+	 * and the engine is then not started elevated without
+	 * `--allow-unsigned-engine`.
+	 */
+	bool (*signer)(void *ud, const char *path, char *signer, size_t cap);
+
+	/*!
+	 * Create an empty file only this user (and administrators) can open, in
+	 * the user's temporary directory, for the elevated engine's `--log`.
+	 * Its path goes to @p path. May be NULL: then nothing is relayed.
+	 */
+	bool (*log_create)(void *ud, char *path, size_t cap);
+
+	//! Read that file (the caller `free()`s the text; NULL when empty) and delete it.
+	char *(*log_take)(void *ud, const char *path);
+
+	/*!
 	 * The licence state of the installed component @p registered_id of catalog
 	 * class @p item_class, as its own class verb reports it (`<class> list
 	 * --json` → `licence`). Returns the `licence` object (the caller owns it)
@@ -159,7 +182,8 @@ struct cli_catalog_request
 	bool json;
 	bool elevate;        //!< `--elevate`: start the engine elevated even on a `--json` / non-interactive call
 	bool no_elevate;     //!< `--no-elevate`: never start it elevated
-	bool allow_runtime;  //!< `--allow-runtime`: do not pass `--no-runtime`
+	bool allow_runtime;  //!< `--allow-runtime`: reserved; refused with exit 64 until the engine can do it
+	bool allow_unsigned_engine; //!< `--allow-unsigned-engine`: start an unsigned engine elevated (development)
 	bool installed;      //!< `list --installed`
 	bool use_default;    //!< `install --default`
 	bool all;            //!< `update --all`
@@ -182,17 +206,36 @@ cli_catalog_timeout_ms(const struct cli_catalog_request *req, bool changes_machi
 
 /*!
  * The engine arguments of one `install` / `uninstall` call, in @p args
- * (at most @p cap, NULL-terminated when room). @p id is the item, or NULL for
- * `install --default`. Returns the count.
+ * (at most @p cap, NULL-terminated when room): @p n_ids items, or none for
+ * `install --default`. @p log_path: `--log <file>`. Returns the count.
  */
 int
 cli_catalog_engine_args(const struct cli_catalog_request *req,
                         const char *engine_verb,
-                        const char *id,
+                        const char *const *ids,
+                        int n_ids,
                         bool no_runtime,
                         bool json,
+                        const char *log_path,
                         const char **args,
                         int cap);
+
+/*!
+ * May the engine be started elevated? It must carry a valid Authenticode
+ * signature, and when this CLI is signed too, the same signer. False with
+ * the reason in @p why. `--allow-unsigned-engine` is the caller's to honour.
+ */
+bool
+cli_catalog_engine_trusted(
+    bool engine_signed, const char *engine_signer, bool self_signed, const char *self_signer, char *why, size_t cap);
+
+/*!
+ * One line of an engine log: `result: <id>: <exit code> <word>`, what
+ * dxr-get writes at the end of each item of a several-item run. Returns 1
+ * and fills @p id and @p code, or 0 for any other line.
+ */
+int
+cli_catalog_parse_result_line(const char *line, char *id, size_t id_cap, int *code);
 
 /*!
  * What the user should expect after an item of @p item_class was installed
@@ -247,6 +290,15 @@ cli_catalog_os_run_elevated(void *ud, struct cli_catalog_run *r);
 
 bool
 cli_catalog_os_is_interactive(void *ud);
+
+bool
+cli_catalog_os_signer(void *ud, const char *path, char *signer, size_t cap);
+
+bool
+cli_catalog_os_log_create(void *ud, char *path, size_t cap);
+
+char *
+cli_catalog_os_log_take(void *ud, const char *path);
 
 #ifdef __cplusplus
 }
