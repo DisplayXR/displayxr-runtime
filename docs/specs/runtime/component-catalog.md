@@ -3,7 +3,8 @@
 Status: schema 1 is P0 of epic #2702 (self-fetching installers), issue #2703, and is what is
 published and consumed today. [Schema 2](#schema-2) (the public DisplayXR Catalog,
 [ADR-064](../../adr/ADR-064-component-catalog-and-third-party-trust.md)) is proposed; the
-generator can derive it, nothing publishes it.
+generator can derive it and `dxr-get` reads it (ADR-064 steps 2 and 3, schema 1 as the
+fallback); nothing publishes it yet.
 
 The component catalog is a small signed JSON index of the DisplayXR installers a
 client may fetch on demand. Its one consumer today is **`dxr-get`** (P1/P2 of the same
@@ -134,7 +135,8 @@ Local dry run (no key needed): `python scripts/gen_catalog.py generate --out out
 
 Status: **Proposed** ([ADR-064](../../adr/ADR-064-component-catalog-and-third-party-trust.md)).
 `gen_catalog.py generate --out-v2 DIR` derives a schema-2 document for the three first-party
-components; nothing publishes it and no client reads it yet. Everything in this section that
+components. `dxr-get` reads it and falls back to schema 1 while it is not published
+([dxr-get.md](dxr-get.md)); nothing publishes it yet. Everything in this section that
 the generator does not emit is specification for the steps of ADR-064's implementation plan,
 and is marked *(planned)* where that matters.
 
@@ -171,7 +173,7 @@ every component class, on several platforms.
 | `channel` | yes | `stable` |
 | `source` | yes | where the index was built from. First-party derivation: `versions_json_sha`. Registry build *(planned)*: `registry_sha` |
 | `publishers` | yes | object keyed by publisher id. See below |
-| `revoked` | no | asset digests a client must refuse to install even when an item still lists them *(planned)* |
+| `revoked` | no | asset digests a client must refuse to install even when an item still lists them |
 | `items` | yes | array, in registry order |
 
 ### Publisher
@@ -224,6 +226,12 @@ every component class, on several platforms.
 
 **Platforms.** `windows-x64`, `linux-x86_64`, `macos-universal`, `android-arm64`. A client
 ignores platforms it does not know.
+
+**`abi` on the `runtime` item** states the class ABI majors that runtime version
+*implements*. A client uses it for the runtime a plan is about to install; for the runtime
+already on the machine it reads what that runtime's installer recorded
+(`HKLM\Software\DisplayXR\Runtime\Abi\<class>` on Windows). With neither, the class ABI is
+not checked and the client says so.
 
 #### Asset
 
@@ -300,8 +308,8 @@ An `external` entry has two supported forms:
   total is shown before the user commits. It is fetched and verified like any asset (below).
   Like every asset, it must be signed.
 
-**Every asset is resumed and verified** *(planned for schema 2, step 2; the rule is the
-schema-1 tool's)*. One item can now mean several downloads: its own asset and the assets of
+**Every asset is resumed and verified** (the schema-1 tool's rule, applied to every asset of
+a plan since ADR-064 step 2). One item can now mean several downloads: its own asset and the assets of
 its external prerequisites. For each one a client resumes an interrupted download with an
 HTTP `Range` request, accepts only a complete file of exactly `size` bytes, compares its
 SHA-256 with `sha256`, and then checks the signature. All assets of a selection are fetched
@@ -315,7 +323,8 @@ order, with the total size known up front.
 
 `detect` rule kinds: `edid` and `registry_dword_min` (schema 1), plus `registry_sz_min`
 (a dotted version string at or above `min`), `registry_key_exists` and `file_exists` (an
-absolute path, no environment expansion) *(planned, step 2)*. A client treats a rule of an
+absolute path, no environment expansion) and `service_exists` (`name`: a Windows service
+that is installed, running or not). A client treats a rule of an
 unknown kind as not matched.
 
 #### Licence
