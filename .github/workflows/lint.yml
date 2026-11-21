@@ -386,6 +386,13 @@ jobs:
         # never matched and every run opened a duplicate).
         run: python3 scripts/tests/test_drift_audit.py
 
+      - name: Runtime installer catalog listing shim (ADR-064)
+        # installer/catalog_plan.ps1 turns `dxr-get catalog --json` into the INI
+        # file the installer's component page reads. Run under PowerShell
+        # against a fake dxr-get: default pre-ticks, /COMPONENTS= tokens, the
+        # runtime-range filter, the offline and "no such verb" outcomes.
+        run: python3 installer/tests/test_catalog_plan.py
+
       - name: Component-catalog generator unit tests (ADR-064)
         # Hermetic (no network, no signing key). Pins the schema-1 catalog bytes
         # that deployed dxr-get builds verify a signature over, that asking for

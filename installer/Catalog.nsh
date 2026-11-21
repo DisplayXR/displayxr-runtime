@@ -1,0 +1,539 @@
+; Copyright 2026, The DisplayXR Project
+; SPDX-License-Identifier: BSL-1.0
+;
+; Catalog-driven optional components for the runtime installer (ADR-064 §8).
+;
+; The installer carries the runtime core only. Optional components (a display
+; processor for the connected display, conversion providers, input providers,
+; the browser ...) are LISTED from the signed DisplayXR Catalog and DOWNLOADED
+; by dxr-get when chosen. Nothing here verifies or runs a payload itself:
+; dxr-get does (docs/specs/runtime/dxr-get.md), and this file only asks it
+; what exists and then asks it to install what was ticked.
+;
+; Pieces, in the order the main script uses them:
+;
+;   !include Catalog.nsh             early: declares the variables
+;   DXR_CATALOG_PAGE_DEFINES         before MUI_PAGE_COMPONENTS / MUI_PAGE_FINISH
+;   DXR_CATALOG_SECTIONS             right after the runtime section
+;   DXR_CATALOG_DESCRIPTIONS         inside MUI_FUNCTION_DESCRIPTION_BEGIN/END
+;   DXR_CATALOG_FUNCTIONS            after every section
+;   Call DxrCatInit                  in .onInit
+;   DXR_CATALOG_UNINSTALL            in the uninstall section
+;
+; WHAT IS LISTED. `dxr-get catalog --json`, turned into an INI file by
+; catalog_plan.ps1 (NSIS has no JSON parser). The component list is a fixed
+; set of hidden "slot" sections: NSIS sections exist at compile time, so each
+; listed item takes one slot, gets its text and flags at run time, and unused
+; slots stay hidden (a section with an empty name is not shown).
+;
+; PRE-TICKED: an item the catalog marks `recommended` (the open conversion
+; provider, so "Convert to 3D" exists on every machine) and an item whose
+; detection rule matched this machine with high confidence (the display
+; processor of the connected display). Detection is dxr-get's; nothing here
+; reads an EDID. An item already at the catalog version is shown as installed,
+; greyed, and is not downloaded.
+;
+; NO CONNECTION. The core install never depends on any of this. If the catalog
+; cannot be reached the page says so and offers nothing; if a download fails
+; later the item is reported on the finish page and in
+; $INSTDIR\catalog-skipped.txt, and Setup still succeeds (exit code 0).
+;
+; SILENT (/S). Nothing is listed, fetched or installed unless the caller asks:
+;
+;   /COMPONENTS=<list>   comma-separated item ids (or their aliases, e.g. the
+;                        versions.json names) and the keywords `recommended`,
+;                        `detected`, `default` (= recommended,detected), `none`.
+;                        Interactive: replaces the default pre-ticks.
+;   /CATALOG=<url|file>  another catalog, passed to dxr-get as --catalog. It
+;                        must still be signed (dxr-get's rule), so this grants
+;                        nothing; it is for testing.
+;
+; So an unattended install with no switch does exactly what it did before this
+; file existed, which also means a runtime installer that dxr-get itself runs
+; (`/S /NOSTART`) never calls back into dxr-get.
+;
+; WHAT NEEDS A NEWER dxr-get. The listing verb is the schema-2 one. With a
+; dxr-get that does not have it (schema 1), catalog_plan.ps1 reports
+; `unsupported`: no slot is shown and the page looks as it did before. An id
+; given explicitly with /COMPONENTS= is still handed to `dxr-get install`,
+; which the schema-1 tool implements for its three components. If dxr-get.exe
+; was not built at all, DXR_CATALOG_UI is undefined and every macro below
+; expands to nothing.
+
+!ifndef DXR_CATALOG_NSH
+!define DXR_CATALOG_NSH
+
+!include "Sections.nsh"
+!include "LogicLib.nsh"
+!include "FileFunc.nsh"
+
+; Slots in the component list. More listed items than slots: the ticked ones
+; are kept and the page says how many are not shown.
+!define DXR_CAT_SLOTS 8
+
+; IDC_INTROTEXT of the components page (the text above the list).
+!define DXR_CAT_IDC_TOP 1006
+
+!define DXR_CAT_TOP_DEFAULT "Check the components you want to install and uncheck the components you don't want to install. Click Install to start."
+
+!ifndef INNER
+	!ifdef BIN_DIR
+		!if /FileExists "${BIN_DIR}\dxr-get.exe"
+			!define DXR_CATALOG_UI
+		!endif
+	!endif
+!endif
+
+; Declared in every build: the page texts below name them.
+Var DxrCatTop          ; text above the component list
+Var DxrCatFinishExtra  ; appended to the finish page text
+!ifdef DXR_CATALOG_UI
+Var DxrCatState        ; "" = not asked yet | ok | offline | unsupported | error
+Var DxrCatCount        ; listed items (<= DXR_CAT_SLOTS)
+Var DxrCatIni          ; catalog_plan.ps1 output
+Var DxrCatSel          ; /COMPONENTS= value
+Var DxrCatUrl          ; /CATALOG= value
+Var DxrCatShown        ; 1 once the components page was shown
+Var DxrCatOffline      ; 1 once dxr-get reported no connection during install
+Var DxrCatSkipped      ; "name: reason" lines of what was not installed
+Var DxrCatExe          ; the dxr-get.exe the install step runs
+Var DxrCatDesc1
+Var DxrCatDesc2
+Var DxrCatDesc3
+Var DxrCatDesc4
+Var DxrCatDesc5
+Var DxrCatDesc6
+Var DxrCatDesc7
+Var DxrCatDesc8
+!endif
+
+;--------------------------------
+; Page texts. Variables, so the text can say what the catalog answered.
+!macro DXR_CATALOG_PAGE_DEFINES
+	!define MUI_COMPONENTSPAGE_TEXT_TOP "$DxrCatTop"
+	!ifdef DXR_CATALOG_UI
+		!define MUI_PAGE_CUSTOMFUNCTION_PRE DxrCatComponentsPre
+	!endif
+!macroend
+
+!macro DXR_CATALOG_FINISH_DEFINES
+	!define MUI_FINISHPAGE_TEXT "$(MUI_TEXT_FINISH_INFO_TEXT)$DxrCatFinishExtra"
+!macroend
+
+;--------------------------------
+; Sections: the slots, then the hidden section that installs what was chosen.
+; The slots MUST stay consecutive: slot N is section index DxrCatSlot1 + N - 1.
+!macro DXR_CATALOG_SECTIONS
+!ifdef DXR_CATALOG_UI
+	Section /o "" DxrCatSlot1
+	SectionEnd
+	Section /o "" DxrCatSlot2
+	SectionEnd
+	Section /o "" DxrCatSlot3
+	SectionEnd
+	Section /o "" DxrCatSlot4
+	SectionEnd
+	Section /o "" DxrCatSlot5
+	SectionEnd
+	Section /o "" DxrCatSlot6
+	SectionEnd
+	Section /o "" DxrCatSlot7
+	SectionEnd
+	Section /o "" DxrCatSlot8
+	SectionEnd
+
+	; Runs after the runtime section (dxr-get, the registry Version value and
+	; the service are in place) and before the conversion-models section, which
+	; prefers the pack of an installed open conversion provider.
+	Section "-Catalog components" SecDxrCatalog
+		Call DxrCatInstallChosen
+	SectionEnd
+!endif
+!macroend
+
+!macro DXR_CATALOG_DESCRIPTIONS
+!ifdef DXR_CATALOG_UI
+	!insertmacro MUI_DESCRIPTION_TEXT ${DxrCatSlot1} "$DxrCatDesc1"
+	!insertmacro MUI_DESCRIPTION_TEXT ${DxrCatSlot2} "$DxrCatDesc2"
+	!insertmacro MUI_DESCRIPTION_TEXT ${DxrCatSlot3} "$DxrCatDesc3"
+	!insertmacro MUI_DESCRIPTION_TEXT ${DxrCatSlot4} "$DxrCatDesc4"
+	!insertmacro MUI_DESCRIPTION_TEXT ${DxrCatSlot5} "$DxrCatDesc5"
+	!insertmacro MUI_DESCRIPTION_TEXT ${DxrCatSlot6} "$DxrCatDesc6"
+	!insertmacro MUI_DESCRIPTION_TEXT ${DxrCatSlot7} "$DxrCatDesc7"
+	!insertmacro MUI_DESCRIPTION_TEXT ${DxrCatSlot8} "$DxrCatDesc8"
+!endif
+!macroend
+
+!macro DXR_CATALOG_UNINSTALL
+	Delete "$INSTDIR\catalog-skipped.txt"
+!macroend
+
+;--------------------------------
+; Functions. Inserted after the sections, because they name section indices.
+!macro DXR_CATALOG_FUNCTIONS
+
+; .onInit: defaults and the two switches. Asks nothing of the network.
+Function DxrCatInit
+	StrCpy $DxrCatTop "${DXR_CAT_TOP_DEFAULT}"
+	StrCpy $DxrCatFinishExtra ""
+!ifdef DXR_CATALOG_UI
+	StrCpy $DxrCatState ""
+	StrCpy $DxrCatCount 0
+	StrCpy $DxrCatShown 0
+	StrCpy $DxrCatOffline 0
+	StrCpy $DxrCatSkipped ""
+	StrCpy $DxrCatIni ""
+	${GetParameters} $R0
+	ClearErrors
+	${GetOptions} $R0 "/COMPONENTS=" $DxrCatSel
+	${If} ${Errors}
+		StrCpy $DxrCatSel ""
+	${EndIf}
+	ClearErrors
+	${GetOptions} $R0 "/CATALOG=" $DxrCatUrl
+	${If} ${Errors}
+		StrCpy $DxrCatUrl ""
+	${EndIf}
+	ClearErrors
+	; Both values end up inside a quoted argument: refuse one that could end it.
+	Push $DxrCatSel
+	Call DxrCatNoQuote
+	Pop $DxrCatSel
+	Push $DxrCatUrl
+	Call DxrCatNoQuote
+	Pop $DxrCatUrl
+!endif
+FunctionEnd
+
+!ifdef DXR_CATALOG_UI
+
+; in: a string on the stack. out: the same string, or "" if it has a double quote.
+Function DxrCatNoQuote
+	Exch $0
+	Push $1
+	Push $2
+	StrCpy $1 0
+	dxr_cat_nq_loop:
+		StrCpy $2 $0 1 $1
+		StrCmp $2 "" dxr_cat_nq_done
+		StrCmp $2 '"' dxr_cat_nq_bad
+		IntOp $1 $1 + 1
+		Goto dxr_cat_nq_loop
+	dxr_cat_nq_bad:
+		StrCpy $0 ""
+	dxr_cat_nq_done:
+	Pop $2
+	Pop $1
+	Exch $0
+FunctionEnd
+
+; Ask dxr-get what the catalog offers for this machine. Once per run.
+; Leaves $DxrCatState, $DxrCatCount and the INI file. Scratch: $R0-$R3.
+Function DxrCatQuery
+	${If} $DxrCatState != ""
+		Return
+	${EndIf}
+	StrCpy $DxrCatState "error"
+	StrCpy $DxrCatCount 0
+	InitPluginsDir
+	; The page is shown before anything is installed, so the listing runs from
+	; the copy of dxr-get this installer carries.
+	File "/oname=$PLUGINSDIR\dxr-get.exe" "${BIN_DIR}\dxr-get.exe"
+	File "/oname=$PLUGINSDIR\catalog_plan.ps1" "${__FILEDIR__}\catalog_plan.ps1"
+	StrCpy $DxrCatIni "$PLUGINSDIR\catalog.ini"
+	Delete "$DxrCatIni"
+
+	StrCpy $R0 '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\catalog_plan.ps1" -DxrGet "$PLUGINSDIR\dxr-get.exe" -Out "$DxrCatIni" -RuntimeVersion ${VERSION} -Slots ${DXR_CAT_SLOTS}'
+	; An empty quoted argument is dropped by powershell -File, so add these
+	; two only when they have a value.
+	${If} $DxrCatSel != ""
+		StrCpy $R0 '$R0 -Select "$DxrCatSel"'
+	${EndIf}
+	${If} $DxrCatUrl != ""
+		StrCpy $R0 '$R0 -Catalog "$DxrCatUrl"'
+	${EndIf}
+	nsExec::ExecToStack /TIMEOUT=90000 $R0
+	Pop $R1
+	Pop $R2
+	ClearErrors
+	ReadINIStr $R3 "$DxrCatIni" "catalog" "state"
+	${If} ${Errors}
+		; No file: PowerShell is missing, blocked by policy, or timed out.
+		DetailPrint "Catalog: the component listing did not run ($R1); optional components are not offered."
+		ClearErrors
+		Return
+	${EndIf}
+	StrCpy $DxrCatState $R3
+	ReadINIStr $DxrCatCount "$DxrCatIni" "catalog" "count"
+	${If} $DxrCatCount == ""
+		StrCpy $DxrCatCount 0
+	${EndIf}
+	ClearErrors
+FunctionEnd
+
+; Give each listed item a slot; hide the rest. Scratch: $R0-$R5.
+Function DxrCatPopulate
+	StrCpy $R0 0
+	${DoWhile} $R0 < ${DXR_CAT_SLOTS}
+		IntOp $R0 $R0 + 1
+		IntOp $R1 ${DxrCatSlot1} + $R0
+		IntOp $R1 $R1 - 1
+		${If} $DxrCatState == "ok"
+		${AndIf} $R0 <= $DxrCatCount
+			ReadINIStr $R2 "$DxrCatIni" "item$R0" "label"
+			ReadINIStr $R3 "$DxrCatIni" "item$R0" "selected"
+			ReadINIStr $R4 "$DxrCatIni" "item$R0" "ro"
+			StrCpy $R5 0
+			${If} $R3 == 1
+				IntOp $R5 $R5 | ${SF_SELECTED}
+			${EndIf}
+			${If} $R4 == 1
+				IntOp $R5 $R5 | ${SF_RO}
+			${EndIf}
+			SectionSetText $R1 "$R2"
+			SectionSetFlags $R1 $R5
+		${Else}
+			SectionSetText $R1 ""
+			SectionSetFlags $R1 0
+		${EndIf}
+	${Loop}
+	ReadINIStr $DxrCatDesc1 "$DxrCatIni" "item1" "desc"
+	ReadINIStr $DxrCatDesc2 "$DxrCatIni" "item2" "desc"
+	ReadINIStr $DxrCatDesc3 "$DxrCatIni" "item3" "desc"
+	ReadINIStr $DxrCatDesc4 "$DxrCatIni" "item4" "desc"
+	ReadINIStr $DxrCatDesc5 "$DxrCatIni" "item5" "desc"
+	ReadINIStr $DxrCatDesc6 "$DxrCatIni" "item6" "desc"
+	ReadINIStr $DxrCatDesc7 "$DxrCatIni" "item7" "desc"
+	ReadINIStr $DxrCatDesc8 "$DxrCatIni" "item8" "desc"
+	ClearErrors
+FunctionEnd
+
+; The line above the list: that ticked items are downloaded, that this needs a
+; connection, and how much. Recomputed on every tick. Scratch: $R0-$R4.
+Function DxrCatUpdateTop
+	StrCpy $R3 0 ; KB of the ticked downloads
+	StrCpy $R4 0 ; how many
+	StrCpy $R0 0
+	${DoWhile} $R0 < $DxrCatCount
+		IntOp $R0 $R0 + 1
+		IntOp $R1 ${DxrCatSlot1} + $R0
+		IntOp $R1 $R1 - 1
+		SectionGetFlags $R1 $R2
+		IntOp $R2 $R2 & ${SF_SELECTED}
+		${If} $R2 != 0
+			ReadINIStr $R2 "$DxrCatIni" "item$R0" "size_kb"
+			${If} $R2 == ""
+				StrCpy $R2 0
+			${EndIf}
+			IntOp $R3 $R3 + $R2
+			IntOp $R4 $R4 + 1
+		${EndIf}
+	${Loop}
+	ClearErrors
+	ReadINIStr $R2 "$DxrCatIni" "catalog" "more"
+	${If} $R2 == ""
+	${OrIf} $R2 == 0
+		StrCpy $R2 ""
+	${Else}
+		StrCpy $R2 " $R2 more are not shown."
+	${EndIf}
+	ClearErrors
+	${If} $R4 == 0
+		StrCpy $DxrCatTop "Items marked 'download' come from the DisplayXR Catalog and need an internet connection. None is selected: nothing will be downloaded.$R2"
+	${Else}
+		IntOp $R3 $R3 + 1023
+		IntOp $R3 $R3 / 1024
+		StrCpy $DxrCatTop "Selected items marked 'download' will be downloaded during setup: an internet connection is required. Total download: $R3 MB.$R2"
+	${EndIf}
+FunctionEnd
+
+; Components page, before it is shown: ask once, fill the slots, set the text.
+Function DxrCatComponentsPre
+	${If} $DxrCatState == ""
+		Banner::show /NOUNLOAD "Checking the DisplayXR Catalog for optional components..."
+		Call DxrCatQuery
+		Banner::destroy
+		Call DxrCatPopulate
+		${If} $DxrCatState == "ok"
+		${AndIf} $DxrCatCount > 0
+			Call DxrCatUpdateTop
+		${ElseIf} $DxrCatState == "offline"
+			StrCpy $DxrCatTop "The DisplayXR Catalog could not be reached (no internet connection?). Setup installs the DisplayXR Runtime only. Run Setup again later to add optional components."
+		${EndIf}
+	${EndIf}
+	StrCpy $DxrCatShown 1
+FunctionEnd
+
+Function .onSelChange
+	${If} $DxrCatState == "ok"
+	${AndIf} $DxrCatCount > 0
+		Call DxrCatUpdateTop
+		FindWindow $R0 "#32770" "" $HWNDPARENT
+		GetDlgItem $R0 $R0 ${DXR_CAT_IDC_TOP}
+		SendMessage $R0 ${WM_SETTEXT} 0 "STR:$DxrCatTop"
+	${EndIf}
+FunctionEnd
+
+; Install one item through dxr-get. in: $R8 = id, $R9 = name shown to the user.
+; Never aborts: a failure is added to $DxrCatSkipped. Scratch: $R1-$R4.
+Function DxrCatInstallOne
+	${If} $DxrCatOffline == 1
+		StrCpy $DxrCatSkipped "$DxrCatSkipped$R9: no connection$\r$\n"
+		Return
+	${EndIf}
+	DetailPrint "Catalog: $R9 - downloading and installing (dxr-get install $R8)"
+	StrCpy $R1 '"$DxrCatExe"'
+	${If} $DxrCatUrl != ""
+		StrCpy $R1 '$R1 --catalog "$DxrCatUrl"'
+	${EndIf}
+	; /NOSTART: the caller restarts the service itself, so dxr-get must not.
+	StrCpy $R2 ""
+	${GetParameters} $R3
+	ClearErrors
+	${GetOptions} $R3 "/NOSTART" $R4
+	${IfNot} ${Errors}
+		StrCpy $R2 " --no-start-service"
+	${EndIf}
+	ClearErrors
+	nsExec::ExecToLog '$R1 install $R8 --yes$R2'
+	Pop $R3
+	${If} $R3 == 2
+		; A dxr-get that takes the component name only (schema 1).
+		nsExec::ExecToLog '$R1 install $R8'
+		Pop $R3
+	${EndIf}
+	${If} $R3 == 0
+		DetailPrint "Catalog: $R9 - done."
+		Return
+	${EndIf}
+	; Exit codes: docs/specs/runtime/dxr-get.md.
+	StrCpy $R4 "dxr-get reported $R3"
+	${If} $R3 == 10
+		StrCpy $R4 "no connection, or the catalog could not be read"
+		StrCpy $DxrCatOffline 1
+	${ElseIf} $R3 == 11
+		StrCpy $R4 "the catalog failed its signature check"
+		StrCpy $DxrCatOffline 1
+	${ElseIf} $R3 == 20
+		StrCpy $R4 "the download failed"
+	${ElseIf} $R3 == 21
+		StrCpy $R4 "the download failed verification and was discarded"
+	${ElseIf} $R3 == 30
+		StrCpy $R4 "its installer reported an error"
+	${ElseIf} $R3 == 40
+		StrCpy $R4 "no signed Windows build fits this runtime"
+	${EndIf}
+	DetailPrint "Catalog: $R9 - NOT installed: $R4."
+	StrCpy $DxrCatSkipped "$DxrCatSkipped$R9: $R4$\r$\n"
+FunctionEnd
+
+; Install what was ticked (interactive) or asked for with /COMPONENTS=.
+; The runtime is fully installed by now; nothing here can fail the install.
+Function DxrCatInstallChosen
+	${If} $DxrCatShown != 1
+		; No page was shown: a silent install. Without /COMPONENTS= this is a no-op.
+		${If} $DxrCatSel == ""
+			Return
+		${EndIf}
+		DetailPrint "Catalog: /COMPONENTS=$DxrCatSel"
+		Call DxrCatQuery
+	${EndIf}
+
+	StrCpy $DxrCatExe "$INSTDIR\dxr-get.exe"
+	${IfNot} ${FileExists} "$DxrCatExe"
+		StrCpy $DxrCatExe "$PLUGINSDIR\dxr-get.exe"
+	${EndIf}
+
+	${If} $DxrCatState == "ok"
+		StrCpy $R0 0
+		${DoWhile} $R0 < $DxrCatCount
+			IntOp $R0 $R0 + 1
+			${If} $DxrCatShown == 1
+				; What the user left ticked.
+				IntOp $R1 ${DxrCatSlot1} + $R0
+				IntOp $R1 $R1 - 1
+				SectionGetFlags $R1 $R2
+				IntOp $R5 $R2 & ${SF_SELECTED}
+				IntOp $R6 $R2 & ${SF_RO}
+				${If} $R6 != 0
+					StrCpy $R5 0
+				${EndIf}
+			${Else}
+				ReadINIStr $R5 "$DxrCatIni" "item$R0" "selected"
+			${EndIf}
+			${If} $R5 != 0
+			${AndIf} $R5 != ""
+				ReadINIStr $R8 "$DxrCatIni" "item$R0" "id"
+				ReadINIStr $R9 "$DxrCatIni" "item$R0" "name"
+				Push $R0
+				Call DxrCatInstallOne
+				Pop $R0
+			${EndIf}
+		${Loop}
+	${EndIf}
+
+	; Ids asked for by name that the listing did not contain (or there was no
+	; listing): dxr-get decides. Space-separated, already filtered to [a-z0-9._-].
+	${If} $DxrCatState == "ok"
+	${OrIf} $DxrCatState == "unsupported"
+	${OrIf} $DxrCatState == "offline"
+		ReadINIStr $R7 "$DxrCatIni" "catalog" "passthrough"
+		ClearErrors
+		${DoWhile} $R7 != ""
+			; Take the first word of $R7 into $R8, keep the rest in $R7.
+			StrCpy $R1 0
+			dxr_cat_word:
+				StrCpy $R2 $R7 1 $R1
+				StrCmp $R2 "" dxr_cat_word_end
+				StrCmp $R2 " " dxr_cat_word_end
+				IntOp $R1 $R1 + 1
+				Goto dxr_cat_word
+			dxr_cat_word_end:
+			StrCpy $R8 $R7 $R1
+			IntOp $R1 $R1 + 1
+			StrCpy $R7 $R7 "" $R1
+			${If} $R8 != ""
+				StrCpy $R9 $R8
+				Push $R7
+				Call DxrCatInstallOne
+				Pop $R7
+			${EndIf}
+		${Loop}
+	${ElseIf} $DxrCatShown != 1
+		DetailPrint "Catalog: the component listing is not available ($DxrCatState); /COMPONENTS= was not acted on."
+		StrCpy $DxrCatSkipped "$DxrCatSkipped/COMPONENTS=$DxrCatSel: the component listing could not be run$\r$\n"
+	${EndIf}
+
+	; Report. The file is for an unattended caller; the finish page for a person.
+	${If} $DxrCatSkipped != ""
+		ClearErrors
+		FileOpen $R0 "$INSTDIR\catalog-skipped.txt" w
+		${IfNot} ${Errors}
+			FileWrite $R0 "DisplayXR Setup ${VERSION}: the runtime was installed. These optional components were NOT installed:$\r$\n$\r$\n"
+			FileWrite $R0 "$DxrCatSkipped"
+			FileWrite $R0 "$\r$\nTo add them, run Setup again with an internet connection, or from an elevated prompt:$\r$\n"
+			FileWrite $R0 "  $\"$INSTDIR\dxr-get.exe$\" install <component>$\r$\n"
+			FileClose $R0
+		${EndIf}
+		ClearErrors
+		StrCpy $DxrCatFinishExtra "$\r$\n$\r$\nNot installed:$\r$\n$DxrCatSkipped"
+		StrCpy $DxrCatFinishExtra "$DxrCatFinishExtra$\r$\nRun Setup again with an internet connection to add them (details: catalog-skipped.txt in the install folder)."
+	${Else}
+		Delete "$INSTDIR\catalog-skipped.txt"
+		${If} $DxrCatState == "offline"
+		${AndIf} $DxrCatShown == 1
+			StrCpy $DxrCatFinishExtra "$\r$\n$\r$\nOptional components (among them the open 2D-to-3D conversion provider) were not offered, because the DisplayXR Catalog could not be reached. Run Setup again with an internet connection to add them."
+		${EndIf}
+	${EndIf}
+
+	; The install log was written at the end of the runtime section; write it
+	; again so it also holds the lines above.
+	StrCpy $0 "$INSTDIR\install.log"
+	Push $0
+	Call DumpLog
+FunctionEnd
+
+!endif ; DXR_CATALOG_UI
+!macroend
+
+!endif ; DXR_CATALOG_NSH

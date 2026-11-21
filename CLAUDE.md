@@ -555,6 +555,7 @@ See `docs/README.md` for the full index. By task:
 | Extension API (display_info, window bindings) | `docs/specs/extensions/XR_DXR_display_info.md` |
 | Why an architectural decision was made | `docs/adr/` |
 | Write / scaffold / lint a DisplayXR app | `docs/guides/displayxr-app-rules.md` (+ `/new-displayxr-app`, `scripts/check_displayxr_app.py`) |
+| Change what the Windows installer offers or downloads (the catalog-driven component page, `/COMPONENTS=`, offline behaviour, the bundle plan) | `docs/roadmap/catalog-driven-bundle.md` -> `installer/Catalog.nsh` (its header is the contract) + `installer/catalog_plan.ps1` |
 | Diagnose a runtime/hardware/environment failure (app hangs at startup, VPN Winsock LSP deadlock, "Failed to initialize OpenXR", Vulkan crash, eye-tracking/camera, Samsung Odyssey stays 2D or wrong colours at 60 Hz (OSD "3D PC selection" + HDMI 2.0), wrong runtime loads) | `docs/getting-started/troubleshooting.md` (triage with `displayxr-cli selftest`) |
 | Diagnose a workspace freeze/wedge (close hangs, one app freezing everything, [RENDER] diag reading, unbounded-wait rules) | `docs/reference/workspace-stability.md` (epic #925; site-by-site audit in the issue) |
 | Understand the service process (who spawns whom, threads/locks, the two compositor modes, client classes, `IPC_MAX_CLIENTS`, failure domains) | `docs/architecture/service-architecture.md` → target: `docs/adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md` |

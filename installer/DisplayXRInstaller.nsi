@@ -94,6 +94,12 @@ ShowUninstDetails show
 ; !makensis, so do not depend on the working directory.
 !include "${__FILEDIR__}\FilesInUse.nsh"
 
+; ADR-064 §8: optional components are listed from the signed DisplayXR Catalog
+; and downloaded by dxr-get; the installer carries the runtime core only. The
+; whole mechanism, its silent-mode rules (/COMPONENTS=, /CATALOG=) and what it
+; does when dxr-get is older or absent are described at the top of this file.
+!include "${__FILEDIR__}\Catalog.nsh"
+
 ; ADR-054 N4b (PR B): the provenance gate enforces by default — a plug-in DLL
 ; must be signed or allowlisted (SHA-256 under HKLM\Software\DisplayXR\Trust\
 ; Allowlist) or the runtime refuses to load it. installer/gen_allowlist_nsh.cmake
@@ -229,9 +235,14 @@ FunctionEnd
 !insertmacro MUI_PAGE_LICENSE "${SOURCE_DIR}\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
 ; ADR-053 P4 (#2108): the conversion-models components (default pack checked,
-; the large still-depth model unchecked).
+; the large still-depth model unchecked). ADR-064 §8: plus the optional
+; components the catalog offers for this machine (Catalog.nsh), with the line
+; above the list saying that they are downloaded and how much.
+!insertmacro DXR_CATALOG_PAGE_DEFINES
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
+; The finish page also names any chosen component that could not be fetched.
+!insertmacro DXR_CATALOG_FINISH_DEFINES
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -1620,6 +1631,12 @@ client_dll_ok:
 
 SectionEnd
 
+; ADR-064 §8: the catalog component slots and the section that installs the
+; chosen ones. Here, between the runtime and the conversion models, on purpose:
+; dxr-get and the runtime's registry Version exist by now, and the models
+; section below prefers the pack of an open conversion provider installed here.
+!insertmacro DXR_CATALOG_SECTIONS
+
 ; #2234: resolve the default conversion pack into $R2 (precedence in the
 ; "Conversion model store" block near the top). Scratch: $R4-$R7.
 Function DxrResolveModelsPack
@@ -1893,6 +1910,7 @@ Section "Uninstall"
 	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
 	Delete "$INSTDIR\displayxr-cli.exe"
 	Delete "$INSTDIR\dxr-get.exe"
+	!insertmacro DXR_CATALOG_UNINSTALL
 	; Retired (superseded by the Dashboard); kept so uninstalling an older
 	; install still cleans it.
 	Delete "$INSTDIR\displayxr-control-panel.exe"
@@ -1991,10 +2009,14 @@ SectionEnd
 	!insertmacro MUI_DESCRIPTION_TEXT ${SecShortcuts} "Create Start Menu shortcuts"
 	!insertmacro MUI_DESCRIPTION_TEXT ${SecModels} "Download the default 2D-to-3D conversion models now (about 113 MB). Without it they download on first use."
 	!insertmacro MUI_DESCRIPTION_TEXT ${SecModelsLarge} "Also download the large still-image depth model now (about 0.7 GB). Without it it downloads when first needed."
+	!insertmacro DXR_CATALOG_DESCRIPTIONS
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ;--------------------------------
 ; Installer Functions
+
+; ADR-064 §8 (Catalog.nsh). After the sections: these name section indices.
+!insertmacro DXR_CATALOG_FUNCTIONS
 
 Function .onInit
 !ifdef INNER
@@ -2010,6 +2032,8 @@ Function .onInit
 		MessageBox MB_ICONSTOP "DisplayXR requires 64-bit Windows." /SD IDOK
 		Abort
 	${EndIf}
+	; Page texts and the /COMPONENTS= and /CATALOG= switches. No network here.
+	Call DxrCatInit
 FunctionEnd
 
 ; #2713 backstop: any section Abort lands here. The explicit calls before
