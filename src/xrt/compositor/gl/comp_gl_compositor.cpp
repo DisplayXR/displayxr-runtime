@@ -10488,12 +10488,34 @@ comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
 	float pixel_size_y = disp_h_m / (float)disp_px_h;
 
+	// The panel's desktop origin. ClientToScreen is in virtual-desktop
+	// coordinates, so the window centre must be measured from the panel's
+	// top-left, not from (0,0) — on a panel that is not the leftmost/topmost
+	// monitor (a G90XF at x=1920 beside a laptop panel) the old (0,0) origin
+	// put every window ~one monitor-width off-centre and shifted the Kooima
+	// frustum. Same query and arithmetic as the D3D12/D3D11 paths; a DP that
+	// cannot answer keeps the old 0,0 behaviour.
+	int32_t disp_left = 0;
+	int32_t disp_top = 0;
+	if (c->display_processor != NULL) {
+		uint32_t dp_px_w = 0;
+		uint32_t dp_px_h = 0;
+		int32_t dp_left = 0;
+		int32_t dp_top = 0;
+		if (xrt_display_processor_gl_get_display_pixel_info(c->display_processor, &dp_px_w, &dp_px_h,
+		                                                     &dp_left, &dp_top) &&
+		    dp_px_w > 0 && dp_px_h > 0) {
+			disp_left = dp_left;
+			disp_top = dp_top;
+		}
+	}
+
 	out_metrics->display_width_m = disp_w_m;
 	out_metrics->display_height_m = disp_h_m;
 	out_metrics->display_pixel_width = disp_px_w;
 	out_metrics->display_pixel_height = disp_px_h;
-	out_metrics->display_screen_left = 0;
-	out_metrics->display_screen_top = 0;
+	out_metrics->display_screen_left = disp_left;
+	out_metrics->display_screen_top = disp_top;
 
 	out_metrics->window_pixel_width = win_px_w;
 	out_metrics->window_pixel_height = win_px_h;
@@ -10503,8 +10525,8 @@ comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->window_width_m = (float)win_px_w * pixel_size_x;
 	out_metrics->window_height_m = (float)win_px_h * pixel_size_y;
 
-	float win_center_px_x = (float)(client_origin.x) + (float)win_px_w / 2.0f;
-	float win_center_px_y = (float)(client_origin.y) + (float)win_px_h / 2.0f;
+	float win_center_px_x = (float)(client_origin.x - disp_left) + (float)win_px_w / 2.0f;
+	float win_center_px_y = (float)(client_origin.y - disp_top) + (float)win_px_h / 2.0f;
 	float disp_center_px_x = (float)disp_px_w / 2.0f;
 	float disp_center_px_y = (float)disp_px_h / 2.0f;
 
