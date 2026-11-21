@@ -12,6 +12,7 @@
 #endif
 
 #include "get_core.h"
+#include "get_signers.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -25,9 +26,10 @@
 /*
  * Schema 1 only: the Authenticode signers a schema-1 payload may carry. A
  * schema-2 catalog names its publishers' signers itself, in the signed index,
- * and this list plays no part there (ADR-064 §4).
+ * and this list plays no part there (ADR-064 §4). The names are shared with
+ * `displayxr-cli catalog` (get_signers.h).
  */
-static const char *const k_v1_trusted_signers[] = {"Leia, Inc."};
+static const char *const k_v1_trusted_signers[] = DXR_FIRST_PARTY_SIGNERS;
 
 /*
  * Schema 1 only: what that schema says by component NAME and schema 2 says as

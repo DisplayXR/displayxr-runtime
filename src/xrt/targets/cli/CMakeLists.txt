@@ -45,6 +45,8 @@ endif()
 add_library(cli_catalog STATIC cli_catalog.c cli_catalog_os.c cli_catalog.h)
 target_link_libraries(cli_catalog PUBLIC xrt-interfaces PRIVATE aux_util xrt-external-cjson)
 target_include_directories(cli_catalog PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# get_signers.h: the first-party signer names, shared with dxr-get (a header only; nothing is linked).
+target_include_directories(cli_catalog PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../get)
 if(WIN32)
 	# shell32: ShellExecuteExW ("runas"); ole32: CoInitializeEx around it, CoCreateGuid;
 	# wintrust + crypt32: the engine's Authenticode signature, checked before an elevated start.

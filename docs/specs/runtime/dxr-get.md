@@ -486,7 +486,8 @@ itself elevated; a front end that wants that does it: [`displayxr-cli catalog`](
   that signer. One publisher's signer cannot vouch for another publisher's item. An unknown
   `signature.kind` is refused, not skipped.
 - **Schema 1 keeps the compiled-in signer list.** A schema-1 catalog names no publishers, so
-  for it the delegation is the list compiled into dxr-get (`Leia, Inc.`), exactly as before.
+  for it the delegation is the list compiled into dxr-get (`Leia, Inc.`, in `get_signers.h`),
+  exactly as before. `displayxr-cli catalog` reads the same list before an elevated start.
   For schema 2 the only thing compiled in is the catalog keys.
 - **Revoked builds.** An asset whose SHA-256 is in the catalog's `revoked` list is refused.
 - **Every payload is checked:** size and SHA-256 must equal the catalog's, then the signer
@@ -699,11 +700,18 @@ engine checks for elevation before it reports that gate). A declined prompt is e
 nothing was changed.
 
 **The engine's signature is checked before every elevated start**, and only then. `dxr-get.exe`
-must carry a valid Authenticode signature that chains to a trusted root (`WinVerifyTrust`, no
-revocation fetch, the check `dxr-get` makes of a downloaded installer). When `displayxr-cli.exe`
-is signed too, the engine's signer must be the CLI's. An unsigned CLI has no signer to compare
-with, and a validly signed engine is then accepted. Otherwise the items that needed elevation
-exit **65** and nothing is started. `--allow-unsigned-engine` lifts the check. It is for
+must pass three rules:
+
+1. it carries a valid Authenticode signature that chains to a trusted root (`WinVerifyTrust`,
+   no revocation fetch: the check `dxr-get` makes of a downloaded installer);
+2. its signer's subject name is one of the **first-party signers**, the list `dxr-get` itself
+   compiles in for schema-1 payloads (`src/xrt/targets/get/get_signers.h`, one header both
+   include; today `Leia, Inc.`). A valid signature of any other publisher is refused, whether
+   or not the CLI is signed;
+3. when `displayxr-cli.exe` is signed too, the engine's signer is the CLI's.
+
+Otherwise the items that needed elevation exit **65** and nothing is started.
+`--allow-unsigned-engine` lifts the check, and is the only thing that does. It is for
 development builds (CI builds are unsigned), it must be given explicitly, and `--elevate` does
 not imply it. Running an unsigned engine with the rights the CLI already has (`list`, or any
 verb from an elevated terminal) is not affected.
@@ -797,8 +805,8 @@ engine on every platform.
 - Updating the runtime from the installed tools: `displayxr-cli catalog` refuses it (exit 64),
   because `dxr-get.exe` runs from the directory the runtime installer has to replace
   (§ displayxr-cli catalog; ADR-064 step 4b).
-- One stop and start of the service for a several-item run (it is stopped and started around
-  each item that needs it).
+- One stop and start of the service for a several-item run: it is stopped and started around
+  each item that needs it, so N such items mean N restarts (ADR-064 step 4c).
 - macOS and Linux (step 5).
 - Progress output a setup UI can render.
 
