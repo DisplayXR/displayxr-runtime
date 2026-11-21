@@ -284,11 +284,43 @@ env_service_exists(void *u, const char *name)
 	return dxr_service_exists(name);
 }
 
+/*
+ * Detect evidence, gathered once per run (#2737): `list` evaluates every item's
+ * rules, and a SetupAPI walk per rule set would be wasted work.
+ */
+#define MAX_EDIDS 32
+#define MAX_USB 128
+
+static struct
+{
+	struct dxr_edid_id edid[MAX_EDIDS];
+	int n_edid; //!< -1 until gathered
+	struct dxr_usb_id usb[MAX_USB];
+	int n_usb; //!< -1 until gathered
+} g_evidence = {.n_edid = -1, .n_usb = -1};
+
 static int
 env_edids(void *u, struct dxr_edid_id *out, int max)
 {
 	(void)u;
-	return dxr_detect_edids(out, max);
+	if (g_evidence.n_edid < 0) {
+		g_evidence.n_edid = dxr_detect_edids(g_evidence.edid, MAX_EDIDS);
+	}
+	int n = g_evidence.n_edid < max ? g_evidence.n_edid : max;
+	memcpy(out, g_evidence.edid, (size_t)n * sizeof(*out));
+	return n;
+}
+
+static int
+env_usb(void *u, struct dxr_usb_id *out, int max)
+{
+	(void)u;
+	if (g_evidence.n_usb < 0) {
+		g_evidence.n_usb = dxr_detect_usb(g_evidence.usb, MAX_USB);
+	}
+	int n = g_evidence.n_usb < max ? g_evidence.n_usb : max;
+	memcpy(out, g_evidence.usb, (size_t)n * sizeof(*out));
+	return n;
 }
 
 static bool
@@ -323,6 +355,7 @@ static struct dxr_env k_env = {
     .file_exists = env_file_exists,
     .service_exists = env_service_exists,
     .edids = env_edids,
+    .usb = env_usb,
     .receipt = env_receipt,
     .cached_bytes = env_cached_bytes,
 };
@@ -902,8 +935,8 @@ usage(void)
 static int
 cmd_detect(const struct dxr_catalog *c, bool json)
 {
-	struct dxr_edid_id ids[32];
-	int n = dxr_detect_edids(ids, 32);
+	struct dxr_edid_id ids[MAX_EDIDS];
+	int n = env_edids(NULL, ids, MAX_EDIDS);
 	cJSON *o = cJSON_CreateObject();
 	cJSON *e = cJSON_AddArrayToObject(o, "edids");
 	for (int i = 0; i < n; i++) {
@@ -916,8 +949,23 @@ cmd_detect(const struct dxr_catalog *c, bool json)
 			       ids[i].prod);
 		}
 	}
-	// One entry per item that has detect rules, keyed by the name a schema-1
-	// caller knows it by (so `leia_plugin` keeps its key).
+	// Present USB devices: the evidence the `usb` rule kind reads (#2737).
+	struct dxr_usb_id usb[MAX_USB];
+	int n_usb = env_usb(NULL, usb, MAX_USB);
+	cJSON *u = cJSON_AddArrayToObject(o, "usb");
+	for (int i = 0; i < n_usb; i++) {
+		cJSON *x = cJSON_CreateObject();
+		cJSON_AddNumberToObject(x, "vid", usb[i].vid);
+		cJSON_AddNumberToObject(x, "pid", usb[i].pid);
+		cJSON_AddItemToArray(u, x);
+		if (!json) {
+			printf("USB device %04X:%04X\n", usb[i].vid, usb[i].pid);
+		}
+	}
+	// One entry per item that has detect rules: in the `display_plugins` list
+	// (#2737), and -- for one release -- also as an object keyed by the name a
+	// schema-1 caller knows it by (so `leia_plugin` keeps its key).
+	cJSON *dps = cJSON_AddArrayToObject(o, "display_plugins");
 	const cJSON *it;
 	cJSON_ArrayForEach(it, c->items)
 	{
@@ -934,6 +982,14 @@ cmd_detect(const struct dxr_catalog *c, bool json)
 		cJSON_AddBoolToObject(l, "high_confidence", hi);
 		cJSON_AddStringToObject(l, "evidence", hi ? why_hi : why_any);
 		cJSON_AddStringToObject(l, "id", dxr_item_id(it));
+		cJSON *d = cJSON_CreateObject();
+		cJSON_AddStringToObject(d, "id", dxr_item_id(it));
+		cJSON_AddStringToObject(d, "component", name);
+		cJSON_AddStringToObject(d, "label", dxr_item_label(it));
+		cJSON_AddBoolToObject(d, "match", any);
+		cJSON_AddBoolToObject(d, "high_confidence", hi);
+		cJSON_AddStringToObject(d, "evidence", hi ? why_hi : why_any);
+		cJSON_AddItemToArray(dps, d);
 		if (!json) {
 			printf("%s: %s%s%s\n", name,
 			       any ? (hi ? "MATCH (high confidence)" : "match (low confidence)") : "no match",

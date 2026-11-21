@@ -57,6 +57,7 @@ struct Machine
 	std::map<std::string, uint32_t, NoCase> dword; // "key|value" -> data
 	std::set<std::string, NoCase> keys, files, services;
 	std::vector<dxr_edid_id> edids;
+	std::vector<dxr_usb_id> usb;
 	std::map<std::string, dxr_receipt> receipts;
 	std::map<std::string, uint64_t> cached; // sha256 -> bytes in the download cache
 
@@ -100,6 +101,14 @@ struct Machine
 		};
 		e.edids = [](void *u, dxr_edid_id *out, int max) {
 			auto &v = static_cast<Machine *>(u)->edids;
+			int n = 0;
+			for (; n < max && n < (int)v.size(); n++) {
+				out[n] = v[n];
+			}
+			return n;
+		};
+		e.usb = [](void *u, dxr_usb_id *out, int max) {
+			auto &v = static_cast<Machine *>(u)->usb;
 			int n = 0;
 			for (; n < max && n < (int)v.size(); n++) {
 				out[n] = v[n];
@@ -1021,6 +1030,54 @@ TEST_CASE("detect rules: every kind, and an unknown kind is not a match")
 
 	CHECK_FALSE(match(R"([{"kind":"telepathy","confidence":"high"}])"));
 	CHECK_FALSE(match(R"({"not":"an array"})"));
+}
+
+TEST_CASE("detect rules (#2737): edid product range, usb VID:PID, vendor-only rules are never high")
+{
+	Machine m;
+	dxr_env e = m.env();
+	char why[256];
+	auto match = [&](const char *rules, bool high_only = false) {
+		cJSON *r = cJSON_Parse(rules);
+		REQUIRE(r != nullptr);
+		bool ok = dxr_detect_rules(r, &e, high_only, why, sizeof(why));
+		cJSON_Delete(r);
+		return ok;
+	};
+	m.edids = {{44048, 16711}};
+
+	// edid product range: inclusive, high when the catalog says so.
+	CHECK(match(R"([{"kind":"edid","man":44048,"prod_min":16700,"prod_max":16711,"confidence":"high"}])", true));
+	CHECK(std::string(why).find("high confidence") != std::string::npos);
+	CHECK(match(R"([{"kind":"edid","man":44048,"prod_min":16711,"prod_max":16720,"confidence":"high"}])", true));
+	CHECK_FALSE(match(R"([{"kind":"edid","man":44048,"prod_min":16712,"prod_max":16720,"confidence":"high"}])"));
+	CHECK_FALSE(match(R"([{"kind":"edid","man":44049,"prod_min":0,"prod_max":65535,"confidence":"high"}])"));
+	// Malformed: inverted range, half a range, exact + range, out of 16 bits.
+	CHECK_FALSE(match(R"([{"kind":"edid","man":44048,"prod_min":16720,"prod_max":16700,"confidence":"high"}])"));
+	CHECK_FALSE(match(R"([{"kind":"edid","man":44048,"prod_min":16700,"confidence":"high"}])"));
+	CHECK_FALSE(match(R"([{"kind":"edid","man":44048,"prod":16711,"prod_max":16720,"confidence":"high"}])"));
+	CHECK_FALSE(match(R"([{"kind":"edid","man":44048,"prod":80000,"confidence":"high"}])"));
+
+	// Manufacturer only: matches, but never as high confidence (Dell ships 2D monitors).
+	CHECK(match(R"([{"kind":"edid","man":44048,"confidence":"high"}])"));
+	CHECK(std::string(why).find("low confidence") != std::string::npos);
+	CHECK_FALSE(match(R"([{"kind":"edid","man":44048,"confidence":"high"}])", true));
+
+	// usb: exact, range, vendor-only.
+	CHECK_FALSE(match(R"([{"kind":"usb","vid":11012,"pid":7,"confidence":"high"}])"));
+	m.usb = {{0x046D, 0xC34B}, {11012, 7}};
+	CHECK(match(R"([{"kind":"usb","vid":11012,"pid":7,"confidence":"high","note":"tracking camera"}])", true));
+	CHECK(std::string(why) == "USB device 2B04:0007 tracking camera (high confidence)");
+	CHECK(match(R"([{"kind":"usb","vid":11012,"pid_min":1,"pid_max":9,"confidence":"high"}])", true));
+	CHECK_FALSE(match(R"([{"kind":"usb","vid":11012,"pid":8,"confidence":"high"}])"));
+	CHECK(match(R"([{"kind":"usb","vid":1133,"confidence":"high"}])"));
+	CHECK_FALSE(match(R"([{"kind":"usb","vid":1133,"confidence":"high"}])", true));
+	CHECK_FALSE(match(R"([{"kind":"usb","pid":7,"confidence":"high"}])"));
+
+	// An unknown kind before a matching rule does not stop evaluation.
+	const char *unknown_then_edid =
+	    R"([{"kind":"telepathy","confidence":"high"},{"kind":"edid","man":44048,"prod":16711,"confidence":"high"}])";
+	CHECK(match(unknown_then_edid, true));
 }
 
 TEST_CASE("installed version: the catalog's rule, the registration row, then the receipt")
