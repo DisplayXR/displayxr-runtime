@@ -301,6 +301,24 @@ class Schema2OnlyComponents(unittest.TestCase):
         self.assertEqual(gen_catalog.pick_asset(runtime, "2.69.2", [{"name": "DisplayXRSetup-2.69.2.exe"}])["name"],
                          "DisplayXRSetup-2.69.2.exe")
 
+    def test_unsigned_release_is_listed_without_an_asset_and_still_validates(self):
+        # ADR-064: every installable asset is signed. A provider whose release is not
+        # signed yet (no `windows` block from the generator) is listed with nothing to
+        # fetch; it becomes installable when a signed asset replaces the unsigned one.
+        extra = extra_fixture()
+        del extra["leia_conversion"]["windows"]
+        del extra["ultraleap"]["windows"]
+        v2 = gen_catalog.build_catalog_v2(v1_fixture(), extra)
+        items = {i["id"]: i for i in v2["items"]}
+        self.assertNotIn("assets", items["leia-conversion"])
+        self.assertNotIn("assets", items["ultraleap"])
+        self.assertEqual(items["leia-conversion"]["aliases"], ["leia_conversion"])  # `dxr-get install leia_conversion`
+        self.assertEqual(gen_catalog.validate_v2(v2), [])
+        # And the validator refuses an installable asset that lost its signature.
+        signed = gen_catalog.build_catalog_v2(v1_fixture(), extra_fixture())
+        del signed["items"][4]["assets"]["windows-x64"]["signature"]
+        self.assertTrue(any("needs a signature" in p for p in gen_catalog.validate_v2(signed)))
+
     def test_unpinned_component_is_not_listed_and_does_not_touch_the_network(self):
         saved = gen_catalog.api_json
         gen_catalog.api_json = lambda path: self.fail("network access for an unpinned component: " + path)
