@@ -563,6 +563,48 @@ absolute_windows_path(const char *p)
 	       (p[2] == '\\' || p[2] == '/') && strchr(p, '%') == NULL;
 }
 
+static bool
+u16_of(const cJSON *o, const char *k, uint16_t *out)
+{
+	const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+	if (!cJSON_IsNumber(v) || v->valuedouble < 0 || v->valuedouble > 65535) {
+		return false;
+	}
+	*out = (uint16_t)v->valueint;
+	return true;
+}
+
+/*!
+ * The id part of an `edid` (prod) or `usb` (pid) rule: an exact `<k>`, else an
+ * inclusive `<k>_min`..`<k>_max`, else (neither) any id, with @p specific false.
+ * Returns false for a malformed rule.
+ */
+static bool
+id_range(const cJSON *r, const char *k, uint16_t *lo, uint16_t *hi, bool *specific)
+{
+	char kmin[16], kmax[16];
+	(void)snprintf(kmin, sizeof(kmin), "%s_min", k);
+	(void)snprintf(kmax, sizeof(kmax), "%s_max", k);
+	const bool has_exact = cJSON_GetObjectItemCaseSensitive(r, k) != NULL;
+	const bool has_min = cJSON_GetObjectItemCaseSensitive(r, kmin) != NULL;
+	const bool has_max = cJSON_GetObjectItemCaseSensitive(r, kmax) != NULL;
+	*specific = true;
+	if (has_exact) {
+		if (has_min || has_max || !u16_of(r, k, lo)) {
+			return false;
+		}
+		*hi = *lo;
+		return true;
+	}
+	if (has_min || has_max) {
+		return has_min && has_max && u16_of(r, kmin, lo) && u16_of(r, kmax, hi) && *lo <= *hi;
+	}
+	*specific = false;
+	*lo = 0;
+	*hi = 0xFFFF;
+	return true;
+}
+
 bool
 dxr_detect_rules(const cJSON *rules, const struct dxr_env *env, bool high_only, char *why, size_t why_size)
 {
@@ -571,7 +613,8 @@ dxr_detect_rules(const cJSON *rules, const struct dxr_env *env, bool high_only, 
 		return false;
 	}
 	struct dxr_edid_id ids[32];
-	int n = -1; // gathered on first use: most rule sets have no EDID rule
+	struct dxr_usb_id usb[128];
+	int n = -1, n_usb = -1; // gathered on first use: most rule sets have no EDID / USB rule
 	const cJSON *r;
 	cJSON_ArrayForEach(r, rules)
 	{
@@ -579,28 +622,54 @@ dxr_detect_rules(const cJSON *rules, const struct dxr_env *env, bool high_only, 
 		const char *conf = jstr(r, "confidence");
 		const char *note = jstr(r, "note");
 		const char *key = jstr(r, "key"), *val = jstr(r, "value");
-		const bool high = conf != NULL && strcmp(conf, "high") == 0;
-		if (kind == NULL || (high_only && !high)) {
+		bool high = conf != NULL && strcmp(conf, "high") == 0;
+		if (kind == NULL) {
 			continue;
 		}
-		if (strcmp(kind, "edid") == 0) {
-			const cJSON *m = cJSON_GetObjectItemCaseSensitive(r, "man");
-			const cJSON *p = cJSON_GetObjectItemCaseSensitive(r, "prod");
-			if (!cJSON_IsNumber(m) || !cJSON_IsNumber(p)) {
+		if (strcmp(kind, "edid") == 0 || strcmp(kind, "usb") == 0) {
+			// #2737: `edid` {man, prod | prod_min..prod_max} and `usb`
+			// {vid, pid | pid_min..pid_max}. A rule with no product id matches
+			// any product of that vendor (Dell and Acer ship 2D monitors too):
+			// never high confidence, whatever it claims. Malformed: no match.
+			const bool edid = kind[0] == 'e';
+			uint16_t want = 0, lo = 0, hi = 0;
+			bool specific = false;
+			if (!u16_of(r, edid ? "man" : "vid", &want) ||
+			    !id_range(r, edid ? "prod" : "pid", &lo, &hi, &specific)) {
 				continue;
 			}
-			if (n < 0) {
+			high = high && specific;
+			if (high_only && !high) {
+				continue;
+			}
+			if (edid && n < 0) {
 				n = env->edids != NULL ? env->edids(env->user, ids, 32) : 0;
 			}
-			for (int i = 0; i < n; i++) {
-				if (ids[i].man == (uint16_t)m->valueint && ids[i].prod == (uint16_t)p->valueint) {
-					(void)snprintf(why, why_size, "display EDID %u/%u%s%s (%s confidence)",
-					               ids[i].man, ids[i].prod, note ? " " : "", note ? note : "",
-					               conf ? conf : "?");
-					return true;
-				}
+			if (!edid && n_usb < 0) {
+				n_usb = env->usb != NULL ? env->usb(env->user, usb, 128) : 0;
 			}
-		} else if (strcmp(kind, "registry_dword_min") == 0) {
+			const int count = edid ? n : n_usb;
+			for (int i = 0; i < count; i++) {
+				const uint16_t v = edid ? ids[i].man : usb[i].vid;
+				const uint16_t id = edid ? ids[i].prod : usb[i].pid;
+				if (v != want || id < lo || id > hi) {
+					continue;
+				}
+				if (edid) {
+					(void)snprintf(why, why_size, "display EDID %u/%u%s%s (%s confidence)", v, id,
+					               note ? " " : "", note ? note : "", high ? "high" : "low");
+				} else {
+					(void)snprintf(why, why_size, "USB device %04X:%04X%s%s (%s confidence)", v, id,
+					               note ? " " : "", note ? note : "", high ? "high" : "low");
+				}
+				return true;
+			}
+			continue;
+		}
+		if (high_only && !high) {
+			continue;
+		}
+		if (strcmp(kind, "registry_dword_min") == 0) {
 			const cJSON *min = cJSON_GetObjectItemCaseSensitive(r, "min");
 			uint32_t v = 0;
 			if (key && val && cJSON_IsNumber(min) && env->reg_dword != NULL &&

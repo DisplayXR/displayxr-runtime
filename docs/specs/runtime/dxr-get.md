@@ -473,23 +473,34 @@ itself elevated; a front end that wants that does it (ADR-064 step 4).
 
 Detect rules are data in the signed catalog: an item's `detect` array, and the `detect` array
 of an external prerequisite. Supporting a new panel therefore needs a catalog change, not a
-new dxr-get. The Leia plug-in's rules are generated from its own EDID table
-(`src/drv_leia/leia_edid_table.h` in displayxr-leia-plugin).
+new dxr-get. A display plug-in's rules come from its own release asset,
+`displayxr-detect.json` (#2737, `component-catalog.md` § Display plug-in detect manifest); the
+Leia plug-in generates it from its EDID table (`src/drv_leia/leia_edid_table.h` in
+displayxr-leia-plugin).
 
 | Kind | Matches when |
 |---|---|
-| `edid` | `{man, prod}` equals a present monitor's EDID ids. Both 16-bit words are read little-endian, the plug-in table's convention: Dell shows as `man` 44048 (`0xAC10`). A Leia panel can carry another brand's manufacturer id (the 8K Leia display enumerates as Dell `DEL4147`), which is why the product id is part of every rule. The full EDID value is read, because 8K panels carry DisplayID extension blocks well past 256 bytes |
+| `edid` | `man` and `prod` (exact) or `prod_min`..`prod_max` (inclusive) match a present monitor's EDID ids. Both 16-bit words are read little-endian, the plug-in table's convention: Dell shows as `man` 44048 (`0xAC10`). A Leia panel can carry another brand's manufacturer id (the 8K Leia display enumerates as Dell `DEL4147`), which is why a product id is part of every high-confidence rule. The full EDID value is read, because 8K panels carry DisplayID extension blocks well past 256 bytes |
+| `usb` | `vid` and `pid` (exact) or `pid_min`..`pid_max` match a present USB device (SetupAPI's `USB` enumerator, interface children included), e.g. a vendor's tracking camera |
 | `registry_dword_min` | the DWORD `key`\\`value` is at least `min` (the SR platform's `NConnectedDevices >= 1`) |
 | `registry_sz_min` | the string `key`\\`value` is a dotted version at or above `min` |
 | `registry_key_exists` | the `HKLM` key exists |
 | `file_exists` | `path` exists. An absolute path only; a path with `%` or without a drive is never matched |
 | `service_exists` | a Windows service named `name` is installed (running or not) |
 
-Registry rules read the 64-bit view. A rule of an unknown kind is not matched.
+Registry rules read the 64-bit view. An `edid` rule with only `man`, or a `usb` rule with only
+`vid`, is always treated as **low** confidence, whatever the catalog says. A malformed rule (half
+or inverted range, exact and range together, a value outside 16 bits) matches nothing. A rule of
+an unknown kind is not matched, and evaluation goes on to the next rule. The EDID and USB
+evidence is gathered once per run, however many items' rules are evaluated.
 
-`detect` evaluates the rules of **every** item that has some, and prints one entry per item
-under its schema-1 name (so the Leia plug-in's key is still `leia_plugin`). Low-confidence
-rules (the generic Acer product ids 0–3) are reported and never trigger an install.
+`detect` evaluates the rules of **every** item that has some. `--json`:
+`{"edids":[{man,prod}], "usb":[{vid,pid}], "display_plugins":[{id, component, label, match,
+high_confidence, evidence}], "<schema-1 name>":{match, high_confidence, evidence, id}, ...}`.
+`display_plugins` has one entry per item with detect rules (`component` is its schema-1 name);
+the per-name objects (so the Leia plug-in's key is still `leia_plugin`) are kept for one
+release. Low-confidence rules (the generic Acer product ids 0–3) are reported and never trigger
+an install.
 
 ## What changed for the three first-party components
 
@@ -502,7 +513,7 @@ Their behaviour and exit codes are the schema-1 tool's, with these deliberate di
 | `plan --json` | the schema-1 fields | the same fields in the same order, plus new ones after them |
 | `plan`: `reason` of a hardware item | `Leia display: <evidence>` | `detected: <evidence>`, for any item. Intentional: the text was Leia-specific. `reason` is free text for people; the DisplayXR Browser installer, the Leia plug-in installer and the runtime installer's listing shim were checked and none reads it (they read `component`, `state`, `target`, `size` and exit codes) |
 | `ensure-for`, `install` | no record | write a receipt per installed item |
-| `detect --json` | one `leia_plugin` object | the same object (plus its `id`), and one per other item with detect rules |
+| `detect --json` | one `leia_plugin` object | the same object (plus its `id`), and one per other item with detect rules; plus `usb` evidence and a `display_plugins` list (#2737) |
 | any | waited for a child installer without limit | waits at most one hour |
 
 ## Validating on a test machine

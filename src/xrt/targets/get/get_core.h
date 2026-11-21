@@ -86,6 +86,8 @@ struct dxr_env
 	bool (*file_exists)(void *user, const char *path);
 	bool (*service_exists)(void *user, const char *name);
 	int (*edids)(void *user, struct dxr_edid_id *out, int max);
+	//! Present USB devices' VID:PIDs (the `usb` detect rule, #2737).
+	int (*usb)(void *user, struct dxr_usb_id *out, int max);
 	bool (*receipt)(void *user, const char *id, struct dxr_receipt *out);
 	//! Bytes of this asset already in the download cache (complete or partial).
 	uint64_t (*cached_bytes)(void *user, const char *sha256, const char *file, uint64_t size);

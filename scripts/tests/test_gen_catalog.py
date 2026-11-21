@@ -270,5 +270,288 @@ class Schema2Validation(unittest.TestCase):
         self.assertIn("listing.url must be an https URL", self.problems())
 
 
+# --------------------------------------------------------------------------- #2737
+
+MANIFEST = {
+    "schema": 1,
+    "id": "leia-sr",
+    "label": "Leia display plug-in (manifest)",
+    "registry_version": "HKLM\\Software\\DisplayXR\\Plugins\\LeiaSR\\Version",
+    "requires": {"runtime": ">=2.66.8"},
+    "detect": [
+        {"kind": "edid", "man": 44048, "prod": 16711, "confidence": "high", "note": "DELL_8K32"},
+        {"kind": "edid", "man": 19501, "prod_min": 29440, "prod_max": 29447, "confidence": "high"},
+        {"kind": "usb", "vid": 11012, "pid": 7, "confidence": "high", "note": "tracking camera"},
+        {"kind": "teleport", "confidence": "high"},
+    ],
+}
+
+LEIA_HEADER = """
+static const uint16_t leia_edid_table[][2] = {
+    {44048, 16711},   // DELL_8K32
+    {44806, 3},       // ACER_GENERIC
+};
+"""
+
+
+class DetectRuleValidation(unittest.TestCase):
+    def test_exact_and_range(self):
+        r, p = gen_catalog.validate_rule({"kind": "edid", "man": 1, "prod": 2, "confidence": "high"})
+        self.assertEqual(r, {"kind": "edid", "man": 1, "prod": 2, "confidence": "high"})
+        self.assertEqual(p, [])
+        r, _ = gen_catalog.validate_rule({"kind": "usb", "vid": 1, "pid_min": 2, "pid_max": 9,
+                                          "confidence": "low"})
+        self.assertEqual((r["pid_min"], r["pid_max"]), (2, 9))
+
+    def test_vendor_only_is_never_high(self):
+        for rule in ({"kind": "edid", "man": 44048, "confidence": "high"},
+                     {"kind": "usb", "vid": 1133, "confidence": "high"}):
+            r, p = gen_catalog.validate_rule(rule)
+            self.assertEqual(r["confidence"], "low")
+            self.assertTrue(p)
+
+    def test_rejects(self):
+        for rule in (
+                {"kind": "edid", "man": 70000, "prod": 1, "confidence": "high"},
+                {"kind": "edid", "man": 1, "prod": 1, "prod_min": 1, "prod_max": 2, "confidence": "high"},
+                {"kind": "edid", "man": 1, "prod_min": 5, "prod_max": 2, "confidence": "high"},
+                {"kind": "edid", "man": True, "prod": 1, "confidence": "high"},
+                {"kind": "usb", "vid": 1, "pid": 2, "confidence": "maybe"},
+                {"kind": "registry_dword_min", "key": "HKCU\\X", "value": "v", "min": 1, "confidence": "high"},
+                {"kind": "file_exists", "path": "%ProgramFiles%\\a.dll"},
+                {"kind": "file_exists", "path": "C:\\%WINDIR%\\a.dll"},
+        ):
+            r, p = gen_catalog.validate_rule(rule)
+            self.assertIsNone(r, rule)
+            self.assertTrue(p, rule)
+
+    def test_unknown_kind_dropped(self):
+        r, p = gen_catalog.validate_rule({"kind": "teleport", "confidence": "high"})
+        self.assertIsNone(r)
+        self.assertIn("unknown rule kind", p[0])
+
+    def test_schema2_prerequisite_detectors_pass_through(self):
+        for rule in (
+                dict(gen_catalog.SR_REGISTRY_DETECT),
+                {"kind": "registry_sz_min", "key": "HKLM\\K", "value": "Version", "min": "3.2"},
+                {"kind": "registry_key_exists", "key": "HKLM\\K"},
+                {"kind": "file_exists", "path": "C:\\Program Files\\Acme\\a.dll"},
+                {"kind": "service_exists", "name": "AcmeSvc"},
+        ):
+            r, p = gen_catalog.validate_rule(rule)
+            self.assertEqual(r, rule)
+            self.assertEqual(p, [])
+
+    def test_high_only_on_product_evidence(self):
+        # A rule true on ordinary machines must never be an unattended install.
+        for rule in (
+                {"kind": "file_exists", "path": "C:\\Windows\\System32\\kernel32.dll", "confidence": "high"},
+                {"kind": "service_exists", "name": "Spooler", "confidence": "high"},
+                {"kind": "registry_key_exists", "key": "HKLM\\SOFTWARE\\Microsoft", "confidence": "high"},
+                {"kind": "registry_sz_min", "key": "HKLM\\K", "value": "V", "min": "1", "confidence": "high"},
+        ):
+            r, p = gen_catalog.validate_rule(rule)
+            self.assertEqual(r["confidence"], "low", rule)
+            self.assertIn("downgraded to low", p[0])
+        for rule in (
+                {"kind": "edid", "man": 1, "prod": 2, "confidence": "high"},
+                {"kind": "usb", "vid": 1, "pid_min": 2, "pid_max": 3, "confidence": "high"},
+                dict(gen_catalog.SR_REGISTRY_DETECT),
+        ):
+            self.assertEqual(gen_catalog.validate_rule(rule), (rule, []))
+
+    def test_unknown_keys_are_stripped(self):
+        r, p = gen_catalog.validate_rule({"kind": "edid", "man": 1, "prod": 2, "confidence": "high",
+                                          "url": "https://evil.example", "path": "C:\\x"})
+        self.assertEqual(r, {"kind": "edid", "man": 1, "prod": 2, "confidence": "high"})
+        self.assertIn("stripped", p[0])
+        # A key valid for another kind is still foreign to this one.
+        r, _ = gen_catalog.validate_rule({"kind": "service_exists", "name": "S", "min": 1})
+        self.assertEqual(r, {"kind": "service_exists", "name": "S"})
+
+    def test_fixture_rules_are_clean(self):
+        for rule in v1_fixture()["components"]["leia_plugin"]["detect"]:
+            self.assertEqual(gen_catalog.validate_rule(rule), (rule, []))
+
+
+class DetectManifestValidation(unittest.TestCase):
+    def test_good(self):
+        clean, probs = gen_catalog.validate_detect_manifest(MANIFEST)
+        self.assertEqual(clean["id"], "leia-sr")
+        self.assertEqual(clean["label"], "Leia display plug-in (manifest)")
+        self.assertEqual(clean["floor"], "2.66.8")
+        self.assertEqual(len(clean["detect"]), 3)  # the unknown kind is dropped
+        self.assertEqual(len(probs), 1)
+
+    def test_wrong_schema_or_no_rule(self):
+        self.assertIsNone(gen_catalog.validate_detect_manifest(dict(MANIFEST, schema=2))[0])
+        self.assertIsNone(gen_catalog.validate_detect_manifest(
+            dict(MANIFEST, detect=[{"kind": "teleport", "confidence": "high"}]))[0])
+
+    def test_bad_optional_fields_are_ignored(self):
+        clean, probs = gen_catalog.validate_detect_manifest(
+            dict(MANIFEST, id="Bad Id", requires={"runtime": "2.66"}))
+        self.assertNotIn("id", clean)
+        self.assertNotIn("floor", clean)
+        self.assertEqual(len(probs), 3)
+
+
+class FakeResponse:
+    def __init__(self, data):
+        self.data = data
+
+    def read(self, n=-1):
+        return self.data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class DetectManifestIngest(unittest.TestCase):
+    """build_catalog() with GitHub stubbed: the manifest drives detect / floor /
+    registry key; without it the Leia header fallback gives today's rules."""
+
+    def run_build(self, with_manifest, components=None, manifest=MANIFEST):
+        seen = {}
+
+        def release(path):
+            repo = path.split("/")[3]
+            names = [gen_catalog.DETECT_MANIFEST] if with_manifest else []
+            return {"assets": [{"name": n, "browser_download_url": f"https://example.invalid/{repo}/{n}"}
+                               for n in names]}
+
+        def windows_block(comp, version, verifier, download_dir, registry_version=None):
+            seen[comp["name"]] = registry_version
+            return None
+
+        saved = {k: getattr(gen_catalog, k) for k in (
+            "api_json", "windows_block", "repo_file", "browser_floor", "leia_floor", "warn", "info",
+            "COMPONENTS")}
+        saved_urlopen = gen_catalog.urllib.request.urlopen
+        try:
+            gen_catalog.api_json = release
+            gen_catalog.windows_block = windows_block
+            gen_catalog.repo_file = lambda repo, path, ref: LEIA_HEADER if path.endswith("table.h") else None
+            gen_catalog.browser_floor = lambda tag: "2.62.0"
+            gen_catalog.leia_floor = lambda tag: "2.60.0"
+            gen_catalog.warn = gen_catalog.info = lambda msg: None
+            if components is not None:
+                gen_catalog.COMPONENTS = components
+            gen_catalog.urllib.request.urlopen = lambda req, timeout=None: FakeResponse(
+                json.dumps(manifest).encode())
+            versions = {"runtime": "v2.69.1", "leia_plugin": "v2.23.0", "browser": "v1.10.5",
+                        "acme_plugin": "v1.0.0"}
+            cat = gen_catalog.build_catalog(versions, gen_catalog.VERIFIERS["none"], "unused")
+        finally:
+            for k, v in saved.items():
+                setattr(gen_catalog, k, v)
+            gen_catalog.urllib.request.urlopen = saved_urlopen
+        return cat, seen
+
+    def test_manifest_drives_the_entry(self):
+        cat, seen = self.run_build(True)
+        leia = cat["components"]["leia_plugin"]
+        self.assertEqual(leia["requires"], {"runtime": ">=2.66.8"})
+        self.assertEqual([r["kind"] for r in leia["detect"]], ["edid", "edid", "usb"])
+        self.assertEqual(seen["leia_plugin"], MANIFEST["registry_version"])
+        self.assertNotIn("label", leia)  # schema 1 is unchanged in shape
+        self.assertNotIn("id", leia)
+        self.assertEqual(cat["components"]["browser"]["requires"], {"runtime": ">=2.62.0"})
+
+    def test_fallback_without_manifest(self):
+        cat, seen = self.run_build(False)
+        leia = cat["components"]["leia_plugin"]
+        self.assertEqual(leia["requires"], {"runtime": ">=2.60.0"})
+        self.assertEqual(leia["detect"][0], {"kind": "edid", "man": 44048, "prod": 16711,
+                                             "confidence": "high", "note": "DELL_8K32"})
+        self.assertEqual(leia["detect"][1]["confidence"], "low")  # prod < 16
+        self.assertEqual(leia["detect"][-1], gen_catalog.SR_REGISTRY_DETECT)
+        self.assertIsNone(seen["leia_plugin"])
+        self.assertEqual(gen_catalog.MANIFESTS, {})
+
+    def test_floor_above_the_runtime_pin_drops_the_manifest(self):
+        # versions.json pins runtime 2.69.1: a manifest asking for 9.0.0 would make
+        # every ensure-for that detects the plug-in exit 40. The fallback is used.
+        cat, seen = self.run_build(True, manifest=dict(MANIFEST, requires={"runtime": ">=9.0.0"}))
+        leia = cat["components"]["leia_plugin"]
+        self.assertEqual(leia["requires"], {"runtime": ">=2.60.0"})  # the fallback floor
+        self.assertEqual(leia["detect"][-1], gen_catalog.SR_REGISTRY_DETECT)  # the fallback rules
+        self.assertIsNone(seen["leia_plugin"])
+        self.assertNotIn("leia_plugin", gen_catalog.MANIFESTS)
+        # At the pin exactly is fine.
+        cat, _ = self.run_build(True, manifest=dict(MANIFEST, requires={"runtime": ">=2.69.1"}))
+        self.assertEqual(cat["components"]["leia_plugin"]["requires"], {"runtime": ">=2.69.1"})
+
+    def test_manifest_rules_are_cleaned(self):
+        rules = [{"kind": "file_exists", "path": "C:\\Windows\\System32\\kernel32.dll", "confidence": "high"},
+                 {"kind": "edid", "man": 44048, "prod": 16711, "confidence": "high", "extra": 1}]
+        cat, _ = self.run_build(True, manifest=dict(MANIFEST, detect=rules))
+        self.assertEqual(cat["components"]["leia_plugin"]["detect"], [
+            {"kind": "file_exists", "path": "C:\\Windows\\System32\\kernel32.dll", "confidence": "low"},
+            {"kind": "edid", "man": 44048, "prod": 16711, "confidence": "high"}])
+
+    def test_manifests_is_keyword_only(self):
+        with self.assertRaises(TypeError):
+            gen_catalog.build_catalog_v2(v1_fixture(), {})
+
+    def test_v2_names_a_new_vendor_from_its_manifest(self):
+        acme = {"name": "acme_plugin", "pin": "acme_plugin", "repo": "acme-plugin",
+                "asset": "Acme-{v}.exe", "kind": "display_plugin", "args": ["/S"],
+                "registry_version": "HKLM\\Software\\Acme\\Version"}
+        manifest = dict(MANIFEST, id="acme-lightfield", label="Acme lightfield")
+        cat, _ = self.run_build(True, list(gen_catalog.COMPONENTS) + [acme], manifest)
+        v2 = gen_catalog.build_catalog_v2(cat, manifests=dict(gen_catalog.MANIFESTS))
+        item = next(i for i in v2["items"] if i["id"] == "acme-lightfield")
+        self.assertEqual(item["class"], "display_processor")
+        self.assertEqual(item["registered_id"], "acme-lightfield")
+        self.assertEqual(item["name"], "Acme lightfield")
+        self.assertEqual(item["aliases"], ["acme_plugin"])
+        self.assertEqual(len(item["detect"]), 3)
+        # Leia keeps its V2_ITEMS identity whatever its manifest says.
+        self.assertTrue(any(i["id"] == "leia-sr" for i in v2["items"]))
+        # Without the manifests, a vendor V2_ITEMS does not know is not listed.
+        v2 = gen_catalog.build_catalog_v2(cat)
+        self.assertFalse(any(i["id"] == "acme-lightfield" for i in v2["items"]))
+
+
+class Schema2DetectValidation(unittest.TestCase):
+    """validate_v2 checks item and external-requirement detect rules with validate_rule."""
+
+    def setUp(self):
+        self.v2 = gen_catalog.build_catalog_v2(v1_fixture())
+        self.leia = next(i for i in self.v2["items"] if i["id"] == "leia-sr")
+
+    def problems(self):
+        return "\n".join(gen_catalog.validate_v2(self.v2))
+
+    def test_generated_detect_is_clean(self):
+        self.assertEqual(self.problems(), "")
+
+    def test_item_rule_problems(self):
+        self.leia["detect"].append({"kind": "file_exists", "path": "C:\\a.dll", "confidence": "high"})
+        self.leia["detect"].append({"kind": "edid", "man": 1, "prod_min": 9, "prod_max": 2, "confidence": "high"})
+        self.leia["detect"].append({"kind": "teleport"})
+        text = self.problems()
+        self.assertIn("detect[2]: file_exists: high confidence is not allowed", text)
+        self.assertIn("detect[3]: edid: prod_min/prod_max", text)
+        self.assertIn("detect[4]: unknown rule kind 'teleport'", text)
+
+    def test_external_requirement_rules(self):
+        self.leia.setdefault("requires", []).append({
+            "kind": "external", "name": "Acme depth runtime", "info_url": "https://acme.example",
+            "detect": [{"kind": "registry_sz_min", "key": "HKLM\\SOFTWARE\\Acme", "value": "Version",
+                        "min": "3.2"}]})
+        self.assertEqual(self.problems(), "")
+        self.leia["requires"][-1]["detect"][0]["key"] = "HKCU\\SOFTWARE\\Acme"
+        self.assertIn("requires 'Acme depth runtime' detect[0]", self.problems())
+
+    def test_reserved_ids(self):
+        self.leia["aliases"] = ["leia_plugin", "display_plugins"]
+        self.assertIn("'display_plugins' is reserved", self.problems())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  dxr-get detection inputs: monitor EDID ids (SetupAPI) and HKLM
- *         registry reads. The RULES live in the signed catalog (P2, #2705);
+ * @brief  dxr-get detection inputs: monitor EDID ids and present USB
+ *         VID:PIDs (SetupAPI), and HKLM registry reads. The RULES live in the signed catalog (P2, #2705);
  *         this file only gathers evidence.
  */
 
@@ -54,6 +54,68 @@ dxr_detect_edids(struct dxr_edid_id *out, int max)
 			}
 		}
 		RegCloseKey(k);
+	}
+	SetupDiDestroyDeviceInfoList(di);
+	return n;
+}
+
+//! Parses "VID_xxxx&PID_yyyy" out of a hardware id such as "USB\VID_2B04&PID_0007&REV_0100".
+static bool
+parse_usb_hwid(const wchar_t *s, struct dxr_usb_id *id)
+{
+	const wchar_t *v = wcsstr(s, L"VID_");
+	const wchar_t *p = wcsstr(s, L"PID_");
+	if (v == NULL || p == NULL) {
+		return false;
+	}
+	wchar_t *end = NULL;
+	unsigned long vid = wcstoul(v + 4, &end, 16);
+	if (end != v + 8) {
+		return false;
+	}
+	unsigned long pid = wcstoul(p + 4, &end, 16);
+	if (end != p + 8) {
+		return false;
+	}
+	id->vid = (uint16_t)vid;
+	id->pid = (uint16_t)pid;
+	return true;
+}
+
+int
+dxr_detect_usb(struct dxr_usb_id *out, int max)
+{
+	int n = 0;
+	// Every present device the USB enumerator owns: the device node itself and
+	// its interface children (USB\VID_..&PID_..&MI_00) carry the same ids.
+	HDEVINFO di = SetupDiGetClassDevsW(NULL, L"USB", NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+	if (di == INVALID_HANDLE_VALUE) {
+		return 0;
+	}
+	SP_DEVINFO_DATA dd;
+	dd.cbSize = sizeof(dd);
+	for (DWORD i = 0; n < max && SetupDiEnumDeviceInfo(di, i, &dd); i++) {
+		wchar_t ids[1024];
+		DWORD type = 0;
+		if (!SetupDiGetDeviceRegistryPropertyW(di, &dd, SPDRP_HARDWAREID, &type, (PBYTE)ids,
+		                                       sizeof(ids) - 2 * sizeof(wchar_t), NULL) ||
+		    type != REG_MULTI_SZ) {
+			continue;
+		}
+		ids[sizeof(ids) / sizeof(ids[0]) - 1] = 0;
+		ids[sizeof(ids) / sizeof(ids[0]) - 2] = 0;
+		struct dxr_usb_id id;
+		// The first (most specific) hardware id is enough: they all name the same VID:PID.
+		if (!parse_usb_hwid(ids, &id)) {
+			continue;
+		}
+		bool dup = false;
+		for (int j = 0; j < n; j++) {
+			dup = dup || (out[j].vid == id.vid && out[j].pid == id.pid);
+		}
+		if (!dup) {
+			out[n++] = id;
+		}
 	}
 	SetupDiDestroyDeviceInfoList(di);
 	return n;
