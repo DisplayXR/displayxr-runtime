@@ -259,6 +259,14 @@ The full rules, shared by every class, are in
 [vendor-plugin-onboarding.md](vendor-plugin-onboarding.md) § *Licensed
 components* and plugin-discovery.md §2.4.
 
+A provider entitled by its own device reports `licensed` with source
+`hardware` and needs nothing else. One sold separately can be activated from
+your checkout page through the `displayxr://activate` deep link (set the
+deep-link activation flag and a `purchase_url`); the token in that link should
+be a one-time redemption code, never a reusable key, which belongs in the
+`secret` setting. See
+[activation-deep-link.md](../specs/runtime/activation-deep-link.md) §4.
+
 ## 12. Discovery, per OS
 
 **Windows — registry.** `HKLM\Software\DisplayXR\InputProviders\<id>` (64-bit view):

@@ -520,6 +520,14 @@ provider may keep reporting `UNLICENSED` per capability itself, as before.
 - **Activation.** The optional `activate` slot receives an opaque token; it
   may block for a few seconds and never overlaps another `activate` on the
   provider. `displayxr-cli conv activate <id> <token | @file>`.
+- **Activation of the live provider.** A token that arrives through the
+  `displayxr://activate` deep link is delivered to the provider that is LIVE
+  in the service: `conv_core_activate_provider` calls the slot through the
+  provider's host (in-service directly, a satellite through the host
+  channel's `ACTIVATE` message), on a worker thread, and re-describes the
+  provider on acceptance, so its capabilities stop reading `UNLICENSED`
+  without a restart. `conv activate-begin <id>` starts such an activation
+  ([activation-deep-link.md](activation-deep-link.md)).
 - **A licence key** may be a setting of type `secret` (§3.9): stored with
   `conv set`, read through `host->get_setting`, never printed.
 - **Where it shows.** `conv list` has a `licence` column; each provider row of
