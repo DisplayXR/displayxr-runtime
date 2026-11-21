@@ -1636,6 +1636,41 @@ target_plugin_activate(
 	return a.result;
 }
 
+enum target_component_activate_result
+target_plugin_activate_resident(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap)
+{
+	if (out_state != NULL) {
+		xrt_component_license_state_init(out_state);
+	}
+	if (err != NULL && err_cap > 0) {
+		err[0] = '\0';
+	}
+	if (id == NULL || id[0] == '\0') {
+		return TARGET_COMPONENT_ACTIVATE_NOT_LOADED;
+	}
+	// Only the ACTIVE plug-in is resident for certain: a candidate that
+	// declined (an unlicensed one among them) was unloaded. The iface of an
+	// active plug-in stays valid for the life of the process, so it is read
+	// under the refresh lock and called outside it (activate may block).
+	const struct xrt_plugin_iface *iface = NULL;
+	const bool locked = g_refresh_mutex_initialized != 0;
+	if (locked) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	if (g_active_iface != NULL && strcmp(g_active_row_id, id) == 0) {
+		iface = g_active_iface;
+	}
+	if (locked) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	if (iface == NULL) {
+		return TARGET_COMPONENT_ACTIVATE_NOT_LOADED;
+	}
+	return target_component_activate_call(xrt_plugin_iface_has_activate(iface) ? iface->activate : NULL, token,
+	                                      out_state, err, err_cap);
+}
+
 /*!
  * ADR-054 N5: record what the plug-in says about its licence in its ADR-045
  * status record and return the state. Asked after negotiate (so a plug-in

@@ -139,6 +139,18 @@ target_input_plugin_activate(
     const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap);
 
 /*!
+ * Hand @p token to the `activate` slot of the provider @p id that is LIVE in
+ * this process (it loaded, passed the ABI gate and probed), without loading
+ * or negotiating anything: the delivery the service uses so its running
+ * instance learns the new state (activation-deep-link.md §6). NOT_LOADED when
+ * no such provider is resident here: nothing was called. May block for as
+ * long as the provider's `activate` does. The token is opaque, never logged.
+ */
+enum target_component_activate_result
+target_input_plugin_activate_resident(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap);
+
+/*!
  * How many providers loaded, ABI-passed and probed successfully.
  *
  * ADR-034 Amendment 3: the scan keeps EVERY claiming provider resident,

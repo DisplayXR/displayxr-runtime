@@ -144,9 +144,27 @@ bool
 target_plugin_license_state(const char *id, struct xrt_component_license_state *out);
 
 /*!
- * Hand @p token to the registered plug-in @p id's `activate` slot (negotiate
- * only) and return what it said: the new state in @p out_state (may be NULL)
- * or its error line in @p err. The token is opaque and never logged.
+ * Hand @p token to the `activate` slot of the plug-in @p id that is LIVE in
+ * this process (the active display processor), without loading or
+ * negotiating anything: the delivery a long-lived host (the service) uses so
+ * the running instance learns its new state (ADR-064 §5,
+ * activation-deep-link.md §6). NOT_LOADED when @p id is not the active
+ * plug-in here: nothing was called, and the token can be delivered another
+ * way. May block for as long as the plug-in's `activate` does. The token is
+ * opaque and never logged.
+ */
+enum target_component_activate_result
+target_plugin_activate_resident(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap);
+
+/*!
+ * Hand @p token to the registered plug-in @p id's `activate` slot through a
+ * load of its own (load, negotiate, call, unload). This is the HEADLESS
+ * delivery (`displayxr-cli dp activate`, the deep-link handler when no
+ * service hosts the plug-in): it reaches the plug-in in this process, and a
+ * plug-in keeps its activation across processes itself. Never call it in a
+ * process where the plug-in is live: negotiating a second time resets it.
+ * There, use @ref target_plugin_activate_resident.
  */
 enum target_component_activate_result
 target_plugin_activate(
