@@ -63,6 +63,7 @@ set(tests
     tests_cli_lever_catalog
     tests_cli_input_predict
     tests_cli_dp_predict
+    tests_get_catalog
     tests_comp_vblank_grid
     tests_comp_present_feedback
     tests_comp_late_weave_adapt
@@ -1430,6 +1431,12 @@ target_link_libraries(tests_cli_metres_check PRIVATE xrt-interfaces)
 # (linked by the loop) supplies u_setting_is_managed for the managed-lever check.
 target_include_directories(tests_cli_lever_catalog PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
 target_link_libraries(tests_cli_lever_catalog PRIVATE xrt-interfaces)
+
+# ADR-064 steps 2 and 3: dxr-get's catalog model, plan and trust decisions.
+# dxr-get is Windows-only; get_core.c has no OS calls (the machine comes in
+# through a callback table the test fakes), so this runs on every platform.
+target_sources(tests_get_catalog PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/get/get_core.c)
+target_include_directories(tests_get_catalog PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/get)
 
 # N3a (ADR-054): the `input list` prediction rule — PreferredPlugin over
 # ProbeOrder, Enabled=0 never predicted — and the provider-id check behind

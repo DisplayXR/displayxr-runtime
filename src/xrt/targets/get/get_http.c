@@ -208,6 +208,21 @@ file_size(const wchar_t *path)
 	return ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
 }
 
+//! true when a 206 answer's Content-Range starts at @p have (or carries no parsable Content-Range).
+static bool
+range_starts_at(struct conn *c, uint64_t have)
+{
+	wchar_t cr[128];
+	DWORD sz = sizeof(cr);
+	unsigned long long start = 0;
+	if (!WinHttpQueryHeaders(c->req, WINHTTP_QUERY_CONTENT_RANGE, WINHTTP_HEADER_NAME_BY_INDEX, cr, &sz,
+	                         WINHTTP_NO_HEADER_INDEX) ||
+	    swscanf(cr, L"bytes %llu-", &start) != 1) {
+		return true;
+	}
+	return start == (unsigned long long)have;
+}
+
 bool
 dxr_http_get_file(const char *url, const wchar_t *path, uint64_t expect_size, bool octet)
 {
@@ -236,6 +251,14 @@ dxr_http_get_file(const char *url, const wchar_t *path, uint64_t expect_size, bo
 		if (status == 200 && have > 0) {
 			// Server ignored the Range: start over.
 			have = 0;
+		} else if (status == 206 && !range_starts_at(&c, have)) {
+			// A partial answer for another range than the one asked for would
+			// be appended at the wrong offset. The hash check would catch it,
+			// but only after the whole download: start over now instead.
+			conn_close(&c);
+			(void)DeleteFileW(path);
+			dxr_log("  server answered with a different range, restarting the download\n");
+			continue;
 		} else if (status == 416) {
 			conn_close(&c);
 			(void)DeleteFileW(path);

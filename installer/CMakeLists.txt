@@ -75,6 +75,29 @@ if(_dxr_conv_open_err)
 	message(FATAL_ERROR "versions.json has no conversion_open pin: ${_dxr_conv_open_err}")
 endif()
 
+# ADR-064: the class ABI majors this runtime implements, read from the class
+# headers and written by the installer under HKLM\Software\DisplayXR\Runtime\Abi.
+# dxr-get reads them to refuse a catalog item the loader would reject (ADR-020)
+# instead of installing it. A header that stops matching only drops that one
+# value (the .nsi guards each with !ifdef); dxr-get then says "ABI not checked".
+set(DXR_CLASS_ABI_DEFINES "")
+function(dxr_class_abi_define header prefix nsis_name)
+	file(READ "${CMAKE_SOURCE_DIR}/src/xrt/include/xrt/${header}" _h)
+	if(_h MATCHES "#define ${prefix}_CURRENT[ \t]+(${prefix}_[0-9]+)")
+		set(_alias "${CMAKE_MATCH_1}")
+		if(_h MATCHES "#define ${_alias}[ \t]+([0-9]+)")
+			list(APPEND DXR_CLASS_ABI_DEFINES "/D${nsis_name}=${CMAKE_MATCH_1}")
+			set(DXR_CLASS_ABI_DEFINES "${DXR_CLASS_ABI_DEFINES}" PARENT_SCOPE)
+			return()
+		endif()
+	endif()
+	message(WARNING "installer: cannot read ${prefix}_CURRENT from ${header}; Runtime/Abi will lack it")
+endfunction()
+dxr_class_abi_define(xrt_plugin.h XRT_PLUGIN_API_VERSION ABI_DISPLAY_PROCESSOR)
+dxr_class_abi_define(xrt_input_plugin.h XRT_INPUT_PLUGIN_API_VERSION ABI_INPUT_PROVIDER)
+dxr_class_abi_define(xrt_conversion_plugin.h XRT_CONVERSION_PLUGIN_API_VERSION ABI_CONVERSION_PROVIDER)
+dxr_class_abi_define(xrt_tracking_plugin.h XRT_TRACKING_PLUGIN_API_VERSION ABI_TRACKING_PROVIDER)
+
 # Create installer target
 # White icon is set via MUI_ICON in the .nsi script (visible in dark mode Explorer).
 # Do NOT use rcedit post-build — it corrupts NSIS self-extracting executables.
@@ -85,7 +108,20 @@ set(DISPLAYXR_ALLOWLIST_NSH "${CMAKE_CURRENT_BINARY_DIR}/Allowlist.nsh")
 # makensis resolves `!include` against a native (backslash) path only.
 file(TO_NATIVE_PATH "${DISPLAYXR_ALLOWLIST_NSH}" DISPLAYXR_ALLOWLIST_NSH_NATIVE)
 
+# A dxr-get built with a test root key must never be packed (see
+# src/xrt/targets/get/CMakeLists.txt). The option lives in the cache, so a tree
+# that was used for a test build would otherwise keep producing installers.
+set(DXR_INSTALLER_GUARD "")
+if(DXR_GET_TEST_ROOT_KEY)
+	set(DXR_INSTALLER_GUARD
+	    COMMAND "${CMAKE_COMMAND}" -E echo
+	            "ERROR: DXR_GET_TEST_ROOT_KEY is set. Reconfigure with -UDXR_GET_TEST_ROOT_KEY before building an installer."
+	    COMMAND "${CMAKE_COMMAND}" -E false
+	    )
+endif()
+
 add_custom_target(installer
+	${DXR_INSTALLER_GUARD}
 	COMMAND "${CMAKE_COMMAND}"
 		"-DBIN_DIR=${DISPLAYXR_BIN_DIR}"
 		"-DVERSION=${DISPLAYXR_VERSION}"
@@ -104,6 +140,7 @@ add_custom_target(installer
 		"/DSIGN_CMD=${SIGN_CMD}"
 		"/DALLOWLIST_NSH=${DISPLAYXR_ALLOWLIST_NSH_NATIVE}"
 		"/DDXR_CONVERSION_OPEN_TAG=${DXR_CONVERSION_OPEN_TAG}"
+		${DXR_CLASS_ABI_DEFINES}
 		"${CMAKE_CURRENT_SOURCE_DIR}/DisplayXRInstaller.nsi"
 	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 	COMMENT "Building DisplayXR installer..."

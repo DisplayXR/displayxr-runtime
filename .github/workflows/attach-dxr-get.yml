@@ -54,6 +54,8 @@ jobs:
           $s = Get-AuthenticodeSignature out\dxr-get.exe
           $cn = $s.SignerCertificate.GetNameInfo('SimpleName', $false)
           if ($s.Status -ne 'Valid' -or $cn -ne 'Leia, Inc.') { throw "dxr-get.exe signature: $($s.Status), signer '$cn' -- refusing to attach" }
+          # A dxr-get built with a test root key (CMake DXR_GET_TEST_ROOT_KEY) must never be attached.
+          if ([System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("$PWD\out\dxr-get.exe")).Contains('TEST ROOT KEY BUILD')) { throw "dxr-get.exe is a TEST ROOT KEY build -- refusing to attach" }
           (Get-FileHash out\dxr-get.exe -Algorithm SHA256).Hash.ToLower() | Tee-Object out\dxr-get.exe.sha256
           "dxr-get.exe: signed by $cn" >> $env:GITHUB_STEP_SUMMARY
 
