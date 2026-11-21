@@ -83,6 +83,11 @@ cli_print_help(int argc, const char **argv)
 	P("                      'conv options <id> [--json]', 'conv set <id> <KEY> <value> [--machine]',\n");
 	P("                      'conv unset <id> <KEY>', 'conv models list|prune'. Reads the service over\n");
 	P("                      DIAG, else headless.\n");
+	P("  catalog <...>     - The DisplayXR Catalog (ADR-064), through the install engine dxr-get:\n");
+	P("                      'catalog list [--installed] [--json]', 'catalog outdated', 'catalog show <id>',\n");
+	P("                      'catalog install <id>... | --default', 'catalog uninstall <id>...',\n");
+	P("                      'catalog update <id>... | --all'. Installing asks for elevation (--elevate\n");
+	P("                      with --json); the runtime itself is left alone unless named.\n");
 	P("  camera <...>      - Stereo camera sources (XR_DXR_stereo_camera, ADR-043), over IPC (DIAG).\n");
 	P("                      'camera list [--json]', 'camera calib <id> [--raw|--rectified]',\n");
 	P("                      'camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]\n");
@@ -163,6 +168,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "conv") == 0) {
 		return cli_cmd_conv(argc, argv);
+	}
+	if (strcmp(argv[1], "catalog") == 0) {
+		return cli_cmd_catalog(argc, argv);
 	}
 	if (strcmp(argv[1], "camera") == 0) {
 		// The calibration store is local (no IPC): routed before the IPC-only camera verbs.

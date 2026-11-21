@@ -100,6 +100,10 @@ cli_cmd_conv_credential(int argc, const char **argv);
 int
 cli_cmd_conv(int argc, const char **argv);
 
+//! `catalog list|show|install|uninstall|update|outdated` — the DisplayXR Catalog through dxr-get (ADR-064 step 4).
+int
+cli_cmd_catalog(int argc, const char **argv);
+
 struct cli_query_result;
 
 /*!
