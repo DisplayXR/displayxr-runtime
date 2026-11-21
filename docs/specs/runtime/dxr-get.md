@@ -78,8 +78,12 @@ stderr; stdout carries only results (`plan` text or JSON, the `fetch` path, `det
 - **Rollback guard:** the highest serial accepted is kept in
   `HKLM\SOFTWARE\DisplayXR\Update\CatalogSerial`, and an older serial is refused.
 - **Every payload is checked:** size and SHA-256 must equal the catalog's. Then `WinVerifyTrust`
-  must report a valid Authenticode signature whose leaf signer CN equals both the catalog's
-  `signer` and an entry in the compiled-in list (`Leia, Inc.`). The download is named by its hash
+  must report a valid Authenticode signature whose leaf signer CN equals the catalog's
+  `signer`, and that signer must be trusted: in the compiled-in list (`Leia, Inc.`), **or**
+  (#2737) listed in the catalog's top-level `signers.windows` — accepted only when the catalog's
+  Ed25519 signature was verified, never under `--no-verify-catalog`. Onboarding a display
+  vendor's signer is therefore a catalog change, not a dxr-get release. The catalog cannot
+  remove a compiled-in signer. The download is named by its hash
   (`%ProgramData%\DisplayXR\Downloads\<sha256>-<file>`), resumes with `Range`, and falls back
   from the release URL to the GitHub API asset URL (the 504 case).
 - **What dxr-get never does:**

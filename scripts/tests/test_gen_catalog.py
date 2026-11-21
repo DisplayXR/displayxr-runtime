@@ -191,5 +191,36 @@ class BuildCatalog(unittest.TestCase):
         self.assertEqual(cat["components"]["acme_plugin"]["kind"], "display_plugin")
 
 
+class Signers(unittest.TestCase):
+    """#2737 trust: a row's own `signers` are accepted for that row only, and the
+    top-level signers.windows lists the base set plus the vendor signers in use."""
+
+    def test_allowed_signers_are_per_component(self):
+        acme = {"name": "acme_plugin", "signers": ["Acme Corp"]}
+        self.assertEqual(gen.allowed_signers(acme), ["Leia, Inc.", "Acme Corp"])
+        self.assertEqual(gen.allowed_signers({"name": "browser"}), ["Leia, Inc."])
+
+    def test_top_level_signers(self):
+        acme = {"name": "acme_plugin", "pin": "acme_plugin", "repo": "acme-plugin", "asset": "Acme-{v}.exe",
+                "kind": "display_plugin", "args": ["/S"], "signers": ["Acme Corp"],
+                "registry_version": "HKLM\\Software\\Acme\\Version"}
+
+        def fake_windows_block(comp, version, rel, verifier, download_dir, registry_version=None):
+            if comp["name"] != "acme_plugin":
+                return None
+            return {"version": version, "signer": "Acme Corp"}
+
+        with mock.patch.object(gen, "get_release", lambda comp, tag: None), \
+                mock.patch.object(gen, "windows_block", fake_windows_block), \
+                mock.patch.object(gen, "repo_file", lambda *a: None), \
+                mock.patch.dict(gen.FLOOR_READERS, {"browser_nsis": lambda c, t: None,
+                                                    "leia_cmake": lambda c, t: None}), \
+                mock.patch.object(gen, "COMPONENTS", list(gen.COMPONENTS) + [acme]), \
+                mock.patch.object(gen, "warn", lambda msg: None), \
+                mock.patch.object(gen, "info", lambda msg: None):
+            cat = gen.build_catalog({"acme_plugin": "v1.0.0"}, gen.VERIFIERS["none"], "unused")
+        self.assertEqual(cat["signers"]["windows"], ["Leia, Inc.", "Acme Corp"])
+
+
 if __name__ == "__main__":
     unittest.main()

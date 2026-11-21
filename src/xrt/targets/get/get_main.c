@@ -7,8 +7,9 @@
  *
  * Rules that matter more than the code (docs/specs/runtime/dxr-get.md):
  * - Fail closed: a payload installs only if its size, SHA-256 and
- *   Authenticode signer all match the signed catalog, and the signer is in
- *   the compiled-in list too.
+ *   Authenticode signer all match the signed catalog, and the signer is
+ *   trusted: in the compiled-in list, or named by the Ed25519-VERIFIED catalog
+ *   in its top-level signers.windows (#2737).
  * - A stale or unreachable catalog is "offline", never an authority: it can
  *   only ever cause dxr-get to do nothing.
  * - Never downgrade, never touch ActiveRuntime, never write Trust\Allowlist.
@@ -38,6 +39,7 @@
 #define DEFAULT_CATALOG "https://updates.displayxr.org/catalog/v1/stable.json"
 #define SERIAL_KEY "SOFTWARE\\DisplayXR\\Update"
 
+//! Always trusted. A signed catalog can add signers (catalog_trusts_signer); it cannot remove these.
 static const char *const k_trusted_signers[] = {"Leia, Inc."};
 
 void
@@ -117,6 +119,7 @@ struct catalog
 	cJSON *components;
 	long long serial;
 	char key_id[9];
+	bool verified; //!< the Ed25519 signature was checked (false only under DXR_GET_DEV --no-verify-catalog)
 };
 
 static bool
@@ -247,6 +250,7 @@ load_catalog(const char *where, bool verify, struct catalog *c)
 			}
 		}
 	}
+	c->verified = verify;
 	dxr_log("catalog ok: serial %lld, key %s, expires %s\n", c->serial, c->key_id, jstr(c->root, "expires"));
 	return DXR_GET_OK;
 }
@@ -694,6 +698,32 @@ downloads_dir(wchar_t *out, size_t cap)
 	return true;
 }
 
+/*!
+ * #2737: a signer is also trusted when the catalog names it in its top-level
+ * signers.windows -- the catalog is Ed25519-signed by DisplayXR, so onboarding a
+ * display vendor is a catalog change rather than a dxr-get release. Only for a
+ * catalog whose signature was actually verified: the DXR_GET_DEV unsigned path
+ * keeps the compiled-in list alone. The component's own windows.signer must
+ * still equal the payload's Authenticode leaf CN (checked by the caller).
+ */
+static bool
+catalog_trusts_signer(const struct catalog *c, const char *signer)
+{
+	if (!c->verified) {
+		return false;
+	}
+	const cJSON *s = cJSON_GetObjectItemCaseSensitive(c->root, "signers");
+	const cJSON *w = s ? cJSON_GetObjectItemCaseSensitive(s, "windows") : NULL;
+	const cJSON *it;
+	cJSON_ArrayForEach(it, w)
+	{
+		if (cJSON_IsString(it) && it->valuestring[0] != '\0' && strcmp(it->valuestring, signer) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static int
 fetch_component(const struct catalog *c, const char *name, wchar_t *out_path, size_t cap, const wchar_t *dir_override)
 {
@@ -713,6 +743,10 @@ fetch_component(const struct catalog *c, const char *name, wchar_t *out_path, si
 	bool signer_known = false;
 	for (size_t i = 0; i < sizeof(k_trusted_signers) / sizeof(k_trusted_signers[0]); i++) {
 		signer_known = signer_known || strcmp(signer, k_trusted_signers[i]) == 0;
+	}
+	if (!signer_known && catalog_trusts_signer(c, signer)) {
+		dxr_log("%s: signer \"%s\" trusted through the signed catalog's signers.windows\n", name, signer);
+		signer_known = true;
 	}
 	if (!signer_known) {
 		dxr_log("%s: catalog names signer \"%s\", which this dxr-get does not trust\n", name, signer);

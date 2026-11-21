@@ -143,9 +143,11 @@ previous row's note) plus the fixed SR-platform registry rule, and its installer
 A row with neither gets no `detect` and is therefore never installed unattended.
 
 **Onboarding a display vendor** is then: one `COMPONENTS` row (`kind: "display_plugin"`, repo,
-asset name, args), a `versions.json` pin, and `displayxr-detect.json` on each release. Its
-installer must be Authenticode-signed by a signer `dxr-get` trusts — today a compiled-in list
-(`Leia, Inc.`), so a new signer also needs a `dxr-get` release (see `dxr-get.md` §Trust rules).
+asset name, args, and its Authenticode CN in `signers`), a `versions.json` pin, and
+`displayxr-detect.json` on each release. A row's `signers` are accepted by the generator for
+that component only, and every signer a listed component carries is published in the top-level
+`signers.windows`. `dxr-get` trusts that list because the catalog is signed (`dxr-get.md`
+§Trust rules), so a new vendor signer needs no `dxr-get` release.
 
 ## Signing
 

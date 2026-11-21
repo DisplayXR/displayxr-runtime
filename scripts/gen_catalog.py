@@ -46,8 +46,15 @@ import urllib.request
 ORG = "DisplayXR"
 API = "https://api.github.com"
 
-# Authenticode signer CNs a listed asset may carry. dxr-get compiles in the same set.
+# Authenticode signer CNs any listed asset may carry. dxr-get compiles in the same set.
+# A COMPONENTS row may add its own vendor's signer(s) (`signers`); those are
+# accepted for THAT component only and published in the catalog's top-level
+# signers.windows, which dxr-get trusts because the catalog is signed (#2737).
 SIGNERS_WINDOWS = ["Leia, Inc."]
+
+
+def allowed_signers(comp):
+    return list(SIGNERS_WINDOWS) + [s for s in comp.get("signers", []) if s not in SIGNERS_WINDOWS]
 
 # Ed25519 public keys trusted for the catalog, base64 of the 32 raw bytes.
 # Key id = first 8 hex of sha256(raw pubkey). Rotation: ADD a key here and in
@@ -65,8 +72,10 @@ EXPIRY_DAYS = 30
 #   kind      -- "display_plugin": detect rules + label + floor come from the release's
 #                DETECT_MANIFEST asset; `fallback` names the readers used when a
 #                release predates the manifest (FLOOR_READERS / DETECT_READERS keys).
-# Adding a display vendor = one row here (kind display_plugin, no fallback) and a
-# displayxr-detect.json on each of its releases.
+#   signers   -- extra Authenticode CNs accepted for this component only (#2737 trust;
+#                published in the catalog's signers.windows, which dxr-get trusts).
+# Adding a display vendor = one row here (kind display_plugin, no fallback, its
+# `signers`) and a displayxr-detect.json on each of its releases.
 COMPONENTS = [
     {
         "name": "runtime",
@@ -497,8 +506,8 @@ def windows_block(comp, version, rel, verifier, download_dir, registry_version=N
         return None
 
     signer = verifier(dest)
-    if signer not in SIGNERS_WINDOWS:
-        warn(f"{comp['name']}: {asset_name} signer {signer!r} not in {SIGNERS_WINDOWS}; "
+    if signer not in allowed_signers(comp):
+        warn(f"{comp['name']}: {asset_name} signer {signer!r} not in {allowed_signers(comp)}; "
              "no windows block (unsigned / unverifiable assets are never listed)")
         return None
     info(f"{comp['name']}: {asset_name} {size} bytes sha256={sha} signer={signer!r}")
@@ -597,7 +606,7 @@ def build_catalog(versions, verifier, download_dir, previous=None):
             # verified, signed installer rather than making the component
             # unfetchable; windows.version says which one it is.
             old = previous.get("components", {}).get(comp["name"], {}).get("windows")
-            if old and old.get("signer") in SIGNERS_WINDOWS:
+            if old and old.get("signer") in allowed_signers(comp):
                 warn(f"{comp['name']}: carrying forward the previously listed {old.get('file')}")
                 win = old
         if win:
@@ -613,6 +622,13 @@ def build_catalog(versions, verifier, download_dir, previous=None):
                      "(dxr-get will never install it unattended)")
         components[comp["name"]] = entry
 
+    # Top-level list = the base set + every vendor signer a listed component carries.
+    signers = list(SIGNERS_WINDOWS)
+    for e in components.values():
+        s = e.get("windows", {}).get("signer")
+        if s and s not in signers:
+            signers.append(s)
+
     return {
         "schema": 1,
         "serial": int(now.timestamp()),
@@ -620,7 +636,7 @@ def build_catalog(versions, verifier, download_dir, previous=None):
         "expires": iso_z(now + datetime.timedelta(days=EXPIRY_DAYS)),
         "channel": "stable",
         "source": {"versions_json_sha": git_head()},
-        "signers": {"windows": list(SIGNERS_WINDOWS)},
+        "signers": {"windows": signers},
         "components": components,
     }
 
