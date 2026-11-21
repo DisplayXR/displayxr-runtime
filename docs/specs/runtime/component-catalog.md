@@ -377,9 +377,18 @@ Every rule may carry `confidence` (`high` or `low`; required on `edid`, `usb`,
 `registry_dword_min`) and `note` (shown as evidence). An `edid` rule with only `man`, or a
 `usb` rule with only `vid`, matches any product of that vendor (Dell and Acer ship ordinary 2D
 monitors), so it is **always low confidence**, whatever it claims: the generator downgrades it
-and `dxr-get` enforces the same. A malformed rule (a half or inverted range, a product id
-given both exactly and as a range, a value outside 16 bits) matches nothing. A client treats a
-rule of an unknown kind as not matched and goes on to the next rule; the generator drops it.
+and `dxr-get` enforces the same. `high` means an unattended install, so the generator allows
+it only on evidence that names the product: a product-specific `edid` or `usb` rule, or
+`registry_dword_min` (a device count the vendor's own platform reports). A `high` on
+`registry_sz_min`, `registry_key_exists`, `file_exists` or `service_exists` — all true on
+ordinary machines — is downgraded to `low` with a warning. A rule carries only its kind's fields
+plus `kind`, `confidence` and `note`; the generator strips any other key, so a vendor manifest
+cannot add unreviewed keys to the signed catalog, and `validate_v2` rejects an item's or an
+external requirement's `detect` rule that is not already in that clean form. A malformed rule (a
+half or inverted range, a product id given both exactly and as a range, a value outside 16
+bits) matches nothing. A client treats a rule of an unknown kind as not matched and goes on to
+the next rule; the generator drops it. Item ids and aliases `edids`, `usb` and
+`display_plugins` are reserved: they are top-level keys of `dxr-get detect --json`.
 `edid` ranges and `usb` are #2737 additions: a `dxr-get` from before them skips a range rule
 (no `prod`) and a `usb` rule, which is why the generator still emits one exact `edid` rule per
 Leia table row rather than compacting runs into ranges.
@@ -738,10 +747,10 @@ A display plug-in describes itself (#2737). Each release may attach a
 |---|---|---|
 | `schema` | yes | `1` |
 | `detect` | yes | at least one valid rule (kinds above). Invalid rules are dropped with a warning |
-| `id` | no | the schema-2 item id (and `registered_id`) for this plug-in. Used when the generator has no `V2_ITEMS` entry for the component; without it such a component is not listed in schema 2. A first-party component's `V2_ITEMS` identity always wins |
+| `id` | no | the schema-2 item id (and `registered_id`) for this plug-in. It **must equal the id the plug-in registers under** (`DisplayProcessors\<id>`, e.g. `leia-sr`), since the runtime and receipts key on it. Used when the generator has no `V2_ITEMS` entry for the component; without it such a component is not listed in schema 2. A first-party component's `V2_ITEMS` identity always wins |
 | `label` | no | the schema-2 item `name` in that same case. Never written into schema 1 |
 | `registry_version` | no | `HKLM\...\Value` where the plug-in's installer writes its version; becomes `windows.registry_version` |
-| `requires.runtime` | no | `>=X.Y.Z`; becomes the component's `requires.runtime` |
+| `requires.runtime` | no | `>=X.Y.Z`; becomes the component's `requires.runtime`. A floor **above the runtime pinned in `versions.json`** would make every `ensure-for` that detects the plug-in fail with exit 40 on every machine, so the generator then ignores the **whole** manifest (rules too) with a warning and uses the fallback, as for a release without one |
 
 An invalid optional field is ignored with a warning; a manifest with the wrong `schema` or no
 usable rule is rejected and the generator uses the fallback. For every `kind: display_plugin`
