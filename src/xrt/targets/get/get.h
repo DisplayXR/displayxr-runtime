@@ -75,6 +75,11 @@ dxr_authenticode_signer(const wchar_t *path, char *cn, size_t cn_size);
 bool
 dxr_catalog_signature_ok(const char *msg, size_t msg_len, const char *sig_b64, char key_id_out[9]);
 
+//! NULL in every build that ships. In a TEST ROOT KEY build (CMake DXR_GET_TEST_ROOT_KEY): the banner it
+//! prints on every run. Such a build trusts one throwaway key instead of the catalog keys.
+const char *
+dxr_test_root_key_banner(void);
+
 /*
  * Detection (get_detect.c).
  */

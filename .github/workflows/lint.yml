@@ -392,3 +392,9 @@ jobs:
         # the schema-2 document leaves them unchanged, and the schema-2
         # validator's refusals (an undelegated signer, a plain-http URL).
         run: python3 scripts/tests/test_gen_catalog.py
+
+      - name: dxr-get validation fixture unit tests (ADR-064)
+        # The schema-2 fixture catalog a TEST ROOT KEY build of dxr-get reads
+        # (docs/specs/runtime/dxr-get.md, "Validating on a test machine").
+        # Hermetic; the signing case runs where `cryptography` is installed.
+        run: python3 scripts/tests/test_make_test_catalog.py
