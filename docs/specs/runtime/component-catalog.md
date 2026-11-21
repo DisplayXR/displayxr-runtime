@@ -193,8 +193,8 @@ every component class, on several platforms.
 | key | yes | publisher id, `[a-z0-9][a-z0-9-]*`. Never reused for another party |
 | `name` | yes | display name |
 | `url`, `support_url` | no | `https` |
-| `signers.<platform>` | no | the signing identities **delegated to this publisher** on that platform. An asset's signature is accepted only if it matches one of its own publisher's signers for the asset's platform. A publisher with no signers can list hash-pinned Community assets and link-outs only |
-| signer `kind: authenticode` | | `subject_cn` = the leaf certificate's simple display name, compared exactly. Optional `subject_o`, `issuer_cn` narrow the match when present *(planned; ADR-064 open question 2)* |
+| `signers.<platform>` | no | the signing identities **delegated to this publisher** on that platform. An asset's signature is accepted only if it matches one of its own publisher's signers for the asset's platform. A publisher with no signers for a platform can list link-outs only on it: every fetchable asset is signed |
+| signer `kind: authenticode` | | `subject_cn` = the leaf certificate's subject (its simple display name), compared exactly, as schema 1 does. Pinning the subject organisation or the issuer as well is a possible later tightening, not part of schema 2: it resists a look-alike certificate better, and makes a publisher's renewal or change of authority break installs until the registry is updated |
 | signer `kind: ed25519` | | for platforms with no OS signer check: a detached signature `<asset>.sig` over the asset bytes, `key_id` = first 8 hex of sha256(raw public key) *(planned, step 5)* |
 
 ### Item
@@ -209,7 +209,7 @@ every component class, on several platforms.
 | `name` | yes | display name |
 | `summary` | no | one line, plain text, at most 200 characters |
 | `publisher` | yes | a key of `publishers` |
-| `tier` | no | `verified` or `community`. Absent = `community`. See § Trust |
+| `tier` | no | `listed` or `verified`. Absent = `listed`. See § Trust |
 | `conformance` | with `verified` | `{ "suite": "selftest", "runtime": "X.Y.Z", "date": "YYYY-MM-DD", "report_url": "https://…" }`: the class conformance run that earned the tier, and the runtime it ran against |
 | `version` | yes | the publisher's current release, `X.Y.Z`. An asset's own `version` may lag it (see `assets`) |
 | `abi` | no | object keyed by class: `{ "display_processor": { "min": 5, "max": 5 } }`. The class ABI **majors** the binary negotiates. The loader rejects a major mismatch (ADR-020), so a client refuses to install an item whose range does not contain the installed runtime's major for that class, instead of installing something that will be rejected at load. Omitted when not known; never guessed |
@@ -249,7 +249,7 @@ ignores platforms it does not know.
 | `size` | yes | bytes, positive integer |
 | `sha256` | yes | 64 lowercase hex, of the file |
 | `urls` | yes | non-empty, `https` only, tried in order. Publisher-hosted. A URL under `api.github.com` is fetched with `Accept: application/octet-stream` |
-| `signature` | no | `{ "kind": "authenticode", "signer": "<CN>" }` or `{ "kind": "ed25519", "key_id": "…" }`. The named signer must be one of the publisher's `signers` for this platform; the registry and the generator's `verify` both check it. Absent = hash-pinned only (§ Trust says when a client may install that) |
+| `signature` | yes, unless `listing` | `{ "kind": "authenticode", "signer": "<CN>" }` or `{ "kind": "ed25519", "key_id": "…" }`. The named signer must be one of the publisher's `signers` for this platform; the registry and the generator's `verify` both check it. **Required on every asset that is not `listing`**: there is no unsigned, hash-pinned-only form |
 | `installer.kind` | yes, unless `listing` | `exe` (a self-contained silent installer run with `args`), `msi`, `deb`, `pkg`. A client refuses a kind it does not implement. There is no "run this script" kind |
 | `installer.args` | no | arguments for the silent install. Fixed strings: no placeholders, no shell |
 | `installer.scope` | yes | `machine` or `user` |
@@ -298,7 +298,7 @@ An `external` entry has two supported forms:
   The client installs it **only when `detect` says it is absent**, never to upgrade one that
   is present, and **in order: before the item**. Its `size` is added to the item's, and the
   total is shown before the user commits. It is fetched and verified like any asset (below).
-  A prerequisite's asset must be signed; there is no hash-pinned-only form for it.
+  Like every asset, it must be signed.
 
 **Every asset is resumed and verified** *(planned for schema 2, step 2; the rule is the
 schema-1 tool's)*. One item can now mean several downloads: its own asset and the assets of
@@ -361,51 +361,48 @@ code only carry the state it reports. There is no DRM in the runtime.
 
 ### Trust
 
-**Tiers.** `verified`: every component binary is signed by one of the publisher's delegated
-signers, and `conformance` records a passed class conformance run. `community`: listed after
-manifest validation; DisplayXR has not tested it. A client shows the tier wherever it shows
-the item.
+**Every installable binary is signed.** An item with a fetchable asset is listed only if the
+installer and the component binaries it installs are signed by a signer delegated to its
+publisher. `dxr-get` does not write `Trust\Allowlist` rows (the #2702 rule), so an unsigned
+component binary could not pass the load gate, and the catalog does not list one.
+
+**Tiers.** `listed`: the manifest validated and the assets are signed by the publisher's
+delegated signer; DisplayXR has not tested the item. `verified`: the same, plus `conformance`
+records a passed class conformance run. A client shows the tier wherever it shows the item.
 
 **What a client checks before running an installer**, in order, failing closed:
 
 1. the catalog signature, `expires` and serial (§ Signing and expiry);
 2. the asset is not in `revoked`;
 3. size and SHA-256 of the download equal the asset's;
-4. if the asset has a `signature`: the OS check passes (`WinVerifyTrust`) and the signer is
-   one of the **item's publisher's** `signers` for this platform. There is no compiled-in
-   signer list in a schema-2 client;
-5. if it has none: the item is `community`, and the user was told the asset is unsigned and
-   agreed (never in an unattended `ensure-for`).
+4. the asset has a `signature`, the OS check passes (`WinVerifyTrust`), and the signer is one
+   of the **item's publisher's** `signers` for this platform. There is no compiled-in signer
+   list in a schema-2 client, and no way to install an asset without a signature.
 
 **`provenance`** says how the *installed component binaries* (the DLL the loader opens, not
-the installer) pass the load-time gate (plugin-discovery.md §4.3):
+the installer) pass the load-time gate (plugin-discovery.md §4.3). It is informational: the
+gate decides at every load from the file in front of it, and the engine writes nothing for it.
 
 ```json
-"provenance": {
- "mode": "allowlisted",
- "binaries": [ { "file": "DisplayXR-Acme.dll", "sha256": "<64 hex>" } ]
-}
+"provenance": { "mode": "signed" }
 ```
 
 | `mode` | Meaning |
 |---|---|
-| `signed` | the binaries carry the publisher's signature and read `signed` at the gate. Nothing to write |
-| `allowlisted` | the binaries are unsigned. After the installer has run, the engine hashes each named file where the registration row points, and for each one that equals the listed digest writes that digest under `HKLM\Software\DisplayXR\Trust\Allowlist` with data `"<file> (DisplayXR Catalog <item-id> <version>)"`; uninstall removes exactly those rows *(planned, step 3; needs ADR-064 open question 1)* |
+| `signed` | the binaries carry the publisher's signature and read `signed` at the gate. The only mode on Windows |
 | `platform-trusted` | POSIX packages installed into the root-owned locations the gate already vouches for |
-
-The gate itself is unchanged: it still decides at every load, from the file in front of it.
 
 **Registry rules** *(planned, step 1)*. A manifest is merged only if: its publisher exists
 and the pull request comes from that publisher's registered maintainers; every URL is
-`https` and resolves; the downloaded asset's size and hash match; a declared signature
-verifies and its signer is delegated to the publisher; `registered_id` is not claimed by
+`https` and resolves; the downloaded asset's size and hash match; every fetchable asset
+is signed, the signature verifies and its signer is delegated to the publisher; `registered_id` is not claimed by
 another publisher's item; and, for `verified`, the conformance report is attached. A new
 publisher, and a new signer for an existing one, need a maintainer's review.
 
 ### Worked examples
 
 Sizes, hashes, dates, floors, licence ids and third-party names in these examples are
-illustrative. `acme` and `penworks` are placeholders, not real publishers. The first example
+illustrative. `acme` and `handco` are placeholders, not real publishers. The first example
 has the exact shape the generator emits; the others show fields that are specified here and
 filled in when an item is actually listed.
 
@@ -520,33 +517,49 @@ reports its own state: `licensed` with source `hardware` on a machine whose disp
 it, otherwise `trial` or `unlicensed`; while it is `unlicensed` or `expired` selection falls
 through to the next conversion provider.
 
-An input provider (third party, Community tier, unsigned binaries admitted by allowlist row):
+An input provider with an external prerequisite and a **bounded runtime range** (third
+party, Listed tier; its tracking service is installed separately, detection-only form):
 
 ```json
 {
- "id": "penworks.stylus",
+ "id": "handco.hands",
  "class": "input_provider",
- "registered_id": "penworks-stylus",
- "name": "Penworks Stylus",
- "publisher": "penworks",
- "tier": "community",
+ "registered_id": "handco-hands",
+ "name": "Handco Hands",
+ "publisher": "handco",
+ "tier": "listed",
  "version": "0.3.0",
  "abi": { "input_provider": { "min": 1, "max": 1 } },
- "runtime": { "min": "2.50.0" },
- "license": { "class": "free", "spdx": "LicenseRef-Penworks" },
+ "runtime": { "min": "2.60.0", "max": "2.69.99" },
+ "requires": [
+  { "kind": "runtime", "version": ">=2.60.0" },
+  { "kind": "external", "name": "Handco Tracking Service", "min_version": "6.0",
+    "detect": [ { "kind": "registry_key_exists", "key": "HKLM\\SOFTWARE\\Handco\\TrackingService" } ],
+    "info_url": "https://handco.example/tracking-service" }
+ ],
+ "license": { "class": "free", "spdx": "LicenseRef-Handco", "sources": ["hardware"] },
  "assets": {
   "windows-x64": {
-   "version": "0.3.0", "file": "PenworksStylusSetup-0.3.0.exe", "size": 2097152, "sha256": "<64 hex>",
-   "urls": ["https://github.com/penworks/dxr-stylus/releases/download/v0.3.0/PenworksStylusSetup-0.3.0.exe"],
+   "version": "0.3.0", "file": "HandcoHandsSetup-0.3.0.exe", "size": 2097152, "sha256": "<64 hex>",
+   "urls": ["https://github.com/handco/dxr-hands/releases/download/v0.3.0/HandcoHandsSetup-0.3.0.exe"],
+   "signature": { "kind": "authenticode", "signer": "Handco Ltd" },
    "installer": { "kind": "exe", "args": ["/S"], "scope": "machine", "elevation": "required" },
    "installed": { "kind": "registration_row" },
-   "uninstall": { "kind": "registry_command", "path": "HKLM\\Software\\DisplayXR\\InputProviders\\penworks-stylus\\UninstallString", "args": ["/S"] }
+   "uninstall": { "kind": "registry_command", "path": "HKLM\\Software\\DisplayXR\\InputProviders\\handco-hands\\UninstallString", "args": ["/S"] }
   }
  },
- "provenance": { "mode": "allowlisted", "binaries": [ { "file": "DisplayXR-PenworksStylus.dll", "sha256": "<64 hex>" } ] },
- "links": { "support": "https://github.com/penworks/dxr-stylus/issues", "privacy": "https://penworks.example/privacy" }
+ "provenance": { "mode": "signed" },
+ "links": { "support": "https://github.com/handco/dxr-hands/issues", "privacy": "https://handco.example/privacy" }
 }
 ```
+
+`runtime.max` is set when the publisher knows the item works only up to a runtime version.
+An input provider is the usual case today: the devices it returns are the runtime's internal
+device struct, which the input ABI major does not cover (ADR-063), so a provider is good for
+the runtime range it was built and tested against. A client refuses to install the item on a
+runtime outside the range and says which versions it needs; it never downgrades the runtime
+to fit. `requires` carries the floor only, so the `runtime` object is where an upper bound
+lives.
 
 A workspace controller (no class ABI: it is a process contract over IPC, so compatibility
 is the runtime range alone):
@@ -605,7 +618,8 @@ Rules that follow:
   names in installers' command lines (`ensure-for browser`, `--for leia_plugin`) keep working.
 - **Unknown values.** A schema-2 client ignores unknown keys, skips an item whose `class`,
   platform or `installer.kind` it does not know, and treats an unknown `detect` kind as not
-  matched. It refuses, rather than skips, an unknown `signature.kind`.
+  matched. It refuses, rather than skips, an unknown `signature.kind` and an installable
+  asset with no `signature`.
 
 ### Signing and expiry
 

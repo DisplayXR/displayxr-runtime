@@ -9,8 +9,9 @@ here is that
     and those bytes are the ones the generator wrote before schema 2 existed;
   * the schema-2 document carries the same assets (hash, size, URLs, signer)
     and nothing schema 1 does not know;
-  * the validator refuses the mistakes that matter (a signer the publisher was
-    not delegated, a non-https URL, a duplicate id).
+  * the validator refuses the mistakes that matter (an unsigned installable
+    asset, a signer the publisher was not delegated, a non-https URL, a
+    duplicate id).
 
     python3 scripts/tests/test_gen_catalog.py
 """
@@ -254,10 +255,19 @@ class Schema2Validation(unittest.TestCase):
         self.assertIn("requires kind 'magic'", text)
         self.assertIn("is not >=X.Y.Z", text)
 
-    def test_external_requirement_and_unsigned_asset_are_allowed(self):
+    def test_external_requirement_is_allowed(self):
         self.v2["items"][1]["requires"].append({"kind": "external", "name": "vendor-service"})
-        del self.v2["items"][0]["assets"]["windows-x64"]["signature"]
         self.assertEqual(gen_catalog.validate_v2(self.v2), [])
+
+    def test_installable_asset_must_be_signed(self):
+        del self.v2["items"][0]["assets"]["windows-x64"]["signature"]
+        self.assertIn("an installable asset needs a signature", self.problems())
+
+    def test_listing_only_asset_needs_no_signature(self):
+        self.v2["items"][2]["assets"] = {"android-arm64": {"listing": {"url": "https://example.invalid/app"}}}
+        self.assertEqual(gen_catalog.validate_v2(self.v2), [])
+        self.v2["items"][2]["assets"]["android-arm64"]["listing"]["url"] = "http://example.invalid/app"
+        self.assertIn("listing.url must be an https URL", self.problems())
 
 
 if __name__ == "__main__":

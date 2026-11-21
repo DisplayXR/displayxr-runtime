@@ -594,6 +594,10 @@ def validate_v2(cat):
                 problems.append(f"{where}: requires version {req.get('version')!r} is not >=X.Y.Z")
         for platform, asset in item.get("assets", {}).items():
             awhere = f"{where} {platform}"
+            if "listing" in asset:  # link-out: nothing is downloaded or run
+                if not str(asset["listing"].get("url", "")).startswith("https://"):
+                    problems.append(f"{awhere}: listing.url must be an https URL")
+                continue
             if not re.fullmatch(r"[0-9a-f]{64}", asset.get("sha256", "")):
                 problems.append(f"{awhere}: sha256 is not 64 lowercase hex")
             if not isinstance(asset.get("size"), int) or asset["size"] <= 0:
@@ -603,7 +607,9 @@ def validate_v2(cat):
                 problems.append(f"{awhere}: urls must be a non-empty list of https URLs")
             sig = asset.get("signature")
             if sig is None:
-                continue  # hash-pinned only; the spec's trust rules decide what a client does
+                # ADR-064: every installable asset is signed; there is no hash-pinned-only form.
+                problems.append(f"{awhere}: an installable asset needs a signature")
+                continue
             allowed = (pub or {}).get("signers", {}).get(platform, [])
             if sig.get("kind") == "authenticode" and sig.get("signer") not in [
                     a.get("subject_cn") for a in allowed if a.get("kind") == "authenticode"]:

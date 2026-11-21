@@ -7,8 +7,10 @@ related: [ADR-019, ADR-020, ADR-038, ADR-045, ADR-051, ADR-053, ADR-054, ADR-063
 ---
 # ADR-064: Component catalog and third-party trust
 
-**Status:** Proposed (2026-11-20). The direction below is decided by the project lead; the
-schema, the trust mechanics and the step order are proposed for review. Only the generator's
+**Status:** Proposed (2026-11-20). The direction below is decided by the project lead,
+including the review decisions of 2026-11-20 (every installable binary is signed; signers are
+matched by certificate subject; § Decided in review). The schema details and the step order
+are proposed for review. Only the generator's
 schema-2 derivation (`scripts/gen_catalog.py --out-v2`) is implemented; nothing publishes or
 consumes schema 2 yet. Builds on epic [#2702](https://github.com/DisplayXR/displayxr-runtime/issues/2702)
 (self-fetching installers), applies [ADR-054](ADR-054-component-model.md) (the component
@@ -122,7 +124,7 @@ Specified field by field in
  "schema": 2, "serial": 0, "generated": "…", "expires": "…", "channel": "stable",
  "publishers": { "<publisher>": { "name": "…", "signers": { "windows-x64": [ { "kind": "authenticode", "subject_cn": "…" } ] } } },
  "items": [ {
-   "id": "…", "class": "…", "registered_id": "…", "publisher": "<publisher>", "tier": "verified|community",
+   "id": "…", "class": "…", "registered_id": "…", "publisher": "<publisher>", "tier": "listed|verified",
    "version": "…", "abi": { "<class>": { "min": 0, "max": 0 } }, "runtime": { "min": "…", "max": "…" },
    "assets": { "<platform>": { "file": "…", "size": 0, "sha256": "…", "urls": ["…"],
                                "signature": {}, "installer": {}, "installed": {}, "uninstall": {} } },
@@ -138,31 +140,38 @@ Schema 1 keeps being published unchanged for as long as those builds are in serv
 
 ### 4. Trust model
 
+**Every listed installable binary is signed.** An item with a fetchable asset is listed only
+if the installer and the component binaries it installs are signed by a signer delegated to
+its publisher. There is no unsigned, hash-pinned-only form. Reason: an unsigned binary can
+pass the load gate only through an allowlist row, and **`dxr-get` does not write
+`Trust\Allowlist` rows** — the #2702 rule stands. A catalog that listed unsigned binaries
+would either break that rule or list things that install and then refuse to load.
+
 **Two tiers.**
 
 | Tier | Requirements | What the user sees |
 |---|---|---|
-| **Verified** | every component binary is signed by a signer delegated to the publisher; the item passed the class conformance run (ADR-054 N4: selected, one round trip, `Enabled=0` falls back, `Preferred` wins, an ABI-mismatch fixture is rejected) against a named runtime version, recorded in the item | listed and installable, marked Verified |
-| **Community** | listed after manifest validation only; hash-pinned; not conformance-tested | listed and installable, marked Community, with a one-line statement that DisplayXR has not tested it |
+| **Listed** | manifest validated; assets signed by the publisher's delegated signer; hashes pinned. Not conformance-tested | listed and installable, with a one-line statement that DisplayXR has not tested it |
+| **Verified** | everything Listed requires, plus a recorded class conformance run (ADR-054 N4: selected, one round trip, `Enabled=0` falls back, `Preferred` wins, an ABI-mismatch fixture is rejected) against a named runtime version | listed and installable, marked Verified |
 
 **The provenance gate stays the load-time enforcement point.** The catalog does not load
-anything and grants nothing at load time by itself. It is how a third-party binary *earns*
-what the gate already checks (plugin-discovery.md §4.3):
+anything and grants nothing at load time by itself. A catalog-installed binary reads `signed`
+at the gate, as any signed binary does today (plugin-discovery.md §4.3). What the catalog
+adds is the missing half, *who* is expected to have signed it: the item's publisher and that
+publisher's delegated signers. That is how a third-party binary earns signer trust: at
+install, the engine refuses a payload whose signer is not delegated to its publisher. The
+gate may later record whether the signer it sees at load matches the catalog's; it does not
+refuse on a mismatch in this ADR, because pinning publishers at load is a separate decision
+with its own failure modes (step 2 lists it as an open point). The allowlist keeps its
+current writers and its current purpose: the runtime installer's own unsigned reference
+builds, a vendor installer's own rows, and the dev lane.
 
-- a signed binary reads `signed` at the gate, as today. The catalog adds the missing half,
-  *who* is expected to have signed it: the item's publisher and that publisher's delegated
-  signers. The gate records whether the signer it saw matches (shown in `list` and `status`);
-  it does not refuse on a mismatch in this ADR, because pinning publishers at load is a
-  separate decision with its own failure modes (step 2 lists it as an open point).
-- an unsigned Community binary needs an allowlist row. The engine writes the row for each
-  digest in the item's `provenance.binaries`, after the publisher's installer has run and
-  the file on disk hashes to that digest, with row data
-  `"<file> (DisplayXR Catalog <item-id> <version>)"`, and removes exactly those rows at
-  uninstall. **This changes a rule of epic #2702** ("`dxr-get` never writes
-  `Trust\Allowlist`"). The reason for the change: without it the row is written by the
-  publisher's own installer, which any administrator-run installer can already do, and the
-  catalog adds nothing; with it, a row exists only for a digest that is in the signed
-  catalog. It needs the project lead's explicit confirmation (open question 1).
+**Signer identity.** A signer is named by the **certificate subject**, exactly as schema 1
+does (the Authenticode leaf's subject CN), declared per publisher in the signed index. A
+possible later tightening is to also pin the subject organisation or the issuer. It is
+recorded and not adopted now: a subject CN is not unique across certificate authorities, so
+pinning more would resist a look-alike certificate better, but a publisher's renewal or
+change of authority would then break installs until the registry is updated.
 
 **Per-publisher signers replace the compiled-in list.** Today the set of acceptable
 Authenticode signers is compiled into `dxr-get`. In schema 2 the signed index carries
@@ -305,6 +314,7 @@ What `dxr-get` already covers for this, verified in `get_main.c`, `get_http.c`,
   and never in a public adapter (§5).
 - No rating, review or ranking system.
 - No game profiles (§2).
+- No unsigned installable items, and no allowlist rows written by the install engine (§4).
 - No load-time refusal on a publisher mismatch (§4), and no change to what the provenance
   gate enforces.
 
@@ -319,14 +329,18 @@ What `dxr-get` already covers for this, verified in `get_main.c`, `get_http.c`,
   rollback serial in a separate value (spec § Compatibility).
 - The registry is a new thing to run: a repository, validation CI, a review rule, a signing
   job, and a policy for delisting.
-- The allowlist gains a second writer if open question 1 is confirmed. Its rows are tied to
-  signed-catalog digests and are removed with the item.
+- The allowlist does not change: `dxr-get` writes no rows, and every catalog-installed
+  binary passes the gate on its signature. A publisher without a code-signing certificate
+  cannot be listed with a fetchable asset; it can be listed as a link-out.
 - Every class gains licence vocabulary (ADR-054 N5), and the settings contract gains a type.
 - The bundle depends on the network by default. The offline bundle remains the answer for
   machines without one.
-- Trade-off accepted: Community items are installable without conformance testing. The tier
-  label and the unchanged load gate are the protection, not a listing ban; a ban would send
-  third parties back to hand-distributed installers the catalog cannot see at all.
+- Trade-off accepted: Listed items are installable without conformance testing. The
+  signature, the tier label and the unchanged load gate are the protection, not a listing
+  ban; a ban would send third parties back to hand-distributed installers the catalog cannot
+  see at all.
+- Trade-off accepted: requiring signatures raises the cost of entry for a small publisher.
+  It is the price of keeping one trust path.
 
 ## Implementation plan
 
@@ -336,32 +350,38 @@ Each step is one pull request unless noted. Steps 1–4 are Windows.
 |---|---|---|
 | 1 | **Registry repository + validation CI.** `displayxr-catalog`: `publishers/<id>.json`, `items/<id>.json`, a JSON Schema, a validator (the rules of the spec's § Registry rules), a compile-and-sign job producing `catalog/v2/stable.json`, and the publish path. First-party items move there from `gen_catalog.py`'s derivation. Schema 1 keeps being published by the existing workflow | component-catalog.md (publishing section); versions-json-autobump.md (the bump also updates first-party items) |
 | 2 | **`dxr-get` reads schema 2.** Data-driven item table (no component names in code); `class`, `registered_id`, `abi` and `runtime` range checks against the installed runtime; `requires.external` detection, and install of a prerequisite's own asset before the item when one is given; several assets per item, each resumed (HTTP `Range`) and verified against the manifest's size and SHA-256; per-publisher signers from the index; two compiled-in root keys; its own serial value. Open point to settle in this step: whether the gate later pins publishers at load | dxr-get.md (commands, trust rules, exit codes); component-catalog.md (status of schema 2) |
-| 3 | **Receipt, uninstall, inventory.** An install receipt per item; `uninstall`; `list --installed`; `outdated`; `UninstallString` and `Version` required on the per-class registration rows of catalog-installed items; allowlist rows written and removed with the item (if open question 1 is confirmed) | dxr-get.md; plugin-discovery.md §2, §4.3 and §5; input-, conversion- and tracking-provider-discovery.md (row values); workspace-controller-registration.md; epic #2702 rule on `Trust\Allowlist` |
+| 3 | **Receipt, uninstall, inventory.** An install receipt per item; `uninstall`; `list --installed`; `outdated`; `UninstallString` and `Version` required on the per-class registration rows of catalog-installed items | dxr-get.md; plugin-discovery.md §2 and §5; input-, conversion- and tracking-provider-discovery.md (row values); workspace-controller-registration.md |
 | 4 | **`displayxr-cli catalog list|show|install|uninstall|update`**, with an elevation relaunch for the verbs that need one, and `--json` on every verb | new CLI section in dxr-get.md or a `catalog` section in the CLI reference; ADR-054 §2.6 note (the four verbs stay per class; `catalog` is distribution, not selection) |
-| 5 | **POSIX engine.** The same commands on macOS and Linux: `.pkg` / `.deb` assets, a detached Ed25519 signature per asset in place of Authenticode, the receipt under `/var/lib/displayxr/catalog/`, allowlist lines in `/etc/displayxr/trust/allowlist` | dxr-get.md; plugin-discovery.md §4.3 (POSIX has no signer check today) |
+| 5 | **POSIX engine.** The same commands on macOS and Linux: `.pkg` / `.deb` assets, a detached Ed25519 signature per asset in place of Authenticode, the receipt under `/var/lib/displayxr/catalog/`; installed binaries pass the gate as `platform-trusted` in the root-owned package locations | dxr-get.md; plugin-discovery.md §4.3 (POSIX has no signer check today) |
 | 6 | **Licence-state slot + `secret` setting type.** The appended slot and feature macro on all four class vtables, carrying state, message, purchase URL and the optional `source` and `expiry`; the fall-through rule in each selection path, `status --json` and `list` columns, `XRT_COMPONENT_SETTING_TYPE_SECRET` with redaction on every read path | ADR-054 (N5 done, and decision 7 gains a type); ADR-020 (one more worked example of an appended slot); ADR-053 (maps `UNLICENSED` onto the shared vocabulary); `xrt_plugin_iface.md`, `xrt_input_plugin_iface.md`; plugin-discovery.md §2.3 and the three provider-discovery specs; the two onboarding guides. ADR-063 needs a note only: the slot is on the provider interface, not on the provider-device descriptor it proposes |
 | 7 | **`displayxr://activate` handler.** Scheme registration by the runtime installer, nonce start / consume RPCs on the service's DIAG channel, token delivery through the plug-in's activation slot | dxr-get.md or a new activation spec; ADR-051 (a Dashboard action that starts a browser flow); service-architecture.md |
 | 8 | **Dashboard Catalog tab.** Browse, install, uninstall, update, tier and prerequisite display, Buy / Activate. Renders the CLI's JSON | ADR-051; `src/dashboard/README.md` |
 | 9 | **Catalog-driven bundle** (§8), in `displayxr-installer`, plus the runtime installer pulling the open conversion provider | versions-json-autobump.md (bundle membership stops being five pins read by name); `displayxr-installer` docs; ADR-042 / ADR-053 note on the default converter |
 
+## Decided in review (2026-11-20)
+
+- **Every listed installable binary is signed; `dxr-get` writes no `Trust\Allowlist` rows.**
+  An earlier draft proposed an unsigned tier admitted by engine-written allowlist rows. It
+  is dropped, and with it the tier name it used. The tiers are Listed and Verified (§4).
+- **Signers are matched by certificate subject**, declared per publisher in the signed
+  index. Organisation / issuer pinning is a possible later tightening (§4).
+- **Licence `source` and `expiry`, and installer assets on external prerequisites, stay in**
+  (§5, §6).
+
 ## Open questions
 
-1. **May `dxr-get` write `Trust\Allowlist` rows** for digests in the signed catalog (§4)?
-   It reverses a rule of #2702. The alternative is that Community items must be signed too,
-   which removes the question and shrinks the Community tier to "signed but untested".
-2. **Signer identity.** Schema 2 names an Authenticode signer by subject CN, as schema 1
-   does. A CN is not unique across certificate authorities. The spec reserves optional
-   `subject_o` and `issuer_cn` fields; whether to require them, or to pin a public key,
-   trades spoofing resistance against yearly certificate renewals breaking installs.
-3. **Who runs the Verified conformance run**, and on what hardware, for a class that needs
-   a device (a display processor's panel)? Self-attested by the publisher with a report, or
-   run by DisplayXR?
-4. **Registry governance.** Where the repository lives, who may approve a new publisher,
-   and the delisting policy.
-5. **First-party tiers.** The generator emits no `tier` because no conformance record
-   exists for the first-party items yet; an item without `tier` is shown as Community.
-   Should first-party items be Verified by a recorded run before schema 2 is published?
-6. **The `companion` kind** depends on the pose-consumer registration (ADR-054 N8), which
+Left open for the project lead:
+
+1. **Conformance ownership for hardware-dependent classes.** Who runs the Verified
+   conformance run, and on what hardware, for a class that needs a device (a display
+   processor's panel, a tracked input device)? Self-attested by the publisher with a
+   report, or run by DisplayXR?
+2. **Registry governance.** Where the repository lives, who may approve a new publisher or
+   a new signer, and the delisting policy.
+3. **First-party tier recording.** The generator emits no `tier` because no conformance
+   record exists for the first-party items yet, so they are Listed. Should a run be recorded
+   for each, so they are Verified, before schema 2 is published?
+4. **The `companion` kind** depends on the pose-consumer registration (ADR-054 N8), which
    is not designed yet. It is in the schema's class list; no companion can be installed
    before N8.
 
