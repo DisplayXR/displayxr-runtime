@@ -385,3 +385,10 @@ jobs:
         # (GitHub search does not index HTML comments, so a --search lookup
         # never matched and every run opened a duplicate).
         run: python3 scripts/tests/test_drift_audit.py
+
+      - name: Component-catalog generator unit tests (#2737)
+        # Hermetic (GitHub stubbed). Pins the vendor-generic display plug-in path:
+        # a release's displayxr-detect.json drives label / floor / detect, a release
+        # without one falls back (Leia: its EDID header), and rule validation
+        # (ranges, manufacturer-only rules never high, unknown kinds dropped).
+        run: python3 scripts/tests/test_gen_catalog.py

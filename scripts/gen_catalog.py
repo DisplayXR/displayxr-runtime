@@ -4,7 +4,7 @@
 """Generate, sign and verify the DisplayXR component catalog (#2703, epic #2702).
 
 The catalog is the signed index `dxr-get` reads to fetch DisplayXR components
-(runtime, Leia SR plug-in, browser) on demand. It is published to
+(the runtime, the display plug-ins, the browser) on demand. It is published to
 https://updates.displayxr.org/catalog/v1/stable.json (+ .sig) by
 .github/workflows/publish-catalog.yml. Spec: docs/specs/runtime/component-catalog.md.
 
@@ -12,6 +12,13 @@ https://updates.displayxr.org/catalog/v1/stable.json (+ .sig) by
                             [--download-dir DIR] [--verifier powershell|none]
                             [--previous URL|FILE]
     gen_catalog.py verify   DIR/stable.json [--sig DIR/stable.json.sig]
+    gen_catalog.py validate-detect displayxr-detect.json
+
+Display plug-ins (kind "display_plugin") describe themselves: each release attaches
+a `displayxr-detect.json` (schema 1: label, registry_version, requires.runtime,
+detect rules), which is ingested generically (#2737). A release without one falls
+back to the component's `fallback` readers in COMPONENTS (Leia: its EDID header and
+installer CMake), so older plug-in releases keep their detection.
 
 Signing key: env DXR_CATALOG_ED25519_KEY = base64 of the 32-byte Ed25519 seed.
 The matching public key is hardcoded below (PUBLIC_KEYS) and compiled into dxr-get.
@@ -52,13 +59,21 @@ PUBLIC_KEYS = {
 CATALOG_URL = "https://updates.displayxr.org/catalog/v1/stable.json"
 EXPIRY_DAYS = 30
 
-# Per-component publishing facts. `pin` is the versions.json field.
+# Per-component publishing facts -- the catalog's component list is this table, and
+# nothing below branches on a component's name. `pin` is the versions.json field.
+#   floor     -- how to read the component's runtime floor (a FLOOR_READERS key).
+#   kind      -- "display_plugin": detect rules + label + floor come from the release's
+#                DETECT_MANIFEST asset; `fallback` names the readers used when a
+#                release predates the manifest (FLOOR_READERS / DETECT_READERS keys).
+# Adding a display vendor = one row here (kind display_plugin, no fallback) and a
+# displayxr-detect.json on each of its releases.
 COMPONENTS = [
     {
         "name": "runtime",
         "pin": "runtime",
         "repo": "displayxr-runtime",
         "asset": "DisplayXRSetup-{v}.exe",
+        "label": "DisplayXR runtime",
         "args": ["/S", "/NOSTART"],
         "registry_version": "HKLM\\Software\\DisplayXR\\Runtime\\Version",
     },
@@ -68,20 +83,28 @@ COMPONENTS = [
         "repo": "displayxr-leia-plugin",
         "asset": "DisplayXRLeiaSRSetup-{v}.exe",
         "kind": "display_plugin",
+        "label": "Leia display plug-in",
         "args": ["/S"],
         "registry_version": "HKLM\\Software\\DisplayXR\\Plugins\\LeiaSR\\Version",
+        "fallback": {"floor": "leia_cmake", "detect": "leia_edid_header"},
     },
     {
         "name": "browser",
         "pin": "browser",
         "repo": "displayxr-browser",
         "asset": "DisplayXR-Browser-Setup-{v}.exe",
+        "label": "DisplayXR Browser",
+        "floor": "browser_nsis",
         "args": ["/S"],
         "registry_version": "HKLM\\Software\\DisplayXR\\Browser\\Version",
     },
 ]
 
-# Fixed P2 detector (contract §6): the SR platform reports a connected SR device.
+# The vendor-owned detect manifest a display plug-in release attaches (#2737).
+DETECT_MANIFEST = "displayxr-detect.json"
+
+# Leia fallback (releases without DETECT_MANIFEST): the SR platform reports a
+# connected SR device.
 SR_REGISTRY_DETECT = {
     "kind": "registry_dword_min",
     "key": "HKLM\\SOFTWARE\\Dimenco\\Simulated Reality",
@@ -221,7 +244,7 @@ VERIFIERS = {
 SEMVER_RE = re.compile(r"^v?(\d+\.\d+\.\d+)$")
 
 
-def browser_floor(tag):
+def browser_floor(comp, tag):
     """Browser floor = its installer's declared MIN_RUNTIME_VERSION at the pinned tag.
 
     Where to look comes from downstream-pins.json consumer_floors (declared_floor),
@@ -244,15 +267,15 @@ def browser_floor(tag):
     return m.group(1)
 
 
-def leia_floor(tag):
+def leia_floor(comp, tag):
     """Leia floor = its installer's MIN_RUNTIME_VERSION, which installer/CMakeLists.txt
     derives from the DXR_RUNTIME_GIT_TAG pin in the top-level CMakeLists.txt."""
-    inst = repo_file("displayxr-leia-plugin", "installer/CMakeLists.txt", tag)
+    inst = repo_file(comp["repo"], "installer/CMakeLists.txt", tag)
     if inst is None or not re.search(r'set\(MIN_RUNTIME_VERSION\s+"\$\{CMAKE_MATCH_1\}"\)', inst) \
             or "DXR_RUNTIME_GIT_TAG" not in inst:
         warn(f"leia-plugin@{tag}: MIN_RUNTIME_VERSION derivation not recognised; omitting requires")
         return None
-    top = repo_file("displayxr-leia-plugin", "CMakeLists.txt", tag)
+    top = repo_file(comp["repo"], "CMakeLists.txt", tag)
     if top is None:
         return None
     m = re.search(r'set\(DXR_RUNTIME_GIT_TAG\s+"([^"]+)"', top)
@@ -265,9 +288,9 @@ def leia_floor(tag):
 EDID_ROW_RE = re.compile(r"^\s*\{\s*(\d+)\s*,\s*(\d+)\s*\}\s*,?\s*(?://\s*(.*))?$")
 
 
-def leia_detect(tag):
+def leia_detect(comp, tag):
     """EDID detectors from the plug-in's own frozen table, plus the SR registry rule."""
-    text = repo_file("displayxr-leia-plugin", "src/drv_leia/leia_edid_table.h", tag)
+    text = repo_file(comp["repo"], "src/drv_leia/leia_edid_table.h", tag)
     rules = []
     if text is None:
         warn("leia EDID table unreadable; detect carries the registry rule only")
@@ -299,16 +322,160 @@ def leia_detect(tag):
     return rules
 
 
+FLOOR_READERS = {"browser_nsis": browser_floor, "leia_cmake": leia_floor}
+DETECT_READERS = {"leia_edid_header": leia_detect}
+
+
+# --------------------------------------------------------------------------- detect manifest (#2737)
+
+RULE_KINDS = ("edid", "usb", "registry_dword_min")
+FLOOR_RE = re.compile(r"^>=\s*(\d+\.\d+\.\d+)$")
+
+
+def _u16(v):
+    return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 0xFFFF
+
+
+def validate_rule(rule):
+    """Return (clean_rule or None, [problems]). Unknown kinds are dropped: dxr-get
+    ignores them, and this generator ships with the dxr-get that would read them."""
+    probs = []
+    if not isinstance(rule, dict):
+        return None, ["rule is not an object"]
+    kind = rule.get("kind")
+    if kind not in RULE_KINDS:
+        return None, [f"unknown rule kind {kind!r} (dropped)"]
+    conf = rule.get("confidence")
+    if conf not in ("high", "low"):
+        return None, [f"{kind}: confidence {conf!r} is not high|low"]
+    out = {"kind": kind}
+    if kind in ("edid", "usb"):
+        vk, ik = ("man", "prod") if kind == "edid" else ("vid", "pid")
+        if not _u16(rule.get(vk)):
+            return None, [f"{kind}: {vk} must be an integer 0..65535"]
+        out[vk] = rule[vk]
+        has_exact = ik in rule
+        has_range = f"{ik}_min" in rule or f"{ik}_max" in rule
+        if has_exact and has_range:
+            return None, [f"{kind}: give {ik} or {ik}_min/{ik}_max, not both"]
+        if has_exact:
+            if not _u16(rule[ik]):
+                return None, [f"{kind}: {ik} must be an integer 0..65535"]
+            out[ik] = rule[ik]
+        elif has_range:
+            lo, hi = rule.get(f"{ik}_min"), rule.get(f"{ik}_max")
+            if not (_u16(lo) and _u16(hi) and lo <= hi):
+                return None, [f"{kind}: {ik}_min/{ik}_max must both be integers 0..65535, min <= max"]
+            out[f"{ik}_min"], out[f"{ik}_max"] = lo, hi
+        elif conf == "high":
+            # A manufacturer / vendor id alone also matches that vendor's ordinary
+            # 2D monitors and devices: never an unattended install. dxr-get
+            # enforces the same downgrade.
+            probs.append(f"{kind}: {vk}-only rule downgraded to low confidence")
+            conf = "low"
+    else:
+        key, value, mn = rule.get("key"), rule.get("value"), rule.get("min")
+        if not (isinstance(key, str) and re.match(r"^(HKLM|HKEY_LOCAL_MACHINE)\\", key, re.I)):
+            return None, ["registry_dword_min: key must be an HKLM\\ path"]
+        if not isinstance(value, str) or not value:
+            return None, ["registry_dword_min: value must be a non-empty string"]
+        if not (isinstance(mn, int) and not isinstance(mn, bool) and 0 <= mn <= 0xFFFFFFFF):
+            return None, ["registry_dword_min: min must be an integer 0..2^32-1"]
+        out.update(key=key, value=value, min=mn)
+    out["confidence"] = conf
+    if isinstance(rule.get("note"), str):
+        out["note"] = rule["note"]
+    return out, probs
+
+
+def validate_detect_manifest(m):
+    """Validate a displayxr-detect.json (schema 1).
+
+    Returns (clean, problems). `clean` is None when the manifest is unusable as a
+    whole; otherwise it holds label / registry_version / floor / detect, with bad
+    rules dropped (each one reported in problems).
+    """
+    if not isinstance(m, dict):
+        return None, ["manifest is not a JSON object"]
+    if m.get("schema") != 1:
+        return None, [f"schema {m.get('schema')!r} is not 1"]
+    probs = []
+    clean = {}
+    label = m.get("label")
+    if label is not None:
+        if isinstance(label, str) and label.strip():
+            clean["label"] = label.strip()
+        else:
+            probs.append("label is not a non-empty string (ignored)")
+    reg = m.get("registry_version")
+    if reg is not None:
+        if isinstance(reg, str) and re.match(r"^(HKLM|HKEY_LOCAL_MACHINE)\\.+\\[^\\]+$", reg, re.I):
+            clean["registry_version"] = reg
+        else:
+            probs.append("registry_version is not an HKLM\\...\\Value path (ignored)")
+    req = m.get("requires")
+    if req is not None:
+        rt = req.get("runtime") if isinstance(req, dict) else None
+        fm = FLOOR_RE.match(rt) if isinstance(rt, str) else None
+        if fm:
+            clean["floor"] = fm.group(1)
+        else:
+            probs.append(f"requires.runtime {rt!r} is not '>=X.Y.Z' (ignored)")
+    rules = m.get("detect")
+    if not isinstance(rules, list):
+        return None, probs + ["detect is not a list"]
+    clean["detect"] = []
+    for i, r in enumerate(rules):
+        cr, rp = validate_rule(r)
+        probs += [f"detect[{i}]: {x}" for x in rp]
+        if cr is not None:
+            clean["detect"].append(cr)
+    if not clean["detect"]:
+        return None, probs + ["no usable detect rule"]
+    return clean, probs
+
+
 # --------------------------------------------------------------------------- generate
 
 
-def windows_block(comp, version, verifier, download_dir):
+def get_release(comp, tag):
+    """The GitHub release JSON for <comp repo>@<tag>, or None."""
+    try:
+        return api_json(f"/repos/{ORG}/{comp['repo']}/releases/tags/{tag}")
+    except urllib.error.HTTPError as e:
+        warn(f"{comp['name']}: release {comp['repo']}@{tag} not found (HTTP {e.code})")
+        return None
+
+
+def fetch_detect_manifest(comp, rel):
+    """The release's DETECT_MANIFEST, validated; None when absent or unusable."""
+    asset = next((a for a in (rel or {}).get("assets", []) if a.get("name") == DETECT_MANIFEST), None)
+    if asset is None:
+        return None
+    try:
+        req = urllib.request.Request(asset["browser_download_url"],
+                                     headers={"User-Agent": "displayxr-gen-catalog"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read(1 << 20)
+        m = json.loads(data.decode("utf-8"))
+    except (OSError, urllib.error.URLError, ValueError) as e:
+        warn(f"{comp['name']}: {DETECT_MANIFEST} unreadable ({e}); using the fallback")
+        return None
+    clean, probs = validate_detect_manifest(m)
+    for x in probs:
+        warn(f"{comp['name']}: {DETECT_MANIFEST}: {x}")
+    if clean is None:
+        warn(f"{comp['name']}: {DETECT_MANIFEST} rejected; using the fallback")
+        return None
+    info(f"{comp['name']}: using {DETECT_MANIFEST} ({len(clean['detect'])} rules)")
+    return clean
+
+
+def windows_block(comp, version, rel, verifier, download_dir, registry_version=None):
     repo, asset_name = comp["repo"], comp["asset"].format(v=version)
     tag = "v" + version
-    try:
-        rel = api_json(f"/repos/{ORG}/{repo}/releases/tags/{tag}")
-    except urllib.error.HTTPError as e:
-        warn(f"{comp['name']}: release {repo}@{tag} not found (HTTP {e.code}); no windows block")
+    if rel is None:
+        warn(f"{comp['name']}: no release {repo}@{tag}; no windows block")
         return None
     asset = next((a for a in rel.get("assets", []) if a.get("name") == asset_name), None)
     if asset is None:
@@ -347,7 +514,7 @@ def windows_block(comp, version, verifier, download_dir):
             f"{API}/repos/{ORG}/{repo}/releases/assets/{asset['id']}",
         ],
         "args": list(comp["args"]),
-        "registry_version": comp["registry_version"],
+        "registry_version": registry_version or comp["registry_version"],
     }
 
 
@@ -401,19 +568,29 @@ def build_catalog(versions, verifier, download_dir, previous=None):
             continue
         version = m.group(1)
         tag = "v" + version
+        rel = get_release(comp, tag)
+
+        # Self-description: a display plug-in's manifest, else the table + fallbacks.
+        manifest = fetch_detect_manifest(comp, rel) if comp.get("kind") == "display_plugin" else None
+        fallback = comp.get("fallback", {})
+        label = (manifest or {}).get("label") or comp.get("label")
+
         entry = {"recommended": version}
         if "kind" in comp:
             entry["kind"] = comp["kind"]
+        if label:
+            entry["label"] = label
 
-        floor = None
-        if comp["name"] == "leia_plugin":
-            floor = leia_floor(tag)
-        elif comp["name"] == "browser":
-            floor = browser_floor(tag)
+        if manifest is not None:
+            floor = manifest.get("floor")
+        else:
+            reader = FLOOR_READERS.get(comp.get("floor") or fallback.get("floor"))
+            floor = reader(comp, tag) if reader else None
         if floor:
             entry["requires"] = {"runtime": ">=" + floor}
 
-        win = windows_block(comp, version, verifier, download_dir)
+        win = windows_block(comp, version, rel, verifier, download_dir,
+                            (manifest or {}).get("registry_version"))
         if not win and previous:
             # The new pin is not listable (typically: a release whose signed asset
             # has not replaced the unsigned CI one yet). Keep serving the last
@@ -425,8 +602,15 @@ def build_catalog(versions, verifier, download_dir, previous=None):
                 win = old
         if win:
             entry["windows"] = win
-        if comp["name"] == "leia_plugin":
-            entry["detect"] = leia_detect(tag)
+
+        if comp.get("kind") == "display_plugin":
+            if manifest is not None:
+                entry["detect"] = manifest["detect"]
+            elif DETECT_READERS.get(fallback.get("detect")):
+                entry["detect"] = DETECT_READERS[fallback["detect"]](comp, tag)
+            else:
+                warn(f"{comp['name']}: no {DETECT_MANIFEST} and no fallback; no detect rules "
+                     "(dxr-get will never install it unattended)")
         components[comp["name"]] = entry
 
     return {
@@ -551,11 +735,31 @@ def cmd_verify(args):
             problems.append(f"{name}: signer {w.get('signer')!r} not in signers.windows")
         if not re.fullmatch(r"[0-9a-f]{64}", w.get("sha256", "")):
             problems.append(f"{name}: sha256 is not 64 lowercase hex")
+    for name, comp in cat.get("components", {}).items():
+        for i, r in enumerate(comp.get("detect") or []):
+            cr, rp = validate_rule(r)
+            if cr is None or cr != r:
+                problems.append(f"{name}: detect[{i}] is not a clean rule: {'; '.join(rp) or 'normalised'}")
     if problems:
         for p in problems:
             print(f"FAIL: {p}", file=sys.stderr)
         return 1
     print(f"OK: signature valid (key id {kid}), serial {cat['serial']}, expires {cat['expires']}")
+    return 0
+
+
+def cmd_validate_detect(args):
+    with open(args.manifest, encoding="utf-8") as f:
+        m = json.load(f)
+    clean, probs = validate_detect_manifest(m)
+    for x in probs:
+        print(f"WARN: {x}", file=sys.stderr)
+    if clean is None:
+        print(f"FAIL: {args.manifest} is not a usable {DETECT_MANIFEST}", file=sys.stderr)
+        return 1
+    print(f"OK: {len(clean['detect'])} detect rules"
+          + (f", label {clean['label']!r}" if "label" in clean else "")
+          + (f", requires runtime >={clean['floor']}" if "floor" in clean else ""))
     return 0
 
 
@@ -579,6 +783,10 @@ def main():
     v.add_argument("catalog", help="path to stable.json")
     v.add_argument("--sig", help="signature path (default <catalog>.sig)")
     v.set_defaults(func=cmd_verify)
+
+    d = sub.add_parser("validate-detect", help=f"check a display plug-in's {DETECT_MANIFEST} (schema 1)")
+    d.add_argument("manifest", help=f"path to {DETECT_MANIFEST}")
+    d.set_defaults(func=cmd_validate_detect)
 
     args = ap.parse_args()
     return args.func(args)
