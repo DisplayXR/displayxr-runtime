@@ -113,6 +113,7 @@ Var DxrCatDesc8
 	!define MUI_COMPONENTSPAGE_TEXT_TOP "$DxrCatTop"
 	!ifdef DXR_CATALOG_UI
 		!define MUI_PAGE_CUSTOMFUNCTION_PRE DxrCatComponentsPre
+		!define MUI_PAGE_CUSTOMFUNCTION_SHOW DxrCatComponentsShow
 	!endif
 !macroend
 
@@ -362,6 +363,14 @@ Function DxrCatComponentsPre
 		${EndIf}
 	${EndIf}
 	StrCpy $DxrCatShown 1
+FunctionEnd
+
+; Components page, once its controls exist: write the text above the list
+; explicitly, so it does not depend on when NSIS expands the page's own string.
+Function DxrCatComponentsShow
+	FindWindow $R0 "#32770" "" $HWNDPARENT
+	GetDlgItem $R0 $R0 ${DXR_CAT_IDC_TOP}
+	SendMessage $R0 ${WM_SETTEXT} 0 "STR:$DxrCatTop"
 FunctionEnd
 
 Function .onSelChange
