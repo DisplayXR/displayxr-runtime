@@ -20,19 +20,23 @@ dxr-get [--catalog <url|file>] detect [--json]
 dxr-get [--catalog <url|file>] catalog
 ```
 
-Components: `runtime`, `leia_plugin`, `browser`. Human-readable log goes to stderr; stdout carries
-only results (`plan` text or JSON, the `fetch` path, `detect` output).
+Components: the catalog's component keys (`dxr-get catalog` lists them) — today `runtime`,
+`leia_plugin`, `browser`; nothing in dxr-get is limited to those. Human-readable log goes to
+stderr; stdout carries only results (`plan` text or JSON, the `fetch` path, `detect` output).
 
 - **`ensure-for <c>`** is what installers call. It makes sure the prerequisites of component
   `<c>` are present, then stops. It does not install `<c>` itself (the caller is doing that), and
   it is not an updater:
   - **runtime:** installed if missing or older than the floor. The floor is `--min-runtime` when
-    given, else the catalog's `<c>.requires.runtime`, raised to the Leia plug-in's own floor when
-    the plug-in is wanted.
-  - **leia_plugin:** wanted only on a **high-confidence** catalog detect rule matching this
-    machine (§Detection). It is installed if missing. It is also brought to the catalog version
+    given, else the catalog's `<c>.requires.runtime`, raised to each wanted display plug-in's own
+    `requires.runtime`.
+  - **display plug-ins:** every catalog component with `kind: "display_plugin"` is evaluated the
+    same way (#2737). Each is wanted only on a **high-confidence** detect rule matching this
+    machine (§Detection), so two vendors matching two panels plan both (the runtime arbitrates per
+    screen). A wanted plug-in is installed if missing. It is also brought to the catalog version
     when the runtime is being installed or upgraded in the same pass, because the catalog pins
-    are an ABI-matched set.
+    are an ABI-matched set. When `<c>` is itself a display plug-in, only the runtime is planned:
+    other vendors' plug-ins are not its prerequisites. A plan carries at most 8 display plug-ins.
   - **Order:** everything is downloaded and verified first, then the DisplayXR service and its
     satellites (`displayxr-conversion-host`, `displayxr-tracking-host`) are stopped, the
     installers run (runtime first), and the service starts once at the end.
@@ -41,10 +45,16 @@ only results (`plan` text or JSON, the `fetch` path, `detect` output).
     (the bundle).
 - **`plan`** prints what `ensure-for` would do. The `--json` form has one flat object per
   component: `component`, `installed` (or null), `state`
-  (`ok | missing | too_old | not_fetchable`), `required`, `target`, `size` (bytes) and `reason`.
+  (`ok | missing | too_old | not_fetchable`), `required`, `target`, `size` (bytes) and `reason`
+  (for a display plug-in, `detected: <evidence>`). The text form names each component by the
+  catalog's `label` (compiled-in names only as a fallback for older catalogs).
 - **`install <c>`** fetches and installs one component, and does nothing if the installed
   version is at or above the catalog's.
-- **`detect`** shows the evidence (monitor EDID ids) and whether the Leia rules match.
+- **`detect`** shows the evidence (monitor EDID ids, present USB VID:PIDs) and, per display
+  plug-in, whether its rules match. `--json`:
+  `{"edids":[{man,prod}], "usb":[{vid,pid}], "display_plugins":[{component, label, match,
+  high_confidence, evidence}], "leia_plugin":{match, high_confidence, evidence}}`. The top-level
+  `leia_plugin` object is the pre-#2737 shape, kept for one release; read `display_plugins`.
 
 ## Exit codes
 
@@ -85,19 +95,31 @@ only results (`plan` text or JSON, the `fetch` path, `detect` output).
 
 ## Detection (P2)
 
-The rules are data in the signed catalog (`leia_plugin.detect`), generated from the Leia
-plug-in's own EDID table (`src/drv_leia/leia_edid_table.h` in displayxr-leia-plugin). Supporting
-a new panel therefore needs a plug-in release and a catalog re-sign, not a new dxr-get.
+The rules are data in the signed catalog (`<display plug-in>.detect`), which the catalog
+generator takes from each plug-in release's own `displayxr-detect.json` (Leia: generated from
+`src/drv_leia/leia_edid_table.h`; see `component-catalog.md` §Display plug-ins). Supporting a new
+panel, or a new display vendor, therefore needs a plug-in release and a catalog re-sign, not a new
+dxr-get. The evidence is gathered once per run and every display plug-in's rules are tested
+against it.
 
-- **`edid`** matches `{man, prod}` against the present monitors' EDIDs. Both 16-bit words are
-  read little-endian, the plug-in table's convention: Dell shows as `man` 44048 (`0xAC10`). A Leia
-  panel can carry another brand's manufacturer id (the 8K Leia display enumerates as Dell
-  `DEL4147`), which is why the product id is part of every rule. The full EDID value is read,
-  because 8K panels carry DisplayID extension blocks well past 256 bytes.
-- **`registry_dword_min`** means the SR platform reports a connected device:
+- **`edid`** matches `man` plus `prod` (exact) or `prod_min`..`prod_max` (inclusive range)
+  against the present monitors' EDIDs. Both 16-bit words are read little-endian, the Leia table's
+  convention: Dell shows as `man` 44048 (`0xAC10`). A 3D panel can carry another brand's
+  manufacturer id (the 8K Leia display enumerates as Dell `DEL4147`), which is why a product id is
+  part of every high-confidence rule. The full EDID value is read, because 8K panels carry
+  DisplayID extension blocks well past 256 bytes.
+- **`usb`** matches `vid` plus `pid` (exact) or `pid_min`..`pid_max` against present USB devices
+  (SetupAPI, the `USB` enumerator, so interface children count too) — e.g. a vendor's tracking
+  camera.
+- **`registry_dword_min`** reads a DWORD (or decimal REG_SZ) under HKLM, 64-bit view. Leia's: the
+  SR platform reports a connected device,
   `HKLM\SOFTWARE\Dimenco\Simulated Reality\NConnectedDevices >= 1`.
-- **Low-confidence rules** (the generic Acer product ids 0–3) are reported by `detect` but never
-  trigger an install.
+- **Manufacturer-only / vendor-only rules** (`edid` without a product id, `usb` without a PID)
+  are always treated as low confidence, whatever the catalog says.
+- **Low-confidence rules** (also the generic Acer product ids 0–3) are reported by `detect` but
+  never trigger an install.
+- **Unknown kinds** are ignored, so a newer catalog can add a kind without breaking older
+  dxr-get builds. A malformed rule matches nothing.
 
 ## Runtime installer: ActiveRuntime on upgrade
 

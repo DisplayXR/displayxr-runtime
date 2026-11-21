@@ -5,7 +5,8 @@ Status: P0 of epic #2702 (self-fetching installers), issue #2703.
 The component catalog is a small signed JSON index of the DisplayXR installers a
 client may fetch on demand. Its one consumer today is **`dxr-get`** (P1/P2 of the same
 epic), which the browser installer and other component installers call to bring in a
-missing or too-old runtime, and the Leia SR plug-in when a Leia display is detected.
+missing or too-old runtime, and a display plug-in when its display is detected (any vendor's:
+see §Display plug-ins, #2737).
 
 | | |
 |---|---|
@@ -31,6 +32,7 @@ UTF-8, LF, no BOM, `indent=1`, key order as written by the generator, trailing n
  "components": {
   "runtime": {
    "recommended": "2.68.0",
+   "label": "DisplayXR runtime",
    "windows": {
     "version": "2.68.0",
     "file": "DisplayXRSetup-2.68.0.exe",
@@ -43,7 +45,7 @@ UTF-8, LF, no BOM, `indent=1`, key order as written by the generator, trailing n
    }
   },
   "leia_plugin": {
-   "recommended": "2.21.1", "kind": "display_plugin",
+   "recommended": "2.21.1", "kind": "display_plugin", "label": "Leia display plug-in",
    "requires": { "runtime": ">=2.66.8" },
    "windows": { "...": "as above, args [\"/S\"], registry HKLM\\Software\\DisplayXR\\Plugins\\LeiaSR\\Version" },
    "detect": [
@@ -64,6 +66,11 @@ Field rules:
 - `expires` — `generated` + 30 days. An expired catalog is treated as *offline*, never as
   authority. The weekly scheduled run re-signs well before that.
 - `recommended` — the `versions.json` pin, leading `v` stripped.
+- `label` — the human name `dxr-get` shows in its plan (the one consent box an installer
+  shows). From the generator's component table, or a display plug-in's detect manifest.
+  Optional: clients fall back to compiled-in names, then to the component key.
+- `kind` — `"display_plugin"` marks a vendor display plug-in. Clients evaluate **every**
+  component of that kind the same way (its `detect` rules); no vendor is special.
 - `windows` — present only if the release has the asset **and** its Authenticode signature is
   `Valid` with leaf signer CN in `signers.windows` (checked by the generator with
   `Get-AuthenticodeSignature` on a Windows runner). Absent = "not fetchable". When a new pin's
@@ -75,15 +82,70 @@ Field rules:
 - `requires.runtime` — the consumer's own advertised floor, `>=X.Y.Z`, read at the pinned tag:
   browser = `MIN_RUNTIME_VERSION` in browser-pvt `installer/DisplayXRBrowserInstaller.nsi`
   (location taken from `downstream-pins.json` `consumer_floors.displayxr-browser-pvt.declared_floor`);
-  Leia = the `DXR_RUNTIME_GIT_TAG` pin that leia-plugin's `installer/CMakeLists.txt` derives
+  a display plug-in = its detect manifest's `requires.runtime`; for a Leia release without a
+  manifest, the `DXR_RUNTIME_GIT_TAG` pin that leia-plugin's `installer/CMakeLists.txt` derives
   `MIN_RUNTIME_VERSION` from. Omitted when it cannot be read — never guessed.
-- `leia_plugin.detect` — one `edid` rule per row of leia-plugin's
-  `src/drv_leia/leia_edid_table.h` at the pinned tag (`man` = EDID bytes 8-9 big-endian,
-  `prod` = bytes 10-11 little-endian, decimal; `prod < 16` → `low` (generic Acer DS ids),
-  else `high`; a row without its own comment inherits the previous row's note), plus the
-  fixed SR-platform registry rule. Clients install the plug-in unattended only on a `high` match.
+- `<display plug-in>.detect` — the rules below, from the plug-in release's detect manifest
+  (§Display plug-ins). Clients install a plug-in unattended only on a `high` match.
 
 Clients ignore unknown keys and unknown components.
+
+### Detect rules
+
+| `kind` | fields | matches when |
+|---|---|---|
+| `edid` | `man`, and `prod` **or** `prod_min` + `prod_max` (inclusive) | a present monitor's EDID has that manufacturer id and a product id in range. Both are 16-bit words read **little-endian** from EDID bytes 8-9 / 10-11, decimal (Dell = `44048` = `0xAC10`) — the Leia plug-in table's convention. |
+| `usb` | `vid`, and `pid` **or** `pid_min` + `pid_max` | a present USB device (e.g. a tracking camera) has that VID:PID. Decimal. |
+| `registry_dword_min` | `key` (`HKLM\...`), `value`, `min` | the DWORD (or decimal REG_SZ) under HKLM, 64-bit view, is `>= min`. |
+
+Every rule has `confidence` (`high` or `low`) and an optional `note` (shown as evidence).
+A rule with only `man` (or only `vid`) matches any product of that vendor — Dell and Acer ship
+ordinary 2D monitors too — so it is **always low confidence**, whatever it claims: the
+generator downgrades it and `dxr-get` enforces the same. A rule of an unknown `kind` is
+dropped by the generator and ignored by clients (forward compatibility), and a malformed rule
+matches nothing. Linux/macOS evidence is not defined yet.
+
+## Display plug-ins (#2737)
+
+A display plug-in describes itself. Each release attaches a **`displayxr-detect.json`**
+asset, schema 1:
+
+```json
+{
+ "schema": 1,
+ "label": "Leia display plug-in",
+ "registry_version": "HKLM\\Software\\DisplayXR\\Plugins\\LeiaSR\\Version",
+ "requires": { "runtime": ">=2.66.8" },
+ "detect": [
+  { "kind": "edid", "man": 44048, "prod": 16711, "confidence": "high", "note": "DELL_8K32" },
+  { "kind": "registry_dword_min", "key": "HKLM\\SOFTWARE\\Dimenco\\Simulated Reality",
+    "value": "NConnectedDevices", "min": 1, "confidence": "high" }
+ ]
+}
+```
+
+- `schema` (required, `1`) and `detect` (required, at least one valid rule). `label`,
+  `registry_version` (`HKLM\...\ValueName`, where the plug-in's installer writes its version) and
+  `requires.runtime` (`>=X.Y.Z`) are optional; an invalid optional field is ignored with a
+  warning, an invalid rule is dropped with a warning.
+- The vendor generates it at build time from the same table its plug-in reads (Leia: from
+  `src/drv_leia/leia_edid_table.h`), so the installer's idea of "this is our panel" and the
+  plug-in's cannot diverge.
+- Check one locally: `python scripts/gen_catalog.py validate-detect displayxr-detect.json`.
+
+The generator's component list is a table (`COMPONENTS` in `gen_catalog.py`), not code: every
+`kind: display_plugin` row is handled the same way. For each, it fetches the manifest from the
+pinned release and uses its `label`, `requires.runtime`, `registry_version` (into
+`windows.registry_version`) and `detect`. A release **without** the manifest falls back to the
+row's `fallback` readers — for Leia, today's parse of `leia_edid_table.h` (one `edid` rule per
+row; `prod < 16` → `low`, the generic Acer DS ids; a row without its own comment inherits the
+previous row's note) plus the fixed SR-platform registry rule, and its installer CMake's floor.
+A row with neither gets no `detect` and is therefore never installed unattended.
+
+**Onboarding a display vendor** is then: one `COMPONENTS` row (`kind: "display_plugin"`, repo,
+asset name, args), a `versions.json` pin, and `displayxr-detect.json` on each release. Its
+installer must be Authenticode-signed by a signer `dxr-get` trusts — today a compiled-in list
+(`Leia, Inc.`), so a new signer also needs a `dxr-get` release (see `dxr-get.md` §Trust rules).
 
 ## Signing
 
