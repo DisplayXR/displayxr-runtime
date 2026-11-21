@@ -12,6 +12,7 @@
 #endif
 
 #include "get_core.h"
+#include "get_signers.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -25,9 +26,10 @@
 /*
  * Schema 1 only: the Authenticode signers a schema-1 payload may carry. A
  * schema-2 catalog names its publishers' signers itself, in the signed index,
- * and this list plays no part there (ADR-064 §4).
+ * and this list plays no part there (ADR-064 §4). The names are shared with
+ * `displayxr-cli catalog` (get_signers.h).
  */
-static const char *const k_v1_trusted_signers[] = {"Leia, Inc."};
+static const char *const k_v1_trusted_signers[] = DXR_FIRST_PARTY_SIGNERS;
 
 /*
  * Schema 1 only: what that schema says by component NAME and schema 2 says as
@@ -1778,4 +1780,73 @@ dxr_receipt_dependents(const struct dxr_receipt *all, int n, const char *id, cha
 		}
 	}
 	return count;
+}
+
+/*
+ * Several items in one `install` / `uninstall`.
+ */
+
+enum dxr_install_verdict
+dxr_install_judge(const struct dxr_plan *p, bool elevated)
+{
+	if (p->gate == DXR_GET_INCOMPATIBLE) {
+		return DXR_INSTALL_INCOMPATIBLE;
+	}
+	if (p->todo == 0 && p->gate == DXR_GET_OK) {
+		return DXR_INSTALL_NOTHING;
+	}
+	if (!elevated) {
+		return DXR_INSTALL_NEEDS_ADMIN;
+	}
+	if (p->gate == DXR_GET_NOT_FETCHABLE) {
+		return DXR_INSTALL_NOT_FETCHABLE;
+	}
+	return DXR_INSTALL_PROCEED;
+}
+
+const char *
+dxr_install_result_word(enum dxr_install_verdict v, int code)
+{
+	switch (v) {
+	case DXR_INSTALL_NOTHING: return "nothing_to_do";
+	case DXR_INSTALL_INCOMPATIBLE: return "incompatible";
+	case DXR_INSTALL_NEEDS_ADMIN: return "needs_elevation";
+	case DXR_INSTALL_NOT_FETCHABLE: return "not_fetchable";
+	default: return code == DXR_GET_OK ? "installed" : "failed";
+	}
+}
+
+cJSON *
+dxr_install_item_json(const char *id, int code, const char *result, const char *plan_json)
+{
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddStringToObject(o, "id", id);
+	cJSON_AddNumberToObject(o, "exit", code);
+	cJSON_AddStringToObject(o, "result", result);
+	cJSON *plan = plan_json != NULL ? cJSON_Parse(plan_json) : NULL;
+	if (plan != NULL) {
+		cJSON_AddItemToObject(o, "plan", plan);
+	}
+	return o;
+}
+
+cJSON *
+dxr_multi_json(cJSON *items, int *out_exit)
+{
+	int first = DXR_GET_OK;
+	const cJSON *x;
+	cJSON_ArrayForEach(x, items)
+	{
+		const cJSON *e = cJSON_GetObjectItemCaseSensitive(x, "exit");
+		if (first == DXR_GET_OK && cJSON_IsNumber(e) && e->valueint != DXR_GET_OK) {
+			first = e->valueint;
+		}
+	}
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddNumberToObject(o, "exit", first);
+	cJSON_AddItemToObject(o, "items", items);
+	if (out_exit != NULL) {
+		*out_exit = first;
+	}
+	return o;
 }

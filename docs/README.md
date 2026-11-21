@@ -72,7 +72,7 @@ Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary co
 - [Workspace Controller Registration](specs/runtime/workspace-controller-registration.md) — how shell-style apps register with the runtime
 - [DisplayXR App Manifest](specs/runtime/displayxr-app-manifest.md) — sidecar JSON for app discovery
 - [Component catalog](specs/runtime/component-catalog.md) — the signed index of installable components: schema 1 (what `dxr-get` reads today) and the proposed schema 2 for the public DisplayXR Catalog (publishers, item classes, per-platform assets, licence terms, external prerequisites, trust tiers; ADR-064)
-- [dxr-get](specs/runtime/dxr-get.md) — the Windows tool that fetches, verifies and installs components from the catalog: commands, exit codes, trust rules, detection
+- [dxr-get](specs/runtime/dxr-get.md) — the Windows tool that fetches, verifies and installs components from the catalog: commands, exit codes, trust rules, detection, and its command-line front end `displayxr-cli catalog`
 
 ---
 

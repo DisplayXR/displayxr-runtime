@@ -1478,3 +1478,87 @@ TEST_CASE("uninstall: what elevation cannot fix is reported before elevation is 
 	CHECK(std::string(result) == "needs_elevation");
 	CHECK(dxr_uninstall_check(&rs[1], rs, 3, true, &result, detail, sizeof(detail)) == DXR_GET_OK);
 }
+
+TEST_CASE("several items in one install / uninstall: each judged alone, exit = the first failure")
+{
+	Cat cat(V2);
+	Machine m;
+
+	// The verdict of one item's plan, in the single-item verb's order.
+	m.sz[RT_VER] = "2.69.0";
+	dxr_plan work = plan(cat, m, "leia_plugin", DXR_PLAN_INSTALL, nullptr, true);
+	REQUIRE(work.todo == 1);
+	CHECK(dxr_install_judge(&work, true) == DXR_INSTALL_PROCEED);
+	CHECK(dxr_install_judge(&work, false) == DXR_INSTALL_NEEDS_ADMIN);
+
+	m.sz[RT_VER] = "2.60.0"; // needs a newer runtime, and --no-runtime forbids moving it
+	dxr_plan refused = plan(cat, m, "leia_plugin", DXR_PLAN_INSTALL, nullptr, true);
+	REQUIRE(refused.gate == DXR_GET_INCOMPATIBLE);
+	// Not compatible is answered before elevation is asked for: elevating would not help.
+	CHECK(dxr_install_judge(&refused, false) == DXR_INSTALL_INCOMPATIBLE);
+	CHECK(dxr_install_judge(&refused, true) == DXR_INSTALL_INCOMPATIBLE);
+
+	m.sz[RT_VER] = "2.70.0";
+	dxr_plan current = plan(cat, m, "runtime", DXR_PLAN_INSTALL, nullptr, true);
+	REQUIRE(current.todo == 0);
+	CHECK(dxr_install_judge(&current, false) == DXR_INSTALL_NOTHING); // nothing to do needs no elevation
+
+	dxr_plan unknown = plan(cat, m, "no-such-item", DXR_PLAN_INSTALL, nullptr, true);
+	REQUIRE(unknown.gate == DXR_GET_NOT_FETCHABLE);
+	// The order deployed callers know: elevation first, then "not fetchable".
+	CHECK(dxr_install_judge(&unknown, false) == DXR_INSTALL_NEEDS_ADMIN);
+	CHECK(dxr_install_judge(&unknown, true) == DXR_INSTALL_NOT_FETCHABLE);
+
+	CHECK(std::string(dxr_install_result_word(DXR_INSTALL_PROCEED, DXR_GET_OK)) == "installed");
+	CHECK(std::string(dxr_install_result_word(DXR_INSTALL_PROCEED, DXR_GET_DOWNLOAD)) == "failed");
+	CHECK(std::string(dxr_install_result_word(DXR_INSTALL_NOTHING, DXR_GET_OK)) == "nothing_to_do");
+	CHECK(std::string(dxr_install_result_word(DXR_INSTALL_INCOMPATIBLE, DXR_GET_INCOMPATIBLE)) == "incompatible");
+	CHECK(std::string(dxr_install_result_word(DXR_INSTALL_NEEDS_ADMIN, DXR_GET_NEEDS_ADMIN)) == "needs_elevation");
+	CHECK(std::string(dxr_install_result_word(DXR_INSTALL_NOT_FETCHABLE, DXR_GET_NOT_FETCHABLE)) ==
+	      "not_fetchable");
+
+	// The document: one entry per item in the order given, each with its own
+	// plan (the single-item `--json` document, unchanged), and the first
+	// failure as the exit code. A failed item does not hide the ones after it.
+	char *work_js = dxr_plan_json(&work);
+	char *refused_js = dxr_plan_json(&refused);
+	cJSON *items = cJSON_CreateArray();
+	cJSON_AddItemToArray(items, dxr_install_item_json("a", DXR_GET_OK, "installed", work_js));
+	cJSON_AddItemToArray(items, dxr_install_item_json("b", DXR_GET_INCOMPATIBLE, "incompatible", refused_js));
+	cJSON_AddItemToArray(items, dxr_install_item_json("c", DXR_GET_DOWNLOAD, "failed", nullptr));
+	cJSON_AddItemToArray(items, dxr_install_item_json("d", DXR_GET_OK, "installed", work_js));
+	int code = -1;
+	cJSON *doc = dxr_multi_json(items, &code);
+	CHECK(code == DXR_GET_INCOMPATIBLE);
+	CHECK(cJSON_GetObjectItem(doc, "exit")->valueint == DXR_GET_INCOMPATIBLE);
+	const cJSON *arr = cJSON_GetObjectItem(doc, "items");
+	REQUIRE(cJSON_GetArraySize(arr) == 4);
+	const cJSON *b = cJSON_GetArrayItem(arr, 1);
+	CHECK(std::string(cJSON_GetObjectItem(b, "id")->valuestring) == "b");
+	CHECK(std::string(cJSON_GetObjectItem(b, "result")->valuestring) == "incompatible");
+	CHECK(cJSON_GetObjectItem(cJSON_GetObjectItem(b, "plan"), "gate")->valueint == DXR_GET_INCOMPATIBLE);
+	CHECK(cJSON_GetObjectItem(cJSON_GetArrayItem(arr, 2), "plan") == nullptr);
+	CHECK(cJSON_GetObjectItem(cJSON_GetArrayItem(arr, 3), "exit")->valueint == DXR_GET_OK);
+	// The embedded plan is the document `install <one item> --json` prints.
+	char *again = cJSON_PrintUnformatted(cJSON_GetObjectItem(cJSON_GetArrayItem(arr, 0), "plan"));
+	cJSON *ref = cJSON_Parse(work_js);
+	char *ref_s = cJSON_PrintUnformatted(ref);
+	CHECK(std::string(again) == ref_s);
+	cJSON_free(again);
+	cJSON_free(ref_s);
+	cJSON_Delete(ref);
+	cJSON_Delete(doc);
+	cJSON_free(work_js);
+	cJSON_free(refused_js);
+
+	// Nothing failed: exit 0. The uninstall entries are the single-item objects.
+	cJSON *un = cJSON_CreateArray();
+	cJSON *u = cJSON_CreateObject();
+	cJSON_AddStringToObject(u, "id", "a");
+	cJSON_AddStringToObject(u, "result", "uninstalled");
+	cJSON_AddNumberToObject(u, "exit", DXR_GET_OK);
+	cJSON_AddItemToArray(un, u);
+	cJSON *undoc = dxr_multi_json(un, &code);
+	CHECK(code == DXR_GET_OK);
+	cJSON_Delete(undoc);
+}

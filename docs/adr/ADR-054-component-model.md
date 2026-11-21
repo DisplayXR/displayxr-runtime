@@ -98,6 +98,9 @@ every one of these holds:
    `options` — one spelling per class in `displayxr-cli`; the CLI is the logic and the
    dashboard renders what the CLI (or the service's DIAG snapshot) returns (ADR-051). A class
    missing a verb is a bug, not a design choice.
+   `displayxr-cli catalog` (ADR-064 step 4) is not a class verb: it is distribution
+   (what is installed, through `dxr-get`), and selection among what is installed stays with
+   these verbs, per class.
 7. **One options contract.** Per-component settings live under one `Settings\<class>\<id>`
    key (the `u_setting` machine/user stores) with a `DXR_<CLASS>_<ID>_<KEY>` environment
    override that always wins, and the component reads them **through the host interface**,
