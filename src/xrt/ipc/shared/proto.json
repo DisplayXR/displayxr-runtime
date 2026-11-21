@@ -1737,5 +1737,29 @@
 		"out": [
 			{"name": "poll", "type": "struct xrt_share_link_poll"}
 		]
+	},
+
+	"system_component_activate_put": {
+		"in": [
+			{"name": "chunk", "type": "struct ipc_component_activate_chunk"}
+		],
+		"out": [
+			{"name": "status", "type": "uint32_t"}
+		]
+	},
+
+	"system_component_activate_commit": {
+		"in": [
+			{"name": "target", "type": "struct ipc_component_activate_target"}
+		],
+		"out": [
+			{"name": "status", "type": "uint32_t"}
+		]
+	},
+
+	"system_component_activate_poll": {
+		"out": [
+			{"name": "outcome", "type": "struct ipc_component_activate_result"}
+		]
 	}
 }

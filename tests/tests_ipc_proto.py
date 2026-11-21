@@ -47,6 +47,11 @@ SPEC5_CONV_CALLS = ['conv_enum_candidates', 'conv_stream_create_v5']
 SERVICE_LINK_CALLS = ['service_link_register', 'service_link_share_poll', 'service_link_share_publish_ring',
                       'service_link_share_publish_fence', 'service_link_share_frame_ready']
 
+#: ADR-064 step 7 (activation-deep-link.md §6.1): the live-activation DIAG calls,
+#: appended LAST (after the service link's) in this order.
+COMPONENT_ACTIVATE_CALLS = ['system_component_activate_put', 'system_component_activate_commit',
+                            'system_component_activate_poll']
+
 #: ADR-034 Amendment 5 (#2181): per-client input selection, appended after the spec-4 family.
 INPUT_SELECTION_CALLS = ['input_providers_enumerate', 'input_set_provider_preference', 'system_get_input_holders']
 
@@ -183,7 +188,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
                  "workspace_set_overlay_on_screen", "conv_hint_interest", "compositor_set_cursor_draw_request",
                  "compositor_set_cursor_measure_request", "system_request_component_reselect",
                  "conv_warm") + tuple(SPEC4_CONV_CALLS) + tuple(INPUT_SELECTION_CALLS) + tuple(SPEC5_CONV_CALLS) + \
-            tuple(SERVICE_LINK_CALLS)
+            tuple(SERVICE_LINK_CALLS) + tuple(COMPONENT_ACTIVATE_CALLS)
         self.assertTrue(all(n.startswith("system_get_") or n in later
                             for n in names[i + 3:]), names[i + 3:])
         enable = self._call("compositor_segments_enable")
@@ -353,9 +358,40 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertIn("ipc_handle_system_get_conv_provider_row(", text)
         self.assertIn("ipc_handle_system_get_conv_task_row(", text)
 
-    def _names_before_service_link(self):
-        """Command names up to the service link's share calls (ADR-061 arm 2), appended LAST."""
+    def _names_before_component_activate(self):
+        """Command names up to the live-activation DIAG calls (ADR-064 step 7), appended LAST."""
         names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-len(COMPONENT_ACTIVATE_CALLS):], COMPONENT_ACTIVATE_CALLS)
+        return names[:-len(COMPONENT_ACTIVATE_CALLS)]
+
+    def test_component_activate_calls_are_appended(self):
+        # ADR-064 step 7: the three DIAG calls that hand an activation token to
+        # the component instance live in the service ride at the very END, so
+        # every earlier command keeps its enum value. A token does not fit one
+        # message: it is staged in chunks, committed, and the outcome polled.
+        self._names_before_component_activate()
+        put = self._call("system_component_activate_put")
+        self.assertEqual([(a.name, a.typename) for a in put.in_args],
+                         [("chunk", "struct ipc_component_activate_chunk")])
+        self.assertEqual([(a.name, a.typename) for a in put.out_args], [("status", "uint32_t")])
+        commit = self._call("system_component_activate_commit")
+        self.assertEqual([(a.name, a.typename) for a in commit.in_args],
+                         [("target", "struct ipc_component_activate_target")])
+        self.assertEqual([(a.name, a.typename) for a in commit.out_args], [("status", "uint32_t")])
+        poll = self._call("system_component_activate_poll")
+        self.assertEqual(poll.in_args, [])
+        self.assertEqual([(a.name, a.typename) for a in poll.out_args],
+                         [("outcome", "struct ipc_component_activate_result")])
+        for call in (put, commit, poll):
+            self.assertFalse(call.in_handles or call.out_handles or call.varlen, call.name)
+        text = self._generate("generate_server_c", "ipc_server_generated.c")
+        for name in COMPONENT_ACTIVATE_CALLS:
+            self.assertIn("ipc_handle_%s(" % name, text)
+
+    def _names_before_service_link(self):
+        """Command names up to the service link's share calls (ADR-061 arm 2); only the
+        live-activation calls follow them."""
+        names = self._names_before_component_activate()
         self.assertEqual(names[-len(SERVICE_LINK_CALLS):], SERVICE_LINK_CALLS)
         return names[:-len(SERVICE_LINK_CALLS)]
 
@@ -370,7 +406,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # registration and share messages ride at the very END, so every
         # earlier command keeps its enum value. The ring's textures and its
         # fence travel on two messages: a message carries one handle type.
-        names = [c.name for c in self.p.calls]
+        names = self._names_before_component_activate()
         self.assertEqual(names[-len(SERVICE_LINK_CALLS):], SERVICE_LINK_CALLS)
         reg = self._call("service_link_register")
         self.assertEqual([(a.name, a.typename) for a in reg.in_args],

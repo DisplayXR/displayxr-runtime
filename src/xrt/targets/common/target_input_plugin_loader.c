@@ -669,6 +669,34 @@ target_input_plugin_activate(
 	return a.result;
 }
 
+enum target_component_activate_result
+target_input_plugin_activate_resident(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap)
+{
+	if (out_state != NULL) {
+		xrt_component_license_state_init(out_state);
+	}
+	if (err != NULL && err_cap > 0) {
+		err[0] = '\0';
+	}
+	if (id == NULL || id[0] == '\0') {
+		return TARGET_COMPONENT_ACTIVATE_NOT_LOADED;
+	}
+	// The slot table is filled once by the discovery pass and never shrinks,
+	// so a provider found here stays loaded for the life of the process. This
+	// never starts a discovery pass of its own.
+	for (int p = 0; p < g_input_provider_count; p++) {
+		const struct input_provider_slot *slot = &g_input_providers[p];
+		if (slot->iface == NULL || strcmp(slot->row_id, id) != 0) {
+			continue;
+		}
+		return target_component_activate_call(
+		    XRT_INPUT_PLUGIN_IFACE_HAS(slot->iface, activate) ? slot->iface->activate : NULL, token, out_state,
+		    err, err_cap);
+	}
+	return TARGET_COMPONENT_ACTIVATE_NOT_LOADED;
+}
+
 void
 target_input_plugin_set_display_geometry(const struct xrt_input_host_display_geometry *geometry)
 {
