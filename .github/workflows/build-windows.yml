@@ -1036,6 +1036,90 @@ jobs:
             Expect (([int]$o.input_providers.scan_failed -eq 1) -and (@($o.input_providers.ranked) -contains "sim-stylus") -and ($null -ne (Pen $o))) "stylus: ABI fixture rejected, sim-stylus still resident with its pen (ranked: $(Ranked $o) failed=$($o.input_providers.scan_failed))"
             reg delete "$inRoot\abi-fixture-input" /f | Out-Null
             reg delete "$inRoot\sim-stylus" /f | Out-Null
+
+            # 7. The licence-state contract (ADR-054 N5, ADR-064 §5): every class
+            # carries the same optional `get_license_state` / `activate` slots and
+            # every `list --json` row a `licence` object. The reference providers
+            # script it through their settings (LICENSE_SIM, and LICENSE_KEY, a
+            # setting of type `secret`). Proven here, on the real loaders:
+            #  - a provider that reports nothing reads not_applicable (every class);
+            #  - an unlicensed provider is reported as such and selection falls
+            #    through it: no conversion task selects it, the tracking provider is
+            #    not resident (nominal viewer), and the self-test stays green;
+            #  - activation: a wrong token is refused with the provider's line, the
+            #    test key is accepted and the new state comes back;
+            #  - a secret: stored like any setting, longer than 255 bytes, effective
+            #    (the key makes the provider licensed), and its value appears in no
+            #    output of the CLI.
+            function Lic($list, $key, $id) { ($list.$key | Where-Object { $_.id -eq $id } | Select-Object -First 1).licence }
+            function OwnTasks($l, $id) { @($l.tasks | Where-Object { ($_.provider -eq $id) -and (-not $_.composed) }) }
+            function Sel($rows) { @($rows | Where-Object { $_.selected }).Count }
+            $secretKey = "DXR-SIM-TEST-KEY"
+            $cl = ConvRowList
+            Expect ((Lic $cl "providers" "sim-conversion").state -eq "not_applicable") "licence: nothing scripted -> sim-conversion reads not_applicable (got '$((Lic $cl "providers" "sim-conversion").state)')"
+            $baseSel = Sel (OwnTasks $cl "sim-conversion")
+            Expect ($baseSel -gt 0) "licence: baseline, sim-conversion is selected for at least one task ($baseSel)"
+            $dl = Cli-Json @("dp", "list")
+            Expect ((Lic $dl "plugins" "sim-display").state -eq "not_applicable") "licence: 'dp list' carries the licence object; sim-display reports none"
+            $il = Cli-Json @("input", "list")
+            Expect ((Lic $il "providers" "sim-input").state -eq "not_applicable") "licence: 'input list' carries the licence object; sim-input reports none"
+
+            reg add "$cvRoot\sim-conversion\Settings" /v LICENSE_SIM /t REG_SZ /d "unlicensed" /f | Out-Null
+            $cl = ConvRowList
+            $lc = Lic $cl "providers" "sim-conversion"
+            Expect (($lc.state -eq "unlicensed") -and $lc.blocks -and $lc.activation.key -and ($lc.purchase_url -like "https://*")) "licence: LICENSE_SIM=unlicensed is reported with its purchase URL and activation methods (state='$($lc.state)' blocks=$($lc.blocks) url='$($lc.purchase_url)')"
+            $own = OwnTasks $cl "sim-conversion"
+            Expect ((@($own | Where-Object { $_.state -ne "UNLICENSED" }).Count -eq 0) -and ((Sel $own) -eq 0)) "licence: every capability of the unlicensed provider reads UNLICENSED and none is selected (rows: $(($own | ForEach-Object { $_.task + ':' + $_.state + ':' + $_.selected }) -join ', '))"
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "licence: an unlicensed provider never fails the self-test (exit $lastExit)"
+            Expect ((ConvRow $o "sim-conversion").licence.state -eq "unlicensed") "licence: selftest --json carries the state on the provider row (got '$((ConvRow $o "sim-conversion").licence.state)')"
+            Expect ((Plugin $o "sim-display").licence.state -eq "not_applicable") "licence: selftest --json carries the DP's licence object"
+
+            $bad = Cli-Json @("conv", "activate", "sim-conversion", "not-the-key")
+            Expect ((-not $bad.accepted) -and ($bad.result -eq "refused") -and ($bad.error -ne "") -and ($bad.licence.state -eq "unlicensed")) "licence: a wrong activation token is refused with the provider's reason (result='$($bad.result)' error='$($bad.error)')"
+            $good = Cli-Json @("conv", "activate", "sim-conversion", $secretKey)
+            Expect ($good.accepted -and ($good.licence.state -eq "licensed") -and ($good.licence.source -eq "key")) "licence: the test key is accepted and the state flips to licensed/key (result='$($good.result)' state='$($good.licence.state)')"
+            & $cli conv activate sim-conversion "not-the-key" | Out-Null
+            Expect ($LASTEXITCODE -ne 0) "licence: 'conv activate' exits non-zero on a refused token"
+            $un = Cli-Json @("input", "activate", "sim-input", $secretKey)
+            Expect ((-not $un.accepted) -and ($un.result -eq "unsupported")) "licence: a provider without the slot answers 'unsupported' (got '$($un.result)')"
+
+            $setOut = (& $cli conv set sim-conversion LICENSE_KEY $secretKey 2>&1 | Out-String)
+            Expect (($LASTEXITCODE -eq 0) -and (-not $setOut.Contains($secretKey))) "secret: 'conv set' stores the key and does not echo it"
+            $everything = (& $cli conv options sim-conversion --json 2>&1 | Out-String) + (& $cli conv options sim-conversion 2>&1 | Out-String) + (& $cli conv list --json 2>&1 | Out-String) + (& $cli conv list 2>&1 | Out-String) + (& $cli selftest --json 2>&1 | Out-String) + (& $cli info --json 2>&1 | Out-String) + (& $cli status --json 2>&1 | Out-String)
+            Expect (-not $everything.Contains($secretKey)) "secret: the value appears in no output of options / list / selftest / info / status"
+            $co = Cli-Json @("conv", "options", "sim-conversion")
+            $lk = $co.settings | Where-Object { $_.key -eq "LICENSE_KEY" } | Select-Object -First 1
+            Expect (($null -ne $lk) -and $lk.secret -and $lk.set -and ($null -eq $lk.value) -and ($lk.type -eq "secret") -and ($lk.source -eq "user")) "secret: options shows LICENSE_KEY as set, typed secret, with no value (secret=$($lk.secret) set=$($lk.set) value='$($lk.value)' source='$($lk.source)')"
+            $cl = ConvRowList
+            $lc = Lic $cl "providers" "sim-conversion"
+            Expect (($lc.state -eq "licensed") -and ($lc.source -eq "key") -and (-not $lc.blocks)) "secret: the stored key reaches the provider, which reports licensed/key (state='$($lc.state)' source='$($lc.source)')"
+            Expect ((Sel (OwnTasks $cl "sim-conversion")) -eq $baseSel) "licence: licensed again, sim-conversion is selected as before"
+            $long = "J" * 1500
+            & $cli conv set sim-conversion LICENSE_KEY $long | Out-Null
+            Expect ($LASTEXITCODE -eq 0) "secret: a 1500-byte key is accepted (got exit $LASTEXITCODE)"
+            & $cli conv set sim-conversion WARM_MS $long | Out-Null
+            Expect ($LASTEXITCODE -ne 0) "secret: an ordinary setting keeps the 256-byte cap"
+            & $cli conv unset sim-conversion LICENSE_KEY | Out-Null
+            $co = Cli-Json @("conv", "options", "sim-conversion")
+            $lk = $co.settings | Where-Object { $_.key -eq "LICENSE_KEY" } | Select-Object -First 1
+            Expect (($lk.secret) -and (-not $lk.set)) "secret: after unset LICENSE_KEY reads not set"
+            reg delete "$cvRoot\sim-conversion\Settings" /v LICENSE_SIM /f | Out-Null
+
+            reg add "$trRoot\sim-tracking\Settings" /v LICENSE_SIM /t REG_SZ /d "unlicensed" /f | Out-Null
+            $o = Selftest-Json
+            Expect (($lastExit -eq 0) -and ($o.tracking_providers.active_id -eq "") -and ($o.tracking_providers.viewer_source -eq "nominal")) "licence: an unlicensed tracking provider is skipped -> nominal viewer, selftest exit 0 ($(Tr $o))"
+            $tlic = ($o.tracking_providers.licences | Where-Object { $_.id -eq "sim-tracking" } | Select-Object -First 1).licence
+            Expect ($tlic.state -eq "unlicensed") "licence: selftest --json lists the tracking provider's state (got '$($tlic.state)')"
+            $tl = Cli-Json @("tracking", "list")
+            Expect ((Lic $tl "providers" "sim-tracking").state -eq "unlicensed") "licence: 'tracking list' reports it"
+            reg add "$trRoot\sim-tracking\Settings" /v LICENSE_SIM /t REG_SZ /d "trial" /f | Out-Null
+            $o = Selftest-Json
+            Expect (($o.tracking_providers.active_id -eq "sim-tracking") -and ($o.tracking_providers.viewer_source -eq "provider:sim-tracking")) "licence: a trial serves ($(Tr $o))"
+            $tl = Cli-Json @("tracking", "list")
+            $tlc = Lic $tl "providers" "sim-tracking"
+            Expect (($tlc.state -eq "trial") -and ($tlc.expires -eq "2100-01-01T00:00:00Z") -and (-not $tlc.blocks)) "licence: the trial carries its end (state='$($tlc.state)' expires='$($tlc.expires)')"
+            reg delete "$trRoot\sim-tracking\Settings" /v LICENSE_SIM /f | Out-Null
           } finally {
             foreach ($k in @("$dpRoot\sim-display", "$dpRoot\sim-display-alt", "$dpRoot\abi-fixture-dp",
                              "$inRoot\sim-input", "$inRoot\sim-input-alt", "$inRoot\abi-fixture-input",
@@ -1061,7 +1145,7 @@ jobs:
             Write-Host "::error::per-class conformance (ADR-054 N4): $($script:fails.Count) assertion(s) failed — see FAIL lines above."
             exit 1
           }
-          Write-Host "PASS: per-class conformance (ADR-054 N4) — selected / Enabled=0 falls back / Preferred wins / EmulatedControllers gate / ABI mismatch rejected and fallen through / sim-stylus dominant-hand pen."
+          Write-Host "PASS: per-class conformance (ADR-054 N4) — selected / Enabled=0 falls back / Preferred wins / EmulatedControllers gate / ABI mismatch rejected and fallen through / sim-stylus dominant-hand pen / licence state reported, unlicensed falls through, activation flips it, a secret is redacted."
           # Explicit: the pwsh step otherwise exits with the LAST native command's
           # code, and the finally block's best-effort `reg delete` of an
           # already-removed value legitimately returns 1.

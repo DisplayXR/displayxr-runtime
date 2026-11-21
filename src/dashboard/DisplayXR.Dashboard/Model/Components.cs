@@ -503,6 +503,7 @@ public static class Components
         if (pol.Preferred) chips.Add(("preferred", Level.Info));
         if (pol.Untrusted) chips.Add(("refused: provenance", Level.Warn));
         if (pol.ProvenanceChip is { } pc) chips.Add(pc);
+        if (pol.LicenceChip is { } lc) chips.Add(lc); // ADR-054 N5: what the component says about its licence
     }
 
     /// <summary>The state chip of one model pack: installed green, downloading blue with its percentage, evicted amber.</summary>

@@ -107,6 +107,9 @@ fill_plugins(struct xrt_status_snapshot *out)
 			p->platform_state = st[j].platform_state;
 			(void)snprintf(p->hint, sizeof(p->hint), "%s", st[j].hint);
 			p->fallback = st[j].fallback;
+			p->licence.state = st[j].license.state;
+			p->licence.source = st[j].license.source;
+			p->licence.expiry_unix_s = st[j].license.expiry_unix_s;
 			break;
 		}
 		p->active = strcmp(p->id, active_id) == 0;
@@ -130,6 +133,9 @@ fill_plugins(struct xrt_status_snapshot *out)
 		p->platform_state = st[j].platform_state;
 		(void)snprintf(p->hint, sizeof(p->hint), "%s", st[j].hint);
 		p->fallback = st[j].fallback;
+		p->licence.state = st[j].license.state;
+		p->licence.source = st[j].license.source;
+		p->licence.expiry_unix_s = st[j].license.expiry_unix_s;
 		p->active = strcmp(p->id, active_id) == 0;
 	}
 	// Insertion sort by ProbeOrder (n <= 32).
@@ -442,6 +448,9 @@ fill_viewer_source(struct xrt_status_screen *s, const struct target_viewer_scree
 		snprintf(s->eye_tracking.viewer_host_state, sizeof(s->eye_tracking.viewer_host_state), "%s",
 		         hi.host_state);
 		s->eye_tracking.viewer_host_restarts = hi.restarts;
+		s->eye_tracking.viewer_licence.state = hi.license_state;
+		s->eye_tracking.viewer_licence.source = hi.license_source;
+		s->eye_tracking.viewer_licence.expiry_unix_s = hi.license_expiry_unix_s;
 	}
 }
 

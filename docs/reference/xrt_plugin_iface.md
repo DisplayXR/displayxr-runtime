@@ -592,6 +592,35 @@ above, applied). Reference implementation: sim_display returns `EXTERNAL_OK`
 (`sim_display_plugin_get_viewer_policy`). Contract:
 [tracking-provider-discovery.md](../specs/runtime/tracking-provider-discovery.md) §4–5.
 
+### `get_license_state` / `activate` (licensed plug-ins, ADR-054 N5)
+
+```c
+bool (*get_license_state)(struct xrt_component_license_state *out);
+bool (*activate)(const char *token, uint32_t token_size, struct xrt_component_license_state *out_state,
+                 char *out_error, uint32_t error_size);
+```
+
+The licence-state contract every component class shares (`xrt/xrt_component_license.h`; spec: plugin-discovery.md §2.4). Install is free and the runtime carries no licence logic: **your binary decides whether this user is entitled, by whatever check you own** (the connected panel, a key, a licence server), and reports the result. The runtime shows it and acts on it.
+
+`get_license_state` fills `out` (zero-filled by the caller, `struct_size` preset; write within it) and returns true, or returns false for "nothing to report":
+
+| Field | What to write |
+|---|---|
+| `state` | `XRT_COMPONENT_LICENSE_LICENSED`, `_TRIAL`, `_EXPIRED` or `_UNLICENSED` |
+| `source` | `_SOURCE_HARDWARE` when the connected display entitles the user (the Dashboard then says "included with your display", not "buy"), `_SOURCE_KEY`, `_SOURCE_TRIAL`, `_SOURCE_OEM` |
+| `expiry_unix_s` | when a trial or term licence ends or ended (UTC seconds); 0 = none |
+| `message` | one short line for a human |
+| `purchase_url` | where to buy or learn more |
+| `activation` | `XRT_COMPONENT_LICENSE_ACTIVATION_KEY` and / or `_DEEP_LINK`: how you can be activated |
+
+Answer **from memory**: no I/O, no network, no allocation; no instance; any thread. The CLI calls it on a negotiated-only plug-in, the loader after a successful `probe()`. That second answer is the one discovery acts on: with `unlicensed` or `expired` your instance is destroyed and the loader moves to the next plug-in, exactly as if you had declined (your row reads `DECLINED`, reason `licence: unlicensed`). Decide your state at `probe()` at the latest.
+
+`activate` receives an opaque token (a pasted key, or what your checkout returned): at most `XRT_COMPONENT_ACTIVATION_TOKEN_MAX - 1` bytes, also NUL-terminated. The runtime never parses, logs or stores it. Return true with the new state in `out_state`, or false with one line in `out_error`. It may block for a few seconds. Persisting the activation is yours.
+
+A licence **key** can also be an ordinary setting of type `secret` (`XRT_COMPONENT_SETTING_TYPE_SECRET`, plugin-discovery.md §2.3): `displayxr-cli dp set <id> LICENSE_KEY <key>` stores it per user, your `get_setting` reads it (up to 2047 bytes, so use a buffer of `XRT_COMPONENT_SETTING_SECRET_MAX`), and no CLI or Dashboard surface ever prints it.
+
+**Both slots are optional.** NULL (or a plug-in built before them) has no licence to report: its state reads `not_applicable` and nothing changes. Appended per ADR-020 after `get_viewer_policy` (gated by `struct_size`, no API bump): `#ifdef XRT_PLUGIN_IFACE_HAS_GET_LICENSE_STATE` / `XRT_PLUGIN_IFACE_HAS_ACTIVATE`; the runtime reads through `xrt_plugin_iface_license_state()`. A reference implementation of both slots is `drivers/sim_common/sim_license.h`, used by the sim conversion and tracking providers.
+
 ## Forward-compatibility rules
 
 The iface is designed to evolve without breaking older plug-ins:

@@ -46,6 +46,7 @@
 
 #include "sim_tracking_script.h"
 #include "sim_tracking_webcam.h"
+#include "../sim_common/sim_license.h" // the scripted licence state (ADR-054 N5)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,6 +102,7 @@ static const struct xrt_component_setting_desc g_descs[] = {
      "DEPRECATED (SOURCE=webcam): when set, the legacy bezel-offset model (camera at the panel's top-centre + "
      "\"x,y,z\" mm) replaces the runtime's default prior; a calibration or placement hint still wins"},
     {"WEBCAM_MIRROR", XRT_COMPONENT_SETTING_TYPE_BOOL, "0", "SOURCE=webcam: the source delivers a mirrored image"},
+    SIM_LICENSE_SETTING_DESCS, // LICENSE_SIM + LICENSE_KEY (a `secret`): the scripted licence state (ADR-054 N5)
 };
 
 static const struct xrt_tracking_plugin_host_iface *g_host = NULL;
@@ -177,6 +179,25 @@ source_is_webcam(void)
 		U_LOG_W("sim-tracking: SOURCE='%s' is not script|webcam - using script.", v);
 	}
 	return false;
+}
+
+//! The scripted licence (ADR-054 N5; ../sim_common/sim_license.h), loaded at negotiate.
+static struct sim_license g_license;
+
+static bool
+get_license_state(struct xrt_component_license_state *out)
+{
+	return sim_license_get(&g_license, out);
+}
+
+static bool
+activate(const char *token,
+         uint32_t token_size,
+         struct xrt_component_license_state *out_state,
+         char *out_error,
+         uint32_t error_size)
+{
+	return sim_license_activate(&g_license, token, token_size, out_state, out_error, error_size);
 }
 
 static uint32_t
@@ -621,6 +642,8 @@ static struct xrt_tracking_plugin_iface g_iface = {
     .get_status = sim_tracking_get_status,
     .destroy = sim_tracking_destroy,
     .describe_settings = describe_settings,
+    .get_license_state = get_license_state,
+    .activate = activate,
 };
 
 XRT_TRACKING_PLUGIN_EXPORT xrt_result_t
@@ -635,6 +658,15 @@ xrtTrackingPluginNegotiate(uint32_t runtime_api_version,
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
 	g_host = host;
+	{
+		// The scripted licence: read once here, so the slots answer from memory.
+		char sim[16];
+		char key[XRT_COMPONENT_SETTING_SECRET_MAX];
+		const bool have_sim = setting("LICENSE_SIM", sim, sizeof(sim));
+		const bool have_key = setting("LICENSE_KEY", key, sizeof(key));
+		sim_license_load(&g_license, have_sim ? sim : NULL, have_key ? key : NULL);
+		memset(key, 0, sizeof(key));
+	}
 	*out_iface = &g_iface;
 	return XRT_SUCCESS;
 }

@@ -219,6 +219,7 @@ extern "C" {
 #define CONV_HOST_MSG_JOB_PROGRESS 0x0005u  //!< conv_host_wire_job_progress
 #define CONV_HOST_MSG_OUTPUT_IMAGE 0x0006u  //!< conv_host_wire_output_image; request_id = the ALLOC_OUTPUTS it answers
 #define CONV_HOST_MSG_SYNC 0x0007u          //!< conv_host_wire_sync (host-created output fence); request_id as above
+#define CONV_HOST_MSG_LICENSE_STATE 0x0008u //!< conv_host_wire_license; when there is one to report, and on change
 
 /* S -> H (requests). */
 #define CONV_HOST_MSG_HELLO_ACK 0x0101u        //!< conv_host_wire_hello_ack; request_id 0, no reply
@@ -242,6 +243,7 @@ extern "C" {
 #define CONV_HOST_MSG_SHUTDOWN 0x0113u         //!< conv_host_wire_shutdown -> conv_host_wire_status, then exit 0
 #define CONV_HOST_MSG_JOB_RELEASE 0x0114u      //!< conv_host_wire_job_release -> – (no reply)
 #define CONV_HOST_MSG_GET_PROVIDER_STATUS 0x0115u //!< conv_host_wire_index (0) -> conv_host_wire_provider_status
+#define CONV_HOST_MSG_ACTIVATE 0x0116u            //!< conv_host_wire_activate -> conv_host_wire_activate_reply
 
 
 /*
@@ -693,6 +695,62 @@ struct conv_host_wire_provider_status
 	char hint[128];
 };
 
+/*!
+ * LICENSE_STATE (H -> S, unsolicited): the provider's licence state as the
+ * host process reads it from `get_license_state` (ADR-054 N5), so a satellite
+ * provider's state shows in the service like an in-service one's. Sent once
+ * after the hello and again whenever it changes. @c reported 0 = the provider
+ * has no such slot (`not_applicable`). The flat twin of
+ * xrt_component_license_state. sizeof == 416.
+ */
+struct conv_host_wire_license
+{
+	uint32_t struct_size;
+	uint32_t family_version;
+	uint32_t reported;
+	uint32_t state;      //!< XRT_COMPONENT_LICENSE_*
+	uint32_t source;     //!< XRT_COMPONENT_LICENSE_SOURCE_*
+	uint32_t activation; //!< XRT_COMPONENT_LICENSE_ACTIVATION_*
+	int64_t expiry_unix_s;
+	char message[128];
+	char purchase_url[256];
+};
+
+/*!
+ * ACTIVATE request: an activation token for the provider's `activate` slot.
+ * Opaque to both ends of the channel; neither logs it. sizeof == 2064.
+ */
+struct conv_host_wire_activate
+{
+	uint32_t struct_size;
+	uint32_t family_version;
+	uint32_t token_bytes; //!< bytes of @c token in use, NUL excluded
+	uint32_t reserved_0;
+	char token[2048]; //!< XRT_COMPONENT_ACTIVATION_TOKEN_MAX
+};
+
+/*!
+ * ACTIVATE reply. @c result: XRT_SUCCESS when the slot was called (then
+ * @c accepted says what it answered), XRT_ERROR_FEATURE_NOT_SUPPORTED when the
+ * provider has none. The state fields are the provider's state after the
+ * call. sizeof == 552.
+ */
+struct conv_host_wire_activate_reply
+{
+	uint32_t struct_size;
+	uint32_t family_version;
+	int32_t result;
+	uint32_t accepted;
+	uint32_t state;
+	uint32_t source;
+	uint32_t activation;
+	uint32_t reserved_0;
+	int64_t expiry_unix_s;
+	char message[128];
+	char purchase_url[256];
+	char error[128]; //!< the provider's error line when not accepted
+};
+
 //! JOB_PROGRESS (H -> S). sizeof == 56.
 struct conv_host_wire_job_progress
 {
@@ -898,6 +956,36 @@ conv_host_wire_set_str(char *dst, size_t dst_size, const char *src)
 		memcpy(dst, src, n);
 	}
 	memset(dst + n, 0, dst_size - n);
+}
+
+//! xrt_component_license_state -> its wire twin (@p out already conv_host_wire_init'ed).
+static inline void
+conv_host_wire_pack_license(const struct xrt_component_license_state *in, struct conv_host_wire_license *out)
+{
+	out->reported = in->state != XRT_COMPONENT_LICENSE_NOT_APPLICABLE ? 1u : 0u;
+	out->state = in->state;
+	out->source = in->source;
+	out->activation = in->activation;
+	out->expiry_unix_s = in->expiry_unix_s;
+	conv_host_wire_set_str(out->message, sizeof(out->message), in->message);
+	conv_host_wire_set_str(out->purchase_url, sizeof(out->purchase_url), in->purchase_url);
+}
+
+//! The wire twin -> a sanitised xrt_component_license_state (the host process is untrusted).
+static inline void
+conv_host_wire_unpack_license(const struct conv_host_wire_license *in, struct xrt_component_license_state *out)
+{
+	xrt_component_license_state_init(out);
+	if (in->reported == 0) {
+		return;
+	}
+	out->state = in->state;
+	out->source = in->source;
+	out->activation = in->activation;
+	out->expiry_unix_s = in->expiry_unix_s;
+	conv_host_wire_set_str(out->message, sizeof(out->message), in->message);
+	conv_host_wire_set_str(out->purchase_url, sizeof(out->purchase_url), in->purchase_url);
+	xrt_component_license_state_sanitize(out);
 }
 
 //! xrt_conv_capability -> wire (every field; struct_size = what the host saw).
@@ -1254,6 +1342,16 @@ XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_release) == 16, "job releas
 XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_job_release, job_id) == 8, "job release layout");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_provider_status) == 152, "provider status size");
 XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_provider_status, hint) == 24, "provider status layout");
+XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_license) == 416, "license size");
+XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_license, message) == 32, "license layout");
+XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_activate) == 2064, "activate size");
+XRT_CONV_ABI_ASSERT(sizeof(((struct conv_host_wire_activate *)0)->token) == XRT_COMPONENT_ACTIVATION_TOKEN_MAX,
+                    "activate: the token field is one activation token");
+XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_activate_reply) == 552, "activate reply size");
+XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_activate_reply, error) == 424, "activate reply layout");
+XRT_CONV_ABI_ASSERT(sizeof(((struct conv_host_wire_license *)0)->message) == XRT_COMPONENT_LICENSE_MESSAGE_MAX &&
+                    sizeof(((struct conv_host_wire_license *)0)->purchase_url) == XRT_COMPONENT_LICENSE_URL_MAX,
+                    "license: the strings twin xrt_component_license_state");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_progress) == 56, "job progress size");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_done) == 936, "job done size");
 XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_job_done, splat_result) == 368, "job done: splat_result appended at 368");
@@ -1276,6 +1374,7 @@ XRT_CONV_ABI_ASSERT((CONV_HOST_WIRE_RING_CAPACITY & (CONV_HOST_WIRE_RING_CAPACIT
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_log) <= CONV_HOST_WIRE_MAX_PAYLOAD, "log > max payload");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_describe_reply) <= CONV_HOST_WIRE_MAX_PAYLOAD, "describe > max payload");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_done) <= CONV_HOST_WIRE_MAX_PAYLOAD, "job done > max payload");
+XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_activate) <= CONV_HOST_WIRE_MAX_PAYLOAD, "activate > max payload");
 // clang-format on
 
 #ifdef __cplusplus

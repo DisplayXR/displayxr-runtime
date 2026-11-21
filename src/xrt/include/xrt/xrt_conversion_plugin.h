@@ -41,6 +41,7 @@
 #pragma once
 
 #include "xrt/xrt_component_settings.h"
+#include "xrt/xrt_component_license.h"
 #include "xrt/xrt_results.h"
 
 #include <stdbool.h>
@@ -1097,12 +1098,84 @@ struct xrt_conversion_plugin_iface
 	 *  keys are still listed. Gated by XRT_CONV_IFACE_HAS; announced by
 	 *  XRT_CONVERSION_PLUGIN_HAS_DESCRIBE_SETTINGS. */
 	xrt_component_describe_settings_fn_t describe_settings;
+
+	/*! [C]; from memory. The provider's LICENCE STATE (ADR-054 N5, ADR-064
+	 *  §5; the one contract every class shares,
+	 *  `xrt/xrt_component_license.h`): does THIS USER hold an entitlement.
+	 *  It is not the licence class of a capability (XRT_CONV_LICENCE_*, the
+	 *  terms a model ships under). While the state is `unlicensed` or
+	 *  `expired` the runtime reads every capability of the provider as
+	 *  XRT_CONV_STATE_UNLICENSED / XRT_CONV_FAIL_LICENCE
+	 *  (@ref xrt_conv_state_apply_license), so selection falls through to
+	 *  the next candidate by the rule it already has; a provider may keep
+	 *  reporting XRT_CONV_STATE_UNLICENSED per capability itself, as before.
+	 *  A provider whose licence state changes calls host->state_changed like
+	 *  for any other readiness change. Optional: NULL (or a provider whose
+	 *  `struct_size` predates this slot) has no licence to report
+	 *  (`not_applicable`). Gated by XRT_CONV_IFACE_HAS; announced by
+	 *  XRT_CONVERSION_PLUGIN_HAS_GET_LICENSE_STATE. */
+	xrt_component_get_license_state_fn_t get_license_state;
+
+	/*! May block for a few seconds; never overlaps another activate on the
+	 *  provider. Hand the provider an ACTIVATION TOKEN (a pasted key, or a
+	 *  vendor checkout's deep-link token): an opaque UTF-8 blob the runtime
+	 *  never interprets, logs or stores. Returns the new licence state or an
+	 *  error line. Optional. Gated by XRT_CONV_IFACE_HAS; announced by
+	 *  XRT_CONVERSION_PLUGIN_HAS_ACTIVATE. */
+	xrt_component_activate_fn_t activate;
 };
 
 /*! Defined when @ref xrt_conversion_plugin_iface carries `describe_settings`
  *  (N3c), so a provider built against an older runtime header can
  *  #ifdef-guard filling it. */
 #define XRT_CONVERSION_PLUGIN_HAS_DESCRIBE_SETTINGS 1
+
+/*! Defined when @ref xrt_conversion_plugin_iface carries `get_license_state`
+ *  (ADR-054 N5), so a provider built against an older runtime header can
+ *  #ifdef-guard filling it. */
+#define XRT_CONVERSION_PLUGIN_HAS_GET_LICENSE_STATE 1
+
+/*! Defined when @ref xrt_conversion_plugin_iface carries `activate`
+ *  (ADR-054 N5), so a provider built against an older runtime header can
+ *  #ifdef-guard filling it. */
+#define XRT_CONVERSION_PLUGIN_HAS_ACTIVATE 1
+
+/*!
+ * The licence state of @p iface, with the absent-slot rule applied
+ * (`not_applicable` unless the provider says otherwise). @p out is always a
+ * valid, sanitised struct. Returns the state.
+ */
+static inline uint32_t
+xrt_conversion_plugin_iface_license_state(const struct xrt_conversion_plugin_iface *iface,
+                                          struct xrt_component_license_state *out)
+{
+	return xrt_component_license_query(
+	    iface != NULL && XRT_CONV_IFACE_HAS(iface, get_license_state) ? iface->get_license_state : NULL, out);
+}
+
+/*!
+ * The mapping of the shared licence state onto the conversion readiness
+ * vocabulary: when @p license_state is `unlicensed` or `expired`, @p st (one
+ * capability's get_state answer) reads XRT_CONV_STATE_UNLICENSED with
+ * XRT_CONV_FAIL_LICENCE, not retryable; otherwise @p st is untouched. Applied
+ * by whoever reads a provider's get_state (the in-process host, which the
+ * satellite host uses too, and the headless status pass), so every consumer
+ * of readiness - selection first - sees one answer. Returns true when it
+ * changed @p st.
+ */
+static inline bool
+xrt_conv_state_apply_license(uint32_t license_state, struct xrt_conv_state *st)
+{
+	if (st == NULL || !xrt_component_license_blocks(license_state)) {
+		return false;
+	}
+	st->state = XRT_CONV_STATE_UNLICENSED;
+	st->failure_reason = XRT_CONV_FAIL_LICENCE;
+	st->retryable = 0;
+	st->progress = 0.0f;
+	st->eta_ns = 0;
+	return true;
+}
 
 /*!
  * Signature of the exported XRT_CONVERSION_PLUGIN_ENTRYPOINT_NAME symbol. The
@@ -1134,8 +1207,12 @@ XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conversion_plugin_iface, destroy) == 8 +
                     "conversion iface: v1 slot order changed - API major bump");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conversion_plugin_iface, describe_settings) == 8 + 17 * sizeof(void *),
                     "conversion iface: describe_settings is the first slot appended past destroy (N3c)");
-XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conversion_plugin_iface) == 8 + 18 * sizeof(void *),
-                    "conversion iface v1 = 4 strings + 13 slots + describe_settings; append-only past it");
+XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conversion_plugin_iface, get_license_state) == 8 + 18 * sizeof(void *) &&
+                    offsetof(struct xrt_conversion_plugin_iface, activate) == 8 + 19 * sizeof(void *),
+                    "conversion iface: get_license_state then activate follow describe_settings (ADR-054 N5)");
+XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conversion_plugin_iface) == 8 + 20 * sizeof(void *),
+                    "conversion iface v1 = 4 strings + 13 slots + describe_settings + the two licence slots; "
+                    "append-only past it");
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conversion_plugin_host_iface) == 16 + 16 * sizeof(void *),
                     "conversion host iface size changed - carve from reserved[] instead");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_capability, struct_size) == 0 &&

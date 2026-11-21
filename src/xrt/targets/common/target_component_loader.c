@@ -15,6 +15,7 @@
 #include "target_plugin_path_guard.h"
 #include "target_plugin_preload_sanitize.h"
 
+#include "xrt/xrt_component_license.h"
 #include "xrt/xrt_component_settings.h"
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_results.h"
@@ -1545,7 +1546,7 @@ tc_store_read(
 	const HKEY hive = user ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
 	const DWORD flags = RRF_RT_ANY | (user ? 0u : RRF_SUBKEY_WOW6464KEY);
 	DWORD type = 0;
-	BYTE data[TARGET_COMPONENT_SETTING_VALUE_MAX * sizeof(wchar_t)];
+	BYTE data[TARGET_COMPONENT_SETTING_SECRET_VALUE_MAX * sizeof(wchar_t)]; // a `secret` may be this long
 	DWORD bytes = sizeof(data) - sizeof(wchar_t);
 	memset(data, 0, sizeof(data));
 	if (RegGetValueW(hive, wpath, wkey, flags, &type, data, &bytes) != ERROR_SUCCESS) {
@@ -1590,7 +1591,7 @@ tc_store_write(
 		return rc == ERROR_ACCESS_DENIED ? TARGET_COMPONENT_STORE_DENIED : TARGET_COMPONENT_STORE_FAILED;
 	}
 	if (value != NULL) {
-		wchar_t wval[TARGET_COMPONENT_SETTING_VALUE_MAX];
+		wchar_t wval[TARGET_COMPONENT_SETTING_SECRET_VALUE_MAX]; // a `secret` may be this long
 		if (!tc_u2w(value, wval, (int)(sizeof(wval) / sizeof(wval[0])))) {
 			RegCloseKey(k);
 			return TARGET_COMPONENT_STORE_FAILED;
@@ -2478,6 +2479,9 @@ tc_store_write(
 		if (f == NULL) {
 			r = errno == EACCES ? TARGET_COMPONENT_STORE_DENIED : TARGET_COMPONENT_STORE_FAILED;
 		} else {
+			// Owner-only before the first byte: the file may hold a `secret`
+			// setting (a licence key), and nobody else has a reason to read it.
+			(void)fchmod(fileno(f), 0600);
 			fprintf(f, "%s\n", printed);
 			fclose(f);
 		}
@@ -3658,8 +3662,9 @@ tc_get_setting(const struct target_component_class *cls,
 	// Tier 1: the hosting process's environment, through u_setting's env
 	// reader (Windows getenv_s, Android debug.xrt.* properties, POSIX
 	// getenv) — an unmanaged name never touches u_setting's own stores.
+	// Buffers sized for a `secret` (a licence key): the caller's @p cap decides what it gets.
 	char env_name[TARGET_COMPONENT_SETTING_ENV_MAX];
-	char env_buf[TARGET_COMPONENT_SETTING_VALUE_MAX];
+	char env_buf[TARGET_COMPONENT_SETTING_SECRET_VALUE_MAX];
 	const char *env_value = NULL;
 	if (target_component_setting_env_name(cls->env_class, id, key, env_name, sizeof(env_name))) {
 		enum u_setting_source us = U_SETTING_SOURCE_DEFAULT;
@@ -3669,8 +3674,8 @@ tc_get_setting(const struct target_component_class *cls,
 	}
 
 	// Tiers 2 + 3, read only when needed (each is a registry / file read).
-	char user_buf[TARGET_COMPONENT_SETTING_VALUE_MAX];
-	char stored_buf[TARGET_COMPONENT_SETTING_VALUE_MAX];
+	char user_buf[TARGET_COMPONENT_SETTING_SECRET_VALUE_MAX];
+	char stored_buf[TARGET_COMPONENT_SETTING_SECRET_VALUE_MAX];
 	const char *user_value = NULL;
 	const char *stored_value = NULL;
 	bool lock = false;
@@ -3682,6 +3687,14 @@ tc_get_setting(const struct target_component_class *cls,
 		if (user_value == NULL) {
 			if (use_row) {
 				stored_value = row_value;
+				// A row value that fills its 256-byte cell may be a longer
+				// value cut short (a `secret` in the machine store): read
+				// the store itself, which is not capped there.
+				if (row_value != NULL && strlen(row_value) >= TARGET_COMPONENT_SETTING_VALUE_MAX - 1 &&
+				    tc_store_read(cls, id, key, false, stored_buf, sizeof(stored_buf)) &&
+				    strlen(stored_buf) > strlen(row_value)) {
+					stored_value = stored_buf;
+				}
 			} else if (tc_store_read(cls, id, key, false, stored_buf, sizeof(stored_buf))) {
 				stored_value = stored_buf;
 			}
@@ -3719,17 +3732,100 @@ target_component_get_setting_ex(const struct target_component_class *cls,
 	return tc_get_setting(cls, id, key, true, row_value, buf, cap, out_source);
 }
 
-enum target_component_store_result
-target_component_set_setting(
-    const struct target_component_class *cls, const char *id, const char *key, const char *value, bool machine)
+const char *
+target_component_activate_result_str(enum target_component_activate_result r)
+{
+	switch (r) {
+	case TARGET_COMPONENT_ACTIVATE_OK: return "ok";
+	case TARGET_COMPONENT_ACTIVATE_REFUSED: return "refused";
+	case TARGET_COMPONENT_ACTIVATE_UNSUPPORTED: return "unsupported";
+	case TARGET_COMPONENT_ACTIVATE_BAD_TOKEN: return "bad-token";
+	case TARGET_COMPONENT_ACTIVATE_NOT_LOADED:
+	default: return "not-loaded";
+	}
+}
+
+enum target_component_activate_result
+target_component_activate_call(xrt_component_activate_fn_t fn,
+                               const char *token,
+                               struct xrt_component_license_state *out_state,
+                               char *err,
+                               size_t err_cap)
+{
+	if (err != NULL && err_cap > 0) {
+		err[0] = '\0';
+	}
+	struct xrt_component_license_state local;
+	struct xrt_component_license_state *st = out_state != NULL ? out_state : &local;
+	xrt_component_license_state_init(st);
+	const size_t n = token != NULL ? strlen(token) : 0;
+	if (n == 0 || n >= XRT_COMPONENT_ACTIVATION_TOKEN_MAX) {
+		return TARGET_COMPONENT_ACTIVATE_BAD_TOKEN;
+	}
+	if (fn == NULL) {
+		return TARGET_COMPONENT_ACTIVATE_UNSUPPORTED;
+	}
+	// The token is the component's: not parsed, not logged, not kept.
+	const bool ok = fn(token, (uint32_t)n, st, err, err != NULL ? (uint32_t)err_cap : 0u);
+	xrt_component_license_state_sanitize(st);
+	if (err != NULL && err_cap > 0) {
+		err[err_cap - 1] = '\0';
+	}
+	return ok ? TARGET_COMPONENT_ACTIVATE_OK : TARGET_COMPONENT_ACTIVATE_REFUSED;
+}
+
+static enum target_component_store_result
+tc_set_setting(const struct target_component_class *cls,
+               const char *id,
+               const char *key,
+               const char *value,
+               bool machine,
+               size_t value_max)
 {
 	if (cls == NULL || id == NULL || id[0] == '\0' || !target_component_setting_key_valid(key) || value == NULL ||
-	    strlen(value) >= TARGET_COMPONENT_SETTING_VALUE_MAX) {
+	    strlen(value) >= value_max) {
 		return TARGET_COMPONENT_STORE_FAILED;
 	}
 	char upper[TARGET_COMPONENT_SETTING_KEY_MAX];
 	tc_upper_copy(upper, sizeof(upper), key);
 	return tc_store_write(cls, id, upper, value, machine);
+}
+
+enum target_component_store_result
+target_component_set_setting(
+    const struct target_component_class *cls, const char *id, const char *key, const char *value, bool machine)
+{
+	return tc_set_setting(cls, id, key, value, machine, TARGET_COMPONENT_SETTING_VALUE_MAX);
+}
+
+enum target_component_store_result
+target_component_set_secret(
+    const struct target_component_class *cls, const char *id, const char *key, const char *value, bool machine)
+{
+	return tc_set_setting(cls, id, key, value, machine, TARGET_COMPONENT_SETTING_SECRET_VALUE_MAX);
+}
+
+bool
+target_component_setting_is_secret(const char *type, const char *key)
+{
+	if (type != NULL && type[0] != '\0') {
+		return tc_ci_equal(type, XRT_COMPONENT_SETTING_TYPE_SECRET);
+	}
+	if (key == NULL) {
+		return false;
+	}
+	static const char *const words[] = {"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSPHRASE"};
+	const size_t kn = strlen(key);
+	for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		const size_t wn = strlen(words[i]);
+		if (kn < wn || !tc_ci_equal(key + (kn - wn), words[i])) {
+			continue;
+		}
+		if (kn == wn || key[kn - wn - 1] == '_') {
+			return true;
+		}
+	}
+	return false;
 }
 
 enum target_component_store_result

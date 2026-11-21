@@ -112,6 +112,9 @@ fence(void)
 #define OFF_PROD_PROVIDER 352u // .. 416
 #define OFF_PROD_SOURCE 416u   // .. 544
 #define OFF_PROD_CAMERA 544u   // .. 672
+#define OFF_PROD_LICENSE_STATE 672u // ADR-054 N5; formerly unused, zero
+#define OFF_PROD_LICENSE_SOURCE 676u
+#define OFF_PROD_LICENSE_EXPIRY 680u // .. 688
 
 #define OFF_DEMAND 768u
 
@@ -340,6 +343,9 @@ u_vpp_write_producer(void *mem, const struct u_vpp_producer_status *st)
 	put_str(mem, OFF_PROD_PROVIDER, U_VPP_ID_MAX, st->provider_id);
 	put_str(mem, OFF_PROD_SOURCE, U_VPP_TEXT_MAX, st->source);
 	put_str(mem, OFF_PROD_CAMERA, U_VPP_TEXT_MAX, st->camera_key);
+	put_u32(mem, OFF_PROD_LICENSE_STATE, st->license_state);
+	put_u32(mem, OFF_PROD_LICENSE_SOURCE, st->license_source);
+	put_i64(mem, OFF_PROD_LICENSE_EXPIRY, st->license_expiry_unix_s);
 	fence();
 	store64(seq, s + 1u);
 }
@@ -454,6 +460,16 @@ u_vpp_read_producer(const void *mem, struct u_vpp_producer_status *out)
 		get_str(mem, OFF_PROD_PROVIDER, U_VPP_ID_MAX, st.provider_id);
 		get_str(mem, OFF_PROD_SOURCE, U_VPP_TEXT_MAX, st.source);
 		get_str(mem, OFF_PROD_CAMERA, U_VPP_TEXT_MAX, st.camera_key);
+		// The producer is untrusted: an out-of-range value reads as "nothing stated".
+		st.license_state = get_u32(mem, OFF_PROD_LICENSE_STATE);
+		st.license_source = get_u32(mem, OFF_PROD_LICENSE_SOURCE);
+		st.license_expiry_unix_s = get_i64(mem, OFF_PROD_LICENSE_EXPIRY);
+		if (st.license_state > 4u) {
+			st.license_state = 0;
+		}
+		if (st.license_source > 4u) {
+			st.license_source = 0;
+		}
 		fence();
 		if (load64(seq) == s1) {
 			*out = st;

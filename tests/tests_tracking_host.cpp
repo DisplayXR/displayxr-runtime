@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <signal.h>
 #include <thread>
 #include <vector>
@@ -233,6 +234,65 @@ TEST_CASE("tracking host: an unknown provider exits no_provider (terminal)", "[t
 	CHECK(hs.last_exit == TARGET_VHOST_EXIT_NO_PROVIDER);
 	CHECK(hs.restarts == 0);
 	target_viewer_host_destroy(&host);
+	os_shm_close(&shm);
+}
+
+TEST_CASE("tracking host: an unlicensed provider is skipped; a trial serves and says so on the page (ADR-054 N5)",
+          "[tracking_host][license]")
+{
+	char name[64];
+	std::snprintf(name, sizeof(name), "/dxr-vpth5-%ld", os_process_current_pid());
+	os_shm shm;
+	REQUIRE(os_shm_create(name, U_VPP_PAGE_BYTES, &shm) == 0);
+	REQUIRE(u_vpp_init(shm.map, shm.size, os_process_current_pid(), os_monotonic_get_ns()));
+	char id[64] = {0};
+	bool ran = false;
+
+	// Unlicensed: the host's scan treats it like a provider that declined and
+	// falls through. With no other provider registered nothing is usable
+	// (exit 10); on a box that has another one installed (the discovery roots
+	// include the machine's), THAT one answers. Either way sim-tracking does not.
+	auto probe_skips_sim = [&] {
+		id[0] = '\0';
+		u_vpp_init(shm.map, shm.size, os_process_current_pid(),
+		           os_monotonic_get_ns()); // a clean producer block
+		const bool usable =
+		    target_viewer_host_probe(TRACKING_HOST_EXE, name, shm.map, -1, 20000, id, sizeof(id), &ran);
+		INFO("probe answered: usable=" << usable << " id='" << id << "'");
+		return ran && (!usable || std::string(id) != "sim-tracking");
+	};
+	setenv("DXR_TRACKING_SIM_TRACKING_LICENSE_SIM", "unlicensed", 1);
+	CHECK(probe_skips_sim());
+
+	// Expired: the same.
+	setenv("DXR_TRACKING_SIM_TRACKING_LICENSE_SIM", "expired", 1);
+	CHECK(probe_skips_sim());
+
+	// The licence key (a `secret` setting) makes it usable again: licensed by key.
+	setenv("DXR_TRACKING_SIM_TRACKING_LICENSE_SIM", "unlicensed", 1);
+	setenv("DXR_TRACKING_SIM_TRACKING_LICENSE_KEY", "DXR-SIM-TEST-KEY", 1);
+	REQUIRE(target_viewer_host_probe(TRACKING_HOST_EXE, name, shm.map, -1, 10000, id, sizeof(id), &ran));
+	CHECK(std::string(id) == "sim-tracking");
+	u_vpp_producer_status ps;
+	REQUIRE(u_vpp_read_producer(shm.map, &ps));
+	CHECK(ps.license_state == XRT_COMPONENT_LICENSE_LICENSED);
+	CHECK(ps.license_source == XRT_COMPONENT_LICENSE_SOURCE_KEY);
+	unsetenv("DXR_TRACKING_SIM_TRACKING_LICENSE_KEY");
+
+	// A trial serves, and the page carries its state and end.
+	setenv("DXR_TRACKING_SIM_TRACKING_LICENSE_SIM", "trial", 1);
+	REQUIRE(target_viewer_host_probe(TRACKING_HOST_EXE, name, shm.map, -1, 10000, id, sizeof(id), &ran));
+	REQUIRE(u_vpp_read_producer(shm.map, &ps));
+	CHECK(ps.license_state == XRT_COMPONENT_LICENSE_TRIAL);
+	CHECK(ps.license_source == XRT_COMPONENT_LICENSE_SOURCE_TRIAL);
+	CHECK(ps.license_expiry_unix_s == 4102444800ll);
+
+	// Nothing scripted (every existing provider): usable, and nothing to report.
+	unsetenv("DXR_TRACKING_SIM_TRACKING_LICENSE_SIM");
+	REQUIRE(target_viewer_host_probe(TRACKING_HOST_EXE, name, shm.map, -1, 10000, id, sizeof(id), &ran));
+	REQUIRE(u_vpp_read_producer(shm.map, &ps));
+	CHECK(ps.license_state == XRT_COMPONENT_LICENSE_NOT_APPLICABLE);
+
 	os_shm_close(&shm);
 }
 

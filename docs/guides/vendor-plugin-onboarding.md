@@ -168,6 +168,47 @@ Your plug-in's own knobs (a debug overlay, a tracker tuning, a vendor-SDK toggle
 
 `drivers/sim_display/sim_display_settings.c` is the worked example (36 keys behind one shim, cached per process), and the spec is [`plugin-discovery.md` §2.3](../specs/runtime/plugin-discovery.md). The in-tree reference plug-ins are guarded by CI against any `getenv` outside that shim; copy the shape.
 
+### Licensed components (ADR-054 N5)
+
+If your plug-in is licensed, three rules hold for every class (display
+processor, input provider, conversion provider, viewer-tracking provider):
+
+1. **Install stays free.** Your installer registers and installs without a
+   key or an account. Only the licence is gated.
+2. **The gate is in your binary.** Whatever decides entitlement (the connected
+   panel, a key, your licence server) runs inside your plug-in. The runtime
+   has no licence logic and never sees a payment.
+3. **You report the result; the runtime acts on it.**
+
+What to implement, all optional and all appended at an unchanged ABI
+(`xrt/xrt_component_license.h`; spec: plugin-discovery.md §2.4):
+
+| Piece | What it is |
+|---|---|
+| `get_license_state` slot | fill `state` (`licensed` / `trial` / `expired` / `unlicensed`), and where you can `source` (`hardware` when the user's display or device is the entitlement, `key`, `trial`, `oem`), `expiry_unix_s`, a one-line `message`, your `purchase_url` and the `activation` flags. Answer from memory; return false when you have nothing to report |
+| `activate` slot | receives an opaque token of up to 2047 bytes (a pasted key, or what your checkout page returned); return the new state or one line saying why not. Persist it yourself |
+| a `secret` setting | declare e.g. `{"LICENSE_KEY", XRT_COMPONENT_SETTING_TYPE_SECRET, "", "your licence key"}` in `describe_settings`. The user stores it with `displayxr-cli <class> set <id> LICENSE_KEY <key>`; you read it through the host's `get_setting` into a `XRT_COMPONENT_SETTING_SECRET_MAX` buffer; no surface prints it |
+
+What happens with `unlicensed` or `expired`: the runtime treats your component
+like one that declined and falls through to the next candidate (a display
+processor falls back to the next plug-in, a conversion provider's capabilities
+read `UNLICENSED`). `licensed` and `trial` serve normally. Say `hardware` as
+the source when the display itself entitles the user: the Dashboard then shows
+"included with your display" instead of a purchase action. Guard the slots
+with `#ifdef XRT_PLUGIN_IFACE_HAS_GET_LICENSE_STATE` (per class:
+`XRT_INPUT_PLUGIN_IFACE_HAS_…`, `XRT_CONVERSION_PLUGIN_HAS_…`,
+`XRT_TRACKING_PLUGIN_IFACE_HAS_…`) so the same source builds against an older
+runtime header. The reference implementation is
+`drivers/sim_common/sim_license.h`; try it without hardware:
+
+```powershell
+displayxr-cli conv set sim-conversion LICENSE_SIM unlicensed   # scripted state
+displayxr-cli conv list                                        # licence column: UNLICENSED; tasks fall through
+displayxr-cli conv activate sim-conversion DXR-SIM-TEST-KEY    # the test key is accepted
+displayxr-cli conv set sim-conversion LICENSE_KEY DXR-SIM-TEST-KEY
+displayxr-cli conv options sim-conversion                      # LICENSE_KEY  secret  <set>
+```
+
 ### `ProbeOrder` convention
 
 | Range | Meaning | Examples |
@@ -658,6 +699,17 @@ Set `retryable` when a later `warm` may succeed. Version-gate extended entry poi
 | `UNKNOWN` | | treated as `RESEARCH_ONLY` |
 
 `commercial_ok` is an **AND** over the model, every dependency it was derived from, and the inference runtime you load: a provider cannot advertise a commercial class over a research-only runtime. Put the SPDX identifier in `licence_spdx` (`LicenseRef-<owner>` for a proprietary licence).
+
+### 9.7a Licence state
+
+The licence *class* above describes the model's terms. Whether **this user**
+is entitled to your provider is the licence *state*, the contract every class
+shares (§4 *Licensed components*): fill `get_license_state`, and while you say
+`unlicensed` or `expired` the runtime reads every capability of yours as
+`UNLICENSED` and selection falls through. Call `host->notify_changed(0)` when
+your state changes. Your provider runs in `displayxr-conversion-host`; the
+host carries the state and the activation token to and from the service, so
+nothing about hosting changes for you.
 
 ### 9.8 The installer contract: close the host, never the service
 

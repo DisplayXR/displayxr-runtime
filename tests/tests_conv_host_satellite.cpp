@@ -39,6 +39,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -114,6 +115,9 @@ struct Host
 	conv_host_chan *chan = nullptr;
 	os_process *proc = nullptr;
 	bool exited = false;
+	xrt_component_license_state license = {}; //!< the host's last LICENSE_STATE (ADR-054 N5)
+	int license_messages = 0;
+	int state_changes = 0;
 
 	~Host()
 	{
@@ -256,8 +260,20 @@ struct Host
 			if (!conv_host_chan_recv(chan, &f, payload.data())) {
 				return false;
 			}
-			if (f.type == CONV_HOST_MSG_LOG || f.type == CONV_HOST_MSG_HEARTBEAT ||
-			    f.type == CONV_HOST_MSG_STATE_CHANGED) {
+			if (f.type == CONV_HOST_MSG_LICENSE_STATE) {
+				// ADR-054 N5: unsolicited, like a state change; kept for the cases that assert it.
+				conv_host_wire_license lw;
+				if (conv_host_wire_receive(&lw, sizeof(lw), payload.data(), f.payload_bytes)) {
+					conv_host_wire_unpack_license(&lw, &license);
+					license_messages++;
+				}
+				continue;
+			}
+			if (f.type == CONV_HOST_MSG_STATE_CHANGED) {
+				state_changes++;
+				continue;
+			}
+			if (f.type == CONV_HOST_MSG_LOG || f.type == CONV_HOST_MSG_HEARTBEAT) {
 				continue;
 			}
 			return true;
@@ -469,6 +485,142 @@ TEST_CASE("conv_host: a per-user setting (conv set) reaches the satellite provid
 	CHECK(h.wait_exit(15000) == CONV_HOST_EXIT_ORDERLY);
 }
 #endif
+
+namespace {
+
+//! GET_STATE of @p cap_id through the channel.
+uint32_t
+wire_state(Host &h, uint32_t cap_id, uint32_t rid, uint32_t *out_reason = nullptr)
+{
+	conv_host_wire_cap_request s;
+	conv_host_wire_init(&s, sizeof(s));
+	s.cap_id = cap_id;
+	REQUIRE(h.send(CONV_HOST_MSG_GET_STATE, rid, &s, sizeof(s)));
+	conv_host_wire_frame f;
+	std::vector<uint8_t> pl;
+	REQUIRE(h.recv(f, pl));
+	REQUIRE(f.type == (CONV_HOST_MSG_GET_STATE | CONV_HOST_MSG_REPLY_BIT));
+	conv_host_wire_state_reply sr;
+	REQUIRE(conv_host_wire_receive(&sr, sizeof(sr), pl.data(), f.payload_bytes));
+	REQUIRE(sr.result == XRT_SUCCESS);
+	if (out_reason != nullptr) {
+		*out_reason = sr.state.failure_reason;
+	}
+	return sr.state.state;
+}
+
+//! ACTIVATE with @p token; the reply.
+conv_host_wire_activate_reply
+wire_activate(Host &h, const char *token, uint32_t rid)
+{
+	auto q = std::make_unique<conv_host_wire_activate>();
+	conv_host_wire_init(q.get(), sizeof(*q));
+	q->token_bytes = (uint32_t)std::strlen(token);
+	std::memcpy(q->token, token, q->token_bytes);
+	REQUIRE(h.send(CONV_HOST_MSG_ACTIVATE, rid, q.get(), sizeof(*q)));
+	conv_host_wire_frame f;
+	std::vector<uint8_t> pl;
+	REQUIRE(h.recv(f, pl));
+	REQUIRE(f.type == (CONV_HOST_MSG_ACTIVATE | CONV_HOST_MSG_REPLY_BIT));
+	REQUIRE(f.request_id == rid);
+	conv_host_wire_activate_reply rep;
+	REQUIRE(conv_host_wire_receive(&rep, sizeof(rep), pl.data(), f.payload_bytes));
+	return rep;
+}
+
+} // namespace
+
+TEST_CASE("conv_host: the licence state crosses the channel; unlicensed reads UNLICENSED; activation flips it",
+          "[conv_host][license]")
+{
+	// ADR-054 N5: the provider runs in the host process, so its licence state
+	// has to reach the service over the host channel: LICENSE_STATE for
+	// showing it, GET_STATE (every capability UNLICENSED) for selection, and
+	// ACTIVATE to hand it a token.
+	common_env();
+	set_env("DXR_CONV_SIM_CONVERSION_LICENSE_SIM", "unlicensed");
+	struct Restore
+	{
+		~Restore()
+		{
+			set_env("DXR_CONV_SIM_CONVERSION_LICENSE_SIM", nullptr);
+		}
+	} restore;
+
+	Host h;
+	REQUIRE(h.spawn(sim_args(h)));
+	REQUIRE(h.chan != nullptr);
+	uint32_t caps = 0;
+	REQUIRE(handshake(h, &caps));
+	REQUIRE(caps >= 1);
+	uint32_t rid = 1;
+	const uint32_t cap_id = XRT_CONV_TASK_DEPTH_MONO;
+
+	// Every capability reads UNLICENSED(licence): what selection falls through.
+	uint32_t reason = 0;
+	CHECK(wire_state(h, cap_id, rid++, &reason) == XRT_CONV_STATE_UNLICENSED);
+	CHECK(reason == XRT_CONV_FAIL_LICENCE);
+
+	// A wrong token: delivered, refused with the provider's own line, state unchanged.
+	conv_host_wire_activate_reply rep = wire_activate(h, "not-the-key", rid++);
+	CHECK(rep.result == XRT_SUCCESS);
+	CHECK(rep.accepted == 0);
+	CHECK(rep.state == XRT_COMPONENT_LICENSE_UNLICENSED);
+	CHECK(std::string(rep.error) == "not the simulated test key");
+	CHECK(wire_state(h, cap_id, rid++) == XRT_CONV_STATE_UNLICENSED);
+
+	// By now the host has published the state it started with.
+	CHECK(h.license_messages >= 1);
+	CHECK(h.license.state == XRT_COMPONENT_LICENSE_UNLICENSED);
+	CHECK(std::string(h.license.purchase_url).find("https://") == 0);
+	CHECK((h.license.activation & XRT_COMPONENT_LICENSE_ACTIVATION_KEY) != 0u);
+
+	// The test key: accepted, the reply carries the new state, and the capability serves again.
+	const int before = h.state_changes; // re-describe requests seen before the flip
+	rep = wire_activate(h, "DXR-SIM-TEST-KEY", rid++);
+	CHECK(rep.result == XRT_SUCCESS);
+	CHECK(rep.accepted == 1);
+	CHECK(rep.state == XRT_COMPONENT_LICENSE_LICENSED);
+	CHECK(rep.source == XRT_COMPONENT_LICENSE_SOURCE_KEY);
+	CHECK(rep.error[0] == '\0');
+	CHECK(wire_state(h, cap_id, rid++) != XRT_CONV_STATE_UNLICENSED);
+
+	// ... and the host says so on its own: the new LICENSE_STATE plus a
+	// re-describe request (the live re-selection, through the channel's
+	// existing STATE_CHANGED).
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	// The host sends LICENSE_STATE first and the re-describe request right
+	// after it: drain until both have been seen.
+	while ((h.license.state != XRT_COMPONENT_LICENSE_LICENSED || h.state_changes <= before) &&
+	       std::chrono::steady_clock::now() < deadline) {
+		(void)wire_state(h, cap_id, rid++); // drains unsolicited frames on the way
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	CHECK(h.license.state == XRT_COMPONENT_LICENSE_LICENSED);
+	CHECK(h.license.source == XRT_COMPONENT_LICENSE_SOURCE_KEY);
+	CHECK(h.state_changes > before);
+}
+
+TEST_CASE("conv_host: a provider with no licence to report sends no licence message", "[conv_host][license]")
+{
+	// The default (LICENSE_SIM unset) is every existing provider: nothing new on the wire.
+	common_env();
+	Host h;
+	REQUIRE(h.spawn(sim_args(h)));
+	REQUIRE(h.chan != nullptr);
+	REQUIRE(handshake(h));
+	uint32_t rid = 1;
+	for (int i = 0; i < 6; i++) {
+		CHECK(wire_state(h, XRT_CONV_TASK_DEPTH_MONO, rid++) != XRT_CONV_STATE_UNLICENSED);
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	CHECK(h.license_messages == 0);
+	// Its activate slot is there, and refuses (the script is off): the token still crosses.
+	const conv_host_wire_activate_reply rep = wire_activate(h, "DXR-SIM-TEST-KEY", rid++);
+	CHECK(rep.result == XRT_SUCCESS);
+	CHECK(rep.accepted == 0);
+	CHECK(rep.state == XRT_COMPONENT_LICENSE_NOT_APPLICABLE);
+}
 
 TEST_CASE("conv_host: idle exit with no bound task", "[conv_host]")
 {

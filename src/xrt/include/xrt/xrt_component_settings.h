@@ -52,7 +52,37 @@ extern "C" {
 #define XRT_COMPONENT_SETTING_TYPE_FLOAT "float"   //!< decimal real
 #define XRT_COMPONENT_SETTING_TYPE_STRING "string" //!< free text (a path, a device name)
 #define XRT_COMPONENT_SETTING_TYPE_ENUM "enum"     //!< one of the words `help` lists
+/*!
+ * A credential: a licence key, an API token (ADR-054 N5, ADR-064 §5).
+ * Stored like any setting (per user by default, `displayxr-cli <class> set
+ * <id> <KEY> <value>`), read by the component through the same host slot,
+ * and NEVER shown: `options`, `list`, the status feed, the Dashboard and
+ * every log print *set* / *not set*, never the value. A secret may be up to
+ * @ref XRT_COMPONENT_SETTING_SECRET_MAX bytes (other types: 256), so the
+ * component reads it into a buffer of that size. Its `default_value` MUST be
+ * "" (a default is not a secret). A component that takes a licence key this
+ * way reports `XRT_COMPONENT_LICENSE_ACTIVATION_KEY` in its licence state
+ * (`xrt_component_license.h`).
+ */
+#define XRT_COMPONENT_SETTING_TYPE_SECRET "secret"
 /*! @} */
+
+/*!
+ * Largest value of a `secret` setting, in bytes, NUL included. Larger than
+ * the 256 bytes every other type gets because a licence key is often a
+ * signed token rather than a product key: an RS256 JWT's signature alone is
+ * 342 characters. Equal to `XRT_COMPONENT_ACTIVATION_TOKEN_MAX`, so whatever
+ * fits a deep link fits a pasted key.
+ */
+#define XRT_COMPONENT_SETTING_SECRET_MAX 2048u
+
+/*!
+ * Defined when this header carries @ref XRT_COMPONENT_SETTING_TYPE_SECRET, so
+ * a component built against an older runtime header can #ifdef-guard
+ * declaring one (an older runtime lists the key with an unknown type and
+ * prints its value: do not store a secret through it).
+ */
+#define XRT_COMPONENT_SETTINGS_HAS_SECRET_TYPE 1
 
 /*!
  * One setting a component declares. FROZEN layout (four pointers, no

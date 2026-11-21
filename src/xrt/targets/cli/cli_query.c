@@ -1205,6 +1205,17 @@ probe_tracking_providers(struct cli_query_result *r,
 {
 	struct target_viewer_decision d;
 	target_viewer_tracking_evaluate(iface, target_plugin_get_active_instance(), dp_supported, &d);
+	// ADR-054 N5: what each registered provider says about its licence.
+	{
+		struct target_tracking_plugin_desc ldescs[CLI_QUERY_MAX_LICENSES];
+		const int ln = target_tracking_plugin_enumerate(ldescs, CLI_QUERY_MAX_LICENSES);
+		r->tracking_license_count = 0;
+		for (int i = 0; i < ln; i++) {
+			struct cli_query_license *l = &r->tracking_licenses[r->tracking_license_count++];
+			snprintf(l->id, sizeof(l->id), "%s", ldescs[i].id);
+			(void)target_tracking_plugin_license_state(ldescs[i].id, &l->license);
+		}
+	}
 	target_tracking_plugin_get_scan_result(&r->tracking_registered, &r->tracking_enabled,
 	                                       &r->tracking_scan_declined, &r->tracking_scan_failed,
 	                                       &r->tracking_scan_untrusted);
@@ -1292,6 +1303,13 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 {
 	struct target_input_plugin_desc descs[16];
 	r->input_provider_count = target_input_plugin_enumerate(descs, 16);
+	// ADR-054 N5: what each registered provider says about its licence.
+	r->input_license_count = 0;
+	for (int i = 0; i < r->input_provider_count && r->input_license_count < CLI_QUERY_MAX_LICENSES; i++) {
+		struct cli_query_license *l = &r->input_licenses[r->input_license_count++];
+		snprintf(l->id, sizeof(l->id), "%s", descs[i].id);
+		(void)target_input_plugin_license_state(descs[i].id, &l->license);
+	}
 	r->input_force_qwerty = target_input_plugin_get_force_qwerty();
 	// N7: the gate, and the device list it shapes — recorded before any of
 	// the early returns below, so they are data whatever the verdict.
@@ -2075,6 +2093,8 @@ add_plugin_states_json(cJSON *root, const struct cli_query_result *r)
 		cJSON_AddStringToObject(o, "provenance", target_component_provenance_str(p->provenance));
 		cJSON_AddStringToObject(o, "signer", p->signer);
 		cJSON_AddStringToObject(o, "provenance_reason", p->provenance_reason);
+		// ADR-054 N5: the plug-in's licence state at the last load attempt.
+		u_status_license_add_cjson(o, &p->license);
 		cJSON_AddItemToArray(arr, o);
 	}
 }
@@ -2958,9 +2978,23 @@ add_conversion_providers_json(cJSON *root, const struct cli_query_result *r);
  * N7: the EmulatedControllers gate and the device list, as data, on the
  * `input_providers` object of both `info --json` and `selftest --json`.
  */
+//! ADR-054 N5: `licences`: [{"id", "licence": {...}}], one per registered provider of a class.
+static void
+add_licences_json(cJSON *obj, const struct cli_query_license *list, int count)
+{
+	cJSON *arr = cJSON_AddArrayToObject(obj, "licences");
+	for (int i = 0; i < count; i++) {
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddStringToObject(o, "id", list[i].id);
+		u_status_license_add_cjson(o, &list[i].license);
+		cJSON_AddItemToArray(arr, o);
+	}
+}
+
 static void
 add_input_emulated_json(cJSON *ip, const struct cli_query_result *r)
 {
+	add_licences_json(ip, r->input_licenses, r->input_license_count);
 	cJSON *em = cJSON_AddObjectToObject(ip, "emulated_controllers");
 	cJSON_AddNumberToObject(em, "value", (double)r->input_emulated_controllers);
 	cJSON_AddStringToObject(em, "source", r->input_emulated_source);
@@ -2997,6 +3031,7 @@ add_tracking_providers_json(cJSON *root, const struct cli_query_result *r)
 	cJSON_AddStringToObject(tp, "viewer_reason", r->tracking_viewer_reason);
 	cJSON_AddStringToObject(tp, "display_viewer_policy", r->tracking_viewer_policy);
 	cJSON_AddNumberToObject(tp, "composed_eye_tracking_modes", (double)r->tracking_composed_modes);
+	add_licences_json(tp, r->tracking_licenses, r->tracking_license_count);
 }
 
 cJSON *

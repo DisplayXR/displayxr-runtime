@@ -422,6 +422,103 @@ target_conv_status_headless_host(void)
 
 /*
  *
+ * Licence state + activation by id (ADR-054 N5).
+ *
+ */
+
+/*!
+ * Run @p fn on the negotiated-only iface of the registered provider @p id,
+ * with the headless host bound to its row. False when @p id is not registered
+ * or did not negotiate.
+ */
+static bool
+conv_with_negotiated(const char *id, void (*fn)(const struct xrt_conversion_plugin_iface *iface, void *ud), void *ud)
+{
+	if (id == NULL || id[0] == '\0') {
+		return false;
+	}
+	struct xrt_conversion_plugin_entry *entries =
+	    (struct xrt_conversion_plugin_entry *)calloc(XRT_CONV_LOADER_MAX_ENTRIES, sizeof(*entries));
+	if (entries == NULL) {
+		return false;
+	}
+	bool done = false;
+	const int count = target_conversion_plugin_enumerate(entries, XRT_CONV_LOADER_MAX_ENTRIES);
+	for (int i = 0; i < count; i++) {
+		struct xrt_conversion_plugin_entry *e = &entries[i];
+		if (strcmp(e->id, id) != 0) {
+			continue;
+		}
+		// A disabled row still answers: its licence is what one needs to see
+		// before enabling it.
+		if (e->status == XRT_CONV_LOAD_DISABLED) {
+			e->status = XRT_CONV_LOAD_NOT_LOADED;
+		}
+		const struct xrt_conversion_plugin_entry *prev = g_headless_entry;
+		g_headless_entry = e;
+		if (target_conversion_plugin_negotiate_one(e, target_conv_status_headless_host()) && e->iface != NULL) {
+			fn(e->iface, ud);
+			done = true;
+		}
+		g_headless_entry = prev;
+		target_conversion_plugin_unload(e);
+		break;
+	}
+	free(entries);
+	return done;
+}
+
+static void
+conv_license_cb(const struct xrt_conversion_plugin_iface *iface, void *ud)
+{
+	(void)xrt_conversion_plugin_iface_license_state(iface, (struct xrt_component_license_state *)ud);
+}
+
+bool
+target_conv_license_state(const char *id, struct xrt_component_license_state *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	xrt_component_license_state_init(out);
+	return conv_with_negotiated(id, conv_license_cb, out);
+}
+
+struct conv_activate_args
+{
+	const char *token;
+	struct xrt_component_license_state *out_state;
+	char *err;
+	size_t err_cap;
+	enum target_component_activate_result result;
+};
+
+static void
+conv_activate_cb(const struct xrt_conversion_plugin_iface *iface, void *ud)
+{
+	struct conv_activate_args *a = (struct conv_activate_args *)ud;
+	a->result = target_component_activate_call(XRT_CONV_IFACE_HAS(iface, activate) ? iface->activate : NULL,
+	                                           a->token, a->out_state, a->err, a->err_cap);
+}
+
+enum target_component_activate_result
+target_conv_activate(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap)
+{
+	struct conv_activate_args a = {token, out_state, err, err_cap, TARGET_COMPONENT_ACTIVATE_NOT_LOADED};
+	if (out_state != NULL) {
+		xrt_component_license_state_init(out_state);
+	}
+	if (err != NULL && err_cap > 0) {
+		err[0] = '\0';
+	}
+	(void)conv_with_negotiated(id, conv_activate_cb, &a);
+	return a.result;
+}
+
+
+/*
+ *
  * The pass.
  *
  */
@@ -438,6 +535,7 @@ struct prov_extra
 	bool licence_exempt;
 	bool built_in;
 	int entry; //!< index into the caller's entries, -1 for built-ins
+	struct xrt_component_license_state license; //!< ADR-054 N5: the provider's licence state
 };
 
 static void
@@ -471,6 +569,9 @@ apply_provider_states(struct conv_registry *reg, uint32_t pi, struct target_conv
 		if (p->iface->get_state(p->inst, row->cap.cap_id, &st) != XRT_SUCCESS) {
 			continue;
 		}
+		// ADR-054 N5: the same mapping the hosts apply, so the headless
+		// selection falls through an unlicensed / expired provider too.
+		(void)xrt_conv_state_apply_license(p->license.state, &st);
 		if (conv_cap_validate_state(&st) != CONV_CAP_OK) {
 			char why[64];
 			(void)snprintf(why, sizeof(why), "cap %u: get_state answered %u (out of range)", row->cap.cap_id,
@@ -518,6 +619,9 @@ fill_provider_row(const struct conv_registry *reg,
 	o->described = p->described;
 	o->bad_descriptors = p->bad_descriptors;
 	copy_str(o->descriptor_error, sizeof(o->descriptor_error), cap_error_str(p->first_error));
+	o->licence.state = x->license.state;
+	o->licence.source = x->license.source;
+	o->licence.expiry_unix_s = x->license.expiry_unix_s;
 	for (uint32_t r = 0; r < reg->row_count; r++) {
 		if (reg->rows[r].provider != pi) {
 			continue;
@@ -732,6 +836,7 @@ target_conv_status_build_from_entries_hinted(struct xrt_conversion_plugin_entry 
 				note_bad(out, e->id, cap_error_str(reg->providers[pi].first_error));
 			}
 		}
+		extra[pi].license = reg->providers[pi].license; // read while its settings still answer
 		apply_provider_states(reg, (uint32_t)pi, out);
 	}
 	g_headless_entry = NULL;
@@ -835,6 +940,15 @@ target_conv_status_from_registry(const struct conv_registry *reg,
 			x->built_in = true;
 			copy_str(x->name, sizeof(x->name), reg->providers[pi].id);
 			copy_str(x->load, sizeof(x->load), "BUILT_IN");
+		}
+		// ADR-054 N5: asked live (from memory), so the service's feed follows
+		// a licence that changed since the last describe.
+		if (reg->providers[pi].host != NULL) {
+			(void)conv_host_get_license_state(reg->providers[pi].host, &x->license);
+		} else if (reg->providers[pi].iface != NULL) {
+			(void)xrt_conversion_plugin_iface_license_state(reg->providers[pi].iface, &x->license);
+		} else {
+			x->license = reg->providers[pi].license;
 		}
 		x->licence_exempt = (reg->providers[pi].flags & CONV_PROV_LICENCE_EXEMPT) != 0;
 		for (uint32_t r = 0; r < reg->row_count && !x->licence_exempt; r++) {

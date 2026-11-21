@@ -1543,6 +1543,120 @@ target_plugin_describe_settings(const char *id, struct target_component_setting_
 }
 
 /*!
+ * Run @p fn on the negotiated-only iface of the registered plug-in @p id
+ * (quiet load, negotiate, ABI gate, @p fn, unload). False when @p id is not
+ * registered or did not get that far.
+ */
+static bool
+dp_with_negotiated(const char *id, void (*fn)(const struct xrt_plugin_iface *iface, void *ud), void *ud)
+{
+	if (id == NULL || id[0] == '\0') {
+		return false;
+	}
+	struct target_component_entry *entries = dp_entries_alloc();
+	if (entries == NULL) {
+		return false;
+	}
+	bool done = false;
+	const int count = target_component_enumerate(&g_dp_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	for (int i = 0; i < count; i++) {
+		struct target_component_entry *e = &entries[i];
+		if ((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0 || strcmp(e->id, id) != 0) {
+			continue;
+		}
+		void *module = NULL;
+		void *entry = NULL;
+		if (target_component_load_binary_ex(&g_dp_class, e, TARGET_COMPONENT_LOAD_FLAG_QUIET, &module, &entry,
+		                                    NULL, NULL, 0) != TARGET_COMPONENT_LOAD_OK) {
+			break;
+		}
+		struct xrt_plugin_host_iface host;
+		dp_fill_host_iface(&host);
+		struct xrt_plugin_iface *iface = NULL;
+		uint32_t plugin_version = 0;
+		const xrt_result_t xret =
+		    ((xrt_plugin_negotiate_fn_t)entry)(XRT_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version);
+		if (target_component_abi_gate(&g_dp_class, e->id, xret, iface, plugin_version, NULL, 0) ==
+		    TARGET_COMPONENT_ABI_OK) {
+			fn(iface, ud);
+			done = true;
+		}
+		target_component_unload(module);
+		break;
+	}
+	free(entries);
+	return done;
+}
+
+static void
+dp_license_cb(const struct xrt_plugin_iface *iface, void *ud)
+{
+	(void)xrt_plugin_iface_license_state(iface, (struct xrt_component_license_state *)ud);
+}
+
+bool
+target_plugin_license_state(const char *id, struct xrt_component_license_state *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	xrt_component_license_state_init(out);
+	return dp_with_negotiated(id, dp_license_cb, out);
+}
+
+struct dp_activate_args
+{
+	const char *token;
+	struct xrt_component_license_state *out_state;
+	char *err;
+	size_t err_cap;
+	enum target_component_activate_result result;
+};
+
+static void
+dp_activate_cb(const struct xrt_plugin_iface *iface, void *ud)
+{
+	struct dp_activate_args *a = (struct dp_activate_args *)ud;
+	a->result = target_component_activate_call(xrt_plugin_iface_has_activate(iface) ? iface->activate : NULL,
+	                                           a->token, a->out_state, a->err, a->err_cap);
+}
+
+enum target_component_activate_result
+target_plugin_activate(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap)
+{
+	struct dp_activate_args a = {token, out_state, err, err_cap, TARGET_COMPONENT_ACTIVATE_NOT_LOADED};
+	if (out_state != NULL) {
+		xrt_component_license_state_init(out_state);
+	}
+	if (err != NULL && err_cap > 0) {
+		err[0] = '\0';
+	}
+	(void)dp_with_negotiated(id, dp_activate_cb, &a);
+	return a.result;
+}
+
+/*!
+ * ADR-054 N5: record what the plug-in says about its licence in its ADR-045
+ * status record and return the state. Asked after negotiate (so a plug-in
+ * about to decline still shows it) and again after a successful probe(),
+ * which is the answer discovery acts on.
+ */
+static uint32_t
+status_record_license(const char *id, const struct xrt_plugin_iface *iface)
+{
+	struct xrt_component_license_state lic;
+	const uint32_t state = xrt_plugin_iface_license_state(iface, &lic);
+	status_lock();
+	int i = status_find_or_add_locked(id != NULL ? id : "?");
+	if (i >= 0) {
+		g_status[i].license = lic;
+	}
+	status_unlock();
+	return state;
+}
+
+/*!
  * ADR-054 N4b: copy the provenance verdict the shared load path left on the
  * entry into the plug-in's ADR-045 status record, for `displayxr-cli info` /
  * `selftest --json` and the dashboard.
@@ -1688,6 +1802,7 @@ load_and_probe_one(struct target_component_entry *e,
 
 	// ADR-045: ask BEFORE probe(), so a plug-in about to decline can say why.
 	status_record_platform_state(e->id, iface);
+	(void)status_record_license(e->id, iface);
 
 	if (iface->probe != NULL) {
 		xret = iface->probe(out_inst);
@@ -1710,6 +1825,28 @@ load_and_probe_one(struct target_component_entry *e,
 			target_component_unload(module);
 			return NULL;
 		}
+	}
+
+	// ADR-054 N5 / ADR-064 §5: the licence state, asked AFTER probe() (an
+	// entitlement that comes from the connected hardware is known now). An
+	// unlicensed or expired plug-in is treated like one that declined: its
+	// instance goes, and discovery falls through to the next candidate. A
+	// plug-in without the slot reads `not_applicable` and is never skipped.
+	const uint32_t license = status_record_license(e->id, iface);
+	if (xrt_component_license_blocks(license)) {
+		char lic_why[64];
+		snprintf(lic_why, sizeof(lic_why), "licence: %s", xrt_component_license_state_str(license));
+		g_last_reject_declined = true;
+		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason), "%s", lic_why);
+		const bool changed = status_finish(e->id, TARGET_PLUGIN_RESULT_DECLINED, 0, lic_why);
+		PLUGIN_LOG_OUTCOME(changed, "plugin loader:   %s: %s — skipping; the next candidate is tried.", e->id,
+		                   lic_why);
+		if (*out_inst != NULL && iface->destroy != NULL) {
+			iface->destroy(*out_inst);
+		}
+		*out_inst = NULL;
+		target_component_unload(module);
+		return NULL;
 	}
 
 	if (out_version != NULL) {

@@ -317,6 +317,30 @@ of who owns AUTO, the stream now keeps the last valid content range across frame
 none (`conv_policy_depth_carry_range`; a fresh range always replaces it, and a different depth
 kind never inherits it). A single frame without range data can no longer change the source.
 
+## Amendment 2 — `UNLICENSED` is the conversion face of the shared licence state (2026-11-20)
+
+Decision 6 made `UNLICENSED` a readiness state a provider reports per
+capability, and selection falls through it. ADR-054 Amendment 2 gives every
+component class one licence-state contract (`xrt/xrt_component_license.h`):
+a provider-level `licensed` / `trial` / `expired` / `unlicensed` with source,
+expiry, a message and a purchase URL, reported through an optional appended
+slot. For this class the two are joined, not duplicated:
+
+- while a provider's licence state is `unlicensed` or `expired`, the runtime
+  reads **every capability** of that provider as `XRT_CONV_STATE_UNLICENSED`
+  with `XRT_CONV_FAIL_LICENCE`. Selection, the app-facing
+  `XR_LIFT_TASK_STATE_UNLICENSED_DXR` and the status rows need no new rule;
+- a provider may still report `UNLICENSED` for one capability itself (one
+  model of several needs a licence): unchanged;
+- the licence **class** of a capability (`PERMISSIVE` / `COMMERCIAL` /
+  `RESEARCH_ONLY`), `XRT_CONV_CAP_LICENSED_LOCAL_INSTALL` and the
+  `AllowResearchOnly` gate describe the terms a model ships under, not the
+  user's entitlement, and are unchanged.
+
+The satellite channel carries the state (`LICENSE_STATE`) and the activation
+token (`ACTIVATE`). Spec: conversion-provider-discovery.md §4.3a. Not done
+here: trial and expiry detail in the `XR_DXR_lift` candidate enumeration.
+
 ## Amendments to earlier records
 
 Recorded here so ADR-042 and ADR-049 stay readable as written; each points at the section of

@@ -171,6 +171,20 @@ describe_into(const struct xrt_tracking_plugin_iface *iface,
 	}
 }
 
+//! The resident provider's licence state into the producer block; true when it changed.
+static bool
+license_into(int index, struct u_vpp_producer_status *ps)
+{
+	struct xrt_component_license_state lic;
+	(void)target_tracking_plugin_get_license_state(index, &lic);
+	const bool changed = ps->license_state != lic.state || ps->license_source != lic.source ||
+	                     ps->license_expiry_unix_s != lic.expiry_unix_s;
+	ps->license_state = lic.state;
+	ps->license_source = lic.source;
+	ps->license_expiry_unix_s = lic.expiry_unix_s;
+	return changed;
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -252,6 +266,10 @@ main(int argc, char *argv[])
 	struct u_vpp_producer_status ps;
 	memset(&ps, 0, sizeof(ps));
 	describe_into(iface, inst, row_id, &ps);
+	// ADR-054 N5: the provider's licence state rides the producer block. An
+	// unlicensed / expired provider never gets here: the scan above skipped
+	// it and the next one in rank (or exit 10) answered.
+	license_into(index, &ps);
 
 	if (a.probe) {
 		// The answer the service decides on: who would serve, and what it tracks.
@@ -301,8 +319,21 @@ main(int argc, char *argv[])
 		const uint32_t st = XRT_TRACKING_PLUGIN_IFACE_HAS(iface, get_status)
 		                        ? (uint32_t)iface->get_status(inst)
 		                        : (uint32_t)XRT_TRACKING_PROVIDER_STATUS_RUNNING;
+		bool dirty = license_into(index, &ps);
+		if (dirty && xrt_component_license_blocks(ps.license_state)) {
+			// The licence lapsed while serving (a trial that ended): stop, and
+			// say so through the ordinary exit. The service's next spawn scans
+			// again, skips this provider and falls through to the next.
+			U_LOG_W("tracking host: provider '%s' licence is now %s — stopping", row_id,
+			        xrt_component_license_state_str(ps.license_state));
+			u_vpp_write_producer(shm.map, &ps);
+			break;
+		}
 		if (st != ps.provider_status) {
 			ps.provider_status = st;
+			dirty = true;
+		}
+		if (dirty) {
 			u_vpp_write_producer(shm.map, &ps);
 		}
 	}

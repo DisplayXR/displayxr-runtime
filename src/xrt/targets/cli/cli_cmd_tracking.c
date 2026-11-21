@@ -31,6 +31,8 @@
 
 #include "cli_common.h"
 #include "cli_component_options.h"
+
+#include "xrt/xrt_component_license.h"
 #include "cli_input_predict.h" // cli_input_id_valid: the same id rule
 
 #include "xrt/xrt_config_os.h"
@@ -122,6 +124,11 @@ cmd_list(int argc, const char **argv)
 			cJSON_AddStringToObject(p, "provenance", target_component_provenance_str(list[i].provenance));
 			cJSON_AddStringToObject(p, "provenance_reason", list[i].provenance_reason);
 			cJSON_AddStringToObject(p, "signer", list[i].signer);
+			// ADR-054 N5: the licence state the component reports (negotiate
+			// only, like `options`); `not_applicable` when it reports none.
+			struct xrt_component_license_state lic;
+			(void)target_tracking_plugin_license_state(list[i].id, &lic);
+			cli_component_license_json(p, &lic);
 			cJSON_AddBoolToObject(p, "preferred", have_pref && strcmp(list[i].id, preferred) == 0);
 			cJSON_AddBoolToObject(p, "first", i == first);
 			cJSON_AddItemToArray(arr, p);
@@ -151,14 +158,20 @@ cmd_list(int argc, const char **argv)
 		P("\t(none — the views of a display that does not track stay on the nominal viewer)\n");
 		return 0;
 	}
-	P("\t  %-20s %-24s %10s  %-18s %-10s %s\n", "id", "name", "ProbeOrder", "Enabled", "Preferred", "Provenance");
+	P("\t  %-20s %-24s %10s  %-18s %-10s %-17s %s\n", "id", "name", "ProbeOrder", "Enabled", "Preferred",
+	  "Provenance", "Licence");
 	for (int i = 0; i < n; i++) {
+		// ADR-054 N5: what the component says about its licence ("-" = nothing to report).
+		struct xrt_component_license_state lic;
+		char lic_cell[40];
+		(void)target_tracking_plugin_license_state(list[i].id, &lic);
 		char enabled[32];
 		snprintf(enabled, sizeof(enabled), "%s (%s)", list[i].enabled ? "yes" : "no", list[i].enabled_source);
-		P("\t%s %-20s %-24s %10u  %-18s %-10s %s\n", i == first ? "*" : " ", list[i].id,
+		P("\t%s %-20s %-24s %10u  %-18s %-10s %-17s %s\n", i == first ? "*" : " ", list[i].id,
 		  list[i].display_name[0] ? list[i].display_name : "?", list[i].probe_order, enabled,
 		  (have_pref && strcmp(list[i].id, preferred) == 0) ? "yes" : "-",
-		  target_component_provenance_str(list[i].provenance));
+		  target_component_provenance_str(list[i].provenance),
+		  cli_component_license_cell(&lic, lic_cell, sizeof(lic_cell)));
 		P("\t    %s\n", list[i].binary_path);
 	}
 	P("\t('*' = the provider the loader would rank first. It serves a screen only when that display does not\n");
@@ -432,6 +445,14 @@ cmd_reset(bool machine)
 	return 0;
 }
 
+//! The class's `activate` slot behind the shared `activate` verb (ADR-054 N5).
+static int
+tracking_activate(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap)
+{
+	return (int)target_tracking_plugin_activate(id, token, out_state, err, err_cap);
+}
+
 static int
 cmd_options_verbs(int argc, const char **argv)
 {
@@ -443,6 +464,7 @@ cmd_options_verbs(int argc, const char **argv)
 	    .describe = target_tracking_plugin_describe_settings,
 	    .note_pickup = note_settings_pickup,
 	    .posix_machine_hint = "the manifest's \"settings\" object (NNN-<id>-tracking-provider.json)",
+	    .activate = tracking_activate,
 	};
 	return cli_component_options_dispatch(&k, argc, argv);
 }
@@ -460,8 +482,10 @@ print_usage(void)
 	P("  reset [--machine]            Clear the PreferredPlugin override.\n");
 	P("  calibrate --screen <key> --watch --json | solve --in <f> | apply --screen <k> --camera <k> --pose <p>\n");
 	P("                               Camera-pose calibration (mirror alignment); 'tracking calibrate help'.\n");
-	cli_component_options_usage(&(const struct cli_component_class){
-	    .verb = "tracking", .noun = "viewer-tracking provider", .cls = target_tracking_plugin_component_class()});
+	cli_component_options_usage(&(const struct cli_component_class){.verb = "tracking",
+	                                                                .noun = "viewer-tracking provider",
+	                                                                .cls = target_tracking_plugin_component_class(),
+	                                                                .activate = tracking_activate});
 	P("A provider serves a screen only when that display does not track the viewer itself and declares\n");
 	P("EXTERNAL_OK; 'displayxr-cli status' shows each screen's viewer source. Everything applies at the next\n");
 	P("app launch. POSIX: use/reset write the per-user tracking-preferred file; enable/disable = the\n");

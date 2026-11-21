@@ -397,6 +397,42 @@ In-tree examples: `ultraleap_provider.cpp` maintains it from LeapC
 it to "a feeder is connected", since for a wire provider the peer *is*
 the hardware.
 
+## `get_license_state` / `activate` — a licensed provider (ADR-054 N5)
+
+Two optional slots appended after `describe_settings` under `struct_size`
+cover (API major stays 1; `XRT_INPUT_PLUGIN_IFACE_HAS_GET_LICENSE_STATE`,
+`XRT_INPUT_PLUGIN_IFACE_HAS_ACTIVATE`), typed in
+`xrt/xrt_component_license.h` and shared by every component class
+(plugin-discovery.md §2.4):
+
+```c
+bool (*get_license_state)(struct xrt_component_license_state *out);
+bool (*activate)(const char *token, uint32_t token_size, struct xrt_component_license_state *out_state,
+                 char *out_error, uint32_t error_size);
+```
+
+Install is free and the runtime holds no licence logic: your binary decides
+whether the user is entitled and reports `licensed` / `trial` / `expired` /
+`unlicensed`, with an optional source (`hardware` when the device itself
+entitles the user), expiry, one line of text and a purchase URL.
+`get_license_state` answers from memory (no I/O), with no instance, on any
+thread; return false for "nothing to report". The loader acts on the answer it
+gets **after a successful `probe()`**: with `unlicensed` or `expired` the
+provider is not loaded, exactly as if it had declined, and the roles go to the
+next provider. A resident provider whose state turns blocking later (a trial
+that ends) stops being a candidate at the next policy re-read and returns when
+its state does.
+
+`activate` receives an opaque token (at most
+`XRT_COMPONENT_ACTIVATION_TOKEN_MAX - 1` bytes) that the runtime never parses,
+logs or stores; return the new state, or false with one line of text. A
+licence key may instead be a setting of type `secret`
+(`XRT_COMPONENT_SETTING_TYPE_SECRET`): stored with `input set`, read through
+`get_setting` into a `XRT_COMPONENT_SETTING_SECRET_MAX` buffer, never printed.
+
+A provider that fills neither slot reads `not_applicable` and behaves exactly
+as before.
+
 ## Role arbitration (what the runtime does with the devices)
 
 `t_builder_add_input_provider_devices()` runs before the qwerty fallback,

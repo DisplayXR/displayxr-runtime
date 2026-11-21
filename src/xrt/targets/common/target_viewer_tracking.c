@@ -1391,6 +1391,7 @@ target_viewer_tracking_get_hosting(struct target_viewer_hosting_info *out)
 	memset(out, 0, sizeof(*out));
 	lock();
 	const enum vt_hosting h = g_hosting;
+	const int idx = g_provider_index;
 	switch (h) {
 	case VT_HOSTING_LOCAL: snprintf(out->hosting, sizeof(out->hosting), "in_process"); break;
 	case VT_HOSTING_OWNER_HOST: snprintf(out->hosting, sizeof(out->hosting), "host"); break;
@@ -1421,9 +1422,29 @@ target_viewer_tracking_get_hosting(struct target_viewer_hosting_info *out)
 		out->host_pid = (int64_t)os_process_current_pid();
 		snprintf(out->host_state, sizeof(out->host_state), "%s", g_started ? "running" : "idle");
 	}
+	if ((h == VT_HOSTING_OWNER_HOST || h == VT_HOSTING_READER) && page != NULL) {
+		// The host process holds the provider: its licence state is on the page.
+		struct u_vpp_producer_status ps;
+		if (u_vpp_read_producer(page, &ps)) {
+			out->license_state = ps.license_state;
+			out->license_source = ps.license_source;
+			out->license_expiry_unix_s = ps.license_expiry_unix_s;
+		}
+		return;
+	}
 #else
 	unlock();
 #endif
+	// Loaded in this process (and only then: a process that hosts the
+	// provider elsewhere must not scan, it would load the binary): ask the
+	// resident iface, from memory.
+	if ((h == VT_HOSTING_LOCAL || h == VT_HOSTING_OWNER_INPROC) && idx >= 0) {
+		struct xrt_component_license_state lic;
+		(void)target_tracking_plugin_get_license_state(idx, &lic);
+		out->license_state = lic.state;
+		out->license_source = lic.source;
+		out->license_expiry_unix_s = lic.expiry_unix_s;
+	}
 }
 
 void

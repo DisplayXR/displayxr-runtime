@@ -82,12 +82,47 @@ public static class ComponentClasses
 /// <see cref="RankedFirst"/>: <c>tracking list --json</c> <c>first</c> — the row the loader would
 /// rank first (a prediction from the registry; it serves a screen only where the display lets it).
 /// <see cref="Vendor"/> / <see cref="Version"/> / <see cref="ProbeOrder"/>: the registration, verbatim.
+/// <see cref="Licence"/> and the fields after it: the row's <c>licence</c> object (ADR-054 N5) — the
+/// state the component itself reports (<c>not_applicable | licensed | trial | expired | unlicensed</c>;
+/// "" from a CLI that predates it), where the entitlement comes from, when it ends (ISO 8601), the
+/// component's one line and its purchase page. The Dashboard shows it; it never decides it.
 /// </summary>
 public sealed record PolicyRow(ComponentClass Class, string Id, string Name, bool Enabled, string EnabledSource,
                                bool Preferred, bool Active, string Load, string Provenance, string? Signer,
                                string? ProvenanceReason, bool Hidden = false, bool BuiltIn = false,
-                               bool RankedFirst = false, string Vendor = "", string Version = "", int? ProbeOrder = null)
+                               bool RankedFirst = false, string Vendor = "", string Version = "", int? ProbeOrder = null,
+                               string Licence = "", string? LicenceSource = null, string? LicenceExpires = null,
+                               string? LicenceMessage = null, string? LicencePurchaseUrl = null)
 {
+    /// <summary>Selection skips the component: it is unlicensed or its licence expired (the CLI's <c>blocks</c>).</summary>
+    public bool LicenceBlocks => Licence is "unlicensed" or "expired";
+
+    /// <summary>
+    /// The licence chip (ADR-054 N5, ADR-064 §5). Nothing for a component with no licence to
+    /// report; an entitlement that comes with the hardware reads "included with your display",
+    /// not as something to buy.
+    /// </summary>
+    public (string Text, Level Level)? LicenceChip
+    {
+        get
+        {
+            string? day = LicenceExpires is { Length: >= 10 } x ? x[..10] : null;
+            return Licence switch
+            {
+                "licensed" => (LicenceSource switch
+                {
+                    "hardware" => "included with your display",
+                    "oem" => "included with this machine",
+                    _ => day is null ? "licensed" : $"licensed until {day}",
+                }, Level.Ok),
+                "trial" => (day is null ? "trial" : $"trial until {day}", Level.Info),
+                "expired" => (day is null ? "licence expired" : $"licence expired {day}", Level.Warn),
+                "unlicensed" => ("unlicensed", Level.Warn),
+                _ => null,
+            };
+        }
+    }
+
     /// <summary>
     /// Whether the row has an Enabled value the CLI reported (older CLIs do not, and a
     /// built-in row has none): the Enabled control shows only then.
@@ -265,7 +300,11 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
                     // `built_in` from a current CLI; the load verdict says the same on an older one.
                     e.Bool("built_in") || string.Equals(e.Str("load"), "BUILT_IN", StringComparison.Ordinal),
                     e.Bool("first"), e.Str("vendor"), e.Str("version"),
-                    e.Has("probe_order") ? e.Int("probe_order") : null))
+                    e.Has("probe_order") ? e.Int("probe_order") : null,
+                    // ADR-054 N5: the `licence` object; absent on an older CLI (no chip then).
+                    e.Obj("licence").Str("state"), e.Obj("licence").StrOrNull("source"),
+                    e.Obj("licence").StrOrNull("expires"), e.Obj("licence").StrOrNull("message"),
+                    e.Obj("licence").StrOrNull("purchase_url")))
                 .ToArray();
             var byTask = new Dictionary<string, string>(StringComparer.Ordinal);
             var tasks = new List<PolicyTask>();

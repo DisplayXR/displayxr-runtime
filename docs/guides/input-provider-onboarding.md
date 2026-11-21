@@ -242,6 +242,23 @@ displayxr-cli input unset <id> TIP_THRESHOLD
 
 On a runtime without `get_handedness` (the slot is NULL), `DOMINANT` claims no role. A provider that must run there too declares `LEFT` or `RIGHT` itself from its own setting — the template's `HAND` key (`auto` / `left` / `right`) does exactly that, and on a newer runtime `auto` defers to the policy.
 
+### A licensed provider
+
+If your provider is licensed: install stays free, the entitlement check lives
+in your binary, and you report the result through two optional slots appended
+after `describe_settings` (`XRT_INPUT_PLUGIN_IFACE_HAS_GET_LICENSE_STATE`,
+`XRT_INPUT_PLUGIN_IFACE_HAS_ACTIVATE`; `xrt/xrt_component_license.h`).
+`get_license_state` says `licensed` / `trial` / `expired` / `unlicensed`
+(source `hardware` when the device itself is the entitlement) with an
+optional expiry, a line of text and your purchase URL; `activate` receives an
+opaque token. With `unlicensed` or `expired` the loader does not load the
+provider and the roles go to the next one. A licence key can be a setting of
+type `secret`: declared in `describe_settings`, stored with `displayxr-cli
+input set <id> LICENSE_KEY <key>`, read through `get_setting`, never printed.
+The full rules, shared by every class, are in
+[vendor-plugin-onboarding.md](vendor-plugin-onboarding.md) § *Licensed
+components* and plugin-discovery.md §2.4.
+
 ## 12. Discovery, per OS
 
 **Windows — registry.** `HKLM\Software\DisplayXR\InputProviders\<id>` (64-bit view):

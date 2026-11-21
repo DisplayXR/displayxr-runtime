@@ -133,6 +133,26 @@ bool
 target_plugin_get_preferred(char *out, size_t cap);
 
 /*!
+ * The licence state of the registered plug-in @p id (ADR-054 N5): negotiate
+ * only (no probe, no instance), ask its `get_license_state` slot, unload.
+ * @p out is always a valid struct (`not_applicable` when the plug-in reports
+ * none). Returns false when @p id is not registered or its binary did not
+ * load / negotiate. A lister's call: may load the registered binary, like
+ * @ref target_plugin_describe_settings.
+ */
+bool
+target_plugin_license_state(const char *id, struct xrt_component_license_state *out);
+
+/*!
+ * Hand @p token to the registered plug-in @p id's `activate` slot (negotiate
+ * only) and return what it said: the new state in @p out_state (may be NULL)
+ * or its error line in @p err. The token is opaque and never logged.
+ */
+enum target_component_activate_result
+target_plugin_activate(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap);
+
+/*!
  * The display-processor class's row in the shared component loader (ADR-054
  * N2): what the one options contract keys on (`target_component_get_setting`,
  * `displayxr-cli dp options|set|unset`, N3c). Static, never NULL.
@@ -311,6 +331,10 @@ struct target_plugin_status
 	char signer[128];
 	//! One line: why that provenance verdict (incl. the allowlist row to write).
 	char provenance_reason[224]; //!< mirrors target_component_entry (PR B widened it: the elevated-host reason + digest is > 160)
+	//! ADR-054 N5: the plug-in's licence state at the last attempt (after
+	//! probe() when it got that far); `not_applicable` when it reports none
+	//! or was never negotiated.
+	struct xrt_component_license_state license;
 };
 
 /*!

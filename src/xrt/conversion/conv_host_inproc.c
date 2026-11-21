@@ -12,6 +12,7 @@
 #include "os/os_time.h"
 #include "util/u_logging.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -423,7 +424,58 @@ inproc_get_state(struct conv_host *base, uint32_t cap_id, struct xrt_conv_state 
 	if (!XRT_CONV_IFACE_HAS(h->iface, get_state)) {
 		return XRT_ERROR_NOT_IMPLEMENTED;
 	}
-	return h->iface->get_state(h->inst, cap_id, out);
+	const xrt_result_t r = h->iface->get_state(h->inst, cap_id, out);
+	if (r == XRT_SUCCESS && XRT_CONV_IFACE_HAS(h->iface, get_license_state)) {
+		// ADR-054 N5: an unlicensed / expired PROVIDER reads UNLICENSED on
+		// every capability, so selection falls through by its existing rule.
+		// Here, at the provider's edge, so the service's core and the
+		// satellite host (which serves through this host too) agree.
+		struct xrt_component_license_state lic;
+		(void)xrt_conv_state_apply_license(xrt_conversion_plugin_iface_license_state(h->iface, &lic), out);
+	}
+	return r;
+}
+
+static uint32_t
+inproc_get_license_state(struct conv_host *base, struct xrt_component_license_state *out)
+{
+	return xrt_conversion_plugin_iface_license_state(hi(base)->iface, out);
+}
+
+static bool
+inproc_activate(struct conv_host *base,
+                const char *token,
+                struct xrt_component_license_state *out_state,
+                char *err,
+                uint32_t err_cap)
+{
+	struct host_inproc *h = hi(base);
+	struct xrt_component_license_state local;
+	struct xrt_component_license_state *st = out_state != NULL ? out_state : &local;
+	xrt_component_license_state_init(st);
+	if (err != NULL && err_cap > 0) {
+		err[0] = '\0';
+	}
+	const size_t n = token != NULL ? strlen(token) : 0;
+	if (n == 0 || n >= XRT_COMPONENT_ACTIVATION_TOKEN_MAX) {
+		if (err != NULL && err_cap > 0) {
+			(void)snprintf(err, err_cap, "the token is empty or too long");
+		}
+		return false;
+	}
+	if (!XRT_CONV_IFACE_HAS(h->iface, activate)) {
+		if (err != NULL && err_cap > 0) {
+			(void)snprintf(err, err_cap, "the provider has no activation slot");
+		}
+		(void)xrt_conversion_plugin_iface_license_state(h->iface, st);
+		return false;
+	}
+	const bool ok = h->iface->activate(token, (uint32_t)n, st, err, err != NULL ? err_cap : 0u);
+	xrt_component_license_state_sanitize(st);
+	if (err != NULL && err_cap > 0) {
+		err[err_cap - 1] = '\0';
+	}
+	return ok;
 }
 
 static xrt_result_t
@@ -664,6 +716,8 @@ static const struct conv_host_ops k_inproc_ops = {
     .heartbeat = inproc_heartbeat,
     .abandon = inproc_abandon,
     .destroy = inproc_destroy,
+    .get_license_state = inproc_get_license_state,
+    .activate = inproc_activate,
 };
 
 xrt_result_t

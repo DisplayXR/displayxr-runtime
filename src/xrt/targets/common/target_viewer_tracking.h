@@ -352,6 +352,11 @@ struct target_viewer_hosting_info
 	int64_t host_pid;    //!< the host (or hosting service) pid; 0 = none
 	char host_state[16]; //!< u_vpp_state_str: "idle" / "starting" / "running" / "backoff" / "failed" / "stopped"
 	uint32_t restarts;   //!< host restarts since the service started
+	//! ADR-054 N5: the serving provider's licence state (`xrt_component_license.h` values; 0 =
+	//! not_applicable): from the pose page when a host produces, else asked of the resident iface.
+	uint32_t license_state;
+	uint32_t license_source;
+	int64_t license_expiry_unix_s;
 };
 
 void

@@ -188,6 +188,31 @@ u_status_snapshot_set_head(struct xrt_status_snapshot *snap, const struct xrt_st
 cJSON *
 u_status_conv_provider_to_cjson(const struct xrt_status_conv_provider *p);
 
+struct xrt_component_license_state;
+
+/*!
+ * Seconds since the Unix epoch (UTC) as "2026-12-31" or, with @p with_time,
+ * "2026-12-31T23:59:59Z". Pure arithmetic (no libc time zone state), valid
+ * for years 1..9999; "" outside that range.
+ */
+void
+u_status_unix_time_str(int64_t unix_s, bool with_time, char *buf, size_t cap);
+
+/*!
+ * Add a component's whole `licence` object to @p row (ADR-054 N5; the shape
+ * every `displayxr-cli <class> list --json` row and the `plugins[]` rows of
+ * `info` / `selftest` carry):
+ * `{"state", "source", "expires_unix", "expires", "message", "purchase_url",
+ * "activation": {"key", "deep_link"}, "blocks"}`. `state` is one of
+ * `not_applicable | licensed | trial | expired | unlicensed`; `source` is
+ * `hardware | key | trial | oem` or null; `expires_unix` (seconds, UTC) and
+ * `expires` (ISO 8601) are null when the component states none; `blocks` is
+ * true when selection skips the component (`unlicensed`, `expired`). The
+ * snapshot rows of the status feed carry the first three keys only.
+ */
+void
+u_status_license_add_cjson(cJSON *row, const struct xrt_component_license_state *lic);
+
 /*!
  * ADR-053: one conversion task row as a JSON object (the `conv_tasks[]` element).
  * @p providers / @p provider_count resolve the row's provider index to its id.

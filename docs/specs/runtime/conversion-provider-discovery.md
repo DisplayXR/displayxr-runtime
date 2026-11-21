@@ -490,6 +490,42 @@ Golden test: properties queried on a cold boot before the first describe return 
 
 A provider whose host failed terminally (the satellite supervisor latched FAILED: a declined probe / negotiate failure — e.g. the opt-in `sim-conversion` with `ENABLE` unset —, an ABI reject, a licence or device refusal) counts as terminal for discovery, and every task it backs goes `FAILED(<host reason>)`, not retryable — the cold `INSTALLED` rows from the describe cache included, since nothing can serve them — so a spec-3 caller reads UNAVAILABLE instead of ACTIVATING forever (#2279). Tasks another live provider backs are unaffected. A configuration change (`conv set` / `conv enable`, a registry edit) clears the latch: the rows go back to `INSTALLED` (ACTIVATING) and warm to READY.
 
+### 4.3a Licence state: the user's entitlement (ADR-054 N5)
+
+Three things in this class are called "licence", and they answer different
+questions:
+
+| What | Question | Where |
+|---|---|---|
+| Licence **class** (`XRT_CONV_LICENCE_PERMISSIVE` / `_COMMERCIAL` / `_RESEARCH_ONLY`, per capability) and `XRT_CONV_CAP_LICENSED_LOCAL_INSTALL` | under what **terms** does this model ship? | the `AllowResearchOnly` gate, §3.4 step 2 and § *Licence gate* below. Unchanged |
+| Readiness `XRT_CONV_STATE_UNLICENSED` (per capability; `XRT_CONV_FAIL_LICENCE`) | can this capability serve **now**? | §4.3; selection falls through it, §3.4 step 4. Unchanged |
+| Licence **state** (per provider: `licensed` / `trial` / `expired` / `unlicensed`, with source, expiry, message, purchase URL) | does **this user** hold an entitlement to the provider? | the optional `get_license_state` slot, the contract every component class shares (plugin-discovery.md §2.4) |
+
+The third maps onto the second, so nothing in selection is new: **while a
+provider's licence state is `unlicensed` or `expired`, the runtime reads every
+one of its capabilities as `XRT_CONV_STATE_UNLICENSED` with
+`XRT_CONV_FAIL_LICENCE`** (`xrt_conv_state_apply_license`, applied where the
+provider's `get_state` is read: the in-process host, which the satellite host
+serves through too, and the headless status pass). Step 4 of §3.4 then falls
+through to the next candidate. `licensed`, `trial` and a provider with no
+slot (`not_applicable`) leave each capability's own state alone, and a
+provider may keep reporting `UNLICENSED` per capability itself, as before.
+
+- **Threading.** `get_license_state` is a [C] slot: from memory, any thread,
+  concurrent with anything; it runs with every readiness read.
+- **Live change.** A provider whose licence state changes calls
+  `host->notify_changed(0)` like for any other readiness change. A satellite
+  host also watches the state itself and asks the service to re-describe when
+  it crosses the blocking line, so the selection follows either way.
+- **Activation.** The optional `activate` slot receives an opaque token; it
+  may block for a few seconds and never overlaps another `activate` on the
+  provider. `displayxr-cli conv activate <id> <token | @file>`.
+- **A licence key** may be a setting of type `secret` (§3.9): stored with
+  `conv set`, read through `host->get_setting`, never printed.
+- **Where it shows.** `conv list` has a `licence` column; each provider row of
+  `conv list --json` carries the whole `licence` object, and the status
+  snapshot row (§7.3) its compact form.
+
 ### 4.4 In-service and satellite hosting
 
 Both hostings implement the same service-side **host interface** (describe, warm / evict, stream open / reset / close, submit, job submit / cancel, register image, heartbeat, shutdown; callbacks for state, completion, progress and log). The provider ABI cannot tell them apart.
@@ -519,6 +555,7 @@ Both hostings implement the same service-side **host interface** (describe, warm
   | 30 | killed by the supervisor (call watchdog, hello timeout, heartbeat silence) | crash accounting |
   | other | crash; the host wrote a minidump | backoff, crash-loop cutoff |
 - **Logs:** `DisplayXR_conversion-host_<id>.<pid>_<ts>.log`; WARN+ lines are forwarded into the service log, prefixed `[conv:<id>]`.
+- **Licence state (ADR-054 N5, §4.3a).** The provider runs in the host, so its licence state crosses the control channel: the host sends `LICENSE_STATE` (0x0008, the flat twin of `xrt_component_license_state`) once it has one to report and again on every change, plus `STATE_CHANGED` with cap 0 when the state crosses the blocking line, so the service re-describes and selection follows. A provider with nothing to report sends nothing: the channel is byte-for-byte what it was. The service hands an activation token to the provider with `ACTIVATE` (0x0116; the token is opaque to both ends and neither logs it), and the reply carries the provider's answer and its state after the call. Exit code 12 stays reserved: an unlicensed provider is a state, not an exit.
 
 ### 4.5 The legacy DP-lift adapter (`dp-lift`)
 
@@ -868,7 +905,8 @@ Verbs (ADR-053); `lift caps|probe` stay as aliases.
 | `conv use <task> <id>[/<cap>] [--machine]` / `conv reset <task>\|all` | registry (HKCU; HKLM with `--machine`) | per-task preference, like `dp use --screen` |
 | `conv warm <task>\|<id>/<cap> [--wait]` / `conv evict <task>` | DIAG → service | explicit prewarm / unload; `evict` is accepted only on the CLI's own DIAG connection |
 | `conv enable\|disable <id>` | registry | `Enabled` |
-| `conv options <id> [--json]` / `conv set <id> <KEY> <value> [--machine]` / `conv unset <id> <KEY> [--machine]` | registry (HKCU; HKLM with `--machine`) / the POSIX per-user `<id>.settings.json`; `options` negotiates the binary headless | the one options contract (§3.9, N3c): declared + stored keys with value and source; `Settings\<KEY>` writes |
+| `conv options <id> [--json]` / `conv set <id> <KEY> <value> [--machine]` / `conv unset <id> <KEY> [--machine]` | registry (HKCU; HKLM with `--machine`) / the POSIX per-user `<id>.settings.json`; `options` negotiates the binary headless | the one options contract (§3.9, N3c): declared + stored keys with value and source; `Settings\<KEY>` writes. A setting of type `secret` (a licence key) shows as `<set>` / `<unset>` only |
+| `conv activate <id> <token \| @file> [--json]` | negotiates the binary headless | hands an activation token to the provider's `activate` slot (§4.3a); prints the new licence state or the provider's reason. The token is never printed |
 | `conv probe <task> <file\|dir>` | APP connection, stream lane | today's `lift probe` |
 | `conv run <task> <in> [<in-right>] <out> [--provider <id>]` | **as built (ADR-057): headless, in the CLI** | file → file; the provider is the runtime's selection for the task with `--provider` as the per-create hint (§3.4, lift spec 5), but **strict**: when the selection cannot bind the named provider (unknown, disabled, licence-gated, terminal, no job lane) the command exits 5 with the reason — no fall-through, which is for apps (`conv candidates` shows why); the CLI decodes the input (the service never decodes media), hosts the provider headless (negotiate, probe, describe, warm, `job_execute`: the job lane the core drives), downscales to the capability's `max_input_edge`, writes the blob untouched and prints the facts. Options: `--baseline-m`, `--rectified` / `--raw`, `--sbs`, `--focal-px`, `--max-long-side`, `--format sog\|ply`, `--facts <json>`, `--camera-block auto`, `--allow-research-only` (POSIX has no root `AllowResearchOnly` yet; this is the per-run opt-in). Moves to the APP connection once spec-5 jobs run over IPC; for a local provider it loads a second model instance meanwhile, and says so. Splat tasks only in this release |
 | `conv consent <id> grant\|revoke\|status` / `conv consent status` | the per-user consent store | off-box consent for a `REMOTE` provider (§6.3) |
@@ -903,7 +941,7 @@ sim provider DLL was built and registered (until #2002 makes that unconditional)
 
 ### 7.3 Status snapshot (ADR-051)
 
-`xrt_status_snapshot` gains `conv_providers[]` (id, name, vendor, version, load, status state + hint, fallback, probe_order, hosting `in_service` / `satellite` / `android_service`, host pid, restarts, last exit code, adapter, backend, VRAM used, licence class) and per-task rows (provider index, task, cap_id, state, reason, progress, selected, licence class, backend, model id for diagnostics, typical latency, streams, queued jobs). Rows are fetched **by index** over DIAG to stay under the 1 KB DIAG limit. Keys are only added, so the schema number stays **1**. A `conversion` generation counter bumps on every readiness transition, so `status --watch` and the dashboard update live. New warning codes: `CONV_CRASH_LOOP`, `CONV_RESEARCH_MODEL_ENABLED`, `CONV_TASK_UNSERVED`, `CONV_CPU_STAGING`.
+`xrt_status_snapshot` gains `conv_providers[]` (id, name, vendor, version, load, status state + hint, fallback, probe_order, hosting `in_service` / `satellite` / `android_service`, host pid, restarts, last exit code, adapter, backend, VRAM used, licence class, and the compact `licence` object `{state, source, expires_unix}` of §4.3a) and per-task rows (provider index, task, cap_id, state, reason, progress, selected, licence class, backend, model id for diagnostics, typical latency, streams, queued jobs). Rows are fetched **by index** over DIAG to stay under the 1 KB DIAG limit. Keys are only added, so the schema number stays **1**. A `conversion` generation counter bumps on every readiness transition, so `status --watch` and the dashboard update live. New warning codes: `CONV_CRASH_LOOP`, `CONV_RESEARCH_MODEL_ENABLED`, `CONV_TASK_UNSERVED`, `CONV_CPU_STAGING`.
 
 As built (#2006): the row types are `xrt_status_conv_provider` / `xrt_status_conv_task`
 (`xrt_display_status.h`), fetched with `system_get_conv_provider_row(index)` /

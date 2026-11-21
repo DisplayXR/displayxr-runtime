@@ -371,9 +371,42 @@ other.
 
 | Verb | What |
 |---|---|
-| `displayxr-cli dp options <id> [--json]` | Every key the plug-in declares (`xrt_plugin_iface::describe_settings`, `XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`; or the POSIX manifest's `plugin.settings_schema` array `[{"key","type","default","help"}, …]`) unioned with every key the stores hold: key, type (`bool` / `int` / `float` / `string` / `enum`), default, effective value and its source (`environment` / `user` / `machine` / `manifest` / `absent`), plus the environment prefix and both store paths. Loads + negotiates the registered binary (no probe) to ask it — the same exposure as `dp list`'s status snapshot. |
+| `displayxr-cli dp options <id> [--json]` | Every key the plug-in declares (`xrt_plugin_iface::describe_settings`, `XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`; or the POSIX manifest's `plugin.settings_schema` array `[{"key","type","default","help"}, …]`) unioned with every key the stores hold: key, type (`bool` / `int` / `float` / `string` / `enum` / `secret`), default, effective value and its source (`environment` / `user` / `machine` / `manifest` / `absent`), plus the environment prefix and both store paths. Loads + negotiates the registered binary (no probe) to ask it — the same exposure as `dp list`'s status snapshot. |
 | `dp set <id> <KEY> <value> [--machine]` | Writes the per-user store (no admin) or, with `--machine`, the HKLM 64-bit view (admin). Refused on POSIX with `--machine` — the manifest's `settings` object is the machine store there and is edited by hand. An unregistered id or an invalid key is refused with nothing written (the `enable\|disable` rule). After the write the CLI reads the key back and prints *Effective now:* the value the plug-in will actually see and why — including when the environment or `Policy\Lock` overrides what was just written. |
 | `dp unset <id> <KEY> [--machine]` | Removes it from that store; absent is success (POSIX: the per-user file is deleted once empty). |
+
+**Secrets.** A setting declared with type `secret`
+(`XRT_COMPONENT_SETTING_TYPE_SECRET`, announced by
+`XRT_COMPONENT_SETTINGS_HAS_SECRET_TYPE`) is a credential: a licence key, an
+API token. It is stored through this same store, in the same tiers (per user
+by default), written with the same `set` verb and read by the component
+through the same host slot. What differs:
+
+- **It is never shown.** `options` prints `<set>` or `<unset>`; in
+  `options --json` its row has `"secret": true`, `"value": null` and
+  `"set": true|false`; `set` and `unset` confirm without echoing the value;
+  nothing in the runtime logs a setting value. Every row of `options --json`
+  carries `secret`.
+- **It may be longer.** An ordinary value is capped at 255 bytes. A secret
+  may be up to 2047 bytes (`XRT_COMPONENT_SETTING_SECRET_MAX` = 2048 with the
+  terminator), because a licence key is often a signed token rather than a
+  product key: an RS256 JWT's signature alone is 342 characters. 2048 is also
+  the practical ceiling of a deep-link URL and the size of an activation
+  token, and it fits one frame of the satellite channels. The component reads
+  it into a buffer of that size. The per-user tier, the environment and the
+  Windows machine tier carry the full length; a POSIX manifest's `settings`
+  object keeps the 255-byte cap, and a manifest is no place for a secret.
+- **The per-user file is owner-only.** On POSIX `<id>.settings.json` is
+  written with mode 0600, whatever it holds.
+- **Redaction follows the declaration.** The store holds strings and does not
+  know which are secret: every reader that shows values redacts by the
+  declared type (the binary's `describe_settings`, or the manifest's
+  `settings_schema`). When there is no declaration for a key (the binary could
+  not be loaded to declare, or the key is stored but not declared), a key
+  whose name is, or ends in `_` and, `KEY`, `TOKEN`, `SECRET`, `PASSWORD` or
+  `PASSPHRASE` is redacted too. Hiding an undeclared key costs a redacted
+  cell; the other mistake prints a licence key.
+- **Its default is empty.** A default is not a secret.
 
 **When it applies.** A display processor reads its settings at init through
 the host iface (sim-display resolves each key once per process and caches
@@ -401,6 +434,123 @@ displayxr-cli dp options sim-display
 # Fake eye tracking for this user (next session), then undo it:
 displayxr-cli dp set sim-display TRACKING 1
 displayxr-cli dp unset sim-display TRACKING
+```
+
+### 2.4 Licence state and activation — the one licence contract (ADR-054 N5)
+
+A component may be licensed. **Install is free; the vendor gates only the
+licence, and gates it inside its own binary.** The runtime carries no licence
+logic and no payment logic: it asks the component for a state, shows it, and
+treats a component that is not entitled like any other that cannot serve. Any
+hardware or entitlement check lives in the vendor's binary, never in the
+runtime ([ADR-064](../../adr/ADR-064-component-catalog-and-third-party-trust.md) §5).
+
+Every class carries the contract the same way (`xrt/xrt_component_license.h`):
+two optional vtable slots, appended under `struct_size` at an unchanged ABI
+(ADR-020), each announced by a feature macro.
+
+| Class | Slots | Feature macros |
+|---|---|---|
+| Display processor (`xrt_plugin.h`) | `get_license_state`, `activate`, after `get_viewer_policy` | `XRT_PLUGIN_IFACE_HAS_GET_LICENSE_STATE`, `XRT_PLUGIN_IFACE_HAS_ACTIVATE` |
+| Input provider (`xrt_input_plugin.h`) | the same two, after `describe_settings` | `XRT_INPUT_PLUGIN_IFACE_HAS_GET_LICENSE_STATE`, `XRT_INPUT_PLUGIN_IFACE_HAS_ACTIVATE` |
+| Conversion provider (`xrt_conversion_plugin.h`) | the same two, after `describe_settings` | `XRT_CONVERSION_PLUGIN_HAS_GET_LICENSE_STATE`, `XRT_CONVERSION_PLUGIN_HAS_ACTIVATE` |
+| Viewer-tracking provider (`xrt_tracking_plugin.h`) | the same two, after `describe_settings` | `XRT_TRACKING_PLUGIN_IFACE_HAS_GET_LICENSE_STATE`, `XRT_TRACKING_PLUGIN_IFACE_HAS_ACTIVATE` |
+
+**A component that fills neither slot has no licence to report.** Its state
+reads `not_applicable` and nothing about it changes: this is every component
+that existed before the slots.
+
+**The state** (`struct xrt_component_license_state`; the caller zero-fills it
+and sets `struct_size`, the component writes within that size):
+
+| Field | Values |
+|---|---|
+| `state` | `not_applicable` (0, nothing to report), `licensed`, `trial`, `expired`, `unlicensed` |
+| `source` (optional) | `hardware` (the connected display entitles the user: no key, no purchase), `key`, `trial`, `oem` (came with the machine) |
+| `expiry_unix_s` (optional) | when a trial or a term licence ends or ended, seconds since the Unix epoch, UTC |
+| `message` | one short line for a human, shown verbatim, never parsed |
+| `purchase_url` | the vendor's purchase or information page |
+| `activation` | flags: `KEY` (a pasted key is accepted: a `secret` setting, or the `activate` slot), `DEEP_LINK` (the vendor's checkout can return a token) |
+
+`get_license_state` answers **from memory**: no I/O, no network, no allocation,
+any thread, no instance. It is called on a negotiated-only binary by the CLI
+(before `probe()`), and after a successful `probe()` by the loader; a component
+whose entitlement depends on hardware answers what it knows at each point.
+Whatever a third-party binary writes is sanitised before it is used (an
+unknown state or source reads as "nothing stated", both strings are
+terminated).
+
+**Selection.** `unlicensed` and `expired` are the two states that keep a
+component from serving. Each class treats them like its existing "declined"
+case, and falls through to the next candidate:
+
+| Class | What a blocking state does | Live change |
+|---|---|---|
+| Display processor | asked after a successful `probe()`: the instance is destroyed, the row is recorded `DECLINED` with the reason `licence: unlicensed` / `licence: expired`, and discovery tries the next plug-in (the fallback last). It contributes no display claims either | at the next session: the active plug-in is never swapped under a live session (§4.2) |
+| Input provider | asked after a successful `probe()`: not loaded, counted as declined, the roles go to the next provider (or stay with the keyboard pair) | a **resident** provider whose state turns blocking stops being a candidate at the next policy re-read, and comes back when its state does (the §4.2a re-rank). One that was unlicensed at the scan is not resident and joins at the next service start |
+| Conversion provider | every capability reads `XRT_CONV_STATE_UNLICENSED` (`XRT_CONV_FAIL_LICENCE`), which selection already falls through (conversion-provider-discovery.md §3.4) | live, through the readiness path the class already has: the provider calls `notify_changed`, and a satellite host re-describes on its own when the state crosses the line (§4.4 there) |
+| Viewer-tracking provider | asked after a successful `probe()`: not resident, the next provider in rank serves; none left means the nominal viewer | at the next scan: the next process, or the next spawn of `displayxr-tracking-host` (which stops serving when the licence lapses under it) |
+
+A component that reports `not_applicable`, `licensed` or `trial` is never
+skipped for its licence.
+
+**Activation.** `activate(token, token_size, out_state, out_error, error_size)`
+hands the component an opaque UTF-8 token of at most 2047 bytes
+(`XRT_COMPONENT_ACTIVATION_TOKEN_MAX`): a key the user pasted, or the token a
+vendor's checkout returned through a deep link. **The runtime does not
+interpret, log or store it.** The component returns the new state, or refuses
+with one line of text. Keeping the activation across processes is the
+component's business. The slot may block for a few seconds.
+
+`displayxr-cli <class> activate <id> <token | @file> [--json]` calls the slot
+on the registered binary in the CLI's own process (negotiate only) and prints
+the new state or the component's line; `@file` reads the token from the first
+line of a file, so it need not appear on a command line. Exit 0 means
+accepted. The JSON form is
+`{"id", "class", "result": "ok|refused|unsupported|bad-token|not-loaded", "accepted", "error", "licence": {…}}`.
+
+**Where the state shows.**
+
+| Surface | What |
+|---|---|
+| `displayxr-cli dp\|input\|conv\|tracking list` | a `Licence` column: `-` (nothing to report), `licensed (hardware)`, `trial until 2100-01-01`, `UNLICENSED`, `EXPIRED 2026-10-01` |
+| `… list --json` | every row carries `licence`: `{"state", "source", "expires_unix", "expires", "message", "purchase_url", "activation": {"key", "deep_link"}, "blocks"}`. `source`, `expires_unix` and `expires` (ISO 8601) are null when not stated; `blocks` is true for `unlicensed` and `expired`. The lister asks the registered binary (negotiate only), like `options` |
+| `displayxr-cli selftest --json`, `info --json` | `plugins[].licence` (the same object, as the load path recorded it), `conversion_providers.providers[].licence`, and `input_providers.licences[]` / `tracking_providers.licences[]` (`{"id", "licence"}` per registered provider). An unlicensed component never fails the self-test |
+| `displayxr-cli status --json` (the feed) | compact `licence` `{"state", "source", "expires_unix"}` on `plugins[]`, on the conversion provider rows, and under a screen's `eye_tracking.viewer_host` for the serving tracking provider. The message and the URL are not in the feed |
+
+**Hosted classes.** A provider that runs in a satellite reports through the
+channel the satellite already has, so the service never loads the binary to
+ask: `displayxr-conversion-host` sends `LICENSE_STATE` (and answers
+`ACTIVATE`), and `displayxr-tracking-host` writes the state into the producer
+block of the pose page (conversion-provider-discovery.md §4.4,
+tracking-provider-discovery.md §4a).
+
+**Reference implementation.** `sim-conversion` and `sim-tracking` script the
+contract through two settings (`drivers/sim_common/sim_license.h`):
+`LICENSE_SIM` = `licensed` / `trial` / `expired` / `unlicensed` (unset = no
+licence to report), and `LICENSE_KEY`, a `secret` setting whose fixed test
+value `DXR-SIM-TEST-KEY` turns `unlicensed` / `expired` into `licensed` by
+key; their `activate` slot accepts the same value. The Windows conformance
+job asserts, on the real loaders: the state is reported, an unlicensed
+provider falls through, activation flips the state, and a secret appears in
+no output.
+
+**Not yet (documented gaps).**
+
+- The `displayxr://activate` deep-link handler and the service-side delivery
+  of a token to a provider that is already running (ADR-064 step 7). Today
+  `activate` reaches the binary in the CLI's process; the satellite channel
+  already carries `ACTIVATE` for that step to use.
+- Live re-selection of a display processor or a tracking provider on a
+  licence change (table above): next session / next scan.
+- Entitlement detail in the app-facing `XR_DXR_lift` task enumeration (trial,
+  expiry): apps still see `XR_LIFT_TASK_STATE_UNLICENSED_DXR` only.
+
+```powershell
+displayxr-cli conv list                                  # the Licence column
+displayxr-cli conv activate acme-convert @licence.txt    # hand over a token
+displayxr-cli conv set acme-convert LICENSE_KEY <key>    # or store a key (a secret setting)
+displayxr-cli conv options acme-convert                  # LICENSE_KEY shows as <set>
 ```
 
 ## 3. Per-platform filesystem discovery

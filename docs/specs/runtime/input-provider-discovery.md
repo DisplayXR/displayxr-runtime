@@ -293,6 +293,22 @@ ranked list is exposed via `target_input_plugin_get_count()/get_iface(i)`;
 `get_active()` aliases index 0. No registered provider is not an error: the
 builder falls back to qwerty.
 
+**Licence state (ADR-054 N5).** A provider may report a licence state
+through the optional `get_license_state` slot (the contract every class
+shares: plugin-discovery.md §2.4, `xrt/xrt_component_license.h`). The loader
+asks after a successful `probe()`: a provider that says `unlicensed` or
+`expired` is **not loaded**, exactly like one whose probe declined (one WARN,
+counted in the scan's declined tally), and the roles go to the next provider
+or stay with the keyboard pair. A provider without the slot reads
+`not_applicable` and is never skipped for it. A **resident** provider whose
+state turns blocking later is taken out of the candidates at the next policy
+re-read below, and put back when its state recovers; one that was unlicensed
+at the scan is not resident, so it joins at the next service start (the rule
+a newly enabled provider already follows). `input list` shows a `Licence`
+column and `input list --json` a `licence` object per row; `input activate
+<id> <token | @file>` hands a token to the provider's `activate` slot; a
+licence key may also be a setting of type `secret` (§ *Component settings*).
+
 **Live re-select (ADR-054 N3d, #2051).** The provider set is fixed per
 process (next section), so an `Enabled` / `PreferredPlugin` change while
 the service runs cannot add or remove a provider — it **re-ranks** the

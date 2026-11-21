@@ -243,6 +243,19 @@ struct xrt_status_vendor
 };
 
 /*!
+ * A component's licence state, as the snapshot carries it (ADR-054 N5,
+ * `xrt/xrt_component_license.h`): the state, where the entitlement comes from
+ * and when it ends. The message and the purchase URL are not in the feed;
+ * `displayxr-cli <class> list --json` has the whole `licence` object.
+ */
+struct xrt_status_licence
+{
+	uint32_t state;        //!< XRT_COMPONENT_LICENSE_* (0 = not_applicable: nothing to report).
+	uint32_t source;       //!< XRT_COMPONENT_LICENSE_SOURCE_* (0 = not stated).
+	int64_t expiry_unix_s; //!< Seconds since the Unix epoch, UTC; 0 = none / unknown.
+};
+
+/*!
  * One registered display plug-in (ADR-045 record + registration).
  */
 struct xrt_status_plugin
@@ -257,6 +270,7 @@ struct xrt_status_plugin
 	bool fallback;                     //!< A FALLBACK plug-in (sim-display).
 	bool active;                       //!< The active plug-in of the process that built the snapshot.
 	uint32_t probe_order;              //!< ProbeOrder (lower wins).
+	struct xrt_status_licence licence; //!< Its licence state at the last load attempt (ADR-054 N5).
 };
 
 //! EDID identity of a screen.
@@ -396,6 +410,8 @@ struct xrt_status_eye_tracking
 	int64_t viewer_host_pid;       //!< the host's pid (0 = not running / n/a)
 	char viewer_host_state[16];    //!< "idle" / "starting" / "running" / "backoff" / "failed" / "stopped"
 	uint32_t viewer_host_restarts; //!< host restarts since the service started
+	//! The serving viewer-tracking provider's licence state (ADR-054 N5), where the views follow one.
+	struct xrt_status_licence viewer_licence;
 };
 
 //! The rendering mode a screen is in (phase 2; absent headless).
@@ -615,6 +631,9 @@ struct xrt_status_conv_provider
 	uint32_t cap_count;                   //!< Capabilities accepted at the last describe.
 	uint32_t bad_descriptors;             //!< Capabilities rejected at the last describe (selftest exit 13).
 	char descriptor_error[48];            //!< Why the first one was rejected ("" = none).
+	//! The provider's licence state (ADR-054 N5): does this user hold an
+	//! entitlement. Not @ref licence_class (the terms its model ships under).
+	struct xrt_status_licence licence;
 };
 
 /*!

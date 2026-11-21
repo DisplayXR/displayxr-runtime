@@ -36,6 +36,7 @@
 
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_component_settings.h"
+#include "xrt/xrt_component_license.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_display_processor.h"
 #include "xrt/xrt_display_processor_d3d11.h"
@@ -1877,7 +1878,88 @@ struct xrt_plugin_iface
 	 * Announced by @ref XRT_PLUGIN_IFACE_HAS_VIEWER_POLICY.
 	 */
 	uint32_t (*get_viewer_policy)(struct xrt_plugin_instance *inst, const struct xrt_display_descriptor *display);
+
+	/*!
+	 * The plug-in's LICENCE STATE (ADR-054 N5, ADR-064 §5; the one contract
+	 * every class shares, `xrt/xrt_component_license.h`): `licensed`,
+	 * `trial`, `expired` or `unlicensed`, with an optional source
+	 * (`hardware` when the connected display entitles the user), an optional
+	 * expiry, one line for a human and a purchase URL. Answers from memory,
+	 * no instance, any thread; called before `probe()` by the CLI and after a
+	 * successful `probe()` by the loader, which is the answer discovery acts
+	 * on: a plug-in whose state is `unlicensed` or `expired` is destroyed
+	 * and skipped, and discovery falls through to the next candidate exactly
+	 * as for a plug-in that declined.
+	 *
+	 * Any gate behind the answer lives in the plug-in's own binary; the
+	 * runtime only acts on the state.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * has no licence to report: its state reads `not_applicable` and nothing
+	 * changes. Appended per ADR-020 (append-only within a major; gated by
+	 * @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref get_viewer_policy. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_GET_LICENSE_STATE.
+	 */
+	xrt_component_get_license_state_fn_t get_license_state;
+
+	/*!
+	 * Hand the plug-in an ACTIVATION TOKEN: a key the user pasted
+	 * (`displayxr-cli dp activate <id> <token>`) or the token a vendor's
+	 * checkout returned through a deep link. An opaque UTF-8 blob of at most
+	 * `XRT_COMPONENT_ACTIVATION_TOKEN_MAX - 1` bytes that the runtime never
+	 * interprets, logs or stores. Returns the new licence state, or an error
+	 * line (`xrt/xrt_component_license.h`). May block for a few seconds.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * cannot be activated this way. Appended per ADR-020 (append-only within
+	 * a major; gated by @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT
+	 * bump) after @ref get_license_state. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_ACTIVATE.
+	 */
+	xrt_component_activate_fn_t activate;
 };
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_license_state (ADR-054 N5), so a plug-in built against
+ * an older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_GET_LICENSE_STATE 1
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref xrt_plugin_iface::activate
+ * (ADR-054 N5), so a plug-in built against an older runtime header can
+ * #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_ACTIVATE 1
+
+/*!
+ * The licence state of @p iface, with the absent-slot rule applied
+ * (`not_applicable` unless the plug-in says otherwise). @p out is always a
+ * valid, sanitised struct. Returns the state.
+ */
+static inline uint32_t
+xrt_plugin_iface_license_state(const struct xrt_plugin_iface *iface, struct xrt_component_license_state *out)
+{
+	const bool has = iface != NULL &&
+	                 iface->struct_size >=
+	                     offsetof(struct xrt_plugin_iface, get_license_state) + sizeof(iface->get_license_state) &&
+	                 iface->get_license_state != NULL;
+	return xrt_component_license_query(has ? iface->get_license_state : NULL, out);
+}
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::activate (and its
+ * struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_activate(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, activate) + sizeof(iface->activate) &&
+	       iface->activate != NULL;
+}
 
 /*!
  * Values of @ref xrt_plugin_iface::get_viewer_policy. Stable (they cross the
