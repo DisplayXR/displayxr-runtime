@@ -11,6 +11,8 @@
 
 #include "cli_catalog.h"
 
+#include "get_signers.h"
+
 #include <cjson/cJSON.h>
 
 #include <stdlib.h>
@@ -202,9 +204,9 @@ cli_catalog_print_usage(FILE *f)
 	    "                               whole command. With --json, or when not at a terminal, it is not:\n"
 	    "                               exit 50, unless --elevate is given. --no-elevate: never.\n"
 	    "  --allow-unsigned-engine      Development builds only. dxr-get.exe is started elevated only when it\n"
-	    "                               carries a valid Authenticode signature (and this CLI's signer, when\n"
-	    "                               the CLI is signed); otherwise exit 65. This lifts that check. It is\n"
-	    "                               never implied by --elevate.\n"
+	    "                               is Authenticode-signed by a DisplayXR signer (and by this CLI's own\n"
+	    "                               signer, when the CLI is signed); otherwise exit 65. This lifts that\n"
+	    "                               check, and nothing else does: --elevate does not imply it.\n"
 	    "  --allow-runtime              Not available yet (exit 64). Replacing the runtime as part of an\n"
 	    "                               install needs an engine that does not run from the runtime's own\n"
 	    "                               directory; 'install runtime' and 'update runtime' are refused for\n"
@@ -406,13 +408,24 @@ bool
 cli_catalog_engine_trusted(
     bool engine_signed, const char *engine_signer, bool self_signed, const char *self_signer, char *why, size_t cap)
 {
+	// The first-party signers dxr-get itself trusts (get_signers.h).
+	static const char *const first_party[] = DXR_FIRST_PARTY_SIGNERS;
 	if (!engine_signed) {
 		(void)snprintf(why, cap, "dxr-get.exe carries no valid Authenticode signature");
 		return false;
 	}
-	// A signed CLI ships with an engine signed by the same publisher. An
-	// unsigned CLI (a development build) has nothing to compare with, and a
-	// validly signed engine is then taken as it is.
+	// Valid is not enough: anyone can have a valid signature. Whether or not
+	// this CLI is signed, the engine's signer must be a first-party one.
+	bool known = false;
+	for (size_t i = 0; i < ARRAY_SIZE(first_party); i++) {
+		known = known || (engine_signer != NULL && strcmp(engine_signer, first_party[i]) == 0);
+	}
+	if (!known) {
+		(void)snprintf(why, cap, "dxr-get.exe is signed by \"%s\", which is not a DisplayXR signer",
+		               engine_signer != NULL ? engine_signer : "");
+		return false;
+	}
+	// And a signed CLI ships with an engine signed by the same publisher.
 	if (self_signed &&
 	    strcmp(engine_signer != NULL ? engine_signer : "", self_signer != NULL ? self_signer : "") != 0) {
 		(void)snprintf(why, cap, "dxr-get.exe is signed by \"%s\", not by this CLI's signer \"%s\"",
@@ -1012,7 +1025,7 @@ item_answer(const cJSON *out, int n, int i, bool install, int overall, int *code
 	return install ? cJSON_GetObjectItemCaseSensitive(entry, "plan") : entry;
 }
 
-//! The engine may be started elevated: it is validly signed (cli_catalog_engine_trusted).
+//! The engine may be started elevated: it is signed by a first-party signer (cli_catalog_engine_trusted).
 static bool
 engine_trusted(struct ctx *c, char *why, size_t cap)
 {

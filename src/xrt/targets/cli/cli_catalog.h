@@ -222,8 +222,10 @@ cli_catalog_engine_args(const struct cli_catalog_request *req,
 
 /*!
  * May the engine be started elevated? It must carry a valid Authenticode
- * signature, and when this CLI is signed too, the same signer. False with
- * the reason in @p why. `--allow-unsigned-engine` is the caller's to honour.
+ * signature whose signer is one of the first-party signers `dxr-get` itself
+ * trusts (get_signers.h), and when this CLI is signed too, the CLI's signer.
+ * False with the reason in @p why. `--allow-unsigned-engine` is the caller's
+ * to honour, and the only way around it.
  */
 bool
 cli_catalog_engine_trusted(

@@ -123,7 +123,7 @@ struct Host
 	bool elevated_admin = true; //!< the elevated engine answers as an elevated process
 	bool engine_signed = true;
 	bool self_signed = false; //!< a development CLI
-	std::string engine_cn = "DisplayXR Test";
+	std::string engine_cn = "Leia, Inc."; //!< a first-party signer (get_signers.h)
 	int signer_asks = 0;
 	std::vector<std::string> log_paths;
 	std::vector<std::string> licence_asks;
@@ -158,7 +158,7 @@ struct Host
 		h->signer_asks++;
 		const bool is_signed = path != nullptr ? h->engine_signed : h->self_signed;
 		(void)snprintf(out, cap, "%s",
-		               !is_signed ? "" : (path != nullptr ? h->engine_cn.c_str() : "DisplayXR Test"));
+		               !is_signed ? "" : (path != nullptr ? h->engine_cn.c_str() : "Leia, Inc."));
 		return is_signed;
 	}
 
@@ -682,26 +682,41 @@ TEST_CASE("catalog: an engine that is not validly signed is never started elevat
 		CHECK(h.run({"install", "open-conv", "--json"}).exit == 0);
 		CHECK(h.signer_asks == 0);
 	}
-	SECTION("signed by someone else than this CLI")
+	SECTION("validly signed, but not by a DisplayXR signer")
 	{
-		Host h;
-		h.self_signed = true;
-		h.engine_cn = "Somebody Else";
-		Result r = h.run({"uninstall", "leia-sr", "--json", "--elevate"});
-		CHECK(r.exit == 65);
-		CHECK(h.elevated_runs == 0);
-		CHECK(has(r.str({"items", "0", "message"}), "Somebody Else"));
+		// Whether or not the CLI is signed: a valid signature of anyone else's is not enough.
+		for (bool cli_signed : {false, true}) {
+			Host h;
+			h.self_signed = cli_signed;
+			h.engine_cn = "Somebody Else";
+			Result r = h.run({"uninstall", "leia-sr", "--json", "--elevate"});
+			CHECK(r.exit == 65);
+			CHECK(h.elevated_runs == 0);
+			CHECK(has(r.str({"items", "0", "message"}), "Somebody Else"));
+			CHECK(has(r.str({"items", "0", "message"}), "not a DisplayXR signer"));
+
+			// The explicit switch stays the only way around it.
+			Result ok = h.run({"uninstall", "leia-sr", "--json", "--elevate", "--allow-unsigned-engine"});
+			CHECK(ok.exit == 0);
+			CHECK(h.elevated_runs == 1);
+		}
 	}
 	SECTION("the rule")
 	{
 		char why[200];
 		CHECK(cli_catalog_engine_trusted(true, "Leia, Inc.", true, "Leia, Inc.", why, sizeof(why)));
-		// A development CLI is unsigned: a validly signed engine has nothing to be compared with.
+		// A development CLI is unsigned: the engine must still be a first-party one.
 		CHECK(cli_catalog_engine_trusted(true, "Leia, Inc.", false, "", why, sizeof(why)));
+		CHECK_FALSE(cli_catalog_engine_trusted(true, "Other", false, "", why, sizeof(why)));
+		CHECK(has(why, "not a DisplayXR signer"));
+		CHECK_FALSE(cli_catalog_engine_trusted(true, "", false, "", why, sizeof(why)));
+		CHECK_FALSE(cli_catalog_engine_trusted(true, "leia, inc.", false, "", why, sizeof(why))); // exact name
 		CHECK_FALSE(cli_catalog_engine_trusted(false, "", false, "", why, sizeof(why)));
-		CHECK_FALSE(cli_catalog_engine_trusted(false, "", true, "Leia, Inc.", why, sizeof(why)));
+		CHECK_FALSE(cli_catalog_engine_trusted(false, "Leia, Inc.", true, "Leia, Inc.", why, sizeof(why)));
 		CHECK_FALSE(cli_catalog_engine_trusted(true, "Other", true, "Leia, Inc.", why, sizeof(why)));
-		CHECK(has(why, "Other"));
+		// A first-party engine beside a CLI signed by someone else is refused too.
+		CHECK_FALSE(cli_catalog_engine_trusted(true, "Leia, Inc.", true, "Other", why, sizeof(why)));
+		CHECK(has(why, "this CLI's signer"));
 	}
 }
 
