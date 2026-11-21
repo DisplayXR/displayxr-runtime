@@ -10493,10 +10493,14 @@ comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
 	// top-left, not from (0,0) — on a panel that is not the leftmost/topmost
 	// monitor (a G90XF at x=1920 beside a laptop panel) the old (0,0) origin
 	// put every window ~one monitor-width off-centre and shifted the Kooima
-	// frustum. Same query and arithmetic as the D3D12/D3D11 paths; a DP that
-	// cannot answer keeps the old 0,0 behaviour.
-	int32_t disp_left = 0;
-	int32_t disp_top = 0;
+	// frustum. Same query and arithmetic as the D3D12/D3D11 paths. A DP that
+	// cannot answer falls back to the panel origin the system compositor info
+	// carries (XR_DXR_display_info's panel rect, the VK path's fallback too):
+	// measuring from (0,0) instead is silently one monitor-width off on such a
+	// box, which is what a Leia GL DP on the SR v2 API produced (it answered
+	// nothing when not bound per-screen).
+	int32_t disp_left = c->sys_info.display_screen_left;
+	int32_t disp_top = c->sys_info.display_screen_top;
 	if (c->display_processor != NULL) {
 		uint32_t dp_px_w = 0;
 		uint32_t dp_px_h = 0;
