@@ -46,6 +46,48 @@ public class ComponentPolicyTests
     }
 
     [Fact]
+    public void LicenceObject_ReadsStateSourceAndExpiry()
+    {
+        // ADR-054 N5: `<class> list --json` rows carry a `licence` object; the fixture is
+        // `tracking list --json` with the sim provider's scripted states.
+        var l = Parse(ComponentClass.Tracking, "tracking-list-n5-licence.json");
+        Assert.Equal(new[] { "acme-eyes", "sim-tracking", "sim-tracking-b", "plain" }, l.Rows.Select(r => r.Id));
+
+        var hw = l.Row("acme-eyes")!;
+        Assert.Equal("licensed", hw.Licence);
+        Assert.Equal("hardware", hw.LicenceSource);
+        Assert.False(hw.LicenceBlocks);
+        Assert.Equal(("included with your display", Level.Ok), hw.LicenceChip);
+
+        var trial = l.Row("sim-tracking")!;
+        Assert.Equal("trial", trial.Licence);
+        Assert.Equal("2100-01-01T00:00:00Z", trial.LicenceExpires);
+        Assert.False(trial.LicenceBlocks);
+        Assert.Equal(("trial until 2100-01-01", Level.Info), trial.LicenceChip);
+
+        var none = l.Row("sim-tracking-b")!;
+        Assert.Equal("unlicensed", none.Licence);
+        Assert.True(none.LicenceBlocks);
+        Assert.Equal(("unlicensed", Level.Warn), none.LicenceChip);
+        Assert.Equal("https://example.invalid/displayxr/sim-licence", none.LicencePurchaseUrl);
+        Assert.Equal("No simulated licence", none.LicenceMessage);
+
+        // Nothing to report: no chip, exactly like a row from a CLI that predates the object.
+        var plain = l.Row("plain")!;
+        Assert.Equal("not_applicable", plain.Licence);
+        Assert.Null(plain.LicenceChip);
+        Assert.False(plain.LicenceBlocks);
+        var old = Parse(ComponentClass.Tracking, "tracking-list-n6.json");
+        Assert.All(old.Rows, r => Assert.Null(r.LicenceChip));
+        Assert.All(old.Rows, r => Assert.Equal("", r.Licence));
+
+        // The chip rides the row's other policy chips.
+        var chips = new List<(string, Level)>();
+        Components.AddPolicyChips(chips, none);
+        Assert.Contains(("unlicensed", Level.Warn), chips);
+    }
+
+    [Fact]
     public void InputList_UnverifiedReadsAsWarning()
     {
         var input = Parse(ComponentClass.Input, "input-list-n3.json");

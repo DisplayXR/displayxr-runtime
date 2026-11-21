@@ -31,6 +31,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,6 +39,8 @@ extern "C" {
 
 struct target_component_class;
 struct target_component_setting_desc;
+struct xrt_component_license_state;
+struct cJSON;
 
 //! One component class, as the shared verbs see it.
 struct cli_component_class
@@ -60,6 +63,16 @@ struct cli_component_class
 	void (*note_pickup)(void);
 	//! POSIX: where the machine value lives instead ("the manifest's \"settings\" object (NNN-<id>.json)").
 	const char *posix_machine_hint;
+	/*!
+	 * ADR-054 N5: hand an activation token to @p id's `activate` slot and
+	 * return an `enum target_component_activate_result` (the class loader's
+	 * `target_*_activate`). NULL = the class has no `activate` verb.
+	 */
+	int (*activate)(const char *id,
+	                const char *token,
+	                struct xrt_component_license_state *out_state,
+	                char *err,
+	                size_t err_cap);
 };
 
 //! `<class> options <id> [--json]`: every declared / stored key with type, default, value and source.
@@ -87,6 +100,43 @@ cli_component_options_dispatch(const struct cli_component_class *k, int argc, co
 //! The three usage lines, for a class's own `print_usage` ("  options <id> [--json] ...").
 void
 cli_component_options_usage(const struct cli_component_class *k);
+
+/*
+ *
+ * Licence state (ADR-054 N5, ADR-064 §5): the `licence` object and column of
+ * every class's `list`, and the `activate` verb.
+ *
+ */
+
+/*!
+ * Add the `licence` object to a `list --json` row:
+ * `{"state", "source", "expires_unix", "expires", "message", "purchase_url",
+ * "activation": {"key", "deep_link"}, "blocks"}`. `state` is one of
+ * `not_applicable | licensed | trial | expired | unlicensed`; `source` is
+ * `hardware | key | trial | oem` or null; `expires_unix` (seconds, UTC) and
+ * `expires` (ISO 8601) are null when the component states none; `blocks` is
+ * true when selection skips the component (`unlicensed`, `expired`).
+ */
+void
+cli_component_license_json(struct cJSON *row, const struct xrt_component_license_state *lic);
+
+/*!
+ * The human cell of a `list` row, into @p buf: "-" (nothing to report),
+ * "licensed (hardware)", "trial until 2026-12-31", "UNLICENSED",
+ * "EXPIRED 2026-10-01". Returns @p buf.
+ */
+const char *
+cli_component_license_cell(const struct xrt_component_license_state *lic, char *buf, size_t cap);
+
+/*!
+ * `<class> activate <id> <token | @file> [--json]`: read the token (the
+ * argument itself, or the first line of `@file`), hand it to the component's
+ * `activate` slot through @ref cli_component_class::activate, and print the
+ * new licence state or the component's error line. The token is never
+ * printed. Exit 0 = accepted.
+ */
+int
+cli_component_activate(const struct cli_component_class *k, const char *id, const char *token_arg, bool json);
 
 #ifdef __cplusplus
 }

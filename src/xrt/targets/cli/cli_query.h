@@ -20,6 +20,7 @@
 #include "cli_dims_check.h"
 
 #include "xrt/xrt_plugin.h"
+#include "xrt/xrt_component_license.h"
 #include "target_plugin_loader.h" // ADR-045 per-plug-in status
 #include "os/os_display_desktop.h"
 #include "os/os_display_scale.h"
@@ -194,6 +195,16 @@ struct cli_gpu_adapter
  */
 //! = XRT_SYSTEM_MAX_DEVICES, without pulling xrt_system.h into every CLI TU (N7 device list).
 #define CLI_INPUT_MAX_DEVICES 32
+
+//! Registered providers per class whose licence state `info` / `selftest` carry (ADR-054 N5).
+#define CLI_QUERY_MAX_LICENSES 16
+
+//! One registered component's licence state, by registration id.
+struct cli_query_license
+{
+	char id[64];
+	struct xrt_component_license_state license;
+};
 
 struct cli_query_result
 {
@@ -375,6 +386,14 @@ struct cli_query_result
 	 * "Provider registered but its hardware is absent" is the normal
 	 * state of any box whose tracker is unplugged, and it is a PASS: the
 	 * arbiter hands the hand roles to qwerty, which is exactly right. */
+	/* ADR-054 N5: every registered provider's licence state, as its binary
+	 * reports it (negotiate only). Data: an unlicensed provider is skipped by
+	 * selection and never fails the self-test. */
+	int input_license_count;
+	struct cli_query_license input_licenses[CLI_QUERY_MAX_LICENSES];
+	int tracking_license_count;
+	struct cli_query_license tracking_licenses[CLI_QUERY_MAX_LICENSES];
+
 	int input_provider_count;    //!< registered providers (enumerated, unloaded)
 	int input_enabled_count;     //!< ...of which Enabled (ADR-054 N4: Enabled=0 must fall back)
 	int input_scan_declined;     //!< loader scan: providers that declined cleanly

@@ -12,6 +12,8 @@
 
 #include "target_component_loader.h"
 
+#include "xrt/xrt_component_license.h"
+#include "util/u_status_snapshot.h" // u_status_license_add_cjson
 #include "xrt/xrt_config_os.h"
 
 #include <cjson/cJSON.h>
@@ -91,18 +93,22 @@ write_result(const struct cli_component_class *k, enum target_component_store_re
 
 //! After a write: what the component will actually read, and why, when that is not what was just written.
 static void
-report_effective(const struct cli_component_class *k, const char *id, const char *key, bool machine)
+report_effective(const struct cli_component_class *k, const char *id, const char *key, bool machine, bool secret)
 {
 	char value[TARGET_COMPONENT_SETTING_VALUE_MAX];
 	uint32_t source = TARGET_COMPONENT_SETTING_ABSENT;
 	const bool set = target_component_get_setting(k->cls, id, key, value, sizeof(value), &source);
+	if (secret) {
+		snprintf(value, sizeof(value), "<set>"); // a secret is shown as set / not set, never as a value
+	}
 	char env[TARGET_COMPONENT_SETTING_ENV_MAX] = {0};
 	(void)target_component_setting_env_name(k->cls->env_class, id, key, env, sizeof(env));
 	if (!set) {
 		P("Effective now: %s unset — the %s keeps its compiled default.\n", key, k->noun);
 		return;
 	}
-	P("Effective now: %s = '%s' (source: %s)", key, value, target_component_setting_source_str(source));
+	P("Effective now: %s = %s%s%s (source: %s)", key, secret ? "" : "'", value, secret ? "" : "'",
+	  target_component_setting_source_str(source));
 	if (source == TARGET_COMPONENT_SETTING_ENVIRONMENT) {
 		P(" — %s is set in THIS process's environment and always wins; the hosting process's own "
 		  "environment decides there.",
@@ -126,10 +132,21 @@ report_effective(const struct cli_component_class *k, const char *id, const char
 struct option_row
 {
 	struct target_component_setting_desc desc; //!< key + type / default / help ("" when undeclared)
-	char value[TARGET_COMPONENT_SETTING_VALUE_MAX];
+	char value[TARGET_COMPONENT_SETTING_VALUE_MAX]; //!< "" for a secret: never held past the read
 	uint32_t source;
 	bool declared;
+	bool secret; //!< ADR-054 N5: shown as set / not set, never as a value
 };
+
+//! Redact a row whose key is a secret: keep where it came from, drop what it is.
+static void
+row_redact(struct option_row *r)
+{
+	r->secret = target_component_setting_is_secret(r->declared ? r->desc.type : NULL, r->desc.key);
+	if (r->secret) {
+		memset(r->value, 0, sizeof(r->value));
+	}
+}
 
 static bool
 ci_equal(const char *a, const char *b)
@@ -171,6 +188,7 @@ collect(const struct cli_component_class *k, const char *id, struct option_row *
 		r->desc = descs[i];
 		r->declared = true;
 		(void)target_component_get_setting(k->cls, id, r->desc.key, r->value, sizeof(r->value), &r->source);
+		row_redact(r);
 	}
 	const int nv = target_component_list_settings(k->cls, id, views, max);
 	for (int i = 0; i < nv && n < max; i++) {
@@ -190,7 +208,10 @@ collect(const struct cli_component_class *k, const char *id, struct option_row *
 		snprintf(r->value, sizeof(r->value), "%s", views[i].value);
 		r->source = views[i].source;
 		r->declared = false;
+		row_redact(r);
 	}
+	// The scratch copies held every stored value, secrets included.
+	memset(views, 0, (size_t)max * sizeof(*views));
 	free(descs);
 	free(views);
 	return n;
@@ -240,7 +261,13 @@ cli_component_options(const struct cli_component_class *k, const char *id, bool 
 				cJSON_AddNullToObject(o, "default");
 				cJSON_AddNullToObject(o, "help");
 			}
-			if (r->source == TARGET_COMPONENT_SETTING_ABSENT) {
+			// A secret's value is never emitted: `value` is null, `set` says
+			// whether one is stored. `secret` is on every row.
+			cJSON_AddBoolToObject(o, "secret", r->secret);
+			if (r->secret) {
+				cJSON_AddNullToObject(o, "value");
+				cJSON_AddBoolToObject(o, "set", r->source != TARGET_COMPONENT_SETTING_ABSENT);
+			} else if (r->source == TARGET_COMPONENT_SETTING_ABSENT) {
 				cJSON_AddNullToObject(o, "value");
 			} else {
 				cJSON_AddStringToObject(o, "value", r->value);
@@ -267,7 +294,7 @@ cli_component_options(const struct cli_component_class *k, const char *id, bool 
 			const struct option_row *r = &rows[i];
 			P("\t%-24s %-7s %-10s %-20s %-12s %s\n", r->desc.key, r->declared ? r->desc.type : "?",
 			  r->declared && r->desc.default_value[0] != '\0' ? r->desc.default_value : "-",
-			  r->source == TARGET_COMPONENT_SETTING_ABSENT ? "<unset>" : r->value,
+			  r->source == TARGET_COMPONENT_SETTING_ABSENT ? "<unset>" : (r->secret ? "<set>" : r->value),
 			  target_component_setting_source_str(r->source),
 			  r->declared ? r->desc.help : "(stored, not declared by the component)");
 		}
@@ -307,6 +334,24 @@ tier_str(bool machine)
 #endif
 }
 
+//! Is @p key of @p id a secret: by its declared type, else by its name (target_component_setting_is_secret).
+static bool
+key_is_secret(const struct cli_component_class *k, const char *id, const char *key)
+{
+	const char *type = NULL;
+	struct target_component_setting_desc *descs = calloc(CLI_OPTIONS_MAX, sizeof(*descs));
+	const int nd = descs != NULL && k->describe != NULL ? k->describe(id, descs, CLI_OPTIONS_MAX) : 0;
+	for (int i = 0; i < nd; i++) {
+		if (ci_equal(descs[i].key, key)) {
+			type = descs[i].type;
+			break;
+		}
+	}
+	const bool secret = target_component_setting_is_secret(type, key);
+	free(descs);
+	return secret;
+}
+
 int
 cli_component_set(const struct cli_component_class *k, const char *id, const char *key, const char *value, bool machine)
 {
@@ -319,12 +364,19 @@ cli_component_set(const struct cli_component_class *k, const char *id, const cha
 		  key != NULL ? key : "");
 		return 1;
 	}
-	if (value == NULL || strlen(value) >= TARGET_COMPONENT_SETTING_VALUE_MAX) {
-		P("error: the value must be under %d bytes.\n", TARGET_COMPONENT_SETTING_VALUE_MAX);
+	// ADR-054 N5: a `secret` (a licence key) goes to the same store, may be
+	// longer, and is never echoed back.
+	const bool secret = key_is_secret(k, id, key);
+	const size_t value_max =
+	    secret ? (size_t)TARGET_COMPONENT_SETTING_SECRET_VALUE_MAX : (size_t)TARGET_COMPONENT_SETTING_VALUE_MAX;
+	if (value == NULL || strlen(value) >= value_max) {
+		P("error: the value must be under %d bytes.\n", (int)value_max);
 		return 1;
 	}
 	const int w =
-	    write_result(k, target_component_set_setting(k->cls, id, key, value, machine),
+	    write_result(k,
+	                 secret ? target_component_set_secret(k->cls, id, key, value, machine)
+	                        : target_component_set_setting(k->cls, id, key, value, machine),
 	                 machine ? "writing the machine-wide setting" : "writing the per-user setting", machine);
 	if (w != 0) {
 		return w;
@@ -340,8 +392,13 @@ cli_component_set(const struct cli_component_class *k, const char *id, const cha
 		}
 	}
 	upper[sizeof(upper) - 1] = '\0';
-	P("%s: %s = '%s' %s (%s).\n", id, upper, value, tier_str(machine), store);
-	report_effective(k, id, upper, machine);
+	if (secret) {
+		P("%s: %s = <set> %s (%s). The value is a secret: it is never shown again.\n", id, upper,
+		  tier_str(machine), store);
+	} else {
+		P("%s: %s = '%s' %s (%s).\n", id, upper, value, tier_str(machine), store);
+	}
+	report_effective(k, id, upper, machine, secret);
 	if (k->note_pickup != NULL) {
 		k->note_pickup();
 	}
@@ -367,7 +424,7 @@ cli_component_unset(const struct cli_component_class *k, const char *id, const c
 		return w;
 	}
 	P("%s: %s cleared %s.\n", id, key, tier_str(machine));
-	report_effective(k, id, key, machine);
+	report_effective(k, id, key, machine, key_is_secret(k, id, key));
 	if (k->note_pickup != NULL) {
 		k->note_pickup();
 	}
@@ -393,6 +450,14 @@ cli_component_options_usage(const struct cli_component_class *k)
 	  k->cls != NULL && k->cls->env_class != NULL ? k->cls->env_class : "<CLASS>");
 	P("                               hosting process's environment always wins.\n");
 	P("  unset <id> <KEY> [--machine] Clear it (per user, or the machine value with --machine).\n");
+	P("                               A setting of type 'secret' (a licence key) is stored the same way and\n");
+	P("                               shown only as <set> / <unset>.\n");
+	if (k->activate != NULL) {
+		P("  activate <id> <token | @file> [--json]\n");
+		P("                               Hand an activation token (a licence key, or the token a vendor's\n");
+		P("                               checkout returned) to the %s. Opaque to the runtime:\n", k->noun);
+		P("                               never parsed, logged or stored by it. @file reads the first line.\n");
+	}
 }
 
 int
@@ -437,5 +502,181 @@ cli_component_options_dispatch(const struct cli_component_class *k, int argc, co
 		}
 		return cli_component_unset(k, pos[0], pos[1], machine);
 	}
+	if (strcmp(verb, "activate") == 0 && k->activate != NULL) {
+		if (np < 2) {
+			P("error: '%s activate' needs <id> <token | @file>.\n\n", k->verb);
+			cli_component_options_usage(k);
+			return 1;
+		}
+		return cli_component_activate(k, pos[0], pos[1], json);
+	}
 	return -1;
+}
+
+
+/*
+ *
+ * Licence state + activate (ADR-054 N5).
+ *
+ */
+
+void
+cli_component_license_json(struct cJSON *row, const struct xrt_component_license_state *lic)
+{
+	u_status_license_add_cjson(row, lic); // one writer for every `licence` object (aux_util)
+}
+
+const char *
+cli_component_license_cell(const struct xrt_component_license_state *lic, char *buf, size_t cap)
+{
+	char day[24];
+	u_status_unix_time_str(lic->expiry_unix_s, false, day, sizeof(day));
+	const bool dated = lic->expiry_unix_s != 0 && day[0] != '\0';
+	const char *src = xrt_component_license_source_str(lic->source);
+	switch (lic->state) {
+	case XRT_COMPONENT_LICENSE_LICENSED:
+		if (dated) {
+			snprintf(buf, cap, "licensed until %s", day);
+		} else if (src[0] != '\0') {
+			snprintf(buf, cap, "licensed (%s)", src);
+		} else {
+			snprintf(buf, cap, "licensed");
+		}
+		break;
+	case XRT_COMPONENT_LICENSE_TRIAL:
+		if (dated) {
+			snprintf(buf, cap, "trial until %s", day);
+		} else {
+			snprintf(buf, cap, "trial");
+		}
+		break;
+	case XRT_COMPONENT_LICENSE_EXPIRED:
+		if (dated) {
+			snprintf(buf, cap, "EXPIRED %s", day);
+		} else {
+			snprintf(buf, cap, "EXPIRED");
+		}
+		break;
+	case XRT_COMPONENT_LICENSE_UNLICENSED: snprintf(buf, cap, "UNLICENSED"); break;
+	default: snprintf(buf, cap, "-"); break;
+	}
+	return buf;
+}
+
+/*!
+ * The token of `activate`: @p arg itself, or for `@path` the first line of
+ * that file (trailing CR / LF / blanks dropped). False (message printed) when
+ * the file cannot be read or the token is empty / too long.
+ */
+static bool
+read_token(const char *arg, char *out, size_t cap)
+{
+	out[0] = '\0';
+	if (arg == NULL) {
+		return false;
+	}
+	if (arg[0] != '@') {
+		if (strlen(arg) >= cap) {
+			P("error: the token must be under %d bytes.\n", (int)cap);
+			return false;
+		}
+		snprintf(out, cap, "%s", arg);
+		return out[0] != '\0';
+	}
+	FILE *f = fopen(arg + 1, "rb");
+	if (f == NULL) {
+		P("error: cannot read the token file '%s'.\n", arg + 1);
+		return false;
+	}
+	const size_t n = fread(out, 1, cap - 1, f);
+	const bool more = n == cap - 1 && fgetc(f) != EOF;
+	fclose(f);
+	out[n] = '\0';
+	size_t len = strcspn(out, "\r\n");
+	out[len] = '\0';
+	while (len > 0 && (out[len - 1] == ' ' || out[len - 1] == '\t')) {
+		out[--len] = '\0';
+	}
+	if (len == 0) {
+		P("error: the token file '%s' is empty.\n", arg + 1);
+		return false;
+	}
+	if (more && len == cap - 1) {
+		memset(out, 0, cap);
+		P("error: the token must be under %d bytes.\n", (int)cap);
+		return false;
+	}
+	return true;
+}
+
+int
+cli_component_activate(const struct cli_component_class *k, const char *id, const char *token_arg, bool json)
+{
+	const int rc = gate(k, id, "activate");
+	if (rc != 0) {
+		return rc;
+	}
+	char *token = calloc(1, XRT_COMPONENT_ACTIVATION_TOKEN_MAX);
+	if (token == NULL) {
+		return 1;
+	}
+	if (!read_token(token_arg, token, XRT_COMPONENT_ACTIVATION_TOKEN_MAX)) {
+		free(token);
+		return 1;
+	}
+	struct xrt_component_license_state lic;
+	xrt_component_license_state_init(&lic);
+	char err[XRT_COMPONENT_ACTIVATION_ERROR_MAX] = {0};
+	const enum target_component_activate_result r =
+	    (enum target_component_activate_result)k->activate(id, token, &lic, err, sizeof(err));
+	memset(token, 0, XRT_COMPONENT_ACTIVATION_TOKEN_MAX); // the token is the component's, not ours to keep
+	free(token);
+
+	if (json) {
+		cJSON *root = cJSON_CreateObject();
+		cJSON_AddStringToObject(root, "id", id);
+		cJSON_AddStringToObject(root, "class", k->verb);
+		cJSON_AddStringToObject(root, "result", target_component_activate_result_str(r));
+		cJSON_AddBoolToObject(root, "accepted", r == TARGET_COMPONENT_ACTIVATE_OK);
+		cJSON_AddStringToObject(root, "error", err);
+		cli_component_license_json(root, &lic);
+		char *out = cJSON_Print(root);
+		if (out != NULL) {
+			printf("%s\n", out);
+			cJSON_free(out);
+		}
+		cJSON_Delete(root);
+		return r == TARGET_COMPONENT_ACTIVATE_OK ? 0 : 1;
+	}
+
+	char cell[64];
+	switch (r) {
+	case TARGET_COMPONENT_ACTIVATE_OK:
+		P("%s: activation accepted — licence: %s%s%s.\n", id,
+		  cli_component_license_cell(&lic, cell, sizeof(cell)), lic.message[0] != '\0' ? " — " : "",
+		  lic.message);
+		P("This reached the %s in this process. One already running (in the service or its host) follows\n",
+		  k->noun);
+		P("when it re-reads its licence; restart the service to be sure.\n");
+		return 0;
+	case TARGET_COMPONENT_ACTIVATE_REFUSED:
+		P("FAIL: '%s' refused the token%s%s (licence: %s).\n", id, err[0] != '\0' ? " — " : "", err,
+		  cli_component_license_cell(&lic, cell, sizeof(cell)));
+		return 1;
+	case TARGET_COMPONENT_ACTIVATE_UNSUPPORTED:
+		P("FAIL: '%s' has no activation slot — it takes no token this way (see '%s options %s' for a "
+		  "licence-key setting).\n",
+		  id, k->verb, id);
+		return 1;
+	case TARGET_COMPONENT_ACTIVATE_BAD_TOKEN:
+		P("FAIL: the token is empty or longer than %u bytes — nothing was delivered.\n",
+		  (unsigned)(XRT_COMPONENT_ACTIVATION_TOKEN_MAX - 1));
+		return 1;
+	case TARGET_COMPONENT_ACTIVATE_NOT_LOADED:
+	default:
+		P("FAIL: '%s' could not be loaded (its binary is missing, refused by the provenance gate, or did "
+		  "not negotiate) — see '%s list'.\n",
+		  id, k->verb);
+		return 1;
+	}
 }

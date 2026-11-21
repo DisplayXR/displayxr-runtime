@@ -1,0 +1,121 @@
+{
+ "preferred": null,
+ "policy": {
+  "policy_lock": false
+ },
+ "disabled_by_env": false,
+ "providers": [
+  {
+   "id": "acme-eyes",
+   "display_name": "Acme Eyes",
+   "vendor": "DisplayXR",
+   "version": "dev",
+   "probe_order": 50,
+   "binary_path": "/Users/dev/displayxr/_package/DisplayXR-macOS/lib/displayxr/plugins/DisplayXR-SimTracking.dylib",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\c709663369f0190b1cf8b849a4b1eff9cf3c6f35da5b178233e51506d2760923)",
+   "signer": "",
+   "licence": {
+    "state": "licensed",
+    "source": "hardware",
+    "expires_unix": null,
+    "expires": null,
+    "message": "Included with the simulated display",
+    "purchase_url": "",
+    "activation": {
+     "key": false,
+     "deep_link": false
+    },
+    "blocks": false
+   },
+   "preferred": false,
+   "first": true
+  },
+  {
+   "id": "sim-tracking",
+   "display_name": "DisplayXR Sim Tracking",
+   "vendor": "DisplayXR",
+   "version": "dev",
+   "probe_order": 200,
+   "binary_path": "/Users/dev/displayxr/_package/DisplayXR-macOS/lib/displayxr/plugins/DisplayXR-SimTracking.dylib",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\c709663369f0190b1cf8b849a4b1eff9cf3c6f35da5b178233e51506d2760923)",
+   "signer": "",
+   "licence": {
+    "state": "trial",
+    "source": "trial",
+    "expires_unix": 4102444800,
+    "expires": "2100-01-01T00:00:00Z",
+    "message": "Simulated trial",
+    "purchase_url": "",
+    "activation": {
+     "key": false,
+     "deep_link": false
+    },
+    "blocks": false
+   },
+   "preferred": false,
+   "first": false
+  },
+  {
+   "id": "sim-tracking-b",
+   "display_name": "DisplayXR Sim Tracking B",
+   "vendor": "DisplayXR",
+   "version": "dev",
+   "probe_order": 210,
+   "binary_path": "/Users/dev/displayxr/_package/DisplayXR-macOS/lib/displayxr/plugins/DisplayXR-SimTracking.dylib",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\c709663369f0190b1cf8b849a4b1eff9cf3c6f35da5b178233e51506d2760923)",
+   "signer": "",
+   "licence": {
+    "state": "unlicensed",
+    "source": null,
+    "expires_unix": null,
+    "expires": null,
+    "message": "No simulated licence",
+    "purchase_url": "https://example.invalid/displayxr/sim-licence",
+    "activation": {
+     "key": true,
+     "deep_link": true
+    },
+    "blocks": true
+   },
+   "preferred": false,
+   "first": false
+  },
+  {
+   "id": "plain",
+   "display_name": "Plain Provider",
+   "vendor": "DisplayXR",
+   "version": "dev",
+   "probe_order": 220,
+   "binary_path": "/Users/dev/displayxr/_package/DisplayXR-macOS/lib/displayxr/plugins/DisplayXR-SimTracking.dylib",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\c709663369f0190b1cf8b849a4b1eff9cf3c6f35da5b178233e51506d2760923)",
+   "signer": "",
+   "licence": {
+    "state": "not_applicable",
+    "source": null,
+    "expires_unix": null,
+    "expires": null,
+    "message": "",
+    "purchase_url": "",
+    "activation": {
+     "key": false,
+     "deep_link": false
+    },
+    "blocks": false
+   },
+   "preferred": false,
+   "first": false
+  }
+ ]
+}

@@ -47,6 +47,7 @@
 
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_display_status.h"
+#include "xrt/xrt_component_license.h"
 #include "xrt/xrt_conversion_plugin.h"
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_plugin.h"
@@ -292,6 +293,29 @@ conv_enabled_source(const struct xrt_status_conv_provider &p, const struct targe
 	return "default";
 }
 
+/*!
+ * ADR-054 N5: the provider's whole licence object. The snapshot row carries
+ * the state, source and expiry (live from the service when it answered); the
+ * message, the purchase URL and the activation methods come from asking the
+ * registered binary here (negotiate only), like provenance. A row with a
+ * state keeps it; one without takes the lister's answer.
+ */
+struct xrt_component_license_state
+license_of(const struct xrt_status_conv_provider &p)
+{
+	struct xrt_component_license_state lic;
+	xrt_component_license_state_init(&lic);
+	if (p.binary[0] != '\0') {
+		(void)target_conv_license_state(p.id, &lic);
+	}
+	if (p.licence.state != XRT_COMPONENT_LICENSE_NOT_APPLICABLE) {
+		lic.state = p.licence.state;
+		lic.source = p.licence.source;
+		lic.expiry_unix_s = p.licence.expiry_unix_s;
+	}
+	return lic;
+}
+
 void
 print_json(const struct xrt_status_snapshot *snap, const struct target_conv_policy *policy, bool compact)
 {
@@ -314,6 +338,10 @@ print_json(const struct xrt_status_snapshot *snap, const struct target_conv_poli
 		// settings (`conv enable|disable dp-lift` is refused).
 		cJSON_AddStringToObject(row, "enabled_source", conv_enabled_source(snap->conv_providers[i], policy));
 		cJSON_AddBoolToObject(row, "built_in", is_built_in(snap->conv_providers[i]));
+		// ADR-054 N5: the row's compact `licence` becomes the whole object.
+		const struct xrt_component_license_state lic = license_of(snap->conv_providers[i]);
+		cJSON_DeleteItemFromObjectCaseSensitive(row, "licence");
+		cli_component_license_json(row, &lic);
 	}
 	char *s = compact ? cJSON_PrintUnformatted(root) : cJSON_Print(root);
 	if (s != nullptr) {
@@ -340,8 +368,8 @@ print_providers_text(const struct xrt_status_snapshot *snap)
 		P("  none registered\n");
 		return;
 	}
-	P("  %-18s %-16s %5s  %-10s %-9s %4s  %-12s %s\n", "id", "load", "order", "hosting", "status", "caps",
-	  "provenance", "notes");
+	P("  %-18s %-16s %5s  %-10s %-9s %4s  %-12s %-17s %s\n", "id", "load", "order", "hosting", "status", "caps",
+	  "provenance", "licence", "notes");
 	for (uint32_t i = 0; i < snap->conv_provider_count && i < XRT_STATUS_MAX_CONV_PROVIDERS; i++) {
 		const struct xrt_status_conv_provider &p = snap->conv_providers[i];
 		const conv_provenance pv = provenance_of(p);
@@ -364,9 +392,12 @@ print_providers_text(const struct xrt_status_snapshot *snap)
 		if (p.hint[0] != '\0') {
 			notes += std::string("- ") + p.hint;
 		}
-		P("  %-18s %-16s %5u  %-10s %-9s %4u  %-12s %s\n", p.id, p.load, p.probe_order,
+		const struct xrt_component_license_state lic = license_of(p);
+		char lic_cell[40];
+		P("  %-18s %-16s %5u  %-10s %-9s %4u  %-12s %-17s %s\n", p.id, p.load, p.probe_order,
 		  u_status_conv_hosting_str(p.hosting), u_status_platform_state_str(p.platform_state), p.cap_count,
-		  target_component_provenance_str(pv.verdict), notes.c_str());
+		  target_component_provenance_str(pv.verdict),
+		  cli_component_license_cell(&lic, lic_cell, sizeof(lic_cell)), notes.c_str());
 	}
 }
 
@@ -836,6 +867,14 @@ options_registered(const char *id)
 	return strcmp(id, "dp-lift") != 0 && provider_known(id);
 }
 
+//! The class's `activate` slot behind the shared `activate` verb (ADR-054 N5).
+int
+conv_activate(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap)
+{
+	return (int)target_conv_activate(id, token, out_state, err, err_cap);
+}
+
 const struct cli_component_class k_conv_options_class = {
     /* verb */ "conv",
     /* noun */ "conversion provider",
@@ -844,6 +883,7 @@ const struct cli_component_class k_conv_options_class = {
     /* describe */ target_conversion_plugin_describe_settings,
     /* note_pickup */ note_service_pickup,
     /* posix_machine_hint */ "the manifest's \"settings\" object (NNN-<id>-conversion-provider.json)",
+    /* activate */ conv_activate,
 };
 
 int
@@ -1496,6 +1536,9 @@ usage(void)
 	P("  options <id> [--json]               the provider's settings: key, type, default, value, source (N3c)\n");
 	P("  set <id> <KEY> <value> [--machine]  Settings\\<KEY> on the provider's row (HKCU; --machine = HKLM)\n");
 	P("  unset <id> <KEY> [--machine]        clear it; DXR_CONV_<ID>_<KEY> in the service's env always wins\n");
+	P("  activate <id> <token | @file> [--json]\n");
+	P("                                      hand an activation token to the provider (opaque to the runtime;\n");
+	P("                                      a licence-key setting of type 'secret' shows only as <set>)\n");
 	P("  models list|verify|prune|init [--json] [--root <dir>]   the runtime-owned model store\n");
 	P("  models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]   write protocol, here\n");
 	P("  run <task> <in> [<in-right>] <out> [options]   one splat job, file to file (`conv run` for options)\n");

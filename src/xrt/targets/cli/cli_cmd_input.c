@@ -72,6 +72,8 @@
 
 #include "cli_common.h"
 #include "cli_component_options.h"
+
+#include "xrt/xrt_component_license.h"
 #include "cli_input_predict.h"
 #include "cli_ipc.h"
 #include "cli_query.h"
@@ -253,6 +255,11 @@ cmd_list(int argc, const char **argv)
 			cJSON_AddStringToObject(p, "provenance", target_component_provenance_str(list[i].provenance));
 			cJSON_AddStringToObject(p, "provenance_reason", list[i].provenance_reason);
 			cJSON_AddStringToObject(p, "signer", list[i].signer);
+			// ADR-054 N5: the licence state the component reports (negotiate
+			// only, like `options`); `not_applicable` when it reports none.
+			struct xrt_component_license_state lic;
+			(void)target_input_plugin_license_state(list[i].id, &lic);
+			cli_component_license_json(p, &lic);
 			cJSON_AddBoolToObject(p, "preferred", have_pref && strcmp(list[i].id, preferred) == 0);
 			cJSON_AddBoolToObject(p, "active", i == active && !force_qwerty);
 			cJSON_AddItemToArray(arr, p);
@@ -285,14 +292,20 @@ cmd_list(int argc, const char **argv)
 	if (force_qwerty) {
 		P("\tForceQwerty override: SET — providers are skipped, qwerty claims the hand roles.\n");
 	}
-	P("\t  %-20s %-24s %10s  %-18s %-10s %s\n", "id", "name", "ProbeOrder", "Enabled", "Preferred", "Provenance");
+	P("\t  %-20s %-24s %10s  %-18s %-10s %-17s %s\n", "id", "name", "ProbeOrder", "Enabled", "Preferred",
+	  "Provenance", "Licence");
 	for (int i = 0; i < n; i++) {
+		// ADR-054 N5: what the component says about its licence ("-" = nothing to report).
+		struct xrt_component_license_state lic;
+		char lic_cell[40];
+		(void)target_input_plugin_license_state(list[i].id, &lic);
 		char enabled[32];
 		snprintf(enabled, sizeof(enabled), "%s (%s)", list[i].enabled ? "yes" : "no", list[i].enabled_source);
-		P("\t%s %-20s %-24s %10u  %-18s %-10s %s\n", (i == active && !force_qwerty) ? "*" : " ", list[i].id,
-		  list[i].display_name[0] ? list[i].display_name : "?", list[i].probe_order, enabled,
+		P("\t%s %-20s %-24s %10u  %-18s %-10s %-17s %s\n", (i == active && !force_qwerty) ? "*" : " ",
+		  list[i].id, list[i].display_name[0] ? list[i].display_name : "?", list[i].probe_order, enabled,
 		  (have_pref && strcmp(list[i].id, preferred) == 0) ? "yes" : "-",
-		  target_component_provenance_str(list[i].provenance));
+		  target_component_provenance_str(list[i].provenance),
+		  cli_component_license_cell(&lic, lic_cell, sizeof(lic_cell)));
 		P("\t    %s\n", list[i].binary_path);
 	}
 	P("\t('*' = the provider the loader would rank first.)\n");
@@ -635,6 +648,14 @@ note_settings_pickup(void)
 	P("session keeps what it read; restart the DisplayXR service (or launch a fresh app).\n");
 }
 
+//! The class's `activate` slot behind the shared `activate` verb (ADR-054 N5).
+static int
+input_activate(
+    const char *id, const char *token, struct xrt_component_license_state *out_state, char *err, size_t err_cap)
+{
+	return (int)target_input_plugin_activate(id, token, out_state, err, err_cap);
+}
+
 //! The options | set | unset verbs over the input class (shared logic, cli_component_options.c).
 static int
 cmd_options_verbs(int argc, const char **argv)
@@ -647,6 +668,7 @@ cmd_options_verbs(int argc, const char **argv)
 	    .describe = target_input_plugin_describe_settings,
 	    .note_pickup = note_settings_pickup,
 	    .posix_machine_hint = "the manifest's \"settings\" object (NNN-<id>-input-provider.json)",
+	    .activate = input_activate,
 	};
 	return cli_component_options_dispatch(&k, argc, argv);
 }
@@ -985,8 +1007,10 @@ print_usage(void)
 	P("                               EmulatedControllers gate: off = no qwerty left/right pair, hand\n");
 	P("                               roles unassigned when no provider holds them (per user; --machine\n");
 	P("                               = HKLM). The qwerty head (look-around) stays either way.\n");
-	cli_component_options_usage(&(const struct cli_component_class){
-	    .verb = "input", .noun = "input provider", .cls = target_input_plugin_component_class()});
+	cli_component_options_usage(&(const struct cli_component_class){.verb = "input",
+	                                                                .noun = "input provider",
+	                                                                .cls = target_input_plugin_component_class(),
+	                                                                .activate = input_activate});
 	P("  haptic-test [seconds]        Headless: fire vibrations on the hand-role devices (default 5 s).\n");
 	P("                               Pair with scripts/net_input_feeder.py --assert-haptic.\n");
 	P("A running service re-ranks at once (roles move on the next xrSyncActions); a provider it did not\n");
