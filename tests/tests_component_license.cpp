@@ -364,7 +364,7 @@ TEST_CASE("component licence: the reference script reports each state", "[compon
 
 	// A caller compiled against a shorter struct is never overrun.
 	sim_license_load(&c, "unlicensed", nullptr);
-	unsigned char guarded[sizeof(License) + 16];
+	alignas(License) unsigned char guarded[sizeof(License) + 16];
 	std::memset(guarded, 0xEE, sizeof(guarded));
 	License *small = reinterpret_cast<License *>(guarded);
 	small->struct_size = 24; // header + expiry only

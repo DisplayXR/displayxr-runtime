@@ -576,6 +576,7 @@ TEST_CASE("conv_host: the licence state crosses the channel; unlicensed reads UN
 	CHECK((h.license.activation & XRT_COMPONENT_LICENSE_ACTIVATION_KEY) != 0u);
 
 	// The test key: accepted, the reply carries the new state, and the capability serves again.
+	const int before = h.state_changes; // re-describe requests seen before the flip
 	rep = wire_activate(h, "DXR-SIM-TEST-KEY", rid++);
 	CHECK(rep.result == XRT_SUCCESS);
 	CHECK(rep.accepted == 1);
@@ -587,16 +588,17 @@ TEST_CASE("conv_host: the licence state crosses the channel; unlicensed reads UN
 	// ... and the host says so on its own: the new LICENSE_STATE plus a
 	// re-describe request (the live re-selection, through the channel's
 	// existing STATE_CHANGED).
-	const int before = h.state_changes;
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-	while (h.license.state != XRT_COMPONENT_LICENSE_LICENSED && std::chrono::steady_clock::now() < deadline) {
+	// The host sends LICENSE_STATE first and the re-describe request right
+	// after it: drain until both have been seen.
+	while ((h.license.state != XRT_COMPONENT_LICENSE_LICENSED || h.state_changes <= before) &&
+	       std::chrono::steady_clock::now() < deadline) {
 		(void)wire_state(h, cap_id, rid++); // drains unsolicited frames on the way
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	}
 	CHECK(h.license.state == XRT_COMPONENT_LICENSE_LICENSED);
 	CHECK(h.license.source == XRT_COMPONENT_LICENSE_SOURCE_KEY);
-	CHECK(h.state_changes > 0);
-	(void)before;
+	CHECK(h.state_changes > before);
 }
 
 TEST_CASE("conv_host: a provider with no licence to report sends no licence message", "[conv_host][license]")

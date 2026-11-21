@@ -1713,12 +1713,12 @@ send_state_changed(struct conv_host_serve *s, uint32_t cap_id)
 }
 
 /*!
- * ADR-054 N5: publish the provider's licence state — once at start, then on
- * every change. A change of the state itself also asks the service to
- * re-describe (STATE_CHANGED with cap 0), because every capability's
- * readiness just flipped to or from UNLICENSED: that is the live re-selection,
- * through the channel's existing message, whether or not the provider thought
- * to call notify_changed.
+ * ADR-054 N5: publish the provider's licence state — as soon as it has one to
+ * report, then on every change. A change that crosses the blocking line also
+ * asks the service to re-describe (STATE_CHANGED with cap 0), because every
+ * capability's readiness just flipped to or from UNLICENSED: that is the live
+ * re-selection, through the channel's existing message, whether or not the
+ * provider thought to call notify_changed.
  */
 static void
 publish_license(struct conv_host_serve *s)
