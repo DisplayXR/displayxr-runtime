@@ -10,6 +10,9 @@
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_compositor.h"
 #include "comp_vk_native_swapchain.h"
+#ifdef XRT_OS_WINDOWS
+#include "comp_vk_native_region_win.h"
+#endif
 
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_vulkan_includes.h"
@@ -139,6 +142,13 @@ dxr_late_weave_enabled();
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <vector>
+#ifdef XRT_OS_WINDOWS
+// Present tap PNGs; STATIC keeps the symbols in this TU (the compositor TU has its own copy).
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+#endif
 #include <deque>
 
 #ifdef XRT_OS_WINDOWS
@@ -1044,7 +1054,21 @@ struct comp_vk_native_target
 	double rb_stat_copy_ms;
 	double rb_stat_upload_ms;
 	double rb_stat_max_ms;
+	//! Present tap (trigger-gated diagnostic): whether the weave recorded
+	//! into each slot was a #868 repaint, and its present sequence number.
+	bool rb_slot_repaint[DCOMP_RB_RING];
+	uint64_t rb_slot_seqno[DCOMP_RB_RING];
+	uint64_t rb_present_seq;
+	//! Worker only: frames still to tap, and the last trigger poll.
+	uint32_t rb_tap_left;
+	uint64_t rb_tap_poll_ns;
+	struct dcomp_present_tap *rb_tap;
+	//! Runtime-owned window region (comp_vk_native_region_win.h); NULL when
+	//! disabled. Fed by the present worker right after each Present.
+	struct comp_vk_region_owner *rb_region;
 #endif
+	//! Frame thread: the last weave mark was a repaint (comp_vk_native_target_weave_mark_repaint).
+	bool dbg_last_mark_repaint;
 
 	//! The present carries alpha to the window system (a transparent
 	//! compositeAlpha, or the DComp bridge). False when a transparent
@@ -1487,6 +1511,7 @@ dcomp_destroy(struct comp_vk_native_target *target)
 	// #2708: the present worker uses the ring, the swapchain and the D3D11
 	// context — retire it (it presents what is queued) before any of them go.
 	dcomp_rb_worker_stop(target);
+	comp_vk_region_owner_destroy(&target->rb_region); // after the worker: it feeds the owner
 	dcomp_release_ring(target);
 	for (uint32_t i = 0; i < DCOMP_RB_RING; i++) {
 		if (target->rb_fence[i] != VK_NULL_HANDLE) {
@@ -1706,6 +1731,9 @@ dcomp_rb_init_static(struct comp_vk_native_target *target)
 	if (!dcomp_rb_worker_start(target)) {
 		U_LOG_E("DComp bridge #2708: could not start the present worker");
 		return false;
+	}
+	if (target->rb_region == NULL) {
+		target->rb_region = comp_vk_region_owner_create((void *)target->hwnd);
 	}
 	return true;
 }
@@ -2331,6 +2359,205 @@ struct dcomp_rb_worker
 	bool error_logged = false;
 };
 
+/*!
+ * Present tap (trigger-gated diagnostic, never per frame): the DComp
+ * readback route holds the exact premultiplied bytes it hands DWM, which is
+ * the only place an excluded-from-capture transparent window's output can be
+ * imaged. Touch %TEMP%\displayxr_present_tap_trigger and the worker copies the
+ * next DCOMP_TAP_FRAMES presented frames, then a detached thread writes them
+ * as displayxr_present_tap_NN.png (raw alpha) and logs one WARN per frame
+ * with its present sequence, whether the weave was a #868 repaint, and pixel
+ * counts (alpha 0 / opaque / opaque-black / partial).
+ */
+#define DCOMP_TAP_FRAMES 16u
+struct dcomp_present_tap
+{
+	std::vector<std::vector<uint8_t>> px;
+	std::vector<uint64_t> seq;
+	std::vector<bool> repaint;
+	std::vector<uint64_t> t_ns;
+	//! Window region at each tapped present (1 = inside), empty = unshaped.
+	std::vector<std::vector<uint8_t>> rgn;
+	uint32_t w = 0, h = 0;
+};
+
+//! Snapshot the window region as a w*h mask (empty vector when unshaped).
+static std::vector<uint8_t>
+dcomp_tap_region(HWND hwnd, uint32_t w, uint32_t h)
+{
+	std::vector<uint8_t> m;
+	HRGN r = CreateRectRgn(0, 0, 0, 0);
+	if (r == NULL) {
+		return m;
+	}
+	const int kind = hwnd != NULL ? GetWindowRgn(hwnd, r) : ERROR;
+	if (kind != ERROR) {
+		const DWORD bytes = GetRegionData(r, 0, NULL);
+		std::vector<uint8_t> buf(bytes);
+		RGNDATA *rd = (RGNDATA *)buf.data();
+		if (bytes > 0 && GetRegionData(r, bytes, rd) == bytes) {
+			m.assign((size_t)w * h, 0);
+			const RECT *rc = (const RECT *)rd->Buffer;
+			for (DWORD i = 0; i < rd->rdh.nCount; i++) {
+				const LONG x0 = rc[i].left < 0 ? 0 : rc[i].left, y0 = rc[i].top < 0 ? 0 : rc[i].top;
+				const LONG x1 = rc[i].right > (LONG)w ? (LONG)w : rc[i].right;
+				const LONG y1 = rc[i].bottom > (LONG)h ? (LONG)h : rc[i].bottom;
+				for (LONG y = y0; y < y1; y++) {
+					if (x1 > x0) {
+						memset(&m[(size_t)y * w + x0], 1, (size_t)(x1 - x0));
+					}
+				}
+			}
+		}
+	}
+	DeleteObject(r);
+	return m;
+}
+
+static void
+dcomp_tap_path(char *out, size_t n, const char *name)
+{
+	const char *tmp = getenv("TEMP");
+	snprintf(out, n, "%s\\%s", (tmp != NULL && tmp[0] != '\0') ? tmp : "C:\\Temp", name);
+}
+
+//! Region-vs-content sync: for each tapped present f, how much opaque content
+//! the region in force at that present clips, and which tapped present's
+//! content the region fits best (offset > 0 = the region was cut for a frame
+//! presented LATER, i.e. the region leads the pixels on screen).
+static void
+dcomp_tap_region_sync(struct dcomp_present_tap *tap)
+{
+	const size_t n = tap->px.size(), npx = (size_t)tap->w * tap->h;
+	for (size_t f = 0; f < n; f++) {
+		if (tap->rgn[f].empty()) {
+			U_LOG_W("present tap %02u: region none (window unshaped)", (unsigned)f);
+			continue;
+		}
+		const uint8_t *m = tap->rgn[f].data();
+		uint64_t best = UINT64_MAX, clip_self = 0, clip_prev = 0;
+		size_t best_g = f;
+		for (size_t g = 0; g < n; g++) {
+			const uint8_t *b = tap->px[g].data();
+			uint64_t clipped = 0, empty = 0;
+			for (size_t i = 0; i < npx; i++) {
+				const bool c = b[i * 4 + 3] != 0;
+				if (c && !m[i]) {
+					clipped++;
+				} else if (!c && m[i]) {
+					empty++;
+				}
+			}
+			// Clipped content is the visible error; region slack is cheap
+			// (the region is dilated on purpose) — weight it low.
+			const uint64_t cost = clipped * 8 + empty;
+			if (g == f) {
+				clip_self = clipped;
+			}
+			// The region is snapshotted just before present f, so the frame
+			// on glass at that moment is (at best) present f-1.
+			if (g + 1 == f) {
+				clip_prev = clipped;
+			}
+			if (cost < best) {
+				best = cost;
+				best_g = g;
+			}
+		}
+		const double dt = ((double)tap->t_ns[best_g] - (double)tap->t_ns[f]) / 1e6;
+		U_LOG_W("present tap %02u: region clips %llu px of the frame on glass (present %02d), %llu of the one "
+		        "being presented; best-fit content = present %02u (offset %+d presents, %+.1f ms)",
+		        (unsigned)f, (unsigned long long)clip_prev, (int)f - 1, (unsigned long long)clip_self,
+		        (unsigned)best_g, (int)best_g - (int)f, dt);
+	}
+}
+
+static void
+dcomp_tap_write(struct dcomp_present_tap *tap)
+{
+	dcomp_tap_region_sync(tap);
+	const uint64_t t0 = tap->t_ns.empty() ? 0 : tap->t_ns[0];
+	for (size_t f = 0; f < tap->px.size(); f++) {
+		std::vector<uint8_t> &b = tap->px[f];
+		const size_t npx = (size_t)tap->w * tap->h;
+		uint64_t a0 = 0, opaque = 0, black = 0, partial = 0;
+		for (size_t i = 0; i < npx; i++) {
+			uint8_t *p = &b[i * 4];
+			const uint8_t a = p[3];
+			if (a == 0) {
+				a0++;
+			} else if (a == 255) {
+				opaque++;
+				if (p[0] <= 8 && p[1] <= 8 && p[2] <= 8) {
+					black++;
+				}
+			} else {
+				partial++;
+			}
+			const uint8_t t = p[0]; // BGRA -> RGBA for the PNG
+			p[0] = p[2];
+			p[2] = t;
+		}
+		char name[64];
+		snprintf(name, sizeof(name), "displayxr_present_tap_%02u.png", (unsigned)f);
+		char path[600];
+		dcomp_tap_path(path, sizeof(path), name);
+		const int ok = stbi_write_png(path, (int)tap->w, (int)tap->h, 4, b.data(), (int)tap->w * 4);
+		U_LOG_W("present tap %02u: seq=%llu %s t=+%.1f ms  a0=%llu opaque=%llu opaque_black=%llu partial=%llu "
+		        "(%ux%u) png=%d",
+		        (unsigned)f, (unsigned long long)tap->seq[f], tap->repaint[f] ? "REPAINT" : "app    ",
+		        (double)(tap->t_ns[f] - t0) / 1e6, (unsigned long long)a0, (unsigned long long)opaque,
+		        (unsigned long long)black, (unsigned long long)partial, tap->w, tap->h, ok);
+	}
+	delete tap;
+}
+
+//! Worker: poll the trigger (<= 4 Hz) and copy this presented slot while armed.
+static void
+dcomp_tap_maybe(struct comp_vk_native_target *target, uint32_t p)
+{
+	const uint64_t now = os_monotonic_get_ns();
+	if (target->rb_tap_left == 0) {
+		if (now - target->rb_tap_poll_ns < 250ull * 1000 * 1000) {
+			return;
+		}
+		target->rb_tap_poll_ns = now;
+		char trig[600];
+		dcomp_tap_path(trig, sizeof(trig), "displayxr_present_tap_trigger");
+		static bool s_armed_logged = false;
+		if (!s_armed_logged) {
+			s_armed_logged = true;
+			U_LOG_W("DComp bridge #2708: present tap armed — touch %s to dump the next %u presented frames",
+			        trig, DCOMP_TAP_FRAMES);
+		}
+		if (GetFileAttributesA(trig) == INVALID_FILE_ATTRIBUTES) {
+			return;
+		}
+		DeleteFileA(trig);
+		target->rb_tap = new (std::nothrow) dcomp_present_tap();
+		if (target->rb_tap == NULL) {
+			return;
+		}
+		target->rb_tap->w = target->rb_w[p];
+		target->rb_tap->h = target->rb_h[p];
+		target->rb_tap_left = DCOMP_TAP_FRAMES;
+	}
+	struct dcomp_present_tap *tap = target->rb_tap;
+	if (target->rb_w[p] == tap->w && target->rb_h[p] == tap->h) {
+		const size_t bytes = (size_t)tap->w * tap->h * 4;
+		const uint8_t *src = (const uint8_t *)target->rb_map[p];
+		tap->px.emplace_back(src, src + bytes);
+		tap->seq.push_back(target->rb_slot_seqno[p]);
+		tap->repaint.push_back(target->rb_slot_repaint[p]);
+		tap->t_ns.push_back(now);
+		tap->rgn.push_back(dcomp_tap_region((HWND)target->hwnd, tap->w, tap->h));
+	}
+	if (--target->rb_tap_left == 0) {
+		target->rb_tap = NULL;
+		std::thread(dcomp_tap_write, tap).detach();
+	}
+}
+
 //! Worker side: present the newest slot of a retired batch.
 static void
 dcomp_rb_present_slot(struct comp_vk_native_target *target, uint32_t p, uint64_t submit_ns)
@@ -2345,6 +2572,7 @@ dcomp_rb_present_slot(struct comp_vk_native_target *target, uint32_t p, uint64_t
 		};
 		target->rb_invalidate(vk->device, 1, &range);
 	}
+	dcomp_tap_maybe(target, p);
 	const uint64_t t1 = os_monotonic_get_ns();
 
 	ID3D11Texture2D *back = NULL;
@@ -2360,6 +2588,10 @@ dcomp_rb_present_slot(struct comp_vk_native_target *target, uint32_t p, uint64_t
 	back->Release();
 	const uint64_t t2 = os_monotonic_get_ns();
 	(void)dcomp_present_swap(target);
+	// The region cut from exactly these bytes, applied right after their
+	// Present (comp_vk_native_region_win.h).
+	comp_vk_region_owner_on_present(target->rb_region, (const uint8_t *)target->rb_map[p], target->rb_w[p],
+	                                target->rb_h[p], target->rb_slot_repaint[p]);
 
 	// #2708: one INFO per 10 s with the readback cost, never per frame.
 	const double copy_ms = (double)(t1 - submit_ns) / 1e6;
@@ -2619,6 +2851,8 @@ dcomp_present_readback(struct comp_vk_native_target *target, VkQueue queue, VkSe
 	target->rb_img_slot[idx] = s;
 	target->rb_img_seq[idx] = target->rb_slot_seq[s];
 	target->rb_img_valid[idx] = true;
+	target->rb_slot_repaint[s] = target->dbg_last_mark_repaint;
+	target->rb_slot_seqno[s] = ++target->rb_present_seq;
 
 	{
 		std::lock_guard<std::mutex> lk(w->mtx);
@@ -4250,6 +4484,7 @@ wl_teardown(struct comp_vk_native_target *target)
 void
 comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target, bool mode_3d)
 {
+	target->dbg_last_mark_repaint = true;
 	g_frame_witness_vk.count_weave(true, mode_3d);
 #ifdef XRT_OS_WINDOWS
 	/*
@@ -4375,6 +4610,7 @@ comp_vk_native_target_repaint_pace(struct comp_vk_native_target *target)
 void
 comp_vk_native_target_weave_mark(struct comp_vk_native_target *target, bool mode_3d)
 {
+	target->dbg_last_mark_repaint = false;
 	g_frame_witness_vk.count_weave(false, mode_3d);
 #ifdef XRT_OS_WINDOWS
 	LARGE_INTEGER now;
