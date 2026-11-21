@@ -20,7 +20,9 @@
 ;   Call DxrCatInit                  in .onInit
 ;   DXR_CATALOG_UNINSTALL            in the uninstall section
 ;
-; WHAT IS LISTED. `dxr-get catalog --json`, turned into an INI file by
+; WHAT IS LISTED. `dxr-get list --json` (the items and their state), joined
+; with `dxr-get detect --json` (hardware matches) and the catalog document
+; (`recommended`, sizes, runtime ranges), turned into an INI file by
 ; catalog_plan.ps1 (NSIS has no JSON parser). The component list is a fixed
 ; set of hidden "slot" sections: NSIS sections exist at compile time, so each
 ; listed item takes one slot, gets its text and flags at run time, and unused
@@ -52,13 +54,12 @@
 ; file existed, which also means a runtime installer that dxr-get itself runs
 ; (`/S /NOSTART`) never calls back into dxr-get.
 ;
-; WHAT NEEDS A NEWER dxr-get. The listing verb is the schema-2 one. With a
-; dxr-get that does not have it (schema 1), catalog_plan.ps1 reports
-; `unsupported`: no slot is shown and the page looks as it did before. An id
-; given explicitly with /COMPONENTS= is still handed to `dxr-get install`,
-; which the schema-1 tool implements for its three components. If dxr-get.exe
-; was not built at all, DXR_CATALOG_UI is undefined and every macro below
-; expands to nothing.
+; WHEN IT IS NOT THERE. If dxr-get.exe was not built, DXR_CATALOG_UI is
+; undefined and every macro below expands to nothing: the installer is what it
+; was before this file. If the listing cannot be produced at run time
+; (PowerShell blocked by policy, dxr-get failing), no slot is shown and the
+; page looks as it did; an id given explicitly with /COMPONENTS= is still
+; handed to `dxr-get install`.
 
 !ifndef DXR_CATALOG_NSH
 !define DXR_CATALOG_NSH
@@ -88,7 +89,7 @@
 Var DxrCatTop          ; text above the component list
 Var DxrCatFinishExtra  ; appended to the finish page text
 !ifdef DXR_CATALOG_UI
-Var DxrCatState        ; "" = not asked yet | ok | offline | unsupported | error
+Var DxrCatState        ; "" = not asked yet | ok | offline | error
 Var DxrCatCount        ; listed items (<= DXR_CAT_SLOTS)
 Var DxrCatIni          ; catalog_plan.ps1 output
 Var DxrCatSel          ; /COMPONENTS= value
@@ -406,11 +407,6 @@ Function DxrCatInstallOne
 	ClearErrors
 	nsExec::ExecToLog '$R1 install $R8 --yes$R2'
 	Pop $R3
-	${If} $R3 == 2
-		; A dxr-get that takes the component name only (schema 1).
-		nsExec::ExecToLog '$R1 install $R8'
-		Pop $R3
-	${EndIf}
 	${If} $R3 == 0
 		DetailPrint "Catalog: $R9 - done."
 		Return
@@ -430,7 +426,11 @@ Function DxrCatInstallOne
 	${ElseIf} $R3 == 30
 		StrCpy $R4 "its installer reported an error"
 	${ElseIf} $R3 == 40
-		StrCpy $R4 "no signed Windows build fits this runtime"
+		StrCpy $R4 "the catalog has no such component, or no signed Windows build of it"
+	${ElseIf} $R3 == 41
+		StrCpy $R4 "it is not compatible with this version of the DisplayXR Runtime"
+	${ElseIf} $R3 == 50
+		StrCpy $R4 "dxr-get was not running elevated"
 	${EndIf}
 	DetailPrint "Catalog: $R9 - NOT installed: $R4."
 	StrCpy $DxrCatSkipped "$DxrCatSkipped$R9: $R4$\r$\n"
@@ -481,11 +481,23 @@ Function DxrCatInstallChosen
 		${Loop}
 	${EndIf}
 
+	; Unattended and no listing: the keywords (recommended, detected, default)
+	; could not be resolved. Say so; ids given by name are still tried below.
+	${If} $DxrCatShown != 1
+	${AndIf} $DxrCatState != "ok"
+	${AndIf} ${FileExists} "$DxrCatIni"
+		ReadINIStr $R1 "$DxrCatIni" "catalog" "message"
+		ClearErrors
+		DetailPrint "Catalog: no component listing ($DxrCatState). $R1"
+		StrCpy $DxrCatSkipped "$DxrCatSkipped/COMPONENTS=$DxrCatSel: the catalog could not be listed, so only components named by id were attempted. $R1$\r$\n"
+	${EndIf}
+
 	; Ids asked for by name that the listing did not contain (or there was no
-	; listing): dxr-get decides. Space-separated, already filtered to [a-z0-9._-].
-	${If} $DxrCatState == "ok"
-	${OrIf} $DxrCatState == "unsupported"
-	${OrIf} $DxrCatState == "offline"
+	; listing): dxr-get decides, and answers 40 for an id it does not know.
+	; Space-separated, already filtered to [a-z0-9._-]. catalog_plan.ps1 leaves
+	; the list empty when the catalog was refused (signature).
+	${If} $DxrCatIni != ""
+	${AndIf} ${FileExists} "$DxrCatIni"
 		ReadINIStr $R7 "$DxrCatIni" "catalog" "passthrough"
 		ClearErrors
 		${DoWhile} $R7 != ""

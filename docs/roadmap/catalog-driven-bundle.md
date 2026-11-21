@@ -26,8 +26,8 @@ the conversion models:
 |---|---|---|
 | not installed | `<name> <version> (download N MB)` | if **recommended** by the catalog, or if its detection rule **matched this machine with high confidence** |
 | installed, older than the catalog | `<name> <installed> to <version> (download N MB)` | same rule |
-| installed at the catalog version | `<name> <version> - installed, up to date`, greyed | never; nothing is downloaded |
-| no signed Windows build, or its runtime range excludes the runtime being installed | `<name> - not available`, greyed, the reason in the description box | never |
+| installed at the catalog version, or newer | `<name> <installed> - installed`, greyed | never; nothing is downloaded |
+| no signed Windows build, a link-out item, or its runtime range excludes the runtime being installed | `<name> - not available`, greyed, the reason in the description box | never |
 
 - **Recommended** is the open conversion provider (`recommended: true` in the catalog), so
   "Convert to 3D" exists on a machine whose display vendor ships no converter (ADR-064 §7).
@@ -61,6 +61,7 @@ steps 4 and 8) do not exist yet, so the installer does not mention them.
 | `/COMPONENTS=<list>` | comma-separated item ids or aliases (`leia-sr`, `leia_plugin`, `open-conversion`, …) and the keywords `recommended`, `detected`, `default` (= `recommended,detected`), `none` |
 | `/CATALOG=<url\|file>` | passed to `dxr-get` as `--catalog`; the catalog must still be signed. For testing |
 | `/NOSTART` | as before; items are then installed with `--no-start-service` |
+| `/CATALOG=` and `/COMPONENTS=` values | a value containing a double quote is ignored |
 
 In an interactive run `/COMPONENTS=` replaces the default pre-ticks. `/KEEPACTIVERUNTIME`,
 `/FORCEACTIVERUNTIME`, `/NOMODELS`, `/MODELSPACK=` and `/CLOSEAPPS` are untouched, and so are
@@ -72,60 +73,82 @@ would nest one engine run inside another.
 
 ### What it asks of `dxr-get`
 
-| Call | Used for | Exists today (schema 1) |
-|---|---|---|
-| `dxr-get [--catalog X] catalog --json` | the listing behind the page and behind the `recommended` / `detected` keywords | **no**: this is the schema-2 listing |
-| `dxr-get [--catalog X] install <id> --yes [--no-start-service]` | one call per chosen item | `install <component>` exists for `runtime`, `leia_plugin`, `browser`; on exit 2 the installer retries without the flags |
-| exit codes 0, 10, 11, 20, 21, 30, 40 | the reason shown for a skipped item | yes |
+Only verbs the engine has ([dxr-get.md](../specs/runtime/dxr-get.md)); the installer embeds the
+`dxr-get.exe` of its own build, so the two always match.
 
-The listing the page needs, as JSON on stdout: an array, or an object with an `items` array.
-Per item, everything optional except `id`:
-
-| Field | Meaning |
+| Call | Used for |
 |---|---|
-| `id`, `aliases[]`, `class`, `name`, `summary` | from the catalog. `class: "runtime"` is ignored (the installer is the runtime) |
-| `version` (or `target`) | the catalog version of the Windows asset |
-| `installed` | installed version, or null |
-| `state` | `ok`, `missing`, `outdated` (or `too_old`), `not_fetchable`, `incompatible`. When absent it is derived from the two versions |
-| `size` | bytes to download: the item's asset plus the installer assets of its unmet external prerequisites |
-| `detected` | `"high"`, `"low"`, `"none"` (or a boolean): the best detection rule that matched this machine |
-| `recommended` | the catalog's flag |
-| `reason` | one line, shown for an unavailable item |
-| `runtime { min, max }`, `requires[]` | passed through from the catalog. An `external` entry may carry `met: false` |
+| `dxr-get [--catalog X] list --json` | the rows: `id`, `name`, `class`, `installed`, `available`, `state`, `installable`, `listing`. It must succeed; exit 10 is "offline", 11 a refused catalog |
+| `dxr-get [--catalog X] detect --json` | which items' detection rules match this machine (`high_confidence`), and each item's schema-1 name |
+| `dxr-get [--catalog X] catalog` | the schema-2 document, for what `list` does not carry: `recommended`, `summary`, `aliases`, the Windows asset's `size`, `runtime { min, max }`, `requires` |
+| `dxr-get [--catalog X] install <id> --yes [--no-start-service]` | one call per chosen item, after the runtime section |
+| exit codes 0, 10, 11, 20, 21, 30, 40, 41, 50 | the reason shown for a skipped item |
 
-`catalog_plan.ps1` re-judges the runtime range against the runtime **being installed**, because
-`dxr-get` can only judge it against what was on the machine before (possibly nothing).
+`installer/catalog_plan.ps1` joins the three reports by item id. `list` states map to the
+page's four: `not_installed` is offered, `outdated` and `rebuilt` are offered as an update,
+`current`, `newer` and `installed` are shown as installed, and anything not `installable` is
+shown as not available. The second and third calls are best effort: without them the rows
+remain, nothing is pre-ticked, no size is shown and no runtime range is checked on the page
+(`dxr-get install` still refuses an incompatible item, exit 41).
+
+The shim re-judges each item's runtime range against the runtime **being installed**. `list`
+does not judge it at all, and `install` judges it only after the user has committed.
+
+### What the engine does not emit yet
+
+Each of these is worked around above. With them, `list --json` alone would answer the page,
+in one catalog fetch instead of three.
+
+| Missing from `list --json` | Today's substitute | Cost of the substitute |
+|---|---|---|
+| `recommended` (the catalog's flag) | read from the `catalog` document | a second fetch; absent when the fallback schema-1 catalog is in use |
+| `detected`: `high` / `low` / `none` per item | `detect --json`, joined by `id` | a third fetch |
+| `download`: bytes to fetch for the item, including the installer assets of its unmet external prerequisites, minus what the cache holds | the asset's `size` from the document | prerequisite assets and the cache are not counted, so the total shown can be off. `plan --for X --json` has `total_download`, but it plans `ensure-for X` (X's prerequisites, not X) and costs one call per item |
+| `summary`, `aliases` | from the document | as above |
+| compatibility with a **given** runtime version (`--assume-runtime X.Y.Z`, or a `compatible` field computed against it) | the shim compares `runtime` / `requires` itself | duplicates the engine's rule; the class ABI check is not duplicated, so an ABI mismatch is only caught at `install` |
+| unmet external prerequisites per item (`prerequisites[]` with `met`) | named from the document, not judged | the page says "also needs" even when the prerequisite is present |
+
+Two requirements for the engine, beyond fields:
+
+1. **`dxr-get` must not upgrade the runtime from inside the runtime installer.** `install X`
+   installs what X requires, the runtime included. Run from the runtime installer, that would
+   start a second runtime installer inside the first. The page never offers an item whose
+   floor is above the runtime being installed, but an id passed with `/COMPONENTS=` reaches
+   `install` unfiltered. The engine needs a switch for this (for example `--no-runtime`,
+   answering 40 or 41 instead of planning the runtime), and the installer will pass it.
+2. **A selection form for the bundle** (section 2, item 6): install "the recommended set and
+   what the hardware matches" in one call, since on the bundle's version-skip path no
+   installer is there to resolve those keywords.
 
 ### Live and waiting
 
 | Part | State |
 |---|---|
-| The installer builds and behaves as before when `dxr-get.exe` is not in the build | live (compile-time guard, both variants compiled) |
-| `/S` with no switch | live, unchanged |
-| `/S /COMPONENTS=leia_plugin` (an explicit id) | live with today's `dxr-get`: the id is handed to `dxr-get install` |
-| The component rows, the pre-ticks, the size line, `recommended` / `detected` | **waiting** on `dxr-get catalog --json`. Until then the listing reports `unsupported` and the page looks as it did |
-| The open conversion provider pre-ticked | **waiting** on that verb, and on a published schema-2 catalog that lists it |
-| Offline text on the page | waiting on the same verb (it is what reports exit 10) |
+| The installer builds and behaves as before when `dxr-get.exe` is not in the build | compiled, both variants |
+| `/S` with no switch | unchanged by construction: the install step returns before any call |
+| Rows, states, greyed installed items, `/COMPONENTS=<id>` | written against the engine's real output; waits only on a Windows run |
+| Hardware pre-tick | as above; needs a catalog whose items carry `detect` rules (the Leia SR item does) |
+| Open conversion provider pre-ticked, download sizes, runtime-range check on the page | **waits on a published schema-2 catalog.** `publish-catalog.yml` publishes schema 1 only, and `dxr-get` falls back to it; the fallback has no `recommended`, and the `catalog` document it prints is schema 1, which the shim does not use |
+| The open conversion provider, the Leia conversion provider and the Ultraleap provider as rows at all | wait on the generator change that lists them in schema 2 (#2733) and on signed releases |
 
 Known gaps:
 
-1. An id given explicitly with `/COMPONENTS=` that is not in the listing bypasses the runtime
-   range check here and is left to `dxr-get`.
-2. If an item needs a **newer** runtime than the one being installed, the page refuses it. An
-   explicit id is not refused, and a schema-2 `dxr-get install` may then try to upgrade the
-   runtime from inside the runtime installer. `dxr-get` should refuse that when its parent is
-   the runtime installer (exit 40), or offer a switch for it.
-3. At most eight rows. When the catalog offers more, ticked items are kept and the text says
+1. An id given explicitly with `/COMPONENTS=` that is not in the listing is left entirely to
+   `dxr-get install` (requirement 1 above).
+2. At most eight rows. When the catalog offers more, ticked items are kept and the text says
    how many are not shown.
-4. The listing needs Windows PowerShell. Where it is blocked by policy the page shows no
-   optional row, as with an older `dxr-get`.
+3. The listing needs Windows PowerShell. Where it is blocked by policy the page shows no
+   optional row.
+4. Three catalog fetches before the page appears, behind a "Checking the DisplayXR Catalog"
+   banner.
 5. The texts are English only, like the rest of the installer.
 
 ### To verify on Windows
 
 Nothing below has been run. `makensis` compiled the script on macOS with stub payloads, with and
 without a `dxr-get.exe`, and the listing shim's tests ran under PowerShell 7 against a fake
-`dxr-get`. Windows PowerShell 5.1 has not run it.
+`dxr-get` that answers with documents in the shape dxr-get.md gives. The real `dxr-get.exe`
+has not been run by the shim. Windows PowerShell 5.1 has not run it.
 
 1. Fresh install, interactive, schema-2 `dxr-get` and catalog (`/CATALOG=` with a local signed
    file): rows, pre-ticks on a Leia display and on a plain monitor, the size line changing with
@@ -137,7 +160,8 @@ without a `dxr-get.exe`, and the listing shim's tests ran under PowerShell 7 aga
 5. Upgrade over an existing install with the Leia plug-in present: shown as installed, or as an
    upgrade; the service stopped and started the expected number of times; `ActiveRuntime`
    handling as documented in dxr-get.md.
-6. With today's schema-1 `dxr-get`: the page exactly as before; `/S /COMPONENTS=leia_plugin`
+6. With only the schema-1 catalog published (today): rows for the Leia SR plug-in and the
+   browser, the plug-in pre-ticked on a Leia display, no sizes; `/S /COMPONENTS=leia_plugin`
    installs the plug-in.
 7. Order: with the open conversion provider ticked, the conversion-models section that follows
    takes its pack from the provider just installed.
@@ -190,9 +214,8 @@ providers, and they are not in the catalog. Moving them is a later, separate ste
 6. **The version-skip path.** When the runtime is already current the bundle does not run the
    runtime child, so `/COMPONENTS=` would never be acted on. On that path the bundle runs the
    installed `dxr-get.exe` itself. This needs one more `dxr-get` verb than the runtime
-   installer uses, because the keywords have no installer to resolve them:
-   `dxr-get install --recommended --detected --yes --no-start-service` (or the equivalent
-   selection form the schema-2 tool ends up with).
+   installer uses, because the keywords have no installer to resolve them: a selection
+   form of `install` (requirement 2 in section 1).
 7. The existing "remove when unticked" branches for the Leia plug-in and the open conversion
    provider stay, reading the same `UninstallString` values.
 8. After the runtime child, the bundle reads `<runtime dir>\catalog-skipped.txt` and shows its
@@ -221,8 +244,8 @@ of pins read by name).
 
 ### Order of work
 
-1. `dxr-get` schema 2 with the listing verb, and a published schema-2 catalog that lists the
-   open conversion provider. Nothing below is useful before this.
+1. A published schema-2 catalog that lists the open conversion provider (the engine reads it
+   already, #2734), and the engine switch that keeps `install` from upgrading the runtime.
 2. The runtime installer page (this change), verified on Windows.
 3. A runtime release carrying both.
 4. The bundle change, pinned to that runtime release, both variants built in CI.
