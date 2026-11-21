@@ -10,8 +10,12 @@ https://updates.displayxr.org/catalog/v1/stable.json (+ .sig) by
 
     gen_catalog.py generate --out DIR [--no-sign] [--versions versions.json]
                             [--download-dir DIR] [--verifier powershell|none]
-                            [--previous URL|FILE]
+                            [--previous URL|FILE] [--out-v2 DIR2]
     gen_catalog.py verify   DIR/stable.json [--sig DIR/stable.json.sig]
+
+`--out-v2` additionally writes the schema-2 document (ADR-064, spec §Schema 2) for
+the same components. It is derived from the schema-1 catalog of the same run and
+never changes the schema-1 bytes. Nothing publishes it yet.
 
 Signing key: env DXR_CATALOG_ED25519_KEY = base64 of the 32-byte Ed25519 seed.
 The matching public key is hardcoded below (PUBLIC_KEYS) and compiled into dxr-get.
@@ -445,6 +449,175 @@ def canonical_bytes(catalog):
     return (json.dumps(catalog, indent=1, sort_keys=False, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+# --------------------------------------------------------------------------- schema 2 (ADR-064)
+#
+# Schema 2 is a SEPARATE document (catalog/v2/stable.json). Deployed dxr-get builds
+# accept `schema == 1` only and treat anything else as offline, so schema 1 keeps
+# being generated exactly as above and schema 2 is derived from it: a pure function
+# of the schema-1 dict, with no network access and no second look at the assets.
+# What schema 1 does not know (class ABI ranges, uninstall, trust tier, licence
+# terms) is left out, never guessed. Spec: docs/specs/runtime/component-catalog.md.
+
+V2_PUBLISHER = "displayxr"
+V2_PLATFORM_WINDOWS = "windows-x64"
+
+# Facts about the first-party components that schema 1 carries only implicitly.
+# Keyed by the schema-1 component name (the versions.json field).
+V2_ITEMS = {
+    "runtime": {
+        "id": "runtime",
+        "class": "runtime",
+        "name": "DisplayXR Runtime",
+    },
+    "leia_plugin": {
+        "id": "leia-sr",
+        "class": "display_processor",
+        "registered_id": "leia-sr",
+        "name": "Leia SR display processor",
+    },
+    "browser": {
+        "id": "browser",
+        "class": "app",
+        "name": "DisplayXR Browser",
+    },
+}
+
+V2_CLASSES = ("runtime", "display_processor", "input_provider", "conversion_provider",
+              "tracking_provider", "workspace_controller", "companion", "app", "sdk")
+# Classes the runtime loads or spawns under a registered id.
+V2_REGISTERED_CLASSES = ("display_processor", "input_provider", "conversion_provider",
+                         "tracking_provider", "workspace_controller", "companion")
+V2_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)?$")
+V2_VERSION_REQ_RE = re.compile(r"^>=\d+\.\d+\.\d+$")
+
+
+def v2_asset(win):
+    """Schema-1 `windows` block -> schema-2 asset. Same bytes, same signer, regrouped."""
+    return {
+        "version": win["version"],
+        "file": win["file"],
+        "size": win["size"],
+        "sha256": win["sha256"],
+        "urls": list(win["urls"]),
+        "signature": {"kind": "authenticode", "signer": win["signer"]},
+        "installer": {
+            "kind": "exe",
+            "args": list(win.get("args", [])),
+            "scope": "machine",
+            "elevation": "required",
+        },
+        "installed": {"kind": "registry_sz", "path": win["registry_version"]},
+    }
+
+
+def build_catalog_v2(v1):
+    """Schema-2 catalog for the components of a schema-1 catalog. Does not modify `v1`."""
+    items = []
+    for name, comp in v1.get("components", {}).items():
+        meta = V2_ITEMS.get(name)
+        if meta is None:
+            warn(f"schema 2: no item metadata for component {name!r}; not listed")
+            continue
+        item = {"id": meta["id"]}
+        if name != meta["id"]:
+            item["aliases"] = [name]  # the schema-1 name, so `ensure-for <name>` keeps resolving
+        item["class"] = meta["class"]
+        if "registered_id" in meta:
+            item["registered_id"] = meta["registered_id"]
+        item["name"] = meta["name"]
+        item["publisher"] = V2_PUBLISHER
+        item["version"] = comp["recommended"]
+        floor = comp.get("requires", {}).get("runtime")
+        if floor:
+            item["requires"] = [{"kind": "runtime", "version": floor}]
+        if "windows" in comp:
+            item["assets"] = {V2_PLATFORM_WINDOWS: v2_asset(comp["windows"])}
+        if "detect" in comp:
+            item["detect"] = [dict(r) for r in comp["detect"]]
+        items.append(item)
+
+    return {
+        "schema": 2,
+        "serial": v1["serial"],
+        "generated": v1["generated"],
+        "expires": v1["expires"],
+        "channel": v1["channel"],
+        "source": dict(v1["source"]),
+        "publishers": {
+            V2_PUBLISHER: {
+                "name": "DisplayXR",
+                "url": "https://displayxr.org",
+                "signers": {
+                    V2_PLATFORM_WINDOWS: [
+                        {"kind": "authenticode", "subject_cn": cn}
+                        for cn in v1.get("signers", {}).get("windows", [])
+                    ],
+                },
+            },
+        },
+        "items": items,
+    }
+
+
+def validate_v2(cat):
+    """Structural problems of a schema-2 catalog, as strings. Empty list = valid."""
+    problems = []
+    publishers = cat.get("publishers")
+    if not isinstance(publishers, dict):
+        return ["publishers is not an object"]
+    items = cat.get("items")
+    if not isinstance(items, list):
+        return ["items is not an array"]
+    seen = set()
+    for item in items:
+        iid = item.get("id")
+        where = f"item {iid!r}"
+        if not isinstance(iid, str) or not V2_ID_RE.match(iid):
+            problems.append(f"{where}: id is not [a-z0-9-] (optionally publisher.name)")
+        for name in [iid] + list(item.get("aliases", [])):
+            if name in seen:
+                problems.append(f"{where}: id or alias {name!r} is used twice")
+            seen.add(name)
+        cls = item.get("class")
+        if cls not in V2_CLASSES:
+            problems.append(f"{where}: unknown class {cls!r}")
+        if cls in V2_REGISTERED_CLASSES and not item.get("registered_id"):
+            problems.append(f"{where}: class {cls} needs registered_id")
+        pub = publishers.get(item.get("publisher"))
+        if pub is None:
+            problems.append(f"{where}: publisher {item.get('publisher')!r} is not in publishers")
+        for req in item.get("requires", []):
+            kind = req.get("kind")
+            if kind not in ("runtime", "item", "external"):
+                problems.append(f"{where}: requires kind {kind!r}")
+            elif kind in ("runtime", "item") and not V2_VERSION_REQ_RE.match(req.get("version", ">=0.0.0")):
+                problems.append(f"{where}: requires version {req.get('version')!r} is not >=X.Y.Z")
+        for platform, asset in item.get("assets", {}).items():
+            awhere = f"{where} {platform}"
+            if "listing" in asset:  # link-out: nothing is downloaded or run
+                if not str(asset["listing"].get("url", "")).startswith("https://"):
+                    problems.append(f"{awhere}: listing.url must be an https URL")
+                continue
+            if not re.fullmatch(r"[0-9a-f]{64}", asset.get("sha256", "")):
+                problems.append(f"{awhere}: sha256 is not 64 lowercase hex")
+            if not isinstance(asset.get("size"), int) or asset["size"] <= 0:
+                problems.append(f"{awhere}: size is not a positive integer")
+            urls = asset.get("urls")
+            if not urls or any(not str(u).startswith("https://") for u in urls):
+                problems.append(f"{awhere}: urls must be a non-empty list of https URLs")
+            sig = asset.get("signature")
+            if sig is None:
+                # ADR-064: every installable asset is signed; there is no hash-pinned-only form.
+                problems.append(f"{awhere}: an installable asset needs a signature")
+                continue
+            allowed = (pub or {}).get("signers", {}).get(platform, [])
+            if sig.get("kind") == "authenticode" and sig.get("signer") not in [
+                    a.get("subject_cn") for a in allowed if a.get("kind") == "authenticode"]:
+                problems.append(f"{awhere}: signer {sig.get('signer')!r} is not one of the "
+                                f"publisher's {platform} signers")
+    return problems
+
+
 # --------------------------------------------------------------------------- sign / verify
 
 
@@ -504,17 +677,36 @@ def cmd_generate(args):
     listed = [n for n, c in catalog["components"].items() if "windows" in c]
     info(f"windows blocks: {', '.join(listed) or 'none'}")
 
+    write_signature(out_json, data, args.no_sign)
+
+    if args.out_v2:
+        if os.path.abspath(args.out_v2) == os.path.abspath(args.out):
+            sys.exit("error: --out-v2 must be a different directory from --out")
+        catalog2 = build_catalog_v2(catalog)
+        problems = validate_v2(catalog2)
+        if problems:
+            sys.exit("error: generated schema-2 catalog is invalid: " + "; ".join(problems))
+        data2 = canonical_bytes(catalog2)
+        os.makedirs(args.out_v2, exist_ok=True)
+        out2 = os.path.join(args.out_v2, "stable.json")
+        with open(out2, "wb") as f:
+            f.write(data2)
+        info(f"wrote {out2} ({len(data2)} bytes, schema 2, {len(catalog2['items'])} items)")
+        write_signature(out2, data2, args.no_sign)
+    return 0
+
+
+def write_signature(out_json, data, no_sign):
     sig_path = out_json + ".sig"
-    if args.no_sign:
+    if no_sign:
         if os.path.exists(sig_path):
             os.remove(sig_path)  # never leave a signature that no longer matches
         info("--no-sign: no signature written")
-        return 0
+        return
     sig = sign_bytes(data)
     with open(sig_path, "wb") as f:
         f.write(base64.b64encode(sig) + b"\n")
     info(f"wrote {sig_path}")
-    return 0
 
 
 def cmd_verify(args):
@@ -537,8 +729,10 @@ def cmd_verify(args):
         return 1
     cat = json.loads(data)
     problems = []
-    if cat.get("schema") != 1:
-        problems.append(f"schema {cat.get('schema')} != 1")
+    if cat.get("schema") not in (1, 2):
+        problems.append(f"schema {cat.get('schema')} is not 1 or 2")
+    if cat.get("schema") == 2:
+        problems.extend(validate_v2(cat))
     exp = datetime.datetime.strptime(cat.get("expires", ""), "%Y-%m-%dT%H:%M:%SZ").replace(
         tzinfo=datetime.timezone.utc)
     if exp <= datetime.datetime.now(datetime.timezone.utc):
@@ -568,6 +762,9 @@ def main():
     g.add_argument("--versions", default=os.path.join(REPO_ROOT, "versions.json"))
     g.add_argument("--download-dir", help="where to keep downloaded installers (reused if same size)")
     g.add_argument("--no-sign", action="store_true", help="dry run: write stable.json only")
+    g.add_argument("--out-v2", metavar="DIR",
+                   help="also write the schema-2 document (ADR-064) to DIR/stable.json (+ .sig); "
+                        "derived from the schema-1 catalog, which is written unchanged")
     g.add_argument("--previous", metavar="URL|FILE",
                    help=f"published catalog (e.g. {CATALOG_URL}); a component whose new pin is not "
                         "listable keeps that catalog's signed windows block")

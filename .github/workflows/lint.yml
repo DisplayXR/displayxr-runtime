@@ -385,3 +385,10 @@ jobs:
         # (GitHub search does not index HTML comments, so a --search lookup
         # never matched and every run opened a duplicate).
         run: python3 scripts/tests/test_drift_audit.py
+
+      - name: Component-catalog generator unit tests (ADR-064)
+        # Hermetic (no network, no signing key). Pins the schema-1 catalog bytes
+        # that deployed dxr-get builds verify a signature over, that asking for
+        # the schema-2 document leaves them unchanged, and the schema-2
+        # validator's refusals (an undelegated signer, a plain-http URL).
+        run: python3 scripts/tests/test_gen_catalog.py

@@ -9,6 +9,12 @@ executable (`src/xrt/targets/get/`, static CRT, links nothing from the runtime),
 can embed it and run it on a machine that has no DisplayXR yet. The runtime installer also
 installs it into the runtime directory.
 
+This document describes `dxr-get` as built: Windows, catalog schema 1, three components known by
+name, a compiled-in signer list, no uninstall. [ADR-064](../../adr/ADR-064-component-catalog-and-third-party-trust.md)
+proposes making it the install engine of the public DisplayXR Catalog (schema 2, any item class,
+per-publisher signers, receipts and uninstall); none of that is implemented, and each step of that
+plan amends this spec when it lands.
+
 ## Commands
 
 ```
