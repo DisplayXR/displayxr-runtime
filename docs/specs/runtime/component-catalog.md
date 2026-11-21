@@ -131,6 +131,35 @@ browser's floor), generates with `--previous` = the live catalog, verifies, and 
 
 Local dry run (no key needed): `python scripts/gen_catalog.py generate --out out --no-sign`.
 
+### Publishing schema 2
+
+The same workflow can also publish `catalog/v2/stable.json`. It is **off by default** and is
+turned on by the repository variable `DXR_PUBLISH_CATALOG_V2` = `true` (Settings, Variables),
+or for one manual run by the `publish_v2` input of the workflow's dispatch form.
+
+| | Off (the default) | On |
+|---|---|---|
+| Generator call | `generate --out out`, as before | the same call with `--out-v2 out-v2`: schema 2 is derived in the same run, with the same serial and the same key |
+| Published | `feed/catalog/v1/stable.json` + `.sig` | those, plus `feed/catalog/v2/stable.json` + `.sig`, in the same commit |
+
+Schema 1 never depends on schema 2:
+
+- asking for schema 2 does not change one byte of the schema-1 document (pinned by
+  `scripts/tests/test_gen_catalog.py`);
+- if the combined generator run fails, the step starts over with the schema-1-only command.
+  A schema-2 defect cannot stop the schema-1 publish. A schema-1 failure fails the job, as
+  it always did;
+- the schema-2 document is checked in its own step (`verify`, and that its serial and expiry
+  equal the schema-1 document's). That step cannot fail the job. When it does not pass, the
+  v2 files are not copied and the commit carries schema 1 alone;
+- a v2 document that was published earlier is left as it is in that case. It stays valid
+  until its own `expires`, then clients treat it as offline and fall back to schema 1.
+
+What turning it on changes for users: a `dxr-get` that reads schema 2 (ADR-064 step 2 and
+later) stops falling back to schema 1 and uses the v2 document. Older `dxr-get` builds never
+request it. Turning the variable off again stops updates; the published v2 document then
+expires within 30 days and clients fall back.
+
 ## Schema 2
 
 Status: **Proposed** ([ADR-064](../../adr/ADR-064-component-catalog-and-third-party-trust.md)).
