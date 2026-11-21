@@ -200,6 +200,11 @@ if(TARGET target_lists)
 	# (environment > user > machine / manifest), the DXR_<CLASS>_<ID>_<KEY>
 	# mapping, the per-user JSON lookup, and a live POSIX round trip.
 	list(APPEND tests tests_component_settings)
+	# ADR-054 N5 / ADR-064 §5 -- the licence-state contract every class shares
+	# (vocabulary, sanitising, the conversion mapping), the activation
+	# hand-over, the `secret` setting type (redaction rule + a live POSIX round
+	# trip) and the reference script the sim providers run.
+	list(APPEND tests tests_component_license)
 	# ADR-054 N7 (#2143) -- the EmulatedControllers gate: the root-policy
 	# resolve rule (user over machine, under Policy\Lock) and the input
 	# loader's live POSIX per-user file read with HOME redirected.
@@ -779,6 +784,11 @@ if(TARGET tests_conversion_loader)
 endif()
 if(TARGET tests_component_settings)
 	target_link_libraries(tests_component_settings PRIVATE target_lists xrt-interfaces aux_util)
+endif()
+if(TARGET tests_component_license)
+	target_link_libraries(tests_component_license PRIVATE target_lists xrt-interfaces aux_util xrt-external-cjson)
+	# sim_common/sim_license.h: the header-only reference script.
+	target_include_directories(tests_component_license PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers)
 endif()
 if(TARGET tests_input_emulated_controllers)
 	target_link_libraries(tests_input_emulated_controllers PRIVATE target_lists xrt-interfaces aux_util)

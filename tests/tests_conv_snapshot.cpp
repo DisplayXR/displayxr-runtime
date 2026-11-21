@@ -722,6 +722,83 @@ TEST_CASE("conv headless: the shipped sim provider describes cleanly (the CI sel
 	CHECK(std::string(st->providers[0].load) == "PROBE_DECLINED");
 	CHECK(st->providers[0].cap_count == 0);
 }
+
+TEST_CASE("conv headless: an unlicensed provider reads UNLICENSED on every row and is never selected (ADR-054 N5)",
+          "[conv_snapshot][headless][license]")
+{
+	auto st = std::make_unique<target_conv_status>();
+	auto run = [&](const char *license_sim, const char *license_key) {
+		set_env("DXR_CONV_SIM_CONVERSION_ENABLE", "1");
+		set_env("DXR_CONV_SIM_CONVERSION_LICENSE_SIM", license_sim);
+		set_env("DXR_CONV_SIM_CONVERSION_LICENSE_KEY", license_key);
+		xrt_conversion_plugin_entry e = sim_entry();
+		target_conv_status_build_from_entries(&e, 1, nullptr, nullptr, st.get());
+		set_env("DXR_CONV_SIM_CONVERSION_ENABLE", nullptr);
+		set_env("DXR_CONV_SIM_CONVERSION_LICENSE_SIM", nullptr);
+		set_env("DXR_CONV_SIM_CONVERSION_LICENSE_KEY", nullptr);
+		REQUIRE(st->provider_count == 1);
+		REQUIRE(st->task_count > 0);
+	};
+	auto selected = [&] {
+		uint32_t n = 0;
+		for (uint32_t i = 0; i < st->task_count; i++) {
+			n += st->tasks[i].selected ? 1u : 0u;
+		}
+		return n;
+	};
+
+	// Nothing scripted (every existing provider): no licence to report, selection as before.
+	run(nullptr, nullptr);
+	CHECK(st->providers[0].licence.state == XRT_COMPONENT_LICENSE_NOT_APPLICABLE);
+	const uint32_t baseline = selected();
+	CHECK(baseline > 0);
+
+	// Unlicensed: the row says so, every capability reads UNLICENSED, none is selected.
+	run("unlicensed", nullptr);
+	CHECK(st->providers[0].licence.state == XRT_COMPONENT_LICENSE_UNLICENSED);
+	CHECK(st->bad_descriptors == 0); // a state, not a malformed provider
+	for (uint32_t i = 0; i < st->task_count; i++) {
+		INFO("task " << st->tasks[i].task_name);
+		if (st->tasks[i].composed) {
+			continue; // a composed row has the reference stage's state of its own
+		}
+		CHECK(st->tasks[i].state == XRT_CONV_STATE_UNLICENSED);
+		CHECK_FALSE(st->tasks[i].selected);
+	}
+	CHECK(selected() == 0);
+
+	// Expired blocks the same way, and carries when it ended.
+	run("expired", nullptr);
+	CHECK(st->providers[0].licence.state == XRT_COMPONENT_LICENSE_EXPIRED);
+	CHECK(st->providers[0].licence.expiry_unix_s == 946684800ll);
+	CHECK(selected() == 0);
+
+	// A trial serves, and says until when.
+	run("trial", nullptr);
+	CHECK(st->providers[0].licence.state == XRT_COMPONENT_LICENSE_TRIAL);
+	CHECK(st->providers[0].licence.source == XRT_COMPONENT_LICENSE_SOURCE_TRIAL);
+	CHECK(st->providers[0].licence.expiry_unix_s == 4102444800ll);
+	CHECK(selected() == baseline);
+
+	// The licence key (a `secret` setting) turns unlicensed into licensed by key.
+	run("unlicensed", "DXR-SIM-TEST-KEY");
+	CHECK(st->providers[0].licence.state == XRT_COMPONENT_LICENSE_LICENSED);
+	CHECK(st->providers[0].licence.source == XRT_COMPONENT_LICENSE_SOURCE_KEY);
+	CHECK(selected() == baseline);
+
+	// The feed's row carries the compact licence object.
+	auto snap = std::make_unique<xrt_status_snapshot>();
+	std::memset(snap.get(), 0, sizeof(*snap));
+	run("unlicensed", nullptr);
+	target_conv_status_to_snapshot(st.get(), snap.get());
+	cJSON *row = u_status_conv_provider_to_cjson(&snap->conv_providers[0]);
+	char *text = cJSON_PrintUnformatted(row);
+	const std::string json = text != nullptr ? text : "";
+	cJSON_free(text);
+	cJSON_Delete(row);
+	CHECK(json.find(R"("licence":{"state":"unlicensed","source":null,"expires_unix":null})") != std::string::npos);
+	CHECK(json.find("DXR-SIM-TEST-KEY") == std::string::npos);
+}
 #endif
 
 TEST_CASE("conv headless: DXR_CONV=0 (alias DXR_LIFT=0) means no conversion service (#2029)",

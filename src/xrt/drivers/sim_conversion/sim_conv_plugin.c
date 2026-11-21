@@ -26,6 +26,7 @@
 
 #include "sim_conv_fake_ply.h"
 #include "sim_conv_synth.h"
+#include "../sim_common/sim_license.h" // the scripted licence state (ADR-054 N5)
 
 #ifdef _WIN32
 #include "sim_conv_d3d11_io.h"
@@ -149,6 +150,9 @@ struct sim_conv
 };
 
 static const struct xrt_conversion_plugin_host_iface *g_host = NULL;
+
+//! The scripted licence (ADR-054 N5; ../sim_common/sim_license.h), loaded at negotiate.
+static struct sim_license g_license;
 
 /*
  *
@@ -975,10 +979,30 @@ scratch_touch(void)
 	U_LOG_W("sim conversion: SCRATCH_TOUCH: wrote %s", fin);
 }
 
+/*!
+ * Read the scripted licence's two settings (ADR-054 N5), so the licence slots
+ * answer from memory. At negotiate, and again at probe (a host may only
+ * answer get_setting from probe on); an activation already accepted in this
+ * process survives the second read.
+ */
+static void
+sc_license_read(bool keep_activation)
+{
+	const bool was_activated = keep_activation && g_license.activated;
+	char sim[16];
+	char key[XRT_COMPONENT_SETTING_SECRET_MAX];
+	const bool have_sim = setting("LICENSE_SIM", sim, sizeof(sim));
+	const bool have_key = setting("LICENSE_KEY", key, sizeof(key));
+	sim_license_load(&g_license, have_sim ? sim : NULL, have_key ? key : NULL);
+	g_license.activated = was_activated;
+	memset(key, 0, sizeof(key));
+}
+
 static xrt_result_t
 sc_probe(struct xrt_conversion_plugin_instance **out_inst)
 {
 	char buf[16];
+	sc_license_read(true);
 	if (out_inst == NULL || !setting("ENABLE", buf, sizeof(buf)) || strtoul(buf, NULL, 10) == 0) {
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
@@ -2032,6 +2056,7 @@ static const struct xrt_component_setting_desc g_sim_conv_settings[] = {
      "research = RESEARCH_ONLY, commercial_ok 0 (AllowResearchOnly gate)"},
     {"SCRATCH_TOUCH", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
      "probe() writes sim-scratch-touch into host->get_path(SCRATCH) (tests)"},
+    SIM_LICENSE_SETTING_DESCS, // LICENSE_SIM + LICENSE_KEY (a `secret`): the scripted licence state (ADR-054 N5)
     {"SCRIPT", XRT_COMPONENT_SETTING_TYPE_STRING, "",
      "per-task script (README.md); applied last. STATE_<cap> = absent|incompatible|unlicensed|disabled|"
      "failed:<reason>|installed also works per capability"},
@@ -2044,6 +2069,32 @@ sc_describe_settings(const struct xrt_component_setting_desc **out_descs)
 		*out_descs = g_sim_conv_settings;
 	}
 	return (uint32_t)(sizeof(g_sim_conv_settings) / sizeof(g_sim_conv_settings[0]));
+}
+
+/*
+ * The licence-state contract (ADR-054 N5), scripted: LICENSE_SIM picks the
+ * state, LICENSE_KEY (a `secret` setting) or activate() with the fixed test
+ * key turns unlicensed / expired into licensed. Both slots answer from
+ * memory: the settings were read at negotiate.
+ */
+static bool
+sc_get_license_state(struct xrt_component_license_state *out)
+{
+	return sim_license_get(&g_license, out);
+}
+
+static bool
+sc_activate(const char *token,
+            uint32_t token_size,
+            struct xrt_component_license_state *out_state,
+            char *out_error,
+            uint32_t error_size)
+{
+	const bool ok = sim_license_activate(&g_license, token, token_size, out_state, out_error, error_size);
+	if (ok) {
+		notify(0); // every capability's readiness just changed: re-describe
+	}
+	return ok;
 }
 
 static struct xrt_conversion_plugin_iface g_iface = {
@@ -2066,6 +2117,8 @@ static struct xrt_conversion_plugin_iface g_iface = {
     .job_execute = sc_job_execute,
     .destroy = sc_destroy,
     .describe_settings = sc_describe_settings,
+    .get_license_state = sc_get_license_state,
+    .activate = sc_activate,
 };
 
 /*!
@@ -2089,6 +2142,7 @@ xrtConversionPluginNegotiate(uint32_t runtime_api_version,
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	g_host = host;
+	sc_license_read(false);
 	*out_iface = &g_iface;
 	return XRT_SUCCESS;
 }

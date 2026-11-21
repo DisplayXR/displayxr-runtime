@@ -67,6 +67,8 @@ source (the provider declares it through `describe_settings`).
 | `DEVICE_LOST_EVERY` | 0 | every Nth convert / job fails and its capability reports `FAILED(DEVICE_LOST)`, retryable; the next `warm` reloads |
 | `LICENCE` | — | `research` ⇒ `RESEARCH_ONLY`, `commercial_ok = 0` (the `AllowResearchOnly` gate) |
 | `SCRATCH_TOUCH` | 0 | `probe()` asks `host->get_path(XRT_CONV_PATH_SCRATCH)` and writes `sim-scratch-touch` (the directory, one line) there, temp + rename: the test vehicle for the hosts' scratch directory (#2194) |
+| `LICENSE_SIM` | — | the scripted **licence state** (ADR-054 N5, `xrt_component_license.h`): `licensed` (source `hardware`), `trial` (ends 2100-01-01), `expired` (ended 2000-01-01), `unlicensed`. Unset = the provider reports no licence at all (`not_applicable`), which is the default and changes nothing. While the state is `unlicensed` or `expired` every capability reads `UNLICENSED` and selection falls through. Not to be confused with `LICENCE` above, which sets the licence *class* of the model |
+| `LICENSE_KEY` | — | a setting of type `secret`: with `LICENSE_SIM` = `unlicensed` / `expired`, the fixed test key `DXR-SIM-TEST-KEY` makes the state `licensed` (source `key`). `conv options` shows it as `<set>` / `<unset>`, never its value. `displayxr-cli conv activate sim-conversion DXR-SIM-TEST-KEY` does the same through the `activate` slot, for the life of that process |
 | `SCRIPT` | — | the compact per-task script below; applied last, so it wins |
 
 ### `SCRIPT` grammar

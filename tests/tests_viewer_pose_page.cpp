@@ -266,6 +266,27 @@ TEST_CASE("viewer pose page: status blocks, heartbeat and demand", "[vpp]")
 	REQUIRE(u_vpp_read_producer(p.mem, &ps2));
 	CHECK(ps2.pid == 4242);
 	CHECK(std::string(ps2.source) == "scripted sweep");
+	// ADR-054 N5: a host that says nothing about a licence leaves it not_applicable (0)...
+	CHECK(ps2.license_state == 0);
+	CHECK(ps2.license_source == 0);
+	CHECK(ps2.license_expiry_unix_s == 0);
+	// ... one that does is carried across ...
+	ps.license_state = 2;  // XRT_COMPONENT_LICENSE_TRIAL
+	ps.license_source = 3; // XRT_COMPONENT_LICENSE_SOURCE_TRIAL
+	ps.license_expiry_unix_s = 4102444800ll;
+	u_vpp_write_producer(p.mem, &ps);
+	REQUIRE(u_vpp_read_producer(p.mem, &ps2));
+	CHECK(ps2.license_state == 2);
+	CHECK(ps2.license_source == 3);
+	CHECK(ps2.license_expiry_unix_s == 4102444800ll);
+	CHECK(std::string(ps2.source) == "scripted sweep"); // the neighbours are untouched
+	// ... and an out-of-range value from the untrusted producer reads as nothing stated.
+	ps.license_state = 77;
+	ps.license_source = 78;
+	u_vpp_write_producer(p.mem, &ps);
+	REQUIRE(u_vpp_read_producer(p.mem, &ps2));
+	CHECK(ps2.license_state == 0);
+	CHECK(ps2.license_source == 0);
 
 	// An untrusted producer leaving a string unterminated cannot overrun a reader.
 	std::memset(p.mem + 416, 'x', 128);
