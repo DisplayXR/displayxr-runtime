@@ -443,7 +443,7 @@ licence, and gates it inside its own binary.** The runtime carries no licence
 logic and no payment logic: it asks the component for a state, shows it, and
 treats a component that is not entitled like any other that cannot serve. Any
 hardware or entitlement check lives in the vendor's binary, never in the
-runtime (ADR-064 §5, draft PR #2732).
+runtime ([ADR-064](../../adr/ADR-064-component-catalog-and-third-party-trust.md) §5).
 
 Every class carries the contract the same way (`xrt/xrt_component_license.h`):
 two optional vtable slots, appended under `struct_size` at an unchanged ABI
@@ -538,7 +538,7 @@ no output.
 **Not yet (documented gaps).**
 
 - The `displayxr://activate` deep-link handler and the service-side delivery
-  of a token to a provider that is already running (ADR-064's deep-link step). Today
+  of a token to a provider that is already running (ADR-064 step 7). Today
   `activate` reaches the binary in the CLI's process; the satellite channel
   already carries `ACTIVATE` for that step to use.
 - Live re-selection of a display processor or a tracking provider on a

@@ -438,9 +438,10 @@ produce the verdicts.
 
 ## Amendment 2 — Licence state for every class, activation, and the `secret` setting type (2026-11-20)
 
-**Status:** Accepted with the implementation (N5). Triggered by ADR-064 (component catalog and
-third-party trust, draft PR #2732), whose §5 fixes the licence model and whose step for the
-licence-state slot this amendment carries out.
+**Status:** Accepted with the implementation (N5). Triggered by
+[ADR-064](ADR-064-component-catalog-and-third-party-trust.md) (component catalog and
+third-party trust), whose §5 fixes the licence model and whose step 6, the licence-state slot,
+this amendment carries out.
 
 ### What was open
 
