@@ -153,6 +153,8 @@ static const struct xrt_conversion_plugin_host_iface *g_host = NULL;
 
 //! The scripted licence (ADR-054 N5; ../sim_common/sim_license.h), loaded at negotiate.
 static struct sim_license g_license;
+//! LICENSE_STORE: where an accepted activation is kept across processes ("" = nowhere).
+static char g_license_store[512];
 
 /*
  *
@@ -994,7 +996,12 @@ sc_license_read(bool keep_activation)
 	const bool have_sim = setting("LICENSE_SIM", sim, sizeof(sim));
 	const bool have_key = setting("LICENSE_KEY", key, sizeof(key));
 	sim_license_load(&g_license, have_sim ? sim : NULL, have_key ? key : NULL);
-	g_license.activated = was_activated;
+	// The provider's own licence storage: an activation accepted by an earlier
+	// process (the displayxr://activate handler) is this process's state.
+	if (!setting("LICENSE_STORE", g_license_store, sizeof(g_license_store))) {
+		g_license_store[0] = '\0';
+	}
+	g_license.activated = was_activated || sim_license_store_read(g_license_store);
 	memset(key, 0, sizeof(key));
 }
 
@@ -2056,7 +2063,8 @@ static const struct xrt_component_setting_desc g_sim_conv_settings[] = {
      "research = RESEARCH_ONLY, commercial_ok 0 (AllowResearchOnly gate)"},
     {"SCRATCH_TOUCH", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
      "probe() writes sim-scratch-touch into host->get_path(SCRATCH) (tests)"},
-    SIM_LICENSE_SETTING_DESCS, // LICENSE_SIM + LICENSE_KEY (a `secret`): the scripted licence state (ADR-054 N5)
+    SIM_LICENSE_SETTING_DESCS,      // LICENSE_SIM + LICENSE_KEY (a `secret`): the scripted licence state (ADR-054 N5)
+    SIM_LICENSE_STORE_SETTING_DESC, // LICENSE_STORE: where an accepted activation is kept (ADR-064 §5)
     {"SCRIPT", XRT_COMPONENT_SETTING_TYPE_STRING, "",
      "per-task script (README.md); applied last. STATE_<cap> = absent|incompatible|unlicensed|disabled|"
      "failed:<reason>|installed also works per capability"},
@@ -2092,6 +2100,11 @@ sc_activate(const char *token,
 {
 	const bool ok = sim_license_activate(&g_license, token, token_size, out_state, out_error, error_size);
 	if (ok) {
+		if (g_license_store[0] != '\0' && !sim_license_store_write(g_license_store)) {
+			U_LOG_W(
+			    "sim conversion: LICENSE_STORE: cannot write %s (the activation holds for this process)",
+			    g_license_store);
+		}
 		notify(0); // every capability's readiness just changed: re-describe
 	}
 	return ok;
