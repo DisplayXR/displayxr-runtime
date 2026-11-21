@@ -304,6 +304,8 @@ oxr_vk_route_via_metal(struct oxr_system *sys)
 #include <android/looper.h>
 #include "android/android_custom_surface.h"
 #include "android/android_globals.h"
+#include "android/android_glue_pump.h"
+#include "os/os_time.h"
 #endif
 
 /*
@@ -495,9 +497,51 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 			return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 			                 "Android: android_custom_surface_async_start failed");
 		}
-		ANativeWindow *win = android_custom_surface_wait_get_surface(cs, /*timeout_ms*/ 5000);
+		/*
+		 * #2087 (and #1358 bug 1): do NOT sit in one 5 s wait.
+		 *
+		 * The view add above is POSTED to the UI thread. When this is
+		 * `native_app_glue`'s android_main thread, the UI thread may be
+		 * blocked inside the glue (onResume / onPause / a window callback)
+		 * until android_main reads the matching command — which it cannot
+		 * while it waits here. That is the "first launch after the runtime
+		 * starts cold" failure: the wake-up activity pauses and resumes the
+		 * app's activity, the RESUME sits unread, and the posted add never
+		 * runs. So wait in short slices and service the glue's command
+		 * queue between them (android_glue_pump_once() is a no-op on a
+		 * thread that is not a glue thread).
+		 */
+		ANativeWindow *win = NULL;
+		bool glue_teardown = false;
+		uint32_t glue_cmds = 0;
+		{
+			const uint64_t slice_ms = 20;
+			const int64_t deadline_ns = os_monotonic_get_ns() + 5000LL * 1000LL * 1000LL;
+			while (win == NULL) {
+				struct android_glue_pump_result pr = android_glue_pump_once();
+				glue_cmds += pr.processed;
+				if (pr.teardown) {
+					glue_teardown = true;
+					break;
+				}
+				win = android_custom_surface_wait_get_surface(cs, slice_ms);
+				if (win == NULL && os_monotonic_get_ns() >= deadline_ns) {
+					break;
+				}
+			}
+		}
+		if (glue_cmds > 0) {
+			U_LOG_IFL_W(U_LOGGING_WARN,
+			            "Android: serviced %u app-glue command(s) while waiting for the hosted "
+			            "surface (#2087)%s",
+			            glue_cmds, win != NULL ? "" : " — still no surface");
+		}
 		if (win == NULL) {
 			android_custom_surface_destroy(&cs);
+			if (glue_teardown) {
+				return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
+				                 "Android: the activity's window went away during xrCreateSession");
+			}
 			return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 			                 "Android: surfaceCreated callback never fired within 5 s");
 		}
