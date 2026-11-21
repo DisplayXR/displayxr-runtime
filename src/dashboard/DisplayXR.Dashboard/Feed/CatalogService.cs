@@ -294,56 +294,35 @@ public sealed class CatalogService
         }
     }
 
-    /// <summary>
-    /// The page Buy opens. Today: the vendor's <c>purchase_url</c>, as it is. When the CLI has
-    /// <c>&lt;class&gt; activate-begin &lt;id&gt; --json</c> (ADR-064 step 7) and the component takes a
-    /// deep-link token, that verb starts an activation (a single-use nonce bound to this item) and the
-    /// nonce travels to the checkout, so the vendor's page can come back through
-    /// <c>displayxr://activate</c>. A CLI without the verb (unknown command, no JSON) is the fallback,
-    /// silently. A key is never part of any URL.
-    /// </summary>
-    public async Task<Uri> PurchaseUrlAsync(ComponentClass cls, string id, Uri purchase, bool deepLink, CancellationToken cancel = default)
-    {
-        if (!deepLink) return purchase;
-        try
-        {
-            var r = await _cli.RunAsync(new CliArgs(cls.Verb(), "activate-begin", id, "--json"), TimeSpan.FromSeconds(30), cancel)
-                .ConfigureAwait(false);
-            if (r.Ok && PurchaseLink.FromActivateBegin(purchase, id, r.Json) is { } withNonce) return withNonce;
-        }
-        catch (Exception ex) { DashboardLog.Warn($"activate-begin: {ex.GetType().Name}"); }
-        return purchase;
-    }
-}
+    /// <summary><c>&lt;class&gt; activate-begin &lt;id&gt; --json</c> (activation-deep-link.md §3).</summary>
+    public static CliArgs ActivateBeginCommand(ComponentClass cls, string id) => new(cls.Verb(), "activate-begin", id, "--json");
 
-/// <summary>Building the checkout URL from <c>activate-begin</c>'s answer. Pure.</summary>
-public static class PurchaseLink
-{
     /// <summary>
-    /// <c>{"url": "https://…"}</c> (the CLI built it: accepted only on the vendor's own host), or
-    /// <c>{"nonce": "…", "return_url": "displayxr://activate…"}</c> (appended to the purchase URL as
-    /// <c>item</c>, <c>nonce</c> and <c>return</c>). Anything else: null, and Buy opens the purchase URL as it is.
+    /// What Buy does for one component. When the component takes a deep-link token, the CLI's
+    /// <c>activate-begin</c> starts the activation and prints the COMPLETE URL to open (the vendor's
+    /// page plus the single-use nonce and the return address): it is opened as it is, nothing is
+    /// added to it here. A runtime without the verb, or a component without deep-link activation,
+    /// falls back to the licence's <c>purchase_url</c>. Nothing is opened by this method; the caller
+    /// opens <see cref="BuyPlan.Url"/> (https only, in the browser, never through a shell).
     /// </summary>
-    public static Uri? FromActivateBegin(Uri purchase, string id, string json)
+    public async Task<BuyPlan> BeginBuyAsync(ComponentClass cls, string id, string name, Uri? purchase, bool? deepLink,
+                                            CancellationToken cancel = default)
     {
+        // The component says it takes no deep-link token: do not load it just to hear "no-deep-link".
+        if (deepLink == false) return BuyPlan.Fallback(name, purchase);
         try
         {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (root.StrOrNull("url") is { } built)
-                return SafeUrl.TryHttps(built, out var u) && string.Equals(u!.Host, purchase.Host, StringComparison.OrdinalIgnoreCase) ? u : null;
-            string? nonce = root.StrOrNull("nonce");
-            if (nonce is null || nonce.Length > 256 || !nonce.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_')) return null;
-            var q = new StringBuilder(purchase.Query.TrimStart('?'));
-            void Add(string k, string v) => q.Append(q.Length > 0 ? "&" : "").Append(k).Append('=').Append(Uri.EscapeDataString(v));
-            Add("item", id);
-            Add("nonce", nonce);
-            if (root.StrOrNull("return_url") is { } ret && ret.StartsWith("displayxr://activate", StringComparison.Ordinal) && ret.Length <= 512)
-                Add("return", ret);
-            var b = new UriBuilder(purchase) { Query = q.ToString() };
-            return SafeUrl.TryHttps(b.Uri.AbsoluteUri, out var with) ? with : null;
+            var r = await _cli.RunAsync(ActivateBeginCommand(cls, id), TimeSpan.FromSeconds(60), cancel).ConfigureAwait(false);
+            if (!r.Started || r.TimedOut) return BuyPlan.Fallback(name, purchase);
+            var plan = BuyPlan.FromActivateBegin(r.Ok, r.Json, name, purchase, DateTimeOffset.UtcNow);
+            DashboardLog.Info($"activate-begin {cls.Verb()} {CliArgs.Display(id)}: {plan.Result}{(plan.NonceId.Length > 0 ? $" (nonce id {plan.NonceId})" : "")}");
+            return plan;
         }
-        catch (Exception ex) when (ex is JsonException or InvalidOperationException or UriFormatException) { return null; }
+        catch (Exception ex)
+        {
+            DashboardLog.Warn($"activate-begin: {ex.GetType().Name}");
+            return BuyPlan.Fallback(name, purchase);
+        }
     }
 }
 

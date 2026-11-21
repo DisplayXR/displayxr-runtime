@@ -129,6 +129,8 @@ public sealed class MainWindow : Window
         // the DPI ratio, which can push it past that monitor's working area (a
         // 250 % -> 300 % move does). Fit once the move has settled.
         ScalingChanged += (_, _) => DispatcherTimer.RunOnce(FitToScreen, TimeSpan.FromMilliseconds(250));
+        // A purchase finishes in the browser and the licence changes underneath us: look again on return.
+        Activated += (_, _) => { if (!_shutdown && _ctx.BuyPending is not null) _ = _ctx.RefreshPendingBuyAsync(); };
         Closing += (_, _) => ShutdownFeed();
     }
 

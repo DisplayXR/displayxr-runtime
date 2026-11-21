@@ -105,7 +105,8 @@ public sealed class CatalogPage : Page
           .Append(_class).Append(_installedOnly).Append(_detail).Append(_keyFor).Append('|');
         if (Ctx.CatalogOp is { } op) sb.Append(op.ItemId).Append(op.Verb).Append(op.Phase);
         if (Ctx.CatalogResult is { } res) sb.Append(res.ItemId).Append(res.Outcome.Title);
-        sb.Append(Ctx.ActivatingItem);
+        sb.Append(Ctx.ActivatingItem).Append(Ctx.BuyStarting).Append(Ctx.BuyPending?.ItemId);
+        if (Ctx.BuyNote is { } bn) sb.Append(bn.ItemId).Append(bn.Plan.Kind).Append(bn.Plan.Title);
         if (Ctx.ActivationResult is { } ar) sb.Append(ar.ItemId).Append(ar.Outcome.Title);
         sb.Append('|');
         foreach (var i in read?.List?.Items ?? Array.Empty<CatalogItem>())
@@ -488,24 +489,33 @@ public sealed class CatalogPage : Page
         if (v.Message is not null) col.Children.Add(U.Wrapped(v.Message, "soft"));
 
         bool activating = Ctx.ActivatingItem == i.Id;
-        if (v.OfferBuy || v.OfferKey)
+        bool offerBuy = v.OfferBuy && !Ctx.NoBuy(i.Id);
+        if (offerBuy || v.OfferKey)
         {
             var actions = U.Flow(10, 6);
-            if (v.OfferBuy)
+            if (offerBuy)
             {
-                var buy = U.Button("Buy", () => _ = Ctx.BuyAsync(i, cls, v.PurchaseUrl!, row.LicenceDeepLink == true), "primary", "sm");
+                bool starting = Ctx.BuyStarting == i.Id;
+                var buy = U.Button(starting ? "Opening…" : "Buy", () => _ = Ctx.BuyAsync(i, cls, v.PurchaseUrl, row.LicenceDeepLink), "primary", "sm");
+                buy.IsEnabled = Ctx.BuyStarting is null;
                 ToolTip.SetTip(buy, $"Opens {v.PurchaseUrl!.Host} in your browser. You buy from {(i.Publisher.Length > 0 ? i.Publisher : "its maker")}; DisplayXR is not part of the purchase.");
                 AutomationProperties.SetName(buy, $"Buy {i.Name}: opens {v.PurchaseUrl.Host} in your browser");
                 U.AddFlow(actions, buy, 10, 6);
             }
             if (v.OfferKey && _keyFor != i.Id)
             {
-                var paste = U.Button("Paste a key", () => { _keyFor = i.Id; Update(force: true); }, v.OfferBuy ? "quiet" : "primary", "sm");
+                var paste = U.Button("Paste a key", () => { _keyFor = i.Id; Update(force: true); }, offerBuy ? "quiet" : "primary", "sm");
                 paste.IsEnabled = !activating;
                 AutomationProperties.SetName(paste, $"Paste a licence key for {i.Name}");
                 U.AddFlow(actions, paste, 10, 6);
             }
             if (actions.Children.Count > 0) col.Children.Add(actions);
+        }
+        if (Ctx.BuyNote is { } note && note.ItemId == i.Id)
+        {
+            var n = U.Notice(Level.Info, note.Plan.Title, note.Plan.Text, U.Button("OK", Ctx.DismissBuyNote, "quiet", "sm"));
+            AutomationProperties.SetLiveSetting(n, AutomationLiveSetting.Polite);
+            col.Children.Add(n);
         }
         if (v.OfferKey && _keyFor == i.Id) col.Children.Add(KeyEntry(i, cls));
         if (activating)
@@ -565,7 +575,7 @@ public sealed class CatalogPage : Page
         box.AttachedToVisualTree += (_, _) => Dispatcher.UIThread.Post(() => box.Focus());
         var cancel = U.Button("Cancel", Close, "quiet", "sm");
         var row = U.Flow(10, 6, box, activate, cancel);
-        var note = U.Wrapped($"Your key goes straight to {i.Name}. DisplayXR does not keep it or write it to any log.", "meta");
+        var note = U.Wrapped($"Your key goes straight to {i.Name}. DisplayXR does not keep it or write it to any log. A licence key belongs in this box, never in a link.", "meta");
         var wrap = new Border { Child = U.VStack(8, row, note) };
         wrap.Classes.Add("field");
         return wrap;

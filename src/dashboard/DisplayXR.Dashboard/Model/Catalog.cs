@@ -393,6 +393,96 @@ public sealed record LicenceView(string Headline, Level Level, string? Message, 
     }
 }
 
+/// <summary>What Buy does, decided from <c>activate-begin</c>'s answer.</summary>
+public enum BuyKind
+{
+    /// <summary>An activation is pending: open the complete URL; the vendor's page comes back through <c>displayxr://activate</c>.</summary>
+    OpenWithReturn,
+    /// <summary>No deep link (the component does not take one, or the runtime predates the verb): open the purchase page; the user pastes a key.</summary>
+    OpenPurchasePage,
+    /// <summary>There is no acceptable purchase page: nothing to open, and no Buy button from now on.</summary>
+    NoPurchasePage,
+    /// <summary>The activation could not be started now (too many pending, the store, not loaded): say so calmly; the key box stays.</summary>
+    NotNow,
+}
+
+/// <summary>
+/// One press of Buy (activation-deep-link.md §3). <see cref="Url"/> is what to open, exactly as given:
+/// for <see cref="BuyKind.OpenWithReturn"/> it is <c>activate-begin</c>'s complete <c>url</c> and nothing
+/// is ever appended to it. <see cref="Expires"/>: when the pending activation ends (15 minutes), which
+/// is how long the Dashboard keeps looking for the licence to change. <see cref="NonceId"/> is the
+/// loggable id, never the nonce.
+/// </summary>
+public sealed record BuyPlan(BuyKind Kind, string Result, Uri? Url, DateTimeOffset? Expires, string Title, string Text, string NonceId = "")
+{
+    public bool Opens => Url is not null && Kind is BuyKind.OpenWithReturn or BuyKind.OpenPurchasePage;
+
+    /// <summary>The licence's own purchase page, when it is an acceptable https URL; else there is nothing to buy from here.</summary>
+    public static BuyPlan Fallback(string name, Uri? purchase, string result = "unavailable") =>
+        purchase is not null && SafeUrl.TryHttps(purchase.AbsoluteUri, out var u)
+            ? new(BuyKind.OpenPurchasePage, result, u, null, "Finish in your browser",
+                  $"When you have your licence key, come back and choose Paste a key. A key goes in the masked box, never in a link.")
+            : NoPage(name, result);
+
+    private static BuyPlan NoPage(string name, string result) => new(BuyKind.NoPurchasePage, result, null, null,
+        $"{name} isn't sold from here", "If you have a licence key, choose Paste a key. Otherwise its maker can tell you where to get one.");
+
+    /// <summary>
+    /// Read <c>activate-begin --json</c>: <c>{class, id, result, url, return_url, nonce_id, ttl_s,
+    /// expires_unix, expires, licence}</c>. No JSON or no <c>result</c> (an unknown-verb or usage
+    /// error from a runtime without the verb) means the verb is not available: the purchase page as it is.
+    /// </summary>
+    public static BuyPlan FromActivateBegin(bool exitOk, string json, string name, Uri? purchase, DateTimeOffset now)
+    {
+        string result = "", url = "", nonceId = "";
+        long expiresUnix = 0;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            result = root.Str("result");
+            url = root.Str("url");
+            nonceId = root.Str("nonce_id");
+            expiresUnix = root.Long("expires_unix");
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException) { }
+        switch (result)
+        {
+            case "":
+                return Fallback(name, purchase);
+            case "ok" when exitOk && SafeUrl.TryHttps(url, out var open):
+            {
+                // The record lives 15 minutes; never trust a time further out than a little over that.
+                var expires = expiresUnix > 0 ? DateTimeOffset.FromUnixTimeSeconds(expiresUnix) : now.AddMinutes(15);
+                if (expires > now.AddMinutes(20)) expires = now.AddMinutes(20);
+                return new(BuyKind.OpenWithReturn, result, open, expires, "Finish in your browser",
+                    $"When you are done, choose the button on that page that returns to DisplayXR. It brings back a one-time code for {name}, and this page updates by itself.",
+                    nonceId);
+            }
+            case "ok": // "ok" without an https URL to open: nothing was started that the user can finish
+                return new(BuyKind.NotNow, "bad-url", null, null, "The purchase couldn't be started",
+                    "Try again in a moment. You can still paste a key.");
+            case "no-deep-link":
+                return Fallback(name, purchase, result);
+            case "no-purchase-url":
+                return NoPage(name, result);
+            case "too-many":
+                return new(BuyKind.NotNow, result, null, null, "A few purchases are still waiting to finish",
+                    "Finish one in your browser, or try again in a few minutes: each one waits for 15 minutes. You can still paste a key.");
+            case "not-registered":
+                return new(BuyKind.NotNow, result, null, null, $"{name} isn't loaded right now",
+                    "Open Components to see why, then try again. You can still paste a key.");
+            default: // store-error, and any result a newer CLI adds
+                return new(BuyKind.NotNow, result, null, null, "The purchase couldn't be started",
+                    "DisplayXR could not prepare it on this machine. Try again in a moment. You can still paste a key.");
+        }
+    }
+}
+
+/// <summary>A Buy the user has started and may still be finishing in the browser.</summary>
+public sealed record BuyPending(string ItemId, string Name, ComponentClass Class, string ComponentId, BuyPlan Plan,
+                                string LicenceWas, DateTimeOffset Until);
+
 /// <summary>What <c>&lt;class&gt; activate &lt;id&gt; @file --json</c> answered. Never carries the key.</summary>
 public sealed record ActivationOutcome(bool Accepted, string Title, string Text)
 {

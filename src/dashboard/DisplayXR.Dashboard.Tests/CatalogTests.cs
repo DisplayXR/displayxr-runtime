@@ -650,48 +650,248 @@ public class CatalogTests
         Assert.Throws<ArgumentException>(() => UrlLauncher.StartInfo(new Uri("file:///C:/x.exe"), true, false));
     }
 
-    // ── Buy: activate-begin when the CLI has it, the purchase URL as it is otherwise ──
+    // ── Buy: activate-begin (activation-deep-link.md §3) ─────────────────────
+
+    private static readonly Uri Purchase = new("https://store.example.com/depth-studio");
+    private static readonly DateTimeOffset Now = DateTimeOffset.FromUnixTimeSeconds(1795262606);
+
+    private static BuyPlan Begin(string file, bool exitOk, Uri? purchase = null) =>
+        BuyPlan.FromActivateBegin(exitOk, TestData.Text(file), "Acme Depth Studio", purchase ?? Purchase, Now);
+
+    private static string Refusal(string result) =>
+        "{\"class\":\"conv\",\"id\":\"acme-depth\",\"result\":\"" + result + "\",\"url\":\"\",\"return_url\":\"displayxr://activate\"," +
+        "\"nonce_id\":\"\",\"ttl_s\":900,\"expires_unix\":null,\"expires\":null,\"licence\":{\"state\":\"unlicensed\"}}";
 
     [Fact]
-    public async Task Buy_FallsBackToThePurchaseUrl_WhenTheCliHasNoActivateBegin()
+    public void ActivateBegin_Ok_OpensItsUrlExactlyAsGiven_AndIsPendingUntilItExpires()
     {
-        var purchase = new Uri("https://store.example.com/depth-studio");
-        var cli = new RecordingCli { OnRun = _ => new CliResult(2, "", "error: unknown command 'activate-begin'", false, null) };
-        var svc = new CatalogService(new FakeEngine(), cli);
-        Assert.Equal(purchase, await svc.PurchaseUrlAsync(ComponentClass.Conversion, "acme-depth", purchase, deepLink: true));
-        Assert.Equal(new[] { "conv", "activate-begin", "acme-depth", "--json" }, Assert.Single(cli.Argv).Args);
-
-        // A component that takes no deep-link token: the verb is not even asked.
-        cli.Argv.Clear();
-        Assert.Equal(purchase, await svc.PurchaseUrlAsync(ComponentClass.Conversion, "acme-depth", purchase, deepLink: false));
-        Assert.Empty(cli.Argv);
+        var plan = Begin("activate-begin-ok.json", exitOk: true);
+        Assert.Equal(BuyKind.OpenWithReturn, plan.Kind);
+        Assert.True(plan.Opens);
+        // The CLI's url is complete: byte for byte what is opened, nothing appended, nothing rebuilt.
+        using var doc = System.Text.Json.JsonDocument.Parse(TestData.Text("activate-begin-ok.json"));
+        string url = doc.RootElement.GetProperty("url").GetString()!;
+        Assert.Equal(url, plan.Url!.OriginalString);
+        Assert.Contains("displayxr_nonce=", url);
+        Assert.Contains("displayxr_item=conv%2Facme-depth", url);
+        Assert.Contains("displayxr_return=displayxr%3A%2F%2Factivate", url);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1795263506), plan.Expires);
+        Assert.Equal("790fa3af", plan.NonceId);                 // the loggable id, not the nonce
+        Assert.DoesNotContain(plan.NonceId, url);
+        Assert.Contains("one-time code", plan.Text);
+        // What is handed to the OS for it: the URL alone, no shell.
+        var psi = UrlLauncher.StartInfo(plan.Url, windows: true, macos: false);
+        Assert.Equal(url, psi.FileName);
+        Assert.Empty(psi.ArgumentList);
     }
 
     [Fact]
-    public async Task Buy_CarriesTheNonce_WhenActivateBeginAnswers()
+    public void ActivateBegin_NoDeepLink_FallsBackToThePurchasePage_HttpsOnly()
     {
-        var purchase = new Uri("https://store.example.com/depth-studio?ref=dxr");
-        var cli = new RecordingCli
-        {
-            OnRun = _ => new CliResult(0, "{\"nonce\":\"n0nce-123_abc\",\"return_url\":\"displayxr://activate\"}", "", false, null),
-        };
-        var url = await new CatalogService(new FakeEngine(), cli).PurchaseUrlAsync(ComponentClass.Conversion, "acme-depth", purchase, true);
-        Assert.Equal("https://store.example.com/depth-studio?ref=dxr&item=acme-depth&nonce=n0nce-123_abc&return=displayxr%3A%2F%2Factivate", url.AbsoluteUri);
-        Assert.True(SafeUrl.TryHttps(url.AbsoluteUri, out _));
+        var plan = BuyPlan.FromActivateBegin(false, Refusal("no-deep-link"), "X", Purchase, Now);
+        Assert.Equal(BuyKind.OpenPurchasePage, plan.Kind);
+        Assert.Equal(Purchase.AbsoluteUri, plan.Url!.AbsoluteUri);
+        Assert.Null(plan.Expires);
+        Assert.Contains("Paste a key", plan.Text);
+
+        Assert.Equal(BuyKind.NoPurchasePage, BuyPlan.FromActivateBegin(false, Refusal("no-deep-link"), "X", new Uri("http://store.example.com/x"), Now).Kind);
+        Assert.Equal(BuyKind.NoPurchasePage, BuyPlan.FromActivateBegin(false, Refusal("no-deep-link"), "X", null, Now).Kind);
+    }
+
+    [Fact]
+    public void ActivateBegin_NoPurchaseUrl_MeansNoBuy()
+    {
+        var plan = BuyPlan.FromActivateBegin(false, Refusal("no-purchase-url"), "X", Purchase, Now);
+        Assert.Equal(BuyKind.NoPurchasePage, plan.Kind);
+        Assert.Null(plan.Url);            // even though the list's purchase_url looked fine: the CLI's check decides
+        Assert.False(plan.Opens);
     }
 
     [Theory]
-    [InlineData("{\"url\":\"https://store.example.com/checkout?n=1\"}", "https://store.example.com/checkout?n=1")]
-    [InlineData("{\"url\":\"https://evil.example.net/checkout\"}", null)]       // not the vendor's host
-    [InlineData("{\"url\":\"http://store.example.com/checkout\"}", null)]       // not https
-    [InlineData("{\"nonce\":\"bad nonce&x=1\"}", null)]
-    [InlineData("{\"nonce\":\"abc\",\"return_url\":\"https://evil.example.net/\"}", "https://store.example.com/p?item=x&nonce=abc")]
-    [InlineData("{}", null)]
-    [InlineData("not json", null)]
-    public void ActivateBegin_IsUsedOnlyWhenItIsWellFormed(string json, string? expected)
+    [InlineData("too-many", "still waiting")]
+    [InlineData("store-error", "couldn't be started")]
+    [InlineData("not-registered", "isn't loaded")]
+    [InlineData("a-result-from-the-future", "couldn't be started")]
+    public void ActivateBegin_NotNow_IsACalmSentence_AndTheKeyBoxStays(string result, string title)
     {
-        var url = PurchaseLink.FromActivateBegin(new Uri("https://store.example.com/p"), "x", json);
-        Assert.Equal(expected, url?.AbsoluteUri);
+        var plan = BuyPlan.FromActivateBegin(false, Refusal(result), "X", Purchase, Now);
+        Assert.Equal(BuyKind.NotNow, plan.Kind);
+        Assert.Null(plan.Url);
+        Assert.Contains(title, plan.Title);
+        Assert.Contains("paste a key", plan.Text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("error", plan.Title, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("")]                                                    // an unknown verb prints no JSON
+    [InlineData("error: unknown command 'activate-begin'")]
+    [InlineData("Usage: displayxr-cli conv <list|use|reset|enable|disable|options|set|activate>")]
+    [InlineData("{\"providers\":[]}")]                                  // JSON, but not this verb's
+    public void ARuntimeWithoutTheVerb_IsNotAvailable_AndBuyOpensThePurchasePage(string stdout)
+    {
+        var plan = BuyPlan.FromActivateBegin(false, stdout, "X", Purchase, Now);
+        Assert.Equal(BuyKind.OpenPurchasePage, plan.Kind);
+        Assert.Equal(Purchase.AbsoluteUri, plan.Url!.AbsoluteUri);
+    }
+
+    [Theory]
+    [InlineData("http://store.example.com/buy?displayxr_nonce=x")]
+    [InlineData("displayxr://activate?nonce=x&token=y")]
+    [InlineData("file:///C:/x.exe")]
+    [InlineData("")]
+    public void AnOk_WithAUrlThatIsNotHttps_OpensNothing(string url)
+    {
+        string json = "{\"result\":\"ok\",\"url\":" + System.Text.Json.JsonSerializer.Serialize(url) + ",\"nonce_id\":\"aa\",\"expires_unix\":1795263506}";
+        var plan = BuyPlan.FromActivateBegin(true, json, "X", Purchase, Now);
+        Assert.Equal(BuyKind.NotNow, plan.Kind);
+        Assert.False(plan.Opens);
+    }
+
+    [Fact]
+    public void APendingActivation_NeverOutlivesItsFifteenMinutesByMuch()
+    {
+        string json = "{\"result\":\"ok\",\"url\":\"https://store.example.com/buy?displayxr_nonce=x\",\"nonce_id\":\"aa\",\"expires_unix\":4102444800}";
+        Assert.Equal(Now.AddMinutes(20), BuyPlan.FromActivateBegin(true, json, "X", Purchase, Now).Expires);
+        json = "{\"result\":\"ok\",\"url\":\"https://store.example.com/buy?displayxr_nonce=x\",\"nonce_id\":\"aa\"}";
+        Assert.Equal(Now.AddMinutes(15), BuyPlan.FromActivateBegin(true, json, "X", Purchase, Now).Expires);
+    }
+
+    [Fact]
+    public async Task Buy_AsksActivateBegin_UnlessTheComponentTakesNoDeepLink()
+    {
+        var cli = new RecordingCli { OnRun = _ => new CliResult(0, TestData.Text("activate-begin-ok.json"), "", false, null) };
+        var svc = new CatalogService(new FakeEngine(), cli);
+        var plan = await svc.BeginBuyAsync(ComponentClass.Conversion, "acme-depth", "Acme Depth Studio", Purchase, deepLink: true);
+        Assert.Equal(BuyKind.OpenWithReturn, plan.Kind);
+        Assert.Equal(new[] { "conv", "activate-begin", "acme-depth", "--json" }, Assert.Single(cli.Argv).Args);
+
+        // activation.deep_link = false: the verb is not even run; the purchase page as it is.
+        cli.Argv.Clear();
+        plan = await svc.BeginBuyAsync(ComponentClass.Conversion, "acme-depth", "Acme Depth Studio", Purchase, deepLink: false);
+        Assert.Equal(BuyKind.OpenPurchasePage, plan.Kind);
+        Assert.Empty(cli.Argv);
+
+        // A CLI that predates the activation object (null): ask; an old runtime answers with a usage error.
+        cli.OnRun = _ => new CliResult(2, "", "error: unknown command 'activate-begin'", false, null);
+        plan = await svc.BeginBuyAsync(ComponentClass.Conversion, "acme-depth", "Acme Depth Studio", Purchase, deepLink: null);
+        Assert.Equal(BuyKind.OpenPurchasePage, plan.Kind);
+        Assert.Single(cli.Argv);
+
+        // The CLI missing or hanging is the same fallback, never an exception.
+        cli.OnRun = _ => new CliResult(-1, "", "", true, null);
+        Assert.Equal(BuyKind.OpenPurchasePage, (await svc.BeginBuyAsync(ComponentClass.Conversion, "x", "X", Purchase, true)).Kind);
+        cli.OnRun = _ => throw new InvalidOperationException("boom");
+        Assert.Equal(BuyKind.OpenPurchasePage, (await svc.BeginBuyAsync(ComponentClass.Conversion, "x", "X", Purchase, true)).Kind);
+    }
+
+    [Fact]
+    public async Task TheFixtureCli_AnswersActivateBegin_InTheRealShape()
+    {
+        var src = new FixtureProcessSource(TestData.Path("components.ndjson"), new RecordingCli());
+        var svc = new CatalogService(new FakeEngine(), src);
+        var ok = await svc.BeginBuyAsync(ComponentClass.Conversion, "acme-depth", "Acme Depth Studio", Purchase, true);
+        Assert.Equal(BuyKind.OpenWithReturn, ok.Kind);
+        Assert.StartsWith("https://store.example.com/depth-studio?displayxr_nonce=", ok.Url!.OriginalString);
+        Assert.EndsWith("&displayxr_item=conv%2Facme-depth&displayxr_return=displayxr%3A%2F%2Factivate", ok.Url.OriginalString);
+
+        var noLink = await svc.BeginBuyAsync(ComponentClass.Conversion, "northlight-3d", "Northlight Live 3D", new Uri("https://northlight.example.com/buy"), null);
+        Assert.Equal(BuyKind.OpenPurchasePage, noLink.Kind);
+        Assert.Equal("no-deep-link", noLink.Result);
+        Assert.Equal(BuyKind.NotNow, (await svc.BeginBuyAsync(ComponentClass.Conversion, "nobody", "Nobody", Purchase, true)).Kind);
+    }
+
+    // ── After Buy: the licence changes underneath the Dashboard ─────────────
+
+    private static (DashboardContext Ctx, RecordingCli Cli, List<string> Opened) Context(Func<CliArgs, CliResult> run)
+    {
+        DashboardLog.Disabled = true;
+        var cli = new RecordingCli { OnRun = run };
+        var ctx = new DashboardContext(new StatusFeed(new FakeSource(), new ManualScheduler()), new CliProcessSource("no-such-cli"), cli, new FakeEngine())
+        {
+            BuyPollInterval = TimeSpan.FromMilliseconds(20),
+        };
+        var opened = new List<string>();
+        ctx.OpenUrl = u => { opened.Add(u); return true; };
+        return (ctx, cli, opened);
+    }
+
+    [Fact]
+    public async Task AfterBuy_TheLicenceIsPolled_UntilItChanges_ThenThePollStops()
+    {
+        string trial = TestData.Text("conv-list.json");
+        string licensed = trial.Replace("\"state\": \"trial\"", "\"state\": \"licensed\"").Replace("\"source\": \"trial\"", "\"source\": \"key\"");
+        Assert.NotEqual(trial, licensed);
+        bool bought = false;
+        var (ctx, cli, opened) = Context(a => a.Args[1] switch
+        {
+            // The fixture's expiry is a fixed moment; a pending activation is one that has not ended yet.
+            "activate-begin" => new CliResult(0, TestData.Text("activate-begin-ok.json")
+                .Replace("1795263506", DateTimeOffset.UtcNow.AddMinutes(15).ToUnixTimeSeconds().ToString()), "", false, null),
+            _ => new CliResult(0, bought ? licensed : trial, "", false, null),
+        });
+        await ctx.LoadPolicyAsync(ComponentClass.Conversion);
+        var item = Item("acme-depth");
+        var row = ctx.Policies[ComponentClass.Conversion].Row("acme-depth")!;
+
+        await ctx.BuyAsync(item, ComponentClass.Conversion, LicenceView.For(row, item.Class)!.PurchaseUrl, row.LicenceDeepLink);
+        Assert.StartsWith("https://store.example.com/depth-studio?displayxr_nonce=", Assert.Single(opened));
+        Assert.EndsWith("&displayxr_return=displayxr%3A%2F%2Factivate", opened[0]); // as given: nothing after it
+        Assert.NotNull(ctx.BuyPending);
+        Assert.Equal(BuyKind.OpenWithReturn, ctx.BuyNote!.Value.Plan.Kind);
+
+        bought = true; // the handler delivered the code; the component now reports licensed
+        for (int i = 0; i < 200 && ctx.BuyPending is not null; i++) await Task.Delay(20);
+        Assert.Null(ctx.BuyPending);
+        Assert.True(ctx.ActivationResult!.Value.Outcome.Accepted);
+        Assert.Equal("Acme Depth Studio is activated", ctx.ActivationResult.Value.Outcome.Title);
+
+        int reads = cli.Argv.Count;
+        await Task.Delay(150);
+        Assert.Equal(reads, cli.Argv.Count); // the poll has stopped
+    }
+
+    [Fact]
+    public async Task APendingBuy_EndsWithItsActivation_EvenIfNothingChanges()
+    {
+        string ended = TestData.Text("activate-begin-ok.json").Replace("1795263506", DateTimeOffset.UtcNow.AddSeconds(2).ToUnixTimeSeconds().ToString());
+        var (ctx, cli, _) = Context(a => a.Args[1] == "activate-begin"
+            ? new CliResult(0, ended, "", false, null)
+            : new CliResult(0, TestData.Text("conv-list.json"), "", false, null));
+        await ctx.LoadPolicyAsync(ComponentClass.Conversion);
+        await ctx.BuyAsync(Item("acme-depth"), ComponentClass.Conversion, Purchase, true);
+        Assert.NotNull(ctx.BuyPending);
+        for (int i = 0; i < 400 && ctx.BuyPending is not null; i++) await Task.Delay(20);
+        Assert.Null(ctx.BuyPending);
+        Assert.Null(ctx.ActivationResult);
+        int reads = cli.Argv.Count;
+        await Task.Delay(150);
+        Assert.Equal(reads, cli.Argv.Count);
+    }
+
+    [Fact]
+    public async Task Buy_ThatCannotStart_OpensNothing_AndNoPurchasePageRemovesTheButton()
+    {
+        string result = "too-many";
+        var (ctx, _, opened) = Context(a => a.Args[1] == "activate-begin"
+            ? new CliResult(1, Refusal(result), "", false, null)
+            : new CliResult(0, TestData.Text("conv-list.json"), "", false, null));
+        var item = Item("acme-depth");
+        await ctx.BuyAsync(item, ComponentClass.Conversion, Purchase, true);
+        Assert.Empty(opened);
+        Assert.Null(ctx.BuyPending);
+        Assert.Equal(BuyKind.NotNow, ctx.BuyNote!.Value.Plan.Kind);
+        Assert.False(ctx.NoBuy(item.Id));
+
+        result = "no-purchase-url";
+        await ctx.BuyAsync(item, ComponentClass.Conversion, Purchase, true);
+        Assert.Empty(opened);
+        Assert.True(ctx.NoBuy(item.Id));
+
+        // no-deep-link: the purchase page, pending for the focus refresh only (no poll, no nonce).
+        result = "no-deep-link";
+        await ctx.BuyAsync(Item("northlight-3d"), ComponentClass.Conversion, Purchase, null);
+        Assert.Equal(Purchase.AbsoluteUri, Assert.Single(opened));
+        Assert.Equal(BuyKind.OpenPurchasePage, ctx.BuyPending!.Plan.Kind);
     }
 
     // ── Fakes ───────────────────────────────────────────────────────────────

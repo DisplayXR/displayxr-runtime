@@ -14,7 +14,7 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 | Displays | the status feed (screens, desktop map); `dp list --json` for the per-screen selector (its options: that screen's `candidates`) | `dp use <id> --screen <key>`, `dp reset --screen <key>` |
 | Windows | the status feed (clients) | — |
 | Components | the status feed (clients by class; per screen `eye_tracking.viewer_source` / `viewer_reason` / `viewer_policy` for the tracking card); `info --json` (incl. `tracking_providers`: probe results, the primary screen's arbitration); `workspace list --json`; `dp\|input\|conv\|tracking list --json` (ADR-054 N3e: `enabled`, `enabled_source`, `preferred`, `provenance`, conv `built_in`, tracking `first`, `policy.policy_lock`; ADR-054 N5: each row's `licence` object, shown as a chip — `unlicensed`, `licence expired`, `trial until <date>`, `licensed`, or `included with your display` when the entitlement comes with the hardware; nothing for a component with no licence to report. The Dashboard only shows it: the component decides it) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace reset <id>` (back to the runtime default, Ctrl+Shift+Space / auto), `workspace launch <id>`; `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `input use <id> --app <exe>` / `input reset --app <exe>` (the Input card's **Per app** table, ADR-034 Am.5: each pinned or running app's pin per role family and its live holder from `input list --json` `per_app` + `holders`; per user only — no machine-wide per-app pin exists — and disabled under `Policy\Lock`), `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise every control's `--machine` command — Enabled, Prefer, Reset — is shown for an administrator). No Enabled or Prefer on the built-in `dp-lift` row; under `Policy\Lock` the class shows "Locked by machine policy" and its per-user controls are disabled (for tracking, the per-user Prefer / Reset too). **Tracking providers** (ADR-054 N6): `tracking enable\|disable <id>`, `tracking use <id>` / `tracking reset` (then re-reads `tracking list --json` and `info --json`); per screen the viewer source and why (provider; standby: the display tracks; no source; source paused; FIXED / OWN) beside the display's viewer policy, and a **Calibrate camera…** button on provider-served screens that opens the calibration window (below): `tracking calibrate --screen <key> --watch --json` (long-lived), `tracking calibrate solve --in <tmp> --mode b --eye mid --reject-mm 5 --json`, `tracking calibrate apply --screen <key> --camera <key> --pose <setting> --provider <id> --rms-mm <rms> --samples <n> --mode b [--depth-scale <iris>] --json` (writes the runtime-owned camera calibration store, shared by every provider; `--provider` is accepted and ignored; then re-reads `tracking list --json` and `info --json`) |
-| Catalog | the install engine's `dxr-get list --json --no-runtime` (one call: state, versions, detection, sizes, compatibility, prerequisites), `dxr-get list --installed --json` when offline; `dp\|input\|conv\|tracking list --json` for an installed item's `licence` object | `dxr-get install <id> --yes --json --no-runtime`, `dxr-get uninstall <id> --json` (elevated for that one run, see below); `displayxr-cli <class> activate <id> @<key file> --json`; `displayxr-cli <class> activate-begin <id> --json` when the CLI has it |
+| Catalog | the install engine's `dxr-get list --json --no-runtime` (one call: state, versions, detection, sizes, compatibility, prerequisites), `dxr-get list --installed --json` when offline; `dp\|input\|conv\|tracking list --json` for an installed item's `licence` object | `dxr-get install <id> --yes --json --no-runtime`, `dxr-get uninstall <id> --json` (elevated for that one run, see below); `displayxr-cli <class> activate <id> @<key file> --json`; `displayxr-cli <class> activate-begin <id> --json` (Buy) |
 | Performance | `perf list --json`, `info --json` (adapters) | `perf set` / `perf reset` |
 | Developer | `perf list --all --json` (the read-only Tier 1/2 lever list: only while "Developer settings" is expanded, and on Refresh; collapsed again on every launch); `dp list --json` (`preferred` only: a machine-wide override is shown as a notice) | `perf reset <name>` / `perf reset` (managed levers only; the rest are environment-only), `dp reset` (machine-wide; admin) |
 
@@ -78,23 +78,31 @@ ADR-064 step 8. Spec of the engine: [dxr-get.md](../../docs/specs/runtime/dxr-ge
   - `source: hardware` (or `oem`) is the zero-click case: "Included with your display", and
     **no Buy, no key box and no activation handler**, in any state. Buy and Paste a key are for the
     `key` and `trial` sources.
-  - **Buy** opens the vendor's `purchase_url` in the default browser. Only an absolute `https` URL
-    with a host and no credentials is ever opened (`SafeUrl`), on Windows through the shell's
-    default verb on the URL itself, on macOS / Linux as the single argument of `open` / `xdg-open`:
-    never through a command interpreter. When the component takes a deep-link token
-    (`activation.deep_link`) and the CLI has `<class> activate-begin <id> --json`, that verb starts
-    the activation and its single-use nonce is added to the checkout URL (`PurchaseLink`); a CLI
-    without the verb is the silent fallback to the purchase URL as it is.
+  - **Buy** (`docs/specs/runtime/activation-deep-link.md` §3, PR #2748) runs
+    `displayxr-cli <class> activate-begin <id> --json` and acts on its `result`: `ok` opens its
+    `url` **exactly as given** (it is complete: the vendor's page with `displayxr_nonce`,
+    `displayxr_item` and `displayxr_return` already on it; the Dashboard appends and rebuilds
+    nothing, and logs only `nonce_id`); `no-deep-link` opens the licence's `purchase_url` as it is;
+    `no-purchase-url` opens nothing and removes the Buy button; `too-many`, `store-error` and
+    `not-registered` show one calm sentence and leave the key box. A runtime without the verb
+    (no JSON, an unknown-command or usage error) is "not available": the `purchase_url` as it is.
+    The verb is not run at all when the component says `activation.deep_link: false`. Only an
+    absolute `https` URL with a host and no credentials is ever opened (`SafeUrl`), on Windows
+    through the shell's default verb on the URL itself, on macOS / Linux as the single argument of
+    `open` / `xdg-open`: never through a command interpreter.
+  - **After Buy the licence changes underneath the Dashboard** (the `displayxr://activate` handler
+    delivers the one-time code to the component). While a Buy is pending the item's class list is
+    re-read when the window comes back to the front and every 15 s, until the pending activation
+    expires (`expires_unix`, 15 minutes) or the licence changes, then it stops. A purchase page
+    opened without a return link gets the focus refresh only.
   - **Paste a key** opens a masked box. The key is written to a new file only its owner can read
     (mode 0600; on Windows an ACL with one entry, inheritance off, under `%LOCALAPPDATA%\DisplayXR`),
     the CLI gets `@<that file>`, and the file is overwritten and deleted whatever happens. The key is
     never an argument, an environment variable, a log line or a field of the page. Not offered when
     the component says it takes no key (`activation.key: false`).
-  - **A key belongs in the key box, never in a URL.** A reusable licence key goes through the
-    masked box (and, for a component that stores it, its `secret` setting). What comes back
-    through `displayxr://activate` should be a one-time code the component exchanges with its
-    maker's service: URLs end up in browser history, referrers and system logs. The Dashboard puts
-    nothing but the item id, the single-use nonce and the return address in a URL.
+  - **A key belongs in the key box, never in a link.** What comes back through the link is a
+    one-time code the component redeems with its maker; a reusable licence key goes only through
+    the masked box; `source: hardware` needs neither.
 - **Where the engine is.** `dxr-get.exe` beside the CLI, then the installed runtime's;
   `DXR_DASHBOARD_GET=<path>` overrides it (development). **All of it sits behind
   `Feed/CatalogService.cs`** (`CatalogCommands`, `DxrGetEngine`): when `displayxr-cli catalog …`
@@ -111,7 +119,7 @@ ADR-064 step 8. Spec of the engine: [dxr-get.md](../../docs/specs/runtime/dxr-ge
   `--screenshot <png> [--screenshot-delay <s>]` saves the window and exits.
 - Tests: `CatalogTests` (both list shapes, grouping and filters, every exit code, the unelevated
   then elevated order, the licence block, the key never in a `ProcessStartInfo`, the key file's
-  permissions and removal, the URL rule, `activate-begin`).
+  permissions and removal, the URL rule, every `activate-begin` result and the runtime without the verb).
 
 ## Camera calibration window
 

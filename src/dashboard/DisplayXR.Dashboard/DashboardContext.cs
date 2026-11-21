@@ -163,13 +163,108 @@ public sealed class DashboardContext
         await LoadPolicyAsync(cls, force: true);
     }
 
-    /// <summary>Buy: the vendor's checkout in the default browser (through <c>activate-begin</c> when the CLI has it).</summary>
-    public async Task BuyAsync(CatalogItem item, ComponentClass cls, Uri purchase, bool deepLink)
+    /// <summary>How the last press of Buy went (what was opened, or why nothing was), and the Buy still being finished.</summary>
+    public (string ItemId, BuyPlan Plan)? BuyNote { get; private set; }
+    public BuyPending? BuyPending { get; private set; }
+    public string? BuyStarting { get; private set; }
+    private readonly HashSet<string> _noBuy = new();
+
+    /// <summary><c>activate-begin</c> said this item has no acceptable purchase page: no Buy button for it.</summary>
+    public bool NoBuy(string itemId) => _noBuy.Contains(itemId);
+
+    /// <summary>How often the licence is re-read while a Buy is pending (each read loads the class's components).</summary>
+    public TimeSpan BuyPollInterval { get; set; } = TimeSpan.FromSeconds(15);
+
+    private static string LicenceKey(PolicyRow? r) => r is null ? "" : $"{r.Licence}|{r.LicenceSource}|{r.LicenceExpires}";
+
+    /// <summary>
+    /// Buy (activation-deep-link.md §3): start the activation through the CLI, open what it says to
+    /// open in the default browser, and, while the purchase may still be coming back through
+    /// <c>displayxr://activate</c>, keep the item's licence fresh: on window focus and on a bounded
+    /// poll that ends with the pending activation (15 minutes) or as soon as the licence changes.
+    /// </summary>
+    public async Task BuyAsync(CatalogItem item, ComponentClass cls, Uri? purchase, bool? deepLink)
     {
-        Uri url = purchase;
-        try { url = await Task.Run(() => Catalog.PurchaseUrlAsync(cls, item.ComponentId, purchase, deepLink)); }
-        catch (Exception ex) { DashboardLog.Warn($"buy: {ex.GetType().Name}"); }
-        if (!UrlLauncher.Open(url.AbsoluteUri)) Toast("Could not open the browser");
+        if (BuyStarting is not null) return;
+        BuyStarting = item.Id;
+        BuyNote = null;
+        Bump();
+        BuyPlan plan;
+        try { plan = await Task.Run(() => Catalog.BeginBuyAsync(cls, item.ComponentId, item.Name, purchase, deepLink)); }
+        catch (Exception ex)
+        {
+            plan = BuyPlan.Fallback(item.Name, purchase);
+            DashboardLog.Warn($"buy: {ex.GetType().Name}");
+        }
+        BuyStarting = null;
+        if (plan.Kind == BuyKind.NoPurchasePage) _noBuy.Add(item.Id);
+        if (plan.Opens && !OpenUrl(plan.Url!.AbsoluteUri))
+            plan = plan with { Kind = BuyKind.NotNow, Title = "The browser didn't open", Text = "Try again. You can still paste a key." };
+        BuyNote = (item.Id, plan);
+        if (plan.Opens)
+        {
+            _policies.TryGetValue(cls, out var pl);
+            // A purchase page without a return link still gets the focus refresh, for 15 minutes.
+            var until = plan.Expires ?? DateTimeOffset.UtcNow.AddMinutes(15);
+            var pending = new BuyPending(item.Id, item.Name, cls, item.ComponentId, plan, LicenceKey(pl?.Row(item.ComponentId)), until);
+            BuyPending = pending;
+            if (plan.Kind == BuyKind.OpenWithReturn) _ = PollBuyAsync(pending);
+        }
+        Bump();
+    }
+
+    /// <summary>Opens an https URL in the browser; replaceable in tests.</summary>
+    public Func<string, bool> OpenUrl { get; set; } = UrlLauncher.Open;
+
+    private async Task PollBuyAsync(BuyPending pending)
+    {
+        try
+        {
+            while (ReferenceEquals(BuyPending, pending) && DateTimeOffset.UtcNow < pending.Until)
+            {
+                await Task.Delay(BuyPollInterval);
+                if (!ReferenceEquals(BuyPending, pending)) return;
+                await RefreshPendingBuyAsync();
+            }
+        }
+        catch (Exception ex) { DashboardLog.Warn($"buy poll: {ex.GetType().Name}"); }
+        if (ReferenceEquals(BuyPending, pending))
+        {
+            BuyPending = null; // the pending activation has ended: stop looking
+            Bump();
+        }
+    }
+
+    /// <summary>
+    /// Re-read the licence of the item a Buy is pending for (the window came back to the front, or the
+    /// poll ticked). When it changed, the Buy is over; when it is now licensed, say so.
+    /// </summary>
+    public async Task RefreshPendingBuyAsync()
+    {
+        if (BuyPending is not { } pending) return;
+        if (DateTimeOffset.UtcNow >= pending.Until)
+        {
+            BuyPending = null;
+            Bump();
+            return;
+        }
+        await LoadPolicyAsync(pending.Class, force: true);
+        if (!ReferenceEquals(BuyPending, pending)) return;
+        _policies.TryGetValue(pending.Class, out var pl);
+        var row = pl?.Row(pending.ComponentId);
+        if (row is null || LicenceKey(row) == pending.LicenceWas) return;
+        BuyPending = null;
+        BuyNote = null;
+        if (row.Licence == "licensed")
+            ActivationResult = (pending.ItemId, new ActivationOutcome(true, $"{pending.Name} is activated", "Thank you. It is ready to use."));
+        DashboardLog.Info($"catalog: licence of {pending.ItemId} is now '{row.Licence}'");
+        Bump();
+    }
+
+    public void DismissBuyNote()
+    {
+        BuyNote = null;
+        Bump();
     }
 
     /// <summary>Suspends the service's workspace hotkey while the capture box has focus.</summary>

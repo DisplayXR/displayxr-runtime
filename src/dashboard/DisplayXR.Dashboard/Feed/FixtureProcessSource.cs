@@ -249,11 +249,42 @@ public sealed class FixtureProcessSource : IProcessSource
     /// <summary>
     /// <c>&lt;verb&gt; activate &lt;id&gt; @file --json</c> against a simulated class list: the file's first
     /// line is the key; <see cref="TestKey"/> makes the provider <c>licensed</c> (source <c>key</c>),
-    /// anything else is refused. <c>activate-begin</c> is not simulated (exit 2: an older CLI), so Buy
-    /// opens the purchase URL as it is.
+    /// anything else is refused. <c>&lt;verb&gt; activate-begin &lt;id&gt; --json</c> answers in the CLI's shape
+    /// (activation-deep-link.md §3): <c>ok</c> with a complete URL for a provider whose licence says
+    /// <c>activation.deep_link</c>, else <c>no-deep-link</c> / <c>no-purchase-url</c> / <c>not-registered</c>.
+    /// The nonce in that URL is made up: nothing is pending anywhere.
     /// </summary>
     private CliResult Activate(string[] a)
     {
+        if (a is [var bverb, "activate-begin", var bid, ..])
+        {
+            lock (_gate)
+            {
+                var list = _classLists[bverb];
+                var row = ((list["providers"] ?? list["plugins"]) as JsonArray)?.OfType<JsonObject>()
+                    .FirstOrDefault(p => p["id"]?.GetValue<string>() == bid);
+                var lic = row?["licence"] as JsonObject;
+                string purchase = lic?["purchase_url"]?.GetValue<string>() ?? "";
+                string result = row is null ? "not-registered"
+                    : lic?["activation"]?["deep_link"]?.GetValue<bool>() != true ? "no-deep-link"
+                    : !purchase.StartsWith("https://", StringComparison.Ordinal) ? "no-purchase-url" : "ok";
+                bool ok = result == "ok";
+                long expires = DateTimeOffset.UtcNow.AddSeconds(900).ToUnixTimeSeconds();
+                var o = new JsonObject
+                {
+                    ["class"] = bverb, ["id"] = bid, ["result"] = result,
+                    ["url"] = ok ? purchase + (purchase.Contains('?') ? "&" : "?")
+                                   + "displayxr_nonce=FIXTUREFIXTUREFIXTUREFIXTUREFIXTUREFIXTURE0"
+                                   + "&displayxr_item=" + bverb + "%2F" + Uri.EscapeDataString(bid)
+                                   + "&displayxr_return=displayxr%3A%2F%2Factivate" : "",
+                    ["return_url"] = "displayxr://activate", ["nonce_id"] = ok ? "f1x7ure0" : "", ["ttl_s"] = 900,
+                    ["expires_unix"] = ok ? expires : null,
+                    ["expires"] = ok ? DateTimeOffset.FromUnixTimeSeconds(expires).ToString("yyyy-MM-ddTHH:mm:ssZ") : null,
+                    ["licence"] = lic?.DeepClone(),
+                };
+                return new CliResult(ok ? 0 : 1, o.ToJsonString(), "", false, null);
+            }
+        }
         if (a is not [var verb, "activate", var id, var arg, ..] || !arg.StartsWith('@'))
             return new CliResult(2, "", $"fixture: unsupported '{string.Join(' ', a)}'", false, null);
         string key;
