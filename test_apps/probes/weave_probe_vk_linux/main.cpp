@@ -110,11 +110,24 @@
  * ($TMPDIR/displayxr_atlas_trigger.weave_probe_vk_linux) shows the sprite in
  * both tiles of the pre-weave atlas.
  *
- * Run (service already started with the sim display plug-in):
- *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=build/_plugins \
- *     build/src/xrt/targets/service/displayxr-service &
+ * Run, against a dev service started with sim_display as its only component.
+ * On a desktop box (an installed runtime, a Wayland session) use the helper:
+ * it gives the pair a runtime dir of its own for the IPC socket, keeps the
+ * Wayland and D-Bus addresses reachable from it, and isolates the plug-ins
+ * (docs/getting-started/building.md, "A dev service beside an installed
+ * runtime", says why each step is needed):
+ *   ./scripts/run_dev_service_linux.sh &          # add --no-session-bus to keep it off the session bus
+ *   SVC=$!
+ *   . "$XDG_RUNTIME_DIR/dxr-dev/client.env"       # the client's half, in this shell
+ *   build/run_weave_probe_vk_linux.sh --service-pid=$SVC [--cursor | --cursor-dmabuf | ...]
+ * In a container or on a box with nothing installed and no session (CI), the
+ * short form is enough:
+ *   XRT_PLUGIN_SEARCH_PATH=build/_plugins build/src/xrt/targets/service/displayxr-service &
  *   XRT_FORCE_MODE=ipc XR_RUNTIME_JSON=build/openxr_displayxr-dev.json \
  *     ./weave_probe_vk_linux --service-pid=$!
+ * The probe asserts anaglyph colours (sim_display's default output) and takes
+ * the panel from XR_DXR_display_info, so sim_display may adopt the box's real
+ * panel: nothing needs pinning to 1920x1080.
  */
 
 #include <vulkan/vulkan.h>
@@ -2445,17 +2458,19 @@ main(int argc, char **argv)
 	if (has_rig) {
 		enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
 	}
-	// --span2d reads the panel's desktop rect (XR_DXR_display_info); only
-	// then, so the default run's instance is unchanged.
+	// XR_DXR_display_info: the panel the runtime reports. --span2d,
+	// --flat-regions and --lift need its desktop rect; the locate check needs
+	// its pixel pitch, because sim_display adopts the box's real panel and the
+	// canvas in metres follows it (a 2880 px / 0.300 m panel is not sim_display's
+	// 1920 px / 0.344 m default). Enabled whenever it is offered.
 	if (span2d || flat_regions) {
 		if (!has_display_info) {
 			LOG("--span2d / --flat-regions need XR_DXR_display_info (the panel rect)");
 			return 1;
 		}
-		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 	}
-	// --lift only, so the default run's instance is unchanged. It also reads
-	// the panel rect, to put rect A on the panel's axis (see run_lift).
+	// XR_DXR_lift: --lift only, so the default run does not enable it. --lift
+	// also reads the panel rect, to put rect A on the panel's axis (see run_lift).
 	if (do_lift) {
 		if (!has_lift || !has_display_info) {
 			LOG("--lift needs XR_DXR_lift (%d) + XR_DXR_display_info (%d)", (int)has_lift,
@@ -2463,6 +2478,8 @@ main(int argc, char **argv)
 			return 1;
 		}
 		enabled.push_back(XR_DXR_LIFT_EXTENSION_NAME);
+	}
+	if (has_display_info) {
 		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 	}
 	// --cursor only, so the default run's instance is unchanged.
@@ -2502,7 +2519,11 @@ main(int argc, char **argv)
 	XR_CHECK(xrGetSystem(instance, &sgi, &system_id));
 
 	PanelRect panel;
-	if (span2d || flat_regions || do_lift) {
+	// Metres per panel pixel, the square pitch the runtime derives the weave
+	// window's canvas from (multi_compositor_get_window_metrics: width in
+	// metres / width in pixels). 0 = not reported.
+	double panel_pitch_m = 0.0;
+	if (has_display_info) {
 		XrDisplayDesktopPositionDXR pos = {XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR};
 		XrDisplayInfoDXR di = {XR_TYPE_DISPLAY_INFO_DXR};
 		di.next = &pos;
@@ -2513,6 +2534,11 @@ main(int argc, char **argv)
 		panel.top = pos.top;
 		panel.w = di.displayPixelWidth;
 		panel.h = di.displayPixelHeight;
+		if (di.displayPixelWidth > 0 && di.displaySizeMeters.width > 0.0f) {
+			panel_pitch_m = (double)di.displaySizeMeters.width / (double)di.displayPixelWidth;
+		}
+		LOG("panel (XR_DXR_display_info): %ux%u px at (%d,%d), %.4fx%.4f m", panel.w, panel.h, panel.left,
+		    panel.top, (double)di.displaySizeMeters.width, (double)di.displaySizeMeters.height);
 		if ((span2d || flat_regions) && (panel.w < kWinW || panel.h < kWinH)) {
 			LOG("--span2d: panel %ux%u is smaller than the %ux%u window", panel.w, panel.h, kWinW, kWinH);
 			return 1;
@@ -3164,7 +3190,9 @@ main(int argc, char **argv)
 	// XrViewDisplayRawDXR goes to the service (session_locate_views_rig ->
 	// ipc_try_get_oop_view_poses), which now sources the canvas from the bound
 	// weave geometry (multi_compositor_get_window_metrics). The raw canvas must
-	// be the bound window: 1280x720 px, sim_display pitch 0.344 m / 1920 px.
+	// be the bound window: 1280x720 px, at the pixel pitch of the panel the
+	// runtime reports (XR_DXR_display_info), never a constant: sim_display's
+	// default is 0.344 m / 1920 px, but it adopts the box's real panel.
 	if (has_rig) {
 		XrReferenceSpaceCreateInfo rsci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
 		rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -3191,18 +3219,31 @@ main(int argc, char **argv)
 			    (double)views[i].fov.angleRight * 57.2958, (double)views[i].fov.angleUp * 57.2958,
 			    (double)views[i].fov.angleDown * 57.2958);
 		}
-		const double want_w_m = 1280.0 * 0.344 / 1920.0, want_h_m = 720.0 * 0.344 / 1920.0;
-		const bool canvas_ok = raw.canvasRectPx.extent.width == (int32_t)kWinW &&
-		                       raw.canvasRectPx.extent.height == (int32_t)kWinH &&
-		                       raw.canvasSizeMeters.width > want_w_m * 0.98 &&
-		                       raw.canvasSizeMeters.width < want_w_m * 1.02 &&
-		                       raw.canvasSizeMeters.height > want_h_m * 0.98 &&
-		                       raw.canvasSizeMeters.height < want_h_m * 1.02;
-		LOG("locate raw: canvas (%d,%d %dx%d)px %.4fx%.4fm eyes=%u tracking=%d (want %ux%u px, %.4fx%.4fm) -> %s",
-		    raw.canvasRectPx.offset.x, raw.canvasRectPx.offset.y, raw.canvasRectPx.extent.width,
-		    raw.canvasRectPx.extent.height, (double)raw.canvasSizeMeters.width,
-		    (double)raw.canvasSizeMeters.height, raw.eyeCountOutput, (int)raw.isTracking, kWinW, kWinH, want_w_m,
-		    want_h_m, canvas_ok ? "OK (per-window canvas)" : "WRONG");
+		const bool px_ok = raw.canvasRectPx.extent.width == (int32_t)kWinW &&
+		                   raw.canvasRectPx.extent.height == (int32_t)kWinH;
+		bool canvas_ok = px_ok;
+		if (panel_pitch_m > 0.0) {
+			const double want_w_m = (double)kWinW * panel_pitch_m, want_h_m = (double)kWinH * panel_pitch_m;
+			canvas_ok = px_ok && raw.canvasSizeMeters.width > want_w_m * 0.98 &&
+			            raw.canvasSizeMeters.width < want_w_m * 1.02 &&
+			            raw.canvasSizeMeters.height > want_h_m * 0.98 &&
+			            raw.canvasSizeMeters.height < want_h_m * 1.02;
+			LOG("locate raw: canvas (%d,%d %dx%d)px %.4fx%.4fm eyes=%u tracking=%d (want %ux%u px, %.4fx%.4fm "
+			    "at the reported panel's %.4f mm pitch) -> %s",
+			    raw.canvasRectPx.offset.x, raw.canvasRectPx.offset.y, raw.canvasRectPx.extent.width,
+			    raw.canvasRectPx.extent.height, (double)raw.canvasSizeMeters.width,
+			    (double)raw.canvasSizeMeters.height, raw.eyeCountOutput, (int)raw.isTracking, kWinW, kWinH,
+			    want_w_m, want_h_m, panel_pitch_m * 1000.0, canvas_ok ? "OK (per-window canvas)" : "WRONG");
+		} else {
+			// No panel size to compare with (XR_DXR_display_info absent, or a
+			// panel of unknown physical size): the pixels are still checked.
+			LOG("locate raw: canvas (%d,%d %dx%d)px %.4fx%.4fm eyes=%u tracking=%d (want %ux%u px; metres "
+			    "NOT checked, the runtime reports no panel size) -> %s",
+			    raw.canvasRectPx.offset.x, raw.canvasRectPx.offset.y, raw.canvasRectPx.extent.width,
+			    raw.canvasRectPx.extent.height, (double)raw.canvasSizeMeters.width,
+			    (double)raw.canvasSizeMeters.height, raw.eyeCountOutput, (int)raw.isTracking, kWinW, kWinH,
+			    px_ok ? "OK (pixels only)" : "WRONG");
+		}
 		LOG("xrLocateViews -> %d (%u views)", (int)r, n);
 		pass = pass && ok && canvas_ok;
 		xrDestroySpace(local);

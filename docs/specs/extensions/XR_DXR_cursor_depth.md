@@ -422,6 +422,13 @@ over rear content draws uncrossed). The engines' capture trigger
 (`$TMPDIR/displayxr_atlas_trigger.<client-exe>` in the service's `$TMPDIR`) shows the sprite in
 every view of the pre-weave atlas.
 
+Run status of the POSIX engines (ADR-046 Amendment 6, *Evidence*): macOS on sim-display, both
+backends; desktop Linux on GNOME Wayland with sim-display, the probe's four legs with the
+`OPAQUE_FD` and with the dma-buf sprite. Not run: an X11 session, a tracked 3D panel, the
+browser end to end. Starting the Linux dev service for the probe:
+`scripts/run_dev_service_linux.sh` (`docs/getting-started/building.md`, *A dev service beside an
+installed runtime*).
+
 ## 3. Runtime behaviour
 
 The canvas point under the cursor is triangulated from the outermost pair of **located views**.
