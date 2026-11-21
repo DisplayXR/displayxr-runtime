@@ -5,7 +5,8 @@ name: Bump versions.json
 # this workflow with `event_type=versions-bump` and a client_payload of:
 #
 #   {
-#     "field":       "shell" | "leia_plugin" | "mcp_tools" | "browser" | "demos.<name>",
+#     "field":       "shell" | "leia_plugin" | "conversion_open" | "leia_conversion" |
+#                    "ultraleap" | "mcp_tools" | "browser" | "<name>_demo",
 #     "tag":         "v1.2.3"   (the browser field also still accepts the
 #                                retiring "preview-0.1.16" shape)
 #     "source_repo": "DisplayXR/displayxr-<repo>"
@@ -16,8 +17,14 @@ name: Bump versions.json
 #   2. For leia_plugin only: runs scripts/check_plugin_abi.py first. If
 #      the sibling's ABI doesn't match the runtime's, the bump is skipped
 #      and a tracking issue is opened in displayxr-leia-plugin asking for
-#      a rebuild. Other fields skip the ABI gate entirely.
-#   3. Writes the new tag into versions.json.
+#      a rebuild. For leia_conversion and ultraleap: the same check against
+#      the ABI those providers negotiate (conversion / input); a mismatch
+#      fails this run red and bumps nothing. Other fields skip the ABI gate.
+#   3. Writes the new tag into versions.json (scripts/apply_versions_bump.py).
+#      A field that is not in the file is refused, except the components that
+#      have no release yet (FIRST_RELEASE_FIELDS in that script): their first
+#      release's dispatch ADDS the field. See versions-json-autobump.md,
+#      "A component with no release yet".
 #   4. Direct-commits to main via the displayxr-publish-bot GitHub App.
 #
 # Why direct commit (not PR): "released = tested" is the working
@@ -187,50 +194,52 @@ jobs:
           fi
           exit 0
 
+      # Providers that ship from their own repo and negotiate a plug-in ABI other
+      # than the display one (ADR-053 conversion, ADR-034 input). Same question
+      # as the leia_plugin gate, asked of that ABI. Any non-zero result fails
+      # this run and bumps nothing: rc 1 is a real mismatch (the loader would
+      # reject the provider), rc 2 means the check could not run. No issue is
+      # opened: the publish bot's token is not scoped to these repos, and
+      # widening it to a repo the App is not installed on would break every bump.
+      - name: ABI assertion (leia_conversion, ultraleap)
+        id: provider_abi
+        if: steps.inputs.outputs.field == 'leia_conversion' || steps.inputs.outputs.field == 'ultraleap'
+        env:
+          FIELD: ${{ steps.inputs.outputs.field }}
+          TAG:   ${{ steps.inputs.outputs.tag }}
+        run: |
+          set +e
+          python3 scripts/check_plugin_abi.py --component "$FIELD" --tag "$TAG" | tee abi.out
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" = "1" ]; then
+            echo "::error::$FIELD $TAG negotiates a plug-in ABI major the runtime on main does not: versions.json was NOT bumped. Rebuild the provider against the current runtime headers and tag a new release."
+            exit 1
+          elif [ "$rc" != "0" ]; then
+            echo "::error::check_plugin_abi.py could not run for $FIELD $TAG (rc=$rc): versions.json was NOT bumped. Re-run this workflow once the cause is fixed."
+            exit 1
+          fi
+          # The Ultraleap provider hands the runtime raw struct xrt_device, which
+          # the input ABI major does not cover (ADR-063), so a build is only
+          # known-good on the runtime release it was built at. The pin is still
+          # recorded: the catalog item carries that exact runtime range and
+          # the provider's installer refuses another runtime. Say so here.
+          if [ "$FIELD" = "ultraleap" ]; then
+            PIN=$(sed -n 's/^runtime_pin=//p' abi.out | head -1)
+            RT=$(python3 -c "import json; print(json.load(open('versions.json'))['runtime'])")
+            if [ -n "$PIN" ] && [ "$PIN" != "$RT" ]; then
+              echo "::warning::ultraleap $TAG was built at runtime $PIN; versions.json pins runtime $RT. The pin is recorded, but that build only installs on runtime $PIN (ADR-063)."
+            fi
+          fi
+          rm -f abi.out
+
       - name: Apply bump
         if: steps.inputs.outputs.field != 'leia_plugin' || steps.abi.outputs.rc == '0'
         run: |
-          python3 - <<'PY'
-          import json, os, re, sys
-          field = os.environ["FIELD"]
-          tag   = os.environ["TAG"]
-          path  = "versions.json"
-          text  = open(path).read()
-
-          # Sanity-check the field exists in the parsed structure (catches
-          # typos in the dispatched payload before we touch the file).
-          d = json.loads(text)
-          parts = field.split(".")
-          cur = d
-          for p in parts[:-1]:
-              if p not in cur or not isinstance(cur[p], dict):
-                  sys.exit(f"versions.json has no nested key path '{field}'")
-              cur = cur[p]
-          leaf = parts[-1]
-          if leaf not in cur:
-              sys.exit(f"versions.json has no field '{field}'")
-
-          # Rewrite the file via a regex on the value-between-quotes so the
-          # bot's commits preserve whatever formatting (column alignment,
-          # whitespace, key order) the file already had. json.dump would
-          # normalize everything to its canonical style and churn the diff
-          # on every bump — fixed once, this stays stable across bumps.
-          # The leaf-name match is unambiguous in the current schema (no two
-          # scalar keys at different nesting levels share a name); if a future
-          # field collision appears, switch to a (\n + indent + leaf) anchor.
-          pat = re.compile(r'(?m)^(\s*"' + re.escape(leaf) + r'":\s*")[^"]*(")')
-          hits = pat.findall(text)
-          if len(hits) != 1:
-              sys.exit(f"expected exactly 1 occurrence of leaf '{leaf}' in versions.json, found {len(hits)}")
-          new_text = pat.sub(lambda m: m.group(1) + tag + m.group(2), text, count=1)
-          if new_text == text:
-              print(f"versions.json[{field}] already == {tag}; nothing to do")
-              # Touch a sentinel so the next step skips the commit.
-              open(".bump-noop", "w").close()
-          else:
-              print(f"versions.json[{field}]: {cur[leaf]} → {tag}")
-              open(path, "w").write(new_text)
-          PY
+          python3 scripts/apply_versions_bump.py --field "$FIELD" --tag "$TAG" | tee bump.out
+          # Touch a sentinel so the next steps skip the commit when nothing changed.
+          if grep -q '^NOOP' bump.out; then touch .bump-noop; fi
+          rm -f bump.out
         env:
           FIELD: ${{ steps.inputs.outputs.field }}
           TAG:   ${{ steps.inputs.outputs.tag }}

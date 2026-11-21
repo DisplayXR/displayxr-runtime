@@ -24,7 +24,23 @@ Each track carries a POLICY (`bump_when` in downstream-pins.json):
             the abi gate is blind to (leia-plugin#264 guards on
             XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE, first shipped in v2.21.1 at ABI 5;
             at the old pin that code silently compiled out).
+  layout    repin when ANY byte changed in the include closure of the track's
+            `layout_headers`. For a plug-in that shares raw, unversioned
+            structs with the runtime (an input provider returning
+            `struct xrt_device`, ADR-063): a field added to such a struct, or
+            an enumerator inserted in an enum it carries, changes the layout
+            without touching a feature macro, a vtable slot or the ABI major,
+            so neither policy above sees it. Deliberately coarse: a comment
+            edit in one of those headers also triggers, because nothing here
+            can tell a harmless edit from a layout change. Identical bytes at
+            both tags is the only "the old build is still valid" this policy
+            ever states.
   manual    human-owned; never touched.
+
+A repo entry may carry `"unpublished": true`: its repository is not readable
+yet (not pushed, or still private to the bot). Its tracks are then skipped
+instead of failing the run when the pin cannot be read. Remove the flag once
+the repo is public; a readable pin is always evaluated normally.
 
 Spec: docs/specs/runtime/downstream-pin-bump.md
 
@@ -67,7 +83,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = REPO_ROOT / "downstream-pins.json"
 
 TAG_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
-POLICIES = ("abi", "features", "manual")
+POLICIES = ("abi", "features", "layout", "manual")
 
 
 def fetch(url: str) -> str:
@@ -104,6 +120,20 @@ def abi_headers(track: dict | None) -> list[str]:
     if unknown:
         raise SystemExit("abi_headers lists non-ABI header(s) %s (want keys of ABI_HEADERS)" % unknown)
     return hdrs
+
+
+def layout_headers(track: dict | None) -> list[str]:
+    """The root headers of a `layout` track. Required: there is no default set,
+    because which structs a plug-in shares with the runtime is its own fact."""
+    hdrs = list((track or {}).get("layout_headers") or [])
+    if not hdrs:
+        raise SystemExit("a bump_when=layout track needs a non-empty layout_headers list")
+    return hdrs
+
+
+def policy_headers(man: dict, track: dict | None, policy: str) -> list[str]:
+    """The header list `verdict` reads for a policy."""
+    return layout_headers(track) if policy == "layout" else feature_headers(man, track)
 
 
 def feature_headers(man: dict, track: dict | None) -> list[str]:
@@ -258,6 +288,52 @@ def diff_surfaces(old: dict, new: dict) -> tuple[list[str], list[str]]:
 
 
 # --------------------------------------------------------------------------
+# the layout closure
+#
+# Every header reachable from the roots through `#include "xrt/..."`, as raw
+# text. `xrt/` includes resolve under src/xrt/include; a root may also be any
+# other repo path (an aux header whose functions the plug-in imports), which
+# is hashed but not followed unless it includes `xrt/` headers itself.
+# --------------------------------------------------------------------------
+_XRT_INCLUDE_RX = re.compile(r'^[ \t]*#[ \t]*include[ \t]+"(xrt/[^"]+)"', re.M)
+
+
+def layout_closure(tag: str, roots: list[str]) -> dict:
+    """path -> text (None when absent at `tag`) for the closure of `roots`."""
+    out: dict = {}
+    todo = list(roots)
+    while todo:
+        path = todo.pop()
+        if path in out:
+            continue
+        text = header_at(tag, path)
+        out[path] = text
+        if text is None:
+            continue
+        for inc in _XRT_INCLUDE_RX.findall(text):
+            todo.append("src/xrt/include/" + inc)
+    return out
+
+
+def diff_layouts(old: dict, new: dict) -> list[str]:
+    trig = []
+    for path in sorted(old.keys() | new.keys()):
+        name = Path(path).name
+        if path not in old:
+            trig.append("%s joined the shared-header closure" % name)
+        elif path not in new:
+            trig.append("%s left the shared-header closure" % name)
+        elif old[path] != new[path]:
+            if old[path] is None:
+                trig.append("%s is new" % name)
+            elif new[path] is None:
+                trig.append("%s was removed" % name)
+            else:
+                trig.append("%s changed" % name)
+    return trig
+
+
+# --------------------------------------------------------------------------
 # the verdict: one track, one (pinned, new) pair
 # --------------------------------------------------------------------------
 def verdict(policy: str, cur: str, new: str, headers: list[str], abi_hdrs: list[str] | None = None) -> dict:
@@ -308,6 +384,24 @@ def verdict(policy: str, cur: str, new: str, headers: list[str], abi_hdrs: list[
         return dict(d, action="bump", triggers=triggers,
                     reason="plug-in ABI changed between %s and %s: %s" % (cur, new, "; ".join(triggers)))
 
+    if policy == "layout":
+        try:
+            old_l, new_l = layout_closure(cur, headers), layout_closure(new, headers)
+        except Exception as e:
+            return dict(d, action="error", reason="could not read layout headers: %s" % e)
+        missing = [Path(h).name for h in headers if old_l.get(h) is None and new_l.get(h) is None]
+        if missing:
+            return dict(d, action="error",
+                        reason="layout header(s) %s exist at neither %s nor %s" % (", ".join(missing), cur, new))
+        trig = diff_layouts(old_l, new_l)
+        d["headers"] = sorted(Path(h).name for h in new_l)
+        if not trig:
+            return dict(d, action="skip",
+                        reason="the %d shared headers are byte-identical at %s and %s -- a build made at "
+                               "%s is still valid" % (len(new_l), cur, new, cur))
+        return dict(d, action="bump", triggers=trig,
+                    reason="shared headers changed between %s and %s: %s" % (cur, new, "; ".join(trig)))
+
     # features
     try:
         old_s, new_s = surface_at(cur, headers), surface_at(new, headers)
@@ -351,7 +445,18 @@ def pr_text(d: dict, track: dict) -> tuple[str, str]:
     ]
     lines += ["- %s" % t for t in d.get("triggers") or [d["reason"]]]
     lines.append("")
-    if d["policy"] == "features":
+    if d["policy"] == "layout":
+        lines += [
+            "Layout-gated: this repo's binary shares raw, unversioned structs with the runtime, so",
+            "a build is only known-good on a runtime whose shared headers are byte-identical to the",
+            "ones it was built against. At least one of them changed between the pinned tag and the",
+            "new one. The change may be harmless (a comment); nothing automatic can tell. Rebuild,",
+            "test, and release against the new runtime, or close this PR with the reason.",
+            "",
+            "Pins that are not a `set(...)` literal or a workflow `env` value (a catalog entry, a",
+            "README) are NOT rewritten here: update them in this PR by hand.",
+        ]
+    elif d["policy"] == "features":
         lines += [
             "Feature-gated, not tag-chasing: this track repins only when a `XRT_*_HAS_*` feature",
             "macro, a vtable slot, or the plug-in ABI changed in %s between the pinned" % ", ".join("`%s`" % h for h in d.get("headers", [])),
@@ -429,11 +534,18 @@ def cmd_decide(args: argparse.Namespace) -> int:
                 d["reason"] += ": " + t.get("reason", "no reason recorded")
             else:
                 cur = pinned_tag_upstream(repo, t["locations"][0])
-                if cur is None:
+                if cur is None and spec.get("unpublished"):
+                    d = {"policy": policy, "current_tag": None, "new_tag": args.new_tag, "triggers": [],
+                         "action": "skip",
+                         "reason": "repo is marked unpublished and its pin is not readable yet"}
+                elif cur is None:
                     d = {"policy": policy, "current_tag": None, "new_tag": args.new_tag,
                          "action": "error", "reason": "could not read the current pin", "triggers": []}
                 else:
-                    d = verdict(policy, cur, args.new_tag, feature_headers(man, t), abi_headers(t))
+                    if spec.get("unpublished"):
+                        print("  ! %s is readable now: remove \"unpublished\" from downstream-pins.json" % repo)
+                    d = verdict(policy, cur, args.new_tag, policy_headers(man, t, policy),
+                                abi_headers(t) if policy == "abi" else None)
             d.update(repo=repo, track=track_name)
             if d["action"] == "bump":
                 d["pr_title"], d["pr_body"] = pr_text(d, t)
@@ -460,7 +572,11 @@ def cmd_verdict(args: argparse.Namespace) -> int:
             print("no such repo/track in the manifest: %s/%s" % (args.repo, args.track))
             return 2
     policy = args.policy or (track_policy(track) if track else "features")
-    d = verdict(policy, args.from_tag, args.to_tag, feature_headers(man, track), abi_headers(track))
+    if policy == "layout" and not track:
+        print("--policy layout needs --repo and --track (the roots are the track's layout_headers)")
+        return 2
+    d = verdict(policy, args.from_tag, args.to_tag, policy_headers(man, track, policy),
+                abi_headers(track) if policy == "abi" else None)
     print("%s -> %s  policy=%s  => %s" % (args.from_tag, args.to_tag, policy, d["action"].upper()))
     for t in d.get("triggers") or []:
         print("  trigger: %s" % t)
@@ -539,7 +655,7 @@ def main() -> int:
     v.add_argument("--to", dest="to_tag", required=True)
     v.add_argument("--repo")
     v.add_argument("--track")
-    v.add_argument("--policy", choices=("abi", "features"),
+    v.add_argument("--policy", choices=("abi", "features", "layout"),
                    help="override the track's policy (default: the track's, else features)")
     v.add_argument("--json", action="store_true", help="also print the decision as JSON")
     v.set_defaults(fn=cmd_verdict)

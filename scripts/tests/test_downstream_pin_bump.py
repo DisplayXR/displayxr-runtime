@@ -240,5 +240,114 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(dpb.verdict("features", "v2.20.1", "v2.21.0", self.linux)["action"], "skip")
 
 
+class LayoutTests(unittest.TestCase):
+    """bump_when=layout: any byte in the shared-header closure (ADR-063 providers)."""
+
+    TREES = {
+        "v1.0.0": {
+            "src/xrt/include/xrt/xrt_device.h": '#include "xrt/xrt_defines.h"\nstruct xrt_device { int a; };\n',
+            "src/xrt/include/xrt/xrt_defines.h": "enum xrt_device_name { A, B };\n",
+            "src/xrt/auxiliary/util/u_logging.h": "void u_log(void);\n",
+        },
+        # A plain field appended: no macro, no slot, no ABI major.
+        "v1.0.1": {
+            "src/xrt/include/xrt/xrt_device.h": '#include "xrt/xrt_defines.h"\nstruct xrt_device { int a; int b; };\n',
+            "src/xrt/include/xrt/xrt_defines.h": "enum xrt_device_name { A, B };\n",
+            "src/xrt/auxiliary/util/u_logging.h": "void u_log(void);\n",
+        },
+        # An enumerator inserted in a header only reached through an include.
+        "v1.0.2": {
+            "src/xrt/include/xrt/xrt_device.h": '#include "xrt/xrt_defines.h"\nstruct xrt_device { int a; int b; };\n',
+            "src/xrt/include/xrt/xrt_defines.h": "enum xrt_device_name { A, NEW, B };\n",
+            "src/xrt/auxiliary/util/u_logging.h": "void u_log(void);\n",
+        },
+    }
+    ROOTS = ["src/xrt/include/xrt/xrt_device.h", "src/xrt/auxiliary/util/u_logging.h"]
+
+    def setUp(self):
+        self._saved = dpb.header_at
+        dpb.header_at = lambda tag, path: self.TREES.get(tag, {}).get(path)
+
+    def tearDown(self):
+        dpb.header_at = self._saved
+
+    def test_closure_follows_xrt_includes(self):
+        got = dpb.layout_closure("v1.0.0", self.ROOTS)
+        self.assertEqual(sorted(got), sorted(self.TREES["v1.0.0"]))
+
+    def test_identical_bytes_skip(self):
+        self.TREES["v1.0.0-again"] = dict(self.TREES["v1.0.0"])
+        d = dpb.verdict("layout", "v1.0.0", "v1.0.1", self.ROOTS)
+        self.assertEqual(d["action"], "bump")
+        same = dpb.diff_layouts(dpb.layout_closure("v1.0.0", self.ROOTS),
+                                dpb.layout_closure("v1.0.0-again", self.ROOTS))
+        self.assertEqual(same, [])
+
+    def test_plain_field_triggers_where_features_is_blind(self):
+        d = dpb.verdict("layout", "v1.0.0", "v1.0.1", self.ROOTS)
+        self.assertEqual((d["action"], d["triggers"]), ("bump", ["xrt_device.h changed"]))
+        # The same pair under `features`: nothing to see.
+        f = dpb.verdict("features", "v1.0.0", "v1.0.1", [self.ROOTS[0]])
+        self.assertEqual(f["action"], "skip")
+
+    def test_change_in_an_included_header_triggers(self):
+        d = dpb.verdict("layout", "v1.0.1", "v1.0.2", self.ROOTS)
+        self.assertEqual((d["action"], d["triggers"]), ("bump", ["xrt_defines.h changed"]))
+
+    def test_never_downgrades_and_missing_root_is_an_error(self):
+        self.assertEqual(dpb.verdict("layout", "v1.0.2", "v1.0.0", self.ROOTS)["action"], "skip")
+        d = dpb.verdict("layout", "v1.0.0", "v1.0.1", ["src/xrt/include/xrt/no_such.h"])
+        self.assertEqual(d["action"], "error")
+
+    def test_layout_track_needs_roots(self):
+        with self.assertRaises(SystemExit):
+            dpb.layout_headers({"bump_when": "layout"})
+
+    def test_manifest_layout_roots_exist_in_this_tree(self):
+        dpb.header_at = self._saved
+        man = dpb.load_manifest()
+        for repo, spec in man["runtime_tag_pins"].items():
+            for name, t in spec["tracks"].items():
+                if t["bump_when"] != "layout":
+                    continue
+                for h in dpb.layout_headers(t):
+                    with self.subTest(track="%s/%s" % (repo, name), header=h):
+                        self.assertTrue((REPO_ROOT / h).is_file())
+
+
+class UnpublishedRepoTests(unittest.TestCase):
+    """A repo marked unpublished is skipped, not an error, while its pin is unreadable."""
+
+    def run_decide(self, pin):
+        import argparse
+        import contextlib
+        import io
+        saved = (dpb.load_manifest, dpb.pinned_tag_upstream, dpb.header_at)
+        dpb.load_manifest = lambda: {"feature_surface": {"headers": []}, "runtime_tag_pins": {
+            "new-repo": {"unpublished": True, "tracks": {"all": {
+                "bump_when": "layout", "layout_headers": ["a.h"],
+                "locations": [{"file": "CMakeLists.txt", "kind": "cmake_set", "key": "K"}]}}}}}
+        dpb.pinned_tag_upstream = lambda repo, loc: pin
+        dpb.header_at = lambda tag, path: "same\n"
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = dpb.cmd_decide(argparse.Namespace(new_tag="v1.0.1", repo=None, json=None))
+        finally:
+            dpb.load_manifest, dpb.pinned_tag_upstream, dpb.header_at = saved
+        return rc, out.getvalue()
+
+    def test_unreadable_pin_is_a_skip(self):
+        rc, out = self.run_decide(None)
+        self.assertEqual(rc, 0)
+        self.assertIn("[skip ] new-repo/all (layout): repo is marked unpublished", out)
+
+    def test_readable_pin_is_evaluated_and_the_flag_is_called_out(self):
+        rc, out = self.run_decide("v1.0.0")
+        self.assertEqual(rc, 0)
+        self.assertIn('remove "unpublished"', out)
+        self.assertIn("byte-identical", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -90,7 +90,8 @@ gated on `Runtime` succeeding. It:
 repos. Each sibling repo's release workflow ends with a dispatch
 step (snippets below). The handler reads the dispatched `{field,
 tag, source_repo}`, runs the same ABI gate when `field ==
-leia_plugin`, and commits the bump.
+leia_plugin` (and the matching one for `leia_conversion` and `ultraleap`,
+below), writes the pin with `scripts/apply_versions_bump.py` and commits it.
 
 The handler also supports `workflow_dispatch` so a human can bump
 any field by hand from the Actions tab — useful if a sibling repo's
@@ -404,6 +405,78 @@ As with every other key: adding this field does **not** enroll anything
 in `DisplayXRBundle-*.exe`. See the note at the end of "The browser
 field".
 
+## The `leia_conversion` and `ultraleap` fields
+
+Two providers that ship from their own repositories and have **no release yet**
+(2026-11):
+
+| Field | Repository | What it is | Bump gate |
+|---|---|---|---|
+| `leia_conversion` | `DisplayXR/displayxr-leia-conversion` | the Leia 2D-to-3D conversion provider, split out of the Leia SR plug-in (ADR-053). Needs the NeurD runtime, which has its own installer | the conversion ABI major |
+| `ultraleap` | `DisplayXR/displayxr-ultraleap` | the Ultraleap hands input provider, moved out of the runtime trunk (ADR-034). Needs the Ultraleap tracking software and a camera | the input ABI major, plus a warning (below) |
+
+Both are **opt-in** in the orchestrator (`--with leia-conversion`, `--with
+ultraleap`), like the browser: each needs third-party software DisplayXR does not
+ship, so neither is something a default install lays down. Both are **in the
+schema-2 catalog only** (`V2_ONLY_COMPONENTS` in `scripts/gen_catalog.py`): schema 1
+cannot express an external prerequisite or a maximum runtime, and a schema-1 client
+would offer the Ultraleap provider on every runtime newer than its floor. Neither
+is enrolled in `DisplayXRBundle-*.exe`.
+
+**The gate.** `check_plugin_abi.py --component <field> --tag <tag>` reads the
+runtime tag the release was built at (`DXR_RUNTIME_GIT_TAG` in its
+`CMakeLists.txt`) and compares that tag's ABI major with `main`'s, for the ABI the
+provider negotiates. A mismatch, or a check that could not run, **fails the run
+red and bumps nothing**. No issue is opened in the provider's repository: the
+publish bot's token is scoped to four repositories, and adding one the App is not
+installed on would fail the token mint and with it every bump.
+
+**The Ultraleap warning.** That provider returns raw `struct xrt_device`, which the
+input ABI major does not cover (ADR-063), so a build is known-good only on the
+runtime release it was built at. The bump still records the pin and prints a
+warning when the provider's runtime pin is not the runtime `versions.json` pins.
+Refusing instead would leave the field permanently behind, because `runtime` moves
+on every runtime release. What enforces the pairing is elsewhere: the catalog item
+carries `runtime.min == runtime.max`, and the provider's installer exits 3 on any
+other runtime.
+
+### A component with no release yet
+
+A pin must name a tag that exists. Three consumers break on one that does not:
+
+| Consumer | What a pin with no release does |
+|---|---|
+| `setup-displayxr.{sh,bat}` | `gh release view <tag>` fails and the run exits non-zero |
+| `displayxr-installer` `check_bundle_coverage.ps1` | fails on any key that is neither chained nor in `$IntentionallyUnbundled`, on the next mirror |
+| `gen_catalog.py` | lists a component whose release cannot be read (a warning on every scheduled run) |
+
+A placeholder value does not help: an empty string or `"unreleased"` still adds
+the key, so the coverage check still fails, and the website's sync would show it
+as a version. So the rule is: **a component with no release has no field.**
+Everything else is put in place first, and the first release adds the field:
+
+1. `scripts/apply_versions_bump.py` (the write step of `versions-bump.yml`) refuses
+   a field that is not in the file, **except** the ones in its
+   `FIRST_RELEASE_FIELDS` table. For those it inserts the line after a named
+   neighbour, keeping the file's formatting, and reports `ADDED`.
+2. `scripts/lib/components.sh` and the `.bat` mirror list the same names in
+   `COMPONENTS_AWAITING_FIRST_RELEASE`: asking for one (`--with <name>`) while it
+   has no pin is a warning and a skip, not an error. For every other component a
+   missing pin stays an error.
+3. `gen_catalog.py` does not list a component that has no pin, and does not touch
+   the network for it.
+4. `displayxr-installer` lists the field in `$IntentionallyUnbundled` **before** the
+   first release (a change in that repository; it accepts a name that is not in
+   `versions.json` yet).
+
+After the first release, delete the name from `FIRST_RELEASE_FIELDS` and from both
+`COMPONENTS_AWAITING_FIRST_RELEASE` lists, so a missing pin is an error again.
+`scripts/tests/test_component_tables.py` fails while the three disagree, and
+`test_apply_versions_bump.py` fails while a pinned field is still in the table.
+
+The mirror to `displayxr-installer` needs nothing special: the bump's own mirror
+step copies the file byte for byte, new key included.
+
 ## ABI gate (the one carve-out)
 
 The leia plug-in reports `XRT_PLUGIN_API_VERSION_CURRENT` from the
@@ -518,6 +591,9 @@ known-good matrix that's been continuously curated by this flow.
 | ABI mismatch on runtime self-bump | Bump skipped, issue opened on leia repo | Rebuild leia + tag, *then* re-run `workflow_dispatch` on `versions-bump.yml` with `field=runtime, tag=<this runtime tag>` |
 | ABI gate could not run (rc 2: network after retries, missing tag/file, unparsable header) | Job fails red with `::error::`; no bump, no issue | Fix the cause, then re-run the failed job (runtime self-bump) or the `versions-bump.yml` run (leia bump) |
 | A `versions.json` field is edited by hand and merged as an ordinary PR | `versions-mirror.yml` mirrors it to `displayxr-installer` within ~1 min of the merge | None needed. Before that workflow existed this silently blocked every bundle release (`assert-versions-in-sync`) until the next component bump |
+| First release of `leia_conversion` / `ultraleap`: the field is not in `versions.json` | The bump **adds** it (`ADDED` in the log) and mirrors it | Before that release, list the field in `displayxr-installer`'s `$IntentionallyUnbundled`; after it, drop the name from `FIRST_RELEASE_FIELDS` and `COMPONENTS_AWAITING_FIRST_RELEASE` |
+| Any other field that is not in `versions.json` is dispatched | Run fails: `versions.json has no field '<field>'` | Add the field in a PR (with its `components.sh` rows), or fix the sender's payload |
+| ABI mismatch on a `leia_conversion` / `ultraleap` bump | Run fails red; no bump, no issue | Rebuild the provider against the current runtime headers, tag a new release |
 | Sibling repo forgets the dispatch step | `versions.json` doesn't update | Manual `workflow_dispatch` on `versions-bump.yml` with the field + tag, then fix the sibling repo's release workflow |
 | `displayxr-publish-bot` token expires | All bumps fail with auth error | Rotate the GitHub App's private key per `.secrets/NOTE.md` |
 | Bundle build fails downloading a component asset (`gh release download … exit 1`) | `components.sh` declares a platform glob the pinned release doesn't carry (see "Asset-table timing" above) | Cut a component release whose CI produces the asset (`/dxr-release <component> <ver>`); the auto-bump re-pins, the bundle finds it. Or, as a stopgap, blank the glob in `components.sh` to restore warn-and-skip. |

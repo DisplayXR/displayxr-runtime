@@ -26,6 +26,13 @@ Usage:
     check_plugin_abi.py --leia-tag v1.0.7
     check_plugin_abi.py --leia-tag v1.0.7 --runtime-tree .
     check_plugin_abi.py --leia-tag v1.0.7 --runtime-tag v2.70.0
+    check_plugin_abi.py --component leia_conversion --tag v0.1.0
+    check_plugin_abi.py --component ultraleap --tag v0.1.0
+
+`--component` runs the same check for a provider that ships from its own repo
+and is gated on another plug-in ABI (COMPONENT_GATES: the conversion ABI for
+the Leia conversion provider, the input ABI for the Ultraleap provider). It
+also prints `runtime_pin=vX.Y.Z`, the runtime tag that release was built at.
 
 Designed to be called from .github/workflows/versions-bump.yml and from
 build-windows.yml's runtime self-bump step. No external deps beyond
@@ -147,6 +154,15 @@ def tree_abis(tree_root: Path) -> dict[str, int | None]:
     return out
 
 
+# Providers gated by `--component`: versions.json field -> (repo, the ABI header
+# whose major the provider negotiates). Each pins the runtime it was built at
+# with the same `set(DXR_RUNTIME_GIT_TAG "vX.Y.Z"` literal as the Leia plug-in.
+COMPONENT_GATES: dict[str, tuple[str, str]] = {
+    "leia_conversion": ("DisplayXR/displayxr-leia-conversion", CONVERSION_PLUGIN_HEADER_PATH),
+    "ultraleap": ("DisplayXR/displayxr-ultraleap", INPUT_PLUGIN_HEADER_PATH),
+}
+
+
 def _extract_dxr_runtime_git_tag(leia_cmakelists: str) -> str:
     """
     The leia plug-in's CMakeLists.txt sets DXR_RUNTIME_GIT_TAG as a CACHE
@@ -180,8 +196,59 @@ def leia_runtime_pin(leia_tag: str) -> str:
     return _extract_dxr_runtime_git_tag(_fetch(url))
 
 
+def component_runtime_pin(repo: str, tag: str) -> str:
+    return _extract_dxr_runtime_git_tag(_fetch(f"{GITHUB_RAW}/{repo}/{tag}/CMakeLists.txt"))
+
+
+def abi_from_tree(tree_root: Path, header: str) -> int:
+    return _resolve_api_version_current(_read_local(tree_root / header), ABI_HEADERS[header])
+
+
+def abi_from_tag(runtime_tag: str, header: str) -> int:
+    url = f"{GITHUB_RAW}/{RUNTIME_REPO}/{runtime_tag}/{header}"
+    return _resolve_api_version_current(_fetch(url), ABI_HEADERS[header])
+
+
+def check_component(component: str, tag: str, runtime_tree: str, runtime_tag: str | None) -> int:
+    """The --leia-tag check for a COMPONENT_GATES provider. Same exit codes."""
+    repo, header = COMPONENT_GATES[component]
+    macro = ABI_HEADERS[header] + "_CURRENT"
+    try:
+        if runtime_tag:
+            runtime_abi = abi_from_tag(runtime_tag, header)
+            runtime_label = f"runtime {runtime_tag}"
+        else:
+            runtime_abi = abi_from_tree(Path(runtime_tree), header)
+            runtime_label = f"runtime tree @ {runtime_tree}"
+        pin = component_runtime_pin(repo, tag)
+        plugin_abi = abi_from_tag(pin, header)
+    except Exception as e:  # noqa: BLE001 - surface to caller as fatal
+        print(f"ABI check FAILED to run: {e}", file=sys.stderr)
+        return 2
+
+    print(f"{runtime_label}: {macro} = {runtime_abi}")
+    print(f"{component} {tag} ({repo}) built against runtime {pin}: {macro} = {plugin_abi}")
+    print(f"runtime_pin={pin}")
+    if runtime_abi != plugin_abi:
+        print(
+            f"\nMISMATCH: the runtime's {macro} is {runtime_abi}; {component} {tag} negotiates "
+            f"{plugin_abi} and would be rejected at load. Rebuild {repo} against the current "
+            f"runtime headers and tag a new release.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"\nOK: {macro} = {runtime_abi} on both sides.")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--component",
+        choices=sorted(COMPONENT_GATES),
+        help="check a provider from its own repo against its own plug-in ABI (needs --tag)",
+    )
+    p.add_argument("--tag", help="the provider release tag for --component (e.g. v0.1.0)")
     p.add_argument(
         "--leia-tag",
         help="leia plug-in tag to check (e.g. v1.0.7); required unless --print-tree-abis",
@@ -210,8 +277,12 @@ def main() -> int:
             print(f"ABI read FAILED: {e}", file=sys.stderr)
             return 2
         return 0
+    if args.component:
+        if not args.tag:
+            p.error("--component needs --tag")
+        return check_component(args.component, args.tag, args.runtime_tree, args.runtime_tag)
     if not args.leia_tag:
-        p.error("--leia-tag is required (or pass --print-tree-abis)")
+        p.error("--leia-tag is required (or pass --print-tree-abis / --component)")
 
     try:
         if args.runtime_tag:

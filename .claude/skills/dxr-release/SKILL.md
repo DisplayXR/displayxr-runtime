@@ -34,7 +34,7 @@ Spec: [`docs/specs/runtime/versions-json-autobump.md`](../../docs/specs/runtime/
 ```
 /dxr-release <component> <version-spec>
 
-  <component>     shell | leia-plugin (leia) | mcp | browser | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer) | avatar (demo-avatar) | earthview (demo-earthview) | unity
+  <component>     shell | leia-plugin (leia) | leia-conversion | ultraleap | mcp | browser | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer) | avatar (demo-avatar) | earthview (demo-earthview) | unity
   <version-spec>  vX.Y.Z  |  patch  |  minor  |  major        (browser too, from v1.0.0 — see "Browser is special")
 ```
 
@@ -59,6 +59,8 @@ from cwd — that's the old cwd-detecting behavior this skill replaced.
 | `shell` | `DisplayXR/displayxr-shell-pvt` | `shell` | `publish-shell-releases.yml` | `displayxr-shell-releases` |
 | `browser` | `DisplayXR/displayxr-browser-pvt` | `browser` | `publish-browser-releases.yml` | `displayxr-browser` (public, keeps its name) |
 | `leia-plugin` / `leia` | `DisplayXR/displayxr-leia-plugin` | `leia_plugin` | `build-windows.yml` | same repo |
+| `leia-conversion` | `DisplayXR/displayxr-leia-conversion` | `leia_conversion` | `release.yml` | same repo |
+| `ultraleap` | `DisplayXR/displayxr-ultraleap` | `ultraleap` | `release.yml` | same repo |
 | `mcp` | `DisplayXR/displayxr-mcp` | `mcp_tools` | `build.yml` | same repo |
 | `gauss` / `demo-gaussiansplat` | `DisplayXR/displayxr-demo-gaussiansplat` | `gauss_demo` | `build-windows.yml` | same repo |
 | `modelviewer` / `demo-modelviewer` | `DisplayXR/displayxr-demo-modelviewer` | `modelviewer_demo` | `build-windows.yml` | same repo |
@@ -66,6 +68,30 @@ from cwd — that's the old cwd-detecting behavior this skill replaced.
 | `avatar` / `demo-avatar` | `DisplayXR/displayxr-demo-avatar` | `avatar_demo` | `build-windows.yml` | same repo |
 | `earthview` / `demo-earthview` | `DisplayXR/displayxr-demo-earthview` | `earthview_demo` | `build-macos.yml` | same repo |
 | `unity` | `DisplayXR/displayxr-unity` | *(none — not pinned)* | `build-native.yml` | same repo |
+
+**`leia-conversion` and `ultraleap` have no release yet** (2026-11). Three things differ
+until each has one:
+- **`versions.json` has no field for them.** That is deliberate: a pin naming a tag that does
+  not exist breaks `setup-displayxr` and `displayxr-installer`'s coverage check. The first
+  release's `versions-bump` dispatch **adds** the field (`scripts/apply_versions_bump.py`,
+  `FIRST_RELEASE_FIELDS`), so Phase 4 reports `ADDED`, not `BUMPED`, and the commit subject
+  still reads `bump <field> → <tag>`. After that first release, remove the field from
+  `FIRST_RELEASE_FIELDS` and from `COMPONENTS_AWAITING_FIRST_RELEASE` (`components.sh` and
+  the `.bat`); `scripts/tests/test_component_tables.py` fails until all three agree.
+- **Before the first tag, `displayxr-installer` must already list the field** in
+  `$IntentionallyUnbundled` (`scripts/check_bundle_coverage.ps1`). Otherwise the mirrored
+  `versions.json` fails that repo's `build-bundle.yml` on the new key.
+- **The bump is ABI-gated, and a mismatch is a red run with no issue opened**: the
+  conversion ABI for `leia-conversion`, the input ABI for `ultraleap`
+  (`check_plugin_abi.py --component`). For `ultraleap` the run also warns when the
+  provider's runtime pin is not the runtime `versions.json` pins: that build installs only
+  on the runtime it was built at (ADR-063).
+
+`ultraleap` builds on a self-hosted runner that has the Ultraleap SDK, and its repo gates
+the dispatch on the repository variable `DXR_VERSIONS_BUMP=true`. Neither repo is known to
+the signing provider yet, so Phase 3.5 has nothing to dispatch for them (`INST=""`): an
+unsigned provider release is **not listed in the component catalog** (every listed asset
+is signed), so teach the signing provider the component before expecting it there.
 
 **Browser is special** — it is the second private→public split after the shell
 (source, patch series, build lanes and the Android keystore live in the PRIVATE
@@ -223,6 +249,8 @@ case "$COMPONENT" in
   shell)                         REPO=DisplayXR/displayxr-shell-pvt;          FIELD=shell;       WORKFLOW=publish-shell-releases.yml; REL_REPO=DisplayXR/displayxr-shell-releases ;;
   browser)                       REPO=DisplayXR/displayxr-browser-pvt;        FIELD=browser;     WORKFLOW=publish-browser-releases.yml; REL_REPO=DisplayXR/displayxr-browser ;;
   leia|leia-plugin)              REPO=DisplayXR/displayxr-leia-plugin;        FIELD=leia_plugin; WORKFLOW=build-windows.yml;           REL_REPO=DisplayXR/displayxr-leia-plugin ;;
+  leia-conversion)               REPO=DisplayXR/displayxr-leia-conversion;    FIELD=leia_conversion; WORKFLOW=release.yml;             REL_REPO=DisplayXR/displayxr-leia-conversion ;;
+  ultraleap)                     REPO=DisplayXR/displayxr-ultraleap;          FIELD=ultraleap;   WORKFLOW=release.yml;                 REL_REPO=DisplayXR/displayxr-ultraleap ;;
   mcp)                           REPO=DisplayXR/displayxr-mcp;                FIELD=mcp_tools;   WORKFLOW=build.yml;                   REL_REPO=DisplayXR/displayxr-mcp ;;
   gauss|demo-gaussiansplat)      REPO=DisplayXR/displayxr-demo-gaussiansplat; FIELD=gauss_demo; WORKFLOW=build-windows.yml;           REL_REPO=DisplayXR/displayxr-demo-gaussiansplat ;;
   modelviewer|demo-modelviewer)  REPO=DisplayXR/displayxr-demo-modelviewer;   FIELD=modelviewer_demo; WORKFLOW=build-windows.yml;      REL_REPO=DisplayXR/displayxr-demo-modelviewer ;;
@@ -232,7 +260,7 @@ case "$COMPONENT" in
   unity)                         REPO=DisplayXR/displayxr-unity;              FIELD="";               WORKFLOW=build-native.yml;      REL_REPO=DisplayXR/displayxr-unity ;;
   runtime)                       echo "Use /release (in-repo) for the runtime."; exit 1 ;;
   installer)                     echo "Use /installer-release for the bundle.";  exit 1 ;;
-  *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, mcp, browser, gauss, modelviewer, mediaplayer, avatar, earthview, unity."; exit 1 ;;
+  *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, leia-conversion, ultraleap, mcp, browser, gauss, modelviewer, mediaplayer, avatar, earthview, unity."; exit 1 ;;
 esac
 # FIELD="" (unity) → no versions.json entry; skip the Phase 4 versions-bump watch.
 # Tag shape is `vX.Y.Z` for EVERY component, browser included (browser-pvt#120 retired

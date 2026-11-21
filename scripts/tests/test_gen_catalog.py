@@ -87,6 +87,30 @@ def v1_fixture() -> dict:
     }
 
 
+def extra_fixture() -> dict:
+    """What build_extra_components returns: the schema-2-only components."""
+    return {
+        "conversion_open": {
+            "recommended": "0.1.1",
+            "windows": win("DisplayXROpenConversionSetup-0.1.1.exe", "0.1.1", SHA_C, ["/S"],
+                           "HKLM\\Software\\DisplayXR\\Plugins\\OpenConversion\\Version"),
+        },
+        "leia_conversion": {
+            "recommended": "0.1.0",
+            "requires": {"runtime": ">=2.41.0"},
+            "windows": win("DisplayXRLeiaConversionSetup-0.1.0.exe", "0.1.0", "d" * 64, ["/S"],
+                           "HKLM\\Software\\DisplayXR\\Plugins\\LeiaConversion\\Version"),
+        },
+        "ultraleap": {
+            "recommended": "0.1.0",
+            "runtime_exact": "2.69.3",
+            "requires": {"runtime": ">=2.69.3"},
+            "windows": win("DisplayXRUltraleapSetup-0.1.0.7.exe", "0.1.0", "e" * 64, ["/S"],
+                           "HKLM\\Software\\DisplayXR\\Plugins\\Ultraleap\\Version"),
+        },
+    }
+
+
 # sha256 of canonical_bytes(v1_fixture()) as written by the generator at
 # origin/main before the schema-2 change. A change to the schema-1 serialisation
 # (indent, key order, escaping, trailing newline) fails here: deployed dxr-get
@@ -114,13 +138,16 @@ class Schema1Untouched(unittest.TestCase):
 
     def run_generate(self, out: Path, out_v2: Path | None) -> None:
         saved = gen_catalog.build_catalog
+        saved_extra = gen_catalog.build_extra_components
         gen_catalog.build_catalog = lambda versions, verifier, download_dir, previous=None: v1_fixture()
+        gen_catalog.build_extra_components = lambda versions, verifier, download_dir: extra_fixture()
         try:
             rc = gen_catalog.cmd_generate(argparse.Namespace(
                 versions=str(REPO_ROOT / "versions.json"), download_dir=str(out / "dl"), previous=None,
                 verifier="none", out=str(out), no_sign=True, out_v2=str(out_v2) if out_v2 else None))
         finally:
             gen_catalog.build_catalog = saved
+            gen_catalog.build_extra_components = saved_extra
         self.assertEqual(rc, 0)
 
     def test_generate_writes_identical_schema1_with_and_without_v2(self):
@@ -205,6 +232,82 @@ class Schema2Content(unittest.TestCase):
 
     def test_generated_document_validates(self):
         self.assertEqual(gen_catalog.validate_v2(self.v2), [])
+
+
+class Schema2OnlyComponents(unittest.TestCase):
+    """The providers schema 1 cannot describe (V2_ONLY_COMPONENTS)."""
+
+    def setUp(self):
+        self.v2 = gen_catalog.build_catalog_v2(v1_fixture(), extra=extra_fixture())
+        self.items = {i["id"]: i for i in self.v2["items"]}
+
+    def test_they_follow_the_schema1_components_and_validate(self):
+        self.assertEqual([i["id"] for i in self.v2["items"]],
+                         ["runtime", "leia-sr", "browser", "open-conversion", "leia-conversion", "ultraleap"])
+        self.assertEqual(gen_catalog.validate_v2(self.v2), [])
+
+    def test_schema1_never_carries_them(self):
+        names = {c["name"] for c in gen_catalog.V2_ONLY_COMPONENTS}
+        self.assertFalse(names & {c["name"] for c in gen_catalog.COMPONENTS})
+        self.assertFalse(names & set(v1_fixture()["components"]))
+
+    def test_open_conversion_is_the_recommended_converter(self):
+        item = self.items["open-conversion"]
+        self.assertEqual((item["class"], item["registered_id"]), ("conversion_provider", "open-conversion"))
+        self.assertIs(item["recommended"], True)
+        self.assertEqual(item["aliases"], ["conversion_open"])
+        self.assertNotIn("requires", item)  # it declares no floor; none is invented
+        # Nothing else is recommended without a hardware match.
+        self.assertEqual([i["id"] for i in self.v2["items"] if i.get("recommended")], ["open-conversion"])
+
+    def test_leia_conversion_declares_neurd_and_installs_nothing_for_it(self):
+        item = self.items["leia-conversion"]
+        self.assertEqual(item["aliases"], ["leia_conversion"])
+        self.assertEqual(item["requires"][0], {"kind": "runtime", "version": ">=2.41.0"})
+        ext = item["requires"][1]
+        self.assertEqual((ext["kind"], ext["min_version"]), ("external", "0.4.6"))
+        self.assertNotIn("asset", ext)       # declared and detected only
+        self.assertNotIn("info_url", ext)    # not known, so not written
+        self.assertNotIn("runtime", item)    # a floor, not a range
+
+    def test_ultraleap_is_pinned_to_one_runtime(self):
+        item = self.items["ultraleap"]
+        self.assertEqual((item["class"], item["registered_id"]), ("input_provider", "ultraleap"))
+        self.assertEqual(item["runtime"], {"min": "2.69.3", "max": "2.69.3"})
+        self.assertEqual(item["requires"][0], {"kind": "runtime", "version": ">=2.69.3"})
+        self.assertEqual(item["requires"][1]["kind"], "external")
+        self.assertEqual(item["assets"]["windows-x64"]["file"], "DisplayXRUltraleapSetup-0.1.0.7.exe")
+
+    def test_metadata_is_not_aliased_into_the_document(self):
+        self.items["leia-conversion"]["requires"][1]["detect"][0]["min"] = "9.9.9"
+        again = gen_catalog.build_catalog_v2(v1_fixture(), extra=extra_fixture())
+        self.assertEqual(again["items"][4]["requires"][1]["detect"][0]["min"], "0.4.6")
+
+    def test_runtime_range_rules(self):
+        bad = gen_catalog.build_catalog_v2(v1_fixture(), extra=extra_fixture())
+        bad["items"][5]["runtime"] = {"min": "2.70.0", "max": "2.69.3"}
+        problems = gen_catalog.validate_v2(bad)
+        self.assertTrue(any("above runtime.max" in p for p in problems), problems)
+        self.assertTrue(any("disagrees with requires" in p for p in problems), problems)
+
+    def test_asset_with_a_build_number_picks_the_highest_build(self):
+        comp = next(c for c in gen_catalog.V2_ONLY_COMPONENTS if c["name"] == "ultraleap")
+        assets = [{"name": n} for n in ("DisplayXRUltraleapSetup-0.1.0.3.exe", "DisplayXRUltraleapSetup-0.1.0.12.exe",
+                                         "DisplayXRUltraleapSetup-0.1.00.99.exe", "DisplayXRUltraleapSetup-0.1.0.exe",
+                                         "displayxr-ultraleap-0.1.0-linux-x86_64.tar.gz")]
+        self.assertEqual(gen_catalog.pick_asset(comp, "0.1.0", assets)["name"], "DisplayXRUltraleapSetup-0.1.0.12.exe")
+        self.assertIsNone(gen_catalog.pick_asset(comp, "0.2.0", assets))
+        runtime = gen_catalog.COMPONENTS[0]
+        self.assertEqual(gen_catalog.pick_asset(runtime, "2.69.2", [{"name": "DisplayXRSetup-2.69.2.exe"}])["name"],
+                         "DisplayXRSetup-2.69.2.exe")
+
+    def test_unpinned_component_is_not_listed_and_does_not_touch_the_network(self):
+        saved = gen_catalog.api_json
+        gen_catalog.api_json = lambda path: self.fail("network access for an unpinned component: " + path)
+        try:
+            self.assertEqual(gen_catalog.build_extra_components({"runtime": "v2.69.2"}, lambda p: None, "."), {})
+        finally:
+            gen_catalog.api_json = saved
 
 
 class Schema2Validation(unittest.TestCase):
