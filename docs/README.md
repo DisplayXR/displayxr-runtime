@@ -189,6 +189,7 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 ### Shipped
 
 - [3D Capture](roadmap/3d-capture.md) — capture pipeline (shipped in Shell Phase 8)
+- [Catalog-driven installers](roadmap/catalog-driven-bundle.md) — the runtime installer's catalog component page (`/COMPONENTS=`), and the plan for the bundle and the POSIX packages (ADR-064 §8)
 - [Workspace/Runtime Contract](roadmap/workspace-runtime-contract.md) — IPC between a workspace controller and the runtime
 - **MCP** — framework extracted to [`DisplayXR/displayxr-mcp`](https://github.com/DisplayXR/displayxr-mcp). See the [MCP spec](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md) for the protocol; Phase A (handle-app introspection) and Phase B (workspace tools, hosted in `displayxr-shell-pvt`) both shipped.
 - [Desktop Overlay Apps — Forward Work](roadmap/avatar-overlay-native.md) — follow-on work after the transparent HWND path shipped (#191)
