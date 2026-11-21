@@ -562,6 +562,15 @@ public sealed class ComponentsPage : Page
             U.AddFlow(row, mw, 10, 6);
         }
 
+        // ADR-064 step 8: the same component as the Catalog lists it (version, update, licence, uninstall).
+        if (!r.BuiltIn)
+        {
+            var catalog = U.Button("View in Catalog", () => Ctx.OpenInCatalog(cls, r.Id, r.Name), "link");
+            Avalonia.Automation.AutomationProperties.SetName(catalog, $"View {r.Name} in the Catalog");
+            ToolTip.SetTip(catalog, "Its version, updates, licence and uninstall are in the Catalog.");
+            U.AddFlow(row, catalog, 10, 6);
+        }
+
         // (d) what a change means, and how an administrator does it machine-wide.
         var col = U.VStack(6, row);
         if (r.BuiltIn)

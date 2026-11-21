@@ -21,12 +21,250 @@ public sealed class DashboardContext
     public static readonly TimeSpan ActionTimeout = TimeSpan.FromSeconds(30);
     public static readonly TimeSpan SelftestTimeout = TimeSpan.FromSeconds(90);
 
-    public DashboardContext(StatusFeed feed, CliProcessSource cli, IProcessSource? runner = null)
+    public DashboardContext(StatusFeed feed, CliProcessSource cli, IProcessSource? runner = null, ICatalogEngine? engine = null)
     {
         Feed = feed;
         CliInfo = cli;
         Cli = runner ?? cli;
         HotkeySuspend = new HotkeySuspend(Cli);
+        Catalog = new CatalogService(engine ?? new DxrGetEngine(cli.CliPath), Cli);
+    }
+
+    // ── Catalog (ADR-064 step 8) ────────────────────────────────────────────
+
+    /// <summary>The install engine and the licence verbs, behind one class (Feed/CatalogService.cs).</summary>
+    public CatalogService Catalog { get; }
+
+    /// <summary>The last read of the catalog: the list, or why there is none.</summary>
+    public CatalogRead? CatalogRead { get; private set; }
+    public bool CatalogLoading { get; private set; }
+    private DateTime? _catalogWhen;
+    private bool _catalogReloadPending;
+
+    /// <summary>The install / update / uninstall in flight (one at a time), and how the last one ended.</summary>
+    public CatalogOperation? CatalogOp { get; private set; }
+    public (string ItemId, CatalogOutcome Outcome)? CatalogResult { get; private set; }
+
+    /// <summary>The key activation in flight, and how the last one ended. Neither ever holds the key.</summary>
+    public string? ActivatingItem { get; private set; }
+    public (string ItemId, ActivationOutcome Outcome)? ActivationResult { get; private set; }
+
+    /// <summary>An item (or a Components row) another page asked the Catalog to open; the Catalog page consumes it.</summary>
+    public CatalogFocus? CatalogFocus { get; set; }
+
+    /// <summary>Open the Catalog on the item behind a Components row.</summary>
+    public void OpenInCatalog(ComponentClass cls, string componentId, string name)
+    {
+        CatalogFocus = new CatalogFocus(null, cls, componentId, name);
+        Navigate("catalog");
+    }
+
+    /// <summary>
+    /// <c>list --json</c> through the engine: on Catalog show when older than 5 min, on Refresh and
+    /// after an operation (<paramref name="force"/>). It reaches the network (bounded by the engine),
+    /// so it is never polled, and never runs on the UI thread.
+    /// </summary>
+    public async Task LoadCatalogAsync(bool force = false)
+    {
+        if (CatalogLoading) { if (force) _catalogReloadPending = true; return; }
+        if (!force && CatalogRead is not null && _catalogWhen is { } t && DateTime.Now - t < TimeSpan.FromMinutes(5)) return;
+        CatalogLoading = true;
+        Bump();
+        try { CatalogRead = await Task.Run(() => Catalog.ListAsync()); }
+        catch (Exception ex)
+        {
+            CatalogRead = Model.CatalogRead.From(-1, "", false, false, ex.Message);
+            DashboardLog.Error("catalog list", ex);
+        }
+        finally
+        {
+            CatalogLoading = false;
+            _catalogWhen = DateTime.Now;
+        }
+        DashboardLog.Info($"catalog: {CatalogRead.Status}, {CatalogRead.List?.Items.Count ?? 0} item(s)");
+        Bump();
+        if (_catalogReloadPending)
+        {
+            _catalogReloadPending = false;
+            await LoadCatalogAsync(force: true);
+        }
+    }
+
+    /// <summary>
+    /// Install, update or uninstall one item: bounded, cancellable (the wait, see
+    /// <see cref="ICatalogEngine.RunElevatedAsync"/>), and always ending in an outcome the page
+    /// shows. Then the catalog, and the item's class rows, are re-read.
+    /// </summary>
+    public async Task RunCatalogAsync(CatalogVerb verb, CatalogItem item)
+    {
+        if (CatalogOp is not null) return;
+        var op = new CatalogOperation(item.Id, item.Name, verb, DateTime.Now);
+        CatalogOp = op;
+        CatalogResult = null;
+        Bump();
+        CatalogOutcome outcome;
+        try
+        {
+            DashboardLog.Info($"catalog: {verb} {item.Id}");
+            void Phase(string p) => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            {
+                if (!ReferenceEquals(CatalogOp, op)) return;
+                op.Phase = p;
+                Bump();
+            });
+            outcome = await Task.Run(() => Catalog.RunAsync(verb, item, Phase, op.StopWaiting.Token));
+        }
+        catch (Exception ex)
+        {
+            outcome = CatalogExit.StartFailed(ex.Message);
+            DashboardLog.Error("catalog operation", ex);
+        }
+        DashboardLog.Info($"catalog: {verb} {item.Id} -> {(outcome.Ok ? "ok" : "not done")} (exit {outcome.ExitCode?.ToString() ?? "-"}): {outcome.Title}");
+        CatalogOp = null;
+        CatalogResult = (item.Id, outcome);
+        op.StopWaiting.Dispose();
+        Bump();
+        await LoadCatalogAsync(force: true);
+        if (outcome.Changed && item.PolicyClass is { } cls) await LoadPolicyAsync(cls, force: true);
+    }
+
+    /// <summary>Stop waiting for the operation in flight. The engine, once elevated, finishes on its own.</summary>
+    public void StopWaitingForCatalog()
+    {
+        try { CatalogOp?.StopWaiting.Cancel(); }
+        catch (ObjectDisposedException) { }
+    }
+
+    public void DismissCatalogResult()
+    {
+        CatalogResult = null;
+        ActivationResult = null;
+        Bump();
+    }
+
+    /// <summary>Deliver a pasted key to an installed component, then re-read its licence. The key is not kept.</summary>
+    public async Task ActivateAsync(CatalogItem item, ComponentClass cls, string key)
+    {
+        if (ActivatingItem is not null) return;
+        ActivatingItem = item.Id;
+        ActivationResult = null;
+        Bump();
+        ActivationOutcome outcome;
+        try { outcome = await Task.Run(() => Catalog.ActivateAsync(cls, item.ComponentId, item.Name, key)); }
+        catch (Exception ex)
+        {
+            outcome = new ActivationOutcome(false, "The key could not be delivered", "Try again.");
+            DashboardLog.Warn($"activate: {ex.GetType().Name}");
+        }
+        DashboardLog.Info($"catalog: activate {item.Id} -> {(outcome.Accepted ? "accepted" : "not accepted")}");
+        ActivatingItem = null;
+        ActivationResult = (item.Id, outcome);
+        Bump();
+        await LoadPolicyAsync(cls, force: true);
+    }
+
+    /// <summary>How the last press of Buy went (what was opened, or why nothing was), and the Buy still being finished.</summary>
+    public (string ItemId, BuyPlan Plan)? BuyNote { get; private set; }
+    public BuyPending? BuyPending { get; private set; }
+    public string? BuyStarting { get; private set; }
+    private readonly HashSet<string> _noBuy = new();
+
+    /// <summary><c>activate-begin</c> said this item has no acceptable purchase page: no Buy button for it.</summary>
+    public bool NoBuy(string itemId) => _noBuy.Contains(itemId);
+
+    /// <summary>How often the licence is re-read while a Buy is pending (each read loads the class's components).</summary>
+    public TimeSpan BuyPollInterval { get; set; } = TimeSpan.FromSeconds(15);
+
+    private static string LicenceKey(PolicyRow? r) => r is null ? "" : $"{r.Licence}|{r.LicenceSource}|{r.LicenceExpires}";
+
+    /// <summary>
+    /// Buy (activation-deep-link.md §3): start the activation through the CLI, open what it says to
+    /// open in the default browser, and, while the purchase may still be coming back through
+    /// <c>displayxr://activate</c>, keep the item's licence fresh: on window focus and on a bounded
+    /// poll that ends with the pending activation (15 minutes) or as soon as the licence changes.
+    /// </summary>
+    public async Task BuyAsync(CatalogItem item, ComponentClass cls, Uri? purchase, bool? deepLink)
+    {
+        if (BuyStarting is not null) return;
+        BuyStarting = item.Id;
+        BuyNote = null;
+        Bump();
+        BuyPlan plan;
+        try { plan = await Task.Run(() => Catalog.BeginBuyAsync(cls, item.ComponentId, item.Name, purchase, deepLink)); }
+        catch (Exception ex)
+        {
+            plan = BuyPlan.Fallback(item.Name, purchase);
+            DashboardLog.Warn($"buy: {ex.GetType().Name}");
+        }
+        BuyStarting = null;
+        if (plan.Kind == BuyKind.NoPurchasePage) _noBuy.Add(item.Id);
+        if (plan.Opens && !OpenUrl(plan.Url!.AbsoluteUri))
+            plan = plan with { Kind = BuyKind.NotNow, Title = "The browser didn't open", Text = "Try again. You can still paste a key." };
+        BuyNote = (item.Id, plan);
+        if (plan.Opens)
+        {
+            _policies.TryGetValue(cls, out var pl);
+            // A purchase page without a return link still gets the focus refresh, for 15 minutes.
+            var until = plan.Expires ?? DateTimeOffset.UtcNow.AddMinutes(15);
+            var pending = new BuyPending(item.Id, item.Name, cls, item.ComponentId, plan, LicenceKey(pl?.Row(item.ComponentId)), until);
+            BuyPending = pending;
+            if (plan.Kind == BuyKind.OpenWithReturn) _ = PollBuyAsync(pending);
+        }
+        Bump();
+    }
+
+    /// <summary>Opens an https URL in the browser; replaceable in tests.</summary>
+    public Func<string, bool> OpenUrl { get; set; } = UrlLauncher.Open;
+
+    private async Task PollBuyAsync(BuyPending pending)
+    {
+        try
+        {
+            while (ReferenceEquals(BuyPending, pending) && DateTimeOffset.UtcNow < pending.Until)
+            {
+                await Task.Delay(BuyPollInterval);
+                if (!ReferenceEquals(BuyPending, pending)) return;
+                await RefreshPendingBuyAsync();
+            }
+        }
+        catch (Exception ex) { DashboardLog.Warn($"buy poll: {ex.GetType().Name}"); }
+        if (ReferenceEquals(BuyPending, pending))
+        {
+            BuyPending = null; // the pending activation has ended: stop looking
+            Bump();
+        }
+    }
+
+    /// <summary>
+    /// Re-read the licence of the item a Buy is pending for (the window came back to the front, or the
+    /// poll ticked). When it changed, the Buy is over; when it is now licensed, say so.
+    /// </summary>
+    public async Task RefreshPendingBuyAsync()
+    {
+        if (BuyPending is not { } pending) return;
+        if (DateTimeOffset.UtcNow >= pending.Until)
+        {
+            BuyPending = null;
+            Bump();
+            return;
+        }
+        await LoadPolicyAsync(pending.Class, force: true);
+        if (!ReferenceEquals(BuyPending, pending)) return;
+        _policies.TryGetValue(pending.Class, out var pl);
+        var row = pl?.Row(pending.ComponentId);
+        if (row is null || LicenceKey(row) == pending.LicenceWas) return;
+        BuyPending = null;
+        BuyNote = null;
+        if (row.Licence == "licensed")
+            ActivationResult = (pending.ItemId, new ActivationOutcome(true, $"{pending.Name} is activated", "Thank you. It is ready to use."));
+        DashboardLog.Info($"catalog: licence of {pending.ItemId} is now '{row.Licence}'");
+        Bump();
+    }
+
+    public void DismissBuyNote()
+    {
+        BuyNote = null;
+        Bump();
     }
 
     /// <summary>Suspends the service's workspace hotkey while the capture box has focus.</summary>

@@ -1,0 +1,66 @@
+{
+ "schema": 1,
+ "items": [
+  {
+   "id": "runtime",
+   "name": "DisplayXR runtime",
+   "class": "runtime",
+   "publisher": "",
+   "tier": "listed",
+   "installed": "2.64.0",
+   "available": "2.70.0",
+   "state": "outdated",
+   "installable": true,
+   "receipt": false,
+   "aliases": [],
+   "recommended": false,
+   "detected": "none",
+   "size": 50034808,
+   "download": 50034808,
+   "compatible": true,
+   "prerequisites": []
+  },
+  {
+   "id": "leia-sr",
+   "name": "Leia display plug-in",
+   "class": "display_processor",
+   "registered_id": "leia-sr",
+   "publisher": "",
+   "tier": "listed",
+   "installed": null,
+   "available": "2.23.0",
+   "state": "not_installed",
+   "installable": true,
+   "receipt": false,
+   "aliases": [
+    "leia_plugin"
+   ],
+   "recommended": false,
+   "detected": "high",
+   "evidence": "display EDID 44048/16711 DELL_8K32 (high confidence)",
+   "size": 31457280,
+   "download": 31457280,
+   "compatible": true,
+   "prerequisites": []
+  },
+  {
+   "id": "browser",
+   "name": "DisplayXR Browser",
+   "class": "app",
+   "publisher": "",
+   "tier": "listed",
+   "installed": "1.10.5",
+   "available": "1.10.5",
+   "state": "current",
+   "installable": true,
+   "receipt": false,
+   "aliases": [],
+   "recommended": false,
+   "detected": "none",
+   "size": 213909504,
+   "download": 0,
+   "compatible": true,
+   "prerequisites": []
+  }
+ ]
+}

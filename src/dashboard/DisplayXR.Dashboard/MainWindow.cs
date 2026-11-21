@@ -81,14 +81,16 @@ public sealed class MainWindow : Window
             catch (Exception ex) { DashboardLog.Error("fixture", ex); }
         }
         _feed = new StatusFeed(feedSource, new DispatcherScheduler());
-        _ctx = new DashboardContext(_feed, cli, feedSource)
+        // --fixture with a catalog-list.json beside it: the install engine is simulated too.
+        ICatalogEngine? engine = Program.Fixture is { } cfx ? FixtureCatalogEngine.Beside(cfx) : null;
+        _ctx = new DashboardContext(_feed, cli, feedSource, engine)
         {
             Navigate = Navigate,
             CopyText = CopyAsync,
             Toast = ShowToast,
         };
 
-        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new WindowsPage(), new ComponentsPage(), new PerformancePage(), new DeveloperPage() };
+        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new WindowsPage(), new ComponentsPage(), new CatalogPage(), new PerformancePage(), new DeveloperPage() };
         foreach (var p in _pages)
         {
             p.Bind(_ctx);
@@ -115,14 +117,55 @@ public sealed class MainWindow : Window
         Opened += (_, _) =>
         {
             FitToScreen();
+#if DEBUG
+            if (Program.CatalogItem is { } focus) _ctx.CatalogFocus = new CatalogFocus(focus, null, null, null);
+#endif
             Navigate(_pages.Any(p => p.Id == startPage) ? startPage : "home");
+#if DEBUG
+            DebugCapture();
+#endif
         };
         // Moving onto a monitor with another scale: Windows rescales the window by
         // the DPI ratio, which can push it past that monitor's working area (a
         // 250 % -> 300 % move does). Fit once the move has settled.
         ScalingChanged += (_, _) => DispatcherTimer.RunOnce(FitToScreen, TimeSpan.FromMilliseconds(250));
+        // A purchase finishes in the browser and the licence changes underneath us: look again on return.
+        Activated += (_, _) => { if (!_shutdown && _ctx.BuyPending is not null) _ = _ctx.RefreshPendingBuyAsync(); };
         Closing += (_, _) => ShutdownFeed();
     }
+
+#if DEBUG
+    /// <summary>Debug builds: <c>--catalog-do</c> and <c>--screenshot</c> (see Program).</summary>
+    private void DebugCapture()
+    {
+        if (Program.CatalogDo is { } verb && Program.CatalogItem is { } id)
+        {
+            void Go()
+            {
+                if (_ctx.CatalogRead?.List?.Find(id) is not { } item) return;
+                _ctx.Changed -= Go;
+                if (verb == "key") _ = _ctx.ActivateAsync(item, item.PolicyClass ?? ComponentClass.Conversion, "not-the-right-key");
+                else _ = _ctx.RunCatalogAsync(verb == "uninstall" ? CatalogVerb.Uninstall : item.HasUpdate ? CatalogVerb.Update : CatalogVerb.Install, item);
+            }
+            _ctx.Changed += Go;
+        }
+        if (Program.Screenshot is not { } file) return;
+        DispatcherTimer.RunOnce(() =>
+        {
+            try
+            {
+                double scale = RenderScaling;
+                var size = new PixelSize((int)Math.Round(Bounds.Width * scale), (int)Math.Round(Bounds.Height * scale));
+                using var bmp = new RenderTargetBitmap(size, new Vector(96 * scale, 96 * scale));
+                bmp.Render(this);
+                bmp.Save(file);
+                DashboardLog.Info($"screenshot: {file} ({size.Width}x{size.Height})");
+            }
+            catch (Exception ex) { DashboardLog.Error("screenshot", ex); }
+            Close();
+        }, TimeSpan.FromSeconds(Program.ScreenshotDelay));
+    }
+#endif
 
     // ── Shell ───────────────────────────────────────────────────────────────
 
@@ -371,6 +414,8 @@ public sealed class MainWindow : Window
         SetBadge("displays", StatusText.DisplaysBadge(s));
         SetBadge("windows", StatusText.WindowsBadge(s));
         SetBadge("performance", _ctx.PerfNonDefault ? new NavBadge(_ctx.Perf!.Levers.Count(l => l.IsSet), Level.Warn) : null);
+        int updates = _ctx.CatalogRead?.List?.Items.Count(i => i.HasUpdate && i.Action == CatalogAction.Update) ?? 0;
+        SetBadge("catalog", updates > 0 ? new NavBadge(updates, Level.Info) : null);
         SetBadge("home", _ctx.PreferredPlugin is not null ? new NavBadge(1, Level.Warn) : null);
 
         string rt = s?.Runtime.Version is { Length: > 0 } v ? $"Runtime {v}\n" : "";
@@ -403,6 +448,7 @@ public sealed class MainWindow : Window
             "displays" => $"{badge.Count} warning{(badge.Count == 1 ? "" : "s")} on the screens",
             "windows" => $"{badge.Count} client app{(badge.Count == 1 ? "" : "s")}",
             "performance" => "Non-default performance settings are in force",
+            "catalog" => $"{badge.Count} update{(badge.Count == 1 ? "" : "s")} available",
             _ => "A display-processor override is active",
         });
     }
@@ -422,6 +468,10 @@ public sealed class MainWindow : Window
             case "components":
                 _ = _ctx.LoadInfoAsync(force: true);
                 _ = _ctx.LoadWorkspaceAsync(force: true);
+                break;
+            case "catalog":
+                _ = _ctx.LoadCatalogAsync(force: true);
+                foreach (var c in ComponentClasses.All) _ = _ctx.LoadPolicyAsync(c, force: true);
                 break;
             case "performance":
                 _ = _ctx.LoadPerfAsync(force: true);

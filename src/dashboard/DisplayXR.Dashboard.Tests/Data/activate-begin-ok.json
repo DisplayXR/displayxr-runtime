@@ -1,0 +1,24 @@
+{
+ "class": "conv",
+ "id": "acme-depth",
+ "result": "ok",
+ "url": "https://store.example.com/depth-studio?displayxr_nonce=Zk3pQ9x-7Lr_T2vWb8YcA1dE5fG6hJ0KmNnOoPqRsUu&displayxr_item=conv%2Facme-depth&displayxr_return=displayxr%3A%2F%2Factivate",
+ "return_url": "displayxr://activate",
+ "nonce_id": "790fa3af",
+ "ttl_s": 900,
+ "expires_unix": 1795263506,
+ "expires": "2026-11-21T12:18:26Z",
+ "licence": {
+  "state": "trial",
+  "source": "trial",
+  "expires_unix": 1797811200,
+  "expires": "2026-12-21T00:00:00Z",
+  "message": "30-day trial, every feature unlocked",
+  "purchase_url": "https://store.example.com/depth-studio",
+  "activation": {
+   "key": true,
+   "deep_link": true
+  },
+  "blocks": false
+ }
+}

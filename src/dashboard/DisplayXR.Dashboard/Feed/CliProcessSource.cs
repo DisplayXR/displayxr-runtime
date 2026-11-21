@@ -90,7 +90,7 @@ public sealed class CliProcessSource : IProcessSource
     /// The start info for one run. Arguments go through <see cref="ProcessStartInfo.ArgumentList"/>
     /// (the runtime quotes each one for the platform), never a hand-built command line.
     /// </summary>
-    private ProcessStartInfo Info(CliArgs args, bool stdin)
+    internal ProcessStartInfo Info(CliArgs args, bool stdin)
     {
         var psi = NewInfo(stdin);
         foreach (var a in args.Args) psi.ArgumentList.Add(a);
