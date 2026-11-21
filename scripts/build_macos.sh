@@ -530,6 +530,16 @@ if [ -d "$CAPTURE_APP" ]; then
   echo "Staged DisplayXRDesktopCapture.app into _package bin/"
 fi
 
+# ADR-064 §5: the displayxr:// URL-scheme handler bundle (a URL scheme needs an
+# app bundle on macOS). A shim over the displayxr-cli beside it: system
+# frameworks only, no rpath fixup. The .pkg postinstall registers it.
+ACTIVATE_APP="$BUILD_DIR/src/xrt/targets/activate/DisplayXRActivate.app"
+if [ -d "$ACTIVATE_APP" ]; then
+  rm -rf "$PKG_DIR/bin/DisplayXRActivate.app"
+  cp -R "$ACTIVATE_APP" "$PKG_DIR/bin/"
+  echo "Staged DisplayXRActivate.app into _package bin/"
+fi
+
 # Create MoltenVK ICD manifest
 cat > "$PKG_DIR/share/vulkan/icd.d/MoltenVK_icd.json" <<EOF
 {
