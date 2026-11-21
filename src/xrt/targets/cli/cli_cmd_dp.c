@@ -501,6 +501,7 @@ cmd_options_verbs(int argc, const char **argv)
 	    .note_pickup = note_settings_pickup,
 	    .posix_machine_hint = "the manifest's \"settings\" object (NNN-<id>.json in the DisplayProcessors dir)",
 	    .activate = dp_activate,
+	    .license = target_plugin_license_state,
 	};
 	return cli_component_options_dispatch(&k, argc, argv);
 }

@@ -97,6 +97,11 @@ cli_print_help(int argc, const char **argv)
 	P("                      log: 'desktop status [--json]', 'desktop stop|resume' (kill switch),\n");
 	P("                      'desktop allow|deny|forget <exe>', 'desktop audit [--tail N] [--json]'.\n");
 #endif
+#ifdef CLI_HAVE_ACTIVATION
+	P("  activate-url [--json] [--notify] <link>\n");
+	P("                    - Handle one displayxr://activate deep link (ADR-064): consume its pending\n");
+	P("                      nonce ('<class> activate-begin <id>') and hand the token to that component.\n");
+#endif
 	P("  test              - List found devices and role assignments, for prober testing.\n");
 	P("  probe             - Just probe and then exit.\n");
 
@@ -177,6 +182,11 @@ main(int argc, const char **argv)
 #ifdef CLI_HAVE_DESKTOP
 	if (strcmp(argv[1], "desktop") == 0) {
 		return cli_cmd_desktop(argc, argv);
+	}
+#endif
+#ifdef CLI_HAVE_ACTIVATION
+	if (strcmp(argv[1], "activate-url") == 0) {
+		return cli_cmd_activate_url(argc, argv);
 	}
 #endif
 	return cli_print_help(argc, argv);
