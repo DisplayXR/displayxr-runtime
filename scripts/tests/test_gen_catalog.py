@@ -222,8 +222,25 @@ class Schema2Content(unittest.TestCase):
         for item in self.v2["items"]:
             for key in ("abi", "tier", "license", "conformance", "provenance"):
                 self.assertNotIn(key, item)
-            for asset in item.get("assets", {}).values():
-                self.assertNotIn("uninstall", asset)
+
+    def test_uninstall_rules(self):
+        # The engine copies this command into the install receipt. Known for the
+        # Leia plug-in and the browser (their Add/Remove Programs keys); never
+        # emitted for the runtime, and never without an asset to install.
+        arp = "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
+        self.assertNotIn("uninstall", self.items["runtime"]["assets"]["windows-x64"])
+        self.assertEqual(self.items["leia-sr"]["assets"]["windows-x64"]["uninstall"],
+                         {"kind": "registry_command", "path": arp + "DisplayXRLeiaSR\\UninstallString", "args": ["/S"]})
+        self.assertNotIn("assets", self.items["browser"])  # unlistable in the fixture: no rule without an asset
+        v1 = v1_fixture()
+        v1["components"]["browser"]["windows"] = win("DisplayXR-Browser-Setup-1.10.5.exe", "1.10.5", SHA_C, ["/S"],
+                                                     "HKLM\\Software\\DisplayXR\\Browser\\Version")
+        v2 = gen_catalog.build_catalog_v2(v1)
+        self.assertEqual(v2["items"][2]["assets"]["windows-x64"]["uninstall"],
+                         {"kind": "registry_command", "path": arp + "DisplayXR Browser\\UninstallString", "args": ["/S"]})
+        self.assertEqual(gen_catalog.validate_v2(v2), [])
+        # The schema-1 document knows nothing of it.
+        self.assertNotIn(b"ninstall", gen_catalog.canonical_bytes(v1))
 
     def test_unknown_component_is_not_listed(self):
         self.v1["components"]["mystery"] = {"recommended": "1.0.0"}
@@ -290,6 +307,25 @@ class Schema2OnlyComponents(unittest.TestCase):
         self.assertTrue(any("above runtime.max" in p for p in problems), problems)
         self.assertTrue(any("disagrees with requires" in p for p in problems), problems)
 
+    def test_extra_is_keyword_only(self):
+        # The second positional slot is `manifests` (#2740).
+        with self.assertRaises(TypeError):
+            gen_catalog.build_catalog_v2(v1_fixture(), None, extra_fixture())
+        self.assertEqual(len(gen_catalog.build_catalog_v2(v1_fixture())["items"]), 3)
+
+    def test_prerequisite_detect_rules_pass_the_rule_validator(self):
+        # Every rule this table writes must survive validate_rule unchanged, and
+        # none claims a confidence (that is for hardware evidence).
+        n = 0
+        for meta in gen_catalog.V2_ITEMS.values():
+            for ext in meta.get("external", []):
+                for rule in ext["detect"]:
+                    clean, problems = gen_catalog.validate_rule(rule)
+                    self.assertEqual((clean, problems), (rule, []), rule)
+                    self.assertNotIn("confidence", rule)
+                    n += 1
+        self.assertEqual(n, 2)
+
     def test_asset_with_a_build_number_picks_the_highest_build(self):
         comp = next(c for c in gen_catalog.V2_ONLY_COMPONENTS if c["name"] == "ultraleap")
         assets = [{"name": n} for n in ("DisplayXRUltraleapSetup-0.1.0.3.exe", "DisplayXRUltraleapSetup-0.1.0.12.exe",
@@ -308,14 +344,14 @@ class Schema2OnlyComponents(unittest.TestCase):
         extra = extra_fixture()
         del extra["leia_conversion"]["windows"]
         del extra["ultraleap"]["windows"]
-        v2 = gen_catalog.build_catalog_v2(v1_fixture(), extra)
+        v2 = gen_catalog.build_catalog_v2(v1_fixture(), extra=extra)
         items = {i["id"]: i for i in v2["items"]}
         self.assertNotIn("assets", items["leia-conversion"])
         self.assertNotIn("assets", items["ultraleap"])
         self.assertEqual(items["leia-conversion"]["aliases"], ["leia_conversion"])  # `dxr-get install leia_conversion`
         self.assertEqual(gen_catalog.validate_v2(v2), [])
         # And the validator refuses an installable asset that lost its signature.
-        signed = gen_catalog.build_catalog_v2(v1_fixture(), extra_fixture())
+        signed = gen_catalog.build_catalog_v2(v1_fixture(), extra=extra_fixture())
         del signed["items"][4]["assets"]["windows-x64"]["signature"]
         self.assertTrue(any("needs a signature" in p for p in gen_catalog.validate_v2(signed)))
 

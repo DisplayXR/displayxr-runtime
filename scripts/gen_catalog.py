@@ -799,6 +799,9 @@ V2_PUBLISHER = "displayxr"
 V2_PLATFORM_WINDOWS = "windows-x64"
 
 # Facts about the first-party components that schema 1 carries only implicitly.
+# `uninstall` is deliberately absent for the runtime: dxr-get never removes the
+# trunk. The three schema-2-only providers get theirs once their installers'
+# key names have been read from a release.
 # Keyed by the schema-1 component name (the versions.json field).
 V2_ITEMS = {
     "runtime": {
@@ -811,11 +814,23 @@ V2_ITEMS = {
         "class": "display_processor",
         "registered_id": "leia-sr",
         "name": "Leia SR display processor",
+        # Where the plug-in's own installer leaves its uninstall command (its
+        # Add/Remove Programs key, installer/DisplayXRLeiaSRInstaller.nsi).
+        "uninstall": {
+            "path": "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DisplayXRLeiaSR\\UninstallString",
+            "args": ["/S"],
+        },
     },
     "browser": {
         "id": "browser",
         "class": "app",
         "name": "DisplayXR Browser",
+        # The browser installer's Add/Remove Programs key (browser-pvt
+        # installer/DisplayXRBrowserInstaller.nsi, `!define ARP`).
+        "uninstall": {
+            "path": "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DisplayXR Browser\\UninstallString",
+            "args": ["/S"],
+        },
     },
     # --- schema 2 only (V2_ONLY_COMPONENTS) ---
     "conversion_open": {
@@ -915,7 +930,10 @@ def build_catalog_v2(v1, *, manifests=None, extra=None):
 
     `manifests` (component name -> validated displayxr-detect.json, as build_catalog
     collected them) names a display plug-in that V2_ITEMS does not know: its `id`
-    becomes the item id and registered_id, its `label` the item name (#2737)."""
+    becomes the item id and registered_id, its `label` the item name (#2737).
+
+    Both are keyword-only: a caller with one argument (make_test_catalog.py) gets
+    the three schema-1 components and nothing else."""
     items = []
     for name, comp in list(v1.get("components", {}).items()) + list((extra or {}).items()):
         meta = V2_ITEMS.get(name)
@@ -1132,6 +1150,7 @@ def cmd_generate(args):
     if args.out_v2:
         if os.path.abspath(args.out_v2) == os.path.abspath(args.out):
             sys.exit("error: --out-v2 must be a different directory from --out")
+        extra = build_extra_components(versions, VERIFIERS[args.verifier], download_dir)
         extra = build_extra_components(versions, VERIFIERS[args.verifier], download_dir)
         catalog2 = build_catalog_v2(catalog, manifests=MANIFESTS, extra=extra)
         problems = validate_v2(catalog2)
