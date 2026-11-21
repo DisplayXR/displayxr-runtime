@@ -6,6 +6,11 @@
  *         steps 2 and 3). No operating-system calls: see get_core.h.
  */
 
+// Also built into tests/tests_get_catalog, which does not set this on the command line.
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
 #include "get_core.h"
 
 #include <stdlib.h>
