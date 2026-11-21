@@ -2,21 +2,30 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  dxr-get: plan / fetch / install DisplayXR components from the
- *         signed component catalog. Epic #2702; P1 #2704, P2 #2705.
+ * @brief  dxr-get: plan / fetch / install / uninstall DisplayXR components
+ *         from the signed component catalog. Epic #2702 (P1 #2704, P2 #2705);
+ *         ADR-064 steps 2 and 3 (schema 2, receipts, uninstall, inventory).
+ *
+ * This file is the Windows half: the network, the registry, Authenticode and
+ * the installers. What to do is decided in get_core.c, which has no OS calls
+ * and is unit-tested (tests/tests_get_catalog.cpp).
  *
  * Rules that matter more than the code (docs/specs/runtime/dxr-get.md):
  * - Fail closed: a payload installs only if its size, SHA-256 and
- *   Authenticode signer all match the signed catalog, and the signer is in
- *   the compiled-in list too.
+ *   Authenticode signer all match the signed catalog, and the signer is one
+ *   the catalog delegates to the item's own publisher.
+ * - Every installable binary is signed. There is no hash-pinned-only form.
  * - A stale or unreachable catalog is "offline", never an authority: it can
  *   only ever cause dxr-get to do nothing.
  * - Never downgrade, never touch ActiveRuntime, never write Trust\Allowlist.
- * - The display plug-in installs only on positive evidence (a high-confidence
+ * - A hardware item installs only on positive evidence (a high-confidence
  *   catalog detect rule matching this machine).
+ * - No unbounded wait: every network call has a timeout and a retry limit,
+ *   and a child installer is waited for a bounded time.
  */
 
 #include "get.h"
+#include "get_core.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -32,12 +41,18 @@
 #include <string.h>
 #include <time.h>
 
-#include "cjson/cJSON.h"
-
-#define DEFAULT_CATALOG "https://updates.displayxr.org/catalog/v1/stable.json"
+#define CATALOG_V2 "https://updates.displayxr.org/catalog/v2/stable.json"
+#define CATALOG_V1 "https://updates.displayxr.org/catalog/v1/stable.json"
 #define SERIAL_KEY "SOFTWARE\\DisplayXR\\Update"
+#define RECEIPT_KEY "SOFTWARE\\DisplayXR\\Catalog"
+#define MAX_RECEIPTS 128
 
-static const char *const k_trusted_signers[] = {"Leia, Inc."};
+//! How long a child installer or uninstaller is waited for. One that is still
+//! running after this is reported as failed; it is not killed.
+#define CHILD_WAIT_MS (60u * 60u * 1000u)
+//! How long an uninstaller that returned at once (NSIS re-executes itself from
+//! %TEMP%) is given to actually remove the component.
+#define UNINSTALL_SETTLE_MS (120u * 1000u)
 
 void
 dxr_log(const char *fmt, ...)
@@ -56,67 +71,258 @@ env_on(const char *name)
 	return v != NULL && strcmp(v, "1") == 0;
 }
 
-/*
- * Versions: dotted numeric, up to 4 parts; anything after '-' or '+' ignored.
- */
-static int
-vercmp(const char *a, const char *b)
-{
-	for (int i = 0; i < 4; i++) {
-		unsigned long x = 0, y = 0;
-		if (a && *a >= '0' && *a <= '9') {
-			x = strtoul(a, (char **)&a, 10);
-		}
-		if (b && *b >= '0' && *b <= '9') {
-			y = strtoul(b, (char **)&b, 10);
-		}
-		if (x != y) {
-			return x < y ? -1 : 1;
-		}
-		if (a && *a == '.') {
-			a++;
-		}
-		if (b && *b == '.') {
-			b++;
-		}
-	}
-	return 0;
-}
-
-//! ">=2.62.0" -> "2.62.0"; other operators are not in schema 1.
-static const char *
-floor_of(const char *req)
-{
-	if (req == NULL) {
-		return NULL;
-	}
-	if (strncmp(req, ">=", 2) == 0) {
-		req += 2;
-	}
-	while (*req == ' ') {
-		req++;
-	}
-	return *req ? req : NULL;
-}
-
 static const char *
 jstr(const cJSON *o, const char *k)
 {
-	const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+	const cJSON *v = o ? cJSON_GetObjectItemCaseSensitive(o, k) : NULL;
 	return cJSON_IsString(v) ? v->valuestring : NULL;
 }
+
+static void
+print_json(cJSON *o)
+{
+	char *s = cJSON_PrintUnformatted(o);
+	printf("%s\n", s);
+	(void)fflush(stdout);
+	cJSON_free(s);
+	cJSON_Delete(o);
+}
+
+static bool
+is_admin(void)
+{
+	return IsUserAnAdmin() != FALSE;
+}
+
+/*
+ * Download cache.
+ */
+
+static bool
+downloads_dir(wchar_t *out, size_t cap, bool create)
+{
+	wchar_t *pd = NULL;
+	if (FAILED(SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, NULL, &pd))) {
+		return false;
+	}
+	(void)_snwprintf(out, cap, L"%ls\\DisplayXR\\Downloads", pd);
+	CoTaskMemFree(pd);
+	if (create) {
+		(void)SHCreateDirectoryExW(NULL, out, NULL);
+	}
+	return true;
+}
+
+static uint64_t
+size_of_file(const wchar_t *path)
+{
+	WIN32_FILE_ATTRIBUTE_DATA fa;
+	if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) {
+		return 0;
+	}
+	return ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+}
+
+/*
+ * Receipts: HKLM\Software\DisplayXR\Catalog\<id>, 64-bit view.
+ */
+
+static bool
+receipt_id_ok(const char *id)
+{
+	return id != NULL && id[0] != '\0' && strlen(id) < 96 && strpbrk(id, "\\/") == NULL;
+}
+
+static void
+reg_get(HKEY k, const char *name, char *out, size_t out_size)
+{
+	DWORD sz = (DWORD)out_size;
+	out[0] = '\0';
+	if (RegGetValueA(k, NULL, name, RRF_RT_REG_SZ, NULL, out, &sz) != ERROR_SUCCESS) {
+		out[0] = '\0';
+	}
+}
+
+static bool
+receipt_read(const char *id, struct dxr_receipt *r)
+{
+	memset(r, 0, sizeof(*r));
+	if (!receipt_id_ok(id)) {
+		return false;
+	}
+	char key[256];
+	(void)snprintf(key, sizeof(key), RECEIPT_KEY "\\%s", id);
+	HKEY k;
+	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, key, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &k) != ERROR_SUCCESS) {
+		return false;
+	}
+	(void)snprintf(r->id, sizeof(r->id), "%s", id);
+	reg_get(k, "Name", r->name, sizeof(r->name));
+	reg_get(k, "Class", r->item_class, sizeof(r->item_class));
+	reg_get(k, "Publisher", r->publisher, sizeof(r->publisher));
+	reg_get(k, "Version", r->version, sizeof(r->version));
+	reg_get(k, "SourceUrl", r->source_url, sizeof(r->source_url));
+	reg_get(k, "Sha256", r->sha256, sizeof(r->sha256));
+	reg_get(k, "File", r->file, sizeof(r->file));
+	reg_get(k, "InstallTime", r->install_time, sizeof(r->install_time));
+	reg_get(k, "UninstallCommand", r->uninstall, sizeof(r->uninstall));
+	reg_get(k, "VersionPath", r->version_path, sizeof(r->version_path));
+	reg_get(k, "Requires", r->requires_ids, sizeof(r->requires_ids));
+	RegCloseKey(k);
+	return r->version[0] != '\0';
+}
+
+static bool
+receipt_write(const struct dxr_receipt *r)
+{
+	if (!receipt_id_ok(r->id)) {
+		return false;
+	}
+	char key[256];
+	(void)snprintf(key, sizeof(key), RECEIPT_KEY "\\%s", r->id);
+	HKEY k;
+	if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, key, 0, NULL, 0, KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &k, NULL) !=
+	    ERROR_SUCCESS) {
+		return false;
+	}
+	const struct
+	{
+		const char *name, *value;
+	} v[] = {
+	    {"Name", r->name},
+	    {"Class", r->item_class},
+	    {"Publisher", r->publisher},
+	    {"Version", r->version},
+	    {"SourceUrl", r->source_url},
+	    {"Sha256", r->sha256},
+	    {"File", r->file},
+	    {"InstallTime", r->install_time},
+	    {"UninstallCommand", r->uninstall},
+	    {"VersionPath", r->version_path},
+	    {"Requires", r->requires_ids},
+	};
+	bool ok = true;
+	for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+		ok = RegSetValueExA(k, v[i].name, 0, REG_SZ, (const BYTE *)v[i].value, (DWORD)strlen(v[i].value) + 1) ==
+		         ERROR_SUCCESS &&
+		     ok;
+	}
+	RegCloseKey(k);
+	return ok;
+}
+
+static void
+receipt_delete(const char *id)
+{
+	char key[256];
+	if (!receipt_id_ok(id)) {
+		return;
+	}
+	(void)snprintf(key, sizeof(key), RECEIPT_KEY "\\%s", id);
+	(void)RegDeleteKeyExA(HKEY_LOCAL_MACHINE, key, KEY_WOW64_64KEY, 0);
+}
+
+static int
+receipts_all(struct dxr_receipt *out, int max)
+{
+	HKEY k;
+	int n = 0;
+	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, RECEIPT_KEY, 0, KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &k) !=
+	    ERROR_SUCCESS) {
+		return 0;
+	}
+	for (DWORD i = 0; n < max; i++) {
+		char name[128];
+		DWORD sz = sizeof(name);
+		if (RegEnumKeyExA(k, i, name, &sz, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+			break;
+		}
+		if (receipt_read(name, &out[n])) {
+			n++;
+		}
+	}
+	RegCloseKey(k);
+	return n;
+}
+
+/*
+ * The machine, as get_core.c sees it.
+ */
+
+static bool
+env_reg_sz(void *u, const char *full, char *out, size_t n)
+{
+	(void)u;
+	return dxr_reg_read_path_sz(full, out, n);
+}
+
+static bool
+env_reg_dword(void *u, const char *key, const char *value, uint32_t *out)
+{
+	(void)u;
+	return dxr_reg_read_dword(key, value, out);
+}
+
+static bool
+env_reg_key_exists(void *u, const char *key)
+{
+	(void)u;
+	return dxr_reg_key_exists(key);
+}
+
+static bool
+env_file_exists(void *u, const char *path)
+{
+	(void)u;
+	return dxr_file_exists(path);
+}
+
+static bool
+env_service_exists(void *u, const char *name)
+{
+	(void)u;
+	return dxr_service_exists(name);
+}
+
+static int
+env_edids(void *u, struct dxr_edid_id *out, int max)
+{
+	(void)u;
+	return dxr_detect_edids(out, max);
+}
+
+static bool
+env_receipt(void *u, const char *id, struct dxr_receipt *out)
+{
+	(void)u;
+	return receipt_read(id, out);
+}
+
+static uint64_t
+env_cached_bytes(void *u, const char *sha, const char *file, uint64_t size)
+{
+	(void)u;
+	wchar_t dir[MAX_PATH], path[MAX_PATH + 8];
+	if (!downloads_dir(dir, MAX_PATH, false)) {
+		return 0;
+	}
+	(void)_snwprintf(path, MAX_PATH, L"%ls\\%hs-%hs", dir, sha, file);
+	if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+		return size; // a finished file is named by its hash; it is re-hashed before use
+	}
+	(void)_snwprintf(path, MAX_PATH + 8, L"%ls\\%hs-%hs.part", dir, sha, file);
+	uint64_t got = size_of_file(path);
+	return got > size ? 0 : got;
+}
+
+static const struct dxr_env k_env = {
+    NULL,      env_reg_sz,  env_reg_dword,    env_reg_key_exists, env_file_exists, env_service_exists,
+    env_edids, env_receipt, env_cached_bytes,
+};
 
 /*
  * Catalog.
  */
-
-struct catalog
-{
-	cJSON *root;
-	cJSON *components;
-	long long serial;
-	char key_id[9];
-};
 
 static bool
 read_whole_file(const char *path, char **out, size_t *len)
@@ -139,24 +345,16 @@ read_whole_file(const char *path, char **out, size_t *len)
 	return *len == (size_t)n;
 }
 
-static time_t
-parse_utc(const char *s)
-{
-	struct tm t;
-	memset(&t, 0, sizeof(t));
-	if (s == NULL ||
-	    sscanf(s, "%d-%d-%dT%d:%d:%dZ", &t.tm_year, &t.tm_mon, &t.tm_mday, &t.tm_hour, &t.tm_min, &t.tm_sec) != 6) {
-		return 0;
-	}
-	t.tm_year -= 1900;
-	t.tm_mon -= 1;
-	return _mkgmtime(&t);
-}
-
+/*!
+ * Fetches, verifies and parses one catalog document (schema 1 or 2).
+ * @p no_network is set when the failure was a transport error: the host could
+ * not be reached at all, so asking it for another document is pointless.
+ */
 static int
-load_catalog(const char *where, bool verify, struct catalog *c)
+load_catalog(const char *where, bool verify, struct dxr_catalog *c, bool *no_network)
 {
 	memset(c, 0, sizeof(*c));
+	*no_network = false;
 	char *body = NULL, *sig = NULL;
 	size_t blen = 0, slen = 0;
 	char sig_where[2100];
@@ -168,6 +366,7 @@ load_catalog(const char *where, bool verify, struct catalog *c)
 		if (st != 200) {
 			dxr_log("catalog unavailable (%s %d) -- treating as offline\n",
 			        st < 0 ? "network error" : "HTTP", st);
+			*no_network = st < 0;
 			return DXR_GET_OFFLINE;
 		}
 		if (verify && dxr_http_get_mem(sig_where, &sig, &slen, 4096) != 200) {
@@ -186,8 +385,12 @@ load_catalog(const char *where, bool verify, struct catalog *c)
 			return DXR_GET_OFFLINE;
 		}
 	}
+	char key_id[16];
 	if (verify) {
-		bool ok = dxr_catalog_signature_ok(body, blen, sig, c->key_id);
+		// The root of trust for both schemas: the catalog keys compiled into
+		// this build. Everything else a schema-2 catalog says (publishers,
+		// their signers) is trusted because this signature covers it.
+		bool ok = dxr_catalog_signature_ok(body, blen, sig, key_id);
 		free(sig);
 		if (!ok) {
 			free(body);
@@ -195,44 +398,33 @@ load_catalog(const char *where, bool verify, struct catalog *c)
 			return DXR_GET_BAD_SIGNATURE;
 		}
 	} else {
-		(void)snprintf(c->key_id, sizeof(c->key_id), "UNVERIFIED");
+		(void)snprintf(key_id, sizeof(key_id), "UNVERIFIED");
 		dxr_log("WARNING: catalog signature NOT verified (DXR_GET_DEV)\n");
 	}
-	c->root = cJSON_ParseWithLength(body, blen);
+	char err[128];
+	int r = dxr_catalog_parse(body, blen, time(NULL), c, err, sizeof(err));
 	free(body);
-	const cJSON *schema = c->root ? cJSON_GetObjectItemCaseSensitive(c->root, "schema") : NULL;
-	if (!cJSON_IsNumber(schema) || schema->valueint != 1) {
-		dxr_log("catalog: unsupported schema -- treating as offline\n");
-		cJSON_Delete(c->root);
-		c->root = NULL;
-		return DXR_GET_OFFLINE;
-	}
-	const cJSON *serial = cJSON_GetObjectItemCaseSensitive(c->root, "serial");
-	c->serial = cJSON_IsNumber(serial) ? (long long)serial->valuedouble : 0;
-	c->components = cJSON_GetObjectItemCaseSensitive(c->root, "components");
-
-	time_t exp = parse_utc(jstr(c->root, "expires"));
-	if (exp == 0 || time(NULL) > exp) {
-		dxr_log("catalog expired (%s) -- treating as offline\n", jstr(c->root, "expires"));
-		cJSON_Delete(c->root);
-		c->root = NULL;
-		return DXR_GET_OFFLINE;
+	if (r != DXR_GET_OK) {
+		dxr_log("catalog: %s -- treating as offline\n", err);
+		return r;
 	}
 	// Rollback guard: never accept an older serial than one this machine
-	// already verified (a replayed old-but-validly-signed catalog).
+	// already verified (a replayed old-but-validly-signed catalog). Each schema
+	// keeps its own value, so a schema-1 catalog accepted by an older dxr-get
+	// on this machine can never make this one refuse a schema-2 catalog.
 	if (verify) {
+		const char *value = c->schema == 2 ? "CatalogSerialV2" : "CatalogSerial";
 		char buf[32] = {0};
 		DWORD sz = sizeof(buf);
 		long long last = 0;
-		if (RegGetValueA(HKEY_LOCAL_MACHINE, SERIAL_KEY, "CatalogSerial", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
-		                 NULL, buf, &sz) == ERROR_SUCCESS) {
+		if (RegGetValueA(HKEY_LOCAL_MACHINE, SERIAL_KEY, value, RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, NULL,
+		                 buf, &sz) == ERROR_SUCCESS) {
 			last = _atoi64(buf);
 		}
 		if (c->serial < last) {
 			dxr_log("catalog serial %lld is older than one already seen (%lld) -- refusing it\n", c->serial,
 			        last);
-			cJSON_Delete(c->root);
-			c->root = NULL;
+			dxr_catalog_free(c);
 			return DXR_GET_BAD_SIGNATURE;
 		}
 		if (c->serial > last) {
@@ -240,362 +432,66 @@ load_catalog(const char *where, bool verify, struct catalog *c)
 			if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, SERIAL_KEY, 0, NULL, 0, KEY_SET_VALUE | KEY_WOW64_64KEY,
 			                    NULL, &k, NULL) == ERROR_SUCCESS) {
 				(void)snprintf(buf, sizeof(buf), "%lld", c->serial);
-				(void)RegSetValueExA(k, "CatalogSerial", 0, REG_SZ, (const BYTE *)buf,
-				                     (DWORD)strlen(buf) + 1);
+				(void)RegSetValueExA(k, value, 0, REG_SZ, (const BYTE *)buf, (DWORD)strlen(buf) + 1);
 				RegCloseKey(k);
 			}
 		}
 	}
-	dxr_log("catalog ok: serial %lld, key %s, expires %s\n", c->serial, c->key_id, jstr(c->root, "expires"));
+	dxr_log("catalog ok: schema %d, serial %lld, key %s, expires %s\n", c->schema, c->serial, key_id,
+	        jstr(c->doc, "expires"));
 	return DXR_GET_OK;
 }
 
-static const cJSON *
-component(const struct catalog *c, const char *name)
-{
-	return c->components ? cJSON_GetObjectItemCaseSensitive(c->components, name) : NULL;
-}
-
-static const cJSON *
-win_block(const struct catalog *c, const char *name)
-{
-	const cJSON *comp = component(c, name);
-	const cJSON *w = comp ? cJSON_GetObjectItemCaseSensitive(comp, "windows") : NULL;
-	return cJSON_IsObject(w) ? w : NULL;
-}
-
-/*
- * Installed state. The registry path comes from the catalog when it names one,
- * else from the compiled-in defaults (they are the contract with today's
- * installers; the catalog's copy lets a future installer move the key).
+/*!
+ * The default catalog: schema 2, falling back to schema 1 when schema 2 is
+ * not published, unreadable or expired. A schema-2 document whose SIGNATURE
+ * or serial is refused does not fall back: that is a refusal, not an absence.
  */
-static const char *
-default_reg_version(const char *name)
+static int
+load_default_catalog(bool verify, struct dxr_catalog *c)
 {
-	if (strcmp(name, "runtime") == 0) {
-		return "HKLM\\SOFTWARE\\DisplayXR\\Runtime\\Version";
+	bool no_network = false;
+	int r = load_catalog(CATALOG_V2, verify, c, &no_network);
+	if (r != DXR_GET_OFFLINE || no_network) {
+		return r;
 	}
-	if (strcmp(name, "leia_plugin") == 0) {
-		return "HKLM\\SOFTWARE\\DisplayXR\\Plugins\\LeiaSR\\Version";
-	}
-	if (strcmp(name, "browser") == 0) {
-		return "HKLM\\SOFTWARE\\DisplayXR\\Browser\\Version";
-	}
-	return NULL;
-}
-
-static bool
-installed_version(const struct catalog *c, const char *name, char *out, size_t out_size)
-{
-	const cJSON *w = win_block(c, name);
-	const char *reg = w ? jstr(w, "registry_version") : NULL;
-	if (reg == NULL) {
-		reg = default_reg_version(name);
-	}
-	return reg != NULL && dxr_reg_read_path_sz(reg, out, out_size) && out[0] != '\0';
-}
-
-/*
- * Detection (P2): catalog rules against this machine's evidence.
- */
-static bool
-detect_match(const cJSON *comp, bool high_only, char *why, size_t why_size)
-{
-	const cJSON *rules = cJSON_GetObjectItemCaseSensitive(comp, "detect");
-	if (!cJSON_IsArray(rules)) {
-		return false;
-	}
-	struct dxr_edid_id ids[32];
-	int n = dxr_detect_edids(ids, 32);
-	const cJSON *r;
-	cJSON_ArrayForEach(r, rules)
-	{
-		const char *kind = jstr(r, "kind");
-		const char *conf = jstr(r, "confidence");
-		const bool high = conf != NULL && strcmp(conf, "high") == 0;
-		if (kind == NULL || (high_only && !high)) {
-			continue;
-		}
-		if (strcmp(kind, "edid") == 0) {
-			const cJSON *m = cJSON_GetObjectItemCaseSensitive(r, "man");
-			const cJSON *p = cJSON_GetObjectItemCaseSensitive(r, "prod");
-			if (!cJSON_IsNumber(m) || !cJSON_IsNumber(p)) {
-				continue;
-			}
-			for (int i = 0; i < n; i++) {
-				if (ids[i].man == (uint16_t)m->valueint && ids[i].prod == (uint16_t)p->valueint) {
-					const char *note = jstr(r, "note");
-					(void)snprintf(why, why_size, "display EDID %u/%u%s%s (%s confidence)",
-					               ids[i].man, ids[i].prod, note ? " " : "", note ? note : "",
-					               conf ? conf : "?");
-					return true;
-				}
-			}
-		} else if (strcmp(kind, "registry_dword_min") == 0) {
-			const char *key = jstr(r, "key"), *val = jstr(r, "value");
-			const cJSON *min = cJSON_GetObjectItemCaseSensitive(r, "min");
-			uint32_t v = 0;
-			if (key && val && cJSON_IsNumber(min) && dxr_reg_read_dword(key, val, &v) &&
-			    v >= (uint32_t)min->valueint) {
-				const char *note = jstr(r, "note");
-				(void)snprintf(why, why_size, "%s (%s confidence)", note ? note : val,
-				               conf ? conf : "?");
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
-/*
- * Plan.
- */
-
-enum state
-{
-	ST_OK,
-	ST_MISSING,
-	ST_TOO_OLD,
-	ST_NOT_FETCHABLE,
-};
-static const char *const k_state_names[] = {"ok", "missing", "too_old", "not_fetchable"};
-
-struct action
-{
-	const char *component;
-	const char *label;
-	char installed[64]; //!< "" when absent
-	enum state state;
-	char required[64]; //!< floor, "" when none
-	const char *target;
-	double size;
-	char reason[256];
-};
-
-struct plan
-{
-	const char *for_component;
-	struct action a[4];
-	int n;
-};
-
-static const char *
-label_of(const char *name)
-{
-	if (strcmp(name, "runtime") == 0) {
-		return "DisplayXR runtime";
-	}
-	if (strcmp(name, "leia_plugin") == 0) {
-		return "Leia display plug-in";
-	}
-	if (strcmp(name, "browser") == 0) {
-		return "DisplayXR Browser";
-	}
-	return name;
-}
-
-//! Fills @p a for @p name given a floor (may be NULL: then only presence matters). @p want_latest: also act
-//! when installed is older than the catalog's version (used for the display plug-in, whose pins are an
-//! ABI-matched set with the runtime).
-static void
-plan_one(const struct catalog *c, const char *name, const char *floor, bool want_latest, struct action *a)
-{
-	memset(a, 0, sizeof(*a));
-	a->component = name;
-	a->label = label_of(name);
-	const cJSON *w = win_block(c, name);
-	const char *target = w ? jstr(w, "version") : NULL;
-	a->target = target;
-	if (w) {
-		const cJSON *sz = cJSON_GetObjectItemCaseSensitive(w, "size");
-		a->size = cJSON_IsNumber(sz) ? sz->valuedouble : 0;
-	}
-	if (floor) {
-		(void)snprintf(a->required, sizeof(a->required), ">=%s", floor);
-	}
-	bool have = installed_version(c, name, a->installed, sizeof(a->installed));
-	if (!have) {
-		a->state = ST_MISSING;
-	} else if (floor && vercmp(a->installed, floor) < 0) {
-		a->state = ST_TOO_OLD;
-	} else if (want_latest && target && vercmp(a->installed, target) < 0) {
-		a->state = ST_TOO_OLD;
-	} else {
-		a->state = ST_OK;
-		return;
-	}
-	// Fetchable only if the catalog offers a version that satisfies the floor
-	// and is not a downgrade.
-	if (target == NULL || (floor && vercmp(target, floor) < 0) || (have && vercmp(target, a->installed) <= 0)) {
-		(void)snprintf(a->reason, sizeof(a->reason), "%s",
-		               target == NULL ? "no signed Windows build in the catalog"
-		                              : "the catalog's version does not satisfy the requirement");
-		a->state = ST_NOT_FETCHABLE;
-	}
-}
-
-static void
-make_plan(const struct catalog *c, const char *for_component, const char *min_runtime, struct plan *p)
-{
-	memset(p, 0, sizeof(*p));
-	p->for_component = for_component;
-	const cJSON *comp = component(c, for_component);
-	const cJSON *req = comp ? cJSON_GetObjectItemCaseSensitive(comp, "requires") : NULL;
-	const char *floor = min_runtime ? min_runtime : (req ? floor_of(jstr(req, "runtime")) : NULL);
-
-	// Display plug-ins: positive evidence only.
-	const cJSON *leia = component(c, "leia_plugin");
-	char why[256] = {0};
-	const bool leia_wanted =
-	    leia != NULL && strcmp(for_component, "leia_plugin") != 0 && detect_match(leia, true, why, sizeof(why));
-	if (leia_wanted) {
-		// The plug-in's own runtime floor joins the runtime requirement.
-		const cJSON *lreq = cJSON_GetObjectItemCaseSensitive(leia, "requires");
-		const char *lf = lreq ? floor_of(jstr(lreq, "runtime")) : NULL;
-		if (lf && (floor == NULL || vercmp(lf, floor) > 0)) {
-			floor = lf;
-		}
-	}
-
-	if (strcmp(for_component, "runtime") != 0) {
-		plan_one(c, "runtime", floor, false, &p->a[p->n++]);
-	}
-	if (leia_wanted) {
-		struct action *runtime = &p->a[0];
-		// Upgrading the runtime makes an older plug-in ABI-stale: bring it to the
-		// catalog's ABI-matched pin in the same pass. Otherwise only install it
-		// when it is absent -- this tool ensures, it does not update.
-		const bool runtime_moves = p->n > 0 && runtime->state != ST_OK && runtime->state != ST_NOT_FETCHABLE;
-		struct action *a = &p->a[p->n++];
-		plan_one(c, "leia_plugin", NULL, runtime_moves, a);
-		(void)snprintf(a->reason + strlen(a->reason), sizeof(a->reason) - strlen(a->reason),
-		               "%sLeia display: %s", a->reason[0] ? "; " : "", why);
-	}
-}
-
-static void
-print_plan_json(const struct plan *p)
-{
-	cJSON *o = cJSON_CreateObject();
-	cJSON_AddStringToObject(o, "for", p->for_component);
-	cJSON *arr = cJSON_AddArrayToObject(o, "actions");
-	for (int i = 0; i < p->n; i++) {
-		const struct action *a = &p->a[i];
-		cJSON *x = cJSON_CreateObject();
-		cJSON_AddStringToObject(x, "component", a->component);
-		if (a->installed[0]) {
-			cJSON_AddStringToObject(x, "installed", a->installed);
-		} else {
-			cJSON_AddNullToObject(x, "installed");
-		}
-		cJSON_AddStringToObject(x, "state", k_state_names[a->state]);
-		if (a->required[0]) {
-			cJSON_AddStringToObject(x, "required", a->required);
-		}
-		if (a->target) {
-			cJSON_AddStringToObject(x, "target", a->target);
-		}
-		cJSON_AddNumberToObject(x, "size", a->size);
-		if (a->reason[0]) {
-			cJSON_AddStringToObject(x, "reason", a->reason);
-		}
-		cJSON_AddItemToArray(arr, x);
-	}
-	char *s = cJSON_PrintUnformatted(o);
-	printf("%s\n", s);
-	cJSON_free(s);
-	cJSON_Delete(o);
-}
-
-static bool
-needs_work(const struct action *a)
-{
-	return a->state == ST_MISSING || a->state == ST_TOO_OLD;
-}
-
-//! Human-readable plan: what the browser installer shows in its one consent box.
-static void
-print_plan_text(const struct plan *p)
-{
-	double total = 0;
-	int todo = 0;
-	for (int i = 0; i < p->n; i++) {
-		const struct action *a = &p->a[i];
-		if (needs_work(a)) {
-			todo++;
-			total += a->size;
-			if (a->state == ST_MISSING) {
-				printf("%s: not installed -> install %s (%.1f MB)\n", a->label, a->target,
-				       a->size / 1048576.0);
-			} else {
-				printf("%s: %s is too old -> update to %s (%.1f MB)\n", a->label, a->installed,
-				       a->target, a->size / 1048576.0);
-			}
-		} else if (a->state == ST_NOT_FETCHABLE) {
-			printf("%s: %s, but %s\n", a->label, a->installed[0] ? "too old" : "not installed", a->reason);
-		}
-	}
-	if (todo == 0) {
-		printf("Nothing to install.\n");
-	} else {
-		printf("Total download: %.1f MB\n", total / 1048576.0);
-	}
-	(void)fflush(stdout);
+	dxr_log("schema-2 catalog not usable -- falling back to schema 1\n");
+	return load_catalog(CATALOG_V1, verify, c, &no_network);
 }
 
 /*
  * Fetch + verify + install.
  */
 
-static bool
-is_admin(void)
-{
-	return IsUserAnAdmin() != FALSE;
-}
-
-static bool
-downloads_dir(wchar_t *out, size_t cap)
-{
-	wchar_t *pd = NULL;
-	if (FAILED(SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, NULL, &pd))) {
-		return false;
-	}
-	(void)_snwprintf(out, cap, L"%ls\\DisplayXR\\Downloads", pd);
-	CoTaskMemFree(pd);
-	(void)SHCreateDirectoryExW(NULL, out, NULL);
-	return true;
-}
-
+/*!
+ * Downloads (resuming a partial file), then checks size, SHA-256 and the
+ * Authenticode signer of one asset. @p item is the catalog item whose
+ * publisher's signers apply.
+ */
 static int
-fetch_component(const struct catalog *c, const char *name, wchar_t *out_path, size_t cap, const wchar_t *dir_override)
+fetch_asset(const struct dxr_catalog *c,
+            const cJSON *item,
+            const cJSON *asset,
+            const char *name,
+            wchar_t *out_path,
+            size_t cap,
+            const wchar_t *dir_override)
 {
-	const cJSON *w = win_block(c, name);
-	if (w == NULL) {
-		dxr_log("%s: nothing fetchable in the catalog\n", name);
-		return DXR_GET_NOT_FETCHABLE;
+	char why[256];
+	int r = dxr_asset_check(c, item, asset, NULL, why, sizeof(why));
+	if (r != DXR_GET_OK) {
+		dxr_log("%s: %s\n", name, why);
+		return r;
 	}
-	const char *sha = jstr(w, "sha256"), *signer = jstr(w, "signer"), *file = jstr(w, "file");
-	const cJSON *size = cJSON_GetObjectItemCaseSensitive(w, "size");
-	const cJSON *urls = cJSON_GetObjectItemCaseSensitive(w, "urls");
-	if (sha == NULL || strlen(sha) != 64 || signer == NULL || file == NULL || !cJSON_IsNumber(size) ||
-	    !cJSON_IsArray(urls)) {
-		dxr_log("%s: malformed catalog entry\n", name);
-		return DXR_GET_NOT_FETCHABLE;
-	}
-	bool signer_known = false;
-	for (size_t i = 0; i < sizeof(k_trusted_signers) / sizeof(k_trusted_signers[0]); i++) {
-		signer_known = signer_known || strcmp(signer, k_trusted_signers[i]) == 0;
-	}
-	if (!signer_known) {
-		dxr_log("%s: catalog names signer \"%s\", which this dxr-get does not trust\n", name, signer);
-		return DXR_GET_VERIFY;
-	}
+	const char *sha = jstr(asset, "sha256"), *file = jstr(asset, "file");
+	const cJSON *size = cJSON_GetObjectItemCaseSensitive(asset, "size");
+	const cJSON *urls = cJSON_GetObjectItemCaseSensitive(asset, "urls");
 
 	wchar_t dir[MAX_PATH];
 	if (dir_override) {
 		(void)_snwprintf(dir, MAX_PATH, L"%ls", dir_override);
 		(void)SHCreateDirectoryExW(NULL, dir, NULL);
-	} else if (!downloads_dir(dir, MAX_PATH)) {
+	} else if (!downloads_dir(dir, MAX_PATH, true)) {
 		return DXR_GET_DOWNLOAD;
 	}
 	// Named by hash, so a resumed or cached file can only ever be these bytes.
@@ -611,7 +507,11 @@ fetch_component(const struct catalog *c, const char *name, wchar_t *out_path, si
 		dxr_log("%s: using cached %ls\n", name, out_path);
 	} else {
 		(void)DeleteFileW(out_path);
-		dxr_log("%s: downloading %s %s (%.1f MB)\n", name, file, jstr(w, "version"), want / 1048576.0);
+		const uint64_t resume = size_of_file(part);
+		dxr_log("%s: downloading %s %s (%.1f MB)\n", name, file, jstr(asset, "version"), want / 1048576.0);
+		if (resume > 0 && resume <= want) {
+			dxr_log("%s: resuming at %.1f MB\n", name, resume / 1048576.0);
+		}
 		bool ok = false;
 		const cJSON *u;
 		int idx = 0;
@@ -649,8 +549,12 @@ fetch_component(const struct catalog *c, const char *name, wchar_t *out_path, si
 		dxr_log("%s: WARNING Authenticode check skipped (DXR_GET_ALLOW_UNSIGNED)\n", name);
 	} else {
 		char cn[256];
-		if (!dxr_authenticode_signer(out_path, cn, sizeof(cn)) || strcmp(cn, signer) != 0) {
-			dxr_log("%s: Authenticode signer \"%s\" does not match \"%s\" -- refusing\n", name, cn, signer);
+		if (!dxr_authenticode_signer(out_path, cn, sizeof(cn))) {
+			dxr_log("%s: no valid Authenticode signature -- refusing\n", name);
+			return DXR_GET_VERIFY;
+		}
+		if (dxr_asset_check(c, item, asset, cn, why, sizeof(why)) != DXR_GET_OK) {
+			dxr_log("%s: %s -- refusing\n", name, why);
 			return DXR_GET_VERIFY;
 		}
 		dxr_log("%s: verified (sha256 ok, signed by %s)\n", name, cn);
@@ -658,41 +562,59 @@ fetch_component(const struct catalog *c, const char *name, wchar_t *out_path, si
 	return DXR_GET_OK;
 }
 
+//! Runs @p cmd and waits a bounded time. @p what: "installer" / "uninstaller".
 static int
-run_installer(const char *name, const wchar_t *path, const cJSON *args)
+run_child(const char *name, wchar_t *cmd, const char *what)
 {
-	wchar_t cmd[4096];
-	int n = _snwprintf(cmd, 4096, L"\"%ls\"", path);
-	const cJSON *a;
-	cJSON_ArrayForEach(a, args)
-	{
-		if (cJSON_IsString(a)) {
-			n += _snwprintf(cmd + n, 4096 - n, L" %hs", a->valuestring);
-		}
-	}
-	dxr_log("%s: running installer %ls\n", name, cmd);
+	dxr_log("%s: running %s %ls\n", name, what, cmd);
 	STARTUPINFOW si;
 	PROCESS_INFORMATION pi;
 	memset(&si, 0, sizeof(si));
 	si.cb = sizeof(si);
 	if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-		dxr_log("%s: cannot start installer (error %lu)\n", name, GetLastError());
+		dxr_log("%s: cannot start the %s (error %lu)\n", name, what, GetLastError());
 		return DXR_GET_CHILD;
 	}
 	// NSIS /S installers re-exec themselves from %TEMP% (the uninstaller copy
-	// trick) for some paths; WaitForSingleObject on the parent is what NSIS
-	// documents as sufficient for a plain installer.
-	(void)WaitForSingleObject(pi.hProcess, INFINITE);
+	// trick) for some paths; waiting on the parent is what NSIS documents as
+	// sufficient for a plain installer. The wait is bounded: a child that is
+	// still running after an hour is hung, and this tool is run by installers
+	// that are themselves being waited for.
 	DWORD code = 1;
+	if (WaitForSingleObject(pi.hProcess, CHILD_WAIT_MS) != WAIT_OBJECT_0) {
+		dxr_log("%s: the %s is still running after %u minutes -- not waiting any longer\n", name, what,
+		        CHILD_WAIT_MS / 60000u);
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
+		return DXR_GET_CHILD;
+	}
 	(void)GetExitCodeProcess(pi.hProcess, &code);
 	CloseHandle(pi.hProcess);
 	CloseHandle(pi.hThread);
 	if (code != 0) {
-		dxr_log("%s: installer exited with %lu\n", name, code);
+		dxr_log("%s: %s exited with %lu\n", name, what, code);
 		return DXR_GET_CHILD;
 	}
-	dxr_log("%s: installed\n", name);
 	return DXR_GET_OK;
+}
+
+static int
+run_installer(const char *name, const wchar_t *path, const cJSON *args)
+{
+	static wchar_t cmd[4096];
+	int n = _snwprintf(cmd, 4096, L"\"%ls\"", path);
+	const cJSON *a;
+	cJSON_ArrayForEach(a, args)
+	{
+		if (cJSON_IsString(a) && n > 0 && n < 4000) {
+			n += _snwprintf(cmd + n, 4096 - n, L" %hs", a->valuestring);
+		}
+	}
+	int r = run_child(name, cmd, "installer");
+	if (r == DXR_GET_OK) {
+		dxr_log("%s: installed\n", name);
+	}
+	return r;
 }
 
 //! Stops the service and its satellites. Returns true when a running
@@ -721,7 +643,7 @@ stop_service(void)
 		}
 		HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
 		if (h != NULL) {
-			dxr_log("stopping %ls (pid %lu) for the install\n", pe.szExeFile, pe.th32ProcessID);
+			dxr_log("stopping %ls (pid %lu)\n", pe.szExeFile, pe.th32ProcessID);
 			(void)TerminateProcess(h, 0);
 			(void)WaitForSingleObject(h, 5000);
 			CloseHandle(h);
@@ -759,39 +681,401 @@ start_service(void)
 	}
 }
 
-static int
-install_component(const struct catalog *c, const char *name)
+static void
+now_utc(char *out, size_t n)
 {
-	wchar_t path[MAX_PATH];
-	int r = fetch_component(c, name, path, MAX_PATH, NULL);
-	if (r != DXR_GET_OK) {
-		return r;
+	time_t t = time(NULL);
+	struct tm *g = gmtime(&t);
+	if (g == NULL || strftime(out, n, "%Y-%m-%dT%H:%M:%SZ", g) == 0) {
+		out[0] = '\0';
 	}
-	const cJSON *w = win_block(c, name);
-	return run_installer(name, path, cJSON_GetObjectItemCaseSensitive(w, "args"));
+}
+
+//! Records what was just installed, so `list --installed`, `outdated` and `uninstall` have something to read.
+static void
+write_receipt(const struct dxr_step *s)
+{
+	struct dxr_receipt r;
+	memset(&r, 0, sizeof(r));
+	(void)snprintf(r.id, sizeof(r.id), "%s", s->id);
+	(void)snprintf(r.name, sizeof(r.name), "%s", s->label);
+	(void)snprintf(r.item_class, sizeof(r.item_class), "%s",
+	               dxr_item_class(s->item) ? dxr_item_class(s->item) : "");
+	(void)snprintf(r.publisher, sizeof(r.publisher), "%s",
+	               jstr(s->item, "publisher") ? jstr(s->item, "publisher") : "");
+	(void)snprintf(r.version, sizeof(r.version), "%s", s->target ? s->target : "");
+	const cJSON *u0 = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(s->asset, "urls"), 0);
+	(void)snprintf(r.source_url, sizeof(r.source_url), "%s", cJSON_IsString(u0) ? u0->valuestring : "");
+	(void)snprintf(r.sha256, sizeof(r.sha256), "%s", jstr(s->asset, "sha256") ? jstr(s->asset, "sha256") : "");
+	(void)snprintf(r.file, sizeof(r.file), "%s", jstr(s->asset, "file") ? jstr(s->asset, "file") : "");
+	now_utc(r.install_time, sizeof(r.install_time));
+	(void)dxr_installed_path(s->item, r.version_path, sizeof(r.version_path));
+
+	// The uninstall command is read NOW, from where the component's installer
+	// just wrote it, so `uninstall` needs no catalog (and works offline).
+	const cJSON *un = cJSON_GetObjectItemCaseSensitive(s->asset, "uninstall");
+	const char *kind = jstr(un, "kind"), *path = jstr(un, "path");
+	char cmd[768];
+	if (kind != NULL && strcmp(kind, "registry_command") == 0 && path != NULL &&
+	    dxr_reg_read_path_sz(path, cmd, sizeof(cmd)) && cmd[0] != '\0') {
+		size_t l = (size_t)snprintf(r.uninstall, sizeof(r.uninstall), "%s", cmd);
+		const cJSON *a;
+		cJSON_ArrayForEach(a, cJSON_GetObjectItemCaseSensitive(un, "args"))
+		{
+			if (cJSON_IsString(a) && l < sizeof(r.uninstall)) {
+				l += (size_t)snprintf(r.uninstall + l, sizeof(r.uninstall) - l, " %s", a->valuestring);
+			}
+		}
+	}
+	const cJSON *q;
+	cJSON_ArrayForEach(q, cJSON_GetObjectItemCaseSensitive(s->item, "requires"))
+	{
+		const char *qk = jstr(q, "kind");
+		const char *dep = NULL;
+		if (qk != NULL && strcmp(qk, "item") == 0) {
+			dep = jstr(q, "id");
+		} else if (qk != NULL && strcmp(qk, "runtime") == 0) {
+			dep = "runtime";
+		}
+		size_t l = strlen(r.requires_ids);
+		if (dep != NULL && l + strlen(dep) + 2 < sizeof(r.requires_ids)) {
+			(void)snprintf(r.requires_ids + l, sizeof(r.requires_ids) - l, "%s%s", l ? "," : "", dep);
+		}
+	}
+	if (!receipt_write(&r)) {
+		dxr_log("%s: installed, but the install receipt could not be written\n", s->label);
+	} else if (r.uninstall[0] == '\0') {
+		dxr_log("%s: receipt written (the catalog gives no uninstall command for it)\n", s->label);
+	}
+}
+
+static bool
+step_stops_service(const struct dxr_step *s)
+{
+	return s->kind == DXR_STEP_EXTERNAL || dxr_class_is_loaded(dxr_item_class(s->item));
+}
+
+/*!
+ * Runs a plan: download and verify EVERYTHING first, then stop the service
+ * once, run the installers in plan order (prerequisites first), write a
+ * receipt per item, start the service once.
+ */
+static int
+execute_plan(const struct dxr_catalog *c, struct dxr_plan *p, bool no_start, const char *retry_hint)
+{
+	static wchar_t paths[DXR_MAX_STEPS][MAX_PATH];
+	// A network failure halfway must not leave a new runtime next to an
+	// ABI-stale plug-in, or an item without the prerequisite it needs.
+	for (int i = 0; i < p->n; i++) {
+		struct dxr_step *s = &p->steps[i];
+		if (!dxr_step_needs_work(s)) {
+			continue;
+		}
+		int r = fetch_asset(c, s->item, s->asset, s->label, paths[i], MAX_PATH, NULL);
+		if (r != DXR_GET_OK) {
+			dxr_log("Nothing was installed. Not installed:");
+			for (int j = 0; j < p->n; j++) {
+				if (dxr_step_needs_work(&p->steps[j])) {
+					dxr_log(" %s%s", p->steps[j].label, j + 1 < p->n ? ";" : "");
+				}
+			}
+			dxr_log("\n");
+			if (r == DXR_GET_DOWNLOAD) {
+				dxr_log(
+				    "The download could not be completed (no connection, or the server is "
+				    "unreachable). "
+				    "What was fetched is kept and resumes next time: %s\n",
+				    retry_hint);
+			}
+			return r;
+		}
+	}
+	// Same order as the bundle (#461/#342): nothing may hold the runtime's or a
+	// plug-in's DLLs while their installers replace them -- an NSIS /S install
+	// skips a locked file silently -- and the service starts once, at the end,
+	// at the user's integrity level. An application-only plan leaves it alone.
+	bool touches_service = false;
+	for (int i = 0; i < p->n; i++) {
+		touches_service =
+		    touches_service || (dxr_step_needs_work(&p->steps[i]) && step_stops_service(&p->steps[i]));
+	}
+	bool was_running = touches_service ? stop_service() : false;
+	int r = DXR_GET_OK;
+	for (int i = 0; i < p->n && r == DXR_GET_OK; i++) {
+		struct dxr_step *s = &p->steps[i];
+		if (!dxr_step_needs_work(s)) {
+			continue;
+		}
+		const cJSON *ins = cJSON_GetObjectItemCaseSensitive(s->asset, "installer");
+		r = run_installer(s->label, paths[i], cJSON_GetObjectItemCaseSensitive(ins, "args"));
+		if (r == DXR_GET_OK && s->kind == DXR_STEP_ITEM) {
+			write_receipt(s);
+		}
+	}
+	// #2713: a failed child install (exit 6: a program holds the client DLL)
+	// must leave the machine as it was found -- restart the service only if it
+	// was running before. A successful install starts it as always. The service
+	// is single-instance, so racing the installer's own restore-on-abort is
+	// harmless.
+	if (touches_service && !no_start && (r == DXR_GET_OK || was_running)) {
+		start_service();
+	}
+	return r;
 }
 
 /*
- * CLI.
+ * Offline: say what was not done and how to get it later. Never a hang: the
+ * catalog fetch that led here is bounded (timeouts, four attempts).
+ */
+static void
+report_offline(const char *cmd, const char *target, bool json)
+{
+	char hint[256];
+	if (target != NULL) {
+		(void)snprintf(hint, sizeof(hint), "dxr-get %s %s", strcmp(cmd, "plan") == 0 ? "ensure-for" : cmd,
+		               target);
+	} else {
+		(void)snprintf(hint, sizeof(hint), "dxr-get %s", cmd);
+	}
+	dxr_log("OFFLINE: the DisplayXR catalog could not be reached (or it has expired).\n");
+	if (target != NULL) {
+		dxr_log("Skipped: %s%s. Nothing was downloaded, installed or changed.\n", target,
+		        strcmp(cmd, "install") == 0 ? "" : " and whatever it needs");
+	} else {
+		dxr_log("Skipped: %s. Nothing was changed.\n", cmd);
+	}
+	dxr_log("What is already installed keeps working. To get it later, connect and run: %s\n", hint);
+	if (json) {
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddBoolToObject(o, "offline", 1);
+		cJSON_AddStringToObject(o, "reason", "catalog unreachable or expired");
+		cJSON *sk = cJSON_AddArrayToObject(o, "skipped");
+		cJSON_AddItemToArray(sk, cJSON_CreateString(target ? target : cmd));
+		cJSON_AddStringToObject(o, "retry", hint);
+		print_json(o);
+	}
+}
+
+/*
+ * Verbs.
  */
 
 static void
 usage(void)
 {
 	dxr_log(
-	    "dxr-get -- fetch, verify and install DisplayXR components from the signed catalog\n"
+	    "dxr-get -- fetch, verify, install and remove DisplayXR components from the signed catalog\n"
 	    "\n"
-	    "  dxr-get [--catalog <url|file>] plan --for <component> [--min-runtime X.Y.Z] [--json]\n"
-	    "  dxr-get [--catalog <url|file>] ensure-for <component> [--min-runtime X.Y.Z] [--yes] "
-	    "[--no-start-service]\n"
-	    "  dxr-get [--catalog <url|file>] fetch <component> [--out <dir>]\n"
-	    "  dxr-get [--catalog <url|file>] install <component> [--yes]\n"
+	    "  dxr-get [--catalog <url|file>] plan --for <item> [--min-runtime X.Y.Z] [--json]\n"
+	    "  dxr-get [--catalog <url|file>] ensure-for <item> [--min-runtime X.Y.Z] [--yes] [--no-start-service]\n"
+	    "  dxr-get [--catalog <url|file>] fetch <item> [--out <dir>]\n"
+	    "  dxr-get [--catalog <url|file>] install <item> [--yes] [--no-start-service]\n"
 	    "  dxr-get [--catalog <url|file>] detect [--json]\n"
 	    "  dxr-get [--catalog <url|file>] catalog\n"
+	    "  dxr-get [--catalog <url|file>] list [--json]\n"
+	    "  dxr-get [--catalog <url|file>] outdated [--json]\n"
+	    "  dxr-get list --installed [--json]\n"
+	    "  dxr-get uninstall <id> [--json] [--no-start-service]\n"
 	    "\n"
-	    "components: runtime, leia_plugin, browser\n"
+	    "items: the ids `dxr-get list` shows (the schema-1 names runtime, leia_plugin, browser still work)\n"
 	    "exit: 0 ok, 2 usage, 10 offline/expired catalog, 11 bad signature, 20 download,\n"
-	    "      21 verification, 30 installer failed, 40 not fetchable, 50 needs elevation\n");
+	    "      21 verification, 30 installer failed, 40 not fetchable, 41 not compatible with the\n"
+	    "      installed runtime, 42 not installed, 43 cannot uninstall, 50 needs elevation\n");
+}
+
+static int
+cmd_detect(const struct dxr_catalog *c, bool json)
+{
+	struct dxr_edid_id ids[32];
+	int n = dxr_detect_edids(ids, 32);
+	cJSON *o = cJSON_CreateObject();
+	cJSON *e = cJSON_AddArrayToObject(o, "edids");
+	for (int i = 0; i < n; i++) {
+		cJSON *x = cJSON_CreateObject();
+		cJSON_AddNumberToObject(x, "man", ids[i].man);
+		cJSON_AddNumberToObject(x, "prod", ids[i].prod);
+		cJSON_AddItemToArray(e, x);
+		if (!json) {
+			printf("monitor EDID man=%u (0x%04X) prod=%u (0x%04X)\n", ids[i].man, ids[i].man, ids[i].prod,
+			       ids[i].prod);
+		}
+	}
+	// One entry per item that has detect rules, keyed by the name a schema-1
+	// caller knows it by (so `leia_plugin` keeps its key).
+	const cJSON *it;
+	cJSON_ArrayForEach(it, c->items)
+	{
+		const cJSON *rules = cJSON_GetObjectItemCaseSensitive(it, "detect");
+		if (!cJSON_IsArray(rules) || dxr_item_find(c, dxr_item_id(it)) != it) {
+			continue;
+		}
+		char why_hi[256], why_any[256];
+		bool hi = dxr_detect_rules(rules, &k_env, true, why_hi, sizeof(why_hi));
+		bool any = dxr_detect_rules(rules, &k_env, false, why_any, sizeof(why_any));
+		const char *name = dxr_item_legacy_name(it);
+		cJSON *l = cJSON_AddObjectToObject(o, name);
+		cJSON_AddBoolToObject(l, "match", any);
+		cJSON_AddBoolToObject(l, "high_confidence", hi);
+		cJSON_AddStringToObject(l, "evidence", hi ? why_hi : why_any);
+		cJSON_AddStringToObject(l, "id", dxr_item_id(it));
+		if (!json) {
+			printf("%s: %s%s%s\n", name,
+			       any ? (hi ? "MATCH (high confidence)" : "match (low confidence)") : "no match",
+			       any ? " -- " : "", hi ? why_hi : why_any);
+		}
+	}
+	if (json) {
+		print_json(o);
+	} else {
+		cJSON_Delete(o);
+		(void)fflush(stdout);
+	}
+	return DXR_GET_OK;
+}
+
+static void
+print_table(const cJSON *arr, const char *ver_key, const char *avail_key, const char *empty)
+{
+	const cJSON *x;
+	int rows = 0;
+	cJSON_ArrayForEach(x, arr)
+	{
+		const char *avail = avail_key ? jstr(x, avail_key) : NULL;
+		const char *state = jstr(x, "state");
+		if (rows++ == 0) {
+			printf("%-28s %-22s %-12s %-12s %s\n", "ID", "CLASS", "INSTALLED", avail_key ? "AVAILABLE" : "",
+			       avail_key ? "STATE" : "INSTALLED AT");
+		}
+		printf("%-28s %-22s %-12s %-12s %s\n", jstr(x, "id"), jstr(x, "class") ? jstr(x, "class") : "",
+		       jstr(x, ver_key) ? jstr(x, ver_key) : "-", avail ? avail : (avail_key ? "-" : ""),
+		       avail_key ? (state ? state : "") : (jstr(x, "install_time") ? jstr(x, "install_time") : ""));
+	}
+	if (rows == 0) {
+		printf("%s\n", empty);
+	}
+	(void)fflush(stdout);
+}
+
+static int
+cmd_list_installed(bool json)
+{
+	static struct dxr_receipt all[MAX_RECEIPTS];
+	int n = receipts_all(all, MAX_RECEIPTS);
+	cJSON *arr = dxr_list_receipts(all, n);
+	if (json) {
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddItemToObject(o, "installed", arr);
+		print_json(o);
+	} else {
+		print_table(arr, "version", NULL,
+		            "Nothing was installed through dxr-get on this machine. (Components installed by their own "
+		            "installers have no receipt; `dxr-get list` shows them.)");
+		cJSON_Delete(arr);
+	}
+	return DXR_GET_OK;
+}
+
+static int
+cmd_list(const struct dxr_catalog *c, bool outdated, bool json)
+{
+	cJSON *arr = dxr_list_catalog(c, &k_env, outdated);
+	if (json) {
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddNumberToObject(o, "schema", c->schema);
+		cJSON_AddItemToObject(o, outdated ? "outdated" : "items", arr);
+		print_json(o);
+	} else {
+		print_table(arr, "installed", "available",
+		            outdated ? "Everything installed is at the catalog's version."
+		                     : "The catalog lists no items.");
+		cJSON_Delete(arr);
+	}
+	return DXR_GET_OK;
+}
+
+static int
+uninstall_result(const char *id, int code, const char *result, const char *detail, bool json)
+{
+	dxr_log("%s: %s%s%s\n", id, result, detail[0] ? " -- " : "", detail);
+	if (json) {
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddStringToObject(o, "id", id);
+		cJSON_AddStringToObject(o, "result", result);
+		cJSON_AddNumberToObject(o, "exit", code);
+		if (detail[0]) {
+			cJSON_AddStringToObject(o, "detail", detail);
+		}
+		print_json(o);
+	}
+	return code;
+}
+
+//! `uninstall <id>`: needs no catalog and no network. Everything comes from the receipt.
+static int
+cmd_uninstall(const char *id, bool json, bool no_start)
+{
+	static struct dxr_receipt all[MAX_RECEIPTS];
+	struct dxr_receipt r;
+	char detail[700];
+	if (!receipt_read(id, &r)) {
+		return uninstall_result(
+		    id, DXR_GET_NOT_INSTALLED, "not_installed",
+		    "dxr-get has no install receipt for this id (see `dxr-get list --installed`); a "
+		    "component installed by its own installer is removed from Windows Settings",
+		    json);
+	}
+	if (r.uninstall[0] == '\0') {
+		return uninstall_result(id, DXR_GET_CANNOT_UNINSTALL, "no_uninstall_command",
+		                        "the catalog gave no uninstall command for this item; remove it from Windows "
+		                        "Settings > Apps",
+		                        json);
+	}
+	int n = receipts_all(all, MAX_RECEIPTS);
+	char deps[400];
+	if (dxr_receipt_dependents(all, n, id, deps, sizeof(deps)) > 0) {
+		(void)snprintf(detail, sizeof(detail), "still required by: %s. Uninstall those first", deps);
+		return uninstall_result(id, DXR_GET_CANNOT_UNINSTALL, "required_by_others", detail, json);
+	}
+	if (!is_admin()) {
+		return uninstall_result(id, DXR_GET_NEEDS_ADMIN, "needs_elevation",
+		                        "uninstalling needs an elevated process", json);
+	}
+	const bool loaded = dxr_class_is_loaded(r.item_class);
+	const bool is_runtime = strcmp(r.item_class, "runtime") == 0;
+	bool was_running = loaded ? stop_service() : false;
+	static wchar_t cmd[2048];
+	(void)_snwprintf(cmd, 2048, L"%hs", r.uninstall);
+	int rc = run_child(r.name[0] ? r.name : id, cmd, "uninstaller");
+	bool gone = rc == DXR_GET_OK;
+	if (rc == DXR_GET_OK && r.version_path[0] != '\0') {
+		// An NSIS uninstaller copies itself to %TEMP% and returns at once. The
+		// component is gone when its version value is; wait a bounded time.
+		char v[64];
+		for (DWORD waited = 0;; waited += 500) {
+			gone = !dxr_reg_read_path_sz(r.version_path, v, sizeof(v)) || v[0] == '\0';
+			if (gone || waited >= UNINSTALL_SETTLE_MS) {
+				break;
+			}
+			Sleep(500);
+		}
+	}
+	if (loaded && !is_runtime && !no_start && (was_running || gone)) {
+		start_service();
+	}
+	if (rc != DXR_GET_OK) {
+		return uninstall_result(id, DXR_GET_CHILD, "failed", "the uninstaller did not finish successfully",
+		                        json);
+	}
+	if (!gone) {
+		return uninstall_result(
+		    id, DXR_GET_CHILD, "failed",
+		    "the uninstaller returned, but the component still reports an installed version; "
+		    "the receipt is kept",
+		    json);
+	}
+	receipt_delete(id);
+	(void)snprintf(detail, sizeof(detail), "%s %s removed", r.name[0] ? r.name : id, r.version);
+	return uninstall_result(id, DXR_GET_OK, "uninstalled", detail, json);
 }
 
 int
@@ -800,9 +1084,9 @@ main(int argc, char **argv)
 	// DXR_GET_CATALOG redirects to another catalog (a test or staging copy). It
 	// grants nothing: that catalog must still carry a valid signature from a
 	// compiled-in key, and the serial guard still applies.
-	const char *catalog_where = getenv("DXR_GET_CATALOG") ? getenv("DXR_GET_CATALOG") : DEFAULT_CATALOG;
+	const char *catalog_where = getenv("DXR_GET_CATALOG");
 	const char *cmd = NULL, *arg = NULL, *for_c = NULL, *min_runtime = NULL, *out_dir = NULL;
-	bool json = false, yes = false, no_verify = false, no_start = false;
+	bool json = false, yes = false, no_verify = false, no_start = false, installed_only = false;
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
 		if (strcmp(a, "--catalog") == 0 && i + 1 < argc) {
@@ -819,6 +1103,8 @@ main(int argc, char **argv)
 			json = true;
 		} else if (strcmp(a, "--yes") == 0) {
 			yes = true;
+		} else if (strcmp(a, "--installed") == 0) {
+			installed_only = true;
 		} else if (strcmp(a, "--no-start-service") == 0) {
 			no_start = true;
 		} else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -844,165 +1130,149 @@ main(int argc, char **argv)
 		dxr_log("--no-verify-catalog needs DXR_GET_DEV=1\n");
 		return DXR_GET_USAGE;
 	}
+	(void)yes; // installers pass --yes; the consent prompt is theirs, not ours
 	if (strcmp(cmd, "ensure-for") == 0) {
 		for_c = arg;
 	}
 
-	struct catalog c;
-	int r = load_catalog(catalog_where, !no_verify, &c);
+	// The two verbs that work from receipts alone: no catalog, no network.
+	if (strcmp(cmd, "uninstall") == 0) {
+		if (arg == NULL) {
+			usage();
+			return DXR_GET_USAGE;
+		}
+		return cmd_uninstall(arg, json, no_start);
+	}
+	if (strcmp(cmd, "list") == 0 && installed_only) {
+		return cmd_list_installed(json);
+	}
+	static const char *const known[] = {"plan",   "ensure-for", "fetch", "install",
+	                                    "detect", "catalog",    "list",  "outdated"};
+	bool is_known = false;
+	for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+		is_known = is_known || strcmp(cmd, known[i]) == 0;
+	}
+	const bool plan_verb = strcmp(cmd, "plan") == 0 || strcmp(cmd, "ensure-for") == 0;
+	const bool item_verb = strcmp(cmd, "fetch") == 0 || strcmp(cmd, "install") == 0;
+	if (!is_known || (plan_verb && for_c == NULL) || (item_verb && arg == NULL)) {
+		usage();
+		return DXR_GET_USAGE;
+	}
+	const char *target = plan_verb ? for_c : arg;
+
+	struct dxr_catalog c;
+	bool no_network = false;
+	int r = catalog_where != NULL ? load_catalog(catalog_where, !no_verify, &c, &no_network)
+	                              : load_default_catalog(!no_verify, &c);
 	if (r != DXR_GET_OK) {
+		if (r == DXR_GET_OFFLINE) {
+			report_offline(cmd, target, json);
+		}
 		return r;
 	}
 
 	if (strcmp(cmd, "catalog") == 0) {
-		char *s = cJSON_Print(c.root);
+		char *s = cJSON_Print(c.doc);
 		printf("%s\n", s);
 		cJSON_free(s);
 		r = DXR_GET_OK;
 	} else if (strcmp(cmd, "detect") == 0) {
-		struct dxr_edid_id ids[32];
-		int n = dxr_detect_edids(ids, 32);
-		const cJSON *leia = component(&c, "leia_plugin");
-		char why_hi[256] = {0}, why_any[256] = {0};
-		bool hi = leia && detect_match(leia, true, why_hi, sizeof(why_hi));
-		bool any = leia && detect_match(leia, false, why_any, sizeof(why_any));
-		if (json) {
-			cJSON *o = cJSON_CreateObject();
-			cJSON *e = cJSON_AddArrayToObject(o, "edids");
-			for (int i = 0; i < n; i++) {
-				cJSON *x = cJSON_CreateObject();
-				cJSON_AddNumberToObject(x, "man", ids[i].man);
-				cJSON_AddNumberToObject(x, "prod", ids[i].prod);
-				cJSON_AddItemToArray(e, x);
-			}
-			cJSON *l = cJSON_AddObjectToObject(o, "leia_plugin");
-			cJSON_AddBoolToObject(l, "match", any);
-			cJSON_AddBoolToObject(l, "high_confidence", hi);
-			cJSON_AddStringToObject(l, "evidence", hi ? why_hi : why_any);
-			char *s = cJSON_PrintUnformatted(o);
-			printf("%s\n", s);
-			cJSON_free(s);
-			cJSON_Delete(o);
-		} else {
-			for (int i = 0; i < n; i++) {
-				printf("monitor EDID man=%u (0x%04X) prod=%u (0x%04X)\n", ids[i].man, ids[i].man,
-				       ids[i].prod, ids[i].prod);
-			}
-			printf("leia_plugin: %s%s%s\n",
-			       any ? (hi ? "MATCH (high confidence)" : "match (low confidence)") : "no match",
-			       any ? " -- " : "", hi ? why_hi : why_any);
-		}
-		r = DXR_GET_OK;
-	} else if (strcmp(cmd, "plan") == 0 || strcmp(cmd, "ensure-for") == 0) {
-		if (for_c == NULL) {
-			usage();
-			r = DXR_GET_USAGE;
-			goto done;
-		}
-		struct plan p;
-		make_plan(&c, for_c, min_runtime, &p);
+		r = cmd_detect(&c, json);
+	} else if (strcmp(cmd, "list") == 0 || strcmp(cmd, "outdated") == 0) {
+		r = cmd_list(&c, strcmp(cmd, "outdated") == 0, json);
+	} else if (plan_verb) {
+		static struct dxr_plan p;
+		char hint[200];
+		dxr_make_plan(&c, &k_env, for_c, min_runtime, DXR_PLAN_ENSURE, &p);
 		if (strcmp(cmd, "plan") == 0) {
 			if (json) {
-				print_plan_json(&p);
+				char *s = dxr_plan_json(&p);
+				printf("%s\n", s);
+				cJSON_free(s);
 			} else {
-				print_plan_text(&p);
+				dxr_plan_text(&p, stdout);
 			}
-			r = DXR_GET_OK;
+			// `plan` reports; only a range/ABI refusal changes its exit code,
+			// so a caller can tell the user before it asks for consent.
+			r = p.gate == DXR_GET_INCOMPATIBLE ? DXR_GET_INCOMPATIBLE : DXR_GET_OK;
 			goto done;
 		}
 		// ensure-for
-		(void)yes; // installers pass --yes; the consent prompt is theirs, not ours
-		int todo = 0;
-		for (int i = 0; i < p.n; i++) {
-			todo += needs_work(&p.a[i]);
+		dxr_plan_text(&p, stdout);
+		if (p.gate == DXR_GET_INCOMPATIBLE) {
+			dxr_log("not compatible: %s\n", p.gate_reason);
+			r = DXR_GET_INCOMPATIBLE;
+			goto done;
 		}
-		print_plan_text(&p);
-		if (todo > 0 && !is_admin()) {
+		if (p.todo > 0 && !is_admin()) {
 			dxr_log("installing needs an elevated process\n");
 			r = DXR_GET_NEEDS_ADMIN;
 			goto done;
 		}
-		r = DXR_GET_OK;
-		for (int i = 0; i < p.n; i++) {
-			if (p.a[i].state == ST_NOT_FETCHABLE && strcmp(p.a[i].component, "runtime") == 0) {
-				// The runtime the caller needs can't be had: say so, and don't
-				// install a plug-in for a runtime that isn't there.
-				r = DXR_GET_NOT_FETCHABLE;
-				goto done;
-			}
-		}
-		if (todo == 0) {
+		if (p.gate == DXR_GET_NOT_FETCHABLE) {
+			// What the caller needs can't be had: say so, and don't install a
+			// plug-in for a runtime that isn't there.
+			dxr_log("not fetchable: %s\n", p.gate_reason);
+			r = DXR_GET_NOT_FETCHABLE;
 			goto done;
 		}
-		// Download and verify EVERYTHING first: a network failure halfway must
-		// not leave a new runtime next to an ABI-stale plug-in.
-		wchar_t paths[4][MAX_PATH];
-		for (int i = 0; i < p.n; i++) {
-			if (needs_work(&p.a[i])) {
-				int rr = fetch_component(&c, p.a[i].component, paths[i], MAX_PATH, NULL);
-				if (rr != DXR_GET_OK) {
-					r = rr;
-					goto done;
+		if (p.todo == 0) {
+			r = DXR_GET_OK;
+			goto done;
+		}
+		(void)snprintf(hint, sizeof(hint), "dxr-get ensure-for %s", for_c);
+		r = execute_plan(&c, &p, no_start, hint);
+	} else if (strcmp(cmd, "install") == 0) {
+		static struct dxr_plan p;
+		char hint[200];
+		dxr_make_plan(&c, &k_env, arg, min_runtime, DXR_PLAN_INSTALL, &p);
+		dxr_plan_text(&p, stdout);
+		if (p.gate == DXR_GET_INCOMPATIBLE) {
+			dxr_log("%s: not compatible -- %s\n", arg, p.gate_reason);
+			r = DXR_GET_INCOMPATIBLE;
+			goto done;
+		}
+		if (p.todo == 0 && p.gate == DXR_GET_OK) {
+			for (int i = 0; i < p.n; i++) {
+				if (p.steps[i].is_target) {
+					dxr_log(
+					    "%s: %s installed, catalog has %s -- nothing to do (never downgrades)\n",
+					    arg, p.steps[i].installed,
+					    p.steps[i].target ? p.steps[i].target : "no build");
 				}
 			}
-		}
-		// Same order as the bundle (#461/#342): nothing may hold the runtime's
-		// or a plug-in's DLLs while their installers replace them -- an NSIS /S
-		// install skips a locked file silently -- and the service starts once,
-		// at the end, at the user's integrity level.
-		bool was_running = stop_service();
-		for (int i = 0; i < p.n && r == DXR_GET_OK; i++) {
-			if (needs_work(&p.a[i])) {
-				r = run_installer(
-				    p.a[i].component, paths[i],
-				    cJSON_GetObjectItemCaseSensitive(win_block(&c, p.a[i].component), "args"));
-			}
-		}
-		// #2713: a failed child install (exit 6: a program holds the client
-		// DLL) must leave the machine as it was found -- restart the service
-		// only if it was running before. A successful install starts it as
-		// always. The service is single-instance, so racing the installer's
-		// own restore-on-abort is harmless.
-		if (!no_start && (r == DXR_GET_OK || was_running)) {
-			start_service();
-		}
-	} else if (strcmp(cmd, "fetch") == 0 || strcmp(cmd, "install") == 0) {
-		if (arg == NULL) {
-			usage();
-			r = DXR_GET_USAGE;
+			r = DXR_GET_OK;
 			goto done;
 		}
-		if (strcmp(cmd, "install") == 0) {
-			char inst[64];
-			const cJSON *w = win_block(&c, arg);
-			const char *target = w ? jstr(w, "version") : NULL;
-			if (target && installed_version(&c, arg, inst, sizeof(inst)) && vercmp(inst, target) >= 0) {
-				dxr_log("%s: %s installed, catalog has %s -- nothing to do (never downgrades)\n", arg,
-				        inst, target);
-				r = DXR_GET_OK;
-				goto done;
-			}
-			if (!is_admin()) {
-				dxr_log("installing needs an elevated process\n");
-				r = DXR_GET_NEEDS_ADMIN;
-				goto done;
-			}
-			r = install_component(&c, arg);
-		} else {
-			wchar_t wout[MAX_PATH], path[MAX_PATH];
-			if (out_dir) {
-				(void)MultiByteToWideChar(CP_UTF8, 0, out_dir, -1, wout, MAX_PATH);
-			}
-			r = fetch_component(&c, arg, path, MAX_PATH, out_dir ? wout : NULL);
-			if (r == DXR_GET_OK) {
-				printf("%ls\n", path);
-			}
+		if (!is_admin()) {
+			dxr_log("installing needs an elevated process\n");
+			r = DXR_GET_NEEDS_ADMIN;
+			goto done;
 		}
-	} else {
-		usage();
-		r = DXR_GET_USAGE;
+		if (p.gate == DXR_GET_NOT_FETCHABLE) {
+			dxr_log("%s: nothing fetchable in the catalog -- %s\n", arg, p.gate_reason);
+			r = DXR_GET_NOT_FETCHABLE;
+			goto done;
+		}
+		(void)snprintf(hint, sizeof(hint), "dxr-get install %s", arg);
+		r = execute_plan(&c, &p, no_start, hint);
+	} else { // fetch
+		const cJSON *item = dxr_item_find(&c, arg);
+		if (item == NULL) {
+			dxr_log("%s: nothing fetchable in the catalog\n", arg);
+			r = DXR_GET_NOT_FETCHABLE;
+			goto done;
+		}
+		wchar_t wout[MAX_PATH], path[MAX_PATH];
+		if (out_dir) {
+			(void)MultiByteToWideChar(CP_UTF8, 0, out_dir, -1, wout, MAX_PATH);
+		}
+		r = fetch_asset(&c, item, dxr_item_asset(item), arg, path, MAX_PATH, out_dir ? wout : NULL);
+		if (r == DXR_GET_OK) {
+			printf("%ls\n", path);
+		}
 	}
 done:
-	cJSON_Delete(c.root);
+	dxr_catalog_free(&c);
 	return r;
 }

@@ -1,56 +1,304 @@
-# dxr-get — fetch, verify and install DisplayXR components
+# dxr-get — fetch, verify, install and remove DisplayXR components
 
-Epic [#2702](https://github.com/DisplayXR/displayxr-runtime/issues/2702) · P1 [#2704](https://github.com/DisplayXR/displayxr-runtime/issues/2704) · P2 [#2705](https://github.com/DisplayXR/displayxr-runtime/issues/2705) · catalog: `component-catalog.md` (PR #2706)
+Epic [#2702](https://github.com/DisplayXR/displayxr-runtime/issues/2702) · P1 [#2704](https://github.com/DisplayXR/displayxr-runtime/issues/2704) · P2 [#2705](https://github.com/DisplayXR/displayxr-runtime/issues/2705) · [ADR-064](../../adr/ADR-064-component-catalog-and-third-party-trust.md) steps 2 and 3 · catalog: [component-catalog.md](component-catalog.md)
 
-`dxr-get.exe` lets one DisplayXR component installer bring in the components it depends on.
-The first user is the DisplayXR Browser installer, which used to leave a box with a missing or
-too-old runtime in a broken state with only a warning. It is a small standalone Windows
-executable (`src/xrt/targets/get/`, static CRT, links nothing from the runtime), so any installer
-can embed it and run it on a machine that has no DisplayXR yet. The runtime installer also
-installs it into the runtime directory.
+`dxr-get.exe` is the install engine of the DisplayXR Catalog. It reads the signed catalog,
+works out what a component needs, downloads and verifies it, runs the installers in order,
+and records what it installed. Its first user is the DisplayXR Browser installer, which calls
+it to bring in a missing or too-old runtime.
 
-This document describes `dxr-get` as built: Windows, catalog schema 1, three components known by
-name, a compiled-in signer list, no uninstall. [ADR-064](../../adr/ADR-064-component-catalog-and-third-party-trust.md)
-proposes making it the install engine of the public DisplayXR Catalog (schema 2, any item class,
-per-publisher signers, receipts and uninstall); none of that is implemented, and each step of that
-plan amends this spec when it lands.
+It is a small standalone Windows executable (`src/xrt/targets/get/`, static CRT, links nothing
+from the runtime), so any installer can embed it and run it on a machine that has no DisplayXR
+yet. The runtime installer also installs it into the runtime directory.
+
+The code has two halves:
+
+| File | What it holds |
+|---|---|
+| `get_core.c` | every decision: the catalog model, the plan, compatibility, signer delegation, the inventory. No operating-system calls. Unit-tested on every platform (`tests/tests_get_catalog.cpp`) |
+| `get_main.c`, `get_http.c`, `get_verify.c`, `get_detect.c` | Windows: the network, the registry, Authenticode, the installers |
 
 ## Commands
 
 ```
-dxr-get [--catalog <url|file>] plan --for <component> [--min-runtime X.Y.Z] [--json]
-dxr-get [--catalog <url|file>] ensure-for <component> [--min-runtime X.Y.Z] [--yes] [--no-start-service]
-dxr-get [--catalog <url|file>] fetch <component> [--out <dir>]
-dxr-get [--catalog <url|file>] install <component>
+dxr-get [--catalog <url|file>] plan --for <item> [--min-runtime X.Y.Z] [--json]
+dxr-get [--catalog <url|file>] ensure-for <item> [--min-runtime X.Y.Z] [--yes] [--no-start-service]
+dxr-get [--catalog <url|file>] install <item> [--yes] [--no-start-service]
+dxr-get [--catalog <url|file>] fetch <item> [--out <dir>]
 dxr-get [--catalog <url|file>] detect [--json]
 dxr-get [--catalog <url|file>] catalog
+dxr-get [--catalog <url|file>] list [--json]
+dxr-get [--catalog <url|file>] outdated [--json]
+dxr-get list --installed [--json]
+dxr-get uninstall <id> [--json] [--no-start-service]
 ```
 
-Components: `runtime`, `leia_plugin`, `browser`. Human-readable log goes to stderr; stdout carries
-only results (`plan` text or JSON, the `fetch` path, `detect` output).
+`<item>` is a catalog id (`dxr-get list` shows them) or one of an item's `aliases`. The
+schema-1 names `runtime`, `leia_plugin` and `browser` keep working, with either schema.
 
-- **`ensure-for <c>`** is what installers call. It makes sure the prerequisites of component
-  `<c>` are present, then stops. It does not install `<c>` itself (the caller is doing that), and
-  it is not an updater:
-  - **runtime:** installed if missing or older than the floor. The floor is `--min-runtime` when
-    given, else the catalog's `<c>.requires.runtime`, raised to the Leia plug-in's own floor when
-    the plug-in is wanted.
-  - **leia_plugin:** wanted only on a **high-confidence** catalog detect rule matching this
-    machine (§Detection). It is installed if missing. It is also brought to the catalog version
-    when the runtime is being installed or upgraded in the same pass, because the catalog pins
-    are an ABI-matched set.
-  - **Order:** everything is downloaded and verified first, then the DisplayXR service and its
-    satellites (`displayxr-conversion-host`, `displayxr-tracking-host`) are stopped, the
-    installers run (runtime first), and the service starts once at the end.
-  - **Starting the service:** through the user's `explorer.exe`, so it runs at Medium integrity
-    (#1478). Skip this with `--no-start-service`, for a caller that restarts the service itself
-    (the bundle).
-- **`plan`** prints what `ensure-for` would do. The `--json` form has one flat object per
-  component: `component`, `installed` (or null), `state`
-  (`ok | missing | too_old | not_fetchable`), `required`, `target`, `size` (bytes) and `reason`.
-- **`install <c>`** fetches and installs one component, and does nothing if the installed
-  version is at or above the catalog's.
-- **`detect`** shows the evidence (monitor EDID ids) and whether the Leia rules match.
+The human-readable log goes to stderr. stdout carries only results: the plan, the `fetch`
+path, `detect`, `catalog`, `list`, `outdated` and the `--json` documents.
+
+| Verb | Needs the catalog | Needs elevation | What it does |
+|---|---|---|---|
+| `plan --for X` | yes | no | prints what `ensure-for X` would do. Changes nothing |
+| `ensure-for X` | yes | when something must be installed | installs what X **needs**, not X itself |
+| `install X` | yes | when something must be installed | installs X **and** what it needs |
+| `fetch X` | yes | no | downloads and verifies X's installer, prints its path |
+| `detect` | yes | no | shows the monitor EDID ids and which items' detect rules match |
+| `catalog` | yes | no | prints the catalog document as fetched |
+| `list` | yes | no | every catalog item with its installed version and state |
+| `outdated` | yes | no | the items whose installed version is behind the catalog's |
+| `list --installed` | **no** | no | the install receipts on this machine |
+| `uninstall <id>` | **no** | yes | removes an item that `dxr-get` installed |
+
+### ensure-for
+
+This is what installers call. It makes sure the prerequisites of item `X` are present, then
+stops. It does not install `X` itself (the caller is doing that), and it is not an updater.
+
+- **Runtime.** Installed if it is missing or older than the floor. The floor is
+  `--min-runtime` when given, else `X`'s own (`requires` kind `runtime`, or `runtime.min`).
+  It is raised to the floor of every other item this pass installs.
+- **Items `X` requires** (`requires` kind `item`). Installed if missing or below the stated
+  floor, before anything that needs them. They are not brought to the catalog's version
+  when they already satisfy the floor.
+- **External prerequisites of `X`** (`requires` kind `external`). Detected with the catalog's
+  rules and reported as present or missing. One that carries its own installer asset is
+  installed when it is absent, and never to upgrade one that is present.
+- **Hardware items.** Any other item whose `detect` rules match this machine with **high**
+  confidence (§ Detection) is installed if missing. It is also brought to the catalog's
+  version when the runtime is being installed or upgraded in the same pass, because the
+  catalog's pins are an ABI-matched set. Today that is the Leia display plug-in on a Leia
+  panel. A hardware item that cannot be installed never fails the pass.
+- **Order.** Everything is downloaded and verified first. Then the DisplayXR service and its
+  satellites (`displayxr-conversion-host`, `displayxr-tracking-host`) are stopped, the
+  installers run (the runtime first, then prerequisites before what needs them), and the
+  service starts once at the end.
+- **Starting the service.** Through the user's `explorer.exe`, so it runs at Medium integrity
+  (#1478). `--no-start-service` skips this, for a caller that restarts the service itself
+  (the bundle). A plan that installs only applications does not stop or start the service.
+
+### install
+
+`install X` is `ensure-for X` plus `X` itself: the same prerequisites in the same order, then
+`X`, brought to the catalog's version. It does nothing when `X` is installed at or above the
+catalog's version, and it never downgrades. Hardware detection plays no part: only what `X`
+requires is installed with it.
+
+### plan
+
+`plan --for X` prints the `ensure-for X` plan. The text form has one line per component,
+including the ones that need nothing:
+
+```
+DisplayXR Runtime: 2.64.0 is too old -> update to 2.70.0 (47.7 MB)
+Leia SR display processor: 2.23.0 is installed and is the catalog's version -> not downloaded
+Prerequisite MISSING: Handco Tracking Service (needed by handco.hands). DisplayXR does not install it; get it from https://…
+Total download: 47.7 MB
+Already downloaded: 12.0 MB, still to fetch: 35.7 MB
+```
+
+`--json`:
+
+```json
+{"for":"browser","schema":2,"gate":0,"total_size":50034808,"total_download":50034808,
+ "actions":[
+  {"component":"runtime","installed":"2.64.0","state":"too_old","required":">=2.66.8","target":"2.70.0",
+   "size":50034808,"id":"runtime","kind":"item","action":"upgrade","current":false,"download":50034808},
+  {"component":"leia_plugin","installed":"2.23.0","state":"ok","target":"2.23.0","size":31457280,
+   "reason":"detected: display EDID 44048/16711 DELL_8K32 (high confidence)",
+   "id":"leia-sr","kind":"item","action":"none","current":true,"hash_match":true,"download":0}],
+ "prerequisites":[{"name":"Handco Tracking Service","for":"handco.hands","met":false,"installable":false,"info_url":"https://…"}]}
+```
+
+| Field | Meaning |
+|---|---|
+| `gate` | `0`, `40` (a needed component cannot be had) or `41` (not compatible). `gate_reason` says why. `ensure-for` and `install` exit with it |
+| `total_size` | bytes of every asset the plan would install |
+| `total_download` | the same, minus what the download cache already holds |
+| `actions[].component` | the schema-1 name of the item (its first alias, else its id); for an external prerequisite, its name |
+| `actions[].state` | `ok`, `missing`, `too_old`, `not_fetchable`, `incompatible` |
+| `actions[].action` | `none` (nothing to do), `install`, `upgrade`, `reinstall` (same version, another build), `skip` (cannot be installed) |
+| `actions[].current` | installed at exactly the catalog's version |
+| `actions[].hash_match` | present when a receipt exists for the installed version: whether the installed asset's SHA-256 equals the catalog's |
+| `actions[].download` | bytes still to fetch for this action; `0` when nothing is downloaded |
+| `actions[].kind` | `item`, or `external` for a prerequisite's own installer |
+| `prerequisites[]` | every external prerequisite, met or not, and whether it carries an installer |
+
+**The action objects are flat, and `component` is their first key.** Deployed installers scan
+this output with a string search, from `"component":"` to the first `}`, and read `state`,
+`target` and `size` from that span (the DisplayXR Browser installer does). New fields are
+added after the schema-1 ones, and nothing is ever nested in an action. A unit test
+reproduces that scan.
+
+### Skip-if-current
+
+An item installed at the catalog's version is not downloaded again. The check is the
+installed version (read the way the catalog says, § Receipts) against the asset's version,
+and, when a receipt exists for that version, the receipt's SHA-256 against the asset's.
+
+| Installed | Receipt hash | `ensure-for` | `install` |
+|---|---|---|---|
+| older than the floor | any | upgraded | upgraded |
+| satisfies the floor, older than the catalog | any | left alone | upgraded |
+| equal to the catalog | equal, or no receipt | not downloaded | not downloaded |
+| equal to the catalog | **differs** | left alone | re-installed (`action: reinstall`) |
+| newer than the catalog | any | left alone | left alone (never downgraded) |
+
+A download that is already in the cache is not fetched again either; see § Downloads.
+
+### list, outdated
+
+`list` shows every item of the catalog whose class this build knows: id, class, installed
+version, the catalog's version and a state (`not_installed`, `current`, `outdated`, `newer`,
+`rebuilt` = same version but another build than the receipt records, `installed` = present
+but the catalog has no build to compare with). It includes components that were installed by
+their own installers, because the installed version is read from the machine, not from a
+receipt. `outdated` is the same list filtered to `outdated` and `rebuilt`. Both exit 0.
+
+`--json` gives `{"schema":2,"items":[…]}` or `{"schema":2,"outdated":[…]}`, each entry with
+`id`, `name`, `class`, `registered_id`, `publisher`, `tier`, `installed` (or null),
+`available` (or null), `state`, `installable`, `receipt` and, for a link-out, `listing`.
+
+`list --installed` reads the install receipts and nothing else. It needs no catalog and no
+network. `--json` gives `{"installed":[…]}` with `id`, `name`, `class`, `publisher`,
+`version`, `source_url`, `sha256`, `install_time`, `can_uninstall` and `uninstall_command`.
+
+### uninstall
+
+`uninstall <id>` removes an item that `dxr-get` installed. It needs no catalog and no
+network: everything comes from the receipt.
+
+1. No receipt for that id: exit 42. A component installed by its own installer is removed
+   from Windows Settings.
+2. The receipt holds no uninstall command (the catalog gave none): exit 43.
+3. Another receipt lists this id in its requirements: exit 43, naming them.
+4. Not elevated: exit 50.
+5. The service and its satellites are stopped when the item's class is one the runtime or
+   the service loads. The receipt's command runs. `dxr-get` waits for it, then waits up to
+   two minutes for the item's installed-version value to disappear, because an NSIS
+   uninstaller copies itself to `%TEMP%` and returns at once.
+6. On success the receipt is deleted and the service is started again (not after removing
+   the runtime). If the uninstaller fails, or the component still reports a version, the
+   receipt is kept and the exit code is 30.
+
+`--json` prints `{"id","result","exit","detail"}`; `result` is `uninstalled`,
+`not_installed`, `no_uninstall_command`, `required_by_others`, `needs_elevation` or `failed`.
+
+External prerequisites installed on the way are not uninstalled and get no receipt: they
+have their own licences and other software may depend on them.
+
+## Which catalog
+
+With `--catalog` or `DXR_GET_CATALOG`, that one document is used, whichever schema it is.
+
+Otherwise `dxr-get` fetches schema 2 (`catalog/v2/stable.json`) and **falls back to schema 1**
+(`catalog/v1/stable.json`) when the schema-2 document is not published (any HTTP error),
+unreadable, of an unknown schema, or expired. It does not fall back when the schema-2
+signature or serial is refused (exit 11: that is a refusal, not an absence), and it does not
+try schema 1 when the host could not be reached at all (same host, and the second attempt
+would only double the wait).
+
+A schema-1 catalog is converted to the schema-2 model when it is parsed, so every verb
+behaves the same on both. That conversion is the only place the three schema-1 component
+names appear in the code. What schema 1 does not carry is simply absent: no class ABI, no
+uninstall command, no external prerequisites.
+
+## Compatibility gating
+
+An item is refused, with exit **41** and a message naming the versions, when:
+
+- its `runtime.max` is below the runtime this machine has, or would have after the plan. The
+  runtime is never downgraded, or held back, to fit;
+- its `runtime.min` is above what the machine has and the catalog's runtime cannot reach it;
+- its `abi` range for a class does not contain the major the runtime implements for that
+  class. The loader would reject the plug-in (ADR-020), so it is not installed.
+
+The runtime's class ABI majors come from `HKLM\Software\DisplayXR\Runtime\Abi\<class>`
+(DWORD values `display_processor`, `input_provider`, `conversion_provider`,
+`tracking_provider`), which the runtime installer writes from the class headers. When the
+runtime is being replaced in the same plan, the catalog's runtime item says what the new one
+implements (its own `abi` object). When neither source has the number, the ABI is **not
+checked** and the plan says so (`… ABI not checked: the runtime does not publish it`): an
+unknown ABI is not a refusal. Runtimes released before this change do not write the values.
+
+The refusal applies to the item asked for and to the items it requires. A hardware item
+picked up by detection that is out of range is reported as `incompatible` and skipped; it
+does not fail the pass. `plan` exits 41 too, so an installer can tell the user before it asks
+for consent.
+
+A floor that comes from `requires` (or `--min-runtime`) and cannot be satisfied keeps the
+schema-1 result, exit 40.
+
+## Prerequisites
+
+`requires` entries are resolved before the item, depth first:
+
+| Kind | What happens |
+|---|---|
+| `runtime` | raises the runtime floor. The runtime is planned first |
+| `item` | that item is planned before this one, with its own requirements before it. An unknown id or a cycle fails the plan (exit 40) instead of looping |
+| `external`, no asset | detected and reported. A missing one is shown with its `info_url`; the item is still installed |
+| `external`, with an asset for `windows-x64` | detected. When absent, its installer is downloaded, verified and run **immediately before the item**. Its size is part of the total. It must be signed by a signer delegated to the item's publisher, like any asset |
+
+Detect rules for an external prerequisite are the catalog's `detect` kinds (§ Detection); the
+prerequisite is met when any rule matches.
+
+## Downloads
+
+Every asset of a plan is fetched and verified **before the first installer runs**: the item's
+own asset and the assets of its external prerequisites. The total size is printed before any
+download starts.
+
+What the downloader already did (P1), unchanged:
+
+- the finished file is named by its hash (`%ProgramData%\DisplayXR\Downloads\<sha256>-<file>`)
+  and a cached copy is used only if it hashes to the catalog's digest;
+- an interrupted download is kept as `<name>.part` and resumed with an HTTP `Range` request;
+  when the server ignores the range (answers 200) the download starts over;
+- transport errors and 5xx answers are retried with backoff, four attempts per URL, then the
+  next URL is tried (the release URL, then the GitHub API asset URL: the 504 case);
+- only a complete file of exactly `size` bytes is accepted, its SHA-256 is compared, and a
+  mismatch discards the file (exit 21). There is no override for the hash check.
+
+What ADR-064 step 2 added:
+
+- several assets per plan, each resumed and verified on its own, in plan order;
+- the total size, and how much of it the cache already holds, known before the first byte
+  (`total_size`, `total_download`, and `download` per action);
+- a 206 answer whose `Content-Range` does not start at the offset asked for restarts the
+  download, instead of appending the bytes at the wrong offset and failing the hash check at
+  the end;
+- the same size, hash and signer rules for an external prerequisite's asset.
+
+## Receipts
+
+After an item's installer exits 0, `dxr-get` writes a receipt under
+`HKLM\Software\DisplayXR\Catalog\<id>` (64-bit view, `REG_SZ` values):
+
+| Value | Content |
+|---|---|
+| `Name`, `Class`, `Publisher` | from the catalog item |
+| `Version` | the version of the asset that was installed |
+| `SourceUrl` | the asset's first URL |
+| `Sha256`, `File` | the asset's digest and file name |
+| `InstallTime` | UTC, `YYYY-MM-DDTHH:MM:SSZ` |
+| `UninstallCommand` | the complete command line `uninstall` runs. Read **at install time** from where the catalog's `uninstall` rule points (`registry_command`: the registry value, then its `args`). Empty when the catalog gives no `uninstall` rule |
+| `VersionPath` | the registry value that holds the item's installed version |
+| `Requires` | comma-separated ids of the items this one required (`runtime` for a runtime floor) |
+
+The installed version of an item is read, in this order: from the asset's `installed` rule
+(`registry_sz`: a registry value; `registration_row`: the `Version` value of the item's own
+class row, `HKLM\Software\DisplayXR\<ClassRoot>\<registered_id>\Version`); for an item with
+no asset here, from the runtime's version value or the class row; and only when the catalog
+gives nothing to read, from the receipt.
+
+A receipt exists only for what `dxr-get` installed. A component installed by its own
+installer or by the bundle has none: it shows in `list` and `outdated`, not in
+`list --installed`, and `uninstall` answers 42 for it. The generator emits no `uninstall`
+rule for the three first-party components today, so their receipts carry no uninstall
+command and `uninstall` answers 43 for them until the catalog gains the rule.
 
 ## Exit codes
 
@@ -61,49 +309,112 @@ only results (`plan` text or JSON, the `fetch` path, `detect` output).
 | 10 | offline: catalog unreachable, unparsable, unsupported schema, or **expired** |
 | 11 | catalog signature invalid, or its serial is older than one this machine already accepted |
 | 20 | download failed (after retries on every URL) |
-| 21 | verification failed: size, SHA-256, or Authenticode signer |
-| 30 | a component installer exited non-zero |
-| 40 | the required component has no signed Windows build in the catalog that satisfies the floor |
-| 50 | installing needs an elevated process |
+| 21 | verification failed: size, SHA-256, Authenticode signer, a signer the publisher was not delegated, or a revoked build |
+| 30 | a component installer or uninstaller exited non-zero, was still running after an hour, or left the component installed |
+| 40 | a needed component has no signed Windows build in the catalog that satisfies the floor |
+| 41 | the item's runtime range or class ABI excludes this machine's runtime |
+| 42 | `uninstall`: `dxr-get` has no receipt for that id |
+| 43 | `uninstall`: no uninstall command was recorded, or other installed items require it |
+| 50 | installing or uninstalling needs an elevated process |
+
+Codes 0 to 40 and 50 mean what they meant for the schema-1 tool. `dxr-get` does not relaunch
+itself elevated; a front end that wants that does it (ADR-064 step 4).
 
 ## Trust rules
 
-- **Catalog signature:** Ed25519 over the exact bytes of `stable.json`, checked against keys
-  compiled into dxr-get (key id `9b762f9a`). The catalog's `expires` must lie in the future.
-  An expired catalog is treated as **offline**: it can make dxr-get do nothing, never install.
-- **Rollback guard:** the highest serial accepted is kept in
-  `HKLM\SOFTWARE\DisplayXR\Update\CatalogSerial`, and an older serial is refused.
-- **Every payload is checked:** size and SHA-256 must equal the catalog's. Then `WinVerifyTrust`
-  must report a valid Authenticode signature whose leaf signer CN equals both the catalog's
-  `signer` and an entry in the compiled-in list (`Leia, Inc.`). The download is named by its hash
-  (`%ProgramData%\DisplayXR\Downloads\<sha256>-<file>`), resumes with `Range`, and falls back
-  from the release URL to the GitHub API asset URL (the 504 case).
+- **Catalog signature.** Ed25519 over the exact bytes of `stable.json`, checked against the
+  keys compiled into dxr-get (key id `9b762f9a`), for both schemas. The catalog's `expires`
+  must lie in the future. An expired catalog is treated as **offline**: it can make dxr-get
+  do nothing, never install.
+- **Rollback guard.** The highest serial accepted is kept under
+  `HKLM\SOFTWARE\DisplayXR\Update`, in `CatalogSerialV2` for schema 2 and `CatalogSerial` for
+  schema 1, and an older serial is refused. The two values are separate so that a schema-1
+  catalog accepted by an older `dxr-get` on the machine cannot make this one refuse a
+  schema-2 catalog.
+- **Every installable binary is signed.** An asset without a `signature` is not installable
+  (state `not_fetchable`). There is no hash-pinned-only form.
+- **Signers are per publisher.** The signed catalog names each publisher's signers
+  (`publishers.<id>.signers.windows-x64`, by certificate subject). A payload is accepted only
+  when (1) its asset's `signature.signer` is one of **its own item's publisher's** signers,
+  and (2) `WinVerifyTrust` reports a valid Authenticode signature whose leaf subject equals
+  that signer. One publisher's signer cannot vouch for another publisher's item. An unknown
+  `signature.kind` is refused, not skipped.
+- **Schema 1 keeps the compiled-in signer list.** A schema-1 catalog names no publishers, so
+  for it the delegation is the list compiled into dxr-get (`Leia, Inc.`), exactly as before.
+  For schema 2 the only thing compiled in is the catalog keys.
+- **Revoked builds.** An asset whose SHA-256 is in the catalog's `revoked` list is refused.
+- **Every payload is checked:** size and SHA-256 must equal the catalog's, then the signer
+  rule above. This holds for an external prerequisite's asset too.
 - **What dxr-get never does:**
   - downgrade a component;
   - write `Trust\Allowlist`;
   - touch `ActiveRuntime` (the runtime installer owns it; see below);
-  - follow a redirect to plain HTTP.
+  - follow a redirect to plain HTTP, or fetch a plain-HTTP URL;
+  - ask for an account, a key or a payment. Installing is anonymous.
 - **Dev overrides:**
   - `DXR_GET_CATALOG=<url|file>` points dxr-get at another catalog. That catalog must still be
     signed, so the override grants nothing.
   - `DXR_GET_DEV=1` plus `--no-verify-catalog` skips the catalog signature.
-  - `DXR_GET_ALLOW_UNSIGNED=1` skips the Authenticode check. The hash check always stays on.
+  - `DXR_GET_ALLOW_UNSIGNED=1` skips the Authenticode check of the downloaded file. The hash
+    check and the catalog-side signer delegation always stay on.
+
+## Offline, and no unbounded wait
+
+- **No catalog** (no network, a captive portal, an expired document): exit 10, before
+  anything is changed. stderr says what was skipped and the command to run later; with
+  `--json`, stdout carries `{"offline":true,"reason":…,"skipped":[…],"retry":"dxr-get …"}`.
+  What is already installed keeps working. `list --installed` and `uninstall` do not need the
+  catalog and work offline.
+- **A download fails after the catalog was read:** exit 20, nothing is installed (downloads
+  come before installers), the log names what was not installed, and the partial file is kept
+  so the same command resumes it.
+- **Bounds.** Each HTTP request has connect, send and receive timeouts (15 s, 15 s, 30 s,
+  60 s) and at most four attempts with 1 s, 4 s and 15 s between them. A child installer or
+  uninstaller is waited for at most one hour; one still running after that is reported as
+  failed (exit 30) and is not killed. Stopping the service waits at most 5 s per process.
 
 ## Detection (P2)
 
-The rules are data in the signed catalog (`leia_plugin.detect`), generated from the Leia
-plug-in's own EDID table (`src/drv_leia/leia_edid_table.h` in displayxr-leia-plugin). Supporting
-a new panel therefore needs a plug-in release and a catalog re-sign, not a new dxr-get.
+Detect rules are data in the signed catalog: an item's `detect` array, and the `detect` array
+of an external prerequisite. Supporting a new panel therefore needs a catalog change, not a
+new dxr-get. The Leia plug-in's rules are generated from its own EDID table
+(`src/drv_leia/leia_edid_table.h` in displayxr-leia-plugin).
 
-- **`edid`** matches `{man, prod}` against the present monitors' EDIDs. Both 16-bit words are
-  read little-endian, the plug-in table's convention: Dell shows as `man` 44048 (`0xAC10`). A Leia
-  panel can carry another brand's manufacturer id (the 8K Leia display enumerates as Dell
-  `DEL4147`), which is why the product id is part of every rule. The full EDID value is read,
-  because 8K panels carry DisplayID extension blocks well past 256 bytes.
-- **`registry_dword_min`** means the SR platform reports a connected device:
-  `HKLM\SOFTWARE\Dimenco\Simulated Reality\NConnectedDevices >= 1`.
-- **Low-confidence rules** (the generic Acer product ids 0–3) are reported by `detect` but never
-  trigger an install.
+| Kind | Matches when |
+|---|---|
+| `edid` | `{man, prod}` equals a present monitor's EDID ids. Both 16-bit words are read little-endian, the plug-in table's convention: Dell shows as `man` 44048 (`0xAC10`). A Leia panel can carry another brand's manufacturer id (the 8K Leia display enumerates as Dell `DEL4147`), which is why the product id is part of every rule. The full EDID value is read, because 8K panels carry DisplayID extension blocks well past 256 bytes |
+| `registry_dword_min` | the DWORD `key`\\`value` is at least `min` (the SR platform's `NConnectedDevices >= 1`) |
+| `registry_sz_min` | the string `key`\\`value` is a dotted version at or above `min` |
+| `registry_key_exists` | the `HKLM` key exists |
+| `file_exists` | `path` exists. An absolute path only; a path with `%` or without a drive is never matched |
+| `service_exists` | a Windows service named `name` is installed (running or not) |
+
+Registry rules read the 64-bit view. A rule of an unknown kind is not matched.
+
+`detect` evaluates the rules of **every** item that has some, and prints one entry per item
+under its schema-1 name (so the Leia plug-in's key is still `leia_plugin`). Low-confidence
+rules (the generic Acer product ids 0–3) are reported and never trigger an install.
+
+## What changed for the three first-party components
+
+Their behaviour and exit codes are the schema-1 tool's, with these deliberate differences:
+
+| Verb | Before | Now |
+|---|---|---|
+| `install X` | installed X only | installs what X requires first (a missing or too-old runtime), and stops and restarts the service around a component the runtime loads |
+| `plan` (text) | printed only what needed work | also prints one line per component that needs nothing |
+| `plan --json` | the schema-1 fields | the same fields in the same order, plus new ones after them |
+| `ensure-for`, `install` | no record | write a receipt per installed item |
+| `detect --json` | one `leia_plugin` object | the same object (plus its `id`), and one per other item with detect rules |
+| any | waited for a child installer without limit | waits at most one hour |
+
+## Not implemented yet
+
+- A second, standby catalog root key (ADR-064 §4): it needs a key pair generated offline.
+- Installer kinds other than `exe` (`msi`, `deb`, `pkg`): such an asset is `not_fetchable`.
+- Elevation relaunch, and the `displayxr-cli catalog` front end (step 4).
+- macOS and Linux (step 5).
+- Progress output a setup UI can render.
 
 ## Runtime installer: ActiveRuntime on upgrade
 

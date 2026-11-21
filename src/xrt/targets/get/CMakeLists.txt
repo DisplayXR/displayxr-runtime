@@ -10,6 +10,7 @@
 add_executable(
 	dxr-get
 	get_main.c
+	get_core.c
 	get_http.c
 	get_verify.c
 	get_detect.c

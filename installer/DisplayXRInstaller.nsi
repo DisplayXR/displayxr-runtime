@@ -1353,6 +1353,23 @@ client_dll_ok:
 	WriteRegStr HKLM "Software\DisplayXR\Runtime" "InstallPath" "$INSTDIR"
 	WriteRegStr HKLM "Software\DisplayXR\Runtime" "Version" "${VERSION}"
 
+	; ADR-064: the class ABI majors this runtime implements (from the class
+	; headers, via installer/CMakeLists.txt). dxr-get reads them to refuse a
+	; catalog item whose plug-in the loader would reject (ADR-020) instead of
+	; installing it. The uninstaller removes them with the Runtime key.
+	!ifdef ABI_DISPLAY_PROCESSOR
+		WriteRegDWORD HKLM "Software\DisplayXR\Runtime\Abi" "display_processor" ${ABI_DISPLAY_PROCESSOR}
+	!endif
+	!ifdef ABI_INPUT_PROVIDER
+		WriteRegDWORD HKLM "Software\DisplayXR\Runtime\Abi" "input_provider" ${ABI_INPUT_PROVIDER}
+	!endif
+	!ifdef ABI_CONVERSION_PROVIDER
+		WriteRegDWORD HKLM "Software\DisplayXR\Runtime\Abi" "conversion_provider" ${ABI_CONVERSION_PROVIDER}
+	!endif
+	!ifdef ABI_TRACKING_PROVIDER
+		WriteRegDWORD HKLM "Software\DisplayXR\Runtime\Abi" "tracking_provider" ${ABI_TRACKING_PROVIDER}
+	!endif
+
 	; ADR-053 P4 (#2108): the runtime-owned conversion model store. Root order
 	; as the runtime resolves it: an existing Models\Path, else the browser's
 	; ModelsPath (adopted, so its blobs are not downloaded twice), else
