@@ -744,8 +744,34 @@ Rules that follow from "never guessed":
   (versions-json-autobump.md, "A component with no release yet").
 - If the Ultraleap provider's runtime pin cannot be read at its tag, the item is **not
   listed at all**: without the range it would read as "works on any runtime".
-- The NeurD prerequisite carries no `info_url`, because its download page is not recorded
-  anywhere this generator reads.
+- The NeurD prerequisite carries no `info_url` and no installer `asset`: no public download
+  of NeurD exists yet. When a public signed build exists the entry gains an asset.
+- Its floor and its one detect rule are the **Windows** facts: 0.4.6 (the provider's
+  `MinVersion`) and the `Version` value under `HKLM\SOFTWARE\LeiaInc\NeurD`, which NeurD's own
+  installer writes. The rule's `note` says what it does not see. The Linux facts (below) are
+  recorded here and in the generator, not in the document.
+
+**What an external prerequisite cannot say.** Found while encoding NeurD; none of it is
+worked around with an invented key or detector kind.
+
+| Fact about NeurD | Expressible today | Why not |
+|---|---|---|
+| Windows floor 0.4.6 | yes: `min_version`, and `registry_sz_min` with `min` | |
+| Linux: 0.4.6 converts, look-around needs 0.5.0 | **no** | `min_version` is one string for every platform; only `asset` is keyed by platform |
+| Windows: registered under `HKLM\SOFTWARE\LeiaInc\NeurD` | yes: `registry_sz_min` | |
+| Windows: found on `PATH` | **no** | no detector resolves a library name on `PATH` |
+| Windows and Linux: the `NEURD_PATH` environment variable | **no** | no detector reads an environment variable; `file_exists` takes an absolute path with no expansion, on purpose |
+| Linux: `/opt/immersity/neurd-runtime` | **no** | `detect` rules carry no platform, and `file_exists` accepts a Windows drive path only |
+| Linux: the version in that directory's `VERSION.txt` | **no** | no detector reads a version from a file |
+| macOS: nothing to install | yes: the item lists no macOS asset | |
+
+Consequences today, all on the safe side: on Windows a NeurD present only through `PATH` or
+`NEURD_PATH` is reported as unmet (the item still installs, and the provider finds it); the
+authoritative answer on any box is `displayxr-cli conv status`. On Linux nothing is evaluated,
+because the POSIX engine does not exist yet (ADR-064 step 5). What that step needs, as a
+follow-up to this schema: a platform key on an external entry's `min_version` and `detect`,
+and POSIX detector kinds (a file at an absolute POSIX path, a version read from a file, a
+library that resolves).
 - The Ultraleap asset name carries a build number (`DisplayXRUltraleapSetup-<v>.<build>.exe`);
   the highest build of the pinned version is taken.
 - There is no carry-forward for these components yet: it needs a previously *published*
