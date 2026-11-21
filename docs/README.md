@@ -71,6 +71,8 @@ Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary co
 - [Legacy App Support](specs/runtime/legacy-app-support.md) — compromise scaling for non-extension apps
 - [Workspace Controller Registration](specs/runtime/workspace-controller-registration.md) — how shell-style apps register with the runtime
 - [DisplayXR App Manifest](specs/runtime/displayxr-app-manifest.md) — sidecar JSON for app discovery
+- [Component catalog](specs/runtime/component-catalog.md) — the signed index of installable components: schema 1 (what `dxr-get` reads today) and the proposed schema 2 for the public DisplayXR Catalog (publishers, item classes, per-platform assets, licence terms, external prerequisites, trust tiers; ADR-064)
+- [dxr-get](specs/runtime/dxr-get.md) — the Windows tool that fetches, verifies and installs components from the catalog: commands, exit codes, trust rules, detection
 
 ---
 
@@ -81,6 +83,7 @@ Integrate your 3D display hardware into DisplayXR.
 - **[Vendor Plug-in Onboarding](guides/vendor-plugin-onboarding.md)** — zero-to-shipping guide for a new vendor's external plug-in repo (post-#263 model)
 - **[`xrt_plugin_iface` reference](reference/xrt_plugin_iface.md)** — per-method contract for the plug-in vtable
 - **[Plug-in discovery spec](specs/runtime/plugin-discovery.md)** — registry / JSON manifest formats, env-var overrides
+- **[Component catalog](specs/runtime/component-catalog.md)** + **[ADR-064](adr/ADR-064-component-catalog-and-third-party-trust.md)** — how a third-party component is listed, verified, installed and (for paid plug-ins) licensed: schema 2, the Verified / Community tiers, per-publisher signers (proposed)
 - **[Conversion-provider discovery spec](specs/runtime/conversion-provider-discovery.md)** — the third plug-in type (2D→3D models: depth, view synthesis, splats): C ABI summary, registry / manifest formats, selection, readiness, hosting rules, model packs (draft, ADR-053)
 - **[ADR-019: Vendor Plug-in / Aux Boundary](adr/ADR-019-vendor-plugin-aux-boundary.md)** — why the runtime DLL holds zero vendor identifiers
 - **[ADR-022: Per-Mode Capability Flags + Frozen Enumerated App Structs](adr/ADR-022-per-mode-capability-flags-frozen-enum-structs.md)** — `mode_flags` bits (no more rendering-mode ABI breaks) + `XrDisplayRenderingModeInfoDXR` frozen at v13 (all future per-mode fields chain)
@@ -174,6 +177,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-061](adr/ADR-061-3d-screen-share.md) — 3D screen share — a running app's pre-weave views are a stereo-camera source of kind app
 - [ADR-062](adr/ADR-062-window-visibility-drives-lens-weave-and-session-state.md) — Window visibility drives the lens, the weave and the session state — one runtime-owned signal
 - [ADR-063](adr/ADR-063-input-provider-device-abi-hardening.md) — Harden the provider-device ABI — the devices an input provider returns get a versioned contract
+- [ADR-064](adr/ADR-064-component-catalog-and-third-party-trust.md) — Component catalog and third-party trust
 <!-- END ADR INDEX -->
 
 ---
