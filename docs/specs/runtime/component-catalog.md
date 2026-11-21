@@ -86,6 +86,9 @@ Field rules:
   `prod` = bytes 10-11 little-endian, decimal; `prod < 16` → `low` (generic Acer DS ids),
   else `high`; a row without its own comment inherits the previous row's note), plus the
   fixed SR-platform registry rule. Clients install the plug-in unattended only on a `high` match.
+  That parse is the **fallback**: when the pinned release carries a `displayxr-detect.json`
+  (see [Display plug-in detect manifest](#display-plug-in-detect-manifest)), its rules, floor and
+  registry key are used instead. For Leia both give the same bytes.
 
 Clients ignore unknown keys and unknown components, and accept `schema == 1` only: any other
 value is treated as an unreachable catalog. Schema 1 is **frozen** (see
@@ -358,11 +361,28 @@ of the display plug-in's own table. Dell's bytes `0x10 0xAC` are therefore `man`
 three-letter PNP id is packed in: a rule written from the PNP id would be `4268` (`0x10AC`)
 for Dell and would never match.
 
-`detect` rule kinds: `edid` and `registry_dword_min` (schema 1), plus `registry_sz_min`
-(a dotted version string at or above `min`), `registry_key_exists` and `file_exists` (an
-absolute path, no environment expansion) and `service_exists` (`name`: a Windows service
-that is installed, running or not). A client treats a rule of an
-unknown kind as not matched.
+`detect` rule kinds:
+
+| `kind` | fields | matches when |
+|---|---|---|
+| `edid` | `man`, and `prod` **or** `prod_min` + `prod_max` (inclusive) | a present monitor's EDID has that manufacturer id and a product id in range. Both are 16-bit words from EDID bytes 8-9 / 10-11, decimal (Dell = `44048`), the Leia table's convention. |
+| `usb` | `vid`, and `pid` **or** `pid_min` + `pid_max` (inclusive) | a present USB device (e.g. a tracking camera) has that VID:PID, decimal. Windows: SetupAPI's `USB` enumerator, so interface children count too. |
+| `registry_dword_min` | `key` (`HKLM\...`), `value`, `min` | the DWORD (or decimal REG_SZ), 64-bit view, is `>= min` |
+| `registry_sz_min` | `key`, `value`, `min` (dotted version) | the REG_SZ is a version at or above `min` |
+| `registry_key_exists` | `key` | the HKLM key exists |
+| `file_exists` | `path` | the file exists; an absolute path, no environment expansion |
+| `service_exists` | `name` | a Windows service of that name is installed, running or not |
+
+Every rule may carry `confidence` (`high` or `low`; required on `edid`, `usb`,
+`registry_dword_min`) and `note` (shown as evidence). An `edid` rule with only `man`, or a
+`usb` rule with only `vid`, matches any product of that vendor (Dell and Acer ship ordinary 2D
+monitors), so it is **always low confidence**, whatever it claims: the generator downgrades it
+and `dxr-get` enforces the same. A malformed rule (a half or inverted range, a product id
+given both exactly and as a range, a value outside 16 bits) matches nothing. A client treats a
+rule of an unknown kind as not matched and goes on to the next rule; the generator drops it.
+`edid` ranges and `usb` are #2737 additions: a `dxr-get` from before them skips a range rule
+(no `prod`) and a `usb` rule, which is why the generator still emits one exact `edid` rule per
+Leia table row rather than compacting runs into ranges.
 
 #### Licence
 
@@ -693,3 +713,42 @@ python scripts/tests/test_gen_catalog.py
 
 `--out-v2` must be a different directory from `--out`. Without `--out-v2` the generator
 behaves exactly as before; `publish-catalog.yml` does not pass it.
+
+### Display plug-in detect manifest
+
+A display plug-in describes itself (#2737). Each release may attach a
+**`displayxr-detect.json`** asset, schema 1:
+
+```json
+{
+ "schema": 1,
+ "id": "leia-sr",
+ "label": "Leia display plug-in",
+ "registry_version": "HKLM\\Software\\DisplayXR\\Plugins\\LeiaSR\\Version",
+ "requires": { "runtime": ">=2.66.8" },
+ "detect": [
+  { "kind": "edid", "man": 44048, "prod": 16711, "confidence": "high", "note": "DELL_8K32" },
+  { "kind": "registry_dword_min", "key": "HKLM\\SOFTWARE\\Dimenco\\Simulated Reality",
+    "value": "NConnectedDevices", "min": 1, "confidence": "high" }
+ ]
+}
+```
+
+| field | required | meaning |
+|---|---|---|
+| `schema` | yes | `1` |
+| `detect` | yes | at least one valid rule (kinds above). Invalid rules are dropped with a warning |
+| `id` | no | the schema-2 item id (and `registered_id`) for this plug-in. Used when the generator has no `V2_ITEMS` entry for the component; without it such a component is not listed in schema 2. A first-party component's `V2_ITEMS` identity always wins |
+| `label` | no | the schema-2 item `name` in that same case. Never written into schema 1 |
+| `registry_version` | no | `HKLM\...\Value` where the plug-in's installer writes its version; becomes `windows.registry_version` |
+| `requires.runtime` | no | `>=X.Y.Z`; becomes the component's `requires.runtime` |
+
+An invalid optional field is ignored with a warning; a manifest with the wrong `schema` or no
+usable rule is rejected and the generator uses the fallback. For every `kind: display_plugin`
+component the generator fetches the asset from the pinned release. A release without it falls
+back to the per-vendor parse (Leia: `leia_edid_table.h` plus the installer CMake floor, as
+above). The vendor generates the file at build time from the same table its plug-in reads, so
+"the installer thinks this is our panel" and "the plug-in claims it" cannot diverge. Leia does
+this from displayxr-leia-plugin#557 on.
+
+Check one locally: `python scripts/gen_catalog.py validate-detect displayxr-detect.json`.
