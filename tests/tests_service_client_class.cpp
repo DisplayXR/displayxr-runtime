@@ -80,8 +80,29 @@ TEST_CASE("client class path compare: bytes, empties, symlinks", "[service][clie
 	CHECK(service_client_class_path_equal(dangling.c_str(), dangling.c_str()));
 	CHECK_FALSE(service_client_class_path_equal((real + " (deleted)").c_str(), real.c_str()));
 
-	// POSIX stays case-sensitive.
-	CHECK_FALSE(service_client_class_path_equal((t.path + "/REAL-controller").c_str(), real.c_str()));
+	// POSIX compares bytes case-sensitively: two spellings that differ only in
+	// case and do not resolve never match, on any volume.
+	CHECK_FALSE(service_client_class_path_equal((t.path + "/NO-such-binary").c_str(),
+	                                            (t.path + "/no-such-binary").c_str()));
+
+	// A different-case spelling of an EXISTING binary: on a case-sensitive
+	// volume it names no file, so it does not match. On a case-insensitive one
+	// (the APFS default on macOS) it names the same file, realpath() returns the
+	// on-disk spelling for both sides, and "equal after realpath()" holds — the
+	// two paths do name the same binary (#2198).
+	const std::string upper = t.path + "/REAL-controller";
+#if defined(__APPLE__)
+	const bool case_sensitive_volume = pathconf(t.path.c_str(), _PC_CASE_SENSITIVE) == 1;
+#else
+	const bool case_sensitive_volume = true;
+#endif
+	CAPTURE(case_sensitive_volume);
+	if (case_sensitive_volume) {
+		CHECK_FALSE(service_client_class_path_equal(upper.c_str(), real.c_str()));
+	} else {
+		CHECK(service_client_class_path_equal(upper.c_str(), real.c_str()));
+		CHECK(service_client_class_path_equal(real.c_str(), upper.c_str()));
+	}
 }
 
 TEST_CASE("CONTROLLER claim verifies against a manifest naming a symlink", "[service][client_class]")

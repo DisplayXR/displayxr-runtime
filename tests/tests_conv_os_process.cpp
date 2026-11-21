@@ -24,6 +24,8 @@
 #include "os/os_process.h"
 #include "conversion/conv_host_wire.h"
 
+#include "macos_protected_folder.hpp"
+
 #include <chrono>
 #include <cstring>
 #include <string>
@@ -82,6 +84,22 @@ spawn(const std::vector<std::string> &args,
 	return os_process_spawn(&si, &g.p);
 }
 
+/*!
+ * macOS only: a disclaimed helper whose binary sits in ~/Documents, ~/Desktop
+ * or ~/Downloads stalls opening itself (macos_protected_folder.hpp, #2198), so
+ * the disclaim arm is skipped for a tree built there. Never skips elsewhere.
+ */
+void
+skip_disclaim_arm_if_unrunnable(bool disclaim)
+{
+	std::string folder;
+	if (disclaim && macos_exe_in_protected_folder(kHelper, &folder)) {
+		SKIP("disclaim arm not runnable here: the helper binary is under "
+		     << folder << " (macOS privacy-protected folder; a disclaimed child cannot open it). "
+		     << "Build outside ~/Documents, ~/Desktop and ~/Downloads to run this arm.");
+	}
+}
+
 int32_t
 wait_exit(proc_guard &g, uint32_t ms = 10000)
 {
@@ -133,6 +151,7 @@ TEST_CASE("os_process: exit codes arrive verbatim", "[conv][os_process]")
 {
 	const bool disclaim = GENERATE(false, true);
 	CAPTURE(disclaim);
+	skip_disclaim_arm_if_unrunnable(disclaim);
 	for (int code : {0, 7, 20, 30, 139}) {
 		proc_guard g;
 		REQUIRE(spawn({"exit", std::to_string(code)}, g, OS_NATIVE_HANDLE_INVALID, disclaim) == 0);
@@ -217,6 +236,7 @@ TEST_CASE("os_process: channel frame + pushed handle round trip", "[conv][os_pro
 	// responsibility disclaimed, which must lay out the child identically.
 	const bool disclaim = GENERATE(false, true);
 	CAPTURE(disclaim);
+	skip_disclaim_arm_if_unrunnable(disclaim);
 	os_channel *ch = nullptr;
 	char token[256] = {};
 	uint64_t child_end = OS_NATIVE_HANDLE_INVALID;
