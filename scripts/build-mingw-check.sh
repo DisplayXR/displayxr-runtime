@@ -9,7 +9,9 @@
 # under MinGW. Builds a curated subset of targets known to be portable.
 #
 # Usage:  scripts/build-mingw-check.sh [target...]
-# Default targets: aux_util displayxr_mcp
+# Default targets: aux_util displayxr_mcp dxr-get
+# (dxr-get is plain Win32 C with no vcpkg dependency, so it compiles AND links
+# here: the one Windows-only executable this check covers end to end.)
 # (mcp_adapter moved to the displayxr-mcp repo in 2026-05; the lib
 # itself is fetched via CMake FetchContent and built as displayxr_mcp.)
 
@@ -28,7 +30,7 @@ fi
 
 TARGETS=("$@")
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
-	TARGETS=(aux_util displayxr_mcp)
+	TARGETS=(aux_util displayxr_mcp dxr-get)
 fi
 
 echo "=== MinGW-w64 compile check ==="

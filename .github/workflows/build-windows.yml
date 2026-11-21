@@ -374,6 +374,35 @@ jobs:
       # this costs seconds and is the only place some fixes CAN be covered: the
       # app-level zones arm cannot run on a hosted runner at all (no Vulkan ICD is
       # registered; the sole adapter is "Microsoft Hyper-V Video").
+      # dxr-get can be built with a TEST root key that replaces the catalog keys
+      # (CMake DXR_GET_TEST_ROOT_KEY, for validating schema 2 on a test box). A
+      # binary built that way must never reach a package or a release: assert the
+      # option is off in this tree, and that no dxr-get.exe carries the banner
+      # string that exists only in such a build.
+      - name: dxr-get carries no test root key
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          $bd = if (Test-Path build) { "build" } else { "_build" }
+          $cache = Join-Path $bd "CMakeCache.txt"
+          if ((Test-Path $cache) -and (Select-String -Path $cache -Pattern '^DXR_GET_TEST_ROOT_KEY:[A-Z]+=.+$' -Quiet)) {
+            Write-Host "::error::DXR_GET_TEST_ROOT_KEY is set in $cache -- this build must not ship."
+            exit 1
+          }
+          $exes = @(Get-ChildItem -Recurse -Filter dxr-get.exe -Path $bd, _package -ErrorAction SilentlyContinue)
+          if ($exes.Count -eq 0) {
+            Write-Host "::error::no dxr-get.exe found to check."
+            exit 1
+          }
+          foreach ($e in $exes) {
+            $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($e.FullName))
+            if ($text.Contains('TEST ROOT KEY BUILD')) {
+              Write-Host "::error::$($e.FullName) is a TEST ROOT KEY build -- it must not ship."
+              exit 1
+            }
+            Write-Host "ok: $($e.FullName)"
+          }
+
       - name: Unit tests (ctest)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh

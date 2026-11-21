@@ -32,6 +32,9 @@ enum dxr_get_exit
 	DXR_GET_VERIFY = 21, //!< size / hash / Authenticode signer mismatch
 	DXR_GET_CHILD = 30,  //!< a component installer exited non-zero
 	DXR_GET_NOT_FETCHABLE = 40,
+	DXR_GET_INCOMPATIBLE = 41,     //!< the item's runtime range or class ABI excludes this machine's runtime
+	DXR_GET_NOT_INSTALLED = 42,    //!< uninstall: no install receipt for that id
+	DXR_GET_CANNOT_UNINSTALL = 43, //!< uninstall: no uninstall command recorded, or other items require it
 	DXR_GET_NEEDS_ADMIN = 50,
 };
 
@@ -72,6 +75,11 @@ dxr_authenticode_signer(const wchar_t *path, char *cn, size_t cn_size);
 bool
 dxr_catalog_signature_ok(const char *msg, size_t msg_len, const char *sig_b64, char key_id_out[9]);
 
+//! NULL in every build that ships. In a TEST ROOT KEY build (CMake DXR_GET_TEST_ROOT_KEY): the banner it
+//! prints on every run. Such a build trusts one throwaway key instead of the catalog keys.
+const char *
+dxr_test_root_key_banner(void);
+
 /*
  * Detection (get_detect.c).
  */
@@ -93,6 +101,23 @@ dxr_reg_read_dword(const char *subkey, const char *value, uint32_t *out);
 //! Reads a REG_SZ given as `HKLM\\Sub\\Key\\ValueName` (64-bit view). Returns false when absent.
 bool
 dxr_reg_read_path_sz(const char *full, char *out, size_t out_size);
+
+//! The same value in the 32-bit registry view. A 32-bit installer (NSIS without SetRegView 64) writes its
+//! Add/Remove Programs entry there.
+bool
+dxr_reg_read_path_sz_32(const char *full, char *out, size_t out_size);
+
+//! true when the `HKLM\\...` key exists (64-bit view).
+bool
+dxr_reg_key_exists(const char *key);
+
+//! true when @p path names an existing file or directory.
+bool
+dxr_file_exists(const char *path);
+
+//! true when a Windows service of that name is installed (running or not).
+bool
+dxr_service_exists(const char *name);
 
 #ifdef __cplusplus
 }

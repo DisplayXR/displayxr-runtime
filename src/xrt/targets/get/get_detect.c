@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <setupapi.h>
 #include <devguid.h>
+#include <winsvc.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,8 +99,8 @@ dxr_reg_read_dword(const char *subkey, const char *value, uint32_t *out)
 	return true;
 }
 
-bool
-dxr_reg_read_path_sz(const char *full, char *out, size_t out_size)
+static bool
+read_path_sz(const char *full, char *out, size_t out_size, DWORD view)
 {
 	const char *sk = strip_hklm(full);
 	if (sk == NULL) {
@@ -113,6 +114,54 @@ dxr_reg_read_path_sz(const char *full, char *out, size_t out_size)
 	}
 	*slash = '\0';
 	DWORD sz = (DWORD)out_size;
-	return RegGetValueA(HKEY_LOCAL_MACHINE, key, slash + 1, RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, NULL, out,
-	                    &sz) == ERROR_SUCCESS;
+	return RegGetValueA(HKEY_LOCAL_MACHINE, key, slash + 1, RRF_RT_REG_SZ | view, NULL, out, &sz) == ERROR_SUCCESS;
+}
+
+bool
+dxr_reg_read_path_sz(const char *full, char *out, size_t out_size)
+{
+	return read_path_sz(full, out, out_size, RRF_SUBKEY_WOW6464KEY);
+}
+
+bool
+dxr_reg_read_path_sz_32(const char *full, char *out, size_t out_size)
+{
+	return read_path_sz(full, out, out_size, RRF_SUBKEY_WOW6432KEY);
+}
+
+bool
+dxr_reg_key_exists(const char *key)
+{
+	const char *sk = strip_hklm(key);
+	HKEY k;
+	if (sk == NULL ||
+	    RegOpenKeyExA(HKEY_LOCAL_MACHINE, sk, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &k) != ERROR_SUCCESS) {
+		return false;
+	}
+	RegCloseKey(k);
+	return true;
+}
+
+bool
+dxr_file_exists(const char *path)
+{
+	return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+bool
+dxr_service_exists(const char *name)
+{
+	// Installed is the question, not running: a vendor service that is stopped
+	// is the vendor's (or the user's) business, not a missing prerequisite.
+	SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+	if (scm == NULL) {
+		return false;
+	}
+	SC_HANDLE svc = OpenServiceA(scm, name, SERVICE_QUERY_STATUS);
+	const bool found = svc != NULL;
+	if (svc != NULL) {
+		CloseServiceHandle(svc);
+	}
+	CloseServiceHandle(scm);
+	return found;
 }

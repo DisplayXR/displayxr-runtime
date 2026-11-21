@@ -28,6 +28,7 @@
  * it. Never remove a key a deployed dxr-get still needs in the same release.
  * docs/specs/runtime/component-catalog.md.
  */
+#ifndef DXR_GET_TEST_ROOT_KEY_HEX // a test-root-key build trusts its one key INSTEAD of these
 static const struct
 {
 	const char *id; //!< first 8 hex of sha256(pubkey)
@@ -36,6 +37,7 @@ static const struct
     {"9b762f9a", {0x74, 0xfc, 0x4d, 0x1d, 0x2e, 0x50, 0x2e, 0xdb, 0x2b, 0x7b, 0x35, 0x56, 0x77, 0x46, 0x5e, 0x39,
                   0x87, 0x0d, 0x55, 0x51, 0x4a, 0xc2, 0xea, 0x13, 0xbb, 0xc6, 0xf3, 0x50, 0xc1, 0x2e, 0xf4, 0x34}},
 };
+#endif
 
 bool
 dxr_sha256_file(const wchar_t *path, char out_hex[65])
@@ -174,6 +176,44 @@ b64_decode(const char *in, uint8_t *out, int cap)
 	return n;
 }
 
+/*
+ * TEST ROOT KEY builds (CMake -DDXR_GET_TEST_ROOT_KEY=<64 hex>, never set for a
+ * build that ships). The one key given at configure time REPLACES the catalog
+ * keys above: such a binary can verify a local fixture catalog signed with a
+ * throwaway key (scripts/make_test_catalog.py) and cannot verify the real
+ * catalog at all. There is no run-time switch for this: no environment
+ * variable, no registry value, no argument. The banner text exists only in
+ * these builds, which is what CI greps shipped binaries for.
+ */
+#ifdef DXR_GET_TEST_ROOT_KEY_HEX
+static int
+hexv(char c)
+{
+	if (c >= '0' && c <= '9') {
+		return c - '0';
+	}
+	if (c >= 'a' && c <= 'f') {
+		return c - 'a' + 10;
+	}
+	if (c >= 'A' && c <= 'F') {
+		return c - 'A' + 10;
+	}
+	return -1;
+}
+
+const char *
+dxr_test_root_key_banner(void)
+{
+	return "TEST ROOT KEY BUILD -- not for distribution";
+}
+#else
+const char *
+dxr_test_root_key_banner(void)
+{
+	return NULL;
+}
+#endif
+
 bool
 dxr_catalog_signature_ok(const char *msg, size_t msg_len, const char *sig_b64, char key_id_out[9])
 {
@@ -181,6 +221,25 @@ dxr_catalog_signature_ok(const char *msg, size_t msg_len, const char *sig_b64, c
 	if (b64_decode(sig_b64, sig, 64) != 64) {
 		return false;
 	}
+#ifdef DXR_GET_TEST_ROOT_KEY_HEX
+	static const char hex[] = DXR_GET_TEST_ROOT_KEY_HEX;
+	uint8_t key[32];
+	if (sizeof(hex) != 65) {
+		return false;
+	}
+	for (int i = 0; i < 32; i++) {
+		int hi = hexv(hex[2 * i]), lo = hexv(hex[2 * i + 1]);
+		if (hi < 0 || lo < 0) {
+			return false;
+		}
+		key[i] = (uint8_t)(hi * 16 + lo);
+	}
+	if (crypto_ed25519_check(sig, key, (const uint8_t *)msg, msg_len) == 0) {
+		(void)snprintf(key_id_out, 9, "TESTROOT");
+		return true;
+	}
+	return false;
+#else
 	for (size_t i = 0; i < sizeof(k_catalog_keys) / sizeof(k_catalog_keys[0]); i++) {
 		if (crypto_ed25519_check(sig, k_catalog_keys[i].key, (const uint8_t *)msg, msg_len) == 0) {
 			(void)snprintf(key_id_out, 9, "%s", k_catalog_keys[i].id);
@@ -188,4 +247,5 @@ dxr_catalog_signature_ok(const char *msg, size_t msg_len, const char *sig_b64, c
 		}
 	}
 	return false;
+#endif
 }

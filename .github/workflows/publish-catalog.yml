@@ -26,6 +26,21 @@ name: Publish component catalog
 # makes a component unfetchable.
 #
 # Windows runner: the Authenticode check is Get-AuthenticodeSignature.
+#
+# Schema 2 (ADR-064, catalog/v2/stable.json) is OFF by default. It is generated,
+# signed with the same key and published next to schema 1 only when the
+# repository variable DXR_PUBLISH_CATALOG_V2 is "true", or a manual run ticks
+# `publish_v2`. Merging this file therefore publishes nothing new.
+#
+# Schema 1 never depends on schema 2:
+#   - schema 2 is derived in the SAME generator run (same serial, same assets),
+#     and asking for it does not change one byte of the schema-1 document
+#     (pinned by scripts/tests/test_gen_catalog.py);
+#   - if that run fails, the step falls back to the unchanged schema-1-only
+#     command, so a schema-2 defect cannot stop the schema-1 publish;
+#   - the schema-2 check is `continue-on-error`, and the commit step copies the
+#     v2 files only when that check passed. Otherwise the previously published
+#     v2 document (if any) stays as it is until a later run replaces it.
 
 on:
   push:
@@ -39,10 +54,19 @@ on:
     types: [completed]
   schedule:
     - cron: '17 6 * * 1'   # Mondays 06:17 UTC
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      publish_v2:
+        description: 'Also generate, sign and publish catalog/v2/stable.json (schema 2, ADR-064)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+
+env:
+  # "true" turns the schema-2 publish on. See the header.
+  PUBLISH_V2: ${{ vars.DXR_PUBLISH_CATALOG_V2 == 'true' || inputs.publish_v2 == true }}
 
 concurrency:
   # Never cancel mid-publish; queue. A later run regenerates from current main anyway.
@@ -88,14 +112,34 @@ jobs:
         run: python -m pip install --quiet cryptography
 
       - name: Generate + sign catalog
+        id: generate
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           DXR_CATALOG_ED25519_KEY: ${{ secrets.DXR_CATALOG_ED25519_KEY }}
         run: |
-          python scripts/gen_catalog.py generate \
-            --out out \
-            --download-dir "$RUNNER_TEMP/catalog-dl" \
-            --previous https://updates.displayxr.org/catalog/v1/stable.json
+          set -euo pipefail
+          # The schema-1 command, unchanged; "$@" adds --out-v2 when schema 2 is on.
+          generate() {
+            python scripts/gen_catalog.py generate \
+              --out out \
+              --download-dir "$RUNNER_TEMP/catalog-dl" \
+              --previous https://updates.displayxr.org/catalog/v1/stable.json "$@"
+          }
+          v2_generated=false
+          if [ "$PUBLISH_V2" = "true" ]; then
+            if generate --out-v2 out-v2; then
+              v2_generated=true
+            else
+              # Whatever broke, schema 1 must not depend on it: start over with
+              # the schema-1-only command. If THAT fails, the job fails as before.
+              echo "::warning::schema-2 catalog generation failed; publishing schema 1 alone"
+              rm -rf out out-v2
+              generate
+            fi
+          else
+            generate
+          fi
+          echo "v2_generated=$v2_generated" >> "$GITHUB_OUTPUT"
 
       - name: Verify signature
         run: |
@@ -105,21 +149,46 @@ jobs:
           python -c "import json;c=json.load(open('out/stable.json'));print(json.dumps({k:{'recommended':v['recommended'],'windows':v.get('windows',{}).get('version'),'requires':v.get('requires')} for k,v in c['components'].items()},indent=1))" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Verify schema-2 catalog
+        id: v2
+        if: steps.generate.outputs.v2_generated == 'true'
+        # Never fails the job: a schema-2 document that does not check out is
+        # simply not published, and schema 1 goes out as always.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python scripts/gen_catalog.py verify out-v2/stable.json
+          # Same run, same serial (spec: component-catalog.md, Compatibility with schema 1).
+          python -c "import json,sys;a=json.load(open('out/stable.json'));b=json.load(open('out-v2/stable.json'));sys.exit(0 if b.get('schema')==2 and a['serial']==b['serial'] and a['expires']==b['expires'] else 'schema-2 document does not match the schema-1 run')"
+          echo '### Catalog, schema 2' >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          python -c "import json;c=json.load(open('out-v2/stable.json'));print(json.dumps([{'id':i['id'],'class':i['class'],'version':i['version'],'windows':i.get('assets',{}).get('windows-x64',{}).get('version')} for i in c['items']],indent=1))" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
       - name: Commit to displayxr-browser (Pages)
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          V2_READY: ${{ steps.v2.outputs.ok }}
         run: |
           set -euo pipefail
           SHA=$(git rev-parse --short=9 HEAD)
           git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/DisplayXR/displayxr-browser.git" pages
           mkdir -p pages/feed/catalog/v1
           cp out/stable.json out/stable.json.sig pages/feed/catalog/v1/
+          if [ "${V2_READY:-}" = "true" ]; then
+            mkdir -p pages/feed/catalog/v2
+            cp out-v2/stable.json out-v2/stable.json.sig pages/feed/catalog/v2/
+          fi
           cd pages
           # Byte-exact: the signature covers these bytes, so no EOL conversion.
           git config core.autocrlf false
           git config user.name  "displayxr-publish-bot[bot]"
           git config user.email "displayxr-publish-bot@users.noreply.github.com"
           git add feed/catalog/v1/stable.json feed/catalog/v1/stable.json.sig
+          if [ "${V2_READY:-}" = "true" ]; then
+            git add feed/catalog/v2/stable.json feed/catalog/v2/stable.json.sig
+          fi
           if git diff --cached --quiet; then
             echo "catalog unchanged"; exit 0
           fi
