@@ -274,7 +274,44 @@ ignores platforms it does not know.
 |---|---|---|
 | `runtime` | the DisplayXR runtime, `>=X.Y.Z` | installs or upgrades the runtime first, as `ensure-for` does today |
 | `item` | another catalog item, optional `>=X.Y.Z` | installs it first |
-| `external` | something DisplayXR does not ship: a vendor service, a vendor model runtime | **detects** it with the `detect` rules and reports met / unmet before install, with `info_url`. It does not install it. The one exception: the entry carries its own `asset` (same shape as an item asset, signed by the same publisher), and then the client installs it **only when absent**, never to upgrade it |
+| `external` | something DisplayXR does not ship: a vendor service, a vendor model runtime | **detects** it with the `detect` rules and reports met / unmet before install, with `info_url`. Whether it also installs it depends on the form, below |
+
+An `external` entry has two supported forms:
+
+- **Declared and detected only** (no `asset`). The client installs nothing for it. An unmet
+  prerequisite is shown before install with `info_url`; the user may still install the item.
+- **Declared with its own installer asset.** The entry carries an `asset` keyed by platform,
+  with the fields of an item asset (`version`, `file`, `size`, `sha256`, `urls`, `signature`,
+  `installer`), signed by a signer delegated to the item's publisher:
+
+  ```json
+  { "kind": "external", "name": "Acme Depth Runtime", "min_version": "3.2",
+    "detect": [ { "kind": "registry_sz_min", "key": "HKLM\\SOFTWARE\\Acme\\DepthRuntime", "value": "Version", "min": "3.2" } ],
+    "info_url": "https://acme.example/depth-runtime",
+    "asset": { "windows-x64": {
+      "version": "3.2.1", "file": "AcmeDepthRuntimeSetup-3.2.1.exe", "size": 20971520, "sha256": "<64 hex>",
+      "urls": ["https://downloads.acme.example/runtime/AcmeDepthRuntimeSetup-3.2.1.exe"],
+      "signature": { "kind": "authenticode", "signer": "Acme Displays, Inc." },
+      "installer": { "kind": "exe", "args": ["/quiet"], "scope": "machine", "elevation": "required" } } } }
+  ```
+
+  The client installs it **only when `detect` says it is absent**, never to upgrade one that
+  is present, and **in order: before the item**. Its `size` is added to the item's, and the
+  total is shown before the user commits. It is fetched and verified like any asset (below).
+  A prerequisite's asset must be signed; there is no hash-pinned-only form for it.
+
+**Every asset is resumed and verified** *(planned for schema 2, step 2; the rule is the
+schema-1 tool's)*. One item can now mean several downloads: its own asset and the assets of
+its external prerequisites. For each one a client resumes an interrupted download with an
+HTTP `Range` request, accepts only a complete file of exactly `size` bytes, compares its
+SHA-256 with `sha256`, and then checks the signature. All assets of a selection are fetched
+and verified before the first installer runs. What `dxr-get` does today, read from
+`get_http.c`, `get_main.c` and `dxr-get.md`: it resumes a `.part` file with `Range` (and
+starts over when the server ignores the range), retries transport errors with backoff, falls
+back to the next URL, names the finished file by its hash so a cached copy is reused only if
+it hashes to the catalog's digest, discards a file whose hash differs, and has no override
+for the hash check. What is new is doing that for more than one asset per item, in a stated
+order, with the total size known up front.
 
 `detect` rule kinds: `edid` and `registry_dword_min` (schema 1), plus `registry_sz_min`
 (a dotted version string at or above `min`), `registry_key_exists` and `file_exists` (an
@@ -289,8 +326,8 @@ unknown kind as not matched.
  "spdx": "LicenseRef-Acme-EULA",
  "price_label": "from US$49",
  "purchase_url": "https://acme.example/buy/depth-pro",
- "activation": ["deep_link", "key"],
- "trial": true
+ "sources": ["hardware", "key", "trial"],
+ "activation": ["deep_link", "key"]
 }
 ```
 
@@ -300,13 +337,27 @@ unknown kind as not matched.
 | `spdx` | SPDX expression or `LicenseRef-…`. The full text is at `links.eula` |
 | `price_label` | free text, shown as written. DisplayXR does not parse or verify it and takes no part in the sale |
 | `purchase_url` | `https`, the **vendor's** checkout. Required for `paid` |
-| `activation` | which methods the plug-in supports: `deep_link` (`displayxr://activate`), `key` (a pasted key stored as a `secret` setting). Required for `paid` |
-| `trial` | `true` when the plug-in can report `trial` |
+| `sources` | which entitlement sources the item may use, any of `hardware` (entitled by a connected display), `key` (a purchased or issued key), `trial` (a time-limited trial the plug-in grants), `oem` (an entitlement that came with the machine). Lets a front end say "included with supported displays" or "free trial" before install. Absent = no statement |
+| `activation` | which user-driven methods the plug-in supports: `deep_link` (`displayxr://activate`), `key` (a pasted key stored as a `secret` setting). Required when `sources` includes `key`. `hardware`, `oem` and `trial` need no activation |
 
-The catalog describes the terms. The **state** on a machine (`licensed` / `trial` /
-`expired` / `unlicensed`, a message, a purchase URL) comes from the installed plug-in through
-its licence-state slot *(planned, step 6)*, never from the catalog. Installing never needs a
-licence, an account or a key.
+The catalog describes the terms. The **state** on a machine comes from the installed plug-in
+through its licence-state slot *(planned, step 6)*, never from the catalog:
+
+| Reported field | Req | Values |
+|---|---|---|
+| state | yes | `licensed`, `trial`, `expired`, `unlicensed` |
+| message | no | one line for the user |
+| purchase URL | no | overrides the manifest's `purchase_url` when present |
+| source | no | `hardware`, `key`, `trial`, `oem`: where the current entitlement comes from |
+| expiry | no | when the current entitlement ends (a trial, a term licence). Absent = it does not end |
+
+`licensed` with source `hardware` is a first-class state: the connected display entitles the
+user with no purchase and no click, and a front end shows "Included with your display" and
+no Buy / Activate action. A front end shows `expiry` when it is present.
+
+Installing never needs a licence, an account or a key. Any hardware or entitlement check is
+made inside the vendor's own binary; the runtime and any public adapter in front of vendor
+code only carry the state it reports. There is no DRM in the runtime.
 
 ### Trust
 
@@ -446,7 +497,7 @@ its model runtime installed separately by the user):
  ],
  "license": {
   "class": "paid", "spdx": "LicenseRef-Acme-EULA", "price_label": "from US$49",
-  "purchase_url": "https://acme.example/buy/depth-pro", "activation": ["deep_link", "key"], "trial": true
+  "purchase_url": "https://acme.example/buy/depth-pro", "sources": ["hardware", "key", "trial"], "activation": ["deep_link", "key"]
  },
  "assets": {
   "windows-x64": {
@@ -464,8 +515,10 @@ its model runtime installed separately by the user):
 ```
 
 Installing it is free. With the prerequisite missing the client says so before install and
-shows `info_url`; after install the provider reports its own state, and while it is
-`unlicensed` selection falls through to the next conversion provider.
+shows `info_url` (this example uses the detection-only form). After install the provider
+reports its own state: `licensed` with source `hardware` on a machine whose display entitles
+it, otherwise `trial` or `unlicensed`; while it is `unlicensed` or `expired` selection falls
+through to the next conversion provider.
 
 An input provider (third party, Community tier, unsigned binaries admitted by allowlist row):
 

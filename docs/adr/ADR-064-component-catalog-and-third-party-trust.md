@@ -194,6 +194,20 @@ behaves like any provider that cannot serve.
   slot at the end of each class's vtable, gated by `struct_size`, announced by a feature
   macro, no ABI bump (ADR-020). A plug-in without the slot has no licence to report and is
   treated as free.
+- **Source and expiry.** The state carries two optional facts: a `source`, saying where the
+  entitlement comes from (`hardware`, `key`, `trial` or `oem`), and an `expiry` time.
+  **`licensed` with `source = hardware` is a first-class state**: the connected display
+  entitles the user, with no purchase, no key and no click, and the Dashboard shows
+  "Included with your display" instead of a Buy / Activate action. `oem` is the same idea
+  for an entitlement that came with the machine. `expiry` lets the Dashboard say when a
+  trial or a term licence ends before it does. The catalog manifest declares which sources
+  an item may use, so a front end can say "included with supported displays" before install;
+  what is true on a given machine still comes only from the plug-in.
+- **The gate lives in the vendor's binary.** Any hardware or entitlement check is made
+  inside the vendor's own binary. It is never made by the runtime, and never by a public
+  adapter that sits between the runtime and a vendor's code. The runtime carries what the
+  plug-in reports and acts on it (shows it, falls through); it does not decide it. "No DRM
+  in the runtime" is a stated principle of this record, not a current limitation.
 - **Fall-through.** An unlicensed provider declines, and selection falls through to the next
   candidate. Conversion providers already do this (`UNLICENSED` falls through,
   conversion-provider-discovery.md §4); the same rule now holds for every class.
@@ -213,12 +227,22 @@ behaves like any provider that cannot serve.
 ### 6. External prerequisites
 
 `requires` gains kind `external`, for something DisplayXR does not ship: a vendor tracking
-service, a vendor model runtime. It is **declared and detected, not installed** by DisplayXR,
-unless the publisher provides a fetchable installer for it in the same manifest. Reason:
-these have their own licences and update channels, and silently installing or upgrading one
-can break other software on the box that depends on it (#2702 already has this rule for the
-SR platform: fetched only when missing, never upgraded on its own). The front ends show an
-unmet prerequisite before install, with the publisher's link, instead of after.
+service, a vendor model runtime. Two forms are supported, and the publisher chooses:
+
+1. **Declared and detected only.** The manifest names the prerequisite, gives detection
+   rules and a link. DisplayXR reports met or unmet before install and installs nothing.
+2. **Declared with its own installer asset.** A proprietary prerequisite may carry an asset
+   in the manifest: URL, SHA-256, size and signer, the same fields as an item asset, signed
+   by a signer delegated to the same publisher. The engine then installs it **in order,
+   before the item**, only when detection says it is absent, and never to upgrade one that
+   is present. Its download size is added to the item's and **shown before the user
+   commits**.
+
+Reason for keeping detection-only as a full form: these prerequisites have their own
+licences and update channels, and silently installing or upgrading one can break other
+software on the box that depends on it (#2702 already has this rule for the SR platform:
+fetched only when missing, never upgraded on its own). Either way the front ends show an
+unmet prerequisite before install, instead of after.
 
 ### 7. Default converter
 
@@ -255,8 +279,9 @@ What `dxr-get` already covers for this, verified in `get_main.c`, `get_http.c`,
 | Detect hardware | `detect` reads every present monitor's EDID and evaluates the catalog's `edid` and `registry_dword_min` rules, with a confidence level | rules are evaluated for `leia_plugin` only; needs "which items match this machine", for any item |
 | Compare versions | installed version is read from the registry value the catalog names; `install` does nothing at or above the catalog version; never downgrades | components that register a `Version` on their class row but have no installer key; inventory of everything installed |
 | Same-hash skip | a downloaded installer is cached under `%ProgramData%\DisplayXR\Downloads\<sha256>-<file>` and reused when its hash matches | nothing records which asset hash is *installed*; the install receipt (step 3) does |
-| Verify | size, SHA-256, then Authenticode chain and signer CN | signer taken from the catalog's publisher delegation instead of a compiled-in list |
-| Resumable download | `Range` resume of a `.part` file, bounded retries, fallback to the second URL | progress output a setup UI can render |
+| Verify | **every** payload: a complete file of the catalog's size, SHA-256 equal to the catalog's, then Authenticode chain and signer CN. A mismatch discards the file and exits 21. The hash check has no override | the same check on every asset of an item, with the signer taken from the catalog's publisher delegation instead of a compiled-in list |
+| Resumable download | `Range` resume of a `.part` file (restarting from zero when the server ignores the range), bounded retries, fallback to the second URL. This is what makes a large asset practical | progress output a setup UI can render |
+| Several assets for one item | one asset per component | an item plus the installer assets of its external prerequisites (§6): each resumed and verified on its own, all fetched and verified before the first installer runs, total size known up front |
 | Plan before acting | `plan --json` (state, installed, target, size, reason per component) | a plan for a *selection* of items rather than "the prerequisites of X" |
 | No connection | an unreachable, expired or unparsable catalog is exit 10, and nothing is installed | a cheap "is the catalog reachable" answer for the up-front notice, and a report of what was skipped |
 | Service handling | everything is downloaded and verified first; the service and its satellites stop once, installers run runtime-first, the service starts once | unchanged |
@@ -275,8 +300,9 @@ What `dxr-get` already covers for this, verified in `get_main.c`, `get_http.c`,
 - No background update and no scheduled network traffic: the #2702 rules that protect
   deployed units all stay. Nothing changes on a box until someone runs an installer or asks
   for an install; a stale catalog never blocks anything already installed.
-- No DRM in the runtime. The runtime carries a licence *state* and an opaque token; the
-  check lives in the vendor's plug-in.
+- **No DRM in the runtime.** The runtime carries a licence *state* and an opaque token. Any
+  hardware or entitlement gate lives inside the vendor's own binary, never in the runtime
+  and never in a public adapter (§5).
 - No rating, review or ranking system.
 - No game profiles (§2).
 - No load-time refusal on a publisher mismatch (§4), and no change to what the provenance
@@ -309,11 +335,11 @@ Each step is one pull request unless noted. Steps 1–4 are Windows.
 | # | Step | Amends |
 |---|---|---|
 | 1 | **Registry repository + validation CI.** `displayxr-catalog`: `publishers/<id>.json`, `items/<id>.json`, a JSON Schema, a validator (the rules of the spec's § Registry rules), a compile-and-sign job producing `catalog/v2/stable.json`, and the publish path. First-party items move there from `gen_catalog.py`'s derivation. Schema 1 keeps being published by the existing workflow | component-catalog.md (publishing section); versions-json-autobump.md (the bump also updates first-party items) |
-| 2 | **`dxr-get` reads schema 2.** Data-driven item table (no component names in code); `class`, `registered_id`, `abi` and `runtime` range checks against the installed runtime; `requires.external` detection; per-publisher signers from the index; two compiled-in root keys; its own serial value. Open point to settle in this step: whether the gate later pins publishers at load | dxr-get.md (commands, trust rules, exit codes); component-catalog.md (status of schema 2) |
+| 2 | **`dxr-get` reads schema 2.** Data-driven item table (no component names in code); `class`, `registered_id`, `abi` and `runtime` range checks against the installed runtime; `requires.external` detection, and install of a prerequisite's own asset before the item when one is given; several assets per item, each resumed (HTTP `Range`) and verified against the manifest's size and SHA-256; per-publisher signers from the index; two compiled-in root keys; its own serial value. Open point to settle in this step: whether the gate later pins publishers at load | dxr-get.md (commands, trust rules, exit codes); component-catalog.md (status of schema 2) |
 | 3 | **Receipt, uninstall, inventory.** An install receipt per item; `uninstall`; `list --installed`; `outdated`; `UninstallString` and `Version` required on the per-class registration rows of catalog-installed items; allowlist rows written and removed with the item (if open question 1 is confirmed) | dxr-get.md; plugin-discovery.md §2, §4.3 and §5; input-, conversion- and tracking-provider-discovery.md (row values); workspace-controller-registration.md; epic #2702 rule on `Trust\Allowlist` |
 | 4 | **`displayxr-cli catalog list|show|install|uninstall|update`**, with an elevation relaunch for the verbs that need one, and `--json` on every verb | new CLI section in dxr-get.md or a `catalog` section in the CLI reference; ADR-054 §2.6 note (the four verbs stay per class; `catalog` is distribution, not selection) |
 | 5 | **POSIX engine.** The same commands on macOS and Linux: `.pkg` / `.deb` assets, a detached Ed25519 signature per asset in place of Authenticode, the receipt under `/var/lib/displayxr/catalog/`, allowlist lines in `/etc/displayxr/trust/allowlist` | dxr-get.md; plugin-discovery.md §4.3 (POSIX has no signer check today) |
-| 6 | **Licence-state slot + `secret` setting type.** The appended slot and feature macro on all four class vtables, the fall-through rule in each selection path, `status --json` and `list` columns, `XRT_COMPONENT_SETTING_TYPE_SECRET` with redaction on every read path | ADR-054 (N5 done, and decision 7 gains a type); ADR-020 (one more worked example of an appended slot); ADR-053 (maps `UNLICENSED` onto the shared vocabulary); `xrt_plugin_iface.md`, `xrt_input_plugin_iface.md`; plugin-discovery.md §2.3 and the three provider-discovery specs; the two onboarding guides. ADR-063 needs a note only: the slot is on the provider interface, not on the provider-device descriptor it proposes |
+| 6 | **Licence-state slot + `secret` setting type.** The appended slot and feature macro on all four class vtables, carrying state, message, purchase URL and the optional `source` and `expiry`; the fall-through rule in each selection path, `status --json` and `list` columns, `XRT_COMPONENT_SETTING_TYPE_SECRET` with redaction on every read path | ADR-054 (N5 done, and decision 7 gains a type); ADR-020 (one more worked example of an appended slot); ADR-053 (maps `UNLICENSED` onto the shared vocabulary); `xrt_plugin_iface.md`, `xrt_input_plugin_iface.md`; plugin-discovery.md §2.3 and the three provider-discovery specs; the two onboarding guides. ADR-063 needs a note only: the slot is on the provider interface, not on the provider-device descriptor it proposes |
 | 7 | **`displayxr://activate` handler.** Scheme registration by the runtime installer, nonce start / consume RPCs on the service's DIAG channel, token delivery through the plug-in's activation slot | dxr-get.md or a new activation spec; ADR-051 (a Dashboard action that starts a browser flow); service-architecture.md |
 | 8 | **Dashboard Catalog tab.** Browse, install, uninstall, update, tier and prerequisite display, Buy / Activate. Renders the CLI's JSON | ADR-051; `src/dashboard/README.md` |
 | 9 | **Catalog-driven bundle** (§8), in `displayxr-installer`, plus the runtime installer pulling the open conversion provider | versions-json-autobump.md (bundle membership stops being five pins read by name); `displayxr-installer` docs; ADR-042 / ADR-053 note on the default converter |
