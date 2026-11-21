@@ -86,6 +86,16 @@ struct dxr_edid_id
 int
 dxr_detect_edids(struct dxr_edid_id *out, int max);
 
+struct dxr_usb_id
+{
+	uint16_t vid; //!< USB vendor id
+	uint16_t pid; //!< USB product id
+};
+
+//! Fills up to @p max distinct VID:PID pairs of present USB devices (SetupAPI, USB enumerator). Returns the count.
+int
+dxr_detect_usb(struct dxr_usb_id *out, int max);
+
 //! Reads a DWORD (or a decimal REG_SZ) under HKLM, 64-bit view. Returns false when absent.
 bool
 dxr_reg_read_dword(const char *subkey, const char *value, uint32_t *out);

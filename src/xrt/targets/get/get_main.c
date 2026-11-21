@@ -12,8 +12,9 @@
  * - A stale or unreachable catalog is "offline", never an authority: it can
  *   only ever cause dxr-get to do nothing.
  * - Never downgrade, never touch ActiveRuntime, never write Trust\Allowlist.
- * - The display plug-in installs only on positive evidence (a high-confidence
- *   catalog detect rule matching this machine).
+ * - A display plug-in installs only on positive evidence (a high-confidence
+ *   catalog detect rule matching this machine). Every catalog component of
+ *   kind "display_plugin" is evaluated the same way; no vendor is compiled in.
  */
 
 #include "get.h"
@@ -267,7 +268,9 @@ win_block(const struct catalog *c, const char *name)
 /*
  * Installed state. The registry path comes from the catalog when it names one,
  * else from the compiled-in defaults (they are the contract with today's
- * installers; the catalog's copy lets a future installer move the key).
+ * installers; the catalog's copy lets a future installer move the key). A
+ * display plug-in the defaults do not know is only ever found through the
+ * catalog's windows.registry_version.
  */
 static const char *
 default_reg_version(const char *name)
@@ -295,54 +298,143 @@ installed_version(const struct catalog *c, const char *name, char *out, size_t o
 	return reg != NULL && dxr_reg_read_path_sz(reg, out, out_size) && out[0] != '\0';
 }
 
+static bool
+is_display_plugin(const cJSON *comp)
+{
+	const char *kind = comp ? jstr(comp, "kind") : NULL;
+	return kind != NULL && strcmp(kind, "display_plugin") == 0;
+}
+
 /*
- * Detection (P2): catalog rules against this machine's evidence.
+ * Detection (P2): catalog rules against this machine's evidence. The evidence
+ * is gathered once per run; every display plug-in's rules are tested against it
+ * (#2737).
+ */
+
+#define MAX_EDIDS 32
+#define MAX_USB 128
+
+struct evidence
+{
+	struct dxr_edid_id edid[MAX_EDIDS];
+	int n_edid;
+	struct dxr_usb_id usb[MAX_USB];
+	int n_usb;
+};
+
+static void
+gather_evidence(struct evidence *ev)
+{
+	memset(ev, 0, sizeof(*ev));
+	ev->n_edid = dxr_detect_edids(ev->edid, MAX_EDIDS);
+	ev->n_usb = dxr_detect_usb(ev->usb, MAX_USB);
+}
+
+static bool
+jnum16(const cJSON *o, const char *k, uint16_t *out)
+{
+	const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+	if (!cJSON_IsNumber(v) || v->valuedouble < 0 || v->valuedouble > 65535) {
+		return false;
+	}
+	*out = (uint16_t)v->valueint;
+	return true;
+}
+
+/*!
+ * The id part shared by `edid` (prod) and `usb` (pid): an exact `<k>`, else an
+ * inclusive `<k>_min`..`<k>_max` range, else (neither given) any id. @p specific
+ * is false in that last case: a manufacturer / vendor id alone is never specific
+ * enough for an unattended install (Dell and Acer ship 2D monitors too), so the
+ * caller treats such a rule as low confidence whatever it claims. Returns false
+ * for a malformed rule, which then matches nothing.
  */
 static bool
-detect_match(const cJSON *comp, bool high_only, char *why, size_t why_size)
+id_rule(const cJSON *r, const char *k, uint16_t *lo, uint16_t *hi, bool *specific)
 {
-	const cJSON *rules = cJSON_GetObjectItemCaseSensitive(comp, "detect");
+	char kmin[16], kmax[16];
+	(void)snprintf(kmin, sizeof(kmin), "%s_min", k);
+	(void)snprintf(kmax, sizeof(kmax), "%s_max", k);
+	const bool has_exact = cJSON_GetObjectItemCaseSensitive(r, k) != NULL;
+	const bool has_min = cJSON_GetObjectItemCaseSensitive(r, kmin) != NULL;
+	const bool has_max = cJSON_GetObjectItemCaseSensitive(r, kmax) != NULL;
+	*specific = true;
+	if (has_exact) {
+		if (!jnum16(r, k, lo)) {
+			return false;
+		}
+		*hi = *lo;
+		return true;
+	}
+	if (has_min || has_max) {
+		return has_min && has_max && jnum16(r, kmin, lo) && jnum16(r, kmax, hi) && *lo <= *hi;
+	}
+	*specific = false;
+	*lo = 0;
+	*hi = 0xFFFF;
+	return true;
+}
+
+static bool
+detect_match(const cJSON *comp, const struct evidence *ev, bool high_only, char *why, size_t why_size)
+{
+	const cJSON *rules = comp ? cJSON_GetObjectItemCaseSensitive(comp, "detect") : NULL;
 	if (!cJSON_IsArray(rules)) {
 		return false;
 	}
-	struct dxr_edid_id ids[32];
-	int n = dxr_detect_edids(ids, 32);
 	const cJSON *r;
 	cJSON_ArrayForEach(r, rules)
 	{
 		const char *kind = jstr(r, "kind");
 		const char *conf = jstr(r, "confidence");
-		const bool high = conf != NULL && strcmp(conf, "high") == 0;
-		if (kind == NULL || (high_only && !high)) {
+		bool high = conf != NULL && strcmp(conf, "high") == 0;
+		if (kind == NULL) {
 			continue;
 		}
-		if (strcmp(kind, "edid") == 0) {
-			const cJSON *m = cJSON_GetObjectItemCaseSensitive(r, "man");
-			const cJSON *p = cJSON_GetObjectItemCaseSensitive(r, "prod");
-			if (!cJSON_IsNumber(m) || !cJSON_IsNumber(p)) {
+		const char *note = jstr(r, "note");
+		if (strcmp(kind, "edid") == 0 || strcmp(kind, "usb") == 0) {
+			const bool edid = kind[0] == 'e';
+			uint16_t want = 0, lo = 0, hi = 0;
+			bool specific = false;
+			if (!jnum16(r, edid ? "man" : "vid", &want) ||
+			    !id_rule(r, edid ? "prod" : "pid", &lo, &hi, &specific)) {
+				continue; // malformed: matches nothing
+			}
+			high = high && specific;
+			if (high_only && !high) {
 				continue;
 			}
+			const int n = edid ? ev->n_edid : ev->n_usb;
 			for (int i = 0; i < n; i++) {
-				if (ids[i].man == (uint16_t)m->valueint && ids[i].prod == (uint16_t)p->valueint) {
-					const char *note = jstr(r, "note");
-					(void)snprintf(why, why_size, "display EDID %u/%u%s%s (%s confidence)",
-					               ids[i].man, ids[i].prod, note ? " " : "", note ? note : "",
-					               conf ? conf : "?");
-					return true;
+				const uint16_t v = edid ? ev->edid[i].man : ev->usb[i].vid;
+				const uint16_t id = edid ? ev->edid[i].prod : ev->usb[i].pid;
+				if (v != want || id < lo || id > hi) {
+					continue;
 				}
+				if (edid) {
+					(void)snprintf(why, why_size, "display EDID %u/%u%s%s (%s confidence)", v, id,
+					               note ? " " : "", note ? note : "", high ? "high" : "low");
+				} else {
+					(void)snprintf(why, why_size, "USB device %04X:%04X%s%s (%s confidence)", v, id,
+					               note ? " " : "", note ? note : "", high ? "high" : "low");
+				}
+				return true;
 			}
 		} else if (strcmp(kind, "registry_dword_min") == 0) {
+			if (high_only && !high) {
+				continue;
+			}
 			const char *key = jstr(r, "key"), *val = jstr(r, "value");
 			const cJSON *min = cJSON_GetObjectItemCaseSensitive(r, "min");
 			uint32_t v = 0;
 			if (key && val && cJSON_IsNumber(min) && dxr_reg_read_dword(key, val, &v) &&
 			    v >= (uint32_t)min->valueint) {
-				const char *note = jstr(r, "note");
 				(void)snprintf(why, why_size, "%s (%s confidence)", note ? note : val,
-				               conf ? conf : "?");
+				               high ? "high" : "low");
 				return true;
 			}
 		}
+		// Any other kind was written for a newer dxr-get: ignored (forward compat).
 	}
 	return false;
 }
@@ -372,16 +464,28 @@ struct action
 	char reason[256];
 };
 
+//! Display plug-ins one plan can carry. More matching vendors than this on one
+//! machine is not a real configuration; the rest are logged and skipped.
+#define MAX_DISPLAY_PLUGINS 8
+#define MAX_ACTIONS (1 + MAX_DISPLAY_PLUGINS) //!< the runtime + the display plug-ins
+
 struct plan
 {
 	const char *for_component;
-	struct action a[4];
+	struct action a[MAX_ACTIONS];
 	int n;
 };
 
+//! The catalog's `label` when it carries one, else a compiled-in default (catalogs from before #2737 have no
+//! labels), else the component name.
 static const char *
-label_of(const char *name)
+label_of(const struct catalog *c, const char *name)
 {
+	const cJSON *comp = component(c, name);
+	const char *l = comp ? jstr(comp, "label") : NULL;
+	if (l != NULL && l[0] != '\0') {
+		return l;
+	}
 	if (strcmp(name, "runtime") == 0) {
 		return "DisplayXR runtime";
 	}
@@ -402,7 +506,7 @@ plan_one(const struct catalog *c, const char *name, const char *floor, bool want
 {
 	memset(a, 0, sizeof(*a));
 	a->component = name;
-	a->label = label_of(name);
+	a->label = label_of(c, name);
 	const cJSON *w = win_block(c, name);
 	const char *target = w ? jstr(w, "version") : NULL;
 	a->target = target;
@@ -435,7 +539,11 @@ plan_one(const struct catalog *c, const char *name, const char *floor, bool want
 }
 
 static void
-make_plan(const struct catalog *c, const char *for_component, const char *min_runtime, struct plan *p)
+make_plan(const struct catalog *c,
+          const struct evidence *ev,
+          const char *for_component,
+          const char *min_runtime,
+          struct plan *p)
 {
 	memset(p, 0, sizeof(*p));
 	p->for_component = for_component;
@@ -443,33 +551,53 @@ make_plan(const struct catalog *c, const char *for_component, const char *min_ru
 	const cJSON *req = comp ? cJSON_GetObjectItemCaseSensitive(comp, "requires") : NULL;
 	const char *floor = min_runtime ? min_runtime : (req ? floor_of(jstr(req, "runtime")) : NULL);
 
-	// Display plug-ins: positive evidence only.
-	const cJSON *leia = component(c, "leia_plugin");
-	char why[256] = {0};
-	const bool leia_wanted =
-	    leia != NULL && strcmp(for_component, "leia_plugin") != 0 && detect_match(leia, true, why, sizeof(why));
-	if (leia_wanted) {
-		// The plug-in's own runtime floor joins the runtime requirement.
-		const cJSON *lreq = cJSON_GetObjectItemCaseSensitive(leia, "requires");
-		const char *lf = lreq ? floor_of(jstr(lreq, "runtime")) : NULL;
-		if (lf && (floor == NULL || vercmp(lf, floor) > 0)) {
-			floor = lf;
+	// Display plug-ins (#2737): every catalog component of kind display_plugin,
+	// each wanted only on positive (high-confidence) evidence. Two vendors
+	// matching two panels plan both; the runtime arbitrates per screen. A
+	// display plug-in's own installer (for_component is one) gets only its
+	// runtime: the other vendors' plug-ins are not its prerequisites.
+	const char *dp[MAX_DISPLAY_PLUGINS];
+	char why[MAX_DISPLAY_PLUGINS][256];
+	int n_dp = 0;
+	if (!is_display_plugin(comp) && c->components != NULL) {
+		const cJSON *it;
+		cJSON_ArrayForEach(it, c->components)
+		{
+			if (!is_display_plugin(it) || it->string == NULL) {
+				continue;
+			}
+			char w[256] = {0};
+			if (!detect_match(it, ev, true, w, sizeof(w))) {
+				continue;
+			}
+			if (n_dp == MAX_DISPLAY_PLUGINS) {
+				dxr_log("%s: detected, but the plan already carries %d display plug-ins -- skipped\n",
+				        it->string, MAX_DISPLAY_PLUGINS);
+				continue;
+			}
+			// The plug-in's own runtime floor joins the runtime requirement.
+			const cJSON *preq = cJSON_GetObjectItemCaseSensitive(it, "requires");
+			const char *pf = preq ? floor_of(jstr(preq, "runtime")) : NULL;
+			if (pf && (floor == NULL || vercmp(pf, floor) > 0)) {
+				floor = pf;
+			}
+			(void)snprintf(why[n_dp], sizeof(why[n_dp]), "%s", w);
+			dp[n_dp++] = it->string;
 		}
 	}
 
 	if (strcmp(for_component, "runtime") != 0) {
 		plan_one(c, "runtime", floor, false, &p->a[p->n++]);
 	}
-	if (leia_wanted) {
-		struct action *runtime = &p->a[0];
-		// Upgrading the runtime makes an older plug-in ABI-stale: bring it to the
-		// catalog's ABI-matched pin in the same pass. Otherwise only install it
-		// when it is absent -- this tool ensures, it does not update.
-		const bool runtime_moves = p->n > 0 && runtime->state != ST_OK && runtime->state != ST_NOT_FETCHABLE;
+	// Upgrading the runtime makes an older plug-in ABI-stale: bring each wanted
+	// plug-in to the catalog's ABI-matched pin in the same pass. Otherwise only
+	// install it when it is absent -- this tool ensures, it does not update.
+	const bool runtime_moves = p->n > 0 && p->a[0].state != ST_OK && p->a[0].state != ST_NOT_FETCHABLE;
+	for (int i = 0; i < n_dp; i++) {
 		struct action *a = &p->a[p->n++];
-		plan_one(c, "leia_plugin", NULL, runtime_moves, a);
-		(void)snprintf(a->reason + strlen(a->reason), sizeof(a->reason) - strlen(a->reason),
-		               "%sLeia display: %s", a->reason[0] ? "; " : "", why);
+		plan_one(c, dp[i], NULL, runtime_moves, a);
+		(void)snprintf(a->reason + strlen(a->reason), sizeof(a->reason) - strlen(a->reason), "%sdetected: %s",
+		               a->reason[0] ? "; " : "", why[i]);
 	}
 }
 
@@ -789,7 +917,8 @@ usage(void)
 	    "  dxr-get [--catalog <url|file>] detect [--json]\n"
 	    "  dxr-get [--catalog <url|file>] catalog\n"
 	    "\n"
-	    "components: runtime, leia_plugin, browser\n"
+	    "components: the catalog's component names (`dxr-get catalog` lists them) -- the runtime,\n"
+	    "  the components that depend on it, and every display plug-in (kind display_plugin)\n"
 	    "exit: 0 ok, 2 usage, 10 offline/expired catalog, 11 bad signature, 20 download,\n"
 	    "      21 verification, 30 installer failed, 40 not fetchable, 50 needs elevation\n");
 }
@@ -860,38 +989,72 @@ main(int argc, char **argv)
 		cJSON_free(s);
 		r = DXR_GET_OK;
 	} else if (strcmp(cmd, "detect") == 0) {
-		struct dxr_edid_id ids[32];
-		int n = dxr_detect_edids(ids, 32);
-		const cJSON *leia = component(&c, "leia_plugin");
-		char why_hi[256] = {0}, why_any[256] = {0};
-		bool hi = leia && detect_match(leia, true, why_hi, sizeof(why_hi));
-		bool any = leia && detect_match(leia, false, why_any, sizeof(why_any));
-		if (json) {
-			cJSON *o = cJSON_CreateObject();
-			cJSON *e = cJSON_AddArrayToObject(o, "edids");
-			for (int i = 0; i < n; i++) {
-				cJSON *x = cJSON_CreateObject();
-				cJSON_AddNumberToObject(x, "man", ids[i].man);
-				cJSON_AddNumberToObject(x, "prod", ids[i].prod);
-				cJSON_AddItemToArray(e, x);
+		struct evidence ev;
+		gather_evidence(&ev);
+		cJSON *o = cJSON_CreateObject();
+		cJSON *e = cJSON_AddArrayToObject(o, "edids");
+		for (int i = 0; i < ev.n_edid; i++) {
+			cJSON *x = cJSON_CreateObject();
+			cJSON_AddNumberToObject(x, "man", ev.edid[i].man);
+			cJSON_AddNumberToObject(x, "prod", ev.edid[i].prod);
+			cJSON_AddItemToArray(e, x);
+			if (!json) {
+				printf("monitor EDID man=%u (0x%04X) prod=%u (0x%04X)\n", ev.edid[i].man,
+				       ev.edid[i].man, ev.edid[i].prod, ev.edid[i].prod);
 			}
-			cJSON *l = cJSON_AddObjectToObject(o, "leia_plugin");
-			cJSON_AddBoolToObject(l, "match", any);
-			cJSON_AddBoolToObject(l, "high_confidence", hi);
-			cJSON_AddStringToObject(l, "evidence", hi ? why_hi : why_any);
-			char *s = cJSON_PrintUnformatted(o);
-			printf("%s\n", s);
-			cJSON_free(s);
-			cJSON_Delete(o);
-		} else {
-			for (int i = 0; i < n; i++) {
-				printf("monitor EDID man=%u (0x%04X) prod=%u (0x%04X)\n", ids[i].man, ids[i].man,
-				       ids[i].prod, ids[i].prod);
-			}
-			printf("leia_plugin: %s%s%s\n",
-			       any ? (hi ? "MATCH (high confidence)" : "match (low confidence)") : "no match",
-			       any ? " -- " : "", hi ? why_hi : why_any);
 		}
+		cJSON *u = cJSON_AddArrayToObject(o, "usb");
+		for (int i = 0; i < ev.n_usb; i++) {
+			cJSON *x = cJSON_CreateObject();
+			cJSON_AddNumberToObject(x, "vid", ev.usb[i].vid);
+			cJSON_AddNumberToObject(x, "pid", ev.usb[i].pid);
+			cJSON_AddItemToArray(u, x);
+			if (!json) {
+				printf("USB device %04X:%04X\n", ev.usb[i].vid, ev.usb[i].pid);
+			}
+		}
+		cJSON *dps = cJSON_AddArrayToObject(o, "display_plugins");
+		// Compat (#2737): the earlier shape had only a top-level leia_plugin
+		// object. Kept for one release next to display_plugins.
+		cJSON *leia = cJSON_CreateObject();
+		cJSON_AddBoolToObject(leia, "match", false);
+		cJSON_AddBoolToObject(leia, "high_confidence", false);
+		cJSON_AddStringToObject(leia, "evidence", "");
+		const cJSON *it;
+		cJSON_ArrayForEach(it, c.components)
+		{
+			if (!is_display_plugin(it) || it->string == NULL) {
+				continue;
+			}
+			char why_hi[256] = {0}, why_any[256] = {0};
+			const bool hi = detect_match(it, &ev, true, why_hi, sizeof(why_hi));
+			const bool any = hi || detect_match(it, &ev, false, why_any, sizeof(why_any));
+			const char *evid = hi ? why_hi : why_any;
+			cJSON *x = cJSON_CreateObject();
+			cJSON_AddStringToObject(x, "component", it->string);
+			cJSON_AddStringToObject(x, "label", label_of(&c, it->string));
+			cJSON_AddBoolToObject(x, "match", any);
+			cJSON_AddBoolToObject(x, "high_confidence", hi);
+			cJSON_AddStringToObject(x, "evidence", evid);
+			cJSON_AddItemToArray(dps, x);
+			if (strcmp(it->string, "leia_plugin") == 0) {
+				cJSON_ReplaceItemInObjectCaseSensitive(leia, "match", cJSON_CreateBool(any));
+				cJSON_ReplaceItemInObjectCaseSensitive(leia, "high_confidence", cJSON_CreateBool(hi));
+				cJSON_ReplaceItemInObjectCaseSensitive(leia, "evidence", cJSON_CreateString(evid));
+			}
+			if (!json) {
+				printf("%s: %s%s%s\n", it->string,
+				       any ? (hi ? "MATCH (high confidence)" : "match (low confidence)") : "no match",
+				       any ? " -- " : "", evid);
+			}
+		}
+		cJSON_AddItemToObject(o, "leia_plugin", leia);
+		if (json) {
+			char *str = cJSON_PrintUnformatted(o);
+			printf("%s\n", str);
+			cJSON_free(str);
+		}
+		cJSON_Delete(o);
 		r = DXR_GET_OK;
 	} else if (strcmp(cmd, "plan") == 0 || strcmp(cmd, "ensure-for") == 0) {
 		if (for_c == NULL) {
@@ -899,8 +1062,10 @@ main(int argc, char **argv)
 			r = DXR_GET_USAGE;
 			goto done;
 		}
+		struct evidence ev;
+		gather_evidence(&ev);
 		struct plan p;
-		make_plan(&c, for_c, min_runtime, &p);
+		make_plan(&c, &ev, for_c, min_runtime, &p);
 		if (strcmp(cmd, "plan") == 0) {
 			if (json) {
 				print_plan_json(&p);
@@ -936,7 +1101,7 @@ main(int argc, char **argv)
 		}
 		// Download and verify EVERYTHING first: a network failure halfway must
 		// not leave a new runtime next to an ABI-stale plug-in.
-		wchar_t paths[4][MAX_PATH];
+		wchar_t paths[MAX_ACTIONS][MAX_PATH];
 		for (int i = 0; i < p.n; i++) {
 			if (needs_work(&p.a[i])) {
 				int rr = fetch_component(&c, p.a[i].component, paths[i], MAX_PATH, NULL);
