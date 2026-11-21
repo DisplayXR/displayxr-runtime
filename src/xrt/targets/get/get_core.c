@@ -18,6 +18,8 @@
 
 #define RUNTIME_VERSION_PATH "HKLM\\SOFTWARE\\DisplayXR\\Runtime\\Version"
 #define RUNTIME_ABI_KEY "HKLM\\SOFTWARE\\DisplayXR\\Runtime\\Abi"
+//! The runtime version the Abi values were written by. They count only while it is the installed one.
+#define RUNTIME_ABI_STAMP RUNTIME_ABI_KEY "\\RuntimeVersion"
 #define V1_PUBLISHER "displayxr"
 
 /*
@@ -877,12 +879,19 @@ runtime_abi(struct build *b, const char *item_class, const char *rt_eff, bool rt
 				return true;
 			}
 		}
-	} else if (!rt_moves && b->env->reg_dword != NULL &&
-	           b->env->reg_dword(b->env->user, RUNTIME_ABI_KEY, item_class, &v)) {
+	} else if (!rt_moves && b->env->reg_dword != NULL && b->env->reg_sz != NULL) {
 		// The installed runtime publishes its own majors; that is the truth
-		// while the runtime is not being replaced in this pass.
-		*lo = *hi = (int)v;
-		return true;
+		// while the runtime is not being replaced in this pass -- and only
+		// while the values are that runtime's. An older runtime installed over
+		// a newer one does not know the Abi key and leaves it behind, so the
+		// values carry the version that wrote them, and a stamp that is absent
+		// or names another version means "nothing says": not checked.
+		char stamp[64];
+		if (rt_eff != NULL && b->env->reg_sz(b->env->user, RUNTIME_ABI_STAMP, stamp, sizeof(stamp)) &&
+		    strcmp(stamp, rt_eff) == 0 && b->env->reg_dword(b->env->user, RUNTIME_ABI_KEY, item_class, &v)) {
+			*lo = *hi = (int)v;
+			return true;
+		}
 	}
 	// Otherwise the catalog's runtime item describes exactly one version.
 	const cJSON *rt = b->runtime;
@@ -1627,6 +1636,54 @@ dxr_list_receipts(const struct dxr_receipt *r, int n)
 		cJSON_AddItemToArray(arr, x);
 	}
 	return arr;
+}
+
+int
+dxr_uninstall_check(const struct dxr_receipt *r,
+                    const struct dxr_receipt *all,
+                    int n,
+                    bool elevated,
+                    const char **result,
+                    char *detail,
+                    size_t detail_size)
+{
+	char deps[400];
+	detail[0] = '\0';
+	// What elevation cannot fix comes first: a caller told "needs elevation"
+	// would elevate, run again, and only then learn it could never work.
+	if (r == NULL) {
+		*result = "not_installed";
+		copy(
+		    detail, detail_size,
+		    "dxr-get has no install receipt for this id (see `dxr-get list --installed`). A component that was "
+		    "installed by its own installer or by the bundle is removed from Windows Settings > Apps > "
+		    "Installed "
+		    "apps");
+		return DXR_GET_NOT_INSTALLED;
+	}
+	if (r->uninstall[0] == '\0') {
+		*result = "no_uninstall_command";
+		(void)snprintf(
+		    detail, detail_size,
+		    "%s was installed from a catalog entry that names no uninstall command, so dxr-get cannot "
+		    "remove it. That is the case for every item of the schema-1 catalog, and for a schema-2 "
+		    "item without an `uninstall` rule. Remove it from Windows Settings > Apps > Installed apps "
+		    "(or run its own uninstaller). Nothing was changed",
+		    r->name[0] ? r->name : r->id);
+		return DXR_GET_CANNOT_UNINSTALL;
+	}
+	if (dxr_receipt_dependents(all, n, r->id, deps, sizeof(deps)) > 0) {
+		*result = "required_by_others";
+		(void)snprintf(detail, detail_size, "still required by: %s. Uninstall those first", deps);
+		return DXR_GET_CANNOT_UNINSTALL;
+	}
+	if (!elevated) {
+		*result = "needs_elevation";
+		copy(detail, detail_size, "uninstalling needs an elevated process");
+		return DXR_GET_NEEDS_ADMIN;
+	}
+	*result = "ok";
+	return DXR_GET_OK;
 }
 
 int

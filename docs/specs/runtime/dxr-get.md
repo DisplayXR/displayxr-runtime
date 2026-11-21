@@ -223,9 +223,17 @@ network. `--json` gives `{"installed":[…]}` with `id`, `name`, `class`, `publi
 `uninstall <id>` removes an item that `dxr-get` installed. It needs no catalog and no
 network: everything comes from the receipt.
 
+The checks run in this order, and the first that fails is the answer. What elevation cannot
+fix comes first, so a caller is told to elevate only when elevating is all that is missing
+(otherwise it would elevate, run again, and only then learn it could never work):
+
 1. No receipt for that id: exit 42. A component installed by its own installer is removed
    from Windows Settings.
-2. The receipt holds no uninstall command (the catalog gave none): exit 43.
+2. The receipt holds no uninstall command (the catalog gave none): exit 43, elevated or not.
+   The message names the item and says what to do instead: remove it from Windows Settings >
+   Apps > Installed apps, or run its own uninstaller. **This is the answer for every item
+   installed from the schema-1 catalog**, which carries no uninstall rules; so until schema 2
+   is published, `uninstall` can only ever answer 42 or 43.
 3. Another receipt lists this id in its requirements: exit 43, naming them.
 4. Not elevated: exit 50.
 5. The service and its satellites are stopped when the item's class is one the runtime or
@@ -294,7 +302,12 @@ An item is refused, with exit **41** and a message naming the versions, when:
 
 The runtime's class ABI majors come from `HKLM\Software\DisplayXR\Runtime\Abi\<class>`
 (DWORD values `display_processor`, `input_provider`, `conversion_provider`,
-`tracking_provider`), which the runtime installer writes from the class headers. When the
+`tracking_provider`), which the runtime installer writes from the class headers. Next to
+them it writes `Abi\RuntimeVersion`, the version that wrote them, and `dxr-get` uses the
+values **only while that stamp equals `Runtime\Version`**. An older runtime installed over a
+newer one does not know the key and leaves it behind; without the stamp the gate would read
+the newer runtime's ABI for the older one. A stamp that is absent or names another version
+means the same as no values at all: not checked. When the
 runtime is being replaced in the same plan, the catalog's runtime item says what the new one
 implements (its own `abi` object). When neither source has the number, the ABI is **not
 checked** and the plan says so (`… ABI not checked: the runtime does not publish it`): an
@@ -398,7 +411,7 @@ Leia plug-in and the browser, not for the runtime; the values their installers w
 | 41 | the item's runtime range or class ABI excludes this machine's runtime |
 | 42 | `uninstall`: `dxr-get` has no receipt for that id |
 | 43 | `uninstall`: no uninstall command was recorded, or other installed items require it |
-| 50 | installing or uninstalling needs an elevated process |
+| 50 | installing or uninstalling needs an elevated process. For `uninstall` it is given only when nothing else stands in the way: 42 and 43 are answered first, elevated or not |
 
 Codes 0 to 40 and 50 mean what they meant for the schema-1 tool. `dxr-get` does not relaunch
 itself elevated; a front end that wants that does it (ADR-064 step 4).
@@ -487,9 +500,67 @@ Their behaviour and exit codes are the schema-1 tool's, with these deliberate di
 | `install X` | installed X only | installs what X requires first (a missing or too-old runtime; `--no-runtime` turns that into exit 41), and stops and restarts the service around a component the runtime loads |
 | `plan` (text) | printed only what needed work | also prints one line per component that needs nothing |
 | `plan --json` | the schema-1 fields | the same fields in the same order, plus new ones after them |
+| `plan`: `reason` of a hardware item | `Leia display: <evidence>` | `detected: <evidence>`, for any item. Intentional: the text was Leia-specific. `reason` is free text for people; the DisplayXR Browser installer, the Leia plug-in installer and the runtime installer's listing shim were checked and none reads it (they read `component`, `state`, `target`, `size` and exit codes) |
 | `ensure-for`, `install` | no record | write a receipt per installed item |
 | `detect --json` | one `leia_plugin` object | the same object (plus its `id`), and one per other item with detect rules |
 | any | waited for a child installer without limit | waits at most one hour |
+
+## Validating on a test machine
+
+Schema 2 is not published, and a test catalog must be signed to be read. Test content is
+never signed with the production catalog key. Instead, `dxr-get` can be **compiled** to trust
+one throwaway key, and a script signs a fixture catalog with it.
+
+**The test build.** CMake option `DXR_GET_TEST_ROOT_KEY` (64 hex digits of an Ed25519 public
+key, empty by default). It is compile time only: no environment variable, registry value or
+argument turns it on in a normal build. A binary built with it:
+
+- prints `TEST ROOT KEY BUILD -- not for distribution` on every run, before anything else;
+- trusts that one key **instead of** the catalog keys, so it cannot verify the real catalog;
+- reads a local catalog file only: without `--catalog <file>`, or with a URL, it exits 2;
+- is not installed into `_package\bin`, and makes the `installer` target fail.
+
+Everything else is the shipping code path: the serial guard, expiry, publisher signers,
+hashes, Authenticode. CI asserts that the option is unset and that no `dxr-get.exe` it builds
+contains the banner text (`build-windows.yml`); `attach-dxr-get.yml` refuses to attach one.
+
+**The fixture.** `scripts/make_test_catalog.py` (needs Python with `cryptography` for signing):
+
+```
+python scripts/make_test_catalog.py keygen --out C:\dxr-fixture
+   -> C:\dxr-fixture\test-root.seed, and prints the public key and the CMake flag
+cmake -DDXR_GET_TEST_ROOT_KEY=<64 hex> build
+scripts\build_windows.bat build
+python scripts/make_test_catalog.py build --key C:\dxr-fixture\test-root.seed --out C:\dxr-fixture\cat
+build\src\xrt\targets\get\Release\dxr-get.exe --catalog C:\dxr-fixture\cat\stable.json list --json
+```
+
+Afterwards: `cmake -UDXR_GET_TEST_ROOT_KEY build`, rebuild, and delete the seed.
+
+The fixture takes the three real first-party installers, with their sizes, hashes and URLs,
+from the live schema-1 catalog (`--v1` names another). They are really signed, so a fetch
+really verifies, and nothing has to be built, hosted or signed for the test. Around them it
+adds items whose ids start with `fixture.`. A fixture item's installed-version value is one
+nothing writes, so it always reads as not installed and its plan is the same on every run.
+Each fixture item stands on the browser's installer (`fixture.abi-mismatch` on the Leia
+plug-in's): installing one really runs that installer.
+
+| Case | Command (after `--catalog <file>`) | Expected |
+|---|---|---|
+| Schema 2 is read, serial guard | `list --json` | `"schema":2`; `CatalogSerialV2` is written under `HKLM\SOFTWARE\DisplayXR\Update` when elevated |
+| Every detector, met | `plan --for fixture.detectors-met --json` | four `prerequisites`, all `"met":true` (`registry_key_exists`, `file_exists`, `service_exists`, `registry_sz_min` against Windows' own key, file and service) |
+| Every detector, unmet | `plan --for fixture.detectors-unmet` | three `Prerequisite MISSING` lines with their links; nothing is planned for them |
+| Runtime range, maximum | `install fixture.runtime-too-new` | exit 41, naming `1.0.0` and the installed runtime |
+| Runtime range, minimum | `install fixture.runtime-too-old` | exit 41, naming `99.0.0` |
+| Class ABI | `install fixture.abi-mismatch` | exit 41 (`display_processor ABI 99`) when the runtime's ABI is known: a runtime that wrote `Runtime\Abi` with its stamp, a plan that moves the runtime to the catalog's version, or `list --json --assume-runtime <catalog runtime version>` for `"compatible":false`. On a runtime that never wrote the values and is newer than the catalog's, the plan says `ABI not checked` |
+| Stale ABI values | install an older runtime over one that wrote `Runtime\Abi`, then the row above | `ABI not checked`: the stamp names another version |
+| Several assets | `plan --for fixture.multi-asset --json`, then `install fixture.multi-asset` on a machine without the Leia plug-in | two actions with a `download`, `total_size` their sum; the prerequisite's installer runs before the item's |
+| Default set | `plan --default`, `install --default` | the browser (`recommended`); also the Leia plug-in on a Leia panel |
+| Wrong signer | `fetch fixture.wrong-signer` | downloads, hash ok, then exit 21: the file's signer is not the one the catalog names |
+| Signer of another publisher | `install fixture.undelegated-signer` (elevated) | exit 40 before any download: `not delegated to publisher "fixture-other"` |
+| Link-out | `list`, `install fixture.link-out` | `installable: false` with its `listing`; exit 40 |
+| Uninstall with a rule | `install browser`, `list --installed`, `uninstall browser` | the receipt carries an `uninstall_command`; exit 0 and the receipt is gone |
+| Offline | `--catalog C:\no\such\file plan --for browser --json` | exit 10, `{"offline":true,…}` |
 
 ## Not implemented yet
 

@@ -329,6 +329,24 @@ dxr_list_catalog(const struct dxr_catalog *c, const struct dxr_env *env, bool ou
 cJSON *
 dxr_list_receipts(const struct dxr_receipt *r, int n);
 
+/*!
+ * May `uninstall` run? @p r is the item's receipt (NULL: none), @p all every
+ * receipt on the machine. Returns DXR_GET_OK, or the exit code with @p result
+ * (the `--json` result word) and @p detail (what to do instead).
+ *
+ * Order: what elevation cannot fix first (no receipt: 42; no uninstall
+ * command, or required by another installed item: 43), then elevation (50).
+ * A caller is only told to elevate when elevating is all that is missing.
+ */
+int
+dxr_uninstall_check(const struct dxr_receipt *r,
+                    const struct dxr_receipt *all,
+                    int n,
+                    bool elevated,
+                    const char **result,
+                    char *detail,
+                    size_t detail_size);
+
 //! Ids (from @p all) whose receipts say they required @p id. Returns the count, names in @p out.
 int
 dxr_receipt_dependents(const struct dxr_receipt *all, int n, const char *id, char *out, size_t out_size);

@@ -108,7 +108,20 @@ set(DISPLAYXR_ALLOWLIST_NSH "${CMAKE_CURRENT_BINARY_DIR}/Allowlist.nsh")
 # makensis resolves `!include` against a native (backslash) path only.
 file(TO_NATIVE_PATH "${DISPLAYXR_ALLOWLIST_NSH}" DISPLAYXR_ALLOWLIST_NSH_NATIVE)
 
+# A dxr-get built with a test root key must never be packed (see
+# src/xrt/targets/get/CMakeLists.txt). The option lives in the cache, so a tree
+# that was used for a test build would otherwise keep producing installers.
+set(DXR_INSTALLER_GUARD "")
+if(DXR_GET_TEST_ROOT_KEY)
+	set(DXR_INSTALLER_GUARD
+	    COMMAND "${CMAKE_COMMAND}" -E echo
+	            "ERROR: DXR_GET_TEST_ROOT_KEY is set. Reconfigure with -UDXR_GET_TEST_ROOT_KEY before building an installer."
+	    COMMAND "${CMAKE_COMMAND}" -E false
+	    )
+endif()
+
 add_custom_target(installer
+	${DXR_INSTALLER_GUARD}
 	COMMAND "${CMAKE_COMMAND}"
 		"-DBIN_DIR=${DISPLAYXR_BIN_DIR}"
 		"-DVERSION=${DISPLAYXR_VERSION}"

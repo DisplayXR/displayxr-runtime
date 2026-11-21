@@ -1357,6 +1357,11 @@ client_dll_ok:
 	; headers, via installer/CMakeLists.txt). dxr-get reads them to refuse a
 	; catalog item whose plug-in the loader would reject (ADR-020) instead of
 	; installing it. The uninstaller removes them with the Runtime key.
+	; RuntimeVersion says which runtime wrote them: an older runtime installed
+	; over this one does not know the key and leaves it behind, so dxr-get
+	; trusts the values only while this stamp equals Runtime\Version.
+	DeleteRegKey HKLM "Software\DisplayXR\Runtime\Abi"
+	WriteRegStr HKLM "Software\DisplayXR\Runtime\Abi" "RuntimeVersion" "${VERSION}"
 	!ifdef ABI_DISPLAY_PROCESSOR
 		WriteRegDWORD HKLM "Software\DisplayXR\Runtime\Abi" "display_processor" ${ABI_DISPLAY_PROCESSOR}
 	!endif

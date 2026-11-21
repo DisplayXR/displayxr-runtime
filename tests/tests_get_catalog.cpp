@@ -125,6 +125,7 @@ struct Machine
 };
 
 const char *RT_VER = "HKLM\\Software\\DisplayXR\\Runtime\\Version";
+const char *ABI_STAMP = "HKLM\\SOFTWARE\\DisplayXR\\Runtime\\Abi\\RuntimeVersion";
 const char *LEIA_VER = "HKLM\\Software\\DisplayXR\\Plugins\\LeiaSR\\Version";
 
 #define SHA_RT "1111111111111111111111111111111111111111111111111111111111111111"
@@ -819,7 +820,14 @@ TEST_CASE("gating: the class ABI")
 	CHECK(p.gate == DXR_GET_OK);
 	CHECK(std::string(step(p, "open-conversion")->reason).find("ABI not checked") != std::string::npos);
 
-	// It publishes a matching major: fine.
+	// Abi values with no stamp saying which runtime wrote them are not trusted.
+	m.dword["HKLM\\SOFTWARE\\DisplayXR\\Runtime\\Abi|conversion_provider"] = 2;
+	p = plan(cat, m, "open-conversion", DXR_PLAN_INSTALL);
+	CHECK(p.gate == DXR_GET_OK);
+	CHECK(std::string(step(p, "open-conversion")->reason).find("ABI not checked") != std::string::npos);
+
+	// It publishes a matching major, stamped with the installed version: fine.
+	m.sz[ABI_STAMP] = "2.69.0";
 	m.dword["HKLM\\SOFTWARE\\DisplayXR\\Runtime\\Abi|conversion_provider"] = 1;
 	p = plan(cat, m, "open-conversion", DXR_PLAN_INSTALL);
 	CHECK(p.gate == DXR_GET_OK);
@@ -832,6 +840,25 @@ TEST_CASE("gating: the class ABI")
 	CHECK(step(p, "open-conversion")->state == DXR_ST_INCOMPATIBLE);
 	CHECK(std::string(p.gate_reason).find("conversion_provider ABI 1") != std::string::npos);
 	CHECK(p.todo == 0);
+
+	// An older runtime was installed over the one that wrote the values (it does
+	// not know the key and leaves it behind): the stamp no longer names the
+	// installed version, so the stale values are ignored -- not checked, not refused.
+	m.sz[RT_VER] = "2.68.0";
+	p = plan(cat, m, "open-conversion", DXR_PLAN_INSTALL);
+	CHECK(p.gate == DXR_GET_OK);
+	CHECK(step(p, "open-conversion")->state == DXR_ST_MISSING);
+	CHECK(std::string(step(p, "open-conversion")->reason).find("ABI not checked") != std::string::npos);
+	// The same holds for `list`.
+	{
+		dxr_env e = m.env();
+		cJSON *all = dxr_list_catalog(&cat.c, &e, false, false);
+		CHECK(cJSON_IsTrue(cJSON_GetObjectItem(row(all, "open-conversion"), "compatible")));
+		cJSON_Delete(all);
+	}
+	// Re-installing the runtime that wrote them makes them count again.
+	m.sz[RT_VER] = "2.69.0";
+	CHECK(plan(cat, m, "open-conversion", DXR_PLAN_INSTALL).gate == DXR_GET_INCOMPATIBLE);
 
 	// The runtime is being replaced in this plan: the installed runtime's ABI no
 	// longer matters, the catalog's runtime item says what the new one implements.
@@ -1356,4 +1383,41 @@ TEST_CASE("install --default: the recommended set plus high-confidence hardware"
 	CHECK(p.n == 0);
 	CHECK(p.todo == 0);
 	CHECK(text(p).find("Nothing to install.") != std::string::npos);
+}
+
+TEST_CASE("uninstall: what elevation cannot fix is reported before elevation is asked for")
+{
+	dxr_receipt rs[3] = {receipt("runtime", "2.70.0", SHA_RT), receipt("leia-sr", "2.23.0", SHA_LEIA, "runtime"),
+	                     receipt("browser", "1.10.3", SHA_BROWSER)};
+	rs[2].uninstall[0] = '\0'; // installed from a catalog entry with no uninstall rule (every schema-1 item)
+	snprintf(rs[2].name, sizeof(rs[2].name), "DisplayXR Browser");
+	const char *result = nullptr;
+	char detail[700];
+
+	for (bool elevated : {false, true}) {
+		INFO("elevated: " << elevated);
+		// No receipt: 42, elevated or not.
+		CHECK(dxr_uninstall_check(nullptr, rs, 3, elevated, &result, detail, sizeof(detail)) ==
+		      DXR_GET_NOT_INSTALLED);
+		CHECK(std::string(result) == "not_installed");
+
+		// No uninstall command: 43, elevated or not, and the message says what to do instead.
+		CHECK(dxr_uninstall_check(&rs[2], rs, 3, elevated, &result, detail, sizeof(detail)) ==
+		      DXR_GET_CANNOT_UNINSTALL);
+		CHECK(std::string(result) == "no_uninstall_command");
+		CHECK(std::string(detail).find("DisplayXR Browser") != std::string::npos);
+		CHECK(std::string(detail).find("schema-1") != std::string::npos);
+		CHECK(std::string(detail).find("Windows Settings") != std::string::npos);
+
+		// Required by another installed item: 43.
+		CHECK(dxr_uninstall_check(&rs[0], rs, 3, elevated, &result, detail, sizeof(detail)) ==
+		      DXR_GET_CANNOT_UNINSTALL);
+		CHECK(std::string(result) == "required_by_others");
+		CHECK(std::string(detail).find("leia-sr") != std::string::npos);
+	}
+
+	// Everything else in order: only now does elevation decide.
+	CHECK(dxr_uninstall_check(&rs[1], rs, 3, false, &result, detail, sizeof(detail)) == DXR_GET_NEEDS_ADMIN);
+	CHECK(std::string(result) == "needs_elevation");
+	CHECK(dxr_uninstall_check(&rs[1], rs, 3, true, &result, detail, sizeof(detail)) == DXR_GET_OK);
 }

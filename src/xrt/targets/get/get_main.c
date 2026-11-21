@@ -1033,28 +1033,12 @@ cmd_uninstall(const char *id, bool json, bool no_start)
 	static struct dxr_receipt all[MAX_RECEIPTS];
 	struct dxr_receipt r;
 	char detail[700];
-	if (!receipt_read(id, &r)) {
-		return uninstall_result(
-		    id, DXR_GET_NOT_INSTALLED, "not_installed",
-		    "dxr-get has no install receipt for this id (see `dxr-get list --installed`); a "
-		    "component installed by its own installer is removed from Windows Settings",
-		    json);
-	}
-	if (r.uninstall[0] == '\0') {
-		return uninstall_result(id, DXR_GET_CANNOT_UNINSTALL, "no_uninstall_command",
-		                        "the catalog gave no uninstall command for this item; remove it from Windows "
-		                        "Settings > Apps",
-		                        json);
-	}
+	const char *result = "";
+	const bool have = receipt_read(id, &r);
 	int n = receipts_all(all, MAX_RECEIPTS);
-	char deps[400];
-	if (dxr_receipt_dependents(all, n, id, deps, sizeof(deps)) > 0) {
-		(void)snprintf(detail, sizeof(detail), "still required by: %s. Uninstall those first", deps);
-		return uninstall_result(id, DXR_GET_CANNOT_UNINSTALL, "required_by_others", detail, json);
-	}
-	if (!is_admin()) {
-		return uninstall_result(id, DXR_GET_NEEDS_ADMIN, "needs_elevation",
-		                        "uninstalling needs an elevated process", json);
+	int check = dxr_uninstall_check(have ? &r : NULL, all, n, is_admin(), &result, detail, sizeof(detail));
+	if (check != DXR_GET_OK) {
+		return uninstall_result(id, check, result, detail, json);
 	}
 	const bool loaded = dxr_class_is_loaded(r.item_class);
 	const bool is_runtime = strcmp(r.item_class, "runtime") == 0;
@@ -1158,6 +1142,15 @@ main(int argc, char **argv)
 			return DXR_GET_USAGE;
 		}
 	}
+	// A build whose catalog root key was replaced for testing says so on every
+	// run, before anything else, and reads a local catalog file only.
+	const char *test_banner = dxr_test_root_key_banner();
+	if (test_banner != NULL) {
+		dxr_log(
+		    "\n*** %s ***\n*** This dxr-get trusts a throwaway key instead of the DisplayXR catalog keys. "
+		    "***\n\n",
+		    test_banner);
+	}
 	if (cmd == NULL) {
 		usage();
 		return DXR_GET_USAGE;
@@ -1203,6 +1196,12 @@ main(int argc, char **argv)
 	}
 	const char *target = use_default ? "--default" : (plan_verb ? for_c : arg);
 
+	if (test_banner != NULL && (catalog_where == NULL || _strnicmp(catalog_where, "http", 4) == 0)) {
+		// It cannot verify the real catalog (it does not hold its keys), and it
+		// must never be pointed at one by accident.
+		dxr_log("this build reads a local test catalog only: pass --catalog <file>\n");
+		return DXR_GET_USAGE;
+	}
 	struct dxr_catalog c;
 	bool no_network = false;
 	int r = catalog_where != NULL ? load_catalog(catalog_where, !no_verify, &c, &no_network)
