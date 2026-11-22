@@ -271,10 +271,25 @@ gatekeeper_check() {
     grep -q 'source=Notarized Developer ID' <<<"$assess" || die "Gatekeeper accepted $file but not as 'Notarized Developer ID'"
 }
 
+# stapler validate looks the ticket up over the network (CloudKit), so a dropped
+# connection fails it even when the ticket is stapled (pro-v0.9.10: -1005 "The
+# network connection was lost" -> Error 68 -> a good signed .pkg replaced by the
+# unsigned copy). Retry a few times before calling it a failure.
+stapler_validate() {
+    local file="$1" i
+    for i in 1 2 3 4; do
+        xcrun stapler validate "$file" && return 0
+        [ "$i" -lt 4 ] || break
+        log "stapler validate failed (attempt $i/4) - retrying in $((i * 15)) s"
+        sleep $((i * 15))
+    done
+    return 1
+}
+
 cmd_staple() {
     local file="${1:?staple <file>}"
     xcrun stapler staple "$file"
-    xcrun stapler validate "$file"
+    stapler_validate "$file" || die "stapler validate failed for $file"
     gatekeeper_check "$file"
     case "$file" in *.pkg) pkgutil --check-signature "$file" ;; esac
     log "staple OK: $(basename "$file") is notarized, stapled and Gatekeeper-accepted"
@@ -287,7 +302,7 @@ cmd_verify_pkg() {
     sig="$(pkgutil --check-signature "$pkg" 2>&1)" || { echo "$sig" >&2; die "pkgutil: $pkg is not signed"; }
     echo "$sig"
     grep -q 'Developer ID Installer' <<<"$sig" || die "$pkg is not signed with a Developer ID Installer identity"
-    xcrun stapler validate "$pkg" || die "no valid notarization ticket stapled to $pkg"
+    stapler_validate "$pkg" || die "no valid notarization ticket stapled to $pkg"
     gatekeeper_check "$pkg"
     log "verify-pkg OK: $(basename "$pkg") — Developer ID signed, notarized, stapled"
 }
