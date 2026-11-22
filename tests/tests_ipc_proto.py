@@ -47,6 +47,9 @@ SPEC5_CONV_CALLS = ['conv_enum_candidates', 'conv_stream_create_v5']
 SERVICE_LINK_CALLS = ['service_link_register', 'service_link_share_poll', 'service_link_share_publish_ring',
                       'service_link_share_publish_fence', 'service_link_share_frame_ready']
 
+#: Window-drag phase snap for an ordinary session client, appended after the service link's calls.
+APP_SNAP_CALLS = ['compositor_snap_window_rect']
+
 #: ADR-034 Amendment 5 (#2181): per-client input selection, appended after the spec-4 family.
 INPUT_SELECTION_CALLS = ['input_providers_enumerate', 'input_set_provider_preference', 'system_get_input_holders']
 
@@ -183,7 +186,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
                  "workspace_set_overlay_on_screen", "conv_hint_interest", "compositor_set_cursor_draw_request",
                  "compositor_set_cursor_measure_request", "system_request_component_reselect",
                  "conv_warm") + tuple(SPEC4_CONV_CALLS) + tuple(INPUT_SELECTION_CALLS) + tuple(SPEC5_CONV_CALLS) + \
-            tuple(SERVICE_LINK_CALLS)
+            tuple(SERVICE_LINK_CALLS) + tuple(APP_SNAP_CALLS)
         self.assertTrue(all(n.startswith("system_get_") or n in later
                             for n in names[i + 3:]), names[i + 3:])
         enable = self._call("compositor_segments_enable")
@@ -353,9 +356,15 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertIn("ipc_handle_system_get_conv_provider_row(", text)
         self.assertIn("ipc_handle_system_get_conv_task_row(", text)
 
-    def _names_before_service_link(self):
-        """Command names up to the service link's share calls (ADR-061 arm 2), appended LAST."""
+    def _names_before_app_snap(self):
+        """Command names up to the session client's window-drag snap call, appended LAST."""
         names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-len(APP_SNAP_CALLS):], APP_SNAP_CALLS)
+        return names[:-len(APP_SNAP_CALLS)]
+
+    def _names_before_service_link(self):
+        """Command names up to the service link's share calls (ADR-061 arm 2); only the app snap follows."""
+        names = self._names_before_app_snap()
         self.assertEqual(names[-len(SERVICE_LINK_CALLS):], SERVICE_LINK_CALLS)
         return names[:-len(SERVICE_LINK_CALLS)]
 
@@ -367,10 +376,11 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
 
     def test_service_link_calls_are_appended(self):
         # ADR-061 arm 2 (ADR-049 Amendment 1): the in-process service link's
-        # registration and share messages ride at the very END, so every
-        # earlier command keeps its enum value. The ring's textures and its
-        # fence travel on two messages: a message carries one handle type.
-        names = [c.name for c in self.p.calls]
+        # registration and share messages were appended at the END (only the
+        # app snap call follows them), so every earlier command keeps its enum
+        # value. The ring's textures and its fence travel on two messages: a
+        # message carries one handle type.
+        names = self._names_before_app_snap()
         self.assertEqual(names[-len(SERVICE_LINK_CALLS):], SERVICE_LINK_CALLS)
         reg = self._call("service_link_register")
         self.assertEqual([(a.name, a.typename) for a in reg.in_args],
@@ -607,6 +617,20 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         body = self._function_body(text, "ipc_call_compositor_get_predicted_eye_positions(")
         self.assertIn("int64_t target_ns", body)
         self.assertIn("struct xrt_eye_positions *out_eye_positions", body)
+
+    def test_app_snap_call_is_appended(self):
+        # The window-drag snap for an ordinary session client rides at the very
+        # END, so every earlier command keeps its enum value. Plain scalars in
+        # and out: no handles, no variable-length payload.
+        names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-len(APP_SNAP_CALLS):], APP_SNAP_CALLS)
+        snap = self._call("compositor_snap_window_rect")
+        self.assertEqual([(a.name, a.typename) for a in snap.in_args],
+                         [("origin_x", "int32_t"), ("origin_y", "int32_t"),
+                          ("target_x", "int32_t"), ("target_y", "int32_t")])
+        self.assertEqual([a.name for a in snap.out_args], ["snapped", "snapped_x", "snapped_y", "never"])
+        self.assertFalse(snap.in_handles or snap.out_handles or snap.varlen)
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
