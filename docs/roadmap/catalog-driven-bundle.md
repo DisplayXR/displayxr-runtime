@@ -25,10 +25,16 @@ the conversion models:
 
 | Item state | Row | Ticked |
 |---|---|---|
-| not installed | `<name> <version> (download N MB)` | if **recommended** by the catalog, or if its detection rule **matched this machine with high confidence** |
-| installed, older than the catalog | `<name> <installed> to <version> (download N MB)` | same rule |
-| installed at the catalog version, or newer | `<name> <installed> - installed`, greyed | never; nothing is downloaded |
-| no signed Windows build, a link-out item, or its runtime range excludes the runtime being installed | `<name> - not available`, greyed, the reason in the description box | never |
+| not installed | `N MB - <name> <version>` | if **recommended** by the catalog, or if its detection rule **matched this machine with high confidence** |
+| installed, older than the catalog | `Update, N MB - <name> <installed> to <version>` | same rule |
+| installed at the catalog version, or newer | `Installed - <name> <installed>`, greyed | never; nothing is downloaded |
+| no signed Windows build, a link-out item, or its runtime range excludes the runtime being installed | `Not available - <name>`, greyed, the reason in the description box | never |
+
+The status leads the row because the list cuts a long row on the right; `Downloaded` stands in
+for the size when the download cache already holds everything. The page uses the layout with
+the description under the list (`MUI_COMPONENTSPAGE_SMALLDESC`), which gives the list about
+twice the width. That box holds about two lines, so a description is at most 170 characters
+with what matters first: for a row that is not available, the reason and nothing else.
 
 - **Recommended** is the open conversion provider (`recommended: true` in the catalog), so
   "Convert to 3D" exists on a machine whose display vendor ships no converter (ADR-064 §7).
@@ -74,9 +80,14 @@ that was skipped, failed or refused never changes it: the runtime is installed a
 0. The components' outcome is `<install dir>\catalog-skipped.txt`: one line per item that was
 not installed, `<name>: <reason> (dxr-get exit <n>)`. No file means nothing that was asked for
 was skipped; a file left by an earlier run is removed at the start of each run. The file is
-written directly, so it exists after `/S`. `install.log` does not: it is a copy of the
-installer's details list, which a silent install does not have. In an interactive install it
-is written by the installer's last section and holds the catalog and conversion-model lines too.
+written directly, so it exists after `/S`.
+
+`install.log` always describes the run that wrote it. Interactive, it is a copy of the
+installer's details list, taken after the catalog step, so it holds the `Catalog:` lines. A
+silent install has no such list (it used to write nothing and leave the previous run's log in
+place); it now replaces the file with a short record: version, time, the parameters, that the
+runtime was installed, and the catalog outcome (nothing asked for, no failure, or the same
+lines as `catalog-skipped.txt`).
 
 **An id that is named but not offered.** An id or alias in `/COMPONENTS=` that the catalog
 lists as not installable here (its runtime range or class ABI excludes this runtime, it has no
@@ -146,11 +157,13 @@ Known gaps:
 1. Unattended `/COMPONENTS=default` reports a failure of the whole call in
    `catalog-skipped.txt`; an individual item `dxr-get` skipped while the call succeeded (exit
    0) is recorded nowhere: it is only in `dxr-get`'s output, which goes to the details list,
-   and a silent install has neither that list nor an `install.log`.
+   and a silent install has no such list (its `install.log` says so).
    `dxr-get plan --default` shows what would be skipped and why. Ids given by name do not have
    this gap: each is one `dxr-get install` call whose exit code is recorded.
-2. At most eight rows. When the catalog offers more, ticked items are kept and the text says
-   how many are not shown.
+2. At most eight rows. When the catalog offers more, the text says how many are not shown,
+   and the rows kept are, in this order: ticked, then what can be ticked, then installed, then
+   not available. So the rows dropped first are the ones that cannot be installed anyway. A
+   dropped row cannot be ticked on the page; its id still works with `/COMPONENTS=`.
 3. The page's listing needs Windows PowerShell. Where it is blocked by policy the page shows
    no optional row. Unattended `/COMPONENTS=default` does not need it.
 4. The texts are English only, like the rest of the installer.
@@ -158,9 +171,12 @@ Known gaps:
 ### To verify on Windows
 
 A Windows box ran part of this list on main @0cd768e2b with a test-key `dxr-get` and the
-fixture catalog. It found that line 6 did nothing (the refused id was dropped), that no
-`install.log` exists after `/S`, and that `/S /COMPONENTS=none` still ran the listing. Lines 5,
-6 and 12 describe the behaviour after those fixes, which has not been re-run on Windows.
+fixture catalog. It found that line 6 did nothing (the refused id was dropped), that `/S`
+writes no `install.log` and leaves the previous run's in place, that `/S /COMPONENTS=none`
+still ran the listing, and that the page's rows were cut after about 22 characters with a
+long reason clipped in the description box. Lines 1, 5, 6, 10 and 12 describe the behaviour
+after those fixes, which has not been re-run on Windows (the page layout was changed without
+seeing it).
 `makensis` compiled the script on macOS with stub payloads, with and
 without a `dxr-get.exe`; CI builds the real installer; the listing shim's tests ran under
 PowerShell 7 against a fake `dxr-get` that prints a listing in the shape dxr-get.md gives. The
@@ -186,7 +202,9 @@ installer:
    and (on a Leia display) the Leia plug-in ticked, nothing vendor-specific on a plain monitor;
    the size line changing with each tick; the incompatible and ABI-mismatch fixture items
    greyed with `dxr-get`'s reason in the description box; the unmet-prerequisite item naming
-   what is missing; an installed item greyed.
+   what is missing; an installed item greyed. Every row's status (`N MB`, `Update, N MB`,
+   `Installed`, `Not available`) readable without the horizontal scrollbar, and most of the
+   name; no description clipped by its box, the longest "not available" reason included.
 2. The same listing by hand, to compare:
    `dxr-get --catalog <file> list --json --assume-runtime <version> --assume-abi display_processor=<n> …`.
 3. With the production `dxr-get` and only schema 1 published (today): rows for the Leia SR
@@ -215,13 +233,15 @@ installer:
 9. Order: with the open conversion provider ticked, the conversion-models section that follows
    takes its pack from the provider just installed.
 10. The components page with eight rows plus the existing four: the list scrolls, the text
-    above it fits in two lines.
+    above it fits in two lines, the description box sits under the list, and with more than
+    eight optional items the rows not shown are the not-available ones first.
 11. A box where PowerShell is restricted by policy: the page as before, and
     `/S /COMPONENTS=default` still working.
-12. Log files. After an interactive install with one item skipped: `<install dir>\install.log`
-    exists and holds the `Catalog:` lines and the conversion-model lines, not only the runtime
-    section's. After `/S`: no `install.log` (expected), and `catalog-skipped.txt` exists exactly
-    when something asked for was not installed.
+12. Log files. After an interactive install: `<install dir>\install.log` holds the `Catalog:`
+    lines (verified on main @0cd768e2b). After `/S` over an install that has an older
+    `install.log`: the file is replaced by the short record of this run (version, time,
+    parameters, the catalog outcome), and `catalog-skipped.txt` exists exactly when something
+    asked for was not installed.
 
 ## 2. The bundle (`displayxr-installer`)
 

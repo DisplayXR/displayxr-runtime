@@ -126,10 +126,10 @@ class ShimTests(unittest.TestCase):
         self.assertNotIn("runtime", it)  # the installer is the runtime
         # Detected hardware and the recommended converter are ticked; nothing else.
         self.assertEqual({k for k, v in it.items() if v["selected"] == "1"}, {"leia-sr", "open-conversion"})
-        self.assertEqual(it["leia-sr"]["label"], "Leia SR display processor 2.23.0 (download 30 MB)")
-        self.assertEqual(it["open-conversion"]["label"], "Open conversion provider 0.1.0 to 0.1.1 (download 15 MB)")
+        self.assertEqual(it["leia-sr"]["label"], "30 MB - Leia SR display processor 2.23.0")
+        self.assertEqual(it["open-conversion"]["label"], "Update, 15 MB - Open conversion provider 0.1.0 to 0.1.1")
         self.assertEqual(it["leia-sr"]["size_kb"], "30720")
-        self.assertIn("matching hardware was detected", it["leia-sr"]["desc"])
+        self.assertTrue(it["leia-sr"]["desc"].startswith("Matching hardware was detected."))
         self.assertIn("Recommended. Open models.", it["open-conversion"]["desc"])
 
     def test_download_is_what_is_still_to_fetch(self):
@@ -137,17 +137,43 @@ class ShimTests(unittest.TestCase):
         lst["items"][1]["download"] = 0          # the asset is in the download cache
         lst["items"][3]["download"] = 4194304 + 20971520   # plus a prerequisite's own installer
         it = self.items(self.run_shim(lst))
-        self.assertEqual(it["leia-sr"]["label"], "Leia SR display processor 2.23.0 (already downloaded)")
+        self.assertEqual(it["leia-sr"]["label"], "Downloaded - Leia SR display processor 2.23.0")
         self.assertEqual(it["leia-sr"]["size_kb"], "0")
-        self.assertEqual(it["leia-conversion"]["label"], "Leia conversion provider 0.1.0 (download 24 MB)")
+        self.assertEqual(it["leia-conversion"]["label"], "24 MB - Leia conversion provider 0.1.0")
 
     def test_installed_and_unavailable_items_are_read_only(self):
         it = self.items(self.run_shim())
         self.assertEqual((it["browser"]["status"], it["browser"]["ro"], it["browser"]["selected"]), ("current", "1", "0"))
-        self.assertEqual(it["browser"]["label"], "DisplayXR Browser 1.10.5 - installed")
+        self.assertEqual(it["browser"]["label"], "Installed - DisplayXR Browser 1.10.5")
         self.assertEqual((it["unsigned-thing"]["status"], it["unsigned-thing"]["ro"]), ("unavailable", "1"))
         self.assertIn("no signed Windows build", it["unsigned-thing"]["desc"])
         self.assertIn("publisher's page", it["acme.viewer"]["desc"])  # a link-out
+        self.assertEqual(it["acme.viewer"]["label"], "Not available - Acme Viewer")
+
+    def test_status_leads_the_row_and_the_description_fits_its_box(self):
+        # The list cuts a row on the right and the box under it holds about two
+        # lines: the status is the first thing in the label, the reason the
+        # first thing in the description, and no description is long.
+        lst = copy.deepcopy(LIST)
+        for i in lst["items"]:
+            i["name"] = "Fixture: every external prerequisite detector there is, " + i["name"]
+            i["summary"] = "A very long summary. " * 30
+        lst["items"][4]["incompatible_reason"] = "needs a newer runtime. " * 30
+        it = self.items(self.run_shim(lst))
+        firsts = {"leia-sr": "30 MB - ", "open-conversion": "Update, 15 MB - ", "browser": "Installed - ",
+                  "ultraleap": "Not available - ", "leia-conversion": "4 MB - "}
+        for k, first in firsts.items():
+            self.assertTrue(it[k]["label"].startswith(first), it[k]["label"])
+        for v in it.values():
+            self.assertLessEqual(len(v["desc"]), 170)
+        self.assertTrue(it["ultraleap"]["desc"].startswith("Not available: needs a newer runtime."))
+        self.assertTrue(it["leia-conversion"]["desc"].startswith("Also needs, and does not install: NeurD runtime"))
+
+    def test_rows_dropped_first_are_the_not_available_ones(self):
+        # More items than slots: ticked, then tickable, then installed are kept.
+        ini = self.run_shim(Slots=4)
+        self.assertEqual(set(self.items(ini)), {"leia-sr", "open-conversion", "leia-conversion", "browser"})
+        self.assertEqual(ini["catalog"]["more"], "3")
 
     def test_list_states(self):
         lst = copy.deepcopy(LIST)
@@ -178,7 +204,7 @@ class ShimTests(unittest.TestCase):
     def test_unmet_prerequisite_is_named_and_a_met_or_installable_one_is_not(self):
         lc = self.items(self.run_shim())["leia-conversion"]
         self.assertEqual((lc["status"], lc["ro"], lc["selected"]), ("missing", "0", "0"))
-        self.assertIn("Also needs, and does not install: NeurD runtime (Leia) (not found", lc["desc"])
+        self.assertIn("Also needs, and does not install: NeurD runtime (Leia) (not found)", lc["desc"])
         lst = copy.deepcopy(LIST)
         lst["items"][3]["prerequisites"] = [{"name": "A", "met": True, "installable": False},
                                             {"name": "B", "met": False, "installable": True}]

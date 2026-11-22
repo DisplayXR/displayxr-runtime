@@ -76,7 +76,10 @@
 ; the components is $INSTDIR\catalog-skipped.txt: one line per item that was
 ; not installed, with the reason and dxr-get's exit code; no file = nothing
 ; asked for was skipped. It is written with FileWrite, so it exists after /S
-; too (install.log is a dump of the details list, which /S does not have).
+; too. install.log: interactive, the details list (dumped after this section,
+; so it holds the lines printed here); /S has no such list, so the runtime
+; section writes a short record instead and this file appends the catalog
+; outcome to it. Either way it describes THIS run.
 ;
 ; WHEN IT IS NOT THERE. If dxr-get.exe was not built, DXR_CATALOG_UI is
 ; undefined and every macro below expands to nothing: the installer is what it
@@ -105,6 +108,10 @@
 	!ifdef BIN_DIR
 		!if /FileExists "${BIN_DIR}\dxr-get.exe"
 			!define DXR_CATALOG_UI
+			; The description under the list instead of beside it: the list
+			; gets about twice the width, so a row's status is readable
+			; without the horizontal scrollbar. Must precede the first page.
+			!define MUI_COMPONENTSPAGE_SMALLDESC
 		!endif
 	!endif
 !endif
@@ -395,11 +402,11 @@ Function DxrCatUpdateTop
 	${EndIf}
 	ClearErrors
 	${If} $R4 == 0
-		StrCpy $DxrCatTop "Items marked 'download' come from the DisplayXR Catalog and need an internet connection. None is selected: nothing will be downloaded.$R2"
+		StrCpy $DxrCatTop "Items shown with a size come from the DisplayXR Catalog and need an internet connection. None is selected: nothing will be downloaded.$R2"
 	${Else}
 		IntOp $R3 $R3 + 1023
 		IntOp $R3 $R3 / 1024
-		StrCpy $DxrCatTop "Selected items marked 'download' will be downloaded during setup: an internet connection is required. Total download: $R3 MB.$R2"
+		StrCpy $DxrCatTop "Selected items shown with a size are downloaded during setup: an internet connection is required. Total download: $R3 MB.$R2"
 	${EndIf}
 FunctionEnd
 
@@ -546,7 +553,7 @@ Function DxrCatInstallChosen
 		; listed (no PowerShell, no dxr-get call).
 		${If} $DxrCatSel == ""
 		${OrIf} $DxrCatSel == "none"
-			Return
+			Goto dxr_cat_log
 		${EndIf}
 		DetailPrint "Catalog: /COMPONENTS=$DxrCatSel"
 		${If} $DxrCatSel == "default"
@@ -659,8 +666,32 @@ Function DxrCatInstallChosen
 			StrCpy $DxrCatFinishExtra "$\r$\n$\r$\nOptional components (among them the open 2D-to-3D conversion provider) were not offered, because the DisplayXR Catalog could not be reached. Run Setup again with an internet connection to add them."
 		${EndIf}
 	${EndIf}
-	; install.log is written by the main script's last section, after every
-	; section has run, so it holds the lines above in an interactive install.
+	dxr_cat_log:
+	${If} ${Silent}
+		; No details list: append the outcome to the record the runtime
+		; section wrote.
+		ClearErrors
+		FileOpen $R0 "$INSTDIR\install.log" a
+		${IfNot} ${Errors}
+			FileSeek $R0 0 END
+			${If} $DxrCatSel == ""
+			${OrIf} $DxrCatSel == "none"
+				FileWrite $R0 "Catalog components: none asked for (/COMPONENTS=$DxrCatSel).$\r$\n"
+			${ElseIf} $DxrCatSkipped == ""
+				FileWrite $R0 "Catalog components: /COMPONENTS=$DxrCatSel. dxr-get reported no failure (an item that install --default skips by itself is not listed here).$\r$\n"
+			${Else}
+				FileWrite $R0 "Catalog components: /COMPONENTS=$DxrCatSel. NOT installed (also in catalog-skipped.txt):$\r$\n$DxrCatSkipped"
+			${EndIf}
+			FileClose $R0
+		${EndIf}
+		ClearErrors
+	${Else}
+		; The install log was written at the end of the runtime section;
+		; write it again so it also holds the lines above.
+		StrCpy $0 "$INSTDIR\install.log"
+		Push $0
+		Call DumpLog
+	${EndIf}
 FunctionEnd
 
 !endif ; DXR_CATALOG_UI
