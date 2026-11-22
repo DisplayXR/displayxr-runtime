@@ -71,7 +71,7 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
         RowStatus.UpdateAvailable => ("Update available", Level.Info),
         RowStatus.Available => ("Available", Level.Plain),
         RowStatus.NotFromCatalog => ("Not from catalog", Level.Plain),
-        RowStatus.PartOfRuntime => ("Part of the runtime", Level.Ok),
+        RowStatus.PartOfRuntime => ("Part of the runtime", Level.Plain),
         _ => null,
     };
 

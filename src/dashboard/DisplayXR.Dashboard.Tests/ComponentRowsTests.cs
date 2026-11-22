@@ -120,7 +120,7 @@ public class ComponentRowsTests
 
         var pad = Row(groups, "input_provider:pad");
         Assert.Equal(RowStatus.PartOfRuntime, pad.Status);
-        Assert.Equal(("Part of the runtime", Level.Ok), pad.StatusChip);
+        Assert.Equal(("Part of the runtime", Level.Plain), pad.StatusChip);
         Assert.Null(pad.RemoveNote);
         Assert.NotNull(pad.Installed!.Policy); // the Enabled / Prefer controls still have their row
         Assert.Equal(CatalogAction.None, pad.Action);
