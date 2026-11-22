@@ -195,7 +195,13 @@ A splat result carries three kinds of information with three owners (ADR-057 §3
 (`src/xrt/conversion/conv_host_paths.{h,c}`; the in-service host binds it per provider slot like
 `get_setting`, the satellite answers for its one provider). The satellite is started with the
 service's environment, so it resolves the same directories. A failure writes `""` and returns
-false, never a truncated path.
+false, never a truncated path. `displayxr-cli conv run`, which hosts one provider for real in the
+CLI (§7.1), answers it the way the satellite does (`target_conv_store_headless_host`): the scratch
+directory and the model-store root from the CLI's environment, no log directory, and
+`model_resolve` / `model_request` over the CLI process's own store, configured with that
+provider's packs under the run's policy. The store stays read-only to the provider; the CLI is the
+store's writer for that run, as the satellite is. The describe-only headless pass (`conv list`,
+`selftest`) still answers none of them.
 
 | `kind` | Answer |
 |---|---|
@@ -238,7 +244,7 @@ every `FAILED(DEVICE_LOST)`. `sim-conversion`'s `SCRATCH_TOUCH` setting exercise
 | Root value | Type | Default | Meaning |
 |---|---|---|---|
 | `PreferredProvider\<task>` | REG_SZ | — | `"<provider-id>[/<cap_id or model_id>]"`, task names as `views-mono`, `depth-video`, … Written by `displayxr-cli conv use` to HKCU (per user, no admin, as `dp use`); `--machine` writes HKLM. |
-| `AllowResearchOnly` | DWORD | 0 | 1 lets selection consider `RESEARCH_ONLY` and `UNKNOWN` licence classes. HKCU or HKLM. **Signed installers never write it**, and never pre-fetch a non-commercial blob. Not needed for a capability flagged `XRT_CONV_CAP_LICENSED_LOCAL_INSTALL` (below). |
+| `AllowResearchOnly` | DWORD | 0 | 1 lets selection consider `RESEARCH_ONLY` and `UNKNOWN` licence classes, and lets the model store fetch and hand out a non-commercial model (§5.4). HKCU or HKLM; `displayxr-cli conv research on\|off [--machine]` writes it. POSIX: a per-user file (§3.5). **Signed installers never write it**, and never pre-fetch a non-commercial blob. Not needed for a capability flagged `XRT_CONV_CAP_LICENSED_LOCAL_INSTALL` (below). |
 | `Prewarm\<task>` | DWORD | 1 for `views-mono` and `depth-video`; else 0 | which tasks are prewarmed (§4.2); 0 opts out |
 | `PrewarmOn` | REG_SZ | `interest` on mains power / desktop; `first-create` on battery | `interest` / `first-create` / `start` (kiosk opt-in); §4.2 |
 | `KeepAliveSec` | DWORD | **0 = never** | idle eviction of prewarm-task models. Job-only models evict after **600 s** idle. Nothing is evicted while a stream or job is bound. A reload is always reported WARMING with progress |
@@ -304,6 +310,8 @@ The suffix is the router, so all three plug-in types share one directory:
 | Every loader | skips `<pack>.models.json` — a model pack (§ model store) is not a manifest. Packs ship beside the provider that lists them in `packs[]`, i.e. in this same directory; before this rule the DP loader read each one as a malformed DP manifest (`target_plugin_classify_manifest`, `target_component_loader.c`) |
 
 Preferred provider: `DXR_CONV_PREFERRED_<TASK>` in the environment, or a `conversion-preferred.json` in the per-user dir (the `plugin-discovery.md` §3.3 pattern).
+
+**`AllowResearchOnly` on POSIX** (the §3.1 root value): the file `conversion-allow-research-only` in the per-user manifest dir (`target_component_user_dir`: `$XDG_DATA_HOME/DisplayXR/DisplayProcessors`, default `~/.local/share/…`; macOS `~/Library/Application Support/DisplayXR/DisplayProcessors`), beside `force_qwerty` / `emulated_controllers` and with their one-byte convention, except that it is an **opt-in**: on only when the first byte is `1`; absent, empty or anything else is off. `displayxr-cli conv research on` writes `1`, `off` removes it; `--machine` is refused. There is **no machine tier and no lock** on POSIX: a package never writes a user's home directory, so no installer can turn it on (the §3.1 rule holds by construction). The service's per-user dir poll (§4.1) covers the file, so a write re-reads the policy live. Every reader of the policy honours it — selection, the model store (fetch and hand-out, §5.4), `conv run`, `conv models fetch`, `conv list`'s `policy.allow_research_only`. The other root values (`PreferredProvider`, `AllowDownloads`, prewarm) have no POSIX store yet beyond the environment variables named above.
 
 ### 3.6 Android — `libdxrc<NNN>_<id>.so` and the `:conversion` process
 
@@ -656,6 +664,7 @@ Schema 2 replaces the browser's `models.json` schema 1. The browser's store is d
 - **Signing.** A signed installer MUST NOT pre-fetch a non-commercial blob; the open-provider repo's CI asserts it.
 - **Blob identity.** `sha256` + `size` identify a blob; variants may share blobs.
 - **URL.** `<blobBaseUrl>/<sha256>.<format>`, unless the model gives its own `url` (§5.5).
+- **Locally built models (`local_build`).** A model whose bytes may not be redistributed can be produced on the user's box by a deterministic script instead (ADR-057 §5): the model carries `"local_build": { "script": "<repo-relative path>", … }` (other keys informational) and its files list the sha256 + size the script produces, like any blob. The store treats the bytes like any other blob (hash, stamp, the `AllowResearchOnly` gate on fetch and hand-out); only the outcome of a fetch that finds nothing changes: when the blob is not in the store and no source answered (no `url` / `blobBaseUrl`, or a mirror that does not have it), the result is **`build-locally`** (`CONV_STORE_BLOB_LOCAL_BUILD`), not `network`, and `conv models fetch` names the script. A `url` or `blobBaseUrl` that serves the bytes (a dev mirror) is still fetched normally. As built, the runtime's `model_request` for a missing locally built blob is unchanged (`FAILED(NETWORK)`, retryable: once the script has written the blob, the next request verifies it).
 - **Validation.** `scripts/check_model_pack.py` (open-provider repo) checks the schema and the licence AND; `--verify-store` checks a store against its packs.
 
 ### 5.4 The store as built (P4, #2108)
@@ -746,7 +755,10 @@ snapshot it prints, read from disk (no IPC): `display-dashboard.md` §3.3.
 [--model <name>] [--installer]` (the write protocol on the calling thread; `--installer` =
 nonce `installer`, stamped blobs skipped without hashing, non-commercial models never),
 `init [--root <dir>]` (create the root with its ACL and marker). `fetch --prefetch` with no URL
-pre-fetches every registered pack's `prefetch` models.
+pre-fetches every registered pack's `prefetch` models. `fetch` honours `AllowResearchOnly` (§3.1,
+POSIX §3.5) and the per-run `--allow-research-only`, never with `--installer`; a research-only
+model refused by that gate prints `policy` with what would lift it, and a locally built model with
+nothing to fetch prints `build-locally` with its script (§5.3).
 
 ### 5.5 Per-model `url` and `auth` (ADR-057 §5)
 
@@ -903,12 +915,13 @@ Verbs (ADR-053); `lift caps|probe` stay as aliases.
 | `conv status [--watch]` | DIAG | readiness, streams, jobs |
 | `conv candidates <task> [--json]` | DIAG → service (`conv_enum_candidates`), never headless | exactly what an app's `xrEnumerateLiftTaskCandidatesDXR` returns (lift spec 5): one row per provider in selection order — id, the provider's own display name, state, licence class, hosting, `selected`, `user-default` |
 | `conv use <task> <id>[/<cap>] [--machine]` / `conv reset <task>\|all` | registry (HKCU; HKLM with `--machine`) | per-task preference, like `dp use --screen` |
+| `conv research on\|off\|status [--machine]` | registry `AllowResearchOnly` (HKCU; HKLM with `--machine`) / the POSIX per-user file (§3.5; `--machine` refused) | the research-only opt-in; `status` prints the resolved value. Never run by an installer |
 | `conv warm <task>\|<id>/<cap> [--wait]` / `conv evict <task>` | DIAG → service | explicit prewarm / unload; `evict` is accepted only on the CLI's own DIAG connection |
 | `conv enable\|disable <id>` | registry | `Enabled` |
 | `conv options <id> [--json]` / `conv set <id> <KEY> <value> [--machine]` / `conv unset <id> <KEY> [--machine]` | registry (HKCU; HKLM with `--machine`) / the POSIX per-user `<id>.settings.json`; `options` negotiates the binary headless | the one options contract (§3.9, N3c): declared + stored keys with value and source; `Settings\<KEY>` writes. A setting of type `secret` (a licence key) shows as `<set>` / `<unset>` only |
 | `conv activate <id> <token \| @file> [--json]` | negotiates the binary headless | hands an activation token to the provider's `activate` slot (§4.3a); prints the new licence state or the provider's reason. The token is never printed |
 | `conv probe <task> <file\|dir>` | APP connection, stream lane | today's `lift probe` |
-| `conv run <task> <in> [<in-right>] <out> [--provider <id>]` | **as built (ADR-057): headless, in the CLI** | file → file; the provider is the runtime's selection for the task with `--provider` as the per-create hint (§3.4, lift spec 5), but **strict**: when the selection cannot bind the named provider (unknown, disabled, licence-gated, terminal, no job lane) the command exits 5 with the reason — no fall-through, which is for apps (`conv candidates` shows why); the CLI decodes the input (the service never decodes media), hosts the provider headless (negotiate, probe, describe, warm, `job_execute`: the job lane the core drives), downscales to the capability's `max_input_edge`, writes the blob untouched and prints the facts. Options: `--baseline-m`, `--rectified` / `--raw`, `--sbs`, `--focal-px`, `--max-long-side`, `--format sog\|ply`, `--facts <json>`, `--camera-block auto`, `--allow-research-only` (POSIX has no root `AllowResearchOnly` yet; this is the per-run opt-in). Moves to the APP connection once spec-5 jobs run over IPC; for a local provider it loads a second model instance meanwhile, and says so. Splat tasks only in this release |
+| `conv run <task> <in> [<in-right>] <out> [--provider <id>]` | **as built (ADR-057): headless, in the CLI** | file → file; the provider is the runtime's selection for the task with `--provider` as the per-create hint (§3.4, lift spec 5), but **strict**: when the selection cannot bind the named provider (unknown, disabled, licence-gated, terminal, no job lane) the command exits 5 with the reason — no fall-through, which is for apps (`conv candidates` shows why); the CLI decodes the input (the service never decodes media), hosts the provider headless (negotiate, probe, describe, warm, `job_execute`: the job lane the core drives), downscales to the capability's `max_input_edge` (each side rounded; a `--focal-px` — given in the input file's pixels — is scaled per axis with the image), writes the blob untouched and prints the facts. The provider's host answers `get_path` and the model store like the satellite (§2.7). Options: `--baseline-m`, `--rectified` / `--raw`, `--sbs`, `--focal-px`, `--max-long-side`, `--format sog\|ply`, `--facts <json>`, `--camera-block auto`, `--allow-research-only` (the per-run opt-in, beside the root `AllowResearchOnly`: it applies to selection **and** to the run's model store). Moves to the APP connection once spec-5 jobs run over IPC; for a local provider it loads a second model instance meanwhile, and says so. Splat tasks only in this release |
 | `conv consent <id> grant\|revoke\|status` / `conv consent status` | the per-user consent store | off-box consent for a `REMOTE` provider (§6.3) |
 | `conv camera-block <sog\|meta.json\|dir> --facts <json>` | local | the convenience writer on its own (§2.6): `"source": "auto"`, never over an authored block |
 | `conv credential set\|delete\|status <name>` | the OS credential store | stores a provider's token (`set` reads one line from stdin; `status` never prints it). On macOS an item a DisplayXR binary made is readable by DisplayXR binaries without a prompt; one made with the `security` tool is not (its partition list names Apple's tools), and reads as `denied` — never a prompt, never a hang |

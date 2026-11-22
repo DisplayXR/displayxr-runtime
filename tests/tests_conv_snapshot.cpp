@@ -31,7 +31,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -1050,4 +1052,146 @@ TEST_CASE("conv run --provider is strict: a named provider binds or the run is r
 		      nullptr);
 		CHECK(std::string(why).find("lane") != std::string::npos);
 	}
+}
+
+
+/*
+ *
+ * POSIX AllowResearchOnly (spec §3.5) and the headless host's store answers
+ * (`conv run`, spec §2.7 / §5.4).
+ *
+ */
+
+TEST_CASE("conv policy: the POSIX AllowResearchOnly file is an opt-in on '1' only", "[conv_snapshot][policy]")
+{
+	CHECK(target_conv_research_file_parse("1", 1));
+	CHECK(target_conv_research_file_parse("1\n", 2));
+	CHECK_FALSE(target_conv_research_file_parse("0\n", 2));
+	CHECK_FALSE(target_conv_research_file_parse("yes", 3));
+	CHECK_FALSE(target_conv_research_file_parse("", 0));
+	CHECK_FALSE(target_conv_research_file_parse(nullptr, 0));
+}
+
+#if !defined(_WIN32) && !defined(__ANDROID__)
+TEST_CASE("conv policy: target_conv_policy_read honours the per-user file on POSIX", "[conv_snapshot][policy]")
+{
+	namespace fs = std::filesystem;
+	const fs::path dir =
+	    fs::temp_directory_path() / ("dxr_conv_policy_" + std::to_string((unsigned long long)rand()));
+	fs::create_directories(dir);
+	const char *old = getenv("XDG_DATA_HOME");
+	const std::string saved = old != nullptr ? old : "";
+	set_env("XDG_DATA_HOME", dir.u8string().c_str());
+
+	target_conv_policy pol;
+	target_conv_policy_read(&pol);
+	CHECK_FALSE(pol.allow_research_only); // absent = off
+
+	char path[1024];
+	REQUIRE(target_conv_research_file_path(path, sizeof(path), true));
+	CHECK(std::string(path).rfind(dir.u8string(), 0) == 0);
+	CHECK(std::string(path).find(TARGET_CONV_RESEARCH_FILE) != std::string::npos);
+	{
+		std::ofstream(path) << "1\n";
+	}
+	target_conv_policy_read(&pol);
+	CHECK(pol.allow_research_only);
+	{
+		std::ofstream(path) << "0\n";
+	}
+	target_conv_policy_read(&pol);
+	CHECK_FALSE(pol.allow_research_only);
+
+	set_env("XDG_DATA_HOME", old != nullptr ? saved.c_str() : nullptr);
+	std::error_code ec;
+	fs::remove_all(dir, ec);
+}
+#endif
+
+TEST_CASE("conv run: the headless host answers get_path and the model store like the satellite",
+          "[conv_snapshot][conv_run][store]")
+{
+	namespace fs = std::filesystem;
+	const fs::path dir =
+	    fs::temp_directory_path() / ("dxr_conv_hstore_" + std::to_string((unsigned long long)rand()));
+	fs::create_directories(dir / "Models" / "blobs");
+	std::string blob;
+	for (int i = 0; i < 64; i++) {
+		blob += "0123456789abcdef";
+	}
+	uint8_t d[32];
+	u_sha256(blob.data(), blob.size(), d);
+	char hex[65];
+	for (int i = 0; i < 32; i++) {
+		snprintf(hex + i * 2, 3, "%02x", d[i]);
+	}
+	// One research-only model whose blob is already in the store (built locally).
+	{
+		std::ofstream(dir / "local.models.json")
+		    << "{\"schema\":2,\"pack\":\"local\",\"provider\":\"local-prov\",\"models\":[{\"name\":\"m\","
+		       "\"local_build\":{\"script\":\"export.py\"},\"license\":{\"commercial\":false},"
+		       "\"variants\":[{\"files\":[{\"sha256\":\""
+		    << hex << "\",\"size\":1024}]}]}]}";
+		std::ofstream(dir / "Models" / "blobs" / hex, std::ios::binary) << blob;
+		std::ofstream(dir / "Models" / "blobs" / (std::string(hex) + ".ok")) << hex << " 1024\n";
+	}
+	set_env("DXR_CONV_MODELS_ROOT", (dir / "Models").u8string().c_str());
+	set_env("DXR_CONV_SCRATCH_ROOT", (dir / "scratch").u8string().c_str());
+
+	auto e = std::make_unique<xrt_conversion_plugin_entry>();
+	std::memset(e.get(), 0, sizeof(*e));
+	cpy(e->id, sizeof(e->id), "local-prov");
+	cpy(e->binary_path, sizeof(e->binary_path), (dir / "prov.so").u8string().c_str());
+	e->pack_count = 1;
+	cpy(e->packs[0], sizeof(e->packs[0]), "local.models.json"); // relative to the binary
+
+	target_conv_policy pol;
+	std::memset(&pol, 0, sizeof(pol));
+	pol.allow_downloads = false;
+
+	SECTION("paths: the provider's scratch dir (created) and the store root")
+	{
+		const xrt_conversion_plugin_host_iface *host = target_conv_store_headless_host(e.get(), &pol);
+		REQUIRE(host != nullptr);
+		char buf[1024];
+		REQUIRE(host->get_path(XRT_CONV_PATH_SCRATCH, buf, sizeof(buf)));
+		CHECK(fs::path(buf) == dir / "scratch" / "local-prov");
+		CHECK(fs::is_directory(buf));
+		REQUIRE(host->get_path(XRT_CONV_PATH_MODEL_STORE, buf, sizeof(buf)));
+		CHECK(fs::path(buf) == dir / "Models");
+		CHECK_FALSE(host->get_path(XRT_CONV_PATH_LOGS, buf, sizeof(buf))); // a CLI has no log file
+		target_conv_store_headless_release();
+	}
+	SECTION("a research-only blob without the opt-in is ABSENT(policy)")
+	{
+		const xrt_conversion_plugin_host_iface *host = target_conv_store_headless_host(e.get(), &pol);
+		xrt_conv_model_location loc{};
+		loc.struct_size = sizeof(loc);
+		CHECK_FALSE(host->model_request("local/m"));
+		(void)host->model_resolve("local/m", &loc);
+		CHECK(loc.state == XRT_CONV_STATE_ABSENT);
+		CHECK(loc.failure_reason == XRT_CONV_FAIL_POLICY);
+		target_conv_store_headless_release();
+	}
+	SECTION("with the opt-in, the present blob is handed out (INSTALLED, then READY once verified)")
+	{
+		pol.allow_research_only = true;
+		const xrt_conversion_plugin_host_iface *host = target_conv_store_headless_host(e.get(), &pol);
+		xrt_conv_model_location loc{};
+		loc.struct_size = sizeof(loc);
+		REQUIRE(host->model_resolve("local/m", &loc));
+		CHECK(loc.state == XRT_CONV_STATE_INSTALLED);
+		REQUIRE(host->model_request("local/m"));
+		for (int i = 0; i < 200 && loc.state != XRT_CONV_STATE_READY; i++) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			(void)host->model_resolve("local/m", &loc);
+		}
+		CHECK(loc.state == XRT_CONV_STATE_READY);
+		CHECK(std::string(loc.path).find(hex) != std::string::npos);
+		target_conv_store_headless_release();
+	}
+	set_env("DXR_CONV_MODELS_ROOT", nullptr);
+	set_env("DXR_CONV_SCRATCH_ROOT", nullptr);
+	std::error_code ec;
+	fs::remove_all(dir, ec);
 }

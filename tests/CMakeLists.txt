@@ -60,6 +60,7 @@ set(tests
     tests_aux_display_desktop_select
     tests_cli_dims_check
     tests_cli_metres_check
+    tests_cli_conv_run_math
     tests_cli_lever_catalog
     tests_cli_input_predict
     tests_cli_dp_predict
@@ -1431,6 +1432,9 @@ target_include_directories(tests_cli_dims_check PRIVATE ${PROJECT_SOURCE_DIR}/sr
 # VERIFIED claim has physical metres" (the 0 m screen trap). Header-only.
 target_include_directories(tests_cli_metres_check PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
 target_link_libraries(tests_cli_metres_check PRIVATE xrt-interfaces)
+
+# `conv run`: the input downscale and the given intrinsics that follow it. Header-only.
+target_include_directories(tests_cli_conv_run_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
 
 # perf-settings Phase 2A: the generated Tier 1/2 lever catalog behind
 # `perf list --all` (scripts/gen_lever_catalog.py). Header-only data; aux_util

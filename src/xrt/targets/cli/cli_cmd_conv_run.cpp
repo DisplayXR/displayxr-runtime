@@ -31,6 +31,7 @@
  */
 
 #include "cli_common.h"
+#include "cli_conv_run_math.h"
 
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_conversion_plugin.h"
@@ -173,13 +174,10 @@ load_image(const char *path, pixels &out)
 void
 downscale(pixels &img, uint32_t max_edge, int split_columns)
 {
-	const int long_side = std::max(img.w / split_columns, img.h);
-	if (max_edge == 0 || long_side <= (int)max_edge) {
+	int nw = img.w, nh = img.h;
+	if (!cli_conv_downscale_dims(img.w, img.h, max_edge, split_columns, &nw, &nh)) {
 		return;
 	}
-	const double s = (double)max_edge / (double)long_side;
-	const int nw = std::max(split_columns, (int)((double)img.w * s) / split_columns * split_columns);
-	const int nh = std::max(1, (int)((double)img.h * s));
 	std::vector<uint8_t> dst((size_t)nw * nh * 4);
 	for (int y = 0; y < nh; y++) {
 		const int y0 = (int)((double)y / nh * img.h),
@@ -295,6 +293,7 @@ release(hosted &h)
 		target_conversion_plugin_unload(h.e);
 	}
 	target_conv_status_set_headless_entry(nullptr);
+	target_conv_store_headless_release();
 	h.iface = nullptr;
 }
 
@@ -311,12 +310,15 @@ read_state(const hosted &h, xrt_conv_state &st)
  * False (and unloaded) when it does not serve the task.
  */
 bool
-host_one(xrt_conversion_plugin_entry *e, uint32_t task, hosted &h)
+host_one(xrt_conversion_plugin_entry *e, uint32_t task, const target_conv_policy &policy, hosted &h)
 {
 	h = hosted{};
 	h.e = e;
 	target_conv_status_set_headless_entry(e);
-	if (!target_conversion_plugin_negotiate_one(e, target_conv_status_headless_host())) {
+	// The satellite host's answers (spec §2.7, §5.4): scratch, the model store
+	// root and model_resolve / model_request over this process's store, with
+	// this provider's packs under the run's policy (its opt-in included).
+	if (!target_conversion_plugin_negotiate_one(e, target_conv_store_headless_host(e, &policy))) {
 		E("conv run: %s: not loaded (%s)\n", e->id, e->reason);
 		release(h);
 		return false;
@@ -368,7 +370,8 @@ usage_run(void)
 	  "  --format sog|ply       blob format (default from the output extension)\n"
 	  "  --baseline-m <m>       stereo baseline in metres; omitted = unknown (no metric result, never defaulted)\n"
 	  "  --rectified | --raw    declare the pair (stereo needs one; it is never guessed)\n"
-	  "  --focal-px <px>        a GIVEN focal length (wins over EXIF / estimates)\n"
+	  "  --focal-px <px>        a GIVEN focal length in the input file's pixels (wins over EXIF / estimates;\n"
+	  "                         scaled with the image when it is downscaled)\n"
 	  "  --max-long-side <px>   bound the splat count by the input size\n"
 	  "  --facts <file.json>    save the result's facts (X-DXR-Result shape)\n"
 	  "  --camera-block auto    also write facts + suggestions as the SOG camera block, \"source\":\"auto\"\n"
@@ -521,7 +524,7 @@ cli_cmd_conv_run(int argc, const char **argv)
 	bool found = false;
 	for (int i = 0; i < n && !found; i++) {
 		if (strcmp(entries[i].id, chosen) == 0) {
-			found = host_one(&entries[i], task, h);
+			found = host_one(&entries[i], task, sel_policy, h);
 		}
 	}
 	if (!found) {
@@ -548,6 +551,13 @@ cli_cmd_conv_run(int argc, const char **argv)
 	}
 	if (st.state != XRT_CONV_STATE_READY) {
 		E("conv run: %s is %s: %s\n", h.e->id, state_word(st.state), st.detail);
+		const bool research_cap = h.cap.licence_class == XRT_CONV_LICENCE_RESEARCH_ONLY ||
+		                          h.cap.licence_class == XRT_CONV_LICENCE_UNKNOWN;
+		if (st.state == XRT_CONV_STATE_ABSENT && !allow_research &&
+		    (st.failure_reason == XRT_CONV_FAIL_POLICY || research_cap)) {
+			E("conv run: a research-only model is handed out only with AllowResearchOnly "
+			  "(`displayxr-cli conv research on`, or --allow-research-only for this run)\n");
+		}
 		release(h);
 		free(entries);
 		return st.state == XRT_CONV_STATE_DISABLED ? 3 : 1;
@@ -557,8 +567,7 @@ cli_cmd_conv_run(int argc, const char **argv)
 	     h.cap.licence_class == XRT_CONV_LICENCE_UNKNOWN) &&
 	    !allow_research) {
 		E("conv run: %s's capability is %s (%s): it is selectable only with AllowResearchOnly "
-		  "(Windows: HKCU\\Software\\DisplayXR\\ConversionProviders AllowResearchOnly = 1; "
-		  "or --allow-research-only for this run)\n",
+		  "(`displayxr-cli conv research on`; or --allow-research-only for this run)\n",
 		  h.e->id, licence_word(h.cap.licence_class), h.cap.licence_spdx);
 		release(h);
 		free(entries);
@@ -568,9 +577,18 @@ cli_cmd_conv_run(int argc, const char **argv)
 	  h.cap.model_id);
 
 	// Inputs (CPU RGBA8), downscaled to the capability's max input edge (the runtime's rule).
+	// --focal-px is in the ORIGINAL image's pixels: scale it with the image
+	// (per axis; the box filter keeps the aspect within a pixel), or a
+	// downscaled input would be handed a focal length for a larger sensor.
+	const int in_w = img[0].w, in_h = img[0].h;
 	downscale(img[0], h.cap.max_input_edge, sbs ? 2 : 1);
 	if (stereo && !sbs) {
 		downscale(img[1], h.cap.max_input_edge, 1);
+	}
+	const float focal_x = cli_conv_scale_intrinsic(focal, in_w, img[0].w);
+	const float focal_y = cli_conv_scale_intrinsic(focal, in_h, img[0].h);
+	if (focal > 0.0f && focal_x != focal) {
+		E("conv run: --focal-px %.2f scaled with the input -> %.2f px\n", (double)focal, (double)focal_x);
 	}
 	xrt_conv_job_in in{};
 	in.struct_size = sizeof(in);
@@ -595,11 +613,12 @@ cli_cmd_conv_run(int argc, const char **argv)
 	xrt_conv_params params{};
 	params.struct_size = sizeof(params);
 	params.content_hint = XRT_CONV_CONTENT_PHOTO;
-	params.focal_px = focal;
+	params.focal_px = focal_x;
 	params.baseline_m = baseline;
 	params.stereo.baseline_m = baseline; // 0 = unknown, never defaulted
 	params.stereo.sbs_packed = sbs ? 1u : 0u;
-	params.stereo.fx = params.stereo.fy = focal;
+	params.stereo.fx = focal_x;
+	params.stereo.fy = focal_y;
 
 	file_sink fs;
 	fs.tmp = std::string(out_path) + ".part";

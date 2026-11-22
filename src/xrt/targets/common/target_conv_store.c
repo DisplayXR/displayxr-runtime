@@ -11,6 +11,7 @@
 #include "target_conv_status.h"
 #include "target_conversion_plugin_loader.h"
 
+#include "conversion/conv_host_paths.h"
 #include "conversion/conv_model_store.h"
 #include "xrt/xrt_display_status.h"
 
@@ -38,6 +39,35 @@ target_conv_store_configure(const struct xrt_conversion_plugin_entry *entries,
 	}
 	conv_store_host_configure(ptrs, n, policy == NULL || policy->allow_downloads,
 	                          policy != NULL && policy->allow_research_only);
+}
+
+static char g_headless_id[64];
+static struct xrt_conversion_plugin_host_iface g_headless_store_host;
+
+//! Spec §2.7: the satellite's answer for its one provider; a CLI has no log file.
+static bool
+headless_store_get_path(uint32_t kind, char *buf, uint32_t buf_size)
+{
+	return conv_host_get_path(g_headless_id, kind, NULL, buf, buf_size);
+}
+
+const struct xrt_conversion_plugin_host_iface *
+target_conv_store_headless_host(const struct xrt_conversion_plugin_entry *e, const struct target_conv_policy *policy)
+{
+	(void)snprintf(g_headless_id, sizeof(g_headless_id), "%s", e != NULL ? e->id : "");
+	target_conv_store_configure(e, e != NULL ? 1 : 0, policy);
+	g_headless_store_host = *target_conv_status_headless_host();
+	g_headless_store_host.get_path = headless_store_get_path;
+	g_headless_store_host.model_resolve = conv_store_host_model_resolve;
+	g_headless_store_host.model_request = conv_store_host_model_request;
+	return &g_headless_store_host;
+}
+
+void
+target_conv_store_headless_release(void)
+{
+	conv_store_host_shutdown();
+	g_headless_id[0] = '\0';
 }
 
 uint32_t

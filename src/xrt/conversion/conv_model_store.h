@@ -166,6 +166,11 @@ struct conv_pack_model
 	char url[CONV_STORE_PATH_MAX];
 	char url_sha256[CONV_STORE_SHA_HEX]; //!< the blob `url` serves ("" when url is "")
 	struct conv_pack_auth auth;          //!< ADR-057 §5; kind NONE = public
+	/*! ADR-057 §5: the model's `local_build.script` — its bytes are built on
+	 *  this box by that (deterministic) script, never published. A missing
+	 *  blob is then `build-locally`, not a network failure; a `url` /
+	 *  `blobBaseUrl` still serves as a mirror when one answers. "" = none. */
+	char local_build[128];
 	uint32_t variant_count;
 	struct conv_pack_variant variants[CONV_STORE_MAX_VARIANTS];
 };
@@ -349,6 +354,7 @@ enum conv_store_blob_result
 	CONV_STORE_BLOB_IO,              //!< cannot create / write / rename in the store
 	CONV_STORE_BLOB_CANCELLED,       //!< the store is shutting down
 	CONV_STORE_BLOB_AUTH,            //!< the model's credential is missing / unreadable, or was refused (ADR-057)
+	CONV_STORE_BLOB_LOCAL_BUILD,     //!< not in the store and no source answered: build it locally (`local_build`)
 };
 
 const char *

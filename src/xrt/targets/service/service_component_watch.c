@@ -425,7 +425,8 @@ fold_path(uint64_t h, const char *dir, const char *name)
 /*!
  * One hash per class over what that class reads from the per-user dir:
  * `preferred` (display), `input-preferred` + `emulated_controllers` + every per-app
- * `input-preferred-<exe>` pin (input), every manifest by its
+ * `input-preferred-<exe>` pin (input), `conversion-allow-research-only`
+ * (conversion), every manifest by its
  * suffix (the manifest's `enabled` is the POSIX Enabled switch). A file's
  * absence is folded too, and a manifest added or removed changes its
  * class's name set — so the dir's own mtime is deliberately NOT folded: it
@@ -451,6 +452,10 @@ fingerprint_now(uint64_t out[WATCH_CLASSES])
 	// writes; the Windows twin lives under the InputProviders root the
 	// registry watch already covers.
 	out[TARGET_COMPONENT_CLASS_INPUT] = fold_path(out[TARGET_COMPONENT_CLASS_INPUT], dir, "emulated_controllers");
+	// Conversion spec §3.5: the per-user AllowResearchOnly opt-in — what
+	// `conv research on|off` writes; re-reads the policy live like a manifest edit.
+	out[TARGET_COMPONENT_CLASS_CONVERSION] =
+	    fold_path(out[TARGET_COMPONENT_CLASS_CONVERSION], dir, "conversion-allow-research-only");
 
 	DIR *d = opendir(dir);
 	if (d == NULL) {

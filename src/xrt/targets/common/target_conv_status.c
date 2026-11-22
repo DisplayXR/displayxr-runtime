@@ -30,6 +30,8 @@
 #include <string.h>
 #ifndef XRT_OS_WINDOWS
 #include <strings.h> // strcasecmp
+#include <limits.h>  // PATH_MAX
+#include <sys/stat.h> // mkdir
 #endif
 
 #ifdef XRT_OS_WINDOWS
@@ -187,6 +189,68 @@ read_enabled_overrides(struct target_conv_policy *out)
 }
 #endif
 
+bool
+target_conv_research_file_parse(const char *bytes, size_t len)
+{
+	return bytes != NULL && len > 0 && bytes[0] == '1';
+}
+
+bool
+target_conv_research_file_path(char *out, size_t cap, bool create_dir)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_ANDROID)
+	(void)create_dir;
+	return false;
+#else
+	char dir[PATH_MAX];
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return false;
+	}
+	if (create_dir) {
+		// mkdir -p: a fresh box has no per-user dir yet.
+		char tmp[PATH_MAX];
+		(void)snprintf(tmp, sizeof(tmp), "%s", dir);
+		for (char *p = tmp + 1; *p != '\0'; p++) {
+			if (*p == '/') {
+				*p = '\0';
+				(void)mkdir(tmp, 0755);
+				*p = '/';
+			}
+		}
+		(void)mkdir(tmp, 0755);
+	}
+	const int n = snprintf(out, cap, "%s/%s", dir, TARGET_CONV_RESEARCH_FILE);
+	if (n <= 0 || (size_t)n >= cap) {
+		out[0] = '\0';
+		return false;
+	}
+	return true;
+#endif
+}
+
+#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_ANDROID)
+static bool
+read_research_file(void)
+{
+	char path[PATH_MAX];
+	if (!target_conv_research_file_path(path, sizeof(path), false)) {
+		return false;
+	}
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return false;
+	}
+	char buf[4] = {0};
+	const size_t got = fread(buf, 1, sizeof(buf), f);
+	fclose(f);
+	return target_conv_research_file_parse(buf, got);
+}
+#endif
+
 void
 target_conv_policy_read(struct target_conv_policy *out)
 {
@@ -218,6 +282,9 @@ target_conv_policy_read(struct target_conv_policy *out)
 	if (!out->policy_lock) {
 		read_enabled_overrides(out);
 	}
+#elif !defined(XRT_OS_ANDROID)
+	// Spec §3.5: the per-user opt-in file (no machine tier, no lock on POSIX).
+	out->allow_research_only = read_research_file();
 #endif
 	const char *dl = getenv("DXR_CONV_ALLOW_DOWNLOADS");
 	if (dl != NULL && strcmp(dl, "0") == 0) {
