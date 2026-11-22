@@ -4972,6 +4972,7 @@ d3d11_hr_is_device_lost(HRESULT hr)
 //! @ref dxr_test_fake_device_removed arms.
 #define DXR_FAKE_DR_PRESENT 1
 #define DXR_FAKE_DR_OUT_CREATE 2
+#define DXR_FAKE_DR_ENSURE_OUTPUT 3
 
 static HRESULT
 dxr_test_fake_device_removed(HRESULT hr, int arm = DXR_FAKE_DR_PRESENT)
@@ -4979,7 +4980,7 @@ dxr_test_fake_device_removed(HRESULT hr, int arm = DXR_FAKE_DR_PRESENT)
 	static int want = -1;
 	if (want < 0) {
 		const char *e = getenv("DXR_TEST_FAKE_DEVICE_REMOVED");
-		want = (e != nullptr && e[0] >= '1' && e[0] <= '2') ? (e[0] - '0') : 0;
+		want = (e != nullptr && e[0] >= '1' && e[0] <= '3') ? (e[0] - '0') : 0;
 	}
 	if (want != arm || FAILED(hr)) {
 		return hr;
@@ -5001,9 +5002,16 @@ dxr_test_fake_device_removed(HRESULT hr, int arm = DXR_FAKE_DR_PRESENT)
 	 * politely wait for a present: a chain rebuild or a resize reaches a create
 	 * first, and until PR 6 every one of those HRESULTs was dropped. This arm is
 	 * how that half is walked.
+	 *
+	 * `=3` fires at the first service swap-chain create in
+	 * `multi_compositor_ensure_output`, which runs while a session is being
+	 * created. The session then fails and its client leaves, so no frame is ever
+	 * rendered: this arm walks the exit with the render path idle.
 	 */
 	U_LOG_W("DXR_TEST_FAKE_DEVICE_REMOVED=%d: injecting DXGI_ERROR_DEVICE_REMOVED on this %s (test)", arm,
-	        arm == DXR_FAKE_DR_OUT_CREATE ? "output-device back-buffer RTV refresh" : "present");
+	        arm == DXR_FAKE_DR_OUT_CREATE      ? "output-device back-buffer RTV refresh"
+	        : arm == DXR_FAKE_DR_ENSURE_OUTPUT ? "service swap-chain create"
+	                                           : "present");
 	return DXGI_ERROR_DEVICE_REMOVED;
 }
 
@@ -11955,6 +11963,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	// Create swap chain (+ its waitable and back-buffer RTV) on whichever device
 	// the output half currently lives on.
 	HRESULT hr = multi_compositor_create_service_chain(sys, mc, actual_w, actual_h);
+	hr = dxr_test_fake_device_removed(hr, DXR_FAKE_DR_ENSURE_OUTPUT);
 	if (FAILED(hr)) {
 		service_note_device_lost(sys, hr, "multi_compositor_ensure_output/swapchain"); // #1002
 		U_LOG_E("Multi-comp: failed to create swap chain (hr=0x%08X)", hr);
@@ -12951,7 +12960,13 @@ pipeline_weave_idle_release_if_due(struct d3d11_service_system *sys,
  * unwind rather than dying mid-RPC. DXR_DEVICE_REMOVED_EXIT_MS=0 disables the
  * exit entirely (the service then just runs inert, for debugging).
  *
- * Called from the RENDER THREAD only — never an IPC handler.
+ * Called from the render path, and from the IPC server's main loop through
+ * @ref comp_d3d11_service_device_removed_exit_if_due — never from an IPC
+ * handler. The main loop is the one that still ticks when nothing renders: a
+ * removal latched while a session is being created (a swap-chain create on a
+ * dead device) fails that session, its client leaves, and no render tick ever
+ * comes. Without the second caller the service stayed up and refused every
+ * session until someone restarted it.
  */
 static void
 service_device_removed_exit_if_due(struct d3d11_service_system *sys)
@@ -39496,6 +39511,18 @@ comp_d3d11_service_device_is_removed(struct xrt_system_compositor *xsysc)
 		return false;
 	}
 	return service_device_removed(d3d11_service_system_from_xrt(xsysc));
+}
+
+extern "C" void
+comp_d3d11_service_device_removed_exit_if_due(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == nullptr) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (service_device_removed(sys)) {
+		service_device_removed_exit_if_due(sys);
+	}
 }
 
 extern "C" uint32_t
