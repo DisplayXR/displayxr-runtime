@@ -117,7 +117,7 @@ shell.
 | Nonce | 32 bytes from the OS random source, base64url without padding: 43 characters of `A-Z a-z 0-9 - _` |
 | Bound to | one component (class + id) and the user who began it |
 | Lifetime | 15 minutes (`U_ACTIVATION_TTL_S`) |
-| Uses | one. The record is deleted by the first presentation of its nonce, whatever the outcome |
+| Uses | one. The record is deleted by the first presentation of its nonce, whatever the outcome. Nothing but a link carrying that nonce (or expiry) removes it: no number of other links, failed or not, touches it |
 | Limit | 16 pending per user (`U_ACTIVATION_MAX_PENDING`); expired ones are pruned at every begin |
 | Windows | `%LOCALAPPDATA%\DisplayXR\Activation\` (the profile's ACL) |
 | macOS | `~/Library/Application Support/DisplayXR/activation/` (directory `0700`, files `0600`) |
@@ -255,27 +255,56 @@ One implementation, `activation_handle_url()`
 (`src/xrt/targets/activate/activation_handler.c`), behind every platform's
 registered entry (§8). In this order and no other:
 
-1. **Flood check.** If five links failed in the last ten minutes for this
-   user, stop: the link is not looked at, nothing is spent, nothing is shown.
-2. **Strict parse** (§4.2). An allow-list parser over a closed character set
+1. **Strict parse** (§4.2). An allow-list parser over a closed character set
    with hard length caps; a refused link yields no field at all.
-3. **Consume the nonce.** The record is claimed with an atomic rename and
-   deleted, *then* judged: not found, expired, begun by another user, or not a
-   record this code wrote are all refusals, and the record is gone in every
-   case. Of two handlers racing on one nonce, exactly one claim succeeds.
-4. **Cross-check `item`**, if present, against the record.
-5. **Deliver** the token to the record's component (§6), then wipe it.
-6. **Record** one line: time, nonce id, class, id, outcome. Never the token,
+2. **Consume the nonce.** The record is read, claimed with an atomic rename
+   and deleted, *then* judged: not found, expired, begun by another user, or
+   not a record this code wrote are all refusals, and the record is gone in
+   every case. Of two handlers racing on one nonce, exactly one claim
+   succeeds. (The record is read before the claim, so a concurrent
+   `activate-begin`, which sweeps leftover claim files, cannot make a good
+   record read as damaged.)
+3. **Cross-check `item`**, if present, against the record.
+4. **Deliver** the token to the record's component (§6), then wipe it.
+5. **Record** one line: time, nonce id, class, id, outcome. Never the token,
    never the link (`activation.log` in the store directory, capped at 64 KB).
-7. **Show the outcome** (below).
+6. **Show the outcome** (§5.1).
+
+**Nothing comes before the parse and the consume.** A link whose nonce is
+pending always goes through, whatever else has been sent to the handler. There
+is no state in which the handler declines to look at a link.
 
 What it never does: open, execute or forward any part of the link; pass any of
 it to a shell; start the service; ask for elevation; choose a component from
 the link.
 
-Failures that count toward the flood limit: an invalid link, a nonce that is
-not pending, an `item` mismatch. A component refusing a token it was
-legitimately handed does not count.
+### 5.0 Failed links, and the one thing the failure count does
+
+Any page can open `displayxr://…` links at will, and each failed link raises a
+message (§5.1). To keep a page from raising one per attempt, the handler
+counts the links that **named no pending activation**: a malformed link, or a
+well-formed one whose nonce is not pending (never begun, already used, a
+guess). When five of those fell within the last ten minutes
+(`U_ACTIVATION_FAIL_LIMIT`, `U_ACTIVATION_FAIL_WINDOW_S`), a further one is
+handled exactly as before, logged with a `.quiet` suffix, and **raises no
+message** (`quiet` in §5.2).
+
+That is all the count does:
+
+- It never stops a link from being parsed or its nonce from being consumed. A
+  link with a pending nonce is delivered and its outcome shown in the middle of
+  any flood. A 256-bit nonce cannot be guessed, so declining to look would add
+  no security, and it would let any page (or a user re-clicking a spent link)
+  silently disable the user's real return link.
+- It is never applied to an outcome that concerned a real pending activation.
+  Activated, refused by the component, expired, wrong user, damaged record and
+  `item` mismatch are always shown and never counted: only someone holding the
+  nonce can produce them.
+- It does not limit `activate-begin`.
+
+So the worst a flood of junk links does is this: a later failed link (a
+re-click of a link that was already used, say) shows no message for up to ten
+minutes after the last junk link. Nothing is spent and nothing is blocked.
 
 ### 5.1 The user always sees the outcome
 
@@ -291,20 +320,36 @@ which component it concerned and what happened, in a minimal native message:
 The text is fixed sentences plus the component's id **from the pending
 record**, its licence state, and its own one-line message when that is
 well-formed text. Nothing from the link is ever shown. The one exception to
-"always" is the flood state of step 1: a hostile page must not be able to
-raise a dialog per attempt, so links ignored for that reason are ignored
-quietly (and logged).
+"always" is a **failed** link during a flood of failed links (§5.0): a hostile
+page must not be able to raise a dialog per attempt, so a link that named no
+pending activation is then answered quietly (and logged). An activation, or
+any other outcome of a link whose nonce was pending, is never quiet.
+
+On Linux the message is a desktop notification, which is transient and which
+the desktop can suppress (Do Not Disturb, a notification daemon that is not
+running, a full-screen application). The handler cannot tell whether it was
+seen, so on Linux an activation can complete without the user noticing; the
+component's licence state in the Dashboard and `activation.log` are the
+record. Windows and macOS show a modal message.
 
 ### 5.2 `activate-url`
 
 ```
-displayxr-cli activate-url [--json] [--notify] <link>
+displayxr-cli activate-url [--json] [--notify] <link | ->
 ```
 
 The same handler from a terminal, and the registered entry on Linux. The link
 is the **last** argument and is never read as an option; the only options are
 `--json` and `--notify`, and only before it; any other argument is refused
 before the link is looked at.
+
+A last argument of exactly `-` reads the link from **standard input** (one
+line, a trailing line break ignored). A command-line argument is visible to
+every user of the machine in the process list for as long as the handler runs
+(up to about a minute when a live delivery waits); standard input is not. A
+caller that holds the link privately uses `-`: the macOS handler bundle does
+(§8). A hostile link of `-` reads an empty standard input under a browser
+launch and is an invalid link.
 
 `--json`:
 
@@ -322,16 +367,20 @@ before the link is looked at.
 | `refused` | it refused; `error` is its line |
 | `unsupported` | it has no activation slot |
 | `not-loaded` | it is not registered any more, or did not load |
-| `unknown` | the service took the token and did not report back in time; check the licence state before retrying |
-| `busy` | the service was busy with another activation for 10 s; nothing was delivered |
+| `unknown` | the token was sent to the service and the outcome is not known: no answer in time, the service went away, or the reply to the commit call was lost. The component may or may not have been activated; check the licence state before retrying. Never retried by the handler (§6) |
+| `busy` | the service was busy with another activation for 10 s; nothing was delivered. The nonce is spent all the same (§9, limits) |
 | `invalid-link` | not a well-formed link; `detail` says which rule (`bad-scheme`, `bad-action`, `bad-query`, `bad-nonce`, `bad-token`, `bad-item`, `bad-character`, `too-long`, `empty`) |
 | `not-pending` | no live pending activation; `detail` is `not-found`, `expired`, `wrong-user` or `corrupt` |
 | `item-mismatch` | the link's `item` is not what the nonce was begun for |
-| `rate-limited` | the flood limit is in force; `quiet` is true |
 | `store-error` | the user's pending store could not be located |
 
 `class` and `id` name the component the nonce was begun for, and are `""` when
 the link never resolved to one. `via` is `service` or `process` (§6).
+
+`quiet` is `true` only with `invalid-link`, or `not-pending` with `detail`
+`not-found`, and only during a flood of such links (§5.0): the front end shows
+nothing for that link. (There is no `rate-limited` result: a link is always
+handled and reported for what it is.)
 
 ## 6. Delivery: exactly one `activate` call
 
@@ -356,9 +405,16 @@ and it is unloaded. A component keeps its activation across processes itself;
 a running service is then asked to re-select the class
 (`system_request_component_reselect`).
 
-Step 2 runs only when step 1 reported that **nothing was called**. Once the
-service has taken the token its answer is final, and a missing answer is
-reported as `unknown`, never retried.
+Step 2 runs only when step 1 can say that **nothing was called**: no service,
+a connection that dropped while the token was being staged (no commit was ever
+sent), a commit the service answered with a refusal, or its `NOT_HOSTED`
+answer. The **commit call is the point of no return**. From the moment it is
+sent the service may hold the token, whether or not its reply arrives, so a
+transport failure on the commit, a service that goes away afterwards and a
+missing answer are all reported as `unknown` and never delivered a second time
+from the handler's process: a one-time token must not reach `activate` twice.
+The user is told to check the component's licence state.
+(`activation_service_delivery.c`, unit-tested over a scripted transport.)
 
 ### 6.1 The DIAG calls
 
@@ -389,9 +445,10 @@ the nonce protects against a *web page*, which cannot reach the IPC channel.
 |---|---|
 | a busy activation slot | retried for 10 s, then `busy` |
 | the service's answer | 45 s, then `unknown` |
+| the reply to the commit call | lost at transport level: `unknown` at once, no in-process delivery |
 | the conversion host's answer to `ACTIVATE` | 30 s (the proxy), reported as refused |
 | service shutdown with a delivery still inside a component | 2 s grace, then abandoned |
-| macOS: the CLI run by the handler bundle | 75 s, then ended |
+| macOS: the CLI run by the handler bundle | 75 s, then ended (the alert then says nothing was confirmed) |
 
 ### 6.3 What the runtime persists
 
@@ -425,8 +482,8 @@ needs no service and no hardware (§10).
 | Platform | Registered as | Handler | By |
 |---|---|---|---|
 | Windows | `HKLM\Software\Classes\displayxr` (`URL Protocol`), `shell\open\command` = `"<dir>\displayxr-activate.exe" "%1"` | `displayxr-activate.exe` | the runtime installer; removed by its uninstaller when it still points at that install |
-| macOS | `CFBundleURLTypes` → `displayxr` in the bundle's `Info.plist`, registered with Launch Services by the `.pkg` postinstall (`lsregister -f`) for the console user | `DisplayXRActivate.app` in the runtime's `bin/` | the runtime `.pkg`; `uninstall.sh` unregisters it |
-| Linux | `displayxr-url-handler.desktop` with `MimeType=x-scheme-handler/displayxr;` and `Exec=<bin>/displayxr-cli activate-url --notify %u` | `displayxr-cli` | the `.deb` (`/usr/share/applications`, refreshed by the `desktop-file-utils` trigger and postinst) and the tarball's `install.sh` (`$XDG_DATA_HOME/applications`, or `/usr/local/share/applications` with `--system`) |
+| macOS | `CFBundleURLTypes` → `displayxr` in the bundle's `Info.plist`, registered with Launch Services **per user**: by `displayxr-service` at every start for the user it runs as (`LSRegisterURL`), and by the `.pkg` postinstall (`lsregister -f`) for the console user at install time | `DisplayXRActivate.app` in the runtime's `bin/` | the runtime `.pkg` and the service; `uninstall.sh` unregisters it |
+| Linux | `displayxr-url-handler.desktop` with `MimeType=x-scheme-handler/displayxr;` and `Exec=<bin>/displayxr-cli activate-url --notify %u` (the tarball quotes and escapes `<bin>` per the Desktop Entry Specification, since its prefix is the user's choice) | `displayxr-cli` | the `.deb` (`/usr/share/applications`, refreshed by the `desktop-file-utils` trigger and postinst) and the tarball's `install.sh` (`$XDG_DATA_HOME/applications`, or `/usr/local/share/applications` with `--system`) |
 
 **Windows: a dedicated program.** `displayxr-activate.exe` is a GUI-subsystem
 program with no options and one action. It takes its command line from
@@ -434,9 +491,22 @@ program with no options and one action. It takes its command line from
 the classic scheme-handler injection (a link containing `" --flag`) produces
 more than one and is refused before anything is parsed. It has the default
 `asInvoker` manifest (it runs as the user who clicked and never asks for
-elevation) and removes the current directory from the DLL search path before
-anything loads. The registered command is `"<exe>" "%1"`: both quoted, nothing
-after `%1`. `displayxr-cli activate-url` was not registered instead because
+elevation). Its first statement removes the current directory from the DLL
+search path (`SetDllDirectoryW(L"")`), which covers every DLL loaded by name
+**after** startup: a plug-in's dependencies, a delay load. It cannot cover the
+program's own static imports, which the loader resolves before any of its code
+runs. Those are found in the program's own directory or the system
+directories, both ahead of the current directory in the standard search order
+(and several are KnownDLLs), so the current directory is consulted only for an
+import missing from both, which an intact install does not have. No link-time
+restriction (`/DEPENDENTLOADFLAG`) is applied: the program's own directory has
+to stay searchable for the DLLs installed beside it. The registered command is
+`"<exe>" "%1"`: both quoted, nothing after `%1`. The link is therefore on the
+handler's command line, visible in the process list to other users of the
+machine while it runs; that is inherent in how Windows starts a scheme
+handler (§4.3 is why the token should be single use). An upgrade to a build
+that ships no handler removes the previous install's program and the scheme
+key that pointed at it. `displayxr-cli activate-url` was not registered instead because
 the CLI is a console program (a console window would flash over the browser on
 every link) with many verbs and flags.
 
@@ -444,14 +514,43 @@ every link) with many verbs and flags.
 to an app bundle and the link arrives as an Apple Event, never as an argument,
 so a bare executable cannot be the handler. `DisplayXRActivate.app` is a
 shim: `LSUIElement`, system frameworks only, no entitlements. It runs the
-`displayxr-cli` beside it (`activate-url --json <link>`, an argument vector,
-no shell, found only beside the bundle) and shows the `title` / `message` it
-reports. The CLI is the process that loads plug-ins and already carries the
-signing entitlements for that. Launch Services does not register a bundle
-that lives under a temporary directory.
+`displayxr-cli` beside it (`activate-url --json -`, an argument vector, no
+shell, found only beside the bundle), writes the link to the CLI's **standard
+input**, and shows the `title` / `message` it reports. The link reaches the
+bundle privately, as an Apple Event, and is kept out of the process list all
+the way: it is never an argument of any process. The CLI is the process that
+loads plug-ins and already carries the signing entitlements for that. Launch
+Services does not register a bundle that lives under a temporary directory.
+
+*Registration is per user and is not automatic.* The Launch Services database
+belongs to each user, and the bundle lives in the runtime's `bin/`, a
+directory Launch Services never scans. Two things register it:
+
+- `displayxr-service` calls `LSRegisterURL` on the installed bundle at every
+  start (`service_url_scheme_macos.c`). Its LaunchAgent starts it in each
+  user's GUI session at login, so every user of the machine, an install made
+  with nobody logged in (MDM, ssh) and a rebuilt Launch Services database are
+  covered from that user's next login (or next service start). Only an
+  installed service does this (executable under
+  `/Library/Application Support/DisplayXR/bin/`), so a dev build never takes
+  the scheme.
+- the `.pkg` postinstall runs `lsregister -f` for the user at the console, so
+  that user needs no logout.
+
+Known limitations: a **runtime-only `.pkg`** (no service) has only the
+postinstall line, so only the console user at install time gets the handler; a
+user whose service is not running (Background Task Management disallowed the
+LaunchAgent) is in the same position; and if another bundle also declares the
+`displayxr` scheme (another application, or a second copy of this one, such as
+a developer's build tree that the system indexed and registered by itself),
+which one Launch Services picks is not controlled here. Where no handler is registered the browser reports that it cannot open
+the link, and the pasted key (§1.1) still works. **This registration path has
+not been run on a machine yet** (§11).
 
 **Linux: the CLI.** There is no console to flash and a `.desktop` entry is the
-registration, so the CLI is the handler. `%u` is one argument, last.
+registration, so the CLI is the handler. `%u` is one argument, last, and is
+therefore visible in the process list to other users while the handler runs:
+inherent in the desktop-entry mechanism, as `"%1"` is on Windows.
 
 ## 9. Threat model
 
@@ -464,22 +563,43 @@ say yes).
 | A page pushes a token at a plug-in | no pending nonce → nothing reaches a plug-in. A nonce is 256 bits of OS randomness, lives 15 minutes, works once, on one machine, for one user |
 | A page picks which component gets a token | the component comes from the pending record; `item` is only a cross-check |
 | A page triggers another action (`displayxr://install`, `…/open`) | the action allow-list is `activate`; there is no other |
-| Argument injection through the registered command (`" --flag`, spaces, `%1` tricks) | Windows: `"%1"` quoted and a handler that accepts exactly one argument and has no options. Linux: the link is the last argument and never an option. macOS: an Apple Event, then an argument vector. The link's character set excludes quote, space and backslash in any case |
+| Argument injection through the registered command (`" --flag`, spaces, `%1` tricks) | Windows: `"%1"` quoted and a handler that accepts exactly one argument and has no options. Linux: the link is the last argument and never an option. macOS: an Apple Event, then the CLI's standard input (never an argument). The link's character set excludes quote, space and backslash in any case |
+| The link (token included) is read from the process list by another local user | macOS: never on a command line. Windows (`"%1"`) and Linux (`%u`): the OS puts it there, for the handler's lifetime; not mitigable in the handler, which is why the token should be single use (§4.3) |
 | Shell or command injection | no part of the link reaches a shell, a command line of ours beyond the one argument, a file name (records are named by a hash) or a format string |
 | Malformed input: oversized, `%00`, control characters, invalid or overlong UTF-8, unknown or repeated keys | the strict parser (§4.2); table-tested |
 | Replay of a captured link | the nonce is spent by first use, valid or not |
 | A link leaks (history, `Referer`, logs) | our half is single use and writes nothing; the vendor's half is §4.3 |
 | Another local user's pending activation | the store is per user; a record names its user and is refused for any other; POSIX also checks owner and mode |
-| A hostile page floods the handler (dialog spam, nonce guessing) | five failures in ten minutes stop the handler answering, quietly; the counter is bounded |
-| A hostile page burns a legitimate pending activation | it would need the nonce. Failed links spend only the nonce they name. A flood can make the handler ignore links for up to ten minutes (the pasted key is unaffected) |
+| A hostile page floods the handler (dialog spam, nonce guessing) | after five failed links in ten minutes, further failed links raise no message (§5.0); the counter is bounded. Guessing is hopeless against 256 bits, so nothing else is limited |
+| A hostile page burns or blocks a legitimate pending activation | it would need the nonce. Failed links spend only the nonce they name, and **no number of them stops a link whose nonce is pending**: it is consumed, delivered and shown. The failure count silences failed links only |
+| The token reaches `activate` twice | one consume per nonce; the handler delivers in its own process only when the service provably called nothing, and a commit whose reply was lost is `unknown`, not a retry (§6) |
 | The token appears in a log, a crash line or a UI | never logged or shown; wiped from the handler's and the service's buffers after delivery |
 | A hostile purchase URL from a plug-in | `https` only, closed character set (§3); the front end opens it in the browser, never a shell |
 | Elevation | the handler never asks for it; a browser running elevated runs the handler elevated, where the component loader's provenance gate still applies |
-| DLL planting next to the browser's working directory (Windows) | the handler drops the current directory from the DLL search path first |
+| DLL planting next to the browser's working directory (Windows) | the handler drops the current directory from the search path for every DLL loaded by name after startup; its static imports resolve from its own directory and the system directories, ahead of the current directory (§8) |
 | A second program takes the scheme | out of scope for the handler; the installer writes the registration, and uninstall removes it only when it still points at that install |
 
 Outside the model: code already running as the user (it can call a
 component's slot directly) and an administrator.
+
+**Known limits**, stated so that nobody relies on more than is there:
+
+- *A local process can make an activation fail with `busy`.* The service has
+  one activation slot. A process running as the user, on the DIAG channel, can
+  hold it; the handler has by then consumed the nonce, waits 10 s, and reports
+  `busy` with the nonce spent (the user starts again from the Dashboard).
+  Consuming the nonce only after the slot is held would mean staging the token
+  in the service before the nonce is validated, which is the wrong order for a
+  handler fed by a web page, so it was not done. Such a process is outside the
+  threat model above.
+- *Linux: the outcome can go unseen.* The notification is transient and can be
+  suppressed (§5.1).
+- *macOS: a user can be left without a handler* (runtime-only `.pkg`, a
+  service that is not running; §8).
+- *Windows and Linux: the link is on the handler's command line* while it
+  runs (§8).
+- *A failed link may show no message* for up to ten minutes after a burst of
+  failed links (§5.0). Nothing else is affected.
 
 **Not DRM.** Nothing here protects a licence. The nonce protects the *user*
 from pages that would push data at a plug-in; entitlement is the vendor's
@@ -498,12 +618,16 @@ displayxr-cli conv list                              # licensed (key), selected 
 ```
 
 Tests: `tests/tests_activation.cpp` (the parser's table of hostile links, the
-store, the handler end to end against a scripted component, the service's
+store including a prune racing a consume, the handler end to end against a
+scripted component, a flood of junk links followed by a pending link that
+still activates, a re-clicked spent link, the client half of a live delivery
+over a scripted transport with the commit's reply lost, the service's
 activation slot), `tests_conv_lanes` *"a live activation licenses a provider
 and the task re-selects it"* (the delivery to a live conversion provider), and
 the conformance cell in `build-windows.yml` (the round trip on the real
-loaders and the real per-user store, the flood limit, the handler program's
-subsystem, manifest and exit code).
+loaders and the real per-user store, a pending link accepted in the middle of
+a flood of failed links, `activate-url -`, the handler program's subsystem,
+manifest and exit code). Only the Windows `Runtime` job runs ctest.
 
 ## 11. Validation checklist (not covered by CI)
 
@@ -534,9 +658,14 @@ installer from the branch:
    - `displayxr://activate?nonce=<guessed 43 characters>&token=x`
    - `displayxr://activate?nonce=<valid>&token=x&item=dp%2Fsim-display` (mismatch; this one spends the nonce)
    - `displayxr-activate.exe` started by hand with zero and with three arguments
-   After the fifth failure further links produce **no** dialog for ten minutes
-   and `%LOCALAPPDATA%\DisplayXR\Activation\activation.log` gains
-   `outcome=rate-limited` lines; delete `failures` there to reset.
+   After the fifth failed link further **failed** links produce no dialog for
+   ten minutes and `%LOCALAPPDATA%\DisplayXR\Activation\activation.log` gains
+   `outcome=….quiet` lines; delete `failures` there to reset.
+   **Then, without resetting:** run `activate-begin` and open its real link.
+   It must activate and show its message box (a flood never blocks a pending
+   link). Re-click that link five more times: at most the first clicks show
+   "No activation is waiting…", the rest nothing, and a fresh `activate-begin`
+   plus its link still activates.
 6. **Another user.** Begin as user A; as user B (same machine) open the link:
    "No activation is waiting…", and A's record is untouched.
 7. **Expiry.** Begin, wait 16 minutes, open the link: refused.
@@ -544,9 +673,39 @@ installer from the branch:
    at the browser's integrity level, gone after the message box. The log holds
    no token and no nonce; no `.pending` file remains.
 9. **Uninstall** removes `HKLM\Software\Classes\displayxr` and the program.
+10. **Upgrade to a build without the handler** (an installer built with
+    `displayxr-activate.exe` absent, over an install that has it): the program
+    and `HKLM\Software\Classes\displayxr` are both gone afterwards.
+11. **Service gone mid-delivery.** With the service hosting `sim-conversion`,
+    open a link and end `displayxr-service.exe` as the link is handled: the
+    message says the outcome is not known and to check the licence state;
+    `activate-url --json` reports `"result": "unknown"`, `"via": "service"`,
+    and the provider's `activate` was not called a second time in the
+    handler's process.
 
-macOS: after installing the `.pkg`, `open 'displayxr://activate?nonce=x&token=y'`
-shows the alert ("not a valid… link"); then steps 2, 4 and 5. Linux:
-`xdg-mime query default x-scheme-handler/displayxr` names
+macOS (**never run so far; every line is open**), after installing the `.pkg`:
+
+1. `open 'displayxr://activate?nonce=x&token=y'` shows the alert ("not a
+   valid… link"); then steps 2, 4 and 5 above.
+2. While a real link is being handled, `ps -axww | grep -i displayxr` in
+   another terminal shows `displayxr-cli activate-url --json -` and **no
+   link, nonce or token** on any command line.
+3. Registration for a second user: log in as another user of the machine
+   (never logged in since the install) and open a `displayxr://` link; the
+   handler starts (the service registered it at that user's login).
+4. Registration after a rebuild: `lsregister -kill -r -domain local -domain user`
+   (or delete the user's Launch Services database), log out and in, open a
+   link: the handler starts.
+5. An install with nobody at the console (`sudo installer -pkg … -target /`
+   over ssh), then a login: the handler starts.
+6. A dev build's `displayxr-service` run from a build or `_package` tree does
+   **not** change which bundle handles the scheme.
+7. `uninstall.sh` unregisters the bundle.
+
+Linux: `xdg-mime query default x-scheme-handler/displayxr` names
 `displayxr-url-handler.desktop`; `xdg-open '<link>'` raises a notification;
-then steps 2, 4 and 5.
+then steps 2, 4 and 5. Tarball install under a prefix containing a space
+(`XDG_DATA_HOME="$HOME/my data" ./install.sh`): `desktop-file-validate`
+accepts the entry and `xdg-open '<link>'` still reaches the handler. With Do
+Not Disturb on, the activation completes and no notification is seen (the
+documented limit of §5.1).
