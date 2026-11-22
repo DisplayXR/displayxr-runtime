@@ -11,6 +11,7 @@
  *   conv enable | disable <id> [--machine]           `Enabled` (HKCU; HKLM with --machine)
  *   conv use    <task> <id>[/<cap>] [--machine]      `PreferredProvider\<task>`
  *   conv reset  <task>|all [--machine]
+ *   conv research on|off|status [--machine]          `AllowResearchOnly` (HKCU / HKLM; POSIX: the per-user file)
  *   conv options <id> [--json]                       the provider's settings: declared + stored, with source
  *   conv set    <id> <KEY> <value> [--machine]       `Settings\<KEY>` (HKCU; HKLM with --machine) — N3c
  *   conv unset  <id> <KEY> [--machine]
@@ -75,6 +76,7 @@
 
 #include <cjson/cJSON.h>
 
+#include <cerrno>
 #include <algorithm>
 #include <cctype>
 #include <csignal>
@@ -854,6 +856,78 @@ cmd_reset(const char *task_name, bool machine)
 	return rc;
 }
 
+/*!
+ * `conv research on|off|status [--machine]` — the `AllowResearchOnly` opt-in
+ * (spec §3.1 / §3.5). Windows: the DWORD under the root, HKCU (HKLM with
+ * --machine). Desktop POSIX: the per-user TARGET_CONV_RESEARCH_FILE ("1"),
+ * removed by `off`; --machine is refused (no machine tier there). Signed
+ * installers never write either store: only a user turns it on.
+ */
+int
+cmd_research(const char *what, bool machine)
+{
+	const bool on = strcmp(what, "on") == 0;
+	const bool off = strcmp(what, "off") == 0;
+	if (!on && !off && strcmp(what, "status") != 0) {
+		P("usage: displayxr-cli conv research on|off|status [--machine]\n");
+		return 1;
+	}
+	if (on || off) {
+#ifdef XRT_OS_WINDOWS
+		const int rc = write_result(set_dword(machine, "", "AllowResearchOnly", on ? 1u : 0u),
+		                            machine ? "writing the machine-wide AllowResearchOnly"
+		                                    : "writing the per-user AllowResearchOnly");
+		if (rc != 0) {
+			return rc;
+		}
+#else
+		if (machine) {
+			P("FAIL: no machine-wide AllowResearchOnly on this platform: it is a per-user opt-in\n"
+			  "(the per-user file %s).\n",
+			  TARGET_CONV_RESEARCH_FILE);
+			return 1;
+		}
+		char path[1024];
+		if (!target_conv_research_file_path(path, sizeof(path), on)) {
+			P("FAIL: no per-user DisplayXR directory (HOME / XDG_DATA_HOME unset).\n");
+			return 1;
+		}
+		if (on) {
+			FILE *f = fopen(path, "wb");
+			if (f == nullptr || fputs("1\n", f) < 0) {
+				if (f != nullptr) {
+					fclose(f);
+				}
+				P("FAIL: cannot write %s\n", path);
+				return 1;
+			}
+			fclose(f);
+		} else if (remove(path) != 0 && errno != ENOENT) {
+			P("FAIL: cannot remove %s\n", path);
+			return 1;
+		}
+#endif
+		P("AllowResearchOnly %s %s.\n", on ? "on" : "off", machine ? "machine-wide (HKLM)" : "for this user");
+		if (on) {
+			P("Research-only and unknown-licence models may now be selected, fetched and loaded: they are\n"
+			  "not licensed for commercial use.\n");
+		}
+	}
+	struct target_conv_policy pol;
+	target_conv_policy_read(&pol);
+	char path[1024];
+	const bool has_file = target_conv_research_file_path(path, sizeof(path), false);
+	P("AllowResearchOnly: %s%s%s%s\n", pol.allow_research_only ? "on" : "off", has_file ? "  (" : "",
+	  has_file ? path : "", has_file ? ")" : "");
+	if (pol.policy_lock && !machine && (on || off)) {
+		P("note: HKLM Policy\\Lock is set, so the per-user value is ignored.\n");
+	}
+	if (on || off) {
+		note_service_pickup();
+	}
+	return 0;
+}
+
 /*
  *
  * options / set / unset (N3c) — the shared verbs over the conversion class.
@@ -1309,23 +1383,39 @@ fetch_one(const char *src, int argc, const char **argv, conv_model_store *s, boo
 			continue;
 		}
 		const char *result;
+		std::string hint;
 		if (installer && !m.commercial) {
 			// A signed installer never pre-fetches a non-commercial blob (roadmap §11.1 c).
 			result = "skipped-non-commercial";
 		} else {
-			result = conv_store_blob_result_str(
-			    conv_model_store_fetch_model(s, pack.get(), &m, nullptr, /*skip_stamped=*/installer));
-			if (strcmp(result, "ok") != 0 && strcmp(result, "skipped") != 0) {
+			const conv_store_blob_result r =
+			    conv_model_store_fetch_model(s, pack.get(), &m, nullptr, /*skip_stamped=*/installer);
+			result = conv_store_blob_result_str(r);
+			if (r != CONV_STORE_BLOB_OK && r != CONV_STORE_BLOB_SKIPPED) {
 				failed++;
+			}
+			if (r == CONV_STORE_BLOB_POLICY && !m.commercial) {
+				hint =
+				    "research-only: needs AllowResearchOnly (`conv research on`) or "
+				    "--allow-research-only";
+				if (m.local_build[0] != '\0') {
+					hint += std::string("; its bytes are built locally by ") + m.local_build;
+				}
+			} else if (r == CONV_STORE_BLOB_LOCAL_BUILD) {
+				hint = std::string("never downloaded: build it locally with ") + m.local_build +
+				       ", which writes it into this store";
 			}
 		}
 		if (arr != nullptr) {
 			cJSON *e = cJSON_CreateObject();
 			cJSON_AddStringToObject(e, "name", m.name);
 			cJSON_AddStringToObject(e, "result", result);
+			if (!hint.empty()) {
+				cJSON_AddStringToObject(e, "hint", hint.c_str());
+			}
 			cJSON_AddItemToArray(arr, e);
 		} else {
-			P("  %-28s %s\n", m.name, result);
+			P("  %-28s %s%s%s\n", m.name, result, hint.empty() ? "" : "  -- ", hint.c_str());
 		}
 	}
 	if (o != nullptr) {
@@ -1350,6 +1440,7 @@ models_fetch(int argc, const char **argv, conv_model_store *s, bool json)
 	}
 	if (!cli_has_flag(argc, argv, "--prefetch")) {
 		P("usage: displayxr-cli conv models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]\n"
+		  "                                         [--allow-research-only]\n"
 		  "       displayxr-cli conv models fetch --prefetch   (every registered pack's prefetch models)\n");
 		return 1;
 	}
@@ -1375,7 +1466,8 @@ cmd_models(int argc, const char **argv)
 	if (strcmp(verb, "list") != 0 && strcmp(verb, "prune") != 0 && strcmp(verb, "verify") != 0 &&
 	    strcmp(verb, "fetch") != 0 && strcmp(verb, "init") != 0) {
 		P("usage: displayxr-cli conv models list|verify|prune|init [--json] [--root <dir>]\n"
-		  "       displayxr-cli conv models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]\n");
+		  "       displayxr-cli conv models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]\n"
+		  "                                         [--allow-research-only]\n");
 		return 1;
 	}
 	char root[512] = "", source[64] = "";
@@ -1393,7 +1485,10 @@ cmd_models(int argc, const char **argv)
 	snprintf(cfg.root, sizeof(cfg.root), "%s", root);
 	const bool installer = cli_has_flag(argc, argv, "--installer");
 	cfg.allow_downloads = true; // an explicit fetch is the user's (or the installer's) own request
-	cfg.allow_research_only = !installer && policy.allow_research_only;
+	// The per-run opt-in reaches the store as well as selection (`conv run`):
+	// an explicit fetch is the user's own request. Never with --installer.
+	cfg.allow_research_only =
+	    !installer && (policy.allow_research_only || cli_has_flag(argc, argv, "--allow-research-only"));
 	if (installer) {
 		snprintf(cfg.nonce, sizeof(cfg.nonce), "installer");
 	}
@@ -1540,7 +1635,10 @@ usage(void)
 	P("                                      hand an activation token to the provider (opaque to the runtime;\n");
 	P("                                      a licence-key setting of type 'secret' shows only as <set>)\n");
 	P("  models list|verify|prune|init [--json] [--root <dir>]   the runtime-owned model store\n");
-	P("  models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]   write protocol, here\n");
+	P("  models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer] [--allow-research-only]\n"
+	  "                                      the write protocol, here (research-only models need the opt-in)\n");
+	P("  research on|off|status [--machine]  AllowResearchOnly: research-only / unknown-licence models may be\n"
+	  "                                      selected, fetched and loaded (per user; never set by an installer)\n");
 	P("  run <task> <in> [<in-right>] <out> [options]   one splat job, file to file (`conv run` for options)\n");
 	P("  consent <id> grant|revoke|status    off-box consent for a remote provider (per user)\n");
 	P("  camera-block <sog> --facts <json>   write facts as the SOG camera block, \"source\":\"auto\"\n");
@@ -1588,6 +1686,9 @@ cli_cmd_conv(int argc, const char **argv)
 			return usage();
 		}
 		return cmd_reset(argv[3], machine);
+	}
+	if (strcmp(verb, "research") == 0) {
+		return cmd_research(argc >= 4 && argv[3][0] != '-' ? argv[3] : "status", machine);
 	}
 	if (strcmp(verb, "models") == 0) {
 		return cmd_models(argc, argv);

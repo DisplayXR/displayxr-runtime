@@ -563,6 +563,59 @@ TEST_CASE("conv_store: synchronous fetch (installer pre-fetch), prune, pack stat
 	CHECK(fs::exists(blobs / "README.txt"));
 }
 
+TEST_CASE("conv_store: a locally built model (local_build) is never a network failure (ADR-057 §5)")
+{
+	// A research-only model whose bytes a deterministic script builds on this
+	// box: no source serves them unless a mirror (blobBaseUrl / url) answers.
+	temp_dir dir;
+	const std::string bytes = blob_bytes('L');
+	const std::string sha = sha_hex(bytes);
+	const fs::path mirror = dir.path / "mirror";
+	fs::create_directories(mirror);
+	const std::string json = R"({
+  "schema": 2, "pack": "local", "provider": "open", "blobBaseUrl": "file://)" +
+	                         mirror.generic_u8string() + R"(",
+  "models": [ { "name": "built", "version": "1.0.0", "task": "splats-mono",
+    "local_build": { "script": "scripts/export_model.py", "deterministic": true },
+    "license": { "spdx": "LicenseRef-research", "commercial": false },
+    "variants": [ { "id": "int4", "files": [ { "format": "onnx", "sha256": ")" +
+	                         sha + R"(", "size": 1024 } ] } ] } ] })";
+	conv_pack p{};
+	char err[192] = {0};
+	REQUIRE(conv_pack_parse(json.c_str(), dir.path.u8string().c_str(), &p, err, sizeof(err)));
+	REQUIRE(p.model_count == 1);
+	CHECK(std::string(p.models[0].local_build) == "scripts/export_model.py");
+	CHECK_FALSE(p.models[0].commercial);
+
+	SECTION("without AllowResearchOnly: policy, whatever is on disk")
+	{
+		store_handle h(dir.path / "Models", true, false);
+		CHECK(conv_model_store_fetch_model(h.s, &p, &p.models[0], nullptr, false) == CONV_STORE_BLOB_POLICY);
+	}
+	SECTION("opted in, nothing built and no mirror: build-locally")
+	{
+		store_handle h(dir.path / "Models", true, true);
+		const auto r = conv_model_store_fetch_model(h.s, &p, &p.models[0], nullptr, false);
+		CHECK(r == CONV_STORE_BLOB_LOCAL_BUILD);
+		CHECK(std::string(conv_store_blob_result_str(r)) == "build-locally");
+	}
+	SECTION("opted in, the built blob is in the store: verified, ok")
+	{
+		const fs::path blobs = dir.path / "Models" / "blobs";
+		fs::create_directories(blobs);
+		write_file(blobs / sha, bytes);
+		write_file(blobs / (sha + ".ok"), sha + " 1024\n");
+		store_handle h(dir.path / "Models", true, true);
+		CHECK(conv_model_store_fetch_model(h.s, &p, &p.models[0], nullptr, false) == CONV_STORE_BLOB_OK);
+	}
+	SECTION("opted in, a mirror answers: fetched like any blob")
+	{
+		write_file(mirror / (sha + ".onnx"), bytes);
+		store_handle h(dir.path / "Models", true, true);
+		CHECK(conv_model_store_fetch_model(h.s, &p, &p.models[0], nullptr, false) == CONV_STORE_BLOB_OK);
+	}
+}
+
 TEST_CASE("conv_store: process glue serves the host ops")
 {
 	fake_pack fp;

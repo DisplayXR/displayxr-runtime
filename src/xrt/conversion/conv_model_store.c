@@ -604,6 +604,13 @@ conv_pack_parse(const char *json, const char *base_dir, struct conv_pack *out, c
 		pm->prefetch = jbool(m, "prefetch", false);
 		// ADR-057 §5: an optional per-model URL and auth block.
 		jstr(m, "url", pm->url, sizeof(pm->url));
+		const cJSON *lb = cJSON_GetObjectItemCaseSensitive(m, "local_build");
+		if (cJSON_IsObject(lb)) {
+			jstr(lb, "script", pm->local_build, sizeof(pm->local_build));
+			if (pm->local_build[0] == '\0') {
+				(void)snprintf(pm->local_build, sizeof(pm->local_build), "%s", "its local build");
+			}
+		}
 		const cJSON *auth = cJSON_GetObjectItemCaseSensitive(m, "auth");
 		if (auth != NULL) {
 			char kind[32] = {0};
@@ -910,6 +917,7 @@ conv_store_blob_result_str(enum conv_store_blob_result r)
 	case CONV_STORE_BLOB_IO: return "io";
 	case CONV_STORE_BLOB_CANCELLED: return "cancelled";
 	case CONV_STORE_BLOB_AUTH: return "auth";
+	case CONV_STORE_BLOB_LOCAL_BUILD: return "build-locally";
 	default: return "unknown";
 	}
 }
@@ -2616,6 +2624,11 @@ conv_model_store_fetch_model(struct conv_model_store *s,
 				worst = r;
 			}
 		}
+	}
+	// ADR-057 §5: a locally built model has no published bytes; when no mirror
+	// answered, the caller is told to build it, not that the network failed.
+	if (m->local_build[0] != '\0' && (worst == CONV_STORE_BLOB_NETWORK || worst == CONV_STORE_BLOB_POLICY)) {
+		worst = CONV_STORE_BLOB_LOCAL_BUILD;
 	}
 	if (worst == CONV_STORE_BLOB_OK) {
 		(void)conv_model_store_ensure_root(s);

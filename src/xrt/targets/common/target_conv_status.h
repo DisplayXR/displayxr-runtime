@@ -33,6 +33,7 @@
 #include "target_component_loader.h" // enum target_component_activate_result
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -52,8 +53,10 @@ struct xrt_conversion_plugin_entry;
 
 /*!
  * The effective §3.1 policy, already resolved (HKCU over HKLM unless
- * `Policy\Lock`). Windows reads the registry; POSIX leaves it empty (the
- * manifests carry `enabled`; root policy on POSIX is a later phase).
+ * `Policy\Lock`). Windows reads the registry. Desktop POSIX reads one root
+ * value, `AllowResearchOnly`, from the per-user file
+ * @ref TARGET_CONV_RESEARCH_FILE (spec §3.5); the rest stays at its default
+ * there (the manifests carry `enabled`).
  */
 struct target_conv_policy
 {
@@ -133,11 +136,33 @@ bool
 target_conv_policy_enabled(const struct target_conv_policy *policy, const char *id, bool dflt);
 
 /*!
- * Read the effective policy (Windows registry; POSIX: zeroed). Never fails;
- * an unreadable value is "absent".
+ * Read the effective policy (Windows registry; desktop POSIX: the per-user
+ * `AllowResearchOnly` file, the rest default). Never fails; an unreadable
+ * value is "absent".
  */
 void
 target_conv_policy_read(struct target_conv_policy *out);
+
+/*!
+ * POSIX `AllowResearchOnly` (spec §3.5): a file of this name in the per-user
+ * manifest dir (target_component_user_dir), the `force_qwerty` /
+ * `emulated_controllers` convention — but opt-IN: on only when its first
+ * byte is '1'; absent, empty or anything else is off. What
+ * `displayxr-cli conv research on|off` writes. No machine tier: a package
+ * never writes a user's home, so a signed installer cannot turn it on.
+ */
+#define TARGET_CONV_RESEARCH_FILE "conversion-allow-research-only"
+
+//! The POSIX file's verdict from its contents (@p len bytes; pure, for tests).
+bool
+target_conv_research_file_parse(const char *bytes, size_t len);
+
+/*!
+ * Absolute path of @ref TARGET_CONV_RESEARCH_FILE; false where there is no
+ * per-user dir (Windows, Android, no HOME). @p create_dir makes the dir.
+ */
+bool
+target_conv_research_file_path(char *out, size_t cap, bool create_dir);
 
 /*!
  * The per-user `Enabled` override @p policy carries for @p id: 1 (HKCU
@@ -158,6 +183,23 @@ void
 target_conv_store_configure(const struct xrt_conversion_plugin_entry *entries,
                             int count,
                             const struct target_conv_policy *policy);
+
+/*!
+ * The headless host (target_conv_status_headless_host) plus what the
+ * satellite host answers for its one provider (spec §2.7, §5.4): `get_path`
+ * (scratch + model-store root; no log directory) and `model_resolve` /
+ * `model_request` against this process's model store, configured with
+ * @p e's packs under @p policy. For a headless run that hosts @p e for real
+ * (`conv run`); the store stays read-only to the provider — this process
+ * verifies / downloads as the store's writer, like the satellite. Pair with
+ * @ref target_conv_store_headless_release. Single provider, single thread.
+ */
+const struct xrt_conversion_plugin_host_iface *
+target_conv_store_headless_host(const struct xrt_conversion_plugin_entry *e, const struct target_conv_policy *policy);
+
+//! Shut the process model store down again (after the provider was destroyed).
+void
+target_conv_store_headless_release(void);
 
 /*!
  * ADR-053 P4: fill @p snap's model-store root + pack rows from disk: the
