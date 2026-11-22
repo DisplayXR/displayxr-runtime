@@ -23,7 +23,15 @@
  *
  * `activate` accepts exactly @ref SIM_LICENSE_TEST_KEY (when `LICENSE_SIM` is
  * set) and flips the state to `licensed`, source `key`, for the life of the
- * process: the script keeps nothing on disk, which a real provider would.
+ * process. By default the script keeps nothing on disk.
+ *
+ * A real provider keeps its activation itself, across processes; the script
+ * can stand in for that with an optional LICENCE STORE: a provider that reads
+ * a `LICENSE_STORE` setting (a file path) calls @ref sim_license_store_write
+ * when `activate` accepts and @ref sim_license_store_read when it loads, so
+ * an activation delivered in one process (the `displayxr://activate`
+ * handler) is the licence state of the next (ADR-064 §5,
+ * activation-deep-link.md §7). The file holds a fixed marker, never the key.
  */
 
 #pragma once
@@ -42,6 +50,15 @@
 #define SIM_LICENSE_PURCHASE_URL "https://example.invalid/displayxr/sim-licence"
 #define SIM_LICENSE_TRIAL_END_UNIX_S 4102444800ll //!< 2100-01-01T00:00:00Z
 #define SIM_LICENSE_EXPIRED_AT_UNIX_S 946684800ll //!< 2000-01-01T00:00:00Z
+
+//! What a licence store file holds once an activation was accepted. Not the key.
+#define SIM_LICENSE_STORE_MARKER "displayxr-sim-licence-v1 activated\n"
+//! The optional third setting, for a provider that keeps a licence store.
+#define SIM_LICENSE_STORE_SETTING_DESC                                                                                 \
+	{                                                                                                              \
+		"LICENSE_STORE", XRT_COMPONENT_SETTING_TYPE_STRING, "",                                                \
+		    "file the scripted licence keeps an accepted activation in (unset = this process only)"            \
+	}
 
 //! The two settings a provider adds to its `describe_settings` table.
 #define SIM_LICENSE_SETTING_DESCS                                                                                      \
@@ -167,4 +184,36 @@ sim_license_activate(struct sim_license *c,
 		(void)sim_license_get(c, out_state);
 	}
 	return why == NULL;
+}
+
+//! Does the licence store at @p path (NULL / "" = none) hold an accepted activation?
+static inline bool
+sim_license_store_read(const char *path)
+{
+	if (path == NULL || path[0] == '\0') {
+		return false;
+	}
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return false;
+	}
+	char buf[sizeof(SIM_LICENSE_STORE_MARKER) + 1];
+	const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+	(void)fclose(f);
+	return n == sizeof(SIM_LICENSE_STORE_MARKER) - 1 && memcmp(buf, SIM_LICENSE_STORE_MARKER, n) == 0;
+}
+
+//! Record an accepted activation in the licence store at @p path (NULL / "" = none). False when not written.
+static inline bool
+sim_license_store_write(const char *path)
+{
+	if (path == NULL || path[0] == '\0') {
+		return false;
+	}
+	FILE *f = fopen(path, "wb");
+	if (f == NULL) {
+		return false;
+	}
+	const size_t n = fwrite(SIM_LICENSE_STORE_MARKER, 1, sizeof(SIM_LICENSE_STORE_MARKER) - 1, f);
+	return fclose(f) == 0 && n == sizeof(SIM_LICENSE_STORE_MARKER) - 1;
 }

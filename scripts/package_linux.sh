@@ -16,6 +16,8 @@
 #   bin/displayxr-dashboard  (the DisplayXR Dashboard: self-contained .NET single
 #       file, beside the displayxr-cli it runs; from resolve_dashboard_bin.sh)
 #   share/applications/displayxr-dashboard.desktop.in + share/icons/displayxr-dashboard.png
+#   share/applications/displayxr-url-handler.desktop.in  (the displayxr:// URL scheme,
+#       ADR-064 §5: install.sh writes it with the installed displayxr-cli path)
 #       (install.sh writes the menu entry with the installed path)
 #   lib/openxr_displayxr.so
 #   lib/libVkLayer_DXR_queue_lock.so + share/vulkan/VkLayer_DXR_queue_lock.json.in
@@ -186,6 +188,9 @@ if [ -n "$DASHBOARD_BIN" ]; then
     cp "$ROOT/scripts/linux/dashboard/displayxr-dashboard.desktop.in" "$STAGE/share/applications/"
     cp "$ROOT/scripts/linux/dashboard/displayxr-dashboard.png" "$STAGE/share/icons/"
 fi
+# ADR-064 §5: the displayxr:// URL-scheme handler entry (install.sh fills in the path).
+mkdir -p "$STAGE/share/applications"
+cp "$ROOT/scripts/linux/activation/displayxr-url-handler.desktop.in" "$STAGE/share/applications/"
 cp "$SERVICE_BIN" "$STAGE/bin/"
 cp "$HOST_BIN" "$STAGE/bin/"
 cp "$TRACKHOST_BIN" "$STAGE/bin/"

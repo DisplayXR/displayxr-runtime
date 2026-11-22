@@ -554,6 +554,16 @@ ipc_server_set_component_reselect_provider(ipc_server_component_reselect_fn fn)
 	s_component_reselect_provider = fn;
 }
 
+// ADR-064 §5: the service's live-activation hooks (see the
+// system_component_activate_* handlers at the end of this file).
+static const struct ipc_server_component_activate_provider *s_component_activate_provider = NULL;
+
+void
+ipc_server_set_component_activate_provider(const struct ipc_server_component_activate_provider *provider)
+{
+	s_component_activate_provider = provider;
+}
+
 void
 ipc_server_set_workspace_launch_provider(ipc_server_workspace_launch_fn fn)
 {
@@ -9981,6 +9991,10 @@ ipc_server_client_lift_release(volatile struct ipc_client_state *ics)
 	}
 	// The conversion core's streams / jobs of this connection die with it.
 	ipc_server_conv_client_gone(ipc_server_get_conv(), ics->lift_owner);
+	// ADR-064 §5: a token this connection staged for a live activation goes with it.
+	if (s_component_activate_provider != NULL && s_component_activate_provider->client_gone != NULL) {
+		s_component_activate_provider->client_gone(ics->lift_owner);
+	}
 	ics->lift_owner = 0;
 }
 
@@ -10963,4 +10977,82 @@ ipc_handle_workspace_get_window_placement(volatile struct ipc_client_state *_ics
 	free(list);
 	return XRT_SUCCESS;
 #endif
+}
+
+/*
+ * ADR-064 §5 (docs/specs/runtime/activation-deep-link.md §6): live activation.
+ * The deep-link handler has already consumed a pending nonce and knows which
+ * component the token is for; these three calls hand the token to the
+ * instance that is live in this service. DIAG only, session-free. The token
+ * is opaque: never logged, never parsed, and the staging buffer is the
+ * provider's (zeroed when it is done with it). None of the three blocks.
+ */
+static_assert(sizeof(struct ipc_system_component_activate_put_msg) <= IPC_BUF_SIZE,
+              "system_component_activate_put exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_system_component_activate_commit_msg) <= IPC_BUF_SIZE,
+              "system_component_activate_commit exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_system_component_activate_poll_reply) <= IPC_BUF_SIZE,
+              "system_component_activate_poll reply exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_system_component_activate_put(volatile struct ipc_client_state *ics,
+                                         const struct ipc_component_activate_chunk *chunk,
+                                         uint32_t *out_status)
+{
+	*out_status = IPC_COMPONENT_ACTIVATE_UNSUPPORTED;
+	xrt_result_t xret = require_status_diag(ics, "system_component_activate_put");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (s_component_activate_provider == NULL) {
+		return XRT_SUCCESS;
+	}
+	if (chunk->size == 0 || chunk->size > IPC_COMPONENT_ACTIVATE_CHUNK_MAX) {
+		*out_status = IPC_COMPONENT_ACTIVATE_BAD_REQUEST;
+		return XRT_SUCCESS;
+	}
+	*out_status = s_component_activate_provider->put(lift_owner(ics), chunk->offset, chunk->bytes, chunk->size);
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_system_component_activate_commit(volatile struct ipc_client_state *ics,
+                                            const struct ipc_component_activate_target *target,
+                                            uint32_t *out_status)
+{
+	*out_status = IPC_COMPONENT_ACTIVATE_UNSUPPORTED;
+	xrt_result_t xret = require_status_diag(ics, "system_component_activate_commit");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (s_component_activate_provider == NULL) {
+		return XRT_SUCCESS;
+	}
+	char id[sizeof(target->id) + 1];
+	memcpy(id, target->id, sizeof(target->id));
+	id[sizeof(target->id)] = '\0'; // never trust the wire to terminate
+	*out_status =
+	    s_component_activate_provider->commit(lift_owner(ics), target->component_class, id, target->token_size);
+	// One line per activation: who asked, for what, and whether it was taken. Never the token.
+	IPC_WARN(ics->server, "system_component_activate_commit: class %u, %u-byte token, by pid %ld: status %u.",
+	         (unsigned)target->component_class, (unsigned)target->token_size, (long)ics->client_state.pid,
+	         (unsigned)*out_status);
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_system_component_activate_poll(volatile struct ipc_client_state *ics,
+                                          struct ipc_component_activate_result *out_outcome)
+{
+	memset(out_outcome, 0, sizeof(*out_outcome));
+	out_outcome->status = IPC_COMPONENT_ACTIVATE_UNSUPPORTED;
+	xrt_result_t xret = require_status_diag(ics, "system_component_activate_poll");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (s_component_activate_provider == NULL) {
+		return XRT_SUCCESS;
+	}
+	s_component_activate_provider->poll(lift_owner(ics), out_outcome);
+	return XRT_SUCCESS;
 }

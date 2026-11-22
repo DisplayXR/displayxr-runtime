@@ -266,6 +266,13 @@ list(APPEND tests tests_u_capture_intent_tag)
 if(TARGET target_workspace_config AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	list(APPEND tests tests_service_orchestrator_linux tests_service_hotkey_linux)
 endif()
+# ADR-064 §5 -- the displayxr://activate deep link: the strict link parser
+# against a table of hostile links, the per-user pending-nonce store, the
+# handler end to end against a scripted component, and the service's
+# live-activation slot.
+if(TARGET activation_handler)
+	list(APPEND tests tests_activation)
+endif()
 # ADR-051 D6: the service's DRM hotplug feeder -- the kernel-uevent parser and
 # the polling fallback's status hash, against recorded uevent payloads.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
@@ -790,6 +797,19 @@ if(TARGET tests_component_license)
 	target_link_libraries(tests_component_license PRIVATE target_lists xrt-interfaces aux_util xrt-external-cjson)
 	# sim_common/sim_license.h: the header-only reference script.
 	target_include_directories(tests_component_license PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers)
+endif()
+if(TARGET tests_activation)
+	# The service's slot is a service-target source, compiled in (it depends
+	# on nothing of the service but aux_os / aux_util).
+	target_sources(
+		tests_activation PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_component_activate.c
+		)
+	target_link_libraries(tests_activation PRIVATE activation_handler xrt-interfaces aux_util aux_os)
+	target_include_directories(
+		tests_activation PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service
+					 ${PROJECT_SOURCE_DIR}/src/xrt/drivers
+		)
+	set_target_properties(tests_activation PROPERTIES CXX_STANDARD 17)
 endif()
 if(TARGET tests_input_emulated_controllers)
 	target_link_libraries(tests_input_emulated_controllers PRIVATE target_lists xrt-interfaces aux_util)
@@ -2117,6 +2137,8 @@ set_target_properties(tests_conv_store PROPERTIES CXX_STANDARD 17)
 # pipeline, policy, jobs) against a scriptable CPU fake provider.
 target_sources(tests_conv_lanes PRIVATE conv_fake_provider.c)
 target_link_libraries(tests_conv_lanes PRIVATE displayxr::conversion_runtime)
+# sim_common/sim_license.h: the scripted licence of the live-activation case (ADR-064 §5).
+target_include_directories(tests_conv_lanes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers)
 # #2030: the still-image dedupe measured against the shipped sim provider.
 if(TARGET sim_conversion_static)
 	target_link_libraries(tests_conv_lanes PRIVATE sim_conversion_static)

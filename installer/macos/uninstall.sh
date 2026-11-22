@@ -28,6 +28,14 @@ if [ -f "$CAPTURE_AGENT" ]; then
     sudo rm -f "$CAPTURE_AGENT"
 fi
 pkill -x DisplayXRDesktopCapture 2>/dev/null || true
+# displayxr:// URL scheme (ADR-064 §5): drop the handler bundle from Launch
+# Services (per user: as the invoking user, not via sudo) before its files go.
+ACTIVATE_APP="/Library/Application Support/DisplayXR/bin/DisplayXRActivate.app"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ -d "$ACTIVATE_APP" ] && [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -u "$ACTIVATE_APP" >/dev/null 2>&1 || true
+fi
+pkill -x DisplayXRActivate 2>/dev/null || true
 # Forget the helper's Screen Recording grant and its one-time-prompt marker, so
 # a later reinstall asks again instead of silently staying NOT_GRANTED. Both
 # are per-user state: run as the invoking user, not via sudo.

@@ -509,6 +509,19 @@ line of a file, so it need not appear on a command line. Exit 0 means
 accepted. The JSON form is
 `{"id", "class", "result": "ok|refused|unsupported|bad-token|not-loaded", "accepted", "error", "licence": {…}}`.
 
+**Activation by deep link.** A component that sets
+`XRT_COMPONENT_LICENSE_ACTIVATION_DEEP_LINK` and reports an `https`
+`purchase_url` can be activated from its vendor's checkout page:
+`displayxr-cli <class> activate-begin <id>` creates a one-time nonce and the
+URL to open, the page returns through `displayxr://activate?nonce=…&token=…`,
+and the registered handler delivers the token to that component's `activate`
+slot: to the live instance in a running service when there is one, else in the
+handler's own process. The link's grammar, the nonce's lifecycle, the threat
+model and what a vendor's page must do are in
+[activation-deep-link.md](activation-deep-link.md). The token in a link should
+be a one-time redemption code, not a reusable key; a reusable key belongs in a
+`secret` setting.
+
 **Where the state shows.**
 
 | Surface | What |
@@ -537,10 +550,9 @@ no output.
 
 **Not yet (documented gaps).**
 
-- The `displayxr://activate` deep-link handler and the service-side delivery
-  of a token to a provider that is already running (ADR-064 step 7). Today
-  `activate` reaches the binary in the CLI's process; the satellite channel
-  already carries `ACTIVATE` for that step to use.
+- A viewer-tracking provider that runs in `displayxr-tracking-host` has no
+  control channel, so an activation reaches it at the next service start
+  (activation-deep-link.md §6.4).
 - Live re-selection of a display processor or a tracking provider on a
   licence change (table above): next session / next scan.
 - Entitlement detail in the app-facing `XR_DXR_lift` task enumeration (trial,

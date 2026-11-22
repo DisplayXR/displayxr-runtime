@@ -275,7 +275,9 @@ jobs:
           # import and shows only on the link line.
           # displayxr-tracking-host (tracking-provider-discovery §4a) loads providers
           # only through the tracking loader, exactly like the service.
-          $trunk = @("_package/bin/DisplayXRClient.dll", "_package/bin/displayxr-service.exe", "_package/bin/displayxr-cli.exe", "_package/bin/displayxr-tracking-host.exe")
+          # displayxr-activate (ADR-064 §5, the displayxr:// URL-scheme handler) delivers
+          # an activation token through the same loaders, and is held to the same rule.
+          $trunk = @("_package/bin/DisplayXRClient.dll", "_package/bin/displayxr-service.exe", "_package/bin/displayxr-cli.exe", "_package/bin/displayxr-tracking-host.exe", "_package/bin/displayxr-activate.exe")
           $forbiddenDeps = "SimulatedReality|LeapC|DisplayXR-Sim|DisplayXR-Ultraleap|DisplayXR-LeiaSR|DimencoWeaving"
           $forbiddenLibs = "drv_sim_display\.lib|drv_leia|drv_ultraleap|SimulatedReality|LeapC|drv_sim_input|drv_sim_conversion|drv_sim_tracking"
           $ninjaFile = "build/CMakeFiles/impl-Release.ninja"
@@ -1120,6 +1122,147 @@ jobs:
             $tlc = Lic $tl "providers" "sim-tracking"
             Expect (($tlc.state -eq "trial") -and ($tlc.expires -eq "2100-01-01T00:00:00Z") -and (-not $tlc.blocks)) "licence: the trial carries its end (state='$($tlc.state)' expires='$($tlc.expires)')"
             reg delete "$trRoot\sim-tracking\Settings" /v LICENSE_SIM /f | Out-Null
+
+            # 8. The displayxr://activate deep link (ADR-064 §5,
+            # docs/specs/runtime/activation-deep-link.md), on the real loaders and
+            # the real per-user store, headless (no service: the handler delivers
+            # in its own process, and the reference provider keeps the activation
+            # in its own licence store, LICENSE_STORE, as a real provider would):
+            #  - activate-begin: a one-time nonce and the vendor's purchase URL
+            #    with the three displayxr_* parameters; refused for a component
+            #    that does not advertise deep-link activation;
+            #  - the round trip: begin -> link -> handler -> the provider reads
+            #    licensed in a LATER process -> its tasks are selected again;
+            #  - a link never works twice, never reaches another component, and a
+            #    wrong action / an oversized link / a guessed nonce reach nothing;
+            #  - five failed links make further FAILED links quiet (no dialog), and
+            #    never stop a link whose nonce is pending: it is accepted and
+            #    shown in the middle of the flood;
+            #  - `activate-url -` reads the link from standard input;
+            #  - the registered handler program is a GUI-subsystem binary that
+            #    exits non-zero on a hostile command line without showing anything
+            #    while failed links are quiet;
+            #  - neither the token nor the nonce appears in the store or its log.
+            function ActUrl([string]$url) {
+              $raw = (& $cli activate-url --json $url 2>$null | Out-String)
+              $script:actExit = $LASTEXITCODE
+              $s = $raw.IndexOf('{'); $e = $raw.LastIndexOf('}')
+              if ($s -lt 0 -or $e -le $s) { throw "activate-url --json emitted no JSON object" }
+              return ($raw.Substring($s, $e - $s + 1) | ConvertFrom-Json)
+            }
+            function NonceOf($begin) {
+              if ($begin.url -match 'displayxr_nonce=([A-Za-z0-9_-]{43})(&|$)') { return $Matches[1] }
+              return ""
+            }
+            function Pending { @(Get-ChildItem -Path $actDir -Filter *.pending -ErrorAction SilentlyContinue).Count }
+            $actDir = Join-Path $env:LOCALAPPDATA "DisplayXR\Activation"
+            $simStore = Join-Path $env:RUNNER_TEMP "dxr-sim-licence.txt"
+            Remove-Item $actDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item $simStore -Force -ErrorAction SilentlyContinue
+            reg add "$cvRoot\sim-conversion\Settings" /v LICENSE_SIM /t REG_SZ /d "unlicensed" /f | Out-Null
+            reg add "$cvRoot\sim-conversion\Settings" /v LICENSE_STORE /t REG_SZ /d "$simStore" /f | Out-Null
+            $cl = ConvRowList
+            Expect (((Lic $cl "providers" "sim-conversion").state -eq "unlicensed") -and ((Sel (OwnTasks $cl "sim-conversion")) -eq 0)) "deep link: baseline, sim-conversion is unlicensed and selected for nothing"
+            Expect ((Lic $cl "providers" "sim-conversion").activation.deep_link) "deep link: the provider advertises deep-link activation"
+
+            $nb = Cli-Json @("input", "activate-begin", "sim-input")
+            Expect (($nb.result -eq "no-deep-link") -and ($nb.url -eq "")) "deep link: activate-begin is refused for a component that does not advertise it (got '$($nb.result)')"
+            $nb = Cli-Json @("conv", "activate-begin", "no-such-provider")
+            Expect ($nb.result -eq "not-registered") "deep link: activate-begin is refused for an unregistered id (got '$($nb.result)')"
+            Expect ((Pending) -eq 0) "deep link: a refused begin leaves nothing pending"
+
+            $b = Cli-Json @("conv", "activate-begin", "sim-conversion")
+            $nonce = NonceOf $b
+            Expect (($b.result -eq "ok") -and ($nonce -ne "") -and ($b.url -like "https://*") -and ($b.url -like "*&displayxr_item=conv%2Fsim-conversion&displayxr_return=displayxr%3A%2F%2Factivate") -and ($b.ttl_s -eq 900) -and ($b.return_url -eq "displayxr://activate")) "deep link: activate-begin returns the vendor URL with the nonce, the item and the return link (result='$($b.result)' url='$($b.url -replace 'displayxr_nonce=[^&]*', 'displayxr_nonce=<nonce>')')"
+            Expect ((Pending) -eq 1) "deep link: one pending record in the user's own store ($actDir)"
+            $onDisk = (Get-ChildItem -Path $actDir -File | ForEach-Object { $_.Name + "`n" + (Get-Content $_.FullName -Raw) }) -join "`n"
+            Expect (($nonce -ne "") -and (-not $onDisk.Contains($nonce))) "deep link: the nonce itself is not on disk (neither a file name nor a record holds it)"
+
+            $r = ActUrl "displayxr://open?nonce=$nonce&token=$secretKey"
+            Expect (($r.result -eq "invalid-link") -and ($r.detail -eq "bad-action") -and ($script:actExit -ne 0) -and ((Pending) -eq 1)) "deep link: an action other than 'activate' is refused and spends nothing (result='$($r.result)' detail='$($r.detail)')"
+            $r = ActUrl "displayxr://activate?nonce=$nonce&token=not-the-key"
+            Expect (($r.result -eq "refused") -and ($r.class -eq "conv") -and ($r.id -eq "sim-conversion") -and ($r.error -ne "") -and ($script:actExit -ne 0)) "deep link: a wrong token reaches the bound provider, which refuses it with its own line (result='$($r.result)' error='$($r.error)')"
+            $r = ActUrl "displayxr://activate?nonce=$nonce&token=$secretKey"
+            Expect (($r.result -eq "not-pending") -and ($r.detail -eq "not-found") -and ((Pending) -eq 0)) "deep link: the nonce was spent by its first use; the right key on the same link does nothing (result='$($r.result)')"
+
+            $b = Cli-Json @("conv", "activate-begin", "sim-conversion")
+            $r = ActUrl "displayxr://activate?nonce=$(NonceOf $b)&token=$secretKey&item=dp%2Fsim-display"
+            Expect (($r.result -eq "item-mismatch") -and ((Pending) -eq 0)) "deep link: a link naming another component is refused, and the nonce is spent (result='$($r.result)')"
+            $cl = ConvRowList
+            Expect ((Lic $cl "providers" "sim-conversion").state -eq "unlicensed") "deep link: nothing above licensed the provider"
+
+            $b = Cli-Json @("conv", "activate-begin", "sim-conversion")
+            $good = NonceOf $b
+            $r = ActUrl "displayxr://activate?nonce=$good&token=$secretKey&item=conv%2Fsim-conversion"
+            Expect (($r.result -eq "activated") -and $r.accepted -and ($r.via -eq "process") -and ($r.licence.state -eq "licensed") -and ($r.licence.source -eq "key") -and ($script:actExit -eq 0) -and ($r.message -like "*sim-conversion*")) "deep link: begin -> link -> handler: the provider accepts and reads licensed/key (result='$($r.result)' via='$($r.via)' state='$($r.licence.state)')"
+            $cl = ConvRowList
+            $lc = Lic $cl "providers" "sim-conversion"
+            Expect (($lc.state -eq "licensed") -and ($lc.source -eq "key") -and (-not $lc.blocks)) "deep link: a later process sees the provider licensed (its own licence store) (state='$($lc.state)')"
+            Expect ((Sel (OwnTasks $cl "sim-conversion")) -eq $baseSel) "deep link: selection follows, sim-conversion is selected as before"
+            $r = ActUrl "displayxr://activate?nonce=$good&token=$secretKey"
+            Expect ($r.result -eq "not-pending") "deep link: the accepted link cannot be replayed (result='$($r.result)')"
+            $r = ActUrl ("displayxr://activate?nonce=$good&token=" + ("A" * 7000))
+            Expect (($r.result -eq "invalid-link") -and ($r.detail -eq "too-long")) "deep link: an oversized link is refused (detail='$($r.detail)')"
+
+            # The failure count only silences FAILED links; it never stops a link
+            # from being read. Four links that named no pending activation have
+            # failed by now (bad action, two replays, the oversized one; the item
+            # mismatch held a real nonce and is not counted). The fifth still
+            # answers; from the sixth on, a failed link is quiet.
+            $b = Cli-Json @("conv", "activate-begin", "sim-conversion")
+            $held = NonceOf $b
+            $r = ActUrl "displayxr://x"
+            Expect (($r.result -eq "invalid-link") -and (-not $r.quiet)) "deep link: the fifth failed link still answers (result='$($r.result)' quiet=$($r.quiet))"
+            $r = ActUrl "displayxr://x"
+            Expect (($r.result -eq "invalid-link") -and $r.quiet -and ((Pending) -eq 1)) "deep link: after five failed links a further failed link is quiet and spends nothing (result='$($r.result)' quiet=$($r.quiet))"
+
+            # The registered handler program. GUI subsystem (no console window), and
+            # on a hostile command line (a quote-breaking link plus injected
+            # arguments) it exits non-zero; failed links being quiet now, it shows nothing.
+            $act = "_package/bin/displayxr-activate.exe"
+            Expect (Test-Path $act) "deep link: displayxr-activate.exe is built"
+            if (Test-Path $act) {
+              $hdr = (& dumpbin /headers $act 2>&1 | Out-String)
+              Expect ($hdr -match 'subsystem \(Windows GUI\)') "deep link: the handler is a GUI-subsystem program"
+              # The embedded manifest must not ask for elevation (asInvoker is the default).
+              $manFile = Join-Path $env:RUNNER_TEMP "displayxr-activate.manifest"
+              Remove-Item $manFile -Force -ErrorAction SilentlyContinue
+              & mt.exe -nologo "-inputresource:$act;#1" "-out:$manFile" 2>&1 | Out-Null
+              $man = if (Test-Path $manFile) { Get-Content $manFile -Raw } else { "" }
+              Expect (($man -ne "") -and (-not ($man -match 'requireAdministrator|highestAvailable'))) "deep link: the handler's manifest asks for no elevation"
+              # No argument, then two hostile command lines. $null = start with no arguments.
+              foreach ($hostile in @($null, '"displayxr://activate?nonce=x&token=y" --json extra', 'displayxr://activate?nonce=x" --json "&token=y')) {
+                $shown = if ($null -eq $hostile) { "<no argument>" } else { $hostile }
+                $p = if ($null -eq $hostile) { Start-Process -FilePath $act -PassThru } else { Start-Process -FilePath $act -ArgumentList $hostile -PassThru }
+                if (-not $p.WaitForExit(30000)) {
+                  try { $p.Kill() } catch {}
+                  Expect $false "deep link: displayxr-activate.exe did not exit on $shown (a dialog for a failed link during a flood?)"
+                } else {
+                  Expect ($p.ExitCode -ne 0) "deep link: displayxr-activate.exe exits non-zero on $shown (exit $($p.ExitCode))"
+                }
+              }
+              Expect ((Pending) -eq 1) "deep link: none of that spent the pending nonce"
+            }
+
+            # The flood is still on (nothing cleared the counter): the link whose
+            # nonce is pending goes through all the same, and is shown. A page that
+            # opens junk displayxr:// links cannot mute the user's real return link.
+            $r = ActUrl "displayxr://activate?nonce=$held&token=$secretKey"
+            Expect (($r.result -eq "activated") -and (-not $r.quiet) -and ((Pending) -eq 0)) "deep link: a pending link is accepted and shown during a flood of failed links (result='$($r.result)' quiet=$($r.quiet))"
+            # The link on standard input ("-"), where the process list does not show it.
+            $b = Cli-Json @("conv", "activate-begin", "sim-conversion")
+            $raw = ("displayxr://activate?nonce=$(NonceOf $b)&token=$secretKey" | & $cli activate-url --json - 2>$null | Out-String)
+            $s0 = $raw.IndexOf('{'); $e0 = $raw.LastIndexOf('}')
+            $r = if ($s0 -ge 0 -and $e0 -gt $s0) { $raw.Substring($s0, $e0 - $s0 + 1) | ConvertFrom-Json } else { $null }
+            Expect (($null -ne $r) -and ($r.result -eq "activated") -and ((Pending) -eq 0)) "deep link: 'activate-url -' takes the link from standard input (result='$($r.result)')"
+            $r = ActUrl "displayxr://activate?nonce=$held&token=$secretKey"
+            Expect (($r.result -eq "not-pending") -and $r.quiet) "deep link: replaying it during the flood is a quiet failure (result='$($r.result)' quiet=$($r.quiet))"
+            $log = (Get-Content (Join-Path $actDir "activation.log") -Raw)
+            Expect (($log -match 'class=conv id=sim-conversion outcome=activated') -and ($log -match 'outcome=[a-z-]+\.quiet') -and (-not $log.Contains($secretKey)) -and (-not $log.Contains($good)) -and (-not $log.Contains($held))) "deep link: the log records nonce id + component + outcome, and neither the token nor a nonce"
+            reg delete "$cvRoot\sim-conversion\Settings" /v LICENSE_SIM /f | Out-Null
+            reg delete "$cvRoot\sim-conversion\Settings" /v LICENSE_STORE /f | Out-Null
+            Remove-Item $simStore -Force -ErrorAction SilentlyContinue
+            Remove-Item $actDir -Recurse -Force -ErrorAction SilentlyContinue
           } finally {
             foreach ($k in @("$dpRoot\sim-display", "$dpRoot\sim-display-alt", "$dpRoot\abi-fixture-dp",
                              "$inRoot\sim-input", "$inRoot\sim-input-alt", "$inRoot\abi-fixture-input",

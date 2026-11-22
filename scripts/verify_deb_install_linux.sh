@@ -191,6 +191,22 @@ echo "=== displayxr-service: headless smoke (installed binaries, sim-display)"
 "$(dirname "$(readlink -f "$0")")/smoke_service_linux.sh" ||
     { echo "error: displayxr-service smoke failed on $PRETTY_NAME." >&2; fail=1; }
 
+# --- displayxr:// URL scheme (ADR-064 §5) ---------------------------------------
+# The handler entry is installed and well-formed, and the handler itself refuses
+# a hostile link without touching anything (no pending activation exists here).
+echo "=== displayxr:// URL scheme: handler entry + a refused link"
+URLH=/usr/share/applications/displayxr-url-handler.desktop
+grep -qx 'Exec=/usr/lib/displayxr/bin/displayxr-cli activate-url --notify %u' "$URLH" 2>/dev/null ||
+    { echo "error: $URLH missing or its Exec line is not the fixed handler command" >&2; fail=1; }
+grep -qx 'MimeType=x-scheme-handler/displayxr;' "$URLH" 2>/dev/null ||
+    { echo "error: $URLH does not declare x-scheme-handler/displayxr" >&2; fail=1; }
+if out="$(HOME="${HOME:-/root}" displayxr-cli activate-url --json 'displayxr://open?nonce=x&token=y' 2>/dev/null)"; then
+    echo "error: displayxr-cli activate-url accepted a link whose action is not 'activate'" >&2; fail=1
+else
+    echo "$out" | grep -q '"result":[[:space:]]*"invalid-link"' ||
+        { echo "error: a wrong-action link was not reported invalid-link: $out" >&2; fail=1; }
+fi
+
 # --- DisplayXR Dashboard ------------------------------------------------------
 echo "=== displayxr-dashboard: payload + --version (no display server)"
 DASH=/usr/lib/displayxr/bin/displayxr-dashboard

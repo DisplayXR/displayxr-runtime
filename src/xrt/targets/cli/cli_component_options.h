@@ -73,6 +73,12 @@ struct cli_component_class
 	                struct xrt_component_license_state *out_state,
 	                char *err,
 	                size_t err_cap);
+	/*!
+	 * ADR-064 §5: the licence state @p id reports (the class loader's
+	 * `target_*_license_state`), which carries its purchase URL and whether it
+	 * takes a deep-link activation. NULL = the class has no `activate-begin`.
+	 */
+	bool (*license)(const char *id, struct xrt_component_license_state *out);
 };
 
 //! `<class> options <id> [--json]`: every declared / stored key with type, default, value and source.
@@ -137,6 +143,26 @@ cli_component_license_cell(const struct xrt_component_license_state *lic, char *
  */
 int
 cli_component_activate(const struct cli_component_class *k, const char *id, const char *token_arg, bool json);
+
+/*!
+ * `<class> activate-begin <id> [--json]`: start a deep-link activation
+ * (ADR-064 §5, docs/specs/runtime/activation-deep-link.md §3). Creates a
+ * one-time nonce bound to this component and this user (15 minutes, single
+ * use, in the user's own profile) and prints the URL to open: the
+ * component's own purchase URL with `displayxr_nonce`, `displayxr_item` and
+ * `displayxr_return` appended. Nothing is opened or fetched here: the caller
+ * (the Dashboard) opens the URL in the user's browser.
+ *
+ * `--json`, stable for the Dashboard:
+ * `{"class", "id", "result", "url", "return_url", "nonce_id", "ttl_s",
+ * "expires_unix", "expires", "licence": {...}}`. `result` is `ok`,
+ * `not-registered`, `no-deep-link` (the component does not advertise it),
+ * `no-purchase-url` (none, or not an acceptable https URL), `too-many`
+ * (16 activations already pending) or `store-error`; `url` and `nonce_id`
+ * are "" and the times null unless `ok`. Exit 0 = `ok`.
+ */
+int
+cli_component_activate_begin(const struct cli_component_class *k, const char *id, bool json);
 
 #ifdef __cplusplus
 }

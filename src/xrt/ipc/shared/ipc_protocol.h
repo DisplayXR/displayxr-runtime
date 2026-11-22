@@ -31,6 +31,7 @@
 #include "xrt/xrt_share_link.h"
 #include "xrt/xrt_screen.h"
 #include "xrt/xrt_input_selection.h"
+#include "xrt/xrt_component_license.h"
 #include "xrt/xrt_config_build.h"
 
 #include <assert.h>
@@ -443,6 +444,72 @@ struct ipc_file_picker_result_path
 struct ipc_workspace_controller_id
 {
 	char id[64];
+};
+
+/*
+ * Live activation (ADR-064 §5, docs/specs/runtime/activation-deep-link.md §6):
+ * the deep-link handler, a DIAG client, hands an activation token to the
+ * component instance that is LIVE in the service. A token (up to
+ * XRT_COMPONENT_ACTIVATION_TOKEN_MAX - 1 bytes) does not fit one IPC message
+ * (IPC_BUF_SIZE), so it is staged in chunks, committed against one component,
+ * and the outcome is polled: the component's `activate` may block, and it
+ * never runs on an IPC thread.
+ *
+ *   system_component_activate_put     x N   (offset 0 starts a new staging)
+ *   system_component_activate_commit        (class + id + total size)
+ *   system_component_activate_poll    x M   (until status != PENDING)
+ */
+
+//! Bytes of token one `system_component_activate_put` carries.
+#define IPC_COMPONENT_ACTIVATE_CHUNK_MAX 768u
+
+/*!
+ * One chunk of a staged activation token.
+ *
+ * @ingroup ipc
+ */
+struct ipc_component_activate_chunk
+{
+	uint32_t offset; //!< where these bytes go; 0 discards anything staged and starts over
+	uint32_t size;   //!< 1 .. IPC_COMPONENT_ACTIVATE_CHUNK_MAX
+	uint8_t bytes[IPC_COMPONENT_ACTIVATE_CHUNK_MAX];
+};
+
+/*!
+ * The component a staged token is for.
+ *
+ * @ingroup ipc
+ */
+struct ipc_component_activate_target
+{
+	uint32_t component_class; //!< TARGET_COMPONENT_CLASS_* (target_component_loader.h)
+	uint32_t token_size;      //!< must equal the bytes staged, contiguous from 0
+	char id[64];              //!< the component's registration id; never trusted to be terminated
+};
+
+//! `status` of the three calls. Stable values.
+enum ipc_component_activate_status
+{
+	IPC_COMPONENT_ACTIVATE_NONE = 0,        //!< nothing staged or running for this connection
+	IPC_COMPONENT_ACTIVATE_PENDING = 1,     //!< put: staged; commit / poll: the component is being asked
+	IPC_COMPONENT_ACTIVATE_DONE = 2,        //!< poll: `result` + `state` + `error` are the component's answer
+	IPC_COMPONENT_ACTIVATE_NOT_HOSTED = 3,  //!< poll: no live instance here; the token was NOT delivered
+	IPC_COMPONENT_ACTIVATE_BUSY = 4,        //!< another activation is in progress; nothing was taken
+	IPC_COMPONENT_ACTIVATE_BAD_REQUEST = 5, //!< a malformed chunk / target; the staging was discarded
+	IPC_COMPONENT_ACTIVATE_UNSUPPORTED = 6, //!< this service has no live-activation path
+};
+
+/*!
+ * The outcome of a live activation (`system_component_activate_poll`).
+ *
+ * @ingroup ipc
+ */
+struct ipc_component_activate_result
+{
+	uint32_t status;                                //!< enum ipc_component_activate_status
+	uint32_t result;                                //!< enum target_component_activate_result, when status is DONE
+	struct xrt_component_license_state state;       //!< the component's licence state after the call (DONE)
+	char error[XRT_COMPONENT_ACTIVATION_ERROR_MAX]; //!< the component's one line when it refused (DONE)
 };
 
 /*!

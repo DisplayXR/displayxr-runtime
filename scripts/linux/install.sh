@@ -15,6 +15,8 @@
 #                              and enabled for this user (unless they disabled it)
 #     Dashboard menu entry  -> $XDG_DATA_HOME/applications/displayxr-dashboard.desktop
 #                              + icons/hicolor/256x256/apps/displayxr-dashboard.png
+#     displayxr:// handler  -> $XDG_DATA_HOME/applications/displayxr-url-handler.desktop
+#                              (x-scheme-handler/displayxr -> displayxr-cli activate-url)
 #
 #   sudo ./install.sh --system
 #     runtime + plug-in     -> /usr/local/{bin,lib}
@@ -28,6 +30,7 @@
 #                              + /etc/xdg/autostart entry enabling it once per user at login
 #     Dashboard menu entry  -> /usr/local/share/applications/displayxr-dashboard.desktop
 #                              + /usr/local/share/icons/hicolor/256x256/apps/displayxr-dashboard.png
+#     displayxr:// handler  -> /usr/local/share/applications/displayxr-url-handler.desktop
 #
 # The DisplayProcessors directory is a SHARED discovery root: a vendor plug-in
 # installer (e.g. Leia SR) drops its own .so + <probe-order>-<id>.json next to
@@ -280,6 +283,63 @@ if [ -x "$PREFIX/bin/displayxr-dashboard" ] && [ -f "$HERE/share/applications/di
         "$HERE/share/applications/displayxr-dashboard.desktop.in" >"$SHARE_ROOT/applications/displayxr-dashboard.desktop"
     cp "$HERE/share/icons/displayxr-dashboard.png" "$SHARE_ROOT/icons/hicolor/256x256/apps/displayxr-dashboard.png"
     echo "==> DisplayXR Dashboard: $SHARE_ROOT/applications/displayxr-dashboard.desktop"
+fi
+
+# --- displayxr:// URL scheme (ADR-064 §5) --------------------------------------
+# A vendor's checkout page returns an activation token through a
+# displayxr://activate link; this entry makes displayxr-cli its handler
+# (docs/specs/runtime/activation-deep-link.md §8). The path is this install's.
+if [ -f "$HERE/share/applications/displayxr-url-handler.desktop.in" ]; then
+    mkdir -p "$SHARE_ROOT/applications"
+    # $PREFIX is the user's (by default under $HOME): it may hold a space or
+    # any other character the Desktop Entry Specification reserves in Exec=.
+    # Exec gets the path as a quoted argument, with the four characters that
+    # stay special inside quotes (" ` $ \) backslash-escaped, then the string
+    # rule's own escaping (\ -> \\), and % doubled (a field-code introducer).
+    # TryExec is a plain string: only the backslash is escaped. A path with a
+    # newline cannot be written in a desktop entry at all: no scheme then.
+    CLI_BIN="$PREFIX/bin/displayxr-cli"
+    case "$CLI_BIN" in
+    *'
+'*)
+        echo "==> displayxr:// URL scheme: NOT registered (the install path contains a line break)"
+        ;;
+    *)
+        DXR_CLI_BIN="$CLI_BIN" awk '
+            function sub_all(s, from, to,    out, i) {
+                out = ""
+                while ((i = index(s, from)) > 0) {
+                    out = out substr(s, 1, i - 1) to
+                    s = substr(s, i + length(from))
+                }
+                return out s
+            }
+            BEGIN {
+                bin = ENVIRON["DXR_CLI_BIN"]
+                bs = sprintf("%c", 92)
+                # TryExec: string escaping only.
+                tryexec = sub_all(bin, bs, bs bs)
+                # Exec: quoted-argument escaping, then string escaping, then %%.
+                q = sub_all(bin, bs, bs bs)
+                q = sub_all(q, "\"", bs "\"")
+                q = sub_all(q, "`", bs "`")
+                q = sub_all(q, "$", bs "$")
+                q = sub_all(q, bs, bs bs)
+                q = sub_all(q, "%", "%%")
+                exec = "\"" q "\""
+            }
+            /^Exec=/    { print "Exec=" exec substr($0, index($0, "@CLI_BIN@") + 9); next }
+            /^TryExec=/ { print "TryExec=" tryexec; next }
+            { print }
+        ' "$HERE/share/applications/displayxr-url-handler.desktop.in" >"$SHARE_ROOT/applications/displayxr-url-handler.desktop"
+        ;;
+    esac
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database -q "$SHARE_ROOT/applications" >/dev/null 2>&1 || true
+    fi
+    if [ -f "$SHARE_ROOT/applications/displayxr-url-handler.desktop" ]; then
+        echo "==> displayxr:// URL scheme: $SHARE_ROOT/applications/displayxr-url-handler.desktop"
+    fi
 fi
 
 echo ""

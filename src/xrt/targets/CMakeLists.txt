@@ -11,6 +11,13 @@ if(XRT_FEATURE_OPENXR)
 	add_subdirectory(openxr)
 endif()
 
+# ADR-064 §5: the displayxr://activate deep-link handler (a library the CLI
+# links, plus the Windows program / macOS bundle the installers register for
+# the URL scheme). Desktop only; before `cli`, which tests for its target.
+if(XRT_MODULE_CLI AND NOT ANDROID)
+	add_subdirectory(activate)
+endif()
+
 if(XRT_MODULE_CLI)
 	add_subdirectory(cli)
 endif()

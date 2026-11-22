@@ -55,6 +55,11 @@
 #       it runs the displayxr-cli beside it)
 #   /usr/bin/displayxr-dashboard -> ../lib/displayxr/bin/displayxr-dashboard
 #   /usr/share/applications/displayxr-dashboard.desktop
+#   /usr/share/applications/displayxr-url-handler.desktop
+#       (the displayxr:// URL scheme, x-scheme-handler/displayxr: runs
+#       `displayxr-cli activate-url --notify %u` - ADR-064 §5,
+#       docs/specs/runtime/activation-deep-link.md §8; registered by the
+#       desktop-file-utils dpkg trigger, and by postinst when that is absent)
 #   /usr/share/icons/hicolor/256x256/apps/displayxr-dashboard.png
 #       (scripts/linux/dashboard/; the binary comes from
 #       resolve_dashboard_bin.sh — CI's DashboardLinux artifact)
@@ -304,6 +309,13 @@ install -m 0644 "$SIMCONV_PACK" "$STAGE/usr/lib/displayxr/plugins/sim-conversion
 mkdir -p "$STAGE/usr/lib/displayxr/plugins/sim-conversion-blobs"
 install -m 0644 "$(dirname "$SIMCONV_SO")/sim-conversion-blobs"/* "$STAGE/usr/lib/displayxr/plugins/sim-conversion-blobs/"
 install -m 0644 "$VKLAYER_SO"  "$STAGE/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so"
+# ADR-064 §5: the displayxr:// URL scheme. The handler is displayxr-cli itself
+# (`activate-url`), so the scheme ships with every .deb, dashboard or not.
+mkdir -p "$STAGE/usr/share/applications"
+sed 's|@CLI_BIN@|/usr/lib/displayxr/bin/displayxr-cli|g' \
+    "$ROOT/scripts/linux/activation/displayxr-url-handler.desktop.in" \
+    >"$STAGE/usr/share/applications/displayxr-url-handler.desktop"
+chmod 0644 "$STAGE/usr/share/applications/displayxr-url-handler.desktop"
 # The dashboard sits beside displayxr-cli, which it resolves next to itself.
 # Never strip it: the payload is appended to the ELF host.
 if [ -n "$DASHBOARD_BIN" ]; then
@@ -560,6 +572,11 @@ INSTALLED_KB="$(du -sk "$STAGE/usr" | cut -f1)"
 # release by verify_deb_install_linux.sh.
 RECOMMENDS=""
 [ -z "$DASHBOARD_BIN" ] || RECOMMENDS="libfontconfig1, libice6, libsm6, libx11-6, libxcursor1, libxi6, libxrandr2"
+# ADR-064 §5: the displayxr:// handler shows its outcome through notify-send
+# (libnotify-bin; zenity / kdialog are accepted too) and refuses to act when
+# it cannot show one. desktop-file-utils registers the scheme handler. Both
+# are on every Ubuntu desktop; Recommends keeps a headless install lean.
+RECOMMENDS="${RECOMMENDS:+$RECOMMENDS, }libnotify-bin, desktop-file-utils"
 
 # --- control ---------------------------------------------------------------
 cat > "$STAGE/DEBIAN/control" <<EOF
@@ -628,6 +645,12 @@ dxr_each_user_manager() {
 
 case "$1" in
 configure)
+    # ADR-064 §5: the displayxr:// scheme handler's .desktop entry is picked
+    # up by the desktop-file-utils trigger; refresh the MIME cache here too so
+    # the scheme resolves when that trigger did not run.
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+    fi
     mkdir -p "$CONF_DIR"
     # Preserve a pre-existing non-DisplayXR runtime so uninstall can restore it.
     if [ -f "$ACTIVE" ] && ! grep -q "openxr_displayxr.so" "$ACTIVE" 2>/dev/null; then
@@ -687,6 +710,11 @@ BACKUP="$ACTIVE.pre-displayxr.bak"
 
 case "$1" in
 remove|purge|upgrade|deconfigure)
+    # ADR-064 §5: the displayxr:// handler's .desktop entry is gone with the
+    # package files; drop it from the MIME cache too.
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+    fi
     if [ -f "$ACTIVE" ] && grep -q "openxr_displayxr.so" "$ACTIVE" 2>/dev/null; then
         rm -f "$ACTIVE"
         if [ -f "$BACKUP" ]; then

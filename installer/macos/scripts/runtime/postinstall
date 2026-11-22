@@ -63,6 +63,26 @@ if [ -x "$INSTALL_DIR/bin/displayxr-cli" ]; then
     ln -sfn "$INSTALL_DIR/bin/displayxr-cli" /usr/local/bin/displayxr-cli
 fi
 
+# displayxr:// URL scheme (ADR-064 §5): register the handler bundle with
+# Launch Services so a displayxr://activate link opens it. The Launch Services
+# database is PER USER and nothing scans the runtime's bin/ directory, so this
+# line covers exactly one case: the user at the console right now, without a
+# logout. It does nothing for any other user, for an install with nobody
+# logged in (MDM, ssh), or after the database is rebuilt. Those are covered by
+# displayxr-service, which re-registers the bundle for its own user at every
+# start (service_url_scheme_macos.c; the LaunchAgent starts it in each GUI
+# session). A runtime-only .pkg has no service: there, only this line
+# registers the scheme (activation-deep-link.md §8, known limitation).
+ACTIVATE_APP="$INSTALL_DIR/bin/DisplayXRActivate.app"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ -d "$ACTIVATE_APP" ] && [ -x "$LSREGISTER" ]; then
+    ACT_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+    if [ -n "$ACT_USER" ] && [ "$ACT_USER" != "root" ]; then
+        ACT_UID="$(id -u "$ACT_USER" 2>/dev/null || true)"
+        [ -n "$ACT_UID" ] && launchctl asuser "$ACT_UID" sudo -u "$ACT_USER" "$LSREGISTER" -f "$ACTIVATE_APP" >/dev/null 2>&1 || true
+    fi
+fi
+
 # Desktop-capture helper (#2264): load its on-demand agent into the console
 # user's GUI domain now so the Mach service exists without a logout. Loading
 # does not start the helper (no RunAtLoad), and so does not prompt for Screen

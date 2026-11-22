@@ -3127,3 +3127,97 @@ TEST_CASE("stream: a discontinuity latest-wins skipped rides on the next result 
 	}
 	conv_fake_fini(&f);
 }
+
+/*
+ * ADR-064 §5 (activation-deep-link.md §6): the delivery the service makes to
+ * a LIVE conversion provider. A provider ranked first but unlicensed is
+ * skipped; conv_core_activate_provider hands its token to the live instance
+ * through its host, and the task re-selects it without a restart.
+ */
+#include "sim_common/sim_license.h"
+
+namespace {
+
+sim_license g_live_license;
+
+bool
+live_get_license(struct xrt_component_license_state *out)
+{
+	return sim_license_get(&g_live_license, out);
+}
+
+bool
+live_activate(const char *token,
+              uint32_t token_size,
+              struct xrt_component_license_state *out_state,
+              char *out_error,
+              uint32_t error_size)
+{
+	return sim_license_activate(&g_live_license, token, token_size, out_state, out_error, error_size);
+}
+
+} // namespace
+
+TEST_CASE("core: a live activation licenses a provider and the task re-selects it", "[conv_lanes][activation]")
+{
+	sim_license_load(&g_live_license, "unlicensed", nullptr);
+
+	conv_fake_provider paid;
+	conv_fake_init(&paid, "paid");
+	conv_fake_cap *pc =
+	    conv_fake_add_cap(&paid, 1, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	pc->state = XRT_CONV_STATE_READY;
+	pc->cap.est_vram_mb = 111; // the mark that says which provider a task description came from
+	paid.iface.get_license_state = live_get_license;
+	paid.iface.activate = live_activate;
+
+	conv_fake_provider free_p;
+	conv_fake_init(&free_p, "free");
+	conv_fake_cap *fc =
+	    conv_fake_add_cap(&free_p, 1, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	fc->state = XRT_CONV_STATE_READY;
+	fc->cap.est_vram_mb = 222;
+	{
+		Core core(false);
+		REQUIRE(core.add(paid, 10) >= 0); // ranked first
+		REQUIRE(core.add(free_p, 20) >= 0);
+
+		const auto selected_mark = [&]() -> uint32_t {
+			xrt_conv_wire_task_desc td{};
+			if (!conv_core_get_task_desc(core.c, XRT_CONV_TASK_DEPTH_VIDEO, &td) ||
+			    td.state == XRT_CONV_STATE_UNLICENSED) {
+				return 0;
+			}
+			return td.est_vram_mb;
+		};
+		// Unlicensed: the first warm of the first-ranked provider reads
+		// UNLICENSED (the core learns a row's readiness when it warms it),
+		// that row is skipped from then on, and the next provider serves.
+		(void)conv_core_warm_task(core.c, XRT_CONV_TASK_DEPTH_VIDEO);
+		REQUIRE(wait_until([&] { return selected_mark() == 222u; }, 2000));
+
+		xrt_component_license_state st;
+		char err[XRT_COMPONENT_ACTIVATION_ERROR_MAX];
+		// A provider the core does not host: nothing is called.
+		CHECK(conv_core_activate_provider(core.c, "nobody", SIM_LICENSE_TEST_KEY, &st, err, sizeof(err)) ==
+		      CONV_CORE_ACTIVATE_NOT_HOSTED);
+		// A wrong token: the provider's own refusal comes back, and nothing changes.
+		CHECK(conv_core_activate_provider(core.c, "paid", "not-the-key", &st, err, sizeof(err)) ==
+		      CONV_CORE_ACTIVATE_REFUSED);
+		CHECK(std::string(err) != "");
+		CHECK(st.state == XRT_COMPONENT_LICENSE_UNLICENSED);
+		CHECK(selected_mark() == 222u);
+		// A provider with no licence slots at all refuses, and says so.
+		CHECK(conv_core_activate_provider(core.c, "free", SIM_LICENSE_TEST_KEY, &st, err, sizeof(err)) ==
+		      CONV_CORE_ACTIVATE_REFUSED);
+
+		// The key: accepted by the LIVE instance, and selection follows without a restart.
+		REQUIRE(conv_core_activate_provider(core.c, "paid", SIM_LICENSE_TEST_KEY, &st, err, sizeof(err)) ==
+		        CONV_CORE_ACTIVATE_ACCEPTED);
+		CHECK(st.state == XRT_COMPONENT_LICENSE_LICENSED);
+		CHECK(st.source == XRT_COMPONENT_LICENSE_SOURCE_KEY);
+		CHECK(wait_until([&] { return selected_mark() == 111u; }, 2000));
+	}
+	conv_fake_fini(&paid);
+	conv_fake_fini(&free_p);
+}
