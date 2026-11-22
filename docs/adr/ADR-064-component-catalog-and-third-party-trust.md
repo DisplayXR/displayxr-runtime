@@ -361,6 +361,7 @@ Each step is one pull request unless noted. Steps 1–4 are Windows.
 | 8 | **Dashboard Catalog tab.** Browse, install, uninstall, update, tier and prerequisite display, Buy / Activate. Renders the CLI's JSON | ADR-051; `src/dashboard/README.md` |
 | 9 | **Catalog-driven bundle** (§8), in `displayxr-installer`, plus the runtime installer pulling the open conversion provider | versions-json-autobump.md (bundle membership stops being five pins read by name); `displayxr-installer` docs; ADR-042 / ADR-053 note on the default converter |
 | 10 | **Upgradable prerequisites** (Amendment 1). `upgradable`, `license_url`, `stop_runtime` and `cleared_sources` on an external entry; the upgrade rules in `plan` and `install`; the prerequisite's state and versions in `list --json`; the machine pin; the replaced version in the receipt; the Restart Manager stop and single restart; the front ends' pre-ticked and "update available" rows. Restore (Amendment 1 §7) is a second pull request | component-catalog.md § Requires; dxr-get.md (commands, exit codes, the pin); catalog-driven-bundle.md; `src/dashboard/README.md` |
+| 11 | **Compatibility table and installed-set check** (Amendment 2). `check [--json]` in `dxr-get` and `displayxr-cli catalog check`; the same rows in the Dashboard's Catalog tab; a generated compatibility table published beside the catalog and rendered by the website; a release job that re-evaluates every listed item against the new runtime and reports the ones it leaves without a compatible version | dxr-get.md (the verb, its JSON, exit codes); component-catalog.md (the published table); versions-json-autobump.md and downstream-pin-bump.md (the release job sits beside the ABI gate); `src/dashboard/README.md`; `displayxr-website` docs/org-sync.md |
 
 ## Decided in review (2026-11-20)
 
@@ -495,6 +496,61 @@ and the user would have no path to fix it from DisplayXR.
 §6's "never to upgrade one that is present", and #2702's "the SR platform is fetched only
 when missing, never upgraded on its own", for prerequisites whose publisher sets
 `upgradable`. Both stand for every other prerequisite.
+
+## Amendment 2 (2026-11-22): a compatibility table, and a check of what is installed
+
+Decided by the project lead on 2026-11-22. Implementation is step 11.
+
+### What already answers "is this compatible"
+
+The signed catalog is the compatibility record: each item states the runtime range it works
+with, the ABI major of its class, and what it requires (the runtime, other items, external
+prerequisites). `dxr-get` enforces it at install, and the runtime installer's component page
+asks the engine about the runtime it is about to install, so an upgrade offers matching
+versions (§8). The loader enforces the class ABI again when it loads a component.
+
+### What is missing
+
+1. **Nobody can read it.** The record is in a signed JSON document. No page says
+   "component X works with runtime A to B".
+2. **Nothing checks a machine as a whole.** Compatibility is evaluated when an item is
+   installed. After a runtime upgrade from another source, a prerequisite change, or a
+   delisting, the user finds out when a component fails to load.
+3. **A release can strand an item silently.** When a runtime release moves outside an
+   item's range, nothing tells its publisher. Items pinned to one exact runtime are the
+   sharpest case.
+
+### Decision
+
+1. **A check verb.** `dxr-get check` (and `displayxr-cli catalog check`, and the Dashboard)
+   evaluates every installed item (the receipts, and the per-class registrations of
+   components the catalog knows) against the installed runtime, the class ABI majors it
+   recorded, the item's `requires`, and the state of each external prerequisite. One row
+   per item: compatible, update available, incompatible with the reason, or not in the
+   catalog. It changes nothing, needs no elevation, and works from the cached catalog when
+   the machine is offline, saying how old that copy is. `--json` carries the same rows.
+   A component that is installed but not listed is reported as such and is never called
+   incompatible: the catalog has no record to judge it by.
+
+2. **A published table, generated.** The job that compiles the catalog also writes a
+   compatibility table: per item and version, the runtime range, the class ABI and the
+   prerequisites with their minimum versions. It is derived from the same inputs as the
+   signed document and is never typed by hand. The website renders it on the item pages
+   and as one table. A publisher's own page that lists pairings for its prerequisite is
+   linked through that prerequisite's `info_url` (Amendment 1).
+
+3. **A release-time evaluation.** When a runtime release is tagged, a job evaluates every
+   listed item against it. An item the release leaves with no compatible version is
+   reported: an issue on the item's repository for first-party items, and an entry in the
+   registry's report for the others. It sits beside the ABI gate and the downstream pin
+   job and, like them, never blocks the release. The catalog then shows the item as not
+   available on that runtime, which is already the engine's behaviour.
+
+### What does not change
+
+- The rules themselves: ranges, ABI majors and `requires` are as §3 defines them.
+- Nothing is repaired automatically. The check reports; the user installs or updates.
+- No background check and no scheduled run (#2702).
 
 ## Alternatives rejected
 
