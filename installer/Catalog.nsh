@@ -34,8 +34,13 @@
 ; provider, so "Convert to 3D" exists on every machine) and an item whose
 ; detection rule matched this machine with high confidence (the display
 ; processor of the connected display). Detection is dxr-get's; nothing here
-; reads an EDID. An item already at the catalog version is shown as installed,
-; greyed, and is not downloaded.
+; reads an EDID.
+;
+; ALREADY INSTALLED => TICKED, for every item. An installed item that has an
+; update is pre-ticked (the update comes with the runtime; clearing the box
+; keeps the installed version). An item already at the catalog version is
+; shown as installed, ticked and greyed, and is not downloaded. Nothing on this
+; page removes a component: a cleared box means "do not install or update".
 ;
 ; NO CONNECTION. The core install never depends on any of this. If the catalog
 ; cannot be reached the page says so and offers nothing; if a download fails
@@ -46,7 +51,9 @@
 ;
 ;   /COMPONENTS=<list>   comma-separated item ids (or their aliases, e.g. the
 ;                        versions.json names) and the keywords `recommended`,
-;                        `detected`, `default` (= recommended,detected), `none`.
+;                        `detected`, `default` (= recommended,detected),
+;                        `installed` (items already installed that have an
+;                        update), `none`.
 ;                        Interactive: replaces the default pre-ticks.
 ;                        Unattended, exactly `/COMPONENTS=default` is one
 ;                        `dxr-get install --default` (what the bundle passes):
@@ -352,6 +359,14 @@ Function DxrCatPopulate
 			${If} $R3 == 1
 				IntOp $R5 $R5 | ${SF_SELECTED}
 			${EndIf}
+			; Already installed and nothing to do: ticked AND greyed. The tick
+			; is display only (the slot sections are empty, and every reader of
+			; the flags below skips a read-only slot).
+			ReadINIStr $R3 "$DxrCatIni" "item$R0" "installed"
+			${If} $R3 == 1
+			${AndIf} $R4 == 1
+				IntOp $R5 $R5 | ${SF_SELECTED}
+			${EndIf}
 			${If} $R4 == 1
 				IntOp $R5 $R5 | ${SF_RO}
 			${EndIf}
@@ -373,6 +388,8 @@ Function DxrCatPopulate
 	ClearErrors
 FunctionEnd
 
+!define /math DXR_CAT_SF_SELECTED_OR_RO ${SF_SELECTED} | ${SF_RO}
+
 ; The line above the list: that ticked items are downloaded, that this needs a
 ; connection, and how much. Recomputed on every tick. Scratch: $R0-$R4.
 Function DxrCatUpdateTop
@@ -384,8 +401,10 @@ Function DxrCatUpdateTop
 		IntOp $R1 ${DxrCatSlot1} + $R0
 		IntOp $R1 $R1 - 1
 		SectionGetFlags $R1 $R2
-		IntOp $R2 $R2 & ${SF_SELECTED}
-		${If} $R2 != 0
+		; A read-only slot (installed, or not available) downloads nothing,
+		; ticked or not.
+		IntOp $R2 $R2 & ${DXR_CAT_SF_SELECTED_OR_RO}
+		${If} $R2 == ${SF_SELECTED}
 			ReadINIStr $R2 "$DxrCatIni" "item$R0" "size_kb"
 			${If} $R2 == ""
 				StrCpy $R2 0

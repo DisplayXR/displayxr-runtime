@@ -144,6 +144,7 @@ class ShimTests(unittest.TestCase):
     def test_installed_and_unavailable_items_are_read_only(self):
         it = self.items(self.run_shim())
         self.assertEqual((it["browser"]["status"], it["browser"]["ro"], it["browser"]["selected"]), ("current", "1", "0"))
+        self.assertEqual(it["browser"]["installed"], "1")  # the page shows it ticked and greyed
         self.assertEqual(it["browser"]["label"], "Installed - DisplayXR Browser 1.10.5")
         self.assertEqual((it["unsigned-thing"]["status"], it["unsigned-thing"]["ro"]), ("unavailable", "1"))
         self.assertIn("no signed Windows build", it["unsigned-thing"]["desc"])
@@ -165,13 +166,24 @@ class ShimTests(unittest.TestCase):
         for k, first in firsts.items():
             self.assertTrue(it[k]["label"].startswith(first), it[k]["label"])
         for v in it.values():
-            self.assertLessEqual(len(v["desc"]), 110)   # the box is two lines tall
+            # The box is two lines of about 50 characters; 95 leaves room for the word wrap.
+            self.assertLessEqual(len(v["desc"]), 95)
+            # A cut description ends in the marker, attached to a whole word.
+            if v["desc"].endswith("..."):
+                self.assertRegex(v["desc"], r"[A-Za-z0-9)]\.\.\.$")
         # A long reason gets the whole box: the row already says "Not available".
         self.assertTrue(it["ultraleap"]["desc"].startswith("needs a newer runtime. needs a newer"))
-        # A sentence of the length dxr-get gives for a fixture item fits whole, versions included.
+        self.assertTrue(it["ultraleap"]["desc"].endswith("runtime..."), it["ultraleap"]["desc"])
+        # A reason that fits is shown whole, versions included, with no marker.
+        fits = "ultraleap 0.1.0 works with runtime 2.69.3 at most; this machine would have 2.70.0"
+        lst["items"][4]["incompatible_reason"] = fits
+        self.assertEqual(self.items(self.run_shim(lst))["ultraleap"]["desc"], fits + ".")
+        # A longer one (the length dxr-get gives for a fixture item, 102 characters)
+        # is cut at a word, never mid-word: what it works with stays readable.
         real = "fixture.runtime-too-new 1.0.0 works with runtime versions up to 1.0.0; this machine would have 2.70.0"
         lst["items"][4]["incompatible_reason"] = real
-        self.assertEqual(self.items(self.run_shim(lst))["ultraleap"]["desc"], real + ".")
+        self.assertEqual(self.items(self.run_shim(lst))["ultraleap"]["desc"],
+                         "fixture.runtime-too-new 1.0.0 works with runtime versions up to 1.0.0; this machine would...")
         self.assertTrue(it["leia-conversion"]["desc"].startswith("Also needs, and does not install: NeurD runtime"))
 
     def test_rows_dropped_first_are_the_not_available_ones(self):
@@ -227,6 +239,54 @@ class ShimTests(unittest.TestCase):
         self.assertEqual(self.selected(Select="default"), {"leia-sr", "open-conversion"})
         self.assertEqual(self.selected(Select="none"), set())
         self.assertEqual(self.selected(Select="recommended,leia-conversion"), {"open-conversion", "leia-conversion"})
+
+    # ---- already installed => ticked ---------------------------------------------
+    def shell_listing(self, **kw):
+        """LIST plus an item that is neither recommended nor detected (a workspace controller)."""
+        lst = copy.deepcopy(LIST)
+        lst["items"].append(row("displayxr-shell", "DisplayXR Shell", "workspace_controller", aliases=["shell"],
+                                available="2.5.0", size=8388608, download=8388608, **kw))
+        return lst
+
+    def test_not_installed_and_not_recommended_stays_unticked(self):
+        sh = self.items(self.run_shim(self.shell_listing()))["displayxr-shell"]
+        self.assertEqual((sh["status"], sh["selected"], sh["installed"], sh["ro"]), ("missing", "0", "0", "0"))
+
+    def test_installed_with_an_update_is_ticked_without_being_recommended_or_detected(self):
+        sh = self.items(self.run_shim(self.shell_listing(installed="2.4.2", state="outdated")))["displayxr-shell"]
+        self.assertEqual((sh["status"], sh["selected"], sh["installed"], sh["ro"]), ("outdated", "1", "1", "0"))
+        self.assertEqual(sh["label"], "Update, 8 MB - DisplayXR Shell 2.4.2 to 2.5.0")
+        self.assertEqual(sh["desc"], "Already installed: this updates it. Clear the box to keep the version you have.")
+
+    def test_installed_and_current_is_marked_installed_and_downloads_nothing(self):
+        sh = self.items(self.run_shim(self.shell_listing(installed="2.5.0", state="current")))["displayxr-shell"]
+        # selected stays 0 (nothing is run); installed + ro is what the page ticks and greys.
+        self.assertEqual((sh["status"], sh["selected"], sh["installed"], sh["ro"]), ("current", "0", "1", "1"))
+        self.assertEqual(sh["label"], "Installed - DisplayXR Shell 2.5.0")
+
+    def test_installed_rule_is_general_and_marks_every_installed_row(self):
+        it = self.items(self.run_shim())
+        self.assertEqual({k for k, v in it.items() if v["installed"] == "1"}, {"open-conversion", "browser"})
+        lst = copy.deepcopy(LIST)
+        by = {i["id"]: i for i in lst["items"]}
+        by["leia-conversion"].update(installed="0.0.9", state="outdated")   # an unrelated class
+        by["ultraleap"].update(installed="0.0.5", state="outdated")         # installed, but its update is incompatible
+        it = self.items(self.run_shim(lst))
+        self.assertEqual((it["leia-conversion"]["selected"], it["leia-conversion"]["installed"]), ("1", "1"))
+        self.assertEqual((it["ultraleap"]["status"], it["ultraleap"]["selected"], it["ultraleap"]["installed"],
+                          it["ultraleap"]["ro"]), ("unavailable", "0", "1", "1"))
+
+    def test_explicit_selection_updates_installed_items_only_when_asked(self):
+        lst = self.shell_listing(installed="2.4.2", state="outdated")
+        # /COMPONENTS= replaces the default pre-ticks, including this one ...
+        self.assertEqual(self.selected(listing=lst, Select="none"), set())
+        self.assertEqual(self.selected(listing=lst, Select="default"), {"leia-sr", "open-conversion"})
+        # ... and `installed` asks for it. open-conversion is installed and outdated too.
+        self.assertEqual(self.selected(listing=lst, Select="installed"), {"displayxr-shell", "open-conversion"})
+        self.assertEqual(self.selected(listing=lst, Select="detected,installed"),
+                         {"leia-sr", "displayxr-shell", "open-conversion"})
+        ini = self.run_shim(lst, Select="installed")
+        self.assertEqual(ini["catalog"]["passthrough"], "")   # a keyword, never handed to dxr-get as an id
 
     def test_requested_id_that_is_current_is_not_selected_and_not_passed_through(self):
         ini = self.run_shim(Select="browser")
