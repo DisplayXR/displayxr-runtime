@@ -736,9 +736,25 @@ only when its Authenticode signature is valid with a listed signer.
 | `conversion_open` | `open-conversion` | `conversion_provider` | `recommended: true`, the converter a setup UI pre-ticks (ADR-064 §7) | no floor is declared by that repository, so none is written |
 | `leia_conversion` | `leia-conversion` | `conversion_provider` | an external prerequisite (the NeurD runtime), declared and detected only | floor = `DXR_CONV_MIN_RUNTIME_VERSION` in its `CMakeLists.txt` at the released tag |
 | `ultraleap` | `ultraleap` | `input_provider` | an **exact** runtime range and an external prerequisite (the Ultraleap tracking software) | `runtime.min == runtime.max` = `DXR_RUNTIME_GIT_TAG` in its `CMakeLists.txt` at the released tag |
+| `shell` | `displayxr-shell` | `workspace_controller` | nothing schema 1 lacks words for; it was simply never one of the three frozen names. Not `recommended` and no `detect`: a setup UI lists it **unticked** and `install --default` never installs it | floor = `MIN_RUNTIME_VERSION` in its installer at the released tag, located through `downstream-pins.json` `consumer_floors` (`declared_floor`), the literal the drift audit checks |
 
 Rules that follow from "never guessed":
 
+- The Shell's installer refuses a runtime below its floor (exit 5), so the item is **not
+  listed at all** when the floor cannot be read. The floor lives in the private source
+  repository, so the token of the generator run must be able to read it. `publish-catalog.yml`
+  mints its token for the browser repositories only today: `displayxr-shell-pvt` has to be
+  added to that list **before schema-2 publishing is turned on**, or the Shell stays unlisted
+  (with a warning, never a guess).
+- The Shell item's `installed` and `uninstall` both read its registration row
+  (`WorkspaceControllers\shell\Version`, `...\UninstallString`), so a Shell installed by the
+  bundle or by hand is recognised as installed, and shown as an update when it is older.
+- Its installer arguments are `/S` and nothing else: the launch hotkey is the user's setting
+  (workspace-controller-registration.md, "Choosing the hotkey when a controller is
+  installed"), not an installer argument the catalog could carry. An install through
+  `dxr-get` keeps whatever the user has, or the default on a new machine.
+- No `license` is written for the Shell: none of the four licence classes says "free for
+  non-commercial use", and the generator does not guess.
 - A component with no `versions.json` pin has no release yet and is not listed (and costs
   no network access). `leia_conversion` and `ultraleap` are in that state today
   (versions-json-autobump.md, "A component with no release yet").
