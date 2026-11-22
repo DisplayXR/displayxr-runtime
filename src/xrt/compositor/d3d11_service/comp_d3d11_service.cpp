@@ -10,6 +10,7 @@
 #include "comp_d3d11_service.h"
 #include "comp_eye_dp_policy.h"
 #include "comp_failsafe_2d_policy.h"
+#include "comp_eye_mode_policy.h"
 #include "comp_d3d11_service_formats.h"
 #include "d3d11_service_shaders.h"
 #include "d3d11_bitmap_font.h"
@@ -1578,6 +1579,13 @@ struct d3d11_service_compositor
 	//! -1 = no wish (never asked) — the panel is then left exactly as it is.
 	std::atomic<int32_t> wish_content_mode{-1};
 	std::atomic<int> wish_hw_3d{-1};
+
+	//! XR_DXR_display_info eye-tracking mode this client asked for over IPC
+	//! (xrRequestEyeTrackingModeDXR: 0 = MANAGED, 1 = MANUAL; -1 = never
+	//! asked). Written on the client's IPC thread, read by the render thread,
+	//! which applies it to the panel DP only while this client holds the panel
+	//! on the direct path (pipeline_eye_mode_sync).
+	std::atomic<int32_t> wish_eye_mode{-1};
 
 	//! #939: deadline (os_monotonic ns, 0 = none) for a hardware-2D wish that
 	//! pipeline_rearm_focus_wish chose NOT to replay yet. A present-owner such as
@@ -4544,6 +4552,20 @@ struct d3d11_multi_compositor
 	//! needs while still only calling the vendor on a real change.
 	int panel_dp_encoding;
 
+	//! The eye-tracking mode the LIVE panel DP was last told, plus one (0 =
+	//! unknown: a fresh DP on the plug-in's default). Cleared with the other
+	//! beliefs (`pipeline_dp_forget_beliefs`, the fresh bind). Render thread,
+	//! under render_mutex. See pipeline_eye_mode_sync.
+	uint32_t panel_dp_eye_mode_plus1;
+	//! Some panel DP was told a mode other than the system default and no DP
+	//! has been told the default since. Deliberately NOT cleared with the
+	//! beliefs: the vendor's tracking policy may outlive one DP instance, so a
+	//! replacement DP is told the default explicitly while this is set.
+	bool eye_mode_nondefault_told;
+	//! The client whose wish the panel DP currently carries (NULL: the system
+	//! default). Compared by pointer only; cleared at that client's teardown.
+	struct d3d11_service_compositor *eye_mode_holder;
+
 	//! #1016: DP-state thrash detector. Counts encoding/transparency FLIPS in
 	//! a rolling one-second window; more than a couple per second means two
 	//! writers are fighting over the shared DP every frame, which is the
@@ -5641,6 +5663,7 @@ pipeline_dp_forget_beliefs(struct d3d11_multi_compositor *mc)
 		return;
 	}
 	mc->panel_dp_encoding = -1;                 // #1016: a fresh DP starts unknown
+	mc->panel_dp_eye_mode_plus1 = 0;            // and so does its eye-tracking mode
 	mc->panel_dp_client_presents_valid = false; // #1319: and so does its transparency
 }
 
@@ -5658,6 +5681,74 @@ panel_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
 		return sys->multi_comp != nullptr ? sys->multi_comp->display_processor : nullptr;
 	}
 	return c != nullptr ? c->render.display_processor : nullptr;
+}
+
+/*!
+ * XR_DXR_display_info eye-tracking mode (MANAGED / MANUAL) on the panel DP.
+ *
+ * In process every session owns its DP and pushes its own mode into it
+ * (comp_d3d11_compositor_set_eye_tracking_mode). Here one DP serves the panel
+ * and is handed from client to client, so a mode is a per-client WISH
+ * (`wish_eye_mode`) and the panel carries the wish of the client holding it:
+ *
+ *  - direct path (no controller, or a controller's foreground override): the
+ *    presented client, when the panel DP weaves it (APP_HWND / SERVICE_WINDOW);
+ *    a present-owner or client-texture presenter weaves elsewhere and gets
+ *    the default;
+ *  - workspace compose: nobody — the workspace owns mode, the panel gets the
+ *    system default (`default_eye_tracking_mode`).
+ *
+ * So a client that asked for MANUAL and then loses the panel, or leaves, hands
+ * the DP back to the next holder's wish or to the default; it is never left in
+ * MANUAL for someone who did not ask. The vendor is called only on a change,
+ * and a fresh DP is left on its own default unless a non-default mode was told
+ * to an earlier one (the policy can outlive an instance).
+ *
+ * Render thread (or teardown), under render_mutex. @p holder may be NULL.
+ */
+static void
+pipeline_eye_mode_sync(struct d3d11_service_system *sys,
+                       struct d3d11_multi_compositor *mc,
+                       struct d3d11_service_compositor *holder,
+                       const char *why)
+{
+	if (sys == nullptr || mc == nullptr || !pipeline_always_on(sys)) {
+		return;
+	}
+	struct xrt_display_processor_d3d11 *dp = panel_dp(sys, nullptr);
+	if (dp == nullptr) {
+		return; // no DP (or device removed): a fresh one is synced when it binds
+	}
+	// The rule is comp_eye_mode_decide() (comp_eye_mode_policy.h), pinned by
+	// tests_comp_eye_mode_policy; this only reads its inputs and acts.
+	struct comp_eye_mode_state st = {};
+	st.holder_woven_by_panel_dp =
+	    holder != nullptr &&
+	    (holder->presenter == PRESENTER_APP_HWND || holder->presenter == PRESENTER_SERVICE_WINDOW);
+	st.holder_wish = st.holder_woven_by_panel_dp ? holder->wish_eye_mode.load(std::memory_order_acquire) : -1;
+	st.default_mode = sys->base.info.default_eye_tracking_mode;
+	st.told_plus1 = mc->panel_dp_eye_mode_plus1;
+	st.nondefault_told = mc->eye_mode_nondefault_told;
+	const struct comp_eye_mode_result r = comp_eye_mode_decide(&st);
+
+	mc->eye_mode_holder = r.from_holder ? holder : nullptr;
+	mc->panel_dp_eye_mode_plus1 = r.mode + 1u;
+	if (!r.tell_dp) {
+		return;
+	}
+	xrt_display_processor_d3d11_set_eye_tracking_mode(dp, r.mode);
+	mc->eye_mode_nondefault_told = r.mode != st.default_mode;
+	U_LOG_W("[pipeline] eye-tracking mode %u (%s) -> panel DP (%s)", r.mode,
+	        r.from_holder ? "the presented client's request" : "system default", why);
+}
+
+static inline struct d3d11_service_compositor *
+pipeline_slot_compositor(struct d3d11_multi_compositor *mc, int32_t slot)
+{
+	if (mc == nullptr || slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS) {
+		return nullptr;
+	}
+	return mc->clients[slot].compositor;
 }
 
 /*!
@@ -13407,6 +13498,7 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	// has touched it yet — record "unknown" so the first process_atlas site
 	// asserts its own encoding rather than trusting that default.
 	mc->panel_dp_encoding = -1;
+	mc->panel_dp_eye_mode_plus1 = 0; // and pipeline_eye_mode_sync re-asserts the holder's mode
 
 	if (mc->window != nullptr && hwnd == mc->hwnd) {
 		comp_d3d11_window_set_workspace_dp(mc->window, fresh);
@@ -17948,6 +18040,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// changing. Same order as the compose path: drain first.
 		service_ws_cmd_drain(sys);
 		pipeline_default_policy_render(sys, mc, /*forced_focus*/ -1);
+		pipeline_eye_mode_sync(sys, mc, pipeline_slot_compositor(mc, mc->focused_slot), "default policy");
 		return;
 	}
 
@@ -18016,6 +18109,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// Same order as the default path: drain the S3 ring first.
 			service_ws_cmd_drain(sys);
 			pipeline_default_policy_render(sys, mc, override_slot);
+			pipeline_eye_mode_sync(sys, mc, pipeline_slot_compositor(mc, override_slot),
+			                       "foreground override");
 			return;
 		}
 
@@ -18040,6 +18135,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// No override this frame: a composed client's own window has no business
 		// being on screen. Put back any the app re-showed itself (Ctrl+T).
 		pipeline_repark_stray_client_windows(mc);
+
+		// The workspace owns mode: no client's eye-tracking wish on the panel.
+		pipeline_eye_mode_sync(sys, mc, nullptr, "workspace compose");
 	}
 
 	// ADR-018: the runtime no longer consumes TAB to cycle focus. TAB is
@@ -29116,6 +29214,13 @@ compositor_destroy(struct xrt_compositor *xc)
 		// unregister above has made the survivor scan accurate.
 		service_failsafe_hardware_2d_on_teardown(sys, c);
 
+		// A leaving client's eye-tracking wish leaves with it: hand the panel
+		// DP back to the default now rather than at the next holder's first
+		// tick (there may be no next holder for a while).
+		if (sys->multi_comp->eye_mode_holder == c) {
+			pipeline_eye_mode_sync(sys, sys->multi_comp, nullptr, "client teardown");
+		}
+
 		// #939: THE same scan, asked the other question — does a weave
 		// present-owner survive? The failsafe uses it to decide whether the
 		// lens may go flat; the rebind below uses it to decide whether the
@@ -34044,6 +34149,24 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
 	*out_x = sx;
 	*out_y = sy;
 	return true;
+}
+
+extern "C" void
+comp_d3d11_service_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy || mode > 1u) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	// Latch only; the render thread applies it on its next tick while this
+	// client holds the panel (pipeline_eye_mode_sync) — the same lease every
+	// other mode request obeys, and no DP call from this IPC thread.
+	const int32_t prev = c->wish_eye_mode.exchange((int32_t)mode, std::memory_order_acq_rel);
+	if (prev != (int32_t)mode) {
+		U_LOG_W("[pipeline] eye-tracking mode %u requested — applied to the panel DP while this client holds "
+		        "the panel on the direct path, held otherwise",
+		        mode);
+	}
 }
 
 extern "C" bool
