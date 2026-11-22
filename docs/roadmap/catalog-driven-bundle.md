@@ -26,18 +26,25 @@ the conversion models:
 | Item state | Row | Ticked |
 |---|---|---|
 | not installed | `N MB - <name> <version>` | if **recommended** by the catalog, or if its detection rule **matched this machine with high confidence** |
-| installed, older than the catalog | `Update, N MB - <name> <installed> to <version>` | same rule |
-| installed at the catalog version, or newer | `Installed - <name> <installed>`, greyed | never; nothing is downloaded |
-| no signed Windows build, a link-out item, or its runtime range excludes the runtime being installed | `Not available - <name>`, greyed, the reason in the description box | never |
+| installed, older than the catalog | `Update, N MB - <name> <installed> to <version>` | **always** (already installed ⇒ ticked): the update comes with the runtime. Clearing the box keeps the installed version |
+| installed at the catalog version, or newer | `Installed - <name> <installed>`, greyed | shown ticked, greyed; nothing is downloaded or run |
+| no signed Windows build, a link-out item, or its runtime range excludes the runtime being installed | `Not available - <name>`, greyed, the reason in the description box | never (shown ticked and greyed when an older version of it is installed: it stays installed) |
 
 The status leads the row because the list cuts a long row on the right; `Downloaded` stands in
 for the size when the download cache already holds everything. The page uses the layout with
 the description under the list (`MUI_COMPONENTSPAGE_SMALLDESC`), which gives the list about
-twice the width and shows about five rows at once instead of nine. That box is two lines
-tall, so a description is at most 110 characters with what matters first: for a row that is
-not available, the reason and nothing else, without the "Not available:" lead when the reason
-is long (the row says it).
+twice the width and shows about five rows at once instead of nine. That box is two lines of
+about 50 characters, so a description is at most **95** characters with what matters first:
+for a row that is not available, the reason and nothing else, without the "Not available:"
+lead when the reason is long (the row says it). The cap is below 2 x 50 because a line breaks
+at a space. A longer description is cut at the last whole word that fits and ends in `...`,
+so neither the marker nor half a word lands on a third line that the box does not show.
 
+- **Already installed ⇒ ticked** holds for every item, whatever its class, recommended or
+  not, detected or not. A component the user has is never presented as something they are
+  about to lose. And **nothing on this page removes a component**: a cleared box means "do
+  not install or update", for an installed item as for a new one. (The meta-bundle is
+  different: it removes an installed component whose row is cleared. See section 4.)
 - **Recommended** is the open conversion provider (`recommended: true` in the catalog), so
   "Convert to 3D" exists on a machine whose display vendor ships no converter (ADR-064 §7).
 - **Detected** is whatever `dxr-get` reports: it reads the monitors' EDIDs and evaluates the
@@ -68,12 +75,13 @@ steps 4 and 8; on the Components tab) do not exist yet, so the installer does no
 | Switch | Meaning |
 |---|---|
 | *(none)* | **unchanged**: the runtime only. No catalog request, no `dxr-get` call |
-| `/COMPONENTS=<list>` | comma-separated item ids or aliases (`leia-sr`, `leia_plugin`, `open-conversion`, …) and the keywords `recommended`, `detected`, `default` (= `recommended,detected`), `none`. Exactly `/COMPONENTS=default` is what the bundle passes. Unattended, exactly `/COMPONENTS=none` is the same as no switch: no listing, no PowerShell, no `dxr-get` call |
+| `/COMPONENTS=<list>` | comma-separated item ids or aliases (`leia-sr`, `leia_plugin`, `open-conversion`, …) and the keywords `recommended`, `detected`, `default` (= `recommended,detected`), `installed` (installed items that have an update), `none`. Exactly `/COMPONENTS=default` is what the bundle passes; `default` does not include `installed`, so it means the same as `dxr-get install --default`. Unattended, exactly `/COMPONENTS=none` is the same as no switch: no listing, no PowerShell, no `dxr-get` call |
 | `/CATALOG=<url\|file>` | passed to `dxr-get` as `--catalog`; the catalog must still be signed. For testing |
 | `/NOSTART` | as before; items are then installed with `--no-start-service` |
 | `/CATALOG=` and `/COMPONENTS=` values | a value containing a double quote is ignored |
 
-In an interactive run `/COMPONENTS=` replaces the default pre-ticks. `/KEEPACTIVERUNTIME`,
+In an interactive run `/COMPONENTS=` replaces the default pre-ticks, the "installed, has an
+update" tick included (an item at the catalog version is still shown ticked and greyed). `/KEEPACTIVERUNTIME`,
 `/FORCEACTIVERUNTIME`, `/NOMODELS`, `/MODELSPACK=` and `/CLOSEAPPS` are untouched, and so are
 the `ActiveRuntime` rule and the allowlist rows: none of that code changed.
 
@@ -124,6 +132,7 @@ What the page takes from each `list` row, unchanged:
 | `installable`, `listing` | not installable: shown as not available (a link-out says so) |
 | `compatible`, `incompatible_reason` | not compatible: shown as not available, with `dxr-get`'s own sentence |
 | `recommended`, `detected: "high"` | the pre-ticks. `low` never ticks |
+| `installed` (a version) | already installed ⇒ ticked: with `state` `outdated` / `rebuilt` the row is pre-ticked; at the catalog version it is shown ticked and greyed |
 | `download` | the size on the row and in the total: what `install <id>` would still fetch, prerequisite installers included, the download cache deducted. `0` reads "already downloaded" |
 | `prerequisites[]` with `met: false` and no installer of its own | named in the description box as needed and not found |
 | `summary`, `aliases` | the description, and the names `/COMPONENTS=` accepts |
@@ -217,7 +226,8 @@ installer:
    installer. `/S /COMPONENTS=none`: the same, no PowerShell and no `dxr-get` process either,
    and a `catalog-skipped.txt` left by an earlier run is gone.
    `/S /COMPONENTS=default` (one `install --default` call, no PowerShell),
-   `/S /COMPONENTS=leia_plugin`, `/S /COMPONENTS=recommended`.
+   `/S /COMPONENTS=leia_plugin`, `/S /COMPONENTS=recommended`, `/S /COMPONENTS=installed`
+   (updates what is installed and older, installs nothing new).
 6. `--no-runtime`: `/S /COMPONENTS=<an item whose floor is above this runtime>`
    (`fixture.runtime-too-old`; also `fixture.runtime-too-new`, `fixture.abi-mismatch`): one
    `dxr-get install <id> --yes --no-runtime` runs and exits 41; Setup exits 0;
@@ -226,8 +236,12 @@ installer:
    `/S /COMPONENTS=fixture.link-out`: the same with exit 40. `/S /COMPONENTS=no.such.id`:
    exit 40, as before. Interactive with the same switch: the row is greyed and unticked, and
    the finish page lists the item as not installed.
-7. Upgrade over an existing install with the Leia plug-in present: shown as installed, or as
-   an update; the service stopped and started the expected number of times; `ActiveRuntime`
+7. Upgrade over an existing install with the Leia plug-in present: shown as installed
+   (`Installed - ...`, ticked, greyed), or as an update (`Update, N MB - ...`, ticked); the
+   size line counts the update and not the greyed rows; clearing an update's box leaves the
+   installed version in place and removes nothing; the description box shows at most two
+   lines for every row, with no text cut mid-word;
+   the service stopped and started the expected number of times; `ActiveRuntime`
    handling as documented in dxr-get.md; `Runtime\Abi\RuntimeVersion` stamped with the new
    version.
 8. A second run right after the first: rows read "already downloaded" or installed, and
@@ -343,9 +357,13 @@ is nothing for an installer to call.
 
 ## 4. The Shell as a component the user picks
 
-Status: the catalog item and the hotkey checks are implemented and unit-tested; the Shell
-installer's shortcut page is written and compile-checked, **not run on Windows**. The
-decisions marked *open* are product decisions and nothing here acts on them.
+Status: the catalog item, the hotkey checks and the "already installed ⇒ ticked" rule of the
+runtime installer page are implemented and unit-tested; the Shell installer's shortcut page
+and the page change are compile-checked, **not run on Windows**. The bundle part is a
+recorded decision with no code yet.
+
+The Shell is an experimental showcase of the workspace concept. Hence: opt-in, never a
+surprise for someone who already has it, and nothing extra built around it for now.
 
 The DisplayXR Shell is one registered workspace controller
 ([workspace-controller-registration.md](../specs/runtime/workspace-controller-registration.md)).
@@ -360,8 +378,8 @@ component-catalog.md § Generating it.
 
 | Question | Answer |
 |---|---|
-| Ticked by default? | No `recommended`, no `detect`: listed **unticked**, never installed by `install --default` / `/COMPONENTS=default`. *Open*: David may want it pre-ticked; that is one `"recommended": True` in `V2_ITEMS` |
-| An existing install | recognised through the registration row's `Version`: shown as installed, or as an update when older. Nothing is removed by not ticking it |
+| Ticked by default? | **No** (decided). No `recommended`, no `detect`: listed unticked on a machine without it, never installed by `install --default` / `/COMPONENTS=default` |
+| An existing install | recognised through the registration row's `Version`. It comes up **ticked**: as an update when older, ticked and greyed when current (section 1, "already installed ⇒ ticked"). Nothing is removed by clearing the box |
 | Uninstall | the registration row's `UninstallString` with `/S` |
 | Runtime floor | the Shell installer's `MIN_RUNTIME_VERSION`, read at the released tag. Unreadable = the item is not listed |
 | Unattended | `/COMPONENTS=shell` (or `displayxr-shell`) on the runtime installer, `dxr-get install shell` |
@@ -399,7 +417,8 @@ Known limit: `service.json` is per-user and the installer is elevated. Under an 
 prompt that is the same user. Under over-the-shoulder elevation, or a deployment tool running
 as SYSTEM, `/HOTKEY=` writes another profile and the logged-on user keeps the default. A
 per-machine default carried by the controller's registration would close that; it changes the
-"default is never stored" rule of `service.json` and is not done here.
+"default is never stored" rule of `service.json`. **Decided: not now.** The limitation stays
+documented.
 
 ### The application entry
 
@@ -411,7 +430,8 @@ Today, per platform:
 | macOS | none: the `.pkg` installs a bare executable, not an `.app` | same shape |
 | Linux | none: the `.deb` ships no `.desktop` file | same shape |
 
-Recommendation (not implemented; it is Shell behaviour that needs a run on each platform):
+**Decided: not now.** Windows already has the Start menu entry, and that is the application
+entry for the time being. What follows is a documented follow-up, not planned work:
 
 - the entry's result is "the service launches the registered controller", the same path as
   the hotkey. The Shell does that itself: started without `--service-managed`, it asks the
@@ -427,12 +447,27 @@ Recommendation (not implemented; it is Shell behaviour that needs a run on each 
 
 ### The bundle
 
-*Open*, with a recommendation each:
+Decided; **no code change now** (the bundle is `displayxr-installer`, and it changes with the
+rest of section 2).
 
-| Decision | Recommendation |
+| Bundle | The Shell |
 |---|---|
-| Is the Shell row ticked in the bundle's component list? | Unticked on a machine without the Shell; **ticked when the Shell is already installed**. The bundle removes an installed component whose row is unticked, so a plain "unticked by default" would uninstall the Shell on every upgrade |
-| The offline full bundle | keeps embedding the Shell, row state as above |
-| The online bundle | stops embedding the Shell once a schema-2 catalog lists it, and passes the tick as `/COMPONENTS=...,shell` to the runtime child; until then it keeps embedding it |
-| Users who have the Shell | nothing changes: it is updated when the bundle or the catalog carries a newer one, its shortcut and launch mode are not touched |
-| `versions.json` membership | `shell` stays a pin (the orchestrator, the offline bundle and the generator all read it) |
+| Online | **stops embedding the Shell once a schema-2 catalog lists it.** The Shell row then drives `/COMPONENTS=...,shell` on the runtime child. Until that catalog is published the bundle keeps embedding it, as today |
+| Offline | **keeps carrying the file.** The row is unticked on a machine without the Shell and ticked when the Shell is already installed |
+| Both | a machine that has the Shell keeps it: updated when the bundle or the catalog carries a newer one, launch shortcut and launch mode untouched |
+| `versions.json` | `shell` stays a pin: the dev orchestrator, the offline bundle and the catalog generator read it |
+
+One thing the bundle change must get right, because the bundle differs from the runtime
+installer page: **the bundle removes an installed component whose row is cleared**
+(`DisplayXRBundleInstaller.nsi`, the `$G_ShellInstalled == 1` branch of the Shell section,
+and the same shape for the Leia plug-in and the open conversion provider). A Shell row that
+is simply "unticked by default" would therefore uninstall the Shell on every bundle run if
+nothing re-selected it. The bundle's `.onInit` already does the re-selecting: after
+`DetectComponent "DisplayXRShell"` it selects the section when the Shell's install marker
+exists (`$0 != ""`, which also covers an install whose files were damaged, so the run
+repairs it). So the whole change for the offline bundle is one word: declare the section
+unselected, `Section /o "DisplayXR Shell" SecShell`, and keep that `SelectSection` line. The
+comment above it ("default-checked") changes with it. The removal branch stays: it then
+fires only when the user clears the box by hand. To verify on Windows: `/S` over an installed
+Shell keeps it; `/S` on a clean machine does not install it; the interactive row follows the
+same two states.

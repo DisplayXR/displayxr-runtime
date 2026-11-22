@@ -27,8 +27,19 @@
 #
 # -Select is the installer's /COMPONENTS= value: a comma-separated list of
 # item ids or aliases and the keywords `recommended`, `detected`, `default`
-# (= recommended + detected) and `none`. Without it the default pre-ticks
-# apply: `recommended` items and items with `detected: "high"`.
+# (= recommended + detected), `installed` and `none`. Without it the default
+# pre-ticks apply: `recommended` items, items with `detected: "high"`, and
+# items that are ALREADY INSTALLED and have an update.
+#
+# Already installed => ticked, for every item, whatever its class: a component
+# the user has is never presented as something they are about to lose.
+#   installed, older than the catalog  -> `selected=1` by default (the update is
+#       installed with the runtime); unticking it only skips the update.
+#   installed, at the catalog version  -> `installed=1`, `ro=1`: the page shows
+#       it ticked and greyed. `selected` stays 0: nothing is downloaded or run.
+# Nothing on this page ever REMOVES a component, ticked or not.
+# `default` deliberately stays recommended + detected, so the page's meaning of
+# it equals `dxr-get install --default` (the unattended one-call path).
 #
 # Output (ASCII, one section per listed item):
 #   [catalog] state=ok|offline|error  exit=<dxr-get exit code>
@@ -36,7 +47,9 @@
 #             passthrough=<requested ids the listing lacks or marks unavailable>
 #             message=<one line>
 #   [itemN]   id, name, label, desc, size_kb, selected (0|1), ro (0|1),
-#             status (missing|outdated|current|unavailable)
+#             installed (0|1), status (missing|outdated|current|unavailable)
+#             selected = dxr-get is asked to install or update it.
+#             installed = it is on this machine now (current or outdated).
 
 param(
     [Parameter(Mandatory = $true)][string]$DxrGet,
@@ -92,7 +105,7 @@ function Write-Ini([string]$state, [int]$exit, [string]$message, [object[]]$item
     foreach ($it in $items) {
         $n++
         $lines.Add("[item$n]")
-        foreach ($k in 'id', 'name', 'label', 'desc', 'size_kb', 'selected', 'ro', 'status') {
+        foreach ($k in 'id', 'name', 'label', 'desc', 'size_kb', 'selected', 'ro', 'installed', 'status') {
             $lines.Add("$k=$(Clean $it[$k])")
         }
     }
@@ -109,7 +122,8 @@ if ($Select) {
 $explicit = $tokens.Count -gt 0
 $wantRecommended = (-not $explicit) -or ($tokens -contains 'recommended') -or ($tokens -contains 'default')
 $wantDetected = (-not $explicit) -or ($tokens -contains 'detected') -or ($tokens -contains 'default')
-$wantIds = @($tokens | Where-Object { @('recommended', 'detected', 'default', 'none') -notcontains $_ })
+$wantInstalled = (-not $explicit) -or ($tokens -contains 'installed')
+$wantIds = @($tokens | Where-Object { @('recommended', 'detected', 'default', 'installed', 'none') -notcontains $_ })
 
 # ---- dxr-get list --json --assume-runtime ... ---------------------------------
 $dxrArgs = @()
@@ -153,7 +167,22 @@ if ($null -eq $rows) {
     exit 0
 }
 
-$DescMax = 110   # the description box under the list is two lines tall (measured on Windows)
+# The description box under the list is two lines of about 50 characters
+# (measured on Windows). 95 leaves room for the word wrap: a line breaks at a
+# space, so two lines hold less than 2 x 50 when a long word moves down.
+$DescMax = 95
+
+function Clip-Desc([string]$text) {
+    # A description that fits is left alone. A longer one is cut at the last
+    # word that fits and ends in "...", so the marker never stands alone on a
+    # third, hidden line and no word is cut in half.
+    $s = Clean $text 400
+    if ($s.Length -le $DescMax) { return $s }
+    $cut = $s.Substring(0, $DescMax - 3)
+    $sp = $cut.LastIndexOf(' ')
+    if ($sp -ge ($DescMax - 3 - 20)) { $cut = $cut.Substring(0, $sp) }
+    return $cut.TrimEnd(' ', ',', ';', ':', '.', '-', '(') + '...'
+}
 $items = New-Object System.Collections.Generic.List[object]
 $known = @{}
 $refused = New-Object System.Collections.Generic.List[string]
@@ -211,10 +240,16 @@ foreach ($r in @($rows)) {
     $recommended = (Get-Prop $r 'recommended') -eq $true
 
     $selectable = ($status -eq 'missing' -or $status -eq 'outdated')
+    # On this machine now. An unavailable row can be an installed item whose
+    # update cannot be installed here: it stays installed, and is shown so.
+    $isInstalled = [bool]$installed
+    $keptForUpdate = $false
     $selected = $false
     if ($selectable) {
         if ($wantRecommended -and $recommended) { $selected = $true }
         if ($wantDetected -and $detected) { $selected = $true }
+        # Already installed => ticked: the update comes with the runtime.
+        if ($wantInstalled -and $status -eq 'outdated' -and -not $selected) { $selected = $true; $keptForUpdate = $true }
         foreach ($n in $names) { if ($wantIds -contains $n) { $selected = $true } }
     }
 
@@ -246,15 +281,16 @@ foreach ($r in @($rows)) {
         if ($unmet.Count -gt 0) { $desc = "Also needs, and does not install: $($unmet -join ', ') (not found). $desc" }
         if ($detected) { $desc = "Matching hardware was detected. $desc" }
         elseif ($recommended) { $desc = "Recommended. $desc" }
+        elseif ($keptForUpdate) { $desc = "Already installed: this updates it. Clear the box to keep the version you have. $desc" }
     }
 
     # Which rows are kept when there are more items than slots: ticked, then
     # what can be ticked, then installed, then not available (dropped first).
     $rank = if ($selected) { 0 } elseif ($selectable) { 1 } elseif ($status -eq 'current') { 2 } else { 3 }
     $items.Add(@{
-            id = $id; name = (Clean $name 80); label = (Clean $label 120); desc = (Clean $desc $DescMax)
+            id = $id; name = (Clean $name 80); label = (Clean $label 120); desc = (Clip-Desc $desc)
             size_kb = [long][math]::Ceiling($download / 1024); selected = [int]$selected
-            ro = [int](-not $selectable); status = $status
+            ro = [int](-not $selectable); installed = [int]$isInstalled; status = $status
             rank = ($rank * 100000 + $items.Count)   # the listing order breaks ties (no Sort -Stable in 5.1)
         })
 }
