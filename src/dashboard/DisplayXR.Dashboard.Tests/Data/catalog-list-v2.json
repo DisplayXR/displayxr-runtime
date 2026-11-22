@@ -12,6 +12,7 @@
    "state": "current",
    "installable": true,
    "receipt": false,
+   "can_uninstall": false,
    "aliases": [],
    "recommended": false,
    "detected": "none",
@@ -32,6 +33,7 @@
    "state": "outdated",
    "installable": true,
    "receipt": true,
+   "can_uninstall": true,
    "aliases": [
     "leia_plugin"
    ],
@@ -54,6 +56,7 @@
    "state": "current",
    "installable": true,
    "receipt": false,
+   "can_uninstall": false,
    "aliases": [],
    "recommended": false,
    "detected": "none",
@@ -74,6 +77,7 @@
    "state": "not_installed",
    "installable": true,
    "receipt": false,
+   "can_uninstall": false,
    "summary": "2D-to-3D conversion with open models. Needs no vendor software.",
    "aliases": [
     "conversion_open"
@@ -97,6 +101,7 @@
    "state": "current",
    "installable": true,
    "receipt": true,
+   "can_uninstall": true,
    "summary": "2D-to-3D conversion with Leia's NeurD module.",
    "aliases": [
     "leia_conversion"
@@ -126,6 +131,7 @@
    "state": "not_installed",
    "installable": true,
    "receipt": false,
+   "can_uninstall": false,
    "summary": "Hand tracking from an Ultraleap camera, as controllers and hand joints.",
    "aliases": [],
    "recommended": false,

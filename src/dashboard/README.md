@@ -55,7 +55,7 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
 
   | Status | When | Offered |
   |---|---|---|
-  | **Installed** | present, and the catalog has the same build (or no catalog has been read: nothing is claimed) | the row's own controls; Details; Uninstall with a receipt |
+  | **Installed** | present, and the catalog has the same build (or no catalog has been read: nothing is claimed) | the row's own controls; Details; Uninstall when the engine can do it |
   | **Update available** | present, and the catalog has another build (`outdated` / `rebuilt`) | the same, and **Update** |
   | **Available** | in the catalog, not on this machine | **Install** (or **Get it** for a link-out item); Details |
   | **Not from catalog** | present, and the catalog does not list it, or lists it but the engine did not find this copy (a dev registration, another installer, a preinstall) | the row's own controls only, and "Remove with its own uninstaller." |
@@ -73,13 +73,19 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
 - **After an install the same row is the installed row**, with its detail open: the row's key is
   its class and registered id, which do not change. The status feed, the class's policy rows and
   the workspace list are re-read.
-- **Uninstall needs a receipt.** Only what the engine installed can be removed by it
-  (`receipt: true`); every other installed row says how it is removed instead, and a row that is
-  not from the catalog is never offered Update, Install or Uninstall. **Disable is not
-  Uninstall**: the Enabled box turns a component off and leaves it on the machine; Uninstall
-  (in Details) removes it.
-- **What happens to an item is said on its row**: the progress of an install, a declined
-  permission prompt, each exit code as a sentence.
+- **Uninstall is offered only when it can succeed.** The engine must have installed the item
+  (`receipt: true`) AND say it can remove it (`can_uninstall: true` in `dxr-get list --json`:
+  the receipt recorded an uninstall command). A receipt alone is not enough: an item installed
+  from a catalog entry that names no uninstall command (every schema-1 item) would be refused
+  with exit 43, so its row shows "Remove it from Windows Settings > Apps." instead of a button.
+  A list without the field (an older engine) reads as "cannot remove". A row that is not from
+  the catalog is never offered Update, Install or Uninstall. **Disable is not Uninstall**: the
+  Enabled box turns a component off and leaves it on the machine; Uninstall (in Details)
+  removes it.
+- **What happens to an item is said on its row.** A success is the row's new status and one line
+  ("… is up to date. It is ready to use.") that stays until the next action, with nothing to
+  dismiss. A failure (a declined permission prompt, each exit code as a sentence) is a notice on
+  that row that stays until it is dismissed.
 - **When the catalog cannot be read** (offline, refused, the engine missing, a platform with no
   engine) one banner at the top says so, with **Try again** or the Download page. Everything
   installed stays below and works as usual. Rows from the last catalog read in this session are

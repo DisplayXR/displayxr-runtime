@@ -17,10 +17,12 @@ namespace DisplayXR.Dashboard.Tests;
 /// </summary>
 public class ComponentRowsTests
 {
-    private static string Item(string id, string cls, string state, bool receipt = false, bool installable = true, string? registered = null) =>
+    private static string Item(string id, string cls, string state, bool receipt = false, bool installable = true, string? registered = null,
+                               bool? canUninstall = null) =>
         $"{{\"id\":\"{id}\",\"name\":\"{id} name\",\"class\":\"{cls}\",\"publisher\":\"acme-labs\",\"state\":\"{state}\","
         + $"\"installed\":{(state == "not_installed" ? "null" : "\"1.0.0\"")},\"available\":\"1.1.0\","
         + $"\"installable\":{(installable ? "true" : "false")},\"receipt\":{(receipt ? "true" : "false")}"
+        + (canUninstall is null && !receipt ? "" : $",\"can_uninstall\":{((canUninstall ?? receipt) ? "true" : "false")}")
         + (registered is null ? "" : $",\"registered_id\":\"{registered}\"") + "}";
 
     private static CatalogList Catalog(params string[] items)
@@ -125,7 +127,44 @@ public class ComponentRowsTests
         var pad = Row(groups, "input_provider:pad"); // installed by its own installer: the catalog knows it, has no receipt
         Assert.Equal(RowStatus.UpdateAvailable, pad.Status);
         Assert.False(pad.CanUninstall);
-        Assert.NotNull(pad.RemoveNote);
+        Assert.Equal(CatalogText.RemoveFromSettings, pad.RemoveNote);
+    }
+
+    [Fact]
+    public void AReceiptWithoutAnUninstallCommand_IsNotOfferedForRemoval()
+    {
+        // What the engine answers for an item installed from an entry that names no uninstall command:
+        // receipt true, can_uninstall false. `uninstall` would be refused (exit 43), so it is not offered.
+        var sections = new[] { Section("display_processors", Registered(ComponentClass.Display, "panel-a"), Registered(ComponentClass.Display, "panel-b")) };
+        var groups = ComponentRows.Join(sections, Live(
+            Item("panel-a", "display_processor", "current", receipt: true, canUninstall: false),
+            "{\"id\":\"panel-b\",\"name\":\"b\",\"class\":\"display_processor\",\"state\":\"current\",\"installed\":\"1.0.0\",\"installable\":true,\"receipt\":true}"));
+
+        var a = Row(groups, "display_processor:panel-a");
+        Assert.Equal(RowStatus.Installed, a.Status);
+        Assert.True(a.Catalog!.Receipt);
+        Assert.False(a.CanUninstall);
+        Assert.Equal("Remove it from Windows Settings > Apps.", a.RemoveNote);
+
+        // An engine that predates the field says nothing about it: read as "cannot remove".
+        var b = Row(groups, "display_processor:panel-b");
+        Assert.False(b.CanUninstall);
+        Assert.Equal(CatalogText.RemoveFromSettings, b.RemoveNote);
+
+        // The receipts-only list (offline) carries the same flag.
+        Assert.True(CatalogList.TryParseInstalled(
+            "{\"installed\":[{\"id\":\"panel-a\",\"class\":\"display_processor\",\"version\":\"1.0.0\",\"can_uninstall\":false,\"uninstall_command\":\"\"}]}", out var receipts));
+        var offline = ComponentRows.Join(sections, new CatalogSource(receipts, false, false));
+        Assert.False(Row(offline, "display_processor:panel-a").CanUninstall);
+    }
+
+    [Fact]
+    public void ASuccess_IsOneLine_WithNothingToDismiss()
+    {
+        var ok = CatalogExit.Describe(CatalogVerb.Update, CatalogExit.Ok, "Panel A");
+        Assert.True(ok.Ok);
+        Assert.Equal("Panel A is up to date. It is ready to use.", CatalogText.Inline(ok.Title, ok.Text));
+        Assert.Equal("Done.", CatalogText.Inline("Done", ""));
     }
 
     [Fact]
@@ -154,7 +193,7 @@ public class ComponentRowsTests
     [Fact]
     public void TheReceiptsAlone_AreNotACatalog_SoNothingIsCalledNotFromCatalog()
     {
-        Assert.True(CatalogList.TryParseInstalled("{\"installed\":[{\"id\":\"pen\",\"name\":\"Pen\",\"class\":\"input_provider\",\"version\":\"1.0.0\"}]}", out var receipts));
+        Assert.True(CatalogList.TryParseInstalled("{\"installed\":[{\"id\":\"pen\",\"name\":\"Pen\",\"class\":\"input_provider\",\"version\":\"1.0.0\",\"can_uninstall\":true}]}", out var receipts));
         var offline = CatalogRead.From(CatalogExit.Offline, "", true, false, null) with { List = receipts };
         var source = CatalogSource.From(offline, null);
         Assert.False(source.Stale);

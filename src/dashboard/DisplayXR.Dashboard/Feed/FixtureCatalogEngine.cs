@@ -75,7 +75,7 @@ public sealed class FixtureCatalogEngine : ICatalogEngine
                     {
                         ["id"] = i["id"]?.GetValue<string>(), ["name"] = i["name"]?.GetValue<string>(),
                         ["class"] = i["class"]?.GetValue<string>(), ["publisher"] = i["publisher"]?.GetValue<string>() ?? "",
-                        ["version"] = i["installed"]?.GetValue<string>() ?? "", ["can_uninstall"] = true,
+                        ["version"] = i["installed"]?.GetValue<string>() ?? "", ["can_uninstall"] = i["can_uninstall"]?.GetValue<bool>() == true,
                     }).ToArray());
                 return Task.FromResult(Exit(0, new JsonObject { ["installed"] = have }.ToJsonString()));
             }
@@ -94,6 +94,8 @@ public sealed class FixtureCatalogEngine : ICatalogEngine
             if (a is ["uninstall", var uid, ..])
             {
                 if (Item(uid) is not { } it || it["receipt"]?.GetValue<bool>() != true) return Task.FromResult(Exit(CatalogExit.NoReceipt));
+                // A receipt without an uninstall command: refused before any prompt, like the engine.
+                if (it["can_uninstall"]?.GetValue<bool>() != true) return Task.FromResult(Exit(CatalogExit.CannotUninstall));
                 if (it["fixture_uninstall_exit"]?.GetValue<int>() is CatalogExit.CannotUninstall) return Task.FromResult(Exit(CatalogExit.CannotUninstall));
                 return Task.FromResult(Exit(CatalogExit.NeedsAdmin));
             }
@@ -130,6 +132,8 @@ public sealed class FixtureCatalogEngine : ICatalogEngine
                 it["installed"] = it["available"]?.GetValue<string>();
                 it["state"] = "current";
                 it["receipt"] = true;
+                // "fixture_no_uninstall": the item installs from an entry that names no uninstall command.
+                it["can_uninstall"] = it["fixture_no_uninstall"]?.GetValue<bool>() != true;
                 it["download"] = 0;
                 return 0;
             }
@@ -138,6 +142,7 @@ public sealed class FixtureCatalogEngine : ICatalogEngine
                 it["installed"] = null;
                 it["state"] = "not_installed";
                 it["receipt"] = false;
+                it["can_uninstall"] = false;
                 it["download"] = it["size"]?.GetValue<long>() ?? 0;
                 return 0;
             }

@@ -908,6 +908,14 @@ public sealed class ComponentsPage : Page
         if (Ctx.CatalogResult is { } res && res.ItemId == i.Id)
         {
             var o = res.Outcome;
+            if (o.Ok)
+            {
+                // A success needs no click: the row's new status says it, with one line that stays
+                // until the next action. Only a failure is a message to read and dismiss.
+                var done = U.Wrapped(CatalogText.Inline(o.Title, o.Text), "soft");
+                AutomationProperties.SetLiveSetting(done, AutomationLiveSetting.Polite);
+                return done;
+            }
             var n = U.Notice(o.Level, o.Title, o.Text, U.Button("OK", Ctx.DismissCatalogResult, "quiet", "sm"));
             AutomationProperties.SetLiveSetting(n, AutomationLiveSetting.Polite);
             return n;
@@ -1013,10 +1021,19 @@ public sealed class ComponentsPage : Page
         }
         if (Ctx.ActivationResult is { } ar && ar.ItemId == i.Id)
         {
-            var n = U.Notice(ar.Outcome.Accepted ? Level.Ok : Level.Info, ar.Outcome.Title, ar.Outcome.Text,
-                             U.Button("OK", Ctx.DismissCatalogResult, "quiet", "sm"));
-            AutomationProperties.SetLiveSetting(n, AutomationLiveSetting.Polite);
-            col.Children.Add(n);
+            if (ar.Outcome.Accepted)
+            {
+                // Accepted: said in one line, nothing to dismiss (the licence chip above has changed).
+                var done = U.Wrapped(CatalogText.Inline(ar.Outcome.Title, ar.Outcome.Text), "soft");
+                AutomationProperties.SetLiveSetting(done, AutomationLiveSetting.Polite);
+                col.Children.Add(done);
+            }
+            else
+            {
+                var n = U.Notice(Level.Info, ar.Outcome.Title, ar.Outcome.Text, U.Button("OK", Ctx.DismissCatalogResult, "quiet", "sm"));
+                AutomationProperties.SetLiveSetting(n, AutomationLiveSetting.Polite);
+                col.Children.Add(n);
+            }
         }
         if (v.Reassurance is not null) col.Children.Add(U.Wrapped(v.Reassurance, "meta"));
         return col;

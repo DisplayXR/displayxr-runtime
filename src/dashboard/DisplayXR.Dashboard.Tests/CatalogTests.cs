@@ -195,7 +195,9 @@ public class CatalogTests
     {
         Assert.True(CatalogList.TryParseInstalled(TestData.Text("catalog-installed.json"), out var list));
         Assert.Equal(new[] { "leia-sr", "open-conversion" }, list!.Items.Select(i => i.Id));
-        Assert.All(list.Items, i => { Assert.True(i.IsInstalled); Assert.True(i.CanUninstall); Assert.Equal(CatalogAction.None, i.Action); });
+        Assert.All(list.Items, i => { Assert.True(i.IsInstalled); Assert.True(i.Receipt); Assert.Equal(CatalogAction.None, i.Action); });
+        // A receipt is not enough: only the one that recorded an uninstall command can be removed from here.
+        Assert.Equal(new[] { true, false }, list.Items.Select(i => i.CanUninstall));
         Assert.Equal("2.22.0 installed", list.Items[0].VersionText);
         Assert.False(CatalogList.TryParseInstalled(TestData.Text("catalog-list-v2.json"), out _));
     }

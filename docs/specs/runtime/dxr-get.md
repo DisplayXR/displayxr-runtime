@@ -272,6 +272,7 @@ a setup page: no second fetch is needed for detection, sizes or compatibility.
 | `state` | as above |
 | `installable` | the catalog has a signed Windows build of it |
 | `receipt` | `dxr-get` installed it |
+| `can_uninstall` | `uninstall <id>` has a command to run: there is a receipt and it recorded an uninstall command. `false` with `receipt: true` is an item installed from a catalog entry that names no `uninstall` rule (every schema-1 item): `uninstall` refuses it with exit 43. A front end offers removal only when this is `true`, and treats a list without the field (an older engine) as `false` |
 | `listing` | for a link-out: where to get it |
 | `summary` | the catalog's one-line description, when it has one |
 | `aliases` | other names the item answers to (the schema-1 name). Always an array |

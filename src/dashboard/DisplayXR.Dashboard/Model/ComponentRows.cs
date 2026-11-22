@@ -78,7 +78,10 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
     /// </summary>
     public CatalogAction Action => Catalog is null || Status == RowStatus.NotFromCatalog ? CatalogAction.None : Catalog.Action;
 
-    /// <summary>Uninstall only with a receipt: what the engine installed, it can remove; nothing else.</summary>
+    /// <summary>
+    /// Uninstall only when it can succeed: the engine installed it (a receipt) and says it has an
+    /// uninstall command for it (<see cref="CatalogItem.CanUninstall"/>). Nothing else.
+    /// </summary>
     public bool CanUninstall => Catalog is { CanUninstall: true } && Status is RowStatus.Installed or RowStatus.UpdateAvailable;
 
     /// <summary>The catalog's detail (what it does, version, licence) can be opened.</summary>
@@ -88,7 +91,7 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
     public string? RemoveNote =>
         Status == RowStatus.NotFromCatalog ? "Remove with its own uninstaller."
         : Status is RowStatus.Installed or RowStatus.UpdateAvailable && Catalog is { IsRuntime: false } && !CanUninstall
-            ? "Installed by its own installer: remove it with that uninstaller."
+            ? CatalogText.RemoveFromSettings
         : null;
 
     public bool Shows(RowFilter filter) => filter switch

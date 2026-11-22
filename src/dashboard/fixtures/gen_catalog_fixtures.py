@@ -12,7 +12,7 @@ root = sys.argv[1]  # src/dashboard
 def item(id, name, cls, *, registered_id=None, publisher="displayxr", tier="listed", installed=None, available=None,
          state="not_installed", installable=True, receipt=False, listing=None, summary=None, aliases=(),
          recommended=False, detected="none", evidence=None, size=0, download=None, compatible=True,
-         incompatible_reason=None, prerequisites=(), **extra):
+         incompatible_reason=None, prerequisites=(), can_uninstall=None, **extra):
     x = {"id": id, "name": name, "class": cls}
     if registered_id:
         x["registered_id"] = registered_id
@@ -23,6 +23,8 @@ def item(id, name, cls, *, registered_id=None, publisher="displayxr", tier="list
     x["state"] = state
     x["installable"] = installable
     x["receipt"] = receipt
+    # The receipt recorded an uninstall command (false for an install from an entry that names none).
+    x["can_uninstall"] = receipt if can_uninstall is None else can_uninstall
     if listing:
         x["listing"] = listing
     if summary:
@@ -123,6 +125,7 @@ layout = {"schema": 2, "items": v2["items"][:2] + [
          summary="Studio-grade 2D-to-3D conversion for film and photo work.", size=524288000),
     item("northlight-3d", "Northlight Live 3D", "conversion_provider", registered_id="northlight-3d",
          publisher="northlight", installed="1.0.2", available="1.0.2", state="current", receipt=True,
+         can_uninstall=False, fixture_no_uninstall=True,
          summary="Real-time 3D for video calls and streams.", size=73400320),
     item("open-tracking", "Open camera tracking", "tracking_provider", registered_id="open-tracking",
          installed="0.2.0", available="0.2.0", state="current", receipt=True,
