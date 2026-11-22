@@ -153,7 +153,7 @@ if ($null -eq $rows) {
     exit 0
 }
 
-$DescMax = 170   # about two lines of the description box under the list
+$DescMax = 110   # the description box under the list is two lines tall (measured on Windows)
 $items = New-Object System.Collections.Generic.List[object]
 $known = @{}
 $refused = New-Object System.Collections.Generic.List[string]
@@ -235,7 +235,12 @@ foreach ($r in @($rows)) {
     # The description box holds about two lines: what matters first, and the
     # whole text short (see $DescMax below).
     $desc = Clean (Get-Prop $r 'summary') 200
-    if ($status -eq 'unavailable') { $desc = "Not available: $reason." }
+    if ($status -eq 'unavailable') {
+        # The row already says "Not available": when the reason is long, it
+        # alone gets the two lines.
+        $desc = "Not available: $reason."
+        if ($desc.Length -gt $DescMax) { $desc = "$reason." }
+    }
     elseif ($status -eq 'current') { $desc = "Already installed; nothing is downloaded. $desc" }
     else {
         if ($unmet.Count -gt 0) { $desc = "Also needs, and does not install: $($unmet -join ', ') (not found). $desc" }

@@ -33,8 +33,10 @@ the conversion models:
 The status leads the row because the list cuts a long row on the right; `Downloaded` stands in
 for the size when the download cache already holds everything. The page uses the layout with
 the description under the list (`MUI_COMPONENTSPAGE_SMALLDESC`), which gives the list about
-twice the width. That box holds about two lines, so a description is at most 170 characters
-with what matters first: for a row that is not available, the reason and nothing else.
+twice the width and shows about five rows at once instead of nine. That box is two lines
+tall, so a description is at most 110 characters with what matters first: for a row that is
+not available, the reason and nothing else, without the "Not available:" lead when the reason
+is long (the row says it).
 
 - **Recommended** is the open conversion provider (`recommended: true` in the catalog), so
   "Convert to 3D" exists on a machine whose display vendor ships no converter (ADR-064 §7).
@@ -54,7 +56,7 @@ The core install does not depend on the catalog.
 | When | What happens |
 |---|---|
 | the catalog cannot be reached when the page opens | no optional row is shown; the text above the list says the runtime alone is installed and to run Setup again later; the finish page repeats it and names the open conversion provider as not offered |
-| a download or an item's installer fails later, or `dxr-get` refuses the item | the runtime is installed, the item is listed on the finish page and in `<install dir>\catalog-skipped.txt` with the reason and `dxr-get`'s exit code, Setup exits 0 |
+| a download or an item's installer fails later, or `dxr-get` refuses the item | the runtime is installed, the item is listed on the finish page and in `<install dir>\catalog-skipped.txt` with the reason and `dxr-get`'s exit code, Setup exits 0. "Run Setup again with an internet connection" is added only when an item failed for a connection reason (exit 10 or 20); a list of refusals ends after the list |
 | the connection drops between two items | the remaining items are skipped without further attempts, and listed |
 
 "How to get it later" is: run Setup again with a connection, or `dxr-get install <id>` from an

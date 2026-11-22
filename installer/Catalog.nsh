@@ -154,6 +154,7 @@ Var DxrCatSel          ; /COMPONENTS= value
 Var DxrCatUrl          ; /CATALOG= value
 Var DxrCatShown        ; 1 once the components page was shown
 Var DxrCatOffline      ; 1 once dxr-get reported no connection during install
+Var DxrCatRetry        ; 1 once an item failed for a connection reason (offline, a download)
 Var DxrCatSkipped      ; "name: reason" lines of what was not installed
 Var DxrCatExe          ; the dxr-get.exe the install step runs
 Var DxrCatDesc1
@@ -241,6 +242,7 @@ Function DxrCatInit
 	StrCpy $DxrCatCount 0
 	StrCpy $DxrCatShown 0
 	StrCpy $DxrCatOffline 0
+	StrCpy $DxrCatRetry 0
 	StrCpy $DxrCatSkipped ""
 	StrCpy $DxrCatIni ""
 	${GetParameters} $R0
@@ -449,6 +451,7 @@ FunctionEnd
 ; Never aborts: a failure is added to $DxrCatSkipped. Scratch: $R1-$R4.
 Function DxrCatInstallOne
 	${If} $DxrCatOffline == 1
+		StrCpy $DxrCatRetry 1
 		StrCpy $DxrCatSkipped "$DxrCatSkipped$R9: no connection$\r$\n"
 		Return
 	${EndIf}
@@ -494,6 +497,11 @@ Function DxrCatInstallOne
 	${ElseIf} $R3 == 50
 		StrCpy $R4 "dxr-get was not running elevated"
 	${EndIf}
+	; Only these are cured by running Setup again with a connection.
+	${If} $R3 == 10
+	${OrIf} $R3 == 20
+		StrCpy $DxrCatRetry 1
+	${EndIf}
 	DetailPrint "Catalog: $R9 - NOT installed: $R4 (dxr-get exit $R3)."
 	StrCpy $DxrCatSkipped "$DxrCatSkipped$R9: $R4 (dxr-get exit $R3)$\r$\n"
 FunctionEnd
@@ -536,6 +544,10 @@ Function DxrCatInstallDefault
 		StrCpy $R4 "a download failed verification and was discarded"
 	${ElseIf} $R3 == 30
 		StrCpy $R4 "a component's installer reported an error"
+	${EndIf}
+	${If} $R3 == 10
+	${OrIf} $R3 == 20
+		StrCpy $DxrCatRetry 1
 	${EndIf}
 	DetailPrint "Catalog: default set - NOT fully installed: $R4."
 	StrCpy $DxrCatSkipped "$DxrCatSkipped/COMPONENTS=default (the recommended set and what matches this computer's hardware): $R4$\r$\n"
@@ -653,13 +665,20 @@ Function DxrCatInstallChosen
 		${IfNot} ${Errors}
 			FileWrite $R0 "DisplayXR Setup ${VERSION}: the runtime was installed. These optional components were NOT installed:$\r$\n$\r$\n"
 			FileWrite $R0 "$DxrCatSkipped"
-			FileWrite $R0 "$\r$\nTo add them, run Setup again with an internet connection, or from an elevated prompt:$\r$\n"
-			FileWrite $R0 "  $\"$INSTDIR\dxr-get.exe$\" install <component>$\r$\n"
+			; Said only when it is true: a refused item (40, 41) is not cured
+			; by a connection.
+			${If} $DxrCatRetry == 1
+				FileWrite $R0 "$\r$\nTo add what failed for lack of a connection, run Setup again with an internet connection, or from an elevated prompt:$\r$\n"
+				FileWrite $R0 "  $\"$INSTDIR\dxr-get.exe$\" install <component>$\r$\n"
+			${EndIf}
 			FileClose $R0
 		${EndIf}
 		ClearErrors
 		StrCpy $DxrCatFinishExtra "$\r$\n$\r$\nNot installed:$\r$\n$DxrCatSkipped"
-		StrCpy $DxrCatFinishExtra "$DxrCatFinishExtra$\r$\nRun Setup again with an internet connection to add them (details: catalog-skipped.txt in the install folder)."
+		${If} $DxrCatRetry == 1
+			StrCpy $DxrCatFinishExtra "$DxrCatFinishExtra$\r$\nRun Setup again with an internet connection to add what could not be downloaded."
+		${EndIf}
+		StrCpy $DxrCatFinishExtra "$DxrCatFinishExtra$\r$\nDetails: catalog-skipped.txt in the install folder."
 	${Else}
 		${If} $DxrCatState == "offline"
 		${AndIf} $DxrCatShown == 1

@@ -165,8 +165,13 @@ class ShimTests(unittest.TestCase):
         for k, first in firsts.items():
             self.assertTrue(it[k]["label"].startswith(first), it[k]["label"])
         for v in it.values():
-            self.assertLessEqual(len(v["desc"]), 170)
-        self.assertTrue(it["ultraleap"]["desc"].startswith("Not available: needs a newer runtime."))
+            self.assertLessEqual(len(v["desc"]), 110)   # the box is two lines tall
+        # A long reason gets the whole box: the row already says "Not available".
+        self.assertTrue(it["ultraleap"]["desc"].startswith("needs a newer runtime. needs a newer"))
+        # A sentence of the length dxr-get gives for a fixture item fits whole, versions included.
+        real = "fixture.runtime-too-new 1.0.0 works with runtime versions up to 1.0.0; this machine would have 2.70.0"
+        lst["items"][4]["incompatible_reason"] = real
+        self.assertEqual(self.items(self.run_shim(lst))["ultraleap"]["desc"], real + ".")
         self.assertTrue(it["leia-conversion"]["desc"].startswith("Also needs, and does not install: NeurD runtime"))
 
     def test_rows_dropped_first_are_the_not_available_ones(self):
