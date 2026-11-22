@@ -1281,6 +1281,14 @@ main_loop(struct ipc_server *s)
 		// #951: per-client health snapshot, throttled.
 		emit_health_if_elapsed(s);
 
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+		// #1002: a lost device ends in an exit-for-relaunch. The render path
+		// counts that down, but it does not tick when nothing renders.
+		if (s->xsysc != NULL) {
+			comp_d3d11_service_device_removed_exit_if_due(s->xsysc);
+		}
+#endif
+
 		// #1721: ~1 Hz display-info re-pull while the plug-in has not
 		// identified the panel yet; a no-op once it has.
 		repull_display_info_if_unknown(s);

@@ -1212,6 +1212,19 @@ bool
 comp_d3d11_service_device_is_removed(struct xrt_system_compositor *xsysc);
 
 /*!
+ * #1002: exit the process if the device was lost and the exit delay
+ * (`DXR_DEVICE_REMOVED_EXIT_MS`) has passed. A no-op otherwise.
+ *
+ * The render path already does this on every tick. This entry point is for the
+ * IPC server's main loop, which keeps ticking when nothing renders. Call it
+ * from that loop only, never from an IPC handler.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_device_removed_exit_if_due(struct xrt_system_compositor *xsysc);
+
+/*!
  * Latest vendor-backend health the panel display processor reported: an
  * XRT_DP_BACKEND_STATE_* value (0 = ok, 1 = degraded, 2 = stale), polled at
  * ~1 Hz by the render thread.
