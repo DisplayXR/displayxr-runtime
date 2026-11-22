@@ -104,6 +104,7 @@ public sealed class CatalogPage : Page
         sb.Append(Ctx.CatalogLoading).Append(read?.Status).Append(read?.Title).Append('|')
           .Append(_class).Append(_installedOnly).Append(_detail).Append(_keyFor).Append('|');
         if (Ctx.CatalogOp is { } op) sb.Append(op.ItemId).Append(op.Verb).Append(op.Phase);
+        sb.Append(Ctx.CatalogBackground?.ItemId);
         if (Ctx.CatalogResult is { } res) sb.Append(res.ItemId).Append(res.Outcome.Title);
         sb.Append(Ctx.ActivatingItem).Append(Ctx.BuyStarting).Append(Ctx.BuyPending?.ItemId);
         if (Ctx.BuyNote is { } bn) sb.Append(bn.ItemId).Append(bn.Plan.Kind).Append(bn.Plan.Title);
@@ -209,7 +210,11 @@ public sealed class CatalogPage : Page
         bar.Children.Add(filters);
 
         _results = new Border { Child = Results(list) };
-        return U.VStack(18, bar, _results);
+        var page = U.VStack(18, bar);
+        // An engine run the Dashboard stopped waiting for: say why the buttons are waiting.
+        if (Ctx.CatalogBackground is { } bg) page.Children.Add(U.Notice(Level.Info, "Still working in the background", bg.Line));
+        page.Children.Add(_results);
+        return page;
     }
 
     private TextBox NewSearch()
@@ -315,7 +320,7 @@ public sealed class CatalogPage : Page
 
     // ── Actions ─────────────────────────────────────────────────────────────
 
-    private bool Busy => Ctx.CatalogOp is not null;
+    private bool Busy => Ctx.CatalogBusy;
 
     private Button? MainButton(CatalogItem i)
     {
@@ -332,7 +337,8 @@ public sealed class CatalogPage : Page
             b.IsEnabled = !Busy;
             ToolTip.SetShowOnDisabled(b, true);
             string size = i.SizeText is { } s ? $" ({s})" : "";
-            ToolTip.SetTip(b, Busy ? "One thing at a time: this starts when the current one is done."
+            ToolTip.SetTip(b, Ctx.CatalogBackground is { } bg ? bg.Line
+                : Busy ? "One thing at a time: this starts when the current one is done."
                 : $"Downloads{size}, checks the publisher's signature and installs. Windows asks for permission once.");
             AutomationProperties.SetName(b, $"{(i.Action == CatalogAction.Update ? "Update" : "Get")} {i.Name}");
         }
@@ -344,7 +350,8 @@ public sealed class CatalogPage : Page
     {
         var b = U.Button("Uninstall", () => _ = Ctx.RunCatalogAsync(CatalogVerb.Uninstall, i), "quiet", "sm");
         b.IsEnabled = !Busy;
-        ToolTip.SetTip(b, "Removes it from this machine. Windows asks for permission once.");
+        ToolTip.SetShowOnDisabled(b, true);
+        ToolTip.SetTip(b, Ctx.CatalogBackground is { } bg ? bg.Line : "Removes it from this machine. Windows asks for permission once.");
         AutomationProperties.SetName(b, $"Uninstall {i.Name}");
         return b;
     }
@@ -370,10 +377,19 @@ public sealed class CatalogPage : Page
             var bar = new ProgressBar { IsIndeterminate = true, Height = 4 };
             AutomationProperties.SetName(bar, op.Title);
             var stop = U.Button("Stop waiting", Ctx.StopWaitingForCatalog, "quiet", "sm");
-            ToolTip.SetTip(stop, "Stops the Dashboard waiting. Once Windows has given permission the work finishes on its own, so nothing is left half done.");
+            ToolTip.SetTip(stop, "Stops the Dashboard waiting, not the work: once it has started it finishes on its own, even if the Dashboard is closed, so nothing is left half done. Other installs wait until it is.");
             AutomationProperties.SetName(stop, $"Stop waiting for {i.Name}");
             var col = U.VStack(8, U.Flow(10, 2, title, _elapsed), bar, U.Wrapped(op.Phase, "soft"), stop);
             var box = new Border { Child = col };
+            box.Classes.Add("field");
+            AutomationProperties.SetLiveSetting(box, AutomationLiveSetting.Polite);
+            return box;
+        }
+        if (Ctx.CatalogBackground is { } bg && bg.ItemId == i.Id)
+        {
+            var bar = new ProgressBar { IsIndeterminate = true, Height = 4 };
+            AutomationProperties.SetName(bar, bg.Line);
+            var box = new Border { Child = U.VStack(8, bar, U.Wrapped(bg.Line, "soft")) };
             box.Classes.Add("field");
             AutomationProperties.SetLiveSetting(box, AutomationLiveSetting.Polite);
             return box;

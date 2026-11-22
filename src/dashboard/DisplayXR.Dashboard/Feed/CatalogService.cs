@@ -48,8 +48,12 @@ public enum EngineAvailability { Ready, NoEngineOnThisPlatform, Missing }
 
 public enum ElevatedEnd { Exited, Declined, StartFailed, TimedOut, StoppedWaiting }
 
-/// <summary>How one elevated engine run ended. <see cref="ExitCode"/> only for <see cref="ElevatedEnd.Exited"/>.</summary>
-public sealed record ElevatedResult(ElevatedEnd End, int ExitCode = -1, string? Error = null);
+/// <summary>
+/// How one work run ended. <see cref="ExitCode"/> only for <see cref="ElevatedEnd.Exited"/>.
+/// <see cref="StillRunning"/>: for <see cref="ElevatedEnd.StoppedWaiting"/> / <see cref="ElevatedEnd.TimedOut"/>,
+/// the engine that is still at work; it completes with the exit code when the process ends.
+/// </summary>
+public sealed record ElevatedResult(ElevatedEnd End, int ExitCode = -1, string? Error = null, Task<int>? StillRunning = null);
 
 /// <summary>The install engine as the Dashboard sees it. The app runs <c>dxr-get</c>; fixtures and tests fake it.</summary>
 public interface ICatalogEngine
@@ -59,19 +63,30 @@ public interface ICatalogEngine
     /// <summary>Where the engine is (or was looked for), for the log and the "engine missing" view.</summary>
     string Path { get; }
 
-    /// <summary>This process is already elevated: one run does the work, no second prompt.</summary>
+    /// <summary>
+    /// This process is already elevated. A run through <see cref="RunAsync"/> would then be the real
+    /// install, in the kill-on-close job and killed by its cancel token, so the service never uses
+    /// <see cref="RunAsync"/> for a verb that changes the machine in that case: it goes straight to
+    /// <see cref="RunElevatedAsync"/>, which starts no prompt when the caller is already elevated.
+    /// </summary>
     bool AlreadyElevated { get; }
 
-    /// <summary>Run a verb as this user, output captured. Cancelling kills it (it changes nothing un-elevated).</summary>
+    /// <summary>
+    /// Run a verb as this user, output captured, as a child that dies with the Dashboard. Cancelling
+    /// kills it. Only for reads, and for the unelevated first ask of a verb (which changes nothing).
+    /// </summary>
     Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel);
 
     /// <summary>
-    /// Run a verb elevated: one Windows permission prompt, no captured output (an elevated child's
-    /// pipes cannot be read from here), the exit code when it ends. Cancelling stops the WAIT, never
-    /// the engine: a non-elevated process cannot stop an elevated one, and an installer is not a
-    /// thing to interrupt.
+    /// Run a verb that changes the machine: elevated (one Windows permission prompt, or none when
+    /// the Dashboard is already elevated), detached from the Dashboard (never in its kill-on-close
+    /// job, never killed), no captured output (an elevated child's pipes cannot be read from here),
+    /// the exit code when it ends. <paramref name="stopWaiting"/> and <paramref name="timeout"/> end
+    /// the WAIT, never the engine: an installer is not a thing to interrupt, so it outlives the wait
+    /// and the window. <paramref name="started"/> is called once the process is known to be running
+    /// (the prompt, if any, was answered Yes).
     /// </summary>
-    Task<ElevatedResult> RunElevatedAsync(CliArgs args, TimeSpan timeout, CancellationToken stopWaiting);
+    Task<ElevatedResult> RunElevatedAsync(CliArgs args, TimeSpan timeout, CancellationToken stopWaiting, Action? started = null);
 }
 
 /// <summary><c>dxr-get.exe</c>: beside the CLI (the runtime installer puts both there).</summary>
@@ -115,15 +130,18 @@ public sealed class DxrGetEngine : ICatalogEngine
             : _runner.RunAsync(args, timeout, cancel);
 
     /// <summary>
-    /// The start info of the elevated run: the shell's <c>runas</c> verb on the engine itself (never a
-    /// command interpreter), arguments as a vector, no window.
+    /// The start info of the work run: the shell's <c>runas</c> verb on the engine itself (never a
+    /// command interpreter), arguments as a vector, no window. From an already elevated Dashboard
+    /// (<paramref name="alreadyElevated"/>) the verb is the default one: the child inherits the
+    /// elevation and no prompt is involved. Either way it is started through the shell, with no
+    /// redirected pipes: it is not a job child and nothing here can kill it.
     /// </summary>
-    public static ProcessStartInfo ElevatedStartInfo(string enginePath, CliArgs args)
+    public static ProcessStartInfo ElevatedStartInfo(string enginePath, CliArgs args, bool alreadyElevated = false)
     {
         var psi = new ProcessStartInfo(enginePath)
         {
             UseShellExecute = true,
-            Verb = "runas",
+            Verb = alreadyElevated ? "" : "runas",
             WindowStyle = ProcessWindowStyle.Hidden,
             WorkingDirectory = System.IO.Path.GetDirectoryName(enginePath) ?? "",
         };
@@ -131,14 +149,15 @@ public sealed class DxrGetEngine : ICatalogEngine
         return psi;
     }
 
-    public async Task<ElevatedResult> RunElevatedAsync(CliArgs args, TimeSpan timeout, CancellationToken stopWaiting)
+    public async Task<ElevatedResult> RunElevatedAsync(CliArgs args, TimeSpan timeout, CancellationToken stopWaiting, Action? started = null)
     {
         if (Availability != EngineAvailability.Ready) return new(ElevatedEnd.StartFailed, Error: $"{ExeName} not found.");
         Process? p;
         try
         {
             // Off the UI thread: ShellExecuteEx blocks until the permission prompt is answered.
-            p = await Task.Run(() => Process.Start(ElevatedStartInfo(Path, args)), CancellationToken.None).ConfigureAwait(false);
+            // Deliberately NOT ChildJob.Add: this process must outlive the Dashboard.
+            p = await Task.Run(() => Process.Start(ElevatedStartInfo(Path, args, AlreadyElevated)), CancellationToken.None).ConfigureAwait(false);
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == 1223 /* ERROR_CANCELLED: the prompt was declined */)
         {
@@ -149,23 +168,29 @@ public sealed class DxrGetEngine : ICatalogEngine
             return new(ElevatedEnd.StartFailed, Error: ex.Message);
         }
         if (p is null) return new(ElevatedEnd.StartFailed, Error: "Windows did not start it.");
-        using (p)
+        try { started?.Invoke(); } catch { }
+        // The process is waited for to its end whatever happens to the wait below, and is never killed.
+        var exit = Task.Run(async () =>
         {
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(stopWaiting);
-            cts.CancelAfter(timeout);
-            try
+            using (p)
             {
-                await p.WaitForExitAsync(cts.Token).ConfigureAwait(false);
-                return new(ElevatedEnd.Exited, p.ExitCode);
+                await p.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+                return p.ExitCode;
             }
-            catch (OperationCanceledException)
-            {
-                return new(stopWaiting.IsCancellationRequested ? ElevatedEnd.StoppedWaiting : ElevatedEnd.TimedOut);
-            }
-            catch (Exception ex)
-            {
-                return new(ElevatedEnd.StartFailed, Error: ex.Message);
-            }
+        });
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(stopWaiting);
+        cts.CancelAfter(timeout);
+        try
+        {
+            return new(ElevatedEnd.Exited, await exit.WaitAsync(cts.Token).ConfigureAwait(false));
+        }
+        catch (OperationCanceledException)
+        {
+            return new(stopWaiting.IsCancellationRequested ? ElevatedEnd.StoppedWaiting : ElevatedEnd.TimedOut, StillRunning: exit);
+        }
+        catch (Exception ex)
+        {
+            return new(ElevatedEnd.StartFailed, Error: ex.Message);
         }
     }
 }
@@ -216,7 +241,11 @@ public sealed class CatalogService
     /// <summary>
     /// Install, update or uninstall one item. First as this user: the engine answers what elevation
     /// cannot fix (offline, not compatible, nothing to do, no receipt) with no prompt at all, and exit
-    /// 50 when elevating is all that is missing. Only then elevated, once.
+    /// 50 when elevating is all that is missing. Only then the work run, once.
+    ///
+    /// <para>From an already elevated Dashboard there is no unelevated first ask: that run would be
+    /// the install itself, as a killable job child. The work run is started directly; it answers the
+    /// same exit codes, and "Stop waiting" or closing the window leaves it running.</para>
     /// </summary>
     public async Task<CatalogOutcome> RunAsync(CatalogVerb verb, CatalogItem item, Action<string> phase, CancellationToken stopWaiting)
     {
@@ -226,31 +255,32 @@ public sealed class CatalogService
         try { args = CatalogCommands.For(verb, item.Id); }
         catch (ArgumentException) { return CatalogExit.StartFailed("That item has an id the install engine would not accept."); }
 
-        phase("Checking…");
-        // Already elevated: this run is the real one, so it gets the long bound.
-        var first = await _engine.RunAsync(args, _engine.AlreadyElevated ? WorkTimeout : ReadTimeout, stopWaiting).ConfigureAwait(false);
-        if (stopWaiting.IsCancellationRequested && !_engine.AlreadyElevated)
-            return new CatalogOutcome(false, Level.Info, "Nothing was changed", $"{item.Name} is as it was.");
-        if (!first.Started) return CatalogExit.StartFailed(first.StartError);
-        if (first.TimedOut) return CatalogExit.TimedOut(verb, item.Name);
-        if (first.ExitCode != CatalogExit.NeedsAdmin) return CatalogExit.Describe(verb, first.ExitCode, item.Name);
-
-        phase("Waiting for your permission…");
-        var run = _engine.RunElevatedAsync(args, WorkTimeout, stopWaiting);
-        // The prompt is up to the user; once the engine runs there is nothing finer to report
-        // (the engine prints no progress a UI can render), so say what it is doing in general.
-        _ = Task.Delay(TimeSpan.FromSeconds(4), stopWaiting).ContinueWith(t =>
+        if (!_engine.AlreadyElevated)
         {
-            if (!t.IsCanceled && !run.IsCompleted)
-                phase(verb == CatalogVerb.Uninstall ? "Removing…" : "Downloading, verifying and installing…");
-        }, TaskScheduler.Default);
+            phase("Checking…");
+            var first = await _engine.RunAsync(args, ReadTimeout, stopWaiting).ConfigureAwait(false);
+            // Unelevated, this run changed nothing, so stopping here is exact.
+            if (stopWaiting.IsCancellationRequested)
+                return new CatalogOutcome(false, Level.Info, "Nothing was changed", $"{item.Name} is as it was.");
+            if (!first.Started) return CatalogExit.StartFailed(first.StartError);
+            if (first.TimedOut)
+                return new CatalogOutcome(false, Level.Info, "The Catalog is taking too long",
+                                          $"Nothing was changed: {item.Name} is as it was. Check your connection and try again.");
+            if (first.ExitCode != CatalogExit.NeedsAdmin) return CatalogExit.Describe(verb, first.ExitCode, item.Name);
+        }
+
+        // Until the process is known to be running, the only true thing to say is that we wait:
+        // for the permission prompt, or (already elevated) for Windows to start it.
+        string working = verb == CatalogVerb.Uninstall ? "Removing…" : "Downloading, verifying and installing…";
+        phase(_engine.AlreadyElevated ? "Starting…" : "Waiting for your permission…");
+        var run = _engine.RunElevatedAsync(args, WorkTimeout, stopWaiting, () => phase(working));
         var r = await run.ConfigureAwait(false);
         return r.End switch
         {
             ElevatedEnd.Exited => CatalogExit.Describe(verb, r.ExitCode, item.Name),
             ElevatedEnd.Declined => CatalogExit.Declined(item.Name),
-            ElevatedEnd.TimedOut => CatalogExit.TimedOut(verb, item.Name),
-            ElevatedEnd.StoppedWaiting => CatalogExit.StoppedWaiting(item.Name),
+            ElevatedEnd.TimedOut => CatalogExit.TimedOut(verb, item.Name) with { StillRunning = r.StillRunning },
+            ElevatedEnd.StoppedWaiting => CatalogExit.StoppedWaiting(item.Name) with { StillRunning = r.StillRunning },
             _ => CatalogExit.StartFailed(r.Error),
         };
     }
@@ -259,7 +289,11 @@ public sealed class CatalogService
 
     /// <summary><c>&lt;class&gt; activate &lt;id&gt; @&lt;file&gt; --json</c>: the key travels in a file only its owner can read.</summary>
     public static CliArgs ActivateCommand(ComponentClass cls, string id, string keyFile) =>
-        new(cls.Verb(), "activate", id, "@" + keyFile, "--json");
+        new(cls.Verb(), "activate", CheckedComponent(id), "@" + keyFile, "--json");
+
+    /// <summary>A component id is one safe argument, by the same rule as a catalog id; anything else is refused.</summary>
+    private static string CheckedComponent(string id) =>
+        CatalogList.IdIsSafe(id) ? id : throw new ArgumentException("not a component id", nameof(id));
 
     /// <summary>
     /// Deliver a pasted key to a component. The key is written to a new file readable by this user
@@ -272,6 +306,8 @@ public sealed class CatalogService
         key = key.Trim();
         if (key.Length == 0 || key.Any(c => c is '\r' or '\n'))
             return new ActivationOutcome(false, "That key is empty or has a line break", "Paste the key exactly as you received it.");
+        if (!CatalogList.IdIsSafe(id))
+            return new ActivationOutcome(false, "The key could not be delivered", $"{name} has an id DisplayXR would not pass on.");
         string? file = null;
         try
         {
@@ -295,7 +331,8 @@ public sealed class CatalogService
     }
 
     /// <summary><c>&lt;class&gt; activate-begin &lt;id&gt; --json</c> (activation-deep-link.md §3).</summary>
-    public static CliArgs ActivateBeginCommand(ComponentClass cls, string id) => new(cls.Verb(), "activate-begin", id, "--json");
+    public static CliArgs ActivateBeginCommand(ComponentClass cls, string id) =>
+        new(cls.Verb(), "activate-begin", CheckedComponent(id), "--json");
 
     /// <summary>
     /// What Buy does for one component. When the component takes a deep-link token, the CLI's
@@ -309,7 +346,7 @@ public sealed class CatalogService
                                             CancellationToken cancel = default)
     {
         // The component says it takes no deep-link token: do not load it just to hear "no-deep-link".
-        if (deepLink == false) return BuyPlan.Fallback(name, purchase);
+        if (deepLink == false || !CatalogList.IdIsSafe(id)) return BuyPlan.Fallback(name, purchase);
         try
         {
             var r = await _cli.RunAsync(ActivateBeginCommand(cls, id), TimeSpan.FromSeconds(60), cancel).ConfigureAwait(false);

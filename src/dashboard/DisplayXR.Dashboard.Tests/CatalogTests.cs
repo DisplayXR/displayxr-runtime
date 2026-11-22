@@ -287,7 +287,157 @@ public class CatalogTests
         Assert.Equal(1, engine.Runs);
         Assert.Equal(1, engine.ElevatedRuns);
         Assert.Equal(engine.LastArgs!.Args, engine.LastElevatedArgs!.Args); // the same command, elevated
-        Assert.Equal(new[] { "Checking…", "Waiting for your permission…" }, phases.Take(2));
+        // F4: "installing" is said only once the process is known to be running (the prompt was answered).
+        Assert.Equal(new[] { "Checking…", "Waiting for your permission…", "Downloading, verifying and installing…" }, phases);
+    }
+
+    [Fact]
+    public async Task WhileThePermissionPromptIsUnanswered_ThePhaseNeverClaimsToBeInstalling()
+    {
+        var engine = new FakeEngine { First = 50, PromptAnswered = false };
+        var phases = new List<string>();
+        var o = await new CatalogService(engine, new RecordingCli()).RunAsync(CatalogVerb.Install, Item("open-conversion"), phases.Add, default);
+        Assert.Equal("Nothing was changed", o.Title);
+        Assert.Equal(new[] { "Checking…", "Waiting for your permission…" }, phases);
+    }
+
+    // F1: an already elevated Dashboard. The run that changes the machine must never be the killable
+    // job child, and "Stop waiting" must leave it running.
+
+    [Fact]
+    public async Task AlreadyElevated_TheInstallNeverGoesThroughTheKillableRun()
+    {
+        var engine = new FakeEngine { AlreadyElevated = true, Elevated = new ElevatedResult(ElevatedEnd.Exited, 0) };
+        using var stop = new CancellationTokenSource();
+        var phases = new List<string>();
+        var o = await new CatalogService(engine, new RecordingCli()).RunAsync(CatalogVerb.Install, Item("open-conversion"), phases.Add, stop.Token);
+        Assert.True(o.Ok);
+        Assert.Equal(0, engine.Runs);                    // no captured, job-child, kill-on-cancel run at all
+        Assert.False(engine.KillableRunGotAStopToken);
+        Assert.Equal(1, engine.ElevatedRuns);            // the detached work run, once
+        Assert.Equal(new[] { "Starting…", "Downloading, verifying and installing…" }, phases); // no prompt is claimed
+        // The work run still answers what the unelevated ask would have: nothing to do, offline, not compatible.
+        foreach (int code in new[] { 10, 41, 42, 43 })
+        {
+            engine.Elevated = new ElevatedResult(ElevatedEnd.Exited, code);
+            Assert.Equal(code, (await new CatalogService(engine, new RecordingCli()).RunAsync(CatalogVerb.Uninstall, Item(), _ => { }, default)).ExitCode);
+        }
+        Assert.Equal(0, engine.Runs);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task StopWaiting_LeavesTheEngineRunning_AndSaysSo(bool alreadyElevated)
+    {
+        var engine = new FakeEngine { AlreadyElevated = alreadyElevated, First = 50, Work = new TaskCompletionSource<int>() };
+        using var stop = new CancellationTokenSource();
+        var run = new CatalogService(engine, new RecordingCli()).RunAsync(CatalogVerb.Install, Item("open-conversion"), _ => { }, stop.Token);
+        Assert.False(run.IsCompleted);
+        stop.Cancel();
+        var o = await run;
+        Assert.Equal("Still working in the background", o.Title);
+        Assert.Contains("keeps going", o.Text);
+        Assert.NotNull(o.StillRunning);
+        Assert.False(o.StillRunning!.IsCompleted);       // the work was not ended by the stop
+        engine.Work.SetResult(0);
+        Assert.Equal(0, await o.StillRunning);
+    }
+
+    [Fact]
+    public void TheWorkRun_IsNeverAJobChild_AndFromAnElevatedDashboardRaisesNoPrompt()
+    {
+        var psi = DxrGetEngine.ElevatedStartInfo(@"C:\Program Files\DisplayXR\Runtime\dxr-get.exe", CatalogCommands.Install("leia-sr"), alreadyElevated: true);
+        Assert.True(psi.UseShellExecute);                // started by the shell: no pipes, not ours to kill
+        Assert.Equal("", psi.Verb);                      // inherits the elevation; "runas" is for the non-elevated case
+        Assert.False(psi.RedirectStandardOutput);
+        Assert.False(psi.RedirectStandardInput);
+        Assert.Equal(new[] { "install", "leia-sr", "--yes", "--json", "--no-runtime" }, psi.ArgumentList);
+    }
+
+    // F2: while the engine may still be running, nothing else starts.
+
+    [Fact]
+    public async Task AfterStopWaiting_ActionsStayBusy_UntilTheEngineExits_OrRefresh()
+    {
+        var engine = new FakeEngine { First = 50, Work = new TaskCompletionSource<int>() };
+        DashboardLog.Disabled = true;
+        var ctx = new DashboardContext(new StatusFeed(new FakeSource(), new ManualScheduler()), new CliProcessSource("no-such-cli"), new RecordingCli(), engine);
+        var item = Item("open-conversion");
+        var run = ctx.RunCatalogAsync(CatalogVerb.Install, item);
+        for (int i = 0; i < 200 && engine.ElevatedRuns == 0; i++) await Task.Delay(10);
+        Assert.NotNull(ctx.CatalogOp);
+        ctx.StopWaitingForCatalog();
+        await run;
+        Assert.Null(ctx.CatalogOp);
+        Assert.NotNull(ctx.CatalogBackground);
+        Assert.True(ctx.CatalogBusy);
+        Assert.Contains("still being installed", ctx.CatalogBackground!.Line);
+
+        // A second verb is refused while the first engine may still be at work.
+        await ctx.RunCatalogAsync(CatalogVerb.Uninstall, Item("acme-depth"));
+        Assert.Equal(1, engine.ElevatedRuns);
+
+        engine.Work.SetResult(0); // the engine exits
+        for (int i = 0; i < 200 && ctx.CatalogBusy; i++) await Task.Delay(10);
+        Assert.False(ctx.CatalogBusy);
+        Assert.True(ctx.CatalogResult!.Value.Outcome.Ok);
+        Assert.Equal("Open conversion provider is installed", ctx.CatalogResult.Value.Outcome.Title);
+
+        // Refresh also clears it (the list the user then sees is the answer).
+        engine.Work = new TaskCompletionSource<int>();
+        run = ctx.RunCatalogAsync(CatalogVerb.Install, item);
+        for (int i = 0; i < 200 && engine.ElevatedRuns < 2; i++) await Task.Delay(10);
+        ctx.StopWaitingForCatalog();
+        await run;
+        Assert.True(ctx.CatalogBusy);
+        ctx.ForgetCatalogBackground();
+        Assert.False(ctx.CatalogBusy);
+    }
+
+    // F7: the registered id is an argument of the CLI too.
+
+    [Theory]
+    [InlineData("--machine")]
+    [InlineData("-x")]
+    [InlineData("a b")]
+    [InlineData("@C:\\secrets.txt")]
+    [InlineData("a\"b")]
+    public async Task ARegisteredIdThatIsNotOneSafeArgument_NeverReachesTheCli(string registered)
+    {
+        string json = "{\"schema\":2,\"items\":[{\"id\":\"ok-item\",\"name\":\"X\",\"class\":\"conversion_provider\",\"registered_id\":"
+                      + System.Text.Json.JsonSerializer.Serialize(registered) + ",\"state\":\"current\"}]}";
+        Assert.True(CatalogList.TryParse(json, out var list));
+        var item = Assert.Single(list!.Items);
+        Assert.Null(item.RegisteredId);                  // dropped when the list is read
+        Assert.Equal("ok-item", item.ComponentId);
+        Assert.True(CatalogList.IdIsSafe(item.ComponentId));
+
+        Assert.Throws<ArgumentException>(() => CatalogService.ActivateCommand(ComponentClass.Conversion, registered, "f"));
+        Assert.Throws<ArgumentException>(() => CatalogService.ActivateBeginCommand(ComponentClass.Conversion, registered));
+
+        var cli = new RecordingCli();
+        var svc = new CatalogService(new FakeEngine(), cli);
+        string dir = Path.Combine(Path.GetTempPath(), "dxr-dash-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Assert.False((await svc.ActivateAsync(ComponentClass.Conversion, registered, "X", Secret, dir)).Accepted);
+            Assert.False(Directory.Exists(dir) && Directory.GetFiles(dir).Length > 0); // no key file was even written
+            var plan = await svc.BeginBuyAsync(ComponentClass.Conversion, registered, "X", Purchase, true);
+            Assert.Equal(BuyKind.OpenPurchasePage, plan.Kind);
+            Assert.Empty(cli.Argv);
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void ASafeRegisteredId_IsKept()
+    {
+        Assert.Equal("leia-sr", Parse("catalog-list-v2.json").Find("leia-sr")!.RegisteredId);
+        Assert.Equal(new[] { "conv", "activate-begin", "acme.depth_2", "--json" }, CatalogService.ActivateBeginCommand(ComponentClass.Conversion, "acme.depth_2").Args);
     }
 
     [Theory]
@@ -327,8 +477,11 @@ public class CatalogTests
     {
         var svc = new CatalogService(new FakeEngine { StartError = "not found" }, new RecordingCli());
         Assert.Contains("did not start", (await svc.RunAsync(CatalogVerb.Install, Item(), _ => { }, default)).Title);
+        // The unelevated ask timing out changed nothing, and says exactly that.
         svc = new CatalogService(new FakeEngine { TimesOut = true }, new RecordingCli());
-        Assert.Contains("longer than expected", (await svc.RunAsync(CatalogVerb.Install, Item(), _ => { }, default)).Title);
+        var slow = await svc.RunAsync(CatalogVerb.Install, Item(), _ => { }, default);
+        Assert.Contains("taking too long", slow.Title);
+        Assert.Contains("Nothing was changed", slow.Text);
     }
 
     [Fact]
@@ -922,21 +1075,31 @@ public class CatalogTests
 
         public EngineAvailability Availability => EngineAvailability.Ready;
         public string Path => "dxr-get.exe";
-        public bool AlreadyElevated => false;
+        public bool AlreadyElevated { get; set; }
+        /// <summary>The killable, job-child path received a token that can be cancelled (the Stop waiting token).</summary>
+        public bool KillableRunGotAStopToken;
+        /// <summary>When set, the work run does not end until this completes (and reports StoppedWaiting if the wait is stopped first).</summary>
+        public TaskCompletionSource<int>? Work;
+        public bool PromptAnswered = true;
 
         public Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel)
         {
             if (args.Args.Contains("--installed")) return Task.FromResult(new CliResult(0, InstalledJson, "", false, null));
             Runs++;
             LastArgs = args;
+            KillableRunGotAStopToken |= cancel.CanBeCanceled;
             return Task.FromResult(new CliResult(StartError is null ? First : -1, "", "", TimesOut, StartError));
         }
 
-        public Task<ElevatedResult> RunElevatedAsync(CliArgs args, TimeSpan timeout, CancellationToken stopWaiting)
+        public async Task<ElevatedResult> RunElevatedAsync(CliArgs args, TimeSpan timeout, CancellationToken stopWaiting, Action? started = null)
         {
             ElevatedRuns++;
             LastElevatedArgs = args;
-            return Task.FromResult(Elevated);
+            if (!PromptAnswered) return new ElevatedResult(ElevatedEnd.Declined);
+            started?.Invoke();
+            if (Work is null) return Elevated;
+            try { return new ElevatedResult(ElevatedEnd.Exited, await Work.Task.WaitAsync(stopWaiting)); }
+            catch (OperationCanceledException) { return new ElevatedResult(ElevatedEnd.StoppedWaiting, StillRunning: Work.Task); }
         }
     }
 }

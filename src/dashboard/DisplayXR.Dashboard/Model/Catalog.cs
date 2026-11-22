@@ -98,7 +98,10 @@ public sealed record CatalogItem(
         _ => null,
     };
 
-    /// <summary>The id the item registers under in its class (the Components row), else its catalog id.</summary>
+    /// <summary>
+    /// The id the item registers under in its class (the Components row), else its catalog id. Always
+    /// one safe argument: an unsafe <c>registered_id</c> is dropped when the list is read.
+    /// </summary>
     public string ComponentId => RegisteredId is { Length: > 0 } r ? r : Id;
 
     public bool Matches(string query)
@@ -186,7 +189,9 @@ public sealed record CatalogList(int Schema, IReadOnlyList<CatalogItem> Items)
             if (root.ValueKind != JsonValueKind.Object || !root.Has("items")) return false;
             var items = root.Arr("items").Where(e => e.ValueKind == JsonValueKind.Object && IdIsSafe(e.Str("id")))
                 .Select(e => new CatalogItem(
-                    e.Str("id"), e.Str("name", e.Str("id")), e.Str("class"), e.StrOrNull("registered_id"),
+                    e.Str("id"), e.Str("name", e.Str("id")), e.Str("class"),
+                    // The registered id becomes an argument of the CLI (activate, activate-begin): same rule as the id.
+                    e.StrOrNull("registered_id") is { } reg && IdIsSafe(reg) ? reg : null,
                     CatalogText.PublisherLabel(e.Str("publisher"), e.StrOrNull("publisher_name")), e.Str("tier"), e.StrOrNull("installed"), e.StrOrNull("available"),
                     e.Str("state", "not_installed"), e.Bool("installable"), e.Bool("receipt"), e.StrOrNull("listing"),
                     e.Str("summary"),
@@ -291,6 +296,12 @@ public enum CatalogVerb { Install, Update, Uninstall }
 /// <summary>How an operation ended, in words: never a bare code, never a spinner left behind.</summary>
 public sealed record CatalogOutcome(bool Ok, Level Level, string Title, string Text, int? ExitCode = null)
 {
+    /// <summary>
+    /// The engine is still at work (the wait was stopped or timed out): completes with its exit code.
+    /// While it runs, nothing else is started: the engine takes no lock of its own.
+    /// </summary>
+    public System.Threading.Tasks.Task<int>? StillRunning { get; init; }
+
     /// <summary>The list may have changed: re-read it.</summary>
     public bool Changed => Ok;
 }
@@ -346,12 +357,13 @@ public static class CatalogExit
     public static CatalogOutcome StartFailed(string? why) => new(false, Level.Warn, "The install engine did not start",
         $"Nothing was changed. {(why is { Length: > 0 } ? why : "Try again; if it keeps happening, reinstall DisplayXR.")}");
 
+    /// <summary>The work run outlasted the wait. It was not stopped: it is detached from the Dashboard and never killed.</summary>
     public static CatalogOutcome TimedOut(CatalogVerb verb, string name) => new(false, Level.Warn, "This is taking longer than expected",
-        $"The Dashboard stopped waiting. {name} may still finish in the background; press Refresh in a few minutes to see where it stands.");
+        $"The Dashboard stopped waiting. {name} is still being worked on in the background and was not interrupted; this page updates when it ends, or press Refresh.");
 
-    /// <summary>The user stopped waiting. The elevated engine cannot be stopped from a non-elevated app, and is not.</summary>
+    /// <summary>The user stopped waiting. The work run is detached from the Dashboard and is never stopped, elevated Dashboard or not.</summary>
     public static CatalogOutcome StoppedWaiting(string name) => new(false, Level.Info, "Still working in the background",
-        $"The Dashboard stopped waiting, but {name} keeps going so it is never left half done. Press Refresh in a few minutes to see the result.");
+        $"The Dashboard stopped waiting, but {name} keeps going so it is never left half done, even if you close the Dashboard. This page updates when it ends, or press Refresh.");
 }
 
 /// <summary>
@@ -552,6 +564,17 @@ public sealed class CatalogOperation
         CatalogVerb.Update => $"Updating {Name}",
         _ => $"Removing {Name}",
     };
+}
+
+/// <summary>An engine run still at work after the Dashboard stopped waiting for it.</summary>
+public sealed record CatalogBackground(string ItemId, string Name, CatalogVerb Verb)
+{
+    public string Line => Verb switch
+    {
+        CatalogVerb.Uninstall => $"{Name} is still being removed in the background.",
+        CatalogVerb.Update => $"{Name} is still being updated in the background.",
+        _ => $"{Name} is still being installed in the background.",
+    } + " Other installs wait until it is done; this page updates by itself, or press Refresh.";
 }
 
 /// <summary>

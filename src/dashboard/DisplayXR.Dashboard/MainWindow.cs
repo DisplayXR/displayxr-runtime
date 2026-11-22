@@ -470,6 +470,7 @@ public sealed class MainWindow : Window
                 _ = _ctx.LoadWorkspaceAsync(force: true);
                 break;
             case "catalog":
+                _ctx.ForgetCatalogBackground();
                 _ = _ctx.LoadCatalogAsync(force: true);
                 foreach (var c in ComponentClasses.All) _ = _ctx.LoadPolicyAsync(c, force: true);
                 break;
@@ -571,6 +572,7 @@ public sealed class MainWindow : Window
     {
         if (_shutdown) return;
         _shutdown = true;
+        _ctx.Shutdown(); // ends the Buy poll and the Dashboard's waits; a running install is left alone
         try
         {
             // Hand the workspace hotkey back before the process goes (the service

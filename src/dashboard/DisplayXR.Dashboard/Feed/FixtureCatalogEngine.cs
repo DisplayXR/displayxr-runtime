@@ -101,7 +101,7 @@ public sealed class FixtureCatalogEngine : ICatalogEngine
         return Task.FromResult(Exit(CatalogExit.Usage, "", $"fixture: unsupported '{args}'"));
     }
 
-    public async Task<ElevatedResult> RunElevatedAsync(CliArgs args, TimeSpan timeout, CancellationToken stopWaiting)
+    public async Task<ElevatedResult> RunElevatedAsync(CliArgs args, TimeSpan timeout, CancellationToken stopWaiting, Action? started = null)
     {
         var a = args.Args.ToArray();
         string id = a.Length > 1 ? a[1] : "";
@@ -109,18 +109,29 @@ public sealed class FixtureCatalogEngine : ICatalogEngine
         lock (_gate) it = Item(id);
         if (it is null) return new(ElevatedEnd.Exited, CatalogExit.NotFetchable);
         if (it["fixture_prompt"]?.GetValue<string>() == "declined") return new(ElevatedEnd.Declined);
-        try { await Task.Delay(_work, stopWaiting).ConfigureAwait(false); }
-        catch (OperationCanceledException) { return new(ElevatedEnd.StoppedWaiting); }
+        started?.Invoke();
+        // Like the real engine, the work is never interrupted: stopping the wait leaves it running.
+        var work = Task.Run(async () =>
+        {
+            await Task.Delay(_work).ConfigureAwait(false);
+            return Finish(a, it);
+        });
+        try { return new(ElevatedEnd.Exited, await work.WaitAsync(stopWaiting).ConfigureAwait(false)); }
+        catch (OperationCanceledException) { return new(ElevatedEnd.StoppedWaiting, StillRunning: work); }
+    }
+
+    private int Finish(string[] a, JsonObject it)
+    {
         lock (_gate)
         {
             if (a[0] == "install")
             {
-                if (it["fixture_exit"]?.GetValue<int>() is { } forced and not 0) return new(ElevatedEnd.Exited, forced);
+                if (it["fixture_exit"]?.GetValue<int>() is { } forced and not 0) return forced;
                 it["installed"] = it["available"]?.GetValue<string>();
                 it["state"] = "current";
                 it["receipt"] = true;
                 it["download"] = 0;
-                return new(ElevatedEnd.Exited, 0);
+                return 0;
             }
             if (a[0] == "uninstall")
             {
@@ -128,9 +139,9 @@ public sealed class FixtureCatalogEngine : ICatalogEngine
                 it["state"] = "not_installed";
                 it["receipt"] = false;
                 it["download"] = it["size"]?.GetValue<long>() ?? 0;
-                return new(ElevatedEnd.Exited, 0);
+                return 0;
             }
         }
-        return new(ElevatedEnd.Exited, CatalogExit.Usage);
+        return CatalogExit.Usage;
     }
 }

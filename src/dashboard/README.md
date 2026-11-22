@@ -55,15 +55,24 @@ ADR-064 step 8. Spec of the engine: [dxr-get.md](../../docs/specs/runtime/dxr-ge
   as the user, output captured. The engine answers what elevation cannot fix before it asks for
   it (offline 10, bad signature 11, not compatible 41, nothing to do 0, no receipt 42, cannot
   uninstall 43), so none of those raises a prompt. Only on exit 50 is the same command started
-  again through the shell's `runas` verb on `dxr-get.exe` itself: one Windows permission prompt,
-  no command interpreter, arguments as a vector. An elevated child's output cannot be read from
-  a non-elevated process, so that run reports its exit code only, and the page shows an
-  indeterminate bar, the elapsed time and a phase line (the engine prints no progress a UI can
-  render). The wait is bounded (75 min; the engine bounds a component installer at one hour).
-  **Stop waiting** stops the wait, never the engine: a non-elevated process cannot stop an
-  elevated one, and an installer is not interrupted half way; the page says so and Refresh shows
-  the result. Every ending is a sentence (`Model/Catalog.cs` `CatalogExit`): each exit code, a
-  declined prompt, an engine that did not start, a timeout. The list is re-read afterwards.
+  again as the **work run**: the shell's `runas` verb on `dxr-get.exe` itself (one Windows
+  permission prompt, no command interpreter, arguments as a vector).
+- **The work run is detached and never killed.** It is started through the shell, is not put in
+  the Dashboard's kill-on-close job and is given no kill token, so it outlives the wait and the
+  window. Its output cannot be read (an elevated child's pipes are out of reach), so it reports
+  its exit code only, and the page shows an indeterminate bar, the elapsed time and a phase line
+  (the engine prints no progress a UI can render). The phase says "Waiting for your permission…"
+  until the process is known to be running, and only then "Downloading, verifying and
+  installing…". The wait is bounded (75 min; the engine bounds a component installer at one hour).
+- **From an already elevated Dashboard** there is no unelevated first run: it would be the install
+  itself, as a job child killed by Stop waiting or by closing the window. The work run is started
+  directly (default verb, the elevation is inherited, no prompt) and answers the same exit codes.
+- **Stop waiting** stops the wait, never the engine, elevated Dashboard or not. While the engine
+  may still be at work, Get it / Update / Uninstall stay disabled on every item, with a line saying
+  what is still running (the engine takes no lock, so a second run must not start beside it). They
+  come back when the process is known to have exited (the result is then shown and the list
+  re-read) or when Refresh is pressed. Every ending is a sentence (`Model/Catalog.cs`
+  `CatalogExit`): each exit code, a declined prompt, an engine that did not start, a timeout.
 - **`--no-runtime` on every call.** The Dashboard and the engine live in the runtime's own
   directory, which the runtime installer replaces; the runtime is therefore never installed or
   upgraded from here. An item that needs a newer runtime reads as not compatible, and the runtime's
@@ -92,7 +101,7 @@ ADR-064 step 8. Spec of the engine: [dxr-get.md](../../docs/specs/runtime/dxr-ge
     `open` / `xdg-open`: never through a command interpreter.
   - **After Buy the licence changes underneath the Dashboard** (the `displayxr://activate` handler
     delivers the one-time code to the component). While a Buy is pending the item's class list is
-    re-read when the window comes back to the front and every 15 s, until the pending activation
+    re-read when the window comes back to the front and every 15 s (a poll that ends with the window), until the pending activation
     expires (`expires_unix`, 15 minutes) or the licence changes, then it stops. A purchase page
     opened without a return link gets the focus refresh only.
   - **Paste a key** opens a masked box. The key is written to a new file only its owner can read
@@ -117,6 +126,9 @@ ADR-064 step 8. Spec of the engine: [dxr-get.md](../../docs/specs/runtime/dxr-ge
 - **Debug builds only** (`#if DEBUG`, absent from a published dashboard): `--catalog-item <id>`
   opens that item, `--catalog-do install|uninstall|key` runs a verb on it, and
   `--screenshot <png> [--screenshot-delay <s>]` saves the window and exits.
+- Ids are arguments: a catalog `id` and a `registered_id` must be one safe argument (letters,
+  digits, `. _ -`, no leading dash); an item whose id is not is dropped, an unsafe `registered_id`
+  is dropped, and the activation verbs refuse one.
 - Tests: `CatalogTests` (both list shapes, grouping and filters, every exit code, the unelevated
   then elevated order, the licence block, the key never in a `ProcessStartInfo`, the key file's
   permissions and removal, the URL rule, every `activate-begin` result and the runtime without the verb).

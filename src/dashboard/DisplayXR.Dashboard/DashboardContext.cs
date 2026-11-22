@@ -97,7 +97,7 @@ public sealed class DashboardContext
     /// </summary>
     public async Task RunCatalogAsync(CatalogVerb verb, CatalogItem item)
     {
-        if (CatalogOp is not null) return;
+        if (CatalogBusy) return;
         var op = new CatalogOperation(item.Id, item.Name, verb, DateTime.Now);
         CatalogOp = op;
         CatalogResult = null;
@@ -123,9 +123,63 @@ public sealed class DashboardContext
         CatalogOp = null;
         CatalogResult = (item.Id, outcome);
         op.StopWaiting.Dispose();
+        if (outcome.StillRunning is { IsCompleted: false } running)
+        {
+            // The wait ended, the engine did not: nothing else may start until it has (it takes no lock).
+            var background = new CatalogBackground(item.Id, item.Name, verb);
+            CatalogBackground = background;
+            Bump();
+            _ = WatchBackgroundAsync(background, running, item);
+            return;
+        }
         Bump();
         await LoadCatalogAsync(force: true);
         if (outcome.Changed && item.PolicyClass is { } cls) await LoadPolicyAsync(cls, force: true);
+    }
+
+    /// <summary>
+    /// The engine run whose wait ended (Stop waiting, or the timeout) while the engine was still at
+    /// work. While it is set, Install / Update / Uninstall stay disabled. Cleared when the process is
+    /// known to have exited, or by Refresh (the list then shows where things stand).
+    /// </summary>
+    public CatalogBackground? CatalogBackground { get; private set; }
+
+    /// <summary>An install, update or uninstall is in flight or still finishing: no other may start.</summary>
+    public bool CatalogBusy => CatalogOp is not null || CatalogBackground is not null;
+
+    private async Task WatchBackgroundAsync(CatalogBackground background, Task<int> running, CatalogItem item)
+    {
+        CatalogOutcome outcome;
+        try { outcome = CatalogExit.Describe(background.Verb, await running, background.Name); }
+        catch (Exception ex)
+        {
+            outcome = CatalogExit.StartFailed(ex.Message);
+            DashboardLog.Warn($"catalog background: {ex.GetType().Name}");
+        }
+        if (_shutdown.IsCancellationRequested) return;
+        DashboardLog.Info($"catalog: {background.Verb} {background.ItemId} ended in the background (exit {outcome.ExitCode?.ToString() ?? "-"})");
+        if (ReferenceEquals(CatalogBackground, background)) CatalogBackground = null;
+        CatalogResult = (background.ItemId, outcome);
+        Bump();
+        await LoadCatalogAsync(force: true);
+        if (outcome.Changed && item.PolicyClass is { } cls) await LoadPolicyAsync(cls, force: true);
+    }
+
+    /// <summary>Refresh: the user asked to see where things stand; the list they get is the answer.</summary>
+    public void ForgetCatalogBackground()
+    {
+        if (CatalogBackground is null) return;
+        CatalogBackground = null;
+        Bump();
+    }
+
+    private readonly System.Threading.CancellationTokenSource _shutdown = new();
+
+    /// <summary>The window is closing: end the Dashboard's own waits and polls (never an engine run).</summary>
+    public void Shutdown()
+    {
+        try { _shutdown.Cancel(); }
+        catch (ObjectDisposedException) { }
     }
 
     /// <summary>Stop waiting for the operation in flight. The engine, once elevated, finishes on its own.</summary>
@@ -222,11 +276,12 @@ public sealed class DashboardContext
         {
             while (ReferenceEquals(BuyPending, pending) && DateTimeOffset.UtcNow < pending.Until)
             {
-                await Task.Delay(BuyPollInterval);
+                await Task.Delay(BuyPollInterval, _shutdown.Token);
                 if (!ReferenceEquals(BuyPending, pending)) return;
                 await RefreshPendingBuyAsync();
             }
         }
+        catch (OperationCanceledException) { return; } // the window is closing
         catch (Exception ex) { DashboardLog.Warn($"buy poll: {ex.GetType().Name}"); }
         if (ReferenceEquals(BuyPending, pending))
         {
