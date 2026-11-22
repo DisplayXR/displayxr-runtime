@@ -30,11 +30,14 @@
 #include "os/os_time.h"
 #include "util/u_viewer_pose_page.h"
 
+#include "macos_protected_folder.hpp"
+
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <signal.h>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -82,6 +85,24 @@ wait_for(F pred, int ms)
 	return pred();
 }
 
+/*!
+ * macOS only: `--serve` is spawned with the responsibility disclaimed (the host
+ * owns the camera grant), and a disclaimed host whose binary sits in
+ * ~/Documents, ~/Desktop or ~/Downloads stalls opening itself
+ * (macos_protected_folder.hpp, #2198). The serve cases are skipped for a tree
+ * built there; `--probe` is not disclaimed and still runs. Never skips elsewhere.
+ */
+void
+skip_serve_if_unrunnable()
+{
+	std::string folder;
+	if (macos_exe_in_protected_folder(TRACKING_HOST_EXE, &folder)) {
+		SKIP("serve mode not runnable here: displayxr-tracking-host is under "
+		     << folder << " (macOS privacy-protected folder; the disclaimed host cannot open it). "
+		     << "Build outside ~/Documents, ~/Desktop and ~/Downloads to run this case.");
+	}
+}
+
 } // namespace
 
 TEST_CASE("tracking host: probe, serve on demand, crash restart, orderly stop", "[tracking_host]")
@@ -104,6 +125,12 @@ TEST_CASE("tracking host: probe, serve on demand, crash restart, orderly stop", 
 	CHECK(ps.pid == 0); // a probe never produces
 	CHECK((ps.tracks & XRT_TRACKING_TRACKS_EYE_PAIR) != 0);
 	INFO("source: " << ps.source);
+
+	// Everything from here needs `--serve`.
+	if (macos_exe_in_protected_folder(TRACKING_HOST_EXE)) {
+		os_shm_close(&shm);
+	}
+	skip_serve_if_unrunnable();
 
 	// 2. The manager: nothing runs until demand.
 	target_vhost_sup_config sup;
@@ -210,6 +237,7 @@ TEST_CASE("tracking host: probe, serve on demand, crash restart, orderly stop", 
 
 TEST_CASE("tracking host: an unknown provider exits no_provider (terminal)", "[tracking_host]")
 {
+	skip_serve_if_unrunnable();
 	char name[64];
 	std::snprintf(name, sizeof(name), "/dxr-vpth2-%ld", os_process_current_pid());
 	os_shm shm;
@@ -319,6 +347,7 @@ external_ok(struct xrt_plugin_instance *, const struct xrt_display_descriptor *)
 TEST_CASE("tracking host: an in-process runtime reads the page instead of loading a provider",
           "[tracking_host][reader]")
 {
+	skip_serve_if_unrunnable();
 	// The service side: page + supervised host (nothing spawned yet).
 	char name[64];
 	std::snprintf(name, sizeof(name), "/dxr-vpth3-%ld", os_process_current_pid());
