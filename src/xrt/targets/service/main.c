@@ -819,6 +819,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 #ifdef XRT_OS_MACOS
 #include "service_config.h"
 #include "service_orchestrator.h"
+#include "service_url_scheme_macos.h"
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
@@ -878,6 +879,11 @@ main(int argc, char *argv[])
 	}
 
 #ifdef XRT_OS_MACOS
+	// ADR-064 §5: the displayxr:// handler bundle, registered with Launch
+	// Services for THIS user at every service start (the database is per user
+	// and the .pkg postinstall only reaches the console user).
+	service_url_scheme_register_macos();
+
 	// macOS orchestrator (#61): discover + auto-spawn the workspace controller
 	// (the shell) and respawn it on crash, mirroring the Windows orchestrator.
 	// Spawn happens at init, before the blocking ipc_server_main loop.

@@ -1369,12 +1369,27 @@ client_dll_ok:
 	; no options to add. HKLM\Software\Classes is shared by the 32- and 64-bit
 	; registry views, so it is written once. /nonfatal: a build without the
 	; handler ships no scheme (activation by pasted key still works).
+	;
+	; The copy an EARLIER install left is removed first, so that what is on
+	; disk after File is this build's handler or nothing. Without that, a
+	; build without the handler upgrading over one that had it would find the
+	; old program still there and register it again: a stale handler, from a
+	; release this install no longer matches, answering the scheme.
+	Delete "$INSTDIR\displayxr-activate.exe"
 	File /nonfatal "${BIN_DIR}\displayxr-activate.exe"
-	IfFileExists "$INSTDIR\displayxr-activate.exe" 0 dxr_url_scheme_done
+	IfFileExists "$INSTDIR\displayxr-activate.exe" 0 dxr_url_scheme_absent
 		WriteRegStr HKLM "Software\Classes\displayxr" "" "URL:DisplayXR Activation"
 		WriteRegStr HKLM "Software\Classes\displayxr" "URL Protocol" ""
 		WriteRegStr HKLM "Software\Classes\displayxr\DefaultIcon" "" '"$INSTDIR\displayxr-activate.exe",0'
 		WriteRegStr HKLM "Software\Classes\displayxr\shell\open\command" "" '"$INSTDIR\displayxr-activate.exe" "%1"'
+		Goto dxr_url_scheme_done
+	dxr_url_scheme_absent:
+		; This build ships no handler. A scheme key that still points at this
+		; install would name a program that is gone: remove it (and only it;
+		; a key that points elsewhere is someone else's).
+		ReadRegStr $0 HKLM "Software\Classes\displayxr\shell\open\command" ""
+		StrCmp $0 '"$INSTDIR\displayxr-activate.exe" "%1"' 0 dxr_url_scheme_done
+			DeleteRegKey HKLM "Software\Classes\displayxr"
 	dxr_url_scheme_done:
 
 	; Write registry keys

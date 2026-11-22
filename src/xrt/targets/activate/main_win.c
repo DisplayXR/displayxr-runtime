@@ -22,12 +22,19 @@
  *  - is a GUI-subsystem program (no console window flashes over the browser)
  *    with the default `asInvoker` manifest: it runs as the user who clicked,
  *    never asks for elevation and has no elevated mode;
- *  - removes the current directory from the DLL search path first (a browser
- *    may start it with the Downloads folder as the working directory);
+ *  - removes the current directory from the DLL search path for every DLL
+ *    loaded by name AFTER startup (a browser may start it with the Downloads
+ *    folder as the working directory). That call cannot cover the program's
+ *    own static imports, which the loader resolves before WinMain runs; those
+ *    are found in the program's directory or the system directories, both of
+ *    which come before the current directory in the standard search order, so
+ *    the current directory is only reached for a DLL missing from both;
  *  - never opens, executes, or passes on any part of the link;
  *  - shows one message box with the outcome, whose text never contains
- *    anything from the link (activation_outcome_message). A flood of bad
- *    links is answered silently once the per-user failure limit is reached.
+ *    anything from the link (activation_outcome_message). A link that names
+ *    no pending activation raises no box once the per-user failure limit is
+ *    reached (`quiet`); a link whose nonce is pending always goes through and
+ *    always shows its outcome.
  *
  * A dedicated program rather than `displayxr-cli.exe activate-url "%1"`: the
  * CLI is a console program (a console window would flash on every link) with
@@ -59,7 +66,9 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	(void)lpCmdLine; // the ANSI command line is lossy: never used
 	(void)nCmdShow;
 
-	// Before anything can load a DLL by name: drop the current directory from the search path.
+	// Before anything here loads a DLL by name (a plug-in's dependencies, a
+	// delay load): drop the current directory from the search path. Static
+	// imports were resolved before this line; see the file comment.
 	(void)SetDllDirectoryW(L"");
 
 	// The link, as exactly one argument, converted strictly (an unpaired

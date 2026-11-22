@@ -291,12 +291,55 @@ fi
 # (docs/specs/runtime/activation-deep-link.md §8). The path is this install's.
 if [ -f "$HERE/share/applications/displayxr-url-handler.desktop.in" ]; then
     mkdir -p "$SHARE_ROOT/applications"
-    sed "s|@CLI_BIN@|$PREFIX/bin/displayxr-cli|g" \
-        "$HERE/share/applications/displayxr-url-handler.desktop.in" >"$SHARE_ROOT/applications/displayxr-url-handler.desktop"
+    # $PREFIX is the user's (by default under $HOME): it may hold a space or
+    # any other character the Desktop Entry Specification reserves in Exec=.
+    # Exec gets the path as a quoted argument, with the four characters that
+    # stay special inside quotes (" ` $ \) backslash-escaped, then the string
+    # rule's own escaping (\ -> \\), and % doubled (a field-code introducer).
+    # TryExec is a plain string: only the backslash is escaped. A path with a
+    # newline cannot be written in a desktop entry at all: no scheme then.
+    CLI_BIN="$PREFIX/bin/displayxr-cli"
+    case "$CLI_BIN" in
+    *'
+'*)
+        echo "==> displayxr:// URL scheme: NOT registered (the install path contains a line break)"
+        ;;
+    *)
+        DXR_CLI_BIN="$CLI_BIN" awk '
+            function sub_all(s, from, to,    out, i) {
+                out = ""
+                while ((i = index(s, from)) > 0) {
+                    out = out substr(s, 1, i - 1) to
+                    s = substr(s, i + length(from))
+                }
+                return out s
+            }
+            BEGIN {
+                bin = ENVIRON["DXR_CLI_BIN"]
+                bs = sprintf("%c", 92)
+                # TryExec: string escaping only.
+                tryexec = sub_all(bin, bs, bs bs)
+                # Exec: quoted-argument escaping, then string escaping, then %%.
+                q = sub_all(bin, bs, bs bs)
+                q = sub_all(q, "\"", bs "\"")
+                q = sub_all(q, "`", bs "`")
+                q = sub_all(q, "$", bs "$")
+                q = sub_all(q, bs, bs bs)
+                q = sub_all(q, "%", "%%")
+                exec = "\"" q "\""
+            }
+            /^Exec=/    { print "Exec=" exec substr($0, index($0, "@CLI_BIN@") + 9); next }
+            /^TryExec=/ { print "TryExec=" tryexec; next }
+            { print }
+        ' "$HERE/share/applications/displayxr-url-handler.desktop.in" >"$SHARE_ROOT/applications/displayxr-url-handler.desktop"
+        ;;
+    esac
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database -q "$SHARE_ROOT/applications" >/dev/null 2>&1 || true
     fi
-    echo "==> displayxr:// URL scheme: $SHARE_ROOT/applications/displayxr-url-handler.desktop"
+    if [ -f "$SHARE_ROOT/applications/displayxr-url-handler.desktop" ]; then
+        echo "==> displayxr:// URL scheme: $SHARE_ROOT/applications/displayxr-url-handler.desktop"
+    fi
 fi
 
 echo ""

@@ -64,11 +64,15 @@ if [ -x "$INSTALL_DIR/bin/displayxr-cli" ]; then
 fi
 
 # displayxr:// URL scheme (ADR-064 §5): register the handler bundle with
-# Launch Services so a displayxr://activate link opens it. The bundle is not in
-# /Applications, where Launch Services looks by itself, so it is registered
-# explicitly: for the console user (the Launch Services database is per user;
-# any other user gets it the first time the bundle is seen, or by running the
-# same command), never as root alone.
+# Launch Services so a displayxr://activate link opens it. The Launch Services
+# database is PER USER and nothing scans the runtime's bin/ directory, so this
+# line covers exactly one case: the user at the console right now, without a
+# logout. It does nothing for any other user, for an install with nobody
+# logged in (MDM, ssh), or after the database is rebuilt. Those are covered by
+# displayxr-service, which re-registers the bundle for its own user at every
+# start (service_url_scheme_macos.c; the LaunchAgent starts it in each GUI
+# session). A runtime-only .pkg has no service: there, only this line
+# registers the scheme (activation-deep-link.md §8, known limitation).
 ACTIVATE_APP="$INSTALL_DIR/bin/DisplayXRActivate.app"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 if [ -d "$ACTIVATE_APP" ] && [ -x "$LSREGISTER" ]; then
