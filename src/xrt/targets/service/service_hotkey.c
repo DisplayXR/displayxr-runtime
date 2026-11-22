@@ -244,6 +244,108 @@ service_hotkey_canonicalize(const char *text, char *out, size_t out_size)
 
 /*
  *
+ * Known conflicts (advice only, see the header).
+ *
+ */
+
+#define M_C SERVICE_HOTKEY_MOD_CTRL
+#define M_S SERVICE_HOTKEY_MOD_SHIFT
+#define M_A SERVICE_HOTKEY_MOD_ALT
+#define M_W SERVICE_HOTKEY_MOD_WIN
+
+struct known_conflict
+{
+	uint32_t mods;
+	uint32_t vk;
+	const char *what;
+};
+
+// Exact combos first; the rules by modifier set follow in the function.
+static const struct known_conflict s_conflicts[] = {
+    // The launch default until 2026-10-26, moved for exactly this reason.
+    {M_C, 0x20, "autocomplete in editors and IDEs, and input-method switching"},
+    {M_A, 0x20, "the window menu, and launchers such as PowerToys Run"},
+    {M_W, 0x20, "keyboard layout switching in Windows"},
+    {M_C, 0x09, "tab switching in browsers, editors and terminals"},
+    {M_C | M_S, 0x09, "tab switching in browsers, editors and terminals"},
+    {M_A, 0x09, "window switching (Alt+Tab)"},
+    {M_A | M_S, 0x09, "window switching (Alt+Shift+Tab)"},
+    {M_C | M_A, 0x09, "the window switcher (Ctrl+Alt+Tab)"},
+    {M_W, 0x09, "Task View in Windows"},
+    {M_A, 0x73, "closing the active window (Alt+F4)"},
+    {M_C, 0x73, "closing the active tab or document (Ctrl+F4)"},
+    {M_A, 0x0D, "full screen in players and games, and Properties in file managers"},
+    {M_C, 0x0D, "send or submit in mail, chat and forms"},
+    {M_S, 0x0D, "a line break in chat and document editors"},
+    {M_C | M_A, 0x2E,
+     "the Windows security screen; Windows never delivers this combo, so it would not launch anything"},
+    {M_C, 0x2D, "copy (Ctrl+Insert)"},
+    {M_S, 0x2D, "paste (Shift+Insert)"},
+    {M_S, 0x2E, "cut, or permanent delete in file managers (Shift+Delete)"},
+    {M_C, 0x24, "jump to the start of a document"},
+    {M_C, 0x23, "jump to the end of a document"},
+};
+
+static bool
+vk_is_alnum(uint32_t vk)
+{
+	return (vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9');
+}
+
+//! A key that types a character or moves the caret on its own.
+static bool
+vk_is_typing_key(uint32_t vk)
+{
+	if (vk_is_alnum(vk) || vk == 0x20 || vk == 0x09 || vk == 0x0D) {
+		return true;
+	}
+	if (vk >= 0xBA && vk <= 0xC0) {
+		return true; // ; = , - . / `
+	}
+	if (vk >= 0xDB && vk <= 0xDE) {
+		return true; // [ \ ] '
+	}
+	return vk >= 0x21 && vk <= 0x28; // PageUp..Down: Shift+<nav> extends a selection
+}
+
+const char *
+service_hotkey_known_conflict(const struct service_hotkey *hk)
+{
+	if (hk == NULL || hk->vk == 0 || hk->mods == 0) {
+		return NULL;
+	}
+	for (size_t i = 0; i < ARRAY_COUNT(s_conflicts); i++) {
+		if (s_conflicts[i].mods == hk->mods && s_conflicts[i].vk == hk->vk) {
+			return s_conflicts[i].what;
+		}
+	}
+	const bool fkey = hk->vk >= 0x70 && hk->vk <= 0x87;
+	if (hk->mods == M_S && vk_is_typing_key(hk->vk)) {
+		return "ordinary typing and text selection (Shift plus this key)";
+	}
+	if (hk->mods == M_C && vk_is_alnum(hk->vk)) {
+		return "a standard application shortcut (copy, paste, save, find and the like)";
+	}
+	if (hk->mods == M_A && vk_is_alnum(hk->vk)) {
+		return "menu access keys in many applications";
+	}
+	if (hk->mods == M_W && !fkey) {
+		return "a Windows system shortcut (Win plus a key is reserved by Windows)";
+	}
+	if (hk->mods == M_C && hk->vk >= 0x25 && hk->vk <= 0x28) {
+		return "word-by-word caret movement in text editors";
+	}
+	return NULL;
+}
+
+#undef M_C
+#undef M_S
+#undef M_A
+#undef M_W
+
+
+/*
+ *
  * Linux mappings: X11 keysyms and GTK accelerator names.
  *
  */
