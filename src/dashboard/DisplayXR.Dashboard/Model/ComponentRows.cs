@@ -23,6 +23,8 @@ public enum RowStatus
     Available,
     /// <summary>Present, and the catalog does not list it, or lists it but did not find this copy (a dev registration, another installer, a preinstall).</summary>
     NotFromCatalog,
+    /// <summary>Present, not a catalog install, and shipped by the runtime's own installer (its binary is in the runtime's <c>plugins</c> folder).</summary>
+    PartOfRuntime,
 }
 
 public enum RowFilter { All, Installed, Updates }
@@ -69,6 +71,7 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
         RowStatus.UpdateAvailable => ("Update available", Level.Info),
         RowStatus.Available => ("Available", Level.Plain),
         RowStatus.NotFromCatalog => ("Not from catalog", Level.Plain),
+        RowStatus.PartOfRuntime => ("Part of the runtime", Level.Ok),
         _ => null,
     };
 
@@ -76,7 +79,7 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
     /// The main button. Nothing is ever offered on a copy the catalog did not find: installing over
     /// it would replace something the user put there another way.
     /// </summary>
-    public CatalogAction Action => Catalog is null || Status == RowStatus.NotFromCatalog ? CatalogAction.None : Catalog.Action;
+    public CatalogAction Action => Catalog is null || Status is RowStatus.NotFromCatalog or RowStatus.PartOfRuntime ? CatalogAction.None : Catalog.Action;
 
     /// <summary>
     /// Uninstall only when it can succeed: the engine installed it (a receipt) and says it has an
@@ -85,12 +88,15 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
     public bool CanUninstall => Catalog is { CanUninstall: true } && Status is RowStatus.Installed or RowStatus.UpdateAvailable;
 
     /// <summary>The catalog's detail (what it does, version, licence) can be opened.</summary>
-    public bool HasDetail => Catalog is not null && Status != RowStatus.NotFromCatalog;
+    public bool HasDetail => Catalog is not null && Status is not (RowStatus.NotFromCatalog or RowStatus.PartOfRuntime);
 
-    /// <summary>How an installed row that cannot be removed from here is removed; null when Uninstall is offered or nothing is installed.</summary>
+    /// <summary>
+    /// How an installed row that cannot be removed from here is removed; null when Uninstall is
+    /// offered, nothing is installed, or the row is part of the runtime (it goes with the runtime).
+    /// </summary>
     public string? RemoveNote =>
         Status == RowStatus.NotFromCatalog ? "Remove with its own uninstaller."
-        : Status is RowStatus.Installed or RowStatus.UpdateAvailable && Catalog is { IsRuntime: false } && !CanUninstall
+        : Status is RowStatus.Installed or RowStatus.UpdateAvailable && Catalog is not null && !CanUninstall
             ? CatalogText.RemoveFromSettings
         : null;
 
@@ -109,6 +115,23 @@ public static class ComponentRows
 {
     /// <summary>The last group: catalog items that are not runtime components.</summary>
     public const string AppsGroupId = "apps";
+
+    /// <summary>The first group: the catalog's row for the runtime itself.</summary>
+    public const string RuntimeGroupId = "runtime";
+
+    /// <summary>
+    /// Shipped by the runtime's own installer: the component's registered binary is inside the
+    /// <c>plugins</c> folder of the runtime directory (the folder of the <c>displayxr-cli</c> this
+    /// Dashboard runs). The installer puts its own plug-ins there and nothing else does: a plug-in
+    /// with its own installer has its own folder, and a build registered from another tree is
+    /// outside it. Compared as text (either slash, any case) so it does not depend on the host OS.
+    /// </summary>
+    public static bool ShippedByRuntime(string? binaryPath, string? runtimeDir)
+    {
+        if (string.IsNullOrWhiteSpace(binaryPath) || string.IsNullOrWhiteSpace(runtimeDir)) return false;
+        string dir = runtimeDir.Replace('\\', '/').TrimEnd('/');
+        return dir.Length > 0 && binaryPath.Replace('\\', '/').StartsWith(dir + "/plugins/", StringComparison.OrdinalIgnoreCase);
+    }
 
     /// <summary>The catalog class whose items live in a Components section; null for a section the catalog has no class for.</summary>
     public static string? CatalogClassOf(string sectionId) => sectionId switch
@@ -139,11 +162,15 @@ public static class ComponentRows
     /// <summary>
     /// Every group, in page order: the Components sections as they are, each with the catalog items
     /// of its class joined in (an installed row and its entry become one row; entries with nothing
-    /// installed follow), then "Apps" for catalog items that are not components. With no catalog
+    /// installed follow), then "Apps" for catalog items that are neither components nor the runtime. With no catalog
     /// (<paramref name="catalog"/> null) the installed rows are all there is, and nothing is said
     /// about where they came from; the same holds for a list that is only the engine's receipts.
+    /// The catalog's row for the runtime itself opens the page, in a group of its own ("Runtime").
+    /// <paramref name="runtimeDir"/> is the runtime directory (see <see cref="ShippedByRuntime"/>):
+    /// with it, a component the catalog did not install but the runtime ships reads "Part of the runtime".
     /// </summary>
-    public static IReadOnlyList<ComponentGroup> Join(IReadOnlyList<ComponentSection> sections, CatalogSource? source)
+    public static IReadOnlyList<ComponentGroup> Join(IReadOnlyList<ComponentSection> sections, CatalogSource? source,
+                                                     string? runtimeDir = null)
     {
         source ??= CatalogSource.None;
         var catalog = source.List;
@@ -172,22 +199,29 @@ public static class ComponentRows
                     : !entry.IsInstalled ? RowStatus.NotFromCatalog
                     : entry.HasUpdate ? RowStatus.UpdateAvailable
                     : RowStatus.Installed;
+                if (status == RowStatus.NotFromCatalog && ShippedByRuntime(item.Policy?.BinaryPath, runtimeDir))
+                    status = RowStatus.PartOfRuntime;
                 rows.Add(new ComponentRow(KeyOf(cls, id), item, entry, status, stale && entry is not null));
             }
             if (cls is not null)
                 rows.AddRange(Ordered(items.Where(c => c.Class == cls && !used.Contains(c.Id))).Select(c => CatalogOnly(c, stale)));
             groups.Add(new ComponentGroup(s, rows));
         }
-        var apps = Ordered(items.Where(c => !ComponentClassNames.Contains(c.Class))).Select(c => CatalogOnly(c, stale)).ToArray();
+        var runtime = Ordered(items.Where(c => c.IsRuntime)).Select(c => CatalogOnly(c, stale)).ToArray();
+        if (runtime.Length > 0)
+            groups.Insert(0, CatalogGroup(RuntimeGroupId, "Runtime", "DisplayXR itself: what every component, app and add-on here runs on.", runtime));
+        var apps = Ordered(items.Where(c => !c.IsRuntime && !ComponentClassNames.Contains(c.Class))).Select(c => CatalogOnly(c, stale)).ToArray();
         if (apps.Length > 0)
-        {
-            int installed = apps.Count(r => r.Status != RowStatus.Available);
-            groups.Add(new ComponentGroup(new ComponentSection(AppsGroupId, "Apps",
-                "Apps and tools from the catalog. They run on the runtime; they are not plugged into it.",
-                apps.Length, installed, $"{installed} installed{StatusText.Sep}{apps.Length - installed} available",
-                Array.Empty<ComponentItem>()), apps));
-        }
+            groups.Add(CatalogGroup(AppsGroupId, "Apps", "Apps and tools from the catalog. They run on the runtime; they are not plugged into it.", apps));
         return groups;
+    }
+
+    /// <summary>A group made of catalog rows only ("Runtime", "Apps"), with its count line.</summary>
+    private static ComponentGroup CatalogGroup(string id, string title, string role, ComponentRow[] rows)
+    {
+        int installed = rows.Count(r => r.Status != RowStatus.Available);
+        return new ComponentGroup(new ComponentSection(id, title, role, rows.Length, installed,
+            CatalogText.Counts(installed, rows.Length - installed), Array.Empty<ComponentItem>()), rows);
     }
 
     /// <summary>A catalog item with no installed row beside it: installed (the engine found it), or available.</summary>
@@ -207,7 +241,7 @@ public static class ComponentRows
     public static IReadOnlyList<ComponentGroup> Filter(IReadOnlyList<ComponentGroup> groups, RowFilter filter) =>
         filter == RowFilter.All ? groups
         : groups.Select(g => g with { Rows = g.Rows.Where(r => r.Shows(filter)).ToArray() })
-                .Where(g => filter == RowFilter.Installed ? g.Section.Id != AppsGroupId || g.Rows.Count > 0 : g.Rows.Count > 0)
+                .Where(g => filter == RowFilter.Installed ? g.Section.Id is not (AppsGroupId or RuntimeGroupId) || g.Rows.Count > 0 : g.Rows.Count > 0)
                 .ToArray();
 
     /// <summary>The updates the nav badge counts: the ones the Update button can do from here.</summary>

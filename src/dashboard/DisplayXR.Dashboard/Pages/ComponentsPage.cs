@@ -28,9 +28,9 @@ namespace DisplayXR.Dashboard.Pages;
 ///
 /// <para>It is also where things are added (ADR-064 step 8): each section carries the catalog
 /// items of its class (<c>dxr-get list --json</c>), an installed component and its catalog entry
-/// being ONE row with one status, and catalog items that are not components close the page as
-/// "Apps". Install / Update / Uninstall go through the install engine (one Windows permission
-/// prompt, the Dashboard itself stays non-elevated). The join, the statuses and what a row may
+/// being ONE row with one status, the runtime's own catalog row opens the page as "Runtime", and
+/// catalog items that are not components close it as "Apps". Install / Update / Uninstall go
+/// through the install engine (one Windows permission prompt, the Dashboard itself stays non-elevated). The join, the statuses and what a row may
 /// offer are <see cref="ComponentRows"/>; the words are <see cref="CatalogItem"/> and friends.</para>
 /// </summary>
 public sealed class ComponentsPage : Page
@@ -105,6 +105,9 @@ public sealed class ComponentsPage : Page
     private CatalogSource Source() => CatalogSource.From(Ctx.CatalogRead, Ctx.CatalogLastGood);
 
     private bool CatalogLive => Ctx.CatalogRead is { Status: CatalogStatus.Ready };
+
+    /// <summary>The runtime directory: the folder of the CLI this Dashboard runs (what its installer ships is in its "plugins" folder).</summary>
+    private string? RuntimeDir => System.IO.Path.GetDirectoryName(Ctx.CliInfo.CliPath);
 
     /// <summary>The component's own row for an installed catalog item, when its class list has been read.</summary>
     private PolicyRow? RowOf(CatalogItem i) =>
@@ -215,13 +218,13 @@ public sealed class ComponentsPage : Page
         page.Children.Add(FilterBar());
         // An engine run the Dashboard stopped waiting for: say why the buttons are waiting.
         if (Ctx.CatalogBackground is { } bg) page.Children.Add(U.Notice(Level.Info, "Still working in the background", bg.Line));
-        var groups = ComponentRows.Filter(ComponentRows.Join(Sections(), Source()), _filter);
+        var groups = ComponentRows.Filter(ComponentRows.Join(Sections(), Source(), RuntimeDir), _filter);
         if (groups.Count == 0)
             page.Children.Add(U.Wrapped(_filter != RowFilter.Updates ? "Nothing to show."
                 : CatalogLive ? "Everything is up to date." : "Updates are listed when the catalog can be read.", "empty"));
         var grid = new U.CardGrid(2) { MinColumnWidth = 460 };
         foreach (var g in groups)
-            grid.Add(SectionCard(g), g.Section.Id is "display_processors" or "workspace_controller" or ComponentRows.AppsGroupId ? 2 : 1);
+            grid.Add(SectionCard(g), g.Section.Id is "display_processors" or "workspace_controller" or ComponentRows.AppsGroupId or ComponentRows.RuntimeGroupId ? 2 : 1);
         page.Children.Add(grid);
         return page;
     }
@@ -477,6 +480,7 @@ public sealed class ComponentsPage : Page
         "conversion_providers" => "No conversion provider registered.",
         "tracking_providers" => "No viewer-tracking provider registered: a display that does not track keeps the nominal viewer.",
         ComponentRows.AppsGroupId => "No app from the catalog is installed.",
+        ComponentRows.RuntimeGroupId => "The runtime is not installed.",
         _ => "None.",
     };
 
@@ -930,9 +934,7 @@ public sealed class ComponentsPage : Page
         // An installed row's head is the component's own state; what the item does is said here.
         if (row.Installed is not null) col.Children.Add(U.Wrapped(CatalogText.About(i), "soft"));
         if (i.DetectedHere)
-            col.Children.Add(U.Wrapped(i.Evidence is { Length: > 0 } ev
-                ? $"Works with your display: DisplayXR found it on this machine ({ev})."
-                : "Works with your display: DisplayXR found it on this machine.", "soft"));
+            col.Children.Add(U.Wrapped(CatalogText.DetectedLine, "soft")); // never the engine's raw evidence
 
         var facts = new U.KvList(130);
         if (i.VersionText.Length > 0) facts.Add("Version", i.VersionText);

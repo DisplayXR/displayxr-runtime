@@ -33,11 +33,13 @@ public class ComponentRowsTests
 
     private static CatalogSource Live(params string[] items) => new(Catalog(items), false, true);
 
-    private static PolicyRow Policy(ComponentClass cls, string id, bool builtIn = false) =>
-        new(cls, id, id, true, "default", false, false, "ACTIVE", "signed", null, null, BuiltIn: builtIn);
+    private static PolicyRow Policy(ComponentClass cls, string id, bool builtIn = false, string binary = "") =>
+        new(cls, id, id, true, "default", false, false, "ACTIVE", "signed", null, null, BuiltIn: builtIn, BinaryPath: binary);
 
-    private static ComponentItem Registered(ComponentClass cls, string id, bool builtIn = false) =>
-        new(id, Level.Ok, Array.Empty<(string, Level)>(), Array.Empty<string>(), Policy: Policy(cls, id, builtIn));
+    private static ComponentItem Registered(ComponentClass cls, string id, bool builtIn = false, string binary = "") =>
+        new(id, Level.Ok, Array.Empty<(string, Level)>(), Array.Empty<string>(), Policy: Policy(cls, id, builtIn, binary));
+
+    private const string RuntimeDir = @"C:\Program Files\Example\Runtime";
 
     private static ComponentSection Section(string id, params ComponentItem[] items) =>
         new(id, id, "", items.Length, 0, "", items);
@@ -99,6 +101,84 @@ public class ComponentRowsTests
         Assert.False(row.CanUninstall);
         Assert.False(row.HasDetail);
         Assert.Equal("Remove with its own uninstaller.", row.RemoveNote);
+    }
+
+    [Fact]
+    public void WhatTheRuntimeInstallerShips_IsPartOfTheRuntime_WithNoRemoveSentence()
+    {
+        var sections = new[]
+        {
+            Section("input_providers",
+                Registered(ComponentClass.Input, "pad", binary: RuntimeDir + @"\plugins\Pad.dll"),          // shipped by the runtime
+                Registered(ComponentClass.Input, "pen", binary: @"C:\Program Files\Example\Plugins\Pen\Pen.dll"), // its own installer
+                Registered(ComponentClass.Input, "dev", binary: @"D:\src\build\plugins\Dev.dll"),          // a dev registration
+                Registered(ComponentClass.Input, "old")),                                                 // a CLI that names no binary
+            Section("conversion_providers", Registered(ComponentClass.Conversion, "depth", binary: RuntimeDir + @"\plugins\Depth.dll")),
+        };
+        var catalog = Live(Item("hands", "input_provider", "not_installed"), Item("depth", "conversion_provider", "not_installed"));
+        var groups = ComponentRows.Join(sections, catalog, RuntimeDir);
+
+        var pad = Row(groups, "input_provider:pad");
+        Assert.Equal(RowStatus.PartOfRuntime, pad.Status);
+        Assert.Equal(("Part of the runtime", Level.Ok), pad.StatusChip);
+        Assert.Null(pad.RemoveNote);
+        Assert.NotNull(pad.Installed!.Policy); // the Enabled / Prefer controls still have their row
+        Assert.Equal(CatalogAction.None, pad.Action);
+        Assert.False(pad.CanUninstall);
+        Assert.False(pad.HasDetail);
+        Assert.True(pad.Shows(RowFilter.Installed));
+        Assert.False(pad.Shows(RowFilter.Updates));
+
+        // Listed by the catalog, not found by the engine, and shipped by the runtime: still never an Install over it.
+        var depth = Row(groups, "conversion_provider:depth");
+        Assert.Equal(RowStatus.PartOfRuntime, depth.Status);
+        Assert.Equal(CatalogAction.None, depth.Action);
+        Assert.Null(depth.RemoveNote);
+
+        foreach (var key in new[] { "input_provider:pen", "input_provider:dev", "input_provider:old" })
+        {
+            var other = Row(groups, key);
+            Assert.Equal(("Not from catalog", Level.Plain), other.StatusChip);
+            Assert.Equal("Remove with its own uninstaller.", other.RemoveNote);
+        }
+
+        // Without the runtime directory nothing is claimed to be part of it.
+        Assert.Equal(RowStatus.NotFromCatalog, Row(ComponentRows.Join(sections, catalog), "input_provider:pad").Status);
+        // A catalog install in the same folder keeps its catalog status; no catalog read claims nothing.
+        var known = ComponentRows.Join(sections, Live(Item("pad", "input_provider", "current", receipt: true)), RuntimeDir);
+        Assert.Equal(RowStatus.Installed, Row(known, "input_provider:pad").Status);
+        Assert.Equal(RowStatus.Installed, Row(ComponentRows.Join(sections, null, RuntimeDir), "input_provider:pad").Status);
+    }
+
+    [Theory]
+    [InlineData(@"C:\Program Files\Example\Runtime\plugins\Pad.dll", @"C:\Program Files\Example\Runtime", true)]
+    [InlineData(@"c:/program files/example/runtime/PLUGINS/sub/Pad.dll", @"C:\Program Files\Example\Runtime\", true)] // slashes and case
+    [InlineData(@"C:\Program Files\Example\Runtime\desk.exe", @"C:\Program Files\Example\Runtime", false)]       // beside the runtime, not its plug-in
+    [InlineData(@"C:\Program Files\Example\Runtime\plugins-extra\Pad.dll", @"C:\Program Files\Example\Runtime", false)]
+    [InlineData(@"C:\Program Files\Example\Plugins\Pen\Pen.dll", @"C:\Program Files\Example\Runtime", false)]
+    [InlineData("", @"C:\Program Files\Example\Runtime", false)]
+    [InlineData(@"C:\Program Files\Example\Runtime\plugins\Pad.dll", null, false)]
+    [InlineData(@"C:\Program Files\Example\Runtime\plugins\Pad.dll", "", false)]
+    public void ShippedByRuntime_IsTheRuntimesPluginsFolder(string binary, string? runtimeDir, bool shipped) =>
+        Assert.Equal(shipped, ComponentRows.ShippedByRuntime(binary, runtimeDir));
+
+    [Theory]
+    [InlineData(2, 0, "2 installed")]
+    [InlineData(0, 1, "1 available to install")]
+    [InlineData(2, 1, "2 installed · 1 available to install")]
+    public void ASectionCount_SaysOnlyItsNonZeroParts(int installed, int available, string text) =>
+        Assert.Equal(text, CatalogText.Counts(installed, available));
+
+    [Fact]
+    public void TheDetectedLine_NeverCarriesTheEnginesEvidence()
+    {
+        Assert.Equal("Works with your display: DisplayXR detected a supported display on this machine.", CatalogText.DetectedLine);
+        // The evidence stays in the model (the engine's own words), for diagnostics only.
+        var item = Catalog("{\"id\":\"panel-a\",\"name\":\"a\",\"class\":\"display_processor\",\"state\":\"not_installed\",\"installable\":true,"
+                           + "\"detected\":\"high\",\"evidence\":\"display EDID 1/2 CODE_NAME (high confidence)\"}").Items[0];
+        Assert.True(item.DetectedHere);
+        Assert.Contains("CODE_NAME", item.Evidence);
+        Assert.DoesNotContain("CODE_NAME", CatalogText.DetectedLine);
     }
 
     [Fact]
@@ -234,7 +314,7 @@ public class ComponentRowsTests
     }
 
     [Fact]
-    public void CatalogItemsThatAreNotComponents_CloseThePageAsApps()
+    public void CatalogItemsThatAreNotComponents_CloseThePageAsApps_AndTheRuntimeOpensIt()
     {
         var sections = new[] { Section("display_processors"), Section("diagnostics") };
         var groups = ComponentRows.Join(sections, Live(
@@ -244,18 +324,27 @@ public class ComponentRowsTests
             Item("toolkit", "sdk", "not_installed"),
             Item("panel-c", "display_processor", "not_installed")));
 
-        Assert.Equal(new[] { "display_processors", "diagnostics", ComponentRows.AppsGroupId }, groups.Select(g => g.Section.Id));
+        Assert.Equal(new[] { ComponentRows.RuntimeGroupId, "display_processors", "diagnostics", ComponentRows.AppsGroupId }, groups.Select(g => g.Section.Id));
         var apps = groups[^1];
         Assert.Equal("Apps", apps.Section.Title);
-        // Installed first inside a class; apps before the other kinds.
-        Assert.Equal(new[] { "browser", "viewer", "toolkit", "runtime" }, apps.Rows.Select(r => r.Catalog!.Id));
+        Assert.Equal("1 installed · 2 available to install", apps.Section.ConnectedLine);
+        // Installed first inside a class; apps before the other kinds. The runtime is not an app.
+        Assert.Equal(new[] { "browser", "viewer", "toolkit" }, apps.Rows.Select(r => r.Catalog!.Id));
         Assert.DoesNotContain(apps.Rows, r => r.Catalog!.Class == "display_processor");
 
-        var runtime = apps.Rows[^1]; // shown, never installed or removed from here
+        // The runtime's own row: a first group of its own, shown, never installed or removed from here.
+        Assert.Equal("Runtime", groups[0].Section.Title);
+        Assert.Equal("1 installed", groups[0].Section.ConnectedLine);
+        var runtime = Assert.Single(groups[0].Rows);
+        Assert.Equal("runtime", runtime.Catalog!.Id);
         Assert.Equal(RowStatus.UpdateAvailable, runtime.Status);
         Assert.Equal(CatalogAction.None, runtime.Action);
         Assert.False(runtime.CanUninstall);
-        Assert.Null(runtime.RemoveNote);
+        Assert.Equal("Remove it from Windows Settings > Apps.", runtime.RemoveNote);
+
+        // Under a filter the Runtime group behaves like Apps: kept while it has a row to show.
+        Assert.Equal(ComponentRows.RuntimeGroupId, ComponentRows.Filter(groups, RowFilter.Installed)[0].Section.Id);
+        Assert.Equal(ComponentRows.RuntimeGroupId, ComponentRows.Filter(groups, RowFilter.Updates)[0].Section.Id);
 
         var browser = apps.Rows[0]; // no receipt: its own uninstaller
         Assert.Equal(RowStatus.Installed, browser.Status);

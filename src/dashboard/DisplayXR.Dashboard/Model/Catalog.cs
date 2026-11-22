@@ -614,6 +614,21 @@ public static class CatalogText
     /// <summary>How an installed catalog item is removed when the engine cannot remove it (no receipt, or no uninstall command).</summary>
     public const string RemoveFromSettings = "Remove it from Windows Settings > Apps.";
 
+    /// <summary>
+    /// The Details line of an item the engine matched to this machine's display. The engine's raw
+    /// evidence (<see cref="CatalogItem.Evidence"/>) names internal panel codes and is not shown.
+    /// </summary>
+    public const string DetectedLine = "Works with your display: DisplayXR detected a supported display on this machine.";
+
+    /// <summary>A section's count line, non-zero parts only: "2 installed", "1 available to install", or both.</summary>
+    public static string Counts(int installed, int available)
+    {
+        var parts = new List<string>(2);
+        if (installed > 0) parts.Add($"{installed} installed");
+        if (available > 0) parts.Add($"{available} available to install");
+        return parts.Count > 0 ? string.Join(StatusText.Sep, parts) : "none installed";
+    }
+
     /// <summary>A success, said on the row with nothing to dismiss: "X is installed. It is ready to use."</summary>
     public static string Inline(string title, string text) => text.Length > 0 ? $"{title}. {text}" : $"{title}.";
 

@@ -46,9 +46,11 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   the ones that only report: present owners, the conversion module, model packs, the stereo
   camera, diagnostics clients). Each section whose class the catalog has (`display_processor`,
   `input_provider`, `tracking_provider`, `conversion_provider`, `workspace_controller`) also
-  carries that class's catalog items. A last group, **Apps**, holds the catalog items that are
-  not components (apps, companions, developer tools, the runtime's own row), each with a chip for
-  its kind when it is not an app.
+  carries that class's catalog items. A first group, **Runtime**, holds the catalog's row for the
+  runtime itself. A last group, **Apps**, holds the catalog items that are not components (apps,
+  companions, developer tools), each with a chip for its kind when it is not an app. Both print a
+  count of their non-zero parts only ("2 installed", "1 available to install", or both;
+  `CatalogText.Counts`).
 - **One row per item, one status per row** (`Model/ComponentRows.cs`, `ComponentRows.Join`). An
   installed component and its catalog entry are joined by the id the component registers under
   (`registered_id`, else the catalog `id`) and are one row:
@@ -59,6 +61,7 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   | **Update available** | present, and the catalog has another build (`outdated` / `rebuilt`) | the same, and **Update** |
   | **Available** | in the catalog, not on this machine | **Install** (or **Get it** for a link-out item); Details |
   | **Not from catalog** | present, and the catalog does not list it, or lists it but the engine did not find this copy (a dev registration, another installer, a preinstall) | the row's own controls only, and "Remove with its own uninstaller." |
+  | **Part of the runtime** | as *Not from catalog*, and the runtime's own installer shipped it: its registered binary (`binary_path` / `binary` of `<class> list --json`) is inside the `plugins` folder of the runtime directory, the folder of the `displayxr-cli` the Dashboard runs (`ComponentRows.ShippedByRuntime`) | the row's own controls only, and no removal sentence (it goes with the runtime) |
 
   A row that is neither installed nor installable (a connected client, a summary line) has no
   status. The built-in conversion adapter reads *Installed*. Filters: **All / Installed /
@@ -68,7 +71,8 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   **Install** / **Update**, **Details** (what it does, version, size, publisher, category, each
   external prerequisite with *Ready* / *Included* / *Get it first* and a link to its maker for an
   unmet one, the licence block, **Uninstall**). Chips state positive facts only: *Works with your
-  display* (`detected: high`), *Recommended*, the download size. An item the engine would refuse
+  display* (`detected: high`), *Recommended*, the download size. Details says the same in one
+  fixed sentence; the engine's `evidence` string (internal panel codes) is parsed and never shown. An item the engine would refuse
   (`compatible: false`) has no button and one calm line; the engine's own reason is in its detail.
 - **After an install the same row is the installed row**, with its detail open: the row's key is
   its class and registered id, which do not change. The status feed, the class's policy rows and
@@ -77,7 +81,8 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   (`receipt: true`) AND say it can remove it (`can_uninstall: true` in `dxr-get list --json`:
   the receipt recorded an uninstall command). A receipt alone is not enough: an item installed
   from a catalog entry that names no uninstall command (every schema-1 item) would be refused
-  with exit 43, so its row shows "Remove it from Windows Settings > Apps." instead of a button.
+  with exit 43, so its row shows "Remove it from Windows Settings > Apps." instead of a button
+  (the runtime's own row shows the same sentence).
   A list without the field (an older engine) reads as "cannot remove". A row that is not from
   the catalog is never offered Update, Install or Uninstall. **Disable is not Uninstall**: the
   Enabled box turns a component off and leaves it on the machine; Uninstall (in Details)

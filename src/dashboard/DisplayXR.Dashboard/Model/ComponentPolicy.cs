@@ -88,6 +88,8 @@ public static class ComponentClasses
 /// component's one line and its purchase page. <see cref="LicenceKeyActivation"/> / <see cref="LicenceDeepLink"/>:
 /// its <c>activation</c> object — whether it takes a pasted key and whether it takes a deep-link token
 /// (null from a CLI that predates the object). The Dashboard shows it; it never decides it.
+/// <see cref="BinaryPath"/>: the registered binary (<c>binary_path</c>, a conversion row's
+/// <c>binary</c>); "" for a built-in row or a CLI that does not say.
 /// </summary>
 public sealed record PolicyRow(ComponentClass Class, string Id, string Name, bool Enabled, string EnabledSource,
                                bool Preferred, bool Active, string Load, string Provenance, string? Signer,
@@ -95,7 +97,8 @@ public sealed record PolicyRow(ComponentClass Class, string Id, string Name, boo
                                bool RankedFirst = false, string Vendor = "", string Version = "", int? ProbeOrder = null,
                                string Licence = "", string? LicenceSource = null, string? LicenceExpires = null,
                                string? LicenceMessage = null, string? LicencePurchaseUrl = null,
-                               bool? LicenceKeyActivation = null, bool? LicenceDeepLink = null)
+                               bool? LicenceKeyActivation = null, bool? LicenceDeepLink = null,
+                               string BinaryPath = "")
 {
     /// <summary>Selection skips the component: it is unlicensed or its licence expired (the CLI's <c>blocks</c>).</summary>
     public bool LicenceBlocks => Licence is "unlicensed" or "expired";
@@ -309,7 +312,8 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
                     e.Obj("licence").StrOrNull("expires"), e.Obj("licence").StrOrNull("message"),
                     e.Obj("licence").StrOrNull("purchase_url"),
                     e.Obj("licence").Obj("activation") is { } act && act.Has("key") ? act.Bool("key") : null,
-                    e.Obj("licence").Obj("activation") is { } act2 && act2.Has("deep_link") ? act2.Bool("deep_link") : null))
+                    e.Obj("licence").Obj("activation") is { } act2 && act2.Has("deep_link") ? act2.Bool("deep_link") : null,
+                    e.Str("binary_path", e.Str("binary"))))
                 .ToArray();
             var byTask = new Dictionary<string, string>(StringComparer.Ordinal);
             var tasks = new List<PolicyTask>();
