@@ -197,10 +197,48 @@ class ShimTests(unittest.TestCase):
         self.assertEqual(self.selected(Select="none"), set())
         self.assertEqual(self.selected(Select="recommended,leia-conversion"), {"open-conversion", "leia-conversion"})
 
-    def test_requested_id_that_is_current_or_unavailable_is_not_selected(self):
-        ini = self.run_shim(Select="browser,ultraleap")
+    def test_requested_id_that_is_current_is_not_selected_and_not_passed_through(self):
+        ini = self.run_shim(Select="browser")
         self.assertFalse([k for k, v in self.items(ini).items() if v["selected"] == "1"])
         self.assertEqual(ini["catalog"]["passthrough"], "")
+
+    def test_requested_incompatible_item_is_handed_to_dxr_get_not_dropped(self):
+        # dxr-get install refuses it (41) and the installer reports that. The row
+        # stays what the page shows without /COMPONENTS=: greyed, not ticked.
+        ini = self.run_shim(Select="ultraleap")
+        ul = self.items(ini)["ultraleap"]
+        self.assertEqual((ul["status"], ul["ro"], ul["selected"]), ("unavailable", "1", "0"))
+        self.assertEqual(ini["catalog"]["passthrough"], "ultraleap")
+
+    def test_requested_not_installable_item_is_handed_to_dxr_get_not_dropped(self):
+        # A link-out and an item with no signed build: dxr-get answers 40.
+        ini = self.run_shim(Select="acme.viewer,unsigned-thing")
+        it = self.items(ini)
+        for k in ("acme.viewer", "unsigned-thing"):
+            self.assertEqual((it[k]["status"], it[k]["ro"], it[k]["selected"]), ("unavailable", "1", "0"))
+        self.assertEqual(ini["catalog"]["passthrough"].split(), ["unsigned-thing", "acme.viewer"])
+
+    def test_refused_item_is_passed_once_by_its_id_after_unknown_ids(self):
+        # Named by alias and by id: one attempt, under the catalog id.
+        lst = copy.deepcopy(LIST)
+        lst["items"][4]["aliases"] = ["ultraleap_hands"]
+        ini = self.run_shim(lst, Select="ultraleap_hands,ultraleap,no.such.id,leia_plugin")
+        self.assertEqual(ini["catalog"]["passthrough"].split(), ["no.such.id", "ultraleap"])
+        self.assertEqual({k for k, v in self.items(ini).items() if v["selected"] == "1"}, {"leia-sr"})
+
+    def test_unavailable_item_is_passed_through_only_when_named(self):
+        # Keywords and the default pre-ticks never reach for an unavailable item.
+        for sel in ("default", "recommended,detected", "none"):
+            self.assertEqual(self.run_shim(Select=sel)["catalog"]["passthrough"], "", sel)
+        self.assertEqual(self.run_shim()["catalog"]["passthrough"], "")
+
+    def test_none_selects_nothing_and_passes_nothing(self):
+        # Interactive /COMPONENTS=none: the rows are still listed, none ticked.
+        # (Unattended, Catalog.nsh does not run the shim at all for `none`.)
+        ini = self.run_shim(Select="none")
+        self.assertFalse([k for k, v in self.items(ini).items() if v["selected"] == "1"])
+        self.assertEqual(ini["catalog"]["passthrough"], "")
+        self.assertGreater(int(ini["catalog"]["count"]), 0)
 
     def test_unknown_requested_id_is_passed_through_and_junk_is_dropped(self):
         ini = self.run_shim(Select='acme.depth,bad"id,;rm')

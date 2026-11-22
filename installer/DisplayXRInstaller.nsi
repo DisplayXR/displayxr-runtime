@@ -1723,6 +1723,20 @@ Section "Start Menu Shortcuts" SecShortcuts
 	CreateShortCut "$SMPROGRAMS\DisplayXR\Uninstall DisplayXR.lnk" "$INSTDIR\Uninstall.exe"
 SectionEnd
 
+; LAST section, on purpose: install.log is a dump of the details list, and the
+; dump at the end of the runtime section predates everything the sections after
+; it print (catalog components, conversion models). Hidden and always run.
+; A silent install has no details list, so it has no install.log at all; what
+; an unattended caller reads for the catalog components is catalog-skipped.txt
+; (Catalog.nsh), which does not depend on the list.
+Section "-Install log" SecInstallLog
+	${IfNot} ${Silent}
+		StrCpy $0 "$INSTDIR\install.log"
+		Push $0
+		Call DumpLog
+	${EndIf}
+SectionEnd
+
 ;--------------------------------
 ; Uninstaller Section
 

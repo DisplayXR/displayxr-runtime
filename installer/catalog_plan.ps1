@@ -33,7 +33,7 @@
 # Output (ASCII, one section per listed item):
 #   [catalog] state=ok|offline|error  exit=<dxr-get exit code>
 #             count=<listed>  more=<not listed: no free slot>
-#             passthrough=<requested ids that are not in the listing>
+#             passthrough=<requested ids the listing lacks or marks unavailable>
 #             message=<one line>
 #   [itemN]   id, name, label, desc, size_kb, selected (0|1), ro (0|1),
 #             status (missing|outdated|current|unavailable)
@@ -155,6 +155,7 @@ if ($null -eq $rows) {
 
 $items = New-Object System.Collections.Generic.List[object]
 $known = @{}
+$refused = New-Object System.Collections.Generic.List[string]
 
 foreach ($r in @($rows)) {
     $id = [string](Get-Prop $r 'id')
@@ -188,6 +189,13 @@ foreach ($r in @($rows)) {
             $reason = Clean (Get-Prop $r 'incompatible_reason') 200
             if (-not $reason) { $reason = 'it is not compatible with this version of the DisplayXR Runtime' }
         }
+    }
+    # Named in -Select but not offered here (not compatible, no signed build, a
+    # link-out): never dropped silently. It is handed to `dxr-get install` like
+    # an unknown id, so the engine's own refusal (41, 40) is what gets reported.
+    # The row itself stays read-only and unticked.
+    if ($status -eq 'unavailable' -and -not $refused.Contains($id)) {
+        foreach ($n in $names) { if ($wantIds -contains $n) { $refused.Add($id); break } }
     }
 
     # External prerequisites DisplayXR does not install, and that are not there.
@@ -240,8 +248,8 @@ foreach ($r in @($rows)) {
 }
 
 # Requested ids the listing does not know: handed to dxr-get as they are (it
-# answers 40 for an id it does not know).
-$passthrough = @($wantIds | Where-Object { -not $known.ContainsKey($_) })
+# answers 40 for an id it does not know). Then the requested items it refuses.
+$passthrough = @($wantIds | Where-Object { -not $known.ContainsKey($_) }) + @($refused.ToArray())
 
 $sorted = @($items | Sort-Object -Property @{ Expression = { $_['rank'] } })
 $more = 0
