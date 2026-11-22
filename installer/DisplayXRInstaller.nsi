@@ -1624,10 +1624,29 @@ client_dll_ok:
 	; governed by /NOSTART alone, so the abort backstop must not fire.
 	StrCpy $DxrServiceWasRunning "0"
 
-	; Save installation log to install directory
-	StrCpy $0 "$INSTDIR\install.log"
-	Push $0
-	Call DumpLog
+	; Save installation log to install directory. DumpLog copies the details
+	; list, which a silent install does not have: /S used to write nothing and
+	; leave the log of an EARLIER run in place, reading as this one's. A silent
+	; run now replaces it with a short record of its own (the catalog section
+	; appends its outcome, Catalog.nsh).
+	${If} ${Silent}
+		${GetParameters} $R0
+		${GetTime} "" "L" $0 $1 $2 $3 $4 $5 $6
+		ClearErrors
+		FileOpen $R1 "$INSTDIR\install.log" w
+		${IfNot} ${Errors}
+			FileWrite $R1 "DisplayXR Setup ${VERSION}: silent install (/S), $2-$1-$0 $4:$5:$6.$\r$\n"
+			FileWrite $R1 "A silent install keeps no detail log. This file replaces the log of any earlier run.$\r$\n"
+			FileWrite $R1 "Parameters: $R0$\r$\n"
+			FileWrite $R1 "The DisplayXR Runtime was installed to $INSTDIR.$\r$\n"
+			FileClose $R1
+		${EndIf}
+		ClearErrors
+	${Else}
+		StrCpy $0 "$INSTDIR\install.log"
+		Push $0
+		Call DumpLog
+	${EndIf}
 
 SectionEnd
 

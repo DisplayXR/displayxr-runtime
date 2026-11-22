@@ -1,7 +1,8 @@
 # Catalog-driven installers
 
-Status: the runtime installer part is implemented and compile-checked, **not yet run on
-Windows**. The bundle part is a plan. Decision record:
+Status: the runtime installer part is implemented and compile-checked; a Windows box has run
+part of the checklist below (main @0cd768e2b), and what it found is fixed but **not yet re-run
+on Windows**. The bundle part is a plan. Decision record:
 [ADR-064 §7 and §8](../adr/ADR-064-component-catalog-and-third-party-trust.md). Engine:
 [`dxr-get`](../specs/runtime/dxr-get.md). Catalog:
 [component-catalog.md](../specs/runtime/component-catalog.md).
@@ -24,10 +25,18 @@ the conversion models:
 
 | Item state | Row | Ticked |
 |---|---|---|
-| not installed | `<name> <version> (download N MB)` | if **recommended** by the catalog, or if its detection rule **matched this machine with high confidence** |
-| installed, older than the catalog | `<name> <installed> to <version> (download N MB)` | same rule |
-| installed at the catalog version, or newer | `<name> <installed> - installed`, greyed | never; nothing is downloaded |
-| no signed Windows build, a link-out item, or its runtime range excludes the runtime being installed | `<name> - not available`, greyed, the reason in the description box | never |
+| not installed | `N MB - <name> <version>` | if **recommended** by the catalog, or if its detection rule **matched this machine with high confidence** |
+| installed, older than the catalog | `Update, N MB - <name> <installed> to <version>` | same rule |
+| installed at the catalog version, or newer | `Installed - <name> <installed>`, greyed | never; nothing is downloaded |
+| no signed Windows build, a link-out item, or its runtime range excludes the runtime being installed | `Not available - <name>`, greyed, the reason in the description box | never |
+
+The status leads the row because the list cuts a long row on the right; `Downloaded` stands in
+for the size when the download cache already holds everything. The page uses the layout with
+the description under the list (`MUI_COMPONENTSPAGE_SMALLDESC`), which gives the list about
+twice the width and shows about five rows at once instead of nine. That box is two lines
+tall, so a description is at most 110 characters with what matters first: for a row that is
+not available, the reason and nothing else, without the "Not available:" lead when the reason
+is long (the row says it).
 
 - **Recommended** is the open conversion provider (`recommended: true` in the catalog), so
   "Convert to 3D" exists on a machine whose display vendor ships no converter (ADR-064 §7).
@@ -47,7 +56,7 @@ The core install does not depend on the catalog.
 | When | What happens |
 |---|---|
 | the catalog cannot be reached when the page opens | no optional row is shown; the text above the list says the runtime alone is installed and to run Setup again later; the finish page repeats it and names the open conversion provider as not offered |
-| a download or an item's installer fails later | the runtime is installed, the item is listed on the finish page and in `<install dir>\catalog-skipped.txt` with the reason, Setup exits 0 |
+| a download or an item's installer fails later, or `dxr-get` refuses the item | the runtime is installed, the item is listed on the finish page and in `<install dir>\catalog-skipped.txt` with the reason and `dxr-get`'s exit code, Setup exits 0. "Run Setup again with an internet connection" is added only when an item failed for a connection reason (exit 10 or 20); a list of refusals ends after the list |
 | the connection drops between two items | the remaining items are skipped without further attempts, and listed |
 
 "How to get it later" is: run Setup again with a connection, or `dxr-get install <id>` from an
@@ -59,7 +68,7 @@ steps 4 and 8) do not exist yet, so the installer does not mention them.
 | Switch | Meaning |
 |---|---|
 | *(none)* | **unchanged**: the runtime only. No catalog request, no `dxr-get` call |
-| `/COMPONENTS=<list>` | comma-separated item ids or aliases (`leia-sr`, `leia_plugin`, `open-conversion`, …) and the keywords `recommended`, `detected`, `default` (= `recommended,detected`), `none`. Exactly `/COMPONENTS=default` is what the bundle passes |
+| `/COMPONENTS=<list>` | comma-separated item ids or aliases (`leia-sr`, `leia_plugin`, `open-conversion`, …) and the keywords `recommended`, `detected`, `default` (= `recommended,detected`), `none`. Exactly `/COMPONENTS=default` is what the bundle passes. Unattended, exactly `/COMPONENTS=none` is the same as no switch: no listing, no PowerShell, no `dxr-get` call |
 | `/CATALOG=<url\|file>` | passed to `dxr-get` as `--catalog`; the catalog must still be signed. For testing |
 | `/NOSTART` | as before; items are then installed with `--no-start-service` |
 | `/CATALOG=` and `/COMPONENTS=` values | a value containing a double quote is ignored |
@@ -67,6 +76,28 @@ steps 4 and 8) do not exist yet, so the installer does not mention them.
 In an interactive run `/COMPONENTS=` replaces the default pre-ticks. `/KEEPACTIVERUNTIME`,
 `/FORCEACTIVERUNTIME`, `/NOMODELS`, `/MODELSPACK=` and `/CLOSEAPPS` are untouched, and so are
 the `ActiveRuntime` rule and the allowlist rows: none of that code changed.
+
+**What an unattended caller reads.** Setup's exit code is about the runtime only. A component
+that was skipped, failed or refused never changes it: the runtime is installed and Setup exits
+0. The components' outcome is `<install dir>\catalog-skipped.txt`: one line per item that was
+not installed, `<name>: <reason> (dxr-get exit <n>)`. No file means nothing that was asked for
+was skipped; a file left by an earlier run is removed at the start of each run. The file is
+written directly, so it exists after `/S`.
+
+`install.log` always describes the run that wrote it. Interactive, it is a copy of the
+installer's details list, taken after the catalog step, so it holds the `Catalog:` lines. A
+silent install has no such list (it used to write nothing and leave the previous run's log in
+place); it now replaces the file with a short record: version, time, the parameters, that the
+runtime was installed, and the catalog outcome (nothing asked for, no failure, or the same
+lines as `catalog-skipped.txt`).
+
+**An id that is named but not offered.** An id or alias in `/COMPONENTS=` that the catalog
+lists as not installable here (its runtime range or class ABI excludes this runtime, it has no
+signed Windows build, it is a link-out) is not ticked, and is not dropped: it is handed to
+`dxr-get install` like an id the listing does not know, and the engine's refusal (41, or 40)
+is what `catalog-skipped.txt` and the finish page report. The keywords never do this: an item
+that is merely recommended or detected and not installable here is left alone. On the page the
+row is unchanged: greyed, unticked, the reason in the description box.
 
 The default is "nothing" on purpose. Installers that need the runtime run it silently through
 `dxr-get` (`/S /NOSTART`), and a runtime installer that called back into `dxr-get` by default
@@ -105,10 +136,13 @@ on the page instead of failing later.
 
 `--no-runtime` is on every install this installer triggers: `dxr-get` never starts a second
 runtime installer inside the first. An id passed with `/COMPONENTS=` that needs a newer runtime
-is refused by `dxr-get` (exit 41) and reported as skipped.
+is refused by `dxr-get` (exit 41) and reported as skipped: the listing already says it is not
+compatible, and `catalog_plan.ps1` puts such an id in `passthrough` so that `install` is still
+asked and the refusal comes from the engine, at install time.
 
 `installer/catalog_plan.ps1` adds only the ticks (the pre-tick rule and `/COMPONENTS=`), the
-row texts, and the order when there are more items than rows.
+`passthrough` list (requested ids the listing lacks or marks unavailable), the row texts, and
+the order when there are more items than rows.
 
 ### Live and waiting
 
@@ -123,17 +157,29 @@ row texts, and the order when there are more items than rows.
 Known gaps:
 
 1. Unattended `/COMPONENTS=default` reports a failure of the whole call in
-   `catalog-skipped.txt`; an individual item `dxr-get` skipped while the call succeeded is in
-   `install.log` only.
-2. At most eight rows. When the catalog offers more, ticked items are kept and the text says
-   how many are not shown.
+   `catalog-skipped.txt`; an individual item `dxr-get` skipped while the call succeeded (exit
+   0) is recorded nowhere: it is only in `dxr-get`'s output, which goes to the details list,
+   and a silent install has no such list (its `install.log` says so).
+   `dxr-get plan --default` shows what would be skipped and why. Ids given by name do not have
+   this gap: each is one `dxr-get install` call whose exit code is recorded.
+2. At most eight rows. When the catalog offers more, the text says how many are not shown,
+   and the rows kept are, in this order: ticked, then what can be ticked, then installed, then
+   not available. So the rows dropped first are the ones that cannot be installed anyway. A
+   dropped row cannot be ticked on the page; its id still works with `/COMPONENTS=`.
 3. The page's listing needs Windows PowerShell. Where it is blocked by policy the page shows
    no optional row. Unattended `/COMPONENTS=default` does not need it.
 4. The texts are English only, like the rest of the installer.
 
 ### To verify on Windows
 
-Nothing below has been run. `makensis` compiled the script on macOS with stub payloads, with and
+A Windows box ran part of this list on main @0cd768e2b with a test-key `dxr-get` and the
+fixture catalog. It found that line 6 did nothing (the refused id was dropped), that `/S`
+writes no `install.log` and leaves the previous run's in place, that `/S /COMPONENTS=none`
+still ran the listing, and that the page's rows were cut after about 22 characters with a
+long reason clipped in the description box. Lines 1, 5, 6, 10 and 12 describe the behaviour
+after those fixes, which has not been re-run on Windows (the page layout was changed without
+seeing it).
+`makensis` compiled the script on macOS with stub payloads, with and
 without a `dxr-get.exe`; CI builds the real installer; the listing shim's tests ran under
 PowerShell 7 against a fake `dxr-get` that prints a listing in the shape dxr-get.md gives. The
 real `dxr-get.exe` has not been run by the shim, and Windows PowerShell 5.1 has not run it.
@@ -158,7 +204,9 @@ installer:
    and (on a Leia display) the Leia plug-in ticked, nothing vendor-specific on a plain monitor;
    the size line changing with each tick; the incompatible and ABI-mismatch fixture items
    greyed with `dxr-get`'s reason in the description box; the unmet-prerequisite item naming
-   what is missing; an installed item greyed.
+   what is missing; an installed item greyed. Every row's status (`N MB`, `Update, N MB`,
+   `Installed`, `Not available`) readable without the horizontal scrollbar, and most of the
+   name; no description clipped by its box, the longest "not available" reason included.
 2. The same listing by hand, to compare:
    `dxr-get --catalog <file> list --json --assume-runtime <version> --assume-abi display_processor=<n> …`.
 3. With the production `dxr-get` and only schema 1 published (today): rows for the Leia SR
@@ -166,11 +214,18 @@ installer:
 4. No network when the page opens: the page text, the finish page, exit code 0, the runtime
    working. Network removed after the page: `catalog-skipped.txt`, the finish page list, exit 0.
 5. `/S` with no switch: no `dxr-get` process, no network request, same result as the previous
-   installer. `/S /COMPONENTS=default` (one `install --default` call, no PowerShell),
-   `/S /COMPONENTS=leia_plugin`, `/S /COMPONENTS=recommended`, `/S /COMPONENTS=none`.
-6. `--no-runtime`: `/S /COMPONENTS=<an item whose floor is above this runtime>` is skipped
-   with exit 41 in the log and a line in `catalog-skipped.txt`; no second runtime installer
-   starts.
+   installer. `/S /COMPONENTS=none`: the same, no PowerShell and no `dxr-get` process either,
+   and a `catalog-skipped.txt` left by an earlier run is gone.
+   `/S /COMPONENTS=default` (one `install --default` call, no PowerShell),
+   `/S /COMPONENTS=leia_plugin`, `/S /COMPONENTS=recommended`.
+6. `--no-runtime`: `/S /COMPONENTS=<an item whose floor is above this runtime>`
+   (`fixture.runtime-too-old`; also `fixture.runtime-too-new`, `fixture.abi-mismatch`): one
+   `dxr-get install <id> --yes --no-runtime` runs and exits 41; Setup exits 0;
+   `catalog-skipped.txt` has `<id>: it is not compatible with this version of the DisplayXR
+   Runtime, or needs a newer one (dxr-get exit 41)`; no second runtime installer starts.
+   `/S /COMPONENTS=fixture.link-out`: the same with exit 40. `/S /COMPONENTS=no.such.id`:
+   exit 40, as before. Interactive with the same switch: the row is greyed and unticked, and
+   the finish page lists the item as not installed.
 7. Upgrade over an existing install with the Leia plug-in present: shown as installed, or as
    an update; the service stopped and started the expected number of times; `ActiveRuntime`
    handling as documented in dxr-get.md; `Runtime\Abi\RuntimeVersion` stamped with the new
@@ -180,9 +235,15 @@ installer:
 9. Order: with the open conversion provider ticked, the conversion-models section that follows
    takes its pack from the provider just installed.
 10. The components page with eight rows plus the existing four: the list scrolls, the text
-    above it fits in two lines.
+    above it fits in two lines, the description box sits under the list, and with more than
+    eight optional items the rows not shown are the not-available ones first.
 11. A box where PowerShell is restricted by policy: the page as before, and
     `/S /COMPONENTS=default` still working.
+12. Log files. After an interactive install: `<install dir>\install.log` holds the `Catalog:`
+    lines (verified on main @0cd768e2b). After `/S` over an install that has an older
+    `install.log`: the file is replaced by the short record of this run (version, time,
+    parameters, the catalog outcome), and `catalog-skipped.txt` exists exactly when something
+    asked for was not installed.
 
 ## 2. The bundle (`displayxr-installer`)
 

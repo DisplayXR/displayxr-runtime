@@ -33,7 +33,7 @@
 # Output (ASCII, one section per listed item):
 #   [catalog] state=ok|offline|error  exit=<dxr-get exit code>
 #             count=<listed>  more=<not listed: no free slot>
-#             passthrough=<requested ids that are not in the listing>
+#             passthrough=<requested ids the listing lacks or marks unavailable>
 #             message=<one line>
 #   [itemN]   id, name, label, desc, size_kb, selected (0|1), ro (0|1),
 #             status (missing|outdated|current|unavailable)
@@ -153,8 +153,10 @@ if ($null -eq $rows) {
     exit 0
 }
 
+$DescMax = 110   # the description box under the list is two lines tall (measured on Windows)
 $items = New-Object System.Collections.Generic.List[object]
 $known = @{}
+$refused = New-Object System.Collections.Generic.List[string]
 
 foreach ($r in @($rows)) {
     $id = [string](Get-Prop $r 'id')
@@ -185,9 +187,16 @@ foreach ($r in @($rows)) {
         elseif ((Get-Prop $r 'compatible') -eq $false) {
             # dxr-get's verdict for the runtime being installed (range and class ABI).
             $status = 'unavailable'
-            $reason = Clean (Get-Prop $r 'incompatible_reason') 200
+            $reason = Clean (Get-Prop $r 'incompatible_reason') 150
             if (-not $reason) { $reason = 'it is not compatible with this version of the DisplayXR Runtime' }
         }
+    }
+    # Named in -Select but not offered here (not compatible, no signed build, a
+    # link-out): never dropped silently. It is handed to `dxr-get install` like
+    # an unknown id, so the engine's own refusal (41, 40) is what gets reported.
+    # The row itself stays read-only and unticked.
+    if ($status -eq 'unavailable' -and -not $refused.Contains($id)) {
+        foreach ($n in $names) { if ($wantIds -contains $n) { $refused.Add($id); break } }
     }
 
     # External prerequisites DisplayXR does not install, and that are not there.
@@ -213,26 +222,37 @@ foreach ($r in @($rows)) {
     # unmet prerequisites, minus the download cache. 0 = already downloaded.
     $download = To-Long (Get-Prop $r 'download')
     $sizeText = Format-Size $download
+    # The status comes FIRST: the list is narrow and cuts a row on the right,
+    # and what must stay readable without scrolling is the status.
+    if (-not $sizeText) { $sizeText = 'Downloaded' }     # nothing left to fetch
     switch ($status) {
-        'current' { $label = "$name $installed - installed" }
-        'outdated' { $label = if ($sizeText) { "$name $installed to $target (download $sizeText)" } else { "$name $installed to $target (already downloaded)" } }
-        'missing' { $label = if ($sizeText) { "$name $target (download $sizeText)" } else { "$name $target (already downloaded)" } }
-        default { $label = "$name - not available" }
+        'current' { $label = "Installed - $name $installed" }
+        'outdated' { $label = "Update, $sizeText - $name $installed to $target" }
+        'missing' { $label = "$sizeText - $name $target" }
+        default { $label = "Not available - $name" }
     }
 
+    # The description box holds about two lines: what matters first, and the
+    # whole text short (see $DescMax below).
     $desc = Clean (Get-Prop $r 'summary') 200
-    if ($status -eq 'unavailable') { $desc = "Not available: $reason. $desc" }
+    if ($status -eq 'unavailable') {
+        # The row already says "Not available": when the reason is long, it
+        # alone gets the two lines.
+        $desc = "Not available: $reason."
+        if ($desc.Length -gt $DescMax) { $desc = "$reason." }
+    }
     elseif ($status -eq 'current') { $desc = "Already installed; nothing is downloaded. $desc" }
     else {
-        if ($detected) { $desc = "Selected because matching hardware was detected on this computer. $desc" }
+        if ($unmet.Count -gt 0) { $desc = "Also needs, and does not install: $($unmet -join ', ') (not found). $desc" }
+        if ($detected) { $desc = "Matching hardware was detected. $desc" }
         elseif ($recommended) { $desc = "Recommended. $desc" }
-        if ($unmet.Count -gt 0) { $desc = "$desc Also needs, and does not install: $($unmet -join ', ') (not found on this computer)." }
-        $desc = "$desc Downloaded from its publisher during setup."
     }
 
+    # Which rows are kept when there are more items than slots: ticked, then
+    # what can be ticked, then installed, then not available (dropped first).
     $rank = if ($selected) { 0 } elseif ($selectable) { 1 } elseif ($status -eq 'current') { 2 } else { 3 }
     $items.Add(@{
-            id = $id; name = (Clean $name 80); label = (Clean $label 120); desc = (Clean $desc 400)
+            id = $id; name = (Clean $name 80); label = (Clean $label 120); desc = (Clean $desc $DescMax)
             size_kb = [long][math]::Ceiling($download / 1024); selected = [int]$selected
             ro = [int](-not $selectable); status = $status
             rank = ($rank * 100000 + $items.Count)   # the listing order breaks ties (no Sort -Stable in 5.1)
@@ -240,8 +260,8 @@ foreach ($r in @($rows)) {
 }
 
 # Requested ids the listing does not know: handed to dxr-get as they are (it
-# answers 40 for an id it does not know).
-$passthrough = @($wantIds | Where-Object { -not $known.ContainsKey($_) })
+# answers 40 for an id it does not know). Then the requested items it refuses.
+$passthrough = @($wantIds | Where-Object { -not $known.ContainsKey($_) }) + @($refused.ToArray())
 
 $sorted = @($items | Sort-Object -Property @{ Expression = { $_['rank'] } })
 $more = 0
