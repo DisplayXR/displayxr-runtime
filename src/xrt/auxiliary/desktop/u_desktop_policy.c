@@ -126,6 +126,34 @@ file_open(const char *path, const char *mode)
 		}
 		return rf;
 	}
+	if (mode[0] == 'a') {
+		// FILE_APPEND_DATA without FILE_WRITE_DATA: the kernel places every write at
+		// the end of the file. The CRT's "a" mode seeks to the end and then writes,
+		// as two steps, so two appenders on separate handles (an automatic release
+		// on the worker and a policy change on the caller's thread) could land on
+		// the same offset and one record would overwrite the other.
+		wchar_t *wa = u8_to_w(path);
+		if (wa == NULL) {
+			return NULL;
+		}
+		HANDLE h = CreateFileW(wa, FILE_APPEND_DATA | SYNCHRONIZE,
+		                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_ALWAYS,
+		                       FILE_ATTRIBUTE_NORMAL, NULL);
+		free(wa);
+		if (h == INVALID_HANDLE_VALUE) {
+			return NULL;
+		}
+		int fd = _open_osfhandle((intptr_t)h, _O_WRONLY | _O_APPEND | _O_BINARY);
+		if (fd < 0) {
+			CloseHandle(h);
+			return NULL;
+		}
+		FILE *af = _fdopen(fd, "ab");
+		if (af == NULL) {
+			_close(fd); // closes the handle too
+		}
+		return af;
+	}
 	wchar_t *wp = u8_to_w(path);
 	wchar_t wm[8];
 	size_t i = 0;
