@@ -14,7 +14,7 @@ using Xunit;
 namespace DisplayXR.Dashboard.Tests;
 
 /// <summary>
-/// ADR-064 step 8: the Catalog tab. The engine's <c>list --json</c> in its schema-2 and
+/// ADR-064 step 8: the catalog (on the Components page). The engine's <c>list --json</c> in its schema-2 and
 /// schema-1-fallback shapes, what every exit code says, the licence block, the URL rule, and the
 /// two things that must never happen: a key on a command line, and a URL through a shell.
 /// The JSON fixtures are written by hand from the emitter (get_core.c <c>dxr_list_catalog</c>,

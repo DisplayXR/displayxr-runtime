@@ -277,7 +277,7 @@ Direction recorded here; implementation is out of scope for this ADR's first ste
 - **Cost:** it needs a network connection. The installer therefore **says so up front**,
   before the user commits, and handles no connection clearly: it installs what is embedded
   (the runtime core), reports what was skipped, and says how to get it later
-  (`displayxr-cli catalog install <id>` or the Dashboard's Catalog tab).
+  (`displayxr-cli catalog install <id>` or the Dashboard's Components tab).
 - **The offline full bundle stays** for OEM and air-gapped installs.
 
 What `dxr-get` already covers for this, verified in `get_main.c`, `get_http.c`,
@@ -357,7 +357,7 @@ Each step is one pull request unless noted. Steps 1–4 are Windows.
 | 5 | **POSIX engine.** The same commands on macOS and Linux: `.pkg` / `.deb` assets, a detached Ed25519 signature per asset in place of Authenticode, the receipt under `/var/lib/displayxr/catalog/`; installed binaries pass the gate as `platform-trusted` in the root-owned package locations | dxr-get.md; plugin-discovery.md §4.3 (POSIX has no signer check today) |
 | 6 | **Licence-state slot + `secret` setting type.** *Done (#2736; ADR-054 Amendment 2), with the `activate` slot step 7 delivers tokens through.* The appended slot and feature macro on all four class vtables, carrying state, message, purchase URL and the optional `source` and `expiry`; the fall-through rule in each selection path, `status --json` and `list` columns, `XRT_COMPONENT_SETTING_TYPE_SECRET` with redaction on every read path | ADR-054 (N5 done, and decision 7 gains a type); ADR-020 (one more worked example of an appended slot); ADR-053 (maps `UNLICENSED` onto the shared vocabulary); `xrt_plugin_iface.md`, `xrt_input_plugin_iface.md`; plugin-discovery.md §2.3 and the three provider-discovery specs; the two onboarding guides. ADR-063 needs a note only: the slot is on the provider interface, not on the provider-device descriptor it proposes |
 | 7 | **`displayxr://activate` handler.** Scheme registration by the runtime installer, nonce start / consume RPCs on the service's DIAG channel, token delivery through the plug-in's activation slot | dxr-get.md or a new activation spec; ADR-051 (a Dashboard action that starts a browser flow); service-architecture.md |
-| 8 | **Dashboard Catalog tab.** Browse, install, uninstall, update, tier and prerequisite display, Buy / Activate. Renders the CLI's JSON | ADR-051; `src/dashboard/README.md` |
+| 8 | **Dashboard catalog.** Browse, install, uninstall, update, tier and prerequisite display, Buy / Activate. Renders the CLI's JSON. Shipped as a Catalog tab, then merged into the Components tab: one list of installed and catalog items (`src/dashboard/README.md`) | ADR-051; `src/dashboard/README.md` |
 | 9 | **Catalog-driven bundle** (§8), in `displayxr-installer`, plus the runtime installer pulling the open conversion provider | versions-json-autobump.md (bundle membership stops being five pins read by name); `displayxr-installer` docs; ADR-042 / ADR-053 note on the default converter |
 
 ## Decided in review (2026-11-20)

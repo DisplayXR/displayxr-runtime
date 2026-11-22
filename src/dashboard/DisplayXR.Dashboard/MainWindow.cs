@@ -90,7 +90,7 @@ public sealed class MainWindow : Window
             Toast = ShowToast,
         };
 
-        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new WindowsPage(), new ComponentsPage(), new CatalogPage(), new PerformancePage(), new DeveloperPage() };
+        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new WindowsPage(), new ComponentsPage(), new PerformancePage(), new DeveloperPage() };
         foreach (var p in _pages)
         {
             p.Bind(_ctx);
@@ -120,7 +120,7 @@ public sealed class MainWindow : Window
 #if DEBUG
             if (Program.CatalogItem is { } focus) _ctx.CatalogFocus = new CatalogFocus(focus, null, null, null);
 #endif
-            Navigate(_pages.Any(p => p.Id == startPage) ? startPage : "home");
+            Navigate(_pages.Any(p => p.Id == PageRoutes.Resolve(startPage)) ? startPage : "home");
 #if DEBUG
             DebugCapture();
 #endif
@@ -317,6 +317,7 @@ public sealed class MainWindow : Window
 
     public void Navigate(string id)
     {
+        id = PageRoutes.Resolve(id); // "catalog" was merged into Components
         var page = _pages.FirstOrDefault(p => p.Id == id);
         if (page is null || _shutdown) return;
         if (_nav.TryGetValue(id, out var rb) && rb.IsChecked != true)
@@ -414,8 +415,8 @@ public sealed class MainWindow : Window
         SetBadge("displays", StatusText.DisplaysBadge(s));
         SetBadge("windows", StatusText.WindowsBadge(s));
         SetBadge("performance", _ctx.PerfNonDefault ? new NavBadge(_ctx.Perf!.Levers.Count(l => l.IsSet), Level.Warn) : null);
-        int updates = _ctx.CatalogRead?.List?.Items.Count(i => i.HasUpdate && i.Action == CatalogAction.Update) ?? 0;
-        SetBadge("catalog", updates > 0 ? new NavBadge(updates, Level.Info) : null);
+        int updates = ComponentRows.Updates(_ctx.CatalogRead is { Status: CatalogStatus.Ready } liveCatalog ? liveCatalog.List : null);
+        SetBadge("components", updates > 0 ? new NavBadge(updates, Level.Info) : null);
         SetBadge("home", _ctx.PreferredPlugin is not null ? new NavBadge(1, Level.Warn) : null);
 
         string rt = s?.Runtime.Version is { Length: > 0 } v ? $"Runtime {v}\n" : "";
@@ -448,7 +449,7 @@ public sealed class MainWindow : Window
             "displays" => $"{badge.Count} warning{(badge.Count == 1 ? "" : "s")} on the screens",
             "windows" => $"{badge.Count} client app{(badge.Count == 1 ? "" : "s")}",
             "performance" => "Non-default performance settings are in force",
-            "catalog" => $"{badge.Count} update{(badge.Count == 1 ? "" : "s")} available",
+            "components" => $"{badge.Count} update{(badge.Count == 1 ? "" : "s")} available",
             _ => "A display-processor override is active",
         });
     }
@@ -468,8 +469,6 @@ public sealed class MainWindow : Window
             case "components":
                 _ = _ctx.LoadInfoAsync(force: true);
                 _ = _ctx.LoadWorkspaceAsync(force: true);
-                break;
-            case "catalog":
                 _ctx.ForgetCatalogBackground();
                 _ = _ctx.LoadCatalogAsync(force: true);
                 foreach (var c in ComponentClasses.All) _ = _ctx.LoadPolicyAsync(c, force: true);

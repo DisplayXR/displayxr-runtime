@@ -13,7 +13,7 @@ namespace DisplayXR.Dashboard.Feed;
 
 /// <summary>
 /// <c>--fixture</c> with a <c>catalog-list.json</c> beside the snapshot file: the install engine,
-/// simulated in memory, so the Catalog tab can be laid out and clicked through on any platform with
+/// simulated in memory, so the catalog rows of the Components page can be laid out and clicked through on any platform with
 /// no network, no engine and no permission prompt. The file is a <c>dxr-get list --json</c> document
 /// (or the engine's offline document, <c>{"offline":true,…}</c>, to see the offline view).
 ///

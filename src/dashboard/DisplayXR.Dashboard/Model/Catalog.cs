@@ -9,7 +9,8 @@ using System.Text.Json;
 
 namespace DisplayXR.Dashboard.Model;
 
-// ADR-064 step 8: the Catalog tab's model. Everything here is pure: the install
+// ADR-064 step 8: the catalog's model (shown on the Components page, joined with what is
+// installed: Model/ComponentRows.cs). Everything here is pure: the install
 // engine's `list --json` (docs/specs/runtime/dxr-get.md § list) read tolerantly, the
 // words the page shows, what each exit code means to a person, the licence block
 // and the URL rule. The page only lays these out; the tests pin them.
@@ -261,7 +262,7 @@ public sealed record CatalogRead(CatalogStatus Status, CatalogList? List, string
 
     public static readonly CatalogRead NoEngineHere = new(CatalogStatus.NoEngineHere, null,
         "Installs come from the Download page for now",
-        "On this system, DisplayXR and its add-ons are installed from the Download page. Everything you install there shows up in Components.");
+        "On this system, DisplayXR and its add-ons are installed from the Download page. Everything you install there shows up here.");
 
     public static CatalogRead EngineMissing(string lookedAt) => new(CatalogStatus.EngineMissing, null,
         "The Catalog arrives with the next DisplayXR update",
@@ -578,7 +579,7 @@ public sealed record CatalogBackground(string ItemId, string Name, CatalogVerb V
 }
 
 /// <summary>
-/// What another page asked the Catalog to open: an item id, or the Components row
+/// The catalog item the Components page is asked to open: an item id, or the component
 /// (<paramref name="Class"/> + <paramref name="ComponentId"/>) whose catalog item it is.
 /// </summary>
 public sealed record CatalogFocus(string? ItemId, ComponentClass? Class, string? ComponentId, string? Name);

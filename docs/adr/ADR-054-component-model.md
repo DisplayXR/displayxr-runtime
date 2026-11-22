@@ -493,7 +493,7 @@ capability (`XRT_CONV_STATE_UNLICENSED`).
   processor (plugin-discovery.md §4.2).
 - Entitlement detail (trial, expiry) in the app-facing `XR_DXR_lift` enumeration.
 - The Dashboard's Buy / Activate action. The Dashboard shows a licence chip; the action is
-  ADR-064's Catalog tab.
+  ADR-064's catalog, on the Dashboard's Components tab.
 
 ### Consequences
 

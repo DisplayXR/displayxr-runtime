@@ -60,8 +60,8 @@ The core install does not depend on the catalog.
 | the connection drops between two items | the remaining items are skipped without further attempts, and listed |
 
 "How to get it later" is: run Setup again with a connection, or `dxr-get install <id>` from an
-elevated prompt. `displayxr-cli catalog install` and the Dashboard's Catalog tab (ADR-064
-steps 4 and 8) do not exist yet, so the installer does not mention them.
+elevated prompt. `displayxr-cli catalog install` and the Dashboard's catalog rows (ADR-064
+steps 4 and 8; on the Components tab) do not exist yet, so the installer does not mention them.
 
 ### Unattended (`/S`)
 
