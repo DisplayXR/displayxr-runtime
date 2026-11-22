@@ -349,9 +349,114 @@ dxr_uninstall_check(const struct dxr_receipt *r,
                     char *detail,
                     size_t detail_size);
 
+/*
+ * Several items in one `install` / `uninstall` (so a front end asks for
+ * elevation once). Each item is judged and run alone, in the order given:
+ * one that cannot be installed or removed is reported and skipped, and the
+ * rest proceed. One item on the command line is the single-item verb, with
+ * its output unchanged.
+ */
+
+//! Most items one `install` / `uninstall` accepts.
+#define DXR_MAX_IDS 32
+
+//! What `install` does with a plan, before any download. The order is the single-item verb's.
+enum dxr_install_verdict
+{
+	DXR_INSTALL_PROCEED,       //!< run the plan
+	DXR_INSTALL_NOTHING,       //!< nothing to do: exit 0
+	DXR_INSTALL_INCOMPATIBLE,  //!< exit 41
+	DXR_INSTALL_NEEDS_ADMIN,   //!< exit 50
+	DXR_INSTALL_NOT_FETCHABLE, //!< exit 40
+};
+
+/*!
+ * Judge an `install` plan: not compatible (41) first, then nothing to do (0),
+ * then elevation (50), then not fetchable (40). Elevation is asked for before
+ * "not fetchable" is reported; that is the single-item verb's order and
+ * deployed callers know it.
+ */
+enum dxr_install_verdict
+dxr_install_judge(const struct dxr_plan *p, bool elevated);
+
+/*!
+ * The result word of one item of a several-item `install`: `installed`,
+ * `nothing_to_do`, `incompatible`, `needs_elevation`, `not_fetchable`, or
+ * `failed` (the plan ran and ended with @p code != 0).
+ */
+const char *
+dxr_install_result_word(enum dxr_install_verdict v, int code);
+
+/*!
+ * One entry of a several-item `install --json`: `{"id","exit","result","plan"}`.
+ * @p plan_json is the item's plan as @ref dxr_plan_json printed it (NULL: no
+ * `plan` key).
+ */
+cJSON *
+dxr_install_item_json(const char *id, int code, const char *result, const char *plan_json);
+
+/*!
+ * The document of a several-item `install` / `uninstall --json`:
+ * `{"exit": <the first item exit code that is not 0, else 0>, "items": [...]}`.
+ * Takes ownership of @p items; @p out_exit (optional) gets `exit`.
+ */
+cJSON *
+dxr_multi_json(cJSON *items, int *out_exit);
+
 //! Ids (from @p all) whose receipts say they required @p id. Returns the count, names in @p out.
 int
 dxr_receipt_dependents(const struct dxr_receipt *all, int n, const char *id, char *out, size_t out_size);
+
+/*
+ * Text that came from the command line or the environment.
+ *
+ * dxr-get may run elevated on behalf of a caller that is not, and what it
+ * logs is read back by that caller's front end one line at a time. No
+ * argument may therefore carry a control character (a newline in an item id
+ * would forge a `result:` line), and nothing that is logged may either.
+ */
+
+//! true when @p arg holds no ASCII control character (0x00-0x1F, 0x7F). Bytes of a UTF-8 sequence pass.
+bool
+dxr_arg_ok(const char *arg);
+
+/*!
+ * Make @p text safe to log, in place: every ASCII control character except
+ * the line feed and the tab becomes `?`. The length does not change.
+ */
+void
+dxr_log_sanitize(char *text);
+
+//! The verification-weakening switches a run honours. All false in every build that ships.
+struct dxr_dev_switches
+{
+	bool no_verify_catalog; //!< `--no-verify-catalog` with `DXR_GET_DEV=1`: the catalog signature is not checked
+	bool allow_unsigned;    //!< `DXR_GET_ALLOW_UNSIGNED=1`: the Authenticode check of a download is skipped
+};
+
+/*!
+ * Decide which switches apply. They exist only in a TEST ROOT KEY build
+ * (@p test_build; CMake DXR_GET_TEST_ROOT_KEY), which is never installed,
+ * never attached to a release, and prints a banner on every run. In every
+ * other build the environment variables are ignored and the argument is a
+ * usage error: a signed dxr-get.exe is started elevated behind a consent
+ * prompt that shows its publisher, and nothing the calling user can set may
+ * make it install something the signed catalog does not name.
+ *
+ * Returns false (usage error, @p why says which) when `--no-verify-catalog`
+ * was given and cannot be honoured. @p ignored (optional) gets a note when an
+ * environment switch was set and ignored, else an empty string.
+ */
+bool
+dxr_dev_switches_resolve(bool test_build,
+                         bool arg_no_verify,
+                         bool env_dev,
+                         bool env_allow_unsigned,
+                         struct dxr_dev_switches *out,
+                         char *why,
+                         size_t why_size,
+                         char *ignored,
+                         size_t ignored_size);
 
 #ifdef __cplusplus
 }

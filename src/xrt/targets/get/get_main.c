@@ -26,6 +26,7 @@
 
 #include "get.h"
 #include "get_core.h"
+#include "get_log_channel.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -54,13 +55,35 @@
 //! %TEMP%) is given to actually remove the component.
 #define UNINSTALL_SETTLE_MS (120u * 1000u)
 
+//! `--log-pipe <token>`: every message also goes to the front end's pipe (get_log_channel.h).
+static dxr_log_channel_t g_log_channel = DXR_LOG_CHANNEL_NONE;
+
 void
 dxr_log(const char *fmt, ...)
 {
+	// One buffer for both destinations. What is logged can hold text that came
+	// from the command line, the registry or a catalog: control characters are
+	// taken out, so that neither a terminal nor a front end reading the channel
+	// line by line can be told something dxr-get did not say.
+	char line[8192]; // the usage text is the longest message
 	va_list ap;
 	va_start(ap, fmt);
-	(void)vfprintf(stderr, fmt, ap);
+	int n = vsnprintf(line, sizeof(line), fmt, ap);
 	va_end(ap);
+	if (n <= 0) {
+		return;
+	}
+	if (n >= (int)sizeof(line)) {
+		n = (int)sizeof(line) - 1;
+		line[n - 1] = '\n'; // a cut message still ends its line
+	}
+	dxr_log_sanitize(line);
+	if (g_log_channel != DXR_LOG_CHANNEL_NONE && !dxr_log_channel_write(g_log_channel, line, (size_t)n)) {
+		// The front end is gone or not reading. One bounded wait was spent; no more.
+		dxr_log_channel_close(g_log_channel);
+		g_log_channel = DXR_LOG_CHANNEL_NONE;
+	}
+	(void)fputs(line, stderr);
 	(void)fflush(stderr);
 }
 
@@ -367,7 +390,12 @@ static struct dxr_env k_env = {
 static bool
 read_whole_file(const char *path, char **out, size_t *len)
 {
-	FILE *f = fopen(path, "rb");
+	// The path is UTF-8 (the command line is read as UTF-16, see main).
+	wchar_t w[2200];
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, w, 2200) <= 0) {
+		return false;
+	}
+	FILE *f = _wfopen(w, L"rb");
 	if (f == NULL) {
 		return false;
 	}
@@ -439,7 +467,7 @@ load_catalog(const char *where, bool verify, struct dxr_catalog *c, bool *no_net
 		}
 	} else {
 		(void)snprintf(key_id, sizeof(key_id), "UNVERIFIED");
-		dxr_log("WARNING: catalog signature NOT verified (DXR_GET_DEV)\n");
+		dxr_log("WARNING: catalog signature NOT verified (DXR_GET_DEV, test-root-key build)\n");
 	}
 	char err[128];
 	int r = dxr_catalog_parse(body, blen, time(NULL), c, err, sizeof(err));
@@ -503,6 +531,9 @@ load_default_catalog(bool verify, struct dxr_catalog *c)
  * Fetch + verify + install.
  */
 
+//! The verification-weakening switches of this run: all off, except in a test-root-key build.
+static struct dxr_dev_switches g_dev = {false, false};
+
 /*!
  * Downloads (resuming a partial file), then checks size, SHA-256 and the
  * Authenticode signer of one asset. @p item is the catalog item whose
@@ -515,7 +546,8 @@ fetch_asset(const struct dxr_catalog *c,
             const char *name,
             wchar_t *out_path,
             size_t cap,
-            const wchar_t *dir_override)
+            const wchar_t *dir_override,
+            bool allow_unsigned)
 {
 	char why[256];
 	int r = dxr_asset_check(c, item, asset, NULL, why, sizeof(why));
@@ -585,8 +617,8 @@ fetch_asset(const struct dxr_catalog *c,
 		}
 	}
 
-	if (env_on("DXR_GET_ALLOW_UNSIGNED")) {
-		dxr_log("%s: WARNING Authenticode check skipped (DXR_GET_ALLOW_UNSIGNED)\n", name);
+	if (allow_unsigned) { // a test-root-key build only (dxr_dev_switches_resolve)
+		dxr_log("%s: WARNING Authenticode check skipped (DXR_GET_ALLOW_UNSIGNED, test-root-key build)\n", name);
 	} else {
 		char cn[256];
 		if (!dxr_authenticode_signer(out_path, cn, sizeof(cn))) {
@@ -812,7 +844,7 @@ execute_plan(const struct dxr_catalog *c, struct dxr_plan *p, bool no_start, con
 		if (!dxr_step_needs_work(s)) {
 			continue;
 		}
-		int r = fetch_asset(c, s->item, s->asset, s->label, paths[i], MAX_PATH, NULL);
+		int r = fetch_asset(c, s->item, s->asset, s->label, paths[i], MAX_PATH, NULL, g_dev.allow_unsigned);
 		if (r != DXR_GET_OK) {
 			dxr_log("Nothing was installed. Not installed:");
 			for (int j = 0; j < p->n; j++) {
@@ -912,19 +944,23 @@ usage(void)
 	    "  dxr-get [--catalog <url|file>] plan --for <item> | --default [--min-runtime X.Y.Z] [--json]\n"
 	    "  dxr-get [--catalog <url|file>] ensure-for <item> [--min-runtime X.Y.Z] [--yes] [--no-start-service]\n"
 	    "  dxr-get [--catalog <url|file>] fetch <item> [--out <dir>]\n"
-	    "  dxr-get [--catalog <url|file>] install <item> | --default [--yes] [--json] [--no-start-service]\n"
+	    "  dxr-get [--catalog <url|file>] install <item>... | --default [--yes] [--json] [--no-start-service]\n"
 	    "  dxr-get [--catalog <url|file>] detect [--json]\n"
 	    "  dxr-get [--catalog <url|file>] catalog\n"
 	    "  dxr-get [--catalog <url|file>] list [--json]\n"
 	    "  dxr-get [--catalog <url|file>] outdated [--json]\n"
 	    "  dxr-get list --installed [--json]\n"
-	    "  dxr-get uninstall <id> [--json] [--no-start-service]\n"
+	    "  dxr-get uninstall <id>... [--json] [--no-start-service]\n"
 	    "\n"
 	    "  --default            the catalog's recommended items plus high-confidence hardware matches\n"
 	    "  --no-runtime         (plan, ensure-for, install, list) never install or upgrade the runtime\n"
 	    "                       itself; an item that would need it is refused with exit 41\n"
 	    "  --assume-runtime V   (list, plan) answer as if runtime V were installed\n"
 	    "  --assume-abi C=N     with --assume-runtime: that runtime implements major N of class C\n"
+	    "  --log-pipe <token>   also send every message to the named pipe dxr-get-log-<token> (32 hex\n"
+	    "                       digits) that the calling front end created; dxr-get writes to no file\n"
+	    "  several items        install / uninstall: each is judged and run alone, in order; one that\n"
+	    "                       cannot be done is reported and skipped; exit = the first failure\n"
 	    "\n"
 	    "items: the ids `dxr-get list` shows (the schema-1 names runtime, leia_plugin, browser still work)\n"
 	    "exit: 0 ok, 2 usage, 10 offline/expired catalog, 11 bad signature, 20 download,\n"
@@ -1065,6 +1101,10 @@ cmd_list(const struct dxr_catalog *c, bool outdated, bool json, bool fixed_runti
 	return DXR_GET_OK;
 }
 
+//! Several items on one command line: the per-item `--json` objects are collected here and
+//! printed as one document at the end. NULL for the single-item verbs, whose output is unchanged.
+static cJSON *g_multi_items = NULL;
+
 static int
 uninstall_result(const char *id, int code, const char *result, const char *detail, bool json)
 {
@@ -1077,9 +1117,39 @@ uninstall_result(const char *id, int code, const char *result, const char *detai
 		if (detail[0]) {
 			cJSON_AddStringToObject(o, "detail", detail);
 		}
-		print_json(o);
+		if (g_multi_items != NULL) {
+			cJSON_AddItemToArray(g_multi_items, o);
+		} else {
+			print_json(o);
+		}
 	}
 	return code;
+}
+
+/*!
+ * The end of one item of a several-item run: a line a front end can read back
+ * from `--log-pipe` (`result: <id>: <exit code> <word>`), and the running exit code.
+ */
+static void
+multi_note(const char *id, int code, const char *word, int *first)
+{
+	dxr_log("result: %s: %d %s\n", id, code, word);
+	if (*first == DXR_GET_OK && code != DXR_GET_OK) {
+		*first = code;
+	}
+}
+
+//! Print the several-item `--json` document and return the exit code: the first failure.
+static int
+multi_finish(bool json, int first)
+{
+	if (json) {
+		print_json(dxr_multi_json(g_multi_items, NULL));
+	} else {
+		cJSON_Delete(g_multi_items);
+	}
+	g_multi_items = NULL;
+	return first;
 }
 
 //! `uninstall <id>`: needs no catalog and no network. Everything comes from the receipt.
@@ -1134,17 +1204,106 @@ cmd_uninstall(const char *id, bool json, bool no_start)
 	return uninstall_result(id, DXR_GET_OK, "uninstalled", detail, json);
 }
 
-int
-main(int argc, char **argv)
+/*!
+ * `install <item>` (@p arg) or `install --default` (@p arg NULL). With
+ * @p multi it is one item of a several-item run: the plan JSON goes into the
+ * collected document instead of stdout, and @p word gets the result word.
+ * Without it, the output is the single-item verb's, byte for byte.
+ */
+static int
+install_one(const struct dxr_catalog *c,
+            const char *arg,
+            const char *min_runtime,
+            const struct dxr_plan_opts *opts,
+            bool json,
+            bool no_start,
+            bool multi,
+            const char **word)
+{
+	static struct dxr_plan p;
+	char hint[200];
+	const bool use_default = arg == NULL;
+	const char *what = use_default ? "the default set" : arg;
+	if (use_default) {
+		// The recommended set plus high-confidence hardware matches. An
+		// item of the set that cannot be installed here is listed as
+		// skipped in the plan and does not fail the rest.
+		dxr_make_default_plan(c, &k_env, opts, &p);
+	} else {
+		dxr_make_plan(c, &k_env, arg, min_runtime, DXR_PLAN_INSTALL, opts, &p);
+	}
+	char *js = json ? dxr_plan_json(&p) : NULL;
+	if (json && !multi) {
+		printf("%s\n", js);
+		(void)fflush(stdout);
+	} else if (!json) {
+		dxr_plan_text(&p, stdout);
+	}
+	int r = DXR_GET_OK;
+	const enum dxr_install_verdict v = dxr_install_judge(&p, is_admin());
+	switch (v) {
+	case DXR_INSTALL_INCOMPATIBLE:
+		dxr_log("%s: not compatible -- %s\n", what, p.gate_reason);
+		r = DXR_GET_INCOMPATIBLE;
+		break;
+	case DXR_INSTALL_NOTHING:
+		for (int i = 0; i < p.n; i++) {
+			if (p.steps[i].is_target && p.steps[i].state == DXR_ST_OK) {
+				dxr_log("%s: %s installed, catalog has %s -- nothing to do (never downgrades)\n",
+				        p.steps[i].component, p.steps[i].installed,
+				        p.steps[i].target ? p.steps[i].target : "no build");
+			}
+		}
+		r = DXR_GET_OK;
+		break;
+	case DXR_INSTALL_NEEDS_ADMIN:
+		dxr_log("installing needs an elevated process\n");
+		r = DXR_GET_NEEDS_ADMIN;
+		break;
+	case DXR_INSTALL_NOT_FETCHABLE:
+		dxr_log("%s: nothing fetchable in the catalog -- %s\n", what, p.gate_reason);
+		r = DXR_GET_NOT_FETCHABLE;
+		break;
+	default:
+		(void)snprintf(hint, sizeof(hint), "dxr-get install %s", use_default ? "--default" : arg);
+		r = execute_plan(c, &p, no_start, hint);
+		break;
+	}
+	if (word != NULL) {
+		*word = dxr_install_result_word(v, r);
+	}
+	if (multi && json) {
+		cJSON_AddItemToArray(g_multi_items, dxr_install_item_json(what, r, dxr_install_result_word(v, r), js));
+	}
+	if (js != NULL) {
+		cJSON_free(js);
+	}
+	return r;
+}
+
+static int
+dxr_main(int argc, char **argv)
 {
 	// DXR_GET_CATALOG redirects to another catalog (a test or staging copy). It
 	// grants nothing: that catalog must still carry a valid signature from a
 	// compiled-in key, and the serial guard still applies.
 	const char *catalog_where = getenv("DXR_GET_CATALOG");
-	const char *cmd = NULL, *arg = NULL, *for_c = NULL, *min_runtime = NULL, *out_dir = NULL;
+	const char *cmd = NULL, *arg = NULL, *for_c = NULL, *min_runtime = NULL, *out_dir = NULL, *log_token = NULL;
+	// Every item named. Only `install` and `uninstall` take more than one.
+	const char *ids[DXR_MAX_IDS];
+	int n_ids = 0;
 	bool json = false, yes = false, no_verify = false, no_start = false, installed_only = false;
 	bool use_default = false;
 	struct dxr_plan_opts opts = {false};
+	// Before anything is read from it: no argument may hold a control character.
+	// An item id with a line feed in it would otherwise write a second line into
+	// the log a front end reads results from.
+	for (int i = 1; i < argc; i++) {
+		if (!dxr_arg_ok(argv[i])) {
+			dxr_log("argument %d holds a control character -- refused\n", i);
+			return DXR_GET_USAGE;
+		}
+	}
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
 		if (strcmp(a, "--catalog") == 0 && i + 1 < argc) {
@@ -1181,6 +1340,13 @@ main(int argc, char **argv)
 			k_env.assume_abi[k_env.n_assume_abi].item_class = argv[i];
 			k_env.assume_abi[k_env.n_assume_abi].major = atoi(eq + 1);
 			k_env.n_assume_abi++;
+		} else if (strcmp(a, "--log-pipe") == 0 && i + 1 < argc) {
+			// A token, never a path: this process may be elevated and its caller not.
+			log_token = argv[++i];
+			if (!dxr_log_token_ok(log_token)) {
+				dxr_log("--log-pipe takes a token of 32 lowercase hex digits, not a path or a name\n");
+				return DXR_GET_USAGE;
+			}
 		} else if (strcmp(a, "--no-start-service") == 0) {
 			no_start = true;
 		} else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -1191,11 +1357,23 @@ main(int argc, char **argv)
 			return DXR_GET_USAGE;
 		} else if (cmd == NULL) {
 			cmd = a;
-		} else if (arg == NULL) {
-			arg = a;
+		} else if (n_ids < DXR_MAX_IDS) {
+			ids[n_ids++] = a;
 		} else {
 			usage();
 			return DXR_GET_USAGE;
+		}
+	}
+	arg = n_ids > 0 ? ids[0] : NULL;
+	const bool many = n_ids > 1;
+	if (many && (cmd == NULL || (strcmp(cmd, "install") != 0 && strcmp(cmd, "uninstall") != 0))) {
+		usage();
+		return DXR_GET_USAGE;
+	}
+	if (log_token != NULL) {
+		g_log_channel = dxr_log_channel_open(log_token);
+		if (g_log_channel == DXR_LOG_CHANNEL_NONE) {
+			dxr_log("--log-pipe: no front end is listening on that pipe; logging to stderr only\n");
 		}
 	}
 	// A build whose catalog root key was replaced for testing says so on every
@@ -1211,10 +1389,19 @@ main(int argc, char **argv)
 		usage();
 		return DXR_GET_USAGE;
 	}
-	if (no_verify && !env_on("DXR_GET_DEV")) {
-		dxr_log("--no-verify-catalog needs DXR_GET_DEV=1\n");
+	// The switches that weaken verification exist in a test-root-key build only.
+	// In every other build the environment is not consulted for them.
+	char why[200], ignored[200];
+	if (!dxr_dev_switches_resolve(test_banner != NULL, no_verify, env_on("DXR_GET_DEV"),
+	                              env_on("DXR_GET_ALLOW_UNSIGNED"), &g_dev, why, sizeof(why), ignored,
+	                              sizeof(ignored))) {
+		dxr_log("%s\n", why);
 		return DXR_GET_USAGE;
 	}
+	if (ignored[0] != '\0') {
+		dxr_log("%s\n", ignored);
+	}
+	no_verify = g_dev.no_verify_catalog;
 	(void)yes; // installers pass --yes; the consent prompt is theirs, not ours
 	if (strcmp(cmd, "ensure-for") == 0) {
 		for_c = arg;
@@ -1226,7 +1413,17 @@ main(int argc, char **argv)
 			usage();
 			return DXR_GET_USAGE;
 		}
-		return cmd_uninstall(arg, json, no_start);
+		if (!many) {
+			return cmd_uninstall(arg, json, no_start);
+		}
+		// Each on its own, in order. One that cannot be removed does not stop the rest.
+		int first = DXR_GET_OK;
+		g_multi_items = cJSON_CreateArray();
+		for (int i = 0; i < n_ids; i++) {
+			const int code = cmd_uninstall(ids[i], json, no_start);
+			multi_note(ids[i], code, code == DXR_GET_OK ? "uninstalled" : "not_uninstalled", &first);
+		}
+		return multi_finish(json, first);
 	}
 	if (strcmp(cmd, "list") == 0 && installed_only) {
 		return cmd_list_installed(json);
@@ -1326,54 +1523,21 @@ main(int argc, char **argv)
 		(void)snprintf(hint, sizeof(hint), "dxr-get ensure-for %s", for_c);
 		r = execute_plan(&c, &p, no_start, hint);
 	} else if (strcmp(cmd, "install") == 0) {
-		static struct dxr_plan p;
-		char hint[200];
-		const char *what = use_default ? "the default set" : arg;
-		if (use_default) {
-			// The recommended set plus high-confidence hardware matches. An
-			// item of the set that cannot be installed here is listed as
-			// skipped in the plan and does not fail the rest.
-			dxr_make_default_plan(&c, &k_env, &opts, &p);
-		} else {
-			dxr_make_plan(&c, &k_env, arg, min_runtime, DXR_PLAN_INSTALL, &opts, &p);
-		}
-		if (json) {
-			char *js = dxr_plan_json(&p);
-			printf("%s\n", js);
-			(void)fflush(stdout);
-			cJSON_free(js);
-		} else {
-			dxr_plan_text(&p, stdout);
-		}
-		if (p.gate == DXR_GET_INCOMPATIBLE) {
-			dxr_log("%s: not compatible -- %s\n", what, p.gate_reason);
-			r = DXR_GET_INCOMPATIBLE;
+		if (!many) {
+			r = install_one(&c, use_default ? NULL : arg, min_runtime, &opts, json, no_start, false, NULL);
 			goto done;
 		}
-		if (p.todo == 0 && p.gate == DXR_GET_OK) {
-			for (int i = 0; i < p.n; i++) {
-				if (p.steps[i].is_target && p.steps[i].state == DXR_ST_OK) {
-					dxr_log(
-					    "%s: %s installed, catalog has %s -- nothing to do (never downgrades)\n",
-					    p.steps[i].component, p.steps[i].installed,
-					    p.steps[i].target ? p.steps[i].target : "no build");
-				}
-			}
-			r = DXR_GET_OK;
-			goto done;
+		// Each on its own, in order: its own plan (made after the items before
+		// it were installed, so skip-if-current sees them), its own verdict,
+		// its own receipt. One that cannot be installed does not stop the rest.
+		int first = DXR_GET_OK;
+		g_multi_items = cJSON_CreateArray();
+		for (int i = 0; i < n_ids; i++) {
+			const char *word = "";
+			const int code = install_one(&c, ids[i], min_runtime, &opts, json, no_start, true, &word);
+			multi_note(ids[i], code, word, &first);
 		}
-		if (!is_admin()) {
-			dxr_log("installing needs an elevated process\n");
-			r = DXR_GET_NEEDS_ADMIN;
-			goto done;
-		}
-		if (p.gate == DXR_GET_NOT_FETCHABLE) {
-			dxr_log("%s: nothing fetchable in the catalog -- %s\n", what, p.gate_reason);
-			r = DXR_GET_NOT_FETCHABLE;
-			goto done;
-		}
-		(void)snprintf(hint, sizeof(hint), "dxr-get install %s", use_default ? "--default" : arg);
-		r = execute_plan(&c, &p, no_start, hint);
+		r = multi_finish(json, first);
 	} else { // fetch
 		const cJSON *item = dxr_item_find(&c, arg);
 		if (item == NULL) {
@@ -1385,7 +1549,8 @@ main(int argc, char **argv)
 		if (out_dir) {
 			(void)MultiByteToWideChar(CP_UTF8, 0, out_dir, -1, wout, MAX_PATH);
 		}
-		r = fetch_asset(&c, item, dxr_item_asset(item), arg, path, MAX_PATH, out_dir ? wout : NULL);
+		r = fetch_asset(&c, item, dxr_item_asset(item), arg, path, MAX_PATH, out_dir ? wout : NULL,
+		                g_dev.allow_unsigned);
 		if (r == DXR_GET_OK) {
 			printf("%ls\n", path);
 		}
@@ -1393,4 +1558,34 @@ main(int argc, char **argv)
 done:
 	dxr_catalog_free(&c);
 	return r;
+}
+
+/*
+ * The command line is read as UTF-16 and handed on as UTF-8. The C runtime's
+ * `argv` is in the ANSI code page, which cannot hold every path: a front end
+ * passes `--catalog C:\\Users\\<a name outside the code page>\\cat.json`.
+ */
+int
+main(void)
+{
+	int argc = 0;
+	wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &argc);
+	if (wargv == NULL || argc < 1) {
+		return DXR_GET_USAGE;
+	}
+	char **argv = (char **)calloc((size_t)argc + 1, sizeof(char *));
+	if (argv == NULL) {
+		return DXR_GET_USAGE;
+	}
+	for (int i = 0; i < argc; i++) {
+		const int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+		argv[i] = (char *)calloc(n > 0 ? (size_t)n : 1, 1);
+		if (argv[i] == NULL ||
+		    (n > 0 && WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], n, NULL, NULL) <= 0)) {
+			return DXR_GET_USAGE;
+		}
+	}
+	LocalFree(wargv);
+	// argv lives for the whole run: the option parser keeps pointers into it.
+	return dxr_main(argc, argv);
 }

@@ -38,6 +38,23 @@ if(WIN32)
 	endif()
 endif()
 
+# `displayxr-cli catalog` (ADR-064 step 4): the front end over dxr-get, as its
+# own static lib so the unit test (tests_cli_catalog) drives it with a fake
+# engine, and so the MinGW compile check covers its Windows half
+# (scripts/build-mingw-check.sh cli_catalog) without the rest of the CLI.
+add_library(cli_catalog STATIC cli_catalog.c cli_catalog_os.c cli_catalog.h)
+target_link_libraries(cli_catalog PUBLIC xrt-interfaces PRIVATE aux_util xrt-external-cjson)
+target_include_directories(cli_catalog PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# get_signers.h: the first-party signer names; get_log_channel.h: the name of the log pipe.
+# Both shared with dxr-get (headers only; nothing is linked).
+target_include_directories(cli_catalog PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../get)
+if(WIN32)
+	# shell32: ShellExecuteExW ("runas"), CommandLineToArgvW; ole32: CoInitializeEx around it;
+	# wintrust + crypt32: the engine's Authenticode signature, checked before an elevated start;
+	# bcrypt: the random token that names the log pipe.
+	target_link_libraries(cli_catalog PRIVATE shell32 ole32 advapi32 wintrust crypt32 bcrypt)
+endif()
+
 add_executable(
 	cli
 	cli_cmd_info.c
@@ -59,6 +76,7 @@ add_executable(
 	cli_cmd_camera_calibration.c
 	cli_cmd_conv.cpp
 	cli_cmd_conv_run.cpp
+	cli_cmd_catalog.c
 	cli_component_options.c
 	cli_component_options.h
 	cli_lift_service.c
@@ -97,6 +115,7 @@ target_link_libraries(
 		aux_util
 		aux_math
 		cli_query
+		cli_catalog
 		target_instance_no_comp
 		target_lists
 		drv_includes

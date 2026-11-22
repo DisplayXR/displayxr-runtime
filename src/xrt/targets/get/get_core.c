@@ -12,6 +12,7 @@
 #endif
 
 #include "get_core.h"
+#include "get_signers.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -25,9 +26,10 @@
 /*
  * Schema 1 only: the Authenticode signers a schema-1 payload may carry. A
  * schema-2 catalog names its publishers' signers itself, in the signed index,
- * and this list plays no part there (ADR-064 §4).
+ * and this list plays no part there (ADR-064 §4). The names are shared with
+ * `displayxr-cli catalog` (get_signers.h).
  */
-static const char *const k_v1_trusted_signers[] = {"Leia, Inc."};
+static const char *const k_v1_trusted_signers[] = DXR_FIRST_PARTY_SIGNERS;
 
 /*
  * Schema 1 only: what that schema says by component NAME and schema 2 says as
@@ -1778,4 +1780,144 @@ dxr_receipt_dependents(const struct dxr_receipt *all, int n, const char *id, cha
 		}
 	}
 	return count;
+}
+
+/*
+ * Several items in one `install` / `uninstall`.
+ */
+
+enum dxr_install_verdict
+dxr_install_judge(const struct dxr_plan *p, bool elevated)
+{
+	if (p->gate == DXR_GET_INCOMPATIBLE) {
+		return DXR_INSTALL_INCOMPATIBLE;
+	}
+	if (p->todo == 0 && p->gate == DXR_GET_OK) {
+		return DXR_INSTALL_NOTHING;
+	}
+	if (!elevated) {
+		return DXR_INSTALL_NEEDS_ADMIN;
+	}
+	if (p->gate == DXR_GET_NOT_FETCHABLE) {
+		return DXR_INSTALL_NOT_FETCHABLE;
+	}
+	return DXR_INSTALL_PROCEED;
+}
+
+const char *
+dxr_install_result_word(enum dxr_install_verdict v, int code)
+{
+	switch (v) {
+	case DXR_INSTALL_NOTHING: return "nothing_to_do";
+	case DXR_INSTALL_INCOMPATIBLE: return "incompatible";
+	case DXR_INSTALL_NEEDS_ADMIN: return "needs_elevation";
+	case DXR_INSTALL_NOT_FETCHABLE: return "not_fetchable";
+	default: return code == DXR_GET_OK ? "installed" : "failed";
+	}
+}
+
+cJSON *
+dxr_install_item_json(const char *id, int code, const char *result, const char *plan_json)
+{
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddStringToObject(o, "id", id);
+	cJSON_AddNumberToObject(o, "exit", code);
+	cJSON_AddStringToObject(o, "result", result);
+	cJSON *plan = plan_json != NULL ? cJSON_Parse(plan_json) : NULL;
+	if (plan != NULL) {
+		cJSON_AddItemToObject(o, "plan", plan);
+	}
+	return o;
+}
+
+cJSON *
+dxr_multi_json(cJSON *items, int *out_exit)
+{
+	int first = DXR_GET_OK;
+	const cJSON *x;
+	cJSON_ArrayForEach(x, items)
+	{
+		const cJSON *e = cJSON_GetObjectItemCaseSensitive(x, "exit");
+		if (first == DXR_GET_OK && cJSON_IsNumber(e) && e->valueint != DXR_GET_OK) {
+			first = e->valueint;
+		}
+	}
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddNumberToObject(o, "exit", first);
+	cJSON_AddItemToObject(o, "items", items);
+	if (out_exit != NULL) {
+		*out_exit = first;
+	}
+	return o;
+}
+
+/*
+ * Text from the command line or the environment.
+ */
+
+bool
+dxr_arg_ok(const char *arg)
+{
+	if (arg == NULL) {
+		return false;
+	}
+	for (const unsigned char *p = (const unsigned char *)arg; *p != '\0'; p++) {
+		if (*p < 0x20 || *p == 0x7F) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void
+dxr_log_sanitize(char *text)
+{
+	for (unsigned char *p = (unsigned char *)text; *p != '\0'; p++) {
+		if ((*p < 0x20 && *p != '\n' && *p != '\t') || *p == 0x7F) {
+			*p = '?';
+		}
+	}
+}
+
+bool
+dxr_dev_switches_resolve(bool test_build,
+                         bool arg_no_verify,
+                         bool env_dev,
+                         bool env_allow_unsigned,
+                         struct dxr_dev_switches *out,
+                         char *why,
+                         size_t why_size,
+                         char *ignored,
+                         size_t ignored_size)
+{
+	out->no_verify_catalog = false;
+	out->allow_unsigned = false;
+	if (why_size > 0) {
+		why[0] = '\0';
+	}
+	if (ignored != NULL && ignored_size > 0) {
+		ignored[0] = '\0';
+	}
+	if (!test_build) {
+		if (arg_no_verify) {
+			(void)snprintf(why, why_size,
+			               "--no-verify-catalog exists only in a test-root-key build of dxr-get "
+			               "(CMake DXR_GET_TEST_ROOT_KEY); this build always verifies the catalog");
+			return false;
+		}
+		if (ignored != NULL && (env_dev || env_allow_unsigned)) {
+			(void)snprintf(ignored, ignored_size,
+			               "%s%s%s ignored: honoured only by a test-root-key build of dxr-get",
+			               env_dev ? "DXR_GET_DEV" : "", env_dev && env_allow_unsigned ? " and " : "",
+			               env_allow_unsigned ? "DXR_GET_ALLOW_UNSIGNED" : "");
+		}
+		return true;
+	}
+	if (arg_no_verify && !env_dev) {
+		(void)snprintf(why, why_size, "--no-verify-catalog needs DXR_GET_DEV=1");
+		return false;
+	}
+	out->no_verify_catalog = arg_no_verify;
+	out->allow_unsigned = env_allow_unsigned;
+	return true;
 }
