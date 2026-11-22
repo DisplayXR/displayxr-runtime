@@ -108,6 +108,12 @@ def extra_fixture() -> dict:
             "windows": win("DisplayXRUltraleapSetup-0.1.0.7.exe", "0.1.0", "e" * 64, ["/S"],
                            "HKLM\\Software\\DisplayXR\\Plugins\\Ultraleap\\Version"),
         },
+        "shell": {
+            "recommended": "2.4.2",
+            "requires": {"runtime": ">=2.36.0"},
+            "windows": win("DisplayXRShellSetup-2.4.2.exe", "2.4.2", "f" * 64, ["/S"],
+                           "HKLM\\Software\\DisplayXR\\WorkspaceControllers\\shell\\Version"),
+        },
     }
 
 
@@ -260,7 +266,8 @@ class Schema2OnlyComponents(unittest.TestCase):
 
     def test_they_follow_the_schema1_components_and_validate(self):
         self.assertEqual([i["id"] for i in self.v2["items"]],
-                         ["runtime", "leia-sr", "browser", "open-conversion", "leia-conversion", "ultraleap"])
+                         ["runtime", "leia-sr", "browser", "open-conversion", "leia-conversion", "ultraleap",
+                          "displayxr-shell"])
         self.assertEqual(gen_catalog.validate_v2(self.v2), [])
 
     def test_schema1_never_carries_them(self):
@@ -303,6 +310,46 @@ class Schema2OnlyComponents(unittest.TestCase):
         self.assertEqual(item["requires"][0], {"kind": "runtime", "version": ">=2.69.3"})
         self.assertEqual(item["requires"][1]["kind"], "external")
         self.assertEqual(item["assets"]["windows-x64"]["file"], "DisplayXRUltraleapSetup-0.1.0.7.exe")
+
+    def test_shell_is_a_workspace_controller_the_user_picks(self):
+        item = self.items["displayxr-shell"]
+        self.assertEqual((item["class"], item["registered_id"]), ("workspace_controller", "shell"))
+        self.assertEqual(item["aliases"], ["shell"])  # the versions.json pin: `/COMPONENTS=shell`
+        self.assertNotIn("recommended", item)         # listed unticked; never installed by `--default`
+        self.assertNotIn("detect", item)              # and no hardware evidence installs it
+        self.assertNotIn("abi", item)                 # a process contract over IPC: no class ABI
+        self.assertNotIn("license", item)             # no licence class fits it yet; not guessed
+        self.assertEqual(item["requires"], [{"kind": "runtime", "version": ">=2.36.0"}])
+        asset = item["assets"]["windows-x64"]
+        row = "HKLM\\Software\\DisplayXR\\WorkspaceControllers\\shell\\"
+        # An existing install is recognised by its registration row.
+        self.assertEqual(asset["installed"], {"kind": "registry_sz", "path": row + "Version"})
+        self.assertEqual(asset["uninstall"],
+                         {"kind": "registry_command", "path": row + "UninstallString", "args": ["/S"]})
+        # No launch-shortcut argument: an unattended install never resets the user's choice.
+        self.assertEqual(asset["installer"]["args"], ["/S"])
+
+    def test_shell_floor_comes_from_its_installer_and_is_required(self):
+        comp = next(c for c in gen_catalog.V2_ONLY_COMPONENTS if c["name"] == "shell")
+        self.assertEqual(comp["floor"], {"consumer_floor": "displayxr-shell-pvt"})
+        saved = {n: getattr(gen_catalog, n) for n in ("repo_file", "windows_block", "warn", "info")}
+        asked = []
+        nsi = '; makensis -DMIN_RUNTIME_VERSION=0.0.0\n!ifndef MIN_RUNTIME_VERSION\n\t!define MIN_RUNTIME_VERSION "2.36.0"\n!endif\n'
+        try:
+            gen_catalog.warn = gen_catalog.info = lambda msg: None
+            gen_catalog.windows_block = lambda comp, version, verifier, d, reg=None: None
+            gen_catalog.repo_file = lambda repo, path, ref: asked.append((repo, path, ref)) or nsi
+            out = gen_catalog.build_extra_components({"shell": "v2.4.2"}, lambda p: None, ".")
+            self.assertEqual(out, {"shell": {"recommended": "2.4.2", "requires": {"runtime": ">=2.36.0"}}})
+            # Read from the source repo's installer at the released tag (downstream-pins.json).
+            self.assertEqual(asked, [("displayxr-shell-pvt", "installer/DisplayXRShellInstaller.nsi", "v2.4.2")])
+            # Unreadable (a token without access to the private repo): not listed at
+            # all, because its installer refuses a runtime below the floor.
+            gen_catalog.repo_file = lambda repo, path, ref: None
+            self.assertEqual(gen_catalog.build_extra_components({"shell": "v2.4.2"}, lambda p: None, "."), {})
+        finally:
+            for n, f in saved.items():
+                setattr(gen_catalog, n, f)
 
     def test_metadata_is_not_aliased_into_the_document(self):
         self.items["leia-conversion"]["requires"][1]["detect"][0]["min"] = "9.9.9"

@@ -104,8 +104,13 @@ COMPONENTS = [
 # Same keys as COMPONENTS, plus:
 #   asset_re       regex over the release's asset names, for an asset whose name
 #                  carries more than the version ({v} is the escaped version)
-#   floor          where the provider declares its minimum runtime, read at the
-#                  released tag: {"file", "cmake_set": <variable>}
+#   floor          where the component declares its minimum runtime, read at the
+#                  released tag: {"file", "cmake_set": <variable>}, or
+#                  {"consumer_floor": <repo>} = that repo's `declared_floor` in
+#                  downstream-pins.json (the literal the drift audit checks)
+#   floor_required the component's own installer refuses an older runtime, so
+#                  without a readable floor the item is not listed at all
+#   source_repo    where `floor` is read, when the releases live in another repo
 #   runtime_exact  where the provider pins the ONE runtime it was built at, read
 #                  at the released tag: the item then carries runtime.min == max
 # Nothing here is a version: every number is read from the release.
@@ -136,6 +141,22 @@ V2_ONLY_COMPONENTS = [
         "args": ["/S"],
         "registry_version": "HKLM\\Software\\DisplayXR\\Plugins\\Ultraleap\\Version",
         "runtime_exact": {"file": "CMakeLists.txt", "cmake_set": "DXR_RUNTIME_GIT_TAG"},
+    },
+    {
+        # The DisplayXR Shell: one registered workspace controller, a component
+        # the user picks. Schema 1 never listed it (its three names are frozen).
+        "name": "shell",
+        "pin": "shell",
+        "repo": "displayxr-shell-releases",
+        "asset": "DisplayXRShellSetup-{v}.exe",
+        # Fixed: no launch-shortcut argument. An unattended install keeps the
+        # user's launch settings (service.json), or the default on a new box.
+        "args": ["/S"],
+        # The `Version` value of its registration row (the workspace-controller
+        # contract), which is also how an existing install is recognised.
+        "registry_version": "HKLM\\Software\\DisplayXR\\WorkspaceControllers\\shell\\Version",
+        "floor": {"consumer_floor": "displayxr-shell-pvt"},
+        "floor_required": True,
     },
 ]
 
@@ -279,27 +300,33 @@ VERIFIERS = {
 SEMVER_RE = re.compile(r"^v?(\d+\.\d+\.\d+)$")
 
 
-def browser_floor(tag):
-    """Browser floor = its installer's declared MIN_RUNTIME_VERSION at the pinned tag.
+def declared_floor(consumer, tag):
+    """A consumer's declared minimum runtime at a tag, as X.Y.Z, or None.
 
     Where to look comes from downstream-pins.json consumer_floors (declared_floor),
-    so this follows the same source the drift audit reads.
+    so this follows the same source the drift audit reads. The repo is usually
+    private: without a token that can read it the answer is None, never a guess.
     """
     with open(os.path.join(REPO_ROOT, "downstream-pins.json"), encoding="utf-8") as f:
         pins = json.load(f)
-    entry = pins.get("consumer_floors", {}).get("displayxr-browser-pvt", {})
+    entry = pins.get("consumer_floors", {}).get(consumer, {})
     decl = entry.get("declared_floor") or {}
     if decl.get("kind") != "nsis_define" or not decl.get("file") or not decl.get("key"):
-        warn("downstream-pins.json gives no usable browser declared_floor; omitting requires")
+        warn(f"downstream-pins.json gives no usable declared_floor for {consumer}; omitting requires")
         return None
-    text = repo_file("displayxr-browser-pvt", decl["file"], tag)
+    text = repo_file(consumer, decl["file"], tag)
     if text is None:
         return None
     m = re.search(r'!define\s+' + re.escape(decl["key"]) + r'\s+"([0-9]+\.[0-9]+\.[0-9]+)"', text)
     if not m:
-        warn(f"no {decl['key']} define in browser-pvt {decl['file']}@{tag}; omitting requires")
+        warn(f"no {decl['key']} define in {consumer} {decl['file']}@{tag}; omitting requires")
         return None
     return m.group(1)
+
+
+def browser_floor(tag):
+    """Browser floor = its installer's declared MIN_RUNTIME_VERSION at the pinned tag."""
+    return declared_floor("displayxr-browser-pvt", tag)
 
 
 def leia_floor(tag):
@@ -660,9 +687,17 @@ def build_extra_components(versions, verifier, download_dir):
             entry["runtime_exact"] = exact
             entry["requires"] = {"runtime": ">=" + exact}
         elif "floor" in comp:
-            floor = cmake_set_value(comp["repo"], comp["floor"], tag)
+            if "consumer_floor" in comp["floor"]:
+                floor = declared_floor(comp["floor"]["consumer_floor"], tag)
+            else:
+                floor = cmake_set_value(comp["repo"], comp["floor"], tag)
             if floor:
                 entry["requires"] = {"runtime": ">=" + floor}
+            elif comp.get("floor_required"):
+                # Its installer aborts on an older runtime: listed without the
+                # floor it would be offered where it cannot install.
+                warn(f"{comp['name']}: its runtime floor is unreadable at {tag}; not listed")
+                continue
         win = windows_block(comp, version, verifier, download_dir)
         if win:
             entry["windows"] = win
@@ -904,6 +939,21 @@ V2_ITEMS = {
                 "info_url": "https://www.ultraleap.com/downloads/",
             },
         ],
+    },
+    "shell": {
+        # ADR-064 worked example. Not `recommended`: a setup UI lists it
+        # unticked, and the user picks it.
+        "id": "displayxr-shell",
+        "class": "workspace_controller",
+        "registered_id": "shell",
+        "name": "DisplayXR Shell",
+        "summary": "Spatial desktop: several 3D apps side by side in one workspace, opened with a keyboard shortcut.",
+        # The registration row's own UninstallString, which the workspace-controller
+        # contract requires of every controller and requires to honour /S.
+        "uninstall": {
+            "path": "HKLM\\Software\\DisplayXR\\WorkspaceControllers\\shell\\UninstallString",
+            "args": ["/S"],
+        },
     },
 }
 
@@ -1173,7 +1223,6 @@ def cmd_generate(args):
     if args.out_v2:
         if os.path.abspath(args.out_v2) == os.path.abspath(args.out):
             sys.exit("error: --out-v2 must be a different directory from --out")
-        extra = build_extra_components(versions, VERIFIERS[args.verifier], download_dir)
         extra = build_extra_components(versions, VERIFIERS[args.verifier], download_dir)
         catalog2 = build_catalog_v2(catalog, manifests=MANIFESTS, extra=extra)
         problems = validate_v2(catalog2)
