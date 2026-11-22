@@ -75,6 +75,24 @@ avoids ordering races with workspace-driven mode switches. `XrViewEyeTrackingSta
 keeps reporting the session's MANAGED/MANUAL preference even while `isTracking == XR_FALSE`
 in an untracked mode — there is no "NONE" enum value.
 
+### Where the preference is enacted
+
+In process, every session owns its display processor and the request goes straight to it. Over
+IPC:
+
+- **Android service** (`comp_multi`): the per-client compositor owns a DP; the request goes to it.
+- **Windows D3D11 service:** one panel DP is shared and handed from client to client, so the
+  request is the client's **wish**. The panel DP carries the wish of the client holding the panel
+  on the direct path (no workspace controller, or a controller's foreground override to that
+  client's own window) when the panel DP weaves it (a window-bound or hosted presenter). When that
+  client loses the panel or leaves, the DP is told the next holder's wish or the system's
+  `default_eye_tracking_mode`, so a MANUAL request never outlives its client. Under a controller's
+  compose the workspace owns mode and the panel carries the default. The rule is
+  `comp_eye_mode_policy.h` (pinned by `tests_comp_eye_mode_policy`).
+
+In every case `XrViewEyeTrackingStateDXR.activeMode` reports the session's preference (above):
+a wish that is held because the session does not hold the panel is latent, not refused.
+
 ### Tracking-state change event (v14, #441)
 
 `XrEventDataEyeTrackingStateChangedDXR { isTracking, activeMode }` is queued on every edge

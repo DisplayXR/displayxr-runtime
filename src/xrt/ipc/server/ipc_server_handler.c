@@ -3894,16 +3894,19 @@ ipc_handle_compositor_set_eye_tracking_mode(volatile struct ipc_client_state *ic
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
-	// Per-session DP policy (MANAGED/MANUAL). The out-of-process per-client
-	// compositor is a multi_compositor; forward to its DP. Only the Android
-	// null+comp_multi service reaches the DP this way (#510/#522); on the
-	// Windows D3D11 service the workspace owns mode and the in-process native
-	// path handles handle apps, so this is a no-op there.
+	// Per-session DP policy (MANAGED/MANUAL). On the Android null+comp_multi
+	// service the per-client compositor is a multi_compositor with its own DP
+	// (#510/#522). On the Windows D3D11 service one panel DP is shared, so the
+	// mode is the client's wish, applied while it holds the panel on the direct
+	// path and handed back (next holder's wish or the default) when it loses
+	// it; under a controller's compose the workspace owns mode.
 #ifdef XRT_OS_ANDROID
 	struct multi_compositor *mc = multi_compositor((struct xrt_compositor *)ics->xc);
 	if (mc != NULL) {
 		multi_compositor_set_eye_tracking_mode(mc, mode);
 	}
+#elif defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	comp_d3d11_service_set_eye_tracking_mode((struct xrt_compositor *)ics->xc, mode);
 #else
 	(void)mode;
 #endif

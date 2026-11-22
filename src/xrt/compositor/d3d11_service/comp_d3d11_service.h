@@ -1774,6 +1774,19 @@ bool
 comp_d3d11_service_weave_export_fence(struct xrt_compositor *xc, xrt_graphics_sync_handle_t *out_handle);
 
 /*!
+ * XR_DXR_display_info xrRequestEyeTrackingModeDXR from an IPC session client
+ * (0 = MANAGED, 1 = MANUAL; anything else is ignored). Latched as the client's
+ * wish; the render thread applies it to the panel display processor while the
+ * client holds the panel on the direct path (no workspace controller, or a
+ * controller's foreground override to the client's own window) and the panel
+ * DP weaves it. When the client loses the panel or leaves, the DP is handed
+ * the next holder's wish or the system default mode. Under a controller's
+ * compose the workspace owns mode and the panel carries the default.
+ */
+void
+comp_d3d11_service_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode);
+
+/*!
  * Snap a proposed window rect to the nearest interlace-phase-aligned screen
  * position (window-drag phase lock, #625). Forwards the drag-start origin
  * top-left + the proposed target top-left (absolute screen pixels) to the DP's

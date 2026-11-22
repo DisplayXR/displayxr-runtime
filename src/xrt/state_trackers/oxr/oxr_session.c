@@ -938,9 +938,11 @@ oxr_session_set_eye_tracking_mode(struct oxr_session *sess, uint32_t mode)
 		return;
 	}
 
-	// Out-of-process IPC client (single-app OOP Android, #522): the per-client
-	// compositor is an ipc_client_compositor; push the mode to the server DP
-	// over IPC. Bridge-relay sessions forward eyes to the browser and own no DP.
+	// Out-of-process IPC client (single-app OOP Android, #522; the Windows D3D11
+	// service, which applies it while this client holds the panel): the
+	// per-client compositor is an ipc_client_compositor; push the mode to the
+	// server DP over IPC. Bridge-relay sessions forward eyes to the browser and
+	// own no DP.
 	if (!sess->is_bridge_relay) {
 		comp_ipc_client_compositor_set_eye_tracking_mode(&sess->xcn->base, mode);
 	}
