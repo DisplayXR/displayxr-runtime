@@ -1805,6 +1805,28 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
                                           int32_t *out_y);
 
 /*!
+ * Window-drag phase snap for an ordinary IPC session client whose own window
+ * the service presents into (PRESENTER_APP_HWND on the direct single-client
+ * path). Same in/out contract as
+ * @ref comp_d3d11_service_weave_snap_window_rect (absolute desktop px,
+ * drag-start and proposed top-left in, snapped top-left out; here the points
+ * are the bound window's CLIENT-AREA origin, not its frame), but it answers
+ * only while the panel display processor weaves THIS client's window into
+ * that window (comp_app_snap_policy.h): under a workspace controller's
+ * compose, for an unfocused client, on the legacy standalone path, with no or
+ * a removed device, or with a DP that has no snap support it returns false
+ * and the caller keeps the proposed position. Takes render_mutex.
+ */
+bool
+comp_d3d11_service_app_snap_window_rect(struct xrt_compositor *xc,
+                                        int32_t origin_x,
+                                        int32_t origin_y,
+                                        int32_t target_x,
+                                        int32_t target_y,
+                                        int32_t *out_x,
+                                        int32_t *out_y);
+
+/*!
  * XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): what the last accepted
  * @ref comp_d3d11_service_weave_submit of this present-owner did per screen —
  * the bound window's segment table (count 0 = woven by one display processor)

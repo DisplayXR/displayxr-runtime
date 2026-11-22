@@ -8754,6 +8754,61 @@ ipc_handle_weave_snap_window_rect(volatile struct ipc_client_state *ics,
 }
 
 /*
+ * Window-drag phase snap for an ordinary session client (class APP): a handle
+ * app on the IPC path whose own window the service presents into. The app's
+ * runtime subclasses that window and asks here from inside its move loop. Read
+ * only — it changes no service state — and it answers only for the caller's own
+ * session. `never` tells the caller to stop asking for the rest of the session
+ * (a class that snaps by other means or has no window of its own, or a build
+ * with no service compositor that could answer); a plain "not snapped" can
+ * change with focus and is asked again on the next drag step.
+ */
+xrt_result_t
+ipc_handle_compositor_snap_window_rect(volatile struct ipc_client_state *ics,
+                                       int32_t origin_x,
+                                       int32_t origin_y,
+                                       int32_t target_x,
+                                       int32_t target_y,
+                                       bool *out_snapped,
+                                       int32_t *out_snapped_x,
+                                       int32_t *out_snapped_y,
+                                       bool *out_never)
+{
+	IPC_TRACE_MARKER();
+
+	// Default = no-op snap (the caller keeps its proposed target).
+	*out_snapped = false;
+	*out_snapped_x = target_x;
+	*out_snapped_y = target_y;
+	*out_never = false;
+
+	// A present-owner snaps through weave_snap_window_rect; a controller, a
+	// relay or a diagnostic client has no window the service presents into.
+	if (ics->client_state.client_class != XRT_CLIENT_CLASS_APP) {
+		*out_never = true;
+		return XRT_SUCCESS;
+	}
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	int32_t sx = target_x, sy = target_y;
+	if (comp_d3d11_service_app_snap_window_rect(ics->xc, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
+		*out_snapped = true;
+		*out_snapped_x = sx;
+		*out_snapped_y = sy;
+	}
+	return XRT_SUCCESS;
+#else
+	(void)origin_x;
+	(void)origin_y;
+	*out_never = true;
+	return XRT_SUCCESS;
+#endif
+}
+
+/*
  * XR_DXR_weave v11 (#1723): the per-point snap above, looped HERE, next to the
  * display processor, so a drag-lattice probe costs the client one round trip
  * instead of one per point. No new DP slot: each arm loops exactly the

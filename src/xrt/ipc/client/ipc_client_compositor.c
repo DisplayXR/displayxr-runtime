@@ -34,6 +34,10 @@
 #include <displayxr_mcp/mcp_capture.h>
 #endif
 
+#ifdef IPC_CLIENT_HAVE_DRAG_SNAP
+#include "util/comp_texture_target_drag_snap_win32.h"
+#endif
+
 #include "shared/ipc_protocol.h"
 #include "client/ipc_client.h"
 #include "client/ipc_client_connection.h"
@@ -124,6 +128,19 @@ struct ipc_client_compositor
 	struct u_capture_intent capture_intent;
 	//! True while @ref mcp_capture is installed as the process's handler.
 	bool mcp_capture_installed;
+#endif
+
+#ifdef IPC_CLIENT_HAVE_DRAG_SNAP
+	//! Window-drag phase snap of the app's own window (window-bound session):
+	//! the subclass that asks the service over compositor_snap_window_rect.
+	//! Created with the native compositor, destroyed first thing in its
+	//! destroy, while the connection is still up.
+	struct comp_tt_drag_snap *app_drag_snap;
+	//! The service said it will never snap this session (or the call failed):
+	//! stop asking. Read and written only by the snap callback, which runs on
+	//! the window's thread (and once, the prewarm, on the creating thread
+	//! before the subclass exists).
+	bool app_snap_never;
 #endif
 
 #ifdef IPC_USE_LOOPBACK_IMAGE_ALLOCATOR
@@ -3373,12 +3390,67 @@ ipc_compositor_get_reference_bounds_rect(struct xrt_compositor *xc,
 	IPC_CHK_ALWAYS_RET(icc->ipc_c, xret, "ipc_call_compositor_get_reference_bounds_rect");
 }
 
+#ifdef IPC_CLIENT_HAVE_DRAG_SNAP
+/*!
+ * Drag snap of a window-bound IPC session's own window. Runs on the window's
+ * thread inside its modal move loop (WM_WINDOWPOSCHANGING), under the drag-snap
+ * binding's shared lock; the prewarm runs once on the thread creating the
+ * compositor. The IPC call serialises with every other call of this connection
+ * on ipc_c->mutex, so a drag step can wait out one in-flight call of the app's
+ * render thread, and then the service's render_mutex for its own answer. No
+ * thread holding ipc_c->mutex ever waits on this window's thread (the pipe read
+ * is a plain blocking ReadFile, which dispatches no window messages), and the
+ * drag-snap destroy that waits out a snap in flight is never called with
+ * ipc_c->mutex held.
+ */
+static bool
+ipc_client_app_drag_snap(void *userdata,
+                         int32_t origin_x,
+                         int32_t origin_y,
+                         int32_t target_x,
+                         int32_t target_y,
+                         int32_t *out_x,
+                         int32_t *out_y)
+{
+	struct ipc_client_compositor *icc = (struct ipc_client_compositor *)userdata;
+	*out_x = target_x;
+	*out_y = target_y;
+	if (icc == NULL || icc->ipc_c == NULL || icc->app_snap_never) {
+		return false;
+	}
+
+	bool snapped = false;
+	bool never = false;
+	int32_t sx = target_x, sy = target_y;
+	xrt_result_t xret = ipc_call_compositor_snap_window_rect(icc->ipc_c, origin_x, origin_y, target_x, target_y,
+	                                                         &snapped, &sx, &sy, &never);
+	if (xret != XRT_SUCCESS || never) {
+		icc->app_snap_never = true;
+		U_LOG_W("IPC client: the service does not snap this window's drags (%s) — it moves unsnapped",
+		        xret != XRT_SUCCESS ? "call failed" : "not for this session");
+		return false;
+	}
+	if (!snapped) {
+		return false;
+	}
+	*out_x = sx;
+	*out_y = sy;
+	return true;
+}
+#endif
+
 static void
 ipc_compositor_destroy(struct xrt_compositor *xc)
 {
 	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
 
 	assert(icc->compositor_created);
+
+#ifdef IPC_CLIENT_HAVE_DRAG_SNAP
+	// Before anything else: once this returns no snap is in flight and none
+	// will start, so the connection the callback uses may go away after it.
+	comp_tt_drag_snap_destroy(&icc->app_drag_snap);
+#endif
 
 	os_precise_sleeper_deinit(&icc->sleeper);
 
@@ -3690,6 +3762,24 @@ ipc_client_create_native_compositor(struct xrt_system_compositor *xsysc,
 	// This avoids the race condition where events must be polled before these are set
 	icc->base.base.info.initial_visible = initial_visible;
 	icc->base.base.info.initial_focused = initial_focused;
+
+#ifdef IPC_CLIENT_HAVE_DRAG_SNAP
+	// A window-bound session whose window the service may present into: snap
+	// the window's drags to the display processor's phase, as the in-process
+	// path's window-bound weaver does. The target is the window's client-area
+	// origin (the service presents the whole client area). A shared-texture
+	// session presents itself and is never woven into its window. The service
+	// decides per drag step whether it weaves this window right now, so the
+	// binding is always active here. The create prewarms one snap from this
+	// thread (no lock held: the call takes ipc_c->mutex like any other).
+	icc->app_snap_never = false;
+	icc->app_drag_snap = NULL;
+	if (xsi != NULL && xsi->external_window_handle != NULL && xsi->shared_texture_handle == NULL) {
+		icc->app_drag_snap = comp_tt_drag_snap_create(xsi->external_window_handle, 0, 0,
+		                                              ipc_client_app_drag_snap, icc, "ipc-handle");
+		comp_tt_drag_snap_update(icc->app_drag_snap, xsi->external_window_handle, 0, 0, true);
+	}
+#endif
 
 	icc->compositor_created = true;
 

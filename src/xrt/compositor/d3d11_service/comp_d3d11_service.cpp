@@ -10,6 +10,7 @@
 #include "comp_d3d11_service.h"
 #include "comp_eye_dp_policy.h"
 #include "comp_failsafe_2d_policy.h"
+#include "comp_app_snap_policy.h"
 #include "comp_eye_mode_policy.h"
 #include "comp_d3d11_service_formats.h"
 #include "d3d11_service_shaders.h"
@@ -1370,6 +1371,14 @@ struct d3d11_service_compositor
 	//! weaves — a background transparent client must not drive the shared
 	//! panel DP out from under whoever holds it.
 	std::atomic<bool> pipe_owns_panel{false};
+
+	//! IPC handle drag snap (comp_d3d11_service_app_snap_window_rect): log
+	//! state, written and read under render_mutex. The last verdict logged,
+	//! plus one (0 = none yet): a decline is logged when its reason differs
+	//! from the last one, so a drag (~60-120 asks a second) logs once.
+	uint32_t app_snap_last_verdict_plus1;
+	bool app_snap_dp_decline_logged;
+	bool app_snap_live_logged;
 
 	//! #1208: throttles for pipeline_client_texture_weave's two 1 Hz lines. These
 	//! used to be FILE-SCOPE statics, i.e. shared by every client and every skip
@@ -32469,30 +32478,38 @@ svc_weave_snap_owner(struct d3d11_service_compositor *c)
  * position, with the handle owner's hysteresis — NULL for the primary screen
  * (the caller's own snap path) or when the window is not segmented.
  *
- * @p target_x / @p target_y position the window FRAME (WM_WINDOWPOSCHANGING);
- * the screens split the CLIENT area, so the frame-to-client offset of the
- * window as it stands now is carried to the target.
+ * @p target_x / @p target_y position the window FRAME (WM_WINDOWPOSCHANGING)
+ * unless @p target_is_client says they already position @p wnd's client-area
+ * origin (the IPC handle drag snap); the screens split the CLIENT area, so a
+ * frame target carries the window's frame-to-client offset as it stands now.
  *
  * Holding render_mutex.
  */
 static struct xrt_display_processor_d3d11 *
-weave_seg_snap_dp(struct d3d11_service_compositor *c, int32_t target_x, int32_t target_y)
+seg_snap_dp_for_window(
+    struct comp_d3d11_segments *segs, HWND wnd, int32_t target_x, int32_t target_y, bool target_is_client)
 {
-	if (c->weave_segs == nullptr || !comp_d3d11_segments_enabled(c->weave_segs)) {
+	if (segs == nullptr || !comp_d3d11_segments_enabled(segs)) {
 		return nullptr;
 	}
-	HWND wnd = c->render.weave_hwnd;
 	struct comp_seg_rect client = {};
 	RECT wr = {};
 	if (!svc_seg_window_rect(wnd, &client) || !GetWindowRect(wnd, &wr)) {
 		return nullptr;
 	}
 	struct comp_seg_rect at = {};
-	at.x = target_x + (client.x - wr.left);
-	at.y = target_y + (client.y - wr.top);
+	at.x = target_is_client ? target_x : target_x + (client.x - wr.left);
+	at.y = target_is_client ? target_y : target_y + (client.y - wr.top);
 	at.w = client.w;
 	at.h = client.h;
-	return comp_d3d11_segments_snap_dp(c->weave_segs, &at, os_monotonic_get_ns(), nullptr);
+	return comp_d3d11_segments_snap_dp(segs, &at, os_monotonic_get_ns(), nullptr);
+}
+
+static struct xrt_display_processor_d3d11 *
+weave_seg_snap_dp(struct d3d11_service_compositor *c, int32_t target_x, int32_t target_y)
+{
+	return seg_snap_dp_for_window(c->weave_segs, c->render.weave_hwnd, target_x, target_y,
+	                              /*target_is_client*/ false);
 }
 
 /*
@@ -34167,6 +34184,111 @@ comp_d3d11_service_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mod
 		        "the panel on the direct path, held otherwise",
 		        mode);
 	}
+}
+
+extern "C" bool
+comp_d3d11_service_app_snap_window_rect(struct xrt_compositor *xc,
+                                        int32_t origin_x,
+                                        int32_t origin_y,
+                                        int32_t target_x,
+                                        int32_t target_y,
+                                        int32_t *out_x,
+                                        int32_t *out_y)
+{
+	if (out_x == nullptr || out_y == nullptr) {
+		return false;
+	}
+	// Default = no-op snap (the window keeps the proposed position).
+	*out_x = target_x;
+	*out_y = target_y;
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct d3d11_service_system *sys = c->sys;
+	if (sys == nullptr) {
+		return false;
+	}
+
+	// The snap drives the vendor weaver's phase math on the same immediate
+	// context the render thread weaves on, and the panel DP / its window
+	// binding / the focus pick are all render-thread state: hold render_mutex
+	// for the whole decision + DP call, exactly like the present-owner snap.
+	render_mutex_fair_lock lock(sys);
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	struct comp_app_snap_state st = {};
+	st.pipeline_always_on = pipeline_always_on(sys) && mc != nullptr;
+	st.presenter_is_app_hwnd = c->presenter == PRESENTER_APP_HWND && c->render.hwnd != nullptr;
+	st.workspace_mode = sys->workspace_mode;
+	st.client_slot = -1;
+	st.focused_slot = -1;
+	st.foreground_override_slot = -1;
+	if (mc != nullptr) {
+		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+			if (mc->clients[i].active && mc->clients[i].compositor == c) {
+				st.client_slot = i;
+				st.window_gone = mc->clients[i].minimized;
+				break;
+			}
+		}
+		st.focused_slot = mc->focused_slot;
+		st.foreground_override_slot = mc->foreground_override_slot.load(std::memory_order_acquire);
+	}
+	st.window_gone = st.window_gone || c->window_closed;
+	struct xrt_display_processor_d3d11 *dp = panel_dp(sys, c);
+	st.have_panel_dp = dp != nullptr;
+	st.panel_dp_on_client_window =
+	    mc != nullptr && c->render.hwnd != nullptr && mc->panel_dp_hwnd == c->render.hwnd;
+
+	const enum comp_app_snap_verdict v = comp_app_snap_decide(&st);
+	const uint32_t logged = c->app_snap_last_verdict_plus1;
+	c->app_snap_last_verdict_plus1 = (uint32_t)v + 1u;
+	if (v != COMP_APP_SNAP_ASK_DP) {
+		if (logged != (uint32_t)v + 1u) {
+			U_LOG_W("[pipeline] IPC handle drag snap: not snapping this client's window (%s) — it moves "
+			        "unsnapped",
+			        comp_app_snap_verdict_str(v));
+		}
+		return false;
+	}
+
+	// Multi-screen: a window woven per screen snaps to the lattice of the
+	// screen holding the majority of it at the proposed position — the same
+	// rule the present-owner snap uses. A segment DP without snap support
+	// falls back to the panel DP.
+	bool snapped = false;
+	int32_t sx = target_x, sy = target_y;
+	// The app's drag snap evaluates at the bound window's client-area origin.
+	struct xrt_display_processor_d3d11 *seg_dp =
+	    seg_snap_dp_for_window(c->segments, c->render.hwnd, target_x, target_y, /*target_is_client*/ true);
+	if (seg_dp != nullptr) {
+		snapped = xrt_display_processor_d3d11_snap_window_rect(seg_dp, origin_x, origin_y, target_x, target_y,
+		                                                       &sx, &sy);
+	}
+	if (!snapped) {
+		sx = target_x;
+		sy = target_y;
+		snapped = xrt_display_processor_d3d11_snap_window_rect(dp, origin_x, origin_y, target_x, target_y, &sx,
+		                                                       &sy);
+	}
+	if (!snapped) {
+		if (!c->app_snap_dp_decline_logged) {
+			c->app_snap_dp_decline_logged = true;
+			U_LOG_W("[pipeline] IPC handle drag snap: the display processor has no snap support — the "
+			        "client's window moves unsnapped");
+		}
+		return false;
+	}
+	if (!c->app_snap_live_logged) {
+		c->app_snap_live_logged = true;
+		U_LOG_W("[pipeline] IPC handle drag snap LIVE: the client's window drags are phase-snapped by the "
+		        "display processor weaving it (first answer (%d,%d) -> (%d,%d))",
+		        (int)target_x, (int)target_y, (int)sx, (int)sy);
+	}
+	*out_x = sx;
+	*out_y = sy;
+	return true;
 }
 
 extern "C" bool

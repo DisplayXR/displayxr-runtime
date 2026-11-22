@@ -105,6 +105,14 @@ if(WIN32)
 	endif()
 
 	target_link_libraries(ipc_client PRIVATE winmm)
+
+	# Window-drag phase snap of a window-bound IPC session's own window: the
+	# shared drag-snap subclass (compositor/util), answered by the service over
+	# compositor_snap_window_rect.
+	if(TARGET comp_tt_drag_snap)
+		target_link_libraries(ipc_client PRIVATE comp_tt_drag_snap)
+		target_compile_definitions(ipc_client PRIVATE IPC_CLIENT_HAVE_DRAG_SNAP)
+	endif()
 endif()
 target_link_libraries(ipc_client PRIVATE aux_util ipc_shared)
 # Phase 2.D: ipc_client_compositor.c translates wire workspace_input_event
