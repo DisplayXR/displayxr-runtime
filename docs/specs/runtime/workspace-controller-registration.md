@@ -280,6 +280,8 @@ service and the CLI). Only the active controller is launched by the hotkey or
 displayxr-cli workspace list [--json]
 displayxr-cli workspace set <id> --hotkey "<combo>" | --no-hotkey | --mode auto|disabled
 displayxr-cli workspace reset <id>                 # back to Ctrl+Shift+Space, auto
+displayxr-cli workspace get <id> --hotkey          # the combo in effect, or "none"; nothing else
+displayxr-cli workspace check-hotkey "<combo>" [--json]   # validate without storing
 displayxr-cli workspace launch <id>                # spawn now, through the running service
 displayxr-cli workspace hotkey-suspend on|off      # take the hook out / put it back
 ```
@@ -304,6 +306,65 @@ IPC (a `CONTROLLER`-class client whose executable is the controller's `binary`);
 when set (no registered controller is then active). `info --json` carries the same objects
 as `workspace_controllers[]`, headless (`connected` / `pid` null). The CLI checks that the
 service pipe exists before connecting, so a settings read never auto-starts the service.
+
+**Validating a combo (`check-hotkey`).** For an installer or a settings box that takes a
+free-form combo. Nothing is stored. Line 1 of the output is the canonical spelling.
+
+| exit | meaning | what a caller does |
+|---|---|---|
+| `0` | usable | accept |
+| `2` | not a combo of the grammar | refuse, ask again |
+| `3` | valid, and a well-known application or OS binding uses it (`service_hotkey_known_conflict`) | **warn, then accept if the user insists** |
+| `4` | valid, and another program holds it as a global hotkey right now (Windows: a `RegisterHotKey` probe) | warn, then accept |
+| `1` | this `displayxr-cli` has no `check-hotkey` (a runtime before it existed), or a usage error | the combo was not checked; `workspace set` still validates the grammar |
+
+`3` wins over `4`. Both are advice: the combo is the user's to choose, and `workspace set`
+accepts it (printing the same warning). The reason for the warning is the *Matching* rule
+above: the hook is global and runs before every application, so a combo an application binds
+stops working there. That is what happened with the old `Ctrl+Space` default, and it is what
+`Ctrl+Tab` or `Ctrl+Shift+Tab` (tab switching in browsers, editors and terminals) would do.
+The known list is short and table-driven (the old default, the Tab and Alt+Tab family,
+`Alt+F4`, `Alt+Space`, `Win+Space`, and the single-modifier rules: `Ctrl` or `Alt` plus a
+letter or digit, `Shift` plus a typing key, `Win` plus a non-function key). No entry means
+"nothing known", not "free". The `RegisterHotKey` probe sees global registrations only, never
+an application's own accelerators, and it also reports a running controller that registered
+the same combo as its dismiss chord. `--json`: `{ "combo", "valid", "canonical" | null,
+"known_conflict": "<text>" | null, "registered_elsewhere": bool | null, "is_default" }`
+(`registered_elsewhere` is `null` where there is no probe: macOS, Linux).
+
+**Choosing the hotkey when a controller is installed.** A controller's installer may ask for
+the launch hotkey. The setting stays the user's, in `service.json`, and the installer goes
+through the CLI like every other writer:
+
+- pre-fill the field with `workspace get <id> --hotkey` (the combo in effect, also for an id
+  that is not registered yet: a stored setting outlives an uninstall), falling back to the
+  default when that command is not there;
+- validate with `check-hotkey`: refuse on `2`, warn and let the user keep it on `3` / `4`;
+- write with `workspace set <id> --hotkey "<combo>"` (or `--no-hotkey`) **after** the
+  registration row exists, and **only when the user changed the field or a silent switch
+  asked for a value**. An upgrade and an unattended install with no switch write nothing, so
+  they never reset a choice;
+- `service.json` is per-user and an installer runs elevated: the write lands in the profile
+  of the account the installer runs as. That is the logged-on user under an ordinary UAC
+  consent prompt. Under over-the-shoulder elevation (a standard user typing an
+  administrator's credentials) or a deployment tool running as SYSTEM it is a different
+  profile, and the logged-on user keeps the default until they set it themselves (CLI or
+  Dashboard). A per-machine default a controller's registration could carry is not part of
+  this contract today.
+
+**"No hotkey" is a valid choice** (`--no-hotkey`): no hook is installed, and the controller
+is started from the tray menu, `workspace launch <id>`, or its own application entry (below).
+
+**An application entry for a controller.** A Start menu, Launchpad or `.desktop` entry
+should have the same result as the hotkey: the *service* launches the registered controller
+(`workspace launch <id>`, `system_workspace_launch`), so the controller gets
+`DISPLAYXR_WORKSPACE_SESSION=1` and `DISPLAYXR_WORKSPACE_HOTKEY`, the service's watcher and
+hook handling apply, and a second activation is a no-op (`status 3`, already running)
+instead of a second process. An entry that runs the controller binary directly bypasses all
+of that: the controller does not learn the user's combo (or that the user chose none) and
+falls back to its own default dismiss chord. A controller that keeps a direct entry should
+hand off to the service itself when it is started without `--service-managed`, and only run
+standalone when no service can be reached.
 
 **Live apply.** Three session-free, DIAG-only RPCs (appended to `proto.json`):
 

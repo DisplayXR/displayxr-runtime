@@ -159,6 +159,73 @@ accel(const char *text)
 
 } // namespace
 
+namespace {
+
+const char *
+conflict(const char *text)
+{
+	struct service_hotkey hk;
+	REQUIRE(service_hotkey_parse(text, &hk));
+	return service_hotkey_known_conflict(&hk);
+}
+
+} // namespace
+
+TEST_CASE("known hotkey conflicts are advice for the common bindings", "[service][hotkey]")
+{
+	// The default has none, and neither do the combos a user is pointed to.
+	CHECK(conflict(SERVICE_HOTKEY_DEFAULT) == nullptr);
+	CHECK(conflict("Ctrl+Shift+F9") == nullptr);
+	CHECK(conflict("Ctrl+Alt+Space") == nullptr);
+	CHECK(conflict("Ctrl+Alt+W") == nullptr);
+	CHECK(conflict("Win+F12") == nullptr);
+	CHECK(conflict("Shift+F5") == nullptr);
+
+	// The old default: the reason it moved.
+	REQUIRE(conflict("Ctrl+Space") != nullptr);
+	CHECK(std::string(conflict("Ctrl+Space")).find("autocomplete") != std::string::npos);
+
+	// Tab switching, in either direction, and the OS switchers.
+	REQUIRE(conflict("Ctrl+Tab") != nullptr);
+	CHECK(std::string(conflict("ctrl+tab")).find("tab switching") != std::string::npos);
+	CHECK(conflict("Shift+Ctrl+Tab") != nullptr);
+	CHECK(conflict("Alt+Tab") != nullptr);
+	CHECK(conflict("Win+Tab") != nullptr);
+	CHECK(conflict("Alt+F4") != nullptr);
+	CHECK(conflict("Win+Space") != nullptr);
+	CHECK(conflict("Ctrl+Alt+Delete") != nullptr);
+
+	// Rules by modifier set: one modifier plus an ordinary key.
+	CHECK(conflict("Ctrl+C") != nullptr);
+	CHECK(conflict("Ctrl+5") != nullptr);
+	CHECK(conflict("Alt+F") != nullptr);
+	CHECK(conflict("Shift+A") != nullptr);
+	CHECK(conflict("Shift+Space") != nullptr);
+	CHECK(conflict("Shift+Left") != nullptr);
+	CHECK(conflict("Win+L") != nullptr);
+	CHECK(conflict("Ctrl+Left") != nullptr);
+
+	// Exact modifier sets only, like the hook: adding a modifier leaves the rule.
+	CHECK(conflict("Ctrl+Alt+Tab") != nullptr); // its own entry
+	CHECK(conflict("Ctrl+Shift+C") == nullptr);
+	CHECK(conflict("Ctrl+Alt+Shift+Tab") == nullptr);
+
+	// Every text is one plain-ASCII clause an installer can print as is.
+	for (const char *t : {"Ctrl+Space", "Ctrl+Tab", "Alt+Tab", "Ctrl+C", "Shift+A", "Win+L", "Ctrl+Alt+Delete"}) {
+		const std::string s = conflict(t);
+		CHECK_FALSE(s.empty());
+		CHECK(s.back() != '.');
+		for (unsigned char ch : s) {
+			CHECK((ch >= 0x20 && ch < 0x7F));
+		}
+	}
+
+	// Not a combo: nothing to say.
+	CHECK(service_hotkey_known_conflict(nullptr) == nullptr);
+	struct service_hotkey none = {0, 0};
+	CHECK(service_hotkey_known_conflict(&none) == nullptr);
+}
+
 TEST_CASE("hotkey grammar maps on to X11 keysyms and modifier masks", "[service][hotkey][linux]")
 {
 	// keysymdef.h: XK_space 0x20, XK_a 0x61, XK_F1 0xffbe, XK_Return 0xff0d ...

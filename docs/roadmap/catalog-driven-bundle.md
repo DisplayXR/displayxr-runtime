@@ -266,8 +266,9 @@ Prepared on the branch `feat/catalog-driven-bundle` of that repository.
 | `DisplayXRBundle-<v>.exe` (default) | the runtime installer, the shell, MCP tools, the demos | needed for the catalog components; without it they are skipped and reported |
 | `DisplayXRBundle-<v>-offline.exe` | everything the bundle embeds today, plus the providers a deployment asks for | none |
 
-The demos and the shell stay embedded in both for now: they are first-party, not vendor
-providers, and they are not in the catalog. Moving them is a later, separate step.
+The demos stay embedded in both for now: they are first-party, not vendor providers, and
+they are not in the catalog. The shell is described in schema 2 (section 4); whether the
+online bundle keeps embedding it is one of the open decisions listed there.
 
 ### Change list
 
@@ -339,3 +340,99 @@ is nothing for an installer to call.
 | Linux `.deb` (`displayxr-runtime_*_amd64.deb`) | the runtime; the Leia SR plug-in and the demos are separate `.deb`s | a package must not download other packages in its maintainer scripts. The equivalent of the pre-ticked converter is a `Recommends:` on the open conversion provider's package once it ships as a `.deb` (it is a tarball today), and `Suggests:` for vendor providers. Detection-driven choice belongs to `dxr-get` or the Dashboard, run by the user |
 | Linux tarball (`install.sh`) | a per-user install of the runtime | `install.sh --with <id>,...` calling the POSIX `dxr-get`, with the same keywords as `/COMPONENTS=`, and the same rule: no switch, no network |
 | macOS / Linux bundles in `displayxr-installer` | chain the available packages | follow the Windows bundle once the engine exists; an offline variant is what they already are |
+
+## 4. The Shell as a component the user picks
+
+Status: the catalog item and the hotkey checks are implemented and unit-tested; the Shell
+installer's shortcut page is written and compile-checked, **not run on Windows**. The
+decisions marked *open* are product decisions and nothing here acts on them.
+
+The DisplayXR Shell is one registered workspace controller
+([workspace-controller-registration.md](../specs/runtime/workspace-controller-registration.md)).
+It moves from "the bundle installs it" to "an item in the component list".
+
+### The catalog item
+
+`displayxr-shell` (alias `shell`, the `versions.json` pin), class `workspace_controller`,
+`registered_id` `shell`. Schema 2 only: schema 1 stays at its three frozen names.
+Generator: `V2_ONLY_COMPONENTS` / `V2_ITEMS` in `scripts/gen_catalog.py`; rules in
+component-catalog.md § Generating it.
+
+| Question | Answer |
+|---|---|
+| Ticked by default? | No `recommended`, no `detect`: listed **unticked**, never installed by `install --default` / `/COMPONENTS=default`. *Open*: David may want it pre-ticked; that is one `"recommended": True` in `V2_ITEMS` |
+| An existing install | recognised through the registration row's `Version`: shown as installed, or as an update when older. Nothing is removed by not ticking it |
+| Uninstall | the registration row's `UninstallString` with `/S` |
+| Runtime floor | the Shell installer's `MIN_RUNTIME_VERSION`, read at the released tag. Unreadable = the item is not listed |
+| Unattended | `/COMPONENTS=shell` (or `displayxr-shell`) on the runtime installer, `dxr-get install shell` |
+| Waits on | a published schema-2 catalog, and `displayxr-shell-pvt` in the token of `publish-catalog.yml` (component-catalog.md) |
+
+### The launch shortcut
+
+Where the choice lives: **in the Shell's own installer** (a page with a free-form field,
+and a silent switch), stored where it already lives, the user's `service.json`, through
+`displayxr-cli workspace set`. Not a per-item "option" in the catalog schema.
+
+| | Installer page + switch (chosen) | A generic catalog "option" |
+|---|---|---|
+| Schema, engine, runtime installer page, Dashboard | unchanged | all four change; `installer.args` stops being "fixed strings: no placeholders" (component-catalog.md), which is a trust rule |
+| Unattended | `/HOTKEY=<combo>`, `/HOTKEY=none`; no switch = nothing written | a value the engine would have to template into a command line |
+| Upgrade | nothing written unless the user edits the field | the same, with more parts |
+| Changing it later | the Dashboard's capture box, `workspace set` (both exist) | the same |
+| macOS | the chord is fixed today (Control+Shift+Space); the `.pkg` has no page, and none is needed until the stored combo is applied there | the same limit |
+| Linux | a `.deb` must not prompt and its scripts run as root, so they cannot write a per-user file: default chord, changed with the CLI or the Dashboard | the same limit |
+
+The field takes any combo of the grammar and is pre-filled with the combo in effect
+(`workspace get shell --hotkey`), which is `Ctrl+Shift+Space` on a new machine. `Ctrl+Space`
+is one click away, with a line saying it takes autocomplete and input-method switching away
+from applications. Validation is `workspace check-hotkey`: an invalid combo is refused, a
+known conflict or a combo another program holds is a warning the user can accept. `none`
+means no shortcut: the Shell is then opened from its Start menu entry or the tray.
+
+Why a warning is needed at all: the service's hook is global and runs before every
+application (`service_orchestrator.c`), so the chosen combo stops working everywhere else
+while the Shell is not running, and the Shell's own global registration takes it while it
+runs. `Ctrl+Tab` and `Ctrl+Shift+Tab` would break tab switching in browsers, editors and
+terminals exactly as `Ctrl+Space` broke autocomplete.
+
+Known limit: `service.json` is per-user and the installer is elevated. Under an ordinary UAC
+prompt that is the same user. Under over-the-shoulder elevation, or a deployment tool running
+as SYSTEM, `/HOTKEY=` writes another profile and the logged-on user keeps the default. A
+per-machine default carried by the controller's registration would close that; it changes the
+"default is never stored" rule of `service.json` and is not done here.
+
+### The application entry
+
+Today, per platform:
+
+| Platform | Entry today | A direct launch |
+|---|---|---|
+| Windows | Start menu shortcut to the Shell executable (its installer has always created it) | starts the service if needed, but is **not** the same as a service launch: the Shell does not get `DISPLAYXR_WORKSPACE_HOTKEY`, so it registers `Ctrl+Shift+Space` as its dismiss chord whatever the user chose, including "none". A second launch prints "already running" and exits |
+| macOS | none: the `.pkg` installs a bare executable, not an `.app` | same shape |
+| Linux | none: the `.deb` ships no `.desktop` file | same shape |
+
+Recommendation (not implemented; it is Shell behaviour that needs a run on each platform):
+
+- the entry's result is "the service launches the registered controller", the same path as
+  the hotkey. The Shell does that itself: started without `--service-managed`, it asks the
+  service to launch it (`displayxr-cli workspace launch shell`, hidden) and exits, and runs
+  standalone only when no service can be reached. The entry keeps pointing at the Shell
+  executable, so there is no console window and no dead entry when the service is down;
+- a second activation **focuses** the running workspace. It does not toggle: closing the
+  workspace from a Start menu click is not what a launcher does;
+- "no shortcut, application entry only" is a valid choice at install (`none`), once the
+  first point holds. Until then a Start menu launch still takes `Ctrl+Shift+Space`;
+- macOS gets a small `.app` wrapper in `/Applications`, Linux a `.desktop` file, both with
+  the same behaviour.
+
+### The bundle
+
+*Open*, with a recommendation each:
+
+| Decision | Recommendation |
+|---|---|
+| Is the Shell row ticked in the bundle's component list? | Unticked on a machine without the Shell; **ticked when the Shell is already installed**. The bundle removes an installed component whose row is unticked, so a plain "unticked by default" would uninstall the Shell on every upgrade |
+| The offline full bundle | keeps embedding the Shell, row state as above |
+| The online bundle | stops embedding the Shell once a schema-2 catalog lists it, and passes the tick as `/COMPONENTS=...,shell` to the runtime child; until then it keeps embedding it |
+| Users who have the Shell | nothing changes: it is updated when the bundle or the catalog carries a newer one, its shortcut and launch mode are not touched |
+| `versions.json` membership | `shell` stays a pin (the orchestrator, the offline bundle and the generator all read it) |

@@ -16,6 +16,17 @@
  *       service to re-apply them (`system_reload_service_config`).
  *   workspace reset <id>
  *       Forget every customisation of <id> (Ctrl+Shift+Space, auto).
+ *   workspace get <id> --hotkey
+ *       Print the launch hotkey in effect for <id> (the canonical combo, or
+ *       `none`) and nothing else: what an installer pre-fills its field with.
+ *       Reads service.json only, so it also answers for an id that is not
+ *       registered yet (a stored setting outlives an uninstall).
+ *   workspace check-hotkey <combo> [--json]
+ *       Validate a combo without storing it, for an installer or a settings
+ *       box. Exit code 0 = usable, 2 = not a valid combo, 3 = valid, but a
+ *       well-known application or OS binding uses it (advice: `set` accepts
+ *       it), 4 = valid, but another program holds it as a global hotkey right
+ *       now (Windows RegisterHotKey probe; advice as well). 3 wins over 4.
  *   workspace launch <id>
  *       Ask the running service to spawn <id> now, through the hotkey's own
  *       spawn path (`system_workspace_launch`).
@@ -426,12 +437,146 @@ cmd_set(int argc, const char **argv)
 	(void)service_config_path(path, sizeof(path));
 	P("Workspace controller '%s': mode=%s hotkey=%s (%s).\n", canon_id, service_config_launch_mode_str(r.mode),
 	  r.has_hotkey ? r.hotkey_text : "none", path);
+	if (r.has_hotkey && service_hotkey_known_conflict(&r.hotkey) != NULL) {
+		// Advice, never a refusal: the combo is the user's to choose.
+		P("warning: %s conflicts with %s. The launch hotkey is global, so that stops working while it is "
+		  "set.\n",
+		  r.hotkey_text, service_hotkey_known_conflict(&r.hotkey));
+	}
 	if (!is_active) {
 		P("note: '%s' is not the controller the service spawns (active: %s); its settings apply once it is.\n",
 		  canon_id, v.active >= 0 ? v.entries[v.active].id : "none");
 	}
 	reload_service();
 	return 0;
+}
+
+static int
+cmd_get(int argc, const char **argv)
+{
+	if (argc < 5 || argv[3][0] == '-' || strcmp(argv[4], "--hotkey") != 0 || argc > 5) {
+		E("error: usage: displayxr-cli workspace get <id> --hotkey\n");
+		return 1;
+	}
+	struct registry_view v;
+	load_view(&v);
+	const int idx = find_controller(&v, argv[3]);
+	// Not registered (yet): service.json still answers, under the id as given.
+	const char *id = idx >= 0 ? v.entries[idx].id : argv[3];
+	struct service_launch_resolved r;
+	service_config_resolve_launch(&v.cfg, id, idx >= 0 && idx == v.active, &r);
+	P("%s\n", r.has_hotkey ? r.hotkey_text : "none");
+	return 0;
+}
+
+#define CHECK_HOTKEY_OK 0
+#define CHECK_HOTKEY_INVALID 2
+#define CHECK_HOTKEY_KNOWN_CONFLICT 3
+#define CHECK_HOTKEY_REGISTERED_ELSEWHERE 4
+
+/*!
+ * Is @p hk held as a global hotkey by another program right now?
+ * 1 = yes, 0 = no, -1 = not checked (not Windows, or the probe itself failed).
+ *
+ * Windows only: RegisterHotKey fails with ERROR_HOTKEY_ALREADY_REGISTERED when
+ * any process holds the combo; a successful registration is dropped at once.
+ * It sees global registrations only, never an application's own accelerators
+ * (that is what service_hotkey_known_conflict is for), and it also reports a
+ * running workspace controller that registered the same combo as its dismiss
+ * chord.
+ */
+static int
+hotkey_registered_elsewhere(const struct service_hotkey *hk)
+{
+#ifdef XRT_OS_WINDOWS
+	UINT mods = MOD_NOREPEAT;
+	if (hk->mods & SERVICE_HOTKEY_MOD_CTRL) {
+		mods |= MOD_CONTROL;
+	}
+	if (hk->mods & SERVICE_HOTKEY_MOD_SHIFT) {
+		mods |= MOD_SHIFT;
+	}
+	if (hk->mods & SERVICE_HOTKEY_MOD_ALT) {
+		mods |= MOD_ALT;
+	}
+	if (hk->mods & SERVICE_HOTKEY_MOD_WIN) {
+		mods |= MOD_WIN;
+	}
+	const int probe_id = 0x4458; // any id: thread-scoped (hWnd NULL), dropped below
+	if (RegisterHotKey(NULL, probe_id, mods, (UINT)hk->vk)) {
+		UnregisterHotKey(NULL, probe_id);
+		return 0;
+	}
+	return GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED ? 1 : -1;
+#else
+	(void)hk;
+	return -1;
+#endif
+}
+
+static int
+cmd_check_hotkey(int argc, const char **argv)
+{
+	const bool json = cli_has_flag(argc, argv, "--json");
+	if (argc < 4 || argv[3][0] == '-') {
+		E("error: 'workspace check-hotkey' needs a combo, e.g. \"" SERVICE_HOTKEY_DEFAULT "\".\n");
+		return 1;
+	}
+	const char *text = argv[3];
+	struct service_hotkey hk;
+	char canon[SERVICE_HOTKEY_MAX] = "";
+	const bool valid = service_hotkey_parse(text, &hk) && service_hotkey_format(&hk, canon, sizeof(canon));
+	const char *conflict = valid ? service_hotkey_known_conflict(&hk) : NULL;
+	const int registered = valid ? hotkey_registered_elsewhere(&hk) : -1;
+	const int code = !valid             ? CHECK_HOTKEY_INVALID
+	                 : conflict != NULL ? CHECK_HOTKEY_KNOWN_CONFLICT
+	                 : registered == 1  ? CHECK_HOTKEY_REGISTERED_ELSEWHERE
+	                                    : CHECK_HOTKEY_OK;
+
+	if (json) {
+		cJSON *root = cJSON_CreateObject();
+		if (root == NULL) {
+			E("FAIL: out of memory.\n");
+			return 1;
+		}
+		cJSON_AddStringToObject(root, "combo", text);
+		cJSON_AddBoolToObject(root, "valid", valid);
+		if (valid) {
+			cJSON_AddStringToObject(root, "canonical", canon);
+		} else {
+			cJSON_AddNullToObject(root, "canonical");
+		}
+		if (conflict != NULL) {
+			cJSON_AddStringToObject(root, "known_conflict", conflict);
+		} else {
+			cJSON_AddNullToObject(root, "known_conflict");
+		}
+		if (registered < 0) {
+			cJSON_AddNullToObject(root, "registered_elsewhere");
+		} else {
+			cJSON_AddBoolToObject(root, "registered_elsewhere", registered == 1);
+		}
+		cJSON_AddBoolToObject(root, "is_default", valid && strcmp(canon, SERVICE_HOTKEY_DEFAULT) == 0);
+		print_cjson(root);
+		cJSON_Delete(root);
+		return code;
+	}
+
+	if (!valid) {
+		E("'%s' is not a valid hotkey. Grammar: [Ctrl+][Shift+][Alt+][Win+]<Key>, at least one modifier.\n",
+		  text);
+		return code;
+	}
+	P("%s\n", canon); // line 1: the canonical spelling
+	if (conflict != NULL) {
+		P("warning: conflicts with %s. The launch hotkey is global, so that stops working while it is set.\n",
+		  conflict);
+	}
+	if (registered == 1) {
+		P("warning: another program holds this combo as a global hotkey right now (possibly a running "
+		  "workspace controller).\n");
+	}
+	return code;
 }
 
 static int
@@ -561,7 +706,7 @@ cmd_hotkey_suspend(int argc, const char **argv)
 static int
 print_usage(void)
 {
-	E("Usage: displayxr-cli workspace <list|set|reset|launch|hotkey-suspend> ...\n");
+	E("Usage: displayxr-cli workspace <list|set|reset|get|check-hotkey|launch|hotkey-suspend> ...\n");
 	E("  list [--json]                       Registered workspace controllers, the active one, live state and\n");
 	E("                                      launch settings.\n");
 	E("  set <id> --hotkey <combo>           Launch hotkey, e.g. \"" SERVICE_HOTKEY_DEFAULT "\" (the default), "
@@ -569,6 +714,10 @@ print_usage(void)
 	E("  set <id> --no-hotkey                No hotkey (launch from the tray or 'workspace launch').\n");
 	E("  set <id> --mode auto|disabled       auto = on demand (default); disabled = never launched.\n");
 	E("  reset <id>                          Back to the defaults (" SERVICE_HOTKEY_DEFAULT ", auto).\n");
+	E("  get <id> --hotkey                   Print the launch hotkey in effect (the combo, or 'none').\n");
+	E("  check-hotkey <combo> [--json]       Validate a combo without storing it. Exit 0 usable, 2 invalid,\n");
+	E("                                      3 a well-known app/OS binding uses it, 4 another program holds\n");
+	E("                                      it now (3 and 4 are advice: 'set' still accepts the combo).\n");
 	E("  launch <id>                         Ask the running service to spawn <id> now.\n");
 	E("  hotkey-suspend on|off               Take the service's launch-hotkey hook out / put it back\n");
 	E("                                      (for a hotkey-capture box; auto-resumes after 60 s).\n");
@@ -590,6 +739,12 @@ cli_cmd_workspace(int argc, const char **argv)
 	}
 	if (strcmp(argv[2], "reset") == 0) {
 		return cmd_reset(argc, argv);
+	}
+	if (strcmp(argv[2], "get") == 0) {
+		return cmd_get(argc, argv);
+	}
+	if (strcmp(argv[2], "check-hotkey") == 0) {
+		return cmd_check_hotkey(argc, argv);
 	}
 	if (strcmp(argv[2], "launch") == 0) {
 		return cmd_launch(argc, argv);

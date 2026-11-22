@@ -87,6 +87,22 @@ service_hotkey_format(const struct service_hotkey *hk, char *buf, size_t buf_siz
 bool
 service_hotkey_canonicalize(const char *text, char *out, size_t out_size);
 
+/*!
+ * A well-known use of @p hk that the launch hotkey would take away, or NULL
+ * when none is known. The service's hook is global and sees a key before any
+ * application, so a combo an application or the OS binds stops working there
+ * while the controller is not running (and while it runs, the controller's own
+ * global registration takes it). This is advice for a settings UI or an
+ * installer: callers WARN with the returned text and never refuse the combo.
+ * It is a short list of common bindings, not a survey of every application;
+ * NULL means "nothing known", not "free".
+ *
+ * The text is plain ASCII, one clause, no trailing period ("tab switching in
+ * browsers, editors and terminals"). The default combo has no entry.
+ */
+const char *
+service_hotkey_known_conflict(const struct service_hotkey *hk);
+
 //! X11 modifier masks (X.h ShiftMask / ControlMask / Mod1Mask / Mod4Mask),
 //! spelled out so this header needs no X11 header.
 #define SERVICE_HOTKEY_X11_SHIFT 0x0001u
