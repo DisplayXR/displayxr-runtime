@@ -172,6 +172,30 @@ if ($null -eq $rows) {
 # space, so two lines hold less than 2 x 50 when a long word moves down.
 $DescMax = 95
 
+# A row of the component list. Measured on Windows (the page layout with the
+# description under the list, 100 % scaling): a 53-character row fits
+# ("Update, 1 MB - Leia display plug-in 2.23.0 to 2.23.1"), and a 59-character
+# one is cut after its 52nd character and brings the horizontal scrollbar back.
+# The font is proportional, so the limit is about 52 characters of ordinary
+# text, not a fixed count: 50 leaves two characters for wider letters. The
+# longest first-party row today, a 17-character status, the 25-character name
+# and a version of the form N.NN.NN, is exactly 50:
+# "Update, cached - Leia SR display processor 2.23.11" (and the same length
+# with "Update, 115 MB - " or "Update, 1.2 GB - "). Anything longer (a longer
+# third-party name, a two-digit major version on that name) has its NAME cut.
+$LabelMax = 50
+
+function Fit-Label([string]$status, [string]$name, [string]$tail) {
+    # status + name + tail, at most $LabelMax characters. The status and the
+    # version stay whole; a name that does not fit is cut and ends in "...".
+    $room = $LabelMax - $status.Length - $tail.Length
+    if ($name.Length -gt $room) {
+        if ($room -lt 8) { $room = 8 }       # a name is never cut to nothing
+        $name = $name.Substring(0, $room - 3).TrimEnd(' ', '-', ',', '.', ':') + '...'
+    }
+    return "$status$name$tail"
+}
+
 function Clip-Desc([string]$text) {
     # A description that fits is left alone. A longer one is cut at the last
     # word that fits and ends in "...", so the marker never stands alone on a
@@ -259,12 +283,16 @@ foreach ($r in @($rows)) {
     $sizeText = Format-Size $download
     # The status comes FIRST: the list is narrow and cuts a row on the right,
     # and what must stay readable without scrolling is the status.
-    if (-not $sizeText) { $sizeText = 'Downloaded' }     # nothing left to fetch
+    # Every row must also FIT the list: a row wider than the list is cut and
+    # brings the horizontal scrollbar back (see $LabelMax). So the row carries
+    # one version, the one it ends up with; the version an update replaces is
+    # in the description. Nothing left to fetch reads "cached".
+    $nm = Clean $name 80
     switch ($status) {
-        'current' { $label = "Installed - $name $installed" }
-        'outdated' { $label = "Update, $sizeText - $name $installed to $target" }
-        'missing' { $label = "$sizeText - $name $target" }
-        default { $label = "Not available - $name" }
+        'current' { $label = Fit-Label 'Installed - ' $nm " $installed" }
+        'outdated' { $label = Fit-Label $(if ($sizeText) { "Update, $sizeText - " } else { 'Update, cached - ' }) $nm " $target" }
+        'missing' { $label = Fit-Label $(if ($sizeText) { "$sizeText - " } else { 'Cached - ' }) $nm " $target" }
+        default { $label = Fit-Label 'Not available - ' $nm '' }
     }
 
     # The description box holds about two lines: what matters first, and the
@@ -281,14 +309,16 @@ foreach ($r in @($rows)) {
         if ($unmet.Count -gt 0) { $desc = "Also needs, and does not install: $($unmet -join ', ') (not found). $desc" }
         if ($detected) { $desc = "Matching hardware was detected. $desc" }
         elseif ($recommended) { $desc = "Recommended. $desc" }
-        elseif ($keptForUpdate) { $desc = "Already installed: this updates it. Clear the box to keep the version you have. $desc" }
+        # The row shows the new version only; the one it replaces is here.
+        if ($keptForUpdate) { $desc = "Updates the installed $installed. Clear the box to keep that version. $desc" }
+        elseif ($status -eq 'outdated') { $desc = "Updates the installed $installed. $desc" }
     }
 
     # Which rows are kept when there are more items than slots: ticked, then
     # what can be ticked, then installed, then not available (dropped first).
     $rank = if ($selected) { 0 } elseif ($selectable) { 1 } elseif ($status -eq 'current') { 2 } else { 3 }
     $items.Add(@{
-            id = $id; name = (Clean $name 80); label = (Clean $label 120); desc = (Clip-Desc $desc)
+            id = $id; name = (Clean $name 80); label = (Clean $label $LabelMax); desc = (Clip-Desc $desc)
             size_kb = [long][math]::Ceiling($download / 1024); selected = [int]$selected
             ro = [int](-not $selectable); installed = [int]$isInstalled; status = $status
             rank = ($rank * 100000 + $items.Count)   # the listing order breaks ties (no Sort -Stable in 5.1)
