@@ -1,0 +1,28 @@
+{
+ "installed": [
+  {
+   "id": "leia-sr",
+   "name": "Leia SR display processor",
+   "class": "display_processor",
+   "publisher": "displayxr",
+   "version": "2.22.0",
+   "source_url": "https://github.com/DisplayXR/displayxr-leia-plugin/releases/download/v2.22.0/DisplayXRLeiaSRSetup-2.22.0.exe",
+   "sha256": "0f3a0c1d6b6a4d0e9b8f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f",
+   "install_time": "2026-11-18T09:12:44Z",
+   "can_uninstall": true,
+   "uninstall_command": "\"C:\\Program Files\\DisplayXR\\Runtime\\Plugins\\LeiaSR\\Uninstall.exe\" /S"
+  },
+  {
+   "id": "open-conversion",
+   "name": "Open conversion provider",
+   "class": "conversion_provider",
+   "publisher": "displayxr",
+   "version": "0.3.0",
+   "source_url": "https://github.com/DisplayXR/displayxr-conversion-open/releases/download/v0.3.0/DisplayXRConversionOpenSetup-0.3.0.exe",
+   "sha256": "9c1e5b7a3d2f4e6081a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f701",
+   "install_time": "2026-11-19T17:03:10Z",
+   "can_uninstall": false,
+   "uninstall_command": ""
+  }
+ ]
+}

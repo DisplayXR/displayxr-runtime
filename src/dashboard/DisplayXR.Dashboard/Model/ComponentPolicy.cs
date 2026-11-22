@@ -85,14 +85,17 @@ public static class ComponentClasses
 /// <see cref="Licence"/> and the fields after it: the row's <c>licence</c> object (ADR-054 N5) — the
 /// state the component itself reports (<c>not_applicable | licensed | trial | expired | unlicensed</c>;
 /// "" from a CLI that predates it), where the entitlement comes from, when it ends (ISO 8601), the
-/// component's one line and its purchase page. The Dashboard shows it; it never decides it.
+/// component's one line and its purchase page. <see cref="LicenceKeyActivation"/> / <see cref="LicenceDeepLink"/>:
+/// its <c>activation</c> object — whether it takes a pasted key and whether it takes a deep-link token
+/// (null from a CLI that predates the object). The Dashboard shows it; it never decides it.
 /// </summary>
 public sealed record PolicyRow(ComponentClass Class, string Id, string Name, bool Enabled, string EnabledSource,
                                bool Preferred, bool Active, string Load, string Provenance, string? Signer,
                                string? ProvenanceReason, bool Hidden = false, bool BuiltIn = false,
                                bool RankedFirst = false, string Vendor = "", string Version = "", int? ProbeOrder = null,
                                string Licence = "", string? LicenceSource = null, string? LicenceExpires = null,
-                               string? LicenceMessage = null, string? LicencePurchaseUrl = null)
+                               string? LicenceMessage = null, string? LicencePurchaseUrl = null,
+                               bool? LicenceKeyActivation = null, bool? LicenceDeepLink = null)
 {
     /// <summary>Selection skips the component: it is unlicensed or its licence expired (the CLI's <c>blocks</c>).</summary>
     public bool LicenceBlocks => Licence is "unlicensed" or "expired";
@@ -304,7 +307,9 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
                     // ADR-054 N5: the `licence` object; absent on an older CLI (no chip then).
                     e.Obj("licence").Str("state"), e.Obj("licence").StrOrNull("source"),
                     e.Obj("licence").StrOrNull("expires"), e.Obj("licence").StrOrNull("message"),
-                    e.Obj("licence").StrOrNull("purchase_url")))
+                    e.Obj("licence").StrOrNull("purchase_url"),
+                    e.Obj("licence").Obj("activation") is { } act && act.Has("key") ? act.Bool("key") : null,
+                    e.Obj("licence").Obj("activation") is { } act2 && act2.Has("deep_link") ? act2.Bool("deep_link") : null))
                 .ToArray();
             var byTask = new Dictionary<string, string>(StringComparer.Ordinal);
             var tasks = new List<PolicyTask>();

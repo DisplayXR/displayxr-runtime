@@ -1,0 +1,8 @@
+{
+ "offline": true,
+ "reason": "catalog unreachable or expired",
+ "skipped": [
+  "list"
+ ],
+ "retry": "dxr-get list"
+}

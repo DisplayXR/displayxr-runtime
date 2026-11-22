@@ -9,11 +9,20 @@ namespace DisplayXR.Dashboard;
 
 internal static class Program
 {
-    /// <summary><c>--page displays</c> opens on that page (home, displays, windows, performance, developer).</summary>
+    /// <summary><c>--page displays</c> opens on that page (home, displays, windows, components, catalog, performance, developer).</summary>
     public static string StartPage { get; private set; } = "home";
 
     /// <summary><c>--fixture file.ndjson</c>: replay snapshots from a file (development aid, see README).</summary>
     public static string? Fixture { get; private set; }
+
+#if DEBUG
+    // Debug builds only (never in a published dashboard): open the Catalog on one item, run a verb on
+    // it, and save the window as a PNG after a delay, then exit. For laying the tab out from fixtures.
+    public static string? CatalogItem { get; private set; }
+    public static string? CatalogDo { get; private set; }
+    public static string? Screenshot { get; private set; }
+    public static double ScreenshotDelay { get; private set; } = 3;
+#endif
 
     [STAThread]
     public static int Main(string[] args)
@@ -33,6 +42,13 @@ internal static class Program
         {
             if (args[i] == "--page") StartPage = args[i + 1].ToLowerInvariant();
             if (args[i] == "--fixture") Fixture = args[i + 1];
+#if DEBUG
+            if (args[i] == "--catalog-item") CatalogItem = args[i + 1];
+            if (args[i] == "--catalog-do") CatalogDo = args[i + 1];
+            if (args[i] == "--screenshot") Screenshot = args[i + 1];
+            if (args[i] == "--screenshot-delay" && double.TryParse(args[i + 1], System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out double d)) ScreenshotDelay = d;
+#endif
         }
 
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>

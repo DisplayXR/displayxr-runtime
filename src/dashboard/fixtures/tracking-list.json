@@ -1,0 +1,37 @@
+{
+ "preferred": null,
+ "policy": {
+  "policy_lock": false
+ },
+ "disabled_by_env": false,
+ "providers": [
+  {
+   "id": "open-tracking",
+   "name": "Open camera tracking",
+   "vendor": "DisplayXR",
+   "version": "1.0.0",
+   "load": "ACTIVE",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "signed",
+   "signer": "DisplayXR",
+   "built_in": false,
+   "licence": {
+    "state": "expired",
+    "source": "key",
+    "expires_unix": null,
+    "expires": "2026-10-31T00:00:00Z",
+    "message": "Your licence ended on 31 October",
+    "purchase_url": "https://displayxr.example.org/tracking",
+    "activation": {
+     "key": true,
+     "deep_link": false
+    },
+    "blocks": true
+   },
+   "display_name": "Open camera tracking",
+   "preferred": false,
+   "first": true
+  }
+ ]
+}
