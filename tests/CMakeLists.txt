@@ -1453,6 +1453,19 @@ if(TARGET tests_cli_catalog)
 		tests_cli_catalog PRIVATE "FAKE_DXR_GET=\"$<TARGET_FILE:tests_cli_catalog_fake_get>\""
 		)
 	add_dependencies(tests_cli_catalog tests_cli_catalog_fake_get)
+	# get_log_channel.h: the fake engine reports through the same pipe code as dxr-get.
+	target_include_directories(
+		tests_cli_catalog_fake_get PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/get
+		)
+	target_include_directories(tests_cli_catalog PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/get)
+	# Windows: the REAL engine too, for what only it can show (it takes no log
+	# path, refuses control characters, ignores the dev switches, reads a
+	# non-ASCII --catalog path). Not in a test-root-key build, which is not
+	# the engine that ships.
+	if(TARGET dxr-get AND NOT DXR_GET_TEST_ROOT_KEY)
+		target_compile_definitions(tests_cli_catalog PRIVATE "REAL_DXR_GET=\"$<TARGET_FILE:dxr-get>\"")
+		add_dependencies(tests_cli_catalog dxr-get)
+	endif()
 endif()
 
 # N3a (ADR-054): the `input list` prediction rule — PreferredPlugin over

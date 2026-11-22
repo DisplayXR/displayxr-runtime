@@ -17,6 +17,9 @@
  *   --catalog garbage   `list` prints text that is not JSON, exit 0
  *   --catalog slow      sleeps 5 s before answering (the bounded-wait test)
  *   --catalog current   `outdated` reports nothing
+ *   --catalog garbage   `install` / `uninstall` also print text that is not JSON, exit 0
+ *   --catalog flood     a several-item run sends ~600 KB of messages around its result lines
+ *   --catalog mute      a several-item run sends no `result:` line at all
  *   install open-conv | leia-sr | --default   a plan with work: 50 when not elevated, else 0
  *   install browser     nothing to do, 0
  *   install nofetch     gate 40: 50 when not elevated (the engine's order), else 40
@@ -27,9 +30,14 @@
  *
  * Like the engine: one item answers with the single-item document; several
  * answer `{"exit","items":[...]}`, each item judged alone, exit = the first
- * failure, and a `result: <id>: <code> <word>` message per item. `--log
- * <file>` appends every message to a file that already exists.
+ * failure, and a `result: <id>: <code> <word>` message per item.
+ * `--log-pipe <token>` sends every message to the front end's pipe, through
+ * the code dxr-get itself uses (get_log_channel.h). There is no `--log
+ * <file>`: like the engine, it takes no path to write to (exit 2).
  */
+
+#include "get_log_channel.h"
+
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -83,7 +91,17 @@
 	"\"aliases\":[],\"recommended\":true,\"detected\":\"none\",\"size\":1000,\"download\":1000,"                   \
 	"\"compatible\":true,\"prerequisites\":[]}"
 
-static const char *g_engine_log = NULL; //!< `--log <file>`
+static dxr_log_channel_t g_channel = DXR_LOG_CHANNEL_NONE; //!< `--log-pipe <token>`
+static bool g_mute = false;                                //!< `--catalog mute`: no `result:` lines
+
+static void
+channel_put(const char *line)
+{
+	if (g_channel != DXR_LOG_CHANNEL_NONE && !dxr_log_channel_write(g_channel, line, strlen(line))) {
+		dxr_log_channel_close(g_channel);
+		g_channel = DXR_LOG_CHANNEL_NONE;
+	}
+}
 
 static bool
 is_admin(void)
@@ -92,7 +110,7 @@ is_admin(void)
 	return v != NULL && strcmp(v, "1") == 0;
 }
 
-//! A message: stderr, and the `--log` file when it exists (never created here, like the engine).
+//! A message: stderr, and the front end's pipe when there is one.
 static void
 say(const char *fmt, ...)
 {
@@ -101,17 +119,24 @@ say(const char *fmt, ...)
 	va_start(ap, fmt);
 	(void)vsnprintf(line, sizeof(line), fmt, ap);
 	va_end(ap);
+	if (g_mute && strncmp(line, "result: ", 8) == 0) {
+		return;
+	}
 	fputs(line, stderr);
-	if (g_engine_log != NULL) {
-		FILE *probe = fopen(g_engine_log, "rb");
-		if (probe != NULL) {
-			fclose(probe);
-			FILE *f = fopen(g_engine_log, "ab");
-			if (f != NULL) {
-				fputs(line, f);
-				fclose(f);
-			}
-		}
+	channel_put(line);
+}
+
+//! `--catalog flood`: far more than a front end keeps, to the pipe only.
+static void
+flood(bool on)
+{
+	for (int i = 0; on && i < 3000; i++) {
+		char line[128];
+		(void)snprintf(line, sizeof(line),
+		               "filler line %04d ........................................................."
+		               "..............................\n",
+		               i);
+		channel_put(line);
 	}
 }
 
@@ -207,8 +232,8 @@ main(int argc, char **argv)
 		FILE *f = fopen(log, "ab");
 		if (f != NULL) {
 			for (int i = 1; i < argc; i++) {
-				// The `--log` path is random: record that it was given, not where.
-				const bool path = i > 1 && strcmp(argv[i - 1], "--log") == 0;
+				// The `--log-pipe` token is random: record that it was given, not what.
+				const bool path = i > 1 && strcmp(argv[i - 1], "--log-pipe") == 0;
 				fprintf(f, "%s%s", i > 1 ? "|" : "", path ? "<log>" : argv[i]);
 			}
 			fprintf(f, "\n");
@@ -224,8 +249,11 @@ main(int argc, char **argv)
 		const char *a = argv[i];
 		if (strcmp(a, "--catalog") == 0 && i + 1 < argc) {
 			catalog = argv[++i];
-		} else if (strcmp(a, "--log") == 0 && i + 1 < argc) {
-			g_engine_log = argv[++i];
+		} else if (strcmp(a, "--log-pipe") == 0 && i + 1 < argc) {
+			if (!dxr_log_token_ok(argv[++i])) {
+				return 2;
+			}
+			g_channel = dxr_log_channel_open(argv[i]);
 		} else if (strcmp(a, "--json") == 0) {
 			json = true;
 		} else if (strcmp(a, "--no-runtime") == 0) {
@@ -303,6 +331,13 @@ main(int argc, char **argv)
 		return 0;
 	}
 
+	if (strcmp(catalog, "garbage") == 0 && (strcmp(cmd, "install") == 0 || strcmp(cmd, "uninstall") == 0)) {
+		printf("this is not JSON\n");
+		return 0;
+	}
+	const bool flooding = many && strcmp(catalog, "flood") == 0;
+	g_mute = many && strcmp(catalog, "mute") == 0;
+
 	static char doc[4096];
 	if (strcmp(cmd, "install") == 0) {
 		const char *word = "";
@@ -325,6 +360,7 @@ main(int argc, char **argv)
 		size_t n = 0;
 		for (int i = 0; i < n_ids; i++) {
 			const int code = install_item(ids[i], doc, sizeof(doc), &word);
+			flood(flooding);
 			say("result: %s: %d %s\n", ids[i], code, word);
 			first = first == 0 ? code : first;
 			n += (size_t)snprintf(items + n, sizeof(items) - n,
@@ -349,6 +385,7 @@ main(int argc, char **argv)
 		size_t n = 0;
 		for (int i = 0; i < n_ids; i++) {
 			const int code = uninstall_item(ids[i], doc, sizeof(doc));
+			flood(flooding);
 			say("result: %s: %d %s\n", ids[i], code, code == 0 ? "uninstalled" : "not_uninstalled");
 			first = first == 0 ? code : first;
 			n += (size_t)snprintf(items + n, sizeof(items) - n, "%s%s", i > 0 ? "," : "", doc);

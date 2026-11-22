@@ -1850,3 +1850,74 @@ dxr_multi_json(cJSON *items, int *out_exit)
 	}
 	return o;
 }
+
+/*
+ * Text from the command line or the environment.
+ */
+
+bool
+dxr_arg_ok(const char *arg)
+{
+	if (arg == NULL) {
+		return false;
+	}
+	for (const unsigned char *p = (const unsigned char *)arg; *p != '\0'; p++) {
+		if (*p < 0x20 || *p == 0x7F) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void
+dxr_log_sanitize(char *text)
+{
+	for (unsigned char *p = (unsigned char *)text; *p != '\0'; p++) {
+		if ((*p < 0x20 && *p != '\n' && *p != '\t') || *p == 0x7F) {
+			*p = '?';
+		}
+	}
+}
+
+bool
+dxr_dev_switches_resolve(bool test_build,
+                         bool arg_no_verify,
+                         bool env_dev,
+                         bool env_allow_unsigned,
+                         struct dxr_dev_switches *out,
+                         char *why,
+                         size_t why_size,
+                         char *ignored,
+                         size_t ignored_size)
+{
+	out->no_verify_catalog = false;
+	out->allow_unsigned = false;
+	if (why_size > 0) {
+		why[0] = '\0';
+	}
+	if (ignored != NULL && ignored_size > 0) {
+		ignored[0] = '\0';
+	}
+	if (!test_build) {
+		if (arg_no_verify) {
+			(void)snprintf(why, why_size,
+			               "--no-verify-catalog exists only in a test-root-key build of dxr-get "
+			               "(CMake DXR_GET_TEST_ROOT_KEY); this build always verifies the catalog");
+			return false;
+		}
+		if (ignored != NULL && (env_dev || env_allow_unsigned)) {
+			(void)snprintf(ignored, ignored_size,
+			               "%s%s%s ignored: honoured only by a test-root-key build of dxr-get",
+			               env_dev ? "DXR_GET_DEV" : "", env_dev && env_allow_unsigned ? " and " : "",
+			               env_allow_unsigned ? "DXR_GET_ALLOW_UNSIGNED" : "");
+		}
+		return true;
+	}
+	if (arg_no_verify && !env_dev) {
+		(void)snprintf(why, why_size, "--no-verify-catalog needs DXR_GET_DEV=1");
+		return false;
+	}
+	out->no_verify_catalog = arg_no_verify;
+	out->allow_unsigned = env_allow_unsigned;
+	return true;
+}

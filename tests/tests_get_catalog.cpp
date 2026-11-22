@@ -1562,3 +1562,63 @@ TEST_CASE("several items in one install / uninstall: each judged alone, exit = t
 	CHECK(code == DXR_GET_OK);
 	cJSON_Delete(undoc);
 }
+
+TEST_CASE("dxr-get: no argument and no log line carries a control character", "[get][log]")
+{
+	CHECK(dxr_arg_ok("leia-sr"));
+	CHECK(dxr_arg_ok("C:\\Program Files\\x\\cat.json"));
+	CHECK(dxr_arg_ok("caf\xC3\xA9-\xE6\x97\xA5")); // UTF-8 passes
+	CHECK(dxr_arg_ok(""));
+	CHECK_FALSE(dxr_arg_ok(nullptr));
+	// A line feed in an item id would write a second, forged line into the log.
+	CHECK_FALSE(dxr_arg_ok("a\nresult: b: 0 installed"));
+	CHECK_FALSE(dxr_arg_ok("a\rb"));
+	CHECK_FALSE(dxr_arg_ok("a\tb"));
+	CHECK_FALSE(dxr_arg_ok("a\x1b[2Jb"));
+	CHECK_FALSE(dxr_arg_ok("a\x7f"));
+	CHECK_FALSE(dxr_arg_ok("\x01"));
+
+	// What is logged: the message's own line feeds and tabs stay, nothing else does.
+	char text[] = "one\ttwo\r\nthree\x1b[31m\x07\x7f caf\xC3\xA9\n";
+	const size_t len = strlen(text);
+	dxr_log_sanitize(text);
+	CHECK(std::string(text) == "one\ttwo?\nthree?[31m?? caf\xC3\xA9\n");
+	CHECK(strlen(text) == len);
+}
+
+TEST_CASE("dxr-get: the switches that weaken verification exist in a test-root-key build only", "[get][trust]")
+{
+	dxr_dev_switches sw = {true, true};
+	char why[200], ignored[200];
+
+	// The build that ships. Whatever the environment says, nothing is weakened...
+	REQUIRE(dxr_dev_switches_resolve(false, false, true, true, &sw, why, sizeof(why), ignored, sizeof(ignored)));
+	CHECK_FALSE(sw.no_verify_catalog);
+	CHECK_FALSE(sw.allow_unsigned);
+	CHECK(std::string(ignored).find("DXR_GET_DEV and DXR_GET_ALLOW_UNSIGNED") != std::string::npos);
+	REQUIRE(dxr_dev_switches_resolve(false, false, false, true, &sw, why, sizeof(why), ignored, sizeof(ignored)));
+	CHECK_FALSE(sw.allow_unsigned);
+	CHECK(std::string(ignored).find("DXR_GET_ALLOW_UNSIGNED") != std::string::npos);
+	REQUIRE(dxr_dev_switches_resolve(false, false, false, false, &sw, why, sizeof(why), ignored, sizeof(ignored)));
+	CHECK(ignored[0] == '\0');
+	// ...and --no-verify-catalog is a usage error, with or without DXR_GET_DEV.
+	sw = {true, true};
+	CHECK_FALSE(dxr_dev_switches_resolve(false, true, true, true, &sw, why, sizeof(why), ignored, sizeof(ignored)));
+	CHECK_FALSE(sw.no_verify_catalog);
+	CHECK_FALSE(sw.allow_unsigned);
+	CHECK(std::string(why).find("test-root-key build") != std::string::npos);
+	CHECK_FALSE(dxr_dev_switches_resolve(false, true, false, false, &sw, why, sizeof(why), nullptr, 0));
+
+	// A test-root-key build: as before.
+	REQUIRE(dxr_dev_switches_resolve(true, true, true, false, &sw, why, sizeof(why), ignored, sizeof(ignored)));
+	CHECK(sw.no_verify_catalog);
+	CHECK_FALSE(sw.allow_unsigned);
+	REQUIRE(dxr_dev_switches_resolve(true, false, false, true, &sw, why, sizeof(why), ignored, sizeof(ignored)));
+	CHECK_FALSE(sw.no_verify_catalog);
+	CHECK(sw.allow_unsigned);
+	CHECK(ignored[0] == '\0');
+	CHECK_FALSE(
+	    dxr_dev_switches_resolve(true, true, false, false, &sw, why, sizeof(why), ignored, sizeof(ignored)));
+	CHECK(std::string(why) == "--no-verify-catalog needs DXR_GET_DEV=1");
+	CHECK_FALSE(sw.no_verify_catalog);
+}

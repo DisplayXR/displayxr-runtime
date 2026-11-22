@@ -407,6 +407,57 @@ dxr_multi_json(cJSON *items, int *out_exit);
 int
 dxr_receipt_dependents(const struct dxr_receipt *all, int n, const char *id, char *out, size_t out_size);
 
+/*
+ * Text that came from the command line or the environment.
+ *
+ * dxr-get may run elevated on behalf of a caller that is not, and what it
+ * logs is read back by that caller's front end one line at a time. No
+ * argument may therefore carry a control character (a newline in an item id
+ * would forge a `result:` line), and nothing that is logged may either.
+ */
+
+//! true when @p arg holds no ASCII control character (0x00-0x1F, 0x7F). Bytes of a UTF-8 sequence pass.
+bool
+dxr_arg_ok(const char *arg);
+
+/*!
+ * Make @p text safe to log, in place: every ASCII control character except
+ * the line feed and the tab becomes `?`. The length does not change.
+ */
+void
+dxr_log_sanitize(char *text);
+
+//! The verification-weakening switches a run honours. All false in every build that ships.
+struct dxr_dev_switches
+{
+	bool no_verify_catalog; //!< `--no-verify-catalog` with `DXR_GET_DEV=1`: the catalog signature is not checked
+	bool allow_unsigned;    //!< `DXR_GET_ALLOW_UNSIGNED=1`: the Authenticode check of a download is skipped
+};
+
+/*!
+ * Decide which switches apply. They exist only in a TEST ROOT KEY build
+ * (@p test_build; CMake DXR_GET_TEST_ROOT_KEY), which is never installed,
+ * never attached to a release, and prints a banner on every run. In every
+ * other build the environment variables are ignored and the argument is a
+ * usage error: a signed dxr-get.exe is started elevated behind a consent
+ * prompt that shows its publisher, and nothing the calling user can set may
+ * make it install something the signed catalog does not name.
+ *
+ * Returns false (usage error, @p why says which) when `--no-verify-catalog`
+ * was given and cannot be honoured. @p ignored (optional) gets a note when an
+ * environment switch was set and ignored, else an empty string.
+ */
+bool
+dxr_dev_switches_resolve(bool test_build,
+                         bool arg_no_verify,
+                         bool env_dev,
+                         bool env_allow_unsigned,
+                         struct dxr_dev_switches *out,
+                         char *why,
+                         size_t why_size,
+                         char *ignored,
+                         size_t ignored_size);
+
 #ifdef __cplusplus
 }
 #endif

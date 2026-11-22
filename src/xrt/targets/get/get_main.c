@@ -26,6 +26,7 @@
 
 #include "get.h"
 #include "get_core.h"
+#include "get_log_channel.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -54,64 +55,36 @@
 //! %TEMP%) is given to actually remove the component.
 #define UNINSTALL_SETTLE_MS (120u * 1000u)
 
-//! `--log <file>`: every message is also appended there. INVALID_HANDLE_VALUE: no log file.
-static HANDLE g_log_file = INVALID_HANDLE_VALUE;
+//! `--log-pipe <token>`: every message also goes to the front end's pipe (get_log_channel.h).
+static dxr_log_channel_t g_log_channel = DXR_LOG_CHANNEL_NONE;
 
 void
 dxr_log(const char *fmt, ...)
 {
+	// One buffer for both destinations. What is logged can hold text that came
+	// from the command line, the registry or a catalog: control characters are
+	// taken out, so that neither a terminal nor a front end reading the channel
+	// line by line can be told something dxr-get did not say.
+	char line[8192]; // the usage text is the longest message
 	va_list ap;
 	va_start(ap, fmt);
-	if (g_log_file != INVALID_HANDLE_VALUE) {
-		// A copy for the file: a front end that started this process elevated
-		// cannot read its stderr, and reads the file instead.
-		char line[2048];
-		va_list ap2;
-		va_copy(ap2, ap);
-		int n = vsnprintf(line, sizeof(line), fmt, ap2);
-		va_end(ap2);
-		if (n > 0) {
-			DWORD wrote = 0;
-			(void)WriteFile(g_log_file, line, (DWORD)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1),
-			                &wrote, NULL);
-		}
-	}
-	(void)vfprintf(stderr, fmt, ap);
+	int n = vsnprintf(line, sizeof(line), fmt, ap);
 	va_end(ap);
+	if (n <= 0) {
+		return;
+	}
+	if (n >= (int)sizeof(line)) {
+		n = (int)sizeof(line) - 1;
+		line[n - 1] = '\n'; // a cut message still ends its line
+	}
+	dxr_log_sanitize(line);
+	if (g_log_channel != DXR_LOG_CHANNEL_NONE && !dxr_log_channel_write(g_log_channel, line, (size_t)n)) {
+		// The front end is gone or not reading. One bounded wait was spent; no more.
+		dxr_log_channel_close(g_log_channel);
+		g_log_channel = DXR_LOG_CHANNEL_NONE;
+	}
+	(void)fputs(line, stderr);
 	(void)fflush(stderr);
-}
-
-/*!
- * `--log <file>`: append to a file that ALREADY EXISTS. dxr-get never creates
- * it, and refuses a directory or a reparse point: this process may be
- * elevated while the path came from a caller that is not, so it must not be
- * led into creating or following anything. The caller creates the file, with
- * the access it wants, and removes it. Nothing dxr-get logs is a secret.
- */
-static void
-log_open(const char *path)
-{
-	wchar_t w[1024];
-	if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1024) <= 0) {
-		dxr_log("--log: the path cannot be used; logging to stderr only\n");
-		return;
-	}
-	HANDLE h = CreateFileW(w, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-	                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-	BY_HANDLE_FILE_INFORMATION info;
-	if (h != INVALID_HANDLE_VALUE &&
-	    (!GetFileInformationByHandle(h, &info) ||
-	     (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)) {
-		CloseHandle(h);
-		h = INVALID_HANDLE_VALUE;
-	}
-	if (h == INVALID_HANDLE_VALUE) {
-		dxr_log(
-		    "--log: %s is not an existing plain file (dxr-get does not create it); logging to stderr only\n",
-		    path);
-		return;
-	}
-	g_log_file = h;
 }
 
 static bool
@@ -417,7 +390,12 @@ static struct dxr_env k_env = {
 static bool
 read_whole_file(const char *path, char **out, size_t *len)
 {
-	FILE *f = fopen(path, "rb");
+	// The path is UTF-8 (the command line is read as UTF-16, see main).
+	wchar_t w[2200];
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, w, 2200) <= 0) {
+		return false;
+	}
+	FILE *f = _wfopen(w, L"rb");
 	if (f == NULL) {
 		return false;
 	}
@@ -489,7 +467,7 @@ load_catalog(const char *where, bool verify, struct dxr_catalog *c, bool *no_net
 		}
 	} else {
 		(void)snprintf(key_id, sizeof(key_id), "UNVERIFIED");
-		dxr_log("WARNING: catalog signature NOT verified (DXR_GET_DEV)\n");
+		dxr_log("WARNING: catalog signature NOT verified (DXR_GET_DEV, test-root-key build)\n");
 	}
 	char err[128];
 	int r = dxr_catalog_parse(body, blen, time(NULL), c, err, sizeof(err));
@@ -553,6 +531,9 @@ load_default_catalog(bool verify, struct dxr_catalog *c)
  * Fetch + verify + install.
  */
 
+//! The verification-weakening switches of this run: all off, except in a test-root-key build.
+static struct dxr_dev_switches g_dev = {false, false};
+
 /*!
  * Downloads (resuming a partial file), then checks size, SHA-256 and the
  * Authenticode signer of one asset. @p item is the catalog item whose
@@ -565,7 +546,8 @@ fetch_asset(const struct dxr_catalog *c,
             const char *name,
             wchar_t *out_path,
             size_t cap,
-            const wchar_t *dir_override)
+            const wchar_t *dir_override,
+            bool allow_unsigned)
 {
 	char why[256];
 	int r = dxr_asset_check(c, item, asset, NULL, why, sizeof(why));
@@ -635,8 +617,8 @@ fetch_asset(const struct dxr_catalog *c,
 		}
 	}
 
-	if (env_on("DXR_GET_ALLOW_UNSIGNED")) {
-		dxr_log("%s: WARNING Authenticode check skipped (DXR_GET_ALLOW_UNSIGNED)\n", name);
+	if (allow_unsigned) { // a test-root-key build only (dxr_dev_switches_resolve)
+		dxr_log("%s: WARNING Authenticode check skipped (DXR_GET_ALLOW_UNSIGNED, test-root-key build)\n", name);
 	} else {
 		char cn[256];
 		if (!dxr_authenticode_signer(out_path, cn, sizeof(cn))) {
@@ -862,7 +844,7 @@ execute_plan(const struct dxr_catalog *c, struct dxr_plan *p, bool no_start, con
 		if (!dxr_step_needs_work(s)) {
 			continue;
 		}
-		int r = fetch_asset(c, s->item, s->asset, s->label, paths[i], MAX_PATH, NULL);
+		int r = fetch_asset(c, s->item, s->asset, s->label, paths[i], MAX_PATH, NULL, g_dev.allow_unsigned);
 		if (r != DXR_GET_OK) {
 			dxr_log("Nothing was installed. Not installed:");
 			for (int j = 0; j < p->n; j++) {
@@ -975,7 +957,8 @@ usage(void)
 	    "                       itself; an item that would need it is refused with exit 41\n"
 	    "  --assume-runtime V   (list, plan) answer as if runtime V were installed\n"
 	    "  --assume-abi C=N     with --assume-runtime: that runtime implements major N of class C\n"
-	    "  --log <file>         also append every message to <file>, which must already exist\n"
+	    "  --log-pipe <token>   also send every message to the named pipe dxr-get-log-<token> (32 hex\n"
+	    "                       digits) that the calling front end created; dxr-get writes to no file\n"
 	    "  several items        install / uninstall: each is judged and run alone, in order; one that\n"
 	    "                       cannot be done is reported and skipped; exit = the first failure\n"
 	    "\n"
@@ -1145,7 +1128,7 @@ uninstall_result(const char *id, int code, const char *result, const char *detai
 
 /*!
  * The end of one item of a several-item run: a line a front end can read back
- * from `--log` (`result: <id>: <exit code> <word>`), and the running exit code.
+ * from `--log-pipe` (`result: <id>: <exit code> <word>`), and the running exit code.
  */
 static void
 multi_note(const char *id, int code, const char *word, int *first)
@@ -1298,20 +1281,29 @@ install_one(const struct dxr_catalog *c,
 	return r;
 }
 
-int
-main(int argc, char **argv)
+static int
+dxr_main(int argc, char **argv)
 {
 	// DXR_GET_CATALOG redirects to another catalog (a test or staging copy). It
 	// grants nothing: that catalog must still carry a valid signature from a
 	// compiled-in key, and the serial guard still applies.
 	const char *catalog_where = getenv("DXR_GET_CATALOG");
-	const char *cmd = NULL, *arg = NULL, *for_c = NULL, *min_runtime = NULL, *out_dir = NULL, *log_path = NULL;
+	const char *cmd = NULL, *arg = NULL, *for_c = NULL, *min_runtime = NULL, *out_dir = NULL, *log_token = NULL;
 	// Every item named. Only `install` and `uninstall` take more than one.
 	const char *ids[DXR_MAX_IDS];
 	int n_ids = 0;
 	bool json = false, yes = false, no_verify = false, no_start = false, installed_only = false;
 	bool use_default = false;
 	struct dxr_plan_opts opts = {false};
+	// Before anything is read from it: no argument may hold a control character.
+	// An item id with a line feed in it would otherwise write a second line into
+	// the log a front end reads results from.
+	for (int i = 1; i < argc; i++) {
+		if (!dxr_arg_ok(argv[i])) {
+			dxr_log("argument %d holds a control character -- refused\n", i);
+			return DXR_GET_USAGE;
+		}
+	}
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
 		if (strcmp(a, "--catalog") == 0 && i + 1 < argc) {
@@ -1348,8 +1340,13 @@ main(int argc, char **argv)
 			k_env.assume_abi[k_env.n_assume_abi].item_class = argv[i];
 			k_env.assume_abi[k_env.n_assume_abi].major = atoi(eq + 1);
 			k_env.n_assume_abi++;
-		} else if (strcmp(a, "--log") == 0 && i + 1 < argc) {
-			log_path = argv[++i];
+		} else if (strcmp(a, "--log-pipe") == 0 && i + 1 < argc) {
+			// A token, never a path: this process may be elevated and its caller not.
+			log_token = argv[++i];
+			if (!dxr_log_token_ok(log_token)) {
+				dxr_log("--log-pipe takes a token of 32 lowercase hex digits, not a path or a name\n");
+				return DXR_GET_USAGE;
+			}
 		} else if (strcmp(a, "--no-start-service") == 0) {
 			no_start = true;
 		} else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -1373,8 +1370,11 @@ main(int argc, char **argv)
 		usage();
 		return DXR_GET_USAGE;
 	}
-	if (log_path != NULL) {
-		log_open(log_path);
+	if (log_token != NULL) {
+		g_log_channel = dxr_log_channel_open(log_token);
+		if (g_log_channel == DXR_LOG_CHANNEL_NONE) {
+			dxr_log("--log-pipe: no front end is listening on that pipe; logging to stderr only\n");
+		}
 	}
 	// A build whose catalog root key was replaced for testing says so on every
 	// run, before anything else, and reads a local catalog file only.
@@ -1389,10 +1389,19 @@ main(int argc, char **argv)
 		usage();
 		return DXR_GET_USAGE;
 	}
-	if (no_verify && !env_on("DXR_GET_DEV")) {
-		dxr_log("--no-verify-catalog needs DXR_GET_DEV=1\n");
+	// The switches that weaken verification exist in a test-root-key build only.
+	// In every other build the environment is not consulted for them.
+	char why[200], ignored[200];
+	if (!dxr_dev_switches_resolve(test_banner != NULL, no_verify, env_on("DXR_GET_DEV"),
+	                              env_on("DXR_GET_ALLOW_UNSIGNED"), &g_dev, why, sizeof(why), ignored,
+	                              sizeof(ignored))) {
+		dxr_log("%s\n", why);
 		return DXR_GET_USAGE;
 	}
+	if (ignored[0] != '\0') {
+		dxr_log("%s\n", ignored);
+	}
+	no_verify = g_dev.no_verify_catalog;
 	(void)yes; // installers pass --yes; the consent prompt is theirs, not ours
 	if (strcmp(cmd, "ensure-for") == 0) {
 		for_c = arg;
@@ -1540,7 +1549,8 @@ main(int argc, char **argv)
 		if (out_dir) {
 			(void)MultiByteToWideChar(CP_UTF8, 0, out_dir, -1, wout, MAX_PATH);
 		}
-		r = fetch_asset(&c, item, dxr_item_asset(item), arg, path, MAX_PATH, out_dir ? wout : NULL);
+		r = fetch_asset(&c, item, dxr_item_asset(item), arg, path, MAX_PATH, out_dir ? wout : NULL,
+		                g_dev.allow_unsigned);
 		if (r == DXR_GET_OK) {
 			printf("%ls\n", path);
 		}
@@ -1548,4 +1558,34 @@ main(int argc, char **argv)
 done:
 	dxr_catalog_free(&c);
 	return r;
+}
+
+/*
+ * The command line is read as UTF-16 and handed on as UTF-8. The C runtime's
+ * `argv` is in the ANSI code page, which cannot hold every path: a front end
+ * passes `--catalog C:\\Users\\<a name outside the code page>\\cat.json`.
+ */
+int
+main(void)
+{
+	int argc = 0;
+	wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &argc);
+	if (wargv == NULL || argc < 1) {
+		return DXR_GET_USAGE;
+	}
+	char **argv = (char **)calloc((size_t)argc + 1, sizeof(char *));
+	if (argv == NULL) {
+		return DXR_GET_USAGE;
+	}
+	for (int i = 0; i < argc; i++) {
+		const int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+		argv[i] = (char *)calloc(n > 0 ? (size_t)n : 1, 1);
+		if (argv[i] == NULL ||
+		    (n > 0 && WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], n, NULL, NULL) <= 0)) {
+			return DXR_GET_USAGE;
+		}
+	}
+	LocalFree(wargv);
+	// argv lives for the whole run: the option parser keeps pointers into it.
+	return dxr_main(argc, argv);
 }

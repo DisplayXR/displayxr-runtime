@@ -33,7 +33,11 @@ dxr-get list --installed [--json]
 dxr-get uninstall <id>... [--json] [--no-start-service]
 ```
 
-Every verb also takes `--log <file>` (§ --log).
+Every verb also takes `--log-pipe <token>` (§ --log-pipe).
+
+**The command line is read as UTF-16** (`GetCommandLineW`) and handled as UTF-8, so a
+`--catalog` or `--out` path outside the ANSI code page works. An argument that holds a control
+character is refused (§ --log-pipe).
 
 Options for callers that are themselves installers:
 
@@ -140,7 +144,7 @@ more are given (at most 32). The other verbs still take one.
   `result: <id>: <exit code> <word>`. The word is `installed`, `nothing_to_do`, `incompatible`,
   `needs_elevation`, `not_fetchable` or `failed` for `install`, and `uninstalled` or
   `not_uninstalled` for `uninstall`. A front end that cannot read the exit code of each item
-  (an elevated run) reads these lines from `--log`.
+  (an elevated run) reads these lines from `--log-pipe`.
 - **`--json`.** One document, printed at the end, instead of one per item:
 
 ```json
@@ -155,17 +159,37 @@ more are given (at most 32). The other verbs still take one.
   document, as for one item, and nothing is attempted.
 - `install --default` takes no items, as before.
 
-### --log
+### --log-pipe
 
-`--log <file>` appends every message `dxr-get` writes to stderr to that file as well. It exists
-for a front end that started `dxr-get` elevated and cannot read its output.
+`--log-pipe <token>` also sends every message `dxr-get` writes to stderr to a **named pipe the
+caller owns**: `\\.\pipe\dxr-get-log-<token>`. It exists for a front end that started `dxr-get`
+elevated and cannot read its output.
 
-- **The file must already exist.** `dxr-get` never creates it, and will not open a directory or
-  a reparse point: it may be running elevated on a path given by a caller that is not. The
-  caller creates the file, with the access it wants, and deletes it.
-- When the file cannot be opened, one message says so and the run goes on with stderr only.
+`dxr-get` takes **no path to write a log to**. It may be running elevated on a command line
+that came from a process that is not, so anything the caller could aim would be an elevated
+write to a place the caller chose. With the pipe, the elevated process writes to no file:
+
+- **The token is 32 lowercase hex digits and nothing else.** Anything else is a usage error
+  (exit 2). `dxr-get` builds the pipe name itself, so it always lies in the named-pipe
+  namespace and can never name a file, a device or a directory.
+- **The caller creates the pipe**, under a random token, before it starts `dxr-get`, and reads
+  it while `dxr-get` runs. `dxr-get` only connects. What it opened must be a pipe.
+- **The caller cannot impersonate `dxr-get`** through it: the pipe is opened with an anonymous
+  impersonation level (`SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS`).
+- **A write waits at most 2 seconds.** A reader that stops reading costs one such wait; the
+  channel is then closed and the run goes on with stderr only. No unbounded wait.
+- When nothing listens on the pipe, one message says so and the run goes on with stderr only.
 - stdout (the plan, the `--json` documents) is not copied to it.
 - Nothing `dxr-get` logs is a secret: it handles no credentials, keys or tokens.
+
+**Control characters.** An argument that holds an ASCII control character (0x00-0x1F, 0x7F) is
+a usage error, exit 2, before anything else is done: a line feed in an item id would otherwise
+put a second, forged `result:` line into what the front end reads. And in everything
+`dxr-get` logs, to stderr and to the pipe, a control character other than the line feed and the
+tab is replaced by `?`, whatever text it came from (an argument, the registry, a catalog).
+
+The code is `src/xrt/targets/get/get_log_channel.h` (the writer; header only, so the unit
+test's stand-in engine uses the same code) and, for the reader, `cli_catalog_os.c`.
 
 ### plan
 
@@ -498,12 +522,24 @@ itself elevated; a front end that wants that does it: [`displayxr-cli catalog`](
   - touch `ActiveRuntime` (the runtime installer owns it; see below);
   - follow a redirect to plain HTTP, or fetch a plain-HTTP URL;
   - ask for an account, a key or a payment. Installing is anonymous.
-- **Dev overrides:**
-  - `DXR_GET_CATALOG=<url|file>` points dxr-get at another catalog. That catalog must still be
-    signed, so the override grants nothing.
-  - `DXR_GET_DEV=1` plus `--no-verify-catalog` skips the catalog signature.
-  - `DXR_GET_ALLOW_UNSIGNED=1` skips the Authenticode check of the downloaded file. The hash
-    check and the catalog-side signer delegation always stay on.
+- **Nothing the calling user can set weakens verification in a build that ships.** A signed
+  `dxr-get.exe` is started elevated behind a consent prompt that shows its publisher, so no
+  environment variable or argument may make it install something the signed catalog does not
+  name. The switches:
+
+  | Switch | What it does | Exists in |
+  |---|---|---|
+  | `--catalog <url\|file>`, `DXR_GET_CATALOG=<url\|file>` | another catalog **location**. That catalog must still carry a valid signature under a compiled-in key, and the serial guard applies, so it grants nothing | every build |
+  | `DXR_GET_DEV=1` plus `--no-verify-catalog` | the catalog signature (and the serial guard) is not checked | a **test-root-key build only** |
+  | `DXR_GET_ALLOW_UNSIGNED=1` | the Authenticode check of a downloaded file is skipped. The size and hash checks and the catalog-side signer delegation stay on | a **test-root-key build only** |
+
+  A test-root-key build is one compiled with `DXR_GET_TEST_ROOT_KEY` (§ Validating on a test
+  machine): it is never installed or attached to a release, and it prints a banner on every
+  run. In every other build `--no-verify-catalog` is a usage error (exit 2) and the two
+  environment variables are **ignored**, with one log line saying so. The decision is one
+  function, `dxr_dev_switches_resolve` (`get_core.c`), unit-tested for both kinds of build;
+  the Windows CI also runs the built `dxr-get.exe` with all three set against an unsigned
+  catalog file and requires exit 2 and exit 10.
 
 ## Offline, and no unbounded wait
 
@@ -584,7 +620,11 @@ argument turns it on in a normal build. A binary built with it:
 - is not installed into `_package\bin`, and makes the `installer` target fail.
 
 Everything else is the shipping code path: the serial guard, expiry, publisher signers,
-hashes, Authenticode. CI asserts that the option is unset and that no `dxr-get.exe` it builds
+hashes, Authenticode. It is also the only build in which `DXR_GET_DEV=1` with
+`--no-verify-catalog` (an unsigned fixture, `make_test_catalog.py build --no-sign`) and
+`DXR_GET_ALLOW_UNSIGNED=1` (an unsigned test payload) do anything (§ Trust rules); the recipe
+below needs neither, because the fixture is signed with the test key and its payloads are the
+real, signed installers. CI asserts that the option is unset and that no `dxr-get.exe` it builds
 contains the banner text (`build-windows.yml`); `attach-dxr-get.yml` refuses to attach one.
 
 **The fixture.** `scripts/make_test_catalog.py` (needs Python with `cryptography` for signing):
@@ -642,7 +682,11 @@ displayxr-cli catalog update <id>... | --all [--elevate|--no-elevate] [--allow-u
 ```
 
 Every verb also takes `--catalog <url|file>` (handed to the engine, which still requires a
-signature) and `--timeout <seconds>`.
+signature) and `--timeout <seconds>`. A catalog **file** is handed on as an absolute path,
+resolved once against the CLI's directory: the elevated engine starts in another one. A URL
+is handed on as written. The CLI reads its own command line as UTF-16 and hands the engine
+UTF-8, so paths and ids outside the ANSI code page survive; an argument with a control
+character is a usage error (exit 2), as it is for the engine.
 
 | Verb | Engine calls | Notes |
 |---|---|---|
@@ -650,10 +694,10 @@ signature) and `--timeout <seconds>`.
 | `list --installed` | `list --installed --json` | the receipts; no catalog, no network |
 | `outdated` | `outdated --json` | |
 | `show <id>` | `list --json` | one item, by id or alias. An id the catalog does not list: exit 40 |
-| `install <id>...` | `install <ids> --no-runtime --json`; then, for the ids that answered 50, `install <those ids> --no-runtime --log <file>`, elevated | one call for all the ids, and at most one elevated call |
+| `install <id>...` | `install <ids> --no-runtime --json`; then, for the ids that answered 50, `install <those ids> --no-runtime --log-pipe <token>`, elevated | one call for all the ids, and at most one elevated call |
 | `install --default` | `install --default --no-runtime --json`, then elevated as above | |
-| `uninstall <id>...` | `uninstall <ids> --json`; then `uninstall <those ids> --log <file>`, elevated | |
-| `update --all` | `outdated --json`, then `install` as above for every row that can be installed | the runtime row and rows without a build are reported, not installed |
+| `uninstall <id>...` | `uninstall <ids> --json`; then `uninstall <those ids> --log-pipe <token>`, elevated | |
+| `update --all` | `outdated --json`, then `install` as above for every row that can be installed | the runtime row and rows without a build are reported, not installed. One run updates at most 32 items; a row past that is reported as not updated in this run (exit 0), and running the command again does the rest |
 | `update <id>...` | `outdated --json`, then `install` as above | an id that is not outdated is explained from one `list --json`: current (exit 0), not installed (42), not listed (40) |
 
 **Where the engine is.** `dxr-get.exe` next to `displayxr-cli.exe`, else in the directory named
@@ -710,6 +754,12 @@ must pass three rules:
    or not the CLI is signed;
 3. when `displayxr-cli.exe` is signed too, the engine's signer is the CLI's.
 
+The file is **held open across the check and the start**. Before the signature is read the CLI
+opens `dxr-get.exe` sharing reading only, reads the signature through that handle, and keeps
+the handle until the CLI exits. While it is open the file cannot be written, deleted or
+renamed, nor a directory above it renamed, so the file the consent prompt starts is the file
+that was checked. A file that cannot be opened that way is treated as unverified.
+
 Otherwise the items that needed elevation exit **65** and nothing is started.
 `--allow-unsigned-engine` lifts the check, and is the only thing that does. It is for
 development builds (CI builds are unsigned), it must be given explicitly, and `--elevate` does
@@ -717,12 +767,24 @@ not imply it. Running an unsigned engine with the rights the CLI already has (`l
 verb from an elevated terminal) is not affected.
 
 **What the elevated engine said.** An elevated child's output cannot be read, so the CLI
-creates an empty log file, hands it to the engine with `--log`, reads it when the engine has
-exited and deletes it. The file is created new, with a random name, in the user's temporary
-directory, with access for its owner, administrators and SYSTEM only. A person sees the
-engine's messages as `dxr-get: …` lines; with `--json` they are the call's `log` string. With
-several items the engine's exit code is only the first failure, and each item's own code is
-read from its `result:` line in the log.
+creates a named pipe under a random 128-bit token (`FILE_FLAG_FIRST_PIPE_INSTANCE`, one
+instance, local clients only), hands the engine the token with `--log-pipe`, reads the pipe
+while the engine runs, and closes it afterwards (§ --log-pipe). No file is created, by either
+process, so there is nothing to clean up after a timeout or a declined prompt. A person sees
+the engine's messages as `dxr-get: …` lines (the first 400); with `--json` they are the call's
+`log` string.
+
+**Each item's own result.** With several items the engine's exit code is only the first
+failure, and each item's own code is its `result:` line in the log. Those lines are never
+lost to the size of the log: the CLI keeps 256 KB of messages and, past that, still keeps
+every `result:` line. And the CLI does not guess:
+
+| Situation | Outcome |
+|---|---|
+| the pipe could not be created, several items need elevation | the engine is **not started**. Each such item exits **61**; nothing was changed. One item is started without the pipe: its exit code is the whole answer |
+| the elevated run exits 0 | every item succeeded (0 means no failure), with or without `result:` lines |
+| the elevated run exits non-zero and an item has no `result:` line | that item exits **63**: its outcome is not known. It does not inherit another item's code |
+| the first (unelevated) call exits 0 without the JSON document | **63** for the items it should have answered; nothing is reported as installed or removed |
 
 **Waits are bounded.** 10 minutes for `list`, `show` and `outdated`, 2 hours for the verbs that
 install; `--timeout` changes either. When the bound passes the CLI exits 62. A listing call is
@@ -747,9 +809,9 @@ the exit code is the first failure in the order given. The CLI adds:
 | 42 | also: `update` of an item that is not installed |
 | 50 | also: the consent prompt was declined |
 | 60 | no engine: `dxr-get` is not installed, or the platform has none |
-| 61 | the engine could not be started |
+| 61 | the engine could not be started; also: several items needed elevation and the log pipe could not be created, so nothing was started |
 | 62 | the engine was still running when the wait ended |
-| 63 | the engine exited 0 without the JSON document the verb needs |
+| 63 | the engine exited 0 without the JSON document the verb needs (every verb, `install` and `uninstall` included), or an elevated run failed without reporting a result for the item |
 | 64 | cannot be done from the CLI: installing or updating the runtime itself, or `--allow-runtime` |
 | 65 | `dxr-get.exe` is not validly signed, so it was not started elevated |
 
@@ -766,7 +828,7 @@ embedded unchanged under `calls[].output`; the CLI renames nothing in them.
    "message":"needs an elevated process", "elevated":false,
    "output":{"exit":50,"items":[{"id":"leia-sr","exit":50,"result":"needs_elevation","plan":{…}},
                                 {"id":"open-conv","exit":50,"result":"needs_elevation","plan":{…}}]}},
-  {"args":["install","leia-sr","open-conv","--no-runtime","--log","C:\\Users\\…\\dxr-get-….log"],
+  {"args":["install","leia-sr","open-conv","--no-runtime","--log-pipe","3f9c…32 hex digits"],
    "exit":0, "message":"done", "elevated":true, "output":null,
    "log":"…\nresult: leia-sr: 0 installed\n…\nresult: open-conv: 0 installed\n"}],
  "items":[
@@ -782,7 +844,7 @@ embedded unchanged under `calls[].output`; the CLI renames nothing in them.
 | `schema` | the version of this envelope: `1` |
 | `verb`, `exit`, `message` | the verb, the process exit code, and its one-line meaning |
 | `engine` | the engine's path, or null when there is none (then `calls` is empty and `exit` is 60) |
-| `calls[]` | every engine invocation that is part of the answer, in order: `args`, `exit`, `message`, `elevated`, and `output`, the engine's stdout document as it printed it (null when it printed none, and always null for an elevated call). An elevated call also has `log`: the engine's messages from its `--log` file, or null |
+| `calls[]` | every engine invocation that is part of the answer, in order: `args`, `exit`, `message`, `elevated`, and `output`, the engine's stdout document as it printed it (null when it printed none, and always null for an elevated call). An elevated call also has `log`: the engine's messages from its `--log-pipe` channel, or null |
 | `licences` | `list`, `outdated`, `show`: the licence object of each **installed** plug-in item, keyed by catalog id. It is the `licence` object of `<class> list --json` (ADR-054 Amendment 2). An item that is not installed, not a plug-in, or not registered on this machine has no key |
 | `item` | `show`: the engine's row for that item, or null |
 | `items[]` | `install`, `uninstall`, `update`: one outcome per item: `id` (null for `--default`), `action` (`install`, `uninstall`, or `none` when no engine call was made for it), `exit`, `message`, `elevated`, `changed` (the ids the engine installed or removed) and `expect` (what to expect, per changed item of a class the runtime loads). The `none` entries come first, then the items the engine was asked for, in the order given |
@@ -794,7 +856,7 @@ the engine's single-item document; with several, its `{"exit","items":[…]}` do
 (§ Several items).
 
 The code is `src/xrt/targets/cli/cli_catalog.c` (every decision, no operating-system calls),
-`cli_catalog_os.c` (finding and running the engine, the signature check, the log file) and
+`cli_catalog_os.c` (finding and running the engine, the signature check, the log pipe) and
 `cli_cmd_catalog.c` (the licence join). `tests/tests_cli_catalog.cpp` drives it against a fake
 engine on every platform.
 

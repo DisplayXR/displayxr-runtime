@@ -60,9 +60,11 @@ enum cli_catalog_exit
 	CLI_CATALOG_EXIT_NOT_INSTALLED = 42,   //!< engine; also `update` of an item that is not installed
 	CLI_CATALOG_EXIT_NEEDS_ELEVATION = 50, //!< engine; also "the elevation prompt was declined"
 	CLI_CATALOG_EXIT_NO_ENGINE = 60,       //!< dxr-get is not installed, or this platform has no engine yet
-	CLI_CATALOG_EXIT_SPAWN = 61,           //!< dxr-get could not be started
-	CLI_CATALOG_EXIT_TIMEOUT = 62,         //!< dxr-get was still running when the bounded wait ended
-	CLI_CATALOG_EXIT_BAD_OUTPUT = 63,      //!< dxr-get's output was not the JSON document the verb promises
+	//! dxr-get could not be started; also: several items were not started elevated, for want of a log channel
+	CLI_CATALOG_EXIT_SPAWN = 61,
+	CLI_CATALOG_EXIT_TIMEOUT = 62, //!< dxr-get was still running when the bounded wait ended
+	//! dxr-get's output was not the JSON document the verb promises, or it reported no result for an item
+	CLI_CATALOG_EXIT_BAD_OUTPUT = 63,
 	//! Refused here: replacing the runtime, whose directory the engine itself runs from.
 	CLI_CATALOG_EXIT_NOT_FROM_HERE = 64,
 	//! dxr-get.exe is not validly signed, so it was not started elevated (`--allow-unsigned-engine`).
@@ -133,14 +135,23 @@ struct cli_catalog_ops
 	bool (*signer)(void *ud, const char *path, char *signer, size_t cap);
 
 	/*!
-	 * Create an empty file only this user (and administrators) can open, in
-	 * the user's temporary directory, for the elevated engine's `--log`.
-	 * Its path goes to @p path. May be NULL: then nothing is relayed.
+	 * Open the channel the elevated engine reports through (`--log-pipe`): a
+	 * named pipe this process creates and reads, under a random token of 32
+	 * hex digits that goes to @p token (at least 33 bytes). The engine is
+	 * given the token, never a path, and writes to no file. May be NULL, or
+	 * fail: a single item is then started without it (its exit code is the
+	 * answer), several items are not started elevated at all.
 	 */
-	bool (*log_create)(void *ud, char *path, size_t cap);
+	bool (*log_open)(void *ud, char *token, size_t cap);
 
-	//! Read that file (the caller `free()`s the text; NULL when empty) and delete it.
-	char *(*log_take)(void *ud, const char *path);
+	//! What the engine sent (the caller `free()`s the text; NULL when nothing), and close the channel.
+	char *(*log_take)(void *ud, const char *token);
+
+	/*!
+	 * @p path as an absolute path, in @p out. For `--catalog <file>`: the
+	 * elevated engine does not start in this process's directory. May be NULL.
+	 */
+	bool (*absolute_path)(void *ud, const char *path, char *out, size_t cap);
 
 	/*!
 	 * The licence state of the installed component @p registered_id of catalog
@@ -207,7 +218,7 @@ cli_catalog_timeout_ms(const struct cli_catalog_request *req, bool changes_machi
 /*!
  * The engine arguments of one `install` / `uninstall` call, in @p args
  * (at most @p cap, NULL-terminated when room): @p n_ids items, or none for
- * `install --default`. @p log_path: `--log <file>`. Returns the count.
+ * `install --default`. @p log_token: `--log-pipe <token>`. Returns the count.
  */
 int
 cli_catalog_engine_args(const struct cli_catalog_request *req,
@@ -216,7 +227,7 @@ cli_catalog_engine_args(const struct cli_catalog_request *req,
                         int n_ids,
                         bool no_runtime,
                         bool json,
-                        const char *log_path,
+                        const char *log_token,
                         const char **args,
                         int cap);
 
@@ -297,10 +308,22 @@ bool
 cli_catalog_os_signer(void *ud, const char *path, char *signer, size_t cap);
 
 bool
-cli_catalog_os_log_create(void *ud, char *path, size_t cap);
+cli_catalog_os_log_open(void *ud, char *token, size_t cap);
 
 char *
-cli_catalog_os_log_take(void *ud, const char *path);
+cli_catalog_os_log_take(void *ud, const char *token);
+
+bool
+cli_catalog_os_absolute_path(void *ud, const char *path, char *out, size_t cap);
+
+/*!
+ * This process's arguments as UTF-8 (Windows: read from the UTF-16 command
+ * line, because the C runtime's `argv` is in the ANSI code page). NULL when
+ * @p argc is not the count it finds, or on macOS and Linux: the caller then
+ * uses its own `argv`. The array lives to the end of the process.
+ */
+const char **
+cli_catalog_os_utf8_args(int argc);
 
 #ifdef __cplusplus
 }

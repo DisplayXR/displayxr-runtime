@@ -80,15 +80,19 @@ cli_cmd_catalog(int argc, const char **argv)
 	    .run_elevated = cli_catalog_os_run_elevated,
 	    .is_interactive = cli_catalog_os_is_interactive,
 	    .signer = cli_catalog_os_signer,
-	    .log_create = cli_catalog_os_log_create,
+	    .log_open = cli_catalog_os_log_open,
 	    .log_take = cli_catalog_os_log_take,
+	    .absolute_path = cli_catalog_os_absolute_path,
 	    .licence = catalog_licence,
 	    .out = stdout,
 	    .err = stderr,
 	};
 	if (argc < 3) {
 		cli_catalog_print_usage(stderr);
-		return 1;
+		return CLI_CATALOG_EXIT_USAGE;
 	}
-	return cli_catalog_main(&ops, argc, argv);
+	// Windows: the arguments as UTF-8, from the UTF-16 command line. `argv` there
+	// is in the ANSI code page, and the engine is handed UTF-8.
+	const char **utf8 = cli_catalog_os_utf8_args(argc);
+	return cli_catalog_main(&ops, argc, utf8 != NULL ? utf8 : argv);
 }

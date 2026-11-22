@@ -21,7 +21,8 @@ nothing else.
 
     make_test_catalog.py build --no-sign --v1 FILE --out DIR
         The document alone (no `cryptography` needed), for a dxr-get run with
-        DXR_GET_DEV=1 --no-verify-catalog, or to read what the fixture holds.
+        DXR_GET_DEV=1 --no-verify-catalog (a test-root-key build of dxr-get only:
+        every other build refuses the option), or to read what the fixture holds.
 
 Why --v1. The fixture's installable assets are the REAL first-party
 installers (runtime, Leia plug-in, browser), taken with their sizes, hashes

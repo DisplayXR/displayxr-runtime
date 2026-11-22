@@ -26,7 +26,7 @@
 #define CHANGE_TIMEOUT_MS (2u * 60u * 60u * 1000u)
 
 #define MAX_ENGINE_ARGS (10 + CLI_CATALOG_MAX_IDS)
-//! The most of an engine log this CLI relays.
+//! The most lines of an engine log this CLI shows a person. Every line is still read for results.
 #define MAX_LOG_LINES 400
 
 /*
@@ -254,6 +254,14 @@ cli_catalog_parse(int argc, const char **argv, struct cli_catalog_request *out, 
 	if (out->verb == CLI_CATALOG_VERB_NONE) {
 		return fail(err, err_cap, "unknown verb '%s'", argv[2]);
 	}
+	// Nothing with a control character goes to the engine: it refuses it too.
+	for (int i = 3; i < argc; i++) {
+		for (const unsigned char *p = (const unsigned char *)argv[i]; *p != '\0'; p++) {
+			if (*p < 0x20 || *p == 0x7F) {
+				return fail(err, err_cap, "%s", "an argument holds a control character");
+			}
+		}
+	}
 	for (int i = 3; i < argc; i++) {
 		const char *a = argv[i];
 		if (strcmp(a, "--json") == 0) {
@@ -363,7 +371,7 @@ cli_catalog_engine_args(const struct cli_catalog_request *req,
                         int n_ids,
                         bool no_runtime,
                         bool json,
-                        const char *log_path,
+                        const char *log_token,
                         const char **args,
                         int cap)
 {
@@ -393,9 +401,9 @@ cli_catalog_engine_args(const struct cli_catalog_request *req,
 	if (json) {
 		ADD("--json");
 	}
-	if (log_path != NULL) {
-		ADD("--log");
-		ADD(log_path);
+	if (log_token != NULL) {
+		ADD("--log-pipe");
+		ADD(log_token);
 	}
 	if (n < cap) {
 		args[n] = NULL;
@@ -476,8 +484,34 @@ struct ctx
 	cJSON *items;    //!< the outcome per item, for the verbs that change the machine
 	cJSON *receipts; //!< `list --installed --json`, read once; NULL until asked
 	bool receipts_read;
-	int exit_code; //!< the first failure
+	int exit_code;      //!< the first failure
+	char catalog[2048]; //!< `--catalog <file>` made absolute; empty: as given
 };
+
+static bool
+is_url(const char *s)
+{
+	static const char *const schemes[] = {"https://", "http://"};
+	for (size_t i = 0; i < ARRAY_SIZE(schemes); i++) {
+		const size_t n = strlen(schemes[i]);
+		bool same = strlen(s) >= n;
+		for (size_t k = 0; same && k < n; k++) {
+			const char ch = s[k] >= 'A' && s[k] <= 'Z' ? (char)(s[k] - 'A' + 'a') : s[k];
+			same = ch == schemes[i][k];
+		}
+		if (same) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! `--catalog` as the engine gets it: a file path made absolute once, a URL as written.
+static const char *
+catalog_arg(const struct ctx *c)
+{
+	return c->catalog[0] != '\0' ? c->catalog : c->req->catalog;
+}
 
 static const char *
 jstr(const cJSON *o, const char *k)
@@ -793,11 +827,11 @@ print_item(struct ctx *c, const cJSON *x, const char *lic_cell)
 }
 
 static void
-add_catalog_arg(const struct cli_catalog_request *req, const char **args, int *n)
+add_catalog_arg(const struct ctx *c, const char **args, int *n)
 {
-	if (req->catalog != NULL) {
+	if (catalog_arg(c) != NULL) {
 		args[(*n)++] = "--catalog";
-		args[(*n)++] = req->catalog;
+		args[(*n)++] = catalog_arg(c);
 	}
 }
 
@@ -812,7 +846,7 @@ engine_rows(struct ctx *c, const char *engine_verb, bool installed, const char *
 	const char *args[MAX_ENGINE_ARGS];
 	int n = 0;
 	if (!installed) { // the receipts need no catalog
-		add_catalog_arg(c->req, args, &n);
+		add_catalog_arg(c, args, &n);
 	}
 	args[n++] = engine_verb;
 	if (installed) {
@@ -991,6 +1025,7 @@ struct change
 	const char *id;   //!< NULL: `install --default`
 	int code;         //!< its exit code so far
 	bool elevated;    //!< the elevated engine run handled it
+	bool reported;    //!< the elevated run's log held a `result:` line for it
 	const cJSON *doc; //!< install: its plan. uninstall: its result object. Owned by a `calls` record
 	char cls[64];     //!< uninstall: the class its receipt recorded, read before the item is removed
 	char msg[600];    //!< a message decided on the way; empty: the default for `code`
@@ -1043,7 +1078,8 @@ engine_trusted(struct ctx *c, char *why, size_t cap)
 /*!
  * The elevated engine's log: relay its text to the person (not with
  * `--json`, where it is the call record's `log`), and take each item's exit
- * code from its `result:` line.
+ * code from its `result:` line. Every line is read, however long the log:
+ * only what is shown to a person is bounded.
  */
 static void
 read_engine_log(struct ctx *c, const char *text, struct change *need[], int n_need)
@@ -1051,8 +1087,8 @@ read_engine_log(struct ctx *c, const char *text, struct change *need[], int n_ne
 	if (text == NULL) {
 		return;
 	}
-	int lines = 0;
-	for (const char *p = text; *p != '\0' && lines < MAX_LOG_LINES; lines++) {
+	int shown = 0;
+	for (const char *p = text; *p != '\0';) {
 		const char *nl = strchr(p, '\n');
 		size_t len = nl != NULL ? (size_t)(nl - p) : strlen(p);
 		char line[1024];
@@ -1068,10 +1104,16 @@ read_engine_log(struct ctx *c, const char *text, struct change *need[], int n_ne
 			for (int i = 0; i < n_need; i++) {
 				if (need[i]->id != NULL && strcmp(need[i]->id, id) == 0) {
 					need[i]->code = code;
+					need[i]->reported = true;
 				}
 			}
 		} else if (!c->req->json && line[0] != '\0') {
-			fprintf(c->ops->err, "  dxr-get: %s\n", line);
+			if (shown < MAX_LOG_LINES) {
+				fprintf(c->ops->err, "  dxr-get: %s\n", line);
+			} else if (shown == MAX_LOG_LINES) {
+				fprintf(c->ops->err, "  dxr-get: (more lines not shown)\n");
+			}
+			shown++;
 		}
 		p += len + (nl != NULL ? 1 : 0);
 	}
@@ -1179,7 +1221,10 @@ change_items(struct ctx *c, const char *engine_verb, const char *const *ids, int
 	// means an elevated run is all that is missing -- and an already elevated
 	// terminal simply does the work here.
 	const char *args[MAX_ENGINE_ARGS];
-	int na = cli_catalog_engine_args(req, engine_verb, ids, n_ids, no_runtime, true, NULL, args, MAX_ENGINE_ARGS);
+	struct cli_catalog_request for_engine = *req;
+	for_engine.catalog = catalog_arg(c); // a file path, made absolute: the elevated run starts elsewhere
+	int na = cli_catalog_engine_args(&for_engine, engine_verb, ids, n_ids, no_runtime, true, NULL, args,
+	                                 MAX_ENGINE_ARGS);
 	const cJSON *answer = NULL;
 	const int overall = call_engine(c, args, na, true, false, NULL, &answer, NULL);
 
@@ -1189,6 +1234,15 @@ change_items(struct ctx *c, const char *engine_verb, const char *const *ids, int
 		struct change *x = &ch[i];
 		const char *label = change_label(x);
 		x->doc = item_answer(answer, n, i, install, overall, &x->code);
+		if (x->code == 0 && x->doc == NULL) {
+			// Exit 0 without the document that says what was done: not a success
+			// this CLI can vouch for (dxr-get.md: exit 63).
+			x->code = CLI_CATALOG_EXIT_BAD_OUTPUT;
+			(void)snprintf(x->msg, sizeof(x->msg),
+			               "%s: %s: it exited 0 without saying what it did. Check with "
+			               "'displayxr-cli catalog list'",
+			               label, cli_catalog_exit_message(x->code));
+		}
 		if (install) {
 			const cJSON *a;
 			cJSON_ArrayForEach(a, cJSON_GetObjectItemCaseSensitive(x->doc, "actions"))
@@ -1234,6 +1288,8 @@ change_items(struct ctx *c, const char *engine_verb, const char *const *ids, int
 	}
 
 	char why[400];
+	char token[64] = {0}; // the log channel's token; empty: no channel
+	bool start = false;   // an elevated run is to be made
 	if (n_need > 0 && !may_elevate(c)) {
 		for (int i = 0; i < n_need; i++) {
 			(void)snprintf(need[i]->msg, sizeof(need[i]->msg),
@@ -1252,6 +1308,29 @@ change_items(struct ctx *c, const char *engine_verb, const char *const *ids, int
 			               change_label(need[i]), why);
 		}
 	} else if (n_need > 0) {
+		// What the elevated engine says comes back through a pipe this process
+		// creates and the engine connects to by token: an elevated child's
+		// output cannot be read, and the engine is handed no path to write to.
+		const bool have_log = c->ops->log_open != NULL && c->ops->log_take != NULL &&
+		                      c->ops->log_open(c->ops->ud, token, sizeof(token));
+		if (!have_log) {
+			token[0] = '\0';
+		}
+		start = have_log || n_need == 1; // one item: its exit code is the whole answer
+		if (!start) {
+			// The engine's exit code is only the FIRST failure. Without the
+			// channel, the outcome of each item could only be guessed.
+			for (int i = 0; i < n_need; i++) {
+				need[i]->code = CLI_CATALOG_EXIT_SPAWN;
+				(void)snprintf(need[i]->msg, sizeof(need[i]->msg),
+				               "%s: not started elevated: the channel dxr-get reports each item's "
+				               "result through could not be opened. Nothing was changed. Run the items "
+				               "one at a time, or from an elevated terminal",
+				               change_label(need[i]));
+			}
+		}
+	}
+	if (start) {
 		if (!req->json) {
 			fprintf(
 			    err,
@@ -1260,11 +1339,6 @@ change_items(struct ctx *c, const char *engine_verb, const char *const *ids, int
 			    n_need, n_need == 1 ? "" : "s");
 			(void)fflush(err);
 		}
-		// The engine's messages come back through a file only this user can
-		// open: nothing else can be read from an elevated child.
-		char log_path[1024] = {0};
-		const bool have_log =
-		    c->ops->log_create != NULL && c->ops->log_create(c->ops->ud, log_path, sizeof(log_path));
 		const char *need_ids[CLI_CATALOG_MAX_IDS];
 		int n_need_ids = 0;
 		for (int i = 0; i < n_need; i++) {
@@ -1273,12 +1347,12 @@ change_items(struct ctx *c, const char *engine_verb, const char *const *ids, int
 			}
 		}
 		// The same command for those items, without --json.
-		na = cli_catalog_engine_args(req, engine_verb, need_ids, n_need_ids, no_runtime, false,
-		                             have_log ? log_path : NULL, args, MAX_ENGINE_ARGS);
+		na = cli_catalog_engine_args(&for_engine, engine_verb, need_ids, n_need_ids, no_runtime, false,
+		                             token[0] != '\0' ? token : NULL, args, MAX_ENGINE_ARGS);
 		enum cli_catalog_run_status st = CLI_CATALOG_RUN_OK;
 		cJSON *rec = NULL;
 		const int code = call_engine(c, args, na, true, true, &st, NULL, &rec);
-		char *text = have_log && c->ops->log_take != NULL ? c->ops->log_take(c->ops->ud, log_path) : NULL;
+		char *text = token[0] != '\0' ? c->ops->log_take(c->ops->ud, token) : NULL;
 		if (text != NULL) {
 			cJSON_AddStringToObject(rec, "log", text);
 		} else {
@@ -1302,9 +1376,24 @@ change_items(struct ctx *c, const char *engine_verb, const char *const *ids, int
 			}
 		}
 		// Several items: the exit code is the first failure, and each item's
-		// own code is in the log.
+		// own code is its `result:` line in the log.
 		read_engine_log(c, st == CLI_CATALOG_RUN_OK ? text : NULL, need, n_need);
 		free(text);
+		for (int i = 0; st == CLI_CATALOG_RUN_OK && n_need > 1 && code != 0 && i < n_need; i++) {
+			struct change *x = need[i];
+			if (x->reported) {
+				continue;
+			}
+			// The run failed somewhere and said nothing about this item (exit 0
+			// would have meant every item succeeded). Its outcome is not known,
+			// and is not made up from another item's code.
+			x->code = CLI_CATALOG_EXIT_BAD_OUTPUT;
+			(void)snprintf(x->msg, sizeof(x->msg),
+			               "%s: dxr-get ended with %d (%s) and reported no result for this item. It may "
+			               "or may not have been %s: check with 'displayxr-cli catalog list'",
+			               change_label(x), code, cli_catalog_exit_message(code),
+			               install ? "installed" : "removed");
+		}
 	}
 
 	// The receipts this run read earlier do not know what was just installed.
@@ -1417,6 +1506,11 @@ do_update(struct ctx *c)
 				          "a newer version exists, but the catalog has no build to install here");
 			} else if (n < CLI_CATALOG_MAX_IDS) {
 				ids[n++] = id;
+			} else {
+				// One engine call takes this many items. Said, not dropped.
+				note_item(c, id, 0,
+				          "not updated in this run: one run updates at most 32 items. Run "
+				          "'displayxr-cli catalog update --all' again for the rest");
 			}
 		}
 		if (seen == 0 && !req->json) {
@@ -1481,6 +1575,12 @@ cli_catalog_execute(const struct cli_catalog_ops *ops, const struct cli_catalog_
 	                     req->verb == CLI_CATALOG_VERB_UPDATE;
 	if (changes) {
 		c.items = cJSON_CreateArray();
+	}
+	// A catalog FILE is named absolutely from here on: the elevated engine does
+	// not start in this process's directory. A URL is passed as written.
+	if (req->catalog != NULL && !is_url(req->catalog) && ops->absolute_path != NULL &&
+	    !ops->absolute_path(ops->ud, req->catalog, c.catalog, sizeof(c.catalog))) {
+		c.catalog[0] = '\0';
 	}
 
 	if (ops->engine == NULL) {

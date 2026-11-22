@@ -34,6 +34,14 @@
 #include <string>
 #include <vector>
 
+// The writer side of the engine's log channel (pulls in <windows.h> on Windows).
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+#include "get_log_channel.h"
+
 #ifdef _WIN32
 #include <process.h>
 #define test_pid() _getpid()
@@ -125,7 +133,9 @@ struct Host
 	bool self_signed = false; //!< a development CLI
 	std::string engine_cn = "Leia, Inc."; //!< a first-party signer (get_signers.h)
 	int signer_asks = 0;
-	std::vector<std::string> log_paths;
+	std::vector<std::string> log_tokens;
+	bool log_channel = true;     //!< false: the channel cannot be opened
+	bool absolute_paths = false; //!< true: the host resolves `--catalog <file>`, as the CLI does
 	std::vector<std::string> licence_asks;
 
 	static enum cli_catalog_run_status
@@ -163,13 +173,34 @@ struct Host
 	}
 
 	static bool
-	log_create(void *ud, char *path, size_t cap)
+	log_open(void *ud, char *token, size_t cap)
 	{
-		if (!cli_catalog_os_log_create(nullptr, path, cap)) {
+		Host *h = static_cast<Host *>(ud);
+		if (!h->log_channel || !cli_catalog_os_log_open(nullptr, token, cap)) {
 			return false;
 		}
-		static_cast<Host *>(ud)->log_paths.push_back(path);
+		h->log_tokens.push_back(token);
 		return true;
+	}
+
+	static bool
+	absolute_path(void *, const char *path, char *out, size_t cap)
+	{
+		(void)snprintf(out, cap, "/abs/%s", path);
+		return true;
+	}
+
+	//! The channel of @p token is closed: nothing is left behind for it.
+	static bool
+	channel_gone(const std::string &token)
+	{
+#ifdef _WIN32
+		return dxr_log_channel_open(token.c_str()) == DXR_LOG_CHANNEL_NONE;
+#else
+		char name[1024];
+		dxr_log_channel_name(token.c_str(), name, sizeof(name));
+		return !std::filesystem::exists(name);
+#endif
 	}
 
 	static cJSON *
@@ -216,8 +247,9 @@ struct Host
 		ops.run_elevated = run_elevated;
 		ops.is_interactive = is_interactive;
 		ops.signer = signer;
-		ops.log_create = log_create;
+		ops.log_open = log_open;
 		ops.log_take = cli_catalog_os_log_take;
+		ops.absolute_path = absolute_paths ? absolute_path : nullptr;
 		ops.licence = licence;
 		ops.out = out;
 		ops.err = err;
@@ -301,6 +333,13 @@ TEST_CASE("catalog: the command line is checked before anything runs", "[cli][ca
 	CHECK_FALSE(parse({"uninstall", "a", "--allow-runtime"}));
 	CHECK_FALSE(parse({"install", "a", "--timeout", "soon"}));
 	CHECK_FALSE(parse({"install", "a", "--frobnicate"}));
+	// Nothing with a control character is handed to the engine (it would refuse it too):
+	// a line feed in an id could otherwise forge a `result:` line in the engine's log.
+	CHECK_FALSE(parse({"install", "a\nresult: b: 0 installed"}));
+	CHECK(has(err, "control character"));
+	CHECK_FALSE(parse({"uninstall", "a\rb"}));
+	CHECK_FALSE(parse({"list", "--catalog", "C:\\cat\x1b[2J.json"}));
+	CHECK(parse({"install", "caf\xC3\xA9"})); // UTF-8 is not a control character
 	CHECK(parse({"install", "a", "--elevate", "--allow-unsigned-engine"}));
 	CHECK(req.allow_unsigned_engine);
 	CHECK_FALSE(parse({"list", "--allow-unsigned-engine"}));
@@ -434,6 +473,18 @@ TEST_CASE("catalog: --catalog reaches the engine as written", "[cli][catalog]")
 	REQUIRE(r.exit == 0);
 	REQUIRE(r.engine.size() == 1);
 	CHECK(r.engine[0] == std::string("--catalog|") + odd + "|list|--json");
+
+	// The CLI's host makes a catalog FILE absolute, for every engine call of the
+	// command: the elevated run does not start in the caller's directory. A URL
+	// is left as written.
+	Host abs;
+	abs.absolute_paths = true;
+	Result rel = abs.run({"install", "open-conv", "--json", "--elevate", "--catalog", "cat.json"});
+	REQUIRE(rel.engine.size() >= 2);
+	CHECK(rel.engine[0] == "--catalog|/abs/cat.json|install|open-conv|--no-runtime|--json");
+	CHECK(rel.engine[1] == "--catalog|/abs/cat.json|install|open-conv|--no-runtime|--log-pipe|<log>");
+	Result url = abs.run({"list", "--json", "--catalog", "HTTPS://example.invalid/c.json"});
+	CHECK(url.engine[0] == "--catalog|HTTPS://example.invalid/c.json|list|--json");
 }
 
 TEST_CASE("catalog: offline, unexpected output and a slow engine", "[cli][catalog]")
@@ -455,6 +506,18 @@ TEST_CASE("catalog: offline, unexpected output and a slow engine", "[cli][catalo
 
 	// Bounded: the fake sleeps 5 s, the wait ends after 1 s, and a read-only
 	// call is ended rather than left behind.
+	// install / uninstall: exit 0 without the document is 63 too, never "installed".
+	Result badi = h.run({"install", "open-conv", "--json", "--catalog", "garbage"});
+	CHECK(badi.exit == 63);
+	CHECK(badi.num({"items", "0", "exit"}) == 63);
+	CHECK(cJSON_GetArraySize(badi.at({"items", "0", "changed"})) == 0);
+	CHECK(cJSON_IsNull(badi.at({"calls", "0", "output"})));
+	Result badu = h.run({"uninstall", "leia-sr", "open-conv", "--catalog", "garbage"});
+	CHECK(badu.exit == 63);
+	CHECK(has(badu.err, "exited 0 without saying what it did"));
+	CHECK_FALSE(has(badu.out, "uninstalled"));
+	CHECK(h.elevated_runs == 0);
+
 	Result slow = h.run({"list", "--json", "--catalog", "slow", "--timeout", "1"});
 	CHECK(slow.exit == 62);
 	CHECK(slow.num({"calls", "0", "exit"}) == 62);
@@ -492,16 +555,18 @@ TEST_CASE("catalog install: elevation is asked for only when it is all that is m
 		CHECK(h.elevated_runs == 1);
 		// The last line is this CLI reading the receipts, to say what to expect.
 		CHECK(r.engine == std::vector<std::string>{"install|open-conv|--no-runtime|--json",
-		                                           "install|open-conv|--no-runtime|--log|<log>",
+		                                           "install|open-conv|--no-runtime|--log-pipe|<log>",
 		                                           "list|--installed|--json"});
 		CHECK(cJSON_GetArraySize(r.at({"calls"})) == 2);
 		CHECK(r.num({"calls", "0", "exit"}) == 50);
 		CHECK(cJSON_IsTrue(r.at({"calls", "1", "elevated"})));
 		CHECK(cJSON_IsNull(r.at({"calls", "1", "output"})));
-		// The elevated engine's own words, relayed from its log file, which is gone afterwards.
+		// The elevated engine's own words, relayed through the pipe, which is gone afterwards.
 		CHECK(has(r.str({"calls", "1", "log"}), "open-conv: installed"));
-		REQUIRE(h.log_paths.size() == 1);
-		CHECK_FALSE(std::filesystem::exists(h.log_paths[0]));
+		REQUIRE(h.log_tokens.size() == 1);
+		CHECK(dxr_log_token_ok(h.log_tokens[0].c_str())); // a token, not a path
+		CHECK(r.str({"calls", "1", "args", "4"}) == h.log_tokens[0]);
+		CHECK(Host::channel_gone(h.log_tokens[0]));
 		CHECK(r.num({"items", "0", "exit"}) == 0);
 		CHECK(cJSON_IsTrue(r.at({"items", "0", "elevated"})));
 		CHECK(r.str({"items", "0", "changed", "0"}) == "open-conv");
@@ -537,8 +602,8 @@ TEST_CASE("catalog install: elevation is asked for only when it is all that is m
 		CHECK(h.elevated_runs == 1);
 		CHECK(has(r.str({"items", "0", "message"}), "declined"));
 		CHECK(cJSON_GetArraySize(r.at({"items", "0", "changed"})) == 0);
-		REQUIRE(h.log_paths.size() == 1);
-		CHECK_FALSE(std::filesystem::exists(h.log_paths[0])); // removed even when nothing wrote to it
+		REQUIRE(h.log_tokens.size() == 1);
+		CHECK(Host::channel_gone(h.log_tokens[0])); // closed even when nothing connected to it
 	}
 	SECTION("already elevated: one call does the work")
 	{
@@ -581,7 +646,7 @@ TEST_CASE("catalog: several items are one engine call, and one consent prompt", 
 		REQUIRE(r.engine.size() == 3);
 		CHECK(r.engine[0] == "install|open-conv|browser|incompat|nofetch|leia-sr|--no-runtime|--json");
 		// Only the two that elevation helps: not the current one, not the refused ones.
-		CHECK(r.engine[1] == "install|open-conv|leia-sr|--no-runtime|--log|<log>");
+		CHECK(r.engine[1] == "install|open-conv|leia-sr|--no-runtime|--log-pipe|<log>");
 		CHECK(r.engine[2] == "list|--installed|--json");
 		CHECK(r.exit == 41); // the first failure, in the order given
 		REQUIRE(cJSON_GetArraySize(r.at({"items"})) == 5);
@@ -608,7 +673,7 @@ TEST_CASE("catalog: several items are one engine call, and one consent prompt", 
 		CHECK(h.elevated_runs == 1);
 		CHECK(r.engine == std::vector<std::string>{"list|--installed|--json",
 		                                           "uninstall|leia-sr|browser|open-conv|ghost|--json",
-		                                           "uninstall|leia-sr|open-conv|--log|<log>"});
+		                                           "uninstall|leia-sr|open-conv|--log-pipe|<log>"});
 		CHECK(r.exit == 43);
 		CHECK(has(r.out, "leia-sr: uninstalled"));
 		CHECK(has(r.out, "open-conv: uninstalled"));
@@ -635,6 +700,77 @@ TEST_CASE("catalog: several items are one engine call, and one consent prompt", 
 		CHECK(h.elevated_runs == 0);
 		CHECK(r.engine.size() == 1);
 		CHECK(has(r.str({"items", "1", "message"}), "--elevate"));
+	}
+	SECTION("a long log does not lose an item's result")
+	{
+		// ~600 KB of messages around the result lines: more than the CLI keeps.
+		// The second item's own code must still be its own, not the first failure's.
+		Host h;
+		h.elevated_admin = true;
+		Result r = h.run({"uninstall", "leia-sr", "open-conv", "--json", "--elevate", "--catalog", "flood"});
+		CHECK(h.elevated_runs == 1);
+		CHECK(r.exit == 0);
+		CHECK(r.num({"items", "0", "exit"}) == 0);
+		CHECK(r.num({"items", "1", "exit"}) == 0);
+		const std::string log = r.str({"calls", "1", "log"});
+		CHECK(log.size() < 400u * 1024u); // bounded
+		CHECK(has(log, "only result lines follow"));
+		CHECK(has(log, "result: leia-sr: 0 uninstalled"));
+		CHECK(has(log, "result: open-conv: 0 uninstalled"));
+
+		// And when the run fails for one item only: each keeps its own code.
+		Host f;
+		f.elevated_admin = false; // elevated, both still answer 50
+		Result mixed =
+		    f.run({"uninstall", "leia-sr", "open-conv", "--json", "--elevate", "--catalog", "flood"});
+		CHECK(mixed.num({"items", "0", "exit"}) == 50);
+		CHECK(mixed.num({"items", "1", "exit"}) == 50);
+
+		// For a person the relay is bounded too, and says so.
+		Host p;
+		p.interactive = true;
+		Result shown = p.run({"uninstall", "leia-sr", "open-conv", "--catalog", "flood"});
+		CHECK(shown.exit == 0);
+		CHECK(has(shown.err, "more lines not shown"));
+		CHECK(shown.err.size() < 100u * 1024u);
+	}
+	SECTION("a failed run that reports no result for an item is not guessed at")
+	{
+		Host h;
+		h.elevated_admin = false; // the run fails (50)...
+		Result r = h.run({"install", "open-conv", "leia-sr", "--json", "--elevate", "--catalog", "mute"});
+		CHECK(h.elevated_runs == 1);
+		// ...and says nothing per item: neither inherits the first failure's code.
+		CHECK(r.exit == 63);
+		CHECK(r.num({"items", "0", "exit"}) == 63);
+		CHECK(r.num({"items", "1", "exit"}) == 63);
+		CHECK(has(r.str({"items", "1", "message"}), "reported no result for this item"));
+		CHECK(cJSON_GetArraySize(r.at({"items", "0", "expect"})) == 0);
+
+		// Exit 0 of a several-item run means every item succeeded: no line needed.
+		Host ok;
+		Result fine = ok.run({"install", "open-conv", "leia-sr", "--json", "--elevate", "--catalog", "mute"});
+		CHECK(fine.exit == 0);
+		CHECK(fine.num({"items", "1", "exit"}) == 0);
+	}
+	SECTION("no log channel: several items are not started elevated; one item is")
+	{
+		Host h;
+		h.log_channel = false;
+		Result r = h.run({"install", "open-conv", "leia-sr", "--json", "--elevate"});
+		CHECK(h.elevated_runs == 0);
+		CHECK(r.engine.size() == 1);
+		CHECK(r.exit == 61);
+		CHECK(r.num({"items", "0", "exit"}) == 61);
+		CHECK(r.num({"items", "1", "exit"}) == 61);
+		CHECK(has(r.str({"items", "0", "message"}), "Nothing was changed"));
+
+		// One item: its exit code is the whole answer, so it runs, without --log-pipe.
+		Result one = h.run({"install", "open-conv", "--json", "--elevate"});
+		CHECK(h.elevated_runs == 1);
+		CHECK(one.exit == 0);
+		CHECK(one.engine[1] == "install|open-conv|--no-runtime");
+		CHECK(cJSON_IsNull(one.at({"calls", "1", "log"})));
 	}
 	SECTION("the result line of an engine log")
 	{
@@ -815,7 +951,7 @@ TEST_CASE("catalog uninstall", "[cli][catalog]")
 	CHECK(h.elevated_runs == 1);
 	// The class is read from the receipt BEFORE the item is removed.
 	CHECK(ok.engine == std::vector<std::string>{"list|--installed|--json", "uninstall|leia-sr|--json",
-	                                            "uninstall|leia-sr|--log|<log>"});
+	                                            "uninstall|leia-sr|--log-pipe|<log>"});
 	CHECK(ok.str({"items", "0", "expect", "0", "class"}) == "display_processor");
 	CHECK(has(ok.str({"items", "0", "message"}), "uninstalled"));
 
@@ -861,7 +997,7 @@ TEST_CASE("catalog update is install for what outdated reports", "[cli][catalog]
 		CHECK(r.engine ==
 		      std::vector<std::string>{"--catalog|two|outdated|--json",
 		                               "--catalog|two|install|leia-sr|open-conv|--no-runtime|--json",
-		                               "--catalog|two|install|leia-sr|open-conv|--no-runtime|--log|<log>",
+		                               "--catalog|two|install|leia-sr|open-conv|--no-runtime|--log-pipe|<log>",
 		                               "list|--installed|--json"});
 		CHECK(r.num({"items", "1", "exit"}) == 0);
 		CHECK(r.num({"items", "2", "exit"}) == 0);
@@ -916,3 +1052,188 @@ TEST_CASE("catalog: what to expect after a change, per class", "[cli][catalog]")
 	CHECK(cli_catalog_expectation("sdk") == nullptr);
 	CHECK(cli_catalog_expectation(nullptr) == nullptr);
 }
+
+TEST_CASE("catalog: the log channel keeps every result line, and is a token", "[cli][catalog]")
+{
+	// The reading end, as the CLI opens it: a random token, never the same twice.
+	char a[64], b[64], tiny[8];
+	REQUIRE(cli_catalog_os_log_open(nullptr, a, sizeof(a)));
+	CHECK(dxr_log_token_ok(a));
+	// What a writer sends arrives, through the engine's own writer code.
+	dxr_log_channel_t ch = dxr_log_channel_open(a);
+	REQUIRE(ch != DXR_LOG_CHANNEL_NONE);
+	const std::string msg = "hello\nresult: x: 0 installed\n";
+	CHECK(dxr_log_channel_write(ch, msg.c_str(), msg.size()));
+	dxr_log_channel_close(ch);
+	char *text = cli_catalog_os_log_take(nullptr, a);
+	REQUIRE(text != nullptr);
+	CHECK(std::string(text) == msg);
+	free(text);
+	// Taken: the channel is gone, and its token opens nothing.
+	CHECK(dxr_log_channel_open(a) == DXR_LOG_CHANNEL_NONE);
+	CHECK(cli_catalog_os_log_take(nullptr, a) == nullptr);
+
+	REQUIRE(cli_catalog_os_log_open(nullptr, b, sizeof(b)));
+	CHECK(std::string(a) != std::string(b));
+	CHECK(cli_catalog_os_log_take(nullptr, "not-the-token") == nullptr);
+	CHECK(cli_catalog_os_log_take(nullptr, b) == nullptr); // nothing was sent
+	CHECK_FALSE(cli_catalog_os_log_open(nullptr, tiny, sizeof(tiny)));
+
+	// A writer takes a token only: nothing that could name a file.
+	CHECK_FALSE(dxr_log_token_ok(nullptr));
+	CHECK_FALSE(dxr_log_token_ok(""));
+	CHECK_FALSE(dxr_log_token_ok("C:\\Windows\\win.ini"));
+	CHECK_FALSE(dxr_log_token_ok("../../../../etc/passwd"));
+	CHECK_FALSE(dxr_log_token_ok("0123456789abcdef0123456789abcde"));   // 31
+	CHECK_FALSE(dxr_log_token_ok("0123456789abcdef0123456789abcdef0")); // 33
+	CHECK_FALSE(dxr_log_token_ok("0123456789ABCDEF0123456789abcdef"));  // lower case only
+	CHECK_FALSE(dxr_log_token_ok("0123456789abcdef0123456789abcd/f"));
+	CHECK_FALSE(dxr_log_token_ok("0123456789abcdef0123456789abcd\\f"));
+	CHECK(dxr_log_token_ok("0123456789abcdef0123456789abcdef"));
+	CHECK(dxr_log_channel_open("C:\\Windows\\win.ini") == DXR_LOG_CHANNEL_NONE);
+	CHECK(dxr_log_channel_open("0123456789abcdef0123456789abcdef") == DXR_LOG_CHANNEL_NONE); // nobody listens
+}
+
+#if defined(_WIN32) && defined(REAL_DXR_GET)
+/*
+ * The real engine, where only it can answer. It is run with the rights of
+ * this test, against the registry of this machine and a local file: no
+ * network, and nothing is installed.
+ */
+namespace {
+
+struct Real
+{
+	int exit = -1;
+	std::string out;
+	std::string log; //!< what it sent through the log pipe
+};
+
+Real
+run_real(std::vector<std::string> args, bool with_pipe = true)
+{
+	Real res;
+	char token[64] = {0};
+	if (with_pipe) {
+		REQUIRE(cli_catalog_os_log_open(nullptr, token, sizeof(token)));
+		args.insert(args.begin(), {"--log-pipe", token});
+	}
+	std::vector<const char *> argv;
+	for (const std::string &a : args) {
+		argv.push_back(a.c_str());
+	}
+	struct cli_catalog_run r = {};
+	r.exe = REAL_DXR_GET;
+	r.args = argv.data();
+	r.n_args = static_cast<int>(argv.size());
+	r.timeout_ms = 120000;
+	r.capture_stdout = true;
+	r.kill_on_timeout = true;
+	const enum cli_catalog_run_status st = cli_catalog_os_run(nullptr, &r);
+	REQUIRE(st == CLI_CATALOG_RUN_OK);
+	res.exit = r.exit_code;
+	res.out = r.out != nullptr ? r.out : "";
+	free(r.out);
+	if (with_pipe) {
+		char *text = cli_catalog_os_log_take(nullptr, token);
+		res.log = text != nullptr ? text : "";
+		free(text);
+	}
+	return res;
+}
+
+std::string
+utf8(const std::filesystem::path &p)
+{
+	const auto u = p.u8string();
+	return std::string(u.begin(), u.end());
+}
+
+} // namespace
+
+TEST_CASE("dxr-get: takes no path to log to, and reports through the caller's pipe", "[cli][catalog][engine]")
+{
+	const std::filesystem::path victim =
+	    std::filesystem::temp_directory_path() / ("dxr_get_victim_" + std::to_string(test_pid()) + ".txt");
+	{
+		std::ofstream f(victim, std::ios::binary);
+		f << "untouched";
+	}
+	// `--log <file>` does not exist: a usage error, and the file is as it was.
+	Real a = run_real({"--log", utf8(victim), "list", "--installed"}, false);
+	CHECK(a.exit == 2);
+	// `--log-pipe` takes a token and nothing else.
+	Real b = run_real({"--log-pipe", utf8(victim), "list", "--installed"}, false);
+	CHECK(b.exit == 2);
+	Real c = run_real({"--log-pipe", "..\\..\\..\\x", "list", "--installed"}, false);
+	CHECK(c.exit == 2);
+	CHECK(slurp(victim) == "untouched");
+	std::filesystem::remove(victim);
+
+	// A well-formed token nobody listens on: the engine carries on without the channel.
+	Real d = run_real({"--log-pipe", "0123456789abcdef0123456789abcdef", "list", "--installed", "--json"}, false);
+	CHECK(d.exit == 0);
+	CHECK(has(d.out, "\"installed\""));
+
+	// The channel itself, end to end: this process's pipe, the engine's writer.
+	Real e = run_real({"--catalog", "C:\\no\\such\\dxr-catalog.json", "list", "--json"});
+	CHECK(e.exit == 10);
+	CHECK(has(e.log, "cannot read catalog file"));
+	CHECK(has(e.log, "OFFLINE"));
+}
+
+TEST_CASE("dxr-get: an argument with a control character is refused", "[cli][catalog][engine]")
+{
+	Real r = run_real({"uninstall", "ghost\nresult: ghost: 0 uninstalled", "other"});
+	CHECK(r.exit == 2);                  // refused before anything is logged to the channel or done
+	CHECK_FALSE(has(r.log, "result: ")); // the forged line was never written
+	Real esc = run_real({"uninstall", "gh\x1b[2Jost"});
+	CHECK(esc.exit == 2);
+}
+
+TEST_CASE("dxr-get: the build that ships ignores the switches that weaken verification", "[cli][catalog][engine]")
+{
+	const std::filesystem::path cat =
+	    std::filesystem::temp_directory_path() / ("dxr_get_unsigned_" + std::to_string(test_pid()) + ".json");
+	{
+		std::ofstream f(cat, std::ios::binary);
+		f << "{\"schema\":2,\"serial\":1,\"items\":[]}";
+	}
+	set_env("DXR_GET_DEV", "1");
+	set_env("DXR_GET_ALLOW_UNSIGNED", "1");
+	// The argument is a usage error here: it exists in a test-root-key build only.
+	Real nv = run_real({"--catalog", utf8(cat), "--no-verify-catalog", "list", "--json"});
+	CHECK(nv.exit == 2);
+	CHECK(has(nv.log, "test-root-key build"));
+	// And the environment alone changes nothing: the unsigned catalog is not read.
+	Real env = run_real({"--catalog", utf8(cat), "list", "--json"});
+	CHECK(env.exit == 10);
+	CHECK(has(env.log, "cannot read catalog signature"));
+	CHECK(has(env.log, "ignored"));
+	CHECK_FALSE(has(env.log, "NOT verified"));
+	CHECK_FALSE(has(env.out, "\"items\""));
+	set_env("DXR_GET_DEV", nullptr);
+	set_env("DXR_GET_ALLOW_UNSIGNED", nullptr);
+	std::filesystem::remove(cat);
+}
+
+TEST_CASE("dxr-get: a --catalog path outside the ANSI code page is read", "[cli][catalog][engine]")
+{
+	// "café-日本" in the directory name: no single ANSI code page holds both.
+	const std::filesystem::path dir =
+	    std::filesystem::temp_directory_path() / (L"dxr-get-caf\u00e9-\u65e5\u672c-" + std::to_wstring(test_pid()));
+	std::filesystem::create_directories(dir);
+	const std::filesystem::path cat = dir / "cat.json";
+	{
+		std::ofstream f(cat, std::ios::binary);
+		f << "{}";
+	}
+	Real r = run_real({"--catalog", utf8(cat), "list", "--json"});
+	// The FILE was opened (it then wants the signature beside it, which is absent).
+	CHECK(r.exit == 10);
+	CHECK(has(r.log, "cannot read catalog signature"));
+	CHECK_FALSE(has(r.log, "cannot read catalog file"));
+	CHECK(has(r.log, utf8(dir).c_str())); // and the path came through as UTF-8, unchanged
+	std::filesystem::remove_all(dir);
+}
+#endif
