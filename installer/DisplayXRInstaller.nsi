@@ -821,6 +821,45 @@ Function DxrRestoreServiceOnAbort
 	${EndIf}
 FunctionEnd
 
+; End a process by image name without noise in install.log. taskkill prints
+; `ERROR: The process "x" not found.` for a process that is simply not running
+; (exit 128), which reads as a failure in the log of a healthy install. Here:
+; not running = no line; ended = one line; anything else (access denied,
+; taskkill missing) = one line WITH taskkill's own text, so a real failure is
+; still in the log. $0 / $1 are preserved.
+!macro DXR_KILL_IMAGE_QUIET IMAGE
+	Push $0
+	Push $1
+	nsExec::ExecToStack 'taskkill /f /im ${IMAGE}'
+	Pop $0 ; exit code, or "error" / "timeout"
+	Pop $1 ; taskkill's output
+	${If} $0 == "0"
+		DetailPrint "Stopped ${IMAGE}."
+	${ElseIf} $0 != "128"
+		DetailPrint "Could not stop ${IMAGE} (taskkill exit $0): $1"
+	${EndIf}
+	Pop $1
+	Pop $0
+!macroend
+
+; Remove the scheduled task of pre-v25.0.1 installs, if it is there. Asking
+; first matters: `schtasks /delete` on a task that does not exist prints
+; "ERROR: The system cannot find the file specified." into install.log, right
+; after the uninstaller is written, on every machine that never had the task.
+; The query writes nothing to the log; the delete, when it runs, is logged
+; with its result as before. $0 is preserved.
+!macro DXR_DELETE_LEGACY_TASK
+	Push $0
+	nsExec::Exec 'schtasks /query /tn "DisplayXR Service"'
+	Pop $0 ; 0 = the task exists
+	${If} $0 == "0"
+		DetailPrint "Removing the legacy 'DisplayXR Service' scheduled task..."
+		nsExec::ExecToLog 'schtasks /delete /tn "DisplayXR Service" /f'
+		Pop $0
+	${EndIf}
+	Pop $0
+!macroend
+
 ; Close every DisplayXR-owned process that could hold the runtime DLL.
 ;
 ; Path-scoped on purpose. The DisplayXR Browser's process is named chrome.exe,
@@ -844,11 +883,10 @@ Function CloseRuntimeClients
 	${EndIf}
 	; ADR-053 P2: conversion hosts die with the service's job object
 	; (KILL_ON_JOB_CLOSE); sweep a straggler so its exe can be replaced.
-	nsExec::ExecToLog 'taskkill /f /im displayxr-conversion-host.exe'
-	Pop $0
+	; Usually already gone, so quiet when it is not running.
+	!insertmacro DXR_KILL_IMAGE_QUIET "displayxr-conversion-host.exe"
 	; The viewer-tracking host dies with the service's job object too.
-	nsExec::ExecToLog 'taskkill /f /im displayxr-tracking-host.exe'
-	Pop $0
+	!insertmacro DXR_KILL_IMAGE_QUIET "displayxr-tracking-host.exe"
 
 	; The browser records its own root; a missing key just means not installed,
 	; and the empty entry is filtered out below.
@@ -1568,8 +1606,7 @@ client_dll_ok:
 	; Also remove any legacy scheduled task from older installs.
 	IfFileExists "$INSTDIR\displayxr-service.exe" 0 skip_service_autostart
 		; Remove legacy scheduled task if it exists (from pre-v25.0.1 installs)
-		nsExec::ExecToLog 'schtasks /delete /tn "DisplayXR Service" /f'
-		Pop $0
+		!insertmacro DXR_DELETE_LEGACY_TASK
 
 		; Register in HKLM Run key (starts in user session with GPU/tray access).
 		; This section runs in the 64-bit view (SetRegView 64 at section start).
@@ -1767,8 +1804,9 @@ Section "Uninstall"
 	; -----------------------------------------------------------------
 	DetailPrint "Stopping DisplayXR Service..."
 	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
-	nsExec::ExecToLog 'taskkill /f /im displayxr-conversion-host.exe'
-	nsExec::ExecToLog 'taskkill /f /im displayxr-tracking-host.exe'
+	Pop $0
+	!insertmacro DXR_KILL_IMAGE_QUIET "displayxr-conversion-host.exe"
+	!insertmacro DXR_KILL_IMAGE_QUIET "displayxr-tracking-host.exe"
 	DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "DisplayXR Service"
 	; Also clear the stale 32-bit (WOW6432Node) Run entry left by interim
 	; installers that wrote it before this section moved to SetRegView 64.
@@ -1779,7 +1817,7 @@ Section "Uninstall"
 	SetRegView 32
 	DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "DisplayXR Service"
 	SetRegView 64
-	nsExec::ExecToLog 'schtasks /delete /tn "DisplayXR Service" /f'
+	!insertmacro DXR_DELETE_LEGACY_TASK
 
 	; -----------------------------------------------------------------
 	; Cascade-uninstall registered workspace controllers FIRST.

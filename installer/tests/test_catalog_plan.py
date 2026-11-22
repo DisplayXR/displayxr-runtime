@@ -127,7 +127,9 @@ class ShimTests(unittest.TestCase):
         # Detected hardware and the recommended converter are ticked; nothing else.
         self.assertEqual({k for k, v in it.items() if v["selected"] == "1"}, {"leia-sr", "open-conversion"})
         self.assertEqual(it["leia-sr"]["label"], "30 MB - Leia SR display processor 2.23.0")
-        self.assertEqual(it["open-conversion"]["label"], "Update, 15 MB - Open conversion provider 0.1.0 to 0.1.1")
+        self.assertEqual(it["open-conversion"]["label"], "Update, 15 MB - Open conversion provider 0.1.1")
+        # The version an update replaces is in the description, not in the row.
+        self.assertTrue(it["open-conversion"]["desc"].startswith("Updates the installed 0.1.0. Recommended."))
         self.assertEqual(it["leia-sr"]["size_kb"], "30720")
         self.assertTrue(it["leia-sr"]["desc"].startswith("Matching hardware was detected."))
         self.assertIn("Recommended. Open models.", it["open-conversion"]["desc"])
@@ -137,7 +139,7 @@ class ShimTests(unittest.TestCase):
         lst["items"][1]["download"] = 0          # the asset is in the download cache
         lst["items"][3]["download"] = 4194304 + 20971520   # plus a prerequisite's own installer
         it = self.items(self.run_shim(lst))
-        self.assertEqual(it["leia-sr"]["label"], "Downloaded - Leia SR display processor 2.23.0")
+        self.assertEqual(it["leia-sr"]["label"], "Cached - Leia SR display processor 2.23.0")
         self.assertEqual(it["leia-sr"]["size_kb"], "0")
         self.assertEqual(it["leia-conversion"]["label"], "24 MB - Leia conversion provider 0.1.0")
 
@@ -185,6 +187,42 @@ class ShimTests(unittest.TestCase):
         self.assertEqual(self.items(self.run_shim(lst))["ultraleap"]["desc"],
                          "fixture.runtime-too-new 1.0.0 works with runtime versions up to 1.0.0; this machine would...")
         self.assertTrue(it["leia-conversion"]["desc"].startswith("Also needs, and does not install: NeurD runtime"))
+
+    def test_every_row_fits_the_list(self):
+        # Measured on Windows: a 53-character row fits, a 59-character one is cut
+        # and brings the horizontal scrollbar back. The budget is 50.
+        lst = copy.deepcopy(LIST)
+        by = {i["id"]: i for i in lst["items"]}
+        # The row that overflowed: an update whose installer is already cached.
+        by["leia-sr"].update(name="Leia display plug-in", installed="2.23.0", available="2.23.1",
+                             state="outdated", download=0)
+        # The longest first-party name, cached, with long versions: exactly the budget.
+        by["open-conversion"].update(name="Leia SR display processor", installed="2.23.10", available="2.23.11",
+                                     download=0)
+        by["leia-conversion"].update(name="Leia SR display processor", available="2.23.11", download=1288490189)
+        by["browser"].update(name="Leia SR display processor", installed="2.23.11", available="2.23.11")
+        it = self.items(self.run_shim(lst))
+        self.assertEqual(it["leia-sr"]["label"], "Update, cached - Leia display plug-in 2.23.1")
+        self.assertTrue(it["leia-sr"]["desc"].startswith("Updates the installed 2.23.0."))
+        self.assertEqual(it["open-conversion"]["label"], "Update, cached - Leia SR display processor 2.23.11")
+        self.assertEqual(len(it["open-conversion"]["label"]), 50)
+        self.assertEqual(it["leia-conversion"]["label"], "1.2 GB - Leia SR display processor 2.23.11")
+        self.assertEqual(it["browser"]["label"], "Installed - Leia SR display processor 2.23.11")
+        for v in it.values():
+            self.assertLessEqual(len(v["label"]), 50, v["label"])
+            self.assertNotIn(" to ", v["label"])
+
+        # A name that cannot fit is cut; the status and the version stay whole.
+        for i in lst["items"]:
+            i["name"] = "Fixture: every external prerequisite detector there is, " + i["name"]
+        by["open-conversion"]["available"] = "10.23.11"
+        it = self.items(self.run_shim(lst))
+        for v in it.values():
+            self.assertLessEqual(len(v["label"]), 50, v["label"])
+        self.assertEqual(it["open-conversion"]["label"], "Update, cached - Fixture: every extern... 10.23.11")
+        self.assertEqual(it["ultraleap"]["label"], "Not available - Fixture: every external prerequ...")
+        self.assertTrue(it["browser"]["label"].startswith("Installed - Fixture: every"))
+        self.assertTrue(it["browser"]["label"].endswith("... 2.23.11"))
 
     def test_rows_dropped_first_are_the_not_available_ones(self):
         # More items than slots: ticked, then tickable, then installed are kept.
@@ -255,8 +293,8 @@ class ShimTests(unittest.TestCase):
     def test_installed_with_an_update_is_ticked_without_being_recommended_or_detected(self):
         sh = self.items(self.run_shim(self.shell_listing(installed="2.4.2", state="outdated")))["displayxr-shell"]
         self.assertEqual((sh["status"], sh["selected"], sh["installed"], sh["ro"]), ("outdated", "1", "1", "0"))
-        self.assertEqual(sh["label"], "Update, 8 MB - DisplayXR Shell 2.4.2 to 2.5.0")
-        self.assertEqual(sh["desc"], "Already installed: this updates it. Clear the box to keep the version you have.")
+        self.assertEqual(sh["label"], "Update, 8 MB - DisplayXR Shell 2.5.0")
+        self.assertEqual(sh["desc"], "Updates the installed 2.4.2. Clear the box to keep that version.")
 
     def test_installed_and_current_is_marked_installed_and_downloads_nothing(self):
         sh = self.items(self.run_shim(self.shell_listing(installed="2.5.0", state="current")))["displayxr-shell"]

@@ -26,12 +26,21 @@ the conversion models:
 | Item state | Row | Ticked |
 |---|---|---|
 | not installed | `N MB - <name> <version>` | if **recommended** by the catalog, or if its detection rule **matched this machine with high confidence** |
-| installed, older than the catalog | `Update, N MB - <name> <installed> to <version>` | **always** (already installed ⇒ ticked): the update comes with the runtime. Clearing the box keeps the installed version |
+| installed, older than the catalog | `Update, N MB - <name> <version>` (the version it replaces is in the description) | **always** (already installed ⇒ ticked): the update comes with the runtime. Clearing the box keeps the installed version |
 | installed at the catalog version, or newer | `Installed - <name> <installed>`, greyed | shown ticked, greyed; nothing is downloaded or run |
 | no signed Windows build, a link-out item, or its runtime range excludes the runtime being installed | `Not available - <name>`, greyed, the reason in the description box | never (shown ticked and greyed when an older version of it is installed: it stays installed) |
 
-The status leads the row because the list cuts a long row on the right; `Downloaded` stands in
-for the size when the download cache already holds everything. The page uses the layout with
+The status leads the row because the list cuts a long row on the right; `Cached` (`Update,
+cached`) stands in for the size when the download cache already holds everything.
+
+A row is at most **50 characters**, because a row wider than the list is cut and brings the
+horizontal scrollbar back. The number is measured, not computed: on Windows at 100 % scaling a
+53-character row fits and a 59-character one (`Update, Downloaded - Leia display plug-in
+2.23.0 to 2.23.1`) is cut after its 52nd character. The font is proportional, so the limit is
+about 52 characters of ordinary text, and 50 leaves a little for wider letters. That is why an
+update row names one version and why the cached word is short. The longest first-party row
+is exactly 50 (`Update, cached - Leia SR display processor 2.23.11`); in a longer one the
+**name** is cut and ends in `...`, the status and the version stay whole. The page uses the layout with
 the description under the list (`MUI_COMPONENTSPAGE_SMALLDESC`), which gives the list about
 twice the width and shows about five rows at once instead of nine. That box is two lines of
 about 50 characters, so a description is at most **95** characters with what matters first:
@@ -213,9 +222,10 @@ installer:
    and (on a Leia display) the Leia plug-in ticked, nothing vendor-specific on a plain monitor;
    the size line changing with each tick; the incompatible and ABI-mismatch fixture items
    greyed with `dxr-get`'s reason in the description box; the unmet-prerequisite item naming
-   what is missing; an installed item greyed. Every row's status (`N MB`, `Update, N MB`,
-   `Installed`, `Not available`) readable without the horizontal scrollbar, and most of the
-   name; no description clipped by its box, the longest "not available" reason included.
+   what is missing; an installed item greyed. Every row's status (`N MB`, `Cached`,
+   `Update, N MB`, `Update, cached`, `Installed`, `Not available`) and its version readable
+   with **no horizontal scrollbar on any row**, at 100 %, 125 % and 150 % scaling; run it
+   twice, so the second run shows the cached forms; no description clipped by its box, the longest "not available" reason included.
 2. The same listing by hand, to compare:
    `dxr-get --catalog <file> list --json --assume-runtime <version> --assume-abi display_processor=<n> …`.
 3. With the production `dxr-get` and only schema 1 published (today): rows for the Leia SR
@@ -237,7 +247,8 @@ installer:
    exit 40, as before. Interactive with the same switch: the row is greyed and unticked, and
    the finish page lists the item as not installed.
 7. Upgrade over an existing install with the Leia plug-in present: shown as installed
-   (`Installed - ...`, ticked, greyed), or as an update (`Update, N MB - ...`, ticked); the
+   (`Installed - ...`, ticked, greyed), or as an update (`Update, N MB - <name> <new version>`,
+   ticked, the description starting `Updates the installed <old version>.`); the
    size line counts the update and not the greyed rows; clearing an update's box leaves the
    installed version in place and removes nothing; the description box shows at most two
    lines for every row, with no text cut mid-word;
