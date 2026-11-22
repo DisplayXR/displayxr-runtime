@@ -8,6 +8,7 @@
  */
 
 #include "activation_deliver.h"
+#include "activation_service_delivery.h"
 
 #include "xrt/xrt_config_os.h"
 #include "os/os_time.h"
@@ -35,12 +36,6 @@
 #include <windows.h>
 #endif
 #endif // ACTIVATION_HAVE_IPC
-
-//! How long the service is given to report the component's answer.
-#define SERVICE_ANSWER_TIMEOUT_MS 45000u
-//! How long a BUSY service (another activation in progress) is retried.
-#define SERVICE_BUSY_TIMEOUT_MS 10000u
-#define POLL_STEP_MS 100u
 
 static uint32_t
 class_id_of(const char *cls)
@@ -101,15 +96,83 @@ diag_connect(struct ipc_connection *ipc_c)
 	return ipc_client_connection_init(ipc_c, U_LOGGING_RAW, &ii) == XRT_SUCCESS;
 }
 
-enum service_delivery
+static enum activation_service_status
+status_of(uint32_t ipc_status)
 {
-	SERVICE_NOT_DELIVERED = 0, //!< no service / no live instance / no such path: nothing was called
-	SERVICE_ANSWERED,          //!< the component was asked; the result is final
-	SERVICE_NO_ANSWER,         //!< the token was taken and no answer came in time
-	SERVICE_BUSY,              //!< another activation held the slot for too long; nothing was taken
-};
+	switch (ipc_status) {
+	case IPC_COMPONENT_ACTIVATE_PENDING: return ACTIVATION_SERVICE_STATUS_PENDING;
+	case IPC_COMPONENT_ACTIVATE_DONE: return ACTIVATION_SERVICE_STATUS_DONE;
+	case IPC_COMPONENT_ACTIVATE_NOT_HOSTED: return ACTIVATION_SERVICE_STATUS_NOT_HOSTED;
+	case IPC_COMPONENT_ACTIVATE_BUSY: return ACTIVATION_SERVICE_STATUS_BUSY;
+	default: return ACTIVATION_SERVICE_STATUS_REFUSED; // NONE / BAD_REQUEST / UNSUPPORTED
+	}
+}
 
-static enum service_delivery
+// The DIAG transport of activation_service_deliver(). Anything but
+// XRT_SUCCESS is a transport failure: the call may or may not have arrived.
+
+static bool
+diag_put(void *ud, uint32_t offset, const char *bytes, uint32_t size, enum activation_service_status *st)
+{
+	struct ipc_component_activate_chunk chunk;
+	memset(&chunk, 0, sizeof(chunk));
+	if (size > IPC_COMPONENT_ACTIVATE_CHUNK_MAX) {
+		return false;
+	}
+	chunk.offset = offset;
+	chunk.size = size;
+	memcpy(chunk.bytes, bytes, size);
+	uint32_t status = IPC_COMPONENT_ACTIVATE_UNSUPPORTED;
+	const xrt_result_t xret = ipc_call_system_component_activate_put((struct ipc_connection *)ud, &chunk, &status);
+	memset(&chunk, 0, sizeof(chunk)); // the token does not linger on this stack
+	*st = status_of(status);
+	return xret == XRT_SUCCESS;
+}
+
+static bool
+diag_commit(void *ud, uint32_t class_id, const char *id, uint32_t token_size, enum activation_service_status *st)
+{
+	struct ipc_component_activate_target target;
+	memset(&target, 0, sizeof(target));
+	target.component_class = class_id;
+	target.token_size = token_size;
+	(void)snprintf(target.id, sizeof(target.id), "%s", id);
+	uint32_t status = IPC_COMPONENT_ACTIVATE_UNSUPPORTED;
+	const xrt_result_t xret =
+	    ipc_call_system_component_activate_commit((struct ipc_connection *)ud, &target, &status);
+	*st = status_of(status);
+	return xret == XRT_SUCCESS;
+}
+
+static bool
+diag_poll(void *ud,
+          enum activation_service_status *st,
+          int *result,
+          struct xrt_component_license_state *state,
+          char *err,
+          size_t err_cap)
+{
+	struct ipc_component_activate_result res;
+	memset(&res, 0, sizeof(res));
+	if (ipc_call_system_component_activate_poll((struct ipc_connection *)ud, &res) != XRT_SUCCESS) {
+		return false;
+	}
+	*st = status_of(res.status);
+	*result = (int)res.result;
+	*state = res.state;
+	res.error[sizeof(res.error) - 1] = '\0';
+	(void)snprintf(err, err_cap, "%s", res.error);
+	return true;
+}
+
+static void
+diag_sleep_ms(void *ud, uint32_t ms)
+{
+	(void)ud;
+	os_nanosleep((int64_t)ms * 1000 * 1000);
+}
+
+static enum activation_service_delivery
 deliver_via_service(uint32_t class_id,
                     const char *id,
                     const char *token,
@@ -121,87 +184,21 @@ deliver_via_service(uint32_t class_id,
 {
 	struct ipc_connection ipc_c;
 	if (!diag_connect(&ipc_c)) {
-		return SERVICE_NOT_DELIVERED;
+		return ACTIVATION_SERVICE_NOT_DELIVERED;
 	}
-	enum service_delivery ret = SERVICE_NOT_DELIVERED;
-
-	// Stage the token in chunks (it does not fit one IPC message). A busy
-	// slot is retried for a while: nothing of ours has been taken yet.
-	uint32_t waited_ms = 0;
-	uint32_t offset = 0;
-	while (offset < token_size) {
-		struct ipc_component_activate_chunk chunk;
-		memset(&chunk, 0, sizeof(chunk));
-		chunk.offset = offset;
-		chunk.size = token_size - offset;
-		if (chunk.size > IPC_COMPONENT_ACTIVATE_CHUNK_MAX) {
-			chunk.size = IPC_COMPONENT_ACTIVATE_CHUNK_MAX;
-		}
-		const uint32_t n = chunk.size;
-		memcpy(chunk.bytes, token + offset, n);
-		uint32_t status = IPC_COMPONENT_ACTIVATE_UNSUPPORTED;
-		const xrt_result_t xret = ipc_call_system_component_activate_put(&ipc_c, &chunk, &status);
-		memset(&chunk, 0, sizeof(chunk)); // the token does not linger on this stack
-		if (xret != XRT_SUCCESS) {
-			break; // the connection dropped: not delivered
-		}
-		if (status == IPC_COMPONENT_ACTIVATE_BUSY && offset == 0) {
-			if (waited_ms >= SERVICE_BUSY_TIMEOUT_MS) {
-				ret = SERVICE_BUSY;
-				break;
-			}
-			os_nanosleep((int64_t)POLL_STEP_MS * 1000 * 1000);
-			waited_ms += POLL_STEP_MS;
-			continue;
-		}
-		if (status != IPC_COMPONENT_ACTIVATE_PENDING) {
-			break; // UNSUPPORTED / BAD_REQUEST / a lost staging: the service discarded it
-		}
-		offset += n;
-	}
-	if (offset < token_size) {
-		ipc_client_connection_fini(&ipc_c);
-		return ret; // NOT_DELIVERED, or BUSY
-	}
-
-	struct ipc_component_activate_target target;
-	memset(&target, 0, sizeof(target));
-	target.component_class = class_id;
-	target.token_size = token_size;
-	(void)snprintf(target.id, sizeof(target.id), "%s", id);
-	uint32_t status = IPC_COMPONENT_ACTIVATE_UNSUPPORTED;
-	if (ipc_call_system_component_activate_commit(&ipc_c, &target, &status) != XRT_SUCCESS ||
-	    status != IPC_COMPONENT_ACTIVATE_PENDING) {
-		// Refused before any delivery started (the service wiped the staging).
-		ipc_client_connection_fini(&ipc_c);
-		return SERVICE_NOT_DELIVERED;
-	}
-
-	// From here the service owns the token: its answer is final, and no answer is "unknown".
-	ret = SERVICE_NO_ANSWER;
-	for (waited_ms = 0; waited_ms < SERVICE_ANSWER_TIMEOUT_MS; waited_ms += POLL_STEP_MS) {
-		struct ipc_component_activate_result res;
-		memset(&res, 0, sizeof(res));
-		if (ipc_call_system_component_activate_poll(&ipc_c, &res) != XRT_SUCCESS) {
-			break; // the service went away mid-delivery
-		}
-		if (res.status == IPC_COMPONENT_ACTIVATE_PENDING) {
-			os_nanosleep((int64_t)POLL_STEP_MS * 1000 * 1000);
-			continue;
-		}
-		if (res.status == IPC_COMPONENT_ACTIVATE_NOT_HOSTED) {
-			ret = SERVICE_NOT_DELIVERED; // no live instance: the service called nothing
-		} else if (res.status == IPC_COMPONENT_ACTIVATE_DONE) {
-			ret = SERVICE_ANSWERED;
-			*out_result = deliver_result_of((enum target_component_activate_result)res.result);
-			*out_state = res.state;
-			xrt_component_license_state_sanitize(out_state);
-			res.error[sizeof(res.error) - 1] = '\0';
-			if (err != NULL && err_cap > 0) {
-				(void)snprintf(err, err_cap, "%s", res.error);
-			}
-		}
-		break;
+	const struct activation_service_transport t = {
+	    .userdata = &ipc_c,
+	    .chunk_max = IPC_COMPONENT_ACTIVATE_CHUNK_MAX,
+	    .put = diag_put,
+	    .commit = diag_commit,
+	    .poll = diag_poll,
+	    .sleep_ms = diag_sleep_ms,
+	};
+	int result = TARGET_COMPONENT_ACTIVATE_NOT_LOADED;
+	const enum activation_service_delivery ret =
+	    activation_service_deliver(&t, class_id, id, token, token_size, &result, out_state, err, err_cap);
+	if (ret == ACTIVATION_SERVICE_ANSWERED) {
+		*out_result = deliver_result_of((enum target_component_activate_result)result);
 	}
 	ipc_client_connection_fini(&ipc_c);
 	return ret;
@@ -250,10 +247,12 @@ activation_deliver_default(void *userdata,
 #ifdef ACTIVATION_HAVE_IPC
 	int svc_result = ACTIVATION_DELIVER_UNKNOWN;
 	switch (deliver_via_service(class_id, id, token, token_size, &svc_result, out_state, err, err_cap)) {
-	case SERVICE_ANSWERED: (void)snprintf(via, via_cap, "service"); return svc_result;
-	case SERVICE_NO_ANSWER: (void)snprintf(via, via_cap, "service"); return ACTIVATION_DELIVER_UNKNOWN;
-	case SERVICE_BUSY: return ACTIVATION_DELIVER_BUSY;
-	default: break; // nothing was delivered: this process delivers
+	case ACTIVATION_SERVICE_ANSWERED: (void)snprintf(via, via_cap, "service"); return svc_result;
+	// The token may have reached the component (no reply to the commit, or no
+	// answer after it): never delivered a second time from here.
+	case ACTIVATION_SERVICE_NO_ANSWER: (void)snprintf(via, via_cap, "service"); return ACTIVATION_DELIVER_UNKNOWN;
+	case ACTIVATION_SERVICE_BUSY: return ACTIVATION_DELIVER_BUSY;
+	default: break; // PROVABLY nothing was called: this process delivers
 	}
 #endif
 

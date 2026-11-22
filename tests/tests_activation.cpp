@@ -15,12 +15,14 @@
  *    licence script): begin -> link -> handler -> the component reads
  *    licensed -> a selection that skipped it now picks it; and that a link
  *    can never choose the component, a nonce is spent by its first use, a
- *    flood is ignored without spending anything, and no token reaches the log;
+ *    flood of failed links silences only failed links (a pending link always
+ *    goes through), and no token reaches the log;
  *  - the service's live-activation slot (chunked staging, one activation at
  *    a time, a departed client, NOT_HOSTED).
  */
 
 #include "activation_handler.h"
+#include "activation_service_delivery.h"
 
 #include "util/u_activation_store.h"
 #include "util/u_activation_url.h"
@@ -534,22 +536,22 @@ TEST_CASE("activation store: bounded pending records, and the failure counter", 
 	      U_ACTIVATION_STORE_OK);
 	CHECK(d.files(".pending").size() == 1u);
 
-	// The failure counter: LIMIT failures inside the window stop the handler; they age out.
-	CHECK_FALSE(u_activation_store_rate_limited(d.str().c_str(), t0));
+	// The failure counter: LIMIT failures inside the window silence further failures; they age out.
+	CHECK_FALSE(u_activation_store_failure_flood(d.str().c_str(), t0));
 	for (int i = 0; i < U_ACTIVATION_FAIL_LIMIT - 1; i++) {
 		u_activation_store_note_failure(d.str().c_str(), t0 + i);
 	}
-	CHECK_FALSE(u_activation_store_rate_limited(d.str().c_str(), t0 + 10));
+	CHECK_FALSE(u_activation_store_failure_flood(d.str().c_str(), t0 + 10));
 	u_activation_store_note_failure(d.str().c_str(), t0 + 10);
-	CHECK(u_activation_store_rate_limited(d.str().c_str(), t0 + 11));
-	CHECK(u_activation_store_rate_limited(d.str().c_str(), t0 + U_ACTIVATION_FAIL_WINDOW_S - 1));
-	CHECK_FALSE(u_activation_store_rate_limited(d.str().c_str(), t0 + U_ACTIVATION_FAIL_WINDOW_S + 11));
+	CHECK(u_activation_store_failure_flood(d.str().c_str(), t0 + 11));
+	CHECK(u_activation_store_failure_flood(d.str().c_str(), t0 + U_ACTIVATION_FAIL_WINDOW_S - 1));
+	CHECK_FALSE(u_activation_store_failure_flood(d.str().c_str(), t0 + U_ACTIVATION_FAIL_WINDOW_S + 11));
 	// A flood does not grow the file without bound.
 	for (int i = 0; i < 200; i++) {
 		u_activation_store_note_failure(d.str().c_str(), t0 + 5000 + i);
 	}
 	CHECK(fs::file_size(d.path / "failures") < 512u);
-	CHECK(u_activation_store_rate_limited(d.str().c_str(), t0 + 5200));
+	CHECK(u_activation_store_failure_flood(d.str().c_str(), t0 + 5200));
 
 	// The log keeps to its fields' character set, whatever it is handed.
 	u_activation_store_log(d.str().c_str(), t0, "abcd1234", "conv", "sim-conversion", "activated");
@@ -768,7 +770,8 @@ TEST_CASE("activation handler: a nonce is spent by its first use, whatever the o
 	CHECK(std::string(activation_outcome_str(h.handle(mk_link(good, SIM_LICENSE_TEST_KEY)).kind)) == "activated");
 }
 
-TEST_CASE("activation handler: hostile links reach nothing, and a flood is ignored quietly", "[activation][handler]")
+TEST_CASE("activation handler: hostile links reach nothing; a flood silences failures and never a pending link",
+          "[activation][handler]")
 {
 	Handler h;
 	const std::string pending = h.begin("conv", "paid-conv");
@@ -786,23 +789,32 @@ TEST_CASE("activation handler: hostile links reach nothing, and a flood is ignor
 		CHECK(out.id[0] == '\0');
 		CHECK(out.nonce_id[0] == '\0');
 	}
-	// A guessed nonce: not pending. That is the fifth failure.
-	CHECK(std::string(activation_outcome_str(h.handle(mk_link(kNonce, "x")).kind)) == "not-pending");
+	// A guessed nonce: not pending. That is the fifth failure, and it is still answered.
+	const activation_outcome fifth = h.handle(mk_link(kNonce, "x"));
+	CHECK(std::string(activation_outcome_str(fifth.kind)) == "not-pending");
+	CHECK_FALSE(fifth.quiet);
 	CHECK(h.world.deliveries == 0);
 
-	// From here the handler does not look at links at all, and asks for no dialog.
+	// From here a FAILED link asks for no dialog. It is still read and reported for what it is.
 	const activation_outcome flood = h.handle(mk_link(kNonce, "x"));
-	CHECK(std::string(activation_outcome_str(flood.kind)) == "rate-limited");
+	CHECK(std::string(activation_outcome_str(flood.kind)) == "not-pending");
+	CHECK(std::string(flood.detail) == "not-found");
 	CHECK(flood.quiet);
-	// Even the valid pending link is ignored while limited, and it is NOT spent by that...
-	const activation_outcome held = h.handle(mk_link(pending, SIM_LICENSE_TEST_KEY));
-	CHECK(std::string(activation_outcome_str(held.kind)) == "rate-limited");
-	CHECK(h.world.deliveries == 0);
-	// ...so once the window has passed (and it is still within its 15 minutes) it works.
-	h.now += U_ACTIVATION_FAIL_WINDOW_S + 1;
+	const activation_outcome junk = h.handle("displayxr://x");
+	CHECK(std::string(activation_outcome_str(junk.kind)) == "invalid-link");
+	CHECK(junk.quiet);
+	CHECK(h.dir.files(".pending").size() == 1u); // none of that touched the pending activation
+
+	// The valid pending link goes through in the middle of the flood, and is shown.
 	const activation_outcome ok = h.handle(mk_link(pending, SIM_LICENSE_TEST_KEY));
 	CHECK(std::string(activation_outcome_str(ok.kind)) == "activated");
+	CHECK_FALSE(ok.quiet);
 	CHECK(h.world.deliveries == 1);
+	CHECK(h.world.selected() == "paid-conv");
+
+	const std::string flog = h.dir.read("activation.log");
+	CHECK(flog.find("outcome=not-found.quiet\n") != std::string::npos);
+	CHECK(flog.find("outcome=activated\n") != std::string::npos);
 
 	// No message ever carries a byte of a link.
 	char title[96];
@@ -813,6 +825,321 @@ TEST_CASE("activation handler: hostile links reach nothing, and a flood is ignor
 	const std::string log = h.dir.read("activation.log");
 	CHECK(log.find("EVIL") == std::string::npos);
 	CHECK(log.find(SIM_LICENSE_TEST_KEY) == std::string::npos);
+}
+
+TEST_CASE("activation handler: junk links cannot mute a real return link, at any volume", "[activation][handler]")
+{
+	// The reviewed defect: any page that opened five junk displayxr:// links
+	// made the user's real return link do nothing, silently, and could hold
+	// that past the nonce's 15 minutes by sending more.
+	Handler h;
+	const std::string pending = h.begin("conv", "paid-conv");
+	for (int i = 0; i < 4 * U_ACTIVATION_FAIL_LIMIT; i++) {
+		const activation_outcome out =
+		    h.handle(i % 2 == 0 ? std::string("displayxr://x") : mk_link(kNonce, "x"));
+		CHECK(out.kind != ACTIVATION_OUTCOME_ACTIVATED);
+		CHECK(out.quiet == (i >= U_ACTIVATION_FAIL_LIMIT)); // dialogs are what is limited
+		h.now += 20;                                        // a sustained flood, re-armed all the way through
+	}
+	CHECK(h.world.deliveries == 0);
+	CHECK(u_activation_store_failure_flood(h.dir.str().c_str(), h.now));
+	const activation_outcome ok = h.handle(mk_link(pending, SIM_LICENSE_TEST_KEY));
+	CHECK(std::string(activation_outcome_str(ok.kind)) == "activated");
+	CHECK_FALSE(ok.quiet);
+	CHECK(h.world.deliveries == 1);
+
+	// A failure that concerned a REAL pending activation is always shown, flood or not, and is not
+	// counted: only someone holding the nonce can cause it.
+	const std::string n1 = h.begin("conv", "paid-conv");
+	const activation_outcome mism = h.handle(mk_link(n1, SIM_LICENSE_TEST_KEY) + "&item=dp%2Fother");
+	CHECK(std::string(activation_outcome_str(mism.kind)) == "item-mismatch");
+	CHECK_FALSE(mism.quiet);
+	const std::string n2 = h.begin("conv", "paid-conv");
+	h.now += U_ACTIVATION_TTL_S + 1;
+	const activation_outcome late = h.handle(mk_link(n2, SIM_LICENSE_TEST_KEY));
+	CHECK(std::string(late.detail) == "expired");
+	CHECK_FALSE(late.quiet);
+	CHECK(h.world.deliveries == 1);
+}
+
+TEST_CASE("activation handler: re-clicking a spent link locks nothing", "[activation][handler]")
+{
+	Handler h;
+	const std::string first = h.begin("conv", "paid-conv");
+	CHECK(std::string(activation_outcome_str(h.handle(mk_link(first, "wrong-key")).kind)) == "refused");
+	// The user clicks the same (now spent) link again and again.
+	for (int i = 0; i < 3 * U_ACTIVATION_FAIL_LIMIT; i++) {
+		const activation_outcome again = h.handle(mk_link(first, "wrong-key"));
+		CHECK(std::string(activation_outcome_str(again.kind)) == "not-pending");
+		CHECK(again.quiet == (i >= U_ACTIVATION_FAIL_LIMIT)); // the box stops repeating; nothing else changes
+	}
+	CHECK(h.world.deliveries == 1);
+	// Starting over from the Dashboard works at once: begin is not limited, and neither is the new link.
+	const std::string second = h.begin("conv", "paid-conv");
+	const activation_outcome ok = h.handle(mk_link(second, SIM_LICENSE_TEST_KEY));
+	CHECK(std::string(activation_outcome_str(ok.kind)) == "activated");
+	CHECK_FALSE(ok.quiet);
+	CHECK(h.world.deliveries == 2);
+}
+
+TEST_CASE("activation store: a prune that removes claim files cannot corrupt a consume", "[activation][store]")
+{
+	// `activate-begin` prunes every claim file it sees. The record is read
+	// before the claim exists, so a prune in the window between a handler's
+	// rename and its delete costs nothing: a good nonce is never reported
+	// corrupt. One thread prunes flat out while another begins and consumes.
+	ScratchDir d;
+	const std::string dir = d.str();
+	const int64_t t0 = 1800000000;
+	char seed[U_ACTIVATION_NONCE_CHARS + 1];
+	REQUIRE(u_activation_store_begin(dir.c_str(), "conv", "a", t0, 900, seed, nullptr) == U_ACTIVATION_STORE_OK);
+
+	std::atomic<bool> stop{false};
+	std::thread pruner([&] {
+		while (!stop.load()) {
+			(void)u_activation_store_prune(dir.c_str(), t0);
+		}
+	});
+	int ok = 0;
+	int other = 0;
+	for (int i = 0; i < 400; i++) {
+		char nonce[U_ACTIVATION_NONCE_CHARS + 1];
+		if (u_activation_store_begin(dir.c_str(), "conv", "a", t0, 900, nonce, nullptr) !=
+		    U_ACTIVATION_STORE_OK) {
+			other++;
+			continue;
+		}
+		struct u_activation_record rec;
+		const enum u_activation_store_result r = u_activation_store_consume(dir.c_str(), nonce, t0, &rec);
+		if (r == U_ACTIVATION_STORE_OK && std::string(rec.id) == "a") {
+			ok++;
+		} else {
+			other++;
+		}
+	}
+	stop.store(true);
+	pruner.join();
+	CHECK(ok == 400);
+	CHECK(other == 0);
+	const auto claims = [&d] {
+		int n = 0;
+		for (const auto &e : fs::directory_iterator(d.path)) {
+			n += e.path().filename().string().find(".claim.") != std::string::npos ? 1 : 0;
+		}
+		return n;
+	};
+	CHECK(claims() == 0);
+
+	// A claim file left by a handler that died is still swept by the next prune.
+	{
+		std::ofstream f(d.path / "0123456789abcdef0123456789abcdef.claim.1.1");
+		f << "v=1\n";
+	}
+	CHECK(claims() == 1);
+	(void)u_activation_store_prune(dir.c_str(), t0);
+	CHECK(claims() == 0);
+}
+
+/*
+ *
+ * The client half of a live delivery, over a scripted transport.
+ *
+ */
+
+namespace {
+
+struct FakeService
+{
+	// Script.
+	int put_fail_at = -1;         //!< the put call (0-based) whose transport fails
+	int busy_puts = 0;            //!< the first N puts at offset 0 answer BUSY
+	bool commit_transport = true; //!< false: the commit's reply never arrives
+	bool commit_takes = true;     //!< does the service start the delivery when the commit arrives
+	activation_service_status commit_status = ACTIVATION_SERVICE_STATUS_PENDING;
+	int poll_fail_at = -1; //!< the poll call (0-based) whose transport fails
+	int pending_polls = 2; //!< PENDING this many times, then `final_status`
+	activation_service_status final_status = ACTIVATION_SERVICE_STATUS_DONE;
+	// Observed.
+	int puts = 0;
+	int commits = 0;
+	int polls = 0;
+	int delivered = 0; //!< how many times the service-side component was called
+	uint32_t slept_ms = 0;
+	std::string staged;
+};
+
+bool
+fake_put(void *ud, uint32_t offset, const char *bytes, uint32_t size, activation_service_status *st)
+{
+	FakeService *f = static_cast<FakeService *>(ud);
+	const int call = f->puts++;
+	if (call == f->put_fail_at) {
+		return false;
+	}
+	if (offset == 0 && f->busy_puts > 0) {
+		f->busy_puts--;
+		*st = ACTIVATION_SERVICE_STATUS_BUSY;
+		return true;
+	}
+	if (offset == 0) {
+		f->staged.clear();
+	}
+	if (offset != f->staged.size()) {
+		*st = ACTIVATION_SERVICE_STATUS_REFUSED;
+		return true;
+	}
+	f->staged.append(bytes, size);
+	*st = ACTIVATION_SERVICE_STATUS_PENDING;
+	return true;
+}
+
+bool
+fake_commit(void *ud, uint32_t class_id, const char *id, uint32_t token_size, activation_service_status *st)
+{
+	(void)class_id;
+	(void)id;
+	FakeService *f = static_cast<FakeService *>(ud);
+	f->commits++;
+	if (f->commit_takes && f->commit_status == ACTIVATION_SERVICE_STATUS_PENDING &&
+	    f->staged.size() == token_size) {
+		f->delivered++; // the service starts the delivery BEFORE it answers
+	}
+	*st = f->commit_status;
+	return f->commit_transport;
+}
+
+bool
+fake_poll(void *ud,
+          activation_service_status *st,
+          int *result,
+          struct xrt_component_license_state *state,
+          char *err,
+          size_t err_cap)
+{
+	FakeService *f = static_cast<FakeService *>(ud);
+	const int call = f->polls++;
+	if (call == f->poll_fail_at) {
+		return false;
+	}
+	if (call < f->pending_polls) {
+		*st = ACTIVATION_SERVICE_STATUS_PENDING;
+		return true;
+	}
+	*st = f->final_status;
+	*result = 0;
+	state->state = XRT_COMPONENT_LICENSE_LICENSED;
+	(void)snprintf(err, err_cap, "%s", "");
+	return true;
+}
+
+void
+fake_sleep(void *ud, uint32_t ms)
+{
+	static_cast<FakeService *>(ud)->slept_ms += ms;
+}
+
+enum activation_service_delivery
+run_fake(FakeService &f, const std::string &token, int *result, struct xrt_component_license_state *state)
+{
+	activation_service_transport t{};
+	t.userdata = &f;
+	t.chunk_max = 768;
+	t.put = fake_put;
+	t.commit = fake_commit;
+	t.poll = fake_poll;
+	t.sleep_ms = fake_sleep;
+	char err[XRT_COMPONENT_ACTIVATION_ERROR_MAX];
+	return activation_service_deliver(&t, 3, "paid-conv", token.c_str(), (uint32_t)token.size(), result, state, err,
+	                                  sizeof(err));
+}
+
+} // namespace
+
+TEST_CASE("live delivery: a commit whose reply is lost is an unknown outcome, never a second delivery",
+          "[activation][service]")
+{
+	const std::string token(2000, 'T'); // three chunks
+	int result = -1;
+	struct xrt_component_license_state st;
+	xrt_component_license_state_init(&st);
+
+	SECTION("the normal path: staged in chunks, committed once, answered")
+	{
+		FakeService f;
+		CHECK(run_fake(f, token, &result, &st) == ACTIVATION_SERVICE_ANSWERED);
+		CHECK(f.puts == 3);
+		CHECK(f.staged == token);
+		CHECK(f.commits == 1);
+		CHECK(f.delivered == 1);
+		CHECK(result == 0);
+		CHECK(st.state == XRT_COMPONENT_LICENSE_LICENSED);
+	}
+	SECTION("the reviewed defect: the service took the commit, its reply never arrived")
+	{
+		FakeService f;
+		f.commit_transport = false;
+		// NOT "not delivered": the caller must not hand the token to the component again.
+		CHECK(run_fake(f, token, &result, &st) == ACTIVATION_SERVICE_NO_ANSWER);
+		CHECK(f.delivered == 1);
+		CHECK(f.polls == 0);
+	}
+	SECTION("a commit lost on the way in is indistinguishable, so it is unknown too")
+	{
+		FakeService f;
+		f.commit_transport = false;
+		f.commit_takes = false;
+		CHECK(run_fake(f, token, &result, &st) == ACTIVATION_SERVICE_NO_ANSWER);
+		CHECK(f.delivered == 0);
+	}
+	SECTION("a commit the service ANSWERED with a refusal delivered nothing: the caller may deliver")
+	{
+		FakeService f;
+		f.commit_status = ACTIVATION_SERVICE_STATUS_REFUSED;
+		CHECK(run_fake(f, token, &result, &st) == ACTIVATION_SERVICE_NOT_DELIVERED);
+		CHECK(f.delivered == 0);
+	}
+	SECTION("a connection that drops while staging delivered nothing: no commit was ever sent")
+	{
+		FakeService f;
+		f.put_fail_at = 1;
+		CHECK(run_fake(f, token, &result, &st) == ACTIVATION_SERVICE_NOT_DELIVERED);
+		CHECK(f.commits == 0);
+		CHECK(f.delivered == 0);
+	}
+	SECTION("the service goes away after taking the token: unknown")
+	{
+		FakeService f;
+		f.poll_fail_at = 1;
+		CHECK(run_fake(f, token, &result, &st) == ACTIVATION_SERVICE_NO_ANSWER);
+		CHECK(f.delivered == 1);
+	}
+	SECTION("no answer inside the bound: unknown")
+	{
+		FakeService f;
+		f.pending_polls = 1 << 30;
+		CHECK(run_fake(f, token, &result, &st) == ACTIVATION_SERVICE_NO_ANSWER);
+		CHECK(f.slept_ms == ACTIVATION_SERVICE_ANSWER_TIMEOUT_MS);
+	}
+	SECTION("no live instance: the service called nothing, the caller delivers")
+	{
+		FakeService f;
+		f.commit_takes = false;
+		f.final_status = ACTIVATION_SERVICE_STATUS_NOT_HOSTED;
+		CHECK(run_fake(f, token, &result, &st) == ACTIVATION_SERVICE_NOT_DELIVERED);
+		CHECK(f.delivered == 0);
+	}
+	SECTION("a busy slot is retried, then given up on with nothing taken")
+	{
+		FakeService f;
+		f.busy_puts = 3;
+		CHECK(run_fake(f, token, &result, &st) == ACTIVATION_SERVICE_ANSWERED);
+		CHECK(f.delivered == 1);
+		FakeService g;
+		g.busy_puts = 1 << 30;
+		CHECK(run_fake(g, token, &result, &st) == ACTIVATION_SERVICE_BUSY);
+		CHECK(g.slept_ms == ACTIVATION_SERVICE_BUSY_TIMEOUT_MS);
+		CHECK(g.commits == 0);
+	}
 }
 
 TEST_CASE("activation handler: a component's own text is shown only when it is text", "[activation][handler]")

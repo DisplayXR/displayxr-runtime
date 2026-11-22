@@ -38,8 +38,10 @@
  *    any other; on POSIX the directory and the file must also be owned by the
  *    caller and closed to group and others;
  *  - bounded: at most @ref U_ACTIVATION_MAX_PENDING records per user;
- *  - failures are counted (@ref u_activation_store_note_failure) so the
- *    handler can stop answering a flood (@ref u_activation_store_rate_limited).
+ *  - links that name no pending activation are counted
+ *    (@ref u_activation_store_note_failure) so the handler can stop raising a
+ *    dialog for each one of a flood (@ref u_activation_store_failure_flood).
+ *    The count never gates @ref u_activation_store_consume.
  *
  * Every function takes the directory, so tests run against a scratch one;
  * the handler passes @ref u_activation_store_default_dir, which is derived
@@ -64,7 +66,7 @@ extern "C" {
 #define U_ACTIVATION_TTL_S 900         //!< a pending activation lives 15 minutes
 #define U_ACTIVATION_MAX_PENDING 16    //!< pending activations per user
 #define U_ACTIVATION_FAIL_WINDOW_S 600 //!< failures are counted over 10 minutes
-#define U_ACTIVATION_FAIL_LIMIT 5      //!< this many failed links in the window stop the handler answering
+#define U_ACTIVATION_FAIL_LIMIT 5      //!< after this many failed links in the window, further ones show no dialog
 #define U_ACTIVATION_NONCE_ID_CHARS 8  //!< the loggable id of a nonce (hex prefix of its hash)
 
 //! Outcome of a store call. Stable names: @ref u_activation_store_result_str.
@@ -119,14 +121,18 @@ u_activation_store_begin(const char *dir,
                          struct u_activation_record *out);
 
 /*!
- * Consume @p nonce: claim its record, delete it, and only then judge it. On
+ * Consume @p nonce: read its record, claim it (an atomic rename: of two
+ * callers exactly one wins), delete it, and only then judge it. The record is
+ * read BEFORE the claim, so a concurrent @ref u_activation_store_prune that
+ * removes the claim file cannot make a good record read as corrupt. On
  * @ref U_ACTIVATION_STORE_OK @p out holds what the activation was begun for.
  * On every other result the record (if there was one) is gone all the same.
  */
 enum u_activation_store_result
 u_activation_store_consume(const char *dir, const char *nonce, int64_t now_unix_s, struct u_activation_record *out);
 
-//! Delete expired records and stale claims; returns how many live records remain, or -1 when @p dir is unusable.
+//! Delete expired records and leftover claim files; returns how many live records remain, or -1 when @p dir is
+//! unusable.
 int
 u_activation_store_prune(const char *dir, int64_t now_unix_s);
 
@@ -134,9 +140,13 @@ u_activation_store_prune(const char *dir, int64_t now_unix_s);
 void
 u_activation_store_note_failure(const char *dir, int64_t now_unix_s);
 
-//! Have @ref U_ACTIVATION_FAIL_LIMIT links failed within @ref U_ACTIVATION_FAIL_WINDOW_S of @p now_unix_s?
+/*!
+ * Have @ref U_ACTIVATION_FAIL_LIMIT links failed within @ref U_ACTIVATION_FAIL_WINDOW_S of @p now_unix_s?
+ * This decides ONLY whether a further failed link raises a dialog. It must never be used to skip
+ * reading a link or consuming a nonce: that would let any page mute a real return link.
+ */
 bool
-u_activation_store_rate_limited(const char *dir, int64_t now_unix_s);
+u_activation_store_failure_flood(const char *dir, int64_t now_unix_s);
 
 /*!
  * Append one line to the store's `activation.log` (truncated past 64 KB):

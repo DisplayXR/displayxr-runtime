@@ -25,7 +25,6 @@ activation_outcome_str(enum activation_outcome_kind k)
 	case ACTIVATION_OUTCOME_INVALID_LINK: return "invalid-link";
 	case ACTIVATION_OUTCOME_NOT_PENDING: return "not-pending";
 	case ACTIVATION_OUTCOME_ITEM_MISMATCH: return "item-mismatch";
-	case ACTIVATION_OUTCOME_RATE_LIMITED: return "rate-limited";
 	default: return "store-error";
 	}
 }
@@ -70,6 +69,24 @@ outcome_of_delivery(int d)
 	}
 }
 
+/*!
+ * A link that named NO pending activation (malformed, or a nonce that is not
+ * pending). These are the only links a page can produce at will, so they are
+ * the only ones counted, and the count does exactly one thing: once
+ * U_ACTIVATION_FAIL_LIMIT of them fell inside the window, further ones are
+ * answered without a dialog (@ref activation_outcome::quiet). The count never
+ * stops a link from being read or a pending nonce from being consumed.
+ */
+static void
+unanswerable_link(const char *dir, int64_t now, const char *nonce_id, struct activation_outcome *out)
+{
+	out->quiet = u_activation_store_failure_flood(dir, now); // judged BEFORE this one is counted
+	u_activation_store_note_failure(dir, now);
+	char what[48];
+	(void)snprintf(what, sizeof(what), "%s%s", out->detail, out->quiet ? ".quiet" : "");
+	u_activation_store_log(dir, now, nonce_id, "", "", what);
+}
+
 void
 activation_handle_url(const char *url, const struct activation_ops *ops, struct activation_outcome *out)
 {
@@ -90,15 +107,10 @@ activation_handle_url(const char *url, const struct activation_ops *ops, struct 
 	}
 	const int64_t now = ops->now_unix_s != 0 ? ops->now_unix_s : u_activation_now_unix_s();
 
-	// 1. A flood of bad links is ignored without looking at them, and without a dialog each.
-	if (u_activation_store_rate_limited(dir, now)) {
-		out->kind = ACTIVATION_OUTCOME_RATE_LIMITED;
-		out->quiet = true;
-		u_activation_store_log(dir, now, "", "", "", activation_outcome_str(out->kind));
-		return;
-	}
-
-	// 2. Strict parse. The parsed link lives on the heap (it holds the token) and is wiped on every path.
+	// 1. Strict parse. The parsed link lives on the heap (it holds the token) and is wiped on every path.
+	//    Nothing is decided before the link is read and its nonce tried: a link
+	//    whose nonce is pending ALWAYS goes through, however many bad links came
+	//    before it (a flood of junk links must not be able to mute a real one).
 	struct u_activation_url *link = (struct u_activation_url *)calloc(1, sizeof(*link));
 	if (link == NULL) {
 		return;
@@ -107,35 +119,41 @@ activation_handle_url(const char *url, const struct activation_ops *ops, struct 
 	if (perr != U_ACTIVATION_URL_OK) {
 		out->kind = ACTIVATION_OUTCOME_INVALID_LINK;
 		(void)snprintf(out->detail, sizeof(out->detail), "%s", u_activation_url_error_str(perr));
-		u_activation_store_note_failure(dir, now);
-		u_activation_store_log(dir, now, "", "", "", out->detail);
+		unanswerable_link(dir, now, "", out);
 		goto done;
 	}
 	u_activation_nonce_id(link->nonce, out->nonce_id);
 
-	// 3. Consume the nonce: single use, whatever happens next.
+	// 2. Consume the nonce: single use, whatever happens next.
 	struct u_activation_record rec;
 	const enum u_activation_store_result sr = u_activation_store_consume(dir, link->nonce, now, &rec);
 	if (sr != U_ACTIVATION_STORE_OK) {
 		out->kind = ACTIVATION_OUTCOME_NOT_PENDING;
 		(void)snprintf(out->detail, sizeof(out->detail), "%s", u_activation_store_result_str(sr));
-		u_activation_store_note_failure(dir, now);
-		u_activation_store_log(dir, now, out->nonce_id, "", "", out->detail);
+		if (sr == U_ACTIVATION_STORE_NOT_FOUND || sr == U_ACTIVATION_STORE_BAD_ARGUMENT) {
+			// Names no record: never begun, already used, or a guess.
+			unanswerable_link(dir, now, out->nonce_id, out);
+		} else {
+			// A record existed (expired / another user's / damaged) and is now
+			// spent. Only someone holding a real nonce gets here, so it is
+			// always shown and never counted.
+			u_activation_store_log(dir, now, out->nonce_id, "", "", out->detail);
+		}
 		goto done;
 	}
 	(void)snprintf(out->cls, sizeof(out->cls), "%s", rec.cls);
 	(void)snprintf(out->id, sizeof(out->id), "%s", rec.id);
 
-	// 4. The optional echo must name the component the nonce was begun for.
+	// 3. The optional echo must name the component the nonce was begun for.
 	//    The component is ALWAYS the record's; the link never chooses it.
 	if (link->has_item && (strcmp(link->item_class, rec.cls) != 0 || strcmp(link->item_id, rec.id) != 0)) {
+		// The nonce was real (and is spent): shown, not counted.
 		out->kind = ACTIVATION_OUTCOME_ITEM_MISMATCH;
-		u_activation_store_note_failure(dir, now);
 		u_activation_store_log(dir, now, out->nonce_id, rec.cls, rec.id, activation_outcome_str(out->kind));
 		goto done;
 	}
 
-	// 5. Deliver to that one component.
+	// 4. Deliver to that one component.
 	const int d = ops->deliver(ops->userdata, rec.cls, rec.id, link->token, link->token_size, &out->licence,
 	                           out->error, sizeof(out->error), out->via, sizeof(out->via));
 	xrt_component_license_state_sanitize(&out->licence);
@@ -143,7 +161,7 @@ activation_handle_url(const char *url, const struct activation_ops *ops, struct 
 	out->via[sizeof(out->via) - 1] = '\0';
 	out->kind = outcome_of_delivery(d);
 
-	// 6. One line: nonce id, component, outcome. A component that refused a
+	// 5. One line: nonce id, component, outcome. A component that refused a
 	//    token it was legitimately handed is not a "failed link": it is not counted.
 	u_activation_store_log(dir, now, out->nonce_id, rec.cls, rec.id, activation_outcome_str(out->kind));
 
@@ -195,8 +213,9 @@ activation_outcome_message(
 		break;
 	case ACTIVATION_OUTCOME_UNKNOWN:
 		(void)snprintf(body, body_cap,
-		               "The activation was handed to the %s \"%s\", but it did not answer in time. Check its "
-		               "licence state in the DisplayXR Dashboard before trying again.",
+		               "The activation was sent to the %s \"%s\", but DisplayXR did not learn the outcome. It "
+		               "may or may not have been activated: check its licence state in the DisplayXR Dashboard "
+		               "before trying again.",
 		               noun, o->id);
 		break;
 	case ACTIVATION_OUTCOME_BUSY:
@@ -221,12 +240,6 @@ activation_outcome_message(
 		(void)snprintf(body, body_cap,
 		               "DisplayXR could not read this user's pending activations. Nothing was "
 		               "activated.");
-		break;
-	case ACTIVATION_OUTCOME_RATE_LIMITED:
-		(void)snprintf(body, body_cap,
-		               "Too many activation links failed in the last few minutes, so this one was ignored. "
-		               "Wait %d minutes, then start the activation again from the DisplayXR Dashboard.",
-		               U_ACTIVATION_FAIL_WINDOW_S / 60);
 		break;
 	case ACTIVATION_OUTCOME_INVALID_LINK:
 	default:

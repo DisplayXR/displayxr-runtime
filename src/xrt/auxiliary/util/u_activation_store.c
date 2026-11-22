@@ -117,7 +117,9 @@ fs_read(const char *path, char *buf, size_t cap)
 	if (w == NULL) {
 		return -1;
 	}
-	HANDLE h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+	// FILE_SHARE_DELETE: a reader (a prune, a racing handler) must not make the
+	// consume's rename of this file fail with a sharing violation.
+	HANDLE h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
 	                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
 	free(w);
 	if (h == INVALID_HANDLE_VALUE) {
@@ -651,7 +653,7 @@ prune_one(const char *name, void *ud)
 		return;
 	}
 	if (strstr(name, k_claim_tag) != NULL) {
-		fs_unlink(path); // a handler died between claiming and deleting
+		fs_unlink(path); // a handler died between claiming and deleting (consume never reads a claim)
 		return;
 	}
 	if (!ends_with(name, k_pending_ext)) {
@@ -725,8 +727,19 @@ u_activation_store_begin(const char *dir,
 	char txt[RECORD_CAP];
 	const int n = snprintf(txt, sizeof(txt), "v=1\nclass=%s\nid=%s\nuser=%s\ncreated=%lld\nexpires=%lld\n", cls, id,
 	                       user, (long long)now_unix_s, (long long)(now_unix_s + ttl_s));
-	if (!join(path, sizeof(path), dir, file) || n <= 0 || n >= (int)sizeof(txt) ||
-	    !fs_write_new(path, txt, (size_t)n)) {
+	// Written under a name no reader looks at, then renamed into place: a
+	// concurrent prune (another `activate-begin`) that read a half-written
+	// `.pending` file would take it for a damaged record and delete it.
+	char newfile[NAME_HEX + 48];
+	char newpath[PATH_CAP];
+	(void)snprintf(newfile, sizeof(newfile), "%s.new.%lu", name, process_id());
+	if (!join(path, sizeof(path), dir, file) || !join(newpath, sizeof(newpath), dir, newfile) || n <= 0 ||
+	    n >= (int)sizeof(txt) || !fs_write_new(newpath, txt, (size_t)n)) {
+		memset(nonce, 0, sizeof(nonce));
+		return U_ACTIVATION_STORE_IO_ERROR;
+	}
+	if (!fs_rename(newpath, path, false)) {
+		fs_unlink(newpath);
 		memset(nonce, 0, sizeof(nonce));
 		return U_ACTIVATION_STORE_IO_ERROR;
 	}
@@ -769,13 +782,18 @@ u_activation_store_consume(const char *dir, const char *nonce, int64_t now_unix_
 	if (!join(claim, sizeof(claim), dir, file)) {
 		return U_ACTIVATION_STORE_BAD_ARGUMENT;
 	}
+	// Read first, claim second. A concurrent `activate-begin` prunes every
+	// claim file it sees; were the record read from the claim, that prune could
+	// delete it between our rename and our read, and a good nonce would be
+	// spent and reported corrupt. Read from the pending name, the content is
+	// in hand before the claim exists, and a pruned claim costs nothing.
+	char txt[RECORD_CAP];
+	const int got = fs_read(pending, txt, sizeof(txt));
 	// The claim: of two handlers racing on one nonce, exactly one rename
 	// succeeds; the other sees no pending record.
 	if (!fs_rename(pending, claim, false)) {
 		return U_ACTIVATION_STORE_NOT_FOUND;
 	}
-	char txt[RECORD_CAP];
-	const int got = fs_read(claim, txt, sizeof(txt));
 	fs_unlink(claim); // spent, whatever follows
 
 	struct u_activation_record r;
@@ -870,7 +888,7 @@ u_activation_store_note_failure(const char *dir, int64_t now_unix_s)
 }
 
 bool
-u_activation_store_rate_limited(const char *dir, int64_t now_unix_s)
+u_activation_store_failure_flood(const char *dir, int64_t now_unix_s)
 {
 	if (dir == NULL || dir[0] == '\0' || !fs_dir_ok(dir)) {
 		return false;

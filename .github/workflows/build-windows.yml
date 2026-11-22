@@ -1135,11 +1135,13 @@ jobs:
             #    licensed in a LATER process -> its tasks are selected again;
             #  - a link never works twice, never reaches another component, and a
             #    wrong action / an oversized link / a guessed nonce reach nothing;
-            #  - five failed links stop the handler answering (quietly), without
-            #    spending a pending nonce;
+            #  - five failed links make further FAILED links quiet (no dialog), and
+            #    never stop a link whose nonce is pending: it is accepted and
+            #    shown in the middle of the flood;
+            #  - `activate-url -` reads the link from standard input;
             #  - the registered handler program is a GUI-subsystem binary that
             #    exits non-zero on a hostile command line without showing anything
-            #    while limited;
+            #    while failed links are quiet;
             #  - neither the token nor the nonce appears in the store or its log.
             function ActUrl([string]$url) {
               $raw = (& $cli activate-url --json $url 2>$null | Out-String)
@@ -1202,16 +1204,21 @@ jobs:
             $r = ActUrl ("displayxr://activate?nonce=$good&token=" + ("A" * 7000))
             Expect (($r.result -eq "invalid-link") -and ($r.detail -eq "too-long")) "deep link: an oversized link is refused (detail='$($r.detail)')"
 
-            # Five links have failed by now (bad action, two replays, the mismatch,
-            # the oversized one): the handler stops answering, quietly.
+            # The failure count only silences FAILED links; it never stops a link
+            # from being read. Four links that named no pending activation have
+            # failed by now (bad action, two replays, the oversized one; the item
+            # mismatch held a real nonce and is not counted). The fifth still
+            # answers; from the sixth on, a failed link is quiet.
             $b = Cli-Json @("conv", "activate-begin", "sim-conversion")
             $held = NonceOf $b
-            $r = ActUrl "displayxr://activate?nonce=$held&token=$secretKey"
-            Expect (($r.result -eq "rate-limited") -and $r.quiet -and ((Pending) -eq 1)) "deep link: after five failed links the handler ignores links quietly and spends nothing (result='$($r.result)' quiet=$($r.quiet))"
+            $r = ActUrl "displayxr://x"
+            Expect (($r.result -eq "invalid-link") -and (-not $r.quiet)) "deep link: the fifth failed link still answers (result='$($r.result)' quiet=$($r.quiet))"
+            $r = ActUrl "displayxr://x"
+            Expect (($r.result -eq "invalid-link") -and $r.quiet -and ((Pending) -eq 1)) "deep link: after five failed links a further failed link is quiet and spends nothing (result='$($r.result)' quiet=$($r.quiet))"
 
             # The registered handler program. GUI subsystem (no console window), and
             # on a hostile command line (a quote-breaking link plus injected
-            # arguments) it exits non-zero; limited as it is now, it shows nothing.
+            # arguments) it exits non-zero; failed links being quiet now, it shows nothing.
             $act = "_package/bin/displayxr-activate.exe"
             Expect (Test-Path $act) "deep link: displayxr-activate.exe is built"
             if (Test-Path $act) {
@@ -1229,7 +1236,7 @@ jobs:
                 $p = if ($null -eq $hostile) { Start-Process -FilePath $act -PassThru } else { Start-Process -FilePath $act -ArgumentList $hostile -PassThru }
                 if (-not $p.WaitForExit(30000)) {
                   try { $p.Kill() } catch {}
-                  Expect $false "deep link: displayxr-activate.exe did not exit on $shown (a dialog while rate-limited?)"
+                  Expect $false "deep link: displayxr-activate.exe did not exit on $shown (a dialog for a failed link during a flood?)"
                 } else {
                   Expect ($p.ExitCode -ne 0) "deep link: displayxr-activate.exe exits non-zero on $shown (exit $($p.ExitCode))"
                 }
@@ -1237,12 +1244,21 @@ jobs:
               Expect ((Pending) -eq 1) "deep link: none of that spent the pending nonce"
             }
 
-            # The window passes (here: the counter is cleared): the held link still works.
-            Remove-Item (Join-Path $actDir "failures") -Force -ErrorAction SilentlyContinue
+            # The flood is still on (nothing cleared the counter): the link whose
+            # nonce is pending goes through all the same, and is shown. A page that
+            # opens junk displayxr:// links cannot mute the user's real return link.
             $r = ActUrl "displayxr://activate?nonce=$held&token=$secretKey"
-            Expect (($r.result -eq "activated") -and (-not $r.quiet)) "deep link: once no longer limited, the still-pending link is accepted (result='$($r.result)')"
+            Expect (($r.result -eq "activated") -and (-not $r.quiet) -and ((Pending) -eq 0)) "deep link: a pending link is accepted and shown during a flood of failed links (result='$($r.result)' quiet=$($r.quiet))"
+            # The link on standard input ("-"), where the process list does not show it.
+            $b = Cli-Json @("conv", "activate-begin", "sim-conversion")
+            $raw = ("displayxr://activate?nonce=$(NonceOf $b)&token=$secretKey" | & $cli activate-url --json - 2>$null | Out-String)
+            $s0 = $raw.IndexOf('{'); $e0 = $raw.LastIndexOf('}')
+            $r = if ($s0 -ge 0 -and $e0 -gt $s0) { $raw.Substring($s0, $e0 - $s0 + 1) | ConvertFrom-Json } else { $null }
+            Expect (($null -ne $r) -and ($r.result -eq "activated") -and ((Pending) -eq 0)) "deep link: 'activate-url -' takes the link from standard input (result='$($r.result)')"
+            $r = ActUrl "displayxr://activate?nonce=$held&token=$secretKey"
+            Expect (($r.result -eq "not-pending") -and $r.quiet) "deep link: replaying it during the flood is a quiet failure (result='$($r.result)' quiet=$($r.quiet))"
             $log = (Get-Content (Join-Path $actDir "activation.log") -Raw)
-            Expect (($log -match 'class=conv id=sim-conversion outcome=activated') -and (-not $log.Contains($secretKey)) -and (-not $log.Contains($good)) -and (-not $log.Contains($held))) "deep link: the log records nonce id + component + outcome, and neither the token nor a nonce"
+            Expect (($log -match 'class=conv id=sim-conversion outcome=activated') -and ($log -match 'outcome=[a-z-]+\.quiet') -and (-not $log.Contains($secretKey)) -and (-not $log.Contains($good)) -and (-not $log.Contains($held))) "deep link: the log records nonce id + component + outcome, and neither the token nor a nonce"
             reg delete "$cvRoot\sim-conversion\Settings" /v LICENSE_SIM /f | Out-Null
             reg delete "$cvRoot\sim-conversion\Settings" /v LICENSE_STORE /f | Out-Null
             Remove-Item $simStore -Force -ErrorAction SilentlyContinue

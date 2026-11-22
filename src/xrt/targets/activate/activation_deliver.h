@@ -20,9 +20,11 @@
  *     across processes itself; the service is then asked to re-select the
  *     class (`system_request_component_reselect`).
  *
- * Step 2 runs only when step 1 reported that nothing was delivered. Once the
- * service has taken the token, its answer is final: a timeout is reported as
- * "unknown", never retried here. The service is never started by this code.
+ * Step 2 runs only when step 1 can say that nothing was called. From the
+ * moment the commit call is SENT the service may hold the token: a commit
+ * whose reply is lost, a service that goes away, and a timeout are all
+ * reported as "unknown", never retried here
+ * (activation_service_delivery.h). The service is never started by this code.
  *
  * @ingroup targets
  */

@@ -9,14 +9,21 @@
  * `displayxr://` link, so every byte of its input is attacker-controlled.
  * What it does, in this order and no other:
  *
- *  1. refuse to answer at all when too many links failed recently;
- *  2. parse the link with the strict parser (`util/u_activation_url.h`);
- *  3. consume the nonce from the per-user pending store
+ *  1. parse the link with the strict parser (`util/u_activation_url.h`);
+ *  2. consume the nonce from the per-user pending store
  *     (`util/u_activation_store.h`): spent by this first use whatever follows;
- *  4. check the optional `item` echo against what the nonce was begun for;
- *  5. hand the token to THE ONE component the nonce was begun for, through
+ *  3. check the optional `item` echo against what the nonce was begun for;
+ *  4. hand the token to THE ONE component the nonce was begun for, through
  *     the delivery function, and wipe it;
- *  6. record nonce id + component + outcome (never the token, never the link).
+ *  5. record nonce id + component + outcome (never the token, never the link).
+ *
+ * A link whose nonce is pending always goes through. Links that name no
+ * pending activation (malformed, or a nonce that is not pending) are counted,
+ * and the count only decides whether such a link still raises a dialog: after
+ * U_ACTIVATION_FAIL_LIMIT of them in U_ACTIVATION_FAIL_WINDOW_S the next ones
+ * are answered `quiet`. It never stops a link from being read (a 256-bit nonce
+ * cannot be guessed, so refusing to look would buy nothing and would let any
+ * page mute the user's real return link).
  *
  * Nothing from the link selects the component: the pending record does. The
  * handler never opens, executes or forwards any part of the link, never
@@ -56,7 +63,6 @@ enum activation_outcome_kind
 	ACTIVATION_OUTCOME_INVALID_LINK,  //!< the link is not a well-formed activation link (`detail` = why)
 	ACTIVATION_OUTCOME_NOT_PENDING,   //!< no live pending activation for the nonce (`detail` = why)
 	ACTIVATION_OUTCOME_ITEM_MISMATCH, //!< the link's `item` is not what the nonce was begun for
-	ACTIVATION_OUTCOME_RATE_LIMITED,  //!< too many failed links recently; the link was not looked at
 	ACTIVATION_OUTCOME_STORE_ERROR,   //!< the per-user store could not be located
 };
 
@@ -82,7 +88,9 @@ struct activation_outcome
 	char via[12];                                   //!< "service" / "process" / "": where the token was delivered
 	struct xrt_component_license_state licence;     //!< the component's state after the call (delivered outcomes)
 	char error[XRT_COMPONENT_ACTIVATION_ERROR_MAX]; //!< the component's own line when it refused
-	//! Set when the caller should show NOTHING (a flood is being ignored). The outcome is still logged.
+	//! Set when the caller should show NOTHING: this link named no pending activation and too many such
+	//! links came recently (dialog spam). Only ever set with INVALID_LINK or NOT_PENDING / not-found; an
+	//! outcome that concerned a real pending activation is never quiet. The outcome is still logged.
 	bool quiet;
 };
 
@@ -121,7 +129,7 @@ void
 activation_handle_url(const char *url, const struct activation_ops *ops, struct activation_outcome *out);
 
 //! "activated" / "refused" / "unsupported" / "not-loaded" / "unknown" / "busy" / "invalid-link" / "not-pending" /
-//! "item-mismatch" / "rate-limited" / "store-error".
+//! "item-mismatch" / "store-error".
 const char *
 activation_outcome_str(enum activation_outcome_kind k);
 

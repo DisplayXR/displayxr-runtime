@@ -7,7 +7,9 @@
 #
 #   activation_handler     the flow, pure over an injected delivery: strict
 #                          parse -> consume the pending nonce -> deliver to the
-#                          one component it was begun for. Unit-tested as is.
+#                          one component it was begun for; and the client half
+#                          of a live delivery, pure over an injected transport
+#                          (activation_service_delivery). Unit-tested as is.
 #   target_activation      + the shipped delivery (the running service's live
 #                          instance over DIAG, else this process's loaders) and
 #                          the native message. Linked by displayxr-cli
@@ -19,7 +21,10 @@
 #                          declares the scheme (a URL scheme needs a bundle). A
 #                          shim over the displayxr-cli beside it.
 
-add_library(activation_handler STATIC activation_handler.c activation_handler.h)
+add_library(
+	activation_handler STATIC activation_handler.c activation_handler.h activation_service_delivery.c
+				  activation_service_delivery.h
+	)
 target_link_libraries(activation_handler PUBLIC xrt-interfaces aux_util)
 target_include_directories(activation_handler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
