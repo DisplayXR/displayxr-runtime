@@ -274,7 +274,7 @@ endif()
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
 	     tests_comp_xbridge_plane_policy tests_comp_split_gate tests_comp_eye_dp_policy
-	     tests_comp_failsafe_2d_policy tests_comp_eye_mode_policy
+	     tests_comp_failsafe_2d_policy tests_comp_eye_mode_policy tests_comp_app_snap_policy
 		)
 endif()
 if(XRT_HAVE_D3D12)
@@ -1807,6 +1807,11 @@ if(XRT_HAVE_D3D11)
 	# holders. Pure header, no device.
 	target_include_directories(
 		tests_comp_eye_mode_policy PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/d3d11_service
+		)
+	# IPC handle drag snap -- when the service may snap a client's window.
+	# Pure header, no device.
+	target_include_directories(
+		tests_comp_app_snap_policy PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/d3d11_service
 		)
 	# Phase 2 — comp_d3d11_client.cpp now references the
 	# comp_ipc_client_compositor_{get,set}_workspace_sync_fence{,_value}
