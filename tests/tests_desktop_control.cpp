@@ -770,6 +770,61 @@ TEST_CASE("desktop_audit: rotation at 1 MiB and tail across the rotated file", "
 	CHECK(lines[2].find("\"action\":\"click\"") != std::string::npos);
 }
 
+TEST_CASE("desktop_audit: concurrent appenders never lose or tear a record", "[desktop][audit]")
+{
+	// An automatic release (the control's worker) and a policy change (the caller's
+	// thread) append at the same moment. Every record must survive, whole (#2530).
+	TempDir dir;
+	const int kThreads = 4, kPerThread = 250;
+	std::atomic<int> failed{0};
+	std::vector<std::thread> threads;
+	for (int t = 0; t < kThreads; t++) {
+		threads.emplace_back([&failed, t] {
+			// Different lengths per thread: a lost append then leaves a torn line too.
+			std::string msg = "writer " + std::to_string(t) + " " + std::string((size_t)t * 40, 'x');
+			u_desktop_audit_record r;
+			memset(&r, 0, sizeof(r));
+			r.action = "release";
+			r.chars = -1;
+			r.result = "ok";
+			r.message = msg.c_str();
+			for (int i = 0; i < kPerThread; i++) {
+				r.count = (uint32_t)(i + 1);
+				if (!u_desktop_audit_append(&r)) {
+					failed++;
+				}
+			}
+		});
+	}
+	for (std::thread &th : threads) {
+		th.join();
+	}
+	CHECK(failed == 0);
+
+	std::istringstream in(slurp(dir.file("desktop_control_audit.jsonl")));
+	std::map<std::string, int> seen;
+	int lines = 0, torn = 0;
+	for (std::string line; std::getline(in, line);) {
+		lines++;
+		if (line.empty() || line.front() != '{' || line.back() != '}' ||
+		    line.find("\"action\":\"release\"") == std::string::npos) {
+			torn++;
+			continue;
+		}
+		for (int t = 0; t < kThreads; t++) {
+			if (line.find("\"message\":\"writer " + std::to_string(t) + " ") != std::string::npos ||
+			    line.find("\"message\":\"writer " + std::to_string(t) + "\"") != std::string::npos) {
+				seen[std::to_string(t)]++;
+			}
+		}
+	}
+	CHECK(torn == 0);
+	CHECK(lines == kThreads * kPerThread);
+	for (int t = 0; t < kThreads; t++) {
+		CHECK(seen[std::to_string(t)] == kPerThread);
+	}
+}
+
 
 /*
  *
