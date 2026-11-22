@@ -867,6 +867,9 @@ enum blob_st
 	B_READY,
 	B_FAILED,
 	B_REFUSED, //!< ABSENT(policy)
+	/*! ABSENT, `build-locally`: a `local_build` model's blob that nothing can fetch
+	 *  (ADR-057 §5). Not sticky: once the script writes the blob it reads INSTALLED. */
+	B_LOCAL_BUILD,
 };
 
 struct blob
@@ -2447,6 +2450,7 @@ conv_model_store_resolve(struct conv_model_store *s, const char *ref, struct xrt
 	// Aggregate over the files: FAILED > ABSENT(policy) > ABSENT > DOWNLOADING > WARMING > INSTALLED > READY.
 	uint32_t worst = XRT_CONV_STATE_READY, fail = 0;
 	bool refused = false, absent = false, downloading = false, warming = false, installed = false;
+	bool build_locally = false;
 	uint64_t done = 0, total = 0;
 	for (uint32_t i = 0; i < rf.count; i++) {
 		struct blob *b = blob_get_locked(s, rf.files[i]->sha256, rf.files[i]->size, false);
@@ -2462,6 +2466,7 @@ conv_model_store_resolve(struct conv_model_store *s, const char *ref, struct xrt
 		case XRT_CONV_STATE_ABSENT:
 			absent = true;
 			refused |= b != NULL && b->st == B_REFUSED;
+			build_locally |= b != NULL && b->st == B_LOCAL_BUILD;
 			break;
 		case XRT_CONV_STATE_DOWNLOADING: downloading = true; break;
 		case XRT_CONV_STATE_WARMING: warming = true; break;
@@ -2477,6 +2482,8 @@ conv_model_store_resolve(struct conv_model_store *s, const char *ref, struct xrt
 		                                            : XRT_CONV_STATE_READY;
 		if (worst == XRT_CONV_STATE_ABSENT && refused) {
 			fail = XRT_CONV_FAIL_POLICY;
+		} else if (worst == XRT_CONV_STATE_ABSENT && build_locally) {
+			fail = XRT_CONV_FAIL_MODEL; // missing, and only its local build can make it
 		}
 	}
 	// A research-only model without the opt-in is never handed out.
@@ -2502,6 +2509,28 @@ conv_model_store_resolve(struct conv_model_store *s, const char *ref, struct xrt
 	return true;
 }
 
+/*!
+ * A blob of a `local_build` model that no source can serve: its URL is empty or a
+ * file:// path that does not exist (a pack with no `url` / `blobBaseUrl` resolves
+ * to its manifest's directory). An http(s) mirror is still a source. mtx held.
+ */
+static bool
+unsourced_local_build(const struct conv_pack_model *m, const struct blob *b)
+{
+	if (m == NULL || m->local_build[0] == '\0') {
+		return false;
+	}
+	if (b->url[0] == '\0') {
+		return true;
+	}
+	if (strncmp(b->url, "file://", 7) != 0) {
+		return false;
+	}
+	char path[CONV_STORE_PATH_MAX];
+	file_url_path(b->url, path, sizeof(path));
+	return !fs_exists(path);
+}
+
 bool
 conv_model_store_request(struct conv_model_store *s, const char *ref)
 {
@@ -2517,7 +2546,7 @@ conv_model_store_request(struct conv_model_store *s, const char *ref)
 	}
 	const bool research_refused = policy_refuses_locked(s, &rf);
 	bool ok = !research_refused;
-	bool queued = false;
+	bool queued = false, build_locally = false;
 	for (uint32_t i = 0; i < rf.count; i++) {
 		const struct conv_pack_file *f = rf.files[i];
 		struct blob *b = blob_get_locked(s, f->sha256, f->size, true);
@@ -2534,6 +2563,13 @@ conv_model_store_request(struct conv_model_store *s, const char *ref)
 		if (st == XRT_CONV_STATE_READY || b->st == B_QUEUED || b->st == B_DOWNLOADING || b->st == B_VERIFYING) {
 			continue; // ready, or one job already serves it
 		}
+		if (st == XRT_CONV_STATE_ABSENT && unsourced_local_build(rf.model, b)) {
+			// ADR-057 §5: never a download (nothing serves the bytes); its script builds it.
+			b->st = B_LOCAL_BUILD;
+			ok = false;
+			build_locally = true;
+			continue;
+		}
 		if (st == XRT_CONV_STATE_ABSENT && !s->cfg.allow_downloads) {
 			b->st = B_REFUSED;
 			ok = false;
@@ -2549,6 +2585,11 @@ conv_model_store_request(struct conv_model_store *s, const char *ref)
 	os_mutex_unlock(&s->mtx);
 	if (research_refused) {
 		U_LOG_W("[conv-store] model_request('%s') refused: research-only model and AllowResearchOnly is off", ref);
+	} else if (build_locally) {
+		U_LOG_W(
+		    "[conv-store] model_request('%s'): build-locally -- never downloaded: build it locally with %s, "
+		    "which writes it into this store",
+		    ref, rf.model->local_build);
 	} else if (!ok) {
 		U_LOG_W("[conv-store] model_request('%s') refused: downloads are off by policy", ref);
 	}

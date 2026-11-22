@@ -664,7 +664,7 @@ Schema 2 replaces the browser's `models.json` schema 1. The browser's store is d
 - **Signing.** A signed installer MUST NOT pre-fetch a non-commercial blob; the open-provider repo's CI asserts it.
 - **Blob identity.** `sha256` + `size` identify a blob; variants may share blobs.
 - **URL.** `<blobBaseUrl>/<sha256>.<format>`, unless the model gives its own `url` (§5.5).
-- **Locally built models (`local_build`).** A model whose bytes may not be redistributed can be produced on the user's box by a deterministic script instead (ADR-057 §5): the model carries `"local_build": { "script": "<repo-relative path>", … }` (other keys informational) and its files list the sha256 + size the script produces, like any blob. The store treats the bytes like any other blob (hash, stamp, the `AllowResearchOnly` gate on fetch and hand-out); only the outcome of a fetch that finds nothing changes: when the blob is not in the store and no source answered (no `url` / `blobBaseUrl`, or a mirror that does not have it), the result is **`build-locally`** (`CONV_STORE_BLOB_LOCAL_BUILD`), not `network`, and `conv models fetch` names the script. A `url` or `blobBaseUrl` that serves the bytes (a dev mirror) is still fetched normally. As built, the runtime's `model_request` for a missing locally built blob is unchanged (`FAILED(NETWORK)`, retryable: once the script has written the blob, the next request verifies it).
+- **Locally built models (`local_build`).** A model whose bytes may not be redistributed can be produced on the user's box by a deterministic script instead (ADR-057 §5): the model carries `"local_build": { "script": "<repo-relative path>", … }` (other keys informational) and its files list the sha256 + size the script produces, like any blob. The store treats the bytes like any other blob (hash, stamp, the `AllowResearchOnly` gate on fetch and hand-out); only the outcome of a fetch that finds nothing changes: when the blob is not in the store and no source answered (no `url` / `blobBaseUrl`, or a mirror that does not have it), the result is **`build-locally`** (`CONV_STORE_BLOB_LOCAL_BUILD`), not `network`, and `conv models fetch` names the script. A `url` or `blobBaseUrl` that serves the bytes (a dev mirror) is still fetched normally. `model_request` for a missing locally built blob that nothing can serve (its URL is empty, or a `file://` path that does not exist — a pack with no `url` / `blobBaseUrl` resolves to its manifest's directory) **queues no download**: it returns false, logs `build-locally` with the script, and `model_resolve` reads `ABSENT` with `failure_reason = XRT_CONV_FAIL_MODEL` (missing; not `POLICY`, so a provider that names the model says it must be built rather than that a policy forbids it). This wins over `AllowDownloads` = 0; the `AllowResearchOnly` gate still answers first. It is not sticky: once the script has written the blob it reads `INSTALLED`, and the next request verifies it. An http(s) mirror is a source and is fetched as usual.
 - **Validation.** `scripts/check_model_pack.py` (open-provider repo) checks the schema and the licence AND; `--verify-store` checks a store against its packs.
 
 ### 5.4 The store as built (P4, #2108)
@@ -710,14 +710,14 @@ stamp). `ref` is `<pack>/<model>[/<variant>]` (first variant when omitted) or a 
 |---|---|---|
 | `READY` | every file present, stamped, and hashed **by this process** (cache key: file id + mtime + size); `path` = the variant's `model` file | load `path` |
 | `INSTALLED` | on disk and stamped, not yet verified by this process | `model_request` (warm-up verifies it) |
-| `WARMING` | the store's worker is hashing it | wait |
+| `WARMING` | the store's worker is hashing it (once per process; `progress` n/a, so a multi-GB blob reads `WARMING` for tens of seconds) | wait; it is progress, not a refusal |
 | `DOWNLOADING` | in flight; `progress` = bytes / total over the model's files | report `DOWNLOADING` with that progress |
-| `ABSENT` | not in the store; `failure_reason = XRT_CONV_FAIL_POLICY` when a request was refused by policy | report `ABSENT` with that reason (the core shows `ABSENT(policy)`) |
+| `ABSENT` | not in the store; `failure_reason = XRT_CONV_FAIL_POLICY` when a request was refused by policy, `XRT_CONV_FAIL_MODEL` when it is a locally built model nothing can fetch (`build-locally`, §5.3) | report `ABSENT` with that reason (the core shows `ABSENT(policy)`) |
 | `FAILED` | `NETWORK` (retryable: a new request retries) or `MODEL` (bytes failed size / hash) | report `FAILED(reason)` |
 
 **`model_request(ref)`** queues verification or download of every file that is not `READY` on
 the store's one worker thread; concurrent requests for one sha256 share one job. It returns
-false for an unknown ref or a policy refusal.
+false for an unknown ref, a policy refusal, or a locally built blob nothing can fetch (§5.3).
 
 **Policy.** `AllowDownloads` (DWORD under `ConversionProviders`, HKCU over HKLM unless
 `Policy\Lock`; default 1; `DXR_CONV_ALLOW_DOWNLOADS=0` in the hosting process forces it off): a
