@@ -851,7 +851,28 @@ V2_ITEMS = {
         "summary": "2D-to-3D conversion with Leia's NeurD module.",
         # Declared and detected only (spec § Requires): NeurD has its own
         # installer, licence and update channel; DisplayXR never fetches it.
-        # No info_url: its download page is not known here, and is not guessed.
+        # Facts confirmed with the provider's maintainers and read from its code
+        # (displayxr-leia-conversion: `MinVersion` default in leia_conv_plugin.cpp,
+        # the search order in leia_lift_neurd.cpp / leia_conv_neurd_posix.cpp):
+        #
+        #   - There is NO public download of NeurD yet, so the entry has no
+        #     `info_url` and no installer `asset`. When a public signed build
+        #     exists it gains an asset (url, sha256, size, signer).
+        #   - Floor: 0.4.6 on Windows (the provider's `MinVersion`). On Linux
+        #     0.4.6 converts with a fixed pair of views and look-around needs
+        #     0.5.0 (the first NeurD that exports NeurD_get_table_size).
+        #   - Where the provider looks, in order. Windows: PATH, then the
+        #     NEURD_PATH environment variable, then HKLM\SOFTWARE\LeiaInc\NeurD
+        #     (default value = the directory, `Version` = the version). Linux:
+        #     /opt/immersity/neurd-runtime (its VERSION.txt), then NEURD_PATH.
+        #
+        # What the entry below can say of that is the Windows registry leg and
+        # the Windows floor. The rest is not expressible in schema 2 today
+        # (component-catalog.md, "What an external prerequisite cannot say"):
+        # one `min_version` for all platforms, detect rules with no platform
+        # and only Windows facts, no "on PATH", no environment variable, no
+        # version read from a file. No detector kind is invented here; the
+        # rule's `note` says what it does not see.
         "external": [
             {
                 "kind": "external",
@@ -859,7 +880,9 @@ V2_ITEMS = {
                 "min_version": "0.4.6",
                 "detect": [
                     {"kind": "registry_sz_min", "key": "HKLM\\SOFTWARE\\LeiaInc\\NeurD",
-                     "value": "Version", "min": "0.4.6"},
+                     "value": "Version", "min": "0.4.6",
+                     "note": "registered by NeurD's own installer; a NeurD found only on PATH "
+                             "or through NEURD_PATH is not seen by this rule"},
                 ],
             },
         ],
