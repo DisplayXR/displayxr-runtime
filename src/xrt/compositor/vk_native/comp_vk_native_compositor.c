@@ -32,6 +32,7 @@
 #include "util/comp_lazy_transparency.h"
 #include "util/comp_segments.h"
 #include "util/comp_segments_route.h"
+#include "util/comp_weave_screens.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
 #include "util/comp_texture_target_win32.h"   // ADR-060 texture target binding (#2721)
@@ -994,6 +995,26 @@ struct comp_vk_native_compositor
 	 * each submitted frame's partition by its own sequence.
 	 */
 	struct comp_segments_content seg_content;
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+	/*!
+	 * Native Wayland (ADR-047 on #1596 geometry): the screens projected into
+	 * the window's own pixel frame (@ref vk_wl_seg_place) — what the manager's
+	 * screen rects were last set to (NULL = not applied to this manager yet).
+	 * Wayland segments for VIEWS only: the table frames xrLocateViews for a
+	 * window wholly on another screen; the frame keeps the single-DP path.
+	 */
+	struct xrt_screen_list *seg_wl_proj;
+	//! Scratch for the placement (heap: an xrt_screen_list is a few KB).
+	struct xrt_screen_list *seg_wl_next;
+	//! The last placement outcome + monitor index logged (change-only WARN).
+	int seg_wl_logged_result;
+	uint32_t seg_wl_logged_monitor;
+	//! This weave's manager update found the window off the primary screen.
+	bool seg_wl_split;
+	//! A one-screen table is published for xrLocateViews (change-only WARN).
+	bool seg_wl_published;
+	uint64_t seg_wl_published_screen;
+#endif
 #endif // VK_NATIVE_HAVE_SEGMENTS
 	/*!
 	 * #2247: the last weave's table does not cover the primary screen (the
@@ -6685,9 +6706,14 @@ vk_own_window_snap_cb(void *userdata,
  * primary one. Everything that cannot be segmented today answers false and
  * keeps the shipped single-DP path, byte for byte:
  *
- * - native Wayland: the geometry service reports a rect relative to the
- *   window's own monitor, in that monitor's device px — not a desktop rect
- *   (docs/specs/runtime/wayland-window-geometry.md, M2 follow-up);
+ * - native Wayland, for the FRAME: the geometry service reports a rect
+ *   relative to the window's own monitor, in that monitor's device px — not a
+ *   desktop rect (docs/specs/runtime/wayland-window-geometry.md, M2
+ *   follow-up). The screens are placed in the window's frame instead
+ *   (@ref vk_wl_seg_place) and the manager runs its table + DP lifecycle, but
+ *   only for xrLocateViews (a window wholly on another screen takes that
+ *   screen's eyes and size): the frame keeps the single-DP path, with the
+ *   #1595 1:1 hold and the #1654 off-panel bands, and this answers false;
  * - Windows under the #918 split (the weave is the split's D3D11 one, which
  *   segments with the D3D11 manager inside hub_d3d11/comp_hub_d3d11.cpp — here
  *   display_processor is NULL);
@@ -6701,6 +6727,91 @@ vk_own_window_snap_cb(void *userdata,
  * compose step can withhold zero-copy for a window off the primary screen.
  * Only the split itself still needs an atlas that is ours to crop.
  */
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+/*!
+ * Native Wayland: place the screen list and the window in the window's own
+ * pixel frame (comp_weave_screens_project_monitor_relative — the projection
+ * the service weave engine uses for a present-owner, fed from wl_geom's
+ * monitor-relative rect + logical origins), into @ref seg_wl_next, and the
+ * window's rect in that frame into @ref seg_window.
+ *
+ * The screen list's rects are X11 (XWayland root) px, which on a mixed-scale
+ * desktop are neither device px nor one grid with the window's monitor-
+ * relative device rect. Each screen is placed by its stage (logical) origin,
+ * derived from its X11 rect, device mode and scale by the same rules the
+ * panel's own phase uses (u_weave_present_origin.h), so a screen at the
+ * window's scale lands exactly where the geometry service says the window's
+ * monitor is — the placement is refused unless exactly one screen does.
+ *
+ * Never touches the present origin or the drop-time snap (the PHASE consumer
+ * stays refused off the panel, #1654). One WARN per outcome change.
+ *
+ * @return true when placed.
+ */
+static bool
+vk_wl_seg_place(struct comp_vk_native_compositor *c)
+{
+	if (c->wl_geom == NULL || c->seg_screens == NULL) {
+		return false;
+	}
+	if (c->seg_wl_next == NULL) {
+		c->seg_wl_next = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (c->seg_wl_next == NULL) {
+			return false;
+		}
+	}
+	struct comp_vk_native_wl_window_rect wr = {0};
+	enum comp_weave_monitor_match r = COMP_WEAVE_MONITOR_NO_WINDOW;
+	struct comp_seg_rect win = {0};
+	uint32_t mon = UINT32_MAX;
+	if (comp_vk_native_wl_geom_get_window_rect(c->wl_geom, &wr)) {
+		const struct comp_weave_monitor_window mw = {
+		    .left_px = wr.left_px,
+		    .top_px = wr.top_px,
+		    .w = wr.width_px,
+		    .h = wr.height_px,
+		    .monitor_w = wr.monitor_width_px,
+		    .monitor_h = wr.monitor_height_px,
+		    .content_logical_x = wr.content_logical_x,
+		    .content_logical_y = wr.content_logical_y,
+		    .mon_logical_x = wr.mon_logical_x,
+		    .mon_logical_y = wr.mon_logical_y,
+		    .scale = wr.scale,
+		};
+		r = comp_weave_screens_project_monitor_relative(c->seg_screens, &mw, c->seg_wl_next, &win, &mon);
+	}
+	// Lifecycle only: the window changed monitor, or the placement started or
+	// stopped working. No window at all (unmapped, no geometry service) stays
+	// quiet until something was logged — wl_geom says so itself, once.
+	if ((int)r != c->seg_wl_logged_result || mon != c->seg_wl_logged_monitor) {
+		const bool was_logged = c->seg_wl_logged_result >= 0;
+		c->seg_wl_logged_result = (int)r;
+		c->seg_wl_logged_monitor = mon;
+		if (r == COMP_WEAVE_MONITOR_OK) {
+			const struct xrt_screen *s = &c->seg_screens->screens[mon];
+			U_LOG_W(
+			    "segments (Wayland): window %d,%d %ux%u (monitor %ux%u, scale %.4f) placed on screen "
+			    "0x%016llx ('%s') — screens projected into the window's frame (ADR-047, #1596)",
+			    win.x, win.y, win.w, win.h, wr.monitor_width_px, wr.monitor_height_px, (double)wr.scale,
+			    (unsigned long long)s->id, s->device_name);
+		} else if (r != COMP_WEAVE_MONITOR_NO_WINDOW || was_logged) {
+			U_LOG_W(
+			    "segments (Wayland): cannot place the window against the screens — %s (monitor %ux%u at "
+			    "logical %d,%d, scale %.4f); views keep the session display's eyes and the panel-centred "
+			    "projection (#1654)",
+			    comp_weave_monitor_match_str(r), wr.monitor_width_px, wr.monitor_height_px,
+			    wr.mon_logical_x, wr.mon_logical_y, (double)wr.scale);
+		}
+	}
+	if (r != COMP_WEAVE_MONITOR_OK) {
+		return false;
+	}
+	c->seg_window = win;
+	c->have_seg_window = true;
+	return true;
+}
+#endif
+
 static bool
 vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
                                const struct xrt_rect *dp_canvas,
@@ -6710,15 +6821,32 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
                                bool *out_would_split)
 {
 	*out_would_split = false;
-	if (c->seg_screens == NULL || c->display_processor == NULL || c->cmd_pool == VK_NULL_HANDLE ||
-	    !c->have_seg_window) {
+	if (c->seg_screens == NULL || c->display_processor == NULL || c->cmd_pool == VK_NULL_HANDLE) {
 		return false;
 	}
+	bool wl = false;
 #ifdef XRT_HAVE_WAYLAND
 	if (c->use_wayland) {
+#ifdef DXR_HAVE_WL_GEOM
+		wl = true;
+		c->seg_wl_split = false;
+		if (!vk_wl_seg_place(c)) {
+			// Not placed: no table at all (a stale one would keep framing
+			// views for a screen the window may have left) — the
+			// single-screen path, exactly as before.
+			c->have_seg_window = false;
+			if (c->segments != NULL) {
+				c->seg_rebuild = true;
+			}
+		}
+#else
 		return false;
+#endif
 	}
 #endif
+	if (!c->have_seg_window && !(wl && c->seg_rebuild)) {
+		return false;
+	}
 	// A new screen list (set_screens) rebuilds the manager — but never under
 	// a parked fill, whose command buffer may still use its DPs and images.
 	if (c->seg_rebuild && !c->fill_parked) {
@@ -6732,6 +6860,9 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 	}
 	if (c->segments != NULL && c->seg_rebuild) {
 		return false; // old manager, new list: sit this frame out
+	}
+	if (!c->have_seg_window) {
+		return false;
 	}
 	if (c->segments == NULL) {
 		struct comp_vk_native_segments *segs =
@@ -6758,6 +6889,11 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 		os_mutex_lock(&c->seg_pub_mutex);
 		c->segments = segs;
 		os_mutex_unlock(&c->seg_pub_mutex);
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+		// A new manager holds the list's X11 rects: re-apply the projection.
+		free(c->seg_wl_proj);
+		c->seg_wl_proj = NULL;
+#endif
 	}
 	if (!comp_vk_native_segments_enabled(c->segments)) {
 		return false;
@@ -6768,6 +6904,39 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 	    (uint32_t)(dp_canvas->extent.w > 0 ? dp_canvas->extent.w : 0),
 	    (uint32_t)(dp_canvas->extent.h > 0 ? dp_canvas->extent.h : 0),
 	};
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+	if (wl) {
+		/*
+		 * Views only. The manager takes the screens in the window's frame
+		 * (its DPs and screen bindings untouched — a projection change is a
+		 * geometry change, comp_weave_screens_compare), then cuts the table
+		 * and runs the DP lifecycle, so a screen the window is wholly on has
+		 * its own segment DP whose eyes xrLocateViews takes. Nothing is
+		 * recorded per segment: zero-copy, the DP's submission mode and the
+		 * frame are left exactly as they were, and the segment DPs stay 2D —
+		 * they never weave on this path.
+		 */
+		if (c->seg_wl_proj == NULL ||
+		    comp_weave_screens_compare(c->seg_wl_proj, c->seg_wl_next) != COMP_WEAVE_SCREENS_SAME) {
+			if (!comp_vk_native_segments_set_screen_geometry(c->segments, c->seg_wl_next)) {
+				return false; // cannot happen (same list, same filter)
+			}
+			if (c->seg_wl_proj == NULL) {
+				c->seg_wl_proj = U_TYPED_CALLOC(struct xrt_screen_list);
+			}
+			if (c->seg_wl_proj != NULL) {
+				*c->seg_wl_proj = *c->seg_wl_next;
+			}
+		}
+		c->seg_wl_split = comp_vk_native_segments_update(
+		    c->segments, &c->seg_window, &canvas, (int32_t)VK_FORMAT_B8G8R8A8_UNORM, !c->fill_parked,
+		    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : 0);
+		comp_vk_native_segments_set_display_mode(c->segments, false);
+		return false;
+	}
+#else
+	(void)wl;
+#endif
 	*out_would_split = comp_vk_native_segments_would_split(c->segments, &c->seg_window, &canvas);
 	if (zero_copy || dp_self_submits || dp_render_pass == VK_NULL_HANDLE) {
 		return false;
@@ -6815,16 +6984,56 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 #else
 	const bool collapsed_2d = false;
 #endif
+	const struct comp_seg_rect canvas = {
+	    dp_canvas->offset.w,
+	    dp_canvas->offset.h,
+	    (uint32_t)(dp_canvas->extent.w > 0 ? dp_canvas->extent.w : 0),
+	    (uint32_t)(dp_canvas->extent.h > 0 ? dp_canvas->extent.h : 0),
+	};
 	if (split && !collapsed_2d) {
-		const struct comp_seg_rect canvas = {
-		    dp_canvas->offset.w,
-		    dp_canvas->offset.h,
-		    (uint32_t)(dp_canvas->extent.w > 0 ? dp_canvas->extent.w : 0),
-		    (uint32_t)(dp_canvas->extent.h > 0 ? dp_canvas->extent.h : 0),
-		};
 		(void)comp_vk_native_segments_get_metrics(c->segments, &c->seg_window, &canvas,
 		                                          c->display_processor != NULL, &m);
 	}
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+	/*
+	 * Native Wayland (views only, see vk_segments_frame_update_split): a
+	 * window WHOLLY on one other screen publishes that one-segment table —
+	 * also while the session is collapsed to 2D there (#1595), the normal case
+	 * off the panel: one segment is one view set, which the collapse's single
+	 * tile holds. xrLocateViews then frames the window for that screen (its
+	 * DP's eyes, its size; ADR-047). A window across screens publishes
+	 * nothing: its frame is one picture woven by the session DP with
+	 * off-panel bands (#1654), which per-segment views would not match.
+	 */
+	if (c->use_wayland) {
+		if (c->seg_wl_split) {
+			(void)comp_vk_native_segments_get_metrics(c->segments, &c->seg_window, &canvas,
+			                                          c->display_processor != NULL, &m);
+			if (m.count != 1 || m.seg[0].is_primary) {
+				memset(&m, 0, sizeof(m));
+			}
+		}
+		const bool pub = m.count == 1;
+		const uint64_t pub_screen = pub ? m.seg[0].screen_id : 0;
+		if (pub != c->seg_wl_published || pub_screen != c->seg_wl_published_screen) {
+			const bool was = c->seg_wl_published;
+			c->seg_wl_published = pub;
+			c->seg_wl_published_screen = pub_screen;
+			if (pub) {
+				U_LOG_W(
+				    "segments (Wayland): window wholly on screen 0x%016llx (%.3f x %.3f m) — views "
+				    "framed for that screen: its segment DP's eyes (nominal until the DP exists) "
+				    "and its size (ADR-047)",
+				    (unsigned long long)pub_screen, (double)m.seg[0].screen_width_m,
+				    (double)m.seg[0].screen_height_m);
+			} else if (was) {
+				U_LOG_W(
+				    "segments (Wayland): window back on the primary screen (or across screens) — views "
+				    "framed for the session's display again");
+			}
+		}
+	}
+#endif
 	os_mutex_lock(&c->seg_pub_mutex);
 	m.generation = c->seg_pub.generation;
 	struct xrt_segment_metrics prev = c->seg_pub;
@@ -14642,6 +14851,12 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	c->seg_screens = NULL;
 	free(c->seg_sys_info);
 	c->seg_sys_info = NULL;
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+	free(c->seg_wl_proj);
+	c->seg_wl_proj = NULL;
+	free(c->seg_wl_next);
+	c->seg_wl_next = NULL;
+#endif
 #endif
 	xrt_display_processor_destroy(&c->display_processor);
 
@@ -15505,6 +15720,10 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	os_mutex_init(&c->ws_stamp.mutex); // #2356
 #ifdef VK_NATIVE_HAVE_SEGMENTS
 	os_mutex_init(&c->seg_pub_mutex); // multi-screen M3
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+	c->seg_wl_logged_result = -1; // nothing placed or refused yet
+	c->seg_wl_logged_monitor = UINT32_MAX;
+#endif
 #endif
 #ifdef XRT_OS_WINDOWS
 	os_mutex_init(&c->dp_swap_mutex); // ADR-047 Amendment 2
@@ -18417,11 +18636,18 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 		// screen registry's RandR rects are in. Windows (M6): the client
 		// area from ClientToScreen, device px — every DisplayXR executable
 		// is per-monitor DPI aware (#1201), the registry's monitor space.
-		c->seg_window.x = m.window_screen_left;
-		c->seg_window.y = m.window_screen_top;
-		c->seg_window.w = m.window_pixel_width;
-		c->seg_window.h = m.window_pixel_height;
-		c->have_seg_window = true;
+		// Native Wayland: vk_wl_seg_place owns it (this rect is the panel's
+		// origin plus a monitor-relative offset, not a desktop rect).
+#ifdef XRT_HAVE_WAYLAND
+		if (!c->use_wayland)
+#endif
+		{
+			c->seg_window.x = m.window_screen_left;
+			c->seg_window.y = m.window_screen_top;
+			c->seg_window.w = m.window_pixel_width;
+			c->seg_window.h = m.window_pixel_height;
+			c->have_seg_window = true;
+		}
 #endif
 	}
 
