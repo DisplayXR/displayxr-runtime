@@ -576,6 +576,38 @@ u_tiling_grow_atlas_extent(uint32_t cur, uint32_t req, uint32_t cap)
 	return (uint32_t)grown;
 }
 
+/*!
+ * Does a high-water-mark atlas allocation (#602) of @p alloc_w x @p alloc_h
+ * still hold the content of a @p tile_columns x @p tile_rows grid of
+ * @p view_w x @p view_h views?
+ *
+ * The content packs top-left, so it fits when both of its extents do. A
+ * renderer whose view size is FIXED (a legacy session at its compromise scale)
+ * must ask this whenever its tile layout changes: the grid alone can outgrow
+ * the allocation. A legacy session that began in a 1x1 mode was allocated for
+ * one view; the 2D -> 3D switch to a 2x1 mode doubled the content width
+ * without touching the allocation, and the cross-adapter bridge refused every
+ * frame from then on (the 1920x2160 source / 3840x2160 copy box of the field
+ * log).
+ *
+ * An empty allocation (0 on either axis) holds nothing.
+ */
+static inline bool
+u_tiling_atlas_alloc_holds(uint32_t tile_columns,
+                           uint32_t tile_rows,
+                           uint32_t view_w,
+                           uint32_t view_h,
+                           uint32_t alloc_w,
+                           uint32_t alloc_h)
+{
+	if (alloc_w == 0 || alloc_h == 0) {
+		return false;
+	}
+	const uint64_t content_w = (uint64_t)tile_columns * view_w;
+	const uint64_t content_h = (uint64_t)tile_rows * view_h;
+	return content_w <= alloc_w && content_h <= alloc_h;
+}
+
 #ifdef __cplusplus
 }
 #endif

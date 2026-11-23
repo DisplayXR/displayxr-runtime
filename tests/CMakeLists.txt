@@ -105,6 +105,7 @@ set(tests
     tests_aux_display_edid_parse
     tests_aux_tiling_row_origin
     tests_aux_tiling_window_size
+    tests_aux_atlas_mode_switch
     tests_aux_window_replug
     tests_aux_wayland_geom
     tests_comp_wl_move_sync_tag
@@ -667,6 +668,11 @@ target_link_libraries(tests_aux_tiling_row_origin PRIVATE xrt-interfaces)
 # 0x0 atlas at compositor create -- that failed xrCreateSession. The create-size
 # pick and the window-scaled view are header arithmetic, pinned on the host.
 target_link_libraries(tests_aux_tiling_window_size PRIVATE xrt-interfaces)
+
+# The in-process D3D11 renderer atlas across a 2D <-> 3D switch: a legacy
+# session's fixed-view-size atlas follows its tile grid. Header arithmetic,
+# pinned on the host.
+target_link_libraries(tests_aux_atlas_mode_switch PRIVATE xrt-interfaces)
 
 target_link_libraries(tests_cxx_wrappers PRIVATE xrt-interfaces)
 # part of #1633 -- u_grip_surface(), the one grip -> grip_surface transform.
