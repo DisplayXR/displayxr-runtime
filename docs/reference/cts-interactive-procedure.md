@@ -166,24 +166,31 @@ cover.
 
 ### 2.3 Set the sim-display output mode deliberately — the default will ruin the run
 
-`SIM_DISPLAY_OUTPUT` is read at device create
-(`src/xrt/drivers/sim_display/sim_display_device.c:539-556`):
+sim-display serves two rendering modes, 2D (mode 0) and the 3D kind
+`SIM_DISPLAY_OUTPUT` names (mode 1), and **starts in 2D** unless
+`SIM_DISPLAY_START_3D=1` ([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md)).
+Both are read at device create (`sim_display_hmd_create`, table of kinds in
+`src/xrt/drivers/sim_display/sim_display_modes.h`). A CTS session is a legacy
+session that cannot change the mode (V is a thumbstick click in a CTS run, not the 2D/3D toggle), so
+whatever the device starts in is what the whole run sees:
 
-| Value | Mode | Use for |
+| Setting | What the panel shows | Use for |
 |---|---|---|
-| `2d` / `passthrough` | first tile fills the screen, flat, 1 view | **everything except eye-visibility** |
-| `sbs` | side-by-side, centre-cropped, 2 views | the `EyeVisibility`-shaped tests only |
-| `squeezed` / `squeezed_sbs` | SBS, no crop, tiles as-is | rarely — cross-check a tiling doubt |
+| `SIM_DISPLAY_OUTPUT=2d` | mode 0: first view flat, full window | **everything except eye-visibility** |
+| `SIM_DISPLAY_OUTPUT=sbs` + `SIM_DISPLAY_START_3D=1` | mode 1: side-by-side, centre-cropped, 2 views | the `EyeVisibility`-shaped tests only |
+| `SIM_DISPLAY_OUTPUT=squeezed` + `SIM_DISPLAY_START_3D=1` | SBS, no crop, tiles as-is | rarely — cross-check a tiling doubt |
 | `anaglyph` | red/cyan, 2 views | **never for these runs** |
 | `blend` | 50/50 alpha blend of the views | never |
 | `quad` | 2×2, 4 views | **never** — see below |
 
-> **The default is `anaglyph`.** If `SIM_DISPLAY_OUTPUT` is unset the DP falls
-> back to red/cyan (the driver says so in its own warning text: *"keeping the
-> anaglyph default"*). Anaglyph destroys every colour judgement in the
+> **Set it explicitly.** With `SIM_DISPLAY_OUTPUT` unset the device now starts
+> flat (mode 0), but the 3D kind behind it is `anaglyph`, and any recipe that adds
+> `SIM_DISPLAY_START_3D=1` (or an old note that relied on sim-display starting in
+> 3D) lands in red/cyan. Anaglyph destroys every colour judgement in the
 > composition set — `GradientFormatsLinearVsNonLinear` and the alpha-blending
 > tests become meaningless, and you would not necessarily notice, because a
-> red/cyan gradient still looks like *a* gradient. **Always set it explicitly.**
+> red/cyan gradient still looks like *a* gradient. `2d` also forces the flat
+> start, whatever else is set.
 
 ```powershell
 $env:SIM_DISPLAY_OUTPUT = "2d"     # PowerShell sets the process env block;
@@ -191,8 +198,9 @@ $env:SIM_DISPLAY_OUTPUT = "2d"     # PowerShell sets the process env block;
 ```
 
 **Never `quad`.** A CTS session is a *legacy* session (§3), so it can submit at
-most 2 views; the #1499 mode floor would demote a 4-view mode anyway, and
-pinning it past the floor with `SIM_DISPLAY_FORCE_MODE` makes the lane fail —
+most 2 views; the #1499 mode floor would demote a 4-view mode to 2D anyway (with
+only {2D, Quad} there is no stereo mode to fall back to), and pinning it past the
+floor with `SIM_DISPLAY_FORCE_MODE=1` makes the lane fail —
 see [View-Configuration Model](view-configuration-model.md). `2d` and `sbs` both
 **stick**: `oxr_pick_fillable_mode_index()` returns the active index untouched
 whenever `view_count <= max_views`
@@ -992,9 +1000,11 @@ against the plug-in repo, do not mark the CTS test FAIL.
 
 ### 10.2 `EyeVisibility` — both views land on one panel
 
-**Rule: switch to `SIM_DISPLAY_OUTPUT=sbs` for this one test, and read the panel
-as two side-by-side images: LEFT half = left view, RIGHT half = right view. Pass
-only if each half contains exactly one quad, of the right colour.**
+**Rule: switch to `SIM_DISPLAY_OUTPUT=sbs` with `SIM_DISPLAY_START_3D=1` for this
+one test (sim-display starts in 2D otherwise, and a CTS session cannot move it),
+and read the panel as two side-by-side images: LEFT half = left view, RIGHT half
+= right view. Pass only if each half contains exactly one quad, of the right
+colour.**
 
 `XrEyeVisibility` asks the runtime to show a layer in one eye only — on an HMD
 you check by closing one eye. There is no "one eye" on a flat panel, and on a
@@ -1020,8 +1030,8 @@ is a real conformance defect, not a display artefact.
 Note `sbs` is **centre-cropped**, and the quads sit at x = ±1 m, i.e. toward the
 outer edges. A quad clipped by the crop is not the same as a quad suppressed by
 eye visibility. If a quad's presence is genuinely ambiguous, re-run this one
-test in `squeezed_sbs`, which places the tiles as-is with no crop, and judge
-there.
+test in `squeezed_sbs` (again with `SIM_DISPLAY_START_3D=1`), which places the
+tiles as-is with no crop, and judge there.
 
 ### 10.3 Stale-swapchain flicker versus weave-phase flicker
 

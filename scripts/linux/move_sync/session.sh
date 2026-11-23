@@ -48,6 +48,8 @@ export XR_RUNTIME_JSON="$WT/build/openxr_displayxr-dev.json"
 export LD_LIBRARY_PATH="$(ls -d "$WT"/build/_openxr-*/lib | head -1)"
 export VK_LAYER_PATH="$WT/build/src/xrt/targets/vk_layer"
 export OXR_ENABLE_VK_NATIVE_COMPOSITOR=1 SIM_DISPLAY_OUTPUT=anaglyph
+# sim-display starts in 2D since ADR-065: open in the anaglyph kind, as before.
+export SIM_DISPLAY_START_3D=1
 # The phase model: period 5 device px is not a divisor of the 3-logical-px
 # lattice probe grid at any tested scale, so the table baseline is constrained.
 export SIM_DISPLAY_INTERLACE_PERIOD="${SIM_PERIOD:-5}"
