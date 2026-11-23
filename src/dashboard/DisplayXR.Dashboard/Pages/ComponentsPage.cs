@@ -173,7 +173,7 @@ public sealed class ComponentsPage : Page
             sb.Append(ip.ClientsDropped);
         }
         if (Ctx.LastActionArea == PolicyCommands.AppArea) sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed);
-        sb.Append(_machine).Append(_calibration is null).Append('|');
+        sb.Append(_machine).Append('|');
         foreach (var s in Sections())
         {
             sb.Append(s.Id).Append(s.Count).Append(s.Connected).Append(s.ConnectedLine);
@@ -362,18 +362,10 @@ public sealed class ComponentsPage : Page
             U.AddFlow(head, policyChip, 10, 6);
             if (r.CanCalibrate)
             {
-                // Camera-pose calibration (tracking-provider-discovery.md §6; design: displayxr-tracking-open
-                // docs/design.md §10): a full-screen window on THIS screen that streams
-                // `tracking calibrate --screen <key> --watch --json`, solves and applies.
-                var screen = Ctx.Feed.Snapshot?.ScreenById(r.ScreenId);
-                string key = screen?.Key is { Length: > 0 } k ? k : r.ScreenId;
-                var calibrate = U.Button("Calibrate camera…", () => OpenCalibration(key, screen, r.Name), "quiet", "sm");
-                calibrate.IsEnabled = _calibration is null;
-                ToolTip.SetShowOnDisabled(calibrate, true);
-                ToolTip.SetTip(calibrate, _calibration is null
-                    ? "Measure where the camera sits next to this display, using your reflection in it, so the picture lines up with where you are."
-                    : "A calibration window is already open.");
-                Avalonia.Automation.AutomationProperties.SetName(calibrate, $"Calibrate camera for {r.Name}");
+                // Camera calibration lives on the display's own card on Displays.
+                var calibrate = U.Button("Calibrate on Displays →", () => Ctx.Navigate("displays"), "link");
+                ToolTip.SetTip(calibrate, "Calibrate camera… is on this display's card on Displays.");
+                Avalonia.Automation.AutomationProperties.SetName(calibrate, $"Calibrate camera for {r.Name} on Displays");
                 U.AddFlow(head, calibrate, 10, 6);
             }
             var reason = U.Wrapped(r.Reason, "soft");
@@ -386,28 +378,6 @@ public sealed class ComponentsPage : Page
         if (Ctx.Info?.Components.Tracking is { } sum && sum.ScanLine is { Length: > 0 } scan)
             col.Children.Add(U.Wrapped($"Last check of the installed camera head tracking: {scan}.", "meta"));
         return col;
-    }
-
-    private CalibrationWindow? _calibration;
-
-    /// <summary>
-    /// Open the calibration window for one provider-served screen (one at a time). After a successful
-    /// apply the tracking rows and info's tracking block are re-read.
-    /// </summary>
-    private void OpenCalibration(string screenKey, Screen? screen, string name)
-    {
-        if (_calibration is not null) { _calibration.Activate(); return; }
-        var w = new CalibrationWindow(Ctx.Cli, screenKey, screen, name, () =>
-        {
-            _ = Ctx.LoadPolicyAsync(ComponentClass.Tracking, force: true);
-            _ = Ctx.LoadInfoAsync(force: true);
-            Ctx.Toast($"Camera calibration saved for {name}.");
-        });
-        w.Closed += (_, _) => { _calibration = null; Update(); };
-        _calibration = w;
-        DashboardLog.Info($"calibration window opened for screen {screenKey}");
-        w.Show();
-        Update();
     }
 
     /// <summary>

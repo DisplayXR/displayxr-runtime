@@ -325,6 +325,15 @@ public static class StatusText
     /// <summary>The tooltip and accessible name of the amber mark on the Home rail entry (a machine-wide driver choice).</summary>
     public const string HomeBadgeTip = "One display driver is set for every display on this PC. Home says which, and how to clear it.";
 
+    /// <summary>
+    /// Whether a display card shows its driver selector on its face rather than behind Details: when
+    /// more than one display driver can drive this display (its candidates in <c>dp list --json</c>),
+    /// or when more than one 3D display is present. Otherwise there is nothing to choose between.
+    /// </summary>
+    public static bool DriverChoiceOnFace(Screen s, StatusSnapshot snap, DpList? dp) =>
+        Claimed(snap) > 1
+        || (dp?.Screen(s.Key)?.Candidates?.Select(c => c.PluginId).Distinct(StringComparer.OrdinalIgnoreCase).Count() ?? 0) > 1;
+
     /// <summary>The CLI verb a selector choice runs.</summary>
     public static CliArgs DpVerb(string key, DpChoice choice) => choice.PluginId is null
         ? new CliArgs("dp", "reset", "--screen", key)

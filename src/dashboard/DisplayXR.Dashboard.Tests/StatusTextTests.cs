@@ -316,6 +316,26 @@ public class StatusTextTests
     }
 
     [Fact]
+    public void DriverSelector_OnTheFace_OnlyWithAChoice()
+    {
+        var a = Design.Screens[0] with { Key = "k0" };
+        var one = Design with { Screens = new[] { a } };
+        var dp = new DpList(null, System.Array.Empty<DpRow>(), new[]
+        {
+            new DpScreen("k0", "", "", "leia-sr", null, null, false, "live", new[] { new DpCandidate("leia-sr", 100) }),
+        });
+        Assert.False(StatusText.DriverChoiceOnFace(a, one, dp));   // one 3D display, one driver: behind Details
+        Assert.False(StatusText.DriverChoiceOnFace(a, one, null));
+        var two = new DpList(null, System.Array.Empty<DpRow>(), new[]
+        {
+            new DpScreen("k0", "", "", "leia-sr", null, null, false, "live",
+                         new[] { new DpCandidate("leia-sr", 100), new DpCandidate("sim-display", 10) }),
+        });
+        Assert.True(StatusText.DriverChoiceOnFace(a, one, two));   // two drivers could drive it
+        Assert.True(StatusText.DriverChoiceOnFace(a, Design, dp)); // two 3D displays
+    }
+
+    [Fact]
     public void HomeRows_EffectiveDriverPerScreen()
     {
         var a = Design.Screens[0] with { Key = "k0" };
