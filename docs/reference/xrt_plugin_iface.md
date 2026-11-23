@@ -161,6 +161,25 @@ Construct the plug-in's `xrt_device` — the head / HMD-equivalent device for th
 
 Ownership of `*out_dev` is transferred to the runtime, which destroys the device via the usual `xrt_device::destroy` vtable method (not through this iface's `destroy`).
 
+**The device's rendering-mode table: two modes at run time
+([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md)).** Declare `rendering_modes[0]`
+= the flat 2D mode (1 view, `hardware_display_3d = false`) and `rendering_modes[1]` = your
+3D mode, `rendering_mode_count = 2`, `mode_index` = the array position. If your display
+supports several 3D *kinds* (layouts, weaver variants), expose the choice as a setting
+(`describe_settings` ENUM + `get_setting`) read when you create the device, and fill mode 1
+from it — the kind applies the next time the runtime starts, never under running apps. Set
+`active_rendering_mode_index` to the mode you start in. The runtime enforces the contract
+where it takes the table (right after `create_device`, again when your display info is
+applied): a longer table is trimmed to mode 0 plus one 3D mode (the one active at creation
+if it is 3D, else the first 3D one), with a WARN naming your plug-in and what was dropped,
+and `hmd->view_count` is recomputed from what remains. A table whose mode 0 is not the 1-view
+2D mode is kept as declared, with a WARN — it does not meet the contract. When the 3D mode
+kept is not your index 1, `XRT_DEVICE_PROPERTY_OUTPUT_MODE` still reaches your
+`set_property` / `get_property` in your own numbering, and for the duration of that call
+(under a lock the runtime owns) your device shows your own `rendering_mode_count`, so an
+index check and a `rendering_modes[index]` read still work — but declare two modes.
+`XRT_MAX_RENDERING_MODES` and the struct layout are unchanged; this is not an ABI change.
+
 ### Per-API DP factories
 
 ```c
@@ -237,7 +256,7 @@ Fields to populate:
 `xrt_rendering_mode::view_scale_x/y` (your device's mode table) is the **single
 source of truth** for view, tile and atlas sizing; `recommended_view_scale_*` is
 a **baseline hint only**, so leave it at `0` (the runtime derives it from the
-mode table) or derive it from the *same* numbers as the active 3D mode's scale —
+mode table) or derive it from the *same* numbers as the 3D mode's (mode 1's) scale —
 never compute it independently.
 
 The two feed different consumers, which is why a disagreement is a bug and not a

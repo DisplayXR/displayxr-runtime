@@ -321,7 +321,9 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   the switchable lens follow the mode the moment it lands (ADR-028), on every platform and every
   graphics API. It never ramps the stereo disparity; that is app content. An app that calls
   `xrRequestDisplayRenderingModeDXR` straight from a key press therefore snaps between full
-  parallax and flat. Route V / 0-8 through displayxr-common's `mode_switch.h`. Call
+  parallax and flat. Route V / 0 / 1 through displayxr-common's `mode_switch.h` (a driver
+  exposes two rendering modes at run time, mode 0 = 2D and mode 1 = its 3D mode, ADR-065;
+  digits 2-8 select nothing). Call
   `dxr::ModeSwitch::step(dt, want, modeCount, modeViewCounts, currentMode, steadyIpd)` once per
   frame, submit the returned `ipd` as the rig's `ipdFactor` (zones apps multiply each zone's
   `ipdFactor` by it, with `steadyIpd = 1`), and call the request only on the frame it returns

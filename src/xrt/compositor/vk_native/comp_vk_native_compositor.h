@@ -237,6 +237,19 @@ void
 comp_vk_native_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
 
 /*!
+ * #1499 / ADR-065: the most views this session can fill (its view
+ * configuration, after the session-begin floor), so the runtime's own V and
+ * '1' keys never move it into a mode it cannot fill - the key-path twin of the
+ * xrRequestDisplayRenderingModeDXR denial. 0 = no limit (orchestrators, a
+ * pinned device, service mode, DXR_MODE_FLOOR=0). Set by the state tracker at
+ * xrBeginSession; read on the frame path (same thread for in-process apps).
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_mode_fill_views(struct xrt_compositor *xc, uint32_t max_views);
+
+/*!
  * XR_DXR_depth_budget: whether this session asked for the rear depth budget.
  *
  * Latched exactly like the transparency flag, and for the same reason: the
@@ -444,7 +457,7 @@ comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
                                       uint64_t pinned_display_id);
 
 /*!
- * Set legacy app tile scaling flag (gates 1/2/3 key mode selection).
+ * Set legacy app tile scaling flag (gates 0/1 key mode selection).
  *
  * @ingroup comp_vk_native
  */

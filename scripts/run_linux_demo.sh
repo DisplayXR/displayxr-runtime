@@ -5,7 +5,9 @@
 # chosen target — a runtime cube app or one of the 5 demos — against that dev
 # runtime by delegating to the target's own run script (which handles its loader)
 # while exporting XR_RUNTIME_JSON + XRT_PLUGIN_SEARCH_PATH + SIM_DISPLAY_OUTPUT so
-# they all point at the runtime we just built.
+# they all point at the runtime we just built. sim-display serves 2D + the 3D kind
+# --output names and starts in 2D (ADR-065); SIM_DISPLAY_START_3D=1 (the default
+# here, overridable) opens the target in the kind. V toggles.
 #
 # Needs a Vulkan GPU + an X server (a real X11 session, or XWayland). No Leia
 # hardware required: sim-display weaves anaglyph/SBS to a normal monitor.
@@ -79,8 +81,9 @@ export XR_RUNTIME_JSON="$MANIFEST"
 export XRT_PLUGIN_SEARCH_PATH="$PLUGIN_DIR"
 export OXR_ENABLE_VK_NATIVE_COMPOSITOR="${OXR_ENABLE_VK_NATIVE_COMPOSITOR:-1}"
 export SIM_DISPLAY_OUTPUT="$OUTPUT"
+export SIM_DISPLAY_START_3D="${SIM_DISPLAY_START_3D:-1}"
 
-echo "=== Launching '$TARGET' (SIM_DISPLAY_OUTPUT=$OUTPUT) ==="
+echo "=== Launching '$TARGET' (SIM_DISPLAY_OUTPUT=$OUTPUT SIM_DISPLAY_START_3D=$SIM_DISPLAY_START_3D) ==="
 echo "    XR_RUNTIME_JSON=$XR_RUNTIME_JSON"
 echo "    XRT_PLUGIN_SEARCH_PATH=$XRT_PLUGIN_SEARCH_PATH"
 

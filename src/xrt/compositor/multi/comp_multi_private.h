@@ -250,8 +250,6 @@ struct multi_compositor
 	//! True when display is in 3D mode (weaver active). False = 2D passthrough.
 	bool hardware_display_3d;
 
-	//! Last known 3D rendering mode index (for V-key toggle restore).
-	uint32_t last_3d_mode_index;
 
 	/*!
 	 * Active CONTENT rendering mode — the atlas recipe (ADR-028, #553).

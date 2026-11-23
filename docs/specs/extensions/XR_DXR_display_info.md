@@ -78,7 +78,7 @@ This proposal introduces four independent but complementary extensions:
 | `XR_DXR_win32_window_binding` | App provides a Win32 HWND for runtime rendering; enables windowed mode, multi-app, app-controlled input, and window-space overlay layers. |
 | `XR_DXR_android_surface_binding` | App provides an Android `ANativeWindow` for runtime rendering; the Android counterpart to the Win32 window binding. |
 | `XR_DXR_cocoa_window_binding` | App provides a Cocoa `NSView*` (with `CAMetalLayer` backing) for runtime rendering on macOS. |
-| `XR_DXR_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, and display mode switching capability. Provides `xrRequestDisplayModeDXR` for 2D/3D mode control, `xrRequestEyeTrackingModeDXR` for managed/manual eye tracking selection, and `xrRequestDisplayRenderingModeDXR` for vendor-specific rendering mode switching. In RAW mode, `xrLocateViews` returns eye positions relative to the display plane (`XrViewDisplayRawDXR::displayPlanePose` locates that plane in the requested space). |
+| `XR_DXR_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, and display mode switching capability. Provides `xrRequestDisplayModeDXR` for 2D/3D mode control, `xrRequestEyeTrackingModeDXR` for managed/manual eye tracking selection, and `xrRequestDisplayRenderingModeDXR` for switching between the 2D mode and the driver's 3D mode. In RAW mode, `xrLocateViews` returns eye positions relative to the display plane (`XrViewDisplayRawDXR::displayPlanePose` locates that plane in the requested space). |
 
 Together they form a minimal, complete interface for tracked 3D display rendering through
 OpenXR across desktop, mobile, and macOS platforms.
@@ -130,7 +130,7 @@ displays. See [OPEN 4](#open-issues) in the Issues section.
         │       XR_DISPLAY_MODE_3D_DXR  /  XR_DISPLAY_MODE_2D_DXR
         │
         ├── xrRequestDisplayRenderingModeDXR(session, modeIndex)  [optional]
-        │       mode 0 = standard, 1+ = vendor-defined
+        │       mode 0 = 2D, mode 1 = the driver's 3D mode
         │
         ├── xrLocateViews(space = LOCAL)
         │       ◄── per-eye positions in screen-centered coordinates (RAW mode)
@@ -2599,12 +2599,19 @@ vendor-neutral way for applications to switch between these modes at runtime.
 XrResult xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex);
 ```
 
-Switches the active display rendering mode. Mode indices are vendor-defined:
+Switches the active display rendering mode. A display driver exposes **two** rendering modes
+at run time ([ADR-065](../../adr/ADR-065-two-runtime-rendering-modes.md)):
 
 | Index | Meaning |
 |-------|---------|
-| 0 | Standard rendering (always available) |
-| 1+ | Vendor-specific variations |
+| 0 | 2D — one view (always available) |
+| 1 | The driver's 3D mode |
+
+Which 3D *kind* mode 1 is (side-by-side, anaglyph, a multi-view quilt, a weaver variant) is a
+per-driver setting applied when the runtime starts; an application never cycles through kinds.
+A driver that declares more modes has its table trimmed by the runtime to 2D plus one 3D mode
+(the one it is in at creation, else its first 3D mode). The index is the array position in the
+enumerated table.
 
 A mode change is a **request**, not an immediate state change. The runtime fires
 `XrEventDataRenderingModeChangedDXR` when the active mode actually changes (and
@@ -2641,7 +2648,7 @@ typedef struct XrDisplayRenderingModeInfoDXR {
 
 | Member | Description |
 |---|---|
-| `modeIndex` | Vendor-defined index to pass to `xrRequestDisplayRenderingModeDXR`. |
+| `modeIndex` | Index to pass to `xrRequestDisplayRenderingModeDXR`: 0 = 2D, 1 = the driver's 3D mode. Equal to the mode's position in the enumerated array. |
 | `modeName` | Human-readable label (e.g. `"2D"`, `"Stereo SBS"`, `"Quad"`). |
 | `viewCount` | Number of views this mode renders. Drives the `xrLocateViews` render/submit loop bound (1=mono … 4=quad). |
 | `viewScaleX/Y` | Per-view render-resolution scale. The app sizes each tile as `windowSize × viewScale` (see [Recommended View Scale](#recommended-view-scale) and the multiview tiling spec). |
@@ -2800,5 +2807,5 @@ The runtime is based on Monado (open-source OpenXR runtime) with native composit
 | **Nominal viewer position** | A static, design-time expectation of the viewer's position relative to the display. Not tracked; defines the apex of the canonical display pyramid. |
 | **Disparity** | Horizontal shift between left and right eye images, measured as a fraction of window width. Controls perceived depth of window-space layers. |
 | **Display mode** | The physical 2D/3D state of a tracked 3D display's switchable element (e.g. lenticular lens). Follows the active rendering mode's default automatically; `xrRequestDisplayModeDXR` (v15) overrides it alone for the current mode, leaving content and DP processing untouched. |
-| **Display rendering mode** | A vendor-specific rendering variation within 3D mode (e.g., SBS stereo, anaglyph, lenticular). Controlled via `xrRequestDisplayRenderingModeDXR`. Mode 0 is standard; higher indices are vendor-defined. |
+| **Display rendering mode** | One of the two modes a driver exposes at run time: mode 0 = 2D, mode 1 = the driver's 3D mode, whose kind (e.g., SBS stereo, anaglyph, lenticular) is a per-driver setting applied at start-up (ADR-065). Controlled via `xrRequestDisplayRenderingModeDXR`. |
 | **Surface binding** | A platform-specific mechanism for the application to provide its own rendering surface to the runtime (`HWND` on Win32; `ANativeWindow*` + Java `Surface` + screen position on Android). |

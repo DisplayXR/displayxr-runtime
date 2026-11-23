@@ -270,7 +270,7 @@ bool
 qwerty_check_display_mode_toggle(struct xrt_device **xdevs, size_t xdev_count, bool *out_force_2d);
 
 /*!
- * Check if a rendering mode change is pending (1/2/3 key).
+ * Check if a rendering mode change is pending (0/1 key, ADR-065).
  *
  * Scans @p xdevs for a qwerty_system and checks its pending state.
  * If a change is pending, clears the pending flag and sets @p out_mode
@@ -278,7 +278,7 @@ qwerty_check_display_mode_toggle(struct xrt_device **xdevs, size_t xdev_count, b
  *
  * @param xdevs Array of devices to search for qwerty devices
  * @param xdev_count Number of devices in the array
- * @param[out] out_mode Receives the rendering mode index (0=SBS, 1+=vendor-defined)
+ * @param[out] out_mode Receives the rendering mode index (0 = 2D, 1 = the driver's 3D mode)
  * @return true if a change was pending (and is now cleared), false otherwise
  *
  * @ingroup drv_qwerty
@@ -288,7 +288,7 @@ qwerty_check_rendering_mode_change(struct xrt_device **xdevs, size_t xdev_count,
 
 /*!
  * Update the qwerty stored rendering mode without triggering a pending change.
- * Used by the polling code to feed back wrapped mode indices (for V key cycling).
+ * Used by the macOS polling code to feed back a range-checked mode index.
  *
  * @ingroup drv_qwerty
  */

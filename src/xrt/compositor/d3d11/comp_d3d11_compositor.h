@@ -354,6 +354,19 @@ void
 comp_d3d11_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
 
 /*!
+ * #1499 / ADR-065: the most views this session can fill (its view
+ * configuration, after the session-begin floor), so the runtime's own V and
+ * '1' keys never move it into a mode it cannot fill - the key-path twin of the
+ * xrRequestDisplayRenderingModeDXR denial. 0 = no limit (orchestrators, a
+ * pinned device, service mode, DXR_MODE_FLOOR=0). Set by the state tracker at
+ * xrBeginSession; read on the frame path (same thread for in-process apps).
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_compositor_set_mode_fill_views(struct xrt_compositor *xc, uint32_t max_views);
+
+/*!
  * XR_DXR_depth_budget: whether this session asked for the rear depth budget.
  *
  * Latched exactly like the transparency flag, and for the same reason: the
@@ -518,7 +531,7 @@ comp_d3d11_compositor_set_system_devices(struct xrt_compositor *xc,
  * Set the legacy app tile scaling flag for the compositor.
  *
  * When true, the compositor disables direct rendering mode selection via
- * qwerty 1/2/3 keys and keeps view dimensions fixed at the compromise scale.
+ * qwerty 0/1 keys and keeps view dimensions fixed at the compromise scale.
  *
  * @param xc The compositor.
  * @param legacy true if legacy app tile scaling is active.

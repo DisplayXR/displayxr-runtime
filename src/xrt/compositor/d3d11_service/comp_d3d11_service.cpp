@@ -28,6 +28,7 @@
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_display_status.h"
 
+#include "util/u_rendering_modes.h"
 // #1589/#1610: the shared format-honesty policy (hatch + fast-path predicate).
 #include "util/u_color_encoding.h"
 #include "util/u_logging.h"
@@ -1149,6 +1150,13 @@ struct d3d11_service_compositor
 	//! Current focus state
 	bool state_focused;
 
+	//! #1499 / ADR-065: the widest projection layer this client has submitted -
+	//! under ADR-041 that is R, its view configuration's count, fixed for the
+	//! session (2 for PRIMARY_STEREO and every legacy app). The V / '1' keys
+	//! never move the panel into a mode wider than this for the client they are
+	//! applied on. 0 = nothing submitted yet (no opinion).
+	uint32_t mode_fill_views_seen;
+
 	//! True if this client was created as a headless bridge-relay session
 	//! (XR_DXR_display_info + XR_MND_headless). Tracked on the compositor so
 	//! compositor_destroy can clear the global g_bridge_relay_active gate
@@ -2171,9 +2179,6 @@ struct d3d11_service_system
 	//! True when display is in 3D mode (weaver active). False = 2D passthrough.
 	bool hardware_display_3d;
 
-	//! Last known 3D rendering mode index (for V-key toggle restore).
-	uint32_t last_3d_mode_index;
-
 	//! Workspace mode: multi-compositor with shared window for all clients.
 	//! Read from base.info.workspace_mode on first client connect.
 	//!
@@ -2358,6 +2363,13 @@ struct d3d11_service_system
 	//! exactly as before. 100 ms TTL gives 10 Hz polling — way more than
 	//! enough for hardware-mode-switch detection.
 	std::atomic<int64_t> last_3d_state_poll_ns{0};
+	//! F5 / ADR-065: the content target of the newest QUEUED mode transition,
+	//! plus one (0 = none queued). The render thread applies queued
+	//! transitions later (#966), so active_rendering_mode_index lags a V press;
+	//! the next V reads this instead, so two quick presses toggle twice instead
+	//! of computing the same target and coalescing into one. Encoded +1 so the
+	//! struct's memset(0) means "none" (#memset-kills-default-init).
+	std::atomic<uint32_t> queued_mode_target_plus1{0};
 	std::atomic<bool>    cached_3d_state{false};
 	std::atomic<bool>    cached_3d_state_valid{false};
 
@@ -5348,8 +5360,8 @@ push_mode_request_denied(struct d3d11_service_compositor *c,
  * catch up" pattern that exposed a 1–N frame raw-atlas artifact while clients
  * lagged the layout change.
  *
- * Caller is responsible for any pre-flip bookkeeping (e.g. saving
- * sys->last_3d_mode_index before transitioning to 2D). This helper:
+ * Caller is responsible for any pre-flip bookkeeping (since ADR-065 the 3D
+ * mode is always index 1, so there is no "last 3D mode" to save). This helper:
  *   1. Broadcasts XrEventDataRenderingModeChangedDXR immediately so clients
  *      can begin re-submitting at the new layout.
  *   2. Marks the multi-comp as MFP_WAITING_ACK with the curtain ON.
@@ -5573,9 +5585,6 @@ apply_mode_transition(struct d3d11_service_system *sys,
 	}
 
 	if (target_idx != UINT32_MAX && target_idx != prev_idx) {
-		if (prev_idx < head->rendering_mode_count && head->rendering_modes[prev_idx].hardware_display_3d) {
-			sys->last_3d_mode_index = prev_idx;
-		}
 		head->hmd->active_rendering_mode_index = target_idx;
 		xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target_idx);
 		broadcast_rendering_mode_change(sys, head, prev_idx, target_idx);
@@ -6295,6 +6304,9 @@ service_request_mode_transition(struct d3d11_service_system *sys,
 	cmd.type = WS_CMD_MODE_TRANSITION;
 	cmd.xc = c; // pointer identity only; never dereferenced at drain
 	cmd.mode_target_idx = target_idx;
+	if (target_idx != UINT32_MAX) {
+		sys->queued_mode_target_plus1.store(target_idx + 1, std::memory_order_release);
+	}
 	cmd.mode_want_3d = want_3d;
 	cmd.mode_skip_dp = skip_dp;
 	cmd.mode_tag = tag; // string literal — outlives the ring
@@ -18458,17 +18470,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			    ? sys->xsysd->static_roles.head : nullptr;
 
 			if (head != nullptr && head->hmd != NULL) {
-				uint32_t target_idx;
-				if (want_2d) {
-					uint32_t cur = head->hmd->active_rendering_mode_index;
-					if (cur < head->rendering_mode_count &&
-					    head->rendering_modes[cur].hardware_display_3d) {
-						sys->last_3d_mode_index = cur;
-					}
-					target_idx = 0; // mode 0 = 2D mono
-				} else {
-					target_idx = sys->last_3d_mode_index;
-				}
+				// ADR-065: 2D is mode 0, the driver's 3D mode is always mode 1.
+				const uint32_t target_idx = (want_2d) ? U_RENDERING_MODE_2D : U_RENDERING_MODE_3D;
 				multi_compositor_request_mode_flip(sys, target_idx, mc->focused_slot);
 			}
 
@@ -25194,35 +25197,41 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		    sys->xsysd->xdevs, sys->xsysd->xdev_count, &force_2d);
 		if (toggled) {
 			struct xrt_device *head = sys->xsysd->static_roles.head;
-			if (head != nullptr && head->hmd != NULL) {
-				uint32_t target_idx;
-				if (force_2d) {
-					// #966: apply_mode_transition saves the outgoing 3D mode
-					// itself, on the render thread. Keep the legacy write for
-					// the direct-apply path only.
-					uint32_t cur = head->hmd->active_rendering_mode_index;
-					if (!pipeline_always_on(sys) && cur < head->rendering_mode_count &&
-					    head->rendering_modes[cur].hardware_display_3d) {
-						sys->last_3d_mode_index = cur;
-					}
-					target_idx = 0; // mode 0 = 2D mono
+			if (head != nullptr && head->hmd != NULL &&
+			    head->rendering_mode_count >= U_RENDERING_MODES_RUNTIME_COUNT) {
+				// ADR-065: V toggles mode 0 <-> mode 1, decided from the mode the
+				// device is in now (qwerty's own flag can be out of phase with a
+				// mode an app or the session-begin floor chose) - or, when a
+				// transition is still queued for the render thread (F5), from the
+				// mode it will land in, so a second press toggles back.
+				const uint32_t queued = sys->queued_mode_target_plus1.load(std::memory_order_acquire);
+				const uint32_t from_idx =
+				    queued != 0 ? queued - 1 : head->hmd->active_rendering_mode_index;
+				const uint32_t target_idx = u_rendering_modes_toggle_target(
+				    head->rendering_modes, head->rendering_mode_count, from_idx);
+				// #1499 on the key path: not into a mode the client cannot fill.
+				if (!u_rendering_modes_key_target_allowed(head->rendering_modes,
+				                                          head->rendering_mode_count, target_idx,
+				                                          c->mode_fill_views_seen)) {
+					u_rendering_modes_log_key_refused(&head->rendering_modes[target_idx],
+					                                  c->mode_fill_views_seen);
 				} else {
-					target_idx = sys->last_3d_mode_index;
-				}
+					force_2d = (target_idx == U_RENDERING_MODE_2D);
 
-				if (sys->workspace_mode &&
-				    sys->multi_comp != nullptr) { // #961: acked flip needs the render thread
-					multi_compositor_request_mode_flip(sys, target_idx, /*origin=*/-1);
-				} else {
-					// #961: runtime-initiated (V key) — DP first, events after.
-					// #966: applied by the render thread.
-					(void)service_request_mode_transition(sys, c, target_idx, !force_2d,
-					                                      /*skip_dp*/ false, "qwerty_v");
-				}
+					if (sys->workspace_mode &&
+					    sys->multi_comp != nullptr) { // #961: acked flip needs the render thread
+						multi_compositor_request_mode_flip(sys, target_idx, /*origin=*/-1);
+					} else {
+						// #961: runtime-initiated (V key) — DP first, events after.
+						// #966: applied by the render thread.
+						(void)service_request_mode_transition(sys, c, target_idx, !force_2d,
+						                                      /*skip_dp*/ false, "qwerty_v");
+					}
+				} // key allowed
 			}
 		}
 
-		// Rendering mode change from qwerty 1/2/3 keys (disabled for legacy apps).
+		// Rendering mode change from the qwerty 0/1 keys (disabled for legacy apps).
 		//
 		// #1499: this gate is DEAD in the server. legacy_app_tile_scaling has no
 		// IPC carrier - it is computed in oxr_system_fill_in() inside the CLIENT
@@ -25234,11 +25243,24 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// the mode the lease moved to is TOLD (the #1499 observation WARN in
 		// oxr_session.c's XRT_SESSION_EVENT_RENDERING_MODE_CHANGE arm) and never
 		// silently clamped; it is not given a veto over the other clients' display.
+		// ADR-065 narrows that for the keys only: V and '1' are applied on behalf
+		// of the committing client, and with {2D, a 4-view kind} they no longer
+		// move the panel into a mode that client's view configuration (R, read off
+		// its projection layers) cannot fill. Requests and the lease are unchanged.
 		if (!sys->base.info.legacy_app_tile_scaling) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(sys->xsysd->xdevs, sys->xsysd->xdev_count, &render_mode)) {
 				struct xrt_device *head = sys->xsysd->static_roles.head;
-				if (head != NULL && head->hmd != NULL) {
+				if (head != NULL && head->hmd != NULL && render_mode >= 0 &&
+				    !u_rendering_modes_key_target_allowed(
+				        head->rendering_modes, head->rendering_mode_count, (uint32_t)render_mode,
+				        c->mode_fill_views_seen)) {
+					// #1499 on the key path: '1' never into a mode the client cannot fill.
+					if ((uint32_t)render_mode < head->rendering_mode_count) {
+						u_rendering_modes_log_key_refused(&head->rendering_modes[render_mode],
+						                                  c->mode_fill_views_seen);
+					}
+				} else if (head != NULL && head->hmd != NULL) {
 					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
 					broadcast_rendering_mode_change(sys, head, prev_idx,
@@ -25403,9 +25425,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					uint32_t cur = rhead->hmd->active_rendering_mode_index;
 					bool cur_is_3d = cur < rhead->rendering_mode_count &&
 					                 rhead->rendering_modes[cur].hardware_display_3d;
-					if (!cur_is_3d && sys->last_3d_mode_index < rhead->rendering_mode_count &&
-					    rhead->rendering_modes[sys->last_3d_mode_index].hardware_display_3d) {
-						restore_idx = sys->last_3d_mode_index;
+					if (!cur_is_3d && U_RENDERING_MODE_3D < rhead->rendering_mode_count &&
+					    rhead->rendering_modes[U_RENDERING_MODE_3D].hardware_display_3d) {
+						restore_idx = U_RENDERING_MODE_3D;
 					}
 				}
 				// #966: applied by the render thread.
@@ -25425,19 +25447,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				if (!bridge_live) {
 				struct xrt_device *head = sys->xsysd ? sys->xsysd->static_roles.head : nullptr;
 				if (head != nullptr && head->hmd != NULL) {
-					uint32_t target_idx;
-					if (!vendor_is_3d) {
-						// #966: as above — the render thread saves it.
-						uint32_t cur = head->hmd->active_rendering_mode_index;
-						if (!pipeline_always_on(sys) &&
-						    cur < head->rendering_mode_count &&
-						    head->rendering_modes[cur].hardware_display_3d) {
-							sys->last_3d_mode_index = cur;
-						}
-						target_idx = 0; // mode 0 = 2D
-					} else {
-						target_idx = sys->last_3d_mode_index;
-					}
+					// ADR-065: 2D is mode 0, the driver's 3D mode is always mode 1.
+					const uint32_t target_idx =
+					    (!vendor_is_3d) ? U_RENDERING_MODE_2D : U_RENDERING_MODE_3D;
 					if (sys->workspace_mode &&
 					    sys->multi_comp != nullptr) { // #961: acked flip needs the render thread
 						// Vendor-initiated: hardware is ALREADY at vendor_is_3d
@@ -25552,12 +25564,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	    client_holds_panel_lease(sys, c)) { // #961: only the lease holder drives the panel
 		struct xrt_device *zhead = sys->xsysd->static_roles.head;
 		if (zhead != nullptr && zhead->hmd != NULL) {
-			// Prefer the last 3D mode; fall back to the first 3D-capable
-			// mode (last_3d_mode_index is only saved on 3D→2D flips).
+			// Prefer mode 1, the driver's 3D mode (ADR-065); fall back to the
+			// first 3D-capable mode (a table the runtime refused to trim).
 			uint32_t mode_idx = zhead->rendering_mode_count; // invalid sentinel
-			if (sys->last_3d_mode_index < zhead->rendering_mode_count &&
-			    zhead->rendering_modes[sys->last_3d_mode_index].hardware_display_3d) {
-				mode_idx = sys->last_3d_mode_index;
+			if (U_RENDERING_MODE_3D < zhead->rendering_mode_count &&
+			    zhead->rendering_modes[U_RENDERING_MODE_3D].hardware_display_3d) {
+				mode_idx = U_RENDERING_MODE_3D;
 			} else {
 				for (uint32_t m = 0; m < zhead->rendering_mode_count; m++) {
 					if (zhead->rendering_modes[m].hardware_display_3d) {
@@ -25631,13 +25643,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (++c->render.commit_frame_counter >= DEFERRED_3D_KICK_FRAMES) {
 			struct xrt_device *head = sys->xsysd->static_roles.head;
 			if (head != nullptr && head->hmd != NULL && !sys->hardware_display_3d) {
-				// Prefer the last 3D mode; fall back to the first 3D-capable
-				// mode (last_3d_mode_index is only saved on 3D→2D flips). Same
-				// selection as the zones tier-1 fallback above.
+				// Prefer mode 1, the driver's 3D mode (ADR-065); fall back to the
+				// first 3D-capable mode (a table the runtime refused to trim).
+				// Same selection as the zones tier-1 fallback above.
 				uint32_t mode_idx = head->rendering_mode_count; // invalid sentinel
-				if (sys->last_3d_mode_index < head->rendering_mode_count &&
-				    head->rendering_modes[sys->last_3d_mode_index].hardware_display_3d) {
-					mode_idx = sys->last_3d_mode_index;
+				if (U_RENDERING_MODE_3D < head->rendering_mode_count &&
+				    head->rendering_modes[U_RENDERING_MODE_3D].hardware_display_3d) {
+					mode_idx = U_RENDERING_MODE_3D;
 				} else {
 					for (uint32_t m = 0; m < head->rendering_mode_count; m++) {
 						if (head->rendering_modes[m].hardware_display_3d) {
@@ -25907,6 +25919,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (mode_tiles == 0)
 			mode_tiles = 1;
 		uint32_t proj_view_count = layer->data.view_count;
+		if (layer->data.view_count > c->mode_fill_views_seen) {
+			c->mode_fill_views_seen = layer->data.view_count; // #1499 key gate (R, before the clamp)
+		}
 		if (proj_view_count > mode_tiles)
 			proj_view_count = mode_tiles;
 		if (!sys->hardware_display_3d)
@@ -31172,18 +31187,19 @@ weave_force_3d_if_needed(struct d3d11_service_system *sys, struct d3d11_service_
 	// blocker 2). A present-owner that asked for a specific mode via
 	// xrRequestDisplayRenderingModeDXR has had it applied by
 	// service_apply_pending_mode() just above; without this branch the
-	// last-3D/first-3D fallback below would immediately overwrite it — and
+	// mode-1/first-3D fallback below would immediately overwrite it — and
 	// because this helper is self-healing (re-fires every submit while the SR
-	// reads 2D) it would fight the request every frame. On sim_display the
-	// first-3D fallback is mode 1 "Anaglyph" (2 views), so an app asking for
-	// mode 4 "Quad" (4 views) could never hold it.
+	// reads 2D) it would fight the request every frame. (Written when
+	// sim_display still had several 3D modes and the fallback could replace a
+	// requested 4-view mode with a 2-view one; with two modes since ADR-065 it
+	// still keeps an active 3D mode from being re-picked.)
 	uint32_t mode_idx = head->rendering_mode_count;
 	uint32_t active_idx = head->hmd->active_rendering_mode_index;
 	if (active_idx < head->rendering_mode_count && head->rendering_modes[active_idx].hardware_display_3d) {
 		mode_idx = active_idx;
-	} else if (sys->last_3d_mode_index < head->rendering_mode_count &&
-	           head->rendering_modes[sys->last_3d_mode_index].hardware_display_3d) {
-		mode_idx = sys->last_3d_mode_index;
+	} else if (U_RENDERING_MODE_3D < head->rendering_mode_count &&
+	           head->rendering_modes[U_RENDERING_MODE_3D].hardware_display_3d) {
+		mode_idx = U_RENDERING_MODE_3D;
 	} else {
 		for (uint32_t m = 0; m < head->rendering_mode_count; m++) {
 			if (head->rendering_modes[m].hardware_display_3d) {
@@ -35077,7 +35093,6 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	sys->usys = usys;
 	sys->log_level = U_LOGGING_INFO;
 	sys->hardware_display_3d = true;
-	sys->last_3d_mode_index = 1;
 
 	// #964 (D-7): latch the pipeline-vs-legacy choice once, up front, and say
 	// which one is running — every downstream gate is a field read from here.
@@ -39518,6 +39533,11 @@ service_ws_cmd_apply(struct d3d11_service_system *sys, const struct ws_command *
 		struct xrt_display_processor_d3d11 *xdp = cmd->mode_skip_dp ? nullptr : panel_dp(sys, nullptr);
 		const char *tag = cmd->mode_tag != nullptr ? cmd->mode_tag : "queued";
 		bool landed = apply_mode_transition(sys, head, xdp, cmd->mode_target_idx, cmd->mode_want_3d, tag);
+		if (cmd->mode_target_idx != UINT32_MAX) {
+			// No longer pending - unless a newer transition was queued since.
+			uint32_t expected = cmd->mode_target_idx + 1;
+			sys->queued_mode_target_plus1.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+		}
 		U_LOG_W("[%s] via=queue applied on the render thread: content=%d hw3d=%d dp=%s landed=%d", tag,
 		        cmd->mode_target_idx == UINT32_MAX ? -1 : (int)cmd->mode_target_idx,
 		        (int)cmd->mode_want_3d, cmd->mode_skip_dp ? "skipped" : (xdp != nullptr ? "panel" : "none"),

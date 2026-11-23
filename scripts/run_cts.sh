@@ -435,8 +435,10 @@ export DXR_WINDOW_FULLSCREEN="${DXR_WINDOW_FULLSCREEN:-0}"
 # caller's environment, and each is printed so the run record carries it.
 CAPTURE_DIR=""
 if [ -n "$INTERACTIVE" ]; then
-  # sim_display's default output is ANAGLYPH, which destroys every colour
-  # judgement (§2.3). 2d = the first view flat and full-window.
+  # sim_display starts in 2D (ADR-065), but its 3D kind is ANAGLYPH, which
+  # destroys every colour judgement (§2.3). 2d = the first view flat and
+  # full-window, and forces the flat start whatever else is set. For the
+  # EyeVisibility pass use SIM_DISPLAY_OUTPUT=sbs SIM_DISPLAY_START_3D=1.
   export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-2d}"
   # The 100-degree legacy rig: under the default 60-degree one the gradient
   # pairs' prompt quad falls outside the frustum (§6, §10.6).

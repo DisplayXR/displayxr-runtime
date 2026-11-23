@@ -24,6 +24,7 @@
 
 #include "util/u_debug.h"
 #include "util/u_misc.h"
+#include "util/u_rendering_modes.h"
 #include "util/u_system.h"
 #include "util/u_time.h"
 #include "util/u_tiling.h"
@@ -440,6 +441,15 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 	// on the 3D modes). Runs AFTER the #441 check above: that check is about
 	// the plug-in's own honesty, the composition is the trunk's.
 	target_viewer_tracking_apply(info, head, plugin, pdi);
+
+	// ADR-065: the two-mode contract, re-asserted on every apply. Already met
+	// after t_instance_create_system's enforce (a no-op here then); this
+	// catches a plug-in that fills or rewrites its table lazily (re-trimmed
+	// keeping the same kind; serialised by g_display_info_mutex on the refresh
+	// path, single-threaded at create), and runs
+	// BEFORE the tiling + worst-case atlas below so both are computed from
+	// the table the runtime actually serves.
+	(void)u_device_reenforce_two_rendering_modes(head, plugin->id);
 
 	// Compute tiling once we have native pixel dims. The per-mode
 	// fields are filled for the current orientation, but the
@@ -1339,6 +1349,17 @@ t_instance_create_system(struct xrt_instance *xinst,
 	    &xso);                                  // out_xso
 	if (xret != XRT_SUCCESS) {
 		return xret;
+	}
+
+	// ADR-065: a display driver's run-time table is [0] = 2D, [1] = 3D. Enforced
+	// here, once, before anything reads the head's table: the compositor below
+	// (tile layout, V-key toggle), the IPC shared-memory copy, oxr's system
+	// view count (hmd->view_count, recomputed by the trim). A longer table is
+	// trimmed with one WARN naming the driver.
+	if (xsysd->static_roles.head != NULL) {
+		const struct xrt_plugin_iface *tm_plugin = target_plugin_get_active();
+		(void)u_device_enforce_two_rendering_modes(xsysd->static_roles.head,
+		                                           (tm_plugin != NULL) ? tm_plugin->id : NULL);
 	}
 
 	// Early out if we only want devices.

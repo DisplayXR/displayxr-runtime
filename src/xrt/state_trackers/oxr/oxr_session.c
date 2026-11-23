@@ -326,6 +326,62 @@ oxr_session_may_move_display_mode(struct oxr_session *sess,
 	return oxr_may_demote(mode_pinned != 0, service_mode);
 }
 
+/*!
+ * #1499 / ADR-065: tell the in-process native compositor how many views this
+ * session can fill, so its V / '1' key paths (u_rendering_modes_key_target_allowed)
+ * refuse a mode this session cannot fill - the key-path twin of the begin floor
+ * and the request denial, with the same exemptions: no limit (0) when the floor
+ * is off, for an orchestrator (workspace controller / bridge relay), for a
+ * pinned device and in service mode. A legacy session submits a fixed two
+ * views; an extension session one segment's share of its view configuration.
+ * IPC sessions are answered by the service, not here.
+ */
+static void
+oxr_session_publish_mode_fill_views(struct oxr_session *sess, struct xrt_device *head, bool legacy_session)
+{
+	uint32_t fill = 0;
+	if (oxr_session_mode_floor_enabled() && !sess->is_active_workspace_controller && !sess->is_bridge_relay &&
+	    oxr_session_may_move_display_mode(sess, head, NULL, NULL)) {
+		fill = legacy_session ? OXR_LEGACY_MAX_SUBMITTED_VIEWS
+		                      : oxr_segment_views_per_segment_capacity(
+		                            sess->view_config_view_count != 0 ? sess->view_config_view_count : 2,
+		                            sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR,
+		                            head->hmd->view_count);
+	}
+	if (sess->xcn == NULL) {
+		return;
+	}
+	struct xrt_compositor *xc = &sess->xcn->base;
+	(void)xc;
+	(void)fill;
+#if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	if (sess->is_d3d11_native_compositor) {
+		comp_d3d11_compositor_set_mode_fill_views(xc, fill);
+	}
+#endif
+#if defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	if (sess->is_d3d12_native_compositor) {
+		comp_d3d12_compositor_set_mode_fill_views(xc, fill);
+	}
+#endif
+#if defined(XRT_HAVE_GL_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	if (sess->is_gl_native_compositor) {
+		comp_gl_compositor_set_mode_fill_views(xc, fill);
+	}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		comp_vk_native_compositor_set_mode_fill_views(xc, fill);
+	}
+#endif
+#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_OS_MACOS)
+	if (sess->is_metal_native_compositor) {
+		comp_metal_compositor_set_mode_fill_views(xc, fill);
+	}
+#endif
+}
+
+
 
 /*
  *
@@ -1889,6 +1945,12 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 			}
 
 			sess->last_rendering_mode_index = default_mode;
+
+			// #1499 / ADR-065: the same fill limit, handed to the in-process
+			// compositor for its V / '1' keys, so a key never moves this
+			// session into the mode the floor above took it out of.
+			oxr_session_publish_mode_fill_views(sess, head, legacy_session);
+
 			if (default_mode < head->rendering_mode_count) {
 				struct xrt_rendering_mode *mode = &head->rendering_modes[default_mode];
 				oxr_session_request_display_mode(log, sess, mode->hardware_display_3d);

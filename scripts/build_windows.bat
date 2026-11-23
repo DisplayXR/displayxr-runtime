@@ -298,6 +298,10 @@ set "PKG=%REPO%_package"
 :: Generate one run_<app>.bat per built exe. Env is DERIVED from the app name,
 :: matching the rule documented in test_apps\apps.cmake (single source of truth):
 ::   * name contains "zones" -> set DISPLAYXR_ZONES=1 (advertise XR_DXR_display_zones)
+::   * every script            -> set DXR_DP_SIM_DISPLAY_START_3D=1: sim-display starts
+::                              in 2D since ADR-065; the dev run scripts open in its 3D
+::                              kind, as they always did and as the macOS / Linux
+::                              run_*.sh do (no effect on any other display processor).
 ::   * name contains "_vk"   -> Vulkan app owns its VkInstance; keep implicit layers.
 ::                              Every other app disables them (#105).
 :: All scripts prepend _package\bin to PATH so the runtime DLL's delay-loaded SR
@@ -314,6 +318,7 @@ if exist "%TA_BIN%" (
             echo @echo off
             echo set "XR_RUNTIME_JSON=%RT_JSON%"
             if defined ISZONES echo set "DISPLAYXR_ZONES=1"
+            echo set "DXR_DP_SIM_DISPLAY_START_3D=1"
             if not defined ISVK echo set "VK_LOADER_LAYERS_DISABLE=*"
             echo set "PATH=%PKG%\bin;%%PATH%%"
             echo "%%E" %%*

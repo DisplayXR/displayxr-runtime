@@ -59,7 +59,7 @@ Four classes (handle, texture, hosted, IPC) — full reference: `docs/getting-st
 - Test app naming: `cube_{class}_{api}_{platform}` (e.g. `cube_handle_metal_macos`, `cube_zones_texture_d3d11_win`).
 
 ### Extension vs legacy apps
-Full reference: `docs/architecture/extension-vs-legacy.md`. `_handle` and `_texture` are always extension apps; `_hosted` can be either. Legacy-app compromise scaling is computed in `oxr_system_fill_in()`. The `legacy_app_tile_scaling` flag on `xrt_system_compositor_info` disables 1/2/3-key mode selection for legacy apps (V toggle only).
+Full reference: `docs/architecture/extension-vs-legacy.md`. `_handle` and `_texture` are always extension apps; `_hosted` can be either. Legacy-app compromise scaling is computed in `oxr_system_fill_in()`. The `legacy_app_tile_scaling` flag on `xrt_system_compositor_info` disables the 0/1 mode keys for legacy apps (V toggle only). Every display driver serves **two** rendering modes at run time, 0 = 2D and 1 = its 3D kind (a driver setting applied at start-up; ADR-065) — V toggles them, 0 / 1 select them, 2-8 do nothing. **sim_display starts in 2D**: set `dp set sim-display START_3D 1` (or `DXR_DP_SIM_DISPLAY_START_3D=1`) to open in its kind (`OUTPUT`), as the generated dev run scripts do; a capture taken before that is a 1x1 atlas.
 
 ### Key notes
 - `struct xrt_compositor` has ~37 function-pointer slots (`xrt_compositor.h`). `comp_base` (`compositor/util/comp_base.{c,h}`) is a boilerplate helper used only by `compositor/main/` and `compositor/null/`; the five native compositors (`d3d11`, `d3d12`, `vk_native`, `gl`, `metal`) and the D3D11 service fill the vtable by hand (e.g. `c->base.base.create_swapchain = …` in each `*_compositor_create`) — copy the nearest native compositor, not `comp_base`.
@@ -419,7 +419,11 @@ wrong for anything judged on position or size (Subimage's grid, the gradient rec
 false FAIL there looks exactly like a compositor bug. To put a knob in the service, stop
 it and relaunch it from a `.bat` that sets the env, via `explorer.exe <bat>` so it stays
 Medium-integrity (an elevated harness's child would not match the clients). Same trap
-class as the caveat above: a knob set on one process while another does the work.
+class as the caveat above: a knob set on one process while another does the work. The
+same holds for **sim_display's settings** (`DXR_DP_SIM_DISPLAY_*` / `SIM_DISPLAY_*`:
+`OUTPUT`, `START_3D`, `FORCE_MODE`, …): in a client's environment they do not reach the
+service's display driver — use `displayxr-cli dp set sim-display <KEY> <value>` and
+restart the service.
 
 ### macOS test apps
 Copy binaries to `_package/DisplayXR-macOS/bin/`. Generated `run_*.sh` set `XRT_PLUGIN_SEARCH_PATH=$DIR/lib/displayxr/plugins` so the dev tree's `DisplayXR-SimDisplay.dylib` (+ `200-sim-display.json`) is discovered without touching `~/Library/Application Support/`.

@@ -140,30 +140,56 @@ legacy_switch_set()
 	return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
 }
 
+//! Loose truth test for a boolean setting in this process's environment.
+bool
+env_on(const char *name)
+{
+	const char *v = std::getenv(name);
+	return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 &&
+	       std::strcmp(v, "false") != 0 && std::strcmp(v, "no") != 0;
+}
+
 /*!
- * #1499: is the plug-in's default rendering mode a >2-view one for THIS process?
+ * #1499 / ADR-065: does sim-display come up IN its 4-view kind for THIS process?
  *
  * The mode floor is only observable on a device whose active mode a stereo
- * session cannot fill, and the only such device is sim-display in its Quad
- * mode. That is chosen by `SIM_DISPLAY_OUTPUT=quad` at plug-in load, so it has
- * to be a process-level fact - hence the separate ctest registrations in
- * tests/CMakeLists.txt (`tests_oxr_view_space_mode_floor` /
- * `_mode_pinned`). Under the plain registration these arms have nothing to
- * observe and say so.
+ * session cannot fill, and the only such device is sim-display with its quad
+ * kind active. Under ADR-065 that takes two settings: `SIM_DISPLAY_OUTPUT=quad`
+ * makes mode 1 the 4-view Quad kind, and `SIM_DISPLAY_START_3D=1` starts the
+ * device in mode 1 (sim-display starts in 2D otherwise). Both are read at
+ * plug-in load, so this has to be a process-level fact - hence the separate
+ * ctest registrations in tests/CMakeLists.txt (`tests_oxr_view_space_mode_floor`
+ * / `_mode_pinned` / `_mode_floor_off`). Under the plain registration these
+ * arms have nothing to observe and say so.
  */
 bool
 sim_quad_requested()
 {
 	const char *v = std::getenv("SIM_DISPLAY_OUTPUT");
-	return v != nullptr && std::strcmp(v, "quad") == 0;
+	return v != nullptr && std::strcmp(v, "quad") == 0 && env_on("SIM_DISPLAY_START_3D");
 }
 
-//! #1499: is SIM_DISPLAY_FORCE_MODE armed (the device PINS its mode)?
+/*!
+ * Was THIS process explicitly configured for a mode-floor arm? tests/CMakeLists.txt
+ * sets DXR_TEST_ARM=<tag> on the dedicated ctest registrations. In such a
+ * process a precondition mismatch is a mis-set environment and must FAIL - a
+ * vacuous SUCCEED would hide it; in every other process the arm still says
+ * "not mine" and succeeds.
+ */
+bool
+configured_arm(const char *tag)
+{
+	const char *v = std::getenv("DXR_TEST_ARM");
+	return v != nullptr && std::strcmp(v, tag) == 0;
+}
+
+//! #1499: is SIM_DISPLAY_FORCE_MODE armed (the device PINS its mode)? Under
+//! ADR-065 only 0 and 1 pin; any other value is ignored by the device.
 bool
 sim_mode_pinned()
 {
 	const char *v = std::getenv("SIM_DISPLAY_FORCE_MODE");
-	return v != nullptr && v[0] != '\0' && std::strcmp(v, "-1") != 0;
+	return v != nullptr && (std::strcmp(v, "0") == 0 || std::strcmp(v, "1") == 0);
 }
 
 /*!
@@ -1237,13 +1263,20 @@ TEST_CASE("DXR_VIEW_CONFIG_LEGACY restores the pre-#1486 mapping", "[oxr][view_s
  * #1499 — the mode floor, end to end through the public API.
  *
  * SEPARATE PROCESSES by construction, like the #1486 kill-switch arm above:
- * which mode sim-display comes up in is decided by `SIM_DISPLAY_OUTPUT` when
- * the plug-in is loaded, and `SIM_DISPLAY_FORCE_MODE` is read through
- * DEBUG_GET_ONCE_NUM_OPTION, so one binary cannot host both the floored and the
- * pinned case. tests/CMakeLists.txt registers this file twice more:
- * `tests_oxr_view_space_mode_floor` (SIM_DISPLAY_OUTPUT=quad, tag
- * `[mode_floor]`) and `tests_oxr_view_space_mode_pinned`
- * (SIM_DISPLAY_FORCE_MODE=4, tag `[mode_pinned]`).
+ * sim-display's 3D kind (`SIM_DISPLAY_OUTPUT`), its start-up mode
+ * (`SIM_DISPLAY_START_3D`) and its pin (`SIM_DISPLAY_FORCE_MODE`) are all read
+ * once, when the plug-in creates its device, so one binary cannot host both the
+ * floored and the pinned case. tests/CMakeLists.txt registers this file three
+ * more times: `tests_oxr_view_space_mode_floor` (OUTPUT=quad START_3D=1, tag
+ * `[mode_floor]`), `tests_oxr_view_space_mode_pinned` (OUTPUT=quad
+ * FORCE_MODE=1, tag `[mode_pinned]`) and `_mode_floor_off`. Each pins
+ * DXR_PLUGIN_EXCLUSIVE=sim-display so a box that also has a vendor plug-in
+ * registered still runs them against sim-display.
+ *
+ * ADR-065: the device serves {2D, Quad}. A stereo session therefore has no
+ * 2-view 3D mode to fall back to and is floored all the way to 2D - the
+ * user-visible cost of choosing a 4-view kind, and the reason it is called an
+ * inspection kind.
  *
  * Under the plain registration these cases have no >2-view active mode to
  * observe, so they SUCCEED with a WARN — deliberately not a Catch2 SKIP, for
@@ -1254,8 +1287,13 @@ TEST_CASE("a PRIMARY_STEREO session is floored out of a >2-view mode (#1499)", "
 {
 	if (legacy_switch_set() || mode_floor_disabled() || !sim_quad_requested() || sim_mode_pinned()) {
 		WARN(
-		    "this arm needs SIM_DISPLAY_OUTPUT=quad, an UNpinned device and DXR_MODE_FLOOR on "
-		    "- see tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		    "this arm needs SIM_DISPLAY_OUTPUT=quad SIM_DISPLAY_START_3D=1, an UNpinned device and "
+		    "DXR_MODE_FLOOR on - see tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		if (configured_arm("mode_floor")) {
+			FAIL(
+			    "this process is configured for [mode_floor] (DXR_TEST_ARM) but its "
+			    "preconditions do not hold - a mis-set environment, not a pass");
+		}
 		SUCCEED("not the mode-floor process; nothing to pin here");
 		return;
 	}
@@ -1275,6 +1313,18 @@ TEST_CASE("a PRIMARY_STEREO session is floored out of a >2-view mode (#1499)", "
 	REQUIRE(device_max > 2); // SIM_DISPLAY_OUTPUT=quad must have taken.
 	INFO("device max view count across rendering modes = " << device_max);
 
+	SECTION("the device serves exactly two modes: 2D and the quad kind (ADR-065)")
+	{
+		const std::vector<XrDisplayRenderingModeInfoDXR> modes = rt.rendering_modes();
+		REQUIRE(modes.size() == 2);
+		CHECK(modes[0].modeIndex == 0);
+		CHECK(modes[0].viewCount == 1);
+		CHECK(modes[0].hardwareDisplay3D == XR_FALSE);
+		CHECK(modes[1].modeIndex == 1);
+		CHECK(modes[1].viewCount == device_max);
+		CHECK(modes[1].hardwareDisplay3D == XR_TRUE);
+	}
+
 	SECTION("after xrBeginSession the active mode is one this session can fill")
 	{
 		XrDisplayRenderingModeInfoDXR active{};
@@ -1283,9 +1333,11 @@ TEST_CASE("a PRIMARY_STEREO session is floored out of a >2-view mode (#1499)", "
 		                    << active.viewCount);
 		// THE assertion: a 2-view session is not left sitting in Quad.
 		CHECK(active.viewCount <= 2);
-		// ...and it kept 3D rather than falling back to the 2D mode, because
-		// sim-display has 2-view 3D modes to fall back to.
-		CHECK(active.hardwareDisplay3D == XR_TRUE);
+		// ...and with only {2D, Quad} there is no 2-view 3D mode to keep it in
+		// 3D: it is floored to the 2D mode (ADR-065). Before the two-mode
+		// contract it fell back to Anaglyph and stayed 3D.
+		CHECK(active.modeIndex == 0u);
+		CHECK(active.hardwareDisplay3D == XR_FALSE);
 	}
 
 	SECTION("the app is TOLD exactly once, and told the truth")
@@ -1309,9 +1361,10 @@ TEST_CASE("a PRIMARY_STEREO session is floored out of a >2-view mode (#1499)", "
 		// EXACTLY one: a second event would mean the floor ran twice, or that
 		// something else moved the mode behind it.
 		REQUIRE(mode_changes == 1);
-		// previousModeIndex is the mode the floor took us OUT of - Quad, the
-		// mode SIM_DISPLAY_OUTPUT=quad started us in.
-		CHECK(changed_from == 4u);
+		// previousModeIndex is the mode the floor took us OUT of - Quad, mode 1,
+		// which OUTPUT=quad START_3D=1 started us in; the floor's target is 2D.
+		CHECK(changed_from == 1u);
+		CHECK(changed_to == 0u);
 
 		XrDisplayRenderingModeInfoDXR active{};
 		REQUIRE(rt.active_mode(&active));
@@ -1327,8 +1380,13 @@ TEST_CASE("a PRIMARY_MULTIVIEW_DXR session keeps the >2-view mode (#1499)", "[ox
 {
 	if (legacy_switch_set() || mode_floor_disabled() || !sim_quad_requested() || sim_mode_pinned()) {
 		WARN(
-		    "this arm needs SIM_DISPLAY_OUTPUT=quad, an UNpinned device and DXR_MODE_FLOOR on "
-		    "- see tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		    "this arm needs SIM_DISPLAY_OUTPUT=quad SIM_DISPLAY_START_3D=1, an UNpinned device and "
+		    "DXR_MODE_FLOOR on - see tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		if (configured_arm("mode_floor")) {
+			FAIL(
+			    "this process is configured for [mode_floor] (DXR_TEST_ARM) but its "
+			    "preconditions do not hold - a mis-set environment, not a pass");
+		}
 		SUCCEED("not the mode-floor process; nothing to pin here");
 		return;
 	}
@@ -1367,8 +1425,13 @@ TEST_CASE("a device that PINS its mode outranks the floor (#1499)", "[oxr][view_
 {
 	if (legacy_switch_set() || mode_floor_disabled() || !sim_mode_pinned()) {
 		WARN(
-		    "this arm needs SIM_DISPLAY_FORCE_MODE=4 - see tests_oxr_view_space_mode_pinned "
-		    "in tests/CMakeLists.txt");
+		    "this arm needs SIM_DISPLAY_OUTPUT=quad SIM_DISPLAY_FORCE_MODE=1 - see "
+		    "tests_oxr_view_space_mode_pinned in tests/CMakeLists.txt");
+		if (configured_arm("mode_pinned")) {
+			FAIL(
+			    "this process is configured for [mode_pinned] (DXR_TEST_ARM) but its "
+			    "preconditions do not hold - a mis-set environment, not a pass");
+		}
 		SUCCEED("not the pinned process; nothing to pin here");
 		return;
 	}
@@ -1395,25 +1458,25 @@ TEST_CASE("a device that PINS its mode outranks the floor (#1499)", "[oxr][view_
 	XrDisplayRenderingModeInfoDXR active{};
 	REQUIRE(rt.active_mode(&active));
 	INFO("active mode " << active.modeIndex << " '" << active.modeName << "' viewCount " << active.viewCount);
-	CHECK(active.modeIndex == 4u); // SIM_DISPLAY_FORCE_MODE=4, Quad
+	CHECK(active.modeIndex == 1u); // OUTPUT=quad FORCE_MODE=1: the Quad kind, pinned
 	CHECK(active.viewCount > 2);
 
 	/*
 	 * ...and the pin exempts the DENIAL too, not just the floor. This session
-	 * is SITTING in mode 4, so denying a request for mode 4 would be refusing
+	 * is SITTING in mode 1, so denying a request for mode 1 would be refusing
 	 * it permission to ask for the mode it is already in - and the device, not
 	 * the runtime, is the authority on a pinned mode. The first cut of the
 	 * denial gate got this wrong.
 	 */
 	rt.drain_events();
 	auto request = rt.fn<PFN_xrRequestDisplayRenderingModeDXR>("xrRequestDisplayRenderingModeDXR");
-	CHECK(request(rt.session, 4u) == XR_SUCCESS);
+	CHECK(request(rt.session, 1u) == XR_SUCCESS);
 	for (const XrEventDataBuffer &ev : rt.drain_events()) {
 		CHECK(ev.type != XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR);
 	}
 	// The device still holds the mode, which is the whole point of the pin.
 	REQUIRE(rt.active_mode(&active));
-	CHECK(active.modeIndex == 4u);
+	CHECK(active.modeIndex == 1u);
 
 	tear_down(rt);
 }
@@ -1438,8 +1501,13 @@ TEST_CASE("an orchestrator session is exempt from the fillability rule (#1499)",
 {
 	if (legacy_switch_set() || mode_floor_disabled() || !sim_quad_requested() || sim_mode_pinned()) {
 		WARN(
-		    "this arm needs SIM_DISPLAY_OUTPUT=quad, an UNpinned device and DXR_MODE_FLOOR on "
-		    "- see tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		    "this arm needs SIM_DISPLAY_OUTPUT=quad SIM_DISPLAY_START_3D=1, an UNpinned device and "
+		    "DXR_MODE_FLOOR on - see tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		if (configured_arm("mode_floor")) {
+			FAIL(
+			    "this process is configured for [mode_floor] (DXR_TEST_ARM) but its "
+			    "preconditions do not hold - a mis-set environment, not a pass");
+		}
 		SUCCEED("not the mode-floor process; nothing to pin here");
 		return;
 	}
@@ -1456,7 +1524,7 @@ TEST_CASE("an orchestrator session is exempt from the fillability rule (#1499)",
 	}
 
 	const int32_t unfillable = rt.first_unfillable_mode(2);
-	REQUIRE(unfillable >= 0); // Quad
+	REQUIRE(unfillable == 1); // Quad, the device's mode 1 (ADR-065)
 	INFO("requesting mode " << unfillable);
 
 	// The floor DID fire at xrBeginSession (the floor has no orchestrator
@@ -1513,8 +1581,13 @@ TEST_CASE("DXR_MODE_FLOOR=0 restores the pre-#1499 behaviour", "[oxr][view_space
 		// SUCCEED, not SKIP: build-windows.yml reads any "SKIPPED:" from this
 		// binary as "the headless runtime did not come up" (#1370).
 		WARN(
-		    "this arm needs DXR_MODE_FLOOR=0 AND SIM_DISPLAY_OUTPUT=quad - see "
+		    "this arm needs DXR_MODE_FLOOR=0 AND SIM_DISPLAY_OUTPUT=quad SIM_DISPLAY_START_3D=1 - see "
 		    "tests_oxr_view_space_mode_floor_off in tests/CMakeLists.txt");
+		if (configured_arm("mode_floor_off")) {
+			FAIL(
+			    "this process is configured for [mode_floor_off] (DXR_TEST_ARM) but its "
+			    "preconditions do not hold - a mis-set environment, not a pass");
+		}
 		SUCCEED("not the kill-switch process; nothing to pin here");
 		return;
 	}

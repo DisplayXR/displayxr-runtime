@@ -52,6 +52,7 @@
 #include "vk/vk_hud_blend.h"
 #include "vk/vk_local2d_composite.h"
 
+#include "util/u_rendering_modes.h"
 #include "util/u_logging.h"
 #include "util/u_window_visibility.h"
 #include "util/u_setting.h"
@@ -808,11 +809,12 @@ struct comp_vk_native_compositor
 	//! layer commit computes it.
 	struct comp_vk_native_eff_layout eff_layout;
 
-	//! Last known 3D rendering mode index (for V-key toggle restore).
-	uint32_t last_3d_mode_index;
-
-	//! True if app is legacy (no XR_DXR_display_info) — gates 1/2/3 key mode selection.
+	//! True if app is legacy (no XR_DXR_display_info) — gates 0/1 key mode selection.
 	bool legacy_app_tile_scaling;
+
+	//! #1499 / ADR-065: the most views this session can fill, for the V / 0 / 1 key
+	//! paths (comp_*_compositor_set_mode_fill_views); 0 = no limit.
+	uint32_t mode_fill_views;
 
 	//! System devices (for qwerty driver).
 	struct xrt_system_devices *xsysd;
@@ -6151,8 +6153,8 @@ vk_linux_apply_hold(struct comp_vk_native_compositor *c)
  */
 /*!
  * Multi-screen M2 review: re-read the DP's resample tolerance when the head's
- * rendering mode changes. sim_display's answer follows its output mode (the
- * 1/2/3 keys / V): switching to INTERLACED on a scaled desktop must degrade
+ * rendering mode changes. sim_display's answer follows its output mode (V /
+ * 0 / 1, ADR-065): switching into the INTERLACED kind on a scaled desktop must degrade
  * (#1595 / #1831 — a resampled interlace is a double image), switching back to
  * anaglyph must weave again. A change re-arms the X11 gate's one-shot; the
  * Wayland arm reads the flag on every evaluation. One vtable call per MODE
@@ -13073,28 +13075,49 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		bool toggled = qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d);
 		if (toggled) {
 			struct xrt_device *head = c->xsysd->static_roles.head;
-			if (head != NULL && head->hmd != NULL) {
-				if (force_2d) {
-					uint32_t cur = head->hmd->active_rendering_mode_index;
-					if (cur < head->rendering_mode_count &&
-					    head->rendering_modes[cur].hardware_display_3d) {
-						c->last_3d_mode_index = cur;
-					}
-					head->hmd->active_rendering_mode_index = 0;
+			bool key_ok = true;
+			if (head != NULL && head->hmd != NULL &&
+			    head->rendering_mode_count >= U_RENDERING_MODES_RUNTIME_COUNT) {
+				// ADR-065: V toggles mode 0 <-> mode 1, decided from the mode the
+				// device is in NOW rather than from qwerty's own flag (which a
+				// session that began in 2D, or moved by an app request, would have
+				// out of phase). The 3D mode is always index 1: no "last 3D mode".
+				const uint32_t target =
+				    u_rendering_modes_toggle_target(head->rendering_modes, head->rendering_mode_count,
+				                                    head->hmd->active_rendering_mode_index);
+				// #1499 on the key path: never into a mode this session cannot fill.
+				key_ok = u_rendering_modes_key_target_allowed(
+				    head->rendering_modes, head->rendering_mode_count, target, c->mode_fill_views);
+				if (key_ok) {
+					force_2d = (target == U_RENDERING_MODE_2D);
+					head->hmd->active_rendering_mode_index = target;
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target);
 				} else {
-					head->hmd->active_rendering_mode_index = c->last_3d_mode_index;
+					u_rendering_modes_log_key_refused(&head->rendering_modes[target],
+					                                  c->mode_fill_views);
 				}
 			}
-			comp_vk_native_compositor_request_display_mode(&c->base.base, !force_2d);
+			if (key_ok) {
+				comp_vk_native_compositor_request_display_mode(&c->base.base, !force_2d);
+			}
 		}
 
-		// Rendering mode change from qwerty 0/1/2/3/4 keys.
+		// Rendering mode change from the qwerty 0/1 keys (ADR-065).
 		// Legacy apps only support V toggle — skip direct mode selection.
 		if (!c->legacy_app_tile_scaling) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
 				struct xrt_device *head = c->xsysd->static_roles.head;
-				if (head != NULL) {
+				if (head != NULL && render_mode >= 0 &&
+				    !u_rendering_modes_key_target_allowed(head->rendering_modes,
+				                                          head->rendering_mode_count,
+				                                          (uint32_t)render_mode, c->mode_fill_views)) {
+					// #1499 on the key path: '1' never moves a session into a mode it cannot fill.
+					if ((uint32_t)render_mode < head->rendering_mode_count) {
+						u_rendering_modes_log_key_refused(&head->rendering_modes[render_mode],
+						                                  c->mode_fill_views);
+					}
+				} else if (head != NULL) {
 					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
 				}
 			}
@@ -15484,7 +15507,6 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	c->app_timeline_semaphores = app_timeline_semaphores;
 	c->app_keyed_mutex = app_keyed_mutex;
 	c->hardware_display_3d = true;
-	c->last_3d_mode_index = 1;
 #ifdef XRT_OS_LINUX_DESKTOP
 	u_display_mode_hold_init(&c->display_mode_hold, true); // sessions begin 3D
 #endif
@@ -18900,7 +18922,6 @@ comp_vk_native_compositor_set_sys_info(struct xrt_compositor *xc,
 	// #2671: the 3D screen the visibility check clips the window to.
 	u_window_visibility_set_panel(c->visibility, info->display_device_name);
 	c->legacy_app_tile_scaling = info->legacy_app_tile_scaling;
-	c->last_3d_mode_index = 1;
 
 	// Legacy apps: fix view dims at the actual recommended size the app was told to render at.
 	if (info->legacy_app_tile_scaling && c->renderer != NULL &&
@@ -22744,4 +22765,13 @@ comp_vk_native_compositor_get_recommended_view_size(struct xrt_compositor *xc, u
 	*out_w = vw;
 	*out_h = vh;
 	return true;
+}
+
+void
+comp_vk_native_compositor_set_mode_fill_views(struct xrt_compositor *xc, uint32_t max_views)
+{
+	if (xc == NULL) {
+		return;
+	}
+	vk_comp(xc)->mode_fill_views = max_views;
 }

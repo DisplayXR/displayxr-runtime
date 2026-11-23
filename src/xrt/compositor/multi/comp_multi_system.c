@@ -30,6 +30,7 @@
 #endif
 #include "os/os_threading.h"
 
+#include "util/u_rendering_modes.h"
 #include "util/u_var.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
@@ -3060,27 +3061,21 @@ render_session_to_own_target(struct multi_compositor *mc,
 		    qwerty_check_display_mode_toggle(mc->xsysd->xdevs, mc->xsysd->xdev_count, &force_2d);
 		if (toggled) {
 			struct xrt_device *head = mc->xsysd->static_roles.head;
-			if (head != NULL && head->hmd != NULL) {
-				if (force_2d) {
-					// Save current 3D mode index before switching to 2D
-					mc->last_3d_mode_index = head->hmd->active_rendering_mode_index;
-					// Find first 2D mode
-					for (uint32_t i = 0; i < head->rendering_mode_count; i++) {
-						if (!head->rendering_modes[i].hardware_display_3d) {
-							head->hmd->active_rendering_mode_index = i;
-							break;
-						}
-					}
-				} else {
-					// Restore last known 3D mode index
-					head->hmd->active_rendering_mode_index = mc->last_3d_mode_index;
-				}
+			if (head != NULL && head->hmd != NULL &&
+			    head->rendering_mode_count >= U_RENDERING_MODES_RUNTIME_COUNT) {
+				// ADR-065: V toggles mode 0 <-> mode 1, decided from the mode the
+				// device is in now. The 3D mode is always index 1.
+				const uint32_t target =
+				    u_rendering_modes_toggle_target(head->rendering_modes, head->rendering_mode_count,
+				                                    head->hmd->active_rendering_mode_index);
+				force_2d = (target == U_RENDERING_MODE_2D);
+				head->hmd->active_rendering_mode_index = target;
 				mc->hardware_display_3d = !force_2d;
 			}
 			multi_compositor_request_display_mode(mc, !force_2d);
 		}
 
-		// Rendering mode change from qwerty 1/2/3 keys (disabled for legacy apps).
+		// Rendering mode change from the qwerty 0/1 keys (disabled for legacy apps).
 		//
 		// #1499: this gate is DEAD in the server. legacy_app_tile_scaling has no
 		// IPC carrier - it is computed in oxr_system_fill_in() inside the CLIENT
@@ -6503,23 +6498,19 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 			    qwerty_check_display_mode_toggle(mc->xsysd->xdevs, mc->xsysd->xdev_count, &force_2d);
 			if (toggled) {
 				struct xrt_device *head = mc->xsysd->static_roles.head;
-				if (head != NULL && head->hmd != NULL) {
-					if (force_2d) {
-						mc->last_3d_mode_index = head->hmd->active_rendering_mode_index;
-						for (uint32_t i = 0; i < head->rendering_mode_count; i++) {
-							if (!head->rendering_modes[i].hardware_display_3d) {
-								head->hmd->active_rendering_mode_index = i;
-								break;
-							}
-						}
-					} else {
-						head->hmd->active_rendering_mode_index = mc->last_3d_mode_index;
-					}
+				if (head != NULL && head->hmd != NULL &&
+				    head->rendering_mode_count >= U_RENDERING_MODES_RUNTIME_COUNT) {
+					// ADR-065: V toggles mode 0 <-> mode 1 (see above).
+					const uint32_t target = u_rendering_modes_toggle_target(
+					    head->rendering_modes, head->rendering_mode_count,
+					    head->hmd->active_rendering_mode_index);
+					force_2d = (target == U_RENDERING_MODE_2D);
+					head->hmd->active_rendering_mode_index = target;
 				}
 				multi_compositor_request_display_mode(mc, !force_2d);
 			}
 
-			// Rendering mode change from qwerty 1/2/3 keys (disabled for legacy apps).
+			// Rendering mode change from the qwerty 0/1 keys (disabled for legacy apps).
 			//
 			// #1499: this gate is DEAD in the server. legacy_app_tile_scaling has no
 			// IPC carrier - it is computed in oxr_system_fill_in() inside the CLIENT

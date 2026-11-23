@@ -359,21 +359,22 @@ XRAPI_ATTR XrResult XRAPI_CALL xrRequestEyeTrackingModeDXR(
 // ---- v7: Display Rendering Mode Control ----
 
 /*!
- * @brief Request a vendor-specific display rendering mode.
+ * @brief Request a display rendering mode: 2D or the driver's 3D mode.
  *
- * Different 3D display vendors support multiple rendering variations
- * (e.g., side-by-side stereo, anaglyph, lenticular). This function lets
- * the application switch between them at runtime.
+ * A display driver exposes two rendering modes at run time:
+ *   - Mode 0 = 2D (one view, always available)
+ *   - Mode 1 = the driver's 3D mode
  *
- * Mode indices are vendor-defined:
- *   - Mode 0 = standard rendering (always available)
- *   - Mode 1+ = vendor-specific variations
+ * Which 3D kind mode 1 is (e.g., side-by-side stereo, anaglyph, a multi-view
+ * quilt, a weaver variant) is a per-driver setting applied when the runtime
+ * starts, not something the application selects. The index is the position
+ * in the table xrEnumerateDisplayRenderingModesDXR returns.
  *
  * The runtime dispatches the request to the active display device, which
  * may accept or silently ignore unsupported indices.
  *
  * @param session A valid XrSession handle.
- * @param modeIndex The vendor-defined rendering mode index.
+ * @param modeIndex The rendering mode index (0 = 2D, 1 = 3D).
  * @return XR_SUCCESS on success.
  */
 typedef XrResult (XRAPI_PTR *PFN_xrRequestDisplayRenderingModeDXR)(
@@ -393,12 +394,13 @@ XRAPI_ATTR XrResult XRAPI_CALL xrRequestDisplayRenderingModeDXR(
  * @brief Information about a single display rendering mode.
  *
  * Returned by xrEnumerateDisplayRenderingModesDXR to describe each available
- * vendor-specific rendering mode (e.g., side-by-side, anaglyph, lenticular).
+ * rendering mode: mode 0 is 2D, mode 1 is the driver's 3D mode (whose kind —
+ * side-by-side, anaglyph, lenticular, ... — the driver's settings choose).
  */
 typedef struct XrDisplayRenderingModeInfoDXR {
     XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR
     void* XR_MAY_ALIAS          next;       //!< Pointer to next structure in chain
-    uint32_t                    modeIndex;  //!< Vendor-defined mode index (pass to xrRequestDisplayRenderingModeDXR)
+    uint32_t                    modeIndex;  //!< Mode index, 0 = 2D, 1 = 3D (pass to xrRequestDisplayRenderingModeDXR)
     char                        modeName[XR_MAX_SYSTEM_NAME_SIZE]; //!< Human-readable mode name
     uint32_t                    viewCount;  //!< Number of views (1=mono, 2=stereo, etc.)
     float                       viewScaleX; //!< Per-view horizontal scale (vendor-provided)

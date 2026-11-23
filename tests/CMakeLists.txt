@@ -149,6 +149,8 @@ set(tests
     tests_oxr_hosted_raw_views_rule
     tests_oxr_input_providers_rule
     tests_xrt_active_mode_scale
+    tests_u_rendering_modes
+    tests_sim_display_modes
     tests_input_arbiter_rig
     tests_input_arbiter_rerank
     tests_input_arbiter_floor
@@ -973,25 +975,31 @@ if(TARGET tests_oxr_view_space)
 		)
 
 	# #1499 -- the mode floor, in two MORE processes of the same binary, for the
-	# same reason as the legacy run above: which mode sim-display comes up in is
-	# decided by SIM_DISPLAY_OUTPUT when the plug-in is loaded, and
-	# SIM_DISPLAY_FORCE_MODE is read through DEBUG_GET_ONCE_NUM_OPTION, so one
-	# process cannot host both the floored and the pinned case. Both arms
+	# same reason as the legacy run above: sim-display's 3D kind (OUTPUT), its
+	# start-up mode (START_3D) and its pin (FORCE_MODE) are read once, when the
+	# plug-in creates its device, so one process cannot host both the floored
+	# and the pinned case. ADR-065: the device serves {2D, the OUTPUT kind} and
+	# starts in 2D, so the floored arm needs the quad kind AND START_3D=1, and
+	# the pinned arm pins mode 1 (the quad kind). DXR_PLUGIN_EXCLUSIVE makes a
+	# box that also has a vendor plug-in registered run these against
+	# sim-display (CI registers sim-display alone, under that id). Both arms
 	# SUCCEED with a WARN (never a Catch2 SKIP -- build-windows.yml reads any
 	# "SKIPPED:" from this binary as "the headless runtime did not come up")
-	# when their variable is absent, so the plain registration above pins
+	# when their variables are absent, so the plain registration above pins
 	# nothing here and stays green on a box with no >2-view mode.
 	add_test(NAME tests_oxr_view_space_mode_floor
 		 COMMAND tests_oxr_view_space "[mode_floor]" --success --allow-running-no-tests
 		)
 	set_tests_properties(
-		tests_oxr_view_space_mode_floor PROPERTIES ENVIRONMENT "SIM_DISPLAY_OUTPUT=quad"
+		tests_oxr_view_space_mode_floor
+		PROPERTIES ENVIRONMENT "SIM_DISPLAY_OUTPUT=quad;SIM_DISPLAY_START_3D=1;DXR_PLUGIN_EXCLUSIVE=sim-display;DXR_TEST_ARM=mode_floor"
 		)
 	add_test(NAME tests_oxr_view_space_mode_pinned
 		 COMMAND tests_oxr_view_space "[mode_pinned]" --success --allow-running-no-tests
 		)
 	set_tests_properties(
-		tests_oxr_view_space_mode_pinned PROPERTIES ENVIRONMENT "SIM_DISPLAY_FORCE_MODE=4"
+		tests_oxr_view_space_mode_pinned
+		PROPERTIES ENVIRONMENT "SIM_DISPLAY_OUTPUT=quad;SIM_DISPLAY_FORCE_MODE=1;DXR_PLUGIN_EXCLUSIVE=sim-display;DXR_TEST_ARM=mode_pinned"
 		)
 
 	# #1499 kill switch, in a process of its OWN for the third time: the runtime
@@ -1176,7 +1184,8 @@ if(TARGET tests_oxr_view_space)
 		)
 	set_tests_properties(
 		tests_oxr_view_space_mode_floor_off
-		PROPERTIES ENVIRONMENT "SIM_DISPLAY_OUTPUT=quad;DXR_MODE_FLOOR=0"
+		PROPERTIES ENVIRONMENT
+			   "SIM_DISPLAY_OUTPUT=quad;SIM_DISPLAY_START_3D=1;DXR_MODE_FLOOR=0;DXR_PLUGIN_EXCLUSIVE=sim-display;DXR_TEST_ARM=mode_floor_off"
 		)
 endif()
 
@@ -1429,6 +1438,12 @@ target_link_libraries(tests_oxr_input_providers_rule PRIVATE xrt-interfaces)
 # needs -- but it is the thing three hand-maintained overwrite sites used to do
 # by hand, which is exactly why it is worth pinning.
 target_link_libraries(tests_xrt_active_mode_scale PRIVATE xrt-interfaces)
+
+# ADR-065 -- sim_display's two run-time modes (2D + the OUTPUT kind) and its
+# start-up rule (sim_display_modes.h, header-only), checked against the
+# runtime's two-mode rule (util/u_rendering_modes.h). No plug-in load.
+target_link_libraries(tests_sim_display_modes PRIVATE xrt-interfaces)
+target_include_directories(tests_sim_display_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
 
 # #1201 — the self-test rule that makes `display_dims` prove its number instead
 # of printing it. A header of pure integer decisions (the probe that feeds it is

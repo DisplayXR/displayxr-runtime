@@ -44,6 +44,7 @@ struct comp_hub_d3d11; // the reroute fields exist either way; the code does not
 #include "xrt/xrt_limits.h"
 #include "xrt/xrt_display_metrics.h"
 
+#include "util/u_rendering_modes.h"
 #include "util/u_logging.h"
 #include "util/u_window_visibility.h"
 #include "util/u_camera_profile.h"
@@ -707,11 +708,12 @@ struct comp_d3d12_compositor
 	//! layer commit computes it.
 	struct comp_d3d12_eff_layout eff_layout;
 
-	//! Last known 3D rendering mode index (for V-key toggle restore).
-	uint32_t last_3d_mode_index;
-
 	//! True when a legacy app is using a compromise view scale.
 	bool legacy_app_tile_scaling;
+
+	//! #1499 / ADR-065: the most views this session can fill, for the V / 0 / 1 key
+	//! paths (comp_*_compositor_set_mode_fill_views); 0 = no limit.
+	uint32_t mode_fill_views;
 
 	//! Compromise view scale for legacy apps. Only valid when legacy_app_tile_scaling is true.
 	float legacy_view_scale_x;
@@ -7167,27 +7169,48 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		bool toggled = qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d);
 		if (toggled) {
 			struct xrt_device *head = c->xsysd->static_roles.head;
-			if (head != nullptr && head->hmd != NULL) {
-				if (force_2d) {
-					uint32_t cur = head->hmd->active_rendering_mode_index;
-					if (cur < head->rendering_mode_count &&
-					    head->rendering_modes[cur].hardware_display_3d) {
-						c->last_3d_mode_index = cur;
-					}
-					head->hmd->active_rendering_mode_index = 0;
+			bool key_ok = true;
+			if (head != nullptr && head->hmd != NULL &&
+			    head->rendering_mode_count >= U_RENDERING_MODES_RUNTIME_COUNT) {
+				// ADR-065: V toggles mode 0 <-> mode 1, decided from the mode the
+				// device is in NOW rather than from qwerty's own flag (which a
+				// session that began in 2D, or moved by an app request, would have
+				// out of phase). The 3D mode is always index 1: no "last 3D mode".
+				const uint32_t target =
+				    u_rendering_modes_toggle_target(head->rendering_modes, head->rendering_mode_count,
+				                                    head->hmd->active_rendering_mode_index);
+				// #1499 on the key path: never into a mode this session cannot fill.
+				key_ok = u_rendering_modes_key_target_allowed(
+				    head->rendering_modes, head->rendering_mode_count, target, c->mode_fill_views);
+				if (key_ok) {
+					force_2d = (target == U_RENDERING_MODE_2D);
+					head->hmd->active_rendering_mode_index = target;
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target);
 				} else {
-					head->hmd->active_rendering_mode_index = c->last_3d_mode_index;
+					u_rendering_modes_log_key_refused(&head->rendering_modes[target],
+					                                  c->mode_fill_views);
 				}
 			}
-			comp_d3d12_compositor_request_display_mode(&c->base.base, !force_2d);
+			if (key_ok) {
+				comp_d3d12_compositor_request_display_mode(&c->base.base, !force_2d);
+			}
 		}
 
-		// Rendering mode change from qwerty 1/2/3 keys (disabled for legacy apps).
+		// Rendering mode change from the qwerty 0/1 keys (disabled for legacy apps).
 		if (!c->legacy_app_tile_scaling) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
 				struct xrt_device *head = c->xsysd->static_roles.head;
-				if (head != nullptr) {
+				if (head != nullptr && render_mode >= 0 &&
+				    !u_rendering_modes_key_target_allowed(head->rendering_modes,
+				                                          head->rendering_mode_count,
+				                                          (uint32_t)render_mode, c->mode_fill_views)) {
+					// #1499 on the key path: '1' never moves a session into a mode it cannot fill.
+					if ((uint32_t)render_mode < head->rendering_mode_count) {
+						u_rendering_modes_log_key_refused(&head->rendering_modes[render_mode],
+						                                  c->mode_fill_views);
+					}
+				} else if (head != nullptr) {
 					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
 				}
 			}
@@ -8896,7 +8919,6 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->own_window = nullptr;
 	c->owns_window = false;
 	c->hardware_display_3d = true;
-	c->last_3d_mode_index = 1;
 	c->transparent_background = transparent_background;
 	u_eye_history_init(&c->eye_hist); // N6 Part 1 (#2144)
 	// XR_DXR_depth_budget: the policy exists from the first frame so that a
@@ -13127,4 +13149,13 @@ comp_d3d12_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint3
 	*out_w = vw;
 	*out_h = vh;
 	return true;
+}
+
+void
+comp_d3d12_compositor_set_mode_fill_views(struct xrt_compositor *xc, uint32_t max_views)
+{
+	if (xc == nullptr) {
+		return;
+	}
+	d3d12_comp(xc)->mode_fill_views = max_views;
 }

@@ -799,7 +799,7 @@ def check_mode_switch_easing(root: Path, findings: list):
             WARN, "INV-2.9", path, line,
             f"{'Leg ' + repr(leg) + ' requests' if leg else 'App requests'} rendering modes but never "
             "uses dxr::ModeSwitch — every switch snaps between full parallax and flat.",
-            "Route V / 0-8 requests through displayxr-common mode_switch.h: call "
+            "Route V / 0 / 1 requests through displayxr-common mode_switch.h: call "
             "g_modeSwitch.step(dt, want, modeCount, modeViewCounts, currentMode, steadyIpd) every frame, "
             "submit f.ipd as the rig ipdFactor and request f.mode when f.fire (Windows "
             "XrSessionManager apps: XrSessionUpdateModeSwitch).",
