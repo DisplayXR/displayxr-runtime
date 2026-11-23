@@ -13,8 +13,8 @@ using DisplayXR.Dashboard.Ui;
 namespace DisplayXR.Dashboard.Pages;
 
 /// <summary>
-/// Performance (#1252): the three shipped controls — Target GPU, Mode,
-/// Diagnostics — over <c>displayxr-cli perf</c>, the effective state with its
+/// Performance (#1252): the three shipped controls — "Graphics card for 3D apps" (Target GPU),
+/// "If 3D looks wrong" (Mode), "Detailed logging" (Diagnostics) — over <c>displayxr-cli perf</c>, the effective state with its
 /// provenance, and the amber "non-default settings" banner with reset. Every
 /// write goes through the CLI and the state shown is re-read afterwards.
 /// </summary>
@@ -25,7 +25,7 @@ public sealed class PerformancePage : Page
     public override bool HoldsFeed => false;
 
     public override string Caption =>
-        "Settings each app reads at start-up. They apply to apps started after a change; a running app keeps what it started with.";
+        "Settings 3D apps read when they start. A change applies to apps you start afterwards; a running app keeps what it started with.";
 
     public override void OnShown()
     {
@@ -54,8 +54,8 @@ public sealed class PerformancePage : Page
         if (perf is null)
         {
             page.Children.Add(Ctx.PerfError is { } err
-                ? U.Notice(Level.Critical, "Could not read the performance settings", err)
-                : U.Card(U.Wrapped("Reading the performance settings…", "empty")));
+                ? U.Notice(Level.Critical, "Couldn't read these settings", err)
+                : U.Card(U.Wrapped("Reading the settings…", "empty")));
             return page;
         }
 
@@ -64,11 +64,11 @@ public sealed class PerformancePage : Page
             var lines = U.VStack(2);
             foreach (var l in perf.Levers.Where(l => l.IsSet))
                 lines.Children.Add(U.Wrapped($"{l.Name} = {l.Value}   [{l.Source}]", "dev"));
-            var reset = U.Button("Reset all performance settings", () => _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf reset")), "warn", "sm");
+            var reset = U.Button("Reset all to defaults", () => _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf reset")), "warn", "sm");
             reset.IsEnabled = !Ctx.ActionRunning;
             var notice = U.Notice(Level.Warn,
-                $"Non-default performance settings are in force{(perf.UserWritten.Length > 0 ? " since " + perf.UserWritten : "")}",
-                "Values marked [env] come from an environment variable and cannot be reset from here.", reset);
+                $"Some settings are changed from their defaults{(perf.UserWritten.Length > 0 ? " (since " + perf.UserWritten + ")" : "")}",
+                "Values marked [env] are set outside the Dashboard and cannot be reset from here.", reset);
             ((Grid)notice.Child!).Children.OfType<StackPanel>().First().Children.Insert(1, lines);
             page.Children.Add(notice);
         }
@@ -99,22 +99,23 @@ public sealed class PerformancePage : Page
 
     private Control TargetGpuCard(PerfState perf)
     {
-        var body = U.VStack(10, U.CardTitle("Target GPU", "Which adapter apps render on. The panel's adapter keeps the weave local to the display."));
+        var body = U.VStack(10, U.CardTitle("Graphics card for 3D apps",
+            "Which graphics card draws 3D apps. Choosing the one your 3D display is plugged into keeps the whole picture on one card."));
         if (Ctx.Info is null)
         {
-            body.Children.Add(U.Wrapped(Ctx.InfoLoading ? "Reading the adapters (displayxr-cli info, about 10 s)…" : Ctx.InfoError ?? "Adapters not read.", "empty"));
+            body.Children.Add(U.Wrapped(Ctx.InfoLoading ? "Looking at your graphics cards (about 10 seconds)…" : Ctx.InfoError ?? "Graphics cards not read.", "empty"));
             return U.Card(body);
         }
         if (!Ctx.HasMultipleAdapters)
         {
-            body.Children.Add(U.Wrapped("This machine has one GPU: there is nothing to choose.", "empty"));
+            body.Children.Add(U.Wrapped("This PC has one graphics card, so there is nothing to choose.", "empty"));
             return U.Card(body);
         }
         string now = perf.TargetGpu;
         (string Label, string Value)[] opts =
         {
-            ("Auto (recommended)", ""), ("Panel's display adapter", "scanout"),
-            ("High performance (discrete)", "dgpu"), ("Power saving (integrated)", "igpu"),
+            ("Automatic (recommended)", ""), ("The one your 3D display is plugged into", "scanout"),
+            ("High performance (separate graphics card)", "dgpu"), ("Power saving (built-in graphics)", "igpu"),
         };
         string group = "gpu" + Guid.NewGuid().ToString("N");
         foreach (var (label, value) in opts)
@@ -129,7 +130,7 @@ public sealed class PerformancePage : Page
             }));
         }
         if (perf.SourceOf("DXR_D3D_FORCE_GPU") == "env")
-            body.Children.Add(U.WarningRow(new StatusWarning("ENV", WarningLevel.Warn, "An environment variable sets this and outranks the dashboard.")));
+            body.Children.Add(U.WarningRow(new StatusWarning("ENV", WarningLevel.Warn, "A setting outside the Dashboard (an environment variable) chooses this, and it wins over the choice here.")));
         return U.Card(body);
     }
 
@@ -137,12 +138,12 @@ public sealed class PerformancePage : Page
     {
         bool compat = perf.CompatibilityMode;
         string group = "mode" + Guid.NewGuid().ToString("N");
-        var body = U.VStack(10, U.CardTitle("Mode", "For “the 3D looks wrong — is it the pipeline?”"),
-            Option(group, "Balanced (default)", !compat, () =>
+        var body = U.VStack(10, U.CardTitle("If 3D looks wrong", "A switch for finding a problem."),
+            Option(group, "Normal (recommended)", !compat, () =>
                 _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf reset DXR_WEAVE_ON_SCANOUT"), CliArgs.Words("perf reset DXR_WEAVE_REPAINT"))),
-            Option(group, "Compatibility", compat, () =>
+            Option(group, "Compatibility mode", compat, () =>
                 _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf set DXR_WEAVE_ON_SCANOUT 0"), CliArgs.Words("perf set DXR_WEAVE_REPAINT 0"))),
-            U.Wrapped("Compatibility turns off the cross-adapter weave split and the repaint. It costs latency; it is not a faster setting. Leave it on Balanced unless you are diagnosing. Under the workspace / shell only the split half applies: the service weaves on its own clock, so its repaint is structural rather than a setting.", "desc"));
+            U.Wrapped("Compatibility mode turns off two ways DisplayXR keeps the 3D picture quick to follow you. It does not make anything faster: the picture can respond more slowly. Turn it on only while finding a problem, then set it back to Normal. On the spatial desktop only one of the two applies.", "desc"));
         return U.Card(body);
     }
 
@@ -150,22 +151,22 @@ public sealed class PerformancePage : Page
     {
         bool on = perf.DiagnosticsOn;
         string group = "diag" + Guid.NewGuid().ToString("N");
-        var body = U.VStack(10, U.CardTitle("Diagnostics", "For bug reports."),
+        var body = U.VStack(10, U.CardTitle("Detailed logging", "For bug reports."),
             Option(group, "Off", !on, () =>
                 _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf reset DXR_FRAME_WITNESS"), CliArgs.Words("perf reset DXR_FRAME_STAGE_TIMING"))),
-            Option(group, "On (frame witness + stage timing)", on, () =>
+            Option(group, "On", on, () =>
                 _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf set DXR_FRAME_WITNESS 5"), CliArgs.Words("perf set DXR_FRAME_STAGE_TIMING 1"))),
-            U.Wrapped("Adds frame / weave / present counters to each app's log. Changes no behaviour.", "desc"));
+            U.Wrapped("Each 3D app writes extra timing details to its log, for a bug report. It changes nothing else.", "desc"));
         return U.Card(body);
     }
 
     private Control EffectiveCard(PerfState perf)
     {
-        var body = U.VStack(12, U.CardTitle("Effective state",
-            "Resolved as a process starting now would resolve it: environment first, then the per-user file, then the machine default."));
+        var body = U.VStack(12, U.CardTitle("Current values",
+            "What a 3D app starting now would use: a setting outside the Dashboard first, then yours, then this PC's default."));
         var g = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto,Auto") };
         g.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
-        string[] heads = { "Lever", "Value", "Source" };
+        string[] heads = { "Setting", "Value", "Comes from" };
         for (int i = 0; i < heads.Length; i++)
         {
             var h = U.Text(heads[i], "meta");
@@ -180,7 +181,8 @@ public sealed class PerformancePage : Page
             var name = U.Wrapped(l.Name, "mono");
             var value = U.Text(l.Value ?? "default", "mono");
             value.Foreground = l.IsSet ? Tokens.For(Level.Warn) : Tokens.Muted;
-            var src = U.Chip(l.Source, l.Source == "env" ? Level.Warn : l.Source == "default" ? Level.Plain : Level.Info);
+            var src = U.Chip(SourceWord(l.Source), l.Source == "env" ? Level.Warn : l.Source == "default" ? Level.Plain : Level.Info);
+            ToolTip.SetTip(src, l.Source); // the CLI's own word
             name.Margin = new Thickness(0, 3, 18, 3);
             value.Margin = new Thickness(0, 3, 18, 3);
             src.Margin = new Thickness(0, 2, 0, 2);
@@ -193,7 +195,17 @@ public sealed class PerformancePage : Page
         }
         body.Children.Add(g);
         if (perf.UserFile.Length > 0)
-            body.Children.Add(U.Wrapped($"Per-user file: {perf.UserFile}{(perf.UserWritten.Length > 0 ? $" (written {perf.UserWritten})" : "")}", "desc"));
+            body.Children.Add(U.Wrapped($"Your settings file: {perf.UserFile}{(perf.UserWritten.Length > 0 ? $" (written {perf.UserWritten})" : "")}", "desc"));
         return U.Card(body);
     }
+
+    /// <summary>Where a value comes from, in plain words (env / user / machine / default).</summary>
+    public static string SourceWord(string source) => source switch
+    {
+        "env" => "outside setting",
+        "user" => "you",
+        "machine" => "this PC",
+        "default" => "default",
+        var other => other,
+    };
 }

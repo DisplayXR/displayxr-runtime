@@ -45,8 +45,8 @@ public sealed class CalibrationSession
         "Close your left eye. With your right eye, find the reflection of your closed eye and move your head until the cross sits on it. Press Space (or click).";
 
     /// <summary>The distance instruction of each pass (the user eyeballs it; the samples' distances check it).</summary>
-    public static string NearPrompt(double m) => $"Near pass: lean in to about {m * 100:0} cm from the screen. ";
-    public static string FarPrompt(double m) => $"Far pass: sit back to about {m * 100:0} cm from the screen. ";
+    public static string NearPrompt(double m) => $"Near pass: lean in to about {m * 100:0} cm from the display. ";
+    public static string FarPrompt(double m) => $"Far pass: sit back to about {m * 100:0} cm from the display. ";
 
     public const string OutOfViewWarning =
         "Move so your face stays in the camera's view: your eyes are near the edge of what it sees. (Press Space again to capture anyway.)";
@@ -176,7 +176,7 @@ public sealed class CalibrationSession
             $"then sit back to about {(Layout?.FarM ?? CalibLayout.FarTargetM) * 100:0} cm, moving your head at each. " +
             "The dot should stay on the reflection of your closed eye at both distances. Arrow keys nudge it by 1 mm; Enter applies.",
         CalibPhase.Applying => "Saving the calibration…",
-        CalibPhase.Done => "Calibration saved. It applies at the provider's next start (the next app launch). Press Esc to close.",
+        CalibPhase.Done => "Calibration saved. It applies the next time an app starts. Press Esc to close.",
         CalibPhase.Failed => Error ?? "Calibration stopped.",
         CalibPhase.Cancelled => "Cancelled.",
         _ => "",
@@ -223,7 +223,7 @@ public sealed class CalibrationSession
             Geometry = CalibGeometry.Choose(_screen, h.Display);
             if (Geometry is null)
             {
-                Fail("The screen's physical size is not known, so the target positions cannot be computed.");
+                Fail("The display's physical size is not known, so the target positions cannot be computed.");
                 return;
             }
             if (Layout is null)

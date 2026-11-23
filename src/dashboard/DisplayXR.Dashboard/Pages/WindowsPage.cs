@@ -14,7 +14,7 @@ using DisplayXR.Dashboard.Ui;
 namespace DisplayXR.Dashboard.Pages;
 
 /// <summary>
-/// Windows (design §8): one card per service client — class, presenter, lease,
+/// Running 3D apps (page id "windows"; design §8 "Windows"): one card per service client — class, presenter, lease,
 /// window and owner screen, the segment table, view-set counts, and on one row
 /// the integrity triple with the weave placement (#1248: never a rate without
 /// them). The counters update in place; the cards rebuild only when the
@@ -25,7 +25,7 @@ public sealed class WindowsPage : Page
     private bool _showDiag;
     private readonly Dictionary<long, TextBlock> _integrity = new();
 
-    public WindowsPage() : base("windows", "Windows") { }
+    public WindowsPage() : base("windows", "Running 3D apps") { }
 
     private IReadOnlyList<Client> Visible(StatusSnapshot s) => s.Clients.Where(c => _showDiag || !c.IsDiag).ToList();
 
@@ -34,10 +34,10 @@ public sealed class WindowsPage : Page
         get
         {
             var s = Ctx.Feed.Snapshot;
-            if (s is null) return "Waiting for the first status snapshot…";
-            if (!s.IsService) return "Live client rows need the service; this is a headless snapshot.";
+            if (s is null) return "Looking for running 3D apps…";
+            if (!s.IsService) return "Running apps are listed when DisplayXR runs in the background.";
             int apps = s.Clients.Count(c => !c.IsDiag), diag = s.Clients.Count - apps;
-            return $"{StatusText.Plural(apps, "client", "clients")}{StatusText.Sep}{diag} diagnostic";
+            return $"{StatusText.Plural(apps, "app", "apps")}{StatusText.Sep}{StatusText.Plural(diag, "status reader", "status readers")}";
         }
     }
 
@@ -47,7 +47,7 @@ public sealed class WindowsPage : Page
         {
             var s = Ctx.Feed.Snapshot;
             int diag = s?.Clients.Count(c => c.IsDiag) ?? 0;
-            var cb = new CheckBox { Content = $"Show diagnostic clients ({diag})", IsChecked = _showDiag, VerticalAlignment = VerticalAlignment.Center };
+            var cb = new CheckBox { Content = $"Show status readers ({diag})", IsChecked = _showDiag, VerticalAlignment = VerticalAlignment.Center };
             cb.IsCheckedChanged += (_, _) =>
             {
                 _showDiag = cb.IsChecked == true;
@@ -91,17 +91,17 @@ public sealed class WindowsPage : Page
         var page = U.VStack(16);
         if (s is null)
         {
-            page.Children.Add(U.Card(U.VStack(8, U.Text("Reading the client list", "group"),
-                U.Wrapped("Waiting for the first status snapshot.", "desc"))));
+            page.Children.Add(U.Card(U.VStack(8, U.Text("Looking for running 3D apps", "group"),
+                U.Wrapped("This takes about a second when DisplayXR runs in the background.", "desc"))));
             return page;
         }
         var clients = Visible(s);
         if (clients.Count == 0)
         {
             string text = s.IsService
-                ? "No OpenXR app is connected to the service. In-process apps (handle / hosted / texture without the shell) do not appear here: they never talk to the service."
-                : "No service was reached, so there are no live clients to list. Start the DisplayXR service (it starts at logon) to see apps that run through it.";
-            page.Children.Add(U.Card(U.VStack(8, U.Text("No windows", "group"), U.Wrapped(text, "desc"))));
+                ? "No 3D app is running through DisplayXR's background service. Many 3D apps run on their own and are not listed here, so an empty list does not mean anything is wrong."
+                : "DisplayXR isn't running in the background, so there is no list of running apps. It normally starts when you sign in.";
+            page.Children.Add(U.Card(U.VStack(8, U.Text("No 3D apps listed", "group"), U.Wrapped(text, "desc"))));
             return page;
         }
         foreach (var c in clients) page.Children.Add(ClientCard(s, c));
@@ -142,7 +142,7 @@ public sealed class WindowsPage : Page
         }
         else
         {
-            body.Children.Add(U.Wrapped("No segment table: the client has not reported one (not split, or not a windowed client).", "desc"));
+            body.Children.Add(U.Wrapped("No segment table: the app has not reported one (its window is not split, or it has no window).", "desc"));
         }
 
         if (flat)
@@ -162,7 +162,7 @@ public sealed class WindowsPage : Page
     private static Control SegmentTable(StatusSnapshot s, Client c)
     {
         var g = new Grid { ColumnDefinitions = new ColumnDefinitions("2*,1.4*,Auto,Auto,Auto") };
-        string[] heads = { "Screen", "Canvas", "DP", "Woven", "Eyes" };
+        string[] heads = { "Display", "Canvas", "Display driver", "Woven", "Eyes" };
         g.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
         for (int i = 0; i < heads.Length; i++)
         {

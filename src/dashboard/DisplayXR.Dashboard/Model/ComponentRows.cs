@@ -70,16 +70,21 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
         RowStatus.Installed => ("Installed", Level.Ok),
         RowStatus.UpdateAvailable => ("Update available", Level.Info),
         RowStatus.Available => ("Available", Level.Plain),
-        RowStatus.NotFromCatalog => ("Not from catalog", Level.Plain),
+        RowStatus.NotFromCatalog => ("Installed separately", Level.Plain),
         RowStatus.PartOfRuntime => ("Part of the runtime", Level.Plain),
         _ => null,
     };
 
     /// <summary>
     /// The main button. Nothing is ever offered on a copy the catalog did not find: installing over
-    /// it would replace something the user put there another way.
+    /// it would replace something the user put there another way. Nor Install / Update on a row kept
+    /// from an earlier read (<see cref="Stale"/>): the catalog cannot be reached now, so the engine
+    /// would only answer "offline", and what the row says may no longer be true.
     /// </summary>
-    public CatalogAction Action => Catalog is null || Status is RowStatus.NotFromCatalog or RowStatus.PartOfRuntime ? CatalogAction.None : Catalog.Action;
+    public CatalogAction Action =>
+        Catalog is null || Status is RowStatus.NotFromCatalog or RowStatus.PartOfRuntime ? CatalogAction.None
+        : Stale && Catalog.Action is CatalogAction.Install or CatalogAction.Update ? CatalogAction.None
+        : Catalog.Action;
 
     /// <summary>
     /// Uninstall only when it can succeed: the engine installed it (a receipt) and says it has an
@@ -100,6 +105,24 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
             ? CatalogText.RemoveFromSettings
         : null;
 
+    /// <summary>The row's face (see <see cref="RowFace"/>).</summary>
+    public RowFace Face
+    {
+        get
+        {
+            bool catalogFacts = Catalog is not null && HasDetail;
+            var status = StatusChip is { } st && Stale && catalogFacts ? ($"{st.Text} (last known)", st.Level) : StatusChip;
+            var details = new List<(string Label, string Text)>();
+            // One line per label: several values of one label (a client's flags) are listed together.
+            foreach (var g in (Installed?.DetailFacts ?? Array.Empty<(string Label, string Text)>()).GroupBy(f => f.Label))
+                details.Add((g.Key, string.Join(", ", g.Select(f => f.Text))));
+            // The catalog's own facts that are not already in its detail (version, size, category, licence are).
+            if (catalogFacts && Catalog!.Recommended) details.Add(("Catalog", "Recommended"));
+            return new RowFace(status, PlainStates.Chip(Installed?.State ?? PlainState.None),
+                               catalogFacts && Catalog!.DetectedHere, details);
+        }
+    }
+
     public bool Shows(RowFilter filter) => filter switch
     {
         RowFilter.Installed => Status != RowStatus.Available,
@@ -107,6 +130,15 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
         _ => true,
     };
 }
+
+/// <summary>
+/// What a row shows on itself, and what its Details lists. On the row: its status (with "last known"
+/// when it comes from an earlier catalog read), at most one plain state word, and "Works with your
+/// display" when the engine matched this machine. Every other chip the row used to carry is a
+/// labelled line of <see cref="Details"/> ("Load state: LOADED", "Signature: signed by ...").
+/// </summary>
+public sealed record RowFace((string Text, Level Level)? Status, (string Text, Level Level)? State, bool WorksWithDisplay,
+                             IReadOnlyList<(string Label, string Text)> Details);
 
 /// <summary>One group of the page: a Components section and its rows.</summary>
 public sealed record ComponentGroup(ComponentSection Section, IReadOnlyList<ComponentRow> Rows);
@@ -193,8 +225,11 @@ public static class ComponentRows
                 }
                 var entry = items.FirstOrDefault(c => c.Class == cls && c.ComponentId == id && !used.Contains(c.Id));
                 if (entry is not null) used.Add(entry.Id);
+                // A built-in row (the conversion class's built-in adapter) is part of the runtime
+                // binary itself: it has no install of its own, whatever the catalog says.
                 RowStatus status =
-                    catalog is null || item.Policy is { BuiltIn: true } ? RowStatus.Installed
+                    item.BuiltIn || item.Policy is { BuiltIn: true } ? RowStatus.PartOfRuntime
+                    : catalog is null ? RowStatus.Installed
                     : entry is null ? (source.Complete ? RowStatus.NotFromCatalog : RowStatus.Installed)
                     : !entry.IsInstalled ? RowStatus.NotFromCatalog
                     : entry.HasUpdate ? RowStatus.UpdateAvailable
@@ -209,10 +244,10 @@ public static class ComponentRows
         }
         var runtime = Ordered(items.Where(c => c.IsRuntime)).Select(c => CatalogOnly(c, stale)).ToArray();
         if (runtime.Length > 0)
-            groups.Insert(0, CatalogGroup(RuntimeGroupId, "Runtime", "DisplayXR itself: what every component, app and add-on here runs on.", runtime));
+            groups.Insert(0, CatalogGroup(RuntimeGroupId, "DisplayXR", "DisplayXR itself: what every add-on and app here runs on.", runtime));
         var apps = Ordered(items.Where(c => !c.IsRuntime && !ComponentClassNames.Contains(c.Class))).Select(c => CatalogOnly(c, stale)).ToArray();
         if (apps.Length > 0)
-            groups.Add(CatalogGroup(AppsGroupId, "Apps", "Apps and tools from the catalog. They run on the runtime; they are not plugged into it.", apps));
+            groups.Add(CatalogGroup(AppsGroupId, "Apps", "Apps and tools for your display. They run on DisplayXR.", apps));
         return groups;
     }
 

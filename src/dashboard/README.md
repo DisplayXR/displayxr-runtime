@@ -12,8 +12,8 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 |---|---|---|
 | Home | the status feed; `info --json` once per show and on Refresh; `dp list --json` (each screen's effective DP, read-only); `selftest --json` on click | `runtime activate`, `dp reset` (only when a machine-wide override is set) |
 | Displays | the status feed (screens, desktop map); `dp list --json` for the per-screen selector (its options: that screen's `candidates`) | `dp use <id> --screen <key>`, `dp reset --screen <key>` |
-| Windows | the status feed (clients) | — |
-| Components | the status feed (clients by class; per screen `eye_tracking.viewer_source` / `viewer_reason` / `viewer_policy` for the tracking card); `info --json` (incl. `tracking_providers`: probe results, the primary screen's arbitration); `workspace list --json`; `dp\|input\|conv\|tracking list --json` (ADR-054 N3e: `enabled`, `enabled_source`, `preferred`, `provenance`, conv `built_in`, tracking `first`, `policy.policy_lock`; ADR-054 N5: each row's `licence` object, shown as a chip — `unlicensed`, `licence expired`, `trial until <date>`, `licensed`, or `included with your display` when the entitlement comes with the hardware; nothing for a component with no licence to report. The Dashboard only shows it: the component decides it) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace reset <id>` (back to the runtime default, Ctrl+Shift+Space / auto), `workspace launch <id>`; `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `input use <id> --app <exe>` / `input reset --app <exe>` (the Input card's **Per app** table, ADR-034 Am.5: each pinned or running app's pin per role family and its live holder from `input list --json` `per_app` + `holders`; per user only — no machine-wide per-app pin exists — and disabled under `Policy\Lock`), `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise every control's `--machine` command — Enabled, Prefer, Reset — is shown for an administrator). No Enabled or Prefer on the built-in `dp-lift` row; under `Policy\Lock` the class shows "Locked by machine policy" and its per-user controls are disabled (for tracking, the per-user Prefer / Reset too). **Tracking providers** (ADR-054 N6): `tracking enable\|disable <id>`, `tracking use <id>` / `tracking reset` (then re-reads `tracking list --json` and `info --json`); per screen the viewer source and why (provider; standby: the display tracks; no source; source paused; FIXED / OWN) beside the display's viewer policy, and a **Calibrate camera…** button on provider-served screens that opens the calibration window (below): `tracking calibrate --screen <key> --watch --json` (long-lived), `tracking calibrate solve --in <tmp> --mode b --eye mid --reject-mm 5 --json`, `tracking calibrate apply --screen <key> --camera <key> --pose <setting> --provider <id> --rms-mm <rms> --samples <n> --mode b [--depth-scale <iris>] --json` (writes the runtime-owned camera calibration store, shared by every provider; `--provider` is accepted and ignored; then re-reads `tracking list --json` and `info --json`) |
+| Running 3D apps (`windows`) | the status feed (clients) | — |
+| Components | the status feed (clients by class; per screen `eye_tracking.viewer_source` / `viewer_reason` / `viewer_policy` for the tracking card); `info --json` (incl. `tracking_providers`: probe results, the primary screen's arbitration); `workspace list --json`; `dp\|input\|conv\|tracking list --json` (ADR-054 N3e: `enabled`, `enabled_source`, `preferred`, `provenance`, conv `built_in`, tracking `first`, `policy.policy_lock`; ADR-054 N5: each row's `licence` object, shown in the row's Details as a *Licence* line — `unlicensed`, `licence expired`, `trial until <date>`, `licensed`, or `included with your display` when the entitlement comes with the hardware; nothing for a component with no licence to report. The Dashboard only shows it: the component decides it) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace reset <id>` (back to the runtime default, Ctrl+Shift+Space / auto), `workspace launch <id>`; `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `input use <id> --app <exe>` / `input reset --app <exe>` (the Input card's **Per app** table, ADR-034 Am.5: each pinned or running app's pin per role family and its live holder from `input list --json` `per_app` + `holders`; per user only — no machine-wide per-app pin exists — and disabled under `Policy\Lock`), `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise every control's `--machine` command — Enabled, "Use this one", "Choose automatically" — is shown for an administrator, in the row's Details). No Enabled or "Use this one" on the built-in `dp-lift` row; under `Policy\Lock` the class shows "Managed by your administrator" (the technical `Policy\Lock` line is in each row's Details) and its per-user controls are disabled (for tracking, the per-user "Use this one" / "Choose automatically" too). **Viewer tracking** (tracking providers, ADR-054 N6): `tracking enable\|disable <id>`, `tracking use <id>` / `tracking reset` (then re-reads `tracking list --json` and `info --json`); per screen the viewer source and why (provider; standby: the display tracks; no source; source paused; FIXED / OWN) beside the display's viewer policy, and a **Calibrate camera…** button on provider-served screens that opens the calibration window (below): `tracking calibrate --screen <key> --watch --json` (long-lived), `tracking calibrate solve --in <tmp> --mode b --eye mid --reject-mm 5 --json`, `tracking calibrate apply --screen <key> --camera <key> --pose <setting> --provider <id> --rms-mm <rms> --samples <n> --mode b [--depth-scale <iris>] --json` (writes the runtime-owned camera calibration store, shared by every provider; `--provider` is accepted and ignored; then re-reads `tracking list --json` and `info --json`) |
 | Components (catalog side) | the install engine's `dxr-get list --json --no-runtime` (one call: state, versions, detection, sizes, compatibility, prerequisites), `dxr-get list --installed --json` when offline; `dp\|input\|conv\|tracking list --json` for an installed item's `licence` object | `dxr-get install <id> --yes --json --no-runtime`, `dxr-get uninstall <id> --json` (elevated for that one run, see below); `displayxr-cli <class> activate <id> @<key file> --json`; `displayxr-cli <class> activate-begin <id> --json` (Buy) |
 | Performance | `perf list --json`, `info --json` (adapters) | `perf set` / `perf reset` |
 | Developer | `perf list --all --json` (the read-only Tier 1/2 lever list: only while "Developer settings" is expanded, and on Refresh; collapsed again on every launch); `dp list --json` (`preferred` only: a machine-wide override is shown as a notice) | `perf reset <name>` / `perf reset` (managed levers only; the rest are environment-only), `dp reset` (machine-wide; admin) |
@@ -23,8 +23,13 @@ Every CLI run is an argument vector (`Model/CliArgs`, passed through
 a manifest put in it; the log pane shows the readable form. A write's result line is
 followed by every `note:` / `warning:` line the CLI printed.
 
-**Components** groups what is plugged into the runtime by ROLE, never by product:
-display processors, the workspace controller (its launch hotkey / mode / Reset / "Launch now",
+**Components** groups what is plugged into the runtime by ROLE, never by product. The
+section titles are plain words: **Displays** (display drivers, i.e. display processors),
+**Spatial desktop** (the workspace controller), **Apps with their own window** (present
+owners), **Input**, **Viewer tracking** (camera head tracking), **2D to 3D in the display
+driver** (`lift_caps`), **2D to 3D** (conversion providers), **2D-to-3D models**, **Stereo
+camera**, **Status readers** (diagnostics clients). By role:
+display processors, the workspace controller (its launch shortcut / mode / Reset / "Open now",
 phase 8, hidden when the CLI has no `launch` block; the shown combo is whatever `workspace list --json`
 reports, so an older runtime shows its own default; `Model/Hotkey.Default` — Ctrl+Shift+Space, Ctrl+Space
 before 2026-10-26 — only feeds the Reset tooltip and the fixture), present owners, input providers and
@@ -46,9 +51,9 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   the ones that only report: present owners, the conversion module, model packs, the stereo
   camera, diagnostics clients). Each section whose class the catalog has (`display_processor`,
   `input_provider`, `tracking_provider`, `conversion_provider`, `workspace_controller`) also
-  carries that class's catalog items. A first group, **Runtime**, holds the catalog's row for the
+  carries that class's catalog items. A first group, **DisplayXR**, holds the catalog's row for the
   runtime itself. A last group, **Apps**, holds the catalog items that are not components (apps,
-  companions, developer tools), each with a chip for its kind when it is not an app. Both print a
+  companions, developer tools), each with its kind in Details (*Category*). Both print a
   count of their non-zero parts only ("2 installed", "1 available to install", or both;
   `CatalogText.Counts`).
 - **One row per item, one status per row** (`Model/ComponentRows.cs`, `ComponentRows.Join`). An
@@ -60,20 +65,45 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   | **Installed** | present, and the catalog has the same build (or no catalog has been read: nothing is claimed) | the row's own controls; Details; Uninstall when the engine can do it |
   | **Update available** | present, and the catalog has another build (`outdated` / `rebuilt`) | the same, and **Update** |
   | **Available** | in the catalog, not on this machine | **Install** (or **Get it** for a link-out item); Details |
-  | **Not from catalog** | present, and the catalog does not list it, or lists it but the engine did not find this copy (a dev registration, another installer, a preinstall) | the row's own controls only, and "Remove with its own uninstaller." |
-  | **Part of the runtime** | as *Not from catalog*, and the runtime's own installer shipped it: its registered binary (`binary_path` / `binary` of `<class> list --json`) is inside the `plugins` folder of the runtime directory, the folder of the `displayxr-cli` the Dashboard runs (`ComponentRows.ShippedByRuntime`) | the row's own controls only, and no removal sentence (it goes with the runtime) |
+  | **Installed separately** | present, and the catalog does not list it, or lists it but the engine did not find this copy (a dev registration, another installer, a preinstall) | the row's own controls only, and "Remove with its own uninstaller." (last line of Details) |
+  | **Part of the runtime** | as *Installed separately*, and the runtime's own installer shipped it: its registered binary (`binary_path` / `binary` of `<class> list --json`) is inside the `plugins` folder of the runtime directory, the folder of the `displayxr-cli` the Dashboard runs (`ComponentRows.ShippedByRuntime`) | the row's own controls only, and no removal sentence (it goes with the runtime) |
 
   A row that is neither installed nor installable (a connected client, a summary line) has no
-  status. The built-in conversion adapter reads *Installed*. Filters: **All / Installed /
+  status. The built-in conversion adapter (`dp-lift`, compiled into the runtime) reads *Part of the runtime*. Filters: **All / Installed /
   Updates**.
-- **Installed rows keep their controls**: Enabled, Prefer / Reset, the launch row of a workspace
-  controller, the per-app and per-screen tables. Under them, a row the catalog knows has
+- **Installed rows keep their controls**: Enabled, **Use this one** / **Choose automatically**
+  (accessible names `Use this one: <name>` / `Choose automatically: <name>`; per task "Use this one
+  for <task>"), the launch row of a workspace controller, the per-app and per-screen tables. Each row
+  has ONE strip: Enabled, "Use this one", Install / Update and Details on one line, Details opening
+  below it in the same box. Every section card takes the full width, one per row. Under them, a row the catalog knows has
   **Install** / **Update**, **Details** (what it does, version, size, publisher, category, each
   external prerequisite with *Ready* / *Included* / *Get it first* and a link to its maker for an
-  unmet one, the licence block, **Uninstall**). Chips state positive facts only: *Works with your
-  display* (`detected: high`), *Recommended*, the download size. Details says the same in one
-  fixed sentence; the engine's `evidence` string (internal panel codes) is parsed and never shown. An item the engine would refuse
+  unmet one, the licence block, **Uninstall**). *Works with your display* (`detected: high`) is a
+  chip on the row; Details says the same in one fixed sentence; the engine's `evidence` string (internal panel codes) is parsed and never shown. An item the engine would refuse
   (`compatible: false`) has no button and one calm line; the engine's own reason is in its detail.
+- **What a row shows, and what is in Details** (`ComponentRow.Face`). On the row: the name, the status
+  chip, at most one plain state word, *Works with your display* when it applies, and one plain line
+  under the name (`ComponentItem.Summary`: publisher · version, and for a display driver which display
+  it drives, "drives your main display"). Every technical line (registration id and ProbeOrder,
+  hosting, licence class, the claims, each conversion task's state, the component's own hint, the
+  workspace controller's status, process and shortcut source) is a labelled line of Details
+  (`ComponentItem.LineFacts`), and so is how a row that cannot be removed from here is removed. The state
+  word maps the component's technical state (`Model/Components.cs` `PlainStates`): **In use** (an
+  `ACTIVE` display processor, a conversion provider selected for a task, a tracking provider
+  serving a screen, an active input provider, a connected workspace controller), **Ready** (loaded
+  or usable but not the one in use: `LOADED`, `BUILT_IN`, an input provider with its hardware
+  present, a tracking provider whose probe found a source, an available conversion module, an
+  installed model pack), **Standby** (registered and allowed but not loaded or not needed:
+  `NOT_ATTEMPTED`, `DECLINED`, superseded, a controller not running), **Turned off** (its Enabled
+  value, or the loader's `DISABLED`), **Needs attention** (refused by the provenance gate: "Blocked:
+  publisher not verified"; any
+  other load failure, malformed descriptors, a failing task). A connected client or a summary line
+  has none. Every other chip is a labelled line of Details (*Load state*, *Platform*, *Role*,
+  *Enabled setting*, *Preference*, *Signature*, *Provenance gate*, *Licence*, *Probe*, *Hardware*,
+  *Flags*, …; provenance reads "Approved on this PC", "Publisher not verified"), with what a policy
+  change means and, from a non-elevated Dashboard, each control's machine-wide command. Enabled and
+  "Use this one" stay on the row. Every row with any of that has a
+  Details toggle (`Details of <name>` / `Hide details of <name>`), catalog row or not.
 - **After an install the same row is the installed row**, with its detail open: the row's key is
   its class and registered id, which do not change. The status feed, the class's policy rows and
   the workspace list are re-read.
@@ -81,7 +111,7 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   (`receipt: true`) AND say it can remove it (`can_uninstall: true` in `dxr-get list --json`:
   the receipt recorded an uninstall command). A receipt alone is not enough: an item installed
   from a catalog entry that names no uninstall command (every schema-1 item) would be refused
-  with exit 43, so its row shows "Remove it from Windows Settings > Apps." instead of a button
+  with exit 43, so its row's Details end with "Remove it from Windows Settings > Apps." instead of a button
   (the runtime's own row shows the same sentence).
   A list without the field (an older engine) reads as "cannot remove". A row that is not from
   the catalog is never offered Update, Install or Uninstall. **Disable is not Uninstall**: the
@@ -94,9 +124,12 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
 - **When the catalog cannot be read** (offline, refused, the engine missing, a platform with no
   engine) one banner at the top says so, with **Try again** or the Download page. Everything
   installed stays below and works as usual. Rows from the last catalog read in this session are
-  kept, with a *last known* chip, and the banner says when that read was; with no earlier read
+  kept, their status reading *… (last known)*, and the banner says when that read was; with no earlier read
   the banner is all there is (offline, what the engine installed is still listed from its
-  receipts and can still be removed).
+  receipts and can still be removed). A *last known* row offers no Install, and an installed one
+  no Update, until the catalog can be read again. While a read is in progress (the first one, Try
+  again, Refresh; the engine retries for about 20 s before it answers offline) a "Checking for
+  add-ons and updates…" line says so (`CatalogText.Checking`).
 - **Install / Update / Uninstall, with the Dashboard staying non-elevated.** The verb first runs
   as the user, output captured. The engine answers what elevation cannot fix before it asks for
   it (offline 10, bad signature 11, not compatible 41, nothing to do 0, no receipt 42, cannot
@@ -182,7 +215,7 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
 
 ## Camera calibration window
 
-Components → Tracking providers → **Calibrate camera…** (only on a screen whose viewer source is a
+Components → Viewer tracking → **Calibrate camera…** (only on a screen whose viewer source is a
 provider) opens a borderless full-screen window on that screen (the monitor that best overlaps the
 screen's desktop rect from the status feed; a points-vs-pixels platform is matched at the feed's
 scale). Method: [tracking-provider-discovery.md §6](../../docs/specs/runtime/tracking-provider-discovery.md#camera-pose-calibration).
@@ -224,7 +257,7 @@ scale). Method: [tracking-provider-discovery.md §6](../../docs/specs/runtime/tr
 ## Feed cadence (ADR-051 D5)
 
 - One long-lived `displayxr-cli status --watch --json` child while a status page (Home,
-  Displays, Windows) is on screen and the window is not minimised. Moving between status
+  Displays, Running 3D apps) is on screen and the window is not minimised. Moving between status
   pages keeps the same child. Leaving for Performance / Developer stops it after a 15 s
   linger (a quick hop back reuses it: a child that cannot reach the service builds a
   headless snapshot, and each of those creates a vendor instance); minimising stops it at
@@ -232,10 +265,15 @@ scale). Method: [tracking-provider-discovery.md §6](../../docs/specs/runtime/tr
   and the snapshot is dropped.
 - A child that exits after ≥ 10 s is restarted; two young exits in a row → fallback to
   `status --json` **every 30 s, never faster** (each headless run creates a vendor
-  instance), with a "Live feed unavailable" banner. A poll that sees `source: service`, or
+  instance), with a "Live status isn't available" banner. A poll that sees `source: service`, or
   every 4th poll, retries the watch child — at most one poll and one watch attempt per 30 s.
 - A line that does not parse keeps the last good snapshot and shows "last read failed,
   retrying" in the header. Never a modal, never a crash.
+- The header's pill says "DisplayXR is running" (`source: service`) or "Not running in the
+  background" (headless), the technical source line in its tooltip. A headless snapshot also
+  shows the banner "DisplayXR isn't running in the background" (`StatusText.NotRunningText`:
+  what the pages show and what is missing; it does not promise that 3D apps work meanwhile).
+  **Copy report** copies the full status snapshot as JSON (unchanged).
 - `info --json` (≈ 10 s: it loads every plug-in) is never polled.
 - Every child is in a kill-on-close job object: no `displayxr-cli` outlives the dashboard.
 - One dashboard per logon session (a second launch raises the first): each one holds a
@@ -295,11 +333,17 @@ parts (the job object, raising the first instance) are no-ops there.
   (the status feed) only from its own directory (#960); any other `displayxr-cli` is
   admitted as APP and refused the status read. The CLI then says so on stderr and shows
   the headless snapshot; the dashboard logs that note (`status --watch says: …`) and, if
-  a watch child prints nothing for 10 s, a WARN and a "no snapshot" pill. Mixing a
+  a watch child prints nothing for 10 s, a WARN and a "No status yet" pill. Mixing a
   `_package\bin` dashboard with an installed service (or the reverse) is the usual way in.
 - `--version` prints the version and exits (no window).
+- Rail badges: Displays (things to check), Components (updates), Performance (changed settings),
+  Running 3D apps (how many), and an amber **1** on Home when one display driver is set for every
+  display on this PC (`dp list --json` `preferred`). Each badge is said in words: its tooltip, the
+  rail entry's accessible name ("Home: One display driver is set ..."), and on Home the notice that
+  explains it and offers "Clear this setting".
 - `--page displays|windows|components|performance|developer|home` opens on that page
-  (`catalog` still works and opens Components).
+  (`catalog` still works and opens Components). `windows` is the page shown as **Running 3D apps**.
+  The rail's order is Home, Displays, Components, Performance, Running 3D apps, Developer.
 - `--fixture <file.ndjson>` replays snapshots from a file instead of `status --watch`
   (one line every 2 s, looping) and simulates the per-screen `dp` verbs in memory, so the
   live-service pages can be laid out without a service that answers. Fixtures and their

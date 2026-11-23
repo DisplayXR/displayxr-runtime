@@ -95,7 +95,7 @@ public class ComponentRowsTests
         var row = Assert.Single(ComponentRows.Join(sections, Live(Item("other", "tracking_provider", "not_installed")))[0].Rows.Where(r => r.Installed is not null));
 
         Assert.Equal(RowStatus.NotFromCatalog, row.Status);
-        Assert.Equal(("Not from catalog", Level.Plain), row.StatusChip);
+        Assert.Equal(("Installed separately", Level.Plain), row.StatusChip);
         Assert.NotNull(row.Installed!.Policy); // the Enabled / Prefer controls still have their row
         Assert.Equal(CatalogAction.None, row.Action);
         Assert.False(row.CanUninstall);
@@ -138,7 +138,7 @@ public class ComponentRowsTests
         foreach (var key in new[] { "input_provider:pen", "input_provider:dev", "input_provider:old" })
         {
             var other = Row(groups, key);
-            Assert.Equal(("Not from catalog", Level.Plain), other.StatusChip);
+            Assert.Equal(("Installed separately", Level.Plain), other.StatusChip);
             Assert.Equal("Remove with its own uninstaller.", other.RemoveNote);
         }
 
@@ -305,6 +305,15 @@ public class ComponentRowsTests
         Assert.Equal(2, rows.Count); // the catalog-only row is not dropped
         Assert.All(rows, r => Assert.True(r.Stale));
         Assert.Equal(RowStatus.Available, rows[1].Status);
+        // Offline, a last-known row offers no Install, and an installed one no Update.
+        Assert.Equal(CatalogAction.Install, rows[1].Catalog!.Action);
+        Assert.Equal(CatalogAction.None, rows[1].Action);
+        var outdated = Catalog(Item("panel-a", "display_processor", "outdated", receipt: true));
+        var staleUpdate = Assert.Single(ComponentRows.Join(new[] { Section("display_processors", Registered(ComponentClass.Display, "panel-a")) },
+            CatalogSource.From(offline, outdated))[0].Rows);
+        Assert.Equal(RowStatus.UpdateAvailable, staleUpdate.Status);
+        Assert.Equal(CatalogAction.None, staleUpdate.Action);
+        Assert.True(staleUpdate.CanUninstall); // removing needs no catalog
 
         // No earlier read: only the banner; the installed row stays, with nothing claimed about it.
         var bare = ComponentRows.Join(new[] { Section("display_processors", Registered(ComponentClass.Display, "panel-a")) }, CatalogSource.From(offline, null))[0].Rows;
@@ -333,7 +342,7 @@ public class ComponentRowsTests
         Assert.DoesNotContain(apps.Rows, r => r.Catalog!.Class == "display_processor");
 
         // The runtime's own row: a first group of its own, shown, never installed or removed from here.
-        Assert.Equal("Runtime", groups[0].Section.Title);
+        Assert.Equal("DisplayXR", groups[0].Section.Title);
         Assert.Equal("1 installed", groups[0].Section.ConnectedLine);
         var runtime = Assert.Single(groups[0].Rows);
         Assert.Equal("runtime", runtime.Catalog!.Id);
@@ -397,12 +406,89 @@ public class ComponentRowsTests
     }
 
     [Fact]
-    public void ABuiltInRow_IsInstalled_NotSomethingToRemove()
+    public void ABuiltInRow_IsPartOfTheRuntime_NotSomethingToRemove()
     {
         var sections = new[] { Section("conversion_providers", Registered(ComponentClass.Conversion, "built-in", builtIn: true)) };
         var row = Assert.Single(ComponentRows.Join(sections, Live(Item("depth", "conversion_provider", "not_installed")))[0].Rows.Where(r => r.Installed is not null));
-        Assert.Equal(RowStatus.Installed, row.Status);
+        Assert.Equal(RowStatus.PartOfRuntime, row.Status);
+        Assert.Equal(("Part of the runtime", Level.Plain), row.StatusChip);
         Assert.Null(row.RemoveNote);
+        Assert.Equal(CatalogAction.None, row.Action);
+
+        // With no catalog read, and before the class's policy list is read (the load verdict alone says it).
+        Assert.Equal(RowStatus.PartOfRuntime, Assert.Single(ComponentRows.Join(sections, null)[0].Rows).Status);
+        var verdictOnly = new ComponentItem("built-in", Level.Ok, Array.Empty<(string, Level)>(), Array.Empty<string>(), Id: "built-in", BuiltIn: true);
+        Assert.Equal(RowStatus.PartOfRuntime,
+            Assert.Single(ComponentRows.Join(new[] { Section("conversion_providers", verdictOnly) }, Live())[0].Rows).Status);
+    }
+
+    [Fact]
+    public void ARow_ShowsItsStatus_OneStateWord_AndWorksWithYourDisplay_EverythingElseIsInDetails()
+    {
+        var chips = new ChipList();
+        chips.Add("Load state", "LOADED", Level.Plain);
+        chips.Add("Platform", "READY", Level.Plain);
+        chips.Add("Signature", "signed by Example Co", Level.Ok);
+        chips.Add("Licence", "trial until 2026-12-21", Level.Info);
+        var item = new ComponentItem("panel-a", Level.Ok, chips.Chips, Array.Empty<string>(),
+            Policy: Policy(ComponentClass.Display, "panel-a"), Facts: chips.Facts, State: PlainState.Ready);
+        string detected = Item("panel-a", "display_processor", "current", receipt: true).Replace("}", ",\"detected\":\"high\",\"recommended\":true,\"size\":971776}");
+        var row = Assert.Single(ComponentRows.Join(new[] { Section("display_processors", item) }, Live(detected))[0].Rows);
+
+        var face = row.Face;
+        Assert.Equal(("Installed", Level.Ok), face.Status);
+        Assert.Equal(("Ready", Level.Plain), face.State);
+        Assert.True(face.WorksWithDisplay);
+        Assert.Equal(new[]
+        {
+            ("Load state", "LOADED"), ("Platform", "READY"), ("Signature", "signed by Example Co"),
+            ("Licence", "trial until 2026-12-21"), ("Catalog", "Recommended"),
+        }, face.Details);
+
+        // Several values of one label are one line.
+        var client = new ComponentItem("app.exe", Level.Ok, new[] { ("focused", Level.Ok), ("active", Level.Plain) }, Array.Empty<string>(),
+            Facts: new[] { ("Flags", "focused"), ("Flags", "active") });
+        var clientFace = Assert.Single(ComponentRows.Join(new[] { Section("present_owners", client) }, null)[0].Rows).Face;
+        Assert.Null(clientFace.Status);
+        Assert.Null(clientFace.State);
+        Assert.Equal(new[] { ("Flags", "focused, active") }, clientFace.Details);
+
+        // A row with no facts of its own lists its chips under "State".
+        var bare = new ComponentItem("x", Level.Ok, new[] { ("connected", Level.Ok) }, Array.Empty<string>());
+        Assert.Equal(new[] { ("State", "connected") }, bare.DetailFacts);
+    }
+
+    [Fact]
+    public void ALastKnownRow_SaysSoInItsStatus()
+    {
+        var good = Catalog(Item("panel-c", "display_processor", "not_installed"));
+        var offline = CatalogRead.From(CatalogExit.Offline, "", true, false, null);
+        var row = Assert.Single(ComponentRows.Join(new[] { Section("display_processors") }, CatalogSource.From(offline, good))[0].Rows);
+        Assert.Equal(("Available (last known)", Level.Plain), row.Face.Status);
+        Assert.Equal(("Available", Level.Plain), Assert.Single(ComponentRows.Join(new[] { Section("display_processors") }, Live(
+            Item("panel-c", "display_processor", "not_installed")))[0].Rows).Face.Status);
+    }
+
+    [Fact]
+    public void PolicyNotes_SayTheScope_AndEveryMachineWideCommand_ForTheDetails()
+    {
+        var row = new PolicyRow(ComponentClass.Display, "panel-a", "panel-a", true, "default", false, false, "ACTIVE", "signed", null, null);
+        var list = new PolicyList(ComponentClass.Display, null, new[] { row }, new Dictionary<string, string>(), Array.Empty<PolicyTask>());
+
+        var notes = PolicyCommands.Notes(row, list, machine: false, elevated: false);
+        Assert.StartsWith("For you only; for everyone on this PC needs administrator permission.", notes[0].Text);
+        Assert.Contains(ComponentClass.Display.AppliesNote(), notes[0].Text);
+        Assert.Contains(("Machine-wide, from an administrator prompt:", false), notes);
+        Assert.Contains(("displayxr-cli dp disable panel-a --machine", true), notes);
+        Assert.Contains(("displayxr-cli dp use panel-a --machine", true), notes);
+
+        // Elevated: the dashboard can write machine-wide itself, so no command to copy.
+        var elevated = PolicyCommands.Notes(row, list, machine: true, elevated: true);
+        Assert.Equal(new[] { ($"For everyone on this PC. {ComponentClass.Display.AppliesNote()}", false) }, elevated);
+
+        var builtIn = row with { Class = ComponentClass.Conversion, Id = "built-in", EnabledSource = "", BuiltIn = true };
+        var conv = new PolicyList(ComponentClass.Conversion, null, new[] { builtIn }, new Dictionary<string, string>(), Array.Empty<PolicyTask>());
+        Assert.StartsWith("Built-in adapter:", PolicyCommands.Notes(builtIn, conv, false, false)[0].Text);
     }
 
     [Fact]
@@ -445,6 +531,7 @@ public class ComponentRowsTests
     [InlineData("catalog", "components")]
     [InlineData("components", "components")]
     [InlineData("home", "home")]
+    [InlineData("windows", "windows")] // the page shown as "Running 3D apps" keeps its route
     [InlineData("no-such-page", "no-such-page")]
     public void TheCatalogRoute_OpensComponents(string id, string page) => Assert.Equal(page, PageRoutes.Resolve(id));
 }

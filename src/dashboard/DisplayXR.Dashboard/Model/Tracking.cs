@@ -94,11 +94,13 @@ public sealed record TrackingScreen(string ScreenId, string Name, bool Primary, 
     /// <summary>Camera-pose calibration is per provider-served screen (tracking-provider-discovery §6).</summary>
     public bool CanCalibrate => Kind == ViewerSourceKind.Provider;
 
-    /// <summary>The viewer-policy chip ("policy not reported" when this screen was not evaluated).</summary>
+    /// <summary>The viewer-policy chip in plain words ("Not reported" when this screen was not evaluated); <see cref="Policy"/> is the CLI's word.</summary>
     public (string Text, Level Level) PolicyChip => Policy switch
     {
-        null or "" => ("policy not reported", Level.Plain),
-        "EXTERNAL_OK" => ("policy EXTERNAL_OK", Level.Info),
+        null or "" => ("Not reported", Level.Plain),
+        "EXTERNAL_OK" => ("Allows camera head tracking", Level.Info),
+        "OWN" => ("Uses its own tracking", Level.Plain),
+        "FIXED" => ("Fixed viewer position", Level.Plain),
         var p => ($"policy {p}", Level.Plain),
     };
 }
@@ -158,22 +160,22 @@ public static class Tracking
         case ViewerSourceKind.Provider:
             return state switch
             {
-                "TRACKING" => ($"Provider: {provider}", "Tracking the viewer.", Level.Ok),
-                "NOT_TRACKING" => ($"Provider: {provider}",
-                    "Source paused: no viewer lock right now (no face, camera unplugged or provider stopped); the views hold the last known viewer.",
+                "TRACKING" => ($"Camera head tracking: {provider}", "Following you.", Level.Ok),
+                "NOT_TRACKING" => ($"Camera head tracking: {provider}",
+                    "Paused: it does not see you right now (no face, camera unplugged or tracking stopped). The picture holds your last position.",
                     Level.Warn),
-                _ => ($"Provider: {provider}", "Selected: starts when an app needs a viewer on this screen.", Level.Info),
+                _ => ($"Camera head tracking: {provider}", "Chosen: it starts when an app needs it on this display.", Level.Info),
             };
         case ViewerSourceKind.Display:
             return reason == StandbyReason
-                ? ("Display", "Standby: the display tracks the viewer on this screen.", Level.Plain)
-                : ("Display", Sentence(reason) ?? "The display owns the viewer on this screen.", Level.Plain);
+                ? ("The display", "Standby: the display tracks you itself.", Level.Plain)
+                : ("The display", Sentence(reason) ?? "The display itself decides where you are.", Level.Plain);
         case ViewerSourceKind.Nominal:
             return reason == NoSourceReason
-                ? ("Nominal viewer", "No source: no enabled provider found a usable source.", Level.Info)
-                : ("Nominal viewer", Sentence(reason) ?? "The views stay on the nominal viewer.", Level.Plain);
+                ? ("Default viewer position", "No camera found you: no camera head tracking that is turned on found a usable camera.", Level.Info)
+                : ("Default viewer position", Sentence(reason) ?? "The picture is shown for a viewer at the default position.", Level.Plain);
         default:
-            return ("Not reported", "Not evaluated: the viewer source is reported by a current CLI for the runtime's default screen.", Level.Plain);
+            return ("Not reported", "Not checked: DisplayXR reports this for the default display only.", Level.Plain);
         }
     }
 
@@ -192,11 +194,11 @@ public static class Tracking
         var screens = Screens(s, summary, id => policy?.Row(id)?.Name is { Length: > 0 } n ? n : id);
         foreach (var r in policy?.Rows ?? Array.Empty<PolicyRow>())
         {
-            var chips = new List<(string, Level)>();
+            var chips = new ChipList();
             bool isServing = screens.Any(x => x.Kind == ViewerSourceKind.Provider && x.ProviderId == r.Id);
-            if (isServing) chips.Add(("serving", Level.Ok));
-            if (summary?.ProbeChip(r) is { } pc) chips.Add(pc);
-            else if (r.RankedFirst && r.Enabled) chips.Add(("ranked first", Level.Plain));
+            if (isServing) chips.Add("State", "serving", Level.Ok);
+            if (summary?.ProbeChip(r) is { } pc) chips.Add("Probe", pc);
+            else if (r.RankedFirst && r.Enabled) chips.Add("Probe", "ranked first", Level.Plain);
             Components.AddPolicyChips(chips, r);
             var lines = new List<string>
             {
@@ -206,20 +208,27 @@ public static class Tracking
                     r.ProbeOrder is { } po ? $"ProbeOrder {po}" : "",
                 }.Where(x => x.Length > 0)),
             };
-            if (r.Provenance == "unverified" && r.ProvenanceReason is { Length: > 0 } why) lines.Add(why);
+            var lineFacts = new List<(string, string)>
+            {
+                ("Registration", string.Join(StatusText.Sep, new[] { r.Id, r.ProbeOrder is { } po2 ? $"ProbeOrder {po2}" : "" }.Where(x => x.Length > 0))),
+            };
+            if (r.Provenance == "unverified" && r.ProvenanceReason is { Length: > 0 } why) { lines.Add(why); lineFacts.Add(("Note", why)); }
+            bool usable = summary is { Evaluated: true } && summary.Ranked.Contains(r.Id);
             items.Add(new ComponentItem(r.Name.Length > 0 ? r.Name : r.Id,
-                isServing ? Level.Ok : r.Untrusted ? Level.Warn : Level.Plain, chips, lines, Policy: r));
+                isServing ? Level.Ok : r.Untrusted ? Level.Warn : Level.Plain, chips.Chips, lines, Policy: r,
+                Facts: chips.Facts, State: PlainStates.TrackingProvider(isServing, usable, r),
+                Summary: Components.PublisherLine(r.Vendor, r.Version), LineFacts: lineFacts));
         }
         int registered = policy?.Rows.Count ?? summary?.Registered ?? 0;
         int enabled = policy?.Rows.Count(r => r.Enabled) ?? summary?.Enabled ?? 0;
         int serving = screens.Count(x => x.Kind == ViewerSourceKind.Provider);
-        string line = registered == 0 ? "none registered"
-            : $"{StatusText.Plural(registered, "registered", "registered")}{StatusText.Sep}{enabled} enabled{StatusText.Sep}"
-              + (serving > 0 ? $"serving {StatusText.Plural(serving, "screen", "screens")}" : "serving no screen");
-        if (policy is { DisabledByEnv: true }) line += $"{StatusText.Sep}DXR_TRACKING_PROVIDERS=0 in the CLI's environment";
-        return new ComponentSection(ComponentClass.Tracking.SectionId(), "Tracking providers",
-            "A viewer-tracking provider measures where the viewer is from a sensor the display does not own (a webcam, a depth camera); "
-            + "it serves only a screen whose display does not track the viewer itself and allows an external viewer.",
+        string line = registered == 0 ? "none installed"
+            : $"{registered} installed{StatusText.Sep}{enabled} turned on{StatusText.Sep}"
+              + (serving > 0 ? $"in use on {StatusText.Plural(serving, "display", "displays")}" : "not in use");
+        if (policy is { DisabledByEnv: true }) line += $"{StatusText.Sep}turned off by a setting outside the Dashboard (DXR_TRACKING_PROVIDERS=0)";
+        return new ComponentSection(ComponentClass.Tracking.SectionId(), "Viewer tracking",
+            "Camera head tracking: a camera that is not part of your display, such as a webcam, follows where you are. "
+            + "It is used only on a display that does not track you itself and allows it.",
             registered, serving, line, items);
     }
 }

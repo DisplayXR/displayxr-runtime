@@ -26,7 +26,7 @@ namespace DisplayXR.Dashboard;
 
 /// <summary>
 /// The shell: a left navigation rail with badges, a header (page title and
-/// caption, the feed's source pill, Refresh, Copy diagnostics), the feed
+/// caption, the feed's source pill, Refresh, Copy report), the feed
 /// banners, and the scrolling page host. Built in code, like its pages.
 /// </summary>
 public sealed class MainWindow : Window
@@ -90,7 +90,8 @@ public sealed class MainWindow : Window
             Toast = ShowToast,
         };
 
-        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new WindowsPage(), new ComponentsPage(), new PerformancePage(), new DeveloperPage() };
+        // Rail order: what an owner asks first, diagnostics last. "Running 3D apps" keeps the page id "windows" (--page windows).
+        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new ComponentsPage(), new PerformancePage(), new WindowsPage(), new DeveloperPage() };
         foreach (var p in _pages)
         {
             p.Bind(_ctx);
@@ -262,9 +263,9 @@ public sealed class MainWindow : Window
     private Control BuildMain()
     {
         var refresh = U.Button("Refresh", Refresh, "outline", "sm");
-        ToolTip.SetTip(refresh, "Restart the status feed and re-read the runtime's facts");
-        var copy = U.Button("Copy diagnostics", () => _ = CopyDiagnostics(), "outline", "sm");
-        ToolTip.SetTip(copy, "Copy the full status snapshot (JSON) to the clipboard");
+        ToolTip.SetTip(refresh, "Read everything again");
+        var copy = U.Button("Copy report", () => _ = CopyDiagnostics(), "outline", "sm");
+        ToolTip.SetTip(copy, "Copy the full status (JSON) to the clipboard, for a bug report or for support");
 
         _pill.Classes.Add("field");
         _pill.Padding = new Thickness(11, 5);
@@ -377,13 +378,14 @@ public sealed class MainWindow : Window
         // Source pill.
         (Level level, string text, string tip) pill = _feed.Mode switch
         {
-            FeedMode.Idle => (Level.Plain, "feed paused", "No status page is on screen, so no status child runs."),
-            _ when s is null && _feed.Silent => (Level.Warn, "no snapshot",
+            // Plain words on the pill; the technical source is its tooltip.
+            FeedMode.Idle => (Level.Plain, "Live status paused", "No status page is on screen, so no status child runs."),
+            _ when s is null && _feed.Silent => (Level.Warn, "No status yet",
                 (_feed.ChildNote ?? "displayxr-cli status --watch is running but has printed nothing.") + $" Details: {DashboardLog.Path}"),
-            _ when s is null => (Level.Info, "connecting…", _feed.ChildNote ?? "Waiting for the first snapshot from displayxr-cli."),
-            FeedMode.Polling => (Level.Warn, "headless · every 30 s", _feed.FallbackReason ?? "The live feed is unavailable."),
-            _ when s.IsService => (Level.Ok, StatusText.SourceLine(s), "Live: one long-lived 'displayxr-cli status --watch --json' child over the service's diagnostics connection."),
-            _ => (Level.Warn, "source: headless", "No service reached: a snapshot built by the CLI itself."),
+            _ when s is null => (Level.Info, "Connecting…", _feed.ChildNote ?? "Waiting for the first snapshot from displayxr-cli."),
+            FeedMode.Polling => (Level.Warn, "Checking every 30 s", $"headless · every 30 s. {_feed.FallbackReason ?? "The live feed is unavailable."}"),
+            _ when s.IsService => (Level.Ok, StatusText.PlainSourceLine(s), $"{StatusText.SourceLine(s)}. Live: one long-lived 'displayxr-cli status --watch --json' child over the service's diagnostics connection."),
+            _ => (Level.Warn, StatusText.PlainSourceLine(s), "source: headless. No service reached: a snapshot built by the CLI itself."),
         };
         _pill.IsVisible = _current?.HoldsFeed == true;
         _pillDot.Fill = Tokens.For(pill.level);
@@ -403,11 +405,11 @@ public sealed class MainWindow : Window
             _bannerKey = key;
             _banners.Children.Clear();
             if (statusPage && _feed.Mode == FeedMode.Polling)
-                _banners.Children.Add(U.Notice(Level.Warn, "Live feed unavailable — showing a headless snapshot",
-                    $"{_feed.FallbackReason ?? "status --watch would not stay up"}. The dashboard re-reads 'displayxr-cli status --json' every 30 s and returns to the live feed when the service answers. {elevated}".Trim()));
+                _banners.Children.Add(U.Notice(Level.Warn, "Live status isn't available",
+                    $"{_feed.FallbackReason ?? "The live status connection kept stopping"}. The Dashboard checks again every 30 seconds and goes back to live status when DisplayXR answers. {elevated}".Trim()));
             else if (statusPage && s is { IsService: false })
-                _banners.Children.Add(U.Notice(Level.Info, "No service reached — headless snapshot",
-                    $"This is what a process starting now would get: live rows (windows, tracking, bound display processors) are absent. The dashboard keeps trying to reach the service. {elevated}".Trim()));
+                _banners.Children.Add(U.Notice(Level.Info, StatusText.NotRunningTitle,
+                    $"{StatusText.NotRunningText} {elevated}".Trim()));
             _banners.Margin = _banners.Children.Count > 0 ? new Thickness(36, 0, 36, 4) : new Thickness(36, 0, 36, 0);
         }
 
@@ -429,6 +431,7 @@ public sealed class MainWindow : Window
         if (badge is null)
         {
             b.IsVisible = false;
+            if (_nav.TryGetValue(id, out var plain)) Avalonia.Automation.AutomationProperties.SetName(plain, TitleOf(id));
             return;
         }
         b.IsVisible = true;
@@ -444,15 +447,20 @@ public sealed class MainWindow : Window
             b.Background = Tokens.Alpha(Tokens.ColorKey(badge.Level), 0.22);
             t.Foreground = Tokens.For(badge.Level);
         }
-        ToolTip.SetTip(b, id switch
+        string tip = id switch
         {
-            "displays" => $"{badge.Count} warning{(badge.Count == 1 ? "" : "s")} on the screens",
-            "windows" => $"{badge.Count} client app{(badge.Count == 1 ? "" : "s")}",
-            "performance" => "Non-default performance settings are in force",
+            "displays" => $"{badge.Count} thing{(badge.Count == 1 ? "" : "s")} to check on your displays",
+            "windows" => $"{badge.Count} 3D app{(badge.Count == 1 ? "" : "s")} running",
+            "performance" => "Some settings are changed from their defaults",
             "components" => $"{badge.Count} update{(badge.Count == 1 ? "" : "s")} available",
-            _ => "A display-processor override is active",
-        });
+            _ => StatusText.HomeBadgeTip,
+        };
+        ToolTip.SetTip(b, tip);
+        // The badge is said in words to a screen reader too: "Home: one display driver is set ...".
+        if (_nav.TryGetValue(id, out var rb)) Avalonia.Automation.AutomationProperties.SetName(rb, $"{TitleOf(id)}: {tip}");
     }
+
+    private string TitleOf(string id) => _pages.FirstOrDefault(p => p.Id == id)?.Title ?? id;
 
     // ── Actions ─────────────────────────────────────────────────────────────
 
@@ -511,7 +519,7 @@ public sealed class MainWindow : Window
             }
         }
         await CopyAsync(text);
-        ShowToast(s is null ? "No snapshot yet" : "Snapshot JSON copied");
+        ShowToast(s is null ? "Nothing to copy yet" : "Report copied");
     }
 
     private async Task CopyAsync(string text)

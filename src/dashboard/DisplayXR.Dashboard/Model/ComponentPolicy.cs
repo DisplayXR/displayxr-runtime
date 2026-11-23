@@ -35,13 +35,13 @@ public static class ComponentClasses
         _ => "conv",
     };
 
-    /// <summary>The ADR-054 N3 vocabulary: one noun per class, never "plug-in" or "driver".</summary>
+    /// <summary>One plain noun per class, as the page says it (the owner's words: "display driver", "add-on").</summary>
     public static string Noun(this ComponentClass c) => c switch
     {
-        ComponentClass.Display => "display processor",
-        ComponentClass.Input => "input provider",
-        ComponentClass.Tracking => "viewer-tracking provider",
-        _ => "conversion provider",
+        ComponentClass.Display => "display driver",
+        ComponentClass.Input => "input add-on",
+        ComponentClass.Tracking => "camera head tracking add-on",
+        _ => "2D-to-3D converter",
     };
 
     /// <summary>The Components section id the class's rows live in.</summary>
@@ -59,11 +59,11 @@ public static class ComponentClasses
     /// </summary>
     public static string AppliesNote(this ComponentClass c) => c switch
     {
-        ComponentClass.Display => "Applies now on secondary screens; the primary screen and in-process apps at the next session.",
-        ComponentClass.Input => "Applies now when the service is running (providers are re-ranked live); otherwise at the next start.",
+        ComponentClass.Display => "Applies now on other displays; on the main 3D display and to apps that run on their own, the next time they start.",
+        ComponentClass.Input => "Applies now when DisplayXR runs in the background; otherwise the next time it starts.",
         // tracking-provider-discovery.md §3: the viewer source is static per OpenXR instance.
-        ComponentClass.Tracking => "Applies at the next app launch: an app's viewer source is fixed for its session.",
-        _ => "Applies to the next stream or job; a live stream never moves.",
+        ComponentClass.Tracking => "Applies the next time an app starts: an app keeps the tracking it started with.",
+        _ => "Applies to the next photo or video converted; one already playing keeps its converter.",
     };
 
     public static readonly ComponentClass[] All =
@@ -145,10 +145,10 @@ public sealed record PolicyRow(ComponentClass Class, string Id, string Name, boo
     {
         null or "" or "unknown" => null,
         "signed" => (Signer is { Length: > 0 } s ? $"signed by {s}" : "signed", Level.Ok),
-        "allowlisted" => ("allowlisted", Level.Ok),
-        "platform-trusted" => ("platform-trusted", Level.Ok),
-        "dev-override" => ("dev override", Level.Info),
-        "unverified" => ("unverified", Level.Warn),
+        "allowlisted" => ("Approved on this PC", Level.Ok),
+        "platform-trusted" => ("Trusted by the system", Level.Ok),
+        "dev-override" => ("Developer override", Level.Info),
+        "unverified" => ("Publisher not verified", Level.Warn),
         var other => (other, Level.Plain),
     };
 
@@ -235,10 +235,17 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
     public IReadOnlyList<string> PinChoices() =>
         Rows.Where(r => r.Enabled && !r.Untrusted).Select(r => r.Id).Append(EmulatedId).Distinct().ToArray();
 
-    /// <summary>The per-app table's "locked" line: Policy\Lock hides every per-app pin.</summary>
+    /// <summary>The per-app table's "managed" line: Policy\Lock hides every per-app pin (the technical cause in brackets).</summary>
     public string? PerAppLockText => PolicyLock && HasPerApp
-        ? "Locked by machine policy (HKLM Policy\\Lock): per-app pins are ignored on this machine."
+        ? "Your administrator manages this on this PC, so a choice per app is ignored. (HKLM Policy\\Lock)"
         : null;
+
+    /// <summary>The title of a class's "managed" notice.</summary>
+    public const string ManagedTitle = "Managed by your administrator";
+
+    /// <summary>The plain sentence of a class's "managed" notice; <see cref="LockText"/> is the technical one (in each row's Details).</summary>
+    public string? LockPlain => !PolicyLock ? null
+        : "Your administrator manages these settings on this PC, so a change made here for you is ignored.";
 
     /// <summary>
     /// What the lock hides from a per-user write: every class's per-user Enabled, for
@@ -387,6 +394,29 @@ public static class PolicyCommands
 
     /// <summary>The action area a class's writes report under (DashboardContext.RunActionsAsync).</summary>
     public static string Area(ComponentClass c) => "policy-" + c.Verb();
+
+    /// <summary>
+    /// What a change on a policy row means and how an administrator makes it machine-wide: the
+    /// lines a row's Details carries under its Enabled / Prefer controls (the controls stay on the
+    /// row). <c>Command</c> marks a command line (shown in a fixed-width font). The built-in row's
+    /// note, the scope with when it applies, and, for a non-elevated dashboard, every control's
+    /// <c>--machine</c> command.
+    /// </summary>
+    public static IReadOnlyList<(string Text, bool Command)> Notes(PolicyRow r, PolicyList list, bool machine, bool elevated)
+    {
+        var notes = new List<(string Text, bool Command)>();
+        if (r.BuiltIn)
+            notes.Add(("Built-in adapter: it has no Enabled value and is not a provider to prefer. A registered provider hides it with Supersedes = dp-lift.", false));
+        string scope = machine ? "For everyone on this PC." : elevated ? "For you only." : "For you only; for everyone on this PC needs administrator permission.";
+        notes.Add(($"{scope} {r.Class.AppliesNote()}", false));
+        if (list.LockText is { } lockText) notes.Add((lockText, false));
+        if (!elevated && MachineHints(r, list) is { Count: > 0 } hints)
+        {
+            notes.Add(("Machine-wide, from an administrator prompt:", false));
+            foreach (var h in hints) notes.Add(($"displayxr-cli {h}", true));
+        }
+        return notes;
+    }
 
     /// <summary>
     /// The machine-wide (<c>--machine</c>) equivalent of every control the row shows, in the

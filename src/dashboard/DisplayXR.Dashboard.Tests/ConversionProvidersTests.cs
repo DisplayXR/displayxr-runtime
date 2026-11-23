@@ -73,7 +73,7 @@ public class ConversionProvidersTests
         var sec = Components.Build(s, null).Single(c => c.Id == "conversion_providers");
         Assert.Equal(2, sec.Count);
         Assert.Equal(0, sec.Connected); // the selected task is WARMING, not READY
-        Assert.Contains("1 task served", sec.ConnectedLine);
+        Assert.Contains("in use for 1 task", sec.ConnectedLine);
 
         var lift = sec.Items[0];
         Assert.Equal("Display plug-in lift slots (legacy adapter)", lift.Name);

@@ -51,7 +51,7 @@ public class ComponentPolicyFixtureTests
         Assert.True(sim.EnabledKnown);
         Assert.Equal("default", sim.EnabledSource);
         Assert.False(sim.BuiltIn);
-        Assert.Equal(("unverified", Level.Warn), sim.ProvenanceChip);
+        Assert.Equal(("Publisher not verified", Level.Warn), sim.ProvenanceChip);
 
         var b = dp.Row("sim-display-b")!;
         Assert.False(b.Enabled);

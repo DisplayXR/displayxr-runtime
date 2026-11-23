@@ -14,13 +14,16 @@ using DisplayXR.Dashboard.Ui;
 namespace DisplayXR.Dashboard.Pages;
 
 /// <summary>
-/// Home: the runtime, its plug-ins, the GPU topology and the self-test (what
-/// the ImGui panel's Overview showed), plus the one-line multi-screen summary
-/// that links to Displays (design §8, the vendor dashboard's Home rule).
+/// Home: "Check my setup" (the self-test) first, then the runtime, its display drivers and the
+/// graphics cards (what the ImGui panel's Overview showed), plus the one-line multi-display
+/// summary that links to Displays (design §8, the vendor dashboard's Home rule). No ticket or
+/// design-record numbers and no environment-variable names on the page; the graphics card's
+/// technical lines sit behind its own "Technical details" toggle.
 /// </summary>
 public sealed class HomePage : Page
 {
     private bool _showAllChecks;
+    private bool _gpuTechnical;
 
     public HomePage() : base("home", "Home") { }
 
@@ -29,8 +32,8 @@ public sealed class HomePage : Page
         get
         {
             var s = Ctx.Feed.Snapshot;
-            string v = s?.Runtime.Version is { Length: > 0 } ver ? $"DisplayXR runtime {ver}" : "DisplayXR runtime";
-            return s is null ? v : $"{v}{StatusText.Sep}{StatusText.Plural(s.Screens.Count, "monitor", "monitors")}{StatusText.Sep}{StatusText.Plural(s.Plugins.Count, "plug-in", "plug-ins")}";
+            string v = s?.Runtime.Version is { Length: > 0 } ver ? $"DisplayXR {ver}" : "DisplayXR";
+            return s is null ? v : $"{v}{StatusText.Sep}{StatusText.Plural(s.Screens.Count, "display", "displays")}{StatusText.Sep}{StatusText.Plural(s.Plugins.Count, "display driver", "display drivers")}";
         }
     }
 
@@ -44,7 +47,7 @@ public sealed class HomePage : Page
     {
         var s = Ctx.Feed.Snapshot;
         var sb = new StringBuilder();
-        sb.Append(Ctx.Version).Append('|').Append(_showAllChecks).Append('|');
+        sb.Append(Ctx.Version).Append('|').Append(_showAllChecks).Append(_gpuTechnical).Append('|');
         if (s is not null)
         {
             sb.Append(s.Source).Append('|').Append(s.Runtime).Append('|').Append(s.Workspace).Append('|');
@@ -61,9 +64,13 @@ public sealed class HomePage : Page
         var s = Ctx.Feed.Snapshot;
         var page = U.VStack(18);
 
+        // The self-test answers "is it working?": it comes first.
+        page.Children.Add(SelftestCard());
+
+        // The amber badge on the Home rail entry means this notice (MainWindow.SetBadge "home").
         if (StatusText.MachineOverrideNotice(Ctx.Dp) is { } ov)
         {
-            var clear = U.Button("Clear machine-wide override", () => _ = Ctx.RunActionsAsync("dp", CliArgs.Words("dp reset")), "warn", "sm");
+            var clear = U.Button("Clear this setting", () => _ = Ctx.RunActionsAsync("dp", CliArgs.Words("dp reset")), "warn", "sm");
             clear.IsEnabled = !Ctx.ActionRunning;
             page.Children.Add(U.Notice(Level.Warn, ov.Title, ov.Text, clear));
         }
@@ -73,8 +80,8 @@ public sealed class HomePage : Page
             var badge = StatusText.DisplaysBadge(s);
             var level = badge?.Level ?? Level.Ok;
             page.Children.Add(U.Notice(level, line,
-                badge is null ? "More than one screen is claimed; each one's state is on Displays."
-                              : "At least one screen needs attention; the details are on Displays.",
+                badge is null ? "More than one 3D display is connected. Each one's details are on Displays."
+                              : "At least one display needs attention. The details are on Displays.",
                 U.Button("Open Displays", () => Ctx.Navigate("displays"), "outline", "sm")));
         }
 
@@ -84,7 +91,6 @@ public sealed class HomePage : Page
         grid.Add(RuntimeCard(s));
         grid.Add(PluginsCard(s));
         grid.Add(GpuCard());
-        grid.Add(SelftestCard());
         page.Children.Add(grid);
         return page;
     }
@@ -99,11 +105,11 @@ public sealed class HomePage : Page
         var kv = new U.KvList(220);
         foreach (var d in StatusText.HomeScreenDps(s, Ctx.Dp))
         {
-            var value = U.Flow(8, 4, U.Text(d.Plugin ?? "not claimed", "value"));
+            var value = U.Flow(8, 4, U.Text(d.Plugin ?? "not a 3D display", "value"));
             if (d.Forced is { } f) U.AddFlow(value, U.Chip(f, Level.Warn));
             kv.Add(d.Name, value);
         }
-        return U.Card(U.VStack(12, U.CardTitle("Display processor per screen", null, link), kv));
+        return U.Card(U.VStack(12, U.CardTitle("Display driver for each display", null, link), kv));
     }
 
     private Control RuntimeCard(StatusSnapshot? s)
@@ -114,7 +120,7 @@ public sealed class HomePage : Page
         string tag = s?.Runtime.GitTag is { Length: > 0 } t ? t : info?.GitTag ?? "";
         kv.Add("Version", tag.Length > 0 ? $"{version}  ({tag})" : version);
         int abi = s?.Runtime.PluginAbi ?? info?.PluginAbi ?? 0;
-        kv.Add("Plug-in ABI", abi > 0 ? $"v{abi}" : "—");
+        kv.Add("Add-on interface", abi > 0 ? $"version {abi}" : "—");
 
         // Active OpenXR runtime: info's resolved key when read, else the snapshot's.
         string? active = info is { ActiveRuntimeQueried: true } ? (info.ActiveRuntimeSet ? info.ActiveRuntimeValue : null)
@@ -129,11 +135,11 @@ public sealed class HomePage : Page
         kv.Add("Active OpenXR runtime", activeBlock);
 
         string service = s is null ? (Ctx.Feed.IsRunning ? "connecting…" : "—")
-            : s.IsService ? "connected"
-            : "not reached (headless snapshot)";
-        kv.Add("Service", service, brush: s?.IsService == true ? Tokens.For(Level.Ok) : null);
+            : s.IsService ? "running"
+            : "not running";
+        kv.Add("Background service", service, brush: s?.IsService == true ? Tokens.For(Level.Ok) : null);
         if (s is not null)
-            kv.Add("Workspace", s.Workspace.Enabled ? $"enabled{(s.Workspace.Controller is { } c ? StatusText.Sep + c : "")}" : "off");
+            kv.Add("Spatial desktop", s.Workspace.Enabled ? $"turned on{(s.Workspace.Controller is { } c ? StatusText.Sep + c : "")}" : "turned off");
         if (info?.Device is { Length: > 0 } dev) kv.Add("Device", dev);
 
         var body = U.VStack(16, U.CardTitle("Runtime"), kv);
@@ -144,11 +150,11 @@ public sealed class HomePage : Page
 
     private Control PluginsCard(StatusSnapshot? s)
     {
-        var body = U.VStack(14, U.CardTitle("Display-processor plug-ins",
-            "Each registered plug-in with its platform state; a hint is the vendor's own words."));
+        var body = U.VStack(14, U.CardTitle("Display drivers",
+            "Each installed display driver and whether it is ready. A note under one is the display maker's own words."));
         if (s is null || s.Plugins.Count == 0)
         {
-            body.Children.Add(U.Wrapped(s is null ? "Waiting for the first status snapshot…" : "No plug-in is registered.", "empty"));
+            body.Children.Add(U.Wrapped(s is null ? "Looking for display drivers…" : "No display driver is installed.", "empty"));
             return U.Card(body);
         }
         var list = U.VStack(0);
@@ -161,13 +167,15 @@ public sealed class HomePage : Page
             dot.Margin = new Thickness(0, 6, 12, 0);
             var name = U.Text(p.Name.Length > 0 ? p.Name : p.Id, "group");
             name.FontSize = 14;
+            // The technical words (load verdict, platform state, id, ProbeOrder) are the name's tooltip.
+            ToolTip.SetTip(name, $"{p.Load}{StatusText.Sep}{p.PlatformState}{StatusText.Sep}{p.Id}{StatusText.Sep}ProbeOrder {p.ProbeOrder}");
             var head = U.Flow(8, 4, name);
-            if (p.Version.Length > 0) U.AddFlow(head, U.Text(p.Version, "meta"));
-            var chips = U.Flow(6, 4,
-                U.Chip(p.Load, p.Load == "ACTIVE" ? Level.Ok : Level.Plain),
-                U.Chip(p.PlatformState, StatusText.PluginLevel(p) is Level.Ok or Level.Plain ? Level.Plain : StatusText.PluginLevel(p)));
-            if (p.Fallback) U.AddFlow(chips, U.Chip("fallback"), 6, 4);
-            U.AddFlow(chips, U.Text($"{p.Id}{StatusText.Sep}ProbeOrder {p.ProbeOrder}", "meta"), 6, 4);
+            if (p.Version.Length > 0) U.AddFlow(head, U.Text("version " + p.Version, "meta"));
+            var chips = U.Flow(6, 4);
+            if (PlainStates.Chip(PlainStates.DisplayProcessor(p.Load, null)) is { } st) U.AddFlow(chips, U.Chip(st.Text, st.Level), 6, 4);
+            if (StatusText.PlainPlatform(p.PlatformState) is { } plat)
+                U.AddFlow(chips, U.Chip(plat, StatusText.PluginLevel(p) is Level.Ok or Level.Plain ? Level.Plain : StatusText.PluginLevel(p)), 6, 4);
+            if (p.Fallback) U.AddFlow(chips, U.Chip("Used when no other driver fits"), 6, 4);
             var col = U.VStack(2, head, chips);
             if (p.Hint.Length > 0) col.Children.Add(U.Wrapped(p.Hint, "soft"));
             var g = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*") };
@@ -182,24 +190,24 @@ public sealed class HomePage : Page
 
     private Control GpuCard()
     {
-        var body = U.VStack(12, U.CardTitle("GPU topology",
-            "Does the woven frame cross adapters to reach the panel? (#918, ADR-037)"));
+        var body = U.VStack(12, U.CardTitle("Graphics cards",
+            "Which graphics card draws 3D apps, and which one your 3D display is plugged into."));
         var info = Ctx.Info;
         if (info is null)
         {
-            body.Children.Add(U.Wrapped(Ctx.InfoLoading ? "Reading the runtime's facts (displayxr-cli info, about 10 s)…"
+            body.Children.Add(U.Wrapped(Ctx.InfoLoading ? "Looking at your graphics cards (about 10 seconds)…"
                                                       : Ctx.InfoError ?? "Not read yet.", Ctx.InfoError is null ? "empty" : "soft"));
             return U.Card(body);
         }
         var g = info.Gpu;
         if (g is null || !g.Probed)
         {
-            body.Children.Add(U.Wrapped($"Not probed{(g?.Note is { Length: > 0 } n ? " — " + n : " — Windows only")}.", "empty"));
+            body.Children.Add(U.Wrapped($"Not checked{(g?.Note is { Length: > 0 } n ? ": " + n : " (Windows only)")}.", "empty"));
             return U.Card(body);
         }
         if (g.Adapters.Count <= 1)
         {
-            body.Children.Add(U.Notice(Level.Ok, "Single adapter: the weave never crosses GPUs.", g.Adapters.FirstOrDefault()?.Name ?? ""));
+            body.Children.Add(U.Notice(Level.Ok, "One graphics card: it does everything.", g.Adapters.FirstOrDefault()?.Name ?? ""));
         }
         else
         {
@@ -207,46 +215,60 @@ public sealed class HomePage : Page
             foreach (var a in g.Adapters)
             {
                 var head = U.Flow(8, 4, U.Text(a.Name, "value"));
-                if (g.Scanout.Resolved && a.Luid == g.Scanout.Luid) U.AddFlow(head, U.Chip("panel scanout", Level.Info));
-                if (g.Render.Resolved && a.Luid == g.Render.Luid) U.AddFlow(head, U.Chip("render (default)"));
-                if (g.Ingest.Resolved && a.Luid == g.Ingest.Luid) U.AddFlow(head, U.Chip("service ingest"));
-                list.Children.Add(U.VStack(1, head, U.Text($"LUID {a.Luid}{StatusText.Sep}{a.VramMb} MB dedicated", "meta")));
+                if (g.Scanout.Resolved && a.Luid == g.Scanout.Luid) U.AddFlow(head, U.Chip("Your 3D display is plugged in here", Level.Info));
+                if (g.Render.Resolved && a.Luid == g.Render.Luid) U.AddFlow(head, U.Chip("Draws 3D apps"));
+                if (g.Ingest.Resolved && a.Luid == g.Ingest.Luid) U.AddFlow(head, U.Chip("Used by the background service"));
+                list.Children.Add(U.VStack(1, head, U.Text($"{a.VramMb} MB of graphics memory", "meta")));
             }
             body.Children.Add(list);
-            body.Children.Add(U.WarningRow(new StatusWarning(g.SplitApplies ? "SPLIT" : "LOCAL",
-                g.SplitApplies ? WarningLevel.Warn : WarningLevel.Info, g.Verdict)));
+            body.Children.Add(U.Wrapped(g.SplitApplies
+                ? "The 3D picture passes from one graphics card to the other on its way to your display."
+                : "3D apps are drawn on the graphics card your display is plugged into.", "soft"));
         }
-        // The configured half: read from the CLI child's own environment, so it
-        // is drawn dimmed and says so (control-panel-performance-settings.md).
-        bool fromEnv = g.WeaveOnScanoutSource == "env";
-        body.Children.Add(U.Rule());
-        body.Children.Add(U.Wrapped(
-            $"DXR_WEAVE_ON_SCANOUT = {(g.WeaveOnScanoutSet ? g.WeaveOnScanout : "<unset>")} [{(g.WeaveOnScanoutSource.Length > 0 ? g.WeaveOnScanoutSource : "?")}]" +
-            $"{(fromEnv ? "  (this dashboard's environment only)" : "")}{StatusText.Sep}ingress {(g.Ingress.Length > 0 ? g.Ingress : "?")}", "dev"));
-        if (g.ServiceSplit.Length > 0) body.Children.Add(U.Wrapped(g.ServiceSplit, "desc"));
-        body.Children.Add(U.Wrapped("A running app's real placement is the 'weave placement:' line in its log (%LOCALAPPDATA%\\DisplayXR\\DisplayXR_<exe>.*.log), or its integrity row on Windows.", "desc"));
+        // The technical half (adapter ids, the runtime's verdict, the configured setting and where it
+        // came from, where an app's log says what it really did): behind its own toggle.
+        var toggle = U.Button(_gpuTechnical ? "Hide technical details" : "Technical details", () =>
+        {
+            _gpuTechnical = !_gpuTechnical;
+            Update();
+        }, "link");
+        body.Children.Add(toggle);
+        if (_gpuTechnical)
+        {
+            var tech = U.VStack(6);
+            foreach (var a in g.Adapters) tech.Children.Add(U.Wrapped($"{a.Name}{StatusText.Sep}LUID {a.Luid}{StatusText.Sep}{a.VramMb} MB dedicated", "dev"));
+            if (g.Adapters.Count > 1) tech.Children.Add(U.Wrapped($"{(g.SplitApplies ? "SPLIT" : "LOCAL")}: {g.Verdict}", "dev"));
+            // The configured half: read from the CLI child's own environment (control-panel-performance-settings.md).
+            bool fromEnv = g.WeaveOnScanoutSource == "env";
+            tech.Children.Add(U.Wrapped(
+                $"DXR_WEAVE_ON_SCANOUT = {(g.WeaveOnScanoutSet ? g.WeaveOnScanout : "<unset>")} [{(g.WeaveOnScanoutSource.Length > 0 ? g.WeaveOnScanoutSource : "?")}]" +
+                $"{(fromEnv ? "  (this dashboard's environment only)" : "")}{StatusText.Sep}ingress {(g.Ingress.Length > 0 ? g.Ingress : "?")}", "dev"));
+            if (g.ServiceSplit.Length > 0) tech.Children.Add(U.Wrapped(g.ServiceSplit, "desc"));
+            tech.Children.Add(U.Wrapped("A running app's real placement is the 'weave placement:' line in its log (%LOCALAPPDATA%\\DisplayXR\\DisplayXR_<exe>.*.log), or its integrity row on Running 3D apps.", "desc"));
+            body.Children.Add(tech);
+        }
         return U.Card(body);
     }
 
     private Control SelftestCard()
     {
         var st = Ctx.Selftest;
-        var run = U.Button(Ctx.SelftestRunning ? "Running…" : (st is null ? "Run self-test" : "Run again"),
+        var run = U.Button(Ctx.SelftestRunning ? "Checking…" : (st is null ? "Check my setup" : "Check again"),
             () => _ = Ctx.RunSelftestAsync(), "primary", "sm");
         run.IsEnabled = !Ctx.SelftestRunning;
-        var body = U.VStack(12, U.CardTitle("Self-test",
-            "Plug-in discovery, ABI, display dimensions, DPI awareness and the active-runtime key, headless.", run));
-        if (Ctx.SelftestError is { } err) body.Children.Add(U.Notice(Level.Critical, "The self-test did not finish", err));
+        var body = U.VStack(12, U.CardTitle("Check my setup",
+            "Checks that DisplayXR finds your display driver, reads your display correctly and is the 3D system apps use.", run));
+        if (Ctx.SelftestError is { } err) body.Children.Add(U.Notice(Level.Critical, "The check did not finish", err));
         if (st is null)
         {
             if (Ctx.SelftestError is null)
-                body.Children.Add(U.Wrapped(Ctx.SelftestRunning ? "Running displayxr-cli selftest (about 10 s)…" : "Not run in this session.", "empty"));
+                body.Children.Add(U.Wrapped(Ctx.SelftestRunning ? "Checking (about 10 seconds)…" : "Not checked yet.", "empty"));
             return U.Card(body);
         }
         int failed = st.Checks.Count(c => !c.Ok);
-        var verdict = U.Flow(10, 4,
-            U.Badge(st.Verdict, st.Passed ? Level.Ok : Level.Critical, tick: st.Passed),
-            U.Text($"{st.Checks.Count} checks{(failed > 0 ? $", {failed} failed" : "")}{StatusText.Sep}{st.When:HH:mm:ss}", "meta"));
+        var badge = U.Badge(StatusText.SelftestVerdict(st.Checks.Count, failed), st.Passed ? Level.Ok : Level.Critical, tick: st.Passed);
+        ToolTip.SetTip(badge, st.Verdict); // the CLI's own word
+        var verdict = U.Flow(10, 4, badge, U.Text($"Checked at {st.When:HH:mm}", "meta"));
         body.Children.Add(verdict);
         var shown = _showAllChecks ? st.Checks : st.Checks.Where(c => !c.Ok).ToList();
         if (shown.Count > 0)
