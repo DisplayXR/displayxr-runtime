@@ -130,6 +130,34 @@ u_rendering_modes_toggle_target(const struct xrt_rendering_mode *modes, uint32_t
 	return (active < count && u_rendering_mode_is_3d(&modes[active])) ? U_RENDERING_MODE_2D : U_RENDERING_MODE_3D;
 }
 
+/*!
+ * May a runtime key (V, '1') move the display to @p target for a session that
+ * can submit at most @p fill_views views? The key-path twin of the
+ * session-begin floor and of xrRequestDisplayRenderingModeDXR's
+ * VIEW_CONFIG_CANNOT_FILL denial (#1499): with {2D, a 4-view kind}, V would
+ * otherwise put a stereo or legacy session straight back into the mode the
+ * floor took it out of.
+ *
+ * @p fill_views == 0 means "no limit": the state tracker has not set one, or
+ * the session is exempt (an orchestrator, a pinned device, service mode, the
+ * floor switched off). An out-of-range target is never allowed; with no table
+ * at all there is no opinion (true).
+ */
+static inline bool
+u_rendering_modes_key_target_allowed(const struct xrt_rendering_mode *modes,
+                                     uint32_t count,
+                                     uint32_t target,
+                                     uint32_t fill_views)
+{
+	if (modes == NULL || count == 0) {
+		return true;
+	}
+	if (target >= count || target >= XRT_MAX_RENDERING_MODES) {
+		return false;
+	}
+	return fill_views == 0 || modes[target].view_count <= fill_views;
+}
+
 //! What @ref u_rendering_modes_trim did.
 enum u_rendering_modes_trim_result
 {
@@ -305,6 +333,11 @@ u_device_enforce_two_rendering_modes(struct xrt_device *xdev, const char *driver
  */
 enum u_rendering_modes_trim_result
 u_device_reenforce_two_rendering_modes(struct xrt_device *xdev, const char *driver_name);
+
+//! One throttled INFO line (never per press) when a mode key is refused by
+//! @ref u_rendering_modes_key_target_allowed.
+void
+u_rendering_modes_log_key_refused(const struct xrt_rendering_mode *mode, uint32_t fill_views);
 
 //! The driver index that is run-time mode 1 for a TRIMMED device; 0 when it was never trimmed.
 uint32_t

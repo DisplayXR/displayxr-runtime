@@ -12,6 +12,7 @@
 #include "util/u_logging.h"
 
 #include "os/os_threading.h"
+#include "os/os_time.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -421,4 +422,21 @@ u_device_rendering_modes_kept_driver_index(struct xrt_device *xdev)
 {
 	struct u_rm_record *r = record_find(xdev);
 	return (r != NULL && xdev != NULL) ? r->kept_driver_index : 0;
+}
+
+void
+u_rendering_modes_log_key_refused(const struct xrt_rendering_mode *mode, uint32_t fill_views)
+{
+	// One INFO line per refusal burst, never per press: a held or hammered V
+	// key must not flood the log (debug-logging.md).
+	static int64_t s_last_ns = 0;
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	if (s_last_ns != 0 && now_ns - s_last_ns < 2 * (int64_t)1000000000) {
+		return;
+	}
+	s_last_ns = now_ns;
+	U_LOG_I(
+	    "Mode key ignored (#1499, ADR-065): mode 1 '%s' has %u views and this session can fill %u - it stays "
+	    "in 2D (begin PRIMARY_MULTIVIEW_DXR to use this kind)",
+	    mode != NULL ? mode->mode_name : "?", mode != NULL ? mode->view_count : 0, fill_views);
 }

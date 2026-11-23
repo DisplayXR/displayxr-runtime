@@ -324,6 +324,19 @@ void
 comp_metal_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
 
 /*!
+ * #1499 / ADR-065: the most views this session can fill (its view
+ * configuration, after the session-begin floor), so the runtime's own V and
+ * '1' keys never move it into a mode it cannot fill - the key-path twin of the
+ * xrRequestDisplayRenderingModeDXR denial. 0 = no limit (orchestrators, a
+ * pinned device, service mode, DXR_MODE_FLOOR=0). Set by the state tracker at
+ * xrBeginSession; read on the frame path (same thread for in-process apps).
+ *
+ * @ingroup comp_metal
+ */
+void
+comp_metal_compositor_set_mode_fill_views(struct xrt_compositor *xc, uint32_t max_views);
+
+/*!
  * Set system devices for qwerty driver support.
  */
 void

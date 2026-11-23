@@ -1090,6 +1090,10 @@ struct comp_gl_compositor
 	struct xrt_system_compositor_info sys_info;
 	bool legacy_app_tile_scaling;      //!< True if app is legacy (gates 0/1 key mode selection)
 
+	//! #1499 / ADR-065: the most views this session can fill, for the V / 0 / 1 key
+	//! paths (comp_*_compositor_set_mode_fill_views); 0 = no limit.
+	uint32_t mode_fill_views;
+
 	// --- #439 Phase 3 — Local2D / zone-mask consumer (full net-new GL leg) ---
 	//! Active authored zone mask (XR_DXR_local_3d_zone). Set by zone_mask_submit
 	//! (sticky, last-submit-wins), cleared on that mask's destroy. NOT owned.
@@ -8021,6 +8025,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		bool toggled = qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d);
 		if (toggled) {
 			struct xrt_device *head = c->xsysd->static_roles.head;
+			bool key_ok = true;
 			if (head != NULL && head->hmd != NULL &&
 			    head->rendering_mode_count >= U_RENDERING_MODES_RUNTIME_COUNT) {
 				// ADR-065: V toggles mode 0 <-> mode 1, decided from the mode the
@@ -8030,11 +8035,21 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 				const uint32_t target =
 				    u_rendering_modes_toggle_target(head->rendering_modes, head->rendering_mode_count,
 				                                    head->hmd->active_rendering_mode_index);
-				force_2d = (target == U_RENDERING_MODE_2D);
-				head->hmd->active_rendering_mode_index = target;
-				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target);
+				// #1499 on the key path: never into a mode this session cannot fill.
+				key_ok = u_rendering_modes_key_target_allowed(
+				    head->rendering_modes, head->rendering_mode_count, target, c->mode_fill_views);
+				if (key_ok) {
+					force_2d = (target == U_RENDERING_MODE_2D);
+					head->hmd->active_rendering_mode_index = target;
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target);
+				} else {
+					u_rendering_modes_log_key_refused(&head->rendering_modes[target],
+					                                  c->mode_fill_views);
+				}
 			}
-			comp_gl_compositor_request_display_mode(&c->base.base, !force_2d);
+			if (key_ok) {
+				comp_gl_compositor_request_display_mode(&c->base.base, !force_2d);
+			}
 		}
 
 		// Rendering mode change from the qwerty 0/1 keys (ADR-065).
@@ -8043,7 +8058,16 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
 				struct xrt_device *head = c->xsysd->static_roles.head;
-				if (head != NULL) {
+				if (head != NULL && render_mode >= 0 &&
+				    !u_rendering_modes_key_target_allowed(head->rendering_modes,
+				                                          head->rendering_mode_count,
+				                                          (uint32_t)render_mode, c->mode_fill_views)) {
+					// #1499 on the key path: '1' never moves a session into a mode it cannot fill.
+					if ((uint32_t)render_mode < head->rendering_mode_count) {
+						u_rendering_modes_log_key_refused(&head->rendering_modes[render_mode],
+						                                  c->mode_fill_views);
+					}
+				} else if (head != NULL) {
 					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
 				}
 			}
@@ -11092,4 +11116,13 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	U_LOG_W("Native OpenGL compositor created: %ux%u", width, height);
 
 	return XRT_SUCCESS;
+}
+
+void
+comp_gl_compositor_set_mode_fill_views(struct xrt_compositor *xc, uint32_t max_views)
+{
+	if (xc == NULL) {
+		return;
+	}
+	gl_comp(xc)->mode_fill_views = max_views;
 }

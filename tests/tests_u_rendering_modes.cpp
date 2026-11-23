@@ -751,3 +751,22 @@ TEST_CASE("F3: trim, the plug-in rewrites its full table, re-trim keeps the same
 		CHECK(d.output == 1);
 	}
 }
+
+TEST_CASE("F4: the V / 1 key target is refused when the session cannot fill mode 1", "[u_rendering_modes]")
+{
+	const std::vector<xrt_rendering_mode> quad = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D"),
+	                                              mk(4, 0.5f, 0.5f, true, 2, 2, "Quad")};
+	const std::vector<xrt_rendering_mode> stereo = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D"),
+	                                                mk(2, 0.5f, 0.5f, true, 2, 1, "Anaglyph")};
+	// 0 = no limit (orchestrator, pinned, service, floor off, nothing begun yet).
+	CHECK(u_rendering_modes_key_target_allowed(quad.data(), 2, 1, 0));
+	// A stereo / legacy session (2) cannot fill the 4-view kind...
+	CHECK_FALSE(u_rendering_modes_key_target_allowed(quad.data(), 2, 1, 2));
+	// ...a multiview session (4) can, and every session can fill 2D and stereo.
+	CHECK(u_rendering_modes_key_target_allowed(quad.data(), 2, 1, 4));
+	CHECK(u_rendering_modes_key_target_allowed(quad.data(), 2, 0, 2));
+	CHECK(u_rendering_modes_key_target_allowed(stereo.data(), 2, 1, 2));
+	// Degenerate: an out-of-range target is not allowed; no table, no opinion.
+	CHECK_FALSE(u_rendering_modes_key_target_allowed(quad.data(), 2, 2, 2));
+	CHECK(u_rendering_modes_key_target_allowed(nullptr, 0, 1, 2));
+}
