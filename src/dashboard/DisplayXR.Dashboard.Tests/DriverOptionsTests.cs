@@ -430,6 +430,73 @@ public class DriverOptionsTests
         }
     }
 
+    private static DriverOptions OptionsJson(string id, string settings)
+    {
+        Assert.True(DriverOptions.TryParse($$"""{ "id": "{{id}}", "env_prefix": "DXR_DP_X_", "settings": [ {{settings}} ] }""", out var o));
+        return o!;
+    }
+
+    private static string Row(string key, string type, string value, string? valuesJson) =>
+        $$"""{ "key": "{{key}}", "declared": true, "type": "{{type}}", "default": "", "help": "h", "secret": false, "value": {{(value.Length > 0 ? $"\"{value}\"" : "null")}}, "source": "{{(value.Length > 0 ? "user" : "absent")}}"{{(valuesJson is null ? "" : $", \"values\": {valuesJson}")}} }""";
+
+    [Fact]
+    public void EnumValues_AreRead_OnlyForAnEnum()
+    {
+        var o = OptionsJson("x", string.Join(",",
+            Row("SCOPE", "enum", "", "[\"canvas\", \"region\", \"Canvas\", \"\", 3]"),
+            Row("NOLIST", "enum", "", "null"),
+            Row("OLD", "enum", "", null),
+            Row("COUNT", "int", "", "[\"1\", \"2\"]")));
+        Assert.Equal(new[] { "canvas", "region" }, o.Find("SCOPE")!.Values); // strings only, once each, no empty word
+        Assert.Null(o.Find("NOLIST")!.Values);
+        Assert.Null(o.Find("OLD")!.Values);   // an older CLI: no key
+        Assert.Null(o.Find("COUNT")!.Values); // not an enum: ignored
+    }
+
+    [Fact]
+    public void AnEnumWithValues_AndNoFriendlyEntry_IsADropDownOfTheRawWords()
+    {
+        var o = OptionsJson("x", string.Join(",", Row("SCOPE", "enum", "Region", "[\"canvas\", \"region\", \"scanout\"]"),
+                                                   Row("PLAIN", "enum", "a", "null")));
+        var b = OptionViews.Build("x", o);
+        var scope = b.More.Single(v => v.Key == "SCOPE");
+        Assert.Equal(OptionControl.Choice, scope.Control);
+        Assert.False(scope.Friendly);
+        Assert.Equal("SCOPE", scope.Label);
+        Assert.Equal(new[] { "canvas", "region", "scanout" }, scope.Choices.Select(c => c.Label));
+        Assert.Equal(new[] { "canvas", "region", "scanout" }, scope.Choices.Select(c => c.Value));
+        Assert.Equal("region", scope.Selected); // stored values match without regard to case
+        Assert.Equal(OptionControl.Text, b.More.Single(v => v.Key == "PLAIN").Control); // no values: a text box, as before
+
+        var odd = OptionViews.Build("x", OptionsJson("x", Row("SCOPE", "enum", "other", "[\"canvas\", \"region\"]"))).More.Single();
+        Assert.Null(odd.Selected);
+        Assert.Equal("“other”", odd.ValueText); // a stored word the CLI does not list: shown as stored, nothing selected
+    }
+
+    [Fact]
+    public void AFriendlyDropDown_FollowsTheCliValues()
+    {
+        var output = FriendlyOptions.Find(FriendlyOptions.SimDisplay, "OUTPUT")!;
+        // No values (every current CLI for OUTPUT, whose help is prose): the entry's own list, unchanged.
+        Assert.Same(output.Choices, OptionViews.ChoicesFor(output, null));
+        // A value the CLI does not list is dropped; one it lists that the entry does not know is appended raw;
+        // an alias keeps its value; a no-kind value is never appended.
+        var c = OptionViews.ChoicesFor(output, new[] { "sbs", "anaglyph", "squeezed_sbs", "tab", "2d" });
+        Assert.Equal(new[] { "anaglyph", "sbs", "squeezed", "tab" }, c.Select(x => x.Value));
+        Assert.Equal(new[] { "Red / cyan (anaglyph)", "Side by side", "Side by side, squeezed", "tab" }, c.Select(x => x.Label));
+
+        var o = OptionsJson(FriendlyOptions.SimDisplay, Row("OUTPUT", "enum", "tab", "[\"anaglyph\", \"sbs\", \"tab\"]"));
+        var v = OptionViews.Build(FriendlyOptions.SimDisplay, o).Friendly.Single(x => x.Key == "OUTPUT");
+        Assert.True(v.Friendly);
+        Assert.Equal("3D preview kind", v.Label);
+        Assert.Equal(new[] { "anaglyph", "sbs", "tab" }, v.Choices.Select(x => x.Value));
+        Assert.Equal("tab", v.Selected);
+        Assert.Equal("tab", v.ValueText);
+
+        var mv = FriendlyOptions.Find("leia-sr", "MULTI_VIEWER")!;
+        Assert.Equal(new[] { "on", "off", "auto" }, OptionViews.ChoicesFor(mv, new[] { "on", "off", "auto" }).Select(x => x.Value));
+    }
+
     /// <summary>The fixture source, with every <c>dp options</c> read timing out while <c>fail</c> says so.</summary>
     private sealed class FailingReads(IProcessSource inner, Func<bool> fail) : IProcessSource
     {

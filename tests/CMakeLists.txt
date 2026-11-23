@@ -1514,8 +1514,8 @@ target_include_directories(
 target_link_libraries(tests_cli_dp_predict PRIVATE xrt-interfaces)
 
 # The shared `<class> set` / `options` verbs' pure pieces (cli_option_parse.h,
-# header-only): the `set ... --stdin` argument rule and the one-line value
-# reader behind it.
+# header-only): the `set ... --stdin` argument rule, the one-line value reader
+# behind it, and the INTERIM enum-values rule of `options --json`.
 target_include_directories(tests_cli_option_parse PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
 
 # Android late-weave / repaint pacing (#868/#902). The vblank grid is

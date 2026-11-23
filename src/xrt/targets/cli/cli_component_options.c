@@ -262,6 +262,20 @@ cli_component_options(const struct cli_component_class *k, const char *id, bool 
 				cJSON_AddNullToObject(o, "default");
 				cJSON_AddNullToObject(o, "help");
 			}
+			// INTERIM (until a richer descriptor declares them): an enum's accepted
+			// words, read from the leading `a|b|c` run of its help; null otherwise.
+			char words[CLI_ENUM_VALUES_MAX][CLI_ENUM_VALUE_LEN];
+			const int nw = r->declared && strcmp(r->desc.type, "enum") == 0
+			                   ? cli_enum_values_from_help(r->desc.help, words, CLI_ENUM_VALUES_MAX)
+			                   : 0;
+			if (nw > 0) {
+				cJSON *vals = cJSON_AddArrayToObject(o, "values");
+				for (int w = 0; w < nw; w++) {
+					cJSON_AddItemToArray(vals, cJSON_CreateString(words[w]));
+				}
+			} else {
+				cJSON_AddNullToObject(o, "values");
+			}
 			// A secret's value is never emitted: `value` is null, `set` says
 			// whether one is stored. `secret` is on every row.
 			cJSON_AddBoolToObject(o, "secret", r->secret);

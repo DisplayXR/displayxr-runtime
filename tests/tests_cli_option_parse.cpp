@@ -175,3 +175,81 @@ TEST_CASE("set --stdin: a secret-sized value fits the secret store", "[cli][set]
 		CHECK(buf[0] == '\0');
 	}
 }
+
+namespace {
+
+//! The words cli_enum_values_from_help() reads from @p help (empty = not parsed).
+std::vector<std::string>
+words_of(const char *help)
+{
+	char out[CLI_ENUM_VALUES_MAX][CLI_ENUM_VALUE_LEN];
+	const int n = cli_enum_values_from_help(help, out, CLI_ENUM_VALUES_MAX);
+	return std::vector<std::string>(out, out + n);
+}
+
+using W = std::vector<std::string>;
+
+} // namespace
+
+TEST_CASE("options --json values: in-tree enum help strings that list their words first", "[cli][options][enum]")
+{
+	// remote_conversion FORMAT
+	CHECK(words_of("sog | ply: the blob asked for when the job names none") == W{"sog", "ply"});
+	// sim_input HANDS
+	CHECK(words_of("which simulated hands track: both | left | right | none (a hand left out stays a device but "
+	               "is never active)")
+	          .empty()); // prose first: not a leading run
+	CHECK(words_of("both | left | right | none (a hand left out stays a device but is never active)") ==
+	      W{"both", "left", "right", "none"});
+	// ultraleap MAPPING: the sentence's full stop is not part of the word
+	CHECK(words_of("relative | physical. relative: hands placed in display heights (ANCHOR_*_H, GAIN_H_PER_M), "
+	               "no measuring; physical: 1:1 metres from a measured mount (MOUNT_*_M)") ==
+	      W{"relative", "physical"});
+	// The documented compact form.
+	CHECK(words_of("a|b|c -- explanation") == W{"a", "b", "c"});
+	CHECK(words_of("anaglyph|sbs|squeezed|quad") == W{"anaglyph", "sbs", "squeezed", "quad"});
+	CHECK(words_of("  0|1|2") == W{"0", "1", "2"});
+	CHECK(words_of("on|off, the rest") == W{"on", "off"});
+	CHECK(words_of("v1.2|v2.0-beta|x_y") == W{"v1.2", "v2.0-beta", "x_y"});
+}
+
+TEST_CASE("options --json values: help strings that must NOT parse", "[cli][options][enum]")
+{
+	// sim_display OUTPUT: prose, then a comma list.
+	CHECK(
+	    words_of("the 3D kind mode 1 draws: anaglyph, sbs, squeezed|squeezed_sbs, quad (4 views: an inspection "
+	             "kind, stereo apps fall back to 2D), interlaced, blend; 2d|passthrough = anaglyph and start in 2D")
+	        .empty());
+	// sim_display WEAVE_SCOPE / WISH_QUANTIZE / STEREO_CAMERA_FORMAT / WEBCAM_ESTIMATOR
+	CHECK(words_of("weave scope the DP declares: canvas, region, scanout").empty());
+	CHECK(words_of("quantise the wish mask: off, band, cell").empty());
+	CHECK(words_of("fake camera: gray8, nv12, bgra8").empty());
+	CHECK(words_of("auto (the built-in face estimator), none, or the built-in name (yunet-onnx)").empty());
+	// sim_common LICENSE_SIM: the words come after prose.
+	CHECK(words_of("scripted licence state: licensed|trial|expired|unlicensed (unset = no licence to report)")
+	          .empty());
+	// sim_input PINCH, sim_tracking SOURCE / SCRIPT: a parenthesis between the words.
+	CHECK(
+	    words_of("wave (open-fist curl wave, 3 s) | hold (thumb + index tips held pinched) | open (never pinches)")
+	        .empty());
+	CHECK(words_of("script (a scripted viewer; see SCRIPT, CAMERA) | webcam (the webcam eye tracker)").empty());
+	CHECK(
+	    words_of("sweep (the head sweeps left-right, AMPLITUDE_M over PERIOD_MS) | offset (holds still)").empty());
+	// sim_conversion LICENCE
+	CHECK(words_of("research = RESEARCH_ONLY, commercial_ok 0 (AllowResearchOnly gate)").empty());
+	// Display driver MULTI_VIEWER as a comma list.
+	CHECK(words_of("multi-viewer weave: system, on, off").empty());
+	// Malformed runs.
+	CHECK(words_of("").empty());
+	CHECK(words_of(nullptr).empty());
+	CHECK(words_of("single").empty());
+	CHECK(words_of("a||b").empty());
+	CHECK(words_of("|a|b").empty());
+	CHECK(words_of("a|b|").empty());
+	CHECK(words_of("a|b!").empty());
+	CHECK(words_of("a|b/c").empty());
+	CHECK(words_of("a|...").empty());
+	CHECK(words_of("a|0123456789012345678901234567890123").empty()); // a word too long
+	CHECK(words_of("a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q").empty());    // 17 words: too many
+	CHECK(words_of("a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p").size() == 16);
+}
