@@ -6,7 +6,7 @@
  *
  * Implements SBS, anaglyph, alpha-blend, squeezed SBS, and quad atlas output
  * modes using HLSL shaders compiled at runtime via D3DCompile. All 5 shaders
- * are pre-compiled at init for instant runtime switching via 1/2/3/4/5 keys.
+ * are pre-compiled at init so any 3D kind (and 2D) draws without a rebuild.
  *
  * @author David Fattal
  * @ingroup drv_sim_display
@@ -342,12 +342,9 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		return;
 	}
 
-	// Read the current mode (may change at runtime via 1/2/3 keys).
+	// Read the current mode (2D <-> the device's 3D kind at run time, ADR-065).
 	// Single-view input forces passthrough — 3D shaders need ≥2 views.
-	enum sim_display_output_mode mode = sim_display_get_output_mode();
-	if (tile_columns * tile_rows <= 1) {
-		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
-	}
+	enum sim_display_output_mode mode = sim_display_output_for_tiles(tile_columns * tile_rows);
 	// #817: no phase-sensitive interlace on this backend yet — see the helper.
 	if (sim_interlaced_fallback_to_anaglyph(mode, "D3D11")) {
 		mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;

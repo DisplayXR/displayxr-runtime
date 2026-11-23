@@ -6,7 +6,7 @@
  *
  * Implements SBS, anaglyph, alpha-blend, squeezed SBS, and quad atlas output
  * modes using GLSL shaders compiled at init. All 5 programs are pre-compiled
- * for instant runtime switching via 1/2/3/4/5 keys.
+ * so any 3D kind (and 2D) draws without a rebuild.
  *
  * @author David Fattal
  * @ingroup drv_sim_display
@@ -339,12 +339,9 @@ sim_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 	struct sim_display_processor_gl *sdp = sim_dp_gl(xdp);
 	(void)format;
 
-	// Read the current mode (may change at runtime via 1/2/3 keys).
+	// Read the current mode (2D <-> the device's 3D kind at run time, ADR-065).
 	// Single-view input forces passthrough — 3D shaders need ≥2 views.
-	enum sim_display_output_mode mode = sim_display_get_output_mode();
-	if (tile_columns * tile_rows <= 1) {
-		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
-	}
+	enum sim_display_output_mode mode = sim_display_output_for_tiles(tile_columns * tile_rows);
 	GLuint active_program = sdp->programs[mode];
 	if (sim_zone_substitute_position_preserving(mode, sdp->zone_active, "GL")) {
 		active_program = sdp->programs[SIM_DISPLAY_OUTPUT_ANAGLYPH];

@@ -343,12 +343,9 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 	}
 	struct vk_bundle *vk = sdp->vk;
 
-	// Read the current mode (may change at runtime via 1/2/3 keys).
+	// Read the current mode (2D <-> the device's 3D kind at run time, ADR-065).
 	// Single-view input forces passthrough — 3D shaders need ≥2 views.
-	enum sim_display_output_mode mode = sim_display_get_output_mode();
-	if (tile_columns * tile_rows <= 1) {
-		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
-	}
+	enum sim_display_output_mode mode = sim_display_output_for_tiles(tile_columns * tile_rows);
 	VkPipeline active_pipeline = sdp->pipelines[mode];
 	if (sim_zone_substitute_position_preserving(mode, sdp->zone_active, "VK")) {
 		active_pipeline = sdp->pipelines[SIM_DISPLAY_OUTPUT_ANAGLYPH];
@@ -883,7 +880,7 @@ sim_dp_set_present_origin(struct xrt_display_processor_vk *xdp, int32_t panel_x,
  * default) and, for multi-screen M2's per-segment 1:1 gate, whether the
  * output survives a display-server resample. Every sim output does except
  * INTERLACED, whose 1-pixel period is exactly what a resample destroys.
- * Read from the CURRENT output mode on every call (the 1/2/3 keys can change
+ * Read from the CURRENT output mode on every call (V / 0 / 1 can change
  * it), so the runtime re-queries when it re-evaluates a segment. Logs on
  * change only.
  */
@@ -1387,7 +1384,7 @@ sim_display_processor_create_impl(enum sim_display_output_mode mode,
 
 	// Set the initial output mode (atomic global read by process_atlas each
 	// frame). The output mode is SESSION state — one atlas, one rendering
-	// mode, switched by the 1/2/3 keys — so a segment DP follows it rather
+	// mode, switched by V / 0 / 1 — so a segment DP follows it rather
 	// than carrying its own (multi-screen M2).
 	sim_display_set_output_mode(mode);
 

@@ -13,6 +13,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_modes.h"
 #include "sim_display_eyes.h"
 #include "sim_display_settings.h"
 #include "sim_display_monitor_geometry.h"
@@ -53,13 +54,21 @@
  *
  */
 
-//! Default when SIM_DISPLAY_OUTPUT is unset: ANAGLYPH. It is the only 3D mode
-//! that is position-preserving (per-pixel colour combine, no canvas
-//! rearrangement), so it composites correctly with display-zones and reads as
-//! real depth on a flat panel. The rearranging modes (SBS / Squeezed / Quad)
-//! are deliberately opt-in — they are view-inspection tools, not a sane default.
-static xrt_atomic_s32_t g_sim_display_output_mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
+//! The output the DP draws right now: PASSTHROUGH while mode 0 (2D) is active,
+//! the device's 3D kind while mode 1 is (ADR-065). Written by the device at
+//! creation and on every OUTPUT_MODE request; read by the DPs each frame.
+//!
+//! The default 3D KIND (OUTPUT unset) is ANAGLYPH. It is the only kind that is
+//! position-preserving (per-pixel colour combine, no canvas rearrangement), so
+//! it composites correctly with display-zones and reads as real depth on a flat
+//! panel. The rearranging kinds (SBS / Squeezed / Quad) are deliberately
+//! opt-in — they are view-inspection tools, not a sane default. The DEVICE
+//! starts in 2D whatever the kind (START_3D=1 starts it in the kind).
+static xrt_atomic_s32_t g_sim_display_output_mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
 static xrt_atomic_s32_t g_sim_display_view_count = 1;
+//! The device's 3D kind (ADR-065), published at creation for the DPs'
+//! sim_display_output_for_tiles(). Anaglyph until a device exists.
+static xrt_atomic_s32_t g_sim_display_kind = SIM_DISPLAY_OUTPUT_ANAGLYPH;
 
 //! Panel metrics published for the DP variants (#856). Written once in
 //! sim_display_hmd_create() before any display processor exists, then read-only
@@ -134,6 +143,19 @@ sim_display_set_output_mode(enum sim_display_output_mode mode)
 		        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" :
 		        mode == SIM_DISPLAY_OUTPUT_INTERLACED     ? "Interlaced" : "Blend");
 	}
+}
+
+enum sim_display_output_mode
+sim_display_output_for_tiles(uint32_t tile_count)
+{
+	if (tile_count <= 1) {
+		return SIM_DISPLAY_OUTPUT_PASSTHROUGH; // 3D shaders need >= 2 views
+	}
+	const enum sim_display_output_mode mode = sim_display_get_output_mode();
+	if (mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH) {
+		return (enum sim_display_output_mode)xrt_atomic_s32_load(&g_sim_display_kind);
+	}
+	return mode;
 }
 
 uint32_t
@@ -255,14 +277,22 @@ sim_display_set_view_count(uint32_t count)
 #define debug_get_float_option_sim_display_nominal_z_m() sim_display_setting_float("NOMINAL_Z_M", 0.60f)
 #define debug_get_num_option_sim_display_pixel_w() sim_display_setting_num("PIXEL_W", 1920)
 #define debug_get_num_option_sim_display_pixel_h() sim_display_setting_num("PIXEL_H", 1080)
-//! Dev/test knob: pin the active rendering mode to an explicit unified index —
-//! 0=2D, 1=Anaglyph, 2=Cropped SBS, 3=Squeezed SBS, 4=Quad — overriding the
-//! OUTPUT-derived default AND every later mode request (see the guard in
-//! sim_display_hmd_set_property). -1 (unset) = normal behaviour. This is
-//! plug-in-wide: it holds ANY sim_display app in the chosen view layout, so
-//! e.g. a zones app can be forced to 4-view Quad for atlas inspection despite
-//! the session-begin/zone reconciliation that would otherwise select 2 views.
+//! Dev/test knob: pin the active rendering mode — 0 = 2D, 1 = the 3D kind that
+//! OUTPUT names — overriding the start-up mode AND every later mode request
+//! (see the guard in sim_display_hmd_set_property). -1 (unset) = normal
+//! behaviour; any other value is ignored with a WARN. This is plug-in-wide: it
+//! holds ANY sim_display app in the chosen view layout, so e.g. a zones app can
+//! be forced to the 4-view Quad kind (OUTPUT=quad FORCE_MODE=1) for atlas
+//! inspection despite the session-begin floor that would otherwise select 2D.
 #define debug_get_num_option_sim_display_force_mode() sim_display_setting_num("FORCE_MODE", -1)
+
+//! FORCE_MODE as the device applies it: a pin only for 0 or 1 (ADR-065).
+static bool
+sim_display_force_mode_pins(void)
+{
+	const long f = debug_get_num_option_sim_display_force_mode();
+	return f == 0 || f == 1;
+}
 
 
 /*
@@ -309,6 +339,11 @@ struct sim_display_hmd
 	//! and screen dimensions for Kooima projection. Ready for future
 	//! scroll-wheel zoom support.
 	float zoom_scale;
+
+	//! The 3D kind mode 1 draws (ADR-065): chosen by OUTPUT at creation and
+	//! fixed for the device's life. Private driver state — the runtime only
+	//! ever sees mode 0 and mode 1.
+	enum sim_display_output_mode kind;
 
 	enum u_logging_level log_level;
 };
@@ -424,7 +459,8 @@ sim_display_get_view_poses(struct xrt_device *xdev,
 		zs = 1.0f;
 	}
 
-	// Screen dims depend on current output mode (atomic, can change mid-frame via 1/2/3 keys).
+	// Screen dims depend on current output mode (atomic, can change mid-frame: V / 0 / 1 switch 2D <-> the 3D
+	// kind).
 	bool sbs_mode = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_SBS);
 	float screen_w = (sbs_mode ? hmd->display_width_m / 2.0f : hmd->display_width_m) / zs;
 	float screen_h = hmd->display_height_m / zs;
@@ -502,7 +538,7 @@ sim_display_hmd_set_property(struct xrt_device *xdev,
 		// (oxr_session.c), the compositor, app xrRequestDisplayModeDXR calls,
 		// and zone reconciliation. Report success so callers don't treat it as
 		// an error; one-shot WARN so the override is visible in the log.
-		if (debug_get_num_option_sim_display_force_mode() >= 0) {
+		if (sim_display_force_mode_pins()) {
 			static bool warned_force = false;
 			if (!warned_force) {
 				warned_force = true;
@@ -513,41 +549,14 @@ sim_display_hmd_set_property(struct xrt_device *xdev,
 			return XRT_SUCCESS;
 		}
 
-		if ((uint32_t)value >= xdev->rendering_mode_count) {
+		// Two run-time modes (ADR-065): 0 = 2D, 1 = this device's 3D kind.
+		if (value < 0 || (uint32_t)value >= xdev->rendering_mode_count) {
 			return XRT_ERROR_NOT_IMPLEMENTED;
 		}
 
-		// Always update active rendering mode index and view count
 		xdev->hmd->active_rendering_mode_index = (uint32_t)value;
 		sim_display_set_view_count(xdev->rendering_modes[value].view_count);
-
-		if (value == 0) {
-			// 2D — switch weaver to passthrough mode
-			sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_PASSTHROUGH);
-			return XRT_SUCCESS;
-		}
-
-		enum sim_display_output_mode internal_mode;
-		switch (value) {
-		case 1:
-			internal_mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
-			break;
-		case 2:
-			internal_mode = SIM_DISPLAY_OUTPUT_SBS;
-			break;
-		case 3:
-			internal_mode = SIM_DISPLAY_OUTPUT_SQUEEZED_SBS;
-			break;
-		case 4:
-			internal_mode = SIM_DISPLAY_OUTPUT_QUAD;
-			break;
-		case 5:
-			internal_mode = SIM_DISPLAY_OUTPUT_INTERLACED;
-			break;
-		default:
-			return XRT_ERROR_NOT_IMPLEMENTED;
-		}
-		sim_display_set_output_mode(internal_mode);
+		sim_display_set_output_mode(value == 0 ? SIM_DISPLAY_OUTPUT_PASSTHROUGH : sim_display_hmd(xdev)->kind);
 		return XRT_SUCCESS;
 	}
 	if (property == XRT_DEVICE_PROPERTY_EXT_APP_MODE) {
@@ -563,18 +572,9 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
                               int32_t *out_value)
 {
 	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
-		// Return unified mode index: internal SBS(0)→2, Anaglyph(1)→1, Blend(2)→3
-		enum sim_display_output_mode internal = sim_display_get_output_mode();
-		switch (internal) {
-		case SIM_DISPLAY_OUTPUT_PASSTHROUGH:   *out_value = 0; break;
-		case SIM_DISPLAY_OUTPUT_SBS:          *out_value = 2; break;
-		case SIM_DISPLAY_OUTPUT_ANAGLYPH:     *out_value = 1; break;
-		case SIM_DISPLAY_OUTPUT_BLEND:        *out_value = 3; break;
-		case SIM_DISPLAY_OUTPUT_SQUEEZED_SBS: *out_value = 3; break;
-		case SIM_DISPLAY_OUTPUT_QUAD:         *out_value = 4; break;
-		case SIM_DISPLAY_OUTPUT_INTERLACED:   *out_value = 5; break;
-		default:                              *out_value = 0; break;
-		}
+		// Two run-time modes (ADR-065): 2D while passthrough is drawn, else
+		// the device's one 3D kind.
+		*out_value = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_PASSTHROUGH) ? 0 : 1;
 		return XRT_SUCCESS;
 	}
 	if (property == XRT_DEVICE_PROPERTY_SBS_MODE) {
@@ -584,7 +584,7 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
 	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED) {
 		// SIM_DISPLAY_FORCE_MODE pins the active mode; the state tracker reads
 		// this to honor the held mode over an app OUTPUT_MODE request.
-		*out_value = (debug_get_num_option_sim_display_force_mode() >= 0) ? 1 : 0;
+		*out_value = sim_display_force_mode_pins() ? 1 : 0;
 		return XRT_SUCCESS;
 	}
 	return XRT_ERROR_NOT_IMPLEMENTED;
@@ -600,33 +600,34 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
 struct xrt_device *
 sim_display_hmd_create(void)
 {
-	// Parse the OUTPUT setting early so it's available when
-	// target_instance.c queries sim_display_get_output_mode() for scale values.
+	// ADR-065: the 3D kind (OUTPUT) and the start-up mode (START_3D, FORCE_MODE),
+	// read once, here. The kind is fixed for the device's life; the output the
+	// DP draws starts as the start-up mode's (PASSTHROUGH for 2D).
+	enum sim_display_output_mode kind = SIM_DISPLAY_OUTPUT_ANAGLYPH;
+	struct sim_display_start start;
 	{
 		char mode_buf[32];
 		const char *mode_str = sim_display_setting("OUTPUT", mode_buf, sizeof(mode_buf)) ? mode_buf : NULL;
-		if (mode_str) {
-			if (strcmp(mode_str, "sbs") == 0)
-				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_SBS);
-			else if (strcmp(mode_str, "anaglyph") == 0)
-				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_ANAGLYPH);
-			else if (strcmp(mode_str, "blend") == 0)
-				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_BLEND);
-			else if (strcmp(mode_str, "quad") == 0)
-				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_QUAD);
-			else if (strcmp(mode_str, "squeezed") == 0 || strcmp(mode_str, "squeezed_sbs") == 0)
-				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_SQUEEZED_SBS);
-			else if (strcmp(mode_str, "2d") == 0 || strcmp(mode_str, "passthrough") == 0)
-				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_PASSTHROUGH);
-			else if (strcmp(mode_str, "interlaced") == 0 || strcmp(mode_str, "interlace") == 0)
-				// #817: the one phase-sensitive mode — see the enum doc.
-				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_INTERLACED);
-			else
-				U_LOG_W("sim_display: unknown SIM_DISPLAY_OUTPUT '%s' (want "
-				        "2d|anaglyph|sbs|squeezed|quad|blend|interlaced) — keeping the anaglyph "
-				        "default",
-				        mode_str);
+		bool output_2d = false;
+		if (!sim_display_kind_parse(mode_str, &kind, &output_2d)) {
+			U_LOG_W(
+			    "sim_display: unknown SIM_DISPLAY_OUTPUT '%s' (want "
+			    "2d|anaglyph|sbs|squeezed|quad|blend|interlaced) — keeping the anaglyph "
+			    "default",
+			    mode_str);
 		}
+		const long force = debug_get_num_option_sim_display_force_mode();
+		start = sim_display_resolve_start(output_2d, sim_display_setting_on("START_3D"), force);
+		if (start.force_ignored) {
+			U_LOG_W(
+			    "sim_display: SIM_DISPLAY_FORCE_MODE=%ld ignored — it takes 0 (2D) or 1 (the 3D kind "
+			    "OUTPUT names); -1 = off",
+			    force);
+		}
+		if (start.start_3d_moot) {
+			U_LOG_W("sim_display: START_3D ignored — OUTPUT=%s means start in 2D", mode_str);
+		}
+		sim_display_set_output_mode(start.active == 1 ? kind : SIM_DISPLAY_OUTPUT_PASSTHROUGH);
 	}
 
 	// Read configuration from environment (used as defaults / overrides).
@@ -768,6 +769,8 @@ sim_display_hmd_create(void)
 
 	hmd->ipd_m = ipd;
 	hmd->zoom_scale = 1.0f;
+	hmd->kind = kind;
+	xrt_atomic_s32_exchange(&g_sim_display_kind, (int32_t)kind);
 	hmd->nominal_z_m = nominal_z;
 	hmd->log_level = U_LOGGING_INFO;
 
@@ -798,73 +801,10 @@ sim_display_hmd_create(void)
 	snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Sim 3D Display");
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "sim_display_0");
 
-	// Rendering modes: sim_display supports 6 modes (2D + 3 stereo + quad + interlaced).
-	// Order: 0=2D, 1=Anaglyph (default 3D), 2=Cropped SBS, 3=Squeezed SBS, 4=Quad,
-	//        5=Interlaced (#817 phase-sensitive weave proxy)
-	hmd->base.rendering_mode_count = 6;
-
-	// Mode 0: 2D (mono, full resolution, 1×1 tile)
-	hmd->base.rendering_modes[0].mode_index = 0;
-	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "2D");
-	hmd->base.rendering_modes[0].view_count = 1;
-	hmd->base.rendering_modes[0].view_scale_x = 1.0f;
-	hmd->base.rendering_modes[0].view_scale_y = 1.0f;
-	hmd->base.rendering_modes[0].hardware_display_3d = false;
-	hmd->base.rendering_modes[0].tile_columns = 1;
-	hmd->base.rendering_modes[0].tile_rows = 1;
-
-	// Mode 1: Anaglyph (stereo, default 3D, 2×1 tiles = side-by-side half-res)
-	hmd->base.rendering_modes[1].mode_index = 1;
-	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "Anaglyph");
-	hmd->base.rendering_modes[1].view_count = 2;
-	hmd->base.rendering_modes[1].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[1].view_scale_y = 0.5f;
-	hmd->base.rendering_modes[1].hardware_display_3d = true;
-	hmd->base.rendering_modes[1].tile_columns = 2;
-	hmd->base.rendering_modes[1].tile_rows = 1;
-
-	// Mode 2: Cropped SBS (stereo, 1×2 tiles = top-bottom half-res)
-	hmd->base.rendering_modes[2].mode_index = 2;
-	snprintf(hmd->base.rendering_modes[2].mode_name, XRT_DEVICE_NAME_LEN, "Cropped SBS");
-	hmd->base.rendering_modes[2].view_count = 2;
-	hmd->base.rendering_modes[2].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[2].view_scale_y = 0.5f;
-	hmd->base.rendering_modes[2].hardware_display_3d = true;
-	hmd->base.rendering_modes[2].tile_columns = 1;
-	hmd->base.rendering_modes[2].tile_rows = 2;
-
-	// Mode 3: Squeezed SBS (stereo, 2×1 tiles = side-by-side full-height)
-	hmd->base.rendering_modes[3].mode_index = 3;
-	snprintf(hmd->base.rendering_modes[3].mode_name, XRT_DEVICE_NAME_LEN, "Squeezed SBS");
-	hmd->base.rendering_modes[3].view_count = 2;
-	hmd->base.rendering_modes[3].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[3].view_scale_y = 1.0f;
-	hmd->base.rendering_modes[3].hardware_display_3d = true;
-	hmd->base.rendering_modes[3].tile_columns = 2;
-	hmd->base.rendering_modes[3].tile_rows = 1;
-
-	// Mode 4: Quad (4 views, 2x2 grid, each quadrant at half-res)
-	hmd->base.rendering_modes[4].mode_index = 4;
-	snprintf(hmd->base.rendering_modes[4].mode_name, XRT_DEVICE_NAME_LEN, "Quad");
-	hmd->base.rendering_modes[4].view_count = 4;
-	hmd->base.rendering_modes[4].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[4].view_scale_y = 0.5f;
-	hmd->base.rendering_modes[4].hardware_display_3d = true;
-	hmd->base.rendering_modes[4].tile_columns = 2;
-	hmd->base.rendering_modes[4].tile_rows = 2;
-
-	// #817: Interlaced — same atlas geometry as Anaglyph (2 full-canvas views,
-	// position-preserving), but the DP picks the view per PANEL COLUMN, so the
-	// output is sensitive to the weave target's size and its X origin the way a
-	// real lenticular weave is. See enum sim_display_output_mode.
-	hmd->base.rendering_modes[5].mode_index = 5;
-	snprintf(hmd->base.rendering_modes[5].mode_name, XRT_DEVICE_NAME_LEN, "Interlaced");
-	hmd->base.rendering_modes[5].view_count = 2;
-	hmd->base.rendering_modes[5].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[5].view_scale_y = 0.5f;
-	hmd->base.rendering_modes[5].hardware_display_3d = true;
-	hmd->base.rendering_modes[5].tile_columns = 2;
-	hmd->base.rendering_modes[5].tile_rows = 1;
+	// Rendering modes (ADR-065): exactly two at run time — 0 = 2D, 1 = the 3D
+	// kind OUTPUT names (sim_display_modes.h has the table of kinds).
+	hmd->base.rendering_mode_count = 2;
+	sim_display_fill_modes(kind, hmd->base.rendering_modes);
 
 	// Per-mode tracking capability (#441): sim_display has no real eye
 	// tracker, so every mode stays untracked (mode_flags/reserved are
@@ -879,7 +819,7 @@ sim_display_hmd_create(void)
 		}
 	}
 
-	// view_count = max across all rendering modes
+	// view_count = max across the two modes (the kind's view count)
 	{
 		uint32_t max_views = 1;
 		for (uint32_t m = 0; m < hmd->base.rendering_mode_count; m++) {
@@ -889,46 +829,20 @@ sim_display_hmd_create(void)
 		hmd->base.hmd->view_count = max_views;
 	}
 
-	// Set default active mode from env var
-	{
-		enum sim_display_output_mode sd_mode = sim_display_get_output_mode();
-		// Map internal mode to unified index: Passthrough→0, Anaglyph→1, SBS→2, SqueezedSBS→3, Quad→4
-		uint32_t default_mode;
-		switch (sd_mode) {
-		case SIM_DISPLAY_OUTPUT_PASSTHROUGH:  default_mode = 0; break;
-		case SIM_DISPLAY_OUTPUT_ANAGLYPH:     default_mode = 1; break;
-		case SIM_DISPLAY_OUTPUT_SBS:          default_mode = 2; break;
-		case SIM_DISPLAY_OUTPUT_SQUEEZED_SBS: default_mode = 3; break;
-		case SIM_DISPLAY_OUTPUT_QUAD:         default_mode = 4; break;
-		case SIM_DISPLAY_OUTPUT_INTERLACED:   default_mode = 5; break;
-		default:                              default_mode = 0; break;
-		}
-
-		// SIM_DISPLAY_FORCE_MODE overrides the SIM_DISPLAY_OUTPUT-derived
-		// default with an explicit unified index and keeps the DP present
-		// pipeline consistent with it. The set_property guard above then holds
-		// this mode against every later request (plug-in-wide, any app).
-		int32_t forced = (int32_t)debug_get_num_option_sim_display_force_mode();
-		if (forced >= 0 && (uint32_t)forced < hmd->base.rendering_mode_count) {
-			static const enum sim_display_output_mode idx_to_internal[6] = {
-			    SIM_DISPLAY_OUTPUT_PASSTHROUGH, SIM_DISPLAY_OUTPUT_ANAGLYPH,
-			    SIM_DISPLAY_OUTPUT_SBS,         SIM_DISPLAY_OUTPUT_SQUEEZED_SBS,
-			    SIM_DISPLAY_OUTPUT_QUAD,        SIM_DISPLAY_OUTPUT_INTERLACED};
-			default_mode = (uint32_t)forced;
-			sim_display_set_output_mode(idx_to_internal[default_mode]);
-			U_LOG_W("sim_display: SIM_DISPLAY_FORCE_MODE=%d — pinning active mode "
-			        "'%s' (view_count=%u); later mode requests are ignored",
-			        forced, hmd->base.rendering_modes[default_mode].mode_name,
-			        hmd->base.rendering_modes[default_mode].view_count);
-		} else if (forced != -1) {
-			U_LOG_W("sim_display: SIM_DISPLAY_FORCE_MODE=%d out of range [0,%u) — "
-			        "ignoring, using the SIM_DISPLAY_OUTPUT default",
-			        forced, hmd->base.rendering_mode_count);
-		}
-
-		hmd->base.hmd->active_rendering_mode_index = default_mode;
-		sim_display_set_view_count(hmd->base.rendering_modes[default_mode].view_count);
+	// Start-up mode (ADR-065): 2D unless START_3D; FORCE_MODE (0/1) pins it and
+	// the set_property guard above then holds it against every later request
+	// (plug-in-wide, any app).
+	if (start.pinned) {
+		U_LOG_W(
+		    "sim_display: SIM_DISPLAY_FORCE_MODE=%u — pinning active mode "
+		    "'%s' (view_count=%u); later mode requests are ignored",
+		    start.active, hmd->base.rendering_modes[start.active].mode_name,
+		    hmd->base.rendering_modes[start.active].view_count);
 	}
+	hmd->base.hmd->active_rendering_mode_index = start.active;
+	sim_display_set_view_count(hmd->base.rendering_modes[start.active].view_count);
+	U_LOG_W("sim_display: rendering modes 0 '2D' and 1 '%s' (%u views); starting in mode %u",
+	        hmd->base.rendering_modes[1].mode_name, hmd->base.rendering_modes[1].view_count, start.active);
 
 	// Initialize per-view eye offsets based on max view_count.
 	// Stored on xrt_hmd_parts so the state tracker can read them generically

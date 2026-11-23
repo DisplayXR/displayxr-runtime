@@ -20,9 +20,49 @@
 | `sim_display_webcam.c` | The DEPRECATED `WEBCAM_TRACKING` alias (#1855): process glue only (refcounted tracker for the DPs, eye override, advertised caps, camera claim). The tracker core it runs lives in `../sim_tracking/` (`sim_webcam_*`: geometry + smoothing, capture worker, host-agnostic source + settings seam; `sim_face_*`: the estimator slot — `_none` by default, `_onnx` + `sim_webcam_onnx.cmake` with `XRT_SIM_WEBCAM_ESTIMATOR=onnx` — and YuNet pre/post-processing) |
 | `shaders/` | Side-by-side / anaglyph compositing shaders |
 
-## Display modes
+## Rendering modes and 3D kinds
 
-sim_display supports several output modes for visualizing stereo content on a 2D screen:
+Like every display driver, sim_display exposes **two rendering modes at run time**
+([ADR-065](../../adr/ADR-065-two-runtime-rendering-modes.md)):
+
+| Index | Mode |
+|---|---|
+| 0 | 2D — one view, full resolution |
+| 1 | the **3D kind** the `OUTPUT` setting names |
+
+The kind is chosen once, when the device is created (the next app start in-process, the
+next service start out-of-process) and never changes while it lives. **The device starts
+in 2D**: a PC with no 3D display shows a normal picture until you press **V** (or **1**),
+or an app requests mode 1. `START_3D=1` starts it in the kind instead.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `OUTPUT` | `anaglyph` | The 3D kind: `anaglyph`, `sbs`, `squeezed` (`squeezed_sbs`), `quad`, `interlaced`, `blend`. `2d` / `passthrough` choose no kind (mode 1 stays anaglyph) and force the start in 2D. |
+| `START_3D` | `0` | Start in mode 1 (the kind) instead of mode 0. Ignored with `OUTPUT=2d`. |
+| `FORCE_MODE` | `-1` | Developer pin: `0` (2D) or `1` (the kind), held against every request from every app. Any other value is ignored with a WARN. |
+
+Set them with `displayxr-cli dp set sim-display <KEY> <value>` (per user), or
+`DXR_DP_SIM_DISPLAY_<KEY>` in the hosting process's environment; the legacy
+`SIM_DISPLAY_<KEY>` names (`SIM_DISPLAY_OUTPUT`, `SIM_DISPLAY_START_3D`,
+`SIM_DISPLAY_FORCE_MODE`) still work for one release.
+
+| Kind | Mode-1 name | Views | Per-view scale | Tiles |
+|---|---|---|---|---|
+| `anaglyph` (default) | Anaglyph | 2 | 0.5 x 0.5 | 2x1 |
+| `sbs` | Cropped SBS | 2 | 0.5 x 0.5 | 1x2 |
+| `squeezed` | Squeezed SBS | 2 | 0.5 x 1.0 | 2x1 |
+| `quad` | Quad | 4 | 0.5 x 0.5 | 2x2 |
+| `interlaced` | Interlaced | 2 | 0.5 x 0.5 | 2x1 |
+| `blend` | Blend | 2 | 0.5 x 0.5 | 2x1 |
+
+**`quad` is an inspection kind.** It is the only way to exercise an N-view path without
+hardware, but a stereo session (`PRIMARY_STEREO`, every legacy app, the engine plug-ins,
+the browser) cannot fill four tiles: the session-begin floor drops such a session to 2D
+and a request for mode 1 is denied with `XrEventDataDisplayModeRequestDeniedDXR`. A
+`PRIMARY_MULTIVIEW_DXR` session fills all four. To hold a stereo app in Quad anyway (the
+under-submit path), pin it: `OUTPUT=quad FORCE_MODE=1`.
+
+The kinds draw as follows:
 
 - **Side-by-side (SBS)** — left view in left half, right view in right half.
 - **Anaglyph (red/cyan)** — for use with red/cyan glasses. The default
@@ -35,15 +75,16 @@ sim_display supports several output modes for visualizing stereo content on a 2D
   instead of a red or cyan copy. A feature thinner than its disparity (a line
   well off the display plane) vanishes the same way. An opaque session keeps the
   alpha of either view, so an opaque app that writes alpha 0 keeps its colours.
-- **Blend** — interleaved or alpha-blended views for quick visual sanity checks.
+- **Squeezed SBS** — the two views side by side at full height, placed as-is.
+- **Quad** — four views in a 2x2 grid.
+- **Blend** — the two views mixed 50/50, for quick visual sanity checks.
 - **Interlaced** — 1-pixel-period column interlace: view 0 on even panel
   columns, view 1 on odd, both sampled at the same UV. The only
-  phase-sensitive mode — see the next section.
+  phase-sensitive kind — see the next section.
 
-Mode is selected at driver init time
-(`SIM_DISPLAY_OUTPUT=2d|anaglyph|sbs|squeezed|quad|blend|interlaced`). See
-`sim_display_processor.c` for the mode dispatch and `shaders/` for the
-per-mode compositing kernels.
+`sim_display_modes.h` holds the table of kinds and the start-up rule (pinned by
+`tests/tests_sim_display_modes.cpp`); `sim_display_processor.c` has the per-kind
+dispatch and `shaders/` the compositing kernels.
 
 ## Panel geometry
 

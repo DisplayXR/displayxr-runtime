@@ -98,13 +98,25 @@ sim_display_get_output_mode(void);
  * Set the output mode at runtime.
  *
  * Thread-safe (atomic). Call from the event pump (main thread) when
- * the user presses 1/2/3 to switch modes.
+ * the active rendering mode changes (2D <-> the device's 3D kind).
  *
  * @param mode The new output mode.
  * @ingroup drv_sim_display
  */
 void
 sim_display_set_output_mode(enum sim_display_output_mode mode);
+
+/*!
+ * The output a display processor draws for an atlas of @p tile_count tiles
+ * (ADR-065): passthrough for a 1-tile (2D) atlas, otherwise the current output
+ * — and the device's 3D kind if the current output is still passthrough, i.e.
+ * the active mode moved to mode 1 without an OUTPUT_MODE request reaching the
+ * device (a direct active-index write). Thread-safe; read each frame.
+ *
+ * @ingroup drv_sim_display
+ */
+enum sim_display_output_mode
+sim_display_output_for_tiles(uint32_t tile_count);
 
 /*!
  * Get the current view count for the active rendering mode.
@@ -614,7 +626,7 @@ sim_display_dp_factory_metal_for_screen(struct xrt_plugin_instance *inst,
  * Create a simulation GL display processor.
  *
  * All 3 GLSL shaders (SBS, anaglyph, blend) are compiled at init
- * for instant runtime switching via 1/2/3 keys.
+ * so any 3D kind (and 2D) draws without a rebuild.
  *
  * @param mode          Output mode (SBS, anaglyph, or blend).
  * @param[out] out_xdp  Receives the created display processor.

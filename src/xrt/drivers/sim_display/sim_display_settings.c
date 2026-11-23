@@ -46,11 +46,18 @@ static const struct knob g_knobs[] = {
     {{"TRACKING_SWAY_PERIOD_MS", XRT_COMPONENT_SETTING_TYPE_INT, "4000", "fake tracking: sway period (>= 100)"},
      "FAKE_TRACKING_SWAY_PERIOD_MS"},
     // Panel geometry + output.
+    // ADR-065: two run-time modes, 0 = 2D and 1 = the 3D kind OUTPUT names;
+    // read when the device is created (next app / service start).
     {{"OUTPUT", XRT_COMPONENT_SETTING_TYPE_ENUM, "anaglyph",
-      "initial output mode: 2d|passthrough, anaglyph, sbs, squeezed|squeezed_sbs, quad, interlaced, blend"},
+      "the 3D kind mode 1 draws: anaglyph, sbs, squeezed|squeezed_sbs, quad (4 views: an inspection kind, "
+      "stereo apps fall back to 2D), interlaced, blend; 2d|passthrough = anaglyph and start in 2D"},
      "OUTPUT"},
+    {{"START_3D", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
+      "start in the 3D kind (mode 1) instead of 2D (mode 0); ignored with OUTPUT=2d"},
+     "START_3D"},
     {{"FORCE_MODE", XRT_COMPONENT_SETTING_TYPE_INT, "-1",
-      "pin the rendering mode index (0=2D 1=Anaglyph 2=Cropped SBS 3=Squeezed SBS 4=Quad) for every app; -1 = off"},
+      "pin the rendering mode for every app: 0 = 2D, 1 = the 3D kind OUTPUT names; -1 = off (other values are "
+      "ignored)"},
      "FORCE_MODE"},
     {{"WIDTH_M", XRT_COMPONENT_SETTING_TYPE_FLOAT, "0.344", "panel width in metres"}, "WIDTH_M"},
     {{"HEIGHT_M", XRT_COMPONENT_SETTING_TYPE_FLOAT, "0.194", "panel height in metres"}, "HEIGHT_M"},
