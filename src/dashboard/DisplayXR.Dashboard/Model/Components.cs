@@ -230,9 +230,20 @@ public static class PlainStates
         return load is "LOADED" or "ACTIVE" or "BUILT_IN" ? PlainState.Ready : PlainState.Standby;
     }
 
-    /// <summary>An input provider: active = In use, hardware present = Ready, otherwise Standby.</summary>
+    /// <summary>
+    /// An input provider: In use only when it is the selected one AND its hardware is known to be
+    /// present; selected without hardware (absent, or not known) = Ready, like a provider whose
+    /// hardware is present but is not selected; otherwise Standby. ("Selected" is <c>input list
+    /// --json</c> <c>active</c>: the provider the arbiter would pick, whether or not a device is
+    /// plugged in.)
+    /// </summary>
     public static PlainState InputProvider(bool active, bool? hardwarePresent, PolicyRow? policy) =>
-        ByPolicy(policy) ?? (active ? PlainState.InUse : hardwarePresent == true ? PlainState.Ready : PlainState.Standby);
+        ByPolicy(policy) ?? (active && hardwarePresent == true ? PlainState.InUse
+                             : active || hardwarePresent == true ? PlainState.Ready
+                             : PlainState.Standby);
+
+    /// <summary>The row line of an input provider that is the selected one while no device of it is connected.</summary>
+    public const string NoDeviceLine = "No device connected";
 
     /// <summary>A viewer-tracking provider: serving a screen = In use, its probe found a usable source = Ready, otherwise Standby.</summary>
     public static PlainState TrackingProvider(bool serving, bool usableSource, PolicyRow? policy) =>
@@ -510,6 +521,11 @@ public static class Components
             {
                 var ip = info.InputProviders.FirstOrDefault(x => x.Id == r.Id);
                 bool active = r.Active || ip is { Active: true };
+                bool? hardware = InputHardware(info, r.Id);
+                var state = PlainStates.InputProvider(active, hardware, r);
+                // Selected, no device: the face says so instead of the publisher line (which moves to Details).
+                bool noDevice = active && hardware != true && state == PlainState.Ready;
+                string? publisher = PublisherLine(r.Vendor, r.Version);
                 var chips = new ChipList();
                 if (ip is not null) chips.Add("Hardware", ip.HardwarePresent ? "hardware present" : "hardware absent", ip.HardwarePresent ? Level.Ok : Level.Plain);
                 if (active) chips.Add("State", "active", Level.Ok);
@@ -517,20 +533,25 @@ public static class Components
                 var lines = new List<string>();
                 if (ip is { Note.Length: > 0 }) lines.Add(ip.Note);
                 else if (r.Untrusted && r.ProvenanceReason is { Length: > 0 } why) lines.Add(why);
-                items.Add(new ComponentItem(r.Name.Length > 0 ? r.Name : r.Id, active ? Level.Ok : r.Untrusted ? Level.Warn : Level.Plain,
-                    chips.Chips, lines, Policy: r, Facts: chips.Facts, State: PlainStates.InputProvider(active, ip?.HardwarePresent, r),
-                    Summary: PublisherLine(r.Vendor, r.Version)));
+                IReadOnlyList<(string, string)>? lineFacts = null;
+                if (noDevice && publisher is not null)
+                    lineFacts = new[] { ("Publisher", publisher) }.Concat(lines.Select(l => ("Note", l))).ToArray();
+                items.Add(new ComponentItem(r.Name.Length > 0 ? r.Name : r.Id,
+                    state == PlainState.InUse ? Level.Ok : r.Untrusted ? Level.Warn : Level.Plain,
+                    chips.Chips, lines, Policy: r, Facts: chips.Facts, State: state,
+                    Summary: noDevice ? PlainStates.NoDeviceLine : publisher, LineFacts: lineFacts));
             }
         }
         else
             foreach (var p in info.InputProviders)
-                items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, p.Active ? Level.Ok : Level.Plain,
+                items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, p.Active && p.HardwarePresent ? Level.Ok : Level.Plain,
                     new[] { (p.HardwarePresent ? "hardware present" : "hardware absent", p.HardwarePresent ? Level.Ok : Level.Plain) }
                         .Concat(p.Active ? new[] { ("active", Level.Ok) } : Array.Empty<(string, Level)>()).ToArray(),
                     p.Note.Length > 0 ? new[] { p.Note } : Array.Empty<string>(), Id: p.Id,
                     Facts: new[] { ("Hardware", p.HardwarePresent ? "hardware present" : "hardware absent") }
                         .Concat(p.Active ? new[] { ("State", "active") } : Array.Empty<(string, string)>()).ToArray(),
-                    State: PlainStates.InputProvider(p.Active, p.HardwarePresent, null)));
+                    State: PlainStates.InputProvider(p.Active, p.HardwarePresent, null),
+                    Summary: p.Active && !p.HardwarePresent ? PlainStates.NoDeviceLine : null));
         if (items.Count == 0 && info.Input is { } sum)
         {
             var lines = new List<string> { sum.Note };
@@ -561,6 +582,22 @@ public static class Components
             info.Input is null && info.InputProviders.Count == 0 && policy is null ? "not read yet"
                 : $"{registered} installed{Sep}{(connected > 0 ? "device connected" : "no device connected")}",
             items);
+    }
+
+    /// <summary>
+    /// Whether the hardware of input provider <paramref name="id"/> is present, from <c>info --json</c>
+    /// <c>input_providers</c>: its own row's <c>hardware_present</c> when the CLI lists providers; else
+    /// the summary's <c>hardware_present</c> when the summary is about this provider
+    /// (<c>active_id</c>), or when it says no provider's hardware is present (the section's "no device
+    /// connected"). Null when not known (info not read, or the summary is about another provider).
+    /// </summary>
+    public static bool? InputHardware(InfoComponents info, string id)
+    {
+        if (info.InputProviders.FirstOrDefault(x => x.Id == id) is { } row) return row.HardwarePresent;
+        if (info.InputProviders.Count > 0) return null;
+        if (info.Input is not { } sum) return null;
+        if (sum.ActiveId == id || !sum.HardwarePresent) return sum.HardwarePresent;
+        return null;
     }
 
     public static ComponentSection Conversion(InfoComponents info)

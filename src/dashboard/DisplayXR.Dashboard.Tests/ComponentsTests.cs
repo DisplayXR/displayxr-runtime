@@ -121,9 +121,13 @@ public class ComponentsTests
         Assert.Equal(PlainState.NeedsAttention, PlainStates.InputProvider(true, true, R(true, "UNTRUSTED")));
         Assert.Equal(PlainState.TurnedOff, PlainStates.TrackingProvider(true, true, R(false)));
 
-        Assert.Equal(PlainState.InUse, PlainStates.InputProvider(true, false, null));
+        // In use needs its hardware: selected without a device (absent or not known) is Ready.
+        Assert.Equal(PlainState.InUse, PlainStates.InputProvider(true, true, null));
+        Assert.Equal(PlainState.Ready, PlainStates.InputProvider(true, false, null));
+        Assert.Equal(PlainState.Ready, PlainStates.InputProvider(true, null, null));
         Assert.Equal(PlainState.Ready, PlainStates.InputProvider(false, true, null));
         Assert.Equal(PlainState.Standby, PlainStates.InputProvider(false, null, null));
+        Assert.Equal(PlainState.Standby, PlainStates.InputProvider(false, false, null));
 
         Assert.Equal(PlainState.InUse, PlainStates.TrackingProvider(true, false, null));
         Assert.Equal(PlainState.Ready, PlainStates.TrackingProvider(false, true, null));
@@ -239,6 +243,42 @@ public class ComponentsTests
         Assert.Contains(input.Items, i => i.Name == "Rig (navigation) role" && i.Lines.Contains("Device: Nav Puck"));
         var cam = Components.StereoCamera(info)!;
         Assert.Equal(new[] { "present: true", "name: Cam 7", "fps: 60" }, cam.Items[0].Lines); // nested object skipped
+    }
+
+    /// <summary>
+    /// Found on real hardware: the selected input add-on read "In use" while its section said "no
+    /// device connected". <c>input list --json</c> <c>active</c> is only the selected one; whether its
+    /// device is there is <c>info --json</c> <c>input_providers.hardware_present</c> (+ <c>active_id</c>).
+    /// </summary>
+    [Fact]
+    public void SelectedInputAddOn_WithoutItsDevice_IsReady_NotInUse()
+    {
+        var policy = ComponentPolicyTests.Parse(ComponentClass.Input, "input-list-n3e.json");
+        var selected = policy.Rows.Single(r => r.Active);
+        InfoComponents Summary(bool hw, string? activeId) => InfoComponents.Empty with
+        {
+            Input = new InputSummary(policy.Rows.Count, hw, true, false, activeId, ""),
+        };
+
+        // No device: the section says so, and so does the selected row.
+        var absent = Components.InputProviders(Summary(false, null), policy);
+        Assert.Equal($"{policy.Rows.Count} installed{StatusText.Sep}no device connected", absent.ConnectedLine);
+        var row = absent.Items.Single(i => i.Name == (selected.Name.Length > 0 ? selected.Name : selected.Id));
+        Assert.Equal(PlainState.Ready, row.State);
+        Assert.Equal("No device connected", row.Summary);
+        Assert.DoesNotContain(absent.Items, i => i.State == PlainState.InUse);
+
+        // Its device is present: In use, and the face line is the publisher line again.
+        var present = Components.InputProviders(Summary(true, selected.Id), policy);
+        var inUse = present.Items.Single(i => i.Name == row.Name);
+        Assert.Equal(PlainState.InUse, inUse.State);
+        Assert.NotEqual("No device connected", inUse.Summary);
+
+        // The summary is about another provider: this one's hardware is not known, so not In use.
+        Assert.Null(Components.InputHardware(Summary(true, "someone-else"), selected.Id));
+        Assert.Equal(PlainState.Ready, Components.InputProviders(Summary(true, "someone-else"), policy).Items.Single(i => i.Name == row.Name).State);
+        // Info not read at all: not known either.
+        Assert.Null(Components.InputHardware(InfoComponents.Empty, selected.Id));
     }
 
     [Fact]

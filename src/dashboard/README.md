@@ -145,9 +145,12 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   (`ComponentItem.LineFacts`), and so is how a row that cannot be removed from here is removed. The state
   word maps the component's technical state (`Model/Components.cs` `PlainStates`): **In use** (an
   `ACTIVE` display processor, a conversion provider selected for a task, a tracking provider
-  serving a screen, an active input provider, a connected workspace controller), **Ready** (loaded
-  or usable but not the one in use: `LOADED`, `BUILT_IN`, an input provider with its hardware
-  present, a tracking provider whose probe found a source, an available conversion module, an
+  serving a screen, the selected input provider while its hardware is present, a connected
+  workspace controller), **Ready** (loaded or usable but not the one in use: `LOADED`, `BUILT_IN`,
+  an input provider with its hardware present, the selected input provider with no device connected
+  — its row line then reads "No device connected" instead of the publisher line; `input list
+  --json` `active` is only "selected", the hardware is `info --json` `input_providers.hardware_present`
+  / `active_id`, or a provider's own `hardware_present` when the CLI lists them, a tracking provider whose probe found a source, an available conversion module, an
   installed model pack), **Standby** (registered and allowed but not loaded or not needed:
   `NOT_ATTEMPTED`, `DECLINED`, superseded, a controller not running), **Turned off** (its Enabled
   value, or the loader's `DISABLED`), **Needs attention** (refused by the provenance gate: "Blocked:

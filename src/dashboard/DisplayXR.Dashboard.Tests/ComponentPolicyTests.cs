@@ -17,7 +17,7 @@ namespace DisplayXR.Dashboard.Tests;
 /// </summary>
 public class ComponentPolicyTests
 {
-    private static PolicyList Parse(ComponentClass cls, string file)
+    internal static PolicyList Parse(ComponentClass cls, string file)
     {
         Assert.True(PolicyList.TryParse(cls, TestData.Text(file), out var list), file);
         return list!;
