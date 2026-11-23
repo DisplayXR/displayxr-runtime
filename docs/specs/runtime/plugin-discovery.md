@@ -373,6 +373,7 @@ other.
 |---|---|
 | `displayxr-cli dp options <id> [--json]` | Every key the plug-in declares (`xrt_plugin_iface::describe_settings`, `XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`; or the POSIX manifest's `plugin.settings_schema` array `[{"key","type","default","help"}, …]`) unioned with every key the stores hold: key, type (`bool` / `int` / `float` / `string` / `enum` / `secret`), default, effective value and its source (`environment` / `user` / `machine` / `manifest` / `absent`), plus the environment prefix and both store paths. Loads + negotiates the registered binary (no probe) to ask it — the same exposure as `dp list`'s status snapshot. |
 | `dp set <id> <KEY> <value> [--machine]` | Writes the per-user store (no admin) or, with `--machine`, the HKLM 64-bit view (admin). Refused on POSIX with `--machine` — the manifest's `settings` object is the machine store there and is edited by hand. An unregistered id or an invalid key is refused with nothing written (the `enable\|disable` rule). After the write the CLI reads the key back and prints *Effective now:* the value the plug-in will actually see and why — including when the environment or `Policy\Lock` overrides what was just written. |
+| `dp set <id> <KEY> --stdin [--machine]` | The same write, the value read from standard input instead of the command line: ONE line, the trailing newline (and a CR before it) dropped, nothing after the first line read. An empty line, or one that does not fit the store (255 bytes; 2047 for a `secret`), is refused with nothing written. A value argument and `--stdin` together are refused. Works for any type; it is the way to set a `secret`, since a command line is visible to other processes and kept in shell history. Same verb on `input`, `conv` and `tracking`. |
 | `dp unset <id> <KEY> [--machine]` | Removes it from that store; absent is success (POSIX: the per-user file is deleted once empty). |
 
 **Secrets.** A setting declared with type `secret`
@@ -387,6 +388,11 @@ through the same host slot. What differs:
   `"set": true|false`; `set` and `unset` confirm without echoing the value;
   nothing in the runtime logs a setting value. Every row of `options --json`
   carries `secret`.
+- **It is set through standard input.** `set <id> <KEY> --stdin` reads the
+  value from standard input (the Dashboard writes it there), so it never
+  appears on a command line. A secret given as an argument is still accepted,
+  so existing scripts keep working, with one warning line on stderr
+  recommending `--stdin`.
 - **It may be longer.** An ordinary value is capped at 255 bytes. A secret
   may be up to 2047 bytes (`XRT_COMPONENT_SETTING_SECRET_MAX` = 2048 with the
   terminator), because a licence key is often a signed token rather than a

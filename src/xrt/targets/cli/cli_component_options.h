@@ -84,6 +84,14 @@ int
 cli_component_set(
     const struct cli_component_class *k, const char *id, const char *key, const char *value, bool machine);
 
+/*!
+ * `<class> set <id> <KEY> --stdin [--machine]`: the value is ONE line of
+ * standard input (the trailing newline stripped; empty or longer than the
+ * store takes is refused, nothing written). Never echoed; wiped after the write.
+ */
+int
+cli_component_set_stdin(const struct cli_component_class *k, const char *id, const char *key, bool machine);
+
 //! `<class> unset <id> <KEY> [--machine]`. Absent is success.
 int
 cli_component_unset(const struct cli_component_class *k, const char *id, const char *key, bool machine);

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using DisplayXR.Dashboard.Feed;
@@ -330,6 +331,103 @@ public class DriverOptionsTests
 
         Assert.Equal("Couldn't read its options.", OptionViews.ReadFailedLine);
         Assert.Equal("Try again reading options: DisplayXR Sim Display", OptionViews.RetryName("DisplayXR Sim Display"));
+    }
+
+    [Fact]
+    public void SecretCommand_PutsNoValueInTheArguments()
+    {
+        Assert.Equal(new[] { "dp", "set", "sim-display", "LICENCE_KEY", "--stdin" }, OptionCommands.SetStdin("sim-display", "LICENCE_KEY").Args);
+        Assert.Equal("Set Licence: Leia SR", OptionViews.SetName("Licence", "Leia SR"));
+        Assert.Equal("This version of DisplayXR can only clear this value.", OptionCommands.SecretSetUnsupported);
+    }
+
+    [Theory]
+    [InlineData("abc-123", "abc-123")]
+    [InlineData("  spaced key  ", "  spaced key  ")] // a credential is written as typed
+    [InlineData("--looks-like-a-flag", "--looks-like-a-flag")] // fine on stdin: never an argument
+    [InlineData("", null)]
+    [InlineData("two\nlines", null)]
+    [InlineData("cr\r", null)]
+    [InlineData("nul\0", null)]
+    public void SecretValues_AreCheckedBeforeTheyAreWritten(string text, string? written)
+    {
+        var v = OptionCommands.ValidateSecret(text, out var error);
+        Assert.Equal(written, v);
+        Assert.Equal(written is null, error is not null);
+    }
+
+    [Fact]
+    public void SecretValues_UpToTheStoreLimit()
+    {
+        Assert.NotNull(OptionCommands.ValidateSecret(new string('x', 2047), out _));
+        Assert.Null(OptionCommands.ValidateSecret(new string('x', 2048), out var e));
+        Assert.Equal("That value is too long.", e);
+        Assert.Null(OptionCommands.ValidateSecret(new string('é', 1024), out _)); // 2048 bytes in UTF-8
+    }
+
+    [Fact]
+    public void AnOlderCliWithoutStdin_IsToldApart()
+    {
+        // An older CLI skips the unknown flag, finds two arguments and asks for a value.
+        Assert.True(OptionCommands.IsStdinUnsupported(new CliResult(1, "error: 'dp set' needs <id> <KEY> <value>.\n\n  options <id> [--json] ...", "", false, null)));
+        // This CLI names --stdin in its own refusals of the verb.
+        Assert.False(OptionCommands.IsStdinUnsupported(new CliResult(1, "error: 'dp set' needs <id> <KEY> <value>, or <id> <KEY> --stdin.", "", false, null)));
+        Assert.False(OptionCommands.IsStdinUnsupported(new CliResult(1, "error: --stdin read an empty value — nothing written (use 'dp unset' to clear it).", "", false, null)));
+        Assert.False(OptionCommands.IsStdinUnsupported(new CliResult(1, "FAIL: 'x' is not a registered display processor (see 'dp list') — nothing written.", "", false, null)));
+        Assert.False(OptionCommands.IsStdinUnsupported(new CliResult(0, "sim-display: LICENCE_KEY = <set> for this user (HKCU).", "", false, null)));
+    }
+
+    /// <summary>
+    /// A secret is set through the CLI's standard input: never an argument, never in the reply the row
+    /// shows, never kept; an older CLI is said in words. The fixture source checks the line as the CLI does.
+    /// </summary>
+    [Fact]
+    public async Task Context_SetsASecretThroughStdin()
+    {
+        const string secret = "LIC-0123-SECRET-VALUE";
+        var fx = new FixtureProcessSource(TestData.Path("components.ndjson"), new FakeSource());
+        var rec = new RecordingSource(fx);
+        var ctx = new DashboardContext(new StatusFeed(new FakeSource(), new ManualScheduler()), new CliProcessSource("no-such-cli"), rec);
+        await ctx.LoadDriverOptionsAsync("sim-display");
+        await ctx.RunOptionWriteAsync("sim-display", "LICENCE_KEY", OptionCommands.Unset("sim-display", "LICENCE_KEY"));
+        Assert.False(ctx.DriverOptionsOf("sim-display")!.Find("LICENCE_KEY")!.IsSet);
+
+        await ctx.RunSecretWriteAsync("sim-display", "LICENCE_KEY", secret);
+        Assert.False(ctx.LastActionFailed);
+        Assert.Equal(("sim-display", "LICENCE_KEY"), ctx.LastOptionWrite);
+        Assert.Equal(OptionCommands.Area, ctx.LastActionArea);
+        var row = ctx.DriverOptionsOf("sim-display")!.Find("LICENCE_KEY")!;
+        Assert.True(row.IsSet);
+        Assert.Null(row.Value);
+        Assert.DoesNotContain(secret, ctx.LastAction ?? "");
+        Assert.Contains(rec.Runs, r => r.Args.SequenceEqual(new[] { "dp", "set", "sim-display", "LICENCE_KEY", "--stdin" }) && r.Input == secret);
+        Assert.DoesNotContain(rec.Runs, r => r.Args.Any(a => a.Contains(secret)));
+
+        // An older CLI: the row says it can only clear the value.
+        fx.StdinUnsupported = true;
+        await ctx.RunSecretWriteAsync("sim-display", "LICENCE_KEY", secret);
+        Assert.True(ctx.LastActionFailed);
+        Assert.Equal(OptionCommands.SecretSetUnsupported, ctx.LastAction);
+    }
+
+    /// <summary>The fixture source, recording each run's arguments and standard input.</summary>
+    private sealed class RecordingSource(IProcessSource inner) : IProcessSource
+    {
+        public readonly List<(string[] Args, string? Input)> Runs = new();
+
+        public IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit, Action<string> onNote) => inner.StartWatch(onLine, onExit, onNote);
+
+        public Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, System.Threading.CancellationToken cancel = default)
+        {
+            Runs.Add((args.Args.ToArray(), null));
+            return inner.RunAsync(args, timeout, cancel);
+        }
+
+        public Task<CliResult> RunWithInputAsync(CliArgs args, string input, TimeSpan timeout, System.Threading.CancellationToken cancel = default)
+        {
+            Runs.Add((args.Args.ToArray(), input));
+            return inner.RunWithInputAsync(args, input, timeout, cancel);
+        }
     }
 
     /// <summary>The fixture source, with every <c>dp options</c> read timing out while <c>fail</c> says so.</summary>

@@ -584,6 +584,43 @@ public sealed class DashboardContext
         await LoadDriverOptionsAsync(driverId, force: true);
     }
 
+    /// <summary>
+    /// Set a secret (<c>dp set &lt;id&gt; &lt;KEY&gt; --stdin</c>): <paramref name="value"/> goes to the CLI's standard
+    /// input and nowhere else. It is not logged, not kept after this call, and never part of LastAction (the CLI
+    /// confirms a secret as <c>&lt;set&gt;</c>). A CLI older than <c>--stdin</c> is told apart and said in words
+    /// (<see cref="OptionCommands.SecretSetUnsupported"/>). Then that driver's settings are re-read.
+    /// </summary>
+    public async Task RunSecretWriteAsync(string driverId, string key, string value)
+    {
+        if (ActionRunning) return;
+        LastOptionWrite = (driverId, key);
+        ActionRunning = true;
+        LastActionArea = OptionCommands.Area;
+        Bump();
+        var cmd = OptionCommands.SetStdin(driverId, key);
+        try
+        {
+            DashboardLog.Info($"action: displayxr-cli {cmd} (value on standard input, not logged)");
+            var r = await Cli.RunWithInputAsync(cmd, value, ActionTimeout);
+            value = ""; // drop this frame's reference as soon as the write is done
+            LastActionFailed = !r.Ok;
+            LastAction = OptionCommands.IsStdinUnsupported(r) ? OptionCommands.SecretSetUnsupported : r.Report;
+            if (!r.Ok) DashboardLog.Info($"action: {cmd} failed (exit {r.ExitCode})");
+        }
+        catch (Exception ex)
+        {
+            LastActionFailed = true;
+            LastAction = ex.Message;
+            DashboardLog.Error("action", ex);
+        }
+        finally
+        {
+            ActionRunning = false;
+            Bump();
+        }
+        await LoadDriverOptionsAsync(driverId, force: true);
+    }
+
     public bool DpLoading { get; private set; }
     private DateTime? _dpWhen;
     private bool _dpReloadPending;

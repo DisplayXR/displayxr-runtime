@@ -856,9 +856,53 @@ public sealed class ComponentsPage : Page
             }
             case OptionControl.Secret:
             {
-                // Never shown. Setting one is not offered: `dp set` takes the value only as an argument,
-                // and a secret is never an argument (see README, Options).
+                // Never shown. Set through a masked box whose text goes to `dp set <id> <KEY> --stdin` on the
+                // CLI's standard input, never an argument; the text is not kept as a draft, not logged, and the
+                // box is emptied as soon as the write starts (see README, Options).
                 U.AddFlow(line, U.Chip(v.ValueText, v.Setting.IsSet ? Level.Info : Level.Plain), 10, 6);
+                var box = new TextBox
+                {
+                    Width = 220, MinHeight = 32, FontSize = 13, PasswordChar = '•', RevealPassword = false,
+                    Background = Tokens.Field, BorderBrush = Tokens.Line, Foreground = Tokens.Fg, IsEnabled = enabled,
+                    CornerRadius = Tokens.Radius("FieldRadius"), Padding = new Thickness(10, 6), AcceptsReturn = false,
+                    Watermark = v.Setting.IsSet ? "Type a new value" : "Type the value",
+                };
+                AutomationProperties.SetName(box, name);
+                ToolTip.SetTip(box, v.Tooltip);
+                // Focus defers the page's rebuild while typing; no draft is kept, so a rebuild empties the box.
+                box.GotFocus += (_, _) => _edits.Focus(errKey);
+                box.LostFocus += (_, _) =>
+                {
+                    _edits.Blur(errKey);
+                    Dispatcher.UIThread.Post(() => Update());
+                };
+                void SetSecret()
+                {
+                    if (Ctx.ActionRunning) return;
+                    var value = OptionCommands.ValidateSecret(box.Text, out var error);
+                    box.Text = "";
+                    if (value is null)
+                    {
+                        _edits.Refuse(errKey);
+                        _optionErrors[errKey] = error!;
+                        Update(force: true);
+                        return;
+                    }
+                    _edits.Submit(errKey);
+                    _optionErrors.Remove(errKey);
+                    _ = Ctx.RunSecretWriteAsync(id, v.Key, value);
+                }
+                box.KeyDown += (_, e) =>
+                {
+                    if (e.Key == Avalonia.Input.Key.Enter) { e.Handled = true; SetSecret(); }
+                };
+                var set = U.Button("Set", SetSecret, "quiet", "sm");
+                set.ClickMode = ClickMode.Press; // see Apply: a press survives the rebuild the box's LostFocus posts
+                set.IsEnabled = enabled;
+                AutomationProperties.SetName(set, OptionViews.SetName(v.Label, driverName));
+                ToolTip.SetTip(set, $"displayxr-cli {OptionCommands.SetStdin(id, v.Key)} (the value goes on standard input)");
+                U.AddFlow(line, box, 10, 6);
+                U.AddFlow(line, set, 10, 6);
                 break;
             }
         }

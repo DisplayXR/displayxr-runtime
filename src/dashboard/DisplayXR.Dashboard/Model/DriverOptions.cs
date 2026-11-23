@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Text.Json;
+using DisplayXR.Dashboard.Feed;
 
 namespace DisplayXR.Dashboard.Model;
 
@@ -254,6 +255,8 @@ public static class OptionViews
 
     public static string AccessibleName(string label, string driver) => $"{label}: {driver}";
     public static string ResetName(string label, string driver) => $"Use the default for {label}: {driver}";
+    /// <summary>The accessible name of a secret's "Set" button.</summary>
+    public static string SetName(string label, string driver) => $"Set {label}: {driver}";
     public static string MoreName(string driver) => $"More options: {driver}";
     public static string RetryName(string driver) => $"Try again reading options: {driver}";
 
@@ -424,4 +427,43 @@ public static class OptionCommands
     public static CliArgs Read(string id) => new("dp", "options", id, "--json");
     public static CliArgs Set(string id, string key, string value) => new("dp", "set", id, key, value);
     public static CliArgs Unset(string id, string key) => new("dp", "unset", id, key);
+
+    /// <summary>A secret's write: the value goes on standard input, never in the argument vector.</summary>
+    public static CliArgs SetStdin(string id, string key) => new("dp", "set", id, key, "--stdin");
+
+    /// <summary>What the Options block says when the CLI cannot take a value on standard input.</summary>
+    public const string SecretSetUnsupported = "This version of DisplayXR can only clear this value.";
+
+    /// <summary>
+    /// A <c>set ... --stdin</c> refused by a CLI that predates <c>--stdin</c>: it skips the unknown flag, finds
+    /// two arguments and answers that <c>set</c> needs <c>&lt;id&gt; &lt;KEY&gt; &lt;value&gt;</c>. A CLI that knows
+    /// the flag names it in every refusal of this verb, so its own errors (an empty value, too long) are not
+    /// mistaken for this.
+    /// </summary>
+    public static bool IsStdinUnsupported(CliResult r)
+    {
+        if (r.Ok) return false;
+        string text = r.Stdout + "\n" + r.Stderr;
+        return text.Contains("needs <id> <KEY> <value>", StringComparison.Ordinal)
+               && !text.Contains("--stdin", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A secret's text box, checked before it is written: one line, not empty, no NUL, at most the 2047
+    /// bytes (UTF-8) the store takes. Null with <paramref name="error"/> set when it cannot be written. The
+    /// value is not trimmed: a credential is written as typed.
+    /// </summary>
+    public static string? ValidateSecret(string? text, out string? error)
+    {
+        error = null;
+        string v = text ?? "";
+        if (v.Length == 0) { error = "Type a value first."; return null; }
+        if (v.Contains('\0')) { error = "That value has a character that can't be stored."; return null; }
+        if (v.Contains('\n') || v.Contains('\r')) { error = "One line only."; return null; }
+        if (System.Text.Encoding.UTF8.GetByteCount(v) > SecretMaxBytes) { error = "That value is too long."; return null; }
+        return v;
+    }
+
+    /// <summary>The longest secret the store takes, in bytes (2048 with the terminator).</summary>
+    public const int SecretMaxBytes = 2047;
 }

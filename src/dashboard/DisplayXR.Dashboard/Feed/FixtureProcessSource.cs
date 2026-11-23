@@ -144,6 +144,29 @@ public sealed class FixtureProcessSource : IProcessSource
         catch (JsonException) { return line; } // a deliberately truncated line stays truncated
     }
 
+    /// <summary>
+    /// <c>dp set &lt;id&gt; &lt;KEY&gt; --stdin</c> with the value on standard input, as the CLI takes it; the
+    /// fixture checks the line as the CLI does (one line, not empty) and never keeps or prints it.
+    /// <see cref="StdinUnsupported"/>: answer as a CLI older than <c>--stdin</c> does.
+    /// </summary>
+    public Task<CliResult> RunWithInputAsync(CliArgs args, string input, TimeSpan timeout, CancellationToken cancel = default)
+    {
+        var a = args.Args.ToArray();
+        if (a is ["dp", "set", var id, var key, "--stdin"])
+        {
+            if (StdinUnsupported)
+                return Task.FromResult(new CliResult(1, $"error: 'dp set' needs <id> <KEY> <value>.\n\n  options <id> [--json] ...", "", false, null));
+            string line = (input ?? "").Split('\n')[0].TrimEnd('\r');
+            if (line.Length == 0)
+                return Task.FromResult(new CliResult(1, "error: --stdin read an empty value — nothing written (use 'dp unset' to clear it).", "", false, null));
+            return Task.FromResult(Options(new[] { "dp", "set", id, key, line }));
+        }
+        return _real.RunWithInputAsync(args, input ?? "", timeout, cancel);
+    }
+
+    /// <summary>Answer <c>set ... --stdin</c> as a CLI that predates it (tests of the Dashboard's fallback).</summary>
+    public bool StdinUnsupported { get; set; }
+
     public Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel = default)
     {
         var a = args.Args.ToArray();
