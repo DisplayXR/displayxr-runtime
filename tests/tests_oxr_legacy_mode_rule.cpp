@@ -290,10 +290,10 @@ TEST_CASE("a flat start sizes a legacy app for the 3D mode V toggles into (ADR-0
 	{
 		CHECK(oxr_legacy_compromise_mode_index(kAnaglyphTable, 2, 0, true, false) == 0);
 	}
-	SECTION("service mode: the lease may move the panel to mode 1, unfloored")
+	SECTION("service mode: floored too - the keys there refuse a mode two views cannot fill (F8)")
 	{
 		CHECK(oxr_legacy_compromise_mode_index(kAnaglyphTable, 2, 0, false, true) == 1);
-		CHECK(oxr_legacy_compromise_mode_index(kQuadTable, 2, 0, false, true) == 1);
+		CHECK(oxr_legacy_compromise_mode_index(kQuadTable, 2, 0, false, true) == 0);
 	}
 	SECTION("every stereo kind from a flat start sizes for its own 3D mode")
 	{
@@ -367,4 +367,45 @@ TEST_CASE("the legacy rule is the general rule at max_views = 2 (#1499 regressio
 	// ever moved, the equalities above would still hold while #1510's
 	// documented behaviour silently changed. Pin the constant itself.
 	CHECK(OXR_LEGACY_MAX_SUBMITTED_VIEWS == 2u);
+}
+
+TEST_CASE("F8: the legacy run mode, size mode and UNFILLABLE flag come from one decision", "[oxr][legacy_mode_rule]")
+{
+	SECTION("sim-display default (anaglyph kind, flat start): runs 2D, sized for anaglyph, fillable")
+	{
+		const auto d = oxr_legacy_decide(kAnaglyphTable, 2, 0, false, false);
+		CHECK(d.run_index == 0);
+		CHECK(d.size_index == 1);
+		CHECK_FALSE(d.forced);
+		CHECK_FALSE(d.unfillable);
+	}
+	SECTION("service, quad kind, flat start: never sized for the quad it will not get, no WARN")
+	{
+		const auto d = oxr_legacy_decide(kQuadTable, 2, 0, false, true);
+		CHECK(d.run_index == 0);
+		CHECK(d.size_index == 0);
+		CHECK_FALSE(d.unfillable);
+	}
+	SECTION("service, the lease already holds quad: runs in it, sized for it, and the WARN fires")
+	{
+		const auto d = oxr_legacy_decide(kQuadTable, 2, 1, false, true);
+		CHECK(d.run_index == 1);
+		CHECK(d.size_index == 1);
+		CHECK(d.unfillable);
+	}
+	SECTION("pinned quad (FORCE_MODE=1): runs and is sized in quad, WARN fires")
+	{
+		const auto d = oxr_legacy_decide(kQuadTable, 2, 1, true, false);
+		CHECK(d.run_index == 1);
+		CHECK(d.size_index == 1);
+		CHECK(d.unfillable);
+	}
+	SECTION("unpinned quad start: floored to 2D (forced), sized for 2D, fillable")
+	{
+		const auto d = oxr_legacy_decide(kQuadTable, 2, 1, false, false);
+		CHECK(d.run_index == 0);
+		CHECK(d.forced);
+		CHECK(d.size_index == 0);
+		CHECK_FALSE(d.unfillable);
+	}
 }

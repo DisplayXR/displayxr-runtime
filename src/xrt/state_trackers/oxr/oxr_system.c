@@ -436,21 +436,18 @@ oxr_system_fill_in(
 			    XRT_SUCCESS) {
 				mode_pinned = 0; // device doesn't implement the query ⟹ not pinned
 			}
-			const bool may_demote = oxr_legacy_may_demote(mode_pinned != 0, info->is_service_mode);
-			uint32_t legacy_idx = active_idx;
-			if (may_demote) {
-				legacy_idx = oxr_legacy_pick_mode_index(head->rendering_modes,
-				                                        head->rendering_mode_count, active_idx);
-			}
+			// ADR-065 F8: ONE decision - the mode it runs in, the mode it is
+			// sized for (from a flat start, sim-display's default: the 3D mode
+			// V toggles into, floored for two views), and whether either is
+			// unfillable (the xrCreateSession WARN) - so they cannot disagree.
+			const struct oxr_legacy_mode_decision ld =
+			    oxr_legacy_decide(head->rendering_modes, head->rendering_mode_count, active_idx,
+			                      mode_pinned != 0, info->is_service_mode);
+			const uint32_t legacy_idx = ld.run_index;
 			sys->legacy_rendering_mode_index = legacy_idx;
-			sys->legacy_rendering_mode_forced = (legacy_idx != active_idx);
-			sys->legacy_mode_unfillable = !oxr_legacy_mode_is_fillable(&head->rendering_modes[legacy_idx]);
-
-			// ADR-065: from a flat start (sim-display's default), size for
-			// the 3D mode V toggles into, not for the 1-view mode.
-			const uint32_t scale_idx =
-			    oxr_legacy_compromise_mode_index(head->rendering_modes, head->rendering_mode_count,
-			                                     legacy_idx, mode_pinned != 0, info->is_service_mode);
+			sys->legacy_rendering_mode_forced = ld.forced;
+			sys->legacy_mode_unfillable = ld.unfillable;
+			const uint32_t scale_idx = ld.size_index;
 			struct xrt_rendering_mode *mode3d = &head->rendering_modes[scale_idx];
 			// Case A: typical SBS — compromise to 0.5x1.0.
 			// Case B: use the mode's actual scale, stretch for 2D.

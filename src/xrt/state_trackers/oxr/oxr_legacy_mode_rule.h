@@ -264,9 +264,11 @@ oxr_legacy_pick_mode_index(const struct xrt_rendering_mode *modes, uint32_t mode
  * the side-by-side compromise the V key's 3D mode wants. So a flat start sizes
  * for mode 1, the 3D mode V toggles into — itself floored for a two-view
  * submission when the runtime may move the display (a 4-view kind floors back
- * to 2D, so Case B 1.0x1.0 stands there), and taken as it is in service mode,
- * where the panel lease may move the panel to it. A device that PINS its mode
- * cannot be toggled out of 2D at all, so a pinned flat start keeps sizing for 2D.
+ * to 2D, so Case B 1.0x1.0 stands there) - in service mode too, where the
+ * runtime's keys refuse a mode the client cannot fill (ADR-065 F4/F8), so a
+ * legacy app is never sized for a mode it will not get. A device that PINS its
+ * mode cannot be toggled out of 2D at all, so a pinned flat start keeps sizing
+ * for 2D.
  *
  * Before ADR-065 the active mode at instance creation was a 3D mode on every
  * default configuration, so this returns exactly what the old code used there.
@@ -291,10 +293,48 @@ oxr_legacy_compromise_mode_index(const struct xrt_rendering_mode *modes,
 	if (m->view_count != 1 || m->hardware_display_3d) {
 		return legacy_index; // already a 3D mode: size for it
 	}
-	if (service_mode) {
-		return 1;
-	}
+	(void)service_mode; // floored the same way: see above
 	return oxr_legacy_pick_mode_index(modes, mode_count, 1);
+}
+
+//! The whole legacy decision, taken once (ADR-065 F8): see @ref oxr_legacy_decide.
+struct oxr_legacy_mode_decision
+{
+	uint32_t run_index;  //!< the mode the session runs in (after the #1510 floor)
+	uint32_t size_index; //!< the mode its compromise scale is computed from
+	bool forced;         //!< run_index != the active index: the floor moves the display
+	bool unfillable;     //!< run_index or size_index is a mode two views cannot fill
+};
+
+/*!
+ * One decision for a legacy session: the mode it runs in, the mode it is
+ * SIZED for, and whether either of them is unfillable - so the
+ * xrCreateSession "UNFILLABLE" WARN and the compromise scale can never
+ * disagree (before ADR-065 F8 the size came from one index and the WARN from
+ * another).
+ */
+static inline struct oxr_legacy_mode_decision
+oxr_legacy_decide(const struct xrt_rendering_mode *modes,
+                  uint32_t mode_count,
+                  uint32_t active_index,
+                  bool mode_pinned,
+                  bool service_mode)
+{
+	struct oxr_legacy_mode_decision d;
+	d.run_index = active_index;
+	if (oxr_legacy_may_demote(mode_pinned, service_mode)) {
+		d.run_index = oxr_legacy_pick_mode_index(modes, mode_count, active_index);
+	}
+	d.forced = d.run_index != active_index;
+	d.size_index = oxr_legacy_compromise_mode_index(modes, mode_count, d.run_index, mode_pinned, service_mode);
+	d.unfillable = false;
+	if (modes != NULL && d.run_index < mode_count) {
+		d.unfillable = !oxr_legacy_mode_is_fillable(&modes[d.run_index]);
+	}
+	if (modes != NULL && d.size_index < mode_count) {
+		d.unfillable = d.unfillable || !oxr_legacy_mode_is_fillable(&modes[d.size_index]);
+	}
+	return d;
 }
 
 /*!
