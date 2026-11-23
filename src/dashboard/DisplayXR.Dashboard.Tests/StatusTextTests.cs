@@ -74,16 +74,52 @@ public class StatusTextTests
         Assert.Contains("size unknown", StatusText.Identity(Design.Screens[1]));
     }
 
+    [Theory]
+    [InlineData("VERIFIED", "Confirmed", Level.Ok)]
+    [InlineData("EDID", "Recognised by model", Level.Info)]
+    [InlineData("FALLBACK", "Generic driver", Level.Warn)]
+    [InlineData("SOMETHING_NEW", "Recognised", Level.Plain)]
+    public void PlainBadge_SaysHowSureDisplayXRIs(string confidence, string text, Level level)
+    {
+        var a = Design.Screens[0];
+        Assert.Equal((text, level), StatusText.PlainBadge(a with { Claim = a.Claim with { Confidence = confidence } }));
+        Assert.Equal(("Not a 3D display", Level.Plain), StatusText.PlainBadge(a with { Claim = a.Claim with { PluginId = null } }));
+    }
+
+    [Fact]
+    public void PlainCardLines_HaveNoTechnicalWords()
+    {
+        var a = Design.Screens[0];
+        Assert.Equal(new[] { "Main display", "Default for 3D apps", "Main 3D display" }, StatusText.PlainChips(a));
+        Assert.Equal("3840×2160 at 60 Hz · 344×194 mm · scaling 250%", StatusText.PlainIdentity(a));
+        Assert.Equal("Recognised as a 3D display · display driver: Leia SR", StatusText.PlainClaimLine(a, _ => "Leia SR"));
+        Assert.Equal("Recognised as a 3D display · display driver: leia-sr", StatusText.PlainClaimLine(a));
+        Assert.StartsWith("Not recognised as a 3D display", StatusText.PlainClaimLine(a with { Claim = a.Claim with { PluginId = null } }));
+        Assert.Equal("Sees you · 3D on · used by 1 app", StatusText.PlainStateLine(a));
+        Assert.Equal("Doesn't see you right now", StatusText.PlainTracking("NOT_TRACKING"));
+        Assert.Null(StatusText.PlainTracking("NO_DP"));
+        Assert.Equal("Display maker's software: ready · calibrated", StatusText.PlainVendorLine(a));
+        Assert.Equal("2 displays · 2 recognised as 3D · 2 see you", StatusText.DisplaysSummary(Design));
+        foreach (var line in new[] { StatusText.PlainIdentity(a), StatusText.PlainClaimLine(a), StatusText.PlainStateLine(a) })
+        {
+            Assert.DoesNotContain("DISPLAY1", line);
+            Assert.DoesNotContain("VERIFIED", line);
+            Assert.DoesNotContain("DP", line);
+        }
+        // The technical lines are still what Copy writes.
+        Assert.Contains(StatusText.ClaimLine(a), StatusText.Copy(Design));
+    }
+
     [Fact]
     public void HomeLine_OnlyWithSeveralScreensOrAWarning()
     {
-        Assert.Equal("2 screens · 2 tracking · 1 warning", StatusText.HomeLine(Design));
+        Assert.Equal("2 3D displays · 2 see you · 1 thing to check", StatusText.HomeLine(Design));
         var one = Design with { Screens = new[] { Design.Screens[0] } };
         Assert.Null(StatusText.HomeLine(one));
         var oneInfo = Design with { Screens = new[] { WithWarnings(Design.Screens[0], new StatusWarning("CLAIM_EDID_ONLY", WarningLevel.Info, "")) } };
         Assert.Null(StatusText.HomeLine(oneInfo)); // info alone shows nothing new
         var oneWarn = Design with { Screens = new[] { Design.Screens[1] } };
-        Assert.Equal("1 screen · 1 tracking · 1 warning", StatusText.HomeLine(oneWarn));
+        Assert.Equal("1 3D display · 1 sees you · 1 thing to check", StatusText.HomeLine(oneWarn));
     }
 
     [Fact]
@@ -154,14 +190,14 @@ public class StatusTextTests
         };
         var keyed = Design.Screens[1] with { Key = "k1" };
         var auto = StatusText.DpSelector(keyed, new DpList(null, plugins, System.Array.Empty<DpScreen>()))!.Value;
-        Assert.Equal(new[] { "Auto (leia-sr)", "DisplayXR Leia SR (leia-sr)", "sim-display" }, auto.Items.Select(i => i.Label));
+        Assert.Equal(new[] { "Automatic (leia-sr)", "DisplayXR Leia SR (leia-sr)", "sim-display" }, auto.Items.Select(i => i.Label));
         Assert.Equal(0, auto.Selected);
 
         var dp = new DpList(null, plugins, new[] { new DpScreen("k1", "", "", "sim-display", "sim-display", "user", true, "live") });
         var forced = StatusText.DpSelector(keyed, dp)!.Value;
         Assert.Equal(2, forced.Selected);
-        Assert.Equal("forced (user)", StatusText.ForcedChip(keyed, dp));
-        Assert.Equal("applies live", StatusText.ApplyLabel(keyed, dp));
+        Assert.Equal("Chosen by you", StatusText.ForcedChip(keyed, dp));
+        Assert.Equal("applies now", StatusText.ApplyLabel(keyed, dp));
         Assert.Equal(new[] { "dp", "use", "sim-display", "--screen", "k1" }, StatusText.DpVerb("k1", forced.Items[2]).Args);
         Assert.Equal(new[] { "dp", "reset", "--screen", "k1" }, StatusText.DpVerb("k1", forced.Items[0]).Args);
         // A key with a space is ONE argument; only the readable form quotes it.
@@ -170,8 +206,8 @@ public class StatusTextTests
 
         var unknown = new DpList(null, plugins, new[] { new DpScreen("k1", "", "", "x", "gone-plugin", "machine", true, "next-session") });
         var u = StatusText.DpSelector(keyed, unknown)!.Value;
-        Assert.Equal("gone-plugin (not registered)", u.Items[u.Selected].Label);
-        Assert.StartsWith("applies to new sessions", StatusText.ApplyLabel(keyed, unknown));
+        Assert.Equal("gone-plugin (not installed)", u.Items[u.Selected].Label);
+        Assert.Equal("applies when 3D apps next start", StatusText.ApplyLabel(keyed, unknown));
         Assert.Null(StatusText.ForcedChip(Design.Screens[0], null));
     }
 
@@ -237,20 +273,20 @@ public class StatusTextTests
             new DpScreen("k1", "", "", "vendor2", null, null, false, "live",
                          new[] { new DpCandidate("vendor2", 80), new DpCandidate("sim-display", 10) }),
         });
-        Assert.Equal(new[] { "Auto (leia-sr)", "DisplayXR Leia SR (leia-sr)", "sim-display" },
+        Assert.Equal(new[] { "Automatic (leia-sr)", "DisplayXR Leia SR (leia-sr)", "sim-display" },
                      StatusText.DpSelector(leiaPanel, dp)!.Value.Items.Select(i => i.Label));
-        Assert.Equal(new[] { "Auto (vendor2)", "Vendor Two (vendor2)", "sim-display" },
+        Assert.Equal(new[] { "Automatic (vendor2)", "Vendor Two (vendor2)", "sim-display" },
                      StatusText.DpSelector(v2Panel, dp)!.Value.Items.Select(i => i.Label));
 
         // A preference for a registered plug-in that does not claim the screen
         // stays visible (selected) and says why it is not honoured.
         var stale = dp with { Screens = new[] { dp.Screens![0] with { PreferredPlugin = "vendor2", PreferredSource = "user" } } };
         var sel = StatusText.DpSelector(leiaPanel, stale)!.Value;
-        Assert.Equal("vendor2 (no claim on this screen)", sel.Items[sel.Selected].Label);
+        Assert.Equal("vendor2 (does not drive this display)", sel.Items[sel.Selected].Label);
 
         // Fallback: no candidates listed (older CLI) -> every registered plug-in.
         var older = new DpList(null, plugins, new[] { new DpScreen("k0", "", "", "leia-sr", null, null, false, "live") });
-        Assert.Equal(new[] { "Auto (leia-sr)", "DisplayXR Leia SR (leia-sr)", "Vendor Two (vendor2)", "sim-display" },
+        Assert.Equal(new[] { "Automatic (leia-sr)", "DisplayXR Leia SR (leia-sr)", "Vendor Two (vendor2)", "sim-display" },
                      StatusText.DpSelector(leiaPanel, older)!.Value.Items.Select(i => i.Label));
         Assert.Equal(new[] { "leia-sr", "vendor2", "sim-display" }, StatusText.DpOptionIds(null, older));
     }
@@ -263,8 +299,8 @@ public class StatusTextTests
         Assert.Null(StatusText.MachineOverrideNotice(new DpList(null, plugins)));         // unset: nothing at all
         Assert.Null(StatusText.MachineOverrideNotice(new DpList("", plugins)));
         var n = StatusText.MachineOverrideNotice(new DpList("sim-display", plugins))!.Value;
-        Assert.Equal("A machine-wide display-processor override is set: sim-display (applies to every screen).", n.Title);
-        Assert.StartsWith("Choose per screen on Displays.", n.Text);
+        Assert.Equal("One display driver is set for every display on this PC: sim-display.", n.Title);
+        Assert.StartsWith("You can choose a driver for each display on Displays.", n.Text);
         Assert.True(DpList.TryParse(TestData.Text("dp-list.json"), out var real));
         Assert.Null(StatusText.MachineOverrideNotice(real));
     }
@@ -284,7 +320,7 @@ public class StatusTextTests
         var rows = StatusText.HomeScreenDps(snap, dp);
         Assert.Equal(StatusText.ScreenName(b), rows[1].Name);
         Assert.Equal("sim-display", rows[1].Plugin);
-        Assert.Equal("forced (user)", rows[1].Forced);
+        Assert.Equal("Chosen by you", rows[1].Forced);
         Assert.Equal(a.Claim.PluginId, rows[0].Plugin);
     }
 

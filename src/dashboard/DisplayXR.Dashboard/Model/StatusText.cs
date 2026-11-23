@@ -90,6 +90,106 @@ public static class StatusText
         };
     }
 
+    // ── Plain words for a display card (the technical lines above stay for Copy and tooltips) ──
+
+    /// <summary>The role chips in plain words (<see cref="Chips"/> keeps the technical ones for Copy).</summary>
+    public static IEnumerable<string> PlainChips(Screen s)
+    {
+        if (s.Roles.OsMain) yield return "Main display";
+        if (s.Roles.RuntimeDefault) yield return "Default for 3D apps";
+        if (s.Roles.VendorPrimary) yield return "Main 3D display";
+    }
+
+    /// <summary>The badge in plain words: is this a 3D display, and how sure is DisplayXR.</summary>
+    public static (string Text, Level Level) PlainBadge(Screen s)
+    {
+        if (!s.Claim.IsClaimed) return ("Not a 3D display", Level.Plain);
+        return s.Claim.Confidence switch
+        {
+            "VERIFIED" => ("Confirmed", Level.Ok),
+            "EDID" => ("Recognised by model", Level.Info),
+            "FALLBACK" => ("Generic driver", Level.Warn),
+            _ => ("Recognised", Level.Plain),
+        };
+    }
+
+    /// <summary><c>3840×2160 at 60 Hz · 344×194 mm · scaling 250%</c>: the identity line without device names or positions.</summary>
+    public static string PlainIdentity(Screen s)
+    {
+        var parts = new List<string>();
+        var d = s.Desktop.Rect;
+        string hz = Hz(s.Native.RefreshMhz);
+        if (d.IsEmpty) parts.Add("not part of the desktop");
+        else parts.Add(hz.Length > 0 ? $"{d.Width}{Times}{d.Height} at {hz}" : $"{d.Width}{Times}{d.Height}");
+        if (s.PhysicalMm.Width > 0 && s.PhysicalMm.Height > 0)
+            parts.Add($"{N(s.PhysicalMm.Width, "0")}{Times}{N(s.PhysicalMm.Height, "0")} mm");
+        if (s.Desktop.Scale > 0 && Math.Abs(s.Desktop.Scale - 1) > 0.001)
+            parts.Add($"scaling {N(s.Desktop.Scale * 100, "0")}%");
+        return string.Join(Sep, parts);
+    }
+
+    /// <summary>
+    /// <c>Recognised as a 3D display · display driver: Leia SR</c>. <paramref name="nameOf"/> maps a driver id to
+    /// its own name (the snapshot's plug-in list); the id is used when it has none.
+    /// </summary>
+    public static string PlainClaimLine(Screen s, Func<string, string?>? nameOf = null)
+    {
+        if (!s.Claim.IsClaimed) return "Not recognised as a 3D display. No display driver shows 3D on it.";
+        string id = s.Claim.PluginId!;
+        string name = nameOf?.Invoke(id) is { Length: > 0 } n ? n : id;
+        string line = $"Recognised as a 3D display{Sep}display driver: {name}";
+        if (s.Claim.Forced == true) line += $"{Sep}{ChosenWord(s.Claim.PreferredSource)}";
+        return line;
+    }
+
+    /// <summary>A forced driver choice in plain words, by where the choice is stored.</summary>
+    public static string ChosenWord(string? source) => source switch
+    {
+        "user" => "chosen by you",
+        "machine" => "chosen for everyone on this PC",
+        _ => "chosen by hand",
+    };
+
+    /// <summary>The tracking state in plain words; null when there is nothing to say (no driver, not reported).</summary>
+    public static string? PlainTracking(string state) => state switch
+    {
+        "TRACKING" => "Sees you",
+        "NOT_TRACKING" => "Doesn't see you right now",
+        _ => null,
+    };
+
+    /// <summary>Whether 3D is on, from the display maker's lens state, else from the mode; null when neither says.</summary>
+    public static bool? Is3DOn(Screen s) =>
+        s.Vendor.Present && s.Vendor.Lens is "3D" ? true
+        : s.Vendor.Present && s.Vendor.Lens is "2D" ? false
+        : s.Mode?.Is3D;
+
+    /// <summary><c>Sees you · 3D on · used by 1 app</c>: the state line in plain words (<see cref="StateLine"/> is the technical one).</summary>
+    public static string PlainStateLine(Screen s)
+    {
+        var parts = new List<string>();
+        if (PlainTracking(s.EyeTracking.State) is { } t) parts.Add(t);
+        if (Is3DOn(s) is { } on) parts.Add(on ? "3D on" : "3D off");
+        if (s.Dps.Count > 0) parts.Add($"used by {Plural(s.Dps.Count, "app", "apps")}");
+        return parts.Count > 0 ? string.Join(Sep, parts) : "No live state yet";
+    }
+
+    /// <summary>The display maker's own status in plain words, or null when its software reports none.</summary>
+    public static string? PlainVendorLine(Screen s)
+    {
+        var v = s.Vendor;
+        if (!v.Present) return null;
+        return "Display maker's software: " + string.Join(Sep, new[]
+        {
+            v.Ready ? "ready" : "not ready",
+            v.Calibrated ? "calibrated" : "not calibrated",
+        });
+    }
+
+    /// <summary><c>2 displays · 2 recognised as 3D displays · 2 see you</c>: the Displays caption.</summary>
+    public static string DisplaysSummary(StatusSnapshot s) =>
+        $"{Plural(s.Screens.Count, "display", "displays")}{Sep}{Claimed(s)} recognised as 3D{Sep}{Tracking(s)} {(Tracking(s) == 1 ? "sees" : "see")} you";
+
     public static string Scale(double scale) => $"{Times}{N(scale <= 0 ? 1 : scale)}";
 
     public static string Hz(long refreshMhz) => refreshMhz > 0 ? $"{N(refreshMhz / 1000.0, "0.##")} Hz" : "";
@@ -184,7 +284,7 @@ public static class StatusText
         var ds = dp.Screen(s.Key);
         string? effective = ds?.EffectivePlugin ?? s.Claim.PluginId;
         string? preferred = ds is not null ? ds.PreferredPlugin : s.Claim.PreferredPlugin;
-        var items = new List<DpChoice> { new(null, $"Auto ({effective ?? "none"})") };
+        var items = new List<DpChoice> { new(null, $"Automatic ({effective ?? "none"})") };
         foreach (var id in DpOptionIds(ds, dp))
         {
             var row = dp.Plugins.FirstOrDefault(p => string.Equals(p.Id, id, StringComparison.OrdinalIgnoreCase));
@@ -197,7 +297,7 @@ public static class StatusText
             if (selected < 0)
             {
                 bool registered = dp.Plugins.Any(p => string.Equals(p.Id, preferred, StringComparison.OrdinalIgnoreCase));
-                items.Add(new DpChoice(preferred, $"{preferred} ({(registered ? "no claim on this screen" : "not registered")})"));
+                items.Add(new DpChoice(preferred, $"{preferred} ({(registered ? "does not drive this display" : "not installed")})"));
                 selected = items.Count - 1;
             }
         }
@@ -218,8 +318,8 @@ public static class StatusText
     /// PreferredPlugin is set (<c>dp list --json</c> <c>preferred</c>); null otherwise.
     /// </summary>
     public static (string Title, string Text)? MachineOverrideNotice(DpList? dp) => dp?.Preferred is { Length: > 0 } id
-        ? ($"A machine-wide display-processor override is set: {id} (applies to every screen).",
-           "Choose per screen on Displays. Clearing it needs administrator rights.")
+        ? ($"One display driver is set for every display on this PC: {id}.",
+           "You can choose a driver for each display on Displays. Clearing this setting needs administrator permission.")
         : null;
 
     public sealed record HomeScreenDp(string Name, string? Plugin, string? Forced);
@@ -245,13 +345,13 @@ public static class StatusText
         bool forced = ds?.Forced ?? s.Claim.Forced ?? false;
         if (!forced) return null;
         string? src = ds?.PreferredSource ?? s.Claim.PreferredSource;
-        return src is { Length: > 0 } && src != "none" ? $"forced ({src})" : "forced";
+        return src is { Length: > 0 } && src != "none" ? char.ToUpperInvariant(ChosenWord(src)[0]) + ChosenWord(src)[1..] : "Chosen by hand";
     }
 
     public static string? ApplyLabel(Screen s, DpList? dp) => (dp?.Screen(s.Key)?.Apply ?? s.Claim.Apply) switch
     {
-        "live" => "applies live",
-        "next-session" or "next_session" => "applies to new sessions (service restart / app relaunch)",
+        "live" => "applies now",
+        "next-session" or "next_session" => "applies when 3D apps next start",
         null => null,
         var other => other,
     };
@@ -281,7 +381,7 @@ public static class StatusText
         int claimed = Claimed(s);
         int warnings = ActionableWarnings(s).Count();
         if (claimed <= 1 && warnings == 0) return null;
-        return $"{Plural(claimed, "screen", "screens")}{Sep}{Tracking(s)} tracking{Sep}{Plural(warnings, "warning", "warnings")}";
+        return $"{Plural(claimed, "3D display", "3D displays")}{Sep}{Tracking(s)} {(Tracking(s) == 1 ? "sees" : "see")} you{Sep}{Plural(warnings, "thing", "things")} to check";
     }
 
     /// <summary>The Displays nav badge: warn / critical only (design §8 feed discipline).</summary>
@@ -324,6 +424,10 @@ public static class StatusText
             sb.Append($"({w.Level.ToString().ToLowerInvariant()}) {WarningLine(w)}\n");
         return sb.ToString();
     }
+
+    /// <summary>The connection pill in plain words; <see cref="SourceLine"/> is the technical one (tooltip, Copy).</summary>
+    public static string PlainSourceLine(StatusSnapshot s) =>
+        s.IsService ? "DisplayXR is running" : "Not running in the background";
 
     public static string SourceLine(StatusSnapshot s) =>
         s.IsService ? $"source: service{Sep}gen {s.Generation.Topology}/{s.Generation.Status}" : $"source: {s.Source}";

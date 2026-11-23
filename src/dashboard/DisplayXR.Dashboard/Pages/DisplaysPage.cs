@@ -37,7 +37,7 @@ public sealed class DisplaysPage : Page
         get
         {
             var s = Ctx.Feed.Snapshot;
-            return s is null ? "Waiting for the first status snapshot…" : StatusText.DisplaysHeader(s);
+            return s is null ? "Looking for your displays…" : StatusText.DisplaysSummary(s);
         }
     }
 
@@ -90,20 +90,20 @@ public sealed class DisplaysPage : Page
         var page = U.VStack(16);
         if (s is null)
         {
-            page.Children.Add(U.Card(U.VStack(8, U.Text("Reading the display status", "group"),
-                U.Wrapped("The first snapshot arrives within a second from the service, or after about ten seconds when the dashboard has to build it without one.", "desc"))));
+            page.Children.Add(U.Card(U.VStack(8, U.Text("Looking for your displays", "group"),
+                U.Wrapped("This takes about a second when DisplayXR runs in the background, or about ten seconds when it does not.", "desc"))));
             return page;
         }
         if (s.Screens.Count == 0)
         {
-            page.Children.Add(U.Card(U.VStack(8, U.Text("No monitors reported", "group"),
-                U.Wrapped("The runtime's screen registry is empty. Check that a display is connected and awake; on a remote-desktop session the physical monitors are not visible.", "desc"))));
+            page.Children.Add(U.Card(U.VStack(8, U.Text("No displays found", "group"),
+                U.Wrapped("DisplayXR found no display. Check that your display is connected and awake. In a remote-desktop session the displays of the PC itself are not visible.", "desc"))));
         }
         foreach (var screen in s.Screens) page.Children.Add(ScreenCard(s, screen));
 
         U.Detach(_map);
         var mapCard = U.VStack(12,
-            U.CardTitle("Desktop", "Monitors to scale. Outlines are client windows; the tinted monitor owns a window; a dashed line is a seam where a window crosses screens."),
+            U.CardTitle("Desktop", "Your displays to scale. Outlines are the windows of 3D apps; the tinted display holds a window; a dashed line is where a window crosses from one display to another."),
             _map);
         var spacer = new Border { Height = 4 };
         page.Children.Add(spacer);
@@ -119,7 +119,7 @@ public sealed class DisplaysPage : Page
     {
         if (s.Key is not null && Ctx.Dp is null && Ctx.DpLoading)
         {
-            var wait = U.Text("Display processor: reading the registered plug-ins…", "meta");
+            var wait = U.Text("Display driver: reading the installed drivers…", "meta");
             wait.Margin = new Thickness(0, 6, 0, 0);
             return wait;
         }
@@ -139,7 +139,7 @@ public sealed class DisplaysPage : Page
             VerticalAlignment = VerticalAlignment.Center,
         };
         combo.Classes.Add("field");
-        Avalonia.Automation.AutomationProperties.SetName(combo, $"Display processor for {StatusText.ScreenName(s)}");
+        Avalonia.Automation.AutomationProperties.SetName(combo, $"Display driver for {StatusText.ScreenName(s)}");
         combo.DropDownOpened += (_, _) => _openDropDowns++;
         combo.DropDownClosed += (_, _) =>
         {
@@ -154,7 +154,7 @@ public sealed class DisplaysPage : Page
             _pending = (key, i, Ctx.Dp);
             _ = Ctx.RunActionsAsync("screen-dp", StatusText.DpVerb(key, sel.Items[i]));
         };
-        var label = U.Text("Display processor", "label");
+        var label = U.Text("Display driver", "label");
         label.VerticalAlignment = VerticalAlignment.Center;
         var row = U.Flow(12, 4, label, combo);
         if (applying)
@@ -187,11 +187,13 @@ public sealed class DisplaysPage : Page
         var name = U.Wrapped(StatusText.ScreenName(s), "group");
         name.FontSize = 17;
         var title = U.Flow(10, 4, name);
-        foreach (var chip in StatusText.Chips(s))
-            U.AddFlow(title, U.Chip(chip, chip == "vendor primary" ? Level.Info : Level.Plain), 6, 4);
+        foreach (var chip in StatusText.PlainChips(s))
+            U.AddFlow(title, U.Chip(chip, chip == "Main 3D display" ? Level.Info : Level.Plain), 6, 4);
 
-        var (badgeText, badgeLevel) = StatusText.Badge(s);
-        var badge = U.Badge(badgeText, badgeLevel, tick: badgeText == "VERIFIED");
+        // Plain words on the card; the technical line each one replaces is its tooltip and is in "Copy list".
+        var (badgeText, badgeLevel) = StatusText.PlainBadge(s);
+        var badge = U.Badge(badgeText, badgeLevel, tick: badgeLevel == Level.Ok);
+        ToolTip.SetTip(badge, StatusText.Badge(s).Text);
         badge.VerticalAlignment = VerticalAlignment.Top;
         badge.Margin = new Thickness(0, 2, 0, 0);
 
@@ -201,21 +203,27 @@ public sealed class DisplaysPage : Page
         head.Children.Add(badge);
 
         var body = U.VStack(5, head);
-        body.Children.Add(U.Wrapped(StatusText.Identity(s), "dev"));
-        var claim = U.Wrapped(StatusText.ClaimLine(s), "soft");
+        var identity = U.Wrapped(StatusText.PlainIdentity(s), "dim");
+        ToolTip.SetTip(identity, StatusText.Identity(s));
+        body.Children.Add(identity);
+        var claim = U.Wrapped(StatusText.PlainClaimLine(s, id => snap.Plugins.FirstOrDefault(p => p.Id == id)?.Name), "soft");
+        ToolTip.SetTip(claim, StatusText.ClaimLine(s));
         body.Children.Add(claim);
-        body.Children.Add(U.Wrapped(StatusText.StateLine(s), "dim"));
+        var state = U.Wrapped(StatusText.PlainStateLine(s), "soft");
+        ToolTip.SetTip(state, StatusText.StateLine(s));
+        body.Children.Add(state);
 
-        if (StatusText.VendorLine(s) is { } vendor)
+        if (StatusText.PlainVendorLine(s) is { } vendor)
         {
             var vendorRow = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto") };
             var vt = U.Wrapped(vendor, "dim");
+            ToolTip.SetTip(vt, StatusText.VendorLine(s));
             vt.VerticalAlignment = VerticalAlignment.Center;
             vendorRow.Children.Add(vt);
             if (s.Vendor.DashboardCommand is { Length: > 0 } cmd)
             {
                 string id = s.Id;
-                var open = U.Button("Open in vendor dashboard ↗", () =>
+                var open = U.Button("Open the display maker's app ↗", () =>
                 {
                     string line = VendorCommand.Expand(cmd, s.Vendor.Serial.Length > 0 ? s.Vendor.Serial : s.Claim.Serial, s.Id);
                     string? err = VendorCommand.Launch(line);
