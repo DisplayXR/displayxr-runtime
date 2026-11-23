@@ -253,6 +253,9 @@ software on the box that depends on it (#2702 already has this rule for the SR p
 fetched only when missing, never upgraded on its own). Either way the front ends show an
 unmet prerequisite before install, instead of after.
 
+> **Amended by Amendment 1 (2026-11-22)** below: a publisher may opt one of its own
+> prerequisites into in-place upgrades. Without that opt-in the rule above is unchanged.
+
 ### 7. Default converter
 
 The runtime installer and the bundle pull the **open conversion provider** by default. "Convert
@@ -359,6 +362,8 @@ Each step is one pull request unless noted. Steps 1–4 are Windows.
 | 7 | **`displayxr://activate` handler.** Scheme registration by the runtime installer, nonce start / consume RPCs on the service's DIAG channel, token delivery through the plug-in's activation slot | dxr-get.md or a new activation spec; ADR-051 (a Dashboard action that starts a browser flow); service-architecture.md |
 | 8 | **Dashboard catalog.** Browse, install, uninstall, update, tier and prerequisite display, Buy / Activate. Renders the CLI's JSON. Shipped as a Catalog tab, then merged into the Components tab: one list of installed and catalog items (`src/dashboard/README.md`) | ADR-051; `src/dashboard/README.md` |
 | 9 | **Catalog-driven bundle** (§8), in `displayxr-installer`, plus the runtime installer pulling the open conversion provider | versions-json-autobump.md (bundle membership stops being five pins read by name); `displayxr-installer` docs; ADR-042 / ADR-053 note on the default converter |
+| 10 | **Upgradable prerequisites** (Amendment 1). `upgradable`, `license_url`, `stop_runtime` and `cleared_sources` on an external entry; the upgrade rules in `plan` and `install`; the prerequisite's state and versions in `list --json`; the machine pin; the replaced version in the receipt; the Restart Manager stop and single restart; the front ends' pre-ticked and "update available" rows. Restore (Amendment 1 §7) is a second pull request | component-catalog.md § Requires; dxr-get.md (commands, exit codes, the pin); catalog-driven-bundle.md; `src/dashboard/README.md` |
+| 11 | **Compatibility table and installed-set check** (Amendment 2). `check [--json]` in `dxr-get` and `displayxr-cli catalog check`; the same rows in the Dashboard's Catalog tab; a generated compatibility table published beside the catalog and rendered by the website; a release job that re-evaluates every listed item against the new runtime and reports the ones it leaves without a compatible version | dxr-get.md (the verb, its JSON, exit codes); component-catalog.md (the published table); versions-json-autobump.md and downstream-pin-bump.md (the release job sits beside the ABI gate); `src/dashboard/README.md`; `displayxr-website` docs/org-sync.md |
 
 ## Decided in review (2026-11-20)
 
@@ -386,6 +391,168 @@ Left open for the project lead:
 4. **The `companion` kind** depends on the pose-consumer registration (ADR-054 N8), which
    is not designed yet. It is in the schema's class list; no companion can be installed
    before N8.
+
+## Amendment 1 (2026-11-22): a publisher may opt a prerequisite into upgrades
+
+Decided by the project lead on 2026-11-21 and 2026-11-22. The field names below are
+proposed and are settled in step 10.
+
+### Why
+
+§6 installs a prerequisite's asset only when the prerequisite is absent, and never upgrades
+one that is present. That rule protects software DisplayXR has no right to touch. It is
+wrong for one case that now exists: a vendor platform that
+
+- has no updater of its own, so machines in the field stay on the version they shipped with;
+- is published by the same publisher as the item that needs it, who permits anyone to
+  redistribute it and to install it unattended;
+- installs over an older copy of itself, and refuses to install over a newer one.
+
+An item that needs a newer platform than the machine has would otherwise never work there,
+and the user would have no path to fix it from DisplayXR.
+
+### The rule
+
+1. **Opt-in, per prerequisite, by its publisher.** An external entry with an `asset` may
+   carry `"upgradable": true`. By setting it the publisher states that it may be
+   redistributed and installed unattended, that its installer upgrades in place, and that
+   its installer refuses to downgrade. An entry without the key behaves exactly as §6 says:
+   installed when absent, never upgraded. Third-party prerequisites are therefore unchanged
+   unless their publisher opts in.
+
+2. **What an install does**, for an upgradable prerequisite. "Installed" is what `detect`
+   reads; "minimum" is the entry's `min_version`; "available" is the asset's `version`.
+
+   | Installed | Interactive install | Unattended install |
+   |---|---|---|
+   | absent | installed, as §6 | installed when the item is selected, as §6 |
+   | below the minimum | upgrade **pre-ticked**, with its size, and the user can untick it | upgraded only when the caller selected the item by id |
+   | at or above the minimum, below available | listed as "update available", **not** ticked | never |
+   | equal to or newer than available | not touched | not touched |
+   | cannot be read | not touched | not touched |
+
+   An unticked or skipped prerequisite does not block the item, as in §6. A plain silent
+   run of an installer (no selection) changes nothing, as today.
+
+3. **Never a downgrade.** The engine compares the three numeric parts of the version and
+   does not run the asset unless available is strictly greater than installed. Any fourth
+   field or build suffix is ignored, because it is not ordered the same way by every
+   publisher. This holds even if the prerequisite's own installer would allow it.
+
+4. **A floor, not a pin.** `min_version` stays a minimum. There is no exact version and no
+   maximum for a prerequisite: a machine may carry a newer one from another source, and
+   DisplayXR leaves it alone. A publisher's "tested with" version is the asset's `version`
+   and is shown as the recommended one.
+
+5. **A machine pin.** One machine-wide setting turns off every prerequisite install and
+   upgrade by the engine. It is for demonstration and customer units. With it set, an unmet
+   prerequisite is still reported.
+
+6. **Installs made by a device maker.** A prerequisite's own installer may record who
+   installed it (a device maker's software bundle, the publisher's public release, or
+   DisplayXR). When it does, the entry names the detect rule that reads it and the
+   publisher lists the sources it has cleared in `cleared_sources`. The engine offers an
+   upgrade over a device maker's install only when that source is cleared, and the front
+   end says, before the user commits, that the copy being replaced came with the device.
+   An install with no such record is treated as a device maker's.
+
+7. **The engine remembers and can restore.** The receipt records the version that was
+   replaced. When the catalog lists that earlier version as an asset of the same
+   prerequisite, a front end offers to restore it, and restoring sets the pin for that
+   prerequisite. If the prerequisite is later found below the version DisplayXR installed
+   (something else put an older copy back), the front end says so once and offers the
+   upgrade again; it does not repeat the upgrade on its own.
+
+8. **Files in use.** An asset may carry `"stop_runtime": true`. Before running it the
+   engine stops the DisplayXR service and its conversion and tracking hosts through Windows
+   Restart Manager, and starts the service again once at the end of the run. Other running
+   OpenXR applications that hold the prerequisite's files are named to the user, who closes
+   them; an unattended run stops with a distinct exit code instead. The engine does not
+   close applications it did not start.
+
+9. **Licence.** An entry that is upgradable or carries an asset has a `license_url`, shown
+   in the plan before the user commits, because an unattended install accepts those terms
+   on the user's behalf. The registry does not list such an entry until its publisher's
+   redistribution terms are final.
+
+10. **What a client reports.** `list --json` and `plan --json` give each external
+    prerequisite a state (`met`, `unmet`, `outdated`), the installed, minimum and available
+    versions, and `info_url`. A provider's licence `message` (§5) may point the user at the
+    same prerequisite; at run time the provider's own answer is the authoritative one,
+    since only it knows whether the prerequisite does what it needs.
+
+### What does not change
+
+- Nothing is installed or upgraded outside an installer or a catalog command that a person
+  ran. There is still no background traffic and no scheduled updater (#2702).
+- The detect kinds. A version is read with the existing `registry_sz_min` rule from the
+  value the prerequisite's installer writes.
+- The runtime, which never names a prerequisite. All of this is in the engine and the
+  front ends.
+- Signed-only (§4): the asset is signed by a signer delegated to the same publisher.
+- Platforms: Windows. A prerequisite package on Linux follows the POSIX engine (step 5) and
+  the same signing rule.
+
+### What it supersedes
+
+§6's "never to upgrade one that is present", and #2702's "the SR platform is fetched only
+when missing, never upgraded on its own", for prerequisites whose publisher sets
+`upgradable`. Both stand for every other prerequisite.
+
+## Amendment 2 (2026-11-22): a compatibility table, and a check of what is installed
+
+Decided by the project lead on 2026-11-22. Implementation is step 11.
+
+### What already answers "is this compatible"
+
+The signed catalog is the compatibility record: each item states the runtime range it works
+with, the ABI major of its class, and what it requires (the runtime, other items, external
+prerequisites). `dxr-get` enforces it at install, and the runtime installer's component page
+asks the engine about the runtime it is about to install, so an upgrade offers matching
+versions (§8). The loader enforces the class ABI again when it loads a component.
+
+### What is missing
+
+1. **Nobody can read it.** The record is in a signed JSON document. No page says
+   "component X works with runtime A to B".
+2. **Nothing checks a machine as a whole.** Compatibility is evaluated when an item is
+   installed. After a runtime upgrade from another source, a prerequisite change, or a
+   delisting, the user finds out when a component fails to load.
+3. **A release can strand an item silently.** When a runtime release moves outside an
+   item's range, nothing tells its publisher. Items pinned to one exact runtime are the
+   sharpest case.
+
+### Decision
+
+1. **A check verb.** `dxr-get check` (and `displayxr-cli catalog check`, and the Dashboard)
+   evaluates every installed item (the receipts, and the per-class registrations of
+   components the catalog knows) against the installed runtime, the class ABI majors it
+   recorded, the item's `requires`, and the state of each external prerequisite. One row
+   per item: compatible, update available, incompatible with the reason, or not in the
+   catalog. It changes nothing, needs no elevation, and works from the cached catalog when
+   the machine is offline, saying how old that copy is. `--json` carries the same rows.
+   A component that is installed but not listed is reported as such and is never called
+   incompatible: the catalog has no record to judge it by.
+
+2. **A published table, generated.** The job that compiles the catalog also writes a
+   compatibility table: per item and version, the runtime range, the class ABI and the
+   prerequisites with their minimum versions. It is derived from the same inputs as the
+   signed document and is never typed by hand. The website renders it on the item pages
+   and as one table. A publisher's own page that lists pairings for its prerequisite is
+   linked through that prerequisite's `info_url` (Amendment 1).
+
+3. **A release-time evaluation.** When a runtime release is tagged, a job evaluates every
+   listed item against it. An item the release leaves with no compatible version is
+   reported: an issue on the item's repository for first-party items, and an entry in the
+   registry's report for the others. It sits beside the ABI gate and the downstream pin
+   job and, like them, never blocks the release. The catalog then shows the item as not
+   available on that runtime, which is already the engine's behaviour.
+
+### What does not change
+
+- The rules themselves: ranges, ABI majors and `requires` are as §3 defines them.
+- Nothing is repaired automatically. The check reports; the user installs or updates.
+- No background check and no scheduled run (#2702).
 
 ## Alternatives rejected
 

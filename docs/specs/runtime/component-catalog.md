@@ -340,6 +340,16 @@ An `external` entry has two supported forms:
   total is shown before the user commits. It is fetched and verified like any asset (below).
   Like every asset, it must be signed.
 
+  **Upgradable prerequisites (ADR-064 Amendment 1; decided, not implemented).** A publisher
+  may set `"upgradable": true` on such an entry. A client then also upgrades a present
+  prerequisite that is below `min_version` (pre-ticked on an interactive install, and on an
+  unattended one only when the item was selected by id), offers an upgrade it does not tick
+  when the prerequisite is at or above `min_version` and below the asset's `version`, and
+  never installs a version that is not strictly newer than the installed one. The entry
+  then also carries `license_url`, and may carry `stop_runtime` and `cleared_sources`. The
+  rules are in the ADR; this section gains the field table when step 10 lands. Until then
+  a client ignores these keys and applies the absent-only rule above.
+
 **Every asset is resumed and verified** (the schema-1 tool's rule, applied to every asset of
 a plan since ADR-064 step 2). One item can now mean several downloads: its own asset and the assets of
 its external prerequisites. For each one a client resumes an interrupted download with an
