@@ -373,13 +373,14 @@ public static class OptionViews
         return null;
     }
 
-    /// <summary>The value a Pin's switch writes, or null when turning it off means clearing it.</summary>
-    /// <remarks>Off clears this user's value; when the value in force comes from the machine, clearing would
-    /// change nothing, so off writes the driver's default for this user instead.</remarks>
-    public static string? PinWrite(OptionView v, bool on) =>
-        on ? v.Entry?.PinValue ?? "1"
-        : v.Setting.Source is SettingSource.Machine or SettingSource.Manifest ? v.Setting.Default
-        : null;
+    /// <summary>
+    /// The value a Pin's switch writes: on, the pin value; off, the driver's declared default, always, for
+    /// this user. Off never unsets: <c>dp options</c> reports only the winning layer, so clearing the
+    /// user's value could leave a machine-wide pin winning (the switch snaps back) or reveal another one.
+    /// "Use the default" is the action that unsets.
+    /// </summary>
+    public static string PinWrite(OptionView v, bool on) =>
+        on ? v.Entry?.PinValue ?? "1" : v.Setting.Default;
 }
 
 /// <summary>The CLI verbs of the Options block: argument vectors, never strings.</summary>

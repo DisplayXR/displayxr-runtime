@@ -166,10 +166,13 @@ public class DriverOptionsTests
         Assert.False(off.On);
         Assert.Equal("Off", off.ValueText);
 
-        // On writes 0; off clears this user's value, or writes the default over a machine-wide one.
+        // On writes 0; off always writes the driver's default (-1) for this user, never unsets: an unset
+        // could leave a machine-wide 0 winning or reveal a machine-wide 1. "Use the default" unsets.
         Assert.Equal("0", OptionViews.PinWrite(off, on: true));
-        Assert.Null(OptionViews.PinWrite(pinned, on: false));
+        Assert.Equal("-1", OptionViews.PinWrite(pinned, on: false));
         Assert.Equal("-1", OptionViews.PinWrite(OptionViews.View(s with { Value = "0", Source = SettingSource.Machine }, entry), on: false));
+        Assert.Equal("-1", OptionViews.PinWrite(OptionViews.View(s with { Value = "1", Source = SettingSource.Machine }, entry), on: false));
+        Assert.True(pinned.CanReset); // the unset is "Use the default"
     }
 
     [Fact]

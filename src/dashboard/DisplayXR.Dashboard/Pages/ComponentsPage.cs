@@ -796,7 +796,7 @@ public sealed class ComponentsPage : Page
                     bool now = sw.IsChecked == true;
                     if (now == v.On || Ctx.ActionRunning) return;
                     if (v.Control == OptionControl.Switch) Write(OptionCommands.Set(id, v.Key, now ? "1" : "0"));
-                    else Write(OptionViews.PinWrite(v, now) is { } value ? OptionCommands.Set(id, v.Key, value) : OptionCommands.Unset(id, v.Key));
+                    else Write(OptionCommands.Set(id, v.Key, OptionViews.PinWrite(v, now)));
                 };
                 U.AddFlow(line, sw, 10, 6);
                 // A pin holding another state (Always 2D stored as 1): that state, said as its own.

@@ -336,7 +336,7 @@ lines, the scope and command-line notes, the catalog detail and the removal sent
   |---|---|---|---|---|
   | simulated display (`sim-display`) | `OUTPUT` | 3D preview kind | drop-down | Red / cyan (anaglyph) `anaglyph`, Side by side `sbs`, Side by side, squeezed `squeezed` (also `squeezed_sbs`), Four views (2x2) `quad`, Interlaced `interlaced` (also `interlace`), Blend `blend`. `2d` / `passthrough` are not offered (Start in and Always 2D cover 2D); a stored one shows quoted, nothing selected. No top-and-bottom kind exists. |
   | simulated display | `START_3D` | Start in | two-way choice | 2D `0`, 3D preview `1` |
-  | simulated display | `FORCE_MODE` | Always 2D | switch | on writes `0`; off clears it (or writes the default `-1` over a value set for everyone on this PC); a stored `1` shows as its own state, *Always 3D preview*, with "Use the default" |
+  | simulated display | `FORCE_MODE` | Always 2D | switch | on writes `0`; off always writes the default `-1` for this user (never an unset: `dp options` shows only the winning layer, so an unset could leave a machine-wide value winning); "Use the default" unsets; a stored `1` shows as its own state, *Always 3D preview*, with "Use the default" |
   | any driver | `MULTI_VIEWER` | Several viewers | drop-down | Follow the display's own setting `system`, On `on`, Off `off` |
 
   The four-view kind carries "For checking four-view apps. Most apps show only two of the views, or
