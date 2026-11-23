@@ -8,6 +8,7 @@
  * @ingroup oxr_api
  */
 
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1529,8 +1530,8 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 	//
 	// This is THE enforcement point for the "workspace owns display mode" rule
 	// (#233). DO NOT enforce by filtering xrEnumerateDisplayRenderingModesDXR
-	// to count=1 — apps index local rendering-mode arrays by VENDOR-ASSIGNED
-	// `mode_index` (not array index). Filtering causes
+	// to count=1 — apps index local rendering-mode arrays by the reported
+	// `modeIndex` (== array position since ADR-065). Filtering causes
 	// `renderingModeViewCounts[active_idx]=0` reads and `XR_ERROR_POSE_INVALID`
 	// at xrEndFrame across cube/gauss/others. Apps need the full enumerator
 	// to interpret indices that arrive via XrEventDataRenderingModeChangedDXR.
@@ -1569,6 +1570,9 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE, "No head device available");
 	}
 
+	// modeIndex is an ARRAY POSITION (== the served mode_index, see the
+	// enumerate below and u_rendering_modes_trim, ADR-065): index the table
+	// with it directly. Under the two-mode contract it is 0 (2D) or 1 (3D).
 	if (modeIndex >= head->rendering_mode_count) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
 		                 "modeIndex %u >= rendering_mode_count %u",
@@ -1802,7 +1806,18 @@ oxr_xrEnumerateDisplayRenderingModesDXR(XrSession session,
 	}
 	uint32_t active_idx = (head->hmd != NULL) ? head->hmd->active_rendering_mode_index : 0;
 
+	/*
+	 * ONE notion of a mode index: the ARRAY POSITION in head->rendering_modes[].
+	 * xrRequestDisplayRenderingModeDXR indexes the array with the app's
+	 * modeIndex, active_rendering_mode_index is a position, and the events
+	 * carry positions. The runtime renumbers every table it serves so that
+	 * mode_index == position (u_rendering_modes_trim, ADR-065), so reporting
+	 * `i` here is the same number the vendor's mode_index carries - asserted.
+	 * (Before ADR-065 this reported mode_index and compared it against the
+	 * position for isActive, which only worked while the two agreed.)
+	 */
 	for (uint32_t i = 0; i < count; i++) {
+		assert(head->rendering_modes[i].mode_index == i);
 		// v14 (#441): apps opt into per-element chain processing by
 		// pre-setting type on input (standard OpenXR convention). The
 		// handshake matters: v13-and-earlier binaries leave type/next
@@ -1826,7 +1841,7 @@ oxr_xrEnumerateDisplayRenderingModesDXR(XrSession session,
 		if (!app_chained) {
 			modes[i].next = NULL; // v13 behavior for non-opted-in callers.
 		}
-		modes[i].modeIndex = head->rendering_modes[i].mode_index;
+		modes[i].modeIndex = i;
 		snprintf(modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE, "%s",
 		         head->rendering_modes[i].mode_name);
 		modes[i].viewCount = head->rendering_modes[i].view_count;
@@ -1838,7 +1853,7 @@ oxr_xrEnumerateDisplayRenderingModesDXR(XrSession session,
 		modes[i].viewWidthPixels = head->rendering_modes[i].view_width_pixels;
 		modes[i].viewHeightPixels = head->rendering_modes[i].view_height_pixels;
 		// v13 fields.
-		modes[i].isActive = (head->rendering_modes[i].mode_index == active_idx) ? XR_TRUE : XR_FALSE;
+		modes[i].isActive = (i == active_idx) ? XR_TRUE : XR_FALSE;
 		modes[i].isRequestable = session_is_requestable;
 	}
 

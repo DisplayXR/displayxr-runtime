@@ -446,7 +446,12 @@ oxr_system_fill_in(
 			sys->legacy_rendering_mode_forced = (legacy_idx != active_idx);
 			sys->legacy_mode_unfillable = !oxr_legacy_mode_is_fillable(&head->rendering_modes[legacy_idx]);
 
-			struct xrt_rendering_mode *mode3d = &head->rendering_modes[legacy_idx];
+			// ADR-065: from a flat start (sim-display's default), size for
+			// the 3D mode V toggles into, not for the 1-view mode.
+			const uint32_t scale_idx =
+			    oxr_legacy_compromise_mode_index(head->rendering_modes, head->rendering_mode_count,
+			                                     legacy_idx, mode_pinned != 0, info->is_service_mode);
+			struct xrt_rendering_mode *mode3d = &head->rendering_modes[scale_idx];
 			// Case A: typical SBS — compromise to 0.5x1.0.
 			// Case B: use the mode's actual scale, stretch for 2D.
 			oxr_legacy_compromise_scale(mode3d, &view_scale_x, &view_scale_y);

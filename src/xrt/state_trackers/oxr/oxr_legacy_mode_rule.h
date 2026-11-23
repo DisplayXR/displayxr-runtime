@@ -63,7 +63,7 @@
  * two-view 3D mode, falling back to 2D) and moves the display there BEFORE the
  * app is sized, so the mode, the compromise scale, the compositor grid and the
  * DP all agree. That is the #1499 direction — mirroring the existing rule that
- * a legacy app gets the V toggle but never the 1/2/3 direct mode keys.
+ * a legacy app gets the V toggle but never the 0/1 direct mode keys.
  *
  * ### When the floor cannot be applied
  *
@@ -125,7 +125,7 @@ extern "C" {
  * is pinned rather than implied: with one mode there is nothing to compromise
  * BETWEEN, the compositor's recommended scale is already the only right answer,
  * and `legacy_app_tile_scaling` stays false (which also leaves the V toggle and
- * the 1/2/3 keys behaving normally).
+ * the 0/1 keys behaving normally).
  *
  * When this is true, `legacy_app_tile_scaling` is raised for BOTH compromise
  * cases — Case A and Case B alike. The flag means "the runtime, not the mode,
@@ -254,8 +254,53 @@ oxr_legacy_pick_mode_index(const struct xrt_rendering_mode *modes, uint32_t mode
 }
 
 /*!
+ * ADR-065: which mode a legacy app's compromise scale is computed FROM.
+ *
+ * The mode it will run in (@p legacy_index, what @ref oxr_legacy_pick_mode_index
+ * returned) — except when that is the flat mode of a multi-mode device. Under
+ * the two-mode contract a driver may START in 2D (sim-display does by default),
+ * and a legacy app sized for the 1-view mode would get 1.0x1.0 views and lose
+ * the side-by-side compromise the V key's 3D mode wants. So a flat start sizes
+ * for mode 1, the 3D mode V toggles into — itself floored for a two-view
+ * submission when the runtime may move the display (a 4-view kind floors back
+ * to 2D, so Case B 1.0x1.0 stands there), and taken as it is in service mode,
+ * where the panel lease may move the panel to it. A device that PINS its mode
+ * cannot be toggled out of 2D at all, so a pinned flat start keeps sizing for 2D.
+ *
+ * Before ADR-065 the active mode at instance creation was a 3D mode on every
+ * default configuration, so this returns exactly what the old code used there.
+ *
+ * @param modes         The device's rendering-mode table; may be NULL.
+ * @param mode_count    Entries in @p modes.
+ * @param legacy_index  The mode the legacy session will run in.
+ * @param mode_pinned   The device pins its mode.
+ * @param service_mode  The panel lease owns the display-global mode.
+ */
+static inline uint32_t
+oxr_legacy_compromise_mode_index(const struct xrt_rendering_mode *modes,
+                                 uint32_t mode_count,
+                                 uint32_t legacy_index,
+                                 bool mode_pinned,
+                                 bool service_mode)
+{
+	if (modes == NULL || legacy_index >= mode_count || mode_count < 2 || mode_pinned) {
+		return legacy_index;
+	}
+	const struct xrt_rendering_mode *m = &modes[legacy_index];
+	if (m->view_count != 1 || m->hardware_display_3d) {
+		return legacy_index; // already a 3D mode: size for it
+	}
+	if (service_mode) {
+		return 1;
+	}
+	return oxr_legacy_pick_mode_index(modes, mode_count, 1);
+}
+
+/*!
  * The compromise view scale a legacy app is sized with, for the mode it will
- * actually run in (i.e. the one @ref oxr_legacy_pick_mode_index returned).
+ * actually run in (i.e. the one @ref oxr_legacy_pick_mode_index returned), or,
+ * from a flat start, the 3D mode it will be toggled into
+ * (@ref oxr_legacy_compromise_mode_index).
  *
  * Case A — two views, both scales at most one half: the classic side-by-side
  * panel. The app is given 0.5x1.0, which fills the canvas on the mode's 2x1
