@@ -161,15 +161,16 @@ u_rendering_modes_key_target_allowed(const struct xrt_rendering_mode *modes,
 //! What a runtime mode key (ADR-065: V toggles, '0' / '1' select) does.
 enum u_rendering_mode_key_action
 {
-	//! Nothing: no key, or a selected index the table does not have.
+	//! Nothing: no key, a digit for a mode the table does not have, or a
+	//! digit for the mode already in effect.
 	U_RENDERING_MODE_KEY_NOTHING = 0,
 	//! Move the device to `target` (write the active index, pass it to the
 	//! driver as OUTPUT_MODE) and request the hardware state `want_3d`.
 	U_RENDERING_MODE_KEY_APPLY = 1,
 	//! The session cannot fill `target` (#1499): log it, change nothing.
 	U_RENDERING_MODE_KEY_REFUSED = 2,
-	//! No two-mode table to move within (no head, or fewer than two modes):
-	//! only request the hardware state `want_3d`.
+	//! V only, with no two-mode table to move within (no head, or fewer than
+	//! two modes): only request the hardware state `want_3d`.
 	U_RENDERING_MODE_KEY_HARDWARE_ONLY = 3,
 };
 
@@ -197,8 +198,15 @@ struct u_rendering_mode_key_decision
  * (Before this, a digit only set OUTPUT_MODE, so on such a driver it did
  * nothing.)
  *
+ * A digit acts only on a mode that exists and is not already the one in
+ * effect: with no table, a one-entry table, or the digit for @p active, it is
+ * NOTHING on every path (never a hardware-only request, never a queued
+ * transition to where the device already is). Only V keeps the hardware-only
+ * fallback for a device without a two-mode table.
+ *
  * @param modes, count    the head device's table (NULL / 0 when there is none).
- * @param active          the device's active index.
+ * @param active          the mode in effect: the device's active index, or the
+ *                        target of a transition already queued for it.
  * @param toggle          true for V; false for a digit.
  * @param selected        the digit's mode (0 or 1); ignored for V; < 0 = none.
  * @param qwerty_force_2d qwerty's own V flag, used only when there is no table.
@@ -218,13 +226,19 @@ u_rendering_modes_decide_key(const struct xrt_rendering_mode *modes,
 		return d;
 	}
 	if (modes == NULL || count < U_RENDERING_MODES_RUNTIME_COUNT) {
+		if (!toggle) {
+			return d; // a digit names a mode this device does not have
+		}
 		d.action = U_RENDERING_MODE_KEY_HARDWARE_ONLY;
-		d.want_3d = toggle ? !qwerty_force_2d : ((uint32_t)selected == U_RENDERING_MODE_3D);
+		d.want_3d = !qwerty_force_2d;
 		return d;
 	}
 	const uint32_t target = toggle ? u_rendering_modes_toggle_target(modes, count, active) : (uint32_t)selected;
 	if (target >= count || target >= XRT_MAX_RENDERING_MODES) {
 		return d;
+	}
+	if (!toggle && target == active) {
+		return d; // already there: no index write, no request, no transition
 	}
 	d.target = target;
 	if (!u_rendering_modes_key_target_allowed(modes, count, target, fill_views)) {

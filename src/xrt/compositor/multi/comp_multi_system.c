@@ -2936,9 +2936,21 @@ update_window_screen_rect(struct multi_compositor *mc)
  * switch at all (before, a digit only set OUTPUT_MODE). No fill limit on this
  * path (as for V here before). @p set_hw_flag: also record the hardware state
  * in mc->hardware_display_3d (the per-session render path).
+ *
+ * @p toggle_sets_output_mode: whether V also passes the index to the driver as
+ * OUTPUT_MODE. False on the shared transfer path: that runs under
+ * list_and_timing_lock (and render_lock), and xrt_device_set_property goes
+ * through the rendering-mode remap's own lock into arbitrary driver code, so
+ * V there keeps its previous behaviour (index write + hardware request, no
+ * OUTPUT_MODE). Digits set OUTPUT_MODE on both paths, as they did before.
  */
 static void
-multi_apply_mode_key(struct multi_compositor *mc, bool toggle, int selected, bool qwerty_force_2d, bool set_hw_flag)
+multi_apply_mode_key(struct multi_compositor *mc,
+                     bool toggle,
+                     int selected,
+                     bool qwerty_force_2d,
+                     bool set_hw_flag,
+                     bool toggle_sets_output_mode)
 {
 	struct xrt_device *head = mc->xsysd->static_roles.head;
 	const bool have_table = head != NULL && head->hmd != NULL;
@@ -2948,7 +2960,9 @@ multi_apply_mode_key(struct multi_compositor *mc, bool toggle, int selected, boo
 	switch (d.action) {
 	case U_RENDERING_MODE_KEY_APPLY:
 		head->hmd->active_rendering_mode_index = d.target;
-		xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)d.target);
+		if (!toggle || toggle_sets_output_mode) {
+			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)d.target);
+		}
 		if (set_hw_flag) {
 			mc->hardware_display_3d = d.want_3d;
 		}
@@ -3094,7 +3108,7 @@ render_session_to_own_target(struct multi_compositor *mc,
 		// ADR-065: V toggles 2D <-> 3D, '0' / '1' select; one path for both.
 		bool force_2d = false;
 		if (qwerty_check_display_mode_toggle(mc->xsysd->xdevs, mc->xsysd->xdev_count, &force_2d)) {
-			multi_apply_mode_key(mc, true, -1, force_2d, true);
+			multi_apply_mode_key(mc, true, -1, force_2d, true, true);
 		}
 
 		// Rendering mode change from the qwerty 0/1 keys (disabled for legacy apps).
@@ -3112,7 +3126,7 @@ render_session_to_own_target(struct multi_compositor *mc,
 		if (!mc->msc->base.info.legacy_app_tile_scaling) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(mc->xsysd->xdevs, mc->xsysd->xdev_count, &render_mode)) {
-				multi_apply_mode_key(mc, false, render_mode, false, true);
+				multi_apply_mode_key(mc, false, render_mode, false, true, true);
 			}
 		}
 	}
@@ -6515,7 +6529,7 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 			// ADR-065: V toggles 2D <-> 3D, '0' / '1' select; one path for both.
 			bool force_2d = false;
 			if (qwerty_check_display_mode_toggle(mc->xsysd->xdevs, mc->xsysd->xdev_count, &force_2d)) {
-				multi_apply_mode_key(mc, true, -1, force_2d, false);
+				multi_apply_mode_key(mc, true, -1, force_2d, false, false);
 			}
 
 			// Rendering mode change from the qwerty 0/1 keys (disabled for legacy apps).
@@ -6534,7 +6548,7 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 				int render_mode = -1;
 				if (qwerty_check_rendering_mode_change(mc->xsysd->xdevs, mc->xsysd->xdev_count,
 				                                       &render_mode)) {
-					multi_apply_mode_key(mc, false, render_mode, false, false);
+					multi_apply_mode_key(mc, false, render_mode, false, false, false);
 				}
 			}
 

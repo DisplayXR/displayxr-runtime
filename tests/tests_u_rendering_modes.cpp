@@ -808,11 +808,27 @@ TEST_CASE("keys: '0' goes to 2D and '1' to 3D, hardware request included", "[u_r
 	CHECK(d.action == U_RENDERING_MODE_KEY_APPLY);
 	CHECK(d.target == 1);
 	CHECK(d.want_3d);
-	// Selecting the mode already active is applied too (idempotent, as V's
-	// hardware request is): it re-asserts a lens that drifted.
-	d = u_rendering_modes_decide_key(vendor.data(), 2, 1, false, 1, false, 0);
-	CHECK(d.action == U_RENDERING_MODE_KEY_APPLY);
-	CHECK(d.want_3d);
+}
+
+TEST_CASE("keys: the digit for the mode already in effect does nothing", "[u_rendering_modes][keys]")
+{
+	// No index write, no hardware request, and on the service no queued
+	// transition to where the device already is (`active` there is the queued
+	// target when one is pending).
+	const std::vector<xrt_rendering_mode> vendor = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D"),
+	                                                mk(2, 0.5f, 0.5f, true, 2, 1, "3D")};
+	CHECK(u_rendering_modes_decide_key(vendor.data(), 2, 1, false, 1, false, 0).action ==
+	      U_RENDERING_MODE_KEY_NOTHING);
+	CHECK(u_rendering_modes_decide_key(vendor.data(), 2, 0, false, 0, false, 0).action ==
+	      U_RENDERING_MODE_KEY_NOTHING);
+	// ...even when the fill check would refuse it: nothing to refuse.
+	const std::vector<xrt_rendering_mode> quad = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D"),
+	                                              mk(4, 0.5f, 0.5f, true, 2, 2, "Quad")};
+	CHECK(u_rendering_modes_decide_key(quad.data(), 2, 1, false, 1, false, 2).action ==
+	      U_RENDERING_MODE_KEY_NOTHING);
+	// V is unaffected: it always moves to the other mode.
+	CHECK(u_rendering_modes_decide_key(vendor.data(), 2, 1, true, -1, false, 0).action ==
+	      U_RENDERING_MODE_KEY_APPLY);
 }
 
 TEST_CASE("keys: the #1499 fill check refuses V and '1' alike", "[u_rendering_modes][keys]")
@@ -830,18 +846,28 @@ TEST_CASE("keys: the #1499 fill check refuses V and '1' alike", "[u_rendering_mo
 	CHECK(u_rendering_modes_decide_key(quad.data(), 2, 0, false, 1, false, 4).action == U_RENDERING_MODE_KEY_APPLY);
 }
 
-TEST_CASE("keys: no table means a hardware-only request; out-of-range digits do nothing", "[u_rendering_modes][keys]")
+TEST_CASE("keys: no table means V is hardware-only and a digit does nothing", "[u_rendering_modes][keys]")
 {
-	// No head / one mode: V falls back to qwerty's own flag, a digit names the state.
+	// No head / one mode: V falls back to qwerty's own flag...
 	u_rendering_mode_key_decision d = u_rendering_modes_decide_key(nullptr, 0, 0, true, -1, true, 0);
 	CHECK(d.action == U_RENDERING_MODE_KEY_HARDWARE_ONLY);
 	CHECK_FALSE(d.want_3d);
 	d = u_rendering_modes_decide_key(nullptr, 0, 0, true, -1, false, 0);
-	CHECK(d.want_3d);
-	const std::vector<xrt_rendering_mode> one = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D")};
-	d = u_rendering_modes_decide_key(one.data(), 1, 0, false, 1, false, 0);
 	CHECK(d.action == U_RENDERING_MODE_KEY_HARDWARE_ONLY);
 	CHECK(d.want_3d);
+	const std::vector<xrt_rendering_mode> one = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D")};
+	d = u_rendering_modes_decide_key(one.data(), 1, 0, true, -1, false, 0);
+	CHECK(d.action == U_RENDERING_MODE_KEY_HARDWARE_ONLY);
+	// ...but a digit names a mode that does not exist: '1' must not ask the
+	// display processor for 3D on a device with no 3D mode, '0' does nothing.
+	CHECK(u_rendering_modes_decide_key(one.data(), 1, 0, false, 1, false, 0).action ==
+	      U_RENDERING_MODE_KEY_NOTHING);
+	CHECK(u_rendering_modes_decide_key(one.data(), 1, 0, false, 0, false, 0).action ==
+	      U_RENDERING_MODE_KEY_NOTHING);
+	CHECK(u_rendering_modes_decide_key(nullptr, 0, 0, false, 1, false, 0).action ==
+	      U_RENDERING_MODE_KEY_NOTHING);
+	CHECK(u_rendering_modes_decide_key(nullptr, 0, 0, false, 0, false, 0).action ==
+	      U_RENDERING_MODE_KEY_NOTHING);
 
 	const std::vector<xrt_rendering_mode> vendor = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D"),
 	                                                mk(2, 0.5f, 0.5f, true, 2, 1, "3D")};
