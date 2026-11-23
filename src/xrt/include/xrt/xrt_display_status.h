@@ -287,6 +287,7 @@ struct xrt_status_plugin
 	char hint[128];                    //!< The plug-in's platform hint, verbatim.
 	bool fallback;                     //!< A FALLBACK plug-in (sim-display).
 	bool active;                       //!< The active plug-in of the process that built the snapshot.
+	bool disabled;                     //!< `Enabled` = 0 (`dp disable`); JSON `enabled` = !disabled.
 	uint32_t probe_order;              //!< ProbeOrder (lower wins).
 	struct xrt_status_licence licence; //!< Its licence state at the last load attempt (ADR-054 N5).
 	struct xrt_status_platform_remedy remedy; //!< Update notice, if any (ADR-045 Amendment 2026-11-22).

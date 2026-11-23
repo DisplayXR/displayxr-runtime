@@ -779,12 +779,13 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 	      V{"version", "git_tag", "plugin_abi", "active_openxr_runtime"});
 
 	const cJSON *p0 = cJSON_GetArrayItem(cJSON_GetObjectItem(d.root, "plugins"), 0);
-	CHECK(keys(p0) == V{"id", "name", "vendor", "version", "load", "platform_state", "hint", "fallback",
+	CHECK(keys(p0) == V{"id", "name", "vendor", "version", "load", "platform_state", "hint", "fallback", "enabled",
 	                    "probe_order", "licence",
 	                    // ADR-045 Amendment 2026-11-22: platform remedy, flat, always present.
 	                    "update_recommended", "update_required", "installed_version", "required_version",
 	                    "action_label", "action_url"});
 	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(p0, "update_recommended")));
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(p0, "enabled"))); // a zeroed row reads enabled (`disabled` is the field)
 	// ADR-054 N5: the compact licence object; a plug-in with nothing to report says so.
 	CHECK(keys(cJSON_GetObjectItem(p0, "licence")) == V{"state", "source", "expires_unix"});
 	CHECK(str(cJSON_GetObjectItem(p0, "licence"), "state") == "not_applicable");

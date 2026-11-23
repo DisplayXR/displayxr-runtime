@@ -96,6 +96,7 @@ fill_plugins(struct xrt_status_snapshot *out)
 		(void)snprintf(p->vendor, sizeof(p->vendor), "%s", descs[i].vendor);
 		(void)snprintf(p->version, sizeof(p->version), "%s", descs[i].version);
 		p->probe_order = descs[i].probe_order;
+		p->disabled = !descs[i].enabled;
 		(void)snprintf(p->load, sizeof(p->load), "%s",
 		               target_plugin_load_result_str(TARGET_PLUGIN_RESULT_NOT_ATTEMPTED));
 		p->fallback = strcmp(descs[i].id, "sim-display") == 0;

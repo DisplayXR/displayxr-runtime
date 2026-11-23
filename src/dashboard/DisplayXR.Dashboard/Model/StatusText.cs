@@ -94,7 +94,7 @@ public static class StatusText
     /// a vendor driver is unhealthy (<see cref="FellBack"/>: a 3D display that needs attention, as before).
     /// A GLOBAL preference (<c>dp use</c> without <c>--screen</c>, or its environment pin: the snapshot's
     /// <c>dp_preference</c>) naming the simulated driver counts too, on a PC where a real display driver is
-    /// registered (<see cref="ChoseSimulatedGlobally"/>). A runtime without that key behaves as before.
+    /// installed and usable (<see cref="ChoseSimulatedGlobally"/>). A runtime without that key behaves as before.
     /// </summary>
     public static bool IsReal3D(StatusSnapshot? snap, Screen s) =>
         s.Claim.IsClaimed && (s.Claim.Forced == true || ChoseSimulated(snap, s)
@@ -109,17 +109,32 @@ public static class StatusText
 
     /// <summary>
     /// The global preference (<c>dp_preference</c>, any source) names the simulated driver, the simulated
-    /// driver holds this display, no per-display preference names another driver for it, and a display
-    /// driver that is not the simulated one is registered: a 3D display showing the simulated preview by
-    /// the user's choice. On a PC whose only driver is the simulated one, nothing changes (no 3D display).
-    /// The snapshot does not say which display the real driver would claim, so every display the
-    /// simulated driver holds counts.
+    /// driver holds this display, no per-display preference names another driver for it, and a real display
+    /// driver is installed AND usable (<see cref="IsUsableRealDriver"/>: enabled, not failed or declined, its
+    /// platform READY): a 3D display showing the simulated preview by the user's choice. A real driver that
+    /// is disabled, or installed on a PC with no panel attached (NO_DISPLAY / PLATFORM_ABSENT / ...), or that
+    /// never reported a platform state (UNKNOWN), does not count, so a 2D-only PC never reads "chosen by you".
+    /// <para>
+    /// PER PC, not per display: the status snapshot does not say which display a real driver would claim (its
+    /// claim names only the winner; the per-display <c>candidates</c> are in <c>dp list --json</c>, not in the
+    /// snapshot every caller shares). So on a PC with a usable real driver, every display the simulated driver
+    /// holds under this preference counts, a second, ordinary monitor included.
+    /// </para>
     /// </summary>
     public static bool ChoseSimulatedGlobally(StatusSnapshot? snap, Screen s) =>
         snap?.DpPreference is { IsSet: true } g && IsSimulatedDriver(snap, g.PluginId)
         && IsSimulatedDriver(snap, s.Claim.PluginId)
         && (s.Claim.PreferredPlugin is not { Length: > 0 } pp || IsSimulatedDriver(snap, pp))
-        && snap.Plugins.Any(p => !p.Fallback && !IsSimulatedDriver(snap, p.Id));
+        && snap.Plugins.Any(p => IsUsableRealDriver(snap, p));
+
+    /// <summary>
+    /// A display driver that is not the simulated one and could drive a panel now: enabled, its load not a
+    /// failure, not DISABLED and not DECLINED ("not my platform"), and its platform state READY.
+    /// </summary>
+    public static bool IsUsableRealDriver(StatusSnapshot? snap, PluginInfo p) =>
+        !p.Fallback && !IsSimulatedDriver(snap, p.Id) && p.Enabled
+        && p.Load is not ("DISABLED" or "DECLINED") && !LoadIsFailure(p.Load)
+        && p.PlatformState == "READY";
 
     /// <summary>Where the choice of the simulated driver is stored: the per-display one, else the global one.</summary>
     public static string? ChosenSource(StatusSnapshot? snap, Screen s) =>

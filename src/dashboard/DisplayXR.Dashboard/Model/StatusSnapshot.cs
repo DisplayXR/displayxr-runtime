@@ -60,6 +60,12 @@ public sealed record PluginInfo(string Id, string Name, string Vendor, string Ve
 {
     /// <summary>The plug-in's platform update notice (ADR-045 Amendment 2026-11-22); <see cref="PlatformRemedy.None"/> when it reports none.</summary>
     public PlatformRemedy Remedy { get; init; } = PlatformRemedy.None;
+
+    /// <summary>
+    /// Registered with <c>Enabled</c> = 1 (<c>dp enable|disable</c>); true from a runtime that predates the key.
+    /// A disabled plug-in is listed but never tried by any scan.
+    /// </summary>
+    public bool Enabled { get; init; } = true;
 }
 
 /// <summary>
@@ -278,7 +284,7 @@ public static class StatusSnapshotParser
     private static PluginInfo ReadPlugin(JsonElement p) => new(
         p.Str("id"), p.Str("name"), p.Str("vendor"), p.Str("version"), p.Str("load"),
         p.Str("platform_state", "UNKNOWN"), p.Str("hint"), p.Bool("fallback"), p.Int("probe_order"))
-    { Remedy = PlatformRemedy.Read(p) };
+    { Remedy = PlatformRemedy.Read(p), Enabled = p.Bool("enabled", true) };
 
     private static PixelRect ReadRect(JsonElement? e) =>
         new(e.Long("left"), e.Long("top"), e.Long("width"), e.Long("height"));

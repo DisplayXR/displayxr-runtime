@@ -1432,6 +1432,7 @@ u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 		cJSON_AddStringToObject(o, "platform_state", u_status_platform_state_str(p->platform_state));
 		cJSON_AddStringToObject(o, "hint", p->hint);
 		cJSON_AddBoolToObject(o, "fallback", p->fallback);
+		cJSON_AddBoolToObject(o, "enabled", !p->disabled);
 		cJSON_AddNumberToObject(o, "probe_order", (double)p->probe_order);
 		add_licence(o, &p->licence);
 		u_status_remedy_add_cjson(o, &p->remedy);

@@ -62,10 +62,10 @@ service RPCs in §5 expose. The last row is what the plug-in slot in §6 carries
                "active_openxr_runtime": "C:\\Program Files\\DisplayXR\\Runtime\\DisplayXR_win64.json" },
   "plugins": [
     { "id": "leia-sr", "name": "DisplayXR Leia SR", "vendor": "Leia Inc.", "version": "2.13.0",
-      "load": "ACTIVE", "platform_state": "READY", "hint": "", "fallback": false, "probe_order": 50,
+      "load": "ACTIVE", "platform_state": "READY", "hint": "", "fallback": false, "enabled": true, "probe_order": 50,
       "licence": { "state": "licensed", "source": "hardware", "expires_unix": null } },
     { "id": "sim-display", "name": "DisplayXR Sim Display", "version": "2.32.0",
-      "load": "NOT_ATTEMPTED", "platform_state": "UNKNOWN", "fallback": true, "probe_order": 200,
+      "load": "NOT_ATTEMPTED", "platform_state": "UNKNOWN", "fallback": true, "enabled": true, "probe_order": 200,
       "licence": { "state": "not_applicable", "source": null, "expires_unix": null } }
   ],
   "screens": [
@@ -255,10 +255,20 @@ their screen, and a preference for a driver that is not installed falls through 
 Read **in the process that renders the snapshot** (the CLI), from its stores and its
 environment, like the model store (§3.3): the DIAG head does not carry it, so no IPC message
 changed, and a `dp use` shows at once, before the service's next start. `status --watch`
-reprints when it moves (no service generation covers it). The `env` source is therefore the
+reprints when it moves (no service generation covers it), with or without a service: headless,
+it re-reads the stores every poll and reprints the same snapshot with the new `dp_preference`
+(the claims are not rebuilt). The `env` source is therefore the
 CLI's environment, which a service started separately need not share. Text output: one line,
 only when one is set — `DP PREF  sim-display for every screen (user); a per-screen choice still wins`.
 A runtime that predates the key sends no `dp_preference`; the Dashboard then behaves as before.
+
+**In the Dashboard** a global preference for the simulated driver makes a display it holds read
+"3D display, chosen by you" only when a real display driver is installed **and usable**: `enabled`
+(the plug-in row's `Enabled`, `dp enable|disable`; absent from an older runtime = true), a load that
+is not a failure, `DISABLED` or `DECLINED`, and `platform_state` `READY`. A disabled driver, one
+installed with no panel attached, or one that never reported a platform state does not count, so a
+2D-only PC never reads "chosen". The rule is per PC: the snapshot's claim names only the winner,
+so it cannot say which display the real driver would claim.
 
 ## 4. Warnings as data
 

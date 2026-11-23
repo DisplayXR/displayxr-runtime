@@ -263,6 +263,51 @@ public class StatusTextTests
         Assert.False(StatusText.IsReal3D(snap, flat));
     }
 
+    /// <summary>
+    /// Only a real display driver that is enabled and usable makes the global choice read "chosen by you": a
+    /// disabled one, one installed on a PC with no panel, one that failed or declined, or one that never
+    /// reported its platform leaves a 2D-only PC reading as before (not a 3D display).
+    /// </summary>
+    [Theory]
+    [InlineData("NOT_ATTEMPTED", "READY", true, true)]
+    [InlineData("ACTIVE", "READY", true, true)]
+    [InlineData("LOADED", "READY", true, true)]
+    [InlineData("NOT_ATTEMPTED", "READY", false, false)]      // dp disable
+    [InlineData("DISABLED", "READY", true, false)]
+    [InlineData("NOT_ATTEMPTED", "NO_DISPLAY", true, false)]  // installed, no panel attached
+    [InlineData("NOT_ATTEMPTED", "PLATFORM_ABSENT", true, false)]
+    [InlineData("NOT_ATTEMPTED", "PLATFORM_NOT_RUNNING", true, false)]
+    [InlineData("NOT_ATTEMPTED", "INCOMPATIBLE", true, false)]
+    [InlineData("NOT_ATTEMPTED", "UNKNOWN", true, false)]     // never said: cannot claim a panel
+    [InlineData("DECLINED", "READY", true, false)]
+    [InlineData("LOAD_FAILED", "READY", true, false)]
+    [InlineData("ABI_MISMATCH", "READY", true, false)]
+    public void GlobalPreference_CountsOnlyAnEnabledUsableRealDriver(string load, string platform, bool enabled, bool chosen)
+    {
+        var snap = TestData.Parse(TestData.Text("status-global-sim.json"));
+        var x = snap.Screens[0];
+        var s = snap with
+        {
+            Plugins = snap.Plugins.Select(p => p.Fallback ? p : p with { Load = load, PlatformState = platform } with { Enabled = enabled }).ToArray(),
+        };
+        Assert.Equal(chosen, StatusText.ChoseSimulatedGlobally(s, x));
+        Assert.Equal(chosen ? "Chosen by you" : null, StatusText.ForcedChip(x, null, s));
+        Assert.Equal(chosen, StatusText.PlainClaimLine(x, null, s).EndsWith("chosen by you", System.StringComparison.Ordinal));
+        // A failed / not-ready vendor driver keeps its older, separate reading (FellBack: a 3D display that
+        // needs attention), never "chosen"; with a healthy-but-unusable one the display is not a 3D display.
+        if (!StatusText.VendorDriverUnhealthy(s)) Assert.Equal(chosen, StatusText.IsReal3D(s, x));
+    }
+
+    [Fact]
+    public void Snapshot_PluginEnabled_ParsedAndDefaultsToTrue()
+    {
+        var text = TestData.Text("status-global-sim.json");
+        Assert.All(TestData.Parse(text).Plugins, p => Assert.True(p.Enabled)); // key absent: enabled
+        var off = TestData.Parse(text.Replace("\"probe_order\":\t50", "\"enabled\": false, \"probe_order\": 50"));
+        Assert.False(off.Plugins.Single(p => p.Id == "leia-sr").Enabled);
+        Assert.False(StatusText.ChoseSimulatedGlobally(off, off.Screens[0]));
+    }
+
     [Fact]
     public void DisplaysCard_SimulatedOnly_SaysOrdinary2D()
     {
