@@ -3,6 +3,7 @@
 
 using System;
 using System.Linq;
+using System.Threading.Tasks;
 using DisplayXR.Dashboard.Feed;
 using DisplayXR.Dashboard.Model;
 using Xunit;
@@ -246,6 +247,39 @@ public class DriverOptionsTests
         Assert.Equal(new[] { "dp", "options", "sim-display", "--json" }, OptionCommands.Read("sim-display").Args);
         Assert.Equal(new[] { "dp", "set", "sim-display", "OUTPUT", "side by side" }, OptionCommands.Set("sim-display", "OUTPUT", "side by side").Args);
         Assert.Equal(new[] { "dp", "unset", "sim-display", "FORCE_MODE" }, OptionCommands.Unset("sim-display", "FORCE_MODE").Args);
+    }
+
+    /// <summary>
+    /// The context reads a driver's settings lazily, writes through the shared action path, re-reads
+    /// after a write, and an unknown driver is no options (the fixture source simulates the verbs from
+    /// <c>dp-options-&lt;id&gt;.json</c>, so nothing here can reach a real store).
+    /// </summary>
+    [Fact]
+    public async Task Context_ReadsLazily_WritesThroughTheCli_ThenReReads()
+    {
+        var fx = new FixtureProcessSource(TestData.Path("components.ndjson"), new FakeSource());
+        var ctx = new DashboardContext(new StatusFeed(new FakeSource(), new ManualScheduler()), new CliProcessSource("no-such-cli"), fx);
+        Assert.Null(ctx.DriverOptionsOf("sim-display")); // nothing read until asked
+
+        await ctx.LoadDriverOptionsAsync("sim-display");
+        Assert.Equal("quad", ctx.DriverOptionsOf("sim-display")!.Find("OUTPUT")!.Value);
+
+        await ctx.RunOptionWriteAsync("sim-display", "OUTPUT", OptionCommands.Set("sim-display", "OUTPUT", "sbs"));
+        Assert.Equal(("sim-display", "OUTPUT"), ctx.LastOptionWrite);
+        Assert.Equal(OptionCommands.Area, ctx.LastActionArea);
+        Assert.False(ctx.LastActionFailed);
+        Assert.Contains("'sbs'", ctx.LastAction); // the CLI's own reply
+        Assert.Equal("sbs", ctx.DriverOptionsOf("sim-display")!.Find("OUTPUT")!.Value);
+
+        await ctx.RunOptionWriteAsync("sim-display", "OUTPUT", OptionCommands.Unset("sim-display", "OUTPUT"));
+        var output = ctx.DriverOptionsOf("sim-display")!.Find("OUTPUT")!;
+        Assert.Equal(SettingSource.Absent, output.Source);
+        Assert.Equal("anaglyph", output.Effective);
+
+        // A driver the CLI does not know (exit 1): no options, and no error kept anywhere.
+        await ctx.LoadDriverOptionsAsync("nosuch");
+        Assert.True(ctx.DriverOptionsOf("nosuch")!.IsEmpty);
+        Assert.False(ctx.DriverOptionsLoading("nosuch"));
     }
 
     [Fact]

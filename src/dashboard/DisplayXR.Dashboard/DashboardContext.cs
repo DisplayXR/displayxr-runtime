@@ -512,6 +512,66 @@ public sealed class DashboardContext
         if (_policyReloadPending.Remove(cls)) await LoadPolicyAsync(cls, force: true);
     }
 
+    // ADR-065: each display driver's settings (`dp options <id> --json`), read lazily when its Details
+    // are opened on Components, and again after a write. One read per driver at a time; never polled.
+    private readonly Dictionary<string, DriverOptions> _driverOptions = new();
+    private readonly HashSet<string> _driverOptionsLoading = new();
+    private readonly HashSet<string> _driverOptionsReloadPending = new();
+
+    /// <summary>A driver's settings once read; an empty list when the CLI has none to give (failed, absent verb, unknown shape).</summary>
+    public DriverOptions? DriverOptionsOf(string id) => _driverOptions.TryGetValue(id, out var o) ? o : null;
+    public bool DriverOptionsLoading(string id) => _driverOptionsLoading.Contains(id);
+
+    /// <summary>The driver the last Options write was for, and the key it changed (its reply shows on that row).</summary>
+    public (string DriverId, string Key)? LastOptionWrite { get; private set; }
+
+    /// <summary>
+    /// <c>dp options &lt;id&gt; --json</c>: when the driver's Details are first opened, and forced after a
+    /// write. A failure, an older CLI without the verb or an unknown document reads as no options,
+    /// with no error banner (the attempt is in the log).
+    /// </summary>
+    public async Task LoadDriverOptionsAsync(string id, bool force = false)
+    {
+        if (_driverOptionsLoading.Contains(id))
+        {
+            if (force) _driverOptionsReloadPending.Add(id);
+            return;
+        }
+        if (!force && _driverOptions.ContainsKey(id)) return;
+        _driverOptionsLoading.Add(id);
+        Bump();
+        try
+        {
+            var r = await Cli.RunAsync(OptionCommands.Read(id), InfoTimeout);
+            var options = DriverOptions.From(id, r.Ok, r.Json);
+            if (!r.Ok) DashboardLog.Info($"dp options {id}: not available ({r.Summary})");
+            _driverOptions[id] = options;
+        }
+        catch (Exception ex)
+        {
+            _driverOptions[id] = DriverOptions.None(id);
+            DashboardLog.Error("dp options", ex);
+        }
+        finally { _driverOptionsLoading.Remove(id); }
+        Bump();
+        if (_driverOptionsReloadPending.Remove(id)) await LoadDriverOptionsAsync(id, force: true);
+    }
+
+    /// <summary>Refresh: re-read the settings of every driver whose settings were read.</summary>
+    public void RefreshDriverOptions()
+    {
+        foreach (var id in _driverOptions.Keys.ToArray()) _ = LoadDriverOptionsAsync(id, force: true);
+    }
+
+    /// <summary>One Options write (<c>dp set</c> / <c>dp unset</c>) through the shared action path, then that driver's settings are re-read.</summary>
+    public async Task RunOptionWriteAsync(string driverId, string key, CliArgs command)
+    {
+        if (ActionRunning) return;
+        LastOptionWrite = (driverId, key);
+        await RunActionsAsync(OptionCommands.Area, command);
+        await LoadDriverOptionsAsync(driverId, force: true);
+    }
+
     public bool DpLoading { get; private set; }
     private DateTime? _dpWhen;
     private bool _dpReloadPending;
