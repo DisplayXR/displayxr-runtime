@@ -540,6 +540,13 @@ struct ipc_workspace_input_event
 			int64_t  cursor_x;
 			int64_t  cursor_y;
 			uint32_t modifiers;
+			//! XR_DXR_workspace_client_input: cursor in the target app's content
+			//! rect, normalized (top-left origin). Written by the shared-surface
+			//! router on a content app's copy only (NaN = no placed rect); the
+			//! controller's copy leaves them 0. Same meaning as pointer.local_u/v
+			//! and pointer_motion.local_u/v on an app's copy.
+			float    local_u;
+			float    local_v;
 		} scroll;
 		struct                      //!< spec_version 6: per-frame motion (capture-gated)
 		{
@@ -618,6 +625,11 @@ struct ipc_workspace_input_event_batch
 	uint32_t count;
 	struct ipc_workspace_input_event events[IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX];
 };
+
+// The batch rides in one reply (plus its xrt_result_t): a payload field must
+// never grow the union past what fits.
+static_assert(sizeof(struct ipc_workspace_input_event_batch) + 16 <= IPC_BUF_SIZE,
+              "ipc_workspace_input_event_batch no longer fits one IPC reply");
 
 /*!
  * Phase 8: 3D capture MVP. Bitmask of which views (sub-images) the workspace controller

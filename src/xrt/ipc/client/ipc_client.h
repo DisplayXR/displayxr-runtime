@@ -578,6 +578,18 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
                                                             size_t event_stride,
                                                             size_t event_buf_capacity);
 
+/*!
+ * XR_DXR_workspace_client_input: drain this content session's routed workspace
+ * input into @p out_events (an XrWorkspaceClientInputEventDXR array of
+ * @p capacity entries, opaque here so st_oxr's callers need no IPC types).
+ * capacity 0 makes no call and drains nothing.
+ */
+xrt_result_t
+comp_ipc_client_compositor_workspace_client_enumerate_input_events(struct xrt_compositor *xc,
+                                                                   uint32_t capacity,
+                                                                   uint32_t *out_count,
+                                                                   void *out_events);
+
 xrt_result_t
 comp_ipc_client_compositor_workspace_pointer_capture_set(struct xrt_compositor *xc,
                                                          bool enabled,

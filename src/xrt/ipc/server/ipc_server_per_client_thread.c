@@ -257,6 +257,7 @@ common_shutdown(volatile struct ipc_client_state *ics)
 			ipc_server_input_queue_set_input_grab(false);
 			ipc_server_input_queue_set_pointer_capture(false);
 			ipc_server_input_queue_clear_frame_tick();
+			ipc_server_input_queue_set_reserved_keys(NULL);
 #endif
 		}
 #ifdef XRT_OS_ANDROID
