@@ -12,6 +12,7 @@
 #include "xrt/xrt_config_os.h"
 
 #include "util/u_system.h"
+#include "util/u_rendering_modes.h"
 #include "util/u_trace_marker.h"
 #include "util/u_system_helpers.h"
 
@@ -60,6 +61,10 @@ t_instance_create_system(struct xrt_instance *xinst,
 		u_system_destroy(&usys);
 		return xret;
 	}
+
+	// ADR-065: the same two-mode contract the compositor instance enforces
+	// (target_instance.c), so a headless diagnostic reports the table apps see.
+	(void)u_device_enforce_two_rendering_modes(xsysd->static_roles.head, NULL);
 
 	u_system_fill_properties(usys, xsysd->static_roles.head->str);
 	*out_xsys = &usys->base;

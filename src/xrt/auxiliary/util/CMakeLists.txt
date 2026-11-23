@@ -164,6 +164,8 @@ add_library(
 	u_prober.h
 	u_rear_budget.c
 	u_rear_budget.h
+	u_rendering_modes.c
+	u_rendering_modes.h
 	u_resampler.c
 	u_resampler.h
 	u_sandbox.c

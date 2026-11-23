@@ -149,6 +149,7 @@ set(tests
     tests_oxr_hosted_raw_views_rule
     tests_oxr_input_providers_rule
     tests_xrt_active_mode_scale
+    tests_u_rendering_modes
     tests_input_arbiter_rig
     tests_input_arbiter_rerank
     tests_input_arbiter_floor
