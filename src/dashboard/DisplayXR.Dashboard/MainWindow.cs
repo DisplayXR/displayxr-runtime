@@ -450,7 +450,7 @@ public sealed class MainWindow : Window
         {
             "displays" => $"{badge.Count} warning{(badge.Count == 1 ? "" : "s")} on the screens",
             "windows" => $"{badge.Count} 3D app{(badge.Count == 1 ? "" : "s")} running",
-            "performance" => "Non-default performance settings are in force",
+            "performance" => "Some settings are changed from their defaults",
             "components" => $"{badge.Count} update{(badge.Count == 1 ? "" : "s")} available",
             _ => "A display-processor override is active",
         });

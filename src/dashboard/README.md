@@ -257,7 +257,7 @@ scale). Method: [tracking-provider-discovery.md §6](../../docs/specs/runtime/tr
 ## Feed cadence (ADR-051 D5)
 
 - One long-lived `displayxr-cli status --watch --json` child while a status page (Home,
-  Displays, Windows) is on screen and the window is not minimised. Moving between status
+  Displays, Running 3D apps) is on screen and the window is not minimised. Moving between status
   pages keeps the same child. Leaving for Performance / Developer stops it after a 15 s
   linger (a quick hop back reuses it: a child that cannot reach the service builds a
   headless snapshot, and each of those creates a vendor instance); minimising stops it at
