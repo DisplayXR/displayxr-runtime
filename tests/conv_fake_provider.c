@@ -345,8 +345,6 @@ fake_job(struct xrt_conversion_plugin_instance *inst,
          struct xrt_conv_job_out *out)
 {
 	struct conv_fake_provider *f = fp(inst);
-	(void)in;
-	(void)params;
 	enter_s(f);
 	os_mutex_lock(&f->mtx);
 	struct conv_fake_cap *c = find_cap(f, cap_id);
@@ -356,6 +354,20 @@ fake_job(struct xrt_conversion_plugin_instance *inst,
 	const uint32_t refusal = c != NULL ? c->job_refusal : 0u;
 	if (c != NULL && in != NULL && XRT_CONV_COVERS(in, struct xrt_conv_job_in, job_flags)) {
 		c->job_flags_seen = in->job_flags;
+	}
+	if (c != NULL && in != NULL && in->image_count > 0) {
+		c->job_in_width_seen = in->images[0].width;
+		c->job_in_height_seen = in->images[0].height;
+	}
+	if (c != NULL && params != NULL) {
+		c->job_focal_seen = params->focal_px;
+	}
+	const uint8_t *custom_blob = c != NULL ? c->job_blob : NULL;
+	const bool report_facts = c != NULL && c->job_report_facts;
+	struct xrt_conv_splat_info facts;
+	memset(&facts, 0, sizeof(facts));
+	if (report_facts) {
+		facts = c->job_splat_info;
 	}
 	const uint32_t poll = f->cancel_poll_ms != 0 ? f->cancel_poll_ms : 10;
 	f->jobs++;
@@ -411,13 +423,16 @@ fake_job(struct xrt_conversion_plugin_instance *inst,
 		for (uint64_t off = 0; r == XRT_SUCCESS && off < bytes; off += sizeof(buf)) {
 			const uint64_t n = bytes - off < sizeof(buf) ? bytes - off : sizeof(buf);
 			for (uint64_t k = 0; k < n; k++) {
-				buf[k] = (uint8_t)((off + k) * 7u + 3u);
+				buf[k] = custom_blob != NULL ? custom_blob[off + k] : (uint8_t)((off + k) * 7u + 3u);
 			}
 			if (!s->write(s->ctx, buf, n)) {
 				r = XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 			}
 		}
 		out->written = XRT_CONV_OUT_SPLAT_BLOB;
+		if (report_facts) {
+			out->splat_info = facts;
+		}
 		out->splat_info.blob_format = blob_format;
 		out->splat_info.splat_count = bytes / 32u;
 	}

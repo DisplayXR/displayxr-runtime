@@ -102,7 +102,10 @@ ipc_client_lift_get_fence(struct ipc_connection *ipc_c,
 /*!
  * Two-call blob acquire. @p capacity 0 = size query (the service latches the
  * blob); otherwise, when @p capacity >= byte_count, the bytes are written to
- * @p out_bytes. @p out_delivered says whether they were.
+ * @p out_bytes. @p out_delivered says whether they were. XR_DXR_lift spec 6:
+ * on success @p out_info->camera_json / facts_json are malloc'd (the caller
+ * frees them, NULL = none) and @p out_info->failed reports a failed
+ * conversion.
  */
 xrt_result_t
 ipc_client_lift_acquire_blob(struct ipc_connection *ipc_c,

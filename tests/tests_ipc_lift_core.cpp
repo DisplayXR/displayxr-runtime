@@ -1099,6 +1099,267 @@ TEST_CASE("CPU route: the GAUSSIANS photo facade takes a spec-4 CPU image and re
 }
 #endif
 
+#ifndef _WIN32
+namespace {
+
+//! A binary little-endian x y z opacity PLY: a subject at 0.6 m filling the
+//! central half of a 1536 x 1024 / fx 1200 camera, a wall at 20 m.
+std::vector<uint8_t>
+photo_ply()
+{
+	std::vector<float> v;
+	uint32_t seed = 99;
+	auto rnd = [&] {
+		seed = seed * 1664525u + 1013904223u;
+		return (float)(seed >> 8) / (float)(1u << 24);
+	};
+	auto put = [&](float px, float py, float z) {
+		v.push_back((px - 768.0f) / 1200.0f * z);
+		v.push_back((py - 512.0f) / 1200.0f * z);
+		v.push_back(z);
+		v.push_back(3.0f);
+	};
+	for (int i = 0; i < 20000; i++) {
+		put(rnd() * 1536.0f, rnd() * 1024.0f, 20.0f);
+	}
+	for (int i = 0; i < 20000; i++) {
+		put(384.0f + 768.0f * rnd(), 256.0f + 512.0f * rnd(), 0.6f);
+	}
+	std::string h = "ply\nformat binary_little_endian 1.0\nelement vertex " + std::to_string(v.size() / 4) +
+	                "\nproperty float x\nproperty float y\nproperty float z\nproperty float opacity\nend_header\n";
+	std::vector<uint8_t> out(h.begin(), h.end());
+	const uint8_t *b = reinterpret_cast<const uint8_t *>(v.data());
+	out.insert(out.end(), b, b + v.size() * sizeof(float));
+	return out;
+}
+
+//! One GAUSSIANS facade over the CPU glue with @p f; @p body(fx, id) runs inside.
+void
+with_facade(conv_fake_provider &f, const std::function<void(Fixture &, uint64_t)> &body)
+{
+	ipc_server_conv_io_ops cpu_io;
+	if (!ipc_server_conv_cpu_io_get(&cpu_io)) {
+		SKIP("no CPU buffer transport on this platform");
+	}
+	Fixture fx(CONV_PREWARM_FIRST_CREATE);
+	REQUIRE(fx.add(f) >= 0);
+	ipc_server_conv_set_io(fx.sc, &cpu_io);
+	REQUIRE(wait_until([&] { return conv_core_task_has_candidate(fx.core, XRT_CONV_TASK_SPLATS_MONO); }, 3000));
+	uint64_t id = 0;
+	REQUIRE(ipc_server_conv_lift_stream_create(fx.sc, 1, XRT_DP_LIFT_MODE_GAUSSIANS, XRT_CONV_CONTENT_PHOTO, 1.0f,
+	                                           0, 0, &id) == XRT_SUCCESS);
+	body(fx, id);
+	CHECK(ipc_server_conv_lift_stream_destroy(fx.sc, 1, id) == XRT_SUCCESS);
+	ipc_server_conv_set_io(fx.sc, nullptr);
+}
+
+//! Submit a W x H CPU photo (optionally with a focal length) to facade @p id.
+uint64_t
+submit_photo(Fixture &fx, uint64_t id, uint32_t W, uint32_t H, float focal_px, int64_t source_time)
+{
+	const uint32_t pitch = W * 4;
+	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	REQUIRE(ipc_cpu_buffer_create((size_t)pitch * H, &h));
+	conv_input_import in{};
+	in.kind = CONV_INPUT_CPU;
+	in.handle = h;
+	in.sync_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	in.cpu_row_pitch = pitch;
+	ipc_arg_lift_submit a{};
+	a.stream_id = id;
+	a.source_time = source_time;
+	a.width = W;
+	a.height = H;
+	if (focal_px > 0.0f) {
+		a.has_params = 1;
+		a.params.convergence = -1.0f;
+		a.params.strength = 1.0f;
+		a.params.inpaint = 1;
+		a.params.focal_px = focal_px;
+	}
+	uint64_t fid = 0;
+	REQUIRE(ipc_server_conv_v4_submit(fx.sc, 1, &a, &in, nullptr, &fid) == XRT_SUCCESS);
+	return fid;
+}
+
+} // namespace
+
+TEST_CASE("GAUSSIANS facade (spec 6): the camera block rides with the blob, runtime focus without facts",
+          "[ipc_lift_core]")
+{
+	const std::vector<uint8_t> ply = photo_ply();
+	conv_fake_provider f;
+	conv_fake_init(&f, "splats");
+	conv_fake_cap *sp =
+	    conv_fake_add_cap(&f, 7, XRT_CONV_TASK_SPLATS_MONO, XRT_CONV_LANE_JOB, XRT_CONV_OUT_SPLAT_BLOB, 0);
+	sp->state = XRT_CONV_STATE_READY;
+	sp->job_blob_format = XRT_CONV_BLOB_PLY_3DGS;
+	sp->job_blob = ply.data();
+	sp->job_bytes = ply.size();
+	with_facade(f, [&](Fixture &fx, uint64_t id) {
+		const uint64_t fid = submit_photo(fx, id, 64, 32, 0.0f, 5);
+		bool ready = false;
+		xrt_lift_blob_info info{};
+		uint8_t *bytes = nullptr;
+		ipc_server_conv_blob_extra extra{};
+		// Size query: the JSON already comes with it, for the latched frame.
+		REQUIRE(wait_until(
+		    [&] {
+			    REQUIRE(ipc_server_conv_lift_acquire_blob_ex(fx.sc, 1, id, 0, &ready, &info, &bytes,
+			                                                 &extra) == XRT_SUCCESS);
+			    if (!ready) {
+				    std::free(extra.camera_json);
+				    std::free(extra.facts_json);
+			    }
+			    return ready;
+		    },
+		    3000));
+		CHECK(bytes == nullptr);
+		CHECK(info.frame_id == fid);
+		CHECK(sp->job_focal_seen == 0.0f); // no focal invented for the provider
+		REQUIRE(extra.camera_json != nullptr);
+		const std::string cam = extra.camera_json;
+		CHECK(cam.find("\"rig\":\"camera\"") != std::string::npos);
+		CHECK(cam.find("\"source\":\"runtime\"") != std::string::npos); // no facts focus -> the splats'
+		CHECK(cam.find("\"intrinsics\"") == std::string::npos);         // none reported, none assumed
+		REQUIRE(extra.facts_json != nullptr);
+		std::free(extra.camera_json);
+		std::free(extra.facts_json);
+
+		// Delivery: the same frame's block again, and the bytes.
+		REQUIRE(ipc_server_conv_lift_acquire_blob_ex(fx.sc, 1, id, 1ull << 30, &ready, &info, &bytes, &extra) ==
+		        XRT_SUCCESS);
+		CHECK(ready);
+		REQUIRE(bytes != nullptr);
+		CHECK(info.byte_count == ply.size());
+		CHECK(std::memcmp(bytes, ply.data(), ply.size()) == 0);
+		REQUIRE(extra.camera_json != nullptr);
+		CHECK(std::string(extra.camera_json) == cam);
+		std::free(bytes);
+		std::free(extra.camera_json);
+		std::free(extra.facts_json);
+	});
+	conv_fake_fini(&f);
+}
+
+TEST_CASE("GAUSSIANS facade (spec 6): an oversize photo is downscaled, facts come back in caller pixels",
+          "[ipc_lift_core]")
+{
+	const std::vector<uint8_t> ply = photo_ply();
+	conv_fake_provider f;
+	conv_fake_init(&f, "splats");
+	conv_fake_cap *sp =
+	    conv_fake_add_cap(&f, 7, XRT_CONV_TASK_SPLATS_MONO, XRT_CONV_LANE_JOB, XRT_CONV_OUT_SPLAT_BLOB, 0);
+	sp->state = XRT_CONV_STATE_READY;
+	sp->job_blob_format = XRT_CONV_BLOB_PLY_3DGS;
+	sp->job_blob = ply.data();
+	sp->job_bytes = ply.size();
+	// The provider reports intrinsics in the pixels IT received (3072 x 1536).
+	sp->job_report_facts = true;
+	sp->job_splat_info.coords = XRT_CONV_COORDS_OPENCV;
+	sp->job_splat_info.intrinsics_source = XRT_CONV_INTRINSICS_GIVEN;
+	sp->job_splat_info.fx = sp->job_splat_info.fy = 2400.0f;
+	sp->job_splat_info.cx = 1536.0f;
+	sp->job_splat_info.cy = 768.0f;
+	sp->job_splat_info.grid_width = 3072;
+	sp->job_splat_info.grid_height = 1536;
+	with_facade(f, [&](Fixture &fx, uint64_t id) {
+		// 3200 x 1600 > IPC_SERVER_CONV_PHOTO_MAX_EDGE: 3072 x 1536 reaches the provider.
+		(void)submit_photo(fx, id, 3200, 1600, 2500.0f, 9);
+		bool ready = false;
+		xrt_lift_blob_info info{};
+		uint8_t *bytes = nullptr;
+		ipc_server_conv_blob_extra extra{};
+		REQUIRE(wait_until(
+		    [&] {
+			    REQUIRE(ipc_server_conv_lift_acquire_blob_ex(fx.sc, 1, id, 1ull << 30, &ready, &info,
+			                                                 &bytes, &extra) == XRT_SUCCESS);
+			    if (!ready) {
+				    std::free(extra.camera_json);
+				    std::free(extra.facts_json);
+			    }
+			    return ready;
+		    },
+		    5000));
+		CHECK(sp->job_in_width_seen == IPC_SERVER_CONV_PHOTO_MAX_EDGE);
+		CHECK(sp->job_in_height_seen == 1536u);
+		CHECK(sp->job_focal_seen == Catch::Approx(2500.0f * 3072.0f / 3200.0f)); // the focal follows the photo
+		REQUIRE(extra.camera_json != nullptr);
+		const std::string cam = extra.camera_json;
+		CHECK(cam.find("\"width\":3200") != std::string::npos); // back in the caller's pixels
+		CHECK(cam.find("\"height\":1600") != std::string::npos);
+		CHECK(cam.find("\"fx\":2500") != std::string::npos);
+		std::free(bytes);
+		std::free(extra.camera_json);
+		std::free(extra.facts_json);
+	});
+	conv_fake_fini(&f);
+}
+
+TEST_CASE("GAUSSIANS facade (spec 6): a failed conversion is reported once, promptly", "[ipc_lift_core]")
+{
+	conv_fake_provider f;
+	conv_fake_init(&f, "splats");
+	conv_fake_cap *sp =
+	    conv_fake_add_cap(&f, 7, XRT_CONV_TASK_SPLATS_MONO, XRT_CONV_LANE_JOB, XRT_CONV_OUT_SPLAT_BLOB, 0);
+	sp->state = XRT_CONV_STATE_READY;
+	sp->job_blob_format = XRT_CONV_BLOB_PLY_3DGS;
+	sp->job_bytes = 4096;
+	sp->job_refusal = XRT_CONV_REFUSAL_INPUT_TOO_LARGE;
+	with_facade(f, [&](Fixture &fx, uint64_t id) {
+		const uint64_t fid = submit_photo(fx, id, 32, 16, 0.0f, 41);
+		bool ready = false;
+		xrt_lift_blob_info info{};
+		uint8_t *bytes = nullptr;
+		ipc_server_conv_blob_extra extra{};
+		const auto t0 = std::chrono::steady_clock::now();
+		REQUIRE(wait_until(
+		    [&] {
+			    REQUIRE(ipc_server_conv_lift_acquire_blob_ex(fx.sc, 1, id, 1ull << 30, &ready, &info,
+			                                                 &bytes, &extra) == XRT_SUCCESS);
+			    return extra.failed;
+		    },
+		    3000));
+		CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(3));
+		CHECK_FALSE(ready);
+		CHECK(bytes == nullptr);
+		CHECK(info.frame_id == fid);
+		CHECK(info.source_time == 41);
+		// Reported once: the stream then reads NOT READY, and stays usable.
+		REQUIRE(ipc_server_conv_lift_acquire_blob_ex(fx.sc, 1, id, 1ull << 30, &ready, &info, &bytes, &extra) ==
+		        XRT_SUCCESS);
+		CHECK_FALSE(extra.failed);
+		CHECK_FALSE(ready);
+
+		// The spec-5 view of the same failure: NOT READY, nothing else.
+		(void)submit_photo(fx, id, 32, 16, 0.0f, 42);
+		for (int i = 0; i < 50; i++) {
+			REQUIRE(ipc_server_conv_lift_acquire_blob(fx.sc, 1, id, 1ull << 30, &ready, &info, &bytes) ==
+			        XRT_SUCCESS);
+			CHECK_FALSE(ready);
+			CHECK(info.frame_id == 0u);
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+
+		// A good photo after a failure succeeds.
+		sp->job_refusal = 0;
+		(void)submit_photo(fx, id, 32, 16, 0.0f, 43);
+		REQUIRE(wait_until(
+		    [&] {
+			    REQUIRE(ipc_server_conv_lift_acquire_blob_ex(fx.sc, 1, id, 1ull << 30, &ready, &info,
+			                                                 &bytes, &extra) == XRT_SUCCESS);
+			    std::free(extra.camera_json);
+			    std::free(extra.facts_json);
+			    return ready;
+		    },
+		    3000));
+		CHECK(info.source_time == 43);
+		std::free(bytes);
+	});
+	conv_fake_fini(&f);
+}
+#endif
+
 TEST_CASE("roadmap 11.2: IPC handle capacity and reply sizes (measured)", "[ipc_lift_core]")
 {
 	// One line per measured limit; the static_asserts above are the gate.

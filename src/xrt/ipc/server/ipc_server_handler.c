@@ -10283,10 +10283,14 @@ ipc_handle_lift_get_fence(volatile struct ipc_client_state *ics,
 
 /*!
  * Varlen reply: struct ipc_lift_acquire_blob_reply {result, ready, frame_id,
- * source_time, format, byte_count}, then — only when result is XRT_SUCCESS,
- * ready, and capacity >= byte_count — byte_count bytes in ONE send. With a
- * smaller capacity only the header goes (the blob stays latched service-side
- * for the second call). Rejections ride in reply.result over a healthy pipe.
+ * source_time, format, byte_count, camera_bytes, facts_bytes, failed,
+ * failure_reason}, then -- only when result is XRT_SUCCESS and ready --
+ * camera_bytes of camera-block JSON and facts_bytes of facts JSON (spec 6, no
+ * NUL, on the size query and the delivery alike), then -- only when capacity
+ * >= byte_count -- byte_count blob bytes in ONE send. With a smaller capacity
+ * the blob stays latched service-side for the second call. A failed
+ * conversion (spec 6) is ready = false, failed = true, no payload.
+ * Rejections ride in reply.result over a healthy pipe.
  */
 xrt_result_t
 ipc_handle_lift_acquire_blob(volatile struct ipc_client_state *ics, uint64_t stream_id, uint64_t capacity)
@@ -10296,19 +10300,28 @@ ipc_handle_lift_acquire_blob(volatile struct ipc_client_state *ics, uint64_t str
 	struct ipc_lift_acquire_blob_reply reply = XRT_STRUCT_INIT;
 	reply.result = require_lift_client(ics, "lift_acquire_blob");
 	uint8_t *bytes = NULL;
+	struct ipc_server_conv_blob_extra extra = {0};
 
 	if (reply.result == XRT_SUCCESS && ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
 		// #2003: the GAUSSIANS photo facade over the job lane (G8).
 		uint64_t cap = capacity > IPC_LIFT_BLOB_MAX_BYTES ? IPC_LIFT_BLOB_MAX_BYTES : capacity;
 		struct xrt_lift_blob_info info = {0};
 		bool ready = false;
-		reply.result = ipc_server_conv_lift_acquire_blob(ipc_server_get_conv(), lift_owner(ics), stream_id, cap,
-		                                                 &ready, &info, &bytes);
+		reply.result = ipc_server_conv_lift_acquire_blob_ex(ipc_server_get_conv(), lift_owner(ics), stream_id,
+		                                                    cap, &ready, &info, &bytes, &extra);
 		reply.ready = ready;
 		reply.frame_id = info.frame_id;
 		reply.source_time = info.source_time;
 		reply.format = info.format;
 		reply.byte_count = info.byte_count;
+		reply.failed = extra.failed;
+		reply.failure_reason = extra.failure_reason;
+		const size_t cam_n = extra.camera_json != NULL ? strlen(extra.camera_json) : 0;
+		const size_t facts_n = extra.facts_json != NULL ? strlen(extra.facts_json) : 0;
+		if (ready && cam_n <= IPC_LIFT_BLOB_JSON_MAX_BYTES && facts_n <= IPC_LIFT_BLOB_JSON_MAX_BYTES) {
+			reply.camera_bytes = (uint32_t)cam_n;
+			reply.facts_bytes = (uint32_t)facts_n;
+		}
 		if (reply.result == XRT_SUCCESS && info.byte_count > IPC_LIFT_BLOB_MAX_BYTES) {
 			reply.result = XRT_ERROR_ALLOCATION;
 			free(bytes);
@@ -10319,13 +10332,22 @@ ipc_handle_lift_acquire_blob(volatile struct ipc_client_state *ics, uint64_t str
 	}
 
 	xrt_result_t xret = ipc_send(imc, &reply, sizeof(reply));
-	if (xret == XRT_SUCCESS && reply.result == XRT_SUCCESS && bytes != NULL && reply.byte_count > 0) {
+	const bool payload = xret == XRT_SUCCESS && reply.result == XRT_SUCCESS && reply.ready;
+	if (payload && reply.camera_bytes > 0) {
+		xret = ipc_send(imc, extra.camera_json, reply.camera_bytes);
+	}
+	if (payload && xret == XRT_SUCCESS && reply.facts_bytes > 0) {
+		xret = ipc_send(imc, extra.facts_json, reply.facts_bytes);
+	}
+	if (payload && xret == XRT_SUCCESS && bytes != NULL && reply.byte_count > 0) {
 		xret = ipc_send(imc, bytes, (size_t)reply.byte_count);
 	}
 	if (xret != XRT_SUCCESS) {
 		IPC_ERROR(ics->server, "lift_acquire_blob: failed to send the reply");
 	}
 	free(bytes);
+	free(extra.camera_json);
+	free(extra.facts_json);
 	return xret;
 }
 

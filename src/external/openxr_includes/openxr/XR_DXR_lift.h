@@ -81,8 +81,15 @@
  * default and whether a create would pick it -- and XrLiftProviderPreferenceDXR
  * chained on XrLiftTaskStreamCreateInfoDXR is a per-create HINT that reorders
  * the non-terminal candidates for that create only. The runtime still
- * arbitrates; an app never sets the user's default. Spec 6 (planned, not in
- * this header): jobs, stereo-pair / image+depth input and splats over the
+ * arbitrates; an app never sets the user's default. 6 = the GAUSSIANS
+ * camera block: XrLiftBlobCameraDXR chained on XrLiftBlobDXR returns, with
+ * each blob, the camera block v2 the runtime builds from the provider's facts
+ * (the same JSON object a SOG's meta.json carries as `camera`, so one parser
+ * serves both) plus those facts; a failed conversion is reported once as
+ * XR_ERROR_LIFT_CONVERSION_FAILED_DXR instead of reading NOT READY forever;
+ * and a photo larger than the provider can take is downscaled by the runtime
+ * (intrinsics reported in the caller's pixels). Spec 7 (planned, not in this
+ * header): jobs, stereo-pair / image+depth input and splats over the
  * extension (the 1004999360.. types).
  */
 #ifndef XR_DXR_LIFT_H
@@ -96,7 +103,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_lift 1
-#define XR_DXR_lift_SPEC_VERSION 5
+#define XR_DXR_lift_SPEC_VERSION 6
 #define XR_DXR_LIFT_EXTENSION_NAME "XR_DXR_lift"
 
 // Reserved 1004999270..279. Allocation registry: README.md in this directory.
@@ -125,8 +132,8 @@ extern "C" {
 // ---- Spec v4 (ADR-053: tasks, readiness, neutral transport) ----
 // Reserved 1004999340..369 (three decades, spec 4, 5 and 6). Registry:
 // README.md in this directory. 1004999340 (held back when provider
-// enumeration was cut from spec 4) is spec 5's candidate struct; 353..359
-// are free.
+// enumeration was cut from spec 4) is spec 5's candidate struct; 353 / 354
+// are spec 6's; 355..359 are free.
 #define XR_TYPE_LIFT_TASK_PROPERTIES_DXR               ((XrStructureType)1004999341)
 #define XR_TYPE_LIFT_TASK_STREAM_CREATE_INFO_DXR       ((XrStructureType)1004999342)
 #define XR_TYPE_LIFT_FRAME_IMAGES_DXR                  ((XrStructureType)1004999343)
@@ -141,6 +148,12 @@ extern "C" {
 // ---- Spec v5 (#2178: read-only provider candidates + a per-create hint) ----
 #define XR_TYPE_LIFT_TASK_CANDIDATE_DXR                ((XrStructureType)1004999340)
 #define XR_TYPE_LIFT_PROVIDER_PREFERENCE_DXR           ((XrStructureType)1004999352)
+// ---- Spec v6 (the GAUSSIANS camera block + a prompt failure) ----
+#define XR_TYPE_LIFT_BLOB_CAMERA_DXR                   ((XrStructureType)1004999353)
+//! ERROR-class result of xrAcquireLiftBlobDXR (spec 6): the newest photo's
+//! conversion FAILED. Reported once, for that photo (XrLiftBlobDXR::frameId /
+//! sourceTime name it); the stream stays usable -- submit another photo.
+#define XR_ERROR_LIFT_CONVERSION_FAILED_DXR            ((XrResult)-1004999354)
 
 //! Size of XrLiftPropertiesDXR::backend, NUL included.
 #define XR_LIFT_BACKEND_NAME_MAX_SIZE_DXR 32
@@ -616,6 +629,45 @@ typedef struct XrLiftBlobDXR {
 } XrLiftBlobDXR;
 
 /*!
+ * The camera of a GAUSSIANS blob (spec 6). Chain on XrLiftBlobDXR::next;
+ * filled on every xrAcquireLiftBlobDXR that returns a blob (XR_SUCCESS),
+ * the size query included, for the SAME frame the blob call latched.
+ *
+ * @c camera is the DisplayXR camera block v2 as UTF-8 JSON -- byte for byte
+ * the object `displayxr-cli conv run --camera-block auto` writes into a SOG's
+ * meta.json as `camera` (`source`, `convention`, `rig`, `rest`, `intrinsics`,
+ * `stereo` / `metric` only when metric, `focus`, `dxr`), so a consumer feeds it
+ * to the parser it uses for a SOG's camera. The RUNTIME builds it from the
+ * common facts schema whatever provider made the splats; never branch on the
+ * provider. `intrinsics` are in the pixels of the photo the CALLER submitted
+ * (scaled back when the runtime downscaled it) and are omitted when the
+ * provider reported none (nothing is assumed). `focus` is the provider's
+ * suggestion (`"source": "auto"`), else the runtime's own estimate from the
+ * splats (`"source": "runtime"`: the screen-plane rule lifted video uses).
+ * A SOG that already carries an authored camera block returns that block
+ * verbatim. @c facts is the provider's facts (the `X-DXR-Result` /
+ * `conv run --facts` shape: intrinsics with their source -- given / estimated /
+ * assumed --, metric, near / far, focus suggestion, build stamp).
+ *
+ * Strings: two-call idiom per string, counts include the terminating NUL.
+ * A string is written only when its capacity is at least its count; a
+ * smaller capacity is NOT an error (the blob call still succeeds and its
+ * latch rules are unchanged), so size both strings on the blob's size query.
+ * A count of 0 = not available. Ignored by a spec-5 runtime (counts stay as
+ * the caller set them: initialise them to 0).
+ */
+typedef struct XrLiftBlobCameraDXR {
+    XrStructureType     type;                //!< XR_TYPE_LIFT_BLOB_CAMERA_DXR
+    void* XR_MAY_ALIAS  next;
+    uint32_t            cameraCapacityInput;
+    uint32_t            cameraCountOutput;   //!< NUL included; 0 = none
+    char*               camera;              //!< camera block v2 JSON
+    uint32_t            factsCapacityInput;
+    uint32_t            factsCountOutput;    //!< NUL included; 0 = none
+    char*               facts;               //!< provider facts JSON
+} XrLiftBlobCameraDXR;
+
+/*!
  * "The content of weave rect @c rectIndex is 2D — lift it before weaving."
  *
  * An element of XrWeaveSubmitLiftRectsDXR (an XrRect2Di has no @c next, so the
@@ -703,17 +755,17 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetLiftStreamStatsDXR)(XrLiftStreamDXR stream
  * WHAT to compute. A fixed vocabulary; a task is served by at most one
  * provider at a time, chosen by the runtime (an app may HINT a provider per
  * create, spec 5; the runtime still decides). RESERVED values
- * are refused (XR_ERROR_VALIDATION_FAILURE). Tasks marked "spec 6" are not
- * creatable on a spec-4 or spec-5 runtime.
+ * are refused (XR_ERROR_VALIDATION_FAILURE). Tasks marked "spec 7" are not
+ * creatable on a spec-4, spec-5 or spec-6 runtime.
  */
 typedef enum XrLiftTaskDXR {
     XR_LIFT_TASK_DEPTH_MONO_DXR        = 1,  //!< one image -> depth (stills; no temporal state)
     XR_LIFT_TASK_DEPTH_VIDEO_DXR       = 2,  //!< frames -> depth, temporally stable; reset on discontinuity
-    XR_LIFT_TASK_DISPARITY_STEREO_DXR  = 3,  //!< rectified pair + calibration -> disparity / depth (spec 6)
+    XR_LIFT_TASK_DISPARITY_STEREO_DXR  = 3,  //!< rectified pair + calibration -> disparity / depth (spec 7)
     XR_LIFT_TASK_VIEWS_MONO_DXR        = 4,  //!< image/frames -> N >= 2 views (+ same-inference aux depth)
-    XR_LIFT_TASK_VIEWS_FROM_DEPTH_DXR  = 5,  //!< image + depth -> N views (spec 6)
+    XR_LIFT_TASK_VIEWS_FROM_DEPTH_DXR  = 5,  //!< image + depth -> N views (spec 7)
     XR_LIFT_TASK_SPLATS_MONO_DXR       = 6,  //!< photo -> 3D Gaussian splats (job lane)
-    XR_LIFT_TASK_SPLATS_STEREO_DXR     = 7,  //!< pair + calibration -> metric splats (spec 6, job lane)
+    XR_LIFT_TASK_SPLATS_STEREO_DXR     = 7,  //!< pair + calibration -> metric splats (spec 7, job lane)
     XR_LIFT_TASK_SPLATS_VIDEO_DXR      = 8,  //!< RESERVED
     XR_LIFT_TASK_INPAINT_DXR           = 9,  //!< RESERVED (a provider sub-stage, never app-creatable)
     XR_LIFT_TASK_MAX_ENUM_DXR = 0x7FFFFFFF
@@ -722,8 +774,8 @@ typedef enum XrLiftTaskDXR {
 /*! The shape of the input a task stream consumes. */
 typedef enum XrLiftInputKindDXR {
     XR_LIFT_INPUT_KIND_MONO_DXR            = 1, //!< one colour image
-    XR_LIFT_INPUT_KIND_STEREO_PAIR_DXR     = 2, //!< rectified L/R pair (spec 6)
-    XR_LIFT_INPUT_KIND_IMAGE_AND_DEPTH_DXR = 3, //!< colour + depth image (spec 6)
+    XR_LIFT_INPUT_KIND_STEREO_PAIR_DXR     = 2, //!< rectified L/R pair (spec 7)
+    XR_LIFT_INPUT_KIND_IMAGE_AND_DEPTH_DXR = 3, //!< colour + depth image (spec 7)
     XR_LIFT_INPUT_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftInputKindDXR;
 typedef XrFlags64 XrLiftInputKindFlagsDXR; //!< bit (1 << XrLiftInputKindDXR)
@@ -785,7 +837,7 @@ typedef enum XrLiftQualityHintDXR {
 
 typedef XrFlags64 XrLiftLaneFlagsDXR;
 static const XrLiftLaneFlagsDXR XR_LIFT_LANE_STREAM_BIT_DXR = 0x00000001; //!< latest-wins streams
-static const XrLiftLaneFlagsDXR XR_LIFT_LANE_JOB_BIT_DXR    = 0x00000002; //!< one-shot jobs (spec 6)
+static const XrLiftLaneFlagsDXR XR_LIFT_LANE_JOB_BIT_DXR    = 0x00000002; //!< one-shot jobs (spec 7)
 
 typedef XrFlags64 XrLiftOutputFlagsDXR;
 static const XrLiftOutputFlagsDXR XR_LIFT_OUTPUT_AUX_DEPTH_BIT_DXR           = 0x00000001; //!< views + same-inference depth
@@ -853,8 +905,8 @@ typedef enum XrLiftColorSpaceDXR {
 
 typedef enum XrLiftImageRoleDXR {
     XR_LIFT_IMAGE_ROLE_COLOR_DXR       = 1, //!< mono input, or the first/left eye, or a whole SBS pair
-    XR_LIFT_IMAGE_ROLE_COLOR_RIGHT_DXR = 2, //!< second eye when the pair is two images (spec 6)
-    XR_LIFT_IMAGE_ROLE_DEPTH_DXR       = 3, //!< depth input (+ XrLiftDepthInfoDXR on next), spec 6
+    XR_LIFT_IMAGE_ROLE_COLOR_RIGHT_DXR = 2, //!< second eye when the pair is two images (spec 7)
+    XR_LIFT_IMAGE_ROLE_DEPTH_DXR       = 3, //!< depth input (+ XrLiftDepthInfoDXR on next), spec 7
     XR_LIFT_IMAGE_ROLE_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftImageRoleDXR;
 
@@ -865,7 +917,7 @@ typedef enum XrLiftDepthKindDXR {
     XR_LIFT_DEPTH_KIND_AFFINE_INVERSE_DEPTH_DXR = 3, //!< unknown scale+shift of 1/depth, larger = nearer (v3: RELATIVE + INVERSE)
     XR_LIFT_DEPTH_KIND_AFFINE_DISPARITY_DXR     = 4, //!< disparity up to scale+shift (v3: RELATIVE + INVERSE)
     XR_LIFT_DEPTH_KIND_AFFINE_DEPTH_DXR         = 5, //!< unknown scale+shift, larger = farther (v3: RELATIVE + LINEAR)
-    XR_LIFT_DEPTH_KIND_PIXEL_DISPARITY_DXR      = 6, //!< exact disparity in pixels of a rectified pair (spec 6)
+    XR_LIFT_DEPTH_KIND_PIXEL_DISPARITY_DXR      = 6, //!< exact disparity in pixels of a rectified pair (spec 7)
     XR_LIFT_DEPTH_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftDepthKindDXR;
 
@@ -1013,7 +1065,7 @@ typedef struct XrEventDataLiftTaskStateChangedDXR {
  *    stream lane, or when a @c requiredOutputs bit is missing from a provider
  *    that is READY. Before READY, @c requiredOutputs is not grounds for a
  *    refusal (a provider may report its outputs only once loaded).
- *  - XR_ERROR_VALIDATION_FAILURE for a reserved or spec-5 task, a @c viewCount
+ *  - XR_ERROR_VALIDATION_FAILURE for a reserved or spec-7 task, a @c viewCount
  *    above the task's maxViews, an input kind or export kind no candidate
  *    offers, or a mode that does not match the task.
  *  - XR_ERROR_LIMIT_REACHED past the task's maxStreams.
@@ -1335,6 +1387,8 @@ XRAPI_ATTR XrResult XRAPI_CALL xrAcquireLiftResultDXR(XrLiftStreamDXR stream, Xr
 
 //! The newest finished blob (GAUSSIANS streams), two-call idiom — see
 //! XrLiftBlobDXR. XR_ERROR_VALIDATION_FAILURE on a texture-mode stream.
+//! Spec 6: chain XrLiftBlobCameraDXR for the camera block; a failed
+//! conversion is XR_ERROR_LIFT_CONVERSION_FAILED_DXR (once per photo).
 XRAPI_ATTR XrResult XRAPI_CALL xrAcquireLiftBlobDXR(XrLiftStreamDXR stream, XrLiftBlobDXR* blob);
 
 //! Set the stream's scheduling priority (see XrLiftPriorityDXR). Cheap; takes

@@ -80,6 +80,8 @@ endif()
 add_library(conv_store STATIC conv_model_store.c conv_model_store.h
 	# ADR-057 S1: facts JSON + the convenience camera-block writer (CLI, tests).
 	conv_camera_block.c conv_camera_block.h
+	# XR_DXR_lift spec 6: the runtime's focus of a splat cloud (camera-block fallback).
+	conv_splat_focus.c conv_splat_focus.h
 	# #2194: get_path (scratch / model store / logs), shared by both hosts.
 	conv_host_paths.c conv_host_paths.h)
 add_library(displayxr::conversion_store ALIAS conv_store)

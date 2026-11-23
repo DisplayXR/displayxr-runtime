@@ -283,24 +283,49 @@ ipc_client_lift_acquire_blob(struct ipc_connection *ipc_c,
 		ipc_client_connection_unlock(ipc_c);
 		return xret;
 	}
-	bool ready = false;
+	bool ready = false, failed = false;
 	uint64_t frame_id = 0, byte_count = 0;
 	int64_t source_time = 0;
-	uint32_t format = 0;
+	uint32_t format = 0, camera_bytes = 0, facts_bytes = 0, failure_reason = 0;
 	xrt_result_t result =
-	    ipc_receive_lift_acquire_blob_locked(ipc_c, &ready, &frame_id, &source_time, &format, &byte_count);
+	    ipc_receive_lift_acquire_blob_locked(ipc_c, &ready, &frame_id, &source_time, &format, &byte_count,
+	                                         &camera_bytes, &facts_bytes, &failed, &failure_reason);
 	if (result != XRT_SUCCESS) {
 		// Receive failure (pipe) or a service-side rejection: no payload follows.
 		ipc_client_connection_unlock(ipc_c);
 		return result;
 	}
+	// Spec 6: the camera block + facts JSON precede the bytes on every ready reply.
+	char *json[2] = {NULL, NULL};
+	const uint32_t json_n[2] = {ready ? camera_bytes : 0u, ready ? facts_bytes : 0u};
+	for (int i = 0; i < 2 && xret == XRT_SUCCESS; i++) {
+		if (json_n[i] == 0) {
+			continue;
+		}
+		json[i] = (char *)malloc((size_t)json_n[i] + 1);
+		if (json[i] == NULL) {
+			// The pipe must still be drained of these bytes: read into a scratch.
+			uint8_t sink[256];
+			uint32_t left = json_n[i];
+			while (left > 0 && xret == XRT_SUCCESS) {
+				const uint32_t n = left < sizeof(sink) ? left : (uint32_t)sizeof(sink);
+				xret = ipc_receive(&ipc_c->imc, sink, n);
+				left -= n;
+			}
+			continue;
+		}
+		xret = ipc_receive(&ipc_c->imc, json[i], json_n[i]);
+		json[i][json_n[i]] = '\0';
+	}
 	// The service sends the bytes exactly when it had them and capacity sufficed.
-	if (ready && byte_count > 0 && capacity >= byte_count) {
+	if (xret == XRT_SUCCESS && ready && byte_count > 0 && capacity >= byte_count) {
 		xret = ipc_receive(&ipc_c->imc, out_bytes, (size_t)byte_count);
 		*out_delivered = xret == XRT_SUCCESS;
 	}
 	ipc_client_connection_unlock(ipc_c);
 	if (xret != XRT_SUCCESS) {
+		free(json[0]);
+		free(json[1]);
 		return xret;
 	}
 	*out_ready = ready;
@@ -308,6 +333,10 @@ ipc_client_lift_acquire_blob(struct ipc_connection *ipc_c,
 	out_info->source_time = source_time;
 	out_info->format = format;
 	out_info->byte_count = byte_count;
+	out_info->camera_json = json[0];
+	out_info->facts_json = json[1];
+	out_info->failed = failed;
+	out_info->failure_reason = failure_reason;
 	return XRT_SUCCESS;
 }
 

@@ -1224,6 +1224,8 @@ struct ipc_weave_dmabuf_output
 #define IPC_LIFT_WEAVE_RECTS_MAX 8
 //! Largest blob the service will send in one lift_acquire_blob reply.
 #define IPC_LIFT_BLOB_MAX_BYTES (256u * 1024u * 1024u)
+//! XR_DXR_lift spec 6: largest camera-block / facts JSON a blob acquire carries (each).
+#define IPC_LIFT_BLOB_JSON_MAX_BYTES (64u * 1024u)
 
 /*!
  * The conversion module's capabilities (xrGetLiftPropertiesDXR). Field values

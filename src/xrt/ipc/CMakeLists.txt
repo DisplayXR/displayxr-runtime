@@ -134,7 +134,7 @@ endif()
 # host-testable with a CPU fake provider (tests_ipc_lift_core).
 add_library(ipc_server_conv STATIC server/ipc_server_conv.c server/ipc_server_conv.h)
 target_include_directories(ipc_server_conv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(ipc_server_conv PUBLIC conv_runtime xrt-interfaces PRIVATE aux_util aux_os)
+target_link_libraries(ipc_server_conv PUBLIC conv_runtime xrt-interfaces PRIVATE conv_store aux_util aux_os xrt-external-cjson)
 if(NOT WIN32)
 	# The POSIX CPU I/O glue (no D3D11 device): spec-4 CPU kinds.
 	target_sources(ipc_server_conv PRIVATE server/ipc_server_conv_cpu.c server/ipc_server_conv_cpu.h)

@@ -31,6 +31,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -89,6 +90,42 @@ conv_camera_block_write(const char *path, const cJSON *block, char *err, size_t 
 /*! Read `meta.json` out of @p path (any of the three forms); malloc'd, NUL-terminated. */
 char *
 conv_sog_read_meta(const char *path, char *err, size_t err_size);
+
+/*! `meta.json` of a bundled SOG held in memory; malloc'd, NUL-terminated (NULL + @p err otherwise). */
+char *
+conv_sog_read_meta_mem(const uint8_t *sog, size_t size, char *err, size_t err_size);
+
+/*!
+ * Scale the `intrinsics` of facts JSON in place: fx, cx and width by @p sx;
+ * fy, cy and height by @p sy (width / height rounded). The runtime downscaled
+ * the caller's photo before the provider saw it, so the facts handed back are
+ * re-expressed in the CALLER's pixels. 1, 1 (or a missing block) = no change.
+ */
+void
+conv_splat_facts_scale_intrinsics(cJSON *facts, double sx, double sy);
+
+/*!
+ * The camera block a lift caller receives with a GAUSSIANS blob (XR_DXR_lift
+ * spec 6): the SAME v2 object `conv run --camera-block auto` writes into a SOG,
+ * built by the RUNTIME from the common facts schema whatever provider made the
+ * splats, so a consumer parses it exactly like a SOG's `meta.json` camera.
+ *
+ *  - A SOG blob that already carries an AUTHORED camera block (any `camera`
+ *    whose `source` is not "auto"): that block, verbatim.
+ *  - Else conv_camera_block_from_facts(); when the facts lack intrinsics, the
+ *    same block without `intrinsics` (a viewer estimates them; never a
+ *    nominal field of view).
+ *  - `focus`: the provider's suggestion ("source": "auto", as the writer
+ *    labels it); else, for a PLY, the runtime's own estimate from the splats
+ *    (conv_splat_focus_from_ply, "source": "runtime"); else, for a SOG, the
+ *    focus of its own auto block. No focus at all when none of these exist.
+ *
+ * @p conv_blob_format is XRT_CONV_BLOB_*. Never NULL for a PLY / SOG (the
+ * caller frees with cJSON_Delete); NULL with @p err for other formats.
+ */
+cJSON *
+conv_lift_camera_block(
+    const cJSON *facts, const uint8_t *blob, size_t size, uint32_t conv_blob_format, char *err, size_t err_size);
 
 #ifdef __cplusplus
 }

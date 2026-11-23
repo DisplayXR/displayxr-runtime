@@ -40,6 +40,15 @@ struct conv_fake_cap
 	uint32_t job_blob_format; //!< XRT_CONV_BLOB_* of the job blob; 0 = SPZ
 	uint32_t job_refusal;     //!< ADR-057: != 0 = the job is refused with this XRT_CONV_REFUSAL_* (fails, no blob)
 	uint32_t job_flags_seen;  //!< ADR-057: xrt_conv_job_in::job_flags of the last job
+	//! XR_DXR_lift spec 6: the blob bytes to write (job_bytes of them) instead
+	//! of the generated pattern; NULL = the pattern.
+	const uint8_t *job_blob;
+	//! Spec 6: splat facts to report (intrinsics etc.; blob_format / splat_count
+	//! are filled by the fake); used when job_report_facts.
+	bool job_report_facts;
+	struct xrt_conv_splat_info job_splat_info;
+	uint32_t job_in_width_seen, job_in_height_seen; //!< first input image of the last job
+	float job_focal_seen;                           //!< xrt_conv_params::focal_px of the last job
 	float convergence_value;  //!< > 0: reported (decoded units) on every depth result
 	float relief_scale;       //!< != 0: relief reported on every depth result
 	float relief_offset;
