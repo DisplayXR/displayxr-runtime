@@ -44,23 +44,25 @@ public sealed class DashboardContext
     /// <summary>The install / update / uninstall in flight (one at a time), and how the last one ended.</summary>
     public CatalogOperation? CatalogOp { get; private set; }
     public (string ItemId, CatalogOutcome Outcome)? CatalogResult { get; private set; }
+    /// <summary>The verb <see cref="CatalogResult"/> is the end of.</summary>
+    public CatalogVerb? CatalogResultVerb { get; private set; }
+
+    /// <summary>
+    /// The last catalog that was read in this session, and when: what the Components page keeps
+    /// showing (marked as such) when a later read fails, so its rows do not vanish.
+    /// </summary>
+    public CatalogList? CatalogLastGood { get; private set; }
+    public DateTime? CatalogLastGoodWhen { get; private set; }
 
     /// <summary>The key activation in flight, and how the last one ended. Neither ever holds the key.</summary>
     public string? ActivatingItem { get; private set; }
     public (string ItemId, ActivationOutcome Outcome)? ActivationResult { get; private set; }
 
-    /// <summary>An item (or a Components row) another page asked the Catalog to open; the Catalog page consumes it.</summary>
+    /// <summary>A catalog item the Components page is asked to open; the page consumes it.</summary>
     public CatalogFocus? CatalogFocus { get; set; }
 
-    /// <summary>Open the Catalog on the item behind a Components row.</summary>
-    public void OpenInCatalog(ComponentClass cls, string componentId, string name)
-    {
-        CatalogFocus = new CatalogFocus(null, cls, componentId, name);
-        Navigate("catalog");
-    }
-
     /// <summary>
-    /// <c>list --json</c> through the engine: on Catalog show when older than 5 min, on Refresh and
+    /// <c>list --json</c> through the engine: on Components show when older than 5 min, on Refresh and
     /// after an operation (<paramref name="force"/>). It reaches the network (bounded by the engine),
     /// so it is never polled, and never runs on the UI thread.
     /// </summary>
@@ -80,6 +82,11 @@ public sealed class DashboardContext
         {
             CatalogLoading = false;
             _catalogWhen = DateTime.Now;
+        }
+        if (CatalogRead is { Status: CatalogStatus.Ready, List: { } good })
+        {
+            CatalogLastGood = good;
+            CatalogLastGoodWhen = _catalogWhen;
         }
         DashboardLog.Info($"catalog: {CatalogRead.Status}, {CatalogRead.List?.Items.Count ?? 0} item(s)");
         Bump();
@@ -122,6 +129,7 @@ public sealed class DashboardContext
         DashboardLog.Info($"catalog: {verb} {item.Id} -> {(outcome.Ok ? "ok" : "not done")} (exit {outcome.ExitCode?.ToString() ?? "-"}): {outcome.Title}");
         CatalogOp = null;
         CatalogResult = (item.Id, outcome);
+        CatalogResultVerb = verb;
         op.StopWaiting.Dispose();
         if (outcome.StillRunning is { IsCompleted: false } running)
         {
@@ -160,6 +168,7 @@ public sealed class DashboardContext
         DashboardLog.Info($"catalog: {background.Verb} {background.ItemId} ended in the background (exit {outcome.ExitCode?.ToString() ?? "-"})");
         if (ReferenceEquals(CatalogBackground, background)) CatalogBackground = null;
         CatalogResult = (background.ItemId, outcome);
+        CatalogResultVerb = background.Verb;
         Bump();
         await LoadCatalogAsync(force: true);
         if (outcome.Changed && item.PolicyClass is { } cls) await LoadPolicyAsync(cls, force: true);

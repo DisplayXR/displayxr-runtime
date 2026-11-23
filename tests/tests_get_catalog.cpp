@@ -1115,6 +1115,7 @@ TEST_CASE("inventory: list, outdated and receipts")
 	m.sz["HKLM\\Software\\DisplayXR\\ConversionProviders\\open-conversion\\Version"] = "0.1.1";
 	m.receipts["leia-sr"] = receipt("leia-sr", "2.23.0", SHA_LEIA, "runtime");
 	m.receipts["open-conversion"] = receipt("open-conversion", "0.1.1", SHA_ACME); // another build
+	m.receipts["open-conversion"].uninstall[0] = '\0'; // installed from an entry that names no uninstall command
 	dxr_env e = m.env();
 
 	auto state_of = [](const cJSON *arr, const char *id) -> std::string {
@@ -1151,6 +1152,19 @@ TEST_CASE("inventory: list, outdated and receipts")
 		if (id == "runtime") {
 			CHECK(std::string(cJSON_GetObjectItem(x, "tier")->valuestring) == "listed"); // absent = listed
 			CHECK(cJSON_IsFalse(cJSON_GetObjectItem(x, "receipt")));
+			CHECK(cJSON_IsFalse(cJSON_GetObjectItem(x, "can_uninstall"))); // no receipt: nothing to run
+		}
+		// `can_uninstall`: the receipt recorded an uninstall command. A receipt alone is not enough.
+		if (id == "leia-sr") {
+			CHECK(cJSON_IsTrue(cJSON_GetObjectItem(x, "receipt")));
+			CHECK(cJSON_IsTrue(cJSON_GetObjectItem(x, "can_uninstall")));
+		}
+		if (id == "open-conversion") {
+			CHECK(cJSON_IsTrue(cJSON_GetObjectItem(x, "receipt")));
+			CHECK(cJSON_IsFalse(cJSON_GetObjectItem(x, "can_uninstall")));
+		}
+		if (id == "browser") {
+			CHECK(cJSON_IsFalse(cJSON_GetObjectItem(x, "can_uninstall")));
 		}
 	}
 	cJSON_Delete(all);
@@ -1201,7 +1215,7 @@ TEST_CASE("list: one call answers a setup page")
 	const cJSON *leia = row(all, "leia-sr");
 	REQUIRE(leia != nullptr);
 	for (const char *k : {"id", "name", "class", "publisher", "tier", "installed", "available", "state",
-	                      "installable", "receipt"}) {
+	                      "installable", "receipt", "can_uninstall"}) {
 		INFO(k);
 		CHECK(cJSON_GetObjectItem(leia, k) != nullptr);
 	}

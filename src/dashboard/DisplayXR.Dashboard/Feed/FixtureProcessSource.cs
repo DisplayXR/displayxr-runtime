@@ -44,7 +44,7 @@ public sealed class FixtureProcessSource : IProcessSource
     // input-list.json beside the fixture (#2181): `input list --json` and the per-app pin verbs, simulated.
     private readonly JsonObject? _input;
     // <verb>-list.json beside the fixture (conv, tracking; input-list.json above): `<verb> list --json`
-    // and `<verb> activate <id> @file --json`, simulated, so the Catalog tab's licence block can be tried.
+    // and `<verb> activate <id> @file --json`, simulated, so the licence block of a Components row can be tried.
     private readonly Dictionary<string, JsonObject> _classLists = new();
     /// <summary>The key the simulated <c>activate</c> accepts (the sim providers' own test key).</summary>
     public const string TestKey = "DXR-SIM-TEST-KEY";

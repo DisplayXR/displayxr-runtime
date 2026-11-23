@@ -9,7 +9,8 @@ using System.Text.Json;
 
 namespace DisplayXR.Dashboard.Model;
 
-// ADR-064 step 8: the Catalog tab's model. Everything here is pure: the install
+// ADR-064 step 8: the catalog's model (shown on the Components page, joined with what is
+// installed: Model/ComponentRows.cs). Everything here is pure: the install
 // engine's `list --json` (docs/specs/runtime/dxr-get.md § list) read tolerantly, the
 // words the page shows, what each exit code means to a person, the licence block
 // and the URL rule. The page only lays these out; the tests pin them.
@@ -35,7 +36,8 @@ public sealed record CatalogItem(
     string Id, string Name, string Class, string? RegisteredId, string Publisher, string Tier,
     string? Installed, string? Available, string State, bool Installable, bool Receipt, string? Listing,
     string Summary, IReadOnlyList<string> Aliases, bool Recommended, string Detected, string? Evidence,
-    long Size, long Download, bool Compatible, string? IncompatibleReason, IReadOnlyList<CatalogPrereq> Prerequisites)
+    long Size, long Download, bool Compatible, string? IncompatibleReason, IReadOnlyList<CatalogPrereq> Prerequisites,
+    bool HasUninstallCommand = false)
 {
     public bool IsRuntime => Class == "runtime";
 
@@ -69,8 +71,13 @@ public sealed record CatalogItem(
         : !IsInstalled && SafeUrl.TryHttps(Listing, out _) ? CatalogAction.OpenListing
         : CatalogAction.None;
 
-    /// <summary>Only what the engine installed can be removed by it (a receipt); the rest has its own uninstaller.</summary>
-    public bool CanUninstall => IsInstalled && Receipt && !IsRuntime;
+    /// <summary>
+    /// Only what the engine installed (a receipt) AND can remove (the engine's <c>can_uninstall</c>:
+    /// the receipt recorded an uninstall command) is offered for removal. A receipt alone is not
+    /// enough: the engine refuses it with exit 43. A list without the field (an older engine)
+    /// reads as "cannot remove".
+    /// </summary>
+    public bool CanUninstall => IsInstalled && Receipt && HasUninstallCommand && !IsRuntime;
 
     /// <summary>"48 MB": what Install would still fetch, else the item's own size; null when unknown.</summary>
     public string? SizeText
@@ -202,7 +209,8 @@ public sealed record CatalogList(int Schema, IReadOnlyList<CatalogItem> Items)
                     e.Has("compatible") ? e.Bool("compatible") : true, e.StrOrNull("incompatible_reason"),
                     e.Arr("prerequisites").Where(p => p.ValueKind == JsonValueKind.Object && p.Str("name").Length > 0)
                         .Select(p => new CatalogPrereq(p.Str("name"), p.Bool("met"), p.Bool("installable"), p.StrOrNull("info_url")))
-                        .ToArray()))
+                        .ToArray(),
+                    e.Bool("can_uninstall")))
                 .ToArray();
             list = new CatalogList(root.Int("schema"), items);
             return true;
@@ -228,7 +236,7 @@ public sealed record CatalogList(int Schema, IReadOnlyList<CatalogItem> Items)
                     e.Str("id"), e.Str("name", e.Str("id")), e.Str("class"), null,
                     CatalogText.PublisherLabel(e.Str("publisher"), null), "",
                     e.StrOrNull("version"), null, "installed", false, true, null, "", Array.Empty<string>(), false,
-                    "none", null, 0, 0, true, null, Array.Empty<CatalogPrereq>()))
+                    "none", null, 0, 0, true, null, Array.Empty<CatalogPrereq>(), e.Bool("can_uninstall")))
                 .ToArray();
             list = new CatalogList(0, items);
             return true;
@@ -261,7 +269,7 @@ public sealed record CatalogRead(CatalogStatus Status, CatalogList? List, string
 
     public static readonly CatalogRead NoEngineHere = new(CatalogStatus.NoEngineHere, null,
         "Installs come from the Download page for now",
-        "On this system, DisplayXR and its add-ons are installed from the Download page. Everything you install there shows up in Components.");
+        "On this system, DisplayXR and its add-ons are installed from the Download page. Everything you install there shows up here.");
 
     public static CatalogRead EngineMissing(string lookedAt) => new(CatalogStatus.EngineMissing, null,
         "The Catalog arrives with the next DisplayXR update",
@@ -340,7 +348,7 @@ public static class CatalogExit
             NoReceipt => new(false, Level.Info, $"{name} was installed by its own installer",
                 "Remove it from Windows Settings > Apps > Installed apps.", code),
             CannotUninstall => new(false, Level.Info, $"{name} can't be removed from here",
-                "Something else you installed still uses it, or it came without an uninstaller. Remove what depends on it first, or use Windows Settings > Apps.", code),
+                $"Something else you installed still uses it, or it came without an uninstaller. Remove what depends on it first, or: {CatalogText.RemoveFromSettings}", code),
             NeedsAdmin => new(false, Level.Info, "Administrator permission is needed",
                 $"Windows asks once before DisplayXR can {doing} {name}. Choose Yes when it asks.", code),
             Usage => new(false, Level.Warn, "This Dashboard and the install engine don't match",
@@ -578,7 +586,7 @@ public sealed record CatalogBackground(string ItemId, string Name, CatalogVerb V
 }
 
 /// <summary>
-/// What another page asked the Catalog to open: an item id, or the Components row
+/// The catalog item the Components page is asked to open: an item id, or the component
 /// (<paramref name="Class"/> + <paramref name="ComponentId"/>) whose catalog item it is.
 /// </summary>
 public sealed record CatalogFocus(string? ItemId, ComponentClass? Class, string? ComponentId, string? Name);
@@ -602,6 +610,27 @@ public static class CatalogText
         return string.Join(" ", id.Split(new[] { '-', '_', '.' }, StringSplitOptions.RemoveEmptyEntries)
             .Select(w => char.ToUpperInvariant(w[0]) + w[1..]));
     }
+
+    /// <summary>How an installed catalog item is removed when the engine cannot remove it (no receipt, or no uninstall command).</summary>
+    public const string RemoveFromSettings = "Remove it from Windows Settings > Apps.";
+
+    /// <summary>
+    /// The Details line of an item the engine matched to this machine's display. The engine's raw
+    /// evidence (<see cref="CatalogItem.Evidence"/>) names internal panel codes and is not shown.
+    /// </summary>
+    public const string DetectedLine = "Works with your display: DisplayXR detected a supported display on this machine.";
+
+    /// <summary>A section's count line, non-zero parts only: "2 installed", "1 available to install", or both.</summary>
+    public static string Counts(int installed, int available)
+    {
+        var parts = new List<string>(2);
+        if (installed > 0) parts.Add($"{installed} installed");
+        if (available > 0) parts.Add($"{available} available to install");
+        return parts.Count > 0 ? string.Join(StatusText.Sep, parts) : "none installed";
+    }
+
+    /// <summary>A success, said on the row with nothing to dismiss: "X is installed. It is ready to use."</summary>
+    public static string Inline(string title, string text) => text.Length > 0 ? $"{title}. {text}" : $"{title}.";
 
     /// <summary>The one calm line for an item the engine would not install on this runtime.</summary>
     public const string OtherVersion = "Made for a different DisplayXR version. Updating DisplayXR usually makes it available.";

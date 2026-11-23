@@ -1608,6 +1608,10 @@ dxr_list_catalog(const struct dxr_catalog *c, const struct dxr_env *env, bool ou
 		cJSON_AddStringToObject(x, "state", state);
 		cJSON_AddBoolToObject(x, "installable", asset != NULL);
 		cJSON_AddBoolToObject(x, "receipt", receipt);
+		// Whether `uninstall <id>` has a command to run: the receipt recorded one. A receipt
+		// without one (every schema-1 install) is refused with exit 43, so a front end must
+		// not offer the removal.
+		cJSON_AddBoolToObject(x, "can_uninstall", receipt && rc.uninstall[0] != '\0');
 		const char *listing = jstr(jobj(platform_asset(it), "listing"), "url");
 		if (listing == NULL) {
 			listing = jstr(jobj(it, "links"), "listing");

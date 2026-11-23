@@ -121,6 +121,11 @@ public class ComponentPolicyFixtureTests
     public void Conv_Windows_BuiltInRowHasNoEnabledAndIsNeverPreferred()
     {
         var conv = Parse(ComponentClass.Conversion, "conv-list-n3e-win.json");
+        // The registered binary: `binary` on a conversion row, `binary_path` elsewhere; none for the built-in adapter.
+        Assert.Equal(@"C:\Program Files\DisplayXR\Runtime\plugins\DisplayXR-SimConversion.dll", conv.Row("sim-conversion")!.BinaryPath);
+        Assert.Equal("", conv.Row("dp-lift")!.BinaryPath);
+        Assert.Equal(@"C:\Program Files\DisplayXR\Plugins\LeiaSR\DisplayXR-LeiaSR.dll",
+                     Parse(ComponentClass.Display, "dp-list-n3e-win.json").Row("leia-sr")!.BinaryPath);
         var lift = conv.Row("dp-lift")!;
         Assert.True(lift.BuiltIn);
         Assert.Equal("default", lift.EnabledSource);

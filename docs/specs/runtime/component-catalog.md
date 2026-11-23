@@ -295,7 +295,7 @@ not checked and the client says so.
 | `installer.scope` | yes | `machine` or `user` |
 | `installer.elevation` | yes | `required` or `none`. A client that is not elevated relaunches itself elevated for `required` |
 | `installed` | yes, unless `listing` | how to read the installed version. `{ "kind": "registry_sz", "path": "HKLM\\…\\Value" }` (64-bit view), or `{ "kind": "registration_row" }` = the `Version` value of the item's own class row *(planned, step 3)*, or `{ "kind": "manifest" }` on POSIX |
-| `uninstall` | no | how to remove it. `{ "kind": "registry_command", "path", "args" }` reads a command line from the registry (the class row's `UninstallString`) and runs it with `args`; `{ "kind": "package", "name" }` on POSIX. Absent = the client offers no uninstall and says so *(planned, step 3)* |
+| `uninstall` | no | how to remove it. `{ "kind": "registry_command", "path", "args" }` reads a command line from the registry (the class row's `UninstallString`) and runs it with `args`; `{ "kind": "package", "name" }` on POSIX. Absent = the client offers no uninstall and says so *(planned, step 3)* Without it the engine can install the item but not remove it: its receipt records no uninstall command, `dxr-get uninstall` refuses with exit 43, and `dxr-get list --json` reports the installed item with `can_uninstall: false` (dxr-get.md § list), so a front end does not offer the removal |
 | `listing` | no | `{ "url": "https://…" }`: a **listing-only** asset. Nothing is downloaded or run; the client shows the link. All Android assets are listing-only (ADR-038), and so are `app` and `sdk` items from third parties |
 
 #### Requires

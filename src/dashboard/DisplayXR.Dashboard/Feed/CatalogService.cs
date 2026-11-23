@@ -16,7 +16,7 @@ using DisplayXR.Dashboard.Model;
 
 namespace DisplayXR.Dashboard.Feed;
 
-// ADR-064 step 8. THE ONE FILE that knows how the Catalog tab reaches the install
+// ADR-064 step 8. THE ONE FILE that knows how the Components page reaches the install
 // engine. Today it runs `dxr-get.exe` directly; when `displayxr-cli catalog …` exists
 // (ADR-064 step 4), CatalogCommands and DxrGetEngine are what change, and nothing else
 // in the Dashboard does.
@@ -196,7 +196,7 @@ public sealed class DxrGetEngine : ICatalogEngine
 }
 
 /// <summary>
-/// What the Catalog tab does, over an engine and the CLI: read the catalog, install / update /
+/// What the catalog rows of the Components page do, over an engine and the CLI: read the catalog, install / update /
 /// uninstall with one permission prompt, activate with a pasted key, open a checkout page.
 /// No UI, no UI thread: every method is awaitable and bounded.
 /// </summary>

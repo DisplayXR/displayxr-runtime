@@ -12,6 +12,7 @@
    "state": "outdated",
    "installable": true,
    "receipt": false,
+   "can_uninstall": false,
    "aliases": [],
    "recommended": false,
    "detected": "none",
@@ -32,6 +33,7 @@
    "state": "not_installed",
    "installable": true,
    "receipt": false,
+   "can_uninstall": false,
    "aliases": [
     "leia_plugin"
    ],
@@ -54,6 +56,7 @@
    "state": "current",
    "installable": true,
    "receipt": false,
+   "can_uninstall": false,
    "aliases": [],
    "recommended": false,
    "detected": "none",

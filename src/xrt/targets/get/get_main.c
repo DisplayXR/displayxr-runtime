@@ -1108,7 +1108,11 @@ static cJSON *g_multi_items = NULL;
 static int
 uninstall_result(const char *id, int code, const char *result, const char *detail, bool json)
 {
-	dxr_log("%s: %s%s%s\n", id, result, detail[0] ? " -- " : "", detail);
+	// With --json the reason is in the document, and the caller says it: logging it as well
+	// made `displayxr-cli catalog uninstall` print a refusal twice (it inherits this stderr).
+	if (!json) {
+		dxr_log("%s: %s%s%s\n", id, result, detail[0] ? " -- " : "", detail);
+	}
 	if (json) {
 		cJSON *o = cJSON_CreateObject();
 		cJSON_AddStringToObject(o, "id", id);

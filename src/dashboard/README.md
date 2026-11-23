@@ -14,7 +14,7 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 | Displays | the status feed (screens, desktop map); `dp list --json` for the per-screen selector (its options: that screen's `candidates`) | `dp use <id> --screen <key>`, `dp reset --screen <key>` |
 | Windows | the status feed (clients) | — |
 | Components | the status feed (clients by class; per screen `eye_tracking.viewer_source` / `viewer_reason` / `viewer_policy` for the tracking card); `info --json` (incl. `tracking_providers`: probe results, the primary screen's arbitration); `workspace list --json`; `dp\|input\|conv\|tracking list --json` (ADR-054 N3e: `enabled`, `enabled_source`, `preferred`, `provenance`, conv `built_in`, tracking `first`, `policy.policy_lock`; ADR-054 N5: each row's `licence` object, shown as a chip — `unlicensed`, `licence expired`, `trial until <date>`, `licensed`, or `included with your display` when the entitlement comes with the hardware; nothing for a component with no licence to report. The Dashboard only shows it: the component decides it) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace reset <id>` (back to the runtime default, Ctrl+Shift+Space / auto), `workspace launch <id>`; `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `input use <id> --app <exe>` / `input reset --app <exe>` (the Input card's **Per app** table, ADR-034 Am.5: each pinned or running app's pin per role family and its live holder from `input list --json` `per_app` + `holders`; per user only — no machine-wide per-app pin exists — and disabled under `Policy\Lock`), `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise every control's `--machine` command — Enabled, Prefer, Reset — is shown for an administrator). No Enabled or Prefer on the built-in `dp-lift` row; under `Policy\Lock` the class shows "Locked by machine policy" and its per-user controls are disabled (for tracking, the per-user Prefer / Reset too). **Tracking providers** (ADR-054 N6): `tracking enable\|disable <id>`, `tracking use <id>` / `tracking reset` (then re-reads `tracking list --json` and `info --json`); per screen the viewer source and why (provider; standby: the display tracks; no source; source paused; FIXED / OWN) beside the display's viewer policy, and a **Calibrate camera…** button on provider-served screens that opens the calibration window (below): `tracking calibrate --screen <key> --watch --json` (long-lived), `tracking calibrate solve --in <tmp> --mode b --eye mid --reject-mm 5 --json`, `tracking calibrate apply --screen <key> --camera <key> --pose <setting> --provider <id> --rms-mm <rms> --samples <n> --mode b [--depth-scale <iris>] --json` (writes the runtime-owned camera calibration store, shared by every provider; `--provider` is accepted and ignored; then re-reads `tracking list --json` and `info --json`) |
-| Catalog | the install engine's `dxr-get list --json --no-runtime` (one call: state, versions, detection, sizes, compatibility, prerequisites), `dxr-get list --installed --json` when offline; `dp\|input\|conv\|tracking list --json` for an installed item's `licence` object | `dxr-get install <id> --yes --json --no-runtime`, `dxr-get uninstall <id> --json` (elevated for that one run, see below); `displayxr-cli <class> activate <id> @<key file> --json`; `displayxr-cli <class> activate-begin <id> --json` (Buy) |
+| Components (catalog side) | the install engine's `dxr-get list --json --no-runtime` (one call: state, versions, detection, sizes, compatibility, prerequisites), `dxr-get list --installed --json` when offline; `dp\|input\|conv\|tracking list --json` for an installed item's `licence` object | `dxr-get install <id> --yes --json --no-runtime`, `dxr-get uninstall <id> --json` (elevated for that one run, see below); `displayxr-cli <class> activate <id> @<key file> --json`; `displayxr-cli <class> activate-begin <id> --json` (Buy) |
 | Performance | `perf list --json`, `info --json` (adapters) | `perf set` / `perf reset` |
 | Developer | `perf list --all --json` (the read-only Tier 1/2 lever list: only while "Developer settings" is expanded, and on Refresh; collapsed again on every launch); `dp list --json` (`preferred` only: a machine-wide override is shown as a notice) | `perf reset <name>` / `perf reset` (managed levers only; the rest are environment-only), `dp reset` (machine-wide; admin) |
 
@@ -34,23 +34,69 @@ providers with each task's readiness and selection (the status feed's `conv_prov
 reports one) and diagnostics clients. Names are shown verbatim from the components'
 own registration.
 
-## Catalog tab
+## Components: installed and catalog items in one list
 
-ADR-064 step 8. Spec of the engine: [dxr-get.md](../../docs/specs/runtime/dxr-get.md).
+ADR-064 step 8. Spec of the engine: [dxr-get.md](../../docs/specs/runtime/dxr-get.md). The catalog
+had a tab of its own for one release (v2.69.4); it is now part of **Components**, and the
+`catalog` page id (`--page catalog`, `DashboardContext.Navigate("catalog")`) opens Components
+(`Model/ComponentRows.cs` `PageRoutes`). The updates badge sits on the Components entry.
 
-- **Browse.** Items grouped by what they are for (Displays, Input, 2D to 3D, Viewer tracking,
-  Workspaces, Apps, …). Inside a group: what matches this machine first, then what the catalog
-  recommends, then by name. A card shows the name, the publisher, the one-line summary and chips
-  that state positive facts only: *Installed*, *Update available*, *Works with your display*
-  (`detected: high`), *Recommended*, the download size, and the licence headline of an installed
-  item. An item that is not installed has no state chip; its button says **Get it**. An item the
-  engine would refuse (`compatible: false`) has no button and one calm line; the engine's own
-  reason is in the detail view. Search, a filter per class and **Installed**.
-- **Detail.** What it does, version, size, publisher, category, each external prerequisite with
-  *Ready* / *Included* / *Get it first* and a link to its maker for an unmet one, the licence
-  block, the actions, and **Manage in Components**. Every policy row of the Components page has
-  **View in Catalog**, which opens the matching item (or, for a component the catalog does not
-  list, the Catalog searched by its name).
+- **One list.** The sections are the Components sections, unchanged (display processors, the
+  workspace controller, input providers, viewer-tracking providers, conversion providers, and
+  the ones that only report: present owners, the conversion module, model packs, the stereo
+  camera, diagnostics clients). Each section whose class the catalog has (`display_processor`,
+  `input_provider`, `tracking_provider`, `conversion_provider`, `workspace_controller`) also
+  carries that class's catalog items. A first group, **Runtime**, holds the catalog's row for the
+  runtime itself. A last group, **Apps**, holds the catalog items that are not components (apps,
+  companions, developer tools), each with a chip for its kind when it is not an app. Both print a
+  count of their non-zero parts only ("2 installed", "1 available to install", or both;
+  `CatalogText.Counts`).
+- **One row per item, one status per row** (`Model/ComponentRows.cs`, `ComponentRows.Join`). An
+  installed component and its catalog entry are joined by the id the component registers under
+  (`registered_id`, else the catalog `id`) and are one row:
+
+  | Status | When | Offered |
+  |---|---|---|
+  | **Installed** | present, and the catalog has the same build (or no catalog has been read: nothing is claimed) | the row's own controls; Details; Uninstall when the engine can do it |
+  | **Update available** | present, and the catalog has another build (`outdated` / `rebuilt`) | the same, and **Update** |
+  | **Available** | in the catalog, not on this machine | **Install** (or **Get it** for a link-out item); Details |
+  | **Not from catalog** | present, and the catalog does not list it, or lists it but the engine did not find this copy (a dev registration, another installer, a preinstall) | the row's own controls only, and "Remove with its own uninstaller." |
+  | **Part of the runtime** | as *Not from catalog*, and the runtime's own installer shipped it: its registered binary (`binary_path` / `binary` of `<class> list --json`) is inside the `plugins` folder of the runtime directory, the folder of the `displayxr-cli` the Dashboard runs (`ComponentRows.ShippedByRuntime`) | the row's own controls only, and no removal sentence (it goes with the runtime) |
+
+  A row that is neither installed nor installable (a connected client, a summary line) has no
+  status. The built-in conversion adapter reads *Installed*. Filters: **All / Installed /
+  Updates**.
+- **Installed rows keep their controls**: Enabled, Prefer / Reset, the launch row of a workspace
+  controller, the per-app and per-screen tables. Under them, a row the catalog knows has
+  **Install** / **Update**, **Details** (what it does, version, size, publisher, category, each
+  external prerequisite with *Ready* / *Included* / *Get it first* and a link to its maker for an
+  unmet one, the licence block, **Uninstall**). Chips state positive facts only: *Works with your
+  display* (`detected: high`), *Recommended*, the download size. Details says the same in one
+  fixed sentence; the engine's `evidence` string (internal panel codes) is parsed and never shown. An item the engine would refuse
+  (`compatible: false`) has no button and one calm line; the engine's own reason is in its detail.
+- **After an install the same row is the installed row**, with its detail open: the row's key is
+  its class and registered id, which do not change. The status feed, the class's policy rows and
+  the workspace list are re-read.
+- **Uninstall is offered only when it can succeed.** The engine must have installed the item
+  (`receipt: true`) AND say it can remove it (`can_uninstall: true` in `dxr-get list --json`:
+  the receipt recorded an uninstall command). A receipt alone is not enough: an item installed
+  from a catalog entry that names no uninstall command (every schema-1 item) would be refused
+  with exit 43, so its row shows "Remove it from Windows Settings > Apps." instead of a button
+  (the runtime's own row shows the same sentence).
+  A list without the field (an older engine) reads as "cannot remove". A row that is not from
+  the catalog is never offered Update, Install or Uninstall. **Disable is not Uninstall**: the
+  Enabled box turns a component off and leaves it on the machine; Uninstall (in Details)
+  removes it.
+- **What happens to an item is said on its row.** A success is the row's new status and one line
+  ("… is up to date. It is ready to use.") that stays until the next action, with nothing to
+  dismiss. A failure (a declined permission prompt, each exit code as a sentence) is a notice on
+  that row that stays until it is dismissed.
+- **When the catalog cannot be read** (offline, refused, the engine missing, a platform with no
+  engine) one banner at the top says so, with **Try again** or the Download page. Everything
+  installed stays below and works as usual. Rows from the last catalog read in this session are
+  kept, with a *last known* chip, and the banner says when that read was; with no earlier read
+  the banner is all there is (offline, what the engine installed is still listed from its
+  receipts and can still be removed).
 - **Install / Update / Uninstall, with the Dashboard staying non-elevated.** The verb first runs
   as the user, output captured. The engine answers what elevation cannot fix before it asks for
   it (offline 10, bad signature 11, not compatible 41, nothing to do 0, no receipt 42, cannot
@@ -68,7 +114,7 @@ ADR-064 step 8. Spec of the engine: [dxr-get.md](../../docs/specs/runtime/dxr-ge
   itself, as a job child killed by Stop waiting or by closing the window. The work run is started
   directly (default verb, the elevation is inherited, no prompt) and answers the same exit codes.
 - **Stop waiting** stops the wait, never the engine, elevated Dashboard or not. While the engine
-  may still be at work, Get it / Update / Uninstall stay disabled on every item, with a line saying
+  may still be at work, Install / Update / Uninstall stay disabled on every item, with a line saying
   what is still running (the engine takes no lock, so a second run must not start beside it). They
   come back when the process is known to have exited (the result is then shown and the list
   re-read) or when Refresh is pressed. Every ending is a sentence (`Model/Catalog.cs`
@@ -77,10 +123,10 @@ ADR-064 step 8. Spec of the engine: [dxr-get.md](../../docs/specs/runtime/dxr-ge
   directory, which the runtime installer replaces; the runtime is therefore never installed or
   upgraded from here. An item that needs a newer runtime reads as not compatible, and the runtime's
   own row links to the Download page when an update exists.
-- **States that are not a list**, each with what to do next: opening; offline (with what the engine
-  installed, from the receipts, still removable); the catalog refused (exit 11); the engine missing
-  on Windows (a runtime that predates it: update from the Download page); **macOS and Linux**, where
-  no engine exists yet: "Installs come from the Download page for now", with the link.
+- **The banner's states**, each with what to do next: offline; the catalog refused (exit 11); the
+  engine missing on Windows (a runtime that predates it: update from the Download page); **macOS
+  and Linux**, where no engine exists yet: "Installs come from the Download page for now", with
+  the link.
 - **Licence** (ADR-064 §5), for an installed item whose component reports one. The state, in the
   component's own words plus the date ("Trial — ends 21 Dec 2026"), and "Your other
   2D-to-3D converters keep working".
@@ -124,12 +170,13 @@ ADR-064 step 8. Spec of the engine: [dxr-get.md](../../docs/specs/runtime/dxr-ge
   `fixtures/gen_catalog_fixtures.py`. The shapes are written by hand from the emitter, not captured
   from an engine run.
 - **Debug builds only** (`#if DEBUG`, absent from a published dashboard): `--catalog-item <id>`
-  opens that item, `--catalog-do install|uninstall|key` runs a verb on it, and
+  opens that item's row on Components, `--catalog-do install|uninstall|key` runs a verb on it, and
   `--screenshot <png> [--screenshot-delay <s>]` saves the window and exits.
 - Ids are arguments: a catalog `id` and a `registered_id` must be one safe argument (letters,
   digits, `. _ -`, no leading dash); an item whose id is not is dropped, an unsafe `registered_id`
   is dropped, and the activation verbs refuse one.
-- Tests: `CatalogTests` (both list shapes, grouping and filters, every exit code, the unelevated
+- Tests: `ComponentRowsTests` (the join, the four statuses, no Uninstall without a receipt, the
+  filters, the stale and receipts-only lists, the `catalog` route) and `CatalogTests` (both list shapes, grouping and filters, every exit code, the unelevated
   then elevated order, the licence block, the key never in a `ProcessStartInfo`, the key file's
   permissions and removal, the URL rule, every `activate-begin` result and the runtime without the verb).
 
@@ -251,7 +298,8 @@ parts (the job object, raising the first instance) are no-ops there.
   a watch child prints nothing for 10 s, a WARN and a "no snapshot" pill. Mixing a
   `_package\bin` dashboard with an installed service (or the reverse) is the usual way in.
 - `--version` prints the version and exits (no window).
-- `--page displays|windows|components|catalog|performance|developer|home` opens on that page.
+- `--page displays|windows|components|performance|developer|home` opens on that page
+  (`catalog` still works and opens Components).
 - `--fixture <file.ndjson>` replays snapshots from a file instead of `status --watch`
   (one line every 2 s, looping) and simulates the per-screen `dp` verbs in memory, so the
   live-service pages can be laid out without a service that answers. Fixtures and their
@@ -272,8 +320,10 @@ parts (the job object, raising the first instance) are no-ops there.
   `ComponentPolicy` (the per-class Enabled / Preferred rows of `dp|input|conv list --json`
   and the CLI lines the Components controls run — ADR-054 N3e), `Tracking` (the tracking card:
   info's probe summary, each screen's viewer source / reason / policy — ADR-054 N6),
-  `Calibration` / `CalibrationSession` (the camera calibration window's model), `Catalog` (the Catalog
-  tab: the engine's list, the words of every exit code, the licence block, the URL rule).
+  `Calibration` / `CalibrationSession` (the camera calibration window's model), `Catalog` (the
+  engine's list, the words of every exit code, the licence block, the URL rule), `ComponentRows`
+  (the Components list: installed components joined with catalog items, a row's status and what
+  it may offer).
 - `Feed/` — `StatusFeed` (the state machine above, single-threaded on a scheduler),
   `CliProcessSource` (the real CLI), `FixtureProcessSource`, the job object, the vendor
   dashboard launcher (D7: the command line is never parsed), `CatalogService` (the install engine,

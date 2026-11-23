@@ -152,7 +152,7 @@ public sealed record LiftModule(bool Probed, bool Malformed, string? Backend, lo
 
 /// <summary>One row of a Components section.</summary>
 public sealed record ComponentItem(string Name, Level Level, IReadOnlyList<(string Text, Level Level)> Chips, IReadOnlyList<string> Lines,
-                                   RegisteredController? Controller = null, PolicyRow? Policy = null);
+                                   RegisteredController? Controller = null, PolicyRow? Policy = null, string? Id = null);
 
 /// <summary>One role: what it is, how many are registered / connected, and its rows.</summary>
 public sealed record ComponentSection(string Id, string Title, string Role, int Count, int Connected,
@@ -230,7 +230,7 @@ public static class Components
                 claims.Count > 0 ? "Claims " + string.Join(", ", claims) : "Claims no screen",
             };
             if (p.Hint.Length > 0) lines.Add(p.Hint);
-            items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, StatusText.PluginLevel(p), chips, lines, Policy: pol));
+            items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, StatusText.PluginLevel(p), chips, lines, Policy: pol, Id: p.Id));
         }
         return new ComponentSection("display_processors", "Display processors",
             "A display processor turns the views an app renders into what one kind of 3D display shows; each claims the screens it drives.",
@@ -347,7 +347,7 @@ public static class Components
                 items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, p.Active ? Level.Ok : Level.Plain,
                     new[] { (p.HardwarePresent ? "hardware present" : "hardware absent", p.HardwarePresent ? Level.Ok : Level.Plain) }
                         .Concat(p.Active ? new[] { ("active", Level.Ok) } : Array.Empty<(string, Level)>()).ToArray(),
-                    p.Note.Length > 0 ? new[] { p.Note } : Array.Empty<string>()));
+                    p.Note.Length > 0 ? new[] { p.Note } : Array.Empty<string>(), Id: p.Id));
         if (items.Count == 0 && info.Input is { } sum)
         {
             var lines = new List<string> { sum.Note };
@@ -482,7 +482,7 @@ public static class Components
                          .DefaultIfEmpty(Level.Plain).Max();
             items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id,
                 malformed ? Level.Critical : worst is Level.Critical or Level.Warn ? worst : usable ? Level.Ok : Level.Plain,
-                chips, lines, Policy: pol));
+                chips, lines, Policy: pol, Id: p.Id));
         }
         var served = s.Tasks.Where(t => t.Selected).Select(t => t.Task).Distinct().ToArray();
         int ready = s.Tasks.Count(t => t.Selected && t.State == "READY");
