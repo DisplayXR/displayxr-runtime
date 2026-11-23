@@ -305,6 +305,15 @@ public class ComponentRowsTests
         Assert.Equal(2, rows.Count); // the catalog-only row is not dropped
         Assert.All(rows, r => Assert.True(r.Stale));
         Assert.Equal(RowStatus.Available, rows[1].Status);
+        // Offline, a last-known row offers no Install, and an installed one no Update.
+        Assert.Equal(CatalogAction.Install, rows[1].Catalog!.Action);
+        Assert.Equal(CatalogAction.None, rows[1].Action);
+        var outdated = Catalog(Item("panel-a", "display_processor", "outdated", receipt: true));
+        var staleUpdate = Assert.Single(ComponentRows.Join(new[] { Section("display_processors", Registered(ComponentClass.Display, "panel-a")) },
+            CatalogSource.From(offline, outdated))[0].Rows);
+        Assert.Equal(RowStatus.UpdateAvailable, staleUpdate.Status);
+        Assert.Equal(CatalogAction.None, staleUpdate.Action);
+        Assert.True(staleUpdate.CanUninstall); // removing needs no catalog
 
         // No earlier read: only the banner; the installed row stays, with nothing claimed about it.
         var bare = ComponentRows.Join(new[] { Section("display_processors", Registered(ComponentClass.Display, "panel-a")) }, CatalogSource.From(offline, null))[0].Rows;

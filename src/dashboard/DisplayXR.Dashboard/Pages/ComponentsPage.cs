@@ -214,6 +214,13 @@ public sealed class ComponentsPage : Page
             page.Children.Add(U.Notice(Ctx.InfoError is null ? Level.Info : Level.Warn,
                 Ctx.InfoError is null ? "Reading the runtime's components" : "Could not read the runtime's components",
                 Ctx.InfoError ?? "Input providers and the conversion module come from 'displayxr-cli info' (about 10 s); connected clients come from the live feed."));
+        // A read in progress (the first one, Try again, Refresh, after an install) is said, never silent.
+        if (CatalogText.Checking(Ctx.CatalogLoading) is { } checking)
+        {
+            var n = U.Notice(Level.Info, checking.Title, checking.Text);
+            AutomationProperties.SetLiveSetting(n, AutomationLiveSetting.Polite);
+            page.Children.Add(n);
+        }
         if (CatalogBanner() is { } banner) page.Children.Add(banner);
         page.Children.Add(FilterBar());
         // An engine run the Dashboard stopped waiting for: say why the buttons are waiting.
@@ -265,12 +272,6 @@ public sealed class ComponentsPage : Page
             var b = U.Button(label, () => { _filter = filter; Update(force: true); }, on ? "primary" : "quiet", "sm");
             AutomationProperties.SetName(b, on ? $"{label}, selected filter" : $"Show {label}");
             U.AddFlow(bar, b, 8, 6);
-        }
-        if (Ctx.CatalogRead is null && Ctx.CatalogLoading)
-        {
-            var reading = U.Text("Reading the catalog of add-ons and apps…", "meta");
-            reading.VerticalAlignment = VerticalAlignment.Center;
-            U.AddFlow(bar, reading, 8, 6);
         }
         return bar;
     }

@@ -77,9 +77,14 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
 
     /// <summary>
     /// The main button. Nothing is ever offered on a copy the catalog did not find: installing over
-    /// it would replace something the user put there another way.
+    /// it would replace something the user put there another way. Nor Install / Update on a row kept
+    /// from an earlier read (<see cref="Stale"/>): the catalog cannot be reached now, so the engine
+    /// would only answer "offline", and what the row says may no longer be true.
     /// </summary>
-    public CatalogAction Action => Catalog is null || Status is RowStatus.NotFromCatalog or RowStatus.PartOfRuntime ? CatalogAction.None : Catalog.Action;
+    public CatalogAction Action =>
+        Catalog is null || Status is RowStatus.NotFromCatalog or RowStatus.PartOfRuntime ? CatalogAction.None
+        : Stale && Catalog.Action is CatalogAction.Install or CatalogAction.Update ? CatalogAction.None
+        : Catalog.Action;
 
     /// <summary>
     /// Uninstall only when it can succeed: the engine installed it (a receipt) and says it has an

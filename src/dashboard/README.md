@@ -96,7 +96,10 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   installed stays below and works as usual. Rows from the last catalog read in this session are
   kept, with a *last known* chip, and the banner says when that read was; with no earlier read
   the banner is all there is (offline, what the engine installed is still listed from its
-  receipts and can still be removed).
+  receipts and can still be removed). A *last known* row offers no Install, and an installed one
+  no Update, until the catalog can be read again. While a read is in progress (the first one, Try
+  again, Refresh; the engine retries for about 20 s before it answers offline) a "Checking the
+  catalog" line says so (`CatalogText.Checking`).
 - **Install / Update / Uninstall, with the Dashboard staying non-elevated.** The verb first runs
   as the user, output captured. The engine answers what elevation cannot fix before it asks for
   it (offline 10, bad signature 11, not compatible 41, nothing to do 0, no receipt 42, cannot

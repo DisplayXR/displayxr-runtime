@@ -1049,6 +1049,16 @@ public class CatalogTests
         Assert.Equal(BuyKind.OpenPurchasePage, ctx.BuyPending!.Plan.Kind);
     }
 
+    [Fact]
+    public void AReadInProgress_IsSaid_AndNothingWhenNoneIs()
+    {
+        Assert.Null(CatalogText.Checking(false));
+        var line = CatalogText.Checking(true);
+        Assert.NotNull(line);
+        Assert.Equal("Checking the catalog", line!.Value.Title);
+        Assert.Contains("20 seconds", line.Value.Text);
+    }
+
     // ── Fakes ───────────────────────────────────────────────────────────────
 
     private sealed class RecordingCli : IProcessSource

@@ -629,6 +629,14 @@ public static class CatalogText
         return parts.Count > 0 ? string.Join(StatusText.Sep, parts) : "none installed";
     }
 
+    /// <summary>
+    /// What the page says while a read of the catalog is in progress (null when none is). The engine
+    /// retries for about 20 seconds before it answers "offline", so the page must not sit silent.
+    /// </summary>
+    public static (string Title, string Text)? Checking(bool loading) => loading
+        ? ("Checking the catalog", "Reading the catalog of add-ons and apps… This can take up to about 20 seconds when the network is down. Everything installed below works as usual meanwhile.")
+        : null;
+
     /// <summary>A success, said on the row with nothing to dismiss: "X is installed. It is ready to use."</summary>
     public static string Inline(string title, string text) => text.Length > 0 ? $"{title}. {text}" : $"{title}.";
 
