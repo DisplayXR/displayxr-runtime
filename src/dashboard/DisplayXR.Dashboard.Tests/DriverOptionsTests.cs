@@ -320,6 +320,40 @@ public class DriverOptionsTests
             fail() && args.Args is ["dp", "options", ..] ? Task.FromResult(new CliResult(-1, "", "", true, null)) : inner.RunAsync(args, timeout, cancel);
     }
 
+    /// <summary>Review finding 4: a submitted edit ends the edit state, so the deferred rebuild (the new value, the reply) lands at once.</summary>
+    [Fact]
+    public void EditState_SubmitEndsTheEdit_RefuseKeepsTheDraft()
+    {
+        var e = new OptionEdits();
+        const string k = "sim-display/WIDTH_M";
+        Assert.False(e.IsEditing);
+        e.Focus(k);
+        Assert.True(e.IsEditing); // rebuilds wait
+        e.Type(k, "0.5");
+        Assert.Equal("0.5", e.Draft(k));
+
+        e.Submit(k);              // Enter / Apply with a value that will be written
+        Assert.False(e.IsEditing); // the rebuild with the write's result is no longer deferred
+        Assert.Null(e.Draft(k));   // the re-read value shows, not the typed text
+
+        e.Focus(k);
+        e.Type(k, "1,000");
+        e.Refuse(k);              // refused: the message must show at once
+        Assert.False(e.IsEditing);
+        Assert.Equal("1,000", e.Draft(k)); // kept, to be corrected
+
+        e.Focus(k);
+        e.Blur("other/KEY");      // another box's blur does not end this edit
+        Assert.True(e.IsEditing);
+        e.Blur(k);
+        Assert.False(e.IsEditing);
+        Assert.Equal("1,000", e.Draft(k)); // leaving the box does not apply or drop the text
+
+        e.Focus(k);
+        e.Rebuilt();              // a forced rebuild replaced the box: never stuck deferring
+        Assert.False(e.IsEditing);
+    }
+
     [Fact]
     public void AccessibleNames()
     {

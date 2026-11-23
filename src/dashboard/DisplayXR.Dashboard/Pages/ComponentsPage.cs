@@ -74,12 +74,11 @@ public sealed class ComponentsPage : Page
     // typed in a text box not yet applied, a value refused before it was written, and a text box
     // with the focus (a rebuild would take the text from under the user's fingers).
     private readonly HashSet<string> _moreOpen = new();
-    private readonly Dictionary<string, string> _drafts = new();
+    private readonly OptionEdits _edits = new();
     private readonly Dictionary<string, string> _optionErrors = new();
-    private int _editing;
 
     // A rebuild would also empty the key box under the user's fingers.
-    protected override bool DeferRebuild => Launch.Busy || _openDropDowns > 0 || _keyFor is not null || _editing > 0;
+    protected override bool DeferRebuild => Launch.Busy || _openDropDowns > 0 || _keyFor is not null || _edits.IsEditing;
 
     public override void OnHidden()
     {
@@ -227,7 +226,7 @@ public sealed class ComponentsPage : Page
     protected override Control Build()
     {
         _openDropDowns = 0;
-        _editing = 0; // a text box taken away by this rebuild may never say it lost the focus
+        _edits.Rebuilt(); // a text box taken away by this rebuild may never say it lost the focus
         _driverKeys.Clear();
         Launch.BeginBuild();
         _elapsed = null;
@@ -809,30 +808,34 @@ public sealed class ComponentsPage : Page
                 string current = v.Setting.Effective;
                 var box = new TextBox
                 {
-                    Text = _drafts.TryGetValue(errKey, out var draft) ? draft : current, Width = 220, MinHeight = 32, FontSize = 13,
+                    Text = _edits.Draft(errKey) ?? current, Width = 220, MinHeight = 32, FontSize = 13,
                     Background = Tokens.Field, BorderBrush = Tokens.Line, Foreground = Tokens.Fg, IsEnabled = enabled,
                     CornerRadius = Tokens.Radius("FieldRadius"), Padding = new Thickness(10, 6), AcceptsReturn = false,
                 };
                 AutomationProperties.SetName(box, name);
                 ToolTip.SetTip(box, v.Tooltip);
-                box.TextChanged += (_, _) => _drafts[errKey] = box.Text ?? "";
-                box.GotFocus += (_, _) => _editing++;
+                box.TextChanged += (_, _) => _edits.Type(errKey, box.Text ?? "");
+                box.GotFocus += (_, _) => _edits.Focus(errKey);
                 box.LostFocus += (_, _) =>
                 {
-                    _editing = Math.Max(0, _editing - 1);
+                    _edits.Blur(errKey);
                     Dispatcher.UIThread.Post(() => Update());
                 };
+                // A submitted edit ends the edit state at once (OptionEdits.Submit / Refuse): the deferred
+                // rebuild is released, so the write's result and the CLI's reply show without waiting for
+                // the focus to leave the box.
                 void Apply()
                 {
                     if (Ctx.ActionRunning) return;
                     var value = OptionViews.Validate(v.Setting.Type, box.Text, out var error);
                     if (value is null)
                     {
+                        _edits.Refuse(errKey);
                         _optionErrors[errKey] = error!;
                         Update(force: true);
                         return;
                     }
-                    _drafts.Remove(errKey);
+                    _edits.Submit(errKey);
                     Write(OptionCommands.Set(id, v.Key, value));
                 }
                 box.KeyDown += (_, e) =>
@@ -840,6 +843,10 @@ public sealed class ComponentsPage : Page
                     if (e.Key == Avalonia.Input.Key.Enter) { e.Handled = true; Apply(); }
                 };
                 var apply = U.Button("Apply", Apply, "quiet", "sm");
+                // Applied on the PRESS: pressing it takes the focus from the box, whose LostFocus posts the
+                // deferred rebuild; on release that rebuild could already have replaced this button and the
+                // click would be lost. Keyboard activation (Space / Enter on the button) still works.
+                apply.ClickMode = ClickMode.Press;
                 apply.IsEnabled = enabled;
                 AutomationProperties.SetName(apply, $"Apply {name}");
                 ToolTip.SetTip(apply, $"displayxr-cli dp set {id} {v.Key} <value>");

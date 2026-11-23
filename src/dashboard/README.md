@@ -320,7 +320,9 @@ lines, the scope and command-line notes, the catalog detail and the removal sent
   the label's tooltip, never the face.
 - **Controls**: an enum with known values is a drop-down; a bool a switch (on writes `1`, off `0`); an
   int, a float, a string, and an enum whose values the CLI does not list, a text box with **Apply**
-  (Enter applies; a whole number for an int, a number for a float written with a `.`, one line, never
+  (Enter applies, and Apply acts on the press so a rebuild cannot swallow the click; a submitted edit
+  ends the edit at once, `Model/OptionEdits.cs`, so the new value and the reply show without waiting
+  for the focus to leave; a whole number for an int, a number for a float written with a `.`, one line, never
   starting with `--`, checked before anything is written). A **secret** is never shown: *Set* / *Not
   set*, and **Clear**; setting one is not offered, because `dp set` takes the value only as an
   argument and a secret is never an argument here (the CLI would need an `@file` form, as `activate`
