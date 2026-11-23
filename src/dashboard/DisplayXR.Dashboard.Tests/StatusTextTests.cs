@@ -122,6 +122,17 @@ public class StatusTextTests
     }
 
     [Fact]
+    public void CheckMySetup_VerdictAndPlatformInPlainWords()
+    {
+        Assert.Equal("Everything checked is fine", StatusText.SelftestVerdict(7, 0));
+        Assert.Equal("1 of 7 checks found a problem", StatusText.SelftestVerdict(7, 1));
+        Assert.Null(StatusText.PlainPlatform("READY"));
+        Assert.Equal("Needs the display maker's software", StatusText.PlainPlatform("PLATFORM_ABSENT"));
+        Assert.Equal("Its display is not connected", StatusText.PlainPlatform("NO_DISPLAY"));
+        Assert.Equal("Not ready (SOMETHING_NEW)", StatusText.PlainPlatform("SOMETHING_NEW"));
+    }
+
+    [Fact]
     public void HomeLine_OnlyWithSeveralScreensOrAWarning()
     {
         Assert.Equal("2 3D displays · 2 see you · 1 thing to check", StatusText.HomeLine(Design));

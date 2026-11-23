@@ -435,6 +435,20 @@ public static class StatusText
     public const string NotRunningText =
         "The pages show what a 3D app starting now would find. Live details, such as running apps and whether a display sees you, appear when it runs. The Dashboard keeps trying to reach it.";
 
+    /// <summary>"Check my setup"'s verdict in plain words (the CLI's own word is the badge's tooltip).</summary>
+    public static string SelftestVerdict(int checks, int failed) =>
+        failed == 0 ? "Everything checked is fine"
+        : $"{failed} of {Plural(checks, "check", "checks")} found a problem";
+
+    /// <summary>A display driver's platform state in plain words; null when it is ready (nothing to say).</summary>
+    public static string? PlainPlatform(string state) => state switch
+    {
+        "READY" or "UNKNOWN" or "" => null,
+        "PLATFORM_ABSENT" => "Needs the display maker's software",
+        "NO_DISPLAY" => "Its display is not connected",
+        var other => $"Not ready ({other})",
+    };
+
     /// <summary>The connection pill in plain words; <see cref="SourceLine"/> is the technical one (tooltip, Copy).</summary>
     public static string PlainSourceLine(StatusSnapshot s) =>
         s.IsService ? "DisplayXR is running" : "Not running in the background";
