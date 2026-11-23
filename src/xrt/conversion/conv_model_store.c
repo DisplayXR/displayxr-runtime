@@ -150,8 +150,6 @@ struct fs_stat
 	bool exists;
 	bool is_dir;
 	uint64_t size;
-	uint64_t mtime;   //!< opaque
-	uint64_t file_id; //!< opaque (volume + index / dev + inode)
 };
 
 #ifdef XRT_OS_WINDOWS
@@ -184,19 +182,6 @@ fs_stat(const char *path, struct fs_stat *st)
 	st->exists = true;
 	st->is_dir = (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 	st->size = ((uint64_t)a.nFileSizeHigh << 32) | a.nFileSizeLow;
-	st->mtime = ((uint64_t)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
-	if (!st->is_dir) {
-		HANDLE h = CreateFileW(w, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-		                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-		if (h != INVALID_HANDLE_VALUE) {
-			BY_HANDLE_FILE_INFORMATION fi;
-			if (GetFileInformationByHandle(h, &fi)) {
-				st->file_id = ((uint64_t)fi.nFileIndexHigh << 32 | fi.nFileIndexLow) ^
-				              ((uint64_t)fi.dwVolumeSerialNumber << 48);
-			}
-			CloseHandle(h);
-		}
-	}
 #else
 	struct stat s;
 	if (stat(path, &s) != 0) {
@@ -205,12 +190,52 @@ fs_stat(const char *path, struct fs_stat *st)
 	st->exists = true;
 	st->is_dir = S_ISDIR(s.st_mode);
 	st->size = (uint64_t)s.st_size;
-#ifdef __APPLE__
-	st->mtime = (uint64_t)s.st_mtimespec.tv_sec * 1000000000ull + (uint64_t)s.st_mtimespec.tv_nsec;
-#else
-	st->mtime = (uint64_t)s.st_mtim.tv_sec * 1000000000ull + (uint64_t)s.st_mtim.tv_nsec;
 #endif
-	st->file_id = ((uint64_t)s.st_dev << 40) ^ (uint64_t)s.st_ino;
+}
+
+/*!
+ * Was @p path written by a writer this process trusts: itself, an
+ * administrator / SYSTEM (Windows) or root (POSIX)? The store root lets
+ * every local user create files (Windows ACL, §5.1), so a blob another user
+ * planted before it was ever downloaded is not trusted on size alone: it is
+ * hashed on load like a blob under DXR_CONV_STORE_FULL_VERIFY.
+ */
+static bool
+fs_owner_trusted(const char *path)
+{
+#ifdef XRT_OS_WINDOWS
+	wchar_t w[CONV_STORE_PATH_MAX];
+	if (!widen(path, w, CONV_STORE_PATH_MAX)) {
+		return false;
+	}
+	PSID owner = NULL;
+	PSECURITY_DESCRIPTOR sd = NULL;
+	if (GetNamedSecurityInfoW(w, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner, NULL, NULL, NULL, &sd) !=
+	        ERROR_SUCCESS ||
+	    owner == NULL) {
+		if (sd != NULL) {
+			LocalFree(sd);
+		}
+		return false;
+	}
+	bool ok = IsWellKnownSid(owner, WinBuiltinAdministratorsSid) || IsWellKnownSid(owner, WinLocalSystemSid);
+	HANDLE tok = NULL;
+	if (!ok && OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+		union {
+			TOKEN_USER tu;
+			BYTE raw[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+		} buf;
+		DWORD n = 0;
+		if (GetTokenInformation(tok, TokenUser, &buf, sizeof(buf), &n)) {
+			ok = EqualSid(owner, buf.tu.User.Sid) != FALSE;
+		}
+		CloseHandle(tok);
+	}
+	LocalFree(sd);
+	return ok;
+#else
+	struct stat s;
+	return stat(path, &s) == 0 && (s.st_uid == geteuid() || s.st_uid == 0);
 #endif
 }
 
@@ -883,8 +908,6 @@ struct blob
 	uint32_t st;
 	uint32_t fail; //!< XRT_CONV_FAIL_* while FAILED
 	uint64_t done; //!< bytes downloaded / hashed so far
-	bool verified; //!< hash checked by this process for key below
-	uint64_t key_id, key_mtime, key_size;
 };
 
 struct conv_model_store
@@ -899,6 +922,10 @@ struct conv_model_store
 	bool thread_started;
 	bool stop;
 	uint32_t busy; //!< jobs in flight on the worker
+	/*! Hash every stamped blob again on its first load per process (the old
+	 *  rule): cfg.full_verify or DXR_CONV_STORE_FULL_VERIFY=1. */
+	bool full_verify;
+	uint64_t hash_count; //!< full hashes of a store file (tests: "no hash on load")
 
 	uint32_t pack_count;
 	struct conv_pack *packs; //!< [CONV_STORE_MAX_PACKS]
@@ -1145,6 +1172,9 @@ hash_file(struct conv_model_store *s, const char *path, char hex[CONV_STORE_SHA_
 		fclose(f);
 		return false;
 	}
+	os_mutex_lock(&s->mtx);
+	s->hash_count++;
+	os_mutex_unlock(&s->mtx);
 	struct u_sha256 h;
 	u_sha256_init(&h);
 	uint64_t total = 0;
@@ -1812,20 +1842,33 @@ conv_pack_load_url(const char *url_or_path, struct conv_pack *out, char *err, si
  *
  */
 
+/*!
+ * This process hashed the blob (or wrote it): READY for resolve even under
+ * full verify. A slot the worker owns right now is left to the worker.
+ */
 static void
-remember_verified(struct conv_model_store *s, const char *sha, uint64_t size, const char *blob_path)
+remember_verified(struct conv_model_store *s, const char *sha, uint64_t size)
 {
-	struct fs_stat st;
-	fs_stat(blob_path, &st);
 	os_mutex_lock(&s->mtx);
 	struct blob *b = blob_get_locked(s, sha, size, true);
-	if (b != NULL) {
-		b->verified = true;
-		b->key_id = st.file_id;
-		b->key_mtime = st.mtime;
-		b->key_size = st.size;
+	if (b != NULL && b->st != B_QUEUED && b->st != B_DOWNLOADING && b->st != B_VERIFYING) {
+		b->st = B_READY;
+		b->done = size;
+		b->fail = 0;
 	}
 	os_mutex_unlock(&s->mtx);
+}
+
+/*!
+ * The load rule (ADR-057 amendment 2026-11-22): a stamped blob of the right
+ * size that a trusted writer made was hashed when it entered the store and
+ * is not hashed again. Under full verify, or for a blob another user wrote,
+ * the first load per process hashes it.
+ */
+static bool
+load_needs_hash(const struct conv_model_store *s, const char *blob)
+{
+	return s->full_verify || !fs_owner_trusted(blob);
 }
 
 static bool
@@ -1838,8 +1881,10 @@ write_stamp(const char *stamp, const char *sha, uint64_t size)
 
 /*!
  * Hash the blob at @p blob; OK (stamped, remembered) or TAMPERED(_LOCKED)
- * after deleting it. Used for a stamped blob, an unstamped right-size blob,
- * and the winner of a rename race.
+ * after deleting it. Used for a blob entering the store (an unstamped
+ * right-size blob, e.g. one a `local_build` script wrote), the winner of a
+ * rename race, `conv models verify`, and a stamped blob only when
+ * load_needs_hash() says so.
  */
 static enum conv_store_blob_result
 check_present(struct conv_model_store *s, const char *sha, uint64_t size, const char *blob, const char *stamp)
@@ -1853,7 +1898,7 @@ check_present(struct conv_model_store *s, const char *sha, uint64_t size, const 
 		if (!fs_exists(stamp)) {
 			(void)write_stamp(stamp, sha, size);
 		}
-		remember_verified(s, sha, size, blob);
+		remember_verified(s, sha, size);
 		return CONV_STORE_BLOB_OK;
 	}
 	U_LOG_W("[conv-store] blob %.12s… does not hash to its name (%llu bytes): rejected", sha,
@@ -1900,6 +1945,9 @@ blob_protocol(struct conv_model_store *s,
 		if (st.size == size) {
 			if (skip_stamped && stamped) {
 				return CONV_STORE_BLOB_SKIPPED;
+			}
+			if (stamped && !load_needs_hash(s, blob)) {
+				return CONV_STORE_BLOB_OK; // verified when it entered the store
 			}
 			if (b != NULL) {
 				os_mutex_lock(&s->mtx);
@@ -1991,7 +2039,7 @@ blob_protocol(struct conv_model_store *s,
 	if (!write_stamp(stamp, sha, size)) {
 		return CONV_STORE_BLOB_IO;
 	}
-	remember_verified(s, sha, size, blob);
+	remember_verified(s, sha, size);
 	return CONV_STORE_BLOB_OK;
 }
 
@@ -2123,6 +2171,11 @@ conv_model_store_create(const struct conv_model_store_config *cfg, struct conv_m
 	}
 	join(s->blobs_dir, sizeof(s->blobs_dir), s->cfg.root, "blobs");
 	join(s->packs_dir, sizeof(s->packs_dir), s->cfg.root, "packs");
+	const char *fv = getenv("DXR_CONV_STORE_FULL_VERIFY");
+	s->full_verify = s->cfg.full_verify || (fv != NULL && fv[0] == '1');
+	if (s->full_verify) {
+		U_LOG_W("[conv-store] full verify: every stamped blob is hashed on its first load in this process");
+	}
 	if (os_mutex_init(&s->mtx) != 0 || os_cond_init(&s->cond) != 0 || os_thread_init(&s->thread) != 0) {
 		free(s->packs);
 		free(s);
@@ -2383,22 +2436,18 @@ blob_state_locked(struct conv_model_store *s, struct blob *b, const struct conv_
 	fs_stat(blob, &st);
 	if (!st.exists || st.size != f->size || !fs_exists(stamp)) {
 		if (b != NULL && b->st == B_READY) {
-			b->st = B_IDLE; // wiped under us (an older browser uninstaller): fetch again on request
-			b->verified = false;
+			// Wiped (an older browser uninstaller) or resized under us: fetch / verify again on request.
+			b->st = B_IDLE;
 		}
 		return XRT_CONV_STATE_ABSENT;
 	}
 	*done = f->size;
-	if (b != NULL && b->verified && b->key_id == st.file_id && b->key_mtime == st.mtime && b->key_size == st.size) {
-		return XRT_CONV_STATE_READY;
+	if (b != NULL && b->st == B_READY) {
+		return XRT_CONV_STATE_READY; // this process hashed or wrote it
 	}
-	if (b != NULL && b->verified) {
-		b->verified = false; // replaced since we hashed it
-		if (b->st == B_READY) {
-			b->st = B_IDLE;
-		}
-	}
-	return XRT_CONV_STATE_INSTALLED;
+	// Stamped at the right size: verified when it entered the store, so READY
+	// without a hash, unless this load must hash it (full verify / foreign writer).
+	return load_needs_hash(s, blob) ? XRT_CONV_STATE_INSTALLED : XRT_CONV_STATE_READY;
 }
 
 static void
@@ -2677,6 +2726,18 @@ conv_model_store_fetch_model(struct conv_model_store *s,
 		return all_skipped ? CONV_STORE_BLOB_SKIPPED : CONV_STORE_BLOB_OK;
 	}
 	return worst;
+}
+
+uint64_t
+conv_model_store_hash_count(struct conv_model_store *s)
+{
+	if (s == NULL) {
+		return 0;
+	}
+	os_mutex_lock(&s->mtx);
+	const uint64_t n = s->hash_count;
+	os_mutex_unlock(&s->mtx);
+	return n;
 }
 
 enum conv_store_blob_result

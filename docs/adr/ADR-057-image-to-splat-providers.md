@@ -205,6 +205,7 @@ build X" signal a downstream copy uses to re-pull.
   releases. Where it does not, as for Sharp, the user runs the conversion script locally
   after downloading the official file.
 - **The model store's tamper rule is unchanged:** the host re-hashes a blob on first load.
+  *Amended 2026-11-22, see "Amendment: verified on entry" below.*
 
 ### 6. Remote endpoint contract, v1
 
@@ -234,6 +235,31 @@ against one text. HTTPS, `Authorization: Bearer <token>`, JSON in UTF-8.
   failed job with that reason. `5xx`, `429`, `408`, `401`, `403`, `404` and timeouts fall
   through to the next host in the list.
 - **Not in v1:** signed-URL uploads and webhooks for long jobs (video) — contract 2.
+
+### Amendment (2026-11-22): verified on entry, size-checked on load
+
+The tamper rule above ("the host re-hashes a blob on first load", per process) cost about 19 s
+for the 2.5 GB fp32 Sharp export and about 4 s for int4 on every `conv run` and every
+conversion-host start, and it outlasted a provider's request grace, so the fp32 model failed to
+warm at all. The rule is now: **verified on entry to the store; size-checked on every load; full
+re-check on demand.**
+
+- A blob is hashed once, when it enters the store: a download while it streams, a `local_build`
+  script before it stamps, an unstamped blob by the first request (then stamped). A mismatch
+  there refuses it, as before.
+- On a load, in any process, the check is stamp + size + a trusted writer (this user, an
+  administrator / SYSTEM, root). No hash. A wrong size reads `ABSENT` and is never handed out.
+- A blob another local user wrote (the Windows store root lets any user create files) is hashed
+  on its first load per process, as before.
+- `DXR_CONV_STORE_FULL_VERIFY=1` brings back the per-process hash for every blob;
+  `displayxr-cli conv models verify` always hashes. No new file format: the existing `.ok` stamp
+  is the entry marker.
+
+Threat model: the load check catches partial writes, truncation and any size change; it does not
+catch a same-size in-place edit or bit rot after entry, which the on-demand check is for. A
+same-user attacker able to rewrite a blob can rewrite its stamp and the manifest it is checked
+against too, so they were out of scope before and still are. Spec:
+`conversion-provider-discovery.md` §5.1, §5.3, §5.4.
 
 ## Consequences
 

@@ -36,15 +36,20 @@
  * delete the part), rename without replace (target exists: another writer won,
  * delete ours and read-check theirs), stamp last.
  *
- * Load check: stamp + size is the browser's read check, and it is NOT trusted
- * here: the store's ACL lets a local user plant a same-size blob and its
- * stamp. The store re-hashes a blob the first time this process hands it out
- * (cached by file id + mtime + size). A mismatch is a tampered blob: it is
- * deleted (when the ACL lets us) and fetched again, or FAILED(MODEL).
+ * Verify rule (ADR-057 amendment 2026-11-22): a blob is hashed ONCE, when it
+ * enters the store (a download hashes while it streams; a blob a local build
+ * wrote without a stamp is hashed by the first request, then stamped). On
+ * every load, in any process, the check is stamp + size + a trusted writer
+ * (this user, or an administrator / root): no hash. A wrong size reads ABSENT
+ * and the next request rejects it. A blob another local user wrote, and every
+ * stamped blob under DXR_CONV_STORE_FULL_VERIFY=1 (or cfg.full_verify), is
+ * hashed on its first load per process, as before; `conv models verify`
+ * always hashes. A mismatch is a tampered blob: it is deleted (when the ACL
+ * lets us) and fetched again, or FAILED(MODEL).
  *
  * Threads: one worker per store does every blocking step (hash, download).
- * conv_model_store_resolve() never blocks on I/O beyond a stat of the blob
- * and its stamp, so it is safe from a provider's [C] slot.
+ * conv_model_store_resolve() never blocks on I/O beyond a stat of the blob,
+ * its owner and its stamp, so it is safe from a provider's [C] slot.
  *
  * @ingroup aux_conversion
  */
@@ -266,6 +271,11 @@ struct conv_model_store_config
 	void *user;
 	uint32_t chunk_bytes; //!< copy / read chunk (0 = 1 MiB)
 	uint32_t throttle_ms; //!< sleep per chunk (tests: an observable DOWNLOADING)
+	/*! Hash every stamped blob again on its first load per process. Off by default:
+	 *  a blob is hashed once, when it enters the store, and size-checked on every
+	 *  load (ADR-057 amendment 2026-11-22). DXR_CONV_STORE_FULL_VERIFY=1 in the
+	 *  hosting process turns it on too. */
+	bool full_verify;
 };
 
 //! Defaults: allow_downloads = true, everything else zero.
@@ -304,10 +314,11 @@ conv_model_store_get_pack(struct conv_model_store *s, uint32_t i, struct conv_pa
 /*!
  * Host op `model_resolve`. @p ref = "<pack>/<model>[/<variant>]" or a 64-hex
  * sha256. Never blocks on hashing or the network. out->state:
- *  - READY: every file present, stamped and hash-verified by this process;
- *    out->path = the variant's "model" file (else its first file);
- *  - INSTALLED: on disk and stamped, not yet verified by this process: call
- *    model_request (warm-up) to verify it;
+ *  - READY: every file present at its size and stamped (verified when it
+ *    entered the store); out->path = the variant's "model" file (else its
+ *    first file);
+ *  - INSTALLED: on disk and stamped but this process must hash it first
+ *    (full verify, or another user wrote it): call model_request to verify it;
  *  - WARMING: the worker is verifying it now;
  *  - DOWNLOADING: in flight, progress = bytes / total over the files;
  *  - ABSENT: not in the store (failure_reason XRT_CONV_FAIL_POLICY when a
@@ -383,9 +394,14 @@ conv_model_store_fetch_model(struct conv_model_store *s,
                              const char *variant,
                              bool skip_stamped);
 
-/*! Re-hash one blob in the store; deletes it (and its stamp) when tampered. */
+/*! Re-hash one blob in the store (always, whatever full_verify says); deletes it
+ *  (and its stamp) when tampered. `conv models verify`. */
 enum conv_store_blob_result
 conv_model_store_verify_blob(struct conv_model_store *s, const char *sha256, uint64_t size);
+
+/*! How many full hashes of a store file this store ran (tests; diagnostics). */
+uint64_t
+conv_model_store_hash_count(struct conv_model_store *s);
 
 /*! One blob's on-disk state (no hashing). */
 struct conv_store_blob_disk
