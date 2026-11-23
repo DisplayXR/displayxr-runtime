@@ -288,7 +288,7 @@ public sealed record CatalogRead(CatalogStatus Status, CatalogList? List, string
         if (exitCode == 0 && CatalogList.TryParse(json, out var list)) return Ready(list!);
         if (exitCode == CatalogExit.Offline)
             return new(CatalogStatus.Offline, null, "You're offline",
-                       "The Catalog couldn't be reached. Everything you have installed keeps working; connect and try again to browse and install.");
+                       "DisplayXR couldn't check for add-ons and updates. Everything you have installed keeps working. Connect and try again to install more.");
         if (exitCode == CatalogExit.BadSignature)
             return new(CatalogStatus.Refused, null, "The Catalog couldn't be verified",
                        "DisplayXR only reads a catalog it can verify, so nothing was shown or changed. Try again later; if it keeps happening, update DisplayXR.");
@@ -634,7 +634,7 @@ public static class CatalogText
     /// retries for about 20 seconds before it answers "offline", so the page must not sit silent.
     /// </summary>
     public static (string Title, string Text)? Checking(bool loading) => loading
-        ? ("Checking the catalog", "Reading the catalog of add-ons and apps… This can take up to about 20 seconds when the network is down. Everything installed below works as usual meanwhile.")
+        ? ("Checking for add-ons and updates…", "This can take up to about 20 seconds when the network is down. Everything installed below works as usual meanwhile.")
         : null;
 
     /// <summary>A success, said on the row with nothing to dismiss: "X is installed. It is ready to use."</summary>

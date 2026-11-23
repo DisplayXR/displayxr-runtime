@@ -95,7 +95,7 @@ public class ComponentRowsTests
         var row = Assert.Single(ComponentRows.Join(sections, Live(Item("other", "tracking_provider", "not_installed")))[0].Rows.Where(r => r.Installed is not null));
 
         Assert.Equal(RowStatus.NotFromCatalog, row.Status);
-        Assert.Equal(("Not from catalog", Level.Plain), row.StatusChip);
+        Assert.Equal(("Installed separately", Level.Plain), row.StatusChip);
         Assert.NotNull(row.Installed!.Policy); // the Enabled / Prefer controls still have their row
         Assert.Equal(CatalogAction.None, row.Action);
         Assert.False(row.CanUninstall);
@@ -138,7 +138,7 @@ public class ComponentRowsTests
         foreach (var key in new[] { "input_provider:pen", "input_provider:dev", "input_provider:old" })
         {
             var other = Row(groups, key);
-            Assert.Equal(("Not from catalog", Level.Plain), other.StatusChip);
+            Assert.Equal(("Installed separately", Level.Plain), other.StatusChip);
             Assert.Equal("Remove with its own uninstaller.", other.RemoveNote);
         }
 
@@ -342,7 +342,7 @@ public class ComponentRowsTests
         Assert.DoesNotContain(apps.Rows, r => r.Catalog!.Class == "display_processor");
 
         // The runtime's own row: a first group of its own, shown, never installed or removed from here.
-        Assert.Equal("Runtime", groups[0].Section.Title);
+        Assert.Equal("DisplayXR", groups[0].Section.Title);
         Assert.Equal("1 installed", groups[0].Section.ConnectedLine);
         var runtime = Assert.Single(groups[0].Rows);
         Assert.Equal("runtime", runtime.Catalog!.Id);
@@ -476,7 +476,7 @@ public class ComponentRowsTests
         var list = new PolicyList(ComponentClass.Display, null, new[] { row }, new Dictionary<string, string>(), Array.Empty<PolicyTask>());
 
         var notes = PolicyCommands.Notes(row, list, machine: false, elevated: false);
-        Assert.StartsWith("Per user; machine-wide needs an administrator prompt.", notes[0].Text);
+        Assert.StartsWith("For you only; for everyone on this PC needs administrator permission.", notes[0].Text);
         Assert.Contains(ComponentClass.Display.AppliesNote(), notes[0].Text);
         Assert.Contains(("Machine-wide, from an administrator prompt:", false), notes);
         Assert.Contains(("displayxr-cli dp disable panel-a --machine", true), notes);
@@ -484,7 +484,7 @@ public class ComponentRowsTests
 
         // Elevated: the dashboard can write machine-wide itself, so no command to copy.
         var elevated = PolicyCommands.Notes(row, list, machine: true, elevated: true);
-        Assert.Equal(new[] { ($"Machine-wide. {ComponentClass.Display.AppliesNote()}", false) }, elevated);
+        Assert.Equal(new[] { ($"For everyone on this PC. {ComponentClass.Display.AppliesNote()}", false) }, elevated);
 
         var builtIn = row with { Class = ComponentClass.Conversion, Id = "built-in", EnabledSource = "", BuiltIn = true };
         var conv = new PolicyList(ComponentClass.Conversion, null, new[] { builtIn }, new Dictionary<string, string>(), Array.Empty<PolicyTask>());

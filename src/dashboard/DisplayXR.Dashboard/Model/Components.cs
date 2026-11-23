@@ -282,14 +282,19 @@ public sealed class ChipList
 /// <c>BUILT_IN</c>), known even before the class's policy list has been read.</param>
 /// <param name="Facts">Each chip with its label, for the row's Details; null = the chips under the label "State".</param>
 /// <param name="State">The one plain state word the row shows.</param>
+/// <param name="Lines">The row's technical lines (registration, claims, tasks, notes), verbatim; they are listed in
+/// Details, labelled by <paramref name="LineFacts"/> (each one under "Note" when that is null).</param>
+/// <param name="Summary">The one plain line the row shows under its name (publisher · version, what it drives); null for none.</param>
 public sealed record ComponentItem(string Name, Level Level, IReadOnlyList<(string Text, Level Level)> Chips, IReadOnlyList<string> Lines,
                                    RegisteredController? Controller = null, PolicyRow? Policy = null, string? Id = null,
                                    bool BuiltIn = false, IReadOnlyList<(string Label, string Text)>? Facts = null,
-                                   PlainState State = PlainState.None)
+                                   PlainState State = PlainState.None, string? Summary = null,
+                                   IReadOnlyList<(string Label, string Text)>? LineFacts = null)
 {
-    /// <summary>What the row's Details lists, label by label.</summary>
+    /// <summary>What the row's Details lists, label by label: its state facts, then its technical lines.</summary>
     public IReadOnlyList<(string Label, string Text)> DetailFacts =>
-        Facts ?? Chips.Select(c => ("State", c.Text)).ToArray();
+        (Facts ?? Chips.Select(c => ("State", c.Text)).ToArray())
+        .Concat(LineFacts ?? Lines.Where(l => l.Length > 0).Select(l => ("Note", l)).ToArray()).ToArray();
 }
 
 /// <summary>One role: what it is, how many are registered / connected, and its rows.</summary>
@@ -309,6 +314,25 @@ public static class Components
 
     private static string Plural(int n, string one, string many) => StatusText.Plural(n, one, many);
 
+    /// <summary>A row's plain line: who makes it and which version ("Acme · version 1.2"), plus one plain fact; null when there is none.</summary>
+    public static string? PublisherLine(string vendor, string version, string? extra = null)
+    {
+        var p = new[] { vendor, version.Length > 0 ? "version " + version : "", extra ?? "" }.Where(x => x.Length > 0).ToArray();
+        return p.Length > 0 ? string.Join(Sep, p) : null;
+    }
+
+    /// <summary>
+    /// Which displays a display driver drives, in plain words: "drives your main display", "drives
+    /// Acer DS1", "drives 2 displays"; null when it drives none (the state word says enough).
+    /// </summary>
+    public static string? DrivesLine(IReadOnlyList<Screen> claimed) => claimed.Count switch
+    {
+        0 => null,
+        1 when claimed[0].Roles.OsMain => "drives your main display",
+        1 => $"drives {StatusText.ScreenName(claimed[0])}",
+        var n => $"drives {n} displays",
+    };
+
     /// <summary>Every section, in page order. Sections whose source is absent are omitted (stereo camera).</summary>
     public static IReadOnlyList<ComponentSection> Build(StatusSnapshot? s, InfoComponents? info, WorkspaceList? workspace = null,
                                                         IReadOnlyDictionary<ComponentClass, PolicyList>? policies = null)
@@ -324,8 +348,8 @@ public static class Components
         {
             DisplayProcessors(s, Of(policies, ComponentClass.Display)),
             WorkspaceController(s, info),
-            ByClass(s, "present_owners", "Present owners", PresentOwnerClass,
-                "A present owner presents its own window (a browser, a capture app) while the runtime weaves into it."),
+            ByClass(s, "present_owners", "Apps with their own window", PresentOwnerClass,
+                "Apps, such as a browser, that show their own window while DisplayXR adds the 3D."),
             InputProviders(info, Of(policies, ComponentClass.Input)),
             Conversion(info),
         };
@@ -338,8 +362,8 @@ public static class Components
         if (Tracking.Section(s, Of(policies, ComponentClass.Tracking), info.Tracking) is { } tr)
             list.Insert(list.FindIndex(x => x.Id == "input_providers") + 1, tr);
         if (StereoCamera(info) is { } cam) list.Add(cam);
-        list.Add(ByClass(s, "diagnostics", "Diagnostics clients", DiagClass,
-            "Read-only status readers, such as this dashboard's own status feed and the CLI.", collapsed: true));
+        list.Add(ByClass(s, "diagnostics", "Status readers", DiagClass,
+            "Programs that only read DisplayXR's status, such as this Dashboard.", collapsed: true));
         return list;
     }
 
@@ -357,21 +381,22 @@ public static class Components
             if (p.Fallback) chips.Add("Role", "FALLBACK", Level.Plain);
             var pol = policy?.Row(p.Id);
             AddPolicyChips(chips, pol);
-            var claims = s!.Screens.Where(x => x.Claim.PluginId == p.Id).Select(x =>
+            var claimed = s!.Screens.Where(x => x.Claim.PluginId == p.Id).ToList();
+            var claims = claimed.Select(x =>
                 $"{(StatusText.ShortDevice(x.DeviceName) is { Length: > 0 } d ? d : StatusText.ScreenName(x))} ({x.Claim.Confidence})").ToList();
-            var lines = new List<string>
-            {
-                string.Join(Sep, new[] { p.Vendor, p.Version.Length > 0 ? "version " + p.Version : "", $"{p.Id}", $"ProbeOrder {p.ProbeOrder}" }
-                    .Where(x => x.Length > 0)),
-                claims.Count > 0 ? "Claims " + string.Join(", ", claims) : "Claims no screen",
-            };
-            if (p.Hint.Length > 0) lines.Add(p.Hint);
+            string registration = string.Join(Sep, new[] { p.Vendor, p.Version.Length > 0 ? "version " + p.Version : "", $"{p.Id}", $"ProbeOrder {p.ProbeOrder}" }
+                .Where(x => x.Length > 0));
+            string claimLine = claims.Count > 0 ? "Claims " + string.Join(", ", claims) : "Claims no screen";
+            var lines = new List<string> { registration, claimLine };
+            var lineFacts = new List<(string, string)> { ("Registration", $"{p.Id}{Sep}ProbeOrder {p.ProbeOrder}"), ("Displays", claimLine) };
+            if (p.Hint.Length > 0) { lines.Add(p.Hint); lineFacts.Add(("Note", p.Hint)); }
             items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, StatusText.PluginLevel(p), chips.Chips, lines, Policy: pol, Id: p.Id,
-                                        Facts: chips.Facts, State: PlainStates.DisplayProcessor(p.Load, pol)));
+                                        Facts: chips.Facts, State: PlainStates.DisplayProcessor(p.Load, pol),
+                                        Summary: PublisherLine(p.Vendor, p.Version, DrivesLine(claimed)), LineFacts: lineFacts));
         }
-        return new ComponentSection("display_processors", "Display processors",
-            "A display processor turns the views an app renders into what one kind of 3D display shows; each claims the screens it drives.",
-            items.Count, active, $"{Plural(items.Count, "registered", "registered")}{Sep}{active} active", items);
+        return new ComponentSection("display_processors", "Displays",
+            "Make every DisplayXR app show 3D on your display. A display driver turns what an app draws into what your kind of 3D display shows.",
+            items.Count, active, $"{items.Count} installed{Sep}{active} in use", items);
     }
 
     public static ComponentSection WorkspaceController(StatusSnapshot? s, InfoComponents info)
@@ -389,32 +414,38 @@ public static class Components
             bool isConnected = reg.Connected ?? client is not null;
             string name = reg.Name.Length > 0 ? reg.Name : reg.Id;
             var lines = new List<string> { Line(name, isConnected, workspaceOn) };
+            var lineFacts = new List<(string, string)> { ("Status", lines[0]) };
             var detail = new[] { reg.Vendor, reg.Id.Length > 0 && reg.Id != name ? reg.Id : "", reg.Version.Length > 0 ? "version " + reg.Version : "", reg.Exe }
                 .Where(x => x.Length > 0).ToArray();
-            if (detail.Length > 0) lines.Add(string.Join(Sep, detail));
-            if (client is not null) lines.Add(ClientLine(client));
-            else if (isConnected && reg.Pid is { } p) lines.Add($"pid {p}");
-            if (reg.Actions.Count > 0) lines.Add("Actions: " + string.Join(", ", reg.Actions));
+            if (detail.Length > 0) { lines.Add(string.Join(Sep, detail)); lineFacts.Add(("Registration", lines[^1])); }
+            if (client is not null) { lines.Add(ClientLine(client)); lineFacts.Add(("Process", lines[^1])); }
+            else if (isConnected && reg.Pid is { } p) { lines.Add($"pid {p}"); lineFacts.Add(("Process", lines[^1])); }
+            if (reg.Actions.Count > 0) { lines.Add("Actions: " + string.Join(", ", reg.Actions)); lineFacts.Add(("Actions", string.Join(", ", reg.Actions))); }
+            // What the launch box used to carry as chips: the row face carries no technical chip.
+            if (reg.Launch is { } launch) lineFacts.Add(("Shortcut", $"set by: {launch.Source}{Sep}mode: {launch.Mode}"));
             string state = isConnected ? (client?.Pid ?? reg.Pid) is { } cp ? $"connected (pid {cp})" : "connected" : "registered, not running";
             items.Add(new ComponentItem(name, isConnected ? Level.Ok : Level.Plain,
-                new[] { (state, isConnected ? Level.Ok : Level.Plain) }, lines, reg, State: PlainStates.Controller(isConnected)));
+                new[] { (state, isConnected ? Level.Ok : Level.Plain) }, lines, reg, State: PlainStates.Controller(isConnected),
+                Summary: PublisherLine(reg.Vendor, reg.Version), LineFacts: lineFacts));
         }
         foreach (var c in connected.Where(c => !matched.Contains(c.Id)))
         {
             string name = c.Name.Length > 0 ? c.Name : snapName ?? $"client {c.Id}";
             items.Add(new ComponentItem(name, Level.Ok, new[] { ("connected", Level.Ok) },
-                new[] { Line(name, true, workspaceOn), ClientLine(c) }, State: PlainStates.Controller(true)));
+                new[] { Line(name, true, workspaceOn), ClientLine(c) }, State: PlainStates.Controller(true),
+                LineFacts: new[] { ("Status", Line(name, true, workspaceOn)), ("Process", ClientLine(c)) }));
         }
         if (items.Count == 0 && snapName is not null)
             items.Add(new ComponentItem(snapName, workspaceOn ? Level.Info : Level.Plain, new[] { ("not connected", Level.Plain) },
-                new[] { Line(snapName, false, workspaceOn) }, State: PlainStates.Controller(false)));
+                new[] { Line(snapName, false, workspaceOn) }, State: PlainStates.Controller(false),
+                LineFacts: new[] { ("Status", Line(snapName, false, workspaceOn)) }));
 
         int nConnected = Math.Max(connected.Count, info.WorkspaceControllers.Count(r => r.Connected == true));
-        string summary = nConnected > 0 ? $"{nConnected} connected" : "none connected";
-        return new ComponentSection("workspace_controller", "Workspace controller",
-            "A workspace controller hosts other apps' 3D windows; the runtime treats it as a client class, not a product.",
-            items.Count, nConnected, $"{summary}{Sep}workspace {(workspaceOn ? "on" : "off")}"
-                + (info.WorkspaceControllersKnown ? $"{Sep}{Plural(info.WorkspaceControllers.Count, "registered", "registered")}" : ""),
+        string summary = nConnected > 0 ? $"{nConnected} running" : "not running";
+        return new ComponentSection("workspace_controller", "Spatial desktop",
+            "Arrange several 3D apps together on your display. It opens with its shortcut.",
+            items.Count, nConnected, $"{summary}{Sep}{(workspaceOn ? "turned on" : "turned off")}"
+                + (info.WorkspaceControllersKnown ? $"{Sep}{info.WorkspaceControllers.Count} installed" : ""),
             items);
     }
 
@@ -450,9 +481,10 @@ public static class Components
         var clients = (s?.Clients ?? Array.Empty<Client>()).Where(c => c.Class == cls).ToList();
         var items = clients.Select(c => new ComponentItem(StatusText.ClientName(c), Level.Ok,
             StatusText.ClientFlags(c).Select(f => (f, f == "focused" ? Level.Ok : Level.Plain)).ToArray(),
-            new[] { ClientLine(c) }, Facts: StatusText.ClientFlags(c).Select(f => ("Flags", f)).ToArray())).ToArray();
+            new[] { ClientLine(c) }, Facts: StatusText.ClientFlags(c).Select(f => ("Flags", f)).ToArray(),
+            LineFacts: new[] { ("Process", ClientLine(c)) })).ToArray();
         return new ComponentSection(id, title, role, items.Length, items.Length,
-            items.Length == 0 ? (s is { IsService: true } ? "none connected" : "live clients need the service") : $"{items.Length} connected",
+            items.Length == 0 ? (s is { IsService: true } ? "none running" : "shown when DisplayXR runs in the background") : $"{items.Length} running",
             items, collapsed);
     }
 
@@ -476,7 +508,8 @@ public static class Components
                 if (ip is { Note.Length: > 0 }) lines.Add(ip.Note);
                 else if (r.Untrusted && r.ProvenanceReason is { Length: > 0 } why) lines.Add(why);
                 items.Add(new ComponentItem(r.Name.Length > 0 ? r.Name : r.Id, active ? Level.Ok : r.Untrusted ? Level.Warn : Level.Plain,
-                    chips.Chips, lines, Policy: r, Facts: chips.Facts, State: PlainStates.InputProvider(active, ip?.HardwarePresent, r)));
+                    chips.Chips, lines, Policy: r, Facts: chips.Facts, State: PlainStates.InputProvider(active, ip?.HardwarePresent, r),
+                    Summary: PublisherLine(r.Vendor, r.Version)));
             }
         }
         else
@@ -512,11 +545,11 @@ public static class Components
                        : info.InputProviders.Count > 0 ? info.InputProviders.Count : info.Input?.Registered ?? 0;
         int connected = info.InputProviders.Count > 0 ? info.InputProviders.Count(p => p.HardwarePresent)
                       : info.Input is { HardwarePresent: true } ? 1 : 0;
-        return new ComponentSection("input_providers", "Input providers",
-            "An input provider feeds controllers, hands or a navigation device into the runtime; without hardware, keyboard and mouse hold those roles.",
+        return new ComponentSection("input_providers", "Input",
+            "Controllers, hands and pens for your apps. Without a device, the keyboard and mouse do the job.",
             registered, connected,
             info.Input is null && info.InputProviders.Count == 0 && policy is null ? "not read yet"
-                : $"{Plural(registered, "registered", "registered")}{Sep}{(connected > 0 ? "hardware present" : "no hardware present")}",
+                : $"{registered} installed{Sep}{(connected > 0 ? "device connected" : "no device connected")}",
             items);
     }
 
@@ -552,10 +585,11 @@ public static class Components
             chips.Add("Module", l.ModuleChip);
             items.Add(new ComponentItem(l.Backend is { Length: > 0 } b ? b : "Conversion module",
                 l.Malformed ? Level.Critical : present ? Level.Ok : Level.Plain,
-                chips.Chips, lines, Facts: chips.Facts, State: PlainStates.ConversionModule(l.Malformed, present, l.ModuleStatus)));
+                chips.Chips, lines, Facts: chips.Facts, State: PlainStates.ConversionModule(l.Malformed, present, l.ModuleStatus),
+                LineFacts: lines.Select(x => ("Details", x)).ToArray()));
         }
-        return new ComponentSection("conversion", "Conversion module",
-            "A conversion module turns 2D content into 3D (depth, side-by-side, multi-view) as a service any app can ask for.",
+        return new ComponentSection("conversion", "2D to 3D in the display driver",
+            "A 2D-to-3D converter that your display driver reports. Any app can ask it for depth or 3D views.",
             present ? 1 : 0, present ? 1 : 0, l is null ? "not read yet" : present ? "1 available" : "none available", items);
     }
 
@@ -601,7 +635,7 @@ public static class Components
             if (p.Hidden) chips.Add("Visibility", "superseded", Level.Plain);
             if (p.Fallback) chips.Add("Role", "FALLBACK", Level.Plain);
             chips.Add("Signature", pol?.ProvenanceChip);
-            if (pol is { Untrusted: true }) chips.Add("Provenance gate", "refused: provenance", Level.Warn);
+            if (pol is { Untrusted: true }) chips.Add("Publisher check", "Blocked: publisher not verified", Level.Warn);
             var lines = new List<string>
             {
                 string.Join(Sep, new[]
@@ -610,32 +644,47 @@ public static class Components
                     p.Hosting.Replace('_', '-'), p.LicenceExempt ? "licence: grandfathered" : "licence " + p.LicenceClass,
                 }.Where(x => x.Length > 0)),
             };
-            if (malformed) lines.Add($"{Plural(p.BadDescriptors, "capability", "capabilities")} rejected: {p.DescriptorError}");
+            var lineFacts = new List<(string, string)>
+            {
+                ("Registration", string.Join(Sep, new[]
+                {
+                    p.Id, $"ProbeOrder {p.ProbeOrder}", p.Hosting.Replace('_', '-'),
+                    p.LicenceExempt ? "licence: grandfathered" : "licence " + p.LicenceClass,
+                }.Where(x => x.Length > 0))),
+            };
+            if (malformed)
+            {
+                lines.Add($"{Plural(p.BadDescriptors, "capability", "capabilities")} rejected: {p.DescriptorError}");
+                lineFacts.Add(("Descriptors", lines[^1]));
+            }
             foreach (var t in s.Tasks.Where(t => t.ProviderIndex == i))
             {
                 var (text, _) = TaskChip(t);
                 string sel = t.Selected ? "selected" : t.Order is null ? t.Verdict : $"#{t.Order + 1} ({t.Verdict})";
                 string load = t.Streams + t.JobsQueued > 0 ? $"{Sep}{t.Streams} streams, {t.JobsQueued} jobs" : "";
-                lines.Add($"{t.Task}{(t.Composed ? " (depth + view synthesis)" : "")}: {text}{Sep}{sel}{load}"
-                          + (t.CpuStaging ? $"{Sep}CPU staging" : ""));
+                string taskName = $"{t.Task}{(t.Composed ? " (depth + view synthesis)" : "")}";
+                string taskLine = $"{text}{Sep}{sel}{load}" + (t.CpuStaging ? $"{Sep}CPU staging" : "");
+                lines.Add($"{taskName}: {taskLine}");
+                lineFacts.Add((taskName, taskLine));
             }
-            if (p.Hint.Length > 0) lines.Add(p.Hint);
+            if (p.Hint.Length > 0) { lines.Add(p.Hint); lineFacts.Add(("Note", p.Hint)); }
             var worst = s.Tasks.Where(t => t.ProviderIndex == i).Select(TaskChip).Select(c => c.Level)
                          .DefaultIfEmpty(Level.Plain).Max();
             bool selected = s.Tasks.Any(t => t.ProviderIndex == i && t.Selected);
             items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id,
                 malformed ? Level.Critical : worst is Level.Critical or Level.Warn ? worst : usable ? Level.Ok : Level.Plain,
                 chips.Chips, lines, Policy: pol, Id: p.Id, BuiltIn: p.Load == "BUILT_IN" || pol is { BuiltIn: true },
-                Facts: chips.Facts, State: PlainStates.ConversionProvider(p.Load, p.Enabled, p.Hidden, malformed, selected, worst, pol)));
+                Facts: chips.Facts, State: PlainStates.ConversionProvider(p.Load, p.Enabled, p.Hidden, malformed, selected, worst, pol),
+                Summary: PublisherLine(p.Vendor, p.Version), LineFacts: lineFacts));
         }
         var served = s.Tasks.Where(t => t.Selected).Select(t => t.Task).Distinct().ToArray();
         int ready = s.Tasks.Count(t => t.Selected && t.State == "READY");
-        return new ComponentSection("conversion_providers", "Conversion providers",
-            "A conversion provider turns 2D content into depth, views or splats; the runtime picks one per task and every app shares it.",
+        return new ComponentSection("conversion_providers", "2D to 3D",
+            "Turn photos and video into 3D. DisplayXR picks one 2D-to-3D converter for each job, and every app shares it.",
             providers.Count, ready,
-            providers.Count == 0 ? "none registered"
-                : $"{Plural(providers.Count, "registered", "registered")}{Sep}{Plural(served.Length, "task", "tasks")} served{Sep}{ready} ready"
-                  + (s.IsService ? "" : $"{Sep}headless describe"),
+            providers.Count == 0 ? "none installed"
+                : $"{providers.Count} installed{Sep}in use for {Plural(served.Length, "task", "tasks")}{Sep}{ready} ready"
+                  + (s.IsService ? "" : $"{Sep}DisplayXR isn't running in the background"),
             items);
     }
 
@@ -644,8 +693,8 @@ public static class Components
     {
         if (pol is null) return;
         chips.Add("Enabled setting", pol.EnabledChip);
-        if (pol.Preferred) chips.Add("Preference", "preferred", Level.Info);
-        if (pol.Untrusted) chips.Add("Provenance gate", "refused: provenance", Level.Warn);
+        if (pol.Preferred) chips.Add("Preference", "your choice", Level.Info);
+        if (pol.Untrusted) chips.Add("Publisher check", "Blocked: publisher not verified", Level.Warn);
         chips.Add("Signature", pol.ProvenanceChip);
         chips.Add("Licence", pol.LicenceChip); // ADR-054 N5: what the component says about its licence
     }
@@ -688,11 +737,12 @@ public static class Components
                 lines.Add($"downloading {Megabytes(p.DownloadDone)} of {Megabytes(p.DownloadTotal)}");
             if (p.ResearchModels > 0)
                 lines.Add($"{Plural(p.ResearchModels, "model is", "models are")} non-commercial: used only with AllowResearchOnly");
-            items.Add(new ComponentItem(p.Pack, chip.Level, new[] { chip }, lines, State: PlainStates.ModelPack(p.State)));
+            items.Add(new ComponentItem(p.Pack, chip.Level, new[] { chip }, lines, State: PlainStates.ModelPack(p.State),
+                Summary: lines[0].Length > 0 ? lines[0] : null, LineFacts: lines.Skip(1).Select(x => ("Note", x)).ToArray()));
         }
         int installed = s.Packs.Count(p => p.State == "installed");
-        return new ComponentSection("conversion_models", "Conversion models",
-            "Model packs the runtime keeps in one shared store; providers load their models from it and download missing ones on first use.",
+        return new ComponentSection("conversion_models", "2D-to-3D models",
+            "Models the 2D-to-3D converters use, kept in one place on this PC. A missing model downloads the first time it is needed.",
             s.Packs.Count, installed,
             $"{installed} of {Plural(s.Packs.Count, "pack", "packs")} installed"
               + (s.ModelStoreRoot is { Length: > 0 } r ? $"{Sep}{r}" : ""),
@@ -702,10 +752,10 @@ public static class Components
     public static ComponentSection? StereoCamera(InfoComponents info)
     {
         if (info.StereoCamera is not { } kv) return null;
-        var item = new ComponentItem("Stereo camera source", Level.Plain, Array.Empty<(string, Level)>(),
-            kv.Select(p => $"{p.Key}: {p.Value}").ToArray());
-        return new ComponentSection("stereo_camera", "Stereo camera source",
-            "A stereo camera source supplies left / right camera frames to apps through the runtime.",
-            1, 0, "reported by the runtime", new[] { item });
+        var item = new ComponentItem("Stereo camera", Level.Plain, Array.Empty<(string, Level)>(),
+            kv.Select(p => $"{p.Key}: {p.Value}").ToArray(), LineFacts: kv.Select(p => (p.Key, p.Value)).ToArray());
+        return new ComponentSection("stereo_camera", "Stereo camera",
+            "A camera with two lenses that gives apps left and right pictures through DisplayXR.",
+            1, 0, "reported by DisplayXR", new[] { item });
     }
 }

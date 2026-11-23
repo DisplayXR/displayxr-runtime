@@ -41,7 +41,7 @@ public class ComponentPolicyTests
         Assert.Equal(("signed by Leia, Inc.", Level.Ok), leia.ProvenanceChip);
 
         var sim = dp.Row("sim-display")!;
-        Assert.Equal(("allowlisted", Level.Ok), sim.ProvenanceChip);
+        Assert.Equal(("Approved on this PC", Level.Ok), sim.ProvenanceChip);
         Assert.False(sim.Untrusted);
     }
 
@@ -95,7 +95,7 @@ public class ComponentPolicyTests
         Assert.True(input.Writable);
         Assert.False(input.ForceQwerty);
         Assert.Equal(2, input.Rows.Count);
-        Assert.All(input.Rows, r => Assert.Equal(("unverified", Level.Warn), r.ProvenanceChip));
+        Assert.All(input.Rows, r => Assert.Equal(("Publisher not verified", Level.Warn), r.ProvenanceChip));
         Assert.All(input.Rows, r => Assert.Contains("allowlisted", r.ProvenanceReason));
         Assert.Equal("DisplayXR-Ultraleap", input.Rows.Single(r => r.Active).Id);
     }
@@ -137,7 +137,7 @@ public class ComponentPolicyTests
         Assert.Equal("user", row.EnabledSource); // the CLI's word, read — never invented
         Assert.Equal(("disabled (user)", Level.Plain), row.EnabledChip);
         Assert.False(conv.PolicyLock);
-        Assert.Equal(("unverified", Level.Warn), row.ProvenanceChip);
+        Assert.Equal(("Publisher not verified", Level.Warn), row.ProvenanceChip);
     }
 
     [Fact]
@@ -169,15 +169,15 @@ public class ComponentPolicyTests
         Assert.Null(R(true, "default").EnabledChip);
         Assert.Null(R(true, "manifest").EnabledChip);
         Assert.True(R(true, "default", load: "UNTRUSTED").Untrusted);
-        Assert.Equal(("dev override", Level.Info), R(true, "default", prov: "dev-override").ProvenanceChip);
-        Assert.Equal(("platform-trusted", Level.Ok), R(true, "default", prov: "platform-trusted").ProvenanceChip);
+        Assert.Equal(("Developer override", Level.Info), R(true, "default", prov: "dev-override").ProvenanceChip);
+        Assert.Equal(("Trusted by the system", Level.Ok), R(true, "default", prov: "platform-trusted").ProvenanceChip);
         Assert.Equal(("signed", Level.Ok), R(true, "default", prov: "signed").ProvenanceChip);
         Assert.Equal(("quantum", Level.Plain), R(true, "default", prov: "quantum").ProvenanceChip); // unknown verdict: verbatim, neutral
 
         var chips = new ChipList();
         Components.AddPolicyChips(chips, R(false, "user", pref: true, load: "UNTRUSTED", prov: "unverified"));
-        Assert.Equal(new[] { ("disabled (user)", Level.Plain), ("preferred", Level.Info), ("refused: provenance", Level.Warn), ("unverified", Level.Warn) }, chips.Chips);
-        Assert.Equal(new[] { ("Enabled setting", "disabled (user)"), ("Preference", "preferred"), ("Provenance gate", "refused: provenance"), ("Signature", "unverified") },
+        Assert.Equal(new[] { ("disabled (user)", Level.Plain), ("your choice", Level.Info), ("Blocked: publisher not verified", Level.Warn), ("Publisher not verified", Level.Warn) }, chips.Chips);
+        Assert.Equal(new[] { ("Enabled setting", "disabled (user)"), ("Preference", "your choice"), ("Publisher check", "Blocked: publisher not verified"), ("Signature", "Publisher not verified") },
                      chips.Facts);
     }
 
@@ -199,7 +199,7 @@ public class ComponentPolicyTests
         // The readable form (log pane, administrator hints).
         Assert.Equal("conv use depth-mono acme-conv/depth-a", PolicyCommands.PreferTask("depth-mono", "acme-conv/depth-a").ToString());
         Assert.Equal(new[] { "policy-dp", "policy-input", "policy-conv", "policy-tracking" }, ComponentClasses.All.Select(PolicyCommands.Area));
-        Assert.Equal(new[] { "display processor", "input provider", "conversion provider", "viewer-tracking provider" }, ComponentClasses.All.Select(c => c.Noun()));
+        Assert.Equal(new[] { "display driver", "input add-on", "2D-to-3D converter", "camera head tracking add-on" }, ComponentClasses.All.Select(c => c.Noun()));
     }
 
     [Theory]
@@ -255,7 +255,8 @@ public class ComponentPolicyTests
         // Every chip is kept for the row's Details, labelled; the row's state word is In use.
         Assert.Contains(("Load state", "ACTIVE"), leia.DetailFacts);
         Assert.Contains(leia.DetailFacts, f => f.Label == "Signature" && f.Text.StartsWith("signed", StringComparison.Ordinal));
-        Assert.Equal(leia.Chips.Count, leia.DetailFacts.Count);
+        Assert.Equal(leia.Chips.Count, leia.Facts!.Count);
+        Assert.Contains(leia.DetailFacts, f => f.Label == "Registration" && f.Text.Contains("ProbeOrder"));
         Assert.Equal(PlainState.InUse, leia.State);
 
         // No info rows at all: the input section is built from the policy list.
@@ -263,9 +264,9 @@ public class ComponentPolicyTests
         Assert.Equal(2, input.Count);
         var ul = input.Items.Single(i => i.Policy?.Id == "DisplayXR-Ultraleap");
         Assert.Contains(("active", Level.Ok), ul.Chips);
-        Assert.Contains(("unverified", Level.Warn), ul.Chips);
-        Assert.Contains(("Signature", "unverified"), ul.DetailFacts);
-        Assert.StartsWith("2 registered", input.ConnectedLine);
+        Assert.Contains(("Publisher not verified", Level.Warn), ul.Chips);
+        Assert.Contains(("Signature", "Publisher not verified"), ul.DetailFacts);
+        Assert.StartsWith("2 installed", input.ConnectedLine);
 
         // Without a policy list nothing changes for the older CLI.
         var plain = Components.Build(snap, null);
@@ -281,8 +282,10 @@ public class ComponentPolicyTests
         {
             Assert.DoesNotContain("plug-in", s.Title, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("plug-in", s.Role, StringComparison.OrdinalIgnoreCase);
-            Assert.DoesNotContain("driver", s.Role, StringComparison.OrdinalIgnoreCase);
+            // The owner's plain word is "display driver"; the architecture's word stays out of the page.
+            Assert.DoesNotContain("display processor", s.Role, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("provider", s.Role, StringComparison.OrdinalIgnoreCase);
         }
-        Assert.Equal("Applies to the next stream or job; a live stream never moves.", ComponentClass.Conversion.AppliesNote());
+        Assert.Equal("Applies to the next photo or video converted; one already playing keeps its converter.", ComponentClass.Conversion.AppliesNote());
     }
 }

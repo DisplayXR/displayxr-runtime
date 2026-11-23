@@ -63,7 +63,7 @@ public class TrackingProvidersTests
         Assert.True(a.RankedFirst);
         Assert.True(a.EnabledKnown);
         Assert.Null(a.EnabledChip); // "default": the quiet default
-        Assert.Equal(("unverified", Level.Warn), a.ProvenanceChip);
+        Assert.Equal(("Publisher not verified", Level.Warn), a.ProvenanceChip);
         Assert.False(a.Untrusted); // POSIX audits: loaded anyway
 
         var b = l.Row("sim-tracking-b")!;
@@ -95,7 +95,7 @@ public class TrackingProvidersTests
         Assert.Equal(V("tracking", "reset"), PolicyCommands.Reset(ComponentClass.Tracking).Args);
         Assert.Equal("policy-tracking", PolicyCommands.Area(ComponentClass.Tracking));
         Assert.Equal(ComponentClass.Tracking, PolicyList.ClassOfSection("tracking_providers"));
-        Assert.Contains("next app launch", ComponentClass.Tracking.AppliesNote());
+        Assert.Contains("next time an app starts", ComponentClass.Tracking.AppliesNote());
     }
 
     [Fact]
@@ -166,21 +166,21 @@ public class TrackingProvidersTests
         Assert.True(p.Primary);
         Assert.Equal(ViewerSourceKind.Provider, p.Kind);
         Assert.Equal("sim-tracking", p.ProviderId);
-        Assert.Equal("Provider: DisplayXR Sim Tracking", p.Source);
-        Assert.StartsWith("Selected:", p.Reason); // headless: no live state yet
+        Assert.Equal("Camera head tracking: DisplayXR Sim Tracking", p.Source);
+        Assert.StartsWith("Chosen:", p.Reason); // headless: no live state yet
         Assert.Equal("EXTERNAL_OK", p.Policy);
-        Assert.Equal(("policy EXTERNAL_OK", Level.Info), p.PolicyChip);
+        Assert.Equal(("Allows camera head tracking", Level.Info), p.PolicyChip);
         Assert.True(p.CanCalibrate);
 
         var n = Assert.Single(Tracking.Screens(Status("nosource"), null, Name));
         Assert.Equal(ViewerSourceKind.Nominal, n.Kind);
-        Assert.Equal("No source: no enabled provider found a usable source.", n.Reason);
+        Assert.Equal("No camera found you: no camera head tracking that is turned on found a usable camera.", n.Reason);
         Assert.Equal("no source", n.RawReason);
         Assert.False(n.CanCalibrate);
 
         var d = Assert.Single(Tracking.Screens(Status("dp"), null, Name));
         Assert.Equal(ViewerSourceKind.Display, d.Kind);
-        Assert.Equal("Standby: the display tracks the viewer on this screen.", d.Reason);
+        Assert.Equal("Standby: the display tracks you itself.", d.Reason);
         Assert.False(d.CanCalibrate);
         Assert.NotEqual(n.Reason, d.Reason);
     }
@@ -188,10 +188,10 @@ public class TrackingProvidersTests
     [Fact]
     public void Words_LiveStateAndVerbatimReasons()
     {
-        Assert.Equal(("Provider: Cam", "Tracking the viewer.", Level.Ok),
+        Assert.Equal(("Camera head tracking: Cam", "Following you.", Level.Ok),
                      Tracking.Words(ViewerSourceKind.Provider, "Cam", null, "TRACKING"));
         var paused = Tracking.Words(ViewerSourceKind.Provider, "Cam", null, "NOT_TRACKING");
-        Assert.StartsWith("Source paused:", paused.Reason);
+        Assert.StartsWith("Paused:", paused.Reason);
         Assert.Equal(Level.Warn, paused.Level);
         Assert.Equal("Display is FIXED.", Tracking.Words(ViewerSourceKind.Nominal, "", "display is FIXED", "NO_DP").Reason);
         Assert.Equal("Display owns the viewer on this screen (policy OWN).",
@@ -207,7 +207,7 @@ public class TrackingProvidersTests
         var rows = Tracking.Screens(old, null);
         Assert.Equal(2, rows.Count);
         Assert.All(rows, r => Assert.Equal(ViewerSourceKind.Unknown, r.Kind));
-        Assert.All(rows, r => Assert.Equal(("policy not reported", Level.Plain), r.PolicyChip));
+        Assert.All(rows, r => Assert.Equal(("Not reported", Level.Plain), r.PolicyChip));
 
         // The runtime-default screen takes info's display_viewer_policy; the other screen does not.
         var withInfo = Tracking.Screens(old, Summary("provider"));
@@ -226,15 +226,15 @@ public class TrackingProvidersTests
         var ids = all.Select(s => s.Id).ToList();
         Assert.Equal(ids.IndexOf("input_providers") + 1, ids.IndexOf("tracking_providers")); // beside the input providers
         var tr = all.Single(s => s.Id == "tracking_providers");
-        Assert.Equal("Tracking providers", tr.Title);
+        Assert.Equal("Viewer tracking", tr.Title);
         Assert.Equal(2, tr.Count);
         Assert.Equal(1, tr.Connected);
-        Assert.Equal("2 registered · 1 enabled · serving 1 screen", tr.ConnectedLine);
+        Assert.Equal("2 installed · 1 turned on · in use on 1 display", tr.ConnectedLine);
         var sim = tr.Items.Single(i => i.Policy?.Id == "sim-tracking");
         Assert.Equal(Level.Ok, sim.Level);
         Assert.Contains(("serving", Level.Ok), sim.Chips);
         Assert.Contains(("probe: usable source, ranked first", Level.Ok), sim.Chips);
-        Assert.Contains(("unverified", Level.Warn), sim.Chips);
+        Assert.Contains(("Publisher not verified", Level.Warn), sim.Chips);
         Assert.StartsWith("DisplayXR · version dev · sim-tracking · ProbeOrder 200", sim.Lines[0]);
         var b = tr.Items.Single(i => i.Policy?.Id == "sim-tracking-b");
         Assert.DoesNotContain(("serving", Level.Ok), b.Chips);
@@ -247,6 +247,6 @@ public class TrackingProvidersTests
         var none = Components.Build(Status("nosource"), null, null, new Dictionary<ComponentClass, PolicyList> { [ComponentClass.Tracking] = empty! })
             .Single(s => s.Id == "tracking_providers");
         Assert.True(none.IsEmpty);
-        Assert.Equal("none registered", none.ConnectedLine);
+        Assert.Equal("none installed", none.ConnectedLine);
     }
 }

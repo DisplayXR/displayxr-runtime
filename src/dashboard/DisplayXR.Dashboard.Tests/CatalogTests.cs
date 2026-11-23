@@ -1055,7 +1055,7 @@ public class CatalogTests
         Assert.Null(CatalogText.Checking(false));
         var line = CatalogText.Checking(true);
         Assert.NotNull(line);
-        Assert.Equal("Checking the catalog", line!.Value.Title);
+        Assert.Equal("Checking for add-ons and updates…", line!.Value.Title);
         Assert.Contains("20 seconds", line.Value.Text);
     }
 

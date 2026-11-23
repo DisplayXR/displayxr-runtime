@@ -36,7 +36,7 @@ public class ComponentsTests
 
         var po = Section(all, "present_owners");
         Assert.Equal("capture_app.exe", Assert.Single(po.Items).Name);
-        Assert.Equal("1 connected", po.ConnectedLine);
+        Assert.Equal("1 running", po.ConnectedLine);
 
         var diag = Section(all, "diagnostics");
         Assert.True(diag.Collapsed);
@@ -61,6 +61,38 @@ public class ComponentsTests
         var sim = dp.Items[1];
         Assert.Contains(("FALLBACK", Level.Plain), sim.Chips);
         Assert.Contains("Claims no screen", sim.Lines);
+    }
+
+    [Fact]
+    public void RowFace_IsOnePlainLine_TheTechnicalLinesAreLabelledInDetails()
+    {
+        var dp = Components.DisplayProcessors(Comp);
+        Assert.Equal("Displays", dp.Title);
+        Assert.Equal("2 installed · 1 in use", dp.ConnectedLine);
+        var leia = dp.Items[0];
+        // Publisher · version · what it drives, in plain words; no id, ProbeOrder or claim confidence.
+        Assert.EndsWith("drives 2 displays", leia.Summary);
+        Assert.DoesNotContain("ProbeOrder", leia.Summary);
+        Assert.DoesNotContain("VERIFIED", leia.Summary);
+        Assert.Contains(("Displays", "Claims DISPLAY1 (VERIFIED), DISPLAY5 (VERIFIED)"), leia.DetailFacts);
+        Assert.Contains(leia.DetailFacts, f => f.Label == "Registration" && f.Text.Contains("ProbeOrder"));
+        // A driver that drives nothing says nothing about it on its face.
+        Assert.DoesNotContain("drives", Components.DisplayProcessors(Comp).Items[1].Summary ?? "");
+        // Lines without labels are still listed, under "Note".
+        var plain = new ComponentItem("x", Level.Plain, Array.Empty<(string, Level)>(), new[] { "hosted in a satellite" });
+        Assert.Contains(("Note", "hosted in a satellite"), plain.DetailFacts);
+    }
+
+    [Fact]
+    public void DrivesLine_SaysWhichDisplayInPlainWords()
+    {
+        var main = Comp.Screens.First(s => s.Roles.OsMain);
+        Assert.Equal("drives your main display", Components.DrivesLine(new[] { main }));
+        var other = main with { Roles = main.Roles with { OsMain = false } };
+        Assert.Equal($"drives {StatusText.ScreenName(other)}", Components.DrivesLine(new[] { other }));
+        Assert.Null(Components.DrivesLine(Array.Empty<Screen>()));
+        Assert.Equal("Acme · version 1.2", Components.PublisherLine("Acme", "1.2"));
+        Assert.Null(Components.PublisherLine("", ""));
     }
 
     [Theory]
@@ -127,7 +159,7 @@ public class ComponentsTests
         var other = wc.Items.Single(i => i.Name == "Other Controller");
         Assert.Contains(("registered, not running", Level.Plain), other.Chips);
         Assert.Contains("not connected", other.Lines[0]);
-        Assert.EndsWith("2 registered", wc.ConnectedLine);
+        Assert.EndsWith("2 installed", wc.ConnectedLine);
     }
 
     [Fact]
@@ -147,7 +179,7 @@ public class ComponentsTests
         Assert.DoesNotContain(all, s => s.Id == "stereo_camera"); // absent block: section omitted
         var input = Section(all, "input_providers");
         Assert.Equal(2, input.Items.Count); // the summary row + the rig role
-        Assert.Equal("2 registered · no hardware present", input.ConnectedLine);
+        Assert.Equal("2 installed · no device connected", input.ConnectedLine);
         var conv = Section(all, "conversion");
         Assert.Equal("neurd-directml", Assert.Single(conv.Items).Name); // backend verbatim
         Assert.Equal(1, conv.Count);
@@ -213,7 +245,7 @@ public class ComponentsTests
         var all = Components.Build(null, bare!.Components);
         Assert.All(all, s => Assert.Empty(s.Items));
         Assert.Equal("not read yet", Section(all, "input_providers").ConnectedLine);
-        Assert.Equal("live clients need the service", Section(all, "present_owners").ConnectedLine);
+        Assert.Equal("shown when DisplayXR runs in the background", Section(all, "present_owners").ConnectedLine);
 
         Assert.True(InfoResult.TryParse("""
             { "workspace_controllers": "nope", "input_providers": 5, "lift_caps": { "probed": true, "malformed": true },
@@ -237,6 +269,6 @@ public class ComponentsTests
         var wc = Components.WorkspaceController(s, InfoComponents.Empty);
         var item = Assert.Single(wc.Items);
         Assert.Equal("Workspace controller: workspace-host · not connected · workspace off", item.Lines[0]);
-        Assert.Equal("none connected · workspace off", wc.ConnectedLine);
+        Assert.Equal("not running · turned off", wc.ConnectedLine);
     }
 }

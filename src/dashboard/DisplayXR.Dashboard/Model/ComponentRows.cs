@@ -70,7 +70,7 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
         RowStatus.Installed => ("Installed", Level.Ok),
         RowStatus.UpdateAvailable => ("Update available", Level.Info),
         RowStatus.Available => ("Available", Level.Plain),
-        RowStatus.NotFromCatalog => ("Not from catalog", Level.Plain),
+        RowStatus.NotFromCatalog => ("Installed separately", Level.Plain),
         RowStatus.PartOfRuntime => ("Part of the runtime", Level.Plain),
         _ => null,
     };
@@ -244,10 +244,10 @@ public static class ComponentRows
         }
         var runtime = Ordered(items.Where(c => c.IsRuntime)).Select(c => CatalogOnly(c, stale)).ToArray();
         if (runtime.Length > 0)
-            groups.Insert(0, CatalogGroup(RuntimeGroupId, "Runtime", "DisplayXR itself: what every component, app and add-on here runs on.", runtime));
+            groups.Insert(0, CatalogGroup(RuntimeGroupId, "DisplayXR", "DisplayXR itself: what every add-on and app here runs on.", runtime));
         var apps = Ordered(items.Where(c => !c.IsRuntime && !ComponentClassNames.Contains(c.Class))).Select(c => CatalogOnly(c, stale)).ToArray();
         if (apps.Length > 0)
-            groups.Add(CatalogGroup(AppsGroupId, "Apps", "Apps and tools from the catalog. They run on the runtime; they are not plugged into it.", apps));
+            groups.Add(CatalogGroup(AppsGroupId, "Apps", "Apps and tools for your display. They run on DisplayXR.", apps));
         return groups;
     }
 

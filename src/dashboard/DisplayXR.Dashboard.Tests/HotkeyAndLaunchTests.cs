@@ -106,7 +106,7 @@ public class HotkeyAndLaunchTests
         var other = wc.Items.Single(i => i.Name == "Other Controller");
         Assert.Contains(("registered, not running", Level.Plain), other.Chips);
         Assert.Equal(1, wc.Connected);
-        Assert.Equal("1 connected · workspace on · 2 registered", wc.ConnectedLine);
+        Assert.Equal("1 running · turned on · 2 installed", wc.ConnectedLine);
     }
 
     [Fact]
