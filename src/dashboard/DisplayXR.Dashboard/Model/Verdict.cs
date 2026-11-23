@@ -78,31 +78,13 @@ public static class Verdicts
         : (false, null);
 
     /// <summary>
-    /// Whether display driver <paramref name="pluginId"/> is the simulated one: the snapshot marks it as the
-    /// fallback (<c>plugins[].fallback</c>: the runtime's vendor-neutral simulated display), or, when the
-    /// snapshot does not list it, its id is the simulated display's.
-    /// </summary>
-    public static bool IsSimulated(StatusSnapshot s, string? pluginId) =>
-        pluginId is { Length: > 0 } id
-        && (s.Plugins.FirstOrDefault(p => p.Id == id) is { } p ? p.Fallback : id == FriendlyOptions.SimDisplay);
-
-    /// <summary>
-    /// A display recognised as a 3D display: claimed by a display driver that is not the simulated one.
-    /// The simulated driver claims every display (at the lowest confidence) so that apps run anywhere;
-    /// that is not a 3D display. A display the simulated driver was CHOSEN for (a per-display override,
-    /// <c>claim.forced</c>) still counts: someone picked it for a display DisplayXR found.
-    /// </summary>
-    public static bool IsReal3D(StatusSnapshot s, Screen x) =>
-        x.Claim.IsClaimed && (x.Claim.Forced == true || !IsSimulated(s, x.Claim.PluginId));
-
-    /// <summary>
     /// The simulated display driver's id when it is the only display driver in use (it claims a display or
     /// is the active one, and no other driver claims a display or is active); null otherwise.
     /// </summary>
     public static string? OnlySimulated(StatusSnapshot s)
     {
-        if (s.Screens.Any(x => IsReal3D(s, x))) return null;
-        if (s.Plugins.Any(p => p.Load == "ACTIVE" && !IsSimulated(s, p.Id))) return null;
+        if (s.Screens.Any(x => StatusText.IsReal3D(s, x))) return null;
+        if (s.Plugins.Any(p => p.Load == "ACTIVE" && !StatusText.IsSimulatedDriver(s, p.Id))) return null;
         return s.Screens.Where(x => x.Claim.IsClaimed).Select(x => x.Claim.PluginId).FirstOrDefault()
                ?? s.Plugins.FirstOrDefault(p => p.Load == "ACTIVE")?.Id;
     }
@@ -150,7 +132,7 @@ public static class Verdicts
             string? role = x.Roles.OsMain ? "Main display" : null;
             string? id = dp?.Screen(x.Key)?.EffectivePlugin ?? (x.Claim.IsClaimed ? x.Claim.PluginId : null);
             string? name = id is null ? null : s.Plugins.FirstOrDefault(p => p.Id == id)?.Name is { Length: > 0 } n ? n : id;
-            bool is3D = IsReal3D(s, x);
+            bool is3D = StatusText.IsReal3D(s, x);
             rows.Add(new VerdictRow(x.Id, StatusText.ScreenName(x), role, is3D, is3D ? name : null, is3D ? id : null,
                                     is3D ? StatusText.ForcedChip(x, dp) : null,
                                     is3D ? Facts(s, x) : Array.Empty<VerdictFact>()));
@@ -250,7 +232,7 @@ public static class Verdicts
         if (s.Screens.Count == 0)
             return new Verdict(VerdictKind.NoDisplay, "No display found",
                                Join("Check that your display is connected and awake.", more), Level.Warn, rows, attention);
-        int claimed = s.Screens.Count(x => IsReal3D(s, x));
+        int claimed = s.Screens.Count(x => StatusText.IsReal3D(s, x));
         if (claimed == 0)
         {
             // Only the simulated display driver: an ordinary PC, where apps show in 2D. Nothing to fix.
@@ -262,7 +244,7 @@ public static class Verdicts
                                Level.Warn, rows, attention);
         }
 
-        int working = s.Screens.Count(x => IsReal3D(s, x) && ThreeD(s, x) == Tick.Yes);
+        int working = s.Screens.Count(x => StatusText.IsReal3D(s, x) && ThreeD(s, x) == Tick.Yes);
         bool blocking = attention.Any(a => a.Level == Level.Critical);
         if (working > 0)
             return new Verdict(VerdictKind.Working, $"3D is working on {StatusText.Plural(working, "display", "displays")}", more,

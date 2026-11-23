@@ -40,7 +40,9 @@ behind a Details toggle.
   a recognised 3D display, unless that driver was chosen for it (`claim.forced`). When the simulated
   driver is the only display driver in use, *No 3D display found* reads "DisplayXR apps show in normal
   2D on this PC. Nothing is wrong." (an info level, not a warning) with a **Try a 3D preview** link to
-  that driver's Details on Components, where its Options are (`Verdicts.OnlySimulated`). "Needs attention" is built only from what is already read: every warn / critical warning
+  that driver's Details on Components, where its Options are (`Verdicts.OnlySimulated`). The rule
+  "is this display a real 3D display" is one pure function, `StatusText.IsReal3D`, shared by Home and
+  Displays. "Needs attention" is built only from what is already read: every warn / critical warning
   of the snapshot (the runtime's codes in plain words, a display maker's own warning quoted), the
   background service not reached, a failed "Check my setup", and another program set as the active
   OpenXR runtime. Its only buttons are ones the Dashboard already had (Open Displays, Open
@@ -53,7 +55,12 @@ behind a Details toggle.
   technical lines "Copy list" writes. The selector stays on the face when more than one driver could
   drive the display or more than one 3D display is present (`StatusText.DriverChoiceOnFace`). The
   desktop map and its legend show only with more than one display. The caption never prints a zero
-  ("One display, recognised as 3D · whether it sees you is not known yet").
+  ("One display, recognised as 3D · whether it sees you is not known yet"). A display claimed only by
+  the simulated display driver (`StatusText.IsReal3D` false, as on Home) has the badge *Ordinary 2D
+  display*, the state line "The simulated display driver gives it a 3D preview." (while no app draws on
+  it), a plain dot, a Details line "Not recognised as a 3D display · display driver: <name>, which
+  gives it a 3D preview", and is not counted as "recognised as 3D"; its driver selector and the
+  technical lines (FALLBACK) are unchanged.
 - **Components**: what you have and what you can add (below). Running programs are not on it.
 - **Settings** (was Performance): *Graphics card for 3D apps* (hidden on a PC with one graphics
   card), *Spatial desktop* (the shortcut, mode and "Open now": the same `Ui/WorkspaceLaunchEditor`
@@ -280,7 +287,8 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
 
 ADR-065: a display driver serves two rendering modes at run time, 2D and 3D; which kind of 3D, and
 everything else, is a per-driver **setting** that the driver declares and the runtime stores. A
-display driver's Details on Components end with an **Options** block (`Model/DriverOptions.cs`,
+display driver's Details on Components open with an **Options** block (then the technical labelled
+lines, the scope and command-line notes, the catalog detail and the removal sentence; `Model/DriverOptions.cs`,
 `ComponentsPage.OptionsBlockView`).
 
 - **Read** `displayxr-cli dp options <id> --json` when the driver's Details are first opened (also

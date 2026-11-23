@@ -219,10 +219,10 @@ public class VerdictTests
     public void IsSimulated_ByTheSnapshotsFallbackFlag_ElseByTheId()
     {
         var s = SimOnly();
-        Assert.True(Verdicts.IsSimulated(s, "sim-display"));
-        Assert.False(Verdicts.IsSimulated(Design, "leia-sr"));
-        Assert.True(Verdicts.IsSimulated(s with { Plugins = Array.Empty<PluginInfo>() }, "sim-display")); // not listed: by id
-        Assert.False(Verdicts.IsSimulated(s, null));
+        Assert.True(StatusText.IsSimulatedDriver(s, "sim-display"));
+        Assert.False(StatusText.IsSimulatedDriver(Design, "leia-sr"));
+        Assert.True(StatusText.IsSimulatedDriver(s with { Plugins = Array.Empty<PluginInfo>() }, "sim-display")); // not listed: by id
+        Assert.False(StatusText.IsSimulatedDriver(s, null));
     }
 
     [Fact]

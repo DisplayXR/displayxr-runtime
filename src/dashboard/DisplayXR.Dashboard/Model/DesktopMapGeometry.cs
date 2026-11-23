@@ -111,7 +111,7 @@ public static class DesktopMapGeometry
         var screens = s.Screens.Select(x => new ScreenIn(
             x.Id, StatusText.ShortDevice(x.DeviceName) is { Length: > 0 } d ? d : StatusText.ScreenName(x),
             $"{StatusText.ScreenName(x)}{StatusText.Sep}{x.Desktop.Rect.Width}{StatusText.Times}{x.Desktop.Rect.Height}{StatusText.Sep}{StatusText.Scale(x.Desktop.Scale)}",
-            x.Desktop.Rect, StatusText.ScreenLevel(x))).ToArray();
+            x.Desktop.Rect, StatusText.ScreenLevel(x, s))).ToArray();
         var windows = s.Clients.Where(c => !c.IsDiag && c.Window is { IsEmpty: false })
             .Select(c => new WindowIn(c.Id, StatusText.ClientName(c), c.Window!.Value, c.OwnerScreen, c.Segments.Split)).ToArray();
         return (screens, windows);

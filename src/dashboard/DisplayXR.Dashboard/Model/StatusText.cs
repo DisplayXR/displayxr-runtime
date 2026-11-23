@@ -49,13 +49,39 @@ public static class StatusText
         return s.Warnings.Append(vw).ToArray();
     }
 
-    /// <summary>The row's status dot: the worst warn / critical, else ok when claimed, else plain.</summary>
-    public static Level ScreenLevel(Screen s)
+    // ── Is this display a real 3D display? The one rule, shared by Home and Displays ──
+
+    /// <summary>
+    /// Whether display driver <paramref name="pluginId"/> is the simulated one: the snapshot marks it as the
+    /// fallback (<c>plugins[].fallback</c>: the runtime's vendor-neutral simulated display), or, when the
+    /// snapshot does not list it (or there is no snapshot), its id is the simulated display's.
+    /// </summary>
+    public static bool IsSimulatedDriver(StatusSnapshot? snap, string? pluginId) =>
+        pluginId is { Length: > 0 } id
+        && (snap?.Plugins.FirstOrDefault(p => p.Id == id) is { } p ? p.Fallback : id == FriendlyOptions.SimDisplay);
+
+    /// <summary>
+    /// A display recognised as a 3D display: claimed by a display driver that is not the simulated one.
+    /// The simulated driver claims every display (at the lowest confidence) so that apps run anywhere;
+    /// that is not a 3D display. A display the simulated driver was CHOSEN for (a per-display override,
+    /// <c>claim.forced</c>) still counts: someone picked it for a display DisplayXR found.
+    /// </summary>
+    public static bool IsReal3D(StatusSnapshot? snap, Screen s) =>
+        s.Claim.IsClaimed && (s.Claim.Forced == true || !IsSimulatedDriver(snap, s.Claim.PluginId));
+
+    /// <summary>Claimed only by the simulated display driver: an ordinary display that driver gives a 3D preview.</summary>
+    public static bool IsSimulatedPreview(StatusSnapshot? snap, Screen s) => s.Claim.IsClaimed && !IsReal3D(snap, s);
+
+    /// <summary>The state line of a display the simulated display driver gives a 3D preview (no live state).</summary>
+    public const string SimulatedPreviewLine = "The simulated display driver gives it a 3D preview.";
+
+    /// <summary>The row's status dot: the worst warn / critical, else ok when it is a real 3D display, else plain.</summary>
+    public static Level ScreenLevel(Screen s, StatusSnapshot? snap = null)
     {
         var worst = ScreenWarnings(s).Select(w => w.Level).DefaultIfEmpty(WarningLevel.Info).Max();
         if (worst == WarningLevel.Critical) return Level.Critical;
         if (worst == WarningLevel.Warn) return Level.Warn;
-        return s.Claim.IsClaimed ? Level.Ok : Level.Plain;
+        return IsReal3D(snap, s) ? Level.Ok : Level.Plain;
     }
 
     public static string ShortDevice(string device)
@@ -101,9 +127,10 @@ public static class StatusText
     }
 
     /// <summary>The badge in plain words: is this a 3D display, and how sure is DisplayXR.</summary>
-    public static (string Text, Level Level) PlainBadge(Screen s)
+    public static (string Text, Level Level) PlainBadge(Screen s, StatusSnapshot? snap = null)
     {
         if (!s.Claim.IsClaimed) return ("Not a 3D display", Level.Plain);
+        if (IsSimulatedPreview(snap, s)) return (Verdicts.Plain2D, Level.Plain);
         return s.Claim.Confidence switch
         {
             "VERIFIED" => ("Confirmed", Level.Ok),
@@ -132,11 +159,12 @@ public static class StatusText
     /// <c>Recognised as a 3D display · display driver: Leia SR</c>. <paramref name="nameOf"/> maps a driver id to
     /// its own name (the snapshot's plug-in list); the id is used when it has none.
     /// </summary>
-    public static string PlainClaimLine(Screen s, Func<string, string?>? nameOf = null)
+    public static string PlainClaimLine(Screen s, Func<string, string?>? nameOf = null, StatusSnapshot? snap = null)
     {
         if (!s.Claim.IsClaimed) return "Not recognised as a 3D display. No display driver shows 3D on it.";
         string id = s.Claim.PluginId!;
         string name = nameOf?.Invoke(id) is { Length: > 0 } n ? n : id;
+        if (IsSimulatedPreview(snap, s)) return $"Not recognised as a 3D display{Sep}display driver: {name}, which gives it a 3D preview";
         string line = $"Recognised as a 3D display{Sep}display driver: {name}";
         if (s.Claim.Forced == true) line += $"{Sep}{ChosenWord(s.Claim.PreferredSource)}";
         return line;
@@ -165,7 +193,7 @@ public static class StatusText
         : s.Mode?.Is3D;
 
     /// <summary><c>Sees you · 3D on · used by 1 app</c>: the state line in plain words (<see cref="StateLine"/> is the technical one).</summary>
-    public static string PlainStateLine(Screen s)
+    public static string PlainStateLine(Screen s, StatusSnapshot? snap = null)
     {
         var parts = new List<string>();
         if (PlainTracking(s.EyeTracking.State) is { } t) parts.Add(t);
@@ -173,7 +201,7 @@ public static class StatusText
         if (s.Dps.Count > 0) parts.Add($"used by {Plural(s.Dps.Count, "app", "apps")}");
         if (parts.Count > 0) return string.Join(Sep, parts);
         // No live state (no app draws on it): the same plain words as Home.
-        return s.Claim.IsClaimed ? IdleLine : Verdicts.Plain2D;
+        return IsSimulatedPreview(snap, s) ? SimulatedPreviewLine : s.Claim.IsClaimed ? IdleLine : Verdicts.Plain2D;
     }
 
     /// <summary>A 3D display with no live state, on Home and on Displays.</summary>
@@ -199,12 +227,12 @@ public static class StatusText
     /// </summary>
     public static string DisplaysSummary(StatusSnapshot s)
     {
-        var claimed = s.Screens.Where(x => x.Claim.IsClaimed).ToList();
+        var claimed = s.Screens.Where(x => IsReal3D(s, x)).ToList();
         if (s.Screens.Count == 0) return "No display found";
         if (s.Screens.Count == 1)
         {
             var one = s.Screens[0];
-            if (!one.Claim.IsClaimed) return "One display, not a 3D display";
+            if (!IsReal3D(s, one)) return "One display, not a 3D display";
             return "One display, recognised as 3D" + Sep + Verdicts.SeesYou(s, one) switch
             {
                 Tick.Yes => "it sees you",
@@ -365,7 +393,7 @@ public static class StatusText
     /// </summary>
     public static bool DriverChoiceOnFace(Screen s, StatusSnapshot snap, DpList? dp)
     {
-        if (Claimed(snap) > 1) return true;
+        if (Real3D(snap) > 1) return true;
         var fallback = snap.Plugins.Where(p => p.Fallback).Select(p => p.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
         int real = dp?.Screen(s.Key)?.Candidates?.Select(c => c.PluginId).Where(id => !fallback.Contains(id))
                      .Distinct(StringComparer.OrdinalIgnoreCase).Count() ?? 0;
@@ -398,6 +426,8 @@ public static class StatusText
     public static string WarningLine(StatusWarning w) => w.Text.Length > 0 ? $"{w.Code}: {w.Text}" : w.Code;
 
     public static int Claimed(StatusSnapshot s) => s.Screens.Count(x => x.Claim.IsClaimed);
+    /// <summary>How many displays are real 3D displays (<see cref="IsReal3D"/>).</summary>
+    public static int Real3D(StatusSnapshot s) => s.Screens.Count(x => IsReal3D(s, x));
     public static int Verified(StatusSnapshot s) => s.Screens.Count(x => x.Claim.IsClaimed && x.Claim.Confidence == "VERIFIED");
     public static int Tracking(StatusSnapshot s) => s.Screens.Count(x => x.EyeTracking.State == "TRACKING");
 
