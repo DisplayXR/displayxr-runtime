@@ -163,7 +163,8 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   serving a screen, the selected input provider while its hardware is present, a connected
   workspace controller), **Ready** (loaded or usable but not the one in use: `LOADED`, `BUILT_IN`,
   an input provider with its hardware present, the selected input provider with no device connected
-  — its row line then reads "No device connected" instead of the publisher line; `input list
+  or not known — its row line reads "No device connected" instead of the publisher line only when
+  the device is known to be absent; `input list
   --json` `active` is only "selected", the hardware is `info --json` `input_providers.hardware_present`
   / `active_id`, or a provider's own `hardware_present` when the CLI lists them, a tracking provider whose probe found a source, an available conversion module, an
   installed model pack), **Standby** (registered and allowed but not loaded or not needed:

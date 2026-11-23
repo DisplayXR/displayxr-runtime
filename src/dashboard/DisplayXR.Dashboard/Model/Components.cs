@@ -523,8 +523,9 @@ public static class Components
                 bool active = r.Active || ip is { Active: true };
                 bool? hardware = InputHardware(info, r.Id);
                 var state = PlainStates.InputProvider(active, hardware, r);
-                // Selected, no device: the face says so instead of the publisher line (which moves to Details).
-                bool noDevice = active && hardware != true && state == PlainState.Ready;
+                // Selected, and its device known to be absent: the face says so instead of the publisher line
+                // (which moves to Details). Not known: nothing is claimed either way.
+                bool noDevice = active && hardware == false && state == PlainState.Ready;
                 string? publisher = PublisherLine(r.Vendor, r.Version);
                 var chips = new ChipList();
                 if (ip is not null) chips.Add("Hardware", ip.HardwarePresent ? "hardware present" : "hardware absent", ip.HardwarePresent ? Level.Ok : Level.Plain);

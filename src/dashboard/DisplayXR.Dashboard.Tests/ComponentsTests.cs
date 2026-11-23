@@ -276,9 +276,12 @@ public class ComponentsTests
 
         // The summary is about another provider: this one's hardware is not known, so not In use.
         Assert.Null(Components.InputHardware(Summary(true, "someone-else"), selected.Id));
-        Assert.Equal(PlainState.Ready, Components.InputProviders(Summary(true, "someone-else"), policy).Items.Single(i => i.Name == row.Name).State);
+        var unknown = Components.InputProviders(Summary(true, "someone-else"), policy).Items.Single(i => i.Name == row.Name);
+        Assert.Equal(PlainState.Ready, unknown.State);
+        Assert.NotEqual("No device connected", unknown.Summary); // not known: the face claims nothing
         // Info not read at all: not known either.
         Assert.Null(Components.InputHardware(InfoComponents.Empty, selected.Id));
+        Assert.NotEqual("No device connected", Components.InputProviders(InfoComponents.Empty, policy).Items.Single(i => i.Name == row.Name).Summary);
     }
 
     [Fact]
