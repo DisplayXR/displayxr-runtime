@@ -16,7 +16,9 @@
  * counters every `--interval` ms (default 500, floor 100) and fetches + prints
  * the snapshot only when one moved — one NDJSON line per change with `--json`
  * (what the Dashboard reads), else the §7 table redrawn in place. Without
- * a service it prints the headless snapshot once and keeps trying to connect.
+ * a service it prints the headless snapshot once and keeps trying to connect,
+ * re-reading the global display-driver preference meanwhile (a change reprints
+ * that snapshot with the new `dp_preference`; its claims are not rebuilt).
  * Ends on Ctrl-C or when stdin reaches EOF (a parent that closes the pipe).
  *
  * @author David Fattal
@@ -433,6 +435,25 @@ stdout_can_redraw(void)
 #endif
 }
 
+/*!
+ * Headless `--watch`: re-read the global display-driver preference (a cheap
+ * registry / settings-file / env read, never a new instance) and, when it
+ * moved, reprint the snapshot with it. The claims stay those of the headless
+ * build, exactly as under a service, whose claims a `dp use` also changes only
+ * at the next session. Returns false when stdout is gone.
+ */
+static bool
+status_headless_pref_reprint(struct xrt_status_snapshot *snap, bool json, bool redraw)
+{
+	struct xrt_status_dp_preference pref;
+	target_status_dp_preference_read(&pref);
+	if (memcmp(&pref, &snap->dp_preference, sizeof(pref)) == 0) {
+		return true;
+	}
+	snap->dp_preference = pref;
+	return status_print(snap, json, true, redraw);
+}
+
 static int
 status_watch(uint32_t interval_ms, bool json)
 {
@@ -537,6 +558,9 @@ status_watch(uint32_t interval_ms, bool json)
 				}
 			}
 		}
+		if (!connected && showing_headless && !status_headless_pref_reprint(snap, json, redraw)) {
+			break;
+		}
 		watch_sleep(connected ? interval_ms : 200);
 	}
 	if (connected) {
@@ -548,7 +572,7 @@ status_watch(uint32_t interval_ms, bool json)
 	note_headless(XRT_ERROR_FEATURE_NOT_SUPPORTED);
 	status_build_headless(snap);
 	if (status_print(snap, json, true, redraw)) {
-		while (!g_stop && !stdin_closed()) {
+		while (!g_stop && !stdin_closed() && status_headless_pref_reprint(snap, json, redraw)) {
 			watch_sleep(200);
 		}
 	}
