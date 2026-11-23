@@ -2392,6 +2392,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     bool hasDisplayInfo = false;
     bool hasViewRig = false;
     bool hasWeave = false;
+    bool hasWorkspaceInput = false;
     bool hasLift = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_DXR_LIFT_EXTENSION_NAME) == 0) {
@@ -2417,6 +2418,9 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         }
         if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) {
             hasWeave = true;
+        }
+        if (strcmp(ext.extensionName, XR_DXR_WORKSPACE_CLIENT_INPUT_EXTENSION_NAME) == 0) {
+            hasWorkspaceInput = true;
         }
         if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
             xr.cursorDepthSpecVersion = ext.extensionVersion;
@@ -2489,6 +2493,16 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         LOG_INFO("XR_DXR_view_rig: %s — falling back to raw xrLocateViews fov",
                  hasViewRig ? "needs display_info" : "NOT FOUND");
     }
+
+    // XR_DXR_workspace_client_input: inside the DisplayXR workspace the window
+    // is hidden (start_hidden) and the service owns the pointer and keyboard;
+    // this lets DxrLinuxWindow (armed by attach_session) drain the app's routed
+    // share and deliver it as ordinary window events. A no-op outside a
+    // workspace, so enable it whenever the runtime advertises it.
+    if (hasWorkspaceInput) {
+        enabledExtensions.push_back(XR_DXR_WORKSPACE_CLIENT_INPUT_EXTENSION_NAME);
+    }
+    LOG_INFO("XR_DXR_workspace_client_input: %s", hasWorkspaceInput ? "ENABLED" : "NOT FOUND");
 
     // XR_DXR_weave (#1588): enabled for ONE entry point, xrWeaveSnapWindowRectDXR
     // — the drag-time lattice snap that keeps the woven interlace phase invariant

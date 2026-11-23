@@ -69,7 +69,9 @@ FetchContent_Declare(
     # fullscreen in a workspace session (displayxr-common#80, #2022); includes #78/#81.
     # v2.32.1: macOS — no depth cursor while the app is inactive; AppKit ignores
     #   +[NSCursor hide] there, which gave a double cursor (displayxr-common#83).
-    GIT_TAG v2.32.1
+    # v2.36.0: DxrLinuxWindow drains XR_DXR_workspace_client_input, so the app gets
+    #   mouse + keyboard under the Linux workspace (displayxr-common#93, runtime#2779).
+    GIT_TAG v2.36.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
