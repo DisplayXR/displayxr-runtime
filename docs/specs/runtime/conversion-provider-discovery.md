@@ -608,7 +608,7 @@ Schema 2 replaces the browser's `models.json` schema 1. The browser's store is d
 |---|---|---|
 | Store root (blobs + stamps) | **the runtime** (service / host); the runtime installer creates it | Resolved in order: `HKLM\Software\DisplayXR\Models\Path`, then `HKLM\Software\DisplayXR\Browser\ModelsPath` (so installed blobs are not re-downloaded), then `%ProgramData%\DisplayXR\Models`. The browser installer writes both keys for as long as it ships models. The browser uninstaller must never delete the store once the `Models` key exists (it deletes `blobs\` today); the runtime treats a wiped store as `DOWNLOADING`, never as a latched failure |
 | Layout, write protocol, read check, ACL | unchanged from the browser's model-distribution contract | `blobs/<sha256>`; `<sha256>.<nonce>.part`; `.ok` stamp written **last**; read check = stamp + size; ACL `*S-1-5-32-545:(OI)(CI)(RX)` + `(CI)(WD,AD)` by SID |
-| Load check | **the host** | verifies sha256 on the first load of a blob per process (inside warm-up), and rejects a blob whose stamp owner SID is not the expected writer |
+| Load check | **the host** | verified on entry, size-checked on every load (ADR-057 amendment 2026-11-22): a blob is hashed once, when it enters the store; a load in any process checks stamp + size + a trusted writer and does not hash. A blob another local user wrote is hashed on its first load per process; `DXR_CONV_STORE_FULL_VERIFY=1` and `conv models verify` re-check on demand (§5.4) |
 | Pack manifests | **each provider ships its own** `<pack>.models.json` | registered via `Packs` (registry) / `packs[]` (POSIX manifest) |
 | Download | **the host**, on `model_request` | Range resume; follow redirects; 200-instead-of-206 restarts; verify size then sha256; rename; stamp last. Shows as `DOWNLOADING`. Concurrent requests for one sha256 share one download. Asks before > 100 MB on metered networks; a refused or policy-forbidden download is `ABSENT(policy)` |
 | Pre-fetch | the installer, as a SYSTEM writer | only `prefetch: true` commercial blobs |
@@ -660,11 +660,11 @@ Schema 2 replaces the browser's `models.json` schema 1. The browser's store is d
 ### 5.3 Rules
 
 - **Commercial is an AND, over the runtime too.** `license.commercial` is the AND over the model, every `dependencies[]` entry and the inference runtime the provider loads. Any `false` or missing value makes the capability `RESEARCH_ONLY`, selectable only with `AllowResearchOnly`.
-- **Trust is the hash, not the stamp.** The host re-hashes a blob on first load per process (cached by file id + mtime + size) before handing it to the inference runtime. The stamp + size check alone is not trusted: the store's inherited ACL lets any local user plant a same-size blob and its stamp.
+- **Verified on entry; size-checked on every load; full re-check on demand.** A blob is hashed once, when it enters the store: a download is hashed while it streams, a `local_build` script hashes its bytes before it stamps them, and an unstamped right-size blob is hashed by the first request and then stamped. After that no process hashes it again on load: the check is the stamp, the size, and the blob's owner (this user, or an administrator / SYSTEM on Windows, root on POSIX). The owner check is there because the Windows store root lets every local user create files: a same-size blob + stamp another user planted before the real download is not trusted on size, and is hashed on its first load per process as before. `DXR_CONV_STORE_FULL_VERIFY=1` in the hosting process brings back the hash on first load per process for every blob, and `conv models verify` always hashes (§5.4).
 - **Signing.** A signed installer MUST NOT pre-fetch a non-commercial blob; the open-provider repo's CI asserts it.
 - **Blob identity.** `sha256` + `size` identify a blob; variants may share blobs.
 - **URL.** `<blobBaseUrl>/<sha256>.<format>`, unless the model gives its own `url` (§5.5).
-- **Locally built models (`local_build`).** A model whose bytes may not be redistributed can be produced on the user's box by a deterministic script instead (ADR-057 §5): the model carries `"local_build": { "script": "<repo-relative path>", … }` (other keys informational) and its files list the sha256 + size the script produces, like any blob. The store treats the bytes like any other blob (hash, stamp, the `AllowResearchOnly` gate on fetch and hand-out); only the outcome of a fetch that finds nothing changes: when the blob is not in the store and no source answered (no `url` / `blobBaseUrl`, or a mirror that does not have it), the result is **`build-locally`** (`CONV_STORE_BLOB_LOCAL_BUILD`), not `network`, and `conv models fetch` names the script. A `url` or `blobBaseUrl` that serves the bytes (a dev mirror) is still fetched normally. `model_request` for a missing locally built blob that nothing can serve (its URL is empty, or a `file://` path that does not exist — a pack with no `url` / `blobBaseUrl` resolves to its manifest's directory) **queues no download**: it returns false, logs `build-locally` with the script, and `model_resolve` reads `ABSENT` with `failure_reason = XRT_CONV_FAIL_MODEL` (missing; not `POLICY`, so a provider that names the model says it must be built rather than that a policy forbids it). This wins over `AllowDownloads` = 0; the `AllowResearchOnly` gate still answers first. It is not sticky: once the script has written the blob it reads `INSTALLED`, and the next request verifies it. An http(s) mirror is a source and is fetched as usual.
+- **Locally built models (`local_build`).** A model whose bytes may not be redistributed can be produced on the user's box by a deterministic script instead (ADR-057 §5): the model carries `"local_build": { "script": "<repo-relative path>", … }` (other keys informational) and its files list the sha256 + size the script produces, like any blob. The store treats the bytes like any other blob (hash, stamp, the `AllowResearchOnly` gate on fetch and hand-out); only the outcome of a fetch that finds nothing changes: when the blob is not in the store and no source answered (no `url` / `blobBaseUrl`, or a mirror that does not have it), the result is **`build-locally`** (`CONV_STORE_BLOB_LOCAL_BUILD`), not `network`, and `conv models fetch` names the script. A `url` or `blobBaseUrl` that serves the bytes (a dev mirror) is still fetched normally. `model_request` for a missing locally built blob that nothing can serve (its URL is empty, or a `file://` path that does not exist — a pack with no `url` / `blobBaseUrl` resolves to its manifest's directory) **queues no download**: it returns false, logs `build-locally` with the script, and `model_resolve` reads `ABSENT` with `failure_reason = XRT_CONV_FAIL_MODEL` (missing; not `POLICY`, so a provider that names the model says it must be built rather than that a policy forbids it). This wins over `AllowDownloads` = 0; the `AllowResearchOnly` gate still answers first. It is not sticky: once the script has written and stamped the blob (it hashes the bytes first, which is the entry check) it reads `READY`; a blob written without a stamp is hashed and stamped by the next request. An http(s) mirror is a source and is fetched as usual.
 - **Validation.** `scripts/check_model_pack.py` (open-provider repo) checks the schema and the licence AND; `--verify-store` checks a store against its packs.
 
 ### 5.4 The store as built (P4, #2108)
@@ -702,15 +702,15 @@ new nonce, and the metered-network ask is not implemented on any platform. The h
 context, so a host's store serves the union of the packs it was configured with: the service
 every registered provider's, a satellite its own provider's.
 
-**`model_resolve(ref)`** never hashes and never touches the network (a stat of the blob and its
-stamp). `ref` is `<pack>/<model>[/<variant>]` (first variant when omitted) or a bare sha256.
+**`model_resolve(ref)`** never hashes and never touches the network (a stat of the blob, its owner
+and its stamp). `ref` is `<pack>/<model>[/<variant>]` (first variant when omitted) or a bare sha256.
 `xrt_conv_model_location::state`:
 
 | state | meaning | provider does |
 |---|---|---|
-| `READY` | every file present, stamped, and hashed **by this process** (cache key: file id + mtime + size); `path` = the variant's `model` file | load `path` |
-| `INSTALLED` | on disk and stamped, not yet verified by this process | `model_request` (warm-up verifies it) |
-| `WARMING` | the store's worker is hashing it (once per process; `progress` n/a, so a multi-GB blob reads `WARMING` for tens of seconds) | wait; it is progress, not a refusal |
+| `READY` | every file present at its size and stamped by a trusted writer (it was hashed when it entered the store), or hashed by this process; `path` = the variant's `model` file | load `path` |
+| `INSTALLED` | on disk and stamped, but this process must hash it before handing it out: another local user wrote it, or `DXR_CONV_STORE_FULL_VERIFY=1` | `model_request` (warm-up verifies it) |
+| `WARMING` | the store's worker is hashing it (only in the `INSTALLED` cases above, or an unstamped blob entering the store; `progress` n/a, so a multi-GB blob reads `WARMING` for tens of seconds) | wait; it is progress, not a refusal |
 | `DOWNLOADING` | in flight; `progress` = bytes / total over the model's files | report `DOWNLOADING` with that progress |
 | `ABSENT` | not in the store; `failure_reason = XRT_CONV_FAIL_POLICY` when a request was refused by policy, `XRT_CONV_FAIL_MODEL` when it is a locally built model nothing can fetch (`build-locally`, §5.3) | report `ABSENT` with that reason (the core shows `ABSENT(policy)`) |
 | `FAILED` | `NETWORK` (retryable: a new request retries) or `MODEL` (bytes failed size / hash) | report `FAILED(reason)` |
@@ -726,11 +726,21 @@ false is fetched **and handed out** only with `AllowResearchOnly`; withdrawing t
 present blob `ABSENT(POLICY)` again. `conv models fetch --installer` never fetches one, whatever
 the opt-in says.
 
-**Tamper rejection.** A stamped blob of the right size passes the browser's read check; the store
-does not trust it. The first `model_request` per process re-hashes it; a mismatch deletes the blob
-and its stamp and fetches it again (`FAILED(MODEL)` when downloads are off). A blob replaced after
-this process verified it changes its cache key and drops back to `INSTALLED`. Downloaded bytes are
-hashed while they stream; a part that fails size or hash is deleted and never renamed.
+**Tamper rejection (verified on entry; size-checked on every load; full re-check on demand).**
+Downloaded bytes are hashed while they stream; a part that fails size or hash is deleted and never
+renamed. An unstamped blob is hashed before it is stamped; a mismatch deletes it. Once stamped, a
+blob of the right size from a trusted writer is handed out with no hash, in every process (a
+2.5 GB model used to cost about 19 s of hashing per process). A blob whose size no longer matches
+reads `ABSENT` at once, is never handed out, and the next request deletes it unhashed and fetches
+it again. A blob another local user wrote, and every blob under `DXR_CONV_STORE_FULL_VERIFY=1`, is
+hashed on its first `model_request` per process; a mismatch deletes the blob and its stamp and
+fetches it again (`FAILED(MODEL)` when downloads are off). `conv models verify` always hashes.
+**Threat model.** The load check catches a partial write, a truncation or append, and anything
+that changes the size. It does not catch a same-size in-place edit or bit rot after entry: that is
+what the on-demand full check is for. A same-user attacker who can rewrite a blob can also rewrite
+its stamp and the pack manifest it is checked against, so a per-process hash never protected
+against them; that stays out of scope, as before. A different local user planting a blob is still
+caught (owner check, above).
 
 **ACL (Windows).** A root the store (or `conv models init`) creates gets a protected DACL:
 SYSTEM and Administrators full; `BUILTIN\Users` `(OI)(CI)` read + execute and `(CI)` create
@@ -750,7 +760,8 @@ moved 5 % (or reached 100 %), so `status --watch` and the dashboard stay quiet d
 snapshot it prints, read from disk (no IPC): `display-dashboard.md` §3.3.
 
 **CLI.** `conv models list [--json]` (per pack and model: on disk, stamped, in flight),
-`verify` (re-hash every referenced blob; a tampered one is deleted; exit 1 when any is),
+`verify` (re-hash every referenced blob, whatever the load rule says; a tampered one is deleted;
+exit 1 when any is),
 `prune` (delete blobs no registered pack references), `fetch <pack-url|path> [--prefetch]
 [--model <name>] [--installer]` (the write protocol on the calling thread; `--installer` =
 nonce `installer`, stamped blobs skipped without hashing, non-commercial models never),

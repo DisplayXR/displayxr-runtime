@@ -10,8 +10,13 @@
  *  - the write protocol with a fake pack served from a file:// URL: the
  *    blob lands under blobs/<sha256> with its stamp, no .part is left, the
  *    pack is recorded and DOWNLOADING is observable with progress;
- *  - a tampered same-size blob (a planted blob + stamp) is rejected, deleted
- *    and fetched again; bytes that fail the hash never become a blob;
+ *  - verified once, on entry (ADR-057 amendment 2026-11-22): a blob is hashed
+ *    when it enters the store (download, or an unstamped blob a local build
+ *    wrote) and only size-checked on later loads, in any process; a resized
+ *    blob is refused; DXR_CONV_STORE_FULL_VERIFY=1 / full_verify brings back
+ *    the per-process hash, under which a tampered same-size blob (a planted
+ *    blob + stamp) is rejected, deleted and fetched again; bytes that fail the
+ *    hash never become a blob;
  *  - policy: downloads off => ABSENT(policy); research-only models are gated
  *    by AllowResearchOnly;
  *  - a locally built model (ADR-057 §5) with nothing to fetch it from is
@@ -177,7 +182,8 @@ struct store_handle
 	                      bool downloads = true,
 	                      bool research = false,
 	                      uint32_t throttle_ms = 0,
-	                      uint32_t chunk = 0)
+	                      uint32_t chunk = 0,
+	                      bool full_verify = false)
 	{
 		conv_model_store_config cfg;
 		conv_model_store_config_defaults(&cfg);
@@ -186,6 +192,7 @@ struct store_handle
 		cfg.allow_research_only = research;
 		cfg.throttle_ms = throttle_ms;
 		cfg.chunk_bytes = chunk;
+		cfg.full_verify = full_verify;
 		REQUIRE(conv_model_store_create(&cfg, &s));
 	}
 	~store_handle()
@@ -379,50 +386,118 @@ TEST_CASE("conv_store: a relative blobBaseUrl resolves under the manifest")
 	CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_READY);
 }
 
-TEST_CASE("conv_store: tamper rejection")
+TEST_CASE("conv_store: verified on entry, size-checked on load")
 {
 	fake_pack fp;
 	temp_dir root;
 	const fs::path store_root = root.path / "Models";
 	const fs::path blob = store_root / "blobs" / fp.sha;
+	const fs::path stamp = store_root / "blobs" / (fp.sha + ".ok");
 	{
 		store_handle h(store_root);
 		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
 		REQUIRE(conv_model_store_request(h.s, "sim/fake"));
 		REQUIRE(conv_model_store_wait_idle(h.s, 5000));
 		REQUIRE(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_READY);
+		CHECK(conv_model_store_hash_count(h.s) == 0); // a download hashes while it streams
+		REQUIRE(fs::exists(stamp));
+	}
 
-		SECTION("a blob replaced after this process verified it is not READY any more")
+	SECTION("a fresh process loads a stamped blob with no hash")
+	{
+		store_handle h(store_root);
+		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+		auto loc = resolve(h.s, "sim/fake");
+		CHECK(loc.state == XRT_CONV_STATE_READY);
+		CHECK(std::string(loc.path) == blob.u8string());
+		REQUIRE(conv_model_store_request(h.s, "sim/fake")); // a no-op: READY
+		REQUIRE(conv_model_store_wait_idle(h.s, 5000));
+		conv_pack p{};
+		REQUIRE(conv_model_store_get_pack(h.s, 0, &p));
+		CHECK(conv_model_store_fetch_model(h.s, &p, &p.models[0], nullptr, false) == CONV_STORE_BLOB_OK);
+		CHECK(conv_model_store_hash_count(h.s) == 0);
+	}
+
+	SECTION("an unstamped blob (a local build wrote it) is hashed once on entry, then stamped")
+	{
+		fs::remove(stamp);
 		{
-			std::this_thread::sleep_for(std::chrono::milliseconds(20)); // a distinct mtime
-			write_file(blob, blob_bytes('X'));
-			CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_INSTALLED);
+			store_handle h(store_root);
+			REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+			CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_ABSENT);
 			REQUIRE(conv_model_store_request(h.s, "sim/fake"));
 			REQUIRE(conv_model_store_wait_idle(h.s, 5000));
 			CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_READY);
-			CHECK(read_file(blob) == blob_bytes());
+			CHECK(conv_model_store_hash_count(h.s) == 1);
+			CHECK(fs::exists(stamp));
 		}
+		store_handle h2(store_root);
+		REQUIRE(conv_model_store_add_pack_file(h2.s, fp.manifest.u8string().c_str()));
+		CHECK(resolve(h2.s, "sim/fake").state == XRT_CONV_STATE_READY);
+		CHECK(conv_model_store_hash_count(h2.s) == 0);
 	}
 
-	SECTION("a planted same-size blob + stamp is rejected by a fresh process, deleted, and re-fetched")
+	SECTION("an unstamped blob with the wrong bytes is refused on entry")
 	{
-		write_file(blob, blob_bytes('X')); // stamp from the honest run stays
-		REQUIRE(fs::exists(store_root / "blobs" / (fp.sha + ".ok")));
+		fs::remove(stamp);
+		write_file(blob, blob_bytes('X'));
+		store_handle h(store_root, false); // downloads off: no re-fetch hides the refusal
+		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_ABSENT);
+		conv_pack p{};
+		REQUIRE(conv_model_store_get_pack(h.s, 0, &p));
+		CHECK(conv_model_store_fetch_model(h.s, &p, &p.models[0], nullptr, false) == CONV_STORE_BLOB_TAMPERED);
+		CHECK(conv_model_store_hash_count(h.s) == 1);
+		CHECK_FALSE(fs::exists(blob));
+		CHECK_FALSE(fs::exists(stamp));
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_ABSENT);
+	}
+
+	SECTION("a truncated / resized blob is refused on load, not handed out")
+	{
+		write_file(blob, blob_bytes().substr(0, 1000));
+		store_handle h(store_root, false);
+		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_ABSENT); // stamp + wrong size: not handed out
+		conv_pack p{};
+		REQUIRE(conv_model_store_get_pack(h.s, 0, &p));
+		CHECK(conv_model_store_fetch_model(h.s, &p, &p.models[0], nullptr, false) == CONV_STORE_BLOB_TAMPERED);
+		CHECK_FALSE(fs::exists(blob)); // the wrong-length blob and its stamp are deleted, unhashed
+		CHECK_FALSE(fs::exists(stamp));
+		CHECK(conv_model_store_hash_count(h.s) == 0);
+	}
+
+	SECTION("a blob resized after this process loaded it drops out of READY")
+	{
 		store_handle h(store_root);
 		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
-		// Stamp + size pass the browser's read check: not trusted, so not READY.
-		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_INSTALLED);
-		REQUIRE(conv_model_store_request(h.s, "sim/fake"));
+		REQUIRE(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_READY);
+		write_file(blob, blob_bytes() + "tail");
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_ABSENT);
+		REQUIRE(conv_model_store_request(h.s, "sim/fake")); // rejected and fetched again
 		REQUIRE(conv_model_store_wait_idle(h.s, 5000));
-		auto loc = resolve(h.s, "sim/fake");
-		CHECK(loc.state == XRT_CONV_STATE_READY);
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_READY);
 		CHECK(read_file(blob) == blob_bytes());
 	}
 
-	SECTION("with downloads off a tampered blob is deleted and the model FAILED(MODEL)")
+	SECTION("full verify: a planted same-size blob + stamp is rejected by a fresh process, deleted, re-fetched")
+	{
+		write_file(blob, blob_bytes('X')); // stamp from the honest run stays
+		REQUIRE(fs::exists(stamp));
+		store_handle h(store_root, true, false, 0, 0, /*full_verify=*/true);
+		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_INSTALLED); // must hash first
+		REQUIRE(conv_model_store_request(h.s, "sim/fake"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 5000));
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_READY);
+		CHECK(read_file(blob) == blob_bytes());
+		CHECK(conv_model_store_hash_count(h.s) == 1);
+	}
+
+	SECTION("full verify with downloads off: a tampered blob is deleted and the model FAILED(MODEL)")
 	{
 		write_file(blob, blob_bytes('X'));
-		store_handle h(store_root, false);
+		store_handle h(store_root, false, false, 0, 0, true);
 		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
 		REQUIRE(conv_model_store_request(h.s, "sim/fake")); // present on disk: a verify, not a download
 		REQUIRE(conv_model_store_wait_idle(h.s, 5000));
@@ -430,13 +505,49 @@ TEST_CASE("conv_store: tamper rejection")
 		CHECK(loc.state == XRT_CONV_STATE_FAILED);
 		CHECK(loc.failure_reason == XRT_CONV_FAIL_MODEL);
 		CHECK_FALSE(fs::exists(blob));
-		CHECK_FALSE(fs::exists(store_root / "blobs" / (fp.sha + ".ok")));
+		CHECK_FALSE(fs::exists(stamp));
 	}
 
-	SECTION("conv models verify: the synchronous check deletes a tampered blob")
+	SECTION("full verify: an honest blob is hashed once per process, then READY")
 	{
-		write_file(blob, blob_bytes('X'));
+		store_handle h(store_root, true, false, 0, 0, true);
+		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_INSTALLED);
+		REQUIRE(conv_model_store_request(h.s, "sim/fake"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 5000));
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_READY);
+		REQUIRE(conv_model_store_request(h.s, "sim/fake"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 5000));
+		CHECK(conv_model_store_hash_count(h.s) == 1);
+	}
+
+	SECTION("DXR_CONV_STORE_FULL_VERIFY=1 in the environment forces the hash on load")
+	{
+#ifdef XRT_OS_WINDOWS
+		_putenv_s("DXR_CONV_STORE_FULL_VERIFY", "1");
+#else
+		setenv("DXR_CONV_STORE_FULL_VERIFY", "1", 1);
+#endif
 		store_handle h(store_root);
+#ifdef XRT_OS_WINDOWS
+		_putenv_s("DXR_CONV_STORE_FULL_VERIFY", "");
+#else
+		unsetenv("DXR_CONV_STORE_FULL_VERIFY");
+#endif
+		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_INSTALLED);
+		REQUIRE(conv_model_store_request(h.s, "sim/fake"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 5000));
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_READY);
+		CHECK(conv_model_store_hash_count(h.s) == 1);
+	}
+
+	SECTION("conv models verify: always a full hash; deletes a tampered blob")
+	{
+		store_handle h(store_root);
+		CHECK(conv_model_store_verify_blob(h.s, fp.sha.c_str(), 1024) == CONV_STORE_BLOB_OK);
+		CHECK(conv_model_store_hash_count(h.s) == 1);
+		write_file(blob, blob_bytes('X'));
 		CHECK(conv_model_store_verify_blob(h.s, fp.sha.c_str(), 1024) == CONV_STORE_BLOB_TAMPERED);
 		CHECK_FALSE(fs::exists(blob));
 		CHECK(conv_model_store_verify_blob(h.s, fp.sha.c_str(), 1024) == CONV_STORE_BLOB_MISSING);
@@ -631,17 +742,16 @@ TEST_CASE("conv_store: a locally built model (local_build) is never a network fa
 		// Asked again: the same answer, still no download.
 		CHECK_FALSE(conv_model_store_request(h.s, "local/built"));
 		CHECK(resolve(h.s, "local/built").state == XRT_CONV_STATE_ABSENT);
-		// The script writes the blob into the store: the next request verifies it.
+		// The script hashes its bytes, writes the blob and stamps it (the entry
+		// check): READY on the next resolve, no hash here.
 		const fs::path blobs = store_root / "blobs";
 		fs::create_directories(blobs);
 		write_file(blobs / sha, bytes);
 		write_file(blobs / (sha + ".ok"), sha + " 1024\n");
-		CHECK(resolve(h.s, "local/built").state == XRT_CONV_STATE_INSTALLED);
-		REQUIRE(conv_model_store_request(h.s, "local/built"));
-		REQUIRE(conv_model_store_wait_idle(h.s, 5000));
 		loc = resolve(h.s, "local/built");
 		CHECK(loc.state == XRT_CONV_STATE_READY);
 		CHECK(fs::path(loc.path) == blobs / sha);
+		CHECK(conv_model_store_hash_count(h.s) == 0);
 	}
 	SECTION("model_request, downloads off: build-locally still wins over ABSENT(policy)")
 	{

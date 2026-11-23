@@ -1173,20 +1173,15 @@ TEST_CASE("conv run: the headless host answers get_path and the model store like
 		CHECK(loc.failure_reason == XRT_CONV_FAIL_POLICY);
 		target_conv_store_headless_release();
 	}
-	SECTION("with the opt-in, the present blob is handed out (INSTALLED, then READY once verified)")
+	SECTION("with the opt-in, the present stamped blob is handed out (READY: verified on entry, no hash here)")
 	{
 		pol.allow_research_only = true;
 		const xrt_conversion_plugin_host_iface *host = target_conv_store_headless_host(e.get(), &pol);
 		xrt_conv_model_location loc{};
 		loc.struct_size = sizeof(loc);
 		REQUIRE(host->model_resolve("local/m", &loc));
-		CHECK(loc.state == XRT_CONV_STATE_INSTALLED);
-		REQUIRE(host->model_request("local/m"));
-		for (int i = 0; i < 200 && loc.state != XRT_CONV_STATE_READY; i++) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-			(void)host->model_resolve("local/m", &loc);
-		}
 		CHECK(loc.state == XRT_CONV_STATE_READY);
+		REQUIRE(host->model_request("local/m")); // READY: nothing to queue
 		CHECK(std::string(loc.path).find(hex) != std::string::npos);
 		target_conv_store_headless_release();
 	}
