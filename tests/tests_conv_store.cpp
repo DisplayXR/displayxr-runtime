@@ -14,6 +14,9 @@
  *    and fetched again; bytes that fail the hash never become a blob;
  *  - policy: downloads off => ABSENT(policy); research-only models are gated
  *    by AllowResearchOnly;
+ *  - a locally built model (ADR-057 §5) with nothing to fetch it from is
+ *    build-locally, never a network failure: fetch says so, and model_request
+ *    queues no download (ABSENT, failure_reason MODEL) until its script writes it;
  *  - prune deletes only unreferenced blobs; pack summaries;
  *  - Windows: a root the store creates is readable by BUILTIN\Users and by
  *    AppContainer processes, writable (create files) by the logged-in user,
@@ -613,6 +616,50 @@ TEST_CASE("conv_store: a locally built model (local_build) is never a network fa
 		write_file(mirror / (sha + ".onnx"), bytes);
 		store_handle h(dir.path / "Models", true, true);
 		CHECK(conv_model_store_fetch_model(h.s, &p, &p.models[0], nullptr, false) == CONV_STORE_BLOB_OK);
+	}
+	SECTION("model_request, nothing built and no mirror: never queues a download; ABSENT, build-locally")
+	{
+		const fs::path store_root = dir.path / "Models";
+		store_handle h(store_root, true, true);
+		REQUIRE(conv_model_store_add_pack(h.s, &p));
+		CHECK_FALSE(conv_model_store_request(h.s, "local/built"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 5000));
+		auto loc = resolve(h.s, "local/built");
+		CHECK(loc.state == XRT_CONV_STATE_ABSENT);
+		CHECK(loc.failure_reason == XRT_CONV_FAIL_MODEL); // missing; not POLICY, not a FAILED(NETWORK)
+		CHECK_FALSE(fs::exists(store_root / "blobs"));
+		// Asked again: the same answer, still no download.
+		CHECK_FALSE(conv_model_store_request(h.s, "local/built"));
+		CHECK(resolve(h.s, "local/built").state == XRT_CONV_STATE_ABSENT);
+		// The script writes the blob into the store: the next request verifies it.
+		const fs::path blobs = store_root / "blobs";
+		fs::create_directories(blobs);
+		write_file(blobs / sha, bytes);
+		write_file(blobs / (sha + ".ok"), sha + " 1024\n");
+		CHECK(resolve(h.s, "local/built").state == XRT_CONV_STATE_INSTALLED);
+		REQUIRE(conv_model_store_request(h.s, "local/built"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 5000));
+		loc = resolve(h.s, "local/built");
+		CHECK(loc.state == XRT_CONV_STATE_READY);
+		CHECK(fs::path(loc.path) == blobs / sha);
+	}
+	SECTION("model_request, downloads off: build-locally still wins over ABSENT(policy)")
+	{
+		store_handle h(dir.path / "Models", false, true);
+		REQUIRE(conv_model_store_add_pack(h.s, &p));
+		CHECK_FALSE(conv_model_store_request(h.s, "local/built"));
+		const auto loc = resolve(h.s, "local/built");
+		CHECK(loc.state == XRT_CONV_STATE_ABSENT);
+		CHECK(loc.failure_reason == XRT_CONV_FAIL_MODEL);
+	}
+	SECTION("model_request, a mirror answers: queued and fetched like any blob")
+	{
+		write_file(mirror / (sha + ".onnx"), bytes);
+		store_handle h(dir.path / "Models", true, true);
+		REQUIRE(conv_model_store_add_pack(h.s, &p));
+		REQUIRE(conv_model_store_request(h.s, "local/built"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 5000));
+		CHECK(resolve(h.s, "local/built").state == XRT_CONV_STATE_READY);
 	}
 }
 
