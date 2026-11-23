@@ -12,7 +12,7 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 |---|---|---|
 | Home | the status feed; `info --json` once per show and on Refresh; `dp list --json` (each screen's effective DP, read-only); `selftest --json` on click | `runtime activate`, `dp reset` (only when a machine-wide override is set) |
 | Displays | the status feed (screens, desktop map); `dp list --json` for the per-screen selector (its options: that screen's `candidates`) | `dp use <id> --screen <key>`, `dp reset --screen <key>`; the camera calibration verbs (below) |
-| Components | the status feed (clients by class; per screen `eye_tracking.viewer_source` / `viewer_reason` / `viewer_policy` for the tracking card); `info --json` (incl. `tracking_providers`: probe results, the primary screen's arbitration); `workspace list --json`; `dp\|input\|conv\|tracking list --json` (ADR-054 N3e: `enabled`, `enabled_source`, `preferred`, `provenance`, conv `built_in`, tracking `first`, `policy.policy_lock`; ADR-054 N5: each row's `licence` object, shown in the row's Details as a *Licence* line — `unlicensed`, `licence expired`, `trial until <date>`, `licensed`, or `included with your display` when the entitlement comes with the hardware; nothing for a component with no licence to report. The Dashboard only shows it: the component decides it) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace reset <id>` (back to the runtime default, Ctrl+Shift+Space / auto), `workspace launch <id>`; `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `input use <id> --app <exe>` / `input reset --app <exe>` (the Input card's **Per app** table, ADR-034 Am.5: each pinned or running app's pin per role family and its live holder from `input list --json` `per_app` + `holders`; per user only — no machine-wide per-app pin exists — and disabled under `Policy\Lock`), `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise every control's `--machine` command — Enabled, "Use this one", "Choose automatically" — is shown for an administrator, in the row's Details). No Enabled or "Use this one" on the built-in `dp-lift` row; under `Policy\Lock` the class shows "Managed by your administrator" (the technical `Policy\Lock` line is in each row's Details) and its per-user controls are disabled (for tracking, the per-user "Use this one" / "Choose automatically" too). **Viewer tracking** (tracking providers, ADR-054 N6): `tracking enable\|disable <id>`, `tracking use <id>` / `tracking reset` (then re-reads `tracking list --json` and `info --json`); per screen the viewer source and why (provider; standby: the display tracks; no source; source paused; FIXED / OWN) beside the display's viewer policy, with a link to Displays on provider-served screens, where the display's card has **Calibrate camera…**, which opens the calibration window (below): `tracking calibrate --screen <key> --watch --json` (long-lived), `tracking calibrate solve --in <tmp> --mode b --eye mid --reject-mm 5 --json`, `tracking calibrate apply --screen <key> --camera <key> --pose <setting> --provider <id> --rms-mm <rms> --samples <n> --mode b [--depth-scale <iris>] --json` (writes the runtime-owned camera calibration store, shared by every provider; `--provider` is accepted and ignored; then re-reads `tracking list --json` and `info --json`) |
+| Components | the status feed (clients by class; per screen `eye_tracking.viewer_source` / `viewer_reason` / `viewer_policy` for the tracking card); `info --json` (incl. `tracking_providers`: probe results, the primary screen's arbitration); `workspace list --json`; `dp options <id> --json` (a display driver's Options, below); `dp\|input\|conv\|tracking list --json` (ADR-054 N3e: `enabled`, `enabled_source`, `preferred`, `provenance`, conv `built_in`, tracking `first`, `policy.policy_lock`; ADR-054 N5: each row's `licence` object, shown in the row's Details as a *Licence* line — `unlicensed`, `licence expired`, `trial until <date>`, `licensed`, or `included with your display` when the entitlement comes with the hardware; nothing for a component with no licence to report. The Dashboard only shows it: the component decides it) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace reset <id>` (back to the runtime default, Ctrl+Shift+Space / auto), `workspace launch <id>`; `dp set <id> <KEY> <value>` / `dp unset <id> <KEY>` (Options); `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `input use <id> --app <exe>` / `input reset --app <exe>` (the Input card's **Per app** table, ADR-034 Am.5: each pinned or running app's pin per role family and its live holder from `input list --json` `per_app` + `holders`; per user only — no machine-wide per-app pin exists — and disabled under `Policy\Lock`), `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise every control's `--machine` command — Enabled, "Use this one", "Choose automatically" — is shown for an administrator, in the row's Details). No Enabled or "Use this one" on the built-in `dp-lift` row; under `Policy\Lock` the class shows "Managed by your administrator" (the technical `Policy\Lock` line is in each row's Details) and its per-user controls are disabled (for tracking, the per-user "Use this one" / "Choose automatically" too). **Viewer tracking** (tracking providers, ADR-054 N6): `tracking enable\|disable <id>`, `tracking use <id>` / `tracking reset` (then re-reads `tracking list --json` and `info --json`); per screen the viewer source and why (provider; standby: the display tracks; no source; source paused; FIXED / OWN) beside the display's viewer policy, with a link to Displays on provider-served screens, where the display's card has **Calibrate camera…**, which opens the calibration window (below): `tracking calibrate --screen <key> --watch --json` (long-lived), `tracking calibrate solve --in <tmp> --mode b --eye mid --reject-mm 5 --json`, `tracking calibrate apply --screen <key> --camera <key> --pose <setting> --provider <id> --rms-mm <rms> --samples <n> --mode b [--depth-scale <iris>] --json` (writes the runtime-owned camera calibration store, shared by every provider; `--provider` is accepted and ignored; then re-reads `tracking list --json` and `info --json`) |
 | Components (catalog side) | the install engine's `dxr-get list --json --no-runtime` (one call: state, versions, detection, sizes, compatibility, prerequisites), `dxr-get list --installed --json` when offline; `dp\|input\|conv\|tracking list --json` for an installed item's `licence` object | `dxr-get install <id> --yes --json --no-runtime`, `dxr-get uninstall <id> --json` (elevated for that one run, see below); `displayxr-cli <class> activate <id> @<key file> --json`; `displayxr-cli <class> activate-begin <id> --json` (Buy) |
 | Settings (`settings`; `performance` opens it) | `perf list --json`, `info --json` (adapters), `workspace list --json` | `perf set` / `perf reset`; the spatial desktop's `workspace set` / `reset` / `launch` (as on Components) |
 | Troubleshooting > Running 3D apps (`windows` opens it) | the status feed (clients; present owners and status readers by role) | — |
@@ -35,7 +35,18 @@ behind a Details toggle.
   headline never says 3D is on. Headlines: *3D is working on N display(s)*; *Your 3D display is
   ready* / *3D turns on when a 3D app runs.* (idle); *3D is off: N thing(s) need fixing*; *Your 3D
   display is recognised* (background service not reached); *No 3D display found*; *No display
-  found*. "Needs attention" is built only from what is already read: every warn / critical warning
+  found*. A display claimed only by the simulated display driver (the snapshot's `plugins[].fallback`
+  driver, which claims every display at `FALLBACK` so apps run anywhere) is an ordinary display, not
+  a recognised 3D display, unless that driver was chosen for it (`claim.forced`, or a per-display
+  `claim.preferred_plugin` naming it, from any source) or holds it only
+  because a vendor driver is unhealthy (a CLAIM_FALLBACK / PLUGIN_NOT_READY warning, or a registered
+  non-fallback driver that failed to load or whose platform is not ready: then it is a 3D display that
+  needs attention, as before). When the simulated driver is the only display driver registered at all
+  and no display fell back, *No 3D display found* reads "DisplayXR apps show in normal
+  2D on this PC. Nothing is wrong." (an info level, not a warning) with a **Try a 3D preview** link to
+  that driver's Details on Components, where its Options are (`Verdicts.OnlySimulated`). The rule
+  "is this display a real 3D display" is one pure function, `StatusText.IsReal3D`, shared by Home and
+  Displays. "Needs attention" is built only from what is already read: every warn / critical warning
   of the snapshot (the runtime's codes in plain words, a display maker's own warning quoted), the
   background service not reached, a failed "Check my setup", and another program set as the active
   OpenXR runtime. Its only buttons are ones the Dashboard already had (Open Displays, Open
@@ -48,7 +59,12 @@ behind a Details toggle.
   technical lines "Copy list" writes. The selector stays on the face when more than one driver could
   drive the display or more than one 3D display is present (`StatusText.DriverChoiceOnFace`). The
   desktop map and its legend show only with more than one display. The caption never prints a zero
-  ("One display, recognised as 3D · whether it sees you is not known yet").
+  ("One display, recognised as 3D · whether it sees you is not known yet"). A display claimed only by
+  the simulated display driver (`StatusText.IsReal3D` false, as on Home) has the badge *Ordinary 2D
+  display*, the state line "The simulated display driver gives it a 3D preview." (while no app draws on
+  it), a plain dot, a Details line "Not recognised as a 3D display · display driver: <name>, which
+  gives it a 3D preview", and is not counted as "recognised as 3D"; its driver selector and the
+  technical lines (FALLBACK) are unchanged.
 - **Components**: what you have and what you can add (below). Running programs are not on it.
 - **Settings** (was Performance): *Graphics card for 3D apps* (hidden on a PC with one graphics
   card), *Spatial desktop* (the shortcut, mode and "Open now": the same `Ui/WorkspaceLaunchEditor`
@@ -145,9 +161,13 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   (`ComponentItem.LineFacts`), and so is how a row that cannot be removed from here is removed. The state
   word maps the component's technical state (`Model/Components.cs` `PlainStates`): **In use** (an
   `ACTIVE` display processor, a conversion provider selected for a task, a tracking provider
-  serving a screen, an active input provider, a connected workspace controller), **Ready** (loaded
-  or usable but not the one in use: `LOADED`, `BUILT_IN`, an input provider with its hardware
-  present, a tracking provider whose probe found a source, an available conversion module, an
+  serving a screen, the selected input provider while its hardware is present, a connected
+  workspace controller), **Ready** (loaded or usable but not the one in use: `LOADED`, `BUILT_IN`,
+  an input provider with its hardware present, the selected input provider with no device connected
+  or not known — its row line reads "No device connected" instead of the publisher line only when
+  the device is known to be absent; `input list
+  --json` `active` is only "selected", the hardware is `info --json` `input_providers.hardware_present`
+  / `active_id`, or a provider's own `hardware_present` when the CLI lists them, a tracking provider whose probe found a source, an available conversion module, an
   installed model pack), **Standby** (registered and allowed but not loaded or not needed:
   `NOT_ATTEMPTED`, `DECLINED`, superseded, a controller not running), **Turned off** (its Enabled
   value, or the loader's `DISABLED`), **Needs attention** (refused by the provenance gate: "Blocked:
@@ -267,6 +287,76 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   filters, the stale and receipts-only lists, the `catalog` route) and `CatalogTests` (both list shapes, grouping and filters, every exit code, the unelevated
   then elevated order, the licence block, the key never in a `ProcessStartInfo`, the key file's
   permissions and removal, the URL rule, every `activate-begin` result and the runtime without the verb).
+
+## Components: a display driver's Options
+
+ADR-065: a display driver serves two rendering modes at run time, 2D and 3D; which kind of 3D, and
+everything else, is a per-driver **setting** that the driver declares and the runtime stores. A
+display driver's Details on Components open with an **Options** block (then the technical labelled
+lines, the scope and command-line notes, the catalog detail and the removal sentence; `Model/DriverOptions.cs`,
+`ComponentsPage.OptionsBlockView`).
+
+- **Read** `displayxr-cli dp options <id> --json` when the driver's Details are first opened (also
+  when Home's "Try a 3D preview" or an install opens them), again after every write, and on Refresh;
+  never polled. Fields used: `env_prefix`, and per entry of `settings[]`: `key`, `declared`, `type`
+  (`bool` / `int` / `float` / `enum` / `string` / `secret`), `default`, `help`, `secret`, `value`,
+  `set` (secrets), `source` (`environment` / `user` / `machine` / `manifest` / `absent`). An entry
+  that is not declared (`type: null`, a value stored for a key the driver no longer declares) or of a
+  type the Dashboard does not know is left out. Only a successful read with nothing to show is "no
+  options" ("This display driver has no options to set here."). A failing run (a timeout, an older CLI
+  without the verb, a driver that went away) or a document of another shape keeps what an earlier read
+  showed and adds one line, "Couldn't read its options.", with **Try again** (accessible name `Try
+  again reading options: <driver>`); no banner. The reply to a write stays visible even when its row
+  is not drawn.
+- **Write** `dp set <id> <KEY> <value>` (per user) and `dp unset <id> <KEY>` ("Use the default"),
+  through the same action path as the other controls (`DashboardContext.RunOptionWriteAsync`); the
+  CLI's reply, with its `note:` / `warning:` lines, shows on the row it was for. The Dashboard saves
+  nothing itself, and never writes `--machine`.
+- **Each row**: the label, a control by type, "Now: <value> · <where it comes from>", the help, and
+  "Use the default" when this user has a value stored (`source: user`; clearing changes nothing for a
+  value set for everyone on this PC). Where it comes from, in words: *Default* (`absent`), *Your
+  choice* (`user`), *Set for everyone on this PC* (`machine`, `manifest`), *Set outside the Dashboard*
+  (`environment`: read-only, with "Set outside the Dashboard, and that value wins: a change here would
+  not apply."). The key, type, default, the driver's own help and the environment variable's name are
+  the label's tooltip, never the face.
+- **Controls**: an enum with known values is a drop-down; a bool a switch (on writes `1`, off `0`); an
+  int, a float, a string, and an enum whose values the CLI does not list, a text box with **Apply**
+  (Enter applies, and Apply acts on the press so a rebuild cannot swallow the click; a submitted edit
+  ends the edit at once, `Model/OptionEdits.cs`, so the new value and the reply show without waiting
+  for the focus to leave; a whole number for an int, a number with a dot for decimals for a float (a comma, as in "1,000", is refused, never rewritten), a string kept exactly as typed but not only spaces, one line, no NUL, never starting with `--`, checked before anything is written). A **secret** is never shown: *Set* / *Not
+  set*, and **Clear**; setting one is not offered, because `dp set` takes the value only as an
+  argument and a secret is never an argument here (the CLI would need an `@file` form, as `activate`
+  has).
+- **Friendly settings** come first, in words; every other one is under **More options (N)**,
+  collapsed by default (accessible name `More options: <driver>`), with its raw key as the label.
+  The friendly presentation is data, `FriendlyOptions.Table` (driver id or any driver, key, label,
+  control, expected type, help, value labels, aliases, notes, order): adding one is a row there. An
+  entry applies only when the setting is declared with the type it expects (MULTI_VIEWER declared as
+  a bool or an int is listed under More options by its key); stored values match without regard to
+  case ("SBS", "Quad").
+
+  | Driver | Key | Label | Control | Values shown |
+  |---|---|---|---|---|
+  | simulated display (`sim-display`) | `OUTPUT` | 3D preview kind | drop-down | Red / cyan (anaglyph) `anaglyph`, Side by side `sbs`, Side by side, squeezed `squeezed` (also `squeezed_sbs`), Four views (2x2) `quad`, Interlaced `interlaced` (also `interlace`), Blend `blend`. `2d` / `passthrough` are not offered (Start in and Always 2D cover 2D); a stored one reads "No 3D preview kind is chosen: apps stay in 2D", nothing selected, and Start in then carries "Has no effect until a 3D preview kind is chosen." No top-and-bottom kind exists. |
+  | simulated display | `START_3D` | Start in | two-way choice | 2D `0`, 3D preview `1` |
+  | simulated display | `FORCE_MODE` | Always 2D | switch | on writes `0`; off always writes the default `-1` for this user (never an unset: `dp options` shows only the winning layer, so an unset could leave a machine-wide value winning); "Use the default" unsets; a stored `1` shows as its own state, *Always 3D preview*, with "Use the default" |
+  | any driver | `MULTI_VIEWER` | Several viewers | drop-down | Follow the display's own setting `system`, On `on`, Off `off` |
+
+  The four-view kind carries "For checking four-view apps. Most apps show only two of the views, or
+  stay in 2D." under the control while it is in force. The CLI's JSON has no per-value view count
+  (and the status snapshot only the kind in force), so this is keyed on the value name `quad`.
+- **Under the block**: "Changes apply the next time a 3D app starts. Apps that are already running,
+  and DisplayXR in the background, keep what they started with."
+- **Accessible names**: each control `<label>: <driver>` (a two-way choice's buttons
+  `<label> <choice>: <driver>`, Apply `Apply <label>: <driver>`), the reset `Use the default for
+  <label>: <driver>`.
+- **Fixtures**: `fixtures/dp-options-<id>.json` beside the snapshot file simulates `dp options <id>
+  --json` and `dp set` / `dp unset` in memory (a driver with no file answers like an unregistered
+  id), so a `--fixture` run never writes a setting. Hand-written in the CLI's shape
+  (`src/xrt/targets/cli/cli_component_options.c`), with one entry of each kind the parse must handle.
+- Tests: `DriverOptionsTests` (the parse and what it drops, no options, the friendly table and order,
+  each control, the source words, the read-only environment value, the pin's writes, text checks,
+  the commands, the accessible names, the context's read / write / re-read against the fixture).
 
 ## Camera calibration window
 
@@ -403,7 +493,8 @@ parts (the job object, raising the first instance) are no-ops there.
   (one line every 2 s, looping) and simulates the per-screen `dp` verbs in memory, so the
   live-service pages can be laid out without a service that answers. Fixtures and their
   generator: `src/dashboard/fixtures/` (`two-panels`, `stress-16x32`, `components`,
-  `empty-headless`). A `workspace-list.json` beside the fixture simulates the
+  `empty-headless`). A `dp-options-<id>.json` beside the fixture simulates `dp options` / `set` /
+  `unset` for that display driver. A `workspace-list.json` beside the fixture simulates the
   `workspace list|set|launch` verbs in memory, and a `dp-machine-override.txt` (one plug-in
   id) simulates a machine-wide `PreferredPlugin` that a global `dp reset` clears.
 - Log: `%LOCALAPPDATA%\DisplayXR\dashboard.log` — lifecycle, child starts / exits, and
@@ -423,14 +514,15 @@ parts (the job object, raising the first instance) are no-ops there.
   engine's list, the words of every exit code, the licence block, the URL rule), `Verdict` (Home's
   headline, rows and "Needs attention"), `PageRoutes` (the rail and every page id), `ComponentRows`
   (the Components list: installed components joined with catalog items, a row's status and what
-  it may offer).
+  it may offer), `DriverOptions` (a display driver's settings from `dp options --json`, the friendly
+  table and each Options row).
 - `Feed/` — `StatusFeed` (the state machine above, single-threaded on a scheduler),
   `CliProcessSource` (the real CLI), `FixtureProcessSource`, the job object, the vendor
   dashboard launcher (D7: the command line is never parsed), `CatalogService` (the install engine,
   the elevated run, the key file, opening a URL) and `FixtureCatalogEngine`.
 - `Ui/`, `Pages/`, `MainWindow.cs` — code-built Avalonia views; styles and the palette in
   `Styles/`. A page rebuilds only when its own key changes (counters update in place), and
-  never while one of its drop-downs is open.
+  never while one of its drop-downs is open or one of its text boxes has the focus.
 - `DisplayXR.Dashboard.Tests/` — xunit: the JSON model, warnings → dot / badge, the map
   geometry, the feed state machine (fake process source + manual clock), the per-screen
   selector.

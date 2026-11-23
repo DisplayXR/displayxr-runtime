@@ -1,0 +1,108 @@
+{
+	"id":	"sim-display",
+	"class":	"dp",
+	"env_prefix":	"DXR_DP_SIM_DISPLAY_",
+	"user_store":	"HKCU\\Software\\DisplayXR\\DisplayProcessors\\sim-display\\Settings",
+	"machine_store":	"HKLM\\Software\\DisplayXR\\DisplayProcessors\\sim-display\\Settings",
+	"settings":	[{
+			"key":	"TRACKING",
+			"declared":	true,
+			"type":	"bool",
+			"default":	"0",
+			"help":	"fake eye tracking: advertise MANUAL_BIT + tracked 3D modes with nominal eyes (was SIM_DISPLAY_FAKE_TRACKING)",
+			"secret":	false,
+			"value":	"1",
+			"source":	"user"
+		}, {
+			"key":	"TRACKING_PERIOD_MS",
+			"declared":	true,
+			"type":	"int",
+			"default":	"0",
+			"help":	"square-wave is_tracking with this period to exercise tracking-loss edges; 0 = always tracking",
+			"secret":	false,
+			"value":	null,
+			"source":	"absent"
+		}, {
+			"key":	"OUTPUT",
+			"declared":	true,
+			"type":	"enum",
+			"default":	"anaglyph",
+			"help":	"the 3D kind mode 1 draws: anaglyph, sbs, squeezed|squeezed_sbs, quad (4 views: an inspection kind, stereo apps fall back to 2D), interlaced, blend; 2d|passthrough = anaglyph and start in 2D",
+			"secret":	false,
+			"value":	"quad",
+			"source":	"user"
+		}, {
+			"key":	"START_3D",
+			"declared":	true,
+			"type":	"bool",
+			"default":	"0",
+			"help":	"start in the 3D kind (mode 1) instead of 2D (mode 0); ignored with OUTPUT=2d",
+			"secret":	false,
+			"value":	null,
+			"source":	"absent"
+		}, {
+			"key":	"FORCE_MODE",
+			"declared":	true,
+			"type":	"int",
+			"default":	"-1",
+			"help":	"pin the rendering mode for every app: 0 = 2D, 1 = the 3D kind OUTPUT names; -1 = off (other values are ignored)",
+			"secret":	false,
+			"value":	"1",
+			"source":	"user"
+		}, {
+			"key":	"WIDTH_M",
+			"declared":	true,
+			"type":	"float",
+			"default":	"0.344",
+			"help":	"panel width in metres",
+			"secret":	false,
+			"value":	"0.5",
+			"source":	"environment"
+		}, {
+			"key":	"WEAVE_SCOPE",
+			"declared":	true,
+			"type":	"enum",
+			"default":	"canvas",
+			"help":	"weave scope the DP declares: canvas, region, scanout",
+			"secret":	false,
+			"value":	null,
+			"source":	"absent"
+		}, {
+			"key":	"STEREO_CAMERA_SIZE",
+			"declared":	true,
+			"type":	"string",
+			"default":	"640x480",
+			"help":	"fake camera: per-eye size WxH",
+			"secret":	false,
+			"value":	"1280x720",
+			"source":	"machine"
+		}, {
+			"key":	"FUTURE_THING",
+			"declared":	true,
+			"type":	"colour",
+			"default":	"red",
+			"help":	"a type this Dashboard does not know",
+			"secret":	false,
+			"value":	null,
+			"source":	"absent"
+		}, {
+			"key":	"LICENCE_KEY",
+			"declared":	true,
+			"type":	"secret",
+			"default":	"",
+			"help":	"a secret (never shown)",
+			"secret":	true,
+			"value":	null,
+			"set":	true,
+			"source":	"user"
+		}, {
+			"key":	"TRACKING_TURN_DEG",
+			"declared":	false,
+			"type":	null,
+			"default":	null,
+			"help":	null,
+			"secret":	false,
+			"value":	"0",
+			"source":	"user"
+		}]
+}

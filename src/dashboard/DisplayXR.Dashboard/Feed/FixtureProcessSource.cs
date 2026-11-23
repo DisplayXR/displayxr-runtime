@@ -46,6 +46,10 @@ public sealed class FixtureProcessSource : IProcessSource
     // <verb>-list.json beside the fixture (conv, tracking; input-list.json above): `<verb> list --json`
     // and `<verb> activate <id> @file --json`, simulated, so the licence block of a Components row can be tried.
     private readonly Dictionary<string, JsonObject> _classLists = new();
+    // dp-options-<id>.json beside the fixture: `dp options <id> --json`, `dp set|unset <id> <KEY>`, simulated
+    // (a driver with no file answers like the CLI for an unregistered id), so a fixture run never writes a setting.
+    private readonly string _dir;
+    private readonly Dictionary<string, JsonObject?> _options = new();
     /// <summary>The key the simulated <c>activate</c> accepts (the sim providers' own test key).</summary>
     public const string TestKey = "DXR-SIM-TEST-KEY";
     public static readonly TimeSpan Interval = TimeSpan.FromSeconds(2);
@@ -69,6 +73,7 @@ public sealed class FixtureProcessSource : IProcessSource
         }
         catch (Exception ex) { DashboardLog.Warn($"fixture: {ex.Message}"); }
         string dir = Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".";
+        _dir = dir;
         try
         {
             string mo = Path.Combine(dir, "dp-machine-override.txt");
@@ -152,9 +157,54 @@ public sealed class FixtureProcessSource : IProcessSource
             lock (_gate) return Task.FromResult(new CliResult(0, cl.ToJsonString(), "", false, null));
         if (_input is not null && (a is ["input", "list", "--json"] || a is ["input", "use" or "reset", .., "--app", _]))
             return Task.FromResult(Input(a));
+        if (a is ["dp", "options", _, "--json"] or ["dp", "set", _, _, _] or ["dp", "unset", _, _])
+            return Task.FromResult(Options(a));
         if (_screens.Count > 0 && a is ["dp", ..])
             return Task.FromResult(Dp(a));
         return _real.RunAsync(args, timeout, cancel);
+    }
+
+    /// <summary>A driver's settings from <c>dp-options-&lt;id&gt;.json</c>, read once and changed in memory by set / unset.</summary>
+    private JsonObject? OptionsOf(string id)
+    {
+        if (_options.TryGetValue(id, out var o)) return o;
+        try
+        {
+            string f = Path.Combine(_dir, $"dp-options-{id}.json");
+            o = File.Exists(f) ? JsonNode.Parse(File.ReadAllText(f)) as JsonObject : null;
+        }
+        catch (Exception ex) { DashboardLog.Warn($"fixture dp options: {ex.Message}"); o = null; }
+        _options[id] = o;
+        return o;
+    }
+
+    private CliResult Options(string[] a)
+    {
+        lock (_gate)
+        {
+            string id = a[2];
+            if (OptionsOf(id) is not { } doc)
+                return new CliResult(1, $"FAIL: '{id}' is not a registered display processor (see 'dp list') — nothing to show.", "", false, null);
+            if (a[1] == "options") return new CliResult(0, doc.ToJsonString(), "", false, null);
+            string key = a[3].ToUpperInvariant();
+            var row = (doc["settings"] as JsonArray)?.OfType<JsonObject>().FirstOrDefault(r => r["key"]?.GetValue<string>() == key);
+            if (row is null) return new CliResult(1, "", $"fixture: '{key}' is not a setting of '{id}'", false, null);
+            if (row["source"]?.GetValue<string>() == "environment")
+                return new CliResult(0, $"{id}: {key} written per user.\nnote: DXR_DP_{id.ToUpperInvariant().Replace('-', '_')}_{key} is set in this process's environment and wins.", "", false, null);
+            bool secret = row["secret"]?.GetValue<bool>() == true;
+            if (a[1] == "set")
+            {
+                row["source"] = "user";
+                row["value"] = secret ? null : a[4];
+                if (secret) row["set"] = true;
+                return new CliResult(0, secret ? $"{id}: {key} = <set> per user (fixture). The value is a secret: it is never shown again."
+                                               : $"{id}: {key} = '{a[4]}' per user (fixture).", "", false, null);
+            }
+            row["source"] = "absent";
+            row["value"] = null;
+            if (secret) row["set"] = false;
+            return new CliResult(0, $"{id}: {key} cleared per user (fixture). Effective now: {key} unset — the display processor keeps its compiled default.", "", false, null);
+        }
     }
 
     private CliResult Dp(string[] a)

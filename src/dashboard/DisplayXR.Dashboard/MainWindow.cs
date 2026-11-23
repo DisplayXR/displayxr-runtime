@@ -492,6 +492,7 @@ public sealed class MainWindow : Window
                 _ctx.ForgetCatalogBackground();
                 _ = _ctx.LoadCatalogAsync(force: true);
                 foreach (var c in ComponentClasses.All) _ = _ctx.LoadPolicyAsync(c, force: true);
+                _ctx.RefreshDriverOptions();
                 break;
             default:
                 _current?.OnRefresh();

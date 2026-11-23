@@ -54,8 +54,11 @@ public enum VerdictKind
     NotRunning,
 }
 
+/// <param name="SimulatedDriverId">Set when the only display driver in use is the simulated one: its id, for the
+/// "Try a 3D preview" link to its Details on Components. Null otherwise.</param>
 public sealed record Verdict(VerdictKind Kind, string Headline, string Subline, Level Level,
-                             IReadOnlyList<VerdictRow> Rows, IReadOnlyList<AttentionItem> Attention);
+                             IReadOnlyList<VerdictRow> Rows, IReadOnlyList<AttentionItem> Attention,
+                             string? SimulatedDriverId = null);
 
 public static class Verdicts
 {
@@ -73,6 +76,26 @@ public static class Verdicts
         info is { ActiveRuntimeQueried: true } ? (true, info.ActiveRuntimeSet ? info.ActiveRuntimeValue : null)
         : s?.Runtime.ActiveOpenXrRuntime is { Length: > 0 } v ? (true, v)
         : (false, null);
+
+    /// <summary>
+    /// The simulated display driver's id when it is the only display driver on this PC: no other display
+    /// driver is registered at all (a registered one that failed, declined or is not ready means a 3D
+    /// display may be there and broken), no display or system warning says a display fell back
+    /// (CLAIM_FALLBACK / PLUGIN_NOT_READY), and no display is a real 3D display. Null otherwise: then
+    /// the usual verdict applies, never "Nothing is wrong".
+    /// </summary>
+    public static string? OnlySimulated(StatusSnapshot s)
+    {
+        if (s.Plugins.Any(p => !StatusText.IsSimulatedDriver(s, p.Id))) return null;
+        if (s.Warnings.Any(w => StatusText.IsFallbackWarning(w.Code))) return null;
+        if (s.Screens.Any(x => x.Warnings.Any(w => StatusText.IsFallbackWarning(w.Code)))) return null;
+        if (s.Screens.Any(x => StatusText.IsReal3D(s, x))) return null;
+        return s.Screens.Where(x => x.Claim.IsClaimed).Select(x => x.Claim.PluginId).FirstOrDefault()
+               ?? s.Plugins.FirstOrDefault(p => p.Load == "ACTIVE")?.Id;
+    }
+
+    /// <summary>The line under "No 3D display found" on a PC whose only display driver is the simulated one.</summary>
+    public const string SimulatedOnlyLine = "DisplayXR apps show in normal 2D on this PC. Nothing is wrong.";
 
     /// <summary>A display has live state only while an app draws on it through the running service.</summary>
     public static bool IsLive(StatusSnapshot s, Screen x) => s.IsService && x.Dps.Count > 0;
@@ -114,7 +137,7 @@ public static class Verdicts
             string? role = x.Roles.OsMain ? "Main display" : null;
             string? id = dp?.Screen(x.Key)?.EffectivePlugin ?? (x.Claim.IsClaimed ? x.Claim.PluginId : null);
             string? name = id is null ? null : s.Plugins.FirstOrDefault(p => p.Id == id)?.Name is { Length: > 0 } n ? n : id;
-            bool is3D = x.Claim.IsClaimed;
+            bool is3D = StatusText.IsReal3D(s, x);
             rows.Add(new VerdictRow(x.Id, StatusText.ScreenName(x), role, is3D, is3D ? name : null, is3D ? id : null,
                                     is3D ? StatusText.ForcedChip(x, dp) : null,
                                     is3D ? Facts(s, x) : Array.Empty<VerdictFact>()));
@@ -214,13 +237,19 @@ public static class Verdicts
         if (s.Screens.Count == 0)
             return new Verdict(VerdictKind.NoDisplay, "No display found",
                                Join("Check that your display is connected and awake.", more), Level.Warn, rows, attention);
-        int claimed = s.Screens.Count(x => x.Claim.IsClaimed);
+        int claimed = s.Screens.Count(x => StatusText.IsReal3D(s, x));
         if (claimed == 0)
+        {
+            // Only the simulated display driver: an ordinary PC, where apps show in 2D. Nothing to fix.
+            if (OnlySimulated(s) is { } sim)
+                return new Verdict(VerdictKind.No3DDisplay, "No 3D display found", Join(SimulatedOnlyLine, more),
+                                   withMore(Level.Info), rows, attention, sim);
             return new Verdict(VerdictKind.No3DDisplay, "No 3D display found",
                                Join("None of your displays is recognised as a 3D display. Displays shows what DisplayXR found.", more),
                                Level.Warn, rows, attention);
+        }
 
-        int working = s.Screens.Count(x => x.Claim.IsClaimed && ThreeD(s, x) == Tick.Yes);
+        int working = s.Screens.Count(x => StatusText.IsReal3D(s, x) && ThreeD(s, x) == Tick.Yes);
         bool blocking = attention.Any(a => a.Level == Level.Critical);
         if (working > 0)
             return new Verdict(VerdictKind.Working, $"3D is working on {StatusText.Plural(working, "display", "displays")}", more,

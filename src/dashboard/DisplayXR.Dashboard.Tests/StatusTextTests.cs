@@ -113,6 +113,87 @@ public class StatusTextTests
         Assert.Contains(StatusText.ClaimLine(a), StatusText.Copy(Design));
     }
 
+    /// <summary>
+    /// The one rule Home and Displays share: a display claimed only by the simulated display driver (the
+    /// snapshot's fallback driver, at FALLBACK) is an ordinary display, unless that driver was chosen for
+    /// it (a per-display override).
+    /// </summary>
+    private static (StatusSnapshot Snap, Screen Screen) SimOnly()
+    {
+        var a = Design.Screens[0];
+        var idle = a with
+        {
+            Dps = System.Array.Empty<ScreenDp>(), Mode = null, EyeTracking = a.EyeTracking with { State = "NO_DP" },
+            Vendor = a.Vendor with { Lens = "UNKNOWN" }, Warnings = System.Array.Empty<StatusWarning>(),
+            Claim = a.Claim with { PluginId = "sim-display", Confidence = "FALLBACK", Forced = false },
+        };
+        var snap = Design with { Plugins = Design.Plugins.Where(p => p.Id == "sim-display").Select(p => p with { Load = "ACTIVE" }).ToArray(), Screens = new[] { idle } };
+        return (snap, idle);
+    }
+
+    [Fact]
+    public void Real3D_TheSharedRule()
+    {
+        var (snap, sim) = SimOnly();
+        Assert.True(StatusText.IsReal3D(Design, Design.Screens[0]));             // a real driver's claim
+        Assert.False(StatusText.IsReal3D(snap, sim));                            // the simulated driver's claim
+        Assert.True(StatusText.IsSimulatedPreview(snap, sim));
+        var chosen = sim with { Claim = sim.Claim with { Forced = true } };
+        Assert.True(StatusText.IsReal3D(snap, chosen));                          // chosen for this display: counts
+        Assert.False(StatusText.IsSimulatedPreview(snap, chosen));
+        var flat = sim with { Claim = sim.Claim with { PluginId = null, Confidence = "NONE" } };
+        Assert.False(StatusText.IsReal3D(snap, flat));                           // unclaimed: neither
+        Assert.False(StatusText.IsSimulatedPreview(snap, flat));
+        // The fallback flag decides; without the plug-in in the snapshot, the simulated display's id does.
+        Assert.True(StatusText.IsSimulatedDriver(snap with { Plugins = System.Array.Empty<PluginInfo>() }, "sim-display"));
+        Assert.False(StatusText.IsSimulatedDriver(Design, "leia-sr"));
+        // Home uses the same rule.
+        Assert.Equal(VerdictKind.No3DDisplay, Verdicts.From(snap).Kind);
+    }
+
+    /// <summary>
+    /// Review finding 8: the simulated driver chosen for a display through a per-display preference from
+    /// any source (the environment included, even where the claim is not marked forced) is a 3D display
+    /// showing the simulated preview by choice, on both pages.
+    /// </summary>
+    [Fact]
+    public void SimulatedChosenByAPreference_CountsAsA3DDisplay()
+    {
+        var (snap, sim) = SimOnly();
+        var byEnv = sim with { Claim = sim.Claim with { Forced = false, PreferredPlugin = "sim-display", PreferredSource = "env" } };
+        var s = snap with { Screens = new[] { byEnv } };
+        Assert.True(StatusText.ChoseSimulated(s, byEnv));
+        Assert.True(StatusText.IsReal3D(s, byEnv));
+        Assert.NotEqual(Verdicts.Plain2D, StatusText.PlainBadge(byEnv, s).Text);
+        Assert.Equal("Recognised as a 3D display · display driver: sim-display · chosen by hand", StatusText.PlainClaimLine(byEnv, null, s));
+        Assert.NotEqual(VerdictKind.No3DDisplay, Verdicts.From(s).Kind);
+        // A preference for another driver does not make the simulated claim a 3D display.
+        var other = sim with { Claim = sim.Claim with { PreferredPlugin = "leia-sr", PreferredSource = "user" } };
+        Assert.False(StatusText.ChoseSimulated(snap, other));
+    }
+
+    [Fact]
+    public void DisplaysCard_SimulatedOnly_SaysOrdinary2D()
+    {
+        var (snap, sim) = SimOnly();
+        Assert.Equal(("Ordinary 2D display", Level.Plain), StatusText.PlainBadge(sim, snap));
+        Assert.Equal("The simulated display driver gives it a 3D preview.", StatusText.PlainStateLine(sim, snap));
+        Assert.Equal("Not recognised as a 3D display · display driver: DisplayXR Sim Display, which gives it a 3D preview",
+                     StatusText.PlainClaimLine(sim, id => snap.Plugins.FirstOrDefault(p => p.Id == id)?.Name, snap));
+        Assert.Equal(Level.Plain, StatusText.ScreenLevel(sim, snap));
+        Assert.Equal("One display, not a 3D display", StatusText.DisplaysSummary(snap));
+        Assert.DoesNotContain("recognised as 3D", StatusText.DisplaysSummary(snap));
+        // With a real 3D display beside it: one recognised, the other ordinary.
+        var two = Design with { Screens = new[] { Design.Screens[0], sim with { Id = "other" } } };
+        Assert.Equal("2 displays · 1 recognised as 3D · 1 sees you", StatusText.DisplaysSummary(two));
+        // The technical badge (tooltip, Copy list) still says what the claim is.
+        Assert.Equal(("FALLBACK", Level.Warn), StatusText.Badge(sim));
+        // Chosen for the display: the usual words.
+        var chosen = sim with { Claim = sim.Claim with { Forced = true } };
+        Assert.Equal(("Generic driver", Level.Warn), StatusText.PlainBadge(chosen, snap));
+        Assert.Equal(StatusText.IdleLine, StatusText.PlainStateLine(chosen, snap));
+    }
+
     [Fact]
     public void DisplaysCaption_NoZeroCounts_OneInWords_NotKnownWithoutLiveState()
     {

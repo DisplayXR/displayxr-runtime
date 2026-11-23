@@ -60,7 +60,7 @@ public sealed class HomePage : Page
         }
         // The verdict: its words, every row's facts and every "Needs attention" sentence.
         var v = Verdict();
-        sb.Append('|').Append(v.Kind).Append(v.Headline).Append(v.Subline).Append(v.Level);
+        sb.Append('|').Append(v.Kind).Append(v.Headline).Append(v.Subline).Append(v.Level).Append(v.SimulatedDriverId);
         foreach (var r in v.Rows) sb.Append(r.Name).Append(r.Role).Append(r.Driver).Append(r.Forced).Append(string.Join(",", r.Facts)).Append(';');
         foreach (var a in v.Attention) sb.Append(a).Append(';');
         sb.Append('|').Append(Ctx.Dp?.Preferred).Append(Ctx.ActionRunning);
@@ -112,6 +112,18 @@ public sealed class HomePage : Page
         if (v.Level is Level.Warn or Level.Critical) headline.Foreground = Tokens.For(v.Level);
         var head = U.VStack(4, headline);
         if (v.Subline.Length > 0) head.Children.Add(U.Wrapped(v.Subline, "dim"));
+        // Only the simulated display driver: its Options (the 3D preview kind, Start in) are on Components.
+        if (v.SimulatedDriverId is { } sim)
+        {
+            var preview = U.Button("Try a 3D preview", () =>
+            {
+                Ctx.CatalogFocus = new CatalogFocus(null, ComponentClass.Display, sim, null);
+                Ctx.Navigate("components");
+            }, "link");
+            preview.HorizontalAlignment = HorizontalAlignment.Left;
+            ToolTip.SetTip(preview, "Opens the simulated display's options on Components, where you can choose what the 3D preview looks like.");
+            head.Children.Add(preview);
+        }
         var top = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*") };
         top.Children.Add(dot);
         Grid.SetColumn(head, 1);

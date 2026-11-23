@@ -70,8 +70,15 @@ public sealed class ComponentsPage : Page
     private WorkspaceLaunchEditor Launch => _launchEditor ??= new WorkspaceLaunchEditor(Ctx, force => Update(force));
     private int _openDropDowns;
 
+    // A display driver's Options block (ADR-065): which "More options" sub-blocks are open, what is
+    // typed in a text box not yet applied, a value refused before it was written, and a text box
+    // with the focus (a rebuild would take the text from under the user's fingers).
+    private readonly HashSet<string> _moreOpen = new();
+    private readonly OptionEdits _edits = new();
+    private readonly Dictionary<string, string> _optionErrors = new();
+
     // A rebuild would also empty the key box under the user's fingers.
-    protected override bool DeferRebuild => Launch.Busy || _openDropDowns > 0 || _keyFor is not null;
+    protected override bool DeferRebuild => Launch.Busy || _openDropDowns > 0 || _keyFor is not null || _edits.IsEditing;
 
     public override void OnHidden()
     {
@@ -108,7 +115,19 @@ public sealed class ComponentsPage : Page
     /// <summary>Asked to open one catalog item (<c>--catalog-item</c>): its row's detail, once the list is here.</summary>
     private void ConsumeFocus()
     {
-        if (Ctx.CatalogFocus is not { } f || Ctx.CatalogRead is null) return;
+        if (Ctx.CatalogFocus is not { } f) return;
+        // An installed component by class and id (Home's "Try a 3D preview"): its row's key is known
+        // without the catalog, so it opens at once.
+        if (f.ItemId is null && f.Class is { } fc && f.ComponentId is { } fid && ComponentRows.CatalogClassOf(fc.SectionId()) is { } cc)
+        {
+            Ctx.CatalogFocus = null;
+            _filter = RowFilter.All;
+            _open.Add(ComponentRows.KeyOf(cc, fid));
+            // Posted: this runs inside Key(), and a load announces itself at once.
+            if (fc == ComponentClass.Display) Dispatcher.UIThread.Post(() => _ = Ctx.LoadDriverOptionsAsync(fid));
+            return;
+        }
+        if (Ctx.CatalogRead is null) return;
         Ctx.CatalogFocus = null;
         var list = Source().List;
         var item = f.ItemId is not null ? list?.Find(f.ItemId)
@@ -182,6 +201,16 @@ public sealed class ComponentsPage : Page
         if (Ctx.BuyNote is { } bn) sb.Append(bn.ItemId).Append(bn.Plan.Kind).Append(bn.Plan.Title);
         if (Ctx.ActivationResult is { } ar) sb.Append(ar.ItemId).Append(ar.Outcome.Title);
         sb.Append('|');
+        // ADR-065: the open display drivers' settings, the last Options write and its reply.
+        foreach (var id in _open)
+        {
+            sb.Append(id).Append(Ctx.DriverOptionsLoading(DriverIdOfKey(id) ?? "")).Append(Ctx.DriverOptionsReadFailed(DriverIdOfKey(id) ?? ""));
+            if (DriverIdOfKey(id) is { } did && Ctx.DriverOptionsOf(did) is { } o)
+                foreach (var st in o.Settings) sb.Append(st.Key).Append('=').Append(st.Value).Append(st.Source).Append(st.IsSet).Append(';');
+        }
+        sb.Append(string.Join(",", _moreOpen)).Append(string.Join(",", _optionErrors.Select(kv => kv.Key + kv.Value)));
+        if (Ctx.LastActionArea == OptionCommands.Area) sb.Append(Ctx.LastOptionWrite).Append(Ctx.LastAction).Append(Ctx.LastActionFailed);
+        sb.Append('|');
         foreach (var i in src.List?.Items ?? Array.Empty<CatalogItem>())
         {
             sb.Append(i.Id).Append(i.State).Append(i.Installed).Append(i.Available).Append(i.Download).Append(i.Compatible)
@@ -197,6 +226,8 @@ public sealed class ComponentsPage : Page
     protected override Control Build()
     {
         _openDropDowns = 0;
+        _edits.Rebuilt(); // a text box taken away by this rebuild may never say it lost the focus
+        _driverKeys.Clear();
         Launch.BeginBuild();
         _elapsed = null;
         var page = U.VStack(18);
@@ -308,7 +339,10 @@ public sealed class ComponentsPage : Page
                 bool writable = pr is not null && Ctx.Policies.TryGetValue(pr.Class, out pl) && pl.Writable;
                 // ONE strip per row: Enabled, "Use this one", Install / Update and Details on one line, the details below it.
                 var controls = writable ? PolicyControls(pr!, pl!) : null;
-                if (RowStrip(row, face, writable ? PolicyNotes(pr!, pl!) : null, controls) is { } strip) list.Children.Add(strip);
+                // ADR-065: an installed display driver's Details carry its Options block.
+                string? driverId = s.Id == ComponentClass.Display.SectionId() ? row.Installed?.Id : null;
+                if (driverId is not null) _driverKeys[row.Key] = driverId;
+                if (RowStrip(row, face, writable ? PolicyNotes(pr!, pl!) : null, controls, driverId) is { } strip) list.Children.Add(strip);
             }
             body.Children.Add(list);
             if (s.Collapsed) body.Children.Add(U.Button("Hide", () => Toggle(s.Id), "link"));
@@ -618,6 +652,246 @@ public sealed class ComponentsPage : Page
         return g;
     }
 
+    // ── A display driver's Options (ADR-065) ────────────────────────────────
+
+    // Row key -> display driver id, for the rows the last build drew as display drivers.
+    private readonly Dictionary<string, string> _driverKeys = new();
+
+    private string? DriverIdOfKey(string rowKey) => _driverKeys.TryGetValue(rowKey, out var id) ? id : null;
+
+    /// <summary>
+    /// The Options block of a display driver's Details: the settings an owner is expected to touch,
+    /// in words (<see cref="FriendlyOptions"/>), then every other one under a collapsed "More options"
+    /// by its key. Each write is one <c>dp set</c> / <c>dp unset</c> through the shared action path;
+    /// the CLI's reply shows on the row it was for, and the settings are re-read. Nothing is saved by
+    /// the Dashboard itself. No options (none declared, an older CLI, a failing read): one quiet line.
+    /// </summary>
+    private Control OptionsBlockView(string id, string driverName)
+    {
+        var col = U.VStack(10, U.Text("Options", "group"));
+        var options = Ctx.DriverOptionsOf(id);
+        bool failed = Ctx.DriverOptionsReadFailed(id);
+        if (options is null && !failed)
+        {
+            // Opened another way than the toggle (after an install, a --catalog-item focus): read now.
+            if (!Ctx.DriverOptionsLoading(id)) Dispatcher.UIThread.Post(() => _ = Ctx.LoadDriverOptionsAsync(id));
+            col.Children.Add(U.Wrapped("Reading its options…", "meta"));
+            return col;
+        }
+        // The last read failed: say so, offer to read again, and keep what an earlier read showed.
+        if (failed)
+        {
+            var retry = U.Button(Ctx.DriverOptionsLoading(id) ? "Reading…" : "Try again", () => _ = Ctx.LoadDriverOptionsAsync(id, force: true), "quiet", "sm");
+            retry.IsEnabled = !Ctx.DriverOptionsLoading(id);
+            AutomationProperties.SetName(retry, OptionViews.RetryName(driverName));
+            var failLine = U.Text(OptionViews.ReadFailedLine, "meta");
+            failLine.VerticalAlignment = VerticalAlignment.Center;
+            col.Children.Add(U.Flow(10, 6, failLine, retry));
+        }
+        var block = options is null ? new OptionsBlock(id, Array.Empty<OptionView>(), Array.Empty<OptionView>()) : OptionViews.Build(id, options);
+        // The reply to a write whose row is not drawn (the read failed, or the setting went away) stays visible.
+        if (Ctx.LastActionArea == OptionCommands.Area && Ctx.LastOptionWrite is { } lw && lw.DriverId == id && Ctx.LastAction is { } la
+            && !block.Friendly.Concat(block.More).Any(v => v.Key == lw.Key))
+            col.Children.Add(Ctx.LastActionFailed ? U.WarningRow(new StatusWarning("OPTION", WarningLevel.Warn, la)) : U.Wrapped(la, "soft"));
+        if (options is null) return col;
+        if (block.IsEmpty)
+        {
+            col.Children.Add(U.Wrapped(OptionViews.NoOptionsLine, "meta"));
+            return col;
+        }
+        foreach (var v in block.Friendly) col.Children.Add(OptionRow(id, driverName, v));
+        if (block.More.Count > 0)
+        {
+            bool open = _moreOpen.Contains(id);
+            var toggle = U.Button(open ? "Hide more options" : $"More options ({block.More.Count})", () =>
+            {
+                if (!_moreOpen.Remove(id)) _moreOpen.Add(id);
+                Update(force: true);
+            }, "link");
+            AutomationProperties.SetName(toggle, OptionViews.MoreName(driverName));
+            ToolTip.SetTip(toggle, "Every other setting this display driver declares, by its own name. Most are for developers.");
+            col.Children.Add(toggle);
+            if (open)
+            {
+                var more = U.VStack(10);
+                foreach (var v in block.More) more.Children.Add(OptionRow(id, driverName, v));
+                col.Children.Add(more);
+            }
+        }
+        col.Children.Add(U.Wrapped(OptionViews.AppliesNote, "meta"));
+        return col;
+    }
+
+    /// <summary>One setting: its label, its control by type, the value in force and where it comes from, its help, "Use the default", and the reply to the last write made here.</summary>
+    private Control OptionRow(string id, string driverName, OptionView v)
+    {
+        string errKey = id + "/" + v.Key;
+        string name = OptionViews.AccessibleName(v.Label, driverName);
+        bool enabled = !Ctx.ActionRunning && !v.ReadOnly;
+
+        void Write(CliArgs command)
+        {
+            _optionErrors.Remove(errKey);
+            _ = Ctx.RunOptionWriteAsync(id, v.Key, command);
+        }
+
+        var label = U.Text(v.Label, v.Friendly ? "value" : "mono");
+        label.FontWeight = FontWeight.SemiBold;
+        label.VerticalAlignment = VerticalAlignment.Center;
+        ToolTip.SetTip(label, v.Tooltip);
+        var line = U.Flow(10, 6, label);
+
+        switch (v.Control)
+        {
+            case OptionControl.Choice:
+            {
+                var choices = v.Choices;
+                var pick = new ComboBox
+                {
+                    ItemsSource = choices.Select(c => c.Label).ToArray(), MinWidth = 220, IsEnabled = enabled,
+                    SelectedIndex = v.Selected is { } sel ? choices.Select(c => c.Value).ToList().IndexOf(sel) : -1,
+                };
+                pick.Classes.Add("field");
+                AutomationProperties.SetName(pick, name);
+                ToolTip.SetTip(pick, v.Tooltip);
+                pick.DropDownOpened += (_, _) => _openDropDowns++;
+                pick.DropDownClosed += (_, _) =>
+                {
+                    _openDropDowns = Math.Max(0, _openDropDowns - 1);
+                    Dispatcher.UIThread.Post(() => Update());
+                };
+                pick.SelectionChanged += (_, _) =>
+                {
+                    int i = pick.SelectedIndex;
+                    if (i < 0 || i >= choices.Count || choices[i].Value == v.Selected || Ctx.ActionRunning) return;
+                    Write(OptionCommands.Set(id, v.Key, choices[i].Value));
+                };
+                U.AddFlow(line, pick, 10, 6);
+                break;
+            }
+            case OptionControl.TwoWay:
+            {
+                string group = "opt" + Guid.NewGuid().ToString("N");
+                foreach (var c in v.Choices)
+                {
+                    bool on = c.Value == v.Selected;
+                    var rb = new RadioButton { GroupName = group, IsChecked = on, IsEnabled = enabled, Content = c.Label, VerticalAlignment = VerticalAlignment.Center };
+                    AutomationProperties.SetName(rb, OptionViews.AccessibleName($"{v.Label} {c.Label}", driverName));
+                    rb.IsCheckedChanged += (_, _) =>
+                    {
+                        if (rb.IsChecked == true && !on && !Ctx.ActionRunning) Write(OptionCommands.Set(id, v.Key, c.Value));
+                    };
+                    U.AddFlow(line, rb, 10, 6);
+                }
+                break;
+            }
+            case OptionControl.Switch:
+            case OptionControl.Pin:
+            {
+                var sw = new ToggleSwitch { IsChecked = v.On, IsEnabled = enabled, OnContent = "On", OffContent = "Off", VerticalAlignment = VerticalAlignment.Center };
+                AutomationProperties.SetName(sw, name);
+                ToolTip.SetTip(sw, v.Tooltip);
+                sw.IsCheckedChanged += (_, _) =>
+                {
+                    bool now = sw.IsChecked == true;
+                    if (now == v.On || Ctx.ActionRunning) return;
+                    if (v.Control == OptionControl.Switch) Write(OptionCommands.Set(id, v.Key, now ? "1" : "0"));
+                    else Write(OptionCommands.Set(id, v.Key, OptionViews.PinWrite(v, now)));
+                };
+                U.AddFlow(line, sw, 10, 6);
+                // A pin holding another state (Always 2D stored as 1): that state, said as its own.
+                if (v.State is { } state) U.AddFlow(line, U.Chip(state, Level.Info), 10, 6);
+                break;
+            }
+            case OptionControl.Text:
+            {
+                string current = v.Setting.Effective;
+                var box = new TextBox
+                {
+                    Text = _edits.Draft(errKey) ?? current, Width = 220, MinHeight = 32, FontSize = 13,
+                    Background = Tokens.Field, BorderBrush = Tokens.Line, Foreground = Tokens.Fg, IsEnabled = enabled,
+                    CornerRadius = Tokens.Radius("FieldRadius"), Padding = new Thickness(10, 6), AcceptsReturn = false,
+                };
+                AutomationProperties.SetName(box, name);
+                ToolTip.SetTip(box, v.Tooltip);
+                box.TextChanged += (_, _) => _edits.Type(errKey, box.Text ?? "");
+                box.GotFocus += (_, _) => _edits.Focus(errKey);
+                box.LostFocus += (_, _) =>
+                {
+                    _edits.Blur(errKey);
+                    Dispatcher.UIThread.Post(() => Update());
+                };
+                // A submitted edit ends the edit state at once (OptionEdits.Submit / Refuse): the deferred
+                // rebuild is released, so the write's result and the CLI's reply show without waiting for
+                // the focus to leave the box.
+                void Apply()
+                {
+                    if (Ctx.ActionRunning) return;
+                    var value = OptionViews.Validate(v.Setting.Type, box.Text, out var error);
+                    if (value is null)
+                    {
+                        _edits.Refuse(errKey);
+                        _optionErrors[errKey] = error!;
+                        Update(force: true);
+                        return;
+                    }
+                    _edits.Submit(errKey);
+                    Write(OptionCommands.Set(id, v.Key, value));
+                }
+                box.KeyDown += (_, e) =>
+                {
+                    if (e.Key == Avalonia.Input.Key.Enter) { e.Handled = true; Apply(); }
+                };
+                var apply = U.Button("Apply", Apply, "quiet", "sm");
+                // Applied on the PRESS: pressing it takes the focus from the box, whose LostFocus posts the
+                // deferred rebuild; on release that rebuild could already have replaced this button and the
+                // click would be lost. Keyboard activation (Space / Enter on the button) still works.
+                apply.ClickMode = ClickMode.Press;
+                apply.IsEnabled = enabled;
+                AutomationProperties.SetName(apply, $"Apply {name}");
+                ToolTip.SetTip(apply, $"displayxr-cli dp set {id} {v.Key} <value>");
+                U.AddFlow(line, box, 10, 6);
+                U.AddFlow(line, apply, 10, 6);
+                break;
+            }
+            case OptionControl.Secret:
+            {
+                // Never shown. Setting one is not offered: `dp set` takes the value only as an argument,
+                // and a secret is never an argument (see README, Options).
+                U.AddFlow(line, U.Chip(v.ValueText, v.Setting.IsSet ? Level.Info : Level.Plain), 10, 6);
+                break;
+            }
+        }
+
+        if (v.CanReset)
+        {
+            var reset = U.Button(v.Control == OptionControl.Secret ? "Clear" : "Use the default", () => Write(OptionCommands.Unset(id, v.Key)), "quiet", "sm");
+            reset.IsEnabled = !Ctx.ActionRunning;
+            AutomationProperties.SetName(reset, OptionViews.ResetName(v.Label, driverName));
+            ToolTip.SetTip(reset, $"Clears your choice, so the display driver's default applies. (displayxr-cli {OptionCommands.Unset(id, v.Key)})");
+            U.AddFlow(line, reset, 10, 6);
+        }
+
+        var col = U.VStack(4, line);
+        var now = U.Wrapped(v.Control == OptionControl.Text && v.ValueText == "Not set" ? $"Not set{StatusText.Sep}{v.SourceText}" : $"Now: {v.ValueText}{StatusText.Sep}{v.SourceText}", "soft");
+        col.Children.Add(now);
+        if (v.Note is { } note) col.Children.Add(U.Wrapped(note, "meta"));
+        if (v.ReadOnly)
+        {
+            var env = U.Wrapped(OptionViews.EnvironmentNote, "meta");
+            ToolTip.SetTip(env, v.Tooltip);
+            col.Children.Add(env);
+        }
+        if (v.Help.Length > 0) col.Children.Add(U.Wrapped(v.Help, "desc"));
+        if (_optionErrors.TryGetValue(errKey, out var err))
+            col.Children.Add(U.WarningRow(new StatusWarning("VALUE", WarningLevel.Warn, err)));
+        else if (Ctx.LastActionArea == OptionCommands.Area && Ctx.LastOptionWrite == (id, v.Key) && Ctx.LastAction is { } la)
+            col.Children.Add(Ctx.LastActionFailed ? U.WarningRow(new StatusWarning("OPTION", WarningLevel.Warn, la)) : U.Wrapped(la, "soft"));
+        var box2 = new Border { Child = col };
+        box2.Classes.Add("field");
+        return box2;
+    }
+
     // ── The catalog side of a row (ADR-064 step 8) ──────────────────────────
 
     /// <summary>The head of a row with no installed component beside it: the catalog's name, what it does, who makes it.</summary>
@@ -638,7 +912,8 @@ public sealed class ComponentsPage : Page
     /// carries), what a policy change means and its machine-wide commands, and the catalog's detail.
     /// Any row with one of those has the toggle, catalog row or not.
     /// </summary>
-    private Control? RowStrip(ComponentRow row, RowFace face, IReadOnlyList<(string Text, bool Command)>? notes, PolicyStrip? policy)
+    private Control? RowStrip(ComponentRow row, RowFace face, IReadOnlyList<(string Text, bool Command)>? notes, PolicyStrip? policy,
+                              string? driverId = null)
     {
         var col = U.VStack(8);
         var catalog = row.Catalog is { } ci && row.HasDetail ? ci : null;
@@ -657,7 +932,7 @@ public sealed class ComponentsPage : Page
         var actions = U.Flow(10, 6);
         foreach (var c in policy?.Controls ?? Array.Empty<Control>()) U.AddFlow(actions, c, 10, 6);
         if (catalog is not null && MainButton(row, catalog) is { } main) U.AddFlow(actions, main, 10, 6);
-        if (catalog is not null || facts.Length > 0 || notes.Count > 0 || row.RemoveNote is not null)
+        if (catalog is not null || facts.Length > 0 || notes.Count > 0 || row.RemoveNote is not null || driverId is not null)
         {
             // The accessible name keeps the catalog's name where the row has a catalog detail, as before.
             string name = catalog?.Name ?? row.Name;
@@ -670,6 +945,9 @@ public sealed class ComponentsPage : Page
         if (open)
         {
             var detail = U.VStack(14);
+            // A display driver's Options first: what an owner opens Details for. Then the technical
+            // labelled lines, the scope / command-line notes, the catalog detail, the removal sentence.
+            if (driverId is not null) detail.Children.Add(OptionsBlockView(driverId, row.Name));
             if (facts.Length > 0)
             {
                 var kv = new U.KvList(130);
@@ -695,7 +973,12 @@ public sealed class ComponentsPage : Page
 
     private void ToggleRow(string key)
     {
-        if (!_open.Remove(key)) _open.Add(key);
+        if (!_open.Remove(key))
+        {
+            _open.Add(key);
+            // ADR-065: a display driver's settings are read when its Details are first opened.
+            if (DriverIdOfKey(key) is { } id) _ = Ctx.LoadDriverOptionsAsync(id);
+        }
         _keyFor = null;
         Update(force: true);
     }

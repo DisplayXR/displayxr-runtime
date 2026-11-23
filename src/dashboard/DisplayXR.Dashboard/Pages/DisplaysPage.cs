@@ -186,7 +186,7 @@ public sealed class DisplaysPage : Page
 
     private Control ScreenCard(StatusSnapshot snap, Screen s)
     {
-        var level = StatusText.ScreenLevel(s);
+        var level = StatusText.ScreenLevel(s, snap);
         var dot = U.Dot(level, 11);
         dot.VerticalAlignment = VerticalAlignment.Top;
         dot.Margin = new Thickness(0, 6, 14, 0);
@@ -200,7 +200,7 @@ public sealed class DisplaysPage : Page
         if (StatusText.ForcedChip(s, Ctx.Dp) is { } forcedChip) U.AddFlow(title, U.Chip(forcedChip, Level.Warn), 6, 4);
 
         // Plain words on the face; the technical line each one replaces is in Details and in "Copy list".
-        var (badgeText, badgeLevel) = StatusText.PlainBadge(s);
+        var (badgeText, badgeLevel) = StatusText.PlainBadge(s, snap);
         var badge = U.Badge(badgeText, badgeLevel, tick: badgeLevel == Level.Ok);
         ToolTip.SetTip(badge, StatusText.Badge(s).Text);
         badge.VerticalAlignment = VerticalAlignment.Top;
@@ -212,7 +212,7 @@ public sealed class DisplaysPage : Page
         head.Children.Add(badge);
 
         var body = U.VStack(5, head);
-        var state = U.Wrapped(StatusText.PlainStateLine(s), "soft");
+        var state = U.Wrapped(StatusText.PlainStateLine(s, snap), "soft");
         ToolTip.SetTip(state, StatusText.StateLine(s)); // the technical line, as "Copy list" writes it
         body.Children.Add(state);
 
@@ -266,7 +266,7 @@ public sealed class DisplaysPage : Page
         {
             var d = U.VStack(6);
             d.Children.Add(U.Wrapped(StatusText.PlainIdentity(s), "dim"));
-            d.Children.Add(U.Wrapped(StatusText.PlainClaimLine(s, id => snap.Plugins.FirstOrDefault(p => p.Id == id)?.Name), "soft"));
+            d.Children.Add(U.Wrapped(StatusText.PlainClaimLine(s, id => snap.Plugins.FirstOrDefault(p => p.Id == id)?.Name, snap), "soft"));
             if (StatusText.PlainVendorLine(s) is { } vendor) d.Children.Add(U.Wrapped(vendor, "dim"));
             if (!choiceOnFace && dpRow is not null)
             {
