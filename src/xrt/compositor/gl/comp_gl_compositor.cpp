@@ -7890,6 +7890,41 @@ comp_gl_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const stru
 	c->cursor_draw.req = *req;
 }
 
+#ifdef XRT_BUILD_DRIVER_QWERTY
+/*!
+ * One path for the runtime's mode keys (ADR-065): V (@p toggle) and '0' / '1'
+ * (@p selected). A digit does exactly what V does for the same target: the
+ * #1499 fill check, the active-index write (which the state tracker turns into
+ * XrEventDataRenderingModeChangedDXR), OUTPUT_MODE for a driver that
+ * implements it, and the hardware 2D/3D request a driver that does NOT
+ * implement OUTPUT_MODE needs to switch at all. Before, a digit only set
+ * OUTPUT_MODE, so on such a driver '0' / '1' did nothing.
+ */
+static void
+gl_apply_mode_key(struct comp_gl_compositor *c, bool toggle, int selected, bool qwerty_force_2d)
+{
+	struct xrt_device *head = c->xsysd->static_roles.head;
+	const bool have_table = head != NULL && head->hmd != NULL;
+	const struct u_rendering_mode_key_decision d = u_rendering_modes_decide_key(
+	    have_table ? head->rendering_modes : NULL, have_table ? head->rendering_mode_count : 0,
+	    have_table ? head->hmd->active_rendering_mode_index : 0, toggle, (int32_t)selected, qwerty_force_2d,
+	    c->mode_fill_views);
+	switch (d.action) {
+	case U_RENDERING_MODE_KEY_APPLY:
+		head->hmd->active_rendering_mode_index = d.target;
+		xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)d.target);
+		comp_gl_compositor_request_display_mode(&c->base.base, d.want_3d);
+		break;
+	case U_RENDERING_MODE_KEY_REFUSED:
+		u_rendering_modes_log_key_refused(&head->rendering_modes[d.target], c->mode_fill_views);
+		break;
+	case U_RENDERING_MODE_KEY_HARDWARE_ONLY: comp_gl_compositor_request_display_mode(&c->base.base, d.want_3d); break;
+	case U_RENDERING_MODE_KEY_NOTHING:
+	default: break;
+	}
+}
+#endif
+
 /*!
  * The frame path proper. Runs with c->mutex HELD — see the locking wrapper
  * below. Keeps its early returns, which is why the lock lives in the wrapper.
@@ -8018,58 +8053,21 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	// finds it off.
 	glDisable(GL_FRAMEBUFFER_SRGB);
 
-	// Runtime-side 2D/3D toggle from qwerty V key
+	// Runtime mode keys (ADR-065): V toggles 2D <-> 3D, '0' / '1' select mode
+	// 0 / 1. One path for both (u_rendering_modes_decide_key).
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	if (c->xsysd != NULL) {
 		bool force_2d = false;
-		bool toggled = qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d);
-		if (toggled) {
-			struct xrt_device *head = c->xsysd->static_roles.head;
-			bool key_ok = true;
-			if (head != NULL && head->hmd != NULL &&
-			    head->rendering_mode_count >= U_RENDERING_MODES_RUNTIME_COUNT) {
-				// ADR-065: V toggles mode 0 <-> mode 1, decided from the mode the
-				// device is in NOW rather than from qwerty's own flag (which a
-				// session that began in 2D, or moved by an app request, would have
-				// out of phase). The 3D mode is always index 1: no "last 3D mode".
-				const uint32_t target =
-				    u_rendering_modes_toggle_target(head->rendering_modes, head->rendering_mode_count,
-				                                    head->hmd->active_rendering_mode_index);
-				// #1499 on the key path: never into a mode this session cannot fill.
-				key_ok = u_rendering_modes_key_target_allowed(
-				    head->rendering_modes, head->rendering_mode_count, target, c->mode_fill_views);
-				if (key_ok) {
-					force_2d = (target == U_RENDERING_MODE_2D);
-					head->hmd->active_rendering_mode_index = target;
-					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target);
-				} else {
-					u_rendering_modes_log_key_refused(&head->rendering_modes[target],
-					                                  c->mode_fill_views);
-				}
-			}
-			if (key_ok) {
-				comp_gl_compositor_request_display_mode(&c->base.base, !force_2d);
-			}
+		if (qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d)) {
+			gl_apply_mode_key(c, true, -1, force_2d);
 		}
 
-		// Rendering mode change from the qwerty 0/1 keys (ADR-065).
-		// Legacy apps only support V toggle — skip direct mode selection.
+		// Legacy apps (no XR_DXR_display_info) only support the V toggle
+		// between mode 0 (2D) and mode 1 (3D) — skip direct mode selection.
 		if (!c->legacy_app_tile_scaling) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
-				struct xrt_device *head = c->xsysd->static_roles.head;
-				if (head != NULL && render_mode >= 0 &&
-				    !u_rendering_modes_key_target_allowed(head->rendering_modes,
-				                                          head->rendering_mode_count,
-				                                          (uint32_t)render_mode, c->mode_fill_views)) {
-					// #1499 on the key path: '1' never moves a session into a mode it cannot fill.
-					if ((uint32_t)render_mode < head->rendering_mode_count) {
-						u_rendering_modes_log_key_refused(&head->rendering_modes[render_mode],
-						                                  c->mode_fill_views);
-					}
-				} else if (head != NULL) {
-					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
-				}
+				gl_apply_mode_key(c, false, render_mode, false);
 			}
 		}
 	}

@@ -158,6 +158,84 @@ u_rendering_modes_key_target_allowed(const struct xrt_rendering_mode *modes,
 	return fill_views == 0 || modes[target].view_count <= fill_views;
 }
 
+//! What a runtime mode key (ADR-065: V toggles, '0' / '1' select) does.
+enum u_rendering_mode_key_action
+{
+	//! Nothing: no key, or a selected index the table does not have.
+	U_RENDERING_MODE_KEY_NOTHING = 0,
+	//! Move the device to `target` (write the active index, pass it to the
+	//! driver as OUTPUT_MODE) and request the hardware state `want_3d`.
+	U_RENDERING_MODE_KEY_APPLY = 1,
+	//! The session cannot fill `target` (#1499): log it, change nothing.
+	U_RENDERING_MODE_KEY_REFUSED = 2,
+	//! No two-mode table to move within (no head, or fewer than two modes):
+	//! only request the hardware state `want_3d`.
+	U_RENDERING_MODE_KEY_HARDWARE_ONLY = 3,
+};
+
+//! The decision behind one mode key, see @ref u_rendering_modes_decide_key.
+struct u_rendering_mode_key_decision
+{
+	enum u_rendering_mode_key_action action;
+	//! The mode to land (APPLY) or the one refused (REFUSED); always < count.
+	uint32_t target;
+	//! The hardware state to request (APPLY, HARDWARE_ONLY).
+	bool want_3d;
+};
+
+/*!
+ * THE decision behind the runtime's mode keys, V and '0' / '1' alike
+ * (ADR-065: "V toggles, 0 and 1 select, on every platform and every driver").
+ *
+ * The two key kinds differ only in how they pick the target: V from the mode
+ * the device is in now (@ref u_rendering_modes_toggle_target), a digit by
+ * naming it. Everything after that is one path, so a digit does exactly what V
+ * does for the same target: the #1499 fill check, the active-index write the
+ * state tracker turns into XrEventDataRenderingModeChangedDXR, the OUTPUT_MODE
+ * property for a driver that implements it, and the hardware 2D/3D request
+ * that a driver which does NOT implement OUTPUT_MODE needs to switch at all.
+ * (Before this, a digit only set OUTPUT_MODE, so on such a driver it did
+ * nothing.)
+ *
+ * @param modes, count    the head device's table (NULL / 0 when there is none).
+ * @param active          the device's active index.
+ * @param toggle          true for V; false for a digit.
+ * @param selected        the digit's mode (0 or 1); ignored for V; < 0 = none.
+ * @param qwerty_force_2d qwerty's own V flag, used only when there is no table.
+ * @param fill_views      the session's fill limit, 0 = none (#1499).
+ */
+static inline struct u_rendering_mode_key_decision
+u_rendering_modes_decide_key(const struct xrt_rendering_mode *modes,
+                             uint32_t count,
+                             uint32_t active,
+                             bool toggle,
+                             int32_t selected,
+                             bool qwerty_force_2d,
+                             uint32_t fill_views)
+{
+	struct u_rendering_mode_key_decision d = {U_RENDERING_MODE_KEY_NOTHING, 0, false};
+	if (!toggle && (selected < 0 || (uint32_t)selected > U_RENDERING_MODE_3D)) {
+		return d;
+	}
+	if (modes == NULL || count < U_RENDERING_MODES_RUNTIME_COUNT) {
+		d.action = U_RENDERING_MODE_KEY_HARDWARE_ONLY;
+		d.want_3d = toggle ? !qwerty_force_2d : ((uint32_t)selected == U_RENDERING_MODE_3D);
+		return d;
+	}
+	const uint32_t target = toggle ? u_rendering_modes_toggle_target(modes, count, active) : (uint32_t)selected;
+	if (target >= count || target >= XRT_MAX_RENDERING_MODES) {
+		return d;
+	}
+	d.target = target;
+	if (!u_rendering_modes_key_target_allowed(modes, count, target, fill_views)) {
+		d.action = U_RENDERING_MODE_KEY_REFUSED;
+		return d;
+	}
+	d.action = U_RENDERING_MODE_KEY_APPLY;
+	d.want_3d = (target != U_RENDERING_MODE_2D);
+	return d;
+}
+
 //! What @ref u_rendering_modes_trim did.
 enum u_rendering_modes_trim_result
 {

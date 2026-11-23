@@ -24571,6 +24571,55 @@ svc_share_tap_commit(struct d3d11_service_system *sys,
 	}
 }
 
+#ifdef XRT_BUILD_DRIVER_QWERTY
+/*!
+ * One path for the runtime's mode keys on the direct (non-workspace) service
+ * route (ADR-065): V (@p toggle) and '0' / '1' (@p selected). A digit does
+ * exactly what V does for the same target — the #1499 check against the R this
+ * client's projection layers carry, then the render-thread transition, which
+ * asks the DP for the hardware state FIRST and only then writes the index,
+ * OUTPUT_MODE and the tile layout and broadcasts the events (#961 / #966).
+ * Before, a digit only set OUTPUT_MODE and broadcast what the device then
+ * reported, so on a driver that does not implement OUTPUT_MODE it did nothing.
+ */
+static void
+service_apply_mode_key(struct d3d11_service_system *sys,
+                       struct d3d11_service_compositor *c,
+                       bool toggle,
+                       int selected,
+                       bool qwerty_force_2d)
+{
+	struct xrt_device *head = sys->xsysd->static_roles.head;
+	if (head == nullptr || head->hmd == NULL) {
+		return;
+	}
+	// V toggles from the mode it will land in when a transition is still
+	// queued for the render thread (F5), so a second press toggles back.
+	const uint32_t queued = sys->queued_mode_target_plus1.load(std::memory_order_acquire);
+	const uint32_t from_idx = queued != 0 ? queued - 1 : head->hmd->active_rendering_mode_index;
+	const struct u_rendering_mode_key_decision d =
+	    u_rendering_modes_decide_key(head->rendering_modes, head->rendering_mode_count, from_idx, toggle,
+	                                 (int32_t)selected, qwerty_force_2d, c->mode_fill_views_seen);
+	switch (d.action) {
+	case U_RENDERING_MODE_KEY_APPLY:
+		if (sys->workspace_mode && sys->multi_comp != nullptr) { // #961: acked flip needs the render thread
+			multi_compositor_request_mode_flip(sys, d.target, /*origin=*/-1);
+		} else {
+			// #961: runtime-initiated (key) — DP first, events after. #966: applied by the render thread.
+			(void)service_request_mode_transition(sys, c, d.target, d.want_3d, /*skip_dp*/ false,
+			                                      toggle ? "qwerty_v" : "qwerty_digit");
+		}
+		break;
+	case U_RENDERING_MODE_KEY_REFUSED:
+		u_rendering_modes_log_key_refused(&head->rendering_modes[d.target], c->mode_fill_views_seen);
+		break;
+	case U_RENDERING_MODE_KEY_HARDWARE_ONLY: // no two-mode table: the service never acted on one
+	case U_RENDERING_MODE_KEY_NOTHING:
+	default: break;
+	}
+}
+#endif
+
 static xrt_result_t
 compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -25193,42 +25242,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	if (sys->xsysd != NULL && !bridge_live && !sys->workspace_mode) {
 		bool force_2d = false;
-		bool toggled = qwerty_check_display_mode_toggle(
-		    sys->xsysd->xdevs, sys->xsysd->xdev_count, &force_2d);
-		if (toggled) {
-			struct xrt_device *head = sys->xsysd->static_roles.head;
-			if (head != nullptr && head->hmd != NULL &&
-			    head->rendering_mode_count >= U_RENDERING_MODES_RUNTIME_COUNT) {
-				// ADR-065: V toggles mode 0 <-> mode 1, decided from the mode the
-				// device is in now (qwerty's own flag can be out of phase with a
-				// mode an app or the session-begin floor chose) - or, when a
-				// transition is still queued for the render thread (F5), from the
-				// mode it will land in, so a second press toggles back.
-				const uint32_t queued = sys->queued_mode_target_plus1.load(std::memory_order_acquire);
-				const uint32_t from_idx =
-				    queued != 0 ? queued - 1 : head->hmd->active_rendering_mode_index;
-				const uint32_t target_idx = u_rendering_modes_toggle_target(
-				    head->rendering_modes, head->rendering_mode_count, from_idx);
-				// #1499 on the key path: not into a mode the client cannot fill.
-				if (!u_rendering_modes_key_target_allowed(head->rendering_modes,
-				                                          head->rendering_mode_count, target_idx,
-				                                          c->mode_fill_views_seen)) {
-					u_rendering_modes_log_key_refused(&head->rendering_modes[target_idx],
-					                                  c->mode_fill_views_seen);
-				} else {
-					force_2d = (target_idx == U_RENDERING_MODE_2D);
-
-					if (sys->workspace_mode &&
-					    sys->multi_comp != nullptr) { // #961: acked flip needs the render thread
-						multi_compositor_request_mode_flip(sys, target_idx, /*origin=*/-1);
-					} else {
-						// #961: runtime-initiated (V key) — DP first, events after.
-						// #966: applied by the render thread.
-						(void)service_request_mode_transition(sys, c, target_idx, !force_2d,
-						                                      /*skip_dp*/ false, "qwerty_v");
-					}
-				} // key allowed
-			}
+		if (qwerty_check_display_mode_toggle(sys->xsysd->xdevs, sys->xsysd->xdev_count, &force_2d)) {
+			service_apply_mode_key(sys, c, true, -1, force_2d);
 		}
 
 		// Rendering mode change from the qwerty 0/1 keys (disabled for legacy apps).
@@ -25243,29 +25258,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// the mode the lease moved to is TOLD (the #1499 observation WARN in
 		// oxr_session.c's XRT_SESSION_EVENT_RENDERING_MODE_CHANGE arm) and never
 		// silently clamped; it is not given a veto over the other clients' display.
-		// ADR-065 narrows that for the keys only: V and '1' are applied on behalf
+		// ADR-065 narrows that for the keys only: V, '0' and '1' are applied on behalf
 		// of the committing client, and with {2D, a 4-view kind} they no longer
 		// move the panel into a mode that client's view configuration (R, read off
 		// its projection layers) cannot fill. Requests and the lease are unchanged.
 		if (!sys->base.info.legacy_app_tile_scaling) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(sys->xsysd->xdevs, sys->xsysd->xdev_count, &render_mode)) {
-				struct xrt_device *head = sys->xsysd->static_roles.head;
-				if (head != NULL && head->hmd != NULL && render_mode >= 0 &&
-				    !u_rendering_modes_key_target_allowed(
-				        head->rendering_modes, head->rendering_mode_count, (uint32_t)render_mode,
-				        c->mode_fill_views_seen)) {
-					// #1499 on the key path: '1' never into a mode the client cannot fill.
-					if ((uint32_t)render_mode < head->rendering_mode_count) {
-						u_rendering_modes_log_key_refused(&head->rendering_modes[render_mode],
-						                                  c->mode_fill_views_seen);
-					}
-				} else if (head != NULL && head->hmd != NULL) {
-					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
-					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
-					broadcast_rendering_mode_change(sys, head, prev_idx,
-					                                head->hmd->active_rendering_mode_index);
-				}
+				service_apply_mode_key(sys, c, false, render_mode, false);
 			}
 		}
 	}

@@ -770,3 +770,84 @@ TEST_CASE("F4: the V / 1 key target is refused when the session cannot fill mode
 	CHECK_FALSE(u_rendering_modes_key_target_allowed(quad.data(), 2, 2, 2));
 	CHECK(u_rendering_modes_key_target_allowed(nullptr, 0, 1, 2));
 }
+
+/*
+ * ADR-065: "V toggles, 0 and 1 select, on every platform and every driver". On
+ * a driver that does not implement OUTPUT_MODE the digits used to do nothing:
+ * they only set the property, while V wrote the active index and asked for the
+ * hardware switch itself. u_rendering_modes_decide_key is now the one decision
+ * both key kinds go through, so a digit must decide exactly what V decides for
+ * the same target.
+ */
+TEST_CASE("keys: V and the digit for the same target decide the same thing", "[u_rendering_modes][keys]")
+{
+	const std::vector<xrt_rendering_mode> vendor = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D"),
+	                                                mk(2, 0.5f, 0.5f, true, 2, 1, "3D")};
+	for (uint32_t active = 0; active < 2; active++) {
+		const u_rendering_mode_key_decision v =
+		    u_rendering_modes_decide_key(vendor.data(), 2, active, true, -1, false, 0);
+		REQUIRE(v.action == U_RENDERING_MODE_KEY_APPLY);
+		CHECK(v.target == (active == 0 ? 1u : 0u));
+		const u_rendering_mode_key_decision digit =
+		    u_rendering_modes_decide_key(vendor.data(), 2, active, false, (int32_t)v.target, false, 0);
+		CHECK(digit.action == v.action);
+		CHECK(digit.target == v.target);
+		CHECK(digit.want_3d == v.want_3d);
+	}
+}
+
+TEST_CASE("keys: '0' goes to 2D and '1' to 3D, hardware request included", "[u_rendering_modes][keys]")
+{
+	const std::vector<xrt_rendering_mode> vendor = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D"),
+	                                                mk(2, 0.5f, 0.5f, true, 2, 1, "3D")};
+	u_rendering_mode_key_decision d = u_rendering_modes_decide_key(vendor.data(), 2, 1, false, 0, false, 0);
+	CHECK(d.action == U_RENDERING_MODE_KEY_APPLY);
+	CHECK(d.target == 0);
+	CHECK_FALSE(d.want_3d);
+	d = u_rendering_modes_decide_key(vendor.data(), 2, 0, false, 1, false, 0);
+	CHECK(d.action == U_RENDERING_MODE_KEY_APPLY);
+	CHECK(d.target == 1);
+	CHECK(d.want_3d);
+	// Selecting the mode already active is applied too (idempotent, as V's
+	// hardware request is): it re-asserts a lens that drifted.
+	d = u_rendering_modes_decide_key(vendor.data(), 2, 1, false, 1, false, 0);
+	CHECK(d.action == U_RENDERING_MODE_KEY_APPLY);
+	CHECK(d.want_3d);
+}
+
+TEST_CASE("keys: the #1499 fill check refuses V and '1' alike", "[u_rendering_modes][keys]")
+{
+	const std::vector<xrt_rendering_mode> quad = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D"),
+	                                              mk(4, 0.5f, 0.5f, true, 2, 2, "Quad")};
+	const u_rendering_mode_key_decision v = u_rendering_modes_decide_key(quad.data(), 2, 0, true, -1, false, 2);
+	const u_rendering_mode_key_decision one = u_rendering_modes_decide_key(quad.data(), 2, 0, false, 1, false, 2);
+	CHECK(v.action == U_RENDERING_MODE_KEY_REFUSED);
+	CHECK(one.action == U_RENDERING_MODE_KEY_REFUSED);
+	CHECK(v.target == 1);
+	CHECK(one.target == 1);
+	// '0' is always fillable; a multiview session fills the quad.
+	CHECK(u_rendering_modes_decide_key(quad.data(), 2, 1, false, 0, false, 2).action == U_RENDERING_MODE_KEY_APPLY);
+	CHECK(u_rendering_modes_decide_key(quad.data(), 2, 0, false, 1, false, 4).action == U_RENDERING_MODE_KEY_APPLY);
+}
+
+TEST_CASE("keys: no table means a hardware-only request; out-of-range digits do nothing", "[u_rendering_modes][keys]")
+{
+	// No head / one mode: V falls back to qwerty's own flag, a digit names the state.
+	u_rendering_mode_key_decision d = u_rendering_modes_decide_key(nullptr, 0, 0, true, -1, true, 0);
+	CHECK(d.action == U_RENDERING_MODE_KEY_HARDWARE_ONLY);
+	CHECK_FALSE(d.want_3d);
+	d = u_rendering_modes_decide_key(nullptr, 0, 0, true, -1, false, 0);
+	CHECK(d.want_3d);
+	const std::vector<xrt_rendering_mode> one = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D")};
+	d = u_rendering_modes_decide_key(one.data(), 1, 0, false, 1, false, 0);
+	CHECK(d.action == U_RENDERING_MODE_KEY_HARDWARE_ONLY);
+	CHECK(d.want_3d);
+
+	const std::vector<xrt_rendering_mode> vendor = {mk(1, 1.0f, 1.0f, false, 1, 1, "2D"),
+	                                                mk(2, 0.5f, 0.5f, true, 2, 1, "3D")};
+	CHECK(u_rendering_modes_decide_key(vendor.data(), 2, 0, false, -1, false, 0).action ==
+	      U_RENDERING_MODE_KEY_NOTHING);
+	CHECK(u_rendering_modes_decide_key(vendor.data(), 2, 0, false, 2, false, 0).action ==
+	      U_RENDERING_MODE_KEY_NOTHING);
+	CHECK(u_rendering_modes_decide_key(nullptr, 0, 0, false, 5, false, 0).action == U_RENDERING_MODE_KEY_NOTHING);
+}
