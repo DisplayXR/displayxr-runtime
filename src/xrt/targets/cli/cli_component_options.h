@@ -40,6 +40,7 @@ extern "C" {
 struct target_component_class;
 struct target_component_setting_desc;
 struct xrt_component_license_state;
+struct xrt_component_setting_status;
 struct cJSON;
 
 //! One component class, as the shared verbs see it.
@@ -73,9 +74,25 @@ struct cli_component_class
 	                struct xrt_component_license_state *out_state,
 	                char *err,
 	                size_t err_cap);
+	/*!
+	 * Whether the value in force of each of @p keys takes effect on this
+	 * machine (`xrt_component_get_setting_status_fn_t`): fill @p out[i] for
+	 * @p keys[i], one load of the component for the whole list. NULL = the
+	 * class has no such slot yet (every setting reads `unknown`).
+	 */
+	bool (*setting_status)(const char *id,
+	                       const char *const *keys,
+	                       int count,
+	                       struct xrt_component_setting_status *out);
 };
 
-//! `<class> options <id> [--json]`: every declared / stored key with type, default, value and source.
+/*!
+ * `<class> options <id> [--json]`: every declared / stored key with type,
+ * default, value and source, plus — when the component reports it through
+ * @ref cli_component_class::setting_status — whether the value in force
+ * takes effect here (`status`: `applies | not_supported | restart_required |
+ * unknown`, the value used instead, the component's note).
+ */
 int
 cli_component_options(const struct cli_component_class *k, const char *id, bool json);
 

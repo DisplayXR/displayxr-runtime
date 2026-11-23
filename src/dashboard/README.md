@@ -353,8 +353,17 @@ lines, the scope and command-line notes, the catalog detail and the removal sent
   The four-view kind carries "For checking four-view apps. Most apps show only two of the views, or
   stay in 2D." under the control while it is in force. The CLI's JSON has no per-value view count
   (and the status snapshot only the kind in force), so this is keyed on the value name `quad`.
-- **Under the block**: "Changes apply the next time a 3D app starts. Apps that are already running,
-  and DisplayXR in the background, keep what they started with."
+- **Under the block**: "Changes apply the next time a 3D app starts; apps already running keep what
+  they started with. Apps that run through DisplayXR in the background (the browser, shell apps) pick
+  up a change only after DisplayXR restarts." The service hosts those apps and read the settings when it
+  started. The Dashboard has no "restart DisplayXR" action yet, so the sentence says it instead of a button.
+- **Not supported here**: when the driver reports (`dp options --json` `status`, its
+  `get_setting_status` slot) that the value in force cannot take effect on this PC, the row keeps its
+  control editable and adds a warning chip "Not supported here" (tooltip: the driver's note), the
+  driver's note under it ("This display driver can't use this value on this PC. …" when it gives none),
+  "Using: <the value used instead, in the row's own words>", and "Now:" becomes "Chosen:". A
+  `restart_required` status is an info chip "Takes effect after a restart". `applies` / `unknown`
+  (or a CLI without `status`) show nothing new.
 - **Accessible names**: each control `<label>: <driver>` (a two-way choice's buttons
   `<label> <choice>: <driver>`, Apply `Apply <label>: <driver>`), the reset `Use the default for
   <label>: <driver>`.

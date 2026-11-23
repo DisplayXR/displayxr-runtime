@@ -28,7 +28,9 @@
  *   dp options <id> [--json]
  *                      The plug-in's settings: declared (describe_settings /
  *                      manifest settings_schema) + stored, with the effective
- *                      value and its source (N3c, ADR-054 decision 7).
+ *                      value and its source (N3c, ADR-054 decision 7), and
+ *                      whether that value takes effect here when the plug-in
+ *                      reports it (get_setting_status).
  *   dp set <id> <KEY> <value> [--machine] / dp unset <id> <KEY> [--machine]
  *                      `Settings\<KEY>` on the plug-in's row: HKCU by default,
  *                      HKLM with --machine (POSIX: the per-user
@@ -501,6 +503,7 @@ cmd_options_verbs(int argc, const char **argv)
 	    .note_pickup = note_settings_pickup,
 	    .posix_machine_hint = "the manifest's \"settings\" object (NNN-<id>.json in the DisplayProcessors dir)",
 	    .activate = dp_activate,
+	    .setting_status = target_plugin_setting_status,
 	};
 	return cli_component_options_dispatch(&k, argc, argv);
 }
