@@ -186,9 +186,35 @@ public static class StatusText
         });
     }
 
-    /// <summary><c>2 displays · 2 recognised as 3D displays · 2 see you</c>: the Displays caption.</summary>
-    public static string DisplaysSummary(StatusSnapshot s) =>
-        $"{Plural(s.Screens.Count, "display", "displays")}{Sep}{Claimed(s)} recognised as 3D{Sep}{Tracking(s)} {(Tracking(s) == 1 ? "sees" : "see")} you";
+    /// <summary>
+    /// The Displays caption. Never a zero count; one display is said in words; whether a display sees you
+    /// is "not known yet" while no app draws on it (no live state, <see cref="Verdicts.SeesYou"/>):
+    /// <c>One display, recognised as 3D · whether it sees you is not known yet</c>,
+    /// <c>2 displays · 2 recognised as 3D · 2 see you</c>.
+    /// </summary>
+    public static string DisplaysSummary(StatusSnapshot s)
+    {
+        var claimed = s.Screens.Where(x => x.Claim.IsClaimed).ToList();
+        if (s.Screens.Count == 0) return "No display found";
+        if (s.Screens.Count == 1)
+        {
+            var one = s.Screens[0];
+            if (!one.Claim.IsClaimed) return "One display, not a 3D display";
+            return "One display, recognised as 3D" + Sep + Verdicts.SeesYou(s, one) switch
+            {
+                Tick.Yes => "it sees you",
+                Tick.No => "it doesn't see you right now",
+                _ => "whether it sees you is not known yet",
+            };
+        }
+        var parts = new List<string> { Plural(s.Screens.Count, "display", "displays") };
+        if (claimed.Count == 0) { parts.Add("no 3D display recognised"); return string.Join(Sep, parts); }
+        parts.Add($"{claimed.Count} recognised as 3D");
+        int seeing = claimed.Count(x => Verdicts.SeesYou(s, x) == Tick.Yes);
+        if (seeing > 0) parts.Add($"{seeing} {(seeing == 1 ? "sees" : "see")} you");
+        else if (!claimed.Any(x => Verdicts.IsLive(s, x))) parts.Add($"whether {(claimed.Count == 1 ? "it sees" : "they see")} you is not known yet");
+        return string.Join(Sep, parts);
+    }
 
     public static string Scale(double scale) => $"{Times}{N(scale <= 0 ? 1 : scale)}";
 

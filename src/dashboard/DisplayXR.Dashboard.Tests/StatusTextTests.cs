@@ -99,7 +99,6 @@ public class StatusTextTests
         Assert.Equal("Doesn't see you right now", StatusText.PlainTracking("NOT_TRACKING"));
         Assert.Null(StatusText.PlainTracking("NO_DP"));
         Assert.Equal("Display maker's software: ready · calibrated", StatusText.PlainVendorLine(a));
-        Assert.Equal("2 displays · 2 recognised as 3D · 2 see you", StatusText.DisplaysSummary(Design));
         foreach (var line in new[] { StatusText.PlainIdentity(a), StatusText.PlainClaimLine(a), StatusText.PlainStateLine(a) })
         {
             Assert.DoesNotContain("DISPLAY1", line);
@@ -108,6 +107,27 @@ public class StatusTextTests
         }
         // The technical lines are still what Copy writes.
         Assert.Contains(StatusText.ClaimLine(a), StatusText.Copy(Design));
+    }
+
+    [Fact]
+    public void DisplaysCaption_NoZeroCounts_OneInWords_NotKnownWithoutLiveState()
+    {
+        Assert.Equal("2 displays · 2 recognised as 3D · 2 see you", StatusText.DisplaysSummary(Design));
+        var a = Design.Screens[0];
+        Assert.Equal("One display, recognised as 3D · it sees you", StatusText.DisplaysSummary(Design with { Screens = new[] { a } }));
+        var idle = a with { Dps = System.Array.Empty<ScreenDp>(), EyeTracking = a.EyeTracking with { State = "NO_DP" } };
+        Assert.Equal("One display, recognised as 3D · whether it sees you is not known yet", StatusText.DisplaysSummary(Design with { Screens = new[] { idle } }));
+        var lost = a with { EyeTracking = a.EyeTracking with { State = "NOT_TRACKING" } };
+        Assert.Equal("One display, recognised as 3D · it doesn't see you right now", StatusText.DisplaysSummary(Design with { Screens = new[] { lost } }));
+        var flat = idle with { Claim = idle.Claim with { PluginId = null, Confidence = "NONE" } };
+        Assert.Equal("One display, not a 3D display", StatusText.DisplaysSummary(Design with { Screens = new[] { flat } }));
+        Assert.Equal("2 displays · no 3D display recognised", StatusText.DisplaysSummary(Design with { Screens = new[] { flat, flat with { Id = "b" } } }));
+        Assert.Equal("2 displays · 1 recognised as 3D · whether it sees you is not known yet", StatusText.DisplaysSummary(Design with { Screens = new[] { idle, flat } }));
+        Assert.Equal("No display found", StatusText.DisplaysSummary(Design with { Screens = System.Array.Empty<Screen>() }));
+        var headless = Design with { Source = "headless" };
+        Assert.Equal("2 displays · 2 recognised as 3D · whether they see you is not known yet", StatusText.DisplaysSummary(headless));
+        foreach (var snap in new[] { Design with { Screens = new[] { idle } }, Design with { Screens = new[] { idle, flat } }, headless })
+            Assert.DoesNotContain(" 0 ", " " + StatusText.DisplaysSummary(snap) + " ");
     }
 
     [Fact]

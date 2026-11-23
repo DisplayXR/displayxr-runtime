@@ -32,7 +32,12 @@ public sealed class HomePage : Page
         {
             var s = Ctx.Feed.Snapshot;
             string v = s?.Runtime.Version is { Length: > 0 } ver ? $"DisplayXR {ver}" : "DisplayXR";
-            return s is null ? v : $"{v}{StatusText.Sep}{StatusText.Plural(s.Screens.Count, "display", "displays")}{StatusText.Sep}{StatusText.Plural(s.Plugins.Count, "display driver", "display drivers")}";
+            if (s is null) return v;
+            // Never a zero count: a part with nothing to count is left out.
+            var parts = new System.Collections.Generic.List<string> { v };
+            if (s.Screens.Count > 0) parts.Add(StatusText.Plural(s.Screens.Count, "display", "displays"));
+            if (s.Plugins.Count > 0) parts.Add(StatusText.Plural(s.Plugins.Count, "display driver", "display drivers"));
+            return string.Join(StatusText.Sep, parts);
         }
     }
 
