@@ -17,7 +17,8 @@ using DisplayXR.Dashboard.Ui;
 namespace DisplayXR.Dashboard.Pages;
 
 /// <summary>
-/// Developer: the read-only "Developer settings" list of every Tier 1 / Tier 2
+/// Troubleshooting > Advanced (was the Developer page, page id "developer"): the "Current values"
+/// table (moved from Settings), the read-only "Developer settings" list of every Tier 1 / Tier 2
 /// runtime lever (perf-settings Phase 2A, <c>perf list --all --json</c>) and
 /// the dashboard's own diagnostics (log path, CLI path, feed state). The display
 /// processor is chosen per screen on Displays; a machine-wide PreferredPlugin
@@ -26,7 +27,7 @@ namespace DisplayXR.Dashboard.Pages;
 /// </summary>
 public sealed class DeveloperPage : Page
 {
-    public DeveloperPage() : base("developer", "Developer") { }
+    public DeveloperPage() : base("developer", "Advanced") { }
 
     // Developer settings: collapsed on every launch (design §3: it does not
     // persist), read only while expanded. The filters live outside Key() and are
@@ -41,12 +42,20 @@ public sealed class DeveloperPage : Page
 
     public override bool HoldsFeed => false;
 
-    public override string Caption => "Every Tier 1 and Tier 2 runtime lever (read-only) and this dashboard's own diagnostics.";
+    public override string Caption => "Every runtime setting by its variable name, and this dashboard's own diagnostics. For developers and support.";
+
+    public override void OnRefresh()
+    {
+        _ = Ctx.LoadDpAsync(force: true);
+        _ = Ctx.LoadPerfAsync(force: true);
+        if (Ctx.PerfAllWanted) _ = Ctx.LoadPerfAllAsync(force: true);
+    }
 
     public override void OnShown()
     {
         _ = Ctx.LoadDpAsync(maxAge: TimeSpan.FromMinutes(1));
         if (_devOpen) _ = Ctx.LoadPerfAllAsync(force: false);
+        _ = Ctx.LoadPerfAsync(force: false); // "Current values"
     }
 
     protected override string Key()
@@ -55,7 +64,8 @@ public sealed class DeveloperPage : Page
         sb.Append(Ctx.ActionRunning).Append('|').Append(Ctx.LastActionArea).Append(Ctx.LastAction).Append('|')
           .Append(Ctx.DpError).Append('|').Append(Ctx.Feed.Mode).Append('|').Append(Ctx.Feed.ChildStarts).Append('|')
           .Append(DashboardLog.ErrorCount).Append('|').Append(Ctx.Feed.Snapshot?.Source);
-        sb.Append(Ctx.Dp?.Preferred).Append('|').Append(_devOpen);
+        sb.Append(Ctx.Dp?.Preferred).Append('|').Append(_devOpen).Append('|').Append(Ctx.PerfError);
+        if (Ctx.Perf is { } perf) foreach (var l in perf.Levers) sb.Append(l).Append(';');
         if (_devOpen)
         {
             sb.Append('|').Append(Ctx.PerfAllLoading).Append('|').Append(Ctx.PerfAllError).Append('|');
@@ -74,6 +84,7 @@ public sealed class DeveloperPage : Page
         if (OverrideNotice() is { } notice) page.Children.Add(notice);
         var grid = new U.CardGrid(2) { MinColumnWidth = 440 };
         grid.Add(DevSettingsCard(), span: 2);
+        grid.Add(CurrentValuesCard.Build(Ctx.Perf, Ctx.PerfError));
         grid.Add(DiagnosticsCard());
         page.Children.Add(grid);
         return page;

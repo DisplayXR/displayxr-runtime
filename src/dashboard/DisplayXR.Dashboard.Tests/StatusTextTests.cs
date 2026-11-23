@@ -96,10 +96,13 @@ public class StatusTextTests
         Assert.Equal("Recognised as a 3D display · display driver: leia-sr", StatusText.PlainClaimLine(a));
         Assert.StartsWith("Not recognised as a 3D display", StatusText.PlainClaimLine(a with { Claim = a.Claim with { PluginId = null } }));
         Assert.Equal("Sees you · 3D on · used by 1 app", StatusText.PlainStateLine(a));
+        var idle = a with { Dps = System.Array.Empty<ScreenDp>(), Mode = null, EyeTracking = a.EyeTracking with { State = "NO_DP" }, Vendor = a.Vendor with { Lens = "UNKNOWN" } };
+        Assert.Equal("3D turns on when a 3D app runs.", StatusText.PlainStateLine(idle)); // as on Home
+        Assert.Equal("Ordinary 2D display", StatusText.PlainStateLine(idle with { Claim = idle.Claim with { PluginId = null, Confidence = "NONE" } }));
+        Assert.StartsWith("tracking unknown", StatusText.StateLine(idle with { EyeTracking = idle.EyeTracking with { State = "UNKNOWN" } })); // the technical line stays
         Assert.Equal("Doesn't see you right now", StatusText.PlainTracking("NOT_TRACKING"));
         Assert.Null(StatusText.PlainTracking("NO_DP"));
         Assert.Equal("Display maker's software: ready · calibrated", StatusText.PlainVendorLine(a));
-        Assert.Equal("2 displays · 2 recognised as 3D · 2 see you", StatusText.DisplaysSummary(Design));
         foreach (var line in new[] { StatusText.PlainIdentity(a), StatusText.PlainClaimLine(a), StatusText.PlainStateLine(a) })
         {
             Assert.DoesNotContain("DISPLAY1", line);
@@ -108,6 +111,42 @@ public class StatusTextTests
         }
         // The technical lines are still what Copy writes.
         Assert.Contains(StatusText.ClaimLine(a), StatusText.Copy(Design));
+    }
+
+    [Fact]
+    public void DisplaysCaption_NoZeroCounts_OneInWords_NotKnownWithoutLiveState()
+    {
+        Assert.Equal("2 displays · 2 recognised as 3D · 2 see you", StatusText.DisplaysSummary(Design));
+        var a = Design.Screens[0];
+        Assert.Equal("One display, recognised as 3D · it sees you", StatusText.DisplaysSummary(Design with { Screens = new[] { a } }));
+        var idle = a with { Dps = System.Array.Empty<ScreenDp>(), EyeTracking = a.EyeTracking with { State = "NO_DP" } };
+        Assert.Equal("One display, recognised as 3D · whether it sees you is not known yet", StatusText.DisplaysSummary(Design with { Screens = new[] { idle } }));
+        var lost = a with { EyeTracking = a.EyeTracking with { State = "NOT_TRACKING" } };
+        Assert.Equal("One display, recognised as 3D · it doesn't see you right now", StatusText.DisplaysSummary(Design with { Screens = new[] { lost } }));
+        var flat = idle with { Claim = idle.Claim with { PluginId = null, Confidence = "NONE" } };
+        Assert.Equal("One display, not a 3D display", StatusText.DisplaysSummary(Design with { Screens = new[] { flat } }));
+        Assert.Equal("2 displays · no 3D display recognised", StatusText.DisplaysSummary(Design with { Screens = new[] { flat, flat with { Id = "b" } } }));
+        Assert.Equal("2 displays · 1 recognised as 3D · whether it sees you is not known yet", StatusText.DisplaysSummary(Design with { Screens = new[] { idle, flat } }));
+        Assert.Equal("No display found", StatusText.DisplaysSummary(Design with { Screens = System.Array.Empty<Screen>() }));
+        var headless = Design with { Source = "headless" };
+        Assert.Equal("2 displays · 2 recognised as 3D · whether they see you is not known yet", StatusText.DisplaysSummary(headless));
+        foreach (var snap in new[] { Design with { Screens = new[] { idle } }, Design with { Screens = new[] { idle, flat } }, headless })
+            Assert.DoesNotContain(" 0 ", " " + StatusText.DisplaysSummary(snap) + " ");
+    }
+
+    [Fact]
+    public void SettingsNotice_NamesSettingsNotVariables()
+    {
+        var perf = new PerfState("", "", new[]
+        {
+            new PerfLever("DXR_FRAME_WITNESS", "5", "user"), new PerfLever("DXR_D3D_FORCE_GPU", "dgpu", "user"),
+            new PerfLever("DXR_VK_FORCE_GPU", "dgpu", "user"), new PerfLever("DXR_WEAVE_REPAINT", null, "default"),
+            new PerfLever("DXR_SOMETHING_NEW", "1", "env"),
+        });
+        Assert.Equal(new[] { "Graphics card for 3D apps", "Detailed logging", "Other settings" }, StatusText.ChangedSettings(perf));
+        Assert.Equal("Compatibility mode", StatusText.PlainSettingName("DXR_WEAVE_ON_SCANOUT"));
+        Assert.Null(StatusText.PlainSettingName("DXR_SOMETHING_NEW"));
+        Assert.All(StatusText.ChangedSettings(perf), n => Assert.DoesNotContain("DXR", n));
     }
 
     [Fact]
@@ -130,18 +169,6 @@ public class StatusTextTests
         Assert.Equal("Needs the display maker's software", StatusText.PlainPlatform("PLATFORM_ABSENT"));
         Assert.Equal("Its display is not connected", StatusText.PlainPlatform("NO_DISPLAY"));
         Assert.Equal("Not ready (SOMETHING_NEW)", StatusText.PlainPlatform("SOMETHING_NEW"));
-    }
-
-    [Fact]
-    public void HomeLine_OnlyWithSeveralScreensOrAWarning()
-    {
-        Assert.Equal("2 3D displays · 2 see you · 1 thing to check", StatusText.HomeLine(Design));
-        var one = Design with { Screens = new[] { Design.Screens[0] } };
-        Assert.Null(StatusText.HomeLine(one));
-        var oneInfo = Design with { Screens = new[] { WithWarnings(Design.Screens[0], new StatusWarning("CLAIM_EDID_ONLY", WarningLevel.Info, "")) } };
-        Assert.Null(StatusText.HomeLine(oneInfo)); // info alone shows nothing new
-        var oneWarn = Design with { Screens = new[] { Design.Screens[1] } };
-        Assert.Equal("1 3D display · 1 sees you · 1 thing to check", StatusText.HomeLine(oneWarn));
     }
 
     [Fact]
@@ -328,22 +355,50 @@ public class StatusTextTests
     }
 
     [Fact]
-    public void HomeScreenDps_EffectivePerScreen()
+    public void DriverSelector_OnTheFace_OnlyWithAChoice()
+    {
+        var a = Design.Screens[0] with { Key = "k0" };
+        var one = Design with { Screens = new[] { a } };
+        var dp = new DpList(null, System.Array.Empty<DpRow>(), new[]
+        {
+            new DpScreen("k0", "", "", "leia-sr", null, null, false, "live", new[] { new DpCandidate("leia-sr", 100) }),
+        });
+        Assert.False(StatusText.DriverChoiceOnFace(a, one, dp));   // one 3D display, one driver: behind Details
+        Assert.False(StatusText.DriverChoiceOnFace(a, one, null));
+        var two = new DpList(null, System.Array.Empty<DpRow>(), new[]
+        {
+            new DpScreen("k0", "", "", "leia-sr", null, null, false, "live",
+                         new[] { new DpCandidate("leia-sr", 100), new DpCandidate("sim-display", 10) }),
+        });
+        // sim-display is the generic fallback driver ("used when no other driver fits"): not a real choice.
+        Assert.False(StatusText.DriverChoiceOnFace(a, one, two));
+        var three = new DpList(null, System.Array.Empty<DpRow>(), new[]
+        {
+            new DpScreen("k0", "", "", "leia-sr", null, null, false, "live",
+                         new[] { new DpCandidate("leia-sr", 100), new DpCandidate("other-panel", 50), new DpCandidate("sim-display", 10) }),
+        });
+        Assert.True(StatusText.DriverChoiceOnFace(a, one, three)); // two real drivers could drive it
+        Assert.True(StatusText.DriverChoiceOnFace(a, Design, dp)); // two 3D displays
+    }
+
+    [Fact]
+    public void HomeRows_EffectiveDriverPerScreen()
     {
         var a = Design.Screens[0] with { Key = "k0" };
         var b = Design.Screens[1] with { Key = "k1" };
         var snap = Design with { Screens = new[] { a, b } };
-        var fromSnapshot = StatusText.HomeScreenDps(snap, null);
-        Assert.Equal(new[] { a.Claim.PluginId, b.Claim.PluginId }, fromSnapshot.Select(d => d.Plugin));
+        var fromSnapshot = Verdicts.Rows(snap, null);
+        Assert.Equal(new[] { a.Claim.PluginId, b.Claim.PluginId }, fromSnapshot.Select(d => d.DriverId));
         var dp = new DpList(null, System.Array.Empty<DpRow>(), new[]
         {
             new DpScreen("k1", "", "", "sim-display", "sim-display", "user", true, "live"),
         });
-        var rows = StatusText.HomeScreenDps(snap, dp);
+        var rows = Verdicts.Rows(snap, dp);
         Assert.Equal(StatusText.ScreenName(b), rows[1].Name);
-        Assert.Equal("sim-display", rows[1].Plugin);
+        Assert.Equal("sim-display", rows[1].DriverId);
+        Assert.Equal("DisplayXR Sim Display", rows[1].Driver); // the name, the id is the tooltip
         Assert.Equal("Chosen by you", rows[1].Forced);
-        Assert.Equal(a.Claim.PluginId, rows[0].Plugin);
+        Assert.Equal(a.Claim.PluginId, rows[0].DriverId);
     }
 
     [Fact]

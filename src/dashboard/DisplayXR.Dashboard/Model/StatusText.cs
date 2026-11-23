@@ -171,8 +171,13 @@ public static class StatusText
         if (PlainTracking(s.EyeTracking.State) is { } t) parts.Add(t);
         if (Is3DOn(s) is { } on) parts.Add(on ? "3D on" : "3D off");
         if (s.Dps.Count > 0) parts.Add($"used by {Plural(s.Dps.Count, "app", "apps")}");
-        return parts.Count > 0 ? string.Join(Sep, parts) : "No live state yet";
+        if (parts.Count > 0) return string.Join(Sep, parts);
+        // No live state (no app draws on it): the same plain words as Home.
+        return s.Claim.IsClaimed ? IdleLine : Verdicts.Plain2D;
     }
+
+    /// <summary>A 3D display with no live state, on Home and on Displays.</summary>
+    public const string IdleLine = "3D turns on when a 3D app runs.";
 
     /// <summary>The display maker's own status in plain words, or null when its software reports none.</summary>
     public static string? PlainVendorLine(Screen s)
@@ -186,9 +191,35 @@ public static class StatusText
         });
     }
 
-    /// <summary><c>2 displays · 2 recognised as 3D displays · 2 see you</c>: the Displays caption.</summary>
-    public static string DisplaysSummary(StatusSnapshot s) =>
-        $"{Plural(s.Screens.Count, "display", "displays")}{Sep}{Claimed(s)} recognised as 3D{Sep}{Tracking(s)} {(Tracking(s) == 1 ? "sees" : "see")} you";
+    /// <summary>
+    /// The Displays caption. Never a zero count; one display is said in words; whether a display sees you
+    /// is "not known yet" while no app draws on it (no live state, <see cref="Verdicts.SeesYou"/>):
+    /// <c>One display, recognised as 3D · whether it sees you is not known yet</c>,
+    /// <c>2 displays · 2 recognised as 3D · 2 see you</c>.
+    /// </summary>
+    public static string DisplaysSummary(StatusSnapshot s)
+    {
+        var claimed = s.Screens.Where(x => x.Claim.IsClaimed).ToList();
+        if (s.Screens.Count == 0) return "No display found";
+        if (s.Screens.Count == 1)
+        {
+            var one = s.Screens[0];
+            if (!one.Claim.IsClaimed) return "One display, not a 3D display";
+            return "One display, recognised as 3D" + Sep + Verdicts.SeesYou(s, one) switch
+            {
+                Tick.Yes => "it sees you",
+                Tick.No => "it doesn't see you right now",
+                _ => "whether it sees you is not known yet",
+            };
+        }
+        var parts = new List<string> { Plural(s.Screens.Count, "display", "displays") };
+        if (claimed.Count == 0) { parts.Add("no 3D display recognised"); return string.Join(Sep, parts); }
+        parts.Add($"{claimed.Count} recognised as 3D");
+        int seeing = claimed.Count(x => Verdicts.SeesYou(s, x) == Tick.Yes);
+        if (seeing > 0) parts.Add($"{seeing} {(seeing == 1 ? "sees" : "see")} you");
+        else if (!claimed.Any(x => Verdicts.IsLive(s, x))) parts.Add($"whether {(claimed.Count == 1 ? "it sees" : "they see")} you is not known yet");
+        return string.Join(Sep, parts);
+    }
 
     public static string Scale(double scale) => $"{Times}{N(scale <= 0 ? 1 : scale)}";
 
@@ -325,16 +356,21 @@ public static class StatusText
     /// <summary>The tooltip and accessible name of the amber mark on the Home rail entry (a machine-wide driver choice).</summary>
     public const string HomeBadgeTip = "One display driver is set for every display on this PC. Home says which, and how to clear it.";
 
-    public sealed record HomeScreenDp(string Name, string? Plugin, string? Forced);
-
     /// <summary>
-    /// Home's per-screen summary: each screen's effective display processor
-    /// (dp list's resolve when read, else the snapshot's claim) and its forced chip.
+    /// Whether a display card shows its driver selector on its face rather than behind Details: when
+    /// more than one display driver can drive this display (its candidates in <c>dp list --json</c>),
+    /// or when more than one 3D display is present. The generic fallback driver (the one "used when no
+    /// other driver fits", <c>plugins[].fallback</c> in the snapshot) is not a real choice and is not
+    /// counted. Otherwise there is nothing to choose between.
     /// </summary>
-    public static IReadOnlyList<HomeScreenDp> HomeScreenDps(StatusSnapshot s, DpList? dp) =>
-        s.Screens.Select(x => new HomeScreenDp(ScreenName(x),
-            dp?.Screen(x.Key)?.EffectivePlugin ?? (x.Claim.IsClaimed ? x.Claim.PluginId : null),
-            ForcedChip(x, dp))).ToList();
+    public static bool DriverChoiceOnFace(Screen s, StatusSnapshot snap, DpList? dp)
+    {
+        if (Claimed(snap) > 1) return true;
+        var fallback = snap.Plugins.Where(p => p.Fallback).Select(p => p.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        int real = dp?.Screen(s.Key)?.Candidates?.Select(c => c.PluginId).Where(id => !fallback.Contains(id))
+                     .Distinct(StringComparer.OrdinalIgnoreCase).Count() ?? 0;
+        return real > 1;
+    }
 
     /// <summary>The CLI verb a selector choice runs.</summary>
     public static CliArgs DpVerb(string key, DpChoice choice) => choice.PluginId is null
@@ -374,18 +410,6 @@ public static class StatusText
     /// <summary>Every warn / critical the snapshot carries: per screen (vendor included) and system-wide.</summary>
     public static IEnumerable<StatusWarning> ActionableWarnings(StatusSnapshot s) =>
         s.Screens.SelectMany(ScreenWarnings).Concat(s.Warnings).Where(w => w.Level != WarningLevel.Info);
-
-    /// <summary>
-    /// Home's line (design §8, the vendor dashboard's Home rule): only with
-    /// more than one claimed screen or a warn / critical warning.
-    /// </summary>
-    public static string? HomeLine(StatusSnapshot s)
-    {
-        int claimed = Claimed(s);
-        int warnings = ActionableWarnings(s).Count();
-        if (claimed <= 1 && warnings == 0) return null;
-        return $"{Plural(claimed, "3D display", "3D displays")}{Sep}{Tracking(s)} {(Tracking(s) == 1 ? "sees" : "see")} you{Sep}{Plural(warnings, "thing", "things")} to check";
-    }
 
     /// <summary>The Displays nav badge: warn / critical only (design §8 feed discipline).</summary>
     public static NavBadge? DisplaysBadge(StatusSnapshot? s)
@@ -545,6 +569,26 @@ public static class StatusText
 
     public const string DevResetAllNote =
         "Reset all clears every lever in the per-user settings file, including the Performance page's. Environment variables and the machine default are untouched.";
+
+    /// <summary>
+    /// The Settings page's name for a setting it writes (<c>perf</c> levers), so its "changed from the
+    /// defaults" notice names no variable; null for a lever Settings does not show.
+    /// </summary>
+    public static string? PlainSettingName(string lever) => lever switch
+    {
+        "DXR_D3D_FORCE_GPU" or "DXR_VK_FORCE_GPU" => "Graphics card for 3D apps",
+        "DXR_WEAVE_ON_SCANOUT" or "DXR_WEAVE_REPAINT" => "Compatibility mode",
+        "DXR_FRAME_WITNESS" or "DXR_FRAME_STAGE_TIMING" => "Detailed logging",
+        _ => null,
+    };
+
+    /// <summary>The changed settings in plain words, once each, in the order Settings shows them ("other settings" for the rest).</summary>
+    public static IReadOnlyList<string> ChangedSettings(PerfState perf)
+    {
+        var names = perf.Levers.Where(l => l.IsSet).Select(l => PlainSettingName(l.Name) ?? "Other settings").Distinct().ToList();
+        string[] order = { "Graphics card for 3D apps", "Compatibility mode", "Detailed logging", "Other settings" };
+        return names.OrderBy(n => Array.IndexOf(order, n)).ToList();
+    }
 
     /// <summary>The chip colour of a value's source.</summary>
     public static Level DevSourceLevel(string source) => source switch

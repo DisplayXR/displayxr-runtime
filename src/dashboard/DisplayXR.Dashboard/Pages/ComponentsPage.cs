@@ -20,10 +20,10 @@ namespace DisplayXR.Dashboard.Pages;
 
 /// <summary>
 /// Components: what is plugged into the runtime, grouped by ROLE (display
-/// processors, workspace controller, present owners, input providers,
-/// viewer-tracking providers, the conversion module, a stereo camera source,
-/// diagnostics clients), never by
-/// product. Clients come from the live feed; the rest from <c>info --json</c>,
+/// processors, workspace controller, input providers, viewer-tracking providers,
+/// the conversion module and providers, a stereo camera source), never by
+/// product: what you have and what you can add. Running programs (present owners,
+/// status readers) are under Troubleshooting > Running 3D apps. Clients come from the live feed; the rest from <c>info --json</c>,
 /// read once per show and on Refresh.
 ///
 /// <para>It is also where things are added (ADR-064 step 8): each section carries the catalog
@@ -65,27 +65,17 @@ public sealed class ComponentsPage : Page
     private bool _machine;
     private string? _policyActionRow;
 
-    // Hotkey capture: the controller being captured, and the last capture's note.
-    private string? _capturing;
-    private string? _captureNote;
-    private string? _captureNoteFor;
+    // The spatial desktop's launch controls (shared with Settings), and the per-app drop-downs.
+    private WorkspaceLaunchEditor? _launchEditor;
+    private WorkspaceLaunchEditor Launch => _launchEditor ??= new WorkspaceLaunchEditor(Ctx, force => Update(force));
     private int _openDropDowns;
 
     // A rebuild would also empty the key box under the user's fingers.
-    protected override bool DeferRebuild => _capturing is not null || _openDropDowns > 0 || _keyFor is not null;
-
-    private TextBlock? _suspendNote;
-
-    /// <summary>End a capture: the hotkey hook is handed back on every exit path.</summary>
-    private void EndCapture()
-    {
-        _capturing = null;
-        Ctx.HotkeySuspend.End();
-    }
+    protected override bool DeferRebuild => Launch.Busy || _openDropDowns > 0 || _keyFor is not null;
 
     public override void OnHidden()
     {
-        if (_capturing is not null) EndCapture();
+        Launch.OnHidden();
         _tick?.Stop();
         _keyFor = null; // a half-typed key never survives leaving the page
     }
@@ -93,7 +83,7 @@ public sealed class ComponentsPage : Page
     protected override void UpdateInPlace()
     {
         // Known only after the first "on" came back: shown without a rebuild.
-        if (_suspendNote is not null) _suspendNote.IsVisible = _capturing is not null && Ctx.HotkeySuspend.Unsupported;
+        Launch.UpdateInPlace();
         if (_elapsed is not null && Ctx.CatalogOp is { } op)
             _elapsed.Text = CatalogText.Elapsed(DateTime.Now - op.Started);
     }
@@ -154,7 +144,7 @@ public sealed class ComponentsPage : Page
         NoteResult();
         var sb = new StringBuilder();
         sb.Append(Ctx.InfoLoading).Append(Ctx.InfoError).Append(string.Join(",", _expanded)).Append('|')
-          .Append(Ctx.ActionRunning).Append(_captureNoteFor).Append(_captureNote).Append('|');
+          .Append(Ctx.ActionRunning).Append(Launch.Key).Append('|');
         if (Ctx.LastActionArea == "workspace") sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed);
         foreach (var c in ComponentClasses.All)
         {
@@ -173,7 +163,7 @@ public sealed class ComponentsPage : Page
             sb.Append(ip.ClientsDropped);
         }
         if (Ctx.LastActionArea == PolicyCommands.AppArea) sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed);
-        sb.Append(_machine).Append(_calibration is null).Append('|');
+        sb.Append(_machine).Append('|');
         foreach (var s in Sections())
         {
             sb.Append(s.Id).Append(s.Count).Append(s.Connected).Append(s.ConnectedLine);
@@ -207,13 +197,13 @@ public sealed class ComponentsPage : Page
     protected override Control Build()
     {
         _openDropDowns = 0;
-        _suspendNote = null;
+        Launch.BeginBuild();
         _elapsed = null;
         var page = U.VStack(18);
         if (Ctx.Info is null)
             page.Children.Add(U.Notice(Ctx.InfoError is null ? Level.Info : Level.Warn,
                 Ctx.InfoError is null ? "Looking for your add-ons" : "Couldn't read the list of add-ons",
-                Ctx.InfoError ?? "This takes about 10 seconds. Running apps appear as soon as DisplayXR reports them."));
+                Ctx.InfoError ?? "This takes about 10 seconds."));
         // A read in progress (the first one, Try again, Refresh, after an install) is said, never silent.
         if (CatalogText.Checking(Ctx.CatalogLoading) is { } checking)
         {
@@ -312,7 +302,7 @@ public sealed class ComponentsPage : Page
                 // status, one plain state word, "Works with your display"; everything else is in Details.
                 var face = row.Face;
                 list.Children.Add(ItemRow(row.Installed ?? CatalogHead(row), face));
-                if (row.Installed?.Controller is { Launch: not null } rc) list.Children.Add(LaunchRow(rc));
+                if (row.Installed?.Controller is { Launch: not null } rc) list.Children.Add(Launch.Build(rc));
                 var pr = row.Installed is { } inst ? inst.Policy : row.Catalog is { } only ? RowOf(only) : null;
                 PolicyList? pl = null;
                 bool writable = pr is not null && Ctx.Policies.TryGetValue(pr.Class, out pl) && pl.Writable;
@@ -362,18 +352,10 @@ public sealed class ComponentsPage : Page
             U.AddFlow(head, policyChip, 10, 6);
             if (r.CanCalibrate)
             {
-                // Camera-pose calibration (tracking-provider-discovery.md §6; design: displayxr-tracking-open
-                // docs/design.md §10): a full-screen window on THIS screen that streams
-                // `tracking calibrate --screen <key> --watch --json`, solves and applies.
-                var screen = Ctx.Feed.Snapshot?.ScreenById(r.ScreenId);
-                string key = screen?.Key is { Length: > 0 } k ? k : r.ScreenId;
-                var calibrate = U.Button("Calibrate camera…", () => OpenCalibration(key, screen, r.Name), "quiet", "sm");
-                calibrate.IsEnabled = _calibration is null;
-                ToolTip.SetShowOnDisabled(calibrate, true);
-                ToolTip.SetTip(calibrate, _calibration is null
-                    ? "Measure where the camera sits next to this display, using your reflection in it, so the picture lines up with where you are."
-                    : "A calibration window is already open.");
-                Avalonia.Automation.AutomationProperties.SetName(calibrate, $"Calibrate camera for {r.Name}");
+                // Camera calibration lives on the display's own card on Displays.
+                var calibrate = U.Button("Calibrate on Displays →", () => Ctx.Navigate("displays"), "link");
+                ToolTip.SetTip(calibrate, "Calibrate camera… is on this display's card on Displays.");
+                Avalonia.Automation.AutomationProperties.SetName(calibrate, $"Calibrate camera for {r.Name} on Displays");
                 U.AddFlow(head, calibrate, 10, 6);
             }
             var reason = U.Wrapped(r.Reason, "soft");
@@ -386,28 +368,6 @@ public sealed class ComponentsPage : Page
         if (Ctx.Info?.Components.Tracking is { } sum && sum.ScanLine is { Length: > 0 } scan)
             col.Children.Add(U.Wrapped($"Last check of the installed camera head tracking: {scan}.", "meta"));
         return col;
-    }
-
-    private CalibrationWindow? _calibration;
-
-    /// <summary>
-    /// Open the calibration window for one provider-served screen (one at a time). After a successful
-    /// apply the tracking rows and info's tracking block are re-read.
-    /// </summary>
-    private void OpenCalibration(string screenKey, Screen? screen, string name)
-    {
-        if (_calibration is not null) { _calibration.Activate(); return; }
-        var w = new CalibrationWindow(Ctx.Cli, screenKey, screen, name, () =>
-        {
-            _ = Ctx.LoadPolicyAsync(ComponentClass.Tracking, force: true);
-            _ = Ctx.LoadInfoAsync(force: true);
-            Ctx.Toast($"Camera calibration saved for {name}.");
-        });
-        w.Closed += (_, _) => { _calibration = null; Update(); };
-        _calibration = w;
-        DashboardLog.Info($"calibration window opened for screen {screenKey}");
-        w.Show();
-        Update();
     }
 
     /// <summary>
@@ -425,7 +385,12 @@ public sealed class ComponentsPage : Page
         bool locked = list.PolicyLock;
         var col = U.VStack(8, U.Text("Per app", "group"),
             U.Wrapped("Which input add-on each app uses. Choosing one for an app makes it use that add-on for everything the add-on supplies; anything else, or an add-on that is not there, uses the automatic order.", "desc"));
-        if (list.PerAppLockText is { } lt) col.Children.Add(U.Notice(Level.Info, PolicyList.ManagedTitle, lt));
+        if (list.PerAppLockText is { } lt)
+        {
+            var managed = U.Notice(Level.Info, PolicyList.ManagedTitle, lt);
+            ToolTip.SetTip(managed, list.LockText);
+            col.Children.Add(managed);
+        }
         if (list.ClientsDropped is > 0 and var dropped)
             col.Children.Add(U.Notice(Level.Warn, "Some apps use the automatic order",
                 $"{dropped:0} app(s) went over the number DisplayXR keeps track of per app, so they use the automatic order and their choice does not apply."));
@@ -489,7 +454,6 @@ public sealed class ComponentsPage : Page
     {
         "display_processors" => "No display driver is installed.",
         "workspace_controller" => "No spatial desktop is installed or running.",
-        "present_owners" => "No app with its own window is running.",
         "input_providers" => "No input add-on reported.",
         "conversion" => "Your display driver reports no 2D-to-3D converter.",
         "conversion_providers" => "No 2D-to-3D converter is installed.",
@@ -503,135 +467,6 @@ public sealed class ComponentsPage : Page
     {
         if (!_expanded.Remove(id)) _expanded.Add(id);
         Update();
-    }
-
-    /// <summary>
-    /// How this workspace controller is launched (phase 8): hotkey capture,
-    /// mode, Launch now. Written with `displayxr-cli workspace set|launch`, then
-    /// `workspace list --json` is re-read once; the CLI makes the service reload,
-    /// so a change is live.
-    /// </summary>
-    private Control LaunchRow(RegisteredController c)
-    {
-        var launch = c.Launch!;
-        string id = c.Id;
-        bool connected = c.Connected == true;
-        bool busy = Ctx.ActionRunning;
-
-        // (a) hotkey capture: click, press the combo, Esc cancels.
-        bool capturing = _capturing == id;
-        var keyText = U.Text(capturing ? "Press a key combination… (Esc cancels)"
-                                       : launch.Hotkey is { Length: > 0 } hk ? hk : "No shortcut", capturing || launch.Hotkey is not { Length: > 0 } ? "dim" : "mono");
-        keyText.VerticalAlignment = VerticalAlignment.Center;
-        var capture = new Border
-        {
-            Child = keyText, Focusable = true, MinWidth = 220, Padding = new Thickness(12, 6),
-            Cursor = new Avalonia.Input.Cursor(Avalonia.Input.StandardCursorType.Hand),
-            BorderBrush = capturing ? Tokens.Accent : Tokens.Line, BorderThickness = new Thickness(capturing ? 2 : 1),
-            Background = Tokens.Field, CornerRadius = Tokens.Radius("FieldRadius"), VerticalAlignment = VerticalAlignment.Center,
-        };
-        Avalonia.Automation.AutomationProperties.SetName(capture, $"Launch hotkey for {c.Name}");
-        ToolTip.SetTip(capture, "Click, then press the combination: at least one of Ctrl / Shift / Alt / Win plus a key. "
-                              + "The service sees it before any app, so avoid a combo your apps use (Ctrl+Space, for one).");
-        capture.PointerPressed += (_, e) =>
-        {
-            if (busy) return;
-            e.Handled = true;
-            _capturing = id;
-            _captureNote = null;
-            Update(force: true);
-        };
-        if (capturing)
-        {
-            capture.GotFocus += (_, _) => Ctx.HotkeySuspend.Begin();
-            capture.AttachedToVisualTree += (_, _) => Avalonia.Threading.Dispatcher.UIThread.Post(() => capture.Focus());
-            capture.LostFocus += (_, _) =>
-            {
-                if (_capturing != id) return;
-                EndCapture();
-                Avalonia.Threading.Dispatcher.UIThread.Post(() => Update(force: true));
-            };
-            capture.AddHandler(InputElement.KeyDownEvent, (_, e) =>
-            {
-                e.Handled = true;
-                if (e.Key == Avalonia.Input.Key.Escape && e.KeyModifiers == Avalonia.Input.KeyModifiers.None)
-                {
-                    EndCapture();
-                    Update(force: true);
-                    return;
-                }
-                if (KeyNames.IsModifier(e.Key)) return; // wait for the key itself
-                var mods = KeyNames.Modifiers(e.KeyModifiers);
-                string? name = KeyNames.Name(e.Key);
-                string? why = name is null ? "That key cannot be used." : Hotkey.Validate(mods, name);
-                EndCapture();
-                _captureNoteFor = id;
-                if (why is not null)
-                {
-                    _captureNote = why;
-                    Update(force: true);
-                    return;
-                }
-                var combo = new Hotkey(mods, name!).ToString();
-                _captureNote = null;
-                _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--hotkey", combo));
-                Update(force: true);
-            }, Avalonia.Interactivity.RoutingStrategies.Tunnel);
-        }
-
-        var clear = U.Button("Clear", () => _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--no-hotkey")), "quiet", "sm");
-        clear.IsEnabled = !busy && launch.Hotkey is { Length: > 0 };
-
-        // Back to the runtime's defaults: `workspace reset` drops the controller's
-        // service.json entry, so it follows the default again (an upgraded box that
-        // stored Ctrl+Space gets Ctrl+Shift+Space this way).
-        var reset = U.Button("Reset", () => _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "reset", id)), "quiet", "sm");
-        reset.IsEnabled = !busy && launch.Source == "user";
-        ToolTip.SetTip(reset, $"Back to the runtime's defaults ({Hotkey.Default}, Auto on current runtimes).");
-
-        // (b) mode.
-        var mode = new ComboBox { ItemsSource = new[] { "Opens with the shortcut", "Turned off" }, SelectedIndex = launch.Disabled ? 1 : 0, MinWidth = 190, IsEnabled = !busy };
-        mode.Classes.Add("field");
-        Avalonia.Automation.AutomationProperties.SetName(mode, $"Launch mode for {c.Name}");
-        int modeWas = mode.SelectedIndex;
-        mode.DropDownOpened += (_, _) => _openDropDowns++;
-        mode.DropDownClosed += (_, _) =>
-        {
-            _openDropDowns = System.Math.Max(0, _openDropDowns - 1);
-            Avalonia.Threading.Dispatcher.UIThread.Post(() => Update());
-        };
-        mode.SelectionChanged += (_, _) =>
-        {
-            if (mode.SelectedIndex < 0 || mode.SelectedIndex == modeWas || Ctx.ActionRunning) return;
-            _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--mode", mode.SelectedIndex == 1 ? "disabled" : "auto"));
-        };
-
-        // (c) launch now.
-        var launchNow = U.Button("Open now", () => _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "launch", id)), "primary", "sm");
-        launchNow.IsEnabled = !busy && !launch.Disabled && !connected;
-        ToolTip.SetTip(launchNow, launch.Disabled ? "It is turned off." : connected ? "Already running." : "Open it now, the same way the shortcut does.");
-
-        var label = U.Text("Shortcut", "label");
-        label.VerticalAlignment = VerticalAlignment.Center;
-        var row = U.Flow(10, 6, label, capture, clear, reset, mode, launchNow);
-
-        // (d) when a change applies. Its state (running, where the shortcut is set) is in the row's Details.
-        var note = U.Text("Changes take effect immediately.", "meta");
-
-        var col = U.VStack(6, row, note);
-        if (capturing)
-        {
-            _suspendNote = U.Wrapped("Press a combo other than the current one while the workspace hotkey is active.", "soft");
-            _suspendNote.IsVisible = Ctx.HotkeySuspend.Unsupported;
-            col.Children.Add(_suspendNote);
-        }
-        if (_captureNoteFor == id && _captureNote is { } cn)
-            col.Children.Add(U.WarningRow(new StatusWarning("HOTKEY", WarningLevel.Warn, cn)));
-        if (Ctx.LastActionArea == "workspace" && Ctx.LastAction is { } la && Ctx.LastActionFailed)
-            col.Children.Add(U.Wrapped(la, "soft"));
-        var box = new Border { Child = col, Margin = new Thickness(22, 10, 0, 0) };
-        box.Classes.Add("field");
-        return box;
     }
 
     /// <summary>
@@ -664,7 +499,8 @@ public sealed class ComponentsPage : Page
         // (a machine-wide write from an elevated dashboard still applies).
         bool enabledLocked = list.LockHidesUserEnabled && !machine;
         bool prefLocked = list.LockHidesUserPreference && !machine;
-        const string lockTip = "Managed by your administrator: a change made here for you would be ignored. (HKLM Policy\\Lock; an administrator changes the machine-wide value with --machine.)";
+        // The technical cause (the machine policy's registry value) is in the row's Details.
+        const string lockTip = "Managed by your administrator: a change made here for you would be ignored. An administrator can change it for everyone on this PC.";
 
         // (a) Enabled — never on the built-in adapter, which has no Enabled value (EnabledKnown).
         if (r.EnabledKnown)
@@ -735,7 +571,7 @@ public sealed class ComponentsPage : Page
         if (elevated)
         {
             var mw = new CheckBox { Content = "For everyone on this PC", IsChecked = _machine, IsEnabled = !busy, VerticalAlignment = VerticalAlignment.Center };
-            ToolTip.SetTip(mw, "Change the setting for everyone on this PC (the machine-wide HKLM value) instead of only for you. Offered because the Dashboard is running as administrator.");
+            ToolTip.SetTip(mw, "Change the setting for everyone on this PC instead of only for you. Offered because the Dashboard is running as administrator.");
             mw.IsCheckedChanged += (_, _) => { _machine = mw.IsChecked == true; Update(force: true); };
             row.Add(mw);
         }

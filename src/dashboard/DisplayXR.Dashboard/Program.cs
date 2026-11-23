@@ -9,7 +9,11 @@ namespace DisplayXR.Dashboard;
 
 internal static class Program
 {
-    /// <summary><c>--page displays</c> opens on that page (home, displays, windows, components, performance, developer; "catalog" opens components).</summary>
+    /// <summary>
+    /// <c>--page displays</c> opens on that page: home, displays, components, settings, troubleshooting, and every
+    /// older id where its content now is (catalog: components; performance: settings; windows: troubleshooting,
+    /// Running 3D apps; developer: troubleshooting, Advanced). Model/PageRoutes.cs.
+    /// </summary>
     public static string StartPage { get; private set; } = "home";
 
     /// <summary><c>--fixture file.ndjson</c>: replay snapshots from a file (development aid, see README).</summary>

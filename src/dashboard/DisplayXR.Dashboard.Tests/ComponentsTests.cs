@@ -25,8 +25,11 @@ public class ComponentsTests
     public void ClientsAreGroupedByRole_NeverByName()
     {
         var all = Components.Build(Comp, null);
-        Assert.Equal(new[] { "display_processors", "workspace_controller", "present_owners", "input_providers", "conversion", "diagnostics" },
+        Assert.Equal(new[] { "display_processors", "workspace_controller", "input_providers", "conversion" },
                      all.Select(s => s.Id));
+        // Running programs are not things you have or can add: they are listed under Troubleshooting.
+        var running = Components.RunningPrograms(Comp);
+        Assert.Equal(new[] { "present_owners", "diagnostics" }, running.Select(s => s.Id));
 
         var wc = Section(all, "workspace_controller");
         var item = Assert.Single(wc.Items);
@@ -34,16 +37,16 @@ public class ComponentsTests
         Assert.Equal(1, wc.Connected);
         Assert.Contains("Workspace controller: workspace-host.exe · connected · workspace on", item.Lines);
 
-        var po = Section(all, "present_owners");
+        var po = Section(running, "present_owners");
         Assert.Equal("capture_app.exe", Assert.Single(po.Items).Name);
         Assert.Equal("1 running", po.ConnectedLine);
 
-        var diag = Section(all, "diagnostics");
+        var diag = Section(running, "diagnostics");
         Assert.True(diag.Collapsed);
         Assert.Equal("displayxr-cli.exe", Assert.Single(diag.Items).Name);
 
         // The APP client belongs to no component role.
-        Assert.DoesNotContain(all.SelectMany(s => s.Items), i => i.Name == "cube_handle_d3d11_win.exe");
+        Assert.DoesNotContain(all.Concat(running).SelectMany(s => s.Items), i => i.Name == "cube_handle_d3d11_win.exe");
         // No product wording: the role captions never name a product.
         Assert.All(all, s => Assert.DoesNotContain("Shell", s.Role));
     }
@@ -245,7 +248,7 @@ public class ComponentsTests
         var all = Components.Build(null, bare!.Components);
         Assert.All(all, s => Assert.Empty(s.Items));
         Assert.Equal("not read yet", Section(all, "input_providers").ConnectedLine);
-        Assert.Equal("shown when DisplayXR runs in the background", Section(all, "present_owners").ConnectedLine);
+        Assert.Equal("shown when DisplayXR runs in the background", Section(Components.RunningPrograms(null), "present_owners").ConnectedLine);
 
         Assert.True(InfoResult.TryParse("""
             { "workspace_controllers": "nope", "input_providers": 5, "lift_caps": { "probed": true, "malformed": true },

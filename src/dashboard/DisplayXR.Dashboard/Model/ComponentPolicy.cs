@@ -235,9 +235,9 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
     public IReadOnlyList<string> PinChoices() =>
         Rows.Where(r => r.Enabled && !r.Untrusted).Select(r => r.Id).Append(EmulatedId).Distinct().ToArray();
 
-    /// <summary>The per-app table's "managed" line: Policy\Lock hides every per-app pin (the technical cause in brackets).</summary>
+    /// <summary>The per-app table's "managed" line: Policy\Lock hides every per-app pin (the technical cause, <see cref="LockText"/>, is the notice's tooltip).</summary>
     public string? PerAppLockText => PolicyLock && HasPerApp
-        ? "Your administrator manages this on this PC, so a choice per app is ignored. (HKLM Policy\\Lock)"
+        ? "Your administrator manages this on this PC, so a choice per app is ignored."
         : null;
 
     /// <summary>The title of a class's "managed" notice.</summary>

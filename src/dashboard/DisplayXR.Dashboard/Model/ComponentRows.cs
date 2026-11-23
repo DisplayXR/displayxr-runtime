@@ -50,13 +50,6 @@ public sealed record CatalogSource(CatalogList? List, bool Stale, bool Complete)
         $"Items that are not installed are shown as last read at {lastRead.ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture)} and may have changed.";
 }
 
-/// <summary>Page ids the shell still answers to after a page was merged into another.</summary>
-public static class PageRoutes
-{
-    /// <summary>"catalog" (the tab merged into Components) opens Components; every other id is itself.</summary>
-    public static string Resolve(string id) => id == "catalog" ? "components" : id;
-}
-
 /// <summary>
 /// One row: the installed component, its catalog entry, or both. <see cref="Status"/> is null for a
 /// row that is neither installed nor installable (a connected client, a summary line).

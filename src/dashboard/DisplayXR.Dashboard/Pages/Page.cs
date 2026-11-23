@@ -35,10 +35,16 @@ public abstract class Page : UserControl
     /// <summary>Page actions placed in the shell header, left of the global ones (rebuilt with the page).</summary>
     public virtual Control? HeaderActions => null;
 
-    public void Bind(DashboardContext ctx) => Ctx = ctx;
+    public virtual void Bind(DashboardContext ctx) => Ctx = ctx;
 
     /// <summary>Raised after a rebuild, so the shell re-reads the caption and header actions.</summary>
     public event System.Action? Rebuilt;
+
+    /// <summary>For a page that hosts other pages (Troubleshooting): one of them rebuilt, so the header is read again.</summary>
+    protected void RaiseRebuilt() => Rebuilt?.Invoke();
+
+    /// <summary>What Refresh re-reads on this page beyond the status feed (the shell calls it).</summary>
+    public virtual void OnRefresh() { }
 
     public virtual void OnShown() { }
     public virtual void OnHidden() { }

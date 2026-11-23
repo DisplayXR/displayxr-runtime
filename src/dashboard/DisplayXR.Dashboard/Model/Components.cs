@@ -333,7 +333,7 @@ public static class Components
         var n => $"drives {n} displays",
     };
 
-    /// <summary>Every section, in page order. Sections whose source is absent are omitted (stereo camera).</summary>
+    /// <summary>Every section of Components, in page order: what you have and what you can add. Sections whose source is absent are omitted (stereo camera); running programs are <see cref="RunningPrograms"/>.</summary>
     public static IReadOnlyList<ComponentSection> Build(StatusSnapshot? s, InfoComponents? info, WorkspaceList? workspace = null,
                                                         IReadOnlyDictionary<ComponentClass, PolicyList>? policies = null)
     {
@@ -348,8 +348,6 @@ public static class Components
         {
             DisplayProcessors(s, Of(policies, ComponentClass.Display)),
             WorkspaceController(s, info),
-            ByClass(s, "present_owners", "Apps with their own window", PresentOwnerClass,
-                "Apps, such as a browser, that show their own window while DisplayXR adds the 3D."),
             InputProviders(info, Of(policies, ComponentClass.Input)),
             Conversion(info),
         };
@@ -362,10 +360,21 @@ public static class Components
         if (Tracking.Section(s, Of(policies, ComponentClass.Tracking), info.Tracking) is { } tr)
             list.Insert(list.FindIndex(x => x.Id == "input_providers") + 1, tr);
         if (StereoCamera(info) is { } cam) list.Add(cam);
-        list.Add(ByClass(s, "diagnostics", "Status readers", DiagClass,
-            "Programs that only read DisplayXR's status, such as this Dashboard.", collapsed: true));
         return list;
     }
+
+    /// <summary>
+    /// The running programs, by role: apps with their own window (present owners) and status readers
+    /// (diagnostics clients). They are processes, not things to install, so they are shown under
+    /// Troubleshooting > Running 3D apps rather than on Components.
+    /// </summary>
+    public static IReadOnlyList<ComponentSection> RunningPrograms(StatusSnapshot? s) => new[]
+    {
+        ByClass(s, "present_owners", "Apps with their own window", PresentOwnerClass,
+            "Apps, such as a browser, that show their own window while DisplayXR adds the 3D."),
+        ByClass(s, "diagnostics", "Status readers", DiagClass,
+            "Programs that only read DisplayXR's status, such as this Dashboard.", collapsed: true),
+    };
 
     public static ComponentSection DisplayProcessors(StatusSnapshot? s, PolicyList? policy = null)
     {

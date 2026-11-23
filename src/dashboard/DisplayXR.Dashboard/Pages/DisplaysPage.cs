@@ -14,14 +14,18 @@ using DisplayXR.Dashboard.Ui;
 namespace DisplayXR.Dashboard.Pages;
 
 /// <summary>
-/// Displays (design §8): one card per screen in registry order — status dot,
-/// name, role chips, claim badge, identity / claim / state / vendor lines,
-/// warnings as data — and the desktop map under them.
+/// Displays (design §8): one card per screen in registry order. Its face: status dot, name, plain
+/// role chips, the plain badge, the plain state line, warnings as data, and its actions (the display
+/// maker's app, "Calibrate camera…" where camera head tracking serves it, Details). Behind
+/// "Details": the plain identity / claim / maker lines, the driver selector with what it does, and
+/// the technical lines. The selector stays on the face when more than one driver could drive the
+/// display or more than one 3D display is present. The desktop map shows only with several displays.
 /// </summary>
 public sealed class DisplaysPage : Page
 {
     private readonly DesktopMap _map = new();
     private readonly Dictionary<string, string> _launchNotes = new();
+    private readonly HashSet<string> _details = new(); // the display cards whose Details are open
     private string? _dpKey; // the screen whose selector ran the last per-screen action
     private int _openDropDowns;
     // The choice just made, shown until the re-read dp list reflects it (the
@@ -62,7 +66,8 @@ public sealed class DisplaysPage : Page
         var s = Ctx.Feed.Snapshot;
         if (s is null) return "none";
         var sb = new System.Text.StringBuilder(StatusText.Copy(s, includeSource: false));
-        sb.Append('|').Append(string.Join(";", _launchNotes)).Append('|').Append(Ctx.ActionRunning).Append(Ctx.DpLoading);
+        sb.Append('|').Append(string.Join(";", _launchNotes)).Append('|').Append(Ctx.ActionRunning).Append(Ctx.DpLoading)
+          .Append('|').Append(string.Join(",", _details)).Append(_calibration is null);
         foreach (var x in s.Screens) sb.Append(x.Key).Append(x.Claim.Forced).Append(x.Claim.PreferredPlugin).Append(x.Claim.Apply);
         if (Ctx.Dp is { } dp)
         {
@@ -101,6 +106,8 @@ public sealed class DisplaysPage : Page
         }
         foreach (var screen in s.Screens) page.Children.Add(ScreenCard(s, screen));
 
+        // The desktop map matters only with more than one display.
+        if (s.Screens.Count < 2) return page;
         U.Detach(_map);
         var mapCard = U.VStack(12,
             U.CardTitle("Desktop", "Your displays to scale. Outlines are the windows of 3D apps; the tinted display holds a window; a dashed line is where a window crosses from one display to another."),
@@ -183,14 +190,16 @@ public sealed class DisplaysPage : Page
         var dot = U.Dot(level, 11);
         dot.VerticalAlignment = VerticalAlignment.Top;
         dot.Margin = new Thickness(0, 6, 14, 0);
+        string screenName = StatusText.ScreenName(s);
 
-        var name = U.Wrapped(StatusText.ScreenName(s), "group");
+        var name = U.Wrapped(screenName, "group");
         name.FontSize = 17;
         var title = U.Flow(10, 4, name);
         foreach (var chip in StatusText.PlainChips(s))
             U.AddFlow(title, U.Chip(chip, chip == "Main 3D display" ? Level.Info : Level.Plain), 6, 4);
+        if (StatusText.ForcedChip(s, Ctx.Dp) is { } forcedChip) U.AddFlow(title, U.Chip(forcedChip, Level.Warn), 6, 4);
 
-        // Plain words on the card; the technical line each one replaces is its tooltip and is in "Copy list".
+        // Plain words on the face; the technical line each one replaces is in Details and in "Copy list".
         var (badgeText, badgeLevel) = StatusText.PlainBadge(s);
         var badge = U.Badge(badgeText, badgeLevel, tick: badgeLevel == Level.Ok);
         ToolTip.SetTip(badge, StatusText.Badge(s).Text);
@@ -203,42 +212,9 @@ public sealed class DisplaysPage : Page
         head.Children.Add(badge);
 
         var body = U.VStack(5, head);
-        var identity = U.Wrapped(StatusText.PlainIdentity(s), "dim");
-        ToolTip.SetTip(identity, StatusText.Identity(s));
-        body.Children.Add(identity);
-        var claim = U.Wrapped(StatusText.PlainClaimLine(s, id => snap.Plugins.FirstOrDefault(p => p.Id == id)?.Name), "soft");
-        ToolTip.SetTip(claim, StatusText.ClaimLine(s));
-        body.Children.Add(claim);
         var state = U.Wrapped(StatusText.PlainStateLine(s), "soft");
-        ToolTip.SetTip(state, StatusText.StateLine(s));
+        ToolTip.SetTip(state, StatusText.StateLine(s)); // the technical line, as "Copy list" writes it
         body.Children.Add(state);
-
-        if (StatusText.PlainVendorLine(s) is { } vendor)
-        {
-            var vendorRow = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto") };
-            var vt = U.Wrapped(vendor, "dim");
-            ToolTip.SetTip(vt, StatusText.VendorLine(s));
-            vt.VerticalAlignment = VerticalAlignment.Center;
-            vendorRow.Children.Add(vt);
-            if (s.Vendor.DashboardCommand is { Length: > 0 } cmd)
-            {
-                string id = s.Id;
-                var open = U.Button("Open the display maker's app ↗", () =>
-                {
-                    string line = VendorCommand.Expand(cmd, s.Vendor.Serial.Length > 0 ? s.Vendor.Serial : s.Claim.Serial, s.Id);
-                    string? err = VendorCommand.Launch(line);
-                    if (err is null) _launchNotes.Remove(id); else _launchNotes[id] = err;
-                    Update();
-                }, "outline", "sm");
-                open.Margin = new Thickness(12, 0, 0, 0);
-                Grid.SetColumn(open, 1);
-                vendorRow.Children.Add(open);
-            }
-            body.Children.Add(vendorRow);
-            if (_launchNotes.TryGetValue(s.Id, out var note)) body.Children.Add(U.Wrapped(note, "soft"));
-        }
-
-        if (DpRow(s) is { } dpRow) body.Children.Add(dpRow);
 
         var warnings = StatusText.ScreenWarnings(s);
         if (warnings.Count > 0)
@@ -250,6 +226,66 @@ public sealed class DisplaysPage : Page
             body.Children.Add(list);
         }
 
+        // The face's actions: the display maker's own app, camera calibration for this display, Details.
+        var actions = U.Flow(10, 6);
+        if (s.Vendor.Present && s.Vendor.DashboardCommand is { Length: > 0 } cmd)
+        {
+            string sid = s.Id;
+            var open = U.Button("Open the display maker's app ↗", () =>
+            {
+                string line = VendorCommand.Expand(cmd, s.Vendor.Serial.Length > 0 ? s.Vendor.Serial : s.Claim.Serial, s.Id);
+                string? err = VendorCommand.Launch(line);
+                if (err is null) _launchNotes.Remove(sid); else _launchNotes[sid] = err;
+                Update();
+            }, "outline", "sm");
+            U.AddFlow(actions, open, 10, 6);
+        }
+        if (CalibrateButton(snap, s) is { } calibrate) U.AddFlow(actions, calibrate, 10, 6);
+        bool open_ = _details.Contains(s.Id);
+        var details = U.Button(open_ ? "Hide details" : "Details", () =>
+        {
+            if (!_details.Remove(s.Id)) _details.Add(s.Id);
+            Update(force: true);
+        }, "quiet", "sm");
+        Avalonia.Automation.AutomationProperties.SetName(details, $"{(open_ ? "Hide details" : "Details")} of {screenName}");
+        U.AddFlow(actions, details, 10, 6);
+        actions.Margin = new Thickness(0, 6, 0, 0);
+        body.Children.Add(actions);
+        if (_launchNotes.TryGetValue(s.Id, out var note)) body.Children.Add(U.Wrapped(note, "soft"));
+
+        // More than one driver could drive this display, or more than one 3D display: the choice is on the face.
+        bool choiceOnFace = StatusText.DriverChoiceOnFace(s, snap, Ctx.Dp);
+        var dpRow = DpRow(s);
+        if (choiceOnFace && dpRow is not null)
+        {
+            body.Children.Add(dpRow);
+            body.Children.Add(U.Wrapped(DriverExplanation, "desc"));
+        }
+
+        if (open_)
+        {
+            var d = U.VStack(6);
+            d.Children.Add(U.Wrapped(StatusText.PlainIdentity(s), "dim"));
+            d.Children.Add(U.Wrapped(StatusText.PlainClaimLine(s, id => snap.Plugins.FirstOrDefault(p => p.Id == id)?.Name), "soft"));
+            if (StatusText.PlainVendorLine(s) is { } vendor) d.Children.Add(U.Wrapped(vendor, "dim"));
+            if (!choiceOnFace && dpRow is not null)
+            {
+                d.Children.Add(dpRow);
+                d.Children.Add(U.Wrapped(DriverExplanation, "desc"));
+            }
+            // The technical lines, as "Copy list" writes them.
+            var tech = U.VStack(2);
+            tech.Margin = new Thickness(0, 6, 0, 0);
+            tech.Children.Add(U.Wrapped(StatusText.Identity(s), "dev"));
+            tech.Children.Add(U.Wrapped(StatusText.ClaimLine(s), "dev"));
+            tech.Children.Add(U.Wrapped(StatusText.StateLine(s), "dev"));
+            if (StatusText.VendorLine(s) is { } vl) tech.Children.Add(U.Wrapped(vl, "dev"));
+            d.Children.Add(tech);
+            var box = new Border { Child = d, Padding = new Thickness(12, 10), Margin = new Thickness(0, 4, 0, 0) };
+            box.Classes.Add("field");
+            body.Children.Add(box);
+        }
+
         var g = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*") };
         g.Children.Add(dot);
         Grid.SetColumn(body, 1);
@@ -257,5 +293,52 @@ public sealed class DisplaysPage : Page
         var card = U.Card(g);
         if (level is Level.Warn or Level.Critical) card.BorderBrush = Tokens.Alpha(Tokens.ColorKey(level), 0.45);
         return card;
+    }
+
+    /// <summary>What the per-display driver selector does, in plain words.</summary>
+    private const string DriverExplanation =
+        "The display driver turns what a 3D app draws into what this display shows. Automatic picks the one made for it. Choosing one here is for you only.";
+
+    /// <summary>
+    /// Camera calibration, on the card of the display it is for: only where camera head tracking
+    /// serves this display (its viewer source is a provider; tracking-provider-discovery.md §6).
+    /// </summary>
+    private Control? CalibrateButton(StatusSnapshot snap, Screen s)
+    {
+        var row = Tracking.Screens(snap, null).FirstOrDefault(r => r.ScreenId == s.Id);
+        if (row is not { CanCalibrate: true }) return null;
+        string name = StatusText.ScreenName(s);
+        string key = s.Key is { Length: > 0 } k ? k : s.Id;
+        var calibrate = U.Button("Calibrate camera…", () => OpenCalibration(key, s, name), "outline", "sm");
+        calibrate.IsEnabled = _calibration is null;
+        ToolTip.SetShowOnDisabled(calibrate, true);
+        ToolTip.SetTip(calibrate, _calibration is null
+            ? "Measure where the camera sits next to this display, using your reflection in it, so the picture lines up with where you are."
+            : "A calibration window is already open.");
+        Avalonia.Automation.AutomationProperties.SetName(calibrate, $"Calibrate camera for {name}");
+        return calibrate;
+    }
+
+    private CalibrationWindow? _calibration;
+
+    /// <summary>
+    /// Open the calibration window for one provider-served display (one at a time): a full-screen window
+    /// on THIS display that streams `tracking calibrate --screen &lt;key&gt; --watch --json`, solves and
+    /// applies. After a successful apply the tracking rows and info's tracking block are re-read.
+    /// </summary>
+    private void OpenCalibration(string screenKey, Screen? screen, string name)
+    {
+        if (_calibration is not null) { _calibration.Activate(); return; }
+        var w = new CalibrationWindow(Ctx.Cli, screenKey, screen, name, () =>
+        {
+            _ = Ctx.LoadPolicyAsync(ComponentClass.Tracking, force: true);
+            _ = Ctx.LoadInfoAsync(force: true);
+            Ctx.Toast($"Camera calibration saved for {name}.");
+        });
+        w.Closed += (_, _) => { _calibration = null; Update(); };
+        _calibration = w;
+        DashboardLog.Info($"calibration window opened for screen {screenKey}");
+        w.Show();
+        Update();
     }
 }
