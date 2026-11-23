@@ -517,6 +517,10 @@ public sealed class DashboardContext
     private readonly Dictionary<string, DriverOptions> _driverOptions = new();
     private readonly HashSet<string> _driverOptionsLoading = new();
     private readonly HashSet<string> _driverOptionsReloadPending = new();
+    private readonly HashSet<string> _driverOptionsFailed = new();
+
+    /// <summary>The last read of a driver's settings failed (an earlier good read, if any, is still what <see cref="DriverOptionsOf"/> gives).</summary>
+    public bool DriverOptionsReadFailed(string id) => _driverOptionsFailed.Contains(id);
 
     /// <summary>A driver's settings once read; an empty list when the CLI has none to give (failed, absent verb, unknown shape).</summary>
     public DriverOptions? DriverOptionsOf(string id) => _driverOptions.TryGetValue(id, out var o) ? o : null;
@@ -537,19 +541,27 @@ public sealed class DashboardContext
             if (force) _driverOptionsReloadPending.Add(id);
             return;
         }
-        if (!force && _driverOptions.ContainsKey(id)) return;
+        if (!force && (_driverOptions.ContainsKey(id) || _driverOptionsFailed.Contains(id))) return;
         _driverOptionsLoading.Add(id);
         Bump();
         try
         {
             var r = await Cli.RunAsync(OptionCommands.Read(id), InfoTimeout);
-            var options = DriverOptions.From(id, r.Ok, r.Json);
-            if (!r.Ok) DashboardLog.Info($"dp options {id}: not available ({r.Summary})");
-            _driverOptions[id] = options;
+            if (DriverOptions.From(id, r.Ok, r.Json) is { } options)
+            {
+                _driverOptions[id] = options;
+                _driverOptionsFailed.Remove(id);
+            }
+            else
+            {
+                // A failed read keeps what an earlier read said (the controls, the reply to a write).
+                _driverOptionsFailed.Add(id);
+                DashboardLog.Info($"dp options {id}: could not read ({r.Summary})");
+            }
         }
         catch (Exception ex)
         {
-            _driverOptions[id] = DriverOptions.None(id);
+            _driverOptionsFailed.Add(id);
             DashboardLog.Error("dp options", ex);
         }
         finally { _driverOptionsLoading.Remove(id); }
@@ -560,7 +572,7 @@ public sealed class DashboardContext
     /// <summary>Refresh: re-read the settings of every driver whose settings were read.</summary>
     public void RefreshDriverOptions()
     {
-        foreach (var id in _driverOptions.Keys.ToArray()) _ = LoadDriverOptionsAsync(id, force: true);
+        foreach (var id in _driverOptions.Keys.Union(_driverOptionsFailed).ToArray()) _ = LoadDriverOptionsAsync(id, force: true);
     }
 
     /// <summary>One Options write (<c>dp set</c> / <c>dp unset</c>) through the shared action path, then that driver's settings are re-read.</summary>

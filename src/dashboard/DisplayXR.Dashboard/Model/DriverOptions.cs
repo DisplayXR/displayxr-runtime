@@ -78,9 +78,13 @@ public sealed record DriverOptions(string Id, string EnvPrefix, IReadOnlyList<Dr
         catch (Exception ex) when (ex is JsonException or InvalidOperationException) { return false; }
     }
 
-    /// <summary>A CLI answer: its JSON when the run succeeded, otherwise (or when it is not that shape) no options.</summary>
-    public static DriverOptions From(string id, bool ok, string json) =>
-        ok && TryParse(json, out var o) ? o! with { Id = o.Id.Length > 0 ? o.Id : id } : None(id);
+    /// <summary>
+    /// A CLI answer: the options when the run succeeded and the document has that shape; null when it did
+    /// not (a failed run, an older CLI without the verb, another shape). Only a successful read can say
+    /// "no options" (an empty list); a failed one says nothing about them.
+    /// </summary>
+    public static DriverOptions? From(string id, bool ok, string json) =>
+        ok && TryParse(json, out var o) ? o! with { Id = o.Id.Length > 0 ? o.Id : id } : null;
 
     private static SettingType? TypeOf(string t) => t switch
     {
@@ -233,6 +237,13 @@ public static class OptionViews
     public static string AccessibleName(string label, string driver) => $"{label}: {driver}";
     public static string ResetName(string label, string driver) => $"Use the default for {label}: {driver}";
     public static string MoreName(string driver) => $"More options: {driver}";
+    public static string RetryName(string driver) => $"Try again reading options: {driver}";
+
+    /// <summary>The last read of the options failed (an earlier read's controls stay below it).</summary>
+    public const string ReadFailedLine = "Couldn't read its options.";
+
+    /// <summary>A successful read with no setting this Dashboard can show.</summary>
+    public const string NoOptionsLine = "This display driver has no options to set here.";
 
     public static bool IsTrue(string v) =>
         v.Trim().ToLowerInvariant() is "1" or "true" or "on" or "yes";

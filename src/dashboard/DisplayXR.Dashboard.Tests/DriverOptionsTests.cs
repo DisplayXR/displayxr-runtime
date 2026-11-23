@@ -57,25 +57,24 @@ public class DriverOptionsTests
     [InlineData("[]")]
     [InlineData("{\"id\":\"x\"}")]
     [InlineData("{\"settings\":5}")]
-    public void ANonDocument_IsNoOptions(string json)
+    public void ANonDocument_IsAFailedRead_NotNoOptions(string json)
     {
         Assert.False(DriverOptions.TryParse(json, out _));
-        var o = DriverOptions.From("x", ok: true, json);
-        Assert.True(o.IsEmpty);
-        Assert.True(OptionViews.Build("x", o).IsEmpty);
+        Assert.Null(DriverOptions.From("x", ok: true, json)); // says nothing about the options
     }
 
     [Fact]
-    public void AFailingVerb_IsNoOptions_NotAnError()
+    public void AFailingVerb_IsAFailedRead_OnlyAnEmptyListIsNoOptions()
     {
         // `dp options nosuch --json` exits 1 with a FAIL line; an older CLI has no verb at all.
         var r = new CliResult(1, "FAIL: 'nosuch' is not a registered display processor (see 'dp list') — nothing to show.", "", false, null);
-        Assert.True(DriverOptions.From("nosuch", r.Ok, r.Json).IsEmpty);
-        var empty = DriverOptions.From("leia-sr", true, """{"id":"leia-sr","settings":[]}""");
+        Assert.Null(DriverOptions.From("nosuch", r.Ok, r.Json));
+        var empty = DriverOptions.From("leia-sr", true, """{"id":"leia-sr","settings":[]}""")!;
         Assert.True(empty.IsEmpty);
+        Assert.True(OptionViews.Build("leia-sr", empty).IsEmpty);
         // A log line printed around the document does not break it.
         var noisy = new CliResult(0, " WARN [x] loading\n" + TestData.Text("dp-options-leia-sr.json") + "\n", "", false, null);
-        Assert.Equal("MULTI_VIEWER", Assert.Single(DriverOptions.From("leia-sr", noisy.Ok, noisy.Json).Settings).Key);
+        Assert.Equal("MULTI_VIEWER", Assert.Single(DriverOptions.From("leia-sr", noisy.Ok, noisy.Json)!.Settings).Key);
     }
 
     [Fact]
@@ -276,10 +275,49 @@ public class DriverOptionsTests
         Assert.Equal(SettingSource.Absent, output.Source);
         Assert.Equal("anaglyph", output.Effective);
 
-        // A driver the CLI does not know (exit 1): no options, and no error kept anywhere.
+        // A driver the CLI does not know (exit 1): a failed read, with nothing earlier to keep.
         await ctx.LoadDriverOptionsAsync("nosuch");
-        Assert.True(ctx.DriverOptionsOf("nosuch")!.IsEmpty);
+        Assert.Null(ctx.DriverOptionsOf("nosuch"));
+        Assert.True(ctx.DriverOptionsReadFailed("nosuch"));
         Assert.False(ctx.DriverOptionsLoading("nosuch"));
+    }
+
+    /// <summary>Review finding 2: a failed read keeps the earlier good read (and the write's reply); the next good read clears the failure.</summary>
+    [Fact]
+    public async Task AFailedReRead_KeepsTheEarlierOptions_AndTheWritesReply()
+    {
+        bool fail = false;
+        var fx = new FixtureProcessSource(TestData.Path("components.ndjson"), new FakeSource());
+        var cli = new FailingReads(fx, () => fail);
+        var ctx = new DashboardContext(new StatusFeed(new FakeSource(), new ManualScheduler()), new CliProcessSource("no-such-cli"), cli);
+        await ctx.LoadDriverOptionsAsync("sim-display");
+        Assert.False(ctx.DriverOptionsReadFailed("sim-display"));
+
+        fail = true; // the write lands, its re-read times out
+        await ctx.RunOptionWriteAsync("sim-display", "OUTPUT", OptionCommands.Set("sim-display", "OUTPUT", "sbs"));
+        Assert.True(ctx.DriverOptionsReadFailed("sim-display"));
+        var kept = ctx.DriverOptionsOf("sim-display")!;
+        Assert.False(kept.IsEmpty);                     // the controls stay
+        Assert.Equal("quad", kept.Find("OUTPUT")!.Value); // as last read
+        Assert.Contains("'sbs'", ctx.LastAction);        // and the write's reply
+        Assert.Equal(("sim-display", "OUTPUT"), ctx.LastOptionWrite);
+
+        fail = false; // Try again
+        await ctx.LoadDriverOptionsAsync("sim-display", force: true);
+        Assert.False(ctx.DriverOptionsReadFailed("sim-display"));
+        Assert.Equal("sbs", ctx.DriverOptionsOf("sim-display")!.Find("OUTPUT")!.Value);
+
+        Assert.Equal("Couldn't read its options.", OptionViews.ReadFailedLine);
+        Assert.Equal("Try again reading options: DisplayXR Sim Display", OptionViews.RetryName("DisplayXR Sim Display"));
+    }
+
+    /// <summary>The fixture source, with every <c>dp options</c> read timing out while <c>fail</c> says so.</summary>
+    private sealed class FailingReads(IProcessSource inner, Func<bool> fail) : IProcessSource
+    {
+        public IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit, Action<string> onNote) => inner.StartWatch(onLine, onExit, onNote);
+
+        public Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, System.Threading.CancellationToken cancel = default) =>
+            fail() && args.Args is ["dp", "options", ..] ? Task.FromResult(new CliResult(-1, "", "", true, null)) : inner.RunAsync(args, timeout, cancel);
     }
 
     [Fact]

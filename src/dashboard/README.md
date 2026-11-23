@@ -300,9 +300,12 @@ lines, the scope and command-line notes, the catalog detail and the removal sent
   (`bool` / `int` / `float` / `enum` / `string` / `secret`), `default`, `help`, `secret`, `value`,
   `set` (secrets), `source` (`environment` / `user` / `machine` / `manifest` / `absent`). An entry
   that is not declared (`type: null`, a value stored for a key the driver no longer declares) or of a
-  type the Dashboard does not know is left out. A failing run, an older CLI without the verb, or a
-  document of another shape is "no options": one quiet line ("This display driver has no options to
-  set here."), no error banner.
+  type the Dashboard does not know is left out. Only a successful read with nothing to show is "no
+  options" ("This display driver has no options to set here."). A failing run (a timeout, an older CLI
+  without the verb, a driver that went away) or a document of another shape keeps what an earlier read
+  showed and adds one line, "Couldn't read its options.", with **Try again** (accessible name `Try
+  again reading options: <driver>`); no banner. The reply to a write stays visible even when its row
+  is not drawn.
 - **Write** `dp set <id> <KEY> <value>` (per user) and `dp unset <id> <KEY>` ("Use the default"),
   through the same action path as the other controls (`DashboardContext.RunOptionWriteAsync`); the
   CLI's reply, with its `note:` / `warning:` lines, shows on the row it was for. The Dashboard saves

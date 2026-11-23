@@ -205,7 +205,7 @@ public sealed class ComponentsPage : Page
         // ADR-065: the open display drivers' settings, the last Options write and its reply.
         foreach (var id in _open)
         {
-            sb.Append(id).Append(Ctx.DriverOptionsLoading(DriverIdOfKey(id) ?? ""));
+            sb.Append(id).Append(Ctx.DriverOptionsLoading(DriverIdOfKey(id) ?? "")).Append(Ctx.DriverOptionsReadFailed(DriverIdOfKey(id) ?? ""));
             if (DriverIdOfKey(id) is { } did && Ctx.DriverOptionsOf(did) is { } o)
                 foreach (var st in o.Settings) sb.Append(st.Key).Append('=').Append(st.Value).Append(st.Source).Append(st.IsSet).Append(';');
         }
@@ -671,17 +671,33 @@ public sealed class ComponentsPage : Page
     {
         var col = U.VStack(10, U.Text("Options", "group"));
         var options = Ctx.DriverOptionsOf(id);
-        if (options is null)
+        bool failed = Ctx.DriverOptionsReadFailed(id);
+        if (options is null && !failed)
         {
             // Opened another way than the toggle (after an install, a --catalog-item focus): read now.
             if (!Ctx.DriverOptionsLoading(id)) Dispatcher.UIThread.Post(() => _ = Ctx.LoadDriverOptionsAsync(id));
             col.Children.Add(U.Wrapped("Reading its options…", "meta"));
             return col;
         }
-        var block = OptionViews.Build(id, options);
+        // The last read failed: say so, offer to read again, and keep what an earlier read showed.
+        if (failed)
+        {
+            var retry = U.Button(Ctx.DriverOptionsLoading(id) ? "Reading…" : "Try again", () => _ = Ctx.LoadDriverOptionsAsync(id, force: true), "quiet", "sm");
+            retry.IsEnabled = !Ctx.DriverOptionsLoading(id);
+            AutomationProperties.SetName(retry, OptionViews.RetryName(driverName));
+            var failLine = U.Text(OptionViews.ReadFailedLine, "meta");
+            failLine.VerticalAlignment = VerticalAlignment.Center;
+            col.Children.Add(U.Flow(10, 6, failLine, retry));
+        }
+        var block = options is null ? new OptionsBlock(id, Array.Empty<OptionView>(), Array.Empty<OptionView>()) : OptionViews.Build(id, options);
+        // The reply to a write whose row is not drawn (the read failed, or the setting went away) stays visible.
+        if (Ctx.LastActionArea == OptionCommands.Area && Ctx.LastOptionWrite is { } lw && lw.DriverId == id && Ctx.LastAction is { } la
+            && !block.Friendly.Concat(block.More).Any(v => v.Key == lw.Key))
+            col.Children.Add(Ctx.LastActionFailed ? U.WarningRow(new StatusWarning("OPTION", WarningLevel.Warn, la)) : U.Wrapped(la, "soft"));
+        if (options is null) return col;
         if (block.IsEmpty)
         {
-            col.Children.Add(U.Wrapped("This display driver has no options to set here.", "meta"));
+            col.Children.Add(U.Wrapped(OptionViews.NoOptionsLine, "meta"));
             return col;
         }
         foreach (var v in block.Friendly) col.Children.Add(OptionRow(id, driverName, v));
