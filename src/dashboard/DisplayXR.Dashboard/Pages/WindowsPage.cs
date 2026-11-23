@@ -14,7 +14,7 @@ using DisplayXR.Dashboard.Ui;
 namespace DisplayXR.Dashboard.Pages;
 
 /// <summary>
-/// Running 3D apps (page id "windows"; design §8 "Windows"): one card per service client — class, presenter, lease,
+/// Troubleshooting > Running 3D apps (was the "windows" page; design §8 "Windows"): one card per service client — class, presenter, lease,
 /// window and owner screen, the segment table, view-set counts, and on one row
 /// the integrity triple with the weave placement (#1248: never a rate without
 /// them). The counters update in place; the cards rebuild only when the

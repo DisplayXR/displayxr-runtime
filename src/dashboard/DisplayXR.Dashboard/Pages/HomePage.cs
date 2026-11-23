@@ -23,7 +23,6 @@ namespace DisplayXR.Dashboard.Pages;
 public sealed class HomePage : Page
 {
     private bool _showAllChecks;
-    private bool _gpuTechnical;
 
     public HomePage() : base("home", "Home") { }
 
@@ -47,7 +46,7 @@ public sealed class HomePage : Page
     {
         var s = Ctx.Feed.Snapshot;
         var sb = new StringBuilder();
-        sb.Append(Ctx.Version).Append('|').Append(_showAllChecks).Append(_gpuTechnical).Append('|');
+        sb.Append(Ctx.Version).Append('|').Append(_showAllChecks).Append('|');
         if (s is not null)
         {
             sb.Append(s.Source).Append('|').Append(s.Runtime).Append('|').Append(s.Workspace).Append('|');
@@ -334,27 +333,8 @@ public sealed class HomePage : Page
                 : "3D apps are drawn on the graphics card your display is plugged into.", "soft"));
         }
         // The technical half (adapter ids, the runtime's verdict, the configured setting and where it
-        // came from, where an app's log says what it really did): behind its own toggle.
-        var toggle = U.Button(_gpuTechnical ? "Hide technical details" : "Technical details", () =>
-        {
-            _gpuTechnical = !_gpuTechnical;
-            Update();
-        }, "link");
-        body.Children.Add(toggle);
-        if (_gpuTechnical)
-        {
-            var tech = U.VStack(6);
-            foreach (var a in g.Adapters) tech.Children.Add(U.Wrapped($"{a.Name}{StatusText.Sep}LUID {a.Luid}{StatusText.Sep}{a.VramMb} MB dedicated", "dev"));
-            if (g.Adapters.Count > 1) tech.Children.Add(U.Wrapped($"{(g.SplitApplies ? "SPLIT" : "LOCAL")}: {g.Verdict}", "dev"));
-            // The configured half: read from the CLI child's own environment (control-panel-performance-settings.md).
-            bool fromEnv = g.WeaveOnScanoutSource == "env";
-            tech.Children.Add(U.Wrapped(
-                $"DXR_WEAVE_ON_SCANOUT = {(g.WeaveOnScanoutSet ? g.WeaveOnScanout : "<unset>")} [{(g.WeaveOnScanoutSource.Length > 0 ? g.WeaveOnScanoutSource : "?")}]" +
-                $"{(fromEnv ? "  (this dashboard's environment only)" : "")}{StatusText.Sep}ingress {(g.Ingress.Length > 0 ? g.Ingress : "?")}", "dev"));
-            if (g.ServiceSplit.Length > 0) tech.Children.Add(U.Wrapped(g.ServiceSplit, "desc"));
-            tech.Children.Add(U.Wrapped("A running app's real placement is the 'weave placement:' line in its log (%LOCALAPPDATA%\\DisplayXR\\DisplayXR_<exe>.*.log), or its integrity row on Running 3D apps.", "desc"));
-            body.Children.Add(tech);
-        }
+        // came from) is in Troubleshooting > Graphics cards.
+        body.Children.Add(U.Button("Technical details in Troubleshooting →", () => Ctx.Navigate("troubleshooting/graphics"), "link"));
         return U.Card(body);
     }
 

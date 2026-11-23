@@ -90,8 +90,9 @@ public sealed class MainWindow : Window
             Toast = ShowToast,
         };
 
-        // Rail order: what an owner asks first, diagnostics last. "Running 3D apps" keeps the page id "windows" (--page windows).
-        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new ComponentsPage(), new SettingsPage(), new WindowsPage(), new DeveloperPage() };
+        // Rail order: what an owner asks first; Troubleshooting (running apps, graphics details, the developer
+        // page) set apart at the bottom. Every older --page id still lands on its content (Model/PageRoutes.cs).
+        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new ComponentsPage(), new SettingsPage(), new TroubleshootingPage() };
         foreach (var p in _pages)
         {
             p.Bind(_ctx);
@@ -201,7 +202,10 @@ public sealed class MainWindow : Window
         ToolTip.SetTip(brand, "Home");
 
         var nav = U.VStack(2);
-        foreach (var p in _pages) nav.Children.Add(NavButton(p));
+        foreach (var p in _pages.Where(p => p.Id != PageRoutes.Troubleshooting)) nav.Children.Add(NavButton(p));
+        // Troubleshooting is set apart: at the bottom of the rail, above the version line, under a rule.
+        var trouble = U.VStack(8, U.Rule(), NavButton(_pages.First(p => p.Id == PageRoutes.Troubleshooting)));
+        trouble.Margin = new Thickness(0, 12, 0, 14);
 
         _railFoot.Margin = new Thickness(26, 0, 16, 22);
         _railFoot.TextWrapping = TextWrapping.Wrap;
@@ -210,8 +214,10 @@ public sealed class MainWindow : Window
         var dock = new DockPanel();
         DockPanel.SetDock(brand, Dock.Top);
         DockPanel.SetDock(_railFoot, Dock.Bottom);
+        DockPanel.SetDock(trouble, Dock.Bottom);
         dock.Children.Add(brand);
         dock.Children.Add(_railFoot);
+        dock.Children.Add(trouble);
         dock.Children.Add(nav);
 
         var rail = new Border
@@ -318,9 +324,13 @@ public sealed class MainWindow : Window
 
     public void Navigate(string id)
     {
-        id = PageRoutes.Resolve(id); // "catalog" was merged into Components
+        // Older ids land where their content moved: catalog -> Components, performance -> Settings,
+        // windows / developer -> a part of Troubleshooting.
+        var route = PageRoutes.Route(id);
+        id = route.Page;
         var page = _pages.FirstOrDefault(p => p.Id == id);
         if (page is null || _shutdown) return;
+        if (route.Section is { } section && page is TroubleshootingPage tp) tp.ShowSection(section);
         if (_nav.TryGetValue(id, out var rb) && rb.IsChecked != true)
         {
             rb.IsChecked = true; // re-enters through IsCheckedChanged
@@ -413,9 +423,9 @@ public sealed class MainWindow : Window
             _banners.Margin = _banners.Children.Count > 0 ? new Thickness(36, 0, 36, 4) : new Thickness(36, 0, 36, 0);
         }
 
-        // Nav badges (warn / critical only on Displays; a client count on Running 3D apps; changed settings on Settings).
+        // Nav badges (warn / critical only on Displays; the running-app count on Troubleshooting; changed settings on Settings).
         SetBadge("displays", StatusText.DisplaysBadge(s));
-        SetBadge("windows", StatusText.WindowsBadge(s));
+        SetBadge(PageRoutes.Troubleshooting, StatusText.WindowsBadge(s)); // the running apps live in Troubleshooting
         SetBadge("settings", _ctx.PerfNonDefault ? new NavBadge(_ctx.Perf!.Levers.Count(l => l.IsSet), Level.Warn) : null);
         int updates = ComponentRows.Updates(_ctx.CatalogRead is { Status: CatalogStatus.Ready } liveCatalog ? liveCatalog.List : null);
         SetBadge("components", updates > 0 ? new NavBadge(updates, Level.Info) : null);
@@ -450,7 +460,7 @@ public sealed class MainWindow : Window
         string tip = id switch
         {
             "displays" => $"{badge.Count} thing{(badge.Count == 1 ? "" : "s")} to check on your displays",
-            "windows" => $"{badge.Count} 3D app{(badge.Count == 1 ? "" : "s")} running",
+            PageRoutes.Troubleshooting => $"{badge.Count} 3D app{(badge.Count == 1 ? "" : "s")} running. Troubleshooting lists them.",
             "settings" => "Some settings are changed from their defaults",
             "components" => $"{badge.Count} update{(badge.Count == 1 ? "" : "s")} available",
             _ => StatusText.HomeBadgeTip,
@@ -480,11 +490,6 @@ public sealed class MainWindow : Window
                 _ctx.ForgetCatalogBackground();
                 _ = _ctx.LoadCatalogAsync(force: true);
                 foreach (var c in ComponentClasses.All) _ = _ctx.LoadPolicyAsync(c, force: true);
-                break;
-            case "developer":
-                _ = _ctx.LoadDpAsync(force: true);
-                _ = _ctx.LoadPerfAsync(force: true);
-                if (_ctx.PerfAllWanted) _ = _ctx.LoadPerfAllAsync(force: true);
                 break;
             default:
                 _current?.OnRefresh();
