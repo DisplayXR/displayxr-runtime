@@ -1,0 +1,383 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Text.Json;
+
+namespace DisplayXR.Dashboard.Model;
+
+// A display driver's settings (ADR-065: the driver serves 2D and 3D at run time; everything else,
+// such as which kind of 3D, is a per-driver SETTING the driver declares and the runtime stores).
+// Read from `displayxr-cli dp options <id> --json`; written with `dp set <id> <KEY> <value>` (per
+// user) and cleared with `dp unset <id> <KEY>`. The Dashboard stores nothing itself.
+//
+// The friendly presentation (a label, value labels, an order) of the few settings an owner is
+// expected to touch is DATA (FriendlyOptions.Table): adding one is a row there, not UI code.
+
+/// <summary>The declared type of a setting (<c>dp options --json</c> <c>type</c>).</summary>
+public enum SettingType { Bool, Int, Float, Enum, String, Secret }
+
+/// <summary>Where the effective value came from (<c>dp options --json</c> <c>source</c>).</summary>
+public enum SettingSource { Absent, Environment, User, Machine, Manifest }
+
+/// <summary>
+/// One declared setting. <see cref="Value"/> is null when nothing stores it (the default stands) and
+/// always for a secret, whose <see cref="IsSet"/> says whether one is stored.
+/// </summary>
+public sealed record DriverSetting(string Key, SettingType Type, string Default, string Help, string? Value, bool IsSet,
+                                   SettingSource Source)
+{
+    /// <summary>The value in force: the stored one, else the declared default.</summary>
+    public string Effective => Value ?? Default;
+}
+
+/// <summary>
+/// <c>displayxr-cli dp options &lt;id&gt; --json</c>. Tolerant: a setting the driver stores but does not
+/// declare (<c>type: null</c>), or of a type this Dashboard does not know, is left out; a document
+/// that is not that shape reads as no options.
+/// </summary>
+public sealed record DriverOptions(string Id, string EnvPrefix, IReadOnlyList<DriverSetting> Settings)
+{
+    public static DriverOptions None(string id) => new(id, "", Array.Empty<DriverSetting>());
+
+    public bool IsEmpty => Settings.Count == 0;
+
+    public DriverSetting? Find(string key) => Settings.FirstOrDefault(s => s.Key == key);
+
+    public static bool TryParse(string? json, out DriverOptions? options)
+    {
+        options = null;
+        if (string.IsNullOrWhiteSpace(json)) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("settings", out var arr) || arr.ValueKind != JsonValueKind.Array)
+                return false;
+            var list = new List<DriverSetting>();
+            foreach (var e in arr.EnumerateArray())
+            {
+                if (e.ValueKind != JsonValueKind.Object) continue;
+                string key = e.Str("key");
+                if (key.Length == 0 || (e.Has("declared") && !e.Bool("declared", true))) continue;
+                bool secret = e.Bool("secret");
+                SettingType? type = secret ? SettingType.Secret : TypeOf(e.Str("type"));
+                if (type is not { } t) continue; // unknown or undeclared: not shown
+                var source = SourceOf(e.Str("source"));
+                string? value = t == SettingType.Secret ? null : e.StrOrNull("value");
+                if (source == SettingSource.Absent) value = null;
+                bool isSet = t == SettingType.Secret ? e.Bool("set", source != SettingSource.Absent) : source != SettingSource.Absent;
+                list.Add(new DriverSetting(key, t, e.Str("default"), e.Str("help"), value, isSet, source));
+            }
+            options = new DriverOptions(root.Str("id"), root.Str("env_prefix"), list);
+            return true;
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException) { return false; }
+    }
+
+    /// <summary>A CLI answer: its JSON when the run succeeded, otherwise (or when it is not that shape) no options.</summary>
+    public static DriverOptions From(string id, bool ok, string json) =>
+        ok && TryParse(json, out var o) ? o! with { Id = o.Id.Length > 0 ? o.Id : id } : None(id);
+
+    private static SettingType? TypeOf(string t) => t switch
+    {
+        "bool" => SettingType.Bool,
+        "int" => SettingType.Int,
+        "float" => SettingType.Float,
+        "enum" => SettingType.Enum,
+        "string" => SettingType.String,
+        "secret" => SettingType.Secret,
+        _ => null,
+    };
+
+    private static SettingSource SourceOf(string s) => s switch
+    {
+        "environment" => SettingSource.Environment,
+        "user" => SettingSource.User,
+        "machine" => SettingSource.Machine,
+        "manifest" => SettingSource.Manifest,
+        _ => SettingSource.Absent,
+    };
+}
+
+/// <summary>How a setting is offered.</summary>
+public enum OptionControl
+{
+    /// <summary>A drop-down of named values (an enum whose values are known).</summary>
+    Choice,
+    /// <summary>On / off (a bool): on writes 1, off writes 0.</summary>
+    Switch,
+    /// <summary>Two named states of a bool (<see cref="FriendlyOption.Choices"/>: the 0 one, then the 1 one).</summary>
+    TwoWay,
+    /// <summary>
+    /// A pin: on writes <see cref="FriendlyOption.PinValue"/>, off clears it. Any other stored value
+    /// that names a state in <see cref="FriendlyOption.Choices"/> is shown as that state.
+    /// </summary>
+    Pin,
+    /// <summary>A text box with Apply (int, float, string, and an enum whose values the CLI does not list).</summary>
+    Text,
+    /// <summary>Never shown: set or not set, and Clear.</summary>
+    Secret,
+}
+
+/// <summary>A value and its words.</summary>
+public sealed record OptionChoice(string Value, string Label);
+
+/// <summary>
+/// The friendly presentation of one setting. <see cref="DriverId"/> null = this key on any display
+/// driver. <see cref="Aliases"/> map other spellings the driver accepts to an offered value;
+/// <see cref="Notes"/> is a sentence shown under the control while that value is in force.
+/// </summary>
+public sealed record FriendlyOption(string? DriverId, string Key, string Label, OptionControl Control, string Help,
+                                    IReadOnlyList<OptionChoice> Choices, int Order,
+                                    IReadOnlyDictionary<string, string>? Aliases = null,
+                                    IReadOnlyDictionary<string, string>? Notes = null,
+                                    string? PinValue = null);
+
+/// <summary>The settings an owner is expected to touch, in words. Everything else is listed under "More options" by its key.</summary>
+public static class FriendlyOptions
+{
+    /// <summary>The simulated display driver's id (the runtime's own, vendor-neutral fallback).</summary>
+    public const string SimDisplay = "sim-display";
+
+    /// <summary>
+    /// The value of the simulated display's OUTPUT with more than two views. The CLI's JSON carries no
+    /// per-value view count (and the status snapshot only the kind in force), so the four-view note is
+    /// keyed on this value name.
+    /// </summary>
+    public const string FourViewKind = "quad";
+
+    public const string FourViewNote = "For checking four-view apps. Most apps show only two of the views, or stay in 2D.";
+
+    public static readonly IReadOnlyList<FriendlyOption> Table = new[]
+    {
+        // ADR-065: the 3D kind mode 1 draws. `2d` / `passthrough` are not offered: "Start in" and
+        // "Always 2D" cover 2D. No top-and-bottom kind exists in sim_display_modes.h.
+        new FriendlyOption(SimDisplay, "OUTPUT", "3D preview kind", OptionControl.Choice,
+            "What the 3D preview looks like when an app turns 3D on.",
+            new[]
+            {
+                new OptionChoice("anaglyph", "Red / cyan (anaglyph)"),
+                new OptionChoice("sbs", "Side by side"),
+                new OptionChoice("squeezed", "Side by side, squeezed"),
+                new OptionChoice(FourViewKind, "Four views (2x2)"),
+                new OptionChoice("interlaced", "Interlaced"),
+                new OptionChoice("blend", "Blend"),
+            }, 10,
+            Aliases: new Dictionary<string, string> { ["squeezed_sbs"] = "squeezed", ["interlace"] = "interlaced" },
+            Notes: new Dictionary<string, string> { [FourViewKind] = FourViewNote }),
+        new FriendlyOption(SimDisplay, "START_3D", "Start in", OptionControl.TwoWay,
+            "How apps start. They can still switch between 2D and the 3D preview.",
+            new[] { new OptionChoice("0", "2D"), new OptionChoice("1", "3D preview") }, 20),
+        new FriendlyOption(SimDisplay, "FORCE_MODE", "Always 2D", OptionControl.Pin,
+            "Keep every app in 2D, whatever it asks for.",
+            new[] { new OptionChoice("1", "Always 3D preview") }, 30, PinValue: "0"),
+        new FriendlyOption(null, "MULTI_VIEWER", "Several viewers", OptionControl.Choice,
+            "Whether 3D is shown for more than one person at a time.",
+            new[]
+            {
+                new OptionChoice("system", "Follow the display's own setting"),
+                new OptionChoice("on", "On"),
+                new OptionChoice("off", "Off"),
+            }, 40),
+    };
+
+    /// <summary>The friendly entry for <paramref name="key"/> of driver <paramref name="driverId"/>: its own first, then one for any driver.</summary>
+    public static FriendlyOption? Find(string driverId, string key) =>
+        Table.FirstOrDefault(f => f.DriverId == driverId && f.Key == key) ?? Table.FirstOrDefault(f => f.DriverId is null && f.Key == key);
+}
+
+/// <summary>Everything a row of the Options block shows, worked out from one setting.</summary>
+/// <param name="Selected">The offered value in force (a Choice / TwoWay value), or null when none is.</param>
+/// <param name="On">A Switch / Pin: whether it is on.</param>
+/// <param name="State">A Pin's other state in force ("Always 3D preview"), shown as its own state.</param>
+/// <param name="ValueText">The value in force, in words (for a Text control: as stored).</param>
+/// <param name="ReadOnly">Set in the environment of the process: it wins, the Dashboard cannot change it.</param>
+/// <param name="CanReset">Something the Dashboard can clear is stored for this user ("Use the default").</param>
+/// <param name="Note">The sentence under the control for the value in force, if any.</param>
+/// <param name="Tooltip">The technical lines: key, type, default, the driver's own help, the environment name.</param>
+public sealed record OptionView(DriverSetting Setting, string Label, OptionControl Control, string Help, bool Friendly,
+                                IReadOnlyList<OptionChoice> Choices, string? Selected, bool On, string? State,
+                                string ValueText, string SourceText, bool ReadOnly, bool CanReset, string? Note,
+                                string Tooltip, FriendlyOption? Entry)
+{
+    public string Key => Setting.Key;
+}
+
+/// <summary>The two parts of a driver's Options block.</summary>
+public sealed record OptionsBlock(string DriverId, IReadOnlyList<OptionView> Friendly, IReadOnlyList<OptionView> More)
+{
+    public bool IsEmpty => Friendly.Count == 0 && More.Count == 0;
+}
+
+public static class OptionViews
+{
+    /// <summary>The sentence under the block.</summary>
+    public const string AppliesNote =
+        "Changes apply the next time a 3D app starts. Apps that are already running, and DisplayXR in the background, keep what they started with.";
+
+    public const string EnvironmentNote = "Set outside the Dashboard, and that value wins: a change here would not apply.";
+
+    /// <summary>Where the value in force comes from, in plain words.</summary>
+    public static string SourceText(SettingSource s) => s switch
+    {
+        SettingSource.User => "Your choice",
+        SettingSource.Machine or SettingSource.Manifest => "Set for everyone on this PC",
+        SettingSource.Environment => "Set outside the Dashboard",
+        _ => "Default",
+    };
+
+    public static string AccessibleName(string label, string driver) => $"{label}: {driver}";
+    public static string ResetName(string label, string driver) => $"Use the default for {label}: {driver}";
+    public static string MoreName(string driver) => $"More options: {driver}";
+
+    public static bool IsTrue(string v) =>
+        v.Trim().ToLowerInvariant() is "1" or "true" or "on" or "yes";
+
+    /// <summary>The block for one driver: the friendly settings in table order, then every other one by its key, in the driver's order.</summary>
+    public static OptionsBlock Build(string driverId, DriverOptions options)
+    {
+        var friendly = new List<(int Order, OptionView View)>();
+        var more = new List<OptionView>();
+        foreach (var s in options.Settings)
+        {
+            var entry = s.Type == SettingType.Secret ? null : FriendlyOptions.Find(driverId, s.Key);
+            var view = View(s, entry, options.EnvPrefix);
+            if (entry is not null) friendly.Add((entry.Order, view));
+            else more.Add(view);
+        }
+        return new OptionsBlock(driverId, friendly.OrderBy(f => f.Order).Select(f => f.View).ToArray(), more);
+    }
+
+    public static OptionView View(DriverSetting s, FriendlyOption? f, string envPrefix = "")
+    {
+        bool readOnly = s.Source == SettingSource.Environment;
+        bool canReset = !readOnly && s.Source == SettingSource.User;
+        string source = SourceText(s.Source);
+        var tip = new List<string> { $"{s.Key} ({TypeWord(s.Type)})" };
+        if (s.Type != SettingType.Secret && s.Default.Length > 0) tip.Add($"default {s.Default}");
+        if (s.Help.Length > 0) tip.Add(s.Help);
+        if (envPrefix.Length > 0) tip.Add($"environment: {envPrefix}{s.Key}");
+        string tooltip = string.Join("\n", tip);
+
+        if (s.Type == SettingType.Secret)
+            return new OptionView(s, s.Key, OptionControl.Secret, s.Help, false, Array.Empty<OptionChoice>(), null, s.IsSet, null,
+                                  s.IsSet ? "Set" : "Not set", source, readOnly, canReset && s.IsSet, null, tooltip, null);
+
+        string effective = s.Effective;
+        if (f is null)
+        {
+            // Raw: the key is the label and the driver's own help is the help. The CLI lists no enum
+            // values, so an enum is a text box too.
+            var control = s.Type == SettingType.Bool ? OptionControl.Switch : OptionControl.Text;
+            bool on = s.Type == SettingType.Bool && IsTrue(effective);
+            string text = s.Type == SettingType.Bool ? (on ? "On" : "Off") : effective.Length > 0 ? effective : "Not set";
+            return new OptionView(s, s.Key, control, s.Help, false, Array.Empty<OptionChoice>(), null, on, null,
+                                  text, source, readOnly, canReset, null, tooltip, null);
+        }
+
+        switch (f.Control)
+        {
+            case OptionControl.Choice:
+            {
+                string resolved = f.Aliases is not null && f.Aliases.TryGetValue(effective, out var a) ? a : effective;
+                var choice = f.Choices.FirstOrDefault(c => c.Value == resolved);
+                string? note = choice is not null && f.Notes is not null && f.Notes.TryGetValue(choice.Value, out var n) ? n : null;
+                return new OptionView(s, f.Label, OptionControl.Choice, f.Help, true, f.Choices, choice?.Value, false, null,
+                                      choice?.Label ?? Quoted(effective), source, readOnly, canReset, note, tooltip, f);
+            }
+            case OptionControl.TwoWay:
+            {
+                bool on = IsTrue(effective);
+                var choice = f.Choices.Count >= 2 ? f.Choices[on ? 1 : 0] : null;
+                return new OptionView(s, f.Label, OptionControl.TwoWay, f.Help, true, f.Choices, choice?.Value, on, null,
+                                      choice?.Label ?? Quoted(effective), source, readOnly, canReset, null, tooltip, f);
+            }
+            case OptionControl.Pin:
+            {
+                bool on = f.PinValue is not null && effective.Trim() == f.PinValue;
+                var other = on ? null : f.Choices.FirstOrDefault(c => c.Value == effective.Trim());
+                string text = on ? "On" : other?.Label ?? "Off";
+                return new OptionView(s, f.Label, OptionControl.Pin, f.Help, true, f.Choices, other?.Value, on, other?.Label,
+                                      text, source, readOnly, canReset, null, tooltip, f);
+            }
+            case OptionControl.Switch:
+            {
+                bool on = IsTrue(effective);
+                return new OptionView(s, f.Label, OptionControl.Switch, f.Help, true, f.Choices, null, on, null,
+                                      on ? "On" : "Off", source, readOnly, canReset, null, tooltip, f);
+            }
+            default:
+                return new OptionView(s, f.Label, OptionControl.Text, f.Help, true, f.Choices, null, false, null,
+                                      effective.Length > 0 ? effective : "Not set", source, readOnly, canReset, null, tooltip, f);
+        }
+    }
+
+    private static string Quoted(string v) => v.Length > 0 ? $"“{v}”" : "Not set";
+
+    private static string TypeWord(SettingType t) => t.ToString().ToLowerInvariant();
+
+    /// <summary>
+    /// A text box's value checked before it is written: an int as a whole number, a float as a
+    /// number (written with a '.'), anything else as one line. A value starting with "--" is
+    /// refused (the CLI would read it as a flag). Null with <paramref name="error"/> set when it
+    /// cannot be written.
+    /// </summary>
+    public static string? Validate(SettingType type, string? text, out string? error)
+    {
+        error = null;
+        string v = (text ?? "").Trim();
+        if (v.Length == 0) { error = "Type a value first."; return null; }
+        if (v.Contains('\n') || v.Contains('\r')) { error = "One line only."; return null; }
+        if (v.StartsWith("--", StringComparison.Ordinal)) { error = "A value can't start with two dashes."; return null; }
+        switch (type)
+        {
+            case SettingType.Int:
+                if (!long.TryParse(v, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var l))
+                {
+                    error = "Type a whole number.";
+                    return null;
+                }
+                return l.ToString(CultureInfo.InvariantCulture);
+            case SettingType.Float:
+                if (!double.TryParse(v.Replace(',', '.'), NumberStyles.Float, CultureInfo.InvariantCulture, out var d) || !double.IsFinite(d))
+                {
+                    error = "Type a number.";
+                    return null;
+                }
+                return d.ToString("R", CultureInfo.InvariantCulture);
+            case SettingType.Bool:
+                return IsTrue(v) ? "1" : v.ToLowerInvariant() is "0" or "false" or "off" or "no" ? "0" : Fail("Type 1 or 0.", out error);
+            default:
+                return v;
+        }
+    }
+
+    private static string? Fail(string message, out string? error)
+    {
+        error = message;
+        return null;
+    }
+
+    /// <summary>The value a Pin's switch writes, or null when turning it off means clearing it.</summary>
+    /// <remarks>Off clears this user's value; when the value in force comes from the machine, clearing would
+    /// change nothing, so off writes the driver's default for this user instead.</remarks>
+    public static string? PinWrite(OptionView v, bool on) =>
+        on ? v.Entry?.PinValue ?? "1"
+        : v.Setting.Source is SettingSource.Machine or SettingSource.Manifest ? v.Setting.Default
+        : null;
+}
+
+/// <summary>The CLI verbs of the Options block: argument vectors, never strings.</summary>
+public static class OptionCommands
+{
+    /// <summary>The action area the Options block's writes report under.</summary>
+    public const string Area = "dp-options";
+
+    public static CliArgs Read(string id) => new("dp", "options", id, "--json");
+    public static CliArgs Set(string id, string key, string value) => new("dp", "set", id, key, value);
+    public static CliArgs Unset(string id, string key) => new("dp", "unset", id, key);
+}

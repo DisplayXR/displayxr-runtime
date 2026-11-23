@@ -1,0 +1,17 @@
+{
+	"id":	"leia-sr",
+	"class":	"dp",
+	"env_prefix":	"DXR_DP_LEIA_SR_",
+	"user_store":	"HKCU\\Software\\DisplayXR\\DisplayProcessors\\leia-sr\\Settings",
+	"machine_store":	"HKLM\\Software\\DisplayXR\\DisplayProcessors\\leia-sr\\Settings",
+	"settings":	[{
+			"key":	"MULTI_VIEWER",
+			"declared":	true,
+			"type":	"enum",
+			"default":	"system",
+			"help":	"multi-viewer weave: system, on, off",
+			"secret":	false,
+			"value":	null,
+			"source":	"absent"
+		}]
+}
