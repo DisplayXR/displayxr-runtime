@@ -94,19 +94,39 @@ ipc_server_input_queue_pointer_captured(void);
 
 /*!
  * Route one service-window input event to the right per-target queue(s) — the
- * #61 policy the macOS AppKit pump implements inline (ipc_server_macos_appkit.m
- * route_input_event), shared here for desktop Linux (ipc_server_linux_input.c):
+ * #61 policy, shared by the macOS AppKit pump (ipc_server_macos_appkit.m) and
+ * desktop Linux (ipc_server_linux_input.c):
  * the controller always receives buttons / motion / keys; content pointer and
  * motion are also forwarded to the window under the cursor
  * (comp_multi_workspace_hit_test_window_px); scroll routes exclusively; keys
- * follow the focused client except workspace chords (Ctrl-chords, TAB, ESC,
- * DELETE, F11, arrows, [ ]). While the launcher band holds the input grab, or a
+ * follow the focused client except the reserved ones (the controller's table
+ * from @ref ipc_server_input_queue_set_reserved_keys, else the Windows default:
+ * bare TAB, DELETE, ESC, [ ]; every other chord, Ctrl ones included, reaches
+ * the app with its modifiers). While the launcher band holds the input grab, or a
  * controller gesture holds pointer capture, everything goes to the controller
  * only. With no controller and no placed window every event lands on the
  * controller queue, which a lone forced-IPC app drains. Thread-safe.
+ *
+ * XR_DXR_workspace_client_input: a content app's copy of a pointer / motion /
+ * scroll event carries the cursor normalized to that app's content rect
+ * (local_u / local_v, NaN when it has no placed rect); the controller's copy is
+ * pushed unchanged. A button press makes the target app the POINTER OWNER: its
+ * motion and its releases keep going to it, with the position unclamped, until
+ * no button is held — a drag that leaves the window is not cut off, and the
+ * release always reaches the app that saw the press.
  */
 void
 ipc_server_input_route(const struct ipc_workspace_input_event *event);
+
+/*!
+ * The controller's reserved-key table (xrSetWorkspaceReservedKeysDXR, spec 24):
+ * those exact (vk, modifiers) chords stay controller-only, every other key is
+ * also forwarded to the focused app. NULL or count 0 restores the built-in
+ * default (the Windows service's list: bare TAB, DELETE, ESC, [ ]).
+ * Thread-safe.
+ */
+void
+ipc_server_input_queue_set_reserved_keys(const struct ipc_workspace_reserved_keys *table);
 
 /*!
  * Inject a synthetic KEY down + up for the workspace controller only

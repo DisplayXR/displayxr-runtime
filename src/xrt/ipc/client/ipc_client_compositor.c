@@ -49,6 +49,9 @@
 // array through without seeing IPC types. Pulling the public header here
 // is fine — it lives outside the IPC layer's coupling concerns.
 #include <openxr/XR_DXR_spatial_workspace.h>
+#include <openxr/XR_DXR_workspace_client_input.h>
+
+#include <math.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -2116,6 +2119,87 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 		}
 	}
 	*out_count = copy;
+	return XRT_SUCCESS;
+}
+
+static void
+client_input_set_position(XrWorkspaceClientInputEventDXR *out, float u, float v)
+{
+	// The router writes NaN when the app has no placed rect.
+	if (!isnan(u) && !isnan(v)) {
+		out->positionValid = XR_TRUE;
+		out->position.x = u;
+		out->position.y = v;
+	}
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_client_enumerate_input_events(struct xrt_compositor *xc,
+                                                                   uint32_t capacity,
+                                                                   uint32_t *out_count,
+                                                                   void *out_events)
+{
+	if (xc == NULL || out_count == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_count = 0;
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	// capacity 0 drains nothing: no round trip at all.
+	if (capacity == 0 || out_events == NULL) {
+		return XRT_SUCCESS;
+	}
+	if (capacity > IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX) {
+		capacity = IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX;
+	}
+
+	struct ipc_workspace_input_event_batch batch = {0};
+	xrt_result_t xret = ipc_call_workspace_client_enumerate_input_events(icc->ipc_c, capacity, &batch);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+
+	XrWorkspaceClientInputEventDXR *dst = (XrWorkspaceClientInputEventDXR *)out_events;
+	uint32_t n = batch.count < capacity ? batch.count : capacity;
+	uint32_t written = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		const struct ipc_workspace_input_event *src = &batch.events[i];
+		XrWorkspaceClientInputEventDXR *out = &dst[written];
+		memset(out, 0, sizeof(*out));
+		out->timestampMs = src->timestamp_ms;
+		switch (src->event_type) {
+		case IPC_WORKSPACE_INPUT_EVENT_KEY:
+			out->eventType = XR_WORKSPACE_CLIENT_INPUT_EVENT_KEY_DXR;
+			out->vkCode = src->u.key.vk_code;
+			out->isDown = src->u.key.is_down ? XR_TRUE : XR_FALSE;
+			out->modifiers = src->u.key.modifiers;
+			break;
+		case IPC_WORKSPACE_INPUT_EVENT_POINTER:
+			out->eventType = XR_WORKSPACE_CLIENT_INPUT_EVENT_BUTTON_DXR;
+			out->button = src->u.pointer.button;
+			out->isDown = src->u.pointer.is_down ? XR_TRUE : XR_FALSE;
+			out->modifiers = src->u.pointer.modifiers;
+			client_input_set_position(out, src->u.pointer.local_u, src->u.pointer.local_v);
+			break;
+		case IPC_WORKSPACE_INPUT_EVENT_POINTER_MOTION:
+			out->eventType = XR_WORKSPACE_CLIENT_INPUT_EVENT_MOTION_DXR;
+			out->buttonMask = src->u.pointer_motion.button_mask;
+			out->modifiers = src->u.pointer_motion.modifiers;
+			client_input_set_position(out, src->u.pointer_motion.local_u, src->u.pointer_motion.local_v);
+			break;
+		case IPC_WORKSPACE_INPUT_EVENT_SCROLL:
+			out->eventType = XR_WORKSPACE_CLIENT_INPUT_EVENT_SCROLL_DXR;
+			out->scrollDeltaY = src->u.scroll.delta_y;
+			out->modifiers = src->u.scroll.modifiers;
+			client_input_set_position(out, src->u.scroll.local_u, src->u.scroll.local_v);
+			break;
+		default: continue; // nothing else is routed to a content app
+		}
+		written++;
+	}
+	*out_count = written;
 	return XRT_SUCCESS;
 }
 

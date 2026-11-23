@@ -5274,6 +5274,7 @@ ipc_handle_workspace_deactivate(volatile struct ipc_client_state *_ics)
 		ipc_server_input_queue_set_input_grab(false);
 		ipc_server_input_queue_set_pointer_capture(false);
 		ipc_server_input_queue_clear_frame_tick();
+		ipc_server_input_queue_set_reserved_keys(NULL);
 #endif
 	}
 #ifdef XRT_OS_ANDROID
@@ -5977,6 +5978,43 @@ ipc_handle_workspace_enumerate_input_events(volatile struct ipc_client_state *_i
 #endif
 }
 
+// XR_DXR_workspace_client_input: a CONTENT app drains the input the workspace
+// routed to it. Only the shared-surface service (desktop Linux, macOS; the
+// arm also compiles on Android, where nothing feeds the queues) has per-client
+// queues. Every other build (the Windows D3D11 service, which posts window
+// messages into the app's own hidden HWND instead) answers zero events and
+// touches nothing.
+xrt_result_t
+ipc_handle_workspace_client_enumerate_input_events(volatile struct ipc_client_state *_ics,
+                                                   uint32_t capacity,
+                                                   struct ipc_workspace_input_event_batch *out_batch)
+{
+	if (out_batch == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	out_batch->count = 0;
+
+#if defined(COMP_MULTI_SHARED_SURFACE) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct ipc_server *s = _ics->server;
+	const unsigned long controller_pid = effective_workspace_controller_pid(s);
+	const unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+
+	// No workspace: the app's own window gets input natively — never
+	// duplicate it (and never steal the controller queue a lone forced-IPC
+	// app drains through XR_DXR_spatial_workspace). The controller itself
+	// drains its stream through xrEnumerateWorkspaceInputEventsDXR.
+	if (controller_pid == 0 || caller_pid == controller_pid || _ics->xc == NULL || capacity == 0) {
+		return XRT_SUCCESS;
+	}
+	ipc_server_input_queue_drain((void *)_ics->xc, capacity, out_batch);
+	return XRT_SUCCESS;
+#else
+	(void)_ics;
+	(void)capacity;
+	return XRT_SUCCESS;
+#endif
+}
+
 xrt_result_t
 ipc_handle_workspace_pointer_capture_set(volatile struct ipc_client_state *_ics, bool enabled, uint32_t button)
 {
@@ -6613,6 +6651,15 @@ ipc_handle_workspace_set_reserved_keys(volatile struct ipc_client_state *_ics,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	return comp_d3d11_service_workspace_set_reserved_keys(s->xsysc, table);
+#elif defined(COMP_MULTI_SHARED_SURFACE)
+	// macOS / desktop Linux: the shared router holds the table and applies it
+	// to the focused-app key forwarding (same policy as the Windows window).
+	(void)s;
+	if (table == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	ipc_server_input_queue_set_reserved_keys(table);
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)table;

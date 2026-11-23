@@ -175,6 +175,15 @@
 		]
 	},
 
+	"workspace_client_enumerate_input_events": {
+		"in": [
+			{"name": "capacity", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "batch", "type": "struct ipc_workspace_input_event_batch"}
+		]
+	},
+
 	"workspace_pointer_capture_set": {
 		"in": [
 			{"name": "enabled", "type": "bool"},

@@ -1798,3 +1798,73 @@ oxr_xrGetWorkspaceClientWindowPlacementDXR(XrSession session,
 }
 
 #endif // OXR_HAVE_DXR_spatial_workspace
+
+
+/*
+ * XR_DXR_workspace_client_input — a CONTENT app drains the input the workspace
+ * routed to it (desktop Linux / macOS shared surface).
+ */
+
+#ifdef OXR_HAVE_DXR_workspace_client_input
+
+// Defined in src/xrt/ipc/client/ipc_client_compositor.c (see the header
+// comment on the bridge pattern at the top of this file).
+xrt_result_t
+comp_ipc_client_compositor_workspace_client_enumerate_input_events(struct xrt_compositor *xc,
+                                                                   uint32_t capacity,
+                                                                   uint32_t *out_count,
+                                                                   void *out_events);
+
+static bool
+client_input_session_is_ipc(struct oxr_session *sess)
+{
+	if (sess == NULL || sess->xcn == NULL || sess->sys == NULL || sess->sys->xsysc == NULL) {
+		return false;
+	}
+	if (sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor || sess->is_metal_native_compositor ||
+	    sess->is_gl_native_compositor || sess->is_vk_native_compositor) {
+		return false;
+	}
+	return sess->sys->xsysc->xmcc == NULL;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateWorkspaceClientInputEventsDXR(XrSession session,
+                                             uint32_t capacityInput,
+                                             uint32_t *countOutput,
+                                             XrWorkspaceClientInputEventDXR *events)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateWorkspaceClientInputEventsDXR");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_workspace_client_input);
+	OXR_VERIFY_ARG_NOT_NULL(&log, countOutput);
+
+	if (capacityInput > 0 && events == NULL) {
+		return oxr_error(
+		    &log, XR_ERROR_VALIDATION_FAILURE,
+		    "xrEnumerateWorkspaceClientInputEventsDXR: events must not be NULL when capacityInput > 0");
+	}
+
+	*countOutput = 0;
+	// In-process sessions own a real window that gets input natively; there
+	// is nothing to drain. capacity 0 drains nothing by definition.
+	if (capacityInput == 0 || !client_input_session_is_ipc(sess)) {
+		return XR_SUCCESS;
+	}
+
+	uint32_t count = 0;
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_client_enumerate_input_events(
+	    &sess->xcn->base, capacityInput, &count, events);
+	if (xret != XRT_SUCCESS) {
+		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
+		                 "xrEnumerateWorkspaceClientInputEventsDXR: IPC call failed (%d)", (int)xret);
+	}
+	*countOutput = count;
+	return XR_SUCCESS;
+}
+
+#endif // OXR_HAVE_DXR_workspace_client_input
