@@ -431,6 +431,7 @@ public sealed class MainWindow : Window
         if (badge is null)
         {
             b.IsVisible = false;
+            if (_nav.TryGetValue(id, out var plain)) Avalonia.Automation.AutomationProperties.SetName(plain, TitleOf(id));
             return;
         }
         b.IsVisible = true;
@@ -446,15 +447,20 @@ public sealed class MainWindow : Window
             b.Background = Tokens.Alpha(Tokens.ColorKey(badge.Level), 0.22);
             t.Foreground = Tokens.For(badge.Level);
         }
-        ToolTip.SetTip(b, id switch
+        string tip = id switch
         {
             "displays" => $"{badge.Count} thing{(badge.Count == 1 ? "" : "s")} to check on your displays",
             "windows" => $"{badge.Count} 3D app{(badge.Count == 1 ? "" : "s")} running",
             "performance" => "Some settings are changed from their defaults",
             "components" => $"{badge.Count} update{(badge.Count == 1 ? "" : "s")} available",
-            _ => "A display-processor override is active",
-        });
+            _ => StatusText.HomeBadgeTip,
+        };
+        ToolTip.SetTip(b, tip);
+        // The badge is said in words to a screen reader too: "Home: one display driver is set ...".
+        if (_nav.TryGetValue(id, out var rb)) Avalonia.Automation.AutomationProperties.SetName(rb, $"{TitleOf(id)}: {tip}");
     }
+
+    private string TitleOf(string id) => _pages.FirstOrDefault(p => p.Id == id)?.Title ?? id;
 
     // ── Actions ─────────────────────────────────────────────────────────────
 

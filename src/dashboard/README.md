@@ -336,6 +336,11 @@ parts (the job object, raising the first instance) are no-ops there.
   a watch child prints nothing for 10 s, a WARN and a "No status yet" pill. Mixing a
   `_package\bin` dashboard with an installed service (or the reverse) is the usual way in.
 - `--version` prints the version and exits (no window).
+- Rail badges: Displays (things to check), Components (updates), Performance (changed settings),
+  Running 3D apps (how many), and an amber **1** on Home when one display driver is set for every
+  display on this PC (`dp list --json` `preferred`). Each badge is said in words: its tooltip, the
+  rail entry's accessible name ("Home: One display driver is set ..."), and on Home the notice that
+  explains it and offers "Clear this setting".
 - `--page displays|windows|components|performance|developer|home` opens on that page
   (`catalog` still works and opens Components). `windows` is the page shown as **Running 3D apps**.
   The rail's order is Home, Displays, Components, Performance, Running 3D apps, Developer.

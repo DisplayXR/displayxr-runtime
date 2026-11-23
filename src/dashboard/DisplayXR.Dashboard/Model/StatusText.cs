@@ -319,8 +319,11 @@ public static class StatusText
     /// </summary>
     public static (string Title, string Text)? MachineOverrideNotice(DpList? dp) => dp?.Preferred is { Length: > 0 } id
         ? ($"One display driver is set for every display on this PC: {id}.",
-           "You can choose a driver for each display on Displays. Clearing this setting needs administrator permission.")
+           "You can choose a driver for each display on Displays. Clearing this setting needs administrator permission. The amber mark next to Home stands for this setting.")
         : null;
+
+    /// <summary>The tooltip and accessible name of the amber mark on the Home rail entry (a machine-wide driver choice).</summary>
+    public const string HomeBadgeTip = "One display driver is set for every display on this PC. Home says which, and how to clear it.";
 
     public sealed record HomeScreenDp(string Name, string? Plugin, string? Forced);
 
