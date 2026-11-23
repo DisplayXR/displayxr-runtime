@@ -46,12 +46,13 @@ struct fake_head
 
 TEST_CASE("active mode view scale: reads the ACTIVE index, not index 0")
 {
-	fake_head h(3, /* active */ 2);
+	// Two modes, as every driver serves at run time (ADR-065): 0 = 2D, 1 = 3D.
+	fake_head h(2, /* active */ 1);
 
 	float x = -1.0f, y = -1.0f;
 	REQUIRE(xrt_device_get_active_mode_view_scale(&h.xdev, &x, &y));
-	CHECK(x == Catch::Approx(0.3f));
-	CHECK(y == Catch::Approx(0.6f));
+	CHECK(x == Catch::Approx(0.2f));
+	CHECK(y == Catch::Approx(0.4f));
 
 	// Moving the active index is the WHOLE update — nothing else to refresh.
 	h.hmd.active_rendering_mode_index = 0;

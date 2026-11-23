@@ -96,6 +96,22 @@ TEST_CASE("requests during a degrade are recorded, not forwarded, and win at rel
 	REQUIRE(h.sent == std::vector<bool>{true, false, false, true});
 }
 
+TEST_CASE("a session that BEGAN in 2D restores 2D (a driver that starts flat, ADR-065)", "[display_mode_hold]")
+{
+	// sim-display starts in mode 0 by default, so xrBeginSession requests the
+	// 2D mode's hardware state: the hold must give back 2D, not force 3D.
+	Harness h;
+	h.session_request(false); // xrBeginSession in the flat mode
+	h.degrade(true);
+	h.degrade(false);
+	REQUIRE(h.sent == std::vector<bool>{false, false, false});
+	CHECK_FALSE(h.hold.wanted_3d);
+
+	// ...and V (or 1) later still reaches the DP.
+	h.session_request(true);
+	REQUIRE(h.sent == std::vector<bool>{false, false, false, true});
+}
+
 TEST_CASE("a session that never asked still restores 3D", "[display_mode_hold]")
 {
 	Harness h; // no request yet: sessions begin 3D

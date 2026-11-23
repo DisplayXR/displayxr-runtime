@@ -129,8 +129,11 @@ TEST_CASE("zero-copy: an ALIASED tail is ignored, not disqualifying (ADR-041)", 
 TEST_CASE("zero-copy: a submission that does NOT cover the mode is refused (ADR-041)", "[aux][u_tiling]")
 {
 	// R < A: PRIMARY_STEREO (2 views) while the panel is in a 2x2 quad mode.
-	// There is no atlas to hand over, and reading 4 tiles out of a 2-view
-	// submission would pick up slots the app never wrote.
+	// Under ADR-065 that is sim_display's quad KIND held as mode 1 by a pin
+	// (OUTPUT=quad FORCE_MODE=1) - unpinned, the session-begin floor would
+	// have taken the stereo session to 2D. There is no atlas to hand over, and
+	// reading 4 tiles out of a 2-view submission would pick up slots the app
+	// never wrote.
 	xrt_rendering_mode quad{};
 	quad.view_count = 4;
 	quad.tile_columns = 2;
@@ -168,7 +171,7 @@ TEST_CASE("zero-copy: a submission that does NOT cover the mode is refused (ADR-
 namespace {
 
 //! Cropped SBS: 1 column x 2 ROWS. The cheapest layout with a top/bottom to
-//! get wrong, and one sim_display has shipped for a long time.
+//! get wrong, and sim_display's `sbs` kind (mode 1 under OUTPUT=sbs, ADR-065).
 xrt_rendering_mode
 stacked_mode()
 {
@@ -183,7 +186,8 @@ stacked_mode()
 	return m;
 }
 
-//! 2x2 quad — two rows AND two columns, so it also pins that X never flips.
+//! 2x2 quad — two rows AND two columns, so it also pins that X never flips
+//! (sim_display's `quad` inspection kind).
 xrt_rendering_mode
 quad_mode()
 {
