@@ -144,6 +144,7 @@ dxr_late_weave_enabled();
 #ifdef XRT_OS_WINDOWS
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan_win32.h>
+#include "comp_vk_native_import.h"
 // Transparent-background present path: VK -> D3D11 KMT shared textures ->
 // DComp + CreateSwapChainForComposition flip-model swapchain -> HWND.
 #include <d3d11.h>
@@ -1568,15 +1569,9 @@ dcomp_import_one(struct comp_vk_native_target *target,
 	    .buffer = VK_NULL_HANDLE,
 	};
 
-	VkPhysicalDeviceMemoryProperties mem_props = {};
-	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mem_props);
-	uint32_t memory_type_index = UINT32_MAX;
-	for (uint32_t k = 0; k < mem_props.memoryTypeCount; k++) {
-		if ((requirements.memoryTypeBits & (1u << k)) != 0) {
-			memory_type_index = k;
-			break;
-		}
-	}
+	// The handle's legal types, not just the image's (VUID-...-memoryTypeIndex-00645).
+	const uint32_t memory_type_index = comp_vk_native_import_memory_type(
+	    vk, requirements.memoryTypeBits, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT, shared_nt);
 	if (memory_type_index == UINT32_MAX) {
 		U_LOG_E("DComp bridge: no compatible memory type for ring[%u]", i);
 		return false;
