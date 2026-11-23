@@ -89,11 +89,19 @@ public static class StatusText
     /// A display recognised as a 3D display: claimed by a display driver that is not the simulated one.
     /// The simulated driver claims every display (at the lowest confidence) so that apps run anywhere;
     /// that is not a 3D display. Two exceptions count as a 3D display: the simulated driver was CHOSEN
-    /// for it (a per-display override, <c>claim.forced</c>), and it holds the display only because a
-    /// vendor driver is unhealthy (<see cref="FellBack"/>: a 3D display that needs attention, as before).
+    /// for it (a per-display preference: <c>claim.forced</c>, or <c>claim.preferred_plugin</c> naming the
+    /// simulated driver from any source, the environment included), and it holds the display only because
+    /// a vendor driver is unhealthy (<see cref="FellBack"/>: a 3D display that needs attention, as before).
+    /// A GLOBAL preference (<c>dp use</c> without <c>--screen</c>, or its environment pin) is not in the
+    /// status snapshot, so it cannot count here.
     /// </summary>
     public static bool IsReal3D(StatusSnapshot? snap, Screen s) =>
-        s.Claim.IsClaimed && (s.Claim.Forced == true || !IsSimulatedDriver(snap, s.Claim.PluginId) || FellBack(snap, s));
+        s.Claim.IsClaimed && (s.Claim.Forced == true || ChoseSimulated(snap, s)
+                              || !IsSimulatedDriver(snap, s.Claim.PluginId) || FellBack(snap, s));
+
+    /// <summary>A per-display preference names the simulated driver for this display (whatever its source).</summary>
+    public static bool ChoseSimulated(StatusSnapshot? snap, Screen s) =>
+        s.Claim.PreferredPlugin is { Length: > 0 } pp && IsSimulatedDriver(snap, pp);
 
     /// <summary>Claimed only by the simulated display driver: an ordinary display that driver gives a 3D preview.</summary>
     public static bool IsSimulatedPreview(StatusSnapshot? snap, Screen s) => s.Claim.IsClaimed && !IsReal3D(snap, s);
@@ -192,7 +200,7 @@ public static class StatusText
         string name = nameOf?.Invoke(id) is { Length: > 0 } n ? n : id;
         if (IsSimulatedPreview(snap, s)) return $"Not recognised as a 3D display{Sep}display driver: {name}, which gives it a 3D preview";
         string line = $"Recognised as a 3D display{Sep}display driver: {name}";
-        if (s.Claim.Forced == true) line += $"{Sep}{ChosenWord(s.Claim.PreferredSource)}";
+        if (s.Claim.Forced == true || ChoseSimulated(snap, s)) line += $"{Sep}{ChosenWord(s.Claim.PreferredSource)}";
         return line;
     }
 

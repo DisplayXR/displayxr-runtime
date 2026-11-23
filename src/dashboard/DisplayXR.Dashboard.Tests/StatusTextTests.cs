@@ -151,6 +151,27 @@ public class StatusTextTests
         Assert.Equal(VerdictKind.No3DDisplay, Verdicts.From(snap).Kind);
     }
 
+    /// <summary>
+    /// Review finding 8: the simulated driver chosen for a display through a per-display preference from
+    /// any source (the environment included, even where the claim is not marked forced) is a 3D display
+    /// showing the simulated preview by choice, on both pages.
+    /// </summary>
+    [Fact]
+    public void SimulatedChosenByAPreference_CountsAsA3DDisplay()
+    {
+        var (snap, sim) = SimOnly();
+        var byEnv = sim with { Claim = sim.Claim with { Forced = false, PreferredPlugin = "sim-display", PreferredSource = "env" } };
+        var s = snap with { Screens = new[] { byEnv } };
+        Assert.True(StatusText.ChoseSimulated(s, byEnv));
+        Assert.True(StatusText.IsReal3D(s, byEnv));
+        Assert.NotEqual(Verdicts.Plain2D, StatusText.PlainBadge(byEnv, s).Text);
+        Assert.Equal("Recognised as a 3D display · display driver: sim-display · chosen by hand", StatusText.PlainClaimLine(byEnv, null, s));
+        Assert.NotEqual(VerdictKind.No3DDisplay, Verdicts.From(s).Kind);
+        // A preference for another driver does not make the simulated claim a 3D display.
+        var other = sim with { Claim = sim.Claim with { PreferredPlugin = "leia-sr", PreferredSource = "user" } };
+        Assert.False(StatusText.ChoseSimulated(snap, other));
+    }
+
     [Fact]
     public void DisplaysCard_SimulatedOnly_SaysOrdinary2D()
     {
