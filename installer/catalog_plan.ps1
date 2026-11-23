@@ -150,12 +150,12 @@ catch {
 }
 
 if ($exit -eq 10) {
-    Write-Ini 'offline' 10 'The DisplayXR Catalog could not be reached.' @() 0 $wantIds
+    Write-Ini 'offline' 10 'The list of optional components could not be reached.' @() 0 $wantIds
     exit 0
 }
 if ($exit -eq 11) {
     # A refused catalog: nothing is handed to `dxr-get install` either.
-    Write-Ini 'error' 11 'The DisplayXR Catalog failed its signature check.' @() 0 @()
+    Write-Ini 'error' 11 'The list of optional components failed its signature check.' @() 0 @()
     exit 0
 }
 $rows = $null
