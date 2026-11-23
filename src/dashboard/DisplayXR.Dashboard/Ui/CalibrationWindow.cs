@@ -347,7 +347,7 @@ public sealed class CalibrationWindow : Window
             if (s.HighRms) Line("Warning: RMS above 5 mm. Retake the flagged samples (R) or start over (A).", 0xF0);
             if (_session.FallbackNote is { } note) Line(note, 0xF0);
             if (s.IllConditioned) Line("Warning: the fit is ill-conditioned (the samples barely constrain a parameter). Check near and far in the live check; start over (A) with a bigger distance change if the dot drifts.", 0xF0);
-            Line(string.Format(ci, "Camera at ({0:0.0}, {1:0.0}) mm from the screen centre, pitch {2:0.0}°, yaw {3:0.0}°, roll {4:0.0}° (mode {5}; depth from the glass is not observable and assumed 0).",
+            Line(string.Format(ci, "Camera at ({0:0.0}, {1:0.0}) mm from the display centre, pitch {2:0.0}°, yaw {3:0.0}°, roll {4:0.0}° (mode {5}; depth from the glass is not observable and assumed 0).",
                                s.Pose!.T.X * 1000, s.Pose.T.Y * 1000, s.PitchDeg, s.YawDeg, s.RollDeg, s.Mode), 0xA0);
             Line(string.Format(ci, "{0} of {1} samples used, {2} distinct targets{3}.", s.UsedCount, s.SampleCount, s.DistinctDots,
                                s.IllConditioned ? "; ill-conditioned" : ""), 0xA0);

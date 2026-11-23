@@ -162,7 +162,7 @@ public sealed class WindowsPage : Page
     private static Control SegmentTable(StatusSnapshot s, Client c)
     {
         var g = new Grid { ColumnDefinitions = new ColumnDefinitions("2*,1.4*,Auto,Auto,Auto") };
-        string[] heads = { "Screen", "Canvas", "DP", "Woven", "Eyes" };
+        string[] heads = { "Display", "Canvas", "Display driver", "Woven", "Eyes" };
         g.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
         for (int i = 0; i < heads.Length; i++)
         {

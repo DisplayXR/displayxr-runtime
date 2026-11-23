@@ -448,7 +448,7 @@ public sealed class MainWindow : Window
         }
         ToolTip.SetTip(b, id switch
         {
-            "displays" => $"{badge.Count} warning{(badge.Count == 1 ? "" : "s")} on the screens",
+            "displays" => $"{badge.Count} thing{(badge.Count == 1 ? "" : "s")} to check on your displays",
             "windows" => $"{badge.Count} 3D app{(badge.Count == 1 ? "" : "s")} running",
             "performance" => "Some settings are changed from their defaults",
             "components" => $"{badge.Count} update{(badge.Count == 1 ? "" : "s")} available",

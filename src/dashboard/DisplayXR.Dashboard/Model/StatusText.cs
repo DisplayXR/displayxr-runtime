@@ -68,7 +68,7 @@ public static class StatusText
     public static string ScreenName(Screen s) =>
         s.FriendlyName.Trim().Length > 0 ? s.FriendlyName.Trim()
         : ShortDevice(s.DeviceName).Length > 0 ? ShortDevice(s.DeviceName)
-        : s.Id.Length > 0 ? s.Id : $"Screen {s.Index}";
+        : s.Id.Length > 0 ? s.Id : $"Display {s.Index}";
 
     public static IEnumerable<string> Chips(Screen s)
     {
@@ -510,7 +510,7 @@ public static class StatusText
         var w = s.ScreenById(seg.Screen)?.Warnings.FirstOrDefault(x => x.Code == "SEGMENT_FLAT_2D");
         return w is not null
             ? WarningLine(w)
-            : "SEGMENT_FLAT_2D: this segment has no display processor; that part of the window is flat 2D.";
+            : "SEGMENT_FLAT_2D: this part of the window is on a display with no display driver, so it shows flat 2D.";
     }
 
     // ── Developer settings (perf-settings Phase 2A) ─────────────────────────

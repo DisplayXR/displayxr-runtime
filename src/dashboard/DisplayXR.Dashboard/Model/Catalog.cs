@@ -130,11 +130,11 @@ public static class CatalogClasses
 {
     private static readonly (string Class, string Label, string Lead, string Others)[] Known =
     {
-        ("display_processor", "Displays", "Make every DisplayXR app show 3D on your display.", "display plug-ins"),
+        ("display_processor", "Displays", "Make every DisplayXR app show 3D on your display.", "display drivers"),
         ("input_provider", "Input", "Controllers, hands and pens for your apps.", "input devices"),
         ("conversion_provider", "2D to 3D", "Turn photos and video into 3D.", "2D-to-3D converters"),
-        ("tracking_provider", "Viewer tracking", "Look-around that follows your eyes.", "viewer-tracking sources"),
-        ("workspace_controller", "Workspaces", "A spatial desktop for your apps.", "workspaces"),
+        ("tracking_provider", "Viewer tracking", "Look-around that follows your eyes.", "camera head tracking add-ons"),
+        ("workspace_controller", "Spatial desktop", "A spatial desktop for your apps.", "spatial desktops"),
         ("app", "Apps", "Ready to open on your display.", "apps"),
         ("companion", "Companions", "Works alongside your display.", "companions"),
         ("sdk", "Developer tools", "Build your own.", "tools"),
@@ -664,11 +664,11 @@ public static class CatalogText
     /// <summary>What an item does when its catalog entry carries no summary (every schema-1 item).</summary>
     public static string About(CatalogItem i) => i.Summary.Length > 0 ? i.Summary : i.Class switch
     {
-        "display_processor" => "A display plug-in: with it, every DisplayXR app shows 3D on the display it supports.",
+        "display_processor" => "A display driver: with it, every DisplayXR app shows 3D on the display it supports.",
         "input_provider" => "An input add-on: it brings its device into every DisplayXR app.",
         "conversion_provider" => "A 2D-to-3D converter, shared by every DisplayXR app.",
-        "tracking_provider" => "A viewer-tracking source: it lets the picture follow your eyes.",
-        "workspace_controller" => "A workspace: a spatial desktop for your DisplayXR apps.",
+        "tracking_provider" => "Camera head tracking: it lets the picture follow where you are.",
+        "workspace_controller" => "A spatial desktop for your DisplayXR apps.",
         "runtime" => "The DisplayXR runtime: what every app and add-on here runs on.",
         "app" => "An app for your DisplayXR display.",
         _ => "An add-on for DisplayXR.",

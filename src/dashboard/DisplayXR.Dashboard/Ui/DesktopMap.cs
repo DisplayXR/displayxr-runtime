@@ -69,7 +69,7 @@ public sealed class DesktopMap : Control
         var layout = DesktopMapGeometry.Compute(_screens, _windows, bounds.Width, bounds.Height, Pad);
         if (layout.Screens.Count == 0 && layout.Windows.Count == 0)
         {
-            var t = Label("No monitors reported", 12.5, Tokens.Muted);
+            var t = Label("No displays found", 12.5, Tokens.Muted);
             ctx.DrawText(t, new Point((bounds.Width - t.Width) / 2, (bounds.Height - t.Height) / 2));
             return;
         }

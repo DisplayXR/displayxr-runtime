@@ -113,7 +113,7 @@ public class CatalogTests
     {
         var list = Parse("catalog-list.json"); // the layout fixture
         var groups = list.Browse("", null, false);
-        Assert.Equal(new[] { "Displays", "Input", "2D to 3D", "Viewer tracking", "Workspaces", "Apps", "DisplayXR" },
+        Assert.Equal(new[] { "Displays", "Input", "2D to 3D", "Viewer tracking", "Spatial desktop", "Apps", "DisplayXR" },
                      groups.Select(g => CatalogClasses.Label(g.Class)));
         Assert.Equal("leia-sr", groups[0].Items[0].Id);               // works with this display: first
         Assert.Equal("open-conversion", groups[2].Items[0].Id);       // recommended: before the rest
@@ -577,7 +577,7 @@ public class CatalogTests
         var ex = LicenceView.For(Policy(ComponentClass.Tracking, "tracking-list.json").Row("open-tracking")!, "tracking_provider")!;
         Assert.Equal("Licence ended 31 Oct 2026", ex.Headline);
         Assert.True(ex.OfferBuy);
-        Assert.Contains("viewer-tracking sources keep working", ex.Reassurance);
+        Assert.Contains("camera head tracking add-ons keep working", ex.Reassurance);
     }
 
     [Fact]
