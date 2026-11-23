@@ -102,10 +102,37 @@ public sealed class WindowsPage : Page
                 ? "No 3D app is running through DisplayXR's background service. Many 3D apps run on their own and are not listed here, so an empty list does not mean anything is wrong."
                 : "DisplayXR isn't running in the background, so there is no list of running apps. It normally starts when you sign in.";
             page.Children.Add(U.Card(U.VStack(8, U.Text("No 3D apps listed", "group"), U.Wrapped(text, "desc"))));
-            return page;
         }
         foreach (var c in clients) page.Children.Add(ClientCard(s, c));
+        page.Children.Add(RolesCard(s));
         return page;
+    }
+
+    /// <summary>
+    /// The running programs by role (moved here from Components, which lists what you have and can add):
+    /// apps with their own window and status readers, each with its process line. Status readers are
+    /// listed when "Show status readers" is ticked.
+    /// </summary>
+    private Control RolesCard(StatusSnapshot s)
+    {
+        var body = U.VStack(14, U.CardTitle("By role", "Running programs that DisplayXR knows by what they do."));
+        foreach (var sec in Components.RunningPrograms(s))
+        {
+            var head = U.Flow(10, 4, U.Text(sec.Title, "value"), U.Text(sec.ConnectedLine, "meta"));
+            var col = U.VStack(4, head, U.Wrapped(sec.Role, "desc"));
+            bool hidden = sec.Collapsed && !_showDiag;
+            if (hidden && sec.Items.Count > 0)
+                col.Children.Add(U.Wrapped($"Tick \"Show status readers\" to list {(sec.Items.Count == 1 ? "it" : "them")}.", "meta"));
+            else
+                foreach (var item in sec.Items)
+                {
+                    var line = U.Flow(10, 2, U.Text(item.Name, "soft"));
+                    foreach (var l in item.Lines) U.AddFlow(line, U.Text(l, "dev"), 10, 2);
+                    col.Children.Add(line);
+                }
+            body.Children.Add(col);
+        }
+        return U.Card(body);
     }
 
     private Control ClientCard(StatusSnapshot s, Client c)

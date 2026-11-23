@@ -20,10 +20,10 @@ namespace DisplayXR.Dashboard.Pages;
 
 /// <summary>
 /// Components: what is plugged into the runtime, grouped by ROLE (display
-/// processors, workspace controller, present owners, input providers,
-/// viewer-tracking providers, the conversion module, a stereo camera source,
-/// diagnostics clients), never by
-/// product. Clients come from the live feed; the rest from <c>info --json</c>,
+/// processors, workspace controller, input providers, viewer-tracking providers,
+/// the conversion module and providers, a stereo camera source), never by
+/// product: what you have and what you can add. Running programs (present owners,
+/// status readers) are under Troubleshooting > Running 3D apps. Clients come from the live feed; the rest from <c>info --json</c>,
 /// read once per show and on Refresh.
 ///
 /// <para>It is also where things are added (ADR-064 step 8): each section carries the catalog
@@ -203,7 +203,7 @@ public sealed class ComponentsPage : Page
         if (Ctx.Info is null)
             page.Children.Add(U.Notice(Ctx.InfoError is null ? Level.Info : Level.Warn,
                 Ctx.InfoError is null ? "Looking for your add-ons" : "Couldn't read the list of add-ons",
-                Ctx.InfoError ?? "This takes about 10 seconds. Running apps appear as soon as DisplayXR reports them."));
+                Ctx.InfoError ?? "This takes about 10 seconds."));
         // A read in progress (the first one, Try again, Refresh, after an install) is said, never silent.
         if (CatalogText.Checking(Ctx.CatalogLoading) is { } checking)
         {
@@ -449,7 +449,6 @@ public sealed class ComponentsPage : Page
     {
         "display_processors" => "No display driver is installed.",
         "workspace_controller" => "No spatial desktop is installed or running.",
-        "present_owners" => "No app with its own window is running.",
         "input_providers" => "No input add-on reported.",
         "conversion" => "Your display driver reports no 2D-to-3D converter.",
         "conversion_providers" => "No 2D-to-3D converter is installed.",
