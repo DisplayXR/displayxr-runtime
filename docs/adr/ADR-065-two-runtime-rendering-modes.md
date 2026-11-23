@@ -93,23 +93,30 @@ modes with the kind fixed at start-up needs none of that.
 7. **One key map.** V toggles mode 0 <-> mode 1 on every platform, decided from the mode the
    device is in now; 0 and 1 request modes 0 and 1; 2-8 request nothing. `last_3d_mode_index`
    is gone: the 3D mode is always index 1. `legacy_app_tile_scaling` gates the 0/1 keys
-   exactly as it gated 1/2/3.
+   exactly as it gated 1/2/3. The keys follow the floor: V or 1 does nothing (one throttled
+   INFO) when the session cannot fill mode 1 - in-process from the limit the state tracker
+   publishes at `xrBeginSession`, in the service from the view count R the client's
+   projection layers carry.
 
 ## Consequences
 
 - **Apps and plug-ins need nothing.** Every app sizes its mode table from the enumerated
   count; digit keys past the count were already inert; every start-up fallback already meant
   "mode 1 is the 3D mode". An older plug-in with a longer table is trimmed, with a WARN, and
-  keeps working; a driver that validates the translated index against its now-trimmed count
-  will refuse it, so plug-ins should declare two modes.
+  keeps working (see the forwarded-call note below); plug-ins should still declare two modes.
 - **Observable changes.** `xrEnumerateDisplayRenderingModesDXR` returns two entries.
   `PRIMARY_MULTIVIEW_DXR`'s view count is the selected kind's (2 on sim_display's default
   kind, 4 only with the quad kind). sim_display sessions begin in 2D. A stereo session against
   the quad kind is floored to 2D, not to a 2-view 3D mode. A legacy app on a device that
   starts in 2D is still sized for the 3D mode V toggles into
   (`oxr_legacy_compromise_mode_index`), so its default sizing does not change.
-- **Recipes that need 3D at start set the kind and the start.** The zones apps, the
-  conformance `EyeVisibility` pass (`OUTPUT=sbs START_3D=1`), the macOS/Linux dev run scripts.
+- **Recipes that need 3D at start set the kind and the start.** The generated dev run
+  scripts on every platform, the conformance `EyeVisibility` pass (`OUTPUT=sbs START_3D=1`).
+  A legacy app's first frame on sim_display is 2D: one compromise-scale view (0.5 x 1.0 with
+  the anaglyph kind) stretched across the window, until V.
+- **An older plug-in with more modes keeps working.** While the runtime forwards an
+  OUTPUT_MODE request in the driver's own numbering, the device shows the driver its own
+  mode count, under a lock, so a driver that range-checks the index accepts it.
 - **Changing the kind costs a restart.** For developers selecting an inspection kind that is a
   restart; owners of a shipping display never change it.
 

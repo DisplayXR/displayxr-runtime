@@ -175,8 +175,9 @@ if it is 3D, else the first 3D one), with a WARN naming your plug-in and what wa
 and `hmd->view_count` is recomputed from what remains. A table whose mode 0 is not the 1-view
 2D mode is kept as declared, with a WARN — it does not meet the contract. When the 3D mode
 kept is not your index 1, `XRT_DEVICE_PROPERTY_OUTPUT_MODE` still reaches your
-`set_property` / `get_property` in your own numbering, but a driver that validates that
-index against its now-trimmed `rendering_mode_count` will refuse it — declare two modes.
+`set_property` / `get_property` in your own numbering, and for the duration of that call
+(under a lock the runtime owns) your device shows your own `rendering_mode_count`, so an
+index check and a `rendering_modes[index]` read still work — but declare two modes.
 `XRT_MAX_RENDERING_MODES` and the struct layout are unchanged; this is not an ABI change.
 
 ### Per-API DP factories
