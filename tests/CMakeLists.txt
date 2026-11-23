@@ -985,14 +985,14 @@ if(TARGET tests_oxr_view_space)
 		)
 	set_tests_properties(
 		tests_oxr_view_space_mode_floor
-		PROPERTIES ENVIRONMENT "SIM_DISPLAY_OUTPUT=quad;SIM_DISPLAY_START_3D=1;DXR_PLUGIN_EXCLUSIVE=sim-display"
+		PROPERTIES ENVIRONMENT "SIM_DISPLAY_OUTPUT=quad;SIM_DISPLAY_START_3D=1;DXR_PLUGIN_EXCLUSIVE=sim-display;DXR_TEST_ARM=mode_floor"
 		)
 	add_test(NAME tests_oxr_view_space_mode_pinned
 		 COMMAND tests_oxr_view_space "[mode_pinned]" --success --allow-running-no-tests
 		)
 	set_tests_properties(
 		tests_oxr_view_space_mode_pinned
-		PROPERTIES ENVIRONMENT "SIM_DISPLAY_OUTPUT=quad;SIM_DISPLAY_FORCE_MODE=1;DXR_PLUGIN_EXCLUSIVE=sim-display"
+		PROPERTIES ENVIRONMENT "SIM_DISPLAY_OUTPUT=quad;SIM_DISPLAY_FORCE_MODE=1;DXR_PLUGIN_EXCLUSIVE=sim-display;DXR_TEST_ARM=mode_pinned"
 		)
 
 	# #1499 kill switch, in a process of its OWN for the third time: the runtime
@@ -1178,7 +1178,7 @@ if(TARGET tests_oxr_view_space)
 	set_tests_properties(
 		tests_oxr_view_space_mode_floor_off
 		PROPERTIES ENVIRONMENT
-			   "SIM_DISPLAY_OUTPUT=quad;SIM_DISPLAY_START_3D=1;DXR_MODE_FLOOR=0;DXR_PLUGIN_EXCLUSIVE=sim-display"
+			   "SIM_DISPLAY_OUTPUT=quad;SIM_DISPLAY_START_3D=1;DXR_MODE_FLOOR=0;DXR_PLUGIN_EXCLUSIVE=sim-display;DXR_TEST_ARM=mode_floor_off"
 		)
 endif()
 

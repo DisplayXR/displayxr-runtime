@@ -169,6 +169,20 @@ sim_quad_requested()
 	return v != nullptr && std::strcmp(v, "quad") == 0 && env_on("SIM_DISPLAY_START_3D");
 }
 
+/*!
+ * Was THIS process explicitly configured for a mode-floor arm? tests/CMakeLists.txt
+ * sets DXR_TEST_ARM=<tag> on the dedicated ctest registrations. In such a
+ * process a precondition mismatch is a mis-set environment and must FAIL - a
+ * vacuous SUCCEED would hide it; in every other process the arm still says
+ * "not mine" and succeeds.
+ */
+bool
+configured_arm(const char *tag)
+{
+	const char *v = std::getenv("DXR_TEST_ARM");
+	return v != nullptr && std::strcmp(v, tag) == 0;
+}
+
 //! #1499: is SIM_DISPLAY_FORCE_MODE armed (the device PINS its mode)? Under
 //! ADR-065 only 0 and 1 pin; any other value is ignored by the device.
 bool
@@ -1275,6 +1289,11 @@ TEST_CASE("a PRIMARY_STEREO session is floored out of a >2-view mode (#1499)", "
 		WARN(
 		    "this arm needs SIM_DISPLAY_OUTPUT=quad SIM_DISPLAY_START_3D=1, an UNpinned device and "
 		    "DXR_MODE_FLOOR on - see tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		if (configured_arm("mode_floor")) {
+			FAIL(
+			    "this process is configured for [mode_floor] (DXR_TEST_ARM) but its "
+			    "preconditions do not hold - a mis-set environment, not a pass");
+		}
 		SUCCEED("not the mode-floor process; nothing to pin here");
 		return;
 	}
@@ -1363,6 +1382,11 @@ TEST_CASE("a PRIMARY_MULTIVIEW_DXR session keeps the >2-view mode (#1499)", "[ox
 		WARN(
 		    "this arm needs SIM_DISPLAY_OUTPUT=quad SIM_DISPLAY_START_3D=1, an UNpinned device and "
 		    "DXR_MODE_FLOOR on - see tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		if (configured_arm("mode_floor")) {
+			FAIL(
+			    "this process is configured for [mode_floor] (DXR_TEST_ARM) but its "
+			    "preconditions do not hold - a mis-set environment, not a pass");
+		}
 		SUCCEED("not the mode-floor process; nothing to pin here");
 		return;
 	}
@@ -1403,6 +1427,11 @@ TEST_CASE("a device that PINS its mode outranks the floor (#1499)", "[oxr][view_
 		WARN(
 		    "this arm needs SIM_DISPLAY_OUTPUT=quad SIM_DISPLAY_FORCE_MODE=1 - see "
 		    "tests_oxr_view_space_mode_pinned in tests/CMakeLists.txt");
+		if (configured_arm("mode_pinned")) {
+			FAIL(
+			    "this process is configured for [mode_pinned] (DXR_TEST_ARM) but its "
+			    "preconditions do not hold - a mis-set environment, not a pass");
+		}
 		SUCCEED("not the pinned process; nothing to pin here");
 		return;
 	}
@@ -1474,6 +1503,11 @@ TEST_CASE("an orchestrator session is exempt from the fillability rule (#1499)",
 		WARN(
 		    "this arm needs SIM_DISPLAY_OUTPUT=quad SIM_DISPLAY_START_3D=1, an UNpinned device and "
 		    "DXR_MODE_FLOOR on - see tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		if (configured_arm("mode_floor")) {
+			FAIL(
+			    "this process is configured for [mode_floor] (DXR_TEST_ARM) but its "
+			    "preconditions do not hold - a mis-set environment, not a pass");
+		}
 		SUCCEED("not the mode-floor process; nothing to pin here");
 		return;
 	}
@@ -1549,6 +1583,11 @@ TEST_CASE("DXR_MODE_FLOOR=0 restores the pre-#1499 behaviour", "[oxr][view_space
 		WARN(
 		    "this arm needs DXR_MODE_FLOOR=0 AND SIM_DISPLAY_OUTPUT=quad SIM_DISPLAY_START_3D=1 - see "
 		    "tests_oxr_view_space_mode_floor_off in tests/CMakeLists.txt");
+		if (configured_arm("mode_floor_off")) {
+			FAIL(
+			    "this process is configured for [mode_floor_off] (DXR_TEST_ARM) but its "
+			    "preconditions do not hold - a mis-set environment, not a pass");
+		}
 		SUCCEED("not the kill-switch process; nothing to pin here");
 		return;
 	}
