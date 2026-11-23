@@ -193,8 +193,11 @@ public static class ComponentRows
                 }
                 var entry = items.FirstOrDefault(c => c.Class == cls && c.ComponentId == id && !used.Contains(c.Id));
                 if (entry is not null) used.Add(entry.Id);
+                // A built-in row (the conversion class's built-in adapter) is part of the runtime
+                // binary itself: it has no install of its own, whatever the catalog says.
                 RowStatus status =
-                    catalog is null || item.Policy is { BuiltIn: true } ? RowStatus.Installed
+                    item.BuiltIn || item.Policy is { BuiltIn: true } ? RowStatus.PartOfRuntime
+                    : catalog is null ? RowStatus.Installed
                     : entry is null ? (source.Complete ? RowStatus.NotFromCatalog : RowStatus.Installed)
                     : !entry.IsInstalled ? RowStatus.NotFromCatalog
                     : entry.HasUpdate ? RowStatus.UpdateAvailable

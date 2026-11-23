@@ -151,8 +151,11 @@ public sealed record LiftModule(bool Probed, bool Malformed, string? Backend, lo
 }
 
 /// <summary>One row of a Components section.</summary>
+/// <param name="BuiltIn">Part of the runtime binary itself (the conversion class's built-in adapter, load verdict
+/// <c>BUILT_IN</c>), known even before the class's policy list has been read.</param>
 public sealed record ComponentItem(string Name, Level Level, IReadOnlyList<(string Text, Level Level)> Chips, IReadOnlyList<string> Lines,
-                                   RegisteredController? Controller = null, PolicyRow? Policy = null, string? Id = null);
+                                   RegisteredController? Controller = null, PolicyRow? Policy = null, string? Id = null,
+                                   bool BuiltIn = false);
 
 /// <summary>One role: what it is, how many are registered / connected, and its rows.</summary>
 public sealed record ComponentSection(string Id, string Title, string Role, int Count, int Connected,
@@ -482,7 +485,7 @@ public static class Components
                          .DefaultIfEmpty(Level.Plain).Max();
             items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id,
                 malformed ? Level.Critical : worst is Level.Critical or Level.Warn ? worst : usable ? Level.Ok : Level.Plain,
-                chips, lines, Policy: pol, Id: p.Id));
+                chips, lines, Policy: pol, Id: p.Id, BuiltIn: p.Load == "BUILT_IN" || pol is { BuiltIn: true }));
         }
         var served = s.Tasks.Where(t => t.Selected).Select(t => t.Task).Distinct().ToArray();
         int ready = s.Tasks.Count(t => t.Selected && t.State == "READY");

@@ -397,12 +397,20 @@ public class ComponentRowsTests
     }
 
     [Fact]
-    public void ABuiltInRow_IsInstalled_NotSomethingToRemove()
+    public void ABuiltInRow_IsPartOfTheRuntime_NotSomethingToRemove()
     {
         var sections = new[] { Section("conversion_providers", Registered(ComponentClass.Conversion, "built-in", builtIn: true)) };
         var row = Assert.Single(ComponentRows.Join(sections, Live(Item("depth", "conversion_provider", "not_installed")))[0].Rows.Where(r => r.Installed is not null));
-        Assert.Equal(RowStatus.Installed, row.Status);
+        Assert.Equal(RowStatus.PartOfRuntime, row.Status);
+        Assert.Equal(("Part of the runtime", Level.Plain), row.StatusChip);
         Assert.Null(row.RemoveNote);
+        Assert.Equal(CatalogAction.None, row.Action);
+
+        // With no catalog read, and before the class's policy list is read (the load verdict alone says it).
+        Assert.Equal(RowStatus.PartOfRuntime, Assert.Single(ComponentRows.Join(sections, null)[0].Rows).Status);
+        var verdictOnly = new ComponentItem("built-in", Level.Ok, Array.Empty<(string, Level)>(), Array.Empty<string>(), Id: "built-in", BuiltIn: true);
+        Assert.Equal(RowStatus.PartOfRuntime,
+            Assert.Single(ComponentRows.Join(new[] { Section("conversion_providers", verdictOnly) }, Live())[0].Rows).Status);
     }
 
     [Fact]

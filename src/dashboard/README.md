@@ -64,7 +64,7 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
   | **Part of the runtime** | as *Not from catalog*, and the runtime's own installer shipped it: its registered binary (`binary_path` / `binary` of `<class> list --json`) is inside the `plugins` folder of the runtime directory, the folder of the `displayxr-cli` the Dashboard runs (`ComponentRows.ShippedByRuntime`) | the row's own controls only, and no removal sentence (it goes with the runtime) |
 
   A row that is neither installed nor installable (a connected client, a summary line) has no
-  status. The built-in conversion adapter reads *Installed*. Filters: **All / Installed /
+  status. The built-in conversion adapter (`dp-lift`, compiled into the runtime) reads *Part of the runtime*. Filters: **All / Installed /
   Updates**.
 - **Installed rows keep their controls**: Enabled, Prefer / Reset, the launch row of a workspace
   controller, the per-app and per-screen tables. Under them, a row the catalog knows has
