@@ -11,12 +11,67 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 | Page | Reads | Writes |
 |---|---|---|
 | Home | the status feed; `info --json` once per show and on Refresh; `dp list --json` (each screen's effective DP, read-only); `selftest --json` on click | `runtime activate`, `dp reset` (only when a machine-wide override is set) |
-| Displays | the status feed (screens, desktop map); `dp list --json` for the per-screen selector (its options: that screen's `candidates`) | `dp use <id> --screen <key>`, `dp reset --screen <key>` |
-| Running 3D apps (`windows`) | the status feed (clients) | — |
-| Components | the status feed (clients by class; per screen `eye_tracking.viewer_source` / `viewer_reason` / `viewer_policy` for the tracking card); `info --json` (incl. `tracking_providers`: probe results, the primary screen's arbitration); `workspace list --json`; `dp\|input\|conv\|tracking list --json` (ADR-054 N3e: `enabled`, `enabled_source`, `preferred`, `provenance`, conv `built_in`, tracking `first`, `policy.policy_lock`; ADR-054 N5: each row's `licence` object, shown in the row's Details as a *Licence* line — `unlicensed`, `licence expired`, `trial until <date>`, `licensed`, or `included with your display` when the entitlement comes with the hardware; nothing for a component with no licence to report. The Dashboard only shows it: the component decides it) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace reset <id>` (back to the runtime default, Ctrl+Shift+Space / auto), `workspace launch <id>`; `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `input use <id> --app <exe>` / `input reset --app <exe>` (the Input card's **Per app** table, ADR-034 Am.5: each pinned or running app's pin per role family and its live holder from `input list --json` `per_app` + `holders`; per user only — no machine-wide per-app pin exists — and disabled under `Policy\Lock`), `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise every control's `--machine` command — Enabled, "Use this one", "Choose automatically" — is shown for an administrator, in the row's Details). No Enabled or "Use this one" on the built-in `dp-lift` row; under `Policy\Lock` the class shows "Managed by your administrator" (the technical `Policy\Lock` line is in each row's Details) and its per-user controls are disabled (for tracking, the per-user "Use this one" / "Choose automatically" too). **Viewer tracking** (tracking providers, ADR-054 N6): `tracking enable\|disable <id>`, `tracking use <id>` / `tracking reset` (then re-reads `tracking list --json` and `info --json`); per screen the viewer source and why (provider; standby: the display tracks; no source; source paused; FIXED / OWN) beside the display's viewer policy, and a **Calibrate camera…** button on provider-served screens that opens the calibration window (below): `tracking calibrate --screen <key> --watch --json` (long-lived), `tracking calibrate solve --in <tmp> --mode b --eye mid --reject-mm 5 --json`, `tracking calibrate apply --screen <key> --camera <key> --pose <setting> --provider <id> --rms-mm <rms> --samples <n> --mode b [--depth-scale <iris>] --json` (writes the runtime-owned camera calibration store, shared by every provider; `--provider` is accepted and ignored; then re-reads `tracking list --json` and `info --json`) |
+| Displays | the status feed (screens, desktop map); `dp list --json` for the per-screen selector (its options: that screen's `candidates`) | `dp use <id> --screen <key>`, `dp reset --screen <key>`; the camera calibration verbs (below) |
+| Components | the status feed (clients by class; per screen `eye_tracking.viewer_source` / `viewer_reason` / `viewer_policy` for the tracking card); `info --json` (incl. `tracking_providers`: probe results, the primary screen's arbitration); `workspace list --json`; `dp\|input\|conv\|tracking list --json` (ADR-054 N3e: `enabled`, `enabled_source`, `preferred`, `provenance`, conv `built_in`, tracking `first`, `policy.policy_lock`; ADR-054 N5: each row's `licence` object, shown in the row's Details as a *Licence* line — `unlicensed`, `licence expired`, `trial until <date>`, `licensed`, or `included with your display` when the entitlement comes with the hardware; nothing for a component with no licence to report. The Dashboard only shows it: the component decides it) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace reset <id>` (back to the runtime default, Ctrl+Shift+Space / auto), `workspace launch <id>`; `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `input use <id> --app <exe>` / `input reset --app <exe>` (the Input card's **Per app** table, ADR-034 Am.5: each pinned or running app's pin per role family and its live holder from `input list --json` `per_app` + `holders`; per user only — no machine-wide per-app pin exists — and disabled under `Policy\Lock`), `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise every control's `--machine` command — Enabled, "Use this one", "Choose automatically" — is shown for an administrator, in the row's Details). No Enabled or "Use this one" on the built-in `dp-lift` row; under `Policy\Lock` the class shows "Managed by your administrator" (the technical `Policy\Lock` line is in each row's Details) and its per-user controls are disabled (for tracking, the per-user "Use this one" / "Choose automatically" too). **Viewer tracking** (tracking providers, ADR-054 N6): `tracking enable\|disable <id>`, `tracking use <id>` / `tracking reset` (then re-reads `tracking list --json` and `info --json`); per screen the viewer source and why (provider; standby: the display tracks; no source; source paused; FIXED / OWN) beside the display's viewer policy, with a link to Displays on provider-served screens, where the display's card has **Calibrate camera…**, which opens the calibration window (below): `tracking calibrate --screen <key> --watch --json` (long-lived), `tracking calibrate solve --in <tmp> --mode b --eye mid --reject-mm 5 --json`, `tracking calibrate apply --screen <key> --camera <key> --pose <setting> --provider <id> --rms-mm <rms> --samples <n> --mode b [--depth-scale <iris>] --json` (writes the runtime-owned camera calibration store, shared by every provider; `--provider` is accepted and ignored; then re-reads `tracking list --json` and `info --json`) |
 | Components (catalog side) | the install engine's `dxr-get list --json --no-runtime` (one call: state, versions, detection, sizes, compatibility, prerequisites), `dxr-get list --installed --json` when offline; `dp\|input\|conv\|tracking list --json` for an installed item's `licence` object | `dxr-get install <id> --yes --json --no-runtime`, `dxr-get uninstall <id> --json` (elevated for that one run, see below); `displayxr-cli <class> activate <id> @<key file> --json`; `displayxr-cli <class> activate-begin <id> --json` (Buy) |
-| Performance | `perf list --json`, `info --json` (adapters) | `perf set` / `perf reset` |
-| Developer | `perf list --all --json` (the read-only Tier 1/2 lever list: only while "Developer settings" is expanded, and on Refresh; collapsed again on every launch); `dp list --json` (`preferred` only: a machine-wide override is shown as a notice) | `perf reset <name>` / `perf reset` (managed levers only; the rest are environment-only), `dp reset` (machine-wide; admin) |
+| Settings (`settings`; `performance` opens it) | `perf list --json`, `info --json` (adapters), `workspace list --json` | `perf set` / `perf reset`; the spatial desktop's `workspace set` / `reset` / `launch` (as on Components) |
+| Troubleshooting > Running 3D apps (`windows` opens it) | the status feed (clients; present owners and status readers by role) | — |
+| Troubleshooting > Graphics cards | `info --json` (adapters, the graphics pipeline's verdict and setting) | — |
+| Troubleshooting > Advanced (`developer` opens it) | `perf list --json` (Current values); `perf list --all --json` (the read-only Tier 1/2 lever list: only while "Developer settings" is expanded, and on Refresh; collapsed again on every launch); `dp list --json` (`preferred` only: a machine-wide override is shown as a notice) | `perf reset <name>` / `perf reset` (managed levers only; the rest are environment-only), `dp reset` (machine-wide; admin) |
+
+## Structure (five rail entries)
+
+The rail is `Model/PageRoutes.cs` `Rail`: **Home**, **Displays**, **Components**, **Settings**, and,
+set apart at the bottom under a rule, **Troubleshooting**. Everything that needs the runtime's own
+vocabulary (variable names, registry paths, process ids, technical lines) is in Troubleshooting or
+behind a Details toggle.
+
+- **Home** answers "is my 3D display working?" (`Model/Verdict.cs`). One headline, one row per
+  display with up to three facts (*3D display recognised*, *3D on*, *Sees you*; each yes, no or
+  *not known yet*), the display driver by name (its id in the tooltip), then **Needs attention**
+  (plain sentences, or "nothing") and **Check my setup** with *Last checked* (this session only; the
+  Dashboard saves nothing). A display has live state only while an app draws on it through the
+  running service (`screens[].dps`); with no app running both facts are *not known yet* and the
+  headline never says 3D is on. Headlines: *3D is working on N display(s)*; *Your 3D display is
+  ready* / *3D turns on when a 3D app runs.* (idle); *3D is off: N thing(s) need fixing*; *Your 3D
+  display is recognised* (background service not reached); *No 3D display found*; *No display
+  found*. "Needs attention" is built only from what is already read: every warn / critical warning
+  of the snapshot (the runtime's codes in plain words, a display maker's own warning quoted), the
+  background service not reached, a failed "Check my setup", and another program set as the active
+  OpenXR runtime. Its only buttons are ones the Dashboard already had (Open Displays, Open
+  Components, Make DisplayXR the active OpenXR runtime). The graphics cards card keeps its plain
+  half; its technical half is in Troubleshooting > Graphics cards.
+- **Displays**: each card's face has the name, the plain badges, the plain state line, the warnings
+  and its actions (the display maker's app, **Calibrate camera…** on a display that camera head
+  tracking serves, **Details**: `Details of <display>` / `Hide details of <display>`). Behind Details:
+  the resolution, driver and maker lines, the per-display driver selector with what it does, and the
+  technical lines "Copy list" writes. The selector stays on the face when more than one driver could
+  drive the display or more than one 3D display is present (`StatusText.DriverChoiceOnFace`). The
+  desktop map and its legend show only with more than one display. The caption never prints a zero
+  ("One display, recognised as 3D · whether it sees you is not known yet").
+- **Components**: what you have and what you can add (below). Running programs are not on it.
+- **Settings** (was Performance): *Graphics card for 3D apps* (hidden on a PC with one graphics
+  card), *Spatial desktop* (the shortcut, mode and "Open now": the same `Ui/WorkspaceLaunchEditor`
+  as on Components; hidden when none is installed), *If 3D looks wrong* (Compatibility mode,
+  Detailed logging). The "changed from the defaults" notice names settings, not variables, and links
+  to Troubleshooting > Advanced.
+- **Troubleshooting**: a tab strip of radio buttons named by their labels, **Running 3D apps** (the
+  old Windows page, plus a *By role* card for apps with their own window and status readers),
+  **Graphics cards** (the graphics pipeline's technical lines) and **Advanced** (the old Developer
+  page with the *Current values* table). The header shows the part's caption and actions. It holds
+  the status feed for all three parts. The part shown is kept for the session only.
+
+| `--page` / `Navigate` id | Lands on |
+|---|---|
+| `home`, `displays`, `components`, `settings`, `troubleshooting` | that page |
+| `catalog` | Components |
+| `performance` | Settings |
+| `windows` | Troubleshooting > Running 3D apps |
+| `developer` | Troubleshooting > Advanced |
+| `troubleshooting/apps` \| `graphics` \| `advanced` | that part of Troubleshooting (the pages' own links) |
+
+Tests: `PageRoutesTests` (every id above), `VerdictTests` (each headline, the three-state facts, the
+idle rule, the plain warning sentences).
 
 Every CLI run is an argument vector (`Model/CliArgs`, passed through
 `ProcessStartInfo.ArgumentList`): an id or value is always exactly one argument, whatever
@@ -25,18 +80,19 @@ followed by every `note:` / `warning:` line the CLI printed.
 
 **Components** groups what is plugged into the runtime by ROLE, never by product. The
 section titles are plain words: **Displays** (display drivers, i.e. display processors),
-**Spatial desktop** (the workspace controller), **Apps with their own window** (present
-owners), **Input**, **Viewer tracking** (camera head tracking), **2D to 3D in the display
-driver** (`lift_caps`), **2D to 3D** (conversion providers), **2D-to-3D models**, **Stereo
-camera**, **Status readers** (diagnostics clients). By role:
+**Spatial desktop** (the workspace controller), **Input**, **Viewer tracking** (camera head
+tracking), **2D to 3D in the display driver** (`lift_caps`), **2D to 3D** (conversion providers),
+**2D-to-3D models**, **Stereo camera**. The running programs, **Apps with their own window** (present
+owners) and **Status readers** (diagnostics clients), are `Components.RunningPrograms` and are shown
+under Troubleshooting > Running 3D apps. By role:
 display processors, the workspace controller (its launch shortcut / mode / Reset / "Open now",
-phase 8, hidden when the CLI has no `launch` block; the shown combo is whatever `workspace list --json`
+phase 8, hidden when the CLI has no `launch` block; the same controls are on Settings; the shown combo is whatever `workspace list --json`
 reports, so an older runtime shows its own default; `Model/Hotkey.Default` — Ctrl+Shift+Space, Ctrl+Space
-before 2026-10-26 — only feeds the Reset tooltip and the fixture), present owners, input providers and
+before 2026-10-26 — only feeds the Reset tooltip and the fixture), input providers and
 the rig role, the viewer-tracking providers with each screen's viewer source (ADR-054 N6), the 2D->3D conversion module (`info --json` `lift_caps`, kept for one release), the conversion
 providers with each task's readiness and selection (the status feed's `conv_providers[]` /
 `conv_tasks[]`, ADR-053; shown only when the CLI reports them), a stereo camera source (only when `info`
-reports one) and diagnostics clients. Names are shown verbatim from the components'
+reports one). Names are shown verbatim from the components'
 own registration.
 
 ## Components: installed and catalog items in one list
@@ -48,8 +104,7 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
 
 - **One list.** The sections are the Components sections, unchanged (display processors, the
   workspace controller, input providers, viewer-tracking providers, conversion providers, and
-  the ones that only report: present owners, the conversion module, model packs, the stereo
-  camera, diagnostics clients). Each section whose class the catalog has (`display_processor`,
+  the ones that only report: the conversion module, model packs, the stereo camera). Each section whose class the catalog has (`display_processor`,
   `input_provider`, `tracking_provider`, `conversion_provider`, `workspace_controller`) also
   carries that class's catalog items. A first group, **DisplayXR**, holds the catalog's row for the
   runtime itself. A last group, **Apps**, holds the catalog items that are not components (apps,
@@ -215,8 +270,8 @@ had a tab of its own for one release (v2.69.4); it is now part of **Components**
 
 ## Camera calibration window
 
-Components → Viewer tracking → **Calibrate camera…** (only on a screen whose viewer source is a
-provider) opens a borderless full-screen window on that screen (the monitor that best overlaps the
+Displays → the display's card → **Calibrate camera…** (only on a display whose viewer source is a
+provider; Components → Viewer tracking links there) opens a borderless full-screen window on that screen (the monitor that best overlaps the
 screen's desktop rect from the status feed; a points-vs-pixels platform is matched at the feed's
 scale). Method: [tracking-provider-discovery.md §6](../../docs/specs/runtime/tracking-provider-discovery.md#camera-pose-calibration).
 
@@ -257,8 +312,8 @@ scale). Method: [tracking-provider-discovery.md §6](../../docs/specs/runtime/tr
 ## Feed cadence (ADR-051 D5)
 
 - One long-lived `displayxr-cli status --watch --json` child while a status page (Home,
-  Displays, Running 3D apps) is on screen and the window is not minimised. Moving between status
-  pages keeps the same child. Leaving for Performance / Developer stops it after a 15 s
+  Displays, Troubleshooting) is on screen and the window is not minimised. Moving between status
+  pages keeps the same child. Leaving for Components / Settings stops it after a 15 s
   linger (a quick hop back reuses it: a child that cannot reach the service builds a
   headless snapshot, and each of those creates a vendor instance); minimising stops it at
   once. Stopping = stdin closed (the CLI's stop signal), killed after 1.5 s if it lingers,
@@ -279,7 +334,7 @@ scale). Method: [tracking-provider-discovery.md §6](../../docs/specs/runtime/tr
 - One dashboard per logon session (a second launch raises the first): each one holds a
   DIAG slot on the service (quota 4).
 - Run it **non-elevated**: the service answers status reads only from non-elevated DIAG
-  clients; elevated, the feed is headless (the Developer page says so).
+  clients; elevated, the feed is headless (Troubleshooting > Advanced says so).
 
 ## Build
 
@@ -336,14 +391,14 @@ parts (the job object, raising the first instance) are no-ops there.
   a watch child prints nothing for 10 s, a WARN and a "No status yet" pill. Mixing a
   `_package\bin` dashboard with an installed service (or the reverse) is the usual way in.
 - `--version` prints the version and exits (no window).
-- Rail badges: Displays (things to check), Components (updates), Performance (changed settings),
-  Running 3D apps (how many), and an amber **1** on Home when one display driver is set for every
+- Rail badges: Displays (things to check), Components (updates), Settings (changed settings),
+  Troubleshooting (how many 3D apps are running), and an amber **1** on Home when one display driver is set for every
   display on this PC (`dp list --json` `preferred`). Each badge is said in words: its tooltip, the
   rail entry's accessible name ("Home: One display driver is set ..."), and on Home the notice that
   explains it and offers "Clear this setting".
-- `--page displays|windows|components|performance|developer|home` opens on that page
-  (`catalog` still works and opens Components). `windows` is the page shown as **Running 3D apps**.
-  The rail's order is Home, Displays, Components, Performance, Running 3D apps, Developer.
+- `--page home|displays|components|settings|troubleshooting` opens on that page; the older ids still
+  land where their content is (`catalog`, `performance`, `windows`, `developer`: the table under
+  *Structure*). The rail's order is Home, Displays, Components, Settings, then Troubleshooting set apart.
 - `--fixture <file.ndjson>` replays snapshots from a file instead of `status --watch`
   (one line every 2 s, looping) and simulates the per-screen `dp` verbs in memory, so the
   live-service pages can be laid out without a service that answers. Fixtures and their
@@ -353,7 +408,7 @@ parts (the job object, raising the first instance) are no-ops there.
   id) simulates a machine-wide `PreferredPlugin` that a global `dp reset` clears.
 - Log: `%LOCALAPPDATA%\DisplayXR\dashboard.log` — lifecycle, child starts / exits, and
   every exception (unhandled AppDomain / TaskScheduler / Dispatcher handlers log and keep
-  going). The Developer page shows its path and the session's error count.
+  going). Troubleshooting > Advanced shows its path and the session's error count.
 - From an elevated shell, launch it through Explorer to drop elevation:
   `explorer.exe _package\bin\displayxr-dashboard.exe`.
 
@@ -365,7 +420,8 @@ parts (the job object, raising the first instance) are no-ops there.
   and the CLI lines the Components controls run — ADR-054 N3e), `Tracking` (the tracking card:
   info's probe summary, each screen's viewer source / reason / policy — ADR-054 N6),
   `Calibration` / `CalibrationSession` (the camera calibration window's model), `Catalog` (the
-  engine's list, the words of every exit code, the licence block, the URL rule), `ComponentRows`
+  engine's list, the words of every exit code, the licence block, the URL rule), `Verdict` (Home's
+  headline, rows and "Needs attention"), `PageRoutes` (the rail and every page id), `ComponentRows`
   (the Components list: installed components joined with catalog items, a row's status and what
   it may offer).
 - `Feed/` — `StatusFeed` (the state machine above, single-threaded on a scheduler),
