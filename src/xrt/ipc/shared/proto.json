@@ -992,7 +992,11 @@
 			{"name": "frame_id", "type": "uint64_t"},
 			{"name": "source_time", "type": "int64_t"},
 			{"name": "format", "type": "uint32_t"},
-			{"name": "byte_count", "type": "uint64_t"}
+			{"name": "byte_count", "type": "uint64_t"},
+			{"name": "camera_bytes", "type": "uint32_t"},
+			{"name": "facts_bytes", "type": "uint32_t"},
+			{"name": "failed", "type": "bool"},
+			{"name": "failure_reason", "type": "uint32_t"}
 		]
 	},
 

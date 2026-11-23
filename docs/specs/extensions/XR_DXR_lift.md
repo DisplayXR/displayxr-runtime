@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_lift` |
-| **Spec Version** | 5 (one extension; every earlier version's structs, values and behaviour are kept — §14) |
+| **Spec Version** | 6 (one extension; every earlier version's structs, values and behaviour are kept — §14) |
 | **Extension Type** | Instance extension. Conversion runs in the service, on whichever **conversion provider** the runtime selects per task (ADR-053). Reached by IPC sessions, and by in-process D3D11 / D3D12 sessions on Windows over a lift-only connection (ADR-049); advertised on every desktop platform, where a service with no provider reports nothing to convert with |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_lift.h` (canonical; auto-syncs to `displayxr-extensions`) |
-| **Status** | Provisional. Type values: `1004999270–285` (spec 1–3), `1004999340–369` (spec 4 and 5), pending Khronos registry |
+| **Status** | Provisional. Type values: `1004999270–285` (spec 1–3), `1004999340–369` (spec 4, 5 and 6), pending Khronos registry |
 | **Decision records** | [ADR-053](../../adr/ADR-053-conversion-providers.md) (conversion providers, tasks, readiness, the consumer contract; amends ADR-042 and ADR-049) · [ADR-054](../../adr/ADR-054-component-model.md) decision 8 (apps enumerate and request, never set policy: spec 5) · [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md) (pre-weave results, the asynchronous mailbox, scheduling) · [ADR-048](../../adr/ADR-048-lift-viewpoint-policy.md) + Addendum A (viewpoint policy, app rig, auxiliary depth) · [ADR-049](../../adr/ADR-049-in-process-lift-rides-the-service.md) (in-process sessions) |
 | **Provider contract** | [`conversion-provider-discovery.md`](../runtime/conversion-provider-discovery.md) + `src/xrt/include/xrt/xrt_conversion_plugin.h` (§11). The display-processor lift slots (`xrt_dp_lift.h`, `XRT_DP_D3D11_HAS_LIFT`) are frozen and reached only through the built-in `dp-lift` adapter |
 
@@ -89,11 +89,11 @@ populated from the first query of a boot. No call of this extension ever waits f
 |---|---|---|---|
 | `XR_LIFT_TASK_DEPTH_MONO_DXR` | 1 | one image → depth (no temporal state) | DEPTH + PHOTO |
 | `XR_LIFT_TASK_DEPTH_VIDEO_DXR` | 2 | frames → temporally stable depth; reset on a discontinuity | DEPTH + VIDEO |
-| `XR_LIFT_TASK_DISPARITY_STEREO_DXR` | 3 | rectified pair → disparity (spec 6) | — |
+| `XR_LIFT_TASK_DISPARITY_STEREO_DXR` | 3 | rectified pair → disparity (spec 7) | — |
 | `XR_LIFT_TASK_VIEWS_MONO_DXR` | 4 | image / frames → N ≥ 2 views, + same-inference depth | SBS, NVIEW |
-| `XR_LIFT_TASK_VIEWS_FROM_DEPTH_DXR` | 5 | image + depth → N views (spec 6) | — |
+| `XR_LIFT_TASK_VIEWS_FROM_DEPTH_DXR` | 5 | image + depth → N views (spec 7) | — |
 | `XR_LIFT_TASK_SPLATS_MONO_DXR` | 6 | photo → 3D Gaussian splats (job lane) | GAUSSIANS |
-| `XR_LIFT_TASK_SPLATS_STEREO_DXR` | 7 | pair → metric splats (spec 6) | — |
+| `XR_LIFT_TASK_SPLATS_STEREO_DXR` | 7 | pair → metric splats (spec 7) | — |
 | `SPLATS_VIDEO`, `INPAINT` | 8, 9 | **reserved**: never accepted | — |
 
 **`xrEnumerateLiftTasksDXR(session, capacityInput, &countOutput, tasks)`** (two-call idiom)
@@ -246,7 +246,7 @@ per-create **hint**: `providerId` = a candidate's `providerId`, optionally `/<mo
 | Validation | the create's checks (`viewCount` against `maxViews`, `requiredOutputs` of a READY provider) are against the provider the hinted create binds |
 
 Jobs: the hint applies to job creation with the same meaning once the job API lands; it will
-chain on the job create info (spec 6). `displayxr-cli conv run --provider <id>` ranks with the
+chain on the job create info (spec 7). `displayxr-cli conv run --provider <id>` ranks with the
 same rule (`conv_select` rule 3a) but is **strict**: a human named the provider, so when the run
 cannot bind it the command exits non-zero with the reason instead of falling through
 (`conv candidates <task>` shows why).
@@ -291,7 +291,7 @@ Chain `XrLiftTaskStreamCreateInfoDXR` on `XrLiftStreamCreateInfoDXR`:
 | Field | Meaning |
 |---|---|
 | `task` | a stream-lane task (§2.2) |
-| `inputKind` | one of the task's `inputKinds` (`MONO` in spec 4; stereo pairs and image + depth arrive with spec 6) |
+| `inputKind` | one of the task's `inputKinds` (`MONO` in spec 4; stereo pairs and image + depth arrive with spec 7) |
 | `qualityHint` | `DEFAULT`, `LATENCY`, `BALANCED`, `QUALITY` — the only lever an app has on which variant runs |
 | `viewCount` | `VIEWS_*`: 2..`maxViews`, or **0 = match the weave** (on a lifted weave rect, the active mode's view count, and the service resizes the stream on a mode switch without a new handle; on a plain stream, 2) |
 | `requiredOutputs` | output bits to refuse rather than degrade (e.g. `METRIC`, `AUX_DEPTH`) |
@@ -379,7 +379,7 @@ region**, in display axes (+x right, +y up, +z toward the viewer), metres:
 | `xrSubmitLiftFrameDXR` | the session's window (its window binding / presenter window) |
 | `xrSubmitLiftFrameDXR` on a connection with no session window (e.g. `displayxr-cli lift`, an in-process link) | the panel; for a spec-4 submit, a rect of the submitted `extent`'s aspect fitted inside the panel, centred |
 
-The windowless default is "aspect-fit, centred": the rect is geometry only, the module still synthesizes at the submitted `extent`, and an app-declared placement (a canvas or rect on the stream) is a spec-6 item.
+The windowless default is "aspect-fit, centred": the rect is geometry only, the module still synthesizes at the submitted `extent`, and an app-declared placement (a canvas or rect on the stream) is a spec-7 item.
 
 So a lifted video in a corner window looks straight-on to a viewer facing that window, not to a
 viewer facing the panel centre (the same window-relative rule ADR-012 sets for Kooima). This
@@ -583,7 +583,7 @@ Chain `XrLiftFrameImagesDXR` (1..3 `XrLiftImageDXR`, at most one per role) on
 
 | `XrLiftImageDXR` field | Meaning |
 |---|---|
-| `role` | `COLOR` (the mono input, or a whole SBS pair); `COLOR_RIGHT` and `DEPTH` arrive with spec 6 |
+| `role` | `COLOR` (the mono input, or a whole SBS pair); `COLOR_RIGHT` and `DEPTH` arrive with spec 7 |
 | `kind` | `D3D11_NT` (= spec 3 `inputTexture`, keyed mutex key 0), `D3D11_DXGI` (= `inputIsDxgi`), `D3D12_NT`, `VK_OPAQUE_WIN32`, `OPAQUE_FD`, `DMABUF` (+ `XrLiftImageDmabufDescDXR` on `next`), `IOSURFACE`, `AHARDWAREBUFFER`, `CPU`. Values 1–6 equal `XrWeaveHandleKindDXR`'s. Must be one of the task's `imageKinds` for this session |
 | `handle` / `cpuBytes` + `cpuRowPitch` | the image; handles are **borrowed** (the runtime duplicates what it keeps); CPU bytes are copied before the call returns |
 | `format`, `colorSpace` | `XrLiftPixelFormatDXR` (RGBA8 / BGRA8 UNORM or SRGB, NV12, …), `XrLiftColorSpaceDXR` (sRGB, linear, BT.709 limited / full) |
@@ -695,6 +695,69 @@ Why a separate entry point rather than a struct chained on the texture acquire: 
 kinds never coexist on a stream, and a blob needs the two-call size negotiation a texture does
 not. One call per result kind keeps each contract minimal.
 
+**The camera block (spec 6).** A blob alone does not say where the scene's screen plane is: a
+photo model's output is usually not metric (the subject of a portrait may sit at 0.6 units), so a
+viewer that guesses a pivot converges far behind the subject. Chain `XrLiftBlobCameraDXR` on
+`XrLiftBlobDXR::next` and every acquire that returns a blob — the size query included, for the
+same latched frame — also returns:
+
+- `camera`: the **DisplayXR camera block v2** as UTF-8 JSON, the very object
+  `displayxr-cli conv run --camera-block auto` writes into a SOG's `meta.json` as `camera`
+  (same writer, `conv_camera_block.c`), so a consumer passes it to the parser it already uses for
+  a SOG's camera. Shape (a photo with estimated intrinsics and a provider focus suggestion):
+
+  ```json
+  {"source":"auto","convention":"opencv","rig":"camera",
+   "rest":{"position":[0,0,0],"rotation":[0,0,0,1]},
+   "intrinsics":{"fx":1462.2,"fy":1462.2,"cx":1008,"cy":672,"width":2016,"height":1344},
+   "focus":{"point":[0,0,0.6092],"subject_m":0.6092,"near_m":0.5773,"far_m":22.64,"source":"auto"},
+   "dxr":{"ipd_factor":1,"parallax_factor":1}}
+  ```
+
+- `facts`: the provider's facts in the common schema (`X-DXR-Result` / `conv run --facts`):
+  intrinsics with their source (`given` / `estimated` / `assumed`), `metric`, near / far, the
+  focus suggestion, the build stamp.
+
+Rules, all runtime-side and provider-agnostic (a consumer never branches on the provider):
+
+- **Built by the runtime**, from the facts schema, whichever provider made the splats.
+- **Intrinsics in the caller's pixels.** When the runtime downscaled the photo (below), the
+  provider's intrinsics are scaled back to the photo the caller submitted. A provider that
+  reports none gets no `intrinsics` key: nothing is assumed (no nominal field of view). A
+  `focalPx` the caller gives is passed on (scaled with the photo); none stays none, and the
+  provider estimates it and says so in `facts.intrinsics.source`.
+- **Focus**: the provider's suggestion (`"source": "auto"`, as the writer labels it); without
+  one — or without any facts — the **runtime's own** estimate from the splats
+  (`"source": "runtime"`): the opaque splats are projected into a small nearest-surface
+  inverse-depth image and the screen plane is the auto-convergence rule lifted video uses
+  (§4.4: the centre-weighted 80th percentile of nearness blended with the dominant clump, far
+  background excluded), falling back to the 80th percentile of nearness; `near_m` / `far_m` are
+  the 2nd / 98th percentile of the opaque splats' depth. (PLY blobs; a SOG lends the focus of its
+  own auto block.)
+- **An authored block is never rewritten**: a SOG blob whose `meta.json` already carries a
+  `camera` that is not `"source": "auto"` returns that block verbatim.
+- Strings use the two-call idiom per string (counts include the NUL), but a too-small string
+  capacity is **not** an error — the blob call's own result and latch rules are unchanged — so a
+  caller sizes both strings on the blob's size query. A spec-5 runtime ignores the struct
+  (initialise the counts to 0).
+
+The blob's format needs no guessing: `XrLiftBlobDXR::format` says PLY or SOG
+(`XrLiftTaskPropertiesDXR::blobFormats` lists what the task may return). The browser path
+requests PLY: writing a PLY costs a fraction of a SOG encode and the runtime ships no SOG encoder.
+
+**Failures are reported (spec 6).** When the newest photo's conversion fails, the next acquire
+returns `XR_ERROR_LIFT_CONVERSION_FAILED_DXR` once, with `frameId` / `sourceTime` naming that
+photo; afterwards the stream reads `XR_LIFT_NOT_READY_DXR` until a newer photo succeeds. The
+stream stays usable. (Spec 5 left a failed photo pending forever: a caller waited out its own
+timeout and its next request queued behind it.) A failure that a newer photo supersedes before it
+was acquired is never reported.
+
+**Oversize photos (spec 6).** A photo whose longest edge exceeds 3072 px is box-downscaled by the
+runtime, aspect kept, before it reaches the provider (photo models infer far below that; a
+6016 × 4000 RGBA photo did not fit a satellite host's input scratch). Any 50 MP photo works;
+callers that can should still downscale to the model's working size first (the cost is the
+caller's copy of a large image).
+
 ### 5.3 D3D12 callers (engine apps, ADR-049)
 
 The handles are D3D12-consumable as they are: the export texture is an NT-handle shared texture
@@ -752,7 +815,7 @@ adapter is served through a CPU copy inside the runtime and never changes what t
 ### 5.5 What a result means: depth and views (spec 4)
 
 **`XrLiftDepthInfoDXR`** describes depth wherever it appears: chained on `XrLiftResultDXR` of a
-`DEPTH_*` stream, on `XrLiftDepthResultDXR` (auxiliary depth, §4.3), and (spec 6) on a depth
+`DEPTH_*` stream, on `XrLiftDepthResultDXR` (auxiliary depth, §4.3), and (spec 7) on a depth
 input image and a job result. Decode a sample `s` as `v = rawScale · s + rawShift`, then read
 `v` by `kind`:
 
@@ -763,7 +826,7 @@ input image and a job result. Decode a sample `s` as `v = rawScale · s + rawShi
 | `AFFINE_INVERSE_DEPTH` | 3 | 1 / depth up to an unknown scale and shift; larger = nearer | RELATIVE + INVERSE |
 | `AFFINE_DISPARITY` | 4 | disparity up to an unknown scale and shift; larger = nearer | RELATIVE + INVERSE (§14.2 shift 3) |
 | `AFFINE_DEPTH` | 5 | depth up to an unknown scale and shift; larger = farther | RELATIVE + LINEAR |
-| `PIXEL_DISPARITY` | 6 | exact disparity in pixels of a rectified pair (`DISPARITY_STEREO`, spec 6) | never reaches a spec-3 result |
+| `PIXEL_DISPARITY` | 6 | exact disparity in pixels of a rectified pair (`DISPARITY_STEREO`, spec 7) | never reaches a spec-3 result |
 
 - `measure`: PLANAR (to the camera plane) or RAY (along the pixel ray).
 - `nearZ` / `farZ`: **depth readings** `d` (see the decoding table below), so `nearZ < farZ` for
@@ -1028,6 +1091,7 @@ Mirrors XR_DXR_weave §4b.
 | `XR_ERROR_FEATURE_UNSUPPORTED` | in-process session other than D3D11/D3D12 on Windows (spec-3 calls); a task or mode with no non-terminal candidate; a `requiredOutputs` bit missing from a READY provider; in-process: a stream of a lift connection that was lost (destroy it, create a new one) | yes — permanent for that request |
 | `XR_ERROR_LIMIT_REACHED` | the selected provider's `maxStreams` for the task | yes |
 | `XR_ERROR_SIZE_INSUFFICIENT` | blob capacity too small (latch kept); `xrEnumerateLiftTasksDXR` capacity too small | yes |
+| `XR_ERROR_LIFT_CONVERSION_FAILED_DXR` (spec 6) | `xrAcquireLiftBlobDXR`: the newest photo's conversion failed; reported once, `frameId` / `sourceTime` name it (§5.2) | yes — submit another photo |
 | `XR_ERROR_RUNTIME_FAILURE` | the service refused this call over a healthy pipe — most commonly the 4 ms input keyed-mutex miss, or a stream the service no longer knows | **yes — retry next frame** |
 | `XR_ERROR_INSTANCE_LOST` | the IPC connection is gone (IPC sessions only — an in-process session's lift connection dying is `XR_ERROR_RUNTIME_FAILURE` on that call; the session renders on, and the next `xrGetLiftPropertiesDXR` reconnects) | no — recover with a new instance (weave §4b) |
 | `XR_ERROR_SESSION_LOST` | any call after that | no |
@@ -1133,7 +1197,8 @@ its minimum runtime in the same change (`consumer_floors`).
 | 3 | App camera + metric depth (ADR-048 Addendum A, §4.2–4.3): `XrDisplayRigDXR` / `XrCameraRigDXR` on `XrLiftOptionsDXR` / `XrWeaveRectLiftDXR` drive the TRACKED viewpoints with the `xrLocateViews` rig math; EXPLICIT viewpoints accepted on lifted weave rects; auxiliary depth for SBS / NVIEW streams — `XrLiftDepthRequestDXR`, `XrLiftDepthResultDXR` (texture + shared fence, units, encoding, intrinsics, convergence depth, viewpoint, `depthToDisplay`), `XrLiftDepthPropertiesDXR`. A separate version from 2 because v2 can ship on its own (#1864): an app tests `SPEC_VERSION >= 3` for these. |
 | 4 | Conversion providers (ADR-053, §2.2–2.4, §3.2, §4.5–4.6, §5.4–5.5, §6.1): the task vocabulary (`XrLiftTaskDXR`), input kinds and a quality hint; `xrEnumerateLiftTasksDXR` (the effective capability, readiness and licence class per task) and `xrRequestLiftTaskWarmDXR`; `XrLiftTaskStateDXR` + failure reason; `XrEventDataLiftTaskStateChangedDXR` / `XrEventDataLiftProvidersChangedDXR`, opt-in per session; `XrLiftTaskStreamCreateInfoDXR` (task, input kind, quality hint, `viewCount` 0 = match the weave, `requiredOutputs`, export kind); `XrLiftFrameImagesDXR` / `XrLiftImageDXR` with explicit sync, `XrLiftImageDmabufDescDXR`, `XrLiftFrameControlDXR` (discontinuity); `XrLiftResultExportDXR`, `XrLiftDepthInfoDXR`, `XrLiftViewsInfoDXR`. The consumer contract (§2.4) replaces ADR-042's "open default". Type values `1004999341–351`; enum values equal the plug-in ABI's. An app tests `SPEC_VERSION >= 4`. |
 | 5 | Provider candidates (#2178, ADR-054 decision 8, §2.5): `xrEnumerateLiftTaskCandidatesDXR` / `XrLiftTaskCandidateDXR` (read-only: id, the provider's own display name, readiness, licence class, hosting, `isUserDefault`, `isSelected`), `XrLiftProviderHostingDXR`, and `XrLiftProviderPreferenceDXR` on `XrLiftTaskStreamCreateInfoDXR` (a per-create hint that reorders the non-terminal candidates; an unknown or terminal one falls through). `XrEventDataLiftProvidersChangedDXR` is also sent when an enumerated candidate list changes. Type values `1004999340` (held back from spec 4 for exactly this) and `1004999352`. An app tests `SPEC_VERSION >= 5`. |
-| 6 | *Planned, not shipped:* jobs (`XrLiftJobDXR`, the 1004999360.. types), stereo-pair and image + depth input (`DISPARITY_STEREO`, `VIEWS_FROM_DEPTH`, `SPLATS_STEREO`) and splats over the extension. The header marks those tasks / enums "spec 6"; a spec-4 or spec-5 runtime refuses them. |
+| 6 | The GAUSSIANS camera block (§5.2): `XrLiftBlobCameraDXR` on `XrLiftBlobDXR` returns the runtime-built camera block v2 (the SOG `meta.json` `camera` object, focus from the provider's suggestion or the runtime's own estimate from the splats) and the provider's facts with each blob; `XR_ERROR_LIFT_CONVERSION_FAILED_DXR` reports a failed photo once instead of `XR_LIFT_NOT_READY_DXR` forever; photos above 3072 px are downscaled by the runtime with the intrinsics reported in the caller's pixels. Type value `1004999353`, result `-1004999354`. An app tests `SPEC_VERSION >= 6`. |
+| 7 | *Planned, not shipped:* jobs (`XrLiftJobDXR`, the 1004999360.. types), stereo-pair and image + depth input (`DISPARITY_STEREO`, `VIEWS_FROM_DEPTH`, `SPLATS_STEREO`) and splats over the extension. The header marks those tasks / enums "spec 7"; a spec-4, spec-5 or spec-6 runtime refuses them. (Planned as spec 6 until the camera block took that number.) |
 
 ### 14.1 Spec 3 is frozen
 
@@ -1173,7 +1238,7 @@ pinned by a golden test (`tests/tests_lift_v3_shifts.cpp`, tag `[lift_v3_shift]`
 
 ### 14.4 Open items
 
-- **DMABUF out needs modifier + stride on `XrLiftResultExportDXR` (spec 6).** A dma-buf export
+- **DMABUF out needs modifier + stride on `XrLiftResultExportDXR` (spec 7).** A dma-buf export
   cannot be imported without its DRM modifier and plane stride, and the struct has no fields
   for them; no fields are added now. Until then `DMABUF` is never an export kind (§5.4) and
   Linux results leave as `OPAQUE_FD` or `CPU`.

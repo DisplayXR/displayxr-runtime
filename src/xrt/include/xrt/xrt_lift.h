@@ -137,6 +137,14 @@ struct xrt_lift_blob_info
 	int64_t source_time;
 	uint32_t format; //!< XRT_DP_LIFT_BLOB_*
 	uint64_t byte_count;
+	//! XR_DXR_lift spec 6 (client side): the runtime-built camera block v2 and
+	//! the provider's facts of this blob, NUL-terminated, malloc'd (the caller
+	//! frees); NULL = none.
+	char *camera_json;
+	char *facts_json;
+	//! Spec 6: the newest conversion FAILED (frame_id / source_time are its).
+	bool failed;
+	uint32_t failure_reason;
 };
 
 //! A lift-flagged rect of the NEXT weave submit (XrWeaveRectLiftDXR).

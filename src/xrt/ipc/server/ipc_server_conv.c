@@ -17,6 +17,7 @@
 
 #include "xrt/xrt_display_metrics.h"
 
+#include "conversion/conv_camera_block.h"
 #include "conversion/conv_candidates.h"
 #include "conversion/conv_core.h"
 #include "conversion/conv_readiness.h"
@@ -27,6 +28,8 @@
 #include "util/u_logging.h"
 #include "util/u_lift_depth.h"
 #include "util/u_lift_mailbox.h"
+
+#include <cjson/cJSON.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -78,6 +81,14 @@ struct sc_stream
 	uint32_t blob_format;
 	uint64_t blob_frame_id;
 	int64_t blob_source_time;
+	/* Spec 6: what rides with the latched blob, and the newest job's failure. */
+	char *camera_json;               //!< runtime-built camera block v2 of the latched blob
+	char *facts_json;                //!< the provider's facts, intrinsics in the caller's pixels
+	double job_scale_x, job_scale_y; //!< caller px / provider px of the newest job (downscale)
+	bool fail_latched;               //!< the newest job FAILED: report it once
+	uint64_t fail_frame_id;
+	int64_t fail_source_time;
+	uint32_t fail_reason;
 
 	/* Spec 4 (#2054): created by conv_stream_create (a task stream). */
 	bool v4;
@@ -319,6 +330,19 @@ v3_blob_format(uint32_t conv_format)
 	}
 }
 
+//! Free a GAUSSIANS stream's latched blob and what rides with it.
+static void
+sc_free_latch(struct sc_stream *s)
+{
+	free(s->blob);
+	free(s->camera_json);
+	free(s->facts_json);
+	s->blob = NULL;
+	s->camera_json = NULL;
+	s->facts_json = NULL;
+	s->blob_size = 0;
+}
+
 static xrt_result_t
 core_create(struct ipc_server_conv *sc, struct sc_stream *st, uint64_t *out_core_id)
 {
@@ -481,7 +505,7 @@ ipc_server_conv_destroy(struct ipc_server_conv **sc_ptr)
 		if (s->job_id != 0) {
 			(void)conv_core_job_destroy(sc->core, s->job_id);
 		}
-		free(s->blob);
+		sc_free_latch(s);
 		if (sc->io_set) {
 			sc->io.stream_gone(sc->io.ud, s->wire_id);
 		}
@@ -709,7 +733,7 @@ ipc_server_conv_install_gpu(struct ipc_server_conv *sc, const struct ipc_server_
 		if (s->job_id != 0) {
 			(void)conv_core_job_destroy(sc->core, s->job_id);
 		}
-		free(s->blob);
+		sc_free_latch(s);
 		memset(s, 0, sizeof(*s));
 	}
 	os_mutex_unlock(&sc->mtx);
@@ -905,7 +929,7 @@ ipc_server_conv_lift_stream_destroy(struct ipc_server_conv *sc, uint64_t client_
 	if (st.job_id != 0) {
 		(void)conv_core_job_destroy(sc->core, st.job_id);
 	}
-	free(st.blob);
+	sc_free_latch(&st);
 	struct ipc_server_conv_io_ops io;
 	if (get_io(sc, &io)) {
 		io.stream_gone(io.ud, stream_id);
@@ -924,9 +948,79 @@ ipc_server_conv_lift_submit(struct ipc_server_conv *sc,
 	return ipc_server_conv_lift_submit_framed(sc, client_id, args, handle, is_dxgi, NULL, out_frame_id);
 }
 
+/*!
+ * Box-downscale @p px (@p w x @p h tightly packed RGBA8) so its longest edge
+ * is at most @p max_edge, aspect kept. Returns the new malloc'd pixels (the
+ * old ones are freed) or @p px unchanged when it already fits; NULL on OOM
+ * (@p px freed).
+ */
+static uint8_t *
+photo_downscale(uint8_t *px, uint32_t w, uint32_t h, uint32_t max_edge, uint32_t *out_w, uint32_t *out_h)
+{
+	*out_w = w;
+	*out_h = h;
+	const uint32_t edge = w > h ? w : h;
+	if (edge <= max_edge || max_edge == 0) {
+		return px;
+	}
+	const double s = (double)max_edge / (double)edge;
+	uint32_t dw = (uint32_t)((double)w * s + 0.5), dh = (uint32_t)((double)h * s + 0.5);
+	dw = dw < 1 ? 1 : (dw > max_edge ? max_edge : dw);
+	dh = dh < 1 ? 1 : (dh > max_edge ? max_edge : dh);
+	uint8_t *out = (uint8_t *)malloc((size_t)dw * dh * 4u);
+	uint64_t *acc = (uint64_t *)calloc((size_t)dw * 5u, sizeof(uint64_t)); // r g b a n per column
+	if (out == NULL || acc == NULL) {
+		free(out);
+		free(acc);
+		free(px);
+		return NULL;
+	}
+	// Area average: each source pixel lands in exactly one destination cell.
+	uint32_t *col = (uint32_t *)malloc(sizeof(uint32_t) * w);
+	if (col == NULL) {
+		free(out);
+		free(acc);
+		free(px);
+		return NULL;
+	}
+	for (uint32_t x = 0; x < w; x++) {
+		col[x] = (uint32_t)((uint64_t)x * dw / w);
+	}
+	for (uint32_t dy = 0; dy < dh; dy++) {
+		const uint32_t y0 = (uint32_t)((uint64_t)dy * h / dh), y1 = (uint32_t)((uint64_t)(dy + 1) * h / dh);
+		memset(acc, 0, sizeof(uint64_t) * dw * 5u);
+		for (uint32_t y = y0; y < y1; y++) {
+			const uint8_t *row = px + (size_t)y * w * 4u;
+			for (uint32_t x = 0; x < w; x++) {
+				uint64_t *a = acc + (size_t)col[x] * 5u;
+				a[0] += row[4 * x + 0];
+				a[1] += row[4 * x + 1];
+				a[2] += row[4 * x + 2];
+				a[3] += row[4 * x + 3];
+				a[4]++;
+			}
+		}
+		for (uint32_t dx = 0; dx < dw; dx++) {
+			const uint64_t *a = acc + (size_t)dx * 5u;
+			const uint64_t n = a[4] > 0 ? a[4] : 1;
+			uint8_t *o = out + ((size_t)dy * dw + dx) * 4u;
+			for (int c = 0; c < 4; c++) {
+				o[c] = (uint8_t)((a[c] + n / 2) / n);
+			}
+		}
+	}
+	free(col);
+	free(acc);
+	free(px);
+	*out_w = dw;
+	*out_h = dh;
+	return out;
+}
+
 /*! GAUSSIANS facade job: @p px (args->width x args->height tightly packed
  *  RGBA8, malloc'd; freed here) as one SPLATS_MONO job; a newer photo cancels
- *  the previous job (latest wins). */
+ *  the previous job (latest wins). A photo above IPC_SERVER_CONV_PHOTO_MAX_EDGE
+ *  is downscaled first (spec 6; a 6016 x 4000 photo did not fit the lane). */
 static xrt_result_t
 gaussians_job_submit(struct ipc_server_conv *sc,
                      struct sc_stream *st,
@@ -935,6 +1029,17 @@ gaussians_job_submit(struct ipc_server_conv *sc,
                      uint8_t *px,
                      uint64_t *out_frame_id)
 {
+	uint32_t pw = args->width, ph = args->height;
+	px = photo_downscale(px, args->width, args->height, IPC_SERVER_CONV_PHOTO_MAX_EDGE, &pw, &ph);
+	if (px == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	const double scale_x = (double)args->width / (double)pw;
+	const double scale_y = (double)args->height / (double)ph;
+	if (pw != args->width || ph != args->height) {
+		U_LOG_W("[conv] GAUSSIANS: photo %ux%u downscaled to %ux%u for the provider (max edge %u)", args->width,
+		        args->height, pw, ph, IPC_SERVER_CONV_PHOTO_MAX_EDGE);
+	}
 	struct conv_job_create_info ji;
 	memset(&ji, 0, sizeof(ji));
 	ji.task = XRT_CONV_TASK_SPLATS_MONO;
@@ -947,15 +1052,17 @@ gaussians_job_submit(struct ipc_server_conv *sc,
 	struct xrt_conv_image *im = &ji.images[0];
 	im->memory_kind = XRT_CONV_MEM_CPU;
 	im->cpu_ptr = px;
-	im->byte_size = (uint64_t)args->width * args->height * 4u;
-	im->width = args->width;
-	im->height = args->height;
+	im->byte_size = (uint64_t)pw * ph * 4u;
+	im->width = pw;
+	im->height = ph;
 	im->format = XRT_CONV_FMT_RGBA8_UNORM;
 	im->color_space = XRT_CONV_CS_SRGB;
-	im->row_stride = args->width * 4u;
+	im->row_stride = pw * 4u;
 	ji.params.struct_size = (uint32_t)sizeof(ji.params);
 	ji.params.content_hint = XRT_CONV_CONTENT_PHOTO;
-	ji.params.focal_px = p->focal_px > 0.0f ? p->focal_px : 0.0f;
+	// A given focal length follows the photo into the provider's pixels; none
+	// stays none (the provider estimates it and says so in its facts).
+	ji.params.focal_px = p->focal_px > 0.0f ? (float)((double)p->focal_px / scale_x) : 0.0f;
 	ji.params.source_time_ns = (uint64_t)args->source_time;
 	ji.params.input_scale = 1.0f;
 	uint64_t job_id = 0;
@@ -971,6 +1078,9 @@ gaussians_job_submit(struct ipc_server_conv *sc,
 	st->job_id = job_id;
 	st->job_frame_id = ++st->next_frame;
 	st->job_source_time = args->source_time;
+	st->job_scale_x = scale_x;
+	st->job_scale_y = scale_y;
+	st->fail_latched = false; // a newer photo supersedes an unreported failure
 	*out_frame_id = st->job_frame_id;
 	return XRT_SUCCESS;
 }
@@ -1340,18 +1450,85 @@ ipc_server_conv_lift_stats(struct ipc_server_conv *sc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Spec 6: the facts and the runtime-built camera block of a succeeded job's
+ * blob, as compact JSON (either may stay NULL). The provider's intrinsics are
+ * re-expressed in the caller's pixels when the facade downscaled the photo.
+ */
+static void
+gaussians_describe(struct ipc_server_conv *sc,
+                   const struct sc_stream *st,
+                   const struct xrt_conv_wire_job_result *jr,
+                   const uint8_t *blob,
+                   uint64_t size,
+                   char **out_camera,
+                   char **out_facts)
+{
+	*out_camera = NULL;
+	*out_facts = NULL;
+	struct xrt_conv_splat_info si;
+	memset(&si, 0, sizeof(si));
+	xrt_conv_wire_unpack_splat_info(&jr->splat_info, &si);
+	struct xrt_conv_splat_result sr;
+	memset(&sr, 0, sizeof(sr));
+	sr.struct_size = (uint32_t)sizeof(sr);
+	const bool have_sr = conv_core_job_splat_result(sc->core, st->job_id, &sr) == XRT_SUCCESS;
+	cJSON *facts = conv_splat_facts_to_json(&si, have_sr ? &sr : NULL);
+	if (facts == NULL) {
+		return;
+	}
+	conv_splat_facts_scale_intrinsics(facts, st->job_scale_x > 0.0 ? st->job_scale_x : 1.0,
+	                                  st->job_scale_y > 0.0 ? st->job_scale_y : 1.0);
+	char err[160] = {0};
+	cJSON *block = conv_lift_camera_block(facts, blob, (size_t)size, jr->blob_format, err, sizeof(err));
+	if (block != NULL) {
+		*out_camera = cJSON_PrintUnformatted(block);
+		const cJSON *focus = cJSON_GetObjectItemCaseSensitive(block, "focus");
+		const cJSON *fsrc = cJSON_GetObjectItemCaseSensitive(focus, "source");
+		const cJSON *subj = cJSON_GetObjectItemCaseSensitive(focus, "subject_m");
+		U_LOG_W("[conv] GAUSSIANS frame %llu: camera block %s intrinsics, focus %s at %.4g (0 = none)",
+		        (unsigned long long)st->job_frame_id,
+		        cJSON_GetObjectItemCaseSensitive(block, "intrinsics") != NULL ? "with" : "without",
+		        cJSON_IsString(fsrc) ? fsrc->valuestring : "none",
+		        cJSON_IsNumber(subj) ? subj->valuedouble : 0.0);
+		cJSON_Delete(block);
+	} else {
+		U_LOG_W("[conv] GAUSSIANS frame %llu: no camera block (%s)", (unsigned long long)st->job_frame_id, err);
+	}
+	*out_facts = cJSON_PrintUnformatted(facts);
+	cJSON_Delete(facts);
+}
+
+static char *
+dup_str(const char *s)
+{
+	if (s == NULL) {
+		return NULL;
+	}
+	const size_t n = strlen(s) + 1;
+	char *d = (char *)malloc(n);
+	if (d != NULL) {
+		memcpy(d, s, n);
+	}
+	return d;
+}
+
 xrt_result_t
-ipc_server_conv_lift_acquire_blob(struct ipc_server_conv *sc,
-                                  uint64_t client_id,
-                                  uint64_t stream_id,
-                                  uint64_t capacity,
-                                  bool *out_ready,
-                                  struct xrt_lift_blob_info *out_info,
-                                  uint8_t **out_bytes)
+ipc_server_conv_lift_acquire_blob_ex(struct ipc_server_conv *sc,
+                                     uint64_t client_id,
+                                     uint64_t stream_id,
+                                     uint64_t capacity,
+                                     bool *out_ready,
+                                     struct xrt_lift_blob_info *out_info,
+                                     uint8_t **out_bytes,
+                                     struct ipc_server_conv_blob_extra *extra)
 {
 	*out_ready = false;
 	memset(out_info, 0, sizeof(*out_info));
 	*out_bytes = NULL;
+	if (extra != NULL) {
+		memset(extra, 0, sizeof(*extra));
+	}
 	struct sc_stream st;
 	if (sc == NULL || !find_stream(sc, client_id, stream_id, &st)) {
 		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
@@ -1383,11 +1560,14 @@ ipc_server_conv_lift_acquire_blob(struct ipc_server_conv *sc,
 					}
 					const uint32_t v3_format = v3_blob_format(jr.blob_format);
 					if (buf != NULL && off == jr.byte_size && v3_format != 0) {
+						sc_free_latch(&st);
 						st.blob = buf;
 						st.blob_size = jr.byte_size;
 						st.blob_format = v3_format;
 						st.blob_frame_id = st.job_frame_id;
 						st.blob_source_time = st.job_source_time;
+						gaussians_describe(sc, &st, &jr, buf, jr.byte_size, &st.camera_json,
+						                   &st.facts_json);
 					} else {
 						if (v3_format == 0) {
 							// Never relabelled: a v3 caller would parse the
@@ -1401,7 +1581,17 @@ ipc_server_conv_lift_acquire_blob(struct ipc_server_conv *sc,
 				}
 				(void)conv_core_job_destroy(sc->core, st.job_id);
 				st.job_id = 0;
-			} else if (js.status == CONV_JOB_FAILED || js.status == CONV_JOB_CANCELLED) {
+			} else if (js.status == CONV_JOB_FAILED) {
+				// Spec 6: a failed photo is reported, not left pending forever.
+				U_LOG_W("[conv] GAUSSIANS frame %llu: the conversion failed (reason %u, stage '%s')",
+				        (unsigned long long)st.job_frame_id, js.failure_reason, js.stage);
+				st.fail_latched = true;
+				st.fail_frame_id = st.job_frame_id;
+				st.fail_source_time = st.job_source_time;
+				st.fail_reason = js.failure_reason;
+				(void)conv_core_job_destroy(sc->core, st.job_id);
+				st.job_id = 0;
+			} else if (js.status == CONV_JOB_CANCELLED) {
 				(void)conv_core_job_destroy(sc->core, st.job_id);
 				st.job_id = 0;
 			}
@@ -1409,6 +1599,14 @@ ipc_server_conv_lift_acquire_blob(struct ipc_server_conv *sc,
 		}
 	}
 	if (st.blob == NULL) {
+		if (st.fail_latched && extra != NULL) {
+			extra->failed = true;
+			extra->failure_reason = st.fail_reason;
+			out_info->frame_id = st.fail_frame_id;
+			out_info->source_time = st.fail_source_time;
+			st.fail_latched = false; // reported once
+			store_stream(sc, &st);
+		}
 		return XRT_SUCCESS; // nothing newer
 	}
 	*out_ready = true;
@@ -1416,14 +1614,38 @@ ipc_server_conv_lift_acquire_blob(struct ipc_server_conv *sc,
 	out_info->source_time = st.blob_source_time;
 	out_info->format = st.blob_format;
 	out_info->byte_count = st.blob_size;
+	if (extra != NULL) {
+		extra->camera_json = dup_str(st.camera_json);
+		extra->facts_json = dup_str(st.facts_json);
+	}
 	if (capacity >= st.blob_size) {
 		// Delivered: the latch is consumed (the caller frees the bytes).
 		*out_bytes = st.blob;
 		st.blob = NULL;
-		st.blob_size = 0;
+		sc_free_latch(&st);
 		store_stream(sc, &st);
 	}
 	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_server_conv_lift_acquire_blob(struct ipc_server_conv *sc,
+                                  uint64_t client_id,
+                                  uint64_t stream_id,
+                                  uint64_t capacity,
+                                  bool *out_ready,
+                                  struct xrt_lift_blob_info *out_info,
+                                  uint8_t **out_bytes)
+{
+	struct ipc_server_conv_blob_extra extra;
+	const xrt_result_t r = ipc_server_conv_lift_acquire_blob_ex(sc, client_id, stream_id, capacity, out_ready,
+	                                                            out_info, out_bytes, &extra);
+	free(extra.camera_json);
+	free(extra.facts_json);
+	if (extra.failed) {
+		memset(out_info, 0, sizeof(*out_info)); // the spec-5 view: NOT READY
+	}
+	return r;
 }
 
 void
@@ -1462,7 +1684,7 @@ ipc_server_conv_client_gone(struct ipc_server_conv *sc, uint64_t client_id)
 		struct sc_stream *s = &sc->streams[i];
 		if (s->used && s->client_id == client_id) {
 			gone[n++] = s->wire_id;
-			free(s->blob); // its jobs die with the connection in the core
+			sc_free_latch(s); // its jobs die with the connection in the core
 			memset(s, 0, sizeof(*s));
 		}
 	}

@@ -7,6 +7,7 @@
  */
 
 #include "conv_camera_block.h"
+#include "conv_splat_focus.h"
 
 #include <cjson/cJSON.h>
 
@@ -213,13 +214,16 @@ copy_num(cJSON *dst, const cJSON *src, const char *from, const char *to)
 	}
 }
 
-cJSON *
-conv_camera_block_from_facts(const cJSON *facts, char *err, size_t err_size)
+/*! The v2 block from facts; without intrinsics it is NULL (@p need_intrinsics)
+ *  or the block without its `intrinsics` key. */
+static cJSON *
+build_block(const cJSON *facts, bool need_intrinsics, char *err, size_t err_size)
 {
 	const cJSON *in = cJSON_GetObjectItemCaseSensitive(facts, "intrinsics");
 	double fx = 0, fy = 0, cx = 0, cy = 0, w = 0, h = 0;
-	if (!num(in, "fx", &fx) || fx <= 0 || !num(in, "cx", &cx) || !num(in, "cy", &cy) || !num(in, "width", &w) ||
-	    !num(in, "height", &h) || w <= 0 || h <= 0) {
+	const bool have_intrinsics = num(in, "fx", &fx) && fx > 0 && num(in, "cx", &cx) && num(in, "cy", &cy) &&
+	                             num(in, "width", &w) && num(in, "height", &h) && w > 0 && h > 0;
+	if (!have_intrinsics && need_intrinsics) {
 		seterr(err, err_size, "the facts carry no intrinsics: no camera block (a viewer estimates them)");
 		return NULL;
 	}
@@ -239,13 +243,15 @@ conv_camera_block_from_facts(const cJSON *facts, char *err, size_t err_size)
 	const float pos[3] = {0, 0, 0}, rot[4] = {0, 0, 0, 1};
 	cJSON_AddItemToObject(rest, "position", farray(pos, 3));
 	cJSON_AddItemToObject(rest, "rotation", farray(rot, 4));
-	cJSON *ib = cJSON_AddObjectToObject(b, "intrinsics");
-	cJSON_AddNumberToObject(ib, "fx", fx);
-	cJSON_AddNumberToObject(ib, "fy", fy);
-	cJSON_AddNumberToObject(ib, "cx", cx);
-	cJSON_AddNumberToObject(ib, "cy", cy);
-	cJSON_AddNumberToObject(ib, "width", (double)(int64_t)w);
-	cJSON_AddNumberToObject(ib, "height", (double)(int64_t)h);
+	if (have_intrinsics) {
+		cJSON *ib = cJSON_AddObjectToObject(b, "intrinsics");
+		cJSON_AddNumberToObject(ib, "fx", fx);
+		cJSON_AddNumberToObject(ib, "fy", fy);
+		cJSON_AddNumberToObject(ib, "cx", cx);
+		cJSON_AddNumberToObject(ib, "cy", cy);
+		cJSON_AddNumberToObject(ib, "width", (double)(int64_t)w);
+		cJSON_AddNumberToObject(ib, "height", (double)(int64_t)h);
+	}
 
 	// Metric facts only for a metric result: a guessed baseline is the trap.
 	double baseline = 0;
@@ -282,6 +288,12 @@ conv_camera_block_from_facts(const cJSON *facts, char *err, size_t err_size)
 	cJSON_AddNumberToObject(dxr, "ipd_factor", 1.0);
 	cJSON_AddNumberToObject(dxr, "parallax_factor", 1.0);
 	return b;
+}
+
+cJSON *
+conv_camera_block_from_facts(const cJSON *facts, char *err, size_t err_size)
+{
+	return build_block(facts, true, err, err_size);
 }
 
 const char *
@@ -779,4 +791,146 @@ conv_camera_block_write(const char *path, const cJSON *block, char *err, size_t 
 	}
 	free(data);
 	return r;
+}
+
+
+/*
+ *
+ * The lift caller's camera block (XR_DXR_lift spec 6).
+ *
+ */
+
+char *
+conv_sog_read_meta_mem(const uint8_t *sog, size_t size, char *err, size_t err_size)
+{
+	if (err != NULL && err_size > 0) {
+		err[0] = 0;
+	}
+	if (sog == NULL || size == 0) {
+		seterr(err, err_size, "no SOG bytes");
+		return NULL;
+	}
+	return zip_read_meta(sog, size, err, err_size);
+}
+
+static void
+scale_num(cJSON *o, const char *k, double s, bool round_it)
+{
+	cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+	if (cJSON_IsNumber(v) && isfinite(v->valuedouble)) {
+		const double x = v->valuedouble * s;
+		cJSON_SetNumberValue(v, round_it ? floor(x + 0.5) : x);
+	}
+}
+
+void
+conv_splat_facts_scale_intrinsics(cJSON *facts, double sx, double sy)
+{
+	cJSON *in = cJSON_GetObjectItemCaseSensitive(facts, "intrinsics");
+	if (!cJSON_IsObject(in) || !(sx > 0.0) || !(sy > 0.0) || (sx == 1.0 && sy == 1.0)) {
+		return;
+	}
+	scale_num(in, "fx", sx, false);
+	scale_num(in, "cx", sx, false);
+	scale_num(in, "width", sx, true);
+	scale_num(in, "fy", sy, false);
+	scale_num(in, "cy", sy, false);
+	scale_num(in, "height", sy, true);
+}
+
+//! The `camera` object of a SOG's meta.json, or NULL; *@p authored when its source is not "auto".
+static cJSON *
+sog_camera(const uint8_t *blob, size_t size, bool *authored)
+{
+	*authored = false;
+	char *meta_text = conv_sog_read_meta_mem(blob, size, NULL, 0);
+	cJSON *meta = meta_text != NULL ? cJSON_Parse(meta_text) : NULL;
+	free(meta_text);
+	cJSON *cam = NULL;
+	const cJSON *it = NULL;
+	cJSON_ArrayForEach(it, meta)
+	{
+		if (it->string == NULL || strcmp(it->string, "camera") != 0) {
+			continue;
+		}
+		const cJSON *src = cJSON_GetObjectItemCaseSensitive(it, "source");
+		const bool is_auto = cJSON_IsObject(it) && cJSON_IsString(src) && strcmp(src->valuestring, "auto") == 0;
+		if (!is_auto || cam == NULL) {
+			cJSON_Delete(cam);
+			cam = cJSON_Duplicate(it, true);
+			*authored = !is_auto;
+		}
+		if (!is_auto) {
+			break; // the author's block wins (the conv_camera_block_apply_meta rule)
+		}
+	}
+	cJSON_Delete(meta);
+	return cam;
+}
+
+cJSON *
+conv_lift_camera_block(
+    const cJSON *facts, const uint8_t *blob, size_t size, uint32_t conv_blob_format, char *err, size_t err_size)
+{
+	if (err != NULL && err_size > 0) {
+		err[0] = 0;
+	}
+	const bool ply = conv_blob_format == XRT_CONV_BLOB_PLY_3DGS;
+	const bool sog = conv_blob_format == XRT_CONV_BLOB_SOG;
+	if (!ply && !sog) {
+		seterr(err, err_size, "no camera block for this blob format");
+		return NULL;
+	}
+	cJSON *sog_cam = NULL;
+	if (sog) {
+		bool authored = false;
+		sog_cam = sog_camera(blob, size, &authored);
+		if (authored) {
+			return sog_cam; // the author's block: verbatim, never rewritten
+		}
+	}
+	cJSON *empty = NULL;
+	if (facts == NULL) {
+		empty = cJSON_CreateObject();
+		facts = empty;
+	}
+	cJSON *b = build_block(facts, false, err, err_size);
+	if (b != NULL && cJSON_GetObjectItemCaseSensitive(b, "focus") == NULL) {
+		cJSON *f = NULL;
+		if (ply) {
+			const cJSON *coords = cJSON_GetObjectItemCaseSensitive(facts, "coords");
+			const bool rub = cJSON_IsString(coords) && strcmp(coords->valuestring, "rub") == 0;
+			const cJSON *in = cJSON_GetObjectItemCaseSensitive(b, "intrinsics");
+			double iv[6] = {0};
+			const char *keys[6] = {"fx", "fy", "cx", "cy", "width", "height"};
+			bool have = cJSON_IsObject(in);
+			for (int i = 0; have && i < 6; i++) {
+				have = num(in, keys[i], &iv[i]);
+			}
+			const float intr[6] = {(float)iv[0], (float)iv[1], (float)iv[2],
+			                       (float)iv[3], (float)iv[4], (float)iv[5]};
+			struct conv_splat_focus sf;
+			if (conv_splat_focus_from_ply(blob, size, rub, have ? intr : NULL, &sf)) {
+				f = cJSON_CreateObject();
+				cJSON_AddItemToObject(f, "point", farray(sf.point, 3));
+				add_pos(f, "subject_m", sf.subject_m);
+				add_pos(f, "near_m", sf.near_m);
+				add_pos(f, "far_m", sf.far_m);
+				cJSON_AddStringToObject(f, "source", "runtime");
+			}
+		} else if (sog_cam != NULL && cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(sog_cam, "focus"))) {
+			f = cJSON_Duplicate(cJSON_GetObjectItemCaseSensitive(sog_cam, "focus"), true);
+		}
+		if (f != NULL) {
+			// Before `dxr`, where conv_camera_block_from_facts puts a focus.
+			cJSON *dxr = cJSON_DetachItemFromObjectCaseSensitive(b, "dxr");
+			cJSON_AddItemToObject(b, "focus", f);
+			if (dxr != NULL) {
+				cJSON_AddItemToObject(b, "dxr", dxr);
+			}
+		}
+	}
+	cJSON_Delete(empty);
+	cJSON_Delete(sog_cam);
+	return b;
 }

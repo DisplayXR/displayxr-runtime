@@ -462,3 +462,26 @@ TEST_CASE("lift ABI v5: candidates and the preference hint", "[lift_abi]")
 	STATIC_REQUIRE(
 	    std::is_same<decltype(&xrEnumerateLiftTaskCandidatesDXR), PFN_xrEnumerateLiftTaskCandidatesDXR>::value);
 }
+
+/*
+ *
+ * Spec 6: the GAUSSIANS camera block + a prompt failure. Pinned at
+ * introduction; frozen once a release ships them.
+ *
+ */
+
+TEST_CASE("lift ABI v6: the blob camera block and the failure result", "[lift_abi]")
+{
+	STATIC_REQUIRE(XR_DXR_lift_SPEC_VERSION >= 6);
+	STATIC_REQUIRE(XR_TYPE_LIFT_BLOB_CAMERA_DXR == (XrStructureType)1004999353);
+	STATIC_REQUIRE(XR_ERROR_LIFT_CONVERSION_FAILED_DXR == (XrResult)-1004999354);
+	STATIC_REQUIRE(XR_ERROR_LIFT_CONVERSION_FAILED_DXR < 0); // error class
+
+	CHECK(sizeof(XrLiftBlobCameraDXR) == 48);
+	PIN_OFF(XrLiftBlobCameraDXR, cameraCapacityInput, 16);
+	PIN_OFF(XrLiftBlobCameraDXR, cameraCountOutput, 20);
+	PIN_OFF(XrLiftBlobCameraDXR, camera, 24);
+	PIN_OFF(XrLiftBlobCameraDXR, factsCapacityInput, 32);
+	PIN_OFF(XrLiftBlobCameraDXR, factsCountOutput, 36);
+	PIN_OFF(XrLiftBlobCameraDXR, facts, 40);
+}

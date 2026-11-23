@@ -561,7 +561,11 @@ ipc_receive_lift_acquire_blob_locked(struct ipc_connection *ipc_c,
                                      uint64_t *out_frame_id,
                                      int64_t *out_source_time,
                                      uint32_t *out_format,
-                                     uint64_t *out_byte_count)
+                                     uint64_t *out_byte_count,
+                                     uint32_t *out_camera_bytes,
+                                     uint32_t *out_facts_bytes,
+                                     bool *out_failed,
+                                     uint32_t *out_failure_reason)
 {
 	(void)ipc_c;
 	*out_ready = false;
@@ -569,6 +573,10 @@ ipc_receive_lift_acquire_blob_locked(struct ipc_connection *ipc_c,
 	*out_source_time = 0;
 	*out_format = 0;
 	*out_byte_count = 0;
+	*out_camera_bytes = 0; // XR_DXR_lift spec 6
+	*out_facts_bytes = 0;
+	*out_failed = false;
+	*out_failure_reason = 0;
 	return XRT_SUCCESS;
 }
 

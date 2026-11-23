@@ -45,6 +45,7 @@ set(tests
     tests_conv_readiness
     tests_conv_registry
     tests_conv_store
+    tests_conv_lift_camera
     tests_conv_lanes
     tests_conv_supervisor
     tests_conv_shm_ring
@@ -2178,6 +2179,10 @@ endforeach()
 # file:// pack, tamper rejection, research-only gating, the store ACL (Windows).
 target_link_libraries(tests_conv_store PRIVATE displayxr::conversion_store)
 set_target_properties(tests_conv_store PROPERTIES CXX_STANDARD 17)
+# XR_DXR_lift spec 6: the GAUSSIANS camera block a lift caller receives and
+# the runtime's focus fallback from the splats (provider-agnostic).
+target_link_libraries(tests_conv_lift_camera PRIVATE displayxr::conversion_store xrt-external-cjson)
+set_target_properties(tests_conv_lift_camera PROPERTIES CXX_STANDARD 17)
 
 # ADR-053 P1a (#2001): the conversion core's runtime half (hosts, lanes,
 # pipeline, policy, jobs) against a scriptable CPU fake provider.

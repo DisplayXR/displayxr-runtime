@@ -408,6 +408,49 @@ ipc_server_conv_lift_acquire_blob(struct ipc_server_conv *sc,
                                   struct xrt_lift_blob_info *out_info,
                                   uint8_t **out_bytes);
 
+/*!
+ * What a GAUSSIANS acquire carries besides the bytes (XR_DXR_lift spec 6).
+ * Both strings are malloc'd (the caller frees them) and NULL when absent.
+ */
+struct ipc_server_conv_blob_extra
+{
+	//! The runtime-built camera block v2 (conv_lift_camera_block) of the
+	//! latched blob, compact JSON; on every ready acquire (size query and
+	//! delivery alike), so the two-call idiom sees the same frame's block.
+	char *camera_json;
+	//! The provider's facts (conv_splat_facts_to_json), intrinsics in the
+	//! CALLER's pixels; same lifetime as camera_json.
+	char *facts_json;
+	//! The newest job FAILED: reported once (frame id / source time in the
+	//! info), then the stream reads NOT READY until a new photo succeeds.
+	bool failed;
+	uint32_t failure_reason; //!< XRT_CONV_FAIL_* / CONV_REASON_* of the failed job
+};
+
+/*!
+ * ipc_server_conv_lift_acquire_blob plus @p extra (spec 6): the camera block,
+ * the facts and a prompt failure report. The plain call is this with the
+ * extras dropped (a failure then reads NOT READY, the spec-5 behaviour).
+ */
+xrt_result_t
+ipc_server_conv_lift_acquire_blob_ex(struct ipc_server_conv *sc,
+                                     uint64_t client_id,
+                                     uint64_t stream_id,
+                                     uint64_t capacity,
+                                     bool *out_ready,
+                                     struct xrt_lift_blob_info *out_info,
+                                     uint8_t **out_bytes,
+                                     struct ipc_server_conv_blob_extra *extra);
+
+/*!
+ * Longest edge of a photo the GAUSSIANS facade hands a provider: a larger CPU
+ * photo is box-downscaled (aspect kept) before it enters the job lane, its
+ * focal length scaled with it, and the reported intrinsics scaled back to the
+ * caller's pixels. Photo models infer far below this; the cap keeps a 50 MP
+ * photo inside a satellite lane's scratch (#2003 G8).
+ */
+#define IPC_SERVER_CONV_PHOTO_MAX_EDGE 3072u
+
 xrt_result_t
 ipc_server_conv_lift_acquire(struct ipc_server_conv *sc,
                              uint64_t client_id,

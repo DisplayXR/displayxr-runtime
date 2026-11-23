@@ -1724,6 +1724,21 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 	return XR_SUCCESS;
 }
 
+/*! XrLiftBlobCameraDXR string (spec 6): count with the NUL; written only when it fits. */
+static void
+lift_fill_json(const char *json, uint32_t capacity, uint32_t *count, char *out)
+{
+	const size_t n = json != NULL ? strlen(json) : 0;
+	if (n == 0 || n >= UINT32_MAX) {
+		*count = 0;
+		return;
+	}
+	*count = (uint32_t)(n + 1);
+	if (out != NULL && capacity >= *count) {
+		memcpy(out, json, n + 1);
+	}
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrAcquireLiftBlobDXR(XrLiftStreamDXR stream, XrLiftBlobDXR *blob)
 {
@@ -1758,10 +1773,34 @@ oxr_xrAcquireLiftBlobDXR(XrLiftStreamDXR stream, XrLiftBlobDXR *blob)
 	if (xr != XR_SUCCESS) {
 		return xr;
 	}
+	// Spec 6: the camera block + facts of this blob, when the caller chained the struct.
+	XrLiftBlobCameraDXR *cam = OXR_GET_OUTPUT_FROM_CHAIN(blob, XR_TYPE_LIFT_BLOB_CAMERA_DXR, XrLiftBlobCameraDXR);
+	if (cam != NULL) {
+		cam->cameraCountOutput = 0;
+		cam->factsCountOutput = 0;
+	}
+	if (info.failed) {
+		free(info.camera_json);
+		free(info.facts_json);
+		blob->frameId = info.frame_id;
+		blob->sourceTime = (XrTime)info.source_time;
+		blob->byteCountOutput = 0;
+		return oxr_error(&log, XR_ERROR_LIFT_CONVERSION_FAILED_DXR,
+		                 "xrAcquireLiftBlobDXR: the conversion of frame %llu failed (reason %u)",
+		                 (unsigned long long)info.frame_id, info.failure_reason);
+	}
 	if (!ready) {
+		free(info.camera_json);
+		free(info.facts_json);
 		blob->byteCountOutput = 0;
 		return XR_LIFT_NOT_READY_DXR;
 	}
+	if (cam != NULL) {
+		lift_fill_json(info.camera_json, cam->cameraCapacityInput, &cam->cameraCountOutput, cam->camera);
+		lift_fill_json(info.facts_json, cam->factsCapacityInput, &cam->factsCountOutput, cam->facts);
+	}
+	free(info.camera_json);
+	free(info.facts_json);
 	if (info.byte_count > UINT32_MAX) {
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE, "xrAcquireLiftBlobDXR: blob exceeds 4 GiB");
 	}
