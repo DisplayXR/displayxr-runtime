@@ -423,7 +423,7 @@ Function DxrCatUpdateTop
 	${EndIf}
 	ClearErrors
 	${If} $R4 == 0
-		StrCpy $DxrCatTop "Items shown with a size come from the DisplayXR Catalog and need an internet connection. None is selected: nothing will be downloaded.$R2"
+		StrCpy $DxrCatTop "Items shown with a size are optional components and need an internet connection. None is selected: nothing will be downloaded.$R2"
 	${Else}
 		IntOp $R3 $R3 + 1023
 		IntOp $R3 $R3 / 1024
@@ -434,7 +434,7 @@ FunctionEnd
 ; Components page, before it is shown: ask once, fill the slots, set the text.
 Function DxrCatComponentsPre
 	${If} $DxrCatState == ""
-		Banner::show /NOUNLOAD "Checking the DisplayXR Catalog for optional components..."
+		Banner::show /NOUNLOAD "Checking for optional components..."
 		Call DxrCatQuery
 		Banner::destroy
 		Call DxrCatPopulate
@@ -442,7 +442,7 @@ Function DxrCatComponentsPre
 		${AndIf} $DxrCatCount > 0
 			Call DxrCatUpdateTop
 		${ElseIf} $DxrCatState == "offline"
-			StrCpy $DxrCatTop "The DisplayXR Catalog could not be reached (no internet connection?). Setup installs the DisplayXR Runtime only. Run Setup again later to add optional components."
+			StrCpy $DxrCatTop "The list of optional components could not be reached (no internet connection?). Setup installs the DisplayXR Runtime only. Run Setup again later to add optional components."
 		${EndIf}
 	${EndIf}
 	StrCpy $DxrCatShown 1
@@ -701,7 +701,7 @@ Function DxrCatInstallChosen
 	${Else}
 		${If} $DxrCatState == "offline"
 		${AndIf} $DxrCatShown == 1
-			StrCpy $DxrCatFinishExtra "$\r$\n$\r$\nOptional components (among them the open 2D-to-3D conversion provider) were not offered, because the DisplayXR Catalog could not be reached. Run Setup again with an internet connection to add them."
+			StrCpy $DxrCatFinishExtra "$\r$\n$\r$\nOptional components (among them the open 2D-to-3D conversion provider) were not offered, because the list of components could not be reached. Run Setup again with an internet connection to add them."
 		${EndIf}
 	${EndIf}
 	dxr_cat_log:

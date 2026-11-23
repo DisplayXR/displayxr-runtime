@@ -216,9 +216,6 @@ FunctionEnd
 !endif
 ; The open provider's registry row (its installer writes Packs there).
 !define DXR_OPEN_CONVERSION_ROW "Software\DisplayXR\ConversionProviders\open-conversion"
-!ifndef DXR_MODELS_LARGE_STILL
-	!define DXR_MODELS_LARGE_STILL "depth-still-large"
-!endif
 
 ;--------------------------------
 ; Interface Settings
@@ -234,8 +231,8 @@ FunctionEnd
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "${SOURCE_DIR}\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
-; ADR-053 P4 (#2108): the conversion-models components (default pack checked,
-; the large still-depth model unchecked). ADR-064 §8: plus the optional
+; ADR-053 P4 (#2108): the conversion-models component (the default pack,
+; checked). ADR-064 §8: plus the optional
 ; components the catalog offers for this machine (Catalog.nsh), with the line
 ; above the list saying that they are downloaded and how much.
 !insertmacro DXR_CATALOG_PAGE_DEFINES
@@ -1754,15 +1751,11 @@ Section "Conversion models (default pack)" SecModels
 	models_done:
 SectionEnd
 
-; The large still-depth model: on demand otherwise (DOWNLOADING on first use).
-Section /o "Large still-depth model (on demand otherwise)" SecModelsLarge
-	Call DxrResolveModelsPack
-	nsExec::ExecToLog '"$INSTDIR\displayxr-cli.exe" conv models fetch "$R2" --model "${DXR_MODELS_LARGE_STILL}" --installer'
-	Pop $R3
-	${If} $R3 != 0
-		DetailPrint "Large still-depth model: not fetched (exit $R3); it downloads on first use."
-	${EndIf}
-SectionEnd
+; There is no "large still-depth model" component any more. It asked
+; `conv models fetch` for a model the default pack does not carry, so it
+; fetched nothing. A model outside the default pack is fetched on first use
+; or with `displayxr-cli conv models fetch`. No switch ever named the
+; component, so there is nothing to keep accepting.
 
 Section "Start Menu Shortcuts" SecShortcuts
 	CreateDirectory "$SMPROGRAMS\DisplayXR"
@@ -2065,7 +2058,6 @@ SectionEnd
 	!insertmacro MUI_DESCRIPTION_TEXT ${SecRuntime} "DisplayXR OpenXR runtime files (required)"
 	!insertmacro MUI_DESCRIPTION_TEXT ${SecShortcuts} "Create Start Menu shortcuts"
 	!insertmacro MUI_DESCRIPTION_TEXT ${SecModels} "Download the default 2D-to-3D conversion models now (about 113 MB). Without it they download on first use."
-	!insertmacro MUI_DESCRIPTION_TEXT ${SecModelsLarge} "Also download the large still-image depth model now (about 0.7 GB). Without it it downloads when first needed."
 	!insertmacro DXR_CATALOG_DESCRIPTIONS
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
