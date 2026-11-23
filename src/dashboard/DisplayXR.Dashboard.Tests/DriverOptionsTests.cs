@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using DisplayXR.Dashboard.Feed;
@@ -408,6 +409,58 @@ public class DriverOptionsTests
         await ctx.RunSecretWriteAsync("sim-display", "LICENCE_KEY", secret);
         Assert.True(ctx.LastActionFailed);
         Assert.Equal(OptionCommands.SecretSetUnsupported, ctx.LastAction);
+    }
+
+    /// <summary>
+    /// A value written through standard input is never echoed back, even for a key the CLI does not think a
+    /// secret (its secret test falls back to a name check): LastAction carries the CLI's reply, so the reply
+    /// must not hold the value.
+    /// </summary>
+    [Fact]
+    public async Task Context_StdinValueOfANonSecretKey_IsNotEchoed()
+    {
+        const string value = "1920x1080-stdin-only";
+        var fx = new FixtureProcessSource(TestData.Path("components.ndjson"), new FakeSource());
+        var ctx = new DashboardContext(new StatusFeed(new FakeSource(), new ManualScheduler()), new CliProcessSource("no-such-cli"), fx);
+        await ctx.LoadDriverOptionsAsync("sim-display");
+        await ctx.RunSecretWriteAsync("sim-display", "STEREO_CAMERA_SIZE", value);
+        Assert.False(ctx.LastActionFailed);
+        Assert.DoesNotContain(value, ctx.LastAction ?? "");
+        Assert.Contains("<set>", ctx.LastAction ?? "");
+    }
+
+    /// <summary>
+    /// The real process source writes exactly the value and one "\n" to the child's standard input: UTF-8, no
+    /// byte-order mark, nothing else. The child is a tiny script that copies its stdin, byte for byte, to a file.
+    /// </summary>
+    [Fact]
+    public async Task CliProcessSource_WritesValuePlusNewline_NoBom()
+    {
+        if (!OperatingSystem.IsWindows()) return; // the stand-in CLI is a .cmd script
+        string dir = Path.Combine(Path.GetTempPath(), "dxr-dash-stdin-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string outFile = Path.Combine(dir, "stdin.bin");
+            string script = Path.Combine(dir, "fake-cli.cmd");
+            // [Console]::OpenStandardInput() is the raw byte stream: no decoding, no line handling.
+            File.WriteAllText(script,
+                "@echo off\r\n" +
+                "powershell -NoProfile -NonInteractive -Command \"$i=[Console]::OpenStandardInput(); $o=[IO.File]::Create('"
+                + outFile + "'); $i.CopyTo($o); $o.Close()\"\r\n",
+                new System.Text.UTF8Encoding(false));
+            var src = new CliProcessSource(script);
+            const string value = "héllo-✓";
+            var r = await src.RunWithInputAsync(new CliArgs("dp", "set", "x", "K", "--stdin"), value, TimeSpan.FromSeconds(60));
+            Assert.Equal(0, r.ExitCode);
+            byte[] got = File.ReadAllBytes(outFile);
+            byte[] want = new System.Text.UTF8Encoding(false).GetBytes(value + "\n");
+            Assert.Equal(want, got);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, true); } catch { }
+        }
     }
 
     /// <summary>The fixture source, recording each run's arguments and standard input.</summary>

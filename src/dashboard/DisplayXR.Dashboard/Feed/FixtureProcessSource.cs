@@ -159,7 +159,7 @@ public sealed class FixtureProcessSource : IProcessSource
             string line = (input ?? "").Split('\n')[0].TrimEnd('\r');
             if (line.Length == 0)
                 return Task.FromResult(new CliResult(1, "error: --stdin read an empty value — nothing written (use 'dp unset' to clear it).", "", false, null));
-            return Task.FromResult(Options(new[] { "dp", "set", id, key, line }));
+            return Task.FromResult(Options(new[] { "dp", "set", id, key, line }, fromStdin: true));
         }
         return _real.RunWithInputAsync(args, input ?? "", timeout, cancel);
     }
@@ -201,7 +201,7 @@ public sealed class FixtureProcessSource : IProcessSource
         return o;
     }
 
-    private CliResult Options(string[] a)
+    private CliResult Options(string[] a, bool fromStdin = false)
     {
         lock (_gate)
         {
@@ -220,8 +220,10 @@ public sealed class FixtureProcessSource : IProcessSource
                 row["source"] = "user";
                 row["value"] = secret ? null : a[4];
                 if (secret) row["set"] = true;
+                // As the CLI: a secret, or any value that came through --stdin, is never echoed.
                 return new CliResult(0, secret ? $"{id}: {key} = <set> per user (fixture). The value is a secret: it is never shown again."
-                                               : $"{id}: {key} = '{a[4]}' per user (fixture).", "", false, null);
+                                       : fromStdin ? $"{id}: {key} = <set> per user (fixture). Read from standard input: not echoed."
+                                       : $"{id}: {key} = '{a[4]}' per user (fixture).", "", false, null);
             }
             row["source"] = "absent";
             row["value"] = null;

@@ -10,7 +10,9 @@
  *  - `--stdin` reads ONE line: the trailing newline (and a CR before it) is
  *    dropped, nothing after the first line is taken, an empty line is
  *    refused, a line that does not fit the store is refused and the buffer
- *    wiped; every byte past the value is zero.
+ *    wiped; every byte past the value is zero;
+ *  - a leading UTF-8 BOM is dropped (a lone BOM is empty), a UTF-16 BOM refused;
+ *  - a `--stdin` value is never echoed in the confirmation, secret or not.
  */
 
 #include "catch_amalgamated.hpp"
@@ -173,6 +175,130 @@ TEST_CASE("set --stdin: a secret-sized value fits the secret store", "[cli][set]
 		stream s(jwt + "y\n");
 		CHECK(cli_read_value_line(s.f, buf.data(), buf.size()) == CLI_VALUE_READ_TOO_LONG);
 		CHECK(buf[0] == '\0');
+	}
+}
+
+TEST_CASE("set --stdin: byte-order marks", "[cli][set][stdin][bom]")
+{
+	const std::string bom = "\xEF\xBB\xBF";
+	char buf[16];
+	SECTION("UTF-8 BOM + value: the BOM is dropped")
+	{
+		stream s(bom + "abc\n");
+		CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_OK);
+		CHECK(std::string(buf) == "abc");
+		CHECK(zero_past(buf, 3, sizeof(buf)));
+	}
+	SECTION("UTF-8 BOM + value + CRLF")
+	{
+		stream s(bom + "abc\r\nrest\n");
+		CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_OK);
+		CHECK(std::string(buf) == "abc");
+	}
+	SECTION("CRLF without a BOM")
+	{
+		stream s("abc\r\n");
+		CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_OK);
+		CHECK(std::string(buf) == "abc");
+	}
+	SECTION("empty input and a bare newline are empty")
+	{
+		{
+			stream s("");
+			CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_EMPTY);
+		}
+		{
+			stream s("\r\n");
+			CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_EMPTY);
+		}
+	}
+	SECTION("only a BOM is empty (refused), with or without a newline")
+	{
+		{
+			stream s(bom);
+			CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_EMPTY);
+		}
+		{
+			stream s(bom + "\r\n");
+			CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_EMPTY);
+		}
+		CHECK(buf[0] == '\0');
+	}
+	SECTION("the BOM does not count against the size")
+	{
+		std::string v(sizeof(buf) - 1, 'x');
+		stream s(bom + v + "\n");
+		CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_OK);
+		CHECK(std::string(buf) == v);
+	}
+	SECTION("BOM + an over-long value is refused and wiped")
+	{
+		stream s(bom + std::string(sizeof(buf), 'x') + "\n");
+		CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_TOO_LONG);
+		CHECK(zero_past(buf, 0, sizeof(buf)));
+	}
+	SECTION("a partial BOM is value bytes, kept as they came")
+	{
+		stream s("\xEF\xBB"
+		         "z\n");
+		CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_OK);
+		CHECK(std::string(buf) == "\xEF\xBBz");
+	}
+	SECTION("a BOM only counts at the start")
+	{
+		stream s("a" + bom + "\n");
+		CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_OK);
+		CHECK(std::string(buf) == "a" + bom);
+	}
+	SECTION("UTF-16 LE and BE BOMs are refused, the buffer wiped")
+	{
+		{
+			stream s(std::string("\xFF\xFE"
+			                     "a\0b\0\r\0\n\0",
+			                     10));
+			CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_UTF16);
+			CHECK(zero_past(buf, 0, sizeof(buf)));
+		}
+		{
+			stream s(std::string("\xFE\xFF\0a\0b\0\n", 8));
+			CHECK(cli_read_value_line(s.f, buf, sizeof(buf)) == CLI_VALUE_READ_UTF16);
+			CHECK(zero_past(buf, 0, sizeof(buf)));
+		}
+	}
+}
+
+TEST_CASE("set: a --stdin value is never echoed back", "[cli][set][stdin][echo]")
+{
+	CHECK(cli_set_may_echo_value(false, false));
+	CHECK_FALSE(cli_set_may_echo_value(true, false));
+	CHECK_FALSE(cli_set_may_echo_value(false, true)); // even when the secret test said "not a secret"
+	CHECK_FALSE(cli_set_may_echo_value(true, true));
+
+	const char *value = "hunter2-value";
+	char out[512];
+	SECTION("a plain argument value is confirmed with its value")
+	{
+		cli_format_set_confirmation(out, sizeof(out), "sim", "MODE", value, "for this user", "store", false,
+		                            false);
+		CHECK(std::string(out) == "sim: MODE = 'hunter2-value' for this user (store).\n");
+	}
+	SECTION("a --stdin value that is not a secret: key + store, the placeholder, never the value")
+	{
+		cli_format_set_confirmation(out, sizeof(out), "sim", "TOKEN", value, "for this user", "store", false,
+		                            true);
+		const std::string s(out);
+		CHECK(s.find(value) == std::string::npos);
+		CHECK(s.find("TOKEN = " CLI_HIDDEN_VALUE) != std::string::npos);
+		CHECK(s.find("(store)") != std::string::npos);
+	}
+	SECTION("a secret, from either source: the placeholder")
+	{
+		for (bool from_stdin : {false, true}) {
+			cli_format_set_confirmation(out, sizeof(out), "sim", "KEY", value, "for this user", "store", true,
+			                            from_stdin);
+			CHECK(std::string(out).find(value) == std::string::npos);
+			CHECK(std::string(out).find(CLI_HIDDEN_VALUE) != std::string::npos);
+		}
 	}
 }
 
