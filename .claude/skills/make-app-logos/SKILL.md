@@ -74,7 +74,12 @@ app. The manifest stem is the exe stem (`<exe-stem>.displayxr.json`).
    rm -f "$TEMP/displayxr_atlas.projection.png" "$TEMP/displayxr_atlas_trigger.projection"
    ```
    (PowerShell: `$env:TEMP`.) The app must run in a **3D mode** (tiles cols/rows > 1) for a
-   meaningful atlas — native cube apps default to one; for a mono app the 3D logo degenerates.
+   meaningful atlas — for a mono app the 3D logo degenerates. Native cube apps start in
+   whatever mode the display driver starts in, and **sim_display starts in 2D** since ADR-065
+   (a capture then is a 1x1 atlas). On a sim_display box launch the app with
+   `DXR_DP_SIM_DISPLAY_START_3D=1` in its environment (in-process apps; the generated
+   `_package\run_*.bat` scripts already set it), or press **V** (or **1**) in the app before
+   triggering, and confirm the `tiles=CxR` line shows more than one tile.
 
    **The target app must be the ONLY DisplayXR app rendering.** The projection trigger is
    **process-global**: every running native compositor polls the same `%TEMP%` trigger file, and
