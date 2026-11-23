@@ -24,14 +24,45 @@ public enum SettingType { Bool, Int, Float, Enum, String, Secret }
 /// <summary>Where the effective value came from (<c>dp options --json</c> <c>source</c>).</summary>
 public enum SettingSource { Absent, Environment, User, Machine, Manifest }
 
+/// <summary>Whether the value in force takes effect on this machine (<c>dp options --json</c> <c>status.state</c>).</summary>
+public enum SettingState { Unknown, Applies, NotSupported, RestartRequired }
+
+/// <summary>
+/// What the driver says about a setting on this machine (<c>status</c>, reported through its
+/// <c>get_setting_status</c> slot). <see cref="EffectiveValue"/>: with <see cref="SettingState.NotSupported"/>,
+/// the value the driver uses instead (a value of the setting); <see cref="Note"/>: the driver's one sentence.
+/// </summary>
+public sealed record SettingStatus(SettingState State, string? EffectiveValue = null, string? Note = null)
+{
+    public static readonly SettingStatus Unknown = new(SettingState.Unknown);
+
+    /// <summary>The <c>status</c> object of a row; <see cref="Unknown"/> when absent (an older CLI) or not that shape.</summary>
+    public static SettingStatus From(JsonElement row)
+    {
+        if (row.ValueKind != JsonValueKind.Object || !row.TryGetProperty("status", out var st) || st.ValueKind != JsonValueKind.Object)
+            return Unknown;
+        var state = st.Str("state") switch
+        {
+            "applies" => SettingState.Applies,
+            "not_supported" => SettingState.NotSupported,
+            "restart_required" => SettingState.RestartRequired,
+            _ => SettingState.Unknown,
+        };
+        if (state == SettingState.Unknown) return Unknown;
+        string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+        return new SettingStatus(state, state == SettingState.NotSupported ? Clean(st.StrOrNull("effective_value")) : null,
+                                 Clean(st.StrOrNull("note")));
+    }
+}
+
 /// <summary>
 /// One declared setting. <see cref="Value"/> is null when nothing stores it (the default stands) and
 /// always for a secret, whose <see cref="IsSet"/> says whether one is stored. <see cref="Values"/>: an enum's
 /// accepted words as the CLI lists them (<c>values</c>, interim: read from the help), null when it lists none
-/// or predates the key.
+/// or predates the key. <see cref="Status"/>: whether the value in force takes effect here (null = not reported).
 /// </summary>
 public sealed record DriverSetting(string Key, SettingType Type, string Default, string Help, string? Value, bool IsSet,
-                                   SettingSource Source, IReadOnlyList<string>? Values = null)
+                                   SettingSource Source, IReadOnlyList<string>? Values = null, SettingStatus? Status = null)
 {
     /// <summary>The value in force: the stored one, else the declared default.</summary>
     public string Effective => Value ?? Default;
@@ -81,7 +112,9 @@ public sealed record DriverOptions(string Id, string EnvPrefix, IReadOnlyList<Dr
                                   .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
                     if (words.Length > 0) values = words;
                 }
-                list.Add(new DriverSetting(key, t, e.Str("default"), e.Str("help"), value, isSet, source, values));
+                var status = SettingStatus.From(e);
+                list.Add(new DriverSetting(key, t, e.Str("default"), e.Str("help"), value, isSet, source, values,
+                                           status.State == SettingState.Unknown ? null : status));
             }
             options = new DriverOptions(root.Str("id"), root.Str("env_prefix"), list);
             return true;
@@ -235,10 +268,17 @@ public static class FriendlyOptions
 public sealed record OptionView(DriverSetting Setting, string Label, OptionControl Control, string Help, bool Friendly,
                                 IReadOnlyList<OptionChoice> Choices, string? Selected, bool On, string? State,
                                 string ValueText, string SourceText, bool ReadOnly, bool CanReset, string? Note,
-                                string Tooltip, FriendlyOption? Entry, bool NoKind = false)
+                                string Tooltip, FriendlyOption? Entry, bool NoKind = false, OptionStatusView? Status = null)
 {
     public string Key => Setting.Key;
 }
+
+/// <summary>
+/// What the row says when the driver reports that the value in force does not simply apply here.
+/// <paramref name="Chip"/>: the warning chip next to the control; <paramref name="Note"/>: the driver's sentence;
+/// <paramref name="Using"/>: the value used instead, in the row's words ("Using: …"), or null when the driver names none.
+/// </summary>
+public sealed record OptionStatusView(SettingState State, string Chip, string? Note, string? Using);
 
 /// <summary>The two parts of a driver's Options block.</summary>
 public sealed record OptionsBlock(string DriverId, IReadOnlyList<OptionView> Friendly, IReadOnlyList<OptionView> More)
@@ -248,9 +288,33 @@ public sealed record OptionsBlock(string DriverId, IReadOnlyList<OptionView> Fri
 
 public static class OptionViews
 {
-    /// <summary>The sentence under the block.</summary>
+    /// <summary>
+    /// The sentence under the block. Apps that go through DisplayXR in the background (the browser, shell
+    /// apps, an app forced through the service) are hosted by the DisplayXR service, which read the settings
+    /// when it started: they see a change only once DisplayXR itself restarts.
+    /// </summary>
     public const string AppliesNote =
-        "Changes apply the next time a 3D app starts. Apps that are already running, and DisplayXR in the background, keep what they started with.";
+        "Changes apply the next time a 3D app starts; apps already running keep what they started with. " +
+        "Apps that run through DisplayXR in the background (the browser, shell apps) pick up a change only after DisplayXR restarts.";
+
+    /// <summary>The chip of a setting whose value cannot take effect on this machine.</summary>
+    public const string NotSupportedChip = "Not supported here";
+
+    /// <summary>The chip of a setting that takes effect after a restart.</summary>
+    public const string RestartChip = "Takes effect after a restart";
+
+    /// <summary>The sentence when the driver says the value is not supported here but gives no reason.</summary>
+    public const string NotSupportedFallbackNote =
+        "This display driver can't use this value on this PC. Your choice is kept and applies where it is supported.";
+
+    /// <summary>"Now: …" normally; "Chosen: …" while the chosen value cannot take effect here (it is not what is in force).</summary>
+    public static string NowLine(OptionView v)
+    {
+        string head = v.Control == OptionControl.Text && v.ValueText == "Not set"
+            ? "Not set"
+            : $"{(v.Status?.State == SettingState.NotSupported ? "Chosen" : "Now")}: {v.ValueText}";
+        return $"{head}{StatusText.Sep}{v.SourceText}";
+    }
 
     public const string EnvironmentNote = "Set outside the Dashboard, and that value wins: a change here would not apply.";
 
@@ -300,6 +364,42 @@ public static class OptionViews
     }
 
     public static OptionView View(DriverSetting s, FriendlyOption? f, string envPrefix = "")
+    {
+        var v = ViewOf(s, f, envPrefix);
+        return s.Status is { } st && StatusOf(v, st) is { } sv ? v with { Status = sv } : v;
+    }
+
+    /// <summary>
+    /// The row's status line from the driver's report: nothing for applies / unknown; for not supported, the
+    /// chip, the driver's note (or a plain fallback) and the value used instead named with the row's own labels.
+    /// </summary>
+    public static OptionStatusView? StatusOf(OptionView v, SettingStatus st)
+    {
+        switch (st.State)
+        {
+            case SettingState.NotSupported:
+                return new OptionStatusView(st.State, NotSupportedChip, st.Note ?? NotSupportedFallbackNote,
+                                            st.EffectiveValue is { } ev ? ValueWords(v, ev) : null);
+            case SettingState.RestartRequired:
+                return new OptionStatusView(st.State, RestartChip, st.Note, null);
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>A value of the setting in the words the row gives it: its choice label (aliases counted), On / Off, else quoted.</summary>
+    public static string ValueWords(OptionView v, string value)
+    {
+        string w = value.Trim();
+        if (v.Entry?.Aliases is { } al && al.TryGetValue(w, out var a)) w = a;
+        var label = v.Choices.FirstOrDefault(c => string.Equals(c.Value, w, StringComparison.OrdinalIgnoreCase))?.Label
+                    ?? v.Entry?.Choices.FirstOrDefault(c => string.Equals(c.Value, w, StringComparison.OrdinalIgnoreCase))?.Label;
+        if (label is not null) return label;
+        if (v.Control is OptionControl.Switch) return IsTrue(w) ? "On" : "Off";
+        return Quoted(w);
+    }
+
+    private static OptionView ViewOf(DriverSetting s, FriendlyOption? f, string envPrefix)
     {
         bool readOnly = s.Source == SettingSource.Environment;
         bool canReset = !readOnly && s.Source == SettingSource.User;

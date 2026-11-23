@@ -346,7 +346,9 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	CHECK(offsetof(xrt_plugin_iface, get_license_state) ==
 	      offsetof(xrt_plugin_iface, get_viewer_policy) + sizeof(void *));
 	CHECK(offsetof(xrt_plugin_iface, activate) == offsetof(xrt_plugin_iface, get_license_state) + sizeof(void *));
-	CHECK(offsetof(xrt_plugin_iface, activate) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	// ADR-054 Amendment 3 appended get_setting_status after activate (the new last slot).
+	CHECK(offsetof(xrt_plugin_iface, get_setting_status) == offsetof(xrt_plugin_iface, activate) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, get_setting_status) + sizeof(void *) == sizeof(xrt_plugin_iface));
 	{
 		// An older plug-in (struct_size ends before the slot) declares nothing.
 		xrt_plugin_iface older{};

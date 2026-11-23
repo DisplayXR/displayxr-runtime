@@ -159,6 +159,22 @@ bool
 target_plugin_license_state(const char *id, struct xrt_component_license_state *out);
 
 /*!
+ * Whether the value in force of each of @p keys (@p count of them) takes
+ * effect on this machine, as the registered plug-in @p id reports through
+ * its `get_setting_status` slot: negotiate only (no probe, no instance), ask
+ * once per key, unload — one load for the whole list. @p out[i] is always a
+ * valid, sanitised struct (UNKNOWN when the plug-in reports nothing for that
+ * key or has no slot). Returns false when @p id is not registered or its
+ * binary did not load / negotiate. A lister's call, like
+ * @ref target_plugin_license_state; the plug-in may spend a bounded probe.
+ */
+bool
+target_plugin_setting_status(const char *id,
+                             const char *const *keys,
+                             int count,
+                             struct xrt_component_setting_status *out);
+
+/*!
  * Hand @p token to the registered plug-in @p id's `activate` slot (negotiate
  * only) and return what it said: the new state in @p out_state (may be NULL)
  * or its error line in @p err. The token is opaque and never logged.

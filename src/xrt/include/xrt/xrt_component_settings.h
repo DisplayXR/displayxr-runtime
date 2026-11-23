@@ -36,6 +36,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -123,6 +124,161 @@ typedef bool (*xrt_component_get_setting_fn_t)(const char *id, const char *key, 
  * "nothing declared". Callable at any time after negotiate, from any thread.
  */
 typedef uint32_t (*xrt_component_describe_settings_fn_t)(const struct xrt_component_setting_desc **out_descs);
+
+/*
+ *
+ * Setting status: does the stored value take effect HERE?
+ *
+ */
+
+/*!
+ * @name States a component may report for one of its settings
+ * (`xrt_component_setting_status::state`).
+ * @{
+ */
+//! Not reported: the component has no slot, does not know the key, or declined. Diagnostics show nothing.
+#define XRT_COMPONENT_SETTING_STATE_UNKNOWN 0u
+//! The value in force (stored, or the default) takes effect on this machine.
+#define XRT_COMPONENT_SETTING_STATE_APPLIES 1u
+/*!
+ * The value in force CANNOT take effect on this machine (a capability the
+ * hardware, driver or vendor platform installed here lacks). The component
+ * uses @ref xrt_component_setting_status::effective_value instead, and says
+ * why in @ref xrt_component_setting_status::note. The stored value is kept:
+ * it takes effect on a machine that supports it.
+ */
+#define XRT_COMPONENT_SETTING_STATE_NOT_SUPPORTED 2u
+/*!
+ * The value in force differs from what the running process(es) read at
+ * init; it takes effect once they restart. Optional: a component that cannot
+ * tell reports APPLIES (or nothing).
+ */
+#define XRT_COMPONENT_SETTING_STATE_RESTART_REQUIRED 3u
+/*! @} */
+
+//! Size of @ref xrt_component_setting_status::effective_value, NUL included.
+#define XRT_COMPONENT_SETTING_STATUS_VALUE_MAX 64
+//! Size of @ref xrt_component_setting_status::note, NUL included.
+#define XRT_COMPONENT_SETTING_STATUS_NOTE_MAX 160
+
+/*!
+ * What a component says about one of its settings on this machine, for the
+ * diagnostics (`displayxr-cli <class> options`, the Dashboard). The runtime
+ * zero-fills it and sets @ref struct_size to its own `sizeof` before the
+ * call; the component MUST NOT write past `struct_size`. Grows append-only
+ * (by consuming @ref reserved or appending after it, gated by `struct_size`)
+ * with no ABI bump. 264 bytes in this version (offsets 0, 4, 8, 72, 232).
+ */
+struct xrt_component_setting_status
+{
+	//! `sizeof(struct xrt_component_setting_status)` as the RUNTIME knows it.
+	uint32_t struct_size;
+
+	//! One of the XRT_COMPONENT_SETTING_STATE_* values; an unknown value reads as UNKNOWN.
+	uint32_t state;
+
+	/*!
+	 * NOT_SUPPORTED: the value the component uses instead, as a value of
+	 * the setting (a word the store would accept, e.g. "off"), so a UI can
+	 * name it with the same label it gives that value. UTF-8,
+	 * NUL-terminated, truncated to fit; "" = not said. Ignored otherwise.
+	 */
+	char effective_value[XRT_COMPONENT_SETTING_STATUS_VALUE_MAX];
+
+	/*!
+	 * One short sentence for a human, written by the component and shown
+	 * verbatim (never parsed): why the value cannot take effect, or what to
+	 * restart. UTF-8, NUL-terminated, truncated to fit; "" = none.
+	 */
+	char note[XRT_COMPONENT_SETTING_STATUS_NOTE_MAX];
+
+	//! Reserved for future fields. Components MUST leave these 0.
+	uint64_t reserved[4];
+};
+
+/*!
+ * The optional vtable slot through which a component reports, per setting,
+ * whether the value in force takes effect on this machine
+ * (@ref xrt_component_setting_status). Fill @p out for setting @p key (a key
+ * the component declares; compare without regard to case) and return true;
+ * return false — writing nothing — for a key it does not report on, which
+ * the runtime shows as UNKNOWN.
+ *
+ * Contract:
+ *   - Called by diagnostics (`displayxr-cli <class> options`, which the
+ *     Dashboard runs), on a negotiated-only component: before, and without,
+ *     any `probe()` / instance / device creation. Answer from what the
+ *     component can learn on its own.
+ *   - May run a bounded capability probe (load the vendor runtime, ask a
+ *     version): at most ~500 ms for the FIRST key of a process, and cache
+ *     the answer so later keys are immediate. Never open a device, take a
+ *     camera, change display state or show UI.
+ *   - Thread-safe; callable from any thread; @p out is never NULL.
+ *   - The value it reports on is the one the component would read through
+ *     the host's `get_setting` (the runtime calls this in the same process
+ *     whose store / environment that read resolves).
+ */
+typedef bool (*xrt_component_get_setting_status_fn_t)(const char *key, struct xrt_component_setting_status *out);
+
+/*!
+ * Defined when this header carries @ref xrt_component_setting_status and
+ * @ref xrt_component_get_setting_status_fn_t, so a component built against
+ * an older runtime header can #ifdef-guard reporting setting status.
+ */
+#define XRT_COMPONENT_SETTINGS_HAS_SETTING_STATUS 1
+
+/*!
+ * The state word diagnostics use: "applies" | "not_supported" |
+ * "restart_required" | "unknown" (anything else).
+ */
+static inline const char *
+xrt_component_setting_state_str(uint32_t state)
+{
+	switch (state) {
+	case XRT_COMPONENT_SETTING_STATE_APPLIES: return "applies";
+	case XRT_COMPONENT_SETTING_STATE_NOT_SUPPORTED: return "not_supported";
+	case XRT_COMPONENT_SETTING_STATE_RESTART_REQUIRED: return "restart_required";
+	default: return "unknown";
+	}
+}
+
+/*!
+ * Ask @p fn (may be NULL) about @p key with the runtime's half of the
+ * contract applied: @p out is zero-filled, `struct_size` set, the strings
+ * NUL-terminated afterwards, and an unknown state — or a false return —
+ * reads as UNKNOWN with empty strings. Returns the state.
+ */
+static inline uint32_t
+xrt_component_setting_status_query(xrt_component_get_setting_status_fn_t fn,
+                                   const char *key,
+                                   struct xrt_component_setting_status *out)
+{
+	if (out == NULL) {
+		return XRT_COMPONENT_SETTING_STATE_UNKNOWN;
+	}
+	memset(out, 0, sizeof(*out));
+	out->struct_size = (uint32_t)sizeof(*out);
+	if (fn == NULL || key == NULL || key[0] == '\0' || !fn(key, out)) {
+		memset(out, 0, sizeof(*out));
+		out->struct_size = (uint32_t)sizeof(*out);
+		return XRT_COMPONENT_SETTING_STATE_UNKNOWN;
+	}
+	out->struct_size = (uint32_t)sizeof(*out);
+	out->effective_value[sizeof(out->effective_value) - 1] = '\0';
+	out->note[sizeof(out->note) - 1] = '\0';
+	memset(out->reserved, 0, sizeof(out->reserved));
+	if (out->state != XRT_COMPONENT_SETTING_STATE_APPLIES &&
+	    out->state != XRT_COMPONENT_SETTING_STATE_NOT_SUPPORTED &&
+	    out->state != XRT_COMPONENT_SETTING_STATE_RESTART_REQUIRED) {
+		memset(out, 0, sizeof(*out));
+		out->struct_size = (uint32_t)sizeof(*out);
+		return XRT_COMPONENT_SETTING_STATE_UNKNOWN;
+	}
+	if (out->state != XRT_COMPONENT_SETTING_STATE_NOT_SUPPORTED) {
+		out->effective_value[0] = '\0';
+	}
+	return out->state;
+}
 
 #ifdef __cplusplus
 }

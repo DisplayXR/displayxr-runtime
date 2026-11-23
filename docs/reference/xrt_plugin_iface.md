@@ -640,6 +640,38 @@ A licence **key** can also be an ordinary setting of type `secret` (`XRT_COMPONE
 
 **Both slots are optional.** NULL (or a plug-in built before them) has no licence to report: its state reads `not_applicable` and nothing changes. Appended per ADR-020 after `get_viewer_policy` (gated by `struct_size`, no API bump): `#ifdef XRT_PLUGIN_IFACE_HAS_GET_LICENSE_STATE` / `XRT_PLUGIN_IFACE_HAS_ACTIVATE`; the runtime reads through `xrt_plugin_iface_license_state()`. A reference implementation of both slots is `drivers/sim_common/sim_license.h`, used by the sim conversion and tracking providers.
 
+### `get_setting_status` (does a stored setting take effect here, ADR-054 Amendment 3)
+
+```c
+bool (*get_setting_status)(const char *key, struct xrt_component_setting_status *out);
+```
+
+Say, per setting you declare, whether the value in force can take effect **on this machine**.
+`displayxr-cli dp options <id>` (and so the Dashboard) asks once per declared key; without it a
+setting your platform cannot honour is shown as if it applied. `out` is zero-filled with
+`struct_size` preset (264 bytes today; write within it):
+
+| Field | What to write |
+|---|---|
+| `state` | `XRT_COMPONENT_SETTING_STATE_APPLIES` (1), `_NOT_SUPPORTED` (2) or `_RESTART_REQUIRED` (3); `_UNKNOWN` (0) = say nothing |
+| `effective_value[64]` | with `NOT_SUPPORTED`: the value you use instead, as a value of the setting (`"system"`), so a UI can label it like any other value |
+| `note[160]` | one short sentence for a human: why it cannot apply, or what to restart |
+
+Return false (writing nothing) for a key you do not report on. Match the key without regard to
+case. Resolve the value you report on through `get_setting`, exactly as you would at init.
+
+Contract: called on a **negotiated-only** plug-in (no `probe()`, no instance, no device), from any
+thread. A bounded capability probe is allowed — at most ~500 ms for the first key in a process,
+then cached — but never open a device, take a camera, change display state or show UI.
+
+The stored value is never rewritten: the Dashboard keeps the control editable and shows a
+"Not supported here" chip, your note and "Using: <label of effective_value>".
+
+**NULL is allowed** (every key reads `unknown`, as before). Appended per ADR-020 after `activate`
+(`offsetof == 296`, `sizeof(struct xrt_plugin_iface) == 304` on 64-bit; gated by `struct_size`,
+no API bump): `#ifdef XRT_PLUGIN_IFACE_HAS_SETTING_STATUS`; the runtime reads through
+`xrt_plugin_iface_setting_status()`. Spec: plugin-discovery.md §2.3 *Setting status*.
+
 ### `get_platform_state` and the platform remedy (ADR-045, Amendment 1)
 
 ```c

@@ -14,6 +14,7 @@
 #include "target_component_loader.h"
 
 #include "xrt/xrt_component_license.h"
+#include "xrt/xrt_component_settings.h"
 #include "util/u_status_snapshot.h" // u_status_license_add_cjson
 #include "xrt/xrt_config_os.h"
 
@@ -150,6 +151,8 @@ struct option_row
 	uint32_t source;
 	bool declared;
 	bool secret; //!< ADR-054 N5: shown as set / not set, never as a value
+	//! Does the value in force take effect here (UNKNOWN = not reported).
+	struct xrt_component_setting_status status;
 };
 
 //! Redact a row whose key is a secret: keep where it came from, drop what it is.
@@ -231,6 +234,85 @@ collect(const struct cli_component_class *k, const char *id, struct option_row *
 	return n;
 }
 
+//! Ask the component, in one load, whether each declared key's value in force takes effect here.
+static void
+query_status(const struct cli_component_class *k, const char *id, struct option_row *rows, int n)
+{
+	for (int i = 0; i < n; i++) {
+		(void)xrt_component_setting_status_query(NULL, NULL, &rows[i].status); // UNKNOWN
+	}
+	if (k->setting_status == NULL || n <= 0) {
+		return;
+	}
+	const char **keys = calloc((size_t)n, sizeof(*keys));
+	struct xrt_component_setting_status *st = calloc((size_t)n, sizeof(*st));
+	int *row_of = calloc((size_t)n, sizeof(*row_of));
+	int m = 0;
+	if (keys != NULL && st != NULL && row_of != NULL) {
+		for (int i = 0; i < n; i++) {
+			if (rows[i].declared) { // only what the component declares is its to report on
+				keys[m] = rows[i].desc.key;
+				row_of[m++] = i;
+			}
+		}
+		if (m > 0 && k->setting_status(id, keys, m, st)) {
+			for (int j = 0; j < m; j++) {
+				rows[row_of[j]].status = st[j];
+			}
+		}
+	}
+	free(keys);
+	free(st);
+	free(row_of);
+}
+
+//! The `status` object of an `options --json` row: always present, `unknown` when not reported.
+static void
+status_json(cJSON *o, const struct xrt_component_setting_status *st)
+{
+	cJSON *js = cJSON_AddObjectToObject(o, "status");
+	cJSON_AddStringToObject(js, "state", xrt_component_setting_state_str(st->state));
+	if (st->state == XRT_COMPONENT_SETTING_STATE_NOT_SUPPORTED && st->effective_value[0] != '\0') {
+		cJSON_AddStringToObject(js, "effective_value", st->effective_value);
+	} else {
+		cJSON_AddNullToObject(js, "effective_value");
+	}
+	if (st->note[0] != '\0') {
+		cJSON_AddStringToObject(js, "note", st->note);
+	} else {
+		cJSON_AddNullToObject(js, "note");
+	}
+}
+
+//! The human status line under the table for one reported setting; nothing for UNKNOWN / APPLIES without a note.
+static void
+status_line(const struct option_row *r)
+{
+	const struct xrt_component_setting_status *st = &r->status;
+	switch (st->state) {
+	case XRT_COMPONENT_SETTING_STATE_NOT_SUPPORTED:
+		P("\t%-24s status: NOT SUPPORTED here", r->desc.key);
+		if (st->note[0] != '\0') {
+			P(" — %s", st->note);
+		}
+		if (st->effective_value[0] != '\0') {
+			P(" (using '%s')", st->effective_value);
+		}
+		P("\n");
+		break;
+	case XRT_COMPONENT_SETTING_STATE_RESTART_REQUIRED:
+		P("\t%-24s status: takes effect after a restart%s%s\n", r->desc.key, st->note[0] != '\0' ? " — " : "",
+		  st->note);
+		break;
+	case XRT_COMPONENT_SETTING_STATE_APPLIES:
+		if (st->note[0] != '\0') {
+			P("\t%-24s status: applies — %s\n", r->desc.key, st->note);
+		}
+		break;
+	default: break;
+	}
+}
+
 int
 cli_component_options(const struct cli_component_class *k, const char *id, bool json)
 {
@@ -243,6 +325,7 @@ cli_component_options(const struct cli_component_class *k, const char *id, bool 
 		return 1;
 	}
 	const int n = collect(k, id, rows, CLI_OPTIONS_MAX);
+	query_status(k, id, rows, n);
 
 	char env_prefix[TARGET_COMPONENT_SETTING_ENV_MAX] = {0};
 	if (target_component_setting_env_name(k->cls->env_class, id, "KEY", env_prefix, sizeof(env_prefix))) {
@@ -301,6 +384,7 @@ cli_component_options(const struct cli_component_class *k, const char *id, bool 
 				cJSON_AddStringToObject(o, "value", r->value);
 			}
 			cJSON_AddStringToObject(o, "source", target_component_setting_source_str(r->source));
+			status_json(o, &r->status);
 			cJSON_AddItemToArray(arr, o);
 		}
 		char *out = cJSON_Print(root);
@@ -325,6 +409,9 @@ cli_component_options(const struct cli_component_class *k, const char *id, bool 
 			  r->source == TARGET_COMPONENT_SETTING_ABSENT ? "<unset>" : (r->secret ? "<set>" : r->value),
 			  target_component_setting_source_str(r->source),
 			  r->declared ? r->desc.help : "(stored, not declared by the component)");
+		}
+		for (int i = 0; i < n; i++) {
+			status_line(&rows[i]);
 		}
 	}
 	P("\tenvironment: %s<KEY> in the hosting process always wins\n",

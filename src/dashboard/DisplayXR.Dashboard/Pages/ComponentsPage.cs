@@ -907,6 +907,15 @@ public sealed class ComponentsPage : Page
             }
         }
 
+        // The driver says the value in force does not simply apply on this PC: a chip beside the control,
+        // which stays editable (the stored choice applies where it is supported).
+        if (v.Status is { } stv)
+        {
+            var chip = U.Chip(stv.Chip, stv.State == SettingState.NotSupported ? Level.Warn : Level.Info);
+            if (stv.Note is { } tipNote) ToolTip.SetTip(chip, tipNote);
+            U.AddFlow(line, chip, 10, 6);
+        }
+
         if (v.CanReset)
         {
             var reset = U.Button(v.Control == OptionControl.Secret ? "Clear" : "Use the default", () => Write(OptionCommands.Unset(id, v.Key)), "quiet", "sm");
@@ -917,8 +926,13 @@ public sealed class ComponentsPage : Page
         }
 
         var col = U.VStack(4, line);
-        var now = U.Wrapped(v.Control == OptionControl.Text && v.ValueText == "Not set" ? $"Not set{StatusText.Sep}{v.SourceText}" : $"Now: {v.ValueText}{StatusText.Sep}{v.SourceText}", "soft");
+        var now = U.Wrapped(OptionViews.NowLine(v), "soft");
         col.Children.Add(now);
+        if (v.Status is { } sv)
+        {
+            if (sv.Using is { } usingText) col.Children.Add(U.Wrapped($"Using: {usingText}", "soft"));
+            if (sv.Note is { } statusNote) col.Children.Add(U.Wrapped(statusNote, "meta"));
+        }
         if (v.Note is { } note) col.Children.Add(U.Wrapped(note, "meta"));
         if (v.ReadOnly)
         {

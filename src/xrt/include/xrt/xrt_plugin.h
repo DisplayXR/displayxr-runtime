@@ -1986,6 +1986,25 @@ struct xrt_plugin_iface
 	 * @ref XRT_PLUGIN_IFACE_HAS_ACTIVATE.
 	 */
 	xrt_component_activate_fn_t activate;
+
+	/*!
+	 * Whether the value in force of one of this plug-in's settings takes
+	 * effect on this machine (`xrt/xrt_component_settings.h`,
+	 * @ref xrt_component_setting_status): APPLIES, NOT_SUPPORTED (with the
+	 * value used instead and one sentence why) or RESTART_REQUIRED. Called
+	 * by `displayxr-cli dp options <id>` — and so the Dashboard — once per
+	 * declared key, on a negotiated-only plug-in (no probe, no instance);
+	 * may run a bounded, cached capability probe (≤ ~500 ms per process).
+	 * The full contract is on @ref xrt_component_get_setting_status_fn_t.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * reports nothing: every setting reads `unknown` and diagnostics show
+	 * the stored value alone, as before. Appended per ADR-020 (append-only
+	 * within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) after @ref activate. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_SETTING_STATUS.
+	 */
+	xrt_component_get_setting_status_fn_t get_setting_status;
 };
 
 /*!
@@ -2001,6 +2020,13 @@ struct xrt_plugin_iface
  * #ifdef-guard filling it.
  */
 #define XRT_PLUGIN_IFACE_HAS_ACTIVATE 1
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_setting_status, so a plug-in built against an older
+ * runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_SETTING_STATUS 1
 
 /*!
  * The licence state of @p iface, with the absent-slot rule applied
@@ -2027,6 +2053,24 @@ xrt_plugin_iface_has_activate(const struct xrt_plugin_iface *iface)
 	return iface != NULL &&
 	       iface->struct_size >= offsetof(struct xrt_plugin_iface, activate) + sizeof(iface->activate) &&
 	       iface->activate != NULL;
+}
+
+/*!
+ * The status of setting @p key of @p iface, with the absent-slot rule
+ * applied (UNKNOWN unless the plug-in says otherwise; see
+ * xrt_component_setting_status_query). @p out is always a valid, sanitised
+ * struct. Returns the state.
+ */
+static inline uint32_t
+xrt_plugin_iface_setting_status(const struct xrt_plugin_iface *iface,
+                                const char *key,
+                                struct xrt_component_setting_status *out)
+{
+	const bool has = iface != NULL &&
+	                 iface->struct_size >= offsetof(struct xrt_plugin_iface, get_setting_status) +
+	                                           sizeof(iface->get_setting_status) &&
+	                 iface->get_setting_status != NULL;
+	return xrt_component_setting_status_query(has ? iface->get_setting_status : NULL, key, out);
 }
 
 /*!

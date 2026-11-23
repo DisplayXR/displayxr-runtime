@@ -66,6 +66,7 @@ set(tests
     tests_cli_input_predict
     tests_cli_dp_predict
     tests_cli_option_parse
+    tests_component_setting_status
     tests_get_catalog
     tests_comp_vblank_grid
     tests_comp_present_feedback

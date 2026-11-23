@@ -958,6 +958,7 @@ const struct cli_component_class k_conv_options_class = {
     /* note_pickup */ note_service_pickup,
     /* posix_machine_hint */ "the manifest's \"settings\" object (NNN-<id>-conversion-provider.json)",
     /* activate */ conv_activate,
+    /* setting_status */ nullptr, // the conversion class has no get_setting_status slot yet
 };
 
 int

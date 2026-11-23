@@ -1721,6 +1721,39 @@ target_plugin_license_state(const char *id, struct xrt_component_license_state *
 	return dp_with_negotiated(id, dp_license_cb, out);
 }
 
+struct dp_setting_status_args
+{
+	const char *const *keys;
+	int count;
+	struct xrt_component_setting_status *out;
+};
+
+static void
+dp_setting_status_cb(const struct xrt_plugin_iface *iface, void *ud)
+{
+	struct dp_setting_status_args *a = (struct dp_setting_status_args *)ud;
+	for (int i = 0; i < a->count; i++) {
+		(void)xrt_plugin_iface_setting_status(iface, a->keys[i], &a->out[i]);
+	}
+}
+
+bool
+target_plugin_setting_status(const char *id,
+                             const char *const *keys,
+                             int count,
+                             struct xrt_component_setting_status *out)
+{
+	if (keys == NULL || out == NULL || count <= 0) {
+		return false;
+	}
+	for (int i = 0; i < count; i++) {
+		// UNKNOWN until the plug-in says otherwise.
+		(void)xrt_component_setting_status_query(NULL, NULL, &out[i]);
+	}
+	struct dp_setting_status_args a = {keys, count, out};
+	return dp_with_negotiated(id, dp_setting_status_cb, &a);
+}
+
 struct dp_activate_args
 {
 	const char *token;

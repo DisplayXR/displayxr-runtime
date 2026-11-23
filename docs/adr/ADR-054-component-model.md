@@ -506,3 +506,43 @@ capability (`XRT_CONV_STATE_UNLICENSED`).
   reference is `sim-conversion` / `sim-tracking` (`LICENSE_SIM`, `LICENSE_KEY`).
 - Spec: plugin-discovery.md §2.3 (secrets) and §2.4 (licence state and activation), with the
   class sections in the input, conversion and tracking discovery specs.
+
+## Amendment 3 — Setting status: whether a stored value takes effect on this machine (2026-11-23)
+
+**Status:** Accepted with the implementation.
+
+### What was open
+
+Decision 7's options contract says what a setting *is* and where its value comes from, never
+whether the value can take effect. A display-driver option that needs a capability the vendor
+platform installed on this machine lacks (first case: a multi-viewer switch on a platform
+without multi-viewer weaving) was shown by `dp options` and the Dashboard as stored, with
+nothing telling the user it does nothing here.
+
+### Decision
+
+1. **One status shape, shared** (`xrt/xrt_component_settings.h`):
+   `struct xrt_component_setting_status { struct_size; state; effective_value[64]; note[160];
+   reserved[4]; }` (264 bytes), states `UNKNOWN` 0, `APPLIES` 1, `NOT_SUPPORTED` 2,
+   `RESTART_REQUIRED` 3, and the slot type
+   `bool (*xrt_component_get_setting_status_fn_t)(const char *key, struct xrt_component_setting_status *out)`.
+   The frozen `xrt_component_setting_desc` is untouched.
+2. **An appended slot, no ABI bump** (ADR-020): `get_setting_status` after `activate` at the
+   end of `xrt_plugin_iface`, under `struct_size`, announced by
+   `XRT_PLUGIN_IFACE_HAS_SETTING_STATUS`. Display processors only for now; another class adopts
+   the shared typedef by appending its own slot the same way.
+3. **The component decides; the runtime shows.** The runtime never infers support. It
+   zero-fills, sizes and sanitises the struct, reads a missing slot, a false return or an
+   unknown state as `unknown`, and front ends then behave exactly as before.
+4. **Diagnostic, bounded, instance-free.** The slot is called by `options` on a negotiated-only
+   plug-in, may spend a bounded, cached probe (≤ ~500 ms), and must not touch devices.
+5. **The stored value stays the user's.** `not_supported` never rewrites or hides it: the
+   Dashboard keeps the control editable and adds a "Not supported here" chip, the component's
+   note and "Using: <the value used instead>".
+
+### Consequences
+
+- `options --json` rows gain a `status` object (always present); the human table gains one
+  `status:` line per reported key. Keys are only added.
+- Spec: plugin-discovery.md §2.3 *Setting status*; reference: `docs/reference/xrt_plugin_iface.md`
+  § `get_setting_status`; test: `tests_component_setting_status`.

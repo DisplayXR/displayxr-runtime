@@ -644,4 +644,102 @@ public class DriverOptionsTests
         Assert.Equal("Use the default for Always 2D: DisplayXR Sim Display", OptionViews.ResetName("Always 2D", "DisplayXR Sim Display"));
         Assert.Equal("More options: DisplayXR Sim Display", OptionViews.MoreName("DisplayXR Sim Display"));
     }
+
+    // ── Setting status: does the value in force take effect on this PC (get_setting_status) ──
+
+    private const string MultiViewerJson = """
+        {"id":"vendor-dp","class":"dp","env_prefix":"DXR_DP_VENDOR_DP_","settings":[
+          {"key":"MULTI_VIEWER","declared":true,"type":"enum","default":"system","help":"system | on | off: several viewers",
+           "values":["system","on","off"],"secret":false,"value":"on","source":"user",
+           "status":{"state":"not_supported","effective_value":"system","note":"The installed display software has no multi-viewer mode."}},
+          {"key":"GAIN","declared":true,"type":"float","default":"1","help":"gain","values":null,"secret":false,
+           "value":null,"source":"absent","status":{"state":"restart_required","effective_value":"ignored","note":null}},
+          {"key":"PLAIN","declared":true,"type":"bool","default":"0","help":"plain","values":null,"secret":false,
+           "value":null,"source":"absent","status":{"state":"applies","effective_value":null,"note":null}},
+          {"key":"OLD","declared":true,"type":"bool","default":"0","help":"from a CLI without status","secret":false,
+           "value":null,"source":"absent"},
+          {"key":"ODD","declared":true,"type":"bool","default":"0","help":"","secret":false,"value":null,"source":"absent",
+           "status":{"state":"sideways","note":"x"}}
+        ]}
+        """;
+
+    private static DriverOptions MultiViewer()
+    {
+        Assert.True(DriverOptions.TryParse(MultiViewerJson, out var o));
+        return o!;
+    }
+
+    [Fact]
+    public void Status_Parse_ReadsEachState_AndAnAbsentOrUnknownOneAsNotReported()
+    {
+        var o = MultiViewer();
+        var mv = o.Find("MULTI_VIEWER")!.Status!;
+        Assert.Equal(SettingState.NotSupported, mv.State);
+        Assert.Equal("system", mv.EffectiveValue);
+        Assert.Equal("The installed display software has no multi-viewer mode.", mv.Note);
+
+        var gain = o.Find("GAIN")!.Status!;
+        Assert.Equal(SettingState.RestartRequired, gain.State);
+        Assert.Null(gain.EffectiveValue); // meaningful only for not_supported
+        Assert.Null(gain.Note);
+
+        Assert.Equal(SettingState.Applies, o.Find("PLAIN")!.Status!.State);
+        Assert.Null(o.Find("OLD")!.Status);  // a CLI that predates `status`
+        Assert.Null(o.Find("ODD")!.Status);  // a state this Dashboard does not know
+        // The existing fields are unchanged by the new object.
+        Assert.Equal("on", o.Find("MULTI_VIEWER")!.Value);
+        Assert.Equal(SettingSource.User, o.Find("MULTI_VIEWER")!.Source);
+    }
+
+    [Fact]
+    public void Status_NotSupported_ChipNoteAndTheValueUsedInTheRowsWords_ControlStaysEditable()
+    {
+        var block = OptionViews.Build("vendor-dp", MultiViewer());
+        var v = block.Friendly.Single(x => x.Key == "MULTI_VIEWER");
+        Assert.Equal("Several viewers", v.Label);
+        Assert.Equal("on", v.Selected);         // the stored choice is still what the control shows
+        Assert.False(v.ReadOnly);               // and it can still be changed
+        Assert.True(v.CanReset);
+        var st = v.Status!;
+        Assert.Equal(SettingState.NotSupported, st.State);
+        Assert.Equal("Not supported here", st.Chip);
+        Assert.Equal("The installed display software has no multi-viewer mode.", st.Note);
+        Assert.Equal("Follow the display's own setting", st.Using);
+        Assert.Equal("Chosen: On · Your choice", OptionViews.NowLine(v));
+    }
+
+    [Fact]
+    public void Status_NotSupported_WithoutNoteOrValue_FallsBackToAPlainSentence()
+    {
+        var s = MultiViewer().Find("MULTI_VIEWER")! with { Status = new SettingStatus(SettingState.NotSupported) };
+        var v = OptionViews.View(s, FriendlyOptions.Find("vendor-dp", "MULTI_VIEWER"));
+        Assert.Equal(OptionViews.NotSupportedFallbackNote, v.Status!.Note);
+        Assert.Null(v.Status.Using);
+
+        // A value the row has no label for is quoted; an alias resolves to its label.
+        Assert.Equal("“auto”", OptionViews.ValueWords(v, "auto"));
+        var output = OptionViews.View(Sim().Find("OUTPUT")!, FriendlyOptions.Find(FriendlyOptions.SimDisplay, "OUTPUT"));
+        Assert.Equal("Side by side, squeezed", OptionViews.ValueWords(output, "squeezed_sbs"));
+    }
+
+    [Fact]
+    public void Status_RestartRequired_IsAnInfoChip_AppliesAndUnknownShowNothing()
+    {
+        var block = OptionViews.Build("vendor-dp", MultiViewer());
+        var gain = block.More.Single(x => x.Key == "GAIN");
+        Assert.Equal(SettingState.RestartRequired, gain.Status!.State);
+        Assert.Equal("Takes effect after a restart", gain.Status.Chip);
+        Assert.Null(gain.Status.Using);
+        Assert.StartsWith("Now: ", OptionViews.NowLine(gain));
+        Assert.Null(block.More.Single(x => x.Key == "PLAIN").Status);
+        Assert.Null(block.More.Single(x => x.Key == "OLD").Status);
+    }
+
+    [Fact]
+    public void AppliesNote_SaysServiceHostedAppsNeedDisplayXRRestarted()
+    {
+        Assert.Contains("next time a 3D app starts", OptionViews.AppliesNote);
+        Assert.Contains("only after DisplayXR restarts", OptionViews.AppliesNote);
+        Assert.Contains("browser", OptionViews.AppliesNote);
+    }
 }

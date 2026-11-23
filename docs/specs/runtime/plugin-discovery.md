@@ -371,7 +371,7 @@ other.
 
 | Verb | What |
 |---|---|
-| `displayxr-cli dp options <id> [--json]` | Every key the plug-in declares (`xrt_plugin_iface::describe_settings`, `XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`; or the POSIX manifest's `plugin.settings_schema` array `[{"key","type","default","help"}, …]`) unioned with every key the stores hold: key, type (`bool` / `int` / `float` / `string` / `enum` / `secret`), default, effective value and its source (`environment` / `user` / `machine` / `manifest` / `absent`), plus the environment prefix and both store paths. Loads + negotiates the registered binary (no probe) to ask it — the same exposure as `dp list`'s status snapshot. In `--json` every row also carries `values`: for a declared `enum`, the accepted words as an array, else `null` (see *Enum values* below). |
+| `displayxr-cli dp options <id> [--json]` | Every key the plug-in declares (`xrt_plugin_iface::describe_settings`, `XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`; or the POSIX manifest's `plugin.settings_schema` array `[{"key","type","default","help"}, …]`) unioned with every key the stores hold: key, type (`bool` / `int` / `float` / `string` / `enum` / `secret`), default, effective value and its source (`environment` / `user` / `machine` / `manifest` / `absent`), plus the environment prefix and both store paths. Loads + negotiates the registered binary (no probe) to ask it — the same exposure as `dp list`'s status snapshot. In `--json` every row also carries `values`: for a declared `enum`, the accepted words as an array, else `null` (see *Enum values* below). and `status`: whether the value in force takes effect on this machine (see *Setting status* below). |
 | `dp set <id> <KEY> <value> [--machine]` | Writes the per-user store (no admin) or, with `--machine`, the HKLM 64-bit view (admin). Refused on POSIX with `--machine` — the manifest's `settings` object is the machine store there and is edited by hand. An unregistered id or an invalid key is refused with nothing written (the `enable\|disable` rule). After the write the CLI reads the key back and prints *Effective now:* the value the plug-in will actually see and why — including when the environment or `Policy\Lock` overrides what was just written. |
 | `dp set <id> <KEY> --stdin [--machine]` | The same write, the value read from standard input instead of the command line: ONE line, the trailing newline (and a CR before it) dropped, nothing after the first line read. An empty line, or one that does not fit the store (255 bytes; 2047 for a `secret`), is refused with nothing written. A value argument and `--stdin` together are refused. Works for any type; it is the way to set a `secret`, since a command line is visible to other processes and kept in shell history. Same verb on `input`, `conv` and `tracking`. |
 | `dp unset <id> <KEY> [--machine]` | Removes it from that store; absent is success (POSIX: the per-user file is deleted once empty). |
@@ -389,6 +389,47 @@ most 16 words of under 32 bytes (`cli_option_parse.h`,
 `tests_cli_option_parse`). A component that wants a drop-down in every front
 end writes its enum help as `word|word|word -- explanation`. The descriptor,
 the plug-in ABI and the human table are unchanged.
+
+**Setting status — does the value take effect *here*?** A stored value is
+not always one the component can honour on this machine: a display-driver
+option may need a capability the vendor platform installed here lacks. A
+display processor says so, per declared key, through the optional
+`xrt_plugin_iface::get_setting_status` slot
+(`xrt_component_get_setting_status_fn_t`, announced by
+`XRT_PLUGIN_IFACE_HAS_SETTING_STATUS`; the struct and states are in
+`xrt/xrt_component_settings.h`, `XRT_COMPONENT_SETTINGS_HAS_SETTING_STATUS`).
+It fills an `xrt_component_setting_status` the runtime zero-filled and sized:
+
+| `state` | Meaning |
+|---|---|
+| `unknown` (0) | Not reported — no slot, an older plug-in, a key it does not report on, or it returned false. Front ends show the stored value alone, as before. |
+| `applies` (1) | The value in force takes effect on this machine. |
+| `not_supported` (2) | It cannot take effect here. `effective_value` names the value the component uses instead (a value of the setting, e.g. `system`), `note` says why in one sentence. The stored value is kept and still editable: it takes effect on a machine that supports it. |
+| `restart_required` (3) | Optional: it differs from what the running process read at init and takes effect after a restart. |
+
+The slot is called on a **negotiated-only** plug-in — no `probe()`, no
+instance, no device — once per declared key, by `options` (one load for the
+whole list). It may run a bounded capability probe (≤ ~500 ms for the first
+key of a process, cached for the rest), must be thread-safe, and must never
+open a device, take a camera, change display state or show UI. Strings are
+UTF-8, NUL-terminated (the runtime forces it), shown verbatim, never parsed.
+An unknown state reads as `unknown`. Input, conversion and tracking providers
+do not carry the slot yet; the typedef is shared so they can append it the
+same way.
+
+`options` prints one line under the table per reported key that has
+something to say:
+
+```
+	MULTI_VIEWER             status: NOT SUPPORTED here — <note> (using 'system')
+	SOME_KEY                 status: takes effect after a restart — <note>
+	OTHER_KEY                status: applies — <note>          (only when a note is given)
+```
+
+and every `options --json` row carries a `status` object, always present
+(other keys unchanged):
+`"status": {"state": "applies" | "not_supported" | "restart_required" | "unknown", "effective_value": "<word>" | null, "note": "<sentence>" | null}`
+— `effective_value` is non-null only for `not_supported`.
 
 **Secrets.** A setting declared with type `secret`
 (`XRT_COMPONENT_SETTING_TYPE_SECRET`, announced by
