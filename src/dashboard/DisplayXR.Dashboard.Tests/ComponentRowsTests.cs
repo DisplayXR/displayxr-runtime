@@ -271,6 +271,22 @@ public class ComponentRowsTests
     }
 
     [Fact]
+    public void AReceiptWhoseComponentIsGone_IsNotAnInstalledRow()
+    {
+        // The engine read each receipt's version marker: "browser" was removed by its own
+        // uninstaller (null), "pen" is there at a newer version than its receipt, "pad" comes
+        // from an engine that does not send the field.
+        Assert.True(CatalogList.TryParseInstalled(
+            "{\"installed\":[" +
+            "{\"id\":\"browser\",\"name\":\"Browser\",\"class\":\"app\",\"version\":\"1.10.5\",\"installed\":null,\"can_uninstall\":false}," +
+            "{\"id\":\"pen\",\"name\":\"Pen\",\"class\":\"input_provider\",\"version\":\"1.0.0\",\"installed\":\"1.1.0\",\"can_uninstall\":true}," +
+            "{\"id\":\"pad\",\"name\":\"Pad\",\"class\":\"input_provider\",\"version\":\"2.0.0\",\"can_uninstall\":true}]}", out var receipts));
+        Assert.Equal(new[] { "pen", "pad" }, receipts!.Items.Select(i => i.Id).ToArray());
+        Assert.Equal("1.1.0", receipts.Items[0].Installed);
+        Assert.Equal("2.0.0", receipts.Items[1].Installed);
+    }
+
+    [Fact]
     public void TheReceiptsAlone_AreNotACatalog_SoNothingIsCalledNotFromCatalog()
     {
         Assert.True(CatalogList.TryParseInstalled("{\"installed\":[{\"id\":\"pen\",\"name\":\"Pen\",\"class\":\"input_provider\",\"version\":\"1.0.0\",\"can_uninstall\":true}]}", out var receipts));

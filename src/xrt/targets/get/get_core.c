@@ -1693,7 +1693,7 @@ dxr_list_catalog(const struct dxr_catalog *c, const struct dxr_env *env, bool ou
 }
 
 cJSON *
-dxr_list_receipts(const struct dxr_receipt *r, int n)
+dxr_list_receipts(const struct dxr_env *env, const struct dxr_receipt *r, int n)
 {
 	cJSON *arr = cJSON_CreateArray();
 	for (int i = 0; i < n; i++) {
@@ -1703,6 +1703,18 @@ dxr_list_receipts(const struct dxr_receipt *r, int n)
 		cJSON_AddStringToObject(x, "class", r[i].item_class);
 		cJSON_AddStringToObject(x, "publisher", r[i].publisher);
 		cJSON_AddStringToObject(x, "version", r[i].version);
+		// What is on the machine NOW, read from where the receipt says the component
+		// keeps its version: a receipt outlives a component removed by its own
+		// uninstaller. null = the value is gone; no field = the receipt does not
+		// say where to look (or there is no machine to ask), so nothing was checked.
+		if (env != NULL && env->reg_sz != NULL && r[i].version_path[0] != '\0') {
+			char now[64];
+			if (env->reg_sz(env->user, r[i].version_path, now, sizeof(now)) && now[0] != '\0') {
+				cJSON_AddStringToObject(x, "installed", now);
+			} else {
+				cJSON_AddNullToObject(x, "installed");
+			}
+		}
 		cJSON_AddStringToObject(x, "source_url", r[i].source_url);
 		cJSON_AddStringToObject(x, "sha256", r[i].sha256);
 		cJSON_AddStringToObject(x, "install_time", r[i].install_time);

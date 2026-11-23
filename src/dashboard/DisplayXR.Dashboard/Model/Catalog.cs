@@ -221,6 +221,9 @@ public sealed record CatalogList(int Schema, IReadOnlyList<CatalogItem> Items)
     /// <summary>
     /// <c>dxr-get list --installed --json</c> (<c>{"installed":[…]}</c>, the receipts: no catalog,
     /// no network) as items, for the offline view: what the engine installed and can remove.
+    /// A row whose <c>installed</c> is null is left out: the engine looked and the component is
+    /// gone (its own uninstaller removed it and left the receipt). An engine that does not send
+    /// the field checked nothing, so its rows are shown as before.
     /// </summary>
     public static bool TryParseInstalled(string? json, out CatalogList? list)
     {
@@ -232,10 +235,11 @@ public sealed record CatalogList(int Schema, IReadOnlyList<CatalogItem> Items)
             var root = doc.RootElement;
             if (root.ValueKind != JsonValueKind.Object || !root.Has("installed")) return false;
             var items = root.Arr("installed").Where(e => e.ValueKind == JsonValueKind.Object && IdIsSafe(e.Str("id")))
+                .Where(e => !(e.TryGetProperty("installed", out var now) && now.ValueKind == JsonValueKind.Null))
                 .Select(e => new CatalogItem(
                     e.Str("id"), e.Str("name", e.Str("id")), e.Str("class"), null,
                     CatalogText.PublisherLabel(e.Str("publisher"), null), "",
-                    e.StrOrNull("version"), null, "installed", false, true, null, "", Array.Empty<string>(), false,
+                    e.StrOrNull("installed") ?? e.StrOrNull("version"), null, "installed", false, true, null, "", Array.Empty<string>(), false,
                     "none", null, 0, 0, true, null, Array.Empty<CatalogPrereq>(), e.Bool("can_uninstall")))
                 .ToArray();
             list = new CatalogList(0, items);
