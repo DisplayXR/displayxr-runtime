@@ -232,7 +232,13 @@ public class DriverOptionsTests
     [InlineData(SettingType.Int, "42", "42")]
     [InlineData(SettingType.Int, " -1 ", "-1")]
     [InlineData(SettingType.Int, "4.5", null)]
-    [InlineData(SettingType.Float, "0,344", "0.344")]
+    [InlineData(SettingType.Float, "0,344", null)]
+    [InlineData(SettingType.Float, "1,000", null)]
+    [InlineData(SettingType.Float, " 0.344 ", "0.344")]
+    [InlineData(SettingType.String, "  a  b ", "  a  b ")]
+    [InlineData(SettingType.String, "   ", null)]
+    [InlineData(SettingType.String, "a\0b", null)]
+    [InlineData(SettingType.Int, "4\0", null)]
     [InlineData(SettingType.Float, "1e400", null)]
     [InlineData(SettingType.String, "1280x720", "1280x720")]
     [InlineData(SettingType.String, "--machine", null)]
@@ -244,6 +250,15 @@ public class DriverOptionsTests
         var v = OptionViews.Validate(type, text, out var error);
         Assert.Equal(written, v);
         Assert.Equal(written is null, error is not null);
+    }
+
+    [Fact]
+    public void AFloatWithACommaIsRefused_WithTheReason()
+    {
+        Assert.Null(OptionViews.Validate(SettingType.Float, "1,000", out var error));
+        Assert.Equal("Type a number, with a dot for decimals.", error);
+        Assert.Null(OptionViews.Validate(SettingType.String, "x\0", out var nul));
+        Assert.Equal("That value has a character that can't be stored.", nul);
     }
 
     [Fact]

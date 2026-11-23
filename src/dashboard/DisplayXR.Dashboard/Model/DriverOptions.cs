@@ -360,16 +360,20 @@ public static class OptionViews
 
     /// <summary>
     /// A text box's value checked before it is written: an int as a whole number, a float as a
-    /// number (written with a '.'), anything else as one line. A value starting with "--" is
+    /// number with a dot for decimals (no comma), anything else as one line, kept as typed (not only
+    /// spaces, no NUL). A value starting with "--" is
     /// refused (the CLI would read it as a flag). Null with <paramref name="error"/> set when it
     /// cannot be written.
     /// </summary>
     public static string? Validate(SettingType type, string? text, out string? error)
     {
         error = null;
-        string v = (text ?? "").Trim();
-        if (v.Length == 0) { error = "Type a value first."; return null; }
-        if (v.Contains('\n') || v.Contains('\r')) { error = "One line only."; return null; }
+        string raw = text ?? "";
+        // A string keeps exactly what was typed; a number or a bool may carry spaces around it.
+        string v = type is SettingType.Int or SettingType.Float or SettingType.Bool ? raw.Trim() : raw;
+        if (raw.Trim().Length == 0) { error = "Type a value first."; return null; }
+        if (raw.Contains('\0')) { error = "That value has a character that can't be stored."; return null; }
+        if (raw.Contains('\n') || raw.Contains('\r')) { error = "One line only."; return null; }
         if (v.StartsWith("--", StringComparison.Ordinal)) { error = "A value can't start with two dashes."; return null; }
         switch (type)
         {
@@ -381,9 +385,10 @@ public static class OptionViews
                 }
                 return l.ToString(CultureInfo.InvariantCulture);
             case SettingType.Float:
-                if (!double.TryParse(v.Replace(',', '.'), NumberStyles.Float, CultureInfo.InvariantCulture, out var d) || !double.IsFinite(d))
+                // No thousands separators and no decimal comma: "1,000" is refused, never read as 1 or 1000.
+                if (v.Contains(',') || !double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) || !double.IsFinite(d))
                 {
-                    error = "Type a number.";
+                    error = "Type a number, with a dot for decimals.";
                     return null;
                 }
                 return d.ToString("R", CultureInfo.InvariantCulture);
