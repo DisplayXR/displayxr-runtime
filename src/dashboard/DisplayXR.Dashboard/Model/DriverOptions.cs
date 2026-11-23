@@ -133,13 +133,19 @@ public sealed record OptionChoice(string Value, string Label);
 /// <summary>
 /// The friendly presentation of one setting. <see cref="DriverId"/> null = this key on any display
 /// driver. <see cref="Aliases"/> map other spellings the driver accepts to an offered value;
-/// <see cref="Notes"/> is a sentence shown under the control while that value is in force.
+/// <see cref="Notes"/> is a sentence shown under the control while that value is in force. The entry
+/// applies only to a setting declared with <see cref="Type"/>; any other is listed under "More options".
+/// Values match without regard to case. <see cref="NoKindValues"/>: values that choose no kind at all
+/// (shown as <see cref="FriendlyOptions.NoKindText"/>); <see cref="InertWithoutKindOf"/>: the key of the
+/// setting without whose kind this one has no effect.
 /// </summary>
 public sealed record FriendlyOption(string? DriverId, string Key, string Label, OptionControl Control, string Help,
-                                    IReadOnlyList<OptionChoice> Choices, int Order,
+                                    IReadOnlyList<OptionChoice> Choices, int Order, SettingType Type,
                                     IReadOnlyDictionary<string, string>? Aliases = null,
                                     IReadOnlyDictionary<string, string>? Notes = null,
-                                    string? PinValue = null);
+                                    string? PinValue = null,
+                                    IReadOnlyList<string>? NoKindValues = null,
+                                    string? InertWithoutKindOf = null);
 
 /// <summary>The settings an owner is expected to touch, in words. Everything else is listed under "More options" by its key.</summary>
 public static class FriendlyOptions
@@ -156,6 +162,12 @@ public static class FriendlyOptions
 
     public const string FourViewNote = "For checking four-view apps. Most apps show only two of the views, or stay in 2D.";
 
+    /// <summary>The 3D preview kind is set to a value that chooses none (<c>2d</c> / <c>passthrough</c>).</summary>
+    public const string NoKindText = "No 3D preview kind is chosen: apps stay in 2D";
+
+    /// <summary>Under "Start in" while no kind is chosen.</summary>
+    public const string InertNote = "Has no effect until a 3D preview kind is chosen.";
+
     public static readonly IReadOnlyList<FriendlyOption> Table = new[]
     {
         // ADR-065: the 3D kind mode 1 draws. `2d` / `passthrough` are not offered: "Start in" and
@@ -170,15 +182,17 @@ public static class FriendlyOptions
                 new OptionChoice(FourViewKind, "Four views (2x2)"),
                 new OptionChoice("interlaced", "Interlaced"),
                 new OptionChoice("blend", "Blend"),
-            }, 10,
-            Aliases: new Dictionary<string, string> { ["squeezed_sbs"] = "squeezed", ["interlace"] = "interlaced" },
-            Notes: new Dictionary<string, string> { [FourViewKind] = FourViewNote }),
+            }, 10, SettingType.Enum,
+            Aliases: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["squeezed_sbs"] = "squeezed", ["interlace"] = "interlaced" },
+            Notes: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [FourViewKind] = FourViewNote },
+            NoKindValues: new[] { "2d", "passthrough" }),
         new FriendlyOption(SimDisplay, "START_3D", "Start in", OptionControl.TwoWay,
             "How apps start. They can still switch between 2D and the 3D preview.",
-            new[] { new OptionChoice("0", "2D"), new OptionChoice("1", "3D preview") }, 20),
+            new[] { new OptionChoice("0", "2D"), new OptionChoice("1", "3D preview") }, 20, SettingType.Bool,
+            InertWithoutKindOf: "OUTPUT"),
         new FriendlyOption(SimDisplay, "FORCE_MODE", "Always 2D", OptionControl.Pin,
             "Keep every app in 2D, whatever it asks for.",
-            new[] { new OptionChoice("1", "Always 3D preview") }, 30, PinValue: "0"),
+            new[] { new OptionChoice("1", "Always 3D preview") }, 30, SettingType.Int, PinValue: "0"),
         new FriendlyOption(null, "MULTI_VIEWER", "Several viewers", OptionControl.Choice,
             "Whether 3D is shown for more than one person at a time.",
             new[]
@@ -186,12 +200,16 @@ public static class FriendlyOptions
                 new OptionChoice("system", "Follow the display's own setting"),
                 new OptionChoice("on", "On"),
                 new OptionChoice("off", "Off"),
-            }, 40),
+            }, 40, SettingType.Enum),
     };
 
     /// <summary>The friendly entry for <paramref name="key"/> of driver <paramref name="driverId"/>: its own first, then one for any driver.</summary>
     public static FriendlyOption? Find(string driverId, string key) =>
         Table.FirstOrDefault(f => f.DriverId == driverId && f.Key == key) ?? Table.FirstOrDefault(f => f.DriverId is null && f.Key == key);
+
+    /// <summary>The friendly entry for a declared setting: only when the declared type is the one the entry expects.</summary>
+    public static FriendlyOption? For(string driverId, DriverSetting s) =>
+        s.Type != SettingType.Secret && Find(driverId, s.Key) is { } f && f.Type == s.Type ? f : null;
 }
 
 /// <summary>Everything a row of the Options block shows, worked out from one setting.</summary>
@@ -206,7 +224,7 @@ public static class FriendlyOptions
 public sealed record OptionView(DriverSetting Setting, string Label, OptionControl Control, string Help, bool Friendly,
                                 IReadOnlyList<OptionChoice> Choices, string? Selected, bool On, string? State,
                                 string ValueText, string SourceText, bool ReadOnly, bool CanReset, string? Note,
-                                string Tooltip, FriendlyOption? Entry)
+                                string Tooltip, FriendlyOption? Entry, bool NoKind = false)
 {
     public string Key => Setting.Key;
 }
@@ -255,11 +273,16 @@ public static class OptionViews
         var more = new List<OptionView>();
         foreach (var s in options.Settings)
         {
-            var entry = s.Type == SettingType.Secret ? null : FriendlyOptions.Find(driverId, s.Key);
+            var entry = FriendlyOptions.For(driverId, s);
             var view = View(s, entry, options.EnvPrefix);
             if (entry is not null) friendly.Add((entry.Order, view));
             else more.Add(view);
         }
+        // A setting that has no effect without another's kind says so while that one chooses none.
+        var noKind = friendly.Where(f => f.View.NoKind).Select(f => f.View.Key).ToHashSet();
+        for (int i = 0; i < friendly.Count; i++)
+            if (friendly[i].View.Entry?.InertWithoutKindOf is { } k && noKind.Contains(k))
+                friendly[i] = (friendly[i].Order, friendly[i].View with { Note = FriendlyOptions.InertNote });
         return new OptionsBlock(driverId, friendly.OrderBy(f => f.Order).Select(f => f.View).ToArray(), more);
     }
 
@@ -294,8 +317,12 @@ public static class OptionViews
         {
             case OptionControl.Choice:
             {
-                string resolved = f.Aliases is not null && f.Aliases.TryGetValue(effective, out var a) ? a : effective;
-                var choice = f.Choices.FirstOrDefault(c => c.Value == resolved);
+                string value = effective.Trim();
+                if (f.NoKindValues?.Any(x => string.Equals(x, value, StringComparison.OrdinalIgnoreCase)) == true)
+                    return new OptionView(s, f.Label, OptionControl.Choice, f.Help, true, f.Choices, null, false, null,
+                                          FriendlyOptions.NoKindText, source, readOnly, canReset, null, tooltip, f, NoKind: true);
+                string resolved = f.Aliases is not null && f.Aliases.TryGetValue(value, out var a) ? a : value;
+                var choice = f.Choices.FirstOrDefault(c => string.Equals(c.Value, resolved, StringComparison.OrdinalIgnoreCase));
                 string? note = choice is not null && f.Notes is not null && f.Notes.TryGetValue(choice.Value, out var n) ? n : null;
                 return new OptionView(s, f.Label, OptionControl.Choice, f.Help, true, f.Choices, choice?.Value, false, null,
                                       choice?.Label ?? Quoted(effective), source, readOnly, canReset, note, tooltip, f);
@@ -309,8 +336,8 @@ public static class OptionViews
             }
             case OptionControl.Pin:
             {
-                bool on = f.PinValue is not null && effective.Trim() == f.PinValue;
-                var other = on ? null : f.Choices.FirstOrDefault(c => c.Value == effective.Trim());
+                bool on = f.PinValue is not null && string.Equals(effective.Trim(), f.PinValue, StringComparison.OrdinalIgnoreCase);
+                var other = on ? null : f.Choices.FirstOrDefault(c => string.Equals(c.Value, effective.Trim(), StringComparison.OrdinalIgnoreCase));
                 string text = on ? "On" : other?.Label ?? "Off";
                 return new OptionView(s, f.Label, OptionControl.Pin, f.Help, true, f.Choices, other?.Value, on, other?.Label,
                                       text, source, readOnly, canReset, null, tooltip, f);

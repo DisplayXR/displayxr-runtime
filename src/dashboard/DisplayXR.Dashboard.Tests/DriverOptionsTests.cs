@@ -123,10 +123,13 @@ public class DriverOptionsTests
         var entry = FriendlyOptions.Find("sim-display", "OUTPUT");
         Assert.Null(OptionViews.View(s with { Value = "sbs" }, entry).Note);
         Assert.Equal("squeezed", OptionViews.View(s with { Value = "squeezed_sbs" }, entry).Selected);
-        // `2d` is not offered: nothing selected, the stored value quoted.
+        // `2d` is not offered: nothing selected, said plainly.
         var flat = OptionViews.View(s with { Value = "2d" }, entry);
         Assert.Null(flat.Selected);
-        Assert.Equal("“2d”", flat.ValueText);
+        Assert.Equal("No 3D preview kind is chosen: apps stay in 2D", flat.ValueText);
+        Assert.True(flat.NoKind);
+        // A value the driver does not know: quoted as stored.
+        Assert.Equal("“mosaic”", OptionViews.View(s with { Value = "mosaic" }, entry).ValueText);
         // Unset: the default kind, "Default", nothing to reset.
         var dflt = OptionViews.View(s with { Value = null, Source = SettingSource.Absent }, entry);
         Assert.Equal("anaglyph", dflt.Selected);
@@ -355,6 +358,50 @@ public class DriverOptionsTests
         e.Focus(k);
         e.Rebuilt();              // a forced rebuild replaced the box: never stuck deferring
         Assert.False(e.IsEditing);
+    }
+
+    /// <summary>Review finding 6: a friendly entry applies only to the type it expects; values match without regard to case.</summary>
+    [Fact]
+    public void FriendlyEntries_NeedTheirType_AndMatchAnyCase()
+    {
+        DriverSetting Setting(string key, SettingType type, string? value) =>
+            new(key, type, "", "", value, value is not null, value is null ? SettingSource.Absent : SettingSource.User);
+
+        // MULTI_VIEWER declared as a bool or an int on some driver: not the friendly drop-down.
+        var asBool = OptionViews.Build("other", new DriverOptions("other", "", new[] { Setting("MULTI_VIEWER", SettingType.Bool, "1") }));
+        Assert.Empty(asBool.Friendly);
+        Assert.Equal(OptionControl.Switch, Assert.Single(asBool.More).Control);
+        var asInt = OptionViews.Build("other", new DriverOptions("other", "", new[] { Setting("MULTI_VIEWER", SettingType.Int, "2") }));
+        Assert.Equal(OptionControl.Text, Assert.Single(asInt.More).Control);
+        Assert.Equal("MULTI_VIEWER", asInt.More[0].Label);
+        Assert.Equal("Several viewers", Assert.Single(OptionViews.Build("other",
+            new DriverOptions("other", "", new[] { Setting("MULTI_VIEWER", SettingType.Enum, "ON") })).Friendly).Label);
+        // START_3D declared as an enum: not the two-way choice.
+        Assert.Null(FriendlyOptions.For("sim-display", Setting("START_3D", SettingType.Enum, "1")));
+
+        // Any case.
+        var output = FriendlyOptions.Find("sim-display", "OUTPUT");
+        var s = Sim().Find("OUTPUT")!;
+        Assert.Equal("sbs", OptionViews.View(s with { Value = "SBS" }, output).Selected);
+        var quad = OptionViews.View(s with { Value = "Quad" }, output);
+        Assert.Equal("Four views (2x2)", quad.ValueText);
+        Assert.Equal(FriendlyOptions.FourViewNote, quad.Note);
+        Assert.Equal("squeezed", OptionViews.View(s with { Value = "Squeezed_SBS" }, output).Selected);
+        Assert.Equal("On", OptionViews.View(Setting("MULTI_VIEWER", SettingType.Enum, "ON"), FriendlyOptions.Find("x", "MULTI_VIEWER")).ValueText);
+    }
+
+    [Fact]
+    public void NoKindChosen_SaysSo_AndStartInHasNoEffect()
+    {
+        var o = Sim();
+        var two = o with { Settings = o.Settings.Select(x => x.Key == "OUTPUT" ? x with { Value = "Passthrough" } : x).ToArray() };
+        var b = OptionViews.Build("sim-display", two);
+        var kind = b.Friendly.Single(v => v.Key == "OUTPUT");
+        Assert.Equal("No 3D preview kind is chosen: apps stay in 2D", kind.ValueText);
+        Assert.Null(kind.Selected);
+        Assert.Equal("Has no effect until a 3D preview kind is chosen.", b.Friendly.Single(v => v.Key == "START_3D").Note);
+        // With a kind chosen, no such note.
+        Assert.Null(SimBlock().Friendly.Single(v => v.Key == "START_3D").Note);
     }
 
     [Fact]

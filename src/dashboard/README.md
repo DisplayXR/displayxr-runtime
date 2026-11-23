@@ -330,11 +330,14 @@ lines, the scope and command-line notes, the catalog detail and the removal sent
 - **Friendly settings** come first, in words; every other one is under **More options (N)**,
   collapsed by default (accessible name `More options: <driver>`), with its raw key as the label.
   The friendly presentation is data, `FriendlyOptions.Table` (driver id or any driver, key, label,
-  control, help, value labels, aliases, notes, order): adding one is a row there.
+  control, expected type, help, value labels, aliases, notes, order): adding one is a row there. An
+  entry applies only when the setting is declared with the type it expects (MULTI_VIEWER declared as
+  a bool or an int is listed under More options by its key); stored values match without regard to
+  case ("SBS", "Quad").
 
   | Driver | Key | Label | Control | Values shown |
   |---|---|---|---|---|
-  | simulated display (`sim-display`) | `OUTPUT` | 3D preview kind | drop-down | Red / cyan (anaglyph) `anaglyph`, Side by side `sbs`, Side by side, squeezed `squeezed` (also `squeezed_sbs`), Four views (2x2) `quad`, Interlaced `interlaced` (also `interlace`), Blend `blend`. `2d` / `passthrough` are not offered (Start in and Always 2D cover 2D); a stored one shows quoted, nothing selected. No top-and-bottom kind exists. |
+  | simulated display (`sim-display`) | `OUTPUT` | 3D preview kind | drop-down | Red / cyan (anaglyph) `anaglyph`, Side by side `sbs`, Side by side, squeezed `squeezed` (also `squeezed_sbs`), Four views (2x2) `quad`, Interlaced `interlaced` (also `interlace`), Blend `blend`. `2d` / `passthrough` are not offered (Start in and Always 2D cover 2D); a stored one reads "No 3D preview kind is chosen: apps stay in 2D", nothing selected, and Start in then carries "Has no effect until a 3D preview kind is chosen." No top-and-bottom kind exists. |
   | simulated display | `START_3D` | Start in | two-way choice | 2D `0`, 3D preview `1` |
   | simulated display | `FORCE_MODE` | Always 2D | switch | on writes `0`; off always writes the default `-1` for this user (never an unset: `dp options` shows only the winning layer, so an unset could leave a machine-wide value winning); "Use the default" unsets; a stored `1` shows as its own state, *Always 3D preview*, with "Use the default" |
   | any driver | `MULTI_VIEWER` | Several viewers | drop-down | Follow the display's own setting `system`, On `on`, Off `off` |
