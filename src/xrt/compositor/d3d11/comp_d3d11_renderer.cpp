@@ -3031,9 +3031,10 @@ comp_d3d11_renderer_set_tile_layout(struct comp_d3d11_renderer *renderer,
 	 * bumps the atlas generation, so the bridge rebinds to the new texture on
 	 * its next submit.
 	 */
-	if (renderer->legacy_app_tile_scaling && renderer->atlas_texture != nullptr &&
-	    !u_tiling_atlas_alloc_holds(tile_columns, tile_rows, renderer->view_width, renderer->view_height,
-	                                renderer->atlas_alloc_width, renderer->atlas_alloc_height)) {
+	if (u_tiling_tile_layout_needs_atlas_grow(renderer->legacy_app_tile_scaling, renderer->atlas_texture != nullptr,
+	                                          tile_columns, tile_rows, renderer->view_width,
+	                                          renderer->view_height, renderer->atlas_alloc_width,
+	                                          renderer->atlas_alloc_height)) {
 		(void)comp_d3d11_renderer_resize(renderer, renderer->view_width, renderer->view_height,
 		                                 renderer->texture_height);
 	}

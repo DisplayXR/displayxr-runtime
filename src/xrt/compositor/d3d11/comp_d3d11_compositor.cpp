@@ -822,6 +822,13 @@ struct comp_d3d11_compositor
 	//! the worst-case atlas (the per-frame view-size sync in layer_commit).
 	bool view_cap_clamp_warned;
 
+	//! The active rendering-mode index layer_commit read for the last
+	//! committed frame (its single read, under c->mutex). The weave's segment
+	//! update and the HUD use it instead of re-reading the device, so they
+	//! describe the same mode as the atlas they present (a repaint replays
+	//! that frame, so the same index is right there too).
+	uint32_t frame_mode_index;
+
 	//! Compromise view scale for legacy apps. Only valid when legacy_app_tile_scaling is true.
 	float legacy_view_scale_x;
 	float legacy_view_scale_y;
@@ -1780,9 +1787,8 @@ d3d11_tt_weave(struct comp_d3d11_compositor *c,
 			// the publish below withholds zero-copy from the next (#2218) —
 			// the same one-frame lag as the windowed path.
 			if (!zero_copy && atlas_srv != nullptr) {
-				const uint32_t mode_index = (c->xdev != nullptr && c->xdev->hmd != nullptr)
-				                                ? c->xdev->hmd->active_rendering_mode_index
-				                                : 0;
+				// The frame's single read (layer_commit), not a fresh one.
+				const uint32_t mode_index = c->frame_mode_index;
 				seg_split =
 				    comp_d3d11_segments_update(c->segments, &c->seg_window, &canvas, c->context, mode_index);
 				comp_d3d11_segments_set_visibility(c->segments, c->visibility); // #2671
@@ -2522,11 +2528,13 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c,
 	data.fps = fps;
 	data.frame_time_ms = c->smoothed_frame_time_ms;
 	data.mode_3d = c->hardware_display_3d;
-	if (c->xdev != NULL && c->xdev->hmd != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-		if (idx < c->xdev->rendering_mode_count) {
-			data.rendering_mode_name = c->xdev->rendering_modes[idx].mode_name;
-		}
+	// The frame's single read of the active mode (layer_commit), not a fresh one.
+	const struct xrt_rendering_mode *hud_mode =
+	    (c->xdev != NULL && c->frame_mode_index < c->xdev->rendering_mode_count)
+	        ? &c->xdev->rendering_modes[c->frame_mode_index]
+	        : NULL;
+	if (hud_mode != NULL) {
+		data.rendering_mode_name = hud_mode->mode_name;
 	}
 	data.render_width = render_w;
 	data.render_height = render_h;
@@ -2544,11 +2552,8 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c,
 	// Use the active rendering mode's view_count for eye display (not eye_pos->count,
 	// which may report more eyes than the mode uses — e.g. tracker returns L/R in 2D mode).
 	uint32_t mode_eye_count = eye_pos->count;
-	if (c->xdev != NULL && c->xdev->hmd != NULL) {
-		uint32_t midx = c->xdev->hmd->active_rendering_mode_index;
-		if (midx < c->xdev->rendering_mode_count) {
-			mode_eye_count = c->xdev->rendering_modes[midx].view_count;
-		}
+	if (hud_mode != NULL) {
+		mode_eye_count = hud_mode->view_count;
 	}
 	if (mode_eye_count > eye_pos->count) {
 		mode_eye_count = eye_pos->count;
@@ -3902,9 +3907,8 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			// per-segment weave exactly as after the single-DP weave, and each
 			// segment DP gets its share of the zone mask (d3d11_sync_zone_mask_to_dp).
 			if (!zero_copy && atlas_srv != nullptr) {
-				const uint32_t mode_index = (c->xdev != nullptr && c->xdev->hmd != nullptr)
-				                                ? c->xdev->hmd->active_rendering_mode_index
-				                                : 0;
+				// The frame's single read (layer_commit), not a fresh one.
+				const uint32_t mode_index = c->frame_mode_index;
 				seg_split = comp_d3d11_segments_update(c->segments, &c->seg_window, &canvas,
 				                                       d3d11_out_context(c), mode_index);
 				// Every segment DP follows the session's 2D/3D mode on the
@@ -5745,8 +5749,21 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	const struct xrt_rendering_mode *frame_mode = NULL;
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		c->frame_mode_index = idx;
 		if (idx < c->xdev->rendering_mode_count) {
 			frame_mode = &c->xdev->rendering_modes[idx];
+		}
+	}
+	// The worst-case atlas cap follows the table as it is now: a display-info
+	// refresh (hotplug, a larger panel) recomputes the per-mode view sizes, and
+	// a cap left at its create-time value would clamp a legitimately larger
+	// mode below. Before anything below sizes or clamps against it.
+	if (frame_mode != NULL && c->renderer != NULL) {
+		uint32_t cap_w = 0, cap_h = 0;
+		comp_d3d11_renderer_get_atlas_cap(c->renderer, &cap_w, &cap_h);
+		if (u_tiling_follow_atlas_cap(c->xdev->rendering_modes, c->xdev->rendering_mode_count, &cap_w,
+		                              &cap_h)) {
+			comp_d3d11_renderer_set_atlas_cap(c->renderer, cap_w, cap_h);
 		}
 	}
 

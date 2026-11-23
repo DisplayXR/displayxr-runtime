@@ -5331,13 +5331,26 @@ metal_compositor_layer_commit_frame(struct xrt_compositor *xc, xrt_graphics_sync
 
 	struct u_canvas_rect eff_canvas = metal_effective_canvas(c, output_texture, mask_active);
 
-	// Sync hardware_display_3d, tile layout, and per-view dimensions
-	// from device's active rendering mode.
-	// Legacy apps: view dims are fixed at compromise scale, only update tile layout.
+	/*
+	 * THE active mode for this frame: read ONCE, after the key paths above
+	 * (which may move it), and used by the sync below and the zero-copy
+	 * recipe, so a write from the app's xrRequestDisplayRenderingModeDXR
+	 * thread between the two cannot give the frame two different modes.
+	 */
+	const struct xrt_rendering_mode *frame_mode = NULL;
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
-			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+			frame_mode = &c->xdev->rendering_modes[idx];
+		}
+	}
+
+	// Sync hardware_display_3d, tile layout, and per-view dimensions
+	// from the frame's active mode.
+	// Legacy apps: view dims are fixed at compromise scale, only update tile layout.
+	if (frame_mode != NULL) {
+		{
+			const struct xrt_rendering_mode *mode = frame_mode;
 			c->hardware_display_3d = mode->hardware_display_3d;
 			if (mode->tile_columns > 0) {
 				c->tile_columns = mode->tile_columns;
@@ -5444,12 +5457,7 @@ metal_compositor_layer_commit_frame(struct xrt_compositor *xc, xrt_graphics_sync
 		struct comp_layer *layer = &c->layer_accum.layers[0];
 		if (layer->data.type == XRT_LAYER_PROJECTION ||
 		    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
-			const struct xrt_rendering_mode *mode = NULL;
-			if (c->xdev != NULL && c->xdev->hmd != NULL) {
-				uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-				if (idx < c->xdev->rendering_mode_count)
-					mode = &c->xdev->rendering_modes[idx];
-			}
+			const struct xrt_rendering_mode *mode = frame_mode;
 			if (mode != NULL && mode->view_count <= XRT_MAX_VIEWS) {
 				uint32_t vc = mode->view_count;
 				// All views must reference the same swapchain.

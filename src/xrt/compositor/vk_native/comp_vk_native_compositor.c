@@ -13029,13 +13029,48 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		}
 	}
 
-	// Sync hardware_display_3d, tile layout, and per-view dimensions
-	// from device's active rendering mode.
-	// Legacy apps: view dims are fixed at compromise scale, only update tile layout.
+	// Runtime mode keys (ADR-065): V toggles 2D <-> 3D, '0' / '1' select mode
+	// 0 / 1. One path for both (u_rendering_modes_decide_key).
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (c->xsysd != NULL) {
+		bool force_2d = false;
+		if (qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d)) {
+			vk_apply_mode_key(c, true, -1, force_2d);
+		}
+
+		// Legacy apps (no XR_DXR_display_info) only support the V toggle
+		// between mode 0 (2D) and mode 1 (3D) — skip direct mode selection.
+		if (!c->legacy_app_tile_scaling) {
+			int render_mode = -1;
+			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
+				vk_apply_mode_key(c, false, render_mode, false);
+			}
+		}
+	}
+#endif
+
+	/*
+	 * THE active mode for this frame: read ONCE, after the key paths above
+	 * (which may move it), and used by the renderer sync below and the
+	 * zero-copy recipe. The keys used to run after the sync, which kept the
+	 * renderer consistent within a frame but let the zero-copy check judge the
+	 * frame against the mode the key had just moved to; the index can also be
+	 * written from the app's xrRequestDisplayRenderingModeDXR thread.
+	 */
+	const struct xrt_rendering_mode *frame_mode = NULL;
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
-			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+			frame_mode = &c->xdev->rendering_modes[idx];
+		}
+	}
+
+	// Sync hardware_display_3d, tile layout, and per-view dimensions
+	// from the frame's active mode.
+	// Legacy apps: view dims are fixed at compromise scale, only update tile layout.
+	if (frame_mode != NULL) {
+		{
+			const struct xrt_rendering_mode *mode = frame_mode;
 			c->hardware_display_3d = mode->hardware_display_3d;
 			if (mode->tile_columns > 0 && c->renderer != NULL) {
 				if (!c->legacy_app_tile_scaling) {
@@ -13099,29 +13134,29 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				// Always update tile layout (both legacy and extension apps)
 				comp_vk_native_renderer_set_tile_layout(
 				    c->renderer, mode->tile_columns, mode->tile_rows);
+
+				/*
+				 * A legacy session's view size is fixed (no resize above),
+				 * but its grid follows the mode: one that began in the 1x1
+				 * 2D mode was allocated for ONE compromise-scale view, and
+				 * the V switch to a 2x1 mode doubles the content, which then
+				 * draws past the allocation and the DP crop copies out of
+				 * bounds. Grow to the extent a legacy session that began in
+				 * this mode is given (comp_vk_native_compositor_set_legacy_*:
+				 * tiles x view), never shrinking (#602).
+				 */
+				uint32_t lvw = 0, lvh = 0, alloc_w = 0, alloc_h = 0;
+				comp_vk_native_renderer_get_view_dimensions(c->renderer, &lvw, &lvh);
+				comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &alloc_w, &alloc_h);
+				if (u_tiling_tile_layout_needs_atlas_grow(c->legacy_app_tile_scaling, alloc_w > 0 && alloc_h > 0,
+				                                          mode->tile_columns, mode->tile_rows, lvw, lvh,
+				                                          alloc_w, alloc_h)) {
+					comp_vk_native_renderer_resize(c->renderer, lvw, lvh, mode->tile_columns * lvw,
+					                               mode->tile_rows * lvh);
+				}
 			}
 		}
 	}
-
-	// Runtime mode keys (ADR-065): V toggles 2D <-> 3D, '0' / '1' select mode
-	// 0 / 1. One path for both (u_rendering_modes_decide_key).
-#ifdef XRT_BUILD_DRIVER_QWERTY
-	if (c->xsysd != NULL) {
-		bool force_2d = false;
-		if (qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d)) {
-			vk_apply_mode_key(c, true, -1, force_2d);
-		}
-
-		// Legacy apps (no XR_DXR_display_info) only support the V toggle
-		// between mode 0 (2D) and mode 1 (3D) — skip direct mode selection.
-		if (!c->legacy_app_tile_scaling) {
-			int render_mode = -1;
-			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
-				vk_apply_mode_key(c, false, render_mode, false);
-			}
-		}
-	}
-#endif
 
 	// Get target dimensions
 	uint32_t tgt_width = c->settings.preferred.width;
@@ -13192,12 +13227,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	uint32_t zc_width = 0, zc_height = 0;
 
 	{
-		const struct xrt_rendering_mode *mode = NULL;
-		if (c->xdev != NULL && c->xdev->hmd != NULL) {
-			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-			if (idx < c->xdev->rendering_mode_count)
-				mode = &c->xdev->rendering_modes[idx];
-		}
+		const struct xrt_rendering_mode *mode = frame_mode;
 		if (mode != NULL && c->layer_accum.layer_count == 1) {
 			struct comp_layer *layer = &c->layer_accum.layers[0];
 			if (layer->data.type == XRT_LAYER_PROJECTION ||

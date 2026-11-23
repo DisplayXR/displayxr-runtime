@@ -715,6 +715,10 @@ struct comp_d3d12_compositor
 	//! paths (comp_*_compositor_set_mode_fill_views); 0 = no limit.
 	uint32_t mode_fill_views;
 
+	//! The once-only WARN when a mode-derived view size had to be clamped to
+	//! the worst-case atlas (the per-frame view-size sync in layer_commit).
+	bool view_cap_clamp_warned;
+
 	//! Compromise view scale for legacy apps. Only valid when legacy_app_tile_scaling is true.
 	float legacy_view_scale_x;
 	float legacy_view_scale_y;
@@ -7127,6 +7131,56 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		c->cursor_measure.req.requested = false;
 	}
 
+	// Runtime mode keys (ADR-065): V toggles 2D <-> 3D, '0' / '1' select mode
+	// 0 / 1. One path for both (u_rendering_modes_decide_key).
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (c->xsysd != nullptr) {
+		bool force_2d = false;
+		if (qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d)) {
+			d3d12_apply_mode_key(c, true, -1, force_2d);
+		}
+
+		// Legacy apps (no XR_DXR_display_info) only support the V toggle
+		// between mode 0 (2D) and mode 1 (3D) — skip direct mode selection.
+		if (!c->legacy_app_tile_scaling) {
+			int render_mode = -1;
+			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
+				d3d12_apply_mode_key(c, false, render_mode, false);
+			}
+		}
+	}
+#endif
+
+	/*
+	 * THE active mode for this frame: read ONCE, after the key paths above
+	 * (which may move it) and under c->mutex, and used by every per-frame
+	 * reader below — the eye-count fallback and clamp, the renderer's tile
+	 * layout, its view size and the zero-copy recipe. The keys used to run
+	 * BETWEEN the tile-layout sync and the view-size sync, so a V from 3D to 2D
+	 * gave one frame with mode 0's view size on mode 1's grid (the torn frame
+	 * fixed on the D3D11 leg). The index can also be written from the app's
+	 * xrRequestDisplayRenderingModeDXR thread, so re-reading it per site could
+	 * tear the same way.
+	 */
+	const struct xrt_rendering_mode *frame_mode = NULL;
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		if (idx < c->xdev->rendering_mode_count) {
+			frame_mode = &c->xdev->rendering_modes[idx];
+		}
+	}
+	// The worst-case atlas cap follows the table as it is now (a display-info
+	// refresh recomputes the per-mode view sizes); before anything below sizes
+	// or clamps against it.
+	if (frame_mode != NULL && c->renderer != NULL) {
+		uint32_t cap_w = 0, cap_h = 0;
+		comp_d3d12_renderer_get_atlas_cap(c->renderer, &cap_w, &cap_h);
+		if (u_tiling_follow_atlas_cap(c->xdev->rendering_modes, c->xdev->rendering_mode_count, &cap_w,
+		                              &cap_h)) {
+			comp_d3d12_renderer_set_atlas_cap(c->renderer, cap_w, cap_h);
+		}
+	}
+
 	// Get predicted eye positions
 	struct xrt_eye_positions eye_pos = {};
 	if (c->display_processor != nullptr) {
@@ -7140,11 +7194,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	if (!eye_pos.valid) {
 		// Use view_count from the active rendering mode for the fallback
 		uint32_t fallback_count = 2;
-		if (c->xdev != NULL && c->xdev->hmd != NULL) {
-			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-			if (idx < c->xdev->rendering_mode_count) {
-				fallback_count = c->xdev->rendering_modes[idx].view_count;
-			}
+		if (frame_mode != NULL) {
+			fallback_count = frame_mode->view_count;
 		}
 		if (fallback_count == 1) {
 			eye_pos.count = 1;
@@ -7170,20 +7221,16 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	 */
 	const struct xrt_eye_positions render_eyes = eye_pos;
 
-	// Sync hardware_display_3d and tile layout from device's active rendering mode
-	if (c->xdev != NULL && c->xdev->hmd != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-		if (idx < c->xdev->rendering_mode_count) {
-			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
-			c->hardware_display_3d = mode->hardware_display_3d;
-			// Clamp eye count to the active mode's view_count
-			if (eye_pos.count > mode->view_count) {
-				eye_pos.count = mode->view_count;
-			}
-			if (mode->tile_columns > 0 && c->renderer != NULL) {
-				comp_d3d12_renderer_set_tile_layout(
-				    c->renderer, mode->tile_columns, mode->tile_rows);
-			}
+	// Sync hardware_display_3d and tile layout from the frame's active mode
+	if (frame_mode != NULL) {
+		const struct xrt_rendering_mode *mode = frame_mode;
+		c->hardware_display_3d = mode->hardware_display_3d;
+		// Clamp eye count to the active mode's view_count
+		if (eye_pos.count > mode->view_count) {
+			eye_pos.count = mode->view_count;
+		}
+		if (mode->tile_columns > 0 && c->renderer != NULL) {
+			comp_d3d12_renderer_set_tile_layout(c->renderer, mode->tile_columns, mode->tile_rows);
 		}
 	}
 
@@ -7196,26 +7243,6 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		        c->layer_accum.layer_count, c->hardware_display_3d,
 		        (void *)c->display_processor, (void *)c->target);
 	}
-
-	// Runtime mode keys (ADR-065): V toggles 2D <-> 3D, '0' / '1' select mode
-	// 0 / 1. One path for both (u_rendering_modes_decide_key).
-#ifdef XRT_BUILD_DRIVER_QWERTY
-	if (c->xsysd != nullptr) {
-		bool force_2d = false;
-		if (qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d)) {
-			d3d12_apply_mode_key(c, true, -1, force_2d);
-		}
-
-		// Legacy apps (no XR_DXR_display_info) only support the V toggle
-		// between mode 0 (2D) and mode 1 (3D) — skip direct mode selection.
-		if (!c->legacy_app_tile_scaling) {
-			int render_mode = -1;
-			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
-				d3d12_apply_mode_key(c, false, render_mode, false);
-			}
-		}
-	}
-#endif
 
 	// #439 Phase 3: detect Local2D layers once per frame (under c->mutex).
 	// Drives the effective-canvas supersede + the composite's have_local_2d
@@ -7341,11 +7368,9 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// view dims from atlas invariance, but actual mode dims may differ
 	// (e.g. 2D mode needs full display height). Resize if needed.
 	// Legacy apps: view dims are fixed at compromise scale, skip mode sync.
-	if (!c->legacy_app_tile_scaling &&
-	    c->xdev != NULL && c->xdev->hmd != NULL && c->renderer != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-		if (idx < c->xdev->rendering_mode_count) {
-			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+	if (!c->legacy_app_tile_scaling && frame_mode != NULL && c->renderer != NULL) {
+		{
+			const struct xrt_rendering_mode *mode = frame_mode;
 			if (mode->view_width_pixels > 0) {
 				uint32_t new_vw = mode->view_width_pixels;
 				uint32_t new_vh = mode->view_height_pixels;
@@ -7357,6 +7382,30 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					// derive view dims from actual window client area.
 					u_tiling_compute_canvas_view(mode, tgt_width, tgt_height,
 					                             &new_vw, &new_vh);
+				} else {
+					/*
+					 * The view size is the mode's own: with the mode's grid it
+					 * is inside the worst-case atlas across the CURRENT table
+					 * (the cap followed it above) by construction. A size
+					 * outside it means two halves of "the active mode"
+					 * disagree; growing for it would keep a past-the-cap
+					 * allocation for the session (#602). Clamp, say so once.
+					 * Canvas- and window-derived sizes are left alone, as on
+					 * the D3D11 leg.
+					 */
+					uint32_t cap_w = 0, cap_h = 0;
+					comp_d3d12_renderer_get_atlas_cap(c->renderer, &cap_w, &cap_h);
+					const bool cw = u_tiling_clamp_view_to_atlas_cap(mode->tile_columns, cap_w, &new_vw);
+					const bool ch = u_tiling_clamp_view_to_atlas_cap(mode->tile_rows, cap_h, &new_vh);
+					if ((cw || ch) && !c->view_cap_clamp_warned) {
+						c->view_cap_clamp_warned = true;
+						U_LOG_W("d3d12: mode %u '%s' view %ux%u x tiles %ux%u exceeds the worst-case atlas "
+						        "%ux%u - view clamped to %ux%u, the atlas is not grown past the cap "
+						        "(logged once)",
+						        mode->mode_index, mode->mode_name, mode->view_width_pixels,
+						        mode->view_height_pixels, mode->tile_columns, mode->tile_rows, cap_w, cap_h,
+						        new_vw, new_vh);
+					}
 				}
 				uint32_t cur_vw, cur_vh;
 				comp_d3d12_renderer_get_view_dimensions(c->renderer, &cur_vw, &cur_vh);
@@ -7395,12 +7444,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	bool zero_copy = false;
 	void *zc_resource = nullptr;
 	{
-		const struct xrt_rendering_mode *mode = NULL;
-		if (c->xdev != NULL && c->xdev->hmd != NULL) {
-			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-			if (idx < c->xdev->rendering_mode_count)
-				mode = &c->xdev->rendering_modes[idx];
-		}
+		const struct xrt_rendering_mode *mode = frame_mode;
 		if (mode != NULL && c->layer_accum.layer_count == 1) {
 			struct comp_layer *layer = &c->layer_accum.layers[0];
 			if (layer->data.type == XRT_LAYER_PROJECTION ||

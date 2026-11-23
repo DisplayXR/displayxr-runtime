@@ -527,6 +527,13 @@ void
 comp_d3d12_renderer_set_atlas_cap(struct comp_d3d12_renderer *renderer, uint32_t cap_width, uint32_t cap_height);
 
 /*!
+ * The worst-case atlas extent set by comp_d3d12_renderer_set_atlas_cap
+ * (0 x 0 when none is known).
+ */
+void
+comp_d3d12_renderer_get_atlas_cap(struct comp_d3d12_renderer *renderer, uint32_t *out_cap_width, uint32_t *out_cap_height);
+
+/*!
  * Resize the renderer's atlas texture to match a new view size.
  *
  * Recreates the atlas texture, RTV, and SRV at the new dimensions.

@@ -4634,6 +4634,27 @@ comp_d3d12_renderer_set_tile_layout(struct comp_d3d12_renderer *renderer,
 	// Only update tile layout — the app always renders the same atlas.
 	renderer->tile_columns = tile_columns;
 	renderer->tile_rows = tile_rows;
+
+	/*
+	 * A legacy renderer's view size is fixed, so nothing else resizes it (the
+	 * compositor's per-frame view-size sync skips legacy sessions), but its
+	 * grid follows the mode. A legacy session that began in the 1x1 2D mode
+	 * was allocated for ONE compromise-scale view; the V switch to a 2x1 mode
+	 * doubles the content, which then no longer fits: the right view draws
+	 * outside the allocation and the DP crop reads past it. Grow here, with
+	 * the unchanged view size, to the extent a session that began in that mode
+	 * has (create_atlas_texture's high-water grow, within the cap). An
+	 * external (deposit) atlas is sized by the compositor, which already grows
+	 * its ring to the frame's content, so it is left alone.
+	 */
+	if (u_tiling_tile_layout_needs_atlas_grow(renderer->legacy_app_tile_scaling,
+	                                          renderer->atlas_texture != nullptr && !renderer->external_atlas,
+	                                          tile_columns, tile_rows, renderer->view_width,
+	                                          renderer->view_height, renderer->atlas_alloc_width,
+	                                          renderer->atlas_alloc_height)) {
+		(void)comp_d3d12_renderer_resize(renderer, renderer->view_width, renderer->view_height,
+		                                 renderer->texture_height);
+	}
 }
 
 extern "C" void
@@ -4706,6 +4727,13 @@ comp_d3d12_renderer_set_atlas_cap(struct comp_d3d12_renderer *renderer, uint32_t
 		renderer->atlas_cap_width = cap_width;
 		renderer->atlas_cap_height = cap_height;
 	}
+}
+
+extern "C" void
+comp_d3d12_renderer_get_atlas_cap(struct comp_d3d12_renderer *renderer, uint32_t *out_cap_width, uint32_t *out_cap_height)
+{
+	*out_cap_width = renderer != nullptr ? renderer->atlas_cap_width : 0;
+	*out_cap_height = renderer != nullptr ? renderer->atlas_cap_height : 0;
 }
 
 extern "C" xrt_result_t

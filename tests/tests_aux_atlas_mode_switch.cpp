@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  The in-process D3D11 renderer atlas across a 2D <-> 3D switch.
+ * @brief  The in-process renderer atlas across a 2D <-> 3D switch.
  *
  * Field log (hosted D3D11 sessions on a hybrid-GPU laptop, runtime v2.70.0):
  *
@@ -13,9 +13,12 @@
  *     1920x2160 allocation, and the cross-adapter bridge refuses every frame:
  *     "the copy box is 3840x2160 but the source is 1920x2160".
  *
- * The decision the renderer now takes on every tile-layout change is header
- * arithmetic, so it is pinned here on the host: does the allocation still hold
- * the content, and how far does the grow go.
+ * The decision the renderers take on every tile-layout change is
+ * u_tiling_tile_layout_needs_atlas_grow — the very function
+ * comp_d3d11_renderer_set_tile_layout, comp_d3d12_renderer_set_tile_layout and
+ * the vk_native per-frame mode sync call — so it is pinned here on the host,
+ * together with how far the grow then goes (u_tiling_grow_atlas_extent, the
+ * D3D11 / D3D12 renderers' allocation rule).
  */
 
 #include "catch_amalgamated.hpp"
@@ -24,9 +27,9 @@
 
 namespace {
 
-//! The renderer's allocation after a tile-layout change, as
-//! comp_d3d11_renderer_set_tile_layout + comp_d3d11_renderer_resize decide it
-//! for a renderer with a FIXED view size (a legacy session).
+//! The renderer's allocation after a tile-layout change for a renderer with a
+//! FIXED view size (a legacy session): the shipped decision, then the
+//! renderer's own grow rule when it says so.
 struct alloc
 {
 	uint32_t w, h;
@@ -35,7 +38,7 @@ struct alloc
 alloc
 legacy_alloc_after_tiles(alloc cur, uint32_t cols, uint32_t rows, uint32_t vw, uint32_t vh, alloc cap)
 {
-	if (u_tiling_atlas_alloc_holds(cols, rows, vw, vh, cur.w, cur.h)) {
+	if (!u_tiling_tile_layout_needs_atlas_grow(true, true, cols, rows, vw, vh, cur.w, cur.h)) {
 		return cur;
 	}
 	return {u_tiling_grow_atlas_extent(cur.w, cols * vw, cap.w), u_tiling_grow_atlas_extent(cur.h, rows * vh, cap.h)};
@@ -61,6 +64,25 @@ TEST_CASE("holds: an empty allocation holds nothing", "[tiling][atlas_mode_switc
 TEST_CASE("holds: no overflow on large grids", "[tiling][atlas_mode_switch]")
 {
 	CHECK_FALSE(u_tiling_atlas_alloc_holds(0x10000u, 1, 0x10000u, 1, 0xFFFFFFFFu, 1));
+}
+
+TEST_CASE("grow decision: only a fixed-view-size renderer that owns its atlas, only when it no longer holds",
+          "[tiling][atlas_mode_switch][legacy]")
+{
+	// The field case: 1x1 -> 2x1 at a fixed 1920x2160 view in a 1920x2160 allocation.
+	CHECK(u_tiling_tile_layout_needs_atlas_grow(true, true, 2, 1, 1920, 2160, 1920, 2160));
+	// An extension renderer resizes through its per-frame view sync instead.
+	CHECK_FALSE(u_tiling_tile_layout_needs_atlas_grow(false, true, 2, 1, 1920, 2160, 1920, 2160));
+	// No atlas yet, or one borrowed from a deposit ring the compositor sizes.
+	CHECK_FALSE(u_tiling_tile_layout_needs_atlas_grow(true, false, 2, 1, 1920, 2160, 1920, 2160));
+	// Still holds (3D -> 2D, or a session that started in 3D).
+	CHECK_FALSE(u_tiling_tile_layout_needs_atlas_grow(true, true, 1, 1, 1920, 2160, 3840, 2160));
+	CHECK_FALSE(u_tiling_tile_layout_needs_atlas_grow(true, true, 2, 1, 1920, 2160, 3840, 2160));
+	// A 2-row kind outgrows the height alone.
+	CHECK(u_tiling_tile_layout_needs_atlas_grow(true, true, 2, 2, 1920, 1080, 3840, 1080));
+	// A degenerate grid is never a reason to reallocate.
+	CHECK_FALSE(u_tiling_tile_layout_needs_atlas_grow(true, true, 0, 1, 1920, 2160, 1920, 2160));
+	CHECK_FALSE(u_tiling_tile_layout_needs_atlas_grow(true, true, 2, 0, 1920, 2160, 1920, 2160));
 }
 
 TEST_CASE("legacy session started in 2D: V to the 2x1 mode grows the atlas to the 3D size",
@@ -191,4 +213,68 @@ TEST_CASE("cap: unknown cap or grid leaves the view alone; never 0", "[tiling][a
 	v = 100;
 	CHECK(u_tiling_clamp_view_to_atlas_cap(8, 4, &v));
 	CHECK(v == 1);
+}
+
+/*
+ * 3. The cap the clamp above uses must follow the table. A display-info
+ *    refresh (hotplug, a larger panel) recomputes the per-mode view sizes; a
+ *    cap left at its create-time value would clamp a legitimately larger mode
+ *    and silently reduce the session's content. u_tiling_follow_atlas_cap is
+ *    what the D3D11 and D3D12 compositors call at the frame's single read.
+ */
+TEST_CASE("cap follow: a refreshed, larger table moves the cap and the larger mode is not clamped",
+          "[tiling][atlas_mode_switch][cap]")
+{
+	// Created against a 3840x2160 panel.
+	xrt_rendering_mode modes[2] = {mode(1, 1, 1, 3840, 2160), mode(2, 2, 1, 1920, 1080)};
+	uint32_t cap_w = 0, cap_h = 0;
+	REQUIRE(u_tiling_follow_atlas_cap(modes, 2, &cap_w, &cap_h));
+	REQUIRE(cap_w == 3840);
+	REQUIRE(cap_h == 2160);
+	// Same table: nothing to do.
+	CHECK_FALSE(u_tiling_follow_atlas_cap(modes, 2, &cap_w, &cap_h));
+
+	// Refreshed for a 7680x4320 panel.
+	modes[0] = mode(1, 1, 1, 7680, 4320);
+	modes[1] = mode(2, 2, 1, 3840, 2160);
+
+	// Against the stale cap the new 2D mode would be halved...
+	uint32_t stale_vw = 7680;
+	CHECK(u_tiling_clamp_view_to_atlas_cap(1, cap_w, &stale_vw));
+	CHECK(stale_vw == 3840);
+
+	// ...after following the table it is left alone, on both modes.
+	CHECK(u_tiling_follow_atlas_cap(modes, 2, &cap_w, &cap_h));
+	CHECK(cap_w == 7680);
+	CHECK(cap_h == 4320);
+	for (const xrt_rendering_mode &m : modes) {
+		uint32_t vw = m.view_width_pixels, vh = m.view_height_pixels;
+		CHECK_FALSE(u_tiling_clamp_view_to_atlas_cap(m.tile_columns, cap_w, &vw));
+		CHECK_FALSE(u_tiling_clamp_view_to_atlas_cap(m.tile_rows, cap_h, &vh));
+	}
+	// The impossible mixed pair is still stopped against the new cap.
+	uint32_t torn = 7680; // the 2D view on the 2x1 grid
+	CHECK(u_tiling_clamp_view_to_atlas_cap(2, cap_w, &torn));
+	CHECK(torn == 3840);
+}
+
+TEST_CASE("cap follow: a smaller table follows down; an empty table keeps the held cap",
+          "[tiling][atlas_mode_switch][cap]")
+{
+	xrt_rendering_mode modes[2] = {mode(1, 1, 1, 1920, 1080), mode(2, 2, 1, 960, 540)};
+	uint32_t cap_w = 3840, cap_h = 2160;
+	CHECK(u_tiling_follow_atlas_cap(modes, 2, &cap_w, &cap_h));
+	CHECK(cap_w == 1920);
+	CHECK(cap_h == 1080);
+	// ...and each mode's own view on its own grid still fits it exactly.
+	for (const xrt_rendering_mode &m : modes) {
+		CHECK(m.tile_columns * m.view_width_pixels <= cap_w);
+		CHECK(m.tile_rows * m.view_height_pixels <= cap_h);
+	}
+
+	xrt_rendering_mode empty[1] = {};
+	CHECK_FALSE(u_tiling_follow_atlas_cap(empty, 1, &cap_w, &cap_h));
+	CHECK_FALSE(u_tiling_follow_atlas_cap(nullptr, 0, &cap_w, &cap_h));
+	CHECK(cap_w == 1920);
+	CHECK(cap_h == 1080);
 }
