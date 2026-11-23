@@ -54,7 +54,11 @@ public sealed record PerfState(string UserFile, string UserWritten, IReadOnlyLis
 }
 
 public sealed record InfoPlugin(string Id, string Name, string Version, string LoadResult, string PlatformState,
-                                string Hint, string Reason, bool Fallback, int ProbeOrder);
+                                string Hint, string Reason, bool Fallback, int ProbeOrder)
+{
+    /// <summary>The plug-in's platform update notice (ADR-045 Amendment 2026-11-22).</summary>
+    public PlatformRemedy Remedy { get; init; } = PlatformRemedy.None;
+}
 
 public sealed record InfoResult(
     string Description, string GitTag, int PluginAbi, bool ActiveRuntimeQueried, bool ActiveRuntimeSet,
@@ -108,7 +112,7 @@ public sealed record InfoResult(
                 root.Arr("plugins").Where(p => p.ValueKind == JsonValueKind.Object).Select(p => new InfoPlugin(
                     p.Str("id"), p.Str("display_name"), p.Str("version"), p.Str("load_result"),
                     p.Str("platform_state", "UNKNOWN"), p.Str("hint"), p.Str("reason"), p.Bool("fallback"),
-                    p.Int("probe_order"))).ToArray(),
+                    p.Int("probe_order")) { Remedy = PlatformRemedy.Read(p) }).ToArray(),
                 gpu, perf) { Components = InfoComponents.Read(root) };
             return true;
         }

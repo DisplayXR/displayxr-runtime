@@ -38,6 +38,7 @@
 #include <stdbool.h>
 
 #include "xrt/xrt_plugin.h"
+#include "xrt/xrt_display_status.h" // struct xrt_status_platform_remedy
 
 // The class-agnostic half (ADR-054 N2): the manifest-kind router, the
 // Android file-name parse, the #328 core-DLL pin and the POSIX discovery
@@ -317,6 +318,9 @@ struct target_plugin_status
 	uint32_t platform_flags;
 	//! Vendor-written hint, shown verbatim.
 	char hint[XRT_PLUGIN_PLATFORM_HINT_MAX];
+	//! Platform remedy (update notice), sanitised; all-empty when none
+	//! (ADR-045 Amendment 2026-11-22). Advisory: nothing acts on it.
+	struct xrt_status_platform_remedy remedy;
 	//! Loader-written detail for a failure (ABI text, dlerror, ...); "" if none.
 	char reason[160];
 	//! A FALLBACK plug-in (same rule as @ref target_plugin_iface_is_fallback).
@@ -371,6 +375,36 @@ target_plugin_platform_state_str(uint32_t state);
  */
 bool
 target_plugin_query_active_platform_state(struct xrt_plugin_platform_status *out);
+
+/*!
+ * Ask @p iface for its platform state through the struct_size-gated optional
+ * slot (the loader's own query, exposed for tests). Sets `struct_size` to this
+ * runtime's size and zero-fills before the call; afterwards forces every
+ * string NUL-terminated and maps an unknown state to UNKNOWN. Returns false
+ * (and an all-zero UNKNOWN record) when the plug-in does not report.
+ */
+bool
+target_plugin_query_iface_platform_state(const struct xrt_plugin_iface *iface, struct xrt_plugin_platform_status *out);
+
+/*!
+ * ADR-045 Amendment 2026-11-22: the platform remedy @p ps carries, sanitised
+ * into @p out (always fully written; all-empty when there is no remedy):
+ * only the two `XRT_PLUGIN_PLATFORM_FLAG_UPDATE_*` bits count, every string is
+ * copied bounded and NUL-terminated, and an `action_url` that fails
+ * @ref target_plugin_remedy_url_ok is dropped (logged at DEBUG). Strings are
+ * kept only while a remedy bit is set. Returns true when a remedy bit is set.
+ */
+bool
+target_plugin_platform_remedy_from_status(const struct xrt_plugin_platform_status *ps,
+                                          struct xrt_status_platform_remedy *out);
+
+/*!
+ * The URL rule for a remedy's `action_url`: an absolute `https://` URL with a
+ * host, no spaces, quotes, backslashes, angle brackets or control characters.
+ * The scheme compares case-insensitively.
+ */
+bool
+target_plugin_remedy_url_ok(const char *url);
 
 /*!
  * Is @p iface a FALLBACK plug-in (ADR-045 D3)? True when it reports

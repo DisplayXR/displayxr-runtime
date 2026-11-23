@@ -244,6 +244,10 @@ endif()
 # policy in the loader, so it needs target_lists like the test above.
 if(TARGET target_lists)
 	list(APPEND tests tests_target_backcompat_claim)
+	# ADR-045 Amendment 2026-11-22 -- the platform remedy: the loader's
+	# struct_size-gated query + sanitiser (old plug-in, NUL forcing, https-only
+	# URL) and the one human line / JSON keys every surface prints.
+	list(APPEND tests tests_plugin_platform_remedy)
 endif()
 # Display dashboard phase 8 -- workspace-controller launch settings: the hotkey
 # grammar, service.json's `controllers` map, the active-controller selection
@@ -901,6 +905,9 @@ if(TARGET tests_conv_snapshot)
 endif()
 if(TARGET tests_target_backcompat_claim)
 	target_link_libraries(tests_target_backcompat_claim PRIVATE target_lists xrt-interfaces aux_os)
+endif()
+if(TARGET tests_plugin_platform_remedy)
+	target_link_libraries(tests_plugin_platform_remedy PRIVATE target_lists xrt-interfaces aux_os)
 endif()
 
 # #1380 rig composer -- the head device's pose source. Compiled straight into

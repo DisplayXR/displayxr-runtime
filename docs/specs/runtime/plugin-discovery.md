@@ -1023,6 +1023,14 @@ Every plug-in therefore MUST:
    marks a plug-in that claims any system (the in-tree sim-display); vendor
    plug-ins MUST NOT set it.
 
+   **Platform remedy** (ADR-045 Amendment 1, `XRT_PLUGIN_HAS_PLATFORM_REMEDY`):
+   `XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED` / `_UPDATE_REQUIRED` plus
+   `installed_version`, `required_version`, `action_label` and an `https://`
+   `action_url`, appended after `reserved` and written only when
+   `XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, field)`. Advisory: shown by the
+   cli, tray and Dashboard, never acted on. A platform too old to run reports
+   `INCOMPATIBLE` as well.
+
    Call sequence: **load → negotiate → `get_platform_state` → `probe`**.
    The slot takes no instance, is thread-safe, and may also be called at any
    time after selection (diagnostics poll it while the plug-in is active).
@@ -1373,6 +1381,7 @@ The runtime emits these one-shot lines at instance creation, all at
 | `plugin loader:   <id> disabled (Enabled=0, user\|machine\|manifest; ProbeOrder=<n>) — never tried.`                  | WARN once per process per id (INFO on later scans) — `DISABLED` (N3b, §2.1 / §3.1).                      |
 | `plugin loader: PreferredPlugin '<id>' is disabled (Enabled=0, …) — falling through to ProbeOrder.`                  | WARN once — the preferred plug-in is disabled; `Enabled=0` is the stronger verb (N3b).                    |
 | `plugin loader:   <id>: platform state <STATE>[ — <hint>]`                                                           | WARN on change — what `get_platform_state` reported, before `probe()` (ADR-045).                          |
+| `plugin loader:   <id>: platform update <required\|recommended>[ <installed>][ -> <required>]`                       | WARN on change — the platform remedy (ADR-045 Amendment 1). Advisory; nothing re-routes.                  |
 | `plug-in adoption: '<old>' -> '<new>' — weaving DP and display info follow now; …`                                   | WARN — a refresh adopted a better plug-in under the fallback's head device (service).                     |
 | `plug-in adoption: no client connected — restarting the service so the head device follows '<id>'.`                 | WARN — the adoption restart (Windows service).                                                            |
 

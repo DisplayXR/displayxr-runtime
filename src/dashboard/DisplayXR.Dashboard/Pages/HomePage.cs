@@ -8,6 +8,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
+using DisplayXR.Dashboard.Feed;
 using DisplayXR.Dashboard.Model;
 using DisplayXR.Dashboard.Ui;
 
@@ -176,8 +177,10 @@ public sealed class HomePage : Page
             if (StatusText.PlainPlatform(p.PlatformState) is { } plat)
                 U.AddFlow(chips, U.Chip(plat, StatusText.PluginLevel(p) is Level.Ok or Level.Plain ? Level.Plain : StatusText.PluginLevel(p)), 6, 4);
             if (p.Fallback) U.AddFlow(chips, U.Chip("Used when no other driver fits"), 6, 4);
+            if (StatusText.RemedyChip(p.Remedy) is { } upd) U.AddFlow(chips, U.Chip(upd.Text, upd.Level), 6, 4);
             var col = U.VStack(2, head, chips);
             if (p.Hint.Length > 0) col.Children.Add(U.Wrapped(p.Hint, "soft"));
+            if (RemedyNotice(p.Remedy) is { } notice) col.Children.Add(notice);
             var g = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*") };
             g.Children.Add(dot);
             Grid.SetColumn(col, 1);
@@ -186,6 +189,31 @@ public sealed class HomePage : Page
         }
         body.Children.Add(list);
         return U.Card(body);
+    }
+
+    /// <summary>
+    /// ADR-045 Amendment 2026-11-22: a display driver's platform update notice — the versions it
+    /// reported and, when it gave an https page, a button that opens it. Null when there is none.
+    /// </summary>
+    private Control? RemedyNotice(PlatformRemedy r)
+    {
+        if (StatusText.RemedyLine(r) is not { } text) return null;
+        var box = U.VStack(6, U.Wrapped(text, "soft"));
+        if (r.Url is { } url)
+        {
+            var label = r.ActionLabel.Length > 0 ? r.ActionLabel : "Get the update";
+            var b = U.Button(label, () => { if (!UrlLauncher.Open(url)) Ctx.Toast("Could not open the browser"); },
+                             "outline", "sm");
+            if (SafeUrl.TryHttps(url, out var u)) ToolTip.SetTip(b, $"Opens {u!.Host} in your browser");
+            b.HorizontalAlignment = HorizontalAlignment.Left;
+            box.Children.Add(b);
+        }
+        else if (r.ActionLabel.Length > 0)
+        {
+            box.Children.Add(U.Wrapped(r.ActionLabel, "soft"));
+        }
+        box.Margin = new Thickness(0, 4, 0, 0);
+        return box;
     }
 
     private Control GpuCard()

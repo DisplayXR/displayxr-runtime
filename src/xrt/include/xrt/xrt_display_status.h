@@ -256,6 +256,23 @@ struct xrt_status_licence
 };
 
 /*!
+ * A plug-in's platform remedy (ADR-045 Amendment 2026-11-22): the update
+ * notice its `get_platform_state` reported, sanitised by the loader. Advisory:
+ * nothing in the runtime acts on it beyond showing it. Strings are the
+ * plug-in's own, verbatim; "" = absent. Sizes match the
+ * `XRT_PLUGIN_PLATFORM_*_MAX` of `xrt/xrt_plugin.h` (asserted in the loader).
+ */
+struct xrt_status_platform_remedy
+{
+	bool update_recommended;    //!< XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED.
+	bool update_required;       //!< XRT_PLUGIN_PLATFORM_FLAG_UPDATE_REQUIRED.
+	char installed_version[32]; //!< Platform version installed now.
+	char required_version[32];  //!< Version the update brings / the minimum needed.
+	char action_label[64];      //!< e.g. "Download the update".
+	char action_url[256];       //!< https:// only (anything else is dropped by the loader).
+};
+
+/*!
  * One registered display plug-in (ADR-045 record + registration).
  */
 struct xrt_status_plugin
@@ -271,6 +288,7 @@ struct xrt_status_plugin
 	bool active;                       //!< The active plug-in of the process that built the snapshot.
 	uint32_t probe_order;              //!< ProbeOrder (lower wins).
 	struct xrt_status_licence licence; //!< Its licence state at the last load attempt (ADR-054 N5).
+	struct xrt_status_platform_remedy remedy; //!< Update notice, if any (ADR-045 Amendment 2026-11-22).
 };
 
 //! EDID identity of a screen.

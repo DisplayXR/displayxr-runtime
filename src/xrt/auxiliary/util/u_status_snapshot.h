@@ -214,6 +214,28 @@ void
 u_status_license_add_cjson(cJSON *row, const struct xrt_component_license_state *lic);
 
 /*!
+ * ADR-045 Amendment 2026-11-22: add a plug-in's platform remedy to @p row as
+ * flat keys `update_recommended`, `update_required` (bools) and
+ * `installed_version`, `required_version`, `action_label`, `action_url`
+ * (strings, "" = absent). Always added, so a consumer never has to test for
+ * the keys; all false / "" when the plug-in reports no remedy.
+ */
+void
+u_status_remedy_add_cjson(cJSON *row, const struct xrt_status_platform_remedy *r);
+
+/*!
+ * ADR-045 Amendment 2026-11-22: the one human line for a platform remedy,
+ * vendor-neutral, the plug-in's strings verbatim and empty parts omitted:
+ *   `Update required: 1.2.0 -> 1.4.0. Download the update: https://...`
+ *   `Update recommended: 1.4.0.` (no installed version, no action)
+ *   `Update recommended. https://...` (URL without a label)
+ * REQUIRED wins when both bits are set. Returns false (and "") when there is
+ * no remedy.
+ */
+bool
+u_status_remedy_format(const struct xrt_status_platform_remedy *r, char *out, size_t cap);
+
+/*!
  * ADR-053: one conversion task row as a JSON object (the `conv_tasks[]` element).
  * @p providers / @p provider_count resolve the row's provider index to its id.
  */

@@ -493,6 +493,7 @@ status_finish(const char *id, enum target_plugin_load_result result, uint32_t os
 			s->platform_state = XRT_PLUGIN_PLATFORM_STATE_UNKNOWN;
 			s->platform_flags = 0;
 			s->hint[0] = '\0';
+			memset(&s->remedy, 0, sizeof(s->remedy));
 		}
 	}
 	status_unlock();
@@ -516,6 +517,96 @@ status_set_active(const char *id)
 	status_unlock();
 }
 
+// The snapshot's remedy strings are sized from the plug-in header's maxima.
+_Static_assert(sizeof(((struct xrt_status_platform_remedy *)0)->installed_version) == XRT_PLUGIN_PLATFORM_VERSION_MAX,
+               "xrt_status_platform_remedy::installed_version != XRT_PLUGIN_PLATFORM_VERSION_MAX");
+_Static_assert(sizeof(((struct xrt_status_platform_remedy *)0)->required_version) == XRT_PLUGIN_PLATFORM_VERSION_MAX,
+               "xrt_status_platform_remedy::required_version != XRT_PLUGIN_PLATFORM_VERSION_MAX");
+_Static_assert(sizeof(((struct xrt_status_platform_remedy *)0)->action_label) == XRT_PLUGIN_PLATFORM_ACTION_LABEL_MAX,
+               "xrt_status_platform_remedy::action_label != XRT_PLUGIN_PLATFORM_ACTION_LABEL_MAX");
+_Static_assert(sizeof(((struct xrt_status_platform_remedy *)0)->action_url) == XRT_PLUGIN_PLATFORM_ACTION_URL_MAX,
+               "xrt_status_platform_remedy::action_url != XRT_PLUGIN_PLATFORM_ACTION_URL_MAX");
+
+bool
+target_plugin_remedy_url_ok(const char *url)
+{
+	static const char scheme[] = "https://";
+	if (url == NULL) {
+		return false;
+	}
+	for (size_t i = 0; i < sizeof(scheme) - 1; i++) {
+		char c = url[i];
+		if (c >= 'A' && c <= 'Z') {
+			c = (char)(c - 'A' + 'a');
+		}
+		if (c != scheme[i]) {
+			return false;
+		}
+	}
+	const char *host = url + sizeof(scheme) - 1;
+	if (host[0] == '\0' || host[0] == '/' || host[0] == ':' || host[0] == '?' || host[0] == '#') {
+		return false; // no host
+	}
+	for (const unsigned char *c = (const unsigned char *)url; *c != '\0'; c++) {
+		if (*c <= 0x20 || *c == 0x7f || *c == '"' || *c == '\'' || *c == '`' || *c == '<' || *c == '>' ||
+		    *c == '\\') {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Bounded copy of a plug-in-written field that may lack its NUL.
+static void
+remedy_copy(char *dst, size_t dst_cap, const char *src, size_t src_cap)
+{
+	size_t n = 0;
+	while (n < src_cap && n + 1 < dst_cap && src[n] != '\0') {
+		n++;
+	}
+	memcpy(dst, src, n);
+	dst[n] = '\0';
+}
+
+bool
+target_plugin_platform_remedy_from_status(const struct xrt_plugin_platform_status *ps,
+                                          struct xrt_status_platform_remedy *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (ps == NULL) {
+		return false;
+	}
+	out->update_recommended = (ps->flags & XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED) != 0;
+	out->update_required = (ps->flags & XRT_PLUGIN_PLATFORM_FLAG_UPDATE_REQUIRED) != 0;
+	if (!out->update_recommended && !out->update_required) {
+		return false;
+	}
+	remedy_copy(out->installed_version, sizeof(out->installed_version), ps->installed_version,
+	            sizeof(ps->installed_version));
+	remedy_copy(out->required_version, sizeof(out->required_version), ps->required_version,
+	            sizeof(ps->required_version));
+	remedy_copy(out->action_label, sizeof(out->action_label), ps->action_label, sizeof(ps->action_label));
+	remedy_copy(out->action_url, sizeof(out->action_url), ps->action_url, sizeof(ps->action_url));
+	if (out->action_url[0] != '\0' && !target_plugin_remedy_url_ok(out->action_url)) {
+		U_LOG_D("plugin loader: platform remedy action_url dropped (only an absolute https:// URL is shown)");
+		out->action_url[0] = '\0';
+	}
+	return true;
+}
+
+//! Same notice (so the load path logs a remedy once per change, not per re-probe).
+static bool
+remedy_equal(const struct xrt_status_platform_remedy *a, const struct xrt_status_platform_remedy *b)
+{
+	return a->update_recommended == b->update_recommended && a->update_required == b->update_required &&
+	       strcmp(a->installed_version, b->installed_version) == 0 &&
+	       strcmp(a->required_version, b->required_version) == 0 && strcmp(a->action_label, b->action_label) == 0 &&
+	       strcmp(a->action_url, b->action_url) == 0;
+}
+
 /*!
  * Ask @p iface for its platform state through the struct_size-gated optional
  * slot. Always fills @p out (UNKNOWN when not reported).
@@ -537,6 +628,10 @@ query_platform_state(const struct xrt_plugin_iface *iface, struct xrt_plugin_pla
 		return false;
 	}
 	out->hint[sizeof(out->hint) - 1] = '\0';
+	out->installed_version[sizeof(out->installed_version) - 1] = '\0';
+	out->required_version[sizeof(out->required_version) - 1] = '\0';
+	out->action_label[sizeof(out->action_label) - 1] = '\0';
+	out->action_url[sizeof(out->action_url) - 1] = '\0';
 	if (out->state > XRT_PLUGIN_PLATFORM_STATE_INCOMPATIBLE) {
 		out->state = XRT_PLUGIN_PLATFORM_STATE_UNKNOWN;
 	}
@@ -553,7 +648,10 @@ status_record_platform_state(const char *id, const struct xrt_plugin_iface *ifac
 {
 	struct xrt_plugin_platform_status ps;
 	bool reported = query_platform_state(iface, &ps);
+	struct xrt_status_platform_remedy remedy;
+	bool has_remedy = target_plugin_platform_remedy_from_status(&ps, &remedy);
 	bool changed = false;
+	bool remedy_changed = false;
 	// The DP factories the iface offers (plain struct fields — no call, so
 	// valid before probe() and for a plug-in that is about to decline).
 	uint32_t apis = 0;
@@ -570,14 +668,23 @@ status_record_platform_state(const char *id, const struct xrt_plugin_iface *ifac
 		struct target_plugin_status *s = &g_status[i];
 		s->dp_apis = apis;
 		changed = s->platform_state != ps.state || strcmp(s->hint, ps.hint) != 0;
+		remedy_changed = !remedy_equal(&s->remedy, &remedy);
 		s->platform_state = ps.state;
 		s->platform_flags = ps.flags;
 		snprintf(s->hint, sizeof(s->hint), "%s", ps.hint);
+		s->remedy = remedy;
 	}
 	status_unlock();
 	if (reported && changed) {
 		U_LOG_W("plugin loader:   %s: platform state %s%s%s", id != NULL ? id : "?",
 		        target_plugin_platform_state_str(ps.state), ps.hint[0] != '\0' ? " — " : "", ps.hint);
+	}
+	if (reported && has_remedy && remedy_changed) {
+		// Advisory (ADR-045 Amendment 2026-11-22): logged once per change, acted on never.
+		U_LOG_W("plugin loader:   %s: platform update %s%s%s%s%s", id != NULL ? id : "?",
+		        remedy.update_required ? "required" : "recommended",
+		        remedy.installed_version[0] != '\0' ? " " : "", remedy.installed_version,
+		        remedy.required_version[0] != '\0' ? " -> " : "", remedy.required_version);
 	}
 }
 
@@ -656,6 +763,15 @@ target_plugin_iface_is_fallback(const struct xrt_plugin_iface *iface)
 }
 
 bool
+target_plugin_query_iface_platform_state(const struct xrt_plugin_iface *iface, struct xrt_plugin_platform_status *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	return query_platform_state(iface, out);
+}
+
+bool
 target_plugin_query_active_platform_state(struct xrt_plugin_platform_status *out)
 {
 	if (out == NULL) {
@@ -683,6 +799,7 @@ target_plugin_get_status(struct target_plugin_status *out, int max)
 			out[i].platform_state = live.state;
 			out[i].platform_flags = live.flags;
 			snprintf(out[i].hint, sizeof(out[i].hint), "%s", live.hint);
+			(void)target_plugin_platform_remedy_from_status(&live, &out[i].remedy);
 		}
 		out[i].fallback = (out[i].platform_flags & XRT_PLUGIN_PLATFORM_FLAG_FALLBACK) != 0 ||
 		                  (out[i].platform_state == XRT_PLUGIN_PLATFORM_STATE_UNKNOWN &&

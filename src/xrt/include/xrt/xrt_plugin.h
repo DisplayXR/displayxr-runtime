@@ -438,16 +438,48 @@ enum xrt_plugin_platform_state
  * MUST NOT set it.
  */
 #define XRT_PLUGIN_PLATFORM_FLAG_FALLBACK (1u << 0)
+/*!
+ * Platform remedy (ADR-045 Amendment 2026-11-22): the vendor platform works,
+ * but an update is available and recommended. ADVISORY ONLY — the runtime
+ * shows a notice (cli, tray, Dashboard) and changes nothing else: loading,
+ * selection and the self-test verdict are exactly as without the bit.
+ */
+#define XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED (1u << 1)
+/*!
+ * Platform remedy (ADR-045 Amendment 2026-11-22): the vendor platform needs
+ * an update. Informational too: the runtime shows a stronger notice and
+ * NEVER gates loading or selection on it. A plug-in that genuinely cannot run
+ * must ALSO report a non-READY @ref xrt_plugin_platform_state (typically
+ * @ref XRT_PLUGIN_PLATFORM_STATE_INCOMPATIBLE) and decline its probe — the
+ * state, not this bit, is what the runtime acts on. When both remedy bits
+ * are set, REQUIRED wins.
+ */
+#define XRT_PLUGIN_PLATFORM_FLAG_UPDATE_REQUIRED (1u << 2)
 /*! @} */
 
 /*! Size of @ref xrt_plugin_platform_status::hint, including the NUL. */
 #define XRT_PLUGIN_PLATFORM_HINT_MAX 128
+/*! Size of @ref xrt_plugin_platform_status::installed_version and
+ *  ::required_version, including the NUL. */
+#define XRT_PLUGIN_PLATFORM_VERSION_MAX 32
+/*! Size of @ref xrt_plugin_platform_status::action_label, including the NUL. */
+#define XRT_PLUGIN_PLATFORM_ACTION_LABEL_MAX 64
+/*! Size of @ref xrt_plugin_platform_status::action_url, including the NUL. */
+#define XRT_PLUGIN_PLATFORM_ACTION_URL_MAX 256
 
 /*!
  * Out-param of `xrt_plugin_iface::get_platform_state`. The runtime sets
  * @ref struct_size and zero-fills the rest before the call; the plug-in
- * MUST NOT write past `struct_size`. Grows by consuming @ref reserved
- * (append-only; no ABI bump).
+ * MUST NOT write past `struct_size`. Grows append-only — by consuming
+ * @ref reserved or by appending after it, every addition gated by
+ * `struct_size` — with no ABI bump.
+ *
+ * The platform-remedy fields after @ref reserved (ADR-045 Amendment
+ * 2026-11-22) are such an append. A plug-in writes one only when
+ * `XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, field)` is true, so an older
+ * runtime that passes the pre-amendment size never has them written; a
+ * newer runtime reads them as empty from a plug-in that predates them,
+ * because it zero-filled them.
  */
 struct xrt_plugin_platform_status
 {
@@ -473,7 +505,43 @@ struct xrt_plugin_platform_status
 
 	/*! Reserved for future fields. Plug-ins MUST leave these 0. */
 	uint64_t reserved[8];
+
+	/*
+	 * Platform remedy (ADR-045 Amendment 2026-11-22). Appended after
+	 * @ref reserved: each is present only when `struct_size` covers it
+	 * (`XRT_PLUGIN_PLATFORM_STATUS_HAS`). All UTF-8, NUL-terminated,
+	 * truncated to fit; empty = absent. Vendor-written, shown verbatim by
+	 * the runtime's diagnostics, never parsed. Meaningful together with
+	 * @ref XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED /
+	 * @ref XRT_PLUGIN_PLATFORM_FLAG_UPDATE_REQUIRED.
+	 */
+
+	/*! The vendor platform version installed now, e.g. "1.34.2". */
+	char installed_version[XRT_PLUGIN_PLATFORM_VERSION_MAX];
+
+	/*! The version the update brings (or the minimum the plug-in needs). */
+	char required_version[XRT_PLUGIN_PLATFORM_VERSION_MAX];
+
+	/*! Short label for the action, e.g. "Download the update". */
+	char action_label[XRT_PLUGIN_PLATFORM_ACTION_LABEL_MAX];
+
+	/*!
+	 * Where the user gets the update. MUST be an absolute `https://` URL;
+	 * the runtime drops anything else (and anything with spaces, quotes or
+	 * control characters) and shows the notice without a link.
+	 */
+	char action_url[XRT_PLUGIN_PLATFORM_ACTION_URL_MAX];
 };
+
+/*!
+ * True when the runtime-provided @p status (a `struct
+ * xrt_plugin_platform_status *`) has room for @p field — i.e. the runtime
+ * that set `struct_size` knows that field. A plug-in MUST check this before
+ * writing any field appended after @ref xrt_plugin_platform_status::reserved.
+ */
+#define XRT_PLUGIN_PLATFORM_STATUS_HAS(status, field)                                                                  \
+	((status) != NULL && (size_t)(status)->struct_size >=                                                          \
+	                         offsetof(struct xrt_plugin_platform_status, field) + sizeof((status)->field))
 
 
 /*
@@ -2067,6 +2135,17 @@ xrt_plugin_iface_has_describe_settings(const struct xrt_plugin_iface *iface)
  * implementing it.
  */
 #define XRT_PLUGIN_HAS_PLATFORM_STATE 1
+
+/*!
+ * Defined when this header carries the platform-remedy additions (ADR-045
+ * Amendment 2026-11-22): @ref XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED,
+ * @ref XRT_PLUGIN_PLATFORM_FLAG_UPDATE_REQUIRED, the
+ * @ref xrt_plugin_platform_status fields `installed_version`,
+ * `required_version`, `action_label`, `action_url`, and
+ * `XRT_PLUGIN_PLATFORM_STATUS_HAS`, so a plug-in built against an older
+ * runtime header can #ifdef-guard filling them. No ABI bump.
+ */
+#define XRT_PLUGIN_HAS_PLATFORM_REMEDY 1
 
 /*!
  * Defined when @ref xrt_plugin_iface carries the stereo camera slots
