@@ -90,7 +90,8 @@ public sealed class MainWindow : Window
             Toast = ShowToast,
         };
 
-        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new WindowsPage(), new ComponentsPage(), new PerformancePage(), new DeveloperPage() };
+        // Rail order: what an owner asks first, diagnostics last. "Running 3D apps" keeps the page id "windows" (--page windows).
+        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new ComponentsPage(), new PerformancePage(), new WindowsPage(), new DeveloperPage() };
         foreach (var p in _pages)
         {
             p.Bind(_ctx);
@@ -448,7 +449,7 @@ public sealed class MainWindow : Window
         ToolTip.SetTip(b, id switch
         {
             "displays" => $"{badge.Count} warning{(badge.Count == 1 ? "" : "s")} on the screens",
-            "windows" => $"{badge.Count} client app{(badge.Count == 1 ? "" : "s")}",
+            "windows" => $"{badge.Count} 3D app{(badge.Count == 1 ? "" : "s")} running",
             "performance" => "Non-default performance settings are in force",
             "components" => $"{badge.Count} update{(badge.Count == 1 ? "" : "s")} available",
             _ => "A display-processor override is active",
