@@ -1,0 +1,126 @@
+{
+	"schema":	1,
+	"source":	"service",
+	"generation":	{
+		"topology":	3,
+		"status":	41,
+		"conversion":	0
+	},
+	"runtime":	{
+		"version":	"2.70.0",
+		"git_tag":	"v2.70.0",
+		"plugin_abi":	5,
+		"active_openxr_runtime":	"C:\\Program Files\\DisplayXR\\Runtime\\DisplayXR_win64.json"
+	},
+	"plugins":	[{
+			"id":	"leia-sr",
+			"name":	"DisplayXR Leia SR",
+			"vendor":	"Leia Inc.",
+			"version":	"2.23.2",
+			"load":	"NOT_ATTEMPTED",
+			"platform_state":	"READY",
+			"hint":	"",
+			"fallback":	false,
+			"probe_order":	50
+		}, {
+			"id":	"sim-display",
+			"name":	"DisplayXR Sim Display",
+			"vendor":	"DisplayXR",
+			"version":	"2.70.0",
+			"load":	"ACTIVE",
+			"platform_state":	"UNKNOWN",
+			"hint":	"",
+			"fallback":	true,
+			"probe_order":	200
+		}],
+	"screens":	[{
+			"id":	"0x8c413a2f61152ce7",
+			"index":	0,
+			"device_name":	"\\\\.\\DISPLAY1",
+			"friendly_name":	"AUO B194",
+			"key":	"AUO-B194-00000000@DISPLAY1",
+			"edid":	{
+				"manufacturer":	"AUO",
+				"product":	"B194",
+				"serial":	0
+			},
+			"desktop":	{
+				"left":	0,
+				"top":	0,
+				"width":	3840,
+				"height":	2160,
+				"scale":	2.5
+			},
+			"native":	{
+				"width":	3840,
+				"height":	2160,
+				"refresh_mhz":	60000,
+				"is_native":	true
+			},
+			"physical_mm":	{
+				"width":	344,
+				"height":	194,
+				"source":	"edid"
+			},
+			"roles":	{
+				"os_main":	true,
+				"runtime_default":	true,
+				"vendor_primary":	false
+			},
+			"claim":	{
+				"plugin_id":	"sim-display",
+				"confidence":	"FALLBACK",
+				"confidence_value":	10,
+				"serial":	"",
+				"apis":	["d3d11", "d3d12", "vk", "gl"],
+				"forced":	false,
+				"preferred_plugin":	null,
+				"preferred_source":	null,
+				"apply":	"next-session"
+			},
+			"layout":	{
+				"width_m":	0.344,
+				"height_m":	0.194,
+				"nominal_viewer_m":	{
+					"x":	0,
+					"y":	0.1,
+					"z":	0.6
+				},
+				"source":	"edid"
+			},
+			"eye_tracking":	{
+				"supported":	[],
+				"default":	null,
+				"state":	"NO_DP"
+			},
+			"mode":	null,
+			"dps":	[],
+			"vendor":	{
+				"present":	false,
+				"ready":	false,
+				"verified":	false,
+				"calibrated":	false,
+				"tracker":	"UNKNOWN",
+				"lens":	"UNKNOWN",
+				"model":	"",
+				"serial":	"",
+				"worst_warning":	null,
+				"dashboard_command":	null
+			},
+			"warnings":	[]
+		}],
+	"clients":	[],
+	"workspace":	{
+		"enabled":	false,
+		"controller":	null,
+		"screens":	[]
+	},
+	"warnings":	[],
+	"conv_providers":	[],
+	"conv_tasks":	[],
+	"input_holders":	[],
+	"dp_preference":	{
+		"plugin_id":	"sim-display",
+		"source":	"user"
+	}
+}

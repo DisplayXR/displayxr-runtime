@@ -102,6 +102,14 @@ public interface IProcessSource
 
     /// <summary>Run one CLI verb to completion; <paramref name="args"/> is the argument vector, never a parsed string.</summary>
     Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel = default);
+
+    /// <summary>
+    /// The same, with <paramref name="input"/> written to the child's standard input as one line, then
+    /// stdin closed (<c>dp set &lt;id&gt; &lt;KEY&gt; --stdin</c>: a secret never goes on a command line). The
+    /// input is never logged or kept. A source that cannot write stdin fails the run without starting it.
+    /// </summary>
+    Task<CliResult> RunWithInputAsync(CliArgs args, string input, TimeSpan timeout, CancellationToken cancel = default) =>
+        Task.FromResult(new CliResult(-1, "", "", false, "This process source cannot write standard input."));
 }
 
 /// <summary>The feed's clock and thread. The app posts to the UI thread; the tests drive time by hand.</summary>

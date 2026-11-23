@@ -300,7 +300,8 @@ lines, the scope and command-line notes, the catalog detail and the removal sent
   when Home's "Try a 3D preview" or an install opens them), again after every write, and on Refresh;
   never polled. Fields used: `env_prefix`, and per entry of `settings[]`: `key`, `declared`, `type`
   (`bool` / `int` / `float` / `enum` / `string` / `secret`), `default`, `help`, `secret`, `value`,
-  `set` (secrets), `source` (`environment` / `user` / `machine` / `manifest` / `absent`). An entry
+  `set` (secrets), `source` (`environment` / `user` / `machine` / `manifest` / `absent`), `values`
+  (an enum's accepted words; interim, the CLI reads them from the help; null or absent = not listed). An entry
   that is not declared (`type: null`, a value stored for a key the driver no longer declares) or of a
   type the Dashboard does not know is left out. Only a successful read with nothing to show is "no
   options" ("This display driver has no options to set here."). A failing run (a timeout, an older CLI
@@ -308,7 +309,7 @@ lines, the scope and command-line notes, the catalog detail and the removal sent
   showed and adds one line, "Couldn't read its options.", with **Try again** (accessible name `Try
   again reading options: <driver>`); no banner. The reply to a write stays visible even when its row
   is not drawn.
-- **Write** `dp set <id> <KEY> <value>` (per user) and `dp unset <id> <KEY>` ("Use the default"),
+- **Write** `dp set <id> <KEY> <value>` (per user; a secret: `dp set <id> <KEY> --stdin`) and `dp unset <id> <KEY>` ("Use the default"),
   through the same action path as the other controls (`DashboardContext.RunOptionWriteAsync`); the
   CLI's reply, with its `note:` / `warning:` lines, shows on the row it was for. The Dashboard saves
   nothing itself, and never writes `--machine`.
@@ -319,14 +320,21 @@ lines, the scope and command-line notes, the catalog detail and the removal sent
   (`environment`: read-only, with "Set outside the Dashboard, and that value wins: a change here would
   not apply."). The key, type, default, the driver's own help and the environment variable's name are
   the label's tooltip, never the face.
-- **Controls**: an enum with known values is a drop-down; a bool a switch (on writes `1`, off `0`); an
+- **Controls**: an enum with known values is a drop-down (an enum with no friendly entry whose `values`
+  the CLI lists gets a drop-down of those raw words under More options; a friendly entry keeps its labels
+  but drops a value the CLI does not list, counting its aliases, and appends, as its raw word, one the CLI
+  lists that it does not know; with no `values`, the entry's own list); a bool a switch (on writes `1`, off `0`); an
   int, a float, a string, and an enum whose values the CLI does not list, a text box with **Apply**
   (Enter applies, and Apply acts on the press so a rebuild cannot swallow the click; a submitted edit
   ends the edit at once, `Model/OptionEdits.cs`, so the new value and the reply show without waiting
   for the focus to leave; a whole number for an int, a number with a dot for decimals for a float (a comma, as in "1,000", is refused, never rewritten), a string kept exactly as typed but not only spaces, one line, no NUL, never starting with `--`, checked before anything is written). A **secret** is never shown: *Set* / *Not
-  set*, and **Clear**; setting one is not offered, because `dp set` takes the value only as an
-  argument and a secret is never an argument here (the CLI would need an `@file` form, as `activate`
-  has).
+  set*, a masked text box with **Set** (Enter sets; accessible name `Set <label>: <driver>`), and
+  **Clear**. Set runs `dp set <id> <KEY> --stdin` and writes the value to the CLI's standard input
+  as one line (`IProcessSource.RunWithInputAsync`, `DashboardContext.RunSecretWriteAsync`): it is never
+  an argument, never kept as a draft, never logged, never in "Copy report", and the box is emptied as
+  the write starts (checked first: not empty, one line, no NUL, at most 2047 bytes). A CLI older than
+  `--stdin` answers that `set` needs a value; the row then says "This version of DisplayXR can only
+  clear this value."
 - **Friendly settings** come first, in words; every other one is under **More options (N)**,
   collapsed by default (accessible name `More options: <driver>`), with its raw key as the label.
   The friendly presentation is data, `FriendlyOptions.Table` (driver id or any driver, key, label,

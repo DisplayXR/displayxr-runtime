@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Text.Json;
+using DisplayXR.Dashboard.Feed;
 
 namespace DisplayXR.Dashboard.Model;
 
@@ -25,10 +26,12 @@ public enum SettingSource { Absent, Environment, User, Machine, Manifest }
 
 /// <summary>
 /// One declared setting. <see cref="Value"/> is null when nothing stores it (the default stands) and
-/// always for a secret, whose <see cref="IsSet"/> says whether one is stored.
+/// always for a secret, whose <see cref="IsSet"/> says whether one is stored. <see cref="Values"/>: an enum's
+/// accepted words as the CLI lists them (<c>values</c>, interim: read from the help), null when it lists none
+/// or predates the key.
 /// </summary>
 public sealed record DriverSetting(string Key, SettingType Type, string Default, string Help, string? Value, bool IsSet,
-                                   SettingSource Source)
+                                   SettingSource Source, IReadOnlyList<string>? Values = null)
 {
     /// <summary>The value in force: the stored one, else the declared default.</summary>
     public string Effective => Value ?? Default;
@@ -70,7 +73,15 @@ public sealed record DriverOptions(string Id, string EnvPrefix, IReadOnlyList<Dr
                 string? value = t == SettingType.Secret ? null : e.StrOrNull("value");
                 if (source == SettingSource.Absent) value = null;
                 bool isSet = t == SettingType.Secret ? e.Bool("set", source != SettingSource.Absent) : source != SettingSource.Absent;
-                list.Add(new DriverSetting(key, t, e.Str("default"), e.Str("help"), value, isSet, source));
+                IReadOnlyList<string>? values = null;
+                if (t == SettingType.Enum && e.TryGetProperty("values", out var va) && va.ValueKind == JsonValueKind.Array)
+                {
+                    var words = va.EnumerateArray().Where(w => w.ValueKind == JsonValueKind.String)
+                                  .Select(w => w.GetString() ?? "").Where(w => w.Length > 0)
+                                  .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                    if (words.Length > 0) values = words;
+                }
+                list.Add(new DriverSetting(key, t, e.Str("default"), e.Str("help"), value, isSet, source, values));
             }
             options = new DriverOptions(root.Str("id"), root.Str("env_prefix"), list);
             return true;
@@ -110,7 +121,7 @@ public sealed record DriverOptions(string Id, string EnvPrefix, IReadOnlyList<Dr
 /// <summary>How a setting is offered.</summary>
 public enum OptionControl
 {
-    /// <summary>A drop-down of named values (an enum whose values are known).</summary>
+    /// <summary>A drop-down of named values (an enum whose values are known: a friendly entry's, or the CLI's <c>values</c>).</summary>
     Choice,
     /// <summary>On / off (a bool): on writes 1, off writes 0.</summary>
     Switch,
@@ -254,6 +265,8 @@ public static class OptionViews
 
     public static string AccessibleName(string label, string driver) => $"{label}: {driver}";
     public static string ResetName(string label, string driver) => $"Use the default for {label}: {driver}";
+    /// <summary>The accessible name of a secret's "Set" button.</summary>
+    public static string SetName(string label, string driver) => $"Set {label}: {driver}";
     public static string MoreName(string driver) => $"More options: {driver}";
     public static string RetryName(string driver) => $"Try again reading options: {driver}";
 
@@ -302,10 +315,18 @@ public static class OptionViews
                                   s.IsSet ? "Set" : "Not set", source, readOnly, canReset && s.IsSet, null, tooltip, null);
 
         string effective = s.Effective;
+        if (f is null && s.Type == SettingType.Enum && s.Values is { Count: > 0 } words)
+        {
+            // Raw, with the words the CLI lists: a drop-down, the raw words as labels.
+            var raw = words.Select(w => new OptionChoice(w, w)).ToArray();
+            var hit = raw.FirstOrDefault(c => string.Equals(c.Value, effective.Trim(), StringComparison.OrdinalIgnoreCase));
+            return new OptionView(s, s.Key, OptionControl.Choice, s.Help, false, raw, hit?.Value, false, null,
+                                  hit?.Label ?? Quoted(effective), source, readOnly, canReset, null, tooltip, null);
+        }
         if (f is null)
         {
-            // Raw: the key is the label and the driver's own help is the help. The CLI lists no enum
-            // values, so an enum is a text box too.
+            // Raw: the key is the label and the driver's own help is the help. An enum whose values the
+            // CLI does not list is a text box too.
             var control = s.Type == SettingType.Bool ? OptionControl.Switch : OptionControl.Text;
             bool on = s.Type == SettingType.Bool && IsTrue(effective);
             string text = s.Type == SettingType.Bool ? (on ? "On" : "Off") : effective.Length > 0 ? effective : "Not set";
@@ -322,9 +343,10 @@ public static class OptionViews
                     return new OptionView(s, f.Label, OptionControl.Choice, f.Help, true, f.Choices, null, false, null,
                                           FriendlyOptions.NoKindText, source, readOnly, canReset, null, tooltip, f, NoKind: true);
                 string resolved = f.Aliases is not null && f.Aliases.TryGetValue(value, out var a) ? a : value;
-                var choice = f.Choices.FirstOrDefault(c => string.Equals(c.Value, resolved, StringComparison.OrdinalIgnoreCase));
+                var choices = ChoicesFor(f, s.Values);
+                var choice = choices.FirstOrDefault(c => string.Equals(c.Value, resolved, StringComparison.OrdinalIgnoreCase));
                 string? note = choice is not null && f.Notes is not null && f.Notes.TryGetValue(choice.Value, out var n) ? n : null;
-                return new OptionView(s, f.Label, OptionControl.Choice, f.Help, true, f.Choices, choice?.Value, false, null,
+                return new OptionView(s, f.Label, OptionControl.Choice, f.Help, true, choices, choice?.Value, false, null,
                                       choice?.Label ?? Quoted(effective), source, readOnly, canReset, note, tooltip, f);
             }
             case OptionControl.TwoWay:
@@ -355,6 +377,24 @@ public static class OptionViews
     }
 
     private static string Quoted(string v) => v.Length > 0 ? $"“{v}”" : "Not set";
+
+    /// <summary>
+    /// A friendly drop-down's values against the words the CLI lists (<paramref name="cliValues"/>, null = it
+    /// lists none: the entry's own, unchanged). The entry keeps its labels and order, but drops a value the CLI
+    /// does not list (nor any spelling of it, <see cref="FriendlyOption.Aliases"/>), and appends, as its raw word,
+    /// one the CLI lists that the entry does not know (not a value, an alias or a no-kind value of the entry).
+    /// </summary>
+    public static IReadOnlyList<OptionChoice> ChoicesFor(FriendlyOption f, IReadOnlyList<string>? cliValues)
+    {
+        if (cliValues is not { Count: > 0 }) return f.Choices;
+        var listed = new HashSet<string>(cliValues, StringComparer.OrdinalIgnoreCase);
+        bool Listed(OptionChoice c) => listed.Contains(c.Value)
+            || (f.Aliases?.Any(kv => listed.Contains(kv.Key) && string.Equals(kv.Value, c.Value, StringComparison.OrdinalIgnoreCase)) ?? false);
+        bool Known(string w) => f.Choices.Any(c => string.Equals(c.Value, w, StringComparison.OrdinalIgnoreCase))
+            || (f.Aliases?.ContainsKey(w) ?? false)
+            || (f.NoKindValues?.Any(x => string.Equals(x, w, StringComparison.OrdinalIgnoreCase)) ?? false);
+        return f.Choices.Where(Listed).Concat(cliValues.Where(w => !Known(w)).Select(w => new OptionChoice(w, w))).ToArray();
+    }
 
     private static string TypeWord(SettingType t) => t.ToString().ToLowerInvariant();
 
@@ -424,4 +464,43 @@ public static class OptionCommands
     public static CliArgs Read(string id) => new("dp", "options", id, "--json");
     public static CliArgs Set(string id, string key, string value) => new("dp", "set", id, key, value);
     public static CliArgs Unset(string id, string key) => new("dp", "unset", id, key);
+
+    /// <summary>A secret's write: the value goes on standard input, never in the argument vector.</summary>
+    public static CliArgs SetStdin(string id, string key) => new("dp", "set", id, key, "--stdin");
+
+    /// <summary>What the Options block says when the CLI cannot take a value on standard input.</summary>
+    public const string SecretSetUnsupported = "This version of DisplayXR can only clear this value.";
+
+    /// <summary>
+    /// A <c>set ... --stdin</c> refused by a CLI that predates <c>--stdin</c>: it skips the unknown flag, finds
+    /// two arguments and answers that <c>set</c> needs <c>&lt;id&gt; &lt;KEY&gt; &lt;value&gt;</c>. A CLI that knows
+    /// the flag names it in every refusal of this verb, so its own errors (an empty value, too long) are not
+    /// mistaken for this.
+    /// </summary>
+    public static bool IsStdinUnsupported(CliResult r)
+    {
+        if (r.Ok) return false;
+        string text = r.Stdout + "\n" + r.Stderr;
+        return text.Contains("needs <id> <KEY> <value>", StringComparison.Ordinal)
+               && !text.Contains("--stdin", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A secret's text box, checked before it is written: one line, not empty, no NUL, at most the 2047
+    /// bytes (UTF-8) the store takes. Null with <paramref name="error"/> set when it cannot be written. The
+    /// value is not trimmed: a credential is written as typed.
+    /// </summary>
+    public static string? ValidateSecret(string? text, out string? error)
+    {
+        error = null;
+        string v = text ?? "";
+        if (v.Length == 0) { error = "Type a value first."; return null; }
+        if (v.Contains('\0')) { error = "That value has a character that can't be stored."; return null; }
+        if (v.Contains('\n') || v.Contains('\r')) { error = "One line only."; return null; }
+        if (System.Text.Encoding.UTF8.GetByteCount(v) > SecretMaxBytes) { error = "That value is too long."; return null; }
+        return v;
+    }
+
+    /// <summary>The longest secret the store takes, in bytes (2048 with the terminator).</summary>
+    public const int SecretMaxBytes = 2047;
 }

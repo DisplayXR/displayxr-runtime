@@ -96,6 +96,7 @@ fill_plugins(struct xrt_status_snapshot *out)
 		(void)snprintf(p->vendor, sizeof(p->vendor), "%s", descs[i].vendor);
 		(void)snprintf(p->version, sizeof(p->version), "%s", descs[i].version);
 		p->probe_order = descs[i].probe_order;
+		p->disabled = !descs[i].enabled;
 		(void)snprintf(p->load, sizeof(p->load), "%s",
 		               target_plugin_load_result_str(TARGET_PLUGIN_RESULT_NOT_ATTEMPTED));
 		p->fallback = strcmp(descs[i].id, "sim-display") == 0;
@@ -706,7 +707,32 @@ target_status_snapshot_build_headless(struct xrt_instance *xi,
 		free(conv);
 	}
 
+	target_status_snapshot_fill_dp_preference(out);
+
 	u_status_warnings_derive(out);
+}
+
+void
+target_status_dp_preference_read(struct xrt_status_dp_preference *out)
+{
+	if (out == NULL) {
+		return;
+	}
+	memset(out, 0, sizeof(*out)); // also the padding: readers memcmp two reads
+	enum xrt_status_pref_source src = XRT_STATUS_PREF_SOURCE_NONE;
+	if (target_plugin_get_global_preference(out->plugin_id, sizeof(out->plugin_id), &src)) {
+		out->source = src;
+	} else {
+		memset(out->plugin_id, 0, sizeof(out->plugin_id));
+	}
+}
+
+void
+target_status_snapshot_fill_dp_preference(struct xrt_status_snapshot *out)
+{
+	if (out != NULL) {
+		target_status_dp_preference_read(&out->dp_preference);
+	}
 }
 
 

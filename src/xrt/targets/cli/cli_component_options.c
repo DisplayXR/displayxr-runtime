@@ -9,6 +9,7 @@
 
 #include "cli_component_options.h"
 #include "cli_common.h"
+#include "cli_option_parse.h"
 
 #include "target_component_loader.h"
 
@@ -21,6 +22,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(XRT_OS_WINDOWS)
+#include <windows.h>
+#elif defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
+#include <signal.h>
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 #define P(...) printf(__VA_ARGS__)
 
@@ -91,7 +100,11 @@ write_result(const struct cli_component_class *k, enum target_component_store_re
 	}
 }
 
-//! After a write: what the component will actually read, and why, when that is not what was just written.
+/*!
+ * After a write: what the component will actually read, and why, when that is
+ * not what was just written. @p secret: show the value as <set> (a secret, or
+ * a value that came through --stdin).
+ */
 static void
 report_effective(const struct cli_component_class *k, const char *id, const char *key, bool machine, bool secret)
 {
@@ -99,7 +112,8 @@ report_effective(const struct cli_component_class *k, const char *id, const char
 	uint32_t source = TARGET_COMPONENT_SETTING_ABSENT;
 	const bool set = target_component_get_setting(k->cls, id, key, value, sizeof(value), &source);
 	if (secret) {
-		snprintf(value, sizeof(value), "<set>"); // a secret is shown as set / not set, never as a value
+		memset(value, 0, sizeof(value));
+		snprintf(value, sizeof(value), CLI_HIDDEN_VALUE); // shown as set / not set, never as a value
 	}
 	char env[TARGET_COMPONENT_SETTING_ENV_MAX] = {0};
 	(void)target_component_setting_env_name(k->cls->env_class, id, key, env, sizeof(env));
@@ -261,6 +275,20 @@ cli_component_options(const struct cli_component_class *k, const char *id, bool 
 				cJSON_AddNullToObject(o, "default");
 				cJSON_AddNullToObject(o, "help");
 			}
+			// INTERIM (until a richer descriptor declares them): an enum's accepted
+			// words, read from the leading `a|b|c` run of its help; null otherwise.
+			char words[CLI_ENUM_VALUES_MAX][CLI_ENUM_VALUE_LEN];
+			const int nw = r->declared && strcmp(r->desc.type, "enum") == 0
+			                   ? cli_enum_values_from_help(r->desc.help, words, CLI_ENUM_VALUES_MAX)
+			                   : 0;
+			if (nw > 0) {
+				cJSON *vals = cJSON_AddArrayToObject(o, "values");
+				for (int w = 0; w < nw; w++) {
+					cJSON_AddItemToArray(vals, cJSON_CreateString(words[w]));
+				}
+			} else {
+				cJSON_AddNullToObject(o, "values");
+			}
 			// A secret's value is never emitted: `value` is null, `set` says
 			// whether one is stored. `secret` is on every row.
 			cJSON_AddBoolToObject(o, "secret", r->secret);
@@ -352,8 +380,120 @@ key_is_secret(const struct cli_component_class *k, const char *id, const char *k
 	return secret;
 }
 
-int
-cli_component_set(const struct cli_component_class *k, const char *id, const char *key, const char *value, bool machine)
+/*
+ *
+ * --stdin from a terminal: prompt, and read without echo.
+ *
+ */
+
+#if defined(XRT_OS_WINDOWS)
+static HANDLE g_echo_h = NULL;
+static DWORD g_echo_mode = 0;
+static volatile LONG g_echo_off = 0;
+
+//! Ctrl-C / Ctrl-Break / close while echo is off: put echo back, then let the default handler end us.
+static BOOL WINAPI
+echo_ctrl_handler(DWORD type)
+{
+	(void)type;
+	if (InterlockedExchange(&g_echo_off, 0) != 0) {
+		(void)SetConsoleMode(g_echo_h, g_echo_mode);
+	}
+	return FALSE;
+}
+#elif defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
+static int g_echo_fd = -1;
+static struct termios g_echo_tio;
+static volatile sig_atomic_t g_echo_off = 0;
+
+//! SIGINT / SIGTERM / SIGHUP while echo is off: put echo back, then die of the signal as before.
+static void
+echo_signal_handler(int sig)
+{
+	if (g_echo_off) {
+		(void)tcsetattr(g_echo_fd, TCSANOW, &g_echo_tio); // async-signal-safe
+		g_echo_off = 0;
+	}
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+#endif
+
+/*!
+ * The `--stdin` value line. From a pipe or a file: read as is. From a console
+ * / terminal: one prompt line on stderr, the line read with echo off (echo is
+ * restored on every path, a Ctrl-C included), then a newline on stderr.
+ * Android reads the line as is (no terminal to type a secret into there).
+ */
+static enum cli_value_read
+read_stdin_value(const char *key, char *line, size_t cap)
+{
+#if defined(XRT_OS_WINDOWS)
+	HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+	DWORD mode = 0;
+	if (h != NULL && h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode)) {
+		fprintf(stderr, "Value for %s (typing is not shown; Enter to finish): ", key);
+		fflush(stderr);
+		g_echo_h = h;
+		g_echo_mode = mode;
+		(void)SetConsoleCtrlHandler(echo_ctrl_handler, TRUE);
+		InterlockedExchange(&g_echo_off, 1); // before the change: a Ctrl-C right after it still restores
+		if (!SetConsoleMode(h, mode & ~(DWORD)ENABLE_ECHO_INPUT)) {
+			InterlockedExchange(&g_echo_off, 0);
+		}
+		const enum cli_value_read r = cli_read_value_line(stdin, line, cap);
+		if (InterlockedExchange(&g_echo_off, 0) != 0) {
+			(void)SetConsoleMode(h, mode);
+		}
+		(void)SetConsoleCtrlHandler(echo_ctrl_handler, FALSE);
+		fputc('\n', stderr);
+		return r;
+	}
+#elif defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
+	const int fd = fileno(stdin);
+	struct termios tio;
+	if (isatty(fd) && tcgetattr(fd, &tio) == 0) {
+		fprintf(stderr, "Value for %s (typing is not shown; Enter to finish): ", key);
+		fflush(stderr);
+		g_echo_fd = fd;
+		g_echo_tio = tio;
+		void (*old_int)(int) = signal(SIGINT, echo_signal_handler);
+		void (*old_term)(int) = signal(SIGTERM, echo_signal_handler);
+		void (*old_hup)(int) = signal(SIGHUP, echo_signal_handler);
+		struct termios quiet = tio;
+		quiet.c_lflag &= ~(tcflag_t)(ECHO | ECHONL); // not even the newline: we print our own
+		g_echo_off = 1; // before the change: a signal right after it still restores
+		if (tcsetattr(fd, TCSAFLUSH, &quiet) != 0) {
+			g_echo_off = 0;
+		}
+		const enum cli_value_read r = cli_read_value_line(stdin, line, cap);
+		if (g_echo_off) {
+			(void)tcsetattr(fd, TCSAFLUSH, &tio);
+			g_echo_off = 0;
+		}
+		signal(SIGINT, old_int);
+		signal(SIGTERM, old_term);
+		signal(SIGHUP, old_hup);
+		fputc('\n', stderr);
+		return r;
+	}
+#else
+	(void)key;
+#endif
+	return cli_read_value_line(stdin, line, cap);
+}
+
+/*!
+ * `set`, the value from an argument (@p value) or, with @p from_stdin, one
+ * line of standard input. A stdin value is wiped from memory after the write.
+ */
+static int
+component_set(const struct cli_component_class *k,
+              const char *id,
+              const char *key,
+              const char *value,
+              bool from_stdin,
+              bool machine)
 {
 	const int rc = gate(k, id, "set");
 	if (rc != 0) {
@@ -369,8 +509,45 @@ cli_component_set(const struct cli_component_class *k, const char *id, const cha
 	const bool secret = key_is_secret(k, id, key);
 	const size_t value_max =
 	    secret ? (size_t)TARGET_COMPONENT_SETTING_SECRET_VALUE_MAX : (size_t)TARGET_COMPONENT_SETTING_VALUE_MAX;
+	char *line = NULL;
+	if (from_stdin) {
+		// One line, the trailing newline stripped; nothing of it is ever printed.
+		line = calloc(1, value_max);
+		if (line == NULL) {
+			return 1;
+		}
+		const enum cli_value_read r = read_stdin_value(key, line, value_max);
+		if (r != CLI_VALUE_READ_OK) {
+			memset(line, 0, value_max);
+			free(line);
+			if (r == CLI_VALUE_READ_EMPTY) {
+				P("error: --stdin read an empty value — nothing written (use '%s unset' to clear "
+				  "it).\n",
+				  k->verb);
+			} else if (r == CLI_VALUE_READ_UTF16) {
+				P("error: the value read from --stdin is UTF-16 (it starts with a UTF-16 "
+				  "byte-order mark) — nothing written. Send UTF-8 without a byte-order mark.\n");
+			} else if (r == CLI_VALUE_READ_TOO_LONG) {
+				P("error: the value read from --stdin must be under %d bytes — nothing written.\n",
+				  (int)value_max);
+			} else {
+				P("error: could not read the value from standard input — nothing written.\n");
+			}
+			return 1;
+		}
+		value = line;
+	} else if (secret) {
+		// Still accepted (scripts), but a command line is visible to other
+		// processes and kept in shell history.
+		fprintf(
+		    stderr,
+		    "warning: %s is a secret; a value on the command line can be seen by other programs and kept in "
+		    "shell history — prefer '%s set %s %s --stdin'.\n",
+		    key, k->verb, id, key);
+	}
 	if (value == NULL || strlen(value) >= value_max) {
 		P("error: the value must be under %d bytes.\n", (int)value_max);
+		free(line);
 		return 1;
 	}
 	const int w =
@@ -379,6 +556,10 @@ cli_component_set(const struct cli_component_class *k, const char *id, const cha
 	                        : target_component_set_setting(k->cls, id, key, value, machine),
 	                 machine ? "writing the machine-wide setting" : "writing the per-user setting", machine);
 	if (w != 0) {
+		if (line != NULL) {
+			memset(line, 0, value_max);
+			free(line);
+		}
 		return w;
 	}
 	char store[512] = {0};
@@ -392,17 +573,37 @@ cli_component_set(const struct cli_component_class *k, const char *id, const cha
 		}
 	}
 	upper[sizeof(upper) - 1] = '\0';
-	if (secret) {
-		P("%s: %s = <set> %s (%s). The value is a secret: it is never shown again.\n", id, upper,
-		  tier_str(machine), store);
-	} else {
-		P("%s: %s = '%s' %s (%s).\n", id, upper, value, tier_str(machine), store);
+	{
+		// A secret, or any value that came through --stdin, is never echoed (cli_set_may_echo_value).
+		char confirm[TARGET_COMPONENT_SETTING_VALUE_MAX + 1024];
+		(void)cli_format_set_confirmation(confirm, sizeof(confirm), id, upper, value, tier_str(machine), store,
+		                                  secret, from_stdin);
+		fputs(confirm, stdout);
+		memset(confirm, 0, sizeof(confirm));
 	}
-	report_effective(k, id, upper, machine, secret);
+	if (line != NULL) {
+		memset(line, 0, value_max); // the value lives in the store now, not here
+		free(line);
+		line = NULL;
+		value = NULL;
+	}
+	report_effective(k, id, upper, machine, !cli_set_may_echo_value(secret, from_stdin));
 	if (k->note_pickup != NULL) {
 		k->note_pickup();
 	}
 	return 0;
+}
+
+int
+cli_component_set(const struct cli_component_class *k, const char *id, const char *key, const char *value, bool machine)
+{
+	return component_set(k, id, key, value, false, machine);
+}
+
+int
+cli_component_set_stdin(const struct cli_component_class *k, const char *id, const char *key, bool machine)
+{
+	return component_set(k, id, key, NULL, true, machine);
 }
 
 int
@@ -449,9 +650,13 @@ cli_component_options_usage(const struct cli_component_class *k)
 	P("                               machine-wide (HKLM, admin) with --machine. DXR_%s_<ID>_<KEY> in the\n",
 	  k->cls != NULL && k->cls->env_class != NULL ? k->cls->env_class : "<CLASS>");
 	P("                               hosting process's environment always wins.\n");
+	P("  set <id> <KEY> --stdin [--machine]\n");
+	P("                               The same, the value read from standard input: one line, the trailing\n");
+	P("                               newline dropped; empty is refused. Never echoed. Use it for a secret.\n");
 	P("  unset <id> <KEY> [--machine] Clear it (per user, or the machine value with --machine).\n");
 	P("                               A setting of type 'secret' (a licence key) is stored the same way and\n");
-	P("                               shown only as <set> / <unset>.\n");
+	P("                               shown only as <set> / <unset>; set it with --stdin (a value on the\n");
+	P("                               command line still works, with a warning).\n");
 	if (k->activate != NULL) {
 		P("  activate <id> <token | @file> [--json]\n");
 		P("                               Hand an activation token (a licence key, or the token a vendor's\n");
@@ -487,12 +692,20 @@ cli_component_options_dispatch(const struct cli_component_class *k, int argc, co
 		return cli_component_options(k, pos[0], json);
 	}
 	if (strcmp(verb, "set") == 0) {
-		if (np < 3) {
-			P("error: '%s set' needs <id> <KEY> <value>.\n\n", k->verb);
+		switch (cli_set_args_check(np, cli_has_flag(argc, argv, "--stdin"))) {
+		case CLI_SET_ARGS_VALUE: return cli_component_set(k, pos[0], pos[1], pos[2], machine);
+		case CLI_SET_ARGS_STDIN: return cli_component_set_stdin(k, pos[0], pos[1], machine);
+		case CLI_SET_ARGS_BOTH:
+			P("error: '%s set' takes the value either as an argument or with --stdin, not both.\n\n",
+			  k->verb);
+			cli_component_options_usage(k);
+			return 1;
+		case CLI_SET_ARGS_MISSING:
+		default:
+			P("error: '%s set' needs <id> <KEY> <value>, or <id> <KEY> --stdin.\n\n", k->verb);
 			cli_component_options_usage(k);
 			return 1;
 		}
-		return cli_component_set(k, pos[0], pos[1], pos[2], machine);
 	}
 	if (strcmp(verb, "unset") == 0) {
 		if (np < 2) {

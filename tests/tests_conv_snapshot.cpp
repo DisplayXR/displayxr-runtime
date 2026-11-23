@@ -14,6 +14,8 @@
 #include "target_component_loader.h"
 #include "target_conv_status.h"
 #include "target_conversion_plugin_loader.h"
+#include "target_plugin_loader.h"
+#include "target_status_snapshot.h"
 
 #include "util/u_status_snapshot.h"
 #include "xrt/xrt_conversion_plugin.h"
@@ -1189,4 +1191,44 @@ TEST_CASE("conv run: the headless host answers get_path and the model store like
 	set_env("DXR_CONV_SCRATCH_ROOT", nullptr);
 	std::error_code ec;
 	fs::remove_all(dir, ec);
+}
+
+// The snapshot's global display-driver preference (`dp_preference`), read in the
+// rendering process. The stores (HKCU/HKLM, the per-user file) belong to the
+// machine, so only the environment tier is driven here: an exclusive pin
+// outranks whatever the stores hold and reads as "env".
+TEST_CASE("status: dp_preference reads an exclusive environment pin as env", "[conv_snapshot][dp_preference]")
+{
+	set_env("DXR_PLUGIN_EXCLUSIVE", "sim-display");
+	xrt_status_dp_preference a;
+	xrt_status_dp_preference b;
+	std::memset(&a, 0xAB, sizeof(a));
+	std::memset(&b, 0xCD, sizeof(b));
+	target_status_dp_preference_read(&a);
+	target_status_dp_preference_read(&b);
+	CHECK(std::string(a.plugin_id) == "sim-display");
+	CHECK(a.source == XRT_STATUS_PREF_SOURCE_ENV);
+	// Two reads of the same state compare equal byte for byte (status --watch memcmps them).
+	CHECK(std::memcmp(&a, &b, sizeof(a)) == 0);
+
+	char id[64];
+	xrt_status_pref_source src = XRT_STATUS_PREF_SOURCE_NONE;
+	REQUIRE(target_plugin_get_global_preference(id, sizeof(id), &src));
+	CHECK(std::string(id) == "sim-display");
+	CHECK(src == XRT_STATUS_PREF_SOURCE_ENV);
+
+	auto snap = std::make_unique<xrt_status_snapshot>();
+	std::memset(snap.get(), 0, sizeof(*snap));
+	target_status_snapshot_fill_dp_preference(snap.get());
+	cJSON *root = u_status_snapshot_to_cjson(snap.get());
+	const cJSON *p = cJSON_GetObjectItem(root, "dp_preference");
+	REQUIRE(cJSON_IsObject(p));
+	CHECK(std::string(cJSON_GetObjectItem(p, "plugin_id")->valuestring) == "sim-display");
+	CHECK(std::string(cJSON_GetObjectItem(p, "source")->valuestring) == "env");
+	cJSON_Delete(root);
+	set_env("DXR_PLUGIN_EXCLUSIVE", nullptr);
+
+	// Without the pin: whatever the machine's stores say, the pair is consistent.
+	target_status_dp_preference_read(&a);
+	CHECK((a.plugin_id[0] == '\0') == (a.source == XRT_STATUS_PREF_SOURCE_NONE));
 }

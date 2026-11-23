@@ -134,6 +134,20 @@ bool
 target_plugin_get_preferred(char *out, size_t cap);
 
 /*!
+ * The GLOBAL display-driver preference a process starting now with this
+ * environment would honour, and where it came from: the `DXR_PLUGIN_EXCLUSIVE`
+ * pin (ENV; it outranks the preference in discovery), else the
+ * `PreferredPlugin` store of @ref target_plugin_get_preferred — Windows HKCU
+ * (USER) then HKLM (MACHINE); POSIX `XRT_PREFERRED_PLUGIN_ID` (ENV) then the
+ * per-user `preferred` file (USER). Read-only, loads nothing, logs nothing.
+ *
+ * @return true with @p out / @p out_source (may be NULL) filled; false with ""
+ *         and @ref XRT_STATUS_PREF_SOURCE_NONE when nothing is set.
+ */
+bool
+target_plugin_get_global_preference(char *out, size_t cap, enum xrt_status_pref_source *out_source);
+
+/*!
  * The licence state of the registered plug-in @p id (ADR-054 N5): negotiate
  * only (no probe, no instance), ask its `get_license_state` slot, unload.
  * @p out is always a valid struct (`not_applicable` when the plug-in reports

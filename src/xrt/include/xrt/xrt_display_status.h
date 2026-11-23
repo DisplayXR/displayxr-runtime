@@ -98,12 +98,13 @@ enum xrt_status_source
 	XRT_STATUS_SOURCE_HEADLESS = 1, //!< Assembled in-process: "what a process starting now would get".
 };
 
-//! Where a screen's per-screen DP preference came from (JSON lower-case; null for NONE).
+//! Where a DP preference came from, per screen or global (JSON lower-case; null for NONE).
 //! Values equal `enum u_setting_source`.
 enum xrt_status_pref_source
 {
-	XRT_STATUS_PREF_SOURCE_NONE = 0,    //!< No preference for this screen.
-	XRT_STATUS_PREF_SOURCE_ENV = 1,     //!< `DXR_PREFERRED_PLUGIN_PER_SCREEN`.
+	XRT_STATUS_PREF_SOURCE_NONE = 0,    //!< No preference.
+	XRT_STATUS_PREF_SOURCE_ENV = 1,     //!< An environment variable (`DXR_PREFERRED_PLUGIN_PER_SCREEN`; global: see
+	                                    //!< @ref xrt_status_dp_preference).
 	XRT_STATUS_PREF_SOURCE_USER = 2,    //!< The per-user settings file (what the dashboard writes).
 	XRT_STATUS_PREF_SOURCE_MACHINE = 3, //!< HKLM (admin).
 };
@@ -286,6 +287,7 @@ struct xrt_status_plugin
 	char hint[128];                    //!< The plug-in's platform hint, verbatim.
 	bool fallback;                     //!< A FALLBACK plug-in (sim-display).
 	bool active;                       //!< The active plug-in of the process that built the snapshot.
+	bool disabled;                     //!< `Enabled` = 0 (`dp disable`); JSON `enabled` = !disabled.
 	uint32_t probe_order;              //!< ProbeOrder (lower wins).
 	struct xrt_status_licence licence; //!< Its licence state at the last load attempt (ADR-054 N5).
 	struct xrt_status_platform_remedy remedy; //!< Update notice, if any (ADR-045 Amendment 2026-11-22).
@@ -743,6 +745,21 @@ struct xrt_status_workspace
 };
 
 /*!
+ * The GLOBAL display-driver preference (`displayxr-cli dp use <id>` without
+ * `--screen`, per user or per machine, or an environment pin), as opposed to
+ * the per-screen one on @ref xrt_status_claim. JSON `dp_preference`.
+ *
+ * Never crosses IPC: the process that renders the snapshot (the CLI) reads the
+ * stores itself, like the model store (`target_status_snapshot_fill_dp_preference`),
+ * so a `dp use` shows at once, before the service's next start.
+ */
+struct xrt_status_dp_preference
+{
+	char plugin_id[XRT_STATUS_NAME_MAX]; //!< The preferred plug-in id ("" = none set).
+	enum xrt_status_pref_source source;  //!< Where it came from (NONE when @ref plugin_id is "").
+};
+
+/*!
  * The snapshot (ADR-051 D1).
  */
 struct xrt_status_snapshot
@@ -781,6 +798,8 @@ struct xrt_status_snapshot
 	 */
 	uint32_t input_holder_count;
 	struct xrt_input_client_holders input_holders[XRT_STATUS_MAX_CLIENTS];
+	//! The global display-driver preference (filled by the rendering process; not in @ref xrt_status_head).
+	struct xrt_status_dp_preference dp_preference;
 };
 
 /*!

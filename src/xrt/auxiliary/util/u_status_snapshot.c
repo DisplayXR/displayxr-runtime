@@ -1375,6 +1375,30 @@ u_status_input_holders_add_cjson(cJSON *root, const struct xrt_input_client_hold
 	}
 }
 
+void
+u_status_dp_preference_add_cjson(cJSON *root, const struct xrt_status_dp_preference *pref)
+{
+	cJSON *o = cJSON_AddObjectToObject(root, "dp_preference");
+	const bool set = pref != NULL && pref->plugin_id[0] != '\0';
+	add_str_or_null(o, "plugin_id", set ? pref->plugin_id : "");
+	add_str_or_null(o, "source", set ? u_status_pref_source_str(pref->source) : NULL);
+}
+
+bool
+u_status_dp_preference_format(const struct xrt_status_dp_preference *pref, char *out, size_t cap)
+{
+	if (out != NULL && cap > 0) {
+		out[0] = '\0';
+	}
+	if (pref == NULL || pref->plugin_id[0] == '\0' || out == NULL || cap == 0) {
+		return false;
+	}
+	const char *src = u_status_pref_source_str(pref->source);
+	(void)snprintf(out, cap, "%.*s for every screen (%s); a per-screen choice still wins",
+	               (int)sizeof(pref->plugin_id), pref->plugin_id, src != NULL ? src : "unknown source");
+	return true;
+}
+
 cJSON *
 u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 {
@@ -1408,6 +1432,7 @@ u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 		cJSON_AddStringToObject(o, "platform_state", u_status_platform_state_str(p->platform_state));
 		cJSON_AddStringToObject(o, "hint", p->hint);
 		cJSON_AddBoolToObject(o, "fallback", p->fallback);
+		cJSON_AddBoolToObject(o, "enabled", !p->disabled);
 		cJSON_AddNumberToObject(o, "probe_order", (double)p->probe_order);
 		add_licence(o, &p->licence);
 		u_status_remedy_add_cjson(o, &p->remedy);
@@ -1457,6 +1482,8 @@ u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 	u_status_input_holders_add_cjson(root, snap->input_holders,
 	                                 snap->input_holder_count < XRT_STATUS_MAX_CLIENTS ? snap->input_holder_count
 	                                                                                   : XRT_STATUS_MAX_CLIENTS);
+	// The global display-driver preference (keys only added; the schema stays 1).
+	u_status_dp_preference_add_cjson(root, &snap->dp_preference);
 	return root;
 }
 
@@ -1753,6 +1780,13 @@ u_status_snapshot_format_text(const struct xrt_status_snapshot *snap, char *buf,
 		char line[512];
 		if (u_status_remedy_format(&snap->plugins[i].remedy, line, sizeof(line))) {
 			tb_printf(&t, "PLUG-IN  %s: %s\n", snap->plugins[i].id, line);
+		}
+	}
+	// The global display-driver preference: one line, only when one is set.
+	{
+		char line[160];
+		if (u_status_dp_preference_format(&snap->dp_preference, line, sizeof(line))) {
+			tb_printf(&t, "DP PREF  %s\n", line);
 		}
 	}
 

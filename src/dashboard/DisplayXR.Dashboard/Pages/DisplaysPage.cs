@@ -197,7 +197,7 @@ public sealed class DisplaysPage : Page
         var title = U.Flow(10, 4, name);
         foreach (var chip in StatusText.PlainChips(s))
             U.AddFlow(title, U.Chip(chip, chip == "Main 3D display" ? Level.Info : Level.Plain), 6, 4);
-        if (StatusText.ForcedChip(s, Ctx.Dp) is { } forcedChip) U.AddFlow(title, U.Chip(forcedChip, Level.Warn), 6, 4);
+        if (StatusText.ForcedChip(s, Ctx.Dp, snap) is { } forcedChip) U.AddFlow(title, U.Chip(forcedChip, Level.Warn), 6, 4);
 
         // Plain words on the face; the technical line each one replaces is in Details and in "Copy list".
         var (badgeText, badgeLevel) = StatusText.PlainBadge(s, snap);

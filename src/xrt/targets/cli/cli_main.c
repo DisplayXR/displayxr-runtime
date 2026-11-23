@@ -65,7 +65,8 @@ cli_print_help(int argc, const char **argv)
 	P("         --watch [--interval ms]  stay connected; poll the service's generation counters\n");
 	P("                      every <ms> (default 500, min 100) and print only on a change: one\n");
 	P("                      NDJSON line per change with --json, else the table redrawn in place.\n");
-	P("                      Ends on Ctrl-C or stdin EOF.\n");
+	P("                      A change of the global 'dp use' preference reprints too, with or\n");
+	P("                      without a service. Ends on Ctrl-C or stdin EOF.\n");
 	P("  workspace <...>   - Workspace controllers (role, registration) and their launch settings.\n");
 	P("                      'workspace list [--json]', 'workspace set <id> --hotkey <combo> |\n");
 	P("                      --no-hotkey | --mode auto|disabled', 'workspace reset <id>',\n");

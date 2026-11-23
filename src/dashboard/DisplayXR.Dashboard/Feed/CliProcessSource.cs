@@ -197,13 +197,22 @@ public sealed class CliProcessSource : IProcessSource
         }
     }
 
-    public async Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel = default)
+    public Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel = default) =>
+        Run(args, null, timeout, cancel);
+
+    public Task<CliResult> RunWithInputAsync(CliArgs args, string input, TimeSpan timeout, CancellationToken cancel = default) =>
+        Run(args, input ?? "", timeout, cancel);
+
+    private async Task<CliResult> Run(CliArgs args, string? input, TimeSpan timeout, CancellationToken cancel)
     {
         if (!CliExists) return new CliResult(-1, "", "", false, $"{ExeName} not found (looked at {CliPath}).");
         Process p;
         try
         {
-            p = new Process { StartInfo = Info(args, stdin: true) };
+            var psi = Info(args, stdin: true);
+            // UTF-8 without a byte-order mark: the CLI stores the line's bytes as they arrive.
+            if (input is not null) psi.StandardInputEncoding = new UTF8Encoding(false);
+            p = new Process { StartInfo = psi };
             p.Start();
         }
         catch (Exception ex)
@@ -213,9 +222,22 @@ public sealed class CliProcessSource : IProcessSource
         using (p)
         {
             ChildJob.Add(p);
-            try { p.StandardInput.Close(); } catch { }
+            // Drain first, so a child busy logging before it reads stdin never blocks on a full pipe.
             var stdout = p.StandardOutput.ReadToEndAsync(CancellationToken.None);
             var stderr = p.StandardError.ReadToEndAsync(CancellationToken.None);
+            if (input is not null)
+            {
+                // One line, then EOF. A child that exits early (a refused call) closes the pipe: ignore that.
+                try
+                {
+                    await p.StandardInput.WriteAsync(input).ConfigureAwait(false);
+                    await p.StandardInput.WriteAsync('\n').ConfigureAwait(false);
+                    await p.StandardInput.FlushAsync().ConfigureAwait(false);
+                }
+                catch (IOException) { }
+                catch (ObjectDisposedException) { }
+            }
+            try { p.StandardInput.Close(); } catch { }
             bool timedOut = false;
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancel);
             cts.CancelAfter(timeout);

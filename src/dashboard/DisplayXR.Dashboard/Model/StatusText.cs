@@ -92,16 +92,54 @@ public static class StatusText
     /// for it (a per-display preference: <c>claim.forced</c>, or <c>claim.preferred_plugin</c> naming the
     /// simulated driver from any source, the environment included), and it holds the display only because
     /// a vendor driver is unhealthy (<see cref="FellBack"/>: a 3D display that needs attention, as before).
-    /// A GLOBAL preference (<c>dp use</c> without <c>--screen</c>, or its environment pin) is not in the
-    /// status snapshot, so it cannot count here.
+    /// A GLOBAL preference (<c>dp use</c> without <c>--screen</c>, or its environment pin: the snapshot's
+    /// <c>dp_preference</c>) naming the simulated driver counts too, on a PC where a real display driver is
+    /// installed and usable (<see cref="ChoseSimulatedGlobally"/>). A runtime without that key behaves as before.
     /// </summary>
     public static bool IsReal3D(StatusSnapshot? snap, Screen s) =>
         s.Claim.IsClaimed && (s.Claim.Forced == true || ChoseSimulated(snap, s)
                               || !IsSimulatedDriver(snap, s.Claim.PluginId) || FellBack(snap, s));
 
-    /// <summary>A per-display preference names the simulated driver for this display (whatever its source).</summary>
+    /// <summary>
+    /// The simulated driver was chosen for this display: a per-display preference names it (whatever its
+    /// source), or the global preference does (<see cref="ChoseSimulatedGlobally"/>).
+    /// </summary>
     public static bool ChoseSimulated(StatusSnapshot? snap, Screen s) =>
-        s.Claim.PreferredPlugin is { Length: > 0 } pp && IsSimulatedDriver(snap, pp);
+        (s.Claim.PreferredPlugin is { Length: > 0 } pp && IsSimulatedDriver(snap, pp)) || ChoseSimulatedGlobally(snap, s);
+
+    /// <summary>
+    /// The global preference (<c>dp_preference</c>, any source) names the simulated driver, the simulated
+    /// driver holds this display, no per-display preference names another driver for it, and a real display
+    /// driver is installed AND usable (<see cref="IsUsableRealDriver"/>: enabled, not failed or declined, its
+    /// platform READY): a 3D display showing the simulated preview by the user's choice. A real driver that
+    /// is disabled, or installed on a PC with no panel attached (NO_DISPLAY / PLATFORM_ABSENT / ...), or that
+    /// never reported a platform state (UNKNOWN), does not count, so a 2D-only PC never reads "chosen by you".
+    /// <para>
+    /// PER PC, not per display: the status snapshot does not say which display a real driver would claim (its
+    /// claim names only the winner; the per-display <c>candidates</c> are in <c>dp list --json</c>, not in the
+    /// snapshot every caller shares). So on a PC with a usable real driver, every display the simulated driver
+    /// holds under this preference counts, a second, ordinary monitor included.
+    /// </para>
+    /// </summary>
+    public static bool ChoseSimulatedGlobally(StatusSnapshot? snap, Screen s) =>
+        snap?.DpPreference is { IsSet: true } g && IsSimulatedDriver(snap, g.PluginId)
+        && IsSimulatedDriver(snap, s.Claim.PluginId)
+        && (s.Claim.PreferredPlugin is not { Length: > 0 } pp || IsSimulatedDriver(snap, pp))
+        && snap.Plugins.Any(p => IsUsableRealDriver(snap, p));
+
+    /// <summary>
+    /// A display driver that is not the simulated one and could drive a panel now: enabled, its load not a
+    /// failure, not DISABLED and not DECLINED ("not my platform"), and its platform state READY.
+    /// </summary>
+    public static bool IsUsableRealDriver(StatusSnapshot? snap, PluginInfo p) =>
+        !p.Fallback && !IsSimulatedDriver(snap, p.Id) && p.Enabled
+        && p.Load is not ("DISABLED" or "DECLINED") && !LoadIsFailure(p.Load)
+        && p.PlatformState == "READY";
+
+    /// <summary>Where the choice of the simulated driver is stored: the per-display one, else the global one.</summary>
+    public static string? ChosenSource(StatusSnapshot? snap, Screen s) =>
+        s.Claim.Forced == true || s.Claim.PreferredPlugin is { Length: > 0 } ? s.Claim.PreferredSource
+        : ChoseSimulatedGlobally(snap, s) ? snap!.DpPreference!.Source : s.Claim.PreferredSource;
 
     /// <summary>Claimed only by the simulated display driver: an ordinary display that driver gives a 3D preview.</summary>
     public static bool IsSimulatedPreview(StatusSnapshot? snap, Screen s) => s.Claim.IsClaimed && !IsReal3D(snap, s);
@@ -200,7 +238,7 @@ public static class StatusText
         string name = nameOf?.Invoke(id) is { Length: > 0 } n ? n : id;
         if (IsSimulatedPreview(snap, s)) return $"Not recognised as a 3D display{Sep}display driver: {name}, which gives it a 3D preview";
         string line = $"Recognised as a 3D display{Sep}display driver: {name}";
-        if (s.Claim.Forced == true || ChoseSimulated(snap, s)) line += $"{Sep}{ChosenWord(s.Claim.PreferredSource)}";
+        if (s.Claim.Forced == true || ChoseSimulated(snap, s)) line += $"{Sep}{ChosenWord(ChosenSource(snap, s))}";
         return line;
     }
 
@@ -439,13 +477,17 @@ public static class StatusText
         ? new CliArgs("dp", "reset", "--screen", key)
         : new CliArgs("dp", "use", choice.PluginId, "--screen", key);
 
-    /// <summary>"forced (user)" when an override forces this screen's claim.</summary>
-    public static string? ForcedChip(Screen s, DpList? dp)
+    /// <summary>
+    /// "Chosen by you" when an override forces this screen's claim, or when the global preference chose the
+    /// simulated driver for it (<paramref name="snap"/> given; <see cref="ChoseSimulatedGlobally"/>).
+    /// </summary>
+    public static string? ForcedChip(Screen s, DpList? dp, StatusSnapshot? snap = null)
     {
         var ds = dp?.Screen(s.Key);
         bool forced = ds?.Forced ?? s.Claim.Forced ?? false;
-        if (!forced) return null;
-        string? src = ds?.PreferredSource ?? s.Claim.PreferredSource;
+        bool global = !forced && ChoseSimulatedGlobally(snap, s);
+        if (!forced && !global) return null;
+        string? src = global ? snap!.DpPreference!.Source : ds?.PreferredSource ?? s.Claim.PreferredSource;
         return src is { Length: > 0 } && src != "none" ? char.ToUpperInvariant(ChosenWord(src)[0]) + ChosenWord(src)[1..] : "Chosen by hand";
     }
 
@@ -494,11 +536,20 @@ public static class StatusText
         return new NavBadge(apps.Count, flat ? Level.Warn : Level.Plain);
     }
 
+    /// <summary>
+    /// <c>Display driver for every display: sim-display (user)</c> when a global preference is set
+    /// (<c>dp_preference</c>); null when none is, or the runtime predates the key.
+    /// </summary>
+    public static string? GlobalPreferenceLine(StatusSnapshot s) => s.DpPreference is { IsSet: true } g
+        ? $"Display driver for every display: {g.PluginId}{(g.Source is { Length: > 0 } src ? $" ({src})" : "")}"
+        : null;
+
     public static string Copy(StatusSnapshot s, bool includeSource = true)
     {
         var sb = new StringBuilder();
         sb.Append("Displays: ").Append(DisplaysHeader(s)).Append('\n');
         if (includeSource) sb.Append("Source: ").Append(SourceLine(s)).Append('\n');
+        if (GlobalPreferenceLine(s) is { } gp) sb.Append(gp).Append('\n');
         for (int i = 0; i < s.Screens.Count; i++)
         {
             var x = s.Screens[i];
