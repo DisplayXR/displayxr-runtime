@@ -43,7 +43,7 @@ the entire "switch signers" operation.
 
 ### 1. `build-signed-release.yml` — build + sign a component (used by `/release`, `/dxr-release`)
 
-- **Inputs:** `component` (`runtime|leia-plugin|mcp|gauss|modelviewer|mediaplayer|avatar`),
+- **Inputs:** `component` (`runtime|leia-plugin|leia-conversion|mcp|gauss|modelviewer|mediaplayer|avatar`),
   `repo` (`owner/name`), `ref` (the tag, e.g. `v1.6.0`).
 - **Behavior:** checkout `repo@ref` on a Windows runner that has the cert; set
   `SIGN_CMD` to the runner-local signer; run that component's own signed build

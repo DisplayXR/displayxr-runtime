@@ -88,10 +88,13 @@ until each has one:
   on the runtime it was built at (ADR-063).
 
 `ultraleap` builds on a self-hosted runner that has the Ultraleap SDK, and its repo gates
-the dispatch on the repository variable `DXR_VERSIONS_BUMP=true`. Neither repo is known to
-the signing provider yet, so Phase 3.5 has nothing to dispatch for them (`INST=""`): an
+the dispatch on the repository variable `DXR_VERSIONS_BUMP=true`. `ultraleap` is not known
+to the signing provider yet, so Phase 3.5 has nothing to dispatch for it (`INST=""`): an
 unsigned provider release is **not listed in the component catalog** (every listed asset
 is signed), so teach the signing provider the component before expecting it there.
+`leia-conversion` is signed through Phase 3.5 like any installer component once the signing
+provider's `leia-conversion` recipe is merged; a provider without it returns no
+`DisplayXRLeiaConversionSetup-<version>.exe` and the release ships unsigned.
 
 **Browser is special** — it is the second private→public split after the shell
 (source, patch series, build lanes and the Android keystore live in the PRIVATE
@@ -806,11 +809,12 @@ fi
 ```
 
 ### Step 3.5.2: Normalize the component name for the workflow
-The workflow expects canonical names (`runtime|leia-plugin|mcp|gauss|modelviewer|mediaplayer|avatar|earthview`).
+The workflow expects canonical names (`runtime|leia-plugin|leia-conversion|mcp|gauss|modelviewer|mediaplayer|avatar|earthview`).
 Map the skill's aliases:
 ```bash
 case "$COMPONENT" in
   leia|leia-plugin)              COMP=leia-plugin ;;
+  leia-conversion)               COMP=leia-conversion ;;
   gauss|demo-gaussiansplat)      COMP=gauss ;;
   modelviewer|demo-modelviewer)  COMP=modelviewer ;;
   avatar|demo-avatar)            COMP=avatar ;;
@@ -828,6 +832,7 @@ esac
 # Expected installer basename per component — the artifact must hold EXACTLY this file.
 case "$COMP" in
   leia-plugin) INST=DisplayXRLeiaSRSetup ;;
+  leia-conversion) INST=DisplayXRLeiaConversionSetup ;;
   mcp)         INST=DisplayXRMCPSetup ;;
   gauss)       INST=DisplayXRGaussianSplatSetup ;;
   modelviewer) INST=DisplayXRModelViewerSetup ;;
