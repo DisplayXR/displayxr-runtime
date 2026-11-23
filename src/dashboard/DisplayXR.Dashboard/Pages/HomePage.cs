@@ -14,11 +14,11 @@ using DisplayXR.Dashboard.Ui;
 namespace DisplayXR.Dashboard.Pages;
 
 /// <summary>
-/// Home: "Check my setup" (the self-test) first, then the runtime, its display drivers and the
-/// graphics cards (what the ImGui panel's Overview showed), plus the one-line multi-display
-/// summary that links to Displays (design §8, the vendor dashboard's Home rule). No ticket or
-/// design-record numbers and no environment-variable names on the page; the graphics card's
-/// technical lines sit behind its own "Technical details" toggle.
+/// Home answers "is my 3D display working?": the verdict (<see cref="Verdicts"/>: one headline, one
+/// row per display with up to three facts, each yes / no / not known yet), "Needs attention" (plain
+/// sentences, or "nothing"), then "Check my setup" (the self-test) with when it last ran in this
+/// session. Under them the runtime, its display drivers and the graphics cards. No ticket or
+/// design-record numbers and no environment-variable names on the page.
 /// </summary>
 public sealed class HomePage : Page
 {
@@ -52,19 +52,28 @@ public sealed class HomePage : Page
         {
             sb.Append(s.Source).Append('|').Append(s.Runtime).Append('|').Append(s.Workspace).Append('|');
             foreach (var p in s.Plugins) sb.Append(p).Append(';');
-            sb.Append(StatusText.HomeLine(s));
-            foreach (var d in StatusText.HomeScreenDps(s, Ctx.Dp)) sb.Append(d).Append(';');
         }
+        // The verdict: its words, every row's facts and every "Needs attention" sentence.
+        var v = Verdict();
+        sb.Append('|').Append(v.Kind).Append(v.Headline).Append(v.Subline).Append(v.Level);
+        foreach (var r in v.Rows) sb.Append(r.Name).Append(r.Role).Append(r.Driver).Append(r.Forced).Append(string.Join(",", r.Facts)).Append(';');
+        foreach (var a in v.Attention) sb.Append(a).Append(';');
         sb.Append('|').Append(Ctx.Dp?.Preferred).Append(Ctx.ActionRunning);
         return sb.ToString();
     }
+
+    private Verdict Verdict() =>
+        Verdicts.From(Ctx.Feed.Snapshot, Ctx.Selftest, Verdicts.ActiveRuntime(Ctx.Info, Ctx.Feed.Snapshot), Ctx.Dp);
 
     protected override Control Build()
     {
         var s = Ctx.Feed.Snapshot;
         var page = U.VStack(18);
+        var verdict = Verdict();
 
-        // The self-test answers "is it working?": it comes first.
+        // The answer to "is my 3D display working?" first: the headline, one row per display, what to fix.
+        page.Children.Add(VerdictCard(verdict));
+        page.Children.Add(AttentionCard(verdict));
         page.Children.Add(SelftestCard());
 
         // The amber badge on the Home rail entry means this notice (MainWindow.SetBadge "home").
@@ -75,18 +84,6 @@ public sealed class HomePage : Page
             page.Children.Add(U.Notice(Level.Warn, ov.Title, ov.Text, clear));
         }
 
-        if (s is not null && StatusText.HomeLine(s) is { } line)
-        {
-            var badge = StatusText.DisplaysBadge(s);
-            var level = badge?.Level ?? Level.Ok;
-            page.Children.Add(U.Notice(level, line,
-                badge is null ? "More than one 3D display is connected. Each one's details are on Displays."
-                              : "At least one display needs attention. The details are on Displays.",
-                U.Button("Open Displays", () => Ctx.Navigate("displays"), "outline", "sm")));
-        }
-
-        if (s is not null && s.Screens.Count > 0) page.Children.Add(ScreensCard(s));
-
         var grid = new U.CardGrid(2) { MinColumnWidth = 440 };
         grid.Add(RuntimeCard(s));
         grid.Add(PluginsCard(s));
@@ -96,20 +93,131 @@ public sealed class HomePage : Page
     }
 
     /// <summary>
-    /// Each screen's effective display processor, read-only: the selector is on
-    /// Displays (one place to change it).
+    /// The verdict's headline and one row per display: its name, which display driver shows 3D on it
+    /// (the driver's own name; its id is the tooltip) and up to three facts, each yes / no / not known
+    /// yet. This replaces the "Display driver for each display" card, whose content is in the rows.
     /// </summary>
-    private Control ScreensCard(StatusSnapshot s)
+    private Control VerdictCard(Verdict v)
     {
-        var link = U.Button("Change on Displays →", () => Ctx.Navigate("displays"), "link");
-        var kv = new U.KvList(220);
-        foreach (var d in StatusText.HomeScreenDps(s, Ctx.Dp))
+        var dot = U.Dot(v.Level, 14);
+        dot.VerticalAlignment = VerticalAlignment.Top;
+        dot.Margin = new Thickness(0, 9, 14, 0);
+        var headline = U.Wrapped(v.Headline, "h1");
+        headline.FontSize = 24;
+        if (v.Level is Level.Warn or Level.Critical) headline.Foreground = Tokens.For(v.Level);
+        var head = U.VStack(4, headline);
+        if (v.Subline.Length > 0) head.Children.Add(U.Wrapped(v.Subline, "dim"));
+        var top = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*") };
+        top.Children.Add(dot);
+        Grid.SetColumn(head, 1);
+        top.Children.Add(head);
+        Avalonia.Automation.AutomationProperties.SetLiveSetting(top, Avalonia.Automation.AutomationLiveSetting.Polite);
+
+        var body = U.VStack(14, top);
+        foreach (var r in v.Rows) body.Children.Add(VerdictRowView(r));
+        return U.Card(body);
+    }
+
+    private Control VerdictRowView(VerdictRow r)
+    {
+        var name = U.Wrapped(r.Name, "group");
+        name.FontSize = 15;
+        var title = U.Flow(10, 4, name);
+        if (r.Role is { } role) U.AddFlow(title, U.Chip(role), 6, 4);
+        if (!r.Is3D) U.AddFlow(title, U.Text(Verdicts.Plain2D, "meta"), 6, 4);
+        var details = U.Button("Details →", () => Ctx.Navigate("displays"), "link");
+        Avalonia.Automation.AutomationProperties.SetName(details, $"Details of {r.Name}");
+        var head = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto") };
+        head.Children.Add(title);
+        Grid.SetColumn(details, 1);
+        details.VerticalAlignment = VerticalAlignment.Top;
+        head.Children.Add(details);
+        var col = U.VStack(6, head);
+        if (r.Is3D)
         {
-            var value = U.Flow(8, 4, U.Text(d.Plugin ?? "not a 3D display", "value"));
-            if (d.Forced is { } f) U.AddFlow(value, U.Chip(f, Level.Warn));
-            kv.Add(d.Name, value);
+            var facts = U.Flow(16, 4);
+            foreach (var f in r.Facts) U.AddFlow(facts, FactView(f), 16, 4);
+            col.Children.Add(facts);
+            if (r.Driver is { } driver)
+            {
+                var line = U.Text($"Display driver: {driver}", "meta");
+                if (r.DriverId is { } id) ToolTip.SetTip(line, id);
+                var dl = U.Flow(8, 4, line);
+                if (r.Forced is { } forced) U.AddFlow(dl, U.Chip(forced, Level.Warn), 8, 4);
+                col.Children.Add(dl);
+            }
         }
-        return U.Card(U.VStack(12, U.CardTitle("Display driver for each display", null, link), kv));
+        var box = new Border { Child = col, Padding = new Thickness(14, 10) };
+        box.Classes.Add("field");
+        return box;
+    }
+
+    /// <summary>One fact: a tick (yes), an amber dot (no) or a hollow ring (not known yet), then its words.</summary>
+    private static Control FactView(VerdictFact f)
+    {
+        Control mark = f.Tick switch
+        {
+            Tick.Yes => new Avalonia.Controls.Shapes.Path
+            {
+                Data = Geometry.Parse("M 1,5 L 4,8 L 10,1"), Stroke = Tokens.For(Level.Ok), StrokeThickness = 2,
+                StrokeLineCap = PenLineCap.Round, StrokeJoin = PenLineJoin.Round, Width = 11, Height = 9,
+                VerticalAlignment = VerticalAlignment.Center,
+            },
+            Tick.No => U.Dot(Level.Warn, 8),
+            _ => new Avalonia.Controls.Shapes.Ellipse
+            {
+                Width = 8, Height = 8, Stroke = Tokens.Muted, StrokeThickness = 1.2, VerticalAlignment = VerticalAlignment.Center,
+            },
+        };
+        var text = U.Text(f.Text, f.Tick == Tick.NotKnownYet ? "dim" : "value");
+        text.VerticalAlignment = VerticalAlignment.Center;
+        var row = U.HStack(7, mark, text);
+        Avalonia.Automation.AutomationProperties.SetName(row, f.Text);
+        return row;
+    }
+
+    /// <summary>"Needs attention": one plain sentence per thing to fix, or "nothing", with the action the Dashboard already has for it.</summary>
+    private Control AttentionCard(Verdict v)
+    {
+        if (v.Kind == VerdictKind.Checking) return U.Card(U.Wrapped("Needs attention: checking…", "empty"));
+        if (v.Attention.Count == 0)
+            return U.Card(U.Flow(8, 4, U.Text("Needs attention", "group"), U.Text("nothing", "dim")));
+        var list = U.VStack(10);
+        foreach (var a in v.Attention)
+        {
+            var dot = U.Dot(a.Level, 8);
+            dot.VerticalAlignment = VerticalAlignment.Top;
+            dot.Margin = new Thickness(0, 6, 10, 0);
+            var text = U.Wrapped(a.Text, "soft");
+            if (a.Technical is { Length: > 0 } tech) ToolTip.SetTip(text, tech);
+            var col = U.VStack(6, text);
+            if (AttentionButton(a) is { } b) col.Children.Add(b);
+            var g = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*") };
+            g.Children.Add(dot);
+            Grid.SetColumn(col, 1);
+            g.Children.Add(col);
+            list.Children.Add(g);
+        }
+        return U.Card(U.VStack(12, U.CardTitle("Needs attention"), list));
+    }
+
+    /// <summary>Only actions the Dashboard already has; none opens the system's settings.</summary>
+    private Control? AttentionButton(AttentionItem a)
+    {
+        switch (a.Action)
+        {
+        case AttentionAction.OpenDisplays:
+            return U.Button("Open Displays", () => Ctx.Navigate("displays"), "outline", "sm");
+        case AttentionAction.OpenComponents:
+            return U.Button("Open Components", () => Ctx.Navigate("components"), "outline", "sm");
+        case AttentionAction.ActivateRuntime:
+            var b = U.Button("Make DisplayXR the active OpenXR runtime",
+                () => _ = Ctx.RunActionsAsync("runtime", CliArgs.Words("runtime activate")), "primary", "sm");
+            b.IsEnabled = !Ctx.ActionRunning;
+            return b;
+        default:
+            return null;
+        }
     }
 
     private Control RuntimeCard(StatusSnapshot? s)
@@ -256,20 +364,21 @@ public sealed class HomePage : Page
         var run = U.Button(Ctx.SelftestRunning ? "Checking…" : (st is null ? "Check my setup" : "Check again"),
             () => _ = Ctx.RunSelftestAsync(), "primary", "sm");
         run.IsEnabled = !Ctx.SelftestRunning;
+        var right = U.HStack(12, U.Text(Verdicts.LastChecked(st, Ctx.SelftestRunning), "meta"), run);
+        ((TextBlock)right.Children[0]).VerticalAlignment = VerticalAlignment.Center;
         var body = U.VStack(12, U.CardTitle("Check my setup",
-            "Checks that DisplayXR finds your display driver, reads your display correctly and is the 3D system apps use.", run));
+            "Checks that DisplayXR finds your display driver, reads your display correctly and is the 3D system apps use. Nothing is saved: the result is for this session.", right));
         if (Ctx.SelftestError is { } err) body.Children.Add(U.Notice(Level.Critical, "The check did not finish", err));
         if (st is null)
         {
             if (Ctx.SelftestError is null)
-                body.Children.Add(U.Wrapped(Ctx.SelftestRunning ? "Checking (about 10 seconds)…" : "Not checked yet.", "empty"));
+                body.Children.Add(U.Wrapped(Ctx.SelftestRunning ? "Checking (about 10 seconds)…" : "Not checked yet in this session.", "empty"));
             return U.Card(body);
         }
         int failed = st.Checks.Count(c => !c.Ok);
         var badge = U.Badge(StatusText.SelftestVerdict(st.Checks.Count, failed), st.Passed ? Level.Ok : Level.Critical, tick: st.Passed);
         ToolTip.SetTip(badge, st.Verdict); // the CLI's own word
-        var verdict = U.Flow(10, 4, badge, U.Text($"Checked at {st.When:HH:mm}", "meta"));
-        body.Children.Add(verdict);
+        body.Children.Add(U.Flow(10, 4, badge));
         var shown = _showAllChecks ? st.Checks : st.Checks.Where(c => !c.Ok).ToList();
         if (shown.Count > 0)
         {

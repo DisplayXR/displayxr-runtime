@@ -325,17 +325,6 @@ public static class StatusText
     /// <summary>The tooltip and accessible name of the amber mark on the Home rail entry (a machine-wide driver choice).</summary>
     public const string HomeBadgeTip = "One display driver is set for every display on this PC. Home says which, and how to clear it.";
 
-    public sealed record HomeScreenDp(string Name, string? Plugin, string? Forced);
-
-    /// <summary>
-    /// Home's per-screen summary: each screen's effective display processor
-    /// (dp list's resolve when read, else the snapshot's claim) and its forced chip.
-    /// </summary>
-    public static IReadOnlyList<HomeScreenDp> HomeScreenDps(StatusSnapshot s, DpList? dp) =>
-        s.Screens.Select(x => new HomeScreenDp(ScreenName(x),
-            dp?.Screen(x.Key)?.EffectivePlugin ?? (x.Claim.IsClaimed ? x.Claim.PluginId : null),
-            ForcedChip(x, dp))).ToList();
-
     /// <summary>The CLI verb a selector choice runs.</summary>
     public static CliArgs DpVerb(string key, DpChoice choice) => choice.PluginId is null
         ? new CliArgs("dp", "reset", "--screen", key)
@@ -374,18 +363,6 @@ public static class StatusText
     /// <summary>Every warn / critical the snapshot carries: per screen (vendor included) and system-wide.</summary>
     public static IEnumerable<StatusWarning> ActionableWarnings(StatusSnapshot s) =>
         s.Screens.SelectMany(ScreenWarnings).Concat(s.Warnings).Where(w => w.Level != WarningLevel.Info);
-
-    /// <summary>
-    /// Home's line (design §8, the vendor dashboard's Home rule): only with
-    /// more than one claimed screen or a warn / critical warning.
-    /// </summary>
-    public static string? HomeLine(StatusSnapshot s)
-    {
-        int claimed = Claimed(s);
-        int warnings = ActionableWarnings(s).Count();
-        if (claimed <= 1 && warnings == 0) return null;
-        return $"{Plural(claimed, "3D display", "3D displays")}{Sep}{Tracking(s)} {(Tracking(s) == 1 ? "sees" : "see")} you{Sep}{Plural(warnings, "thing", "things")} to check";
-    }
 
     /// <summary>The Displays nav badge: warn / critical only (design §8 feed discipline).</summary>
     public static NavBadge? DisplaysBadge(StatusSnapshot? s)

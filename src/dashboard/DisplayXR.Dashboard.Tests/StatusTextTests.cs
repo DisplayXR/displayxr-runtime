@@ -133,18 +133,6 @@ public class StatusTextTests
     }
 
     [Fact]
-    public void HomeLine_OnlyWithSeveralScreensOrAWarning()
-    {
-        Assert.Equal("2 3D displays · 2 see you · 1 thing to check", StatusText.HomeLine(Design));
-        var one = Design with { Screens = new[] { Design.Screens[0] } };
-        Assert.Null(StatusText.HomeLine(one));
-        var oneInfo = Design with { Screens = new[] { WithWarnings(Design.Screens[0], new StatusWarning("CLAIM_EDID_ONLY", WarningLevel.Info, "")) } };
-        Assert.Null(StatusText.HomeLine(oneInfo)); // info alone shows nothing new
-        var oneWarn = Design with { Screens = new[] { Design.Screens[1] } };
-        Assert.Equal("1 3D display · 1 sees you · 1 thing to check", StatusText.HomeLine(oneWarn));
-    }
-
-    [Fact]
     public void NavBadges()
     {
         Assert.Equal(new NavBadge(1, Level.Warn), StatusText.DisplaysBadge(Design));
@@ -328,22 +316,23 @@ public class StatusTextTests
     }
 
     [Fact]
-    public void HomeScreenDps_EffectivePerScreen()
+    public void HomeRows_EffectiveDriverPerScreen()
     {
         var a = Design.Screens[0] with { Key = "k0" };
         var b = Design.Screens[1] with { Key = "k1" };
         var snap = Design with { Screens = new[] { a, b } };
-        var fromSnapshot = StatusText.HomeScreenDps(snap, null);
-        Assert.Equal(new[] { a.Claim.PluginId, b.Claim.PluginId }, fromSnapshot.Select(d => d.Plugin));
+        var fromSnapshot = Verdicts.Rows(snap, null);
+        Assert.Equal(new[] { a.Claim.PluginId, b.Claim.PluginId }, fromSnapshot.Select(d => d.DriverId));
         var dp = new DpList(null, System.Array.Empty<DpRow>(), new[]
         {
             new DpScreen("k1", "", "", "sim-display", "sim-display", "user", true, "live"),
         });
-        var rows = StatusText.HomeScreenDps(snap, dp);
+        var rows = Verdicts.Rows(snap, dp);
         Assert.Equal(StatusText.ScreenName(b), rows[1].Name);
-        Assert.Equal("sim-display", rows[1].Plugin);
+        Assert.Equal("sim-display", rows[1].DriverId);
+        Assert.Equal("DisplayXR Sim Display", rows[1].Driver); // the name, the id is the tooltip
         Assert.Equal("Chosen by you", rows[1].Forced);
-        Assert.Equal(a.Claim.PluginId, rows[0].Plugin);
+        Assert.Equal(a.Claim.PluginId, rows[0].DriverId);
     }
 
     [Fact]
