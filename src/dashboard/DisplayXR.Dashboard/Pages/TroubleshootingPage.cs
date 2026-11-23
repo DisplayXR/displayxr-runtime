@@ -36,6 +36,7 @@ public sealed class TroubleshootingPage : Page
 
     public TroubleshootingPage() : base(PageRoutes.Troubleshooting, "Troubleshooting")
     {
+        System.Diagnostics.Debug.Assert(_parts.Select(p => p.Id).SequenceEqual(PageRoutes.TroubleshootingSections));
         foreach (var (_, _, page) in _parts)
             page.Rebuilt += () => { if (ReferenceEquals(page, Current)) RaiseRebuilt(); };
     }

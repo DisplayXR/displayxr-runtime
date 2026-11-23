@@ -92,7 +92,9 @@ public sealed class MainWindow : Window
 
         // Rail order: what an owner asks first; Troubleshooting (running apps, graphics details, the developer
         // page) set apart at the bottom. Every older --page id still lands on its content (Model/PageRoutes.cs).
-        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new ComponentsPage(), new SettingsPage(), new TroubleshootingPage() };
+        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new ComponentsPage(), new SettingsPage(), new TroubleshootingPage() }
+            .OrderBy(p => PageRoutes.Rail.ToList().IndexOf(p.Id)).ToList();
+        System.Diagnostics.Debug.Assert(_pages.Select(p => p.Id).SequenceEqual(PageRoutes.Rail), "the rail is PageRoutes.Rail");
         foreach (var p in _pages)
         {
             p.Bind(_ctx);

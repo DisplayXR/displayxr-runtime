@@ -21,6 +21,15 @@ public static class PageRoutes
     /// <summary>Troubleshooting's parts, in the order of its tab strip.</summary>
     public const string RunningApps = "apps", Graphics = "graphics", Advanced = "advanced";
 
+    /// <summary>The rail, top to bottom: five entries, the last one set apart at the bottom.</summary>
+    public static readonly System.Collections.Generic.IReadOnlyList<string> Rail = new[] { Home, Displays, Components, Settings, Troubleshooting };
+
+    /// <summary>Troubleshooting's tab strip, left to right.</summary>
+    public static readonly System.Collections.Generic.IReadOnlyList<string> TroubleshootingSections = new[] { RunningApps, Graphics, Advanced };
+
+    /// <summary>Every id an earlier Dashboard answered to (<c>--page</c>), each of which must still land somewhere.</summary>
+    public static readonly System.Collections.Generic.IReadOnlyList<string> LegacyIds = new[] { "home", "displays", "components", "catalog", "performance", "windows", "developer" };
+
     public static Route Route(string id)
     {
         id = (id ?? "").Trim().ToLowerInvariant();
