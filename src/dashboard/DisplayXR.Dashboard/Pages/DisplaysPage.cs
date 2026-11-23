@@ -212,7 +212,9 @@ public sealed class DisplaysPage : Page
         head.Children.Add(badge);
 
         var body = U.VStack(5, head);
-        body.Children.Add(U.Wrapped(StatusText.PlainStateLine(s), "soft"));
+        var state = U.Wrapped(StatusText.PlainStateLine(s), "soft");
+        ToolTip.SetTip(state, StatusText.StateLine(s)); // the technical line, as "Copy list" writes it
+        body.Children.Add(state);
 
         var warnings = StatusText.ScreenWarnings(s);
         if (warnings.Count > 0)

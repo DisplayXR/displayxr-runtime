@@ -171,8 +171,13 @@ public static class StatusText
         if (PlainTracking(s.EyeTracking.State) is { } t) parts.Add(t);
         if (Is3DOn(s) is { } on) parts.Add(on ? "3D on" : "3D off");
         if (s.Dps.Count > 0) parts.Add($"used by {Plural(s.Dps.Count, "app", "apps")}");
-        return parts.Count > 0 ? string.Join(Sep, parts) : "No live state yet";
+        if (parts.Count > 0) return string.Join(Sep, parts);
+        // No live state (no app draws on it): the same plain words as Home.
+        return s.Claim.IsClaimed ? IdleLine : Verdicts.Plain2D;
     }
+
+    /// <summary>A 3D display with no live state, on Home and on Displays.</summary>
+    public const string IdleLine = "3D turns on when a 3D app runs.";
 
     /// <summary>The display maker's own status in plain words, or null when its software reports none.</summary>
     public static string? PlainVendorLine(Screen s)

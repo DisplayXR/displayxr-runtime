@@ -14,7 +14,7 @@ namespace DisplayXR.Dashboard.Model;
 //
 // Honesty rule: a display has live state (3D on / off, sees you) only while a 3D app draws on it
 // through the running service (`screens[].dps` non-empty). With no app running the snapshot carries
-// none ("No live state yet"), so the two facts are "not known yet" and the headline never claims
+// none, so the two facts are "not known yet" and the headline never claims
 // that 3D is on or that the display sees the viewer.
 
 /// <summary>One fact's state: known yes, known no, or not known yet (no live state).</summary>
@@ -232,7 +232,7 @@ public static class Verdicts
             return new Verdict(VerdictKind.NotRunning, claimed == 1 ? "Your 3D display is recognised" : "Your 3D displays are recognised",
                                "Whether 3D is on is not known yet: DisplayXR isn't running in the background.", withMore(Level.Info), rows, attention);
         return new Verdict(VerdictKind.Ready, claimed == 1 ? "Your 3D display is ready" : "Your 3D displays are ready",
-                           Join("3D turns on when a 3D app runs.", more), withMore(Level.Ok), rows, attention);
+                           Join(StatusText.IdleLine, more), withMore(Level.Ok), rows, attention);
     }
 
     private static string Join(string a, string b) => b.Length == 0 ? a : $"{a} {b}";

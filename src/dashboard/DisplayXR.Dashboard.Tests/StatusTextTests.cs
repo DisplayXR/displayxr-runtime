@@ -96,6 +96,10 @@ public class StatusTextTests
         Assert.Equal("Recognised as a 3D display · display driver: leia-sr", StatusText.PlainClaimLine(a));
         Assert.StartsWith("Not recognised as a 3D display", StatusText.PlainClaimLine(a with { Claim = a.Claim with { PluginId = null } }));
         Assert.Equal("Sees you · 3D on · used by 1 app", StatusText.PlainStateLine(a));
+        var idle = a with { Dps = System.Array.Empty<ScreenDp>(), Mode = null, EyeTracking = a.EyeTracking with { State = "NO_DP" }, Vendor = a.Vendor with { Lens = "UNKNOWN" } };
+        Assert.Equal("3D turns on when a 3D app runs.", StatusText.PlainStateLine(idle)); // as on Home
+        Assert.Equal("Ordinary 2D display", StatusText.PlainStateLine(idle with { Claim = idle.Claim with { PluginId = null, Confidence = "NONE" } }));
+        Assert.StartsWith("tracking unknown", StatusText.StateLine(idle with { EyeTracking = idle.EyeTracking with { State = "UNKNOWN" } })); // the technical line stays
         Assert.Equal("Doesn't see you right now", StatusText.PlainTracking("NOT_TRACKING"));
         Assert.Null(StatusText.PlainTracking("NO_DP"));
         Assert.Equal("Display maker's software: ready · calibrated", StatusText.PlainVendorLine(a));
