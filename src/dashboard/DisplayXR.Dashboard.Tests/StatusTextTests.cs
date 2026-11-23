@@ -366,7 +366,14 @@ public class StatusTextTests
             new DpScreen("k0", "", "", "leia-sr", null, null, false, "live",
                          new[] { new DpCandidate("leia-sr", 100), new DpCandidate("sim-display", 10) }),
         });
-        Assert.True(StatusText.DriverChoiceOnFace(a, one, two));   // two drivers could drive it
+        // sim-display is the generic fallback driver ("used when no other driver fits"): not a real choice.
+        Assert.False(StatusText.DriverChoiceOnFace(a, one, two));
+        var three = new DpList(null, System.Array.Empty<DpRow>(), new[]
+        {
+            new DpScreen("k0", "", "", "leia-sr", null, null, false, "live",
+                         new[] { new DpCandidate("leia-sr", 100), new DpCandidate("other-panel", 50), new DpCandidate("sim-display", 10) }),
+        });
+        Assert.True(StatusText.DriverChoiceOnFace(a, one, three)); // two real drivers could drive it
         Assert.True(StatusText.DriverChoiceOnFace(a, Design, dp)); // two 3D displays
     }
 

@@ -354,11 +354,18 @@ public static class StatusText
     /// <summary>
     /// Whether a display card shows its driver selector on its face rather than behind Details: when
     /// more than one display driver can drive this display (its candidates in <c>dp list --json</c>),
-    /// or when more than one 3D display is present. Otherwise there is nothing to choose between.
+    /// or when more than one 3D display is present. The generic fallback driver (the one "used when no
+    /// other driver fits", <c>plugins[].fallback</c> in the snapshot) is not a real choice and is not
+    /// counted. Otherwise there is nothing to choose between.
     /// </summary>
-    public static bool DriverChoiceOnFace(Screen s, StatusSnapshot snap, DpList? dp) =>
-        Claimed(snap) > 1
-        || (dp?.Screen(s.Key)?.Candidates?.Select(c => c.PluginId).Distinct(StringComparer.OrdinalIgnoreCase).Count() ?? 0) > 1;
+    public static bool DriverChoiceOnFace(Screen s, StatusSnapshot snap, DpList? dp)
+    {
+        if (Claimed(snap) > 1) return true;
+        var fallback = snap.Plugins.Where(p => p.Fallback).Select(p => p.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        int real = dp?.Screen(s.Key)?.Candidates?.Select(c => c.PluginId).Where(id => !fallback.Contains(id))
+                     .Distinct(StringComparer.OrdinalIgnoreCase).Count() ?? 0;
+        return real > 1;
+    }
 
     /// <summary>The CLI verb a selector choice runs.</summary>
     public static CliArgs DpVerb(string key, DpChoice choice) => choice.PluginId is null
