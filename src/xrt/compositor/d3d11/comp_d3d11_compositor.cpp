@@ -818,6 +818,17 @@ struct comp_d3d11_compositor
 	//! paths (comp_*_compositor_set_mode_fill_views); 0 = no limit.
 	uint32_t mode_fill_views;
 
+	//! The once-only WARN when a mode-derived view size had to be clamped to
+	//! the worst-case atlas (the per-frame view-size sync in layer_commit).
+	bool view_cap_clamp_warned;
+
+	//! The active rendering-mode index layer_commit read for the last
+	//! committed frame (its single read, under c->mutex). The weave's segment
+	//! update and the HUD use it instead of re-reading the device, so they
+	//! describe the same mode as the atlas they present (a repaint replays
+	//! that frame, so the same index is right there too).
+	uint32_t frame_mode_index;
+
 	//! Compromise view scale for legacy apps. Only valid when legacy_app_tile_scaling is true.
 	float legacy_view_scale_x;
 	float legacy_view_scale_y;
@@ -1776,9 +1787,8 @@ d3d11_tt_weave(struct comp_d3d11_compositor *c,
 			// the publish below withholds zero-copy from the next (#2218) —
 			// the same one-frame lag as the windowed path.
 			if (!zero_copy && atlas_srv != nullptr) {
-				const uint32_t mode_index = (c->xdev != nullptr && c->xdev->hmd != nullptr)
-				                                ? c->xdev->hmd->active_rendering_mode_index
-				                                : 0;
+				// The frame's single read (layer_commit), not a fresh one.
+				const uint32_t mode_index = c->frame_mode_index;
 				seg_split =
 				    comp_d3d11_segments_update(c->segments, &c->seg_window, &canvas, c->context, mode_index);
 				comp_d3d11_segments_set_visibility(c->segments, c->visibility); // #2671
@@ -2518,11 +2528,13 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c,
 	data.fps = fps;
 	data.frame_time_ms = c->smoothed_frame_time_ms;
 	data.mode_3d = c->hardware_display_3d;
-	if (c->xdev != NULL && c->xdev->hmd != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-		if (idx < c->xdev->rendering_mode_count) {
-			data.rendering_mode_name = c->xdev->rendering_modes[idx].mode_name;
-		}
+	// The frame's single read of the active mode (layer_commit), not a fresh one.
+	const struct xrt_rendering_mode *hud_mode =
+	    (c->xdev != NULL && c->frame_mode_index < c->xdev->rendering_mode_count)
+	        ? &c->xdev->rendering_modes[c->frame_mode_index]
+	        : NULL;
+	if (hud_mode != NULL) {
+		data.rendering_mode_name = hud_mode->mode_name;
 	}
 	data.render_width = render_w;
 	data.render_height = render_h;
@@ -2540,11 +2552,8 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c,
 	// Use the active rendering mode's view_count for eye display (not eye_pos->count,
 	// which may report more eyes than the mode uses — e.g. tracker returns L/R in 2D mode).
 	uint32_t mode_eye_count = eye_pos->count;
-	if (c->xdev != NULL && c->xdev->hmd != NULL) {
-		uint32_t midx = c->xdev->hmd->active_rendering_mode_index;
-		if (midx < c->xdev->rendering_mode_count) {
-			mode_eye_count = c->xdev->rendering_modes[midx].view_count;
-		}
+	if (hud_mode != NULL) {
+		mode_eye_count = hud_mode->view_count;
 	}
 	if (mode_eye_count > eye_pos->count) {
 		mode_eye_count = eye_pos->count;
@@ -3898,9 +3907,8 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			// per-segment weave exactly as after the single-DP weave, and each
 			// segment DP gets its share of the zone mask (d3d11_sync_zone_mask_to_dp).
 			if (!zero_copy && atlas_srv != nullptr) {
-				const uint32_t mode_index = (c->xdev != nullptr && c->xdev->hmd != nullptr)
-				                                ? c->xdev->hmd->active_rendering_mode_index
-				                                : 0;
+				// The frame's single read (layer_commit), not a fresh one.
+				const uint32_t mode_index = c->frame_mode_index;
 				seg_split = comp_d3d11_segments_update(c->segments, &c->seg_window, &canvas,
 				                                       d3d11_out_context(c), mode_index);
 				// Every segment DP follows the session's 2D/3D mode on the
@@ -5577,6 +5585,41 @@ d3d11_hub_commit(struct comp_d3d11_compositor *c,
 	return XRT_SUCCESS;
 }
 
+#ifdef XRT_BUILD_DRIVER_QWERTY
+/*!
+ * One path for the runtime's mode keys (ADR-065): V (@p toggle) and '0' / '1'
+ * (@p selected). A digit does exactly what V does for the same target: the
+ * #1499 fill check, the active-index write (which the state tracker turns into
+ * XrEventDataRenderingModeChangedDXR), OUTPUT_MODE for a driver that
+ * implements it, and the hardware 2D/3D request a driver that does NOT
+ * implement OUTPUT_MODE needs to switch at all. Before, a digit only set
+ * OUTPUT_MODE, so on such a driver '0' / '1' did nothing.
+ */
+static void
+d3d11_apply_mode_key(struct comp_d3d11_compositor *c, bool toggle, int selected, bool qwerty_force_2d)
+{
+	struct xrt_device *head = c->xsysd->static_roles.head;
+	const bool have_table = head != nullptr && head->hmd != nullptr;
+	const struct u_rendering_mode_key_decision d = u_rendering_modes_decide_key(
+	    have_table ? head->rendering_modes : nullptr, have_table ? head->rendering_mode_count : 0,
+	    have_table ? head->hmd->active_rendering_mode_index : 0, toggle, (int32_t)selected, qwerty_force_2d,
+	    c->mode_fill_views);
+	switch (d.action) {
+	case U_RENDERING_MODE_KEY_APPLY:
+		head->hmd->active_rendering_mode_index = d.target;
+		xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)d.target);
+		comp_d3d11_compositor_request_display_mode(&c->base.base, d.want_3d);
+		break;
+	case U_RENDERING_MODE_KEY_REFUSED:
+		u_rendering_modes_log_key_refused(&head->rendering_modes[d.target], c->mode_fill_views);
+		break;
+	case U_RENDERING_MODE_KEY_HARDWARE_ONLY: comp_d3d11_compositor_request_display_mode(&c->base.base, d.want_3d); break;
+	case U_RENDERING_MODE_KEY_NOTHING:
+	default: break;
+	}
+}
+#endif
+
 static xrt_result_t
 d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -5670,6 +5713,60 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	// Runtime mode keys (ADR-065): V toggles 2D <-> 3D, '0' / '1' select mode
+	// 0 / 1. One path for both (u_rendering_modes_decide_key).
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (c->xsysd != nullptr) {
+		bool force_2d = false;
+		if (qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d)) {
+			d3d11_apply_mode_key(c, true, -1, force_2d);
+		}
+
+		// Legacy apps (no XR_DXR_display_info) only support the V toggle
+		// between mode 0 (2D) and mode 1 (3D) — skip direct mode selection.
+		if (!c->legacy_app_tile_scaling) {
+			int render_mode = -1;
+			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
+				d3d11_apply_mode_key(c, false, render_mode, false);
+			}
+		}
+	}
+#endif
+
+	/*
+	 * THE active mode for this frame: read ONCE, after the key paths above
+	 * (which may move it) and under c->mutex, and used by every per-frame
+	 * reader below — the eye-count fallback and clamp, the renderer's tile
+	 * layout, its view size and the zero-copy recipe. The V path used to run
+	 * BETWEEN the tile-layout sync and the view-size sync, so a V from 3D to 2D
+	 * gave one frame with mode 0's view size (3840x2160) on mode 1's 2x1 grid:
+	 * a 7680x2160 renderer atlas, twice the worst-case cap, and a content box
+	 * the cross-adapter bridge refused. The device's index can also be written
+	 * from the app's xrRequestDisplayRenderingModeDXR thread, so re-reading it
+	 * per site could tear the same way. The table itself is fixed for the
+	 * device's life (ADR-065), so the pointer stays valid.
+	 */
+	const struct xrt_rendering_mode *frame_mode = NULL;
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		c->frame_mode_index = idx;
+		if (idx < c->xdev->rendering_mode_count) {
+			frame_mode = &c->xdev->rendering_modes[idx];
+		}
+	}
+	// The worst-case atlas cap follows the table as it is now: a display-info
+	// refresh (hotplug, a larger panel) recomputes the per-mode view sizes, and
+	// a cap left at its create-time value would clamp a legitimately larger
+	// mode below. Before anything below sizes or clamps against it.
+	if (frame_mode != NULL && c->renderer != NULL) {
+		uint32_t cap_w = 0, cap_h = 0;
+		comp_d3d11_renderer_get_atlas_cap(c->renderer, &cap_w, &cap_h);
+		if (u_tiling_follow_atlas_cap(c->xdev->rendering_modes, c->xdev->rendering_mode_count, &cap_w,
+		                              &cap_h)) {
+			comp_d3d11_renderer_set_atlas_cap(c->renderer, cap_w, cap_h);
+		}
+	}
+
 	// Get predicted eye positions
 	struct xrt_eye_positions eye_pos = {};
 	if (c->display_processor != nullptr || c->hub.active) {
@@ -5688,11 +5785,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	if (!eye_pos.valid) {
 		// Use view_count from the active rendering mode for the fallback
 		uint32_t fallback_count = 2;
-		if (c->xdev != NULL && c->xdev->hmd != NULL) {
-			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-			if (idx < c->xdev->rendering_mode_count) {
-				fallback_count = c->xdev->rendering_modes[idx].view_count;
-			}
+		if (frame_mode != NULL) {
+			fallback_count = frame_mode->view_count;
 		}
 		if (fallback_count == 1) {
 			eye_pos.count = 1;
@@ -5714,80 +5808,18 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	 */
 	const struct xrt_eye_positions render_eyes = eye_pos;
 
-	// Sync hardware_display_3d and tile layout from device's active rendering mode
-	if (c->xdev != NULL && c->xdev->hmd != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-		if (idx < c->xdev->rendering_mode_count) {
-			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
-			c->hardware_display_3d = mode->hardware_display_3d;
-			// Clamp eye count to the active mode's view_count
-			if (eye_pos.count > mode->view_count) {
-				eye_pos.count = mode->view_count;
-			}
-			if (mode->tile_columns > 0 && c->renderer != NULL) {
-				comp_d3d11_renderer_set_tile_layout(
-				    c->renderer, mode->tile_columns, mode->tile_rows);
-			}
+	// Sync hardware_display_3d and tile layout from the frame's active mode
+	if (frame_mode != NULL) {
+		const struct xrt_rendering_mode *mode = frame_mode;
+		c->hardware_display_3d = mode->hardware_display_3d;
+		// Clamp eye count to the active mode's view_count
+		if (eye_pos.count > mode->view_count) {
+			eye_pos.count = mode->view_count;
+		}
+		if (mode->tile_columns > 0 && c->renderer != NULL) {
+			comp_d3d11_renderer_set_tile_layout(c->renderer, mode->tile_columns, mode->tile_rows);
 		}
 	}
-
-	// Runtime-side 2D/3D toggle from qwerty V key
-#ifdef XRT_BUILD_DRIVER_QWERTY
-	if (c->xsysd != nullptr) {
-		bool force_2d = false;
-		bool toggled = qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d);
-		if (toggled) {
-			struct xrt_device *head = c->xsysd->static_roles.head;
-			bool key_ok = true;
-			if (head != nullptr && head->hmd != NULL &&
-			    head->rendering_mode_count >= U_RENDERING_MODES_RUNTIME_COUNT) {
-				// ADR-065: V toggles mode 0 <-> mode 1, decided from the mode the
-				// device is in NOW rather than from qwerty's own flag (which a
-				// session that began in 2D, or moved by an app request, would have
-				// out of phase). The 3D mode is always index 1: no "last 3D mode".
-				const uint32_t target =
-				    u_rendering_modes_toggle_target(head->rendering_modes, head->rendering_mode_count,
-				                                    head->hmd->active_rendering_mode_index);
-				// #1499 on the key path: never into a mode this session cannot fill.
-				key_ok = u_rendering_modes_key_target_allowed(
-				    head->rendering_modes, head->rendering_mode_count, target, c->mode_fill_views);
-				if (key_ok) {
-					force_2d = (target == U_RENDERING_MODE_2D);
-					head->hmd->active_rendering_mode_index = target;
-					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target);
-				} else {
-					u_rendering_modes_log_key_refused(&head->rendering_modes[target],
-					                                  c->mode_fill_views);
-				}
-			}
-			if (key_ok) {
-				comp_d3d11_compositor_request_display_mode(&c->base.base, !force_2d);
-			}
-		}
-
-		// Rendering mode change from the qwerty 0/1 keys (ADR-065).
-		// Legacy apps (no XR_DXR_display_info) only support V toggle between
-		// mode 0 (2D) and mode 1 (default 3D) — skip direct mode selection.
-		if (!c->legacy_app_tile_scaling) {
-			int render_mode = -1;
-			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
-				struct xrt_device *head = c->xsysd->static_roles.head;
-				if (head != nullptr && render_mode >= 0 &&
-				    !u_rendering_modes_key_target_allowed(head->rendering_modes,
-				                                          head->rendering_mode_count,
-				                                          (uint32_t)render_mode, c->mode_fill_views)) {
-					// #1499 on the key path: '1' never moves a session into a mode it cannot fill.
-					if ((uint32_t)render_mode < head->rendering_mode_count) {
-						u_rendering_modes_log_key_refused(&head->rendering_modes[render_mode],
-						                                  c->mode_fill_views);
-					}
-				} else if (head != nullptr) {
-					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
-				}
-			}
-		}
-	}
-#endif
 
 	// #439 Phase 3: frame mask state. Any XrCompositionLayerLocal2DDXR layer
 	// this frame raises an implicit mask (Q3) which, like an explicit one,
@@ -5890,11 +5922,9 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// view dims from atlas invariance, but actual mode dims may differ
 	// (e.g. 2D mode needs full display height). Resize if needed.
 	// Legacy apps: view dims are fixed at compromise scale, skip mode sync.
-	if (!c->legacy_app_tile_scaling &&
-	    c->xdev != NULL && c->xdev->hmd != NULL && c->renderer != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-		if (idx < c->xdev->rendering_mode_count) {
-			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+	if (!c->legacy_app_tile_scaling && frame_mode != NULL && c->renderer != NULL) {
+		{
+			const struct xrt_rendering_mode *mode = frame_mode;
 			if (mode->view_width_pixels > 0) {
 				uint32_t new_vw = mode->view_width_pixels;
 				uint32_t new_vh = mode->view_height_pixels;
@@ -5906,6 +5936,32 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					// derive view dims from actual window client area.
 					u_tiling_compute_canvas_view(mode, tgt_width, tgt_height,
 					                             &new_vw, &new_vh);
+				} else {
+					/*
+					 * The view size is the mode's own: the content it makes
+					 * with the mode's grid is, by construction, inside the
+					 * worst-case atlas across the modes. Hold that as a hard
+					 * bound: a size outside it means two halves of "the
+					 * active mode" disagree, and growing the atlas for it
+					 * would leave a past-the-cap allocation for the rest of
+					 * the session (it never shrinks, #602). Clamp, and say so
+					 * once. Canvas- and window-derived sizes above are left
+					 * alone: a window larger than the display may legitimately
+					 * ask for more than the cap (u_tiling_grow_atlas_extent).
+					 */
+					uint32_t cap_w = 0, cap_h = 0;
+					comp_d3d11_renderer_get_atlas_cap(c->renderer, &cap_w, &cap_h);
+					const bool cw = u_tiling_clamp_view_to_atlas_cap(mode->tile_columns, cap_w, &new_vw);
+					const bool ch = u_tiling_clamp_view_to_atlas_cap(mode->tile_rows, cap_h, &new_vh);
+					if ((cw || ch) && !c->view_cap_clamp_warned) {
+						c->view_cap_clamp_warned = true;
+						U_LOG_W("d3d11: mode %u '%s' view %ux%u x tiles %ux%u exceeds the worst-case atlas "
+						        "%ux%u - view clamped to %ux%u, the atlas is not grown past the cap "
+						        "(logged once)",
+						        mode->mode_index, mode->mode_name, mode->view_width_pixels,
+						        mode->view_height_pixels, mode->tile_columns, mode->tile_rows, cap_w, cap_h,
+						        new_vw, new_vh);
+					}
 				}
 				uint32_t cur_vw, cur_vh;
 				comp_d3d11_renderer_get_view_dimensions(c->renderer, &cur_vw, &cur_vh);
@@ -5940,12 +5996,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	void *zc_srv = nullptr;
 	// #2317 P1b: nor under the hub — the hub opens the RENDERER atlas.
 	if (!c->split_active && !c->hub.active) {
-		const struct xrt_rendering_mode *mode = NULL;
-		if (c->xdev != NULL && c->xdev->hmd != NULL) {
-			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-			if (idx < c->xdev->rendering_mode_count)
-				mode = &c->xdev->rendering_modes[idx];
-		}
+		const struct xrt_rendering_mode *mode = frame_mode;
 		if (mode != NULL && c->layer_accum.layer_count == 1) {
 			struct comp_layer *layer = &c->layer_accum.layers[0];
 			if (layer->data.type == XRT_LAYER_PROJECTION ||

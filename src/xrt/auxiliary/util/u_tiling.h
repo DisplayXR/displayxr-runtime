@@ -576,6 +576,135 @@ u_tiling_grow_atlas_extent(uint32_t cur, uint32_t req, uint32_t cap)
 	return (uint32_t)grown;
 }
 
+/*!
+ * Does a high-water-mark atlas allocation (#602) of @p alloc_w x @p alloc_h
+ * still hold the content of a @p tile_columns x @p tile_rows grid of
+ * @p view_w x @p view_h views?
+ *
+ * The content packs top-left, so it fits when both of its extents do. A
+ * renderer whose view size is FIXED (a legacy session at its compromise scale)
+ * must ask this whenever its tile layout changes: the grid alone can outgrow
+ * the allocation. A legacy session that began in a 1x1 mode was allocated for
+ * one view; the 2D -> 3D switch to a 2x1 mode doubled the content width
+ * without touching the allocation, and the cross-adapter bridge refused every
+ * frame from then on (the 1920x2160 source / 3840x2160 copy box of the field
+ * log).
+ *
+ * An empty allocation (0 on either axis) holds nothing.
+ */
+static inline bool
+u_tiling_atlas_alloc_holds(uint32_t tile_columns,
+                           uint32_t tile_rows,
+                           uint32_t view_w,
+                           uint32_t view_h,
+                           uint32_t alloc_w,
+                           uint32_t alloc_h)
+{
+	if (alloc_w == 0 || alloc_h == 0) {
+		return false;
+	}
+	const uint64_t content_w = (uint64_t)tile_columns * view_w;
+	const uint64_t content_h = (uint64_t)tile_rows * view_h;
+	return content_w <= alloc_w && content_h <= alloc_h;
+}
+
+/*!
+ * THE decision a renderer takes when its tile layout changes: must the atlas
+ * allocation grow to hold the new grid?
+ *
+ * Only a renderer whose view size is FIXED (@p fixed_view_size: a legacy
+ * session at its compromise scale) needs it — an extension session's per-frame
+ * view-size sync resizes anyway — and only one that owns its allocation
+ * (@p have_owned_atlas: there is an atlas, and it is not borrowed from a
+ * deposit ring the compositor sizes itself). Then it must grow exactly when
+ * the allocation no longer holds the grid (u_tiling_atlas_alloc_holds). The
+ * caller grows with its ordinary resize at the unchanged view size, which
+ * lands at u_tiling_grow_atlas_extent of the new content: the extent a session
+ * that began in the new mode has.
+ *
+ * Every renderer that keeps a legacy view size fixed calls this from its
+ * set-tile-layout path (D3D11, D3D12) or its per-frame mode sync (vk_native);
+ * GL and Metal allocate the worst case across modes up front and never grow.
+ */
+static inline bool
+u_tiling_tile_layout_needs_atlas_grow(bool fixed_view_size,
+                                      bool have_owned_atlas,
+                                      uint32_t tile_columns,
+                                      uint32_t tile_rows,
+                                      uint32_t view_w,
+                                      uint32_t view_h,
+                                      uint32_t alloc_w,
+                                      uint32_t alloc_h)
+{
+	if (!fixed_view_size || !have_owned_atlas || tile_columns == 0 || tile_rows == 0) {
+		return false;
+	}
+	return !u_tiling_atlas_alloc_holds(tile_columns, tile_rows, view_w, view_h, alloc_w, alloc_h);
+}
+
+/*!
+ * Bring a held worst-case atlas cap up to date with the rendering-mode table
+ * AS IT IS NOW.
+ *
+ * The per-mode view sizes are recomputed whenever the display info is
+ * refreshed (a hotplug, a larger panel), so a cap computed once at compositor
+ * create can go stale; clamped against it, a legitimately larger mode would be
+ * silently reduced. Call this at the frame's single read of the active mode,
+ * before anything is sized or clamped against the cap.
+ *
+ * A table that yields no extent (0 on either axis) leaves the held cap alone.
+ *
+ * @return true when *@p inout_cap_w / *@p inout_cap_h changed.
+ */
+static inline bool
+u_tiling_follow_atlas_cap(const struct xrt_rendering_mode *modes,
+                          uint32_t count,
+                          uint32_t *inout_cap_w,
+                          uint32_t *inout_cap_h)
+{
+	if (modes == NULL || count == 0 || inout_cap_w == NULL || inout_cap_h == NULL) {
+		return false;
+	}
+	uint32_t w = 0, h = 0;
+	u_tiling_compute_system_atlas(modes, count, &w, &h);
+	if (w == 0 || h == 0 || (w == *inout_cap_w && h == *inout_cap_h)) {
+		return false;
+	}
+	*inout_cap_w = w;
+	*inout_cap_h = h;
+	return true;
+}
+
+/*!
+ * Clamp one axis of a per-view extent so @p tiles of it fit the worst-case
+ * atlas extent @p cap (from u_tiling_compute_system_atlas()).
+ *
+ * For a view size taken from a rendering mode, content within the worst case
+ * across the modes holds by construction; a request outside it means the
+ * caller combined one mode's view size with another mode's grid (a 2D view on
+ * a 2x1 grid asked for 7680x2160 against a 3840x2160 cap in the field). The
+ * renderer atlas never shrinks (#602), so growing for it would keep the
+ * oversized allocation for the rest of the session: clamp instead.
+ *
+ * @p tiles == 0 or @p cap == 0 (unknown) leaves @p inout_view alone. The
+ * result is never 0.
+ *
+ * @return true when @p inout_view was clamped.
+ */
+static inline bool
+u_tiling_clamp_view_to_atlas_cap(uint32_t tiles, uint32_t cap, uint32_t *inout_view)
+{
+	if (inout_view == NULL || tiles == 0 || cap == 0) {
+		return false;
+	}
+	if ((uint64_t)tiles * *inout_view <= cap) {
+		return false;
+	}
+	uint32_t v = cap / tiles;
+	*inout_view = v > 0 ? v : 1;
+	return true;
+}
+
 #ifdef __cplusplus
 }
 #endif

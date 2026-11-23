@@ -27,6 +27,7 @@
 #include "xrt/xrt_device.h"
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
+#include "util/u_rendering_modes.h"
 #endif
 
 // Defined in os_macos.c (aux_os library, linked by all targets)
@@ -159,13 +160,19 @@ oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt
 		if (!legacy_app && xdevs != NULL && xdev_count > 0 && head != NULL) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(xdevs, xdev_count, &render_mode)) {
-				// Range guard (V no longer cycles, ADR-065); feed the value back
-				if (head->rendering_mode_count > 0) {
-					render_mode = render_mode % (int)head->rendering_mode_count;
+				// The same digit rule as every compositor (ADR-065,
+				// u_rendering_modes_decide_key): only a mode the table has
+				// and that is not already in effect; anything else is a no-op.
+				const bool have_table = head->hmd != NULL;
+				const struct u_rendering_mode_key_decision d = u_rendering_modes_decide_key(
+				    have_table ? head->rendering_modes : NULL, have_table ? head->rendering_mode_count : 0,
+				    have_table ? head->hmd->active_rendering_mode_index : 0, false, (int32_t)render_mode, false,
+				    0);
+				if (d.action == U_RENDERING_MODE_KEY_APPLY) {
 					// Update qwerty's stored mode for correct V cycling
-					qwerty_set_rendering_mode_silent(xdevs, xdev_count, render_mode);
+					qwerty_set_rendering_mode_silent(xdevs, xdev_count, (int)d.target);
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)d.target);
 				}
-				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
 				// Note: do NOT change hmd->view_count for _rt apps.
 				// _rt apps always render 3D; the compositor/weaver
 				// handles 2D by displaying one eye or blending.
