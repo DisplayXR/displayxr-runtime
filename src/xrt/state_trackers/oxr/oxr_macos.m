@@ -153,13 +153,13 @@ oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt
 		}
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
-		// Poll for direct rendering mode change (1/2/3 keys via qwerty driver).
+		// Poll for direct rendering mode change (0/1 keys via qwerty driver, ADR-065).
 		// Legacy apps (no XR_DXR_display_info) only support V toggle between
 		// mode 0 (2D) and mode 1 (default 3D) — skip direct mode selection.
 		if (!legacy_app && xdevs != NULL && xdev_count > 0 && head != NULL) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(xdevs, xdev_count, &render_mode)) {
-				// Wrap for V key cycling and feed back wrapped value
+				// Range guard (V no longer cycles, ADR-065); feed the value back
 				if (head->rendering_mode_count > 0) {
 					render_mode = render_mode % (int)head->rendering_mode_count;
 					// Update qwerty's stored mode for correct V cycling

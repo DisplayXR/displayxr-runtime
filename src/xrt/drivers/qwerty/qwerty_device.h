@@ -54,7 +54,7 @@ struct qwerty_system
 	bool force_2d_mode;              //!< Runtime-side 2D/3D toggle (V key when HMD focused)
 	bool display_mode_toggle_pending; //!< Set by key handler, cleared by compositor
 
-	int rendering_mode;                  //!< Current unified rendering mode index (0=2D, 1+=3D modes)
+	int rendering_mode;                  //!< Last requested rendering mode (0 = 2D, 1 = the 3D mode; ADR-065)
 	bool rendering_mode_change_pending;  //!< Set by key handler, cleared by caller
 
 	// View controls (P toggles mode with derivation, spacebar resets)
@@ -566,7 +566,7 @@ void
 qwerty_toggle_display_mode(struct qwerty_system *qs);
 
 /*!
- * Set the rendering mode index (1/2/3 keys). Marks the change as
+ * Set the rendering mode index (0/1 keys, ADR-065). Marks the change as
  * pending for the compositor to pick up via
  * qwerty_check_rendering_mode_change().
  * @public @memberof qwerty_system

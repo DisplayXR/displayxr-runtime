@@ -880,7 +880,9 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 	qs->log_level = log_level;
 	qs->process_keys = true;
 
-	// Default rendering mode matches sim_display default (mode 1 = first 3D mode)
+	// Two run-time modes (ADR-065): 0 = 2D, 1 = the driver's 3D mode. The V
+	// toggle is decided by the compositor from the device's active mode, so
+	// this initial value only seeds the 0/1 bookkeeping below.
 	qs->rendering_mode = 1;
 
 	// View defaults
@@ -1317,6 +1319,8 @@ qwerty_set_rendering_mode(struct qwerty_system *qs, int mode)
 {
 	qs->rendering_mode = mode;
 	qs->rendering_mode_change_pending = true;
+	// Keep the V flag in phase with an explicit 0/1 choice (ADR-065).
+	qs->force_2d_mode = (mode == 0);
 	U_LOG_W("Qwerty: rendering mode set to %d", mode);
 }
 

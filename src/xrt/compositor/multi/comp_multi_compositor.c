@@ -16,6 +16,7 @@
  * (#967); platform shape: `docs/architecture/service-architecture.md` §7.
  */
 
+#include "util/u_rendering_modes.h"
 #include "util/u_logging.h"
 #include "xrt/xrt_display_processor_vk.h" // N6 Part 1 (#2144): the target-time eye slot on the VK variant
 #include "xrt/xrt_session.h"
@@ -2740,14 +2741,17 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 	// NOTE: May be replaced by XR_EXT_display_render_mode / xrSetDisplayRenderModeEXT()
 	struct xrt_device *head = mc->xsysd ? mc->xsysd->static_roles.head : NULL;
 	if (head != NULL && head->set_property != NULL) {
+		// ADR-065: two run-time modes, so 2D is mode 0 and 3D is mode 1. (This
+		// used to park the device in OUTPUT_MODE 2 for "2D" — a stale index
+		// that, on the old multi-mode sim_display table, was a 3D layout.)
 		if (!enable_3d) {
 			int32_t current_mode = 0;
 			xrt_device_get_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, &current_mode);
 			mc->session_render.saved_output_mode = current_mode;
-			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 2); // blend for 2D
+			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)U_RENDERING_MODE_2D);
 		} else {
 			int saved = mc->session_render.saved_output_mode;
-			int32_t restore_mode = (saved >= 0) ? saved : 1; // default anaglyph
+			int32_t restore_mode = (saved > 0) ? saved : (int32_t)U_RENDERING_MODE_3D;
 			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, restore_mode);
 			mc->session_render.saved_output_mode = -1;
 		}
@@ -2882,7 +2886,6 @@ multi_compositor_create(struct multi_system_compositor *msc,
 	mc->xses = xses;
 	mc->xsi = *xsi;
 	mc->hardware_display_3d = true;
-	mc->last_3d_mode_index = 1;
 	mc->session_render.saved_output_mode = -1;
 
 	os_mutex_init(&mc->slot_lock);

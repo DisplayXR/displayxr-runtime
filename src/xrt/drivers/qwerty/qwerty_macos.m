@@ -421,14 +421,10 @@ qwerty_process_macos(struct xrt_device **xdevs,
 
 		case kVK_ANSI_V:
 			if (qsys->hmd_focused) {
-				// HMD focused: toggle 2D/3D AND cycle rendering mode.
-				// The compositor processes toggle first (all apps), then
-				// mode cycling (extension apps only — gated by legacy flag).
-				// Legacy apps: only the toggle fires (2D/3D).
-				// Extension apps: mode cycling overrides the toggle.
+				// HMD focused: toggle 2D <-> 3D (mode 0 <-> mode 1), the same
+				// as every other platform (ADR-065; V no longer also cycles).
 				if (is_down && ![event isARepeat]) {
 					qwerty_toggle_display_mode(qsys);
-					qwerty_set_rendering_mode(qsys, qsys->rendering_mode + 1);
 				}
 			} else {
 				// Controller focused: thumbstick click
@@ -439,17 +435,15 @@ qwerty_process_macos(struct xrt_device **xdevs,
 			}
 			break;
 
-		// 0/1/2/3: unified rendering mode (HMD focused, keydown, no repeat)
+		// 0/1: rendering mode 0 (2D) / 1 (the driver's 3D mode), HMD focused,
+		// keydown, no repeat. ADR-065: one key map on every platform; 2-8 select nothing.
 		case kVK_ANSI_0:
 			if (is_down && ![event isARepeat] && qsys->hmd_focused)
 				qwerty_set_rendering_mode(qsys, 0);
 			break;
 		case kVK_ANSI_1:
-		case kVK_ANSI_2:
-		case kVK_ANSI_3:
-		case kVK_ANSI_4:
 			if (is_down && ![event isARepeat] && qsys->hmd_focused)
-				qwerty_set_rendering_mode(qsys, keyCode - kVK_ANSI_1 + 1);
+				qwerty_set_rendering_mode(qsys, 1);
 			break;
 
 		// Controller follow HMD toggle

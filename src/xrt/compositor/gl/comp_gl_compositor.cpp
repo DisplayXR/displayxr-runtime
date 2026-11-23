@@ -67,6 +67,7 @@
 
 #include "os/os_threading.h"
 
+#include "util/u_rendering_modes.h"
 #include "util/u_logging.h"
 #include "util/u_window_visibility.h"
 // #1589/#1610: the two shared colour decisions — the fast-path predicate and
@@ -1087,7 +1088,6 @@ struct comp_gl_compositor
 	struct xrt_system_devices *xsysd;
 	bool sys_info_set;
 	struct xrt_system_compositor_info sys_info;
-	uint32_t last_3d_mode_index;       //!< Last 3D mode index (for V-key toggle restore)
 	bool legacy_app_tile_scaling;      //!< True if app is legacy (gates 1/2/3 key mode selection)
 
 	// --- #439 Phase 3 — Local2D / zone-mask consumer (full net-new GL leg) ---
@@ -8021,22 +8021,23 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		bool toggled = qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d);
 		if (toggled) {
 			struct xrt_device *head = c->xsysd->static_roles.head;
-			if (head != NULL && head->hmd != NULL) {
-				if (force_2d) {
-					uint32_t cur = head->hmd->active_rendering_mode_index;
-					if (cur < head->rendering_mode_count &&
-					    head->rendering_modes[cur].hardware_display_3d) {
-						c->last_3d_mode_index = cur;
-					}
-					head->hmd->active_rendering_mode_index = 0;
-				} else {
-					head->hmd->active_rendering_mode_index = c->last_3d_mode_index;
-				}
+			if (head != NULL && head->hmd != NULL &&
+			    head->rendering_mode_count >= U_RENDERING_MODES_RUNTIME_COUNT) {
+				// ADR-065: V toggles mode 0 <-> mode 1, decided from the mode the
+				// device is in NOW rather than from qwerty's own flag (which a
+				// session that began in 2D, or moved by an app request, would have
+				// out of phase). The 3D mode is always index 1: no "last 3D mode".
+				const uint32_t target =
+				    u_rendering_modes_toggle_target(head->rendering_modes, head->rendering_mode_count,
+				                                    head->hmd->active_rendering_mode_index);
+				force_2d = (target == U_RENDERING_MODE_2D);
+				head->hmd->active_rendering_mode_index = target;
+				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target);
 			}
 			comp_gl_compositor_request_display_mode(&c->base.base, !force_2d);
 		}
 
-		// Rendering mode change from qwerty 0/1/2/3/4 keys.
+		// Rendering mode change from the qwerty 0/1 keys (ADR-065).
 		// Legacy apps only support V toggle — skip direct mode selection.
 		if (!c->legacy_app_tile_scaling) {
 			int render_mode = -1;
@@ -9763,7 +9764,6 @@ comp_gl_compositor_set_sys_info(struct xrt_compositor *xc, const struct xrt_syst
 	c->sys_info = *info;
 	c->sys_info_set = true;
 	c->legacy_app_tile_scaling = info->legacy_app_tile_scaling;
-	c->last_3d_mode_index = 1;
 
 	// Legacy apps: fix view dims at the actual recommended size the app was told to render at.
 	if (info->legacy_app_tile_scaling &&

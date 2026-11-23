@@ -44,6 +44,7 @@
 #include "xrt/xrt_display_processor_metal.h"
 #include "xrt/xrt_system.h"
 
+#include "util/u_rendering_modes.h"
 #include "util/u_logging.h"
 #include "util/u_window_visibility.h"
 #include "util/u_misc.h"
@@ -309,9 +310,6 @@ struct comp_metal_compositor
 
 	//! True when display is in 3D mode (weaver active). False = 2D passthrough.
 	bool hardware_display_3d;
-
-	//! Last 3D mode index (for V-key toggle restore).
-	uint32_t last_3d_mode_index;
 
 	//! True if app is legacy (no XR_DXR_display_info) — gates 1/2/3 key mode selection.
 	bool legacy_app_tile_scaling;
@@ -5238,22 +5236,22 @@ metal_compositor_layer_commit_frame(struct xrt_compositor *xc, xrt_graphics_sync
 		bool toggled = qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d);
 		if (toggled) {
 			struct xrt_device *head = c->xsysd->static_roles.head;
-			if (head != NULL && head->hmd != NULL) {
-				if (force_2d) {
-					uint32_t cur = head->hmd->active_rendering_mode_index;
-					if (cur < head->rendering_mode_count &&
-					    head->rendering_modes[cur].hardware_display_3d) {
-						c->last_3d_mode_index = cur;
-					}
-					head->hmd->active_rendering_mode_index = 0;
-				} else {
-					head->hmd->active_rendering_mode_index = c->last_3d_mode_index;
-				}
+			if (head != NULL && head->hmd != NULL &&
+			    head->rendering_mode_count >= U_RENDERING_MODES_RUNTIME_COUNT) {
+				// ADR-065: V toggles mode 0 <-> mode 1, decided from the mode the
+				// device is in NOW rather than from qwerty's own flag (which a
+				// session that began in 2D, or moved by an app request, would have
+				// out of phase). The 3D mode is always index 1: no "last 3D mode".
+				const uint32_t target = u_rendering_modes_toggle_target(
+				    head->rendering_modes, head->rendering_mode_count, head->hmd->active_rendering_mode_index);
+				force_2d = (target == U_RENDERING_MODE_2D);
+				head->hmd->active_rendering_mode_index = target;
+				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target);
 			}
 			comp_metal_compositor_request_display_mode(&c->base.base, !force_2d);
 		}
 
-		// Rendering mode change from qwerty 0/1/2/3/4 keys.
+		// Rendering mode change from the qwerty 0/1 keys (ADR-065).
 		// Legacy apps only support V toggle — skip direct mode selection.
 		if (!c->legacy_app_tile_scaling) {
 			int render_mode = -1;
@@ -7918,7 +7916,6 @@ comp_metal_compositor_set_sys_info(struct xrt_compositor *xc,
 	struct comp_metal_compositor *c = metal_comp(xc);
 	c->sys_info = info;
 	c->legacy_app_tile_scaling = info->legacy_app_tile_scaling;
-	c->last_3d_mode_index = 1;
 
 	// Legacy apps: fix view dims at the actual recommended size the app was told to render at.
 	if (info->legacy_app_tile_scaling &&

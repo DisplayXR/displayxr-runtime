@@ -410,12 +410,12 @@ qwerty_process_xcb(struct xrt_device **xdevs, size_t xdev_count, const struct qw
 			}
 			break;
 
-		// 1/2/3: rendering mode (HMD focused, keydown only)
+		// 0/1: rendering mode 0 (2D) / 1 (the driver's 3D mode), HMD focused,
+		// keydown only. ADR-065: one key map on every platform; 2-8 select nothing.
+		case XK_0:
 		case XK_1:
-		case XK_2:
-		case XK_3:
 			if (is_keydown && qsys->hmd_focused)
-				qwerty_set_rendering_mode(qsys, (int)(ks - XK_1));
+				qwerty_set_rendering_mode(qsys, (int)(ks - XK_0));
 			break;
 
 		// C: controllers follow the HMD
