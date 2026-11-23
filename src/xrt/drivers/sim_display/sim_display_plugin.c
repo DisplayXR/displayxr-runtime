@@ -458,15 +458,13 @@ static struct xrt_plugin_iface g_sim_display_iface = {
     .probe_displays = sim_display_plugin_probe_displays,
 
     /*
-     * ADR-042 lift-only D3D11 DP. sim_display builds no weaver or tracker for
-     * any DP, so its ordinary factory is already "lift-only"-cheap; the lift
-     * slots are filled only under SIM_DISPLAY_FAKE_LIFT=1.
+     * ADR-042 lift-only D3D11 DP. NULL here: xrtPluginNegotiate fills it only
+     * when the test converter is on (setting LIFT), so a default sim_display
+     * does not advertise lift it does not have (#2769). sim_display builds no
+     * weaver or tracker for any DP, so its ordinary factory is already
+     * "lift-only"-cheap and serves as the lift-only one.
      */
-#if defined(_WIN32)
-    .create_dp_d3d11_lift = sim_display_dp_factory_d3d11,
-#else
     .create_dp_d3d11_lift = NULL,
-#endif
 
     .get_platform_state = sim_display_plugin_get_platform_state,
 
@@ -560,6 +558,19 @@ xrtPluginNegotiate(uint32_t runtime_api_version,
 	/* N3c: settings come through the host from now on (the pointer lives
 	 * in the runtime for the life of the process, like request_display_rescan). */
 	sim_display_settings_bind(host);
+
+#if defined(_WIN32)
+	/*
+	 * #2769: the lift-only factory is how a display driver says "I offer
+	 * lift" (the runtime lists its built-in dp-lift conversion row on it).
+	 * The lift slots exist only with the test converter on (setting LIFT,
+	 * legacy SIM_DISPLAY_FAKE_LIFT; sim_display_processor_d3d11.cpp), so the
+	 * factory is exported on the same condition. Decided here, once per
+	 * process: a changed LIFT takes effect at the next service / app start,
+	 * as the slots themselves already did (the setting is cached per process).
+	 */
+	g_sim_display_iface.create_dp_d3d11_lift = sim_display_setting_on("LIFT") ? sim_display_dp_factory_d3d11 : NULL;
+#endif
 
 	*out_iface = &g_sim_display_iface;
 	return XRT_SUCCESS;

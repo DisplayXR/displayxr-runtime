@@ -22,7 +22,9 @@ namespace DisplayXR.Dashboard.Tests;
 ///   <c>user</c> (HKCU overlay) / <c>machine</c> (HKLM Enabled = 0), <c>policy_lock</c> true
 ///   (HKLM Policy\Lock), and the built-in <c>dp-lift</c> conversion row (as the v2.44.6
 ///   Windows CLI printed it in <c>conv-list-n3.json</c>, plus the new <c>enabled_source</c> /
-///   <c>built_in</c> keys).
+///   <c>built_in</c> keys). Since #2769 the CLI prints that row only when the display driver
+///   offers lift (an older driver that still carries a converter); these fixtures are that
+///   case, which the Dashboard must keep rendering. The no-row case is every POSIX fixture.
 /// </summary>
 public class ComponentPolicyFixtureTests
 {

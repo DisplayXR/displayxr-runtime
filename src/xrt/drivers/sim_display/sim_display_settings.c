@@ -87,7 +87,7 @@ static const struct knob g_knobs[] = {
      "WISH_QUANTIZE"},
     // Lift (ADR-042; Windows D3D11).
     {{"LIFT", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
-      "fake 2D->3D lift on the D3D11 DP (synthetic depth / views) (was SIM_DISPLAY_FAKE_LIFT)"},
+      "fake 2D->3D lift on the D3D11 DP (synthetic depth / views); read at start (was SIM_DISPLAY_FAKE_LIFT)"},
      "FAKE_LIFT"},
     {{"LIFT_LATENCY_MS", XRT_COMPONENT_SETTING_TYPE_INT, "8", "fake lift: latency per frame"}, "FAKE_LIFT_LATENCY_MS"},
     // Stereo camera (ADR-043).
