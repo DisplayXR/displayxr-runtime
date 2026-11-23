@@ -444,10 +444,12 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 
 	// ADR-065: the two-mode contract, re-asserted on every apply. Already met
 	// after t_instance_create_system's enforce (a no-op here then); this
-	// catches a plug-in that fills or rewrites its table lazily, and runs
+	// catches a plug-in that fills or rewrites its table lazily (re-trimmed
+	// keeping the same kind; serialised by g_display_info_mutex on the refresh
+	// path, single-threaded at create), and runs
 	// BEFORE the tiling + worst-case atlas below so both are computed from
 	// the table the runtime actually serves.
-	(void)u_device_enforce_two_rendering_modes(head, plugin->id);
+	(void)u_device_reenforce_two_rendering_modes(head, plugin->id);
 
 	// Compute tiling once we have native pixel dims. The per-mode
 	// fields are filled for the current orientation, but the

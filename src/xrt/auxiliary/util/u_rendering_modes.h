@@ -272,16 +272,16 @@ u_rendering_modes_trim(struct xrt_rendering_mode *modes,
  * @p driver_name and what was dropped (or why the table was refused).
  *
  * When the kept 3D mode is not the driver's own index 1, the device's
- * `set_property` / `get_property` / `destroy` are wrapped so that
+ * `set_property` / `get_property` / `destroy` are wrapped (once) so that
  * `XRT_DEVICE_PROPERTY_OUTPUT_MODE` crosses in the driver's numbering
- * (run-time 1 -> the driver's original index, and back). A driver that checks
- * that index against its own, now trimmed, `rendering_mode_count` will still
- * refuse it; the runtime's own active index stays right either way.
+ * (run-time 1 -> the driver's original index, and back). During each
+ * forwarded call, under a lock the wrapper owns, the device shows the driver
+ * its own `rendering_mode_count` (its entries past index 1 are never cleared),
+ * so a pre-ADR-065 driver that range-checks the index and reads
+ * `rendering_modes[index]` keeps working; the two-mode count is restored
+ * before the call returns. u_rendering_modes.c states the residual race.
  *
- * Idempotent: a second call on an already two-mode table does nothing but
- * renumber (which it will not need to). Not thread-safe against concurrent
- * calls for the same device; it runs at system creation.
- *
+ * The FIRST enforce of a device, at system creation. Single-threaded there.
  * Does NOT recompute the per-mode tiling or the worst-case atlas: that is the
  * display-info apply's job, which runs on the trimmed table afterwards.
  *
@@ -289,6 +289,26 @@ u_rendering_modes_trim(struct xrt_rendering_mode *modes,
  */
 enum u_rendering_modes_trim_result
 u_device_enforce_two_rendering_modes(struct xrt_device *xdev, const char *driver_name);
+
+/*!
+ * Re-enforce the contract after the first enforce (the display-info apply).
+ * A no-op on a table that is still two modes. If the driver has rewritten its
+ * full table since, it is trimmed again keeping the SAME driver index as
+ * before (the kind does not change under the session) when that is still a 3D
+ * mode, else the first 3D mode; the active index keeps its run-time meaning;
+ * the wrappers are never installed twice - only their index maps are updated,
+ * under the wrapper's lock.
+ *
+ * Threading: the caller serialises calls for one device (target_instance.c
+ * holds its display-info mutex); concurrent readers of the table are not
+ * locked out, exactly as they are not from the driver's own rewrite.
+ */
+enum u_rendering_modes_trim_result
+u_device_reenforce_two_rendering_modes(struct xrt_device *xdev, const char *driver_name);
+
+//! The driver index that is run-time mode 1 for a TRIMMED device; 0 when it was never trimmed.
+uint32_t
+u_device_rendering_modes_kept_driver_index(struct xrt_device *xdev);
 
 #ifdef __cplusplus
 }

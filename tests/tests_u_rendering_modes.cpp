@@ -497,3 +497,257 @@ TEST_CASE("enforce: a refused table keeps its count and functions", "[u_renderin
 	CHECK(h.hmd.view_count == 4);
 	CHECK(h.xdev.set_property == fake_head::set_prop);
 }
+
+
+/*
+ *
+ * A REALISTIC pre-ADR-065 driver: range-checks the index it is handed against
+ * its own rendering_mode_count and reads rendering_modes[index] - what the
+ * released six-mode sim-display does. The fake above omits both; this one is
+ * the case the wrapper exists for.
+ *
+ */
+
+namespace {
+
+struct strict_driver
+{
+	xrt_device xdev{};
+	xrt_hmd_parts hmd{};
+	int32_t output = 0;               //!< the driver's own output mode (its numbering)
+	bool pinned = false;              //!< FORCE_MODE-style pin
+	std::vector<int32_t> accepted;    //!< indices it accepted
+	std::vector<int32_t> refused;     //!< indices it refused
+	std::vector<uint32_t> seen_count; //!< rendering_mode_count it saw on each call
+	std::vector<uint32_t> seen_views; //!< rendering_modes[value].view_count it read
+	bool destroyed = false;
+
+	static strict_driver *
+	of(xrt_device *x)
+	{
+		return reinterpret_cast<strict_driver *>(x); // xdev is the first member
+	}
+
+	static xrt_result_t
+	set_prop(xrt_device *x, xrt_device_property_id p, int32_t v)
+	{
+		strict_driver *d = of(x);
+		if (p != XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
+			return XRT_ERROR_NOT_IMPLEMENTED;
+		}
+		d->seen_count.push_back(x->rendering_mode_count);
+		if (d->pinned) {
+			return XRT_SUCCESS; // swallowed
+		}
+		if (v < 0 || (uint32_t)v >= x->rendering_mode_count) {
+			d->refused.push_back(v);
+			return XRT_ERROR_NOT_IMPLEMENTED;
+		}
+		d->accepted.push_back(v);
+		d->seen_views.push_back(x->rendering_modes[v].view_count);
+		x->hmd->active_rendering_mode_index = (uint32_t)v;
+		d->output = v;
+		return XRT_SUCCESS;
+	}
+
+	static xrt_result_t
+	get_prop(xrt_device *x, xrt_device_property_id p, int32_t *out)
+	{
+		strict_driver *d = of(x);
+		if (p == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
+			*out = d->output;
+			return XRT_SUCCESS;
+		}
+		if (p == XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED) {
+			*out = d->pinned ? 1 : 0;
+			return XRT_SUCCESS;
+		}
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+
+	static void
+	destroy(xrt_device *x)
+	{
+		of(x)->destroyed = true;
+	}
+
+	strict_driver(const std::vector<xrt_rendering_mode> &v, uint32_t active, bool pin = false)
+	{
+		xdev.rendering_mode_count = (uint32_t)v.size();
+		uint32_t max_views = 1;
+		for (uint32_t i = 0; i < v.size(); i++) {
+			xdev.rendering_modes[i] = v[i];
+			max_views = v[i].view_count > max_views ? v[i].view_count : max_views;
+		}
+		hmd.view_count = max_views;
+		hmd.active_rendering_mode_index = active;
+		output = (int32_t)active;
+		pinned = pin;
+		xdev.hmd = &hmd;
+		xdev.set_property = set_prop;
+		xdev.get_property = get_prop;
+		xdev.destroy = destroy;
+		std::snprintf(xdev.str, sizeof(xdev.str), "strict driver");
+	}
+
+	~strict_driver()
+	{
+		if (!destroyed && xdev.destroy != nullptr) {
+			xdev.destroy(&xdev); // frees the wrapper slot for the next test
+		}
+	}
+
+	//! What every runtime writer does: write the run-time index, then tell the device.
+	void
+	runtime_select(uint32_t runtime_idx)
+	{
+		hmd.active_rendering_mode_index = runtime_idx;
+		xrt_device_set_property(&xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)runtime_idx);
+	}
+
+	int32_t
+	runtime_output()
+	{
+		int32_t v = -1;
+		REQUIRE(xrt_device_get_property(&xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, &v) == XRT_SUCCESS);
+		return v;
+	}
+};
+
+void
+rewrite_full_table(strict_driver &d, const std::vector<xrt_rendering_mode> &full)
+{
+	for (uint32_t i = 0; i < full.size(); i++) {
+		d.xdev.rendering_modes[i] = full[i];
+	}
+	d.xdev.rendering_mode_count = (uint32_t)full.size();
+}
+
+} // namespace
+
+TEST_CASE("F1: a range-checking pre-ADR-065 driver really switches through the wrapper", "[u_rendering_modes][device]")
+{
+	strict_driver d(old_sim_table(), /* started in Quad */ 4);
+	REQUIRE(u_device_enforce_two_rendering_modes(&d.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
+	REQUIRE(d.xdev.rendering_mode_count == 2);
+	REQUIRE(d.hmd.active_rendering_mode_index == 1);
+	REQUIRE(d.xdev.set_property != strict_driver::set_prop); // wrapped
+	CHECK(u_device_rendering_modes_kept_driver_index(&d.xdev) == 4);
+
+	SECTION("V to 2D and back")
+	{
+		d.runtime_select(0);
+		CHECK(d.output == 0);
+		CHECK(d.hmd.active_rendering_mode_index == 0);
+		CHECK(d.runtime_output() == 0);
+
+		d.runtime_select(1);
+		CHECK(d.refused.empty()); // the defect: it used to refuse its own index 4
+		CHECK(d.output == 4);
+		CHECK(d.seen_views.back() == 4);               // it read ITS Quad entry
+		CHECK(d.seen_count.back() == 6);               // it saw its own table during the call
+		CHECK(d.xdev.rendering_mode_count == 2);       // ...and the runtime sees two after it
+		CHECK(d.hmd.active_rendering_mode_index == 1); // repointed from the driver index 4
+		CHECK(d.runtime_output() == 1);
+		CHECK(std::strcmp(d.xdev.rendering_modes[1].mode_name, "Quad") == 0);
+	}
+
+	SECTION("session end -> begin restore")
+	{
+		// xrEndSession: OUTPUT_MODE 0, then the runtime's active 0.
+		xrt_device_set_property(&d.xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0);
+		d.hmd.active_rendering_mode_index = 0;
+		CHECK(d.output == 0);
+		// xrBeginSession restores the ended mode (#1041): 1.
+		d.runtime_select(1);
+		CHECK(d.output == 4);
+		CHECK(d.refused.empty());
+		CHECK(d.hmd.active_rendering_mode_index == 1);
+		CHECK(d.xdev.rendering_mode_count == 2);
+	}
+
+	SECTION("run-time indices past 1 never reach the driver")
+	{
+		CHECK(xrt_device_set_property(&d.xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 2) ==
+		      XRT_ERROR_NOT_IMPLEMENTED);
+		CHECK(d.seen_count.empty());
+	}
+
+	SECTION("PINNED round-trips through the wrapper untouched")
+	{
+		int32_t pinned = -1;
+		CHECK(xrt_device_get_property(&d.xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED, &pinned) == XRT_SUCCESS);
+		CHECK(pinned == 0);
+	}
+}
+
+TEST_CASE("F1: a PINNED pre-ADR-065 driver holds its mode through the wrapper", "[u_rendering_modes][device]")
+{
+	strict_driver d(old_sim_table(), 4, /* pinned */ true);
+	REQUIRE(u_device_enforce_two_rendering_modes(&d.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
+	int32_t pinned = 0;
+	CHECK(xrt_device_get_property(&d.xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED, &pinned) == XRT_SUCCESS);
+	CHECK(pinned == 1);
+	CHECK(xrt_device_set_property(&d.xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0) == XRT_SUCCESS); // swallowed
+	CHECK(d.output == 4);
+	CHECK(d.runtime_output() == 1); // the driver index 4, in run-time numbering
+	CHECK(d.xdev.rendering_mode_count == 2);
+}
+
+TEST_CASE("F3: trim, the plug-in rewrites its full table, re-trim keeps the same kind", "[u_rendering_modes][device]")
+{
+	strict_driver d(old_sim_table(), 4);
+	REQUIRE(u_device_enforce_two_rendering_modes(&d.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
+	auto *const wrapped_set = d.xdev.set_property;
+	REQUIRE(wrapped_set != strict_driver::set_prop);
+
+	SECTION("a refresh on the trimmed table is a no-op")
+	{
+		CHECK(u_device_reenforce_two_rendering_modes(&d.xdev, "sim-display") ==
+		      U_RENDERING_MODES_TRIM_UNCHANGED);
+		CHECK(d.xdev.rendering_mode_count == 2);
+		CHECK(d.xdev.set_property == wrapped_set);
+	}
+
+	SECTION("rewritten while in 3D: the same driver index, active still 1, wrappers not reinstalled")
+	{
+		rewrite_full_table(d, old_sim_table());
+		// The runtime's active index is 1 (run-time numbering) - which in the
+		// driver numbering would be Anaglyph. The re-trim must not read it so.
+		REQUIRE(d.hmd.active_rendering_mode_index == 1);
+
+		CHECK(u_device_reenforce_two_rendering_modes(&d.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
+		CHECK(d.xdev.rendering_mode_count == 2);
+		CHECK(std::strcmp(d.xdev.rendering_modes[1].mode_name, "Quad") == 0);
+		CHECK(d.hmd.active_rendering_mode_index == 1);
+		CHECK(d.hmd.view_count == 4);
+		CHECK(d.xdev.set_property == wrapped_set);
+		CHECK(u_device_rendering_modes_kept_driver_index(&d.xdev) == 4);
+
+		d.runtime_select(1);
+		CHECK(d.output == 4);
+		CHECK(d.refused.empty());
+	}
+
+	SECTION("rewritten while in 2D: active stays 0")
+	{
+		d.runtime_select(0);
+		rewrite_full_table(d, old_sim_table());
+		CHECK(u_device_reenforce_two_rendering_modes(&d.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
+		CHECK(d.hmd.active_rendering_mode_index == 0);
+		CHECK(std::strcmp(d.xdev.rendering_modes[1].mode_name, "Quad") == 0);
+	}
+
+	SECTION("the kept index is no longer 3D: the first 3D mode, and the map follows")
+	{
+		auto full = old_sim_table();
+		full[4] = mk(1, 1.0f, 1.0f, false, 1, 1, "2D again");
+		rewrite_full_table(d, full);
+		CHECK(u_device_reenforce_two_rendering_modes(&d.xdev, "sim-display") == U_RENDERING_MODES_TRIM_TRIMMED);
+		CHECK(std::strcmp(d.xdev.rendering_modes[1].mode_name, "Anaglyph") == 0);
+		CHECK(u_device_rendering_modes_kept_driver_index(&d.xdev) == 1);
+		CHECK(d.xdev.set_property == wrapped_set); // still never re-wrapped
+		d.runtime_select(1);
+		CHECK(d.output == 1);
+	}
+}
