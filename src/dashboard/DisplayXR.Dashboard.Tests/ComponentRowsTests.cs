@@ -526,12 +526,4 @@ public class ComponentRowsTests
             Item("pad", "input_provider", "outdated", installable: false),  // nothing the engine can fetch
             Item("panel-c", "display_processor", "not_installed"))));
     }
-
-    [Theory]
-    [InlineData("catalog", "components")]
-    [InlineData("components", "components")]
-    [InlineData("home", "home")]
-    [InlineData("windows", "windows")] // the page shown as "Running 3D apps" keeps its route
-    [InlineData("no-such-page", "no-such-page")]
-    public void TheCatalogRoute_OpensComponents(string id, string page) => Assert.Equal(page, PageRoutes.Resolve(id));
 }

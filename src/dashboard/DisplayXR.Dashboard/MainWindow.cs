@@ -91,7 +91,7 @@ public sealed class MainWindow : Window
         };
 
         // Rail order: what an owner asks first, diagnostics last. "Running 3D apps" keeps the page id "windows" (--page windows).
-        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new ComponentsPage(), new PerformancePage(), new WindowsPage(), new DeveloperPage() };
+        _pages = new List<Page> { new HomePage(), new DisplaysPage(), new ComponentsPage(), new SettingsPage(), new WindowsPage(), new DeveloperPage() };
         foreach (var p in _pages)
         {
             p.Bind(_ctx);
@@ -413,10 +413,10 @@ public sealed class MainWindow : Window
             _banners.Margin = _banners.Children.Count > 0 ? new Thickness(36, 0, 36, 4) : new Thickness(36, 0, 36, 0);
         }
 
-        // Nav badges (warn / critical only on Displays; a client count on Windows; a dot on Performance).
+        // Nav badges (warn / critical only on Displays; a client count on Running 3D apps; changed settings on Settings).
         SetBadge("displays", StatusText.DisplaysBadge(s));
         SetBadge("windows", StatusText.WindowsBadge(s));
-        SetBadge("performance", _ctx.PerfNonDefault ? new NavBadge(_ctx.Perf!.Levers.Count(l => l.IsSet), Level.Warn) : null);
+        SetBadge("settings", _ctx.PerfNonDefault ? new NavBadge(_ctx.Perf!.Levers.Count(l => l.IsSet), Level.Warn) : null);
         int updates = ComponentRows.Updates(_ctx.CatalogRead is { Status: CatalogStatus.Ready } liveCatalog ? liveCatalog.List : null);
         SetBadge("components", updates > 0 ? new NavBadge(updates, Level.Info) : null);
         SetBadge("home", _ctx.PreferredPlugin is not null ? new NavBadge(1, Level.Warn) : null);
@@ -451,7 +451,7 @@ public sealed class MainWindow : Window
         {
             "displays" => $"{badge.Count} thing{(badge.Count == 1 ? "" : "s")} to check on your displays",
             "windows" => $"{badge.Count} 3D app{(badge.Count == 1 ? "" : "s")} running",
-            "performance" => "Some settings are changed from their defaults",
+            "settings" => "Some settings are changed from their defaults",
             "components" => $"{badge.Count} update{(badge.Count == 1 ? "" : "s")} available",
             _ => StatusText.HomeBadgeTip,
         };
@@ -481,12 +481,13 @@ public sealed class MainWindow : Window
                 _ = _ctx.LoadCatalogAsync(force: true);
                 foreach (var c in ComponentClasses.All) _ = _ctx.LoadPolicyAsync(c, force: true);
                 break;
-            case "performance":
-                _ = _ctx.LoadPerfAsync(force: true);
-                break;
             case "developer":
                 _ = _ctx.LoadDpAsync(force: true);
+                _ = _ctx.LoadPerfAsync(force: true);
                 if (_ctx.PerfAllWanted) _ = _ctx.LoadPerfAllAsync(force: true);
+                break;
+            default:
+                _current?.OnRefresh();
                 break;
             case "displays":
                 _ = _ctx.LoadDpAsync(force: true);

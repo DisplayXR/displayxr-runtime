@@ -47,6 +47,7 @@ public sealed class DeveloperPage : Page
     {
         _ = Ctx.LoadDpAsync(maxAge: TimeSpan.FromMinutes(1));
         if (_devOpen) _ = Ctx.LoadPerfAllAsync(force: false);
+        _ = Ctx.LoadPerfAsync(force: false); // "Current values"
     }
 
     protected override string Key()
@@ -55,7 +56,8 @@ public sealed class DeveloperPage : Page
         sb.Append(Ctx.ActionRunning).Append('|').Append(Ctx.LastActionArea).Append(Ctx.LastAction).Append('|')
           .Append(Ctx.DpError).Append('|').Append(Ctx.Feed.Mode).Append('|').Append(Ctx.Feed.ChildStarts).Append('|')
           .Append(DashboardLog.ErrorCount).Append('|').Append(Ctx.Feed.Snapshot?.Source);
-        sb.Append(Ctx.Dp?.Preferred).Append('|').Append(_devOpen);
+        sb.Append(Ctx.Dp?.Preferred).Append('|').Append(_devOpen).Append('|').Append(Ctx.PerfError);
+        if (Ctx.Perf is { } perf) foreach (var l in perf.Levers) sb.Append(l).Append(';');
         if (_devOpen)
         {
             sb.Append('|').Append(Ctx.PerfAllLoading).Append('|').Append(Ctx.PerfAllError).Append('|');
@@ -74,6 +76,7 @@ public sealed class DeveloperPage : Page
         if (OverrideNotice() is { } notice) page.Children.Add(notice);
         var grid = new U.CardGrid(2) { MinColumnWidth = 440 };
         grid.Add(DevSettingsCard(), span: 2);
+        grid.Add(CurrentValuesCard.Build(Ctx.Perf, Ctx.PerfError));
         grid.Add(DiagnosticsCard());
         page.Children.Add(grid);
         return page;

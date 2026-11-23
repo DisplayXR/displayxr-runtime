@@ -65,27 +65,17 @@ public sealed class ComponentsPage : Page
     private bool _machine;
     private string? _policyActionRow;
 
-    // Hotkey capture: the controller being captured, and the last capture's note.
-    private string? _capturing;
-    private string? _captureNote;
-    private string? _captureNoteFor;
+    // The spatial desktop's launch controls (shared with Settings), and the per-app drop-downs.
+    private WorkspaceLaunchEditor? _launchEditor;
+    private WorkspaceLaunchEditor Launch => _launchEditor ??= new WorkspaceLaunchEditor(Ctx, force => Update(force));
     private int _openDropDowns;
 
     // A rebuild would also empty the key box under the user's fingers.
-    protected override bool DeferRebuild => _capturing is not null || _openDropDowns > 0 || _keyFor is not null;
-
-    private TextBlock? _suspendNote;
-
-    /// <summary>End a capture: the hotkey hook is handed back on every exit path.</summary>
-    private void EndCapture()
-    {
-        _capturing = null;
-        Ctx.HotkeySuspend.End();
-    }
+    protected override bool DeferRebuild => Launch.Busy || _openDropDowns > 0 || _keyFor is not null;
 
     public override void OnHidden()
     {
-        if (_capturing is not null) EndCapture();
+        Launch.OnHidden();
         _tick?.Stop();
         _keyFor = null; // a half-typed key never survives leaving the page
     }
@@ -93,7 +83,7 @@ public sealed class ComponentsPage : Page
     protected override void UpdateInPlace()
     {
         // Known only after the first "on" came back: shown without a rebuild.
-        if (_suspendNote is not null) _suspendNote.IsVisible = _capturing is not null && Ctx.HotkeySuspend.Unsupported;
+        Launch.UpdateInPlace();
         if (_elapsed is not null && Ctx.CatalogOp is { } op)
             _elapsed.Text = CatalogText.Elapsed(DateTime.Now - op.Started);
     }
@@ -154,7 +144,7 @@ public sealed class ComponentsPage : Page
         NoteResult();
         var sb = new StringBuilder();
         sb.Append(Ctx.InfoLoading).Append(Ctx.InfoError).Append(string.Join(",", _expanded)).Append('|')
-          .Append(Ctx.ActionRunning).Append(_captureNoteFor).Append(_captureNote).Append('|');
+          .Append(Ctx.ActionRunning).Append(Launch.Key).Append('|');
         if (Ctx.LastActionArea == "workspace") sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed);
         foreach (var c in ComponentClasses.All)
         {
@@ -207,7 +197,7 @@ public sealed class ComponentsPage : Page
     protected override Control Build()
     {
         _openDropDowns = 0;
-        _suspendNote = null;
+        Launch.BeginBuild();
         _elapsed = null;
         var page = U.VStack(18);
         if (Ctx.Info is null)
@@ -312,7 +302,7 @@ public sealed class ComponentsPage : Page
                 // status, one plain state word, "Works with your display"; everything else is in Details.
                 var face = row.Face;
                 list.Children.Add(ItemRow(row.Installed ?? CatalogHead(row), face));
-                if (row.Installed?.Controller is { Launch: not null } rc) list.Children.Add(LaunchRow(rc));
+                if (row.Installed?.Controller is { Launch: not null } rc) list.Children.Add(Launch.Build(rc));
                 var pr = row.Installed is { } inst ? inst.Policy : row.Catalog is { } only ? RowOf(only) : null;
                 PolicyList? pl = null;
                 bool writable = pr is not null && Ctx.Policies.TryGetValue(pr.Class, out pl) && pl.Writable;
@@ -473,135 +463,6 @@ public sealed class ComponentsPage : Page
     {
         if (!_expanded.Remove(id)) _expanded.Add(id);
         Update();
-    }
-
-    /// <summary>
-    /// How this workspace controller is launched (phase 8): hotkey capture,
-    /// mode, Launch now. Written with `displayxr-cli workspace set|launch`, then
-    /// `workspace list --json` is re-read once; the CLI makes the service reload,
-    /// so a change is live.
-    /// </summary>
-    private Control LaunchRow(RegisteredController c)
-    {
-        var launch = c.Launch!;
-        string id = c.Id;
-        bool connected = c.Connected == true;
-        bool busy = Ctx.ActionRunning;
-
-        // (a) hotkey capture: click, press the combo, Esc cancels.
-        bool capturing = _capturing == id;
-        var keyText = U.Text(capturing ? "Press a key combination… (Esc cancels)"
-                                       : launch.Hotkey is { Length: > 0 } hk ? hk : "No shortcut", capturing || launch.Hotkey is not { Length: > 0 } ? "dim" : "mono");
-        keyText.VerticalAlignment = VerticalAlignment.Center;
-        var capture = new Border
-        {
-            Child = keyText, Focusable = true, MinWidth = 220, Padding = new Thickness(12, 6),
-            Cursor = new Avalonia.Input.Cursor(Avalonia.Input.StandardCursorType.Hand),
-            BorderBrush = capturing ? Tokens.Accent : Tokens.Line, BorderThickness = new Thickness(capturing ? 2 : 1),
-            Background = Tokens.Field, CornerRadius = Tokens.Radius("FieldRadius"), VerticalAlignment = VerticalAlignment.Center,
-        };
-        Avalonia.Automation.AutomationProperties.SetName(capture, $"Launch hotkey for {c.Name}");
-        ToolTip.SetTip(capture, "Click, then press the combination: at least one of Ctrl / Shift / Alt / Win plus a key. "
-                              + "The service sees it before any app, so avoid a combo your apps use (Ctrl+Space, for one).");
-        capture.PointerPressed += (_, e) =>
-        {
-            if (busy) return;
-            e.Handled = true;
-            _capturing = id;
-            _captureNote = null;
-            Update(force: true);
-        };
-        if (capturing)
-        {
-            capture.GotFocus += (_, _) => Ctx.HotkeySuspend.Begin();
-            capture.AttachedToVisualTree += (_, _) => Avalonia.Threading.Dispatcher.UIThread.Post(() => capture.Focus());
-            capture.LostFocus += (_, _) =>
-            {
-                if (_capturing != id) return;
-                EndCapture();
-                Avalonia.Threading.Dispatcher.UIThread.Post(() => Update(force: true));
-            };
-            capture.AddHandler(InputElement.KeyDownEvent, (_, e) =>
-            {
-                e.Handled = true;
-                if (e.Key == Avalonia.Input.Key.Escape && e.KeyModifiers == Avalonia.Input.KeyModifiers.None)
-                {
-                    EndCapture();
-                    Update(force: true);
-                    return;
-                }
-                if (KeyNames.IsModifier(e.Key)) return; // wait for the key itself
-                var mods = KeyNames.Modifiers(e.KeyModifiers);
-                string? name = KeyNames.Name(e.Key);
-                string? why = name is null ? "That key cannot be used." : Hotkey.Validate(mods, name);
-                EndCapture();
-                _captureNoteFor = id;
-                if (why is not null)
-                {
-                    _captureNote = why;
-                    Update(force: true);
-                    return;
-                }
-                var combo = new Hotkey(mods, name!).ToString();
-                _captureNote = null;
-                _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--hotkey", combo));
-                Update(force: true);
-            }, Avalonia.Interactivity.RoutingStrategies.Tunnel);
-        }
-
-        var clear = U.Button("Clear", () => _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--no-hotkey")), "quiet", "sm");
-        clear.IsEnabled = !busy && launch.Hotkey is { Length: > 0 };
-
-        // Back to the runtime's defaults: `workspace reset` drops the controller's
-        // service.json entry, so it follows the default again (an upgraded box that
-        // stored Ctrl+Space gets Ctrl+Shift+Space this way).
-        var reset = U.Button("Reset", () => _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "reset", id)), "quiet", "sm");
-        reset.IsEnabled = !busy && launch.Source == "user";
-        ToolTip.SetTip(reset, $"Back to the runtime's defaults ({Hotkey.Default}, Auto on current runtimes).");
-
-        // (b) mode.
-        var mode = new ComboBox { ItemsSource = new[] { "Opens with the shortcut", "Turned off" }, SelectedIndex = launch.Disabled ? 1 : 0, MinWidth = 190, IsEnabled = !busy };
-        mode.Classes.Add("field");
-        Avalonia.Automation.AutomationProperties.SetName(mode, $"Launch mode for {c.Name}");
-        int modeWas = mode.SelectedIndex;
-        mode.DropDownOpened += (_, _) => _openDropDowns++;
-        mode.DropDownClosed += (_, _) =>
-        {
-            _openDropDowns = System.Math.Max(0, _openDropDowns - 1);
-            Avalonia.Threading.Dispatcher.UIThread.Post(() => Update());
-        };
-        mode.SelectionChanged += (_, _) =>
-        {
-            if (mode.SelectedIndex < 0 || mode.SelectedIndex == modeWas || Ctx.ActionRunning) return;
-            _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--mode", mode.SelectedIndex == 1 ? "disabled" : "auto"));
-        };
-
-        // (c) launch now.
-        var launchNow = U.Button("Open now", () => _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "launch", id)), "primary", "sm");
-        launchNow.IsEnabled = !busy && !launch.Disabled && !connected;
-        ToolTip.SetTip(launchNow, launch.Disabled ? "It is turned off." : connected ? "Already running." : "Open it now, the same way the shortcut does.");
-
-        var label = U.Text("Shortcut", "label");
-        label.VerticalAlignment = VerticalAlignment.Center;
-        var row = U.Flow(10, 6, label, capture, clear, reset, mode, launchNow);
-
-        // (d) when a change applies. Its state (running, where the shortcut is set) is in the row's Details.
-        var note = U.Text("Changes take effect immediately.", "meta");
-
-        var col = U.VStack(6, row, note);
-        if (capturing)
-        {
-            _suspendNote = U.Wrapped("Press a combo other than the current one while the workspace hotkey is active.", "soft");
-            _suspendNote.IsVisible = Ctx.HotkeySuspend.Unsupported;
-            col.Children.Add(_suspendNote);
-        }
-        if (_captureNoteFor == id && _captureNote is { } cn)
-            col.Children.Add(U.WarningRow(new StatusWarning("HOTKEY", WarningLevel.Warn, cn)));
-        if (Ctx.LastActionArea == "workspace" && Ctx.LastAction is { } la && Ctx.LastActionFailed)
-            col.Children.Add(U.Wrapped(la, "soft"));
-        var box = new Border { Child = col, Margin = new Thickness(22, 10, 0, 0) };
-        box.Classes.Add("field");
-        return box;
     }
 
     /// <summary>
