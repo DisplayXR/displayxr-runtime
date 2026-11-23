@@ -518,7 +518,7 @@ comp_d3d11_compositor_set_system_devices(struct xrt_compositor *xc,
  * Set the legacy app tile scaling flag for the compositor.
  *
  * When true, the compositor disables direct rendering mode selection via
- * qwerty 1/2/3 keys and keeps view dimensions fixed at the compromise scale.
+ * qwerty 0/1 keys and keeps view dimensions fixed at the compromise scale.
  *
  * @param xc The compositor.
  * @param legacy true if legacy app tile scaling is active.

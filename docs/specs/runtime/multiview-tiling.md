@@ -84,18 +84,26 @@ The tiling algorithm uses `ceil` (not `round`) for the column count, which biase
 | Device | Mode | N | scale_x x scale_y | V_w x V_h | C x R | Atlas | Notes |
 |--------|------|---|-------------------|---------|-------|-------|-------|
 | sim_display (1920x1080) | 2D | 1 | 1.0x1.0 | 1920x1080 | 1x1 | 1920x1080 | |
-| sim_display (1920x1080) | Stereo | 2 | 0.5x0.5 | 960x540 | 2x1 | 1920x540 | SBS (horizontal) |
-| sim_display (1920x1080) | Quad | 4 | 0.5x0.5 | 960x540 | 2x2 | 1920x1080 | 2x2 grid |
+| sim_display (1920x1080) | Stereo (anaglyph kind) | 2 | 0.5x0.5 | 960x540 | 2x1 | 1920x540 | SBS (horizontal) |
+| sim_display (1920x1080) | Quad (quad kind) | 4 | 0.5x0.5 | 960x540 | 2x2 | 1920x1080 | 2x2 grid |
 | Looking Glass (2560x1600) | Multi | 45 | 0.1x0.1 | 256x160 | 6x8 | 1536x1280 | Near-square, well under 4096 |
 | Looking Glass (2560x1600) | 2D | 1 | 1.0x1.0 | 2560x1600 | 1x1 | 2560x1600 | |
 | 4K 3D display (3840x2160) | 2D | 1 | 1.0x1.0 | 3840x2160 | 1x1 | 3840x2160 | |
 | 4K 3D display (3840x2160) | Stereo | 2 | 0.5x0.5 | 1920x1080 | 2x1 | 3840x1080 | SBS (horizontal) |
 
-System swapchain for sim_display: max(1920,1920,1920) x max(1080,540,1080) = **1920x1080** (display res).
+System swapchain for sim_display: a device serves two modes at run time, 2D and the 3D kind
+selected at start-up ([ADR-065](../../adr/ADR-065-two-runtime-rendering-modes.md)), so the
+worst case is taken over those two — max(1920,1920) x max(1080,540) = **1920x1080** with the
+anaglyph kind, and the same with the quad kind (max(1920,1920) x max(1080,1080)).
 System swapchain for Looking Glass: max(2560,1536) x max(1600,1280) = **2560x1600** (display res).
 System swapchain for the 3840x2160 display: max(3840,3840) x max(2160,1080) = **3840x2160** (display res).
 
-In all cases, the 2D mode (1 view at full display) dominates. The N-view modes tile smaller views that fit within.
+In all of these examples the 2D mode (1 view at full display) dominates and the N-view modes
+tile smaller views that fit within. **That is a property of these tables, not a rule.** A
+multiview quilt whose tiles add up to more than the panel (e.g. a 3x3 quilt at 0.5x0.5 is
+1.5x the panel in each dimension) makes the 3D mode the worst case. Because only 2D and the
+selected kind are sized for (ADR-065), such a driver's allocation is max(2D, the selected
+kind), not the largest over every kind it could offer.
 
 ---
 
@@ -164,11 +172,11 @@ All test apps (macOS + Windows, handle/texture/hosted classes):
 - Swapchain sizing: `max(cols * scaleX * displayW)` across all modes
 - HUD: dynamic `Eye[N]` display (replaces fixed "Eye L/R")
 - `xrEndFrame` validation: accepts mode's view_count (not hardcoded 1-or-2)
-- 1/2/3 key mode selection gated for legacy apps; HUD references removed
+- Direct mode keys gated for legacy apps (were 1/2/3; 0/1 since ADR-065, V toggles); HUD references removed
 
 ### Phase H: N=4 quad test mode
 
-sim_display has quad mode (4 views, 2x2 tiling). Verified working end-to-end with handle_metal_macos. `xrLocateViews` returns 4 views, apps render 4 viewports in 2x2 grid, display processor receives 2x2 atlas.
+sim_display has a quad kind (4 views, 2x2 tiling; `OUTPUT=quad`, mode 1 since ADR-065). Verified working end-to-end with handle_metal_macos. `xrLocateViews` returns 4 views, apps render 4 viewports in 2x2 grid, display processor receives 2x2 atlas.
 
 ### Bug fixes during implementation
 
@@ -282,14 +290,14 @@ The app swapchain flows **into** the compositor; the target swapchain flows **ou
 
 ### Swapchain images are worst-case sized
 
-Swapchain images are runtime-allocated (via `xrCreateSwapchain`) and **fixed at init** to the worst-case dimensions across all rendering modes:
+Swapchain images are runtime-allocated (via `xrCreateSwapchain`) and **fixed at init** to the worst-case dimensions across all rendering modes — under ADR-065 the two a driver serves at run time, 2D and the 3D kind selected at start-up (nothing is ever rebuilt, ADR-010):
 
 ```
 swapchain_width  = max(tile_columns[i] * view_width[i])  across all modes i
 swapchain_height = max(tile_rows[i] * view_height[i])    across all modes i
 ```
 
-This is computed by `u_tiling_compute_system_atlas()`. In practice, the 2D mode (1 view at full display resolution) typically dominates, making the swapchain equal to the display resolution.
+This is computed by `u_tiling_compute_system_atlas()`. On the shipping drivers the 2D mode (1 view at full display resolution) dominates, making the swapchain equal to the display resolution; a quilt larger than the panel would make the 3D mode the worst case instead (see the worked examples above).
 
 ### Per-frame atlas is typically smaller
 

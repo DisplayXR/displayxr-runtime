@@ -311,7 +311,7 @@ struct comp_metal_compositor
 	//! True when display is in 3D mode (weaver active). False = 2D passthrough.
 	bool hardware_display_3d;
 
-	//! True if app is legacy (no XR_DXR_display_info) — gates 1/2/3 key mode selection.
+	//! True if app is legacy (no XR_DXR_display_info) — gates 0/1 key mode selection.
 	bool legacy_app_tile_scaling;
 
 	//! System devices (for qwerty driver keyboard input).

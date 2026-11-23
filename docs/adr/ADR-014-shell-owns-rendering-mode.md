@@ -10,6 +10,8 @@ self-switch while sharing the display — only the *how* was updated to the curr
 Current contract: `docs/architecture/separation-of-concerns.md`,
 `docs/specs/extensions/XR_DXR_spatial_workspace.md`.
 
+> **See [ADR-065](ADR-065-two-runtime-rendering-modes.md):** a display driver now serves two rendering modes at run time (0 = 2D, 1 = its 3D kind, chosen at start-up); the workspace's mode control is therefore a 2D/3D toggle.
+
 ## Context
 
 In standalone mode, apps control their own rendering mode (2D/3D/multiview) via the `xrRequestDisplayRenderingModeDXR` API, typically triggered by the V key or number keys (1-8). The app and runtime are in the same process, so mode changes take effect immediately.

@@ -1440,7 +1440,7 @@ comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
 	// One INFO line per table change while split, and one on leaving it —
 	// a drag produces a burst, a still window logs once. Never WARN.
 	if (split && (!segs->have_logged_table || !comp_segments_table_equal(&segs->table, &segs->logged_table))) {
-		// The capability can follow a runtime mode switch (sim's 1/2/3 keys):
+		// The capability can follow a runtime mode switch (V / 0 / 1):
 		// re-ask on change, never per frame.
 		for (uint32_t i = 0; i < segs->screen_count; i++) {
 			if (segs->st[i].dp != NULL) {

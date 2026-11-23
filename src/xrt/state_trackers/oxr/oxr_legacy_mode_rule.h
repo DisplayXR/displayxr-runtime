@@ -37,7 +37,8 @@
  * — sim-display's Quad, 4 views, 0.5x0.5, a 2x2 grid — failed Case A's
  * `== 2` and fell into Case B, so the legacy app was sized for 0.5x0.5 tiles,
  * painted the first two of four, and left the bottom half of the canvas at the
- * clear colour. Measured on the win box with `SIM_DISPLAY_FORCE_MODE=4`.
+ * clear colour. Measured with `SIM_DISPLAY_FORCE_MODE=4` (Quad's index before
+ * ADR-065; today `OUTPUT=quad FORCE_MODE=1`).
  *
  * ### Why the fix is a MODE FLOOR and not a wider Case A
  *

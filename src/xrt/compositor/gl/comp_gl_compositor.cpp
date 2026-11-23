@@ -1088,7 +1088,7 @@ struct comp_gl_compositor
 	struct xrt_system_devices *xsysd;
 	bool sys_info_set;
 	struct xrt_system_compositor_info sys_info;
-	bool legacy_app_tile_scaling;      //!< True if app is legacy (gates 1/2/3 key mode selection)
+	bool legacy_app_tile_scaling;      //!< True if app is legacy (gates 0/1 key mode selection)
 
 	// --- #439 Phase 3 — Local2D / zone-mask consumer (full net-new GL leg) ---
 	//! Active authored zone mask (XR_DXR_local_3d_zone). Set by zone_mask_submit

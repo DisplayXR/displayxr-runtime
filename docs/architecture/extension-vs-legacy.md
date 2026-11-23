@@ -25,7 +25,7 @@ Orthogonal to the [four app classes](../getting-started/app-classes.md), apps ar
 
 Legacy apps don't know about rendering modes, so the runtime provides a **compromise scale** that works acceptably across modes. For SBS displays this is `0.5 × 1.0` (half-width, full-height).
 
-The compromise scaling is computed in `oxr_system_fill_in()`. The `legacy_app_tile_scaling` flag on `xrt_system_compositor_info` disables 1/2/3 key mode selection for legacy apps (V toggle only).
+The compromise scaling is computed in `oxr_system_fill_in()`. The `legacy_app_tile_scaling` flag on `xrt_system_compositor_info` disables 0/1 key mode selection for legacy apps (V toggle only).
 
 ### A legacy app in a mode with more than two views — the mode floor (#1510)
 

@@ -444,7 +444,7 @@ comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
                                       uint64_t pinned_display_id);
 
 /*!
- * Set legacy app tile scaling flag (gates 1/2/3 key mode selection).
+ * Set legacy app tile scaling flag (gates 0/1 key mode selection).
  *
  * @ingroup comp_vk_native
  */

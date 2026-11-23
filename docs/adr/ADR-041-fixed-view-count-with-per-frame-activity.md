@@ -8,6 +8,8 @@ related: [ADR-010](ADR-010-shared-app-iosurface-worst-case-sized.md),
 [ADR-027](ADR-027-display-zones.md), [ADR-030](ADR-030-crop-before-dp-zero-copy-only-when-swapchain-equals-atlas.md),
 [ADR-032](ADR-032-array-layered-swapchains-first-class.md)
 
+> **See [ADR-065](ADR-065-two-runtime-rendering-modes.md):** a display driver now serves two rendering modes at run time (0 = 2D, 1 = its 3D kind, chosen at start-up); live switches are 2D <-> that one 3D mode, whose view count (stereo or quad) the kind fixes for the instance, so the fixed view count below is the selected kind's.
+
 ## Context
 
 A 3D display changes its *rendering mode* while an app is running — 2D (1 view), stereo

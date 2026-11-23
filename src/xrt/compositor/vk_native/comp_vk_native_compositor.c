@@ -809,7 +809,7 @@ struct comp_vk_native_compositor
 	//! layer commit computes it.
 	struct comp_vk_native_eff_layout eff_layout;
 
-	//! True if app is legacy (no XR_DXR_display_info) — gates 1/2/3 key mode selection.
+	//! True if app is legacy (no XR_DXR_display_info) — gates 0/1 key mode selection.
 	bool legacy_app_tile_scaling;
 
 	//! System devices (for qwerty driver).
@@ -6149,8 +6149,8 @@ vk_linux_apply_hold(struct comp_vk_native_compositor *c)
  */
 /*!
  * Multi-screen M2 review: re-read the DP's resample tolerance when the head's
- * rendering mode changes. sim_display's answer follows its output mode (the
- * 1/2/3 keys / V): switching to INTERLACED on a scaled desktop must degrade
+ * rendering mode changes. sim_display's answer follows its output mode (V /
+ * 0 / 1, ADR-065): switching into the INTERLACED kind on a scaled desktop must degrade
  * (#1595 / #1831 — a resampled interlace is a double image), switching back to
  * anaglyph must weave again. A change re-arms the X11 gate's one-shot; the
  * Wayland arm reads the flag on every evaluation. One vtable call per MODE

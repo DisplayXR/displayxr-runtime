@@ -14,6 +14,16 @@ types it advertises, how many views each reports, what `xrLocateViews` and
 > Landed for [#1486](https://github.com/DisplayXR/displayxr-runtime/issues/1486)
 > (option B) / [#80](https://github.com/DisplayXR/displayxr-runtime/issues/80).
 
+> **Two rendering modes per driver ([ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md)).**
+> At run time every display driver serves exactly two modes: mode 0 = 2D (1 view)
+> and mode 1 = its 3D *kind*, chosen by a driver setting when the device is created
+> (sim-display's `OUTPUT`). The runtime trims a longer table at the apply point. So
+> the device max view count — what `PRIMARY_MULTIVIEW_DXR` reports — is the
+> selected kind's (2 for every stereo kind, 4 only for sim-display's `quad`
+> inspection kind), and it is fixed for the instance, as OpenXR requires. A stereo
+> session against a 4-view kind has no 2-view 3D mode to fall back to: the floor
+> below takes it to **2D**, and a request for mode 1 is denied.
+
 ## What the runtime advertises
 
 The system carries a **list** of view configurations, not a single type
@@ -272,7 +282,8 @@ removes: the session is moved out of a mode it cannot fill before its first
 frame ([below](#the-mode-floor-1499)). One direct consequence worth knowing
 before someone debugs it cold:
 
-- A CTS lane **forced** into quad (`SIM_DISPLAY_OUTPUT=quad`) used to fail
+- A CTS lane **forced** into quad (`SIM_DISPLAY_OUTPUT=quad`, plus `SIM_DISPLAY_START_3D=1`
+  since ADR-065) used to fail
   `xrLocateSpace_xrLocateViews` — not on its `views.size() == 2` assertion,
   which now passes, but on its **centroid check**: VIEW space was the centre of
   the fan, while the centroid of tiles 0 and 1 is not. #1502 closes that gap
@@ -352,7 +363,7 @@ sample. The clamp, the 1 Hz throttle and the doorbell all follow from there.
   it is an orchestrator, not a painter, so a painter's constraint does not apply
   to it. (This is why the denial is gated on the session running, not merely on
   the view count being known.)
-- **A device that PINS its mode** (`SIM_DISPLAY_FORCE_MODE`). The pin exists to
+- **A device that PINS its mode** (`SIM_DISPLAY_FORCE_MODE=0|1`). The pin exists to
   hold a mode against every later request — which is exactly what keeps the
   N-view narrow-submission path testable at all.
 - **Service mode.** The panel lease, not this session, owns the display-global
@@ -374,9 +385,11 @@ of clamping silently: `xrBeginSession` logs `session in an UNFILLABLE rendering 
 (#1499)`, and a later display-global mode change into an unfillable mode logs
 once more as it lands.
 
-The runtime's own 1/2/3 mode keys are **not** gated, in-process or in the
-service. In-process the keys only reach modes 0/1/2 (`qwerty_win32.c:514-519`),
-none of which is >2-view on any device we have; in the service they are a
+The runtime's own mode keys are **not** gated, in-process or in the service.
+Since ADR-065 they are V (toggle 2D <-> 3D) and 0 / 1 on every platform, and
+they reach only modes 0 and 1. Mode 1 is >2-view only on sim-display's quad
+kind, where an in-process stereo session is moved into it exactly as by any
+other request the runtime itself makes; in the service they are a
 lease-holder action rather than a client request, so a single client that cannot
 fill the result is told, not given a veto over the other clients' display.
 
@@ -506,8 +519,9 @@ CTS failure, so a box running it is out of contract on purpose.
 | **Legacy apps** hardcoding 2 | out of contract | correct | They were only ever broken by the max-across-modes count; `PRIMARY_STEREO` = 2 makes them right. |
 
 **Nothing in-tree actually renders more than 2 views of content.** The only
-device that ever sets `view_count > 2` is `sim_display`, whose Quad mode is
-opt-in (`SIM_DISPLAY_OUTPUT=quad` / `SIM_DISPLAY_FORCE_MODE=4`) and self-described
+device that ever sets `view_count > 2` is `sim_display`, whose Quad kind is
+opt-in (`SIM_DISPLAY_OUTPUT=quad`, with `SIM_DISPLAY_START_3D=1` or
+`SIM_DISPLAY_FORCE_MODE=1` to start or pin it) and self-described
 as a *"view-inspection tool, not a sane default"*
 (`sim_display_device.c:52-56`). The Leia plug-in hardcodes
 `hmd->base.hmd->view_count = 2` on every platform (`src/drv_leia/leia_device.c:257`)
@@ -598,8 +612,9 @@ if (view_count == 1) {
 
 `sys->view_count` — the **max across the device's rendering modes**, computed in
 `sim_display_device.c` — was handed verbatim to
-`xrEnumerateViewConfigurationViews` and `xrLocateViews`. `sim_display` declares 5
-modes (2D 1 view, Anaglyph 2, Cropped SBS 2, Squeezed SBS 2, Quad 4), so **every**
+`xrEnumerateViewConfigurationViews` and `xrLocateViews`. `sim_display` then declared 5
+modes (2D 1 view, Anaglyph 2, Cropped SBS 2, Squeezed SBS 2, Quad 4; two since
+ADR-065), so **every**
 sim-display instance reported **4 views for `PRIMARY_STEREO`**, in every mode.
 That was the deviation: not latent, not mode-dependent, and in direct conflict
 with the spec's two-view definition of `PRIMARY_STEREO`.

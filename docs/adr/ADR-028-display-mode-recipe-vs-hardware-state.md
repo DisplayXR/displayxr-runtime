@@ -5,6 +5,8 @@ issues: [542, 541, 522]
 ---
 # ADR-028: The rendering mode is the content recipe; the hardware state is an orthogonal override
 
+> **See [ADR-065](ADR-065-two-runtime-rendering-modes.md):** a display driver now serves two rendering modes at run time (0 = 2D, 1 = its 3D kind, chosen at start-up); the recipe/hardware split below is unchanged.
+
 ## Context
 
 A 2D↔3D change on a switchable 3D display involves three separable things:

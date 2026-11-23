@@ -4,6 +4,8 @@ date: 2026-06-06
 ---
 # ADR-022: Per-Mode Capability Flags + Frozen Enumerated App Structs
 
+> **See [ADR-065](ADR-065-two-runtime-rendering-modes.md):** a display driver now serves two rendering modes at run time (0 = 2D, 1 = its 3D kind, chosen at start-up); per-mode flags still apply, to those two modes.
+
 ## Context
 
 #441 added per-rendering-mode tracking capability (`has_tracking`) so a vendor

@@ -327,14 +327,37 @@ behaviour (the runtime uses your `get_predicted_eye_positions` answer unchanged)
 slot opts in to display-time sampling. Contract:
 [eye-tracking-modes.md § Target-time query](../specs/vendor/eye-tracking-modes.md#target-time-query-adr-054-41--n6-part-1-2144).
 
+### Two rendering modes, and your 3D kinds as a setting (ADR-065)
+
+Your `create_device` device declares exactly **two** rendering modes:
+`rendering_modes[0]` = 2D (1 view, `hardware_display_3d = false`, 1 × 1 tiles) and
+`rendering_modes[1]` = your 3D mode, with `mode_index` equal to the array position. That is
+what every app sees (`xrEnumerateDisplayRenderingModesDXR` returns two entries), what V
+toggles between, and what 0 / 1 select.
+
+**Declare your 3D kinds as a setting, not as more modes.** If the display supports several
+layouts or weaver variants, add an ENUM to your `describe_settings` (the way sim-display's
+`OUTPUT` selects anaglyph / sbs / squeezed / quad / interlaced / blend), read it through
+`get_setting` when you create the device, and fill mode 1 from it. It applies the next time
+the runtime starts — view counts and the worst-case atlas stay fixed for an instance, as
+OpenXR requires, and no app swapchain is ever rebuilt (ADR-010). A variant that changes no
+geometry (a weaver option) can apply live through your own setting without being a kind at
+all. A kind with more than two views is an *inspection* kind: stereo apps cannot fill it and
+fall back to 2D.
+
+An older plug-in that declares more modes keeps working: the runtime trims the table to
+mode 0 plus one 3D mode (the one active at creation, else the first) and logs a WARN naming
+your plug-in. See [ADR-065](../adr/ADR-065-two-runtime-rendering-modes.md) and
+[`xrt_plugin_iface.md` § create_device](../reference/xrt_plugin_iface.md#create_device).
+
 ### Per-mode tracking capability (`mode_flags`, ABI v3 / #441)
 
 Every `xrt_rendering_mode` your `create_device` device exposes carries a `mode_flags`
 bitmask in the **vendor-provided (MUST set)** section:
 
 - `XRT_RENDERING_MODE_FLAG_HAS_TRACKING` (`1u << 0`) — set on each mode that consumes live
-  eye tracking (typically your 3D modes; optionally a "2D tracked" mode where content is
-  flat but the viewer remains tracked).
+  eye tracking (typically your 3D mode; optionally the 2D mode too, when content is flat
+  but the viewer remains tracked).
 - Zero-init = untracked = the safe default; `reserved[]` MUST stay zeroed.
 
 The runtime forces the app-visible `isTracking` to false whenever the active mode is
@@ -378,8 +401,8 @@ The reference implementation is already in the tree: `sim_display`'s
 `view_scale_x/y`, and they — not `xrt_plugin_display_info::recommended_view_scale_*`
 — are the single source of truth for view, tile and atlas sizing. Leave the
 `recommended_view_scale_*` scalar at `0` (the runtime then derives it from your
-modes, which is what the template does) or derive it from the same numbers as the
-active 3D mode; never compute it a second time. They feed different consumers —
+modes, which is what the template does) or derive it from the same numbers as your
+3D mode (mode 1); never compute it a second time. They feed different consumers —
 the scalar sizes `XrViewConfigurationView.recommended*`, the mode table sizes the
 tiles, the atlas and the compositor grid — so a scalar that disagrees with (and is
 larger than) your mode's scale declares an atlas too small to hold your own tiles.
@@ -479,7 +502,8 @@ it. Your sideband command slots into that; you do not need your own.
 `sim_display` doubles for all of it, on any machine:
 
 ```bat
-set SIM_DISPLAY_FORCE_MODE=3        REM pin Squeezed SBS — a real 2x1 packed frame
+set SIM_DISPLAY_OUTPUT=squeezed     REM the Squeezed SBS kind — a real 2x1 packed frame
+set SIM_DISPLAY_FORCE_MODE=1        REM pin mode 1 (that kind) for every app
 set SIM_DISPLAY_WEAVE_SCOPE=region  REM or scanout: claim a scope, exercise the routing
 ```
 

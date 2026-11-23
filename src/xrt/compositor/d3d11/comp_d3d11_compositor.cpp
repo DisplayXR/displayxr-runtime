@@ -811,7 +811,7 @@ struct comp_d3d11_compositor
 
 	//! True when a legacy app is using a compromise view scale that doesn't
 	//! match the 3D mode's native scale, so direct rendering mode selection
-	//! via 1/2/3 keys should be disabled.
+	//! via the 0/1 keys should be disabled.
 	bool legacy_app_tile_scaling;
 
 	//! Compromise view scale for legacy apps. Only valid when legacy_app_tile_scaling is true.
