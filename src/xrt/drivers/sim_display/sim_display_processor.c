@@ -320,7 +320,7 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 			// #817: only the interlaced output consumes the offset. Every
 			// other mode renders the same pixels wherever the target sits,
 			// so a phase error genuinely cannot show up in what it draws.
-			const bool phase_visible = sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_INTERLACED;
+			const bool phase_visible = sim_display_resolved_output() == SIM_DISPLAY_OUTPUT_INTERLACED;
 			U_LOG_W("sim_display STRICT PANEL (#817): canvas offset (%d,%d) size %ux%u%s; atlas view "
 			        "%ux%u grid %ux%u. %s",
 			        canvas_offset_x, canvas_offset_y, canvas_width, canvas_height,
@@ -892,7 +892,7 @@ sim_dp_get_scanout_caps(struct xrt_display_processor_vk *xdp, struct xrt_dp_scan
 		return false;
 	}
 	const enum xrt_dp_weave_scope scope = sim_scanout_scope_from_env();
-	const bool interlaced = sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_INTERLACED;
+	const bool interlaced = sim_display_resolved_output() == SIM_DISPLAY_OUTPUT_INTERLACED;
 	uint32_t flags = interlaced ? 0u : XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE;
 	// ADR-060 (#2721, the Vulkan twin of the D3D11/D3D12 DPs' answer): a
 	// screen-bound instance — the one that confines itself to its canvas —

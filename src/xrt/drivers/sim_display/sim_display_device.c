@@ -69,6 +69,11 @@ static xrt_atomic_s32_t g_sim_display_view_count = 1;
 //! The device's 3D kind (ADR-065), published at creation for the DPs'
 //! sim_display_output_for_tiles(). Anaglyph until a device exists.
 static xrt_atomic_s32_t g_sim_display_kind = SIM_DISPLAY_OUTPUT_ANAGLYPH;
+//! The live device's hmd parts (ADR-065, F6), so every consumer resolves the
+//! output from the ACTIVE MODE - which any runtime writer may set directly,
+//! without an OUTPUT_MODE request - rather than from the last request. Set at
+//! creation, cleared at destroy; one sim head device per process.
+static struct xrt_hmd_parts *volatile g_sim_live_hmd = NULL;
 
 //! Panel metrics published for the DP variants (#856). Written once in
 //! sim_display_hmd_create() before any display processor exists, then read-only
@@ -146,16 +151,19 @@ sim_display_set_output_mode(enum sim_display_output_mode mode)
 }
 
 enum sim_display_output_mode
+sim_display_resolved_output(void)
+{
+	struct xrt_hmd_parts *hmd = g_sim_live_hmd;
+	return sim_display_output_resolve(hmd != NULL, hmd != NULL ? hmd->active_rendering_mode_index : 0,
+	                                  (enum sim_display_output_mode)xrt_atomic_s32_load(&g_sim_display_kind),
+	                                  sim_display_get_output_mode());
+}
+
+enum sim_display_output_mode
 sim_display_output_for_tiles(uint32_t tile_count)
 {
-	if (tile_count <= 1) {
-		return SIM_DISPLAY_OUTPUT_PASSTHROUGH; // 3D shaders need >= 2 views
-	}
-	const enum sim_display_output_mode mode = sim_display_get_output_mode();
-	if (mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH) {
-		return (enum sim_display_output_mode)xrt_atomic_s32_load(&g_sim_display_kind);
-	}
-	return mode;
+	return sim_display_output_draw(tile_count, sim_display_resolved_output(),
+	                               (enum sim_display_output_mode)xrt_atomic_s32_load(&g_sim_display_kind));
 }
 
 uint32_t
@@ -414,6 +422,9 @@ sim_display_hmd_destroy(struct xrt_device *xdev)
 {
 	struct sim_display_hmd *hmd = sim_display_hmd(xdev);
 
+	if (g_sim_live_hmd == hmd->base.hmd) {
+		g_sim_live_hmd = NULL;
+	}
 	u_var_remove_root(hmd);
 	u_device_free(&hmd->base);
 }
@@ -461,7 +472,7 @@ sim_display_get_view_poses(struct xrt_device *xdev,
 
 	// Screen dims depend on current output mode (atomic, can change mid-frame: V / 0 / 1 switch 2D <-> the 3D
 	// kind).
-	bool sbs_mode = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_SBS);
+	bool sbs_mode = (sim_display_resolved_output() == SIM_DISPLAY_OUTPUT_SBS);
 	float screen_w = (sbs_mode ? hmd->display_width_m / 2.0f : hmd->display_width_m) / zs;
 	float screen_h = hmd->display_height_m / zs;
 	float half_w = screen_w / 2.0f;
@@ -574,11 +585,11 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
 	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
 		// Two run-time modes (ADR-065): 2D while passthrough is drawn, else
 		// the device's one 3D kind.
-		*out_value = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_PASSTHROUGH) ? 0 : 1;
+		*out_value = (sim_display_resolved_output() == SIM_DISPLAY_OUTPUT_PASSTHROUGH) ? 0 : 1;
 		return XRT_SUCCESS;
 	}
 	if (property == XRT_DEVICE_PROPERTY_SBS_MODE) {
-		*out_value = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_SBS) ? 1 : 0;
+		*out_value = (sim_display_resolved_output() == SIM_DISPLAY_OUTPUT_SBS) ? 1 : 0;
 		return XRT_SUCCESS;
 	}
 	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED) {
@@ -840,6 +851,7 @@ sim_display_hmd_create(void)
 		    hmd->base.rendering_modes[start.active].view_count);
 	}
 	hmd->base.hmd->active_rendering_mode_index = start.active;
+	g_sim_live_hmd = hmd->base.hmd;
 	sim_display_set_view_count(hmd->base.rendering_modes[start.active].view_count);
 	U_LOG_W("sim_display: rendering modes 0 '2D' and 1 '%s' (%u views); starting in mode %u",
 	        hmd->base.rendering_modes[1].mode_name, hmd->base.rendering_modes[1].view_count, start.active);
@@ -895,7 +907,7 @@ sim_display_hmd_create(void)
 	// angles from its eye position to the display edges.
 	// In SBS mode each eye sees half the display width.
 	{
-		bool sbs_mode = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_SBS);
+		bool sbs_mode = (sim_display_resolved_output() == SIM_DISPLAY_OUTPUT_SBS);
 		const float half_w = (sbs_mode ? display_w_m / 2.0f : display_w_m) / 2.0f;
 		const float half_h = display_h_m / 2.0f;
 

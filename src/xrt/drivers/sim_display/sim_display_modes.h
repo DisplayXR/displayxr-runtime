@@ -190,6 +190,39 @@ sim_display_fill_modes(enum sim_display_output_mode kind, struct xrt_rendering_m
 	                      d.tile_columns, d.tile_rows);
 }
 
+/*!
+ * The output the device is in now (ADR-065): passthrough in mode 0, the kind
+ * in mode 1 - from the ACTIVE MODE, which a runtime writer may set without an
+ * OUTPUT_MODE request. With no device (a bare display processor) the last
+ * request stands. sim_display_resolved_output() is this, on the live device.
+ */
+static inline enum sim_display_output_mode
+sim_display_output_resolve(bool have_device,
+                           uint32_t active_mode,
+                           enum sim_display_output_mode kind,
+                           enum sim_display_output_mode last_request)
+{
+	if (!have_device) {
+		return last_request;
+	}
+	return active_mode == 0 ? SIM_DISPLAY_OUTPUT_PASSTHROUGH : kind;
+}
+
+/*!
+ * What a display processor draws for an atlas of @p tile_count tiles:
+ * passthrough for one tile (3D shaders need two views), otherwise the resolved
+ * output - and the kind when that is still passthrough (the one frame a
+ * multi-tile atlas lands after a switch back to 2D).
+ */
+static inline enum sim_display_output_mode
+sim_display_output_draw(uint32_t tile_count, enum sim_display_output_mode resolved, enum sim_display_output_mode kind)
+{
+	if (tile_count <= 1) {
+		return SIM_DISPLAY_OUTPUT_PASSTHROUGH;
+	}
+	return resolved == SIM_DISPLAY_OUTPUT_PASSTHROUGH ? kind : resolved;
+}
+
 //! What the device starts in, and whether it is pinned there.
 struct sim_display_start
 {

@@ -119,6 +119,21 @@ enum sim_display_output_mode
 sim_display_output_for_tiles(uint32_t tile_count);
 
 /*!
+ * The output the device is in NOW (ADR-065): passthrough while the active
+ * rendering mode is 0, the device's 3D kind while it is 1 - read from the
+ * active mode, which a runtime writer may set without an OUTPUT_MODE request.
+ * Every consumer that asks "what is drawn" (SBS view sizing, the interlace
+ * phase / resample gate, the lens state, the OUTPUT_MODE property) uses this;
+ * the per-frame draw uses @ref sim_display_output_for_tiles, which agrees with
+ * it except on the one frame a multi-tile atlas lands after a switch to 2D.
+ * Falls back to the last request when no device exists (a bare DP).
+ *
+ * @ingroup drv_sim_display
+ */
+enum sim_display_output_mode
+sim_display_resolved_output(void);
+
+/*!
  * Get the current view count for the active rendering mode.
  *
  * Thread-safe (atomic). The display processor reads this each frame

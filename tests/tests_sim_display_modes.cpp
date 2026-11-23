@@ -217,3 +217,34 @@ TEST_CASE("the worst-case atlas covers 2D and the selected kind only", "[sim_dis
 		CHECK(u_rendering_modes_max_view_count(modes, 2) == k.views);
 	}
 }
+
+TEST_CASE("F6: every consumer resolves the output from the ACTIVE mode", "[sim_display_modes]")
+{
+	const auto Q = SIM_DISPLAY_OUTPUT_QUAD;
+	const auto P = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
+	const auto I = SIM_DISPLAY_OUTPUT_INTERLACED;
+	SECTION("a direct active-index write to 1 means the kind, whatever was last requested")
+	{
+		// The case F6 is about: started in 2D (last request passthrough), then a
+		// runtime writer set active = 1 without an OUTPUT_MODE request.
+		CHECK(sim_display_output_resolve(true, 1, I, P) == I);
+		CHECK(sim_display_output_resolve(true, 1, Q, P) == Q);
+	}
+	SECTION("active 0 is passthrough even if the last request was the kind")
+	{
+		CHECK(sim_display_output_resolve(true, 0, I, I) == P);
+	}
+	SECTION("no device: the last request stands")
+	{
+		CHECK(sim_display_output_resolve(false, 1, I, P) == P);
+		CHECK(sim_display_output_resolve(false, 0, I, I) == I);
+	}
+	SECTION("the draw agrees with the resolution, except a 1-tile atlas is always flat")
+	{
+		CHECK(sim_display_output_draw(1, I, I) == P);
+		CHECK(sim_display_output_draw(2, I, I) == I);
+		CHECK(sim_display_output_draw(4, Q, Q) == Q);
+		// A multi-tile atlas on the frame the active mode went back to 2D.
+		CHECK(sim_display_output_draw(2, P, I) == I);
+	}
+}
