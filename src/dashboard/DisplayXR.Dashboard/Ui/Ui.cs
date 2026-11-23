@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Shapes;
@@ -286,20 +287,46 @@ public static class U
             ColumnDefinitions.Clear();
             RowDefinitions.Clear();
             for (int i = 0; i < columns; i++) ColumnDefinitions.Add(new ColumnDefinition(1, GridUnitType.Star));
-            int row = 0, col = 0;
-            foreach (var (control, spanWanted) in _items)
+            var cells = Layout(_items.Select(x => x.Span).ToArray(), columns);
+            for (int i = 0; i < _items.Count; i++)
             {
-                int span = Math.Min(spanWanted, columns);
-                if (col + span > columns) { row++; col = 0; }
+                var control = _items[i].Control;
+                var (row, col, span) = cells[i];
                 while (RowDefinitions.Count <= row) RowDefinitions.Add(new RowDefinition(GridLength.Auto));
                 SetRow(control, row);
                 SetColumn(control, col);
                 SetColumnSpan(control, span);
                 control.Margin = new Thickness(col == 0 ? 0 : _gap / 2, row == 0 ? 0 : _gap, col + span == columns ? 0 : _gap / 2, 0);
                 control.VerticalAlignment = VerticalAlignment.Stretch;
+            }
+        }
+
+        /// <summary>
+        /// Where each card goes, left to right, a new row when a card does not fit. A card left alone
+        /// in its row (the next one is wider than what is left, or it is the last) takes the whole
+        /// row, so no row ends in an empty half. Pure, for the tests.
+        /// </summary>
+        public static (int Row, int Col, int Span)[] Layout(IReadOnlyList<int> spans, int columns)
+        {
+            columns = Math.Max(1, columns);
+            var cells = new (int Row, int Col, int Span)[spans.Count];
+            int row = 0, col = 0;
+            for (int i = 0; i < spans.Count; i++)
+            {
+                int span = Math.Clamp(spans[i], 1, columns);
+                if (col + span > columns) { row++; col = 0; }
+                cells[i] = (row, col, span);
                 col += span;
                 if (col >= columns) { col = 0; row++; }
             }
+            // A row whose cards do not fill it: its last card takes what is left.
+            for (int i = 0; i < cells.Length; i++)
+            {
+                bool lastInRow = i == cells.Length - 1 || cells[i + 1].Row != cells[i].Row;
+                if (lastInRow && cells[i].Col + cells[i].Span < columns)
+                    cells[i] = (cells[i].Row, cells[i].Col, columns - cells[i].Col);
+            }
+            return cells;
         }
 
         protected override Size MeasureOverride(Size available)
