@@ -1069,7 +1069,7 @@ cmd_list_installed(bool json)
 {
 	static struct dxr_receipt all[MAX_RECEIPTS];
 	int n = receipts_all(all, MAX_RECEIPTS);
-	cJSON *arr = dxr_list_receipts(all, n);
+	cJSON *arr = dxr_list_receipts(&k_env, all, n);
 	if (json) {
 		cJSON *o = cJSON_CreateObject();
 		cJSON_AddItemToObject(o, "installed", arr);

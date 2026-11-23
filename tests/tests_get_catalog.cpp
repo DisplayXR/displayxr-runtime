@@ -1185,8 +1185,17 @@ TEST_CASE("inventory: list, outdated and receipts")
 	dxr_receipt rs[3] = {receipt("runtime", "2.70.0", SHA_RT), receipt("leia-sr", "2.23.0", SHA_LEIA, "runtime"),
 	                     receipt("acme.depth-pro", "1.4.0", SHA_ACME, "runtime,open-conversion")};
 	rs[0].uninstall[0] = '\0'; // the catalog gave no uninstall command for it
-	cJSON *inst = dxr_list_receipts(rs, 3);
+	// Where each keeps its version: the runtime's is there, the plug-in's is gone (removed by
+	// its own uninstaller, the receipt left behind), the third receipt does not say.
+	(void)snprintf(rs[0].version_path, sizeof(rs[0].version_path), "%s", RT_VER);
+	(void)snprintf(rs[1].version_path, sizeof(rs[1].version_path), "%s",
+	               "HKLM\\Software\\DisplayXR\\Plugins\\Gone\\Version");
+	cJSON *inst = dxr_list_receipts(&e, rs, 3);
 	REQUIRE(cJSON_GetArraySize(inst) == 3);
+	CHECK(std::string(cJSON_GetObjectItem(cJSON_GetArrayItem(inst, 0), "installed")->valuestring) == "2.71.0");
+	CHECK(std::string(cJSON_GetObjectItem(cJSON_GetArrayItem(inst, 0), "version")->valuestring) == "2.70.0");
+	CHECK(cJSON_IsNull(cJSON_GetObjectItem(cJSON_GetArrayItem(inst, 1), "installed")));
+	CHECK(cJSON_GetObjectItem(cJSON_GetArrayItem(inst, 2), "installed") == nullptr);
 	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(cJSON_GetArrayItem(inst, 0), "can_uninstall")));
 	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetArrayItem(inst, 1), "can_uninstall")));
 	CHECK(std::string(cJSON_GetObjectItem(cJSON_GetArrayItem(inst, 1), "sha256")->valuestring) == SHA_LEIA);

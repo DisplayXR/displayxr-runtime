@@ -327,9 +327,15 @@ dxr_plan_text(const struct dxr_plan *p, FILE *out);
 cJSON *
 dxr_list_catalog(const struct dxr_catalog *c, const struct dxr_env *env, bool outdated_only, bool fixed_runtime);
 
-//! `list --installed`: the receipts, no catalog needed.
+/*!
+ * `list --installed`: the receipts, no catalog needed. Each row carries the
+ * receipt's `version` (what was installed) and, when the receipt recorded where
+ * the component keeps its version and @p env can read it, `installed`: that
+ * value now, or null when it is gone (removed by the component's own
+ * uninstaller, which leaves the receipt behind).
+ */
 cJSON *
-dxr_list_receipts(const struct dxr_receipt *r, int n);
+dxr_list_receipts(const struct dxr_env *env, const struct dxr_receipt *r, int n);
 
 /*!
  * May `uninstall` run? @p r is the item's receipt (NULL: none), @p all every

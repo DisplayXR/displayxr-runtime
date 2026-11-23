@@ -288,9 +288,16 @@ for the item is not a reason: `install` would upgrade it. With `--no-runtime` or
 `--assume-runtime` the runtime is taken as fixed, and an item that needs a newer one is not
 compatible. The fields that existed before these were added are unchanged.
 
-`list --installed` reads the install receipts and nothing else. It needs no catalog and no
-network. `--json` gives `{"installed":[…]}` with `id`, `name`, `class`, `publisher`,
-`version`, `source_url`, `sha256`, `install_time`, `can_uninstall` and `uninstall_command`.
+`list --installed` reads the install receipts. It needs no catalog and no network. `--json`
+gives `{"installed":[…]}` with `id`, `name`, `class`, `publisher`, `version`, `installed`,
+`source_url`, `sha256`, `install_time`, `can_uninstall` and `uninstall_command`.
+
+`version` is what the receipt recorded at install time. `installed` is what is on the machine
+now, read from the place the receipt says the component keeps its version: the version string,
+or `null` when that value is gone. A component removed by its own uninstaller leaves its
+receipt behind, so `null` means "there is a receipt and the component is not installed". A
+receipt that does not record where the version is kept has no `installed` field: nothing was
+checked. A front end must not show a row whose `installed` is `null` as installed.
 
 ### uninstall
 
