@@ -111,6 +111,17 @@ public class StatusTextTests
     }
 
     [Fact]
+    public void ConnectionPill_IsPlain_TheSourceLineStaysTechnical()
+    {
+        Assert.Equal("DisplayXR is running", StatusText.PlainSourceLine(Design));
+        Assert.StartsWith("source: service", StatusText.SourceLine(Design));
+        var headless = Design with { Source = "headless" };
+        Assert.Equal("Not running in the background", StatusText.PlainSourceLine(headless));
+        Assert.DoesNotContain("headless", StatusText.NotRunningText);
+        Assert.DoesNotContain("work", StatusText.NotRunningText); // no promise the Dashboard cannot check
+    }
+
+    [Fact]
     public void HomeLine_OnlyWithSeveralScreensOrAWarning()
     {
         Assert.Equal("2 3D displays · 2 see you · 1 thing to check", StatusText.HomeLine(Design));

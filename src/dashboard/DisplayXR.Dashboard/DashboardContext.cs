@@ -688,7 +688,7 @@ public sealed class DashboardContext
     public bool PerfNonDefault => Perf?.AnyNonDefault ?? false;
 
     public string ElevationNote => Ui.Elevation.IsElevated
-        ? "The dashboard is running elevated. The service answers status reads only from non-elevated diagnostics clients, so the feed falls back to headless snapshots. Start it from the Start menu (not as administrator) for live rows."
+        ? "The Dashboard is running as administrator, so it cannot read live status from DisplayXR. Start it from the Start menu, not as administrator, for live details."
         : "";
 
     public int AppClientCount => Feed.Snapshot?.Clients.Count(c => !c.IsDiag) ?? 0;

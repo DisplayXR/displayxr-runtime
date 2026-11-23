@@ -212,8 +212,8 @@ public sealed class ComponentsPage : Page
         var page = U.VStack(18);
         if (Ctx.Info is null)
             page.Children.Add(U.Notice(Ctx.InfoError is null ? Level.Info : Level.Warn,
-                Ctx.InfoError is null ? "Reading the runtime's components" : "Could not read the runtime's components",
-                Ctx.InfoError ?? "Input providers and the conversion module come from 'displayxr-cli info' (about 10 s); connected clients come from the live feed."));
+                Ctx.InfoError is null ? "Looking for your add-ons" : "Couldn't read the list of add-ons",
+                Ctx.InfoError ?? "This takes about 10 seconds. Running apps appear as soon as DisplayXR reports them."));
         // A read in progress (the first one, Try again, Refresh, after an install) is said, never silent.
         if (CatalogText.Checking(Ctx.CatalogLoading) is { } checking)
         {

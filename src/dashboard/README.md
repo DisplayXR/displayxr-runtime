@@ -250,10 +250,15 @@ scale). Method: [tracking-provider-discovery.md §6](../../docs/specs/runtime/tr
   and the snapshot is dropped.
 - A child that exits after ≥ 10 s is restarted; two young exits in a row → fallback to
   `status --json` **every 30 s, never faster** (each headless run creates a vendor
-  instance), with a "Live feed unavailable" banner. A poll that sees `source: service`, or
+  instance), with a "Live status isn't available" banner. A poll that sees `source: service`, or
   every 4th poll, retries the watch child — at most one poll and one watch attempt per 30 s.
 - A line that does not parse keeps the last good snapshot and shows "last read failed,
   retrying" in the header. Never a modal, never a crash.
+- The header's pill says "DisplayXR is running" (`source: service`) or "Not running in the
+  background" (headless), the technical source line in its tooltip. A headless snapshot also
+  shows the banner "DisplayXR isn't running in the background" (`StatusText.NotRunningText`:
+  what the pages show and what is missing; it does not promise that 3D apps work meanwhile).
+  **Copy report** copies the full status snapshot as JSON (unchanged).
 - `info --json` (≈ 10 s: it loads every plug-in) is never polled.
 - Every child is in a kill-on-close job object: no `displayxr-cli` outlives the dashboard.
 - One dashboard per logon session (a second launch raises the first): each one holds a
@@ -313,7 +318,7 @@ parts (the job object, raising the first instance) are no-ops there.
   (the status feed) only from its own directory (#960); any other `displayxr-cli` is
   admitted as APP and refused the status read. The CLI then says so on stderr and shows
   the headless snapshot; the dashboard logs that note (`status --watch says: …`) and, if
-  a watch child prints nothing for 10 s, a WARN and a "no snapshot" pill. Mixing a
+  a watch child prints nothing for 10 s, a WARN and a "No status yet" pill. Mixing a
   `_package\bin` dashboard with an installed service (or the reverse) is the usual way in.
 - `--version` prints the version and exits (no window).
 - `--page displays|windows|components|performance|developer|home` opens on that page

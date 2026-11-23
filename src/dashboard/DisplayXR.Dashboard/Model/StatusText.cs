@@ -425,6 +425,16 @@ public static class StatusText
         return sb.ToString();
     }
 
+    /// <summary>The banner shown while the background service cannot be reached (a headless snapshot).</summary>
+    public const string NotRunningTitle = "DisplayXR isn't running in the background";
+
+    /// <summary>
+    /// What the not-running banner can honestly say: what the pages show and what is missing. It does not
+    /// promise that 3D apps work meanwhile (the Dashboard cannot know that).
+    /// </summary>
+    public const string NotRunningText =
+        "The pages show what a 3D app starting now would find. Live details, such as running apps and whether a display sees you, appear when it runs. The Dashboard keeps trying to reach it.";
+
     /// <summary>The connection pill in plain words; <see cref="SourceLine"/> is the technical one (tooltip, Copy).</summary>
     public static string PlainSourceLine(StatusSnapshot s) =>
         s.IsService ? "DisplayXR is running" : "Not running in the background";

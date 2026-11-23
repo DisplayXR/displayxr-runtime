@@ -34,7 +34,7 @@ public sealed class WindowsPage : Page
         get
         {
             var s = Ctx.Feed.Snapshot;
-            if (s is null) return "Waiting for the first status snapshot…";
+            if (s is null) return "Looking for running 3D apps…";
             if (!s.IsService) return "Live client rows need the service; this is a headless snapshot.";
             int apps = s.Clients.Count(c => !c.IsDiag), diag = s.Clients.Count - apps;
             return $"{StatusText.Plural(apps, "client", "clients")}{StatusText.Sep}{diag} diagnostic";
@@ -91,8 +91,8 @@ public sealed class WindowsPage : Page
         var page = U.VStack(16);
         if (s is null)
         {
-            page.Children.Add(U.Card(U.VStack(8, U.Text("Reading the client list", "group"),
-                U.Wrapped("Waiting for the first status snapshot.", "desc"))));
+            page.Children.Add(U.Card(U.VStack(8, U.Text("Looking for running 3D apps", "group"),
+                U.Wrapped("This takes about a second when DisplayXR runs in the background.", "desc"))));
             return page;
         }
         var clients = Visible(s);
