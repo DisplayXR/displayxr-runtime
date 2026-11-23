@@ -152,6 +152,23 @@ void
 u_status_input_holders_add_cjson(cJSON *root, const struct xrt_input_client_holders *rows, uint32_t count);
 
 /*!
+ * Add the global display-driver preference to @p root as
+ * `"dp_preference": {"plugin_id": "<id>" | null, "source": "user" | "machine" | "env" | null}`.
+ * Always added (both null when none is set), so a reader tells "none set" from
+ * an older runtime that has no such key.
+ */
+void
+u_status_dp_preference_add_cjson(cJSON *root, const struct xrt_status_dp_preference *pref);
+
+/*!
+ * The one human line for a global display-driver preference, e.g.
+ * `sim-display for every screen (user); a per-screen choice still wins`.
+ * Returns false (and "") when none is set.
+ */
+bool
+u_status_dp_preference_format(const struct xrt_status_dp_preference *pref, char *out, size_t cap);
+
+/*!
  * The design §3 JSON of @p snap (`schema` first). Caller owns the tree.
  */
 cJSON *

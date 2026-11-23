@@ -172,6 +172,97 @@ public class StatusTextTests
         Assert.False(StatusText.ChoseSimulated(snap, other));
     }
 
+    /// <summary>
+    /// The global preference (<c>dp_preference</c>) names the simulated driver on a PC with a real, healthy
+    /// display driver registered: Home and Displays read a 3D display showing the simulated preview by the
+    /// user's choice, never "No 3D display found".
+    /// </summary>
+    [Fact]
+    public void GlobalPreference_SimulatedChosen_ReadsAsA3DDisplay()
+    {
+        var snap = TestData.Parse(TestData.Text("status-global-sim.json"));
+        Assert.Equal(new DpPreference("sim-display", "user"), snap.DpPreference);
+        var x = snap.Screens[0];
+        Assert.False(StatusText.VendorDriverUnhealthy(snap));        // the real driver is healthy
+        Assert.True(StatusText.ChoseSimulatedGlobally(snap, x));
+        Assert.True(StatusText.ChoseSimulated(snap, x));
+        Assert.True(StatusText.IsReal3D(snap, x));
+        Assert.False(StatusText.IsSimulatedPreview(snap, x));
+        Assert.NotEqual(Verdicts.Plain2D, StatusText.PlainBadge(x, snap).Text);
+        string? NameOf(string id) => snap.Plugins.FirstOrDefault(p => p.Id == id)?.Name;
+        Assert.Equal("Recognised as a 3D display · display driver: DisplayXR Sim Display · chosen by you",
+                     StatusText.PlainClaimLine(x, NameOf, snap));
+        Assert.Equal("Chosen by you", StatusText.ForcedChip(x, null, snap));
+        Assert.Null(StatusText.ForcedChip(x, null));                 // without the snapshot: as before
+        Assert.StartsWith("One display, recognised as 3D", StatusText.DisplaysSummary(snap));
+
+        var v = Verdicts.From(snap);
+        Assert.NotEqual(VerdictKind.No3DDisplay, v.Kind);
+        Assert.DoesNotContain("Nothing is wrong", v.Subline);
+        Assert.True(v.Rows[0].Is3D);
+        Assert.Equal("Chosen by you", v.Rows[0].Forced);
+        Assert.Null(Verdicts.OnlySimulated(snap));
+
+        Assert.Equal("Display driver for every display: sim-display (user)", StatusText.GlobalPreferenceLine(snap));
+        Assert.Contains("Display driver for every display: sim-display (user)\n", StatusText.Copy(snap));
+    }
+
+    [Fact]
+    public void GlobalPreference_SourceWords()
+    {
+        var snap = TestData.Parse(TestData.Text("status-global-sim.json"));
+        var x = snap.Screens[0];
+        var machine = snap with { DpPreference = new DpPreference("sim-display", "machine") };
+        Assert.EndsWith("chosen for everyone on this PC", StatusText.PlainClaimLine(x, null, machine));
+        Assert.Equal("Chosen for everyone on this PC", StatusText.ForcedChip(x, null, machine));
+        var env = snap with { DpPreference = new DpPreference("sim-display", "env") };
+        Assert.EndsWith("chosen by hand", StatusText.PlainClaimLine(x, null, env));
+        Assert.True(StatusText.IsReal3D(env, x));
+    }
+
+    /// <summary>An older runtime has no <c>dp_preference</c>: exactly today's reading.</summary>
+    [Fact]
+    public void GlobalPreference_OlderRuntimeWithoutTheKey_BehavesAsBefore()
+    {
+        var text = TestData.Text("status-global-sim.json");
+        int at = text.IndexOf(",\n\t\"dp_preference\"", System.StringComparison.Ordinal);
+        if (at < 0) at = text.IndexOf(",\r\n\t\"dp_preference\"", System.StringComparison.Ordinal);
+        Assert.True(at > 0);
+        var old = TestData.Parse(text[..at] + "\n}");
+        Assert.Null(old.DpPreference);
+        var x = old.Screens[0];
+        Assert.False(StatusText.ChoseSimulated(old, x));
+        Assert.False(StatusText.IsReal3D(old, x));
+        Assert.Null(StatusText.GlobalPreferenceLine(old));
+        var v = Verdicts.From(old);
+        Assert.Equal(VerdictKind.No3DDisplay, v.Kind);
+        Assert.StartsWith("None of your displays is recognised as a 3D display.", v.Subline);
+        // Present but empty (none set) reads the same.
+        var none = old with { DpPreference = new DpPreference(null, null) };
+        Assert.False(StatusText.IsReal3D(none, x));
+    }
+
+    [Fact]
+    public void GlobalPreference_DoesNotCountWhereItShouldNot()
+    {
+        var snap = TestData.Parse(TestData.Text("status-global-sim.json"));
+        var x = snap.Screens[0];
+        // Only the simulated driver on this PC: still an ordinary display ("Nothing is wrong").
+        var simOnly = snap with { Plugins = snap.Plugins.Where(p => p.Fallback).ToArray() };
+        Assert.False(StatusText.IsReal3D(simOnly, x));
+        Assert.Equal("sim-display", Verdicts.OnlySimulated(simOnly));
+        // The global preference names the real driver: the simulated claim is no choice.
+        var other = snap with { DpPreference = new DpPreference("leia-sr", "user") };
+        Assert.False(StatusText.ChoseSimulatedGlobally(other, x));
+        Assert.False(StatusText.IsReal3D(other, x));
+        // A per-display preference for another driver wins over the global one on that display.
+        var perScreen = x with { Claim = x.Claim with { PreferredPlugin = "leia-sr", PreferredSource = "user" } };
+        Assert.False(StatusText.ChoseSimulatedGlobally(snap, perScreen));
+        // Unclaimed displays stay unclaimed.
+        var flat = x with { Claim = x.Claim with { PluginId = null, Confidence = "NONE" } };
+        Assert.False(StatusText.IsReal3D(snap, flat));
+    }
+
     [Fact]
     public void DisplaysCard_SimulatedOnly_SaysOrdinary2D()
     {

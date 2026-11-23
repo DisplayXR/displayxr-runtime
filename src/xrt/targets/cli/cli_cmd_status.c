@@ -206,6 +206,8 @@ status_fetch_service(struct xrt_status_snapshot *out, xrt_result_t *out_why)
 	ipc_client_connection_fini(&ipc_c);
 	// ADR-053 P4: the model store's packs, read from disk here (never over IPC).
 	target_conv_store_fill_snapshot(out);
+	// The global display-driver preference: read here too (not in the DIAG head).
+	target_status_snapshot_fill_dp_preference(out);
 	if (out_why != NULL) {
 		*out_why = xret;
 	}
@@ -488,8 +490,14 @@ status_watch(uint32_t interval_ms, bool json)
 		if (connected) {
 			struct xrt_status_generation g;
 			xrt_result_t xret = ipc_call_system_get_status_generation(&ipc_c, &g);
-			if (xret == XRT_SUCCESS && (!have_gen || !u_status_generation_equal(&g, &last))) {
+			// The global display-driver preference is read here, not by the
+			// service, so no generation covers it: a change reprints too.
+			struct xrt_status_dp_preference pref;
+			target_status_dp_preference_read(&pref);
+			const bool pref_moved = memcmp(&pref, &snap->dp_preference, sizeof(pref)) != 0;
+			if (xret == XRT_SUCCESS && (!have_gen || pref_moved || !u_status_generation_equal(&g, &last))) {
 				xret = status_fetch_over(&ipc_c, snap);
+				target_status_snapshot_fill_dp_preference(snap);
 				if (xret == XRT_SUCCESS) {
 					last = snap->generation;
 					have_gen = true;

@@ -770,8 +770,9 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 
 	CHECK(keys(d.root) ==
 	      V{"schema", "source", "generation", "runtime", "plugins", "screens", "clients", "workspace", "warnings",
-	        "conv_providers", "conv_tasks",
-	        "input_holders"}); // ADR-053 (#2006), ADR-034 Am.5 (#2181): keys only added, schema stays 1
+	        "conv_providers", "conv_tasks", "input_holders",
+	        "dp_preference"}); // ADR-053 (#2006), ADR-034 Am.5 (#2181), global DP choice: keys only added, schema 1
+	CHECK(keys(cJSON_GetObjectItem(d.root, "dp_preference")) == V{"plugin_id", "source"});
 	CHECK(str(d.root, "source") == "service");
 	CHECK(keys(cJSON_GetObjectItem(d.root, "generation")) == V{"topology", "status", "conversion"});
 	CHECK(keys(cJSON_GetObjectItem(d.root, "runtime")) ==
@@ -920,6 +921,57 @@ TEST_CASE("status: a plug-in's platform remedy reaches the JSON and the text (AD
 	          .find(std::string("PLUG-IN  ") + s->plugins[0].id +
 	                ": Update recommended: 1.2.0 -> 1.4.0. Download the update: "
 	                "https://example.com/update\n") != std::string::npos);
+}
+
+TEST_CASE("status: the global display-driver preference reaches the JSON and the text", "[status][json][text]")
+{
+	{
+		// None set: the key is there, both members null; no text line.
+		auto s = healthy();
+		json_doc_light d(*s);
+		const cJSON *p = cJSON_GetObjectItem(d.root, "dp_preference");
+		REQUIRE(cJSON_IsObject(p));
+		CHECK(cJSON_IsNull(cJSON_GetObjectItem(p, "plugin_id")));
+		CHECK(cJSON_IsNull(cJSON_GetObjectItem(p, "source")));
+		std::vector<char> text(64 * 1024);
+		u_status_snapshot_format_text(s.get(), text.data(), text.size());
+		CHECK(std::string(text.data()).find("DP PREF") == std::string::npos);
+		char line[160];
+		CHECK_FALSE(u_status_dp_preference_format(&s->dp_preference, line, sizeof(line)));
+		CHECK(line[0] == '\0');
+	}
+	const struct
+	{
+		xrt_status_pref_source src;
+		const char *word;
+	} cases[] = {{XRT_STATUS_PREF_SOURCE_USER, "user"},
+	             {XRT_STATUS_PREF_SOURCE_MACHINE, "machine"},
+	             {XRT_STATUS_PREF_SOURCE_ENV, "env"}};
+	for (const auto &c : cases) {
+		auto s = healthy();
+		SET(s->dp_preference.plugin_id, "sim-display");
+		s->dp_preference.source = c.src;
+		u_status_warnings_derive(s.get());
+		CHECK(sys_codes(*s).empty()); // a choice, not a problem: no warning
+
+		json_doc_light d(*s);
+		const cJSON *p = cJSON_GetObjectItem(d.root, "dp_preference");
+		REQUIRE(cJSON_IsObject(p));
+		CHECK(str(p, "plugin_id") == "sim-display");
+		CHECK(str(p, "source") == c.word);
+		// Additive: the per-screen claim keys are untouched.
+		const cJSON *claim =
+		    cJSON_GetObjectItem(cJSON_GetArrayItem(cJSON_GetObjectItem(d.root, "screens"), 0), "claim");
+		CHECK(cJSON_IsNull(cJSON_GetObjectItem(claim, "preferred_plugin")));
+
+		std::vector<char> text(64 * 1024);
+		u_status_snapshot_format_text(s.get(), text.data(), text.size());
+		const std::string t(text.data());
+		const std::string want = std::string("DP PREF  sim-display for every screen (") + c.word +
+		                         "); a per-screen choice still wins\n";
+		CHECK(t.find(want) != std::string::npos);
+		CHECK(t.find("DP PREF") == t.rfind("DP PREF")); // one line only
+	}
 }
 
 TEST_CASE("status: the workspace block lists the screens it presents on (ADR-052)", "[status][json]")

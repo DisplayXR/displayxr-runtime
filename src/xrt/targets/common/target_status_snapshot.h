@@ -85,6 +85,20 @@ target_status_snapshot_build_service(struct xrt_instance *xi,
 uint64_t
 target_status_snapshot_change_key(const struct xrt_dp_factory_registry *reg);
 
+/*!
+ * Fill @p out's `dp_preference` (the GLOBAL display-driver preference,
+ * `target_plugin_get_global_preference`) from the stores and the environment
+ * of THIS process. The headless builder calls it; a reader that assembled a
+ * service snapshot over DIAG calls it after the fetch (the head does not carry
+ * it, so no IPC message changes), like the model store's packs. Read-only.
+ */
+void
+target_status_snapshot_fill_dp_preference(struct xrt_status_snapshot *out);
+
+//! The same read into one @ref xrt_status_dp_preference (zeroed first, padding included).
+void
+target_status_dp_preference_read(struct xrt_status_dp_preference *out);
+
 #ifdef __cplusplus
 }
 #endif

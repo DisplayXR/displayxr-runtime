@@ -162,12 +162,22 @@ public sealed record Client(
 
 public sealed record Workspace(bool Enabled, string? Controller);
 
+/// <summary>
+/// The GLOBAL display-driver preference (<c>dp_preference</c>: <c>dp use &lt;id&gt;</c> without <c>--screen</c>,
+/// per user or for the whole PC, or an environment pin). <see cref="PluginId"/> null = none set;
+/// <see cref="Source"/> is "user" / "machine" / "env". The whole record is null from a runtime that predates it.
+/// </summary>
+public sealed record DpPreference(string? PluginId, string? Source)
+{
+    public bool IsSet => !string.IsNullOrEmpty(PluginId);
+}
+
 public sealed record StatusSnapshot(
     int Schema, string Source, Generation Generation, RuntimeInfo Runtime, IReadOnlyList<PluginInfo> Plugins,
     IReadOnlyList<Screen> Screens, IReadOnlyList<Client> Clients, Workspace Workspace,
     IReadOnlyList<StatusWarning> Warnings, string RawJson,
     IReadOnlyList<ConvProvider>? ConvProviders = null, IReadOnlyList<ConvTask>? ConvTasks = null, bool ConvKnown = false,
-    IReadOnlyList<ConvPack>? ConvPacks = null, string? ModelStoreRoot = null)
+    IReadOnlyList<ConvPack>? ConvPacks = null, string? ModelStoreRoot = null, DpPreference? DpPreference = null)
 {
     /// <summary>Model packs in the runtime-owned store (ADR-053 P4); empty from a CLI that predates the store.</summary>
     public IReadOnlyList<ConvPack> Packs => ConvPacks ?? Array.Empty<ConvPack>();
@@ -234,7 +244,10 @@ public static class StatusSnapshotParser
             root.Arr("conv_tasks").Where(t => t.ValueKind == JsonValueKind.Object).Select(ReadConvTask).ToArray(),
             root.Has("conv_providers"),
             root.Arr("conv_packs").Where(p => p.ValueKind == JsonValueKind.Object).Select(ReadConvPack).ToArray(),
-            root.Obj("conv_model_store").StrOrNull("root"));
+            root.Obj("conv_model_store").StrOrNull("root"),
+            root.Obj("dp_preference") is { } pref && pref.ValueKind == JsonValueKind.Object
+                ? new DpPreference(pref.StrOrNull("plugin_id"), pref.StrOrNull("source"))
+                : null);
     }
 
     private static ConvPack ReadConvPack(JsonElement p) => new(

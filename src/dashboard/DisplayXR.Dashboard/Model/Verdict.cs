@@ -139,7 +139,7 @@ public static class Verdicts
             string? name = id is null ? null : s.Plugins.FirstOrDefault(p => p.Id == id)?.Name is { Length: > 0 } n ? n : id;
             bool is3D = StatusText.IsReal3D(s, x);
             rows.Add(new VerdictRow(x.Id, StatusText.ScreenName(x), role, is3D, is3D ? name : null, is3D ? id : null,
-                                    is3D ? StatusText.ForcedChip(x, dp) : null,
+                                    is3D ? StatusText.ForcedChip(x, dp, s) : null,
                                     is3D ? Facts(s, x) : Array.Empty<VerdictFact>()));
         }
         return rows;

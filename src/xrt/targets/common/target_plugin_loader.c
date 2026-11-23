@@ -2475,9 +2475,11 @@ target_plugin_enumerate(struct target_plugin_desc *out, int max)
 
 #ifdef XRT_OS_WINDOWS
 
-bool
-target_plugin_get_preferred(char *out, size_t cap)
+//! The PreferredPlugin store and the tier it came from (USER = HKCU, MACHINE = HKLM).
+static bool
+preferred_read(char *out, size_t cap, enum u_setting_source *out_source)
 {
+	*out_source = U_SETTING_SOURCE_DEFAULT;
 	if (out == NULL || cap == 0) {
 		return false;
 	}
@@ -2491,10 +2493,12 @@ target_plugin_get_preferred(char *out, size_t cap)
 	DWORD wbuf_bytes = sizeof(wbuf);
 	LSTATUS rc = RegGetValueW(HKEY_CURRENT_USER, L"Software\\DisplayXR\\DisplayProcessors", L"PreferredPlugin",
 	                          RRF_RT_REG_SZ, NULL, wbuf, &wbuf_bytes);
+	enum u_setting_source src = U_SETTING_SOURCE_USER;
 	if (rc != ERROR_SUCCESS || wbuf[0] == L'\0') {
 		wbuf_bytes = sizeof(wbuf);
 		rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", L"PreferredPlugin",
 		                  RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, NULL, wbuf, &wbuf_bytes);
+		src = U_SETTING_SOURCE_MACHINE;
 	}
 	if (rc != ERROR_SUCCESS) {
 		return false;
@@ -2502,7 +2506,11 @@ target_plugin_get_preferred(char *out, size_t cap)
 	if (WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, (int)cap, NULL, NULL) <= 0) {
 		out[0] = '\0';
 	}
-	return out[0] != '\0';
+	if (out[0] == '\0') {
+		return false;
+	}
+	*out_source = src;
+	return true;
 }
 
 xrt_result_t
@@ -2566,9 +2574,10 @@ target_plugin_clear_preferred(void)
  * pin a plug-in.
  */
 
-bool
-target_plugin_get_preferred(char *out, size_t cap)
+static bool
+preferred_read(char *out, size_t cap, enum u_setting_source *out_source)
 {
+	*out_source = U_SETTING_SOURCE_DEFAULT;
 	if (out == NULL || cap == 0) {
 		return false;
 	}
@@ -2576,6 +2585,7 @@ target_plugin_get_preferred(char *out, size_t cap)
 	const char *env = getenv("XRT_PREFERRED_PLUGIN_ID");
 	if (env != NULL && *env != '\0') {
 		snprintf(out, cap, "%s", env);
+		*out_source = U_SETTING_SOURCE_ENV;
 		return out[0] != '\0';
 	}
 	return false;
@@ -2596,9 +2606,10 @@ target_plugin_clear_preferred(void)
 
 #else /* macOS / Linux: env override, else a `preferred` file in the per-user dir */
 
-bool
-target_plugin_get_preferred(char *out, size_t cap)
+static bool
+preferred_read(char *out, size_t cap, enum u_setting_source *out_source)
 {
+	*out_source = U_SETTING_SOURCE_DEFAULT;
 	if (out == NULL || cap == 0) {
 		return false;
 	}
@@ -2608,6 +2619,7 @@ target_plugin_get_preferred(char *out, size_t cap)
 	const char *env = getenv("XRT_PREFERRED_PLUGIN_ID");
 	if (env != NULL && *env != '\0') {
 		snprintf(out, cap, "%s", env);
+		*out_source = U_SETTING_SOURCE_ENV;
 		return out[0] != '\0';
 	}
 
@@ -2632,6 +2644,7 @@ target_plugin_get_preferred(char *out, size_t cap)
 		buf[--len] = '\0';
 	}
 	snprintf(out, cap, "%s", buf);
+	*out_source = out[0] != '\0' ? U_SETTING_SOURCE_USER : U_SETTING_SOURCE_DEFAULT;
 	return out[0] != '\0';
 }
 
@@ -2683,6 +2696,39 @@ target_plugin_clear_preferred(void)
 }
 
 #endif /* PreferredPlugin store */
+
+bool
+target_plugin_get_preferred(char *out, size_t cap)
+{
+	enum u_setting_source src;
+	return preferred_read(out, cap, &src);
+}
+
+bool
+target_plugin_get_global_preference(char *out, size_t cap, enum xrt_status_pref_source *out_source)
+{
+	enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+	bool have = false;
+	if (out != NULL && cap > 0) {
+		out[0] = '\0';
+		// The exclusive pin outranks the preference (discover_active_plugin), so it
+		// is what a process starting with this environment honours. Read directly:
+		// plugin_exclusive_id() latches and WARNs, as only discovery should.
+		const char *only = getenv("DXR_PLUGIN_EXCLUSIVE");
+		if (only != NULL && only[0] != '\0') {
+			snprintf(out, cap, "%s", only);
+			src = U_SETTING_SOURCE_ENV;
+			have = true;
+		} else {
+			have = preferred_read(out, cap, &src);
+		}
+	}
+	if (out_source != NULL) {
+		// enum xrt_status_pref_source values equal enum u_setting_source.
+		*out_source = have ? (enum xrt_status_pref_source)src : XRT_STATUS_PREF_SOURCE_NONE;
+	}
+	return have;
+}
 
 
 
