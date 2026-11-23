@@ -80,14 +80,16 @@ public sealed class SettingsPage : Page
 
         if (perf is not null && perf.AnyNonDefault)
         {
-            var lines = U.VStack(2);
-            foreach (var l in perf.Levers.Where(l => l.IsSet))
-                lines.Children.Add(U.Wrapped($"{l.Name} = {l.Value}   [{l.Source}]", "dev"));
+            // Plain names here; each variable, its value and where it comes from are in Troubleshooting > Advanced.
+            var lines = U.Wrapped(string.Join(StatusText.Sep, StatusText.ChangedSettings(perf)), "soft");
             var reset = U.Button("Reset all to defaults", () => _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf reset")), "warn", "sm");
             reset.IsEnabled = !Ctx.ActionRunning;
+            var values = U.Button("Show the values", () => Ctx.Navigate("troubleshooting/advanced"), "outline", "sm");
+            bool outside = perf.Levers.Any(l => l.IsSet && l.Source == "env");
             var notice = U.Notice(Level.Warn,
                 $"Some settings are changed from their defaults{(perf.UserWritten.Length > 0 ? " (since " + perf.UserWritten + ")" : "")}",
-                "Values marked [env] are set outside the Dashboard and cannot be reset from here.", reset);
+                (outside ? "One or more is set outside the Dashboard and cannot be reset from here. " : "")
+                + "Troubleshooting > Advanced lists each value and where it comes from.", reset, values);
             ((Grid)notice.Child!).Children.OfType<StackPanel>().First().Children.Insert(1, lines);
             page.Children.Add(notice);
         }

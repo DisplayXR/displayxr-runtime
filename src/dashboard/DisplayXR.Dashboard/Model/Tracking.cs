@@ -225,7 +225,8 @@ public static class Tracking
         string line = registered == 0 ? "none installed"
             : $"{registered} installed{StatusText.Sep}{enabled} turned on{StatusText.Sep}"
               + (serving > 0 ? $"in use on {StatusText.Plural(serving, "display", "displays")}" : "not in use");
-        if (policy is { DisabledByEnv: true }) line += $"{StatusText.Sep}turned off by a setting outside the Dashboard (DXR_TRACKING_PROVIDERS=0)";
+        // The variable's name is in Troubleshooting > Advanced, with every other runtime setting.
+        if (policy is { DisabledByEnv: true }) line += $"{StatusText.Sep}turned off by a setting outside the Dashboard (Troubleshooting > Advanced lists it)";
         return new ComponentSection(ComponentClass.Tracking.SectionId(), "Viewer tracking",
             "Camera head tracking: a camera that is not part of your display, such as a webcam, follows where you are. "
             + "It is used only on a display that does not track you itself and allows it.",

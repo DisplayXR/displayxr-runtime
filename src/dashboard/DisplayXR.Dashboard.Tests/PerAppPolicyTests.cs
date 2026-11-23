@@ -81,6 +81,7 @@ public class PerAppPolicyTests
         var l = Parse(root.ToJsonString());
         Assert.True(l.PolicyLock);
         Assert.NotNull(l.PerAppLockText);
+        Assert.DoesNotContain("HKLM", l.PerAppLockText); // the registry path is the notice's tooltip, not its text
         Assert.Null(l.Holders);
         Assert.Null(l.ClientsDropped);
         var rows = l.PerAppRows();

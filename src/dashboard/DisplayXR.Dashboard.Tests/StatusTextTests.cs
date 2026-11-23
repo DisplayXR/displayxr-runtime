@@ -131,6 +131,21 @@ public class StatusTextTests
     }
 
     [Fact]
+    public void SettingsNotice_NamesSettingsNotVariables()
+    {
+        var perf = new PerfState("", "", new[]
+        {
+            new PerfLever("DXR_FRAME_WITNESS", "5", "user"), new PerfLever("DXR_D3D_FORCE_GPU", "dgpu", "user"),
+            new PerfLever("DXR_VK_FORCE_GPU", "dgpu", "user"), new PerfLever("DXR_WEAVE_REPAINT", null, "default"),
+            new PerfLever("DXR_SOMETHING_NEW", "1", "env"),
+        });
+        Assert.Equal(new[] { "Graphics card for 3D apps", "Detailed logging", "Other settings" }, StatusText.ChangedSettings(perf));
+        Assert.Equal("Compatibility mode", StatusText.PlainSettingName("DXR_WEAVE_ON_SCANOUT"));
+        Assert.Null(StatusText.PlainSettingName("DXR_SOMETHING_NEW"));
+        Assert.All(StatusText.ChangedSettings(perf), n => Assert.DoesNotContain("DXR", n));
+    }
+
+    [Fact]
     public void ConnectionPill_IsPlain_TheSourceLineStaysTechnical()
     {
         Assert.Equal("DisplayXR is running", StatusText.PlainSourceLine(Design));

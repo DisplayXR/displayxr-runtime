@@ -385,7 +385,12 @@ public sealed class ComponentsPage : Page
         bool locked = list.PolicyLock;
         var col = U.VStack(8, U.Text("Per app", "group"),
             U.Wrapped("Which input add-on each app uses. Choosing one for an app makes it use that add-on for everything the add-on supplies; anything else, or an add-on that is not there, uses the automatic order.", "desc"));
-        if (list.PerAppLockText is { } lt) col.Children.Add(U.Notice(Level.Info, PolicyList.ManagedTitle, lt));
+        if (list.PerAppLockText is { } lt)
+        {
+            var managed = U.Notice(Level.Info, PolicyList.ManagedTitle, lt);
+            ToolTip.SetTip(managed, list.LockText);
+            col.Children.Add(managed);
+        }
         if (list.ClientsDropped is > 0 and var dropped)
             col.Children.Add(U.Notice(Level.Warn, "Some apps use the automatic order",
                 $"{dropped:0} app(s) went over the number DisplayXR keeps track of per app, so they use the automatic order and their choice does not apply."));
@@ -494,7 +499,8 @@ public sealed class ComponentsPage : Page
         // (a machine-wide write from an elevated dashboard still applies).
         bool enabledLocked = list.LockHidesUserEnabled && !machine;
         bool prefLocked = list.LockHidesUserPreference && !machine;
-        const string lockTip = "Managed by your administrator: a change made here for you would be ignored. (HKLM Policy\\Lock; an administrator changes the machine-wide value with --machine.)";
+        // The technical cause (the machine policy's registry value) is in the row's Details.
+        const string lockTip = "Managed by your administrator: a change made here for you would be ignored. An administrator can change it for everyone on this PC.";
 
         // (a) Enabled — never on the built-in adapter, which has no Enabled value (EnabledKnown).
         if (r.EnabledKnown)
@@ -565,7 +571,7 @@ public sealed class ComponentsPage : Page
         if (elevated)
         {
             var mw = new CheckBox { Content = "For everyone on this PC", IsChecked = _machine, IsEnabled = !busy, VerticalAlignment = VerticalAlignment.Center };
-            ToolTip.SetTip(mw, "Change the setting for everyone on this PC (the machine-wide HKLM value) instead of only for you. Offered because the Dashboard is running as administrator.");
+            ToolTip.SetTip(mw, "Change the setting for everyone on this PC instead of only for you. Offered because the Dashboard is running as administrator.");
             mw.IsCheckedChanged += (_, _) => { _machine = mw.IsChecked == true; Update(force: true); };
             row.Add(mw);
         }

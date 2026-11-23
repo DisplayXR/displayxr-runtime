@@ -558,6 +558,26 @@ public static class StatusText
     public const string DevResetAllNote =
         "Reset all clears every lever in the per-user settings file, including the Performance page's. Environment variables and the machine default are untouched.";
 
+    /// <summary>
+    /// The Settings page's name for a setting it writes (<c>perf</c> levers), so its "changed from the
+    /// defaults" notice names no variable; null for a lever Settings does not show.
+    /// </summary>
+    public static string? PlainSettingName(string lever) => lever switch
+    {
+        "DXR_D3D_FORCE_GPU" or "DXR_VK_FORCE_GPU" => "Graphics card for 3D apps",
+        "DXR_WEAVE_ON_SCANOUT" or "DXR_WEAVE_REPAINT" => "Compatibility mode",
+        "DXR_FRAME_WITNESS" or "DXR_FRAME_STAGE_TIMING" => "Detailed logging",
+        _ => null,
+    };
+
+    /// <summary>The changed settings in plain words, once each, in the order Settings shows them ("other settings" for the rest).</summary>
+    public static IReadOnlyList<string> ChangedSettings(PerfState perf)
+    {
+        var names = perf.Levers.Where(l => l.IsSet).Select(l => PlainSettingName(l.Name) ?? "Other settings").Distinct().ToList();
+        string[] order = { "Graphics card for 3D apps", "Compatibility mode", "Detailed logging", "Other settings" };
+        return names.OrderBy(n => Array.IndexOf(order, n)).ToList();
+    }
+
     /// <summary>The chip colour of a value's source.</summary>
     public static Level DevSourceLevel(string source) => source switch
     {
