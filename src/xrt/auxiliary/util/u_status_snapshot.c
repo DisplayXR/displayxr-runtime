@@ -864,6 +864,64 @@ u_status_license_add_cjson(cJSON *row, const struct xrt_component_license_state 
 	cJSON_AddBoolToObject(o, "blocks", xrt_component_license_blocks(lic->state));
 }
 
+void
+u_status_remedy_add_cjson(cJSON *row, const struct xrt_status_platform_remedy *r)
+{
+	static const struct xrt_status_platform_remedy none = {0};
+	if (r == NULL) {
+		r = &none;
+	}
+	cJSON_AddBoolToObject(row, "update_recommended", r->update_recommended);
+	cJSON_AddBoolToObject(row, "update_required", r->update_required);
+	cJSON_AddStringToObject(row, "installed_version", r->installed_version);
+	cJSON_AddStringToObject(row, "required_version", r->required_version);
+	cJSON_AddStringToObject(row, "action_label", r->action_label);
+	cJSON_AddStringToObject(row, "action_url", r->action_url);
+}
+
+//! Append @p s to @p out (truncating, always NUL-terminated).
+static void
+remedy_append(char *out, size_t cap, const char *s)
+{
+	const size_t used = strlen(out);
+	if (used + 1 < cap) {
+		(void)snprintf(out + used, cap - used, "%s", s);
+	}
+}
+
+bool
+u_status_remedy_format(const struct xrt_status_platform_remedy *r, char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	if (r == NULL || (!r->update_recommended && !r->update_required)) {
+		return false;
+	}
+	const bool have_from = r->installed_version[0] != '\0';
+	const bool have_to = r->required_version[0] != '\0';
+	const bool have_label = r->action_label[0] != '\0';
+	const bool have_url = r->action_url[0] != '\0';
+
+	remedy_append(out, cap, r->update_required ? "Update required" : "Update recommended");
+	if (have_from || have_to) {
+		remedy_append(out, cap, ": ");
+		remedy_append(out, cap, r->installed_version);
+		remedy_append(out, cap, have_from && have_to ? " -> " : "");
+		remedy_append(out, cap, r->required_version);
+	}
+	if (have_label || have_url) {
+		remedy_append(out, cap, ". ");
+		remedy_append(out, cap, r->action_label);
+		remedy_append(out, cap, have_label && have_url ? ": " : "");
+		remedy_append(out, cap, r->action_url);
+	} else {
+		remedy_append(out, cap, ".");
+	}
+	return true;
+}
+
 static void
 add_str_or_null(cJSON *o, const char *key, const char *s)
 {
@@ -1352,6 +1410,7 @@ u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 		cJSON_AddBoolToObject(o, "fallback", p->fallback);
 		cJSON_AddNumberToObject(o, "probe_order", (double)p->probe_order);
 		add_licence(o, &p->licence);
+		u_status_remedy_add_cjson(o, &p->remedy);
 		cJSON_AddItemToArray(pl, o);
 	}
 
@@ -1689,6 +1748,13 @@ u_status_snapshot_format_text(const struct xrt_status_snapshot *snap, char *buf,
 		tb_printf(&t, "%s%s %s", i > 0 ? ", " : "", p->id, state);
 	}
 	tb_printf(&t, "\n");
+	// ADR-045 Amendment 2026-11-22: one line per plug-in with an update notice.
+	for (uint32_t i = 0; i < snap->plugin_count && i < XRT_STATUS_MAX_PLUGINS; i++) {
+		char line[512];
+		if (u_status_remedy_format(&snap->plugins[i].remedy, line, sizeof(line))) {
+			tb_printf(&t, "PLUG-IN  %s: %s\n", snap->plugins[i].id, line);
+		}
+	}
 
 	// Screens.
 	uint32_t claimed = 0, verified = 0, tracking = 0;

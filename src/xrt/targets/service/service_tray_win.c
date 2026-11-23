@@ -23,6 +23,7 @@
 #include "server/ipc_server_interface.h" // ADR-045: ipc_server_request_display_reprobe
 #include "server/ipc_server_stereo_camera.h" // ADR-043 R3: camera indicator, prompt, kill switch, lock
 #include "target_plugin_loader.h"        // ADR-045: per-plug-in platform state for the tooltip
+#include "util/u_status_snapshot.h"      // ADR-045 Amendment 2026-11-22: the platform-remedy line
 
 #include <wtsapi32.h> // WTSRegisterSessionNotification (lock-screen suspension)
 
@@ -40,6 +41,8 @@
 // ADR-043 R3: stereo camera indicator / kill switch / sharing toggle
 #define IDM_CAMERA_STOP     1060
 #define IDM_CAMERA_SHARING  1061
+// ADR-045 Amendment 2026-11-22: open the active plug-in's platform-update page
+#define IDM_PLATFORM_REMEDY 1070
 #define WM_CAMERA_PROMPT (WM_APP + 2)       //!< lParam = struct cam_prompt_req * (heap; the tray owns it)
 #define WM_CAMERA_PROMPT_CLOSE (WM_APP + 3) //!< wParam = request generation (close its dialog)
 #define WM_CAMERA_INDICATOR     (WM_APP + 4) //!< refresh icon + tooltip now
@@ -287,6 +290,77 @@ launch_dashboard(void)
 	ShellExecuteW(NULL, L"open", path, NULL, NULL, SW_SHOWNORMAL);
 }
 
+/*!
+ * The https URL the platform-remedy menu item opens, captured when the menu
+ * was built so a click opens exactly the page the menu showed. Tray thread
+ * only (menu build and WM_COMMAND both run there).
+ */
+static wchar_t s_remedy_url[XRT_PLUGIN_PLATFORM_ACTION_URL_MAX];
+
+/*!
+ * ADR-045 Amendment 2026-11-22: when the ACTIVE plug-in reports a platform
+ * remedy, add its notice (greyed, the plug-in's words verbatim) and — when it
+ * gave an https URL — a clickable item labelled with its action label.
+ * Advisory: nothing else changes. Returns true when it added anything.
+ */
+static bool
+append_platform_remedy(HMENU menu)
+{
+	s_remedy_url[0] = L'\0';
+	struct target_plugin_status st[16];
+	const int n = target_plugin_get_status(st, 16);
+	for (int i = 0; i < n; i++) {
+		const struct target_plugin_status *p = &st[i];
+		char line[512];
+		if (p->result != TARGET_PLUGIN_RESULT_ACTIVE ||
+		    !u_status_remedy_format(&p->remedy, line, sizeof(line))) {
+			continue;
+		}
+		// The menu line without the URL (it is the click target below).
+		struct xrt_status_platform_remedy shown = p->remedy;
+		shown.action_url[0] = '\0';
+		shown.action_label[0] = '\0';
+		(void)u_status_remedy_format(&shown, line, sizeof(line));
+		const char *name = p->display_name[0] != '\0' ? p->display_name : p->id;
+		char text[640];
+		snprintf(text, sizeof(text), "%s: %s", name, line);
+		wchar_t wtext[640];
+		if (MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, ARRAYSIZE(wtext)) == 0) {
+			wcscpy_s(wtext, ARRAYSIZE(wtext),
+			         p->remedy.update_required ? L"Platform update required"
+			                                   : L"Platform update recommended");
+		}
+		AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wtext);
+		if (p->remedy.action_url[0] != '\0' && target_plugin_remedy_url_ok(p->remedy.action_url) &&
+		    MultiByteToWideChar(CP_UTF8, 0, p->remedy.action_url, -1, s_remedy_url, ARRAYSIZE(s_remedy_url)) !=
+		        0) {
+			wchar_t wlabel[XRT_PLUGIN_PLATFORM_ACTION_LABEL_MAX + 4];
+			if (p->remedy.action_label[0] == '\0' ||
+			    MultiByteToWideChar(CP_UTF8, 0, p->remedy.action_label, -1, wlabel, ARRAYSIZE(wlabel)) ==
+			        0) {
+				wcscpy_s(wlabel, ARRAYSIZE(wlabel), L"Get the update");
+			}
+			wcscat_s(wlabel, ARRAYSIZE(wlabel), L"...");
+			AppendMenuW(menu, MF_STRING, IDM_PLATFORM_REMEDY, wlabel);
+		} else {
+			s_remedy_url[0] = L'\0';
+		}
+		AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+		return true;
+	}
+	return false;
+}
+
+//! Open the page @ref append_platform_remedy captured (https only, checked when captured).
+static void
+open_platform_remedy(void)
+{
+	if (s_remedy_url[0] == L'\0') {
+		return;
+	}
+	ShellExecuteW(NULL, L"open", s_remedy_url, NULL, NULL, SW_SHOWNORMAL);
+}
+
 //! Build and show the tray context menu at the cursor position.
 static void
 show_context_menu(HWND hwnd)
@@ -312,6 +386,9 @@ show_context_menu(HWND hwnd)
 		AppendMenuW(menu, MF_STRING, IDM_DASHBOARD, L"DisplayXR Dashboard");
 		AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
 	}
+
+	// ADR-045 Amendment 2026-11-22: the active plug-in's platform update notice.
+	(void)append_platform_remedy(menu);
 
 	// Workspace submenu — only built when a controller binary is detected.
 	// Bare runtime (no controller installed) gets no workspace entry at all,
@@ -971,7 +1048,11 @@ build_status_line(char *out, size_t cap)
 		         active->hint);
 		return;
 	}
-	snprintf(out, cap, "Display: %s", name);
+	// ADR-045 Amendment 2026-11-22: short, the details are in the menu.
+	snprintf(out, cap, "Display: %s%s", name,
+	         active->remedy.update_required      ? " (update required)"
+	         : active->remedy.update_recommended ? " (update recommended)"
+	                                             : "");
 }
 
 static void
@@ -1200,6 +1281,7 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 		// Open the DisplayXR Dashboard
 		case IDM_DASHBOARD: launch_dashboard(); break;
+		case IDM_PLATFORM_REMEDY: open_platform_remedy(); break;
 
 		// Start on login toggle
 		case IDM_START_ON_LOGIN:

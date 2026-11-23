@@ -56,7 +56,37 @@ public sealed record ConvPack(string Pack, string Provider, string State, int Mo
 public sealed record RuntimeInfo(string Version, string GitTag, int PluginAbi, string? ActiveOpenXrRuntime);
 
 public sealed record PluginInfo(string Id, string Name, string Vendor, string Version, string Load,
-                                string PlatformState, string Hint, bool Fallback, int ProbeOrder);
+                                string PlatformState, string Hint, bool Fallback, int ProbeOrder)
+{
+    /// <summary>The plug-in's platform update notice (ADR-045 Amendment 2026-11-22); <see cref="PlatformRemedy.None"/> when it reports none.</summary>
+    public PlatformRemedy Remedy { get; init; } = PlatformRemedy.None;
+}
+
+/// <summary>
+/// A display plug-in's platform remedy (ADR-045 Amendment 2026-11-22): the vendor platform has an
+/// update, recommended or required. Advisory: the runtime changes nothing because of it, the
+/// Dashboard only shows it. The strings are the plug-in's own, verbatim; "" = absent. The CLI
+/// already dropped an <c>action_url</c> that is not https; <see cref="Url"/> checks again.
+/// </summary>
+public sealed record PlatformRemedy(bool UpdateRecommended, bool UpdateRequired, string InstalledVersion,
+                                    string RequiredVersion, string ActionLabel, string ActionUrl)
+{
+    public static readonly PlatformRemedy None = new(false, false, "", "", "", "");
+
+    /// <summary>A notice to show (either bit; REQUIRED wins when both are set).</summary>
+    public bool Any => UpdateRecommended || UpdateRequired;
+
+    /// <summary>The page to open, or null when there is none or it is not plain https.</summary>
+    public string? Url => SafeUrl.TryHttps(ActionUrl, out var u) ? u!.AbsoluteUri : null;
+
+    /// <summary>Flat keys on a plug-in row (<c>status --json</c>, <c>info --json</c>); absent keys read as no remedy.</summary>
+    internal static PlatformRemedy Read(JsonElement p)
+    {
+        var r = new PlatformRemedy(p.Bool("update_recommended"), p.Bool("update_required"), p.Str("installed_version"),
+                                   p.Str("required_version"), p.Str("action_label"), p.Str("action_url"));
+        return r.Any ? r : None;
+    }
+}
 
 public readonly record struct PixelRect(long Left, long Top, long Width, long Height)
 {
@@ -234,7 +264,8 @@ public static class StatusSnapshotParser
 
     private static PluginInfo ReadPlugin(JsonElement p) => new(
         p.Str("id"), p.Str("name"), p.Str("vendor"), p.Str("version"), p.Str("load"),
-        p.Str("platform_state", "UNKNOWN"), p.Str("hint"), p.Bool("fallback"), p.Int("probe_order"));
+        p.Str("platform_state", "UNKNOWN"), p.Str("hint"), p.Bool("fallback"), p.Int("probe_order"))
+    { Remedy = PlatformRemedy.Read(p) };
 
     private static PixelRect ReadRect(JsonElement? e) =>
         new(e.Long("left"), e.Long("top"), e.Long("width"), e.Long("height"));

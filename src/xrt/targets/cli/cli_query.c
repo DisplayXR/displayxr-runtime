@@ -2069,7 +2069,53 @@ print_plugin_states_text(const struct cli_query_result *r)
 		char line[640];
 		format_plugin_state_line(&r->plugin_states[i], line, sizeof(line));
 		printf("\t%s\n", line);
+		// ADR-045 Amendment 2026-11-22: the plug-in's update notice, verbatim.
+		if (u_status_remedy_format(&r->plugin_states[i].remedy, line, sizeof(line))) {
+			printf("\t    %s\n", line);
+		}
 	}
+}
+
+/*!
+ * ADR-045 Amendment 2026-11-22: selftest's platform-remedy warnings. ADVISORY —
+ * never a check row, never the exit code, for RECOMMENDED and REQUIRED alike
+ * (a plug-in that truly cannot run reports a non-READY state and declines,
+ * which the existing rows already judge). Calls @p emit once per plug-in with
+ * a remedy: code PLATFORM_UPDATE_REQUIRED or PLATFORM_UPDATE_RECOMMENDED.
+ */
+static void
+for_each_plugin_remedy(const struct cli_query_result *r,
+                       void (*emit)(void *ctx, const char *code, const char *text),
+                       void *ctx)
+{
+	for (int i = 0; i < r->plugin_state_count; i++) {
+		const struct target_plugin_status *p = &r->plugin_states[i];
+		char line[512];
+		if (!u_status_remedy_format(&p->remedy, line, sizeof(line))) {
+			continue;
+		}
+		char text[640];
+		snprintf(text, sizeof(text), "plug-in '%s': %s", p->display_name[0] != '\0' ? p->display_name : p->id,
+		         line);
+		emit(ctx, p->remedy.update_required ? "PLATFORM_UPDATE_REQUIRED" : "PLATFORM_UPDATE_RECOMMENDED", text);
+	}
+}
+
+static void
+emit_remedy_text(void *ctx, const char *code, const char *text)
+{
+	(void)ctx;
+	printf("WARN: %s — %s\n", code, text);
+}
+
+static void
+emit_remedy_json(void *ctx, const char *code, const char *text)
+{
+	cJSON *w = cJSON_CreateObject();
+	cJSON_AddStringToObject(w, "code", code);
+	cJSON_AddStringToObject(w, "level", "warn");
+	cJSON_AddStringToObject(w, "text", text);
+	cJSON_AddItemToArray((cJSON *)ctx, w);
 }
 
 static void
@@ -2095,6 +2141,8 @@ add_plugin_states_json(cJSON *root, const struct cli_query_result *r)
 		cJSON_AddStringToObject(o, "provenance_reason", p->provenance_reason);
 		// ADR-054 N5: the plug-in's licence state at the last load attempt.
 		u_status_license_add_cjson(o, &p->license);
+		// ADR-045 Amendment 2026-11-22: platform remedy (update notice), flat keys.
+		u_status_remedy_add_cjson(o, &p->remedy);
 		cJSON_AddItemToArray(arr, o);
 	}
 }
@@ -3880,6 +3928,9 @@ cli_query_print_selftest_text(const struct cli_query_result *r)
 		P("WARN: ULTRALEAP_OPENXR_LAYER — %s\n", r->input_ultraleap_layer_note);
 	}
 
+	// ADR-045 Amendment 2026-11-22: a platform update notice warns, never fails.
+	for_each_plugin_remedy(r, emit_remedy_text, NULL);
+
 	// ADR-045: informational — never changes the verdict or the exit code.
 	print_plugin_states_text(r);
 
@@ -3926,6 +3977,7 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 		cJSON_AddStringToObject(w, "text", r->input_ultraleap_layer_note);
 		cJSON_AddItemToArray(warnings, w);
 	}
+	for_each_plugin_remedy(r, emit_remedy_json, warnings);
 
 	cJSON_AddStringToObject(root, "dpi_awareness", r->dpi_awareness);
 	add_plugin_states_json(root, r);

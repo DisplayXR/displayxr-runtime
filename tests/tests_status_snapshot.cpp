@@ -779,7 +779,11 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 
 	const cJSON *p0 = cJSON_GetArrayItem(cJSON_GetObjectItem(d.root, "plugins"), 0);
 	CHECK(keys(p0) == V{"id", "name", "vendor", "version", "load", "platform_state", "hint", "fallback",
-	                    "probe_order", "licence"});
+	                    "probe_order", "licence",
+	                    // ADR-045 Amendment 2026-11-22: platform remedy, flat, always present.
+	                    "update_recommended", "update_required", "installed_version", "required_version",
+	                    "action_label", "action_url"});
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(p0, "update_recommended")));
 	// ADR-054 N5: the compact licence object; a plug-in with nothing to report says so.
 	CHECK(keys(cJSON_GetObjectItem(p0, "licence")) == V{"state", "source", "expires_unix"});
 	CHECK(str(cJSON_GetObjectItem(p0, "licence"), "state") == "not_applicable");
@@ -888,6 +892,34 @@ TEST_CASE("status: a tracked client window reports its visibility (ADR-062)", "[
 	u_status_snapshot_format_text(s.get(), text.data(), text.size());
 	CHECK(std::string(text.data()).find("visibility: hidden (covered, covered by notepad.exe) - lens 2D") !=
 	      std::string::npos);
+}
+
+TEST_CASE("status: a plug-in's platform remedy reaches the JSON and the text (ADR-045 Am. 2026-11-22)",
+          "[status][json]")
+{
+	auto s = healthy();
+	xrt_status_platform_remedy &r = s->plugins[0].remedy;
+	r.update_recommended = true;
+	SET(r.installed_version, "1.2.0");
+	SET(r.required_version, "1.4.0");
+	SET(r.action_label, "Download the update");
+	SET(r.action_url, "https://example.com/update");
+	u_status_warnings_derive(s.get());
+	CHECK(sys_codes(*s).empty()); // advisory: no snapshot warning, nothing re-routes
+
+	json_doc_light d(*s);
+	const cJSON *p0 = cJSON_GetArrayItem(cJSON_GetObjectItem(d.root, "plugins"), 0);
+	CHECK(cJSON_IsTrue(cJSON_GetObjectItem(p0, "update_recommended")));
+	CHECK(cJSON_IsFalse(cJSON_GetObjectItem(p0, "update_required")));
+	CHECK(str(p0, "installed_version") == "1.2.0");
+	CHECK(str(p0, "action_url") == "https://example.com/update");
+
+	std::vector<char> text(64 * 1024);
+	u_status_snapshot_format_text(s.get(), text.data(), text.size());
+	CHECK(std::string(text.data())
+	          .find(std::string("PLUG-IN  ") + s->plugins[0].id +
+	                ": Update recommended: 1.2.0 -> 1.4.0. Download the update: "
+	                "https://example.com/update\n") != std::string::npos);
 }
 
 TEST_CASE("status: the workspace block lists the screens it presents on (ADR-052)", "[status][json]")

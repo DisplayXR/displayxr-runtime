@@ -399,6 +399,7 @@ public static class Components
             var lines = new List<string> { registration, claimLine };
             var lineFacts = new List<(string, string)> { ("Registration", $"{p.Id}{Sep}ProbeOrder {p.ProbeOrder}"), ("Displays", claimLine) };
             if (p.Hint.Length > 0) { lines.Add(p.Hint); lineFacts.Add(("Note", p.Hint)); }
+            if (StatusText.RemedyLine(p.Remedy) is { } upd) { lines.Add(upd); lineFacts.Add(("Update", upd)); } // ADR-045 Am. 2026-11-22
             items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, StatusText.PluginLevel(p), chips.Chips, lines, Policy: pol, Id: p.Id,
                                         Facts: chips.Facts, State: PlainStates.DisplayProcessor(p.Load, pol),
                                         Summary: PublisherLine(p.Vendor, p.Version, DrivesLine(claimed)), LineFacts: lineFacts));

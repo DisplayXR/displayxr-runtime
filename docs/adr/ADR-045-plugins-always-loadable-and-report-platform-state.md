@@ -122,3 +122,70 @@ so a plug-in whose probe flaps cannot cause a restart loop.
 - The service can now restart itself, once, to complete an adoption. That is a new lifecycle event.
   It is logged ("plug-in adoption: no client connected — restarting the service …") and happens
   only after the fallback was active and a vendor plug-in was adopted.
+
+## Amendment 1 (2026-11-22): the platform remedy — "update recommended" / "update required"
+
+**What changed.** A plug-in can now say that its vendor platform has an update, and where to get
+it, through the same `get_platform_state` call. Two flags join `FALLBACK` in
+`xrt_plugin_platform_status::flags`, and four strings are appended to the struct:
+
+| Addition | Meaning |
+|---|---|
+| `XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED` (`1u << 1`) | The platform works; an update is available and recommended. |
+| `XRT_PLUGIN_PLATFORM_FLAG_UPDATE_REQUIRED` (`1u << 2`) | The platform needs an update. Wins when both bits are set. |
+| `char installed_version[32]` | The platform version installed now. |
+| `char required_version[32]` | The version the update brings, or the minimum the plug-in needs. |
+| `char action_label[64]` | A short label for the action, e.g. "Download the update". |
+| `char action_url[256]` | Where to get it. Absolute `https://` only. |
+
+The strings are UTF-8, NUL-terminated and empty when absent. The vendor writes them, and the runtime
+shows them verbatim, the same way it treats the hint. `XRT_PLUGIN_HAS_PLATFORM_REMEDY` marks a
+header that has all of this.
+
+**The rule: advisory only.** The runtime never gates loading, selection, adoption or re-probe on
+either bit. `UPDATE_RECOMMENDED` changes nothing but the notice. `UPDATE_REQUIRED` is
+informational too. If a platform is too old to run at all, the plug-in must also report a non-READY
+state (normally `INCOMPATIBLE`) and decline its probe. The state is what the runtime acts on (D2);
+the bit is what it tells the user. This keeps the vendor's judgment about versions inside the
+vendor's binary, which is the whole idea of D2.
+
+**Growth without an ABI bump.** The 64 bytes of `reserved[8]` cannot hold a URL, so the strings are
+appended *after* `reserved`, and `reserved` and `reserved_0` stay as they are. The struct's
+contract always allowed this: the runtime sets `struct_size` to its own size and zero-fills, and the
+plug-in writes nothing past `struct_size`. A plug-in writes each new field only when
+`XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, field)` is true. As a result:
+
+- A newer runtime with an older plug-in gets zero-filled fields, which reads as no remedy.
+- An older runtime with a newer plug-in passes the old `struct_size`, so the plug-in writes nothing
+  new.
+
+`XRT_PLUGIN_API_VERSION_CURRENT` does not change. `tests_plugin_platform_remedy` pins the offsets.
+
+**What the loader does.** It forces every string to be NUL-terminated. It keeps only the two remedy
+bits and drops the strings when neither bit is set. It drops an `action_url` that is not a plain
+absolute `https://` URL (no spaces, quotes, backslashes, angle brackets or control characters) and
+logs that at DEBUG; the notice still shows, without the link. The sanitised remedy goes in the
+per-plug-in record and in the status snapshot's plug-in row
+(`xrt_status_plugin::remedy`, a same-build service↔CLI struct). It is part of the topology change
+key, so `status --watch`, the tray and the Dashboard refresh when it appears or changes. A changed
+remedy logs one WARN on the load path, not one per re-probe.
+
+**Where the user sees it.** Every surface uses vendor-neutral wording around the plug-in's strings:
+
+- `displayxr-cli info` / `selftest` print an indented line under the plug-in, and `status` prints a
+  `PLUG-IN <id>:` line under its header. The line is
+  `Update recommended: <installed> -> <required>. <label>: <url>`, with empty parts left out. On
+  each plug-in object in `--json`, the keys `update_recommended`, `update_required`,
+  `installed_version`, `required_version`, `action_label` and `action_url` are always present.
+- **`selftest` warns and never fails** on either bit. It prints `WARN: PLATFORM_UPDATE_RECOMMENDED`
+  or `WARN: PLATFORM_UPDATE_REQUIRED` with the line, and the same code appears in `warnings[]`
+  (level `warn`). The exit code is decided exactly as before. A plug-in that cannot run fails the
+  existing checks through its state and its decline, not through this bit.
+- The service tray adds the active plug-in's notice to its menu (greyed text) and, when there is an
+  https URL, an item named after `action_label` that opens the page. The tooltip adds
+  "(update recommended)" or "(update required)".
+- On the Home page, the Dashboard shows an "Update available" or "Update required" chip, the
+  versions, and a button that opens the page. The URL is checked again with the Dashboard's
+  https-only rule. The Components row lists the same line.
+
+`sim_display` reports no remedy.

@@ -110,6 +110,7 @@ fill_plugins(struct xrt_status_snapshot *out)
 			p->licence.state = st[j].license.state;
 			p->licence.source = st[j].license.source;
 			p->licence.expiry_unix_s = st[j].license.expiry_unix_s;
+			p->remedy = st[j].remedy;
 			break;
 		}
 		p->active = strcmp(p->id, active_id) == 0;
@@ -136,6 +137,7 @@ fill_plugins(struct xrt_status_snapshot *out)
 		p->licence.state = st[j].license.state;
 		p->licence.source = st[j].license.source;
 		p->licence.expiry_unix_s = st[j].license.expiry_unix_s;
+		p->remedy = st[j].remedy;
 		p->active = strcmp(p->id, active_id) == 0;
 	}
 	// Insertion sort by ProbeOrder (n <= 32).
@@ -862,7 +864,8 @@ uint64_t
 target_status_snapshot_change_key(const struct xrt_dp_factory_registry *reg)
 {
 	// FNV-1a over what the "topology" counter covers beyond the screen list:
-	// each plug-in's load result + live platform state + hint, and (with the
+	// each plug-in's load result + live platform state + hint + platform
+	// remedy (ADR-045 Amendment 2026-11-22), and (with the
 	// ADR-051 D2 slot) every claiming plug-in's per-screen change counter.
 	uint64_t h = 1469598103934665603ull;
 #define MIX(ptr, len)                                                                                                  \
@@ -880,6 +883,13 @@ target_status_snapshot_change_key(const struct xrt_dp_factory_registry *reg)
 		MIX(&st[i].result, sizeof(st[i].result));
 		MIX(&st[i].platform_state, sizeof(st[i].platform_state));
 		MIX(st[i].hint, strlen(st[i].hint));
+		const struct xrt_status_platform_remedy *rm = &st[i].remedy;
+		MIX(&rm->update_recommended, sizeof(rm->update_recommended));
+		MIX(&rm->update_required, sizeof(rm->update_required));
+		MIX(rm->installed_version, strlen(rm->installed_version) + 1);
+		MIX(rm->required_version, strlen(rm->required_version) + 1);
+		MIX(rm->action_label, strlen(rm->action_label) + 1);
+		MIX(rm->action_url, strlen(rm->action_url) + 1);
 	}
 #ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS
 	for (uint32_t i = 0; reg != NULL && i < reg->entry_count && i < XRT_DP_REGISTRY_MAX_ENTRIES; i++) {

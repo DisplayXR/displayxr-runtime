@@ -485,6 +485,32 @@ public static class StatusText
 
     // ── Plug-ins ────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// A platform remedy's chip (ADR-045 Amendment 2026-11-22): "Update required" / "Update
+    /// available"; null when there is none. Advisory, so it never changes the plug-in's own level.
+    /// </summary>
+    public static (string Text, Level Level)? RemedyChip(PlatformRemedy r) =>
+        !r.Any ? null : r.UpdateRequired ? ("Update required", Level.Warn) : ("Update available", Level.Info);
+
+    /// <summary>
+    /// The remedy in plain words, the plug-in's version strings verbatim, empty parts left out:
+    /// "Version 1.2.0 is installed; 1.4.0 is required." Null when there is no remedy.
+    /// </summary>
+    public static string? RemedyLine(PlatformRemedy r)
+    {
+        if (!r.Any) return null;
+        var verb = r.UpdateRequired ? "is required" : "is available";
+        var from = r.InstalledVersion.Length > 0 ? $"Version {r.InstalledVersion} is installed" : null;
+        var to = r.RequiredVersion.Length > 0 ? $"{r.RequiredVersion} {verb}" : null;
+        return (from, to) switch
+        {
+            ({ } f, { } t) => $"{f}; {t}.",
+            ({ } f, null) => $"{f}; an update {verb}.",
+            (null, { } t) => $"Version {t}.",
+            _ => $"An update for the display maker's software {verb}.",
+        };
+    }
+
     public static Level PluginLevel(PluginInfo p) => p.PlatformState switch
     {
         "READY" => p.Load == "ACTIVE" ? Level.Ok : Level.Plain,

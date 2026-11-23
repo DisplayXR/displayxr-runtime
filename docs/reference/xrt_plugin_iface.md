@@ -621,6 +621,47 @@ A licence **key** can also be an ordinary setting of type `secret` (`XRT_COMPONE
 
 **Both slots are optional.** NULL (or a plug-in built before them) has no licence to report: its state reads `not_applicable` and nothing changes. Appended per ADR-020 after `get_viewer_policy` (gated by `struct_size`, no API bump): `#ifdef XRT_PLUGIN_IFACE_HAS_GET_LICENSE_STATE` / `XRT_PLUGIN_IFACE_HAS_ACTIVATE`; the runtime reads through `xrt_plugin_iface_license_state()`. A reference implementation of both slots is `drivers/sim_common/sim_license.h`, used by the sim conversion and tracking providers.
 
+### `get_platform_state` and the platform remedy (ADR-045, Amendment 1)
+
+```c
+bool (*get_platform_state)(struct xrt_plugin_platform_status *out_status);
+```
+
+Report whether your vendor platform is installed, running and has its display attached
+(`state` + a short `hint`), from memory, in about 100 ms, before `probe()` and without an instance.
+See [ADR-045](../adr/ADR-045-plugins-always-loadable-and-report-platform-state.md) D2.
+
+**Platform remedy (`XRT_PLUGIN_HAS_PLATFORM_REMEDY`).** When your platform has an update, set
+`XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED` or `_UPDATE_REQUIRED` in `flags` and fill the strings
+that come after `reserved`. Write each one only when the runtime's `struct_size` covers it:
+
+```c
+#ifdef XRT_PLUGIN_HAS_PLATFORM_REMEDY
+out_status->flags |= XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED;
+if (XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, installed_version))
+	snprintf(out_status->installed_version, sizeof(out_status->installed_version), "%s", installed);
+if (XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, required_version))
+	snprintf(out_status->required_version, sizeof(out_status->required_version), "%s", latest);
+if (XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, action_label))
+	snprintf(out_status->action_label, sizeof(out_status->action_label), "%s", "Download the update");
+if (XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, action_url))
+	snprintf(out_status->action_url, sizeof(out_status->action_url), "%s", "https://example.com/update");
+#endif
+```
+
+| Field | Size | What to write |
+|---|---|---|
+| `installed_version` | `XRT_PLUGIN_PLATFORM_VERSION_MAX` (32) | the platform version installed now |
+| `required_version` | `XRT_PLUGIN_PLATFORM_VERSION_MAX` (32) | the version the update brings, or the minimum you need |
+| `action_label` | `XRT_PLUGIN_PLATFORM_ACTION_LABEL_MAX` (64) | a short label, e.g. "Download the update" |
+| `action_url` | `XRT_PLUGIN_PLATFORM_ACTION_URL_MAX` (256) | an absolute `https://` URL; anything else is dropped |
+
+The remedy is **advisory**. The runtime shows it in `displayxr-cli` (`info`, `selftest`, `status`,
+and `--json`), in the service tray and in the Dashboard. It never changes loading, selection or the
+self-test verdict, for `UPDATE_REQUIRED` too. If your platform is too old to run at all, also report
+`XRT_PLUGIN_PLATFORM_STATE_INCOMPATIBLE` and decline `probe()`. Keep your own wording in these
+strings: the runtime adds only neutral text ("Update recommended", "Update required").
+
 ## Forward-compatibility rules
 
 The iface is designed to evolve without breaking older plug-ins:
