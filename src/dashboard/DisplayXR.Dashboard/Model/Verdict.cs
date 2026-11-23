@@ -78,13 +78,18 @@ public static class Verdicts
         : (false, null);
 
     /// <summary>
-    /// The simulated display driver's id when it is the only display driver in use (it claims a display or
-    /// is the active one, and no other driver claims a display or is active); null otherwise.
+    /// The simulated display driver's id when it is the only display driver on this PC: no other display
+    /// driver is registered at all (a registered one that failed, declined or is not ready means a 3D
+    /// display may be there and broken), no display or system warning says a display fell back
+    /// (CLAIM_FALLBACK / PLUGIN_NOT_READY), and no display is a real 3D display. Null otherwise: then
+    /// the usual verdict applies, never "Nothing is wrong".
     /// </summary>
     public static string? OnlySimulated(StatusSnapshot s)
     {
+        if (s.Plugins.Any(p => !StatusText.IsSimulatedDriver(s, p.Id))) return null;
+        if (s.Warnings.Any(w => StatusText.IsFallbackWarning(w.Code))) return null;
+        if (s.Screens.Any(x => x.Warnings.Any(w => StatusText.IsFallbackWarning(w.Code)))) return null;
         if (s.Screens.Any(x => StatusText.IsReal3D(s, x))) return null;
-        if (s.Plugins.Any(p => p.Load == "ACTIVE" && !StatusText.IsSimulatedDriver(s, p.Id))) return null;
         return s.Screens.Where(x => x.Claim.IsClaimed).Select(x => x.Claim.PluginId).FirstOrDefault()
                ?? s.Plugins.FirstOrDefault(p => p.Load == "ACTIVE")?.Id;
     }

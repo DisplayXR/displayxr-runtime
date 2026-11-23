@@ -60,14 +60,40 @@ public static class StatusText
         pluginId is { Length: > 0 } id
         && (snap?.Plugins.FirstOrDefault(p => p.Id == id) is { } p ? p.Fallback : id == FriendlyOptions.SimDisplay);
 
+    /// <summary>The runtime's warnings that say a display got only the fallback driver because a vendor driver is unhealthy.</summary>
+    public static bool IsFallbackWarning(string code) => code is "CLAIM_FALLBACK" or "PLUGIN_NOT_READY";
+
+    /// <summary>
+    /// A registered display driver that is not the simulated one failed to load or reports a platform state
+    /// other than ready: the runtime's own proxy (u_status_snapshot.c <c>vendor_plugin_unhealthy</c>) for "a
+    /// 3D display got only the fallback driver".
+    /// </summary>
+    public static bool VendorDriverUnhealthy(StatusSnapshot? snap) =>
+        snap is not null && snap.Plugins.Any(p => !p.Fallback
+            && (LoadIsFailure(p.Load) || p.PlatformState is not ("" or "UNKNOWN" or "READY")));
+
+    // u_status_snapshot.c load_is_failure: every verdict but these is a failure.
+    private static bool LoadIsFailure(string load) =>
+        load is not ("" or "UNKNOWN" or "ACTIVE" or "LOADED" or "DECLINED" or "NOT_ATTEMPTED" or "NOT_LOADED" or "DISABLED");
+
+    /// <summary>
+    /// A display the simulated driver claims only because a vendor driver is unhealthy: the display (or the
+    /// snapshot) carries CLAIM_FALLBACK / PLUGIN_NOT_READY, or a vendor driver failed / is not ready.
+    /// </summary>
+    public static bool FellBack(StatusSnapshot? snap, Screen s) =>
+        s.Warnings.Any(w => IsFallbackWarning(w.Code))
+        || (snap is not null && snap.Warnings.Any(w => IsFallbackWarning(w.Code)))
+        || VendorDriverUnhealthy(snap);
+
     /// <summary>
     /// A display recognised as a 3D display: claimed by a display driver that is not the simulated one.
     /// The simulated driver claims every display (at the lowest confidence) so that apps run anywhere;
-    /// that is not a 3D display. A display the simulated driver was CHOSEN for (a per-display override,
-    /// <c>claim.forced</c>) still counts: someone picked it for a display DisplayXR found.
+    /// that is not a 3D display. Two exceptions count as a 3D display: the simulated driver was CHOSEN
+    /// for it (a per-display override, <c>claim.forced</c>), and it holds the display only because a
+    /// vendor driver is unhealthy (<see cref="FellBack"/>: a 3D display that needs attention, as before).
     /// </summary>
     public static bool IsReal3D(StatusSnapshot? snap, Screen s) =>
-        s.Claim.IsClaimed && (s.Claim.Forced == true || !IsSimulatedDriver(snap, s.Claim.PluginId));
+        s.Claim.IsClaimed && (s.Claim.Forced == true || !IsSimulatedDriver(snap, s.Claim.PluginId) || FellBack(snap, s));
 
     /// <summary>Claimed only by the simulated display driver: an ordinary display that driver gives a 3D preview.</summary>
     public static bool IsSimulatedPreview(StatusSnapshot? snap, Screen s) => s.Claim.IsClaimed && !IsReal3D(snap, s);

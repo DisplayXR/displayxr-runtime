@@ -37,8 +37,11 @@ behind a Details toggle.
   display is recognised* (background service not reached); *No 3D display found*; *No display
   found*. A display claimed only by the simulated display driver (the snapshot's `plugins[].fallback`
   driver, which claims every display at `FALLBACK` so apps run anywhere) is an ordinary display, not
-  a recognised 3D display, unless that driver was chosen for it (`claim.forced`). When the simulated
-  driver is the only display driver in use, *No 3D display found* reads "DisplayXR apps show in normal
+  a recognised 3D display, unless that driver was chosen for it (`claim.forced`) or holds it only
+  because a vendor driver is unhealthy (a CLAIM_FALLBACK / PLUGIN_NOT_READY warning, or a registered
+  non-fallback driver that failed to load or whose platform is not ready: then it is a 3D display that
+  needs attention, as before). When the simulated driver is the only display driver registered at all
+  and no display fell back, *No 3D display found* reads "DisplayXR apps show in normal
   2D on this PC. Nothing is wrong." (an info level, not a warning) with a **Try a 3D preview** link to
   that driver's Details on Components, where its Options are (`Verdicts.OnlySimulated`). The rule
   "is this display a real 3D display" is one pure function, `StatusText.IsReal3D`, shared by Home and

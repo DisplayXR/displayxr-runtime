@@ -215,6 +215,77 @@ public class VerdictTests
         Assert.Null(none.SimulatedDriverId);
     }
 
+    /// <summary>
+    /// Review finding 1: a REAL 3D display whose vendor driver is broken also ends up claimed by the
+    /// simulated driver at FALLBACK. That must keep reading as something to fix, never "Nothing is wrong",
+    /// on Home and on Displays.
+    /// </summary>
+    private static StatusSnapshot BrokenVendor(string load, string platform, params StatusWarning[] screenWarnings)
+    {
+        var vendor = Design.Plugins.Single(p => p.Id == "leia-sr") with { Load = load, PlatformState = platform };
+        var sim = SimOnly();
+        return sim with
+        {
+            Plugins = new[] { vendor, sim.Plugins[0] },
+            Screens = new[] { sim.Screens[0] with { Warnings = screenWarnings } },
+        };
+    }
+
+    [Fact]
+    public void VendorDriverFailedToLoad_IsNotCalm()
+    {
+        var s = BrokenVendor("LOAD_FAILED", "UNKNOWN",
+            new StatusWarning("CLAIM_FALLBACK", WarningLevel.Warn, "Only the fallback 'sim-display' claims this screen"));
+        Assert.Null(Verdicts.OnlySimulated(s));
+        var v = Verdicts.From(s, null, DxrRuntime);
+        Assert.NotEqual(VerdictKind.No3DDisplay, v.Kind);
+        Assert.DoesNotContain("Nothing is wrong", v.Subline);
+        Assert.Null(v.SimulatedDriverId);
+        Assert.True(Assert.Single(v.Rows).Is3D);
+        // Displays: a 3D display that needs attention, not "Ordinary 2D display".
+        Assert.True(StatusText.IsReal3D(s, s.Screens[0]));
+        Assert.NotEqual(Verdicts.Plain2D, StatusText.PlainBadge(s.Screens[0], s).Text);
+        Assert.Equal(Level.Warn, StatusText.ScreenLevel(s.Screens[0], s));
+    }
+
+    [Fact]
+    public void VendorDriverPlatformNotReady_IsNotCalm()
+    {
+        // Even without the screen warning (an older snapshot), the vendor driver's platform state says it.
+        var s = BrokenVendor("LOADED", "NOT_RUNNING");
+        Assert.Null(Verdicts.OnlySimulated(s));
+        var v = Verdicts.From(s, null, DxrRuntime);
+        Assert.NotEqual(VerdictKind.No3DDisplay, v.Kind);
+        Assert.DoesNotContain("Nothing is wrong", v.Subline);
+        Assert.True(StatusText.IsReal3D(s, s.Screens[0]));
+        Assert.NotEqual(StatusText.SimulatedPreviewLine, StatusText.PlainStateLine(s.Screens[0], s));
+
+        // A PLUGIN_NOT_READY warning anywhere is enough too.
+        var warned = SimOnly() with { Warnings = new[] { new StatusWarning("PLUGIN_NOT_READY", WarningLevel.Critical, "x") } };
+        Assert.Null(Verdicts.OnlySimulated(warned));
+    }
+
+    [Fact]
+    public void VendorDriverRegisteredButDeclined_IsNotCalmEither()
+    {
+        // A healthy vendor driver that found no display of its own: no fallback warning, but a registered
+        // vendor driver means the calm "only the simulated driver" sentence does not apply.
+        var s = BrokenVendor("DECLINED", "READY");
+        Assert.Null(Verdicts.OnlySimulated(s));
+        var v = Verdicts.From(s, null, DxrRuntime);
+        Assert.Equal(VerdictKind.No3DDisplay, v.Kind);
+        Assert.StartsWith("None of your displays is recognised as a 3D display.", v.Subline);
+        Assert.Null(v.SimulatedDriverId);
+    }
+
+    [Fact]
+    public void OnlyTheSimulatedDriverRegistered_IsCalm_AndARealActiveDriverIsNotAffected()
+    {
+        Assert.Equal("sim-display", Verdicts.OnlySimulated(SimOnly()));
+        Assert.Equal(VerdictKind.Ready, Verdicts.From(OneIdle, null, DxrRuntime).Kind); // leia-sr ACTIVE, healthy
+        Assert.Null(Verdicts.OnlySimulated(OneIdle));
+    }
+
     [Fact]
     public void IsSimulated_ByTheSnapshotsFallbackFlag_ElseByTheId()
     {
