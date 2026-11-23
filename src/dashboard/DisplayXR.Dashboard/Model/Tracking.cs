@@ -192,11 +192,11 @@ public static class Tracking
         var screens = Screens(s, summary, id => policy?.Row(id)?.Name is { Length: > 0 } n ? n : id);
         foreach (var r in policy?.Rows ?? Array.Empty<PolicyRow>())
         {
-            var chips = new List<(string, Level)>();
+            var chips = new ChipList();
             bool isServing = screens.Any(x => x.Kind == ViewerSourceKind.Provider && x.ProviderId == r.Id);
-            if (isServing) chips.Add(("serving", Level.Ok));
-            if (summary?.ProbeChip(r) is { } pc) chips.Add(pc);
-            else if (r.RankedFirst && r.Enabled) chips.Add(("ranked first", Level.Plain));
+            if (isServing) chips.Add("State", "serving", Level.Ok);
+            if (summary?.ProbeChip(r) is { } pc) chips.Add("Probe", pc);
+            else if (r.RankedFirst && r.Enabled) chips.Add("Probe", "ranked first", Level.Plain);
             Components.AddPolicyChips(chips, r);
             var lines = new List<string>
             {
@@ -207,8 +207,10 @@ public static class Tracking
                 }.Where(x => x.Length > 0)),
             };
             if (r.Provenance == "unverified" && r.ProvenanceReason is { Length: > 0 } why) lines.Add(why);
+            bool usable = summary is { Evaluated: true } && summary.Ranked.Contains(r.Id);
             items.Add(new ComponentItem(r.Name.Length > 0 ? r.Name : r.Id,
-                isServing ? Level.Ok : r.Untrusted ? Level.Warn : Level.Plain, chips, lines, Policy: r));
+                isServing ? Level.Ok : r.Untrusted ? Level.Warn : Level.Plain, chips.Chips, lines, Policy: r,
+                Facts: chips.Facts, State: PlainStates.TrackingProvider(isServing, usable, r)));
         }
         int registered = policy?.Rows.Count ?? summary?.Registered ?? 0;
         int enabled = policy?.Rows.Count(r => r.Enabled) ?? summary?.Enabled ?? 0;

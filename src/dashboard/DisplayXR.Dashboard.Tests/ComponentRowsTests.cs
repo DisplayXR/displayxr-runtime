@@ -423,6 +423,75 @@ public class ComponentRowsTests
     }
 
     [Fact]
+    public void ARow_ShowsItsStatus_OneStateWord_AndWorksWithYourDisplay_EverythingElseIsInDetails()
+    {
+        var chips = new ChipList();
+        chips.Add("Load state", "LOADED", Level.Plain);
+        chips.Add("Platform", "READY", Level.Plain);
+        chips.Add("Signature", "signed by Example Co", Level.Ok);
+        chips.Add("Licence", "trial until 2026-12-21", Level.Info);
+        var item = new ComponentItem("panel-a", Level.Ok, chips.Chips, Array.Empty<string>(),
+            Policy: Policy(ComponentClass.Display, "panel-a"), Facts: chips.Facts, State: PlainState.Ready);
+        string detected = Item("panel-a", "display_processor", "current", receipt: true).Replace("}", ",\"detected\":\"high\",\"recommended\":true,\"size\":971776}");
+        var row = Assert.Single(ComponentRows.Join(new[] { Section("display_processors", item) }, Live(detected))[0].Rows);
+
+        var face = row.Face;
+        Assert.Equal(("Installed", Level.Ok), face.Status);
+        Assert.Equal(("Ready", Level.Plain), face.State);
+        Assert.True(face.WorksWithDisplay);
+        Assert.Equal(new[]
+        {
+            ("Load state", "LOADED"), ("Platform", "READY"), ("Signature", "signed by Example Co"),
+            ("Licence", "trial until 2026-12-21"), ("Catalog", "Recommended"),
+        }, face.Details);
+
+        // Several values of one label are one line.
+        var client = new ComponentItem("app.exe", Level.Ok, new[] { ("focused", Level.Ok), ("active", Level.Plain) }, Array.Empty<string>(),
+            Facts: new[] { ("Flags", "focused"), ("Flags", "active") });
+        var clientFace = Assert.Single(ComponentRows.Join(new[] { Section("present_owners", client) }, null)[0].Rows).Face;
+        Assert.Null(clientFace.Status);
+        Assert.Null(clientFace.State);
+        Assert.Equal(new[] { ("Flags", "focused, active") }, clientFace.Details);
+
+        // A row with no facts of its own lists its chips under "State".
+        var bare = new ComponentItem("x", Level.Ok, new[] { ("connected", Level.Ok) }, Array.Empty<string>());
+        Assert.Equal(new[] { ("State", "connected") }, bare.DetailFacts);
+    }
+
+    [Fact]
+    public void ALastKnownRow_SaysSoInItsStatus()
+    {
+        var good = Catalog(Item("panel-c", "display_processor", "not_installed"));
+        var offline = CatalogRead.From(CatalogExit.Offline, "", true, false, null);
+        var row = Assert.Single(ComponentRows.Join(new[] { Section("display_processors") }, CatalogSource.From(offline, good))[0].Rows);
+        Assert.Equal(("Available (last known)", Level.Plain), row.Face.Status);
+        Assert.Equal(("Available", Level.Plain), Assert.Single(ComponentRows.Join(new[] { Section("display_processors") }, Live(
+            Item("panel-c", "display_processor", "not_installed")))[0].Rows).Face.Status);
+    }
+
+    [Fact]
+    public void PolicyNotes_SayTheScope_AndEveryMachineWideCommand_ForTheDetails()
+    {
+        var row = new PolicyRow(ComponentClass.Display, "panel-a", "panel-a", true, "default", false, false, "ACTIVE", "signed", null, null);
+        var list = new PolicyList(ComponentClass.Display, null, new[] { row }, new Dictionary<string, string>(), Array.Empty<PolicyTask>());
+
+        var notes = PolicyCommands.Notes(row, list, machine: false, elevated: false);
+        Assert.StartsWith("Per user; machine-wide needs an administrator prompt.", notes[0].Text);
+        Assert.Contains(ComponentClass.Display.AppliesNote(), notes[0].Text);
+        Assert.Contains(("Machine-wide, from an administrator prompt:", false), notes);
+        Assert.Contains(("displayxr-cli dp disable panel-a --machine", true), notes);
+        Assert.Contains(("displayxr-cli dp use panel-a --machine", true), notes);
+
+        // Elevated: the dashboard can write machine-wide itself, so no command to copy.
+        var elevated = PolicyCommands.Notes(row, list, machine: true, elevated: true);
+        Assert.Equal(new[] { ($"Machine-wide. {ComponentClass.Display.AppliesNote()}", false) }, elevated);
+
+        var builtIn = row with { Class = ComponentClass.Conversion, Id = "built-in", EnabledSource = "", BuiltIn = true };
+        var conv = new PolicyList(ComponentClass.Conversion, null, new[] { builtIn }, new Dictionary<string, string>(), Array.Empty<PolicyTask>());
+        Assert.StartsWith("Built-in adapter:", PolicyCommands.Notes(builtIn, conv, false, false)[0].Text);
+    }
+
+    [Fact]
     public void RowsWithoutAnId_AndSectionsTheCatalogHasNoClassFor_AreLeftAsTheyAre()
     {
         var summary = new ComponentItem("Rig (navigation) role", Level.Plain, Array.Empty<(string, Level)>(), Array.Empty<string>());

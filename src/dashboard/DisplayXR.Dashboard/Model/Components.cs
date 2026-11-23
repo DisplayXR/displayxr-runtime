@@ -150,12 +150,147 @@ public sealed record LiftModule(bool Probed, bool Malformed, string? Backend, lo
     };
 }
 
+/// <summary>
+/// The one plain word a row may carry for its state, beside its status. Every technical state a
+/// component reports (load verdict, Enabled value, provenance verdict, probe, connection) maps onto
+/// one of these (<see cref="PlainStates"/>); the technical words themselves are kept for the row's
+/// Details (<see cref="ComponentItem.DetailFacts"/>).
+/// </summary>
+public enum PlainState
+{
+    /// <summary>No state word (a connected client, a summary line, a catalog row with nothing installed).</summary>
+    None,
+    /// <summary>Doing its job now: the active display processor, a selected conversion provider, a serving tracker, a connected controller.</summary>
+    InUse,
+    /// <summary>Loaded or usable, and not the one in use.</summary>
+    Ready,
+    /// <summary>Registered and allowed, not loaded or not needed now.</summary>
+    Standby,
+    /// <summary>Its Enabled value (or the loader's verdict) says off.</summary>
+    TurnedOff,
+    /// <summary>Refused or failed: the provenance gate, a load failure, malformed descriptors, a failing task.</summary>
+    NeedsAttention,
+}
+
+/// <summary>The pure mapping from the components' technical states to <see cref="PlainState"/>, and its words.</summary>
+public static class PlainStates
+{
+    /// <summary>The chip of a state word; null for <see cref="PlainState.None"/>.</summary>
+    public static (string Text, Level Level)? Chip(PlainState s) => s switch
+    {
+        PlainState.InUse => ("In use", Level.Ok),
+        PlainState.Ready => ("Ready", Level.Plain),
+        PlainState.Standby => ("Standby", Level.Plain),
+        PlainState.TurnedOff => ("Turned off", Level.Plain),
+        PlainState.NeedsAttention => ("Needs attention", Level.Warn),
+        _ => null,
+    };
+
+    /// <summary>
+    /// The loader's verdicts that are not a failure (u_status_snapshot.c <c>load_is_failure</c>, plus
+    /// the conversion class's <c>BUILT_IN</c>, <c>DISABLED</c> and an unreported value); every other verdict is one.
+    /// </summary>
+    private static bool LoadIsFailure(string load) =>
+        load is not ("" or "UNKNOWN" or "ACTIVE" or "LOADED" or "DECLINED" or "NOT_ATTEMPTED" or "NOT_LOADED" or "BUILT_IN" or "DISABLED");
+
+    /// <summary>What the policy row alone decides: refused by the provenance gate, or turned off.</summary>
+    private static PlainState? ByPolicy(PolicyRow? r) =>
+        r is { Untrusted: true } ? PlainState.NeedsAttention
+        : r is { EnabledKnown: true, Enabled: false } ? PlainState.TurnedOff
+        : null;
+
+    /// <summary>
+    /// A display processor: ACTIVE = In use, LOADED = Ready, DISABLED = Turned off, any failure verdict
+    /// (UNTRUSTED, LOAD_FAILED, ABI_MISMATCH, ...) = Needs attention, otherwise (NOT_ATTEMPTED, DECLINED) Standby.
+    /// </summary>
+    public static PlainState DisplayProcessor(string load, PolicyRow? policy) =>
+        ByPolicy(policy) ?? load switch
+        {
+            "ACTIVE" => PlainState.InUse,
+            "LOADED" => PlainState.Ready,
+            "DISABLED" => PlainState.TurnedOff,
+            var l when LoadIsFailure(l) => PlainState.NeedsAttention,
+            _ => PlainState.Standby,
+        };
+
+    /// <summary>
+    /// A conversion provider: malformed, a failure verdict or a failing task = Needs attention; off
+    /// (its Enabled value or the snapshot's flag) = Turned off; superseded = Standby; selected for a
+    /// task = In use; loaded or built in = Ready; otherwise Standby.
+    /// </summary>
+    public static PlainState ConversionProvider(string load, bool enabled, bool hidden, bool malformed, bool selected,
+                                                Level worstTask, PolicyRow? policy)
+    {
+        if (malformed || policy is { Untrusted: true } || LoadIsFailure(load) || worstTask is Level.Warn or Level.Critical)
+            return PlainState.NeedsAttention;
+        if (ByPolicy(policy) is { } p) return p;
+        if (!enabled || load == "DISABLED") return PlainState.TurnedOff;
+        if (hidden) return PlainState.Standby;
+        if (selected) return PlainState.InUse;
+        return load is "LOADED" or "ACTIVE" or "BUILT_IN" ? PlainState.Ready : PlainState.Standby;
+    }
+
+    /// <summary>An input provider: active = In use, hardware present = Ready, otherwise Standby.</summary>
+    public static PlainState InputProvider(bool active, bool? hardwarePresent, PolicyRow? policy) =>
+        ByPolicy(policy) ?? (active ? PlainState.InUse : hardwarePresent == true ? PlainState.Ready : PlainState.Standby);
+
+    /// <summary>A viewer-tracking provider: serving a screen = In use, its probe found a usable source = Ready, otherwise Standby.</summary>
+    public static PlainState TrackingProvider(bool serving, bool usableSource, PolicyRow? policy) =>
+        ByPolicy(policy) ?? (serving ? PlainState.InUse : usableSource ? PlainState.Ready : PlainState.Standby);
+
+    /// <summary>A workspace controller: connected = In use, registered and not running = Standby.</summary>
+    public static PlainState Controller(bool connected) => connected ? PlainState.InUse : PlainState.Standby;
+
+    /// <summary>The conversion module: malformed or a module that cannot be used = Needs attention, turned off, available = Ready.</summary>
+    public static PlainState ConversionModule(bool malformed, bool present, string? moduleStatus) =>
+        malformed || moduleStatus is "too_old" or "unlicensed" or "load_failed" ? PlainState.NeedsAttention
+        : moduleStatus == "disabled" ? PlainState.TurnedOff
+        : present ? PlainState.Ready
+        : PlainState.Standby;
+
+    /// <summary>A model pack: installed = Ready; downloading, partly installed, evicted or absent (fetched on use) = Standby.</summary>
+    public static PlainState ModelPack(string state) => state == "installed" ? PlainState.Ready : PlainState.Standby;
+}
+
+/// <summary>
+/// A row's chips, each with the label it carries in the row's Details ("Load state: LOADED",
+/// "Signature: signed by ..."). The row itself shows none of them (only its status, one
+/// <see cref="PlainState"/> word and "Works with your display"); nothing is dropped.
+/// </summary>
+public sealed class ChipList
+{
+    private readonly List<(string Text, Level Level)> _chips = new();
+    private readonly List<(string Label, string Text)> _facts = new();
+
+    public void Add(string label, string text, Level level)
+    {
+        _chips.Add((text, level));
+        _facts.Add((label, text));
+    }
+
+    public void Add(string label, (string Text, Level Level)? chip)
+    {
+        if (chip is { } c) Add(label, c.Text, c.Level);
+    }
+
+    public IReadOnlyList<(string Text, Level Level)> Chips => _chips.ToArray();
+    public IReadOnlyList<(string Label, string Text)> Facts => _facts.ToArray();
+}
+
 /// <summary>One row of a Components section.</summary>
 /// <param name="BuiltIn">Part of the runtime binary itself (the conversion class's built-in adapter, load verdict
 /// <c>BUILT_IN</c>), known even before the class's policy list has been read.</param>
+/// <param name="Facts">Each chip with its label, for the row's Details; null = the chips under the label "State".</param>
+/// <param name="State">The one plain state word the row shows.</param>
 public sealed record ComponentItem(string Name, Level Level, IReadOnlyList<(string Text, Level Level)> Chips, IReadOnlyList<string> Lines,
                                    RegisteredController? Controller = null, PolicyRow? Policy = null, string? Id = null,
-                                   bool BuiltIn = false);
+                                   bool BuiltIn = false, IReadOnlyList<(string Label, string Text)>? Facts = null,
+                                   PlainState State = PlainState.None)
+{
+    /// <summary>What the row's Details lists, label by label.</summary>
+    public IReadOnlyList<(string Label, string Text)> DetailFacts =>
+        Facts ?? Chips.Select(c => ("State", c.Text)).ToArray();
+}
 
 /// <summary>One role: what it is, how many are registered / connected, and its rows.</summary>
 public sealed record ComponentSection(string Id, string Title, string Role, int Count, int Connected,
@@ -216,12 +351,10 @@ public static class Components
         {
             bool isActive = p.Load == "ACTIVE";
             if (isActive) active++;
-            var chips = new List<(string, Level)>
-            {
-                (p.Load.Length > 0 ? p.Load : "UNKNOWN", isActive ? Level.Ok : Level.Plain),
-                (p.PlatformState, StatusText.PluginLevel(p) is Level.Ok or Level.Plain ? Level.Plain : StatusText.PluginLevel(p)),
-            };
-            if (p.Fallback) chips.Add(("FALLBACK", Level.Plain));
+            var chips = new ChipList();
+            chips.Add("Load state", p.Load.Length > 0 ? p.Load : "UNKNOWN", isActive ? Level.Ok : Level.Plain);
+            chips.Add("Platform", p.PlatformState, StatusText.PluginLevel(p) is Level.Ok or Level.Plain ? Level.Plain : StatusText.PluginLevel(p));
+            if (p.Fallback) chips.Add("Role", "FALLBACK", Level.Plain);
             var pol = policy?.Row(p.Id);
             AddPolicyChips(chips, pol);
             var claims = s!.Screens.Where(x => x.Claim.PluginId == p.Id).Select(x =>
@@ -233,7 +366,8 @@ public static class Components
                 claims.Count > 0 ? "Claims " + string.Join(", ", claims) : "Claims no screen",
             };
             if (p.Hint.Length > 0) lines.Add(p.Hint);
-            items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, StatusText.PluginLevel(p), chips, lines, Policy: pol, Id: p.Id));
+            items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, StatusText.PluginLevel(p), chips.Chips, lines, Policy: pol, Id: p.Id,
+                                        Facts: chips.Facts, State: PlainStates.DisplayProcessor(p.Load, pol)));
         }
         return new ComponentSection("display_processors", "Display processors",
             "A display processor turns the views an app renders into what one kind of 3D display shows; each claims the screens it drives.",
@@ -263,17 +397,17 @@ public static class Components
             if (reg.Actions.Count > 0) lines.Add("Actions: " + string.Join(", ", reg.Actions));
             string state = isConnected ? (client?.Pid ?? reg.Pid) is { } cp ? $"connected (pid {cp})" : "connected" : "registered, not running";
             items.Add(new ComponentItem(name, isConnected ? Level.Ok : Level.Plain,
-                new[] { (state, isConnected ? Level.Ok : Level.Plain) }, lines, reg));
+                new[] { (state, isConnected ? Level.Ok : Level.Plain) }, lines, reg, State: PlainStates.Controller(isConnected)));
         }
         foreach (var c in connected.Where(c => !matched.Contains(c.Id)))
         {
             string name = c.Name.Length > 0 ? c.Name : snapName ?? $"client {c.Id}";
             items.Add(new ComponentItem(name, Level.Ok, new[] { ("connected", Level.Ok) },
-                new[] { Line(name, true, workspaceOn), ClientLine(c) }));
+                new[] { Line(name, true, workspaceOn), ClientLine(c) }, State: PlainStates.Controller(true)));
         }
         if (items.Count == 0 && snapName is not null)
             items.Add(new ComponentItem(snapName, workspaceOn ? Level.Info : Level.Plain, new[] { ("not connected", Level.Plain) },
-                new[] { Line(snapName, false, workspaceOn) }));
+                new[] { Line(snapName, false, workspaceOn) }, State: PlainStates.Controller(false)));
 
         int nConnected = Math.Max(connected.Count, info.WorkspaceControllers.Count(r => r.Connected == true));
         string summary = nConnected > 0 ? $"{nConnected} connected" : "none connected";
@@ -316,7 +450,7 @@ public static class Components
         var clients = (s?.Clients ?? Array.Empty<Client>()).Where(c => c.Class == cls).ToList();
         var items = clients.Select(c => new ComponentItem(StatusText.ClientName(c), Level.Ok,
             StatusText.ClientFlags(c).Select(f => (f, f == "focused" ? Level.Ok : Level.Plain)).ToArray(),
-            new[] { ClientLine(c) })).ToArray();
+            new[] { ClientLine(c) }, Facts: StatusText.ClientFlags(c).Select(f => ("Flags", f)).ToArray())).ToArray();
         return new ComponentSection(id, title, role, items.Length, items.Length,
             items.Length == 0 ? (s is { IsService: true } ? "none connected" : "live clients need the service") : $"{items.Length} connected",
             items, collapsed);
@@ -334,15 +468,15 @@ public static class Components
             {
                 var ip = info.InputProviders.FirstOrDefault(x => x.Id == r.Id);
                 bool active = r.Active || ip is { Active: true };
-                var chips = new List<(string, Level)>();
-                if (ip is not null) chips.Add((ip.HardwarePresent ? "hardware present" : "hardware absent", ip.HardwarePresent ? Level.Ok : Level.Plain));
-                if (active) chips.Add(("active", Level.Ok));
+                var chips = new ChipList();
+                if (ip is not null) chips.Add("Hardware", ip.HardwarePresent ? "hardware present" : "hardware absent", ip.HardwarePresent ? Level.Ok : Level.Plain);
+                if (active) chips.Add("State", "active", Level.Ok);
                 AddPolicyChips(chips, r);
                 var lines = new List<string>();
                 if (ip is { Note.Length: > 0 }) lines.Add(ip.Note);
                 else if (r.Untrusted && r.ProvenanceReason is { Length: > 0 } why) lines.Add(why);
                 items.Add(new ComponentItem(r.Name.Length > 0 ? r.Name : r.Id, active ? Level.Ok : r.Untrusted ? Level.Warn : Level.Plain,
-                    chips, lines, Policy: r));
+                    chips.Chips, lines, Policy: r, Facts: chips.Facts, State: PlainStates.InputProvider(active, ip?.HardwarePresent, r)));
             }
         }
         else
@@ -350,7 +484,10 @@ public static class Components
                 items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, p.Active ? Level.Ok : Level.Plain,
                     new[] { (p.HardwarePresent ? "hardware present" : "hardware absent", p.HardwarePresent ? Level.Ok : Level.Plain) }
                         .Concat(p.Active ? new[] { ("active", Level.Ok) } : Array.Empty<(string, Level)>()).ToArray(),
-                    p.Note.Length > 0 ? new[] { p.Note } : Array.Empty<string>(), Id: p.Id));
+                    p.Note.Length > 0 ? new[] { p.Note } : Array.Empty<string>(), Id: p.Id,
+                    Facts: new[] { ("Hardware", p.HardwarePresent ? "hardware present" : "hardware absent") }
+                        .Concat(p.Active ? new[] { ("State", "active") } : Array.Empty<(string, string)>()).ToArray(),
+                    State: PlainStates.InputProvider(p.Active, p.HardwarePresent, null)));
         if (items.Count == 0 && info.Input is { } sum)
         {
             var lines = new List<string> { sum.Note };
@@ -362,12 +499,15 @@ public static class Components
                 {
                     (sum.HardwarePresent ? "hardware present" : "hardware absent", sum.HardwarePresent ? Level.Ok : Level.Plain),
                     (sum.Evaluated ? "evaluated" : "not evaluated", Level.Plain),
-                }, lines));
+                }, lines,
+                Facts: new[] { ("Hardware", sum.HardwarePresent ? "hardware present" : "hardware absent"),
+                               ("Evaluation", sum.Evaluated ? "evaluated" : "not evaluated") }));
         }
         if (info.Rig is { } rig)
             items.Add(new ComponentItem("Rig (navigation) role", rig.Evaluated ? Level.Ok : Level.Plain,
                 new[] { (rig.Evaluated ? "evaluated" : "not evaluated", Level.Plain) },
-                new[] { rig.Device is { Length: > 0 } d ? $"Device: {d}" : "", rig.Note }.Where(x => x.Length > 0).ToArray()));
+                new[] { rig.Device is { Length: > 0 } d ? $"Device: {d}" : "", rig.Note }.Where(x => x.Length > 0).ToArray(),
+                Facts: new[] { ("Evaluation", rig.Evaluated ? "evaluated" : "not evaluated") }));
         int registered = policy is { Rows.Count: > 0 } ? policy.Rows.Count
                        : info.InputProviders.Count > 0 ? info.InputProviders.Count : info.Input?.Registered ?? 0;
         int connected = info.InputProviders.Count > 0 ? info.InputProviders.Count(p => p.HardwarePresent)
@@ -406,15 +546,13 @@ public static class Components
                 if (line.Length > 0) lines.Insert(0, line);
             }
             if (l.Note.Length > 0) lines.Add(l.Note);
-            var chips = new List<(string, Level)>
-            {
-                (l.Malformed ? "malformed" : present ? "available" : l.Probed ? "none" : "not probed",
-                 l.Malformed ? Level.Critical : present ? Level.Ok : Level.Plain),
-            };
-            if (l.ModuleChip is { } mc) chips.Add(mc);
+            var chips = new ChipList();
+            chips.Add("State", l.Malformed ? "malformed" : present ? "available" : l.Probed ? "none" : "not probed",
+                      l.Malformed ? Level.Critical : present ? Level.Ok : Level.Plain);
+            chips.Add("Module", l.ModuleChip);
             items.Add(new ComponentItem(l.Backend is { Length: > 0 } b ? b : "Conversion module",
                 l.Malformed ? Level.Critical : present ? Level.Ok : Level.Plain,
-                chips, lines));
+                chips.Chips, lines, Facts: chips.Facts, State: PlainStates.ConversionModule(l.Malformed, present, l.ModuleStatus)));
         }
         return new ComponentSection("conversion", "Conversion module",
             "A conversion module turns 2D content into 3D (depth, side-by-side, multi-view) as a service any app can ask for.",
@@ -452,17 +590,18 @@ public static class Components
             var p = providers[i];
             bool malformed = p.BadDescriptors > 0;
             bool usable = p.Enabled && !p.Hidden && !malformed && p.CapCount > 0;
-            var chips = new List<(string, Level)> { (p.Load.Length > 0 ? p.Load : "UNKNOWN", usable ? Level.Ok : Level.Plain) };
-            if (malformed) chips.Add(("malformed", Level.Critical));
+            var chips = new ChipList();
+            chips.Add("Load state", p.Load.Length > 0 ? p.Load : "UNKNOWN", usable ? Level.Ok : Level.Plain);
+            if (malformed) chips.Add("Descriptors", "malformed", Level.Critical);
             var pol = policy?.Row(p.Id);
             // Enabled: the policy row's chip names the source ("disabled (user)"); the snapshot's
             // bare flag only when `conv list` has not said (or predates enabled_source).
-            if (pol?.EnabledChip is { } ec) chips.Add(ec);
-            else if (!p.Enabled) chips.Add(("disabled", Level.Plain));
-            if (p.Hidden) chips.Add(("superseded", Level.Plain));
-            if (p.Fallback) chips.Add(("FALLBACK", Level.Plain));
-            if (pol?.ProvenanceChip is { } pc) chips.Add(pc);
-            if (pol is { Untrusted: true }) chips.Add(("refused: provenance", Level.Warn));
+            if (pol?.EnabledChip is { } ec) chips.Add("Enabled setting", ec);
+            else if (!p.Enabled) chips.Add("Enabled setting", "disabled", Level.Plain);
+            if (p.Hidden) chips.Add("Visibility", "superseded", Level.Plain);
+            if (p.Fallback) chips.Add("Role", "FALLBACK", Level.Plain);
+            chips.Add("Signature", pol?.ProvenanceChip);
+            if (pol is { Untrusted: true }) chips.Add("Provenance gate", "refused: provenance", Level.Warn);
             var lines = new List<string>
             {
                 string.Join(Sep, new[]
@@ -483,9 +622,11 @@ public static class Components
             if (p.Hint.Length > 0) lines.Add(p.Hint);
             var worst = s.Tasks.Where(t => t.ProviderIndex == i).Select(TaskChip).Select(c => c.Level)
                          .DefaultIfEmpty(Level.Plain).Max();
+            bool selected = s.Tasks.Any(t => t.ProviderIndex == i && t.Selected);
             items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id,
                 malformed ? Level.Critical : worst is Level.Critical or Level.Warn ? worst : usable ? Level.Ok : Level.Plain,
-                chips, lines, Policy: pol, Id: p.Id, BuiltIn: p.Load == "BUILT_IN" || pol is { BuiltIn: true }));
+                chips.Chips, lines, Policy: pol, Id: p.Id, BuiltIn: p.Load == "BUILT_IN" || pol is { BuiltIn: true },
+                Facts: chips.Facts, State: PlainStates.ConversionProvider(p.Load, p.Enabled, p.Hidden, malformed, selected, worst, pol)));
         }
         var served = s.Tasks.Where(t => t.Selected).Select(t => t.Task).Distinct().ToArray();
         int ready = s.Tasks.Count(t => t.Selected && t.State == "READY");
@@ -499,14 +640,14 @@ public static class Components
     }
 
     /// <summary>ADR-054 N3e: the policy chips a row carries — Enabled (and its source), Preferred, the provenance verdict.</summary>
-    public static void AddPolicyChips(List<(string, Level)> chips, PolicyRow? pol)
+    public static void AddPolicyChips(ChipList chips, PolicyRow? pol)
     {
         if (pol is null) return;
-        if (pol.EnabledChip is { } ec) chips.Add(ec);
-        if (pol.Preferred) chips.Add(("preferred", Level.Info));
-        if (pol.Untrusted) chips.Add(("refused: provenance", Level.Warn));
-        if (pol.ProvenanceChip is { } pc) chips.Add(pc);
-        if (pol.LicenceChip is { } lc) chips.Add(lc); // ADR-054 N5: what the component says about its licence
+        chips.Add("Enabled setting", pol.EnabledChip);
+        if (pol.Preferred) chips.Add("Preference", "preferred", Level.Info);
+        if (pol.Untrusted) chips.Add("Provenance gate", "refused: provenance", Level.Warn);
+        chips.Add("Signature", pol.ProvenanceChip);
+        chips.Add("Licence", pol.LicenceChip); // ADR-054 N5: what the component says about its licence
     }
 
     /// <summary>The state chip of one model pack: installed green, downloading blue with its percentage, evicted amber.</summary>
@@ -547,7 +688,7 @@ public static class Components
                 lines.Add($"downloading {Megabytes(p.DownloadDone)} of {Megabytes(p.DownloadTotal)}");
             if (p.ResearchModels > 0)
                 lines.Add($"{Plural(p.ResearchModels, "model is", "models are")} non-commercial: used only with AllowResearchOnly");
-            items.Add(new ComponentItem(p.Pack, chip.Level, new[] { chip }, lines));
+            items.Add(new ComponentItem(p.Pack, chip.Level, new[] { chip }, lines, State: PlainStates.ModelPack(p.State)));
         }
         int installed = s.Packs.Count(p => p.State == "installed");
         return new ComponentSection("conversion_models", "Conversion models",

@@ -82,9 +82,10 @@ public class ComponentPolicyTests
         Assert.All(old.Rows, r => Assert.Equal("", r.Licence));
 
         // The chip rides the row's other policy chips.
-        var chips = new List<(string, Level)>();
+        var chips = new ChipList();
         Components.AddPolicyChips(chips, none);
-        Assert.Contains(("unlicensed", Level.Warn), chips);
+        Assert.Contains(("unlicensed", Level.Warn), chips.Chips);
+        Assert.Contains(("Licence", "unlicensed"), chips.Facts); // and in the row's Details, labelled
     }
 
     [Fact]
@@ -173,9 +174,11 @@ public class ComponentPolicyTests
         Assert.Equal(("signed", Level.Ok), R(true, "default", prov: "signed").ProvenanceChip);
         Assert.Equal(("quantum", Level.Plain), R(true, "default", prov: "quantum").ProvenanceChip); // unknown verdict: verbatim, neutral
 
-        var chips = new List<(string, Level)>();
+        var chips = new ChipList();
         Components.AddPolicyChips(chips, R(false, "user", pref: true, load: "UNTRUSTED", prov: "unverified"));
-        Assert.Equal(new[] { ("disabled (user)", Level.Plain), ("preferred", Level.Info), ("refused: provenance", Level.Warn), ("unverified", Level.Warn) }, chips);
+        Assert.Equal(new[] { ("disabled (user)", Level.Plain), ("preferred", Level.Info), ("refused: provenance", Level.Warn), ("unverified", Level.Warn) }, chips.Chips);
+        Assert.Equal(new[] { ("Enabled setting", "disabled (user)"), ("Preference", "preferred"), ("Provenance gate", "refused: provenance"), ("Signature", "unverified") },
+                     chips.Facts);
     }
 
     [Fact]
@@ -249,6 +252,11 @@ public class ComponentPolicyTests
         Assert.Equal("leia-sr", leia.Policy!.Id);
         Assert.Contains(("signed by Leia, Inc.", Level.Ok), leia.Chips);
         Assert.DoesNotContain(leia.Chips, c => c.Text.StartsWith("enabled", StringComparison.Ordinal)); // the quiet default
+        // Every chip is kept for the row's Details, labelled; the row's state word is In use.
+        Assert.Contains(("Load state", "ACTIVE"), leia.DetailFacts);
+        Assert.Contains(leia.DetailFacts, f => f.Label == "Signature" && f.Text.StartsWith("signed", StringComparison.Ordinal));
+        Assert.Equal(leia.Chips.Count, leia.DetailFacts.Count);
+        Assert.Equal(PlainState.InUse, leia.State);
 
         // No info rows at all: the input section is built from the policy list.
         var input = all.Single(s => s.Id == "input_providers");
@@ -256,6 +264,7 @@ public class ComponentPolicyTests
         var ul = input.Items.Single(i => i.Policy?.Id == "DisplayXR-Ultraleap");
         Assert.Contains(("active", Level.Ok), ul.Chips);
         Assert.Contains(("unverified", Level.Warn), ul.Chips);
+        Assert.Contains(("Signature", "unverified"), ul.DetailFacts);
         Assert.StartsWith("2 registered", input.ConnectedLine);
 
         // Without a policy list nothing changes for the older CLI.

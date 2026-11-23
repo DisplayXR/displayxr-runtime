@@ -389,6 +389,28 @@ public static class PolicyCommands
     public static string Area(ComponentClass c) => "policy-" + c.Verb();
 
     /// <summary>
+    /// What a change on a policy row means and how an administrator makes it machine-wide: the
+    /// lines a row's Details carries under its Enabled / Prefer controls (the controls stay on the
+    /// row). <c>Command</c> marks a command line (shown in a fixed-width font). The built-in row's
+    /// note, the scope with when it applies, and, for a non-elevated dashboard, every control's
+    /// <c>--machine</c> command.
+    /// </summary>
+    public static IReadOnlyList<(string Text, bool Command)> Notes(PolicyRow r, PolicyList list, bool machine, bool elevated)
+    {
+        var notes = new List<(string Text, bool Command)>();
+        if (r.BuiltIn)
+            notes.Add(("Built-in adapter: it has no Enabled value and is not a provider to prefer. A registered provider hides it with Supersedes = dp-lift.", false));
+        string scope = machine ? "Machine-wide." : elevated ? "Per user." : "Per user; machine-wide needs an administrator prompt.";
+        notes.Add(($"{scope} {r.Class.AppliesNote()}", false));
+        if (!elevated && MachineHints(r, list) is { Count: > 0 } hints)
+        {
+            notes.Add(("Machine-wide, from an administrator prompt:", false));
+            foreach (var h in hints) notes.Add(($"displayxr-cli {h}", true));
+        }
+        return notes;
+    }
+
+    /// <summary>
     /// The machine-wide (<c>--machine</c>) equivalent of every control the row shows, in the
     /// order they appear: the Enabled flip, then the global Prefer / Reset (display / input)
     /// or each task's Prefer / Reset (conversion). What a non-elevated dashboard prints for an

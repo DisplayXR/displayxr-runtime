@@ -177,7 +177,7 @@ public sealed class ComponentsPage : Page
         foreach (var s in Sections())
         {
             sb.Append(s.Id).Append(s.Count).Append(s.Connected).Append(s.ConnectedLine);
-            foreach (var i in s.Items) sb.Append(i.Name).Append(i.Level).Append(string.Join("/", i.Chips)).Append(string.Join("/", i.Lines)).Append(i.Controller?.Launch).Append(i.Policy);
+            foreach (var i in s.Items) sb.Append(i.Name).Append(i.Level).Append(i.State).Append(string.Join("/", i.Chips)).Append(string.Join("/", i.Lines)).Append(i.Controller?.Launch).Append(i.Policy);
             sb.Append(';');
         }
         // The catalog side: the read, what is in flight or just ended, and every item a row shows.
@@ -305,12 +305,16 @@ public sealed class ComponentsPage : Page
                 if (i > 0) list.Children.Add(new Border { Height = 12 });
                 var row = g.Rows[i];
                 // One row: the installed component (its state, its launch and policy controls), its
-                // catalog entry (status, Install / Update, detail), or both.
-                list.Children.Add(ItemRow(row.Installed ?? CatalogHead(row), row.StatusChip, CatalogChips(row, s.Id)));
+                // catalog entry (status, Install / Update, detail), or both. On the row itself: the
+                // status, one plain state word, "Works with your display"; everything else is in Details.
+                var face = row.Face;
+                list.Children.Add(ItemRow(row.Installed ?? CatalogHead(row), face));
                 if (row.Installed?.Controller is { Launch: not null } rc) list.Children.Add(LaunchRow(rc));
                 var pr = row.Installed is { } inst ? inst.Policy : row.Catalog is { } only ? RowOf(only) : null;
-                if (pr is not null && Ctx.Policies.TryGetValue(pr.Class, out var pl) && pl.Writable) list.Children.Add(PolicyControls(pr, pl));
-                if (CatalogStrip(row) is { } strip) list.Children.Add(strip);
+                PolicyList? pl = null;
+                bool writable = pr is not null && Ctx.Policies.TryGetValue(pr.Class, out pl) && pl.Writable;
+                if (writable && PolicyControls(pr!, pl!) is { } controls) list.Children.Add(controls);
+                if (RowStrip(row, face, writable ? PolicyNotes(pr!, pl!) : null) is { } strip) list.Children.Add(strip);
             }
             body.Children.Add(list);
             if (s.Collapsed) body.Children.Add(U.Button("Hide", () => Toggle(s.Id), "link"));
@@ -630,9 +634,11 @@ public sealed class ComponentsPage : Page
     /// conversion provider. Every change is a `displayxr-cli` write (logged, visible in the
     /// log pane); the row is then re-read from `&lt;class&gt; list --json`. Per user unless the
     /// dashboard runs elevated and "Machine-wide" is ticked; a non-elevated dashboard shows the
-    /// `--machine` command for an administrator instead of attempting it.
+    /// `--machine` command for an administrator instead of attempting it (in the row's Details,
+    /// <see cref="PolicyNotes"/>). Null when the row has no control to show (the built-in adapter
+    /// with no task to reset) and no action reply.
     /// </summary>
-    private Control PolicyControls(PolicyRow r, PolicyList list)
+    private Control? PolicyControls(PolicyRow r, PolicyList list)
     {
         var cls = r.Class;
         string area = PolicyCommands.Area(cls);
@@ -723,27 +729,30 @@ public sealed class ComponentsPage : Page
             U.AddFlow(row, mw, 10, 6);
         }
 
-        // (d) what a change means, and how an administrator does it machine-wide.
-        var col = U.VStack(6, row);
-        if (r.BuiltIn)
-            col.Children.Add(U.Wrapped("Built-in adapter: it has no Enabled value and is not a provider to prefer. A registered provider hides it with Supersedes = dp-lift.", "meta"));
-        string scope = machine ? "Machine-wide." : elevated ? "Per user." : "Per user; machine-wide needs an administrator prompt.";
-        col.Children.Add(U.Wrapped($"{scope} {cls.AppliesNote()}", "meta"));
-        // Non-elevated: every control's machine-wide command (Enabled, Prefer, Reset), for an administrator.
-        if (!elevated && PolicyCommands.MachineHints(r, list) is { Count: > 0 } hints)
-        {
-            col.Children.Add(U.Wrapped("Machine-wide, from an administrator prompt:", "meta"));
-            foreach (var h in hints) col.Children.Add(U.Wrapped($"displayxr-cli {h}", "mono"));
-        }
+        // (d) the reply to the last change made here. What a change means, and how an administrator
+        // does it machine-wide, is in the row's Details (PolicyNotes).
+        var col = U.VStack(6);
+        if (row.Children.Count > 0) col.Children.Add(row);
         if (Ctx.LastActionArea == area && _policyActionRow == r.Id && Ctx.LastAction is { } la)
             col.Children.Add(Ctx.LastActionFailed ? U.WarningRow(new StatusWarning("POLICY", WarningLevel.Warn, la)) : U.Wrapped(la, "soft"));
+        if (col.Children.Count == 0) return null;
         var box = new Border { Child = col, Margin = new Thickness(22, 8, 0, 0) };
         box.Classes.Add("field");
         return box;
     }
 
-    /// <summary>The status (one per row) leads the chips; the catalog's own facts close them.</summary>
-    private static Control ItemRow(ComponentItem item, (string Text, Level Level)? status, IReadOnlyList<(string Text, Level Level)> more)
+    /// <summary>
+    /// The policy lines of a row's Details: the built-in note, per user or machine-wide and when it
+    /// applies, and (non-elevated) every control's machine-wide command for an administrator.
+    /// </summary>
+    private IReadOnlyList<(string Text, bool Command)> PolicyNotes(PolicyRow r, PolicyList list)
+    {
+        bool elevated = Elevation.IsElevated;
+        return PolicyCommands.Notes(r, list, _machine && elevated, elevated);
+    }
+
+    /// <summary>The row's head: its status, at most one plain state word, and "Works with your display". The rest is in Details.</summary>
+    private static Control ItemRow(ComponentItem item, RowFace face)
     {
         var dot = U.Dot(item.Level);
         dot.VerticalAlignment = VerticalAlignment.Top;
@@ -751,9 +760,9 @@ public sealed class ComponentsPage : Page
         var name = U.Wrapped(item.Name, "value");
         name.FontWeight = FontWeight.SemiBold;
         var head = U.Flow(8, 4, name);
-        if (status is { } st) U.AddFlow(head, U.Chip(st.Text, st.Level), 6, 4);
-        foreach (var (text, level) in item.Chips) U.AddFlow(head, U.Chip(text, level), 6, 4);
-        foreach (var (text, level) in more) U.AddFlow(head, U.Chip(text, level), 6, 4);
+        if (face.Status is { } st) U.AddFlow(head, U.Chip(st.Text, st.Level), 6, 4);
+        if (face.State is { } state) U.AddFlow(head, U.Chip(state.Text, state.Level), 6, 4);
+        if (face.WorksWithDisplay) U.AddFlow(head, U.Chip("Works with your display", Level.Ok), 6, 4);
         var col = U.VStack(2, head);
         for (int i = 0; i < item.Lines.Count; i++)
             col.Children.Add(U.Wrapped(item.Lines[i], i == 0 ? "soft" : "desc"));
@@ -776,45 +785,57 @@ public sealed class ComponentsPage : Page
                                  Array.Empty<(string, Level)>(), lines);
     }
 
-    /// <summary>The catalog's chips of a row: positive facts only, and "last known" for a row from an earlier read.</summary>
-    private IReadOnlyList<(string Text, Level Level)> CatalogChips(ComponentRow row, string sectionId)
-    {
-        var chips = new List<(string, Level)>();
-        if (row.Catalog is not { } i || !row.HasDetail) return chips;
-        if (row.Stale) chips.Add(("last known", Level.Plain));
-        // "Apps" holds every catalog item that is not a component: say which kind when it is not an app.
-        if (sectionId == ComponentRows.AppsGroupId && i.Class != "app") chips.Add((CatalogClasses.Label(i.Class), Level.Plain));
-        if (i.DetectedHere) chips.Add(("Works with your display", Level.Ok));
-        if (i.Recommended) chips.Add(("Recommended", Level.Info));
-        // An installed row already carries its component's licence chip.
-        if (row.Installed is null && LicenceOf(i) is { } lic) chips.Add((lic.Headline, lic.Level == Level.Warn ? Level.Info : lic.Level));
-        if (i.SizeText is { } size && (!i.IsInstalled || i.HasUpdate)) chips.Add((size, Level.Plain));
-        return chips;
-    }
-
     /// <summary>
-    /// Under a row: what the catalog can do for it (Install / Update, its detail), what is happening
-    /// to it now or how the last thing ended, and, for a row that cannot be removed from here, how
-    /// it is removed. Nothing for a row the catalog has no part in.
+    /// Under a row: what the catalog can do for it (Install / Update), what is happening to it now or
+    /// how the last thing ended, its Details toggle, and, for a row that cannot be removed from here,
+    /// how it is removed. Details holds the row's labelled state lines (the chips the row no longer
+    /// carries), what a policy change means and its machine-wide commands, and the catalog's detail.
+    /// Any row with one of those has the toggle, catalog row or not.
     /// </summary>
-    private Control? CatalogStrip(ComponentRow row)
+    private Control? RowStrip(ComponentRow row, RowFace face, IReadOnlyList<(string Text, bool Command)>? notes)
     {
         var col = U.VStack(8);
-        if (row.Catalog is { } i && row.HasDetail)
+        var catalog = row.Catalog is { } ci && row.HasDetail ? ci : null;
+        // The licence block of the catalog detail says the licence already: not twice.
+        bool licenceBlock = catalog is not null && catalog.IsInstalled && LicenceOf(catalog) is not null;
+        var facts = face.Details.Where(f => !(licenceBlock && f.Label == "Licence")).ToArray();
+        notes ??= Array.Empty<(string, bool)>();
+        bool open = _open.Contains(row.Key);
+        if (catalog is { } i)
         {
-            bool open = _open.Contains(row.Key);
             if (!i.Compatible) col.Children.Add(U.Wrapped(open ? CompatibilityLine(i) : CatalogText.OtherVersion, "meta"));
             else if (i.Unmet.FirstOrDefault(p => !p.Installable) is { } need && !i.IsInstalled)
                 col.Children.Add(U.Wrapped($"Works together with {need.Name}.", "meta"));
             if (Progress(i) is { } progress) col.Children.Add(progress);
-
-            var actions = U.Flow(10, 6);
-            if (MainButton(row, i) is { } main) U.AddFlow(actions, main, 10, 6);
+        }
+        var actions = U.Flow(10, 6);
+        if (catalog is not null && MainButton(row, catalog) is { } main) U.AddFlow(actions, main, 10, 6);
+        if (catalog is not null || facts.Length > 0 || notes.Count > 0)
+        {
+            // The accessible name keeps the catalog's name where the row has a catalog detail, as before.
+            string name = catalog?.Name ?? row.Name;
             var details = U.Button(open ? "Hide details" : "Details", () => ToggleRow(row.Key), "quiet", "sm");
-            AutomationProperties.SetName(details, $"{(open ? "Hide details" : "Details")} of {i.Name}");
+            AutomationProperties.SetName(details, $"{(open ? "Hide details" : "Details")} of {name}");
             U.AddFlow(actions, details, 10, 6);
-            col.Children.Add(actions);
-            if (open) col.Children.Add(Detail(row, i));
+        }
+        if (actions.Children.Count > 0) col.Children.Add(actions);
+        if (open)
+        {
+            var detail = U.VStack(14);
+            if (facts.Length > 0)
+            {
+                var kv = new U.KvList(130);
+                foreach (var (label, text) in facts) kv.Add(label, text);
+                detail.Children.Add(kv);
+            }
+            if (notes.Count > 0)
+            {
+                var policy = U.VStack(6);
+                foreach (var (text, command) in notes) policy.Children.Add(U.Wrapped(text, command ? "mono" : "meta"));
+                detail.Children.Add(policy);
+            }
+            if (catalog is not null) detail.Children.Add(Detail(row, catalog));
+            if (detail.Children.Count > 0) col.Children.Add(detail);
         }
         if (row.RemoveNote is { } note) col.Children.Add(U.Wrapped(note, "meta"));
         if (col.Children.Count == 0) return null;

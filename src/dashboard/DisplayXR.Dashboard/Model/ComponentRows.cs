@@ -105,6 +105,24 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
             ? CatalogText.RemoveFromSettings
         : null;
 
+    /// <summary>The row's face (see <see cref="RowFace"/>).</summary>
+    public RowFace Face
+    {
+        get
+        {
+            bool catalogFacts = Catalog is not null && HasDetail;
+            var status = StatusChip is { } st && Stale && catalogFacts ? ($"{st.Text} (last known)", st.Level) : StatusChip;
+            var details = new List<(string Label, string Text)>();
+            // One line per label: several values of one label (a client's flags) are listed together.
+            foreach (var g in (Installed?.DetailFacts ?? Array.Empty<(string Label, string Text)>()).GroupBy(f => f.Label))
+                details.Add((g.Key, string.Join(", ", g.Select(f => f.Text))));
+            // The catalog's own facts that are not already in its detail (version, size, category, licence are).
+            if (catalogFacts && Catalog!.Recommended) details.Add(("Catalog", "Recommended"));
+            return new RowFace(status, PlainStates.Chip(Installed?.State ?? PlainState.None),
+                               catalogFacts && Catalog!.DetectedHere, details);
+        }
+    }
+
     public bool Shows(RowFilter filter) => filter switch
     {
         RowFilter.Installed => Status != RowStatus.Available,
@@ -112,6 +130,15 @@ public sealed record ComponentRow(string Key, ComponentItem? Installed, CatalogI
         _ => true,
     };
 }
+
+/// <summary>
+/// What a row shows on itself, and what its Details lists. On the row: its status (with "last known"
+/// when it comes from an earlier catalog read), at most one plain state word, and "Works with your
+/// display" when the engine matched this machine. Every other chip the row used to carry is a
+/// labelled line of <see cref="Details"/> ("Load state: LOADED", "Signature: signed by ...").
+/// </summary>
+public sealed record RowFace((string Text, Level Level)? Status, (string Text, Level Level)? State, bool WorksWithDisplay,
+                             IReadOnlyList<(string Label, string Text)> Details);
 
 /// <summary>One group of the page: a Components section and its rows.</summary>
 public sealed record ComponentGroup(ComponentSection Section, IReadOnlyList<ComponentRow> Rows);

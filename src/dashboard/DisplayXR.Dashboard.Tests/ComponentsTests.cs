@@ -63,6 +63,58 @@ public class ComponentsTests
         Assert.Contains("Claims no screen", sim.Lines);
     }
 
+    [Theory]
+    [InlineData("ACTIVE", PlainState.InUse)]
+    [InlineData("LOADED", PlainState.Ready)]
+    [InlineData("NOT_ATTEMPTED", PlainState.Standby)]
+    [InlineData("DECLINED", PlainState.Standby)]
+    [InlineData("", PlainState.Standby)]
+    [InlineData("DISABLED", PlainState.TurnedOff)]
+    [InlineData("UNTRUSTED", PlainState.NeedsAttention)]
+    [InlineData("LOAD_FAILED", PlainState.NeedsAttention)]
+    [InlineData("ABI_MISMATCH", PlainState.NeedsAttention)]
+    public void ADisplayProcessorsLoadVerdict_IsOnePlainWord(string load, PlainState state) =>
+        Assert.Equal(state, PlainStates.DisplayProcessor(load, null));
+
+    [Fact]
+    public void PlainStates_ThePolicyRowDecidesFirst_ThenTheClass()
+    {
+        PolicyRow R(bool enabled, string load = "ACTIVE") =>
+            new(ComponentClass.Display, "x", "x", enabled, "user", false, false, load, "signed", null, null);
+        // Turned off by its Enabled value, refused by the provenance gate: whatever the class says.
+        Assert.Equal(PlainState.TurnedOff, PlainStates.DisplayProcessor("ACTIVE", R(false)));
+        Assert.Equal(PlainState.NeedsAttention, PlainStates.InputProvider(true, true, R(true, "UNTRUSTED")));
+        Assert.Equal(PlainState.TurnedOff, PlainStates.TrackingProvider(true, true, R(false)));
+
+        Assert.Equal(PlainState.InUse, PlainStates.InputProvider(true, false, null));
+        Assert.Equal(PlainState.Ready, PlainStates.InputProvider(false, true, null));
+        Assert.Equal(PlainState.Standby, PlainStates.InputProvider(false, null, null));
+
+        Assert.Equal(PlainState.InUse, PlainStates.TrackingProvider(true, false, null));
+        Assert.Equal(PlainState.Ready, PlainStates.TrackingProvider(false, true, null));
+        Assert.Equal(PlainState.Standby, PlainStates.TrackingProvider(false, false, null));
+
+        Assert.Equal(PlainState.InUse, PlainStates.ConversionProvider("LOADED", true, false, false, true, Level.Ok, null));
+        Assert.Equal(PlainState.Ready, PlainStates.ConversionProvider("BUILT_IN", true, false, false, false, Level.Plain, null));
+        Assert.Equal(PlainState.Standby, PlainStates.ConversionProvider("LOADED", true, true, false, false, Level.Plain, null)); // superseded
+        Assert.Equal(PlainState.TurnedOff, PlainStates.ConversionProvider("NOT_ATTEMPTED", false, false, false, false, Level.Plain, null));
+        Assert.Equal(PlainState.NeedsAttention, PlainStates.ConversionProvider("LOADED", true, false, true, false, Level.Plain, null)); // malformed
+        Assert.Equal(PlainState.NeedsAttention, PlainStates.ConversionProvider("LOADED", true, false, false, true, Level.Warn, null)); // a failing task
+
+        Assert.Equal(PlainState.InUse, PlainStates.Controller(true));
+        Assert.Equal(PlainState.Standby, PlainStates.Controller(false));
+        Assert.Equal(PlainState.Ready, PlainStates.ConversionModule(false, true, "ready"));
+        Assert.Equal(PlainState.NeedsAttention, PlainStates.ConversionModule(false, true, "unlicensed"));
+        Assert.Equal(PlainState.TurnedOff, PlainStates.ConversionModule(false, false, "disabled"));
+        Assert.Equal(PlainState.Ready, PlainStates.ModelPack("installed"));
+        Assert.Equal(PlainState.Standby, PlainStates.ModelPack("downloading"));
+
+        Assert.Equal(new[] { "In use", "Ready", "Standby", "Turned off", "Needs attention" },
+            new[] { PlainState.InUse, PlainState.Ready, PlainState.Standby, PlainState.TurnedOff, PlainState.NeedsAttention }
+                .Select(x => PlainStates.Chip(x)!.Value.Text));
+        Assert.Null(PlainStates.Chip(PlainState.None));
+    }
+
     [Fact]
     public void RegisteredControllers_MatchConnectedOnesByExe()
     {
