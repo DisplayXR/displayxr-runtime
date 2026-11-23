@@ -115,3 +115,80 @@ TEST_CASE("legacy session: a 2-row kind grows the height, not past the cap", "[t
 	CHECK(a.w == 3840);
 	CHECK(a.h == 2160);
 }
+
+/*
+ * 2. An EXTENSION hosted session on a display with {2D 1x1 at 1.0, 3D 2x1 at
+ *    0.5x0.5} (3840x2160 panel). The V path ran between the compositor's
+ *    tile-layout sync and its view-size sync, so for one frame mode 0's view
+ *    size (3840x2160) met mode 1's 2x1 grid: "Renderer resized: atlas alloc
+ *    3840x2160 -> 7680x2160 ... cap 3840x2160". The compositor now reads the
+ *    active mode once per frame (not reachable without a GPU); what IS pinned
+ *    here is the arithmetic both halves rest on: one mode's view size on the
+ *    same mode's grid is always inside the worst-case cap, and a mixed pair is
+ *    clamped back inside it instead of growing the atlas.
+ */
+
+namespace {
+
+xrt_rendering_mode
+mode(uint32_t views, uint32_t cols, uint32_t rows, uint32_t vw, uint32_t vh)
+{
+	xrt_rendering_mode m{};
+	m.view_count = views;
+	m.tile_columns = cols;
+	m.tile_rows = rows;
+	m.view_width_pixels = vw;
+	m.view_height_pixels = vh;
+	m.atlas_width_pixels = cols * vw;
+	m.atlas_height_pixels = rows * vh;
+	return m;
+}
+
+} // namespace
+
+TEST_CASE("cap: one mode's view on its own grid never exceeds the worst case", "[tiling][atlas_mode_switch][cap]")
+{
+	const xrt_rendering_mode modes[2] = {mode(1, 1, 1, 3840, 2160), mode(2, 2, 1, 1920, 1080)};
+	uint32_t cap_w = 0, cap_h = 0;
+	u_tiling_compute_system_atlas(modes, 2, &cap_w, &cap_h);
+	REQUIRE(cap_w == 3840);
+	REQUIRE(cap_h == 2160);
+
+	for (const xrt_rendering_mode &m : modes) {
+		uint32_t vw = m.view_width_pixels, vh = m.view_height_pixels;
+		CHECK_FALSE(u_tiling_clamp_view_to_atlas_cap(m.tile_columns, cap_w, &vw));
+		CHECK_FALSE(u_tiling_clamp_view_to_atlas_cap(m.tile_rows, cap_h, &vh));
+		CHECK(vw == m.view_width_pixels);
+		CHECK(vh == m.view_height_pixels);
+		CHECK(m.tile_columns * vw <= cap_w);
+		CHECK(m.tile_rows * vh <= cap_h);
+	}
+}
+
+TEST_CASE("cap: the torn V frame (mode 0 view, mode 1 grid) is clamped, not grown",
+          "[tiling][atlas_mode_switch][cap]")
+{
+	const uint32_t cap_w = 3840, cap_h = 2160;
+	uint32_t vw = 3840, vh = 2160; // mode 0's view
+	const uint32_t cols = 2, rows = 1; // mode 1's grid
+	REQUIRE(cols * vw == 7680);        // the field log's content
+	CHECK(u_tiling_clamp_view_to_atlas_cap(cols, cap_w, &vw));
+	CHECK_FALSE(u_tiling_clamp_view_to_atlas_cap(rows, cap_h, &vh));
+	CHECK(vw == 1920);
+	CHECK(cols * vw <= cap_w);
+	// ...and an allocation already at the cap then holds it: no realloc.
+	CHECK(u_tiling_atlas_alloc_holds(cols, rows, vw, vh, cap_w, cap_h));
+}
+
+TEST_CASE("cap: unknown cap or grid leaves the view alone; never 0", "[tiling][atlas_mode_switch][cap]")
+{
+	uint32_t v = 5000;
+	CHECK_FALSE(u_tiling_clamp_view_to_atlas_cap(2, 0, &v));
+	CHECK(v == 5000);
+	CHECK_FALSE(u_tiling_clamp_view_to_atlas_cap(0, 3840, &v));
+	CHECK(v == 5000);
+	CHECK_FALSE(u_tiling_clamp_view_to_atlas_cap(2, 3840, nullptr));
+	v = 100;
+	CHECK(u_tiling_clamp_view_to_atlas_cap(8, 4, &v));
+	CHECK(v == 1);
+}

@@ -3063,6 +3063,13 @@ comp_d3d11_renderer_set_atlas_cap(struct comp_d3d11_renderer *renderer, uint32_t
 	}
 }
 
+extern "C" void
+comp_d3d11_renderer_get_atlas_cap(struct comp_d3d11_renderer *renderer, uint32_t *out_cap_width, uint32_t *out_cap_height)
+{
+	*out_cap_width = renderer != nullptr ? renderer->atlas_cap_width : 0;
+	*out_cap_height = renderer != nullptr ? renderer->atlas_cap_height : 0;
+}
+
 extern "C" xrt_result_t
 comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
                            uint32_t new_view_width,

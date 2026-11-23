@@ -670,7 +670,8 @@ target_link_libraries(tests_aux_tiling_row_origin PRIVATE xrt-interfaces)
 target_link_libraries(tests_aux_tiling_window_size PRIVATE xrt-interfaces)
 
 # The in-process D3D11 renderer atlas across a 2D <-> 3D switch: a legacy
-# session's fixed-view-size atlas follows its tile grid. Header arithmetic,
+# session's fixed-view-size atlas follows its tile grid; a mode-derived view
+# size never takes the atlas past the worst-case cap. Header arithmetic,
 # pinned on the host.
 target_link_libraries(tests_aux_atlas_mode_switch PRIVATE xrt-interfaces)
 

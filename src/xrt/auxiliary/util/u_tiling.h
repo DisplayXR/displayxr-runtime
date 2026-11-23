@@ -608,6 +608,36 @@ u_tiling_atlas_alloc_holds(uint32_t tile_columns,
 	return content_w <= alloc_w && content_h <= alloc_h;
 }
 
+/*!
+ * Clamp one axis of a per-view extent so @p tiles of it fit the worst-case
+ * atlas extent @p cap (from u_tiling_compute_system_atlas()).
+ *
+ * For a view size taken from a rendering mode, content within the worst case
+ * across the modes holds by construction; a request outside it means the
+ * caller combined one mode's view size with another mode's grid (a 2D view on
+ * a 2x1 grid asked for 7680x2160 against a 3840x2160 cap in the field). The
+ * renderer atlas never shrinks (#602), so growing for it would keep the
+ * oversized allocation for the rest of the session: clamp instead.
+ *
+ * @p tiles == 0 or @p cap == 0 (unknown) leaves @p inout_view alone. The
+ * result is never 0.
+ *
+ * @return true when @p inout_view was clamped.
+ */
+static inline bool
+u_tiling_clamp_view_to_atlas_cap(uint32_t tiles, uint32_t cap, uint32_t *inout_view)
+{
+	if (inout_view == NULL || tiles == 0 || cap == 0) {
+		return false;
+	}
+	if ((uint64_t)tiles * *inout_view <= cap) {
+		return false;
+	}
+	uint32_t v = cap / tiles;
+	*inout_view = v > 0 ? v : 1;
+	return true;
+}
+
 #ifdef __cplusplus
 }
 #endif

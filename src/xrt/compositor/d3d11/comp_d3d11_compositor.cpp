@@ -818,6 +818,10 @@ struct comp_d3d11_compositor
 	//! paths (comp_*_compositor_set_mode_fill_views); 0 = no limit.
 	uint32_t mode_fill_views;
 
+	//! The once-only WARN when a mode-derived view size had to be clamped to
+	//! the worst-case atlas (the per-frame view-size sync in layer_commit).
+	bool view_cap_clamp_warned;
+
 	//! Compromise view scale for legacy apps. Only valid when legacy_app_tile_scaling is true.
 	float legacy_view_scale_x;
 	float legacy_view_scale_y;
@@ -5670,67 +5674,6 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Get predicted eye positions
-	struct xrt_eye_positions eye_pos = {};
-	if (c->display_processor != nullptr || c->hub.active) {
-		if (c->hub.active) {
-			// #2317 P1b: the hub's weaver is this session's.
-			comp_hub_d3d11_get_predicted_eye_positions(c->hub.split, &eye_pos);
-		} else {
-			xrt_display_processor_d3d11_get_predicted_eye_positions(c->display_processor, &eye_pos);
-		}
-		if (eye_pos.valid) {
-			// N6 Part 1 (#2144): the per-frame answer feeds the ring, keyed
-			// by the time it was asked.
-			u_eye_history_push(&c->eye_hist, &eye_pos, (int64_t)os_monotonic_get_ns());
-		}
-	}
-	if (!eye_pos.valid) {
-		// Use view_count from the active rendering mode for the fallback
-		uint32_t fallback_count = 2;
-		if (c->xdev != NULL && c->xdev->hmd != NULL) {
-			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-			if (idx < c->xdev->rendering_mode_count) {
-				fallback_count = c->xdev->rendering_modes[idx].view_count;
-			}
-		}
-		if (fallback_count == 1) {
-			eye_pos.count = 1;
-			eye_pos.eyes[0] = {0.0f, 0.0f, 0.6f};
-		} else {
-			eye_pos.count = 2;
-			eye_pos.eyes[0] = {-0.032f, 0.0f, 0.6f};
-			eye_pos.eyes[1] = { 0.032f, 0.0f, 0.6f};
-		}
-	}
-
-	/*
-	 * #1580: the layer-composition camera set, snapshotted BEFORE the
-	 * active-mode clamp below. The clamp truncates the DP's set to the mode's
-	 * view count, which would turn a mono frame's two-eye set into "eye 0" and
-	 * so hand the quad camera the LEFT eye's off-axis frustum — while
-	 * xrLocateViews reports the CENTROID for the same frame. The resolver does
-	 * that collapse itself, from the full set.
-	 */
-	const struct xrt_eye_positions render_eyes = eye_pos;
-
-	// Sync hardware_display_3d and tile layout from device's active rendering mode
-	if (c->xdev != NULL && c->xdev->hmd != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-		if (idx < c->xdev->rendering_mode_count) {
-			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
-			c->hardware_display_3d = mode->hardware_display_3d;
-			// Clamp eye count to the active mode's view_count
-			if (eye_pos.count > mode->view_count) {
-				eye_pos.count = mode->view_count;
-			}
-			if (mode->tile_columns > 0 && c->renderer != NULL) {
-				comp_d3d11_renderer_set_tile_layout(
-				    c->renderer, mode->tile_columns, mode->tile_rows);
-			}
-		}
-	}
-
 	// Runtime-side 2D/3D toggle from qwerty V key
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	if (c->xsysd != nullptr) {
@@ -5788,6 +5731,81 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 #endif
+
+	/*
+	 * THE active mode for this frame: read ONCE, after the key paths above
+	 * (which may move it) and under c->mutex, and used by every per-frame
+	 * reader below — the eye-count fallback and clamp, the renderer's tile
+	 * layout, its view size and the zero-copy recipe. The V path used to run
+	 * BETWEEN the tile-layout sync and the view-size sync, so a V from 3D to 2D
+	 * gave one frame with mode 0's view size (3840x2160) on mode 1's 2x1 grid:
+	 * a 7680x2160 renderer atlas, twice the worst-case cap, and a content box
+	 * the cross-adapter bridge refused. The device's index can also be written
+	 * from the app's xrRequestDisplayRenderingModeDXR thread, so re-reading it
+	 * per site could tear the same way. The table itself is fixed for the
+	 * device's life (ADR-065), so the pointer stays valid.
+	 */
+	const struct xrt_rendering_mode *frame_mode = NULL;
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		if (idx < c->xdev->rendering_mode_count) {
+			frame_mode = &c->xdev->rendering_modes[idx];
+		}
+	}
+
+	// Get predicted eye positions
+	struct xrt_eye_positions eye_pos = {};
+	if (c->display_processor != nullptr || c->hub.active) {
+		if (c->hub.active) {
+			// #2317 P1b: the hub's weaver is this session's.
+			comp_hub_d3d11_get_predicted_eye_positions(c->hub.split, &eye_pos);
+		} else {
+			xrt_display_processor_d3d11_get_predicted_eye_positions(c->display_processor, &eye_pos);
+		}
+		if (eye_pos.valid) {
+			// N6 Part 1 (#2144): the per-frame answer feeds the ring, keyed
+			// by the time it was asked.
+			u_eye_history_push(&c->eye_hist, &eye_pos, (int64_t)os_monotonic_get_ns());
+		}
+	}
+	if (!eye_pos.valid) {
+		// Use view_count from the active rendering mode for the fallback
+		uint32_t fallback_count = 2;
+		if (frame_mode != NULL) {
+			fallback_count = frame_mode->view_count;
+		}
+		if (fallback_count == 1) {
+			eye_pos.count = 1;
+			eye_pos.eyes[0] = {0.0f, 0.0f, 0.6f};
+		} else {
+			eye_pos.count = 2;
+			eye_pos.eyes[0] = {-0.032f, 0.0f, 0.6f};
+			eye_pos.eyes[1] = { 0.032f, 0.0f, 0.6f};
+		}
+	}
+
+	/*
+	 * #1580: the layer-composition camera set, snapshotted BEFORE the
+	 * active-mode clamp below. The clamp truncates the DP's set to the mode's
+	 * view count, which would turn a mono frame's two-eye set into "eye 0" and
+	 * so hand the quad camera the LEFT eye's off-axis frustum — while
+	 * xrLocateViews reports the CENTROID for the same frame. The resolver does
+	 * that collapse itself, from the full set.
+	 */
+	const struct xrt_eye_positions render_eyes = eye_pos;
+
+	// Sync hardware_display_3d and tile layout from the frame's active mode
+	if (frame_mode != NULL) {
+		const struct xrt_rendering_mode *mode = frame_mode;
+		c->hardware_display_3d = mode->hardware_display_3d;
+		// Clamp eye count to the active mode's view_count
+		if (eye_pos.count > mode->view_count) {
+			eye_pos.count = mode->view_count;
+		}
+		if (mode->tile_columns > 0 && c->renderer != NULL) {
+			comp_d3d11_renderer_set_tile_layout(c->renderer, mode->tile_columns, mode->tile_rows);
+		}
+	}
 
 	// #439 Phase 3: frame mask state. Any XrCompositionLayerLocal2DDXR layer
 	// this frame raises an implicit mask (Q3) which, like an explicit one,
@@ -5890,11 +5908,9 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// view dims from atlas invariance, but actual mode dims may differ
 	// (e.g. 2D mode needs full display height). Resize if needed.
 	// Legacy apps: view dims are fixed at compromise scale, skip mode sync.
-	if (!c->legacy_app_tile_scaling &&
-	    c->xdev != NULL && c->xdev->hmd != NULL && c->renderer != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-		if (idx < c->xdev->rendering_mode_count) {
-			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+	if (!c->legacy_app_tile_scaling && frame_mode != NULL && c->renderer != NULL) {
+		{
+			const struct xrt_rendering_mode *mode = frame_mode;
 			if (mode->view_width_pixels > 0) {
 				uint32_t new_vw = mode->view_width_pixels;
 				uint32_t new_vh = mode->view_height_pixels;
@@ -5906,6 +5922,32 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					// derive view dims from actual window client area.
 					u_tiling_compute_canvas_view(mode, tgt_width, tgt_height,
 					                             &new_vw, &new_vh);
+				} else {
+					/*
+					 * The view size is the mode's own: the content it makes
+					 * with the mode's grid is, by construction, inside the
+					 * worst-case atlas across the modes. Hold that as a hard
+					 * bound: a size outside it means two halves of "the
+					 * active mode" disagree, and growing the atlas for it
+					 * would leave a past-the-cap allocation for the rest of
+					 * the session (it never shrinks, #602). Clamp, and say so
+					 * once. Canvas- and window-derived sizes above are left
+					 * alone: a window larger than the display may legitimately
+					 * ask for more than the cap (u_tiling_grow_atlas_extent).
+					 */
+					uint32_t cap_w = 0, cap_h = 0;
+					comp_d3d11_renderer_get_atlas_cap(c->renderer, &cap_w, &cap_h);
+					const bool cw = u_tiling_clamp_view_to_atlas_cap(mode->tile_columns, cap_w, &new_vw);
+					const bool ch = u_tiling_clamp_view_to_atlas_cap(mode->tile_rows, cap_h, &new_vh);
+					if ((cw || ch) && !c->view_cap_clamp_warned) {
+						c->view_cap_clamp_warned = true;
+						U_LOG_W("d3d11: mode %u '%s' view %ux%u x tiles %ux%u exceeds the worst-case atlas "
+						        "%ux%u - view clamped to %ux%u, the atlas is not grown past the cap "
+						        "(logged once)",
+						        mode->mode_index, mode->mode_name, mode->view_width_pixels,
+						        mode->view_height_pixels, mode->tile_columns, mode->tile_rows, cap_w, cap_h,
+						        new_vw, new_vh);
+					}
 				}
 				uint32_t cur_vw, cur_vh;
 				comp_d3d11_renderer_get_view_dimensions(c->renderer, &cur_vw, &cur_vh);
@@ -5940,12 +5982,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	void *zc_srv = nullptr;
 	// #2317 P1b: nor under the hub — the hub opens the RENDERER atlas.
 	if (!c->split_active && !c->hub.active) {
-		const struct xrt_rendering_mode *mode = NULL;
-		if (c->xdev != NULL && c->xdev->hmd != NULL) {
-			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-			if (idx < c->xdev->rendering_mode_count)
-				mode = &c->xdev->rendering_modes[idx];
-		}
+		const struct xrt_rendering_mode *mode = frame_mode;
 		if (mode != NULL && c->layer_accum.layer_count == 1) {
 			struct comp_layer *layer = &c->layer_accum.layers[0];
 			if (layer->data.type == XRT_LAYER_PROJECTION ||
