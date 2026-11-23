@@ -151,6 +151,80 @@ public class VerdictTests
         Assert.Null(row.Driver);
     }
 
+    /// <summary>
+    /// A PC with no 3D display: the simulated display driver claims every display (at FALLBACK, so apps
+    /// run anywhere). That is not a 3D display: Home says "No 3D display found", calmly, with a link to
+    /// the simulated display's options.
+    /// </summary>
+    private static StatusSnapshot SimOnly()
+    {
+        var sim = OneIdle.Plugins.Single(p => p.Id == "sim-display") with { Load = "ACTIVE" };
+        var screen = OneIdle.Screens[0] with { Claim = OneIdle.Screens[0].Claim with { PluginId = "sim-display", Confidence = "FALLBACK" } };
+        return OneIdle with { Plugins = new[] { sim }, Screens = new[] { screen } };
+    }
+
+    [Fact]
+    public void OnlyTheSimulatedDriver_IsNo3DDisplay_AndNothingIsWrong()
+    {
+        var v = Verdicts.From(SimOnly(), null, DxrRuntime);
+        Assert.Equal(VerdictKind.No3DDisplay, v.Kind);
+        Assert.Equal("No 3D display found", v.Headline);
+        Assert.Equal("DisplayXR apps show in normal 2D on this PC. Nothing is wrong.", v.Subline);
+        Assert.Equal(Level.Info, v.Level); // not a warning
+        Assert.Equal("sim-display", v.SimulatedDriverId);
+        var row = Assert.Single(v.Rows);
+        Assert.False(row.Is3D); // an ordinary display, not "3D display recognised"
+        Assert.Empty(row.Facts);
+
+        // Something that does need attention is still counted after the sentence.
+        var off = Verdicts.From(SimOnly() with { Source = "headless" }, null, DxrRuntime);
+        Assert.Equal(VerdictKind.No3DDisplay, off.Kind);
+        Assert.StartsWith(Verdicts.SimulatedOnlyLine + " 1 thing needs attention.", off.Subline);
+    }
+
+    [Fact]
+    public void ARealDriverRecognised_IsNeverReportedMissing()
+    {
+        // The real driver claims the display, the simulated one is installed beside it: the usual verdict.
+        var v = Verdicts.From(OneIdle, null, DxrRuntime);
+        Assert.Equal(VerdictKind.Ready, v.Kind);
+        Assert.Null(v.SimulatedDriverId);
+
+        // Two displays: the 3D one claimed by the real driver, the other by the simulated one.
+        var two = OneIdle with
+        {
+            Plugins = Design.Plugins.Select(p => p with { Load = "ACTIVE" }).ToArray(),
+            Screens = new[] { OneIdle.Screens[0], SimOnly().Screens[0] with { Id = "other", Roles = OneIdle.Screens[0].Roles with { OsMain = false } } },
+        };
+        var tv = Verdicts.From(two, null, DxrRuntime);
+        Assert.Equal(VerdictKind.Ready, tv.Kind);
+        Assert.Equal("Your 3D display is ready", tv.Headline); // one 3D display; the other is ordinary
+        Assert.Equal(new[] { true, false }, tv.Rows.Select(r => r.Is3D));
+        Assert.Null(tv.SimulatedDriverId);
+
+        // The simulated driver chosen for a display on purpose (a per-display override): a display DisplayXR
+        // found, kept as recognised.
+        var forced = SimOnly() with { Screens = new[] { SimOnly().Screens[0] with { Claim = SimOnly().Screens[0].Claim with { Forced = true } } } };
+        Assert.NotEqual(VerdictKind.No3DDisplay, Verdicts.From(forced, null, DxrRuntime).Kind);
+
+        // A real driver is active but claims nothing (and no display at all is claimed): the general sentence.
+        var flat = OneIdle.Screens[0] with { Claim = OneIdle.Screens[0].Claim with { PluginId = null, Confidence = "NONE" } };
+        var none = Verdicts.From(OneIdle with { Screens = new[] { flat } }, null, DxrRuntime);
+        Assert.Equal(VerdictKind.No3DDisplay, none.Kind);
+        Assert.StartsWith("None of your displays is recognised as a 3D display.", none.Subline);
+        Assert.Null(none.SimulatedDriverId);
+    }
+
+    [Fact]
+    public void IsSimulated_ByTheSnapshotsFallbackFlag_ElseByTheId()
+    {
+        var s = SimOnly();
+        Assert.True(Verdicts.IsSimulated(s, "sim-display"));
+        Assert.False(Verdicts.IsSimulated(Design, "leia-sr"));
+        Assert.True(Verdicts.IsSimulated(s with { Plugins = Array.Empty<PluginInfo>() }, "sim-display")); // not listed: by id
+        Assert.False(Verdicts.IsSimulated(s, null));
+    }
+
     [Fact]
     public void Checking_BeforeTheFirstSnapshot()
     {

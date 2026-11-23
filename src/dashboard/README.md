@@ -35,7 +35,12 @@ behind a Details toggle.
   headline never says 3D is on. Headlines: *3D is working on N display(s)*; *Your 3D display is
   ready* / *3D turns on when a 3D app runs.* (idle); *3D is off: N thing(s) need fixing*; *Your 3D
   display is recognised* (background service not reached); *No 3D display found*; *No display
-  found*. "Needs attention" is built only from what is already read: every warn / critical warning
+  found*. A display claimed only by the simulated display driver (the snapshot's `plugins[].fallback`
+  driver, which claims every display at `FALLBACK` so apps run anywhere) is an ordinary display, not
+  a recognised 3D display, unless that driver was chosen for it (`claim.forced`). When the simulated
+  driver is the only display driver in use, *No 3D display found* reads "DisplayXR apps show in normal
+  2D on this PC. Nothing is wrong." (an info level, not a warning) with a **Try a 3D preview** link to
+  that driver's Details on Components, where its Options are (`Verdicts.OnlySimulated`). "Needs attention" is built only from what is already read: every warn / critical warning
   of the snapshot (the runtime's codes in plain words, a display maker's own warning quoted), the
   background service not reached, a failed "Check my setup", and another program set as the active
   OpenXR runtime. Its only buttons are ones the Dashboard already had (Open Displays, Open

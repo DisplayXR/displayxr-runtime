@@ -116,7 +116,19 @@ public sealed class ComponentsPage : Page
     /// <summary>Asked to open one catalog item (<c>--catalog-item</c>): its row's detail, once the list is here.</summary>
     private void ConsumeFocus()
     {
-        if (Ctx.CatalogFocus is not { } f || Ctx.CatalogRead is null) return;
+        if (Ctx.CatalogFocus is not { } f) return;
+        // An installed component by class and id (Home's "Try a 3D preview"): its row's key is known
+        // without the catalog, so it opens at once.
+        if (f.ItemId is null && f.Class is { } fc && f.ComponentId is { } fid && ComponentRows.CatalogClassOf(fc.SectionId()) is { } cc)
+        {
+            Ctx.CatalogFocus = null;
+            _filter = RowFilter.All;
+            _open.Add(ComponentRows.KeyOf(cc, fid));
+            // Posted: this runs inside Key(), and a load announces itself at once.
+            if (fc == ComponentClass.Display) Dispatcher.UIThread.Post(() => _ = Ctx.LoadDriverOptionsAsync(fid));
+            return;
+        }
+        if (Ctx.CatalogRead is null) return;
         Ctx.CatalogFocus = null;
         var list = Source().List;
         var item = f.ItemId is not null ? list?.Find(f.ItemId)
