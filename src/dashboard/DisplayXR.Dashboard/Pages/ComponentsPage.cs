@@ -922,6 +922,9 @@ public sealed class ComponentsPage : Page
         if (open)
         {
             var detail = U.VStack(14);
+            // A display driver's Options first: what an owner opens Details for. Then the technical
+            // labelled lines, the scope / command-line notes, the catalog detail, the removal sentence.
+            if (driverId is not null) detail.Children.Add(OptionsBlockView(driverId, row.Name));
             if (facts.Length > 0)
             {
                 var kv = new U.KvList(130);
@@ -934,7 +937,6 @@ public sealed class ComponentsPage : Page
                 foreach (var (text, command) in notes) policyLines.Children.Add(U.Wrapped(text, command ? "mono" : "meta"));
                 detail.Children.Add(policyLines);
             }
-            if (driverId is not null) detail.Children.Add(OptionsBlockView(driverId, row.Name));
             if (catalog is not null) detail.Children.Add(Detail(row, catalog));
             // How a row that cannot be removed from here is removed: the last line of Details.
             if (row.RemoveNote is { } note) detail.Children.Add(U.Wrapped(note, "meta"));
