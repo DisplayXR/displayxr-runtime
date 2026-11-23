@@ -2468,6 +2468,55 @@ session_display_dims_m(struct multi_compositor *mc, float *out_w_m, float *out_h
 	return true;
 }
 
+#ifdef XRT_BUILD_DRIVER_QWERTY
+/*!
+ * One path for the runtime's mode keys (ADR-065): V (@p toggle) and '0' / '1'
+ * (@p selected). A digit does exactly what V does for the same target: the
+ * active-index write, OUTPUT_MODE for a driver that implements it, and the
+ * hardware 2D/3D request a driver that does NOT implement OUTPUT_MODE needs to
+ * switch at all (before, a digit only set OUTPUT_MODE). No fill limit on this
+ * path (as for V here before). @p set_hw_flag: also record the hardware state
+ * in mc->hardware_display_3d (the per-session render path).
+ *
+ * @p toggle_sets_output_mode: whether V also passes the index to the driver as
+ * OUTPUT_MODE. False on the shared transfer path: that runs under
+ * list_and_timing_lock (and render_lock), and xrt_device_set_property goes
+ * through the rendering-mode remap's own lock into arbitrary driver code, so
+ * V there keeps its previous behaviour (index write + hardware request, no
+ * OUTPUT_MODE). Digits set OUTPUT_MODE on both paths, as they did before.
+ */
+static void
+multi_apply_mode_key(struct multi_compositor *mc,
+                     bool toggle,
+                     int selected,
+                     bool qwerty_force_2d,
+                     bool set_hw_flag,
+                     bool toggle_sets_output_mode)
+{
+	struct xrt_device *head = mc->xsysd->static_roles.head;
+	const bool have_table = head != NULL && head->hmd != NULL;
+	const struct u_rendering_mode_key_decision d = u_rendering_modes_decide_key(
+	    have_table ? head->rendering_modes : NULL, have_table ? head->rendering_mode_count : 0,
+	    have_table ? head->hmd->active_rendering_mode_index : 0, toggle, (int32_t)selected, qwerty_force_2d, 0);
+	switch (d.action) {
+	case U_RENDERING_MODE_KEY_APPLY:
+		head->hmd->active_rendering_mode_index = d.target;
+		if (!toggle || toggle_sets_output_mode) {
+			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)d.target);
+		}
+		if (set_hw_flag) {
+			mc->hardware_display_3d = d.want_3d;
+		}
+		multi_compositor_request_display_mode(mc, d.want_3d);
+		break;
+	case U_RENDERING_MODE_KEY_HARDWARE_ONLY: multi_compositor_request_display_mode(mc, d.want_3d); break;
+	case U_RENDERING_MODE_KEY_REFUSED: // fill limit 0: never refused here
+	case U_RENDERING_MODE_KEY_NOTHING:
+	default: break;
+	}
+}
+#endif
+
 #ifdef COMP_MULTI_PER_SESSION_TARGET
 /*!
  * Physical size, in meters, of THIS client's window surface (Tier-2, #59). The
@@ -2926,55 +2975,6 @@ update_window_screen_rect(struct multi_compositor *mc)
 	(void)mc;
 #endif
 }
-
-#ifdef XRT_BUILD_DRIVER_QWERTY
-/*!
- * One path for the runtime's mode keys (ADR-065): V (@p toggle) and '0' / '1'
- * (@p selected). A digit does exactly what V does for the same target: the
- * active-index write, OUTPUT_MODE for a driver that implements it, and the
- * hardware 2D/3D request a driver that does NOT implement OUTPUT_MODE needs to
- * switch at all (before, a digit only set OUTPUT_MODE). No fill limit on this
- * path (as for V here before). @p set_hw_flag: also record the hardware state
- * in mc->hardware_display_3d (the per-session render path).
- *
- * @p toggle_sets_output_mode: whether V also passes the index to the driver as
- * OUTPUT_MODE. False on the shared transfer path: that runs under
- * list_and_timing_lock (and render_lock), and xrt_device_set_property goes
- * through the rendering-mode remap's own lock into arbitrary driver code, so
- * V there keeps its previous behaviour (index write + hardware request, no
- * OUTPUT_MODE). Digits set OUTPUT_MODE on both paths, as they did before.
- */
-static void
-multi_apply_mode_key(struct multi_compositor *mc,
-                     bool toggle,
-                     int selected,
-                     bool qwerty_force_2d,
-                     bool set_hw_flag,
-                     bool toggle_sets_output_mode)
-{
-	struct xrt_device *head = mc->xsysd->static_roles.head;
-	const bool have_table = head != NULL && head->hmd != NULL;
-	const struct u_rendering_mode_key_decision d = u_rendering_modes_decide_key(
-	    have_table ? head->rendering_modes : NULL, have_table ? head->rendering_mode_count : 0,
-	    have_table ? head->hmd->active_rendering_mode_index : 0, toggle, (int32_t)selected, qwerty_force_2d, 0);
-	switch (d.action) {
-	case U_RENDERING_MODE_KEY_APPLY:
-		head->hmd->active_rendering_mode_index = d.target;
-		if (!toggle || toggle_sets_output_mode) {
-			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)d.target);
-		}
-		if (set_hw_flag) {
-			mc->hardware_display_3d = d.want_3d;
-		}
-		multi_compositor_request_display_mode(mc, d.want_3d);
-		break;
-	case U_RENDERING_MODE_KEY_HARDWARE_ONLY: multi_compositor_request_display_mode(mc, d.want_3d); break;
-	case U_RENDERING_MODE_KEY_REFUSED: // fill limit 0: never refused here
-	case U_RENDERING_MODE_KEY_NOTHING:
-	default: break;
-	}
-}
-#endif
 
 /*!
  * Render a single per-session client to its own comp_target using display processing.
