@@ -407,8 +407,9 @@ field".
 
 ## The `leia_conversion` and `ultraleap` fields
 
-Two providers that ship from their own repositories and have **no release yet**
-(2026-11):
+Two providers that ship from their own repositories. `leia_conversion` had its
+first release on 2026-11-23 (v0.1.0) and is an ordinary pinned field since;
+`ultraleap` has **no release yet**:
 
 | Field | Repository | What it is | Bump gate |
 |---|---|---|---|
@@ -473,6 +474,12 @@ After the first release, delete the name from `FIRST_RELEASE_FIELDS` and from bo
 `COMPONENTS_AWAITING_FIRST_RELEASE` lists, so a missing pin is an error again.
 `scripts/tests/test_component_tables.py` fails while the three disagree, and
 `test_apply_versions_bump.py` fails while a pinned field is still in the table.
+That second failure is on `main` and on every PR from the moment the bump lands,
+so the cleanup is the next change after a first release, not a later one.
+
+`ultraleap` is the one component in this state today. `leia_conversion` was, until
+its first release (v0.1.0) added the field; it is `ultraleap`'s preferred neighbour
+in `FIRST_RELEASE_FIELDS`, so the two provider pins sit together.
 
 The mirror to `displayxr-installer` needs nothing special: the bump's own mirror
 step copies the file byte for byte, new key included.
@@ -591,7 +598,7 @@ known-good matrix that's been continuously curated by this flow.
 | ABI mismatch on runtime self-bump | Bump skipped, issue opened on leia repo | Rebuild leia + tag, *then* re-run `workflow_dispatch` on `versions-bump.yml` with `field=runtime, tag=<this runtime tag>` |
 | ABI gate could not run (rc 2: network after retries, missing tag/file, unparsable header) | Job fails red with `::error::`; no bump, no issue | Fix the cause, then re-run the failed job (runtime self-bump) or the `versions-bump.yml` run (leia bump) |
 | A `versions.json` field is edited by hand and merged as an ordinary PR | `versions-mirror.yml` mirrors it to `displayxr-installer` within ~1 min of the merge | None needed. Before that workflow existed this silently blocked every bundle release (`assert-versions-in-sync`) until the next component bump |
-| First release of `leia_conversion` / `ultraleap`: the field is not in `versions.json` | The bump **adds** it (`ADDED` in the log) and mirrors it | Before that release, list the field in `displayxr-installer`'s `$IntentionallyUnbundled`; after it, drop the name from `FIRST_RELEASE_FIELDS` and `COMPONENTS_AWAITING_FIRST_RELEASE` |
+| First release of `ultraleap` (as `leia_conversion`'s was): the field is not in `versions.json` | The bump **adds** it (`ADDED` in the log) and mirrors it | Before that release, list the field in `displayxr-installer`'s `$IntentionallyUnbundled`; after it, drop the name from `FIRST_RELEASE_FIELDS` and `COMPONENTS_AWAITING_FIRST_RELEASE` |
 | Any other field that is not in `versions.json` is dispatched | Run fails: `versions.json has no field '<field>'` | Add the field in a PR (with its `components.sh` rows), or fix the sender's payload |
 | ABI mismatch on a `leia_conversion` / `ultraleap` bump | Run fails red; no bump, no issue | Rebuild the provider against the current runtime headers, tag a new release |
 | Sibling repo forgets the dispatch step | `versions.json` doesn't update | Manual `workflow_dispatch` on `versions-bump.yml` with the field + tag, then fix the sibling repo's release workflow |

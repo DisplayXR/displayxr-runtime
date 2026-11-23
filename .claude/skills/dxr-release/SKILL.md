@@ -69,15 +69,19 @@ from cwd — that's the old cwd-detecting behavior this skill replaced.
 | `earthview` / `demo-earthview` | `DisplayXR/displayxr-demo-earthview` | `earthview_demo` | `build-macos.yml` | same repo |
 | `unity` | `DisplayXR/displayxr-unity` | *(none — not pinned)* | `build-native.yml` | same repo |
 
-**`leia-conversion` and `ultraleap` have no release yet** (2026-11). Three things differ
-until each has one:
-- **`versions.json` has no field for them.** That is deliberate: a pin naming a tag that does
-  not exist breaks `setup-displayxr` and `displayxr-installer`'s coverage check. The first
-  release's `versions-bump` dispatch **adds** the field (`scripts/apply_versions_bump.py`,
-  `FIRST_RELEASE_FIELDS`), so Phase 4 reports `ADDED`, not `BUMPED`, and the commit subject
-  still reads `bump <field> → <tag>`. After that first release, remove the field from
-  `FIRST_RELEASE_FIELDS` and from `COMPONENTS_AWAITING_FIRST_RELEASE` (`components.sh` and
-  the `.bat`); `scripts/tests/test_component_tables.py` fails until all three agree.
+**`leia-conversion` has been released** (v0.1.0, 2026-11-23): `leia_conversion` is an
+ordinary pinned field and Phase 4 reports `BUMPED` for it. **`ultraleap` has no release
+yet.** The first two points below apply to `ultraleap` until it has one; the third holds
+for both providers on every release:
+- **`versions.json` has no `ultraleap` field.** That is deliberate: a pin naming a tag that
+  does not exist breaks `setup-displayxr` and `displayxr-installer`'s coverage check. The
+  first release's `versions-bump` dispatch **adds** the field
+  (`scripts/apply_versions_bump.py`, `FIRST_RELEASE_FIELDS`), so Phase 4 reports `ADDED`,
+  not `BUMPED`, and the commit subject still reads `bump <field> → <tag>`. After that first
+  release, remove the field from `FIRST_RELEASE_FIELDS` and from
+  `COMPONENTS_AWAITING_FIRST_RELEASE` (`components.sh` and the `.bat`);
+  `scripts/tests/test_apply_versions_bump.py` and `test_component_tables.py` fail on `main`
+  and on every PR until that is done.
 - **Before the first tag, `displayxr-installer` must already list the field** in
   `$IntentionallyUnbundled` (`scripts/check_bundle_coverage.ps1`). Otherwise the mirrored
   `versions.json` fails that repo's `build-bundle.yml` on the new key.
