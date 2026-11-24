@@ -262,6 +262,31 @@ comp_segments_decide(bool have_dp, bool dp_tolerates_resample, enum comp_seg_1to
 	return COMP_SEG_RENDER_WEAVE;
 }
 
+enum comp_seg_surface_hold
+comp_segments_surface_hold(bool on_primary,
+                           bool per_screen,
+                           bool surface_resampled,
+                           bool session_dp_tolerates,
+                           enum comp_seg_dp_resample window_screen_dp)
+{
+	if (on_primary) {
+		return (surface_resampled && !session_dp_tolerates) ? COMP_SEG_SURFACE_HOLD_YES
+		                                                    : COMP_SEG_SURFACE_HOLD_NO;
+	}
+	if (!per_screen) {
+		return COMP_SEG_SURFACE_HOLD_YES;
+	}
+	if (!surface_resampled) {
+		return COMP_SEG_SURFACE_HOLD_NO;
+	}
+	switch (window_screen_dp) {
+	case COMP_SEG_DP_RESAMPLE_TOLERATES: return COMP_SEG_SURFACE_HOLD_NO;
+	case COMP_SEG_DP_RESAMPLE_NEEDS_1TO1: return COMP_SEG_SURFACE_HOLD_YES;
+	case COMP_SEG_DP_RESAMPLE_UNKNOWN:
+	default: return COMP_SEG_SURFACE_HOLD_KEEP;
+	}
+}
+
 static void
 sort_i32(int32_t *v, uint32_t n)
 {

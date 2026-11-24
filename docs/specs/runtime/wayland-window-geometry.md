@@ -615,26 +615,38 @@ seen, which is what it had before.
   the other monitor is resampled: the per-segment 1:1 policy applies (a
   resample-tolerant DP weaves it, a lenticular weave gets flat 2D).
 
-  **What the in-process compositor does today, without that change: views
-  only.** The payload's logical origins (`content_logical_*`, `mon_logical_*`)
-  plus the screen list's X11 rect, device mode and scale are enough to place
-  every screen in the window's own pixel frame — the same projection the
-  service weave engine applies to a present-owner
+  **What the in-process compositor does today, without that change: it
+  weaves per screen.** The payload's logical origins (`content_logical_*`,
+  `mon_logical_*`) plus the screen list's X11 rect, device mode and scale are
+  enough to place every screen in the window's own pixel frame — the same
+  projection the service weave engine applies to a present-owner
   (`comp_weave_screens_project`, LOGICAL rule). The vk_native compositor does
   that (`comp_weave_screens_project_monitor_relative`) and accepts the result
   only when exactly one projected screen lands where the payload says the
   window's monitor is, at that monitor's device size (±1 px); otherwise it
-  logs one WARN and keeps the old behaviour. With a placement, the segment
-  manager cuts the table and runs its DP lifecycle, and a window **wholly on
-  one other screen** publishes that one-segment table, so `xrLocateViews`
-  frames it for that screen: that screen's DP's eyes (a sim-display segment
-  DP reports the nominal viewer) and its size, instead of the 3D panel's
-  tracked eyes and a panel-centred frustum (ADR-047). The FRAME is
-  unchanged: no per-segment weave, the #1595 1:1 hold, the #1654 off-panel
-  bands, no present origin and no drop-time snap off the panel. A window
-  straddling two screens publishes nothing yet (its one woven picture would
-  not match per-segment views); that, and weaving per segment, still wait
-  for the extension change above.
+  logs one WARN and keeps the single-DP path (the #1595 hold off the panel,
+  the #1654 off-panel bands).
+
+  With a placement, a window that is not wholly on the 3D panel is woven per
+  screen, exactly as the service weave engine weaves a present-owner
+  ("Per-screen display processors", #2218 item 6): each screen's part by that
+  screen's own DP in the app's 2D/3D mode (a window wholly on the laptop
+  screen is drawn by the laptop's DP — sim-display's anaglyph, say), the
+  panel's part by the session's DP, the part on no claimed screen flat. The
+  1:1 rule is per DP, not per session (`comp_segments_surface_hold`): a
+  segment whose screen resamples the window is flat only when its DP needs 1:1
+  pixels (`comp_segments_decide`; the panel's part included, judged by the
+  panel's own scale), and the session-wide 2D hold now fires off the panel only
+  when the buffer itself is resampled and the window's screen's DP needs 1:1.
+  The panel's lens still goes 2D when the window leaves it (#2247); the app's
+  mode is the app's. `xrLocateViews` takes the table like X11 does: per-segment
+  views for a multiview app, the majority screen's frame for a one-view-set
+  (`PRIMARY_STEREO`) app, and a window wholly on another screen that screen's
+  DP's eyes and size. On the panel nothing changes — present origin, drag
+  snap, MOVE SYNC (#1596, #1654). A straddling window whose own monitor is not
+  the panel phases the panel's DP from the panel segment's present origin in
+  the projected frame (the service engine's panel-relative origin), and only
+  where the panel is 1:1 for the window.
 
 ## 6. Capture exclusion — `org.displayxr.CaptureExclusion1` (extension version 2)
 

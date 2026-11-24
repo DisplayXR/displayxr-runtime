@@ -22,10 +22,12 @@
  * single-DP path.
  *
  * Scope: desktop Linux, X11/XWayland (root coordinates are desktop-absolute),
- * and Windows (multi-screen M6: the window rect is the client area from
- * ClientToScreen in device px). Native Wayland stays primary-only until the
- * window-geometry service reports a desktop rect
- * (docs/specs/runtime/wayland-window-geometry.md, follow-up).
+ * native Wayland (the screens are projected into the window's own pixel frame
+ * from the window-geometry service's monitor-relative rect,
+ * comp_weave_screens_project_monitor_relative — the frame the service weave
+ * engine uses; docs/specs/runtime/wayland-window-geometry.md), and Windows
+ * (multi-screen M6: the window rect is the client area from ClientToScreen in
+ * device px).
  *
  * Also used OUT of process (#2218 item 6): the desktop-Linux service's
  * XR_DXR_weave present-owner engine (compositor/multi/comp_multi_weave_linux.c)
@@ -289,6 +291,19 @@ struct comp_vk_native_segments_frame
 	//! caller has already fed it this frame's present origin, background,
 	//! timing and atlas encoding.
 	struct xrt_display_processor *primary_dp;
+
+	/*!
+	 * Judge the primary segment by its own screen's 1:1 too
+	 * (@ref comp_segments_decide with @ref primary_tolerates_resample), the
+	 * rule every other segment follows. false (X11, Windows, the service):
+	 * the primary's gate is the session-level one, already applied to the
+	 * frame's layout. Native Wayland sets it: there the session gate judges
+	 * the window's OWN monitor, so a window mostly on another screen at a
+	 * different scale would otherwise have its panel part woven resampled.
+	 */
+	bool primary_gate_per_segment;
+	//! The primary DP survives a resample (read with @ref primary_gate_per_segment).
+	bool primary_tolerates_resample;
 };
 
 /*!

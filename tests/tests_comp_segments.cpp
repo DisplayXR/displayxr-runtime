@@ -255,6 +255,55 @@ TEST_CASE("comp_segments: 1:1 policy")
 	CHECK(comp_segments_decide(true, false, COMP_SEG_1TO1_UNKNOWN) == COMP_SEG_RENDER_WEAVE);
 }
 
+TEST_CASE("comp_segments: per-DP surface hold (native Wayland, #1595 per screen)")
+{
+	const auto U = COMP_SEG_DP_RESAMPLE_UNKNOWN;
+	const auto N = COMP_SEG_DP_RESAMPLE_NEEDS_1TO1;
+	const auto T = COMP_SEG_DP_RESAMPLE_TOLERATES;
+	const auto YES = COMP_SEG_SURFACE_HOLD_YES;
+	const auto NO = COMP_SEG_SURFACE_HOLD_NO;
+	const auto KEEP = COMP_SEG_SURFACE_HOLD_KEEP;
+
+	SECTION("on the panel: the shipped rule, whatever the other screens' DPs say")
+	{
+		for (auto w : {U, N, T}) {
+			for (bool ps : {false, true}) {
+				// 1:1 surface: weave.
+				CHECK(comp_segments_surface_hold(true, ps, false, false, w) == NO);
+				CHECK(comp_segments_surface_hold(true, ps, false, true, w) == NO);
+				// Resampled: the panel's lenticular DP holds, a tolerant one weaves.
+				CHECK(comp_segments_surface_hold(true, ps, true, false, w) == YES);
+				CHECK(comp_segments_surface_hold(true, ps, true, true, w) == NO);
+			}
+		}
+	}
+	SECTION("off the panel, no per-screen weave: held 2D as before")
+	{
+		for (auto w : {U, N, T}) {
+			for (bool rs : {false, true}) {
+				for (bool st : {false, true}) {
+					CHECK(comp_segments_surface_hold(false, false, rs, st, w) == YES);
+				}
+			}
+		}
+	}
+	SECTION("off the panel, woven per screen: the window's screen's DP decides")
+	{
+		// The laptop case: a 1:1 surface is never held — the app's mode is
+		// drawn by the laptop's DP, the session DP's tolerance is irrelevant.
+		for (auto w : {U, N, T}) {
+			CHECK(comp_segments_surface_hold(false, true, false, false, w) == NO);
+			CHECK(comp_segments_surface_hold(false, true, false, true, w) == NO);
+		}
+		// A resampled surface: anaglyph weaves, interlaced holds, unknown keeps.
+		CHECK(comp_segments_surface_hold(false, true, true, false, T) == NO);
+		CHECK(comp_segments_surface_hold(false, true, true, false, N) == YES);
+		CHECK(comp_segments_surface_hold(false, true, true, false, U) == KEEP);
+		// ...and the session (panel) DP's tolerance plays no part there.
+		CHECK(comp_segments_surface_hold(false, true, true, true, N) == YES);
+	}
+}
+
 namespace {
 
 comp_segment_table

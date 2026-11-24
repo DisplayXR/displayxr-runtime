@@ -1512,6 +1512,11 @@ comp_vk_native_segments_record(struct comp_vk_native_segments *segs,
 			// (#1595 / #1831), already applied to the frame's layout.
 			dp_of[k] = f->primary_dp;
 			weave[k] = f->primary_dp != NULL;
+			if (f->primary_gate_per_segment) {
+				// Native Wayland: its screen's 1:1 as well (see the field).
+				weave[k] = comp_segments_decide(f->primary_dp != NULL, f->primary_tolerates_resample,
+				                                g->screen_1to1) == COMP_SEG_RENDER_WEAVE;
+			}
 		} else if (st_of[k] != NULL) {
 			dp_of[k] = st_of[k]->dp;
 			weave[k] = comp_segments_decide(dp_of[k] != NULL, st_of[k]->tolerates_resample, g->screen_1to1) ==

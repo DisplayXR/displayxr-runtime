@@ -384,6 +384,68 @@ comp_segments_window_is_split(const struct comp_seg_rect *window_desktop,
 enum comp_seg_render
 comp_segments_decide(bool have_dp, bool dp_tolerates_resample, enum comp_seg_1to1 screen_1to1);
 
+/*!
+ * What a display processor's output says about a resample, as far as the
+ * caller knows it (the DP may not exist yet: segment DPs are created with
+ * hysteresis).
+ */
+enum comp_seg_dp_resample
+{
+	//! No DP to ask yet (or none at all): no evidence either way.
+	COMP_SEG_DP_RESAMPLE_UNKNOWN = 0,
+	//! The DP needs 1:1 pixels (a lenticular weave, sim_display INTERLACED).
+	COMP_SEG_DP_RESAMPLE_NEEDS_1TO1 = 1,
+	//! The DP's output survives a resample (anaglyph, SBS, blend).
+	COMP_SEG_DP_RESAMPLE_TOLERATES = 2,
+};
+
+/*!
+ * The verdict of @ref comp_segments_surface_hold.
+ */
+enum comp_seg_surface_hold
+{
+	//! Weave: no runtime 2D hold for the surface.
+	COMP_SEG_SURFACE_HOLD_NO = 0,
+	//! Hold the session at flat 2D (#1595: refuse rather than resample).
+	COMP_SEG_SURFACE_HOLD_YES = 1,
+	//! No evidence: keep whatever the session does now (never degrade on ignorance).
+	COMP_SEG_SURFACE_HOLD_KEEP = 2,
+};
+
+/*!
+ * The in-process native-Wayland 1:1 hold (#1595), per display processor
+ * rather than per session — the #1654 off-panel rule, per screen, as the
+ * desktop-Linux service weave engine applies it to a present-owner
+ * (comp_multi_weave_linux.c, "Per-screen display processors").
+ *
+ * @param on_primary            The window's own monitor is the primary screen
+ *                              (the one the session's DP weaves).
+ * @param per_screen            The window can be woven per screen: placed
+ *                              against the screen list, segmentation enabled,
+ *                              and a DP path the split can record.
+ * @param surface_resampled     The buffer does not land 1:1 in the region the
+ *                              display server paints it into (wrong buffer
+ *                              size, or a surface spilling past its frame).
+ * @param session_dp_tolerates  The session's DP survives a resample.
+ * @param window_screen_dp      The DP of the window's own monitor, when that
+ *                              is not the primary screen.
+ *
+ * - On the primary screen: hold exactly when the surface is resampled and the
+ *   session's DP needs 1:1 — the shipped rule, unchanged.
+ * - Off it, with no per-screen weave: hold (no DP of that screen can draw it;
+ *   the shipped "not on the 3D panel" rule).
+ * - Off it, woven per screen: the window's screen's DP decides. A 1:1 surface
+ *   never holds (each segment is then judged by @ref comp_segments_decide on
+ *   its own screen's scale); a resampled one holds only for a DP needing 1:1,
+ *   and keeps the current state while that DP is not known yet.
+ */
+enum comp_seg_surface_hold
+comp_segments_surface_hold(bool on_primary,
+                           bool per_screen,
+                           bool surface_resampled,
+                           bool session_dp_tolerates,
+                           enum comp_seg_dp_resample window_screen_dp);
+
 //! Max rectangles @ref comp_segments_uncovered emits.
 #define COMP_SEGMENTS_MAX_UNCOVERED 32
 
