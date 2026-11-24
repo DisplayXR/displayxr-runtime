@@ -1948,6 +1948,37 @@ if (frameState.shouldRender) {
 }
 ```
 
+### Proposed, not implemented: the mode table can change under a running session
+
+> **Status: proposed, not implemented.** Design:
+> [ADR-047 Amendment 10](../../adr/ADR-047-multi-screen-segments-and-per-screen-views.md#amendment-10-2026-11-23-the-view-size-follows-the-windows-screen)
+> and [ADR-066](../../adr/ADR-066-live-display-driver-settings-envelope-sizing.md). Nothing below
+> is in the current header (`SPEC_VERSION` 26). Each item takes the next `SPEC_VERSION` when it
+> lands, and the numbers are not reserved.
+
+- **`XrEventDataRenderingModeChangedDXR` with `previousModeIndex == currentModeIndex`** will mean
+  "the active mode's table changed: re-read `xrEnumerateDisplayRenderingModesDXR` and retile; your
+  swapchain is still large enough". The runtime will send it in two cases:
+  - when the window moves to a screen whose display renders the app's current mode at a different
+    view size (ADR-047 Amendment 10);
+  - when the user switches the screen's display configuration in the Dashboard or the CLI
+    (ADR-066 C1).
+
+  The active index does not change: the app keeps its 2D/3D state. No struct changes. An app that
+  ignores the event keeps its old tile size, and the runtime resamples what it submits.
+- **A read-only worst-case statement**: the atlas size and view count over every mode the display
+  drivers declare. Apps size their swapchain from it instead of from the two enumerated modes
+  (ADR-066 C1.6). Its placement, chained on the enumerate or on `XrSystemProperties`, is open.
+- **A new event, "the mode table changed: recreate your swapchains"** (working name
+  `XrEventDataRenderingModeTableChangedDXR`), sent only when a change falls outside every declared
+  mode, for example a display driver installed while the app runs (ADR-066 C2). It is the only event
+  from which an app may call `xrCreateSwapchain`. An app that does not answer it keeps its old
+  swapchain, and the runtime resamples into the new mode.
+
+Unchanged: `PRIMARY_MULTIVIEW_DXR`'s view count stays fixed for the instance, and a session submits
+the located count with the inactive tail aliased (v21). A stereo session facing a mode it cannot
+fill is floored to 2D with the existing denial (v20).
+
 ---
 
 ## 6. Interactions and External Dependencies

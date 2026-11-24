@@ -69,3 +69,4 @@
 - [ADR-063](ADR-063-input-provider-device-abi-hardening.md) — Harden the provider-device ABI — the devices an input provider returns get a versioned contract
 - [ADR-064](ADR-064-component-catalog-and-third-party-trust.md) — Component catalog and third-party trust
 - [ADR-065](ADR-065-two-runtime-rendering-modes.md) — Two run-time rendering modes per display driver; the 3D kind is a start-up setting
+- [ADR-066](ADR-066-live-display-driver-settings-envelope-sizing.md) — Display-driver settings apply live; envelope sizing first, swapchain recreation as the rare path
