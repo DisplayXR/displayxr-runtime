@@ -445,6 +445,10 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrSetWorkspaceViewRigDXR, DXR_view_rig);
 #endif
 
+#ifdef OXR_HAVE_DXR_workspace_client_input
+	ENTRY_IF_EXT(xrEnumerateWorkspaceClientInputEventsDXR, DXR_workspace_client_input);
+#endif
+
 #ifdef OXR_HAVE_DXR_spatial_workspace
 	ENTRY_IF_EXT(xrActivateSpatialWorkspaceDXR, DXR_spatial_workspace);
 	ENTRY_IF_EXT(xrDeactivateSpatialWorkspaceDXR, DXR_spatial_workspace);

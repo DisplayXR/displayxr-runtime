@@ -718,6 +718,26 @@
 
 
 /*
+ * XR_DXR_workspace_client_input
+ *
+ * Hand-added DisplayXR extension. A content app drains the workspace input the
+ * service routed to it. Advertised only where the service composes every app
+ * onto the comp_multi shared surface and routes input through the per-client
+ * queues (ipc_server_input_queue): desktop Linux (the XRT_OS_LINUX_DESKTOP
+ * rule, "Linux AND NOT Android") and macOS. Never Windows (the D3D11 service
+ * posts window messages into the app's own window) and never Android.
+ */
+#if defined(XR_DXR_workspace_client_input) &&                                                                           \
+    ((defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)) || defined(XRT_OS_MACOS))
+#define OXR_HAVE_DXR_workspace_client_input
+#define OXR_EXTENSION_SUPPORT_DXR_workspace_client_input(_) \
+    _(DXR_workspace_client_input, DXR_WORKSPACE_CLIENT_INPUT)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_workspace_client_input(_)
+#endif
+
+
+/*
  * XR_DXR_window_visibility
  *
  * Hand-added DisplayXR extension (ADR-062 D4). No entry points: an event and
@@ -1419,6 +1439,7 @@
     OXR_EXTENSION_SUPPORT_DXR_macos_gl_binding(_) \
     OXR_EXTENSION_SUPPORT_DXR_display_info(_) \
     OXR_EXTENSION_SUPPORT_DXR_spatial_workspace(_) \
+    OXR_EXTENSION_SUPPORT_DXR_workspace_client_input(_) \
     OXR_EXTENSION_SUPPORT_DXR_android_surface_binding(_) \
     OXR_EXTENSION_SUPPORT_DXR_atlas_capture(_) \
     OXR_EXTENSION_SUPPORT_DXR_local_3d_zone(_) \

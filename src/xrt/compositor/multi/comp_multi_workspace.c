@@ -358,6 +358,35 @@ comp_multi_workspace_hit_test_window_px(int32_t x, int32_t y)
 }
 
 bool
+comp_multi_workspace_window_local_uv(struct xrt_compositor *target_xc, int32_t x, int32_t y, float *out_u, float *out_v)
+{
+	if (target_xc == NULL) {
+		return false;
+	}
+	bool ok = false;
+	float u = 0.0f;
+	float v = 0.0f;
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	struct chrome_entry *e = find_locked(target_xc);
+	if (e != NULL && e->win_pose_valid && e->win_px_w > 0 && e->win_px_h > 0) {
+		u = (float)((double)x - (double)e->win_px_x) / (float)e->win_px_w;
+		v = (float)((double)y - (double)e->win_px_y) / (float)e->win_px_h;
+		ok = true;
+	}
+	os_mutex_unlock(&g_lock);
+	if (ok) {
+		if (out_u != NULL) {
+			*out_u = u;
+		}
+		if (out_v != NULL) {
+			*out_v = v;
+		}
+	}
+	return ok;
+}
+
+bool
 comp_multi_workspace_get_client_style(struct xrt_compositor *target_xc, struct comp_multi_client_style *out_style)
 {
 	bool found = false;

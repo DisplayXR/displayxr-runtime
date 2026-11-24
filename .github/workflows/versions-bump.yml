@@ -21,9 +21,9 @@ name: Bump versions.json
 #      the ABI those providers negotiate (conversion / input); a mismatch
 #      fails this run red and bumps nothing. Other fields skip the ABI gate.
 #   3. Writes the new tag into versions.json (scripts/apply_versions_bump.py).
-#      A field that is not in the file is refused, except the components that
-#      have no release yet (FIRST_RELEASE_FIELDS in that script): their first
-#      release's dispatch ADDS the field. See versions-json-autobump.md,
+#      A field that is not in the file is refused, except a component that
+#      has no release yet (FIRST_RELEASE_FIELDS in that script; ultraleap
+#      today): its first release's dispatch ADDS the field. See versions-json-autobump.md,
 #      "A component with no release yet".
 #   4. Direct-commits to main via the displayxr-publish-bot GitHub App.
 #

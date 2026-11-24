@@ -69,3 +69,8 @@ Rules:
 `XR_DXR_android_surface_binding` was implemented in #1037 and now has its own
 header and decade — see the row above for why its create-info type value sits
 outside that decade.
+
+`XR_DXR_workspace_client_input` (`XR_DXR_workspace_client_input.h`, spec v1)
+claims **no** values: its one entry point,
+`xrEnumerateWorkspaceClientInputEventsDXR`, fills a plain event record with no
+`type` / `next`, so it has no row in the table above.

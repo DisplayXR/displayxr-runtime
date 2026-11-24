@@ -2379,6 +2379,21 @@ if(NOT WIN32 AND NOT ANDROID)
 		)
 	target_link_libraries(tests_ipc_input_queue_frame_tick PRIVATE xrt-external-catch2 aux_util aux_os)
 	add_test(NAME tests_ipc_input_queue_frame_tick COMMAND tests_ipc_input_queue_frame_tick --success)
+
+	# XR_DXR_workspace_client_input: content-app copies (local UV, pointer
+	# owner) and the reserved-key policy of the shared router.
+	add_executable(
+		tests_ipc_input_route_client
+		tests_ipc_input_route_client.cpp
+		${PROJECT_SOURCE_DIR}/src/xrt/ipc/server/ipc_server_input_queue.c
+		${PROJECT_SOURCE_DIR}/src/xrt/compositor/multi/comp_multi_workspace.c
+		)
+	target_include_directories(
+		tests_ipc_input_route_client PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/ipc
+						     ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+		)
+	target_link_libraries(tests_ipc_input_route_client PRIVATE xrt-external-catch2 aux_util aux_os)
+	add_test(NAME tests_ipc_input_route_client COMMAND tests_ipc_input_route_client --success)
 endif()
 
 # #886 -- VK_LAYER_DXR_queue_lock's activation routes through the REAL Vulkan

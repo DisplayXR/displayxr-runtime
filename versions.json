@@ -1,14 +1,15 @@
 {
   "$schema": "https://json.schemastore.org/displayxr-versions.json",
-  "runtime":     "v2.70.2",
+  "runtime":     "v2.70.4",
   "shell":       "v2.4.2",
   "leia_plugin": "v2.23.4",
   "conversion_open": "v0.2.0",
+  "leia_conversion": "v0.1.0",
   "mcp_tools":   "v0.5.7",
   "browser":     "v1.10.6",
   "gauss_demo":  "v1.29.5",
   "modelviewer_demo": "v0.37.0",
-  "mediaplayer_demo": "v1.21.0",
+  "mediaplayer_demo": "v1.22.0",
   "avatar_demo": "v0.14.4",
   "earthview_demo": "v0.11.3",
   "cnsdk_services": "v0.10.98"

@@ -298,6 +298,19 @@ comp_multi_workspace_hit_test_window_px(int32_t x, int32_t y);
 struct xrt_compositor *
 comp_multi_workspace_get_focused_client(void);
 
+/*!
+ * XR_DXR_workspace_client_input: map a display-pixel cursor position (top-left
+ * origin, the same space as @ref comp_multi_workspace_hit_test_window_px) into
+ * @p target_xc's placed window CONTENT rect, normalized so the rect spans
+ * [0,1] x [0,1] with a top-left origin. Not clamped: a cursor outside the rect
+ * (a drag that left the window) maps outside [0,1]. Returns false, leaving the
+ * outputs untouched, when @p target_xc has no placed rect (no pose yet, or a
+ * zero-size rect).
+ */
+bool
+comp_multi_workspace_window_local_uv(
+    struct xrt_compositor *target_xc, int32_t x, int32_t y, float *out_u, float *out_v);
+
 
 /*
  *

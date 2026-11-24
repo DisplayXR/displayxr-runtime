@@ -142,6 +142,11 @@
       "title": "Spatial Workspace",
       "summary": "Multi-app composition across every 3D screen: screen enumeration, per-screen window placement and overlays, capture, modal input grab"
     },
+    "XR_DXR_workspace_client_input": {
+      "group": "workspace",
+      "title": "Workspace Client Input",
+      "summary": "A content app inside a workspace drains the keyboard and mouse the service routed to it (keys follow focus, pointer follows the window under the cursor, with the cursor normalized to the app's content area); a no-op outside a workspace. Desktop Linux and macOS, where every app shares the service's surface"
+    },
     "XR_DXR_workspace_file_dialog": {
       "group": "workspace",
       "title": "Workspace File Dialog",

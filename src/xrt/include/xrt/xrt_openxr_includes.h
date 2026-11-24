@@ -78,6 +78,7 @@ typedef __eglMustCastToProperFunctionPointerType (*PFNEGLGETPROCADDRESSPROC)(con
 #include "openxr/XR_DXR_macos_gl_binding.h"
 #include "openxr/XR_DXR_display_info.h"
 #include "openxr/XR_DXR_spatial_workspace.h"
+#include "openxr/XR_DXR_workspace_client_input.h"
 #include "openxr/XR_DXR_workspace_file_dialog.h"
 #include "openxr/XR_DXR_atlas_capture.h"
 #include "openxr/XR_DXR_mcp_tools.h"
