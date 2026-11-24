@@ -13,6 +13,7 @@ code-paths:
   - src/xrt/compositor/multi/comp_multi_weave_android.c
   - src/xrt/compositor/vk_native/comp_vk_native_compositor.c
   - scripts/android-oem-probe.sh
+  - scripts/android-oem-soak.sh
   - scripts/android-sidebyside.sh
   - scripts/android_bg_capture.sh
 ---
@@ -896,6 +897,31 @@ device that does freeze:
 3. `adb shell dumpsys deviceidle whitelist | grep -E 'monado|displayxr'` at the
    start and again after 30 minutes of mixed use: the entries must be **identical**.
    A pruned entry is a FAIL even if steps 1–2 passed at the start.
+
+**Acceptance test, automated (the soak half):**
+[`scripts/android-oem-soak.sh`](../../../scripts/android-oem-soak.sh) runs the
+time- and load-dependent checks above over adb, without root, and prints
+PASS / FAIL / INCONCLUSIVE per KPI with the raw samples kept on disk:
+
+- `--mode soak --url <inline-3D page> --pressure <heavy apps>` — a browser page
+  weaving for 60 minutes on battery with 10 screen off/on cycles and 20 app
+  switches; every 30 s it samples `MemAvailable`, the freezer state and the pid
+  of the runtime, its satellites, the vendor display services and the browser's
+  GPU process, and collects refused-bind log lines. KPIs: no process frozen
+  while the browser is in front, no process replaced, no refused bind, no new
+  `reason=2 status=9` exit record, device-idle whitelist unchanged, and the
+  weave answers a liveness probe after every screen-on and app switch. A run
+  in which `MemAvailable` never fell below the threshold reports the kill KPIs
+  as INCONCLUSIVE, never PASS.
+- `--mode idle` — the R8.6 idle test: 10 minutes screen-off on battery, then a
+  cold 3D app launch that must come up with no manual step.
+- `--mode reinstall --runtime-apk <apk>` — reinstall in place, then a 3D app
+  must work on its first launch without the runtime being opened, and the
+  overlay app-op must be unchanged (R8.4).
+
+It has been run on one reference device in shortened form only (2 to 4 minute
+soaks, a 1 minute idle); the reinstall mode and the memory-pressure branch have
+not been exercised on hardware.
 
 **Acceptance test, automated (the snapshot half):**
 `scripts/android-oem-probe.sh --only r8` reads the runtime service's process

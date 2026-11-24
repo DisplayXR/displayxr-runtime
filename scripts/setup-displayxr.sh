@@ -68,7 +68,8 @@ Usage: $0 [flags]
                     installed by default.
   --with leia-conversion
                     Also install the Leia 2D-to-3D conversion provider. It
-                    needs the NeurD runtime, which has its own installer.
+                    needs the Leia conversion runtime, which has its own
+                    installer.
                     No macOS build, so this warn+skips here.
   --with ultraleap  Also install the Ultraleap hands input provider. It needs
                     the Ultraleap tracking software and a camera. No macOS

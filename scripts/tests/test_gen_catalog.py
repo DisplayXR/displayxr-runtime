@@ -284,6 +284,22 @@ class Schema2OnlyComponents(unittest.TestCase):
         # Nothing else is recommended without a hardware match.
         self.assertEqual([i["id"] for i in self.v2["items"] if i.get("recommended")], ["open-conversion"])
 
+    def test_user_facing_strings_do_not_name_the_vendor_converter_technology(self):
+        # What a user reads of an item: its name, its summary, and the name of each
+        # thing it requires (Dashboard rows, the installer's component page, `dxr-get`).
+        # Ids, aliases, registry keys and a detect rule's `note` are not shown and stay.
+        item = self.items["leia-conversion"]
+        self.assertEqual(item["name"], "Leia conversion")
+        self.assertEqual(item["summary"], "2D-to-3D conversion from the display maker.")
+        self.assertEqual(item["requires"][1]["name"], "Leia conversion runtime")
+        self.assertEqual((item["id"], item["registered_id"], item["aliases"]),
+                         ("leia-conversion", "leia-conversion", ["leia_conversion"]))
+        for i in self.v2["items"]:
+            shown = [i.get("name", ""), i.get("summary", "")]
+            shown += [r.get("name", "") for r in i.get("requires", [])]
+            for text in shown:
+                self.assertNotIn("neurd", text.lower(), "%s: %r" % (i["id"], text))
+
     def test_leia_conversion_declares_neurd_and_installs_nothing_for_it(self):
         item = self.items["leia-conversion"]
         self.assertEqual(item["aliases"], ["leia_conversion"])

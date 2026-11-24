@@ -149,6 +149,7 @@ set(tests
     tests_dp_atlas_encoding_query
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
+    tests_oxr_mode_observed_rule
     tests_oxr_tracking_properties_rule
     tests_oxr_hosted_raw_views_rule
     tests_oxr_input_providers_rule
@@ -1082,9 +1083,12 @@ if(TARGET tests_oxr_view_space)
 	# POSIX only: discovery there reads XRT_PLUGIN_SEARCH_PATH, while Windows
 	# discovery is registry-only, so the arms would find no provider and fail
 	# (CI's per-class conformance step covers the Windows registry path).
-	# XRT_PREFERRED_TRACKING_PLUGIN_ID pins sim-tracking: the search path ADDS a
-	# directory, it does not hide the system one, so a provider installed on the
-	# box (open-tracking, probe order 100) would otherwise outrank it.
+	# XRT_PREFERRED_TRACKING_PLUGIN_ID pins sim-tracking and DXR_PLUGIN_EXCLUSIVE
+	# pins sim-display: the search path ADDS a directory, it does not hide the
+	# system one, so a provider or display plug-in installed on the box would
+	# otherwise outrank them. (The hermetic block at the end of this file also
+	# sets DXR_PLUGIN_SEARCH_PATH_ONLY, which hides the installed roots
+	# outright; the pins keep these arms honest if run by hand without it.)
 	if(NOT WIN32 AND TARGET drv_sim_tracking_plugin AND TARGET drv_sim_display_plugin)
 		set(_viewer_dir "${CMAKE_CURRENT_BINARY_DIR}/viewer_tracking_plugins/$<CONFIG>")
 		file(GENERATE
@@ -1098,7 +1102,7 @@ if(TARGET tests_oxr_view_space)
 		add_dependencies(tests_oxr_view_space drv_sim_tracking_plugin drv_sim_display_plugin)
 		add_test(NAME tests_oxr_view_space_viewer_tracking
 		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1 XRT_PREFERRED_TRACKING_PLUGIN_ID=sim-tracking
-		                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_PERIOD_MS=2000
+		                 DXR_PLUGIN_EXCLUSIVE=sim-display DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_PERIOD_MS=2000
 		                 DXR_TRACKING_SIM_TRACKING_AMPLITUDE_M=0.1 DXR_VIEWER_POSE_PAGE=none
 		                 $<TARGET_FILE:tests_oxr_view_space> "[viewer_tracking]" --success --allow-running-no-tests
 		         )
@@ -1119,7 +1123,7 @@ if(TARGET tests_oxr_view_space)
 			add_dependencies(tests_tracking_host displayxr-tracking-host drv_sim_tracking_plugin)
 			add_test(NAME tests_tracking_host
 			         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1 XRT_PREFERRED_TRACKING_PLUGIN_ID=sim-tracking
-			                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_SCRIPT=sweep
+			                 DXR_PLUGIN_EXCLUSIVE=sim-display DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_SCRIPT=sweep
 			                 DXR_TRACKING_SIM_TRACKING_PERIOD_MS=500 DXR_TRACKING_SIM_TRACKING_AMPLITUDE_M=0.1
 			                 $<TARGET_FILE:tests_tracking_host> --success
 			         )
@@ -1420,6 +1424,14 @@ target_include_directories(
 	tests_oxr_mode_fillable_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 target_link_libraries(tests_oxr_mode_fillable_rule PRIVATE xrt-interfaces)
+
+# #2801 - what an in-process session is told when the compositor moved the
+# rendering mode (the runtime's V / 0 / 1 keys on a runtime-owned window). Only
+# the rule is host-drivable, like the two above; same include + xrt-interfaces.
+target_include_directories(
+	tests_oxr_mode_observed_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+target_link_libraries(tests_oxr_mode_observed_rule PRIVATE xrt-interfaces)
 
 # #1631 — what XrSystemTrackingProperties advertises on a 3D display: the head's
 # own flags OR the display processor's eye-tracking capability OR any tracked
@@ -2420,4 +2432,59 @@ if(NOT WIN32
 			 $<TARGET_FILE_DIR:VkLayer_DXR_queue_lock>
 		)
 	set_tests_properties(tests_vk_queue_lock_activation PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
+endif()
+
+# Hermetic plug-in discovery and settings for every POSIX test. Keep this block
+# LAST: it walks every test registered above.
+#
+# On a dev box with a vendor plug-in installed system-wide and a real 3D panel
+# attached, a test that reaches plug-in discovery (an instance, a system, the
+# CLI, or a spawned tracking / conversion host) would otherwise load the
+# INSTALLED plug-in and bind the real panel headless: XRT_PLUGIN_SEARCH_PATH
+# only ADDS a directory in front of the per-user and system ones. So each test
+# starts from:
+#   - XRT_PLUGIN_SEARCH_PATH = a directory holding only this build's
+#     sim-display, and DXR_PLUGIN_SEARCH_PATH_ONLY=1 so discovery never looks
+#     past the search path (a test's own fixture directory included);
+#   - XDG_CONFIG_HOME / XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME under
+#     the build tree, so no test reads the user's real DisplayXR settings
+#     (preferred plug-in, per-screen display-driver choice, component settings)
+#     or writes into them;
+#   - DXR_VIEWER_POSE_PAGE=none, so an in-process runtime never attaches to a
+#     running service's viewer-pose page (and so never posts tracking demand
+#     to it). A test that wants a page names its own.
+# These are DEFAULTS, prepended to each test's own ENVIRONMENT (later entries
+# win) and overridden by any `cmake -E env` in a test's COMMAND. Windows
+# discovery is registry-only and Android has no ctest, so neither is touched.
+if(NOT WIN32
+   AND NOT ANDROID
+   AND TARGET drv_sim_display_plugin
+	)
+	set(_hermetic_root "${CMAKE_CURRENT_BINARY_DIR}/hermetic")
+	set(_hermetic_plugins "${_hermetic_root}/plugins/$<CONFIG>")
+	file(GENERATE
+	     OUTPUT "${_hermetic_plugins}/200-sim-display.json"
+	     CONTENT "{\n  \"file_format_version\": \"1.0\",\n  \"plugin\": {\n    \"id\": \"sim-display\",\n    \"display_name\": \"DisplayXR Sim Display\",\n    \"binary_path\": \"$<TARGET_FILE:drv_sim_display_plugin>\",\n    \"probe_order\": 200\n  }\n}\n"
+	     )
+	file(MAKE_DIRECTORY "${_hermetic_root}/config" "${_hermetic_root}/data" "${_hermetic_root}/state"
+	     "${_hermetic_root}/cache"
+	     )
+	set(_hermetic_env
+	    "XRT_PLUGIN_SEARCH_PATH=${_hermetic_plugins}"
+	    "DXR_PLUGIN_SEARCH_PATH_ONLY=1"
+	    "XDG_CONFIG_HOME=${_hermetic_root}/config"
+	    "XDG_DATA_HOME=${_hermetic_root}/data"
+	    "XDG_STATE_HOME=${_hermetic_root}/state"
+	    "XDG_CACHE_HOME=${_hermetic_root}/cache"
+	    "DXR_VIEWER_POSE_PAGE=none"
+	    )
+	get_property(_all_tests DIRECTORY PROPERTY TESTS)
+	foreach(_t IN LISTS _all_tests)
+		set(_t_merged ${_hermetic_env})
+		get_test_property(${_t} ENVIRONMENT _t_env)
+		if(_t_env)
+			list(APPEND _t_merged ${_t_env})
+		endif()
+		set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${_t_merged}")
+	endforeach()
 endif()

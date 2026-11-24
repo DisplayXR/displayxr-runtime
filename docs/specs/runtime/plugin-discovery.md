@@ -695,6 +695,13 @@ a dev build still overrides an installed one; when it is unset, discovery
 falls through to `/usr/lib/displayxr/plugins/` and the install is
 self-sufficient.
 
+Prepending does not hide the installed roots. `DXR_PLUGIN_SEARCH_PATH_ONLY=1`
+(test / dev only) does: discovery then searches `XRT_PLUGIN_SEARCH_PATH` and
+nothing else, neither the per-user root nor any machine-wide one. Every POSIX
+ctest runs with it and a build-tree search path, so a box with a vendor
+plug-in installed never has that plug-in loaded (and its panel bound) by a
+unit test.
+
 ### 3.1a `plugin.sandbox`: what a plug-in needs inside a container (POSIX)
 
 A runtime can run inside a container that is not the host: a Windows game under Proton runs in the Steam Linux

@@ -62,12 +62,17 @@ target_screen_modes_build(const struct xrt_screen_list *list,
 /*!
  * Build the tables for @p list, apply every screen's stored 3D-mode choice,
  * and publish them to the process registry; registers the choice resolver.
+ * With @p initial (the system's first publish, before the instance is sized),
+ * a stored choice naming a start-up-only entry is declared for this instance
+ * (u_screen_modes_table_promote_choice): `dp mode set` stored it as
+ * `applies: restart_app`, and this is that next start.
  * Logs one WARN per screen whose table changed.
  */
 void
 target_screen_modes_publish(const struct xrt_screen_list *list,
                             const struct xrt_dp_factory_registry *reg,
-                            struct xrt_device *head);
+                            struct xrt_device *head,
+                            bool initial);
 
 /*!
  * The resolver the registry calls for a screen's stored choice (the per-screen

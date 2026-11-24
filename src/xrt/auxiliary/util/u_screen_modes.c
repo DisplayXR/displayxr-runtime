@@ -9,6 +9,7 @@
 
 #include "util/u_screen_modes.h"
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 
 #include "xrt/xrt_display_status.h"
 
@@ -30,6 +31,8 @@ static struct
 	uint64_t last_refresh_ns;
 	u_screen_modes_choice_fn resolver;
 	uint32_t worst_w, worst_h;
+	//! The per-user store's stamp at the last re-read (u_setting_user_stamp).
+	uint64_t store_stamp;
 } g_sm;
 
 static void
@@ -151,11 +154,17 @@ u_screen_modes_refresh_choices(uint64_t now_ns, bool force)
 	uint64_t ids[U_SCREEN_MODES_MAX_SCREENS];
 	uint32_t n = 0;
 	u_screen_modes_choice_fn resolver = NULL;
+	// A store write is honoured at the next poll, whatever the throttle says
+	// (one stat; the throttle still bounds a store that is not changing).
+	const uint64_t stamp = u_setting_user_stamp();
 	sm_lock();
-	if (!force && g_sm.last_refresh_ns != 0 && now_ns - g_sm.last_refresh_ns < U_SCREEN_MODES_REFRESH_NS) {
+	const bool store_moved = stamp != g_sm.store_stamp;
+	if (!force && !store_moved && g_sm.last_refresh_ns != 0 &&
+	    now_ns - g_sm.last_refresh_ns < U_SCREEN_MODES_REFRESH_NS) {
 		sm_unlock();
 		return false;
 	}
+	g_sm.store_stamp = stamp;
 	g_sm.last_refresh_ns = now_ns != 0 ? now_ns : 1;
 	resolver = g_sm.resolver;
 	for (uint32_t i = 0; i < g_sm.count; i++) {

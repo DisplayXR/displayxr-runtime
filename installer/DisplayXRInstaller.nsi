@@ -807,6 +807,9 @@ Var DxrServiceWasRunning
 ; /NOSTART is irrelevant here -- it suppresses only the post-INSTALL start;
 ; restoring a service the installer itself stopped is not a new start.
 ; Medium integrity via explorer.exe, exactly as the success path (#1478).
+; No --autostart, as on the success path and for the same reason (#2805):
+; that switch arms the "Start on login" gate, which would keep a service the
+; user started by hand from coming back.
 ; Uses no stack and no registers.
 Function DxrRestoreServiceOnAbort
 	${If} $DxrServiceWasRunning == "1"
@@ -1651,6 +1654,14 @@ client_dll_ok:
 			; (vendor plug-in installers run before or after us, in any order)
 			; demotes it, so a High-integrity instance started here would keep
 			; every Medium app from connecting until the next restart/logon.
+			; #2805: the command line here is NOT the Run key's, on purpose. Do
+			; not add --autostart: it is the logon marker, and its one effect in
+			; the service is to exit when the user turned "Start on login" off,
+			; so an upgrade would then stop a hand-started service for good.
+			; explorer.exe is given the program only, so this route carries no
+			; arguments in any case. The instance started here is the same tray
+			; daemon as the logon one (docs/architecture/service-architecture.md
+			; section 1.1).
 			Exec 'explorer.exe "$INSTDIR\displayxr-service.exe"'
 		${EndIf}
 	skip_service_autostart:

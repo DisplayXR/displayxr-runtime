@@ -159,7 +159,7 @@ target_screen_modes_choice(const char *key, char *out_name, size_t cap, uint32_t
 }
 
 static void
-apply_stored_choices(struct u_screen_mode_table *tables, uint32_t n)
+apply_stored_choices(struct u_screen_mode_table *tables, uint32_t n, bool promote)
 {
 	for (uint32_t i = 0; i < n; i++) {
 		struct u_screen_mode_table *t = &tables[i];
@@ -170,6 +170,12 @@ apply_stored_choices(struct u_screen_mode_table *tables, uint32_t n)
 		uint32_t src = XRT_STATUS_MODE_3D_SOURCE_USER;
 		if (!target_screen_modes_choice(t->key, name, sizeof(name), &src)) {
 			name[0] = '\0';
+		}
+		if (promote && u_screen_modes_table_promote_choice(t, name)) {
+			U_LOG_W(
+			    "screen modes: 0x%016llx '%s': the stored 3D mode '%s' is declared only at start-up - "
+			    "declared for this instance (ADR-047 Amendment 10)",
+			    (unsigned long long)t->screen_id, t->key, name);
 		}
 		(void)u_screen_modes_table_apply_choice(t, name, src);
 	}
@@ -189,7 +195,8 @@ list_source_str(uint32_t s)
 void
 target_screen_modes_publish(const struct xrt_screen_list *list,
                             const struct xrt_dp_factory_registry *reg,
-                            struct xrt_device *head)
+                            struct xrt_device *head,
+                            bool initial)
 {
 	struct u_screen_mode_table *tables = calloc(U_SCREEN_MODES_MAX_SCREENS, sizeof(*tables));
 	struct u_screen_mode_table *before = calloc(U_SCREEN_MODES_MAX_SCREENS, sizeof(*before));
@@ -199,7 +206,7 @@ target_screen_modes_publish(const struct xrt_screen_list *list,
 		return;
 	}
 	const uint32_t n = target_screen_modes_build(list, reg, head, tables, U_SCREEN_MODES_MAX_SCREENS);
-	apply_stored_choices(tables, n);
+	apply_stored_choices(tables, n, initial);
 	const uint32_t nb = u_screen_modes_get_all(before, U_SCREEN_MODES_MAX_SCREENS);
 	u_screen_modes_set_choice_resolver(target_screen_modes_choice);
 	u_screen_modes_publish(tables, n);
@@ -262,7 +269,7 @@ target_screen_modes_fill_status(const struct xrt_screen_list *list,
 				if (local != NULL) {
 					local_n = target_screen_modes_build(list, reg, head, local,
 					                                    U_SCREEN_MODES_MAX_SCREENS);
-					apply_stored_choices(local, local_n);
+					apply_stored_choices(local, local_n, false);
 				}
 			}
 			for (uint32_t k = 0; local != NULL && k < local_n && !have; k++) {

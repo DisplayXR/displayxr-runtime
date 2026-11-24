@@ -2228,7 +2228,20 @@ tc_append_root(char roots[][PATH_MAX], int max_roots, int *n_roots, const char *
  *
  * Per-user shadows system: roots are walked in priority order and the first
  * occurrence of an id wins (@ref target_component_merge).
+ *
+ * `DXR_PLUGIN_SEARCH_PATH_ONLY=1` (test / dev only) stops after root 1: the
+ * per-user and machine-wide roots are not searched, so a box with a vendor
+ * plug-in installed system-wide still discovers only the dev tree's plug-ins.
+ * ctest sets it for every POSIX test (tests/CMakeLists.txt), because the
+ * search path ADDS a directory and does not hide the installed ones.
  */
+static bool
+tc_search_path_only(void)
+{
+	const char *env = getenv("DXR_PLUGIN_SEARCH_PATH_ONLY");
+	return env != NULL && env[0] != '\0' && env[0] != '0';
+}
+
 int
 target_plugin_build_discovery_roots(char roots[][PATH_MAX], int max_roots)
 {
@@ -2252,6 +2265,18 @@ target_plugin_build_discovery_roots(char roots[][PATH_MAX], int max_roots)
 			}
 			p = colon + 1;
 		}
+	}
+
+	if (tc_search_path_only()) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W(
+			    "plugin discovery: DXR_PLUGIN_SEARCH_PATH_ONLY set — searching only "
+			    "XRT_PLUGIN_SEARCH_PATH ('%s'); per-user and system plug-in directories skipped.",
+			    override != NULL ? override : "");
+		}
+		return n_roots;
 	}
 
 	const char *home = getenv("HOME");

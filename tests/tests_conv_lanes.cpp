@@ -3127,3 +3127,114 @@ TEST_CASE("stream: a discontinuity latest-wins skipped rides on the next result 
 	}
 	conv_fake_fini(&f);
 }
+
+TEST_CASE("core: a running core follows a rebound and a removed registration (spec 3.8.1)", "[conv_lanes]")
+{
+	conv_fake_provider fa, fo;
+	conv_fake_init(&fa, "acme-conversion");
+	conv_fake_init(&fo, "open-conversion");
+	for (conv_fake_provider *f : {&fa, &fo}) {
+		conv_fake_cap *c =
+		    conv_fake_add_cap(f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+		c->state = XRT_CONV_STATE_READY;
+		c->convert_ms = 2;
+	}
+	{
+		Core core(false);
+		REQUIRE(core.add(fa, 50) >= 0);
+		REQUIRE(core.add(fo, 200) >= 0);
+		auto d = stream_desc(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_OUT_VIEWS, 2);
+		xrt_conv_wire_stream_created cr{};
+		REQUIRE(conv_core_stream_create(core.c, 1, &d, nullptr, &cr) == XRT_SUCCESS);
+		REQUIRE(std::string(stats(core.c, cr.stream_id).provider_id) == "acme-conversion");
+		conv_result r{};
+		REQUIRE(convert_one_frame(core, cr.stream_id, &r));
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+
+		xrt_conv_wire_generation g0{}, g1{};
+		conv_core_get_generation(core.c, &g0);
+
+		// The registration is rebound to another binary: the table reports it,
+		// readers wake, and the stream that was converting is not disturbed.
+		conv_provider_desc nd{};
+		nd.id = "acme-conversion";
+		nd.probe_order = 50;
+		nd.binary_path = "/opt/new/AcmeConversion/acme-conversion.so";
+		nd.binary_size = 11;
+		nd.binary_mtime = 22;
+		CHECK(conv_core_rebind_provider(core.c, &nd));
+		CHECK_FALSE(conv_core_rebind_provider(core.c, &nd)); // the same key again
+		conv_core_provider_changed(core.c, "acme-conversion");
+		conv_core_get_generation(core.c, &g1);
+		CHECK(g1.conv_gen > g0.conv_gen);
+		{
+			static conv_registry reg;
+			conv_core_copy_registry(core.c, &reg);
+			const int32_t pi = conv_registry_find_provider(&reg, "acme-conversion");
+			REQUIRE(pi >= 0);
+			CHECK(std::string(reg.providers[pi].binary_path) ==
+			      "/opt/new/AcmeConversion/acme-conversion.so");
+			CHECK(reg.providers[pi].enabled);
+		}
+		REQUIRE(convert_one_frame(core, cr.stream_id, &r));
+		CHECK_FALSE(r.discontinuity);
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+		CHECK(stats(core.c, cr.stream_id).rebinds == 0u);
+		CHECK(std::string(stats(core.c, cr.stream_id).provider_id) == "acme-conversion");
+		{
+			nd.id = "nobody";
+			CHECK_FALSE(conv_core_rebind_provider(core.c, &nd)); // an unknown id changes nothing
+		}
+
+		// The registration is removed: no rows, never selected; the live
+		// stream moves once to the next provider, flagged discontinuity.
+		conv_core_set_provider_enabled(core.c, "acme-conversion", false);
+		conv_core_set_provider_registered(core.c, "acme-conversion", false);
+		{
+			static conv_registry reg;
+			conv_core_copy_registry(core.c, &reg);
+			const int32_t pi = conv_registry_find_provider(&reg, "acme-conversion");
+			REQUIRE(pi >= 0); // the slot stays
+			CHECK(reg.providers[pi].unregistered);
+			CHECK(conv_registry_find_row(&reg, (uint32_t)pi, 4) < 0);
+		}
+		REQUIRE(submit(core.c, cr.stream_id));
+		REQUIRE(wait_until([&] { return stats(core.c, cr.stream_id).rebinds == 1u; }, 3000));
+		CHECK(std::string(stats(core.c, cr.stream_id).provider_id) == "open-conversion");
+		REQUIRE(convert_one_frame(core, cr.stream_id, &r));
+		CHECK(r.discontinuity);
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+		CHECK(views_state(core) == XRT_CONV_STATE_READY); // the task is still served
+
+		// A new create never picks the removed provider, and a late change
+		// notification for it does not bring its rows back.
+		conv_core_provider_changed(core.c, "acme-conversion");
+		sleep_ms(100);
+		xrt_conv_wire_stream_created cr2{};
+		REQUIRE(conv_core_stream_create(core.c, 2, &d, nullptr, &cr2) == XRT_SUCCESS);
+		CHECK(std::string(stats(core.c, cr2.stream_id).provider_id) == "open-conversion");
+		REQUIRE(conv_core_stream_destroy(core.c, cr2.stream_id) == XRT_SUCCESS);
+
+		// Reinstalled: registered, enabled and described again; the next
+		// create is its own (a live stream never moves back by itself).
+		conv_core_set_provider_registered(core.c, "acme-conversion", true);
+		conv_core_set_provider_enabled(core.c, "acme-conversion", true);
+		conv_core_provider_changed(core.c, "acme-conversion");
+		REQUIRE(wait_until(
+		    [&] {
+			    static conv_registry reg;
+			    conv_core_copy_registry(core.c, &reg);
+			    const int32_t pi = conv_registry_find_provider(&reg, "acme-conversion");
+			    return pi >= 0 && conv_registry_find_row(&reg, (uint32_t)pi, 4) >= 0;
+		    },
+		    3000));
+		xrt_conv_wire_stream_created cr3{};
+		REQUIRE(conv_core_stream_create(core.c, 3, &d, nullptr, &cr3) == XRT_SUCCESS);
+		CHECK(std::string(stats(core.c, cr3.stream_id).provider_id) == "acme-conversion");
+		CHECK(std::string(stats(core.c, cr.stream_id).provider_id) == "open-conversion");
+		REQUIRE(conv_core_stream_destroy(core.c, cr3.stream_id) == XRT_SUCCESS);
+		REQUIRE(conv_core_stream_destroy(core.c, cr.stream_id) == XRT_SUCCESS);
+	}
+	conv_fake_fini(&fa);
+	conv_fake_fini(&fo);
+}

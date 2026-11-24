@@ -50,9 +50,9 @@ LIST = {"schema": 2, "items": [
     row("open-conversion", "Open conversion provider", "conversion_provider", aliases=["conversion_open"],
         installed="0.1.0", available="0.1.1", state="outdated", recommended=True, summary="Open models.",
         size=15720487, download=15720487),
-    row("leia-conversion", "Leia conversion provider", "conversion_provider", aliases=["leia_conversion"],
+    row("leia-conversion", "Leia conversion", "conversion_provider", aliases=["leia_conversion"],
         available="0.1.0", size=4194304, download=4194304,
-        prerequisites=[{"name": "NeurD runtime (Leia)", "met": False, "installable": False}]),
+        prerequisites=[{"name": "Leia conversion runtime", "met": False, "installable": False}]),
     row("ultraleap", "Ultraleap hands", "input_provider", available="0.1.0", detected="low", size=2097152,
         download=2097152, compatible=False,
         incompatible_reason="ultraleap 0.1.0 works with runtime 2.69.3 at most; this machine would have 2.70.0"),
@@ -141,7 +141,7 @@ class ShimTests(unittest.TestCase):
         it = self.items(self.run_shim(lst))
         self.assertEqual(it["leia-sr"]["label"], "Cached - Leia SR display processor 2.23.0")
         self.assertEqual(it["leia-sr"]["size_kb"], "0")
-        self.assertEqual(it["leia-conversion"]["label"], "24 MB - Leia conversion provider 0.1.0")
+        self.assertEqual(it["leia-conversion"]["label"], "24 MB - Leia conversion 0.1.0")
 
     def test_installed_and_unavailable_items_are_read_only(self):
         it = self.items(self.run_shim())
@@ -186,7 +186,7 @@ class ShimTests(unittest.TestCase):
         lst["items"][4]["incompatible_reason"] = real
         self.assertEqual(self.items(self.run_shim(lst))["ultraleap"]["desc"],
                          "fixture.runtime-too-new 1.0.0 works with runtime versions up to 1.0.0; this machine would...")
-        self.assertTrue(it["leia-conversion"]["desc"].startswith("Also needs, and does not install: NeurD runtime"))
+        self.assertTrue(it["leia-conversion"]["desc"].startswith("Also needs, and does not install: Leia conversion runtime"))
 
     def test_every_row_fits_the_list(self):
         # Measured on Windows: a 53-character row fits, a 59-character one is cut
@@ -259,7 +259,7 @@ class ShimTests(unittest.TestCase):
     def test_unmet_prerequisite_is_named_and_a_met_or_installable_one_is_not(self):
         lc = self.items(self.run_shim())["leia-conversion"]
         self.assertEqual((lc["status"], lc["ro"], lc["selected"]), ("missing", "0", "0"))
-        self.assertIn("Also needs, and does not install: NeurD runtime (Leia) (not found)", lc["desc"])
+        self.assertIn("Also needs, and does not install: Leia conversion runtime (not found)", lc["desc"])
         lst = copy.deepcopy(LIST)
         lst["items"][3]["prerequisites"] = [{"name": "A", "met": True, "installable": False},
                                             {"name": "B", "met": False, "installable": True}]

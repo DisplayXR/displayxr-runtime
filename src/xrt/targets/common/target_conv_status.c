@@ -1002,6 +1002,13 @@ target_conv_status_from_registry(const struct conv_registry *reg,
 	for (uint32_t pi = 0; pi < reg->provider_count; pi++) {
 		struct prov_extra *x = &extra[pi];
 		x->entry = -1;
+		status_index[pi] = XRT_STATUS_CONV_NO_PROVIDER;
+		if (reg->providers[pi].unregistered) {
+			// Its registration is gone (uninstalled under a running service,
+			// discovery spec §3.8.1): the core keeps the slot, the snapshot
+			// reads as if it were not installed. It has no rows either.
+			continue;
+		}
 		for (int i = 0; entries != NULL && i < count; i++) {
 			if (strcmp(entries[i].id, reg->providers[pi].id) == 0) {
 				x->entry = i;

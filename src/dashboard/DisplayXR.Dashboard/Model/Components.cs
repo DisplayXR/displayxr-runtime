@@ -168,6 +168,10 @@ public enum PlainState
     Standby,
     /// <summary>Its Enabled value (or the loader's verdict) says off.</summary>
     TurnedOff,
+    /// <summary>Has no switch of its own, and nothing of its kind is turned on (the conversion module while no converter is selected for any task).</summary>
+    Off,
+    /// <summary>Installed, and cannot do its job on this machine: a conversion provider whose probe declined (<c>PROBE_DECLINED</c>). Its Enabled value changes nothing.</summary>
+    NotAvailable,
     /// <summary>Refused or failed: the provenance gate, a load failure, malformed descriptors, a failing task.</summary>
     NeedsAttention,
 }
@@ -182,6 +186,8 @@ public static class PlainStates
         PlainState.Ready => ("Ready", Level.Plain),
         PlainState.Standby => ("Standby", Level.Plain),
         PlainState.TurnedOff => ("Turned off", Level.Plain),
+        PlainState.Off => ("Off", Level.Plain),
+        PlainState.NotAvailable => ("Not available on this PC", Level.Plain),
         PlainState.NeedsAttention => ("Needs attention", Level.Warn),
         _ => null,
     };
@@ -214,20 +220,38 @@ public static class PlainStates
         };
 
     /// <summary>
-    /// A conversion provider: malformed, a failure verdict or a failing task = Needs attention; off
+    /// The conversion class's load verdict for a provider that loaded and whose probe then said "not
+    /// on this machine" (target_conv_status.c: <c>probe()</c> returned XRT_ERROR_PROBER_NOT_SUPPORTED).
+    /// It is not a failure and not a provider to turn on: it has no capability here whatever its
+    /// Enabled value says.
+    /// </summary>
+    public const string ProbeDeclined = "PROBE_DECLINED";
+
+    /// <summary>
+    /// Whether a conversion provider's load verdict is a failure. <c>NEGOTIATED</c> is the conversion
+    /// loader's word for "loaded" (target_conversion_plugin_status_str) and <see cref="ProbeDeclined"/>
+    /// is "not on this machine": neither is one. <c>PROBE_FAILED</c> and the loader's refusals are.
+    /// </summary>
+    public static bool ConversionLoadIsFailure(string load) =>
+        load is not ("NEGOTIATED" or ProbeDeclined) && LoadIsFailure(load);
+
+    /// <summary>
+    /// A conversion provider: a declined probe = Not available on this PC (decided first: its Enabled
+    /// value changes nothing); malformed, a failure verdict or a failing task = Needs attention; off
     /// (its Enabled value or the snapshot's flag) = Turned off; superseded = Standby; selected for a
     /// task = In use; loaded or built in = Ready; otherwise Standby.
     /// </summary>
     public static PlainState ConversionProvider(string load, bool enabled, bool hidden, bool malformed, bool selected,
                                                 Level worstTask, PolicyRow? policy)
     {
-        if (malformed || policy is { Untrusted: true } || LoadIsFailure(load) || worstTask is Level.Warn or Level.Critical)
+        if (load == ProbeDeclined) return PlainState.NotAvailable;
+        if (malformed || policy is { Untrusted: true } || ConversionLoadIsFailure(load) || worstTask is Level.Warn or Level.Critical)
             return PlainState.NeedsAttention;
         if (ByPolicy(policy) is { } p) return p;
         if (!enabled || load == "DISABLED") return PlainState.TurnedOff;
         if (hidden) return PlainState.Standby;
         if (selected) return PlainState.InUse;
-        return load is "LOADED" or "ACTIVE" or "BUILT_IN" ? PlainState.Ready : PlainState.Standby;
+        return load is "LOADED" or "ACTIVE" or "NEGOTIATED" or "BUILT_IN" ? PlainState.Ready : PlainState.Standby;
     }
 
     /// <summary>
@@ -360,7 +384,8 @@ public static class Components
             DisplayProcessors(s, Of(policies, ComponentClass.Display)),
             WorkspaceController(s, info),
             InputProviders(info, Of(policies, ComponentClass.Input)),
-            Conversion(info),
+            // With no converter selected for any task, the module's card says so instead of "Standby".
+            Conversion(info, NoConverterLine(s, Of(policies, ComponentClass.Conversion))),
         };
         // ADR-053: only from a CLI whose snapshot carries the conversion rows.
         if (s is { ConvKnown: true }) list.Add(ConversionProviders(s, Of(policies, ComponentClass.Conversion)));
@@ -601,7 +626,18 @@ public static class Components
         return null;
     }
 
-    public static ComponentSection Conversion(InfoComponents info)
+    /// <summary>
+    /// The row name of the display driver's converter, in every state (available or not, a backend
+    /// named or not). Its backend id (the plug-in's own word) is a line of Details, never the name.
+    /// </summary>
+    public const string ModuleName = "Converter";
+
+    /// <summary>
+    /// The converter the display driver reports (<c>info --json</c> <c>lift_caps</c>).
+    /// <paramref name="noConverter"/> is <see cref="NoConverterLine"/>: when it is set and the display
+    /// driver has no converter, the card reads "Off" with that sentence, never "Standby" with "none available".
+    /// </summary>
+    public static ComponentSection Conversion(InfoComponents info, string? noConverter = null)
     {
         var items = new List<ComponentItem>();
         var l = info.Lift;
@@ -631,14 +667,19 @@ public static class Components
             chips.Add("State", l.Malformed ? "malformed" : present ? "available" : l.Probed ? "none" : "not probed",
                       l.Malformed ? Level.Critical : present ? Level.Ok : Level.Plain);
             chips.Add("Module", l.ModuleChip);
-            items.Add(new ComponentItem(l.Backend is { Length: > 0 } b ? b : "Conversion module",
+            var state = PlainStates.ConversionModule(l.Malformed, present, l.ModuleStatus);
+            bool off = noConverter is not null && state == PlainState.Standby;
+            var lineFacts = lines.Select(x => ("Details", x)).ToList();
+            bool named = l.Backend is { Length: > 0 };
+            if (named) lineFacts.Insert(0, ("Backend", l.Backend!));
+            items.Add(new ComponentItem(ModuleName,
                 l.Malformed ? Level.Critical : present ? Level.Ok : Level.Plain,
-                chips.Chips, lines, Facts: chips.Facts, State: PlainStates.ConversionModule(l.Malformed, present, l.ModuleStatus),
-                LineFacts: lines.Select(x => ("Details", x)).ToArray()));
+                chips.Chips, lines, Facts: chips.Facts, State: off ? PlainState.Off : state,
+                Summary: off ? noConverter : null, LineFacts: lineFacts));
         }
         return new ComponentSection("conversion", "2D to 3D in the display driver",
             "A 2D-to-3D converter that your display driver reports. Any app can ask it for depth or 3D views.",
-            present ? 1 : 0, present ? 1 : 0, l is null ? "not read yet" : present ? "1 available" : "none available", items);
+            present ? 1 : 0, present ? 1 : 0, l is null ? "not read yet" : present ? "1 available" : noConverter ?? "none available", items);
     }
 
     /// <summary>The state chip of one task row: READY green, waited-for states blue, terminal states amber.</summary>
@@ -658,10 +699,85 @@ public static class Components
         var other => (other.ToLowerInvariant(), Level.Plain),
     };
 
+    /// <summary>The id of the conversion class's built-in adapter over a display driver's own converter.</summary>
+    public const string BuiltInConverterId = "dp-lift";
+
+    /// <summary>The built-in adapter's row name. Its registered name and id are lines of Details.</summary>
+    public const string BuiltInConverterName = "Converter in the display driver";
+
+    /// <summary>The one plain line under the built-in adapter's name.</summary>
+    public const string BuiltInConverterLine = "Built into the runtime for display drivers that carry their own converter.";
+
+    /// <summary>The section line when no task has a converter and a provider that could convert is turned off.</summary>
+    public const string NoConverterOn = "No 2D-to-3D converter is turned on.";
+
+    /// <summary>The section line when no installed provider could convert on this machine, whatever is turned on.</summary>
+    public const string NoConverterInstalled = "No 2D-to-3D converter is installed.";
+
+    /// <summary>The conversion class's built-in adapter: by its load verdict, its id, or the policy row's <c>built_in</c>.</summary>
+    public static bool IsBuiltInConverter(ConvProvider p, PolicyRow? pol = null) =>
+        p.Load == "BUILT_IN" || p.Id == BuiltInConverterId || pol is { BuiltIn: true };
+
+    /// <summary>A built-in adapter the CLI reports as hidden (superseded by a provider): never a row of the page.</summary>
+    public static bool IsHiddenBuiltIn(ConvProvider p, PolicyRow? pol = null) => p.Hidden && IsBuiltInConverter(p, pol);
+
+    /// <summary>What a conversion provider row means for <see cref="NoConverterLine"/>.</summary>
+    public enum ConverterUse
+    {
+        /// <summary>Cannot convert on this machine whatever its switch says: its probe declined (<c>load</c> = <c>PROBE_DECLINED</c>), or it is the built-in adapter the CLI reports <c>hidden</c>. Not counted.</summary>
+        Unavailable,
+        /// <summary>Could convert, and is turned off: <c>enabled</c> false, <c>load</c> = <c>DISABLED</c>, or <c>conv list</c> reports its Enabled value off.</summary>
+        TurnedOff,
+        /// <summary>Turned on and broken: a failure load verdict, the provenance gate, or malformed descriptors. Its row reads "Needs attention".</summary>
+        Broken,
+        /// <summary>The built-in adapter, shown: it has no switch.</summary>
+        BuiltIn,
+        /// <summary>Turned on and able to serve (selected or not: warming, a model or a prerequisite missing).</summary>
+        Usable,
+    }
+
+    /// <summary>
+    /// Classify one provider from what the CLI reports about it: the snapshot row's <c>load</c>,
+    /// <c>enabled</c>, <c>hidden</c> and <c>bad_descriptors</c>, and the <c>conv list</c> row's
+    /// <c>enabled</c> / <c>enabled_source</c> / <c>built_in</c> / <c>load</c>. A declined probe is
+    /// decided first: the provider has no capability here, so its Enabled value says nothing.
+    /// (A provider that is turned off is never loaded or probed, so it is taken as one that could convert.)
+    /// </summary>
+    public static ConverterUse UseOf(ConvProvider p, PolicyRow? pol = null)
+    {
+        if (IsHiddenBuiltIn(p, pol) || p.Load == PlainStates.ProbeDeclined) return ConverterUse.Unavailable;
+        if (IsBuiltInConverter(p, pol)) return ConverterUse.BuiltIn;
+        if (!p.Enabled || p.Load == "DISABLED" || pol is { EnabledKnown: true, Enabled: false }) return ConverterUse.TurnedOff;
+        if (p.BadDescriptors > 0 || pol is { Untrusted: true } || PlainStates.ConversionLoadIsFailure(p.Load)) return ConverterUse.Broken;
+        return ConverterUse.Usable;
+    }
+
+    /// <summary>
+    /// Why nothing converts, in one sentence. It is about what can convert, not about the Enabled
+    /// values alone. Null when a converter is selected for a task or when the CLI predates the
+    /// conversion rows. Otherwise, by <see cref="UseOf"/> over the providers, first match:
+    /// a turned-on provider that can serve = null (the count line stays; its own row says what it is
+    /// waiting for); a provider that could convert is turned off = <see cref="NoConverterOn"/> (a
+    /// provider whose probe declined is not one that is on, whatever its Enabled value);
+    /// a broken provider or a shown built-in adapter = null (the row says why);
+    /// no provider, or only ones that cannot convert here = <see cref="NoConverterInstalled"/>.
+    /// </summary>
+    public static string? NoConverterLine(StatusSnapshot? s, PolicyList? policy = null)
+    {
+        if (s is not { ConvKnown: true } || s.Tasks.Any(t => t.Selected)) return null;
+        var uses = s.Providers.Select(p => UseOf(p, policy?.Row(p.Id))).ToArray();
+        if (uses.Contains(ConverterUse.Usable)) return null;
+        if (uses.Contains(ConverterUse.TurnedOff)) return NoConverterOn;
+        if (uses.Contains(ConverterUse.Broken) || uses.Contains(ConverterUse.BuiltIn)) return null;
+        return NoConverterInstalled;
+    }
+
     /// <summary>
     /// ADR-053 conversion providers, from the status snapshot: one row per provider with its
     /// load / platform state, and one line per task it declares (its readiness and whether
-    /// selection picked it). Provider names are the providers' own registration, verbatim.
+    /// selection picked it). Provider names are the providers' own registration, verbatim; the
+    /// built-in adapter has a plain name of its own (<see cref="BuiltInConverterName"/>) and is
+    /// not a row while the CLI reports it hidden. The count line never prints a zero.
     /// </summary>
     public static ComponentSection ConversionProviders(StatusSnapshot s, PolicyList? policy = null)
     {
@@ -670,12 +786,15 @@ public static class Components
         for (int i = 0; i < providers.Count; i++)
         {
             var p = providers[i];
+            var pol = policy?.Row(p.Id);
+            bool builtIn = IsBuiltInConverter(p, pol);
+            // Superseded by a provider: not a row (the index i still counts it, the tasks name providers by index).
+            if (builtIn && p.Hidden) continue;
             bool malformed = p.BadDescriptors > 0;
-            bool usable = p.Enabled && !p.Hidden && !malformed && p.CapCount > 0;
+            bool usable = p.Enabled && !p.Hidden && !malformed && p.CapCount > 0 && p.Load != PlainStates.ProbeDeclined;
             var chips = new ChipList();
             chips.Add("Load state", p.Load.Length > 0 ? p.Load : "UNKNOWN", usable ? Level.Ok : Level.Plain);
             if (malformed) chips.Add("Descriptors", "malformed", Level.Critical);
-            var pol = policy?.Row(p.Id);
             // Enabled: the policy row's chip names the source ("disabled (user)"); the snapshot's
             // bare flag only when `conv list` has not said (or predates enabled_source).
             if (pol?.EnabledChip is { } ec) chips.Add("Enabled setting", ec);
@@ -700,6 +819,8 @@ public static class Components
                     p.LicenceExempt ? "licence: grandfathered" : "licence " + p.LicenceClass,
                 }.Where(x => x.Length > 0))),
             };
+            // The built-in adapter's own registration name is technical: a line of Details, not the row's name.
+            if (builtIn && p.Name.Length > 0) lineFacts.Insert(0, ("Registered name", p.Name));
             if (malformed)
             {
                 lines.Add($"{Plural(p.BadDescriptors, "capability", "capabilities")} rejected: {p.DescriptorError}");
@@ -710,8 +831,9 @@ public static class Components
                 var (text, _) = TaskChip(t);
                 string sel = t.Selected ? "selected" : t.Order is null ? t.Verdict : $"#{t.Order + 1} ({t.Verdict})";
                 string load = t.Streams + t.JobsQueued > 0 ? $"{Sep}{t.Streams} streams, {t.JobsQueued} jobs" : "";
-                string taskName = $"{t.Task}{(t.Composed ? " (depth + view synthesis)" : "")}";
-                string taskLine = $"{text}{Sep}{sel}{load}" + (t.CpuStaging ? $"{Sep}CPU staging" : "");
+                // The label is the task in plain words; its id (what `conv use` takes) ends the line.
+                string taskName = $"{StatusText.ConversionTaskLabel(t.Task)}{(t.Composed ? " (depth + view synthesis)" : "")}";
+                string taskLine = $"{text}{Sep}{sel}{load}" + (t.CpuStaging ? $"{Sep}CPU staging" : "") + $"{Sep}id {t.Task}";
                 lines.Add($"{taskName}: {taskLine}");
                 lineFacts.Add((taskName, taskLine));
             }
@@ -719,20 +841,25 @@ public static class Components
             var worst = s.Tasks.Where(t => t.ProviderIndex == i).Select(TaskChip).Select(c => c.Level)
                          .DefaultIfEmpty(Level.Plain).Max();
             bool selected = s.Tasks.Any(t => t.ProviderIndex == i && t.Selected);
-            items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id,
+            items.Add(new ComponentItem(builtIn ? BuiltInConverterName : p.Name.Length > 0 ? p.Name : p.Id,
                 malformed ? Level.Critical : worst is Level.Critical or Level.Warn ? worst : usable ? Level.Ok : Level.Plain,
-                chips.Chips, lines, Policy: pol, Id: p.Id, BuiltIn: p.Load == "BUILT_IN" || pol is { BuiltIn: true },
+                chips.Chips, lines, Policy: pol, Id: p.Id, BuiltIn: builtIn,
                 Facts: chips.Facts, State: PlainStates.ConversionProvider(p.Load, p.Enabled, p.Hidden, malformed, selected, worst, pol),
-                Summary: PublisherLine(p.Vendor, p.Version), LineFacts: lineFacts));
+                Summary: builtIn ? BuiltInConverterLine : PublisherLine(p.Vendor, p.Version), LineFacts: lineFacts));
         }
         var served = s.Tasks.Where(t => t.Selected).Select(t => t.Task).Distinct().ToArray();
         int ready = s.Tasks.Count(t => t.Selected && t.State == "READY");
         return new ComponentSection("conversion_providers", "2D to 3D",
             "Turn photos and video into 3D. DisplayXR picks one 2D-to-3D converter for each job, and every app shares it.",
-            providers.Count, ready,
-            providers.Count == 0 ? "none installed"
-                : $"{providers.Count} installed{Sep}in use for {Plural(served.Length, "task", "tasks")}{Sep}{ready} ready"
-                  + (s.IsService ? "" : $"{Sep}DisplayXR isn't running in the background"),
+            items.Count, ready,
+            NoConverterLine(s, policy) ?? string.Join(Sep, new[]
+            {
+                // Non-zero parts only: a zero is never printed.
+                items.Count > 0 ? $"{items.Count} installed" : "",
+                served.Length > 0 ? $"in use for {Plural(served.Length, "task", "tasks")}" : "",
+                ready > 0 ? $"{ready} ready" : "",
+                s.IsService ? "" : "DisplayXR isn't running in the background",
+            }.Where(x => x.Length > 0)),
             items);
     }
 
