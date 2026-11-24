@@ -127,6 +127,29 @@ primary DP weave (the X11 gate of #1831 and the resample reasons of the Wayland
 gate of #1595). On `ds1-linux` both monitors are resampled under XWayland, which is
 why M2 could not be shown there without this.
 
+## Each segment in its own screen's entry; the view size follows the window (ADR-047 Amendment 10)
+
+A segment on another screen is drawn in **that screen's** rendering-mode entry for the app's slot,
+not the session's: its screen's table comes from the per-screen registry (`util/u_screen_modes.h`,
+the owning plug-in's `get_rendering_modes_for_monitor` list and that screen's own 3D-mode choice).
+`comp_segments_view_size_segment_grid` turns the entry into the grid the segment's crop is laid out
+in (one tile for a one-view entry or for one the atlas cannot fill, else the entry's own tiles,
+filled with the session's first views), and the segment DP is told which entry to draw through
+`xrt_display_processor_vk::set_output_entry` on change. The primary segment keeps the session's
+grid.
+
+The window's **effective table** — what its app enumerates — is held by the manager
+(`comp_segments_view_size`, header-only): the covered screens after a 0.5 s dwell, the majority
+after a 20 % dead band, then `u_screen_modes_effective`. It is recomputed from the manager's own
+segment table on every weave with a placed window, also when the split update does not run
+(zero-copy on the primary), and published in `xrt_segment_metrics::table`; the state tracker
+answers `xrEnumerateDisplayRenderingModesDXR` from it and queues
+`XrEventDataRenderingModeTableChangedDXR` on a change. vk_native then lays its atlas out from the
+same table (tiles and scale overlaid on the frame's mode), so the app, the compositor and each
+segment DP agree. Built for vk_native (Linux X11 + Wayland); the D3D11 / D3D12 / GL / Metal
+managers and the service weave engines publish no table (the session screen's stands) and crop every
+segment in the session's grid.
+
 ## The lens wish follows coverage (#2247)
 
 A screen's DP is asked for the session's 2D/3D mode while the window covers that

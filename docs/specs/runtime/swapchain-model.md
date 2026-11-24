@@ -7,7 +7,7 @@ Each compositor maintains two distinct, unrelated swapchains. Understanding this
 ### App Swapchain
 
 - **Allocated by**: the runtime via `xrCreateSwapchain`
-- **Sized to**: worst-case atlas dimensions across all rendering modes (allocated once at session creation)
+- **Sized to**: worst-case atlas dimensions across all rendering modes of **every claimed screen** (allocated once at session creation). Since `XR_DXR_display_info` v28 the runtime states that worst case to apps (`XrDisplayRenderingWorstCaseDXR` on `XrSystemProperties`: the largest atlas and the largest per-view rect, fixed for the instance); `maxImageRect*` covers the largest view. A window moving to another screen, or a live switch of a screen's 3D mode, never asks for more (ADR-047 Amendment 10). `DXR_SIZE_EXCLUDE_SCREENS=<key>[;<key>...]` leaves a screen out of the union (a window on it is resampled).
 - **Content**: the app renders a tiled atlas of views into this swapchain
 - **Flow direction**: app → compositor (input)
 
