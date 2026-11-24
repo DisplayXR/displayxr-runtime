@@ -123,6 +123,27 @@ is_multiview_count(size_t n, uint32_t device_max)
 #endif
 	return true;
 }();
+
+/*
+ * ADR-066 C1: sim-display's default 3D mode is "Same as 2D" (one view), so
+ * the ENUMERATED slots' max view count (1) no longer equals the located count
+ * (the envelope's max, 2) - the app-visible worst-case statement that closes
+ * that gap is stage 3. These arms read "the device max" off the enumerate, so
+ * they pin the 3D mode to anaglyph (2 views = the envelope max) unless an arm's
+ * own environment chose one (the quad arms set SIM_DISPLAY_OUTPUT themselves).
+ */
+[[maybe_unused]] const bool kSim3dModeAnaglyph = [] {
+#ifdef _WIN32
+	if (getenv("SIM_DISPLAY_OUTPUT") == nullptr && getenv("DXR_DP_SIM_DISPLAY_OUTPUT") == nullptr) {
+		_putenv_s("SIM_DISPLAY_OUTPUT", "anaglyph");
+	}
+#else
+	if (getenv("DXR_DP_SIM_DISPLAY_OUTPUT") == nullptr) {
+		setenv("SIM_DISPLAY_OUTPUT", "anaglyph", 0);
+	}
+#endif
+	return true;
+}();
 constexpr float kAngTolDeg = 0.1f;    // 0.1 degree
 
 /*!
@@ -2941,6 +2962,115 @@ TEST_CASE("RIG_LOCAL_PHYSICAL: a pen on the glass is at zero parallax in the ses
 		REQUIRE(stylus_tip_locate(rt, st, rt.local, t, &tip));
 		check_tip_on_glass("camera rig, LOCAL", cviews, tip);
 	}
+
+	tear_down(rt);
+}
+
+
+/*
+ * ADR-066 C1 / XR_DXR_display_info v27: a live 3D-mode switch, end to end in a
+ * real in-process session. The driver's default 3D mode (sim-display's OUTPUT,
+ * read through the host as DXR_DP_SIM_DISPLAY_OUTPUT, which outranks the legacy
+ * alias this binary sets) changes under the running session; within the 1 s
+ * poll the enumerate answers the new slot 1, one
+ * XrEventDataRenderingModeTableChangedDXR arrives with the unchanged index, and
+ * no XrEventDataRenderingModeChangedDXR with an unchanged index is ever sent.
+ */
+namespace {
+
+void
+set_sim_output(const char *v)
+{
+#ifdef _WIN32
+	_putenv_s("DXR_DP_SIM_DISPLAY_OUTPUT", v != nullptr ? v : "");
+#else
+	if (v != nullptr) {
+		setenv("DXR_DP_SIM_DISPLAY_OUTPUT", v, 1);
+	} else {
+		unsetenv("DXR_DP_SIM_DISPLAY_OUTPUT");
+	}
+#endif
+}
+
+} // namespace
+
+TEST_CASE("ADR-066 C1: a live 3D-mode switch sends the table-changed event, never a same-index mode change",
+          "[oxr][view_space][mode_table_live]")
+{
+	if (legacy_switch_set()) {
+		WARN("DXR_VIEW_CONFIG_LEGACY is armed - nothing to pin here");
+		SUCCEED("legacy process");
+		return;
+	}
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	opt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info) {
+		WARN("XR_DXR_display_info not advertised");
+		tear_down(rt);
+		return;
+	}
+	const std::vector<XrDisplayRenderingModeInfoDXR> before = rt.rendering_modes();
+	REQUIRE(before.size() == 2);
+	if (std::string(before[1].modeName) != "Anaglyph") {
+		// Not sim-display's list (a vendor plug-in won the head): nothing to switch.
+		WARN("slot 1 is '" << before[1].modeName << "', not sim-display's Anaglyph - arm inert");
+		SUCCEED("not sim-display");
+		tear_down(rt);
+		return;
+	}
+	uint32_t active_before = 0;
+	for (const auto &m : before) {
+		if (m.isActive == XR_TRUE) {
+			active_before = m.modeIndex;
+		}
+	}
+	(void)rt.drain_events();
+
+	set_sim_output("sbs");
+	uint32_t table_events = 0;
+	bool same_index_mode_event = false;
+	uint32_t reported_active = 0xFFFFFFFFu;
+	uint64_t reported_flags = 0xFFu;
+	for (int i = 0; i < 60 && table_events == 0; i++) { // up to 3 s
+		for (const XrEventDataBuffer &ev : rt.drain_events()) {
+			if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR) {
+				const auto *t = reinterpret_cast<const XrEventDataRenderingModeTableChangedDXR *>(&ev);
+				table_events++;
+				reported_active = t->activeModeIndex;
+				reported_flags = (uint64_t)t->flags;
+			} else if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR) {
+				const auto *m = reinterpret_cast<const XrEventDataRenderingModeChangedDXR *>(&ev);
+				same_index_mode_event |= m->previousModeIndex == m->currentModeIndex;
+			}
+		}
+		if (table_events == 0) {
+			sleep_ms(50);
+		}
+	}
+	const std::vector<XrDisplayRenderingModeInfoDXR> after = rt.rendering_modes();
+	set_sim_output(nullptr);
+
+	CHECK(table_events == 1);
+	CHECK(reported_active == active_before);
+	CHECK(reported_flags == 0); // C1 never asks for recreation
+	CHECK_FALSE(same_index_mode_event);
+	REQUIRE(after.size() == 2);
+	CHECK(std::string(after[1].modeName) == "Cropped SBS");
+	CHECK(after[1].tileColumns == 1);
+	CHECK(after[1].tileRows == 2);
+	CHECK(after[0].isActive == before[0].isActive); // the index did not move
+
+	// Coalesced: nothing more within the second that followed.
+	bool more = false;
+	for (const XrEventDataBuffer &ev : rt.drain_events()) {
+		more |= ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR;
+	}
+	CHECK_FALSE(more);
 
 	tear_down(rt);
 }

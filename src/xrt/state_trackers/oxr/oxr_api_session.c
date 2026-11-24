@@ -19,6 +19,8 @@
 
 #include "os/os_threading.h"
 
+#include "os/os_time.h"
+#include "util/u_rendering_modes.h"
 #include "util/u_debug.h"
 #include "util/u_trace_marker.h"
 
@@ -1778,6 +1780,9 @@ oxr_xrEnumerateDisplayRenderingModesDXR(XrSession session,
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE, "No head device available");
 	}
 
+	// ADR-066 C1: answer from the current slots (an IPC client re-copies the
+	// service's table when it moved; in-process the table is the device's).
+	(void)u_device_rendering_modes_sync(head, os_monotonic_get_ns());
 	uint32_t count = head->rendering_mode_count;
 
 	OXR_VERIFY_ARG_NOT_NULL(&log, modeCountOutput);

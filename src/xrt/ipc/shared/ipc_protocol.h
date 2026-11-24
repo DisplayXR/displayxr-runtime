@@ -296,6 +296,13 @@ struct ipc_shared_memory
 		uint32_t rendering_mode_count;
 		struct xrt_rendering_mode rendering_modes[XRT_MAX_RENDERING_MODES];
 		uint32_t active_rendering_mode_index;
+		//! ADR-066 C1: how many entries of @ref rendering_modes are the head's
+		//! envelope (its full declared list; >= rendering_mode_count).
+		uint32_t rendering_mode_envelope_count;
+		//! ADR-066 C1: the head's slot-table generation. Bumped (last, after the
+		//! table) when a config switch remaps slot 1; the client re-copies the
+		//! table when it moves (ipc_client_hmd's sync hook).
+		volatile uint32_t rendering_mode_generation;
 	} hmd;
 
 	struct xrt_input inputs[IPC_SHARED_MAX_INPUTS];

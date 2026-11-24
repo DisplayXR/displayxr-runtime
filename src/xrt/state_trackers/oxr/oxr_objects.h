@@ -1720,6 +1720,16 @@ oxr_event_push_XrEventDataReferenceSpaceChangePending(struct oxr_logger *log,
                                                       XrBool32 poseValid,
                                                       const XrPosef *poseInPreviousSpace);
 
+/*!
+ * ADR-066 C1 (XR_DXR_display_info v27): the rendering-mode table changed, the
+ * active index did not. Never the answer to a mode request.
+ */
+XrResult
+oxr_event_push_XrEventDataRenderingModeTableChanged(struct oxr_logger *log,
+                                                    struct oxr_session *sess,
+                                                    uint32_t activeModeIndex,
+                                                    uint64_t flags);
+
 XrResult
 oxr_event_push_XrEventDataRenderingModeChanged(struct oxr_logger *log,
                                                 struct oxr_session *sess,
@@ -3797,6 +3807,15 @@ struct oxr_session
 
 	//! Cached rendering mode index for detecting compositor-driven mode changes.
 	uint32_t last_rendering_mode_index;
+
+	//! ADR-066 C1: the head's slot-table generation this session last told
+	//! the app about (u_device_rendering_modes_generation). A change is a live
+	//! config switch: oxr_session_poll queues an equal-index
+	//! XrEventDataRenderingModeChangedDXR.
+	uint32_t rendering_mode_generation;
+	//! When this session was last sent XrEventDataRenderingModeTableChangedDXR
+	//! (monotonic ns; 0 = never): at most one per second, coalesced.
+	uint64_t rendering_mode_table_event_ns;
 
 	//! (#1041's end->begin restore memory moved to oxr_system — see
 	//! oxr_system::ended_rendering_mode_index.)

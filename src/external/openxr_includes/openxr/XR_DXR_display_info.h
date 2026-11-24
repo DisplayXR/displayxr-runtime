@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_info 1
-#define XR_DXR_display_info_SPEC_VERSION 26
+#define XR_DXR_display_info_SPEC_VERSION 27
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -478,6 +478,49 @@ typedef struct XrEventDataRenderingModeChangedDXR {
     uint32_t                    previousModeIndex;
     uint32_t                    currentModeIndex;
 } XrEventDataRenderingModeChangedDXR;
+
+// ---- v27: the rendering-mode table can change under a running session (ADR-066 C1) ----
+
+#define XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR ((XrStructureType)1004999451)
+
+typedef XrFlags64 XrRenderingModeTableChangeFlagsDXR;
+
+/*!
+ * Reserved (ADR-066 C2): the change falls outside every mode the display
+ * drivers declared, and the app's swapchains must be recreated. Never set by
+ * a v27 runtime: without it the swapchain is still large enough and the app
+ * must not reallocate.
+ */
+static const XrRenderingModeTableChangeFlagsDXR XR_RENDERING_MODE_TABLE_CHANGE_RECREATE_SWAPCHAINS_BIT_DXR =
+    0x00000001;
+
+/*!
+ * @brief Event fired when the rendering-mode table this session sees changed
+ *        while the active index did not (v27, ADR-066 C1).
+ *
+ * "Re-read xrEnumerateDisplayRenderingModesDXR and retile; the active index
+ * is unchanged." Sent when the user switches the screen's 3D mode (slot 1 now
+ * maps to another of the display driver's declared modes), live, with no
+ * restart and no swapchain recreation. Rules:
+ * - it is queued after the enumerate already answers the new table;
+ * - it is NEVER the answer to xrRequestDisplayRenderingModeDXR (that answer
+ *   stays XrEventDataRenderingModeChangedDXR or a denial; "no mode-changed
+ *   event means the request did not take" keeps its meaning);
+ * - when a mode change is due too, XrEventDataRenderingModeChangedDXR is
+ *   queued first, then this event carrying the new index;
+ * - it is never reverted (under a workspace controller included);
+ * - at most one per session per second, coalesced to the latest table.
+ * XrEventDataRenderingModeChangedDXR is never sent with an unchanged index.
+ *
+ * @extends XrEventDataBaseHeader
+ */
+typedef struct XrEventDataRenderingModeTableChangedDXR {
+    XrStructureType                       type;            //!< Must be XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR
+    const void* XR_MAY_ALIAS              next;
+    XrSession                             session;
+    uint32_t                              activeModeIndex; //!< The active index (unchanged by the table change)
+    XrRenderingModeTableChangeFlagsDXR    flags;           //!< 0 in v27; see XR_RENDERING_MODE_TABLE_CHANGE_RECREATE_SWAPCHAINS_BIT_DXR
+} XrEventDataRenderingModeTableChangedDXR;
 
 /*!
  * @brief Event fired when the physical display hardware state changes.

@@ -41,6 +41,7 @@
 
 #include "os/os_time.h"
 
+#include "util/u_rendering_modes.h"
 #include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
@@ -2179,6 +2180,102 @@ xrt_to_passthrough_state_flags(enum xrt_passthrough_state state)
 }
 #endif
 
+
+#ifdef OXR_HAVE_DXR_display_info
+//! ADR-066 C1.6: at most one table-changed event per session per second.
+#define OXR_MODE_TABLE_EVENT_MIN_NS (1000ull * 1000ull * 1000ull)
+
+/*!
+ * ADR-066 C1: tell the app when a 3D-mode switch remapped the head's slot 1.
+ *
+ * Polled from oxr_session_poll, i.e. from the app's own xrPollEvent: first
+ * u_device_rendering_modes_sync makes the table current (in-process: re-read
+ * the screen's 3D-mode choice and the driver's default at most once a second;
+ * IPC: re-copy the service's table when its generation moved). Then, on a new
+ * generation:
+ *  - the slot index does NOT move (the app owns its 2D/3D state) - except when
+ *    this session sits in slot 1 and cannot fill the new entry (a 2-view
+ *    session facing a 4-view slot 1): it is floored to slot 0 exactly as at
+ *    xrBeginSession (#1499), and told with XrEventDataRenderingModeChangedDXR
+ *    1 -> 0, queued FIRST;
+ *  - then one XrEventDataRenderingModeTableChangedDXR (XR_DXR_display_info v27)
+ *    carrying the active index, flags 0 (C1 never asks for recreation). It is
+ *    queued here, never inside xrRequestDisplayRenderingModeDXR, so it is
+ *    never the answer to a request; at most one per second per session,
+ *    coalesced to the latest table (a newer generation inside the second waits
+ *    and is reported once). XrEventDataRenderingModeChangedDXR is never sent
+ *    with an unchanged index;
+ *  - in-process, when the session is in slot 1 and the new entry wants the
+ *    other lens state (a passthrough entry vs a 3D one), the lens follows, with
+ *    the usual hardware-state event.
+ */
+static void
+oxr_session_rendering_modes_poll(struct oxr_logger *log, struct oxr_session *sess)
+{
+	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+	if (head == NULL || head->hmd == NULL) {
+		return;
+	}
+	const uint64_t now = os_monotonic_get_ns();
+	const uint32_t gen = u_device_rendering_modes_sync(head, now);
+	if (gen == sess->rendering_mode_generation) {
+		return;
+	}
+	if (!sess->sys->inst->extensions.DXR_display_info) {
+		sess->rendering_mode_generation = gen;
+		return; // a legacy app cannot be told; its table is current anyway
+	}
+	if (sess->rendering_mode_table_event_ns != 0 &&
+	    now - sess->rendering_mode_table_event_ns < OXR_MODE_TABLE_EVENT_MIN_NS) {
+		return; // coalesce: the next poll past the second reports the latest table
+	}
+	sess->rendering_mode_generation = gen;
+	uint32_t cur = head->hmd->active_rendering_mode_index;
+	if (cur >= head->rendering_mode_count) {
+		return;
+	}
+	const bool service_mode = sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
+
+	if (cur == U_RENDERING_MODE_3D && oxr_session_mode_floor_enabled() &&
+	    oxr_frame_sync_is_session_running(&sess->frame_sync) && sess->view_config_view_count > 0 &&
+	    oxr_session_may_move_display_mode(sess, head, NULL, NULL)) {
+		const uint32_t max_submit = oxr_segment_views_per_segment_capacity(
+		    sess->view_config_view_count,
+		    sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, head->hmd->view_count);
+		if (!oxr_mode_fillable_by(&head->rendering_modes[cur], max_submit)) {
+			U_LOG_W(
+			    "oxr: 3D-mode switch (ADR-066 C1) put '%s' (%u views) in slot 1, which this %u-view "
+			    "session "
+			    "cannot fill - floored to 2D (#1499)",
+			    head->rendering_modes[cur].mode_name, head->rendering_modes[cur].view_count, max_submit);
+			head->hmd->active_rendering_mode_index = U_RENDERING_MODE_2D;
+			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)U_RENDERING_MODE_2D);
+			oxr_session_request_display_mode(log, sess, false);
+			sess->last_rendering_mode_index = U_RENDERING_MODE_2D;
+			oxr_event_push_XrEventDataRenderingModeChanged(log, sess, cur, U_RENDERING_MODE_2D);
+			cur = U_RENDERING_MODE_2D;
+		}
+	}
+
+	if (cur == U_RENDERING_MODE_3D && !service_mode) {
+		const bool want_hw =
+		    u_rendering_modes_index_wants_hw_3d(head->rendering_modes, head->rendering_mode_count, cur);
+		if (want_hw != sess->hardware_display_3d) {
+			oxr_session_request_display_mode(log, sess, want_hw);
+			if (!oxr_session_window_hidden(sess)) {
+				oxr_event_push_XrEventDataHardwareDisplayStateChanged(log, sess,
+				                                                      want_hw ? XR_TRUE : XR_FALSE);
+			}
+		}
+	}
+	U_LOG_W("oxr: rendering-mode table changed (ADR-066 C1, generation %u): slot 1 is now '%s' (%u views)", gen,
+	        head->rendering_mode_count > 1 ? head->rendering_modes[1].mode_name : "-",
+	        head->rendering_mode_count > 1 ? head->rendering_modes[1].view_count : 0);
+	sess->rendering_mode_table_event_ns = now;
+	oxr_event_push_XrEventDataRenderingModeTableChanged(log, sess, cur, 0);
+}
+#endif // OXR_HAVE_DXR_display_info
+
 XrResult
 oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 {
@@ -2202,6 +2299,11 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 
 	// ADR-062 D1: report a visibility-driven lens edge (in-process sessions).
 	oxr_session_visibility_poll(log, sess);
+
+#ifdef OXR_HAVE_DXR_display_info
+	// ADR-066 C1: a live config switch (the screen's 3D mode) remapped slot 1.
+	oxr_session_rendering_modes_poll(log, sess);
+#endif
 
 	// In-process device loss (XRT_ERROR_COMPOSITOR_DEVICE_LOST, armed from
 	// xrWaitFrame): the transition the out-of-process path gets from
@@ -8937,6 +9039,9 @@ oxr_session_create(struct oxr_logger *log,
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 		if (head != NULL && head->hmd != NULL) {
 			sess->last_rendering_mode_index = head->hmd->active_rendering_mode_index;
+			// ADR-066 C1: the table this session starts from; a later
+			// generation is a live config switch (oxr_session_poll).
+			sess->rendering_mode_generation = u_device_rendering_modes_generation(head);
 			// Seed the hardware 2D/3D belief from the ACTIVE mode too. It was
 			// zero-initialised ("2D") regardless of the panel, so on a display
 			// that boots in its 3D mode the first xrRequestDisplayRenderingModeDXR

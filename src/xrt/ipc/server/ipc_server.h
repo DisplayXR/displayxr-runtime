@@ -568,6 +568,9 @@ struct ipc_server
 	//! Workspace mode: multi-compositor with shared window for all clients.
 	bool workspace_mode;
 
+	//! ADR-066 C1: the head's slot-table generation last copied into the clients' shm (main loop).
+	uint32_t rendering_mode_generation_synced;
+
 	//! PID of the IPC client that activated workspace mode. Captured at
 	//! ipc_handle_workspace_activate; checked in common_shutdown so that
 	//! abrupt controller-process death (e.g. orchestrator killing the

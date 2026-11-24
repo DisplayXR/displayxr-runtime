@@ -147,6 +147,10 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		XrEventDataHardwareDisplayStateChangedDXR *changed = (XrEventDataHardwareDisplayStateChangedDXR *)type;
 		return changed->session == session;
 	}
+	case XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR: {
+		XrEventDataRenderingModeTableChangedDXR *changed = (XrEventDataRenderingModeTableChangedDXR *)type;
+		return changed->session == session;
+	}
 	case XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
 		XrEventDataEyeTrackingStateChangedDXR *changed = (XrEventDataEyeTrackingStateChangedDXR *)type;
 		return changed->session == session;
@@ -467,6 +471,36 @@ oxr_event_push_XrEventDataUserPresenceChangedEXT(struct oxr_logger *log, struct 
 	return XR_SUCCESS;
 }
 #endif // OXR_HAVE_EXT_user_presence
+
+XrResult
+oxr_event_push_XrEventDataRenderingModeTableChanged(struct oxr_logger *log,
+                                                    struct oxr_session *sess,
+                                                    uint32_t activeModeIndex,
+                                                    uint64_t flags)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataRenderingModeTableChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->activeModeIndex = activeModeIndex;
+	changed->flags = (XrRenderingModeTableChangeFlagsDXR)flags;
+	event->result = XR_SUCCESS;
+
+	// WARN: rare lifecycle event (a user's 3D-mode switch), the proof it reached the client.
+	U_LOG_W("OXR EVENT: Rendering mode table changed (active mode %u, flags 0x%llx)", activeModeIndex,
+	        (unsigned long long)flags);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
 
 XrResult
 oxr_event_push_XrEventDataRenderingModeChanged(struct oxr_logger *log,

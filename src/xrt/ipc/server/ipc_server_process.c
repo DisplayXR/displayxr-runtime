@@ -20,6 +20,7 @@
 #include "xrt/xrt_config_os.h"
 
 #include "os/os_time.h"
+#include "util/u_rendering_modes.h"
 #include "util/u_var.h"
 #include "util/u_misc.h"
 #include "util/u_debug.h"
@@ -426,6 +427,27 @@ handle_binding(struct ipc_shared_memory *ism,
 	*output_pair_index_ptr = output_pair_index;
 }
 
+/*!
+ * ADR-066 C1: the head's slot table into one client's shared memory - the two
+ * presented slots plus the rest of the envelope (the full declared list), its
+ * count and the table generation, written LAST so a client that sees the new
+ * generation sees the new table.
+ */
+static void
+shm_copy_rendering_modes(struct ipc_shared_memory *ism, struct xrt_device *head)
+{
+	if (ism == NULL || head == NULL) {
+		return;
+	}
+	const uint32_t env = u_device_rendering_modes_envelope_count(head);
+	ism->hmd.rendering_mode_count = head->rendering_mode_count;
+	for (uint32_t i = 0; i < env && i < XRT_MAX_RENDERING_MODES; i++) {
+		ism->hmd.rendering_modes[i] = head->rendering_modes[i];
+	}
+	ism->hmd.rendering_mode_envelope_count = env;
+	ism->hmd.rendering_mode_generation = u_device_rendering_modes_generation(head);
+}
+
 XRT_CHECK_RESULT static xrt_result_t
 init_shm(struct ipc_server *s, volatile struct ipc_client_state *cs)
 {
@@ -564,14 +586,8 @@ init_shm(struct ipc_server *s, volatile struct ipc_client_state *cs)
 	ism->hmd.blend_mode_count = s->xsysd->static_roles.head->hmd->blend_mode_count;
 
 	// Sync rendering modes to shared memory (for IPC clients to detect mode changes)
-	{
-		struct xrt_device *head = s->xsysd->static_roles.head;
-		ism->hmd.rendering_mode_count = head->rendering_mode_count;
-		for (uint32_t i = 0; i < head->rendering_mode_count && i < XRT_MAX_RENDERING_MODES; i++) {
-			ism->hmd.rendering_modes[i] = head->rendering_modes[i];
-		}
-		ism->hmd.active_rendering_mode_index = head->hmd->active_rendering_mode_index;
-	}
+	shm_copy_rendering_modes(ism, s->xsysd->static_roles.head);
+	ism->hmd.active_rendering_mode_index = s->xsysd->static_roles.head->hmd->active_rendering_mode_index;
 
 	// Finally tell the client how many devices we have.
 	ism->isdev_count = count;
@@ -1139,6 +1155,19 @@ reprobe_thread_func(void *ptr)
 		}
 
 		if (reason == NULL) {
+			// ADR-066 C1: the rendering-mode config poll rides this worker's
+			// 1 s idle tick (never the main loop, which must not read stores):
+			// a per-screen 3D-mode choice or a driver default changed since is
+			// a live slot remap; the main loop then copies the table to every
+			// client (rendering_mode_generation).
+			os_mutex_unlock(&g_reprobe_mutex);
+			if (s->xsysd != NULL && s->xsysd->static_roles.head != NULL) {
+				(void)u_device_rendering_modes_sync(s->xsysd->static_roles.head, now);
+			}
+			os_mutex_lock(&g_reprobe_mutex);
+			if (g_reprobe_stop || g_reprobe_pending) {
+				continue;
+			}
 			os_cond_wait_timeout_ns(&g_reprobe_cond, &g_reprobe_mutex, U_TIME_1S_IN_NS);
 			continue;
 		}
@@ -1146,6 +1175,11 @@ reprobe_thread_func(void *ptr)
 		os_mutex_unlock(&g_reprobe_mutex);
 		reprobe_run(s, reason, world_event);
 		last_fallback_ns = os_monotonic_get_ns();
+		// ADR-066 C1: a CLI write (`dp mode set`) pokes this worker; apply the
+		// choice now rather than at the next tick.
+		if (s->xsysd != NULL && s->xsysd->static_roles.head != NULL) {
+			(void)u_device_rendering_modes_refresh_config(s->xsysd->static_roles.head, NULL);
+		}
 		os_mutex_lock(&g_reprobe_mutex);
 	}
 	os_mutex_unlock(&g_reprobe_mutex);
@@ -1263,14 +1297,24 @@ main_loop(struct ipc_server *s)
 		// main_loop+0x9e when two clients tore down in one tick, 2026-08-16).
 		if (s->xsysd != NULL && s->xsysd->static_roles.head != NULL &&
 		    s->xsysd->static_roles.head->hmd != NULL) {
-			uint32_t mode_idx = s->xsysd->static_roles.head->hmd->active_rendering_mode_index;
+			struct xrt_device *head = s->xsysd->static_roles.head;
+			uint32_t mode_idx = head->hmd->active_rendering_mode_index;
+			// ADR-066 C1: a config switch remapped slot 1 (the rendering-mode
+			// config poll below bumped the generation): every client's copy
+			// of the table follows. An integer compare per tick otherwise.
+			const uint32_t gen = u_device_rendering_modes_generation(head);
+			const bool table_moved = gen != s->rendering_mode_generation_synced;
 			os_mutex_lock(&s->global_state.lock);
 			for (uint32_t ci = 0; ci < IPC_MAX_CLIENTS; ci++) {
 				if (s->isms[ci] != NULL) {
+					if (table_moved) {
+						shm_copy_rendering_modes(s->isms[ci], head);
+					}
 					s->isms[ci]->hmd.active_rendering_mode_index = mode_idx;
 				}
 			}
 			os_mutex_unlock(&s->global_state.lock);
+			s->rendering_mode_generation_synced = gen;
 		}
 
 		// #962: mirror the compositor's focus into the IPC layer (controller policy).

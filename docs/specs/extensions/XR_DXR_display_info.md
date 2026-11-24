@@ -8,7 +8,7 @@
 | **Authors** | The DisplayXR Project |
 | **Date** | 2026-02-13 |
 | **Revision** | 0.2 |
-| **Status** | Implemented (`SPEC_VERSION` 26). `XrStructureType` values are provisional (1004999xxx) until Khronos registration |
+| **Status** | Implemented (`SPEC_VERSION` 27). `XrStructureType` values are provisional (1004999xxx) until Khronos registration |
 | **Extension Names** | `XR_DXR_win32_window_binding`, `XR_DXR_android_surface_binding`, `XR_DXR_cocoa_window_binding`, `XR_DXR_display_info` |
 | **OpenXR Version** | 1.0 |
 | **Extension Type** | Instance extensions |
@@ -1484,6 +1484,80 @@ top-bottom), stereo photos, a flat UI. Do **not** chain it for content rendered 
 follow the viewer. An app that shows both kinds chains it per frame, only while the
 viewer-independent content is on screen.
 
+### The rendering-mode table can change under a running session (v27, ADR-066 C1)
+
+A display driver declares its full list of rendering modes; the runtime keeps it as the **sizing
+envelope** and shows apps two slots: `modeIndex` 0 = the full-screen 2D mode and `modeIndex` 1 =
+the screen's **3D mode**, one entry of that list. The 3D mode is a runtime-owned per-screen
+setting (`displayxr-cli dp mode set <name> --screen <key>`, the Dashboard's "3D mode" picker),
+with the display driver's own setting as its default. Changing it **remaps slot 1 live**: the
+active index does not move, nothing is resized, and no swapchain is recreated, because the
+swapchain, `maxImageRect*` and `PRIMARY_MULTIVIEW_DXR`'s located view count were all sized over the
+whole declared list from the start.
+
+```c
+#define XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR ((XrStructureType)1004999451)
+
+typedef XrFlags64 XrRenderingModeTableChangeFlagsDXR;
+// Reserved for ADR-066 C2; never set by a v27 runtime.
+static const XrRenderingModeTableChangeFlagsDXR XR_RENDERING_MODE_TABLE_CHANGE_RECREATE_SWAPCHAINS_BIT_DXR = 0x00000001;
+
+typedef struct XrEventDataRenderingModeTableChangedDXR {
+    XrStructureType                       type;
+    const void* XR_MAY_ALIAS              next;
+    XrSession                             session;
+    uint32_t                              activeModeIndex;
+    XrRenderingModeTableChangeFlagsDXR    flags;
+} XrEventDataRenderingModeTableChangedDXR;
+```
+
+**Meaning.** "The rendering-mode table this session sees changed. Re-read
+`xrEnumerateDisplayRenderingModesDXR` and retile; the active index is `activeModeIndex`,
+unchanged." Without `XR_RENDERING_MODE_TABLE_CHANGE_RECREATE_SWAPCHAINS_BIT_DXR` (always, in v27)
+the swapchain is still large enough and the app must not reallocate it.
+
+**Rules.**
+- It is queued after the enumerate already answers the new table.
+- It is **never the answer to `xrRequestDisplayRenderingModeDXR`**. That answer stays
+  `XrEventDataRenderingModeChangedDXR` (the index changed) or `XrEventDataDisplayModeRequestDeniedDXR`.
+  "No mode-changed event means the request did not take" keeps its meaning.
+- `XrEventDataRenderingModeChangedDXR` keeps meaning exactly "the active index changed": the
+  runtime never sends it with `previousModeIndex == currentModeIndex`.
+- When both are due, the mode-changed event is queued first, then this event carrying the new
+  index. The one case in v27: the session is in slot 1, and the new 3D mode has more views than
+  its view configuration can fill (a `PRIMARY_STEREO` session facing a 4-view entry). It is
+  floored to slot 0 exactly as at `xrBeginSession` (v20): mode-changed 1 → 0, then this event
+  with `activeModeIndex` 0.
+- It is sent only for a table already applied and is **never reverted** (under a workspace
+  controller too).
+- **At most one per session per second**, coalesced to the latest table.
+- When the session is in slot 1 and the new entry wants the other lens state (a passthrough entry,
+  below, versus a 3D one), `XrEventDataHardwareDisplayStateChangedDXR` follows as usual.
+
+**A passthrough 3D entry.** A driver may put a one-view entry in slot 1 (sim-display's default,
+**Same as 2D**): `viewCount` 1, `viewScale` 1.0 × 1.0, `hardwareDisplay3D` false. The app is in its
+3D mode by **position** — slot 1 is the 3D mode whatever its content — and the screen shows one
+sharp full-resolution view. Apps decide "am I in 3D?" from the index, not from `viewCount` or
+`hardwareDisplay3D`.
+
+**The located view count** of `PRIMARY_MULTIVIEW_DXR` is the maximum over the declared list (full
+view sets only: `floor(8 / max)` sets, at least one, at most the view-set capacity), fixed for the
+instance. A 3D-mode switch changes `XrViewActivityStateDXR.activeViewCount`, never the located
+count; submit the located count with the inactive tail aliased (v21).
+
+**Apps that ignore the event** keep their old tile size, and the runtime resamples what they
+submit (the compositor crops by the submitted `imageRect`s, ADR-030): the picture is soft, never
+wrong. An app that never enumerates the table again keeps working.
+
+**Not in v27** (later revisions, ADR-066 / ADR-047 Amendment 10): the app-visible worst-case
+statement (atlas size and view count over the full list), the event for a window moving to a screen
+with a different view size, the per-screen tracking setting, and recreation (the reserved bit).
+
+How the runtime applies a switch: in-process, the state tracker re-reads the screen's choice and the
+driver's default at most once a second from `xrPollEvent` (one settings read; no thread); IPC
+clients re-copy the service's table when its generation moves; the service re-reads on its 1 s
+display worker tick and immediately after `dp mode set` pokes it.
+
 ### Example Code: Querying Display Mode Support and Requesting 2D
 
 > ⚠️ **These inline examples predate the multiview model and the v13 header — read with care.**
@@ -2759,6 +2833,7 @@ the property) silently ignore the call — graceful degradation.
 | 24 | 2026-11-03 | David Fattal | **Stable per-display key**: added `XrDisplayStableKeyDXR` (`1004999219`), chained on `XrDisplayDXR::next`, a key to persist per-panel data under. Append-only: `XrDisplayDXR` is unchanged. |
 | 25 | 2026-11-03 | David Fattal | **Fixed-viewer locates**: added `XrViewLocateFixedViewerDXR` (`1004999450`, the first value of display_info's second decade — 210–219 is full, and 430–449 went to `XR_DXR_app_share` / `XR_DXR_stereo_comfort`), chained on `XrViewLocateInfo` at `xrLocateViews`. A locate that sets `fixedViewer` is framed for the nominal viewer and posts no viewer-tracking demand, so a viewer-tracking provider (a webcam tracker) is not started for viewer-independent content such as video. Per call; also carried to the service for IPC clients. Additive: new chained input struct only. |
 | 26 | 2026-11-15 | David Fattal | **A hidden window does not hold the lens** (ADR-062 D1): added `XR_DISPLAY_MODE_DENIAL_REASON_WINDOW_HIDDEN_DXR` (`7`) to `XrDisplayModeDenialReasonDXR`. The runtime drops the lens wish of a session whose window is hidden, without a hardware state event; a 3D request made while hidden is recorded, answered with the new reason, and applied when the window is seen again. **Enumerant only** — no struct, wire or ABI change. |
+| 27 | 2026-11-23 | David Fattal | **The rendering-mode table can change under a running session** (ADR-066 C1): added `XrEventDataRenderingModeTableChangedDXR` (`1004999451`) with `XrRenderingModeTableChangeFlagsDXR` (one reserved bit, `XR_RENDERING_MODE_TABLE_CHANGE_RECREATE_SWAPCHAINS_BIT_DXR`, never set in v27). A switch of the screen's 3D mode remaps slot 1 live, with no resize and no recreation; the event is never the answer to a mode request, and `XrEventDataRenderingModeChangedDXR` is never sent with an unchanged index. Slot 1 is the 3D mode by position (a one-view passthrough entry included). `PRIMARY_MULTIVIEW_DXR` locates the maximum over the driver's full declared list (full view sets only). Additive: new event type only. |
 
 > The `XR_DXR_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do
