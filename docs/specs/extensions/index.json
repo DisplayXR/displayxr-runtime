@@ -170,7 +170,7 @@
     "XR_DXR_stereo_camera": {
       "group": "capture",
       "title": "Stereo Camera Source",
-      "summary": "A runtime-owned, privacy-gated stereo camera source: the display's own camera (usually the eye tracker's, supplied by the vendor plug-in without taking it from the tracker) or an opted-in plain UVC side-by-side webcam, fanned out by the service to clients as rectified newest-frame side-by-side pairs over shared memory"
+      "summary": "A runtime-owned, privacy-gated stereo camera source: the display's own camera (usually the eye tracker's, supplied by the vendor plug-in without taking it from the tracker) or an opted-in plain UVC side-by-side webcam, fanned out by the service to clients as rectified newest-frame side-by-side pairs over shared memory, with capture modes, focus / exposure controls and full-resolution stills for camera apps"
     },
     "XR_DXR_app_share": {
       "group": "capture",
