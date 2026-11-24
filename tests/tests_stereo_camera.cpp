@@ -348,7 +348,37 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	CHECK(offsetof(xrt_plugin_iface, activate) == offsetof(xrt_plugin_iface, get_license_state) + sizeof(void *));
 	// ADR-054 Amendment 3 appended get_setting_status after activate (the new last slot).
 	CHECK(offsetof(xrt_plugin_iface, get_setting_status) == offsetof(xrt_plugin_iface, activate) + sizeof(void *));
-	CHECK(offsetof(xrt_plugin_iface, get_setting_status) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	// XR_DXR_stereo_camera v8 (§9b) appended its eight slots after get_setting_status, in this order;
+	// stereo_camera_release_still is the new last slot.
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_enumerate_modes) ==
+	      offsetof(xrt_plugin_iface, get_setting_status) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_set_mode) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_enumerate_modes) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_get_control_caps) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_set_mode) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_set_controls) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_get_control_caps) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_get_capture_result) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_set_controls) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_request_still) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_get_capture_result) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_poll_still) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_request_still) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_release_still) ==
+	      offsetof(xrt_plugin_iface, stereo_camera_poll_still) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, stereo_camera_release_still) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	{
+		// A plug-in built before v8 (struct_size ends at get_setting_status) has none of them.
+		xrt_plugin_iface older{};
+		older.stereo_camera_set_mode = [](xrt_plugin_stereo_camera *, uint32_t) -> xrt_result_t {
+			return XRT_SUCCESS;
+		};
+		older.struct_size = (uint32_t)(offsetof(xrt_plugin_iface, get_setting_status) + sizeof(void *));
+		CHECK_FALSE(XRT_PLUGIN_IFACE_SLOT_PRESENT(&older, stereo_camera_set_mode));
+		older.struct_size = (uint32_t)sizeof(xrt_plugin_iface);
+		CHECK(XRT_PLUGIN_IFACE_SLOT_PRESENT(&older, stereo_camera_set_mode));
+		CHECK_FALSE(XRT_PLUGIN_IFACE_SLOT_PRESENT(&older, stereo_camera_poll_still));
+	}
 	{
 		// An older plug-in (struct_size ends before the slot) declares nothing.
 		xrt_plugin_iface older{};

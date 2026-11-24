@@ -1097,6 +1097,181 @@ struct xrt_plugin_stereo_camera_frame
 //! Opaque plug-in-owned open camera.
 struct xrt_plugin_stereo_camera;
 
+/*
+ *
+ * Stereo camera v8 (XR_DXR_stereo_camera spec v8 §5.5-§5.7, §9b): capture
+ * modes, controls + per-frame capture state, stills. All optional, each an
+ * appended xrt_plugin_iface slot (ADR-020). Every call that takes a
+ * `struct xrt_plugin_stereo_camera *` is made from that camera's ONE
+ * runtime-owned camera thread (the one that calls wait_frame), never
+ * concurrently with wait_frame — a plug-in needs no lock of its own for them.
+ *
+ */
+
+//! @ref xrt_plugin_stereo_camera_mode::flags (index 0 is the default mode, implicitly).
+#define XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM (1u << 1) //!< a stream may run it
+#define XRT_PLUGIN_STEREO_CAMERA_MODE_STILL (1u << 2)  //!< a still may be taken at this size
+
+/*!
+ * One capture mode. The runtime sets @ref struct_size; the plug-in must not
+ * write past it. Mode 0 MUST be the default — its eye size equal to
+ * xrt_plugin_stereo_camera_info::eye_width / eye_height — or the runtime
+ * ignores the list. Every mode images the SAME field of view (a scale of the
+ * default: same aspect within 1 %, same optical centre), so the one RAW
+ * calibration, rescaled, describes all of them; a mode with another aspect is
+ * dropped by the runtime. Frames of a mode are 2 * eye_width x eye_height SBS.
+ */
+struct xrt_plugin_stereo_camera_mode
+{
+	uint32_t struct_size;
+	uint32_t eye_width;
+	uint32_t eye_height;
+	//! Highest rate of the mode, Hz, if known; 0 = unknown (and a still-only size).
+	float max_frame_rate;
+	//! XRT_PLUGIN_STEREO_CAMERA_MODE_* bits.
+	uint32_t flags;
+};
+
+//! Bits of @ref xrt_plugin_stereo_camera_control_caps::supported_controls and
+//! @ref xrt_plugin_stereo_camera_controls::valid_controls (= XrStereoCameraControlFlagsDXR).
+#define XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_MODE (1u << 0)
+#define XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE (1u << 1)
+#define XRT_PLUGIN_STEREO_CAMERA_CONTROL_METERING_POINT (1u << 2)
+#define XRT_PLUGIN_STEREO_CAMERA_CONTROL_EXPOSURE_COMPENSATION (1u << 3)
+
+//! Focus modes (values equal XrStereoCameraFocusModeDXR).
+enum xrt_plugin_stereo_camera_focus_mode
+{
+	XRT_PLUGIN_STEREO_CAMERA_FOCUS_CONTINUOUS_AUTO = 1,
+	XRT_PLUGIN_STEREO_CAMERA_FOCUS_AUTO_ONCE = 2, //!< search once at the metering point, then hold
+	XRT_PLUGIN_STEREO_CAMERA_FOCUS_MANUAL = 3,
+	XRT_PLUGIN_STEREO_CAMERA_FOCUS_LOCKED = 4,
+};
+
+//! Values equal XrStereoCameraFocusCalibrationDXR (Camera2 LENS_INFO_FOCUS_DISTANCE_CALIBRATION).
+enum xrt_plugin_stereo_camera_focus_calibration
+{
+	XRT_PLUGIN_STEREO_CAMERA_FOCUS_UNCALIBRATED = 0,
+	XRT_PLUGIN_STEREO_CAMERA_FOCUS_APPROXIMATE = 1,
+	XRT_PLUGIN_STEREO_CAMERA_FOCUS_CALIBRATED = 2,
+};
+
+/*!
+ * What one camera can be told (no open needed). The runtime sets
+ * @ref struct_size and zero-fills the rest; the plug-in must not write past it.
+ */
+struct xrt_plugin_stereo_camera_control_caps
+{
+	uint32_t struct_size;
+	//! XRT_PLUGIN_STEREO_CAMERA_CONTROL_* bits; 0 = no controls.
+	uint32_t supported_controls;
+	//! Bit (1 << xrt_plugin_stereo_camera_focus_mode) per supported focus mode.
+	uint32_t supported_focus_modes;
+	//! Nearest focus, dioptres; 0 = fixed focus.
+	float min_focus_distance_diopters;
+	//! @ref xrt_plugin_stereo_camera_focus_calibration.
+	uint32_t focus_distance_calibration;
+	//! Exposure compensation range and step, EV; step 0 = none.
+	float exposure_compensation_min_ev;
+	float exposure_compensation_max_ev;
+	float exposure_compensation_step_ev;
+};
+
+/*!
+ * The WHOLE control state the runtime wants (it merges the app's partial
+ * updates; the plug-in never sees a partial one). A field whose bit is clear
+ * in @ref valid_controls is "the source's own default" — valid_controls == 0
+ * (the hold was released) = back to the source's defaults entirely.
+ */
+struct xrt_plugin_stereo_camera_controls
+{
+	uint32_t struct_size;
+	uint32_t valid_controls;
+	uint32_t focus_mode; //!< @ref xrt_plugin_stereo_camera_focus_mode
+	//! Bumped each time the app sets AUTO_ONCE: start a NEW search when it changes.
+	uint32_t focus_trigger;
+	float focus_distance_diopters; //!< MANUAL, 0 = infinity .. caps' minimum
+	//! Metering / focus point normalised in the LEFT eye of the RAW frame the
+	//! plug-in delivers (the runtime maps the app's rectified point back).
+	float metering_x, metering_y;
+	float exposure_compensation_ev; //!< within the caps' range, on its step
+};
+
+//! @ref xrt_plugin_stereo_camera_capture_result::valid_fields (= XrStereoCameraCaptureResultFlagsDXR).
+#define XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_DISTANCE (1u << 0)
+#define XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_STATE (1u << 1)
+#define XRT_PLUGIN_STEREO_CAMERA_RESULT_EXPOSURE_TIME (1u << 2)
+#define XRT_PLUGIN_STEREO_CAMERA_RESULT_SENSITIVITY (1u << 3)
+#define XRT_PLUGIN_STEREO_CAMERA_RESULT_EYE_TIMES (1u << 4)
+
+//! Values equal XrStereoCameraFocusStateDXR.
+enum xrt_plugin_stereo_camera_focus_state
+{
+	XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_UNKNOWN = 0,
+	XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_SEARCHING = 1,
+	XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_LOCKED = 2,
+	XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_FIXED = 3,
+	XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_FAILED = 4,
+};
+
+/*!
+ * The capture state of one frame / still. The runtime sets @ref struct_size
+ * and zero-fills the rest; the plug-in fills what it knows and sets the bit.
+ */
+struct xrt_plugin_stereo_camera_capture_result
+{
+	uint32_t struct_size;
+	uint32_t valid_fields; //!< XRT_PLUGIN_STEREO_CAMERA_RESULT_* bits
+	float focus_distance_diopters;
+	uint32_t focus_state; //!< @ref xrt_plugin_stereo_camera_focus_state
+	int64_t exposure_time_ns;
+	uint32_t sensitivity_iso;
+	uint32_t reserved;
+	int64_t eye_time_ns[2]; //!< start of exposure per eye, os_monotonic_get_ns() domain
+};
+
+/*!
+ * One still request (@ref xrt_plugin_iface::stereo_camera_request_still).
+ */
+struct xrt_plugin_stereo_camera_still_request
+{
+	uint32_t struct_size;
+	//! Per eye: a mode this camera listed with XRT_PLUGIN_STEREO_CAMERA_MODE_STILL.
+	uint32_t eye_width;
+	uint32_t eye_height;
+	uint32_t reserved;
+	//! The runtime's id (logs only).
+	uint64_t request_id;
+};
+
+//! Result of @ref xrt_plugin_iface::stereo_camera_poll_still.
+enum xrt_plugin_stereo_camera_still_poll
+{
+	XRT_PLUGIN_STEREO_CAMERA_STILL_NONE = 0,   //!< nothing yet
+	XRT_PLUGIN_STEREO_CAMERA_STILL_READY = 1,  //!< @p out holds it; call stereo_camera_release_still
+	XRT_PLUGIN_STEREO_CAMERA_STILL_FAILED = 2, //!< the request is over, no still (refused / failed)
+};
+
+/*!
+ * A captured still: ONE side-by-side RAW pair, left eye left, in the plug-in's
+ * native format (the runtime rectifies and converts). Planes stay valid until
+ * stereo_camera_release_still. The runtime sets @ref struct_size.
+ */
+struct xrt_plugin_stereo_camera_still
+{
+	uint32_t struct_size;
+	//! Full SBS extent; may be SMALLER than asked (a tracking-shared camera
+	//! protecting its tracker), never larger, same field of view.
+	uint32_t width;
+	uint32_t height;
+	uint32_t format; //!< @ref xrt_plugin_stereo_camera_format
+	const uint8_t *planes[2];
+	uint32_t pitches[2];
+	int64_t time_ns; //!< os_monotonic_get_ns() domain
+	uint32_t time_is_exposure;
+	uint32_t reserved;
+};
+
 //! Bytes per id of @ref xrt_plugin_iface::get_claimed_cameras (NUL included).
 #define XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX 256
 //! Ids the runtime asks @ref xrt_plugin_iface::get_claimed_cameras for at most.
@@ -2005,7 +2180,127 @@ struct xrt_plugin_iface
 	 * @ref XRT_PLUGIN_IFACE_HAS_SETTING_STATUS.
 	 */
 	xrt_component_get_setting_status_fn_t get_setting_status;
+
+	/*!
+	 * @name Stereo camera v8 (XR_DXR_stereo_camera spec v8 §9b)
+	 *
+	 * Appended per ADR-020 (append-only within a major; gated by
+	 * @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref get_setting_status. Each slot is optional on its own: NULL (or a
+	 * plug-in whose struct_size predates it) = the feature is absent and
+	 * the camera behaves as in v7. Calls taking an open camera run on that
+	 * camera's runtime-owned camera thread only (never concurrently with its
+	 * wait_frame). Announced by @ref XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES,
+	 * @ref XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_CONTROLS and
+	 * @ref XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_STILL.
+	 * @{
+	 */
+
+	/*!
+	 * The capture modes of camera @p index: fill up to @p capacity entries of
+	 * @p out (struct_size preset) and return how many exist. Mode 0 is the
+	 * default (= the info's eye size). Pure and cheap, any thread (called at
+	 * registration, with the camera closed). A plug-in that lists more than
+	 * one STREAM mode must implement @ref stereo_camera_set_mode.
+	 */
+	uint32_t (*stereo_camera_enumerate_modes)(struct xrt_plugin_instance *inst,
+	                                          uint32_t index,
+	                                          uint32_t capacity,
+	                                          struct xrt_plugin_stereo_camera_mode *out);
+
+	/*!
+	 * Switch the OPEN camera to mode @p mode_index (an index of
+	 * stereo_camera_enumerate_modes). A camera opens in mode 0; when the
+	 * runtime wants another one it calls this right after stereo_camera_open,
+	 * before the first wait_frame — so a plug-in should configure its capture
+	 * session lazily (on the first wait_frame or this call). A RECONFIGURE,
+	 * not a re-open: sequence numbers keep counting; frames may pause for at
+	 * most 500 ms. An error = the camera stays in the mode it runs (the
+	 * runtime ends the streams that mode cannot serve). A tracking-shared
+	 * camera may refuse a mode that would hurt tracking.
+	 */
+	xrt_result_t (*stereo_camera_set_mode)(struct xrt_plugin_stereo_camera *cam, uint32_t mode_index);
+
+	/*!
+	 * What camera @p index can be told (focus, metering, exposure). Pure and
+	 * cheap, any thread, camera closed. supported_controls == 0 (or an error)
+	 * = no controls.
+	 */
+	xrt_result_t (*stereo_camera_get_control_caps)(struct xrt_plugin_instance *inst,
+	                                               uint32_t index,
+	                                               struct xrt_plugin_stereo_camera_control_caps *out);
+
+	/*!
+	 * Apply the WHOLE control state @p controls to the OPEN camera (between
+	 * two wait_frame calls). Only advertised controls are ever set. Re-sent
+	 * after every open while an app holds the controls.
+	 */
+	xrt_result_t (*stereo_camera_set_controls)(struct xrt_plugin_stereo_camera *cam,
+	                                           const struct xrt_plugin_stereo_camera_controls *controls);
+
+	/*!
+	 * The capture state of the frame the last wait_frame returned (called
+	 * after a WAIT_OK, before stereo_camera_release_frame). XRT_SUCCESS =
+	 * @p out filled (struct_size preset, zero-filled; set the valid bits);
+	 * anything else = nothing known for this frame.
+	 */
+	xrt_result_t (*stereo_camera_get_capture_result)(struct xrt_plugin_stereo_camera *cam,
+	                                                 struct xrt_plugin_stereo_camera_capture_result *out);
+
+	/*!
+	 * Start capturing ONE still at a STILL mode's size (asynchronous: return
+	 * at once). At most one request is outstanding per camera. Frames may
+	 * pause while the still is taken (at most 1 s) and must resume by
+	 * themselves. An error = refused now (the runtime reports it BUSY).
+	 */
+	xrt_result_t (*stereo_camera_request_still)(struct xrt_plugin_stereo_camera *cam,
+	                                            const struct xrt_plugin_stereo_camera_still_request *req);
+
+	/*!
+	 * Has the outstanding still arrived? Polled by the camera thread after
+	 * every wait_frame while a request is outstanding. Returns an
+	 * @ref xrt_plugin_stereo_camera_still_poll; on READY @p out (and, if the
+	 * plug-in knows it, @p out_result) are filled — struct_size preset on
+	 * both — and stay valid until @ref stereo_camera_release_still.
+	 */
+	uint32_t (*stereo_camera_poll_still)(struct xrt_plugin_stereo_camera *cam,
+	                                     struct xrt_plugin_stereo_camera_still *out,
+	                                     struct xrt_plugin_stereo_camera_capture_result *out_result);
+
+	//! Done with the still poll_still returned READY.
+	void (*stereo_camera_release_still)(struct xrt_plugin_stereo_camera *cam);
+
+	/*! @} */
 };
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries
+ * xrt_plugin_iface::stereo_camera_enumerate_modes and
+ * xrt_plugin_iface::stereo_camera_set_mode (XR_DXR_stereo_camera v8).
+ */
+#define XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES 1
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries
+ * xrt_plugin_iface::stereo_camera_get_control_caps,
+ * xrt_plugin_iface::stereo_camera_set_controls and
+ * xrt_plugin_iface::stereo_camera_get_capture_result (XR_DXR_stereo_camera v8).
+ */
+#define XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_CONTROLS 1
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries
+ * xrt_plugin_iface::stereo_camera_request_still,
+ * xrt_plugin_iface::stereo_camera_poll_still and
+ * xrt_plugin_iface::stereo_camera_release_still (XR_DXR_stereo_camera v8).
+ */
+#define XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_STILL 1
+
+//! True when @p iface's struct_size covers slot @p field and the slot is set.
+#define XRT_PLUGIN_IFACE_SLOT_PRESENT(iface, field)                                                                    \
+	((iface) != NULL &&                                                                                            \
+	 (size_t)(iface)->struct_size >= offsetof(struct xrt_plugin_iface, field) + sizeof((iface)->field) &&          \
+	 (iface)->field != NULL)
 
 /*!
  * Defined when @ref xrt_plugin_iface carries @ref
