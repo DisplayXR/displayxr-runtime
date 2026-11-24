@@ -7177,6 +7177,18 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 		(void)comp_vk_native_segments_get_metrics(c->segments, &c->seg_window, &canvas,
 		                                          c->display_processor != NULL, &m);
 	}
+	// ADR-047 Amendment 10: the view size follows the window's screen. Runs
+	// on every weave with a placed window - also the ones that do not split
+	// (zero-copy on the session screen) - so the size follows the window back.
+	// Legacy apps never see the table (their size is the compromise).
+	if (c->segments != NULL && c->have_seg_window && !c->legacy_app_tile_scaling && c->xdev != NULL) {
+		const uint32_t cap_w = c->seg_sys_info != NULL ? c->seg_sys_info->atlas_width_pixels : 0;
+		const uint32_t cap_h = c->seg_sys_info != NULL ? c->seg_sys_info->atlas_height_pixels : 0;
+		(void)comp_vk_native_segments_update_view_size(c->segments, &c->seg_window, &canvas,
+		                                               c->xdev->rendering_modes, c->xdev->rendering_mode_count,
+		                                               c->mode_fill_views, cap_w, cap_h);
+		(void)comp_vk_native_segments_get_effective_table(c->segments, &m.table);
+	}
 #if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
 	/*
 	 * Native Wayland: a split frame publishes its table exactly as above
@@ -9643,6 +9655,9 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				    .view_height = view_height,
 				    .tile_columns = tc,
 				    .tile_rows = tr,
+				    .active_slot = (c->xdev != NULL && c->xdev->hmd != NULL)
+				                       ? c->xdev->hmd->active_rendering_mode_index
+				                       : 0,
 				    .target_fb = target_fb,
 				    .target_image = (VkImage)(uintptr_t)target_image,
 				    .target_view = (VkImageView)(uintptr_t)target_view,
@@ -13471,6 +13486,35 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 			frame_mode = &c->xdev->rendering_modes[idx];
 		}
 	}
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	/*
+	 * ADR-047 Amendment 10: the view size follows the window's screen. When
+	 * the window is on (or across) other screens, the atlas is laid out and
+	 * sized from the table its app was told (the effective table) - the
+	 * session's tiles and view scale are the head screen's only while the
+	 * window is on it. The lens state stays the app's (its slot's): only the
+	 * geometry is overlaid.
+	 */
+	struct xrt_rendering_mode frame_mode_eff;
+	if (frame_mode != NULL && c->segments != NULL && !c->legacy_app_tile_scaling) {
+		const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		struct xrt_effective_mode_table eff;
+		if (idx < 2 && comp_vk_native_segments_get_effective_table(c->segments, &eff)) {
+			frame_mode_eff = *frame_mode;
+			const struct xrt_effective_mode_slot *e = &eff.slot[idx];
+			frame_mode_eff.view_count = e->view_count;
+			frame_mode_eff.tile_columns = e->tile_columns;
+			frame_mode_eff.tile_rows = e->tile_rows;
+			frame_mode_eff.view_scale_x = e->view_scale_x;
+			frame_mode_eff.view_scale_y = e->view_scale_y;
+			frame_mode_eff.view_width_pixels = e->view_width_pixels;
+			frame_mode_eff.view_height_pixels = e->view_height_pixels;
+			frame_mode_eff.atlas_width_pixels = e->tile_columns * e->view_width_pixels;
+			frame_mode_eff.atlas_height_pixels = e->tile_rows * e->view_height_pixels;
+			frame_mode = &frame_mode_eff;
+		}
+	}
+#endif
 
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
 	// from the frame's active mode.

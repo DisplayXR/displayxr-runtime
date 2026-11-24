@@ -1118,6 +1118,45 @@ TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr]
 		CHECK(is_multiview_count(v.size(), device_max));
 	}
 
+	SECTION("v28: the worst-case statement covers every mode the session can be told (ADR-047 Amendment 10)")
+	{
+		XrDisplayRenderingWorstCaseDXR worst = {XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR};
+		XrDisplayInfoDXR di = {XR_TYPE_DISPLAY_INFO_DXR};
+		di.next = &worst;
+		XrSystemProperties props = {XR_TYPE_SYSTEM_PROPERTIES};
+		props.next = &di;
+		auto getProps = rt.fn<PFN_xrGetSystemProperties>("xrGetSystemProperties");
+		REQUIRE(XR_SUCCEEDED(getProps(rt.instance, rt.system, &props)));
+		INFO("worst case: atlas " << worst.maxAtlasWidthPixels << "x" << worst.maxAtlasHeightPixels << ", view "
+		                          << worst.maxViewWidthPixels << "x" << worst.maxViewHeightPixels << ", "
+		                          << worst.maxViewCount << " views; display " << di.displayPixelWidth << "x"
+		                          << di.displayPixelHeight);
+		CHECK(worst.maxViewCount == device_max);
+		// At least the session screen: its 2D entry is its full pixel size.
+		CHECK(worst.maxViewWidthPixels >= di.displayPixelWidth);
+		CHECK(worst.maxViewHeightPixels >= di.displayPixelHeight);
+		for (const XrDisplayRenderingModeInfoDXR &m : rt.rendering_modes()) {
+			CHECK(worst.maxAtlasWidthPixels >= m.tileColumns * m.viewWidthPixels);
+			CHECK(worst.maxAtlasHeightPixels >= m.tileRows * m.viewHeightPixels);
+			CHECK(worst.maxViewWidthPixels >= m.viewWidthPixels);
+			CHECK(worst.maxViewHeightPixels >= m.viewHeightPixels);
+			CHECK(m.viewCount <= worst.maxViewCount);
+		}
+		// maxImageRect* follows the same union.
+		auto pfn = rt.fn<PFN_xrEnumerateViewConfigurationViews>("xrEnumerateViewConfigurationViews");
+		uint32_t n = 0;
+		REQUIRE(XR_SUCCEEDED(
+		    pfn(rt.instance, rt.system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, 0, &n, nullptr)));
+		std::vector<XrViewConfigurationView> vcv(n, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+		REQUIRE(XR_SUCCEEDED(
+		    pfn(rt.instance, rt.system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, n, &n, vcv.data())));
+		for (const XrViewConfigurationView &v : vcv) {
+			CHECK(v.maxImageRectWidth >= worst.maxViewWidthPixels);
+			CHECK(v.maxImageRectHeight >= worst.maxViewHeightPixels);
+			CHECK(v.recommendedImageRectWidth <= v.maxImageRectWidth);
+		}
+	}
+
 	tear_down(rt);
 }
 

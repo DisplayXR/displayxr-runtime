@@ -1860,6 +1860,27 @@ oxr_xrEnumerateDisplayRenderingModesDXR(XrSession session,
 		// v13 fields.
 		modes[i].isActive = (i == active_idx) ? XR_TRUE : XR_FALSE;
 		modes[i].isRequestable = session_is_requestable;
+
+		// ADR-047 Amendment 10: the view size follows the window's screen.
+		// While the window is on (or across) another screen, each slot
+		// describes THAT screen's entry (a straddle: the per-dimension
+		// maximum scale; the layout of the covered entry with the most views).
+		if (sess->eff_table.valid && i < 2) {
+			const struct xrt_effective_mode_slot *e = &sess->eff_table.slot[i];
+			snprintf(modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE, "%s", e->mode_name);
+			modes[i].viewCount = e->view_count;
+			modes[i].viewScaleX = e->view_scale_x;
+			modes[i].viewScaleY = e->view_scale_y;
+			modes[i].hardwareDisplay3D = e->hardware_display_3d ? XR_TRUE : XR_FALSE;
+			modes[i].tileColumns = e->tile_columns;
+			modes[i].tileRows = e->tile_rows;
+			modes[i].viewWidthPixels = e->view_width_pixels;
+			modes[i].viewHeightPixels = e->view_height_pixels;
+			if (tracking != NULL) {
+				tracking->hasTracking =
+				    (e->mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) != 0 ? XR_TRUE : XR_FALSE;
+			}
+		}
 	}
 
 	return XR_SUCCESS;

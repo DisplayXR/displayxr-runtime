@@ -63,6 +63,7 @@ extern "C" {
 
 struct vk_bundle;
 struct comp_vk_native_segments;
+struct xrt_rendering_mode;
 
 /*!
  * Create the segment manager. Nothing is allocated on the GPU until a segment
@@ -304,6 +305,11 @@ struct comp_vk_native_segments_frame
 	bool primary_gate_per_segment;
 	//! The primary DP survives a resample (read with @ref primary_gate_per_segment).
 	bool primary_tolerates_resample;
+
+	//! The app's run-time slot this frame (0 = 2D, 1 = the 3D mode): each
+	//! non-primary segment is cropped and drawn as ITS screen's entry for it
+	//! (ADR-047 Amendment 10).
+	uint32_t active_slot;
 };
 
 /*!
@@ -385,6 +391,36 @@ comp_vk_native_segments_get_metrics(const struct comp_vk_native_segments *segs,
                                     const struct comp_seg_rect *canvas,
                                     bool primary_has_dp,
                                     struct xrt_segment_metrics *out);
+
+/*!
+ * ADR-047 Amendment 10: advance the view-size state with the window's current
+ * placement (its own segment table, so it runs even on frames the split
+ * update skips) and recompute the effective table the app is told: the
+ * session display's table while the window is on the session screen
+ * (invalid), else the covered screens' tables after a 0.5 s dwell (majority
+ * with Amendment 2's 20 % dead band). One WARN per change. Weave thread.
+ *
+ * @param head_modes, head_count  The head device's presented table.
+ * @param max_views    The most views one view set of the session carries (0 = no limit).
+ * @param cap_w, cap_h The instance's worst-case atlas (0 = no clamp).
+ * @return true when the effective table changed.
+ */
+bool
+comp_vk_native_segments_update_view_size(struct comp_vk_native_segments *segs,
+                                         const struct comp_seg_rect *window_desktop,
+                                         const struct comp_seg_rect *canvas,
+                                         const struct xrt_rendering_mode *head_modes,
+                                         uint32_t head_count,
+                                         uint32_t max_views,
+                                         uint32_t cap_w,
+                                         uint32_t cap_h);
+
+/*!
+ * ADR-047 Amendment 10: the effective table (see
+ * @ref comp_vk_native_segments_update_view_size). Any thread. Returns its validity.
+ */
+bool
+comp_vk_native_segments_get_effective_table(struct comp_vk_native_segments *segs, struct xrt_effective_mode_table *out);
 
 /*!
  * Multi-screen M3: the predicted eyes of screen @p screen_id's segment DP, in

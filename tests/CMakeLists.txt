@@ -154,6 +154,7 @@ set(tests
     tests_oxr_input_providers_rule
     tests_xrt_active_mode_scale
     tests_u_rendering_modes
+    tests_u_screen_modes
     tests_sim_display_modes
     tests_input_arbiter_rig
     tests_input_arbiter_rerank
@@ -1610,6 +1611,8 @@ target_link_libraries(tests_comp_rear_budget PRIVATE xrt-interfaces aux_os xrt-e
 # lifecycle hysteresis. Pure math -- compiled into the unit like
 # tests_comp_rear_budget instead of linking the Vulkan-gated comp_util.
 target_sources(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
+# ADR-047 Amendment 10: comp_segments_view_size.h (header-only) next to the pure screen-mode rules.
+target_include_directories(tests_u_screen_modes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 target_include_directories(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 target_link_libraries(tests_comp_segments PRIVATE xrt-interfaces aux_util)
 
