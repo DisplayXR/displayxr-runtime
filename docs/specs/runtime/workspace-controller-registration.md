@@ -797,6 +797,10 @@ a still-3D workspace) but the runtime side (re-parenting onto a
 visible owner HWND, focus restoration) works regardless. Mechanism
 spec: `docs/specs/runtime/modal-dialog-handling.md`.
 
+How the service forwards the rest of the input to the content apps (and which keys the
+controller keeps with `xrSetWorkspaceReservedKeysDXR`) is described per platform in
+[workspace-input-routing.md](../../architecture/workspace-input-routing.md).
+
 ## What this contract is NOT
 
 - **Not a plugin system.** The workspace app runs in its own process
