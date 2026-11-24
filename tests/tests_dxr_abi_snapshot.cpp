@@ -176,7 +176,7 @@ static_assert(offsetof(XrAndroidInputEventDXR, eventTimeNs) == 48, "XrAndroidInp
 #endif // defined(__ANDROID__)
 
 // ---- XR_DXR_display_info.h
-static_assert(XR_DXR_display_info_SPEC_VERSION == 27, "XR_DXR_display_info_SPEC_VERSION moved");
+static_assert(XR_DXR_display_info_SPEC_VERSION == 28, "XR_DXR_display_info_SPEC_VERSION moved");
 static_assert(XR_TYPE_DISPLAY_INFO_DXR == (XrStructureType)1004999003, "XR_TYPE_DISPLAY_INFO_DXR renumbered");
 static_assert(XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR == (XrStructureType)1004999210, "XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR renumbered");
 static_assert(XR_TYPE_DISPLAY_DESKTOP_INFO_DXR == (XrStructureType)1004999211, "XR_TYPE_DISPLAY_DESKTOP_INFO_DXR renumbered");
@@ -186,6 +186,7 @@ static_assert(XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR == (XrStructureType)100499
 static_assert(XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR == (XrStructureType)1004999010, "XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR renumbered");
 static_assert(XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_DXR == (XrStructureType)1004999011, "XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_DXR renumbered");
 static_assert(XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR == (XrStructureType)1004999451, "XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR renumbered");
+static_assert(XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR == (XrStructureType)1004999452, "XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR renumbered");
 static_assert(XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_DXR == (XrStructureType)1004999012, "XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_DXR renumbered");
 static_assert(XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR == (XrStructureType)1004999013, "XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR renumbered");
 static_assert(XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR == (XrStructureType)1004999014, "XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR renumbered");
@@ -256,6 +257,14 @@ static_assert(offsetof(XrEventDataRenderingModeTableChangedDXR, next) == 8, "XrE
 static_assert(offsetof(XrEventDataRenderingModeTableChangedDXR, session) == 16, "XrEventDataRenderingModeTableChangedDXR::session moved");
 static_assert(offsetof(XrEventDataRenderingModeTableChangedDXR, activeModeIndex) == 24, "XrEventDataRenderingModeTableChangedDXR::activeModeIndex moved");
 static_assert(offsetof(XrEventDataRenderingModeTableChangedDXR, flags) == 32, "XrEventDataRenderingModeTableChangedDXR::flags moved");
+static_assert(sizeof(XrDisplayRenderingWorstCaseDXR) == 40, "XrDisplayRenderingWorstCaseDXR size changed");
+static_assert(offsetof(XrDisplayRenderingWorstCaseDXR, type) == 0, "XrDisplayRenderingWorstCaseDXR::type moved");
+static_assert(offsetof(XrDisplayRenderingWorstCaseDXR, next) == 8, "XrDisplayRenderingWorstCaseDXR::next moved");
+static_assert(offsetof(XrDisplayRenderingWorstCaseDXR, maxAtlasWidthPixels) == 16, "XrDisplayRenderingWorstCaseDXR::maxAtlasWidthPixels moved");
+static_assert(offsetof(XrDisplayRenderingWorstCaseDXR, maxAtlasHeightPixels) == 20, "XrDisplayRenderingWorstCaseDXR::maxAtlasHeightPixels moved");
+static_assert(offsetof(XrDisplayRenderingWorstCaseDXR, maxViewWidthPixels) == 24, "XrDisplayRenderingWorstCaseDXR::maxViewWidthPixels moved");
+static_assert(offsetof(XrDisplayRenderingWorstCaseDXR, maxViewHeightPixels) == 28, "XrDisplayRenderingWorstCaseDXR::maxViewHeightPixels moved");
+static_assert(offsetof(XrDisplayRenderingWorstCaseDXR, maxViewCount) == 32, "XrDisplayRenderingWorstCaseDXR::maxViewCount moved");
 static_assert(sizeof(XrEventDataHardwareDisplayStateChangedDXR) == 32, "XrEventDataHardwareDisplayStateChangedDXR size changed");
 static_assert(offsetof(XrEventDataHardwareDisplayStateChangedDXR, type) == 0, "XrEventDataHardwareDisplayStateChangedDXR::type moved");
 static_assert(offsetof(XrEventDataHardwareDisplayStateChangedDXR, next) == 8, "XrEventDataHardwareDisplayStateChangedDXR::next moved");

@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_info 1
-#define XR_DXR_display_info_SPEC_VERSION 27
+#define XR_DXR_display_info_SPEC_VERSION 28
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -500,8 +500,12 @@ static const XrRenderingModeTableChangeFlagsDXR XR_RENDERING_MODE_TABLE_CHANGE_R
  *
  * "Re-read xrEnumerateDisplayRenderingModesDXR and retile; the active index
  * is unchanged." Sent when the user switches the screen's 3D mode (slot 1 now
- * maps to another of the display driver's declared modes), live, with no
- * restart and no swapchain recreation. Rules:
+ * maps to another of the display driver's declared modes), and (v28) when the
+ * window moved to a screen whose table differs (the table follows the screen
+ * the window is on: its view count, tiles and view scale; a straddling window
+ * gets the per-dimension maximum scale), live, with no restart and no
+ * swapchain recreation (the swapchain is sized for
+ * XrDisplayRenderingWorstCaseDXR). Rules:
  * - it is queued after the enumerate already answers the new table;
  * - it is NEVER the answer to xrRequestDisplayRenderingModeDXR (that answer
  *   stays XrEventDataRenderingModeChangedDXR or a denial; "no mode-changed
@@ -521,6 +525,46 @@ typedef struct XrEventDataRenderingModeTableChangedDXR {
     uint32_t                              activeModeIndex; //!< The active index (unchanged by the table change)
     XrRenderingModeTableChangeFlagsDXR    flags;           //!< 0 in v27; see XR_RENDERING_MODE_TABLE_CHANGE_RECREATE_SWAPCHAINS_BIT_DXR
 } XrEventDataRenderingModeTableChangedDXR;
+
+// ---- v28: the instance's worst case (ADR-047 Amendment 10, ADR-066 C1.6) ----
+
+#define XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR ((XrStructureType)1004999452)
+
+/*!
+ * @brief The largest atlas and the largest per-view rect an app may be asked
+ *        for in this instance (v28).
+ *
+ * Chain it to XrSystemProperties at xrGetSystemProperties. The values are the
+ * per-dimension maximum over every rendering mode of every screen the runtime
+ * claimed when the system was created (each screen's 2D and every 3D mode its
+ * display driver declares, at that screen's pixel size and current
+ * orientation), so a window moving between screens, or a live switch of a
+ * screen's 3D mode, never asks for more than this. They are fixed for the
+ * instance. Size swapchains from them once (INV-4.2: "size at the worst case
+ * the runtime states"):
+ *   - one atlas swapchain: maxAtlasWidthPixels x maxAtlasHeightPixels;
+ *   - one swapchain per view: maxViewWidthPixels x maxViewHeightPixels.
+ * An app that sized from displayPixelWidth/Height x the enumerated modes keeps
+ * working; a window on a larger screen is then resampled from what it gets.
+ *
+ * `maxViewCount` is the most views one rendering mode uses
+ * (xrEnumerateDisplayRenderingModesDXR's viewCount can never exceed it). 0 in
+ * any field means "unknown" (no display driver described a screen).
+ *
+ * A screen claimed after the instance was created (hotplug) whose modes need
+ * more than this is shown resampled until the app restarts.
+ *
+ * @extends XrSystemProperties
+ */
+typedef struct XrDisplayRenderingWorstCaseDXR {
+    XrStructureType             type;                 //!< Must be XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR
+    void* XR_MAY_ALIAS          next;
+    uint32_t                    maxAtlasWidthPixels;  //!< Widest atlas (tileColumns x view width) any mode needs
+    uint32_t                    maxAtlasHeightPixels; //!< Tallest atlas (tileRows x view height) any mode needs
+    uint32_t                    maxViewWidthPixels;   //!< Widest single view any mode needs
+    uint32_t                    maxViewHeightPixels;  //!< Tallest single view any mode needs
+    uint32_t                    maxViewCount;         //!< Most views any mode uses
+} XrDisplayRenderingWorstCaseDXR;
 
 /*!
  * @brief Event fired when the physical display hardware state changes.

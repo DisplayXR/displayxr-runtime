@@ -969,8 +969,8 @@ cmd_mode_set(const char *name, const char *screen, bool machine)
 		return 1;
 	}
 	if (!sc->mode_3d.valid) {
-		P("FAIL: the 3D mode of screen '%s' cannot be chosen: no display driver table is known for it here (a "
-		  "secondary screen's own modes come with ADR-047 Amendment 10) — nothing written.\n",
+		P("FAIL: the 3D mode of screen '%s' cannot be chosen: no display driver claims it, so it has no mode "
+		  "table (ADR-047 Amendment 10) — nothing written.\n",
 		  sc->key);
 		free(snap);
 		return 1;

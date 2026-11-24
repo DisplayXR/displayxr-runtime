@@ -53,6 +53,7 @@
 #include "os/os_threading.h"
 #include "os/os_time.h"
 #include "util/u_rendering_modes.h"
+#include "util/u_screen_modes.h"
 #include "util/u_misc.h"
 #include "util/u_status_snapshot.h"
 #include "util/u_time.h"
@@ -343,6 +344,8 @@ live_key(const struct xrt_status_live *live)
 		mix_u64(&h, (uint64_t)(unsigned char)*p);
 	}
 	mix_u64(&h, live->mode_3d.source);
+	// ADR-047 Amendment 10: so does another screen's (its own table's slot 1).
+	mix_u64(&h, u_screen_modes_generation());
 	mix_u64(&h, live->workspace.enabled);
 	mix_str(&h, live->workspace.controller);
 	mix_u64(&h, live->workspace.screen_count);

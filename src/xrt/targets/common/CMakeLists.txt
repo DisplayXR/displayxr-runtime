@@ -22,6 +22,7 @@ add_library(
 			    target_conv_store.c
 			    target_plugin_loader.c target_plugin_loader.h
 			    target_screens.c target_screens.h
+			    target_screen_modes.c target_screen_modes.h
 			    target_display_hotplug.c target_display_hotplug.h
 			    target_status_snapshot.c target_status_snapshot.h
 			    target_screen_pin.c target_screen_pin.h

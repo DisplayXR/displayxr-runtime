@@ -21,6 +21,7 @@
 
 #include "os/os_time.h"
 #include "util/u_rendering_modes.h"
+#include "util/u_screen_modes.h"
 #include "util/u_var.h"
 #include "util/u_misc.h"
 #include "util/u_debug.h"
@@ -1164,6 +1165,8 @@ reprobe_thread_func(void *ptr)
 			if (s->xsysd != NULL && s->xsysd->static_roles.head != NULL) {
 				(void)u_device_rendering_modes_sync(s->xsysd->static_roles.head, now);
 			}
+			// ADR-047 Amendment 10: every other claimed screen's 3D mode too.
+			(void)u_screen_modes_refresh_choices(now, false);
 			os_mutex_lock(&g_reprobe_mutex);
 			if (g_reprobe_stop || g_reprobe_pending) {
 				continue;
@@ -1180,6 +1183,7 @@ reprobe_thread_func(void *ptr)
 		if (s->xsysd != NULL && s->xsysd->static_roles.head != NULL) {
 			(void)u_device_rendering_modes_refresh_config(s->xsysd->static_roles.head, NULL);
 		}
+		(void)u_screen_modes_refresh_choices(os_monotonic_get_ns(), true); // ADR-047 Amendment 10
 		os_mutex_lock(&g_reprobe_mutex);
 	}
 	os_mutex_unlock(&g_reprobe_mutex);

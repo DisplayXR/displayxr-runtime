@@ -14,6 +14,7 @@
 #include "target_conv_status.h"
 #include "target_plugin_loader.h"
 #include "target_screens.h"
+#include "target_screen_modes.h"
 #include "target_viewer_tracking.h"
 
 #include "xrt/xrt_compositor.h" // xrt_dp_factory_registry
@@ -712,6 +713,8 @@ target_status_snapshot_build_headless(struct xrt_instance *xi,
 		if (hr >= 0 && head != NULL) {
 			u_device_rendering_modes_fill_status(head, &out->screens[hr].mode_3d);
 		}
+		// ADR-047 Amendment 10: every other screen's own 3D mode.
+		target_screen_modes_fill_status(&list, &reg, head, out);
 	}
 
 	// ADR-053: conversion providers, described headless (no model load).
@@ -949,6 +952,9 @@ target_status_snapshot_build_service(struct xrt_instance *xi,
 		}
 		out->client_count = nc;
 		merge_live_dps(live, out);
+		// ADR-047 Amendment 10: every other screen's own 3D mode, from the
+		// service's registry (its live slot-1 mapping).
+		target_screen_modes_fill_status(NULL, reg, NULL, out);
 		out->workspace = live->workspace;
 		// ADR-053: the conversion core's rows, as the service's conversion
 		// status source reported them (none registered yet = 0 rows; #2003).
