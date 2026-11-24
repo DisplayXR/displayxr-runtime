@@ -72,11 +72,15 @@
             broker names the slot, which is also what keeps the runtime broker /
             RuntimeService / MonadoService in the main process untouched.
 
-            Same foregroundServiceType as MonadoService above: each satellite
-            calls startForeground() for its own client. specialUse would be the
-            honest type for an always-on compositor, but it requires a
-            PROPERTY_SPECIAL_USE_FGS_SUBTYPE declaration and Play review, so the
-            slots stay consistent with the service they subclass.
+            Same foregroundServiceType as MonadoService above, but a satellite
+            does NOT call startForeground() (RuntimeForegroundPolicy): it lives by
+            its client's binding, and a foreground service anywhere in the
+            runtime uid while the client is in the background parks the uid at
+            AppOps "fgsvc" without the camera capability, which holds the camera
+            refused for the 5 s settle after the client returns. The type stays
+            declared for the debug.dxr.fgs_idle_only=0 kill switch. Never
+            "camera": the OS while-in-use rule stays the backstop of the
+            runtime's own foreground rule (XR_DXR_stereo_camera §7.2).
 
             THE COUNT IS CHECKED: :src:xrt:ipc:checkSatelliteSlotManifest fails
             the build if these entries disagree with dxrSatelliteSlots in

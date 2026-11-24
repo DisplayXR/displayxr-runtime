@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Looper
 import android.os.Process
 import android.util.Log
 import dagger.hilt.android.AndroidEntryPoint
@@ -28,7 +29,7 @@ import org.freedesktop.monado.auxiliary.IServiceNotification
  * This is needed so that the APK can expose the binder service implemented in MonadoImpl.
  */
 @AndroidEntryPoint
-open class MonadoService : Service(), Watchdog.ShutdownListener {
+open class MonadoService : Service(), Watchdog.ShutdownListener, RuntimeForegroundPolicy.Listener {
     private lateinit var binder: MonadoImpl
 
     private lateinit var watchdog: Watchdog
@@ -60,6 +61,14 @@ open class MonadoService : Service(), Watchdog.ShutdownListener {
     /** Off-main-thread timer for the satellite exit backstop; see [scheduleSatelliteExit]. */
     private var exitThread: HandlerThread? = null
 
+    /** Main-process service only: is it a foreground service right now. Main thread. */
+    private var isForegroundNow = false
+
+    /** The notification of the last start, re-used when the policy re-promotes. Main thread. */
+    private var lastNotification: android.app.Notification? = null
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "onCreate: slot=$slotIndex pid=${Process.myPid()}")
@@ -78,6 +87,21 @@ open class MonadoService : Service(), Watchdog.ShutdownListener {
             )
         watchdog.startMonitor()
 
+        if (isSatellite && !legacyForegroundPolicy()) {
+            // A satellite is never a foreground service (see RuntimeForegroundPolicy): it lives
+            // exactly as long as its one client's binding, which already carries the client's
+            // importance (BIND_IMPORTANT | BIND_ABOVE_CLIENT | BIND_INCLUDE_CAPABILITIES). Being a
+            // foreground service would only park the runtime uid at AppOps "fgsvc" without the
+            // camera capability while the client is in the background, and delay the camera by
+            // the 5 s settle on its return. No self-start either: nothing is left to foreground.
+            Log.w(TAG, "onCreate: satellite slot $slotIndex runs WITHOUT a foreground service " +
+                "(lives by its client's binding; debug.dxr.fgs_idle_only=0 restores the old FGS)")
+            return
+        }
+        if (!isSatellite && !legacyForegroundPolicy()) {
+            RuntimeForegroundPolicy.setListener(this, this)
+        }
+
         // start the service so it could be foregrounded
         val intent = Intent(this, javaClass)
         intent.action = BuildConfig.SERVICE_ACTION
@@ -88,6 +112,9 @@ open class MonadoService : Service(), Watchdog.ShutdownListener {
         super.onDestroy()
         Log.d(TAG, "onDestroy")
 
+        if (!isSatellite) {
+            RuntimeForegroundPolicy.setListener(this, null)
+        }
         binder.shutdown()
         watchdog.stopMonitor()
         if (isSatellite) {
@@ -112,6 +139,11 @@ open class MonadoService : Service(), Watchdog.ShutdownListener {
     override fun onBind(intent: Intent): IBinder? {
         Log.d(TAG, "onBind")
         watchdog.onClientConnected()
+        if (!isSatellite) {
+            // A client of the main-process service itself (workspace controller, overlay
+            // joiners, all-slots-busy fallback): attached, so no foreground service needed.
+            RuntimeForegroundPolicy.directClient(+1, "main-process service bound")
+        }
         return binder
     }
 
@@ -135,21 +167,80 @@ open class MonadoService : Service(), Watchdog.ShutdownListener {
             )
 
         val notification = serviceNotification.buildNotification(this, pendingShutdownIntent)
+        lastNotification = notification
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                notificationId,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST,
+        // Always promote on a start: a start may come from startForegroundService() (the boot
+        // receiver, the notification's shutdown action), which must be answered by
+        // startForeground() whatever the policy says. The policy then drops it again at once
+        // when a client is attached.
+        promoteForeground("start")
+        val attached = !RuntimeForegroundPolicy.foregroundWanted()
+        if (!isSatellite && !legacyForegroundPolicy() && attached) {
+            demoteForeground("start with a client attached")
+        }
+    }
+
+    /** startForeground with the last notification. Main thread. False = the OS refused it. */
+    private fun promoteForeground(why: String): Boolean {
+        val notification = lastNotification ?: return false
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    notificationId,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST,
+                )
+            } else {
+                startForeground(notificationId, notification)
+            }
+            if (!isForegroundNow && !isSatellite) {
+                Log.w(TAG, "foreground service: ON ($why)")
+            }
+            isForegroundNow = true
+            true
+        } catch (e: RuntimeException) {
+            // Android 12+ ForegroundServiceStartNotAllowedException: the last client went away
+            // while the runtime was in the background and the runtime is not exempt (e.g. no
+            // battery-optimisation exemption). The service stays started but not foreground;
+            // the next start or the next "no client" transition tries again.
+            Log.w(
+                TAG,
+                "foreground service: could NOT be re-entered ($why): $e — the runtime stays " +
+                    "started but not foreground until the next attempt",
             )
-        } else {
-            startForeground(notificationId, notification)
+            false
+        }
+    }
+
+    /** stopForeground, keeping the notification (and its shutdown action) on screen. Main thread. */
+    private fun demoteForeground(why: String) {
+        @Suppress("DEPRECATION")
+        stopForeground(STOP_FOREGROUND_DETACH)
+        if (isForegroundNow) {
+            Log.w(TAG, "foreground service: OFF ($why)")
+        }
+        isForegroundNow = false
+    }
+
+    /** [RuntimeForegroundPolicy.Listener]: any thread; applied on the main thread. */
+    override fun onForegroundWanted(foreground: Boolean, why: String) {
+        mainHandler.post {
+            if (foreground) {
+                if (!isForegroundNow) {
+                    promoteForeground("no client attached: $why")
+                }
+            } else if (isForegroundNow) {
+                demoteForeground("client attached: $why")
+            }
         }
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
         Log.d(TAG, "onUnbind")
         watchdog.onClientDisconnected()
+        if (!isSatellite) {
+            RuntimeForegroundPolicy.directClient(-1, "main-process service unbound")
+        }
         if (isSatellite) {
             // A satellite hosts exactly one client, so its client unbinding IS the end of this
             // process's reason to exist. Tear down rather than idle: the vendor core, the GPU
@@ -196,6 +287,9 @@ open class MonadoService : Service(), Watchdog.ShutdownListener {
     override fun onRebind(intent: Intent?) {
         Log.d(TAG, "onRebind")
         watchdog.onClientConnected()
+        if (!isSatellite) {
+            RuntimeForegroundPolicy.directClient(+1, "main-process service re-bound")
+        }
     }
 
     override fun onPrepareShutdown() {
@@ -220,8 +314,12 @@ open class MonadoService : Service(), Watchdog.ShutdownListener {
         // Staying resident is also what this runtime does on Windows, where
         // displayxr-service.exe is the always-on orchestrator started at logon
         // (docs/architecture/service-architecture.md). Android now matches it.
-        // We are a foreground service with a notification that carries a
-        // shutdown action, so the user keeps an explicit way out.
+        // Between clients we are a foreground service with a notification that
+        // carries a shutdown action, so the user keeps an explicit way out. While
+        // a client is attached the foreground service is dropped (the notification
+        // stays) — its bindings keep us alive then, and a foreground service would
+        // delay the camera by 5 s after every return from the background
+        // (RuntimeForegroundPolicy).
         //
         // Kill switch: `adb shell setprop debug.dxr.service_resident 0` restores
         // the old stop-when-idle behaviour.
@@ -234,18 +332,36 @@ open class MonadoService : Service(), Watchdog.ShutdownListener {
     }
 
     /** #1245 kill switch — `debug.dxr.service_resident=0` opts out. */
-    private fun residentModeEnabled(): Boolean =
+    private fun residentModeEnabled(): Boolean = boolProperty("debug.dxr.service_resident", true)
+
+    /**
+     * Kill switch for [RuntimeForegroundPolicy]: `debug.dxr.fgs_idle_only=0` restores the old
+     * behaviour (the main service AND every satellite always foreground) — read at service
+     * creation, so restart the runtime after changing it.
+     */
+    private fun legacyForegroundPolicy(): Boolean = !boolProperty("debug.dxr.fgs_idle_only", true)
+
+    private fun boolProperty(name: String, default: Boolean): Boolean =
         try {
             val v = Class.forName("android.os.SystemProperties")
                 .getMethod("get", String::class.java, String::class.java)
-                .invoke(null, "debug.dxr.service_resident", "1") as String
+                .invoke(null, name, if (default) "1" else "0") as String
             v != "0" && !v.equals("false", ignoreCase = true)
         } catch (_: Throwable) {
-            true
+            default
         }
 
     private fun handleShutdown() {
+        // The shutdown action is a startForegroundService(): answer it with startForeground()
+        // even when the policy had dropped the foreground service, then stop.
+        if (!isForegroundNow) {
+            promoteForeground("shutdown request")
+        }
         stopForeground(true)
+        isForegroundNow = false
+        if (!isSatellite) {
+            RuntimeForegroundPolicy.serviceStoppedOnPurpose()
+        }
         stopSelf()
     }
 
