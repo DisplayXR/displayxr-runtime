@@ -374,6 +374,12 @@ jobs:
         # INV-3.1 errors.
         run: python3 scripts/tests/test_check_displayxr_app_skip_build_trees.py
 
+      - name: Weave QA unit tests (tools/weave_qa)
+        # Hermetic (standard library only): the sr_config.ini [Service] edit, the switch
+        # against a fake SR Eye Tracker (and that the file is restored after a failure),
+        # and display-mm -> GRBL G-code against a fake serial port.
+        run: python3 scripts/tests/test_weave_qa.py
+
       - name: App-linter INV-2.9 mode-switch easing unit tests
         # Hermetic. Pins the per-leg "requests modes but never uses dxr::ModeSwitch"
         # check: the runtime never eases a 2D<->3D switch, the app must.

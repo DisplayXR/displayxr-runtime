@@ -24,6 +24,7 @@
 #include "hud_renderer.h"
 #include "projection_depth.h"
 #include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
+#include "weave_pattern_test.h" // tools/weave_qa: side-by-side test patterns, one half per view
 #include "text_overlay.h"
 #include "tracking_loss_director.h" // MANUAL eye-tracking demo (T + L)
 #include "xr_session.h"
@@ -1451,6 +1452,45 @@ static bool StereoPhotoWriteView(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex,
     return true;
 }
 
+// tools/weave_qa (DISPLAYXR_WEAVE_PATTERN): side-by-side test images, the left half in
+// view 0 and the right half in view 1, full screen, with no cube, HUD or status bar, so a
+// stereo camera in front of the panel can measure the weave (test_apps/common/weave_pattern_test.h).
+static dxr_test::WeavePattern g_weavePattern;
+
+static bool WeavePatternWriteView(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, DXGI_FORMAT fmt, UINT subresource,
+                                  int eye, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    bool bgra;
+    switch (fmt) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: bgra = true; break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: bgra = false; break;
+    default: {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_ERROR("weave pattern: swapchain format %d is not 8-bit RGBA/BGRA - cannot show the pattern", (int)fmt);
+        }
+        return false;
+    }
+    }
+    if (w == 0 || h == 0) return false;
+    static int logged = -1;
+    const int shown = g_weavePattern.current();
+    if (shown != logged && eye == 0) {
+        logged = shown;
+        LOG_INFO("weave pattern: showing %s in %ux%u per view (format %d)",
+                 g_weavePattern.images[shown].path.c_str(), w, h, (int)fmt);
+    }
+    const std::vector<uint8_t>& px = g_weavePattern.view(eye, w, h, bgra);
+    const D3D11_BOX box = {x, y, 0, x + w, y + h, 1};
+    ctx->UpdateSubresource(tex, subresource, &box, px.data(), w * 4, 0);
+    return true;
+}
+
 static void CursorQuatRotate(const XrQuaternionf& q, float vx, float vy, float vz, XrVector3f& out)
 {
     // v' = v + 2w (q x v) + 2 q x (q x v)
@@ -2503,13 +2543,20 @@ static void RenderOneFrame(RenderState& rs) {
 
                             // Amendment 3 test content: the stereo photo in place
                             // of the cube (3D only; 2D keeps the cube).
-                            const bool photoDrawn =
-                                g_stereoPhoto && !monoMode &&
+                            const bool patternDrawn =
+                                g_weavePattern.active() && !monoMode &&
+                                WeavePatternWriteView(renderer.context.Get(), swapchainTexture,
+                                                      static_cast<DXGI_FORMAT>(xr.swapchain.format),
+                                                      arrayLayout ? D3D11CalcSubresource(0, (UINT)eye, 1) : 0, eye,
+                                                      (uint32_t)vp.TopLeftX, (uint32_t)vp.TopLeftY,
+                                                      (uint32_t)vp.Width, (uint32_t)vp.Height);
+                            const bool photoDrawn = patternDrawn ||
+                                (g_stereoPhoto && !monoMode &&
                                 StereoPhotoWriteView(renderer.context.Get(), swapchainTexture,
                                                      static_cast<DXGI_FORMAT>(xr.swapchain.format),
                                                      arrayLayout ? D3D11CalcSubresource(0, (UINT)eye, 1) : 0, eye,
                                                      eyeCount, (uint32_t)vp.TopLeftX, (uint32_t)vp.TopLeftY,
-                                                     (uint32_t)vp.Width, (uint32_t)vp.Height);
+                                                     (uint32_t)vp.Width, (uint32_t)vp.Height));
                             if (!photoDrawn) {
                                 RenderScene(renderer, viewRtv, eyeDSV,
                                     renderW, renderH,
@@ -2524,7 +2571,7 @@ static void RenderOneFrame(RenderState& rs) {
                             // collapsing, red flat; blue/red in MANAGED).
                             // Drawn whenever display_info is there: a display that
                             // does not track gets a grey "NO EYE TRACKING" bar.
-                            if (xr.hasDisplayInfoExt) {
+                            if (xr.hasDisplayInfoExt && !g_weavePattern.active()) {
                                 const bool manualEt =
                                     xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANUAL_DXR;
                                 g_lossDirector.SetCaps(xr.supportedEyeTrackingModes);
@@ -3118,6 +3165,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         const char* sp = getenv("DISPLAYXR_STEREO_PHOTO");
         g_stereoPhoto = g_cursorMeasured || (sp != nullptr && sp[0] == '1');
     }
+    {
+        std::string bad;
+        if (g_weavePattern.loadFromEnvironment(bad)) {
+            if (!bad.empty()) {
+                LOG_ERROR("weave pattern: cannot load %s", bad.c_str());
+                return 3;
+            }
+            LOG_INFO("weave pattern: %d image(s), %d ms each, full screen", (int)g_weavePattern.images.size(),
+                     g_weavePattern.periodMs);
+        }
+    }
 
     // INV-1.3: open on the 3D panel (#715) — one-shot move to the panel's
     // desktop position reported by xrGetSystemProperties (virtual-screen
@@ -3268,6 +3326,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Show window
     ShowWindow(hwnd, nCmdShow);
+    if (g_weavePattern.active() && !g_fullscreen) ToggleFullscreen(hwnd); // the pattern fills the panel
     UpdateWindow(hwnd);
 
     // Create single depth buffer at full swapchain dimensions
