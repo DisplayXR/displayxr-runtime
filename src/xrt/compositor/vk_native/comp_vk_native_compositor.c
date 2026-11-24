@@ -6894,14 +6894,18 @@ vk_wl_seg_place(struct comp_vk_native_compositor *c)
 	}
 	c->seg_window = win;
 	c->have_seg_window = true;
-	// The canvas follows the window off the panel too: vk_update_present_origin
+	// The canvas follows the window OFF the panel too: vk_update_present_origin
 	// caches the client size only from panel-scoped metrics, which are refused
 	// off the panel (#1654), so a window that never reached the panel had no
-	// canvas at all, and one that left it kept its size from there. Same
-	// source as that read (the geometry service's content rect, device px).
-	c->last_window_px_w = win.w;
-	c->last_window_px_h = win.h;
-	c->have_last_window_size = true;
+	// canvas at all, and one that left it kept its size from there. Off the
+	// panel the canvas is the placed window — the buffer the segments are cut
+	// from. ON the panel that read stays the only source, unchanged: the
+	// canvas there feeds the panel-scoped projection, in the panel's own px.
+	if ((c->seg_screens->screens[mon].flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) == 0) {
+		c->last_window_px_w = win.w;
+		c->last_window_px_h = win.h;
+		c->have_last_window_size = true;
+	}
 	return true;
 }
 
