@@ -22,6 +22,7 @@
 #include "util/u_camera_consent.h"
 #include "util/u_app_share_fake.h"
 
+#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -141,6 +142,8 @@ struct scm_fixture
 	uint64_t slot_stride;
 	//! ADR-061: the app metadata of the last acquired frame.
 	struct xrt_app_share_frame_info last_app;
+	//! Spec v8: the capture state of the last acquired frame.
+	struct xrt_stereo_camera_capture_result last_result;
 #ifdef XRT_OS_WINDOWS
 	HANDLE section;
 #else
@@ -498,7 +501,7 @@ scm_properties(struct scm_fixture *f, uint32_t index, struct xrt_stereo_camera_p
 xrt_result_t
 scm_calibration(struct scm_fixture *f, uint64_t camera_id, uint32_t output, struct xrt_stereo_camera_calibration *out)
 {
-	return ipc_handle_stereo_camera_get_calibration(&f->ics, camera_id, output, out);
+	return ipc_handle_stereo_camera_get_calibration(&f->ics, camera_id, output, 0, 0, out);
 }
 
 xrt_result_t
@@ -548,7 +551,8 @@ scm_acquire(struct scm_fixture *f,
             struct xrt_stereo_camera_frame_info *out_frame,
             const uint8_t **out_slot)
 {
-	xrt_result_t xret = ipc_handle_stereo_camera_acquire(&f->ics, id, out_ready, out_frame, &f->last_app);
+	xrt_result_t xret =
+	    ipc_handle_stereo_camera_acquire(&f->ics, id, out_ready, out_frame, &f->last_app, &f->last_result);
 	*out_slot = NULL;
 	if (xret == XRT_SUCCESS && *out_ready && f->map != NULL) {
 		*out_slot = f->map + (uint64_t)out_frame->slot * f->slot_stride;
@@ -1186,4 +1190,389 @@ scm_status(uint32_t *out_share_streams, char *out_shares, size_t cap)
 	*out_share_streams = st.share_streams;
 	snprintf(out_shares, cap, "%s", st.shares);
 	return true;
+}
+
+
+/*
+ *
+ * Spec v8 fake plug-in (see the header).
+ *
+ */
+
+static struct
+{
+	pthread_mutex_t lock;
+	struct scm_v8_state st;
+	bool refuse_modes;
+	uint32_t run_w, run_h; //!< the running mode
+	uint8_t *frame;
+	uint64_t seq;
+	bool still_pending;
+	uint32_t still_polls;
+	uint8_t *still;
+	struct xrt_plugin_stereo_camera_controls ctl;
+} g_v8 = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
+static const struct xrt_plugin_stereo_camera_mode k_v8_modes[4] = {
+    {sizeof(struct xrt_plugin_stereo_camera_mode), 320, 240, 30.0f,
+     XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM | XRT_PLUGIN_STEREO_CAMERA_MODE_STILL},
+    {sizeof(struct xrt_plugin_stereo_camera_mode), 160, 120, 30.0f, XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM},
+    {sizeof(struct xrt_plugin_stereo_camera_mode), 640, 480, 15.0f,
+     XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM | XRT_PLUGIN_STEREO_CAMERA_MODE_STILL},
+    {sizeof(struct xrt_plugin_stereo_camera_mode), 640, 360, 30.0f, XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM},
+};
+
+static uint32_t
+v8_enumerate(struct xrt_plugin_instance *inst, uint32_t capacity, struct xrt_plugin_stereo_camera_info *out)
+{
+	(void)inst;
+	if (capacity >= 1 && out != NULL) {
+		snprintf(out->display_name, sizeof(out->display_name), "v8 fake");
+		snprintf(out->device_identity, sizeof(out->device_identity), "v8-0001");
+		out->flags = XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED | XRT_PLUGIN_STEREO_CAMERA_CALIBRATED |
+		             XRT_PLUGIN_STEREO_CAMERA_MONOCHROME;
+		out->eye_width = 320;
+		out->eye_height = 240;
+		out->max_frame_rate = 30.0f;
+		out->native_format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8;
+	}
+	return 1;
+}
+
+static xrt_result_t
+v8_get_calibration(struct xrt_plugin_instance *inst, uint32_t index, struct xrt_plugin_stereo_camera_calibration *out)
+{
+	(void)inst;
+	(void)index;
+	out->image_width = 320;
+	out->image_height = 240;
+	for (int e = 0; e < 2; e++) {
+		out->k[e][0] = 200.0;
+		out->k[e][1] = 200.0;
+		out->k[e][2] = 159.5;
+		out->k[e][3] = 119.5;
+	}
+	out->distortion_model = XRT_PLUGIN_STEREO_CAMERA_DISTORTION_NONE;
+	out->rotation_right_from_left[0][0] = out->rotation_right_from_left[1][1] =
+	    out->rotation_right_from_left[2][2] = 1.0;
+	out->translation_right_from_left_mm[0] = -50.0;
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+v8_open(struct xrt_plugin_instance *inst, uint32_t index, struct xrt_plugin_stereo_camera **out_cam)
+{
+	(void)inst;
+	(void)index;
+	pthread_mutex_lock(&g_v8.lock);
+	g_v8.run_w = 320; // a camera opens in mode 0
+	g_v8.run_h = 240;
+	pthread_mutex_unlock(&g_v8.lock);
+	*out_cam = (struct xrt_plugin_stereo_camera *)calloc(1, sizeof(struct xrt_plugin_stereo_camera));
+	return *out_cam != NULL ? XRT_SUCCESS : XRT_ERROR_ALLOCATION;
+}
+
+static uint32_t
+v8_wait_frame(struct xrt_plugin_stereo_camera *cam, int64_t timeout_ns, struct xrt_plugin_stereo_camera_frame *out)
+{
+	(void)cam;
+	(void)timeout_ns;
+	os_nanosleep(5 * 1000 * 1000);
+	pthread_mutex_lock(&g_v8.lock);
+	const uint32_t w = g_v8.run_w, h = g_v8.run_h;
+	uint8_t *buf = realloc(g_v8.frame, (size_t)2 * w * h);
+	if (buf == NULL) {
+		pthread_mutex_unlock(&g_v8.lock);
+		return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
+	}
+	g_v8.frame = buf;
+	for (uint32_t y = 0; y < h; y++) {
+		memset(buf + (size_t)y * 2 * w, 50, w);
+		memset(buf + (size_t)y * 2 * w + w, 200, w);
+	}
+	g_v8.seq++;
+	memset(out, 0, sizeof(*out));
+	out->sequence = g_v8.seq;
+	out->time_ns = (int64_t)os_monotonic_get_ns();
+	out->time_is_exposure = true;
+	out->width = 2 * w;
+	out->height = h;
+	out->format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8;
+	out->planes[0] = buf;
+	out->pitches[0] = 2 * w;
+	pthread_mutex_unlock(&g_v8.lock);
+	return XRT_PLUGIN_STEREO_CAMERA_WAIT_OK;
+}
+
+static uint32_t
+v8_enumerate_modes(struct xrt_plugin_instance *inst,
+                   uint32_t index,
+                   uint32_t capacity,
+                   struct xrt_plugin_stereo_camera_mode *out)
+{
+	(void)inst;
+	(void)index;
+	for (uint32_t i = 0; i < 4 && i < capacity && out != NULL; i++) {
+		out[i] = k_v8_modes[i];
+	}
+	return 4;
+}
+
+static xrt_result_t
+v8_set_mode(struct xrt_plugin_stereo_camera *cam, uint32_t mode_index)
+{
+	(void)cam;
+	pthread_mutex_lock(&g_v8.lock);
+	g_v8.st.set_mode_calls++;
+	xrt_result_t xret = XRT_SUCCESS;
+	if (mode_index >= 4 || (g_v8.refuse_modes && mode_index != 0)) {
+		xret = XRT_ERROR_INPUT_UNSUPPORTED;
+	} else {
+		g_v8.st.last_mode_index = mode_index;
+		g_v8.run_w = k_v8_modes[mode_index].eye_width;
+		g_v8.run_h = k_v8_modes[mode_index].eye_height;
+	}
+	pthread_mutex_unlock(&g_v8.lock);
+	return xret;
+}
+
+static xrt_result_t
+v8_get_control_caps(struct xrt_plugin_instance *inst, uint32_t index, struct xrt_plugin_stereo_camera_control_caps *out)
+{
+	(void)inst;
+	(void)index;
+	out->supported_controls = 0xF;
+	out->supported_focus_modes = 0x1E;
+	out->min_focus_distance_diopters = 5.0f;
+	out->focus_distance_calibration = XRT_PLUGIN_STEREO_CAMERA_FOCUS_APPROXIMATE;
+	out->exposure_compensation_min_ev = -2.0f;
+	out->exposure_compensation_max_ev = 2.0f;
+	out->exposure_compensation_step_ev = 0.5f;
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+v8_set_controls(struct xrt_plugin_stereo_camera *cam, const struct xrt_plugin_stereo_camera_controls *c)
+{
+	(void)cam;
+	pthread_mutex_lock(&g_v8.lock);
+	g_v8.st.controls_calls++;
+	g_v8.st.last_controls = *c;
+	g_v8.ctl = *c;
+	pthread_mutex_unlock(&g_v8.lock);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+v8_get_capture_result(struct xrt_plugin_stereo_camera *cam, struct xrt_plugin_stereo_camera_capture_result *out)
+{
+	(void)cam;
+	pthread_mutex_lock(&g_v8.lock);
+	const bool manual = (g_v8.ctl.valid_controls & XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE) != 0;
+	out->valid_fields =
+	    XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_DISTANCE | XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_STATE;
+	out->focus_distance_diopters = manual ? g_v8.ctl.focus_distance_diopters : 0.5f;
+	out->focus_state = XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_LOCKED;
+	pthread_mutex_unlock(&g_v8.lock);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+v8_request_still(struct xrt_plugin_stereo_camera *cam, const struct xrt_plugin_stereo_camera_still_request *req)
+{
+	(void)cam;
+	pthread_mutex_lock(&g_v8.lock);
+	g_v8.st.still_requests++;
+	g_v8.st.last_still_w = req->eye_width;
+	g_v8.st.last_still_h = req->eye_height;
+	g_v8.still_pending = true;
+	g_v8.still_polls = 0;
+	pthread_mutex_unlock(&g_v8.lock);
+	return XRT_SUCCESS;
+}
+
+static uint32_t
+v8_poll_still(struct xrt_plugin_stereo_camera *cam,
+              struct xrt_plugin_stereo_camera_still *out,
+              struct xrt_plugin_stereo_camera_capture_result *out_result)
+{
+	(void)cam;
+	pthread_mutex_lock(&g_v8.lock);
+	if (!g_v8.still_pending) {
+		pthread_mutex_unlock(&g_v8.lock);
+		return XRT_PLUGIN_STEREO_CAMERA_STILL_FAILED;
+	}
+	if (g_v8.still_polls++ < 2) { // a little capture latency
+		pthread_mutex_unlock(&g_v8.lock);
+		return XRT_PLUGIN_STEREO_CAMERA_STILL_NONE;
+	}
+	const uint32_t w = g_v8.st.last_still_w, h = g_v8.st.last_still_h;
+	free(g_v8.still);
+	g_v8.still = (uint8_t *)malloc((size_t)2 * w * h);
+	for (uint32_t y = 0; y < h && g_v8.still != NULL; y++) {
+		memset(g_v8.still + (size_t)y * 2 * w, 60, w);
+		memset(g_v8.still + (size_t)y * 2 * w + w, 180, w);
+	}
+	out->width = 2 * w;
+	out->height = h;
+	out->format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8;
+	out->planes[0] = g_v8.still;
+	out->pitches[0] = 2 * w;
+	out->time_ns = (int64_t)os_monotonic_get_ns();
+	out->time_is_exposure = 1;
+	out_result->valid_fields = XRT_PLUGIN_STEREO_CAMERA_RESULT_SENSITIVITY;
+	out_result->sensitivity_iso = 400;
+	g_v8.still_pending = false;
+	pthread_mutex_unlock(&g_v8.lock);
+	return g_v8.still != NULL ? XRT_PLUGIN_STEREO_CAMERA_STILL_READY : XRT_PLUGIN_STEREO_CAMERA_STILL_FAILED;
+}
+
+static void
+v8_release_still(struct xrt_plugin_stereo_camera *cam)
+{
+	(void)cam;
+}
+
+struct scm_fixture *
+scm_create_v8_plugin(void)
+{
+	pthread_mutex_lock(&g_v8.lock);
+	memset(&g_v8.st, 0, sizeof(g_v8.st));
+	memset(&g_v8.ctl, 0, sizeof(g_v8.ctl));
+	g_v8.refuse_modes = false;
+	g_v8.still_pending = false;
+	pthread_mutex_unlock(&g_v8.lock);
+	memset(&g_fake_iface, 0, sizeof(g_fake_iface));
+	g_fake_iface.struct_size = (uint32_t)sizeof(g_fake_iface);
+	g_fake_iface.stereo_camera_enumerate = v8_enumerate;
+	g_fake_iface.stereo_camera_get_calibration = v8_get_calibration;
+	g_fake_iface.stereo_camera_open = v8_open;
+	g_fake_iface.stereo_camera_wait_frame = v8_wait_frame;
+	g_fake_iface.stereo_camera_release_frame = fake_release_frame;
+	g_fake_iface.stereo_camera_close = fake_close;
+	g_fake_iface.stereo_camera_enumerate_modes = v8_enumerate_modes;
+	g_fake_iface.stereo_camera_set_mode = v8_set_mode;
+	g_fake_iface.stereo_camera_get_control_caps = v8_get_control_caps;
+	g_fake_iface.stereo_camera_set_controls = v8_set_controls;
+	g_fake_iface.stereo_camera_get_capture_result = v8_get_capture_result;
+	g_fake_iface.stereo_camera_request_still = v8_request_still;
+	g_fake_iface.stereo_camera_poll_still = v8_poll_still;
+	g_fake_iface.stereo_camera_release_still = v8_release_still;
+	memset(&g_fake_xinst, 0, sizeof(g_fake_xinst));
+	g_fake_xinst.get_active_plugin = fake_get_active_plugin;
+	return create_with(NULL, &g_fake_xinst, -1, 0);
+}
+
+void
+scm_v8_refuse_modes(bool refuse)
+{
+	pthread_mutex_lock(&g_v8.lock);
+	g_v8.refuse_modes = refuse;
+	pthread_mutex_unlock(&g_v8.lock);
+}
+
+void
+scm_v8_get_state(struct scm_v8_state *out)
+{
+	pthread_mutex_lock(&g_v8.lock);
+	*out = g_v8.st;
+	pthread_mutex_unlock(&g_v8.lock);
+}
+
+xrt_result_t
+scm_calibration_mode(struct scm_fixture *f,
+                     uint64_t camera_id,
+                     uint32_t output,
+                     uint32_t eye_w,
+                     uint32_t eye_h,
+                     struct xrt_stereo_camera_calibration *out)
+{
+	return ipc_handle_stereo_camera_get_calibration(&f->ics, camera_id, output, eye_w, eye_h, out);
+}
+
+xrt_result_t
+scm_modes(struct scm_fixture *f, uint64_t camera_id, struct xrt_stereo_camera_mode_list *out)
+{
+	return ipc_handle_stereo_camera_get_modes(&f->ics, camera_id, out);
+}
+
+xrt_result_t
+scm_control_caps(struct scm_fixture *f, uint64_t camera_id, struct xrt_stereo_camera_control_caps *out)
+{
+	return ipc_handle_stereo_camera_get_control_caps(&f->ics, camera_id, out);
+}
+
+xrt_result_t
+scm_set_controls(struct scm_fixture *f, uint64_t stream_id, const struct xrt_stereo_camera_controls *c)
+{
+	return ipc_handle_stereo_camera_set_controls(&f->ics, stream_id, c);
+}
+
+xrt_result_t
+scm_release_controls(struct scm_fixture *f, uint64_t stream_id)
+{
+	return ipc_handle_stereo_camera_release_controls(&f->ics, stream_id);
+}
+
+struct xrt_stereo_camera_capture_result
+scm_last_result(struct scm_fixture *f)
+{
+	return f->last_result;
+}
+
+xrt_result_t
+scm_stream_stop(struct scm_fixture *f, uint64_t id)
+{
+	return ipc_handle_stereo_camera_stream_stop(&f->ics, id);
+}
+
+xrt_result_t
+scm_request_still(struct scm_fixture *f,
+                  uint64_t stream_id,
+                  const struct xrt_stereo_camera_still_request *req,
+                  uint64_t *out_request_id)
+{
+	return ipc_handle_stereo_camera_request_still(&f->ics, stream_id, req, out_request_id);
+}
+
+xrt_result_t
+scm_acquire_still(struct scm_fixture *f,
+                  uint64_t stream_id,
+                  uint64_t request_id,
+                  struct xrt_stereo_camera_still_info *out_info,
+                  uint8_t *out_pixels,
+                  size_t cap)
+{
+	xrt_shmem_handle_t h = XRT_SHMEM_HANDLE_INVALID;
+	uint32_t count = 0;
+	xrt_result_t xret =
+	    ipc_handle_stereo_camera_acquire_still(&f->ics, stream_id, request_id, out_info, 1, &h, &count);
+	if (xret != XRT_SUCCESS || count != 1) {
+		return xret != XRT_SUCCESS ? xret : XRT_ERROR_IPC_FAILURE;
+	}
+	const size_t size = (size_t)out_info->section_size;
+	const size_t n = size < cap ? size : cap;
+	// The handler hands out the manager's read-only handle: map it read-only.
+#ifdef XRT_OS_WINDOWS
+	const uint8_t *p = (const uint8_t *)MapViewOfFile(h, FILE_MAP_READ, 0, 0, (SIZE_T)size);
+	if (p == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	memcpy(out_pixels, p, n);
+	UnmapViewOfFile((LPCVOID)p);
+#else
+	void *p = mmap(NULL, size, PROT_READ, MAP_SHARED, h, 0);
+	if (p == MAP_FAILED) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	memcpy(out_pixels, p, n);
+	munmap(p, size);
+#endif
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+scm_release_still(struct scm_fixture *f, uint64_t stream_id, uint64_t request_id)
+{
+	return ipc_handle_stereo_camera_release_still(&f->ics, stream_id, request_id);
 }

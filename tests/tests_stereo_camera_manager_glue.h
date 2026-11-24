@@ -9,6 +9,7 @@
 #pragma once
 
 #include "xrt/xrt_stereo_camera.h"
+#include "xrt/xrt_plugin.h"
 #include "util/u_stereo_uvc.h"
 #include "xrt/xrt_share_link.h"
 
@@ -281,6 +282,86 @@ scm_stop_all(void);
 
 bool
 scm_status(uint32_t *out_share_streams, char *out_shares, size_t cap);
+
+
+/*
+ * Spec v8: a fake plug-in with modes, controls, a capture result and stills.
+ * One camera, GRAY8, natively rectified and calibrated (a parallel pinhole at
+ * 320x240: fx 200, principal point (159.5, 119.5), baseline 50 mm). It lists
+ * modes 320x240 (default, STREAM + STILL), 160x120 (STREAM), 640x480 (STREAM
+ * + STILL) and 640x360 (another aspect: the manager must drop it). Frames are
+ * delivered every 5 ms at the running mode's size: left half 50, right half
+ * 200. A still is a GRAY8 pair at the asked size: left 60, right 180.
+ */
+
+struct scm_v8_state
+{
+	uint32_t set_mode_calls;
+	uint32_t last_mode_index; //!< plug-in index of the last successful set_mode
+	uint32_t controls_calls;
+	struct xrt_plugin_stereo_camera_controls last_controls;
+	uint32_t still_requests;
+	uint32_t last_still_w, last_still_h;
+};
+
+struct scm_fixture *
+scm_create_v8_plugin(void);
+
+//! The fake refuses every set_mode to a mode other than 0 from now on.
+void
+scm_v8_refuse_modes(bool refuse);
+
+//! A copy of what the fake plug-in saw.
+void
+scm_v8_get_state(struct scm_v8_state *out);
+
+xrt_result_t
+scm_calibration_mode(struct scm_fixture *f,
+                     uint64_t camera_id,
+                     uint32_t output,
+                     uint32_t eye_w,
+                     uint32_t eye_h,
+                     struct xrt_stereo_camera_calibration *out);
+
+xrt_result_t
+scm_modes(struct scm_fixture *f, uint64_t camera_id, struct xrt_stereo_camera_mode_list *out);
+
+xrt_result_t
+scm_control_caps(struct scm_fixture *f, uint64_t camera_id, struct xrt_stereo_camera_control_caps *out);
+
+xrt_result_t
+scm_set_controls(struct scm_fixture *f, uint64_t stream_id, const struct xrt_stereo_camera_controls *c);
+
+xrt_result_t
+scm_release_controls(struct scm_fixture *f, uint64_t stream_id);
+
+//! The capture state of the last scm_acquire'd frame.
+struct xrt_stereo_camera_capture_result
+scm_last_result(struct scm_fixture *f);
+
+xrt_result_t
+scm_stream_stop(struct scm_fixture *f, uint64_t id);
+
+xrt_result_t
+scm_request_still(struct scm_fixture *f,
+                  uint64_t stream_id,
+                  const struct xrt_stereo_camera_still_request *req,
+                  uint64_t *out_request_id);
+
+/*!
+ * Acquire the still and copy its pixels (read-only mapping, as a consumer
+ * does) into @p out_pixels (up to @p cap bytes).
+ */
+xrt_result_t
+scm_acquire_still(struct scm_fixture *f,
+                  uint64_t stream_id,
+                  uint64_t request_id,
+                  struct xrt_stereo_camera_still_info *out_info,
+                  uint8_t *out_pixels,
+                  size_t cap);
+
+xrt_result_t
+scm_release_still(struct scm_fixture *f, uint64_t stream_id, uint64_t request_id);
 
 #ifdef __cplusplus
 }

@@ -2137,3 +2137,398 @@ TEST_CASE("app share link: an incomplete ring hook table is refused whole", "[st
 	scm_destroy(f);
 	scm_set_link_importer(false, nullptr);
 }
+
+
+/*
+ *
+ * Spec v8: modes, controls, stills — through the real manager over a fake
+ * plug-in (tests_stereo_camera_manager_glue.h, scm_create_v8_plugin).
+ *
+ */
+
+namespace {
+
+xrt_stereo_camera_stream_request
+v8_req(uint64_t camera_id, uint32_t eye_w, uint32_t eye_h)
+{
+	xrt_stereo_camera_stream_request r{};
+	r.camera_id = camera_id;
+	r.output = XRT_STEREO_CAMERA_OUTPUT_RECTIFIED;
+	r.format = XRT_STEREO_CAMERA_FORMAT_GRAY8;
+	r.transport = XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY;
+	r.max_frame_rate = 0.0f;
+	r.eye_width = eye_w;
+	r.eye_height = eye_h;
+	return r;
+}
+
+//! Create + start + map a stream; returns its id (0 on failure).
+uint64_t
+v8_start(scm_fixture *f, uint64_t camera_id, uint32_t eye_w, uint32_t eye_h, xrt_stereo_camera_stream_layout *lay)
+{
+	xrt_stereo_camera_stream_request r = v8_req(camera_id, eye_w, eye_h);
+	uint64_t id = 0;
+	if (scm_stream_create(f, &r, &id) != XRT_SUCCESS || scm_stream_start(f, id) != XRT_SUCCESS ||
+	    scm_stream_map(f, id, lay) != XRT_SUCCESS) {
+		return 0;
+	}
+	return id;
+}
+
+//! Wait (<= 3 s) for a frame on the LAST mapped stream; true with its info + slot.
+bool
+v8_frame(scm_fixture *f, uint64_t id, xrt_stereo_camera_frame_info *fi, const uint8_t **slot)
+{
+	for (int i = 0; i < 300; i++) {
+		bool ready = false;
+		if (scm_acquire(f, id, &ready, fi, slot) == XRT_SUCCESS && ready && *slot != nullptr) {
+			return true;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	return false;
+}
+
+//! Wait (<= 3 s) for an event of @p kind.
+bool
+v8_event(scm_fixture *f, uint32_t kind, xrt_stereo_camera_event *out)
+{
+	for (int i = 0; i < 300; i++) {
+		while (scm_poll_event(f, out)) {
+			if (out->kind == kind) {
+				return true;
+			}
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	return false;
+}
+
+} // namespace
+
+TEST_CASE("spec v8: modes are listed, one field of view, default first", "[stereo_camera_manager][v8]")
+{
+	scm_fixture *f = scm_create_v8_plugin();
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1);
+	xrt_stereo_camera_properties p;
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+	CHECK(p.eye_width == 320);
+	xrt_stereo_camera_mode_list ml;
+	REQUIRE(scm_modes(f, p.camera_id, &ml) == XRT_SUCCESS);
+	// 640x360 has another aspect: dropped.
+	REQUIRE(ml.count == 3);
+	CHECK(ml.modes[0].eye_width == 320);
+	CHECK(ml.modes[0].eye_height == 240);
+	CHECK(ml.modes[0].flags ==
+	      (XRT_STEREO_CAMERA_MODE_DEFAULT | XRT_STEREO_CAMERA_MODE_STREAM | XRT_STEREO_CAMERA_MODE_STILL));
+	CHECK(ml.modes[1].eye_width == 160);
+	CHECK(ml.modes[1].flags == XRT_STEREO_CAMERA_MODE_STREAM);
+	CHECK(ml.modes[2].eye_width == 640);
+	CHECK(ml.modes[2].flags == (XRT_STEREO_CAMERA_MODE_STREAM | XRT_STEREO_CAMERA_MODE_STILL));
+	CHECK(scm_modes(f, 999, &ml) == XRT_ERROR_INPUT_UNSUPPORTED);
+
+	// A mode that is not listed is refused at create.
+	xrt_stereo_camera_stream_request bad = v8_req(p.camera_id, 640, 360);
+	uint64_t id = 0;
+	CHECK(scm_stream_create(f, &bad, &id) == XRT_ERROR_INPUT_UNSUPPORTED);
+
+	// Calibration of a mode: the device calibration rescaled, pixel-centre aware.
+	xrt_stereo_camera_calibration c;
+	REQUIRE(scm_calibration_mode(f, p.camera_id, XRT_STEREO_CAMERA_OUTPUT_RAW, 640, 480, &c) == XRT_SUCCESS);
+	CHECK(c.eye[0].width == 640);
+	CHECK(c.eye[0].fx == Catch::Approx(400.0f));
+	CHECK(c.eye[0].cx == Catch::Approx(319.5f));
+	CHECK(c.eye[1].cy == Catch::Approx(239.5f));
+	CHECK(c.baseline_mm == Catch::Approx(50.0f));
+	REQUIRE(scm_calibration_mode(f, p.camera_id, XRT_STEREO_CAMERA_OUTPUT_RECTIFIED, 160, 120, &c) == XRT_SUCCESS);
+	CHECK(c.eye[0].fx == Catch::Approx(100.0f));
+	CHECK(c.eye[0].cx == Catch::Approx(79.5f));
+	CHECK(c.eye[0].model == XRT_PLUGIN_STEREO_CAMERA_DISTORTION_NONE);
+	CHECK(scm_calibration_mode(f, p.camera_id, XRT_STEREO_CAMERA_OUTPUT_RAW, 640, 360, &c) ==
+	      XRT_ERROR_INPUT_UNSUPPORTED);
+	// v7: no mode = the calibration's own size.
+	REQUIRE(scm_calibration(f, p.camera_id, XRT_STEREO_CAMERA_OUTPUT_RAW, &c) == XRT_SUCCESS);
+	CHECK(c.eye[0].width == 320);
+	CHECK(c.eye[0].fx == Catch::Approx(200.0f));
+	scm_destroy(f);
+}
+
+TEST_CASE("spec v8: the source runs the largest started mode; smaller streams are downscaled",
+          "[stereo_camera_manager][v8]")
+{
+	scm_fixture *f = scm_create_v8_plugin();
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1);
+	xrt_stereo_camera_properties p;
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+
+	// Alone, a half-size stream makes the source run the half-size mode.
+	xrt_stereo_camera_stream_layout lay;
+	uint64_t small = v8_start(f, p.camera_id, 160, 120, &lay);
+	REQUIRE(small != 0);
+	CHECK(lay.width == 320);
+	CHECK(lay.height == 120);
+	xrt_stereo_camera_frame_info fi;
+	const uint8_t *slot = nullptr;
+	REQUIRE(v8_frame(f, small, &fi, &slot));
+	CHECK(fi.width == 320);
+	scm_v8_state st;
+	scm_v8_get_state(&st);
+	CHECK(st.last_mode_index == 1);
+
+	// A double-size stream joins: the source switches to it, the default-size
+	// stream below is served downscaled, each half from its own half.
+	xrt_stereo_camera_stream_layout big_lay;
+	uint64_t big = v8_start(f, p.camera_id, 640, 480, &big_lay);
+	REQUIRE(big != 0);
+	CHECK(big_lay.width == 1280);
+	REQUIRE(v8_frame(f, big, &fi, &slot));
+	CHECK(fi.width == 1280);
+	CHECK(fi.height == 480);
+	scm_v8_get_state(&st);
+	CHECK(st.last_mode_index == 2);
+
+	xrt_stereo_camera_stream_layout def_lay;
+	uint64_t def = v8_start(f, p.camera_id, 0, 0, &def_lay); // no mode = the default, as in v7
+	REQUIRE(def != 0);
+	CHECK(def_lay.width == 640);
+	REQUIRE(v8_frame(f, def, &fi, &slot));
+	CHECK(fi.width == 640);
+	CHECK(fi.height == 240);
+	scm_v8_get_state(&st);
+	CHECK(st.last_mode_index == 2); // still the largest
+	const uint32_t pitch = fi.row_pitch[0];
+	for (uint32_t y : {0u, 120u, 239u}) {
+		const uint8_t *row = slot + (size_t)y * pitch;
+		CHECK(row[0] == 50);
+		CHECK(row[319] == 50); // no bleed across the seam
+		CHECK(row[320] == 200);
+		CHECK(row[639] == 200);
+	}
+
+	// The big stream stops: the source goes back down to the largest left (the default).
+	REQUIRE(scm_stream_stop(f, big) == XRT_SUCCESS);
+	bool down = false;
+	for (int i = 0; i < 300 && !down; i++) {
+		scm_v8_get_state(&st);
+		down = st.last_mode_index == 0;
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	CHECK(down);
+	scm_destroy(f);
+}
+
+TEST_CASE("spec v8: a refused mode switch ends only the streams it cannot serve", "[stereo_camera_manager][v8]")
+{
+	scm_fixture *f = scm_create_v8_plugin();
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1);
+	xrt_stereo_camera_properties p;
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+	scm_v8_refuse_modes(true);
+	xrt_stereo_camera_stream_layout lay;
+	uint64_t def = v8_start(f, p.camera_id, 320, 240, &lay);
+	REQUIRE(def != 0);
+	xrt_stereo_camera_frame_info fi;
+	const uint8_t *slot = nullptr;
+	REQUIRE(v8_frame(f, def, &fi, &slot));
+	drain(f, 0);
+	uint64_t big = v8_start(f, p.camera_id, 640, 480, &lay);
+	REQUIRE(big != 0);
+	xrt_stereo_camera_event ev;
+	REQUIRE(v8_event(f, XRT_STEREO_CAMERA_EVENT_STREAM_ENDED, &ev));
+	CHECK(ev.stream_id == big);
+	CHECK(ev.value == XRT_STEREO_CAMERA_END_SOURCE_BUSY);
+	// The default stream keeps streaming (re-map it: the big stream's map replaced it).
+	REQUIRE(scm_stream_map(f, def, &lay) == XRT_SUCCESS);
+	REQUIRE(v8_frame(f, def, &fi, &slot));
+	CHECK(fi.width == 640);
+	scm_v8_refuse_modes(false);
+	scm_destroy(f);
+}
+
+TEST_CASE("spec v8: controls — one holder per camera, ranges, started streams only, capture state",
+          "[stereo_camera_manager][v8]")
+{
+	scm_fixture *f = scm_create_v8_plugin();
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1);
+	xrt_stereo_camera_properties p;
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+	xrt_stereo_camera_control_caps caps;
+	REQUIRE(scm_control_caps(f, p.camera_id, &caps) == XRT_SUCCESS);
+	CHECK(caps.supported_controls == 0xFu);
+	CHECK(caps.min_focus_distance_diopters == Catch::Approx(5.0f));
+	CHECK(caps.exposure_compensation_step_ev == Catch::Approx(0.5f));
+
+	xrt_stereo_camera_stream_request r = v8_req(p.camera_id, 0, 0);
+	uint64_t a = 0;
+	REQUIRE(scm_stream_create(f, &r, &a) == XRT_SUCCESS);
+	xrt_stereo_camera_controls c{};
+	c.valid_controls =
+	    XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_MODE | XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE;
+	c.focus_mode = XRT_PLUGIN_STEREO_CAMERA_FOCUS_MANUAL;
+	c.focus_distance_diopters = 2.0f;
+	CHECK(scm_set_controls(f, a, &c) == XRT_ERROR_CALL_ORDER_INVALID); // not started
+	xrt_stereo_camera_stream_layout lay;
+	REQUIRE(scm_stream_start(f, a) == XRT_SUCCESS);
+	REQUIRE(scm_stream_map(f, a, &lay) == XRT_SUCCESS);
+
+	xrt_stereo_camera_controls bad = c;
+	bad.focus_distance_diopters = 6.0f; // nearer than the lens can focus
+	CHECK(scm_set_controls(f, a, &bad) == XRT_ERROR_INPUT_UNSUPPORTED);
+	bad = c;
+	bad.valid_controls = 0x10; // not a control
+	CHECK(scm_set_controls(f, a, &bad) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
+	REQUIRE(scm_set_controls(f, a, &c) == XRT_SUCCESS);
+
+	// The source gets the WHOLE state, and the frames carry it back.
+	bool seen = false;
+	for (int i = 0; i < 300 && !seen; i++) {
+		xrt_stereo_camera_frame_info fi;
+		const uint8_t *slot = nullptr;
+		bool ready = false;
+		if (scm_acquire(f, a, &ready, &fi, &slot) == XRT_SUCCESS && ready) {
+			xrt_stereo_camera_capture_result res = scm_last_result(f);
+			seen = (res.valid_fields & XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_DISTANCE) != 0 &&
+			       std::fabs(res.focus_distance_diopters - 2.0f) < 1e-4f;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	CHECK(seen);
+	scm_v8_state st;
+	scm_v8_get_state(&st);
+	CHECK(st.last_controls.valid_controls == c.valid_controls);
+	CHECK(st.last_controls.focus_mode == XRT_PLUGIN_STEREO_CAMERA_FOCUS_MANUAL);
+
+	// EV is rounded to the step; a second stream cannot take the controls.
+	xrt_stereo_camera_controls ev{};
+	ev.valid_controls = XRT_PLUGIN_STEREO_CAMERA_CONTROL_EXPOSURE_COMPENSATION;
+	ev.exposure_compensation_ev = 0.7f;
+	REQUIRE(scm_set_controls(f, a, &ev) == XRT_SUCCESS);
+	uint64_t b = 0;
+	REQUIRE(scm_stream_create(f, &r, &b) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, b) == XRT_SUCCESS);
+	CHECK(scm_set_controls(f, b, &ev) == XRT_ERROR_STEREO_CAMERA_CONTROL_HELD);
+
+	// AUTO_ONCE is edge-triggered; the metering point passes through (natively rectified).
+	xrt_stereo_camera_controls once{};
+	once.valid_controls =
+	    XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_MODE | XRT_PLUGIN_STEREO_CAMERA_CONTROL_METERING_POINT;
+	once.focus_mode = XRT_PLUGIN_STEREO_CAMERA_FOCUS_AUTO_ONCE;
+	once.metering_x = 0.25f;
+	once.metering_y = 0.75f;
+	REQUIRE(scm_set_controls(f, a, &once) == XRT_SUCCESS);
+	bool applied = false;
+	for (int i = 0; i < 300 && !applied; i++) {
+		scm_v8_get_state(&st);
+		applied = st.last_controls.focus_mode == XRT_PLUGIN_STEREO_CAMERA_FOCUS_AUTO_ONCE;
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	REQUIRE(applied);
+	CHECK(st.last_controls.focus_trigger == 1);
+	CHECK(st.last_controls.metering_x == Catch::Approx(0.25f));
+	CHECK(st.last_controls.exposure_compensation_ev == Catch::Approx(0.5f)); // 0.7 on a 0.5 step
+	CHECK((st.last_controls.valid_controls & XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE) != 0); // merged
+
+	// The holder stops: the source goes back to its defaults and the other stream may take them.
+	REQUIRE(scm_stream_stop(f, a) == XRT_SUCCESS);
+	bool released = false;
+	for (int i = 0; i < 300 && !released; i++) {
+		scm_v8_get_state(&st);
+		released = st.last_controls.valid_controls == 0;
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	CHECK(released);
+	CHECK(scm_set_controls(f, b, &ev) == XRT_SUCCESS);
+	CHECK(scm_release_controls(f, b) == XRT_SUCCESS);
+	scm_destroy(f);
+}
+
+TEST_CASE("spec v8: a still is delivered once, in its own section, with its calibration", "[stereo_camera_manager][v8]")
+{
+	scm_fixture *f = scm_create_v8_plugin();
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1);
+	xrt_stereo_camera_properties p;
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+
+	xrt_stereo_camera_stream_request r = v8_req(p.camera_id, 160, 120);
+	uint64_t s = 0;
+	REQUIRE(scm_stream_create(f, &r, &s) == XRT_SUCCESS);
+	xrt_stereo_camera_still_request q{};
+	q.output = XRT_STEREO_CAMERA_OUTPUT_RECTIFIED;
+	q.format = XRT_STEREO_CAMERA_FORMAT_GRAY8;
+	uint64_t rid = 0;
+	CHECK(scm_request_still(f, s, &q, &rid) == XRT_ERROR_CALL_ORDER_INVALID); // not started
+	xrt_stereo_camera_stream_layout lay;
+	REQUIRE(scm_stream_start(f, s) == XRT_SUCCESS);
+	REQUIRE(scm_stream_map(f, s, &lay) == XRT_SUCCESS);
+
+	q.eye_width = 160; // a STREAM-only size is not a still size
+	q.eye_height = 120;
+	CHECK(scm_request_still(f, s, &q, &rid) == XRT_ERROR_INPUT_UNSUPPORTED);
+	q.eye_width = 0; // the largest still size: 640 x 480
+	q.eye_height = 0;
+	REQUIRE(scm_request_still(f, s, &q, &rid) == XRT_SUCCESS);
+	CHECK(rid != 0);
+	uint64_t again = 0;
+	CHECK(scm_request_still(f, s, &q, &again) == XRT_ERROR_CLIENT_LIMIT_REACHED); // one at a time
+	xrt_stereo_camera_still_info info;
+	std::vector<uint8_t> px((size_t)1280 * 480);
+	// Before it is ready, acquire is a call-order error (unless it raced ahead).
+	xrt_result_t early = scm_acquire_still(f, s, rid, &info, px.data(), px.size());
+	CHECK((early == XRT_ERROR_CALL_ORDER_INVALID || early == XRT_SUCCESS));
+
+	xrt_stereo_camera_event ev;
+	REQUIRE(v8_event(f, XRT_STEREO_CAMERA_EVENT_STILL_READY, &ev));
+	CHECK(ev.stream_id == s);
+	CHECK(ev.request_id == rid);
+	scm_v8_state st;
+	scm_v8_get_state(&st);
+	CHECK(st.last_still_w == 640);
+	CHECK(st.last_still_h == 480);
+
+	REQUIRE(scm_acquire_still(f, s, rid, &info, px.data(), px.size()) == XRT_SUCCESS);
+	CHECK(info.request_id == rid);
+	CHECK(info.width == 1280);
+	CHECK(info.height == 480);
+	CHECK(info.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED); // natively rectified
+	CHECK(info.format == XRT_STEREO_CAMERA_FORMAT_GRAY8);
+	CHECK((info.result.valid_fields & XRT_PLUGIN_STEREO_CAMERA_RESULT_SENSITIVITY) != 0);
+	CHECK(info.result.sensitivity_iso == 400);
+	CHECK(info.calibration.eye[0].width == 640);
+	CHECK(info.calibration.eye[0].fx == Catch::Approx(400.0f));
+	const uint8_t *row = px.data() + info.plane_offset[0] + (size_t)240 * info.row_pitch[0];
+	CHECK(row[0] == 60);
+	CHECK(row[639] == 60);
+	CHECK(row[640] == 180);
+	CHECK(row[1279] == 180);
+	CHECK(scm_request_still(f, s, &q, &again) == XRT_ERROR_CLIENT_LIMIT_REACHED); // not released yet
+
+	REQUIRE(scm_release_still(f, s, rid) == XRT_SUCCESS);
+	CHECK(scm_acquire_still(f, s, rid, &info, px.data(), px.size()) == XRT_ERROR_INPUT_UNSUPPORTED);
+	CHECK(scm_release_still(f, s, rid) == XRT_SUCCESS); // idempotent
+	REQUIRE(scm_request_still(f, s, &q, &again) == XRT_SUCCESS);
+	CHECK(again > rid);
+
+	// The stream stops before the still lands: it fails STREAM_ENDED (or was already ready).
+	REQUIRE(scm_stream_stop(f, s) == XRT_SUCCESS);
+	xrt_stereo_camera_event e2;
+	bool done = false;
+	for (int i = 0; i < 300 && !done; i++) {
+		while (scm_poll_event(f, &e2)) {
+			if (e2.request_id == again && (e2.kind == XRT_STEREO_CAMERA_EVENT_STILL_FAILED ||
+			                               e2.kind == XRT_STEREO_CAMERA_EVENT_STILL_READY)) {
+				done = true;
+				if (e2.kind == XRT_STEREO_CAMERA_EVENT_STILL_FAILED) {
+					CHECK(e2.result == XRT_ERROR_STEREO_CAMERA_STREAM_ENDED);
+				}
+			}
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	CHECK(done);
+	scm_destroy(f);
+}
